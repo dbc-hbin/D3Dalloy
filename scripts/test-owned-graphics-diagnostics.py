@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRATCH = ROOT / "build/owned-completion-20260919/diagnostics-cpu"
+SCRATCH = ROOT / "build/local/diagnostics-cpu"
 
 
 def load(name: str, filename: str):
