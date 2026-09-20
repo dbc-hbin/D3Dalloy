@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "suite": "dxil-static-sampler",
+  "mode": "no-present",
+  "validation": true,
+  "command": [
+    "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-direct-canonical-cache-20260921/runtime/bin/wine",
+    "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-direct-canonical-cache-20260921/gpu-dxil-static-sampler/fixture/static-sampler.exe",
+    "vs.dxil",
+    "ps.dxil"
+  ],
+  "prefix": "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-direct-canonical-cache-20260921/gpu-dxil-static-sampler/prefix",
+  "runtime_manifest_sha256": "c478eb688d8fd31211b33c9c71acfbdbb921460c4cb18cf66cb91a6d4fcb1817",
+  "lock": "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/graphics-translator/upstream.lock.json",
+  "lock_sha256": "6854a6251882239911ed6b8ce740358a247c5f90456bad4df2ff10323ce725e4",
+  "fixture_sha256": {
+    "static-sampler.exe": "5a2e551275721633fc5ccccc17ad87a77b245b7934c4a2027dc2a6a1448d97a1",
+    "vs.dxil": "e56cdc54c671f826a4056493fe0239f0e47e77a31fcaadfeaec2833b2b3aeb8d",
+    "ps.dxil": "ae1dbf72a45f9b8a89838b43828d643d33a8e9432a874210bbf2282b1f612459"
+  },
+  "timeout_seconds": 120,
+  "exit_code": 0,
+  "timed_out": false,
+  "backend_marker_verified": true,
+  "frames_verified": [],
+  "uav_barrier_verified": false,
+  "dyld_lines": 21363,
+  "owned_native_loads": [
+    "dyld[19559]: <F865A4E2-9F47-3BB4-974C-F4E03D975AB4> /Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-direct-canonical-cache-20260921/runtime/lib/wine/x86_64-unix/winemetal.so"
+  ],
+  "dxil_native_compiler_verified": true,
+  "raytracing": null,
+  "foreign_backend_loads": [],
+  "validation_errors": [],
+  "backend_logs": [
+    "static-sampler_d3d12.log"
+  ],
+  "trace_event_count": 18,
+  "temporal_analysis": null,
+  "pass": true,
+  "scope": "synthetic owned D3D12 fixture; not ZZZ compatibility or a nameplate fix"
+}

@@ -1,0 +1,765 @@
+--- a/src/d3d12/d3d12_command_allocator.cpp	2026-09-19 18:14:23.207731488 +0900
++++ b/src/d3d12/d3d12_command_allocator.cpp	2026-09-19 17:37:55.773600767 +0900
+@@ -158,6 +158,9 @@
+       case EncoderType::Temporal:
+         reinterpret_cast<TemporalEncoderData *>(next)->~TemporalEncoderData();
+         break;
++      case EncoderType::Query:
++        reinterpret_cast<QueryEncoderData *>(next)->~QueryEncoderData();
++        break;
+       }
+       next = following;
+     }
+--- a/src/d3d12/d3d12_command_encoder.hpp	2026-09-19 18:14:22.998122478 +0900
++++ b/src/d3d12/d3d12_command_encoder.hpp	2026-09-19 17:57:06.978252894 +0900
+@@ -19,6 +19,8 @@
+ #pragma once
+ 
+ #include "dxmt_texture.hpp"
++#include "util_svector.hpp"
++#include "owned_query_timestamps.hpp"
+ #include <cstdint>
+ 
+ namespace dxmt {
+@@ -31,6 +33,7 @@
+   Compute,
+   Resolve,
+   Temporal,
++  Query,
+ };
+ 
+ struct EncoderData {
+@@ -88,6 +91,13 @@
+   uint8_t clear_stencil;
+ };
+ 
++struct QueryVisibilityTarget {
++  WMT::Reference<WMT::Buffer> destination;
++  WMT::Reference<WMT::ComputePipelineState> accumulate_pipeline;
++  uint64_t heap_id = 0;
++  uint32_t index = 0;
++};
++
+ struct RenderEncoderData : EncoderData {
+   std::array<RenderEncoderColorAttachmentData, 8> colors;
+   RenderEncoderDepthAttachmentData depth;
+@@ -101,7 +111,11 @@
+   uint8_t dsv_planar_flags;
+   uint8_t dsv_readonly_flags;
+   uint8_t render_target_count;
+-  bool use_visibility_result = 0;
++  // Metal exposes one visibility-result stream per render pass. Snapshot all
++  // D3D12 queries active for this pass, count once into a private 8-byte
++  // scratch slot, then fan that count into each query heap slot on the queue.
++  WMT::Reference<WMT::Buffer> visibility_scratch;
++  small_vector<QueryVisibilityTarget, 4> visibility_targets;
+   bool use_tessellation = 0;
+   bool use_geometry = 0;
+ };
+@@ -120,4 +134,25 @@
+   TextureViewRef dst;
+ };
+ 
++enum class QueryEncoderOp : uint8_t {
++  ResetOcclusion,
++  SampleTimestamp,
++  ResolveOcclusion,
++  ResolveBinaryOcclusion,
++  ResolveTimestamp,
++};
++
++struct QueryEncoderData : EncoderData {
++  QueryEncoderOp op;
++  WMT::Reference<WMT::CounterSampleBuffer> timestamp_samples;
++  std::shared_ptr<owned_graphics::QueryTimestampProducers> timestamp_producers;
++  WMT::Reference<WMT::Buffer> source;
++  WMT::Reference<WMT::Buffer> destination;
++  WMT::Reference<WMT::Buffer> timestamp_dummy;
++  WMT::Reference<WMT::ComputePipelineState> compute_pipeline;
++  uint32_t start_index = 0;
++  uint32_t query_count = 0;
++  uint64_t destination_offset = 0;
++};
++
+ }; // namespace dxmt
+--- a/src/d3d12/d3d12_command_list.cpp	2026-09-19 18:14:23.209362952 +0900
++++ b/src/d3d12/d3d12_command_list.cpp	2026-09-19 17:57:06.980900405 +0900
+@@ -366,6 +366,23 @@
+   FLOAT blend_factor_[4];
+   UINT8 stencil_ref_;
+ 
++  struct ActiveVisibilityQuery {
++    D3D12_QUERY_TYPE type;
++    UINT index;
++    uint64_t heap_id;
++    WMT::Reference<WMT::Buffer> destination;
++    WMT::Reference<WMT::ComputePipelineState> accumulate_pipeline;
++  };
++  small_vector<ActiveVisibilityQuery, 4> active_visibility_queries_;
++
++  bool QueryObjectOwnedByThisDevice(ID3D12DeviceChild *object) {
++    if (!object)
++      return false;
++    Com<ID3D12Device> owner;
++    return SUCCEEDED(object->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) &&
++           owner.ptr() == static_cast<ID3D12Device *>(device_);
++  }
++
+ public:
+   MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type)
+       : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12GraphicsCommandListExt>(pDevice),
+@@ -465,6 +482,7 @@
+     owned_allocator = allocator;
+     entry = new_entry;
+     encoder_count = std::numeric_limits<size_t>::max();
++    active_visibility_queries_.clear();
+     ResetState(pInitialPipelineState);
+     bundle_commands_.clear();
+     bundle_initial_pso_ = pInitialPipelineState;
+@@ -542,6 +560,8 @@
+   Close() {
+     if (encoder_count < std::numeric_limits<size_t>::max())
+       return E_FAIL;
++    if (!active_visibility_queries_.empty())
++      RecordError();
+     auto hr = allocator_->EndRecord(&encoder_count);
+     if (SUCCEEDED(hr) && FAILED(recording_error_))
+       hr = recording_error_;
+@@ -617,6 +637,24 @@
+       render->dsv_planar_flags = 0;
+       render->dsv_readonly_flags = 0;
+       render->render_target_count = num_rtvs;
++      if (!active_visibility_queries_.empty()) {
++        WMTBufferInfo visibility_info{};
++        visibility_info.length = sizeof(uint64_t);
++        visibility_info.options = WMTResourceHazardTrackingModeUntracked;
++        render->visibility_scratch = device_->GetMTLDevice().newBuffer(visibility_info);
++        if (!render->visibility_scratch) {
++          RecordError(E_OUTOFMEMORY);
++          return DrawCallStatus::Invalid;
++        }
++        render->visibility_targets.reserve(active_visibility_queries_.size());
++        for (const auto &query : active_visibility_queries_)
++          render->visibility_targets.push_back(QueryVisibilityTarget{
++              query.destination, query.accumulate_pipeline, query.heap_id, query.index});
++        auto &visibility = allocator_->EncodeRenderCommand<wmtcmd_render_setvisibilitymode>();
++        visibility.type = WMTRenderCommandSetVisibilityMode;
++        visibility.mode = WMTVisibilityResultModeCounting;
++        visibility.offset = 0;
++      }
+ 
+       unsigned render_target_width = 16384, render_target_height = 16384, render_target_array_length = 0;
+ 
+@@ -2071,14 +2109,91 @@
+   BeginQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+     if (RejectBundleOperation())
+       return;
+-    DEBUG("BeginQuery");
++    if (!IsRecording())
++      return;
++    if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT ||
++        (Type != D3D12_QUERY_TYPE_OCCLUSION && Type != D3D12_QUERY_TYPE_BINARY_OCCLUSION) ||
++        !QueryObjectOwnedByThisDevice(pHeap)) {
++      RecordError();
++      return;
++    }
++    auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
++    if (heap->desc.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION || Index >= heap->desc.Count ||
++        !heap->visibility_results || !heap->visibility_accumulate_pipeline) {
++      RecordError();
++      return;
++    }
++    for (const auto &active : active_visibility_queries_) {
++      if (active.heap_id == heap->owned_id && active.index == Index) {
++        RecordError();
++        return;
++      }
++    }
++
++    allocator_->InvalidateCurrentPass();
++    auto reset = allocator_->AllocatePass<QueryEncoderData>();
++    reset->type = EncoderType::Query;
++    reset->op = QueryEncoderOp::ResetOcclusion;
++    reset->source = heap->visibility_results;
++    reset->start_index = Index;
++    reset->query_count = 1;
++    allocator_->InvalidateCurrentPass();
++    active_visibility_queries_.push_back(ActiveVisibilityQuery{
++        Type, Index, heap->owned_id, heap->visibility_results, heap->visibility_accumulate_pipeline});
++    owned_graphics::Trace("query_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
++                          ",\"heap\":", heap->owned_id, ",\"type\":", uint32_t(Type), ",\"index\":", Index,
++                          ",\"active\":", active_visibility_queries_.size());
+   };
+ 
+   void STDMETHODCALLTYPE
+   EndQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+     if (RejectBundleOperation())
+       return;
+-    DEBUG("EndQuery");
++    if (!IsRecording())
++      return;
++    if (!QueryObjectOwnedByThisDevice(pHeap)) {
++      RecordError();
++      return;
++    }
++    auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
++    if (Type == D3D12_QUERY_TYPE_TIMESTAMP) {
++      if ((type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE) ||
++          heap->desc.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP || Index >= heap->desc.Count ||
++          !heap->timestamp_samples || !heap->timestamp_dummy) {
++        RecordError();
++        return;
++      }
++      allocator_->InvalidateCurrentPass();
++      auto sample = allocator_->AllocatePass<QueryEncoderData>();
++      sample->type = EncoderType::Query;
++      sample->op = QueryEncoderOp::SampleTimestamp;
++      sample->timestamp_samples = heap->timestamp_samples;
++      sample->timestamp_producers = heap->timestamp_producers;
++      sample->timestamp_dummy = heap->timestamp_dummy;
++      sample->start_index = Index;
++      sample->query_count = 1;
++      allocator_->InvalidateCurrentPass();
++      owned_graphics::Trace("query_timestamp", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
++                            ",\"heap\":", heap->owned_id, ",\"index\":", Index);
++      return;
++    }
++    if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT ||
++        (Type != D3D12_QUERY_TYPE_OCCLUSION && Type != D3D12_QUERY_TYPE_BINARY_OCCLUSION) ||
++        heap->desc.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION || Index >= heap->desc.Count) {
++      RecordError();
++      return;
++    }
++    for (auto it = active_visibility_queries_.begin(); it != active_visibility_queries_.end(); ++it) {
++      if (it->heap_id != heap->owned_id || it->index != Index || it->type != Type)
++        continue;
++      allocator_->InvalidateCurrentPass();
++      active_visibility_queries_.erase(it);
++      owned_graphics::Trace("query_end", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
++                            ",\"heap\":", heap->owned_id, ",\"type\":", uint32_t(Type), ",\"index\":", Index,
++                            ",\"active\":", active_visibility_queries_.size());
++      return;
++    }
++    RecordError();
+   };
+ 
+   void STDMETHODCALLTYPE
+@@ -2088,7 +2203,63 @@
+   ) {
+     if (RejectBundleOperation())
+       return;
+-    DEBUG("ResolveQueryData");
++    if (!IsRecording())
++      return;
++    if (!QueryObjectOwnedByThisDevice(pHeap) || !QueryObjectOwnedByThisDevice(pDstBuffer)) {
++      RecordError();
++      return;
++    }
++    auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
++    const bool timestamp = Type == D3D12_QUERY_TYPE_TIMESTAMP;
++    const bool occlusion = Type == D3D12_QUERY_TYPE_OCCLUSION || Type == D3D12_QUERY_TYPE_BINARY_OCCLUSION;
++    if (StartIndex > heap->desc.Count || QueryCount > heap->desc.Count - StartIndex ||
++        (AlignedDstBufferOffset & 7) ||
++        (timestamp && (heap->desc.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP ||
++                       (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE))) ||
++        (occlusion && (heap->desc.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION ||
++                       type_ != D3D12_COMMAND_LIST_TYPE_DIRECT)) || (!timestamp && !occlusion)) {
++      RecordError();
++      return;
++    }
++    auto destination = static_cast<MTLD3D12Resource *>(pDstBuffer);
++    auto desc = destination->GetDesc();
++    const UINT64 bytes = UINT64(QueryCount) * sizeof(uint64_t);
++    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !destination->buffer ||
++        !destination->buffer->current() || AlignedDstBufferOffset > desc.Width ||
++        bytes > desc.Width - AlignedDstBufferOffset) {
++      RecordError();
++      return;
++    }
++    if (!QueryCount)
++      return;
++    // Resolving an unfinished query is undefined in D3D12. Reject a known
++    // active range rather than reading an incomplete GPU result.
++    for (const auto &active : active_visibility_queries_) {
++      if (active.heap_id == heap->owned_id && active.index >= StartIndex &&
++          active.index - StartIndex < QueryCount) {
++        RecordError();
++        return;
++      }
++    }
++    allocator_->InvalidateCurrentPass();
++    auto resolve = allocator_->AllocatePass<QueryEncoderData>();
++    resolve->type = EncoderType::Query;
++    resolve->op = timestamp ? QueryEncoderOp::ResolveTimestamp
++        : Type == D3D12_QUERY_TYPE_BINARY_OCCLUSION ? QueryEncoderOp::ResolveBinaryOcclusion
++                                                   : QueryEncoderOp::ResolveOcclusion;
++    resolve->timestamp_samples = heap->timestamp_samples;
++    resolve->timestamp_producers = heap->timestamp_producers;
++    resolve->source = heap->visibility_results;
++    resolve->destination = destination->buffer->current()->buffer();
++    resolve->compute_pipeline = heap->binary_normalize_pipeline;
++    resolve->start_index = StartIndex;
++    resolve->query_count = QueryCount;
++    resolve->destination_offset = AlignedDstBufferOffset;
++    allocator_->InvalidateCurrentPass();
++    owned_graphics::Trace("query_resolve", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
++                          ",\"heap\":", heap->owned_id, ",\"type\":", uint32_t(Type),
++                          ",\"start\":", StartIndex, ",\"count\":", QueryCount,
++                          ",\"dst\":", destination->owned_id, ",\"offset\":", AlignedDstBufferOffset);
+   };
+ 
+   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *pBuffer, UINT64 AlignedBufferOffset, D3D12_PREDICATION_OP Op) {
+--- a/src/d3d12/d3d12_command_queue.cpp	2026-09-19 18:14:23.210396497 +0900
++++ b/src/d3d12/d3d12_command_queue.cpp	2026-09-19 17:57:30.475825894 +0900
+@@ -28,6 +28,7 @@
+ #include "d3d12_temporal.hpp"
+ #include <atomic>
+ #include <new>
++#include <optional>
+ #include <variant>
+ #include "d3d10_1.h"
+ #include "d3d11_4.h"
+@@ -47,6 +48,8 @@
+ 
+   WMT::Reference<WMT::CommandQueue> queue_;
+   WMT::Reference<WMT::Fence> fence_;
++  WMT::Reference<WMT::Event> query_barrier_event_;
++  uint64_t query_barrier_value_ = 0;
+ 
+   owned_graphics::SubmissionRing<kCommandQueueSize> submission_ring_;
+ 
+@@ -126,6 +129,7 @@
+     // Prepared commands retain feature history, native views, and private
+     // scratch until Metal completion, independently of frontend ReleaseFeature.
+     std::vector<std::shared_ptr<OwnedTemporalFrame>> temporal_frames;
++    std::vector<std::pair<std::shared_ptr<owned_graphics::QueryTimestampProducers>, uint32_t>> timestamp_completions;
+   };
+ 
+   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
+@@ -149,6 +153,9 @@
+         inflight.cmdbuf.waitUntilCompleted();
+       if (inflight.cmdbuf.status() == WMTCommandBufferStatusError)
+         ERR("Device error: ", inflight.cmdbuf.error().description().getUTF8String());
++      else
++        for (const auto &[queries, index] : inflight.timestamp_completions)
++          queries->completed(index, inflight.cmdbuf);
+ 
+       owned_graphics::Trace("complete", ",\"queue\":", owned_id_, ",\"submission\":", internal_seq,
+                             ",\"status\":", uint32_t(inflight.cmdbuf.status()));
+@@ -245,6 +252,9 @@
+     fence_ = metal_device.newFence();
+     if (!fence_)
+       return E_FAIL;
++    query_barrier_event_ = metal_device.newEvent();
++    if (!query_barrier_event_)
++      return E_FAIL;
+     owned_graphics::Trace("queue_create", ",\"queue\":", owned_id_, ",\"type\":", uint32_t(desc_.Type));
+ 
+     return S_OK;
+@@ -305,21 +315,53 @@
+ 
+   void
+   ProcessExecute(ExecuteTask &task) {
+-    auto scope = StartCommitting();
+-    scope.inflight.allocators.reserve(task.lists.size());
+-    for (auto &list : task.lists)
+-      scope.inflight.allocators.push_back(list.allocator);
+-    if (task.contains_temporal)
+-      scope.temporal_submission_lock = std::unique_lock(device_->owned_temporal_submission_mutex);
+-    auto &cmdbuf = scope.inflight.cmdbuf;
++    std::optional<CommittingScope> scope;
++    auto begin_segment = [&] {
++      scope.emplace(this);
++      scope->inflight.allocators.reserve(task.lists.size());
++      for (auto &list : task.lists)
++        scope->inflight.allocators.push_back(list.allocator);
++      if (task.contains_temporal)
++        scope->temporal_submission_lock = std::unique_lock(device_->owned_temporal_submission_mutex);
++    };
++    begin_segment();
+     for (auto &list : task.lists) {
+-      owned_graphics::Trace("execute_list", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
++      owned_graphics::Trace("execute_list", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
+                             ",\"list\":", list.list_id,
+                             ",\"recording\":", list.recording);
+       EncoderData *current = list.entry;
+       while (current) {
++        if (current->type == EncoderType::Query &&
++            static_cast<QueryEncoderData *>(current)->op == QueryEncoderOp::ResolveTimestamp) {
++          auto query = static_cast<QueryEncoderData *>(current);
++          const uint64_t producer_submission = scope->seq;
++          // This is the FIFO worker, never the application's Execute caller.
++          // Release both queue and temporal locks before any completion wait.
++          scope.reset();
++          submission_ring_.waitUntilRetired(producer_submission);
++          const auto producers = query->timestamp_producers->snapshot(query->start_index, query->query_count);
++          for (auto producer : producers) {
++            if (!producer)
++              continue;
++            if (producer.status() < WMTCommandBufferStatusCommitted) {
++              ERR("ResolveQueryData: timestamp producer has not been submitted");
++              return;
++            }
++            if (producer.status() <= WMTCommandBufferStatusScheduled)
++              producer.waitUntilCompleted();
++            if (producer.status() == WMTCommandBufferStatusError) {
++              ERR("ResolveQueryData: timestamp producer failed");
++              return;
++            }
++          }
++          owned_graphics::Trace("query_resolve_ready", ",\"queue\":", owned_id_,
++                                ",\"completed_submission\":", producer_submission,
++                                ",\"start\":", query->start_index, ",\"count\":", query->query_count);
++          begin_segment();
++        }
++        auto &cmdbuf = scope->inflight.cmdbuf;
+         if (current->type != EncoderType::Null)
+-          owned_graphics::Trace("encode", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
++          owned_graphics::Trace("encode", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
+                                 ",\"list\":", list.list_id,
+                                 ",\"recording\":", list.recording,
+                                 ",\"encoder\":", current->id, ",\"type\":", uint32_t(current->type));
+@@ -412,12 +454,47 @@
+             render_pass_info.render_target_array_length = data->render_target_array_length;
+             render_pass_info.render_target_width = data->render_target_width;
+             render_pass_info.render_target_height = data->render_target_height;
++            render_pass_info.visibility_buffer = data->visibility_scratch;
+           }
+           auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
+           encoder.waitForFence(fence_, WMTRenderStageVertex);
+           encoder.encodeCommands(&data->cmd_head);
+           encoder.updateFence(fence_, WMTRenderStageFragment);
+           encoder.endEncoding();
++          for (const auto &target : data->visibility_targets) {
++            auto accumulate = cmdbuf.computeCommandEncoder(false);
++            accumulate.waitForFence(fence_);
++            wmtcmd_compute_nop head{};
++            head.type = WMTComputeCommandNop;
++            wmtcmd_compute_setpso set_pso{};
++            set_pso.type = WMTComputeCommandSetPSO;
++            set_pso.pso = target.accumulate_pipeline;
++            set_pso.threadgroup_size = {1, 1, 1};
++            wmtcmd_compute_setbuffer set_source{};
++            set_source.type = WMTComputeCommandSetBuffer;
++            set_source.buffer = data->visibility_scratch;
++            set_source.offset = 0;
++            set_source.index = 0;
++            wmtcmd_compute_setbuffer set_destination{};
++            set_destination.type = WMTComputeCommandSetBuffer;
++            set_destination.buffer = target.destination;
++            set_destination.offset = uint64_t(target.index) * sizeof(uint64_t);
++            set_destination.index = 1;
++            wmtcmd_compute_dispatch dispatch{};
++            dispatch.type = WMTComputeCommandDispatchThreads;
++            dispatch.size = {1, 1, 1};
++            head.next.set(&set_pso);
++            set_pso.next.set(&set_source);
++            set_source.next.set(&set_destination);
++            set_destination.next.set(&dispatch);
++            dispatch.next.set(nullptr);
++            accumulate.encodeCommands(&head);
++            accumulate.updateFence(fence_);
++            accumulate.endEncoding();
++            owned_graphics::Trace("query_accumulate", ",\"queue\":", owned_id_,
++                                  ",\"submission\":", scope->seq, ",\"heap\":", target.heap_id,
++                                  ",\"index\":", target.index);
++          }
+           break;
+         }
+         case EncoderType::Blit: {
+@@ -440,8 +517,8 @@
+         }
+         case EncoderType::Temporal: {
+           auto data = static_cast<TemporalEncoderData *>(current);
+-          scope.inflight.temporal_frames.push_back(data->frame);
+-          EncodeOwnedTemporalFrame(data->frame, cmdbuf, fence_, owned_id_, scope.seq, current->id);
++          scope->inflight.temporal_frames.push_back(data->frame);
++          EncodeOwnedTemporalFrame(data->frame, cmdbuf, fence_, owned_id_, scope->seq, current->id);
+           break;
+         }
+         case EncoderType::Resolve: {
+@@ -462,6 +539,112 @@
+ 
+           break;
+         }
++        case EncoderType::Query: {
++          auto data = static_cast<QueryEncoderData *>(current);
++          switch (data->op) {
++          case QueryEncoderOp::ResetOcclusion: {
++            auto encoder = cmdbuf.blitCommandEncoder();
++            encoder.waitForFence(fence_);
++            wmtcmd_blit_fillbuffer fill{};
++            fill.type = WMTBlitCommandFillBuffer;
++            fill.next.set(nullptr);
++            fill.buffer = data->source;
++            fill.offset = uint64_t(data->start_index) * sizeof(uint64_t);
++            fill.length = sizeof(uint64_t);
++            fill.value = 0;
++            encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
++            encoder.updateFence(fence_);
++            encoder.endEncoding();
++            break;
++          }
++          case QueryEncoderOp::SampleTimestamp: {
++            const uint64_t before = ++query_barrier_value_;
++            cmdbuf.encodeSignalEvent(query_barrier_event_, before);
++            cmdbuf.encodeWaitForEvent(query_barrier_event_, before);
++
++            WMTSampleBufferAttachmentInfo sample{};
++            sample.sample_buffer = data->timestamp_samples;
++            sample.start_of_encoder_sample_index = data->start_index;
++            sample.end_of_encoder_sample_index = ~0ull;
++            auto encoder = cmdbuf.blitCommandEncoderWithSampleBuffers(&sample, 1);
++            wmtcmd_blit_fillbuffer fill{};
++            fill.type = WMTBlitCommandFillBuffer;
++            fill.next.set(nullptr);
++            fill.buffer = data->timestamp_dummy;
++            fill.offset = 0;
++            fill.length = 4;
++            fill.value = 0;
++            encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
++            encoder.updateFence(fence_);
++            encoder.endEncoding();
++
++            const uint64_t after = ++query_barrier_value_;
++            cmdbuf.encodeSignalEvent(query_barrier_event_, after);
++            cmdbuf.encodeWaitForEvent(query_barrier_event_, after);
++            data->timestamp_producers->record(data->start_index, cmdbuf);
++            scope->inflight.timestamp_completions.emplace_back(data->timestamp_producers, data->start_index);
++            break;
++          }
++          case QueryEncoderOp::ResolveOcclusion: {
++            auto encoder = cmdbuf.blitCommandEncoder();
++            encoder.waitForFence(fence_);
++            wmtcmd_blit_copy_from_buffer_to_buffer copy{};
++            copy.type = WMTBlitCommandCopyFromBufferToBuffer;
++            copy.next.set(nullptr);
++            copy.src = data->source;
++            copy.src_offset = uint64_t(data->start_index) * sizeof(uint64_t);
++            copy.dst = data->destination;
++            copy.dst_offset = data->destination_offset;
++            copy.copy_length = uint64_t(data->query_count) * sizeof(uint64_t);
++            encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
++            encoder.updateFence(fence_);
++            encoder.endEncoding();
++            break;
++          }
++          case QueryEncoderOp::ResolveBinaryOcclusion: {
++            auto encoder = cmdbuf.computeCommandEncoder(false);
++            encoder.waitForFence(fence_);
++            wmtcmd_compute_nop head{};
++            head.type = WMTComputeCommandNop;
++            wmtcmd_compute_setpso set_pso{};
++            set_pso.type = WMTComputeCommandSetPSO;
++            set_pso.pso = data->compute_pipeline;
++            set_pso.threadgroup_size = {64, 1, 1};
++            wmtcmd_compute_setbuffer set_source{};
++            set_source.type = WMTComputeCommandSetBuffer;
++            set_source.buffer = data->source;
++            set_source.offset = uint64_t(data->start_index) * sizeof(uint64_t);
++            set_source.index = 0;
++            wmtcmd_compute_setbuffer set_destination{};
++            set_destination.type = WMTComputeCommandSetBuffer;
++            set_destination.buffer = data->destination;
++            set_destination.offset = data->destination_offset;
++            set_destination.index = 1;
++            wmtcmd_compute_dispatch dispatch{};
++            dispatch.type = WMTComputeCommandDispatchThreads;
++            dispatch.size = {data->query_count, 1, 1};
++            head.next.set(&set_pso);
++            set_pso.next.set(&set_source);
++            set_source.next.set(&set_destination);
++            set_destination.next.set(&dispatch);
++            dispatch.next.set(nullptr);
++            encoder.encodeCommands(&head);
++            encoder.updateFence(fence_);
++            encoder.endEncoding();
++            break;
++          }
++          case QueryEncoderOp::ResolveTimestamp: {
++            auto encoder = cmdbuf.blitCommandEncoder();
++            encoder.waitForFence(fence_);
++            encoder.resolveCounters(data->timestamp_samples, data->start_index, data->query_count,
++                                    data->destination, data->destination_offset);
++            encoder.updateFence(fence_);
++            encoder.endEncoding();
++            break;
++          }
++          }
++          break;
++        }
+         }
+         current = current->next;
+       }
+@@ -616,9 +799,13 @@
+ 
+   HRESULT STDMETHODCALLTYPE
+   GetTimestampFrequency(UINT64 *pFrequency) {
+-    // FIXME: stub
+-    if (pFrequency)
+-      *pFrequency = 1;
++    if (!pFrequency)
++      return E_INVALIDARG;
++    if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc_.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
++      return E_FAIL;
++    // Metal timestamp counter samples are MTLTimestamp values, expressed in
++    // nanoseconds. D3D12 reports counter ticks per second, so one tick/ns is 1 GHz.
++    *pFrequency = 1000000000ull;
+     return S_OK;
+   };
+ 
+--- a/src/d3d12/d3d12_device.hpp	2026-09-19 18:14:23.208245115 +0900
++++ b/src/d3d12/d3d12_device.hpp	2026-09-19 17:57:06.979094939 +0900
+@@ -137,6 +137,14 @@
+ 
+ class MTLD3D12QueryHeap : public ID3D12QueryHeap {
+ public:
++  const uint64_t owned_id = owned_graphics::NewObjectId();
++  D3D12_QUERY_HEAP_DESC desc{};
++  WMT::Reference<WMT::CounterSampleBuffer> timestamp_samples;
++  std::shared_ptr<owned_graphics::QueryTimestampProducers> timestamp_producers;
++  WMT::Reference<WMT::Buffer> timestamp_dummy;
++  WMT::Reference<WMT::Buffer> visibility_results;
++  WMT::Reference<WMT::ComputePipelineState> binary_normalize_pipeline;
++  WMT::Reference<WMT::ComputePipelineState> visibility_accumulate_pipeline;
+ };
+ 
+ class MTLD3D12PipelineState : public ID3D12PipelineState {
+--- a/src/d3d12/d3d12_query_heap.cpp	2026-09-19 18:14:22.863256459 +0900
++++ b/src/d3d12/d3d12_query_heap.cpp	2026-09-19 17:57:06.979806567 +0900
+@@ -27,6 +27,52 @@
+ 
+   HRESULT
+   Initialize(const D3D12_QUERY_HEAP_DESC *pDesc) {
++    if (!pDesc || !pDesc->Count || pDesc->NodeMask > 1)
++      return E_INVALIDARG;
++
++    desc = *pDesc;
++    switch (desc.Type) {
++    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP: {
++      timestamp_samples = device_->GetMTLDevice().newCounterSampleBuffer(desc.Count, true);
++      if (!timestamp_samples)
++        return E_NOTIMPL;
++      try {
++        timestamp_producers = std::make_shared<owned_graphics::QueryTimestampProducers>(desc.Count);
++      } catch (const std::bad_alloc &) {
++        return E_OUTOFMEMORY;
++      }
++      WMTBufferInfo dummy_info{};
++      dummy_info.length = 4;
++      dummy_info.options = WMTResourceHazardTrackingModeUntracked;
++      timestamp_dummy = device_->GetMTLDevice().newBuffer(dummy_info);
++      if (!timestamp_dummy)
++        return E_OUTOFMEMORY;
++      break;
++    }
++    case D3D12_QUERY_HEAP_TYPE_OCCLUSION: {
++      WMTBufferInfo visibility_info{};
++      visibility_info.length = uint64_t(desc.Count) * sizeof(uint64_t);
++      visibility_info.options = WMTResourceHazardTrackingModeUntracked;
++      visibility_results = device_->GetMTLDevice().newBuffer(visibility_info);
++      if (!visibility_results)
++        return E_OUTOFMEMORY;
++      auto function = device_->GetLib().getLibrary().newFunction("query_binary_normalize");
++      WMT::Reference<WMT::Error> error;
++      binary_normalize_pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
++      if (!binary_normalize_pipeline)
++        return E_FAIL;
++      auto accumulate_function = device_->GetLib().getLibrary().newFunction("query_accumulate_visibility");
++      visibility_accumulate_pipeline =
++          device_->GetMTLDevice().newComputePipelineState(accumulate_function, error);
++      if (!visibility_accumulate_pipeline)
++        return E_FAIL;
++      break;
++    }
++    default:
++      return E_NOTIMPL;
++    }
++    owned_graphics::Trace("query_heap_create", ",\"heap\":", owned_id,
++                          ",\"type\":", uint32_t(desc.Type), ",\"count\":", desc.Count);
+     return S_OK;
+   }
+ 
+@@ -54,6 +100,10 @@
+ 
+ HRESULT
+ CreateQueryHeap(MTLD3D12Device *pDevice, const D3D12_QUERY_HEAP_DESC *pDesc, REFIID riid, void **ppQueryHeap) {
++  if (ppQueryHeap)
++    *ppQueryHeap = nullptr;
++  if (!pDesc)
++    return E_INVALIDARG;
+   auto heap = Com(new MTLD3D12QueryHeapImpl(pDevice));
+   HRESULT hr = heap->Initialize(pDesc);
+   if (FAILED(hr))
+@@ -63,4 +113,4 @@
+   return heap->QueryInterface(riid, ppQueryHeap);
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+--- a/src/d3d12/owned_query_timestamps.hpp	1970-01-01 09:00:00.000000000 +0900
++++ b/src/d3d12/owned_query_timestamps.hpp	2026-09-19 17:57:06.977242847 +0900
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#pragma once
++
++#include "Metal.hpp"
++#include <memory>
++#include <mutex>
++#include <vector>
++
++namespace owned_graphics {
++
++// The tested Apple Metal driver needs the timestamp producer to complete before
++// resolveCounters is encoded. Keep each pending element's producer independently
++// so unrelated query slots and other queues never introduce a false dependency.
++class QueryTimestampProducers {
++  std::mutex mutex_;
++  std::vector<WMT::Reference<WMT::CommandBuffer>> producers_;
++
++public:
++  explicit QueryTimestampProducers(size_t count) : producers_(count) {}
++
++  void record(size_t index, const WMT::Reference<WMT::CommandBuffer> &producer) {
++    std::lock_guard lock(mutex_);
++    producers_[index] = producer;
++  }
++
++  void completed(size_t index, WMT::CommandBuffer producer) {
++    std::lock_guard lock(mutex_);
++    if (producers_[index] == producer)
++      producers_[index] = nullptr;
++  }
++
++  std::vector<WMT::Reference<WMT::CommandBuffer>> snapshot(size_t first, size_t count) {
++    std::lock_guard lock(mutex_);
++    return {producers_.begin() + first, producers_.begin() + first + count};
++  }
++};
++
++} // namespace owned_graphics
+--- a/src/dxmt/dxmt_command.metal	2026-09-19 18:14:22.865533341 +0900
++++ b/src/dxmt/dxmt_command.metal	2026-09-19 17:37:55.774054853 +0900
+@@ -115,6 +115,21 @@
+   }
+ }
+ 
++[[kernel]] void query_binary_normalize(
++    device const ulong* source [[buffer(0)]],
++    device ulong* destination [[buffer(1)]],
++    uint pos [[thread_position_in_grid]]
++) {
++  destination[pos] = source[pos] ? 1ul : 0ul;
++}
++
++[[kernel]] void query_accumulate_visibility(
++    device const ulong* source [[buffer(0)]],
++    device ulong* destination [[buffer(1)]]
++) {
++  destination[0] += source[0];
++}
++
+ [[kernel]] void clear_texture_1d_float(
+     texture1d<float, access::read_write> tex [[texture(0)]],
+     constant float4& value [[buffer(1)]],

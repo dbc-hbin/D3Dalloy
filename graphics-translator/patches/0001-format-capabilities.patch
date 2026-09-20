@@ -1,0 +1,240 @@
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 080353c..685e35f 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include "d3d12_device.hpp"
+ #include "d3d12_device_child.hpp"
++#include "d3d12_format_support.hpp"
+ #include "Metal.hpp"
+ #include "com/com_pointer.hpp"
+ #include "com/com_object.hpp"
+@@ -373,14 +374,68 @@ public:
+       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT *>(pFeatureData);
+ 
+       if (out->Format == DXGI_FORMAT_UNKNOWN) {
+-        out->Support1 = D3D12_FORMAT_SUPPORT1_BUFFER;
+-        out->Support2 = {};
++        auto support = BuildD3D12FormatSupport(out->Format, {});
++        out->Support1 = support.Support1;
++        out->Support2 = support.Support2;
+         return S_OK;
+       }
+ 
+-      // TODO(d3d12): report correct support
+-      out->Support1 = (D3D12_FORMAT_SUPPORT1)0xffffffff;
+-      out->Support2 = (D3D12_FORMAT_SUPPORT2)0xffffffff;
++      out->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
++      out->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
++
++      MTL_DXGI_FORMAT_DESC format_desc;
++      if (FAILED(MTLQueryDXGIFormat(metal, out->Format, format_desc)))
++        return E_INVALIDARG;
++
++      auto capability = GetMTLPixelFormatCapability(format_desc.PixelFormat);
++      auto has_capability = [&](FormatCapability bit) {
++        return any_bit_set(capability & bit);
++      };
++
++      const bool block_compressed = format_desc.Flag & MTL_DXGI_FORMAT_BC;
++      const bool depth = format_desc.Flag & MTL_DXGI_FORMAT_DEPTH_PLANER;
++      const bool stencil = format_desc.Flag & MTL_DXGI_FORMAT_STENCIL_PLANER;
++      const auto native_texel_size = MTLGetTexelSize(format_desc.PixelFormat);
++      const bool native_layout_compatible =
++          block_compressed || depth || stencil ||
++          (format_desc.BytesPerTexel && native_texel_size == format_desc.BytesPerTexel);
++      const auto texture_capability_mask = static_cast<FormatCapability>(
++          FormatCapability::Atomic | FormatCapability::Filter | FormatCapability::Write |
++          FormatCapability::Color | FormatCapability::Blend | FormatCapability::MSAA |
++          FormatCapability::Sparse | FormatCapability::Resolve | FormatCapability::DepthStencil);
++      const auto buffer_capability_mask = static_cast<FormatCapability>(
++          FormatCapability::TextureBufferRead | FormatCapability::TextureBufferWrite |
++          FormatCapability::TextureBufferReadWrite);
++      const bool inspected_texture_support = any_bit_set(capability & texture_capability_mask);
++      const bool inspected_buffer_support = any_bit_set(capability & buffer_capability_mask);
++
++      D3D12FormatSupportProperties properties{
++          .mapped = format_desc.PixelFormat != WMTPixelFormatInvalid,
++          .buffer_compatible =
++              !block_compressed && !depth && !stencil && native_layout_compatible && inspected_buffer_support,
++          .texture_compatible = native_layout_compatible && inspected_texture_support,
++          .typeless = bool(format_desc.Flag & MTL_DXGI_FORMAT_TYPELESS),
++          .block_compressed = block_compressed,
++          .depth = depth,
++          .stencil = stencil,
++          .backbuffer = bool(format_desc.Flag & MTL_DXGI_FORMAT_BACKBUFFER),
++          .vertex_attribute = format_desc.AttributeFormat != WMTAttributeFormatInvalid,
++          .filter = has_capability(FormatCapability::Filter),
++          .write = has_capability(FormatCapability::Write),
++          .color = has_capability(FormatCapability::Color),
++          .blend = has_capability(FormatCapability::Blend),
++          .multisample = has_capability(FormatCapability::MSAA),
++          .resolve = has_capability(FormatCapability::Resolve),
++          .atomic = has_capability(FormatCapability::Atomic),
++          .typed_uav_load = has_capability(FormatCapability::TextureBufferRead) ||
++                            has_capability(FormatCapability::TextureBufferReadWrite),
++          .typed_uav_store = has_capability(FormatCapability::TextureBufferWrite) ||
++                             has_capability(FormatCapability::TextureBufferReadWrite),
++      };
++
++      auto support = BuildD3D12FormatSupport(out->Format, properties);
++      out->Support1 = support.Support1;
++      out->Support2 = support.Support2;
+       return S_OK;
+     }
+     default:
+@@ -1281,4 +1336,4 @@ CreateD3D12Device(IMTLDXGIAdapter *adapter, const IID &riid, void **ppDevice) {
+   return device->QueryInterface(riid, ppDevice);
+ };
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/d3d12/d3d12_format_support.hpp b/src/d3d12/d3d12_format_support.hpp
+new file mode 100644
+index 0000000..fb89b20
+--- /dev/null
++++ b/src/d3d12/d3d12_format_support.hpp
+@@ -0,0 +1,141 @@
++#pragma once
++
++#include "d3d12.h"
++
++namespace dxmt {
++
++struct D3D12FormatSupportProperties {
++  bool mapped = false;
++  bool buffer_compatible = false;
++  bool texture_compatible = false;
++  bool typeless = false;
++  bool block_compressed = false;
++  bool depth = false;
++  bool stencil = false;
++  bool backbuffer = false;
++  bool vertex_attribute = false;
++  bool filter = false;
++  bool write = false;
++  bool color = false;
++  bool blend = false;
++  bool multisample = false;
++  bool resolve = false;
++  bool atomic = false;
++  bool typed_uav_load = false;
++  bool typed_uav_store = false;
++};
++
++inline D3D12_FEATURE_DATA_FORMAT_SUPPORT
++BuildD3D12FormatSupport(DXGI_FORMAT format, const D3D12FormatSupportProperties &properties) {
++  D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
++  support.Format = format;
++  support.Support1 = D3D12_FORMAT_SUPPORT1_NONE;
++  support.Support2 = D3D12_FORMAT_SUPPORT2_NONE;
++
++  if (format == DXGI_FORMAT_UNKNOWN) {
++    support.Support1 = D3D12_FORMAT_SUPPORT1_BUFFER;
++    return support;
++  }
++
++  if (!properties.mapped)
++    return support;
++
++  auto add_support1 = [&](D3D12_FORMAT_SUPPORT1 bit) {
++    support.Support1 = static_cast<D3D12_FORMAT_SUPPORT1>(
++        static_cast<unsigned int>(support.Support1) | static_cast<unsigned int>(bit));
++  };
++  auto add_support2 = [&](D3D12_FORMAT_SUPPORT2 bit) {
++    support.Support2 = static_cast<D3D12_FORMAT_SUPPORT2>(
++        static_cast<unsigned int>(support.Support2) | static_cast<unsigned int>(bit));
++  };
++
++  const bool typed = !properties.typeless;
++  const bool depth_stencil = properties.depth || properties.stencil;
++
++  if (properties.buffer_compatible)
++    add_support1(D3D12_FORMAT_SUPPORT1_BUFFER);
++
++  if (typed && properties.vertex_attribute)
++    add_support1(D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER);
++
++  if (typed && (format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_R32_UINT))
++    add_support1(D3D12_FORMAT_SUPPORT1_IA_INDEX_BUFFER);
++
++  if (properties.texture_compatible) {
++    if (!properties.block_compressed && !depth_stencil)
++      add_support1(D3D12_FORMAT_SUPPORT1_TEXTURE1D);
++
++    add_support1(D3D12_FORMAT_SUPPORT1_TEXTURE2D);
++
++    if (!properties.block_compressed && !depth_stencil)
++      add_support1(D3D12_FORMAT_SUPPORT1_TEXTURE3D);
++
++    if (!depth_stencil)
++      add_support1(D3D12_FORMAT_SUPPORT1_TEXTURECUBE);
++
++    if (properties.typeless)
++      add_support1(D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT);
++
++    if (typed) {
++      add_support1(D3D12_FORMAT_SUPPORT1_SHADER_LOAD);
++
++      if (properties.filter) {
++        add_support1(D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
++        add_support1(D3D12_FORMAT_SUPPORT1_SHADER_GATHER);
++        add_support1(D3D12_FORMAT_SUPPORT1_MIP);
++      }
++
++      if (properties.depth) {
++        add_support1(D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON);
++        add_support1(D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON);
++      }
++
++      if (properties.color)
++        add_support1(D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
++
++      if (properties.blend)
++        add_support1(D3D12_FORMAT_SUPPORT1_BLENDABLE);
++
++      if (depth_stencil)
++        add_support1(D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL);
++
++      if (properties.resolve && properties.color)
++        add_support1(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE);
++
++      if (properties.backbuffer && properties.color)
++        add_support1(D3D12_FORMAT_SUPPORT1_DISPLAY);
++
++      if (properties.multisample) {
++        add_support1(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD);
++        if (properties.color)
++          add_support1(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET);
++      }
++
++      const bool typed_uav =
++          !properties.block_compressed && !depth_stencil &&
++          ((properties.texture_compatible && properties.write) ||
++           (properties.buffer_compatible && properties.typed_uav_store));
++      if (typed_uav) {
++        add_support1(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW);
++
++        if (properties.typed_uav_load)
++          add_support2(D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD);
++        if (properties.typed_uav_store)
++          add_support2(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
++
++        if (properties.atomic) {
++          add_support2(D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD);
++          add_support2(D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS);
++          add_support2(D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE);
++          add_support2(D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE);
++          add_support2(D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX);
++          add_support2(D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX);
++        }
++      }
++    }
++  }
++
++  return support;
++}
++
++} // namespace dxmt

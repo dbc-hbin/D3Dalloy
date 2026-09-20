@@ -1,0 +1,940 @@
+diff --git a/src/d3d12/d3d12_command_allocator.hpp b/src/d3d12/d3d12_command_allocator.hpp
+index 19f4e11..19ca7f0 100644
+--- a/src/d3d12/d3d12_command_allocator.hpp
++++ b/src/d3d12/d3d12_command_allocator.hpp
+@@ -23,2 +23,3 @@
+ #include "dxmt_ring_bump_allocator.hpp"
++#include "owned_submission_storage.hpp"
+ 
+@@ -88,3 +89,6 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
+ 
+-  small_vector<EncoderData, 64> encoder_lists_;
++  // Closed command-list entry pointers may outlive the list object while a
++  // queue worker defers CPU encoding behind a future fence signal. Appending a
++  // new recording after CommandList::Reset must not move earlier entry heads.
++  owned_graphics::StableSubmissionStorage<EncoderData> encoder_lists_;
+ 
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 4be16ef..2859bd0 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -208,6 +208,7 @@ public:
+ 
+     if (allocator_ != allocator)
+       allocator_ = allocator;
++    owned_allocator = allocator;
+ 
+     ResetState(pInitialPipelineState);
+ 
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 48f6fb4..9b5e33e 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -24,8 +24,11 @@
+ #include "log/log.hpp"
+ #include "util_env.hpp"
+ #include "owned_submission_ring.hpp"
++#include "owned_queue_task_fifo.hpp"
+ #include "d3d12_temporal.hpp"
+ #include <atomic>
++#include <new>
++#include <variant>
+ #include "d3d10_1.h"
+ #include "d3d11_4.h"
+ 
+@@ -47,6 +50,71 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+ 
+   owned_graphics::SubmissionRing<kCommandQueueSize> submission_ring_;
+ 
++  struct OwnedHandle {
++    HANDLE handle = nullptr;
++
++    OwnedHandle() = default;
++    explicit OwnedHandle(HANDLE handle) : handle(handle) {}
++    OwnedHandle(const OwnedHandle &) = delete;
++    OwnedHandle &operator=(const OwnedHandle &) = delete;
++    OwnedHandle(OwnedHandle &&other) : handle(other.handle) {
++      other.handle = nullptr;
++    }
++    OwnedHandle &operator=(OwnedHandle &&other) {
++      if (this != &other) {
++        if (handle)
++          CloseHandle(handle);
++        handle = other.handle;
++        other.handle = nullptr;
++      }
++      return *this;
++    }
++    ~OwnedHandle() {
++      if (handle)
++        CloseHandle(handle);
++    }
++    HANDLE release() {
++      auto result = handle;
++      handle = nullptr;
++      return result;
++    }
++  };
++
++  struct ListSubmission {
++    EncoderData *entry = nullptr;
++    uint64_t list_id = 0;
++    uint64_t recording = 0;
++    Com<ID3D12CommandAllocator> allocator;
++  };
++
++  struct ExecuteTask {
++    std::vector<ListSubmission> lists;
++  };
++
++  struct SignalTask {
++    Rc<Fence> fence;
++    Fence::QueueTicket ticket;
++    uint64_t fence_id = 0;
++  };
++
++  struct WaitTask {
++    Rc<Fence> fence;
++    Fence::QueueTicket ticket;
++    uint64_t fence_id = 0;
++  };
++
++  struct PresentTask {
++    Rc<Presenter> presenter;
++    Com<MTLD3D12Resource> backbuffer;
++    std::unique_ptr<Presenter::PresentState> state;
++    OwnedHandle completion_handle;
++    double after = 0;
++  };
++
++  using QueueTask = std::variant<ExecuteTask, SignalTask, WaitTask, PresentTask>;
++  owned_graphics::QueueTaskFifo<QueueTask> task_fifo_;
++  dxmt::mutex mutex_enqueue_;
++
+   struct InflightCommandBuffer {
+     WMT::Reference<WMT::CommandBuffer> cmdbuf{};
+     HANDLE semaphore{};
+@@ -57,6 +125,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+ 
+   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
+   dxmt::thread inflight_cmdbuf_wait_thread_;
++  dxmt::thread submission_thread_;
+ 
+   dxmt::mutex mutex_commit_;
+ 
+@@ -119,12 +188,35 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+     return CommittingScope(this);
+   }
+ 
++  void
++  SubmissionThread() {
++    env::setThreadName("dxmt-d3d12-submit-thread");
++    QueueTask task;
++    while (task_fifo_.waitPop(task)) {
++      std::visit([this](auto &typed) { this->Process(typed); }, task);
++      // Release allocator/fence/presenter/resource references as soon as the
++      // task has been encoded instead of retaining the last task while idle.
++      task = ExecuteTask{};
++    }
++  }
++
++  void Process(ExecuteTask &task) { ProcessExecute(task); }
++  void Process(SignalTask &task) { ProcessSignal(task); }
++  void Process(WaitTask &task) { ProcessWait(task); }
++  void Process(PresentTask &task) { ProcessPresent(task); }
++
+ public:
+   MTLD3D12CommandQueueImpl(MTLD3D12Device *pDevice) :
+       MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory>(pDevice),
+-      inflight_cmdbuf_wait_thread_([this]() { this->CommandBufferWaitingThread(); }) {}
++      inflight_cmdbuf_wait_thread_([this]() { this->CommandBufferWaitingThread(); }),
++      submission_thread_([this]() { this->SubmissionThread(); }) {}
+ 
+   ~MTLD3D12CommandQueueImpl() {
++    task_fifo_.close();
++    submission_thread_.join();
++    const uint64_t last_submission = submission_ring_.lastPublished();
++    if (last_submission)
++      submission_ring_.waitUntilRetired(last_submission);
+     std::lock_guard<dxmt::mutex> lock(mutex_commit_);
+     submission_ring_.stop();
+     inflight_cmdbuf_wait_thread_.join();
+@@ -203,21 +295,20 @@ public:
+     IMPLEMENT_ME
+   };
+ 
+-  void STDMETHODCALLTYPE
+-  ExecuteCommandLists(UINT Count, ID3D12CommandList *const *ppCommandLists) {
++  void
++  ProcessExecute(ExecuteTask &task) {
+     auto scope = StartCommitting();
+     auto &cmdbuf = scope.inflight.cmdbuf;
+-    for (unsigned i = 0; i < Count; i++) {
+-      auto pCommandList = static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i]);
++    for (auto &list : task.lists) {
+       owned_graphics::Trace("execute_list", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
+-                            ",\"list\":", pCommandList->owned_id,
+-                            ",\"recording\":", pCommandList->owned_recording);
+-      EncoderData *current = pCommandList->entry;
++                            ",\"list\":", list.list_id,
++                            ",\"recording\":", list.recording);
++      EncoderData *current = list.entry;
+       while (current) {
+         if (current->type != EncoderType::Null)
+           owned_graphics::Trace("encode", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
+-                                ",\"list\":", pCommandList->owned_id,
+-                                ",\"recording\":", pCommandList->owned_recording,
++                                ",\"list\":", list.list_id,
++                                ",\"recording\":", list.recording,
+                                 ",\"encoder\":", current->id, ",\"type\":", uint32_t(current->type));
+         switch (current->type) {
+         case EncoderType::Null:
+@@ -364,34 +455,124 @@ public:
+     }
+   };
+ 
++  void STDMETHODCALLTYPE
++  ExecuteCommandLists(UINT Count, ID3D12CommandList *const *ppCommandLists) {
++    try {
++      std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
++      ExecuteTask task;
++      task.lists.reserve(Count);
++      for (unsigned i = 0; i < Count; i++) {
++        auto list = static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i]);
++        if (!list || !list->owned_allocator) {
++          ERR("ExecuteCommandLists: invalid command list or allocator");
++          return;
++        }
++        task.lists.push_back(ListSubmission{
++            list->entry, list->owned_id, list->owned_recording, Com<ID3D12CommandAllocator>(list->owned_allocator)});
++      }
++      if (!task_fifo_.push(QueueTask{std::move(task)}))
++        ERR("ExecuteCommandLists: queue submission worker is closed");
++    } catch (const std::bad_alloc &) {
++      ERR("ExecuteCommandLists: out of memory while capturing submission");
++    } catch (...) {
++      ERR("ExecuteCommandLists: failed to capture submission");
++    }
++  }
++
+   void STDMETHODCALLTYPE SetMarker(UINT metadata, const void *data, UINT size) {};
+ 
+   void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void *data, UINT size) {};
+ 
+   void STDMETHODCALLTYPE EndEvent() {};
+ 
++  void
++  ProcessSignal(SignalTask &task) {
++    uint64_t submission = 0;
++    {
++      auto scope = StartCommitting();
++      submission = scope.seq;
++      task.fence->encodeQueueSignal(scope.inflight.cmdbuf, task.ticket);
++      owned_graphics::Trace("signal", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
++                            ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
++                            ",\"generation\":", task.ticket.generation);
++    }
++    // A consumer queue may start CPU encoding after the producer command
++    // buffer is committed. Native GPU ordering is still enforced by its wait.
++    task.fence->markQueueSignalCommitted(task.ticket);
++    owned_graphics::Trace("signal_committed", ",\"queue\":", owned_id_, ",\"submission\":", submission,
++                          ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
++                          ",\"generation\":", task.ticket.generation);
++  }
++
+   HRESULT STDMETHODCALLTYPE
+   Signal(ID3D12Fence *pFence, UINT64 Value) {
+     if (!pFence)
+       return E_INVALIDARG;
+-    auto scope = StartCommitting();
+-    auto &cmdbuf = scope.inflight.cmdbuf;
+-    static_cast<MTLD3D12Fence *>(pFence)->fence->signal(cmdbuf, Value);
+-    owned_graphics::Trace("signal", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
+-                          ",\"fence\":", static_cast<MTLD3D12Fence *>(pFence)->owned_id, ",\"value\":", Value);
+-    return S_OK;
++    try {
++      std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
++      auto native = static_cast<MTLD3D12Fence *>(pFence);
++      SignalTask task;
++      task.fence = native->fence;
++      task.fence_id = native->owned_id;
++      auto preparation = task.fence->prepareQueueSignal(owned_id_, Value);
++      if (!preparation) {
++        owned_graphics::Trace("signal_order_unsupported", ",\"queue\":", owned_id_,
++                              ",\"fence\":", task.fence_id, ",\"value\":", Value);
++        return E_NOTIMPL;
++      }
++      task.ticket = preparation->ticket;
++      try {
++        if (task_fifo_.push(QueueTask{std::move(task)})) {
++          native->fence->commitQueueSignal(*preparation);
++          return S_OK;
++        }
++      } catch (const std::bad_alloc &) {
++        native->fence->cancelQueueSignal(*preparation);
++        return E_OUTOFMEMORY;
++      } catch (...) {
++        native->fence->cancelQueueSignal(*preparation);
++        return E_FAIL;
++      }
++      native->fence->cancelQueueSignal(*preparation);
++      return E_FAIL;
++    } catch (const std::bad_alloc &) {
++      return E_OUTOFMEMORY;
++    } catch (...) {
++      return E_FAIL;
++    }
+   };
+ 
++  void
++  ProcessWait(WaitTask &task) {
++    if (!task.fence->queueWaitReady(task.ticket))
++      owned_graphics::Trace("wait_defer", ",\"queue\":", owned_id_, ",\"fence\":", task.fence_id,
++                            ",\"value\":", task.ticket.value, ",\"generation\":", task.ticket.generation);
++    task.fence->waitForQueueProducer(task.ticket);
++
++    auto scope = StartCommitting();
++    task.fence->encodeQueueWait(scope.inflight.cmdbuf, task.ticket);
++    owned_graphics::Trace("wait", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
++                          ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
++                          ",\"generation\":", task.ticket.generation);
++  }
++
+   HRESULT STDMETHODCALLTYPE
+   Wait(ID3D12Fence *pFence, UINT64 Value) {
+     if (!pFence)
+       return E_INVALIDARG;
+-    auto scope = StartCommitting();
+-    auto &cmdbuf = scope.inflight.cmdbuf;
+-    static_cast<MTLD3D12Fence *>(pFence)->fence->wait(cmdbuf, Value);
+-    owned_graphics::Trace("wait", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
+-                          ",\"fence\":", static_cast<MTLD3D12Fence *>(pFence)->owned_id, ",\"value\":", Value);
+-    return S_OK;
++    try {
++      std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
++      auto native = static_cast<MTLD3D12Fence *>(pFence);
++      WaitTask task;
++      task.fence = native->fence;
++      task.fence_id = native->owned_id;
++      task.ticket = task.fence->prepareQueueWait(Value);
++      return task_fifo_.push(QueueTask{std::move(task)}) ? S_OK : E_FAIL;
++    } catch (const std::bad_alloc &) {
++      return E_OUTOFMEMORY;
++    } catch (...) {
++      return E_FAIL;
++    }
+   };
+ 
+   HRESULT STDMETHODCALLTYPE
+@@ -421,38 +602,66 @@ public:
+     return dxmt::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
+   }
+ 
+-  HRESULT
+-  Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) {
+-    // The swapchain owns its public handle and may be released while this
+-    // submission is in flight. Keep a separate reference to the same semaphore
+-    // until the completion thread signals and closes it.
+-    HANDLE completion_handle = nullptr;
+-    if (hLantecyWaitable && !DuplicateHandle(GetCurrentProcess(), hLantecyWaitable,
+-                                            GetCurrentProcess(), &completion_handle, 0,
+-                                            FALSE, DUPLICATE_SAME_ACCESS))
+-      return HRESULT_FROM_WIN32(GetLastError());
++  void
++  ProcessPresent(PresentTask &task) {
+     auto scope = StartCommitting();
+     auto &cmdbuf = scope.inflight.cmdbuf;
+-    scope.inflight.semaphore = completion_handle;
++    scope.inflight.semaphore = task.completion_handle.release();
+ 
+-    auto g = reinterpret_cast<MTLD3D12Resource *>(backbuffer);
++    auto g = task.backbuffer.ptr();
+     auto &view = g->texture->view(g->texture->fullView);
+ 
+-    auto state = presenter->synchronizeLayerProperties();
+-    auto drawable = presenter->encodeCommands(
+-        cmdbuf, view.texture, state.metadata,
++    auto drawable = task.presenter->encodeCommands(
++        cmdbuf, view.texture, task.state->metadata,
+         [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
+         [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
+     );
+ 
+-    if (after > 0)
+-      cmdbuf.presentDrawableAfterMinimumDuration(drawable, after);
++    if (task.after > 0)
++      cmdbuf.presentDrawableAfterMinimumDuration(drawable, task.after);
+     else
+       cmdbuf.presentDrawable(drawable);
+     owned_graphics::Trace("present_encode", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
+                           ",\"resource\":", g->owned_id);
++    // Match the existing synchronous/D3D11 behavior: publish presenter CPU
++    // completion after encode, before this command buffer is committed.
++    task.state.reset();
++  }
+ 
+-    return S_OK;
++  HRESULT
++  Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) {
++    if (!presenter || !backbuffer)
++      return E_INVALIDARG;
++    try {
++      // The swapchain owns its public handle and may be released while this
++      // task is waiting behind a queue fence. Keep a duplicate until the
++      // resulting GPU command buffer completes.
++      HANDLE completion_handle = nullptr;
++      if (hLantecyWaitable && !DuplicateHandle(GetCurrentProcess(), hLantecyWaitable,
++                                              GetCurrentProcess(), &completion_handle, 0,
++                                              FALSE, DUPLICATE_SAME_ACCESS))
++        return HRESULT_FROM_WIN32(GetLastError());
++      OwnedHandle retained_completion_handle(completion_handle);
++
++      std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
++      // D3D11 captures PresentState on the Present caller before deferring the
++      // Metal encode. Keep D3D12's presenter/layer state on the same side of
++      // the thread boundary; only the GPU encoding belongs to the queue worker.
++      // Do this under the queue capture lock so concurrent Present calls cannot
++      // snapshot layer/frame state in an order different from their FIFO tasks.
++      auto state = std::make_unique<Presenter::PresentState>(presenter->synchronizeLayerProperties());
++      PresentTask task;
++      task.presenter = Rc<Presenter>(presenter);
++      task.backbuffer = static_cast<MTLD3D12Resource *>(backbuffer);
++      task.state = std::move(state);
++      task.completion_handle = std::move(retained_completion_handle);
++      task.after = after;
++      return task_fifo_.push(QueueTask{std::move(task)}) ? S_OK : E_FAIL;
++    } catch (const std::bad_alloc &) {
++      return E_OUTOFMEMORY;
++    } catch (...) {
++      return E_FAIL;
++    }
+   }
+ };
+ 
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index 3410a80..8ae24b3 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -48,6 +48,7 @@ class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList2 {
+ public:
+   const uint64_t owned_id = owned_graphics::NewObjectId();
+   uint64_t owned_recording = 0;
++  ID3D12CommandAllocator *owned_allocator = nullptr;
+   EncoderData *entry;
+   size_t encoder_count;
+ };
+diff --git a/src/d3d12/d3d12_fence.cpp b/src/d3d12/d3d12_fence.cpp
+index 0a594a3..27f2126 100644
+--- a/src/d3d12/d3d12_fence.cpp
++++ b/src/d3d12/d3d12_fence.cpp
+@@ -34,7 +34,8 @@ public:
+   HRESULT
+   Initialize(UINT64 InitialValue) {
+     fence = new Fence(device_->GetMTLDevice());
+-    fence->signal(InitialValue);
++    if (!fence->initialize(InitialValue))
++      return E_NOTIMPL;
+     return S_OK;
+   }
+ 
+@@ -81,7 +82,10 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   Signal(UINT64 Value) {
+-    fence->signal(Value);
++    if (!fence->signal(Value)) {
++      WARN("ID3D12Fence::Signal non-monotonic or mixed CPU/GPU producer ordering is not supported");
++      return E_NOTIMPL;
++    }
+     return S_OK;
+   }
+ 
+@@ -102,4 +106,4 @@ CreateFence(MTLD3D12Device *pDevice, UINT64 InitialValue, D3D12_FENCE_FLAGS Flag
+   return fence->QueryInterface(riid, ppFence);
+ }
+ 
+-}; // namespace dxmt
+\ No newline at end of file
++}; // namespace dxmt
+diff --git a/src/d3d12/owned_queue_task_fifo.hpp b/src/d3d12/owned_queue_task_fifo.hpp
+new file mode 100644
+index 0000000..7f128d2
+--- /dev/null
++++ b/src/d3d12/owned_queue_task_fifo.hpp
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Queue-local close-and-drain FIFO used by the owned D3D12 submission worker.
++#pragma once
++
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <utility>
++
++namespace owned_graphics {
++
++template <typename Task>
++class QueueTaskFifo {
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  std::deque<Task> tasks_;
++  bool closed_ = false;
++
++public:
++  bool push(Task task) {
++    {
++      std::lock_guard lock(mutex_);
++      if (closed_)
++        return false;
++      tasks_.push_back(std::move(task));
++    }
++    cv_.notify_one();
++    return true;
++  }
++
++  bool waitPop(Task &task) {
++    std::unique_lock lock(mutex_);
++    cv_.wait(lock, [&] { return closed_ || !tasks_.empty(); });
++    if (tasks_.empty())
++      return false;
++    task = std::move(tasks_.front());
++    tasks_.pop_front();
++    return true;
++  }
++
++  void close() {
++    {
++      std::lock_guard lock(mutex_);
++      closed_ = true;
++    }
++    cv_.notify_all();
++  }
++};
++
++} // namespace owned_graphics
+diff --git a/src/d3d12/owned_submission_ring.hpp b/src/d3d12/owned_submission_ring.hpp
+index 4f944f2..c1a6837 100644
+--- a/src/d3d12/owned_submission_ring.hpp
++++ b/src/d3d12/owned_submission_ring.hpp
+@@ -48,6 +48,19 @@ public:
+     retired_.notify_one();
+   }
+ 
++  std::uint64_t lastPublished() const {
++    const auto next = published_.load(std::memory_order_acquire);
++    return next > 1 ? next - 1 : 0;
++  }
++
++  void waitUntilRetired(std::uint64_t sequence) const {
++    auto retired = retired_.load(std::memory_order_acquire);
++    while (retired <= sequence) {
++      retired_.wait(retired, std::memory_order_acquire);
++      retired = retired_.load(std::memory_order_acquire);
++    }
++  }
++
+   void stop() {
+     const auto sequence = published_.load(std::memory_order_relaxed);
+     // Publish the sentinel *after* its identity, including when the completion
+diff --git a/src/d3d12/owned_submission_storage.hpp b/src/d3d12/owned_submission_storage.hpp
+new file mode 100644
+index 0000000..57fda27
+--- /dev/null
++++ b/src/d3d12/owned_submission_storage.hpp
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Stable command-record heads retained by deferred queue submissions.
++#pragma once
++
++#include <deque>
++
++namespace owned_graphics {
++
++template <typename Record>
++using StableSubmissionStorage = std::deque<Record>;
++
++} // namespace owned_graphics
+diff --git a/src/dxmt/dxmt_fence.cpp b/src/dxmt/dxmt_fence.cpp
+index 37b1e82..3711569 100644
+--- a/src/dxmt/dxmt_fence.cpp
++++ b/src/dxmt/dxmt_fence.cpp
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "dxmt_fence.hpp"
++#include <cassert>
+ #include <thread>
+ 
+ namespace dxmt {
+@@ -33,12 +34,96 @@ Fence::decRef() {
+ };
+ 
+ Fence::Fence(WMT::Device device) : device_(device) {
+-  reset();
++  resetLocked();
+ }
+ 
+ void
+-Fence::reset() {
++Fence::resetLocked() {
+   this->event_ = device_.newSharedEvent();
++  this->order_ = std::make_shared<owned_graphics::FenceOrderEpoch>(++generation_);
++  this->schedule_.reset();
++}
++
++bool
++Fence::initialize(uint64_t value) {
++  WMT::Reference<WMT::SharedEvent> event;
++  std::shared_ptr<owned_graphics::FenceOrderEpoch> order;
++  {
++    std::lock_guard lock(schedule_mutex_);
++    if (schedule_.initialize(value) != owned_graphics::FenceSignalSchedule::Result::Accepted)
++      return false;
++    event = event_;
++    order = order_;
++  }
++  event.signalValue(value);
++  order->markCommitted(value);
++  return true;
++}
++
++bool
++Fence::signal(uint64_t value) {
++  WMT::Reference<WMT::SharedEvent> event;
++  std::shared_ptr<owned_graphics::FenceOrderEpoch> order;
++  {
++    std::lock_guard lock(schedule_mutex_);
++    const bool previous_settled = event_.signaledValue() >= schedule_.lastScheduled();
++    if (schedule_.scheduleCpu(value, previous_settled) != owned_graphics::FenceSignalSchedule::Result::Accepted)
++      return false;
++    event = event_;
++    order = order_;
++  }
++  // An accepted CPU producer signal is immediately visible. Mixed producer
++  // handoff is accepted only after the prior scheduled value has completed.
++  event.signalValue(value);
++  order->markCommitted(value);
++  return true;
++}
++
++std::optional<Fence::QueueSignalPreparation>
++Fence::prepareQueueSignal(uint64_t queue, uint64_t value) {
++  std::unique_lock lock(schedule_mutex_);
++  const bool previous_settled = event_.signaledValue() >= schedule_.lastScheduled();
++  const auto previous_schedule = schedule_.state();
++  if (schedule_.scheduleQueue(queue, value, previous_settled) != owned_graphics::FenceSignalSchedule::Result::Accepted)
++    return std::nullopt;
++  return QueueSignalPreparation{
++      QueueTicket{event_, order_, generation_, value}, previous_schedule, std::move(lock)};
++}
++
++void
++Fence::commitQueueSignal(QueueSignalPreparation &preparation) {
++  preparation.schedule_lock.unlock();
++}
++
++void
++Fence::cancelQueueSignal(QueueSignalPreparation &preparation) {
++  // prepareQueueSignal intentionally keeps schedule_mutex_ locked until the
++  // owning queue either publishes the task into its CPU FIFO or rolls back.
++  // No other queue/CPU producer can observe an intermediate scheduling state.
++  assert(preparation.schedule_lock.owns_lock());
++  schedule_.restore(preparation.previous_schedule);
++  preparation.schedule_lock.unlock();
++}
++
++Fence::QueueTicket
++Fence::prepareQueueWait(uint64_t value) const {
++  std::lock_guard lock(schedule_mutex_);
++  return QueueTicket{event_, order_, generation_, value};
++}
++
++bool
++Fence::queueWaitReady(const QueueTicket &ticket) const {
++  if (ticket.order->ready(ticket.value))
++    return true;
++  auto event = ticket.event;
++  return event.signaledValue() >= ticket.value;
++}
++
++void
++Fence::waitForQueueProducer(const QueueTicket &ticket) const {
++  using namespace std::chrono_literals;
++  while (!queueWaitReady(ticket))
++    ticket.order->waitFor(ticket.value, 10ms);
+ }
+ 
+ EventListener::EventListener() :
+@@ -54,7 +139,8 @@ EventListener::~EventListener() {
+ 
+ void
+ EventListener::setEventOnValue(Fence const *fence, HANDLE event, uint64_t value) {
+-  MTLSharedEvent_setWin32EventAtValue(fence->sharedEvent().handle, shared_event_listener_, event, value);
++  auto shared_event = fence->sharedEvent();
++  MTLSharedEvent_setWin32EventAtValue(shared_event.handle, shared_event_listener_, event, value);
+ }
+ 
+-}; // namespace dxmt
+\ No newline at end of file
++}; // namespace dxmt
+diff --git a/src/dxmt/dxmt_fence.hpp b/src/dxmt/dxmt_fence.hpp
+index 652b202..e6052b1 100644
+--- a/src/dxmt/dxmt_fence.hpp
++++ b/src/dxmt/dxmt_fence.hpp
+@@ -19,65 +19,101 @@
+ #pragma once
+ 
+ #include "Metal.hpp"
++#include "dxmt_queue_order.hpp"
+ #include "thread.hpp"
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
++#include <memory>
++#include <mutex>
++#include <optional>
+ 
+ namespace dxmt {
+ 
+ class Fence {
+ public:
++  struct QueueTicket {
++    WMT::Reference<WMT::SharedEvent> event;
++    std::shared_ptr<owned_graphics::FenceOrderEpoch> order;
++    uint64_t generation = 0;
++    uint64_t value = 0;
++  };
++
++  struct QueueSignalPreparation {
++    QueueTicket ticket;
++    owned_graphics::FenceSignalSchedule::State previous_schedule;
++    std::unique_lock<std::mutex> schedule_lock;
++
++    QueueSignalPreparation(QueueTicket ticket, owned_graphics::FenceSignalSchedule::State previous_schedule,
++                           std::unique_lock<std::mutex> schedule_lock)
++        : ticket(std::move(ticket)), previous_schedule(previous_schedule), schedule_lock(std::move(schedule_lock)) {}
++    QueueSignalPreparation(QueueSignalPreparation &&) = default;
++    QueueSignalPreparation &operator=(QueueSignalPreparation &&) = default;
++    QueueSignalPreparation(const QueueSignalPreparation &) = delete;
++    QueueSignalPreparation &operator=(const QueueSignalPreparation &) = delete;
++  };
++
+   void incRef();
+   void decRef();
+ 
+-  WMT::SharedEvent
++  WMT::Reference<WMT::SharedEvent>
+   sharedEvent() const {
++    std::lock_guard lock(schedule_mutex_);
+     return event_;
+   }
+ 
+   uint64_t
+   completedValue() {
+-    return event_.signaledValue();
++    auto event = sharedEvent();
++    return event.signaledValue();
+   }
+ 
++  bool
++  initialize(uint64_t value);
++
++  bool
++  signal(uint64_t value);
++
++  std::optional<QueueSignalPreparation> prepareQueueSignal(uint64_t queue, uint64_t value);
++  void commitQueueSignal(QueueSignalPreparation &preparation);
++  void cancelQueueSignal(QueueSignalPreparation &preparation);
++  QueueTicket prepareQueueWait(uint64_t value) const;
++
+   void
+-  signal(uint64_t value) {
+-    if (value < last_signaled_)
+-      reset();
+-    else if (value == last_signaled_)
+-      return;
+-    event_.signalValue(value);
+-    last_signaled_ = value;
+-  };
++  wait(uint64_t value, uint64_t timeout = ~0ULL) {
++    auto event = sharedEvent();
++    event.waitUntilSignaledValue(value, timeout);
++  }
+ 
+   void
+-  signal(WMT::CommandBuffer cmdbuf, uint64_t value) {
+-    if (value < last_signaled_)
+-      reset();
+-    else if (value == last_signaled_)
+-      return;
+-    cmdbuf.encodeSignalEvent(event_, value);
+-    last_signaled_ = value;
++  encodeQueueSignal(WMT::CommandBuffer cmdbuf, const QueueTicket &ticket) {
++    cmdbuf.encodeSignalEvent(ticket.event, ticket.value);
+   }
+ 
+   void
+-  wait(uint64_t value, uint64_t timeout = ~0ULL) {
+-    event_.waitUntilSignaledValue(value, timeout);
++  encodeQueueWait(WMT::CommandBuffer cmdbuf, const QueueTicket &ticket) {
++    cmdbuf.encodeWaitForEvent(ticket.event, ticket.value);
+   }
+ 
+   void
+-  wait(WMT::CommandBuffer cmdbuf, uint64_t value) {
+-    cmdbuf.encodeWaitForEvent(event_, value);
++  markQueueSignalCommitted(const QueueTicket &ticket) {
++    ticket.order->markCommitted(ticket.value);
+   }
+ 
+-  void reset();
++  bool queueWaitReady(const QueueTicket &ticket) const;
++  void waitForQueueProducer(const QueueTicket &ticket) const;
+ 
+   Fence(WMT::Device device);
+ 
+ private:
++  void resetLocked();
++
+   WMT::Device device_;
+   WMT::Reference<WMT::SharedEvent> event_;
+-  uint64_t last_signaled_ = 0;
++  std::shared_ptr<owned_graphics::FenceOrderEpoch> order_;
++  owned_graphics::FenceSignalSchedule schedule_;
++  mutable std::mutex schedule_mutex_;
++  uint64_t generation_ = 0;
+   std::atomic<uint32_t> refcount_ = {0u};
+ };
+ 
+diff --git a/src/dxmt/dxmt_queue_order.hpp b/src/dxmt/dxmt_queue_order.hpp
+new file mode 100644
+index 0000000..b5ccdec
+--- /dev/null
++++ b/src/dxmt/dxmt_queue_order.hpp
+@@ -0,0 +1,126 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Owned D3D12 queue ordering: CPU-side producer-commit visibility per fence generation.
++#pragma once
++
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <mutex>
++
++namespace owned_graphics {
++
++class FenceSignalSchedule {
++public:
++  enum class Result {
++    Accepted,
++    DecreasingUnsupported,
++    MixedProducerUnsupported,
++  };
++
++  struct State {
++    uint64_t last_scheduled = 0;
++    uint64_t queue_producer = 0;
++    bool cpu_producer = false;
++  };
++
++private:
++  uint64_t last_scheduled_ = 0;
++  uint64_t queue_producer_ = 0;
++  bool cpu_producer_ = false;
++
++public:
++  Result initialize(uint64_t value) {
++    if (value < last_scheduled_)
++      return Result::DecreasingUnsupported;
++    last_scheduled_ = value;
++    return Result::Accepted;
++  }
++
++  Result scheduleQueue(uint64_t queue, uint64_t value, bool previous_settled) {
++    if (value < last_scheduled_)
++      return Result::DecreasingUnsupported;
++    if (cpu_producer_ || (queue_producer_ && queue_producer_ != queue)) {
++      if (!previous_settled)
++        return Result::MixedProducerUnsupported;
++      cpu_producer_ = false;
++    }
++    queue_producer_ = queue;
++    last_scheduled_ = value;
++    return Result::Accepted;
++  }
++
++  Result scheduleCpu(uint64_t value, bool previous_settled) {
++    if (value < last_scheduled_)
++      return Result::DecreasingUnsupported;
++    if (queue_producer_) {
++      if (!previous_settled)
++        return Result::MixedProducerUnsupported;
++      queue_producer_ = 0;
++    }
++    cpu_producer_ = true;
++    last_scheduled_ = value;
++    return Result::Accepted;
++  }
++
++  void reset() {
++    last_scheduled_ = 0;
++    queue_producer_ = 0;
++    cpu_producer_ = false;
++  }
++
++  uint64_t lastScheduled() const {
++    return last_scheduled_;
++  }
++
++  State state() const {
++    return State{last_scheduled_, queue_producer_, cpu_producer_};
++  }
++
++  void restore(State state) {
++    last_scheduled_ = state.last_scheduled;
++    queue_producer_ = state.queue_producer;
++    cpu_producer_ = state.cpu_producer;
++  }
++};
++
++class FenceOrderEpoch {
++  mutable std::mutex mutex_;
++  std::condition_variable cv_;
++  uint64_t committed_value_ = 0;
++  const uint64_t generation_;
++
++public:
++  explicit FenceOrderEpoch(uint64_t generation) : generation_(generation) {}
++
++  uint64_t generation() const {
++    return generation_;
++  }
++
++  uint64_t committedValue() const {
++    std::lock_guard lock(mutex_);
++    return committed_value_;
++  }
++
++  bool ready(uint64_t value) const {
++    std::lock_guard lock(mutex_);
++    return committed_value_ >= value;
++  }
++
++  void markCommitted(uint64_t value) {
++    {
++      std::lock_guard lock(mutex_);
++      if (value <= committed_value_)
++        return;
++      committed_value_ = value;
++    }
++    cv_.notify_all();
++  }
++
++  template <typename Rep, typename Period>
++  bool waitFor(uint64_t value, const std::chrono::duration<Rep, Period> &timeout) {
++    std::unique_lock lock(mutex_);
++    return cv_.wait_for(lock, timeout, [&] { return committed_value_ >= value; });
++  }
++};
++
++} // namespace owned_graphics

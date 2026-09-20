@@ -1,0 +1,1126 @@
+diff --git a/src/d3d12/d3d12_command_allocator.hpp b/src/d3d12/d3d12_command_allocator.hpp
+index d6d0c31..79e7064 100644
+--- a/src/d3d12/d3d12_command_allocator.hpp
++++ b/src/d3d12/d3d12_command_allocator.hpp
+@@ -73,6 +73,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
+   friend struct SimpleCommandContext<MTLD3D12CommandAllocatorImpl>;
+ 
+   D3D12_COMMAND_LIST_TYPE type_;
++  std::shared_ptr<std::atomic<uint64_t>> recording_generation_ = std::make_shared<std::atomic<uint64_t>>(0);
+ 
+   std::vector<void *> spilled_cpu_heap_;
+   void *cpu_heap_ = nullptr;
+diff --git a/src/d3d12/d3d12_command_allocator.cpp b/src/d3d12/d3d12_command_allocator.cpp
+index 18b966e..671326d 100644
+--- a/src/d3d12/d3d12_command_allocator.cpp
++++ b/src/d3d12/d3d12_command_allocator.cpp
+@@ -132,6 +132,7 @@ MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
+ 
+ void
+ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
++  recording_generation_->fetch_add(1, std::memory_order_release);
+   for (auto &encoder_list : encoder_lists_) {
+     EncoderData *next = encoder_list.next;
+     while (next) {
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index bf61525..cb035bc 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -31,6 +31,7 @@
+ #include "dxmt_texture.hpp"
+ #include "log/log.hpp"
+ #include "owned_trace.hpp"
++#include "owned_bundle_recording.hpp"
+ #include <mutex>
+ 
+ #define IMPLEMENT_ME                                                                                                   \
+@@ -52,6 +53,8 @@ public:
+   ID3D12CommandAllocator *owned_allocator = nullptr;
+   EncoderData *entry;
+   size_t encoder_count;
++  bool owned_closed_valid = true;
++  std::vector<owned_graphics::BundleReference> owned_bundle_references;
+ };
+ 
+ class MTLD3D12CommandAllocator : public ID3D12CommandAllocator {
+@@ -159,6 +162,10 @@ public:
+   float scole_scale;
+   float depth_bias_clamp;
+   uint32_t forced_sample_count;
++  std::array<DXGI_FORMAT, 8> owned_rtv_formats{};
++  UINT owned_rt_count = 0;
++  DXGI_FORMAT owned_dsv_format = DXGI_FORMAT_UNKNOWN;
++  DXGI_SAMPLE_DESC owned_sample_desc{};
+ 
+   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
+ 
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 59be662..d61361f 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -343,7 +343,9 @@ public:
+       out->BarycentricsSupported = FALSE;
+       out->CopyQueueTimestampQueriesSupported = FALSE;
+       out->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+-      out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE;
++      out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAGS(
++          D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |
++          D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY | D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE);
+       return S_OK;
+     }
+     case D3D12_FEATURE_D3D12_OPTIONS1: {
+@@ -1397,6 +1399,10 @@ public:
+     }
+     --iter;
+     *pOffset = VA - iter->first;
++    if (*pOffset >= iter->second->byteLength()) {
++      *pOffset = 0;
++      return {};
++    }
+     return iter->second;
+   }
+ 
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 67b51de..23d4b08 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -21,6 +21,9 @@
+ #include "d3d12_temporal.hpp"
+ #include "com/com_pointer.hpp"
+ #include "dxmt_format.hpp"
++#include <functional>
++#include <new>
++#include <vector>
+ 
+ namespace dxmt {
+ 
+@@ -216,6 +219,117 @@ class MTLD3D12GraphicsCommandListImpl
+   Com<MTLD3D12CommandAllocatorImpl, false> allocator_;
+   const D3D12_COMMAND_LIST_TYPE type_;
+ 
++  // Bundle calls are expanded through the parent's ordinary command recorder.
++  // This resolves inherited state at each ExecuteBundle and stores the resulting
++  // Metal commands in the parent's allocator, independently of bundle Reset.
++  using BundleCommand = std::function<void(MTLD3D12GraphicsCommandListImpl &)>;
++  std::vector<BundleCommand> bundle_commands_;
++  ID3D12PipelineState *bundle_initial_pso_ = nullptr;
++  uint64_t bundle_allocator_generation_ = 0;
++  std::array<ID3D12DescriptorHeap *, 2> descriptor_heaps_ = {};
++  bool bundle_heaps_set_ = false;
++  bool bundle_pipeline_seen_ = false;
++  std::array<DXGI_FORMAT, 8> bundle_rtv_formats_{};
++  UINT bundle_rt_count_ = 0;
++  DXGI_FORMAT bundle_dsv_format_ = DXGI_FORMAT_UNKNOWN;
++  DXGI_SAMPLE_DESC bundle_samples_{};
++  std::shared_ptr<owned_graphics::BundleRecordingState> bundle_recording_ =
++      std::make_shared<owned_graphics::BundleRecordingState>();
++  HRESULT recording_error_ = S_OK;
++  HRESULT close_error_ = S_OK;
++
++  bool IsRecording() const {
++    return allocator_ && encoder_count == std::numeric_limits<size_t>::max();
++  }
++
++  bool ObserveBundlePipeline(ID3D12PipelineState *pipeline) {
++    if (!pipeline || type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE)
++      return true;
++    Com<ID3D12Device> pipeline_device;
++    if (FAILED(pipeline->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&pipeline_device))) ||
++        pipeline_device.ptr() != static_cast<ID3D12Device *>(device_)) {
++      RecordError();
++      return false;
++    }
++    if (static_cast<MTLD3D12PipelineState *>(pipeline)->IsComputePipelineState)
++      return true;
++    const auto *graphics = static_cast<MTLD3D12GraphicsPipelineState *>(pipeline);
++    if (!bundle_pipeline_seen_) {
++      bundle_rtv_formats_ = graphics->owned_rtv_formats;
++      bundle_rt_count_ = graphics->owned_rt_count;
++      bundle_dsv_format_ = graphics->owned_dsv_format;
++      bundle_samples_ = graphics->owned_sample_desc;
++      bundle_pipeline_seen_ = true;
++      return true;
++    }
++    if (bundle_rtv_formats_ != graphics->owned_rtv_formats || bundle_rt_count_ != graphics->owned_rt_count ||
++        bundle_dsv_format_ != graphics->owned_dsv_format || bundle_samples_.Count != graphics->owned_sample_desc.Count ||
++        bundle_samples_.Quality != graphics->owned_sample_desc.Quality) {
++      RecordError();
++      return false;
++    }
++    return true;
++  }
++
++  void RecordError(HRESULT hr = E_INVALIDARG) {
++    if (SUCCEEDED(recording_error_))
++      recording_error_ = hr;
++  }
++
++  template <typename F>
++  void AppendBundleCommand(F &&command) {
++    if (!IsRecording()) {
++      RecordError(E_FAIL);
++      return;
++    }
++    if (FAILED(recording_error_))
++      return;
++    try {
++      bundle_commands_.emplace_back(std::forward<F>(command));
++    } catch (const std::bad_alloc &) {
++      RecordError(E_OUTOFMEMORY);
++    }
++  }
++
++  template <typename Method, typename... Args>
++  bool RecordBundle(Method method, Args... args) {
++    if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE)
++      return false;
++    AppendBundleCommand([method, args...](auto &parent) { (parent.*method)(args...); });
++    return true;
++  }
++
++  bool RejectBundleOperation() {
++    if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE)
++      return false;
++    RecordError();
++    return true;
++  }
++
++  bool RecordBundleConstants(bool graphics, UINT index, UINT count, const void *data, UINT offset) {
++    if (type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE)
++      return false;
++    if (count > 64 || offset > 64 - count || (count && !data)) {
++      RecordError();
++      return true;
++    }
++    if (!count)
++      return true;
++    try {
++      const auto *words = static_cast<const UINT *>(data);
++      std::vector<UINT> values(words, words + count);
++      AppendBundleCommand([graphics, index, offset, values = std::move(values)](auto &parent) {
++        if (graphics)
++          parent.SetGraphicsRoot32BitConstants(index, values.size(), values.data(), offset);
++        else
++          parent.SetComputeRoot32BitConstants(index, values.size(), values.data(), offset);
++      });
++    } catch (const std::bad_alloc &) {
++      RecordError(E_OUTOFMEMORY);
++    }
++    return true;
++  }
++
+   /* state */
+ 
+   Flags<DirtyState> dirty_state_;
+@@ -260,7 +374,11 @@ public:
+     encoder_count = 0;
+   }
+ 
+-  ~MTLD3D12GraphicsCommandListImpl() {}
++  ~MTLD3D12GraphicsCommandListImpl() {
++    // Releasing an unfinished list must release its allocator's recording slot.
++    if (IsRecording())
++      allocator_->EndRecord(&encoder_count);
++  }
+ 
+   void
+   ResetState(ID3D12PipelineState *pInitialPipelineState) {
+@@ -305,6 +423,7 @@ public:
+     index_offset = 0;
+ 
+     dirty_state_.clrAll();
++    descriptor_heaps_ = {};
+   }
+ 
+   HRESULT
+@@ -329,24 +448,37 @@ public:
+         return E_INVALIDARG;
+     }
+ 
+-    if (allocator_ != allocator)
+-      allocator_ = allocator;
+-    owned_allocator = allocator;
+-
+-    ResetState(pInitialPipelineState);
++    // Claim the new allocator before touching the old closed recording. In
++    // particular, a busy-allocator Reset must not discard executable commands
++    // or drop references to bundles still pending in that recording.
++    EncoderData *new_entry = nullptr;
++    HRESULT hr;
++    try {
++      hr = allocator->StartRecord(&new_entry);
++    } catch (const std::bad_alloc &) {
++      return E_OUTOFMEMORY;
++    }
++    if (FAILED(hr))
++      return hr;
+ 
++    allocator_ = allocator;
++    owned_allocator = allocator;
++    entry = new_entry;
+     encoder_count = std::numeric_limits<size_t>::max();
+-    auto hr = allocator_->StartRecord(&entry);
+-    if (SUCCEEDED(hr)) {
+-      ++owned_recording;
+-      owned_graphics::Trace("record_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording);
+-    } else {
+-      entry = nullptr;
+-      owned_allocator = nullptr;
+-      allocator_ = nullptr;
+-      encoder_count = 0;
+-    }
+-    return hr;
++    ResetState(pInitialPipelineState);
++    bundle_commands_.clear();
++    bundle_initial_pso_ = pInitialPipelineState;
++    bundle_allocator_generation_ = allocator_->recording_generation_->load(std::memory_order_acquire);
++    bundle_heaps_set_ = false;
++    bundle_pipeline_seen_ = false;
++    recording_error_ = S_OK;
++    close_error_ = S_OK;
++    ObserveBundlePipeline(pInitialPipelineState);
++    owned_closed_valid = false;
++    owned_bundle_references.clear();
++    ++owned_recording;
++    owned_graphics::Trace("record_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording);
++    return S_OK;
+   }
+ 
+   HRESULT
+@@ -411,6 +543,10 @@ public:
+     if (encoder_count < std::numeric_limits<size_t>::max())
+       return E_FAIL;
+     auto hr = allocator_->EndRecord(&encoder_count);
++    if (SUCCEEDED(hr) && FAILED(recording_error_))
++      hr = recording_error_;
++    close_error_ = hr;
++    owned_closed_valid = SUCCEEDED(hr);
+     if (SUCCEEDED(hr))
+       owned_graphics::Trace("record_close", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                             ",\"encoders\":", encoder_count);
+@@ -419,6 +555,10 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   Reset(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialState) {
++    if (bundle_recording_->unsubmitted.load(std::memory_order_acquire))
++      return E_FAIL;
++    if (FAILED(close_error_))
++      return close_error_;
+     if (encoder_count == std::numeric_limits<size_t>::max())
+       return E_FAIL;
+     return Initialize(pAllocator, pInitialState);
+@@ -426,6 +566,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   ClearState(ID3D12PipelineState *pPipelineState) {
++    if (RejectBundleOperation())
++      return;
+     allocator_->InvalidateCurrentPass();
+     ResetState(pPipelineState);
+   };
+@@ -462,6 +604,8 @@ public:
+ 
+   DrawCallStatus
+   PreDraw(bool SkipResourceBinding = false) {
++    if (!pso_graphics_)
++      return DrawCallStatus::Invalid;
+     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render) {
+ 
+       allocator_->InvalidateCurrentPass();
+@@ -664,6 +808,9 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::DrawInstanced, VertexCountPerInstance,
++                     InstanceCount, StartVertexLocation, StartInstanceLocation))
++      return;
+     WMTPrimitiveType primitive_type;
+     uint32_t cp_count;
+     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
+@@ -689,6 +836,9 @@ public:
+       UINT IndexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, INT BaseVertexLocation,
+       UINT StartInstanceLocation
+   ) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::DrawIndexedInstanced, IndexCountPerInstance,
++                     InstanceCount, StartVertexLocation, BaseVertexLocation, StartInstanceLocation))
++      return;
+     WMTPrimitiveType primitive_type;
+     uint32_t cp_count;
+     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
+@@ -783,6 +933,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   Dispatch(UINT X, UINT Y, UINT Z) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::Dispatch, X, Y, Z))
++      return;
+     if (!PreDispatch())
+       return;
+ 
+@@ -811,6 +963,8 @@ public:
+   CopyBufferRegion(
+       ID3D12Resource *pDstBuffer, UINT64 DstOffset, ID3D12Resource *pSrcBuffer, UINT64 SrcOffset, UINT64 ByteCount
+   ) {
++    if (RejectBundleOperation())
++      return;
+     if (!pDstBuffer || !pSrcBuffer)
+       return;
+     const auto dst_desc = pDstBuffer->GetDesc();
+@@ -844,6 +998,8 @@ public:
+       const D3D12_TEXTURE_COPY_LOCATION *pDst, UINT DstX, UINT DstY, UINT DstZ, const D3D12_TEXTURE_COPY_LOCATION *pSrc,
+       const D3D12_BOX *pSrcBox
+   ) {
++    if (RejectBundleOperation())
++      return;
+     if (!pDst || !pSrc || !pDst->pResource || !pSrc->pResource)
+       return;
+     if ((pDst->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+@@ -1121,6 +1277,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   CopyResource(ID3D12Resource *pDstResource, ID3D12Resource *pSrcResource) {
++    if (RejectBundleOperation())
++      return;
+     auto *pDst = static_cast<MTLD3D12Resource *>(pDstResource);
+     auto *pSrc = static_cast<MTLD3D12Resource *>(pSrcResource);
+     if (!pDst || !pSrc || (pDst == pSrc))
+@@ -1175,6 +1333,8 @@ public:
+       const D3D12_TILE_REGION_SIZE *tile_region_size, ID3D12Resource *buffer, UINT64 buffer_offset,
+       D3D12_TILE_COPY_FLAGS flags
+   ) {
++    if (RejectBundleOperation())
++      return;
+     IMPLEMENT_ME
+   };
+ 
+@@ -1182,6 +1342,8 @@ public:
+       ID3D12Resource *pDstResource, UINT DstSubresource, ID3D12Resource *pSrcResource, UINT SrcSubresource,
+       DXGI_FORMAT Format
+   ) {
++    if (RejectBundleOperation())
++      return;
+     auto *pDst = static_cast<MTLD3D12Resource *>(pDstResource);
+     auto *pSrc = static_cast<MTLD3D12Resource *>(pSrcResource);
+ 
+@@ -1232,11 +1394,15 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY Topology) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::IASetPrimitiveTopology, Topology))
++      return;
+     topology_ = Topology;
+   };
+ 
+   void STDMETHODCALLTYPE
+   RSSetViewports(UINT NumViewports, const D3D12_VIEWPORT *pViewports) {
++    if (RejectBundleOperation())
++      return;
+     if (NumViewports > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+       return;
+     num_viewports = NumViewports;
+@@ -1248,6 +1414,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   RSSetScissorRects(UINT NumRects, const D3D12_RECT *rects) {
++    if (RejectBundleOperation())
++      return;
+     if (NumRects > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+       return;
+     num_scissors = NumRects;
+@@ -1259,6 +1427,13 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   OMSetBlendFactor(const FLOAT BlendFactors[4]) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      std::array<FLOAT, 4> values = {1.0f, 1.0f, 1.0f, 1.0f};
++      if (BlendFactors)
++        std::copy_n(BlendFactors, values.size(), values.begin());
++      AppendBundleCommand([values](auto &parent) { parent.OMSetBlendFactor(values.data()); });
++      return;
++    }
+     if (BlendFactors) {
+       memcpy(blend_factor_, BlendFactors, std::size(blend_factor_) * sizeof(blend_factor_[0]));
+     } else {
+@@ -1272,6 +1447,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   OMSetStencilRef(UINT StencilRef) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::OMSetStencilRef, StencilRef))
++      return;
+     if (stencil_ref_ == (UINT8)StencilRef)
+       return;
+     stencil_ref_ = (UINT8)StencilRef;
+@@ -1280,6 +1457,10 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetPipelineState(ID3D12PipelineState *pPSO) {
++    if (!ObserveBundlePipeline(pPSO))
++      return;
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetPipelineState, pPSO))
++      return;
+     if (!pPSO) {
+       pso_graphics_ = nullptr;
+       pso_compute_ = nullptr;
+@@ -1307,6 +1488,8 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
++    if (RejectBundleOperation())
++      return;
+     if (!Count)
+       return;
+     if (!barriers) {
+@@ -1345,14 +1528,91 @@ public:
+     allocator_->InvalidateCurrentPass();
+   };
+ 
+-  void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) { IMPLEMENT_ME };
++  void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) {
++    if (!IsRecording() || type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || !CommandList ||
++        CommandList->GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      RecordError();
++      return;
++    }
++    Com<ID3D12Device> bundle_device;
++    if (FAILED(CommandList->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&bundle_device))) ||
++        bundle_device.ptr() != static_cast<ID3D12Device *>(device_)) {
++      RecordError();
++      return;
++    }
++    auto bundle = static_cast<MTLD3D12GraphicsCommandListImpl *>(CommandList);
++    if (bundle->IsRecording() || FAILED(bundle->close_error_) || FAILED(bundle->recording_error_) ||
++        !bundle->allocator_ ||
++        bundle->bundle_allocator_generation_ != bundle->allocator_->recording_generation_->load(std::memory_order_acquire) ||
++        (bundle->bundle_heaps_set_ && bundle->descriptor_heaps_ != descriptor_heaps_)) {
++      RecordError();
++      return;
++    }
++
++    try {
++      owned_bundle_references.emplace_back(bundle->bundle_recording_, bundle->allocator_->recording_generation_,
++                                           bundle->bundle_allocator_generation_);
++    } catch (const std::bad_alloc &) {
++      RecordError(E_OUTOFMEMORY);
++      return;
++    }
++
++    // DX12 bundles inherit every other state, and their state changes persist
++    // in the caller. In particular, do not restore the parent's old state here.
++    SetPipelineState(bundle->bundle_initial_pso_);
++    IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_UNDEFINED);
++    for (const auto &command : bundle->bundle_commands_) {
++      command(*this);
++      if (FAILED(recording_error_))
++        break;
++    }
++    owned_graphics::Trace("execute_bundle", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
++                          ",\"bundle\":", bundle->owned_id, ",\"bundle_recording\":", bundle->owned_recording,
++                          ",\"commands\":", bundle->bundle_commands_.size());
++  };
+ 
+   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT HeapCount, ID3D12DescriptorHeap *const *Heaps) {
+-    // no need to do anything here because because we encode the full descriptor table address in root argument
++    if (!IsRecording() || HeapCount > descriptor_heaps_.size() || (HeapCount && !Heaps)) {
++      RecordError();
++      return;
++    }
++    std::array<ID3D12DescriptorHeap *, 2> heaps = {};
++    for (UINT i = 0; i < HeapCount; ++i) {
++      if (!Heaps[i]) {
++        RecordError();
++        return;
++      }
++      auto desc = Heaps[i]->GetDesc();
++      if ((desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
++           desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) ||
++          !(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || heaps[desc.Type]) {
++        RecordError();
++        return;
++      }
++      Com<ID3D12Device> heap_device;
++      if (FAILED(Heaps[i]->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&heap_device))) ||
++          heap_device.ptr() != static_cast<ID3D12Device *>(device_)) {
++        RecordError();
++        return;
++      }
++      heaps[desc.Type] = Heaps[i];
++    }
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      if (bundle_heaps_set_ && heaps != descriptor_heaps_) {
++        RecordError();
++        return;
++      }
++      bundle_heaps_set_ = true;
++    }
++    // Root tables contain complete GPU addresses. Keep the binding identities
++    // for the ExecuteBundle contract even though Metal needs no separate bind.
++    descriptor_heaps_ = heaps;
+   };
+ 
+   void STDMETHODCALLTYPE
+   SetComputeRootSignature(ID3D12RootSignature *pRootSignature) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootSignature, pRootSignature))
++      return;
+     if (rootsig_compute_.ptr() == pRootSignature)
+       return;
+     if (pRootSignature) {
+@@ -1366,6 +1626,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootSignature(ID3D12RootSignature *pRootSignature) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootSignature, pRootSignature))
++      return;
+     if (rootsig_graphics_.ptr() == pRootSignature)
+       return;
+     if (pRootSignature) {
+@@ -1378,6 +1640,12 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT Index, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE && !descriptor_heaps_[0] && !descriptor_heaps_[1]) {
++      RecordError();
++      return;
++    }
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootDescriptorTable, Index, BaseDescriptor))
++      return;
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1388,6 +1656,12 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootDescriptorTable(UINT Index, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE && !descriptor_heaps_[0] && !descriptor_heaps_[1]) {
++      RecordError();
++      return;
++    }
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootDescriptorTable, Index, BaseDescriptor))
++      return;
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1397,6 +1671,8 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT Index, UINT Data, UINT DstOffset) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRoot32BitConstant, Index, Data, DstOffset))
++      return;
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1408,6 +1684,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRoot32BitConstant(UINT Index, UINT Data, UINT DstOffset) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRoot32BitConstant, Index, Data, DstOffset))
++      return;
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1419,6 +1697,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetComputeRoot32BitConstants(UINT Index, UINT ConstantCount, const void *pData, UINT DstOffset) {
++    if (RecordBundleConstants(false, Index, ConstantCount, pData, DstOffset))
++      return;
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1433,6 +1713,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRoot32BitConstants(UINT Index, UINT ConstantCount, const void *pData, UINT DstOffset) {
++    if (RecordBundleConstants(true, Index, ConstantCount, pData, DstOffset))
++      return;
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1446,6 +1728,8 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootConstantBufferView, Index, VA))
++      return;
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1456,6 +1740,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootConstantBufferView, Index, VA))
++      return;
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1465,6 +1751,8 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootShaderResourceView, Index, VA))
++      return;
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1475,6 +1763,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootShaderResourceView, Index, VA))
++      return;
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1484,6 +1774,8 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootUnorderedAccessView, Index, VA))
++      return;
+     if (!rootsig_compute_)
+       return;
+     if (Index > rootsig_compute_->ParameterSlots)
+@@ -1494,6 +1786,8 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   SetGraphicsRootUnorderedAccessView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootUnorderedAccessView, Index, VA))
++      return;
+     if (!rootsig_graphics_)
+       return;
+     if (Index > rootsig_graphics_->ParameterSlots)
+@@ -1504,6 +1798,13 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW *pView) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      D3D12_INDEX_BUFFER_VIEW view = pView ? *pView : D3D12_INDEX_BUFFER_VIEW{};
++      AppendBundleCommand([view, present = pView != nullptr](auto &parent) {
++        parent.IASetIndexBuffer(present ? &view : nullptr);
++      });
++      return;
++    }
+     auto index_buffer_allocation = pView ? device_->LookupBufferByVA(pView->BufferLocation, &index_offset) : nullptr;
+     if (index_buffer_allocation) {
+       index_buffer_address = pView->BufferLocation;
+@@ -1519,16 +1820,28 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   IASetVertexBuffers(UINT StartSlot, UINT Count, const D3D12_VERTEX_BUFFER_VIEW *Views) {
+-    if (!Views)
++    if (StartSlot > vertex_buffers_.size() || Count > vertex_buffers_.size() - StartSlot) {
++      RecordError();
++      return;
++    }
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      std::array<D3D12_VERTEX_BUFFER_VIEW, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> views = {};
++      if (Views)
++        std::copy_n(Views, Count, views.begin());
++      AppendBundleCommand([StartSlot, Count, views](auto &parent) {
++        parent.IASetVertexBuffers(StartSlot, Count, views.data());
++      });
+       return;
+-    
++    }
+     for (unsigned Slot = StartSlot; Slot < StartSlot + Count; Slot++) {
+-      vertex_buffers_[Slot] = Views[Slot - StartSlot];
++      vertex_buffers_[Slot] = Views ? Views[Slot - StartSlot] : D3D12_VERTEX_BUFFER_VIEW{};
+     }
+     dirty_state_.set(DirtyState::VertexBuffer);
+   };
+ 
+   void STDMETHODCALLTYPE SOSetTargets(UINT StartSlot, UINT Count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *Views) {
++    if (RejectBundleOperation())
++      return;
+     IMPLEMENT_ME
+   };
+ 
+@@ -1537,6 +1850,8 @@ public:
+       UINT NumRTV, const D3D12_CPU_DESCRIPTOR_HANDLE *RTVs, WINBOOL SingleDescriptor,
+       const D3D12_CPU_DESCRIPTOR_HANDLE *DSV
+   ) {
++    if (RejectBundleOperation())
++      return;
+     allocator_->InvalidateCurrentPass();
+ 
+     num_rtvs = NumRTV;
+@@ -1553,6 +1868,8 @@ public:
+       D3D12_CPU_DESCRIPTOR_HANDLE DSV, D3D12_CLEAR_FLAGS Flags, FLOAT Depth, UINT8 Stencil, UINT RectCount,
+       const D3D12_RECT *Rects
+   ) {
++    if (RejectBundleOperation())
++      return;
+     auto [Heap, Index] = GetRenderTargetHeap(device_, DSV);
+     auto AttachmentDesc = Heap->GetRenderTarget(Index);
+     if (!AttachmentDesc.Texture)
+@@ -1593,6 +1910,8 @@ public:
+   ClearRenderTargetView(
+       D3D12_CPU_DESCRIPTOR_HANDLE RTV, const FLOAT Color[4], UINT RectCount, const D3D12_RECT *Rects
+   ) {
++    if (RejectBundleOperation())
++      return;
+     auto [Heap, Index] = GetRenderTargetHeap(device_, RTV);
+     auto AttachmentDesc = Heap->GetRenderTarget(Index);
+     if (!AttachmentDesc.Texture)
+@@ -1635,6 +1954,8 @@ public:
+       D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle, D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle, ID3D12Resource *pResource,
+       const UINT Values[4], UINT RectCount, const D3D12_RECT *pRects
+   ) {
++    if (RejectBundleOperation())
++      return;
+     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, CpuHandle);
+     auto &Descriptor = Heap->GetDescriptor(Index);
+     auto color = std::array<uint32_t, 4>({Values[0], Values[1], Values[2], Values[3]});
+@@ -1689,6 +2010,8 @@ public:
+       D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle, D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle, ID3D12Resource *pResource,
+       const float Values[4], UINT RectCount, const D3D12_RECT *pRects
+   ) {
++    if (RejectBundleOperation())
++      return;
+     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, CpuHandle);
+     auto &Descriptor = Heap->GetDescriptor(Index);
+     auto color = std::array<float, 4>({Values[0], Values[1], Values[2], Values[3]});
+@@ -1739,16 +2062,22 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *pResource, const D3D12_DISCARD_REGION *pRegion) {
++    if (RejectBundleOperation())
++      return;
+     // do nothing for now
+   };
+ 
+   void STDMETHODCALLTYPE
+   BeginQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
++    if (RejectBundleOperation())
++      return;
+     DEBUG("BeginQuery");
+   };
+ 
+   void STDMETHODCALLTYPE
+   EndQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
++    if (RejectBundleOperation())
++      return;
+     DEBUG("EndQuery");
+   };
+ 
+@@ -1757,24 +2086,35 @@ public:
+       ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT StartIndex, UINT QueryCount, ID3D12Resource *pDstBuffer,
+       UINT64 AlignedDstBufferOffset
+   ) {
++    if (RejectBundleOperation())
++      return;
+     DEBUG("ResolveQueryData");
+   };
+ 
+   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *pBuffer, UINT64 AlignedBufferOffset, D3D12_PREDICATION_OP Op) {
++    if (RejectBundleOperation())
++      return;
+     IMPLEMENT_ME
+   };
+ 
+   void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) {
++    // The existing diagnostic records metadata and length, not marker payloads.
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetMarker, Metadata, static_cast<const void *>(nullptr), size))
++      return;
+     owned_graphics::Trace("marker", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                           ",\"metadata\":", Metadata, ",\"bytes\":", size);
+   };
+ 
+   void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::BeginEvent, Metadata, static_cast<const void *>(nullptr), size))
++      return;
+     owned_graphics::Trace("event_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                           ",\"metadata\":", Metadata, ",\"bytes\":", size);
+   };
+ 
+   void STDMETHODCALLTYPE EndEvent() {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::EndEvent))
++      return;
+     owned_graphics::Trace("event_end", ",\"list\":", owned_id, ",\"recording\":", owned_recording);
+   };
+ 
+@@ -1783,6 +2123,19 @@ public:
+       UINT64 ArgBufferOffset, ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset
+   ) {
+     auto sig = static_cast<MTLD3D12CommandSignature *>(pCommandSignature);
++    if (!sig) {
++      RecordError();
++      return;
++    }
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      if (pCountBuffer || sig->UpdateRootArguments || sig->UpdateVertexBuffers || sig->UpdateIndexBuffer) {
++        RecordError();
++        return;
++      }
++      RecordBundle(&MTLD3D12GraphicsCommandListImpl::ExecuteIndirect, pCommandSignature, MaxCommandCount,
++                   pArgBuffer, ArgBufferOffset, pCountBuffer, CountBufferOffset);
++      return;
++    }
+     auto arg_buffer = static_cast<MTLD3D12Resource *>(pArgBuffer);
+     if (!arg_buffer || !arg_buffer->buffer)
+       return;
+@@ -1846,6 +2199,8 @@ public:
+       ID3D12Resource *pDstBuffer, UINT64 DstOffset, ID3D12Resource *pSrcBuffer, UINT64 SrcOffset, UINT Dependencies,
+       ID3D12Resource *const *ppDependentResources, const D3D12_SUBRESOURCE_RANGE_UINT64 *pDependentSubresourceRanges
+   ) {
++    if (RejectBundleOperation())
++      return;
+     IMPLEMENT_ME
+   }
+ 
+@@ -1854,16 +2209,24 @@ public:
+       ID3D12Resource *pDstBuffer, UINT64 DstOffset, ID3D12Resource *pSrcBuffer, UINT64 SrcOffset, UINT Dependencies,
+       ID3D12Resource *const *ppDependentResources, const D3D12_SUBRESOURCE_RANGE_UINT64 *pDependentSubresourceRanges
+   ) {
++    if (RejectBundleOperation())
++      return;
+     IMPLEMENT_ME
+   }
+ 
+   void STDMETHODCALLTYPE
+   OMSetDepthBounds(FLOAT Min, FLOAT Max) {
++    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::OMSetDepthBounds, Min, Max))
++      return;
+     WARN("OMSetDepthBounds: ignoring (", Min, ", ", Max, ")");
+   }
+ 
+   void STDMETHODCALLTYPE
+   SetSamplePositions(UINT NumSamplesPerPixel, UINT NumPixels, D3D12_SAMPLE_POSITION *pSamplePositions) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      RecordError(E_NOTIMPL);
++      return;
++    }
+     IMPLEMENT_ME
+   }
+ 
+@@ -1872,11 +2235,17 @@ public:
+       ID3D12Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, ID3D12Resource *pSrcResource,
+       UINT SrcSubresource, D3D12_RECT *pSrcRect, DXGI_FORMAT Format, D3D12_RESOLVE_MODE ResolveMode
+   ) {
++    if (RejectBundleOperation())
++      return;
+     IMPLEMENT_ME
+   }
+ 
+   void STDMETHODCALLTYPE
+   SetViewInstanceMask(UINT Mask) {
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      RecordError(E_NOTIMPL);
++      return;
++    }
+     IMPLEMENT_ME
+   }
+ 
+@@ -1884,7 +2253,60 @@ public:
+   WriteBufferImmediate(
+       UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *pParams, const D3D12_WRITEBUFFERIMMEDIATE_MODE *pModes
+   ) {
+-    IMPLEMENT_ME
++    if (!IsRecording() || (Count && !pParams)) {
++      RecordError();
++      return;
++    }
++    if (!Count)
++      return;
++    for (UINT i = 0; i < Count; ++i) {
++      const auto mode = pModes ? pModes[i] : D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT;
++      uint64_t offset = 0;
++      auto allocation = device_->LookupBufferByVA(pParams[i].Dest, &offset);
++      if ((mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT &&
++           mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN &&
++           mode != D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT) ||
++          (pParams[i].Dest & 3) || !allocation || allocation->byteLength() < 4 ||
++          offset > allocation->byteLength() - 4) {
++        RecordError();
++        return;
++      }
++    }
++    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
++      try {
++        std::vector<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> parameters(pParams, pParams + Count);
++        std::vector<D3D12_WRITEBUFFERIMMEDIATE_MODE> modes(Count, D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT);
++        if (pModes)
++          std::copy_n(pModes, Count, modes.begin());
++        AppendBundleCommand([parameters = std::move(parameters), modes = std::move(modes)](auto &parent) {
++          parent.WriteBufferImmediate(parameters.size(), parameters.data(), modes.data());
++        });
++      } catch (const std::bad_alloc &) {
++        RecordError(E_OUTOFMEMORY);
++      }
++      return;
++    }
++
++    // A pass boundary on each side gives all three modes their required ordering.
++    // The marker modes are deliberately stronger than their minimum guarantee.
++    // Values live in immutable allocator storage until GPU completion; never
++    // perform these GPU writes by modifying the destination on the CPU.
++    allocator_->InvalidateCurrentPass();
++    PreBlit();
++    for (UINT i = 0; i < Count; ++i) {
++      uint64_t destination_offset = 0;
++      auto allocation = device_->LookupBufferByVA(pParams[i].Dest, &destination_offset);
++      auto [memory, source_offset] = allocator_->AllocateGPUHeap(sizeof(UINT), alignof(UINT));
++      memcpy(memory, &pParams[i].Value, sizeof(UINT));
++      auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
++      cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
++      cmd.src = allocator_->gpu_heap_buffer_;
++      cmd.src_offset = source_offset;
++      cmd.dst = allocation->buffer();
++      cmd.dst_offset = destination_offset;
++      cmd.copy_length = sizeof(UINT);
++    }
++    allocator_->InvalidateCurrentPass();
+   }
+ };
+ 
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 996c32c..40a4547 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -470,16 +470,27 @@ public:
+ 
+   void STDMETHODCALLTYPE
+   ExecuteCommandLists(UINT Count, ID3D12CommandList *const *ppCommandLists) {
++    if (Count && !ppCommandLists) {
++      ERR("ExecuteCommandLists: null command list array");
++      return;
++    }
+     try {
+       std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
+       ExecuteTask task;
+       task.lists.reserve(Count);
+       for (unsigned i = 0; i < Count; i++) {
+         auto list = static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i]);
+-        if (!list || !list->owned_allocator) {
++        if (!list || !list->owned_allocator || !list->owned_closed_valid ||
++            list->encoder_count == std::numeric_limits<size_t>::max() || list->GetType() != desc_.Type) {
+           ERR("ExecuteCommandLists: invalid command list or allocator");
+           return;
+         }
++        for (const auto &bundle : list->owned_bundle_references) {
++          if (!bundle.valid()) {
++            ERR("ExecuteCommandLists: bundle allocator was reset after recording");
++            return;
++          }
++        }
+         task.lists.push_back(ListSubmission{
+             list->entry, list->owned_id, list->owned_recording, Com<ID3D12CommandAllocator>(list->owned_allocator)});
+         if (!task.contains_temporal) {
+@@ -491,8 +502,15 @@ public:
+           }
+         }
+       }
+-      if (!task_fifo_.push(QueueTask{std::move(task)}))
++      if (!task_fifo_.push(QueueTask{std::move(task)})) {
+         ERR("ExecuteCommandLists: queue submission worker is closed");
++      } else {
++        for (unsigned i = 0; i < Count; ++i) {
++          auto list = static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i]);
++          for (auto &bundle : list->owned_bundle_references)
++            bundle.submitted();
++        }
++      }
+     } catch (const std::bad_alloc &) {
+       ERR("ExecuteCommandLists: out of memory while capturing submission");
+     } catch (...) {
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index 7d48aae..2d3aef1 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -502,6 +502,12 @@ public:
+ 
+   virtual HRESULT
+   Initialize(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
++    if (pDesc->NumRenderTargets > owned_rtv_formats.size())
++      return E_INVALIDARG;
++    owned_rt_count = pDesc->NumRenderTargets;
++    std::copy_n(pDesc->RTVFormats, owned_rt_count, owned_rtv_formats.begin());
++    owned_dsv_format = pDesc->DSVFormat;
++    owned_sample_desc = pDesc->SampleDesc;
+     if (pDesc->StreamOutput.NumEntries) {
+       ERR("CreatePipelineState: SO not supported");
+       return E_NOTIMPL;
+diff --git a/src/dxmt/dxmt_buffer.hpp b/src/dxmt/dxmt_buffer.hpp
+index 057e767..a6e3bfa 100644
+--- a/src/dxmt/dxmt_buffer.hpp
++++ b/src/dxmt/dxmt_buffer.hpp
+@@ -110,6 +110,10 @@ public:
+     return gpuAddress_;
+   }
+ 
++  uint64_t byteLength() const noexcept {
++    return info_.length;
++  }
++
+   void
+   useSuballocation(uint32_t suballocation) noexcept {
+     current_suballocation_ = suballocation;
+@@ -229,4 +233,4 @@ struct BufferSlice {
+   uint32_t elementCount = 0;
+ };
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/d3d12/owned_bundle_recording.hpp b/src/d3d12/owned_bundle_recording.hpp
+new file mode 100644
+index 0000000..e603472
+--- /dev/null
++++ b/src/d3d12/owned_bundle_recording.hpp
+@@ -0,0 +1,57 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <utility>
++
++namespace owned_graphics {
++
++// A bundle may be reset after submission, including while that submission is
++// still in flight, but not while an unsubmitted parent refers to it.
++struct BundleRecordingState {
++  std::atomic<uint64_t> unsubmitted{0};
++};
++
++class BundleReference {
++  std::shared_ptr<BundleRecordingState> recording_;
++  std::shared_ptr<std::atomic<uint64_t>> allocator_generation_;
++  uint64_t generation_ = 0;
++  bool pending_ = false;
++
++public:
++  BundleReference(std::shared_ptr<BundleRecordingState> recording,
++                  std::shared_ptr<std::atomic<uint64_t>> allocator_generation,
++                  uint64_t generation) noexcept
++      : recording_(std::move(recording)), allocator_generation_(std::move(allocator_generation)),
++        generation_(generation), pending_(true) {
++    recording_->unsubmitted.fetch_add(1, std::memory_order_relaxed);
++  }
++  BundleReference(const BundleReference &) = delete;
++  BundleReference &operator=(const BundleReference &) = delete;
++  BundleReference(BundleReference &&other) noexcept
++      : recording_(std::move(other.recording_)),
++        allocator_generation_(std::move(other.allocator_generation_)), generation_(other.generation_),
++        pending_(std::exchange(other.pending_, false)) {}
++  BundleReference &operator=(BundleReference &&other) noexcept {
++    if (this != &other) {
++      submitted();
++      recording_ = std::move(other.recording_);
++      allocator_generation_ = std::move(other.allocator_generation_);
++      generation_ = other.generation_;
++      pending_ = std::exchange(other.pending_, false);
++    }
++    return *this;
++  }
++  ~BundleReference() { submitted(); }
++
++  bool valid() const noexcept {
++    return allocator_generation_ && allocator_generation_->load(std::memory_order_acquire) == generation_;
++  }
++  void submitted() noexcept {
++    if (std::exchange(pending_, false))
++      recording_->unsubmitted.fetch_sub(1, std::memory_order_release);
++  }
++};
++
++} // namespace owned_graphics

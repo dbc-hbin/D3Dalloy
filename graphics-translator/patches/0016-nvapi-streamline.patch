@@ -1,0 +1,215 @@
+--- a/src/nvapi/nvapi.cpp
++++ b/src/nvapi/nvapi.cpp
+@@ -13,6 +13,13 @@
+ #include "nvShaderExtnEnums.h"
+ #undef __NVAPI_EMPTY_SAL
+ 
++/*
++ * `nvapi.h` only declares the D3D12 entry points when the D3D12 headers were
++ * included first. NVAPI clients resolve them through `nvapi_QueryInterface`
++ * with a typeless device pointer, so a forward declaration is enough here.
++ */
++struct ID3D12Device;
++
+ namespace dxmt {
+ Logger Logger::s_instance("nvapi.log");
+ 
+@@ -161,6 +168,9 @@
+ 
+ NVAPI_INTERFACE NvAPI_D3D11_IsNvShaderExtnOpCodeSupported(
+     __in IUnknown *pDev, __in NvU32 opCode, __out bool *pSupported) {
++  if (!pDev || !pSupported)
++    return NVAPI_INVALID_ARGUMENT;
++
+   switch (opCode) {
+   /*
+    * UnrealEngine queries it for checking if Nanite capability
+@@ -184,6 +194,23 @@
+   return NVAPI_OK;
+ }
+ 
++NVAPI_INTERFACE NvAPI_D3D12_IsNvShaderExtnOpCodeSupported(
++    __in ID3D12Device *pDevice, __in NvU32 opCode, __out bool *pSupported) {
++  if (!pDevice || !pSupported)
++    return NVAPI_INVALID_ARGUMENT;
++
++  /*
++   * Neither the DXBC nor the DXIL->AIR shader translator implements any of the
++   * vendor shader extension intrinsics, so no opcode may be advertised as
++   * supported. Reporting FALSE is the documented way to make the application
++   * fall back to standard HLSL, whereas claiming support would produce shaders
++   * the translator cannot compile.
++   */
++  WARN("nvapi: unsupported shader extension opcode ", opCode);
++  *pSupported = false;
++  return NVAPI_OK;
++}
++
+ Com<IMTLD3D11DeviceExt> GetD3D11DeviceExt(IUnknown *pDevice) {
+   Com<IMTLD3D11DeviceExt> device_ext;
+   if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&device_ext)))) {
+@@ -261,6 +288,24 @@
+   return NVAPI_OK;
+ }
+ 
++/*
++ * GPU handles are the stable Metal device registry ID, the same value
++ * `dxgi_adapter.cpp` turns into the adapter LUID. A handle is only meaningful
++ * while it still names a live device, so every lookup validates it.
++ *
++ * `Array::object()` hands out a borrowed device handle owned by the array, so
++ * the caller must keep `devices` alive for as long as it uses the result.
++ */
++static WMT::Device
++FindMetalDeviceByGpuHandle(const WMT::Reference<WMT::Array<WMT::Device>> &devices, uint64_t handle) {
++  for (unsigned i = 0; i < devices.count(); i++) {
++    auto device = devices.object(i);
++    if (handle == device.registryID())
++      return device;
++  }
++  return {};
++}
++
+ NVAPI_INTERFACE
+ NvAPI_EnumPhysicalGPUs(NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32 *pGpuCount) {
+   if (!nvGPUHandle || !pGpuCount)
+@@ -271,6 +316,11 @@
+   if (adapter_count == 0)
+     return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+ 
++  if (adapter_count > NVAPI_MAX_PHYSICAL_GPUS) {
++    *pGpuCount = adapter_count;
++    return NVAPI_INSUFFICIENT_BUFFER;
++  }
++
+   *pGpuCount = adapter_count;
+   for (unsigned i = 0; i < adapter_count; i++) {
+     nvGPUHandle[i] = (NvPhysicalGpuHandle)devices.object(i).registryID();
+@@ -289,6 +339,11 @@
+   if (adapter_count == 0)
+     return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+ 
++  if (adapter_count > NVAPI_MAX_LOGICAL_GPUS) {
++    *pGpuCount = adapter_count;
++    return NVAPI_INSUFFICIENT_BUFFER;
++  }
++
+   *pGpuCount = adapter_count;
+   for (unsigned i = 0; i < adapter_count; i++) {
+     nvGPUHandle[i] = (NvLogicalGpuHandle)devices.object(i).registryID();
+@@ -298,6 +353,48 @@
+ }
+ 
+ NVAPI_INTERFACE
++NvAPI_GetLogicalGPUFromPhysicalGPU(__in NvPhysicalGpuHandle hPhysicalGPU,
++                                   __out NvLogicalGpuHandle *pLogicalGPU) {
++  if (!pLogicalGPU)
++    return NVAPI_INVALID_ARGUMENT;
++  *pLogicalGPU = nullptr;
++
++  if (!hPhysicalGPU)
++    return NVAPI_INVALID_ARGUMENT;
++
++  auto devices = WMT::CopyAllDevices();
++  if (!FindMetalDeviceByGpuHandle(devices, uint64_t(hPhysicalGPU)))
++    return NVAPI_INVALID_ARGUMENT;
++
++  /*
++   * Every Metal device is a standalone physical GPU exposing exactly one
++   * logical GPU, so the logical handle is the same stable identifier.
++   */
++  *pLogicalGPU = (NvLogicalGpuHandle)uint64_t(hPhysicalGPU);
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
++NvAPI_GetPhysicalGPUsFromLogicalGPU(__in NvLogicalGpuHandle hLogicalGPU,
++                                    __out NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS],
++                                    __out NvU32 *pGpuCount) {
++  if (!nvGPUHandle || !pGpuCount)
++    return NVAPI_INVALID_ARGUMENT;
++  *pGpuCount = 0;
++
++  if (!hLogicalGPU)
++    return NVAPI_INVALID_ARGUMENT;
++
++  auto devices = WMT::CopyAllDevices();
++  if (!FindMetalDeviceByGpuHandle(devices, uint64_t(hLogicalGPU)))
++    return NVAPI_INVALID_ARGUMENT;
++
++  nvGPUHandle[0] = (NvPhysicalGpuHandle)uint64_t(hLogicalGPU);
++  *pGpuCount = 1;
++  return NVAPI_OK;
++}
++
++NVAPI_INTERFACE
+ NvAPI_GetPhysicalGPUsFromDisplay(NvDisplayHandle hNvDisp, NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32 *pGpuCount) {
+   if (!hNvDisp || !nvGPUHandle || !pGpuCount)
+     return NVAPI_INVALID_ARGUMENT;
+@@ -765,32 +862,30 @@
+   if (!pLogicalGpuData)
+     return NVAPI_INVALID_ARGUMENT;
+ 
+-  auto registry_id = uint64_t(hLogicalGpu);
+-  auto devices = WMT::CopyAllDevices();
+-  auto adapter_count = devices.count();
+-  if (adapter_count == 0)
+-    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
++  if (pLogicalGpuData->version != NV_LOGICAL_GPU_DATA_VER1)
++    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+ 
+-  WMT::Device target_device{};
+-  for (unsigned i = 0; i < adapter_count; i++) {
+-    if (registry_id == devices.object(i).registryID()) {
+-      target_device = devices.object(i);
+-      break;
+-    }
+-  }
++  /*
++   * `pOSAdapterId` is a caller-owned LUID-sized output buffer; NVAPI must not
++   * write through a null pointer.
++   */
++  if (!hLogicalGpu || !pLogicalGpuData->pOSAdapterId)
++    return NVAPI_INVALID_ARGUMENT;
++
++  /*
++   * `target_device` is borrowed from `devices`; both stay alive until the LUID
++   * has been written.
++   */
++  auto devices = WMT::CopyAllDevices();
++  auto target_device = FindMetalDeviceByGpuHandle(devices, uint64_t(hLogicalGpu));
+   if (!target_device)
+-    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
++    return NVAPI_INVALID_ARGUMENT;
+ 
+-  switch (pLogicalGpuData->version) {
+-  case NV_LOGICAL_GPU_DATA_VER1:
+-    pLogicalGpuData->physicalGpuCount = 1;
+-    memset(pLogicalGpuData->physicalGpuHandles, 0, sizeof(pLogicalGpuData->physicalGpuHandles));
+-    pLogicalGpuData->physicalGpuHandles[0] = (NvPhysicalGpuHandle)registry_id;
+-    *reinterpret_cast<LUID *>(pLogicalGpuData->pOSAdapterId) = GetAdapterLuid(target_device);
+-    break;
+-  default:
+-    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+-  }
++  auto registry_id = uint64_t(hLogicalGpu);
++  pLogicalGpuData->physicalGpuCount = 1;
++  memset(pLogicalGpuData->physicalGpuHandles, 0, sizeof(pLogicalGpuData->physicalGpuHandles));
++  pLogicalGpuData->physicalGpuHandles[0] = (NvPhysicalGpuHandle)registry_id;
++  *reinterpret_cast<LUID *>(pLogicalGpuData->pOSAdapterId) = GetAdapterLuid(target_device);
+ 
+   return NVAPI_OK;
+ }
+@@ -899,6 +994,12 @@
+     return (void *)&NvAPI_GPU_GetAdapterIdFromPhysicalGpu;
+   case 0x842b066e:
+     return (void *)&NvAPI_GPU_GetLogicalGpuInfo;
++  case 0xadd604d1:
++    return (void *)&NvAPI_GetLogicalGPUFromPhysicalGPU;
++  case 0xaea3fa32:
++    return (void *)&NvAPI_GetPhysicalGPUsFromLogicalGPU;
++  case 0x3dfacec8:
++    return (void *)&NvAPI_D3D12_IsNvShaderExtnOpCodeSupported;
+   default:
+     break;
+   }

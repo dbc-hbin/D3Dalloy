@@ -1,0 +1,158 @@
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 9b5e33e..996c32c 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -89,6 +89,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+ 
+   struct ExecuteTask {
+     std::vector<ListSubmission> lists;
++    bool contains_temporal = false;
+   };
+ 
+   struct SignalTask {
+@@ -118,6 +119,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+   struct InflightCommandBuffer {
+     WMT::Reference<WMT::CommandBuffer> cmdbuf{};
+     HANDLE semaphore{};
++    // Allocator GPU argument storage uses newBufferWithBytesNoCopy. Retaining
++    // its MTLBuffer alone does not retain the allocator's malloc backing.
++    // Keep that owner until the submitted command buffer has completed.
++    std::vector<Com<ID3D12CommandAllocator>> allocators;
+     // Prepared commands retain feature history, native views, and private
+     // scratch until Metal completion, independently of frontend ReleaseFeature.
+     std::vector<std::shared_ptr<OwnedTemporalFrame>> temporal_frames;
+@@ -166,6 +171,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+     uint64_t seq;
+     InflightCommandBuffer &inflight;
+     WMT::Reference<WMT::Object> pool;
++    // This stays locked through the destructor's commit(), then releases. No
++    // GPU completion or ring-capacity wait occurs while it is held.
++    std::unique_lock<std::mutex> temporal_submission_lock;
+ 
+     CommittingScope(MTLD3D12CommandQueueImpl *queue) :
+         queue(queue),
+@@ -298,6 +306,11 @@ public:
+   void
+   ProcessExecute(ExecuteTask &task) {
+     auto scope = StartCommitting();
++    scope.inflight.allocators.reserve(task.lists.size());
++    for (auto &list : task.lists)
++      scope.inflight.allocators.push_back(list.allocator);
++    if (task.contains_temporal)
++      scope.temporal_submission_lock = std::unique_lock(device_->owned_temporal_submission_mutex);
+     auto &cmdbuf = scope.inflight.cmdbuf;
+     for (auto &list : task.lists) {
+       owned_graphics::Trace("execute_list", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
+@@ -469,6 +482,14 @@ public:
+         }
+         task.lists.push_back(ListSubmission{
+             list->entry, list->owned_id, list->owned_recording, Com<ID3D12CommandAllocator>(list->owned_allocator)});
++        if (!task.contains_temporal) {
++          for (auto *encoder = list->entry; encoder; encoder = encoder->next) {
++            if (encoder->type == EncoderType::Temporal) {
++              task.contains_temporal = true;
++              break;
++            }
++          }
++        }
+       }
+       if (!task_fifo_.push(QueueTask{std::move(task)}))
+         ERR("ExecuteCommandLists: queue submission worker is closed");
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index 8ae24b3..a60f4b8 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -31,6 +31,7 @@
+ #include "dxmt_texture.hpp"
+ #include "log/log.hpp"
+ #include "owned_trace.hpp"
++#include <mutex>
+ 
+ #define IMPLEMENT_ME                                                                                                   \
+   do {                                                                                                                 \
+@@ -197,6 +198,11 @@ public:
+ 
+   EventListener event_listener;
+ 
++  // Publish all feature-history dependencies of one temporal-containing Metal
++  // command buffer atomically with respect to other queues on this device.
++  // Queue workers acquire this only after reserving their submission-ring slot.
++  std::mutex owned_temporal_submission_mutex;
++
+   WMT::Reference<WMT::DepthStencilState> default_depth_stencil_state;
+ };
+ 
+diff --git a/src/d3d12/d3d12_temporal.cpp b/src/d3d12/d3d12_temporal.cpp
+index b80e0fa..e8bc992 100644
+--- a/src/d3d12/d3d12_temporal.cpp
++++ b/src/d3d12/d3d12_temporal.cpp
+@@ -103,6 +103,7 @@ struct OwnedTemporalFrame {
+   WMT::Reference<WMT::Texture> scratch_output;
+   WMTFXTemporalScalerProps props{};
+   UINT output_width = 0, output_height = 0;
++  UINT output_x = 0, output_y = 0;
+   bool scratch_resident = false;
+ 
+   ~OwnedTemporalFrame() {
+@@ -147,11 +148,12 @@ public:
+       return E_INVALIDARG;
+     if (desc.ExposureScale != 1.0f || desc.BiasCurrentColorMask || desc.TransparencyMask ||
+         desc.ColorBaseX || desc.ColorBaseY || desc.DepthBaseX || desc.DepthBaseY ||
+-        desc.MotionBaseX || desc.MotionBaseY || desc.BiasBaseX || desc.BiasBaseY ||
+-        desc.OutputBaseX || desc.OutputBaseY)
++        desc.MotionBaseX || desc.MotionBaseY || desc.BiasBaseX || desc.BiasBaseY)
+       return E_NOTIMPL;
+ 
+     const auto &create = core_->create;
++    if ((desc.OutputBaseX || desc.OutputBaseY) && !create.OutputSubrectsEnabled)
++      return E_NOTIMPL;
+     // Initial supported subset is the existing DXMT temporal range. The native
+     // factory is still authoritative and can reject unsupported device formats.
+     const float sx = float(create.OutputWidth) / desc.InputContentWidth;
+@@ -174,7 +176,9 @@ public:
+     if (color->width() != depth->width() || color->height() != depth->height() ||
+         color->width() != motion->width() || color->height() != motion->height() ||
+         desc.InputContentWidth > color->width() || desc.InputContentHeight > color->height() ||
+-        create.OutputWidth > output->width() || create.OutputHeight > output->height())
++        desc.OutputBaseX > output->width() || desc.OutputBaseY > output->height() ||
++        create.OutputWidth > output->width() - desc.OutputBaseX ||
++        create.OutputHeight > output->height() - desc.OutputBaseY)
+       return E_INVALIDARG;
+     if (desc.Color == desc.Output || desc.Depth == desc.Output || desc.MotionVector == desc.Output)
+       return E_INVALIDARG;
+@@ -225,7 +229,8 @@ public:
+ 
+     // Always render into a private logical-sized texture. The application's
+     // resource can have larger backing capacity or shared storage. Copy only
+-    // the requested output rectangle, preserving every pixel outside it.
++    // the requested output rectangle at its caller-specified base, preserving
++    // every pixel outside it. MetalFX history remains in logical coordinates.
+     WMTTextureInfo info{};
+     info.width = create.OutputWidth;
+     info.height = create.OutputHeight;
+@@ -245,13 +250,16 @@ public:
+     frame->scratch_resident = true;
+     frame->output_width = create.OutputWidth;
+     frame->output_height = create.OutputHeight;
++    frame->output_x = desc.OutputBaseX;
++    frame->output_y = desc.OutputBaseY;
+     frame->props = {desc.InputContentWidth, desc.InputContentHeight, bool(desc.ResetHistory),
+                     bool(create.FeatureFlags & kDepthInverted), desc.MotionVectorScaleX, desc.MotionVectorScaleY,
+                     desc.JitterOffsetX, desc.JitterOffsetY, desc.PreExposure};
+     owned_graphics::Trace("temporal_record", ",\"feature\":", core_->id, ",\"evaluation\":", frame->id,
+                           ",\"generation\":", frame->generation->id,
+                           ",\"color\":", frame->resources[0]->owned_id, ",\"depth\":", frame->resources[1]->owned_id,
+-                          ",\"motion\":", frame->resources[2]->owned_id, ",\"output\":", frame->resources[3]->owned_id);
++                          ",\"motion\":", frame->resources[2]->owned_id, ",\"output\":", frame->resources[3]->owned_id,
++                          ",\"output_x\":", frame->output_x, ",\"output_y\":", frame->output_y);
+     result = std::move(frame);
+     return S_OK;
+   }
+@@ -336,6 +344,7 @@ void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
+   copy.src = frame->scratch_output;
+   copy.src_size = {frame->output_width, frame->output_height, 1};
+   copy.dst = frame->output.texture();
++  copy.dst_origin = {frame->output_x, frame->output_y, 0};
+   end.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+   end.updateFence(fence);
+   end.endEncoding();

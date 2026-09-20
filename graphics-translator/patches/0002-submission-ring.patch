@@ -1,0 +1,152 @@
+diff --git a/src/d3d12/d3d12_command_queue.cpp b/src/d3d12/d3d12_command_queue.cpp
+index 57b0332..0e29eed 100644
+--- a/src/d3d12/d3d12_command_queue.cpp
++++ b/src/d3d12/d3d12_command_queue.cpp
+@@ -23,6 +23,7 @@
+ #include "dxgi_interfaces.h"
+ #include "log/log.hpp"
+ #include "util_env.hpp"
++#include "owned_submission_ring.hpp"
+ #include <atomic>
+ #include "d3d10_1.h"
+ #include "d3d11_4.h"
+@@ -42,9 +43,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+   WMT::Reference<WMT::CommandQueue> queue_;
+   WMT::Reference<WMT::Fence> fence_;
+ 
+-  std::atomic_uint64_t inflight_cmdbuf_seq_ = 1;
+-  std::atomic_uint64_t inflight_cmdbuf_count_ = 0;
+-  std::atomic_uint64_t inflight_cmdbuf_stop_ = 0;
++  owned_graphics::SubmissionRing<kCommandQueueSize> submission_ring_;
+ 
+   struct InflightCommandBuffer {
+     WMT::Reference<WMT::CommandBuffer> cmdbuf{};
+@@ -63,8 +62,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+ 
+     uint64_t internal_seq = 1;
+     for (;;) {
+-      inflight_cmdbuf_seq_.wait(internal_seq, std::memory_order_acquire);
+-      if (inflight_cmdbuf_stop_.load() == internal_seq)
++      if (!submission_ring_.wait(internal_seq))
+         break;
+       auto &inflight = inflight_cmdbuf_pool_[internal_seq % kCommandQueueSize];
+ 
+@@ -78,8 +76,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+ 
+       inflight = {};
+ 
+-      inflight_cmdbuf_count_.fetch_sub(1, std::memory_order_release);
+-      inflight_cmdbuf_count_.notify_one();
++      submission_ring_.retire(internal_seq);
+ 
+       internal_seq++;
+     }
+@@ -95,7 +92,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+     CommittingScope(MTLD3D12CommandQueueImpl *queue) :
+         queue(queue),
+         lock(queue->mutex_commit_),
+-        seq(queue->inflight_cmdbuf_seq_.load(std::memory_order_relaxed)),
++        seq(queue->submission_ring_.reserve()),
+         inflight(queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize]),
+         pool(WMT::MakeAutoreleasePool()) {
+       inflight.cmdbuf = queue->queue_.commandBuffer();
+@@ -103,15 +100,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
+ 
+     ~CommittingScope() {
+       inflight.cmdbuf.commit();
+-      queue->inflight_cmdbuf_seq_.fetch_add(1, std::memory_order_release);
+-      queue->inflight_cmdbuf_seq_.notify_one();
+-      queue->inflight_cmdbuf_count_.fetch_add(1, std::memory_order_relaxed);
++      queue->submission_ring_.publish(seq);
+     }
+   };
+ 
+   CommittingScope
+   StartCommitting() {
+-    inflight_cmdbuf_count_.wait(kCommandQueueSize, std::memory_order_acquire);
+     return CommittingScope(this);
+   }
+ 
+@@ -122,8 +116,7 @@ public:
+ 
+   ~MTLD3D12CommandQueueImpl() {
+     std::lock_guard<dxmt::mutex> lock(mutex_commit_);
+-    inflight_cmdbuf_stop_.store(inflight_cmdbuf_seq_.fetch_add(1));
+-    inflight_cmdbuf_seq_.notify_one();
++    submission_ring_.stop();
+     inflight_cmdbuf_wait_thread_.join();
+   }
+ 
+@@ -427,4 +420,4 @@ CreateCommandQueue(MTLD3D12Device *pDevice, const D3D12_COMMAND_QUEUE_DESC *pDes
+   return command_queue->QueryInterface(riid, ppCommandQueue);
+ };
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/d3d12/owned_submission_ring.hpp b/src/d3d12/owned_submission_ring.hpp
+new file mode 100644
+index 0000000..4f944f2
+--- /dev/null
++++ b/src/d3d12/owned_submission_ring.hpp
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Owned graphics backend: publication and reclamation of in-flight GPU work.
++#pragma once
++
++#include <atomic>
++#include <cassert>
++#include <cstddef>
++#include <cstdint>
++
++namespace owned_graphics {
++
++// The queue's commit mutex must serialize reserve(), publish(), and stop().
++// Exactly one completion thread calls wait() and retire() in sequence order.
++// Payload writes precede publish(); payload destruction precedes retire().
++// Separate monotonic cursors avoid a count that can underflow when completion
++// wins a race against the publishing thread. No slot is reused before retire.
++template <std::size_t Capacity> class SubmissionRing {
++  static_assert(Capacity > 0);
++  std::atomic<std::uint64_t> published_{1};
++  std::atomic<std::uint64_t> retired_{1};
++  std::atomic<std::uint64_t> stop_at_{0};
++
++public:
++  std::uint64_t reserve() {
++    const auto sequence = published_.load(std::memory_order_relaxed);
++    auto retired = retired_.load(std::memory_order_acquire);
++    while (sequence - retired >= Capacity) {
++      retired_.wait(retired, std::memory_order_acquire);
++      retired = retired_.load(std::memory_order_acquire);
++    }
++    return sequence;
++  }
++
++  void publish(std::uint64_t sequence) {
++    assert(sequence == published_.load(std::memory_order_relaxed));
++    published_.store(sequence + 1, std::memory_order_release);
++    published_.notify_one();
++  }
++
++  bool wait(std::uint64_t sequence) {
++    published_.wait(sequence, std::memory_order_acquire);
++    return stop_at_.load(std::memory_order_relaxed) != sequence;
++  }
++
++  void retire(std::uint64_t sequence) {
++    assert(sequence == retired_.load(std::memory_order_relaxed));
++    retired_.store(sequence + 1, std::memory_order_release);
++    retired_.notify_one();
++  }
++
++  void stop() {
++    const auto sequence = published_.load(std::memory_order_relaxed);
++    // Publish the sentinel *after* its identity, including when the completion
++    // thread observes the changed cursor before notify_one() executes.
++    stop_at_.store(sequence, std::memory_order_relaxed);
++    publish(sequence);
++  }
++};
++
++} // namespace owned_graphics

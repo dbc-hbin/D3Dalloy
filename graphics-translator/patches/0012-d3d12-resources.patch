@@ -1,0 +1,1441 @@
+diff --git a/src/d3d12/d3d12_buffer.cpp b/src/d3d12/d3d12_buffer.cpp
+index 5a80937..28378f1 100644
+--- a/src/d3d12/d3d12_buffer.cpp
++++ b/src/d3d12/d3d12_buffer.cpp
+@@ -18,11 +18,37 @@
+ 
+ #include "d3d12_device.hpp"
+ #include "d3d12_pageable.hpp"
++#include "d3d12_resource_contract.hpp"
+ #include "com/com_pointer.hpp"
+ #include "dxmt_format.hpp"
+ 
+ namespace dxmt {
+ 
++namespace {
++
++HRESULT
++BuildBufferSlice(UINT64 buffer_size, UINT64 first_element, UINT num_elements, UINT stride, BufferSlice &slice) {
++  if (!stride || !num_elements)
++    return E_INVALIDARG;
++  if (first_element > UINT64_MAX / stride || static_cast<UINT64>(num_elements) > UINT64_MAX / stride)
++    return E_INVALIDARG;
++
++  const UINT64 byte_offset = first_element * stride;
++  const UINT64 byte_length = static_cast<UINT64>(num_elements) * stride;
++  if (byte_offset > buffer_size || byte_length > buffer_size - byte_offset)
++    return E_INVALIDARG;
++  if (byte_offset > UINT32_MAX || byte_length > UINT32_MAX || first_element > UINT32_MAX)
++    return E_NOTIMPL;
++
++  slice.firstElement = static_cast<uint32_t>(first_element);
++  slice.elementCount = num_elements;
++  slice.byteOffset = static_cast<uint32_t>(byte_offset);
++  slice.byteLength = static_cast<uint32_t>(byte_length);
++  return S_OK;
++}
++
++} // namespace
++
+ class MTLD3D12Buffer : public MTLD3D12Pageable<MTLD3D12Resource> {
+   D3D12_RESOURCE_DESC desc_;
+   D3D12_HEAP_PROPERTIES heap_props_;
+@@ -53,7 +79,10 @@ public:
+ 
+     if (pHeap) {
+       auto size_and_align = device_->GetMTLDevice().heapBufferSizeAndAlign(desc_.Width, {});
+-      if (size_and_align.size + Offset > pHeap->GetDesc().SizeInBytes)
++      const UINT64 heap_size = pHeap->GetDesc().SizeInBytes;
++      if (!resource_contract::PlacementFits(
++              Offset, size_and_align.size, heap_size, desc_.Alignment, size_and_align.align
++          ))
+         return E_INVALIDARG;
+     }
+ 
+@@ -162,12 +191,25 @@ public:
+     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
+     BufferSlice Slice;
+ 
+-    if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN || ViewDesc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+-      UINT Stride = (ViewDesc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4 : ViewDesc.Buffer.StructureByteStride;
+-      Slice.firstElement = ViewDesc.Buffer.FirstElement;
+-      Slice.elementCount = ViewDesc.Buffer.NumElements;
+-      Slice.byteOffset = Slice.firstElement * Stride;
+-      Slice.byteLength = Slice.elementCount * Stride;
++    if (ViewDesc.Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)
++      return E_INVALIDARG;
++    const bool raw = ViewDesc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW;
++    const bool structured = ViewDesc.Buffer.StructureByteStride != 0;
++    if (raw) {
++      if (ViewDesc.Format != DXGI_FORMAT_R32_TYPELESS || structured)
++        return E_INVALIDARG;
++    } else if (structured) {
++      if (ViewDesc.Format != DXGI_FORMAT_UNKNOWN)
++        return E_INVALIDARG;
++    } else if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN) {
++      return E_INVALIDARG;
++    }
++
++    if (raw || structured) {
++      const UINT Stride = raw ? 4 : ViewDesc.Buffer.StructureByteStride;
++      hr = BuildBufferSlice(desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Stride, Slice);
++      if (FAILED(hr))
++        return hr;
+       return Heap->AddShaderResourceView(Index, buffer.ptr(), Slice);
+     }
+ 
+@@ -176,11 +218,14 @@ public:
+       ERR("D3D12Buffer::CreateShaderResourceView: not an ordinary or packed format: ", ViewDesc.Format);
+       return E_FAIL;
+     }
++    if (!Format.BytesPerTexel)
++      return E_INVALIDARG;
+     BufferViewDescriptor view_descriptor{Format.PixelFormat};
+-    Slice.firstElement = ViewDesc.Buffer.FirstElement;
+-    Slice.elementCount = ViewDesc.Buffer.NumElements;
+-    Slice.byteOffset = Format.BytesPerTexel * ViewDesc.Buffer.FirstElement;
+-    Slice.byteLength = Format.BytesPerTexel * ViewDesc.Buffer.NumElements;
++    hr = BuildBufferSlice(
++        desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Format.BytesPerTexel, Slice
++    );
++    if (FAILED(hr))
++      return hr;
+ 
+     auto view = buffer->createView(view_descriptor);
+     return Heap->AddShaderResourceView(Index, buffer.ptr(), view, Slice);
+@@ -206,16 +251,38 @@ public:
+     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
+     BufferSlice Slice;
+ 
+-    if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN || ViewDesc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
+-      UINT Stride = (ViewDesc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) ? 4 : ViewDesc.Buffer.StructureByteStride;
+-      Slice.firstElement = ViewDesc.Buffer.FirstElement;
+-      Slice.elementCount = ViewDesc.Buffer.NumElements;
+-      Slice.byteOffset = Slice.firstElement * Stride;
+-      Slice.byteLength = Slice.elementCount * Stride;
++    if (ViewDesc.Buffer.Flags & ~D3D12_BUFFER_UAV_FLAG_RAW)
++      return E_INVALIDARG;
++    const bool raw = ViewDesc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW;
++    const bool structured = ViewDesc.Buffer.StructureByteStride != 0;
++    if (raw) {
++      if (ViewDesc.Format != DXGI_FORMAT_R32_TYPELESS || structured || pCounter)
++        return E_INVALIDARG;
++    } else if (structured) {
++      if (ViewDesc.Format != DXGI_FORMAT_UNKNOWN)
++        return E_INVALIDARG;
++    } else {
++      if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN || pCounter)
++        return E_INVALIDARG;
++    }
++    if (!pCounter && ViewDesc.Buffer.CounterOffsetInBytes)
++      return E_INVALIDARG;
++
++    if (raw || structured) {
++      const UINT Stride = raw ? 4 : ViewDesc.Buffer.StructureByteStride;
++      hr = BuildBufferSlice(desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Stride, Slice);
++      if (FAILED(hr))
++        return hr;
+       if (!pCounter)
+         return Heap->AddUnorderedAccessView(Index, buffer.ptr(), Slice, nullptr, 0);
+ 
+-      auto Counter = static_cast<MTLD3D12Buffer *>(pCounter);
++      auto Counter = static_cast<MTLD3D12Resource *>(pCounter);
++      if (!Counter->buffer || (ViewDesc.Buffer.CounterOffsetInBytes % D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT))
++        return E_INVALIDARG;
++      const auto counter_desc = pCounter->GetDesc();
++      if (ViewDesc.Buffer.CounterOffsetInBytes > counter_desc.Width ||
++          sizeof(UINT) > counter_desc.Width - ViewDesc.Buffer.CounterOffsetInBytes)
++        return E_INVALIDARG;
+       return Heap->AddUnorderedAccessView(
+           Index, buffer.ptr(), Slice, Counter->buffer.ptr(), ViewDesc.Buffer.CounterOffsetInBytes
+       );
+@@ -226,11 +293,14 @@ public:
+       ERR("D3D12Buffer::CreateUnorderedAccessView: not an ordinary or packed format: ", ViewDesc.Format);
+       return E_FAIL;
+     }
++    if (!Format.BytesPerTexel)
++      return E_INVALIDARG;
+     BufferViewDescriptor view_descriptor{Format.PixelFormat};
+-    Slice.firstElement = ViewDesc.Buffer.FirstElement;
+-    Slice.elementCount = ViewDesc.Buffer.NumElements;
+-    Slice.byteOffset = Format.BytesPerTexel * ViewDesc.Buffer.FirstElement;
+-    Slice.byteLength = Format.BytesPerTexel * ViewDesc.Buffer.NumElements;
++    hr = BuildBufferSlice(
++        desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Format.BytesPerTexel, Slice
++    );
++    if (FAILED(hr))
++      return hr;
+ 
+     auto view = buffer->createView(view_descriptor);
+     return Heap->AddUnorderedAccessView(Index, buffer.ptr(), view, Slice);
+@@ -238,14 +308,13 @@ public:
+ 
+   virtual HRESULT STDMETHODCALLTYPE
+   CreateRenderTargetView(const D3D12_RENDER_TARGET_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) {
+-    IMPLEMENT_ME
+-    return S_OK;
++    WARN("D3D12Buffer::CreateRenderTargetView: buffer RTV is not implemented");
++    return E_NOTIMPL;
+   };
+ 
+   virtual HRESULT STDMETHODCALLTYPE
+   CreateDepthStencilView(const D3D12_DEPTH_STENCIL_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) {
+-    IMPLEMENT_ME
+-    return S_OK;
++    return E_INVALIDARG;
+   };
+ 
+   virtual void STDMETHODCALLTYPE GetResourceTiling(
+@@ -290,4 +359,4 @@ CreatePlacedBuffer(
+   return buffer->QueryInterface(riid, ppResource);
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index df4e476..67b51de 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -17,12 +17,112 @@
+  */
+ 
+ #include "d3d12_command_allocator.hpp"
++#include "d3d12_resource_contract.hpp"
+ #include "d3d12_temporal.hpp"
+ #include "com/com_pointer.hpp"
+ #include "dxmt_format.hpp"
+ 
+ namespace dxmt {
+ 
++namespace {
++
++bool
++RangeFits(UINT64 offset, UINT64 length, UINT64 total) {
++  return resource_contract::RangeFits(offset, length, total);
++}
++
++bool
++GetSubresourceInfo(
++    WMT::Device device, const D3D12_RESOURCE_DESC &desc, UINT subresource, UINT &level, UINT &slice, UINT &plane
++) {
++  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || !desc.MipLevels)
++    return false;
++  MTL_DXGI_FORMAT_DESC format;
++  if (FAILED(MTLQueryDXGIFormat(device, desc.Format, format)) || !format.PlanarCount)
++    return false;
++  const UINT array_size = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1u : desc.DepthOrArraySize;
++  const UINT64 subresource_count = static_cast<UINT64>(desc.MipLevels) * array_size * format.PlanarCount;
++  if (subresource >= subresource_count)
++    return false;
++  DecomposeSubresource(desc, subresource, &level, &slice, &plane);
++  return plane < format.PlanarCount;
++}
++
++struct PlacedFootprintInfo {
++  UINT block_width = 1;
++  UINT bytes_per_block = 0;
++  UINT64 row_size = 0;
++  UINT64 row_count = 0;
++  UINT64 slice_pitch = 0;
++};
++
++bool
++ValidatePlacedFootprint(
++    WMT::Device device, const D3D12_RESOURCE_DESC &buffer_desc,
++    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &placed, PlacedFootprintInfo &info
++) {
++  if (buffer_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
++    return false;
++  const auto &footprint = placed.Footprint;
++
++  MTL_DXGI_FORMAT_DESC format;
++  if (FAILED(MTLQueryDXGIFormat(device, footprint.Format, format)) || !format.BytesPerTexel)
++    return false;
++  info.block_width = format.Flag & MTL_DXGI_FORMAT_BC ? 4u : 1u;
++  info.bytes_per_block = format.BytesPerTexel;
++  resource_contract::FootprintLayout layout;
++  if (!resource_contract::ValidateFootprintRange(
++          footprint.Width, footprint.Height, footprint.Depth, info.bytes_per_block, info.block_width,
++          footprint.RowPitch, placed.Offset, buffer_desc.Width, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
++          D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, layout
++      ))
++    return false;
++  info.row_size = layout.row_size;
++  info.row_count = layout.row_count;
++  info.slice_pitch = layout.slice_pitch;
++  return true;
++}
++
++bool
++BoxFits(const D3D12_BOX &box, const D3D12_BOX &extent) {
++  return box.left < box.right && box.top < box.bottom && box.front < box.back &&
++         box.right <= extent.right && box.bottom <= extent.bottom && box.back <= extent.back;
++}
++
++bool
++DestinationFits(UINT x, UINT y, UINT z, const D3D12_BOX &copy_box, const D3D12_BOX &extent) {
++  const UINT width = copy_box.right - copy_box.left;
++  const UINT height = copy_box.bottom - copy_box.top;
++  const UINT depth = copy_box.back - copy_box.front;
++  return x <= extent.right && width <= extent.right - x &&
++         y <= extent.bottom && height <= extent.bottom - y &&
++         z <= extent.back && depth <= extent.back - z;
++}
++
++bool
++BlockCopyAligned(
++    UINT block_width, const D3D12_BOX &box, const D3D12_BOX &src_extent,
++    UINT dst_x, UINT dst_y, const D3D12_BOX &dst_extent
++) {
++  if (block_width == 1)
++    return true;
++  if ((box.left % block_width) || (box.top % block_width) || (dst_x % block_width) || (dst_y % block_width))
++    return false;
++  if ((box.right % block_width) && box.right != src_extent.right)
++    return false;
++  if ((box.bottom % block_width) && box.bottom != src_extent.bottom)
++    return false;
++  const UINT width = box.right - box.left;
++  const UINT height = box.bottom - box.top;
++  if (((dst_x + width) % block_width) && dst_x + width != dst_extent.right)
++    return false;
++  if (((dst_y + height) % block_width) && dst_y + height != dst_extent.bottom)
++    return false;
++  return true;
++}
++
++} // namespace
++
+ enum class DirtyState {
+   VertexBuffer,
+   GraphicsRootArguments,
+@@ -713,13 +813,22 @@ public:
+   ) {
+     if (!pDstBuffer || !pSrcBuffer)
+       return;
++    const auto dst_desc = pDstBuffer->GetDesc();
++    const auto src_desc = pSrcBuffer->GetDesc();
++    if (dst_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || src_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
++        !RangeFits(DstOffset, ByteCount, dst_desc.Width) || !RangeFits(SrcOffset, ByteCount, src_desc.Width) || !ByteCount)
++      return;
++    auto *dst_resource = static_cast<MTLD3D12Resource *>(pDstBuffer);
++    auto *src_resource = static_cast<MTLD3D12Resource *>(pSrcBuffer);
++    if (!dst_resource->buffer || !src_resource->buffer)
++      return;
+     if (!PreBlit())
+       return;
+ 
+     auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+     cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
+-    cmd_cp.src = static_cast<MTLD3D12Resource *>(pSrcBuffer)->buffer->current()->buffer();
+-    cmd_cp.dst = static_cast<MTLD3D12Resource *>(pDstBuffer)->buffer->current()->buffer();
++    cmd_cp.src = src_resource->buffer->current()->buffer();
++    cmd_cp.dst = dst_resource->buffer->current()->buffer();
+     cmd_cp.src_offset = SrcOffset;
+     cmd_cp.dst_offset = DstOffset;
+     cmd_cp.copy_length = ByteCount;
+@@ -735,9 +844,12 @@ public:
+       const D3D12_TEXTURE_COPY_LOCATION *pDst, UINT DstX, UINT DstY, UINT DstZ, const D3D12_TEXTURE_COPY_LOCATION *pSrc,
+       const D3D12_BOX *pSrcBox
+   ) {
+-    if (!pDst || !pSrc)
++    if (!pDst || !pSrc || !pDst->pResource || !pSrc->pResource)
+       return;
+-    if (!PreBlit())
++    if ((pDst->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
++         pDst->Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) ||
++        (pSrc->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
++         pSrc->Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT))
+       return;
+ 
+     auto src_desc = pSrc->pResource->GetDesc();
+@@ -745,8 +857,14 @@ public:
+     uint32_t src_level = 0, src_slice = 0, src_planar = 0;
+     uint32_t dst_level = 0, dst_slice = 0, dst_planar = 0;
+     D3D12_BOX src_box, full_src_box;
++    D3D12_BOX dst_extent;
++    PlacedFootprintInfo src_footprint_info, dst_footprint_info;
++    UINT src_block_width = 1, dst_block_width = 1;
+ 
+     if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
++      if (!ValidatePlacedFootprint(device_->GetMTLDevice(), src_desc, pSrc->PlacedFootprint, src_footprint_info))
++        return;
++      src_block_width = src_footprint_info.block_width;
+       full_src_box = {
+           0, 0, 0,
+           pSrc->PlacedFootprint.Footprint.Width,
+@@ -754,13 +872,58 @@ public:
+           pSrc->PlacedFootprint.Footprint.Depth
+       };
+     } else {
+-      DecomposeSubresource(src_desc, pSrc->SubresourceIndex, &src_level, &src_slice, &src_planar);
++      if (!GetSubresourceInfo(
++              device_->GetMTLDevice(), src_desc, pSrc->SubresourceIndex, src_level, src_slice, src_planar
++          ))
++        return;
++      MTL_DXGI_FORMAT_DESC src_resource_format;
++      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_desc.Format, src_resource_format)))
++        return;
++      src_block_width = src_resource_format.Flag & MTL_DXGI_FORMAT_BC ? 4u : 1u;
+       full_src_box = GetResourceExtent(src_desc, src_level);
+     }
+     src_box = pSrcBox ? *pSrcBox : full_src_box;
+ 
+-    // discard invalid & empty box
+-    if (src_box.left >= src_box.right || src_box.front >= src_box.back || src_box.top >= src_box.bottom)
++    if (!BoxFits(src_box, full_src_box))
++      return;
++
++    if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
++      if (!ValidatePlacedFootprint(device_->GetMTLDevice(), dst_desc, pDst->PlacedFootprint, dst_footprint_info))
++        return;
++      dst_block_width = dst_footprint_info.block_width;
++      dst_extent = {
++          0, 0, 0,
++          pDst->PlacedFootprint.Footprint.Width,
++          pDst->PlacedFootprint.Footprint.Height,
++          pDst->PlacedFootprint.Footprint.Depth
++      };
++    } else {
++      if (!GetSubresourceInfo(
++              device_->GetMTLDevice(), dst_desc, pDst->SubresourceIndex, dst_level, dst_slice, dst_planar
++          ))
++        return;
++      MTL_DXGI_FORMAT_DESC dst_resource_format;
++      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), dst_desc.Format, dst_resource_format)))
++        return;
++      dst_block_width = dst_resource_format.Flag & MTL_DXGI_FORMAT_BC ? 4u : 1u;
++      dst_extent = GetResourceExtent(dst_desc, dst_level);
++    }
++
++    if (!DestinationFits(DstX, DstY, DstZ, src_box, dst_extent) ||
++        !BlockCopyAligned(src_block_width, src_box, full_src_box, DstX, DstY, dst_extent) ||
++        src_block_width != dst_block_width ||
++        (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
++         pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
++         src_footprint_info.bytes_per_block != dst_footprint_info.bytes_per_block))
++      return;
++    if (pSrc->pResource == pDst->pResource) {
++      if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ||
++          pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ||
++          pSrc->SubresourceIndex == pDst->SubresourceIndex)
++        return;
++    }
++
++    if (!PreBlit())
+       return;
+ 
+     if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+@@ -768,8 +931,6 @@ public:
+       if (!dst)
+         return;
+ 
+-      DecomposeSubresource(dst_desc, pDst->SubresourceIndex, &dst_level, &dst_slice, &dst_planar);
+-
+       MTL_DXGI_FORMAT_DESC dst_format;
+       if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), dst_desc.Format, dst_format))) {
+         WARN("CopyTextureRegion: unsupported format ", dst_desc.Format);
+@@ -788,10 +949,8 @@ public:
+           return;
+         }
+ 
+-        auto block_width = src_format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
+-        auto src_depth_pitch = dst->textureType() == WMTTextureType3D
+-                                   ? (pSrc->PlacedFootprint.Footprint.Height / block_width) * pSrc->PlacedFootprint.Footprint.RowPitch
+-                                   : 0;
++        const auto block_width = src_footprint_info.block_width;
++        const auto src_depth_pitch = dst->textureType() == WMTTextureType3D ? src_footprint_info.slice_pitch : 0;
+ 
+         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
+         cmd_cp.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
+@@ -904,10 +1063,8 @@ public:
+         }
+         auto src_planar_count = src_format.PlanarCount;
+ 
+-        auto block_width = dst_format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
+-        auto dst_depth_pitch = src->textureType() == WMTTextureType3D
+-                                   ? (pDst->PlacedFootprint.Footprint.Height / block_width) * pDst->PlacedFootprint.Footprint.RowPitch
+-                                   : 0;
++        const auto block_width = dst_footprint_info.block_width;
++        const auto dst_depth_pitch = src->textureType() == WMTTextureType3D ? dst_footprint_info.slice_pitch : 0;
+ 
+         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
+         cmd_cp.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
+@@ -925,8 +1082,39 @@ public:
+                              ? (src_planar ? WMTBlitOptionStencilFromDepthStencil : WMTBlitOptionDepthFromDepthStencil)
+                              : WMTBlitOptionNone;
+       } else {
+-        // so it is buffer to buffer copy?
+-        IMPLEMENT_ME
++        auto &src = static_cast<MTLD3D12Resource *>(pSrc->pResource)->buffer;
++        if (!src)
++          return;
++
++        const UINT block_width = src_footprint_info.block_width;
++        const UINT64 row_bytes =
++            ((static_cast<UINT64>(src_box.right - src_box.left) + block_width - 1) / block_width) *
++            src_footprint_info.bytes_per_block;
++        const UINT64 copy_rows =
++            (static_cast<UINT64>(src_box.bottom - src_box.top) + block_width - 1) / block_width;
++        const UINT64 copy_depth = src_box.back - src_box.front;
++        const UINT64 src_row_start = src_box.top / block_width;
++        const UINT64 dst_row_start = DstY / block_width;
++        const UINT64 src_x_bytes =
++            (static_cast<UINT64>(src_box.left) / block_width) * src_footprint_info.bytes_per_block;
++        const UINT64 dst_x_bytes =
++            (static_cast<UINT64>(DstX) / block_width) * dst_footprint_info.bytes_per_block;
++
++        for (UINT64 z = 0; z < copy_depth; ++z) {
++          for (UINT64 row = 0; row < copy_rows; ++row) {
++            auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
++            cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
++            cmd_cp.src = src->current()->buffer();
++            cmd_cp.src_offset = pSrc->PlacedFootprint.Offset +
++                                (static_cast<UINT64>(src_box.front) + z) * src_footprint_info.slice_pitch +
++                                (src_row_start + row) * pSrc->PlacedFootprint.Footprint.RowPitch + src_x_bytes;
++            cmd_cp.dst = dst->current()->buffer();
++            cmd_cp.dst_offset = pDst->PlacedFootprint.Offset +
++                                (static_cast<UINT64>(DstZ) + z) * dst_footprint_info.slice_pitch +
++                                (dst_row_start + row) * pDst->PlacedFootprint.Footprint.RowPitch + dst_x_bytes;
++            cmd_cp.copy_length = row_bytes;
++          }
++        }
+       }
+     }
+   };
+@@ -946,10 +1134,11 @@ public:
+     if (DstDesc.Dimension != SrcDesc.Dimension)
+       return;
+ 
+-    if (!PreBlit())
+-      return;
+-
+     if (DstDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
++      if (DstDesc.Width != SrcDesc.Width || !pDst->buffer || !pSrc->buffer)
++        return;
++      if (!PreBlit())
++        return;
+       auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+       cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
+       cmd_cp.copy_length = SrcDesc.Width;
+@@ -960,12 +1149,21 @@ public:
+       return;
+     }
+ 
++    if (!pDst->texture || !pSrc->texture ||
++        DstDesc.Width != SrcDesc.Width || DstDesc.Height != SrcDesc.Height ||
++        DstDesc.DepthOrArraySize != SrcDesc.DepthOrArraySize || DstDesc.MipLevels != SrcDesc.MipLevels ||
++        DstDesc.SampleDesc.Count != SrcDesc.SampleDesc.Count || DstDesc.SampleDesc.Quality != SrcDesc.SampleDesc.Quality)
++      return;
++
+     // TODO: handle reinterpret copy
+     if (pDst->texture->pixelFormat() != pSrc->texture->pixelFormat()) {
+       WARN("CopyResource: TODO: reinterpret copy");
+       return;
+     }
+ 
++    if (!PreBlit())
++      return;
++
+     auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_texture>();
+     cmd_cp.type = WMTBlitCommandCopyTexture;
+     cmd_cp.src = pSrc->texture->current()->texture();
+diff --git a/src/d3d12/d3d12_descriptor_heap.cpp b/src/d3d12/d3d12_descriptor_heap.cpp
+index 18e2760..1604416 100644
+--- a/src/d3d12/d3d12_descriptor_heap.cpp
++++ b/src/d3d12/d3d12_descriptor_heap.cpp
+@@ -106,14 +106,20 @@ public:
+       IMPLEMENT_ME
+ #endif
+       buffer_->rename(buffer_->allocate(flags));
++      if (!buffer_->current())
++        return E_OUTOFMEMORY;
+       mapped_argument_buffer_ =
+           reinterpret_cast<ShaderVisibleDescriptorGPUStorage *>(buffer_->current()->mappedMemory(0));
++      if (!mapped_argument_buffer_)
++        return E_OUTOFMEMORY;
+       argument_buffer_gpu_address_ = buffer_->current()->gpuAddress();
+       device_->RegisterResidencyAndVA(buffer_->current());
+     } else {
+       mapped_argument_buffer_ = reinterpret_cast<ShaderVisibleDescriptorGPUStorage *>(
+-          malloc(descriptors_.size() * sizeof(ShaderVisibleDescriptorGPUStorage))
++          calloc(descriptors_.size(), sizeof(ShaderVisibleDescriptorGPUStorage))
+       );
++      if (!descriptors_.empty() && !mapped_argument_buffer_)
++        return E_OUTOFMEMORY;
+     }
+ 
+     return S_OK;
+@@ -239,7 +245,7 @@ public:
+   }
+ 
+   virtual HRESULT
+-  AddUnorderedAccessView(UINT Index, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT CounterOffsetInBytes) {
++  AddUnorderedAccessView(UINT Index, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT64 CounterOffsetInBytes) {
+     if (Index >= descriptors_.size())
+       return E_INVALIDARG;
+     auto &cpu_storage = descriptors_[Index];
+@@ -273,11 +279,11 @@ public:
+       auto &gpu_storage = mapped_argument_buffer_[Index];
+       if (Buffer) {
+         auto &buffer_view = Buffer->view_(View);
+-        gpu_storage.UAVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
+-        gpu_storage.UAVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | (uint64_t)(Slice.firstElement);
++        gpu_storage.SRVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
++        gpu_storage.SRVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | (uint64_t)(Slice.firstElement);
+       } else {
+-        gpu_storage.UAVTexelBuffer.resource_id = 0;
+-        gpu_storage.UAVTexelBuffer.metadata = 0;
++        gpu_storage.SRVTexelBuffer.resource_id = 0;
++        gpu_storage.SRVTexelBuffer.metadata = 0;
+       }
+     }
+     return S_OK;
+@@ -307,36 +313,26 @@ public:
+   AddShaderResourceView(UINT Index, D3D12_SHADER_RESOURCE_VIEW_DESC const *pDesc) {
+     if (Index >= descriptors_.size())
+       return E_INVALIDARG;
+-    if (!pDesc)
+-      return E_INVALIDARG;
+-    /**
+-     * TODO: support null descriptor properly (respect different view dimensions)
+-     */
+     auto &cpu_storage = descriptors_[Index];
+     cpu_storage.type = ShaderVisibleDescriptorType::Null;
+     if (mapped_argument_buffer_) {
+       auto &gpu_storage = mapped_argument_buffer_[Index];
+       gpu_storage.ZeroFilled = {{}};
+     }
+-    return S_OK;
++    return pDesc ? S_OK : E_INVALIDARG;
+   }
+ 
+   virtual HRESULT
+   AddUnorderedAccessView(UINT Index, D3D12_UNORDERED_ACCESS_VIEW_DESC const *pDesc) {
+     if (Index >= descriptors_.size())
+       return E_INVALIDARG;
+-    if (!pDesc)
+-      return E_INVALIDARG;
+-    /**
+-     * TODO: support null descriptor properly (respect different view dimensions)
+-     */
+     auto &cpu_storage = descriptors_[Index];
+     cpu_storage.type = ShaderVisibleDescriptorType::Null;
+     if (mapped_argument_buffer_) {
+       auto &gpu_storage = mapped_argument_buffer_[Index];
+       gpu_storage.ZeroFilled = {{}};
+     }
+-    return S_OK;
++    return pDesc ? S_OK : E_INVALIDARG;
+   }
+ 
+   virtual ShaderVisibleDescriptorCPUStorage const &
+@@ -490,13 +486,19 @@ public:
+       IMPLEMENT_ME
+ #endif
+       buffer_->rename(buffer_->allocate(flags));
++      if (!buffer_->current())
++        return E_OUTOFMEMORY;
+       mapped_argument_buffer_ = reinterpret_cast<SamplerGPUStorage *>(buffer_->current()->mappedMemory(0));
++      if (!mapped_argument_buffer_)
++        return E_OUTOFMEMORY;
+       argument_buffer_gpu_address_ = buffer_->current()->gpuAddress();
+       // FIXME: is residency required for descriptor heap? Should be the case for Metal 4
+       device_->RegisterResidencyAndVA(buffer_->current());
+     } else {
+       mapped_argument_buffer_ =
+-          reinterpret_cast<SamplerGPUStorage *>(malloc(samplers_.size() * sizeof(SamplerGPUStorage)));
++          reinterpret_cast<SamplerGPUStorage *>(calloc(samplers_.size(), sizeof(SamplerGPUStorage)));
++      if (!samplers_.empty() && !mapped_argument_buffer_)
++        return E_OUTOFMEMORY;
+     }
+ 
+     return S_OK;
+@@ -628,4 +630,4 @@ CreateDescriptorHeap(
+   return E_INVALIDARG;
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/d3d12/d3d12_descriptor_heap.hpp b/src/d3d12/d3d12_descriptor_heap.hpp
+index 3d8a1f2..b097e76 100644
+--- a/src/d3d12/d3d12_descriptor_heap.hpp
++++ b/src/d3d12/d3d12_descriptor_heap.hpp
+@@ -140,7 +140,7 @@ public:
+   virtual HRESULT AddUnorderedAccessView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
+ 
+   virtual HRESULT AddUnorderedAccessView(
+-      UINT Index, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT CounterOffsetInBytes
++      UINT Index, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT64 CounterOffsetInBytes
+   ) = 0;
+ 
+   virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
+@@ -181,4 +181,4 @@ public:
+   virtual void CopyDescriptors(UINT From, MTLD3D12RenderTargetDescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) = 0;
+ };
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/d3d12/d3d12_heap.cpp b/src/d3d12/d3d12_heap.cpp
+index 2448ed0..fd2d638 100644
+--- a/src/d3d12/d3d12_heap.cpp
++++ b/src/d3d12/d3d12_heap.cpp
+@@ -58,6 +58,8 @@ public:
+ 
+   HRESULT
+   Initialize(const D3D12_HEAP_DESC *pDesc) {
++    if (!pDesc)
++      return E_INVALIDARG;
+     if (pDesc->Flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY)
+       return E_INVALIDARG; // must be committed resource
+ 
+@@ -81,13 +83,15 @@ public:
+     if (!size_aligned)
+       return E_INVALIDARG;
+ 
+-    WMTHeapInfo info;
+-    info.options = {}; // FIXME: ensure this agrees with {Buffer|Texture}AllocationFlag?
++    WMTHeapInfo info = {};
++    info.options = {};
+     info.size = size_aligned;
+     info.sparse_page_size = WMTSparsePageSize16;
+     info.type = WMTHeapTypePlacement;
+ 
+     heap = device_->GetMTLDevice().newHeap(info);
++    if (!heap)
++      return E_OUTOFMEMORY;
+ 
+     device_->RegisterResidency(heap);
+ 
+@@ -113,4 +117,4 @@ CreateHeap(MTLD3D12Device *pDevice, const D3D12_HEAP_DESC *pDesc, REFIID riid, v
+   return heap->QueryInterface(riid, ppHeap);
+ }
+ 
+-}; // namespace dxmt
+\ No newline at end of file
++}; // namespace dxmt
+diff --git a/src/d3d12/d3d12_resource_contract.hpp b/src/d3d12/d3d12_resource_contract.hpp
+new file mode 100644
+index 0000000..2d2014c
+--- /dev/null
++++ b/src/d3d12/d3d12_resource_contract.hpp
+@@ -0,0 +1,82 @@
++#pragma once
++
++#include <cstdint>
++
++namespace dxmt::resource_contract {
++
++inline bool
++CheckedAdd(uint64_t a, uint64_t b, uint64_t &result) {
++  if (b > UINT64_MAX - a)
++    return false;
++  result = a + b;
++  return true;
++}
++
++inline bool
++CheckedMul(uint64_t a, uint64_t b, uint64_t &result) {
++  if (a && b > UINT64_MAX / a)
++    return false;
++  result = a * b;
++  return true;
++}
++
++inline bool
++RangeFits(uint64_t offset, uint64_t length, uint64_t total) {
++  return offset <= total && length <= total - offset;
++}
++
++inline bool
++ResolveRange(uint32_t first, uint32_t requested, uint32_t total, uint32_t &resolved) {
++  if (first >= total)
++    return false;
++  resolved = requested == UINT32_MAX ? total - first : requested;
++  return resolved && resolved <= total - first;
++}
++
++inline bool
++PlacementFits(uint64_t offset, uint64_t size, uint64_t heap_size, uint64_t d3d_alignment, uint64_t metal_alignment) {
++  if (!d3d_alignment || (offset % d3d_alignment))
++    return false;
++  if (metal_alignment && (offset % metal_alignment))
++    return false;
++  return RangeFits(offset, size, heap_size);
++}
++
++struct FootprintLayout {
++  uint64_t row_size = 0;
++  uint64_t row_count = 0;
++  uint64_t slice_pitch = 0;
++};
++
++inline bool
++ValidateFootprintRange(
++    uint64_t width, uint64_t height, uint64_t depth, uint32_t bytes_per_block, uint32_t block_width,
++    uint32_t row_pitch, uint64_t offset, uint64_t buffer_size,
++    uint32_t placement_alignment, uint32_t pitch_alignment, FootprintLayout &layout
++) {
++  if (!width || !height || !depth || !bytes_per_block || !block_width || !row_pitch ||
++      !placement_alignment || !pitch_alignment || (offset % placement_alignment) || (row_pitch % pitch_alignment))
++    return false;
++
++  const uint64_t block_columns = (width + block_width - 1) / block_width;
++  layout.row_count = (height + block_width - 1) / block_width;
++  if (!CheckedMul(block_columns, bytes_per_block, layout.row_size) || layout.row_size > row_pitch)
++    return false;
++  if (!CheckedMul(row_pitch, layout.row_count, layout.slice_pitch))
++    return false;
++
++  uint64_t required = layout.row_size;
++  if (layout.row_count > 1) {
++    uint64_t rows_before_last = 0;
++    if (!CheckedMul(row_pitch, layout.row_count - 1, rows_before_last) || !CheckedAdd(required, rows_before_last, required))
++      return false;
++  }
++  if (depth > 1) {
++    uint64_t slices_before_last = 0;
++    if (!CheckedMul(layout.slice_pitch, depth - 1, slices_before_last) || !CheckedAdd(required, slices_before_last, required))
++      return false;
++  }
++  return RangeFits(offset, required, buffer_size);
++}
++
++} // namespace dxmt::resource_contract
+diff --git a/src/d3d12/d3d12_texture.cpp b/src/d3d12/d3d12_texture.cpp
+index 174b3b6..71414fa 100644
+--- a/src/d3d12/d3d12_texture.cpp
++++ b/src/d3d12/d3d12_texture.cpp
+@@ -18,11 +18,49 @@
+ 
+ #include "d3d12_device.hpp"
+ #include "d3d12_pageable.hpp"
++#include "d3d12_resource_contract.hpp"
+ #include "dxmt_format.hpp"
+ #include "com/com_pointer.hpp"
+ 
+ namespace dxmt {
+ 
++namespace {
++
++bool
++ResolveViewRange(UINT first, UINT requested, UINT total, UINT &resolved) {
++  return resource_contract::ResolveRange(first, requested, total, resolved);
++}
++
++bool
++IsTypelessTextureFormat(WMT::Device device, DXGI_FORMAT format) {
++  MTL_DXGI_FORMAT_DESC metal_format;
++  return SUCCEEDED(MTLQueryDXGIFormat(device, format, metal_format)) &&
++         (metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS);
++}
++
++HRESULT
++ValidateTexturePlane(
++    WMT::Device device, DXGI_FORMAT resource_format, DXGI_FORMAT view_format, UINT plane_slice
++) {
++  MTL_DXGI_FORMAT_DESC resource_metal_format;
++  MTL_DXGI_FORMAT_DESC view_metal_format;
++  if (FAILED(MTLQueryDXGIFormat(device, resource_format, resource_metal_format)) ||
++      FAILED(MTLQueryDXGIFormat(device, view_format, view_metal_format)))
++    return E_INVALIDARG;
++  if (plane_slice >= resource_metal_format.PlanarCount)
++    return E_INVALIDARG;
++  if (resource_metal_format.PlanarCount == 1)
++    return plane_slice == 0 ? S_OK : E_INVALIDARG;
++
++  const bool depth = view_metal_format.Flag & MTL_DXGI_FORMAT_DEPTH_PLANER;
++  const bool stencil = view_metal_format.Flag & MTL_DXGI_FORMAT_STENCIL_PLANER;
++  if (depth == stencil)
++    return E_INVALIDARG;
++  return plane_slice == (stencil ? 1u : 0u) ? S_OK : E_INVALIDARG;
++}
++
++} // namespace
++
+ HRESULT
+ PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc) {
+   MTL_DXGI_FORMAT_DESC Format;
+@@ -209,7 +247,10 @@ public:
+ 
+     if (pHeap) {
+       auto size_and_align = device_->GetMTLDevice().heapTextureSizeAndAlign(texture_info);
+-      if (size_and_align.size + HeapOffset > pHeap->GetDesc().SizeInBytes)
++      const UINT64 heap_size = pHeap->GetDesc().SizeInBytes;
++      if (!resource_contract::PlacementFits(
++              HeapOffset, size_and_align.size, heap_size, desc_.Alignment, size_and_align.align
++          ))
+         return E_INVALIDARG;
+     }
+ 
+@@ -366,13 +407,18 @@ public:
+     HRESULT hr;
+     D3D12_SHADER_RESOURCE_VIEW_DESC ViewDesc;
+     if (!pDesc) {
++      if (IsTypelessTextureFormat(device_->GetMTLDevice(), desc_.Format))
++        return E_INVALIDARG;
+       hr = ExtractEntireResourceViewDescription(desc_, &ViewDesc);
+       if (FAILED(hr))
+         return hr;
+     } else {
+       ViewDesc = *pDesc;
+-      if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN)
++      if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN) {
++        if (IsTypelessTextureFormat(device_->GetMTLDevice(), desc_.Format))
++          return E_INVALIDARG;
+         ViewDesc.Format = desc_.Format;
++      }
+     }
+ 
+     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
+@@ -394,12 +440,12 @@ public:
+ 
+     switch (ViewDesc.ViewDimension) {
+     case D3D12_SRV_DIMENSION_TEXTURE1D: {
++      UINT mip_count = 0;
++      if (!ResolveViewRange(ViewDesc.Texture1D.MostDetailedMip, ViewDesc.Texture1D.MipLevels, desc_.MipLevels, mip_count))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
+       view_descriptor.firstMiplevel = ViewDesc.Texture1D.MostDetailedMip;
+-      if (ViewDesc.Texture1D.MipLevels == ~0u)
+-        view_descriptor.miplevelCount = desc_.MipLevels - ViewDesc.Texture1D.MostDetailedMip;
+-      else
+-        view_descriptor.miplevelCount = ViewDesc.Texture1D.MipLevels;
++      view_descriptor.miplevelCount = mip_count;
+       view_descriptor.firstArraySlice = 0;
+       view_descriptor.arraySize = 1;
+       View = texture->createView(view_descriptor);
+@@ -407,28 +453,32 @@ public:
+       break;
+     }
+     case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: {
++      UINT mip_count = 0, array_size = 0;
++      if (!ResolveViewRange(
++              ViewDesc.Texture1DArray.MostDetailedMip, ViewDesc.Texture1DArray.MipLevels, desc_.MipLevels, mip_count
++          ) ||
++          !ResolveViewRange(
++              ViewDesc.Texture1DArray.FirstArraySlice, ViewDesc.Texture1DArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DArray;
+       view_descriptor.firstMiplevel = ViewDesc.Texture1DArray.MostDetailedMip;
+-      if (ViewDesc.Texture1DArray.MipLevels == ~0u)
+-        view_descriptor.miplevelCount = desc_.MipLevels - ViewDesc.Texture1DArray.MostDetailedMip;
+-      else
+-        view_descriptor.miplevelCount = ViewDesc.Texture1DArray.MipLevels;
++      view_descriptor.miplevelCount = mip_count;
+       view_descriptor.firstArraySlice = ViewDesc.Texture1DArray.FirstArraySlice;
+-      if (ViewDesc.Texture1DArray.ArraySize == ~0u)
+-        view_descriptor.arraySize = desc_.DepthOrArraySize - ViewDesc.Texture1DArray.FirstArraySlice;
+-      else
+-        view_descriptor.arraySize = ViewDesc.Texture1DArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       View = texture->createView(view_descriptor);
+       ResourceMinLODClamp = ViewDesc.Texture1DArray.ResourceMinLODClamp;
+       break;
+     }
+     case D3D12_SRV_DIMENSION_TEXTURE2D: {
++      UINT mip_count = 0;
++      if (!ResolveViewRange(ViewDesc.Texture2D.MostDetailedMip, ViewDesc.Texture2D.MipLevels, desc_.MipLevels, mip_count) ||
++          FAILED(ValidateTexturePlane(device_->GetMTLDevice(), desc_.Format, ViewDesc.Format, ViewDesc.Texture2D.PlaneSlice)))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
+       view_descriptor.firstMiplevel = ViewDesc.Texture2D.MostDetailedMip;
+-      if (ViewDesc.Texture2D.MipLevels == ~0u)
+-        view_descriptor.miplevelCount = desc_.MipLevels - ViewDesc.Texture2D.MostDetailedMip;
+-      else
+-        view_descriptor.miplevelCount = ViewDesc.Texture2D.MipLevels;
++      view_descriptor.miplevelCount = mip_count;
+       view_descriptor.firstArraySlice = 0;
+       view_descriptor.arraySize = 1;
+       View = texture->createView(view_descriptor);
+@@ -436,28 +486,35 @@ public:
+       break;
+     }
+     case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: {
++      UINT mip_count = 0, array_size = 0;
++      if (!ResolveViewRange(
++              ViewDesc.Texture2DArray.MostDetailedMip, ViewDesc.Texture2DArray.MipLevels, desc_.MipLevels, mip_count
++          ) ||
++          !ResolveViewRange(
++              ViewDesc.Texture2DArray.FirstArraySlice, ViewDesc.Texture2DArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ) ||
++          FAILED(ValidateTexturePlane(
++              device_->GetMTLDevice(), desc_.Format, ViewDesc.Format, ViewDesc.Texture2DArray.PlaneSlice
++          )))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DArray;
+       view_descriptor.firstMiplevel = ViewDesc.Texture2DArray.MostDetailedMip;
+-      if (ViewDesc.Texture2DArray.MipLevels == ~0u)
+-        view_descriptor.miplevelCount = desc_.MipLevels - ViewDesc.Texture2DArray.MostDetailedMip;
+-      else
+-        view_descriptor.miplevelCount = ViewDesc.Texture2DArray.MipLevels;
++      view_descriptor.miplevelCount = mip_count;
+       view_descriptor.firstArraySlice = ViewDesc.Texture2DArray.FirstArraySlice;
+-      if (ViewDesc.Texture2DArray.ArraySize == ~0u)
+-        view_descriptor.arraySize = desc_.DepthOrArraySize - ViewDesc.Texture2DArray.FirstArraySlice;
+-      else
+-        view_descriptor.arraySize = ViewDesc.Texture2DArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       View = texture->createView(view_descriptor);
+       ResourceMinLODClamp = ViewDesc.Texture2DArray.ResourceMinLODClamp;
+       break;
+     }
+     case D3D12_SRV_DIMENSION_TEXTURECUBE: {
++      UINT mip_count = 0;
++      if (desc_.DepthOrArraySize < 6 ||
++          !ResolveViewRange(ViewDesc.TextureCube.MostDetailedMip, ViewDesc.TextureCube.MipLevels, desc_.MipLevels, mip_count))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureTypeCube; // FIXME: lowering to cube array
+       view_descriptor.firstMiplevel = ViewDesc.TextureCube.MostDetailedMip;
+-      if (ViewDesc.TextureCube.MipLevels == ~0u)
+-        view_descriptor.miplevelCount = desc_.MipLevels - ViewDesc.TextureCube.MostDetailedMip;
+-      else
+-        view_descriptor.miplevelCount = ViewDesc.TextureCube.MipLevels;
++      view_descriptor.miplevelCount = mip_count;
+       view_descriptor.firstArraySlice = 0;
+       view_descriptor.arraySize = 6;
+       View = texture->createView(view_descriptor);
+@@ -465,16 +522,24 @@ public:
+       break;
+     }
+     case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: {
++      UINT mip_count = 0;
++      if (!ResolveViewRange(
++              ViewDesc.TextureCubeArray.MostDetailedMip, ViewDesc.TextureCubeArray.MipLevels, desc_.MipLevels, mip_count
++          ) ||
++          (ViewDesc.TextureCubeArray.First2DArrayFace % 6) ||
++          ViewDesc.TextureCubeArray.First2DArrayFace >= desc_.DepthOrArraySize)
++        return E_INVALIDARG;
++      const UINT remaining_faces = desc_.DepthOrArraySize - ViewDesc.TextureCubeArray.First2DArrayFace;
++      UINT cube_count = ViewDesc.TextureCubeArray.NumCubes == UINT_MAX
++                            ? remaining_faces / 6
++                            : ViewDesc.TextureCubeArray.NumCubes;
++      if (!cube_count || cube_count > remaining_faces / 6)
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureTypeCubeArray;
+       view_descriptor.firstMiplevel = ViewDesc.TextureCubeArray.MostDetailedMip;
+-      if (ViewDesc.TextureCubeArray.MipLevels == ~0u)
+-        view_descriptor.miplevelCount = desc_.MipLevels - ViewDesc.TextureCubeArray.MostDetailedMip;
+-      else
+-        view_descriptor.miplevelCount = ViewDesc.TextureCubeArray.MipLevels;
+-      if (ViewDesc.TextureCubeArray.NumCubes == ~0u)
+-        view_descriptor.arraySize = desc_.DepthOrArraySize - ViewDesc.TextureCubeArray.First2DArrayFace;
+-      else
+-        view_descriptor.arraySize = ViewDesc.TextureCubeArray.NumCubes * 6;
++      view_descriptor.miplevelCount = mip_count;
++      view_descriptor.firstArraySlice = ViewDesc.TextureCubeArray.First2DArrayFace;
++      view_descriptor.arraySize = cube_count * 6;
+       View = texture->createView(view_descriptor);
+       ResourceMinLODClamp = ViewDesc.TextureCubeArray.ResourceMinLODClamp;
+       break;
+@@ -489,24 +554,27 @@ public:
+       break;
+     }
+     case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: {
++      UINT array_size = 0;
++      if (!ResolveViewRange(
++              ViewDesc.Texture2DMSArray.FirstArraySlice, ViewDesc.Texture2DMSArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DMultisampleArray;
+       view_descriptor.firstMiplevel = 0;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = ViewDesc.Texture2DMSArray.FirstArraySlice;
+-      if (ViewDesc.Texture2DMSArray.ArraySize == ~0u)
+-        view_descriptor.arraySize = desc_.DepthOrArraySize - ViewDesc.Texture2DMSArray.FirstArraySlice;
+-      else
+-        view_descriptor.arraySize = ViewDesc.Texture2DMSArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       View = texture->createView(view_descriptor);
+       break;
+     }
+     case D3D12_SRV_DIMENSION_TEXTURE3D: {
++      UINT mip_count = 0;
++      if (!ResolveViewRange(ViewDesc.Texture3D.MostDetailedMip, ViewDesc.Texture3D.MipLevels, desc_.MipLevels, mip_count))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType3D;
+       view_descriptor.firstMiplevel = ViewDesc.Texture3D.MostDetailedMip;
+-      if (ViewDesc.Texture3D.MipLevels == ~0u)
+-        view_descriptor.miplevelCount = desc_.MipLevels - ViewDesc.Texture3D.MostDetailedMip;
+-      else
+-        view_descriptor.miplevelCount = ViewDesc.Texture3D.MipLevels;
++      view_descriptor.miplevelCount = mip_count;
+       view_descriptor.firstArraySlice = 0;
+       view_descriptor.arraySize = 1;
+       View = texture->createView(view_descriptor);
+@@ -526,16 +594,23 @@ public:
+   CreateUnorderedAccessView(
+       ID3D12Resource *pCounter, const D3D12_UNORDERED_ACCESS_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor
+   ) {
++    if (pCounter)
++      return E_INVALIDARG;
+     HRESULT hr;
+     D3D12_UNORDERED_ACCESS_VIEW_DESC ViewDesc;
+     if (!pDesc) {
++      if (IsTypelessTextureFormat(device_->GetMTLDevice(), desc_.Format))
++        return E_INVALIDARG;
+       hr = ExtractEntireResourceViewDescription(desc_, &ViewDesc);
+       if (FAILED(hr))
+         return hr;
+     } else {
+       ViewDesc = *pDesc;
+-      if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN)
++      if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN) {
++        if (IsTypelessTextureFormat(device_->GetMTLDevice(), desc_.Format))
++          return E_INVALIDARG;
+         ViewDesc.Format = desc_.Format;
++      }
+     }
+ 
+     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
+@@ -546,11 +621,15 @@ public:
+     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
+     if (FAILED(hr))
+       return hr;
++    if (metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))
++      return E_INVALIDARG;
+ 
+     view_descriptor.format = metal_format.PixelFormat;
+ 
+     switch (ViewDesc.ViewDimension) {
+     case D3D12_UAV_DIMENSION_TEXTURE1D: {
++      if (ViewDesc.Texture1D.MipSlice >= desc_.MipLevels)
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
+       view_descriptor.firstMiplevel = ViewDesc.Texture1D.MipSlice;
+       view_descriptor.miplevelCount = 1;
+@@ -560,6 +639,9 @@ public:
+       break;
+     }
+     case D3D12_UAV_DIMENSION_TEXTURE2D: {
++      if (ViewDesc.Texture2D.MipSlice >= desc_.MipLevels ||
++          FAILED(ValidateTexturePlane(device_->GetMTLDevice(), desc_.Format, ViewDesc.Format, ViewDesc.Texture2D.PlaneSlice)))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
+       view_descriptor.firstMiplevel = ViewDesc.Texture2D.MipSlice;
+       view_descriptor.miplevelCount = 1;
+@@ -569,39 +651,55 @@ public:
+       break;
+     }
+     case D3D12_UAV_DIMENSION_TEXTURE1DARRAY: {
++      UINT array_size = 0;
++      if (ViewDesc.Texture1DArray.MipSlice >= desc_.MipLevels ||
++          !ResolveViewRange(
++              ViewDesc.Texture1DArray.FirstArraySlice, ViewDesc.Texture1DArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DArray;
+       view_descriptor.firstMiplevel = ViewDesc.Texture1DArray.MipSlice;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = ViewDesc.Texture1DArray.FirstArraySlice;
+-      if (ViewDesc.Texture1DArray.ArraySize == ~0u)
+-        view_descriptor.arraySize = desc_.DepthOrArraySize - ViewDesc.Texture1DArray.FirstArraySlice;
+-      else
+-        view_descriptor.arraySize = ViewDesc.Texture1DArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       View = texture->createView(view_descriptor);
+       break;
+     }
+     case D3D12_UAV_DIMENSION_TEXTURE2DARRAY: {
++      UINT array_size = 0;
++      if (ViewDesc.Texture2DArray.MipSlice >= desc_.MipLevels ||
++          !ResolveViewRange(
++              ViewDesc.Texture2DArray.FirstArraySlice, ViewDesc.Texture2DArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ) ||
++          FAILED(ValidateTexturePlane(
++              device_->GetMTLDevice(), desc_.Format, ViewDesc.Format, ViewDesc.Texture2DArray.PlaneSlice
++          )))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DArray;
+       view_descriptor.firstMiplevel = ViewDesc.Texture2DArray.MipSlice;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = ViewDesc.Texture2DArray.FirstArraySlice;
+-      if (ViewDesc.Texture2DArray.ArraySize == ~0u)
+-        view_descriptor.arraySize = desc_.DepthOrArraySize - ViewDesc.Texture2DArray.FirstArraySlice;
+-      else
+-        view_descriptor.arraySize = ViewDesc.Texture2DArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       View = texture->createView(view_descriptor);
+       break;
+     }
+     case D3D12_UAV_DIMENSION_TEXTURE3D: {
++      if (ViewDesc.Texture3D.MipSlice >= desc_.MipLevels)
++        return E_INVALIDARG;
++      const UINT mip_depth = std::max<UINT>(1u, static_cast<UINT>(desc_.DepthOrArraySize) >> ViewDesc.Texture3D.MipSlice);
++      UINT w_size = 0;
++      if (!ResolveViewRange(ViewDesc.Texture3D.FirstWSlice, ViewDesc.Texture3D.WSize, mip_depth, w_size))
++        return E_INVALIDARG;
++      if (ViewDesc.Texture3D.FirstWSlice != 0 || w_size != mip_depth)
++        return E_NOTIMPL;
+       view_descriptor.type = WMTTextureType3D;
+       view_descriptor.firstMiplevel = ViewDesc.Texture3D.MipSlice;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = 0;
+       view_descriptor.arraySize = 1;
+       View = texture->createView(view_descriptor);
+-      if (ViewDesc.Texture3D.FirstWSlice > 0) {
+-        ERR("3D UAV with WSlice unsupported");
+-      }
+       break;
+     }
+     default:
+@@ -616,13 +714,18 @@ public:
+     HRESULT hr;
+     D3D12_RENDER_TARGET_VIEW_DESC ViewDesc;
+     if (!pDesc) {
++      if (IsTypelessTextureFormat(device_->GetMTLDevice(), desc_.Format))
++        return E_INVALIDARG;
+       hr = ExtractEntireResourceViewDescription(desc_, &ViewDesc);
+       if (FAILED(hr))
+         return hr;
+     } else {
+       ViewDesc = *pDesc;
+-      if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN)
++      if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN) {
++        if (IsTypelessTextureFormat(device_->GetMTLDevice(), desc_.Format))
++          return E_INVALIDARG;
+         ViewDesc.Format = desc_.Format;
++      }
+     }
+ 
+     auto [Heap, Index] = GetRenderTargetHeap(device_, Descriptor);
+@@ -633,6 +736,8 @@ public:
+     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
+     if (FAILED(hr))
+       return hr;
++    if (metal_format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))
++      return E_INVALIDARG;
+ 
+     view_descriptor.format = metal_format.PixelFormat;
+ 
+@@ -643,6 +748,8 @@ public:
+ 
+     switch (ViewDesc.ViewDimension) {
+     case D3D12_RTV_DIMENSION_TEXTURE1D: {
++      if (ViewDesc.Texture1D.MipSlice >= desc_.MipLevels)
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
+       view_descriptor.firstMiplevel = ViewDesc.Texture1D.MipSlice;
+       view_descriptor.miplevelCount = 1;
+@@ -652,19 +759,26 @@ public:
+       break;
+     }
+     case D3D12_RTV_DIMENSION_TEXTURE1DARRAY: {
++      UINT array_size = 0;
++      if (ViewDesc.Texture1DArray.MipSlice >= desc_.MipLevels ||
++          !ResolveViewRange(
++              ViewDesc.Texture1DArray.FirstArraySlice, ViewDesc.Texture1DArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DArray;
+       view_descriptor.firstMiplevel = ViewDesc.Texture1DArray.MipSlice;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = ViewDesc.Texture1DArray.FirstArraySlice;
+-      view_descriptor.arraySize =
+-          ViewDesc.Texture1DArray.ArraySize == ~0u ? texture->arrayLength() : ViewDesc.Texture1DArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       RenderTargetDesc.RenderTargetArrayLength = view_descriptor.arraySize;
+       View = texture->createView(view_descriptor);
+       break;
+     }
+     case D3D12_RTV_DIMENSION_TEXTURE2D: {
+-      if (ViewDesc.Texture2D.PlaneSlice)
+-        IMPLEMENT_ME
++      if (ViewDesc.Texture2D.MipSlice >= desc_.MipLevels ||
++          FAILED(ValidateTexturePlane(device_->GetMTLDevice(), desc_.Format, ViewDesc.Format, ViewDesc.Texture2D.PlaneSlice)))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
+       view_descriptor.firstMiplevel = ViewDesc.Texture2D.MipSlice;
+       view_descriptor.miplevelCount = 1;
+@@ -674,14 +788,21 @@ public:
+       break;
+     }
+     case D3D12_RTV_DIMENSION_TEXTURE2DARRAY: {
+-      if (ViewDesc.Texture2DArray.PlaneSlice)
+-        IMPLEMENT_ME
++      UINT array_size = 0;
++      if (ViewDesc.Texture2DArray.MipSlice >= desc_.MipLevels ||
++          !ResolveViewRange(
++              ViewDesc.Texture2DArray.FirstArraySlice, ViewDesc.Texture2DArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ) ||
++          FAILED(ValidateTexturePlane(
++              device_->GetMTLDevice(), desc_.Format, ViewDesc.Format, ViewDesc.Texture2DArray.PlaneSlice
++          )))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DArray;
+       view_descriptor.firstMiplevel = ViewDesc.Texture2DArray.MipSlice;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = ViewDesc.Texture2DArray.FirstArraySlice;
+-      view_descriptor.arraySize =
+-          ViewDesc.Texture2DArray.ArraySize == ~0u ? texture->arrayLength() : ViewDesc.Texture2DArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       RenderTargetDesc.RenderTargetArrayLength = view_descriptor.arraySize;
+       View = texture->createView(view_descriptor);
+       break;
+@@ -696,25 +817,35 @@ public:
+       break;
+     }
+     case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY: {
++      UINT array_size = 0;
++      if (!ResolveViewRange(
++              ViewDesc.Texture2DMSArray.FirstArraySlice, ViewDesc.Texture2DMSArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DMultisampleArray;
+       view_descriptor.firstMiplevel = 0;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = ViewDesc.Texture2DMSArray.FirstArraySlice;
+-      view_descriptor.arraySize =
+-          ViewDesc.Texture2DMSArray.ArraySize == ~0u ? texture->arrayLength() : ViewDesc.Texture2DMSArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       RenderTargetDesc.RenderTargetArrayLength = view_descriptor.arraySize;
+       View = texture->createView(view_descriptor);
+       break;
+     }
+     case D3D12_RTV_DIMENSION_TEXTURE3D: {
++      if (ViewDesc.Texture3D.MipSlice >= desc_.MipLevels)
++        return E_INVALIDARG;
++      const UINT mip_depth = std::max<UINT>(1u, static_cast<UINT>(desc_.DepthOrArraySize) >> ViewDesc.Texture3D.MipSlice);
++      UINT w_size = 0;
++      if (!ResolveViewRange(ViewDesc.Texture3D.FirstWSlice, ViewDesc.Texture3D.WSize, mip_depth, w_size))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType3D;
+       view_descriptor.firstMiplevel = ViewDesc.Texture3D.MipSlice;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = 0;
+       view_descriptor.arraySize = 1;
+-      auto ArraySize = std::max<UINT16>(desc_.DepthOrArraySize >> ViewDesc.Texture3D.MipSlice, 1);
+       RenderTargetDesc.DepthPlane = ViewDesc.Texture3D.FirstWSlice;
+-      RenderTargetDesc.RenderTargetArrayLength = ViewDesc.Texture3D.WSize == ~0u ? ArraySize : ViewDesc.Texture3D.WSize;
++      RenderTargetDesc.RenderTargetArrayLength = w_size;
+       View = texture->createView(view_descriptor);
+       break;
+     }
+@@ -735,13 +866,18 @@ public:
+     HRESULT hr;
+     D3D12_DEPTH_STENCIL_VIEW_DESC ViewDesc;
+     if (!pDesc) {
++      if (IsTypelessTextureFormat(device_->GetMTLDevice(), desc_.Format))
++        return E_INVALIDARG;
+       hr = ExtractEntireResourceViewDescription(desc_, &ViewDesc);
+       if (FAILED(hr))
+         return hr;
+     } else {
+       ViewDesc = *pDesc;
+-      if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN)
++      if (ViewDesc.Format == DXGI_FORMAT_UNKNOWN) {
++        if (IsTypelessTextureFormat(device_->GetMTLDevice(), desc_.Format))
++          return E_INVALIDARG;
+         ViewDesc.Format = desc_.Format;
++      }
+     }
+ 
+     auto [Heap, Index] = GetRenderTargetHeap(device_, Descriptor);
+@@ -752,6 +888,10 @@ public:
+     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
+     if (FAILED(hr))
+       return hr;
++    if (!(metal_format.Flag & MTL_DXGI_FORMAT_DEPTH_PLANER))
++      return E_INVALIDARG;
++    if (ViewDesc.Flags & ~(D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL))
++      return E_INVALIDARG;
+     view_descriptor.format = metal_format.PixelFormat;
+ 
+     MTL_RENDER_TARGET_DESC RenderTargetDesc;
+@@ -761,6 +901,8 @@ public:
+ 
+     switch (ViewDesc.ViewDimension) {
+     case D3D12_DSV_DIMENSION_TEXTURE1D: {
++      if (ViewDesc.Texture1D.MipSlice >= desc_.MipLevels)
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
+       view_descriptor.firstMiplevel = ViewDesc.Texture1D.MipSlice;
+       view_descriptor.miplevelCount = 1;
+@@ -770,17 +912,25 @@ public:
+       break;
+     }
+     case D3D12_DSV_DIMENSION_TEXTURE1DARRAY: {
++      UINT array_size = 0;
++      if (ViewDesc.Texture1DArray.MipSlice >= desc_.MipLevels ||
++          !ResolveViewRange(
++              ViewDesc.Texture1DArray.FirstArraySlice, ViewDesc.Texture1DArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DArray;
+       view_descriptor.firstMiplevel = ViewDesc.Texture1DArray.MipSlice;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = ViewDesc.Texture1DArray.FirstArraySlice;
+-      view_descriptor.arraySize =
+-          ViewDesc.Texture1DArray.ArraySize == ~0u ? texture->arrayLength() : ViewDesc.Texture1DArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       RenderTargetDesc.RenderTargetArrayLength = view_descriptor.arraySize;
+       View = texture->createView(view_descriptor);
+       break;
+     }
+     case D3D12_DSV_DIMENSION_TEXTURE2D: {
++      if (ViewDesc.Texture2D.MipSlice >= desc_.MipLevels)
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
+       view_descriptor.firstMiplevel = ViewDesc.Texture2D.MipSlice;
+       view_descriptor.miplevelCount = 1;
+@@ -790,12 +940,18 @@ public:
+       break;
+     }
+     case D3D12_DSV_DIMENSION_TEXTURE2DARRAY: {
++      UINT array_size = 0;
++      if (ViewDesc.Texture2DArray.MipSlice >= desc_.MipLevels ||
++          !ResolveViewRange(
++              ViewDesc.Texture2DArray.FirstArraySlice, ViewDesc.Texture2DArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DArray;
+       view_descriptor.firstMiplevel = ViewDesc.Texture2DArray.MipSlice;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = ViewDesc.Texture2DArray.FirstArraySlice;
+-      view_descriptor.arraySize =
+-          ViewDesc.Texture2DArray.ArraySize == ~0u ? texture->arrayLength() : ViewDesc.Texture2DArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       RenderTargetDesc.RenderTargetArrayLength = view_descriptor.arraySize;
+       View = texture->createView(view_descriptor);
+       break;
+@@ -810,12 +966,17 @@ public:
+       break;
+     }
+     case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY: {
++      UINT array_size = 0;
++      if (!ResolveViewRange(
++              ViewDesc.Texture2DMSArray.FirstArraySlice, ViewDesc.Texture2DMSArray.ArraySize, desc_.DepthOrArraySize,
++              array_size
++          ))
++        return E_INVALIDARG;
+       view_descriptor.type = WMTTextureType2DMultisampleArray;
+       view_descriptor.firstMiplevel = 0;
+       view_descriptor.miplevelCount = 1;
+       view_descriptor.firstArraySlice = ViewDesc.Texture2DMSArray.FirstArraySlice;
+-      view_descriptor.arraySize =
+-          ViewDesc.Texture2DMSArray.ArraySize == ~0u ? texture->arrayLength() : ViewDesc.Texture2DMSArray.ArraySize;
++      view_descriptor.arraySize = array_size;
+       RenderTargetDesc.RenderTargetArrayLength = view_descriptor.arraySize;
+       View = texture->createView(view_descriptor);
+       break;
+@@ -879,4 +1040,4 @@ CreatePlacedTexture(
+   return texture->QueryInterface(riid, ppResource);
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt

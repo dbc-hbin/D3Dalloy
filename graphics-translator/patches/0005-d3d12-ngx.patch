@@ -1,0 +1,1026 @@
+diff --git a/src/nvngx/meson.build b/src/nvngx/meson.build
+index b94ad4b..bb0b06c 100644
+--- a/src/nvngx/meson.build
++++ b/src/nvngx/meson.build
+@@ -1,10 +1,30 @@
+ nvngx_src = [
+   'nvngx.cpp',
++  'nvngx_d3d12.cpp',
+ ]
+ 
+ nvngx_ld_args      = []
+ nvngx_link_depends = []
+ 
++if dxmt_crossbuild
++  # NVSDK_NGX_Parameter is a C++ interface consumed by MSVC-built applications.
++  # Keep its vftable in a tiny MSVC-ABI object while the storage/frontend stays
++  # in the normal DXMT MinGW translation units.
++  msvc_bridge_compiler = find_program('x86_64-w64-mingw32-g++')
++  nvngx_d3d12_msvc_obj = custom_target('nvngx_d3d12_msvc_obj',
++    input            : 'nvngx_d3d12_msvc.cpp',
++    output           : 'nvngx_d3d12_msvc.obj',
++    command          : [
++      msvc_bridge_compiler, '--target=x86_64-pc-windows-msvc', '-std=c++20',
++      '-fno-exceptions', '-fno-rtti', '-Wall', '-Wextra', '-Werror',
++      '-c', '@INPUT@', '-o', '@OUTPUT@',
++    ],
++    build_by_default : true,
++  )
++  nvngx_ld_args += [ nvngx_d3d12_msvc_obj.full_path() ]
++  nvngx_link_depends += [ nvngx_d3d12_msvc_obj ]
++endif
++
+ nvngx_dll = shared_library('nvngx', nvngx_src,
+   name_prefix         : '',
+   dependencies        : [ dxgi_dep, util_dep, winemetal_dep ],
+diff --git a/src/nvngx/nvngx.hpp b/src/nvngx/nvngx.hpp
+index 82bae54..1a49710 100644
+--- a/src/nvngx/nvngx.hpp
++++ b/src/nvngx/nvngx.hpp
+@@ -2,6 +2,10 @@
+ 
+ struct ID3D11Resource;
+ struct ID3D12Resource;
++struct ID3D12Device;
++struct ID3D12GraphicsCommandList;
++struct IDXGIAdapter;
++struct NVNGXHandle;
+ 
+ #define NVNGX_API extern "C"
+ 
+@@ -12,17 +16,23 @@ enum NVNGX_RESULT : unsigned int {
+   NVNGX_RESULT_INVALID_PARAMETER = 0xbad0005,
+ };
+ 
+-#define NVNGX_FAILED(result) (result & NVNGX_RESULT_FAIL) == NVNGX_RESULT_FAIL
++#define NVNGX_FAILED(result) (((result) & NVNGX_RESULT_FAIL) == NVNGX_RESULT_FAIL)
+ 
+ enum NVNGX_FEATURE : unsigned int {
+   NVNGX_FEATURE_SUPERSAMPLING = 1,
+ };
+ 
+ enum NVNGX_DLSS_FLAG: unsigned int {
++  NVNGX_DLSS_FLAG_HDR = 1 << 0,
+   NVNGX_DLSS_FLAG_MV_LOWRES = 1 << 1,
+   NVNGX_DLSS_FLAG_MV_JITTERED = 1 << 2,
+   NVNGX_DLSS_FLAG_DEPTH_INVERTED = 1 << 3,
++  NVNGX_DLSS_FLAG_RESERVED_0 = 1 << 4,
++  NVNGX_DLSS_FLAG_DO_SHARPENING = 1 << 5,
+   NVNGX_DLSS_FLAG_AUTO_EXPOSURE = 1 << 6,
++  NVNGX_DLSS_FLAG_ALPHA_UPSCALING = 1 << 7,
++  NVNGX_DLSS_FLAG_RESERVED_8 = 1 << 8,
++  NVNGX_DLSS_FLAG_INVALID = 1u << 31,
+ };
+ 
+ enum NVNGX_PERFQUALITY: unsigned int {
+@@ -90,7 +100,10 @@ struct NVNGX_FeatureRequirement {
+ #define NVNGX_Parameter_Depth "Depth"
+ #define NVNGX_Parameter_Reset "Reset"
+ #define NVNGX_Parameter_ExposureTexture "ExposureTexture"
++#define NVNGX_Parameter_TransparencyMask "TransparencyMask"
++#define NVNGX_Parameter_BiasCurrentColorMask "DLSS.Input.Bias.Current.Color.Mask"
+ #define NVNGX_Parameter_DLSS_Pre_Exposure "DLSS.Pre.Exposure"
++#define NVNGX_Parameter_DLSS_Exposure_Scale "DLSS.Exposure.Scale"
+ #define NVNGX_Parameter_MV_Scale_X "MV.Scale.X"
+ #define NVNGX_Parameter_MV_Scale_Y "MV.Scale.Y"
+ #define NVNGX_Parameter_Jitter_Offset_X "Jitter.Offset.X"
+@@ -102,6 +115,18 @@ struct NVNGX_FeatureRequirement {
+ 
+ #define NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Width  "DLSS.Render.Subrect.Dimensions.Width"
+ #define NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Height "DLSS.Render.Subrect.Dimensions.Height"
++#define NVNGX_Parameter_DLSS_Color_Base_X "DLSS.Input.Color.Subrect.Base.X"
++#define NVNGX_Parameter_DLSS_Color_Base_Y "DLSS.Input.Color.Subrect.Base.Y"
++#define NVNGX_Parameter_DLSS_Depth_Base_X "DLSS.Input.Depth.Subrect.Base.X"
++#define NVNGX_Parameter_DLSS_Depth_Base_Y "DLSS.Input.Depth.Subrect.Base.Y"
++#define NVNGX_Parameter_DLSS_Motion_Base_X "DLSS.Input.MV.Subrect.Base.X"
++#define NVNGX_Parameter_DLSS_Motion_Base_Y "DLSS.Input.MV.Subrect.Base.Y"
++#define NVNGX_Parameter_DLSS_Translucency_Base_X "DLSS.Input.Translucency.Subrect.Base.X"
++#define NVNGX_Parameter_DLSS_Translucency_Base_Y "DLSS.Input.Translucency.Subrect.Base.Y"
++#define NVNGX_Parameter_DLSS_Bias_Base_X "DLSS.Input.Bias.Current.Color.Subrect.Base.X"
++#define NVNGX_Parameter_DLSS_Bias_Base_Y "DLSS.Input.Bias.Current.Color.Subrect.Base.Y"
++#define NVNGX_Parameter_DLSS_Output_Base_X "DLSS.Output.Subrect.Base.X"
++#define NVNGX_Parameter_DLSS_Output_Base_Y "DLSS.Output.Subrect.Base.Y"
+ #define NVNGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width "DLSS.Get.Dynamic.Max.Render.Width"
+ #define NVNGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height "DLSS.Get.Dynamic.Max.Render.Height"
+ #define NVNGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width "DLSS.Get.Dynamic.Min.Render.Width"
+diff --git a/src/nvngx/nvngx_d3d12.cpp b/src/nvngx/nvngx_d3d12.cpp
+new file mode 100644
+index 0000000..e338dc8
+--- /dev/null
++++ b/src/nvngx/nvngx_d3d12.cpp
+@@ -0,0 +1,786 @@
++#include "nvngx_d3d12.hpp"
++
++#include "com/com_pointer.hpp"
++#include "log/log.hpp"
++#include "nvngx_parameter.hpp"
++#include "../d3d12/d3d12_interfaces.hpp"
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <new>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++namespace dxmt {
++
++extern "C" {
++unsigned long long owned_ngxd3d12_msvc_parameter_size();
++unsigned long long owned_ngxd3d12_msvc_parameter_align();
++void *owned_ngxd3d12_msvc_parameter_construct(void *memory, void *storage);
++void owned_ngxd3d12_msvc_parameter_destruct(void *object);
++}
++
++namespace {
++
++__attribute__((used)) static const char kOwnedNgxD3D12Marker[] = "own-ngxd3d12";
++
++constexpr uint32_t kFeatureSuperSampling = 1;
++constexpr uint32_t kSupportedCreateFlags =
++    NVNGX_DLSS_FLAG_HDR | NVNGX_DLSS_FLAG_MV_LOWRES | NVNGX_DLSS_FLAG_DEPTH_INVERTED |
++    NVNGX_DLSS_FLAG_DO_SHARPENING | NVNGX_DLSS_FLAG_AUTO_EXPOSURE;
++
++// Keep the legacy D3D11 shim's historical 0x0bad000x values untouched, but
++// return NVIDIA's actual public ABI values from every new D3D12 entry point.
++constexpr NVNGX_RESULT kResultSuccess = static_cast<NVNGX_RESULT>(0x00000001u);
++constexpr NVNGX_RESULT kResultFail = static_cast<NVNGX_RESULT>(0xBAD00000u);
++constexpr NVNGX_RESULT kResultFeatureNotSupported = static_cast<NVNGX_RESULT>(0xBAD00001u);
++constexpr NVNGX_RESULT kResultPlatformError = static_cast<NVNGX_RESULT>(0xBAD00002u);
++constexpr NVNGX_RESULT kResultFeatureNotFound = static_cast<NVNGX_RESULT>(0xBAD00004u);
++constexpr NVNGX_RESULT kResultInvalidParameter = static_cast<NVNGX_RESULT>(0xBAD00005u);
++constexpr NVNGX_RESULT kResultNotInitialized = static_cast<NVNGX_RESULT>(0xBAD00007u);
++constexpr NVNGX_RESULT kResultMissingInput = static_cast<NVNGX_RESULT>(0xBAD0000Au);
++constexpr NVNGX_RESULT kResultUnableToInitializeFeature = static_cast<NVNGX_RESULT>(0xBAD0000Bu);
++constexpr NVNGX_RESULT kResultUnsupportedParameter = static_cast<NVNGX_RESULT>(0xBAD00010u);
++
++struct DeviceEntry {
++  Com<IUnknown> identity;
++  Com<ID3D12Device> device;
++  Com<IMTLD3D12DeviceExt> extension;
++};
++
++struct FeatureState {
++  Com<IUnknown> device_identity;
++  Com<ID3D12Device> device;
++  Com<IMTLD3D12TemporalUpscaleState> backend;
++  MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC create = {};
++};
++
++struct HandleToken {
++  uint32_t id;
++};
++
++struct ParameterState {
++  std::unique_ptr<ParametersImpl> storage;
++  void *memory = nullptr;
++  NVNGXParameter *facade = nullptr;
++  bool managed = false;
++
++  ~ParameterState() {
++    if (facade)
++      owned_ngxd3d12_msvc_parameter_destruct(facade);
++    ::operator delete(memory);
++  }
++};
++
++std::mutex g_mutex;
++std::unordered_map<IUnknown *, DeviceEntry> g_devices;
++std::unordered_map<const NVNGXHandle *, std::shared_ptr<FeatureState>> g_features;
++std::vector<std::unique_ptr<HandleToken>> g_handle_tokens;
++std::unordered_map<const NVNGXParameter *, std::shared_ptr<ParameterState>> g_parameters;
++std::atomic<uint32_t> g_next_handle{1};
++
++NVNGX_RESULT mapBackendResult(HRESULT hr, bool creating);
++
++std::shared_ptr<ParameterState>
++lookupParameter(const NVNGXParameter *parameter) {
++  if (!parameter)
++    return {};
++  std::lock_guard lock(g_mutex);
++  auto it = g_parameters.find(parameter);
++  return it == g_parameters.end() ? std::shared_ptr<ParameterState>{} : it->second;
++}
++
++NVNGX_RESULT
++registerParameter(std::unique_ptr<ParametersImpl> storage, bool managed, NVNGXParameter **out_parameter) {
++  if (!storage || !out_parameter)
++    return kResultInvalidParameter;
++  const auto size = owned_ngxd3d12_msvc_parameter_size();
++  const auto alignment = owned_ngxd3d12_msvc_parameter_align();
++  if (!size || !alignment || alignment > alignof(std::max_align_t))
++    return kResultFail;
++  void *memory = ::operator new(static_cast<size_t>(size), std::nothrow);
++  if (!memory)
++    return kResultFail;
++
++  auto state = std::make_shared<ParameterState>();
++  state->storage = std::move(storage);
++  state->memory = memory;
++  state->managed = managed;
++  state->facade = reinterpret_cast<NVNGXParameter *>(
++      owned_ngxd3d12_msvc_parameter_construct(memory, state->storage.get())
++  );
++  if (!state->facade)
++    return kResultFail;
++  {
++    std::lock_guard lock(g_mutex);
++    g_parameters[state->facade] = state;
++  }
++  *out_parameter = state->facade;
++  return kResultSuccess;
++}
++
++Com<IUnknown>
++identityOf(IUnknown *object) {
++  return Com<IUnknown>::queryFrom(object);
++}
++
++bool
++hasInitializedDevices() {
++  std::lock_guard lock(g_mutex);
++  return !g_devices.empty();
++}
++
++bool
++deviceMaskValid(ID3D12Device *device, uint32_t mask) {
++  if (!device || !mask)
++    return false;
++  const UINT count = device->GetNodeCount();
++  if (!count)
++    return false;
++  const uint32_t valid = count >= 32 ? ~0u : ((1u << count) - 1u);
++  return (mask & ~valid) == 0;
++}
++
++bool
++findInitializedDevice(ID3D12Device *device, DeviceEntry *entry = nullptr) {
++  if (!device)
++    return false;
++  auto identity = identityOf(device);
++  if (!identity)
++    return false;
++  std::lock_guard lock(g_mutex);
++  auto it = g_devices.find(identity.ptr());
++  if (it == g_devices.end())
++    return false;
++  if (entry)
++    *entry = it->second;
++  return true;
++}
++
++NVNGX_RESULT
++validateCommandList(
++    ID3D12GraphicsCommandList *list, const Com<IUnknown> &expected_device,
++    Com<IMTLD3D12GraphicsCommandListExt> &extension, Com<ID3D12Device> &device_out
++) {
++  if (!list)
++    return kResultInvalidParameter;
++  const auto type = list->GetType();
++  if (type == D3D12_COMMAND_LIST_TYPE_COPY || type == D3D12_COMMAND_LIST_TYPE_BUNDLE)
++    return kResultInvalidParameter;
++
++  Com<ID3D12Device> device = nullptr;
++  if (FAILED(list->GetDevice(IID_PPV_ARGS(&device))) || !device)
++    return kResultInvalidParameter;
++  auto identity = identityOf(device.ptr());
++  if (!identity)
++    return kResultInvalidParameter;
++  if (expected_device && identity.ptr() != expected_device.ptr())
++    return kResultInvalidParameter;
++  if (!findInitializedDevice(device.ptr()))
++    return kResultNotInitialized;
++
++  Com<IMTLD3D12GraphicsCommandListExt> ext = nullptr;
++  if (FAILED(list->QueryInterface(IID_PPV_ARGS(&ext))) || !ext)
++    return kResultFeatureNotSupported;
++  const HRESULT recording = ext->ValidateRecording();
++  if (FAILED(recording))
++    return kResultInvalidParameter;
++  extension = std::move(ext);
++  device_out = std::move(device);
++  return kResultSuccess;
++}
++
++NVNGX_RESULT
++getRequiredUInt(const ParametersImpl *params, const char *name, uint32_t *value) {
++  return params && value && !NVNGX_FAILED(params->Get(name, value)) ? kResultSuccess : kResultMissingInput;
++}
++
++NVNGX_RESULT
++getRequiredResource(const ParametersImpl *params, const char *name, ID3D12Resource **value) {
++  if (!params || !value || NVNGX_FAILED(params->Get(name, value)))
++    return kResultMissingInput;
++  return *value ? kResultSuccess : kResultInvalidParameter;
++}
++
++uint32_t
++getOptionalUInt(const ParametersImpl *params, const char *name, uint32_t fallback, bool *present = nullptr) {
++  uint32_t value = 0;
++  const bool found = params && !NVNGX_FAILED(params->Get(name, &value));
++  if (present)
++    *present = found;
++  return found ? value : fallback;
++}
++
++int
++getOptionalInt(const ParametersImpl *params, const char *name, int fallback, bool *present = nullptr) {
++  int value = 0;
++  const bool found = params && !NVNGX_FAILED(params->Get(name, &value));
++  if (present)
++    *present = found;
++  return found ? value : fallback;
++}
++
++float
++getOptionalFloat(const ParametersImpl *params, const char *name, float fallback, bool *present = nullptr) {
++  float value = 0.0f;
++  const bool found = params && !NVNGX_FAILED(params->Get(name, &value));
++  if (present)
++    *present = found;
++  return found ? value : fallback;
++}
++
++ID3D12Resource *
++getOptionalResource(const ParametersImpl *params, const char *name, bool *present = nullptr) {
++  ID3D12Resource *value = nullptr;
++  const bool found = params && !NVNGX_FAILED(params->Get(name, &value));
++  if (present)
++    *present = found;
++  return found ? value : nullptr;
++}
++
++NVNGX_RESULT
++mapBackendResult(HRESULT hr, bool creating) {
++  if (SUCCEEDED(hr))
++    return kResultSuccess;
++  if (hr == E_INVALIDARG || hr == E_POINTER)
++    return kResultInvalidParameter;
++  if (hr == E_NOINTERFACE || hr == E_NOTIMPL)
++    return kResultFeatureNotSupported;
++  return creating ? kResultUnableToInitializeFeature : kResultPlatformError;
++}
++
++NVNGX_RESULT
++optimalSettingsCallback(NVNGXParameter *params) {
++  auto parameter = lookupParameter(params);
++  if (!parameter)
++    return kResultInvalidParameter;
++  auto *storage = parameter->storage.get();
++  uint32_t width = 0, height = 0;
++  int quality = NVNGX_PERFQUALITY_BALANCED;
++  if (NVNGX_FAILED(storage->Get(NVNGX_Parameter_Width, &width)) ||
++      NVNGX_FAILED(storage->Get(NVNGX_Parameter_Height, &height)))
++    return kResultInvalidParameter;
++  storage->Get(NVNGX_Parameter_PerfQualityValue, &quality);
++
++  float scale = 0.58f;
++  switch (quality) {
++  case NVNGX_PERFQUALITY_ULTRA_PERFORMANCE: scale = 1.0f / 3.0f; break;
++  case NVNGX_PERFQUALITY_MAXPERF: scale = 0.5f; break;
++  case NVNGX_PERFQUALITY_MAXQUALITY: scale = 1.0f / 1.5f; break;
++  case NVNGX_PERFQUALITY_ULTRA_QUALITY: scale = 1.0f / 1.3f; break;
++  case NVNGX_PERFQUALITY_DLAA: scale = 1.0f; break;
++  default: break;
++  }
++  const uint32_t out_width = static_cast<uint32_t>(std::ceil(width * scale));
++  const uint32_t out_height = static_cast<uint32_t>(std::ceil(height * scale));
++  storage->Set(NVNGX_Parameter_Scale, scale);
++  storage->Set(NVNGX_Parameter_SuperSampling_ScaleFactor, scale);
++  storage->Set(NVNGX_Parameter_OutWidth, out_width);
++  storage->Set(NVNGX_Parameter_OutHeight, out_height);
++  storage->Set(NVNGX_Parameter_Sharpness, 0.0f);
++  storage->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width, static_cast<uint32_t>(std::ceil(width / 3.0f)));
++  storage->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, static_cast<uint32_t>(std::ceil(height / 3.0f)));
++  storage->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width, width);
++  storage->Set(NVNGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height, height);
++  storage->Set("DLSSMode", 1);
++  storage->Set(NVNGX_Parameter_DLSS_Hint_Render_Preset_DLAA, 0u);
++  storage->Set(NVNGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, 0u);
++  storage->Set(NVNGX_Parameter_DLSS_Hint_Render_Preset_Quality, 0u);
++  storage->Set(NVNGX_Parameter_DLSS_Hint_Render_Preset_Balanced, 0u);
++  storage->Set(NVNGX_Parameter_DLSS_Hint_Render_Preset_Performance, 0u);
++  storage->Set(NVNGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, 0u);
++  return kResultSuccess;
++}
++
++NVNGX_RESULT
++statsCallback(NVNGXParameter *params) {
++  auto parameter = lookupParameter(params);
++  if (!parameter)
++    return kResultInvalidParameter;
++  parameter->storage->Set("SizeInBytes", 0ull);
++  return kResultSuccess;
++}
++
++std::unique_ptr<ParametersImpl>
++makeCapabilityParameters() {
++  auto out = std::make_unique<ParametersImpl>();
++  out->Set("SuperSampling.Available", 1u);
++  out->Set(NVSDK_NGX_EParameter_SuperSampling_Available, 1u);
++  out->Set("SuperSampling.MinDriverVersionMajor", 0);
++  out->Set("SuperSampling.MinDriverVersionMinor", 0);
++  out->Set("SuperSampling.NeedsUpdatedDriver", 0);
++  out->Set("SuperSampling.FeatureInitResult", 1u);
++  out->Set("Snippet.OptLevel", 0);
++  out->Set("Snippet.IsDevBranch", 0);
++  out->Set(NVNGX_Parameter_DLSSOptimalSettingsCallback, reinterpret_cast<void *>(&optimalSettingsCallback));
++  out->Set("DLSSGetStatsCallback", reinterpret_cast<void *>(&statsCallback));
++  out->Set(NVNGX_Parameter_Sharpness, 0.0f);
++  out->Set(NVNGX_Parameter_MV_Scale_X, 1.0f);
++  out->Set(NVNGX_Parameter_MV_Scale_Y, 1.0f);
++  out->Set("MV.Offset.X", 0.0f);
++  out->Set("MV.Offset.Y", 0.0f);
++  out->Set(NVNGX_Parameter_DLSS_Exposure_Scale, 1.0f);
++  out->Set(NVNGX_Parameter_PerfQualityValue, static_cast<int>(NVNGX_PERFQUALITY_MAXQUALITY));
++  out->Set("CreationNodeMask", 1u);
++  out->Set("VisibilityNodeMask", 1u);
++  out->Set("DLSS.Enable.Output.Subrects", 1);
++  out->Set("RTXValue", 0);
++  return out;
++}
++
++NVNGX_RESULT
++parseCreate(const ParametersImpl *params, ID3D12Device *device, MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC *desc) {
++  if (!params || !device || !desc)
++    return kResultInvalidParameter;
++  *desc = {};
++  desc->StructSize = sizeof(*desc);
++  if (auto result = getRequiredUInt(params, NVNGX_Parameter_Width, &desc->InputWidth); result != kResultSuccess)
++    return result;
++  if (auto result = getRequiredUInt(params, NVNGX_Parameter_Height, &desc->InputHeight); result != kResultSuccess)
++    return result;
++  if (auto result = getRequiredUInt(params, NVNGX_Parameter_OutWidth, &desc->OutputWidth); result != kResultSuccess)
++    return result;
++  if (auto result = getRequiredUInt(params, NVNGX_Parameter_OutHeight, &desc->OutputHeight); result != kResultSuccess)
++    return result;
++  if (!desc->InputWidth || !desc->InputHeight || !desc->OutputWidth || !desc->OutputHeight)
++    return kResultInvalidParameter;
++
++  const int flags = getOptionalInt(params, NVNGX_Parameter_DLSS_Feature_Create_Flags, 0);
++  if (flags < 0)
++    return kResultUnsupportedParameter;
++  desc->FeatureFlags = static_cast<uint32_t>(flags);
++  if ((desc->FeatureFlags & ~kSupportedCreateFlags) != 0 ||
++      (desc->FeatureFlags & NVNGX_DLSS_FLAG_MV_LOWRES) == 0)
++    return kResultUnsupportedParameter;
++
++  const int subrects = getOptionalInt(params, "DLSS.Enable.Output.Subrects", 0);
++  if (subrects != 0 && subrects != 1)
++    return kResultInvalidParameter;
++  desc->OutputSubrectsEnabled = subrects ? TRUE : FALSE;
++  desc->CreationNodeMask = getOptionalUInt(params, "CreationNodeMask", 1u);
++  desc->VisibilityNodeMask = getOptionalUInt(params, "VisibilityNodeMask", 1u);
++  if (!deviceMaskValid(device, desc->CreationNodeMask) || !deviceMaskValid(device, desc->VisibilityNodeMask))
++    return kResultInvalidParameter;
++  return kResultSuccess;
++}
++
++NVNGX_RESULT
++parseFrame(
++    const ParametersImpl *params, const FeatureState &feature, MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC *desc
++) {
++  if (!params || !desc)
++    return kResultInvalidParameter;
++  *desc = {};
++  desc->StructSize = sizeof(*desc);
++  if (auto result = getRequiredResource(params, NVNGX_Parameter_Color, &desc->Color); result != kResultSuccess)
++    return result;
++  if (auto result = getRequiredResource(params, NVNGX_Parameter_Output, &desc->Output); result != kResultSuccess)
++    return result;
++  if (auto result = getRequiredResource(params, NVNGX_Parameter_Depth, &desc->Depth); result != kResultSuccess)
++    return result;
++  if (auto result = getRequiredResource(params, NVNGX_Parameter_MotionVectors, &desc->MotionVector); result != kResultSuccess)
++    return result;
++
++  desc->ExposureTexture = getOptionalResource(params, NVNGX_Parameter_ExposureTexture);
++  desc->BiasCurrentColorMask = getOptionalResource(params, NVNGX_Parameter_BiasCurrentColorMask);
++  desc->TransparencyMask = getOptionalResource(params, NVNGX_Parameter_TransparencyMask);
++  if (desc->BiasCurrentColorMask || desc->TransparencyMask)
++    return kResultUnsupportedParameter;
++
++  bool has_width = false, has_height = false;
++  desc->InputContentWidth = getOptionalUInt(
++      params, NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, feature.create.InputWidth, &has_width
++  );
++  desc->InputContentHeight = getOptionalUInt(
++      params, NVNGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, feature.create.InputHeight, &has_height
++  );
++  if (has_width != has_height)
++    return kResultMissingInput;
++  if (!desc->InputContentWidth || !desc->InputContentHeight)
++    return kResultInvalidParameter;
++
++  struct Offset {
++    const char *name;
++    UINT *value;
++  };
++  Offset offsets[] = {
++      {NVNGX_Parameter_DLSS_Color_Base_X, &desc->ColorBaseX},
++      {NVNGX_Parameter_DLSS_Color_Base_Y, &desc->ColorBaseY},
++      {NVNGX_Parameter_DLSS_Depth_Base_X, &desc->DepthBaseX},
++      {NVNGX_Parameter_DLSS_Depth_Base_Y, &desc->DepthBaseY},
++      {NVNGX_Parameter_DLSS_Motion_Base_X, &desc->MotionBaseX},
++      {NVNGX_Parameter_DLSS_Motion_Base_Y, &desc->MotionBaseY},
++      {NVNGX_Parameter_DLSS_Bias_Base_X, &desc->BiasBaseX},
++      {NVNGX_Parameter_DLSS_Bias_Base_Y, &desc->BiasBaseY},
++      {NVNGX_Parameter_DLSS_Output_Base_X, &desc->OutputBaseX},
++      {NVNGX_Parameter_DLSS_Output_Base_Y, &desc->OutputBaseY},
++  };
++  for (const auto &offset : offsets) {
++    *offset.value = getOptionalUInt(params, offset.name, 0);
++    if (*offset.value)
++      return kResultUnsupportedParameter;
++  }
++  if (getOptionalUInt(params, NVNGX_Parameter_DLSS_Translucency_Base_X, 0) ||
++      getOptionalUInt(params, NVNGX_Parameter_DLSS_Translucency_Base_Y, 0))
++    return kResultUnsupportedParameter;
++
++  desc->JitterOffsetX = getOptionalFloat(params, NVNGX_Parameter_Jitter_Offset_X, 0.0f);
++  desc->JitterOffsetY = getOptionalFloat(params, NVNGX_Parameter_Jitter_Offset_Y, 0.0f);
++  desc->MotionVectorScaleX = getOptionalFloat(params, NVNGX_Parameter_MV_Scale_X, 1.0f);
++  desc->MotionVectorScaleY = getOptionalFloat(params, NVNGX_Parameter_MV_Scale_Y, 1.0f);
++  const float raw_pre_exposure = getOptionalFloat(params, NVNGX_Parameter_DLSS_Pre_Exposure, 0.0f);
++  const float raw_exposure_scale = getOptionalFloat(params, NVNGX_Parameter_DLSS_Exposure_Scale, 0.0f);
++  const float sharpness = getOptionalFloat(params, NVNGX_Parameter_Sharpness, 0.0f);
++  if (!std::isfinite(desc->JitterOffsetX) || !std::isfinite(desc->JitterOffsetY) ||
++      !std::isfinite(desc->MotionVectorScaleX) || !std::isfinite(desc->MotionVectorScaleY) ||
++      !std::isfinite(raw_pre_exposure) || !std::isfinite(raw_exposure_scale) || !std::isfinite(sharpness))
++    return kResultInvalidParameter;
++  if (desc->MotionVectorScaleX == 0.0f || desc->MotionVectorScaleY == 0.0f || raw_pre_exposure < 0.0f ||
++      raw_exposure_scale < 0.0f)
++    return kResultInvalidParameter;
++
++  desc->PreExposure = raw_pre_exposure == 0.0f ? 1.0f : raw_pre_exposure;
++  desc->ExposureScale = raw_exposure_scale == 0.0f ? 1.0f : raw_exposure_scale;
++  if (desc->ExposureScale != 1.0f || sharpness != 0.0f)
++    return kResultUnsupportedParameter;
++  desc->ResetHistory = getOptionalInt(params, NVNGX_Parameter_Reset, 0) ? TRUE : FALSE;
++  return kResultSuccess;
++}
++
++std::shared_ptr<FeatureState>
++lookupFeature(const NVNGXHandle *handle) {
++  if (!handle)
++    return {};
++  std::lock_guard lock(g_mutex);
++  auto it = g_features.find(handle);
++  return it == g_features.end() ? std::shared_ptr<FeatureState>{} : it->second;
++}
++
++} // namespace
++
++extern "C" {
++
++void owned_ngxd3d12_param_set_ull(void *storage, const char *name, unsigned long long value) {
++  static_cast<ParametersImpl *>(storage)->Set(name, value);
++}
++void owned_ngxd3d12_param_set_float(void *storage, const char *name, float value) {
++  static_cast<ParametersImpl *>(storage)->Set(name, value);
++}
++void owned_ngxd3d12_param_set_double(void *storage, const char *name, double value) {
++  static_cast<ParametersImpl *>(storage)->Set(name, value);
++}
++void owned_ngxd3d12_param_set_uint(void *storage, const char *name, unsigned int value) {
++  static_cast<ParametersImpl *>(storage)->Set(name, value);
++}
++void owned_ngxd3d12_param_set_int(void *storage, const char *name, int value) {
++  static_cast<ParametersImpl *>(storage)->Set(name, value);
++}
++void owned_ngxd3d12_param_set_d3d11(void *storage, const char *name, ID3D11Resource *value) {
++  static_cast<ParametersImpl *>(storage)->Set(name, value);
++}
++void owned_ngxd3d12_param_set_d3d12(void *storage, const char *name, ID3D12Resource *value) {
++  static_cast<ParametersImpl *>(storage)->Set(name, value);
++}
++void owned_ngxd3d12_param_set_pointer(void *storage, const char *name, void *value) {
++  static_cast<ParametersImpl *>(storage)->Set(name, value);
++}
++
++#define OWNED_NGX_PARAMETER_GET(name, type)                                                                                 \
++  unsigned int name(void *storage, const char *key, type value) {                                                           \
++    if (!storage || !key || !value)                                                                                         \
++      return static_cast<unsigned int>(kResultInvalidParameter);                                                            \
++    return static_cast<ParametersImpl *>(storage)->Get(key, value) == NVNGX_RESULT_OK                                      \
++               ? static_cast<unsigned int>(kResultSuccess)                                                                  \
++               : static_cast<unsigned int>(kResultFail);                                                                    \
++  }
++
++OWNED_NGX_PARAMETER_GET(owned_ngxd3d12_param_get_ull, unsigned long long *)
++OWNED_NGX_PARAMETER_GET(owned_ngxd3d12_param_get_float, float *)
++OWNED_NGX_PARAMETER_GET(owned_ngxd3d12_param_get_double, double *)
++OWNED_NGX_PARAMETER_GET(owned_ngxd3d12_param_get_uint, unsigned int *)
++OWNED_NGX_PARAMETER_GET(owned_ngxd3d12_param_get_int, int *)
++OWNED_NGX_PARAMETER_GET(owned_ngxd3d12_param_get_d3d11, ID3D11Resource **)
++OWNED_NGX_PARAMETER_GET(owned_ngxd3d12_param_get_d3d12, ID3D12Resource **)
++OWNED_NGX_PARAMETER_GET(owned_ngxd3d12_param_get_pointer, void **)
++
++#undef OWNED_NGX_PARAMETER_GET
++
++void owned_ngxd3d12_param_reset(void *storage) {
++  if (storage)
++    static_cast<ParametersImpl *>(storage)->Reset();
++}
++
++} // extern "C"
++
++NVNGX_RESULT
++NVNGXD3D12InitDevice(ID3D12Device *device) {
++  if (!device)
++    return kResultInvalidParameter;
++  auto identity = identityOf(device);
++  if (!identity)
++    return kResultInvalidParameter;
++  Com<IMTLD3D12DeviceExt> extension = nullptr;
++  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&extension))) || !extension)
++    return kResultFeatureNotSupported;
++  BOOL supported = FALSE;
++  if (FAILED(extension->SupportsTemporalUpscale(&supported)))
++    return kResultPlatformError;
++  if (!supported)
++    return kResultFeatureNotSupported;
++
++  DeviceEntry entry{identity, Com<ID3D12Device>(device), extension};
++  std::lock_guard lock(g_mutex);
++  g_devices[identity.ptr()] = std::move(entry);
++  return kResultSuccess;
++}
++
++void
++NVNGXD3D12ShutdownAll() {
++  std::lock_guard lock(g_mutex);
++  g_features.clear();
++  g_devices.clear();
++  g_parameters.clear();
++}
++
++NVNGX_RESULT
++NVNGXD3D12ShutdownDevice(ID3D12Device *device) {
++  if (!device)
++    return kResultInvalidParameter;
++  auto identity = identityOf(device);
++  if (!identity)
++    return kResultInvalidParameter;
++  std::lock_guard lock(g_mutex);
++  auto it = g_devices.find(identity.ptr());
++  if (it == g_devices.end())
++    return kResultNotInitialized;
++  for (auto feature = g_features.begin(); feature != g_features.end();) {
++    if (feature->second->device_identity.ptr() == identity.ptr())
++      feature = g_features.erase(feature);
++    else
++      ++feature;
++  }
++  g_devices.erase(it);
++  if (g_devices.empty())
++    g_parameters.clear();
++  return kResultSuccess;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init(
++    unsigned long long, const wchar_t *, ID3D12Device *device, const void *, unsigned int
++) {
++  return NVNGXD3D12InitDevice(device);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init_Ext(
++    unsigned long long, const wchar_t *, ID3D12Device *device, unsigned int, const void *
++) {
++  return NVNGXD3D12InitDevice(device);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init_ProjectID(
++    const char *, unsigned int, const char *, const wchar_t *, ID3D12Device *device, unsigned int, const void *
++) {
++  return NVNGXD3D12InitDevice(device);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Init_with_ProjectID(
++    const char *, unsigned int, const char *, const wchar_t *, ID3D12Device *device, const void *, unsigned int
++) {
++  return NVNGXD3D12InitDevice(device);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Shutdown() {
++  NVNGXD3D12ShutdownAll();
++  return kResultSuccess;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_Shutdown1(ID3D12Device *device) {
++  return NVNGXD3D12ShutdownDevice(device);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_AllocateParameters(NVNGXParameter **out_params) {
++  if (!out_params)
++    return kResultInvalidParameter;
++  if (!hasInitializedDevices())
++    return kResultNotInitialized;
++  return registerParameter(std::make_unique<ParametersImpl>(), false, out_params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_DestroyParameters(NVNGXParameter *params) {
++  if (!params)
++    return kResultInvalidParameter;
++  std::shared_ptr<ParameterState> state;
++  {
++    std::lock_guard lock(g_mutex);
++    auto it = g_parameters.find(params);
++    if (it == g_parameters.end() || it->second->managed)
++      return kResultInvalidParameter;
++    state = std::move(it->second);
++    g_parameters.erase(it);
++  }
++  return kResultSuccess;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetCapabilityParameters(NVNGXParameter **out_params) {
++  if (!out_params)
++    return kResultInvalidParameter;
++  if (!hasInitializedDevices())
++    return kResultNotInitialized;
++  auto params = makeCapabilityParameters();
++  if (!params)
++    return kResultFail;
++  return registerParameter(std::move(params), false, out_params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetParameters(NVNGXParameter **out_params) {
++  if (!out_params)
++    return kResultInvalidParameter;
++  if (!hasInitializedDevices())
++    return kResultNotInitialized;
++  auto params = makeCapabilityParameters();
++  if (!params)
++    return kResultFail;
++  return registerParameter(std::move(params), true, out_params);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetScratchBufferSize(unsigned int feature, const NVNGXParameter *, size_t *out_size) {
++  if (!out_size)
++    return kResultInvalidParameter;
++  if (feature != kFeatureSuperSampling)
++    return kResultFeatureNotSupported;
++  *out_size = 0;
++  return kResultSuccess;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_CreateFeature(
++    ID3D12GraphicsCommandList *list, unsigned int feature, NVNGXParameter *params, NVNGXHandle **out_handle
++) {
++  if (!list || !params || !out_handle)
++    return kResultInvalidParameter;
++  *out_handle = nullptr;
++  if (feature != kFeatureSuperSampling)
++    return kResultFeatureNotSupported;
++
++  Com<IMTLD3D12GraphicsCommandListExt> list_ext = nullptr;
++  Com<ID3D12Device> device = nullptr;
++  auto result = validateCommandList(list, nullptr, list_ext, device);
++  if (result != kResultSuccess)
++    return result;
++  DeviceEntry device_entry;
++  if (!findInitializedDevice(device.ptr(), &device_entry))
++    return kResultNotInitialized;
++
++  MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC create = {};
++  auto parameter = lookupParameter(params);
++  if (!parameter)
++    return kResultInvalidParameter;
++  result = parseCreate(parameter->storage.get(), device.ptr(), &create);
++  if (result != kResultSuccess)
++    return result;
++
++  Com<IMTLD3D12TemporalUpscaleState> backend = nullptr;
++  const HRESULT hr = device_entry.extension->CreateTemporalUpscaleState(&create, &backend);
++  if (FAILED(hr) || !backend)
++    return mapBackendResult(FAILED(hr) ? hr : E_FAIL, true);
++
++  auto state = std::make_shared<FeatureState>();
++  state->device_identity = device_entry.identity;
++  state->device = device_entry.device;
++  state->backend = std::move(backend);
++  state->create = create;
++
++  auto token = std::make_unique<HandleToken>();
++  token->id = g_next_handle.fetch_add(1, std::memory_order_relaxed);
++  auto *public_handle = reinterpret_cast<NVNGXHandle *>(token.get());
++  {
++    std::lock_guard lock(g_mutex);
++    g_features[public_handle] = std::move(state);
++    g_handle_tokens.push_back(std::move(token));
++  }
++  *out_handle = public_handle;
++  return kResultSuccess;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_EvaluateFeature(
++    ID3D12GraphicsCommandList *list, const NVNGXHandle *handle, NVNGXParameter *params, void *
++) {
++  if (!list || !handle || !params)
++    return kResultInvalidParameter;
++  auto feature = lookupFeature(handle);
++  if (!feature)
++    return kResultFeatureNotFound;
++
++  Com<IMTLD3D12GraphicsCommandListExt> extension = nullptr;
++  Com<ID3D12Device> device = nullptr;
++  auto result = validateCommandList(list, feature->device_identity, extension, device);
++  if (result != kResultSuccess)
++    return result;
++
++  MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC frame = {};
++  auto parameter = lookupParameter(params);
++  if (!parameter)
++    return kResultInvalidParameter;
++  result = parseFrame(parameter->storage.get(), *feature, &frame);
++  if (result != kResultSuccess)
++    return result;
++  return mapBackendResult(extension->TemporalUpscale(feature->backend.ptr(), &frame), false);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_EvaluateFeature_C(
++    ID3D12GraphicsCommandList *list, const NVNGXHandle *handle, NVNGXParameter *params, void *callback
++) {
++  return NVSDK_NGX_D3D12_EvaluateFeature(list, handle, params, callback);
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_ReleaseFeature(NVNGXHandle *handle) {
++  if (!handle)
++    return kResultInvalidParameter;
++  std::lock_guard lock(g_mutex);
++  auto it = g_features.find(handle);
++  if (it == g_features.end())
++    return kResultFeatureNotFound;
++  g_features.erase(it);
++  return kResultSuccess;
++}
++
++NVNGX_API NVNGX_RESULT
++NVSDK_NGX_D3D12_GetFeatureRequirements(
++    IDXGIAdapter *adapter, const NVNGX_FeatureDiscoveryInfo *discovery_info, NVNGX_FeatureRequirement *requirement
++) {
++  if (!adapter || !discovery_info || !requirement)
++    return kResultInvalidParameter;
++  if (discovery_info->FeatureID != NVNGX_FEATURE_SUPERSAMPLING) {
++    requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_UNSUPPORTED;
++    requirement->MinHWArchitecture = 0;
++    requirement->MinOSVersion[0] = 0;
++    return kResultFeatureNotSupported;
++  }
++  requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_SUPPORTED;
++  requirement->MinHWArchitecture = 0;
++  strcpy_s(requirement->MinOSVersion, "10.0.16299.0");
++  return kResultSuccess;
++}
++
++} // namespace dxmt
+diff --git a/src/nvngx/nvngx_d3d12.hpp b/src/nvngx/nvngx_d3d12.hpp
+new file mode 100644
+index 0000000..712acae
+--- /dev/null
++++ b/src/nvngx/nvngx_d3d12.hpp
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include "nvngx.hpp"
++
++namespace dxmt {
++
++NVNGX_RESULT NVNGXD3D12InitDevice(ID3D12Device *device);
++void NVNGXD3D12ShutdownAll();
++NVNGX_RESULT NVNGXD3D12ShutdownDevice(ID3D12Device *device);
++
++} // namespace dxmt
+diff --git a/src/nvngx/nvngx_d3d12_msvc.cpp b/src/nvngx/nvngx_d3d12_msvc.cpp
+new file mode 100644
+index 0000000..88331aa
+--- /dev/null
++++ b/src/nvngx/nvngx_d3d12_msvc.cpp
+@@ -0,0 +1,106 @@
++// This file is intentionally compiled with --target=x86_64-pc-windows-msvc.
++// It contains only the NVIDIA parameter vtable ABI and forwards all storage to
++// C callbacks implemented by the normal MinGW frontend translation unit.
++
++struct ID3D11Resource;
++struct ID3D12Resource;
++
++using NgxResult = unsigned int;
++
++extern "C" {
++void owned_ngxd3d12_param_set_ull(void *, const char *, unsigned long long);
++void owned_ngxd3d12_param_set_float(void *, const char *, float);
++void owned_ngxd3d12_param_set_double(void *, const char *, double);
++void owned_ngxd3d12_param_set_uint(void *, const char *, unsigned int);
++void owned_ngxd3d12_param_set_int(void *, const char *, int);
++void owned_ngxd3d12_param_set_d3d11(void *, const char *, ID3D11Resource *);
++void owned_ngxd3d12_param_set_d3d12(void *, const char *, ID3D12Resource *);
++void owned_ngxd3d12_param_set_pointer(void *, const char *, void *);
++
++NgxResult owned_ngxd3d12_param_get_ull(void *, const char *, unsigned long long *);
++NgxResult owned_ngxd3d12_param_get_float(void *, const char *, float *);
++NgxResult owned_ngxd3d12_param_get_double(void *, const char *, double *);
++NgxResult owned_ngxd3d12_param_get_uint(void *, const char *, unsigned int *);
++NgxResult owned_ngxd3d12_param_get_int(void *, const char *, int *);
++NgxResult owned_ngxd3d12_param_get_d3d11(void *, const char *, ID3D11Resource **);
++NgxResult owned_ngxd3d12_param_get_d3d12(void *, const char *, ID3D12Resource **);
++NgxResult owned_ngxd3d12_param_get_pointer(void *, const char *, void **);
++void owned_ngxd3d12_param_reset(void *);
++}
++
++// Exact virtual order from the pinned public NVSDK_NGX_Parameter declaration.
++struct OwnedNgxParameterABI {
++  virtual void Set(const char *, unsigned long long) = 0;
++  virtual void Set(const char *, float) = 0;
++  virtual void Set(const char *, double) = 0;
++  virtual void Set(const char *, unsigned int) = 0;
++  virtual void Set(const char *, int) = 0;
++  virtual void Set(const char *, ID3D11Resource *) = 0;
++  virtual void Set(const char *, ID3D12Resource *) = 0;
++  virtual void Set(const char *, void *) = 0;
++
++  virtual NgxResult Get(const char *, unsigned long long *) const = 0;
++  virtual NgxResult Get(const char *, float *) const = 0;
++  virtual NgxResult Get(const char *, double *) const = 0;
++  virtual NgxResult Get(const char *, unsigned int *) const = 0;
++  virtual NgxResult Get(const char *, int *) const = 0;
++  virtual NgxResult Get(const char *, ID3D11Resource **) const = 0;
++  virtual NgxResult Get(const char *, ID3D12Resource **) const = 0;
++  virtual NgxResult Get(const char *, void **) const = 0;
++
++  virtual void Reset() = 0;
++};
++
++class OwnedNgxParameterFacade final : public OwnedNgxParameterABI {
++public:
++  explicit OwnedNgxParameterFacade(void *storage) : storage_(storage) {}
++
++  void Set(const char *name, unsigned long long value) final { owned_ngxd3d12_param_set_ull(storage_, name, value); }
++  void Set(const char *name, float value) final { owned_ngxd3d12_param_set_float(storage_, name, value); }
++  void Set(const char *name, double value) final { owned_ngxd3d12_param_set_double(storage_, name, value); }
++  void Set(const char *name, unsigned int value) final { owned_ngxd3d12_param_set_uint(storage_, name, value); }
++  void Set(const char *name, int value) final { owned_ngxd3d12_param_set_int(storage_, name, value); }
++  void Set(const char *name, ID3D11Resource *value) final { owned_ngxd3d12_param_set_d3d11(storage_, name, value); }
++  void Set(const char *name, ID3D12Resource *value) final { owned_ngxd3d12_param_set_d3d12(storage_, name, value); }
++  void Set(const char *name, void *value) final { owned_ngxd3d12_param_set_pointer(storage_, name, value); }
++
++  NgxResult Get(const char *name, unsigned long long *value) const final { return owned_ngxd3d12_param_get_ull(storage_, name, value); }
++  NgxResult Get(const char *name, float *value) const final { return owned_ngxd3d12_param_get_float(storage_, name, value); }
++  NgxResult Get(const char *name, double *value) const final { return owned_ngxd3d12_param_get_double(storage_, name, value); }
++  NgxResult Get(const char *name, unsigned int *value) const final { return owned_ngxd3d12_param_get_uint(storage_, name, value); }
++  NgxResult Get(const char *name, int *value) const final { return owned_ngxd3d12_param_get_int(storage_, name, value); }
++  NgxResult Get(const char *name, ID3D11Resource **value) const final { return owned_ngxd3d12_param_get_d3d11(storage_, name, value); }
++  NgxResult Get(const char *name, ID3D12Resource **value) const final { return owned_ngxd3d12_param_get_d3d12(storage_, name, value); }
++  NgxResult Get(const char *name, void **value) const final { return owned_ngxd3d12_param_get_pointer(storage_, name, value); }
++
++  void Reset() final { owned_ngxd3d12_param_reset(storage_); }
++
++private:
++  void *storage_;
++};
++
++inline void *operator new(unsigned long long, void *memory) noexcept { return memory; }
++inline void operator delete(void *, void *) noexcept {}
++
++extern "C" {
++int _fltused = 0;
++
++unsigned long long owned_ngxd3d12_msvc_parameter_size() {
++  return sizeof(OwnedNgxParameterFacade);
++}
++
++unsigned long long owned_ngxd3d12_msvc_parameter_align() {
++  return alignof(OwnedNgxParameterFacade);
++}
++
++void *owned_ngxd3d12_msvc_parameter_construct(void *memory, void *storage) {
++  if (!memory || !storage)
++    return nullptr;
++  return new (memory) OwnedNgxParameterFacade(storage);
++}
++
++void owned_ngxd3d12_msvc_parameter_destruct(void *object) {
++  if (object)
++    static_cast<OwnedNgxParameterFacade *>(object)->~OwnedNgxParameterFacade();
++}
++}

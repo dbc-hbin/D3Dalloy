@@ -1,0 +1,89 @@
+diff --git a/src/d3d12/d3d12.cpp b/src/d3d12/d3d12.cpp
+index aacf63d..a22b4e8 100644
+--- a/src/d3d12/d3d12.cpp
++++ b/src/d3d12/d3d12.cpp
+@@ -27,6 +27,13 @@ namespace dxmt {
+ 
+ Logger Logger::s_instance("d3d12.log");
+ 
++// This identifies this source-built derivative, not API conformance. Tests
++// must reject a silently selected Wine/GPTK/D3DMetal fallback implementation.
++extern "C" const char *WINAPI
++OwnedGraphicsBackendId() {
++  return "owned-graphics-d3d12";
++}
++
+ extern "C" HRESULT WINAPI
+ D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid, void **ppDevice) {
+ 
+@@ -53,6 +60,8 @@ D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REF
+     }
+   } else {
+     dxgi_adapter = com_cast<IDXGIAdapter>(pAdapter);
++    if (!dxgi_adapter)
++      return E_INVALIDARG;
+   }
+ 
+   if (FAILED(hr = dxgi_adapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter_mtl)))) {
+@@ -87,4 +96,4 @@ DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
+   return TRUE;
+ }
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/d3d12/d3d12.def b/src/d3d12/d3d12.def
+index f365ee9..3c8d6b7 100644
+--- a/src/d3d12/d3d12.def
++++ b/src/d3d12/d3d12.def
+@@ -6,4 +6,5 @@ EXPORTS
+     D3D12CreateVersionedRootSignatureDeserializer
+     D3D12SerializeRootSignature
+     D3D12SerializeVersionedRootSignature
+-    D3D12GetInterface
+\ No newline at end of file
++    D3D12GetInterface
++    OwnedGraphicsBackendId
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 6e82349..18c61f2 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -236,7 +236,7 @@ public:
+ 
+   D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE
+   GetType() {
+-    return D3D12_COMMAND_LIST_TYPE_DIRECT;
++    return allocator_->type_;
+   }
+ 
+   HRESULT STDMETHODCALLTYPE
+@@ -1021,8 +1021,20 @@ public:
+   };
+ 
+   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
+-    // TODO: in the initial implementation, we force synchronize everything and ignore barriers (which can be used as
+-    // optimization hints later)
++    if (!Count)
++      return;
++    if (!barriers) {
++      ERR("ResourceBarrier: nonzero count with null barriers");
++      return;
++    }
++    // Resources use untracked Metal storage. Consecutive commands in the same
++    // encoder therefore cannot ignore a UAV or aliasing dependency. A pass
++    // boundary makes the queue emit updateFence/endEncoding followed by the
++    // next encoder's waitForFence. This deliberately over-synchronizes valid
++    // legacy transition/UAV/aliasing barriers without a CPU or queue-idle wait.
++    // Split barriers may complete early; END_ONLY also establishes a boundary.
++    // This is not a resource-state validator or enhanced-barrier support.
++    allocator_->InvalidateCurrentPass();
+   };
+ 
+   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) { IMPLEMENT_ME };
+@@ -1575,4 +1587,4 @@ MTLD3D12CommandAllocatorImpl::CreateCommandList(
+   return cmd_list->QueryInterface(riid, ppCommandList);
+ }
+ 
+-}; // namespace dxmt
+\ No newline at end of file
++}; // namespace dxmt

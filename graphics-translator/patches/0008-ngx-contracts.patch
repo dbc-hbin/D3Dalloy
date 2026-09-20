@@ -1,0 +1,208 @@
+diff --git a/src/nvngx/nvngx_d3d12.cpp b/src/nvngx/nvngx_d3d12.cpp
+index e338dc8..af13530 100644
+--- a/src/nvngx/nvngx_d3d12.cpp
++++ b/src/nvngx/nvngx_d3d12.cpp
+@@ -16,7 +16,6 @@
+ #include <new>
+ #include <unordered_map>
+ #include <utility>
+-#include <vector>
+ 
+ namespace dxmt {
+ 
+@@ -49,10 +48,16 @@ constexpr NVNGX_RESULT kResultMissingInput = static_cast<NVNGX_RESULT>(0xBAD0000
+ constexpr NVNGX_RESULT kResultUnableToInitializeFeature = static_cast<NVNGX_RESULT>(0xBAD0000Bu);
+ constexpr NVNGX_RESULT kResultUnsupportedParameter = static_cast<NVNGX_RESULT>(0xBAD00010u);
+ 
++// Bounded identity for one Init registration. A device COM identity can be
++// re-initialized after Shutdown1, so CreateFeature must prove that the exact
++// registration it validated is still the one published in the registry.
++struct DeviceRegistration {};
++
+ struct DeviceEntry {
+   Com<IUnknown> identity;
+   Com<ID3D12Device> device;
+   Com<IMTLD3D12DeviceExt> extension;
++  std::shared_ptr<DeviceRegistration> registration;
+ };
+ 
+ struct FeatureState {
+@@ -62,10 +67,6 @@ struct FeatureState {
+   MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC create = {};
+ };
+ 
+-struct HandleToken {
+-  uint32_t id;
+-};
+-
+ struct ParameterState {
+   std::unique_ptr<ParametersImpl> storage;
+   void *memory = nullptr;
+@@ -82,9 +83,12 @@ struct ParameterState {
+ std::mutex g_mutex;
+ std::unordered_map<IUnknown *, DeviceEntry> g_devices;
+ std::unordered_map<const NVNGXHandle *, std::shared_ptr<FeatureState>> g_features;
+-std::vector<std::unique_ptr<HandleToken>> g_handle_tokens;
+ std::unordered_map<const NVNGXParameter *, std::shared_ptr<ParameterState>> g_parameters;
+-std::atomic<uint32_t> g_next_handle{1};
++// Monotonic opaque token space. The public NVSDK_NGX_Handle payload is never
++// dereferenced, so an incrementing integer value is a complete handle: released
++// values are never reused and live storage stays bounded. Exhaustion fails the
++// feature rather than aliasing an old handle.
++std::atomic<uintptr_t> g_next_handle{1};
+ 
+ NVNGX_RESULT mapBackendResult(HRESULT hr, bool creating);
+ 
+@@ -99,7 +103,10 @@ lookupParameter(const NVNGXParameter *parameter) {
+ 
+ NVNGX_RESULT
+ registerParameter(std::unique_ptr<ParametersImpl> storage, bool managed, NVNGXParameter **out_parameter) {
+-  if (!storage || !out_parameter)
++  if (!out_parameter)
++    return kResultInvalidParameter;
++  *out_parameter = nullptr;
++  if (!storage)
+     return kResultInvalidParameter;
+   const auto size = owned_ngxd3d12_msvc_parameter_size();
+   const auto alignment = owned_ngxd3d12_msvc_parameter_align();
+@@ -119,7 +126,12 @@ registerParameter(std::unique_ptr<ParametersImpl> storage, bool managed, NVNGXPa
+   if (!state->facade)
+     return kResultFail;
+   {
++    // The Init gate and the publication are one critical section, so a
++    // concurrent Shutdown1 cannot slip between an external check and this
++    // insertion and publish a parameter map for a closed SDK.
+     std::lock_guard lock(g_mutex);
++    if (g_devices.empty())
++      return kResultNotInitialized;
+     g_parameters[state->facade] = state;
+   }
+   *out_parameter = state->facade;
+@@ -131,10 +143,18 @@ identityOf(IUnknown *object) {
+   return Com<IUnknown>::queryFrom(object);
+ }
+ 
+-bool
+-hasInitializedDevices() {
+-  std::lock_guard lock(g_mutex);
+-  return !g_devices.empty();
++NVNGXHandle *
++allocateFeatureHandle() {
++  // Do not recycle: a released handle value must keep resolving to
++  // FAIL_FeatureNotFound instead of aliasing a later feature.
++  uintptr_t current = g_next_handle.load(std::memory_order_relaxed);
++  while (current != UINTPTR_MAX) {
++    if (g_next_handle.compare_exchange_weak(
++            current, current + 1, std::memory_order_relaxed, std::memory_order_relaxed
++        ))
++      return reinterpret_cast<NVNGXHandle *>(current);
++  }
++  return nullptr;
+ }
+ 
+ bool
+@@ -330,7 +350,10 @@ makeCapabilityParameters() {
+   out->Set(NVNGX_Parameter_PerfQualityValue, static_cast<int>(NVNGX_PERFQUALITY_MAXQUALITY));
+   out->Set("CreationNodeMask", 1u);
+   out->Set("VisibilityNodeMask", 1u);
+-  out->Set("DLSS.Enable.Output.Subrects", 1);
++  // DLSS.Enable.Output.Subrects is a create-time opt-in that NVIDIA's D3D12
++  // helper writes from InEnableOutputSubrects. It is not a capability grant, so
++  // the capability map must not pre-enable it for callers that never asked.
++  out->Set("DLSS.Enable.Output.Subrects", 0);
+   out->Set("RTXValue", 0);
+   return out;
+ }
+@@ -419,14 +442,19 @@ parseFrame(
+       {NVNGX_Parameter_DLSS_Motion_Base_Y, &desc->MotionBaseY},
+       {NVNGX_Parameter_DLSS_Bias_Base_X, &desc->BiasBaseX},
+       {NVNGX_Parameter_DLSS_Bias_Base_Y, &desc->BiasBaseY},
+-      {NVNGX_Parameter_DLSS_Output_Base_X, &desc->OutputBaseX},
+-      {NVNGX_Parameter_DLSS_Output_Base_Y, &desc->OutputBaseY},
+   };
+   for (const auto &offset : offsets) {
+     *offset.value = getOptionalUInt(params, offset.name, 0);
+     if (*offset.value)
+       return kResultUnsupportedParameter;
+   }
++  // Output base is only meaningful for a feature created with output subrects
++  // enabled. When it is enabled the backend owns logical-output-vs-backing
++  // bounds validation; the frontend must not guess or clamp the rectangle.
++  desc->OutputBaseX = getOptionalUInt(params, NVNGX_Parameter_DLSS_Output_Base_X, 0);
++  desc->OutputBaseY = getOptionalUInt(params, NVNGX_Parameter_DLSS_Output_Base_Y, 0);
++  if ((desc->OutputBaseX || desc->OutputBaseY) && !feature.create.OutputSubrectsEnabled)
++    return kResultUnsupportedParameter;
+   if (getOptionalUInt(params, NVNGX_Parameter_DLSS_Translucency_Base_X, 0) ||
+       getOptionalUInt(params, NVNGX_Parameter_DLSS_Translucency_Base_Y, 0))
+     return kResultUnsupportedParameter;
+@@ -535,7 +563,7 @@ NVNGXD3D12InitDevice(ID3D12Device *device) {
+   if (!supported)
+     return kResultFeatureNotSupported;
+ 
+-  DeviceEntry entry{identity, Com<ID3D12Device>(device), extension};
++  DeviceEntry entry{identity, Com<ID3D12Device>(device), extension, std::make_shared<DeviceRegistration>()};
+   std::lock_guard lock(g_mutex);
+   g_devices[identity.ptr()] = std::move(entry);
+   return kResultSuccess;
+@@ -608,6 +636,11 @@ NVSDK_NGX_D3D12_Shutdown() {
+ 
+ NVNGX_API NVNGX_RESULT
+ NVSDK_NGX_D3D12_Shutdown1(ID3D12Device *device) {
++  // Official nvsdk_ngx.h: a null device shuts down every SDK instance.
++  if (!device) {
++    NVNGXD3D12ShutdownAll();
++    return kResultSuccess;
++  }
+   return NVNGXD3D12ShutdownDevice(device);
+ }
+ 
+@@ -615,8 +648,6 @@ NVNGX_API NVNGX_RESULT
+ NVSDK_NGX_D3D12_AllocateParameters(NVNGXParameter **out_params) {
+   if (!out_params)
+     return kResultInvalidParameter;
+-  if (!hasInitializedDevices())
+-    return kResultNotInitialized;
+   return registerParameter(std::make_unique<ParametersImpl>(), false, out_params);
+ }
+ 
+@@ -640,8 +671,6 @@ NVNGX_API NVNGX_RESULT
+ NVSDK_NGX_D3D12_GetCapabilityParameters(NVNGXParameter **out_params) {
+   if (!out_params)
+     return kResultInvalidParameter;
+-  if (!hasInitializedDevices())
+-    return kResultNotInitialized;
+   auto params = makeCapabilityParameters();
+   if (!params)
+     return kResultFail;
+@@ -652,8 +681,6 @@ NVNGX_API NVNGX_RESULT
+ NVSDK_NGX_D3D12_GetParameters(NVNGXParameter **out_params) {
+   if (!out_params)
+     return kResultInvalidParameter;
+-  if (!hasInitializedDevices())
+-    return kResultNotInitialized;
+   auto params = makeCapabilityParameters();
+   if (!params)
+     return kResultFail;
+@@ -708,13 +735,18 @@ NVSDK_NGX_D3D12_CreateFeature(
+   state->backend = std::move(backend);
+   state->create = create;
+ 
+-  auto token = std::make_unique<HandleToken>();
+-  token->id = g_next_handle.fetch_add(1, std::memory_order_relaxed);
+-  auto *public_handle = reinterpret_cast<NVNGXHandle *>(token.get());
++  auto *public_handle = allocateFeatureHandle();
++  if (!public_handle)
++    return kResultFail;
+   {
+     std::lock_guard lock(g_mutex);
++    // The backend state above was built outside the lock. If the device was
++    // shut down (or shut down and re-inited) meanwhile, publishing this handle
++    // would attach a feature to a registration the caller no longer holds.
++    auto current = g_devices.find(device_entry.identity.ptr());
++    if (current == g_devices.end() || current->second.registration != device_entry.registration)
++      return kResultNotInitialized;
+     g_features[public_handle] = std::move(state);
+-    g_handle_tokens.push_back(std::move(token));
+   }
+   *out_handle = public_handle;
+   return kResultSuccess;

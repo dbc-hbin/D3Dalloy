@@ -1,0 +1,390 @@
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index b067053..59be662 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -939,7 +939,43 @@ public:
+       ID3D12Fence *const *pFences, const UINT64 *pValues, UINT FenceCount, D3D12_MULTIPLE_FENCE_WAIT_FLAGS Flags,
+       HANDLE hEvent
+   ) {
+-    return E_NOTIMPL;
++    if (!pFences || !pValues || !FenceCount ||
++        (Flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL && Flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY))
++      return E_INVALIDARG;
++    try {
++      std::vector<WMT::Reference<WMT::SharedEvent>> events;
++      std::vector<WMTSharedEventValue> values;
++      events.reserve(FenceCount);
++      values.reserve(FenceCount);
++      for (UINT i = 0; i < FenceCount; ++i) {
++        if (!pFences[i])
++          return E_INVALIDARG;
++        // Allow other owned devices as well. The private device interface
++        // identifies our implementation before accessing its native fence.
++        Com<IMTLD3D12DeviceExt> owner;
++        if (FAILED(pFences[i]->GetDevice(__uuidof(IMTLD3D12DeviceExt), reinterpret_cast<void **>(&owner))))
++          return E_INVALIDARG;
++        events.push_back(static_cast<MTLD3D12Fence *>(pFences[i])->fence->sharedEvent());
++        values.push_back({events.back().handle, pValues[i]});
++      }
++      HANDLE event = hEvent;
++      if (!event) {
++        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++        if (!event)
++          return HRESULT_FROM_WIN32(GetLastError());
++      }
++      HRESULT hr = event_listener.setEventOnValues(
++          values.data(), FenceCount, Flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, event
++      ) ? S_OK : E_OUTOFMEMORY;
++      if (!hEvent) {
++        if (SUCCEEDED(hr) && WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0)
++          hr = HRESULT_FROM_WIN32(GetLastError());
++        CloseHandle(event);
++      }
++      return hr;
++    } catch (const std::bad_alloc &) {
++      return E_OUTOFMEMORY;
++    }
+   };
+ 
+   HRESULT STDMETHODCALLTYPE
+diff --git a/src/d3d12/d3d12_fence.cpp b/src/d3d12/d3d12_fence.cpp
+index 27f2126..c69634b 100644
+--- a/src/d3d12/d3d12_fence.cpp
++++ b/src/d3d12/d3d12_fence.cpp
+@@ -76,8 +76,7 @@ public:
+       fence->wait(Value);
+       return S_OK;
+     }
+-    device_->event_listener.setEventOnValue(fence.ptr(), Event, Value);
+-    return S_OK;
++    return device_->event_listener.setEventOnValue(fence.ptr(), Event, Value) ? S_OK : E_OUTOFMEMORY;
+   }
+ 
+   HRESULT STDMETHODCALLTYPE
+diff --git a/src/dxmt/dxmt_fence.cpp b/src/dxmt/dxmt_fence.cpp
+index 3711569..2934240 100644
+--- a/src/dxmt/dxmt_fence.cpp
++++ b/src/dxmt/dxmt_fence.cpp
+@@ -131,16 +131,22 @@ EventListener::EventListener() :
+     event_listener_thread_([this]() { SharedEventListener_start(this->shared_event_listener_); }) {};
+ 
+ EventListener::~EventListener() {
+-  // FIXME: potential deadlock if a device is created and immediately destroyed
+-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+   SharedEventListener_destroy(shared_event_listener_);
+   event_listener_thread_.join();
+ }
+ 
+-void
++bool
+ EventListener::setEventOnValue(Fence const *fence, HANDLE event, uint64_t value) {
+   auto shared_event = fence->sharedEvent();
+-  MTLSharedEvent_setWin32EventAtValue(shared_event.handle, shared_event_listener_, event, value);
++  const WMTSharedEventValue item = {shared_event.handle, value};
++  return setEventOnValues(&item, 1, true, event);
++}
++
++bool
++EventListener::setEventOnValues(const WMTSharedEventValue *values, uint32_t count, bool wait_all, HANDLE event) {
++  WMTConstMemoryPointer pointer{};
++  pointer.set(values);
++  return MTLSharedEvent_setWin32EventOnValues(pointer, count, wait_all, shared_event_listener_, event) != 0;
+ }
+ 
+ }; // namespace dxmt
+diff --git a/src/dxmt/dxmt_fence.hpp b/src/dxmt/dxmt_fence.hpp
+index e6052b1..83c8738 100644
+--- a/src/dxmt/dxmt_fence.hpp
++++ b/src/dxmt/dxmt_fence.hpp
+@@ -122,7 +122,8 @@ public:
+   EventListener();
+   ~EventListener();
+ 
+-  void setEventOnValue(Fence const *fence, HANDLE event, uint64_t value);
++  bool setEventOnValue(Fence const *fence, HANDLE event, uint64_t value);
++  bool setEventOnValues(const WMTSharedEventValue *values, uint32_t count, bool wait_all, HANDLE event);
+ 
+ private:
+   obj_handle_t shared_event_listener_;
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 3327b29..754617f 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -2526,61 +2526,126 @@ _MTLSharedEvent_signalValue(void *obj) {
+ 
+ #ifndef DXMT_NATIVE
+ 
+-typedef struct {
+-  _Atomic(CFRunLoopRef) runloop_ref;
+-  MTLSharedEventListener *shared_listener;
+-} *shared_event_listener_t;
++// Callback blocks retain this state independently of the device and of the
++// Wine notification thread. Destroy marks it closed; callbacks which arrive
++// afterwards cannot touch a freed run loop or signal a reused Win32 handle.
++@interface OwnedSharedEventListener : NSObject {
++@public
++  NSCondition *condition;
++  CFRunLoopRef runloop;
++  BOOL closing;
++  MTLSharedEventListener *listener;
++}
++@end
++
++@implementation OwnedSharedEventListener
++- (id)init {
++  if ((self = [super init])) {
++    condition = [[NSCondition alloc] init];
++    listener = [[MTLSharedEventListener alloc] init];
++    if (!condition || !listener) {
++      [self release];
++      return nil;
++    }
++  }
++  return self;
++}
++- (void)dealloc {
++  [condition release];
++  [listener release];
++  [super dealloc];
++}
++@end
++
++@interface OwnedFenceCompletion : NSObject {
++@public
++  OwnedSharedEventListener *owner;
++  uint32_t remaining;
++  void *event;
++}
++@end
++
++@implementation OwnedFenceCompletion
++- (void)dealloc {
++  [owner release];
++  [super dealloc];
++}
++@end
+ 
+ extern NTSTATUS NtSetEvent(void *handle, void *prev_state);
+ 
+ static NTSTATUS
+ _MTLSharedEvent_setWin32EventAtValue(void *obj) {
+   struct unixcall_mtlsharedevent_setevent *params = obj;
+-  void *nt_event_handle = (shared_event_listener_t)params->event_handle;
+-  shared_event_listener_t q = (shared_event_listener_t)params->shared_event_listener;
+-  [(id<MTLSharedEvent>)params->shared_event
+-      notifyListener:q->shared_listener
+-             atValue:params->value
+-               block:^(id<MTLSharedEvent> _e, uint64_t _v) {
+-                 // NOTE: must ensure no more notification comes after listener been destroyed.
+-                 while (!atomic_load_explicit(&q->runloop_ref, memory_order_acquire)) {
+-#if defined(__x86_64__)
+-                   _mm_pause();
+-#elif defined(__aarch64__)
+-          __asm__ __volatile__("yield");
+-#endif
+-                 }
+-                 CFRunLoopPerformBlock(q->runloop_ref, kCFRunLoopCommonModes, ^{
+-                   NtSetEvent(nt_event_handle, NULL);
+-                 });
+-                 CFRunLoopWakeUp(q->runloop_ref);
+-               }];
++  OwnedSharedEventListener *q = (OwnedSharedEventListener *)params->shared_event_listener;
++  const struct WMTSharedEventValue *values = params->values.ptr;
++  params->ret = 0;
++  if (!q || !values || !params->count || !params->event_handle)
++    return STATUS_SUCCESS;
++  OwnedFenceCompletion *completion = [[OwnedFenceCompletion alloc] init];
++  if (!completion)
++    return STATUS_SUCCESS;
++  completion->owner = [q retain];
++  completion->remaining = params->wait_all ? params->count : 1;
++  completion->event = (void *)params->event_handle;
++  for (uint32_t i = 0; i < params->count; ++i) {
++    [(id<MTLSharedEvent>)values[i].event
++        notifyListener:q->listener
++               atValue:values[i].value
++                 block:^(id<MTLSharedEvent> _e, uint64_t _v) {
++                   OwnedSharedEventListener *owner = completion->owner;
++                   [owner->condition lock];
++                   while (!owner->runloop && !owner->closing)
++                     [owner->condition wait];
++                   if (!owner->closing && completion->remaining && --completion->remaining == 0) {
++                     CFRunLoopPerformBlock(owner->runloop, kCFRunLoopCommonModes, ^{
++                       [owner->condition lock];
++                       if (!owner->closing)
++                         NtSetEvent(completion->event, NULL);
++                       [owner->condition unlock];
++                     });
++                     CFRunLoopWakeUp(owner->runloop);
++                   }
++                   [owner->condition unlock];
++                 }];
++  }
++  [completion release];
++  params->ret = 1;
+   return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS
+ _SharedEventListener_start(void *obj) {
+   struct unixcall_generic_obj_noret *params = obj;
+-  shared_event_listener_t q = (shared_event_listener_t)params->handle;
+-  CFRunLoopRef uninited = NULL;
+-  if (q && atomic_compare_exchange_strong(&q->runloop_ref, &uninited, CFRunLoopGetCurrent())) {
+-    /* Add a dummy source so the runloop stays running */
++  OwnedSharedEventListener *q = (OwnedSharedEventListener *)params->handle;
++  if (!q)
++    return STATUS_SUCCESS;
++  [q->condition lock];
++  if (!q->closing) {
++    q->runloop = CFRunLoopGetCurrent();
+     CFRunLoopSourceContext source_context = {0};
+     CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &source_context);
+-    CFRunLoopAddSource(q->runloop_ref, source, kCFRunLoopCommonModes);
++    CFRunLoopAddSource(q->runloop, source, kCFRunLoopCommonModes);
++    [q->condition broadcast];
++    [q->condition unlock];
+     CFRunLoopRun();
++    [q->condition lock];
++    CFRunLoopRemoveSource(q->runloop, source, kCFRunLoopCommonModes);
++    CFRelease(source);
++    q->runloop = NULL;
+   }
++  [q->condition broadcast];
++  [q->condition unlock];
++  // create() reserves this reference before the Wine thread is scheduled.
++  [q release];
+   return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS
+ _SharedEventListener_create(void *obj) {
+   struct unixcall_generic_obj_ret *params = obj;
+-  shared_event_listener_t q = malloc(sizeof(*q));
+-  if (q) {
+-    q->runloop_ref = NULL;
+-    q->shared_listener = [[MTLSharedEventListener alloc] init];
+-  }
++  OwnedSharedEventListener *q = [[OwnedSharedEventListener alloc] init];
++  [q retain]; // The start() reference, also when destroy() runs before start().
+   params->ret = (obj_handle_t)q;
+   return STATUS_SUCCESS;
+ }
+@@ -2588,13 +2653,21 @@ _SharedEventListener_create(void *obj) {
+ static NTSTATUS
+ _SharedEventListener_destroy(void *obj) {
+   struct unixcall_generic_obj_noret *params = obj;
+-  shared_event_listener_t q = (shared_event_listener_t)params->handle;
+-  if (q && q->runloop_ref) {
+-    CFRunLoopStop(q->runloop_ref);
+-    q->runloop_ref = NULL;
+-    [q->shared_listener release];
+-    q->shared_listener = nil;
+-    free(q);
++  OwnedSharedEventListener *q = (OwnedSharedEventListener *)params->handle;
++  if (q) {
++    [q->condition lock];
++    q->closing = YES;
++    [q->condition broadcast];
++    if (q->runloop) {
++      // Stop *inside* Run, even if destroy races between publishing the loop
++      // and entering CFRunLoopRun. CFRunLoopStop before Run loses that wakeup.
++      CFRunLoopPerformBlock(q->runloop, kCFRunLoopCommonModes, ^{
++        CFRunLoopStop(CFRunLoopGetCurrent());
++      });
++      CFRunLoopWakeUp(q->runloop);
++    }
++    [q->condition unlock];
++    [q release];
+   }
+   return STATUS_SUCCESS;
+ }
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index 97fffc7..b9d441a 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -1953,6 +1953,16 @@ WINEMETAL_API void MTLSharedEvent_setWin32EventAtValue(
+     obj_handle_t event, obj_handle_t shared_event_listener, void *nt_event_handle, uint64_t at_value
+ );
+ 
++struct WMTSharedEventValue {
++  obj_handle_t event;
++  uint64_t value;
++};
++
++WINEMETAL_API uint32_t MTLSharedEvent_setWin32EventOnValues(
++    struct WMTConstMemoryPointer values, uint32_t count, uint32_t wait_all,
++    obj_handle_t shared_event_listener, void *nt_event_handle
++);
++
+ WINEMETAL_API obj_handle_t MTLDevice_newFence(obj_handle_t device);
+ 
+ WINEMETAL_API obj_handle_t MTLDevice_newEvent(obj_handle_t device);
+@@ -2148,4 +2158,4 @@ WINEMETAL_API void MTLTexture_getBytes(
+     struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image
+ );
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/winemetal/winemetal_thunks.c b/src/winemetal/winemetal_thunks.c
+index 42286c9..204fbff 100644
+--- a/src/winemetal/winemetal_thunks.c
++++ b/src/winemetal/winemetal_thunks.c
+@@ -900,12 +900,25 @@ WINEMETAL_API void
+ MTLSharedEvent_setWin32EventAtValue(
+     obj_handle_t event, obj_handle_t shared_event_listener, void *nt_event_handle, uint64_t at_value
+ ) {
+-  struct unixcall_mtlsharedevent_setevent params;
+-  params.shared_event = event;
++  struct WMTSharedEventValue value = {event, at_value};
++  struct WMTConstMemoryPointer values = {0};
++  values.ptr = &value;
++  MTLSharedEvent_setWin32EventOnValues(values, 1, 1, shared_event_listener, nt_event_handle);
++}
++
++WINEMETAL_API uint32_t
++MTLSharedEvent_setWin32EventOnValues(
++    struct WMTConstMemoryPointer values, uint32_t count, uint32_t wait_all,
++    obj_handle_t shared_event_listener, void *nt_event_handle
++) {
++  struct unixcall_mtlsharedevent_setevent params = {0};
+   params.shared_event_listener = shared_event_listener;
+   params.event_handle = (obj_handle_t)PtrToUInt64(nt_event_handle);
+-  params.value = at_value;
++  params.values = values;
++  params.count = count;
++  params.wait_all = wait_all;
+   UNIX_CALL(104, &params);
++  return params.ret;
+ }
+ 
+ WINEMETAL_API obj_handle_t
+@@ -938,7 +951,7 @@ MTLBuffer_updateContents(obj_handle_t buffer, uint64_t offset, struct WMTConstMe
+ 
+ WINEMETAL_API obj_handle_t
+ SharedEventListener_create() {
+-  struct unixcall_generic_obj_ret params;
++  struct unixcall_generic_obj_ret params = {0};
+   UNIX_CALL(108, &params);
+   return params.ret;
+ }
+diff --git a/src/winemetal/winemetal_thunks.h b/src/winemetal/winemetal_thunks.h
+index 37645c9..38bb36e 100644
+--- a/src/winemetal/winemetal_thunks.h
++++ b/src/winemetal/winemetal_thunks.h
+@@ -283,10 +283,12 @@ struct unixcall_mtlbuffer_updatecontents {
+ };
+ 
+ struct unixcall_mtlsharedevent_setevent {
+-  obj_handle_t shared_event;
+   obj_handle_t event_handle;
+   obj_handle_t shared_event_listener;
+-  uint64_t value;
++  struct WMTConstMemoryPointer values;
++  uint32_t count;
++  uint32_t wait_all;
++  uint32_t ret;
+ };
+ 
+ struct unixcall_mtlsharedevent_createmachport {

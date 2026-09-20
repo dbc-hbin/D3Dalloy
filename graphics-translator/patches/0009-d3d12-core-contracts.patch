@@ -1,0 +1,319 @@
+diff --git a/src/d3d12/d3d12_command_list.cpp b/src/d3d12/d3d12_command_list.cpp
+index 2859bd0..df4e476 100644
+--- a/src/d3d12/d3d12_command_list.cpp
++++ b/src/d3d12/d3d12_command_list.cpp
+@@ -114,6 +114,7 @@ class MTLD3D12GraphicsCommandListImpl
+     : public MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12GraphicsCommandListExt> {
+ 
+   Com<MTLD3D12CommandAllocatorImpl, false> allocator_;
++  const D3D12_COMMAND_LIST_TYPE type_;
+ 
+   /* state */
+ 
+@@ -152,8 +153,12 @@ class MTLD3D12GraphicsCommandListImpl
+   UINT8 stencil_ref_;
+ 
+ public:
+-  MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice)
+-      : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12GraphicsCommandListExt>(pDevice) {}
++  MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type)
++      : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12GraphicsCommandListExt>(pDevice),
++        type_(Type) {
++    entry = nullptr;
++    encoder_count = 0;
++  }
+ 
+   ~MTLD3D12GraphicsCommandListImpl() {}
+ 
+@@ -204,7 +209,25 @@ public:
+ 
+   HRESULT
+   Initialize(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialPipelineState) {
++    if (!pAllocator)
++      return E_INVALIDARG;
++
++    Com<ID3D12Device> allocator_device;
++    if (FAILED(pAllocator->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&allocator_device))) ||
++        allocator_device.ptr() != static_cast<ID3D12Device *>(device_))
++      return E_INVALIDARG;
++
+     auto allocator = static_cast<MTLD3D12CommandAllocatorImpl *>(pAllocator);
++    if (allocator->type_ != type_)
++      return E_INVALIDARG;
++
++    if (pInitialPipelineState) {
++      Com<ID3D12Device> pipeline_device;
++      if (FAILED(pInitialPipelineState->GetDevice(
++              __uuidof(ID3D12Device), reinterpret_cast<void **>(&pipeline_device))) ||
++          pipeline_device.ptr() != static_cast<ID3D12Device *>(device_))
++        return E_INVALIDARG;
++    }
+ 
+     if (allocator_ != allocator)
+       allocator_ = allocator;
+@@ -217,6 +240,11 @@ public:
+     if (SUCCEEDED(hr)) {
+       ++owned_recording;
+       owned_graphics::Trace("record_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording);
++    } else {
++      entry = nullptr;
++      owned_allocator = nullptr;
++      allocator_ = nullptr;
++      encoder_count = 0;
+     }
+     return hr;
+   }
+@@ -251,7 +279,7 @@ public:
+ 
+   D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE
+   GetType() {
+-    return allocator_->type_;
++    return type_;
+   }
+ 
+   HRESULT STDMETHODCALLTYPE ValidateRecording() final {
+@@ -1670,11 +1698,33 @@ MTLD3D12CommandAllocatorImpl::CreateCommandList(
+   if (Type != type_)
+     return E_INVALIDARG;
+ 
+-  auto cmd_list = Com(new MTLD3D12GraphicsCommandListImpl(device_));
++  auto cmd_list = Com(new MTLD3D12GraphicsCommandListImpl(device_, Type));
+   HRESULT hr = cmd_list->Initialize(this, pInitialPipelineState);
+   if (FAILED(hr))
+     return hr;
+   return cmd_list->QueryInterface(riid, ppCommandList);
+ }
+ 
++HRESULT
++CreateClosedCommandList(
++    MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, REFIID riid, void **ppCommandList
++) {
++  InitReturnPtr(ppCommandList);
++  if (!ppCommandList)
++    return E_POINTER;
++
++  switch (Type) {
++  case D3D12_COMMAND_LIST_TYPE_DIRECT:
++  case D3D12_COMMAND_LIST_TYPE_BUNDLE:
++  case D3D12_COMMAND_LIST_TYPE_COMPUTE:
++  case D3D12_COMMAND_LIST_TYPE_COPY:
++    break;
++  default:
++    return E_INVALIDARG;
++  }
++
++  auto cmd_list = Com(new MTLD3D12GraphicsCommandListImpl(pDevice, Type));
++  return cmd_list->QueryInterface(riid, ppCommandList);
++}
++
+ }; // namespace dxmt
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index b1ee69c..b067053 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -1191,7 +1191,10 @@ public:
+   CreateCommandList1(
+       UINT NodeMask, D3D12_COMMAND_LIST_TYPE Type, D3D12_COMMAND_LIST_FLAGS Flags, REFIID riid, void **ppCommandList
+   ) {
+-    return E_NOTIMPL;
++    InitReturnPtr(ppCommandList);
++    if (NodeMask > 1 || Flags != D3D12_COMMAND_LIST_FLAG_NONE)
++      return E_INVALIDARG;
++    return dxmt::CreateClosedCommandList(this, Type, riid, ppCommandList);
+   }
+ 
+   HRESULT STDMETHODCALLTYPE
+@@ -1205,12 +1208,22 @@ public:
+       D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue,
+       ID3D12ProtectedResourceSession *pSession, REFIID riid, void **ppResource
+   ) {
+-    return E_NOTIMPL;
++    if (pSession) {
++      InitReturnPtr(ppResource);
++      return E_NOTIMPL;
++    }
++    return CreateCommittedResource(
++        pHeapProps, HeapFlags, pDesc, InitialState, OptimizedClearValue, riid, ppResource
++    );
+   }
+ 
+   HRESULT STDMETHODCALLTYPE
+   CreateHeap1(const D3D12_HEAP_DESC *pDesc, ID3D12ProtectedResourceSession *pSession, REFIID riid, void **ppHeap) {
+-    return E_NOTIMPL;
++    if (pSession) {
++      InitReturnPtr(ppHeap);
++      return E_NOTIMPL;
++    }
++    return CreateHeap(pDesc, riid, ppHeap);
+   }
+ 
+   HRESULT STDMETHODCALLTYPE
+diff --git a/src/d3d12/d3d12_device.hpp b/src/d3d12/d3d12_device.hpp
+index 8ae24b3..ada0947 100644
+--- a/src/d3d12/d3d12_device.hpp
++++ b/src/d3d12/d3d12_device.hpp
+@@ -140,7 +140,10 @@ public:
+   UINT IsComputePipelineState;
+ 
+   static HRESULT
+-  InitializeShader(D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl);
++  InitializeShader(
++      const char *Stage, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader,
++      struct MTL_SHADER_REFLECTION *pRefl
++  );
+ };
+ 
+ class MTLD3D12GraphicsPipelineState : public MTLD3D12PipelineState {
+@@ -208,6 +211,11 @@ CreateCommandQueue(MTLD3D12Device *pDevice, const D3D12_COMMAND_QUEUE_DESC *pDes
+ HRESULT
+ CreateCommandAllocator(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, REFIID riid, void **ppCommandAllocator);
+ 
++HRESULT
++CreateClosedCommandList(
++    MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, REFIID riid, void **ppCommandList
++);
++
+ HRESULT
+ CreateDescriptorHeap(
+     MTLD3D12Device *pDevice, const D3D12_DESCRIPTOR_HEAP_DESC *pDesc, REFIID riid, void **ppDescriptorHeap
+diff --git a/src/d3d12/d3d12_pipeline_compute.cpp b/src/d3d12/d3d12_pipeline_compute.cpp
+index aae4946..0182a78 100644
+--- a/src/d3d12/d3d12_pipeline_compute.cpp
++++ b/src/d3d12/d3d12_pipeline_compute.cpp
+@@ -56,7 +56,7 @@ public:
+     common.metal_version = SM50_SHADER_METAL_310;
+     common.next = &rootsig;
+ 
+-    if (HRESULT hr = InitializeShader(pDesc->CS, &shader_cs, &ref_cs); FAILED(hr))
++    if (HRESULT hr = InitializeShader("CS", pDesc->CS, &shader_cs, &ref_cs); FAILED(hr))
+       return hr;
+ 
+     threadgroup_size = {ref_cs.ThreadgroupSize[0], ref_cs.ThreadgroupSize[1], ref_cs.ThreadgroupSize[2]};
+@@ -131,6 +131,9 @@ HRESULT
+ CreateComputePipelineState(
+     MTLD3D12Device *pDevice, const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState
+ ) {
++  InitReturnPtr(ppPipelineState);
++  if (!pDesc)
++    return E_INVALIDARG;
+   auto pso = Com(new MTLD3D12ComputePipelineStateImpl(pDevice));
+   HRESULT hr = pso->Initialize(pDesc);
+   if (FAILED(hr))
+@@ -138,4 +141,4 @@ CreateComputePipelineState(
+   return pso->QueryInterface(riid, ppPipelineState);
+ };
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt
+diff --git a/src/d3d12/d3d12_pipeline_graphics.cpp b/src/d3d12/d3d12_pipeline_graphics.cpp
+index 22d5638..7d48aae 100644
+--- a/src/d3d12/d3d12_pipeline_graphics.cpp
++++ b/src/d3d12/d3d12_pipeline_graphics.cpp
+@@ -25,9 +25,33 @@
+ #include "sha1/sha1_util.hpp"
+ #include "DXBCParser/BlobContainer.h"
+ #include "DXBCParser/DXBCUtils.h"
++#include <atomic>
+ 
+ namespace dxmt {
+ 
++namespace {
++
++constexpr uint32_t kShaderProbeLimit = 16;
++std::atomic_uint32_t g_shader_probe_count = 0;
++
++void
++TraceShaderProbe(const char *stage, D3D12_SHADER_BYTECODE bytecode, const char *chunk, HRESULT hr) {
++  const uint32_t probe_index = g_shader_probe_count.fetch_add(1, std::memory_order_relaxed);
++  if (probe_index >= kShaderProbeLimit)
++    return;
++
++  const auto digest = bytecode.pShaderBytecode && bytecode.BytecodeLength
++                        ? Sha1HashState::compute(bytecode.pShaderBytecode, bytecode.BytecodeLength).string()
++                        : std::string("none");
++  Logger::info(str::format(
++      "D3D12 shader probe[", probe_index, "]: stage=", stage ? stage : "unknown",
++      " bytes=", bytecode.BytecodeLength, " sha1=", digest, " chunk=", chunk,
++      " hr=", uint32_t(hr)
++  ));
++}
++
++} // namespace
++
+ constexpr WMTCompareFunction kCompareFunctionMap[] = {
+     WMTCompareFunctionNever, // padding 0
+     WMTCompareFunctionNever, // 1 - 1
+@@ -233,23 +257,35 @@ ExtractMTLInputLayoutElements(
+ 
+ HRESULT
+ MTLD3D12PipelineState::InitializeShader(
+-    D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl
++    const char *Stage, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl
+ ) {
+   using namespace microsoft;
+   HRESULT hr;
+   CDXBCParser Parser;
+-  if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength)))
++  if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength))) {
++    TraceShaderProbe(Stage, Bytecode, "invalid-container", hr);
+     return hr;
++  }
+ 
+-  if (Parser.FindNextMatchingBlob(microsoft::DXBC_DXIL) != DXBC_BLOB_NOT_FOUND)
++  if (Parser.FindNextMatchingBlob(microsoft::DXBC_DXIL) != DXBC_BLOB_NOT_FOUND) {
++    TraceShaderProbe(Stage, Bytecode, "DXIL", E_NOTIMPL);
+     return E_NOTIMPL;
++  }
++
++  const char *chunk = "unknown";
++  if (Parser.FindNextMatchingBlob(microsoft::DXBC_GenericShaderEx) != DXBC_BLOB_NOT_FOUND)
++    chunk = "SHEX";
++  else if (Parser.FindNextMatchingBlob(microsoft::DXBC_GenericShader) != DXBC_BLOB_NOT_FOUND)
++    chunk = "SHDR";
+ 
+   SM50Error error;
+   if (SM50Initialize(Bytecode.pShaderBytecode, Bytecode.BytecodeLength, ppShader, pRefl, &error)) {
+     ERR("Failed to initialize shader: ", SM50GetErrorMessageString(error));
++    TraceShaderProbe(Stage, Bytecode, chunk, E_FAIL);
+     return E_FAIL;
+   }
+ 
++  TraceShaderProbe(Stage, Bytecode, chunk, S_OK);
+   return S_OK;
+ }
+ 
+@@ -496,7 +532,7 @@ public:
+     common.next = nullptr;
+ 
+     if (pDesc->VS.pShaderBytecode) {
+-      if (FAILED(hr = InitializeShader(pDesc->VS, &shader_vs, &ref_vs)))
++      if (FAILED(hr = InitializeShader("VS", pDesc->VS, &shader_vs, &ref_vs)))
+         return hr;
+       SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
+       data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+@@ -561,7 +597,7 @@ public:
+ 
+       std::string ps_name = "ps_main" + sha1.string().substr(0, 8);
+ 
+-      if (FAILED(hr = InitializeShader(pDesc->PS, &shader_ps, &ref_ps)))
++      if (FAILED(hr = InitializeShader("PS", pDesc->PS, &shader_ps, &ref_ps)))
+         return hr;
+       SM50_SHADER_PSO_PIXEL_SHADER_DATA data_ps;
+       data_ps.dual_source_blending = dual_source_blending;
+@@ -681,6 +717,8 @@ CreateGraphicsPipelineState(
+     MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState
+ ) {
+   InitReturnPtr(ppPipelineState);
++  if (!pDesc)
++    return E_INVALIDARG;
+   auto pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
+   HRESULT hr = pso->Initialize(pDesc);
+   if (FAILED(hr))
+@@ -688,4 +726,4 @@ CreateGraphicsPipelineState(
+   return pso->QueryInterface(riid, ppPipelineState);
+ };
+ 
+-} // namespace dxmt
+\ No newline at end of file
++} // namespace dxmt

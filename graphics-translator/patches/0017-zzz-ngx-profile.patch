@@ -1,0 +1,34 @@
+diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
+index 36cc140..fcbda11 100644
+--- a/src/util/config/config.cpp
++++ b/src/util/config/config.cpp
+@@ -41,11 +41,28 @@ namespace dxmt {
+ 
+ 
+   const static ProfileList g_profiles = {{
+-    { R"(\\(GenshinImpact|YuanShen|ZenlessZoneZero)\.exe$)", {{
++    { R"(\\(GenshinImpact|YuanShen)\.exe$)", {{
+       { "dxgi.customDeviceDesc",   "AMD Radeon Pro 5300M" },
+       { "dxgi.customVendorId",     "1002" },
+       { "dxgi.customDeviceId",     "7340" },
+     }} },
++    /* Zenless Zone Zero: it drives the owned D3D12/NGX translator, and an
++     * explicitly enabled NVEXT backend expects the NVIDIA compatibility
++     * identity. Without that opt-in the game keeps the historical AMD identity,
++     * and Genshin/YuanShen are unaffected. This selects the backend identity,
++     * it does not claim a specific physical GPU. */
++    { R"(\\ZenlessZoneZero\.exe$)",
++      env::getEnvVar("DXMT_ENABLE_NVEXT") == "1"
++        ? Config{{
++            { "dxgi.customDeviceDesc",   "DXMT Metal NGX" },
++            { "dxgi.customVendorId",     "10de" },
++            { "dxgi.customDeviceId",     "2684" },
++          }}
++        : Config{{
++            { "dxgi.customDeviceDesc",   "AMD Radeon Pro 5300M" },
++            { "dxgi.customVendorId",     "1002" },
++            { "dxgi.customDeviceId",     "7340" },
++          }} },
+     { R"(\\SONIC_X_SHADOW_GENERATIONS\.exe$)", {{
+       { "d3d11.ignoreMapFlagNoWait",   "True" },
+     }} },

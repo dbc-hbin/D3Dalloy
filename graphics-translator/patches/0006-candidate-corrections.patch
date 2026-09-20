@@ -1,0 +1,195 @@
+diff --git a/src/d3d12/d3d12_command_allocator.cpp b/src/d3d12/d3d12_command_allocator.cpp
+index 1d1e676..18b966e 100644
+--- a/src/d3d12/d3d12_command_allocator.cpp
++++ b/src/d3d12/d3d12_command_allocator.cpp
+@@ -114,6 +114,24 @@ MTLD3D12CommandAllocatorImpl::Reset() {
+   if (encoder_last)
+     return E_FAIL;
+ 
++  ClearRecordedCommands();
++  return Initialize();
++};
++
++MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
++  // A caller may release an unfinished list instead of closing/resetting it.
++  // Link its last pass before visiting and destroying the recorded payloads.
++  InvalidateCurrentPass();
++  ClearRecordedCommands();
++  free(cpu_heap_);
++  cpu_heap_ = nullptr;
++  gpu_heap_buffer_ = {};
++  free(gpu_heap_);
++  gpu_heap_ = nullptr;
++}
++
++void
++MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
+   for (auto &encoder_list : encoder_lists_) {
+     EncoderData *next = encoder_list.next;
+     while (next) {
+@@ -148,9 +166,7 @@ MTLD3D12CommandAllocatorImpl::Reset() {
+   for (auto ptr : spilled_cpu_heap_)
+     free(ptr);
+   spilled_cpu_heap_.clear();
+-
+-  return Initialize();
+-};
++}
+ 
+ IndirectComputeCommandData *
+ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12ComputePipelineState *pPSO, size_t MaxCount) {
+diff --git a/src/d3d12/d3d12_command_allocator.hpp b/src/d3d12/d3d12_command_allocator.hpp
+index 19f4e11..9e2a73f 100644
+--- a/src/d3d12/d3d12_command_allocator.hpp
++++ b/src/d3d12/d3d12_command_allocator.hpp
+@@ -82,9 +82,9 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
+   size_t gpu_heap_offset_;
+   uint64_t gpu_heap_buffer_address_;
+ 
+-  EncoderData *encoder_last;
+-  EncoderData *encoder_current;
+-  size_t encoder_count_;
++  EncoderData *encoder_last = nullptr;
++  EncoderData *encoder_current = nullptr;
++  size_t encoder_count_ = 0;
+ 
+   small_vector<EncoderData, 64> encoder_lists_;
+ 
+@@ -99,13 +99,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
+ public:
+   MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type);
+ 
+-  ~MTLD3D12CommandAllocatorImpl() {
+-    free(cpu_heap_);
+-    cpu_heap_ = nullptr;
+-    gpu_heap_buffer_ = {};
+-    free(gpu_heap_);
+-    gpu_heap_ = nullptr;
+-  }
++  ~MTLD3D12CommandAllocatorImpl();
+ 
+   HRESULT
+   Initialize();
+@@ -116,6 +110,10 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE Reset();
+ 
++  // Placement-new encoder payloads own retained resources and must be destroyed
++  // both on Reset and final release; freeing their arena alone leaks them.
++  void ClearRecordedCommands();
++
+   HRESULT STDMETHODCALLTYPE CreateCommandList(
+       UINT NodeMask, D3D12_COMMAND_LIST_TYPE Type, ID3D12PipelineState *pInitialPipelineState, REFIID riid,
+       void **ppCommandList
+diff --git a/src/d3d12/d3d12_device.cpp b/src/d3d12/d3d12_device.cpp
+index 61d7fee..b1ee69c 100644
+--- a/src/d3d12/d3d12_device.cpp
++++ b/src/d3d12/d3d12_device.cpp
+@@ -135,6 +135,13 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC *pDesc, REFIID riid, void **ppCommandQueue) {
++    if (ppCommandQueue)
++      *ppCommandQueue = nullptr;
++    if (!pDesc || pDesc->NodeMask > 1 ||
++        (pDesc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT &&
++         pDesc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
++         pDesc->Type != D3D12_COMMAND_LIST_TYPE_COPY))
++      return E_INVALIDARG;
+     if (pDesc->Flags)
+       WARN("CreateCommandQueue: flags ignored: ", pDesc->Flags);
+     return dxmt::CreateCommandQueue(this, pDesc, riid, ppCommandQueue);
+@@ -160,7 +167,14 @@ public:
+       UINT NodeMask, D3D12_COMMAND_LIST_TYPE Type, ID3D12CommandAllocator *pCommandAllocator,
+       ID3D12PipelineState *pInitialPipelineState, REFIID riid, void **ppCommandList
+   ) {
+-    if (!pCommandAllocator)
++    if (ppCommandList)
++      *ppCommandList = nullptr;
++    if (!pCommandAllocator || NodeMask > 1)
++      return E_INVALIDARG;
++    Com<ID3D12Device> allocator_device;
++    if (FAILED(pCommandAllocator->GetDevice(__uuidof(ID3D12Device),
++                                           reinterpret_cast<void **>(&allocator_device))) ||
++        allocator_device.ptr() != static_cast<ID3D12Device *>(this))
+       return E_INVALIDARG;
+     auto allocator = static_cast<MTLD3D12CommandAllocator *>(pCommandAllocator);
+     return allocator->CreateCommandList(NodeMask, Type, pInitialPipelineState, riid, ppCommandList);
+@@ -168,6 +182,8 @@ public:
+ 
+   HRESULT STDMETHODCALLTYPE
+   CheckFeatureSupport(D3D12_FEATURE Feature, void *pFeatureData, UINT DataSize) {
++    if (!pFeatureData)
++      return E_INVALIDARG;
+     auto metal = GetMTLDevice();
+     switch (Feature) {
+     case D3D12_FEATURE_ARCHITECTURE: {
+diff --git a/src/d3d12/d3d12_temporal.cpp b/src/d3d12/d3d12_temporal.cpp
+index 8ca4db8..b80e0fa 100644
+--- a/src/d3d12/d3d12_temporal.cpp
++++ b/src/d3d12/d3d12_temporal.cpp
+@@ -33,7 +33,6 @@ struct Generation {
+   const uint64_t id = owned_graphics::NewObjectId();
+   GenerationKey key{};
+   Rc<TemporalScaler> scaler;
+-  bool initialized = false; // Mutated only when actually encoded, under Core::mutex.
+ };
+ 
+ struct Core {
+@@ -44,6 +43,9 @@ struct Core {
+   std::shared_ptr<Generation> current;
+   WMT::Reference<WMT::SharedEvent> timeline;
+   uint64_t sequence = 0;
++  // A retained closed list may revisit an old generation after another one ran.
++  // Its old history is then discontinuous even though it was initialized once.
++  uint64_t last_executed_generation = 0;
+ };
+ 
+ // A second, DLL-private QI boundary avoids interpreting an arbitrary public
+@@ -72,7 +74,8 @@ HRESULT retainTexture(MTLD3D12Device *device, ID3D12Resource *input,
+   if (!input)
+     return E_INVALIDARG;
+   Com<ID3D12Device> owner;
+-  if (FAILED(input->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(owner.ref()))) ||
++  // Com::ref() returns an AddRef'd T*, not the address of its output storage.
++  if (FAILED(input->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
+       owner.ptr() != static_cast<ID3D12Device *>(device))
+     return E_INVALIDARG;
+   auto desc = input->GetDesc();
+@@ -105,6 +108,10 @@ struct OwnedTemporalFrame {
+   ~OwnedTemporalFrame() {
+     if (scratch_resident)
+       core->device->UnregisterResidency(scratch_output);
++    if (core)
++      owned_graphics::Trace("temporal_frame_destroy", ",\"feature\":", core->id,
++                            ",\"evaluation\":", id,
++                            ",\"generation\":", generation ? generation->id : 0);
+   }
+ };
+ 
+@@ -285,7 +292,7 @@ HRESULT PrepareOwnedTemporalFrame(MTLD3D12Device *device, IMTLD3D12TemporalUpsca
+   if (!state || !desc || desc->StructSize != sizeof(*desc))
+     return E_INVALIDARG;
+   Com<IOwnedTemporalStateInternal> internal;
+-  auto hr = state->QueryInterface(kInternalStateId, reinterpret_cast<void **>(internal.ref()));
++  auto hr = state->QueryInterface(kInternalStateId, reinterpret_cast<void **>(&internal));
+   if (FAILED(hr))
+     return E_INVALIDARG;
+   try {
+@@ -306,7 +313,7 @@ void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
+     cmdbuf.encodeWaitForEvent(core.timeline, core.sequence);
+   const auto sequence = ++core.sequence;
+   auto props = frame->props;
+-  props.reset = props.reset || !generation.initialized;
++  props.reset = props.reset || core.last_executed_generation != generation.id;
+   auto begin = cmdbuf.blitCommandEncoder();
+   begin.setLabel(WMT::String::string("OwnedTemporal.Begin", WMTUTF8StringEncoding));
+   begin.waitForFence(fence);
+@@ -333,6 +340,6 @@ void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
+   end.updateFence(fence);
+   end.endEncoding();
+   cmdbuf.encodeSignalEvent(core.timeline, sequence);
+-  generation.initialized = true;
++  core.last_executed_generation = generation.id;
+ }
+ } // namespace dxmt

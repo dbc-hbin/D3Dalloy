@@ -1,0 +1,95 @@
+{
+  "schema": 1,
+  "implementation": "owned-dxmt-derived",
+  "source": {
+    "dxmt_install": "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-direct-canonical-cache-20260921/install",
+    "wine_source": "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/dlss-translator-20260918/wine-final"
+  },
+  "loader": {
+    "winedlloverrides": "d3d12=b;dxgi=b;d3d11=b;d3d10core=b;winemetal=b;nvngx=b;nvapi64=b",
+    "explicit_wineprefix_required": true
+  },
+  "optional_modules": {
+    "nvngx": true,
+    "nvapi64": true
+  },
+  "artifacts": {
+    "lib/wine/x86_64-windows/d3d12.dll": {
+      "sha256": "5aff3c9207b4e74db12422ed641038618319ecb790362e33d0dfc310f6fc81d9",
+      "size": 24014848
+    },
+    "lib/wine/x86_64-windows/dxgi.dll": {
+      "sha256": "1c8a7bd0e91ba42d642317f3cc1aff8d19c9127cd144957ce1a1d55d534228d4",
+      "size": 5902336
+    },
+    "lib/wine/x86_64-windows/d3d11.dll": {
+      "sha256": "d38b2ceda3d0afd6cb200daec0c3ed2267d37cfbc95c203b1f8d15decadedea7",
+      "size": 35188736
+    },
+    "lib/wine/x86_64-windows/d3d10core.dll": {
+      "sha256": "ffe3fad953691f8e9208db40a5f438a4f7f25950a82f4e78437bdec5273fbfe5",
+      "size": 2170880
+    },
+    "lib/wine/x86_64-windows/winemetal.dll": {
+      "sha256": "9115c7d87bb279cfa9f75dd407a9723cbec87b13c1ba9bb57cdd27257f3cbdb4",
+      "size": 274432
+    },
+    "lib/wine/x86_64-unix/winemetal.so": {
+      "sha256": "ea487e843a1c7990b8bc0d9d297e9fd3e3f46666788921a6d8fda7ce6fd56e37",
+      "size": 53339120
+    },
+    "lib/wine/x86_64-windows/nvngx.dll": {
+      "sha256": "baa330d0e40b5eb956fcdddcd7928fd129fa9b003707a232c50f1a843a69db63",
+      "size": 3600384
+    },
+    "lib/wine/x86_64-windows/nvapi64.dll": {
+      "sha256": "92d6a5113498825958efffdfd0af235fb452e5a988f3cafb261f4fd898bdbbf5",
+      "size": 3244032
+    },
+    "bin/wine": {
+      "sha256": "c1532ed71a973d42dd801a75858fcfd48d33ccbe324f30a262ea61775a31cbde",
+      "size": 2687
+    },
+    "bin/wine.real": {
+      "sha256": "b148d75009974c1523a8ebbe3ccd8b9e8a6a762308d500332738f1a3e1af937b",
+      "size": 14704
+    }
+  },
+  "winemetal_dependencies": [
+    "@rpath/winemetal.so",
+    "@rpath/winemac.so",
+    "@rpath/ntdll.so",
+    "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
+    "/System/Library/Frameworks/Metal.framework/Versions/A/Metal",
+    "/System/Library/Frameworks/MetalFX.framework/Versions/A/MetalFX",
+    "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
+    "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics",
+    "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore",
+    "/System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync",
+    "/System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa",
+    "/usr/lib/libsqlite3.dylib",
+    "/usr/lib/libSystem.B.dylib",
+    "/usr/lib/libz.1.dylib",
+    "/usr/lib/libncurses.5.4.dylib",
+    "/usr/lib/libxml2.2.dylib",
+    "/usr/lib/libc++.1.dylib",
+    "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit",
+    "/usr/lib/libobjc.A.dylib"
+  ],
+  "native_compiler": {
+    "ownership": "self-owned",
+    "path": "lib/wine/x86_64-unix/winemetal.so",
+    "sha256": "ea487e843a1c7990b8bc0d9d297e9fd3e3f46666788921a6d8fda7ce6fd56e37",
+    "integration": "the DXIL compiler is compiled from the owned patch series into airconv and linked into this module",
+    "external_dependencies": []
+  },
+  "airconv_runtime": "statically linked into winemetal.so; no separate runtime executable",
+  "gptk_backend": {
+    "selected": false,
+    "preserved_files": [
+      "lib/external/D3DMetal.framework",
+      "lib/external/libd3dshared.dylib"
+    ],
+    "preservation_reason": "the Wine runtime may contain unrelated consumers; selection is blocked by the owned wrapper"
+  }
+}

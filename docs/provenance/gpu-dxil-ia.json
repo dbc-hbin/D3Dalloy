@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "suite": "dxil-ia",
+  "mode": "no-present",
+  "validation": true,
+  "command": [
+    "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-direct-canonical-cache-20260921/runtime/bin/wine",
+    "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-direct-canonical-cache-20260921/gpu-dxil-ia/fixture/fixture.exe",
+    "compute.dxil",
+    "vertex.dxil",
+    "pixel.dxil",
+    "fixture-vs.dxil",
+    "fixture-ps.dxil"
+  ],
+  "prefix": "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-direct-canonical-cache-20260921/gpu-dxil-ia/prefix",
+  "runtime_manifest_sha256": "c478eb688d8fd31211b33c9c71acfbdbb921460c4cb18cf66cb91a6d4fcb1817",
+  "lock": "/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/graphics-translator/upstream.lock.json",
+  "lock_sha256": "6854a6251882239911ed6b8ce740358a247c5f90456bad4df2ff10323ce725e4",
+  "fixture_sha256": {
+    "fixture.exe": "c16a6d6720913f5ee7975f3154d330f4aab9e7e3deb3a8255b62300e7e35c1c1",
+    "compute.dxil": "b4e6a848999fe69eda66f444788248f38410811ee7a569a4b20414584086bcb2",
+    "vertex.dxil": "66ed0ce0ca7a5473864216a3ea563fadd09e670421f314c714557ebb783f83a3",
+    "pixel.dxil": "df4e0e05425813aad74dc4c28e3654c866cee9f40ecdf9246454455fb4140d04",
+    "fixture-vs.dxil": "51ecfe916bac23b9dde45b4a3d9517259ddf2262267aeb45cf7a06c684900e77",
+    "fixture-ps.dxil": "da991c729ab8abc93f0a9ce7205b1112a2f02afa9de894765cc6cb63030adfce"
+  },
+  "timeout_seconds": 120,
+  "exit_code": 0,
+  "timed_out": false,
+  "backend_marker_verified": true,
+  "frames_verified": [
+    [
+      "3",
+      "13579bdf",
+      "13579bdf"
+    ]
+  ],
+  "uav_barrier_verified": false,
+  "dyld_lines": 21346,
+  "owned_native_loads": [
+    "dyld[19605]: <F865A4E2-9F47-3BB4-974C-F4E03D975AB4> /Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-direct-canonical-cache-20260921/runtime/lib/wine/x86_64-unix/winemetal.so"
+  ],
+  "dxil_native_compiler_verified": true,
+  "raytracing": null,
+  "foreign_backend_loads": [],
+  "validation_errors": [],
+  "backend_logs": [
+    "fixture_d3d12.log"
+  ],
+  "trace_event_count": 47,
+  "temporal_analysis": null,
+  "pass": true,
+  "scope": "synthetic owned D3D12 fixture; not ZZZ compatibility or a nameplate fix"
+}

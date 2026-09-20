@@ -1,0 +1,165 @@
+{
+  "schema": 1,
+  "upstream": {
+    "url": "https://github.com/3Shain/dxmt.git",
+    "commit": "7c8dee1c2d73415301ceb7d1fa810861cef4cd67",
+    "submodules": [
+      {
+        "path": "external/nvapi",
+        "url": "https://github.com/NVIDIA/nvapi.git",
+        "commit": "d08488fcc82eef313b0464db37d2955709691e94"
+      },
+      {
+        "path": "include/native/directx",
+        "url": "https://github.com/misyltoad/mingw-directx-headers",
+        "commit": "9df86f2341616ef1888ae59919feaa6d4fad693d"
+      }
+    ]
+  },
+  "patches": {
+    "directory": "graphics-translator/patches",
+    "reject_unlisted": true,
+    "series": [
+      {
+        "file": "0001-format-capabilities.patch",
+        "sha256": "f0948d8545d9a892bbcfbf1718e5c9ec178692fbaa90f65e2987b12d63cde3ad"
+      },
+      {
+        "file": "0002-submission-ring.patch",
+        "sha256": "6c2d8ed06f54bc4bf448a6f1e7a6d75b2490b95aab38fa298b14ab798ad7c7c9"
+      },
+      {
+        "file": "0003-identity-and-barriers.patch",
+        "sha256": "409beb7472a4185ba786d9c566b8680308a172a17d2a3401a1683f33a9233f26"
+      },
+      {
+        "file": "0004-d3d12-temporal.patch",
+        "sha256": "8ed724806cdcc7e8e14080cee023a2526ad9f941dc3be7bccfefe5a250c1f3fb"
+      },
+      {
+        "file": "0005-d3d12-ngx.patch",
+        "sha256": "e1f3b415324427a648523a96094ad24808535848dc55751e3f1bc81ba614e262"
+      },
+      {
+        "file": "0006-candidate-corrections.patch",
+        "sha256": "97565052ec01e3e652d4ac469796363ecce883652e6c84a9613fbbc2eb362e2c"
+      },
+      {
+        "file": "0007-queue-order.patch",
+        "sha256": "33ffa6c19792e7aa9b855a806486182bd19f8c11661e69a25ba4e05788fa9dad"
+      },
+      {
+        "file": "0009-d3d12-core-contracts.patch",
+        "sha256": "7e50dd34de461d95ff7159b073f2433de745c14cbdf350da43394fbe8bf28db2"
+      },
+      {
+        "file": "0010-temporal-output-order.patch",
+        "sha256": "2d4bff690e4396b498f5cc78ed997bf68f03191fb3264e6ceed8face9d0abdf9"
+      },
+      {
+        "file": "0013-fence-events.patch",
+        "sha256": "69b9635d69947d73d8318380de61e462a45aa53c58c529e4d7ab2fcc67fc9676"
+      },
+      {
+        "file": "0012-d3d12-resources.patch",
+        "sha256": "08fab031ee1f37ca2e903a40806eb5dea87684851a608ffa6f7893afdc994639"
+      },
+      {
+        "file": "0014-d3d12-bundles.patch",
+        "sha256": "74a4f3d324d311f98e08f155f30e8af413971a763f7dc8c6dca79b177cc6468c"
+      },
+      {
+        "file": "0011-d3d12-queries.patch",
+        "sha256": "236cb762d0eaff5a596ae60435b63e79d3f821e9db67587d1fcb1dcf6c772078"
+      },
+      {
+        "file": "0008-ngx-contracts.patch",
+        "sha256": "0c06ef63ee4182804cbef724f8af3276ca704203e3ea95d1643ebb1c20851412"
+      },
+      {
+        "file": "0015-dxil-compiler.patch",
+        "sha256": "af756950f846b88cfd43809ee4c98d41ecc256e978a173d74edcaf1dd09fb472"
+      },
+      {
+        "file": "0016-nvapi-streamline.patch",
+        "sha256": "098d6f67739921a3af5224e712323f0a9895553b3c2a4803f361e45b04a78af9"
+      },
+      {
+        "file": "0017-zzz-ngx-profile.patch",
+        "sha256": "a72e36f923183cf14f2e86b9da7ef91c28c918a3ddcfec1a40510785115e8385"
+      },
+      {
+        "file": "0018-d3d12-pipeline-cache.patch",
+        "sha256": "0340701953bec5d19491ec0a0c66637b6ccb8862f532e517e5cfa3e0837bec2d"
+      }
+    ]
+  },
+  "build": {
+    "cross_file": "build-win64.txt",
+    "buildtype": "debugoptimized",
+    "meson_options": {
+      "enable_d3d12": true,
+      "enable_nvapi": true,
+      "enable_nvngx": true
+    },
+    "native_build_compilers": {
+      "CC_FOR_BUILD": "/usr/bin/clang",
+      "CXX_FOR_BUILD": "/usr/bin/clang++"
+    }
+  },
+  "tools": {
+    "meson": {
+      "version": "1.10.0",
+      "sha256": "4fb6b999a77ddc0dc0db4ec5b4c5677b050582d0f542c252026ddd5e15d58d9c"
+    },
+    "ninja": {
+      "version_prefix": "1.13.0",
+      "sha256": "ad44480e2ba27be95a4850720983fd1b123728bb8a45c6c90670f5aa0d3e0069"
+    },
+    "llvm_mingw": {
+      "compiler_version_contains": "clang version 22.1.8",
+      "target_contains": "x86_64-w64-windows-gnu",
+      "files": {
+        "x86_64-w64-mingw32-gcc": "c9b86311ade81d53235c93fafabdf98328d094de344ea9a9038e0dab6695ee9f",
+        "x86_64-w64-mingw32-g++": "c9b86311ade81d53235c93fafabdf98328d094de344ea9a9038e0dab6695ee9f",
+        "x86_64-w64-mingw32-ar": "ec8b56f0a2c2eb5aaf9e6e3105a9dfa9e2755bfcfd3150ba95be043c97c9f479",
+        "x86_64-w64-mingw32-strip": "f4ca46024a0bfe5a98675f39aab1afbb5cfd58abf4abfe0cd7907610ea9f94c7",
+        "x86_64-w64-mingw32-windres": "8e23a958b47b2198be540737920f0ec7c9bdc27dccd0adb0777233f984cf10c2"
+      }
+    },
+    "native_llvm": {
+      "version": "15.0.7",
+      "source_url": "https://github.com/llvm/llvm-project.git",
+      "source_commit": "8dfdcc7b7bf66834a761bd8de445840ef68e4d1a",
+      "source_tag": "llvmorg-15.0.7",
+      "files": {
+        "include/llvm/Config/llvm-config.h": "9ae458e93291a9f6414b069d0d670a60cb30b0593458533678881a4aeefd2fa9",
+        "lib/libLLVMCore.a": "50a18d515863551d5467b67f45b1625b509141412a4cd969fbee272ae86dd235",
+        "lib/libLLVMSupport.a": "f05c5ce701ae7b8f4815bdba33bf761f09e4652e6319d32ae5864f17e0f5e3eb"
+      },
+      "bootstrap": {
+        "cmake_options": [
+          "-DCMAKE_BUILD_TYPE=Release",
+          "-DBUILD_SHARED_LIBS=OFF",
+          "-DLLVM_ENABLE_PROJECTS=",
+          "-DLLVM_ENABLE_EH=OFF",
+          "-DLLVM_ENABLE_RTTI=OFF",
+          "-DLLVM_ENABLE_TERMINFO=ON",
+          "-DLLVM_ENABLE_ZLIB=ON",
+          "-DLLVM_ENABLE_ZSTD=OFF",
+          "-DLLVM_TARGETS_TO_BUILD="
+        ]
+      }
+    },
+    "wine_sdk": {
+      "files": {
+        "bin/winebuild": "e7010fd4cbbc475a1f70c98dbfa5573e80111ac010d9383271e543498be922b5",
+        "lib/wine/x86_64-windows/libwinecrt0.a": "7cdd25cf0f4f51b2833380d32d1050ab75aceed6a4bd82f5a15e1c00c706cf59",
+        "lib/wine/x86_64-windows/libntdll.a": "55b7273079accd21a868b38243dce825fdd9ff1ec783484f6ba8bc234b345112",
+        "lib/wine/x86_64-windows/libdbghelp.a": "980e17f5f9147af182943b534a851147c17325d299510d81d00248aac46dc40a",
+        "lib/wine/x86_64-unix/winemac.so": "85749cd350e8d3bb7600263e58dc9673509a89f6a0b7b1e56510691b65beb579",
+        "lib/wine/x86_64-unix/ntdll.so": "16a6248fb35d31bbbf14f9ab0c58f123adf9cf79144bb3333cec52adfe7f4505"
+      }
+    }
+  }
+}
