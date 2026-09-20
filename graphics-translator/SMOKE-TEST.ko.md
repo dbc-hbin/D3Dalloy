@@ -28,6 +28,8 @@ python3 scripts/test-owned-graphics.py \
 
 이전 `owned-direct-canonical-icb-20260920/runtime`과 이번 개발용 runtime 사본은 canonical 검증 후 정리했다. 각 root의 `retired-runtime-manifest.json`과 기존 fixture/source/log/result는 보존했다. 새 canonical runtime은 유지하며 이번 검증의 임시 실행 driver와 완료된 전용 prefix만 정리했다.
 
+디스크 정리(2026-09-21): `build/owned-continuation-20260919`, `owned-completion-20260919`, `owned-direct-20260919`, `owned-direct-canonical-{20260920,final-clean-20260920,space-20260920,validated-20260920,rt-final-20260920,icb-20260920}`, `owned-workers`와 `owned-graphics-20260919`/`dlss-translator-20260918`의 per-run runtime 하위 디렉터리를 제거했다(약 243 GiB). 각 root의 4MB 이하 `.json`/`.log`/`.md`/`.txt` 증거는 `build/retired-evidence/`로 옮겨 보존했고 내역은 `build/retired-evidence/retirement-manifest.json`에 있다. 아래 문서의 `build/owned-*` 경로는 이제 역사적 provenance 표기다.
+
 ## 자체 DXIL compiler 실행 검증 (2026-09-20)
 
 ### Canonical DXR / indirect 실행 증거

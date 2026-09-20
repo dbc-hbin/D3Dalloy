@@ -1,10 +1,12 @@
 # Owned graphics translator 재현 빌드
 
+> 이 문서는 import 당시의 frozen baseline 재현 절차를 기록한다. 현재 저장소에서는 루트 소스가 작업 기준이며, 일상 빌드는 [README.md](../README.md)의 Meson 절차를 사용한다. 여기의 `build/owned-*` 경로와 patch 역수출 지침은 역사적 기록이다.
+
 `scripts/build-owned-graphics.py`는 기존 dirty DXMT candidate를 빌드 입력으로 사용하지 않는다. `graphics-translator/upstream.lock.json`에 고정된 upstream commit과 submodule commit을 새 checkout으로 만들고, lock에 적힌 patch series를 순서대로 적용한 뒤 별도 build/install 디렉터리에서 Meson cross build를 수행한다.
 
 현재 lock의 upstream 기준은 DXMT `7c8dee1c2d73415301ceb7d1fa810861cef4cd67`이며 submodule도 commit 단위로 고정한다. patch 파일은 파일명만 고정하는 것이 아니라 SHA-256까지 lock에 들어간다. `graphics-translator/patches`에 lock에 없는 `.patch`가 추가되거나 기존 patch 내용이 바뀌면 build는 source checkout 전에 실패한다. prime이 patch series를 재배치하거나 새 patch를 넣을 때 `upstream.lock.json`의 ordered `patches.series`와 hash를 같이 갱신해야 한다.
 
-현재 series 순서는 `0001-format-capabilities.patch` → `0002-submission-ring.patch` → `0003-identity-and-barriers.patch` → `0004-d3d12-temporal.patch` → `0005-d3d12-ngx.patch` → `0006-candidate-corrections.patch` → `0007-queue-order.patch` → `0009-d3d12-core-contracts.patch` → `0010-temporal-output-order.patch` → `0013-fence-events.patch` → `0012-d3d12-resources.patch` → `0014-d3d12-bundles.patch` → `0011-d3d12-queries.patch` → `0008-ngx-contracts.patch` → `0015-dxil-compiler.patch`다. `0004`는 2026-09-19 frozen candidate snapshot에서 기존 0001/0002/0003을 제외한 D3D12 residual을 그대로 직렬화한 것으로, feature-level gate/query 수정, temporal backend, command recording/submission 연동, shared `src/d3d12/d3d12_interfaces.hpp`를 포함한다. `0005` D3D12 NGX frontend는 이 shared header를 include하므로 0004 뒤에 와야 한다.
+현재 series 순서는 `0001-format-capabilities.patch` → `0002-submission-ring.patch` → `0003-identity-and-barriers.patch` → `0004-d3d12-temporal.patch` → `0005-d3d12-ngx.patch` → `0006-candidate-corrections.patch` → `0007-queue-order.patch` → `0009-d3d12-core-contracts.patch` → `0010-temporal-output-order.patch` → `0013-fence-events.patch` → `0012-d3d12-resources.patch` → `0014-d3d12-bundles.patch` → `0011-d3d12-queries.patch` → `0008-ngx-contracts.patch` → `0015-dxil-compiler.patch` → `0016-nvapi-streamline.patch` → `0017-zzz-ngx-profile.patch` → `0018-d3d12-pipeline-cache.patch`다. `0004`는 2026-09-19 frozen candidate snapshot에서 기존 0001/0002/0003을 제외한 D3D12 residual을 그대로 직렬화한 것으로, feature-level gate/query 수정, temporal backend, command recording/submission 연동, shared `src/d3d12/d3d12_interfaces.hpp`를 포함한다. `0005` D3D12 NGX frontend는 이 shared header를 include하므로 0004 뒤에 와야 한다.
 
 ## 이미 검증된 toolchain 입력
 
