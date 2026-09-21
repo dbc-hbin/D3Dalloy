@@ -474,8 +474,6 @@ public:
 
   llvm::Value *ClampArrayIndex(llvm::Value *ShaderValue, llvm::Value *Metadata);
 
-  llvm::Value *GetSamplePos(llvm::Value *SampleCount, llvm::Value *Index);
-
   void HullGenerateWorkloadForTriangle(
       llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
       llvm::Value *TessFactorIn, llvm::Value *TessFactorOut0, llvm::Value *TessFactorOut1, llvm::Value *TessFactorOut2

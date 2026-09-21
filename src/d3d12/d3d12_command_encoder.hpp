@@ -33,6 +33,7 @@ enum class EncoderType {
   Blit,
   Compute,
   Resolve,
+  PredicatedTextureCopy,
   Temporal,
   Query,
   Raytracing,
@@ -61,6 +62,14 @@ struct ClearEncoderData : EncoderData {
 
 struct RenderEncoderColorAttachmentData {
   TextureViewRef attachment;
+  // D3D12 permits typed buffer RTVs, while Metal render attachments cannot be
+  // texture-buffer views. These retain the backing allocation and the private
+  // 2D staging texture used for an exact copy-in/render/copy-out pass.
+  WMT::Reference<WMT::Buffer> buffer_backing;
+  WMT::Reference<WMT::Texture> buffer_attachment;
+  uint64_t buffer_offset = 0;
+  uint32_t buffer_bytes_per_row = 0;
+  uint32_t buffer_width = 0;
   enum WMTLoadAction load_action;
   enum WMTStoreAction store_action;
   uint16_t level;
@@ -150,9 +159,42 @@ struct ComputeEncoderData : EncoderData {
   WMT::Reference<WMT::VisibleFunctionTable> rt_visible_function_table;
   small_vector<WMT::Reference<WMT::Buffer>, 4> rt_buffers;
 };
+struct PredicatedTextureCopyEncoderData : EncoderData {
+  WMT::Reference<WMT::Texture> source;
+  WMT::Reference<WMT::Texture> destination;
+  WMT::Reference<WMT::Buffer> predicate;
+  const uint64_t *predicate_value = nullptr;
+  uint64_t predicate_offset = 0;
+  WMTOrigin source_origin{};
+  WMTOrigin destination_origin{};
+  WMTSize size{};
+  uint32_t source_level = 0;
+  uint32_t source_slice = 0;
+  uint32_t destination_level = 0;
+  uint32_t destination_slice = 0;
+  bool predicate_not_equal = false;
+};
+
 struct ResolveEncoderData : EncoderData {
   TextureViewRef src;
   TextureViewRef dst;
+  WMT::Reference<WMT::RenderPipelineState> pipeline;
+  WMT::Reference<WMT::DepthStencilState> depth_stencil_state;
+  uint8_t dsv_flags = 0;
+  struct {
+    int32_t source_delta_x = 0;
+    int32_t source_delta_y = 0;
+    uint32_t sample_count = 0;
+    uint32_t mode = 0;
+    uint32_t predicate_enabled = 0;
+    uint32_t predicate_not_equal = 0;
+  } parameters;
+  WMT::Reference<WMT::Buffer> predicate;
+  uint64_t predicate_offset = 0;
+  uint32_t destination_x = 0;
+  uint32_t destination_y = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
 };
 
 enum class QueryEncoderOp : uint8_t {

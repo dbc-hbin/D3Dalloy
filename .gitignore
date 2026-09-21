@@ -7,6 +7,7 @@ wine
 .local
 .config
 toolchains
+__pycache__/
 build-local.txt
 *.cso
 *.ll

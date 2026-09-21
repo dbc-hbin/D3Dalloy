@@ -113,13 +113,16 @@ public:
       if (!mapped_argument_buffer_)
         return E_OUTOFMEMORY;
       argument_buffer_gpu_address_ = buffer_->current()->gpuAddress();
-      device_->RegisterResidencyAndVA(buffer_->current());
+      HRESULT hr = device_->RegisterResidencyAndVA(buffer_->current(), this);
+      if (FAILED(hr))
+        return hr;
     } else {
       mapped_argument_buffer_ = reinterpret_cast<ShaderVisibleDescriptorGPUStorage *>(
           calloc(descriptors_.size(), sizeof(ShaderVisibleDescriptorGPUStorage))
       );
       if (!descriptors_.empty() && !mapped_argument_buffer_)
         return E_OUTOFMEMORY;
+      InitializeResidency(true);
     }
 
     return S_OK;
@@ -127,7 +130,7 @@ public:
 
   ~MTLD3D12DescriptorHeapImpl() {
     if (buffer_) {
-      device_->UnregisterResidencyAndVA(buffer_->current());
+      device_->UnregisterResidencyAndVA(buffer_->current(), this);
     } else {
       free(mapped_argument_buffer_);
     }
@@ -403,6 +406,7 @@ public:
     default:
       return E_INVALIDARG;
     }
+    InitializeResidency(true);
     return S_OK;
   };
 
@@ -519,13 +523,15 @@ public:
       if (!mapped_argument_buffer_)
         return E_OUTOFMEMORY;
       argument_buffer_gpu_address_ = buffer_->current()->gpuAddress();
-      // FIXME: is residency required for descriptor heap? Should be the case for Metal 4
-      device_->RegisterResidencyAndVA(buffer_->current());
+      HRESULT hr = device_->RegisterResidencyAndVA(buffer_->current(), this);
+      if (FAILED(hr))
+        return hr;
     } else {
       mapped_argument_buffer_ =
           reinterpret_cast<SamplerGPUStorage *>(calloc(samplers_.size(), sizeof(SamplerGPUStorage)));
       if (!samplers_.empty() && !mapped_argument_buffer_)
         return E_OUTOFMEMORY;
+      InitializeResidency(true);
     }
 
     return S_OK;
@@ -533,7 +539,7 @@ public:
 
   ~MTLD3D12SamplerDescriptorHeapImpl() {
      if (buffer_) {
-      device_->UnregisterResidencyAndVA(buffer_->current());
+      device_->UnregisterResidencyAndVA(buffer_->current(), this);
     } else {
       free(mapped_argument_buffer_);
     }

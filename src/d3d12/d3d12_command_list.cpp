@@ -400,6 +400,13 @@ class MTLD3D12GraphicsCommandListImpl
   Com<MTLD3D12RootSignature, false> rootsig_compute_;
   uint64_t rootarg_compute_staging_[64];
 
+  WMT::Reference<WMT::ComputePipelineState> predication_snapshot_pipeline_;
+  WMT::Reference<WMT::ComputePipelineState> predication_arguments_pipeline_;
+  WMT::Reference<WMT::ComputePipelineState> predication_copy_pipeline_;
+  uint64_t predication_snapshot_offset_ = 0;
+  D3D12_PREDICATION_OP predication_op_ = D3D12_PREDICATION_OP_EQUAL_ZERO;
+  bool predication_enabled_ = false;
+
   /* IRaytracing dispatch state, set by SetPipelineState1. */
   Com<MTLD3D12StateObject> rt_state_object_;
   WMT::Reference<WMT::ComputePipelineState> rt_pipeline_;
@@ -427,6 +434,168 @@ class MTLD3D12GraphicsCommandListImpl
     Com<ID3D12Device> owner;
     return SUCCEEDED(object->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) &&
            owner.ptr() == static_cast<ID3D12Device *>(device_);
+  }
+
+  bool ValidateRootParameter(
+      MTLD3D12RootSignature *root, UINT index, D3D12_ROOT_PARAMETER_TYPE type,
+      UINT constant_count = 0, UINT constant_offset = 0
+  ) {
+    if (!IsRecording() || !root || index >= root->ParameterSlots || root->ParameterTypes[index] != type ||
+        (type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+         (constant_offset > root->ParameterConstantCounts[index] ||
+          constant_count > root->ParameterConstantCounts[index] - constant_offset))) {
+      RecordError();
+      return false;
+    }
+    return true;
+  }
+
+  bool EnsurePredicationPipelines() {
+    if (predication_snapshot_pipeline_ && predication_arguments_pipeline_ && predication_copy_pipeline_)
+      return true;
+    constexpr auto source = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void dxmt_snapshot_predicate(device const ulong *source [[buffer(0)]],
+                                    device ulong *destination [[buffer(1)]]) {
+  destination[0] = source[0];
+}
+kernel void dxmt_predicate_arguments(device const ulong *predicate [[buffer(0)]],
+                                     device const uint *control [[buffer(1)]],
+                                     device uint *arguments [[buffer(2)]]) {
+  const bool execute = control[0] ? predicate[0] == 0 : predicate[0] != 0;
+  for (uint i = 0; i < control[1]; i++)
+    arguments[i] = execute ? control[i + 2] : 0;
+}
+kernel void dxmt_predicate_copy_bytes(device const ulong *predicate [[buffer(0)]],
+                                      device const ulong *control [[buffer(1)]],
+                                      device const uchar *source [[buffer(2)]],
+                                      device uchar *destination [[buffer(3)]],
+                                      uint index [[thread_position_in_grid]]) {
+  const bool execute = control[0] ? predicate[0] == 0 : predicate[0] != 0;
+  if (execute && index < control[1])
+    destination[index] = source[index];
+}
+)";
+    WMT::Reference<WMT::Error> error;
+    auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
+    if (!library)
+      return false;
+    auto snapshot = library.newFunction("dxmt_snapshot_predicate");
+    auto arguments = library.newFunction("dxmt_predicate_arguments");
+    auto copy = library.newFunction("dxmt_predicate_copy_bytes");
+    if (!snapshot || !arguments || !copy)
+      return false;
+    predication_snapshot_pipeline_ = device_->GetMTLDevice().newComputePipelineState(snapshot, error);
+    if (!predication_snapshot_pipeline_)
+      return false;
+    predication_arguments_pipeline_ = device_->GetMTLDevice().newComputePipelineState(arguments, error);
+    if (!predication_arguments_pipeline_)
+      return false;
+    predication_copy_pipeline_ = device_->GetMTLDevice().newComputePipelineState(copy, error);
+    return bool(predication_copy_pipeline_);
+  }
+
+  void BeginPredicationComputePass(WMT::ComputePipelineState pipeline, uint32_t threadgroup_width = 1) {
+    allocator_->InvalidateCurrentPass();
+    auto compute = allocator_->AllocatePass<ComputeEncoderData>();
+    compute->type = EncoderType::Compute;
+    compute->cmd_head.type = WMTComputeCommandNop;
+    compute->cmd_head.next.set(0);
+    compute->cmd_tail = reinterpret_cast<wmtcmd_base *>(&compute->cmd_head);
+    auto &set_pipeline = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
+    set_pipeline.type = WMTComputeCommandSetPSO;
+    set_pipeline.pso = pipeline;
+    set_pipeline.threadgroup_size = {threadgroup_width, 1, 1};
+  }
+
+  void BindPredicationBuffer(WMT::Buffer buffer, uint64_t offset, uint8_t index) {
+    auto &binding = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
+    binding.type = WMTComputeCommandSetBuffer;
+    binding.buffer = buffer;
+    binding.offset = offset;
+    binding.index = index;
+  }
+
+  void DispatchPredicationKernel() {
+    auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
+    dispatch.type = WMTComputeCommandDispatch;
+    dispatch.size = {1, 1, 1};
+    allocator_->InvalidateCurrentPass();
+  }
+
+  void EncodePredicatedBufferCopy(WMT::Buffer source, uint64_t source_offset, WMT::Buffer destination,
+                                  uint64_t destination_offset, uint64_t byte_count) {
+    while (byte_count) {
+      const uint64_t chunk = std::min<uint64_t>(byte_count, UINT32_MAX);
+      if (!allocator_->CanAllocateGPUHeap(2 * sizeof(uint64_t), 8)) {
+        RecordError(E_OUTOFMEMORY);
+        return;
+      }
+      auto [control, control_offset] = allocator_->AllocateGPUHeap(2 * sizeof(uint64_t), 8);
+      auto *words = static_cast<uint64_t *>(control);
+      words[0] = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
+      words[1] = chunk;
+      BeginPredicationComputePass(predication_copy_pipeline_, 64);
+      BindPredicationBuffer(allocator_->gpu_heap_buffer_, predication_snapshot_offset_, 0);
+      BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 1);
+      BindPredicationBuffer(source, source_offset, 2);
+      BindPredicationBuffer(destination, destination_offset, 3);
+      auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
+      dispatch.type = WMTComputeCommandDispatch;
+      dispatch.size = {(chunk + 63) / 64, 1, 1};
+      allocator_->InvalidateCurrentPass();
+      source_offset += chunk;
+      destination_offset += chunk;
+      byte_count -= chunk;
+    }
+  }
+
+  uint64_t PreparePredicatedArguments(const void *arguments, UINT byte_count) {
+    if (!allocator_->CanAllocateGPUHeap(size_t(byte_count) * 2 + 32, 16))
+      return UINT64_MAX;
+    auto [control, control_offset] = allocator_->AllocateGPUHeap(byte_count + 2 * sizeof(uint32_t), 16);
+    auto [output, output_offset] = allocator_->AllocateGPUHeap(byte_count, 16);
+    auto *words = static_cast<uint32_t *>(control);
+    words[0] = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
+    words[1] = byte_count / sizeof(uint32_t);
+    memcpy(words + 2, arguments, byte_count);
+    memset(output, 0, byte_count);
+
+    BeginPredicationComputePass(predication_arguments_pipeline_);
+    BindPredicationBuffer(allocator_->gpu_heap_buffer_, predication_snapshot_offset_, 0);
+    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 1);
+    BindPredicationBuffer(allocator_->gpu_heap_buffer_, output_offset, 2);
+    DispatchPredicationKernel();
+    return output_offset;
+  }
+
+  void ResetIndirectState(MTLD3D12CommandSignature *sig, MTLD3D12RootSignature *rootsig,
+                          uint64_t *root_staging, bool compute) {
+    if (sig->UpdateRootArguments && rootsig) {
+      for (UINT parameter = 0; parameter < rootsig->ParameterSlots && parameter < 64; parameter++) {
+        if (!(sig->RootParameterMask & (uint64_t(1) << parameter)))
+          continue;
+        const UINT begin = rootsig->SlotQwordOffsets[parameter];
+        const UINT end = parameter + 1 < rootsig->ParameterSlots ? rootsig->SlotQwordOffsets[parameter + 1]
+                                                                 : rootsig->UploadQwords;
+        if (begin < end && end <= 64)
+          memset(root_staging + begin, 0, sizeof(uint64_t) * (end - begin));
+      }
+      dirty_state_.set(compute ? DirtyState::ComputeRootArguments : DirtyState::GraphicsRootArguments);
+    }
+    if (!compute && sig->UpdateVertexBuffers) {
+      for (UINT slot = 0; slot < D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; slot++)
+        if (sig->VertexBufferMask & (1u << slot))
+          vertex_buffers_[slot] = {};
+      dirty_state_.set(DirtyState::VertexBuffer);
+    }
+    if (!compute && sig->UpdateIndexBuffer) {
+      index_buffer_address = 0;
+      index_buffer = {};
+      index_type = {};
+      index_offset = 0;
+    }
   }
 
 public:
@@ -477,6 +646,9 @@ public:
 
     rootsig_compute_ = nullptr;
     memset(rootarg_compute_staging_, 0, sizeof(rootarg_compute_staging_));
+    predication_enabled_ = false;
+    predication_snapshot_offset_ = 0;
+    predication_op_ = D3D12_PREDICATION_OP_EQUAL_ZERO;
 
     rt_state_object_ = nullptr;
     rt_pipeline_ = {};
@@ -660,14 +832,15 @@ public:
     auto [mapped, offset] = allocator_->AllocateGPUHeap(stride * Count, 16);
 
     for (unsigned i = 0; i < Count; i++) {
-      VERTEX_BUFFER_ENTRY *entries = (VERTEX_BUFFER_ENTRY *)(reinterpret_cast<char *>(mapped) + i * stride);
-      for (unsigned slot = 0, index = 0; slot < max_slot; slot++) {
-        if (!(slot_mask & (1 << slot)))
+      auto *entries = reinterpret_cast<VERTEX_BUFFER_ENTRY *>(reinterpret_cast<char *>(mapped) + i * stride);
+      memset(entries, 0, stride);
+      for (unsigned slot = 0; slot < max_slot; slot++) {
+        if (!(slot_mask & (1u << slot)))
           continue;
         auto &state = vertex_buffers_[slot];
-        entries[index].buffer_handle = state.BufferLocation;
-        entries[index].stride = state.StrideInBytes;
-        entries[index++].length = state.SizeInBytes;
+        entries[slot].buffer_handle = state.BufferLocation;
+        entries[slot].stride = state.StrideInBytes;
+        entries[slot].length = state.SizeInBytes;
       };
     }
 
@@ -717,11 +890,43 @@ public:
         effective_rtvs++;
         auto [Heap, Index] = GetRenderTargetHeap(device_, rtvs[i]);
         auto AttachmentDesc = Heap->GetRenderTarget(Index);
-        if (!AttachmentDesc.Texture)
-          continue;
         auto &rt = render->colors[i];
-        rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
-        rt.depth_plane = AttachmentDesc.DepthPlane;
+        if (AttachmentDesc.Texture) {
+          rt.attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
+          rt.depth_plane = AttachmentDesc.DepthPlane;
+        } else if (AttachmentDesc.BufferResource) {
+          auto *allocation = AttachmentDesc.BufferResource->current();
+          const uint32_t staging_width =
+              std::min<uint32_t>(AttachmentDesc.Width, D3D12_REQ_RENDER_TO_BUFFER_WINDOW_WIDTH);
+          const uint32_t texel_size = MTLGetTexelSize(AttachmentDesc.Format);
+          if (!allocation || !staging_width || !texel_size) {
+            RecordError(E_INVALIDARG);
+            return DrawCallStatus::Invalid;
+          }
+          WMTTextureInfo info{};
+          info.type = WMTTextureType2D;
+          info.width = staging_width;
+          info.height = 1;
+          info.depth = 1;
+          info.array_length = 1;
+          info.mipmap_level_count = 1;
+          info.sample_count = 1;
+          info.pixel_format = AttachmentDesc.Format;
+          info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
+          info.usage = WMTTextureUsageRenderTarget;
+          rt.buffer_attachment = device_->GetMTLDevice().newTexture(info);
+          if (!rt.buffer_attachment) {
+            RecordError(E_OUTOFMEMORY);
+            return DrawCallStatus::Invalid;
+          }
+          rt.buffer_backing = allocation->buffer();
+          rt.buffer_offset = allocation->currentSuballocationOffset() + AttachmentDesc.BufferRange.byteOffset;
+          rt.buffer_bytes_per_row = staging_width * texel_size;
+          rt.buffer_width = staging_width;
+          rt.depth_plane = 0;
+        } else {
+          continue;
+        }
         rt.load_action = WMTLoadActionLoad;
         rt.store_action = WMTStoreActionStore;
         render_target_width = std::min(render_target_width, AttachmentDesc.Width);
@@ -857,39 +1062,55 @@ public:
       dirty_state_.clr(DirtyState::GraphicsRootSignature);
     }
 
-    if (dirty_state_.test(DirtyState::Viewport)) {
-      auto metal_viewport = allocator_->AllocateCommandData<WMTViewport>(num_viewports);
-      for (auto i = 0u; i < num_viewports; i++) {
-        auto &viewport = viewports[i];
-        metal_viewport[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
-                             viewport.Height,   viewport.MinDepth, viewport.MaxDepth};
-      }
-      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setviewports>();
-      cmd.type = WMTRenderCommandSetViewports;
-      cmd.viewports.set(metal_viewport);
-      cmd.viewport_count = num_viewports;
-      dirty_state_.clr(DirtyState::Viewport);
-    }
+    if (dirty_state_.any(DirtyState::Viewport, DirtyState::ScissorRect)) {
+      // Metal requires at least one viewport and scissor rectangle. D3D12 instead
+      // uses an empty viewport/scissor state to discard rasterization, while the
+      // vertex stage still runs. Lower empty raster regions to a valid viewport
+      // outside the framebuffer, and always restore both arrays together when
+      // either D3D12 array changes.
+      const UINT metal_count = std::max(num_viewports, 1u);
+      auto metal_viewports = allocator_->AllocateCommandData<WMTViewport>(metal_count);
+      auto metal_scissors = allocator_->AllocateCommandData<WMTScissorRect>(metal_count);
+      const bool empty_raster_state = !num_viewports || !num_scissors;
+      for (auto i = 0u; i < metal_count; i++) {
+        bool empty_region = empty_raster_state;
+        if (!empty_region) {
+          auto &viewport = viewports[i];
+          empty_region = viewport.Width <= 0.0f || viewport.Height <= 0.0f;
+          if (!empty_region) {
+            metal_viewports[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
+                                  viewport.Height,   viewport.MinDepth, viewport.MaxDepth};
+          }
+        }
 
-    if (dirty_state_.test(DirtyState::ScissorRect)) {
-      auto metal_scissors = allocator_->AllocateCommandData<WMTScissorRect>(num_viewports /* yes */);
-      for (auto i = 0u; i < num_viewports; i++) {
-        if (i < num_scissors) {
+        if (!empty_region && i < num_scissors) {
           auto &d3d_rect = scissors[i];
           LONG left = std::clamp(d3d_rect.left, (LONG)0, (LONG)16384);
           LONG top = std::clamp(d3d_rect.top, (LONG)0, (LONG)16384);
           LONG right = std::clamp(d3d_rect.right, left, (LONG)16384);
           LONG bottom = std::clamp(d3d_rect.bottom, top, (LONG)16384);
-          metal_scissors[i] = {uint32_t(left), uint32_t(top), uint32_t(right - left), uint32_t(bottom - top)};
-        } else {
+          empty_region = right == left || bottom == top;
+          if (!empty_region)
+            metal_scissors[i] = {uint32_t(left), uint32_t(top), uint32_t(right - left), uint32_t(bottom - top)};
+        } else if (!empty_region) {
           metal_scissors[i] = {0, 0, 16384, 16384};
         }
+
+        if (empty_region) {
+          metal_viewports[i] = {-2.0, -2.0, 1.0, 1.0, 0.0, 1.0};
+          metal_scissors[i] = {0, 0, 1, 1};
+        }
       }
-      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setscissorrects>();
-      cmd.type = WMTRenderCommandSetScissorRects;
-      cmd.scissor_rects.set(metal_scissors);
-      cmd.rect_count = num_viewports;
-      dirty_state_.clr(DirtyState::ScissorRect);
+
+      auto &viewport_cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setviewports>();
+      viewport_cmd.type = WMTRenderCommandSetViewports;
+      viewport_cmd.viewports.set(metal_viewports);
+      viewport_cmd.viewport_count = metal_count;
+      auto &scissor_cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setscissorrects>();
+      scissor_cmd.type = WMTRenderCommandSetScissorRects;
+      scissor_cmd.scissor_rects.set(metal_scissors);
+      scissor_cmd.rect_count = metal_count;
+      dirty_state_.clr(DirtyState::Viewport, DirtyState::ScissorRect);
     }
 
     if (dirty_state_.test(DirtyState::BlendFactor)) {
@@ -921,17 +1142,35 @@ public:
     uint32_t cp_count;
     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
       return;
+    uint64_t predicated_offset = 0;
+    if (predication_enabled_) {
+      const D3D12_DRAW_ARGUMENTS arguments = {VertexCountPerInstance, InstanceCount, StartVertexLocation,
+                                              StartInstanceLocation};
+      predicated_offset = PreparePredicatedArguments(&arguments, sizeof(arguments));
+      if (predicated_offset == UINT64_MAX) {
+        RecordError(E_OUTOFMEMORY);
+        return;
+      }
+    }
     DrawCallStatus status = PreDraw();
     if (status == DrawCallStatus::Invalid)
       return;
 
-    auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
-    cmd_draw.type = WMTRenderCommandDraw;
-    cmd_draw.primitive_type = primitive_type;
-    cmd_draw.base_instance = StartInstanceLocation;
-    cmd_draw.instance_count = InstanceCount;
-    cmd_draw.vertex_start = StartVertexLocation;
-    cmd_draw.vertex_count = VertexCountPerInstance;
+    if (predication_enabled_) {
+      auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indirect>();
+      cmd_draw.type = WMTRenderCommandDrawIndirect;
+      cmd_draw.primitive_type = primitive_type;
+      cmd_draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+      cmd_draw.indirect_args_offset = predicated_offset;
+    } else {
+      auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
+      cmd_draw.type = WMTRenderCommandDraw;
+      cmd_draw.primitive_type = primitive_type;
+      cmd_draw.base_instance = StartInstanceLocation;
+      cmd_draw.instance_count = InstanceCount;
+      cmd_draw.vertex_start = StartVertexLocation;
+      cmd_draw.vertex_count = VertexCountPerInstance;
+    }
     owned_graphics::Trace("draw", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                           ",\"encoder\":", allocator_->encoder_current->id,
                           ",\"vertices\":", VertexCountPerInstance, ",\"instances\":", InstanceCount);
@@ -949,19 +1188,40 @@ public:
     uint32_t cp_count;
     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
       return;
+    uint64_t predicated_offset = 0;
+    if (predication_enabled_) {
+      const D3D12_DRAW_INDEXED_ARGUMENTS arguments = {IndexCountPerInstance, InstanceCount, StartVertexLocation,
+                                                      BaseVertexLocation, StartInstanceLocation};
+      predicated_offset = PreparePredicatedArguments(&arguments, sizeof(arguments));
+      if (predicated_offset == UINT64_MAX) {
+        RecordError(E_OUTOFMEMORY);
+        return;
+      }
+    }
     DrawCallStatus status = PreDraw();
     if (status == DrawCallStatus::Invalid)
       return;
-    auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indexed>();
-    cmd_draw.type = WMTRenderCommandDrawIndexed;
-    cmd_draw.primitive_type = primitive_type;
-    cmd_draw.index_type = index_type;
-    cmd_draw.index_count = IndexCountPerInstance;
-    cmd_draw.index_buffer = index_buffer;
-    cmd_draw.index_buffer_offset = index_offset + StartVertexLocation * (index_type == WMTIndexTypeUInt32 ? 4 : 2);
-    cmd_draw.instance_count = InstanceCount;
-    cmd_draw.base_vertex = BaseVertexLocation;
-    cmd_draw.base_instance = StartInstanceLocation;
+    if (predication_enabled_) {
+      auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
+      cmd_draw.type = WMTRenderCommandDrawIndexedIndirect;
+      cmd_draw.primitive_type = primitive_type;
+      cmd_draw.index_type = index_type;
+      cmd_draw.index_buffer = index_buffer;
+      cmd_draw.index_buffer_offset = index_offset;
+      cmd_draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+      cmd_draw.indirect_args_offset = predicated_offset;
+    } else {
+      auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indexed>();
+      cmd_draw.type = WMTRenderCommandDrawIndexed;
+      cmd_draw.primitive_type = primitive_type;
+      cmd_draw.index_type = index_type;
+      cmd_draw.index_count = IndexCountPerInstance;
+      cmd_draw.index_buffer = index_buffer;
+      cmd_draw.index_buffer_offset = index_offset + StartVertexLocation * (index_type == WMTIndexTypeUInt32 ? 4 : 2);
+      cmd_draw.instance_count = InstanceCount;
+      cmd_draw.base_vertex = BaseVertexLocation;
+      cmd_draw.base_instance = StartInstanceLocation;
+    }
     owned_graphics::Trace("draw_indexed", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                           ",\"encoder\":", allocator_->encoder_current->id,
                           ",\"indices\":", IndexCountPerInstance, ",\"instances\":", InstanceCount);
@@ -1054,12 +1314,28 @@ public:
   Dispatch(UINT X, UINT Y, UINT Z) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::Dispatch, X, Y, Z))
       return;
+    uint64_t predicated_offset = 0;
+    if (predication_enabled_) {
+      const D3D12_DISPATCH_ARGUMENTS arguments = {X, Y, Z};
+      predicated_offset = PreparePredicatedArguments(&arguments, sizeof(arguments));
+      if (predicated_offset == UINT64_MAX) {
+        RecordError(E_OUTOFMEMORY);
+        return;
+      }
+    }
     if (!PreDispatch())
       return;
 
-    auto &cmd_dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
-    cmd_dispatch.type = WMTComputeCommandDispatch;
-    cmd_dispatch.size = {X, Y, Z};
+    if (predication_enabled_) {
+      auto &cmd_dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+      cmd_dispatch.type = WMTComputeCommandDispatchIndirect;
+      cmd_dispatch.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+      cmd_dispatch.indirect_args_offset = predicated_offset;
+    } else {
+      auto &cmd_dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
+      cmd_dispatch.type = WMTComputeCommandDispatch;
+      cmd_dispatch.size = {X, Y, Z};
+    }
     owned_graphics::Trace("dispatch", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                           ",\"encoder\":", allocator_->encoder_current->id,
                           ",\"x\":", X, ",\"y\":", Y, ",\"z\":", Z);
@@ -1095,6 +1371,26 @@ public:
     auto *src_resource = static_cast<MTLD3D12Resource *>(pSrcBuffer);
     if (!dst_resource->buffer || !src_resource->buffer)
       return;
+    if (pDstBuffer == pSrcBuffer && DstOffset < SrcOffset + ByteCount && SrcOffset < DstOffset + ByteCount) {
+      RecordError();
+      return;
+    }
+    if (predication_enabled_) {
+      if (!EnsurePredicationPipelines()) {
+        RecordError(E_FAIL);
+        return;
+      }
+      UINT64 copied = 0;
+      while (copied < ByteCount) {
+        const UINT chunk = UINT(std::min<UINT64>(ByteCount - copied, UINT32_MAX));
+        EncodePredicatedBufferCopy(
+            src_resource->buffer->current()->buffer(), SrcOffset + copied,
+            dst_resource->buffer->current()->buffer(), DstOffset + copied, chunk
+        );
+        copied += chunk;
+      }
+      return;
+    }
     if (!PreBlit())
       return;
 
@@ -1229,6 +1525,262 @@ public:
         return;
     }
 
+    const DXGI_FORMAT src_copy_format = pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+        ? src_desc.Format
+        : pSrc->PlacedFootprint.Footprint.Format;
+    MTL_DXGI_FORMAT_DESC native_copy_format{};
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_copy_format, native_copy_format))) {
+      RecordError();
+      return;
+    }
+    WMT::Texture source_native_texture{};
+    WMT::Texture destination_native_texture{};
+    uint32_t source_native_level = src_level, source_native_slice = src_slice;
+    uint32_t destination_native_level = dst_level, destination_native_slice = dst_slice;
+    if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+      auto &texture = static_cast<MTLD3D12Resource *>(pSrc->pResource)->texture;
+      source_native_texture = texture->current()->texture();
+      if (texture->pixelFormat() != native_copy_format.PixelFormat) {
+        TextureViewDescriptor view{};
+        view.format = native_copy_format.PixelFormat;
+        view.type = texture->textureType();
+        view.firstMiplevel = src_level;
+        view.miplevelCount = 1;
+        view.firstArraySlice = src_slice;
+        view.arraySize = 1;
+        source_native_texture = texture->view(texture->createView(view)).texture;
+        source_native_level = 0;
+        source_native_slice = 0;
+      }
+    }
+    if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+      auto &texture = static_cast<MTLD3D12Resource *>(pDst->pResource)->texture;
+      destination_native_texture = texture->current()->texture();
+      if (texture->pixelFormat() != native_copy_format.PixelFormat) {
+        TextureViewDescriptor view{};
+        view.format = native_copy_format.PixelFormat;
+        view.type = texture->textureType();
+        view.firstMiplevel = dst_level;
+        view.miplevelCount = 1;
+        view.firstArraySlice = dst_slice;
+        view.arraySize = 1;
+        destination_native_texture = texture->view(texture->createView(view)).texture;
+        destination_native_level = 0;
+        destination_native_slice = 0;
+      }
+    }
+    if ((pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && !source_native_texture) ||
+        (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && !destination_native_texture)) {
+      RecordError(E_OUTOFMEMORY);
+      return;
+    }
+
+    if (predication_enabled_) {
+      if (!EnsurePredicationPipelines()) {
+        RecordError(E_FAIL);
+        return;
+      }
+      if ((pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src_desc.SampleDesc.Count > 1) ||
+          (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && dst_desc.SampleDesc.Count > 1)) {
+        if (pSrc->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ||
+            pDst->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+          RecordError(E_INVALIDARG);
+          return;
+        }
+        auto *source_resource = static_cast<MTLD3D12Resource *>(pSrc->pResource);
+        auto *destination_resource = static_cast<MTLD3D12Resource *>(pDst->pResource);
+        if (!source_resource->texture || !destination_resource->texture) {
+          RecordError(E_INVALIDARG);
+          return;
+        }
+        allocator_->InvalidateCurrentPass();
+        auto *copy = allocator_->AllocatePass<PredicatedTextureCopyEncoderData>();
+        copy->type = EncoderType::PredicatedTextureCopy;
+        copy->source = source_native_texture;
+        copy->destination = destination_native_texture;
+        copy->predicate = allocator_->gpu_heap_buffer_;
+        copy->predicate_value = static_cast<const uint64_t *>(allocator_->gpu_heap_) +
+            predication_snapshot_offset_ / sizeof(uint64_t);
+        copy->predicate_offset = predication_snapshot_offset_;
+        copy->source_origin = {src_box.left, src_box.top, src_box.front};
+        copy->destination_origin = {DstX, DstY, DstZ};
+        copy->size = {src_box.right - src_box.left, src_box.bottom - src_box.top,
+                      src_box.back - src_box.front};
+        copy->source_level = source_native_level;
+        copy->source_slice = source_native_slice;
+        copy->destination_level = destination_native_level;
+        copy->destination_slice = destination_native_slice;
+        copy->predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
+        allocator_->InvalidateCurrentPass();
+        return;
+      }
+
+      MTL_DXGI_FORMAT_DESC copy_format{};
+      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_copy_format, copy_format))) {
+        RecordError();
+        return;
+      }
+      const UINT block_width = src_block_width;
+      const UINT bytes_per_block = (src_planar == 1 || dst_planar == 1) ? 1u : copy_format.BytesPerTexel;
+      const UINT64 width = src_box.right - src_box.left;
+      const UINT64 rows = (UINT64(src_box.bottom - src_box.top) + block_width - 1) / block_width;
+      const UINT64 depth = src_box.back - src_box.front;
+      UINT64 row_bytes = 0, staging_pitch = 0, staging_slice = 0, staging_size = 0;
+      if (!resource_contract::CheckedMul((width + block_width - 1) / block_width, bytes_per_block, row_bytes) ||
+          !resource_contract::CheckedAlign(row_bytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, staging_pitch) ||
+          !resource_contract::CheckedMul(staging_pitch, rows, staging_slice) ||
+          !resource_contract::CheckedMul(staging_slice, depth, staging_size) || staging_size > SIZE_MAX) {
+        RecordError();
+        return;
+      }
+      auto conditional_copy = [&](WMT::Buffer source, UINT64 source_offset, WMT::Buffer destination,
+                                  UINT64 destination_offset, UINT64 bytes) {
+        while (bytes) {
+          const UINT chunk = UINT(std::min<UINT64>(bytes, UINT32_MAX));
+          EncodePredicatedBufferCopy(source, source_offset, destination, destination_offset, chunk);
+          source_offset += chunk;
+          destination_offset += chunk;
+          bytes -= chunk;
+        }
+      };
+      const WMTBlitOption src_option = src_planar ? WMTBlitOptionStencilFromDepthStencil :
+          (copy_format.PlanarCount > 1 ? WMTBlitOptionDepthFromDepthStencil : WMTBlitOptionNone);
+      const WMTBlitOption dst_option = dst_planar ? WMTBlitOptionStencilFromDepthStencil :
+          (copy_format.PlanarCount > 1 ? WMTBlitOptionDepthFromDepthStencil : WMTBlitOptionNone);
+
+      if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+        auto src_texture = static_cast<MTLD3D12Resource *>(pSrc->pResource)->texture;
+        auto [source_staging, source_staging_offset] = allocator_->AllocateTempBuffer(staging_size, 256);
+        if (!PreBlit()) {
+          RecordError();
+          return;
+        }
+        auto &stage_source = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
+        stage_source.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
+        stage_source.src = source_native_texture;
+        stage_source.level = source_native_level;
+        stage_source.slice = source_native_slice;
+        stage_source.origin = {src_box.left, src_box.top, src_box.front};
+        stage_source.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+        stage_source.dst = source_staging;
+        stage_source.offset = source_staging_offset;
+        stage_source.bytes_per_row = staging_pitch;
+        stage_source.bytes_per_image = src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? staging_slice : 0;
+        stage_source.options = src_option;
+        allocator_->InvalidateCurrentPass();
+
+        if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+          auto dst_texture = static_cast<MTLD3D12Resource *>(pDst->pResource)->texture;
+          auto [destination_staging, destination_staging_offset] = allocator_->AllocateTempBuffer(staging_size, 256);
+          if (!PreBlit()) {
+            RecordError();
+            return;
+          }
+          auto &stage_destination = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
+          stage_destination.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
+          stage_destination.src = destination_native_texture;
+          stage_destination.level = destination_native_level;
+          stage_destination.slice = destination_native_slice;
+          stage_destination.origin = {DstX, DstY, DstZ};
+          stage_destination.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+          stage_destination.dst = destination_staging;
+          stage_destination.offset = destination_staging_offset;
+          stage_destination.bytes_per_row = staging_pitch;
+          stage_destination.bytes_per_image = dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? staging_slice : 0;
+          stage_destination.options = dst_option;
+          allocator_->InvalidateCurrentPass();
+          conditional_copy(source_staging, source_staging_offset, destination_staging, destination_staging_offset, staging_size);
+          if (!PreBlit()) {
+            RecordError();
+            return;
+          }
+          auto &write_destination = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
+          write_destination.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
+          write_destination.src = destination_staging;
+          write_destination.src_offset = destination_staging_offset;
+          write_destination.bytes_per_row = staging_pitch;
+          write_destination.bytes_per_image = dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? staging_slice : 0;
+          write_destination.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+          write_destination.dst = destination_native_texture;
+          write_destination.level = destination_native_level;
+          write_destination.slice = destination_native_slice;
+          write_destination.origin = {DstX, DstY, DstZ};
+          write_destination.options = dst_option;
+        } else {
+          auto dst_buffer = static_cast<MTLD3D12Resource *>(pDst->pResource)->buffer->current()->buffer();
+          for (UINT64 z = 0; z < depth; ++z)
+            for (UINT64 row = 0; row < rows; ++row) {
+              const UINT64 source_offset = source_staging_offset + z * staging_slice + row * staging_pitch;
+              const UINT64 destination_offset = pDst->PlacedFootprint.Offset + (UINT64(DstZ) + z) * dst_footprint_info.slice_pitch +
+                  (UINT64(DstY) / block_width + row) * pDst->PlacedFootprint.Footprint.RowPitch +
+                  (UINT64(DstX) / block_width) * dst_footprint_info.bytes_per_block;
+              conditional_copy(source_staging, source_offset, dst_buffer, destination_offset, row_bytes);
+            }
+        }
+      } else {
+        auto src_buffer = static_cast<MTLD3D12Resource *>(pSrc->pResource)->buffer->current()->buffer();
+        if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+          auto dst_texture = static_cast<MTLD3D12Resource *>(pDst->pResource)->texture;
+          auto [destination_staging, destination_staging_offset] = allocator_->AllocateTempBuffer(staging_size, 256);
+          if (!PreBlit()) {
+            RecordError();
+            return;
+          }
+          auto &stage_destination = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
+          stage_destination.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
+          stage_destination.src = destination_native_texture;
+          stage_destination.level = destination_native_level;
+          stage_destination.slice = destination_native_slice;
+          stage_destination.origin = {DstX, DstY, DstZ};
+          stage_destination.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+          stage_destination.dst = destination_staging;
+          stage_destination.offset = destination_staging_offset;
+          stage_destination.bytes_per_row = staging_pitch;
+          stage_destination.bytes_per_image = dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? staging_slice : 0;
+          stage_destination.options = dst_option;
+          allocator_->InvalidateCurrentPass();
+          for (UINT64 z = 0; z < depth; ++z)
+            for (UINT64 row = 0; row < rows; ++row) {
+              const UINT64 source_offset = pSrc->PlacedFootprint.Offset + (UINT64(src_box.front) + z) * src_footprint_info.slice_pitch +
+                  (UINT64(src_box.top) / block_width + row) * pSrc->PlacedFootprint.Footprint.RowPitch +
+                  (UINT64(src_box.left) / block_width) * src_footprint_info.bytes_per_block;
+              conditional_copy(src_buffer, source_offset, destination_staging,
+                               destination_staging_offset + z * staging_slice + row * staging_pitch, row_bytes);
+            }
+          if (!PreBlit()) {
+            RecordError();
+            return;
+          }
+          auto &write_destination = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
+          write_destination.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
+          write_destination.src = destination_staging;
+          write_destination.src_offset = destination_staging_offset;
+          write_destination.bytes_per_row = staging_pitch;
+          write_destination.bytes_per_image = dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? staging_slice : 0;
+          write_destination.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+          write_destination.dst = destination_native_texture;
+          write_destination.level = destination_native_level;
+          write_destination.slice = destination_native_slice;
+          write_destination.origin = {DstX, DstY, DstZ};
+          write_destination.options = dst_option;
+        } else {
+          auto dst_buffer = static_cast<MTLD3D12Resource *>(pDst->pResource)->buffer->current()->buffer();
+          for (UINT64 z = 0; z < depth; ++z)
+            for (UINT64 row = 0; row < rows; ++row) {
+              const UINT64 source_offset = pSrc->PlacedFootprint.Offset + (UINT64(src_box.front) + z) * src_footprint_info.slice_pitch +
+                  (UINT64(src_box.top) / block_width + row) * pSrc->PlacedFootprint.Footprint.RowPitch +
+                  (UINT64(src_box.left) / block_width) * src_footprint_info.bytes_per_block;
+              const UINT64 destination_offset = pDst->PlacedFootprint.Offset + (UINT64(DstZ) + z) * dst_footprint_info.slice_pitch +
+                  (UINT64(DstY) / block_width + row) * pDst->PlacedFootprint.Footprint.RowPitch +
+                  (UINT64(DstX) / block_width) * dst_footprint_info.bytes_per_block;
+              conditional_copy(src_buffer, source_offset, dst_buffer, destination_offset, row_bytes);
+            }
+        }
+      }
+      allocator_->InvalidateCurrentPass();
+      return;
+    }
+
     if (!PreBlit())
       return;
 
@@ -1266,9 +1818,9 @@ public:
         cmd_cp.bytes_per_row = pSrc->PlacedFootprint.Footprint.RowPitch;
         cmd_cp.bytes_per_image = src_depth_pitch;
         cmd_cp.size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
-        cmd_cp.dst = dst->current()->texture();
-        cmd_cp.level = dst_level;
-        cmd_cp.slice = dst_slice;
+        cmd_cp.dst = destination_native_texture;
+        cmd_cp.level = destination_native_level;
+        cmd_cp.slice = destination_native_slice;
         cmd_cp.options = (dst_planar_count > 1)
                              ? (dst_planar ? WMTBlitOptionStencilFromDepthStencil : WMTBlitOptionDepthFromDepthStencil)
                              : WMTBlitOptionNone;
@@ -1304,9 +1856,9 @@ public:
 
           auto &cmd_to_tmp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
           cmd_to_tmp.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
-          cmd_to_tmp.src = src->current()->texture();
-          cmd_to_tmp.level = src_level;
-          cmd_to_tmp.slice = src_slice;
+          cmd_to_tmp.src = source_native_texture;
+          cmd_to_tmp.level = source_native_level;
+          cmd_to_tmp.slice = source_native_slice;
           cmd_to_tmp.origin = {src_box.left, src_box.top, src_box.front};
           cmd_to_tmp.size = {width, height, src_box.back - src_box.front};
           cmd_to_tmp.dst = temp_buffer;
@@ -1323,9 +1875,9 @@ public:
           cmd_to_tex.src_offset = temp_buffer_offset;
           cmd_to_tex.bytes_per_image = 0; // DSV cannot be 3D
           cmd_to_tex.bytes_per_row = bytes_per_row;
-          cmd_to_tex.dst = dst->current()->texture();
-          cmd_to_tex.level = dst_level;
-          cmd_to_tex.slice = dst_slice;
+          cmd_to_tex.dst = destination_native_texture;
+          cmd_to_tex.level = destination_native_level;
+          cmd_to_tex.slice = destination_native_slice;
           cmd_to_tex.origin = {DstX, DstY, DstZ};
           cmd_to_tex.size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
           cmd_to_tex.options = (dst_planar_count > 1) ? (dst_planar ? WMTBlitOptionStencilFromDepthStencil
@@ -1336,14 +1888,14 @@ public:
 
         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
         cmd_cp.type = WMTBlitCommandCopyFromTextureToTexture;
-        cmd_cp.src = src->current()->texture();
-        cmd_cp.src_level = src_level;
-        cmd_cp.src_slice = src_slice;
+        cmd_cp.src = source_native_texture;
+        cmd_cp.src_level = source_native_level;
+        cmd_cp.src_slice = source_native_slice;
         cmd_cp.src_origin = {src_box.left, src_box.top, src_box.front};
         cmd_cp.src_size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
-        cmd_cp.dst = dst->current()->texture();
-        cmd_cp.dst_level = dst_level;
-        cmd_cp.dst_slice = dst_slice;
+        cmd_cp.dst = destination_native_texture;
+        cmd_cp.dst_level = destination_native_level;
+        cmd_cp.dst_slice = destination_native_slice;
         cmd_cp.dst_origin = {DstX, DstY, DstZ};
       }
     } else if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
@@ -1374,9 +1926,9 @@ public:
 
         auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
         cmd_cp.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
-        cmd_cp.src = src->current()->texture();
-        cmd_cp.level = src_level;
-        cmd_cp.slice = src_slice;
+        cmd_cp.src = source_native_texture;
+        cmd_cp.level = source_native_level;
+        cmd_cp.slice = source_native_slice;
         cmd_cp.origin = {src_box.left, src_box.top, src_box.front};
         cmd_cp.size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
         cmd_cp.dst = dst->current()->buffer();
@@ -1463,9 +2015,27 @@ public:
         DstDesc.SampleDesc.Count != SrcDesc.SampleDesc.Count || DstDesc.SampleDesc.Quality != SrcDesc.SampleDesc.Quality)
       return;
 
-    // TODO: handle reinterpret copy
-    if (pDst->texture->pixelFormat() != pSrc->texture->pixelFormat()) {
-      WARN("CopyResource: TODO: reinterpret copy");
+    if (!resource_contract::AreCopyCompatibleFormats(DstDesc.Format, SrcDesc.Format)) {
+      RecordError();
+      return;
+    }
+    if (predication_enabled_) {
+      MTL_DXGI_FORMAT_DESC copy_format{};
+      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), SrcDesc.Format, copy_format))) {
+        RecordError();
+        return;
+      }
+      const UINT arrays = SrcDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : SrcDesc.DepthOrArraySize;
+      const UINT subresources = UINT(SrcDesc.MipLevels) * arrays * copy_format.PlanarCount;
+      for (UINT subresource = 0; subresource < subresources; ++subresource) {
+        D3D12_TEXTURE_COPY_LOCATION source{pSrcResource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_TEXTURE_COPY_LOCATION destination{pDstResource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        source.SubresourceIndex = subresource;
+        destination.SubresourceIndex = subresource;
+        CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        if (FAILED(recording_error_))
+          return;
+      }
       return;
     }
 
@@ -1492,54 +2062,10 @@ public:
       ID3D12Resource *pDstResource, UINT DstSubresource, ID3D12Resource *pSrcResource, UINT SrcSubresource,
       DXGI_FORMAT Format
   ) {
-    if (RejectBundleOperation())
-      return;
-    auto *pDst = static_cast<MTLD3D12Resource *>(pDstResource);
-    auto *pSrc = static_cast<MTLD3D12Resource *>(pSrcResource);
-
-    if (!pDst->texture || !pSrc->texture)
-      return;
-
-    auto DstMips = pDst->texture->miplevelCount();
-    auto DstLevel = DstSubresource % DstMips;
-    auto DstSlice = DstSubresource / DstMips;
-
-    allocator_->InvalidateCurrentPass();
-    auto resolve = allocator_->AllocatePass<ResolveEncoderData>();
-    resolve->type = EncoderType::Resolve;
-
-    MTL_DXGI_FORMAT_DESC format_desc;
-    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format_desc))) {
-      ERR("ResolveSubresource: invalid format ", Format);
-      return;
-    }
-    {
-      auto format = format_desc.PixelFormat;
-      TextureViewDescriptor src_desc;
-      auto &src = pSrc->texture;
-      auto &dst = pDst->texture;
-      src_desc.format = format;
-      src_desc.type = src->textureType();
-      src_desc.arraySize = 1;
-      src_desc.firstArraySlice = SrcSubresource; // src must be a MS(Array) texture which has exactly 1 mipmap level
-      src_desc.miplevelCount = 1;
-      src_desc.firstMiplevel = 0;
-
-      TextureViewDescriptor dst_desc;
-      dst_desc.format = format;
-      dst_desc.type = WMTTextureType2D;
-      dst_desc.arraySize = 1;
-      dst_desc.firstArraySlice = DstSlice;
-      dst_desc.miplevelCount = 1;
-      dst_desc.firstMiplevel = DstLevel;
-
-      auto src_view = src->createView(src_desc);
-      auto dst_view = dst->createView(dst_desc);
-
-      resolve->src = src->view(src_view);
-      resolve->dst = dst->view(dst_view);
-    }
-    allocator_->InvalidateCurrentPass();
+    ResolveSubresourceRegion(
+        pDstResource, DstSubresource, 0, 0, pSrcResource, SrcSubresource, nullptr, Format,
+        D3D12_RESOLVE_MODE_AVERAGE
+    );
   };
 
   void STDMETHODCALLTYPE
@@ -1607,6 +2133,10 @@ public:
 
   void STDMETHODCALLTYPE
   SetPipelineState(ID3D12PipelineState *pPSO) {
+    if (!IsRecording() || (pPSO && !QueryObjectOwnedByThisDevice(pPSO))) {
+      RecordError();
+      return;
+    }
     if (!ObserveBundlePipeline(pPSO))
       return;
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetPipelineState, pPSO))
@@ -1644,15 +2174,74 @@ public:
       return;
     if (!barriers) {
       ERR("ResourceBarrier: nonzero count with null barriers");
+      RecordError(E_INVALIDARG);
       return;
     }
+    constexpr D3D12_RESOURCE_STATES valid_states = D3D12_RESOURCE_STATE_COMMON |
+        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER |
+        D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_DEPTH_READ |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_STREAM_OUT | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT |
+        D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE |
+        D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_RESOLVE_SOURCE |
+        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE |
+        D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE | D3D12_RESOURCE_STATE_PREDICATION;
+    auto valid_state = [valid_states](D3D12_RESOURCE_STATES state) {
+      if (state & ~valid_states)
+        return false;
+      constexpr D3D12_RESOURCE_STATES write_states = D3D12_RESOURCE_STATE_RENDER_TARGET |
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+          D3D12_RESOURCE_STATE_STREAM_OUT | D3D12_RESOURCE_STATE_COPY_DEST |
+          D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+      const UINT writes = std::popcount(UINT(state & write_states));
+      return writes <= 1 && (!writes || !(state & ~write_states));
+    };
+    for (UINT i = 0; i < Count; ++i) {
+      const auto &barrier = barriers[i];
+      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+        if (!barrier.Transition.pResource ||
+            (barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE &&
+             barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY &&
+             barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_END_ONLY) ||
+            !valid_state(barrier.Transition.StateBefore) || !valid_state(barrier.Transition.StateAfter)) {
+          RecordError();
+          return;
+        }
+        const auto desc = barrier.Transition.pResource->GetDesc();
+        if (barrier.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+          MTL_DXGI_FORMAT_DESC format{};
+          const UINT planes = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 :
+              SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc.Format, format)) ? format.PlanarCount : 0;
+          const UINT arrays = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
+          const UINT64 count = UINT64(std::max<UINT16>(desc.MipLevels, 1)) * arrays * planes;
+          if (!planes || barrier.Transition.Subresource >= count) {
+            RecordError();
+            return;
+          }
+        }
+      } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+        if (barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE) {
+          RecordError();
+          return;
+        }
+      } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+        if (barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE) {
+          RecordError();
+          return;
+        }
+      } else {
+        RecordError();
+        return;
+      }
+    }
+
     // Resources use untracked Metal storage. Consecutive commands in the same
     // encoder therefore cannot ignore a UAV or aliasing dependency. A pass
     // boundary makes the queue emit updateFence/endEncoding followed by the
     // next encoder's waitForFence. This deliberately over-synchronizes valid
     // legacy transition/UAV/aliasing barriers without a CPU or queue-idle wait.
     // Split barriers may complete early; END_ONLY also establishes a boundary.
-    // This is not a resource-state validator or enhanced-barrier support.
     for (UINT i = 0; owned_graphics::TraceEnabled() && i < Count; ++i) {
       const auto &barrier = barriers[i];
       if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
@@ -1761,13 +2350,24 @@ public:
 
   void STDMETHODCALLTYPE
   SetComputeRootSignature(ID3D12RootSignature *pRootSignature) {
+    if (!IsRecording() || (pRootSignature && !QueryObjectOwnedByThisDevice(pRootSignature))) {
+      RecordError();
+      return;
+    }
+    if (pRootSignature) {
+      const auto *root = static_cast<MTLD3D12RootSignature *>(pRootSignature);
+      if (root->IsLocal || root->UploadQwords > 64) {
+        RecordError();
+        return;
+      }
+    }
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootSignature, pRootSignature))
       return;
     if (rootsig_compute_.ptr() == pRootSignature)
       return;
     if (pRootSignature) {
       rootsig_compute_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-      assert(rootsig_compute_->UploadQwords < std::size(rootarg_compute_staging_));
+      assert(rootsig_compute_->UploadQwords <= std::size(rootarg_compute_staging_));
     } else {
       rootsig_compute_ = nullptr;
     }
@@ -1776,13 +2376,24 @@ public:
 
   void STDMETHODCALLTYPE
   SetGraphicsRootSignature(ID3D12RootSignature *pRootSignature) {
+    if (!IsRecording() || (pRootSignature && !QueryObjectOwnedByThisDevice(pRootSignature))) {
+      RecordError();
+      return;
+    }
+    if (pRootSignature) {
+      const auto *root = static_cast<MTLD3D12RootSignature *>(pRootSignature);
+      if (root->IsLocal || root->UploadQwords > 64) {
+        RecordError();
+        return;
+      }
+    }
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootSignature, pRootSignature))
       return;
     if (rootsig_graphics_.ptr() == pRootSignature)
       return;
     if (pRootSignature) {
       rootsig_graphics_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-      assert(rootsig_graphics_->UploadQwords < std::size(rootarg_graphics_staging_));
+      assert(rootsig_graphics_->UploadQwords <= std::size(rootarg_graphics_staging_));
     } else {
       rootsig_graphics_ = nullptr;
     }
@@ -1796,9 +2407,7 @@ public:
     }
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootDescriptorTable, Index, BaseDescriptor))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index > rootsig_compute_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_compute_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE))
       return;
     rootarg_compute_staging_[rootsig_compute_->SlotQwordOffsets[Index]] = BaseDescriptor.ptr;
     dirty_state_.set(DirtyState::ComputeRootArguments);
@@ -1812,9 +2421,7 @@ public:
     }
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootDescriptorTable, Index, BaseDescriptor))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index > rootsig_graphics_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_graphics_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE))
       return;
     rootarg_graphics_staging_[rootsig_graphics_->SlotQwordOffsets[Index]] = BaseDescriptor.ptr;
     dirty_state_.set(DirtyState::GraphicsRootArguments);
@@ -1823,9 +2430,7 @@ public:
   void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT Index, UINT Data, UINT DstOffset) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRoot32BitConstant, Index, Data, DstOffset))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index > rootsig_compute_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_compute_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, 1, DstOffset))
       return;
     auto dst = reinterpret_cast<uint32_t *>(rootarg_compute_staging_ + rootsig_compute_->SlotQwordOffsets[Index]);
     dst[DstOffset] = Data;
@@ -1836,9 +2441,7 @@ public:
   SetGraphicsRoot32BitConstant(UINT Index, UINT Data, UINT DstOffset) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRoot32BitConstant, Index, Data, DstOffset))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index > rootsig_graphics_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_graphics_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, 1, DstOffset))
       return;
     auto dst = reinterpret_cast<uint32_t *>(rootarg_graphics_staging_ + rootsig_graphics_->SlotQwordOffsets[Index]);
     dst[DstOffset] = Data;
@@ -1849,9 +2452,12 @@ public:
   SetComputeRoot32BitConstants(UINT Index, UINT ConstantCount, const void *pData, UINT DstOffset) {
     if (RecordBundleConstants(false, Index, ConstantCount, pData, DstOffset))
       return;
-    if (!rootsig_compute_)
+    if (ConstantCount && !pData) {
+      RecordError();
       return;
-    if (Index > rootsig_compute_->ParameterSlots)
+    }
+    if (!ValidateRootParameter(rootsig_compute_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                               ConstantCount, DstOffset))
       return;
     auto src = reinterpret_cast<const uint32_t *>(pData);
     auto dst = reinterpret_cast<uint32_t *>(rootarg_compute_staging_ + rootsig_compute_->SlotQwordOffsets[Index]);
@@ -1865,9 +2471,12 @@ public:
   SetGraphicsRoot32BitConstants(UINT Index, UINT ConstantCount, const void *pData, UINT DstOffset) {
     if (RecordBundleConstants(true, Index, ConstantCount, pData, DstOffset))
       return;
-    if (!rootsig_graphics_)
+    if (ConstantCount && !pData) {
+      RecordError();
       return;
-    if (Index > rootsig_graphics_->ParameterSlots)
+    }
+    if (!ValidateRootParameter(rootsig_graphics_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                               ConstantCount, DstOffset))
       return;
     auto src = reinterpret_cast<const uint32_t *>(pData);
     auto dst = reinterpret_cast<uint32_t *>(rootarg_graphics_staging_ + rootsig_graphics_->SlotQwordOffsets[Index]);
@@ -1880,9 +2489,7 @@ public:
   void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootConstantBufferView, Index, VA))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index > rootsig_compute_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_compute_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_CBV))
       return;
     rootarg_compute_staging_[rootsig_compute_->SlotQwordOffsets[Index]] = VA;
     dirty_state_.set(DirtyState::ComputeRootArguments);
@@ -1892,9 +2499,7 @@ public:
   SetGraphicsRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootConstantBufferView, Index, VA))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index > rootsig_graphics_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_graphics_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_CBV))
       return;
     rootarg_graphics_staging_[rootsig_graphics_->SlotQwordOffsets[Index]] = VA;
     dirty_state_.set(DirtyState::GraphicsRootArguments);
@@ -1903,9 +2508,7 @@ public:
   void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootShaderResourceView, Index, VA))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index > rootsig_compute_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_compute_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_SRV))
       return;
     rootarg_compute_staging_[rootsig_compute_->SlotQwordOffsets[Index]] = VA;
     dirty_state_.set(DirtyState::ComputeRootArguments);
@@ -1915,9 +2518,7 @@ public:
   SetGraphicsRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootShaderResourceView, Index, VA))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index > rootsig_graphics_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_graphics_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_SRV))
       return;
     rootarg_graphics_staging_[rootsig_graphics_->SlotQwordOffsets[Index]] = VA;
     dirty_state_.set(DirtyState::GraphicsRootArguments);
@@ -1926,9 +2527,7 @@ public:
   void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetComputeRootUnorderedAccessView, Index, VA))
       return;
-    if (!rootsig_compute_)
-      return;
-    if (Index > rootsig_compute_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_compute_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_UAV))
       return;
     rootarg_compute_staging_[rootsig_compute_->SlotQwordOffsets[Index]] = VA;
     dirty_state_.set(DirtyState::ComputeRootArguments);
@@ -1938,9 +2537,7 @@ public:
   SetGraphicsRootUnorderedAccessView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetGraphicsRootUnorderedAccessView, Index, VA))
       return;
-    if (!rootsig_graphics_)
-      return;
-    if (Index > rootsig_graphics_->ParameterSlots)
+    if (!ValidateRootParameter(rootsig_graphics_.ptr(), Index, D3D12_ROOT_PARAMETER_TYPE_UAV))
       return;
     rootarg_graphics_staging_[rootsig_graphics_->SlotQwordOffsets[Index]] = VA;
     dirty_state_.set(DirtyState::GraphicsRootArguments);
@@ -2025,23 +2622,43 @@ public:
     if (!AttachmentDesc.Texture)
       return;
     auto CheckedFlags = Flags & DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View));
-    if (!CheckedFlags)
+    if (!CheckedFlags || (RectCount && !Rects))
       return;
-    if (Rects) {
+
+    if (predication_enabled_ || RectCount) {
+      const D3D12_RECT full_rect = {0, 0, LONG(AttachmentDesc.Width), LONG(AttachmentDesc.Height)};
+      const D3D12_RECT *clear_rects = RectCount ? Rects : &full_rect;
+      const UINT clear_rect_count = RectCount ? RectCount : 1;
+
+      small_vector<uint64_t, 4> indirect_offsets;
+      if (predication_enabled_) {
+        indirect_offsets.reserve(clear_rect_count);
+        const uint32_t draw_arguments[] = {
+            3, std::max(AttachmentDesc.RenderTargetArrayLength, 1u), 0, 0
+        };
+        for (UINT i = 0; i < clear_rect_count; i++)
+          indirect_offsets.push_back(PreparePredicatedArguments(draw_arguments, sizeof(draw_arguments)));
+      }
+
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, 0, CheckedFlags);
-      for (unsigned i = 0; i < RectCount; i++) {
-        auto rect = Rects[i];
-        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
-        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
-        int32_t rect_width = rect.right - rect_offset_x;
-        int32_t rect_height = rect.bottom - rect_offset_y;
+      for (UINT i = 0; i < clear_rect_count; i++) {
+        const auto &rect = clear_rects[i];
+        const uint32_t rect_offset_x = std::max(rect.left, LONG(0));
+        const uint32_t rect_offset_y = std::max(rect.top, LONG(0));
+        const int32_t rect_width = rect.right - rect_offset_x;
+        const int32_t rect_height = rect.bottom - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
-        allocator_->clear_rtv_.clear(rect_offset_x, rect_offset_y, rect_width, rect_height, Depth, Stencil);
+        allocator_->clear_rtv_.clear(
+            rect_offset_x, rect_offset_y, rect_width, rect_height, Depth, Stencil,
+            predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
+            predication_enabled_ ? indirect_offsets[i] : 0
+        );
       }
       allocator_->clear_rtv_.end();
       return;
     }
+
     allocator_->InvalidateCurrentPass();
     auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
     encoder_info->type = EncoderType::Clear;
@@ -2064,26 +2681,113 @@ public:
       return;
     auto [Heap, Index] = GetRenderTargetHeap(device_, RTV);
     auto AttachmentDesc = Heap->GetRenderTarget(Index);
+    if (RectCount && !Rects)
+      return;
+
+    if (AttachmentDesc.BufferResource) {
+      WMTClearColor sanitized_color = {Color[0], Color[1], Color[2], Color[3]};
+      SanitizeRTVClearColor(AttachmentDesc.Format, sanitized_color);
+      const std::array<float, 4> clear_color = {
+          float(sanitized_color.r), float(sanitized_color.g), float(sanitized_color.b), float(sanitized_color.a)
+      };
+      if (!RectCount) {
+        uint64_t indirect_offset = 0;
+        if (predication_enabled_) {
+          const uint32_t dispatch_arguments[] = {
+              uint32_t((uint64_t(AttachmentDesc.BufferRange.elementCount) + 31) / 32), 1, 1
+          };
+          indirect_offset = PreparePredicatedArguments(dispatch_arguments, sizeof(dispatch_arguments));
+        }
+        allocator_->clear_uav_.beginRenderTarget(
+            clear_color, AttachmentDesc.BufferResource, AttachmentDesc.BufferView, AttachmentDesc.BufferRange,
+            AttachmentDesc.Format
+        );
+        allocator_->clear_uav_.clear(
+            AttachmentDesc.BufferRange.firstElement, 0, AttachmentDesc.BufferRange.elementCount, 1,
+            predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{}, indirect_offset
+        );
+        allocator_->clear_uav_.end();
+        return;
+      }
+
+      const LONG maximum_x = LONG(std::min<UINT>(AttachmentDesc.BufferRange.elementCount, LONG_MAX));
+      small_vector<uint64_t, 4> indirect_offsets;
+      if (predication_enabled_) {
+        indirect_offsets.reserve(RectCount);
+        for (UINT i = 0; i < RectCount; i++) {
+          const LONG left = std::clamp(Rects[i].left, LONG(0), maximum_x);
+          const LONG right = std::clamp(Rects[i].right, LONG(0), maximum_x);
+          if (right <= left || Rects[i].bottom <= 0 || Rects[i].top >= 1) {
+            indirect_offsets.push_back(0);
+            continue;
+          }
+          const uint32_t dispatch_arguments[] = {
+              uint32_t((uint64_t(uint32_t(right - left)) + 31) / 32), 1, 1
+          };
+          indirect_offsets.push_back(PreparePredicatedArguments(dispatch_arguments, sizeof(dispatch_arguments)));
+        }
+      }
+      allocator_->clear_uav_.beginRenderTarget(
+          clear_color, AttachmentDesc.BufferResource, AttachmentDesc.BufferView, AttachmentDesc.BufferRange,
+          AttachmentDesc.Format
+      );
+      for (UINT i = 0; i < RectCount; i++) {
+        const LONG left = std::clamp(Rects[i].left, LONG(0), maximum_x);
+        const LONG right = std::clamp(Rects[i].right, LONG(0), maximum_x);
+        if (right <= left || Rects[i].bottom <= 0 || Rects[i].top >= 1)
+          continue;
+        allocator_->clear_uav_.clear(
+            AttachmentDesc.BufferRange.firstElement + uint32_t(left), 0, uint32_t(right - left), 1,
+            predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
+            predication_enabled_ ? indirect_offsets[i] : 0
+        );
+      }
+      allocator_->clear_uav_.end();
+      return;
+    }
+
     if (!AttachmentDesc.Texture)
       return;
-    if (Rects) {
+
+    if (predication_enabled_ || RectCount) {
+      const D3D12_RECT full_rect = {0, 0, LONG(AttachmentDesc.Width), LONG(AttachmentDesc.Height)};
+      const D3D12_RECT *clear_rects = RectCount ? Rects : &full_rect;
+      const UINT clear_rect_count = RectCount ? RectCount : 1;
+
+      small_vector<uint64_t, 4> indirect_offsets;
+      if (predication_enabled_) {
+        indirect_offsets.reserve(clear_rect_count);
+        const uint32_t draw_arguments[] = {
+            3, std::max(AttachmentDesc.RenderTargetArrayLength, 1u), 0, 0
+        };
+        for (UINT i = 0; i < clear_rect_count; i++)
+          indirect_offsets.push_back(PreparePredicatedArguments(draw_arguments, sizeof(draw_arguments)));
+      }
+
+      WMTClearColor sanitized_color = {Color[0], Color[1], Color[2], Color[3]};
+      SanitizeRTVClearColor(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View), sanitized_color);
+      const std::array<float, 4> clear_color = {
+          float(sanitized_color.r), float(sanitized_color.g), float(sanitized_color.b), float(sanitized_color.a)
+      };
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, AttachmentDesc.DepthPlane);
-      for (unsigned i = 0; i < RectCount; i++) {
-        auto rect = Rects[i];
-        uint32_t rect_offset_x = std::max(rect.left, (LONG)0);
-        uint32_t rect_offset_y = std::max(rect.top, (LONG)0);
-        int32_t rect_width = rect.right - rect_offset_x;
-        int32_t rect_height = rect.bottom - rect_offset_y;
+      for (UINT i = 0; i < clear_rect_count; i++) {
+        const auto &rect = clear_rects[i];
+        const uint32_t rect_offset_x = std::max(rect.left, LONG(0));
+        const uint32_t rect_offset_y = std::max(rect.top, LONG(0));
+        const int32_t rect_width = rect.right - rect_offset_x;
+        const int32_t rect_height = rect.bottom - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
         allocator_->clear_rtv_.clear(
             rect_offset_x, rect_offset_y, rect_width, rect_height, AttachmentDesc.RenderTargetArrayLength,
-            {Color[0], Color[1], Color[2], Color[3]}
+            clear_color, predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
+            predication_enabled_ ? indirect_offsets[i] : 0
         );
       }
       allocator_->clear_rtv_.end();
       return;
     }
+
     allocator_->InvalidateCurrentPass();
     auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
     encoder_info->type = EncoderType::Clear;
@@ -2104,54 +2808,89 @@ public:
       D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle, D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle, ID3D12Resource *pResource,
       const UINT Values[4], UINT RectCount, const D3D12_RECT *pRects
   ) {
-    if (RejectBundleOperation())
+    if (RejectBundleOperation() || (RectCount && !pRects))
       return;
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, CpuHandle);
     auto &Descriptor = Heap->GetDescriptor(Index);
     auto color = std::array<uint32_t, 4>({Values[0], Values[1], Values[2], Values[3]});
     D3D12_RECT full_rect;
+    uint32_t dispatch_depth = 1;
     switch (Descriptor.type) {
-    case ShaderVisibleDescriptorType::UAVBuffer: {
-      allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
+    case ShaderVisibleDescriptorType::UAVBuffer:
       full_rect = {
-          (LONG)Descriptor.UAVBuffer.slice.byteOffset >> 2, 0,
-          (LONG)((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
+          LONG(Descriptor.UAVBuffer.slice.byteOffset >> 2), 0,
+          LONG((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
       };
       break;
-    }
-    case ShaderVisibleDescriptorType::UAVTexture: {
-      allocator_->clear_uav_.begin(color, Descriptor.UAVTexture.texture, Descriptor.UAVTexture.view);
+    case ShaderVisibleDescriptorType::UAVTexture:
       full_rect = {
-          0, 0, (LONG)Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view),
-          (LONG)Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view)
+          0, 0, LONG(Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view)),
+          LONG(Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view))
+      };
+      switch (Descriptor.UAVTexture.texture->textureType(Descriptor.UAVTexture.view)) {
+      case WMTTextureType1DArray:
+      case WMTTextureType2DArray:
+        dispatch_depth = Descriptor.UAVTexture.texture->arrayLength(Descriptor.UAVTexture.view);
+        break;
+      case WMTTextureType3D:
+        dispatch_depth = Descriptor.UAVTexture.texture->depth(Descriptor.UAVTexture.view);
+        break;
+      default:
+        break;
+      }
+      break;
+    case ShaderVisibleDescriptorType::UAVTexelBuffer:
+      full_rect = {
+          LONG(Descriptor.UAVTexelBuffer.slice.firstElement), 0,
+          LONG(Descriptor.UAVTexelBuffer.slice.firstElement + Descriptor.UAVTexelBuffer.slice.elementCount), 1
       };
       break;
-    }
-    case ShaderVisibleDescriptorType::UAVTexelBuffer: {
-      allocator_->clear_uav_.begin(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view);
-      full_rect = {
-          (LONG)Descriptor.UAVTexelBuffer.slice.firstElement, 0,
-          (LONG)(Descriptor.UAVTexelBuffer.slice.firstElement + Descriptor.UAVTexelBuffer.slice.elementCount), 1
-      };
-      break;
-    }
     default:
-      allocator_->clear_uav_.end();
       return;
     }
 
-    const D3D12_RECT *rects = RectCount > 0 ? pRects : &full_rect;
-    UINT rect_count = RectCount > 0 ? RectCount : 1;
-
-    for (unsigned i = 0; i < rect_count; i++) {
-      auto &rect = rects[i];
-      auto width = rect.right - rect.left;
-      auto height = rect.bottom - rect.top;
-      if (width <= 0 || height <= 0)
-        continue;
-      allocator_->clear_uav_.clear(rect.left, rect.top, width, height);
+    const D3D12_RECT *rects = RectCount ? pRects : &full_rect;
+    const UINT rect_count = RectCount ? RectCount : 1;
+    small_vector<uint64_t, 4> indirect_offsets;
+    if (predication_enabled_) {
+      indirect_offsets.reserve(rect_count);
+      for (UINT i = 0; i < rect_count; i++) {
+        const auto &rect = rects[i];
+        if (rect.right <= rect.left || rect.bottom <= rect.top) {
+          indirect_offsets.push_back(0);
+          continue;
+        }
+        const uint32_t dispatch_arguments[] = {
+            (uint32_t(rect.right - rect.left) + 31) / 32, uint32_t(rect.bottom - rect.top), dispatch_depth
+        };
+        indirect_offsets.push_back(PreparePredicatedArguments(dispatch_arguments, sizeof(dispatch_arguments)));
+      }
     }
 
+    switch (Descriptor.type) {
+    case ShaderVisibleDescriptorType::UAVBuffer:
+      allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
+      break;
+    case ShaderVisibleDescriptorType::UAVTexture:
+      allocator_->clear_uav_.begin(color, Descriptor.UAVTexture.texture, Descriptor.UAVTexture.view);
+      break;
+    case ShaderVisibleDescriptorType::UAVTexelBuffer:
+      allocator_->clear_uav_.begin(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view);
+      break;
+    default:
+      return;
+    }
+
+    for (UINT i = 0; i < rect_count; i++) {
+      const auto &rect = rects[i];
+      if (rect.right <= rect.left || rect.bottom <= rect.top)
+        continue;
+      allocator_->clear_uav_.clear(
+          rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+          predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
+          predication_enabled_ ? indirect_offsets[i] : 0
+      );
+    }
     allocator_->clear_uav_.end();
   };
 
@@ -2160,54 +2899,89 @@ public:
       D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle, D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle, ID3D12Resource *pResource,
       const float Values[4], UINT RectCount, const D3D12_RECT *pRects
   ) {
-    if (RejectBundleOperation())
+    if (RejectBundleOperation() || (RectCount && !pRects))
       return;
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, CpuHandle);
     auto &Descriptor = Heap->GetDescriptor(Index);
     auto color = std::array<float, 4>({Values[0], Values[1], Values[2], Values[3]});
     D3D12_RECT full_rect;
+    uint32_t dispatch_depth = 1;
     switch (Descriptor.type) {
-    case ShaderVisibleDescriptorType::UAVBuffer: {
-      allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
+    case ShaderVisibleDescriptorType::UAVBuffer:
       full_rect = {
-          (LONG)Descriptor.UAVBuffer.slice.byteOffset >> 2, 0,
-          (LONG)((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
+          LONG(Descriptor.UAVBuffer.slice.byteOffset >> 2), 0,
+          LONG((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
       };
       break;
-    }
-    case ShaderVisibleDescriptorType::UAVTexture: {
-      allocator_->clear_uav_.begin(color, Descriptor.SRVTexture.texture, Descriptor.SRVTexture.view);
+    case ShaderVisibleDescriptorType::UAVTexture:
       full_rect = {
-          0, 0, (LONG)Descriptor.SRVTexture.texture->width(Descriptor.SRVTexture.view),
-          (LONG)Descriptor.SRVTexture.texture->height(Descriptor.SRVTexture.view)
+          0, 0, LONG(Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view)),
+          LONG(Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view))
+      };
+      switch (Descriptor.UAVTexture.texture->textureType(Descriptor.UAVTexture.view)) {
+      case WMTTextureType1DArray:
+      case WMTTextureType2DArray:
+        dispatch_depth = Descriptor.UAVTexture.texture->arrayLength(Descriptor.UAVTexture.view);
+        break;
+      case WMTTextureType3D:
+        dispatch_depth = Descriptor.UAVTexture.texture->depth(Descriptor.UAVTexture.view);
+        break;
+      default:
+        break;
+      }
+      break;
+    case ShaderVisibleDescriptorType::UAVTexelBuffer:
+      full_rect = {
+          LONG(Descriptor.UAVTexelBuffer.slice.firstElement), 0,
+          LONG(Descriptor.UAVTexelBuffer.slice.firstElement + Descriptor.UAVTexelBuffer.slice.elementCount), 1
       };
       break;
-    }
-    case ShaderVisibleDescriptorType::UAVTexelBuffer: {
-      allocator_->clear_uav_.begin(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view);
-      full_rect = {
-          (LONG)Descriptor.UAVTexelBuffer.slice.firstElement, 0,
-          (LONG)(Descriptor.UAVTexelBuffer.slice.firstElement + Descriptor.UAVTexelBuffer.slice.elementCount), 1
-      };
-      break;
-    }
     default:
-      allocator_->clear_uav_.end();
       return;
     }
 
-    const D3D12_RECT *rects = RectCount > 0 ? pRects : &full_rect;
-    UINT rect_count = RectCount > 0 ? RectCount : 1;
-
-    for (unsigned i = 0; i < rect_count; i++) {
-      auto &rect = rects[i];
-      auto width = rect.right - rect.left;
-      auto height = rect.bottom - rect.top;
-      if (width <= 0 || height <= 0)
-        continue;
-      allocator_->clear_uav_.clear(rect.left, rect.top, width, height);
+    const D3D12_RECT *rects = RectCount ? pRects : &full_rect;
+    const UINT rect_count = RectCount ? RectCount : 1;
+    small_vector<uint64_t, 4> indirect_offsets;
+    if (predication_enabled_) {
+      indirect_offsets.reserve(rect_count);
+      for (UINT i = 0; i < rect_count; i++) {
+        const auto &rect = rects[i];
+        if (rect.right <= rect.left || rect.bottom <= rect.top) {
+          indirect_offsets.push_back(0);
+          continue;
+        }
+        const uint32_t dispatch_arguments[] = {
+            (uint32_t(rect.right - rect.left) + 31) / 32, uint32_t(rect.bottom - rect.top), dispatch_depth
+        };
+        indirect_offsets.push_back(PreparePredicatedArguments(dispatch_arguments, sizeof(dispatch_arguments)));
+      }
     }
 
+    switch (Descriptor.type) {
+    case ShaderVisibleDescriptorType::UAVBuffer:
+      allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
+      break;
+    case ShaderVisibleDescriptorType::UAVTexture:
+      allocator_->clear_uav_.begin(color, Descriptor.UAVTexture.texture, Descriptor.UAVTexture.view);
+      break;
+    case ShaderVisibleDescriptorType::UAVTexelBuffer:
+      allocator_->clear_uav_.begin(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view);
+      break;
+    default:
+      return;
+    }
+
+    for (UINT i = 0; i < rect_count; i++) {
+      const auto &rect = rects[i];
+      if (rect.right <= rect.left || rect.bottom <= rect.top)
+        continue;
+      allocator_->clear_uav_.clear(
+          rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+          predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
+          predication_enabled_ ? indirect_offsets[i] : 0
+      );
+    }
     allocator_->clear_uav_.end();
   };
 
@@ -2377,7 +3151,42 @@ public:
   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *pBuffer, UINT64 AlignedBufferOffset, D3D12_PREDICATION_OP Op) {
     if (RejectBundleOperation())
       return;
-    IMPLEMENT_ME
+    if (!pBuffer) {
+      predication_enabled_ = false;
+      return;
+    }
+    if ((type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+         type_ != D3D12_COMMAND_LIST_TYPE_COPY) ||
+        !QueryObjectOwnedByThisDevice(pBuffer) || (AlignedBufferOffset & 7) ||
+        (Op != D3D12_PREDICATION_OP_EQUAL_ZERO && Op != D3D12_PREDICATION_OP_NOT_EQUAL_ZERO)) {
+      RecordError();
+      return;
+    }
+    const auto desc = pBuffer->GetDesc();
+    auto resource = static_cast<MTLD3D12Resource *>(pBuffer);
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+        !RangeFits(AlignedBufferOffset, sizeof(uint64_t), desc.Width) || !resource->buffer ||
+        !EnsurePredicationPipelines()) {
+      RecordError();
+      return;
+    }
+
+    if (!allocator_->CanAllocateGPUHeap(sizeof(uint64_t), alignof(uint64_t))) {
+      RecordError(E_OUTOFMEMORY);
+      return;
+    }
+    auto [snapshot, snapshot_offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t), alignof(uint64_t));
+    memset(snapshot, 0, sizeof(uint64_t));
+    BeginPredicationComputePass(predication_snapshot_pipeline_);
+    BindPredicationBuffer(resource->buffer->current()->buffer(), AlignedBufferOffset, 0);
+    BindPredicationBuffer(allocator_->gpu_heap_buffer_, snapshot_offset, 1);
+    DispatchPredicationKernel();
+    predication_snapshot_offset_ = snapshot_offset;
+    predication_op_ = Op;
+    predication_enabled_ = true;
+    owned_graphics::Trace("predication", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                          ",\"resource\":", resource->owned_id, ",\"offset\":", AlignedBufferOffset,
+                          ",\"op\":", uint32_t(Op));
   };
 
   void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) {
@@ -2405,8 +3214,31 @@ public:
       ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgBuffer,
       UINT64 ArgBufferOffset, ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset
   ) {
+    if (!pCommandSignature || !pArgBuffer || !QueryObjectOwnedByThisDevice(pCommandSignature) ||
+        !QueryObjectOwnedByThisDevice(pArgBuffer) || (pCountBuffer && !QueryObjectOwnedByThisDevice(pCountBuffer)) ||
+        (ArgBufferOffset & 3) || (CountBufferOffset & 3)) {
+      RecordError();
+      return;
+    }
     auto sig = static_cast<MTLD3D12CommandSignature *>(pCommandSignature);
-    if (!sig) {
+    const auto arg_desc = pArgBuffer->GetDesc();
+    if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || ArgBufferOffset > arg_desc.Width ||
+        uint64_t(MaxCommandCount) > (arg_desc.Width - ArgBufferOffset) / sig->ByteStride) {
+      RecordError();
+      return;
+    }
+    if (pCountBuffer) {
+      const auto count_desc = pCountBuffer->GetDesc();
+      if (count_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !RangeFits(CountBufferOffset, sizeof(UINT), count_desc.Width)) {
+        RecordError();
+        return;
+      }
+    }
+    if ((sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH &&
+         type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+         type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE) ||
+        (sig->CommandType != D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH &&
+         type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE)) {
       RecordError();
       return;
     }
@@ -2419,20 +3251,49 @@ public:
                    pArgBuffer, ArgBufferOffset, pCountBuffer, CountBufferOffset);
       return;
     }
-    auto arg_buffer = static_cast<MTLD3D12Resource *>(pArgBuffer);
-    if (!arg_buffer || !arg_buffer->buffer)
+    if (!MaxCommandCount) {
+      const bool compute = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+      ResetIndirectState(sig, compute ? rootsig_compute_.ptr() : rootsig_graphics_.ptr(),
+                         compute ? rootarg_compute_staging_ : rootarg_graphics_staging_, compute);
       return;
+    }
+    auto arg_buffer = static_cast<MTLD3D12Resource *>(pArgBuffer);
+    if (!arg_buffer->buffer) {
+      RecordError();
+      return;
+    }
     auto ArgBufferAddress = arg_buffer->buffer->current()->gpuAddress() + ArgBufferOffset;
     uint64_t CountBufferAddress = 0;
     if (auto count_buffer = static_cast<MTLD3D12Resource *>(pCountBuffer)) {
-      if (!count_buffer->buffer)
+      if (!count_buffer->buffer) {
+        RecordError();
         return;
+      }
       CountBufferAddress = count_buffer->buffer->current()->gpuAddress() + CountBufferOffset;
     }
     if (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
       if (!PreDispatch(sig->UpdateRootArguments))
         return;
+      if (sig->UpdateRootArguments && !rootsig_compute_) {
+        RecordError();
+        return;
+      }
 
+      uint64_t required_heap = sizeof(IndirectComputeCommandData);
+      if (!sig->UpdateRootArguments && !allocator_->CanAllocateGPUHeap(required_heap, 16)) {
+        RecordError(E_OUTOFMEMORY);
+        return;
+      }
+      if (sig->UpdateRootArguments) {
+        const uint64_t per_command = uint64_t(rootsig_compute_->UploadQwords) * sizeof(uint64_t);
+        if ((per_command && MaxCommandCount > (SIZE_MAX - required_heap) / per_command) ||
+            !allocator_->CanAllocateGPUHeap(required_heap + per_command * MaxCommandCount +
+                                                uint64_t(rootsig_compute_->NumStaticSamplers) * 4 * sizeof(uint64_t),
+                                            16)) {
+          RecordError(E_OUTOFMEMORY);
+          return;
+        }
+      }
       auto cmd = allocator_->EncodeIndirectComputeCommand(sig, pso_compute_.ptr(), MaxCommandCount);
       if (!cmd) {
         RecordError(E_FAIL);
@@ -2440,6 +3301,8 @@ public:
       }
       cmd->max_count_buffer = CountBufferAddress;
       cmd->argument_buffer = ArgBufferAddress;
+      cmd->predicate = predication_enabled_ ? allocator_->gpu_heap_buffer_address_ + predication_snapshot_offset_ : 0;
+      cmd->predicate_op = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
 
       if (sig->UpdateRootArguments) {
         cmd->rootsig_qwords = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_, MaxCommandCount);
@@ -2448,6 +3311,7 @@ public:
         cmd->static_samplers = EncodeStaticSamplers(rootsig_compute_.ptr());
         cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
       }
+      ResetIndirectState(sig, rootsig_compute_.ptr(), rootarg_compute_staging_, true);
 
       return;
     }
@@ -2459,10 +3323,36 @@ public:
     DrawCallStatus status = PreDraw(encode_binding);
     if (status == DrawCallStatus::Invalid)
       return;
+    if (sig->UpdateRootArguments && !rootsig_graphics_) {
+      RecordError();
+      return;
+    }
     if (status != DrawCallStatus::Ordinary) {
-      IMPLEMENT_ME // TODO: (potential) emulated pipeline
+      RecordError(E_FAIL);
+      return;
     }
 
+    uint64_t required_heap = sizeof(IndirectRenderCommandData);
+    if (!encode_binding && !allocator_->CanAllocateGPUHeap(required_heap, 16)) {
+      RecordError(E_OUTOFMEMORY);
+      return;
+    }
+    if (encode_binding) {
+      uint64_t per_command = 0;
+      if (rootsig_graphics_)
+        per_command += uint64_t(rootsig_graphics_->UploadQwords) * sizeof(uint64_t);
+      const uint32_t slot_mask = pso_graphics_->slot_mask;
+      if (slot_mask)
+        per_command += align(uint64_t(16) * (32 - __builtin_clz(slot_mask)), uint64_t(16));
+      const uint64_t sampler_bytes = rootsig_graphics_
+          ? uint64_t(rootsig_graphics_->NumStaticSamplers) * 4 * sizeof(uint64_t)
+          : 0;
+      if ((per_command && MaxCommandCount > (SIZE_MAX - required_heap - sampler_bytes) / per_command) ||
+          !allocator_->CanAllocateGPUHeap(required_heap + sampler_bytes + per_command * MaxCommandCount, 16)) {
+        RecordError(E_OUTOFMEMORY);
+        return;
+      }
+    }
     auto cmd = allocator_->EncodeIndirectRenderCommand(sig, pso_graphics_.ptr(), MaxCommandCount);
     if (!cmd) {
       RecordError(E_FAIL);
@@ -2470,19 +3360,24 @@ public:
     }
     cmd->max_count_buffer = CountBufferAddress;
     cmd->argument_buffer = ArgBufferAddress;
+    cmd->predicate = predication_enabled_ ? allocator_->gpu_heap_buffer_address_ + predication_snapshot_offset_ : 0;
+    cmd->predicate_op = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
     cmd->primitive_type = primitive_type;
     cmd->index_buffer = index_buffer_address;
     cmd->index_buffer_format = index_type == WMTIndexTypeUInt32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     if (!encode_binding)
       return;
-    cmd->rootsig_qwords = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_, MaxCommandCount);
-    cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
-    cmd->rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
-    cmd->static_samplers = EncodeStaticSamplers(rootsig_graphics_.ptr());
-    cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
+    if (rootsig_graphics_) {
+      cmd->rootsig_qwords = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_, MaxCommandCount);
+      cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
+      cmd->rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
+      cmd->static_samplers = EncodeStaticSamplers(rootsig_graphics_.ptr());
+      cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
+    }
     auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount);
     cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
     cmd->vertex_argbuf_stride = VBStride;
+    ResetIndirectState(sig, rootsig_graphics_.ptr(), rootarg_graphics_staging_, false);
   };
 
   void STDMETHODCALLTYPE
@@ -2528,7 +3423,163 @@ public:
   ) {
     if (RejectBundleOperation())
       return;
-    IMPLEMENT_ME
+    if (!pDstResource || !pSrcResource ||
+        (ResolveMode != D3D12_RESOLVE_MODE_AVERAGE && ResolveMode != D3D12_RESOLVE_MODE_MIN &&
+         ResolveMode != D3D12_RESOLVE_MODE_MAX && ResolveMode != D3D12_RESOLVE_MODE_DECOMPRESS)) {
+      RecordError();
+      return;
+    }
+
+    auto *dst_resource = static_cast<MTLD3D12Resource *>(pDstResource);
+    auto *src_resource = static_cast<MTLD3D12Resource *>(pSrcResource);
+    const auto dst_resource_desc = dst_resource->GetDesc();
+    const auto src_resource_desc = src_resource->GetDesc();
+    MTL_DXGI_FORMAT_DESC format_desc;
+    if (!dst_resource->texture || !src_resource->texture ||
+        dst_resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        src_resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format_desc)) ||
+        !resource_contract::AreCopyCompatibleFormats(dst_resource_desc.Format, Format) ||
+        !resource_contract::AreCopyCompatibleFormats(src_resource_desc.Format, Format)) {
+      RecordError();
+      return;
+    }
+
+    UINT dst_level = 0, dst_slice = 0, dst_plane = 0;
+    UINT src_level = 0, src_slice = 0, src_plane = 0;
+    if (!GetSubresourceInfo(device_->GetMTLDevice(), dst_resource_desc, DstSubresource, dst_level, dst_slice, dst_plane) ||
+        !GetSubresourceInfo(device_->GetMTLDevice(), src_resource_desc, SrcSubresource, src_level, src_slice, src_plane) ||
+        dst_plane != src_plane || src_level || src_resource_desc.SampleDesc.Count <= 1) {
+      RecordError();
+      return;
+    }
+
+    const auto src_extent = GetResourceExtent(src_resource_desc, src_level);
+    const auto dst_extent = GetResourceExtent(dst_resource_desc, dst_level);
+    D3D12_RECT rect = pSrcRect ? *pSrcRect : D3D12_RECT{0, 0, LONG(src_extent.right), LONG(src_extent.bottom)};
+    if (rect.left < 0 || rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top ||
+        UINT(rect.right) > src_extent.right || UINT(rect.bottom) > src_extent.bottom ||
+        DstX > dst_extent.right || UINT(rect.right - rect.left) > dst_extent.right - DstX ||
+        DstY > dst_extent.bottom || UINT(rect.bottom - rect.top) > dst_extent.bottom - DstY) {
+      RecordError();
+      return;
+    }
+
+    if (ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS) {
+      if (dst_resource_desc.SampleDesc.Count != src_resource_desc.SampleDesc.Count ||
+          pDstResource != pSrcResource || DstSubresource != SrcSubresource || DstX != UINT(rect.left) ||
+          DstY != UINT(rect.top))
+        RecordError();
+      return;
+    }
+    const uint8_t dsv_flags = uint8_t(DepthStencilPlanarFlags(format_desc.PixelFormat));
+    const uint8_t dsv_plane = dsv_flags ? (src_plane ? 2 : 1) : 0;
+    if (dst_resource_desc.SampleDesc.Count != 1 || (dsv_flags && ResolveMode == D3D12_RESOLVE_MODE_AVERAGE)) {
+      RecordError();
+      return;
+    }
+
+    auto &src = src_resource->texture;
+    auto &dst = dst_resource->texture;
+    const auto sampling_format = dsv_plane == 2 && DepthStencilPlanarFlags(src->pixelFormat()) == 3
+        ? WMTPixelFormatX32_Stencil8
+        : format_desc.PixelFormat;
+    const auto attachment_format = dsv_plane ? dst->pixelFormat() : format_desc.PixelFormat;
+    TextureViewDescriptor src_view_desc;
+    src_view_desc.format = sampling_format;
+    src_view_desc.type = WMTTextureType2DMultisample;
+    src_view_desc.arraySize = 1;
+    src_view_desc.firstArraySlice = src_slice;
+    src_view_desc.miplevelCount = 1;
+    src_view_desc.firstMiplevel = 0;
+    TextureViewDescriptor dst_view_desc;
+    dst_view_desc.format = attachment_format;
+    dst_view_desc.type = WMTTextureType2D;
+    dst_view_desc.arraySize = 1;
+    dst_view_desc.firstArraySlice = dst_slice;
+    dst_view_desc.miplevelCount = 1;
+    dst_view_desc.firstMiplevel = dst_level;
+    const auto src_view_id = src->createView(src_view_desc);
+    const auto dst_view_id = dst->createView(dst_view_desc);
+    auto &src_view = src->view(src_view_id);
+    auto &dst_view = dst->view(dst_view_id);
+    if (!src_view.texture || !dst_view.texture) {
+      RecordError(E_OUTOFMEMORY);
+      return;
+    }
+
+    allocator_->InvalidateCurrentPass();
+    auto *resolve = allocator_->AllocatePass<ResolveEncoderData>();
+    resolve->type = EncoderType::Resolve;
+    resolve->src = src_view;
+    resolve->dst = dst_view;
+    resolve->dsv_flags = dsv_plane;
+
+    const bool whole_average = !dsv_plane && !predication_enabled_ && ResolveMode == D3D12_RESOLVE_MODE_AVERAGE && !pSrcRect &&
+                               !DstX && !DstY && src_extent.right == dst_extent.right &&
+                               src_extent.bottom == dst_extent.bottom;
+    if (!whole_average) {
+      auto library = device_->GetLib().getLibrary();
+      auto vertex = library.newFunction("dxmt_resolve_vertex");
+      const bool integer = IsIntegerFormat(format_desc.PixelFormat);
+      const bool unsigned_integer = integer && MTLGetUnsignedIntegerFormat(format_desc.PixelFormat) == format_desc.PixelFormat;
+      const char *fragment_name = dsv_plane == 1 ? "dxmt_resolve_depth" :
+                                  dsv_plane == 2 ? "dxmt_resolve_stencil" :
+                                  unsigned_integer ? "dxmt_resolve_uint" :
+                                  integer ? "dxmt_resolve_sint" : "dxmt_resolve_float";
+      auto fragment = library.newFunction(fragment_name);
+      WMTRenderPipelineInfo pipeline_info;
+      WMT::InitializeRenderPipelineInfo(pipeline_info);
+      pipeline_info.vertex_function = vertex.handle;
+      pipeline_info.fragment_function = fragment.handle;
+      if (dsv_plane & 1)
+        pipeline_info.depth_pixel_format = attachment_format;
+      else if (dsv_plane & 2)
+        pipeline_info.stencil_pixel_format = attachment_format;
+      else
+        pipeline_info.colors[0].pixel_format = attachment_format;
+      pipeline_info.raster_sample_count = 1;
+      pipeline_info.rasterization_enabled = true;
+      pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+      WMT::Reference<WMT::Error> error;
+      resolve->pipeline = device_->GetMTLDevice().newRenderPipelineState(pipeline_info, error);
+      if (dsv_plane) {
+        WMTDepthStencilInfo depth_stencil_info;
+        depth_stencil_info.depth_compare_function = WMTCompareFunctionAlways;
+        depth_stencil_info.depth_write_enabled = dsv_plane & 1;
+        if (dsv_plane & 2) {
+          depth_stencil_info.front_stencil.enabled = true;
+          depth_stencil_info.front_stencil.depth_stencil_pass_op = WMTStencilOperationReplace;
+          depth_stencil_info.front_stencil.depth_fail_op = WMTStencilOperationReplace;
+          depth_stencil_info.front_stencil.stencil_fail_op = WMTStencilOperationReplace;
+          depth_stencil_info.front_stencil.stencil_compare_function = WMTCompareFunctionAlways;
+          depth_stencil_info.front_stencil.read_mask = 0xff;
+          depth_stencil_info.front_stencil.write_mask = 0xff;
+          depth_stencil_info.back_stencil = depth_stencil_info.front_stencil;
+        }
+        resolve->depth_stencil_state = device_->GetMTLDevice().newDepthStencilState(depth_stencil_info);
+      }
+      if (!vertex || !fragment || !resolve->pipeline || (dsv_plane && !resolve->depth_stencil_state)) {
+        resolve->~ResolveEncoderData();
+        allocator_->encoder_current = nullptr;
+        RecordError(E_FAIL);
+        return;
+      }
+      resolve->destination_x = DstX;
+      resolve->destination_y = DstY;
+      resolve->width = rect.right - rect.left;
+      resolve->height = rect.bottom - rect.top;
+      resolve->parameters.source_delta_x = rect.left - LONG(DstX);
+      resolve->parameters.source_delta_y = rect.top - LONG(DstY);
+      resolve->parameters.sample_count = src_resource_desc.SampleDesc.Count;
+      resolve->parameters.mode = ResolveMode == D3D12_RESOLVE_MODE_AVERAGE ? 0 :
+                                 ResolveMode == D3D12_RESOLVE_MODE_MIN ? 1 : 2;
+      resolve->parameters.predicate_enabled = predication_enabled_;
+      resolve->parameters.predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
+      resolve->predicate = allocator_->gpu_heap_buffer_;
+      resolve->predicate_offset = predication_enabled_ ? predication_snapshot_offset_ : 0;
+    }
+    allocator_->InvalidateCurrentPass();
   }
 
   void STDMETHODCALLTYPE

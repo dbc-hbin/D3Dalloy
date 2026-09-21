@@ -49,6 +49,18 @@ ComPtr<ID3D12Fence> makeFence(ID3D12Device *device, UINT64 initial = 0) {
   return fence;
 }
 
+ComPtr<ID3D12CommandQueue> makeQueue(ID3D12Device *device) {
+  D3D12_COMMAND_QUEUE_DESC desc = {};
+  desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  ComPtr<ID3D12CommandQueue> queue;
+  check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "CreateCommandQueue");
+  return queue;
+}
+
+void requireValue(ID3D12Fence *fence, UINT64 expected, const char *step) {
+  if (fence->GetCompletedValue() != expected) fail(step);
+}
+
 void backend() {
   const auto module = GetModuleHandleW(L"d3d12.dll");
   using Id = const char *(WINAPI *)();
@@ -128,6 +140,116 @@ void synchronous(ID3D12Device1 *device, D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags) {
               flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL ? "all" : "any");
 }
 
+void cpuRewindEvents(ID3D12Device1 *device) {
+  auto fence = makeFence(device, 10), other = makeFence(device);
+  check(fence->Signal(5), "CPU rewind 10 to 5");
+  requireValue(fence.Get(), 5, "CPU rewind did not publish 5");
+
+  ID3D12Fence *fences[] = {fence.Get(), other.Get()};
+  const UINT64 values[] = {7, 1};
+  Event single, any, all, nullEntered, nullReturned;
+  check(fence->SetEventOnCompletion(7, single.handle), "rewind single registration");
+  check(device->SetEventOnMultipleFenceCompletion(fences, values, 2,
+      D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY, any.handle), "rewind ANY registration");
+  check(device->SetEventOnMultipleFenceCompletion(fences, values, 2,
+      D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, all.handle), "rewind ALL registration");
+  single.expect(WAIT_TIMEOUT, 0, "rewind single observed stale 10");
+  any.expect(WAIT_TIMEOUT, 0, "rewind ANY observed stale 10");
+  all.expect(WAIT_TIMEOUT, 0, "rewind ALL observed stale 10");
+
+  HRESULT nullResult = E_FAIL;
+  std::thread waiter([&] {
+    SetEvent(nullEntered.handle);
+    nullResult = fence->SetEventOnCompletion(7, nullptr);
+    SetEvent(nullReturned.handle);
+  });
+  nullEntered.expect(WAIT_OBJECT_0, kTimeout, "rewind null-event waiter startup");
+  nullReturned.expect(WAIT_TIMEOUT, 0, "rewind null event observed stale 10");
+  check(other->Signal(1), "rewind ALL second fence");
+  all.expect(WAIT_TIMEOUT, 0, "rewind ALL ignored rewound fence");
+  check(fence->Signal(5), "equal CPU signal");
+  requireValue(fence.Get(), 5, "equal CPU signal changed value");
+  single.expect(WAIT_TIMEOUT, 0, "equal CPU signal fired future event");
+  check(fence->Signal(7), "rewind future CPU signal");
+  single.expect(WAIT_OBJECT_0, kTimeout, "rewind single completion");
+  any.expect(WAIT_OBJECT_0, kTimeout, "rewind ANY completion");
+  all.expect(WAIT_OBJECT_0, kTimeout, "rewind ALL completion");
+  nullReturned.expect(WAIT_OBJECT_0, kTimeout, "rewind null-event completion");
+  waiter.join();
+  check(nullResult, "rewind null-event result");
+  std::puts("OWNED_D3D12_FENCE_EVENTS_CASE_PASS case=cpu_rewind_events from=10 to=5 single=1 any=1 all=1 null=1 equal=1");
+}
+
+void gpuSignals(ID3D12Device1 *device) {
+  auto queue = makeQueue(device);
+  auto fence = makeFence(device), retired = makeFence(device);
+  Event highObserved, retiredEvent;
+  check(fence->SetEventOnCompletion(10, highObserved.handle), "GPU rewind high-value event");
+  check(retired->SetEventOnCompletion(1, retiredEvent.handle), "GPU rewind retirement event");
+  check(queue->Signal(fence.Get(), 10), "GPU signal 10");
+  check(queue->Signal(fence.Get(), 5), "GPU rewind 10 to 5");
+  check(queue->Signal(fence.Get(), 5), "equal GPU signal 5");
+  check(queue->Signal(retired.Get(), 1), "GPU rewind retirement marker");
+  retiredEvent.expect(WAIT_OBJECT_0, kTimeout, "GPU rewind retirement");
+  requireValue(fence.Get(), 5, "GPU rewind did not publish 5");
+  highObserved.expect(WAIT_OBJECT_0, kTimeout, "GPU high-value event unlatched after rewind");
+
+  auto gate = makeFence(device), mixed = makeFence(device);
+  Event mixedDone;
+  check(queue->Wait(gate.Get(), 1), "mixed producer gate wait");
+  check(queue->Signal(mixed.Get(), 10), "gated GPU signal 10");
+  check(mixed->Signal(5), "CPU signal while GPU signal gated");
+  requireValue(mixed.Get(), 5, "gated CPU signal did not publish 5");
+  check(mixed->SetEventOnCompletion(10, mixedDone.handle), "mixed producer completion event");
+  mixedDone.expect(WAIT_TIMEOUT, 0, "gated GPU signal completed before gate");
+  check(gate->Signal(1), "release mixed producer gate");
+  mixedDone.expect(WAIT_OBJECT_0, kTimeout, "gated GPU signal did not complete");
+  requireValue(mixed.Get(), 10, "GPU completion after CPU signal did not publish 10");
+
+  auto blockedQueue = makeQueue(device), producerQueue = makeQueue(device), waiterQueue = makeQueue(device);
+  auto blockedGate = makeFence(device), competing = makeFence(device), waiterDone = makeFence(device);
+  auto blockedDone = makeFence(device);
+  Event waiterEvent, blockedEvent;
+  check(blockedQueue->Wait(blockedGate.Get(), 1), "competing blocked queue gate");
+  check(blockedQueue->Signal(competing.Get(), 10), "competing blocked first qualifying signal");
+  check(blockedQueue->Signal(blockedDone.Get(), 1), "competing blocked signal marker");
+  check(blockedDone->SetEventOnCompletion(1, blockedEvent.handle), "competing blocked marker event");
+  check(producerQueue->Signal(competing.Get(), 10), "competing second producer signal");
+  check(waiterQueue->Wait(competing.Get(), 10), "competing future wait");
+  check(waiterQueue->Signal(waiterDone.Get(), 1), "competing future wait marker");
+  check(waiterDone->SetEventOnCompletion(1, waiterEvent.handle), "competing future wait event");
+  waiterEvent.expect(WAIT_OBJECT_0, kTimeout, "blocked first producer prevented second producer");
+  requireValue(competing.Get(), 10, "second producer did not publish future wait value");
+  check(blockedGate->Signal(1), "release competing blocked queue");
+  blockedEvent.expect(WAIT_OBJECT_0, kTimeout, "competing blocked signal did not retire");
+  requireValue(competing.Get(), 10, "late equal competing signal changed value");
+
+  auto latchQueue = makeQueue(device);
+  auto latchGate = makeFence(device), latched = makeFence(device), latchDone = makeFence(device);
+  Event latchEvent;
+  check(latchQueue->Wait(latchGate.Get(), 1), "API-time latch gate wait");
+  check(latchQueue->Wait(latched.Get(), 10), "API-time pending queue wait");
+  check(latchQueue->Signal(latchDone.Get(), 1), "API-time latch tail signal");
+  check(latchDone->SetEventOnCompletion(1, latchEvent.handle), "API-time latch tail event");
+  check(latched->Signal(10), "API-time threshold crossing while worker delayed");
+  check(latched->Signal(5), "API-time latch rewind before worker");
+  requireValue(latched.Get(), 5, "API-time latch rewind did not publish 5");
+  check(latchGate->Signal(1), "release API-time latch worker");
+  latchEvent.expect(WAIT_OBJECT_0, kTimeout, "queue wait lost threshold crossing while worker delayed");
+
+  auto lifetimeGate = makeFence(device);
+  Event lifetimeDone;
+  {
+    auto retained = makeFence(device);
+    check(queue->Wait(lifetimeGate.Get(), 1), "retained signal gate wait");
+    check(queue->Signal(retained.Get(), 1), "retained queued signal");
+    check(retained->SetEventOnCompletion(1, lifetimeDone.handle), "retained completion event");
+  }
+  check(lifetimeGate->Signal(1), "release retained signal gate");
+  lifetimeDone.expect(WAIT_OBJECT_0, kTimeout, "queued signal did not retain fence");
+  std::puts("OWNED_D3D12_FENCE_EVENTS_CASE_PASS case=gpu_rewind_mixed from=10 to=5 equal=1 gated_cpu_gpu=1 competing_queues=1 api_wait_latch=1 retained=1");
+}
+
 void crossDevice(ID3D12Device1 *device) {
   auto other = makeDevice();
   auto first = makeFence(device), second = makeFence(other.Get());
@@ -190,9 +312,11 @@ int main() {
   repeatedFence(device.Get());
   synchronous(device.Get(), D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL);
   synchronous(device.Get(), D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY);
+  cpuRewindEvents(device.Get());
+  gpuSignals(device.Get());
   crossDevice(device.Get());
   invalidArguments(device.Get());
   teardown();
-  std::puts("OWNED_D3D12_FENCE_EVENTS_PASS any_all=1 synchronous_null=1 callback_lifetime=1");
+  std::puts("OWNED_D3D12_FENCE_EVENTS_PASS any_all=1 synchronous_null=1 callback_lifetime=1 rewind=1 mixed_producers=1");
   return 0;
 }

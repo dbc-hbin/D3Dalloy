@@ -28,9 +28,14 @@ SUITE_PREFIXES = {
     "bundles": "OWNED_D3D12_BUNDLES",
     "queries": "OWNED_D3D12_QUERY",
     "resources": "OWNED_D3D12_RESOURCES",
+    "buffer-rtv": "OWNED_D3D12_BUFFER_RTV",
+    "residency": "OWNED_D3D12_RESIDENCY",
+    "copy-resolve": "OWNED_D3D12_COPY_RESOLVE",
+    "predication-indirect": "OWNED_D3D12_PREDICATION_INDIRECT",
     "dxil": "OWNED_D3D12_DXIL",
     "dxil-ia": "OWNED_D3D12_DXIL",
     "dxil-static-sampler": "OWNED_D3D12_DXIL_STATIC_SAMPLER",
+    "dxil-texture": "OWNED_D3D12_DXIL_TEXTURE",
     "raytracing": "OWNED_D3D12_RAYTRACING",
 }
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +54,8 @@ DXIL_SHADERS = ("compute.dxil", "vertex.dxil", "pixel.dxil")
 DXIL_REGRESSION_SHADERS = ("register-space.dxil",)
 DXIL_IA_SHADERS = ("fixture-vs.dxil", "fixture-ps.dxil")
 DXIL_STATIC_SAMPLER_SHADERS = ("vs.dxil", "ps.dxil")
+DXIL_TEXTURE_SHADERS = ("basic-texture-vs.dxil", "basic-texture-ps.dxil")
+PREDICATION_INDIRECT_SHADERS = ("predication-indirect-cs.dxil", "predication-indirect-vs.dxil")
 DXIL_IA_MARKER = (
     "OWNED_D3D12_DXIL_IA_PASS "
     "nonindexed=(0.300,0.500,0.300,1.000) "
@@ -61,8 +68,8 @@ DXIL_STATIC_SAMPLER_MARKER = (
     "actual=(0.625000,0.625000,0.625000,0.625000) "
     "expected=(0.625000,0.625000,0.625000,0.625000)"
 )
-# The owned DXIL shader compiler is compiled from the owned patch series into
-# airconv and linked into winemetal.so, so the DXIL suites prove the native
+# The owned DXIL shader compiler is built from src/airconv and linked into
+# winemetal.so, so the DXIL suites prove the native
 # compiler path by loading that exact module and exercising its contracts;
 # there is no separate compiler dylib to load.
 WINEMETAL_NATIVE_LIBRARY = "winemetal.so"
@@ -547,6 +554,10 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
                 + [fixture.parent / name for name in DXIL_IA_SHADERS])
     if suite == "dxil-static-sampler":
         return [fixture.parent / name for name in DXIL_STATIC_SAMPLER_SHADERS]
+    if suite == "dxil-texture":
+        return [dxil_dir / name for name in DXIL_TEXTURE_SHADERS]
+    if suite == "predication-indirect":
+        return [dxil_dir / name for name in PREDICATION_INDIRECT_SHADERS]
     if suite == "raytracing":
         return [dxil_dir / name for name in RAYTRACING_SHADERS]
     return []
@@ -623,6 +634,10 @@ def run(args: argparse.Namespace) -> int:
             command.extend(DXIL_IA_SHADERS)
     elif args.suite == "dxil-static-sampler":
         command.extend(DXIL_STATIC_SAMPLER_SHADERS)
+    elif args.suite == "dxil-texture":
+        command.extend(DXIL_TEXTURE_SHADERS)
+    elif args.suite == "predication-indirect":
+        command.extend(PREDICATION_INDIRECT_SHADERS)
     elif args.suite == "pipeline-cache":
         command.extend(["pipeline-cache-a.dxil", "pipeline-cache-b.dxil"])
     elif args.suite == "raytracing":
@@ -677,11 +692,66 @@ def run(args: argparse.Namespace) -> int:
                and native_loads and not foreign)
     dxil_compiler_loaded = False
     raytracing_evidence = None
+    fence_rewind_cases: list[str] = []
     if args.suite == "smoke":
         success = success and barrier_ok and frames == [str(n) for n in range(8)]
     if args.suite == "multiqueue":
         frames = re.findall(r"OWNED_D3D12_MULTIQUEUE_FRAME frame=(\d+) words=1024 exact=ok", stdout)
         success = success and frames == [str(n) for n in range(32)]
+    if args.suite == "queries":
+        calibration = re.findall(
+            r"OWNED_D3D12_QUERY_CLOCK_CALIBRATION gpu=(\d+) cpu_qpc=(\d+) monotonic=1", stdout)
+        success = (success and len(calibration) == 1
+                   and all(int(value) > 0 for value in calibration[0]))
+    if args.suite == "residency":
+        success = (success
+                   and stdout.count("OWNED_D3D12_RESIDENCY_CASE validation=1 refcounts=1 "
+                                    "create_not_resident=1 priority=1") == 1
+                   and stdout.count("OWNED_D3D12_RESIDENCY_FENCE value=7 completed=7") == 1
+                   and stdout.count("OWNED_D3D12_RESIDENCY_READBACK bytes=256 checksum=0x59047300") == 1)
+    if args.suite == "core-contracts":
+        success = (success
+                   and stdout.count("OWNED_D3D12_CORE_CONTRACTS_ROOT_VALIDATION_PASS") == 1)
+    if args.suite == "resources":
+        success = (success
+                   and stdout.count("OWNED_D3D12_RESOURCES_PASS owned_backend=1 resource_contracts=1") == 1
+                   and stdout.count("OWNED_D3D12_RESOURCES_ALIASING_GPU_PASS ") == 1
+                   and stdout.count("ordered_snapshots=4 barriers=first_to_second,second_to_first "
+                                    "inheritance=bidirectional") == 1)
+    if args.suite == "buffer-rtv":
+        success = (success
+                   and stdout.count("OWNED_D3D12_BUFFER_RTV_DRAW_READBACK_PASS") == 1
+                   and stdout.count("OWNED_D3D12_BUFFER_RTV_PREDICATED_CLEAR_PASS") == 1
+                   and stdout.count("OWNED_D3D12_BUFFER_RTV_BOUNDARY_PASS") == 1)
+    if args.suite == "copy-resolve":
+        success = (success
+                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_PASS average=2.5 min=1 max=4 "
+                                    "guard=99 uav=1 aliasing=1") == 1
+                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_MSAA_PREDICATION_PASS") == 1
+                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_PREDICATE_SNAPSHOT_PASS") == 1
+                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_RGBA_PASS") == 1
+                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_DEPTH_STENCIL_PASS") == 1)
+    if args.suite == "predication-indirect":
+        dxil_compiler_loaded = native_compiler_proof
+        success = (success and dxil_compiler_loaded
+                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_CLEAR_CASES_PASS") == 1
+                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_INDIRECT_CASES_PASS") == 1
+                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_PREDICATE_SNAPSHOT_PASS "
+                                    "saved=1 source_updated=0 copy_predicated=1 resnap_skip_observed=1") == 1
+                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_TYPED_MULTILAYER_CLEARS_PASS "
+                                    "rtv=R16G16B16A16_UINT dsv=D32_FLOAT_S8X24_UINT "
+                                    "uav=R32G32B32A32_UINT layers=2 rect_preservation=1 "
+                                    "component_preservation=1 predicate_preservation=1") == 1
+                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_TYPED_FLOAT_UAV_PASS "
+                                    "format=R32G32B32A32_FLOAT layers=2 rect_preservation=1 "
+                                    "predicate_preservation=1") == 1)
+    if args.suite == "fence-events":
+        fence_rewind_cases = re.findall(r"OWNED_D3D12_FENCE_EVENTS_CASE_PASS case=([a-z0-9_]+)", stdout)
+        required_rewind_cases = {"cpu_rewind_events", "gpu_rewind_mixed"}
+        success = (success and required_rewind_cases.issubset(fence_rewind_cases)
+                   and stdout.count("case=cpu_rewind_events from=10 to=5 single=1 any=1 all=1 null=1 equal=1") == 1
+                   and stdout.count("case=gpu_rewind_mixed from=10 to=5 equal=1 gated_cpu_gpu=1 "
+                                    "competing_queues=1 api_wait_latch=1 retained=1") == 1)
     if args.suite == "ngx":
         frames = re.findall(r"OWNED_D3D12_NGX_FRAME_PASS frame=(\d+)\b", stdout)
         success = success and frames == [str(n) for n in range(8)]
@@ -725,6 +795,17 @@ def run(args: argparse.Namespace) -> int:
         dxil_compiler_loaded = native_compiler_proof
         success = (success and dxil_compiler_loaded
                    and stdout.count(DXIL_STATIC_SAMPLER_MARKER) == 1)
+    if args.suite == "dxil-texture":
+        dxil_compiler_loaded = native_compiler_proof
+        lod = re.findall(
+            r"OWNED_D3D12_DXIL_TEXTURE_LOD clamped=(-?\d+\.\d+) unclamped=(-?\d+\.\d+)", stdout)
+        success = (success and dxil_compiler_loaded
+                   and stdout.count("OWNED_D3D12_DXIL_TEXTURE_GATHER lanes=(0.000,1.000,0.000,1.000) "
+                                    "array=(0.000,1.000,1.000,0.000)") == 1
+                   and len(lod) == 1 and abs(float(lod[0][0])) <= 0.05
+                   and abs(float(lod[0][1]) + 4.0) <= 0.05
+                   and stdout.count("OWNED_D3D12_DXIL_TEXTURE_SAMPLE_POS texture=(-0.375,0.125) "
+                                    "target=(0.375,-0.125) count=4") == 1)
     if args.suite == "raytracing":
         # The DXR library is lowered by the same owned DXIL compiler that lives inside the
         # staged native module, so the run only proves the ray tracing path when that exact
@@ -792,6 +873,7 @@ def run(args: argparse.Namespace) -> int:
               "owned_native_loads": native_loads,
               "dxil_native_compiler_verified": dxil_compiler_loaded,
               "raytracing": raytracing_evidence,
+              "fence_rewind_cases": fence_rewind_cases,
               "foreign_backend_loads": foreign, "validation_errors": validation_errors,
               "backend_logs": list(backend_logs), "trace_event_count": len(trace_events),
               "temporal_analysis": temporal_analysis,

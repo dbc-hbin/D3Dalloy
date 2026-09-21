@@ -32,6 +32,7 @@ template <typename Context> struct SimpleCommandContext {
   void endPass();
   void setComputePSO(WMT::ComputePipelineState pso, WMTSize tgsize);
   void dispatch(WMTSize size);
+  void dispatchIndirect(WMT::Buffer arguments, uint64_t offset);
   void setComputeTexture(uint32_t index, const Rc<Texture> &texture, uint64_t viewId, int flags);
   void setComputeTexelBuffer(uint32_t index, const Rc<Buffer> &buffer, uint64_t viewId, int flags);
   void setComputeBuffer(uint32_t index, const Rc<Buffer> &buffer, uint32_t offset, uint32_t length, int flags);
@@ -56,6 +57,7 @@ template <typename Context> struct SimpleCommandContext {
       WMTPrimitiveType primitive, uint32_t vertex_start, uint32_t vertex_count, int32_t base_instance,
       uint32_t instance_count
   );
+  void drawIndirect(WMTPrimitiveType primitive, WMT::Buffer arguments, uint64_t offset);
 };
 
 } // namespace dxmt

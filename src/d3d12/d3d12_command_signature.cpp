@@ -32,6 +32,8 @@ struct dxmt_compute_command_data {
   ulong max_count;
   device uint * max_count_buffer;
   device char * argument_buffer;
+  device ulong * predicate;
+  uint predicate_op;
   device ulong * static_samplers;
   device ulong * rootsig_qwords;
   device char * immutable_constants;
@@ -77,6 +79,8 @@ struct dxmt_render_command_data {
   ulong max_count;
   device uint * max_count_buffer;
   device char * argument_buffer;
+  device ulong * predicate;
+  uint predicate_op;
   device ulong * static_samplers;
   device ulong * rootsig_qwords;
   device char * vertex_constants;
@@ -98,11 +102,27 @@ public:
 
   HRESULT
   Initialize(const D3D12_COMMAND_SIGNATURE_DESC *pDesc, ID3D12RootSignature *pRootSignature) {
+    if (!pDesc || !pDesc->NumArgumentDescs || !pDesc->pArgumentDescs || !pDesc->ByteStride ||
+        (pDesc->ByteStride & 3))
+      return E_INVALIDARG;
+
+    if (pRootSignature) {
+      Com<ID3D12Device> owner;
+      if (FAILED(pRootSignature->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
+          owner.ptr() != device_)
+        return E_INVALIDARG;
+      if (static_cast<MTLD3D12RootSignature *>(pRootSignature)->IsLocal)
+        return E_INVALIDARG;
+    }
+
     std::stringstream source;
     D3D12_INDIRECT_ARGUMENT_TYPE side_effect = ~(D3D12_INDIRECT_ARGUMENT_TYPE){};
     UpdateRootArguments = false;
     UpdateVertexBuffers = false;
-    uint32_t ib_index = ~-0u;
+    RootParameterMask = 0;
+    VertexBufferMask = 0;
+    uint32_t ib_index = ~0u;
+    uint64_t packed_size = 0;
 
     source << kSharedHeader;
 
@@ -115,21 +135,29 @@ public:
       switch (arg.Type) {
       case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
         side_effect = arg.Type;
+        packed_size += sizeof(D3D12_DISPATCH_ARGUMENTS);
         source << "packed_uint3 dispatch;\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: {
         side_effect = arg.Type;
+        packed_size += sizeof(D3D12_DRAW_ARGUMENTS);
         source << "d3d12_draw_arguments draw;\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: {
         side_effect = arg.Type;
+        packed_size += sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         source << "d3d12_draw_indexed_arguments draw_indexed;\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
+        if (arg.VertexBuffer.Slot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT ||
+            (VertexBufferMask & (1u << arg.VertexBuffer.Slot)))
+          return E_INVALIDARG;
+        VertexBufferMask |= 1u << arg.VertexBuffer.Slot;
         UpdateVertexBuffers = true;
+        packed_size += sizeof(D3D12_VERTEX_BUFFER_VIEW);
         source << "d3d12_vertex_buffer_view vb_" << i << ";\n";
         break;
       }
@@ -137,11 +165,15 @@ public:
         if (ib_index != ~0u)
           return E_INVALIDARG;
         ib_index = i;
+        packed_size += sizeof(D3D12_INDEX_BUFFER_VIEW);
         source << "d3d12_index_buffer_view ib;\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
+        if (!arg.Constant.Num32BitValuesToSet)
+          return E_INVALIDARG;
         UpdateRootArguments = true;
+        packed_size += sizeof(uint32_t) * arg.Constant.Num32BitValuesToSet;
         for (unsigned j = 0; j < arg.Constant.Num32BitValuesToSet; j++) {
           source << "uint constant_" << i << "_" << j << ";\n";
         }
@@ -149,16 +181,19 @@ public:
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW: {
         UpdateRootArguments = true;
+        packed_size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
         source << "ulong cb_" << i << ";\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: {
         UpdateRootArguments = true;
+        packed_size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
         source << "ulong srv_" << i << ";\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
         UpdateRootArguments = true;
+        packed_size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
         source << "ulong uav_" << i << ";\n";
         break;
       }
@@ -172,10 +207,14 @@ public:
     }
     source << "};\n\n";
 
-    if (~side_effect == 0)
+    if (~side_effect == 0 || packed_size > pDesc->ByteStride)
       return E_INVALIDARG;
     bool is_compute = side_effect == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    if ((is_compute && (UpdateVertexBuffers || ib_index != ~0u)) ||
+        (ib_index != ~0u && side_effect != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED))
+      return E_INVALIDARG;
     CommandType = side_effect;
+    ByteStride = pDesc->ByteStride;
     UpdateIndexBuffer = ib_index != ~0u;
 
     if (is_compute)
@@ -190,6 +229,8 @@ public:
 
     source << "uint count = command_data.max_count_buffer ? "
               "command_data.max_count_buffer[0] : command_data.max_count;\n";
+    source << "if (command_data.predicate && (command_data.predicate_op ? command_data.predicate[0] != 0 : "
+              "command_data.predicate[0] == 0)) count = 0;\n";
     source << "for (uint i = 0; i < command_data.max_count; i++) {\n";
     source << "device d3d12_arguments& arg = reinterpret_cast<device d3d12_arguments *>("
               "command_data.argument_buffer + i * "
@@ -201,8 +242,8 @@ public:
     }
     source << "cmd.reset();\n";
     source << "if (i >= count) continue;\n";
-    source << "device ulong * rootsig_qwords = command_data.rootsig_qwords + "
-              "(i * command_data.rootsig_qwords_stride);\n";
+    source << "device ulong * rootsig_qwords = command_data.rootsig_qwords ? command_data.rootsig_qwords + "
+              "(i * command_data.rootsig_qwords_stride) : nullptr;\n";
     if (!is_compute)
       source << "device dxmt_vertex_buffer * vertex_buffer = "
                 "reinterpret_cast<device dxmt_vertex_buffer *>(command_data.vertex_buffer + "
@@ -211,9 +252,9 @@ public:
     if (UpdateRootArguments || UpdateVertexBuffers || UpdateIndexBuffer) {
       if (!is_compute) {
         source << "cmd.set_vertex_buffer(vertex_buffer," << SM50_BINDING_INDEX_VERTEX_BUFFER << ");\n";
-        source << "cmd.set_vertex_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
+        source << "if (rootsig_qwords) cmd.set_vertex_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
         source << "cmd.set_vertex_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
-        source << "cmd.set_fragment_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
+        source << "if (rootsig_qwords) cmd.set_fragment_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
         source << "cmd.set_fragment_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS
                << ");\n";
         source << "if (command_data.vertex_constants) cmd.set_vertex_buffer(command_data.vertex_constants,"
@@ -221,7 +262,7 @@ public:
         source << "if (command_data.fragment_constants) cmd.set_fragment_buffer(command_data.fragment_constants,"
                << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS << ");\n";
       } else {
-        source << "cmd.set_kernel_buffer(rootsig_qwords, " << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
+        source << "if (rootsig_qwords) cmd.set_kernel_buffer(rootsig_qwords, " << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
         source << "cmd.set_kernel_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
         source << "if (command_data.immutable_constants) cmd.set_kernel_buffer(command_data.immutable_constants,"
                << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS << ");\n";
@@ -278,8 +319,13 @@ public:
         if (!pRootSignature)
           return E_INVALIDARG;
         auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-        if (parameter_index >= rootsig->ParameterSlots)
+        if (parameter_index >= rootsig->ParameterSlots || parameter_index >= 64 ||
+            rootsig->ParameterTypes[parameter_index] != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
+            arg.Constant.DestOffsetIn32BitValues > rootsig->ParameterConstantCounts[parameter_index] ||
+            arg.Constant.Num32BitValuesToSet >
+                rootsig->ParameterConstantCounts[parameter_index] - arg.Constant.DestOffsetIn32BitValues)
           return E_INVALIDARG;
+        RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         for (unsigned j = 0; j < arg.Constant.Num32BitValuesToSet; j++) {
           source << "reinterpret_cast<device uint *>(rootsig_qwords + " << offset << ")["
@@ -292,8 +338,10 @@ public:
         if (!pRootSignature)
           return E_INVALIDARG;
         auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-        if (parameter_index >= rootsig->ParameterSlots)
+        if (parameter_index >= rootsig->ParameterSlots || parameter_index >= 64 ||
+            rootsig->ParameterTypes[parameter_index] != D3D12_ROOT_PARAMETER_TYPE_CBV)
           return E_INVALIDARG;
+        RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         source << "rootsig_qwords[" << offset << "] = arg.cb_" << i << ";\n";
         break;
@@ -303,8 +351,10 @@ public:
         if (!pRootSignature)
           return E_INVALIDARG;
         auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-        if (parameter_index >= rootsig->ParameterSlots)
+        if (parameter_index >= rootsig->ParameterSlots || parameter_index >= 64 ||
+            rootsig->ParameterTypes[parameter_index] != D3D12_ROOT_PARAMETER_TYPE_SRV)
           return E_INVALIDARG;
+        RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         source << "rootsig_qwords[" << offset << "] = arg.srv_" << i << ";\n";
         break;
@@ -314,8 +364,10 @@ public:
         if (!pRootSignature)
           return E_INVALIDARG;
         auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-        if (parameter_index >= rootsig->ParameterSlots)
+        if (parameter_index >= rootsig->ParameterSlots || parameter_index >= 64 ||
+            rootsig->ParameterTypes[parameter_index] != D3D12_ROOT_PARAMETER_TYPE_UAV)
           return E_INVALIDARG;
+        RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         source << "rootsig_qwords[" << offset << "] = arg.uav_" << i << ";\n";
         break;
@@ -390,6 +442,11 @@ CreateCommandSignature(
     MTLD3D12Device *pDevice, const D3D12_COMMAND_SIGNATURE_DESC *pDesc, ID3D12RootSignature *pRootSignature,
     REFIID riid, void **ppCommandSignature
 ) {
+  if (!ppCommandSignature)
+    return E_POINTER;
+  *ppCommandSignature = nullptr;
+  if (!pDesc)
+    return E_INVALIDARG;
   auto sig = Com(new MTLD3D12CommandSignatureImpl(pDevice));
   HRESULT hr = sig->Initialize(pDesc, pRootSignature);
   if (FAILED(hr))

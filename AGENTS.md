@@ -1,28 +1,105 @@
-# dxmt-dx12 에이전트 지침
+# Repository Guidelines
 
-## 작업 기준
+## Project Overview
 
-- 현재 소스는 이 저장소 루트다. `src/`를 직접 수정하고 README.md의 Meson 명령으로 빌드한다.
-- `graphics-translator/patches/`와 `upstream.lock.json`은 import 당시 provenance다. 편집 대상이 아니며, 루트 소스를 바꿀 때 다시 패치로 역수출하지 않는다.
-- `scripts/build-owned-graphics.py`는 frozen baseline 재현용이다. 현재 코드 빌드에 사용하지 않는다.
-- `include/native/directx`, `external/nvapi`는 vendored dependency다. revision을 임의로 바꾸지 않는다.
-- 변경 범위는 요청에 한정한다. 관련 없는 리팩터링, 새 추상화, telemetry, 호환 shim을 덧붙이지 않는다.
+DXMT-based D3D12-to-Metal translator for Wine on macOS, with an owned DXIL/DXBC-to-AIR/metallib compiler. D3D10/11, DXGI, NVAPI, and NGX support share the runtime. No GPTK/D3DMetal, Apple Metal Shader Converter, or SPIR-V fallback.
 
-## 금지
+Edit root `src/` directly. `README.md` describes the current workflow; `graphics-translator/patches/`, its upstream lock, and `docs/provenance/` preserve the frozen import baseline. Do not regenerate current sources with `scripts/build-owned-graphics.py` or export changes back into historical patches.
 
-- 게임 설치 디렉터리, live Wine prefix, 사용자 런처 runtime을 수정하지 않는다. staging과 GPU 검증은 caller가 지정한 **새 runtime 복사본**과 **전용 prefix**에서만 한다.
-- 외부 D3DMetal/GPTK/D3DShared, Apple Metal Shader Converter, SPIR-V 경로를 fallback으로 추가하지 않는다. 번역기와 DXIL compiler는 자체 구현을 유지한다.
-- 근거 없이 게임 렌더링/호환성을 주장하지 않는다. fixture 성공은 D3D12 conformance가 아니며 RaytracingTier 0을 지원 완료로 표현하지 않는다.
+## Architecture & Data Flow
 
-## 검증
+- **API/device:** exported DLL entry points validate arguments, obtain a DXMT DXGI adapter, and construct an API-specific COM device over the shared backend.
+- **D3D12 execution:** command lists record typed encoder passes and command records; `Close` seals recording. Queue-local FIFO tasks (`Execute`, `Signal`, `Wait`, `Present`) retain submission ownership and feed a submission thread. A second thread retires Metal completions in order through `SubmissionRing<32>`. D3D11 uses the separate shared `src/dxmt` encoder/dependency-tracking path.
+- **Shaders:** `src/airconv` parses bytecode, lowers DXIL in place using per-compilation `ModuleInfo`, validates it, and emits AIR/metallib. Mutable LLVM IR must remain local to one compilation/context.
+- **Metal boundary:** Windows WineMetal wrappers send POD parameters through numbered `WINE_UNIX_CALL`s to native Metal handlers. Change wrappers, parameter layouts, call indexes, handlers, and call tables together.
+- **NGX/NVAPI:** translation facades use private DXMT interfaces rather than independent renderers. Preserve cross-DLL ABI contracts.
+- **D3D12 fences:** logical values can rewind; GPU signals use independent monotonic native tokens. Waits latch qualifying completion at API registration or afterward. Consumer workers wait for actual completion, not just producer commit; API callers remain asynchronous. D3D11 retains its separate native fence path.
 
-- CPU/tooling: `python3 scripts/test-owned-graphics-build.py`, `test-owned-graphics-staging.py`, `test-owned-graphics-diagnostics.py`.
-- GPU: 새 runtime을 stage한 뒤 `python3 scripts/test-owned-graphics.py --runtime <runtime> --suite <suite> --fixture <exe> --out <새 디렉터리> --validation`. Runner는 기존 `--out`을 거부하므로 evidence는 항상 새 경로에 남긴다.
-- Metal API/GPU/Shader validation 오류, 비정상 command completion, 외부 D3DMetal/`libd3dshared` 로드는 실패다. stdout 성공 문자열만으로 PASS가 되지 않는다.
-- 동작 변경은 affected suite를 실제 실행해 확인한다. 통과한 검증을 이유 없이 반복하지 않는다.
+## Key Directories
 
-## 소스 규칙
+| Path | Responsibility |
+| --- | --- |
+| `src/d3d12/` | Devices, queues/lists, resources, descriptors, PSOs/cache, queries, temporal scaling, DXR |
+| `src/airconv/` | Shader conversion, LLVM lowering, AIR/metallib output |
+| `src/dxmt/`, `src/dxgi/` | Shared renderer, dependency tracking, adapters, presentation |
+| `src/winemetal/` | Windows/native Metal bridge; native handlers under `unix/` |
+| `src/d3d10/`, `src/d3d11/`, `src/nvapi/`, `src/nvngx/` | Other API frontends and compatibility facades |
+| `src/util/` | COM/reference ownership, Wine-aware threading, logging, configuration |
+| `graphics-translator/tests/` | D3D12 fixture executables, standalone CPU probes, frozen DXIL inputs |
+| `scripts/` | Build/staging regressions, isolated runtime staging, GPU evidence runners |
+| `include/native/`, `external/`, `libs/` | Vendored headers and libraries; not submodules |
 
-- MSL/AIR/metallib 공용 계약을 바꾸면 PE caller, Unix thunk, native consumer를 같은 header로 함께 재빌드한다. module 단독 교체는 ABI 불일치다.
-- cache format, unix call 번호, module UUID 검사를 바꾸면 관련 검증기와 문서를 같은 변경에서 갱신한다.
-- native module은 `@loader_path`로 재배치 가능해야 한다. build-tree absolute `LC_RPATH`를 install 결과에 남기지 않는다.
+## Development Commands
+
+Run from the repository root with the prerequisites below. Configure a fresh build directory once; subsequently rerun Ninja and install.
+
+```sh
+export LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin
+export PATH="$LLVM_MINGW:$PWD/toolchains/tools/bin:$PATH"
+export CC_FOR_BUILD=/usr/bin/clang CXX_FOR_BUILD=/usr/bin/clang++
+meson setup build/local/build . --cross-file build-win64.txt \
+  --prefix "$PWD/build/local/install" --buildtype debugoptimized \
+  -Dwine_builtin_dll=true -Denable_d3d12=true \
+  -Denable_nvapi=true -Denable_nvngx=true \
+  -Dnative_llvm_path=toolchains/llvm-15 \
+  -Dwine_install_path=toolchains/wine-sdk
+ninja -C build/local/build -j8
+meson install -C build/local/build --no-rebuild
+
+python3 scripts/test-owned-graphics-build.py
+python3 scripts/test-owned-graphics-staging.py
+python3 scripts/test-owned-graphics-diagnostics.py
+# Requires a configured cross build and llvm-mingw:
+python3 scripts/test-owned-ngx-frontend.py
+```
+
+There is no configured lint target or general application `run` command. Respect applicable `.clang-format` files; do not invent `ninja lint` or package-manager commands.
+
+For GPU execution, first stage a **new** runtime:
+
+```sh
+python3 scripts/stage-owned-graphics.py stage \
+  --dxmt-install build/local/install --wine-source toolchains/wine-runtime \
+  --wine-dest build/local/runtime --with-nvapi --with-nvngx
+```
+
+Compile the selected fixture using the recipe in `README.md`, then run, for example:
+
+```sh
+python3 scripts/test-owned-graphics.py --runtime build/local/runtime \
+  --suite pipeline-cache --fixture build/local/pipeline-cache.exe \
+  --out build/local/cache-proof --validation
+```
+
+Runtime destinations and evidence output directories must be fresh. Never install DLLs into an existing game or live Wine prefix; use a copied runtime and dedicated prefix.
+
+## Code Conventions & Common Patterns
+
+- C++20; preserve subsystem style. D3D12 formatting uses 2 spaces, no tabs, 120 columns; root formatting disables include sorting. Types/API functions use PascalCase, implementations often end in `Impl`, and locals/members commonly use snake_case. Keep Microsoft ABI spelling intact.
+- Use existing ownership types: `Com<T>` for COM, `Rc<T>` for shared DXMT objects, `WMT::Reference<T>` for Metal handles, and standard smart pointers where already established. Deferred tasks must retain owners until GPU retirement; CPU publication is not GPU completion.
+- API boundaries initialize output pointers and return contract-appropriate `HRESULT`s. Void recording methods retain the first recording error. Airconv is exception-free: propagate or consume `llvm::Error`/`llvm::Expected<T>`. Do not use aborting `IMPLEMENT_ME` for normal unsupported API requests.
+- Preserve queue acquire/release publication, stable record storage, backpressure, and shutdown order: close FIFO, join submitter, retire published GPU work, publish stop sentinel, join completion thread. Use `dxmt::thread`/mutex wrappers where Wine initialization matters; respect AppKit main-thread dispatch.
+- Dependencies flow through COM/private interfaces and constructors. Keep state explicit in device/list/allocator objects; configuration singletons are module-local, not process-global across DLLs. Reuse `TRACE`, `DEBUG`, `WARN`, `ERR`, and structured lifecycle tracing.
+
+## Important Files
+
+- `meson.build`, `meson.options`, `src/meson.build`: build composition and feature gates. `build-win64.txt` is the documented cross configuration; win32 and ARM64EC alternatives also exist.
+- `src/d3d12/d3d12.cpp`, `src/d3d11/d3d11.cpp`, and adjacent `.def` files: public entry points/exports.
+- `src/d3d12/d3d12_interfaces.hpp`: private cross-DLL temporal ABI. `owned_submission_ring.hpp`, `owned_queue_task_fifo.hpp`, and `owned_rtas_lifetime.hpp` in that directory document concurrency/lifetime invariants.
+- `src/airconv/airconv_public.h`, `src/airconv/dxil_converter.hpp`: compiler ABI and lowering contract.
+- `dxmt.conf`, `docs/CUSTOMIZATION.md`: configuration, including `DXMT_CONFIG_FILE`/`DXMT_CONFIG`. `docs/DEVELOPMENT.md`: debugging background; prefer root README build instructions over older recipes.
+- `CONTRIBUTING.md`: semantic commit subjects and legal-name sign-off; it prohibits AI/LLM-authored or co-authored contributions. Do not assume generated changes are eligible for an upstream PR.
+
+## Runtime/Tooling Preferences
+
+Supported local stack: macOS Xcode/Metal tools, Python 3, Meson 1.10.0, Ninja 1.13 family, llvm-mingw clang 22.1.8, x86_64 native LLVM 15.0.7 static libraries, and an installed Wine SDK. Apple Silicon needs Rosetta for this x86_64 Wine path. Meson's declared minimum is 1.3.0, not the documented toolchain version.
+
+Keep local dependencies under ignored `toolchains/` and outputs under `build/`. Use relative `-Dnative_llvm_path=toolchains/llvm-15` to avoid the documented absolute-path handling issue. No Node/Bun runtime or language package manager is required. `.clangd` points at `build/`; explicitly select `build/local/build` as the compilation-database directory when needed.
+
+## Testing & QA
+
+- The three graphics build/staging/diagnostics scripts above use Python stdlib `unittest`; NGX frontend validation separately checks PE exports and MSVC parameter-facade ABI without GPU execution.
+- `-Denable_tests=true` builds manual DX11 samples under `tests/dx11/`; it registers no Meson `test()` cases. `meson test` is not the project regression suite.
+- D3D12 fixtures use `scripts/test-owned-graphics.py`; select the affected suite and enable Metal validation. The runner verifies staged modules, rejects foreign backends/validation errors, and preserves evidence. Standalone `*.test.cpp` files are manual CPU probes, not automatically discovered tests.
+- `scripts/test-owned-metallib.py` and `scripts/test-owned-null-descriptor.py` are native GPU probes requiring built compiler artifacts and Metal tooling.
+- No numeric coverage threshold is configured. Verify the changed behavioral contract; fixture success is not general D3D12/DXR conformance or real-game compatibility. `CreatePipelineLibrary` remains unsupported; do not confuse implemented cached PSO blobs with native Metal pipeline archives.

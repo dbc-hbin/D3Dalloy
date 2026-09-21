@@ -59,14 +59,19 @@ active entry만 제거한다. token address는 session 중 재사용하지 않�
 이 strict 범위는 기능을 조용히 무시하지 않는다. flags74 밖의 public MetalFX 확장이 backend/WMT에 추가되면 frontend
 거부 조건을 개별적으로 해제해야 한다.
 
-CPU/PE 검증은 `scripts/test-owned-ngx-frontend.py`가 담당한다. pinned llvm-mingw로 `nvngx.cpp`와
-`nvngx_d3d12.cpp`를 `-Werror` compile하고, parameter facade는 MSVC target으로 별도 compile한 뒤 기존 owned cross build의 DXGI/util/winemetal import/static library에 함께 링크한다.
-GPU나 D3D12 device를 만들지 않는다. 생성 PE에서 기존 D3D11 exports, 새 D3D12 exports, `own-ngxd3d12` literal marker,
-shared COM header 동일성, StructSize 설정, `ValidateRecording`, private D3DMetal ABI 부재를 검사한다. MSVC object에는
-`??_7OwnedNgxParameterFacade@@6B@` vftable symbol이 실제로 생성되는지 확인하고, D3D12 failure return constant도
-공식 `0xBAD0000x` 값을 사용하는지 검사한다. 추가로 official NVIDIA header를 MSVC target으로 compile한 기존
-`ngx-smoke-msvc.cpp`의 virtual call offset과 facade `.rdata` relocation을 비교한다. 현재 확인된 대표 slot은
-`Set(D3D12Resource*)=0x08`, `Set(float)=0x30`, `Get(D3D12Resource**)=0x48`, `Get(float)=0x70`, `Reset=0x80`이며 모두 일치한다.
+CPU/PE 검증은 `scripts/test-owned-ngx-frontend.py`가 담당한다. 현재 루트 소스의 `src/nvngx/nvngx.cpp`와
+`src/nvngx/nvngx_d3d12.cpp`를 pinned llvm-mingw로 `-Werror` compile하고, parameter facade는 MSVC target으로 별도
+compile한 뒤 현재 Meson cross build(`build/local/build`)의 DXGI/util/winemetal import/static library에 함께 링크한다.
+GPU나 D3D12 device를 만들지 않는다. 생성 PE에서 기존 D3D11 export 15개, 새 D3D12 export 16개와 `own-ngxd3d12`
+literal marker를 검사한다. MSVC object에서는 `??_7OwnedNgxParameterFacade@@6B@` vftable이 실제로 생성되고 공식
+8 Set + 8 Get + Reset slot을 모두 채우는지 확인한다. 이어서 `external/nvngx/include`의 official NVIDIA header로
+`graphics-translator/tests/owned-ngx-parameter-consumer-msvc.cpp`를 MSVC target compile하고, 그 object가 내는
+virtual call offset을 facade `.rdata` relocation과 대조한다. 즉 slot offset의 출처는 공식 header 하나뿐이며,
+양쪽이 같은 slot에서 같은 parameter type을 요구해야 PASS다.
+
+official header는 저장소에 `external/nvngx/include/{nvsdk_ngx.h,nvsdk_ngx_params.h,nvsdk_ngx_defs.h}`로 고정
+snapshot을 두고 `external/nvngx/LICENSE.txt`를 함께 보존한다. 다른 SDK 설치본을 쓰려면 `--nvidia-include` 또는
+`NGX_SDK_INCLUDE`로 지정한다.
 
 이 CPU/PE PASS는 실제 ZZZ/Streamline loader가 owned `nvngx.dll`을 선택한다는 증명이 아니다. Runtime에서는 Prime이
 loader identity, D3D12 NGX calls, queue execution과 MetalFX encode를 별도로 관측해야 한다.

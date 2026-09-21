@@ -17,6 +17,7 @@
  */
 
 #include "d3d12_device.hpp"
+#include "d3d12_resource_contract.hpp"
 #include "util_bit.hpp"
 
 namespace dxmt {
@@ -276,6 +277,8 @@ constexpr D3D12_RESOURCE_STATES kExclusiveWrite =
 
 HRESULT
 ValidateResourceStates(D3D12_RESOURCE_STATES State, const D3D12_HEAP_PROPERTIES *pHeapProps) {
+  if (!pHeapProps)
+    return E_INVALIDARG;
   if (State & kExclusiveWrite) {
     if (State & ~kExclusiveWrite)
       return E_INVALIDARG;
@@ -284,11 +287,14 @@ ValidateResourceStates(D3D12_RESOURCE_STATES State, const D3D12_HEAP_PROPERTIES 
   }
 
   switch (pHeapProps->Type) {
-  case D3D12_HEAP_TYPE_READBACK: {
-    if (State != D3D12_RESOURCE_STATE_COPY_DEST && State != D3D12_RESOURCE_STATE_COMMON)
+  case D3D12_HEAP_TYPE_UPLOAD:
+    if (State != D3D12_RESOURCE_STATE_GENERIC_READ)
       return E_INVALIDARG;
     break;
-  }
+  case D3D12_HEAP_TYPE_READBACK:
+    if (State != D3D12_RESOURCE_STATE_COPY_DEST)
+      return E_INVALIDARG;
+    break;
   default:
     break;
   }
@@ -311,6 +317,17 @@ IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps) {
 
 HRESULT
 ValidateResourceDescs(const D3D12_RESOURCE_DESC *pDesc, const D3D12_HEAP_PROPERTIES *pHeapProps) {
+  if (!pDesc || !pHeapProps || !pDesc->Width || !pDesc->Height || !pDesc->DepthOrArraySize ||
+      !pDesc->SampleDesc.Count || pDesc->SampleDesc.Quality)
+    return E_INVALIDARG;
+
+  if ((pDesc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+      (pDesc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+    return E_INVALIDARG;
+  if ((pDesc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+      (pDesc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+    return E_INVALIDARG;
+
   auto HeapType = pHeapProps->Type;
   switch (HeapType) {
   case D3D12_HEAP_TYPE_UPLOAD: {
@@ -340,13 +357,30 @@ ValidateResourceDescs(const D3D12_RESOURCE_DESC *pDesc, const D3D12_HEAP_PROPERT
 
   switch (pDesc->Dimension) {
   case D3D12_RESOURCE_DIMENSION_BUFFER: {
-    if (pDesc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)
+    if (pDesc->Height != 1 || pDesc->DepthOrArraySize != 1 || pDesc->MipLevels != 1 ||
+        pDesc->Format != DXGI_FORMAT_UNKNOWN || pDesc->SampleDesc.Count != 1 ||
+        pDesc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR ||
+        (pDesc->Alignment && pDesc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) ||
+        (pDesc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                         D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)))
       return E_INVALIDARG;
     break;
   }
   case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
   case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
   case D3D12_RESOURCE_DIMENSION_TEXTURE3D: {
+    if (pDesc->Format == DXGI_FORMAT_UNKNOWN ||
+        (pDesc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && pDesc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR))
+      return E_INVALIDARG;
+    if (pDesc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+        (pDesc->Height != 1 || pDesc->SampleDesc.Count != 1))
+      return E_INVALIDARG;
+    if (pDesc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && pDesc->SampleDesc.Count != 1)
+      return E_INVALIDARG;
+    if (pDesc->SampleDesc.Count > 1 &&
+        (pDesc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || pDesc->MipLevels != 1 ||
+         pDesc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN))
+      return E_INVALIDARG;
     if (pDesc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
       break;
     if (pDesc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
@@ -362,14 +396,30 @@ ValidateResourceDescs(const D3D12_RESOURCE_DESC *pDesc, const D3D12_HEAP_PROPERT
     break;
   }
   default:
-    break;
+    return E_INVALIDARG;
   }
 
   return S_OK;
 }
 
 HRESULT
+ValidateOptimizedClearValue(const D3D12_RESOURCE_DESC *pDesc, const D3D12_CLEAR_VALUE *optimized_clear_value) {
+  if (!pDesc)
+    return E_INVALIDARG;
+  if (!optimized_clear_value)
+    return S_OK;
+  if (pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+      !(pDesc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) ||
+      optimized_clear_value->Format == DXGI_FORMAT_UNKNOWN ||
+      !resource_contract::AreCopyCompatibleFormats(pDesc->Format, optimized_clear_value->Format))
+    return E_INVALIDARG;
+  return S_OK;
+}
+
+HRESULT
 ValidateHeapProperties(const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS Flags, bool AdapterIsNUMA) {
+  if (!pHeapProps || pHeapProps->CreationNodeMask > 1 || pHeapProps->VisibleNodeMask > 1)
+    return E_INVALIDARG;
   switch (pHeapProps->Type) {
   case D3D12_HEAP_TYPE_DEFAULT:
   case D3D12_HEAP_TYPE_READBACK: {

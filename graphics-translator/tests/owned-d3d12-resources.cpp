@@ -83,6 +83,62 @@ D3D12_RESOURCE_DESC texture2DDesc(DXGI_FORMAT format, UINT width, UINT height, U
   return desc;
 }
 
+void testResourceContracts(ID3D12Device* device) {
+  const auto props = defaultHeap();
+  auto buffer = bufferDesc(4096);
+
+  // Validation-only creation must not allocate and must still reject malformed input.
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &buffer,
+                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         S_FALSE, "validation-only buffer");
+  auto badBuffer = buffer;
+  badBuffer.Height = 2;
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &badBuffer,
+                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "invalid buffer shape");
+  D3D12_CLEAR_VALUE bufferClear{};
+  bufferClear.Format = DXGI_FORMAT_R32_UINT;
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &buffer,
+                                         D3D12_RESOURCE_STATE_COMMON, &bufferClear,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "buffer optimized clear");
+
+  auto color = texture2DDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 3, 2, 1, 1,
+                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+  D3D12_CLEAR_VALUE clear{};
+  clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &color,
+                                         D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
+                                         __uuidof(ID3D12Resource), nullptr),
+         S_FALSE, "validation-only optimized clear");
+  clear.Format = DXGI_FORMAT_R32_FLOAT;
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &color,
+                                         D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "incompatible optimized clear");
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  UINT rows = 0;
+  UINT64 rowBytes = 0;
+  UINT64 totalBytes = 0;
+  device->GetCopyableFootprints(&color, 0, 1, 7, &footprint, &rows, &rowBytes, &totalBytes);
+  if (footprint.Offset != D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT ||
+      footprint.Footprint.RowPitch != D3D12_TEXTURE_DATA_PITCH_ALIGNMENT ||
+      rows != 2 || rowBytes != 12 || totalBytes != 773)
+    fail("GetCopyableFootprints alignment");
+
+  auto invalid = color;
+  invalid.Width = 0;
+  const auto invalidInfo = device->GetResourceAllocationInfo(0, 1, &invalid);
+  if (invalidInfo.SizeInBytes != ~0ull || invalidInfo.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+    fail("GetResourceAllocationInfo invalid sentinel");
+  const auto emptyInfo = device->GetResourceAllocationInfo(0, 0, nullptr);
+  if (emptyInfo.SizeInBytes || emptyInfo.Alignment)
+    fail("GetResourceAllocationInfo empty");
+}
+
 void testPlacedAlignment(ID3D12Device* device) {
   D3D12_HEAP_DESC heapDesc{};
   heapDesc.SizeInBytes = 4ull * 1024ull * 1024ull;
@@ -306,6 +362,94 @@ ComPtr<ID3D12Resource> createHostBuffer(ID3D12Device* device, UINT64 bytes, D3D1
   return resource;
 }
 
+
+void testOverlappingPlacedResourceAliasing(ID3D12Device* device) {
+  constexpr UINT64 bytes = 64 * 1024;
+  const auto description = bufferDesc(bytes);
+  const auto allocation = device->GetResourceAllocationInfo(0, 1, &description);
+  if (!allocation.SizeInBytes || allocation.SizeInBytes == ~0ull || !allocation.Alignment)
+    fail("GetResourceAllocationInfo(alias buffers)");
+
+  D3D12_HEAP_DESC heapDesc{};
+  heapDesc.SizeInBytes = allocation.SizeInBytes;
+  heapDesc.Properties = defaultHeap();
+  heapDesc.Alignment = allocation.Alignment;
+  heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  ComPtr<ID3D12Heap> heap;
+  check(device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap(alias buffers)");
+
+  ComPtr<ID3D12Resource> first;
+  ComPtr<ID3D12Resource> second;
+  check(device->CreatePlacedResource(heap.Get(), 0, &description, D3D12_RESOURCE_STATE_COPY_DEST,
+                                     nullptr, IID_PPV_ARGS(&first)), "CreatePlacedResource(alias first)");
+  check(device->CreatePlacedResource(heap.Get(), 0, &description, D3D12_RESOURCE_STATE_COPY_DEST,
+                                     nullptr, IID_PPV_ARGS(&second)), "CreatePlacedResource(alias second)");
+
+  auto firstUpload = createHostBuffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD,
+                                      D3D12_RESOURCE_STATE_GENERIC_READ,
+                                      "CreateCommittedResource(alias first upload)");
+  auto secondUpload = createHostBuffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD,
+                                       D3D12_RESOURCE_STATE_GENERIC_READ,
+                                       "CreateCommittedResource(alias second upload)");
+  auto readback = createHostBuffer(device, bytes * 4, D3D12_HEAP_TYPE_READBACK,
+                                   D3D12_RESOURCE_STATE_COPY_DEST,
+                                   "CreateCommittedResource(alias readback)");
+  UINT8* mapped = nullptr;
+  check(firstUpload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map(alias first upload)");
+  for (UINT64 i = 0; i < bytes; ++i)
+    mapped[i] = static_cast<UINT8>((i * 17 + 0x21) & 0xff);
+  firstUpload->Unmap(0, nullptr);
+  check(secondUpload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map(alias second upload)");
+  for (UINT64 i = 0; i < bytes; ++i)
+    mapped[i] = static_cast<UINT8>((i * 29 + 0x93) & 0xff);
+  secondUpload->Unmap(0, nullptr);
+
+  CopyContext commands(device);
+  commands.list->CopyBufferRegion(first.Get(), 0, firstUpload.Get(), 0, bytes);
+  transition(commands.list.Get(), first.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  commands.list->CopyBufferRegion(readback.Get(), 0, first.Get(), 0, bytes);
+
+  D3D12_RESOURCE_BARRIER aliasBarrier{};
+  aliasBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+  aliasBarrier.Aliasing.pResourceBefore = first.Get();
+  aliasBarrier.Aliasing.pResourceAfter = second.Get();
+  commands.list->ResourceBarrier(1, &aliasBarrier);
+  transition(commands.list.Get(), second.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  commands.list->CopyBufferRegion(readback.Get(), bytes, second.Get(), 0, bytes);
+
+  transition(commands.list.Get(), second.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+             D3D12_RESOURCE_STATE_COPY_DEST);
+  commands.list->CopyBufferRegion(second.Get(), 0, secondUpload.Get(), 0, bytes);
+  transition(commands.list.Get(), second.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  commands.list->CopyBufferRegion(readback.Get(), bytes * 2, second.Get(), 0, bytes);
+
+  aliasBarrier.Aliasing.pResourceBefore = second.Get();
+  aliasBarrier.Aliasing.pResourceAfter = first.Get();
+  commands.list->ResourceBarrier(1, &aliasBarrier);
+  commands.list->CopyBufferRegion(readback.Get(), bytes * 3, first.Get(), 0, bytes);
+  commands.submit();
+
+  D3D12_RANGE readRange{0, static_cast<SIZE_T>(bytes * 4)};
+  mapped = nullptr;
+  check(readback->Map(0, &readRange, reinterpret_cast<void**>(&mapped)), "Map(alias readback)");
+  for (UINT64 i = 0; i < bytes; ++i) {
+    const UINT8 expectedFirst = static_cast<UINT8>((i * 17 + 0x21) & 0xff);
+    const UINT8 expectedSecond = static_cast<UINT8>((i * 29 + 0x93) & 0xff);
+    if (mapped[i] != expectedFirst || mapped[bytes + i] != expectedFirst ||
+        mapped[bytes * 2 + i] != expectedSecond || mapped[bytes * 3 + i] != expectedSecond)
+      fail("overlapping placed-resource alias inheritance mismatch");
+  }
+  D3D12_RANGE writtenRange{0, 0};
+  readback->Unmap(0, &writtenRange);
+
+  std::printf("OWNED_D3D12_RESOURCES_ALIASING_GPU_PASS heap_bytes=%llu overlap_offset=0 write_bytes=%llu ordered_snapshots=4 barriers=first_to_second,second_to_first inheritance=bidirectional\n",
+              static_cast<unsigned long long>(allocation.SizeInBytes),
+              static_cast<unsigned long long>(bytes));
+}
+
 void testBlockCompressedTailCopy(ID3D12Device* device) {
   // A 4x4 BC1 texture's tail mip is 2x2: one 8-byte block. GetCopyableFootprints
   // still pads that footprint to the 4x4 copy block, so a copy of the tail with a
@@ -389,10 +533,12 @@ int main() {
   ComPtr<ID3D12Device> device;
   check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
         "D3D12CreateDevice");
+  testResourceContracts(device.Get());
   testPlacedAlignment(device.Get());
   testTypelessDepthViews(device.Get());
   testBufferDescriptors(device.Get());
+  testOverlappingPlacedResourceAliasing(device.Get());
   testBlockCompressedTailCopy(device.Get());
-  std::puts("OWNED_D3D12_RESOURCES_PASS owned_backend=1 placed_alignment=1 depth_planes=1 mip_array_views=1 typed_buffer_descriptors=1 null_descriptors=1 bc_tail_copy=1");
+  std::puts("OWNED_D3D12_RESOURCES_PASS owned_backend=1 resource_contracts=1 placed_alignment=1 depth_planes=1 mip_array_views=1 typed_buffer_descriptors=1 null_descriptors=1 bc_tail_copy=1");
   return 0;
 }

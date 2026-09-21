@@ -119,14 +119,18 @@ void
 Buffer::prepareAllocationViews(BufferAllocation *allocation) {
   std::unique_lock<dxmt::mutex> lock(mutex_);
   for (unsigned version = allocation->version_; version < version_; version++) {
-    auto format = viewDescriptors_[version].format;
+    const auto &descriptor = viewDescriptors_[version];
+    auto format = descriptor.format;
     auto texel_size = MTLGetTexelSize(format);
     assert(texel_size);
     assert(!(allocation->suballocation_size_ & (texel_size - 1)));
     auto total_length = allocation->suballocation_size_ * allocation->suballocation_count_;
+    const uint64_t view_offset = descriptor.byteOffset;
+    const uint64_t view_length = descriptor.byteLength ? descriptor.byteLength : total_length;
+    assert(view_offset <= total_length && view_length <= total_length - view_offset);
     WMTTextureInfo info;
     info.type = WMTTextureTypeTextureBuffer;
-    info.width = total_length / (uint64_t)texel_size;
+    info.width = view_length / (uint64_t)texel_size;
     info.height = 1;
     info.depth = 1;
     info.array_length = 1;
@@ -135,8 +139,10 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     info.pixel_format = format;
     info.options = allocation->info_.options;
     auto usage = WMTTextureUsageShaderRead;
-    if (!allocation->flags().test(BufferAllocationFlag::GpuReadonly) &&
-       ( allocation->flags().test(BufferAllocationFlag::GpuManaged) ||  allocation->flags().test(BufferAllocationFlag::GpuPrivate))) {
+    if (descriptor.writable ||
+        (!allocation->flags().test(BufferAllocationFlag::GpuReadonly) &&
+         (allocation->flags().test(BufferAllocationFlag::GpuManaged) ||
+          allocation->flags().test(BufferAllocationFlag::GpuPrivate)))) {
       usage |= WMTTextureUsageShaderWrite;
       if (format == WMTPixelFormatR32Uint || format == WMTPixelFormatR32Sint ||
           (format == WMTPixelFormatRG32Uint && device_.supportsFamily(WMTGPUFamilyApple8))) {
@@ -145,21 +151,30 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     }
     info.usage = usage;
 
-    auto view = allocation->obj_.newTexture(info, 0, total_length);
+    auto view = allocation->obj_.newTexture(info, view_offset, view_length);
 
     allocation->cached_view_.push_back(std::make_unique<BufferView>(
-        std::move(view), info.gpu_resource_id, allocation->suballocation_size_ / texel_size
+        std::move(view), info.gpu_resource_id, view_length / texel_size
     ));
   }
   allocation->version_ = version_;
 };
+
+BufferViewDescriptor
+Buffer::viewDescriptor(BufferViewKey key) {
+  std::unique_lock<dxmt::mutex> lock(mutex_);
+  return viewDescriptors_[key.index];
+}
 
 BufferViewKey
 Buffer::createView(BufferViewDescriptor const &descriptor) {
   std::unique_lock<dxmt::mutex> lock(mutex_);
   unsigned i = 0;
   for (; i < version_; i++) {
-    if (viewDescriptors_[i].format == descriptor.format) {
+    if (viewDescriptors_[i].format == descriptor.format &&
+        viewDescriptors_[i].byteOffset == descriptor.byteOffset &&
+        viewDescriptors_[i].byteLength == descriptor.byteLength &&
+        viewDescriptors_[i].writable == descriptor.writable) {
       return BufferViewKey(i, std::nullopt);
     }
   }

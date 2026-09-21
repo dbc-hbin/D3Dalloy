@@ -149,12 +149,46 @@ public:
     }
 
     if (view_format != uint_format) {
-      BufferViewDescriptor view;
-      view.format = uint_format;
-      clearing_view_ = buffer->createView(view);
+      auto descriptor = buffer->viewDescriptor(view);
+      descriptor.format = uint_format;
+      descriptor.writable = true;
+      clearing_view_ = buffer->createView(descriptor);
     }
 
     setClearColor(color, view_format);
+    ctx_.setComputePSO(cs_clear_tbuffer_uint_, {32, 1, 1});
+  }
+
+  void
+  beginRenderTarget(
+      const std::array<float, 4> &color, Buffer *buffer, BufferViewKey view, const BufferSlice &range,
+      WMTPixelFormat format
+  ) {
+    if (!IsIntegerFormat(format)) {
+      begin(color, buffer, view);
+      return;
+    }
+
+    std::array<uint32_t, 4> integer_color;
+    if (MTLGetUnsignedIntegerFormat(format) == format) {
+      for (size_t i = 0; i < integer_color.size(); i++)
+        integer_color[i] = uint32_t(color[i]);
+    } else {
+      for (size_t i = 0; i < integer_color.size(); i++)
+        integer_color[i] = uint32_t(int32_t(color[i]));
+    }
+
+    clearing_buffer_ = buffer;
+    const uint64_t prefix_bytes = uint64_t(range.firstElement) * MTLGetTexelSize(format);
+    BufferViewDescriptor unsigned_view;
+    unsigned_view.format = MTLGetUnsignedIntegerFormat(format);
+    unsigned_view.byteOffset = range.byteOffset - prefix_bytes;
+    unsigned_view.byteLength = prefix_bytes + range.byteLength;
+    unsigned_view.writable = true;
+    clearing_view_ = buffer->createView(unsigned_view);
+
+    ctx_.startComputePass();
+    setClearColor(integer_color, format);
     ctx_.setComputePSO(cs_clear_tbuffer_uint_, {32, 1, 1});
   }
 
@@ -181,7 +215,10 @@ public:
   }
 
   void
-  clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height) {
+  clear(
+      uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height,
+      WMT::Buffer indirect_arguments = {}, uint64_t indirect_offset = 0
+  ) {
     meta_temp_.offset[0] = offset_x;
     meta_temp_.offset[1] = offset_y;
     meta_temp_.size[0] = width;
@@ -209,7 +246,10 @@ public:
     void *temp = ctx_.setComputeBytes(1, sizeof(meta_temp_));
     memcpy(temp, &meta_temp_, sizeof(meta_temp_));
 
-    ctx_.dispatch({width, height, dispatch_depth_});
+    if (indirect_arguments)
+      ctx_.dispatchIndirect(indirect_arguments, indirect_offset);
+    else
+      ctx_.dispatch({width, height, dispatch_depth_});
   }
 
   void
@@ -471,18 +511,24 @@ public:
   void
   clear(
       uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height, uint32_t array_length,
-      const std::array<float, 4> &color
+      const std::array<float, 4> &color, WMT::Buffer indirect_arguments = {}, uint64_t indirect_offset = 0
   ) {
     if (!clearing_texture_)
       return;
     ctx_.setScissorRect({offset_x, offset_y, width, height});
     auto temp = ctx_.setFragmentBytes(kCustomBufferArgumentIndex0, sizeof(color));
     memcpy(temp, color.data(), sizeof(color));
-    ctx_.draw(WMTPrimitiveTypeTriangle, 0, 3, 0, std::max(array_length, 1u));
+    if (indirect_arguments)
+      ctx_.drawIndirect(WMTPrimitiveTypeTriangle, indirect_arguments, indirect_offset);
+    else
+      ctx_.draw(WMTPrimitiveTypeTriangle, 0, 3, 0, std::max(array_length, 1u));
   }
 
   void
-  clear(uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height, float depth, uint8_t stencil) {
+  clear(
+      uint32_t offset_x, uint32_t offset_y, uint32_t width, uint32_t height, float depth, uint8_t stencil,
+      WMT::Buffer indirect_arguments = {}, uint64_t indirect_offset = 0
+  ) {
     if (!clearing_texture_)
       return;
     ctx_.setScissorRect({offset_x, offset_y, width, height});
@@ -490,7 +536,13 @@ public:
     auto temp = ctx_.setFragmentBytes(kCustomBufferArgumentIndex0, sizeof(color));
     memcpy(temp, color.data(), sizeof(color));
     ctx_.setStencilReference(stencil);
-    ctx_.draw(WMTPrimitiveTypeTriangle, 0, 3, 0, std::max(clearing_texture_->arrayLength(clearing_texture_view_), 1u));
+    if (indirect_arguments)
+      ctx_.drawIndirect(WMTPrimitiveTypeTriangle, indirect_arguments, indirect_offset);
+    else
+      ctx_.draw(
+          WMTPrimitiveTypeTriangle, 0, 3, 0,
+          std::max(clearing_texture_->arrayLength(clearing_texture_view_), 1u)
+      );
   }
 
   void

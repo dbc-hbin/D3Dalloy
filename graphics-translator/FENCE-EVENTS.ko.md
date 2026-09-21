@@ -1,5 +1,15 @@
 # D3D12 fence 완료 이벤트와 알림 스레드 수명
 
+## 현재 루트 구현 (2026-09-22)
+
+D3D12 단일/다중 완료 이벤트는 이제 native shared-event 값 snapshot이 아니라 logical fence threshold latch를 사용한다. CPU/GPU rewind, 미완료 다중 producer, 동일값 signal을 지원하고 이미 충족된 알림은 이후 rewind로 취소되지 않는다. ANY/ALL 등록은 모든 callback 설치가 성공한 뒤 활성화되며 한 번만 알린다. D3D11/native bridge의 기존 listener는 별도 경로다.
+
+`graphics-translator/tests/owned-d3d12-fence-events.cpp`의 새 회귀는 기존 runtime에서 CPU 10→5 `E_NOTIMPL` 실패를 재현했고(`build/local/fence-core-before`), 수정 runtime에서 single/ANY/ALL/null, GPU rewind, mixed producer, competing queues, API-time wait latch, retained lifetime 및 64회 teardown을 통과했다(`build/local/fence-core-after/result.json`). Metal API/shader validation 오류와 foreign backend 로딩은 없었다. 프로세스 밖 공유 fence와 실제 게임 검증은 이 결과에 포함되지 않는다.
+
+## 아래 내용은 0013 import 시점의 역사적 구현·증거
+
+아래 native listener 설명과 rewind 제한은 당시 snapshot이며 현재 D3D12 경로에는 적용되지 않는다.
+
 `0013-fence-events.patch`는 `ID3D12Device1::SetEventOnMultipleFenceCompletion`을 구현하고, DXMT 공통 Metal shared-event listener의 시작·종료 경합을 수정한다.
 
 ## API 계약

@@ -1303,9 +1303,10 @@ AIRCONV_API int SM50Initialize(
 
   if (ppShader == nullptr) {
     errorOut << "ppShader can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
+  *ppShader = nullptr;
 
   /* Shader Model 6.x containers have no DXBC shader blob and no DXBC signature
    * chunks, so the DXIL path has to branch before the DXBC parsing below. */
@@ -1317,6 +1318,7 @@ AIRCONV_API int SM50Initialize(
       failCall(errorObj, ppError);
       return 1;
     }
+    delete errorObj;
     *ppShader = sm50_shader;
     return 0;
   }
@@ -1324,7 +1326,7 @@ AIRCONV_API int SM50Initialize(
   CDXBCParser DXBCParser;
   if (DXBCParser.ReadDXBC(pBytecode, BytecodeSize) != S_OK) {
     errorOut << "Invalid DXBC bytecode\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1334,7 +1336,7 @@ AIRCONV_API int SM50Initialize(
   }
   if (codeBlobIdx == DXBC_BLOB_NOT_FOUND) {
     errorOut << "Invalid DXBC bytecode: shader blob not found\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
   const void *codeBlob = DXBCParser.GetBlob(codeBlobIdx);
@@ -1345,13 +1347,13 @@ AIRCONV_API int SM50Initialize(
   CSignatureParser inputParser;
   if (DXBCGetInputSignature(pBytecode, &inputParser) != S_OK) {
     errorOut << "Invalid DXBC bytecode: input signature not found\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
   CSignatureParser5 outputParser;
   if (DXBCGetOutputSignature(pBytecode, &outputParser) != S_OK) {
     errorOut << "Invalid DXBC bytecode: output signature not found\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1367,6 +1369,12 @@ AIRCONV_API int SM50Initialize(
   }
 
   sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader, inputParser, outputParser);
+  if (!sm50_shader->initialization_error.empty()) {
+    errorOut << sm50_shader->initialization_error << '\0';
+    delete sm50_shader;
+    failCall(errorObj, ppError);
+    return 1;
+  }
 
   auto masks = build_argument_tables(sm50_shader);
   if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER &&
@@ -1386,10 +1394,12 @@ AIRCONV_API int SM50Initialize(
   if (pRefl && !fill_shader_reflection(
         sm50_shader, masks, pRefl, &inputParser, &outputParser, errorOut
       )) {
-    *ppError = (sm50_error_t)errorObj;
+    delete sm50_shader;
+    failCall(errorObj, ppError);
     return 1;
   }
 
+  delete errorObj;
   *ppShader = sm50_shader;
   return 0;
 };
@@ -1431,7 +1441,7 @@ AIRCONV_API int SM50Compile(
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1489,7 +1499,7 @@ AIRCONV_API int SM50Compile(
     llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
       errorOut << u.msg;
     });
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1530,7 +1540,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1565,7 +1575,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
     llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
       errorOut << u.msg;
     });
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1607,7 +1617,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1643,7 +1653,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
     llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
       errorOut << u.msg;
     });
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1685,7 +1695,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1720,7 +1730,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
     llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
       errorOut << u.msg;
     });
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1761,7 +1771,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   llvm::raw_svector_ostream errorOut(errorObj->buf);
   if (ppBitcode == nullptr) {
     errorOut << "ppBitcode can not be null\0";
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 
@@ -1797,7 +1807,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
     llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
       errorOut << u.msg;
     });
-    *ppError = (sm50_error_t)errorObj;
+    failCall(errorObj, ppError);
     return 1;
   }
 

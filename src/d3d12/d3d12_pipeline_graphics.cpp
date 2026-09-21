@@ -810,8 +810,23 @@ CreateGraphicsPipelineState(
     MTLD3D12Device *pDevice, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState
 ) {
   InitReturnPtr(ppPipelineState);
-  if (!pDesc)
+  if (!ppPipelineState || !pDesc || pDesc->NodeMask > 1 || pDesc->NumRenderTargets > 8 || !pDesc->SampleDesc.Count ||
+      !pDesc->VS.pShaderBytecode || !pDesc->VS.BytecodeLength ||
+      (!pDesc->PS.pShaderBytecode != !pDesc->PS.BytecodeLength) ||
+      (!pDesc->DS.pShaderBytecode != !pDesc->DS.BytecodeLength) ||
+      (!pDesc->HS.pShaderBytecode != !pDesc->HS.BytecodeLength) ||
+      (!pDesc->GS.pShaderBytecode != !pDesc->GS.BytecodeLength) ||
+      (pDesc->InputLayout.NumElements && !pDesc->InputLayout.pInputElementDescs) ||
+      (pDesc->StreamOutput.NumEntries && !pDesc->StreamOutput.pSODeclaration) ||
+      (pDesc->StreamOutput.NumStrides && !pDesc->StreamOutput.pBufferStrides) ||
+      (pDesc->CachedPSO.CachedBlobSizeInBytes && !pDesc->CachedPSO.pCachedBlob))
     return E_INVALIDARG;
+  if (pDesc->pRootSignature) {
+    Com<ID3D12Device> owner;
+    if (FAILED(pDesc->pRootSignature->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
+        owner.ptr() != static_cast<ID3D12Device *>(pDevice))
+      return E_INVALIDARG;
+  }
   auto pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
   HRESULT hr = pso->Initialize(pDesc);
   if (FAILED(hr))

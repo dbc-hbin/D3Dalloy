@@ -170,8 +170,15 @@ CreateComputePipelineState(
     MTLD3D12Device *pDevice, const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState
 ) {
   InitReturnPtr(ppPipelineState);
-  if (!pDesc)
+  if (!ppPipelineState || !pDesc || pDesc->NodeMask > 1 || !pDesc->CS.pShaderBytecode || !pDesc->CS.BytecodeLength ||
+      (pDesc->CachedPSO.CachedBlobSizeInBytes && !pDesc->CachedPSO.pCachedBlob))
     return E_INVALIDARG;
+  if (pDesc->pRootSignature) {
+    Com<ID3D12Device> owner;
+    if (FAILED(pDesc->pRootSignature->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
+        owner.ptr() != static_cast<ID3D12Device *>(pDevice))
+      return E_INVALIDARG;
+  }
   auto pso = Com(new MTLD3D12ComputePipelineStateImpl(pDevice));
   HRESULT hr = pso->Initialize(pDesc);
   if (FAILED(hr))

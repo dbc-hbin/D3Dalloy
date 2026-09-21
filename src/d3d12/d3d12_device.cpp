@@ -19,6 +19,8 @@
 #include "d3d12_device.hpp"
 #include "d3d12_device_child.hpp"
 #include "d3d12_format_support.hpp"
+#include "d3d12_pageable.hpp"
+#include "d3d12_resource_contract.hpp"
 #include "d3d12_state_object.hpp"
 #include "d3d12_temporal.hpp"
 #include "Metal.hpp"
@@ -27,6 +29,7 @@
 #include "dxgi_interfaces.h"
 #include "dxmt_format.hpp"
 #include "log/log.hpp"
+#include <limits>
 #include <map>
 #include <new>
 #include "d3d10_1.h"
@@ -74,6 +77,99 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   std::unordered_map<raytracing::ArenaKey, uint32_t, RTASKeyHash> rtas_slots_;
   std::mutex rtas_pipeline_lock_;
   RTASComputePipelines rtas_pipelines_;
+
+  struct ResidencyBatchEntry {
+    MTLD3D12PageableResidency *pageable;
+    uint32_t occurrences;
+  };
+
+  HRESULT
+  ResolveResidencyBatch(
+      UINT object_count, ID3D12Pageable *const *objects, std::vector<ResidencyBatchEntry> &batch
+  ) {
+    if (object_count && !objects)
+      return E_INVALIDARG;
+
+    std::unordered_map<MTLD3D12PageableResidency *, size_t> indices;
+    indices.reserve(object_count);
+    batch.reserve(object_count);
+    for (UINT i = 0; i < object_count; ++i) {
+      if (!objects[i])
+        return E_INVALIDARG;
+      Com<ID3D12Device> object_device;
+      if (FAILED(objects[i]->GetDevice(__uuidof(ID3D12Device),
+                                       reinterpret_cast<void **>(&object_device))) ||
+          object_device.ptr() != static_cast<ID3D12Device *>(this))
+        return E_INVALIDARG;
+      auto *pageable = dynamic_cast<MTLD3D12PageableResidency *>(objects[i]);
+      if (!pageable || !pageable->SupportsResidency())
+        return E_INVALIDARG;
+      auto [entry, inserted] = indices.emplace(pageable, batch.size());
+      if (inserted)
+        batch.push_back({pageable, 1});
+      else if (batch[entry->second].occurrences == std::numeric_limits<uint32_t>::max())
+        return E_INVALIDARG;
+      else
+        ++batch[entry->second].occurrences;
+    }
+    return S_OK;
+  }
+
+  HRESULT
+  MakeResidentLocked(const std::vector<ResidencyBatchEntry> &batch, bool deny_overbudget = false) {
+    uint64_t addition_bytes = 0;
+    for (const auto &entry : batch) {
+      if (!entry.pageable->CanAddResidencyReference(entry.occurrences))
+        return E_INVALIDARG;
+      if (!entry.pageable->ResidencyReferenceCount()) {
+        const uint64_t bytes = entry.pageable->ResidencyAllocationBytes();
+        if (bytes > std::numeric_limits<uint64_t>::max() - addition_bytes)
+          return E_OUTOFMEMORY;
+        addition_bytes += bytes;
+      }
+    }
+    if (deny_overbudget) {
+      const uint64_t resident_bytes = residency_set_.allocatedSize();
+      const uint64_t budget = GetMTLDevice().recommendedMaxWorkingSetSize();
+      if (resident_bytes > budget || addition_bytes > budget - resident_bytes)
+        return E_OUTOFMEMORY;
+    }
+
+    std::vector<WMT::Allocation> additions;
+    for (const auto &entry : batch) {
+      if (!entry.pageable->ResidencyReferenceCount()) {
+        const auto &allocations = entry.pageable->ResidencyAllocations();
+        additions.insert(additions.end(), allocations.begin(), allocations.end());
+      }
+    }
+    if (!additions.empty()) {
+      residency_set_.addAllocations(additions.data(), additions.size());
+      residency_set_.commit();
+    }
+    for (const auto &entry : batch)
+      entry.pageable->AddResidencyReference(entry.occurrences);
+    return S_OK;
+  }
+
+  HRESULT
+  EvictLocked(const std::vector<ResidencyBatchEntry> &batch) {
+    std::vector<WMT::Allocation> removals;
+    for (const auto &entry : batch) {
+      if (!entry.pageable->CanRemoveResidencyReference(entry.occurrences))
+        return E_INVALIDARG;
+      if (entry.pageable->ResidencyReferenceCount() == entry.occurrences) {
+        const auto &allocations = entry.pageable->ResidencyAllocations();
+        removals.insert(removals.end(), allocations.begin(), allocations.end());
+      }
+    }
+    if (!removals.empty()) {
+      residency_set_.removeAllocations(removals.data(), removals.size());
+      residency_set_.commit();
+    }
+    for (const auto &entry : batch)
+      entry.pageable->RemoveResidencyReference(entry.occurrences);
+    return S_OK;
+  }
 
 public:
   MTLD3D12DeviceImpl(IMTLDXGIAdapter *adapter) :
@@ -572,6 +668,8 @@ public:
       Heap->AddShaderResourceView(Index, pDesc);
       return;
     }
+    auto [Heap, Index] = GetShaderVisibleDescriptorHeap(this, Descriptor);
+    Heap->AddShaderResourceView(Index, static_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC *>(nullptr));
     auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
     d3d12res->CreateShaderResourceView(pDesc, Descriptor);
   };
@@ -586,6 +684,8 @@ public:
       Heap->AddUnorderedAccessView(Index, pDesc);
       return;
     }
+    auto [Heap, Index] = GetShaderVisibleDescriptorHeap(this, Descriptor);
+    Heap->AddUnorderedAccessView(Index, static_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC *>(nullptr));
     auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
     d3d12res->CreateUnorderedAccessView(pCounter, pDesc, Descriptor);
   };
@@ -599,6 +699,8 @@ public:
       Heap->AddRenderTarget(Index, nullptr);
       return;
     }
+    auto [Heap, Index] = GetRenderTargetHeap(this, Descriptor);
+    Heap->AddRenderTarget(Index, nullptr);
     auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
     d3d12res->CreateRenderTargetView(pDesc, Descriptor);
   };
@@ -612,6 +714,8 @@ public:
       Heap->AddRenderTarget(Index, nullptr);
       return;
     }
+    auto [Heap, Index] = GetRenderTargetHeap(this, Descriptor);
+    Heap->AddRenderTarget(Index, nullptr);
     auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
     d3d12res->CreateDepthStencilView(pDesc, Descriptor);
   };
@@ -740,6 +844,11 @@ public:
     hr = ValidateResourceStates(InitialState, pHeapProps);
     if (FAILED(hr))
       return hr;
+    hr = ValidateOptimizedClearValue(pDesc, OptimizedClearValue);
+    if (FAILED(hr))
+      return hr;
+    if (!ppResource)
+      return S_FALSE;
     switch (pDesc->Dimension) {
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
@@ -759,10 +868,18 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateHeap(const D3D12_HEAP_DESC *pDesc, REFIID riid, void **ppHeap) {
-    HRESULT hr = S_OK;
-    hr = ValidateHeapProperties(&pDesc->Properties, pDesc->Flags, advertise_numa_);
+    InitReturnPtr(ppHeap);
+    if (!pDesc)
+      return E_INVALIDARG;
+    HRESULT hr = ValidateHeapProperties(&pDesc->Properties, pDesc->Flags, advertise_numa_);
     if (FAILED(hr))
       return hr;
+    if (!pDesc->SizeInBytes ||
+        (pDesc->Alignment && pDesc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+         pDesc->Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT))
+      return E_INVALIDARG;
+    if (!ppHeap)
+      return S_FALSE;
     return dxmt::CreateHeap(this, pDesc, riid, ppHeap);
   };
 
@@ -786,6 +903,11 @@ public:
     hr = ValidateResourceStates(InitialState, &heap_desc.Properties);
     if (FAILED(hr))
       return hr;
+    hr = ValidateOptimizedClearValue(pDesc, OptimizedClearValue);
+    if (FAILED(hr))
+      return hr;
+    if (!ppResource)
+      return S_FALSE;
     switch (pDesc->Dimension) {
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
     case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
@@ -826,12 +948,30 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   MakeResident(UINT ObjectCount, ID3D12Pageable *const *objects) {
-    return S_OK;
+    try {
+      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::vector<ResidencyBatchEntry> batch;
+      HRESULT hr = ResolveResidencyBatch(ObjectCount, objects, batch);
+      return FAILED(hr) ? hr : MakeResidentLocked(batch);
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    } catch (...) {
+      return E_FAIL;
+    }
   };
 
   HRESULT STDMETHODCALLTYPE
   Evict(UINT ObjectCount, ID3D12Pageable *const *objects) {
-    return E_NOTIMPL;
+    try {
+      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::vector<ResidencyBatchEntry> batch;
+      HRESULT hr = ResolveResidencyBatch(ObjectCount, objects, batch);
+      return FAILED(hr) ? hr : EvictLocked(batch);
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    } catch (...) {
+      return E_FAIL;
+    }
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -848,110 +988,138 @@ public:
       const D3D12_RESOURCE_DESC *pDesc, UINT FirstSubresource, UINT SubresourceCount, UINT64 BaseOffset,
       D3D12_PLACED_SUBRESOURCE_FOOTPRINT *pLayouts, UINT *pNumRows, UINT64 *pRowSizeInBytes, UINT64 *pTotalBytes
   ) {
-    UINT64 TotalBytes = 0;
-    UINT64 Offset = 0;
-    UINT BlockWidth = 1;
-    do {
-      if (!pDesc)
-        break;
-
-      UINT PlaneCount = 1;
-      UINT PerPlaneSubresources = DecomposeSubresource(*pDesc, 0);
-      DXGI_FORMAT PlaneFormats[2] = {};
-      UINT PlaneBytesPerTexel[2] = {};
-
-      MTL_DXGI_FORMAT_DESC FormatDesc;
-
-      if (pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        if (pDesc->Format != DXGI_FORMAT_UNKNOWN)
-          break;
-        PlaneFormats[0] = DXGI_FORMAT_UNKNOWN;
-        PlaneBytesPerTexel[0] = 1;
-      } else {
-        if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), pDesc->Format, FormatDesc)))
-          break;
-
-        if (pDesc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && pDesc->Height != 1)
-          break;
-
-        if (FormatDesc.Flag & MTL_DXGI_FORMAT_BC)
-          BlockWidth = 4;
-
-        if (FormatDesc.PlanarCount > 1) {
-          assert(FormatDesc.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER));
-          PlaneCount = FormatDesc.PlanarCount;
-          PlaneFormats[0] = DXGI_FORMAT_R32_TYPELESS;
-          PlaneBytesPerTexel[0] = 4;
-          PlaneFormats[1] = DXGI_FORMAT_R8_TYPELESS;
-          PlaneBytesPerTexel[1] = 1;
-        } else {
-          PlaneFormats[0] = pDesc->Format;
-          PlaneBytesPerTexel[0] = FormatDesc.BytesPerTexel;
-          if (PlaneBytesPerTexel[0] == 0)
-            IMPLEMENT_ME
-        }
-      }
-
-      if (pDesc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
-        PerPlaneSubresources *= pDesc->DepthOrArraySize;
-
-      if (FirstSubresource >= PerPlaneSubresources * PlaneCount ||
-          SubresourceCount > PerPlaneSubresources * PlaneCount - FirstSubresource) {
-        WARN("GetCopyableFootprints: subresource is out of range");
-        break;
-      }
-
-      for (unsigned i = 0; i < SubresourceCount; i++) {
-        auto Subresource = FirstSubresource + i;
-        auto Plane = 0u, MipLevel = 0u;
-        DecomposeSubresource(*pDesc, Subresource, &MipLevel, NULL, &Plane);
-        auto Extent = GetResourceExtent(*pDesc, MipLevel);
-        auto Width = align(Extent.right, BlockWidth);
-        auto Height = align(Extent.bottom, BlockWidth);
-        auto RowCount = Height / BlockWidth;
-        auto Depth = Extent.back;
-        auto RowSize = (Width / BlockWidth) * PlaneBytesPerTexel[Plane];
-        auto RowPitch = align(RowSize, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * PlaneCount);
-        if (pLayouts) {
-          pLayouts[i].Offset = BaseOffset + Offset;
-          pLayouts[i].Footprint.Format = PlaneFormats[Plane];
-          pLayouts[i].Footprint.Width = Width;
-          pLayouts[i].Footprint.Height = Height;
-          pLayouts[i].Footprint.Depth = Depth;
-          pLayouts[i].Footprint.RowPitch = RowPitch;
-        }
+    auto invalidate = [&] {
+      for (UINT i = 0; i < SubresourceCount; i++) {
+        if (pLayouts)
+          pLayouts[i] = {UINT64_MAX, {static_cast<DXGI_FORMAT>(UINT_MAX), UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX}};
         if (pNumRows)
-          pNumRows[i] = RowCount;
+          pNumRows[i] = UINT_MAX;
         if (pRowSizeInBytes)
-          pRowSizeInBytes[i] = RowSize;
-
-        auto SubresourceSize = RowPitch * (RowCount - 1) + RowSize;
-        SubresourceSize =
-            align(SubresourceSize, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * PlaneCount) * (Depth - 1) + SubresourceSize;
-
-        TotalBytes = Offset + SubresourceSize;
-        Offset = align(TotalBytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+          pRowSizeInBytes[i] = UINT64_MAX;
       }
       if (pTotalBytes)
-        *pTotalBytes = TotalBytes;
+        *pTotalBytes = UINT64_MAX;
+    };
+
+    if (!SubresourceCount) {
+      if (pTotalBytes)
+        *pTotalBytes = 0;
       return;
-    } while (0);
-    for (unsigned i = 0; i < SubresourceCount; i++) {
-      if (pLayouts) {
-        pLayouts[i].Offset = ~0ull;
-        pLayouts[i].Footprint.Format = ~(DXGI_FORMAT)0u;
-        pLayouts[i].Footprint.Width = ~0u;
-        pLayouts[i].Footprint.Height = ~0u;
-        pLayouts[i].Footprint.Depth = ~0u;
-        pLayouts[i].Footprint.RowPitch = ~0u;
-      }
-      if (pNumRows)
-        pNumRows[i] = ~0u;
-      if (pRowSizeInBytes)
-        pRowSizeInBytes[i] = ~0ull;
     }
-    if (pTotalBytes)
-      *pTotalBytes = UINT64_MAX;
+    if (!pDesc) {
+      invalidate();
+      return;
+    }
+
+    D3D12_RESOURCE_DESC desc = *pDesc;
+    D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    if (FAILED(ValidateResourceDescs(&desc, &default_heap))) {
+      invalidate();
+      return;
+    }
+
+    UINT plane_count = 1;
+    DXGI_FORMAT plane_formats[2] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+    UINT plane_bytes[2] = {1, 0};
+    UINT block_width = 1;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+      WMTTextureInfo texture_info{};
+      MTL_DXGI_FORMAT_DESC format{};
+      if (FAILED(PopulateWMTTextureInfo(GetMTLDevice(), texture_info, desc)) ||
+          FAILED(MTLQueryDXGIFormat(GetMTLDevice(), desc.Format, format))) {
+        invalidate();
+        return;
+      }
+      if (!desc.MipLevels)
+        desc.MipLevels = texture_info.mipmap_level_count;
+      block_width = format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
+      plane_count = format.PlanarCount;
+      if (!plane_count || plane_count > 2) {
+        invalidate();
+        return;
+      }
+      if (plane_count == 2) {
+        plane_formats[0] = DXGI_FORMAT_R32_TYPELESS;
+        plane_formats[1] = DXGI_FORMAT_R8_TYPELESS;
+        plane_bytes[0] = 4;
+        plane_bytes[1] = 1;
+      } else {
+        plane_formats[0] = desc.Format;
+        plane_bytes[0] = format.BytesPerTexel;
+        if (!plane_bytes[0]) {
+          invalidate();
+          return;
+        }
+      }
+    }
+
+    uint64_t per_plane = desc.MipLevels;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+        !resource_contract::CheckedMul(per_plane, desc.DepthOrArraySize, per_plane)) {
+      invalidate();
+      return;
+    }
+    uint64_t subresource_count = 0;
+    if (!resource_contract::CheckedMul(per_plane, plane_count, subresource_count) ||
+        FirstSubresource >= subresource_count || SubresourceCount > subresource_count - FirstSubresource) {
+      invalidate();
+      return;
+    }
+
+    uint64_t offset = 0;
+    if (!resource_contract::CheckedAlign(BaseOffset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, offset)) {
+      invalidate();
+      return;
+    }
+    for (UINT i = 0; i < SubresourceCount; i++) {
+      UINT mip = 0, plane = 0;
+      DecomposeSubresource(desc, FirstSubresource + i, &mip, nullptr, &plane);
+      const auto extent = GetResourceExtent(desc, mip);
+      uint64_t padded_width = 0, padded_height = 0;
+      if (!resource_contract::CheckedAlign(extent.right, block_width, padded_width) ||
+          !resource_contract::CheckedAlign(extent.bottom, block_width, padded_height)) {
+        invalidate();
+        return;
+      }
+      const uint64_t rows = padded_height / block_width;
+      uint64_t row_size = 0, row_pitch = 0;
+      if (!resource_contract::CheckedMul(padded_width / block_width, plane_bytes[plane], row_size) ||
+          !resource_contract::CheckedAlign(row_size, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, row_pitch) ||
+          row_pitch > UINT_MAX || padded_width > UINT_MAX || padded_height > UINT_MAX || rows > UINT_MAX) {
+        invalidate();
+        return;
+      }
+      uint64_t slice_pitch = 0, subresource_size = 0, next_offset = 0;
+      if (!resource_contract::CheckedMul(row_pitch, rows, slice_pitch) ||
+          !resource_contract::CheckedMul(slice_pitch, extent.back - 1, subresource_size) ||
+          !resource_contract::CheckedMul(row_pitch, rows - 1, slice_pitch) ||
+          !resource_contract::CheckedAdd(subresource_size, slice_pitch, subresource_size) ||
+          !resource_contract::CheckedAdd(subresource_size, row_size, subresource_size) ||
+          !resource_contract::CheckedAdd(offset, subresource_size, next_offset)) {
+        invalidate();
+        return;
+      }
+      if (pLayouts)
+        pLayouts[i] = {offset, {plane_formats[plane], static_cast<UINT>(padded_width),
+                               static_cast<UINT>(padded_height), extent.back, static_cast<UINT>(row_pitch)}};
+      if (pNumRows)
+        pNumRows[i] = static_cast<UINT>(rows);
+      if (pRowSizeInBytes)
+        pRowSizeInBytes[i] = row_size;
+      if (i + 1 != SubresourceCount &&
+          !resource_contract::CheckedAlign(next_offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, offset)) {
+        invalidate();
+        return;
+      }
+      if (i + 1 == SubresourceCount) {
+        if (next_offset < BaseOffset) {
+          invalidate();
+          return;
+        }
+        if (pTotalBytes)
+          *pTotalBytes = next_offset - BaseOffset;
+      }
+    }
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1000,9 +1168,9 @@ public:
         (Flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL && Flags != D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY))
       return E_INVALIDARG;
     try {
-      std::vector<WMT::Reference<WMT::SharedEvent>> events;
-      std::vector<WMTSharedEventValue> values;
-      events.reserve(FenceCount);
+      std::vector<Rc<Fence>> fences;
+      std::vector<FenceWaitValue> values;
+      fences.reserve(FenceCount);
       values.reserve(FenceCount);
       for (UINT i = 0; i < FenceCount; ++i) {
         if (!pFences[i])
@@ -1012,9 +1180,10 @@ public:
         Com<IMTLD3D12DeviceExt> owner;
         if (FAILED(pFences[i]->GetDevice(__uuidof(IMTLD3D12DeviceExt), reinterpret_cast<void **>(&owner))))
           return E_INVALIDARG;
-        events.push_back(static_cast<MTLD3D12Fence *>(pFences[i])->fence->sharedEvent());
-        values.push_back({events.back().handle, pValues[i]});
+        fences.push_back(static_cast<MTLD3D12Fence *>(pFences[i])->fence);
       }
+      for (UINT i = 0; i < FenceCount; ++i)
+        values.push_back(fences[i]->prepareWaitValue(pValues[i]));
       HANDLE event = hEvent;
       if (!event) {
         event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1036,8 +1205,30 @@ public:
   };
 
   HRESULT STDMETHODCALLTYPE
-  SetResidencyPriority(UINT ObjectCount, ID3D12Pageable *const *pObjects, const D3D12_RESIDENCY_PRIORITY *pPriorities) {
-    return E_NOTIMPL;
+  SetResidencyPriority(
+      UINT ObjectCount, ID3D12Pageable *const *pObjects, const D3D12_RESIDENCY_PRIORITY *pPriorities
+  ) {
+    if (ObjectCount && !pPriorities)
+      return E_INVALIDARG;
+    try {
+      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::vector<ResidencyBatchEntry> batch;
+      HRESULT hr = ResolveResidencyBatch(ObjectCount, pObjects, batch);
+      if (FAILED(hr))
+        return hr;
+      for (UINT i = 0; i < ObjectCount; ++i) {
+        if (pPriorities[i] < D3D12_RESIDENCY_PRIORITY_MINIMUM ||
+            pPriorities[i] > D3D12_RESIDENCY_PRIORITY_MAXIMUM)
+          return E_INVALIDARG;
+      }
+      for (UINT i = 0; i < ObjectCount; ++i)
+        dynamic_cast<MTLD3D12PageableResidency *>(pObjects[i])->SetResidencyPriorityHint(pPriorities[i]);
+      return S_OK;
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    } catch (...) {
+      return E_FAIL;
+    }
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1277,7 +1468,26 @@ public:
       D3D12_RESIDENCY_FLAGS Flags, UINT NumObjects, ID3D12Pageable *const *ppObjects, ID3D12Fence *pFence,
       UINT64 FenceValue
   ) {
-    return E_NOTIMPL;
+    if ((Flags != D3D12_RESIDENCY_FLAG_NONE && Flags != D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET) || !pFence)
+      return E_INVALIDARG;
+    Com<ID3D12Device> fence_device;
+    if (FAILED(pFence->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&fence_device))) ||
+        fence_device.ptr() != static_cast<ID3D12Device *>(this))
+      return E_INVALIDARG;
+    try {
+      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::vector<ResidencyBatchEntry> batch;
+      HRESULT hr = ResolveResidencyBatch(NumObjects, ppObjects, batch);
+      if (FAILED(hr) || FAILED(hr = MakeResidentLocked(batch, Flags == D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET)))
+        return hr;
+      /* Metal residency-set mutation and commit are synchronous.  Signal only after the
+       * completed operation, while still serialized with other enqueue calls. */
+      return pFence->Signal(FenceValue);
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    } catch (...) {
+      return E_FAIL;
+    }
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1333,57 +1543,56 @@ public:
       D3D12_RESOURCE_ALLOCATION_INFO *__ret, UINT VisibleMask, UINT ResourceDestCount,
       const D3D12_RESOURCE_DESC *pDescs, D3D12_RESOURCE_ALLOCATION_INFO1 *pAllocationInfos
   ) {
-    D3D12_RESOURCE_ALLOCATION_INFO1 resource_info;
-    bool has_msaa_resource = false;
-
+    bool has_msaa = false;
+    auto invalid = [&] {
+      __ret->SizeInBytes = UINT64_MAX;
+      __ret->Alignment = has_msaa ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                                  : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      return __ret;
+    };
     __ret->SizeInBytes = 0;
+    __ret->Alignment = 0;
+    if (VisibleMask > 1)
+      return invalid();
+    if (!ResourceDestCount)
+      return __ret;
+    if (!pDescs)
+      return invalid();
     __ret->Alignment = 1;
 
-    for (unsigned i = 0; i < ResourceDestCount; i++) {
-      const D3D12_RESOURCE_DESC *desc = &pDescs[i];
-      has_msaa_resource |= desc->SampleDesc.Count > 1;
+    D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    for (UINT i = 0; i < ResourceDestCount; i++) {
+      const auto &desc = pDescs[i];
+      has_msaa |= desc.SampleDesc.Count > 1;
+      if (FAILED(ValidateResourceDescs(&desc, &default_heap)))
+        return invalid();
 
-      if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-        if (desc->Alignment && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
-          DEBUG("GetResourceAllocationInfo: invalid alignment ", desc->Alignment, " for buffer resource.\n");
-          goto invalid;
-        }
-        resource_info.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-        auto size_and_align = GetMTLDevice().heapBufferSizeAndAlign(desc->Width, {});
-        resource_info.SizeInBytes = size_and_align.size;
+      D3D12_RESOURCE_ALLOCATION_INFO1 info{};
+      if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        const auto native = GetMTLDevice().heapBufferSizeAndAlign(desc.Width, {});
+        info.SizeInBytes = native.size;
+        info.Alignment = std::max<uint64_t>(native.align, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
       } else {
-        WMTTextureInfo texture_info;
-        if (FAILED(PopulateWMTTextureInfo(GetMTLDevice(), texture_info, *desc))) {
-          DEBUG("GetResourceAllocationInfo: invalid texture descriptor\n");
-          goto invalid;
-        }
-        auto size_and_align = GetMTLDevice().heapTextureSizeAndAlign(texture_info);
-        resource_info.SizeInBytes = size_and_align.size;
-        resource_info.Alignment = size_and_align.align;
-        auto requested_alignment = desc->Alignment              ? desc->Alignment
-                                   : desc->SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
-                                                                : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-        resource_info.Alignment = std::max(resource_info.Alignment, requested_alignment);
+        WMTTextureInfo texture_info{};
+        if (FAILED(PopulateWMTTextureInfo(GetMTLDevice(), texture_info, desc)))
+          return invalid();
+        const auto native = GetMTLDevice().heapTextureSizeAndAlign(texture_info);
+        const uint64_t requested = desc.Alignment ? desc.Alignment
+            : desc.SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                                        : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        info.SizeInBytes = native.size;
+        info.Alignment = std::max<uint64_t>(native.align, requested);
       }
-
-      resource_info.SizeInBytes = align(resource_info.SizeInBytes, resource_info.Alignment);
-      resource_info.Offset = align(__ret->SizeInBytes, resource_info.Alignment);
-
+      if (!info.Alignment || !resource_contract::CheckedAlign(info.SizeInBytes, info.Alignment, info.SizeInBytes) ||
+          !resource_contract::CheckedAlign(__ret->SizeInBytes, info.Alignment, info.Offset) ||
+          !resource_contract::CheckedAdd(info.Offset, info.SizeInBytes, __ret->SizeInBytes))
+        return invalid();
+      __ret->Alignment = std::max(__ret->Alignment, info.Alignment);
       if (pAllocationInfos)
-        pAllocationInfos[i] = resource_info;
-
-      __ret->SizeInBytes = resource_info.Offset + resource_info.SizeInBytes;
-      __ret->Alignment = std::max(__ret->Alignment, resource_info.Alignment);
+        pAllocationInfos[i] = info;
     }
-
-    __ret->SizeInBytes = align(__ret->SizeInBytes, __ret->Alignment);
-    return __ret;
-
-  invalid:
-
-    __ret->SizeInBytes = ~(uint64_t)0;
-    __ret->Alignment = has_msaa_resource ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
-                                         : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    if (!resource_contract::CheckedAlign(__ret->SizeInBytes, __ret->Alignment, __ret->SizeInBytes))
+      return invalid();
     return __ret;
   }
 
@@ -1393,11 +1602,29 @@ public:
   };
 
   HRESULT
-  RegisterResidency(WMT::Allocation allocation) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
-    residency_set_.addAllocations(&allocation, 1);
-    residency_set_.commit();
-    return S_OK;
+  RegisterResidency(
+      WMT::Allocation allocation, MTLD3D12PageableResidency *owner, bool initially_resident
+  ) {
+    if (!allocation)
+      return E_OUTOFMEMORY;
+    try {
+      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      if (owner) {
+        if (!owner->AddResidencyAllocation(allocation))
+          return E_OUTOFMEMORY;
+        if (!owner->SupportsResidency())
+          owner->InitializeResidency(initially_resident);
+      }
+      if (!owner || initially_resident) {
+        residency_set_.addAllocations(&allocation, 1);
+        residency_set_.commit();
+      }
+      return S_OK;
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    } catch (...) {
+      return E_FAIL;
+    }
   }
 
   HRESULT STDMETHODCALLTYPE SupportsTemporalUpscale(BOOL *supported) final {
@@ -1413,23 +1640,58 @@ public:
   }
 
   HRESULT
-  UnregisterResidency(WMT::Allocation allocation) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
-    residency_set_.removeAllocations(&allocation, 1);
-    residency_set_.commit();
-    return S_OK;
+  UnregisterResidency(WMT::Allocation allocation, MTLD3D12PageableResidency *owner) {
+    if (!allocation)
+      return E_INVALIDARG;
+    try {
+      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      if (!owner || owner->ResidencyReferenceCount()) {
+        residency_set_.removeAllocations(&allocation, 1);
+        residency_set_.commit();
+      }
+      return S_OK;
+    } catch (...) {
+      return E_FAIL;
+    }
   }
 
   HRESULT
-  RegisterResidencyAndVA(BufferAllocation *allocation) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
-    interval_map_.emplace(allocation->gpuAddress(), allocation);
-    if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
+  RegisterResidencyAndVA(
+      BufferAllocation *allocation, MTLD3D12PageableResidency *owner, bool initially_resident
+  ) {
+    if (!allocation || !allocation->buffer())
+      return E_OUTOFMEMORY;
+    try {
+      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      auto [entry, inserted] = interval_map_.emplace(allocation->gpuAddress(), allocation);
+      if (!inserted)
+        return E_INVALIDARG;
+      if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
+        return S_OK;
+      auto buffer = allocation->buffer();
+      try {
+        if (owner) {
+          if (!owner->AddResidencyAllocation(buffer)) {
+            interval_map_.erase(entry);
+            return E_OUTOFMEMORY;
+          }
+          if (!owner->SupportsResidency())
+            owner->InitializeResidency(initially_resident);
+        }
+      } catch (...) {
+        interval_map_.erase(entry);
+        throw;
+      }
+      if (!owner || initially_resident) {
+        residency_set_.addAllocations(&buffer, 1);
+        residency_set_.commit();
+      }
       return S_OK;
-    auto buffer = allocation->buffer();
-    residency_set_.addAllocations(&buffer, 1);
-    residency_set_.commit();
-    return S_OK;
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    } catch (...) {
+      return E_FAIL;
+    }
   }
 
   /**
@@ -1458,7 +1720,9 @@ public:
   }
 
   HRESULT
-  UnregisterResidencyAndVA(BufferAllocation *allocation) {
+  UnregisterResidencyAndVA(BufferAllocation *allocation, MTLD3D12PageableResidency *owner) {
+    if (!allocation)
+      return E_INVALIDARG;
     std::unique_lock<dxmt::mutex> lock(residency_lock_);
     interval_map_.erase(allocation->gpuAddress());
     /*
@@ -1485,8 +1749,12 @@ public:
       return S_OK;
     }
     auto buffer = allocation->buffer();
-    residency_set_.removeAllocations(&buffer, 1);
-    residency_set_.commit();
+    if (!owner || owner->ResidencyReferenceCount()) {
+      residency_set_.removeAllocations(&buffer, 1);
+      residency_set_.commit();
+    } else if (released_sidecars) {
+      residency_set_.commit();
+    }
     return S_OK;
   }
 

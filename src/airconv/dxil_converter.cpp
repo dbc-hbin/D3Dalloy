@@ -28,6 +28,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/DebugInfo.h"
 
+#include "airconv_context.hpp"
 #include "airconv_error.hpp"
 
 namespace dxmt::dxil {
@@ -363,6 +364,13 @@ llvm::Expected<std::unique_ptr<ModuleInfo>> LowerShader(
     return binding.takeError();
   if (auto err = LowerResources(**info, **binding))
     return std::move(err);
+  if (auto *sample_position = (*info)->module->getFunction("dxmt.sample_pos.i32");
+      sample_position && sample_position->isDeclaration()) {
+    dxmt::linkSamplePos(*(*info)->module);
+    sample_position = (*info)->module->getFunction("dxmt.sample_pos.i32");
+    if (!sample_position || sample_position->isDeclaration())
+      return createError("dxil: failed to link sample-position helper");
+  }
   if (auto err = LowerOperations(*(*info)->module))
     return std::move(err);
   if (auto err = VerifyLoweredModule(*(*info)->module))

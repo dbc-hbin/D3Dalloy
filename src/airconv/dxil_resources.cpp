@@ -86,8 +86,13 @@ enum Opcode : uint32_t {
   kBufferUpdateCounter = 70,
   kGetDimensions = 72,
   kTextureGather = 73,
+  kTextureGatherCmp = 74,
+  kTexture2DMSGetSamplePosition = 75,
+  kRenderTargetGetSamplePosition = 76,
+  kRenderTargetGetSampleCount = 77,
   kAtomicBinOp = 78,
   kAtomicCompareExchange = 79,
+  kCalculateLOD = 81,
   kRawBufferLoad = 139,
   kRawBufferStore = 140,
   kCreateHandleForLib = 160,
@@ -302,6 +307,11 @@ private:
   llvm::Error lowerRawBufferStore(llvm::CallInst *call);
   llvm::Error lowerSample(llvm::CallInst *call);
   llvm::Error lowerGather(llvm::CallInst *call);
+  llvm::Error lowerGatherCmp(llvm::CallInst *call);
+  llvm::Error lowerTexture2DMSGetSamplePosition(llvm::CallInst *call);
+  llvm::Error lowerRenderTargetGetSamplePosition(llvm::CallInst *call);
+  llvm::Error lowerRenderTargetGetSampleCount(llvm::CallInst *call);
+  llvm::Error lowerCalculateLOD(llvm::CallInst *call);
   llvm::Error lowerSampleBias(llvm::CallInst *call);
   llvm::Error lowerSampleLevel(llvm::CallInst *call);
   llvm::Error lowerSampleGrad(llvm::CallInst *call);
@@ -1968,6 +1978,129 @@ ResourceLowering::lowerGather(llvm::CallInst *call) {
 }
 
 llvm::Error
+ResourceLowering::lowerGatherCmp(llvm::CallInst *call) {
+  auto texture_handle = resolve(call->getArgOperand(1));
+  if (!texture_handle)
+    return texture_handle.takeError();
+  auto descriptor = textureDescriptor(*texture_handle, "textureGatherCmp");
+  if (!descriptor)
+    return descriptor.takeError();
+  auto sampler_handle = resolve(call->getArgOperand(2));
+  if (!sampler_handle)
+    return sampler_handle.takeError();
+  if (!sampler_handle->sampler)
+    return createError("dxil: textureGatherCmp requires a sampler handle");
+  builder.SetInsertPoint(call);
+
+  llvm::Value *coord = nullptr;
+  llvm::Value *array_index = nullptr;
+  llvm::Value *sampler_value = sampler_handle->sampler->SamplerHandle;
+  auto target_error = sampleTarget(
+      *descriptor, sampler_handle->sampler->CubeSamplerHandle, call->getArgOperand(3), call->getArgOperand(4),
+      call->getArgOperand(5), call->getArgOperand(6), coord, array_index, sampler_value
+  );
+  if (target_error)
+    return target_error;
+  int32_t offsets[3] = {};
+  for (unsigned i = 0; i < 2; ++i) {
+    auto offset = constantOperand(call->getArgOperand(7 + i), "gather compare offset");
+    if (!offset)
+      return offset.takeError();
+    offsets[i] = *offset;
+  }
+
+  auto result = air.CreateGatherCompare(
+      textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord, array_index, call->getArgOperand(10),
+      offsets
+  );
+  if (!result.first)
+    return createError("dxil: AIR gather compare failed");
+  llvm::SmallVector<llvm::Value *, 4> components;
+  appendTexel(components, result.first, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  call->replaceAllUsesWith(buildResult(call, components));
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+llvm::Error
+ResourceLowering::lowerTexture2DMSGetSamplePosition(llvm::CallInst *call) {
+  auto handle = resolve(call->getArgOperand(1));
+  if (!handle)
+    return handle.takeError();
+  auto descriptor = textureDescriptor(*handle, "texture2DMSGetSamplePosition");
+  if (!descriptor)
+    return descriptor.takeError();
+  if (descriptor->ResourceKindLogical != llvm::air::Texture::texture2d_ms &&
+      descriptor->ResourceKindLogical != llvm::air::Texture::texture2d_ms_array)
+    return createError("dxil: texture2DMSGetSamplePosition requires a multisampled 2D texture");
+  builder.SetInsertPoint(call);
+  auto *count = air.CreateTextureQuery(
+      textureOf(*descriptor), descriptor->ResourceHandle, llvm::air::Texture::num_samples, air.getInt(0)
+  );
+  auto *position = air.CreateGetSamplePosition(count, call->getArgOperand(2));
+  llvm::Value *result = llvm::UndefValue::get(call->getType());
+  result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, (uint64_t)0), 0);
+  result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, 1), 1);
+  call->replaceAllUsesWith(result);
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+llvm::Error
+ResourceLowering::lowerRenderTargetGetSamplePosition(llvm::CallInst *call) {
+  builder.SetInsertPoint(call);
+  auto *position = air.CreateGetSamplePosition(air.CreateGetNumSamples(), call->getArgOperand(1));
+  llvm::Value *result = llvm::UndefValue::get(call->getType());
+  result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, (uint64_t)0), 0);
+  result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, 1), 1);
+  call->replaceAllUsesWith(result);
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+llvm::Error
+ResourceLowering::lowerRenderTargetGetSampleCount(llvm::CallInst *call) {
+  builder.SetInsertPoint(call);
+  call->replaceAllUsesWith(air.CreateGetNumSamples());
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+llvm::Error
+ResourceLowering::lowerCalculateLOD(llvm::CallInst *call) {
+  auto texture_handle = resolve(call->getArgOperand(1));
+  if (!texture_handle)
+    return texture_handle.takeError();
+  auto descriptor = textureDescriptor(*texture_handle, "calculateLOD");
+  if (!descriptor)
+    return descriptor.takeError();
+  auto sampler_handle = resolve(call->getArgOperand(2));
+  if (!sampler_handle)
+    return sampler_handle.takeError();
+  if (!sampler_handle->sampler)
+    return createError("dxil: calculateLOD requires a sampler handle");
+  builder.SetInsertPoint(call);
+
+  llvm::Value *coord = nullptr;
+  llvm::Value *array_index = nullptr;
+  llvm::Value *sampler_value = sampler_handle->sampler->SamplerHandle;
+  auto target_error = sampleTarget(
+      *descriptor, sampler_handle->sampler->CubeSamplerHandle, call->getArgOperand(3), call->getArgOperand(4),
+      call->getArgOperand(5), llvm::UndefValue::get(air.getFloatTy()), coord, array_index, sampler_value
+  );
+  if (target_error)
+    return target_error;
+  auto lod = air.CreateCalculateLOD(textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord);
+  lod.first = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, minLodClamp(*descriptor), lod.first);
+  auto *clamped = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(6));
+  if (!clamped)
+    return createError("dxil: calculateLOD clamped operand must be constant");
+  call->replaceAllUsesWith(clamped->isZero() ? lod.second : lod.first);
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+llvm::Error
 ResourceLowering::lowerSampleBias(llvm::CallInst *call) {
   auto texture_handle = resolve(call->getArgOperand(1));
   if (!texture_handle)
@@ -2196,6 +2329,16 @@ ResourceLowering::lowerCall(llvm::CallInst *call) {
     return lowerSample(call);
   case kTextureGather:
     return lowerGather(call);
+  case kTextureGatherCmp:
+    return lowerGatherCmp(call);
+  case kTexture2DMSGetSamplePosition:
+    return lowerTexture2DMSGetSamplePosition(call);
+  case kRenderTargetGetSamplePosition:
+    return lowerRenderTargetGetSamplePosition(call);
+  case kRenderTargetGetSampleCount:
+    return lowerRenderTargetGetSampleCount(call);
+  case kCalculateLOD:
+    return lowerCalculateLOD(call);
   case kSampleBias:
     return lowerSampleBias(call);
   case kSampleLevel:
@@ -2246,6 +2389,11 @@ ResourceLowering::run() {
         case kRawBufferStore:
         case kSample:
         case kTextureGather:
+        case kTextureGatherCmp:
+        case kTexture2DMSGetSamplePosition:
+        case kRenderTargetGetSamplePosition:
+        case kRenderTargetGetSampleCount:
+        case kCalculateLOD:
         case kSampleBias:
         case kSampleLevel:
         case kSampleGrad:

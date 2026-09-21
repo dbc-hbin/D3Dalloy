@@ -327,6 +327,32 @@ int run() {
     std::printf("OWNED_D3D12_QUERY_FREQUENCY ticks_per_second=%llu tick_ns=1\n",
                 static_cast<unsigned long long>(frequency));
 
+    UINT64 calibratedGpu = 0;
+    UINT64 calibratedCpu = 0;
+    expectHRESULT(queue->GetClockCalibration(nullptr, &calibratedCpu), E_INVALIDARG,
+                  "clock_calibration_null_gpu");
+    expectHRESULT(queue->GetClockCalibration(&calibratedGpu, nullptr), E_INVALIDARG,
+                  "clock_calibration_null_cpu");
+    LARGE_INTEGER qpcBefore{}, qpcAfter{};
+    if (!QueryPerformanceCounter(&qpcBefore))
+        fail("QueryPerformanceCounter(before calibration)");
+    check(queue->GetClockCalibration(&calibratedGpu, &calibratedCpu),
+          "GetClockCalibration");
+    if (!QueryPerformanceCounter(&qpcAfter))
+        fail("QueryPerformanceCounter(after calibration)");
+    if (!calibratedGpu || calibratedCpu < static_cast<UINT64>(qpcBefore.QuadPart) ||
+        calibratedCpu > static_cast<UINT64>(qpcAfter.QuadPart))
+        fail("clock calibration did not return a paired GPU/Wine-QPC sample");
+    UINT64 nextGpu = 0;
+    UINT64 nextCpu = 0;
+    check(queue->GetClockCalibration(&nextGpu, &nextCpu),
+          "GetClockCalibration(second)");
+    if (nextGpu < calibratedGpu || nextCpu < calibratedCpu)
+        fail("clock calibration samples are not monotonic");
+    std::printf("OWNED_D3D12_QUERY_CLOCK_CALIBRATION gpu=%llu cpu_qpc=%llu monotonic=1\n",
+                static_cast<unsigned long long>(calibratedGpu),
+                static_cast<unsigned long long>(calibratedCpu));
+
     D3D12_COMMAND_QUEUE_DESC copyQueueDesc{};
     copyQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
     ComPtr<ID3D12CommandQueue> copyQueue;
@@ -335,6 +361,8 @@ int run() {
     UINT64 copyFrequency = 0;
     expectHRESULT(copyQueue->GetTimestampFrequency(&copyFrequency), E_FAIL,
                   "copy_queue_timestamp_frequency_unsupported");
+    expectHRESULT(copyQueue->GetClockCalibration(&calibratedGpu, &calibratedCpu), E_FAIL,
+                  "copy_queue_clock_calibration_unsupported");
 
     runCreationNegatives(device.Get());
 

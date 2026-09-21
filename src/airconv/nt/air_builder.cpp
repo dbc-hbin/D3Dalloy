@@ -1112,6 +1112,20 @@ AIRBuilder::CreateDerivative(Value *Val, bool YAxis) {
   return builder.CreateCall(Fn, Ops);
 }
 
+Value *
+AIRBuilder::CreateGetSamplePosition(Value *SampleCount, Value *Index) {
+  auto &Context = getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::ReadNone)}}
+  );
+  auto Fn = getModule()->getOrInsertFunction(
+      "dxmt.sample_pos.i32", FunctionType::get(getFloatTy(2), {getIntTy(), getIntTy()}, false), Attrs
+  );
+  return builder.CreateCall(Fn, {SampleCount, Index});
+}
+
 CallInst *
 AIRBuilder::CreateDiscard() {
   auto &Context = getContext();

@@ -190,13 +190,17 @@ public:
 };
 
 struct MTL_RENDER_TARGET_DESC {
-  Texture *Texture;
-  TextureViewKey View;
-  UINT Width;
-  UINT Height;
-  UINT DepthPlane;
-  UINT RenderTargetArrayLength;
-  UINT Flags;
+  Texture *Texture = nullptr;
+  TextureViewKey View{};
+  Buffer *BufferResource = nullptr;
+  BufferViewKey BufferView{};
+  BufferSlice BufferRange{};
+  WMTPixelFormat Format = WMTPixelFormatInvalid;
+  UINT Width = 0;
+  UINT Height = 0;
+  UINT DepthPlane = 0;
+  UINT RenderTargetArrayLength = 0;
+  UINT Flags = 0;
 };
 
 class MTLD3D12RenderTargetDescriptorHeap : public ID3D12DescriptorHeap {

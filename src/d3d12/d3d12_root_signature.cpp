@@ -26,11 +26,202 @@
 #include "util_math.hpp"
 #include "util_md5.hpp"
 #include <cstring>
+#include <cmath>
+#include <new>
 #include <vector>
 #include "../d3d10/d3d10_blob.hpp"
 #include "../airconv/dxbc_root_signature.hpp"
 
 namespace dxmt {
+
+namespace {
+
+struct RootBinding {
+  D3D12_DESCRIPTOR_RANGE_TYPE type;
+  UINT shader_register;
+  UINT register_space;
+  UINT64 count;
+  D3D12_SHADER_VISIBILITY visibility;
+};
+
+inline D3D12_DESCRIPTOR_RANGE_FLAGS RangeFlags(const D3D12_DESCRIPTOR_RANGE &) {
+  return D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+}
+inline D3D12_DESCRIPTOR_RANGE_FLAGS RangeFlags(const D3D12_DESCRIPTOR_RANGE1 &range) {
+  return range.Flags;
+}
+inline D3D12_ROOT_DESCRIPTOR_FLAGS DescriptorFlags(const D3D12_ROOT_DESCRIPTOR &) {
+  return D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+}
+inline D3D12_ROOT_DESCRIPTOR_FLAGS DescriptorFlags(const D3D12_ROOT_DESCRIPTOR1 &descriptor) {
+  return descriptor.Flags;
+}
+
+bool ValidVisibility(D3D12_SHADER_VISIBILITY visibility) {
+  return visibility >= D3D12_SHADER_VISIBILITY_ALL && visibility <= D3D12_SHADER_VISIBILITY_PIXEL;
+}
+bool VisibilitiesOverlap(D3D12_SHADER_VISIBILITY a, D3D12_SHADER_VISIBILITY b) {
+  return a == D3D12_SHADER_VISIBILITY_ALL || b == D3D12_SHADER_VISIBILITY_ALL || a == b;
+}
+
+bool ValidFilter(D3D12_FILTER filter) {
+  const UINT value = static_cast<UINT>(filter);
+  const UINT reduction = (value >> D3D12_FILTER_REDUCTION_TYPE_SHIFT) & D3D12_FILTER_REDUCTION_TYPE_MASK;
+  const UINT min = (value >> D3D12_MIN_FILTER_SHIFT) & D3D12_FILTER_TYPE_MASK;
+  const UINT mag = (value >> D3D12_MAG_FILTER_SHIFT) & D3D12_FILTER_TYPE_MASK;
+  const UINT mip = (value >> D3D12_MIP_FILTER_SHIFT) & D3D12_FILTER_TYPE_MASK;
+  if ((value & ~0x1d5u) || reduction > D3D12_FILTER_REDUCTION_TYPE_MAXIMUM || min > 1 || mag > 1 || mip > 1)
+    return false;
+  return !(value & D3D12_ANISOTROPIC_FILTERING_BIT) || (min == 1 && mag == 1 && mip == 1);
+}
+
+bool ValidStaticSampler(const D3D12_STATIC_SAMPLER_DESC &sampler) {
+  const auto valid_address = [](D3D12_TEXTURE_ADDRESS_MODE mode) {
+    return mode >= D3D12_TEXTURE_ADDRESS_MODE_WRAP && mode <= D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+  };
+  return ValidFilter(sampler.Filter) && valid_address(sampler.AddressU) && valid_address(sampler.AddressV) &&
+         valid_address(sampler.AddressW) && std::isfinite(sampler.MipLODBias) && sampler.MipLODBias >= -16.0f &&
+         sampler.MipLODBias <= 15.99f && sampler.MaxAnisotropy >= 1 && sampler.MaxAnisotropy <= 16 &&
+         sampler.ComparisonFunc >= D3D12_COMPARISON_FUNC_NEVER &&
+         sampler.ComparisonFunc <= D3D12_COMPARISON_FUNC_ALWAYS &&
+         sampler.BorderColor >= D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK &&
+         sampler.BorderColor <= D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE && !std::isnan(sampler.MinLOD) &&
+         !std::isnan(sampler.MaxLOD) && sampler.MinLOD <= sampler.MaxLOD && ValidVisibility(sampler.ShaderVisibility);
+}
+
+template <typename ROOT_SIGNATURE_DESC>
+HRESULT ValidateRootSignatureDesc(const ROOT_SIGNATURE_DESC &desc) {
+  using ROOT_PARAMETER = typename GetType<ROOT_SIGNATURE_DESC>::ROOT_PARAMETER;
+  using DESCRIPTOR_RANGE = typename GetType<ROOT_SIGNATURE_DESC>::DESCRIPTOR_RANGE;
+  const UINT signature_flags = static_cast<UINT>(desc.Flags);
+  if ((desc.NumParameters && !desc.pParameters) || (desc.NumStaticSamplers && !desc.pStaticSamplers) ||
+      (signature_flags & ~0x3ffu) || ((signature_flags & 0x80u) && signature_flags != 0x80u) ||
+      ((signature_flags & 0x80u) && desc.NumStaticSamplers))
+    return E_INVALIDARG;
+
+  const bool local = (signature_flags & 0x80u) != 0;
+  UINT root_cost = 0;
+  UINT local_bytes = 0;
+  // The 4 KiB record cap includes the 32-byte shader identifier.
+  constexpr UINT local_payload_limit = static_cast<UINT>(
+      raytracing::kMaxShaderRecordSize - raytracing::kShaderIdentifierSize);
+  const UINT root_cost_limit = local ? local_payload_limit / 4u : D3D12_MAX_ROOT_COST;
+  std::vector<RootBinding> bindings;
+  try {
+    bindings.reserve(desc.NumParameters + desc.NumStaticSamplers);
+    for (UINT i = 0; i < desc.NumParameters; ++i) {
+      const ROOT_PARAMETER &parameter = desc.pParameters[i];
+      if (!ValidVisibility(parameter.ShaderVisibility))
+        return E_INVALIDARG;
+      switch (parameter.ParameterType) {
+      case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: {
+        const auto &table = parameter.DescriptorTable;
+        if (!table.NumDescriptorRanges || !table.pDescriptorRanges || root_cost == root_cost_limit)
+          return E_INVALIDARG;
+        ++root_cost;
+        if (local) {
+          local_bytes = (local_bytes + 7u) & ~7u;
+          if (local_bytes > local_payload_limit - 8u)
+            return E_INVALIDARG;
+          local_bytes += 8u;
+        }
+        const bool sampler_heap = table.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        UINT64 previous_end = 0;
+        std::vector<std::pair<UINT64, UINT64>> spans;
+        spans.reserve(table.NumDescriptorRanges);
+        for (UINT j = 0; j < table.NumDescriptorRanges; ++j) {
+          const DESCRIPTOR_RANGE &range = table.pDescriptorRanges[j];
+          if (range.RangeType < D3D12_DESCRIPTOR_RANGE_TYPE_SRV || range.RangeType > D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER ||
+              !range.NumDescriptors || ((range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) != sampler_heap))
+            return E_INVALIDARG;
+          const UINT flags = static_cast<UINT>(RangeFlags(range));
+          const UINT data_flags = flags & 0xeu;
+          if ((flags & ~0xfu) || (data_flags && data_flags != 0x2u && data_flags != 0x4u && data_flags != 0x8u) ||
+              (range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER && (flags & ~0x1u)))
+            return E_INVALIDARG;
+          const UINT64 offset = range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                                  ? previous_end : range.OffsetInDescriptorsFromTableStart;
+          const UINT64 end = offset + range.NumDescriptors;
+          if (end > UINT64(UINT32_MAX) + 1 || (range.NumDescriptors == UINT_MAX && j + 1 != table.NumDescriptorRanges))
+            return E_INVALIDARG;
+          for (const auto &span : spans)
+            if (offset < span.second && span.first < end)
+              return E_INVALIDARG;
+          spans.emplace_back(offset, end);
+          previous_end = end;
+          if (UINT64(range.BaseShaderRegister) + range.NumDescriptors > UINT64(UINT32_MAX) + 1)
+            return E_INVALIDARG;
+          bindings.push_back({range.RangeType, range.BaseShaderRegister, range.RegisterSpace,
+                              range.NumDescriptors, parameter.ShaderVisibility});
+        }
+        break;
+      }
+      case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+        if (!parameter.Constants.Num32BitValues || parameter.Constants.Num32BitValues > D3D12_MAX_ROOT_COST - root_cost)
+          return E_INVALIDARG;
+        root_cost += parameter.Constants.Num32BitValues;
+        if (local) {
+          if (parameter.Constants.Num32BitValues > (local_payload_limit - local_bytes) / 4u)
+            return E_INVALIDARG;
+          local_bytes += parameter.Constants.Num32BitValues * 4u;
+        }
+        bindings.push_back({D3D12_DESCRIPTOR_RANGE_TYPE_CBV, parameter.Constants.ShaderRegister,
+                            parameter.Constants.RegisterSpace, 1, parameter.ShaderVisibility});
+        break;
+      case D3D12_ROOT_PARAMETER_TYPE_CBV:
+      case D3D12_ROOT_PARAMETER_TYPE_SRV:
+      case D3D12_ROOT_PARAMETER_TYPE_UAV: {
+        if (root_cost > D3D12_MAX_ROOT_COST - 2)
+          return E_INVALIDARG;
+        root_cost += 2;
+        if (local) {
+          local_bytes = (local_bytes + 7u) & ~7u;
+          if (local_bytes > local_payload_limit - 8u)
+            return E_INVALIDARG;
+          local_bytes += 8u;
+        }
+        const UINT flags = static_cast<UINT>(DescriptorFlags(parameter.Descriptor));
+        const UINT data_flags = flags & 0xeu;
+        if ((flags & ~0xeu) || (data_flags && data_flags != 0x2u && data_flags != 0x4u && data_flags != 0x8u))
+          return E_INVALIDARG;
+        const auto type = parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV :
+                          parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV :
+                                                                                    D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        bindings.push_back({type, parameter.Descriptor.ShaderRegister, parameter.Descriptor.RegisterSpace, 1,
+                            parameter.ShaderVisibility});
+        break;
+      }
+      default:
+        return E_INVALIDARG;
+      }
+    }
+    for (UINT i = 0; i < desc.NumStaticSamplers; ++i) {
+      const auto &sampler = desc.pStaticSamplers[i];
+      if (!ValidStaticSampler(sampler))
+        return E_INVALIDARG;
+      bindings.push_back({D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, sampler.ShaderRegister, sampler.RegisterSpace, 1,
+                          sampler.ShaderVisibility});
+    }
+  } catch (const std::bad_alloc &) {
+    return E_OUTOFMEMORY;
+  }
+
+  for (size_t i = 0; i < bindings.size(); ++i) {
+    const auto &a = bindings[i];
+    const UINT64 a_end = UINT64(a.shader_register) + a.count;
+    for (size_t j = i + 1; j < bindings.size(); ++j) {
+      const auto &b = bindings[j];
+      if (a.type != b.type || a.register_space != b.register_space || !VisibilitiesOverlap(a.visibility, b.visibility))
+        continue;
+      const UINT64 b_end = UINT64(b.shader_register) + b.count;
+      if (UINT64(a.shader_register) < b_end && UINT64(b.shader_register) < a_end)
+        return E_INVALIDARG;
+    }
+  }
+  return S_OK;
+}
+
+} // namespace
 
 #pragma region Serialization
 
@@ -39,6 +230,11 @@ HRESULT
 SerializeVersionedRootSignatureImpl(
     const ROOT_SIGNATURE_DESC *pDesc, D3D_ROOT_SIGNATURE_VERSION Version, ID3DBlob **ppBlob, ID3DBlob **ppErrorBlob
 ) {
+  if (!pDesc)
+    return E_INVALIDARG;
+  if (HRESULT hr = ValidateRootSignatureDesc(*pDesc); FAILED(hr))
+    return hr;
+
   using ROOT_PARAMETER = GetType<ROOT_SIGNATURE_DESC>::ROOT_PARAMETER;
   using ROOT_DESCRIPTOR = GetType<ROOT_SIGNATURE_DESC>::ROOT_DESCRIPTOR;
   using DESCRIPTOR_RANGE = GetType<ROOT_SIGNATURE_DESC>::DESCRIPTOR_RANGE;
@@ -51,7 +247,8 @@ SerializeVersionedRootSignatureImpl(
       this->offset = offset;
       size_aligned = align(size, 4);
       ptr = malloc(size_aligned);
-      memset(ptr, 0, size_aligned);
+      if (ptr)
+        memset(ptr, 0, size_aligned);
     }
     ~segment() {
       free(ptr);
@@ -203,7 +400,7 @@ D3D12SerializeVersionedRootSignature(
   // InitReturnPtr(ppBlob); // deliberately, don't touch it
   InitReturnPtr(ppErrorBlob);
 
-  if (!ppBlob)
+  if (!pRootSignatureDesc || !ppBlob)
     return E_INVALIDARG;
 
   switch (pRootSignatureDesc->Version) {
@@ -230,7 +427,7 @@ D3D12SerializeRootSignature(
   // InitReturnPtr(ppBlob); // deliberately, don't touch it
   InitReturnPtr(ppErrorBlob);
 
-  if (!ppBlob || Version != D3D_ROOT_SIGNATURE_VERSION_1_0)
+  if (!pRootSignatureDesc || !ppBlob || Version != D3D_ROOT_SIGNATURE_VERSION_1_0)
     return E_INVALIDARG;
 
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned_desc;
@@ -370,6 +567,8 @@ class MTLD3D12RootSignatureImpl : public MTLD3D12DeviceChild<MTLD3D12RootSignatu
 
   std::vector<uint8_t> blob_;
   std::vector<uint32_t> qword_offsets_;
+  std::vector<D3D12_ROOT_PARAMETER_TYPE> parameter_types_;
+  std::vector<UINT> parameter_constant_counts_;
   std::vector<raytracing::LocalRootCopy> local_root_copies_;
 
   std::vector<Rc<Sampler>> static_samplers_; // which is not really "static"
@@ -402,40 +601,10 @@ public:
       return hr;
 
     auto &desc = deserializer.desc_1_1_.Desc_1_1;
+    if (FAILED(hr = ValidateRootSignatureDesc(desc)))
+      return hr;
 
-    if (desc.NumParameters) {
-      if (desc.NumParameters > D3D12_MAX_ROOT_COST)
-        return E_INVALIDARG;
-
-      for (unsigned i = 0; i < desc.NumParameters; i++) {
-        if (!desc.pParameters)
-          return E_INVALIDARG;
-        auto &parameter = desc.pParameters[i];
-        if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-          bool is_normal_range = false, is_sampler_range = false;
-          for (unsigned j = 0; j < parameter.DescriptorTable.NumDescriptorRanges; j++) {
-            if (!parameter.DescriptorTable.pDescriptorRanges)
-              return E_INVALIDARG;
-            auto &range = parameter.DescriptorTable.pDescriptorRanges[j];
-            switch (range.RangeType) {
-            case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
-            case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
-            case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
-              is_normal_range = true;
-              break;
-            case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
-              is_sampler_range = true;
-              break;
-            default:
-              return E_INVALIDARG;
-            }
-          }
-          if (is_normal_range && is_sampler_range)
-            return E_INVALIDARG;
-        }
-      }
-    }
-
+    IsLocal = (static_cast<UINT>(desc.Flags) & 0x80u) != 0;
     NumStaticSamplers = desc.NumStaticSamplers;
     if (NumStaticSamplers) {
       for (unsigned i = 0; i < desc.NumStaticSamplers; i++) {
@@ -454,10 +623,19 @@ public:
     }
 
     auto [offsets, total_qwords] = CalculateRootSignatureQwordOffsets(desc);
-    qword_offsets_ = offsets;
+    qword_offsets_ = std::move(offsets);
+    parameter_types_.reserve(desc.NumParameters);
+    parameter_constant_counts_.reserve(desc.NumParameters);
+    for (UINT i = 0; i < desc.NumParameters; ++i) {
+      parameter_types_.push_back(desc.pParameters[i].ParameterType);
+      parameter_constant_counts_.push_back(desc.pParameters[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS
+                                                ? desc.pParameters[i].Constants.Num32BitValues : 0);
+    }
     UploadQwords = total_qwords;
     ParameterSlots = qword_offsets_.size();
     SlotQwordOffsets = qword_offsets_.data();
+    ParameterTypes = parameter_types_.data();
+    ParameterConstantCounts = parameter_constant_counts_.data();
 
     /*
      * Local root argument translation for raytracing shader records. The
@@ -532,6 +710,8 @@ CreateRootSignature(
     void **ppRootSignature
 ) {
   InitReturnPtr(ppRootSignature);
+  if (!ppRootSignature || NodeMask > 1 || !pBytecode || !BytecodeLength)
+    return E_INVALIDARG;
 
   auto root_sig = Com(new MTLD3D12RootSignatureImpl(pDevice, pBytecode, BytecodeLength));
   HRESULT hr = root_sig->Initialize();

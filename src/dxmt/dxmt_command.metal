@@ -17,6 +17,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <metal_stdlib>
 #include <metal_common>
 #include <metal_texture>
 #include <metal_math>
@@ -565,7 +566,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearFloatMetadata& meta [[buffer(1)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
-  tex.write(meta.value, meta.offset + pos);
+  if (all(pos < meta.size))
+    tex.write(meta.value, meta.offset + pos);
 }
 
 [[kernel]] void cs_clear_texture2d_array_float(
@@ -573,7 +575,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearFloatMetadata& meta [[buffer(1)]],
     uint3 pos [[thread_position_in_grid]]
 ) {
-  tex.write(meta.value, meta.offset + pos.xy, pos.z);
+  if (all(pos.xy < meta.size))
+    tex.write(meta.value, meta.offset + pos.xy, pos.z);
 }
 
 [[kernel]] void cs_clear_texture3d_float(
@@ -581,6 +584,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearFloatMetadata& meta [[buffer(1)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
+  if (!all(pos < meta.size))
+    return;
   auto depth = tex.get_depth();
   for (uint i = 0; i < depth; i++) {
     uint2 final_pos = meta.offset + pos;
@@ -593,7 +598,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearUintMetadata& meta [[buffer(1)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
-  tex.write(meta.value, meta.offset + pos);
+  if (all(pos < meta.size))
+    tex.write(meta.value, meta.offset + pos);
 }
 
 [[kernel]] void cs_clear_texture2d_array_uint(
@@ -601,7 +607,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearUintMetadata& meta [[buffer(1)]],
     uint3 pos [[thread_position_in_grid]]
 ) {
-  tex.write(meta.value, meta.offset + pos.xy, pos.z);
+  if (all(pos.xy < meta.size))
+    tex.write(meta.value, meta.offset + pos.xy, pos.z);
 }
 
 [[kernel]] void cs_clear_texture3d_uint(
@@ -609,6 +616,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearUintMetadata& meta [[buffer(1)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
+  if (!all(pos < meta.size))
+    return;
   auto depth = tex.get_depth();
   for (uint i = 0; i < depth; i++) {
     uint2 final_pos = meta.offset + pos;
@@ -621,7 +630,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearFloatMetadata& meta [[buffer(1)]],
     uint pos [[thread_position_in_grid]]
 ) {
-  tex.write(meta.value, meta.offset.x + pos);
+  if (pos < meta.size.x)
+    tex.write(meta.value, meta.offset.x + pos);
 }
 
 [[kernel]] void cs_clear_tbuffer_uint(
@@ -629,7 +639,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearUintMetadata& meta [[buffer(1)]],
     uint pos [[thread_position_in_grid]]
 ) {
-  tex.write(meta.value, meta.offset.x + pos);
+  if (pos < meta.size.x)
+    tex.write(meta.value, meta.offset.x + pos);
 }
 
 [[kernel]] void cs_clear_buffer_float(
@@ -637,7 +648,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearFloatMetadata& meta [[buffer(1)]],
     uint pos [[thread_position_in_grid]]
 ) {
-  buffer[meta.offset.x + pos] = meta.value.x;
+  if (pos < meta.size.x)
+    buffer[meta.offset.x + pos] = meta.value.x;
 }
 
 [[kernel]] void cs_clear_buffer_uint(
@@ -645,7 +657,8 @@ struct DXMTClearUintMetadata {
     constant DXMTClearUintMetadata& meta [[buffer(1)]],
     uint pos [[thread_position_in_grid]]
 ) {
-  buffer[meta.offset.x + pos] = meta.value.x;
+  if (pos < meta.size.x)
+    buffer[meta.offset.x + pos] = meta.value.x;
 }
 
 [[kernel]] void cs_downscale_dilated_mv(
@@ -667,6 +680,108 @@ struct DXMTClearUintMetadata {
 
 [[kernel]] void tile_barrier(ushort2 pos [[thread_position_in_threadgroup]]) {
   // empty
+}
+
+struct DXMTResolveVertexOutput {
+  float4 position [[position]];
+};
+
+struct DXMTResolveParameters {
+  int2 source_delta;
+  uint sample_count;
+  uint mode;
+  uint predicate_enabled;
+  uint predicate_not_equal;
+};
+
+[[vertex]] DXMTResolveVertexOutput dxmt_resolve_vertex(uint vertex_id [[vertex_id]]) {
+  const float2 positions[] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+  return {float4(positions[vertex_id], 0.0, 1.0)};
+}
+
+template <typename T>
+vec<T, 4> dxmt_resolve_value(texture2d_ms<T, access::read> source, uint2 coordinate,
+                             constant DXMTResolveParameters &parameters) {
+  vec<T, 4> value = source.read(coordinate, 0);
+  if (parameters.mode == 0) {
+    for (uint sample = 1; sample < parameters.sample_count; ++sample)
+      value += source.read(coordinate, sample);
+    return value / T(parameters.sample_count);
+  }
+  for (uint sample = 1; sample < parameters.sample_count; ++sample) {
+    const vec<T, 4> next = source.read(coordinate, sample);
+    value = parameters.mode == 1 ? metal::min(value, next) : metal::max(value, next);
+  }
+  return value;
+}
+
+bool dxmt_resolve_predicate_passes(device const ulong *predicate,
+                                    constant DXMTResolveParameters &parameters) {
+  if (!parameters.predicate_enabled)
+    return true;
+  return parameters.predicate_not_equal ? predicate[0] == 0 : predicate[0] != 0;
+}
+
+[[fragment]] float4 dxmt_resolve_float(
+    DXMTResolveVertexOutput input [[stage_in]], texture2d_ms<float, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters))
+    discard_fragment();
+  return dxmt_resolve_value(source, uint2(int2(input.position.xy) + parameters.source_delta), parameters);
+}
+
+[[fragment]] uint4 dxmt_resolve_uint(
+    DXMTResolveVertexOutput input [[stage_in]], texture2d_ms<uint, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters))
+    discard_fragment();
+  return dxmt_resolve_value(source, uint2(int2(input.position.xy) + parameters.source_delta), parameters);
+}
+
+[[fragment]] int4 dxmt_resolve_sint(
+    DXMTResolveVertexOutput input [[stage_in]], texture2d_ms<int, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters))
+    discard_fragment();
+  return dxmt_resolve_value(source, uint2(int2(input.position.xy) + parameters.source_delta), parameters);
+}
+
+struct DXMTDepthResolveOutput {
+  float depth [[depth(any)]];
+};
+
+[[fragment]] DXMTDepthResolveOutput dxmt_resolve_depth(
+    DXMTResolveVertexOutput input [[stage_in]], depth2d_ms<float, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters))
+    discard_fragment();
+  const uint2 coordinate = uint2(int2(input.position.xy) + parameters.source_delta);
+  float value = source.read(coordinate, 0);
+  for (uint sample = 1; sample < parameters.sample_count; ++sample) {
+    const float next = source.read(coordinate, sample);
+    value = parameters.mode == 1 ? (value < next ? value : next)
+                                 : (value > next ? value : next);
+  }
+  return {value};
+}
+
+struct DXMTStencilResolveOutput {
+  uint stencil [[stencil]];
+};
+
+[[fragment]] DXMTStencilResolveOutput dxmt_resolve_stencil(
+    DXMTResolveVertexOutput input [[stage_in]], texture2d_ms<uint, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters))
+    discard_fragment();
+  const uint2 coordinate = uint2(int2(input.position.xy) + parameters.source_delta);
+  uint value = source.read(coordinate, 0).x;
+  for (uint sample = 1; sample < parameters.sample_count; ++sample) {
+    const uint next = source.read(coordinate, sample).x;
+    value = parameters.mode == 1 ? (value < next ? value : next)
+                                 : (value > next ? value : next);
+  }
+  return {value};
 }
 
 // Keep the acceleration-structure helper kernels in the same metallib as the existing

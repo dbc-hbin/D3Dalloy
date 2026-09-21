@@ -1669,6 +1669,33 @@ WMTASEncoder_fence(obj_handle_t encoder, obj_handle_t fence, bool update) {
 }
 
 WINEMETAL_API uint64_t
+MTLAllocation_allocatedSize(obj_handle_t allocation) {
+  struct unixcall_generic_obj_uint64_ret params = {0};
+  params.handle = allocation;
+  UNIX_CALL(202, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLResidencySet_allocatedSize(obj_handle_t residency_set) {
+  struct unixcall_generic_obj_uint64_ret params = {0};
+  params.handle = residency_set;
+  UNIX_CALL(203, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLDevice_sampleTimestamps(obj_handle_t device, uint64_t *cpu_timestamp, uint64_t *gpu_timestamp) {
+  struct unixcall_mtldevice_sampletimestamps params;
+  params.device = device;
+  params.cpu_timestamp = 0;
+  params.gpu_timestamp = 0;
+  UNIX_CALL(201, &params);
+  *cpu_timestamp = params.cpu_timestamp;
+  *gpu_timestamp = params.gpu_timestamp;
+}
+
+WINEMETAL_API uint64_t
 MTLResource_gpuResourceID(obj_handle_t resource) {
   struct unixcall_wmt_resource_id params;
   params.resource = resource;

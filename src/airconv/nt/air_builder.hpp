@@ -250,6 +250,8 @@ public:
 
   Value *CreateGetNumSamples();
 
+  Value *CreateGetSamplePosition(Value *SampleCount, Value *Index);
+
   Value *CreateDerivative(Value *Val, bool YAxis);
 
   CallInst *CreateDiscard();

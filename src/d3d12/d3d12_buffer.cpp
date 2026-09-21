@@ -21,13 +21,16 @@
 #include "d3d12_resource_contract.hpp"
 #include "com/com_pointer.hpp"
 #include "dxmt_format.hpp"
+#include <new>
 
 namespace dxmt {
 
 namespace {
 
 HRESULT
-BuildBufferSlice(UINT64 buffer_size, UINT64 first_element, UINT num_elements, UINT stride, BufferSlice &slice) {
+BuildBufferSlice(
+    UINT64 buffer_size, UINT64 first_element, UINT num_elements, UINT stride, bool texel_view, BufferSlice &slice
+) {
   if (!stride || !num_elements)
     return E_INVALIDARG;
   if (first_element > UINT64_MAX / stride || static_cast<UINT64>(num_elements) > UINT64_MAX / stride)
@@ -37,13 +40,10 @@ BuildBufferSlice(UINT64 buffer_size, UINT64 first_element, UINT num_elements, UI
   const UINT64 byte_length = static_cast<UINT64>(num_elements) * stride;
   if (byte_offset > buffer_size || byte_length > buffer_size - byte_offset)
     return E_INVALIDARG;
-  if (byte_offset > UINT32_MAX || byte_length > UINT32_MAX || first_element > UINT32_MAX)
-    return E_NOTIMPL;
-
-  slice.firstElement = static_cast<uint32_t>(first_element);
+  slice.firstElement = texel_view ? 0 : static_cast<uint32_t>(first_element);
   slice.elementCount = num_elements;
-  slice.byteOffset = static_cast<uint32_t>(byte_offset);
-  slice.byteLength = static_cast<uint32_t>(byte_length);
+  slice.byteOffset = byte_offset;
+  slice.byteLength = byte_length;
   return S_OK;
 }
 
@@ -53,6 +53,7 @@ class MTLD3D12Buffer : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
   D3D12_HEAP_PROPERTIES heap_props_;
   D3D12_HEAP_FLAGS heap_flags_;
+  bool owns_registration_ = false;
 
 public:
   MTLD3D12Buffer(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Resource>(pDevice) {}
@@ -86,21 +87,29 @@ public:
         return E_INVALIDARG;
     }
 
-    buffer = new Buffer(desc_.Width, device_->GetMTLDevice());
+    try {
+      buffer = new Buffer(desc_.Width, device_->GetMTLDevice());
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    }
 
     Flags<BufferAllocationFlag> flags;
     if (pHeap)
       buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
     else
       buffer->rename(buffer->allocate(flags));
-    device_->RegisterResidencyAndVA(buffer->current());
-
-    return S_OK;
+    if (!buffer->current())
+      return E_OUTOFMEMORY;
+    owns_registration_ = !pHeap;
+    return device_->RegisterResidencyAndVA(
+        buffer->current(), owns_registration_ ? this : nullptr,
+        pHeap || !(HeapFlags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT)
+    );
   };
 
   ~MTLD3D12Buffer() {
-    if (buffer)
-      device_->UnregisterResidencyAndVA(buffer->current());
+    if (buffer && buffer->current())
+      device_->UnregisterResidencyAndVA(buffer->current(), owns_registration_ ? this : nullptr);
   }
 
   HRESULT
@@ -128,7 +137,7 @@ public:
   Map(UINT Subresource, const D3D12_RANGE *pReadRange, void **ppData) {
     if (Subresource)
       return E_INVALIDARG;
-    if (heap_props_.Type == D3D12_HEAP_TYPE_DEFAULT)
+    if (!IsCpuVisibleHeap(&heap_props_))
       return E_INVALIDARG;
     if (ppData)
       *ppData = buffer->current()->mappedMemory(0);
@@ -185,7 +194,8 @@ public:
       ViewDesc = *pDesc;
     }
 
-    if (ViewDesc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER)
+    if ((desc_.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+        ViewDesc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER)
       return E_INVALIDARG;
 
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
@@ -207,7 +217,7 @@ public:
 
     if (raw || structured) {
       const UINT Stride = raw ? 4 : ViewDesc.Buffer.StructureByteStride;
-      hr = BuildBufferSlice(desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Stride, Slice);
+      hr = BuildBufferSlice(desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Stride, false, Slice);
       if (FAILED(hr))
         return hr;
       return Heap->AddShaderResourceView(Index, buffer.ptr(), Slice);
@@ -222,12 +232,18 @@ public:
       return E_INVALIDARG;
     BufferViewDescriptor view_descriptor{Format.PixelFormat};
     hr = BuildBufferSlice(
-        desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Format.BytesPerTexel, Slice
+        desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Format.BytesPerTexel, true, Slice
     );
     if (FAILED(hr))
       return hr;
+    view_descriptor.byteOffset = Slice.byteOffset & ~UINT64(255);
+    const UINT64 prefix_bytes = Slice.byteOffset - view_descriptor.byteOffset;
+    view_descriptor.byteLength = prefix_bytes + Slice.byteLength;
+    Slice.firstElement = static_cast<UINT>(prefix_bytes / Format.BytesPerTexel);
 
     auto view = buffer->createView(view_descriptor);
+    if (!buffer->view(view))
+      return E_OUTOFMEMORY;
     return Heap->AddShaderResourceView(Index, buffer.ptr(), view, Slice);
   };
 
@@ -245,7 +261,8 @@ public:
       ViewDesc = *pDesc;
     }
 
-    if (ViewDesc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
+    if (!(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        ViewDesc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER)
       return E_INVALIDARG;
 
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
@@ -270,7 +287,7 @@ public:
 
     if (raw || structured) {
       const UINT Stride = raw ? 4 : ViewDesc.Buffer.StructureByteStride;
-      hr = BuildBufferSlice(desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Stride, Slice);
+      hr = BuildBufferSlice(desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Stride, false, Slice);
       if (FAILED(hr))
         return hr;
       if (!pCounter)
@@ -296,20 +313,68 @@ public:
     if (!Format.BytesPerTexel)
       return E_INVALIDARG;
     BufferViewDescriptor view_descriptor{Format.PixelFormat};
+    view_descriptor.writable = true;
     hr = BuildBufferSlice(
-        desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Format.BytesPerTexel, Slice
+        desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Format.BytesPerTexel, true, Slice
     );
     if (FAILED(hr))
       return hr;
+    view_descriptor.byteOffset = Slice.byteOffset & ~UINT64(255);
+    const UINT64 prefix_bytes = Slice.byteOffset - view_descriptor.byteOffset;
+    view_descriptor.byteLength = prefix_bytes + Slice.byteLength;
+    Slice.firstElement = static_cast<UINT>(prefix_bytes / Format.BytesPerTexel);
 
     auto view = buffer->createView(view_descriptor);
+    if (!buffer->view(view))
+      return E_OUTOFMEMORY;
     return Heap->AddUnorderedAccessView(Index, buffer.ptr(), view, Slice);
   };
 
   virtual HRESULT STDMETHODCALLTYPE
   CreateRenderTargetView(const D3D12_RENDER_TARGET_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor) {
-    WARN("D3D12Buffer::CreateRenderTargetView: buffer RTV is not implemented");
-    return E_NOTIMPL;
+    if (!pDesc || !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+        pDesc->ViewDimension != D3D12_RTV_DIMENSION_BUFFER || pDesc->Format == DXGI_FORMAT_UNKNOWN)
+      return E_INVALIDARG;
+
+    MTL_DXGI_FORMAT_DESC format;
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), pDesc->Format, format)) || !format.BytesPerTexel ||
+        format.PixelFormat == WMTPixelFormatInvalid || (format.Flag & MTL_DXGI_FORMAT_TYPELESS) ||
+        !any_bit_set(device_->GetMTLPixelFormatCapability(format.PixelFormat) & FormatCapability::Color))
+      return E_INVALIDARG;
+
+    BufferSlice slice;
+    HRESULT hr = BuildBufferSlice(
+        desc_.Width, pDesc->Buffer.FirstElement, pDesc->Buffer.NumElements, format.BytesPerTexel, true, slice
+    );
+    if (FAILED(hr))
+      return hr;
+
+    // A Metal render attachment must be a 2D texture. Texture-buffer views are
+    // deliberately not marked RenderTarget: Metal does not permit using them as
+    // attachments. Recording creates a private single-row texture, copies this
+    // exact range in, renders, and copies it back.
+    BufferViewDescriptor view_descriptor{format.PixelFormat};
+    view_descriptor.writable = true;
+    view_descriptor.byteOffset = slice.byteOffset & ~UINT64(255);
+    const UINT64 prefix_bytes = slice.byteOffset - view_descriptor.byteOffset;
+    view_descriptor.byteLength = prefix_bytes + slice.byteLength;
+    slice.firstElement = static_cast<UINT>(prefix_bytes / format.BytesPerTexel);
+
+    const auto view = buffer->createView(view_descriptor);
+    if (!buffer->view(view))
+      return E_OUTOFMEMORY;
+
+    auto [heap, index] = GetRenderTargetHeap(device_, Descriptor);
+    const MTL_RENDER_TARGET_DESC render_target{
+        .BufferResource = buffer.ptr(),
+        .BufferView = view,
+        .BufferRange = slice,
+        .Format = format.PixelFormat,
+        .Width = pDesc->Buffer.NumElements,
+        .Height = 1,
+        .RenderTargetArrayLength = 1,
+    };
+    return heap->AddRenderTarget(index, &render_target);
   };
 
   virtual HRESULT STDMETHODCALLTYPE
@@ -331,7 +396,10 @@ CreateCommittedBuffer(
     const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue,
     REFIID riid, void **ppResource
 ) {
-  auto buffer = Com(new MTLD3D12Buffer(pDevice));
+  auto *impl = new (std::nothrow) MTLD3D12Buffer(pDevice);
+  if (!impl)
+    return E_OUTOFMEMORY;
+  auto buffer = Com(impl);
   HRESULT hr = buffer->Initialize(pHeapProps, HeapFlags, pDesc, OptimizedClearValue, nullptr, 0);
   if (FAILED(hr))
     return hr;
@@ -345,7 +413,10 @@ CreatePlacedBuffer(
     MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, UINT64 Offset, const D3D12_RESOURCE_DESC *pDesc,
     D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
 ) {
-  auto buffer = Com(new MTLD3D12Buffer(pDevice));
+  auto *impl = new (std::nothrow) MTLD3D12Buffer(pDevice);
+  if (!impl)
+    return E_OUTOFMEMORY;
+  auto buffer = Com(impl);
   D3D12_HEAP_DESC heap_desc = pHeap->GetDesc();
 
   if (heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS)

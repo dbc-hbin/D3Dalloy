@@ -497,6 +497,12 @@ struct unixcall_wmt_resource_id {
   uint64_t ret;
 };
 
+struct unixcall_mtldevice_sampletimestamps {
+  obj_handle_t device;
+  uint64_t cpu_timestamp;
+  uint64_t gpu_timestamp;
+};
+
 struct unixcall_mtlcomputeencoder_functiontable {
   obj_handle_t encoder;
   obj_handle_t table;

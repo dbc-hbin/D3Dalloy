@@ -214,6 +214,10 @@ public:
 
 class Allocation : public Object {
 public:
+  uint64_t
+  allocatedSize() const {
+    return MTLAllocation_allocatedSize(handle);
+  }
 };
 
 class Resource : public Allocation {
@@ -571,6 +575,15 @@ public:
   }
 
   void
+  setDepthStencilState(DepthStencilState state) {
+    struct wmtcmd_render_setdepthstencilstate cmd;
+    cmd.type = WMTRenderCommandSetDepthStencilState;
+    cmd.next.set(nullptr);
+    cmd.depth_stencil_state = state;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
   drawPrimitives(WMTPrimitiveType primitive_type, uint32_t vertex_start, uint32_t vertex_count) {
     struct wmtcmd_render_draw cmd;
     cmd.type = WMTRenderCommandDraw;
@@ -869,6 +882,11 @@ public:
   commit() {
     MTLResidencySet_commit(handle);
   }
+
+  uint64_t
+  allocatedSize() const {
+    return MTLResidencySet_allocatedSize(handle);
+  }
 };
 
 class CommandBuffer : public Object {
@@ -1016,6 +1034,11 @@ public:
   uint64_t
   maxBufferLength() const {
     return MTLDevice_maxBufferLength(handle);
+  }
+
+  void
+  sampleTimestamps(uint64_t *cpu_timestamp, uint64_t *gpu_timestamp) const {
+    MTLDevice_sampleTimestamps(handle, cpu_timestamp, gpu_timestamp);
   }
 
   uint64_t

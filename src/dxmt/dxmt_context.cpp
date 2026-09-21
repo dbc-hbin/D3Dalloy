@@ -1637,6 +1637,15 @@ SimpleCommandContext<ArgumentEncodingContext>::dispatch(WMTSize size) {
 
 template <>
 void
+SimpleCommandContext<ArgumentEncodingContext>::dispatchIndirect(WMT::Buffer arguments, uint64_t offset) {
+  auto &dispatch = ctx.encodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+  dispatch.type = WMTComputeCommandDispatchIndirect;
+  dispatch.indirect_args_buffer = arguments;
+  dispatch.indirect_args_offset = offset;
+}
+
+template <>
+void
 SimpleCommandContext<ArgumentEncodingContext>::setComputeTexture(
     uint32_t index, const Rc<Texture> &texture, uint64_t viewId, int flags
 ) {

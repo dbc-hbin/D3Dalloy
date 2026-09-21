@@ -18,6 +18,8 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include "d3d12_resource_contract.hpp"
+#include <new>
 #include "com/com_pointer.hpp"
 
 namespace dxmt {
@@ -31,7 +33,7 @@ public:
 
   ~MTLD3D12HeapImpl() {
     if (heap)
-      device_->UnregisterResidency(heap);
+      device_->UnregisterResidency(heap, this);
     heap = {};
   }
 
@@ -79,8 +81,9 @@ public:
       return E_INVALIDARG;
     }
 
-    auto size_aligned = align(pDesc->SizeInBytes, desc_.Alignment);
-    if (!size_aligned)
+    uint64_t size_aligned = 0;
+    if (!pDesc->SizeInBytes ||
+        !resource_contract::CheckedAlign(pDesc->SizeInBytes, desc_.Alignment, size_aligned))
       return E_INVALIDARG;
 
     WMTHeapInfo info = {};
@@ -93,9 +96,9 @@ public:
     if (!heap)
       return E_OUTOFMEMORY;
 
-    device_->RegisterResidency(heap);
-
-    return S_OK;
+    return device_->RegisterResidency(
+        heap, this, !(desc_.Flags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT)
+    );
   }
 
   virtual D3D12_HEAP_DESC *STDMETHODCALLTYPE
@@ -108,7 +111,10 @@ public:
 HRESULT
 CreateHeap(MTLD3D12Device *pDevice, const D3D12_HEAP_DESC *pDesc, REFIID riid, void **ppHeap) {
   InitReturnPtr(ppHeap);
-  auto heap = Com(new MTLD3D12HeapImpl(pDevice));
+  auto *impl = new (std::nothrow) MTLD3D12HeapImpl(pDevice);
+  if (!impl)
+    return E_OUTOFMEMORY;
+  auto heap = Com(impl);
   HRESULT hr = heap->Initialize(pDesc);
   if (FAILED(hr))
     return hr;

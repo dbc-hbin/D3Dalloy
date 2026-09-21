@@ -21,6 +21,7 @@
 #include "d3d12_resource_contract.hpp"
 #include "dxmt_format.hpp"
 #include "com/com_pointer.hpp"
+#include <new>
 
 namespace dxmt {
 
@@ -36,6 +37,60 @@ IsTypelessTextureFormat(WMT::Device device, DXGI_FORMAT format) {
   MTL_DXGI_FORMAT_DESC metal_format;
   return SUCCEEDED(MTLQueryDXGIFormat(device, format, metal_format)) &&
          (metal_format.Flag & MTL_DXGI_FORMAT_TYPELESS);
+}
+
+bool
+IsSrvDimensionCompatible(const D3D12_RESOURCE_DESC &desc, D3D12_SRV_DIMENSION dimension) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+    return dimension == D3D12_SRV_DIMENSION_TEXTURE1D || dimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+    return dimension == D3D12_SRV_DIMENSION_TEXTURE3D;
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    return false;
+  if (desc.SampleDesc.Count > 1)
+    return dimension == D3D12_SRV_DIMENSION_TEXTURE2DMS || dimension == D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+  return dimension == D3D12_SRV_DIMENSION_TEXTURE2D || dimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY ||
+         dimension == D3D12_SRV_DIMENSION_TEXTURECUBE || dimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+}
+
+bool
+IsUavDimensionCompatible(const D3D12_RESOURCE_DESC &desc, D3D12_UAV_DIMENSION dimension) {
+  if (desc.SampleDesc.Count > 1)
+    return false;
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+    return dimension == D3D12_UAV_DIMENSION_TEXTURE1D || dimension == D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    return dimension == D3D12_UAV_DIMENSION_TEXTURE2D || dimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+  return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && dimension == D3D12_UAV_DIMENSION_TEXTURE3D;
+}
+
+bool
+IsRtvDimensionCompatible(const D3D12_RESOURCE_DESC &desc, D3D12_RTV_DIMENSION dimension) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+    return dimension == D3D12_RTV_DIMENSION_TEXTURE1D || dimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+    return dimension == D3D12_RTV_DIMENSION_TEXTURE3D;
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    return false;
+  if (desc.SampleDesc.Count > 1)
+    return dimension == D3D12_RTV_DIMENSION_TEXTURE2DMS || dimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+  return dimension == D3D12_RTV_DIMENSION_TEXTURE2D || dimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+}
+
+bool
+IsDsvDimensionCompatible(const D3D12_RESOURCE_DESC &desc, D3D12_DSV_DIMENSION dimension) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+    return dimension == D3D12_DSV_DIMENSION_TEXTURE1D || dimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY;
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    return false;
+  if (desc.SampleDesc.Count > 1)
+    return dimension == D3D12_DSV_DIMENSION_TEXTURE2DMS || dimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+  return dimension == D3D12_DSV_DIMENSION_TEXTURE2D || dimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+}
+
+HRESULT
+ValidateTextureViewFormat(DXGI_FORMAT resource_format, DXGI_FORMAT view_format) {
+  return resource_contract::AreCopyCompatibleFormats(resource_format, view_format) ? S_OK : E_INVALIDARG;
 }
 
 HRESULT
@@ -150,7 +205,7 @@ PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_
     Usage |= WMTTextureUsageRenderTarget;
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
     Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
-  if (!(Desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+  if (!(Desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || Desc.SampleDesc.Count > 1)
     Usage |= WMTTextureUsageShaderRead;
   InfoOut.usage = Usage;
 
@@ -208,6 +263,7 @@ class MTLD3D12Texture : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
   D3D12_HEAP_PROPERTIES heap_props_;
   D3D12_HEAP_FLAGS heap_flags_;
+  bool owns_registration_ = false;
 
 public:
   MTLD3D12Texture(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Resource>(pDevice) {}
@@ -254,21 +310,29 @@ public:
         return E_INVALIDARG;
     }
 
-    texture = new Texture(texture_info, device_->GetMTLDevice());
-    Flags<TextureAllocationFlag> flags = {};
-    if (pHeap) {
-      texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
-    } else {
-      texture->rename(texture->allocate(flags));
-      device_->RegisterResidency(texture->current()->texture());
+    try {
+      texture = new Texture(texture_info, device_->GetMTLDevice());
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
     }
-
-    return S_OK;
+    Flags<TextureAllocationFlag> flags = {};
+    if (pHeap)
+      texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
+    else
+      texture->rename(texture->allocate(flags));
+    if (!texture->current() || !texture->current()->texture())
+      return E_OUTOFMEMORY;
+    owns_registration_ = !pHeap;
+    if (!owns_registration_)
+      return S_OK;
+    return device_->RegisterResidency(
+        texture->current()->texture(), this, !(HeapFlags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT)
+    );
   };
 
   ~MTLD3D12Texture() {
     if (texture && texture->current() && !texture->current()->flags().test(TextureAllocationFlag::AllocatedOnHeap))
-      device_->UnregisterResidency(texture->current()->texture());
+      device_->UnregisterResidency(texture->current()->texture(), owns_registration_ ? this : nullptr);
   }
 
   HRESULT
@@ -420,6 +484,11 @@ public:
         ViewDesc.Format = desc_.Format;
       }
     }
+
+    if ((desc_.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
+        !IsSrvDimensionCompatible(desc_, ViewDesc.ViewDimension) ||
+        FAILED(ValidateTextureViewFormat(desc_.Format, ViewDesc.Format)))
+      return E_INVALIDARG;
 
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
     TextureViewKey View = texture->fullView;
@@ -586,6 +655,8 @@ public:
     }
 
     ResourceMinLODClamp = FLOAT((INT)ResourceMinLODClamp - view_descriptor.firstMiplevel);
+    if (!texture->view(View).texture)
+      return E_OUTOFMEMORY;
 
     return Heap->AddShaderResourceView(Index, texture.ptr(), View, ResourceMinLODClamp);
   };
@@ -612,6 +683,11 @@ public:
         ViewDesc.Format = desc_.Format;
       }
     }
+
+    if (!(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        !IsUavDimensionCompatible(desc_, ViewDesc.ViewDimension) ||
+        FAILED(ValidateTextureViewFormat(desc_.Format, ViewDesc.Format)))
+      return E_INVALIDARG;
 
     auto [Heap, Index] = GetShaderVisibleDescriptorHeap(device_, Descriptor);
     TextureViewKey View = texture->fullView;
@@ -706,6 +782,8 @@ public:
       return E_INVALIDARG;
     }
 
+    if (!texture->view(View).texture)
+      return E_OUTOFMEMORY;
     return Heap->AddUnorderedAccessView(Index, texture.ptr(), View);
   };
 
@@ -727,6 +805,11 @@ public:
         ViewDesc.Format = desc_.Format;
       }
     }
+
+    if (!(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+        !IsRtvDimensionCompatible(desc_, ViewDesc.ViewDimension) ||
+        FAILED(ValidateTextureViewFormat(desc_.Format, ViewDesc.Format)))
+      return E_INVALIDARG;
 
     auto [Heap, Index] = GetRenderTargetHeap(device_, Descriptor);
     TextureViewKey View = texture->fullView;
@@ -853,6 +936,8 @@ public:
       return E_INVALIDARG;
     }
 
+    if (!texture->view(View).texture)
+      return E_OUTOFMEMORY;
     RenderTargetDesc.Texture = texture.ptr();
     RenderTargetDesc.View = View;
     RenderTargetDesc.Width = std::max<uint32_t>(1u, texture->width() >> view_descriptor.firstMiplevel);
@@ -879,6 +964,11 @@ public:
         ViewDesc.Format = desc_.Format;
       }
     }
+
+    if (!(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+        !IsDsvDimensionCompatible(desc_, ViewDesc.ViewDimension) ||
+        FAILED(ValidateTextureViewFormat(desc_.Format, ViewDesc.Format)))
+      return E_INVALIDARG;
 
     auto [Heap, Index] = GetRenderTargetHeap(device_, Descriptor);
     TextureViewKey View = texture->fullView;
@@ -985,6 +1075,8 @@ public:
       return E_INVALIDARG;
     }
 
+    if (!texture->view(View).texture)
+      return E_OUTOFMEMORY;
     RenderTargetDesc.Texture = texture.ptr();
     RenderTargetDesc.View = View;
     RenderTargetDesc.Width = std::max<uint32_t>(1u, texture->width() >> view_descriptor.firstMiplevel);
@@ -1007,7 +1099,10 @@ CreateCommittedTexture(
     const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue,
     REFIID riid, void **ppResource
 ) {
-  auto texture = Com(new MTLD3D12Texture(pDevice));
+  auto *impl = new (std::nothrow) MTLD3D12Texture(pDevice);
+  if (!impl)
+    return E_OUTOFMEMORY;
+  auto texture = Com(impl);
   HRESULT hr = texture->Initialize(pHeapProps, HeapFlags, pDesc, InitialState, nullptr, 0);
   if (FAILED(hr))
     return hr;
@@ -1021,7 +1116,10 @@ CreatePlacedTexture(
     MTLD3D12Device *pDevice, MTLD3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC *pDesc,
     D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
 ) {
-  auto texture = Com(new MTLD3D12Texture(pDevice));
+  auto *impl = new (std::nothrow) MTLD3D12Texture(pDevice);
+  if (!impl)
+    return E_OUTOFMEMORY;
+  auto texture = Com(impl);
   D3D12_HEAP_DESC heap_desc = pHeap->GetDesc();
 
   if (pDesc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {

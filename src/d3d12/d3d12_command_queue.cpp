@@ -26,6 +26,7 @@
 #include "owned_submission_ring.hpp"
 #include "owned_queue_task_fifo.hpp"
 #include "d3d12_temporal.hpp"
+#include <algorithm>
 #include <atomic>
 #include <new>
 #include <optional>
@@ -140,6 +141,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // scratch until Metal completion, independently of frontend ReleaseFeature.
     std::vector<std::shared_ptr<OwnedTemporalFrame>> temporal_frames;
     std::vector<std::pair<std::shared_ptr<owned_graphics::QueryTimestampProducers>, uint32_t>> timestamp_completions;
+    std::optional<SignalTask> fence_completion;
   };
 
   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
@@ -163,9 +165,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         inflight.cmdbuf.waitUntilCompleted();
       if (inflight.cmdbuf.status() == WMTCommandBufferStatusError)
         ERR("Device error: ", inflight.cmdbuf.error().description().getUTF8String());
-      else
+      else {
         for (const auto &[queries, index] : inflight.timestamp_completions)
           queries->completed(index, inflight.cmdbuf);
+        if (inflight.fence_completion)
+          inflight.fence_completion->fence->markQueueSignalCompleted(inflight.fence_completion->ticket);
+      }
 
       owned_graphics::Trace("complete", ",\"queue\":", owned_id_, ",\"submission\":", internal_seq,
                             ",\"status\":", uint32_t(inflight.cmdbuf.status()));
@@ -265,9 +270,16 @@ public:
 
   HRESULT
   Initialize(const D3D12_COMMAND_QUEUE_DESC *pDesc) {
-    // TODO: validate and normalize
+    if (!pDesc ||
+        (pDesc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT && pDesc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+         pDesc->Type != D3D12_COMMAND_LIST_TYPE_COPY) ||
+        (pDesc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
+         pDesc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_HIGH &&
+         pDesc->Priority != D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) ||
+        (pDesc->Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) || pDesc->NodeMask > 1)
+      return E_INVALIDARG;
     desc_ = *pDesc;
-    desc_.NodeMask = 1; // typically 1 GPU only
+    desc_.NodeMask = 1; // one physical node
 
     auto metal_device = device_->GetMTLDevice();
     queue_ = metal_device.newCommandQueue(kCommandQueueSize);
@@ -406,6 +418,34 @@ public:
                                 ",\"start\":", query->start_index, ",\"count\":", query->query_count);
           begin_segment();
         }
+
+        bool execute_predicated_texture_copy = true;
+        if (current->type == EncoderType::PredicatedTextureCopy) {
+          auto copy = static_cast<PredicatedTextureCopyEncoderData *>(current);
+          const uint64_t predicate_submission = scope->seq;
+          auto predicate_producer = scope->inflight.cmdbuf;
+          // The submission worker, never the application thread, commits the
+          // commands which produced the retained snapshot and waits for their
+          // actual completion before consulting CPU-coherent allocator memory.
+          scope.reset();
+          submission_ring_.waitUntilRetired(predicate_submission);
+          if (predicate_producer.status() == WMTCommandBufferStatusError) {
+            ERR("PredicatedTextureCopy: predicate producer failed");
+            return;
+          }
+          if (!copy->predicate_value) {
+            ERR("PredicatedTextureCopy: missing predicate snapshot");
+            return;
+          }
+          const uint64_t value = *copy->predicate_value;
+          execute_predicated_texture_copy = copy->predicate_not_equal ? value == 0 : value != 0;
+          owned_graphics::Trace("predicated_texture_copy_ready", ",\"queue\":", owned_id_,
+                                ",\"completed_submission\":", predicate_submission,
+                                ",\"predicate\":", value,
+                                ",\"execute\":", uint32_t(execute_predicated_texture_copy));
+          begin_segment();
+        }
+
         auto &cmdbuf = scope->inflight.cmdbuf;
         if (current->type != EncoderType::Null)
           owned_graphics::Trace("encode", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
@@ -455,15 +495,40 @@ public:
         }
         case EncoderType::Render: {
           auto data = static_cast<RenderEncoderData *>(current);
+          if (std::any_of(data->colors.begin(), data->colors.end(), [](const auto &color) {
+                return bool(color.buffer_attachment);
+              })) {
+            auto blit = cmdbuf.blitCommandEncoder();
+            blit.waitForFence(fence_);
+            for (const auto &color : data->colors) {
+              if (!color.buffer_attachment)
+                continue;
+              wmtcmd_blit_copy_from_buffer_to_texture copy{};
+              copy.type = WMTBlitCommandCopyFromBufferToTexture;
+              copy.next.set(nullptr);
+              copy.src = color.buffer_backing;
+              copy.src_offset = color.buffer_offset;
+              copy.bytes_per_row = color.buffer_bytes_per_row;
+              copy.bytes_per_image = color.buffer_bytes_per_row;
+              copy.size = {color.buffer_width, 1, 1};
+              copy.dst = color.buffer_attachment;
+              copy.origin = {0, 0, 0};
+              blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+            }
+            blit.updateFence(fence_);
+            blit.endEncoding();
+          }
           WMTRenderPassInfo render_pass_info;
           WMT::InitializeRenderPassInfo(render_pass_info);
           {
             for (unsigned i = 0; i < std::size(render_pass_info.colors); i++) {
               auto &color_data = data->colors[i];
-              if (!color_data.attachment)
+              if (!color_data.attachment && !color_data.buffer_attachment)
                 continue;
               auto &color_info = render_pass_info.colors[i];
-              color_info.texture = color_data.attachment.texture();
+              color_info.texture = color_data.buffer_attachment
+                  ? WMT::Texture(color_data.buffer_attachment)
+                  : color_data.attachment.texture();
               color_info.load_action = color_data.load_action;
               color_info.store_action = color_data.store_action;
               color_info.level = color_data.level;
@@ -508,6 +573,29 @@ public:
           encoder.encodeCommands(&data->cmd_head);
           encoder.updateFence(fence_, WMTRenderStageFragment);
           encoder.endEncoding();
+          if (std::any_of(data->colors.begin(), data->colors.end(), [](const auto &color) {
+                return bool(color.buffer_attachment);
+              })) {
+            auto blit = cmdbuf.blitCommandEncoder();
+            blit.waitForFence(fence_);
+            for (const auto &color : data->colors) {
+              if (!color.buffer_attachment)
+                continue;
+              wmtcmd_blit_copy_from_texture_to_buffer copy{};
+              copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+              copy.next.set(nullptr);
+              copy.src = color.buffer_attachment;
+              copy.origin = {0, 0, 0};
+              copy.size = {color.buffer_width, 1, 1};
+              copy.dst = color.buffer_backing;
+              copy.offset = color.buffer_offset;
+              copy.bytes_per_row = color.buffer_bytes_per_row;
+              copy.bytes_per_image = color.buffer_bytes_per_row;
+              blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+            }
+            blit.updateFence(fence_);
+            blit.endEncoding();
+          }
           for (const auto &target : data->visibility_targets) {
             auto accumulate = cmdbuf.computeCommandEncoder(false);
             accumulate.waitForFence(fence_);
@@ -663,6 +751,29 @@ public:
           encoder.endEncoding();
           break;
         }
+        case EncoderType::PredicatedTextureCopy: {
+          if (!execute_predicated_texture_copy)
+            break;
+          auto data = static_cast<PredicatedTextureCopyEncoderData *>(current);
+          wmtcmd_blit_copy_from_texture_to_texture copy{};
+          copy.type = WMTBlitCommandCopyFromTextureToTexture;
+          copy.next.set(nullptr);
+          copy.src = data->source;
+          copy.src_slice = data->source_slice;
+          copy.src_level = data->source_level;
+          copy.src_origin = data->source_origin;
+          copy.src_size = data->size;
+          copy.dst = data->destination;
+          copy.dst_slice = data->destination_slice;
+          copy.dst_level = data->destination_level;
+          copy.dst_origin = data->destination_origin;
+          auto encoder = cmdbuf.blitCommandEncoder();
+          encoder.waitForFence(fence_);
+          encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+          encoder.updateFence(fence_);
+          encoder.endEncoding();
+          break;
+        }
         case EncoderType::Compute: {
           auto data = static_cast<ComputeEncoderData *>(current);
           auto encoder = cmdbuf.computeCommandEncoder(false);
@@ -683,14 +794,41 @@ public:
 
           WMTRenderPassInfo info;
           WMT::InitializeRenderPassInfo(info);
-          info.colors[0].texture = data->src.texture();
-          info.colors[0].load_action = WMTLoadActionLoad;
-          info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
-          info.colors[0].resolve_texture = data->dst.texture();
+          if (data->pipeline) {
+            if (data->dsv_flags & 1) {
+              info.depth.texture = data->dst.texture();
+              info.depth.load_action = WMTLoadActionLoad;
+              info.depth.store_action = WMTStoreActionStore;
+            } else if (data->dsv_flags & 2) {
+              info.stencil.texture = data->dst.texture();
+              info.stencil.load_action = WMTLoadActionLoad;
+              info.stencil.store_action = WMTStoreActionStore;
+            } else {
+              info.colors[0].texture = data->dst.texture();
+              info.colors[0].load_action = WMTLoadActionLoad;
+              info.colors[0].store_action = WMTStoreActionStore;
+            }
+          } else {
+            info.colors[0].texture = data->src.texture();
+            info.colors[0].load_action = WMTLoadActionLoad;
+            info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
+            info.colors[0].resolve_texture = data->dst.texture();
+          }
 
           auto encoder = cmdbuf.renderCommandEncoder(info);
           encoder.waitForFence(fence_, WMTRenderStageFragment);
           encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
+          if (data->pipeline) {
+            encoder.setRenderPipelineState(data->pipeline);
+            if (data->depth_stencil_state)
+              encoder.setDepthStencilState(data->depth_stencil_state);
+            encoder.setFragmentTexture(data->src.texture(), 0);
+            encoder.setFragmentBytes(&data->parameters, sizeof(data->parameters), 0);
+            encoder.setFragmentBuffer(data->predicate, data->predicate_offset, 1);
+            encoder.setViewport({double(data->destination_x), double(data->destination_y),
+                                 double(data->width), double(data->height), 0.0, 1.0});
+            encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+          }
           encoder.updateFence(fence_, WMTRenderStageFragment);
           encoder.endEncoding();
 
@@ -819,8 +957,19 @@ public:
       ExecuteTask task;
       task.lists.reserve(Count);
       for (unsigned i = 0; i < Count; i++) {
+        if (!ppCommandLists[i]) {
+          ERR("ExecuteCommandLists: null command list");
+          return;
+        }
+        Com<ID3D12Device> owner;
+        auto child = static_cast<ID3D12DeviceChild *>(ppCommandLists[i]);
+        if (FAILED(child->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
+            owner.ptr() != static_cast<ID3D12Device *>(device_)) {
+          ERR("ExecuteCommandLists: command list belongs to another device");
+          return;
+        }
         auto list = static_cast<MTLD3D12GraphicsCommandList *>(ppCommandLists[i]);
-        if (!list || !list->owned_allocator || !list->owned_closed_valid ||
+        if (!list->owned_allocator || !list->owned_closed_valid ||
             list->encoder_count == std::numeric_limits<size_t>::max() || list->GetType() != desc_.Type) {
           ERR("ExecuteCommandLists: invalid command list or allocator");
           return;
@@ -870,14 +1019,12 @@ public:
     {
       auto scope = StartCommitting();
       submission = scope.seq;
+      scope.inflight.fence_completion.emplace(task);
       task.fence->encodeQueueSignal(scope.inflight.cmdbuf, task.ticket);
       owned_graphics::Trace("signal", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
                             ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
                             ",\"generation\":", task.ticket.generation);
     }
-    // A consumer queue may start CPU encoding after the producer command
-    // buffer is committed. Native GPU ordering is still enforced by its wait.
-    task.fence->markQueueSignalCommitted(task.ticket);
     owned_graphics::Trace("signal_committed", ",\"queue\":", owned_id_, ",\"submission\":", submission,
                           ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
                           ",\"generation\":", task.ticket.generation);
@@ -887,6 +1034,10 @@ public:
   Signal(ID3D12Fence *pFence, UINT64 Value) {
     if (!pFence)
       return E_INVALIDARG;
+    Com<ID3D12Device> owner;
+    if (FAILED(pFence->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
+        owner.ptr() != static_cast<ID3D12Device *>(device_))
+      return E_INVALIDARG;
     try {
       std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
       auto native = static_cast<MTLD3D12Fence *>(pFence);
@@ -894,25 +1045,20 @@ public:
       task.fence = native->fence;
       task.fence_id = native->owned_id;
       auto preparation = task.fence->prepareQueueSignal(owned_id_, Value);
-      if (!preparation) {
-        owned_graphics::Trace("signal_order_unsupported", ",\"queue\":", owned_id_,
-                              ",\"fence\":", task.fence_id, ",\"value\":", Value);
-        return E_NOTIMPL;
-      }
-      task.ticket = preparation->ticket;
+      task.ticket = preparation.ticket;
       try {
         if (task_fifo_.push(QueueTask{std::move(task)})) {
-          native->fence->commitQueueSignal(*preparation);
+          native->fence->commitQueueSignal(preparation);
           return S_OK;
         }
       } catch (const std::bad_alloc &) {
-        native->fence->cancelQueueSignal(*preparation);
+        native->fence->cancelQueueSignal(preparation);
         return E_OUTOFMEMORY;
       } catch (...) {
-        native->fence->cancelQueueSignal(*preparation);
+        native->fence->cancelQueueSignal(preparation);
         return E_FAIL;
       }
-      native->fence->cancelQueueSignal(*preparation);
+      native->fence->cancelQueueSignal(preparation);
       return E_FAIL;
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
@@ -929,7 +1075,6 @@ public:
     task.fence->waitForQueueProducer(task.ticket);
 
     auto scope = StartCommitting();
-    task.fence->encodeQueueWait(scope.inflight.cmdbuf, task.ticket);
     owned_graphics::Trace("wait", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
                           ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
                           ",\"generation\":", task.ticket.generation);
@@ -938,6 +1083,10 @@ public:
   HRESULT STDMETHODCALLTYPE
   Wait(ID3D12Fence *pFence, UINT64 Value) {
     if (!pFence)
+      return E_INVALIDARG;
+    Com<ID3D12Device> owner;
+    if (FAILED(pFence->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
+        owner.ptr() != static_cast<ID3D12Device *>(device_))
       return E_INVALIDARG;
     try {
       std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
@@ -968,7 +1117,30 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   GetClockCalibration(UINT64 *gpu_timestamp, UINT64 *cpu_timestamp) {
-    return E_NOTIMPL;
+    if (!gpu_timestamp || !cpu_timestamp)
+      return E_INVALIDARG;
+    if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc_.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
+      return E_FAIL;
+
+    LARGE_INTEGER qpc_before{}, qpc_after{};
+    uint64_t metal_cpu_timestamp = 0;
+    uint64_t metal_gpu_timestamp = 0;
+    if (!QueryPerformanceCounter(&qpc_before))
+      return E_FAIL;
+    device_->GetMTLDevice().sampleTimestamps(&metal_cpu_timestamp, &metal_gpu_timestamp);
+    if (!QueryPerformanceCounter(&qpc_after) || !metal_cpu_timestamp || !metal_gpu_timestamp)
+      return E_FAIL;
+
+    // Metal returns the GPU timestamp paired with a CPU sample taken in the
+    // native host clock domain. Wine's QPC has a different frequency and may
+    // use a different epoch, so bracket the paired Metal sample in QPC space
+    // instead of exposing the host CPU value directly. The midpoint bounds the
+    // conversion error to half of this synchronous bridge call.
+    const uint64_t before = static_cast<uint64_t>(qpc_before.QuadPart);
+    const uint64_t after = static_cast<uint64_t>(qpc_after.QuadPart);
+    *gpu_timestamp = metal_gpu_timestamp;
+    *cpu_timestamp = before + (after - before) / 2;
+    return S_OK;
   };
 
   D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE
@@ -1050,6 +1222,11 @@ public:
 
 HRESULT
 CreateCommandQueue(MTLD3D12Device *pDevice, const D3D12_COMMAND_QUEUE_DESC *pDesc, REFIID riid, void **ppCommandQueue) {
+  if (!ppCommandQueue)
+    return E_POINTER;
+  *ppCommandQueue = nullptr;
+  if (!pDesc)
+    return E_INVALIDARG;
   auto command_queue = Com(new MTLD3D12CommandQueueImpl(pDevice));
   HRESULT hr = command_queue->Initialize(pDesc);
   if (FAILED(hr))

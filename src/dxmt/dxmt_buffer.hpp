@@ -69,6 +69,9 @@ struct BufferViewKey {
 
 struct BufferViewDescriptor {
   WMTPixelFormat format;
+  uint64_t byteOffset = 0;
+  uint64_t byteLength = 0;
+  bool writable = false;
 };
 
 class Buffer;
@@ -181,6 +184,7 @@ public:
   void decRef();
 
   BufferViewKey createView(BufferViewDescriptor const &);
+  BufferViewDescriptor viewDescriptor(BufferViewKey);
 
   constexpr BufferAllocation *
   current() {
@@ -227,8 +231,8 @@ private:
 };
 
 struct BufferSlice {
-  uint32_t byteOffset = 0;
-  uint32_t byteLength = 0;
+  uint64_t byteOffset = 0;
+  uint64_t byteLength = 0;
   uint32_t firstElement = 0;
   uint32_t elementCount = 0;
 };

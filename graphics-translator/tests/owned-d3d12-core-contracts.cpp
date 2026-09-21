@@ -5,6 +5,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <cstdio>
 #include <cstring>
 
@@ -121,6 +122,131 @@ int run() {
   failures += expectHr(list->Reset(directAllocator.Get(), nullptr), S_OK,
                        "Reset remains usable after wrong allocator rejection");
   failures += expectHr(list->Close(), S_OK, "Close after recovery Reset");
+
+  D3D12_ROOT_SIGNATURE_DESC nullGraph{};
+  nullGraph.NumParameters = 1;
+  ComPtr<ID3DBlob> rootBlob;
+  failures += expectHr(D3D12SerializeRootSignature(&nullGraph, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                    &rootBlob, nullptr),
+                       E_INVALIDARG, "root signature null parameter graph");
+
+  D3D12_ROOT_PARAMETER tooManyConstants{};
+  tooManyConstants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  tooManyConstants.Constants.Num32BitValues = 65;
+  tooManyConstants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC tooExpensive{1, &tooManyConstants, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  failures += expectHr(D3D12SerializeRootSignature(&tooExpensive, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                    &rootBlob, nullptr),
+                       E_INVALIDARG, "root signature 65 DWORD cost");
+
+  std::array<D3D12_DESCRIPTOR_RANGE, 64> exactRanges{};
+  std::array<D3D12_ROOT_PARAMETER, 64> exactParameters{};
+  for (UINT i = 0; i < exactParameters.size(); ++i) {
+    exactRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    exactRanges[i].NumDescriptors = 1;
+    exactRanges[i].BaseShaderRegister = i;
+    exactRanges[i].OffsetInDescriptorsFromTableStart = 0;
+    exactParameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    exactParameters[i].DescriptorTable = {1, &exactRanges[i]};
+    exactParameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  D3D12_ROOT_SIGNATURE_DESC exactCost{static_cast<UINT>(exactParameters.size()), exactParameters.data(),
+                                      0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  rootBlob.Reset();
+  hr = D3D12SerializeRootSignature(&exactCost, D3D_ROOT_SIGNATURE_VERSION_1_0, &rootBlob, nullptr);
+  failures += expectHr(hr, S_OK, "root signature exact 64 DWORD cost");
+  ComPtr<ID3D12RootSignature> exactRoot;
+  if (SUCCEEDED(hr))
+    failures += expectHr(device->CreateRootSignature(0, rootBlob->GetBufferPointer(), rootBlob->GetBufferSize(),
+                                                      IID_PPV_ARGS(&exactRoot)),
+                         S_OK, "create exact 64 DWORD root signature");
+
+  std::array<D3D12_ROOT_PARAMETER, 2> overlapParameters{};
+  for (auto &parameter : overlapParameters) {
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameter.Constants.Num32BitValues = 1;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  D3D12_ROOT_SIGNATURE_DESC overlapDesc{2, overlapParameters.data(), 0, nullptr,
+                                        D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  failures += expectHr(D3D12SerializeRootSignature(&overlapDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                    &rootBlob, nullptr),
+                       E_INVALIDARG, "overlapping root bindings");
+
+  D3D12_STATIC_SAMPLER_DESC invalidSampler{};
+  invalidSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  invalidSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  invalidSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  invalidSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  invalidSampler.MaxAnisotropy = 1;
+  invalidSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+  invalidSampler.BorderColor = static_cast<D3D12_STATIC_BORDER_COLOR>(99);
+  invalidSampler.MaxLOD = D3D12_FLOAT32_MAX;
+  D3D12_ROOT_SIGNATURE_DESC invalidSamplerDesc{0, nullptr, 1, &invalidSampler,
+                                               D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  failures += expectHr(D3D12SerializeRootSignature(&invalidSamplerDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                    &rootBlob, nullptr),
+                       E_INVALIDARG, "invalid static sampler enum");
+
+  D3D12_DESCRIPTOR_RANGE1 invalidRange{};
+  invalidRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  invalidRange.NumDescriptors = 1;
+  invalidRange.Flags = static_cast<D3D12_DESCRIPTOR_RANGE_FLAGS>(0x10);
+  D3D12_ROOT_PARAMETER1 invalidRangeParameter{};
+  invalidRangeParameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  invalidRangeParameter.DescriptorTable = {1, &invalidRange};
+  invalidRangeParameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC invalidVersioned{};
+  invalidVersioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  invalidVersioned.Desc_1_1 = {1, &invalidRangeParameter, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  failures += expectHr(D3D12SerializeVersionedRootSignature(&invalidVersioned, &rootBlob, nullptr),
+                       E_INVALIDARG, "invalid 1.1 descriptor range flags");
+
+  D3D12_ROOT_PARAMETER constants{};
+  constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  constants.Constants.Num32BitValues = 2;
+  constants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC constantsDesc{1, &constants, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  rootBlob.Reset();
+  hr = D3D12SerializeRootSignature(&constantsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rootBlob, nullptr);
+  ComPtr<ID3D12RootSignature> constantsRoot;
+  if (FAILED(hr) || FAILED(hr = device->CreateRootSignature(0, rootBlob->GetBufferPointer(),
+                                                             rootBlob->GetBufferSize(),
+                                                             IID_PPV_ARGS(&constantsRoot)))) {
+    failures += fail("create constants root signature", hr);
+  } else {
+    ComPtr<ID3D12GraphicsCommandList> bindingList;
+    if (FAILED(hr = device4->CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                 D3D12_COMMAND_LIST_FLAG_NONE,
+                                                 IID_PPV_ARGS(&bindingList))) ||
+        FAILED(hr = bindingList->Reset(directAllocator.Get(), nullptr))) {
+      failures += fail("create binding validation list", hr);
+    } else {
+      bindingList->SetGraphicsRootSignature(constantsRoot.Get());
+      bindingList->SetGraphicsRootConstantBufferView(0, 0);
+      failures += expectHr(bindingList->Close(), E_INVALIDARG, "root setter type mismatch poisons Close");
+      failures += expectHr(bindingList->Reset(directAllocator.Get(), nullptr), E_INVALIDARG,
+                           "root setter Close failure permanently poisons Reset");
+    }
+  }
+
+  if (otherDevice && rootBlob) {
+    ComPtr<ID3D12RootSignature> foreignRoot;
+    if (SUCCEEDED(hr = otherDevice->CreateRootSignature(0, rootBlob->GetBufferPointer(), rootBlob->GetBufferSize(),
+                                                        IID_PPV_ARGS(&foreignRoot)))) {
+      D3D12_COMPUTE_PIPELINE_STATE_DESC foreignPso{};
+      const UINT invalidShader = 0;
+      foreignPso.pRootSignature = foreignRoot.Get();
+      foreignPso.CS = {&invalidShader, sizeof(invalidShader)};
+      ComPtr<ID3D12PipelineState> rejectedPso;
+      failures += expectHr(device->CreateComputePipelineState(&foreignPso, IID_PPV_ARGS(&rejectedPso)),
+                           E_INVALIDARG, "compute PSO foreign root ownership");
+    } else {
+      failures += fail("create foreign root signature", hr);
+    }
+  }
+
+  std::puts("OWNED_D3D12_CORE_CONTRACTS_ROOT_VALIDATION_PASS");
 
   void *invalidOut = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
   hr = device4->CreateCommandList1(2, D3D12_COMMAND_LIST_TYPE_DIRECT,

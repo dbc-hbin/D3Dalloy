@@ -25,7 +25,7 @@ using namespace dxmt::shader::common;
 
 namespace dxmt::dxbc {
 
-inline air::Interpolation
+inline std::optional<air::Interpolation>
 to_air_interpolation(microsoft::D3D10_SB_INTERPOLATION_MODE mode) {
   using namespace microsoft;
   switch (mode) {
@@ -44,7 +44,7 @@ to_air_interpolation(microsoft::D3D10_SB_INTERPOLATION_MODE mode) {
   case D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE:
     return air::Interpolation::center_no_perspective;
   default:
-    assert(0 && "Unexpected D3D10_SB_INTERPOLATION_MODE");
+    return std::nullopt;
   }
 }
 
@@ -111,8 +111,8 @@ void handle_signature_vs(
       break;
     }
     default:
-      assert(0 && "Unexpected/unhandled input system value");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC vertex shader system-value input";
+      return;
     }
     max_input_register = std::max(reg + 1, max_input_register);
     break;
@@ -155,8 +155,8 @@ void handle_signature_vs(
       break;
     }
     default:
-      assert(0 && "unhandled vertex shader input");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC vertex shader input declaration";
+      return;
     }
     break;
   }
@@ -312,13 +312,10 @@ void handle_signature_ps(
   };
 
   switch (Inst.m_OpCode) {
-  case D3D10_SB_OPCODE_DCL_INPUT_SIV: {
-    assert(0);
-    break;
-  }
+  case D3D10_SB_OPCODE_DCL_INPUT_SIV:
   case D3D10_SB_OPCODE_DCL_INPUT_SGV:
-    assert(0);
-    break;
+    sm50_shader->initialization_error = "Unsupported DXBC pixel shader input declaration";
+    return;
   case D3D10_SB_OPCODE_DCL_INPUT: {
     D3D10_SB_OPERAND_TYPE RegType = Inst.m_Operands[0].m_Type;
 
@@ -335,11 +332,9 @@ void handle_signature_ps(
       break;
     }
     case D3D11_SB_OPERAND_TYPE_INNER_COVERAGE:
-      assert(0);
-      break;
     default:
-      assert(0 && "unimplemented vertex input");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC pixel shader input declaration";
+      return;
     }
     break;
   }
@@ -347,8 +342,12 @@ void handle_signature_ps(
     unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
     auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
     auto siv = Inst.m_InputPSDeclSIV.Name;
-    auto interpolation =
-      to_air_interpolation(Inst.m_InputPSDeclSIV.InterpolationMode);
+    auto interpolation_result = to_air_interpolation(Inst.m_InputPSDeclSIV.InterpolationMode);
+    if (!interpolation_result) {
+      sm50_shader->initialization_error = "Invalid DXBC pixel shader input interpolation mode";
+      return;
+    }
+    auto interpolation = *interpolation_result;
     uint32_t assigned_index;
     switch (siv) {
     case D3D10_SB_NAME_POSITION:
@@ -363,12 +362,18 @@ void handle_signature_ps(
       );
       break;
     case D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX:
-      assert(interpolation == Interpolation::flat);
+      if (interpolation != Interpolation::flat) {
+        sm50_shader->initialization_error = "Invalid interpolation for DXBC render-target-array input";
+        return;
+      }
       assigned_index =
         func_signature.DefineInput(InputRenderTargetArrayIndex{});
       break;
     case D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX:
-      assert(interpolation == Interpolation::flat);
+      if (interpolation != Interpolation::flat) {
+        sm50_shader->initialization_error = "Invalid interpolation for DXBC viewport-array input";
+        return;
+      }
       assigned_index = func_signature.DefineInput(InputViewportArrayIndex{});
       break;
     case D3D10_SB_NAME_CLIP_DISTANCE:
@@ -388,8 +393,8 @@ void handle_signature_ps(
       });
       break;
     default:
-      assert(0 && "Unexpected/unhandled input system value");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC pixel shader system-value input";
+      return;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
       ctx.prologue << init_input_reg(
@@ -403,24 +408,41 @@ void handle_signature_ps(
     unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
     auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
     auto siv = Inst.m_InputPSDeclSIV.Name;
-    [[maybe_unused]] auto interpolation =
-      to_air_interpolation(Inst.m_InputPSDeclSGV.InterpolationMode);
+    const auto interpolation_mode = Inst.m_InputPSDeclSGV.InterpolationMode;
+    auto interpolation_result = interpolation_mode == D3D10_SB_INTERPOLATION_UNDEFINED
+      ? std::optional<air::Interpolation>(Interpolation::flat)
+      : to_air_interpolation(interpolation_mode);
+    if (!interpolation_result) {
+      sm50_shader->initialization_error = "Invalid DXBC pixel shader input interpolation mode";
+      return;
+    }
+    auto interpolation = *interpolation_result;
     uint32_t assigned_index;
     switch (siv) {
     case microsoft::D3D10_SB_NAME_IS_FRONT_FACE:
-      assert(interpolation == Interpolation::flat);
+      if (interpolation != Interpolation::flat) {
+        sm50_shader->initialization_error = "Invalid interpolation for DXBC front-face input";
+        return;
+      }
       assigned_index = func_signature.DefineInput(InputFrontFacing{});
       break;
     case microsoft::D3D10_SB_NAME_SAMPLE_INDEX:
-      assert(interpolation == Interpolation::flat);
+      if (interpolation != Interpolation::flat) {
+        sm50_shader->initialization_error = "Invalid interpolation for DXBC sample-index input";
+        return;
+      }
       assigned_index = func_signature.DefineInput(InputSampleIndex{});
       break;
     case microsoft::D3D10_SB_NAME_PRIMITIVE_ID:
+      if (interpolation != Interpolation::flat) {
+        sm50_shader->initialization_error = "Invalid interpolation for DXBC primitive-id input";
+        return;
+      }
       assigned_index = func_signature.DefineInput(InputPrimitiveID{});
       break;
     default:
-      assert(0 && "Unexpected/unhandled input system value");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC pixel shader generated system-value input";
+      return;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
       ctx.prologue << init_input_reg(assigned_index, reg, mask);
@@ -431,8 +453,12 @@ void handle_signature_ps(
   case D3D10_SB_OPCODE_DCL_INPUT_PS: {
     unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
     auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
-    auto interpolation =
-      to_air_interpolation(Inst.m_InputPSDecl.InterpolationMode);
+    auto interpolation_result = to_air_interpolation(Inst.m_InputPSDecl.InterpolationMode);
+    if (!interpolation_result) {
+      sm50_shader->initialization_error = "Invalid DXBC pixel shader input interpolation mode";
+      return;
+    }
+    auto interpolation = *interpolation_result;
     auto sig = findInputElement([=](Signature sig) {
       return (sig.reg() == reg) && ((sig.mask() & mask) != 0);
     });
@@ -986,10 +1012,9 @@ void handle_signature_cs(
   auto &func_signature = sm50_shader->func_signature;
 
   switch (Inst.m_OpCode) {
-  case D3D10_SB_OPCODE_DCL_INPUT_SGV: {
-    assert(0 && "unhandled compute shader sgv");
-    break;
-  }
+  case D3D10_SB_OPCODE_DCL_INPUT_SGV:
+    sm50_shader->initialization_error = "Unsupported DXBC compute shader system-value input";
+    return;
   case D3D10_SB_OPCODE_DCL_INPUT: {
     D3D10_SB_OPERAND_TYPE RegType = Inst.m_Operands[0].m_Type;
 
@@ -1043,14 +1068,14 @@ void handle_signature_cs(
       break;
     }
     default:
-      assert(0 && "unhandled compute shader input");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC compute shader input declaration";
+      return;
     }
     break;
   }
   default:
-    assert(0);
-    break;
+    sm50_shader->initialization_error = "Unsupported DXBC compute shader signature declaration";
+    return;
   }
 };
 

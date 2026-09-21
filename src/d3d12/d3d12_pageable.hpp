@@ -18,9 +18,97 @@
 
 #pragma once
 #include "d3d12_device_child.hpp"
+#include "Metal.hpp"
+#include <limits>
+#include <vector>
 
 namespace dxmt {
-template <typename... Base> class MTLD3D12Pageable : public MTLD3D12DeviceChild<Base...> {
+
+/*
+ * Residency is an explicit property of the pageable object, not of each COM
+ * interface which happens to derive from ID3D12Pageable.  The device serializes
+ * access to this state with its residency lock, so validation and a whole batch
+ * transition are atomic with respect to other residency calls.
+ */
+class MTLD3D12PageableResidency {
+  bool supported_ = false;
+  uint32_t reference_count_ = 0;
+  D3D12_RESIDENCY_PRIORITY priority_ = D3D12_RESIDENCY_PRIORITY_NORMAL;
+  uint64_t allocation_bytes_ = 0;
+  std::vector<WMT::Allocation> allocations_;
+
+public:
+  virtual ~MTLD3D12PageableResidency() = default;
+
+  bool
+  SupportsResidency() const {
+    return supported_;
+  }
+
+  uint32_t
+  ResidencyReferenceCount() const {
+    return reference_count_;
+  }
+
+  bool
+  CanAddResidencyReference(uint32_t count = 1) const {
+    return count <= std::numeric_limits<uint32_t>::max() - reference_count_;
+  }
+
+  void
+  AddResidencyReference(uint32_t count = 1) {
+    reference_count_ += count;
+  }
+
+  bool
+  CanRemoveResidencyReference(uint32_t count = 1) const {
+    return count <= reference_count_;
+  }
+
+  void
+  RemoveResidencyReference(uint32_t count = 1) {
+    reference_count_ -= count;
+  }
+
+  D3D12_RESIDENCY_PRIORITY
+  ResidencyPriority() const {
+    return priority_;
+  }
+
+  void
+  SetResidencyPriorityHint(D3D12_RESIDENCY_PRIORITY priority) {
+    priority_ = priority;
+  }
+
+  const std::vector<WMT::Allocation> &
+  ResidencyAllocations() const {
+    return allocations_;
+  }
+
+  uint64_t
+  ResidencyAllocationBytes() const {
+    return allocation_bytes_;
+  }
+
+  void
+  InitializeResidency(bool initially_resident) {
+    supported_ = true;
+    reference_count_ = initially_resident ? 1 : 0;
+  }
+
+  bool
+  AddResidencyAllocation(WMT::Allocation allocation) {
+    const uint64_t bytes = allocation.allocatedSize();
+    if (bytes > std::numeric_limits<uint64_t>::max() - allocation_bytes_)
+      return false;
+    allocations_.push_back(allocation);
+    allocation_bytes_ += bytes;
+    return true;
+  }
+};
+
+template <typename... Base>
+class MTLD3D12Pageable : public MTLD3D12DeviceChild<Base...>, public MTLD3D12PageableResidency {
 public:
   MTLD3D12Pageable(MTLD3D12Device *pDevice) : MTLD3D12DeviceChild<Base...>(pDevice) {}
 };

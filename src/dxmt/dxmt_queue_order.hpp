@@ -1,125 +1,210 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-// Owned D3D12 queue ordering: CPU-side producer-commit visibility per fence generation.
+// Logical D3D12 fence timeline independent of monotonic native event values.
 #pragma once
 
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <vector>
 
 namespace owned_graphics {
 
-class FenceSignalSchedule {
+class FenceOrderEpoch {
 public:
-  enum class Result {
-    Accepted,
-    DecreasingUnsupported,
-    MixedProducerUnsupported,
-  };
-
-  struct State {
-    uint64_t last_scheduled = 0;
-    uint64_t queue_producer = 0;
-    bool cpu_producer = false;
+  struct Producer {
+    uint64_t id = 0;
+    uint64_t value = 0;
+    bool published = false;
+    bool completed = false;
+    std::function<bool()> completion_probe;
   };
 
 private:
-  uint64_t last_scheduled_ = 0;
-  uint64_t queue_producer_ = 0;
-  bool cpu_producer_ = false;
+  struct CompletionWaiter {
+    uint64_t value = 0;
+    std::function<void()> callback;
+  };
 
-public:
-  Result initialize(uint64_t value) {
-    if (value < last_scheduled_)
-      return Result::DecreasingUnsupported;
-    last_scheduled_ = value;
-    return Result::Accepted;
-  }
-
-  Result scheduleQueue(uint64_t queue, uint64_t value, bool previous_settled) {
-    if (value < last_scheduled_)
-      return Result::DecreasingUnsupported;
-    if (cpu_producer_ || (queue_producer_ && queue_producer_ != queue)) {
-      if (!previous_settled)
-        return Result::MixedProducerUnsupported;
-      cpu_producer_ = false;
-    }
-    queue_producer_ = queue;
-    last_scheduled_ = value;
-    return Result::Accepted;
-  }
-
-  Result scheduleCpu(uint64_t value, bool previous_settled) {
-    if (value < last_scheduled_)
-      return Result::DecreasingUnsupported;
-    if (queue_producer_) {
-      if (!previous_settled)
-        return Result::MixedProducerUnsupported;
-      queue_producer_ = 0;
-    }
-    cpu_producer_ = true;
-    last_scheduled_ = value;
-    return Result::Accepted;
-  }
-
-  void reset() {
-    last_scheduled_ = 0;
-    queue_producer_ = 0;
-    cpu_producer_ = false;
-  }
-
-  uint64_t lastScheduled() const {
-    return last_scheduled_;
-  }
-
-  State state() const {
-    return State{last_scheduled_, queue_producer_, cpu_producer_};
-  }
-
-  void restore(State state) {
-    last_scheduled_ = state.last_scheduled;
-    queue_producer_ = state.queue_producer;
-    cpu_producer_ = state.cpu_producer;
-  }
-};
-
-class FenceOrderEpoch {
   mutable std::mutex mutex_;
   std::condition_variable cv_;
-  uint64_t committed_value_ = 0;
+  uint64_t next_producer_id_ = 1;
+  uint64_t completed_value_ = 0;
+  std::vector<std::shared_ptr<Producer>> producers_;
+  std::vector<CompletionWaiter> completion_waiters_;
   const uint64_t generation_;
 
+  void completeValueLocked(uint64_t value) {
+    completed_value_ = value;
+    for (auto it = completion_waiters_.begin(); it != completion_waiters_.end();) {
+      if (value >= it->value) {
+        auto callback = std::move(it->callback);
+        it = completion_waiters_.erase(it);
+        callback();
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void reconcileLocked() {
+    for (auto it = producers_.begin(); it != producers_.end();) {
+      const auto &producer = *it;
+      if (producer->published && !producer->completed && producer->completion_probe && producer->completion_probe()) {
+        producer->completed = true;
+        completeValueLocked(producer->value);
+        it = producers_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
 public:
-  explicit FenceOrderEpoch(uint64_t generation) : generation_(generation) {}
+  explicit FenceOrderEpoch(uint64_t generation, uint64_t initial_value = 0)
+      : completed_value_(initial_value), generation_(generation) {}
 
   uint64_t generation() const {
     return generation_;
   }
 
-  uint64_t committedValue() const {
-    std::lock_guard lock(mutex_);
-    return committed_value_;
+  std::shared_ptr<Producer> prepare(uint64_t value, std::function<bool()> completion_probe = {}) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto producer = std::make_shared<Producer>();
+    producer->id = next_producer_id_++;
+    producer->value = value;
+    producer->completion_probe = std::move(completion_probe);
+    producers_.push_back(producer);
+    return producer;
   }
 
-  bool ready(uint64_t value) const {
-    std::lock_guard lock(mutex_);
-    return committed_value_ >= value;
-  }
-
-  void markCommitted(uint64_t value) {
+  void publish(const std::shared_ptr<Producer> &producer) {
     {
-      std::lock_guard lock(mutex_);
-      if (value <= committed_value_)
-        return;
-      committed_value_ = value;
+      std::lock_guard<std::mutex> lock(mutex_);
+      producer->published = true;
     }
     cv_.notify_all();
   }
 
+  void cancel(const std::shared_ptr<Producer> &producer) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = producers_.begin(); it != producers_.end(); ++it) {
+      if (*it == producer) {
+        producers_.erase(it);
+        return;
+      }
+    }
+  }
+
+  void complete(const std::shared_ptr<Producer> &producer) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (producer->completed)
+        return;
+      producer->completed = true;
+      completeValueLocked(producer->value);
+      for (auto it = producers_.begin(); it != producers_.end(); ++it) {
+        if (*it == producer) {
+          producers_.erase(it);
+          break;
+        }
+      }
+    }
+    cv_.notify_all();
+  }
+
+  void signalCpu(uint64_t value) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      // Probe and publish share one critical section. A GPU token observed here
+      // is ordered before this CPU signal; a retirement arriving later is after it.
+      reconcileLocked();
+      completeValueLocked(value);
+    }
+    cv_.notify_all();
+  }
+
+  void reconcile() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      reconcileLocked();
+    }
+    cv_.notify_all();
+  }
+
+  uint64_t completedValue() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return completed_value_;
+  }
+
+  bool addCompletionWaiter(uint64_t value, std::function<void()> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Registration and its initial observation are atomic with completion and
+    // rewind, so a qualifying crossing cannot disappear between two calls.
+    reconcileLocked();
+    if (completed_value_ >= value) {
+      callback();
+      return true;
+    }
+    try {
+      completion_waiters_.push_back(CompletionWaiter{value, std::move(callback)});
+    } catch (...) {
+      return false;
+    }
+    return true;
+  }
+};
+
+class FenceCompletionLatch {
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  std::vector<std::function<void()>> callbacks_;
+  bool signaled_ = false;
+
+public:
+  void signal() {
+    std::vector<std::function<void()>> callbacks;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (signaled_)
+        return;
+      signaled_ = true;
+      callbacks.swap(callbacks_);
+    }
+    cv_.notify_all();
+    for (auto &callback : callbacks)
+      callback();
+  }
+
+  bool addWaiter(std::function<void()> callback) {
+    bool ready_now = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ready_now = signaled_;
+      if (!ready_now) {
+        try {
+          callbacks_.push_back(std::move(callback));
+        } catch (...) {
+          return false;
+        }
+      }
+    }
+    if (ready_now)
+      callback();
+    return true;
+  }
+
+  bool ready() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return signaled_;
+  }
+
   template <typename Rep, typename Period>
-  bool waitFor(uint64_t value, const std::chrono::duration<Rep, Period> &timeout) {
-    std::unique_lock lock(mutex_);
-    return cv_.wait_for(lock, timeout, [&] { return committed_value_ >= value; });
+  bool waitFor(const std::chrono::duration<Rep, Period> &timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, timeout, [&] { return signaled_; });
   }
 };
 

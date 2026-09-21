@@ -3593,6 +3593,27 @@ _MTLResource_gpuResourceID(void *obj) {
 }
 
 static NTSTATUS
+_MTLAllocation_allocatedSize(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLAllocation>)params->handle allocatedSize];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResidencySet_allocatedSize(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLResidencySet>)params->handle allocatedSize];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_sampleTimestamps(void *obj) {
+  struct unixcall_mtldevice_sampletimestamps *params = obj;
+  [(id<MTLDevice>)params->device sampleTimestamps:&params->cpu_timestamp gpuTimestamp:&params->gpu_timestamp];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLComputeCommandEncoder_setVisibleFunctionTable(void *obj) {
   struct unixcall_mtlcomputeencoder_functiontable *params = obj;
   [(id<MTLComputeCommandEncoder>)params->encoder
@@ -3853,6 +3874,9 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTASEncoder_fence,
     &_WMTGetPipelineCacheIdentity, /* 199: native compiler image and Metal driver build. */
     &_MTLDevice_maxBufferLength, /* 200: validate cached constant allocations. */
+    &_MTLDevice_sampleTimestamps, /* 201: paired CPU/GPU clock calibration sample. */
+    &_MTLAllocation_allocatedSize, /* 202: pageable allocation byte accounting. */
+    &_MTLResidencySet_allocatedSize, /* 203: committed residency-set byte total. */
 };
 
 #ifndef DXMT_NATIVE
@@ -4048,5 +4072,8 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTASEncoder_fence,
     &_WMTGetPipelineCacheIdentity,
     &_MTLDevice_maxBufferLength,
+    NULL, /* 201: sampleTimestamps uses pointer outputs and has no WoW64 thunk. */
+    &_MTLAllocation_allocatedSize,
+    &_MTLResidencySet_allocatedSize,
 };
 #endif

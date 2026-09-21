@@ -71,9 +71,23 @@ public:
     default:
       return E_NOTIMPL;
     }
+    WMT::Allocation allocation = desc.Type == D3D12_QUERY_HEAP_TYPE_TIMESTAMP
+                                     ? WMT::Allocation(timestamp_dummy)
+                                     : WMT::Allocation(visibility_results);
+    HRESULT hr = device_->RegisterResidency(allocation, this);
+    if (FAILED(hr))
+      return hr;
     owned_graphics::Trace("query_heap_create", ",\"heap\":", owned_id,
                           ",\"type\":", uint32_t(desc.Type), ",\"count\":", desc.Count);
     return S_OK;
+  }
+
+  ~MTLD3D12QueryHeapImpl() {
+    WMT::Allocation allocation = desc.Type == D3D12_QUERY_HEAP_TYPE_TIMESTAMP
+                                     ? WMT::Allocation(timestamp_dummy)
+                                     : WMT::Allocation(visibility_results);
+    if (allocation)
+      device_->UnregisterResidency(allocation, this);
   }
 
   HRESULT

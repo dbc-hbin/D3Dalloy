@@ -281,7 +281,7 @@ public:
       return S_FALSE;
     }
 
-    auto viewId = buffer_->createView({.format = view_format});
+    auto viewId = buffer_->createView({.format = view_format, .writable = true});
 
     auto srv = ref(new UAVWithCounter(
         &finalDesc, this, m_parent,

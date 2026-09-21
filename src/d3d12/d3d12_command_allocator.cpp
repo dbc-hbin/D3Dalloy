@@ -155,6 +155,9 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
       case EncoderType::Resolve:
         reinterpret_cast<ResolveEncoderData *>(next)->~ResolveEncoderData();
         break;
+      case EncoderType::PredicatedTextureCopy:
+        reinterpret_cast<PredicatedTextureCopyEncoderData *>(next)->~PredicatedTextureCopyEncoderData();
+        break;
       case EncoderType::Temporal:
         reinterpret_cast<TemporalEncoderData *>(next)->~TemporalEncoderData();
         break;
@@ -451,6 +454,15 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::dispatch(WMTSize size) {
 
 template <>
 void
+SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::dispatchIndirect(WMT::Buffer arguments, uint64_t offset) {
+  auto &dispatch = ctx.EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+  dispatch.type = WMTComputeCommandDispatchIndirect;
+  dispatch.indirect_args_buffer = arguments;
+  dispatch.indirect_args_offset = offset;
+}
+
+template <>
+void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputeTexture(
     uint32_t index, const Rc<Texture> &texture, uint64_t viewId, int flags
 ) {
@@ -630,6 +642,18 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::draw(
   draw.vertex_count = vertex_count;
   draw.base_instance = base_instance;
   draw.instance_count = instance_count;
+}
+
+template <>
+void
+SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::drawIndirect(
+    WMTPrimitiveType primitive, WMT::Buffer arguments, uint64_t offset
+) {
+  auto &draw = ctx.EncodeRenderCommand<wmtcmd_render_draw_indirect>();
+  draw.type = WMTRenderCommandDrawIndirect;
+  draw.primitive_type = primitive;
+  draw.indirect_args_buffer = arguments;
+  draw.indirect_args_offset = offset;
 }
 
 }; // namespace dxmt

@@ -76,6 +76,9 @@ WINEMETAL_API uint64_t MTLDevice_recommendedMaxWorkingSetSize(obj_handle_t devic
 
 WINEMETAL_API uint64_t MTLDevice_maxBufferLength(obj_handle_t device);
 
+WINEMETAL_API void
+MTLDevice_sampleTimestamps(obj_handle_t device, uint64_t *cpu_timestamp, uint64_t *gpu_timestamp);
+
 WINEMETAL_API uint64_t MTLDevice_currentAllocatedSize(obj_handle_t device);
 
 WINEMETAL_API obj_handle_t MTLDevice_name(obj_handle_t device);
@@ -2214,6 +2217,10 @@ MTLResidencySet_removeAllocations(obj_handle_t residency_set, const obj_handle_t
 WINEMETAL_API void MTLResidencySet_removeAllAllocations(obj_handle_t residency_set);
 
 WINEMETAL_API void MTLResidencySet_commit(obj_handle_t residency_set);
+
+WINEMETAL_API uint64_t MTLAllocation_allocatedSize(obj_handle_t allocation);
+
+WINEMETAL_API uint64_t MTLResidencySet_allocatedSize(obj_handle_t residency_set);
 
 WINEMETAL_API void MTLCommandQueue_addResidencySet(obj_handle_t queue, obj_handle_t residency_set);
 

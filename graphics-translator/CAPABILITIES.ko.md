@@ -50,7 +50,7 @@ Mapped format은 다음 범위만 광고한다.
 
 `SO_BUFFER`는 광고하지 않는다. 현재 D3D12 graphics pipeline은 `StreamOutput.NumEntries != 0`이면 `E_NOTIMPL`을 반환하고 `SOSetTargets`도 미구현이다.
 
-Depth/stencil `MULTISAMPLE_RESOLVE`도 광고하지 않는다. 현재 `ResolveSubresource` backend는 `WMTRenderPassInfo.colors[0]`에 `WMTStoreActionStoreAndMultisampleResolve`를 설정하는 color resolve만 구현하고 있으며 `ResolveSubresourceRegion`은 미구현이다.
+Depth/stencil `MULTISAMPLE_RESOLVE`는 현재도 capability에서 광고하지 않는다. 다만 이 문서 작성 당시와 달리 현재 루트에는 `ResolveSubresourceRegion`과 depth/stencil MIN/MAX shader resolve가 구현되어 있다. `BuildD3D12FormatSupport`는 여전히 `properties.resolve && properties.color`인 경우에만 `MULTISAMPLE_RESOLVE`를 설정하므로, depth/stencil resolve의 실제 지원 범위와 capability 보고를 별도 matrix로 검증해 일치시키기 전까지 보수적으로 비광고 상태를 유지한다.
 
 Typeless format은 resource layout/casting 용도의 `BUFFER`/texture dimension/`CAST_WITHIN_BIT_LAYOUT`까지만 가능하고, 해당 typeless format 자체에 shader load, RT, DSV, UAV 같은 typed-view capability를 부여하지 않는다.
 

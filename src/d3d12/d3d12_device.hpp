@@ -49,6 +49,8 @@
 
 namespace dxmt {
 
+class MTLD3D12PageableResidency;
+
 // One advertised ceiling shared by creation/probe and feature queries.
 inline constexpr D3D_FEATURE_LEVEL kOwnedMaxFeatureLevel = D3D_FEATURE_LEVEL_11_0;
 
@@ -119,9 +121,12 @@ public:
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
 
-  uint32_t UploadQwords;
-  uint32_t ParameterSlots;
-  uint32_t const *SlotQwordOffsets;
+  uint32_t UploadQwords = 0;
+  uint32_t ParameterSlots = 0;
+  uint32_t const *SlotQwordOffsets = nullptr;
+  D3D12_ROOT_PARAMETER_TYPE const *ParameterTypes = nullptr;
+  UINT const *ParameterConstantCounts = nullptr;
+  bool IsLocal = false;
 
   /**
    * Local root arguments of a raytracing shader record. The application writes the
@@ -142,6 +147,9 @@ public:
 class MTLD3D12CommandSignature : public ID3D12CommandSignature {
 public:
   D3D12_INDIRECT_ARGUMENT_TYPE CommandType;
+  UINT ByteStride;
+  uint64_t RootParameterMask;
+  uint32_t VertexBufferMask;
   UINT UpdateRootArguments : 1;
   UINT UpdateVertexBuffers : 1;
   UINT UpdateIndexBuffer   : 1;
@@ -277,13 +285,21 @@ public:
 
   virtual WMT::ResidencySet GetGlobalResidencySet() = 0;
 
-  virtual HRESULT RegisterResidency(WMT::Allocation allocation) = 0;
+  virtual HRESULT RegisterResidency(
+      WMT::Allocation allocation, MTLD3D12PageableResidency *owner = nullptr, bool initially_resident = true
+  ) = 0;
 
-  virtual HRESULT UnregisterResidency(WMT::Allocation allocation) = 0;
+  virtual HRESULT UnregisterResidency(
+      WMT::Allocation allocation, MTLD3D12PageableResidency *owner = nullptr
+  ) = 0;
 
-  virtual HRESULT RegisterResidencyAndVA(BufferAllocation *allocation) = 0;
+  virtual HRESULT RegisterResidencyAndVA(
+      BufferAllocation *allocation, MTLD3D12PageableResidency *owner = nullptr, bool initially_resident = true
+  ) = 0;
 
-  virtual HRESULT UnregisterResidencyAndVA(BufferAllocation *allocation) = 0;
+  virtual HRESULT UnregisterResidencyAndVA(
+      BufferAllocation *allocation, MTLD3D12PageableResidency *owner = nullptr
+  ) = 0;
 
   virtual BufferAllocation *LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
 
@@ -507,6 +523,10 @@ constexpr auto kDefaultShader4Component = 0b1'011'010'001'000;
 HRESULT ValidateResourceStates(D3D12_RESOURCE_STATES State, const D3D12_HEAP_PROPERTIES *pHeapProps);
 
 HRESULT ValidateResourceDescs(const D3D12_RESOURCE_DESC *pDesc, const D3D12_HEAP_PROPERTIES *pHeapProps);
+
+HRESULT ValidateOptimizedClearValue(
+    const D3D12_RESOURCE_DESC *pDesc, const D3D12_CLEAR_VALUE *optimized_clear_value
+);
 
 HRESULT ValidateHeapProperties(const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS Flags, bool AdapterIsNUMA);
 

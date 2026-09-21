@@ -20,6 +20,7 @@
 #include "d3d12_device_child.hpp"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
+#include <new>
 
 namespace dxmt {
 
@@ -35,7 +36,7 @@ public:
   Initialize(UINT64 InitialValue) {
     fence = new Fence(device_->GetMTLDevice());
     if (!fence->initialize(InitialValue))
-      return E_NOTIMPL;
+      return E_OUTOFMEMORY;
     return S_OK;
   }
 
@@ -67,25 +68,20 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   SetEventOnCompletion(UINT64 Value, HANDLE Event) {
-    if (GetCompletedValue() >= Value) {
-      if (Event)
-        SetEvent(Event);
-      return S_OK;
+    try {
+      if (!Event) {
+        fence->wait(Value);
+        return S_OK;
+      }
+      return device_->event_listener.setEventOnValue(fence.ptr(), Event, Value) ? S_OK : E_OUTOFMEMORY;
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
     }
-    if (!Event) {
-      fence->wait(Value);
-      return S_OK;
-    }
-    return device_->event_listener.setEventOnValue(fence.ptr(), Event, Value) ? S_OK : E_OUTOFMEMORY;
   }
 
   HRESULT STDMETHODCALLTYPE
   Signal(UINT64 Value) {
-    if (!fence->signal(Value)) {
-      WARN("ID3D12Fence::Signal non-monotonic or mixed CPU/GPU producer ordering is not supported");
-      return E_NOTIMPL;
-    }
-    return S_OK;
+    return fence->signal(Value) ? S_OK : E_OUTOFMEMORY;
   }
 
   D3D12_FENCE_FLAGS STDMETHODCALLTYPE

@@ -1,5 +1,22 @@
 # Owned D3D12 cross-queue CPU encode ordering
 
+## 현재 루트 구현: logical fence timeline (2026-09-22)
+
+`src/dxmt/dxmt_queue_order.hpp`, `dxmt_fence.*`, `src/d3d12/d3d12_command_queue.cpp`는 아래 역사적 0007의 fence 제한을 대체한다.
+
+- CPU/GPU 감소 signal과 미완료 다중 queue/CPU producer를 허용한다. GPU signal마다 독립적인 monotonic Metal event token을 사용하고 D3D12 완료값은 별도 logical state로 관리한다.
+- CPU Signal 전에 이미 완료된 native token을 반영한다. 늦게 도착한 retirement가 이미 반영된 signal을 다시 적용해 CPU rewind를 덮어쓰지 않는다.
+- Queue Wait는 API 호출 시 threshold latch를 등록한다. 이미 충족됐거나 이후 어느 producer가 충족한 wait도 rewind 후 유지된다. 첫 blocked producer에 wait를 고정하지 않는다.
+- consumer worker는 실제 qualifying completion까지 후속 encode를 보류한다. API caller는 비차단이며 다른 queue는 계속 진행한다. 기존 commit-only gate보다 보수적이며 CPU/GPU overlap 비용은 별도 측정해야 한다.
+- signal enqueue 실패 시 provisional producer를 취소한다. inflight submission이 fence/ticket을 GPU retirement까지 보유하며 관측 완료된 producer record는 제거한다.
+- single/ANY/ALL/null completion event도 같은 logical latch를 사용한다.
+
+검증: `build/local/fence-core-before/result.json`에서 CPU 10→5가 `E_NOTIMPL`로 실패했고, 수정 후 `fence-core-after`, `fence-core-multiqueue-proof`, `fence-core-temporal-proof`의 `result.json`은 모두 PASS다. 각각 새 prefix, Metal API/shader validation, owned runtime 검사를 사용했다. CPU `queue-order-scheduler.test.cpp`도 PASS다. 실제 게임 및 성능 검증은 아니다.
+
+## 아래 내용은 0007 import 시점의 역사적 설계·증거
+
+아래 commit gate, `FenceSignalSchedule`, rewind 거부 설명은 현재 계약이 아니다.
+
 이 변경은 D3D12 `ID3D12CommandQueue::Wait`가 아직 미래인 fence value를 기다리는 동안 **API caller를 block하지 않고**, 그 queue의 뒤쪽 command list/temporal encode만 CPU 측에서 보류하도록 만든다. GPU queue wait 자체는 제거하지 않는다. producer signal이 Metal command buffer까지 commit된 뒤 consumer worker가 원래의 `encodeWaitForEvent`를 기록하므로 최종 GPU ordering은 native fence wait가 계속 담당한다.
 
 작업은 private owned derivative의 isolated `build/owned-graphics-20260919/queue-order-work`에서만 수행했다. prime candidate, game, Wine prefix, runtime staging, GPU 설정은 수정하지 않았다.

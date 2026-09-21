@@ -45,6 +45,9 @@ struct IndirectComputeCommandData {
   uint64_t max_count;
   uint64_t max_count_buffer;
   uint64_t argument_buffer;
+  uint64_t predicate;
+  uint32_t predicate_op;
+  uint32_t predicate_padding;
   uint64_t static_samplers;
   uint64_t rootsig_qwords;
   uint64_t immutable_constants;
@@ -59,6 +62,9 @@ struct IndirectRenderCommandData {
   uint64_t max_count;
   uint64_t max_count_buffer;
   uint64_t argument_buffer;
+  uint64_t predicate;
+  uint32_t predicate_op;
+  uint32_t predicate_padding;
   uint64_t static_samplers;
   uint64_t rootsig_qwords;
   uint64_t vertex_constants;
@@ -224,6 +230,12 @@ public:
     encoder->cmd_tail = (wmtcmd_base *)storage;
     storage->next.set(nullptr);
     return *storage;
+  }
+
+  bool CanAllocateGPUHeap(size_t Length, size_t Alignment) const {
+    const std::size_t adjustment = align_forward_adjustment(reinterpret_cast<void *>(gpu_heap_offset_), Alignment);
+    return gpu_heap_offset_ < kGPUHeapSize && adjustment < kGPUHeapSize - gpu_heap_offset_ &&
+           Length < kGPUHeapSize - gpu_heap_offset_ - adjustment;
   }
 
   std::tuple<void *, size_t>

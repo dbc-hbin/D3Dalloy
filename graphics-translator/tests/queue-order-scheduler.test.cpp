@@ -16,8 +16,8 @@
 
 namespace {
 
+using owned_graphics::FenceCompletionLatch;
 using owned_graphics::FenceOrderEpoch;
-using owned_graphics::FenceSignalSchedule;
 using owned_graphics::QueueTaskFifo;
 using owned_graphics::SubmissionRing;
 using owned_graphics::StableSubmissionStorage;
@@ -33,56 +33,50 @@ void require(bool value, const char *what) {
     fail(what);
 }
 
-void testEpochCommitIsolation() {
-  auto old_epoch = std::make_shared<FenceOrderEpoch>(11);
-  auto new_epoch = std::make_shared<FenceOrderEpoch>(12);
+void testLogicalFenceRewindAndOverlap() {
+  FenceOrderEpoch timeline(11, 10);
+  timeline.signalCpu(5);
+  require(timeline.completedValue() == 5, "CPU rewind did not become current completion");
 
-  require(!old_epoch->ready(7), "old epoch unexpectedly ready");
-  require(!old_epoch->waitFor(7, 1ms), "old epoch wait should time out before producer commit");
+  bool blocked_done = false;
+  bool qualifying_done = false;
+  auto blocked = timeline.prepare(5, [&] { return blocked_done; });
+  auto qualifying = timeline.prepare(10, [&] { return qualifying_done; });
+  timeline.publish(blocked);
+  timeline.publish(qualifying);
 
-  old_epoch->markCommitted(7);
-  require(old_epoch->ready(7), "producer commit did not make wait ready");
-  require(old_epoch->committedValue() == 7, "committed value mismatch");
+  auto latch = std::make_shared<FenceCompletionLatch>();
+  require(timeline.addCompletionWaiter(10, [latch] { latch->signal(); }), "future completion waiter allocation failed");
+  require(!latch->ready(), "future waiter used stale initial completion after rewind");
 
-  // Epoch state is intentionally independent. Production currently rejects
-  // decreasing signals rather than migrating live waits across epochs.
-  require(!new_epoch->ready(7), "rewound epoch inherited old producer commit");
-  new_epoch->markCommitted(3); // CPU Signal or committed queue Signal on new event.
-  require(new_epoch->ready(3), "new epoch CPU signal was not visible");
-  require(!new_epoch->ready(7), "new epoch incorrectly reached old value");
+  qualifying_done = true;
+  timeline.reconcile();
+  require(latch->ready(), "qualifying producer was pinned behind blocked producer");
+  require(timeline.completedValue() == 10, "actual qualifying completion was not published");
 
-  // Equal queue signals are deliberately not dropped. If the first producer is
-  // blocked, a second producer committing the same value can satisfy the wait.
-  auto duplicate_epoch = std::make_shared<FenceOrderEpoch>(13);
-  duplicate_epoch->markCommitted(9);
-  require(duplicate_epoch->ready(9), "equal-value independent producer did not satisfy wait");
-  std::puts("QUEUE_ORDER_EPOCH_PASS generations=isolated cpu_signal=ready equal_signal=ready");
+  blocked_done = true;
+  timeline.reconcile();
+  require(timeline.completedValue() == 5, "late rewind completion did not become current value");
+  require(latch->ready(), "completion latch was undone by rewind");
+  std::puts("QUEUE_ORDER_LOGICAL_PASS cpu_rewind=1 overlap=1 any_producer=1 latch=1");
 }
 
-void testExplicitRewindLimitation() {
-  using Result = FenceSignalSchedule::Result;
-  FenceSignalSchedule schedule;
-  require(schedule.initialize(2) == Result::Accepted, "initial fence value rejected");
-  require(schedule.scheduleQueue(100, 4, true) == Result::Accepted, "first queue fence value rejected");
-  require(schedule.scheduleQueue(100, 4, false) == Result::Accepted, "equal-value producer was incorrectly rejected");
-  require(schedule.scheduleQueue(100, 9, false) == Result::Accepted, "same-queue increasing fence value rejected");
-  require(schedule.scheduleQueue(100, 8, false) == Result::DecreasingUnsupported,
-          "decreasing fence value was silently accepted");
-  require(schedule.scheduleQueue(200, 10, false) == Result::MixedProducerUnsupported,
-          "second GPU producer queue was silently accepted");
-  require(schedule.scheduleCpu(9, false) == Result::MixedProducerUnsupported,
-          "CPU same-value override of GPU producer was silently accepted");
-  require(schedule.lastScheduled() == 9, "rejected rewind changed scheduled value");
-  require(schedule.scheduleQueue(200, 10, true) == Result::Accepted,
-          "settled fence could not hand off to a second queue producer");
-  require(schedule.scheduleCpu(11, true) == Result::Accepted,
-          "settled fence could not hand off to a CPU producer");
+void testCompletionRegistrationAndRollback() {
+  FenceOrderEpoch timeline(12, 0);
+  bool cancelled_done = false;
+  auto cancelled = timeline.prepare(99, [&] { return cancelled_done; });
+  timeline.cancel(cancelled);
+  cancelled_done = true;
+  timeline.reconcile();
+  require(timeline.completedValue() == 0, "cancelled enqueue changed logical completion");
 
-  const auto before_failed_enqueue = schedule.state();
-  require(schedule.scheduleCpu(12, true) == Result::Accepted, "test signal preparation rejected");
-  schedule.restore(before_failed_enqueue);
-  require(schedule.lastScheduled() == 11, "failed enqueue rollback did not restore fence schedule");
-  std::puts("QUEUE_ORDER_REWIND_LIMIT_PASS decreasing=reject overlap=reject settled_handoff=allowed");
+  auto latch = std::make_shared<FenceCompletionLatch>();
+  require(timeline.addCompletionWaiter(7, [latch] { latch->signal(); }), "completion registration failed");
+  timeline.signalCpu(7);
+  timeline.signalCpu(2);
+  require(latch->ready(), "registered completion did not survive later rewind");
+  require(timeline.completedValue() == 2, "CPU rewind final value mismatch");
+  std::puts("QUEUE_ORDER_REGISTRATION_PASS rollback=1 crossing_latched=1 final=2");
 }
 
 void testCloseDrainsFifo() {
@@ -168,6 +162,9 @@ void testFutureSignalDoesNotBlockCallerAndDefersConsumerEncoding() {
   QueueTaskFifo<Task> queue_a;
   QueueTaskFifo<Task> queue_b;
   auto producer = std::make_shared<FenceOrderEpoch>(21);
+  auto producer_latch = std::make_shared<FenceCompletionLatch>();
+  require(producer->addCompletionWaiter(1, [producer_latch] { producer_latch->signal(); }),
+          "producer latch registration failed");
   std::mutex events_mutex;
   std::vector<std::string> events;
 
@@ -188,15 +185,15 @@ void testFutureSignalDoesNotBlockCallerAndDefersConsumerEncoding() {
   //   B.Wait(F1) -> B.Execute(temporalB) -> A.Execute(temporalA) -> A.Signal(F1)
   // Enqueue calls all return; only B's worker waits. A is free to encode first.
   require(queue_b.push([&] {
-    while (!producer->ready(1))
-      producer->waitFor(1, 2ms);
+    while (!producer_latch->waitFor(2ms))
+      producer->reconcile();
     record("B_WAIT_ENCODE");
   }), "enqueue B.Wait");
   require(queue_b.push([&] { record("B_EXECUTE_TEMPORAL"); }), "enqueue B.Execute");
   require(queue_a.push([&] { record("A_EXECUTE_TEMPORAL"); }), "enqueue A.Execute");
   require(queue_a.push([&] {
     record("A_SIGNAL_COMMIT");
-    producer->markCommitted(1);
+    producer->signalCpu(1);
   }), "enqueue A.Signal");
 
   queue_a.close();
@@ -216,14 +213,14 @@ void testFutureSignalDoesNotBlockCallerAndDefersConsumerEncoding() {
   require(a_execute < a_signal, "queue A FIFO order changed");
   require(a_signal < b_wait, "consumer Wait encoded before producer Signal commit");
   require(b_wait < b_execute, "queue B encoded Execute before its deferred Wait");
-  std::puts("QUEUE_ORDER_CROSSQUEUE_PASS caller_nonblocking=1 producer_commit_gate=1 fifo=1");
+  std::puts("QUEUE_ORDER_CROSSQUEUE_PASS caller_nonblocking=1 producer_completion_gate=1 fifo=1");
 }
 
 } // namespace
 
 int main() {
-  testEpochCommitIsolation();
-  testExplicitRewindLimitation();
+  testLogicalFenceRewindAndOverlap();
+  testCompletionRegistrationAndRollback();
   testCloseDrainsFifo();
   testTaskRetainsSubmissionStorage();
   testRecordHeadAddressStabilityAcrossListReset();
