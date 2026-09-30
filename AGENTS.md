@@ -4,6 +4,8 @@
 
 DXMT-based D3D12-to-Metal translator for Wine on macOS, with an owned DXIL/DXBC-to-AIR/metallib compiler. D3D10/11, DXGI, NVAPI, and NGX support share the runtime. No GPTK/D3DMetal, Apple Metal Shader Converter, or SPIR-V fallback.
 
+Do not expand scope into D3D11. Change it only when necessary for D3D12, and keep such changes minimal.
+
 Edit root `src/` directly. `README.md` describes the current workflow; `graphics-translator/patches/`, its upstream lock, and `docs/provenance/` preserve the frozen import baseline. Do not regenerate current sources with `scripts/build-owned-graphics.py` or export changes back into historical patches.
 
 ## Architecture & Data Flow
@@ -95,6 +97,13 @@ Runtime destinations and evidence output directories must be fresh. Never instal
 Supported local stack: macOS Xcode/Metal tools, Python 3, Meson 1.10.0, Ninja 1.13 family, llvm-mingw clang 22.1.8, x86_64 native LLVM 15.0.7 static libraries, and an installed Wine SDK. Apple Silicon needs Rosetta for this x86_64 Wine path. Meson's declared minimum is 1.3.0, not the documented toolchain version.
 
 Keep local dependencies under ignored `toolchains/` and outputs under `build/`. Use relative `-Dnative_llvm_path=toolchains/llvm-15` to avoid the documented absolute-path handling issue. No Node/Bun runtime or language package manager is required. `.clangd` points at `build/`; explicitly select `build/local/build` as the compilation-database directory when needed.
+
+### Artifact Cleanup During Development
+
+- Clean intermediate artifacts as work progresses, not only at task completion or after the SSD fills. Check available space before creating another full runtime or test prefix.
+- After a verification run finishes, preserve its evidence and remove its disposable Wine prefix once that run's Wine processes have stopped. Retain a prefix only while it is needed for an unresolved reproduction.
+- Keep the current build/install, the latest staged runtime, and one known-good comparison runtime. Retire obsolete runtime payloads (`bin/`, `lib/`, `share/`) while preserving their manifests and provenance. Additional copies must have an active verification purpose; fresh staging/output directory requirements still apply.
+- Preserve source, `toolchains/`, frozen fixtures, logs, `result.json`, and drawable captures. Limit cleanup to identified disposable artifacts under `build/`; never delete installed games, live prefixes, or artifacts still used by another worker. Coordinate shared cleanup with parallel agents before deleting their outputs.
 
 ## Testing & QA
 
