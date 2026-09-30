@@ -31,7 +31,8 @@ analyzer = load("owned_trace_analyzer", "analyze-owned-temporal-trace.py")
 
 class RunnerFailures(unittest.TestCase):
     def simulate(self, *, omit_frame: int | None = None, backend_log: str = "",
-                 foreign: bool = False, timeout: bool = False, stderr_diagnostic: str = "") -> dict:
+                 foreign: bool = False, timeout: bool = False, stderr_diagnostic: str = "",
+                 api_validation: bool = False) -> dict:
         with tempfile.TemporaryDirectory(dir=SCRATCH, prefix="runner-") as directory:
             base = Path(directory)
             runtime = base / "runtime"
@@ -41,7 +42,8 @@ class RunnerFailures(unittest.TestCase):
             fixture.write_bytes(b"controlled runner fixture, never executed")
             args = argparse.Namespace(runtime=runtime, lock=runtime / "owned-graphics-runtime.json",
                                       fixture=fixture, dxil_dir=base / "dxil", out=base / "result",
-                                      suite="ngx", mode="no-present", validation=True, timeout=1)
+                                      suite="ngx", mode="no-present", validation=not api_validation,
+                                      api_validation=api_validation, timeout=1)
 
             def fake_run(command, **kwargs):
                 if command[0] == str(runtime / "bin/wine"):
@@ -87,7 +89,8 @@ class RunnerFailures(unittest.TestCase):
                     (dxil / name).write_bytes(b"dxil-" + name.encode())
             args = argparse.Namespace(runtime=runtime, lock=runtime / "owned-graphics-runtime.json",
                                       fixture=fixture, dxil_dir=dxil, out=base / "result",
-                                      suite="dxil", mode="no-present", validation=False, timeout=1)
+                                      suite="dxil", mode="no-present", validation=False,
+                                      api_validation=False, timeout=1)
 
             def fake_run(command, **kwargs):
                 if command[0] == str(runtime / "bin/wine"):
@@ -101,6 +104,9 @@ class RunnerFailures(unittest.TestCase):
                         kwargs["stdout"].write("OWNED_D3D12_DXIL_DESCRIPTOR_TABLE hr=0x80004001\n")
                     if space_line:
                         kwargs["stdout"].write(f"OWNED_D3D12_DXIL_REGISTER_SPACES {space_line}\n")
+                    kwargs["stdout"].write("OWNED_D3D12_DXIL_STATIC_BOUNDS_PASS null_reads=zero "
+                                           "oob_atomic=zero oob_writes=dropped sentinels=preserved "
+                                           "in_range=exact root_uav=exact\n")
                     for slot in range(4):
                         kwargs["stdout"].write(f"OWNED_D3D12_DXIL_VARYING slot={slot} "
                                                "value=(1.0,2.0,1,1) expected=(1,2,1,1)\n")
@@ -186,7 +192,8 @@ class RunnerFailures(unittest.TestCase):
                     (dxil / name).write_bytes(b"dxil-" + name.encode())
             args = argparse.Namespace(runtime=runtime, lock=runtime / "owned-graphics-runtime.json",
                                       fixture=fixture, dxil_dir=dxil, out=base / "result",
-                                      suite="raytracing", mode="no-present", validation=False, timeout=1)
+                                      suite="raytracing", mode="no-present", validation=False,
+                                      api_validation=False, timeout=1)
 
             def fake_run(command, **kwargs):
                 if command[0] == str(runtime / "bin/wine"):
@@ -440,6 +447,13 @@ class RunnerFailures(unittest.TestCase):
         self.assertFalse(report["pass"])
         self.assertTrue(report["validation_errors"])
 
+    def test_api_only_validation_still_rejects_backend_error(self):
+        report = self.simulate(backend_log="err: Device error: Metal command buffer failed\n",
+                               api_validation=True)
+        self.assertFalse(report["pass"])
+        self.assertEqual(report["validation_mode"], "api-only")
+        self.assertTrue(report["validation_errors"])
+
     def test_shader_invalid_load_with_complete_readback_cannot_pass(self):
         report = self.simulate(stderr_diagnostic=
             "Invalid Metal usage: Invalid load in 'device' or 'constant' address space\n")
@@ -458,6 +472,55 @@ class RunnerFailures(unittest.TestCase):
 
     def test_timeout_after_printed_pass_cannot_pass(self):
         self.assertFalse(self.simulate(timeout=True)["pass"])
+
+    def test_atomic_copy_inconclusive_progress_is_core_pass_not_live_pass(self):
+        # Shader instrumentation can serialize independent queues. All ordered
+        # payloads still pass, but that is not evidence of live reader progress.
+        for suite in ("atomic-copy", "atomic-copy-live"):
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory(dir=SCRATCH, prefix="atomic-") as directory:
+                base = Path(directory)
+                runtime = base / "runtime"
+                native = runtime / "lib/wine/x86_64-unix/winemetal.so"
+                native.parent.mkdir(parents=True)
+                native.write_bytes(b"native")
+                (runtime / "owned-graphics-runtime.json").write_text("{}\n")
+                fixture = base / "owned-d3d12-atomic-copy.exe"
+                fixture.write_bytes(b"controlled runner fixture, never executed")
+                dxil = base / "dxil"
+                dxil.mkdir()
+                (dxil / "atomic-copy-reader.dxil").write_bytes(b"reader")
+                args = argparse.Namespace(runtime=runtime, lock=runtime / "owned-graphics-runtime.json",
+                                          fixture=fixture, dxil_dir=dxil, out=base / "result",
+                                          suite=suite, mode="no-present", validation=False,
+                                          api_validation=True, timeout=1)
+
+                def fake_run(command, **kwargs):
+                    if command[0] == str(runtime / "bin/wine"):
+                        lines = ["OWNED_D3D12_ATOMIC_COPY_BACKEND id=owned-graphics-d3d12"]
+                        for name in ("direct", "compute", "copy"):
+                            lines.extend((f"OWNED_D3D12_ATOMIC_COPY_CASE_PASS list={name} "
+                                          "uint32=1 dependencies=0,1 ordered=1",
+                                          f"OWNED_D3D12_ATOMIC_COPY64_CASE_PASS list={name} "
+                                          "scenarios=6 dependencies=0,2 exact=1"))
+                        lines.extend(("OWNED_D3D12_ATOMIC_COPY64_COMPUTE_PASS list=0 "
+                                      "predication_false=1 payload=1",
+                                      "OWNED_D3D12_ATOMIC_COPY64_COMPUTE_PASS list=2 "
+                                      "predication_false=0 payload=1",
+                                      "OWNED_D3D12_ATOMIC_COPY64_LIFETIME_PASS replay=2 released_list=1",
+                                      "OWNED_D3D12_ATOMIC_COPY64_LIVE_INCONCLUSIVE observed=256 "
+                                      "changed_threads=0 first=0 last=128 atomic64_snapshot=unproven",
+                                      "OWNED_D3D12_ATOMIC_COPY64_CONTROL_PASS threads=256 final=128 payload=1",
+                                      "OWNED_D3D12_ATOMIC_COPY_VALIDATION_PASS cases=33",
+                                      "OWNED_D3D12_ATOMIC_COPY_PASS uint32=1 uint64=1"))
+                        kwargs["stdout"].write("\n".join(lines) + "\n")
+                        kwargs["stderr"].write(f"dyld[1]: {native}\n")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                with patch.object(runner.subprocess, "run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+                    result = runner.run(args)
+                report = json.loads((args.out / "result.json").read_text())
+                self.assertEqual(report["pass"], suite == "atomic-copy")
+                self.assertEqual(result, 0 if suite == "atomic-copy" else 1)
 
 
 def example_trace() -> list[dict]:

@@ -14,4 +14,7 @@ void linkSamplePos(llvm::Module &M);
 
 void linkTessellation(llvm::Module &M);
 
+/** Links the exact fp32 denorm-preserve helpers (dxmt.denorm.*, air_denorm.metal). */
+void linkDenorm(llvm::Module &M);
+
 } // namespace dxmt

@@ -19,6 +19,7 @@
 #pragma once
 #include "d3d12_device_child.hpp"
 #include "Metal.hpp"
+#include <algorithm>
 #include <limits>
 #include <vector>
 
@@ -103,6 +104,16 @@ public:
       return false;
     allocations_.push_back(allocation);
     allocation_bytes_ += bytes;
+    return true;
+  }
+
+  bool
+  RemoveResidencyAllocation(WMT::Allocation allocation) {
+    auto it = std::find(allocations_.begin(), allocations_.end(), allocation);
+    if (it == allocations_.end())
+      return false;
+    allocation_bytes_ -= it->allocatedSize();
+    allocations_.erase(it);
     return true;
   }
 };

@@ -120,7 +120,7 @@ private:
    */
   static constexpr size_t kMaxPages = (uint64_t(UINT32_MAX) + 1) / kSlotsPerPage;
   static_assert(
-      kMaxPages * kSlotsPerPage == uint64_t(UINT32_MAX) + 1,
+      uint64_t(kMaxPages) * kSlotsPerPage == uint64_t(UINT32_MAX) + 1,
       "the page budget must be exactly the 32-bit slot index space"
   );
   static_assert(kSlotsPerPage * uint64_t(sizeof(Slot)) <= UINT32_MAX, "a page length must fit uint32");

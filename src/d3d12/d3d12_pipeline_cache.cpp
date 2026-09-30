@@ -9,7 +9,8 @@ namespace dxmt {
 namespace {
 
 constexpr uint64_t kMagic = 0x004f5350544d5844; // "DXMTPSO\0", little endian.
-constexpr uint32_t kVersion = 1;
+// 2: graphics key covers the stream-output declaration. 3: it covers GS/HS/DS bytecode.
+constexpr uint32_t kVersion = 3;
 
 struct StageRecord {
   uint64_t library_size;
@@ -132,14 +133,21 @@ HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Dige
   return hash.finish(key);
 }
 
-HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Digest &key) {
+HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Digest &key,
+                         const GraphicsPipelineExtras *extras) {
   if (desc.NumRenderTargets > 8 || (desc.InputLayout.NumElements && !desc.InputLayout.pInputElementDescs))
     return E_INVALIDARG;
   KeyBuilder hash;
-  hash.add(uint32_t(1), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  // Shader-visible ROV buffer ordering now has a hidden native resource. Old
+  // cached AIR lacks its access and cannot be paired with the runtime marker.
+  // 4: geometry and tessellation stages select their own AIR, so their bytecode is part of the key.
+  hash.add(uint32_t(4), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.VS);
   hash.shader(desc.PS);
+  hash.shader(desc.DS);
+  hash.shader(desc.HS);
+  hash.shader(desc.GS);
   hash.add(desc.SampleMask, desc.IBStripCutValue, desc.PrimitiveTopologyType,
            desc.NumRenderTargets, desc.DSVFormat, desc.SampleDesc.Count, desc.SampleDesc.Quality);
   for (UINT i = 0; i < desc.NumRenderTargets; ++i)
@@ -162,6 +170,13 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
            depth.StencilReadMask, depth.StencilWriteMask);
   for (const auto *face : {&depth.FrontFace, &depth.BackFace})
     hash.add(face->StencilFailOp, face->StencilDepthFailOp, face->StencilPassOp, face->StencilFunc);
+  // Stream-only state (fractional depth bias, back-face stencil masks); absent for classic descs.
+  if (extras && !extras->empty()) {
+    hash.add(uint32_t(0x45585452), bool(extras->depth_bias), extras->depth_bias.value_or(0.0f),
+             bool(extras->back_stencil_read_write_mask));
+    if (extras->back_stencil_read_write_mask)
+      hash.add(extras->back_stencil_read_write_mask->first, extras->back_stencil_read_write_mask->second);
+  }
   hash.add(desc.InputLayout.NumElements);
   for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
     const auto &element = desc.InputLayout.pInputElementDescs[i];
@@ -171,7 +186,43 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
     hash.add(element.SemanticIndex, element.Format, element.InputSlot, element.AlignedByteOffset,
              element.InputSlotClass, element.InstanceDataStepRate);
   }
+  // Stream output selects the VS capture epilogue, and RasterizedStream selects the
+  // rasterization-disabled (void) VS variant without a fragment stage.
+  const auto &so = desc.StreamOutput;
+  if ((so.NumEntries && !so.pSODeclaration) || (so.NumStrides && !so.pBufferStrides))
+    return E_INVALIDARG;
+  hash.add(so.NumEntries, so.NumStrides, so.RasterizedStream);
+  for (UINT i = 0; i < so.NumEntries; ++i) {
+    const auto &entry = so.pSODeclaration[i];
+    hash.add(entry.Stream, bool(entry.SemanticName));
+    if (entry.SemanticName)
+      hash.bytes(entry.SemanticName, std::strlen(entry.SemanticName));
+    hash.add(entry.SemanticIndex, entry.StartComponent, entry.ComponentCount, entry.OutputSlot);
+  }
+  for (UINT i = 0; i < so.NumStrides; ++i)
+    hash.add(so.pBufferStrides[i]);
   return hash.finish(key);
+}
+
+bool PipelineCacheIdentity(WMTPipelineCacheIdentity &identity) {
+  const auto &native = Identity();
+  identity = native.value;
+  return native.valid;
+}
+
+HRESULT PipelineCacheBlobKey(const void *data, size_t size, Sha1Digest &key) {
+  if (!data || size < sizeof(CacheHeader))
+    return E_INVALIDARG;
+  CacheHeader header;
+  memcpy(&header, data, sizeof(header));
+  if (header.magic != kMagic)
+    return E_INVALIDARG;
+  if (header.version != kVersion)
+    return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+  if (header.size != size)
+    return E_INVALIDARG;
+  key = header.key;
+  return S_OK;
 }
 
 HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, const Sha1Digest &key,
@@ -179,8 +230,11 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
   key_ = key;
   stages_ = stages;
   adapter_ = adapter;
-  if (!cached.CachedBlobSizeInBytes)
+  if (!cached.CachedBlobSizeInBytes) {
+    // A cold PSO compiles every stage; a restored one (below) compiles none.
+    owned_graphics::Trace("pipeline_cache_cold", ",\"stages\":", stages);
     return S_OK;
+  }
   if (!cached.pCachedBlob || cached.CachedBlobSizeInBytes < sizeof(CacheHeader))
     return E_INVALIDARG;
   CacheHeader header;
@@ -213,7 +267,9 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
     for (uint64_t j = 0; j < record.relocation_count; ++j) {
       SM50_CONSTANT_RELOCATION relocation;
       memcpy(&relocation, input + offsets[i].relocations + j * sizeof(relocation), sizeof(relocation));
-      if (relocation.Offset > record.constant_size - sizeof(uint64_t) || relocation.TargetOffset > record.constant_size)
+      if (relocation.Offset > record.constant_size - sizeof(uint64_t) ||
+          (relocation.TargetOffset > record.constant_size &&
+           relocation.TargetOffset != SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE))
         return E_INVALIDARG;
     }
   }
@@ -235,15 +291,20 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
     view.ConstantRelocations = record.relocation_count ? blob_.data() + offsets[i].relocations : nullptr;
     view.ConstantRelocationCount = record.relocation_count;
   }
+  owned_graphics::Trace("pipeline_cache_restore", ",\"stages\":", stages, ",\"bytes\":", uint64_t(size));
   return S_OK;
+}
+
+sm50_bitcode_t PipelineCache::bitcode(Stage stage) {
+  return loaded() ? sm50_bitcode_t{} : sm50_bitcode_t(compiled_[stage]);
 }
 
 SM50_COMPILED_BITCODE PipelineCache::view(Stage stage) {
   if (loaded())
     return views_[stage];
   SM50_COMPILED_BITCODE result{};
-  if (compiled_[stage])
-    SM50GetCompiledBitcode(compiled_[stage], &result);
+  if (sm50_bitcode_t bitcode = compiled_[stage])
+    SM50GetCompiledBitcode(bitcode, &result);
   return result;
 }
 
@@ -292,12 +353,18 @@ HRESULT PipelineCache::GetBlob(ID3DBlob **blob) {
       if (!(stages_ & (1u << i)))
         continue;
       const auto &compiled = views[i];
-      memcpy(bytes + offsets[i].library, compiled.Data, compiled.Size);
-      if (compiled.ConstantDataSize)
-        memcpy(bytes + offsets[i].constants, compiled.ConstantData, compiled.ConstantDataSize);
-      if (compiled.ConstantRelocationCount)
-        memcpy(bytes + offsets[i].relocations, compiled.ConstantRelocations,
-               compiled.ConstantRelocationCount * sizeof(SM50_CONSTANT_RELOCATION));
+      const sm50_bitcode_t source = bitcode(Stage(i));
+      if (!SM50ReadCompiledBitcode(source, SM50_COMPILED_BITCODE_PART_LIBRARY, compiled.Data,
+                                   bytes + offsets[i].library, compiled.Size) ||
+          !SM50ReadCompiledBitcode(source, SM50_COMPILED_BITCODE_PART_CONSTANTS, compiled.ConstantData,
+                                   bytes + offsets[i].constants, compiled.ConstantDataSize) ||
+          !SM50ReadCompiledBitcode(source, SM50_COMPILED_BITCODE_PART_RELOCATIONS, compiled.ConstantRelocations,
+                                   bytes + offsets[i].relocations,
+                                   compiled.ConstantRelocationCount * sizeof(SM50_CONSTANT_RELOCATION))) {
+        (*blob)->Release();
+        *blob = nullptr;
+        return E_FAIL;
+      }
     }
     const auto digest = BlobDigest(bytes, size);
     memcpy(bytes + offsetof(CacheHeader, digest), &digest, sizeof(digest));

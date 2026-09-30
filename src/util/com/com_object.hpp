@@ -58,6 +58,16 @@ public:
 
   void AddRefPrivate() { ++m_refPrivate; }
 
+  bool TryAddRefPrivate() {
+    uint32_t count = m_refPrivate.load(std::memory_order_acquire);
+    while (count && count < 0x7fffffff) {
+      if (m_refPrivate.compare_exchange_weak(count, count + 1, std::memory_order_acq_rel,
+                                             std::memory_order_acquire))
+        return true;
+    }
+    return false;
+  }
+
   void ReleasePrivate() {
     uint32_t refPrivate = --m_refPrivate;
     if (unlikely(!refPrivate)) {

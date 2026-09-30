@@ -21,6 +21,7 @@
 #include "dxmt_buffer.hpp"
 #include "dxmt_texture.hpp"
 #include <cstdint>
+#include <utility>
 
 #if UINTPTR_MAX == 0xffffffffffffffffULL
 #define DXMT_USE_EMBEDDED_HEAP_POINTER
@@ -75,6 +76,28 @@ struct EMBEDDED_DESCRIPTOR_HANDLE {
 
 static_assert(sizeof(EMBEDDED_DESCRIPTOR_HANDLE) == sizeof(D3D12_CPU_DESCRIPTOR_HANDLE));
 
+#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+/*
+ * 32-bit CPU descriptor handles. A 32-bit SIZE_T cannot embed a heap pointer and a 20-bit index,
+ * so each heap reserves a disjoint range of a process-wide 32-bit handle space instead: its handle
+ * for descriptor i is Base + i * kDescriptorHandleStride, the same increment
+ * GetDescriptorHandleIncrementSize reports on 64-bit. Handle 0 is never allocated. A lookup
+ * resolves only a handle inside a live range of the requested heap kind, on a stride boundary;
+ * anything else resolves to a null heap. Ranges are registered by a heap's successful
+ * initialization and released by its destruction, under a lock shared with lookups.
+ */
+enum class DescriptorHandleKind : uint8_t { ShaderVisible, Sampler, RenderTarget };
+constexpr uint32_t kDescriptorHandleStride = 32;
+
+/** Reserves a range for `count` descriptors; returns its base handle, or 0 when the space is exhausted. */
+SIZE_T RegisterDescriptorHandleRange(void *heap, DescriptorHandleKind kind, uint32_t count);
+void UnregisterDescriptorHandleRange(SIZE_T base);
+/** The handle of descriptor `index` of a registered heap, or 0 for an unregistered heap. */
+SIZE_T DescriptorHandleOf(const void *heap, uint32_t index);
+/** The heap of `kind` owning `handle` and the descriptor index, or {nullptr, 0}. */
+std::pair<void *, uint32_t> ResolveDescriptorHandle(SIZE_T handle, DescriptorHandleKind kind);
+#endif
+
 enum class ShaderVisibleDescriptorType {
   Null,
   SRVTexture,
@@ -83,6 +106,7 @@ enum class ShaderVisibleDescriptorType {
   UAVTexelBuffer,
   UAVBuffer,
   SRVTexelBuffer,
+  SRVRGB32Buffer,
   SRVBuffer,
   AccelerationStructure,
 };
@@ -92,7 +116,13 @@ struct SRVTextureCPUStorage {
   TextureViewKey view{};
 };
 
-using UAVTextureCPUStorage = SRVTextureCPUStorage;
+struct UAVTextureCPUStorage {
+  Texture *texture = nullptr;
+  TextureViewKey view{};
+  // Only texture3D UAVs use a W-slice range; the native view spans the mip.
+  uint16_t first_w_slice = 0;
+  uint16_t w_size = 0;
+};
 
 struct UAVTexelBufferCPUStorage {
   Buffer *buffer = nullptr;
@@ -136,6 +166,7 @@ struct ShaderVisibleDescriptorCPUStorage {
     UAVTexelBufferCPUStorage UAVTexelBuffer;
     UAVBufferCPUStorage UAVBuffer;
     SRVTexelBufferCPUStorage SRVTexelBuffer;
+    SRVBufferCPUStorage SRVRGB32Buffer;
     SRVBufferCPUStorage SRVBuffer;
     AccelerationStructureCPUStorage AccelerationStructure;
   };
@@ -145,12 +176,18 @@ struct ShaderVisibleDescriptorCPUStorage {
 
 class MTLD3D12DescriptorHeap : public ID3D12DescriptorHeap {
 public:
+  virtual void AddRefPrivate() = 0;
+  virtual void ReleasePrivate() = 0;
+
   virtual HRESULT
-  AddShaderResourceView(UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp) = 0;
+  AddShaderResourceView(UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp,
+                        bool CubeView, bool CenterSamplePattern) = 0;
 
   virtual HRESULT AddConstantBufferView(UINT Index, UINT64 VA, UINT32 SizeInBytes) = 0;
 
-  virtual HRESULT AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View) = 0;
+  virtual HRESULT AddUnorderedAccessView(
+      UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize
+  ) = 0;
 
   virtual HRESULT AddUnorderedAccessView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
 
@@ -159,6 +196,9 @@ public:
   ) = 0;
 
   virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
+
+  virtual HRESULT AddRGB32ShaderResourceView(UINT Index, Buffer *Buffer, BufferSlice Slice,
+                                             UINT Shader4ComponentMapping) = 0;
 
   virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferSlice Slice) = 0;
 
@@ -200,6 +240,7 @@ struct MTL_RENDER_TARGET_DESC {
   UINT Height = 0;
   UINT DepthPlane = 0;
   UINT RenderTargetArrayLength = 0;
+  bool CenterSamplePattern = false;
   UINT Flags = 0;
 };
 

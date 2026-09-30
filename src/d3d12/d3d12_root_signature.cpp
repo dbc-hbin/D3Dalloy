@@ -26,8 +26,10 @@
 #include "util_math.hpp"
 #include "util_md5.hpp"
 #include <cstring>
+#include <set>
 #include <cmath>
 #include <new>
+#include <type_traits>
 #include <vector>
 #include "../d3d10/d3d10_blob.hpp"
 #include "../airconv/dxbc_root_signature.hpp"
@@ -75,18 +77,54 @@ bool ValidFilter(D3D12_FILTER filter) {
   return !(value & D3D12_ANISOTROPIC_FILTERING_BIT) || (min == 1 && mag == 1 && mip == 1);
 }
 
-bool ValidStaticSampler(const D3D12_STATIC_SAMPLER_DESC &sampler) {
+inline UINT SamplerFlags(const D3D12_STATIC_SAMPLER_DESC &) { return D3D12_SAMPLER_FLAG_NONE; }
+inline UINT SamplerFlags(const D3D12_STATIC_SAMPLER_DESC1 &sampler) { return sampler.Flags; }
+
+/*
+ * A static sampler of any root signature version. 1.0/1.1 samplers carry no flags and
+ * only the three float border colors; 1.2 samplers (D3D12_STATIC_SAMPLER_DESC1) add
+ * the two *_UINT border colors and D3D12_SAMPLER_FLAGS, validated per the
+ * VulkanOn12 spec: UINT_BORDER_COLOR must not be combined with a float border color,
+ * and NON_NORMALIZED_COORDINATES restricts the sampler to point/linear min=mag with
+ * point mips, no comparison/anisotropy, MinLOD = MaxLOD = 0 and CLAMP/BORDER U,V.
+ */
+template <typename STATIC_SAMPLER>
+bool ValidStaticSampler(const STATIC_SAMPLER &sampler) {
   const auto valid_address = [](D3D12_TEXTURE_ADDRESS_MODE mode) {
     return mode >= D3D12_TEXTURE_ADDRESS_MODE_WRAP && mode <= D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
   };
-  return ValidFilter(sampler.Filter) && valid_address(sampler.AddressU) && valid_address(sampler.AddressV) &&
-         valid_address(sampler.AddressW) && std::isfinite(sampler.MipLODBias) && sampler.MipLODBias >= -16.0f &&
-         sampler.MipLODBias <= 15.99f && sampler.MaxAnisotropy >= 1 && sampler.MaxAnisotropy <= 16 &&
-         sampler.ComparisonFunc >= D3D12_COMPARISON_FUNC_NEVER &&
-         sampler.ComparisonFunc <= D3D12_COMPARISON_FUNC_ALWAYS &&
-         sampler.BorderColor >= D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK &&
-         sampler.BorderColor <= D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE && !std::isnan(sampler.MinLOD) &&
-         !std::isnan(sampler.MaxLOD) && sampler.MinLOD <= sampler.MaxLOD && ValidVisibility(sampler.ShaderVisibility);
+  constexpr bool v12 = std::is_same_v<STATIC_SAMPLER, D3D12_STATIC_SAMPLER_DESC1>;
+  const UINT border = static_cast<UINT>(sampler.BorderColor);
+  const UINT max_border = v12 ? kStaticBorderColorOpaqueWhiteUint
+                              : static_cast<UINT>(D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE);
+  if (!(ValidFilter(sampler.Filter) && valid_address(sampler.AddressU) && valid_address(sampler.AddressV) &&
+        valid_address(sampler.AddressW) && std::isfinite(sampler.MipLODBias) && sampler.MipLODBias >= -16.0f &&
+        sampler.MipLODBias <= 15.99f && sampler.MaxAnisotropy >= 1 && sampler.MaxAnisotropy <= 16 &&
+        sampler.ComparisonFunc >= D3D12_COMPARISON_FUNC_NEVER &&
+        sampler.ComparisonFunc <= D3D12_COMPARISON_FUNC_ALWAYS && border <= max_border &&
+        !std::isnan(sampler.MinLOD) && !std::isnan(sampler.MaxLOD) && sampler.MinLOD <= sampler.MaxLOD &&
+        ValidVisibility(sampler.ShaderVisibility)))
+    return false;
+  const UINT flags = SamplerFlags(sampler);
+  if (flags & ~UINT(D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR | D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES))
+    return false;
+  if ((flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR) && border <= D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE)
+    return false;
+  if (flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) {
+    const UINT filter = static_cast<UINT>(sampler.Filter);
+    const UINT reduction = (filter >> D3D12_FILTER_REDUCTION_TYPE_SHIFT) & D3D12_FILTER_REDUCTION_TYPE_MASK;
+    const UINT min = (filter >> D3D12_MIN_FILTER_SHIFT) & D3D12_FILTER_TYPE_MASK;
+    const UINT mag = (filter >> D3D12_MAG_FILTER_SHIFT) & D3D12_FILTER_TYPE_MASK;
+    const UINT mip = (filter >> D3D12_MIP_FILTER_SHIFT) & D3D12_FILTER_TYPE_MASK;
+    const auto clamp_or_border = [](D3D12_TEXTURE_ADDRESS_MODE mode) {
+      return mode == D3D12_TEXTURE_ADDRESS_MODE_CLAMP || mode == D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    };
+    if ((filter & D3D12_ANISOTROPIC_FILTERING_BIT) || reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON ||
+        min != mag || mip != 0 || sampler.MinLOD != 0.0f || sampler.MaxLOD != 0.0f ||
+        !clamp_or_border(sampler.AddressU) || !clamp_or_border(sampler.AddressV))
+      return false;
+  }
+  return true;
 }
 
 template <typename ROOT_SIGNATURE_DESC>
@@ -94,8 +132,10 @@ HRESULT ValidateRootSignatureDesc(const ROOT_SIGNATURE_DESC &desc) {
   using ROOT_PARAMETER = typename GetType<ROOT_SIGNATURE_DESC>::ROOT_PARAMETER;
   using DESCRIPTOR_RANGE = typename GetType<ROOT_SIGNATURE_DESC>::DESCRIPTOR_RANGE;
   const UINT signature_flags = static_cast<UINT>(desc.Flags);
+  // 0x400/0x800 are the SM 6.6 heap-directly-indexed flags; like every other flag they
+  // are rejected on a local root signature, which must carry exactly 0x80.
   if ((desc.NumParameters && !desc.pParameters) || (desc.NumStaticSamplers && !desc.pStaticSamplers) ||
-      (signature_flags & ~0x3ffu) || ((signature_flags & 0x80u) && signature_flags != 0x80u) ||
+      (signature_flags & ~0xfffu) || ((signature_flags & 0x80u) && signature_flags != 0x80u) ||
       ((signature_flags & 0x80u) && desc.NumStaticSamplers))
     return E_INVALIDARG;
 
@@ -136,7 +176,10 @@ HRESULT ValidateRootSignatureDesc(const ROOT_SIGNATURE_DESC &desc) {
             return E_INVALIDARG;
           const UINT flags = static_cast<UINT>(RangeFlags(range));
           const UINT data_flags = flags & 0xeu;
-          if ((flags & ~0xfu) || (data_flags && data_flags != 0x2u && data_flags != 0x4u && data_flags != 0x8u) ||
+          constexpr UINT keep_bounds = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS;
+          if ((flags & ~(0xfu | keep_bounds)) ||
+              (data_flags && data_flags != 0x2u && data_flags != 0x4u && data_flags != 0x8u) ||
+              ((flags & 0x1u) && ((flags & keep_bounds) || data_flags == 0x8u)) ||
               (range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER && (flags & ~0x1u)))
             return E_INVALIDARG;
           const UINT64 offset = range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
@@ -349,12 +392,14 @@ SerializeVersionedRootSignatureImpl(
 
   /* Static Samplers */
 
-  D3D12_STATIC_SAMPLER_DESC *StaticSamplers = nullptr;
+  /* 1.2 stores D3D12_STATIC_SAMPLER_DESC1 (with its flags word), every other version the flagless layout. */
+  using STATIC_SAMPLER = std::remove_const_t<std::remove_pointer_t<decltype(pDesc->pStaticSamplers)>>;
+  STATIC_SAMPLER *StaticSamplers = nullptr;
   RootSig->StaticSamplersOffset = add_segment(pDesc->NumStaticSamplers, &StaticSamplers);
   if (pDesc->NumStaticSamplers) {
     if (!StaticSamplers)
       return E_OUTOFMEMORY;
-    memcpy(StaticSamplers, pDesc->pStaticSamplers, sizeof(D3D12_STATIC_SAMPLER_DESC) * pDesc->NumStaticSamplers);
+    memcpy(StaticSamplers, pDesc->pStaticSamplers, sizeof(STATIC_SAMPLER) * pDesc->NumStaticSamplers);
   }
 
   struct DXBC_ROOT_SIGNATURE_BLOB_HEADER {
@@ -414,6 +459,11 @@ D3D12SerializeVersionedRootSignature(
     return SerializeVersionedRootSignatureImpl<D3D12_ROOT_SIGNATURE_DESC1>(
         &pRootSignatureDesc->Desc_1_1, D3D_ROOT_SIGNATURE_VERSION_1_1, ppBlob, ppErrorBlob
     );
+  case kRootSignatureVersion_1_2:
+    return SerializeVersionedRootSignatureImpl<D3D12_ROOT_SIGNATURE_DESC2>(
+        &reinterpret_cast<const VersionedRootSignatureDesc *>(pRootSignatureDesc)->Desc_1_2,
+        kRootSignatureVersion_1_2, ppBlob, ppErrorBlob
+    );
   }
 
   return E_INVALIDARG;
@@ -470,6 +520,9 @@ public:
     case D3D_ROOT_SIGNATURE_VERSION_1_1:
       *ppDesc = &impl_.desc_1_1_;
       break;
+    case kRootSignatureVersion_1_2:
+      *ppDesc = reinterpret_cast<const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *>(&impl_.desc_1_2_);
+      break;
     default:
       return E_INVALIDARG;
     }
@@ -481,8 +534,10 @@ public:
     switch (impl_.raw_root_sig_->Version) {
     case D3D_ROOT_SIGNATURE_VERSION_1_0:
       return &impl_.desc_1_0_;
-    default:
+    case D3D_ROOT_SIGNATURE_VERSION_1_1:
       return &impl_.desc_1_1_;
+    default:
+      return reinterpret_cast<const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *>(&impl_.desc_1_2_);
     }
   }
 
@@ -567,8 +622,11 @@ class MTLD3D12RootSignatureImpl : public MTLD3D12DeviceChild<MTLD3D12RootSignatu
 
   std::vector<uint8_t> blob_;
   std::vector<uint32_t> qword_offsets_;
+  std::vector<uint32_t> status_qword_offsets_;
   std::vector<D3D12_ROOT_PARAMETER_TYPE> parameter_types_;
   std::vector<UINT> parameter_constant_counts_;
+  std::vector<TableRange> table_ranges_;
+  std::vector<std::pair<uint32_t, uint32_t>> table_range_spans_;
   std::vector<raytracing::LocalRootCopy> local_root_copies_;
 
   std::vector<Rc<Sampler>> static_samplers_; // which is not really "static"
@@ -579,12 +637,25 @@ class MTLD3D12RootSignatureImpl : public MTLD3D12DeviceChild<MTLD3D12RootSignatu
   Let's do it in the simple way
   */
   std::vector<uint64_t> static_samplers_encoded_;
+  std::vector<MTLD3D12Device::StaticSamplerKey> registered_sampler_keys_;
+  bool sampler_keys_registered_ = false;
 
 public:
   MTLD3D12RootSignatureImpl(MTLD3D12Device *pDevice, const void *pBytecode, SIZE_T BytecodeLength) :
       MTLD3D12DeviceChild<MTLD3D12RootSignature>(pDevice) {
     blob_.resize(BytecodeLength);
     memcpy(blob_.data(), pBytecode, BytecodeLength);
+  }
+
+  ~MTLD3D12RootSignatureImpl() override {
+    if (!sampler_keys_registered_)
+      return;
+    std::lock_guard lock(device_->static_sampler_mutex);
+    for (const auto &key : registered_sampler_keys_) {
+      auto state = device_->static_sampler_uses.find(key);
+      if (--state->second == 0)
+        device_->static_sampler_uses.erase(state);
+    }
   }
 
   HRESULT
@@ -601,23 +672,75 @@ public:
       return hr;
 
     auto &desc = deserializer.desc_1_1_.Desc_1_1;
-    if (FAILED(hr = ValidateRootSignatureDesc(desc)))
+    /* A 1.2 blob is validated with its sampler flags and UINT border colors; older
+     * blobs keep the flagless 1.0/1.1 sampler contract. */
+    const auto &desc_1_2 = deserializer.desc_1_2_.Desc_1_2;
+    hr = deserializer.raw_root_sig_->Version == kRootSignatureVersion_1_2 ? ValidateRootSignatureDesc(desc_1_2)
+                                                                           : ValidateRootSignatureDesc(desc);
+    if (FAILED(hr))
       return hr;
 
     IsLocal = (static_cast<UINT>(desc.Flags) & 0x80u) != 0;
+    Flags = static_cast<uint32_t>(desc.Flags);
     NumStaticSamplers = desc.NumStaticSamplers;
     if (NumStaticSamplers) {
-      for (unsigned i = 0; i < desc.NumStaticSamplers; i++) {
-        WMTSamplerInfo info;
-        PopulateWMTSamplerInfo(device_->GetMTLDevice(), info, desc.pStaticSamplers[i]);
+      try {
+        std::set<MTLD3D12Device::StaticSamplerKey> unique;
+        for (UINT i = 0; i < desc.NumStaticSamplers; ++i) {
+          const auto &s = desc_1_2.pStaticSamplers[i];
+          // Sampler flags distinguish otherwise identical states; they share the border word.
+          unique.insert({static_cast<uint32_t>(s.Filter), static_cast<uint32_t>(s.AddressU),
+                         static_cast<uint32_t>(s.AddressV), static_cast<uint32_t>(s.AddressW),
+                         std::bit_cast<uint32_t>(s.MipLODBias), s.MaxAnisotropy,
+                         static_cast<uint32_t>(s.ComparisonFunc),
+                         static_cast<uint32_t>(s.BorderColor) | (static_cast<uint32_t>(s.Flags) << 8),
+                         std::bit_cast<uint32_t>(s.MinLOD), std::bit_cast<uint32_t>(s.MaxLOD)});
+        }
+        registered_sampler_keys_.assign(unique.begin(), unique.end());
+        std::lock_guard lock(device_->static_sampler_mutex);
+        size_t added = 0;
+        for (const auto &key : registered_sampler_keys_)
+          added += !device_->static_sampler_uses.contains(key);
+        if (device_->static_sampler_uses.size() + added > 2032)
+          return E_INVALIDARG;
+        size_t committed = 0;
+        try {
+          for (const auto &key : registered_sampler_keys_) {
+            ++device_->static_sampler_uses[key];
+            ++committed;
+          }
+        } catch (const std::bad_alloc &) {
+          for (size_t i = 0; i < committed; ++i) {
+            auto state = device_->static_sampler_uses.find(registered_sampler_keys_[i]);
+            if (--state->second == 0)
+              device_->static_sampler_uses.erase(state);
+          }
+          return E_OUTOFMEMORY;
+        }
+        sampler_keys_registered_ = true;
+      } catch (const std::bad_alloc &) {
+        return E_OUTOFMEMORY;
+      }
+      try {
+        static_samplers_encoded_.reserve(size_t(desc.NumStaticSamplers) * 4);
+        static_samplers_.reserve(desc.NumStaticSamplers);
+        for (unsigned i = 0; i < desc.NumStaticSamplers; i++) {
+          WMTSamplerInfo info;
+          PopulateWMTSamplerInfo(device_->GetMTLDevice(), info, desc_1_2.pStaticSamplers[i]);
 
-        auto sampler = Sampler::createSampler(device_->GetMTLDevice(), info, desc.pStaticSamplers[i].MipLODBias);
-        static_samplers_encoded_.push_back(sampler->sampler_state_handle);
-        static_samplers_encoded_.push_back(sampler->sampler_state_cube_handle);
-        static_samplers_encoded_.push_back((uint64_t)std::bit_cast<uint32_t>(sampler->lod_bias));
-        static_samplers_encoded_.push_back(0 /* padding */);
+          auto sampler = Sampler::createSampler(device_->GetMTLDevice(), info, desc_1_2.pStaticSamplers[i].MipLODBias,
+                                                SamplerReductionMode(desc_1_2.pStaticSamplers[i].Filter));
+          if (!sampler)
+            return E_OUTOFMEMORY;
+          static_samplers_encoded_.push_back(sampler->sampler_state_handle);
+          static_samplers_encoded_.push_back(sampler->sampler_state_cube_handle);
+          static_samplers_encoded_.push_back((uint64_t)std::bit_cast<uint32_t>(sampler->lod_bias));
+          static_samplers_encoded_.push_back(0 /* padding */);
 
-        static_samplers_.emplace_back(std::move(sampler));
+          static_samplers_.emplace_back(std::move(sampler));
+        }
+      } catch (const std::bad_alloc &) {
+        return E_OUTOFMEMORY;
       }
       EncodedStaticSamplers = static_samplers_encoded_.data();
     }
@@ -626,11 +749,39 @@ public:
     qword_offsets_ = std::move(offsets);
     parameter_types_.reserve(desc.NumParameters);
     parameter_constant_counts_.reserve(desc.NumParameters);
+    table_range_spans_.reserve(desc.NumParameters);
     for (UINT i = 0; i < desc.NumParameters; ++i) {
-      parameter_types_.push_back(desc.pParameters[i].ParameterType);
-      parameter_constant_counts_.push_back(desc.pParameters[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS
-                                                ? desc.pParameters[i].Constants.Num32BitValues : 0);
+      const auto &parameter = desc.pParameters[i];
+      parameter_types_.push_back(parameter.ParameterType);
+      parameter_constant_counts_.push_back(parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS
+                                                ? parameter.Constants.Num32BitValues : 0);
+      const uint32_t begin = table_ranges_.size();
+      if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+        uint64_t previous_end = 0;
+        for (UINT j = 0; j < parameter.DescriptorTable.NumDescriptorRanges; ++j) {
+          const auto &range = parameter.DescriptorTable.pDescriptorRanges[j];
+          const uint64_t offset = range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                                      ? previous_end : range.OffsetInDescriptorsFromTableStart;
+          table_ranges_.push_back({offset, range.NumDescriptors, range.RangeType});
+          HasTextureDescriptorTables |= range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+                                        range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+          previous_end = offset + range.NumDescriptors;
+        }
+      }
+      table_range_spans_.emplace_back(begin, table_ranges_.size() - begin);
     }
+    if (Flags & kRootSignatureFlagsDirectlyIndexed) {
+      HeapQwordOffset = total_qwords;
+      total_qwords += kHeapQwords;
+    }
+    status_qword_offsets_.assign(desc.NumParameters, ~0u);
+    if (!IsLocal) {
+      for (UINT i = 0; i < desc.NumParameters; ++i)
+        if (desc.pParameters[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
+            desc.pParameters[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV)
+          status_qword_offsets_[i] = total_qwords++;
+    }
+    StatusQwordOffsets = status_qword_offsets_.data();
     UploadQwords = total_qwords;
     ParameterSlots = qword_offsets_.size();
     SlotQwordOffsets = qword_offsets_.data();
@@ -701,6 +852,13 @@ public:
   GetBlob(const void **ppBlob) {
     *ppBlob = blob_.data();
     return blob_.size();
+  }
+
+  std::span<const TableRange> GetTableRanges(UINT root_parameter) const override {
+    if (root_parameter >= table_range_spans_.size()) return {};
+    const auto [begin, count] = table_range_spans_[root_parameter];
+    if (!count) return {};
+    return {table_ranges_.data() + begin, count};
   }
 };
 

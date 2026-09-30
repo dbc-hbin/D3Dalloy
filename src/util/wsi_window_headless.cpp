@@ -24,8 +24,9 @@ void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
     *pHeight = 1024;
 }
 
-void resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
+bool resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
                   uint32_t height) {
+  return true;
 }
 
 bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
@@ -53,8 +54,9 @@ HMONITOR getWindowMonitor(HWND hWindow) {
 
 bool isWindow(HWND hWindow) { return true; }
 
-void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow,
+bool updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow,
                             bool forceTopmost) {
+  return true;
 }
 
 bool isForeground(HWND hWindow) { return true; }

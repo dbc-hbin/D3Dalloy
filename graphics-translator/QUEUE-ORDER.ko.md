@@ -1,15 +1,20 @@
 # Owned D3D12 cross-queue CPU encode ordering
 
-## 현재 루트 구현: logical fence timeline (2026-09-22)
+## 현재 루트 구현: 검증 후 공개하는 logical fence timeline
 
 `src/dxmt/dxmt_queue_order.hpp`, `dxmt_fence.*`, `src/d3d12/d3d12_command_queue.cpp`는 아래 역사적 0007의 fence 제한을 대체한다.
 
-- CPU/GPU 감소 signal과 미완료 다중 queue/CPU producer를 허용한다. GPU signal마다 독립적인 monotonic Metal event token을 사용하고 D3D12 완료값은 별도 logical state로 관리한다.
-- CPU Signal 전에 이미 완료된 native token을 반영한다. 늦게 도착한 retirement가 이미 반영된 signal을 다시 적용해 CPU rewind를 덮어쓰지 않는다.
+- CPU/GPU 감소 signal과 미완료 다중 queue/CPU producer를 허용한다. GPU signal은 순차 completion 스레드가 앞선 submission의 Metal 결과와 SO status를 검증한 뒤 논리값으로 공개한다. SO 검증을 우회할 수 있던 native event probe와 signal별 Metal event는 제거했다.
+- CPU signal과 검증된 GPU 완료는 같은 logical timeline mutex로 직렬화한다. 이미 공개한 producer는 다시 적용하지 않아 후속 CPU rewind를 덮어쓰지 않는다.
 - Queue Wait는 API 호출 시 threshold latch를 등록한다. 이미 충족됐거나 이후 어느 producer가 충족한 wait도 rewind 후 유지된다. 첫 blocked producer에 wait를 고정하지 않는다.
 - consumer worker는 실제 qualifying completion까지 후속 encode를 보류한다. API caller는 비차단이며 다른 queue는 계속 진행한다. 기존 commit-only gate보다 보수적이며 CPU/GPU overlap 비용은 별도 측정해야 한다.
-- signal enqueue 실패 시 provisional producer를 취소한다. inflight submission이 fence/ticket을 GPU retirement까지 보유하며 관측 완료된 producer record는 제거한다.
+- enqueue 실패 시 공개되지 않은 ticket은 소멸한다. inflight submission은 fence/ticket을 GPU retirement까지 보유한다. 별도 producer registry나 native event polling은 없다.
 - single/ANY/ALL/null completion event도 같은 logical latch를 사용한다.
+- Device 오류는 fence의 terminal `UINT64_MAX`로 모든 등록 대기를 종료하며 늦은 signal로 rewind하지 않는다. 일반 사용자의 `Signal(UINT64_MAX)`는 여전히 rewind할 수 있다. 취소된 Present는 shared order event, GPU-completion watermark와 frame-latency credit을 함께 해제한다.
+- D3D12 color-space 전환(2026-09-29): setter는 검증된 다음 색 공간만 저장하며 GPU 완료를 직접 기다리지 않는다. Swapchain mutex로 설정·Present capture·resize를 직렬화한다. 다음 Present의 PSO/layer 변경과 resize는 이미 수락한 Present의 CPU encode뿐 아니라 GPU 완료까지 기다린다. `Rc<Presenter>`는 inflight command buffer가 보유하고 completion 스레드가 실제 Metal 완료 후 `notifyPresentCompleted()`를 호출한다. 여러 queue의 완료 스레드가 역순으로 진행해도 누락된 frame을 완료로 취급하지 않도록 최대 frame id가 아닌 완료 개수를 사용한다. D3D11의 기존 drain 경로는 바꾸지 않았다.
+- 색 공간이 바뀌는 다음 Present와 resize는 미신호 queue Wait 뒤의 이전 Present를 기다릴 수 있다. 따라서 그것들이 반환한 뒤에만 gate를 signal하는 호출 순서는 보장하지 않는다. GPU retirement는 물리적 scanout 완료나 Core Animation의 per-drawable 색 공간 latch를 의미하지 않는다. 공개 API·GPU/native 검증은 구현 상태 문서의 color-space 결과를 따른다.
+
+SO 오류 전파 이후 회귀: `build/local/so-integrity/proof-fence-events-02`, `proof-present-queues-02` 및 실제 fault `probe-fixed-02`, `probe-present-fixed-01`은 최종 runtime-02에서 Metal validation과 함께 통과했다. Device-loss 원인과 오류 후 종료 범위는 `CORE-IMPLEMENTATION-STATUS.ko.md`의 SO 추가 결과를 따른다.
 
 검증: `build/local/fence-core-before/result.json`에서 CPU 10→5가 `E_NOTIMPL`로 실패했고, 수정 후 `fence-core-after`, `fence-core-multiqueue-proof`, `fence-core-temporal-proof`의 `result.json`은 모두 PASS다. 각각 새 prefix, Metal API/shader validation, owned runtime 검사를 사용했다. CPU `queue-order-scheduler.test.cpp`도 PASS다. 실제 게임 및 성능 검증은 아니다.
 

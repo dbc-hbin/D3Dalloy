@@ -29,6 +29,18 @@ SM50Destroy(sm50_shader_t pShader) {
 }
 
 AIRCONV_API int
+SM50NeedsRasterOrderedBufferMarker(sm50_shader_t pShader, const void *pRootSignature, size_t RootSignatureLength) {
+  struct sm50_needs_raster_ordered_buffer_marker_params params;
+  params.shader = pShader;
+  params.root_signature = pRootSignature;
+  params.root_signature_length = RootSignatureLength;
+  params.ret = 0;
+  if (UNIX_CALL(sm50_needs_raster_ordered_buffer_marker, &params))
+    return 0;
+  return params.ret;
+}
+
+AIRCONV_API int
 SM50Compile(
     sm50_shader_t pShader, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs, const char *FunctionName,
     sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
@@ -52,6 +64,21 @@ SM50GetCompiledBitcode(sm50_bitcode_t pBitcode, struct SM50_COMPILED_BITCODE *pD
   params.bitcode = pBitcode;
   params.data_out = pData;
   UNIX_CALL(sm50_get_compiled_bitcode, &params);
+}
+
+AIRCONV_API int
+SM50CopyCompiledBitcode(
+    sm50_bitcode_t pBitcode, enum SM50_COMPILED_BITCODE_PART Part, void *pDestination, uint64_t Size
+) {
+  struct sm50_copy_compiled_bitcode_params params;
+  params.bitcode = pBitcode;
+  params.part = Part;
+  params.destination = (uint64_t)(uintptr_t)pDestination;
+  params.size = Size;
+  params.ret = 1;
+  if (UNIX_CALL(sm50_copy_compiled_bitcode, &params))
+    return 1;
+  return params.ret;
 }
 
 AIRCONV_API void
@@ -186,10 +213,21 @@ SM50RTEnumerateLibraryExports(
   params.names = pNames;
   params.names_size = NamesSize;
   params.export_count = pExportCount;
+#ifndef _WIN64
+  /* The legacy thunk transports a pointer-sized count; the public compiler
+   * ABI returns uint64_t on both PE architectures. Never alias those slots. */
+  size_t names_size = 0;
+  params.names_size_out = pNamesSize ? &names_size : NULL;
+#else
   params.names_size_out = pNamesSize;
+#endif
   params.error = ppError;
   params.ret = 0;
   NTSTATUS status = UNIX_CALL(sm50_rt_enumerate_exports, &params);
+#ifndef _WIN64
+  if (pNamesSize)
+    *pNamesSize = names_size;
+#endif
   if (status)
     return 0;
   return params.ret;

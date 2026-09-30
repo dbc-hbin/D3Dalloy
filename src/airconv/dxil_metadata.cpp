@@ -524,19 +524,21 @@ HandleOrigin resolveHandle(const llvm::Value *handle, unsigned depth = 0) {
       origin.has_declaration = true;
     }
     break;
-  case 216: /* createHandleFromBinding(opcode, ResBind, index, nonUniform, isReserved) */
+  case 217: /* createHandleFromBinding(opcode, ResBind, index, nonUniform) */
     if (call->arg_size() >= 2) {
       auto *binding = llvm::dyn_cast_or_null<llvm::ConstantStruct>(call->getArgOperand(1));
-      if (binding && binding->getNumOperands() >= 3) {
+      if (binding && binding->getNumOperands() >= 4) {
         origin.lower_bound = constantU32(binding->getOperand(0));
         origin.space = constantU32(binding->getOperand(2));
+        origin.klass = static_cast<ResourceClass>(constantU32(binding->getOperand(3)));
+        origin.has_class = true;
         origin.has_binding = true;
       }
     }
     break;
-  case 217: /* annotateHandle(opcode, ResourceProperties, Handle) */
+  case 216: /* annotateHandle(opcode, Handle, ResourceProperties) */
     if (call->arg_size() >= 3)
-      return resolveHandle(call->getArgOperand(2), depth + 1);
+      return resolveHandle(call->getArgOperand(1), depth + 1);
     break;
   default:
     break;
@@ -544,23 +546,25 @@ HandleOrigin resolveHandle(const llvm::Value *handle, unsigned depth = 0) {
   return origin;
 }
 
-void accumulateUsage(std::vector<ResourceBinding> &resources, const HandleOrigin &origin, const OpUsage &usage) {
+ResourceBinding *findBinding(std::vector<ResourceBinding> &resources, const HandleOrigin &origin) {
   for (auto &binding : resources) {
-    bool matches = false;
-    if (origin.has_declaration)
-      matches = binding.declaration_id == origin.declaration_id;
-    else if (origin.has_binding)
-      matches = binding.space == origin.space && binding.lower_bound == origin.lower_bound;
-    if (!matches)
-      continue;
     if (origin.has_class && binding.klass != origin.klass)
       continue;
-    binding.read |= usage.read;
-    binding.written |= usage.written;
-    binding.sampled |= usage.sampled;
-    binding.compared |= usage.compared;
-    binding.with_counter |= usage.counter;
-    return;
+    if (origin.has_declaration && binding.declaration_id == origin.declaration_id)
+      return &binding;
+    if (origin.has_binding && binding.space == origin.space && binding.lower_bound == origin.lower_bound)
+      return &binding;
+  }
+  return nullptr;
+}
+
+void accumulateUsage(std::vector<ResourceBinding> &resources, const HandleOrigin &origin, const OpUsage &usage) {
+  if (auto *binding = findBinding(resources, origin)) {
+    binding->read |= usage.read;
+    binding->written |= usage.written;
+    binding->sampled |= usage.sampled;
+    binding->compared |= usage.compared;
+    binding->with_counter |= usage.counter;
   }
 }
 
@@ -577,6 +581,18 @@ void scanUsage(llvm::Module &module, std::vector<ResourceBinding> &resources) {
         if (!call->arg_size())
           continue;
         uint32_t opcode = constantU32(call->getArgOperand(0));
+        if (opcode == 216 && call->arg_size() >= 3) {
+          auto *properties = llvm::dyn_cast<llvm::ConstantAggregate>(call->getArgOperand(2));
+          if (properties && properties->getNumOperands()) {
+            HandleOrigin origin = resolveHandle(call->getArgOperand(1));
+            if (auto *binding = findBinding(resources, origin); binding && binding->klass == ResourceClass::UAV) {
+              uint32_t flags = constantU32(properties->getOperand(0));
+              binding->rasterizer_order |= (flags & 0x2000u) != 0;
+              binding->globally_coherent |= (flags & 0x4000u) != 0;
+            }
+          }
+          continue;
+        }
         OpUsage usage = usageOfOpcode(opcode);
         if (!usage.read && !usage.written)
           continue;
@@ -746,6 +762,12 @@ llvm::Error extractMetadata(
   }
   if (out.stage == Stage::Invalid)
     return createError("DXIL module does not declare a shader model");
+  if (out.shader_model_major != 6 ||
+      ((out.shader_model_major << 4) | out.shader_model_minor) > SM50_MAX_DXIL_SHADER_MODEL)
+    return createError(llvm::Twine("DXIL shader model ") + llvm::Twine(out.shader_model_major) + "." +
+                       llvm::Twine(out.shader_model_minor) + " is not supported (highest supported is " +
+                       llvm::Twine(SM50_MAX_DXIL_SHADER_MODEL >> 4) + "." +
+                       llvm::Twine(SM50_MAX_DXIL_SHADER_MODEL & 0xf) + ")");
   readVersion(module, "dx.version", out.dxil_major, out.dxil_minor);
   readVersion(module, "dx.valver", out.valver_major, out.valver_minor);
 
@@ -759,6 +781,36 @@ llvm::Error extractMetadata(
     return createError("DXIL entry point does not reference a function");
   out.entry_name = getString(entry, 1);
   readThreadGroupSize(getNode(entry, 4), out.num_threads);
+  /* [WaveSize(n)] (tag 11) and SM 6.8 [WaveSize(min, max, preferred)] (tag 23): Apple
+   * simdgroups are always 32 lanes, so only a declaration that admits 32 compiles. */
+  if (llvm::MDNode *properties = getNode(entry, 4)) {
+    uint32_t wave_size = 0;
+    for (unsigned i = 0; i + 1 < properties->getNumOperands(); i += 2) {
+      uint32_t tag = 0;
+      if (!getU32(properties, i, tag) || tag != kDxilWaveSizeTag)
+        continue;
+      /* SM 6.6 encodes the value as `!{i32 n}`. */
+      llvm::MDNode *node = getNode(properties, i + 1);
+      if (!(node ? getU32(node, 0, wave_size) : getU32(properties, i + 1, wave_size)) || wave_size != 32)
+        return createError(llvm::Twine("DXIL [WaveSize(") + llvm::Twine(wave_size) +
+                           ")] is not supported: the wave size is always 32");
+    }
+    for (unsigned i = 0; i + 1 < properties->getNumOperands(); i += 2) {
+      uint32_t tag = 0;
+      if (!getU32(properties, i, tag) || tag != kDxilRangedWaveSizeTag)
+        continue;
+      llvm::MDNode *range = getNode(properties, i + 1);
+      const uint32_t minimum = getU32Or(range, 0, 0);
+      const uint32_t maximum = getU32Or(range, 1, 0);
+      if (!range || minimum > 32 || (maximum && maximum < 32) || (!maximum && minimum != 32))
+        return createError(llvm::Twine("DXIL [WaveSize(") + llvm::Twine(minimum) + ", " + llvm::Twine(maximum) +
+                           ")] does not admit the wave size 32");
+    }
+  }
+  // ForceEarlyDepthStencil is bit 3 in the low word of ShaderFlags (tag 0).
+  uint32_t shader_flags = 0;
+  readEntryProperty(getNode(entry, 4), 0, shader_flags);
+  out.force_early_depth_stencil = (shader_flags & (1u << 3)) != 0;
 
   /*
    * A library container's `!dx.shaderModel` is "lib" for every entry, so the
@@ -776,6 +828,38 @@ llvm::Error extractMetadata(
   }
 
   llvm::MDNode *resources = getNode(entry, 3);
+  /* Stage state: tag 1 GS {input primitive, max vertex count, stream mask, topology,
+   * instance count}, tag 2 DS {domain, input control points}, tag 3 HS {patch constant
+   * function, input CPs, output CPs, domain, partitioning, output primitive, max factor}. */
+  if (llvm::MDNode *properties = getNode(entry, 4)) {
+    for (unsigned i = 0; i + 1 < properties->getNumOperands(); i += 2) {
+      uint32_t tag = 0;
+      if (!getU32(properties, i, tag))
+        continue;
+      llvm::MDNode *state = getNode(properties, i + 1);
+      if (!state)
+        continue;
+      if (tag == 1 && out.stage == Stage::Geometry) {
+        out.geometry.input_primitive = getU32Or(state, 0, 0);
+        out.geometry.max_vertex_count = getU32Or(state, 1, 0);
+        out.geometry.stream_mask = getU32Or(state, 2, 1);
+        out.geometry.output_topology = getU32Or(state, 3, 0);
+        out.geometry.instance_count = getU32Or(state, 4, 1);
+      } else if (tag == 2 && out.stage == Stage::Domain) {
+        out.domain.domain = getU32Or(state, 0, 0);
+        out.domain.input_control_points = getU32Or(state, 1, 0);
+      } else if (tag == 3 && out.stage == Stage::Hull) {
+        out.patch_constant_function = llvm::dyn_cast_or_null<llvm::Function>(getValue(state, 0));
+        out.hull.input_control_points = getU32Or(state, 1, 0);
+        out.hull.output_control_points = getU32Or(state, 2, 0);
+        out.hull.domain = getU32Or(state, 3, 0);
+        out.hull.partitioning = getU32Or(state, 4, 0);
+        out.hull.output_primitive = getU32Or(state, 5, 0);
+        if (auto *factor = llvm::dyn_cast_or_null<llvm::ConstantFP>(getValue(state, 6)))
+          out.hull.max_tess_factor = factor->getValueAPF().convertToFloat();
+      }
+    }
+  }
   if (!resources) {
     if (auto *named = module.getNamedMetadata("dx.resources"))
       if (named->getNumOperands())
@@ -808,7 +892,11 @@ llvm::Error extractMetadata(
     if (auto err = parseSignatureChunk(chunk, out.output_sig))
       return err;
   }
-  if (tryFindChunk(bytecode, size, "PCSG", chunk)) {
+  /* DXIL containers store the hull/domain patch-constant signature as PSG1 (DXC's
+   * DFCC_PatchConstantSignature); PCSG is the DXBC name. */
+  const bool patch_stage = out.stage == Stage::Hull || out.stage == Stage::Domain;
+  if ((patch_stage && tryFindChunk(bytecode, size, "PSG1", chunk)) ||
+      tryFindChunk(bytecode, size, "PCSG", chunk)) {
     if (auto err = parseSignatureChunk(chunk, out.patch_constant_sig))
       return err;
   }
@@ -832,6 +920,27 @@ llvm::Error extractMetadata(
   applyMetadataSignature(metadata_input, out.input_sig);
   applyMetadataSignature(metadata_output, out.output_sig);
   applyMetadataSignature(metadata_patch, out.patch_constant_sig);
+
+  /* Capabilities the device reports as unsupported. SV_ShadingRate is D3D_NAME_SHADINGRATE (24) in the
+   * signature chunks and DXIL::SemanticKind::ShadingRate (29) in the entry metadata. */
+  auto shading_rate = [](const std::vector<SigElement> &sig) {
+    return std::any_of(sig.begin(), sig.end(), [](const SigElement &e) { return e.semantic_kind == 24; });
+  };
+  bool metadata_shading_rate = false;
+  for (unsigned list = 0; signature && list < 3; list++)
+    if (llvm::MDNode *elements = getNode(signature, list))
+      for (unsigned i = 0; i < elements->getNumOperands(); i++)
+        metadata_shading_rate |= getU32Or(getNode(elements, i), 3, 0) == 29;
+  if (metadata_shading_rate || shading_rate(out.input_sig) || shading_rate(out.output_sig))
+    return createError("DXIL SV_ShadingRate is not supported (VariableShadingRateTier is NOT_SUPPORTED)");
+  for (const ResourceBinding &binding : out.resources)
+    if (binding.kind == ResourceKind::FeedbackTexture2D || binding.kind == ResourceKind::FeedbackTexture2DArray)
+      return createError("DXIL sampler feedback is not supported (SamplerFeedbackTier is NOT_SUPPORTED)");
+  /* Inline raytracing: dx.op.allocateRayQuery (178, 258) and the dx.op.rayQuery_* methods (179..215). */
+  for (const llvm::Function &function : module)
+    if (function.isDeclaration() && (function.getName().startswith("dx.op.allocateRayQuery") ||
+                                     function.getName().startswith("dx.op.rayQuery_")))
+      return createError("DXIL inline raytracing (RayQuery) is not supported (RaytracingTier is NOT_SUPPORTED)");
 
   scanUsage(module, out.resources);
   scanOutputWrites(module, out);
@@ -897,17 +1006,23 @@ parseBitcode(
 }
 
 llvm::Expected<std::unique_ptr<ModuleInfo>>
-ModuleInfo::Parse(const void *bytecode, size_t size, const char *entry_name) {
+ModuleInfo::Parse(
+  const void *bytecode, size_t size, const char *entry_name, llvm::LLVMContext *shared_context
+) {
   auto program = FindDXILProgram(bytecode, size);
   if (!program)
     return program.takeError();
 
   auto info = std::make_unique<ModuleInfo>();
-  info->context = std::make_unique<llvm::LLVMContext>();
-  info->context->setOpaquePointers(false);
+  llvm::LLVMContext *context = shared_context;
+  if (!context) {
+    info->context = std::make_unique<llvm::LLVMContext>();
+    info->context->setOpaquePointers(false);
+    context = info->context.get();
+  }
 
   std::string diagnostics;
-  auto module = parseBitcode(*info->context, program->bitcode, program->bitcode_size, diagnostics);
+  auto module = parseBitcode(*context, program->bitcode, program->bitcode_size, diagnostics);
   if (!module) {
     std::string message;
     llvm::raw_string_ostream stream(message);
@@ -944,6 +1059,9 @@ ParseMetadata(const void *bytecode, size_t size, const char *entry_name) {
   metadata.input_sig = std::move((*info)->input_sig);
   metadata.output_sig = std::move((*info)->output_sig);
   metadata.patch_constant_sig = std::move((*info)->patch_constant_sig);
+  metadata.geometry = (*info)->geometry;
+  metadata.hull = (*info)->hull;
+  metadata.domain = (*info)->domain;
   metadata.resources = std::move((*info)->resources);
   return metadata;
 }

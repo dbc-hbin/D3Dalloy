@@ -5,6 +5,29 @@
 
 namespace dxmt::resource_contract {
 
+enum class EmulatedTextureStorage : uint8_t {
+  None,
+  RGB32,
+  PackedR8G8_B8G8,
+  PackedG8R8_G8B8,
+};
+
+inline EmulatedTextureStorage GetEmulatedTextureStorage(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G32B32_TYPELESS:
+  case DXGI_FORMAT_R32G32B32_FLOAT:
+  case DXGI_FORMAT_R32G32B32_UINT:
+  case DXGI_FORMAT_R32G32B32_SINT:
+    return EmulatedTextureStorage::RGB32;
+  case DXGI_FORMAT_R8G8_B8G8_UNORM:
+    return EmulatedTextureStorage::PackedR8G8_B8G8;
+  case DXGI_FORMAT_G8R8_G8B8_UNORM:
+    return EmulatedTextureStorage::PackedG8R8_G8B8;
+  default:
+    return EmulatedTextureStorage::None;
+  }
+}
+
 inline bool
 CheckedAdd(uint64_t a, uint64_t b, uint64_t &result) {
   if (b > UINT64_MAX - a)
@@ -119,16 +142,17 @@ struct FootprintLayout {
 
 inline bool
 ValidateFootprintRange(
-    uint64_t width, uint64_t height, uint64_t depth, uint32_t bytes_per_block, uint32_t block_width,
+    uint64_t width, uint64_t height, uint64_t depth, uint32_t bytes_per_block,
+    uint32_t block_width, uint32_t block_height,
     uint32_t row_pitch, uint64_t offset, uint64_t buffer_size,
     uint32_t placement_alignment, uint32_t pitch_alignment, FootprintLayout &layout
 ) {
-  if (!width || !height || !depth || !bytes_per_block || !block_width || !row_pitch ||
+  if (!width || !height || !depth || !bytes_per_block || !block_width || !block_height || !row_pitch ||
       !placement_alignment || !pitch_alignment || (offset % placement_alignment) || (row_pitch % pitch_alignment))
     return false;
 
   const uint64_t block_columns = (width + block_width - 1) / block_width;
-  layout.row_count = (height + block_width - 1) / block_width;
+  layout.row_count = (height + block_height - 1) / block_height;
   if (!CheckedMul(block_columns, bytes_per_block, layout.row_size) || layout.row_size > row_pitch)
     return false;
   if (!CheckedMul(row_pitch, layout.row_count, layout.slice_pitch))

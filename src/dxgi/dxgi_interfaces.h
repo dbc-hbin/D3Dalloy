@@ -30,6 +30,16 @@ DEFINE_COM_INTERFACE("6c030003-460a-4b19-909b-38f97d203e45",
       IDXGISwapChain1 **ppSwapChain) = 0;
 };
 
+// D3D12-only creation path: validate the optional output before fullscreen
+// setup, without changing the shared swapchain factory ABI used by D3D11.
+DEFINE_COM_INTERFACE("ba5a922b-fee8-40ae-8c74-599855edebb7", IMTLD3D12SwapChainFactory)
+    : public IMTLSwapChainFactory {
+  virtual HRESULT STDMETHODCALLTYPE CreateSwapChainWithOutput(
+      IDXGIFactory1 *factory, HWND window, const DXGI_SWAP_CHAIN_DESC1 *desc,
+      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc, IDXGIOutput *restrict_output,
+      IDXGISwapChain1 **swapchain) = 0;
+};
+
 static constexpr IID DXMT_NVEXT_GUID = dxmt::guid::make_guid("ba0af616-4a43-4259-815c-db3b89829905");
 
 namespace dxmt {

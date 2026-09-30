@@ -41,7 +41,7 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
     info_.length = DXMT_PAGE_SIZE;
   }
   fenceTrackers.resize(suballocation_count_);
-  if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
+  if (flags_.test(BufferAllocationFlag::CpuPlaced) && !info_.memory.get_accessible_or_null()) {
     placed_buffer = wsi::aligned_malloc(info_.length, DXMT_PAGE_SIZE);
     info_.memory.set(placed_buffer);
   }
@@ -68,6 +68,19 @@ BufferAllocation::BufferAllocation(
   obj_ = heap.newBuffer(info_, heap_offset);
   gpuAddress_ = info_.gpu_address;
   mappedMemory_ = info_.memory.get_accessible_or_null();
+}
+
+BufferAllocation::BufferAllocation(
+    WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size
+) :
+    info_(info),
+    flags_(flags),
+    sparse_page_size_(page_size) {
+  suballocation_size_ = info_.length;
+  fenceTrackers.resize(suballocation_count_);
+  obj_ = device.newPlacementSparseBuffer(info_, page_size);
+  gpuAddress_ = info_.gpu_address;
+  mappedMemory_ = nullptr;
 }
 
 void
@@ -151,7 +164,11 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     }
     info.usage = usage;
 
-    auto view = allocation->obj_.newTexture(info, view_offset, view_length);
+    /* A texel view of a placement sparse buffer must carry the buffer's page size, or it reads zero. */
+    auto view = allocation->flags().test(BufferAllocationFlag::PlacementSparse)
+                    ? allocation->obj_.newPlacementSparseTextureView(info, view_offset, view_length,
+                                                                     allocation->sparse_page_size_)
+                    : allocation->obj_.newTexture(info, view_offset, view_length);
 
     allocation->cached_view_.push_back(std::make_unique<BufferView>(
         std::move(view), info.gpu_resource_id, view_length / texel_size
@@ -220,6 +237,32 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t hea
   info.options = options;
   flags.set(BufferAllocationFlag::AllocatedOnHeap);
   return new BufferAllocation(device_, info, flags, heap, heap_offset);
+};
+
+Rc<BufferAllocation>
+Buffer::allocate(Flags<BufferAllocationFlag> flags, void *placed_memory) {
+  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+  if (flags.test(BufferAllocationFlag::CpuWriteCombined)) {
+    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+  }
+  WMTBufferInfo info;
+  info.memory.set(placed_memory);
+  info.length = length_;
+  info.options = options;
+  flags.set(BufferAllocationFlag::CpuPlaced);
+  return new BufferAllocation(device_, info, flags);
+};
+
+Rc<BufferAllocation>
+Buffer::allocateSparse(WMTSparsePageSize page_size) {
+  WMTBufferInfo info;
+  info.memory.set(0);
+  info.length = length_;
+  info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
+  Flags<BufferAllocationFlag> flags;
+  flags.set(BufferAllocationFlag::GpuPrivate);
+  flags.set(BufferAllocationFlag::PlacementSparse);
+  return new BufferAllocation(device_, info, flags, page_size);
 };
 
 Rc<BufferAllocation>

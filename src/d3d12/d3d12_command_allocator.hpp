@@ -55,26 +55,33 @@ struct IndirectComputeCommandData {
   uint32_t tgsize_x;
   uint32_t tgsize_y;
   uint32_t tgsize_z;
+  uint64_t pipeline_statistics;
 };
 
-struct IndirectRenderCommandData {
-  uint64_t cmd_buf;
-  uint64_t max_count;
-  uint64_t max_count_buffer;
-  uint64_t argument_buffer;
-  uint64_t predicate;
-  uint32_t predicate_op;
-  uint32_t predicate_padding;
-  uint64_t static_samplers;
-  uint64_t rootsig_qwords;
-  uint64_t vertex_constants;
-  uint64_t fragment_constants;
-  uint32_t rootsig_qwords_stride;
-  uint32_t primitive_type;
-  uint64_t vertex_buffer;
-  uint64_t index_buffer;
-  DXGI_FORMAT index_buffer_format;
-  uint32_t vertex_argbuf_stride;
+// One stable entry head per recording, owned by its allocator arena. The
+// frontend may Reset the same command-list object onto another allocator
+// while an older recording is executing; each head tracks its own submissions.
+struct RecordedStateEvent {
+  std::shared_ptr<BarrierTracker> resource;
+  UINT subresource;
+  D3D12_RESOURCE_STATES before;
+  D3D12_RESOURCE_STATES after;
+  D3D12_RESOURCE_BARRIER_FLAGS flags;
+  bool implicit_use = false;
+  // ID3D12GraphicsCommandList7::Barrier. Texture barriers carry layouts; buffer barriers (and
+  // texture barriers on layout-less resources) only assert that no legacy state is in effect.
+  bool enhanced = false;
+  bool split_begin = false;
+  bool split_end = false;
+  D3D12_BARRIER_LAYOUT layout_before = D3D12_BARRIER_LAYOUT_UNDEFINED;
+  D3D12_BARRIER_LAYOUT layout_after = D3D12_BARRIER_LAYOUT_UNDEFINED;
+  D3D12_BARRIER_ACCESS access_before = D3D12_BARRIER_ACCESS_NO_ACCESS;
+  D3D12_BARRIER_ACCESS access_after = D3D12_BARRIER_ACCESS_NO_ACCESS;
+};
+
+struct RecordingHead : EncoderData {
+  std::atomic<uint32_t> in_flight{0};
+  std::vector<RecordedStateEvent> state_events;
 };
 
 class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllocator> {
@@ -83,6 +90,8 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
 
   D3D12_COMMAND_LIST_TYPE type_;
   std::shared_ptr<std::atomic<uint64_t>> recording_generation_ = std::make_shared<std::atomic<uint64_t>>(0);
+  dxmt::mutex submission_mutex_;
+  uint32_t outstanding_submissions_ = 0;
 
   std::vector<void *> spilled_cpu_heap_;
   void *cpu_heap_ = nullptr;
@@ -100,7 +109,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   // Closed command-list entry pointers may outlive the list object while a
   // queue worker defers CPU encoding behind a future fence signal. Appending a
   // new recording after CommandList::Reset must not move earlier entry heads.
-  owned_graphics::StableSubmissionStorage<EncoderData> encoder_lists_;
+  owned_graphics::StableSubmissionStorage<RecordingHead> encoder_lists_;
 
   small_vector<WMT::Reference<WMT::IndirectCommandBuffer>, 4> icb_;
 
@@ -112,6 +121,25 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
 
 public:
   MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type);
+
+  bool CaptureSubmission(uint64_t generation) {
+    std::lock_guard<dxmt::mutex> lock(submission_mutex_);
+    if (recording_generation_->load(std::memory_order_acquire) != generation)
+      return false;
+    ++outstanding_submissions_;
+    return true;
+  }
+
+  void RetainSubmission() {
+    std::lock_guard<dxmt::mutex> lock(submission_mutex_);
+    ++outstanding_submissions_;
+  }
+
+  void ReleaseSubmission() {
+    std::lock_guard<dxmt::mutex> lock(submission_mutex_);
+    assert(outstanding_submissions_);
+    --outstanding_submissions_;
+  }
 
   ~MTLD3D12CommandAllocatorImpl();
 
@@ -148,7 +176,11 @@ public:
   StartRecord(EncoderData **pStartEncoder) {
     if (encoder_last)
       return E_INVALIDARG;
-    *pStartEncoder = encoder_last = &encoder_lists_.emplace_back(EncoderType::Null, nullptr);
+    auto &head = encoder_lists_.emplace_back();
+    head.type = EncoderType::Null;
+    head.next = nullptr;
+    head.id = 0;
+    *pStartEncoder = encoder_last = &head;
     return S_OK;
   }
 
@@ -256,9 +288,10 @@ public:
     return {block.buffer, offset};
   }
 
-  IndirectComputeCommandData *EncodeIndirectComputeCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12ComputePipelineState *pPSO, size_t MaxCount);
+  IndirectComputeCommandData *EncodeIndirectComputeCommand(
+      MTLD3D12CommandSignature *pCmdSig, MTLD3D12ComputePipelineState *pPSO, size_t MaxCount, bool statistics);
 
-  IndirectRenderCommandData *EncodeIndirectRenderCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount);
+  IndirectRenderCommandData *EncodeIndirectRenderCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount, bool index_pull);
 };
 
 } // namespace dxmt

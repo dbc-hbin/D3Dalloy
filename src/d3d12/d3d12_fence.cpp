@@ -34,10 +34,71 @@ public:
 
   HRESULT
   Initialize(UINT64 InitialValue) {
-    fence = new Fence(device_->GetMTLDevice());
+    fence = new Fence();
     if (!fence->initialize(InitialValue))
       return E_OUTOFMEMORY;
-    return S_OK;
+    if (!device_->RegisterFenceOrder(fence->currentOrder()))
+      return E_OUTOFMEMORY;
+    if (!(flags_ & (D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER)))
+      return S_OK;
+    auto event = device_->GetMTLDevice().newSharedEvent();
+    if (!event)
+      return E_OUTOFMEMORY;
+    HRESULT hr = sharing::Create(sharing::Kind::Fence, sizeof(SharedFenceTimeline), share);
+    if (FAILED(hr))
+      return hr;
+    share->header().fence_flags = flags_;
+    return Publish(std::move(event), true, InitialValue);
+  }
+
+  /*
+   * Value mapping: the MTLSharedEvent carries monotonic native tokens, never API
+   * values. Every Signal (CPU or GPU, any device or process) reserves the next
+   * token in the section's SharedFenceTimeline and publishes token -> logical
+   * value before the event can reach that token. The API value of the fence is
+   * the logical value published for the event's current token, so it is the
+   * same in every process and Signal(lower) rewinds it, exactly like a
+   * non-shared fence, while Metal's event timeline only moves forward.
+   */
+  HRESULT
+  Publish(WMT::Reference<WMT::SharedEvent> event, bool publish_initial, uint64_t initial_value) {
+    if (share->payloadSize() < sizeof(SharedFenceTimeline))
+      return E_INVALIDARG;
+    const uint64_t identity = WMTShareObjectIdentity(event.handle, 0);
+    if (!identity)
+      return E_FAIL;
+    if (!share->header().identity)
+      share->header().identity = identity;
+    else if (share->header().identity != identity)
+      return E_INVALIDARG;
+    mach_port_t port = event.createMachPort();
+    if (!port)
+      return E_FAIL;
+    HRESULT hr = share->publishPort(port);
+    WMTMachPortDeallocate(port);
+    if (FAILED(hr))
+      return hr;
+    auto *timeline = reinterpret_cast<SharedFenceTimeline *>(share->payload());
+    return fence->initializeShared(std::move(event), timeline, share, publish_initial, initial_value) ? S_OK
+                                                                                                    : E_OUTOFMEMORY;
+  }
+
+  HRESULT
+  InitializeOpened(std::shared_ptr<sharing::SharedObject> object) {
+    share = std::move(object);
+    mach_port_t port = share->lookUpPort();
+    if (!port)
+      return E_INVALIDARG;
+    auto event = WMT::Reference<WMT::SharedEvent>(MTLDevice_newSharedEventWithMachPort(device_->GetMTLDevice().handle, port));
+    WMTMachPortDeallocate(port);
+    if (!event)
+      return E_INVALIDARG;
+    fence = new Fence();
+    if (!fence->initialize(0)) // replaced by the published logical value in Publish
+      return E_OUTOFMEMORY;
+    if (!device_->RegisterFenceOrder(fence->currentOrder()))
+      return E_OUTOFMEMORY;
+    return Publish(std::move(event), false, 0);
   }
 
   HRESULT
@@ -63,15 +124,20 @@ public:
 
   UINT64 STDMETHODCALLTYPE
   GetCompletedValue() {
-    return fence->completedValue();
+    if (device_->RemovedReason() != S_OK)
+      return UINT64_MAX;
+    auto value = fence->completedValue();
+    return device_->RemovedReason() != S_OK ? UINT64_MAX : value;
   }
 
   HRESULT STDMETHODCALLTYPE
   SetEventOnCompletion(UINT64 Value, HANDLE Event) {
+    if (device_->RemovedReason() != S_OK)
+      return DXGI_ERROR_DEVICE_REMOVED;
     try {
       if (!Event) {
         fence->wait(Value);
-        return S_OK;
+        return device_->RemovedReason() == S_OK ? S_OK : DXGI_ERROR_DEVICE_REMOVED;
       }
       return device_->event_listener.setEventOnValue(fence.ptr(), Event, Value) ? S_OK : E_OUTOFMEMORY;
     } catch (const std::bad_alloc &) {
@@ -81,6 +147,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   Signal(UINT64 Value) {
+    if (device_->RemovedReason() != S_OK)
+      return DXGI_ERROR_DEVICE_REMOVED;
     return fence->signal(Value) ? S_OK : E_OUTOFMEMORY;
   }
 
@@ -98,6 +166,18 @@ CreateFence(MTLD3D12Device *pDevice, UINT64 InitialValue, D3D12_FENCE_FLAGS Flag
     return hr;
   if (!ppFence)
     return S_FALSE;
+  return fence->QueryInterface(riid, ppFence);
+}
+
+HRESULT
+OpenSharedFence(MTLD3D12Device *pDevice, std::shared_ptr<sharing::SharedObject> share, REFIID riid, void **ppFence) {
+  InitReturnPtr(ppFence);
+  if (share->kind() != sharing::Kind::Fence)
+    return E_INVALIDARG;
+  auto fence = Com(new MTLD3D12FenceImpl(pDevice, share->header().fence_flags));
+  HRESULT hr = fence->InitializeOpened(std::move(share));
+  if (FAILED(hr))
+    return hr;
   return fence->QueryInterface(riid, ppFence);
 }
 

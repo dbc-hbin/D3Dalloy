@@ -88,8 +88,14 @@ struct IndexByIndexableTempComponent {
   uint32_t offset;
 };
 
+/* A system-value register used as a relative index (e.g. v[vOutputControlPointID + 0]). */
+struct IndexByAttribute {
+  shader::common::InputAttribute attribute;
+  uint32_t offset;
+};
+
 using OperandIndex =
-  std::variant<uint32_t, IndexByIndexableTempComponent, IndexByTempComponent>;
+  std::variant<uint32_t, IndexByIndexableTempComponent, IndexByTempComponent, IndexByAttribute>;
 #pragma endregion
 
 enum class OperandDataType {
@@ -445,6 +451,7 @@ struct InstLoad {
   SrcOperandResource src_resource;
   std::optional<SrcOperand> src_sample_index;
   int32_t offsets[3];
+  std::optional<DstOperand> feedback;
 };
 
 struct InstLoadRaw {
@@ -453,6 +460,7 @@ struct InstLoadRaw {
   std::variant<SrcOperandResource, SrcOperandUAV, SrcOperandTGSM> src;
   // then we can load 4 components at once
   bool opt_flag_offset_is_vec4_aligned = false;
+  std::optional<DstOperand> feedback;
 };
 
 struct InstLoadStructured {
@@ -462,12 +470,14 @@ struct InstLoadStructured {
   std::variant<SrcOperandResource, SrcOperandUAV, SrcOperandTGSM> src;
   // 2nd condition: stride is also vec4 aligned
   bool opt_flag_offset_is_vec4_aligned = false;
+  std::optional<DstOperand> feedback;
 };
 
 struct InstLoadUAVTyped {
   DstOperand dst;
   SrcOperand src_address;
   SrcOperandUAV src_uav;
+  std::optional<DstOperand> feedback;
 };
 
 struct InstStoreUAVTyped {

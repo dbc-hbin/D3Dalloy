@@ -42,6 +42,12 @@ struct SignatureSlot {
   uint32_t mask = 0;
   /** Index of the AIR function argument the element is bound to, ~0u if none. */
   uint32_t air_index = ~0u;
+  /** AIR argument is a pull-mode interpolant rather than an eagerly interpolated value. */
+  bool pull_mode = false;
+  /** AIR `vertex_value` argument for GetAttributeAtVertex (SM 6.1), ~0u if not read per vertex. */
+  uint32_t vertex_value_index = ~0u;
+  /** DXIL interpolation mode from the signature metadata. */
+  uint8_t interpolation = 0;
   /** microsoft::D3D_REGISTER_COMPONENT_TYPE */
   uint8_t comp_type = 0;
   /** microsoft::D3D_NAME */

@@ -61,6 +61,16 @@ Converter::LoadOperandIndex(const IndexByIndexableTempComponent &SrcOpIndex) {
 }
 
 llvm::Value *
+Converter::LoadOperandIndex(const IndexByAttribute &SrcOpIndex) {
+  SrcOperandAttribute RelReg{
+      ._ = {swizzle_identity, false, false, OperandDataType::Integer},
+      .attribute = SrcOpIndex.attribute,
+  };
+  auto Rel = LoadOperand(RelReg, 0b1);
+  return ir.CreateAdd(Rel, ir.getInt32(SrcOpIndex.offset));
+}
+
+llvm::Value *
 Converter::LoadOperand(const SrcOperandConstantBuffer &SrcOp, mask_t Mask) {
 
   auto RangeId = SrcOp.rangeid;
@@ -434,7 +444,9 @@ Converter::LoadTexture(const SrcOperandResource &SrcOp) {
 
   return llvm::Optional<TextureResourceHandle>(
       {texture, descriptor->ResourceKindLogical, descriptor->ResourceHandle, descriptor->Metadata, SrcOp.read_swizzle,
-       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
+       descriptor->GlobalCoherent && SupportsMemoryCoherency(), descriptor->Scoped3DUAV,
+       descriptor->EmulationAddress, descriptor->EmulationTag, descriptor->StatusBase, descriptor->StatusView,
+       descriptor->RGB32StatusBase}
   );
 }
 
@@ -453,7 +465,8 @@ Converter::LoadTexture(const SrcOperandUAV &SrcOp) {
 
   return llvm::Optional<TextureResourceHandle>(
       {texture, descriptor->ResourceKindLogical, descriptor->ResourceHandle, descriptor->Metadata, SrcOp.read_swizzle,
-       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
+       descriptor->GlobalCoherent && SupportsMemoryCoherency(), descriptor->Scoped3DUAV, nullptr, nullptr,
+       descriptor->StatusBase, descriptor->StatusView}
   );
 }
 
@@ -472,8 +485,111 @@ Converter::LoadTexture(const AtomicDstOperandUAV &DstOp) {
 
   return llvm::Optional<TextureResourceHandle>(
       {texture, descriptor->ResourceKindLogical, descriptor->ResourceHandle, descriptor->Metadata, swizzle_identity,
-       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
+       descriptor->GlobalCoherent && SupportsMemoryCoherency(), descriptor->Scoped3DUAV}
   );
+}
+
+llvm::Value *
+Converter::GuardScoped3DUAV(llvm::Value *Valid, llvm::Type *ResultType, llvm::function_ref<llvm::Value *()> Emit) {
+  auto *function = ir.GetInsertBlock()->getParent();
+  auto *entry = ir.GetInsertBlock();
+  auto *access = llvm::BasicBlock::Create(ir.getContext(), "uav3d.access", function);
+  auto *join = llvm::BasicBlock::Create(ir.getContext(), "uav3d.join", function);
+  ir.CreateCondBr(Valid, access, join);
+  ir.SetInsertPoint(access);
+  auto *value = Emit();
+  auto *access_tail = ir.GetInsertBlock();
+  ir.CreateBr(join);
+  ir.SetInsertPoint(join);
+  if (!ResultType)
+    return nullptr;
+  auto *result = ir.CreatePHI(ResultType, 2);
+  result->addIncoming(llvm::Constant::getNullValue(ResultType), entry);
+  result->addIncoming(value, access_tail);
+  return result;
+}
+
+void
+Converter::StoreFeedback(const std::optional<DstOperand> &DstOp, llvm::Value *Status) {
+  if (!DstOp)
+    return;
+  llvm::Value *Mapped = air.getInt(1);
+  if (Status && Status->getType()->isIntegerTy(8))
+    /* AIR texture results: bit 0 set when a texel was not resident (sparse_color::resident()). */
+    Mapped = ir.CreateZExt(ir.CreateICmpEQ(ir.CreateAnd(Status, ir.getInt8(1)), ir.getInt8(0)), air.getIntTy());
+  else if (Status)
+    Mapped = ir.CreateZExt(ir.CreateICmpNE(Status, llvm::ConstantInt::get(Status->getType(), 0)), air.getIntTy());
+  StoreOperand(*DstOp, MaskSwizzle(Mapped, GetMask(*DstOp)));
+}
+
+llvm::Value *
+Converter::BufferTileStatus(llvm::Value *StatusBase, llvm::Value *First, llvm::Value *Last) {
+  if (!StatusBase)
+    return nullptr;
+  /* The descriptor carries base = status_array - (buffer_va >> 16), so the tile byte of address va is at
+   * base + (va >> 16); 0 marks an ordinary, always-mapped buffer. An access spans at most two tiles. */
+  auto *Reserved = ir.CreateICmpNE(StatusBase, ir.getInt64(0));
+  auto *Function = ir.GetInsertBlock()->getParent();
+  auto *Entry = ir.GetInsertBlock();
+  auto *LoadBlock = llvm::BasicBlock::Create(ir.getContext(), "tile.status", Function);
+  auto *Merge = llvm::BasicBlock::Create(ir.getContext(), "tile.status.done", Function);
+  ir.CreateCondBr(Reserved, LoadBlock, Merge);
+  ir.SetInsertPoint(LoadBlock);
+  auto TileMapped = [&](llvm::Value *Address) {
+    auto *Pointer = ir.CreateIntToPtr(ir.CreateAdd(StatusBase, ir.CreateLShr(Address, 16)),
+                                      ir.getInt8Ty()->getPointerTo(1));
+    return ir.CreateICmpNE(ir.CreateLoad(ir.getInt8Ty(), Pointer), ir.getInt8(0));
+  };
+  auto *Loaded = ir.CreateZExt(ir.CreateAnd(TileMapped(First), TileMapped(Last)), air.getIntTy());
+  ir.CreateBr(Merge);
+  LoadBlock = ir.GetInsertBlock();
+  ir.SetInsertPoint(Merge);
+  auto *Status = ir.CreatePHI(air.getIntTy(), 2);
+  Status->addIncoming(air.getInt(1), Entry);
+  Status->addIncoming(Loaded, LoadBlock);
+  return Status;
+}
+
+llvm::Value *
+Converter::TexelBufferStatus(const TextureResourceHandle &Tex, llvm::Value *Element) {
+  if (Tex.Logical != llvm::air::Texture::texture_buffer || !Tex.StatusBase || !Tex.StatusView)
+    return nullptr;
+  /* StatusView = first byte address << 8 | log2(texel bytes) << 1 | rgb32 (rgb32: q0 status base). */
+  auto *View = Tex.StatusView;
+  auto *Rgb32 = ir.CreateICmpNE(ir.CreateAnd(View, ir.getInt64(1)), ir.getInt64(0));
+  /* Out-of-bounds elements (all ones, see InstLoad) read zero and never touch a tile. */
+  auto *OutOfBounds = ir.CreateICmpEQ(Element, llvm::ConstantInt::getAllOnesValue(Element->getType()));
+  auto *Base = ir.CreateSelect(ir.CreateOr(Rgb32, OutOfBounds), ir.getInt64(0), Tex.StatusBase);
+  auto *Log2 = ir.CreateAnd(ir.CreateLShr(View, 1), ir.getInt64(127));
+  auto *First = ir.CreateAdd(ir.CreateLShr(View, 8), ir.CreateShl(ir.CreateZExt(Element, ir.getInt64Ty()), Log2));
+  auto *Last = ir.CreateSub(ir.CreateAdd(First, ir.CreateShl(ir.getInt64(1), Log2)), ir.getInt64(1));
+  if (Tex.RGB32StatusBase) {
+    /* RGB32 views: 12 byte elements from EmulationAddress, status base in q0. `Element` already
+       includes the view's first element; out of bounds is all ones (InstLoad). */
+    auto *RgbFirst = ir.CreateAdd(Tex.EmulationAddress,
+                                  ir.CreateMul(ir.CreateZExt(Element, ir.getInt64Ty()), ir.getInt64(12)));
+    First = ir.CreateSelect(Rgb32, RgbFirst, First);
+    Last = ir.CreateSelect(Rgb32, ir.CreateAdd(RgbFirst, ir.getInt64(11)), Last);
+    Base = ir.CreateSelect(Rgb32, ir.CreateSelect(OutOfBounds, ir.getInt64(0), Tex.RGB32StatusBase), Base);
+  }
+  return BufferTileStatus(Base, First, Last);
+}
+
+llvm::Value *
+Converter::RawBufferStatus(const BufferResourceHandle &Buf, llvm::Value *FirstDword, llvm::Value *LastDword) {
+  if (!Buf.StatusBase)
+    return nullptr;
+  auto *Base = Buf.StatusBase;
+  if (Buf.Metadata) {
+    /* Out-of-bounds dwords read zero without touching memory, so they must not index the tile array. */
+    auto *Dwords = ir.CreateLShr(DecodeRawBufferByteLength(Buf.Metadata), 2);
+    Base = ir.CreateSelect(ir.CreateICmpULT(LastDword, Dwords), Base, ir.getInt64(0));
+  }
+  auto *Pointer = ir.CreatePtrToInt(Buf.Pointer, ir.getInt64Ty());
+  auto *First = ir.CreateAdd(Pointer, ir.CreateShl(ir.CreateZExt(FirstDword, ir.getInt64Ty()), 2));
+  auto *Last = ir.CreateAdd(Pointer, ir.CreateAdd(ir.CreateShl(ir.CreateZExt(LastDword, ir.getInt64Ty()), 2),
+                                                  ir.getInt64(3)));
+  return BufferTileStatus(Base, First, Last);
 }
 
 llvm::Optional<BufferResourceHandle>
@@ -487,7 +603,7 @@ Converter::LoadBuffer(const SrcOperandResource &SrcOp) {
 
   return llvm::Optional<BufferResourceHandle>(
       {descriptor->Pointer, descriptor->Metadata, descriptor->StructureStride, SrcOp.read_swizzle,
-       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
+       descriptor->GlobalCoherent && SupportsMemoryCoherency(), descriptor->StatusBase}
   );
 }
 
@@ -501,7 +617,7 @@ Converter::LoadBuffer(const SrcOperandUAV &SrcOp) {
 
   return llvm::Optional<BufferResourceHandle>(
       {descriptor->Pointer, descriptor->Metadata, descriptor->StructureStride, SrcOp.read_swizzle,
-       descriptor->GlobalCoherent && SupportsMemoryCoherency()}
+       descriptor->GlobalCoherent && SupportsMemoryCoherency(), descriptor->StatusBase}
   );
 }
 
@@ -1417,10 +1533,86 @@ Converter::operator()(const InstLoad &load) {
 
   llvm::Value *LOD = LoadOperand(load.src_address, kMaskComponentW);
 
-  auto [Value, Residency] =
-      air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, SampleIndex, LOD, Tex->GlobalCoherent);
+  llvm::Value *Value = nullptr;
+  llvm::Value *Residency = nullptr;
+  if (Tex->Logical == Texture::texture_buffer && Tex->EmulationTag) {
+    auto *is_rgb32 = ir.CreateICmpNE(ir.CreateAnd(Tex->EmulationTag, ir.getInt64(1)), ir.getInt64(0));
+    auto *function = ir.GetInsertBlock()->getParent();
+    auto *rgb_block = llvm::BasicBlock::Create(ir.getContext(), "rgb32.buffer", function);
+    auto *native_block = llvm::BasicBlock::Create(ir.getContext(), "native.buffer", function);
+    auto *merge_block = llvm::BasicBlock::Create(ir.getContext(), "buffer.loaded", function);
+    ir.CreateCondBr(is_rgb32, rgb_block, native_block);
+
+    ir.SetInsertPoint(rgb_block);
+    auto *count = DecodeTextureBufferElement(Tex->Metadata);
+    auto *valid = ir.CreateAnd(ir.CreateICmpULT(Address, count),
+                               ir.CreateICmpNE(Tex->EmulationAddress,
+                                               llvm::ConstantInt::getNullValue(Tex->EmulationAddress->getType())));
+    auto *raw_block = llvm::BasicBlock::Create(ir.getContext(), "rgb32.valid", function);
+    auto *zero_block = llvm::BasicBlock::Create(ir.getContext(), "rgb32.zero", function);
+    auto *rgb_merge = llvm::BasicBlock::Create(ir.getContext(), "rgb32.loaded", function);
+    ir.CreateCondBr(valid, raw_block, zero_block);
+
+    ir.SetInsertPoint(raw_block);
+    auto *pointer = ir.CreateIntToPtr(Tex->EmulationAddress, air.getIntTy()->getPointerTo(1));
+    auto *word_index = ir.CreateMul(ir.CreateZExt(Address, ir.getInt64Ty()), ir.getInt64(3));
+    llvm::Value *words = llvm::UndefValue::get(llvm::FixedVectorType::get(air.getIntTy(), 4));
+    for (unsigned channel = 0; channel < 3; ++channel)
+      words = ir.CreateInsertElement(words, ir.CreateLoad(air.getIntTy(),
+          ir.CreateGEP(air.getIntTy(), pointer, ir.CreateAdd(word_index, ir.getInt64(channel)))), channel);
+    words = ir.CreateInsertElement(words,
+        air.getInt(Tex->Texture.sample_type == Texture::sample_float ? 0x3f800000u : 1u), 3);
+    auto *mapping = ir.CreateTrunc(ir.CreateLShr(Tex->EmulationTag, 32), air.getIntTy());
+    llvm::Value *mapped_words = llvm::UndefValue::get(words->getType());
+    for (unsigned channel = 0; channel < 4; ++channel) {
+      auto *selector = ir.CreateAnd(ir.CreateLShr(mapping, channel * 3), air.getInt(7));
+      llvm::Value *word = air.getInt(0);
+      for (unsigned component = 0; component < 4; ++component)
+        word = ir.CreateSelect(ir.CreateICmpEQ(selector, air.getInt(component)),
+                               ir.CreateExtractElement(words, component), word);
+      word = ir.CreateSelect(ir.CreateICmpEQ(selector, air.getInt(5)),
+                             ir.CreateExtractElement(words, 3), word);
+      mapped_words = ir.CreateInsertElement(mapped_words, word, channel);
+    }
+    words = mapped_words;
+    ir.CreateBr(rgb_merge);
+    raw_block = ir.GetInsertBlock();
+
+    ir.SetInsertPoint(zero_block);
+    ir.CreateBr(rgb_merge);
+    zero_block = ir.GetInsertBlock();
+
+    ir.SetInsertPoint(rgb_merge);
+    auto *rgb_words = ir.CreatePHI(words->getType(), 2);
+    rgb_words->addIncoming(words, raw_block);
+    rgb_words->addIncoming(llvm::Constant::getNullValue(words->getType()), zero_block);
+    llvm::Value *rgb_value = rgb_words;
+    if (Tex->Texture.sample_type == Texture::sample_float)
+      rgb_value = ir.CreateBitCast(rgb_words, llvm::FixedVectorType::get(air.getFloatTy(), 4));
+    ir.CreateBr(merge_block);
+    rgb_merge = ir.GetInsertBlock();
+
+    ir.SetInsertPoint(native_block);
+    auto native = air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, SampleIndex, LOD,
+                                 Tex->GlobalCoherent).first;
+    ir.CreateBr(merge_block);
+    native_block = ir.GetInsertBlock();
+
+    ir.SetInsertPoint(merge_block);
+    auto *merged = ir.CreatePHI(rgb_value->getType(), 2);
+    merged->addIncoming(rgb_value, rgb_merge);
+    merged->addIncoming(native, native_block);
+    Value = merged;
+  } else {
+    auto Read = air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, SampleIndex, LOD, Tex->GlobalCoherent);
+    Value = Read.first;
+    if (Tex->Logical != Texture::texture_buffer)
+      Residency = Read.second;
+  }
 
   StoreOperand(load.dst, MaskSwizzle(Value, GetMask(load.dst), Tex->Swizzle));
+  if (load.feedback)
+    StoreFeedback(load.feedback, Tex->Logical == Texture::texture_buffer ? TexelBufferStatus(*Tex, Address) : Residency);
 }
 void
 Converter::operator()(const InstLoadUAVTyped &load) {
@@ -1460,6 +1652,21 @@ Converter::operator()(const InstLoadUAVTyped &load) {
     break;
   case Texture::texture3d:
     Address = LoadOperand(load.src_address, kMaskVecXYZ);
+    if (Tex->Scoped3DUAV) {
+      auto *valid = ir.CreateICmpULT(
+          ir.CreateExtractElement(Address, 2), DecodeScoped3DUAVCount(Tex->Metadata));
+      Address = Scoped3DUAVAddress(Address, Tex->Metadata);
+      if (Tex->Texture.memory_access == Texture::acesss_readwrite)
+        air.CreateTextureFence(Tex->Texture, Tex->Handle);
+      auto *value = GuardScoped3DUAV(valid, air.getTexelType(Tex->Texture), [&] {
+        return air.CreateRead(
+            Tex->Texture, Tex->Handle, Address, nullptr, nullptr, air.getInt(0), Tex->GlobalCoherent
+        ).first;
+      });
+      StoreOperand(load.dst, MaskSwizzle(value, GetMask(load.dst), Tex->Swizzle));
+      StoreFeedback(load.feedback, nullptr);
+      return;
+    }
     break;
   default: // invalid type
     return;
@@ -1475,6 +1682,8 @@ Converter::operator()(const InstLoadUAVTyped &load) {
       air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, SampleIndex, air.getInt(0), Tex->GlobalCoherent);
 
   StoreOperand(load.dst, MaskSwizzle(Value, GetMask(load.dst), Tex->Swizzle));
+  if (load.feedback)
+    StoreFeedback(load.feedback, Tex->Logical == Texture::texture_buffer ? TexelBufferStatus(*Tex, Address) : Residency);
 }
 
 void
@@ -1510,6 +1719,18 @@ Converter::operator()(const InstStoreUAVTyped &store) {
     break;
   case Texture::texture3d:
     Address = LoadOperand(store.src_address, kMaskVecXYZ);
+    if (Tex->Scoped3DUAV) {
+      auto *valid = ir.CreateICmpULT(
+          ir.CreateExtractElement(Address, 2), DecodeScoped3DUAVCount(Tex->Metadata));
+      Address = Scoped3DUAVAddress(Address, Tex->Metadata);
+      auto *value = LoadOperand(store.src, kMaskAll);
+      GuardScoped3DUAV(valid, nullptr, [&]() -> llvm::Value * {
+        air.CreateWrite(Tex->Texture, Tex->Handle, Address, nullptr, nullptr, ir.getInt32(0), value,
+                        Tex->GlobalCoherent);
+        return nullptr;
+      });
+      return;
+    }
     break;
   default: // invalid type
     return;
@@ -1557,10 +1778,12 @@ Converter::operator()(const InstSample &sample) {
   case Texture::texture1d:
     Coord = LoadOperand(sample.src_address, kMaskComponentX);
     Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    Coord = ir.CreateInsertElement(Coord, air.getFloat(0.5f), 1ull);
     break;
   case Texture::texture1d_array:
     Coord = LoadOperand(sample.src_address, kMaskComponentX);
     Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    Coord = ir.CreateInsertElement(Coord, air.getFloat(0.5f), 1ull);
     ArrayIndex = LoadOperand(sample.src_address, kMaskComponentY);
     ArrayIndex = ClampArrayIndex(ArrayIndex, Tex->Metadata);
     break;
@@ -1599,6 +1822,7 @@ Converter::operator()(const InstSample &sample) {
   );
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
+  StoreFeedback(sample.feedback, Residency);
 }
 
 void
@@ -1622,10 +1846,12 @@ Converter::operator()(const InstSampleLOD &sample) {
   case Texture::texture1d:
     Coord = LoadOperand(sample.src_address, kMaskComponentX);
     Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    Coord = ir.CreateInsertElement(Coord, air.getFloat(0.5f), 1ull);
     break;
   case Texture::texture1d_array:
     Coord = LoadOperand(sample.src_address, kMaskComponentX);
     Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    Coord = ir.CreateInsertElement(Coord, air.getFloat(0.5f), 1ull);
     ArrayIndex = LoadOperand(sample.src_address, kMaskComponentY);
     ArrayIndex = ClampArrayIndex(ArrayIndex, Tex->Metadata);
     break;
@@ -1659,11 +1885,13 @@ Converter::operator()(const InstSampleLOD &sample) {
   }
 
   llvm::Value *LOD = ir.CreateFAdd(LoadOperand(sample.src_lod, kMaskComponentX), Sampler->Bias);
+  LOD = air.CreateFPBinOp(AIRBuilder::fmax, LOD, DecodeTextureMinLODClamp(Tex->Metadata));
 
   auto [Value, Residency] =
       air.CreateSample(Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, sample.offsets, sample_level{LOD});
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
+  StoreFeedback(sample.feedback, Residency);
 }
 
 void
@@ -1693,10 +1921,12 @@ Converter::operator()(const InstSampleBias &sample) {
   case Texture::texture1d:
     Coord = LoadOperand(sample.src_address, kMaskComponentX);
     Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    Coord = ir.CreateInsertElement(Coord, air.getFloat(0.5f), 1ull);
     break;
   case Texture::texture1d_array:
     Coord = LoadOperand(sample.src_address, kMaskComponentX);
     Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    Coord = ir.CreateInsertElement(Coord, air.getFloat(0.5f), 1ull);
     ArrayIndex = LoadOperand(sample.src_address, kMaskComponentY);
     ArrayIndex = ClampArrayIndex(ArrayIndex, Tex->Metadata);
     break;
@@ -1737,6 +1967,7 @@ Converter::operator()(const InstSampleBias &sample) {
   );
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
+  StoreFeedback(sample.feedback, Residency);
 }
 
 void
@@ -1768,6 +1999,7 @@ Converter::operator()(const InstSampleDerivative &sample) {
   case Texture::texture1d:
     Coord = LoadOperand(sample.src_address, kMaskComponentX);
     Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    Coord = ir.CreateInsertElement(Coord, air.getFloat(0.5f), 1ull);
     DDX = LoadOperand(sample.src_x_derivative, kMaskComponentX);
     DDX = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), DDX, 0ull);
     DDY = LoadOperand(sample.src_y_derivative, kMaskComponentX);
@@ -1776,6 +2008,7 @@ Converter::operator()(const InstSampleDerivative &sample) {
   case Texture::texture1d_array:
     Coord = LoadOperand(sample.src_address, kMaskComponentX);
     Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), Coord, 0ull);
+    Coord = ir.CreateInsertElement(Coord, air.getFloat(0.5f), 1ull);
     DDX = LoadOperand(sample.src_x_derivative, kMaskComponentX);
     DDX = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), DDX, 0ull);
     DDY = LoadOperand(sample.src_y_derivative, kMaskComponentX);
@@ -1827,6 +2060,7 @@ Converter::operator()(const InstSampleDerivative &sample) {
   );
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
+  StoreFeedback(sample.feedback, Residency);
 }
 
 void
@@ -1855,6 +2089,19 @@ Converter::operator()(const InstSampleCompare &sample) {
   llvm::Value *ArrayIndex = nullptr;
 
   switch (Tex->Logical) {
+  case Texture::texture1d:
+  case Texture::texture1d_array: {
+    if (Tex->Texture.kind != Texture::depth2d && Tex->Texture.kind != Texture::depth2d_array)
+      return;
+    auto *x = LoadOperand(sample.src_address, kMaskComponentX);
+    Coord = ir.CreateInsertElement(llvm::ConstantFP::getNullValue(air.getFloatTy(2)), x, 0ull);
+    Coord = ir.CreateInsertElement(Coord, air.getFloat(0.5f), 1ull);
+    if (Tex->Logical == Texture::texture1d_array) {
+      ArrayIndex = LoadOperand(sample.src_address, kMaskComponentY);
+      ArrayIndex = ClampArrayIndex(ArrayIndex, Tex->Metadata);
+    }
+    break;
+  }
   case Texture::depth2d:
     Coord = LoadOperand(sample.src_address, kMaskVecXY);
     break;
@@ -1884,7 +2131,7 @@ Converter::operator()(const InstSampleCompare &sample) {
       sample.level_zero     //
           ? air.CreateSampleCmp(
                 Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, Reference, sample.offsets,
-                sample_level{air.getFloat(0)}
+                sample_level{air.CreateFPBinOp(AIRBuilder::fmax, air.getFloat(0), MinLODClamp)}
             )
           : air.CreateSampleCmp(
                 Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, Reference, sample.offsets,
@@ -1892,6 +2139,7 @@ Converter::operator()(const InstSampleCompare &sample) {
             );
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
+  StoreFeedback(sample.feedback, Residency);
 }
 
 void
@@ -1949,6 +2197,7 @@ Converter::operator()(const InstGather &sample) {
       air.CreateGather(Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, Offset, Component);
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
+  StoreFeedback(sample.feedback, Residency);
 }
 
 void
@@ -2002,6 +2251,7 @@ Converter::operator()(const InstGatherCompare &sample) {
       air.CreateGatherCompare(Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, Reference, Offset);
 
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
+  StoreFeedback(sample.feedback, Residency);
 }
 
 void
@@ -2108,7 +2358,8 @@ Converter::operator()(const InstResourceInfo &resinfo) {
   case Texture::texture3d:
     X = air.CreateTextureQuery(Tex->Texture, Tex->Handle, Texture::width, Level);
     Y = air.CreateTextureQuery(Tex->Texture, Tex->Handle, Texture::height, Level);
-    Z = air.CreateTextureQuery(Tex->Texture, Tex->Handle, Texture::depth, Level);
+    Z = Tex->Scoped3DUAV ? DecodeScoped3DUAVCount(Tex->Metadata)
+                         : air.CreateTextureQuery(Tex->Texture, Tex->Handle, Texture::depth, Level);
     break;
   default:
     return;
@@ -2213,6 +2464,13 @@ Converter::operator()(const InstSamplePos &sample) {
 
   llvm::Value *ValueVec4 = llvm::ConstantAggregateZero::get(air.getFloatTy(2));
   llvm::Value *Pos = air.CreateGetSamplePosition(SampleCount, Index);
+  if (Tex) {
+    auto *center = ir.CreateICmpEQ(ir.CreateTrunc(Tex->Metadata, ir.getInt32Ty()), ir.getInt32(1));
+    Pos = ir.CreateSelect(center, llvm::ConstantAggregateZero::get(air.getFloatTy(2)), Pos);
+  } else if (!sample.src) {
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(Pos))
+      call->setMetadata("dxmt.rt_sample_pos", llvm::MDNode::get(ir.getContext(), {}));
+  }
   ValueVec4 = ir.CreateShuffleVector(Pos, ValueVec4, {0, 1, 2, 3});
 
   StoreOperand(sample.dst, MaskSwizzle(ValueVec4, GetMask(sample.dst), sample.read_swizzle));
@@ -2253,7 +2511,12 @@ Converter::operator()(const InstLoadRaw &load) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(Comp)));
     auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
                                         : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
-    return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
+    StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
+    if (load.feedback) {
+      auto *Dword = ir.CreateAdd(Index, ir.getInt32(Comp));
+      StoreFeedback(load.feedback, RawBufferStatus(Buf.value(), Dword, Dword));
+    }
+    return;
   }
 
   llvm::Value *ValueVec = llvm::PoisonValue::get(air.getIntTy(4));
@@ -2264,6 +2527,17 @@ Converter::operator()(const InstLoadRaw &load) {
     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
   }
   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
+  if (load.feedback) {
+    unsigned FirstComp = 4, LastComp = 0;
+    for (auto [DstComp, _] : EnumerateComponents(MemoryAccessMask(Mask, Buf->Swizzle))) {
+      FirstComp = std::min<unsigned>(FirstComp, DstComp);
+      LastComp = std::max<unsigned>(LastComp, DstComp);
+    }
+    StoreFeedback(load.feedback, FirstComp > LastComp ? nullptr
+                                                      : RawBufferStatus(Buf.value(),
+                                                                        ir.CreateAdd(Index, ir.getInt32(FirstComp)),
+                                                                        ir.CreateAdd(Index, ir.getInt32(LastComp))));
+  }
 }
 
 void
@@ -2285,7 +2559,12 @@ Converter::operator()(const InstLoadStructured &load) {
     auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(Comp)));
     auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
                                         : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
-    return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
+    StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
+    if (load.feedback) {
+      auto *Dword = ir.CreateAdd(Index, ir.getInt32(Comp));
+      StoreFeedback(load.feedback, RawBufferStatus(Buf.value(), Dword, Dword));
+    }
+    return;
   }
 
   llvm::Value *ValueVec = llvm::PoisonValue::get(air.getIntTy(4));
@@ -2296,6 +2575,17 @@ Converter::operator()(const InstLoadStructured &load) {
     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
   }
   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
+  if (load.feedback) {
+    unsigned FirstComp = 4, LastComp = 0;
+    for (auto [DstComp, _] : EnumerateComponents(MemoryAccessMask(Mask, Buf->Swizzle))) {
+      FirstComp = std::min<unsigned>(FirstComp, DstComp);
+      LastComp = std::max<unsigned>(LastComp, DstComp);
+    }
+    StoreFeedback(load.feedback, FirstComp > LastComp ? nullptr
+                                                      : RawBufferStatus(Buf.value(),
+                                                                        ir.CreateAdd(Index, ir.getInt32(FirstComp)),
+                                                                        ir.CreateAdd(Index, ir.getInt32(LastComp))));
+  }
 }
 
 void
@@ -2458,6 +2748,17 @@ Converter::operator()(const InstAtomicBinOp &atomic) {
       break;
     case Texture::texture3d:
       Address = LoadOperand(atomic.dst_address, kMaskVecXYZ);
+      if (Tex->Scoped3DUAV) {
+        auto *valid = ir.CreateICmpULT(
+            ir.CreateExtractElement(Address, 2), DecodeScoped3DUAVCount(Tex->Metadata));
+        Address = Scoped3DUAVAddress(Address, Tex->Metadata);
+        auto *operand = LoadOperand(atomic.src, kMaskAll);
+        auto *result = GuardScoped3DUAV(valid, air.getIntTy(4), [&] {
+          return air.CreateAtomicRMW(Tex->Texture, Tex->Handle, Op, Address, operand, nullptr);
+        });
+        StoreOperand(atomic.dst_original, result);
+        return;
+      }
       break;
     default:
       return;
@@ -2518,6 +2819,18 @@ Converter::operator()(const InstAtomicImmCmpExchange &atomic) {
       break;
     case Texture::texture3d:
       Address = LoadOperand(atomic.dst_address, kMaskVecXYZ);
+      if (Tex->Scoped3DUAV) {
+        auto *valid = ir.CreateICmpULT(
+            ir.CreateExtractElement(Address, 2), DecodeScoped3DUAVCount(Tex->Metadata));
+        Address = Scoped3DUAVAddress(Address, Tex->Metadata);
+        auto *compare = LoadOperand(atomic.src0, kMaskAll);
+        auto *replacement = LoadOperand(atomic.src1, kMaskAll);
+        auto *result = GuardScoped3DUAV(valid, air.getIntTy(4), [&] {
+          return air.CreateAtomicCmpXchg(Tex->Texture, Tex->Handle, Address, compare, replacement, nullptr).first;
+        });
+        StoreOperand(atomic.dst, result);
+        return;
+      }
       break;
     default:
       return;
@@ -2557,51 +2870,64 @@ Converter::operator()(const InstAtomicImmDecrement &atomic) {
   StoreOperand(atomic.dst, ir.CreateSub(Value, ir.getInt32(1)));
 }
 
-llvm::Optional<InterpolantHandle>
-Converter::LoadInterpolant(uint32_t Index) {
-  if (!res.interpolant_map.contains(Index))
-    return {};
+llvm::Value *
+Converter::InterpolateRegister(uint32_t Index, InterpolationLocation location, llvm::Value *argument) {
+  auto found = res.interpolant_map.find(Index);
+  if (found == res.interpolant_map.end())
+    return nullptr;
 
-  auto interpolant = res.interpolant_map[Index];
-  auto h = interpolant.interpolant(nullptr).build(ctx);
-  if (h.takeError())
-    return {};
-
-  return llvm::Optional<InterpolantHandle>({h.get(), interpolant.perspective});
+  // A D3D register can contain several unrelated signature elements. Each
+  // Metal interpolant uses semantic-local low lanes, so reassemble the D3D
+  // physical lanes before applying the instruction's register swizzle.
+  llvm::Value *result = llvm::ConstantAggregateZero::get(air.getFloatTy(4));
+  for (const auto &element : found->second) {
+    auto handle = element.interpolant(nullptr).build(ctx);
+    if (handle.takeError())
+      return nullptr;
+    llvm::Value *value = nullptr;
+    switch (location) {
+    case InterpolationLocation::Centroid:
+      value = air.CreateInterpolateAtCentroid(handle.get(), element.perspective); break;
+    case InterpolationLocation::Sample:
+      value = air.CreateInterpolateAtSample(handle.get(), argument, element.perspective); break;
+    case InterpolationLocation::Offset:
+      value = air.CreateInterpolateAtOffset(handle.get(), argument, element.perspective); break;
+    }
+    unsigned local = 0;
+    for (unsigned physical = 0; physical < 4; ++physical)
+      if (element.mask & (1u << physical))
+        result = ir.CreateInsertElement(result, ir.CreateExtractElement(value, local++), physical);
+  }
+  return result;
 }
 
 void
 Converter::operator()(const InstInterpolateCentroid &eval) {
-  auto Itp = LoadInterpolant(eval.regid);
-  if (!Itp)
+  auto Value = InterpolateRegister(eval.regid, InterpolationLocation::Centroid);
+  if (!Value)
     return;
-
-  auto Value = air.CreateInterpolateAtCentroid(Itp->Handle, Itp->Perspective);
   StoreOperand(eval.dst, MaskSwizzle(Value, GetMask(eval.dst), eval.read_swizzle));
 }
 
 void
 Converter::operator()(const InstInterpolateSample &eval) {
-  auto Itp = LoadInterpolant(eval.regid);
-  if (!Itp)
+  auto Value = InterpolateRegister(eval.regid, InterpolationLocation::Sample,
+                                   LoadOperand(eval.sample_index, kMaskComponentX));
+  if (!Value)
     return;
-
-  auto Value =
-      air.CreateInterpolateAtSample(Itp->Handle, LoadOperand(eval.sample_index, kMaskComponentX), Itp->Perspective);
   StoreOperand(eval.dst, MaskSwizzle(Value, GetMask(eval.dst), eval.read_swizzle));
 }
 
 void
 Converter::operator()(const InstInterpolateOffset &eval) {
-  auto Itp = LoadInterpolant(eval.regid);
-  if (!Itp)
-    return;
-
   auto Offset = LoadOperand(eval.offset, kMaskVecXY);
-  // truncated = (offset.xy + 8) & 0b1111
+  // Truncate to the D3D signed [-8, 7] sixteenth-pixel offset domain.
   auto Truncated = ir.CreateAnd(ir.CreateAdd(Offset, air.getInt2(8, 8)), air.getInt2(0b1111, 0b1111));
+  // D3D offsets are center-relative; Metal's interpolate_at_offset uses the pixel corner.
   auto OffsetFloat = ir.CreateFMul(air.CreateConvertToFloat(Truncated), air.getFloat2(1.0f / 16.0f, 1.0f / 16.0f));
-  auto Value = air.CreateInterpolateAtOffset(Itp->Handle, OffsetFloat, Itp->Perspective);
+  auto Value = InterpolateRegister(eval.regid, InterpolationLocation::Offset, OffsetFloat);
+  if (!Value)
+    return;
   StoreOperand(eval.dst, MaskSwizzle(Value, GetMask(eval.dst), eval.read_swizzle));
 }
 
@@ -2653,9 +2979,10 @@ Converter::operator()(const InstCut &) {
   }
 }
 
-void
+llvm::Value *
 Converter::HullGenerateWorkloadForTriangle(
     llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
+    bool Points,
     llvm::Value *TessFactorIn, llvm::Value *TessFactorOut0, llvm::Value *TessFactorOut1, llvm::Value *TessFactorOut2
 ) {
   using namespace llvm;
@@ -2685,7 +3012,7 @@ Converter::HullGenerateWorkloadForTriangle(
   Tys.push_back(TessFactorOut2->getType());
   Ops.push_back(TessFactorOut2);
 
-  std::string FnName = "dxmt.generate_workload.triangle";
+  std::string FnName = Points ? "dxmt.generate_workload.triangle_points" : "dxmt.generate_workload.triangle";
   switch (Partitioning) {
   case TessellatorPartitioning::integer:
     FnName += ".integer";
@@ -2700,13 +3027,50 @@ Converter::HullGenerateWorkloadForTriangle(
     FnName += ".even";
     break;
   }
-  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs);
-  ir.CreateCall(Fn, Ops);
+  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(ir.getInt32Ty(), Tys, false), Attrs);
+  return ir.CreateCall(Fn, Ops);
 }
 
-void
+llvm::Value *
+Converter::HullGenerateWorkloadForIsoline(
+    llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
+    llvm::Value *TessFactorDetail, llvm::Value *TessFactorDensity
+) {
+  using namespace llvm;
+
+  auto &Context = air.getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{3U, Attribute::get(Context, Attribute::AttrKind::WriteOnly)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
+  );
+  SmallVector<Value *> Ops{PatchIndex, CountPtr, DataPtr, TessFactorDetail, TessFactorDensity};
+  SmallVector<Type *> Tys;
+  for (auto *Op : Ops)
+    Tys.push_back(Op->getType());
+  std::string FnName = "dxmt.generate_workload.isoline";
+  switch (Partitioning) {
+  case TessellatorPartitioning::integer:
+    FnName += ".integer";
+    break;
+  case TessellatorPartitioning::pow2:
+    FnName += ".pow2";
+    break;
+  case TessellatorPartitioning::fractional_odd:
+    FnName += ".odd";
+    break;
+  case TessellatorPartitioning::fractional_even:
+    FnName += ".even";
+    break;
+  }
+  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(ir.getInt32Ty(), Tys, false), Attrs);
+  return ir.CreateCall(Fn, Ops);
+}
+
+llvm::Value *
 Converter::HullGenerateWorkloadForQuad(
     llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
+    bool Points,
     llvm::Value *TessFactorIn0, llvm::Value *TessFactorIn1, llvm::Value *TessFactorOut0, llvm::Value *TessFactorOut1,
     llvm::Value *TessFactorOut2, llvm::Value *TessFactorOut3
 ) {
@@ -2741,7 +3105,7 @@ Converter::HullGenerateWorkloadForQuad(
   Tys.push_back(TessFactorOut3->getType());
   Ops.push_back(TessFactorOut3);
 
-  std::string FnName = "dxmt.generate_workload.quad";
+  std::string FnName = Points ? "dxmt.generate_workload.quad_points" : "dxmt.generate_workload.quad";
   switch (Partitioning) {
   case TessellatorPartitioning::integer:
     FnName += ".integer";
@@ -2756,8 +3120,8 @@ Converter::HullGenerateWorkloadForQuad(
     FnName += ".even";
     break;
   }
-  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs);
-  ir.CreateCall(Fn, Ops);
+  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(ir.getInt32Ty(), Tys, false), Attrs);
+  return ir.CreateCall(Fn, Ops);
 }
 
 llvm::Value *
@@ -2840,7 +3204,7 @@ Converter::DomainGetLocation(
   };
 }
 
-void
+llvm::Value *
 Converter::DomainGeneratePrimitives(
     llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive
 ) {
@@ -2880,8 +3244,69 @@ Converter::DomainGeneratePrimitives(
     FnName += ".triangle_ccw";
     break;
   }
-  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(air.getVoidTy(), Tys, false), Attrs);
-  ir.CreateCall(Fn, Ops);
+  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(ir.getInt32Ty(), Tys, false), Attrs);
+  return ir.CreateCall(Fn, Ops);
+}
+
+llvm::Value *
+Converter::DomainGeneratePrimitivesCapture(
+    llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive, llvm::Value *IndicesPtr
+) {
+  using namespace llvm;
+
+  auto &Context = air.getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{2U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)},
+                {2U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+                {3U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+                {3U, Attribute::get(Context, Attribute::AttrKind::WriteOnly)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
+  );
+
+  Value *Ops[] = {WorkloadIndex, DataPtr, IndicesPtr};
+  Type *Tys[] = {WorkloadIndex->getType(), DataPtr->getType(), IndicesPtr->getType()};
+
+  std::string FnName = "dxmt.domain_generate_primitives";
+  switch (Primitive) {
+  case TessellatorOutputPrimitive::point:
+    FnName += ".point";
+    break;
+  case TessellatorOutputPrimitive::line:
+    FnName += ".line";
+    break;
+  case TessellatorOutputPrimitive::triangle:
+    FnName += ".triangle";
+    break;
+  case TessellatorOutputPrimitive::triangle_ccw:
+    FnName += ".triangle_ccw";
+    break;
+  }
+  FnName += ".capture";
+  auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(ir.getInt32Ty(), Tys, false), Attrs);
+  return ir.CreateCall(Fn, Ops);
+}
+
+llvm::Value *
+Converter::DomainGetWorkloadRank(llvm::Value *WorkloadIndex, llvm::Value *DataPtr) {
+  using namespace llvm;
+
+  auto &Context = air.getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{2U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)},
+                {2U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)}}
+  );
+
+  Value *Ops[] = {WorkloadIndex, DataPtr};
+  Type *Tys[] = {WorkloadIndex->getType(), DataPtr->getType()};
+
+  auto Fn = air.getModule()->getOrInsertFunction(
+      "dxmt.get_domain_workload_rank", llvm::FunctionType::get(air.getIntTy(), Tys, false), Attrs
+  );
+  return ir.CreateCall(Fn, Ops);
 }
 
 llvm::Value *

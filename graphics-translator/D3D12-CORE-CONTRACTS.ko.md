@@ -1,6 +1,6 @@
 # D3D12 core contracts audit
 
-> **현재 상태 주의 (2026-09-22):** 이 문서는 2026-09-19 import 당시의 audit 기록이다. 이후 루트 `src/`에서 기본 DXIL, timestamp/occlusion query, bundle, predication, multiple-fence completion, residency 확장 등이 구현되었다. 현재 backlog와 우선순위는 `CORE-IMPLEMENTATION-STATUS.ko.md`를 기준으로 한다. 아래의 당시 blocker 설명은 provenance로 보존한다.
+> **현재 상태 주의:** 이 문서는 2026-09-19 import 당시의 audit 기록이다. 이후 루트 `src/`에서 기본 DXIL·query·bundle·predication·fence/residency 및 선정 P1-A–D가 구현·검증됐다. 2026-09-29에는 fullscreen 오류·전환, D3D12 HDR10 metadata와 color-space 지원·적용 순서를 구현·검증했다. 기존 D3D11 변경은 유지하되 D3D12에 필수인 경우 외에는 추가 수정하지 않는다. **선정 항목 완료와 P1 전체 완료는 다르다.** Format 지원 보고와 HDR/color-space의 검증 경계 등 현재 판정은 [구현 상태 문서](CORE-IMPLEMENTATION-STATUS.ko.md#p1-완료-판정과-남은-계약)를 기준으로 하며 아래의 당시 blocker 설명은 provenance로 보존한다.
 
 이 문서는 `graphics-translator/patches/0009-d3d12-core-contracts.patch`가 고친 D3D12 기본 계약과 아직 남아 있는 ZZZ/Unity 시작·렌더 경로 blocker를 기록한다. 기준은 `build/owned-graphics-20260919/dxmt`를 복제한 뒤 `0007-queue-order.patch`까지 적용한 private snapshot이다. GPU, Wine, 게임 실행은 이 작업 범위에서 하지 않았다.
 
@@ -81,17 +81,17 @@ project-owned 구현 경로는 다음 순서가 현실적이다.
 
 이 절의 원래 blocker 목록은 이후 구현으로 상당 부분 해소됐다. 현재 루트 기준으로는 다음처럼 읽어야 한다.
 
-| 2026-09-19 당시 항목 | 2026-09-22 현재 상태 |
+| 2026-09-19 당시 항목 | 현재 루트 상태 |
 |---|---|
 | DXIL PSO hard failure | 기본 VS/PS/CS DXIL frontend/lowering과 실제 frozen-DXIL GPU fixture가 추가됐다. 모든 DXIL/SM 지원은 아니다. |
-| query heap / BeginQuery / EndQuery / ResolveQueryData 없음 | timestamp와 occlusion/binary-occlusion이 구현·검증됐다. 정확한 `PIPELINE_STATISTICS`는 아직 미구현이다. |
+| query heap / BeginQuery / EndQuery / ResolveQueryData 없음 | timestamp·occlusion/binary-occlusion, SO statistics와 88-byte `PIPELINE_STATISTICS`를 구현·검증했다. MSAA 실제 실행을 수정한 DXBC/DXIL 346개 GPU case·26개 validation case의 범위와 증거는 상태 문서 P1-C 참조. |
 | `ExecuteBundle` 미구현 | bundle recording/replay와 GPU fixture가 구현·검증됐다. |
 | `SetPredication` 미구현 | GPU snapshot 기반 predication과 direct/indirect/copy/resolve/clear 경로가 구현·검증됐다. |
 | `SetEventOnMultipleFenceCompletion` 미구현 | logical fence latch 기반 single/ANY/ALL/null event와 CPU/GPU rewind가 구현·검증됐다. |
 | `CreatePipelineLibrary / GetCachedBlob` 미구현 | Graphics/compute `GetCachedBlob`과 `CachedPSO`는 구현됐다. `CreatePipelineLibrary`는 여전히 `E_NOTIMPL`이다. |
 | residency extensions 미구현 | `MakeResident`, `Evict`, `SetResidencyPriority`, `EnqueueMakeResident`와 residency-set accounting이 구현됐다. |
 
-현재 P1에서 직접 남은 기본 공백은 `AtomicCopyBufferUINT/UINT64`, D3D12 `ResizeBuffers1` present-queue 계약, 정확한 pipeline statistics, Stream Output/SO statistics 등이다. reserved/tiled/shared-handle/enhanced barrier와 pipeline library 전체 계약은 P2 공통 기반으로 추적한다.
+선정한 P1-A–D(`AtomicCopyBufferUINT/UINT64`, `ResizeBuffers1` present-queue 계약, pipeline statistics, VS→Stream Output/SO statistics)는 명시된 지원 범위에서 구현·검증을 마쳤다. 이후 SO format 보고, mip·typed cast·depth/stencil view, D24 plane copy와 지원 보고의 후속 결과는 [현재 capability 정책](CAPABILITIES.ko.md)에 기록한다. **P1 전체는 아직 완료가 아니다.** 남은 기본 format/지원 보고·DXGI presentation 계약과 검증 범위는 [완료 판정](CORE-IMPLEMENTATION-STATUS.ko.md#p1-완료-판정과-남은-계약)에 구분했다. D3D10/11 전용 작업은 별도 완료 조건으로 확장하지 않는다. GS/HS/DS 및 이에 의존하는 SO 확장, reserved/tiled/shared-handle/enhanced barrier와 pipeline library는 기존 계획대로 P2에서 추적하며, P1을 미완료로 유지하기 위해 P2 항목을 끌어오지 않는다.
 
 기존 actual-game static 조사(`ZZZ-COMPATIBILITY.ko.md`)에서 Unity 초기화가 확인한 feature query는 `D3D12_OPTIONS`, `FEATURE_LEVELS`, `D3D12_OPTIONS5`, `D3D12_OPTIONS7` 네 종류다. 앞의 둘과 OPTIONS7은 구현되어 있고, OPTIONS5 실패는 해당 Unity 경로에서 RT 기능을 비활성화한 뒤 계속 진행한다. 따라서 OPTIONS5의 `E_NOTIMPL`을 이번 core startup blocker로 취급하지 않았다.
 

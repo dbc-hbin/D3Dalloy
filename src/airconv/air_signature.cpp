@@ -107,6 +107,24 @@ uint32_t ArgumentBufferBuilder::DefineBuffer(
   return element_index;
 };
 
+uint32_t ArgumentBufferBuilder::DefineIndirectBuffer(
+  std::string name, llvm::StructType *struct_type, llvm::Metadata *struct_type_info,
+  uint32_t location_index
+) {
+  auto element_index = fieldsType.size();
+  assert(!fields.count(name) && "otherwise duplicated field name");
+  fieldsType.push_back(ArgumentBindingIndirectBuffer{
+    .location_index = location_index == UINT32_MAX ? (uint32_t)element_index : location_index,
+    .array_size = 1,
+    .memory_access = MemoryAccess::read,
+    .address_space = AddressSpace::constant,
+    .struct_type = struct_type,
+    .struct_type_info = struct_type_info,
+    .arg_name = name,
+  });
+  return element_index;
+}
+
 uint32_t ArgumentBufferBuilder::DefineSampler(
   std::string name, uint32_t location_index
 ) {
@@ -449,6 +467,83 @@ auto ArgumentBufferBuilder::Build(
   return std::make_pair(struct_type, struct_metadata.BuildTuple(context));
 };
 
+std::tuple<llvm::StructType *, llvm::MDNode *> BuildRasterOrderedDescriptorTable(
+  llvm::ArrayRef<RasterOrderedDescriptorRange> ranges, llvm::LLVMContext &context,
+  const llvm::DataLayout &layout
+) {
+  auto *ulong_type = llvm::Type::getInt64Ty(context);
+  std::vector<llvm::Type *> fields;
+  StreamMDHelper table_info;
+  uint32_t cursor = 0;
+
+  auto append_array = [&](llvm::Type *element_type, uint32_t count, llvm::MDNode *element_info,
+                          const std::string &element_name, const std::string &field_name,
+                          uint32_t location) {
+    auto *array_type = llvm::StructType::create(
+      context, {llvm::ArrayType::get(element_type, count)}, "metal::array"
+    );
+    StreamMDHelper element_array_info;
+    if (element_type->isStructTy())
+      element_array_info.string("air.struct_type_info")->metadata(element_info);
+    element_array_info.integer(0)->integer(layout.getTypeAllocSize(element_type))
+      ->integer(count)->string(element_name)->string("__elems")
+      ->string("air.indirect_argument");
+    if (element_type->isStructTy())
+      element_array_info.integer(0);
+    else
+      element_array_info.metadata(element_info);
+    table_info.string("air.struct_type_info")->metadata(element_array_info.BuildTuple(context))
+      ->integer(cursor * 32)->integer(layout.getTypeAllocSize(array_type))
+      ->integer(0)->string("metal::array")->string(field_name)
+      ->string("air.indirect_argument")->integer(location);
+    fields.push_back(array_type);
+  };
+
+  StreamMDHelper padding_element_info;
+  padding_element_info.integer(0)->string("air.indirect_constant")
+    ->string("air.location_index")->integer(0)->integer(1)
+    ->string("air.arg_type_name")->string("ulong")
+    ->string("air.arg_name")->string("__elems");
+  auto *padding_metadata = padding_element_info.BuildTuple(context);
+
+  for (const auto &range : ranges) {
+    assert(range.descriptor_count && range.descriptor_offset >= cursor);
+    if (range.descriptor_offset != cursor) {
+      uint32_t gap = range.descriptor_offset - cursor;
+      append_array(ulong_type, gap * 4, padding_metadata, "ulong",
+                   "unused" + std::to_string(cursor), cursor * 4);
+      cursor += gap;
+    }
+
+    ArgumentBufferBuilder descriptor;
+    if (range.texture) {
+      descriptor.DefineTexture(
+        "resource", range.texture->resource_kind_logical, MemoryAccess::read_write,
+        range.texture->component_type, 0, 1
+      );
+    } else {
+      descriptor.DefineBuffer("resource", AddressSpace::device, MemoryAccess::read_write,
+                              msl_uint, 0, 1);
+    }
+    descriptor.DefineInteger64("metadata", 1);
+    if (range.with_counter)
+      descriptor.DefineBuffer("counter", AddressSpace::device, MemoryAccess::read_write,
+                              msl_uint, 2, 1);
+    else
+      descriptor.DefineInteger64("aux", 2);
+    descriptor.DefineInteger64("pad", 3);
+    auto [descriptor_type, descriptor_info] = descriptor.Build(context, layout);
+    assert(layout.getTypeAllocSize(descriptor_type) == 32);
+    append_array(descriptor_type, range.descriptor_count, descriptor_info,
+                 descriptor_type->getName().str(), "ordered" + std::to_string(cursor), cursor * 4);
+    cursor += range.descriptor_count;
+  }
+
+  auto *table_type = llvm::StructType::create(context, fields, "raster_ordered_table");
+  assert(layout.getTypeAllocSize(table_type) == static_cast<uint64_t>(cursor) * 32);
+  return {table_type, table_info.BuildTuple(context)};
+}
+
 uint32_t FunctionSignatureBuilder::DefineInput(const FunctionInput &input) {
   uint32_t index = inputs.size();
   for (auto &element : enumerate(inputs)) {
@@ -462,6 +557,12 @@ uint32_t FunctionSignatureBuilder::DefineInput(const FunctionInput &input) {
               [&](const InputFragmentStageIn s) {
                 return s.user ==
                        std::get<InputFragmentStageIn>(element.value()).user;
+              },
+              [&](const InputBarycentric s) {
+                return s.perspective == std::get<InputBarycentric>(element.value()).perspective;
+              },
+              [&](const InputVertexValue s) {
+                return s.user == std::get<InputVertexValue>(element.value()).user;
               },
               [&](const ArgumentBindingBuffer s) {
                 return s.location_index ==
@@ -722,6 +823,26 @@ auto FunctionSignatureBuilder::CreateFunction(
             ->string("air.arg_name")
             ->string("mtl_frontface");
           return msl_bool.get_llvm_type(context);
+        },
+        [&](const InputBarycentric &barycentric) {
+          metadata_field.string("air.barycentric_coord")
+            ->string("air.center")
+            ->string(barycentric.perspective ? "air.perspective" : "air.no_perspective")
+            ->string("air.arg_type_name")
+            ->string("float3")
+            ->string("air.arg_name")
+            ->string(barycentric.perspective ? "mtl_barycentric" : "mtl_barycentric_noperspective");
+          return msl_float3.get_llvm_type(context);
+        },
+        [&](const InputVertexValue &vertex_value) -> llvm::Type * {
+          metadata_field.string("air.fragment_input")
+            ->string(std::string("user(") + vertex_value.user + ")")
+            ->string("air.vertex_value")
+            ->string("air.arg_type_name")
+            ->string(get_name(vertex_value.type))
+            ->string("air.arg_name")
+            ->string(vertex_value.user + "_vertex_value");
+          return getOrCreateStructType("struct._vertex_value_t", context)->getPointerTo(1);
         },
         [&](const InputSampleIndex &) {
           metadata_field.string("air.sample_id")

@@ -1,8 +1,10 @@
 # D3D12 fence 완료 이벤트와 알림 스레드 수명
 
-## 현재 루트 구현 (2026-09-22)
+## 현재 루트 구현
 
 D3D12 단일/다중 완료 이벤트는 이제 native shared-event 값 snapshot이 아니라 logical fence threshold latch를 사용한다. CPU/GPU rewind, 미완료 다중 producer, 동일값 signal을 지원하고 이미 충족된 알림은 이후 rewind로 취소되지 않는다. ANY/ALL 등록은 모든 callback 설치가 성공한 뒤 활성화되며 한 번만 알린다. D3D11/native bridge의 기존 listener는 별도 경로다.
+
+SO 오류 전파 수정 이후 GPU fence 완료값은 앞선 GPU submission의 오류 검사를 마친 queue completion 스레드만 공개한다. Native event probe는 제거했다. Device 오류는 해당 device의 fence를 terminal `UINT64_MAX`로 만들고 이미 등록된 이벤트와 null-event 대기를 해제한다. 오류 후의 새 등록은 `DXGI_ERROR_DEVICE_REMOVED`를 반환하며 성공한 이벤트 등록이 아니다. 실제 GPU 누락 재현과 최종 fence 회귀는 `build/local/so-integrity/probe-fixed-02`, `proof-fence-events-02`에서 검증했다.
 
 `graphics-translator/tests/owned-d3d12-fence-events.cpp`의 새 회귀는 기존 runtime에서 CPU 10→5 `E_NOTIMPL` 실패를 재현했고(`build/local/fence-core-before`), 수정 runtime에서 single/ANY/ALL/null, GPU rewind, mixed producer, competing queues, API-time wait latch, retained lifetime 및 64회 teardown을 통과했다(`build/local/fence-core-after/result.json`). Metal API/shader validation 오류와 foreign backend 로딩은 없었다. 프로세스 밖 공유 fence와 실제 게임 검증은 이 결과에 포함되지 않는다.
 

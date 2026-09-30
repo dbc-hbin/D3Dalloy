@@ -24,8 +24,6 @@ Fence::decRef() {
     delete this;
 }
 
-Fence::Fence(WMT::Device device) : device_(device) {}
-
 std::shared_ptr<owned_graphics::FenceOrderEpoch>
 Fence::currentOrder() const {
   std::lock_guard<std::mutex> lock(schedule_mutex_);
@@ -46,50 +44,134 @@ Fence::initialize(uint64_t value) {
 uint64_t
 Fence::completedValue() {
   auto order = currentOrder();
-  order->reconcile();
+  if (shared_event_)
+    observeShared();
   return order->completedValue();
 }
 
 bool
 Fence::signal(uint64_t value) {
   auto order = currentOrder();
+  if (shared_event_) {
+    shared_event_.signalValue(reserveSharedToken(value));
+    observeShared();
+    return true;
+  }
   order->signalCpu(value);
   return true;
 }
 
-Fence::QueueSignalPreparation
-Fence::prepareQueueSignal(uint64_t queue, uint64_t value) {
-  (void)queue;
+uint64_t
+Fence::reserveSharedToken(uint64_t value) {
+  /*
+   * Backpressure: a token may be reserved only while fewer than kRing tokens are
+   * outstanding beyond the event's current value, so the ring entry of the current
+   * token is never overwritten and every observer can always resolve it. Callers are
+   * the CPU Signal thread or the queue submission worker; the GPU never waits here.
+   * Later tokens need not complete in order: any signal moving the event forward
+   * frees ring space.
+   */
+  uint64_t token = 0;
+  for (;;) {
+    const auto current = uint64_t(InterlockedCompareExchange64(&timeline_->next_token, 0, 0));
+    const uint64_t signaled = shared_event_.signaledValue();
+    if (current + 1 - signaled >= SharedFenceTimeline::kRing) {
+      shared_event_.waitUntilSignaledValue(current + 2 - SharedFenceTimeline::kRing, 100);
+      continue;
+    }
+    if (uint64_t(InterlockedCompareExchange64(&timeline_->next_token, LONG64(current + 1), LONG64(current))) ==
+        current) {
+      token = current + 1;
+      break;
+    }
+  }
+  auto &entry = timeline_->ring[token % SharedFenceTimeline::kRing];
+  InterlockedExchange64(&entry.logical, LONG64(value));
+  // Publish the mapping before any signal can make the event reach `token`.
+  InterlockedExchange64(&entry.token, LONG64(token));
+  return token;
+}
+
+uint64_t
+Fence::observeShared() {
   auto order = currentOrder();
-  auto event = device_.newSharedEvent();
-  auto producer = order->prepare(value, [event]() mutable { return event.signaledValue() >= 1; });
-  return QueueSignalPreparation{QueueTicket{event, order, producer, {}, order->generation(), value}};
+  std::lock_guard<std::mutex> lock(observe_mutex_);
+  const uint64_t token = shared_event_.signaledValue();
+  if (token <= observed_token_.load(std::memory_order_relaxed))
+    return order->completedValue();
+  const auto &entry = timeline_->ring[token % SharedFenceTimeline::kRing];
+  const uint64_t logical = uint64_t(InterlockedCompareExchange64(const_cast<LONG64 *>(&entry.logical), 0, 0));
+  // reserveSharedToken's backpressure keeps the current token's entry intact; a mismatch
+  // can only be a reservation racing ahead of the event, which a later read resolves.
+  if (uint64_t(InterlockedCompareExchange64(const_cast<LONG64 *>(&entry.token), 0, 0)) != token ||
+      uint64_t(InterlockedCompareExchange64(const_cast<LONG64 *>(&entry.logical), 0, 0)) != logical)
+    return order->completedValue();
+  observed_token_.store(token, std::memory_order_release);
+  // Rewind-aware: a lower logical value (D3D12 Signal(lower)) moves the local timeline back.
+  order->signalCpu(logical);
+  return logical;
 }
 
-void
-Fence::commitQueueSignal(QueueSignalPreparation &preparation) {
-  preparation.ticket.order->publish(preparation.ticket.producer);
+bool
+Fence::initializeShared(WMT::Reference<WMT::SharedEvent> event, SharedFenceTimeline *timeline,
+                        std::shared_ptr<void> owner, bool publish_initial, uint64_t initial_value) {
+  if (!event || !timeline || watcher_)
+    return false;
+  auto order = currentOrder();
+  if (!order)
+    return false;
+  shared_event_ = std::move(event);
+  timeline_ = timeline;
+  timeline_owner_ = std::move(owner);
+  if (publish_initial)
+    shared_event_.signalValue(reserveSharedToken(initial_value));
+  observeShared();
+  watcher_ = CreateThread(nullptr, 0, SharedWatcher, this, 0, nullptr);
+  return watcher_ != nullptr;
 }
 
-void
-Fence::cancelQueueSignal(QueueSignalPreparation &preparation) {
-  preparation.ticket.order->cancel(preparation.ticket.producer);
+DWORD WINAPI
+Fence::SharedWatcher(void *arg) {
+  auto *fence = static_cast<Fence *>(arg);
+  while (!fence->watcher_stop_.load(std::memory_order_acquire)) {
+    const uint64_t token = fence->shared_event_.signaledValue();
+    fence->observeShared();
+    // Wakes as soon as any device or process publishes a later token; the
+    // timeout only bounds how long destruction waits for this thread.
+    fence->shared_event_.waitUntilSignaledValue(token + 1, 25);
+  }
+  return 0;
+}
+
+Fence::~Fence() {
+  if (watcher_) {
+    watcher_stop_.store(true, std::memory_order_release);
+    WaitForSingleObject(watcher_, INFINITE);
+    CloseHandle(watcher_);
+  }
+}
+
+Fence::QueueTicket
+Fence::prepareQueueSignal(uint64_t value) {
+  auto order = currentOrder();
+  // Native completion is not enough: publish only after the ordered queue
+  // completion thread has validated all preceding GPU work.
+  return QueueTicket{order, order->prepare(value), {}, order->generation(), value};
 }
 
 Fence::QueueTicket
 Fence::prepareQueueWait(uint64_t value) {
   auto order = currentOrder();
-  order->reconcile();
   auto latch = std::make_shared<owned_graphics::FenceCompletionLatch>();
-  if (!order->addCompletionWaiter(value, [latch] { latch->signal(); }))
+  uint64_t waiter_id = 0;
+  if (!order->addCompletionWaiter(value, [latch] { latch->signal(); }, &waiter_id))
     throw std::bad_alloc();
-  return QueueTicket{{}, order, {}, std::move(latch), order->generation(), value};
+  return QueueTicket{order, {}, std::move(latch), order->generation(), value, waiter_id};
 }
 
 FenceWaitValue
 Fence::prepareWaitValue(uint64_t value) {
   auto order = currentOrder();
-  order->reconcile();
   auto latch = std::make_shared<owned_graphics::FenceCompletionLatch>();
   if (!order->addCompletionWaiter(value, [latch] { latch->signal(); }))
     throw std::bad_alloc();
@@ -99,20 +181,22 @@ Fence::prepareWaitValue(uint64_t value) {
 void
 Fence::wait(uint64_t value, uint64_t timeout) {
   auto ticket = prepareQueueWait(value);
-  using namespace std::chrono_literals;
   if (timeout == ~0ULL) {
-    while (!ticket.latch->waitFor(10ms))
-      ticket.order->reconcile();
+    ticket.latch->wait();
     return;
   }
   ticket.latch->waitFor(std::chrono::nanoseconds(timeout));
+  cancelQueueWait(ticket);
+}
+
+bool
+Fence::waitForQueueProducer(const QueueTicket &ticket, const std::atomic<bool> &stopping) const {
+  return ticket.latch->waitUnless(stopping);
 }
 
 void
-Fence::waitForQueueProducer(const QueueTicket &ticket) const {
-  using namespace std::chrono_literals;
-  while (!ticket.latch->waitFor(10ms))
-    ticket.order->reconcile();
+Fence::cancelQueueWait(const QueueTicket &ticket) const {
+  ticket.order->removeCompletionWaiter(ticket.waiter_id);
 }
 
 namespace {

@@ -173,6 +173,9 @@ microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE to_program_type(Stage stage);
 /** Scalar lane type of a resource's element, as used by the AIR binding tables. */
 shader::common::ScalerDataType to_scaler_type(ComponentType type);
 
+/** Binding-table resource type of a DXIL resource shape (buffers are NonApplicable). */
+shader::common::ResourceType to_resource_type(ResourceKind kind);
+
 // ---------------------------------------------------------------------------
 // Parsed metadata
 // ---------------------------------------------------------------------------
@@ -251,6 +254,34 @@ struct ResourceBinding {
   }
 };
 
+/**
+ * Stage state of a geometry / hull / domain entry, from its `!dx.entryPoints` properties
+ * (tags 1, 3 and 2). The DXIL enumerations have the D3D10_SB/D3D11_SB token values:
+ * InputPrimitive = D3D10_SB_PRIMITIVE, PrimitiveTopology = D3D10_SB_PRIMITIVE_TOPOLOGY,
+ * TessellatorDomain / Partitioning / OutputPrimitive = D3D11_SB_TESSELLATOR_*.
+ */
+struct GeometryState {
+  uint32_t input_primitive = 0;
+  uint32_t max_vertex_count = 0;
+  uint32_t stream_mask = 0;
+  uint32_t output_topology = 0;
+  uint32_t instance_count = 1;
+};
+
+struct HullState {
+  uint32_t input_control_points = 0;
+  uint32_t output_control_points = 0;
+  uint32_t domain = 0;
+  uint32_t partitioning = 0;
+  uint32_t output_primitive = 0;
+  float max_tess_factor = 64.0f;
+};
+
+struct DomainState {
+  uint32_t domain = 0;
+  uint32_t input_control_points = 0;
+};
+
 struct ModuleInfo {
   /** Owned context: typed pointers, DXIL bitcode constraints preserved. */
   std::unique_ptr<llvm::LLVMContext> context;
@@ -269,6 +300,12 @@ struct ModuleInfo {
   uint32_t valver_minor = 0;
 
   uint32_t num_threads[3] = {0, 0, 0};
+  bool force_early_depth_stencil = false;
+  GeometryState geometry;
+  HullState hull;
+  DomainState domain;
+  /** HS only: the patch-constant function named by `!dx.entryPoints` tag 3. */
+  llvm::Function *patch_constant_function = nullptr;
 
   /**
    * Output registers written through `dx.op.storeOutput`, mirroring the SM 5.x
@@ -289,10 +326,13 @@ struct ModuleInfo {
 
   /**
    * Parse bytecode into IR + metadata. `entry_name` (may be null) selects one
-   * `!dx.entryPoints` entry; otherwise the first entry wins.
+   * `!dx.entryPoints` entry; otherwise the first entry wins. With `shared_context` the
+   * module is parsed into that context (which the caller owns and `context` stays null),
+   * so the stages of one multi-stage pipeline can be linked into a single module.
    */
   static llvm::Expected<std::unique_ptr<ModuleInfo>> Parse(
-    const void *bytecode, size_t size, const char *entry_name = nullptr
+    const void *bytecode, size_t size, const char *entry_name = nullptr,
+    llvm::LLVMContext *shared_context = nullptr
   );
 };
 
@@ -303,6 +343,9 @@ struct ShaderMetadata {
   uint32_t shader_model_major = 0;
   uint32_t shader_model_minor = 0;
   uint32_t num_threads[3] = {0, 0, 0};
+  GeometryState geometry;
+  HullState hull;
+  DomainState domain;
   uint32_t output_register_mask = 0;
   uint32_t max_output_register = 0;
   bool has_coverage_output = false;
@@ -492,6 +535,18 @@ Stage stageFromShaderKind(uint32_t shader_kind);
  * recorded: `!dx.shaderModel` is "lib" for every entry of a container.
  */
 inline constexpr uint32_t kDxilShaderKindTag = 8;
+
+/** `!dx.entryPoints` properties tag for `[WaveSize(...)]` (DXC `kDxilWaveSizeTag`). */
+inline constexpr uint32_t kDxilWaveSizeTag = 11;
+/** SM 6.8 `[WaveSize(min, max, preferred)]` range tag (DXC `kDxilRangedWaveSizeTag`). */
+inline constexpr uint32_t kDxilRangedWaveSizeTag = 23;
+
+/**
+ * Immutable-constant global holding the device address of the 64 bit atomic lock
+ * table (SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE). The resource lowering
+ * creates it on first use; LowerImmutableConstants turns it into a runtime relocation.
+ */
+inline constexpr const char *kAtomicLockTableGlobal = "dxmt.atomic64_lock_table";
 
 /**
  * Drop the DXIL scaffolding (debug info, `dx.*` metadata, the original entry point

@@ -13,6 +13,34 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+struct HeapLifetimeMarker final : IUnknown {
+  explicit HeapLifetimeMarker(bool* released) : released_(released) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override {
+    if (!output) return E_POINTER;
+    *output = nullptr;
+    if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
+    *output = static_cast<IUnknown*>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&references_); }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG remaining = InterlockedDecrement(&references_);
+    if (!remaining) {
+      *released_ = true;
+      delete this;
+    }
+    return remaining;
+  }
+private:
+  ~HeapLifetimeMarker() = default;
+  LONG references_ = 1;
+  bool* released_;
+};
+
+constexpr GUID kHeapLifetimeMarker = {0x9ae5fdc8, 0x5d30, 0x4bf1,
+                                      {0xa3, 0x38, 0xab, 0x31, 0x0f, 0x90, 0x59, 0xc2}};
+
 [[noreturn]] void fail(const char* step, HRESULT hr = E_FAIL) {
   std::fprintf(stderr, "OWNED_D3D12_RESOURCES_FAIL step=%s hr=0x%08lx\n",
                step, static_cast<unsigned long>(hr));
@@ -113,11 +141,66 @@ void testResourceContracts(ID3D12Device* device) {
                                          D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
                                          __uuidof(ID3D12Resource), nullptr),
          S_FALSE, "validation-only optimized clear");
+  auto invalidAlignment = color;
+  invalidAlignment.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &invalidAlignment,
+                                         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "non-MSAA RT rejects small alignment in validation-only create");
   clear.Format = DXGI_FORMAT_R32_FLOAT;
   expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &color,
                                          D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
                                          __uuidof(ID3D12Resource), nullptr),
          E_INVALIDARG, "incompatible optimized clear");
+
+  auto plainTexture = color;
+  plainTexture.Flags = D3D12_RESOURCE_FLAG_NONE;
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &plainTexture,
+                                         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "render-target state without capability");
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &plainTexture,
+                                         D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "depth-write state without capability");
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &plainTexture,
+                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "UAV state without capability");
+  auto invalidBufferState = bufferDesc(4096);
+  ID3D12Resource* invalidStateResource = reinterpret_cast<ID3D12Resource*>(uintptr_t(1));
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &invalidBufferState,
+                                         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                         __uuidof(ID3D12Resource), reinterpret_cast<void**>(&invalidStateResource)),
+         E_INVALIDARG, "buffer render-target state");
+  if (invalidStateResource)
+    fail("invalid initial state output not cleared");
+  invalidBufferState.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &invalidBufferState,
+                                         D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         S_FALSE, "buffer RTV initial state with capability");
+
+  auto overlimitBuffer = bufferDesc(~UINT64(0));
+  if (device->GetResourceAllocationInfo(0, 1, &overlimitBuffer).SizeInBytes != ~UINT64(0))
+    fail("overlimit buffer allocation accepted");
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &overlimitBuffer,
+                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "overlimit buffer create");
+
+  D3D12_HEAP_DESC invalidCustomHeap{};
+  invalidCustomHeap.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  invalidCustomHeap.Properties = props;
+  invalidCustomHeap.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+  invalidCustomHeap.Properties.CPUPageProperty = static_cast<D3D12_CPU_PAGE_PROPERTY>(0x7fff);
+  invalidCustomHeap.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+  expect(device->CreateHeap(&invalidCustomHeap, __uuidof(ID3D12Heap), nullptr),
+         E_INVALIDARG, "invalid custom CPU page property");
+  invalidCustomHeap.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+  invalidCustomHeap.Properties.MemoryPoolPreference = static_cast<D3D12_MEMORY_POOL>(0x7fff);
+  expect(device->CreateHeap(&invalidCustomHeap, __uuidof(ID3D12Heap), nullptr),
+         E_INVALIDARG, "invalid custom memory pool");
 
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
   UINT rows = 0;
@@ -137,6 +220,79 @@ void testResourceContracts(ID3D12Device* device) {
   const auto emptyInfo = device->GetResourceAllocationInfo(0, 0, nullptr);
   if (emptyInfo.SizeInBytes || emptyInfo.Alignment)
     fail("GetResourceAllocationInfo empty");
+
+  auto excessiveMips = texture2DDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 4,
+                                     D3D12_RESOURCE_FLAG_NONE);
+  if (device->GetResourceAllocationInfo(0, 1, &excessiveMips).SizeInBytes != ~UINT64(0))
+    fail("excess mip allocation accepted");
+  ID3D12Resource* impossible = reinterpret_cast<ID3D12Resource*>(uintptr_t(1));
+  if (device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &excessiveMips,
+                                      D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&impossible)) != E_INVALIDARG ||
+      impossible)
+    fail("excess mip texture accepted");
+  excessiveMips.MipLevels = 0;
+  ComPtr<ID3D12Resource> fullChain;
+  check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &excessiveMips,
+                                        D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                        IID_PPV_ARGS(&fullChain)), "full mip chain create");
+  if (fullChain->GetDesc().MipLevels != 3)
+    fail("full mip chain normalized incorrectly");
+
+  auto oversized = texture2DDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 1,
+                                 D3D12_RESOURCE_FLAG_NONE);
+  auto rejectOversized = [&](const char* label) {
+    if (device->GetResourceAllocationInfo(0, 1, &oversized).SizeInBytes != ~UINT64(0))
+      fail(label);
+    ID3D12Resource* unexpected = reinterpret_cast<ID3D12Resource*>(uintptr_t(1));
+    expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &oversized,
+                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           __uuidof(ID3D12Resource), reinterpret_cast<void**>(&unexpected)),
+           E_INVALIDARG, label);
+    if (unexpected)
+      fail("oversized resource output not cleared");
+  };
+  oversized.Width = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION + 1;
+  rejectOversized("oversized 2D width");
+  oversized.Width = ~UINT64(0);
+  rejectOversized("overflowing 2D width");
+  oversized.Width = 4;
+  oversized.Height = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION + 1;
+  rejectOversized("oversized 2D height");
+  oversized.Height = 4;
+  oversized.DepthOrArraySize = D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION + 1;
+  rejectOversized("oversized 2D array");
+  oversized.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  rejectOversized("oversized 3D depth");
+  oversized.DepthOrArraySize = 1;
+  oversized.Width = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION + 1;
+  rejectOversized("oversized 3D width");
+  oversized.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+  oversized.Width = D3D12_REQ_TEXTURE1D_U_DIMENSION + 1;
+  oversized.Height = 1;
+  rejectOversized("oversized 1D width");
+  oversized.Width = 4;
+  oversized.DepthOrArraySize = D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION + 1;
+  rejectOversized("oversized 1D array");
+
+  auto crossAdapter = texture2DDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 1,
+                                    D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+  crossAdapter.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  // Row-major cross-adapter textures are sized (linear, 256-byte pitch) but need a
+  // SHARED_CROSS_ADAPTER heap; the sharing suite verifies the backed path.
+  const auto crossInfo = device->GetResourceAllocationInfo(0, 1, &crossAdapter);
+  if (crossInfo.SizeInBytes != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT ||
+      crossInfo.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+    fail("row-major cross-adapter texture allocation info");
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &crossAdapter,
+                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "unbacked row-major cross-adapter texture");
+  crossAdapter.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  expect(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &crossAdapter,
+                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                         __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "unbacked cross-adapter texture");
 }
 
 void testPlacedAlignment(ID3D12Device* device) {
@@ -144,12 +300,37 @@ void testPlacedAlignment(ID3D12Device* device) {
   heapDesc.SizeInBytes = 4ull * 1024ull * 1024ull;
   heapDesc.Properties = defaultHeap();
   heapDesc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  auto invalidDisplay = heapDesc;
+  invalidDisplay.Flags = D3D12_HEAP_FLAG_ALLOW_DISPLAY;
+  expect(device->CreateHeap(&invalidDisplay, __uuidof(ID3D12Heap), nullptr),
+         E_INVALIDARG, "display heap capability probe");
   heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
   ComPtr<ID3D12Heap> heap;
   check(device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap");
 
+  ComPtr<ID3D12Device> otherDevice;
+  check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&otherDevice)),
+        "CreateDevice(other heap owner)");
+  if (otherDevice.Get() == device)
+    fail("distinct device instances");
+  auto crossDeviceBuffer = bufferDesc(4096);
+  ID3D12Resource* unexpected = reinterpret_cast<ID3D12Resource*>(static_cast<UINT_PTR>(1));
+  expect(otherDevice->CreatePlacedResource(heap.Get(), 0, &crossDeviceBuffer,
+                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           __uuidof(ID3D12Resource), reinterpret_cast<void**>(&unexpected)),
+         E_INVALIDARG, "cross-device heap");
+  if (unexpected)
+    fail("cross-device heap output not cleared");
+  expect(otherDevice->CreatePlacedResource(heap.Get(), 0, &crossDeviceBuffer,
+                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "cross-device heap capability probe");
+
   const auto buffer = bufferDesc(64 * 1024);
   ComPtr<ID3D12Resource> resource;
+  expect(device->CreatePlacedResource(heap.Get(), 4096, &buffer, D3D12_RESOURCE_STATE_COMMON,
+                                      nullptr, __uuidof(ID3D12Resource), nullptr),
+         E_INVALIDARG, "misaligned placed buffer capability probe");
   expect(device->CreatePlacedResource(heap.Get(), 4096, &buffer, D3D12_RESOURCE_STATE_COMMON,
                                       nullptr, IID_PPV_ARGS(&resource)),
          E_INVALIDARG, "misaligned placed buffer");
@@ -170,6 +351,225 @@ void testPlacedAlignment(ID3D12Device* device) {
   check(device->CreatePlacedResource(heap.Get(), 0, &texture, D3D12_RESOURCE_STATE_COMMON,
                                      nullptr, IID_PPV_ARGS(&resource)),
         "aligned placed texture");
+}
+
+void testAllocationInfoPlacement(ID3D12Device* device) {
+  ComPtr<ID3D12Device4> device4;
+  check(device->QueryInterface(IID_PPV_ARGS(&device4)), "ID3D12Device4 allocation query");
+  const D3D12_RESOURCE_DESC descs[2] = {
+      bufferDesc(4096), texture2DDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 1,
+                                      D3D12_RESOURCE_FLAG_NONE)};
+  D3D12_RESOURCE_ALLOCATION_INFO1 offsets[2]{};
+  const auto allocation = device4->GetResourceAllocationInfo1(0, 2, descs, offsets);
+  if (allocation.SizeInBytes == ~UINT64(0) || !allocation.SizeInBytes ||
+      !offsets[0].SizeInBytes || !offsets[1].SizeInBytes ||
+      !offsets[0].Alignment || !offsets[1].Alignment ||
+      offsets[0].Offset % offsets[0].Alignment ||
+      offsets[1].Offset % offsets[1].Alignment ||
+      offsets[1].Offset < offsets[0].Offset + offsets[0].SizeInBytes ||
+      allocation.SizeInBytes < offsets[1].Offset + offsets[1].SizeInBytes)
+    fail("GetResourceAllocationInfo1 invalid placement range");
+  D3D12_HEAP_DESC heapDesc{};
+  heapDesc.SizeInBytes = allocation.SizeInBytes;
+  heapDesc.Alignment = allocation.Alignment;
+  heapDesc.Properties = defaultHeap();
+  ComPtr<ID3D12Heap> heap;
+  check(device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap allocation range");
+  ComPtr<ID3D12Resource> placedBuffer, placedTexture;
+  check(device->CreatePlacedResource(heap.Get(), offsets[0].Offset, &descs[0],
+                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                     IID_PPV_ARGS(&placedBuffer)), "allocation buffer placement");
+  check(device->CreatePlacedResource(heap.Get(), offsets[1].Offset, &descs[1],
+                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                     IID_PPV_ARGS(&placedTexture)), "allocation texture placement");
+  UINT8 source[64]{};
+  UINT8 destination[64]{};
+  for (UINT i = 0; i < 64; ++i) source[i] = static_cast<UINT8>(i ^ 0xa5);
+  check(placedTexture->WriteToSubresource(0, nullptr, source, 16, 64),
+        "allocation placed texture write");
+  check(placedTexture->ReadFromSubresource(destination, 16, 64, 0, nullptr),
+        "allocation placed texture read");
+  if (std::memcmp(source, destination, 64)) fail("allocation placed texture contents");
+}
+
+void testPlacedHeapLifetime(ID3D12Device* device) {
+  const auto props = defaultHeap();
+  const auto buffer = bufferDesc(4096);
+  const auto texture = texture2DDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 1,
+                                     D3D12_RESOURCE_FLAG_NONE);
+  for (UINT kind = 0; kind < 2; ++kind) {
+    const auto& desc = kind ? texture : buffer;
+    D3D12_HEAP_DESC heapDesc{};
+    heapDesc.SizeInBytes = 4ull * 1024ull * 1024ull;
+    heapDesc.Properties = props;
+    ComPtr<ID3D12Heap> heap;
+    check(device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap(lifetime)");
+    bool released = false;
+    auto* marker = new HeapLifetimeMarker(&released);
+    const HRESULT markerHr = heap->SetPrivateDataInterface(kHeapLifetimeMarker, marker);
+    marker->Release();
+    check(markerHr, "SetPrivateDataInterface(lifetime)");
+    ComPtr<ID3D12Resource> resource;
+    check(device->CreatePlacedResource(heap.Get(), 0, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                       nullptr, IID_PPV_ARGS(&resource)),
+          "CreatePlacedResource(lifetime)");
+    heap.Reset();
+    if (released)
+      fail("placed resource did not retain heap");
+    resource.Reset();
+    if (!released)
+      fail("placed resource leaked heap");
+  }
+}
+
+void testSmallMsaaAlignment(ID3D12Device* device) {
+  const auto props = defaultHeap();
+  auto desc = texture2DDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 256, 256, 4, 1,
+                            D3D12_RESOURCE_FLAG_NONE);
+  desc.SampleDesc.Count = 4;
+  desc.Alignment = D3D12_SMALL_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+  auto info = device->GetResourceAllocationInfo(0, 1, &desc);
+  if (info.SizeInBytes == ~UINT64(0) || info.Alignment != desc.Alignment)
+    fail("eligible small MSAA array allocation");
+  ComPtr<ID3D12Resource> resource;
+  check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource)),
+        "eligible small MSAA array create");
+  resource.Reset();
+
+  desc.Width = desc.Height = 1024;
+  info = device->GetResourceAllocationInfo(0, 1, &desc);
+  if (info.SizeInBytes != ~UINT64(0))
+    fail("oversized small MSAA allocation accepted");
+  ID3D12Resource* invalid = reinterpret_cast<ID3D12Resource*>(uintptr_t(1));
+  if (device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+                                      D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&invalid)) != E_INVALIDARG || invalid)
+    fail("oversized small MSAA create accepted");
+
+  desc.Width = desc.Height = 4;
+  desc.DepthOrArraySize = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  info = device->GetResourceAllocationInfo(0, 1, &desc);
+  if (info.SizeInBytes == ~UINT64(0) || info.Alignment != desc.Alignment)
+    fail("small MSAA render target allocation");
+  check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource)),
+        "small MSAA render target create");
+
+  desc.Width = desc.Height = 512;
+  info = device->GetResourceAllocationInfo(0, 1, &desc);
+  if (info.SizeInBytes == ~UINT64(0))
+    fail("small MSAA tile boundary rejected");
+  desc.Width = 513;
+  if (device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != ~UINT64(0))
+    fail("small MSAA over tile boundary accepted");
+
+  desc = texture2DDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 128, 128, 1, 1,
+                       D3D12_RESOURCE_FLAG_NONE);
+  desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+  info = device->GetResourceAllocationInfo(0, 1, &desc);
+  if (info.SizeInBytes == ~UINT64(0) || info.Alignment != desc.Alignment)
+    fail("small 2D tile boundary rejected");
+  desc.Width = 129;
+  if (device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != ~UINT64(0))
+    fail("small 2D over tile boundary accepted");
+
+  desc = texture2DDesc(DXGI_FORMAT_R8G8_B8G8_UNORM, 1024, 32, 1, 1,
+                       D3D12_RESOURCE_FLAG_NONE);
+  desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+  info = device->GetResourceAllocationInfo(0, 1, &desc);
+  if (info.SizeInBytes == ~UINT64(0) || info.Alignment != desc.Alignment)
+    fail("small packed 422 tile boundary rejected");
+  check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource)),
+        "small packed 422 create");
+  resource.Reset();
+  desc.Width = 1026;
+  if (device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != ~UINT64(0))
+    fail("small packed 422 over tile boundary accepted");
+}
+
+void testCpuTextureTransfers(ID3D12Device* device) {
+  const auto desc = texture2DDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 1,
+                                  D3D12_RESOURCE_FLAG_NONE);
+  const auto props = defaultHeap();
+  ComPtr<ID3D12Resource> texture;
+  check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&texture)),
+        "CreateCommittedResource(CPU texture)");
+  UINT8 source[64]{};
+  for (UINT i = 0; i < sizeof(source); ++i)
+    source[i] = static_cast<UINT8>(i ^ 0xa5);
+  check(texture->WriteToSubresource(0, nullptr, source, 16, 64), "CPU texture write");
+  UINT8 destination[64]{};
+  check(texture->ReadFromSubresource(destination, 16, 64, 0, nullptr), "CPU texture read");
+  if (std::memcmp(source, destination, sizeof(source)))
+    fail("CPU texture round trip");
+
+  expect(texture->WriteToSubresource(0, nullptr, source, 1, 4), E_INVALIDARG,
+         "CPU texture undersized write pitch");
+  expect(texture->ReadFromSubresource(destination, 1, 4, 0, nullptr), E_INVALIDARG,
+         "CPU texture undersized read pitch");
+  expect(texture->WriteToSubresource(0, nullptr, nullptr, 16, 64), E_INVALIDARG,
+         "CPU texture null write data");
+  expect(texture->ReadFromSubresource(nullptr, 16, 64, 0, nullptr), E_INVALIDARG,
+         "CPU texture null read data");
+  D3D12_BOX inverted{3, 0, 0, 2, 1, 1};
+  expect(texture->WriteToSubresource(0, &inverted, nullptr, 0, 0), S_OK,
+         "CPU texture empty write box");
+  expect(texture->ReadFromSubresource(nullptr, 0, 0, 0, &inverted), S_OK,
+         "CPU texture empty read box");
+  expect(texture->ReadFromSubresource(destination, 16, 64, 1, nullptr), E_INVALIDARG,
+         "CPU texture invalid subresource");
+
+  UINT8 unalignedSource[68]{};
+  UINT8 unalignedDestination[68]{};
+  for (UINT row = 0; row < 4; ++row)
+    std::memcpy(unalignedSource + row * 17, source + row * 16, 16);
+  check(texture->WriteToSubresource(0, nullptr, unalignedSource, 17, 68),
+        "CPU texture unaligned write pitch");
+  check(texture->ReadFromSubresource(unalignedDestination, 17, 68, 0, nullptr),
+        "CPU texture unaligned read pitch");
+  for (UINT row = 0; row < 4; ++row)
+    if (std::memcmp(unalignedSource + row * 17, unalignedDestination + row * 17, 16))
+      fail("CPU texture unaligned pitch round trip");
+
+  D3D12_RESOURCE_DESC volumeDesc = desc;
+  volumeDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  volumeDesc.Width = volumeDesc.Height = volumeDesc.DepthOrArraySize = 2;
+  ComPtr<ID3D12Resource> volume;
+  check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &volumeDesc,
+                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&volume)),
+        "CreateCommittedResource(CPU volume)");
+  UINT8 volumeSource[40]{};
+  UINT8 volumeDestination[40]{};
+  for (UINT z = 0; z < 2; ++z)
+    for (UINT row = 0; row < 2; ++row)
+      for (UINT byte = 0; byte < 8; ++byte)
+        volumeSource[z * 19 + row * 9 + byte] = static_cast<UINT8>(z * 32 + row * 8 + byte);
+  check(volume->WriteToSubresource(0, nullptr, volumeSource, 9, 19),
+        "CPU volume unaligned slice write");
+  check(volume->ReadFromSubresource(volumeDestination, 9, 19, 0, nullptr),
+        "CPU volume unaligned slice read");
+  for (UINT z = 0; z < 2; ++z)
+    for (UINT row = 0; row < 2; ++row)
+      if (std::memcmp(volumeSource + z * 19 + row * 9,
+                      volumeDestination + z * 19 + row * 9, 8))
+        fail("CPU volume unaligned slice round trip");
+
+  const auto bcDesc = texture2DDesc(DXGI_FORMAT_BC1_UNORM, 2, 2, 1, 1,
+                                    D3D12_RESOURCE_FLAG_NONE);
+  ComPtr<ID3D12Resource> bcTail;
+  check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &bcDesc,
+                                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&bcTail)),
+        "CreateCommittedResource(BC CPU tail)");
+  UINT8 block[8]{1, 2, 3, 4, 5, 6, 7, 8};
+  check(bcTail->WriteToSubresource(0, nullptr, block, 8, 8), "BC CPU tail write");
+  UINT8 copied[8]{};
+  check(bcTail->ReadFromSubresource(copied, 8, 8, 0, nullptr), "BC CPU tail read");
+  if (std::memcmp(block, copied, sizeof(block)))
+    fail("BC CPU tail round trip");
 }
 
 void testTypelessDepthViews(ID3D12Device* device) {
@@ -384,6 +784,13 @@ void testOverlappingPlacedResourceAliasing(ID3D12Device* device) {
                                      nullptr, IID_PPV_ARGS(&first)), "CreatePlacedResource(alias first)");
   check(device->CreatePlacedResource(heap.Get(), 0, &description, D3D12_RESOURCE_STATE_COPY_DEST,
                                      nullptr, IID_PPV_ARGS(&second)), "CreatePlacedResource(alias second)");
+  bool heapReleased = false;
+  auto* marker = new HeapLifetimeMarker(&heapReleased);
+  const HRESULT markerHr = heap->SetPrivateDataInterface(kHeapLifetimeMarker, marker);
+  marker->Release();
+  check(markerHr, "SetPrivateDataInterface(alias heap)");
+  heap.Reset();
+  if (heapReleased) fail("alias heap destroyed before GPU use");
 
   auto firstUpload = createHostBuffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD,
                                       D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -444,10 +851,59 @@ void testOverlappingPlacedResourceAliasing(ID3D12Device* device) {
   }
   D3D12_RANGE writtenRange{0, 0};
   readback->Unmap(0, &writtenRange);
+  first.Reset();
+  if (heapReleased) fail("alias heap destroyed with second placement alive");
+  second.Reset();
+  if (!heapReleased) fail("alias heap leaked after GPU use");
 
   std::printf("OWNED_D3D12_RESOURCES_ALIASING_GPU_PASS heap_bytes=%llu overlap_offset=0 write_bytes=%llu ordered_snapshots=4 barriers=first_to_second,second_to_first inheritance=bidirectional\n",
               static_cast<unsigned long long>(allocation.SizeInBytes),
               static_cast<unsigned long long>(bytes));
+}
+
+void testCustomHeapGpuCoherence(ID3D12Device* device) {
+  constexpr UINT64 bytes = 64 * 1024;
+  const auto desc = bufferDesc(bytes);
+  D3D12_HEAP_DESC heapDesc{};
+  heapDesc.SizeInBytes = bytes;
+  heapDesc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  heapDesc.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+  heapDesc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+  heapDesc.Properties.CreationNodeMask = heapDesc.Properties.VisibleNodeMask = 1;
+  heapDesc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE;
+  ComPtr<ID3D12Heap> uploadHeap;
+  check(device->CreateHeap(&heapDesc, IID_PPV_ARGS(&uploadHeap)), "CreateHeap(custom upload)");
+  heapDesc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+  ComPtr<ID3D12Heap> readbackHeap;
+  check(device->CreateHeap(&heapDesc, IID_PPV_ARGS(&readbackHeap)), "CreateHeap(custom readback)");
+  ComPtr<ID3D12Resource> upload, readback;
+  check(device->CreatePlacedResource(uploadHeap.Get(), 0, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                     nullptr, IID_PPV_ARGS(&upload)), "CreatePlacedResource(custom upload)");
+  check(device->CreatePlacedResource(readbackHeap.Get(), 0, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                     nullptr, IID_PPV_ARGS(&readback)), "CreatePlacedResource(custom readback)");
+  expect(upload->Map(1, nullptr, nullptr), E_INVALIDARG, "Map(custom invalid subresource)");
+  check(upload->Map(0, nullptr, nullptr), "Map(custom null output)");
+  upload->Unmap(0, nullptr);
+  UINT8* mapped = nullptr;
+  check(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map(custom upload)");
+  if (!mapped) fail("custom upload Map null");
+  for (UINT64 i = 0; i < bytes; ++i)
+    mapped[i] = static_cast<UINT8>((i * 13 + 0x67) & 0xff);
+  upload->Unmap(0, nullptr);
+  uploadHeap.Reset();
+  readbackHeap.Reset();
+  CopyContext commands(device);
+  commands.list->CopyBufferRegion(readback.Get(), 0, upload.Get(), 0, bytes);
+  commands.submit();
+  D3D12_RANGE readRange{0, static_cast<SIZE_T>(bytes)};
+  check(readback->Map(0, &readRange, reinterpret_cast<void**>(&mapped)), "Map(custom readback)");
+  if (!mapped) fail("custom readback Map null");
+  for (UINT64 i = 0; i < bytes; ++i)
+    if (mapped[i] != static_cast<UINT8>((i * 13 + 0x67) & 0xff))
+      fail("custom placed heap GPU coherence");
+  D3D12_RANGE written{0, 0};
+  readback->Unmap(0, &written);
 }
 
 void testBlockCompressedTailCopy(ID3D12Device* device) {
@@ -535,9 +991,14 @@ int main() {
         "D3D12CreateDevice");
   testResourceContracts(device.Get());
   testPlacedAlignment(device.Get());
+  testAllocationInfoPlacement(device.Get());
+  testPlacedHeapLifetime(device.Get());
+  testSmallMsaaAlignment(device.Get());
+  testCpuTextureTransfers(device.Get());
   testTypelessDepthViews(device.Get());
   testBufferDescriptors(device.Get());
   testOverlappingPlacedResourceAliasing(device.Get());
+  testCustomHeapGpuCoherence(device.Get());
   testBlockCompressedTailCopy(device.Get());
   std::puts("OWNED_D3D12_RESOURCES_PASS owned_backend=1 resource_contracts=1 placed_alignment=1 depth_planes=1 mip_array_views=1 typed_buffer_descriptors=1 null_descriptors=1 bc_tail_copy=1");
   return 0;

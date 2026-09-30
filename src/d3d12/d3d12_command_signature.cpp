@@ -39,6 +39,7 @@ struct dxmt_compute_command_data {
   device char * immutable_constants;
   uint rootsig_qwords_stride;
   packed_uint3 tgsize;
+  device uint * pipeline_statistics;
 };
 
 struct d3d12_draw_arguments {
@@ -74,6 +75,31 @@ struct dxmt_vertex_buffer {
   uint length;
 };
 
+struct dxmt_index_pull_control {
+  uint index_size;
+  uint index_first;
+  int base_vertex;
+  uint reserved;
+};
+
+struct dxmt_so_draw_arguments {
+  uint vertex_count;
+  uint instance_count;
+  uint start_location;
+  uint start_instance;
+  int base_vertex;
+  uint index_format;
+  ulong index_address;
+};
+
+struct dxmt_so_capture_binding {
+  device ushort * index_address;
+  device uint * control_address;
+  device uint * scratch_address;
+  device uint * positions_address;
+  dxmt_so_draw_arguments args;
+};
+
 struct dxmt_render_command_data {
   command_buffer cmd_buf;
   ulong max_count;
@@ -91,6 +117,11 @@ struct dxmt_render_command_data {
   device void * index_buffer;
   uint index_buffer_format;
   uint vertex_argbuf_stride;
+  device dxmt_index_pull_control * index_pull_controls;
+  uint index_pull_mode;
+  uint index_pull_padding;
+  device dxmt_so_capture_binding * so_draws;
+  device uint * pipeline_statistics;
 };
 
 )";
@@ -123,6 +154,8 @@ public:
     VertexBufferMask = 0;
     uint32_t ib_index = ~0u;
     uint64_t packed_size = 0;
+    DrawArgumentOffset = ~0u;
+    IndexBufferArgumentOffset = ~0u;
 
     source << kSharedHeader;
 
@@ -141,12 +174,14 @@ public:
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: {
         side_effect = arg.Type;
+        DrawArgumentOffset = packed_size;
         packed_size += sizeof(D3D12_DRAW_ARGUMENTS);
         source << "d3d12_draw_arguments draw;\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: {
         side_effect = arg.Type;
+        DrawArgumentOffset = packed_size;
         packed_size += sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
         source << "d3d12_draw_indexed_arguments draw_indexed;\n";
         break;
@@ -165,6 +200,7 @@ public:
         if (ib_index != ~0u)
           return E_INVALIDARG;
         ib_index = i;
+        IndexBufferArgumentOffset = packed_size;
         packed_size += sizeof(D3D12_INDEX_BUFFER_VIEW);
         source << "d3d12_index_buffer_view ib;\n";
         break;
@@ -216,6 +252,11 @@ public:
     CommandType = side_effect;
     ByteStride = pDesc->ByteStride;
     UpdateIndexBuffer = ib_index != ~0u;
+    const bool updates_graphics_bindings = !is_compute && (UpdateRootArguments || UpdateVertexBuffers);
+    std::stringstream graphics_updates;
+    if (updates_graphics_bindings)
+      source << "void update_graphics_bindings(device d3d12_arguments &arg, device ulong *rootsig_qwords, "
+                "device dxmt_vertex_buffer *vertex_buffer);\n";
 
     if (is_compute)
       source
@@ -242,15 +283,24 @@ public:
     }
     source << "cmd.reset();\n";
     source << "if (i >= count) continue;\n";
+    if (!is_compute)
+      source << "if (command_data.so_draws && (!command_data.so_draws[i].args.vertex_count || "
+                "!command_data.so_draws[i].args.instance_count)) continue;\n";
     source << "device ulong * rootsig_qwords = command_data.rootsig_qwords ? command_data.rootsig_qwords + "
               "(i * command_data.rootsig_qwords_stride) : nullptr;\n";
     if (!is_compute)
       source << "device dxmt_vertex_buffer * vertex_buffer = "
                 "reinterpret_cast<device dxmt_vertex_buffer *>(command_data.vertex_buffer + "
                 "(i * command_data.vertex_argbuf_stride));\n";
+    if (updates_graphics_bindings)
+      source << "update_graphics_bindings(arg, rootsig_qwords, vertex_buffer);\n";
 
-    if (UpdateRootArguments || UpdateVertexBuffers || UpdateIndexBuffer) {
+    if (UpdateRootArguments || UpdateVertexBuffers || UpdateIndexBuffer ||
+        side_effect == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ||
+        side_effect == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW) {
       if (!is_compute) {
+        if (!(UpdateRootArguments || UpdateVertexBuffers || UpdateIndexBuffer))
+          source << "if (command_data.so_draws || command_data.index_pull_mode != ~0u) {\n";
         source << "cmd.set_vertex_buffer(vertex_buffer," << SM50_BINDING_INDEX_VERTEX_BUFFER << ");\n";
         source << "if (rootsig_qwords) cmd.set_vertex_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
         source << "cmd.set_vertex_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
@@ -261,11 +311,17 @@ public:
                << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS << ");\n";
         source << "if (command_data.fragment_constants) cmd.set_fragment_buffer(command_data.fragment_constants,"
                << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS << ");\n";
+        if (!(UpdateRootArguments || UpdateVertexBuffers || UpdateIndexBuffer))
+          source << "}\n";
+        source << "if (command_data.pipeline_statistics) {\n"
+                  "cmd.set_vertex_buffer(command_data.pipeline_statistics,25);\n"
+                  "cmd.set_fragment_buffer(command_data.pipeline_statistics,25);\n}\n";
       } else {
         source << "if (rootsig_qwords) cmd.set_kernel_buffer(rootsig_qwords, " << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
         source << "cmd.set_kernel_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
         source << "if (command_data.immutable_constants) cmd.set_kernel_buffer(command_data.immutable_constants,"
                << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS << ");\n";
+        source << "if (command_data.pipeline_statistics) cmd.set_kernel_buffer(command_data.pipeline_statistics,25);\n";
       }
     }
 
@@ -273,10 +329,20 @@ public:
       auto &arg = pDesc->pArgumentDescs[i];
       switch (arg.Type) {
       case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: {
+        source << "if (command_data.so_draws) {\n"
+                  "device dxmt_so_capture_binding &so = command_data.so_draws[i];\n"
+                  "cmd.set_vertex_buffer(so.index_address,26);\n"
+                  "cmd.set_vertex_buffer(so.control_address,27);\n"
+                  "cmd.set_vertex_buffer(so.scratch_address,28);\n"
+                  "cmd.draw_primitives((primitive_type)command_data.primitive_type, "
+                  "so.args.start_location,so.args.vertex_count,so.args.instance_count,"
+                  "so.args.start_instance);\n"
+                  "} else {\n";
         source << "cmd.draw_primitives((primitive_type)command_data.primitive_type, "
                   "arg.draw.start_vertex_location, "
                   "arg.draw.vertex_count_per_instance, arg.draw.instance_count, "
-                  "arg.draw.start_instance_location);\n";
+                  "arg.draw.start_instance_location);\n"
+                  "}\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: {
@@ -284,6 +350,41 @@ public:
           source << "bool ib32bit = command_data.index_buffer_format == 42;\n";
           source << "device void* ib = command_data.index_buffer;\n";
         }
+        source << "if (command_data.so_draws) {\n"
+                  "device dxmt_so_capture_binding &so = command_data.so_draws[i];\n"
+                  "cmd.set_vertex_buffer(so.index_address,26);\n"
+                  "cmd.set_vertex_buffer(so.control_address,27);\n"
+                  "cmd.set_vertex_buffer(so.scratch_address,28);\n"
+                  "cmd.draw_indexed_primitives((primitive_type)command_data.primitive_type, "
+                  "so.args.vertex_count,so.positions_address,"
+                  "so.args.instance_count,0,so.args.start_instance);\n"
+                  "} else {\n";
+        source << "if (command_data.index_pull_mode != ~0u) {\n"
+                  "bool pull = command_data.index_pull_mode != (ib32bit ? 2u : 1u);\n"
+                  "device dxmt_index_pull_control *control = command_data.index_pull_controls + i;\n"
+                  "if (pull) {\n"
+                  "uint size = ib32bit ? 4u : 2u;\n"
+                  "ulong first = (ulong)ib + (ulong)arg.draw_indexed.start_index_location * size;\n"
+                  "control->index_size = size;\n"
+                  "control->index_first = uint((first & 3ul) / 2ul);\n"
+                  "control->base_vertex = arg.draw_indexed.base_vertex_location;\n"
+                  "cmd.set_vertex_buffer(reinterpret_cast<device ushort *>(first & ~3ul),"
+               << SM50_BINDING_INDEX_VERTEX_INDICES << ");\n"
+                  "cmd.set_vertex_buffer(control,"
+               << SM50_BINDING_INDEX_VERTEX_INDEX_CONTROL << ");\n"
+                  "cmd.draw_primitives((primitive_type)command_data.primitive_type, 0, "
+                  "arg.draw_indexed.index_count_per_instance, arg.draw_indexed.instance_count, "
+                  "arg.draw_indexed.start_instance_location);\n"
+                  "} else {\n"
+                  "control->index_size = 0;\n"
+                  "cmd.set_vertex_buffer(control,"
+               << SM50_BINDING_INDEX_VERTEX_INDICES << ");\n"
+                  "cmd.set_vertex_buffer(control,"
+               << SM50_BINDING_INDEX_VERTEX_INDEX_CONTROL << ");\n"
+                  "}\n";
+        source << "}\n";
+        source << "if (command_data.index_pull_mode == ~0u || "
+                  "command_data.index_pull_mode == (ib32bit ? 2u : 1u)) {\n";
         source << "if (ib32bit) {\n";
         source << "cmd.draw_indexed_primitives((primitive_type)command_data.primitive_type, "
                   "arg.draw_indexed.index_count_per_instance, "
@@ -297,6 +398,8 @@ public:
                   "arg.draw_indexed.instance_count, arg.draw_indexed.base_vertex_location, "
                   "arg.draw_indexed.start_instance_location);\n";
         source << "}\n";
+        source << "}\n";
+        source << "}\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
@@ -305,8 +408,8 @@ public:
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
         auto slot = arg.VertexBuffer.Slot;
-        source << "vertex_buffer[" << slot << "] = {arg.vb_" << i << ".buffer,arg.vb_" << i
-               << ".stride_in_bytes,arg.vb_" << i << ".size_in_bytes};\n";
+        graphics_updates << "vertex_buffer[" << slot << "] = {arg.vb_" << i << ".buffer,arg.vb_" << i
+                         << ".stride_in_bytes,arg.vb_" << i << ".size_in_bytes};\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: {
@@ -328,8 +431,9 @@ public:
         RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         for (unsigned j = 0; j < arg.Constant.Num32BitValuesToSet; j++) {
-          source << "reinterpret_cast<device uint *>(rootsig_qwords + " << offset << ")["
-                 << (j + arg.Constant.DestOffsetIn32BitValues) << "] = arg.constant_" << i << "_" << j << ";\n";
+          (is_compute ? source : graphics_updates)
+              << "reinterpret_cast<device uint *>(rootsig_qwords + " << offset << ")["
+              << (j + arg.Constant.DestOffsetIn32BitValues) << "] = arg.constant_" << i << "_" << j << ";\n";
         }
         break;
       }
@@ -343,7 +447,7 @@ public:
           return E_INVALIDARG;
         RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
-        source << "rootsig_qwords[" << offset << "] = arg.cb_" << i << ";\n";
+        (is_compute ? source : graphics_updates) << "rootsig_qwords[" << offset << "] = arg.cb_" << i << ";\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: {
@@ -356,7 +460,12 @@ public:
           return E_INVALIDARG;
         RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
-        source << "rootsig_qwords[" << offset << "] = arg.srv_" << i << ";\n";
+        (is_compute ? source : graphics_updates) << "rootsig_qwords[" << offset << "] = arg.srv_" << i << ";\n";
+        /* TILED: the GPU cannot map an address to its reserved buffer, so an indirect root view
+           reports fully mapped (its status qword is reset instead of keeping an older base). */
+        if (rootsig->StatusQwordOffsets[parameter_index] != ~0u)
+          (is_compute ? source : graphics_updates)
+              << "rootsig_qwords[" << rootsig->StatusQwordOffsets[parameter_index] << "] = 0;\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
@@ -369,7 +478,12 @@ public:
           return E_INVALIDARG;
         RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
-        source << "rootsig_qwords[" << offset << "] = arg.uav_" << i << ";\n";
+        (is_compute ? source : graphics_updates) << "rootsig_qwords[" << offset << "] = arg.uav_" << i << ";\n";
+        /* TILED: the GPU cannot map an address to its reserved buffer, so an indirect root view
+           reports fully mapped (its status qword is reset instead of keeping an older base). */
+        if (rootsig->StatusQwordOffsets[parameter_index] != ~0u)
+          (is_compute ? source : graphics_updates)
+              << "rootsig_qwords[" << rootsig->StatusQwordOffsets[parameter_index] << "] = 0;\n";
         break;
       }
       default:
@@ -379,6 +493,22 @@ public:
 
     source << "}\n"
               "};\n";
+    if (updates_graphics_bindings) {
+      source << "void update_graphics_bindings(device d3d12_arguments &arg, device ulong *rootsig_qwords, "
+                "device dxmt_vertex_buffer *vertex_buffer) {\n"
+             << graphics_updates.view() << "}\n";
+      // MSAA execution consumes these bindings in a compute VS, without an ICB draw.
+      source << "kernel void resolve_graphics_arguments(uint i [[thread_position_in_grid]], "
+                "constant dxmt_render_command_data &command_data [[buffer(30)]]) {\n"
+                "if (i >= command_data.max_count) return;\n"
+                "device d3d12_arguments &arg = *reinterpret_cast<device d3d12_arguments *>("
+                "command_data.argument_buffer + ulong(i) * " << pDesc->ByteStride << ");\n"
+                "device ulong *roots = command_data.rootsig_qwords ? command_data.rootsig_qwords + "
+                "ulong(i) * command_data.rootsig_qwords_stride : nullptr;\n"
+                "device dxmt_vertex_buffer *vertices = reinterpret_cast<device dxmt_vertex_buffer *>("
+                "command_data.vertex_buffer + ulong(i) * command_data.vertex_argbuf_stride);\n"
+                "update_graphics_bindings(arg, roots, vertices);\n}\n";
+    }
 
     WMT::Reference<WMT::Error> err;
     auto lib = device_->GetMTLDevice().newLibraryWithSource(source.view(), err);
@@ -408,6 +538,18 @@ public:
     if (err) {
       ERR("Failed to compile command signature resolve pso: ", err.description().getUTF8String());
       return E_FAIL;
+    }
+    if (updates_graphics_bindings) {
+      auto bindings = lib.newFunction("resolve_graphics_arguments");
+      if (!bindings) {
+        ERR("Failed to create graphics argument resolver shader");
+        return E_FAIL;
+      }
+      graphics_argument_resolver = device_->GetMTLDevice().newComputePipelineState(bindings, err);
+      if (!graphics_argument_resolver) {
+        ERR("Failed to compile graphics argument resolver pso: ", err.description().getUTF8String());
+        return E_FAIL;
+      }
     }
 
     return S_OK;

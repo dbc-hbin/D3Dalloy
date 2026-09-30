@@ -7,9 +7,9 @@
  */
 
 #include "dxil_converter.hpp"
+#include "dxil_pipeline.hpp"
 
 #include <algorithm>
-
 
 #include <string>
 
@@ -41,8 +41,6 @@ llvm::Error unsupported(StringRef what) {
   return llvm::make_error<UnsupportedFeature>(what);
 }
 
-namespace {
-
 shader::common::ResourceType to_resource_type(ResourceKind kind) {
   using shader::common::ResourceType;
   switch (kind) {
@@ -73,6 +71,8 @@ shader::common::ResourceType to_resource_type(ResourceKind kind) {
     return ResourceType::NonApplicable;
   }
 }
+
+namespace {
 
 /** AIR stage entry points, used to tell lowering output from leftover DXIL IR. */
 llvm::SmallPtrSet<llvm::Function *, 8> collectAirEntries(llvm::Module &module) {
@@ -305,12 +305,12 @@ llvm::Error PrepareShader(
   case Stage::Vertex:
   case Stage::Pixel:
   case Stage::Compute:
+  case Stage::Geometry:
+  case Stage::Hull:
+  case Stage::Domain:
     break;
   default:
-    return unsupported(
-      "DXIL shader model 6 stage is not supported yet (only vertex, pixel and "
-      "compute shaders are)"
-    );
+    return unsupported("DXIL shader model 6 stage is not supported by the graphics pipeline");
   }
 
   auto *bytes = static_cast<const uint8_t *>(bytecode);
@@ -322,6 +322,31 @@ llvm::Error PrepareShader(
   shader.max_output_register = metadata->max_output_register;
   shader.pso_valid_output_reg_mask = metadata->output_register_mask;
   shader.ps_has_coverage_output = metadata->has_coverage_output ? 1 : 0;
+  /* The multi-stage converters size the vertex payload and look stream output elements up
+   * through the DXBC-style output signature. The signature chunk rows are the registers the
+   * stage writes (storeOutput addresses elements, not registers). */
+  shader.output_signature = BuildOutputSignature(metadata->output_sig);
+  if (metadata->stage == Stage::Vertex)
+    for (const auto &output : metadata->output_sig)
+      if (output.start_row != ~0u)
+        shader.max_output_register = std::max(shader.max_output_register, output.start_row + output.rows);
+  if (metadata->stage == Stage::Geometry)
+    if (auto error = PrepareGeometryShader(*metadata, shader))
+      return error;
+  if (metadata->stage == Stage::Hull)
+    if (auto error = PrepareHullShader(*metadata, shader))
+      return error;
+  if (metadata->stage == Stage::Domain)
+    if (auto error = PrepareDomainShader(*metadata, shader))
+      return error;
+  if (metadata->stage == Stage::Pixel)
+    for (const auto &input : metadata->input_sig)
+      if (input.semantic_kind == microsoft::D3D10_SB_NAME_SAMPLE_INDEX ||
+          input.interp == microsoft::D3D10_SB_INTERPOLATION_LINEAR_SAMPLE ||
+          input.interp == microsoft::D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE_SAMPLE) {
+        shader.ps_sample_frequency = 1;
+        break;
+      }
 
   /* The resource maps the root-signature binding layer resolves declarations through.
    * The raytracing path calls the same helper (PopulateShaderResourceBindings). */
@@ -488,9 +513,16 @@ llvm::Error LowerImmutableConstants(llvm::Module &module, SM50CompiledBitcodeInt
     return Error::success();
   // A zero-sized global may still have its address taken. Give it a valid binding.
   compiled.constants.resize(std::max<uint64_t>(size, 1), 0);
-  for (auto *global : globals)
+  for (auto *global : globals) {
+    /* The 64 bit atomic lock table address is patched in by the runtime. */
+    if (global->getName() == kAtomicLockTableGlobal) {
+      compiled.constant_relocations.push_back(
+        {offsets.lookup(global), SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE});
+      continue;
+    }
     if (auto error = writeConstantInitializer(global->getInitializer(), offsets.lookup(global), layout, offsets, compiled))
       return error;
+  }
 
   DenseMap<Constant *, bool> dependencies;
   auto references_pool = [&](auto &self, Constant *value) -> bool {

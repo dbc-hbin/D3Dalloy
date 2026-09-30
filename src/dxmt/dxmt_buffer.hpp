@@ -41,6 +41,8 @@ enum class BufferAllocationFlag : uint32_t {
   SuballocateFromOnePage = 5,
   CpuPlaced = 6,
   AllocatedOnHeap = 7,
+  /* A Metal placement sparse buffer: its pages are mapped by explicit tile mapping updates. */
+  PlacementSparse = 8,
 };
 
 struct BufferViewKey {
@@ -152,12 +154,21 @@ public:
 
   DXMT_RESOURCE_RESIDENCY_STATE residencyState;
   small_vector<GenericAccessTracker, 1> fenceTrackers;
+  /*
+   * Placement sparse buffers only: GPU address of a byte-per-64KB-tile residency array, biased so
+   * that the byte of the tile containing GPU address `va` lives at `residencyStatusBase + (va >> 16)`.
+   * Zero for every other buffer, which is always fully mapped.
+   */
+  uint64_t residencyStatusBase = 0;
 
 private:
   BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags);
   BufferAllocation(
       WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMT::Heap heap,
       uint64_t heap_offset
+  );
+  BufferAllocation(
+      WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, WMTSparsePageSize page_size
   );
   void free();
 
@@ -176,6 +187,7 @@ private:
   uint32_t suballocation_count_ = 1;
 
   void * placed_buffer = nullptr;
+  WMTSparsePageSize sparse_page_size_ = WMTSparsePageSize64;
 };
 
 class Buffer {
@@ -193,6 +205,10 @@ public:
 
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset);
+  /** A buffer over caller-owned, page-aligned CPU memory that outlives the allocation. */
+  Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, void *placed_memory);
+  /** A placement sparse buffer whose tiles are all unmapped; `page_size` is the Metal sparse page size. */
+  Rc<BufferAllocation> allocateSparse(WMTSparsePageSize page_size);
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 

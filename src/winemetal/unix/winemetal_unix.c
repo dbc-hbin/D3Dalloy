@@ -1,16 +1,25 @@
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
 #include <sys/sysctl.h>
 #import <Cocoa/Cocoa.h>
 #import <ColorSync/ColorSync.h>
+#import <CoreVideo/CoreVideo.h>
 #import <CoreFoundation/CFRunLoop.h>
+#import <IOKit/IOKitLib.h>
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
 #include "objc/objc-runtime.h"
 #include <bootstrap.h>
 #include <mach/mach_port.h>
+#include <CommonCrypto/CommonDigest.h>
+#import <IOSurface/IOSurface.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
@@ -20,6 +29,7 @@
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
+#define STATUS_NOT_IMPLEMENTED 0xC0000002
 
 void
 execute_on_main(dispatch_block_t block) {
@@ -175,6 +185,82 @@ _MTLDevice_newBuffer(void *obj) {
   info->gpu_address = [buffer gpuAddress];
   return STATUS_SUCCESS;
 }
+
+#ifndef DXMT_NATIVE
+extern NTSTATUS NtAllocateVirtualMemory(void *process, void **address, uintptr_t zero_bits, size_t *size,
+                                        uint32_t type, uint32_t protect);
+extern NTSTATUS NtFreeVirtualMemory(void *process, void **address, size_t *size, uint32_t type);
+
+/*
+ * Storage released by Metal deallocators, which can run on threads Wine does not own. Blocks are
+ * pushed here (the first word links them) and returned to Wine by the next WoW64 allocation, which
+ * always runs on a Wine thread inside a unix call.
+ */
+static _Atomic(void *) wow64_buffer_free_list;
+
+static void
+wow64_buffer_drain_frees(void) {
+  void *block = atomic_exchange(&wow64_buffer_free_list, NULL);
+  while (block) {
+    void *next = *(void **)block;
+    size_t size = 0;
+    NtFreeVirtualMemory((void *)~(uintptr_t)0, &block, &size, 0x8000 /* MEM_RELEASE */);
+    block = next;
+  }
+}
+
+/*
+ * WoW64 twin of _MTLDevice_newBuffer. A CPU-visible Metal allocation lives above 4 GiB, where a
+ * 32-bit PE cannot address it. When the caller asks for an addressable mapping
+ * (WMT_RESOURCE_CPU_ADDRESSABLE) and supplies no storage, the buffer is created over committed
+ * Wine memory below 2 GiB; Metal's deallocator returns it once the buffer is gone. The caller then
+ * reads a mapping it can dereference, exactly as a 64-bit caller reads [buffer contents]. Every
+ * other request is the 64-bit behavior, so GPU-only buffers do not consume the 32-bit address space.
+ */
+static NTSTATUS
+_MTLDevice_newBuffer32(void *obj) {
+  struct unixcall_mtldevice_newbuffer *params = obj;
+  struct WMTBufferInfo *info = params->info.ptr;
+  const bool addressable = info->options & WMT_RESOURCE_CPU_ADDRESSABLE_BIT;
+  info->options &= ~WMT_RESOURCE_CPU_ADDRESSABLE_BIT;
+  const enum MTLResourceOptions options = (enum MTLResourceOptions)info->options;
+  if (!addressable || info->memory.ptr ||
+      (options & MTLResourceStorageModeMask) == MTLResourceStorageModePrivate)
+    return _MTLDevice_newBuffer(obj);
+  wow64_buffer_drain_frees();
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  params->ret = 0;
+  info->gpu_address = 0;
+  /* Metal requires page-aligned no-copy storage; reserve whole 16 KiB host pages. */
+  const uint64_t length = info->length ? info->length : 1;
+  if (length > UINT32_MAX)
+    return STATUS_SUCCESS;
+  void *block = NULL;
+  size_t size = (size_t)((length + 0x3fff) & ~(uint64_t)0x3fff);
+  if (NtAllocateVirtualMemory((void *)~(uintptr_t)0, &block, 0x7fffffff, &size,
+                              0x3000 /* MEM_COMMIT | MEM_RESERVE */, 0x04 /* PAGE_READWRITE */) || !block)
+    return STATUS_SUCCESS;
+  id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:block
+                                                   length:size
+                                                  options:options
+                                              deallocator:^(void *pointer, NSUInteger unused_length) {
+                                                void *head = atomic_load(&wow64_buffer_free_list);
+                                                do {
+                                                  *(void **)pointer = head;
+                                                } while (!atomic_compare_exchange_weak(&wow64_buffer_free_list,
+                                                                                       &head, pointer));
+                                              }];
+  if (!buffer) {
+    size = 0;
+    NtFreeVirtualMemory((void *)~(uintptr_t)0, &block, &size, 0x8000 /* MEM_RELEASE */);
+    return STATUS_SUCCESS;
+  }
+  info->memory.ptr = block;
+  params->ret = (obj_handle_t)buffer;
+  info->gpu_address = [buffer gpuAddress];
+  return STATUS_SUCCESS;
+}
+#endif
 
 static NTSTATUS
 _MTLDevice_newSamplerState(void *obj) {
@@ -466,6 +552,27 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetHeight = info->render_target_height;
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
+  if (info->center_sample_pattern) {
+    NSUInteger sample_count = info->default_raster_sample_count;
+    if (!sample_count) {
+      for (unsigned i = 0; i < 8 && !sample_count; i++)
+        sample_count = [(id<MTLTexture>)info->colors[i].texture sampleCount];
+      if (!sample_count && info->depth.texture)
+        sample_count = [(id<MTLTexture>)info->depth.texture sampleCount];
+      if (!sample_count && info->stencil.texture)
+        sample_count = [(id<MTLTexture>)info->stencil.texture sampleCount];
+    }
+    // The D3D12 validation layer only records center passes with 2/4/8
+    // raster samples. Never silently substitute the standard pattern.
+    if (sample_count != 2 && sample_count != 4 && sample_count != 8) {
+      [descriptor release];
+      return STATUS_UNSUCCESSFUL;
+    }
+    MTLSamplePosition positions[8];
+    for (NSUInteger i = 0; i < sample_count; i++)
+      positions[i] = MTLSamplePositionMake(0.5f, 0.5f);
+    [descriptor setSamplePositions:positions count:sample_count];
+  }
 
   if (info->tile_height && info->tile_width) {
     descriptor.tileWidth = info->tile_width;
@@ -1028,6 +1135,11 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder setStencilReferenceValue:body->stencil_ref];
       break;
     }
+    case WMTRenderCommandSetStencilRefFrontBack: {
+      struct wmtcmd_render_setstencilref_front_back *body = (struct wmtcmd_render_setstencilref_front_back *)next;
+      [encoder setStencilFrontReferenceValue:body->front_stencil_ref backReferenceValue:body->back_stencil_ref];
+      break;
+    }
     case WMTRenderCommandSetVisibilityMode: {
       struct wmtcmd_render_setvisibilitymode *body = (struct wmtcmd_render_setvisibilitymode *)next;
       [encoder setVisibilityResultMode:(MTLVisibilityResultMode)body->mode offset:body->offset];
@@ -1357,6 +1469,35 @@ static NTSTATUS
 _MTLDevice_supportsTextureSampleCount(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
   params->ret = [(id<MTLDevice>)params->handle supportsTextureSampleCount:params->arg];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_programmableSamplePositionsSupported(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLDevice>)params->handle areProgrammableSamplePositionsSupported];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_gpuCoreCount(void *obj) {
+  /* Metal does not expose the core count; read "gpu-core-count" from the IOKit entry of
+   * this exact device (registryID), or from the AGXAccelerator above it. */
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = 0;
+  io_registry_entry_t entry = IOServiceGetMatchingService(
+      kIOMainPortDefault, IORegistryEntryIDMatching([(id<MTLDevice>)params->handle registryID]));
+  if (!entry)
+    return STATUS_SUCCESS;
+  CFTypeRef value = IORegistryEntrySearchCFProperty(entry, kIOServicePlane, CFSTR("gpu-core-count"),
+                                                    kCFAllocatorDefault,
+                                                    kIORegistryIterateRecursively | kIORegistryIterateParents);
+  uint32_t count = 0;
+  if (value && CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, kCFNumberSInt32Type, &count))
+    params->ret = count;
+  if (value)
+    CFRelease(value);
+  IOObjectRelease(entry);
   return STATUS_SUCCESS;
 }
 
@@ -1789,6 +1930,18 @@ thunk_SM50Compile(void *args) {
   return STATUS_SUCCESS;
 }
 
+/* Same handler for both tables: the param layout is fixed-width and the destination is a caller-image address. */
+static NTSTATUS
+thunk_SM50CopyCompiledBitcode(void *args) {
+  struct sm50_copy_compiled_bitcode_params *params = args;
+
+  params->ret = SM50CopyCompiledBitcode(
+      params->bitcode, (enum SM50_COMPILED_BITCODE_PART)params->part, (void *)params->destination, params->size
+  );
+
+  return STATUS_SUCCESS;
+}
+
 static NTSTATUS
 thunk_SM50GetCompiledBitcode(void *args) {
   struct sm50_get_compiled_bitcode_params *params = args;
@@ -1890,6 +2043,14 @@ thunk_SM50GetArgumentsInfo(void *args) {
   return STATUS_SUCCESS;
 }
 
+static NTSTATUS
+thunk_SM50NeedsRasterOrderedBufferMarker(void *args) {
+  struct sm50_needs_raster_ordered_buffer_marker_params *params = args;
+  params->ret = SM50NeedsRasterOrderedBufferMarker(
+      params->shader, params->root_signature, params->root_signature_length);
+  return STATUS_SUCCESS;
+}
+
 /*
  * Whole-pipeline raytracing compilation. Both thunks forward the description the
  * PE side built against dxil_raytracing.h verbatim; the compiler owns the meaning
@@ -1982,6 +2143,7 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   uint32_t unorm_output_reg_mask;
   /** MTLPixelFormat */
   uint32_t pixel_formats[8];
+  uint32_t native_sample_count;
 };
 
 struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
@@ -2013,7 +2175,68 @@ struct SM50_SHADER_ROOT_SIGNATURE_DATA32 {
   uint32_t bytecode_length;
 };
 
-void
+struct SM50_SO_CAPTURE_ELEMENT32 {
+  uint32_t semantic_name;
+  uint32_t semantic_index;
+  uint32_t start_component;
+  uint32_t component_count;
+  uint32_t dword_offset;
+};
+
+struct SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t record_dwords;
+  uint32_t num_elements;
+  uint32_t elements;
+};
+
+struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t variant;
+  uint32_t sample_count;
+  uint32_t layout_out;
+  uint8_t depth_attachment;
+  uint8_t single_sample_target;
+  uint32_t line_mode;
+  uint32_t interpolation_out;
+  uint32_t line_vertex_layout;
+  uint8_t center_pattern;
+  uint32_t distance_vertex_layout;
+  uint32_t distance_vertex_count;
+};
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32, distance_vertex_layout) == 40,
+               "Wine32 MSAA distance layout pointer offset");
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32, distance_vertex_count) == 44,
+               "Wine32 MSAA distance vertex count offset");
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32) == 48,
+               "Wine32 MSAA pixel argument size");
+
+struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t variant;
+  uint32_t sample_count;
+  uint32_t layout_out;
+  uint32_t line_mode;
+  uint32_t interpolation;
+  uint8_t depth_clip_enable;
+};
+
+struct SM50_SHADER_D3D12_TESS_CAPTURE_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t layout_out;
+};
+
+struct SM50_SHADER_GS_TESSELLATION_INPUT_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  SM50_TESS_CAPTURE_LAYOUT layout;
+};
+
+static bool
 sm50_compilation_argument32_convert(
     struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32
 ) {
@@ -2028,6 +2251,8 @@ sm50_compilation_argument32_convert(
       struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA32 *src = (void *)args32;
       struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA *data =
           malloc(sizeof(struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA));
+      if (!data)
+        return false;
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;
@@ -2044,6 +2269,8 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_COMMON: {
       struct SM50_SHADER_COMMON_DATA32 *src = (void *)args32;
       struct SM50_SHADER_COMMON_DATA *data = malloc(sizeof(struct SM50_SHADER_COMMON_DATA));
+      if (!data)
+        return false;
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;
@@ -2055,6 +2282,8 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_PSO_PIXEL_SHADER: {
       struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 *src = (void *)args32;
       struct SM50_SHADER_PSO_PIXEL_SHADER_DATA *data = malloc(sizeof(struct SM50_SHADER_PSO_PIXEL_SHADER_DATA));
+      if (!data)
+        return false;
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;
@@ -2062,6 +2291,7 @@ sm50_compilation_argument32_convert(
       data->unorm_output_reg_mask = src->unorm_output_reg_mask;
       data->disable_depth_output = src->disable_depth_output;
       data->sample_mask = src->sample_mask;
+      data->native_sample_count = src->native_sample_count;
       data->dual_source_blending = src->dual_source_blending;
       memcpy(data->pixel_formats, src->pixel_formats, sizeof(data->pixel_formats));
       break;
@@ -2069,6 +2299,8 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_IA_INPUT_LAYOUT: {
       struct SM50_SHADER_IA_INPUT_LAYOUT_DATA32 *src = (void *)args32;
       struct SM50_SHADER_IA_INPUT_LAYOUT_DATA *data = malloc(sizeof(struct SM50_SHADER_IA_INPUT_LAYOUT_DATA));
+      if (!data)
+        return false;
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;
@@ -2082,6 +2314,8 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_GS_PASS_THROUGH: {
       struct SM50_SHADER_GS_PASS_THROUGH_DATA32 *src = (void *)args32;
       struct SM50_SHADER_GS_PASS_THROUGH_DATA *data = malloc(sizeof(struct SM50_SHADER_GS_PASS_THROUGH_DATA));
+      if (!data)
+        return false;
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;
@@ -2093,6 +2327,8 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_PSO_GEOMETRY_SHADER: {
       struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA32 *src = (void *)args32;
       struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *data = malloc(sizeof(struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA));
+      if (!data)
+        return false;
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;
@@ -2103,6 +2339,8 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_PSO_TESSELLATOR: {
       struct SM50_SHADER_PSO_TESSELLATOR_DATA32 *src = (void *)args32;
       struct SM50_SHADER_PSO_TESSELLATOR_DATA *data = malloc(sizeof(struct SM50_SHADER_PSO_TESSELLATOR_DATA));
+      if (!data)
+        return false;
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;
@@ -2114,6 +2352,8 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_ROOT_SIGNATURE2: {
       struct SM50_SHADER_ROOT_SIGNATURE_DATA32 *src = (void *)args32;
       struct SM50_SHADER_ROOT_SIGNATURE_DATA *data = malloc(sizeof(struct SM50_SHADER_ROOT_SIGNATURE_DATA));
+      if (!data)
+        return false;
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;
@@ -2122,22 +2362,140 @@ sm50_compilation_argument32_convert(
       data->bytecode_length = src->bytecode_length;
       break;
     }
+    case SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE: {
+      const struct SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA32 *src = (void *)args32;
+      const struct SM50_SO_CAPTURE_ELEMENT32 *src_elements = UInt32ToPtr(src->elements);
+      struct SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *data = calloc(1, sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = (void *)data;
+      data->type = src->type;
+      data->record_dwords = src->record_dwords;
+      data->num_elements = src->num_elements;
+      if (src->num_elements) {
+        struct SM50_SO_CAPTURE_ELEMENT *elements = calloc(src->num_elements, sizeof(*elements));
+        if (!elements)
+          return false;
+        data->elements = elements;
+        for (uint32_t i = 0; i < src->num_elements; ++i) {
+          const char *name = UInt32ToPtr(src_elements[i].semantic_name);
+          if (name && !(elements[i].semantic_name = strdup(name)))
+            return false;
+          elements[i].semantic_index = src_elements[i].semantic_index;
+          elements[i].start_component = src_elements[i].start_component;
+          elements[i].component_count = src_elements[i].component_count;
+          elements[i].dword_offset = src_elements[i].dword_offset;
+        }
+      }
+      break;
+    }
+    case SM50_SHADER_D3D12_INDEX_PULL:
+    case SM50_SHADER_D3D12_PIPELINE_STATS: {
+      struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data = malloc(sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = data;
+      data->next = NULL;
+      data->type = args32->type;
+      break;
+    }
+    case SM50_SHADER_D3D12_MSAA_PIXEL: {
+      const struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA *data = calloc(1, sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = (void *)data;
+      data->type = src->type;
+      data->variant = src->variant;
+      data->sample_count = src->sample_count;
+      data->layout_out = UInt32ToPtr(src->layout_out);
+      data->depth_attachment = src->depth_attachment;
+      data->single_sample_target = src->single_sample_target;
+      data->line_mode = src->line_mode;
+      data->interpolation_out = UInt32ToPtr(src->interpolation_out);
+      data->line_vertex_layout = UInt32ToPtr(src->line_vertex_layout);
+      data->center_pattern = src->center_pattern;
+      data->distance_vertex_layout = UInt32ToPtr(src->distance_vertex_layout);
+      data->distance_vertex_count = src->distance_vertex_count;
+      break;
+    }
+    case SM50_SHADER_D3D12_MSAA_VERTEX: {
+      const struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA *data = calloc(1, sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = (void *)data;
+      data->type = src->type;
+      data->variant = src->variant;
+      data->sample_count = src->sample_count;
+      data->layout_out = UInt32ToPtr(src->layout_out);
+      data->line_mode = src->line_mode;
+      data->interpolation = UInt32ToPtr(src->interpolation);
+      data->depth_clip_enable = src->depth_clip_enable;
+      break;
+    }
+    case SM50_SHADER_D3D12_TESS_CAPTURE: {
+      const struct SM50_SHADER_D3D12_TESS_CAPTURE_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_D3D12_TESS_CAPTURE_DATA *data = calloc(1, sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = (void *)data;
+      data->type = src->type;
+      data->layout_out = UInt32ToPtr(src->layout_out);
+      break;
+    }
+    case SM50_SHADER_GS_TESSELLATION_INPUT: {
+      const struct SM50_SHADER_GS_TESSELLATION_INPUT_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_GS_TESSELLATION_INPUT_DATA *data = calloc(1, sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = (void *)data;
+      data->type = src->type;
+      data->layout = src->layout;
+      break;
+    }
     case SM50_SHADER_ARGUMENT_TYPE_MAX:
       break;
     }
     args32 = UInt32ToPtr(args32->next);
   }
+  return true;
 }
 
-void
+static void
 sm50_compilation_argument32_free(struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *first_arg) {
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *arg = first_arg->next;
 
   while (arg) {
     struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *next = arg->next;
+    if (arg->type == SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE) {
+      struct SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *capture = (void *)arg;
+      for (uint32_t i = 0; capture->elements && i < capture->num_elements; ++i)
+        free((void *)capture->elements[i].semantic_name);
+      free((void *)capture->elements);
+    }
     free(arg);
     arg = next;
   }
+}
+
+static NTSTATUS
+sm50_compilation_argument32_oom(
+    struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, uint32_t bitcode, uint32_t error, int *ret
+) {
+  sm50_compilation_argument32_free(first_arg);
+  if (bitcode)
+    *(sm50_bitcode_t *)UInt32ToPtr(bitcode) = (sm50_bitcode_t){0};
+  if (error)
+    *(sm50_error_t *)UInt32ToPtr(error) = (sm50_error_t){0};
+  *ret = 1; // SM50Compile's failure result; the null error means allocation failed in the thunk.
+  return STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -2145,7 +2503,8 @@ thunk32_SM50Compile(void *args) {
   struct sm50_compile_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32))
+    return sm50_compilation_argument32_oom(&first_arg, params->bitcode, params->error, &params->ret);
 
   params->ret = SM50Compile(
       params->shader, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -2180,7 +2539,8 @@ thunk32_SM50CompileTessellationPipelineHull(void *args) {
   struct sm50_compile_tessellation_pipeline_hull_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->hull_args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32))
+    return sm50_compilation_argument32_oom(&first_arg, params->bitcode, params->error, &params->ret);
 
   params->ret = SM50CompileTessellationPipelineHull(
       params->vertex, params->hull, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -2197,7 +2557,8 @@ thunk32_SM50CompileTessellationPipelineDomain(void *args) {
   struct sm50_compile_tessellation_pipeline_domain_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->domain_args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32))
+    return sm50_compilation_argument32_oom(&first_arg, params->bitcode, params->error, &params->ret);
 
   params->ret = SM50CompileTessellationPipelineDomain(
       params->hull, params->domain, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -2214,7 +2575,8 @@ thunk32_SM50CompileGeometryPipelineVertex(void *args) {
   struct sm50_compile_geometry_pipeline_vertex_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->vertex_args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32))
+    return sm50_compilation_argument32_oom(&first_arg, params->bitcode, params->error, &params->ret);
 
   params->ret = SM50CompileGeometryPipelineVertex(
       params->vertex, params->geometry, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -2231,7 +2593,8 @@ thunk32_SM50CompileGeometryPipelineGeometry(void *args) {
   struct sm50_compile_geometry_pipeline_geometry_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->geometry_args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32))
+    return sm50_compilation_argument32_oom(&first_arg, params->bitcode, params->error, &params->ret);
 
   params->ret = SM50CompileGeometryPipelineGeometry(
       params->vertex, params->geometry, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -2249,6 +2612,14 @@ thunk32_SM50GetArgumentsInfo(void *args) {
 
   SM50GetArgumentsInfo(params->shader, UInt32ToPtr(params->constant_buffers), UInt32ToPtr(params->arguments));
 
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_SM50NeedsRasterOrderedBufferMarker(void *args) {
+  struct sm50_needs_raster_ordered_buffer_marker_params32 *params = args;
+  params->ret = SM50NeedsRasterOrderedBufferMarker(
+      params->shader, UInt32ToPtr(params->root_signature), params->root_signature_length);
   return STATUS_SUCCESS;
 }
 
@@ -2590,6 +2961,10 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
   struct WMTHDRMetadata *hdr_metadata_out = params->hdr_metadata.ptr;
 
   params->version = 0;
+  params->colorspace = WMTColorSpaceSRGB;
+  *hdr_metadata_out = (struct WMTHDRMetadata){};
+  params->edr_value.maximum_edr_color_component_value = 1.0;
+  params->edr_value.maximum_potential_edr_color_component_value = 1.0;
   if (![layer.delegate isKindOfClass:NSView.class])
     return STATUS_SUCCESS;
 
@@ -3613,6 +3988,398 @@ _MTLDevice_sampleTimestamps(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* Callback blocks own their observer even if a drawable outlives the swapchain.
+ * The Wine worker blocks in wait(); no callback invokes PE code. */
+@interface OwnedPresentationObserver : NSObject {
+@public
+  NSCondition *condition;
+  BOOL closing;
+  BOOL failed;
+  uint64_t *active_ids;
+  size_t active_count;
+  size_t active_capacity;
+  struct WMTPresentationEvent *events;
+  size_t event_head;
+  size_t event_count;
+  size_t event_capacity;
+  CVDisplayLinkRef display_link;
+  uint32_t display_id;
+  uint64_t refresh_sequence;
+  uint64_t refresh_generation;
+  uint64_t output_host_ticks;
+  uint64_t host_frequency;
+  int64_t previous_video_time;
+  int64_t video_refresh_period;
+  int32_t video_time_scale;
+  double rate_scalar;
+  uint64_t cv_flags;
+  BOOL has_video_anchor;
+}
+@end
+
+@implementation OwnedPresentationObserver
+- (id)init {
+  if ((self = [super init])) {
+    condition = [[NSCondition alloc] init];
+    active_capacity = 16;
+    event_capacity = 16;
+    active_ids = malloc(active_capacity * sizeof(*active_ids));
+    events = malloc(event_capacity * sizeof(*events));
+    if (!condition || !active_ids || !events) {
+      [self release];
+      return nil;
+    }
+  }
+  return self;
+}
+- (void)dealloc {
+  [condition release];
+  free(active_ids);
+  free(events);
+  [super dealloc];
+}
+@end
+
+static CVReturn
+presentation_refresh_callback(CVDisplayLinkRef link, const CVTimeStamp *now,
+                              const CVTimeStamp *output, CVOptionFlags in_flags,
+                              CVOptionFlags *out_flags, void *context) {
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)context;
+  [owner->condition lock];
+  if (!owner->closing && owner->display_link == link) {
+    const uint64_t required = kCVTimeStampVideoTimeValid | kCVTimeStampHostTimeValid |
+        kCVTimeStampVideoRefreshPeriodValid | kCVTimeStampRateScalarValid;
+    const BOOL valid = (output->flags & required) == required && output->hostTime &&
+        output->videoRefreshPeriod > 0 && output->videoTimeScale > 0 &&
+        output->rateScalar > 0;
+    if (valid) {
+      if (owner->has_video_anchor) {
+        const int64_t elapsed = output->videoTime - owner->previous_video_time;
+        if (owner->video_refresh_period == output->videoRefreshPeriod &&
+            owner->video_time_scale == output->videoTimeScale && elapsed > 0 &&
+            elapsed % output->videoRefreshPeriod == 0) {
+          owner->refresh_sequence += (uint64_t)(elapsed / output->videoRefreshPeriod);
+          if (elapsed > output->videoRefreshPeriod)
+            ++owner->refresh_generation;
+        } else {
+          ++owner->refresh_generation;
+          ++owner->refresh_sequence;
+        }
+      } else {
+        ++owner->refresh_sequence;
+      }
+      owner->previous_video_time = output->videoTime;
+      owner->output_host_ticks = output->hostTime;
+      owner->video_refresh_period = output->videoRefreshPeriod;
+      owner->video_time_scale = output->videoTimeScale;
+      owner->rate_scalar = output->rateScalar;
+      owner->has_video_anchor = YES;
+    } else {
+      if (owner->has_video_anchor)
+        ++owner->refresh_generation;
+      owner->has_video_anchor = NO;
+    }
+    owner->cv_flags = output->flags;
+  }
+  [owner->condition unlock];
+  return kCVReturnSuccess;
+}
+
+static NTSTATUS
+_WMTPresentationObserver_create(void *obj) {
+  struct unixcall_generic_obj_ret *params = obj;
+  params->ret = (obj_handle_t)[[OwnedPresentationObserver alloc] init];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MetalDrawable_observePresentation(void *obj) {
+  struct unixcall_wmt_presentation_observe *params = obj;
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)params->observer;
+  id<MTLDrawable> drawable = (id<MTLDrawable>)params->drawable;
+  params->ret = 0;
+  if (!owner || !drawable || !params->present_id ||
+      ![drawable respondsToSelector:@selector(addPresentedHandler:)])
+    return STATUS_SUCCESS;
+
+  [owner->condition lock];
+  if (!owner->closing && !owner->failed) {
+    size_t i = 0;
+    while (i < owner->active_count && owner->active_ids[i] != params->present_id)
+      ++i;
+    if (i == owner->active_count) {
+      if (owner->active_count == owner->active_capacity) {
+        const size_t capacity = owner->active_capacity * 2;
+        void *expanded = realloc(owner->active_ids, capacity * sizeof(*owner->active_ids));
+        if (expanded) {
+          owner->active_ids = expanded;
+          owner->active_capacity = capacity;
+        } else {
+          owner->failed = YES;
+          [owner->condition broadcast];
+        }
+      }
+      if (!owner->failed) {
+        owner->active_ids[owner->active_count++] = params->present_id;
+        params->ret = 1;
+      }
+    }
+  }
+  [owner->condition unlock];
+  if (!params->ret)
+    return STATUS_SUCCESS;
+
+  const uint64_t present_id = params->present_id;
+  [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+    [owner->condition lock];
+    size_t i = 0;
+    while (i < owner->active_count && owner->active_ids[i] != present_id)
+      ++i;
+    if (i < owner->active_count) {
+      owner->active_ids[i] = owner->active_ids[--owner->active_count];
+      if (!owner->closing && !owner->failed) {
+        if (owner->event_count == owner->event_capacity) {
+          const size_t capacity = owner->event_capacity * 2;
+          struct WMTPresentationEvent *expanded = malloc(capacity * sizeof(*expanded));
+          if (expanded) {
+            for (size_t n = 0; n < owner->event_count; ++n)
+              expanded[n] = owner->events[(owner->event_head + n) % owner->event_capacity];
+            free(owner->events);
+            owner->events = expanded;
+            owner->event_capacity = capacity;
+            owner->event_head = 0;
+          } else {
+            owner->failed = YES;
+          }
+        }
+        if (!owner->failed) {
+          const double time = presented.presentedTime;
+          owner->events[(owner->event_head + owner->event_count++) % owner->event_capacity] =
+              (struct WMTPresentationEvent){present_id, presented.drawableID, time,
+                                            owner->refresh_sequence, owner->refresh_generation,
+                                            time > 0 ? WMTPresentationPresented : WMTPresentationSkipped, 0,
+                                            owner->has_video_anchor ? owner->output_host_ticks : 0,
+                                            owner->has_video_anchor ? owner->previous_video_time : 0};
+        }
+        [owner->condition signal];
+      }
+    }
+    [owner->condition unlock];
+  }];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTPresentationObserver_wait(void *obj) {
+  struct unixcall_wmt_presentation_wait *params = obj;
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)params->observer;
+  params->ret = 0;
+  if (!owner)
+    return STATUS_SUCCESS;
+  [owner->condition lock];
+  for (;;) {
+    if (owner->closing || owner->failed) {
+      params->ret = owner->failed ? -1 : 0;
+      break;
+    }
+    if (owner->event_count) {
+      struct WMTPresentationEvent event = owner->events[owner->event_head];
+      owner->event_head = (owner->event_head + 1) % owner->event_capacity;
+      --owner->event_count;
+      if (event.present_id) {
+        params->event = event;
+        params->ret = 1;
+        break;
+      }
+      continue;
+    }
+    [owner->condition wait];
+  }
+  [owner->condition unlock];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTPresentationObserver_cancel(void *obj) {
+  struct unixcall_wmt_presentation_cancel *params = obj;
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)params->observer;
+  if (!owner)
+    return STATUS_SUCCESS;
+  [owner->condition lock];
+  for (size_t i = 0; i < owner->active_count; ++i)
+    if (owner->active_ids[i] == params->present_id) {
+      owner->active_ids[i] = owner->active_ids[--owner->active_count];
+      break;
+    }
+  for (size_t i = 0; i < owner->event_count; ++i) {
+    struct WMTPresentationEvent *event = &owner->events[(owner->event_head + i) % owner->event_capacity];
+    if (event->present_id == params->present_id)
+      event->present_id = 0;
+  }
+  [owner->condition unlock];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_presentDrawableIfCurrent(void *obj) {
+  struct unixcall_mtlcommandbuffer_present_if_current *params = obj;
+  id<MTLDrawable> drawable = (id<MTLDrawable>)params->drawable;
+  id<MTLSharedEvent> token = (id<MTLSharedEvent>)params->token;
+  OwnedPresentationObserver *observer = (OwnedPresentationObserver *)params->observer;
+  const uint64_t epoch = params->epoch;
+  const double after = params->after;
+  const uint64_t present_id = params->present_id;
+  // Diagnostic record of the native decision: whether this drawable was ever handed to Core
+  // Animation. present_id is the swapchain's DXGI present count.
+  static int trace_decision = -1;
+  if (trace_decision < 0) {
+    const char *trace = getenv("OWNED_GRAPHICS_TRACE");
+    trace_decision = trace && trace[0] == '1' && !trace[1];
+  }
+  const int trace = trace_decision;
+  // Hand the drawable to Core Animation only once the GPU finished rendering it, and only if no
+  // DXGI_PRESENT_RESTART advanced the token meanwhile. A discarded drawable is released
+  // unpresented with the block, and its presentation observation is withdrawn so it can never
+  // report a presented time. Block_copy retains the captured drawable, token, and observer (MRC).
+  [(id<MTLCommandBuffer>)params->cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> cmdbuf) {
+    const char *reason = "current";
+    if (token.signaledValue != epoch) {
+      if (observer && present_id) {
+        struct unixcall_wmt_presentation_cancel cancel = {(obj_handle_t)observer, present_id};
+        _WMTPresentationObserver_cancel(&cancel);
+      }
+      reason = "epoch";
+    } else if (cmdbuf.status != MTLCommandBufferStatusCompleted) {
+      reason = "status";
+    } else if (after > 0) {
+      [drawable presentAfterMinimumDuration:after];
+    } else {
+      [drawable present];
+    }
+    if (trace)
+      fprintf(stderr, "OWNED_GRAPHICS_NATIVE_PRESENT_DECISION present_id=%llu presented=%d reason=%s\n",
+              (unsigned long long)present_id, reason[0] == 'c', reason);
+  }];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTPresentationObserver_close(void *obj) {
+  struct unixcall_generic_obj_noret *params = obj;
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)params->handle;
+  if (owner) {
+    [owner->condition lock];
+    owner->closing = YES;
+    owner->active_count = 0;
+    CVDisplayLinkRef link = owner->display_link;
+    owner->display_link = NULL;
+    [owner->condition broadcast];
+    [owner->condition unlock];
+    if (link) {
+      CVDisplayLinkStop(link);
+      CVDisplayLinkRelease(link);
+      [owner release]; // The link's callback-context reference.
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTPresentationObserver_setView(void *obj) {
+  struct unixcall_wmt_observer_view *params = obj;
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)params->observer;
+  NSView *view = (NSView *)params->view;
+  params->ret = 0;
+  if (!owner || !view)
+    return STATUS_SUCCESS;
+
+  __block CGDirectDisplayID display_id = kCGNullDirectDisplay;
+  execute_on_main(^{
+    if ([view isKindOfClass:NSView.class]) {
+      NSScreen *screen = view.window.screen;
+      display_id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
+    }
+  });
+  if (display_id == kCGNullDirectDisplay)
+    return STATUS_SUCCESS;
+  [owner->condition lock];
+  BOOL same_display = !owner->closing && owner->display_link && owner->display_id == display_id;
+  [owner->condition unlock];
+  if (same_display) {
+    params->ret = 1;
+    return STATUS_SUCCESS;
+  }
+
+  CVDisplayLinkRef new_link = NULL;
+  if (CVDisplayLinkCreateWithCGDisplay(display_id, &new_link) != kCVReturnSuccess || !new_link)
+    return STATUS_SUCCESS;
+  [owner retain]; // Keep the callback context alive until Stop returns.
+  CVReturn status = CVDisplayLinkSetOutputCallback(new_link, presentation_refresh_callback, owner);
+  if (status == kCVReturnSuccess)
+    status = CVDisplayLinkStart(new_link);
+  if (status != kCVReturnSuccess) {
+    CVDisplayLinkRelease(new_link);
+    [owner release];
+    return STATUS_SUCCESS;
+  }
+
+  [owner->condition lock];
+  if (owner->closing) {
+    [owner->condition unlock];
+    CVDisplayLinkStop(new_link);
+    CVDisplayLinkRelease(new_link);
+    [owner release];
+    return STATUS_SUCCESS;
+  }
+  CVDisplayLinkRef old_link = owner->display_link;
+  owner->display_link = new_link;
+  owner->display_id = display_id;
+  owner->refresh_sequence = 0;
+  ++owner->refresh_generation;
+  owner->output_host_ticks = 0;
+  owner->host_frequency = CVGetHostClockFrequency();
+  owner->previous_video_time = 0;
+  owner->video_refresh_period = 0;
+  owner->video_time_scale = 0;
+  owner->rate_scalar = 0;
+  owner->cv_flags = 0;
+  owner->has_video_anchor = NO;
+  [owner->condition unlock];
+  if (old_link) {
+    CVDisplayLinkStop(old_link);
+    CVDisplayLinkRelease(old_link);
+    [owner release];
+  }
+  params->ret = 1;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTPresentationObserver_getRefreshSample(void *obj) {
+  struct unixcall_wmt_refresh_sample *params = obj;
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)params->observer;
+  params->ret = 0;
+  if (!owner)
+    return STATUS_SUCCESS;
+  [owner->condition lock];
+  if (!owner->closing && owner->has_video_anchor) {
+    params->sample = (struct WMTDisplayRefreshSample){owner->refresh_sequence, owner->refresh_generation,
+        owner->output_host_ticks, owner->host_frequency, owner->previous_video_time,
+        owner->video_refresh_period, owner->rate_scalar, owner->cv_flags,
+        owner->display_id, owner->video_time_scale};
+    params->ret = 1;
+  }
+  [owner->condition unlock];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTClockSampleHostSeconds(void *obj) {
+  struct unixcall_wmt_clock_sample *params = obj;
+  params->host_seconds = CACurrentMediaTime();
+  return STATUS_SUCCESS;
+}
+
 static NTSTATUS
 _MTLComputeCommandEncoder_setVisibleFunctionTable(void *obj) {
   struct unixcall_mtlcomputeencoder_functiontable *params = obj;
@@ -3681,6 +4448,547 @@ _MTLDevice_maxBufferLength(void *obj) {
   params->ret = [(id<MTLDevice>)params->handle maxBufferLength];
   return STATUS_SUCCESS;
 }
+
+static NTSTATUS
+_MTLDevice_supportsPlacementSparse(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->handle;
+  params->ret = 0;
+  if (@available(macOS 26.4, *))
+    params->ret = [device supportsPlacementSparse] ? 1 : 0;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newPlacementHeap(void *obj) {
+  struct unixcall_mtldevice_newplacementheap *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  const struct WMTHeapInfo *info = params->info.ptr;
+  params->ret = 0;
+  if (@available(macOS 26.0, *)) {
+    MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
+    desc.resourceOptions = (MTLResourceOptions)info->options;
+    desc.type = MTLHeapTypePlacement;
+    desc.size = info->size;
+    desc.maxCompatiblePlacementSparsePageSize = (MTLSparsePageSize)params->max_sparse_page_size;
+    params->ret = (obj_handle_t)[device newHeapWithDescriptor:desc];
+    [desc release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newPlacementSparseBuffer(void *obj) {
+  struct unixcall_mtldevice_newplacementsparseresource *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  struct WMTBufferInfo *info = params->info.ptr;
+  params->ret = 0;
+  info->memory.ptr = NULL;
+  info->gpu_address = 0;
+  if (@available(macOS 26.0, *)) {
+    /* Placement sparse buffers only exist in private storage. */
+    MTLResourceOptions options = ((MTLResourceOptions)info->options & ~MTLResourceStorageModeMask) |
+                                 MTLResourceStorageModePrivate;
+    if (info->length > [device maxBufferLength])
+      return STATUS_SUCCESS;
+    id<MTLBuffer> buffer = [device newBufferWithLength:info->length
+                                               options:options
+                               placementSparsePageSize:(MTLSparsePageSize)params->page_size];
+    params->ret = (obj_handle_t)buffer;
+    if (buffer)
+      info->gpu_address = [buffer gpuAddress];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newPlacementSparseTexture(void *obj) {
+  struct unixcall_mtldevice_newplacementsparseresource *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  struct WMTTextureInfo *info = params->info.ptr;
+  params->ret = 0;
+  info->gpu_resource_id = 0;
+  info->mach_port = 0;
+  if (@available(macOS 26.0, *)) {
+    MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+    fill_texture_descriptor(desc, info);
+    desc.storageMode = MTLStorageModePrivate;
+    desc.placementSparsePageSize = (MTLSparsePageSize)params->page_size;
+    id<MTLTexture> ret = [device newTextureWithDescriptor:desc];
+    params->ret = (obj_handle_t)ret;
+    if (ret)
+      info->gpu_resource_id = [ret gpuResourceID]._impl;
+    [desc release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLBuffer_newPlacementSparseTextureView(void *obj) {
+  struct unixcall_mtlbuffer_newplacementsparsetextureview *params = obj;
+  id<MTLBuffer> buffer = (id<MTLBuffer>)params->buffer;
+  struct WMTTextureInfo *info = params->info.ptr;
+  params->ret = 0;
+  info->gpu_resource_id = 0;
+  info->mach_port = 0;
+  if (@available(macOS 26.0, *)) {
+    MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+    fill_texture_descriptor(desc, info);
+    desc.storageMode = MTLStorageModePrivate;
+    desc.placementSparsePageSize = (MTLSparsePageSize)params->page_size;
+    id<MTLTexture> ret = [buffer newTextureWithDescriptor:desc offset:params->offset bytesPerRow:params->bytes_per_row];
+    params->ret = (obj_handle_t)ret;
+    if (ret)
+      info->gpu_resource_id = [ret gpuResourceID]._impl;
+    [desc release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_sparseTileSize(void *obj) {
+  struct unixcall_mtldevice_sparsetilesize *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  MTLSize size = [device sparseTileSizeWithTextureType:(MTLTextureType)params->type
+                                           pixelFormat:to_metal_pixel_format(params->format)
+                                           sampleCount:params->sample_count
+                                        sparsePageSize:(MTLSparsePageSize)params->page_size];
+  params->ret.width = size.width;
+  params->ret.height = size.height;
+  params->ret.depth = size.depth;
+  params->ret.reserved = 0;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLTexture_sparseTail(void *obj) {
+  struct unixcall_mtltexture_sparsetail *params = obj;
+  id<MTLTexture> texture = (id<MTLTexture>)params->texture;
+  params->ret.first_mipmap_in_tail = [texture firstMipmapInTail];
+  params->ret.tail_size_in_bytes = [texture tailSizeInBytes];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newMTL4CommandQueue(void *obj) {
+  struct unixcall_generic_obj_obj_ret *params = obj;
+  params->ret = 0;
+  if (@available(macOS 26.0, *))
+    params->ret = (obj_handle_t)[(id<MTLDevice>)params->handle newMTL4CommandQueue];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandQueue_addResidencySet(void *obj) {
+  struct unixcall_generic_obj_obj_noret *params = obj;
+  if (@available(macOS 26.0, *))
+    [(id<MTL4CommandQueue>)params->handle addResidencySet:(id<MTLResidencySet>)params->arg];
+  return STATUS_SUCCESS;
+}
+
+#define WMT_SPARSE_MAPPING_BATCH 64
+
+static NTSTATUS
+_MTL4CommandQueue_updateBufferMappings(void *obj) {
+  struct unixcall_mtl4commandqueue_updatemappings *params = obj;
+  if (@available(macOS 26.0, *)) {
+    id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)params->queue;
+    const struct WMTSparseBufferMapping *mappings = params->mappings.ptr;
+    MTL4UpdateSparseBufferMappingOperation operations[WMT_SPARSE_MAPPING_BATCH];
+    for (uint64_t done = 0; done < params->count;) {
+      NSUInteger count = 0;
+      for (; count < WMT_SPARSE_MAPPING_BATCH && done + count < params->count; count++) {
+        const struct WMTSparseBufferMapping *mapping = &mappings[done + count];
+        operations[count].mode = (MTLSparseTextureMappingMode)mapping->mode;
+        operations[count].bufferRange = NSMakeRange(mapping->first_tile, mapping->tile_count);
+        operations[count].heapOffset = mapping->heap_offset;
+      }
+      [queue updateBufferMappings:(id<MTLBuffer>)params->resource
+                             heap:(id<MTLHeap>)params->heap
+                       operations:operations
+                            count:count];
+      done += count;
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandQueue_updateTextureMappings(void *obj) {
+  struct unixcall_mtl4commandqueue_updatemappings *params = obj;
+  if (@available(macOS 26.0, *)) {
+    id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)params->queue;
+    const struct WMTSparseTextureMapping *mappings = params->mappings.ptr;
+    MTL4UpdateSparseTextureMappingOperation operations[WMT_SPARSE_MAPPING_BATCH];
+    for (uint64_t done = 0; done < params->count;) {
+      NSUInteger count = 0;
+      for (; count < WMT_SPARSE_MAPPING_BATCH && done + count < params->count; count++) {
+        const struct WMTSparseTextureMapping *mapping = &mappings[done + count];
+        operations[count].mode = (MTLSparseTextureMappingMode)mapping->mode;
+        operations[count].textureRegion = MTLRegionMake3D(
+            mapping->origin.x, mapping->origin.y, mapping->origin.z, mapping->size.width, mapping->size.height,
+            mapping->size.depth
+        );
+        operations[count].textureLevel = mapping->level;
+        operations[count].textureSlice = mapping->slice;
+        operations[count].heapOffset = mapping->heap_offset;
+      }
+      [queue updateTextureMappings:(id<MTLTexture>)params->resource
+                              heap:(id<MTLHeap>)params->heap
+                        operations:operations
+                             count:count];
+      done += count;
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTL4CommandQueue_signalEvent(void *obj) {
+  struct unixcall_mtl4commandqueue_signalevent *params = obj;
+  if (@available(macOS 26.0, *))
+    [(id<MTL4CommandQueue>)params->queue signalEvent:(id<MTLEvent>)params->event value:params->value];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newSamplerStateWithReduction(void *obj) {
+  struct unixcall_mtldevice_newsamplerstatewithreduction *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  struct WMTSamplerInfo *info = params->info.ptr;
+  params->ret = 0;
+  info->gpu_resource_id = 0;
+  if (@available(macOS 26.0, *)) {
+    MTLSamplerDescriptor *sampler_desc = [[MTLSamplerDescriptor alloc] init];
+    sampler_desc.borderColor = (MTLSamplerBorderColor)info->border_color;
+    sampler_desc.rAddressMode = (MTLSamplerAddressMode)info->r_address_mode;
+    sampler_desc.sAddressMode = (MTLSamplerAddressMode)info->s_address_mode;
+    sampler_desc.tAddressMode = (MTLSamplerAddressMode)info->t_address_mode;
+    sampler_desc.magFilter = (MTLSamplerMinMagFilter)info->mag_filter;
+    sampler_desc.minFilter = (MTLSamplerMinMagFilter)info->min_filter;
+    sampler_desc.mipFilter = (MTLSamplerMipFilter)info->mip_filter;
+    sampler_desc.compareFunction = (MTLCompareFunction)info->compare_function;
+    sampler_desc.lodMaxClamp = info->lod_max_clamp;
+    sampler_desc.lodMinClamp = info->lod_min_clamp;
+    sampler_desc.maxAnisotropy = info->max_anisotroy;
+    sampler_desc.lodAverage = info->lod_average;
+    sampler_desc.normalizedCoordinates = info->normalized_coords;
+    sampler_desc.supportArgumentBuffers = info->support_argument_buffers;
+    sampler_desc.reductionMode = (MTLSamplerReductionMode)params->reduction;
+    id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sampler_desc];
+    info->gpu_resource_id = sampler && info->support_argument_buffers ? [sampler gpuResourceID]._impl : 0;
+    params->ret = (obj_handle_t)sampler;
+    [sampler_desc release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTUnimplemented(void *obj) {
+  return STATUS_NOT_IMPLEMENTED;
+}
+
+/*
+ * D3D12 shared-handle rendezvous (232..237).
+ *
+ * A Metal object port (IOSurface texture port or MTLSharedEvent port) cannot be
+ * registered with bootstrap directly, because bootstrap_register2(name, NULL)
+ * does not remove a registration: only the death of the registered receive
+ * right does. Each process that holds a shared object therefore owns one
+ * receive right R registered as dxmt.share.<pid>.<128-bit random>. A lookup
+ * sends a request to R; the dispatch source replies with a copied send right of
+ * the object port. Destroying the rendezvous destroys R, which unregisters the
+ * name immediately.
+ */
+struct share_rendezvous {
+  dispatch_source_t source;
+  mach_port_t recv;
+  mach_port_t object;
+};
+
+struct share_reply_msg {
+  mach_msg_header_t header;
+  mach_msg_body_t body;
+  mach_msg_port_descriptor_t port;
+};
+
+struct share_request_msg {
+  mach_msg_header_t header;
+  mach_msg_trailer_t trailer;
+};
+
+static NTSTATUS
+_WMTShareRendezvousCreate(void *obj) {
+  struct unixcall_share_rendezvous *params = obj;
+  params->handle = 0;
+  params->name[0] = '\0';
+  if (!MACH_PORT_VALID(params->port))
+    return STATUS_UNSUCCESSFUL;
+  struct share_rendezvous *rv = calloc(1, sizeof(*rv));
+  if (!rv)
+    return STATUS_UNSUCCESSFUL;
+  if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rv->recv) != KERN_SUCCESS) {
+    free(rv);
+    return STATUS_UNSUCCESSFUL;
+  }
+  if (mach_port_insert_right(mach_task_self(), rv->recv, rv->recv, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS ||
+      mach_port_mod_refs(mach_task_self(), params->port, MACH_PORT_RIGHT_SEND, 1) != KERN_SUCCESS) {
+    mach_port_mod_refs(mach_task_self(), rv->recv, MACH_PORT_RIGHT_RECEIVE, -1);
+    free(rv);
+    return STATUS_UNSUCCESSFUL;
+  }
+  rv->object = params->port;
+
+  uint8_t random[16];
+  arc4random_buf(random, sizeof(random));
+  int len = snprintf(params->name, sizeof(params->name), "dxmt.share.%d.", (int)getpid());
+  for (unsigned i = 0; i < sizeof(random); ++i)
+    len += snprintf(params->name + len, sizeof(params->name) - len, "%02x", random[i]);
+
+  mach_port_t bp;
+  kern_return_t kr = task_get_bootstrap_port(mach_task_self(), &bp);
+  if (kr == KERN_SUCCESS) {
+    kr = bootstrap_register2(bp, params->name, rv->recv, 0);
+    mach_port_deallocate(mach_task_self(), bp);
+  }
+  if (kr != KERN_SUCCESS) {
+    mach_port_mod_refs(mach_task_self(), rv->recv, MACH_PORT_RIGHT_RECEIVE, -1);
+    mach_port_deallocate(mach_task_self(), rv->recv);
+    mach_port_deallocate(mach_task_self(), rv->object);
+    free(rv);
+    params->name[0] = '\0';
+    return STATUS_UNSUCCESSFUL;
+  }
+
+  rv->source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MACH_RECV, rv->recv, 0,
+                                      dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+  dispatch_source_set_event_handler(rv->source, ^{
+    struct {
+      struct share_request_msg msg;
+      uint8_t slack[256];
+    } request;
+    memset(&request, 0, sizeof(request));
+    if (mach_msg(&request.msg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(request), rv->recv, 0,
+                 MACH_PORT_NULL) != MACH_MSG_SUCCESS)
+      return;
+    mach_port_t reply_to = request.msg.header.msgh_remote_port;
+    if (!MACH_PORT_VALID(reply_to)) {
+      mach_msg_destroy(&request.msg.header);
+      return;
+    }
+    struct share_reply_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.header.msgh_bits =
+        MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(request.msg.header.msgh_bits), 0) | MACH_MSGH_BITS_COMPLEX;
+    reply.header.msgh_size = sizeof(reply);
+    reply.header.msgh_remote_port = reply_to;
+    reply.header.msgh_id = request.msg.header.msgh_id + 100;
+    reply.body.msgh_descriptor_count = 1;
+    reply.port.name = rv->object;
+    reply.port.disposition = MACH_MSG_TYPE_COPY_SEND;
+    reply.port.type = MACH_MSG_PORT_DESCRIPTOR;
+    if (mach_msg(&reply.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(reply), 0, MACH_PORT_NULL, 1000,
+                 MACH_PORT_NULL) != MACH_MSG_SUCCESS)
+      mach_port_deallocate(mach_task_self(), reply_to);
+  });
+  dispatch_source_set_cancel_handler(rv->source, ^{
+    mach_port_mod_refs(mach_task_self(), rv->recv, MACH_PORT_RIGHT_RECEIVE, -1);
+    mach_port_deallocate(mach_task_self(), rv->recv);
+    mach_port_deallocate(mach_task_self(), rv->object);
+    dispatch_release(rv->source);
+    free(rv);
+  });
+  dispatch_resume(rv->source);
+  params->handle = (uint64_t)(uintptr_t)rv;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTShareRendezvousDestroy(void *obj) {
+  struct unixcall_share_rendezvous *params = obj;
+  struct share_rendezvous *rv = (struct share_rendezvous *)(uintptr_t)params->handle;
+  if (rv)
+    dispatch_source_cancel(rv->source);
+  params->handle = 0;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTShareRendezvousLookUp(void *obj) {
+  struct unixcall_share_rendezvous *params = obj;
+  params->port = 0;
+  params->handle = 0;
+  params->name[sizeof(params->name) - 1] = '\0';
+  if (strncmp(params->name, "dxmt.share.", 11))
+    return STATUS_UNSUCCESSFUL;
+
+  mach_port_t bp, service = MACH_PORT_NULL, reply_port = MACH_PORT_NULL;
+  if (task_get_bootstrap_port(mach_task_self(), &bp) != KERN_SUCCESS)
+    return STATUS_UNSUCCESSFUL;
+  kern_return_t kr = bootstrap_look_up(bp, params->name, &service);
+  mach_port_deallocate(mach_task_self(), bp);
+  if (kr != KERN_SUCCESS)
+    return STATUS_UNSUCCESSFUL;
+  if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply_port) != KERN_SUCCESS) {
+    mach_port_deallocate(mach_task_self(), service);
+    return STATUS_UNSUCCESSFUL;
+  }
+
+  mach_msg_header_t request;
+  memset(&request, 0, sizeof(request));
+  request.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
+  request.msgh_size = sizeof(request);
+  request.msgh_remote_port = service;
+  request.msgh_local_port = reply_port;
+  request.msgh_id = 0x44584d54; /* 'DXMT' */
+  kr = mach_msg(&request, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(request), 0, MACH_PORT_NULL, 2000,
+                MACH_PORT_NULL);
+  mach_port_deallocate(mach_task_self(), service);
+
+  NTSTATUS status = STATUS_UNSUCCESSFUL;
+  if (kr == MACH_MSG_SUCCESS) {
+    struct {
+      struct share_reply_msg msg;
+      mach_msg_trailer_t trailer;
+      uint8_t slack[64];
+    } reply;
+    memset(&reply, 0, sizeof(reply));
+    kr = mach_msg(&reply.msg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(reply), reply_port, 2000,
+                  MACH_PORT_NULL);
+    if (kr == MACH_MSG_SUCCESS) {
+      if ((reply.msg.header.msgh_bits & MACH_MSGH_BITS_COMPLEX) && reply.msg.body.msgh_descriptor_count == 1 &&
+          reply.msg.port.type == MACH_MSG_PORT_DESCRIPTOR && MACH_PORT_VALID(reply.msg.port.name) &&
+          reply.msg.header.msgh_id == request.msgh_id + 100) {
+        params->port = reply.msg.port.name;
+        status = STATUS_SUCCESS;
+      } else {
+        mach_msg_destroy(&reply.msg.header);
+      }
+    }
+  }
+  mach_port_mod_refs(mach_task_self(), reply_port, MACH_PORT_RIGHT_RECEIVE, -1);
+  return status;
+}
+
+@interface MTLSharedTextureHandle ()
+- (IOSurfaceRef)ioSurface;
+@end
+
+@interface NSObject (DXMTShareIdentity)
+- (uint64_t)globalTraceObjectID;
+- (id)baseObject;
+@end
+
+static NTSTATUS
+_WMTShareObjectIdentity(void *obj) {
+  struct unixcall_share_identity *params = obj;
+  params->ret = 0;
+  if (!params->object)
+    return STATUS_UNSUCCESSFUL;
+  if (params->kind == 0) {
+    NSObject *event = (NSObject *)params->object;
+    // Metal API validation wraps the event; the trace id lives on the base object.
+    for (int depth = 0; depth < 4 && ![event respondsToSelector:@selector(globalTraceObjectID)] &&
+                        [event respondsToSelector:@selector(baseObject)];
+         ++depth)
+      event = [(id)event baseObject];
+    if (![event conformsToProtocol:@protocol(MTLSharedEvent)] ||
+        ![event respondsToSelector:@selector(globalTraceObjectID)])
+      return STATUS_UNSUCCESSFUL;
+    params->ret = [event globalTraceObjectID];
+  } else if (params->kind == 1) {
+    id<MTLTexture> texture = (id<MTLTexture>)params->object;
+    if (![texture isShareable])
+      return STATUS_UNSUCCESSFUL;
+    MTLSharedTextureHandle *handle = [texture newSharedTextureHandle];
+    if (!handle)
+      return STATUS_UNSUCCESSFUL;
+    if ([handle respondsToSelector:@selector(ioSurface)]) {
+      IOSurfaceRef surface = [handle ioSurface];
+      if (surface)
+        params->ret = IOSurfaceGetID(surface);
+    }
+    [handle release];
+  } else {
+    return STATUS_UNSUCCESSFUL;
+  }
+  return params->ret ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+static NTSTATUS
+_WMTMachPortDeallocate(void *obj) {
+  struct unixcall_share_rendezvous *params = obj;
+  if (MACH_PORT_VALID(params->port))
+    mach_port_deallocate(mach_task_self(), params->port);
+  params->port = 0;
+  return STATUS_SUCCESS;
+}
+
+/*
+ * The per-user session salt lives in the private per-user temporary directory
+ * (confstr _CS_DARWIN_USER_TEMP_DIR, mode 0700), created 0600 and published
+ * atomically with link(2), so every process of this user derives the same
+ * bootstrap-free hash for a D3D object name and no other user can predict it.
+ */
+static bool
+share_session_salt(uint8_t salt[16]) {
+  char dir[PATH_MAX];
+  size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+  if (!n || n >= sizeof(dir) - 32)
+    return false;
+  strlcat(dir, "dxmt-share", sizeof(dir));
+  if (mkdir(dir, 0700) && errno != EEXIST)
+    return false;
+  struct stat st;
+  if (lstat(dir, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077))
+    return false;
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "%s/salt", dir);
+  int fd = open(path, O_RDONLY | O_NOFOLLOW);
+  if (fd < 0) {
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s/salt.XXXXXX", dir);
+    int tfd = mkstemp(tmp);
+    if (tfd < 0)
+      return false;
+    uint8_t fresh[16];
+    arc4random_buf(fresh, sizeof(fresh));
+    bool wrote = fchmod(tfd, 0600) == 0 && write(tfd, fresh, sizeof(fresh)) == sizeof(fresh) && fsync(tfd) == 0;
+    close(tfd);
+    if (wrote)
+      link(tmp, path); /* loses a race harmlessly: the winner's salt is read below */
+    unlink(tmp);
+    fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0)
+      return false;
+  }
+  bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid() && !(st.st_mode & 077) &&
+            st.st_size == 16 && read(fd, salt, 16) == 16;
+  close(fd);
+  return ok;
+}
+
+static NTSTATUS
+_WMTShareHashName(void *obj) {
+  struct unixcall_share_hashname *params = obj;
+  params->hash[0] = '\0';
+  if (!params->length || params->length > sizeof(params->name) / sizeof(params->name[0]))
+    return STATUS_UNSUCCESSFUL;
+  uint8_t salt[16];
+  if (!share_session_salt(salt))
+    return STATUS_UNSUCCESSFUL;
+  CC_SHA256_CTX ctx;
+  CC_SHA256_Init(&ctx);
+  CC_SHA256_Update(&ctx, "dxmt.d3d12.name\0", 16);
+  CC_SHA256_Update(&ctx, salt, sizeof(salt));
+  CC_SHA256_Update(&ctx, params->name, params->length * sizeof(params->name[0]));
+  uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256_Final(digest, &ctx);
+  for (unsigned i = 0; i < 16; ++i)
+    snprintf(params->hash + i * 2, 3, "%02x", digest[i]);
+  return STATUS_SUCCESS;
+}
+
 
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
@@ -3877,6 +5185,59 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_sampleTimestamps, /* 201: paired CPU/GPU clock calibration sample. */
     &_MTLAllocation_allocatedSize, /* 202: pageable allocation byte accounting. */
     &_MTLResidencySet_allocatedSize, /* 203: committed residency-set byte total. */
+    &_WMTPresentationObserver_create, /* 204 */
+    &_MetalDrawable_observePresentation, /* 205 */
+    &_WMTPresentationObserver_wait, /* 206 */
+    &_WMTPresentationObserver_cancel, /* 207 */
+    &_WMTPresentationObserver_close, /* 208 */
+    &_WMTClockSampleHostSeconds, /* 209 */
+    &_WMTPresentationObserver_setView, /* 210 */
+    &_WMTPresentationObserver_getRefreshSample, /* 211 */
+    &thunk_SM50NeedsRasterOrderedBufferMarker, /* 212 */
+    &_MTLDevice_programmableSamplePositionsSupported, /* 213 */
+    &_MTLCommandBuffer_presentDrawableIfCurrent, /* 214: restart-epoch-gated completion present. */
+    &thunk_SM50CopyCompiledBitcode, /* 215: copy compiled bitcode parts into caller memory. */
+    &_MTLDevice_supportsPlacementSparse, /* 216 */
+    &_MTLDevice_newPlacementHeap, /* 217 */
+    &_MTLDevice_newPlacementSparseBuffer, /* 218 */
+    &_MTLDevice_newPlacementSparseTexture, /* 219 */
+    &_MTLBuffer_newPlacementSparseTextureView, /* 220 */
+    &_MTLDevice_sparseTileSize, /* 221 */
+    &_MTLTexture_sparseTail, /* 222 */
+    &_MTLDevice_newMTL4CommandQueue, /* 223 */
+    &_MTL4CommandQueue_addResidencySet, /* 224 */
+    &_MTL4CommandQueue_updateBufferMappings, /* 225 */
+    &_MTL4CommandQueue_updateTextureMappings, /* 226 */
+    &_MTL4CommandQueue_signalEvent, /* 227 */
+    &_MTLDevice_newSamplerStateWithReduction, /* 228 */
+    &_WMTUnimplemented, /* 229: reserved (tiled) */
+    &_WMTUnimplemented, /* 230: reserved (tiled) */
+    &_WMTUnimplemented, /* 231: reserved (tiled) */
+    &_WMTShareRendezvousCreate, /* 232: D3D12 sharing */
+    &_WMTShareRendezvousDestroy, /* 233: D3D12 sharing */
+    &_WMTShareRendezvousLookUp, /* 234: D3D12 sharing */
+    &_WMTShareObjectIdentity, /* 235: D3D12 sharing */
+    &_WMTMachPortDeallocate, /* 236: D3D12 sharing */
+    &_WMTShareHashName, /* 237: D3D12 sharing */
+    &_WMTUnimplemented, /* 238: reserved (sharing) */
+    &_WMTUnimplemented, /* 239: reserved (sharing) */
+    &_WMTUnimplemented, /* 240: reserved (sharing) */
+    &_WMTUnimplemented, /* 241: reserved (sharing) */
+    &_WMTUnimplemented, /* 242: reserved (sharing) */
+    &_WMTUnimplemented, /* 243: reserved (sharing) */
+    &_WMTUnimplemented, /* 244: reserved (sharing) */
+    &_WMTUnimplemented, /* 245: reserved (sharing) */
+    &_WMTUnimplemented, /* 246: reserved (sharing) */
+    &_WMTUnimplemented, /* 247: reserved (sharing) */
+    &_WMTUnimplemented, /* 248: reserved (gsts) */
+    &_WMTUnimplemented, /* 249: reserved (gsts) */
+    &_WMTUnimplemented, /* 250: reserved (gsts) */
+    &_WMTUnimplemented, /* 251: reserved (gsts) */
+    &_WMTUnimplemented, /* 252: reserved (gsts) */
+    &_WMTUnimplemented, /* 253: reserved (gsts) */
+    &_WMTUnimplemented, /* 254: reserved (gsts) */
+    &_WMTUnimplemented, /* 255: reserved (gsts) */
+    &_MTLDevice_gpuCoreCount, /* 256: IOKit gpu-core-count of the device's accelerator (0 if unknown). */
 };
 
 #ifndef DXMT_NATIVE
@@ -3899,7 +5260,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_newSharedEvent,
     &_MTLSharedEvent_signaledValue,
     &_MTLCommandBuffer_encodeSignalEvent,
-    &_MTLDevice_newBuffer,
+    &_MTLDevice_newBuffer32, /* 18: CPU-visible storage the 32-bit caller can address. */
     &_MTLDevice_newSamplerState,
     &_MTLDevice_newDepthStencilState,
     &_MTLDevice_newTexture,
@@ -4075,5 +5436,59 @@ const void *__wine_unix_call_wow64_funcs[] = {
     NULL, /* 201: sampleTimestamps uses pointer outputs and has no WoW64 thunk. */
     &_MTLAllocation_allocatedSize,
     &_MTLResidencySet_allocatedSize,
+    &_WMTPresentationObserver_create,
+    &_MetalDrawable_observePresentation,
+    &_WMTPresentationObserver_wait,
+    &_WMTPresentationObserver_cancel,
+    &_WMTPresentationObserver_close,
+    &_WMTClockSampleHostSeconds,
+    &_WMTPresentationObserver_setView,
+    &_WMTPresentationObserver_getRefreshSample,
+    &thunk32_SM50NeedsRasterOrderedBufferMarker, /* 212 */
+    &_MTLDevice_programmableSamplePositionsSupported, /* 213 */
+    &_MTLCommandBuffer_presentDrawableIfCurrent, /* 214 */
+    &thunk_SM50CopyCompiledBitcode, /* 215: fixed-width params, shared with the 64-bit table. */
+    /* 216..231: fixed-width params (pointers travel as 64-bit WMTMemoryPointer). */
+    &_MTLDevice_supportsPlacementSparse, /* 216 */
+    &_MTLDevice_newPlacementHeap, /* 217 */
+    &_MTLDevice_newPlacementSparseBuffer, /* 218 */
+    &_MTLDevice_newPlacementSparseTexture, /* 219 */
+    &_MTLBuffer_newPlacementSparseTextureView, /* 220 */
+    &_MTLDevice_sparseTileSize, /* 221 */
+    &_MTLTexture_sparseTail, /* 222 */
+    &_MTLDevice_newMTL4CommandQueue, /* 223 */
+    &_MTL4CommandQueue_addResidencySet, /* 224 */
+    &_MTL4CommandQueue_updateBufferMappings, /* 225 */
+    &_MTL4CommandQueue_updateTextureMappings, /* 226 */
+    &_MTL4CommandQueue_signalEvent, /* 227 */
+    &_MTLDevice_newSamplerStateWithReduction, /* 228 */
+    &_WMTUnimplemented, /* 229: reserved (tiled) */
+    &_WMTUnimplemented, /* 230: reserved (tiled) */
+    &_WMTUnimplemented, /* 231: reserved (tiled) */
+    &_WMTShareRendezvousCreate, /* 232: D3D12 sharing */
+    &_WMTShareRendezvousDestroy, /* 233: D3D12 sharing */
+    &_WMTShareRendezvousLookUp, /* 234: D3D12 sharing */
+    &_WMTShareObjectIdentity, /* 235: D3D12 sharing */
+    &_WMTMachPortDeallocate, /* 236: D3D12 sharing */
+    &_WMTShareHashName, /* 237: D3D12 sharing */
+    &_WMTUnimplemented, /* 238: reserved (sharing) */
+    &_WMTUnimplemented, /* 239: reserved (sharing) */
+    &_WMTUnimplemented, /* 240: reserved (sharing) */
+    &_WMTUnimplemented, /* 241: reserved (sharing) */
+    &_WMTUnimplemented, /* 242: reserved (sharing) */
+    &_WMTUnimplemented, /* 243: reserved (sharing) */
+    &_WMTUnimplemented, /* 244: reserved (sharing) */
+    &_WMTUnimplemented, /* 245: reserved (sharing) */
+    &_WMTUnimplemented, /* 246: reserved (sharing) */
+    &_WMTUnimplemented, /* 247: reserved (sharing) */
+    &_WMTUnimplemented, /* 248: reserved (gsts) */
+    &_WMTUnimplemented, /* 249: reserved (gsts) */
+    &_WMTUnimplemented, /* 250: reserved (gsts) */
+    &_WMTUnimplemented, /* 251: reserved (gsts) */
+    &_WMTUnimplemented, /* 252: reserved (gsts) */
+    &_WMTUnimplemented, /* 253: reserved (gsts) */
+    &_WMTUnimplemented, /* 254: reserved (gsts) */
+    &_WMTUnimplemented, /* 255: reserved (gsts) */
+    &_MTLDevice_gpuCoreCount, /* 256: IOKit gpu-core-count of the device's accelerator (0 if unknown). */
 };
 #endif

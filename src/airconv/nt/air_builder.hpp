@@ -187,9 +187,10 @@ public:
     return CreateSampleGrad(Texture, Handle, Sampler, Coord, ArrayIndex, DerivX, DerivY, getFloat(0), Offset);
   }
 
+  /** `Reference` non-null: the depth compare form (`air.sample_compare_<depth>_grad`). */
   std::pair<Value *, Value *> CreateSampleGrad(
       const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
-      Value *DerivY, Value *MinLOD, const int32_t Offset[3]
+      Value *DerivY, Value *MinLOD, const int32_t Offset[3], Value *Reference = nullptr
   );
 
   Value *CreateAtomicRMW(

@@ -42,7 +42,8 @@ public:
   }
 
   void
-  begin(const std::array<float, 4> &color, Texture *texture, TextureViewKey view) {
+  begin(const std::array<float, 4> &color, Texture *texture, TextureViewKey view,
+        uint32_t first_w_slice = 0, uint32_t w_size = 0) {
 
     clearing_texture_ = texture;
     clearing_view_ = view;
@@ -59,7 +60,8 @@ public:
       break;
     case WMTTextureType3D:
       is_3d = true;
-      dispatch_depth_ = texture->depth(view);
+      first_w_slice_ = first_w_slice;
+      dispatch_depth_ = w_size ? w_size : texture->depth(view);
       break;
     case WMTTextureTypeCube:
     case WMTTextureTypeCubeArray:
@@ -78,7 +80,8 @@ public:
   }
 
   void
-  begin(const std::array<uint32_t, 4> &color, Texture *texture, TextureViewKey view) {
+  begin(const std::array<uint32_t, 4> &color, Texture *texture, TextureViewKey view,
+        uint32_t first_w_slice = 0, uint32_t w_size = 0) {
 
     clearing_texture_ = texture;
     clearing_view_ = view;
@@ -105,7 +108,8 @@ public:
       break;
     case WMTTextureType3D:
       is_3d = true;
-      dispatch_depth_ = texture->depth(view);
+      first_w_slice_ = first_w_slice;
+      dispatch_depth_ = w_size ? w_size : texture->depth(view);
       break;
     case WMTTextureTypeCube:
     case WMTTextureTypeCubeArray:
@@ -226,6 +230,10 @@ public:
 
     if (clearing_texture_) {
       ctx_.setComputeTexture(0, clearing_texture_, clearing_view_, ResourceAccess::Write);
+      if (clearing_texture_->textureType(clearing_view_) == WMTTextureType3D) {
+        void *first = ctx_.setComputeBytes(2, sizeof(first_w_slice_));
+        memcpy(first, &first_w_slice_, sizeof(first_w_slice_));
+      }
     } else if (clearing_buffer_) {
       if (clearing_view_) {
         auto &dst_ = clearing_buffer_->view_(clearing_view_);
@@ -261,6 +269,7 @@ public:
     clearing_buffer_ = nullptr;
     clearing_view_ = 0;
     dispatch_depth_ = 1;
+    first_w_slice_ = 0;
   };
 
 private:
@@ -381,6 +390,7 @@ private:
   Rc<Buffer> clearing_buffer_;
   uint64_t clearing_view_ = 0; // type compatible with BufferViewKey
   uint32_t dispatch_depth_ = 1;
+  uint32_t first_w_slice_ = 0;
 
   struct DXMTClearMetadata {
     union {

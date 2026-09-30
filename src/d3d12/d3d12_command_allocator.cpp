@@ -111,6 +111,9 @@ MTLD3D12CommandAllocatorImpl::QueryInterface(REFIID riid, void **ppvObject) {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D12CommandAllocatorImpl::Reset() {
+  std::lock_guard<dxmt::mutex> lock(submission_mutex_);
+  if (outstanding_submissions_)
+    return E_FAIL;
   if (encoder_last)
     return E_FAIL;
 
@@ -144,12 +147,22 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
         reinterpret_cast<ClearEncoderData *>(next)->~ClearEncoderData();
         break;
       case EncoderType::Render:
+        if (auto &uses = reinterpret_cast<RenderEncoderData *>(next)->swizzle_tables; uses)
+          for (const auto &use : *uses) {
+            use.rootsig->ReleasePrivate();
+            use.heap->ReleasePrivate();
+          }
         reinterpret_cast<RenderEncoderData *>(next)->~RenderEncoderData();
         break;
       case EncoderType::Blit:
         reinterpret_cast<BlitEncoderData *>(next)->~BlitEncoderData();
         break;
       case EncoderType::Compute:
+        if (auto &uses = reinterpret_cast<ComputeEncoderData *>(next)->swizzle_tables; uses)
+          for (const auto &use : *uses) {
+            use.rootsig->ReleasePrivate();
+            use.heap->ReleasePrivate();
+          }
         reinterpret_cast<ComputeEncoderData *>(next)->~ComputeEncoderData();
         break;
       case EncoderType::Resolve:
@@ -164,6 +177,13 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
       case EncoderType::Query:
         reinterpret_cast<QueryEncoderData *>(next)->~QueryEncoderData();
         break;
+      case EncoderType::StandardSwizzle: {
+        auto *record = reinterpret_cast<StandardSwizzleEncoderData *>(next);
+        if (record->resource)
+          record->resource->ReleasePrivate();
+        record->~StandardSwizzleEncoderData();
+        break;
+      }
       case EncoderType::Raytracing: {
         auto *record = reinterpret_cast<RTASEncoderData *>(next);
         /*
@@ -189,8 +209,10 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
 }
 
 IndirectComputeCommandData *
-MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12ComputePipelineState *pPSO, size_t MaxCount) {
-  auto indirect_pso = pPSO->GetIndirectCommandBufferPipelineState();
+MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
+    MTLD3D12CommandSignature *pCmdSig, MTLD3D12ComputePipelineState *pPSO, size_t MaxCount, bool statistics) {
+  auto indirect_pso = statistics ? pPSO->GetPipelineStatisticsPipelineState(true)
+                                 : pPSO->GetIndirectCommandBufferPipelineState();
   if (!indirect_pso)
     return nullptr;
   WMTIndirectCommandBufferInfo info;
@@ -226,12 +248,14 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignat
   data->tgsize_x = pPSO->threadgroup_size.width;
   data->tgsize_y = pPSO->threadgroup_size.height;
   data->tgsize_z = pPSO->threadgroup_size.depth;
-  data->immutable_constants = pPSO->compute_constants.gpu_address;
-  if (pPSO->compute_constants.buffer) {
+  const auto &constants = statistics ? pPSO->pipeline_statistics_compute_constants : pPSO->compute_constants;
+  data->immutable_constants = constants.gpu_address;
+  data->pipeline_statistics = 0;
+  if (constants.buffer) {
     auto &resource = EncodeComputeCommand<wmtcmd_compute_useresource>();
     resource.type = WMTComputeCommandUseResource;
     resource.usage = WMTResourceUsageRead;
-    resource.resource = pPSO->compute_constants.buffer;
+    resource.resource = constants.buffer;
   }
 
   {
@@ -281,7 +305,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignat
   cmd.length = MaxCount;
   auto &restore = EncodeComputeCommand<wmtcmd_compute_setpso>();
   restore.type = WMTComputeCommandSetPSO;
-  restore.pso = pPSO->pso;
+  restore.pso = statistics ? pPSO->GetPipelineStatisticsPipelineState(false) : pPSO->pso;
   restore.threadgroup_size = pPSO->threadgroup_size;
 
   icb_.push_back(std::move(icb));
@@ -291,13 +315,14 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(MTLD3D12CommandSignat
 
 IndirectRenderCommandData *
 MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
-    MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount
+    MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount, bool index_pull
 ) {
-  auto indirect_pso = pPSO->GetIndirectCommandBufferPipelineState();
+  auto indirect_pso = index_pull ? pPSO->GetIndexPullPipelineState(true)
+                                 : pPSO->GetIndirectCommandBufferPipelineState();
   if (!indirect_pso)
     return nullptr;
   WMTIndirectCommandBufferInfo info;
-  info.inherit_buffers = !(pCmdSig->UpdateVertexBuffers || pCmdSig->UpdateIndexBuffer || pCmdSig->UpdateRootArguments);
+  info.inherit_buffers = !(index_pull || pCmdSig->UpdateVertexBuffers || pCmdSig->UpdateIndexBuffer || pCmdSig->UpdateRootArguments);
   info.inherit_pso = 1;
   info.inherit_cull_mode = 1;
   info.inherit_fill_mode = 1;
@@ -308,7 +333,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   info.support_color_attachment_mapping = 0;
   info.support_dynamic_attribute_stride = 0;
   info.support_ray_tracing = 0;
-  info.type = pCmdSig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ? WMTIndirectCommandTypeDrawIndexed
+  info.type = index_pull ? WMTIndirectCommandTypeDraw | WMTIndirectCommandTypeDrawIndexed
+              : pCmdSig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ? WMTIndirectCommandTypeDrawIndexed
                                                                                 : WMTIndirectCommandTypeDraw;
   info.max_vertex_buffer_binding = 31;
   info.max_fragment_buffer_binding = 31;
@@ -327,10 +353,10 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
 
   data->cmd_buf = info.gpu_resource_id;
   data->max_count = MaxCount;
-  data->vertex_constants = pPSO->vertex_constants.gpu_address;
+  data->vertex_constants = index_pull ? pPSO->index_pull_vertex_constants.gpu_address : pPSO->vertex_constants.gpu_address;
   data->fragment_constants = pPSO->fragment_constants.gpu_address;
   for (auto [constants, stage] : {
-         std::pair{&pPSO->vertex_constants, WMTRenderStageVertex},
+         std::pair{index_pull ? &pPSO->index_pull_vertex_constants : &pPSO->vertex_constants, WMTRenderStageVertex},
          std::pair{&pPSO->fragment_constants, WMTRenderStageFragment}}) {
     if (!constants->buffer)
       continue;
@@ -353,6 +379,10 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     data->primitive_type = 0;
     data->index_buffer = 0;
     data->index_buffer_format = {};
+    data->index_pull_controls = 0;
+    data->index_pull_mode = ~0u;
+    data->so_draws = 0;
+    data->pipeline_statistics = 0;
   }
 
   {

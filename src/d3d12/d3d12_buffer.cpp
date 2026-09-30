@@ -21,6 +21,7 @@
 #include "d3d12_resource_contract.hpp"
 #include "com/com_pointer.hpp"
 #include "dxmt_format.hpp"
+#include <cstring>
 #include <new>
 
 namespace dxmt {
@@ -53,6 +54,7 @@ class MTLD3D12Buffer : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
   D3D12_HEAP_PROPERTIES heap_props_;
   D3D12_HEAP_FLAGS heap_flags_;
+  Com<MTLD3D12Heap> placed_heap_;
   bool owns_registration_ = false;
 
 public:
@@ -66,7 +68,6 @@ public:
     if (OptimizedClearValue)
       return E_INVALIDARG;
 
-    // TODO: validate and normalize
     desc_ = *pDesc;
     heap_props_ = *pHeapProps;
     heap_flags_ = HeapFlags;
@@ -94,22 +95,104 @@ public:
     }
 
     Flags<BufferAllocationFlag> flags;
-    if (pHeap)
-      buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
-    else
-      buffer->rename(buffer->allocate(flags));
-    if (!buffer->current())
+    // GPU upload heaps: CPU writes go through write-combined, uncached pages (the GPU reads them in place).
+    if (heap_props_.Type == kHeapTypeGpuUpload)
+      flags.set(BufferAllocationFlag::CpuWriteCombined);
+    if (pHeap && pHeap->external_memory) {
+      // Shared or host-memory heap: alias its memory at the placement offset.
+      buffer->rename(buffer->allocate(flags, pHeap->external_memory + Offset));
+    } else if (!pHeap && (HeapFlags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER))) {
+      heap_flags_ |= D3D12_HEAP_FLAG_SHARED;
+      if (!share) {
+        HRESULT hr = sharing::Create(sharing::Kind::Buffer, desc_.Width, share);
+        if (FAILED(hr))
+          return hr;
+        share->header().heap_props = heap_props_;
+        share->header().heap_flags = heap_flags_;
+        share->header().resource_desc = desc_;
+      }
+      buffer->rename(buffer->allocate(flags, share->payload()));
+    } else {
+#ifdef __i386__
+      /* Map() hands the CPU mapping to a 32-bit caller; back CPU-visible buffers with caller-addressable
+       * storage: private memory for committed ones, the heap's host storage for placed ones. */
+      if (!pHeap && IsCpuVisibleHeap(&heap_props_))
+        flags.set(BufferAllocationFlag::CpuPlaced);
+      if (pHeap && pHeap->host_memory)
+        buffer->rename(buffer->allocate(flags, pHeap->host_memory + Offset));
+      else
+#endif
+      if (pHeap)
+        buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
+      else
+        buffer->rename(buffer->allocate(flags));
+    }
+    if (!buffer->current() || !buffer->current()->buffer())
       return E_OUTOFMEMORY;
     owns_registration_ = !pHeap;
-    return device_->RegisterResidencyAndVA(
+    HRESULT hr = device_->RegisterResidencyAndVA(
         buffer->current(), owns_registration_ ? this : nullptr,
         pHeap || !(HeapFlags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT)
     );
+    if (SUCCEEDED(hr) && pHeap)
+      placed_heap_ = pHeap;
+    return hr;
   };
 
   ~MTLD3D12Buffer() {
     if (buffer && buffer->current())
       device_->UnregisterResidencyAndVA(buffer->current(), owns_registration_ ? this : nullptr);
+    if (reserved && reserved->status_buffer)
+      device_->UnregisterResidency(reserved->status_buffer);
+  }
+
+  /*
+   * A reserved buffer: a Metal placement sparse buffer whose 64KB pages start unmapped. Its GPU virtual
+   * address is permanent, so root descriptors and views work before any tile is mapped. A CPU-visible
+   * byte per tile mirrors the mapping state in queue order for shader residency status.
+   */
+  HRESULT
+  InitializeReserved(const D3D12_RESOURCE_DESC *pDesc) {
+    desc_ = *pDesc;
+    heap_props_ = {};
+    heap_flags_ = D3D12_HEAP_FLAG_NONE;
+    if (desc_.Alignment && desc_.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+      return E_INVALIDARG;
+    desc_.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    HRESULT hr = ReservedResource::CreateBufferTiling(desc_, reserved);
+    if (FAILED(hr))
+      return hr;
+    auto metal = device_->GetMTLDevice();
+    const uint64_t length = uint64_t(reserved->totalTiles()) * kReservedTileBytes;
+    if (length > metal.maxBufferLength())
+      return E_OUTOFMEMORY;
+
+    WMTBufferInfo status_info{};
+    status_info.length = std::max<uint64_t>(reserved->totalTiles(), 16);
+    status_info.options = WMTResourceHazardTrackingModeUntracked | WMT_RESOURCE_CPU_ADDRESSABLE;
+    reserved->status_buffer = metal.newBuffer(status_info);
+    reserved->status_bytes = static_cast<uint8_t *>(status_info.memory.get_accessible_or_null());
+    if (!reserved->status_buffer || !reserved->status_bytes)
+      return E_OUTOFMEMORY;
+    memset(reserved->status_bytes, 0, status_info.length);
+    hr = device_->RegisterResidency(reserved->status_buffer);
+    if (FAILED(hr)) {
+      reserved->status_buffer = {};
+      return hr;
+    }
+
+    try {
+      buffer = new Buffer(length, metal);
+    } catch (const std::bad_alloc &) {
+      return E_OUTOFMEMORY;
+    }
+    buffer->rename(buffer->allocateSparse(WMTSparsePageSize64));
+    if (!buffer->current() || !buffer->current()->buffer())
+      return E_OUTOFMEMORY;
+    buffer->current()->residencyStatusBase =
+        status_info.gpu_address - (buffer->current()->gpuAddress() >> 16);
+    owns_registration_ = true;
+    return device_->RegisterResidencyAndVA(buffer->current(), this, true);
   }
 
   HRESULT
@@ -135,6 +218,11 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   Map(UINT Subresource, const D3D12_RANGE *pReadRange, void **ppData) {
+    if (device_->RemovedReason() != S_OK) {
+      if (ppData)
+        *ppData = nullptr;
+      return DXGI_ERROR_DEVICE_REMOVED;
+    }
     if (Subresource)
       return E_INVALIDARG;
     if (!IsCpuVisibleHeap(&heap_props_))
@@ -175,6 +263,8 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   GetHeapProperties(D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS *pFlags) {
+    if (reserved)
+      return E_INVALIDARG; // a reserved resource has no heap
     if (pHeapProps)
       *pHeapProps = heap_props_;
     if (pFlags)
@@ -229,6 +319,22 @@ public:
       return E_FAIL;
     }
     if (!Format.BytesPerTexel)
+      return E_INVALIDARG;
+    if (resource_contract::GetEmulatedTextureStorage(ViewDesc.Format) ==
+        resource_contract::EmulatedTextureStorage::RGB32 &&
+        !(Format.Flag & MTL_DXGI_FORMAT_TYPELESS)) {
+      hr = BuildBufferSlice(desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements,
+                            12, true, Slice);
+      if (FAILED(hr))
+        return hr;
+      return Heap->AddRGB32ShaderResourceView(Index, buffer.ptr(), Slice, ViewDesc.Shader4ComponentMapping);
+    }
+    const auto read_capability = device_->GetMTLPixelFormatCapability(Format.PixelFormat);
+    if ((Format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_BC |
+                        MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER)) ||
+        MTLGetTexelSize(Format.PixelFormat) != Format.BytesPerTexel ||
+        !any_bit_set(read_capability &
+                     (FormatCapability::TextureBufferRead | FormatCapability::TextureBufferReadWrite)))
       return E_INVALIDARG;
     BufferViewDescriptor view_descriptor{Format.PixelFormat};
     hr = BuildBufferSlice(
@@ -312,6 +418,14 @@ public:
     }
     if (!Format.BytesPerTexel)
       return E_INVALIDARG;
+    const auto write_capability = device_->GetMTLPixelFormatCapability(Format.PixelFormat);
+    if ((Format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_BC |
+                        MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER)) ||
+        MTLGetTexelSize(Format.PixelFormat) != Format.BytesPerTexel ||
+        Is_sRGBVariant(Format.PixelFormat) ||
+        !any_bit_set(write_capability &
+                     (FormatCapability::TextureBufferWrite | FormatCapability::TextureBufferReadWrite)))
+      return E_INVALIDARG;
     BufferViewDescriptor view_descriptor{Format.PixelFormat};
     view_descriptor.writable = true;
     hr = BuildBufferSlice(
@@ -383,10 +497,23 @@ public:
   };
 
   virtual void STDMETHODCALLTYPE GetResourceTiling(
-      UINT *TotalTileCount, D3D12_PACKED_MIP_INFO *PackedMipInfo, D3D12_TILE_SHAPE *StandardTitleShape,
+      UINT *TotalTileCount, D3D12_PACKED_MIP_INFO *PackedMipInfo, D3D12_TILE_SHAPE *StandardTileShape,
       UINT *SubresourceTilingCount, UINT FirstSubresourceTiling, D3D12_SUBRESOURCE_TILING *SubresourceTilings
   ) {
-    IMPLEMENT_ME
+    if (reserved) {
+      reserved->GetResourceTiling(TotalTileCount, PackedMipInfo, StandardTileShape, SubresourceTilingCount,
+                                  FirstSubresourceTiling, SubresourceTilings);
+      return;
+    }
+    /* A committed or placed buffer is not tiled. */
+    if (TotalTileCount)
+      *TotalTileCount = 0;
+    if (PackedMipInfo)
+      *PackedMipInfo = {};
+    if (StandardTileShape)
+      *StandardTileShape = {};
+    if (SubresourceTilingCount)
+      *SubresourceTilingCount = 0;
   };
 };
 
@@ -403,6 +530,49 @@ CreateCommittedBuffer(
   HRESULT hr = buffer->Initialize(pHeapProps, HeapFlags, pDesc, OptimizedClearValue, nullptr, 0);
   if (FAILED(hr))
     return hr;
+  buffer->owned_initial_state = InitialState;
+  if (!ppResource)
+    return S_FALSE;
+  return buffer->QueryInterface(riid, ppResource);
+}
+
+HRESULT
+OpenSharedBuffer(MTLD3D12Device *pDevice, std::shared_ptr<sharing::SharedObject> share, REFIID riid, void **ppResource) {
+  InitReturnPtr(ppResource);
+  if (share->kind() != sharing::Kind::Buffer)
+    return E_INVALIDARG;
+  const auto props = share->header().heap_props;
+  const auto flags = share->header().heap_flags;
+  const auto desc = share->header().resource_desc;
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || desc.Width > share->payloadSize())
+    return E_INVALIDARG;
+  auto *impl = new (std::nothrow) MTLD3D12Buffer(pDevice);
+  if (!impl)
+    return E_OUTOFMEMORY;
+  auto buffer = Com(impl);
+  buffer->share = std::move(share);
+  HRESULT hr = buffer->Initialize(&props, flags, &desc, nullptr, nullptr, 0);
+  if (FAILED(hr))
+    return hr;
+  buffer->owned_initial_state = D3D12_RESOURCE_STATE_COMMON;
+  return buffer->QueryInterface(riid, ppResource);
+}
+
+HRESULT
+CreateReservedBuffer(
+    MTLD3D12Device *pDevice, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState,
+    const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
+) {
+  if (OptimizedClearValue)
+    return E_INVALIDARG;
+  auto *impl = new (std::nothrow) MTLD3D12Buffer(pDevice);
+  if (!impl)
+    return E_OUTOFMEMORY;
+  auto buffer = Com(impl);
+  HRESULT hr = buffer->InitializeReserved(pDesc);
+  if (FAILED(hr))
+    return hr;
+  buffer->owned_initial_state = InitialState;
   if (!ppResource)
     return S_FALSE;
   return buffer->QueryInterface(riid, ppResource);
@@ -425,6 +595,7 @@ CreatePlacedBuffer(
   HRESULT hr = buffer->Initialize(&heap_desc.Properties, heap_desc.Flags, pDesc, OptimizedClearValue, pHeap, Offset);
   if (FAILED(hr))
     return hr;
+  buffer->owned_initial_state = InitialState;
   if (!ppResource)
     return S_FALSE;
   return buffer->QueryInterface(riid, ppResource);

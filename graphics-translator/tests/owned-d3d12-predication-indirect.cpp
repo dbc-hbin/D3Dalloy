@@ -2,10 +2,12 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -93,6 +95,10 @@ struct TestContext {
 
   void submit(ID3D12GraphicsCommandList *list) {
     check(list->Close(), "close-list");
+    submitClosed(list);
+  }
+
+  void submitClosed(ID3D12GraphicsCommandList *list) {
     ID3D12CommandList *lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
     const UINT64 value = ++fenceValue;
@@ -765,6 +771,138 @@ void RunTypedFloatUavClearTest(TestContext &context) {
 }
 
 
+void RunBufferUavRectangleTests(TestContext &context) {
+  constexpr UINT wordCount = 512;
+  constexpr UINT viewElements = 37;
+  constexpr UINT bufferBytes = wordCount * sizeof(UINT);
+  struct ViewCase {
+    DXGI_FORMAT format;
+    UINT components;
+    bool raw;
+    bool floating;
+  };
+  const ViewCase views[] = {
+      {DXGI_FORMAT_R32_TYPELESS, 1, true, false},
+      {DXGI_FORMAT_R32_UINT, 1, false, false},
+      {DXGI_FORMAT_R32_FLOAT, 1, false, true},
+      {DXGI_FORMAT_R32G32B32A32_UINT, 4, false, false},
+      {DXGI_FORMAT_R32G32B32A32_FLOAT, 4, false, true},
+  };
+  const UINT uintValues[] = {0xffffffff, 0x80000001, 0x01000001, 0x7fffffff};
+  const float floatValues[] = {1.25f, -2.5f, 3.75f, -4.5f};
+  // Disjoint visible ranges [0, 5), [12, 17), [35, 37); all other rectangles are empty after clipping.
+  const D3D12_RECT rects[] = {
+      {-3, -2, 5, 2}, {12, 0, 17, 1}, {35, 0, LONG_MAX, 1},
+      {LONG_MIN, 0, -1, 1}, {39, 0, LONG_MAX, 1}, {7, 0, 3, 1},
+      {5, 1, 12, 2}, {5, -2, 12, 0}, {5, 0, 5, 1},
+  };
+  std::array<UINT, wordCount> initial;
+  for (UINT i = 0; i < wordCount; ++i)
+    initial[i] = 0x12340000u + i;
+  auto upload = createBuffer(context.device.Get(), bufferBytes + 16, D3D12_HEAP_TYPE_UPLOAD,
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
+  void *mapped = nullptr;
+  check(upload->Map(0, nullptr, &mapped), "buffer-uav-upload-map");
+  std::memcpy(mapped, initial.data(), bufferBytes);
+  const UINT64 predicates[] = {0, 1};
+  std::memcpy(static_cast<uint8_t *>(mapped) + bufferBytes, predicates, sizeof(predicates));
+  upload->Unmap(0, nullptr);
+  auto predicate = createBuffer(context.device.Get(), sizeof(predicates), D3D12_HEAP_TYPE_DEFAULT,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+  auto readback = createBuffer(context.device.Get(), bufferBytes, D3D12_HEAP_TYPE_READBACK,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> list;
+  check(context.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+        "buffer-uav-allocator");
+  check(context.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                          IID_PPV_ARGS(&list)), "buffer-uav-list");
+  list->CopyBufferRegion(predicate.Get(), 0, upload.Get(), bufferBytes, sizeof(predicates));
+  auto predicateBarrier = transition(predicate.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                      D3D12_RESOURCE_STATE_PREDICATION);
+  list->ResourceBarrier(1, &predicateBarrier);
+  context.submit(list.Get());
+
+  D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+  heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  heapDesc.NumDescriptors = 1;
+  heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> gpuHeap;
+  check(context.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&gpuHeap)), "buffer-uav-gpu-heap");
+  heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+  ComPtr<ID3D12DescriptorHeap> cpuHeap;
+  check(context.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&cpuHeap)), "buffer-uav-cpu-heap");
+  const auto cpu = cpuHeap->GetCPUDescriptorHandleForHeapStart();
+  const auto gpuCpu = gpuHeap->GetCPUDescriptorHandleForHeapStart();
+  const auto gpu = gpuHeap->GetGPUDescriptorHandleForHeapStart();
+  UINT cases = 0;
+  for (const auto &view : views) {
+    for (UINT first : {8u, 72u}) {
+      for (UINT predication = 0; predication < 3; ++predication) {
+        for (bool rectangular : {false, true}) {
+          auto buffer = createBuffer(context.device.Get(), bufferBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                      D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+          D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+          desc.Format = view.format;
+          desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+          desc.Buffer.FirstElement = first;
+          desc.Buffer.NumElements = viewElements;
+          desc.Buffer.Flags = view.raw ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE;
+          context.device->CreateUnorderedAccessView(buffer.Get(), nullptr, &desc, cpu);
+          context.device->CreateUnorderedAccessView(buffer.Get(), nullptr, &desc, gpuCpu);
+          check(allocator->Reset(), "buffer-uav-reset-allocator");
+          check(list->Reset(allocator.Get(), nullptr), "buffer-uav-reset-list");
+          list->CopyBufferRegion(buffer.Get(), 0, upload.Get(), 0, bufferBytes);
+          auto toUav = transition(buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          list->ResourceBarrier(1, &toUav);
+          ID3D12DescriptorHeap *heaps[] = {gpuHeap.Get()};
+          list->SetDescriptorHeaps(1, heaps);
+          // EQUAL_ZERO skips zero and executes nonzero. Test both, independently of the direct path.
+          if (predication)
+            list->SetPredication(predicate.Get(), predication == 1 ? 8 : 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+          const UINT rectCount = rectangular ? static_cast<UINT>(std::size(rects)) : 0;
+          if (view.floating)
+            list->ClearUnorderedAccessViewFloat(gpu, cpu, buffer.Get(), floatValues, rectCount,
+                                                rectangular ? rects : nullptr);
+          else
+            list->ClearUnorderedAccessViewUint(gpu, cpu, buffer.Get(), uintValues, rectCount,
+                                               rectangular ? rects : nullptr);
+          list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+          auto toCopy = transition(buffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+          list->ResourceBarrier(1, &toCopy);
+          list->CopyBufferRegion(readback.Get(), 0, buffer.Get(), 0, bufferBytes);
+          context.submit(list.Get());
+          UINT *actual = nullptr;
+          check(readback->Map(0, nullptr, reinterpret_cast<void **>(&actual)), "buffer-uav-readback-map");
+          for (UINT i = 0; i < wordCount; ++i) {
+            UINT expected = initial[i];
+            const UINT element = i / view.components;
+            if (predication != 2 && element >= first && element < first + viewElements) {
+              const UINT x = element - first;
+              if (!rectangular || x < 5 || (x >= 12 && x < 17) || x >= 35) {
+                const UINT component = i % view.components;
+                expected = view.floating ? std::bit_cast<UINT>(floatValues[component]) : uintValues[component];
+              }
+            }
+            if (actual[i] != expected) {
+              std::fprintf(stderr, "buffer-uav-mismatch format=%u float=%u first=%u predicate=%u rect=%u "
+                                   "word=%u expected=%08x actual=%08x\n",
+                           UINT(view.format), view.floating, first, predication, rectangular, i, expected, actual[i]);
+              fail("buffer-uav-view-relative-rect");
+            }
+          }
+          readback->Unmap(0, nullptr);
+          ++cases;
+        }
+      }
+    }
+  }
+  std::printf("OWNED_D3D12_PREDICATION_INDIRECT_BUFFER_UAV_PASS cases=%u view_relative=1 "
+              "clipping=1 sentinels=1 predicate_preservation=1\n", cases);
+}
+
 void writeUpload(ID3D12Resource *resource, const void *data, size_t size) {
   void *mapped = nullptr;
   check(resource->Map(0, nullptr, &mapped), "map-upload");
@@ -1029,6 +1167,274 @@ void RunIndirectTests(TestContext &context, const std::vector<uint8_t> &computeS
 
 }
 
+void RunMSAAIndexedIndirectMutations(TestContext &context) {
+  static constexpr char source[] = R"(
+    RWStructuredBuffer<uint> counts : register(u1);
+    cbuffer Tint : register(b0) { uint value; };
+    struct VOut { float4 position : SV_Position; nointerpolation float tint : COLOR0; };
+    VOut vs(float4 position : POSITION) {
+      uint old; InterlockedAdd(counts[0], 1, old);
+      VOut result; result.position = position; result.tint = value * .25; return result;
+    }
+    float4 ps(VOut input) : SV_Target0 {
+      uint old; InterlockedAdd(counts[1], 1, old);
+      return float4(input.tint, 0, 0, 1);
+    }
+  )";
+  ComPtr<ID3DBlob> vs, ps, errors;
+  HRESULT shaderResult = D3DCompile(source, sizeof(source)-1, nullptr, nullptr, nullptr, "vs", "vs_5_0",
+                                    D3DCOMPILE_ENABLE_STRICTNESS, 0, &vs, &errors);
+  if (FAILED(shaderResult) && errors)
+    std::fprintf(stderr, "%.*s\n", static_cast<int>(errors->GetBufferSize()),
+                 static_cast<const char *>(errors->GetBufferPointer()));
+  check(shaderResult, "msaa-indirect-vs");
+  errors.Reset();
+  shaderResult = D3DCompile(source, sizeof(source)-1, nullptr, nullptr, nullptr, "ps", "ps_5_0",
+                            D3DCOMPILE_ENABLE_STRICTNESS, 0, &ps, &errors);
+  if (FAILED(shaderResult) && errors)
+    std::fprintf(stderr, "%.*s\n", static_cast<int>(errors->GetBufferSize()),
+                 static_cast<const char *>(errors->GetBufferPointer()));
+  check(shaderResult, "msaa-indirect-ps");
+  D3D12_ROOT_PARAMETER roots[2] = {};
+  roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  roots[0].Descriptor.ShaderRegister = 1;
+  roots[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  roots[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  roots[1].Constants.ShaderRegister = 0;
+  roots[1].Constants.Num32BitValues = 1;
+  roots[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+  D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+  rootDesc.NumParameters = 2;
+  rootDesc.pParameters = roots;
+  ComPtr<ID3DBlob> serialized;
+  check(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors),
+        "msaa-indirect-root-serialize");
+  ComPtr<ID3D12RootSignature> root;
+  check(context.device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                            IID_PPV_ARGS(&root)), "msaa-indirect-root");
+  D3D12_INDIRECT_ARGUMENT_DESC args[5] = {};
+  args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+  args[0].Constant.RootParameterIndex = 1;
+  args[0].Constant.Num32BitValuesToSet = 1;
+  args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW;
+  args[1].UnorderedAccessView.RootParameterIndex = 0;
+  args[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+  args[2].VertexBuffer.Slot = 3;
+  args[3].Type = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
+  args[4].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+  constexpr UINT stride = 4 + 8 + sizeof(D3D12_VERTEX_BUFFER_VIEW) +
+                          sizeof(D3D12_INDEX_BUFFER_VIEW) + sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+  D3D12_COMMAND_SIGNATURE_DESC signatureDesc = {};
+  signatureDesc.ByteStride = stride;
+  signatureDesc.NumArgumentDescs = 5;
+  signatureDesc.pArgumentDescs = args;
+  ComPtr<ID3D12CommandSignature> signature;
+  check(context.device->CreateCommandSignature(&signatureDesc, root.Get(), IID_PPV_ARGS(&signature)),
+        "msaa-indirect-signature");
+  D3D12_INPUT_ELEMENT_DESC input = {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 3, 0,
+                                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+  pso.pRootSignature = root.Get();
+  pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+  pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+  pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pso.SampleMask = UINT_MAX;
+  pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pso.RasterizerState.DepthClipEnable = TRUE;
+  pso.DepthStencilState.DepthEnable = FALSE;
+  pso.InputLayout = {&input, 1};
+  pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pso.NumRenderTargets = 1;
+  pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  pso.SampleDesc.Count = 4;
+  ComPtr<ID3D12PipelineState> pipeline;
+  check(context.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&pipeline)),
+        "msaa-indirect-pipeline");
+  // Multisampled textures cannot be copied to a readback buffer directly.
+  // Load every sample on the GPU, preserving the per-sample color evidence.
+  static constexpr char readSource[] = R"(
+    Texture2DMS<float4> color : register(t0);
+    RWStructuredBuffer<uint4> pixels : register(u0);
+    [numthreads(4,2,1)] void main(uint3 id : SV_DispatchThreadID) {
+      for (uint sample = 0; sample < 4; ++sample)
+        pixels[sample*8 + id.y*4 + id.x] = uint4(round(color.Load(int2(id.xy),sample)*255));
+    }
+  )";
+  ComPtr<ID3DBlob> cs;
+  errors.Reset();
+  check(D3DCompile(readSource,sizeof(readSource)-1,nullptr,nullptr,nullptr,"main","cs_5_0",
+                   D3DCOMPILE_ENABLE_STRICTNESS,0,&cs,&errors),"msaa-indirect-reader-compile");
+  D3D12_DESCRIPTOR_RANGE range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  range.NumDescriptors = 1;
+  D3D12_ROOT_PARAMETER readRoots[2] = {};
+  readRoots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  readRoots[0].DescriptorTable.NumDescriptorRanges = 1;
+  readRoots[0].DescriptorTable.pDescriptorRanges = &range;
+  readRoots[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  readRoots[1].Descriptor.ShaderRegister = 0;
+  D3D12_ROOT_SIGNATURE_DESC readRootDesc = {};
+  readRootDesc.NumParameters = 2;
+  readRootDesc.pParameters = readRoots;
+  ComPtr<ID3DBlob> readSerialized;
+  check(D3D12SerializeRootSignature(&readRootDesc,D3D_ROOT_SIGNATURE_VERSION_1,&readSerialized,&errors),
+        "msaa-indirect-reader-root-serialize");
+  ComPtr<ID3D12RootSignature> readRoot;
+  check(context.device->CreateRootSignature(0,readSerialized->GetBufferPointer(),
+        readSerialized->GetBufferSize(),IID_PPV_ARGS(&readRoot)),"msaa-indirect-reader-root");
+  D3D12_COMPUTE_PIPELINE_STATE_DESC readPso = {};
+  readPso.pRootSignature = readRoot.Get();
+  readPso.CS = {cs->GetBufferPointer(),cs->GetBufferSize()};
+  ComPtr<ID3D12PipelineState> readPipeline;
+  check(context.device->CreateComputePipelineState(&readPso,IID_PPV_ARGS(&readPipeline)),
+        "msaa-indirect-reader-pipeline");
+  D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
+  srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  srvHeapDesc.NumDescriptors = 1;
+  srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> srvHeap;
+  check(context.device->CreateDescriptorHeap(&srvHeapDesc,IID_PPV_ARGS(&srvHeap)),
+        "msaa-indirect-srv-heap");
+  using Vertex = std::array<float,4>;
+  // Both index buffers are valid. The opposite VB/IB combination selects an
+  // offscreen triangle, so forwarding a stale view cannot masquerade as pass.
+  const std::array<Vertex, 6> left = {{{{-1, -1, .5f, 1}}, {{-1, 3, .5f, 1}}, {{3, -1, .5f, 1}},
+                                       {{3, -1, .5f, 1}}, {{3, 3, .5f, 1}}, {{4, -1, .5f, 1}}}};
+  const std::array<Vertex, 6> right = {{{{3, -1, .5f, 1}}, {{3, 3, .5f, 1}}, {{4, -1, .5f, 1}},
+                                        {{-1, -1, .5f, 1}}, {{-1, 3, .5f, 1}}, {{3, -1, .5f, 1}}}};
+  const uint16_t indicesA[] = {0, 1, 2};
+  const uint16_t indicesB[] = {3, 4, 5};
+  auto vbA = createBuffer(context.device.Get(),sizeof(left),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto vbB = createBuffer(context.device.Get(),sizeof(right),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto ibA = createBuffer(context.device.Get(),sizeof(indicesA),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto ibB = createBuffer(context.device.Get(),sizeof(indicesB),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+  writeUpload(vbA.Get(),left.data(),sizeof(left)); writeUpload(vbB.Get(),right.data(),sizeof(right));
+  writeUpload(ibA.Get(),indicesA,sizeof(indicesA)); writeUpload(ibB.Get(),indicesB,sizeof(indicesB));
+  const D3D12_VERTEX_BUFFER_VIEW viewA = {vbA->GetGPUVirtualAddress(),sizeof(left),sizeof(Vertex)};
+  const D3D12_VERTEX_BUFFER_VIEW viewB = {vbB->GetGPUVirtualAddress(),sizeof(right),sizeof(Vertex)};
+  const D3D12_INDEX_BUFFER_VIEW indexA = {ibA->GetGPUVirtualAddress(),sizeof(indicesA),DXGI_FORMAT_R16_UINT};
+  const D3D12_INDEX_BUFFER_VIEW indexB = {ibB->GetGPUVirtualAddress(),sizeof(indicesB),DXGI_FORMAT_R16_UINT};
+  D3D12_RESOURCE_DESC texture = {};
+  texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture.Width = 4; texture.Height = 2; texture.DepthOrArraySize = 1; texture.MipLevels = 1;
+  texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture.SampleDesc.Count = 4;
+  texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+  heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heapDesc.NumDescriptors = 1;
+  ComPtr<ID3D12DescriptorHeap> heap;
+  check(context.device->CreateDescriptorHeap(&heapDesc,IID_PPV_ARGS(&heap)),"msaa-indirect-rtv-heap");
+  for (uint32_t requested = 1; requested <= 2; ++requested) {
+    ComPtr<ID3D12Resource> color;
+    auto properties = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    check(context.device->CreateCommittedResource(&properties,D3D12_HEAP_FLAG_NONE,&texture,
+          D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(&color)),"msaa-indirect-color");
+    auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    context.device->CreateRenderTargetView(color.Get(),nullptr,rtv);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = texture.Format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    context.device->CreateShaderResourceView(color.Get(),&srv,srvHeap->GetCPUDescriptorHandleForHeapStart());
+    auto image = createBuffer(context.device.Get(),32*16,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto imageUav = createBuffer(context.device.Get(),32*16,D3D12_HEAP_TYPE_DEFAULT,
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto countReadback = createBuffer(context.device.Get(),16,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto first = createBuffer(context.device.Get(),8,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto second = createBuffer(context.device.Get(),8,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,
+                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto zero = createBuffer(context.device.Get(),8,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    const uint64_t zeros = 0; writeUpload(zero.Get(),&zeros,8);
+    auto arguments = createBuffer(context.device.Get(),stride*2,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto count = createBuffer(context.device.Get(),4,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    std::array<uint8_t,stride*2> records = {};
+    auto pack = [&](UINT n,uint32_t tint,D3D12_GPU_VIRTUAL_ADDRESS uav,
+                    const D3D12_VERTEX_BUFFER_VIEW &vb,const D3D12_INDEX_BUFFER_VIEW &ib) {
+      uint8_t *p = records.data()+n*stride;
+      const D3D12_DRAW_INDEXED_ARGUMENTS draw = {3,1,0,0,0};
+      std::memcpy(p,&tint,4); p+=4;
+      std::memcpy(p,&uav,8); p+=8;
+      std::memcpy(p,&vb,sizeof(vb)); p+=sizeof(vb);
+      std::memcpy(p,&ib,sizeof(ib)); p+=sizeof(ib);
+      std::memcpy(p,&draw,sizeof(draw));
+    };
+    pack(0,1,first->GetGPUVirtualAddress(),viewA,indexA);
+    pack(1,1,first->GetGPUVirtualAddress(),viewA,indexA);
+    writeUpload(arguments.Get(),records.data(),records.size());
+    const uint32_t one = 1; writeUpload(count.Get(),&one,4);
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    check(context.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),
+          "msaa-indirect-allocator");
+    check(context.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),pipeline.Get(),
+                                            IID_PPV_ARGS(&list)),"msaa-indirect-list");
+    list->CopyBufferRegion(first.Get(),0,zero.Get(),0,8);
+    list->CopyBufferRegion(second.Get(),0,zero.Get(),0,8);
+    D3D12_RESOURCE_BARRIER begin[] = {
+      transition(first.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+      transition(second.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+    list->ResourceBarrier(2,begin);
+    const float clear[4] = {0,0,0,0};
+    list->ClearRenderTargetView(rtv,clear,0,nullptr);
+    list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
+    D3D12_VIEWPORT viewport = {0,0,4,2,0,1}; D3D12_RECT scissor = {0,0,4,2};
+    list->RSSetViewports(1,&viewport); list->RSSetScissorRects(1,&scissor);
+    list->SetGraphicsRootSignature(root.Get());
+    list->SetGraphicsRootUnorderedAccessView(0,second->GetGPUVirtualAddress());
+    list->SetGraphicsRoot32BitConstant(1,3,0);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->IASetVertexBuffers(3,1,&viewA); list->IASetIndexBuffer(&indexA);
+    list->ExecuteIndirect(signature.Get(),2,arguments.Get(),0,count.Get(),0);
+    D3D12_RESOURCE_BARRIER end[] = {
+      transition(first.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE),
+      transition(second.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE),
+      transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+    list->ResourceBarrier(3,end);
+    list->CopyBufferRegion(countReadback.Get(),0,first.Get(),0,8);
+    list->CopyBufferRegion(countReadback.Get(),8,second.Get(),0,8);
+    list->SetPipelineState(readPipeline.Get());
+    list->SetComputeRootSignature(readRoot.Get());
+    ID3D12DescriptorHeap *heaps[] = {srvHeap.Get()};
+    list->SetDescriptorHeaps(1,heaps);
+    list->SetComputeRootDescriptorTable(0,srvHeap->GetGPUDescriptorHandleForHeapStart());
+    list->SetComputeRootUnorderedAccessView(1,imageUav->GetGPUVirtualAddress());
+    list->Dispatch(1,1,1);
+    auto imageBarrier = transition(imageUav.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1,&imageBarrier);
+    list->CopyBufferRegion(image.Get(),0,imageUav.Get(),0,32*16);
+    check(list->Close(), "close-msaa-indirect-list");
+    // The second queue submission must observe data changed after Close,
+    // not the initial record/count copied by any recording-time resolver.
+    if (requested == 2) {
+      pack(1,2,second->GetGPUVirtualAddress(),viewB,indexB);
+      writeUpload(arguments.Get(),records.data(),records.size());
+      writeUpload(count.Get(),&requested,4);
+    }
+    context.submitClosed(list.Get());
+    uint32_t *observed = nullptr;
+    check(countReadback->Map(0,nullptr,reinterpret_cast<void **>(&observed)),"msaa-indirect-count-map");
+    require(observed[0] == 3 && observed[1] == 8,"msaa-indirect-first-exactly-once");
+    require(observed[2] == (requested == 2 ? 3u : 0u) &&
+            observed[3] == (requested == 2 ? 8u : 0u),"msaa-indirect-second-exactly-once");
+    countReadback->Unmap(0,nullptr);
+    uint32_t *pixels = nullptr;
+    check(image->Map(0,nullptr,reinterpret_cast<void **>(&pixels)),"msaa-indirect-color-map");
+    for (UINT sample = 0; sample < 4; ++sample)
+      for (UINT y = 0; y < 2; ++y)
+        for (UINT x = 0; x < 4; ++x) {
+          const uint32_t *pixel = pixels+4*(sample*8+y*4+x);
+          uint8_t expected = requested == 2 ? 128 : 64;
+          require(pixel[0] == expected && pixel[1] == 0 && pixel[2] == 0 &&
+                  pixel[3] == (expected ? 255 : 0),"msaa-indirect-sample-color");
+        }
+    image->Unmap(0,nullptr);
+  }
+  std::puts("OWNED_D3D12_PREDICATION_INDIRECT_MSAA_INDEXED_MUTATIONS_PASS counts=1,2 samples=4");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1042,8 +1448,10 @@ int main(int argc, char **argv) {
   RunPredicatedClearTests(context);
   RunTypedMultilayerClearTests(context);
   RunTypedFloatUavClearTest(context);
+  RunBufferUavRectangleTests(context);
   std::puts("OWNED_D3D12_PREDICATION_INDIRECT_CLEAR_CASES_PASS");
   RunIndirectTests(context, computeShader, vertexShader);
+  RunMSAAIndexedIndirectMutations(context);
   std::puts("OWNED_D3D12_PREDICATION_INDIRECT_INDIRECT_CASES_PASS");
   std::puts("OWNED_D3D12_PREDICATION_INDIRECT_PASS");
   return 0;

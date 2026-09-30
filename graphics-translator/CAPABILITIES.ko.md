@@ -1,101 +1,86 @@
 # D3D12 포맷 capability 정책
 
-이 문서는 owned graphics translator의 `D3D12_FEATURE_FORMAT_SUPPORT` 구현 근거와 현재 광고 범위를 기록한다. 기준 DXMT 소스는 `7c8dee1c2d73415301ceb7d1fa810861cef4cd67`이며, DirectX header submodule은 `9df86f2341616ef1888ae59919feaa6d4fad693d`이다.
+현재 루트 `src/d3d12/`의 지원 보고·resource/view 실행 계약을 기록한다. Import 기준 DXMT는 `7c8dee1c2d73415301ceb7d1fa810861cef4cd67`이며, 당시의 모든 format에 `0xffffffff`를 반환하던 구현은 현재 정책이 아니다. D3D11 전용 구현은 이번 작업에서 변경하지 않았다.
 
-## 문제
+**2026-09-29 추가 경로의 공개 GPU 검증:** 호스트 x86 실행 복구 후 새 격리 `p1-complete/runtime-04`에서 RGB32·paired 4:2:2·STANDARD_SWIZZLE·DXBC 부분 3D UAV·depth dimension이 Metal API/Shader Validation을 통과했다. DXIL 부분 3D UAV의 write→load 가시성 결함은 AIR texture fence로 수정해 `runtime-05` 공개 GPU 회귀에서 load202·OOB0·atomic-before85·OOB-atomic0·slice guard·bounded clear·dimensions를 통과했다. 같은 runtime에서 BC1↔RGBA16UINT bitcast의 정확한32 bytes와 packed cube-array RGBA77/120/120/255도 확인했다. 이전 runtime과 새 소스의 증거는 구분한다.
 
-기준 DXMT의 D3D12 `CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT)`는 `DXGI_FORMAT_UNKNOWN`만 `D3D12_FORMAT_SUPPORT1_BUFFER`로 처리하고, 나머지 모든 포맷에 `Support1 = 0xffffffff`, `Support2 = 0xffffffff`를 반환한다. 이 값에는 현재 D3D12 backend가 구현하지 않은 stream output, tiled resources, logic op, video 경로와 실제 Metal 포맷이 지원하지 않는 RT/UAV/atomic capability까지 포함된다.
+## 판정 입력과 경계
 
-DX11 구현에는 이미 `MTLQueryDXGIFormat`과 `FormatCapabilityInspector`를 이용해 Metal device family별 포맷 capability를 판정하는 경로가 있다. D3D12 device도 초기화 시 동일 inspector를 채우고 `GetMTLPixelFormatCapability()`를 제공하므로, 새 D3D12 경로는 이 데이터를 직접 사용한다.
+- `MTLQueryDXGIFormat`: DXGI→Metal pixel/vertex format, byte size, typeless·BC·depth/stencil·backbuffer 속성.
+- `FormatCapabilityInspector`: 현재 Metal device의 filter/write/color/blend/MSAA/resolve/atomic 및 typed-buffer 접근 capability.
+- D3D12 계약: resource layout과 shader view의 역할, DXGI bit-layout family, 실제 compiler/encoder 경로. Native mapping이 존재한다는 이유만으로 모든 연산을 허용하지 않는다.
 
-## 판정 입력
+일반 uncompressed format은 native texel size와 DXGI byte size가 맞아야 직접 접근한다. 새 `R32G32B32_*` texture 경로는 16-byte RGBA32 backing과 12-byte 논리 footprint 사이를 변환하며, typed-buffer SRV는 12-byte stride의 원시 buffer load를 사용한다. 없는 alpha는 논리적 1로 component mapping과 합성한다. IA/SO 지원은 유지한다. BC와 depth/stencil은 block/planar layout으로 별도 판정하며 BC는 장치 지원도 필요하다.
 
-패치는 세 종류의 정보를 함께 사용한다.
+`DXGI_FORMAT_UNKNOWN`의 format query는 `BUFFER`만 반환한다. Unmapped format은 mask를 0으로 초기화한 뒤 `E_INVALIDARG`를 반환한다. Mapped지만 지원하지 않는 format은 0 mask를 반환할 수 있다.
 
-1. `MTLQueryDXGIFormat`의 DXGI→Metal mapping: PixelFormat, AttributeFormat, byte size, typeless/BC/backbuffer/depth/stencil flags.
-2. 현재 Metal device에서 `FormatCapabilityInspector::Inspect()`가 채운 capability: Filter, Write, Color, Blend, MSAA, Resolve, Atomic, TextureBufferRead/Write/ReadWrite 등.
-3. 현재 D3D12 구현의 실제 경로: texture dimension 제약, SRV/UAV/RTV/DSV 생성, resolve encoder, IA index/vertex 처리, stream-output 미구현 상태.
+## Resource·view 역할
 
-일반 uncompressed 포맷은 `MTLGetTexelSize(PixelFormat) == DXGI BytesPerTexel`일 때만 texture/buffer layout-compatible로 본다. 따라서 `R32G32B32_*`처럼 12-byte DXGI 포맷이 단일 R32 Metal pixel format으로 매핑되는 경우는 IA vertex attribute는 허용할 수 있지만, 해당 mapping만으로 1D/2D/3D texture나 typed buffer를 지원한다고 광고하지 않는다.
+| 구분 | 계약 |
+|---|---|
+| SO | 1–4개 32-bit FLOAT/SINT/UINT component의 12종에 `SO_BUFFER`. Native typed texture 지원과 독립적이다. VS→SO(stream 0) 범위이며 GS/HS/DS를 추가하지 않는다. |
+| Mip | Texture-compatible format의 `MIP`는 filtering 여부와 독립적이다. Integer, typeless, depth/stencil의 mip storage도 포함한다. |
+| Typed cast | `GetFormatFamily`의 DXGI bit-layout family를 사용한다. Fully typed resource도 호환 typed view를 가질 수 있으며, 완전 typeless resource만의 기능이 아니다. |
+| 완전 typeless | Resource layout·mip·cast를 나타내며 그 format 자체로 shader/RTV/DSV/UAV를 허용하지 않는다. |
+| Typed DSV | `D16_UNORM`, `D32_FLOAT`, `D24_UNORM_S8_UINT`, `D32_FLOAT_S8X24_UINT`는 shader load/sample/comparison/gather view가 아니다. MSAA render-target capability는 depth target도 포함하지만 이 format 자체에 MSAA shader load를 보고하지 않는다. |
+| Depth/stencil plane SRV | `R24_UNORM_X8_TYPELESS`, `R32_FLOAT_X8X24_TYPELESS`, `X24_TYPELESS_G8_UINT`, `X32_TYPELESS_G8X24_UINT`는 이름에 TYPELESS가 있어도 shader가 읽는 구체적인 aspect view다. Combined DSV format과 구분한다. |
+| Depth comparison | Shader depth 역할은 native storage flag가 아니라 `R16_UNORM`, `R32_FLOAT`, `R24_UNORM_X8_TYPELESS`, `R32_FLOAT_X8X24_TYPELESS` alias로 판정한다. Stencil aspect는 comparison 대상이 아니다. |
+| Typed buffer | Native byte layout과 read/write capability를 검사한다. RGB32 SRV는 native buffer texture로 가장하지 않고 별도 원시 load·bounds·component mapping 경로를 사용한다. |
+| sRGB UAV | D3D12의 RGBA8/BGRA8 sRGB UAV를 보고하지 않고 생성도 거부한다. UNORM reinterpretation으로 우회하지 않는다. Invalid descriptor는 기존 null descriptor 경로를 따른다. |
+| Packed 4:2:2 | `R8G8_B8G8_UNORM`, `G8R8_G8B8_UNORM`은 두 pixel이 R/B를 공유하는 4-byte pair를 RGBA8 backing으로 풀고 다시 묶는다. Native packed RGB의 다른 변환 의미를 사용하지 않는다. 기본 resource width는 짝수이며 작은 mip의 홀수 tail을 처리한다. CPU·GPU·predicated copy, filtering, cube-array와 STANDARD_SWIZZLE pair layout의 공개 D3D12 GPU 검증을 통과했다. |
 
-BC와 depth/stencil은 block/planar layout 때문에 위 byte-size 비교에서 제외하고, 실제 inspector entry가 있는 경우에만 texture-compatible로 본다. 특히 BC mapping이 존재해도 `supportsBCTextureCompression()` 결과로 inspector capability가 생성되지 않은 device에서는 BC texture 지원을 광고하지 않는다.
+`BUFFER`/IA index·vertex/texture dimension/RTV/blending/display/typed UAV/atomic 보고는 해당 mapping·장치 capability와 D3D12 역할을 함께 사용한다. Tiled resource와 output-merger logic op는 options와 일치하게 비광고 상태다. 공개 feature level/Shader Model/tier는 이번 수정으로 올리지 않았다.
 
-## Support1
+새 depth dimension 소스는 1D를 one-row 2D backing으로, cube/cube-array를 2D array의 view로 표현한다. Native depth/stencil view 생성은 확인했지만 공개 D3D12 comparison/plane shader 결과는 아직 검증 대기다. 부분 3D UAV도 W-slice offset·bounds를 shader load/store/atomic과 clear에 전달하도록 변경했으며 통합 검증 전이다.
 
-`DXGI_FORMAT_UNKNOWN`은 기존 동작을 유지해 `BUFFER`만 반환한다. 다른 unmapped format은 mask를 먼저 0으로 만들고 `E_INVALIDARG`를 반환한다.
+## D24 plane 복사
 
-Mapped format은 다음 범위만 광고한다.
+DXGI R24G8 depth plane의 footprint는 `R32_TYPELESS` family의 4-byte texel이지만 **내용은 하위 24-bit UNORM 정수와 0인 상위 X8**이다. IEEE float32 데이터라는 뜻이 아니다. Stencil plane은 `R8_TYPELESS` family의 1-byte texel이다.
 
-| 비트 | 조건 |
-| --- | --- |
-| `BUFFER` | BC/depth/stencil이 아니고 native texel layout이 맞으며 TextureBuffer inspector capability가 있음 |
-| `IA_VERTEX_BUFFER` | typed format이고 `AttributeFormat` mapping이 있음 |
-| `IA_INDEX_BUFFER` | typed `R16_UINT` 또는 `R32_UINT` |
-| `TEXTURE1D` | inspected texture support가 있고 BC/depth/stencil이 아님 |
-| `TEXTURE2D` | inspected texture support가 있음 |
-| `TEXTURE3D` | inspected texture support가 있고 BC/depth/stencil이 아님 |
-| `TEXTURECUBE` | inspected texture support가 있고 depth/stencil이 아님 |
-| `CAST_WITHIN_BIT_LAYOUT` | texture-compatible typeless mapping |
-| `SHADER_LOAD` | typed texture-compatible format |
-| `SHADER_SAMPLE`, `SHADER_GATHER`, `MIP` | 위 조건에 더해 inspector `Filter`가 있음 |
-| `SHADER_SAMPLE_COMPARISON`, `SHADER_GATHER_COMPARISON` | typed depth format |
-| `RENDER_TARGET` | inspector `Color` |
-| `BLENDABLE` | inspector `Blend` |
-| `DEPTH_STENCIL` | depth 또는 stencil mapping이며 inspector texture support가 있음 |
-| `MULTISAMPLE_RESOLVE` | inspector `Resolve`와 `Color`가 둘 다 있음 |
-| `MULTISAMPLE_RENDERTARGET` | inspector `MSAA`와 `Color`가 둘 다 있음 |
-| `MULTISAMPLE_LOAD` | inspector `MSAA` |
-| `DISPLAY` | backbuffer mapping이며 inspector `Color`가 있음 |
-| `TYPED_UNORDERED_ACCESS_VIEW` | typed/non-BC/non-DS이고 texture `Write` 또는 typed-buffer store capability가 있음 |
+Metal의 `Depth32Float_Stencil8` backing과 경계를 맞추기 위해 D3D12 buffer→texture에서 low24를 float로 변환하고, texture→buffer에서는 nearest-even 정수 변환을 수행한다. 정밀 나눗셈과 2의 거듭제곱 분해를 사용해 24-bit 경계값 및 `.1/.3/.9` clear를 보존한다. Conversion scratch와 command 소유권은 GPU retirement까지 유지한다. D32S8은 float plane blit를 유지한다. 두 family 모두 footprint format을 native texture view format으로 오인한 `R32Uint`/`R8Uint` view 생성을 피한다.
 
-`SO_BUFFER`는 광고하지 않는다. 현재 D3D12 graphics pipeline은 `StreamOutput.NumEntries != 0`이면 `E_NOTIMPL`을 반환하고 `SOSetTargets`도 미구현이다.
+Depth/stencil `CopyTextureRegion`의 유효 계약은 전체 subresource rectangle, destination XYZ=0, source box=null이다. Fixture는 비정렬 depth subrectangle을 정상 사용 사례로 취급하지 않는다.
 
-Depth/stencil `MULTISAMPLE_RESOLVE`는 현재도 capability에서 광고하지 않는다. 다만 이 문서 작성 당시와 달리 현재 루트에는 `ResolveSubresourceRegion`과 depth/stencil MIN/MAX shader resolve가 구현되어 있다. `BuildD3D12FormatSupport`는 여전히 `properties.resolve && properties.color`인 경우에만 `MULTISAMPLE_RESOLVE`를 설정하므로, depth/stencil resolve의 실제 지원 범위와 capability 보고를 별도 matrix로 검증해 일치시키기 전까지 보수적으로 비광고 상태를 유지한다.
+## Sample-count 조회와 실행
 
-Typeless format은 resource layout/casting 용도의 `BUFFER`/texture dimension/`CAST_WITHIN_BIT_LAYOUT`까지만 가능하고, 해당 typeless format 자체에 shader load, RT, DSV, UAV 같은 typed-view capability를 부여하지 않는다.
+- `IsD3D12TextureSampleSupported`를 quality query, committed/placed 생성(null-output 포함), allocation-info, graphics PSO 검증에 사용한다. RGB32는 확장한 RGBA32 backing을 기준으로 판정하며, FLOAT resolve와 FLOAT/UINT/SINT MSAA load의 공개 GPU fixture가 `runtime-04`에서 통과했다. Packed 4:2:2 MSAA는 허용하지 않는다.
+- MSAA count는 compiler/replay의 2/4/8 한계, native 장치 count, 실제 backing pixel format의 MSAA capability를 모두 만족해야 한다. BC MSAA 및 MSAA UAV는 거부한다. Typeless query는 가능한 typed interpretation을 확인하며, 실제 resource는 `ALLOW_DEPTH_STENCIL` 등 flags로 선택한 동일 backing을 생성·검증에 사용한다.
+- 지원하는 ordinary quality level은 1개(`Quality=0`)다. Multisampled resource/PSO는 `0xffffffff` standard pattern도 허용한다. `0xfffffffe` center pattern은 native 장치의 programmable sample-position 지원을 확인한 뒤 모든 sample을 `(0.5, 0.5)`에 배치한다. Quality 0으로 대체하지 않으며 sample ID·mask는 각각 유지한다. Center pattern의 sample-frequency PS·antialiased line 조합은 D3D 계약에 따라 거절한다. Single-sample은 quality 0만 허용한다.
+- Quality query의 `Flags` 입력을 보존한다. Tiled resource tier가 미지원이므로 `TILED_RESOURCE` query는 0 level이다. Count 0은 기존 `E_FAIL`/0, 정의되지 않은 flags는 `E_INVALIDARG`/0, 유효하지만 미지원 조합은 `S_OK`/0을 반환한다.
+- R32_UINT MSAA correction은 Apple9 이상에 한정한 D3D12-local 판정이며 D3D11 inspector table을 바꾸지 않는다. 실제 GPU 증거는 아래 M5 Pro에 한정한다.
+- `MULTISAMPLE_LOAD`는 shader view, `MULTISAMPLE_RENDERTARGET`는 color/depth target 역할을 따른다. Integer/depth의 region MIN/MAX resolve가 가능하다는 이유로 `MULTISAMPLE_RESOLVE`를 올리지 않는다. 이 bit는 기존 typed color의 native resolve capability를 따른다.
 
-## Support2
+## 실제 검증
 
-`UAV_TYPED_LOAD`와 `UAV_TYPED_STORE`는 각각 inspector의 `TextureBufferRead`/`TextureBufferWrite`/`TextureBufferReadWrite`에서 가져온다. `Atomic` capability가 있고 typed UAV 자체가 가능한 포맷에만 다음 6개 atomic 비트를 함께 광고한다.
+Center pattern은 새 `build/local/p1-complete/runtime-08`에서 Metal API/Shader Validation을 통과했다. `center-final08-v2`는 2/4/8 sample의 full/masked RTV, centroid, D32 depth, occlusion·MAX resolve와 reordered semantic RGBA를 확인한다. `center-dxil-final08-v1`은 resource와 render-target quality가 독립적인 7개 조합의 `GetSamplePosition`을 확인한다. Unix-call 213의 x86/x64 layout assertion도 통과했으나 실제 32-bit GPU 실행은 검증하지 않았다.
 
-- `UAV_ATOMIC_ADD`
-- `UAV_ATOMIC_BITWISE_OPS`
-- `UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE`
-- `UAV_ATOMIC_EXCHANGE`
-- `UAV_ATOMIC_SIGNED_MIN_OR_MAX`
-- `UAV_ATOMIC_UNSIGNED_MIN_OR_MAX`
+아래는 확장 storage를 추가하기 **이전** M5 Pro/macOS 27의 격리 Wine runtime/prefix에서 Metal API 및 Shader Validation으로 실행한 증거다. Packed/RGB32 거부 항목과 query 개수는 당시 runtime에만 해당하며 새 기능의 완료 증거가 아니다. Query matrix와 실제 shader/readback 검증 범위를 구분한다.
 
-`OUTPUT_MERGER_LOGIC_OP`는 광고하지 않는다. 현재 D3D12 options가 `OutputMergerLogicOp = FALSE`다. `TILED`도 광고하지 않는다. 현재 options가 `TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED`이고 tiled command 경로도 구현되지 않았다. `MULTIPLANE_OVERLAY` 및 기타 이 구현에서 근거가 없는 Support2 비트도 0으로 둔다.
+| 검증 | 결과·증거 |
+|---|---|
+| SO capture·IA 재입력 | FLOAT/SINT/UINT 12종의 원시 bit, filled-size counter, stride와 guard 검증. `build/local/so-format-support/proof-02` |
+| Format query matrix | 98종 query 중 texture2D 92, buffer 54, compressed 21. 이것은 98종의 모든 GPU 연산 검증이 아니다. `build/local/format-support/proof-05` |
+| Shader/readback | Depth/stencil aspect 읽기, integer/typeless mip, depth mip 보고, RGBA8 linear/sRGB 및 R16 UINT→FLOAT·RGBA32 UINT→FLOAT·BC1 linear→sRGB reinterpretation. 같은 `proof-05` |
+| 미지원 연산 | RGBA8/BGRA8 sRGB UAV의 64-byte sentinel 보존, packed 4:2:2 생성 거부·pair footprint·오류 출력 검사. 같은 `proof-05` |
+| Native cast compatibility | R8/R16/RG16/RGBA8/RGBA16/RGBA32/RGB10A2/BGRA8/BC1/BC4/BC5/BC6의 13개 native view 조합 생성. GPU shader oracle와는 별도 증거다. `build/local/format-support/native-casts.log` |
+| Single-plane depth 역할 | 4종 typed DSV의 shader bit 금지, 4종 depth alias의 comparison 보고, typeless R32/R16의 DSV clear 뒤 R32_FLOAT/R16_UNORM `Load`와 서로 반대 결과의 `SampleCmpLevelZero`. `build/local/format-support/single-depth-after-02` |
+| D24/D32S8 copy | Typed/typeless 4종, 독립 clear·upload·shader load·texture copy, 8×2 padded row, 비영 placed offset, mip/array, low24 경계와 guard. `build/local/d24-plane-runner-03` |
+| Sample-count 정합성 | 45개 quality query, 15개 거부 descriptor 조합의 committed/placed/null-output/allocation 검사, 2×/4×/8× 21개 GPU case. Standard-pattern edge coverage, sample별 load, region MAX 및 depth backing을 검증했다. `build/local/msaa-capability-probe-01/runner-msaa-final-01`, runtime `msaa-capability-runtime-02` |
+| 기존 계약 회귀 | `resources`, `copy-resolve`, `capabilities` 모두 통과. `build/local/format-integration/{resources,copy-resolve,capabilities}-01` |
+| 최종 shared preflight·D24 lazy PSO | `msaa-capability-runtime-01`에서 `build/local/format-integration/{depth,resources,copy-resolve}-final-01` 통과. D24 kernel PSO는 사용하는 변환 방향만 lazy 생성한다. |
 
-## 검증
-
-`graphics-translator/tests/format-capabilities.cpp`는 helper 자체를 CPU-only로 컴파일해 다음 구분을 확인한다.
-
-- `UNKNOWN`과 unmapped format
-- 일반 filterable color/RT/UAV format
-- typeless format
-- BC compressed format 및 mapping만 있고 inspector support가 없는 BC format
-- depth format과 color-only resolve 제한
-- `R32_UINT` typed UAV/atomic
-- 96-bit `R32G32B32_FLOAT`의 IA-only 처리
-- SO/tiled/logic-op 비트의 비광고
-
-검증에 사용한 명령:
+이전 runtime에서 mip/cast/aspect 보고 누락, packed footprint 오류·잘못된 생성 성공, D24 float bit readback과 invalid native plane view를 재현했다. D24 경계 upload에서 발견한 1-LSB 반올림 오류도 수정 후 회귀에 포함했다. 순수 helper에 인위적인 속성을 넣어 bit를 복사 확인하던 `format-capabilities.cpp`는 삭제하고 공개 API/GPU fixture로 대체했다.
 
 ```sh
-clang++ -std=c++20 -Wall -Wextra -Werror \
-  -Ibuild/owned-graphics-20260919/capability-work/include/native/windows \
-  -Ibuild/owned-graphics-20260919/capability-work/include/native/directx \
-  -Ibuild/owned-graphics-20260919/capability-work/src/d3d12 \
-  graphics-translator/tests/format-capabilities.cpp \
-  -o /tmp/dxmt-format-capabilities-test
-/tmp/dxmt-format-capabilities-test
+export LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin
+for fixture in format-support depth-plane-copy so-format-support multisample-capabilities; do
+  "$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static \
+    "graphics-translator/tests/owned-d3d12-$fixture.cpp" \
+    -ld3d12 -ldxgi -ld3dcompiler -o "build/local/owned-d3d12-$fixture.exe"
+  python3 scripts/test-owned-graphics.py --runtime build/local/msaa-capability-runtime-02 \
+    --suite "$fixture" --fixture "build/local/owned-d3d12-$fixture.exe" \
+    --out "build/local/capability-$fixture-new" --validation
+done
 ```
 
-Helper 테스트와 `git diff --check`는 통과했다. `src/dxmt/dxmt_format.cpp`도 동일 scratch tree/header로 syntax-only compile을 통과했다.
-
-전체 `d3d12_device.cpp`의 standalone native syntax compile은 기준 checkout의 header 조합 때문에 완료할 수 없었다. `include/native/directx`의 고정 submodule revision에는 이 WIP D3D12 source가 참조하는 `ID3D12Device4`, `ID3D12Fence1`, `D3D12_PIPELINE_STATE_STREAM_DESC` 등 newer D3D12 선언이 없어서 capability 변경부에 도달하기 전에 baseline type 오류가 난다. 이 제약은 helper CPU 테스트와 별개이며, 실제 translator build에서는 프로젝트가 사용하는 cross-build header/toolchain 조합으로 다시 확인해야 한다.
-
-현재 prime cross build metadata에는 `x86_64-w64-mingw32-g++` clang 22.1.8 compile command가 기록되어 있지만, worker shell의 PATH에서는 해당 wrapper를 찾을 수 없어 (`command not found`) scratch `d3d12_device.cpp`를 같은 cross command로 재컴파일하지 못했다. 이는 source compiler error가 아니라 이 worker 프로세스의 toolchain executable 가시성 제한이다.
-
-이 검증은 capability 산출 정책과 compile-time 계약만 확인한다. 실제 게임 호환성, Metal resource 생성 성공률, GPU correctness 또는 D3D12 conformance를 증명하지 않는다.
+Runtime과 output은 README의 절차에 따라 새 경로로 준비한다. Windows reference differential, 다른 Metal GPU family/OS, 실제 게임의 호환성·성능은 이 검증 범위가 아니다. 현재 단계와 후속 결과는 [구현 상태 문서](CORE-IMPLEMENTATION-STATUS.ko.md#p1-완료-판정과-남은-계약)를 기준으로 한다.

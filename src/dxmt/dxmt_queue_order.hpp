@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-// Logical D3D12 fence timeline independent of monotonic native event values.
+// Logical D3D12 fence timeline published only after ordered completion validation.
 #pragma once
 
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -15,25 +16,22 @@ namespace owned_graphics {
 class FenceOrderEpoch {
 public:
   struct Producer {
-    uint64_t id = 0;
     uint64_t value = 0;
-    bool published = false;
     bool completed = false;
-    std::function<bool()> completion_probe;
   };
 
 private:
   struct CompletionWaiter {
     uint64_t value = 0;
+    uint64_t id = 0;
     std::function<void()> callback;
   };
 
   mutable std::mutex mutex_;
-  std::condition_variable cv_;
-  uint64_t next_producer_id_ = 1;
   uint64_t completed_value_ = 0;
-  std::vector<std::shared_ptr<Producer>> producers_;
+  bool removed_ = false;
   std::vector<CompletionWaiter> completion_waiters_;
+  uint64_t next_waiter_id_ = 1;
   const uint64_t generation_;
 
   void completeValueLocked(uint64_t value) {
@@ -49,19 +47,6 @@ private:
     }
   }
 
-  void reconcileLocked() {
-    for (auto it = producers_.begin(); it != producers_.end();) {
-      const auto &producer = *it;
-      if (producer->published && !producer->completed && producer->completion_probe && producer->completion_probe()) {
-        producer->completed = true;
-        completeValueLocked(producer->value);
-        it = producers_.erase(it);
-      } else {
-        ++it;
-      }
-    }
-  }
-
 public:
   explicit FenceOrderEpoch(uint64_t generation, uint64_t initial_value = 0)
       : completed_value_(initial_value), generation_(generation) {}
@@ -70,68 +55,34 @@ public:
     return generation_;
   }
 
-  std::shared_ptr<Producer> prepare(uint64_t value, std::function<bool()> completion_probe = {}) {
-    std::lock_guard<std::mutex> lock(mutex_);
+  std::shared_ptr<Producer> prepare(uint64_t value) {
     auto producer = std::make_shared<Producer>();
-    producer->id = next_producer_id_++;
     producer->value = value;
-    producer->completion_probe = std::move(completion_probe);
-    producers_.push_back(producer);
     return producer;
   }
 
-  void publish(const std::shared_ptr<Producer> &producer) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      producer->published = true;
-    }
-    cv_.notify_all();
-  }
-
-  void cancel(const std::shared_ptr<Producer> &producer) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto it = producers_.begin(); it != producers_.end(); ++it) {
-      if (*it == producer) {
-        producers_.erase(it);
-        return;
-      }
-    }
-  }
-
   void complete(const std::shared_ptr<Producer> &producer) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (producer->completed)
-        return;
-      producer->completed = true;
-      completeValueLocked(producer->value);
-      for (auto it = producers_.begin(); it != producers_.end(); ++it) {
-        if (*it == producer) {
-          producers_.erase(it);
-          break;
-        }
-      }
-    }
-    cv_.notify_all();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (removed_ || producer->completed)
+      return;
+    producer->completed = true;
+    completeValueLocked(producer->value);
   }
 
   void signalCpu(uint64_t value) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      // Probe and publish share one critical section. A GPU token observed here
-      // is ordered before this CPU signal; a retirement arriving later is after it.
-      reconcileLocked();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!removed_)
       completeValueLocked(value);
-    }
-    cv_.notify_all();
   }
 
-  void reconcile() {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      reconcileLocked();
-    }
-    cv_.notify_all();
+  // Device removal is terminal, unlike a user signal of UINT64_MAX. Release
+  // every pending/late waiter, and never let a delayed producer rewind it.
+  void remove() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (removed_)
+      return;
+    removed_ = true;
+    completeValueLocked(UINT64_MAX);
   }
 
   uint64_t completedValue() const {
@@ -139,21 +90,36 @@ public:
     return completed_value_;
   }
 
-  bool addCompletionWaiter(uint64_t value, std::function<void()> callback) {
+  bool addCompletionWaiter(uint64_t value, std::function<void()> callback, uint64_t *registration = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     // Registration and its initial observation are atomic with completion and
     // rewind, so a qualifying crossing cannot disappear between two calls.
-    reconcileLocked();
     if (completed_value_ >= value) {
+      if (registration)
+        *registration = 0;
       callback();
       return true;
     }
     try {
-      completion_waiters_.push_back(CompletionWaiter{value, std::move(callback)});
+      const uint64_t id = registration ? next_waiter_id_++ : 0;
+      completion_waiters_.push_back(CompletionWaiter{value, id, std::move(callback)});
+      if (registration)
+        *registration = id;
     } catch (...) {
       return false;
     }
     return true;
+  }
+
+  void removeCompletionWaiter(uint64_t registration) {
+    if (!registration)
+      return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = completion_waiters_.begin(); it != completion_waiters_.end(); ++it)
+      if (it->id == registration) {
+        completion_waiters_.erase(it);
+        return;
+      }
   }
 };
 
@@ -205,6 +171,24 @@ public:
   bool waitFor(const std::chrono::duration<Rep, Period> &timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
     return cv_.wait_for(lock, timeout, [&] { return signaled_; });
+  }
+
+  void wait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&] { return signaled_; });
+  }
+
+  bool waitUnless(const std::atomic<bool> &stopping) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&] { return signaled_ || stopping.load(std::memory_order_acquire); });
+    return signaled_;
+  }
+
+  // Wakes only a queue-local waiter. The latch remains unsignaled for every
+  // other queue and any application completion event observing this fence.
+  void wake() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cv_.notify_all();
   }
 };
 

@@ -17,7 +17,9 @@ public:
   uint64_t sampler_state_handle;
   uint64_t sampler_state_cube_handle;
 
-  static Rc<Sampler> createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod_bias);
+  /* `reduction`: 0 weighted average (the only mode D3D11 uses), 1 minimum, 2 maximum (Metal values). */
+  static Rc<Sampler>
+  createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod_bias, uint32_t reduction = 0);
 
 private:
   WMTSamplerInfo info_;

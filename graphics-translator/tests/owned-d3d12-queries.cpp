@@ -267,13 +267,6 @@ void runCreationNegatives(ID3D12Device* device) {
     if (output)
         fail("invalid node mask query heap returned object");
 
-    desc.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
-    desc.NodeMask = 1;
-    output = reinterpret_cast<void*>(UINT_PTR(1));
-    expectHRESULT(device->CreateQueryHeap(&desc, __uuidof(ID3D12QueryHeap), &output),
-                  E_NOTIMPL, "query_heap_pipeline_statistics_unsupported");
-    if (output)
-        fail("unsupported query heap returned object");
 }
 
 void recordDraw(ID3D12GraphicsCommandList* list,

@@ -43,7 +43,7 @@ fxp16v2 mix(fxp16v2 a, fxp16v2 b, fxp32 factor) {
   uint f = min(factor >> 1, (uint)fxp16_1);
   uint invf = fxp16_1 - f;
 
-  uint2 ri = ((ai * invf + bi * f)) / fxp16_1; // effective right shift 15
+  uint2 ri = ((ai * invf + bi * f) + fxp16_1 / 2) / fxp16_1; // effective right shift 15, round to nearest
   ri = min(ri, uint2(fxp16_1));
   return fxp16v2(ri);
 };
@@ -74,27 +74,71 @@ get_int_factor<partitioning::fractional_even>(fxp32 factor) {
 
 template <partitioning partition>
 fxp32
-place_in_1d(short index, fxp32 factor) {
-  return fxp32_invb(index, factor);
+place_in_1d(short index, fxp32 factor);
+
+/* D3D11 fixed-function placement (CHWTessellator::ComputeTessFactorContext + PlacePointIn1D) of a point in the
+ * lower half of an edge, index <= half the segment count; callers mirror the upper half. */
+uint
+remove_msb(uint v) {
+  return v ? v & ~(1u << (31 - clz(v))) : 0;
+}
+
+fxp32
+place_fractional(bool odd, short index, fxp32 factor) {
+  fxp32 half_factor = (factor + 1) / 2;
+  if (odd || half_factor == fxp32_half)
+    half_factor += fxp32_half;
+  fxp32 fl = half_factor & 0x7fff0000u;
+  fxp32 ce = (half_factor & 0xffff) ? fl + fxp32_1 : half_factor;
+  fxp32 frac = half_factor - fl;
+  short num_half = ce >> 16;
+  if (index >= num_half)
+    return fxp32_half;
+  short split = ce == fl ? num_half + 1
+              : odd      ? (fl == fxp32_1 ? 0 : (short)(remove_msb((fl >> 16) - 1) << 1) + 1)
+                         : (short)(remove_msb(fl >> 16) << 1) + 1;
+  uint floor_segments = ((fl * 2) >> 16) - (odd ? 1 : 0);
+  uint ceil_segments = ((ce * 2) >> 16) - (odd ? 1 : 0);
+  fxp32 inv_floor = floor_segments ? (fxp32_1 + floor_segments / 2) / floor_segments : 0;
+  fxp32 inv_ceil = ceil_segments ? (fxp32_1 + ceil_segments / 2) / ceil_segments : 0;
+  uint on_floor = index > split ? index - 1 : index;
+  fxp32 location = on_floor * inv_floor * (fxp32_1 - frac) + (uint)index * inv_ceil * frac;
+  return (location + fxp32_half) >> 16;
 }
 
 template <>
 fxp32
 place_in_1d<partitioning::fractional_odd>(short index, fxp32 factor) {
-  if (factor < fxp32_1) { // it really can only be 0 or 1
-    return index ? fxp32_1 : fxp32_0;
-  }
-  fxp32 maxh = (fxp32_1 - fxp32_invb(1, factor)) >> 1;
-  return min(fxp32_invb(index, factor), maxh);
+  return place_fractional(true, index, factor);
 }
 
 template <>
 fxp32
 place_in_1d<partitioning::fractional_even>(short index, fxp32 factor) {
-  if (factor < fxp32_2) { // it really can only be 0 or 1
-    return index * fxp32_half;
-  }
-  return min(fxp32_invb(index, factor), fxp32_half);
+  return place_fractional(false, index, factor);
+}
+
+/* Integer and pow2 factors are integral; parity follows the factor. The D3D "inside factor 1 is even" rule never
+ * applies here: the workload generators raise every inside factor of a non-trivial patch to at least 2. */
+template <>
+fxp32
+place_in_1d<partitioning::integer>(short index, fxp32 factor) {
+  return place_fractional((factor >> 16) & 1, index, factor);
+}
+
+template <>
+fxp32
+place_in_1d<partitioning::pow2>(short index, fxp32 factor) {
+  return place_in_1d<partitioning::integer>(index, factor);
+}
+
+/* Point `index` of a whole integer-partitioned edge with `factor` segments (both halves), 16.16. */
+fxp32
+place_in_1d_full(short index, fxp32 factor) {
+  const short segments = factor >> 16;
+  const short mirrored = segments - index;
+  const fxp32 lower = place_in_1d<partitioning::integer>(min(index, mirrored), factor);
+  return mirrored < index ? fxp32_1 - lower : lower;
 }
 
 template <partitioning partition>
@@ -107,9 +151,9 @@ regularize_factor(float factor) {
 template <>
 fxp32
 regularize_factor<partitioning::pow2>(float factor) {
-  // For pow2 partitioning, TessFactor range is [1,2,4,8,16,32,64].
-  uint clamped = clamp(ceil(factor), 1.0f, 64.0f);
-  return (clamped == 1 ? 1 : 1 << (32 - clz(clamped - 1))) << 16;
+  // The D3D11 reference tessellator (CHWTessellator) processes pow2 exactly like integer partitioning;
+  // rounding to a power of two is HLSL helper code (CHLSLTessellator), not fixed-function behaviour.
+  return ((uint)clamp(ceil(factor), 1.0f, 64.0f)) << 16;
 }
 
 template <>
@@ -136,7 +180,9 @@ struct TessMeshWorkload {
   char inner_factor_i;
   char outer_factor_i;
   bool has_complement;
-  bool padding;
+  /* Point-output workloads (gen_workload_*_points): bit 0 drops the inner edge's last point, bit 1 the outer
+   * edge's, because the next ring side starts at that point. Always 0 for triangle/line workloads. */
+  uchar drop_last;
   fxp16v2 inner0_c;
   fxp16v2 inner1_c;
   fxp16v2 outer0_c;
@@ -154,6 +200,31 @@ get_next_index(threadgroup int *out_count) {
 }
 
 template <partitioning partition>
+char
+ring_int_factor(fxp32 factor) {
+  const short ring = factor >> 24;
+  return (char)max(0, (int)get_int_factor<partition>(factor & 0xffffffu) - 2 * ring);
+}
+
+/* Position of point `tid` (of `segments`) on a workload edge, as a 16.16 fraction from its left end. */
+template <partitioning partition>
+fxp32
+place_on_ring(ushort tid, ushort segments, fxp32 factor) {
+  const ushort tid_ref = segments - tid;
+  const short ring = factor >> 24;
+  const fxp32 base = factor & 0xffffffu;
+  if (!ring) {
+    fxp32 ratio = place_in_1d<partition>(min(tid, tid_ref), base);
+    return tid_ref < tid ? fxp32_1 - ratio : ratio;
+  }
+  fxp32 point = place_in_1d<partition>(ring + min(tid, tid_ref), base);
+  point = tid_ref < tid ? fxp32_1 - point : point;
+  const fxp32 start = place_in_1d<partition>(ring, base);
+  const fxp32 span = fxp32_1 - 2 * start;
+  return (fxp32)((((ulong)(point - start) << 16) + span / 2) / span);
+}
+
+template <partitioning partition>
 void
 emit_tess_mesh_workload(
     object_data TessMeshWorkload *workloads, threadgroup int *out_count, 
@@ -168,8 +239,8 @@ emit_tess_mesh_workload(
       out1,
       inner_factor,
       outer_factor,
-      get_int_factor<partition>(inner_factor),
-      get_int_factor<partition>(outer_factor),
+      ring_int_factor<partition>(inner_factor),
+      ring_int_factor<partition>(outer_factor),
       has_complement,
       0,
       in0_c,
@@ -178,26 +249,83 @@ emit_tess_mesh_workload(
       out1_c,
       inner_factor_c,
       outer_factor_c,
-      has_complement ? get_int_factor<partition>(inner_factor_c) : (char)0,
-      has_complement ? get_int_factor<partition>(outer_factor_c) : (char)0,
+      has_complement ? ring_int_factor<partition>(inner_factor_c) : (char)0,
+      has_complement ? ring_int_factor<partition>(outer_factor_c) : (char)0,
       patch_index
   };
 }
 
+/* Ring k of an inside factor. D3D places ring points with the full inside-factor context at indices shifted by k
+ * (CHWTessellator::TriGeneratePoints/QuadGeneratePoints), so the ring keeps the base factor and carries k in
+ * bits 24..30; ring_int_factor/place_on_ring decode it. 0 when the ring has no segments. */
 fxp32 factor_offset(fxp32 base, short count) {
   fxp32 result = base - ((count * fxp32_1) << 1);
-  return result & 0x80000000 ? 0 : result;
+  if (result & 0x80000000)
+    return 0;
+  return count ? base | ((uint)count << 24) : base;
+}
+
+/* Unique D3D11 tessellator domain points: the outer ring, then inner rings of 3 * (n - 2k)
+ * points, closed by a centre point when n is even (a triangle of 3 when odd). */
+uint
+domain_point_count_triangle(char n, char e0, char e1, char e2) {
+  uint count = e0 + e1 + e2;
+  for (short k = 1; n - 2 * k > 0; k++)
+    count += 3 * (n - 2 * k);
+  return count + ((n & 1) ? 0 : 1);
+}
+
+/* Quad: outer ring, then (nx - 2k) x (ny - 2k) rings, closed by a line of |nx - ny| + 1 points
+ * when the smaller inner factor is even. */
+uint
+domain_point_count_quad(char nx, char ny, char e0, char e1, char e2, char e3) {
+  uint count = e0 + e1 + e2 + e3;
+  short k = 1;
+  for (; nx - 2 * k > 0 && ny - 2 * k > 0; k++)
+    count += 2 * (nx - 2 * k) + 2 * (ny - 2 * k);
+  if (min(nx, ny) - 2 * k == 0)
+    count += abs(nx - ny) + 1;
+  return count;
+}
+
+/* A patch with any factor above 1 gets an inside factor of at least 2 (fractional odd: above 1). */
+template <partitioning partition>
+void
+regularize_triangle_inside(thread fxp32 &in0f, fxp32 out0f, fxp32 out1f, fxp32 out2f) {
+  if (partition == partitioning::fractional_odd) {
+    if ((out0f | out1f | out2f | in0f) != fxp32_1)
+      in0f = max(fxp32_1 + 1u, in0f);
+  } else if (partition != partitioning::fractional_even) {
+    if ((out0f | out1f | out2f) != fxp32_1)
+      in0f = max(fxp32_2, in0f);
+  }
 }
 
 template <partitioning partition>
 void
+regularize_quad_inside(thread fxp32 &in0f, thread fxp32 &in1f, fxp32 out0f, fxp32 out1f, fxp32 out2f, fxp32 out3f) {
+  if (partition == partitioning::fractional_odd) {
+    if ((out0f | out1f | out2f | out3f | in0f | in1f) != fxp32_1) {
+      in0f = max(fxp32_1 + 1u, in0f);
+      in1f = max(fxp32_1 + 1u, in1f);
+    }
+  } else if (partition != partitioning::fractional_even) {
+    if ((out0f | out1f | out2f | out3f) != fxp32_1) {
+      in0f = max(fxp32_2, in0f);
+      in1f = max(fxp32_2, in1f);
+    }
+  }
+}
+
+template <partitioning partition>
+uint
 gen_workload_triangle_impl(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
 ) {
-  if (isnan(out0) || out0 <= 0) return;
-  if (isnan(out1) || out1 <= 0) return;
-  if (isnan(out2) || out2 <= 0) return;
+  if (isnan(out0) || out0 <= 0) return 0;
+  if (isnan(out1) || out1 <= 0) return 0;
+  if (isnan(out2) || out2 <= 0) return 0;
 
   object_data TessMeshWorkload *workloads = (object_data TessMeshWorkload *)out_buffer;
   fxp32 in0f = regularize_factor<partition>(in);
@@ -205,19 +333,11 @@ gen_workload_triangle_impl(
   fxp32 out1f = regularize_factor<partition>(out1);
   fxp32 out2f = regularize_factor<partition>(out2);
 
-  if (partition == partitioning::fractional_odd) {
-    fxp32 allfactor_and = out0f | out1f | out2f | in0f;
-    if (allfactor_and != fxp32_1) { // any of factor is not 1
-      in0f = max(fxp32_1 + 1u, in0f);
-    }
-  } else if (partition != partitioning::fractional_even) {
-    fxp32 allfactor_and = out0f | out1f | out2f;
-    if (allfactor_and != fxp32_1) {
-      in0f = max(fxp32_2, in0f);
-    }
-  }
+  regularize_triangle_inside<partition>(in0f, out0f, out1f, out2f);
 
   char in0 = get_int_factor<partition>(in0f);
+  const uint points = domain_point_count_triangle(
+      in0, get_int_factor<partition>(out0f), get_int_factor<partition>(out1f), get_int_factor<partition>(out2f));
 
   short rings = in0 / 2;
   fxp16v2 _100{fxp16_1, fxp16_0};
@@ -267,7 +387,7 @@ gen_workload_triangle_impl(
           patch_index, false
         );
       }
-      return;
+      return points;
     }
 
     fxp32 outer_c = place_in_1d<partition>(u - 1, in0f) << 1;
@@ -312,59 +432,59 @@ gen_workload_triangle_impl(
     );
   }
 
-  return;
+  return points;
 }
 
-void gen_workload_triangle_integer(
+uint gen_workload_triangle_integer(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
 ) asm("dxmt.generate_workload.triangle.integer");
-void
+uint
 gen_workload_triangle_integer(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
 ) {
-  gen_workload_triangle_impl<partitioning::integer>(
+  return gen_workload_triangle_impl<partitioning::integer>(
       patch_index, out_count, out_buffer, in, out0, out1, out2
   );
 }
 
-void gen_workload_triangle_pow2(
+uint gen_workload_triangle_pow2(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
 ) asm("dxmt.generate_workload.triangle.pow2");
-void
+uint
 gen_workload_triangle_pow2(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
 ) {
-  gen_workload_triangle_impl<partitioning::pow2>(patch_index, out_count, out_buffer, in, out0, out1, out2);
+  return gen_workload_triangle_impl<partitioning::pow2>(patch_index, out_count, out_buffer, in, out0, out1, out2);
 }
 
-void gen_workload_triangle_odd(
+uint gen_workload_triangle_odd(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
 ) asm("dxmt.generate_workload.triangle.odd");
-void
+uint
 gen_workload_triangle_odd(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
 ) {
-  gen_workload_triangle_impl<partitioning::fractional_odd>(
+  return gen_workload_triangle_impl<partitioning::fractional_odd>(
       patch_index, out_count, out_buffer, in, out0, out1, out2
   );
 }
 
-void gen_workload_triangle_even(
+uint gen_workload_triangle_even(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
 ) asm("dxmt.generate_workload.triangle.even");
-void
+uint
 gen_workload_triangle_even(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
 ) {
-  gen_workload_triangle_impl<partitioning::fractional_even>(
+  return gen_workload_triangle_impl<partitioning::fractional_even>(
       patch_index, out_count, out_buffer, in, out0, out1, out2
   );
 }
@@ -386,15 +506,15 @@ fxp16v2 mxmy(fxp32 x, fxp32 y) {
 }
 
 template <partitioning partition>
-void
+uint
 gen_workload_quad_impl(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
 ) {
-  if (isnan(out0) || out0 <= 0) return;
-  if (isnan(out1) || out1 <= 0) return;
-  if (isnan(out2) || out2 <= 0) return;
-  if (isnan(out3) || out3 <= 0) return;
+  if (isnan(out0) || out0 <= 0) return 0;
+  if (isnan(out1) || out1 <= 0) return 0;
+  if (isnan(out2) || out2 <= 0) return 0;
+  if (isnan(out3) || out3 <= 0) return 0;
 
   object_data TessMeshWorkload *workloads = (object_data TessMeshWorkload *)out_buffer;
   fxp32 in0f = regularize_factor<partition>(in0);
@@ -404,22 +524,13 @@ gen_workload_quad_impl(
   fxp32 out2f = regularize_factor<partition>(out2);
   fxp32 out3f = regularize_factor<partition>(out3);
 
-  if (partition == partitioning::fractional_odd) {
-    fxp32 allfactor_and = out0f | out1f | out2f | out3f | in0f | in1f;
-    if (allfactor_and != fxp32_1) { // any of factor is not 1
-      in0f = max(fxp32_1 + 1u, in0f);
-      in1f = max(fxp32_1 + 1u, in1f);
-    }
-  } else if (partition != partitioning::fractional_even) {
-    fxp32 allfactor_and = out0f | out1f | out2f | out3f;
-    if (allfactor_and != fxp32_1) {
-      in0f = max(fxp32_2, in0f);
-      in1f = max(fxp32_2, in1f);
-    }
-  }
+  regularize_quad_inside<partition>(in0f, in1f, out0f, out1f, out2f, out3f);
 
   char in0i = get_int_factor<partition>(in0f);
   char in1i = get_int_factor<partition>(in1f);
+  const uint points = domain_point_count_quad(
+      in0i, in1i, get_int_factor<partition>(out0f), get_int_factor<partition>(out1f),
+      get_int_factor<partition>(out2f), get_int_factor<partition>(out3f));
 
   short min_in = min(in0i, in1i);
   short rings = min_in / 2;
@@ -523,64 +634,250 @@ gen_workload_quad_impl(
     }
   }
 
-  return;
+  return points;
 }
 
-void gen_workload_quad_integer(
+uint gen_workload_quad_integer(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
 ) asm("dxmt.generate_workload.quad.integer");
-void
+uint
 gen_workload_quad_integer(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
 ) {
-  gen_workload_quad_impl<partitioning::integer>(
+  return gen_workload_quad_impl<partitioning::integer>(
       patch_index, out_count, out_buffer, in0, in1, out0, out1, out2, out3
   );
 }
 
-void gen_workload_quad_pow2(
+uint gen_workload_quad_pow2(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
 ) asm("dxmt.generate_workload.quad.pow2");
-void
+uint
 gen_workload_quad_pow2(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
 ) {
-  gen_workload_quad_impl<partitioning::pow2>(
+  return gen_workload_quad_impl<partitioning::pow2>(
       patch_index, out_count, out_buffer, in0, in1, out0, out1, out2, out3
   );
 }
 
-void gen_workload_quad_odd(
+uint gen_workload_quad_odd(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
 ) asm("dxmt.generate_workload.quad.odd");
-void
+uint
 gen_workload_quad_odd(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
 ) {
-  gen_workload_quad_impl<partitioning::fractional_odd>(
+  return gen_workload_quad_impl<partitioning::fractional_odd>(
       patch_index, out_count, out_buffer, in0, in1, out0, out1, out2, out3
   );
 }
 
-void gen_workload_quad_even(
+uint gen_workload_quad_even(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
 ) asm("dxmt.generate_workload.quad.even");
-void
+uint
 gen_workload_quad_even(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
 ) {
-  gen_workload_quad_impl<partitioning::fractional_even>(
+  return gen_workload_quad_impl<partitioning::fractional_even>(
       patch_index, out_count, out_buffer, in0, in1, out0, out1, out2, out3
   );
 }
+
+/* Point output (D3D11.3 11.7: only unique points within a patch). Instead of the triangle ring workloads, whose
+ * edges repeat every inner ring and every corner, each ring side becomes one workload edge that drops its last point
+ * (the next side's first point); two sides share a workload. Rings, factors and endpoints are exactly those of
+ * gen_workload_triangle_impl / gen_workload_quad_impl, so point positions are identical. */
+struct point_side {
+  fxp16v2 left, right;
+  fxp32 factor;
+  bool drop;
+};
+
+struct point_emitter {
+  object_data TessMeshWorkload *workloads;
+  threadgroup int *out_count;
+  short patch_index;
+  bool pending = false;
+  point_side first;
+
+  template <partitioning partition>
+  void push(point_side side) {
+    if (!pending) {
+      first = side;
+      pending = true;
+      return;
+    }
+    emit<partition>(first, side, true);
+    pending = false;
+  }
+
+  template <partitioning partition>
+  void flush() {
+    if (pending)
+      emit<partition>(first, first, false);
+    pending = false;
+  }
+
+  template <partitioning partition>
+  void emit(point_side a, point_side b, bool pair) {
+    workloads[get_next_index(out_count)] = {
+        a.left, a.right, b.left, b.right, a.factor, b.factor,
+        ring_int_factor<partition>(a.factor), (char)(pair ? ring_int_factor<partition>(b.factor) : -1), false,
+        (uchar)((a.drop ? 1 : 0) | (pair && b.drop ? 2 : 0)),
+        {}, {}, {}, {}, 0, 0, 0, 0, patch_index
+    };
+  }
+};
+
+template <partitioning partition>
+uint
+gen_workload_triangle_points_impl(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
+    float out2
+) {
+  if (isnan(out0) || out0 <= 0 || isnan(out1) || out1 <= 0 || isnan(out2) || out2 <= 0)
+    return 0;
+  fxp32 in0f = regularize_factor<partition>(in);
+  fxp32 out0f = regularize_factor<partition>(out0);
+  fxp32 out1f = regularize_factor<partition>(out1);
+  fxp32 out2f = regularize_factor<partition>(out2);
+  regularize_triangle_inside<partition>(in0f, out0f, out1f, out2f);
+  const char in0 = get_int_factor<partition>(in0f);
+  point_emitter emitter{(object_data TessMeshWorkload *)out_buffer, out_count, (short)patch_index};
+  const fxp16v2 _100{fxp16_1, fxp16_0}, _010{fxp16_0, fxp16_1}, _001{fxp16_0, fxp16_0};
+  const fxp16v2 _C = fxp16_one_third;
+  const short rings = in0 / 2;
+  for (short k = 0; k <= rings; k++) {
+    const fxp32 at = place_in_1d<partition>(k, in0f) << 1;
+    const fxp16v2 a = mix(_001, _C, at), b = mix(_100, _C, at), c = mix(_010, _C, at);
+    if (k && in0 - 2 * k == 0) {
+      emitter.push<partition>({a, a, 0, false}); // centre point of an even inside factor
+      break;
+    }
+    emitter.push<partition>({a, b, k ? factor_offset(in0f, k) : out1f, true});
+    emitter.push<partition>({b, c, k ? factor_offset(in0f, k) : out2f, true});
+    emitter.push<partition>({c, a, k ? factor_offset(in0f, k) : out0f, true});
+  }
+  emitter.flush<partition>();
+  return domain_point_count_triangle(in0, get_int_factor<partition>(out0f), get_int_factor<partition>(out1f),
+                                     get_int_factor<partition>(out2f));
+}
+
+template <partitioning partition>
+uint
+gen_workload_quad_points_impl(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
+    float out1, float out2, float out3
+) {
+  if (isnan(out0) || out0 <= 0 || isnan(out1) || out1 <= 0 || isnan(out2) || out2 <= 0 || isnan(out3) ||
+      out3 <= 0)
+    return 0;
+  fxp32 in0f = regularize_factor<partition>(in0);
+  fxp32 in1f = regularize_factor<partition>(in1);
+  fxp32 out0f = regularize_factor<partition>(out0);
+  fxp32 out1f = regularize_factor<partition>(out1);
+  fxp32 out2f = regularize_factor<partition>(out2);
+  fxp32 out3f = regularize_factor<partition>(out3);
+  regularize_quad_inside<partition>(in0f, in1f, out0f, out1f, out2f, out3f);
+  const char nx = get_int_factor<partition>(in0f), ny = get_int_factor<partition>(in1f);
+  point_emitter emitter{(object_data TessMeshWorkload *)out_buffer, out_count, (short)patch_index};
+  short k = 0;
+  for (; k == 0 || (nx - 2 * k > 0 && ny - 2 * k > 0); k++) {
+    const fxp32 x = place_in_1d<partition>(k, in0f), y = place_in_1d<partition>(k, in1f);
+    const fxp16v2 _01 = pxmy(x, y), _11 = mxmy(x, y), _00 = pxpy(x, y), _10 = mxpy(x, y);
+    emitter.push<partition>({_11, _01, k ? factor_offset(in0f, k) : out3f, true});
+    emitter.push<partition>({_10, _11, k ? factor_offset(in1f, k) : out2f, true});
+    emitter.push<partition>({_00, _10, k ? factor_offset(in0f, k) : out1f, true});
+    emitter.push<partition>({_01, _00, k ? factor_offset(in1f, k) : out0f, true});
+  }
+  if (min(nx, ny) - 2 * k == 0) {
+    // Centre line along the longer inside direction (a point when nx == ny).
+    const fxp32 x = place_in_1d<partition>(k, in0f), y = place_in_1d<partition>(k, in1f);
+    if (nx >= ny)
+      emitter.push<partition>({pxpy(x, y), mxpy(x, y), factor_offset(in0f, k), false});
+    else
+      emitter.push<partition>({pxpy(x, y), pxmy(x, y), factor_offset(in1f, k), false});
+  }
+  emitter.flush<partition>();
+  return domain_point_count_quad(nx, ny, get_int_factor<partition>(out0f), get_int_factor<partition>(out1f),
+                                 get_int_factor<partition>(out2f), get_int_factor<partition>(out3f));
+}
+
+#define POINT_ENTRIES(suffix, part)                                                                                  \
+  uint gen_workload_triangle_points_##suffix(int patch_index, threadgroup int *out_count,                          \
+                                             object_data int *out_buffer, float in, float out0, float out1,        \
+                                             float out2) asm("dxmt.generate_workload.triangle_points." #suffix);   \
+  uint gen_workload_triangle_points_##suffix(int patch_index, threadgroup int *out_count,                          \
+                                             object_data int *out_buffer, float in, float out0, float out1,        \
+                                             float out2) {                                                         \
+    return gen_workload_triangle_points_impl<part>(patch_index, out_count, out_buffer, in, out0, out1, out2);      \
+  }                                                                                                                \
+  uint gen_workload_quad_points_##suffix(int patch_index, threadgroup int *out_count, object_data int *out_buffer, \
+                                         float in0, float in1, float out0, float out1, float out2, float out3)     \
+      asm("dxmt.generate_workload.quad_points." #suffix);                                                          \
+  uint gen_workload_quad_points_##suffix(int patch_index, threadgroup int *out_count, object_data int *out_buffer, \
+                                         float in0, float in1, float out0, float out1, float out2, float out3) {   \
+    return gen_workload_quad_points_impl<part>(patch_index, out_count, out_buffer, in0, in1, out0, out1, out2,     \
+                                               out3);                                                              \
+  }
+POINT_ENTRIES(integer, partitioning::integer)
+POINT_ENTRIES(pow2, partitioning::pow2)
+POINT_ENTRIES(odd, partitioning::fractional_odd)
+POINT_ENTRIES(even, partitioning::fractional_even)
+#undef POINT_ENTRIES
+
+/* Isoline domain (D3D11.3 11.6, CHWTessellator::TessellateIsoLineDomain): tess factor 0 is the line detail (U, any
+ * partitioning), factor 1 the line density (V, always integer, [1, 64]). Lines sit at V = k / density for
+ * k < density (the V = 1 line is not drawn); each has detail + 1 points. One workload carries up to two lines as its
+ * inner (first) and outer (second) edge, so get_domain_point and the line connectivity below are unchanged; a
+ * single-line workload has outer_factor_i = -1 (no points). */
+template <partitioning partition>
+uint
+gen_workload_isoline_impl(
+    int patch_index, threadgroup int *out_count, object_data int *out_buffer, float detail, float density
+) {
+  if (isnan(detail) || detail <= 0 || isnan(density) || density <= 0)
+    return 0;
+  object_data TessMeshWorkload *workloads = (object_data TessMeshWorkload *)out_buffer;
+  const fxp32 detailf = regularize_factor<partition>(detail);
+  const short lines = (short)clamp(ceil(density), 1.0f, 64.0f);
+  const fxp32 densityf = (fxp32)lines << 16;
+  const char detail_i = get_int_factor<partition>(detailf);
+  for (short k = 0; k < lines; k += 2) {
+    const fxp16 v0 = (fxp16)(place_in_1d_full(k, densityf) >> 1);
+    const bool pair = k + 1 < lines;
+    const fxp16 v1 = pair ? (fxp16)(place_in_1d_full(k + 1, densityf) >> 1) : v0;
+    workloads[get_next_index(out_count)] = {
+        fxp16v2(fxp16_0, v0), fxp16v2(fxp16_1, v0), fxp16v2(fxp16_0, v1), fxp16v2(fxp16_1, v1),
+        detailf, detailf, detail_i, (char)(pair ? detail_i : -1), false, 0,
+        {}, {}, {}, {}, 0, 0, 0, 0, (short)patch_index
+    };
+  }
+  return (uint)lines * (uint)(detail_i + 1);
+}
+
+#define ISOLINE_ENTRY(suffix, part)                                                                                  \
+  uint gen_workload_isoline_##suffix(int patch_index, threadgroup int *out_count, object_data int *out_buffer,     \
+                                     float detail, float density) asm("dxmt.generate_workload.isoline." #suffix); \
+  uint gen_workload_isoline_##suffix(int patch_index, threadgroup int *out_count, object_data int *out_buffer,     \
+                                     float detail, float density) {                                               \
+    return gen_workload_isoline_impl<part>(patch_index, out_count, out_buffer, detail, density);                    \
+  }
+ISOLINE_ENTRY(integer, partitioning::integer)
+ISOLINE_ENTRY(pow2, partitioning::pow2)
+ISOLINE_ENTRY(odd, partitioning::fractional_odd)
+ISOLINE_ENTRY(even, partitioning::fractional_even)
+#undef ISOLINE_ENTRY
 
 struct domain_location {
   float2 uv;
@@ -621,10 +918,7 @@ get_domain_point(object_data TessMeshWorkload &workload, ushort tid) {
 
   if (real_factor == 0)
     return to_float(min(left, right)); // very edge case...
-  ushort tid_ref = real_factor - tid;
-  fxp32 ratio = place_in_1d<partition>(min(tid, tid_ref), factor);
-  ratio = select(ratio, fxp32_1 - ratio, tid_ref < tid);
-  return to_float(mix(left, right, ratio));
+  return to_float(mix(left, right, place_on_ring<partition>(tid, real_factor, factor)));
 }
 
 int get_domain_patch_index(int workload_index, object_data int *data) asm("dxmt.get_domain_patch_index");
@@ -632,6 +926,16 @@ int get_domain_patch_index(int workload_index, object_data int *data) asm("dxmt.
 int get_domain_patch_index(int workload_index, object_data int *data) {
   object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
   return workload.patch_index;  
+}
+
+/* Domain points a workload's DS invocations cover: both edges (and the complement), minus dropped points.
+ * outer_factor_i is -1 for a single-line isoline workload. */
+int
+workload_point_count(object_data TessMeshWorkload &workload) {
+  int count = workload.inner_factor_i + workload.outer_factor_i + 2;
+  if (workload.has_complement)
+    count += workload.inner_factor_c_i + workload.outer_factor_c_i + 2;
+  return count - (workload.drop_last & 1) - ((workload.drop_last >> 1) & 1);
 }
 
 template <partitioning partition>
@@ -642,13 +946,12 @@ get_domain_location_impl(int workload_index, int thread_index, object_data int *
   domain_location ret{float2(0), false, false};
   object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
 
-  int count = workload.inner_factor_i + workload.outer_factor_i + 2;
-  if (workload.has_complement)
-    count += workload.inner_factor_c_i + workload.outer_factor_c_i + 2;
-
+  const int count = workload_point_count(workload);
   if (thread_index < count) {
     ret.active = true;
-    ret.uv = (float2)get_domain_point<partition>(workload, thread_index);
+    // Skip the dropped last inner point: the outer edge starts right after it.
+    const int dropped = (workload.drop_last & 1) && thread_index >= workload.inner_factor_i;
+    ret.uv = (float2)get_domain_point<partition>(workload, thread_index + dropped);
   }
 
   simdgroup_barrier(mem_flags::mem_none);
@@ -698,13 +1001,21 @@ struct dummy_vertex {
 };
 
 using MeshTri = metal::mesh<dummy_vertex, void, 130, 128, topology::triangle>;
+using MeshLine = metal::mesh<dummy_vertex, void, 130, 128, topology::line>;
 
-void generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) asm(
-    "dxmt.domain_generate_primitives.triangle"
-);
+/* Primitive index sinks: the mesh variants write the mesh index buffer, the capture variants
+ * (TS->GS pass 1) write `indices[p * K + k]` into the capture scratch. Both share the generators
+ * below, so order and winding are identical. */
+void sink_set_index(MeshTri mesh, uint i, uint v) { mesh.set_index(i, v); }
+void sink_set_index(MeshLine mesh, uint i, uint v) { mesh.set_index(i, v); }
+void sink_set_index(device uint *indices, uint i, uint v) { indices[i] = v; }
+void sink_finish(MeshTri mesh, uint count) { mesh.set_primitive_count(count); }
+void sink_finish(MeshLine mesh, uint count) { mesh.set_primitive_count(count); }
+void sink_finish(device uint *, uint) {}
 
+template <typename Sink>
 void
-generate_triangle_for_edges(MeshTri mesh, short base_inner, short base_outer, short inner, short outer, short provoke_offset, short ccw_xor) {
+generate_triangle_for_edges(Sink sink, short base_inner, short base_outer, short inner, short outer, short provoke_offset, short ccw_xor) {
   for (short i = 0; i <= inner; i++) {
     half frac_left = half(i) / half(inner + 1);
     half frac_right = half(i + 1) / half(inner + 1);
@@ -714,21 +1025,22 @@ generate_triangle_for_edges(MeshTri mesh, short base_inner, short base_outer, sh
     if (count) {
       for (short j = 0; j < count; j++) {
         short primitive_index = base_outer + left + j - provoke_offset - 1;
-        mesh.set_index(primitive_index * 3, base_outer + left + j);
-        mesh.set_index(primitive_index * 3 + (1 ^ ccw_xor), base_outer + left + j + 1);
-        mesh.set_index(primitive_index * 3 + (2 ^ ccw_xor), base_inner + i);
+        sink_set_index(sink, primitive_index * 3, base_outer + left + j);
+        sink_set_index(sink, primitive_index * 3 + (1 ^ ccw_xor), base_outer + left + j + 1);
+        sink_set_index(sink, primitive_index * 3 + (2 ^ ccw_xor), base_inner + i);
       }
     }
     if (i == inner) break;
     short primitive_index = base_inner + i - provoke_offset;
-    mesh.set_index(primitive_index * 3, base_inner + i);
-    mesh.set_index(primitive_index * 3 + (1 ^ ccw_xor), base_outer + right);
-    mesh.set_index(primitive_index * 3 + (2 ^ ccw_xor), base_inner + i + 1);
+    sink_set_index(sink, primitive_index * 3, base_inner + i);
+    sink_set_index(sink, primitive_index * 3 + (1 ^ ccw_xor), base_outer + right);
+    sink_set_index(sink, primitive_index * 3 + (2 ^ ccw_xor), base_inner + i + 1);
   }
 }
 
-void
-generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) {
+template <typename Sink>
+int
+generate_primitive_triangle_impl(int workload_index, object_data int *data, Sink sink, short ccw_xor) {
   object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
 
   short primitive_count = 0;
@@ -738,7 +1050,7 @@ generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mes
     short base_outer = max_in + 1;
 
     primitive_count += max_in + max_out;
-    generate_triangle_for_edges(mesh, 0, base_outer, max_in, max_out, 0, 0);
+    generate_triangle_for_edges(sink, 0, base_outer, max_in, max_out, 0, ccw_xor);
   }
 
   if (workload.has_complement) {
@@ -748,79 +1060,119 @@ generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mes
     short base_outer = base_inner + max_in + 1;
 
     primitive_count += max_in + max_out;
-    generate_triangle_for_edges(mesh, base_inner, base_outer, max_in, max_out, 2, 0);
+    generate_triangle_for_edges(sink, base_inner, base_outer, max_in, max_out, 2, ccw_xor);
   }
 
-  mesh.set_primitive_count(primitive_count);
+  sink_finish(sink, primitive_count);
+  return primitive_count;
 }
 
-void generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri mesh) asm(
+/* Isoline connectivity: each line of detail + 1 points is detail segments (CHWTessellator::IsoLineGenerateConnectivity).
+ * Workload points: line A at [0, inner_factor_i], line B at [inner_factor_i + 1, ...]. */
+template <typename Sink>
+int
+generate_primitive_line_impl(int workload_index, object_data int *data, Sink sink) {
+  object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
+  short primitive_count = 0;
+  const short lines = workload.outer_factor_i < 0 ? 1 : 2;
+  for (short l = 0; l < lines; l++) {
+    const short segments = l ? workload.outer_factor_i : workload.inner_factor_i;
+    const short base = l ? workload.inner_factor_i + 1 : 0;
+    for (short s = 0; s < segments; s++) {
+      sink_set_index(sink, primitive_count * 2, base + s);
+      sink_set_index(sink, primitive_count * 2 + 1, base + s + 1);
+      primitive_count++;
+    }
+  }
+  sink_finish(sink, primitive_count);
+  return primitive_count;
+}
+
+template <typename Sink>
+int
+generate_primitive_point_impl(int workload_index, object_data int *data, Sink sink) {
+  object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
+  // Point workloads hold only unique points (gen_workload_*_points / isoline): one point per DS vertex.
+  const short count = workload_point_count(workload);
+  for (short i = 0; i < count; i++)
+    sink_set_index(sink, i, i);
+  sink_finish(sink, count);
+  return count;
+}
+
+int generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) asm(
+    "dxmt.domain_generate_primitives.triangle"
+);
+int
+generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) {
+  return generate_primitive_triangle_impl(workload_index, data, mesh, 0);
+}
+
+int generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri mesh) asm(
     "dxmt.domain_generate_primitives.triangle_ccw"
 );
-
-void
+int
 generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri mesh) {
-  object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
-
-  short primitive_count = 0;
-  {
-    short max_in = workload.inner_factor_i;
-    short max_out = workload.outer_factor_i;
-    short base_outer = max_in + 1;
-
-    primitive_count += max_in + max_out;
-    generate_triangle_for_edges(mesh, 0, base_outer, max_in, max_out, 0, 3);
-  }
-
-  if (workload.has_complement) {
-    short max_in = workload.inner_factor_c_i;
-    short max_out = workload.outer_factor_c_i;
-    short base_inner = 2 + workload.inner_factor_i + workload.outer_factor_i;
-    short base_outer = base_inner + max_in + 1;
-
-    primitive_count += max_in + max_out;
-    generate_triangle_for_edges(mesh, base_inner, base_outer, max_in, max_out, 2, 3);
-  }
-
-  mesh.set_primitive_count(primitive_count);
+  return generate_primitive_triangle_impl(workload_index, data, mesh, 3);
 }
 
-void generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) asm(
+int generatePrimitiveLine(int workload_index, object_data int *data, MeshLine mesh) asm(
+    "dxmt.domain_generate_primitives.line"
+);
+int
+generatePrimitiveLine(int workload_index, object_data int *data, MeshLine mesh) {
+  return generate_primitive_line_impl(workload_index, data, mesh);
+}
+
+int generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) asm(
     "dxmt.domain_generate_primitives.point"
 );
-
-void
+int
 generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) {
-  object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
+  return generate_primitive_point_impl(workload_index, data, mesh);
+}
 
-  short index_count = 0;
+int generatePrimitiveTriangleCapture(int workload_index, object_data int *data, device uint *indices) asm(
+    "dxmt.domain_generate_primitives.triangle.capture"
+);
+int
+generatePrimitiveTriangleCapture(int workload_index, object_data int *data, device uint *indices) {
+  return generate_primitive_triangle_impl(workload_index, data, indices, 0);
+}
 
-  {
-    short max_in = workload.inner_factor_i;
-    short max_out = workload.outer_factor_i;
-    short base_outer = max_in + 1;
+int generatePrimitiveTriangleCCWCapture(int workload_index, object_data int *data, device uint *indices) asm(
+    "dxmt.domain_generate_primitives.triangle_ccw.capture"
+);
+int
+generatePrimitiveTriangleCCWCapture(int workload_index, object_data int *data, device uint *indices) {
+  return generate_primitive_triangle_impl(workload_index, data, indices, 3);
+}
 
-    for (short i = 0; i < max_in + 1; i++) {
-      mesh.set_index(index_count++, i);
-    }
-    for (short i = 0; i < max_out + 1; i++) {
-      mesh.set_index(index_count++, i + base_outer);
-    }
-  }
+int generatePrimitiveLineCapture(int workload_index, object_data int *data, device uint *indices) asm(
+    "dxmt.domain_generate_primitives.line.capture"
+);
+int
+generatePrimitiveLineCapture(int workload_index, object_data int *data, device uint *indices) {
+  return generate_primitive_line_impl(workload_index, data, indices);
+}
 
-  if (workload.has_complement) {
-    short max_in = workload.inner_factor_c_i;
-    short max_out = workload.outer_factor_c_i;
-    short base_inner = 2 + workload.inner_factor_i + workload.outer_factor_i;
-    short base_outer = base_inner + max_in + 1;
+int generatePrimitivePointCapture(int workload_index, object_data int *data, device uint *indices) asm(
+    "dxmt.domain_generate_primitives.point.capture"
+);
+int
+generatePrimitivePointCapture(int workload_index, object_data int *data, device uint *indices) {
+  return generate_primitive_point_impl(workload_index, data, indices);
+}
 
-    for (short i = 0; i < max_in + 1; i++) {
-      mesh.set_index(index_count++, i + base_inner);
-    }
-    for (short i = 0; i < max_out + 1; i++) {
-      mesh.set_index(index_count++, i + base_outer);
-    }
-  }
-
-  mesh.set_primitive_count(index_count);
+/* Rank of a workload among its patch's workloads (TS->GS capture slot). A patch's workloads are
+ * emitted by one thread in order, so rank = #{ j < workload_index : same patch_index }. */
+int get_domain_workload_rank(int workload_index, object_data int *data) asm("dxmt.get_domain_workload_rank");
+int
+get_domain_workload_rank(int workload_index, object_data int *data) {
+  object_data TessMeshWorkload *workloads = (object_data TessMeshWorkload *)data;
+  const short patch_index = workloads[workload_index].patch_index;
+  int rank = 0;
+  for (int j = 0; j < workload_index; j++)
+    rank += workloads[j].patch_index == patch_index ? 1 : 0;
+  return rank;
 }

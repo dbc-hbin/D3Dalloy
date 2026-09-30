@@ -26,6 +26,8 @@ enum airconv_unixcalls {
    */
   unix_sm50_rt_enumerate_exports = 146,
   unix_sm50_rt_compile_pipeline,
+  unix_sm50_needs_raster_ordered_buffer_marker = 212,
+  unix_sm50_copy_compiled_bitcode = 215,
 };
 
 /** One export of a DXIL library, as reported by SM50RTEnumerateLibraryExports. */
@@ -90,6 +92,14 @@ struct sm50_get_compiled_bitcode_params {
 
 struct sm50_destroy_bitcode_params {
   sm50_bitcode_t bitcode;
+};
+
+struct sm50_copy_compiled_bitcode_params {
+  sm50_bitcode_t bitcode;
+  uint64_t part;
+  uint64_t destination; /* caller-image address, zero-extended from a 32-bit PE */
+  uint64_t size;
+  int ret;
 };
 
 struct sm50_get_error_message_params {
@@ -159,6 +169,13 @@ struct sm50_get_arguments_info_params {
   struct MTL_SM50_SHADER_ARGUMENT *arguments;
 };
 
+struct sm50_needs_raster_ordered_buffer_marker_params {
+  sm50_shader_t shader;
+  const void *root_signature;
+  size_t root_signature_length;
+  int ret;
+};
+
 #if defined(__LP64__) || defined(_WIN64)
 #define COMPATIBLE_STRUCT32(stru, size) _Static_assert(sizeof(struct stru##32) == size, "incompatible struct size");
 #else
@@ -193,6 +210,9 @@ struct sm50_get_compiled_bitcode_params32 {
 };
 
 COMPATIBLE_STRUCT32(sm50_get_compiled_bitcode_params, 16)
+
+/* All fields are fixed-width, so the 32-bit and 64-bit layouts are identical and need no conversion. */
+_Static_assert(sizeof(struct sm50_copy_compiled_bitcode_params) == 40, "incompatible struct size");
 
 struct sm50_get_error_message_params32 {
   sm50_error_t error;
@@ -270,6 +290,15 @@ struct sm50_get_arguments_info_params32 {
 };
 
 COMPATIBLE_STRUCT32(sm50_get_arguments_info_params, 16)
+
+struct sm50_needs_raster_ordered_buffer_marker_params32 {
+  sm50_shader_t shader;
+  uint32_t root_signature;
+  uint32_t root_signature_length;
+  int ret;
+};
+
+COMPATIBLE_STRUCT32(sm50_needs_raster_ordered_buffer_marker_params, 24)
 
 struct sm50_rt_enumerate_exports_params32 {
   uint32_t bytecode;

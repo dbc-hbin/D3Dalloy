@@ -196,9 +196,8 @@ int run() {
                                           D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
                                           D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_RENDER_TARGET),
                                       D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL,
-                                      D3D12_FORMAT_SUPPORT2_NONE,
-                                      static_cast<D3D12_FORMAT_SUPPORT2>(
-                                          D3D12_FORMAT_SUPPORT2_TILED | D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP),
+                                      // TiledResourcesTier 2: reserved 2D textures (tiled suite).
+                                      D3D12_FORMAT_SUPPORT2_TILED, D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP,
                                       "R8G8B8A8_UNORM");
 
     contractFailures += requireFormat(device.Get(), DXGI_FORMAT_R16G16_TYPELESS,
@@ -217,7 +216,7 @@ int run() {
                                           D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
                                           D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE),
                                       D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL,
-                                      D3D12_FORMAT_SUPPORT2_NONE, D3D12_FORMAT_SUPPORT2_TILED,
+                                      D3D12_FORMAT_SUPPORT2_TILED, D3D12_FORMAT_SUPPORT2_NONE,
                                       "R16G16_FLOAT");
 
     contractFailures += requireFormat(device.Get(), DXGI_FORMAT_R32G8X24_TYPELESS,
@@ -233,9 +232,11 @@ int run() {
 
     contractFailures += requireFormat(device.Get(), DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
                                       static_cast<D3D12_FORMAT_SUPPORT1>(
-                                          D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+                                          D3D12_FORMAT_SUPPORT1_TEXTURE2D |
                                           D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL),
                                       static_cast<D3D12_FORMAT_SUPPORT1>(
+                                          D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+                                          D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON |
                                           D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
                                           D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW |
                                           D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE),
@@ -245,16 +246,19 @@ int run() {
                                           D3D12_FORMAT_SUPPORT2_TILED),
                                       "D32_FLOAT_S8X24_UINT");
 
-    contractFailures += requireFormat(device.Get(), DXGI_FORMAT_R32G32B32_FLOAT,
-                                      D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER,
+    contractFailures += requireFormat(device.Get(), DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
                                       static_cast<D3D12_FORMAT_SUPPORT1>(
-                                          D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_TEXTURE1D |
-                                          D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_TEXTURE3D |
-                                          D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW),
-                                      D3D12_FORMAT_SUPPORT2_NONE,
-                                      static_cast<D3D12_FORMAT_SUPPORT2>(
-                                          D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE),
-                                      "R32G32B32_FLOAT");
+                                          D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD),
+                                      D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL,
+                                      D3D12_FORMAT_SUPPORT2_NONE, D3D12_FORMAT_SUPPORT2_NONE,
+                                      "R32_FLOAT_X8X24_TYPELESS");
+    contractFailures += requireFormat(device.Get(), DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+                                      static_cast<D3D12_FORMAT_SUPPORT1>(
+                                          D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD),
+                                      D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL,
+                                      D3D12_FORMAT_SUPPORT2_NONE, D3D12_FORMAT_SUPPORT2_NONE,
+                                      "X32_TYPELESS_G8X24_UINT");
+
 
     D3D12_FEATURE_DATA_FORMAT_SUPPORT invalid{};
     invalid.Format = static_cast<DXGI_FORMAT>(0x7fffffff);

@@ -35,25 +35,35 @@
  *   (`Converter::operator()(const InstFloatUnaryOp &)` uses AIRBuilder with
  *   FastVariant = true) and D3D's relaxed precision contract for these ops.
  *
- * FP64: DXIL double precision is *not* lowered here. The only semantics-exact FP64
- *   rewrite in the product is the UNORM24 pattern performed on the container by
- *   dxil_fp64_prepass.{h,cpp}; if a `dx.op` that inherently produces or consumes an
- *   f64 value survives into this pass (makeDouble/splitDouble, the i64/f64 bitcasts
- *   and the legacy double conversions) the compile fails with a precise diagnostic
- *   instead of emitting a silently wrong approximation.
+ * FP64: Apple GPUs have no double precision ALU and the device reports
+ *   DoublePrecisionFloatShaderOps = FALSE. Any `dx.op` that produces or consumes an
+ *   f64 value (makeDouble/splitDouble, the i64/f64 bitcasts, the legacy double
+ *   conversions) and any plain LLVM instruction with a double operand or result
+ *   fails the compile with a precise diagnostic instead of being approximated.
+ *
+ * Waves: an AIR simdgroup is the D3D wave; Apple simdgroups are always 32 lanes, so
+ *   ballots and lane masks are 32 bit and lane loops run 32 iterations. Metal's
+ *   simdgroup reductions include pixel shader helper threads, D3D wave operations do
+ *   not (unless the entry carries `waveops-include-helper-lanes`), so in pixel
+ *   shaders helper lanes are replaced by the reduction identity and masked out of
+ *   votes and ballots. Quad operations include helper lanes in both APIs.
  */
 
 #include "dxil_converter.hpp"
 
+#include "airconv_context.hpp"
 #include "nt/air_builder.hpp"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
@@ -158,7 +168,35 @@ enum DxilOpcode : uint32_t {
   OpLegacyDoubleToUInt32 = 134,
   OpWaveAllBitCount = 135,
   OpWavePrefixBitCount = 136,
+  OpDot2AddHalf = 162,
+  OpDot4AddI8Packed = 163,
+  OpDot4AddU8Packed = 164,
+  OpWaveMatch = 165,
+  OpWaveMultiPrefixOp = 166,
+  OpWaveMultiPrefixBitCount = 167,
+  OpUnpack4x8 = 219,
+  OpPack4x8 = 220,
+  OpIsHelperLane = 221,
+  OpQuadVote = 222,
+  OpBarrierByMemoryType = 244,
 };
+
+/** Apple simdgroups are always 32 lanes wide (the only WaveSize the device accepts). */
+constexpr unsigned kWaveLanes = 32;
+
+/** DXIL::MemoryTypeFlag and DXIL::BarrierSemanticFlag (SM 6.8 barriers). */
+enum DxilMemoryTypeBit : uint32_t {
+  kMemoryTypeUAV = 1u << 0,
+  kMemoryTypeGroupShared = 1u << 1,
+};
+enum DxilBarrierSemanticBit : uint32_t {
+  kSemanticGroupSync = 1u << 0,
+  kSemanticGroupScope = 1u << 1,
+  kSemanticDeviceScope = 1u << 2,
+};
+
+/** Reduction kinds shared by the active, prefix and multi-prefix wave operations. */
+enum class WaveReduce { Sum, Product, Min, Max, And, Or, Xor };
 
 /** DXIL barrier mode bits (`dxil::BarrierMode`); the operand is a bitmask. */
 enum DxilBarrierBit : uint32_t {
@@ -193,20 +231,6 @@ getDxilOpcode(const CallInst &call, uint32_t &opcode) {
 bool
 isPreciseCall(const CallInst &call) {
   return call.getMetadata("dx.precise") != nullptr;
-}
-
-/** Last component of a dx.op symbol, e.g. "u32" in `dx.op.waveActiveOp.u32`. */
-StringRef
-overloadName(const Function &callee) {
-  StringRef name = callee.getName();
-  size_t dot = name.rfind('.');
-  return dot == StringRef::npos ? name : name.substr(dot + 1);
-}
-
-/** Unsigned overloads carry a `u` prefix in the dx.op symbol ("u32", "u16", "u64"). */
-bool
-isUnsignedOverload(StringRef overload) {
-  return overload.startswith("u");
 }
 
 /**
@@ -316,9 +340,31 @@ public:
 private:
   Module &module;
   raw_ostream &debug;
+  /** The module's AIR entry is a fragment function (helper lanes exist). */
+  bool pixel_stage = false;
+  /** The DXIL entry carries `waveops-include-helper-lanes` (SM 6.7). */
+  bool waves_include_helpers = false;
+  /** The module's AIR entry is a kernel (SM 6.6 compute derivatives use quad shuffles). */
+  bool kernel_stage = false;
+  /** The AIR entry is a vertex function, where the lane-index and simdgroup-size intrinsics
+   * are illegal ("vertex function uses illegal functions"). */
+  bool vertex_stage = false;
+  /** Vertex stage: the lane index of each function, computed once at its entry. */
+  DenseMap<Function *, Value *> vertex_lanes;
+  Value *laneIndex(IRBuilder<> &builder);
 
   bool owns(uint32_t opcode) const;
   Error lowerCall(CallInst &call, uint32_t opcode);
+  /** Rewrites the fp32 arithmetic and comparisons of "preserve" functions (see run()). */
+  void preserveDenormals();
+  /** The function declares "fp32-denorm-mode"="preserve" (SM 6.2). */
+  static bool preserves(const Function &function);
+  /** fp32 add/sub/mul/div through the exact dxmt.denorm.* helpers. */
+  Value *exactBinary(IRBuilder<> &builder, Instruction::BinaryOps op, Value *a, Value *b);
+  /** fcmp evaluated on the IEEE ordering of the bit patterns: a denormal is not zero. */
+  Value *exactCompare(IRBuilder<> &builder, CmpInst::Predicate predicate, Value *a, Value *b);
+  /** Set once a dxmt.denorm.* helper is referenced; run() links air_denorm.metal. */
+  bool uses_denorm_helpers = false;
 
   Error expectArgs(const CallInst &call, unsigned expected, StringRef what) const;
   Error expectAggregateResult(const CallInst &call, unsigned count, Type *element, StringRef what) const;
@@ -336,6 +382,9 @@ private:
   Expected<Value *> lowerDerivative(CallInst &call, uint32_t opcode, IRBuilder<> &builder, air::AIRBuilder &air);
   Expected<Value *> lowerBitcast(CallInst &call, uint32_t opcode, IRBuilder<> &builder);
   Expected<Value *> lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builder, air::AIRBuilder &air);
+  Expected<Value *> lowerPacked(CallInst &call, uint32_t opcode, IRBuilder<> &builder);
+  Error lowerBarrierByMemoryType(CallInst &call, air::AIRBuilder &air);
+  Error emitBarrier(bool sync, bool group_shared, bool uav, bool device_scope, air::AIRBuilder &air);
 };
 
 Error
@@ -437,6 +486,19 @@ OperationLowerer::owns(uint32_t opcode) const {
   case OpQuadOp:
   case OpWaveAllBitCount:
   case OpWavePrefixBitCount:
+  case OpWaveMatch:
+  case OpWaveMultiPrefixOp:
+  case OpWaveMultiPrefixBitCount:
+  case OpIsHelperLane:
+  case OpQuadVote:
+  /* SM 6.4 / 6.6 packed math */
+  case OpDot2AddHalf:
+  case OpDot4AddI8Packed:
+  case OpDot4AddU8Packed:
+  case OpUnpack4x8:
+  case OpPack4x8:
+  /* SM 6.8 barriers */
+  case OpBarrierByMemoryType:
   /* bitcasts and half conversions */
   case OpBitcastI16toF16:
   case OpBitcastF16toI16:
@@ -459,8 +521,38 @@ OperationLowerer::owns(uint32_t opcode) const {
   }
 }
 
+/*
+ * The simdgroup lane index. Kernels and fragments use air.get_thread_index_in_simdgroup.
+ * Vertex functions may not; there the active lanes at function entry are the contiguous
+ * lanes 0..n-1 (M5 Pro probe: every partial draw of 1/7/33/45/100 vertices), so the lane
+ * index is the exclusive prefix count taken once in the entry block.
+ */
+Value *
+OperationLowerer::laneIndex(IRBuilder<> &builder) {
+  Type *i32 = builder.getInt32Ty();
+  if (!vertex_stage)
+    return emitAIR(builder, "air.get_thread_index_in_simdgroup.i32", {}, i32, true);
+  Function *function = builder.GetInsertBlock()->getParent();
+  Value *&lane = vertex_lanes[function];
+  if (!lane) {
+    IRBuilder<> entry(&*function->getEntryBlock().getFirstInsertionPt());
+    lane = emitAIR(entry, "air.simd_prefix_exclusive_sum.u.i32", {entry.getInt32(1)}, i32, true);
+  }
+  return lane;
+}
+
 Error
 OperationLowerer::run() {
+  if (auto *fragments = module.getNamedMetadata("air.fragment"))
+    pixel_stage = fragments->getNumOperands() != 0;
+  if (auto *kernels = module.getNamedMetadata("air.kernel"))
+    kernel_stage = kernels->getNumOperands() != 0;
+  if (auto *vertices = module.getNamedMetadata("air.vertex"))
+    vertex_stage = vertices->getNumOperands() != 0;
+  for (Function &function : module)
+    if (function.hasFnAttribute("waveops-include-helper-lanes"))
+      waves_include_helpers = true;
+
   SmallVector<std::pair<CallInst *, uint32_t>, 64> worklist;
   for (Function &function : module) {
     if (function.isDeclaration())
@@ -480,6 +572,36 @@ OperationLowerer::run() {
       return error;
   }
 
+  preserveDenormals();
+  if (uses_denorm_helpers)
+    dxmt::linkDenorm(module);
+  /* The mode is fully applied; it is a DXIL attribute, not an AIR one. */
+  for (Function &function : module)
+    function.removeFnAttr("fp32-denorm-mode");
+  /* DXC also emits plain LLVM double arithmetic (fpext, fmul double, fptoui
+   * double, ...). Metal has no f64 ALU, so any double value is rejected. */
+  for (Function &function : module) {
+    for (BasicBlock &block : function) {
+      for (Instruction &instruction : block) {
+        bool uses_double = instruction.getType()->getScalarType()->isDoubleTy();
+        for (const Use &operand : instruction.operands())
+          uses_double |= operand->getType()->getScalarType()->isDoubleTy();
+        if (uses_double)
+          return unsupported("FP64 arithmetic (DoublePrecisionFloatShaderOps is not supported)");
+        /* Metal's backend cannot lower 64 bit atomics on threadgroup memory (the PSO
+         * compile service crashes); AtomicInt64OnGroupSharedSupported stays FALSE. */
+        Type *atomic_type = nullptr;
+        if (auto *rmw = dyn_cast<AtomicRMWInst>(&instruction))
+          atomic_type = rmw->getValOperand()->getType();
+        else if (auto *exchange = dyn_cast<AtomicCmpXchgInst>(&instruction))
+          atomic_type = exchange->getNewValOperand()->getType();
+        if (atomic_type && atomic_type->isIntegerTy(64))
+          return unsupported("64 bit atomic on group shared memory (AtomicInt64OnGroupSharedSupported is not "
+                             "supported)");
+      }
+    }
+  }
+
   /* Declarations of everything we lowered are dead now; drop them so that the
    * final module contains no `dx.op.` symbol at all. Declarations still in use
    * belong to other passes and are left alone. */
@@ -494,14 +616,159 @@ OperationLowerer::run() {
   return Error::success();
 }
 
+/*
+ * SM 6.2 "fp32-denorm-mode" (DXIL.rst "DXIL 1.2 Changes"; DXC wiki Denorm-Mode).
+ * Apple GPUs flush fp32 denormals on input and output of every fp32 ALU operation,
+ * comparisons included, and Metal offers no mode that preserves them
+ * (air.compile.denorms_enable / `-fdenorms` change nothing on the GPU); fp16 keeps
+ * its denormals natively. So:
+ *   "any", "ftz": native arithmetic (flush to zero, sign preserved).
+ *   "preserve": fp32 fadd/fsub/fmul/fdiv call the exact dxmt.denorm.* helpers
+ *     (shaders/air_denorm.metal), fcmp compares IEEE bit orderings; FMad, dot and
+ *     float wave sums/products were already expanded into those operations by their
+ *     lowerings. Everything else is exact on bit patterns (fneg, fabs, loads/stores,
+ *     bitcasts, conversions, IsNaN/IsInf/IsFinite/IsNormal) or explicitly allowed to
+ *     flush by DXIL.rst (FMin/FMax "denorms are flushed before comparison", sqrt,
+ *     rsqrt, the rounding ops, frc, log and the transcendental tables map ±denorm
+ *     to the ±0 result).
+ */
+bool
+OperationLowerer::preserves(const Function &function) {
+  Attribute mode = function.getFnAttribute("fp32-denorm-mode");
+  return mode.isStringAttribute() && mode.getValueAsString() == "preserve";
+}
+
+Value *
+OperationLowerer::exactBinary(IRBuilder<> &builder, Instruction::BinaryOps op, Value *a, Value *b) {
+  StringRef name;
+  switch (op) {
+  case Instruction::FAdd:
+    name = "dxmt.denorm.fadd.f32";
+    break;
+  case Instruction::FSub:
+    name = "dxmt.denorm.fsub.f32";
+    break;
+  case Instruction::FMul:
+    name = "dxmt.denorm.fmul.f32";
+    break;
+  case Instruction::FDiv:
+    name = "dxmt.denorm.fdiv.f32";
+    break;
+  default:
+    return builder.CreateBinOp(op, a, b);
+  }
+  uses_denorm_helpers = true;
+  Type *f32 = builder.getFloatTy();
+  LLVMContext &context = builder.getContext();
+  AttributeList attributes = AttributeList::get(context, {{~0U, Attribute::get(context, Attribute::ReadNone)},
+                                                          {~0U, Attribute::get(context, Attribute::NoUnwind)},
+                                                          {~0U, Attribute::get(context, Attribute::WillReturn)}});
+  FunctionCallee helper = module.getOrInsertFunction(name, FunctionType::get(f32, {f32, f32}, false), attributes);
+  return builder.CreateCall(helper, {a, b});
+}
+
+Value *
+OperationLowerer::exactCompare(IRBuilder<> &builder, CmpInst::Predicate predicate, Value *a, Value *b) {
+  Type *i32 = builder.getInt32Ty();
+  if (predicate == CmpInst::FCMP_FALSE)
+    return builder.getFalse();
+  if (predicate == CmpInst::FCMP_TRUE)
+    return builder.getTrue();
+  auto magnitude = [&](Value *x) { return builder.CreateAnd(builder.CreateBitCast(x, i32), 0x7fffffffu); };
+  /* The total order key: -|x| for negative x, |x| otherwise (so -0 == +0). */
+  auto key = [&](Value *x, Value *m) {
+    Value *negative = builder.CreateICmpSLT(builder.CreateBitCast(x, i32), builder.getInt32(0));
+    return builder.CreateSelect(negative, builder.CreateNeg(m), m);
+  };
+  Value *ma = magnitude(a), *mb = magnitude(b);
+  Value *unordered = builder.CreateOr(builder.CreateICmpUGT(ma, builder.getInt32(0x7f800000u)),
+                                      builder.CreateICmpUGT(mb, builder.getInt32(0x7f800000u)));
+  Value *ka = key(a, ma), *kb = key(b, mb);
+  Value *relation = nullptr;
+  switch (predicate) {
+  case CmpInst::FCMP_OEQ:
+  case CmpInst::FCMP_UEQ:
+    relation = builder.CreateICmpEQ(ka, kb);
+    break;
+  case CmpInst::FCMP_ONE:
+  case CmpInst::FCMP_UNE:
+    relation = builder.CreateICmpNE(ka, kb);
+    break;
+  case CmpInst::FCMP_OLT:
+  case CmpInst::FCMP_ULT:
+    relation = builder.CreateICmpSLT(ka, kb);
+    break;
+  case CmpInst::FCMP_OLE:
+  case CmpInst::FCMP_ULE:
+    relation = builder.CreateICmpSLE(ka, kb);
+    break;
+  case CmpInst::FCMP_OGT:
+  case CmpInst::FCMP_UGT:
+    relation = builder.CreateICmpSGT(ka, kb);
+    break;
+  case CmpInst::FCMP_OGE:
+  case CmpInst::FCMP_UGE:
+    relation = builder.CreateICmpSGE(ka, kb);
+    break;
+  case CmpInst::FCMP_ORD:
+    return builder.CreateNot(unordered);
+  case CmpInst::FCMP_UNO:
+    return unordered;
+  default:
+    return nullptr;
+  }
+  return CmpInst::isUnordered(predicate) ? builder.CreateOr(unordered, relation)
+                                         : builder.CreateAnd(builder.CreateNot(unordered), relation);
+}
+
+void
+OperationLowerer::preserveDenormals() {
+  SmallVector<Instruction *, 64> rewrite;
+  for (Function &function : module) {
+    if (function.isDeclaration() || !preserves(function))
+      continue;
+    for (Instruction &instruction : instructions(function)) {
+      if (auto *binary = dyn_cast<BinaryOperator>(&instruction)) {
+        if (binary->getType()->isFloatTy() &&
+            (binary->getOpcode() == Instruction::FAdd || binary->getOpcode() == Instruction::FSub ||
+             binary->getOpcode() == Instruction::FMul || binary->getOpcode() == Instruction::FDiv))
+          rewrite.push_back(binary);
+      } else if (auto *compare = dyn_cast<FCmpInst>(&instruction)) {
+        if (compare->getOperand(0)->getType()->isFloatTy())
+          rewrite.push_back(compare);
+      }
+    }
+  }
+  for (Instruction *instruction : rewrite) {
+    IRBuilder<> builder(instruction);
+    Value *replacement = nullptr;
+    if (auto *compare = dyn_cast<FCmpInst>(instruction)) {
+      replacement = exactCompare(builder, compare->getPredicate(), compare->getOperand(0), compare->getOperand(1));
+    } else {
+      auto *binary = cast<BinaryOperator>(instruction);
+      Value *a = binary->getOperand(0), *b = binary->getOperand(1);
+      /* DXC spells negation `fsub -0.0, x`: a sign flip, exact on the bits. */
+      auto *zero = dyn_cast<ConstantFP>(a);
+      if (binary->getOpcode() == Instruction::FSub && zero && zero->isZero() && zero->isNegative())
+        replacement = builder.CreateFNeg(b);
+      else
+        replacement = exactBinary(builder, binary->getOpcode(), a, b);
+    }
+    if (!replacement)
+      continue;
+    replacement->takeName(instruction);
+    instruction->replaceAllUsesWith(replacement);
+    instruction->eraseFromParent();
+  }
+}
+
 Error
 OperationLowerer::lowerCall(CallInst &call, uint32_t opcode) {
   IRBuilder<> builder(&call);
   air::AIRBuilder air_builder(builder, debug);
 
-  /* FP64 is rejected up front: the UNORM24 rewrite runs on the container before
-   * the module is parsed, so any double that reaches this point is genuine
-   * unsupported precision. */
+  /* FP64 is rejected up front: Apple GPUs have no double precision and the device
+   * reports DoublePrecisionFloatShaderOps = FALSE. */
   switch (opcode) {
   case OpMakeDouble:
   case OpSplitDouble:
@@ -510,10 +777,7 @@ OperationLowerer::lowerCall(CallInst &call, uint32_t opcode) {
   case OpLegacyDoubleToFloat:
   case OpLegacyDoubleToSInt32:
   case OpLegacyDoubleToUInt32:
-    return unsupported(
-      "dx.op FP64 operation; only the semantics-exact UNORM24 rewrite of "
-      "dxil_fp64_prepass is supported"
-    );
+    return unsupported("dx.op FP64 operation (DoublePrecisionFloatShaderOps is not supported)");
   default:
     break;
   }
@@ -606,7 +870,22 @@ OperationLowerer::lowerCall(CallInst &call, uint32_t opcode) {
     case OpQuadOp:
     case OpWaveAllBitCount:
     case OpWavePrefixBitCount:
+    case OpWaveMatch:
+    case OpWaveMultiPrefixOp:
+    case OpWaveMultiPrefixBitCount:
+    case OpIsHelperLane:
+    case OpQuadVote:
       return lowerWave(call, opcode, builder, air_builder);
+    case OpDot2AddHalf:
+    case OpDot4AddI8Packed:
+    case OpDot4AddU8Packed:
+    case OpUnpack4x8:
+    case OpPack4x8:
+      return lowerPacked(call, opcode, builder);
+    case OpBarrierByMemoryType:
+      if (Error error = lowerBarrierByMemoryType(call, air_builder))
+        return std::move(error);
+      return nullptr;
     case OpBarrier:
       if (Error error = lowerBarrier(call, air_builder))
         return std::move(error);
@@ -775,100 +1054,79 @@ OperationLowerer::lowerBitUnary(CallInst &call, uint32_t opcode, IRBuilder<> &bu
 
   Value *operand = call.getArgOperand(1);
   Type *type = operand->getType();
-  if (call.getType() != type)
-    return createError("dx.op bit operation result type does not match its operand");
   if (!type->isIntegerTy() || (type->getIntegerBitWidth() != 16 && type->getIntegerBitWidth() != 32 &&
                               type->getIntegerBitWidth() != 64))
     return unsupported("dx.op bit operation on an unsupported integer width");
+  /* Bfrev is `unary` (result has the operand type); Countbits/Firstbit* are `unaryBits`,
+   * whose result is i32 for every operand width. */
+  Type *i32 = builder.getInt32Ty();
+  if (call.getType() != (opcode == OpBfrev ? type : i32))
+    return createError("dx.op bit operation result type does not match DXIL");
 
   const unsigned width = type->getIntegerBitWidth();
-  /* 16 and 64 bit values are processed with the verified 32 bit AIR primitives:
-   * widening a 16 bit value keeps the counting arithmetic valid, and a 64 bit
-   * value is handled as two halves. This avoids depending on unverified 16/64 bit
-   * AIR spellings. */
-  Type *compute_type = width == 64 ? builder.getInt64Ty() : builder.getInt32Ty();
-  Value *value = operand;
-  if (width == 16)
-    value = builder.CreateZExt(operand, builder.getInt32Ty());
+  /* 16 and 64 bit values are processed with the 32 bit AIR primitives: a 16 bit
+   * value is widened, a 64 bit value is handled as two halves. */
+  Value *value = width == 16 ? builder.CreateZExt(operand, i32) : operand;
+  auto low_half = [&](Value *v) { return width == 64 ? builder.CreateTrunc(v, i32) : v; };
+  auto high_half = [&](Value *v) { return builder.CreateTrunc(builder.CreateLShr(v, 32), i32); };
+  auto if_zero = [&](Value *v, Value *count) {
+    return builder.CreateSelect(builder.CreateICmpEQ(v, ConstantInt::get(v->getType(), 0)), builder.getInt32(-1),
+                                count);
+  };
+  /* Leading zeros of `v` within the operand width; v is never zero where it is used. */
+  auto leading_zeros = [&](Value *v) -> Value * {
+    if (width == 64) {
+      Value *high = high_half(v);
+      Value *high_clz = air_builder.CreateCountZero(high, /*TrailingZero=*/false);
+      Value *low_clz = builder.CreateAdd(air_builder.CreateCountZero(low_half(v), false), builder.getInt32(32));
+      return builder.CreateSelect(builder.CreateICmpEQ(high, builder.getInt32(0)), low_clz, high_clz);
+    }
+    Value *clz = air_builder.CreateCountZero(v, false);
+    return width == 16 ? builder.CreateSub(clz, builder.getInt32(16)) : clz;
+  };
 
-  auto low_half = [&]() {
-    return width == 64 ? builder.CreateTrunc(value, builder.getInt32Ty()) : value;
-  };
-  auto high_half = [&]() {
-    return builder.CreateTrunc(builder.CreateLShr(value, 32), builder.getInt32Ty());
-  };
-  auto zero_result = [&](Value *count) {
-    return builder.CreateSelect(
-      builder.CreateICmpEQ(operand, ConstantInt::get(type, 0)), ConstantInt::getSigned(compute_type, -1), count
-    );
-  };
-
-  Value *result = nullptr;
   switch (opcode) {
   case OpBfrev: {
     if (width == 64) {
-      /* Bit reversal of 64 bits == reverse both 32 bit halves and swap them. */
-      Value *low = air_builder.CreateIntUnOp(air::AIRBuilder::reverse_bits, low_half());
-      Value *high = air_builder.CreateIntUnOp(air::AIRBuilder::reverse_bits, high_half());
-      Value *shifted = builder.CreateShl(builder.CreateZExt(high, builder.getInt64Ty()), 32);
-      result = builder.CreateOr(shifted, builder.CreateZExt(low, builder.getInt64Ty()));
-    } else {
-      result = air_builder.CreateIntUnOp(air::AIRBuilder::reverse_bits, value);
+      /* Reversing 64 bits reverses both 32 bit halves and swaps them. */
+      Value *low = air_builder.CreateIntUnOp(air::AIRBuilder::reverse_bits, low_half(value));
+      Value *high = air_builder.CreateIntUnOp(air::AIRBuilder::reverse_bits, high_half(value));
+      return builder.CreateOr(builder.CreateShl(builder.CreateZExt(low, type), 32), builder.CreateZExt(high, type));
     }
-    break;
+    Value *reversed = air_builder.CreateIntUnOp(air::AIRBuilder::reverse_bits, value);
+    return width == 16 ? builder.CreateTrunc(builder.CreateLShr(reversed, 16), type) : reversed;
   }
-  case OpCountbits: {
-    if (width == 64) {
-      Value *low = air_builder.CreateIntUnOp(air::AIRBuilder::popcount, low_half());
-      Value *high = air_builder.CreateIntUnOp(air::AIRBuilder::popcount, high_half());
-      result = builder.CreateZExt(builder.CreateAdd(low, high), builder.getInt64Ty());
-    } else {
-      result = air_builder.CreateIntUnOp(air::AIRBuilder::popcount, value);
-    }
-    break;
-  }
+  case OpCountbits:
+    if (width == 64)
+      return builder.CreateAdd(air_builder.CreateIntUnOp(air::AIRBuilder::popcount, low_half(value)),
+                               air_builder.CreateIntUnOp(air::AIRBuilder::popcount, high_half(value)));
+    return air_builder.CreateIntUnOp(air::AIRBuilder::popcount, value);
   case OpFirstbitLo: {
-    /* AIR's ctz of zero is defined (32), so only the zero case needs fixing up:
-     * DXIL returns -1 when no bit is set. */
-    Value *count = nullptr;
+    /* Index of the lowest set bit from the LSB, -1 for zero (AIR's ctz of zero is 32). */
+    Value *count;
     if (width == 64) {
-      Value *low = air_builder.CreateCountZero(low_half(), /*TrailingZero=*/true);
-      Value *high = air_builder.CreateCountZero(high_half(), /*TrailingZero=*/true);
-      Value *high_index = builder.CreateAdd(high, builder.getInt32(32));
-      Value *low_is_zero = builder.CreateICmpEQ(low_half(), builder.getInt32(0));
-      count = builder.CreateZExt(builder.CreateSelect(low_is_zero, high_index, low), builder.getInt64Ty());
+      Value *low = low_half(value);
+      Value *high_index = builder.CreateAdd(air_builder.CreateCountZero(high_half(value), true), builder.getInt32(32));
+      count = builder.CreateSelect(builder.CreateICmpEQ(low, builder.getInt32(0)), high_index,
+                                   air_builder.CreateCountZero(low, true));
     } else {
       count = air_builder.CreateCountZero(value, true);
     }
-    result = zero_result(count);
-    break;
+    return if_zero(operand, count);
   }
   case OpFirstbitHi:
+    /* DXIL counts from the MSB (the HLSL intrinsic is `width - 1 - result`), -1 for zero. */
+    return if_zero(operand, leading_zeros(value));
   case OpFirstbitSHi: {
-    /* Index of the highest set bit, -1 when the value is zero. A negative two's
-     * complement value has its sign bit set, so `width - 1 - clz` already yields
-     * width - 1 there and both DXIL flavours share one implementation. */
-    Value *count = nullptr;
-    if (width == 64) {
-      Value *low = air_builder.CreateCountZero(low_half(), /*TrailingZero=*/false);
-      Value *high = air_builder.CreateCountZero(high_half(), /*TrailingZero=*/false);
-      Value *high_is_zero = builder.CreateICmpEQ(high_half(), builder.getInt32(0));
-      Value *low_index = builder.CreateSub(builder.getInt32(31), low);
-      Value *high_index = builder.CreateSub(builder.getInt32(63), high);
-      count = builder.CreateZExt(builder.CreateSelect(high_is_zero, low_index, high_index), builder.getInt64Ty());
-    } else {
-      count = builder.CreateSub(builder.getInt32(31), air_builder.CreateCountZero(value, false));
-    }
-    result = zero_result(count);
-    break;
+    /* The first bit that differs from the sign bit, counted from the MSB; -1 for 0 and -1. */
+    Value *negative = builder.CreateICmpSLT(operand, ConstantInt::get(type, 0));
+    Value *magnitude = builder.CreateSelect(negative, builder.CreateNot(operand), operand);
+    Value *widened = width == 16 ? builder.CreateZExt(magnitude, i32) : magnitude;
+    return if_zero(magnitude, leading_zeros(widened));
   }
   default:
     return unsupported(("unhandled dx.op bit operation opcode " + Twine(opcode)).str());
   }
-
-  if (result->getType() != type)
-    result = builder.CreateTrunc(result, type);
-  return result;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -991,6 +1249,10 @@ OperationLowerer::lowerMultiplyAdd(
   case OpFma: {
     if (!type->isFloatTy() && !type->isHalfTy())
       return unsupported("dx.op fma on a non floating point type");
+    /* "fp32-denorm-mode"="preserve": FMad may be evaluated unfused, and the separate
+     * multiply and add become exact denormal-preserving helpers in preserveDenormals(). */
+    if (type->isFloatTy() && preserves(*call.getFunction()))
+      return builder.CreateFAdd(builder.CreateFMul(a, b), c);
     /* `air.fma` is used unconditionally, like the SM5 lowering: DXIL FMad allows
      * a split multiply/add, Fma requires the fused form, and the fused form
      * satisfies both (defuseFma is a compilation argument, see
@@ -1079,6 +1341,13 @@ OperationLowerer::lowerDot(CallInst &call, uint32_t opcode, IRBuilder<> &builder
     rhs.push_back(call.getArgOperand(1 + dimension + i));
   }
 
+  /* "preserve": a multiply/add chain that preserveDenormals() makes exact. */
+  if (type->isFloatTy() && preserves(*call.getFunction())) {
+    Value *sum = builder.CreateFMul(lhs[0], rhs[0]);
+    for (unsigned i = 1; i < dimension; ++i)
+      sum = builder.CreateFAdd(sum, builder.CreateFMul(lhs[i], rhs[i]));
+    return sum;
+  }
   Value *result = air_builder.CreateDotProduct(buildVector(builder, type, lhs), buildVector(builder, type, rhs));
   if (!result)
     return createError("failed to build air.dot");
@@ -1107,6 +1376,32 @@ OperationLowerer::lowerDerivative(
    * evaluates derivatives per 2x2 quad and air.dfdx/air.dfdy is the only
    * derivative intrinsic the driver accepts. */
   const bool y_axis = opcode == OpDerivCoarseY || opcode == OpDerivFineY;
+  if (kernel_stage) {
+    /*
+     * SM 6.6 compute derivatives: Metal rejects air.dfdx/dfdy outside fragment
+     * functions, so the quad difference is formed explicitly. Quad lane q = 2*y + x
+     * in Z order (the thread IDs were laid out that way by the stage signature).
+     * Fine: right - left in the lane's own row (x) or bottom - top in its own column
+     * (y). Coarse: the same difference taken from the quad's top-left row/column.
+     */
+    Type *type = operand->getType();
+    auto shuffle = [&](Value *value, unsigned lane_xor) {
+      return emitAIR(builder, airSymbol(air_builder, "air.quad_shuffle_xor", type), {value, builder.getInt16(lane_xor)},
+                     type, true);
+    };
+    auto read = [&](Value *value, unsigned lane) {
+      return emitAIR(builder, airSymbol(air_builder, "air.quad_shuffle", type), {value, builder.getInt16(lane)}, type,
+                     true);
+    };
+    const bool coarse = opcode == OpDerivCoarseX || opcode == OpDerivCoarseY;
+    if (coarse)
+      return y_axis ? builder.CreateFSub(read(operand, 2), read(operand, 0))
+                    : builder.CreateFSub(read(operand, 1), read(operand, 0));
+    Value *lane = laneIndex(builder);
+    Value *bit = builder.CreateICmpNE(builder.CreateAnd(lane, builder.getInt32(y_axis ? 2 : 1)), builder.getInt32(0));
+    Value *other = shuffle(operand, y_axis ? 2 : 1);
+    return builder.CreateSelect(bit, builder.CreateFSub(operand, other), builder.CreateFSub(other, operand));
+  }
   Value *result = air_builder.CreateDerivative(operand, y_axis);
   if (!result)
     return createError("failed to build air.dfd");
@@ -1129,36 +1424,45 @@ OperationLowerer::lowerBarrier(CallInst &call, air::AIRBuilder &air_builder) {
     return createError("dx.op barrier mode must be a constant i32");
   const uint32_t mode = static_cast<uint32_t>(mode_constant->getZExtValue());
 
-  /* The DXIL mode is a bitmask: execution sync, device scoped UAV visibility,
-   * thread group scoped UAV visibility and group shared memory ordering. AIR
-   * expresses the same thing with `air.wg.barrier(<flags>, 1)` for the execution
-   * barrier and `air.atomic.fence(<flags>, 5, <scope>)` for pure memory fences,
-   * which is exactly how the SM5 path lowers `sync`
-   * (Converter::operator()(const InstSync &) in nt/dxbc_converter_base.hpp).
-   * The memory spaces a mode requests are never dropped, and no execution
-   * barrier is invented where DXIL did not ask for one. */
+  if (mode & ~(kBarrierSyncThreadGroup | kBarrierAccessUAVGlobal | kBarrierAccessUAVThreadGroup |
+               kBarrierAccessGroupShared))
+    return createError("dx.op barrier mode has unknown bits");
+  return emitBarrier(mode & kBarrierSyncThreadGroup, mode & kBarrierAccessGroupShared,
+                     mode & (kBarrierAccessUAVGlobal | kBarrierAccessUAVThreadGroup), mode & kBarrierAccessUAVGlobal,
+                     air_builder);
+}
+
+/*
+ * The DXIL modes are execution sync plus the memory spaces to order and the scope
+ * of that ordering. AIR expresses the same thing with `air.wg.barrier(<flags>, 1)`
+ * for the execution barrier and `air.atomic.fence(<flags>, 5, <scope>)` for pure
+ * memory fences, which is exactly how the SM5 path lowers `sync`
+ * (Converter::operator()(const InstSync &) in nt/dxbc_converter_base.hpp). The
+ * memory spaces requested are never dropped, and no execution barrier is invented
+ * where DXIL did not ask for one.
+ */
+Error
+OperationLowerer::emitBarrier(bool sync, bool group_shared, bool uav, bool device_scope, air::AIRBuilder &air_builder) {
   uint32_t memory_bits = static_cast<uint32_t>(air::MemFlags::None);
   uint32_t scope = static_cast<uint32_t>(air::ThreadScope::Threadgroup);
   const uint32_t device_memory =
     static_cast<uint32_t>(air::MemFlags::Device) | static_cast<uint32_t>(air::MemFlags::Texture);
-  if (mode & kBarrierAccessGroupShared)
+  if (group_shared)
     memory_bits |= static_cast<uint32_t>(air::MemFlags::Threadgroup);
-  if (mode & kBarrierAccessUAVThreadGroup)
+  if (uav)
     memory_bits |= device_memory;
-  if (mode & kBarrierAccessUAVGlobal) {
-    memory_bits |= device_memory;
+  if (uav && device_scope)
     scope |= static_cast<uint32_t>(air::ThreadScope::Device);
-  }
   const auto memory = static_cast<air::MemFlags>(memory_bits);
 
-  if (mode == 0)
+  if (!sync && !memory_bits)
     return Error::success(); /* neither execution nor memory ordering requested */
 
-  if (mode & kBarrierSyncThreadGroup) {
+  if (sync) {
     /* Device scoped ordering is not expressible with the thread group barrier
      * flag alone; emit the fence first and then the execution barrier, mirroring
      * the SM5 lowering when non execution barriers are unavailable. */
-    if (mode & kBarrierAccessUAVGlobal)
+    if (uav && device_scope)
       air_builder.CreateAtomicFence(memory, air::ThreadScope(scope));
     air_builder.CreateBarrier(memory, /*SimdGroup=*/false);
     return Error::success();
@@ -1166,6 +1470,28 @@ OperationLowerer::lowerBarrier(CallInst &call, air::AIRBuilder &air_builder) {
 
   air_builder.CreateAtomicFence(memory, air::ThreadScope(scope));
   return Error::success();
+}
+
+/*
+ * SM 6.8 barrierByMemoryType (MemoryTypeFlags, SemanticFlags). Memory types: 1 UAV,
+ * 2 group shared, 4 node input, 8 node output (work graphs; nothing to order
+ * outside a node shader). Semantics: 1 group sync, 2 group scope, 4 device scope,
+ * 8 reorder scope (hit-object reordering, which has no memory effect here).
+ */
+Error
+OperationLowerer::lowerBarrierByMemoryType(CallInst &call, air::AIRBuilder &air_builder) {
+  if (Error error = expectArgs(call, 2, "dx.op barrierByMemoryType"))
+    return error;
+  const auto *types = dyn_cast<ConstantInt>(call.getArgOperand(1));
+  const auto *semantics = dyn_cast<ConstantInt>(call.getArgOperand(2));
+  if (!types || !semantics)
+    return createError("dx.op barrierByMemoryType flags must be constant");
+  const uint32_t type_bits = static_cast<uint32_t>(types->getZExtValue());
+  const uint32_t semantic_bits = static_cast<uint32_t>(semantics->getZExtValue());
+  if (type_bits & ~0xfu || semantic_bits & ~0xfu)
+    return createError("dx.op barrierByMemoryType has unknown flag bits");
+  return emitBarrier(semantic_bits & kSemanticGroupSync, type_bits & kMemoryTypeGroupShared,
+                     type_bits & kMemoryTypeUAV, semantic_bits & kSemanticDeviceScope, air_builder);
 }
 
 Error
@@ -1242,21 +1568,211 @@ OperationLowerer::lowerBitcast(CallInst &call, uint32_t opcode, IRBuilder<> &bui
 /* wave / quad operations                                                     */
 /* -------------------------------------------------------------------------- */
 
+namespace {
+
+/** Wave reduction identity; the value a non-participating lane contributes. */
+Value *
+waveIdentity(IRBuilder<> &builder, WaveReduce kind, Type *type, bool is_signed) {
+  if (type->isFloatingPointTy()) {
+    const fltSemantics &semantics = type->getFltSemantics();
+    switch (kind) {
+    case WaveReduce::Sum:
+      return ConstantFP::get(type, 0.0);
+    case WaveReduce::Product:
+      return ConstantFP::get(type, 1.0);
+    case WaveReduce::Min:
+      return ConstantFP::get(type->getContext(), APFloat::getInf(semantics, false));
+    case WaveReduce::Max:
+      return ConstantFP::get(type->getContext(), APFloat::getInf(semantics, true));
+    default:
+      return nullptr;
+    }
+  }
+  const unsigned width = type->getIntegerBitWidth();
+  switch (kind) {
+  case WaveReduce::Sum:
+  case WaveReduce::Or:
+  case WaveReduce::Xor:
+    return ConstantInt::get(type, 0);
+  case WaveReduce::Product:
+    return ConstantInt::get(type, 1);
+  case WaveReduce::And:
+    return ConstantInt::get(type, APInt::getAllOnes(width));
+  case WaveReduce::Min:
+    return ConstantInt::get(type, is_signed ? APInt::getSignedMaxValue(width) : APInt::getMaxValue(width));
+  case WaveReduce::Max:
+    return ConstantInt::get(type, is_signed ? APInt::getSignedMinValue(width) : APInt::getMinValue(width));
+  }
+  return nullptr;
+}
+
+/** Scalar combine step of a wave reduction, bit exact with the native AIR reductions. */
+Value *
+waveCombine(IRBuilder<> &builder, air::AIRBuilder &air_builder, WaveReduce kind, Value *a, Value *b, bool is_signed) {
+  const bool is_float = a->getType()->isFloatingPointTy();
+  switch (kind) {
+  case WaveReduce::Sum:
+    return is_float ? builder.CreateFAdd(a, b) : builder.CreateAdd(a, b);
+  case WaveReduce::Product:
+    return is_float ? builder.CreateFMul(a, b) : builder.CreateMul(a, b);
+  case WaveReduce::Min:
+    if (is_float)
+      return air_builder.CreateFPBinOp(air::AIRBuilder::fmin, a, b, false);
+    return builder.CreateSelect(is_signed ? builder.CreateICmpSLT(a, b) : builder.CreateICmpULT(a, b), a, b);
+  case WaveReduce::Max:
+    if (is_float)
+      return air_builder.CreateFPBinOp(air::AIRBuilder::fmax, a, b, false);
+    return builder.CreateSelect(is_signed ? builder.CreateICmpSGT(a, b) : builder.CreateICmpUGT(a, b), a, b);
+  case WaveReduce::And:
+    return builder.CreateAnd(a, b);
+  case WaveReduce::Or:
+    return builder.CreateOr(a, b);
+  case WaveReduce::Xor:
+    return builder.CreateXor(a, b);
+  }
+  return nullptr;
+}
+
+/** AIR base name of a native simdgroup reduction or exclusive scan. */
+StringRef
+waveNativeName(WaveReduce kind, bool prefix) {
+  switch (kind) {
+  case WaveReduce::Sum:
+    return prefix ? "air.simd_prefix_exclusive_sum" : "air.simd_sum";
+  case WaveReduce::Product:
+    return prefix ? "air.simd_prefix_exclusive_product" : "air.simd_product";
+  case WaveReduce::Min:
+    return prefix ? "" : "air.simd_min";
+  case WaveReduce::Max:
+    return prefix ? "" : "air.simd_max";
+  case WaveReduce::And:
+    return prefix ? "" : "air.simd_and";
+  case WaveReduce::Or:
+    return prefix ? "" : "air.simd_or";
+  case WaveReduce::Xor:
+    return prefix ? "" : "air.simd_xor";
+  }
+  return "";
+}
+
+} // namespace
+
 Expected<Value *>
 OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builder, air::AIRBuilder &air_builder) {
-  const Function *callee = call.getCalledFunction();
-  const bool is_unsigned = callee && isUnsignedOverload(overloadName(*callee));
-
   /* Wave operations are convergent: they read lane state, so they must not be
    * moved or merged across control flow. */
   const bool convergent = true;
+  Type *i1 = builder.getInt1Ty();
+  Type *i16 = builder.getInt16Ty();
+  Type *i32 = builder.getInt32Ty();
+  Type *i64 = builder.getInt64Ty();
 
-  auto lane_index = [&](Value *index) {
-    /* AIR lane indices are 16 bit wide; DXIL passes them as i32. */
-    return builder.CreateTrunc(index, builder.getInt16Ty());
+  /* D3D excludes pixel shader helper lanes from every wave operation except the
+   * quad family and explicit lane reads; Metal's simdgroup functions include them. */
+  const bool exclude_helpers = pixel_stage && !waves_include_helpers;
+  Value *helper = nullptr;
+  auto is_helper = [&]() -> Value * {
+    if (!exclude_helpers)
+      return nullptr;
+    if (!helper)
+      helper = emitAIR(builder, "air.simd_is_helper_thread", {}, i1, convergent);
+    return helper;
   };
-  auto supported_wave_type = [](Type *type) {
-    return type->isFloatTy() || type->isHalfTy() || type->isIntegerTy(32) || type->isIntegerTy(64);
+  auto participates = [&](Value *condition) -> Value * {
+    if (Value *h = is_helper())
+      return builder.CreateAnd(condition, builder.CreateNot(h));
+    return condition;
+  };
+  auto lane_id = [&]() { return laneIndex(builder); };
+  auto ballot = [&](Value *condition) {
+    /* 32 lanes: the upper half of AIR's 64 bit vote is always zero. */
+    return builder.CreateTrunc(emitAIR(builder, "air.simd_ballot.i64", {condition}, i64, convergent), i32);
+  };
+  auto participating_mask = [&]() { return ballot(participates(builder.getTrue())); };
+  auto first_lane = [&](Value *mask) {
+    return emitAIR(builder, "air.ctz.i32", {mask, builder.getFalse()}, i32, false);
+  };
+  auto lanes_below = [&](Value *lane) { return builder.CreateSub(builder.CreateShl(builder.getInt32(1), lane), builder.getInt32(1)); };
+  auto popcount = [&](Value *mask) { return emitAIR(builder, "air.popcount.i32", {mask}, i32, false); };
+
+  auto supported_type = [](Type *type) {
+    return type->isFloatTy() || type->isHalfTy() || type->isIntegerTy(1) || type->isIntegerTy(16) ||
+           type->isIntegerTy(32) || type->isIntegerTy(64);
+  };
+  /* Lane exchange for every supported type: i64 travels as <2 x i32>, i1 as i32. */
+  auto exchange = [&](StringRef base, Value *value, Value *lane16) -> Value * {
+    Type *type = value->getType();
+    if (type->isIntegerTy(64)) {
+      Type *pair = FixedVectorType::get(i32, 2);
+      Value *moved = emitAIR(builder, (base + ".u.v2i32").str(), {builder.CreateBitCast(value, pair), lane16}, pair,
+                             convergent);
+      return builder.CreateBitCast(moved, type);
+    }
+    if (type->isIntegerTy(1)) {
+      Value *moved = emitAIR(builder, (base + ".u.i32").str(), {builder.CreateZExt(value, i32), lane16}, i32,
+                             convergent);
+      return builder.CreateTrunc(moved, i1);
+    }
+    return emitAIR(builder, airSymbol(air_builder, base, type, airSign(type, true)), {value, lane16}, type, convergent);
+  };
+  auto shuffle = [&](Value *value, Value *lane) {
+    return exchange("air.simd_shuffle", value, builder.CreateTrunc(lane, i16));
+  };
+  auto bits_of = [&](Value *value) -> Value * {
+    Type *type = value->getType();
+    if (type->isFloatingPointTy())
+      return builder.CreateBitCast(value, builder.getIntNTy(type->getPrimitiveSizeInBits()));
+    return value;
+  };
+
+  /*
+   * Reduction over the lanes selected per source lane by `take(lane)`. Used where
+   * AIR has no native form (64 bit values, multi-prefix scans): every lane reads
+   * every lane with a uniform shuffle, which is exact because a lane that is not
+   * taken contributes nothing.
+   */
+  auto lane_loop = [&](WaveReduce kind, Value *value, bool is_signed, function_ref<Value *(unsigned)> take) {
+    Value *accumulator = waveIdentity(builder, kind, value->getType(), is_signed);
+    for (unsigned lane = 0; lane < kWaveLanes; ++lane) {
+      Value *other = shuffle(value, builder.getInt32(lane));
+      accumulator = builder.CreateSelect(take(lane), waveCombine(builder, air_builder, kind, accumulator, other,
+                                                                  is_signed), accumulator);
+    }
+    return accumulator;
+  };
+  auto mask_has = [&](Value *mask, unsigned lane) {
+    return builder.CreateICmpNE(builder.CreateAnd(mask, builder.getInt32(1u << lane)), builder.getInt32(0));
+  };
+
+  auto reduce = [&](WaveReduce kind, Value *value, bool is_signed, bool prefix) -> Expected<Value *> {
+    Type *type = value->getType();
+    StringRef native = waveNativeName(kind, prefix);
+    /* The native float sum/product flushes denormals; under "preserve" the lane loop's
+     * fadd/fmul become exact helpers (preserveDenormals). */
+    const bool exact_float = type->isFloatTy() && (kind == WaveReduce::Sum || kind == WaveReduce::Product) &&
+                             preserves(*call.getFunction());
+    if (type->isIntegerTy(64) || native.empty() || exact_float) {
+      Value *mask = participating_mask();
+      Value *lane = prefix ? lane_id() : nullptr;
+      return lane_loop(kind, value, is_signed, [&](unsigned source) -> Value * {
+        Value *taken = mask_has(mask, source);
+        if (prefix)
+          taken = builder.CreateAnd(taken, builder.CreateICmpULT(builder.getInt32(source), lane));
+        return taken;
+      });
+    }
+    if (Value *h = is_helper())
+      value = builder.CreateSelect(h, waveIdentity(builder, kind, type, is_signed), value);
+    const bool bitwise = kind == WaveReduce::And || kind == WaveReduce::Or || kind == WaveReduce::Xor;
+    air::Signedness sign = airSign(type, bitwise ? true : !is_signed);
+    return emitAIR(builder, airSymbol(air_builder, native, type, sign), {value}, type, convergent);
+  };
+
+  auto constant_kind = [&](unsigned operand, StringRef what) -> Expected<uint32_t> {
+    const auto *kind = dyn_cast<ConstantInt>(call.getArgOperand(operand));
+    if (!kind)
+      return createError(what + " kind must be a constant");
+    return static_cast<uint32_t>(kind->getZExtValue());
   };
 
   switch (opcode) {
@@ -1265,21 +1781,35 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
       return std::move(error);
     if (!call.getType()->isIntegerTy(1))
       return createError("dx.op waveIsFirstLane result is not i1");
-    return emitAIR(builder, "air.simd_is_first", {}, call.getType(), convergent);
+    if (!exclude_helpers)
+      return emitAIR(builder, "air.simd_is_first", {}, call.getType(), convergent);
+    return builder.CreateAnd(builder.CreateICmpEQ(lane_id(), first_lane(participating_mask())),
+                             builder.CreateNot(is_helper()));
   }
   case OpWaveGetLaneIndex: {
     if (Error error = expectArgs(call, 0, "dx.op waveGetLaneIndex"))
       return std::move(error);
     if (!call.getType()->isIntegerTy(32))
       return createError("dx.op waveGetLaneIndex result is not i32");
-    return emitAIR(builder, "air.get_thread_index_in_simdgroup", {}, call.getType(), convergent);
+    return lane_id();
   }
   case OpWaveGetLaneCount: {
     if (Error error = expectArgs(call, 0, "dx.op waveGetLaneCount"))
       return std::move(error);
     if (!call.getType()->isIntegerTy(32))
       return createError("dx.op waveGetLaneCount result is not i32");
-    return emitAIR(builder, "air.get_simdgroup_size", {}, call.getType(), convergent);
+    /* Always 32 (Apple simdgroups); a vertex function may not call air.get_simdgroup_size. */
+    return builder.getInt32(kWaveLanes);
+  }
+  case OpIsHelperLane: {
+    if (Error error = expectArgs(call, 0, "dx.op isHelperLane"))
+      return std::move(error);
+    if (!call.getType()->isIntegerTy(1))
+      return createError("dx.op isHelperLane result is not i1");
+    /* Only pixel shaders have helper lanes. */
+    if (!pixel_stage)
+      return builder.getFalse();
+    return emitAIR(builder, "air.simd_is_helper_thread", {}, i1, convergent);
   }
   case OpWaveAnyTrue:
   case OpWaveAllTrue: {
@@ -1288,26 +1818,41 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
     Value *condition = call.getArgOperand(1);
     if (!condition->getType()->isIntegerTy(1) || !call.getType()->isIntegerTy(1))
       return createError("dx.op wave vote operates on i1");
-    return emitAIR(
-      builder, opcode == OpWaveAnyTrue ? "air.simd_any" : "air.simd_all", {condition}, call.getType(), convergent
-    );
+    if (opcode == OpWaveAnyTrue)
+      return emitAIR(builder, "air.simd_any", {participates(condition)}, i1, convergent);
+    if (Value *h = is_helper())
+      condition = builder.CreateOr(condition, h);
+    return emitAIR(builder, "air.simd_all", {condition}, i1, convergent);
+  }
+  case OpQuadVote: {
+    if (Error error = expectArgs(call, 2, "dx.op quadVote"))
+      return std::move(error);
+    Value *condition = call.getArgOperand(1);
+    auto kind = constant_kind(2, "dx.op quadVote");
+    if (!kind)
+      return kind.takeError();
+    if (!condition->getType()->isIntegerTy(1) || !call.getType()->isIntegerTy(1))
+      return createError("dx.op quadVote operates on i1");
+    if (*kind > 1)
+      return createError("dx.op quadVote has an unknown vote kind");
+    /* Quad operations include helper lanes in D3D as well. */
+    return emitAIR(builder, *kind == 0 ? "air.quad_any" : "air.quad_all", {condition}, i1, convergent);
   }
   case OpWaveActiveAllEqual: {
     if (Error error = expectArgs(call, 1, "dx.op waveActiveAllEqual"))
       return std::move(error);
     Value *value = call.getArgOperand(1);
-    Type *type = value->getType();
     if (!call.getType()->isIntegerTy(1))
       return createError("dx.op waveActiveAllEqual result is not i1");
-    if (!supported_wave_type(type))
+    if (!supported_type(value->getType()))
       return unsupported("dx.op waveActiveAllEqual on an unsupported type");
-    /* All lanes equal == every lane matches the value held by the first lane. */
-    Value *first =
-      emitAIR(builder, airSymbol(air_builder, "air.simd_broadcast_first", type, airSign(type, is_unsigned)), {value},
-              type, convergent);
-    Value *equal =
-      type->isFloatingPointTy() ? builder.CreateFCmpOEQ(value, first) : builder.CreateICmpEQ(value, first);
-    return emitAIR(builder, "air.simd_all", {equal}, call.getType(), convergent);
+    /* All lanes equal == every participating lane matches the first one. */
+    Value *first = shuffle(value, first_lane(participating_mask()));
+    Value *equal = value->getType()->isFloatingPointTy() ? builder.CreateFCmpOEQ(value, first)
+                                                          : builder.CreateICmpEQ(value, first);
+    if (Value *h = is_helper())
+      equal = builder.CreateOr(equal, h);
+    return emitAIR(builder, "air.simd_all", {equal}, i1, convergent);
   }
   case OpWaveActiveBallot: {
     if (Error error = expectArgs(call, 1, "dx.op waveActiveBallot"))
@@ -1315,145 +1860,159 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
     Value *condition = call.getArgOperand(1);
     if (!condition->getType()->isIntegerTy(1))
       return createError("dx.op waveActiveBallot condition is not i1");
-    if (Error error = expectAggregateResult(call, 4, builder.getInt32Ty(), "dx.op waveActiveBallot"))
+    if (Error error = expectAggregateResult(call, 4, i32, "dx.op waveActiveBallot"))
       return std::move(error);
-    /* AIR's ballot is a 64 bit mask, one bit per lane; DXIL returns the mask as
-     * four 32 bit words with the unused high words zero. */
-    Value *ballot = emitAIR(builder, "air.simd_ballot", {condition}, builder.getInt64Ty(), convergent);
-    Value *low = builder.CreateTrunc(ballot, builder.getInt32Ty());
-    Value *high = builder.CreateTrunc(builder.CreateLShr(ballot, 32), builder.getInt32Ty());
     Value *zero = builder.getInt32(0);
-    return buildAggregate(builder, call.getType(), {low, high, zero, zero});
+    return buildAggregate(builder, call.getType(), {ballot(participates(condition)), zero, zero, zero});
   }
-  case OpWaveReadLaneAt:
-  case OpQuadReadLaneAt: {
-    if (Error error = expectArgs(call, 2, "dx.op wave lane read"))
+  case OpWaveMatch: {
+    if (Error error = expectArgs(call, 1, "dx.op waveMatch"))
+      return std::move(error);
+    Value *value = call.getArgOperand(1);
+    if (!supported_type(value->getType()))
+      return unsupported("dx.op waveMatch on an unsupported type");
+    if (Error error = expectAggregateResult(call, 4, i32, "dx.op waveMatch"))
+      return std::move(error);
+    /* Lanes are matched on their bit pattern, which is what DXC's reference
+     * implementation compares; -0.0 and +0.0 are therefore distinct. */
+    Value *mask = participating_mask();
+    Value *mine = bits_of(value);
+    Value *matched = builder.getInt32(0);
+    for (unsigned lane = 0; lane < kWaveLanes; ++lane) {
+      Value *equal = builder.CreateAnd(builder.CreateICmpEQ(bits_of(shuffle(value, builder.getInt32(lane))), mine),
+                                       mask_has(mask, lane));
+      matched = builder.CreateOr(matched, builder.CreateShl(builder.CreateZExt(equal, i32), lane));
+    }
+    Value *zero = builder.getInt32(0);
+    return buildAggregate(builder, call.getType(), {matched, zero, zero, zero});
+  }
+  case OpWaveReadLaneAt: {
+    if (Error error = expectArgs(call, 2, "dx.op waveReadLaneAt"))
       return std::move(error);
     Value *value = call.getArgOperand(1);
     Value *index = call.getArgOperand(2);
-    Type *type = value->getType();
-    if (call.getType() != type || !index->getType()->isIntegerTy(32))
-      return createError("dx.op wave lane read operand types are invalid");
-    if (!supported_wave_type(type))
-      return unsupported("dx.op wave lane read on an unsupported type");
-    StringRef base = opcode == OpQuadReadLaneAt ? "air.quad_shuffle" : "air.simd_shuffle";
-    return emitAIR(
-      builder, airSymbol(air_builder, base, type, airSign(type, is_unsigned)), {value, lane_index(index)}, type,
-      convergent
-    );
+    if (call.getType() != value->getType() || !index->getType()->isIntegerTy(32))
+      return createError("dx.op waveReadLaneAt operand types are invalid");
+    if (!supported_type(value->getType()))
+      return unsupported("dx.op waveReadLaneAt on an unsupported type");
+    return shuffle(value, index);
+  }
+  case OpQuadReadLaneAt: {
+    if (Error error = expectArgs(call, 2, "dx.op quadReadLaneAt"))
+      return std::move(error);
+    Value *value = call.getArgOperand(1);
+    Value *index = call.getArgOperand(2);
+    if (call.getType() != value->getType() || !index->getType()->isIntegerTy(32))
+      return createError("dx.op quadReadLaneAt operand types are invalid");
+    if (!supported_type(value->getType()))
+      return unsupported("dx.op quadReadLaneAt on an unsupported type");
+    return exchange("air.quad_shuffle", value, builder.CreateTrunc(builder.CreateAnd(index, builder.getInt32(3)), i16));
   }
   case OpWaveReadLaneFirst: {
     if (Error error = expectArgs(call, 1, "dx.op waveReadLaneFirst"))
       return std::move(error);
     Value *value = call.getArgOperand(1);
-    Type *type = value->getType();
-    if (call.getType() != type)
+    if (call.getType() != value->getType())
       return createError("dx.op waveReadLaneFirst result type does not match its operand");
-    if (!supported_wave_type(type))
+    if (!supported_type(value->getType()))
       return unsupported("dx.op waveReadLaneFirst on an unsupported type");
-    return emitAIR(
-      builder, airSymbol(air_builder, "air.simd_broadcast_first", type, airSign(type, is_unsigned)), {value}, type,
-      convergent
-    );
+    return shuffle(value, first_lane(participating_mask()));
   }
   case OpWaveActiveOp:
   case OpWavePrefixOp: {
-    if (Error error = expectArgs(call, 2, "dx.op wave reduction"))
+    /* waveActiveOp / wavePrefixOp (value, op, sop): op 0 sum, 1 product, 2 min,
+     * 3 max (prefix: sum and product only); sop 0 signed, 1 unsigned. */
+    if (Error error = expectArgs(call, 3, "dx.op wave reduction"))
       return std::move(error);
-    const auto *kind = dyn_cast<ConstantInt>(call.getArgOperand(1));
+    Value *value = call.getArgOperand(1);
+    auto kind = constant_kind(2, "dx.op wave reduction");
     if (!kind)
-      return createError("dx.op wave reduction kind must be a constant");
-    Value *value = call.getArgOperand(2);
-    Type *type = value->getType();
-    if (call.getType() != type)
+      return kind.takeError();
+    auto sign = constant_kind(3, "dx.op wave reduction signedness");
+    if (!sign)
+      return sign.takeError();
+    if (call.getType() != value->getType())
       return createError("dx.op wave reduction result type does not match its operand");
-    const bool is_float = type->isFloatTy() || type->isHalfTy();
-    if (!is_float && !type->isIntegerTy(32))
+    if (!supported_type(value->getType()) || value->getType()->isIntegerTy(1))
       return unsupported("dx.op wave reduction on an unsupported type");
-
-    StringRef base;
-    switch (static_cast<uint32_t>(kind->getZExtValue())) {
-    case 0:
-      base = opcode == OpWaveActiveOp ? "air.simd_sum" : "air.simd_prefix_exclusive_sum";
-      break;
-    case 1:
-      base = opcode == OpWaveActiveOp ? "air.simd_product" : "air.simd_prefix_exclusive_product";
-      break;
-    case 2:
-    case 3:
-      /* AIR has no prefix min/max; DXIL's exclusive scan flavours are left for a
-       * later pass instead of being approximated. */
-      if (opcode == OpWavePrefixOp)
-        return unsupported("dx.op wavePrefixOp min/max has no AIR equivalent");
-      base = static_cast<uint32_t>(kind->getZExtValue()) == 2 ? "air.simd_min" : "air.simd_max";
-      break;
-    default:
+    static constexpr WaveReduce kinds[] = {WaveReduce::Sum, WaveReduce::Product, WaveReduce::Min, WaveReduce::Max};
+    if (*kind > 3 || (opcode == OpWavePrefixOp && *kind > 1))
       return createError("dx.op wave reduction has an unknown kind");
-    }
-    return emitAIR(builder, airSymbol(air_builder, base, type, airSign(type, is_unsigned)), {value}, type, convergent);
+    return reduce(kinds[*kind], value, *sign == 0, opcode == OpWavePrefixOp);
   }
   case OpWaveActiveBit: {
+    /* waveActiveBit (value, op): 0 and, 1 or, 2 xor. */
     if (Error error = expectArgs(call, 2, "dx.op waveActiveBit"))
       return std::move(error);
-    const auto *kind = dyn_cast<ConstantInt>(call.getArgOperand(1));
+    Value *value = call.getArgOperand(1);
+    auto kind = constant_kind(2, "dx.op waveActiveBit");
     if (!kind)
-      return createError("dx.op waveActiveBit kind must be a constant");
-    Value *value = call.getArgOperand(2);
-    Type *type = value->getType();
-    if (call.getType() != type)
+      return kind.takeError();
+    if (call.getType() != value->getType())
       return createError("dx.op waveActiveBit result type does not match its operand");
-    if (!type->isIntegerTy(32) && !type->isIntegerTy(64))
+    if (!value->getType()->isIntegerTy(16) && !value->getType()->isIntegerTy(32) &&
+        !value->getType()->isIntegerTy(64))
       return unsupported("dx.op waveActiveBit on an unsupported type");
-    StringRef base;
-    switch (static_cast<uint32_t>(kind->getZExtValue())) {
-    case 0:
-      base = "air.simd_and";
-      break;
-    case 1:
-      base = "air.simd_or";
-      break;
-    case 2:
-      base = "air.simd_xor";
-      break;
-    default:
+    static constexpr WaveReduce kinds[] = {WaveReduce::And, WaveReduce::Or, WaveReduce::Xor};
+    if (*kind > 2)
       return createError("dx.op waveActiveBit has an unknown kind");
-    }
-    /* Bitwise reductions are sign agnostic; the unsigned spelling is the one
-     * Metal's front end emits. */
-    return emitAIR(builder, airSymbol(air_builder, base, type, air::Signedness::Unsigned), {value}, type, convergent);
+    return reduce(kinds[*kind], value, false, false);
+  }
+  case OpWaveMultiPrefixOp: {
+    /* waveMultiPrefixOp (value, mask0..3, op, sop): op 0 sum, 1 and, 2 or, 3 xor,
+     * 4 product. Only mask0 can name a lane of a 32 lane wave. */
+    if (Error error = expectArgs(call, 7, "dx.op waveMultiPrefixOp"))
+      return std::move(error);
+    Value *value = call.getArgOperand(1);
+    Value *mask = call.getArgOperand(2);
+    auto kind = constant_kind(6, "dx.op waveMultiPrefixOp");
+    if (!kind)
+      return kind.takeError();
+    auto sign = constant_kind(7, "dx.op waveMultiPrefixOp signedness");
+    if (!sign)
+      return sign.takeError();
+    if (call.getType() != value->getType() || !mask->getType()->isIntegerTy(32))
+      return createError("dx.op waveMultiPrefixOp operand types are invalid");
+    if (!supported_type(value->getType()) || value->getType()->isIntegerTy(1))
+      return unsupported("dx.op waveMultiPrefixOp on an unsupported type");
+    static constexpr WaveReduce kinds[] = {WaveReduce::Sum, WaveReduce::And, WaveReduce::Or, WaveReduce::Xor,
+                                           WaveReduce::Product};
+    if (*kind > 4)
+      return createError("dx.op waveMultiPrefixOp has an unknown kind");
+    if (value->getType()->isFloatingPointTy() && *kind >= 1 && *kind <= 3)
+      return createError("dx.op waveMultiPrefixOp bitwise kind on a floating point value");
+    Value *members = builder.CreateAnd(mask, participating_mask());
+    Value *lane = lane_id();
+    return lane_loop(kinds[*kind], value, *sign == 0, [&](unsigned source) -> Value * {
+      return builder.CreateAnd(mask_has(members, source), builder.CreateICmpULT(builder.getInt32(source), lane));
+    });
+  }
+  case OpWaveMultiPrefixBitCount: {
+    if (Error error = expectArgs(call, 5, "dx.op waveMultiPrefixBitCount"))
+      return std::move(error);
+    Value *condition = call.getArgOperand(1);
+    Value *mask = call.getArgOperand(2);
+    if (!condition->getType()->isIntegerTy(1) || !mask->getType()->isIntegerTy(32) || !call.getType()->isIntegerTy(32))
+      return createError("dx.op waveMultiPrefixBitCount operand types are invalid");
+    Value *votes = builder.CreateAnd(ballot(participates(condition)), mask);
+    return popcount(builder.CreateAnd(votes, lanes_below(lane_id())));
   }
   case OpQuadOp: {
+    /* quadOp (value, op): 0 across x, 1 across y, 2 diagonal, a quad lane XOR of
+     * 1, 2 and 3 in the Z ordered quad. */
     if (Error error = expectArgs(call, 2, "dx.op quadOp"))
       return std::move(error);
-    const auto *kind = dyn_cast<ConstantInt>(call.getArgOperand(1));
+    Value *value = call.getArgOperand(1);
+    auto kind = constant_kind(2, "dx.op quadOp");
     if (!kind)
-      return createError("dx.op quadOp kind must be a constant");
-    Value *value = call.getArgOperand(2);
-    Type *type = value->getType();
-    if (call.getType() != type)
+      return kind.takeError();
+    if (call.getType() != value->getType())
       return createError("dx.op quadOp result type does not match its operand");
-    if (!supported_wave_type(type))
+    if (!supported_type(value->getType()))
       return unsupported("dx.op quadOp on an unsupported type");
-    /* DXIL swaps across the 2x2 quad: 0 = horizontal (x), 1 = vertical (y),
-     * 2 = diagonal, which in the quad lane layout is a lane XOR by 1, 2 or 3. */
-    uint64_t lane_xor = 0;
-    switch (static_cast<uint32_t>(kind->getZExtValue())) {
-    case 0:
-      lane_xor = 1;
-      break;
-    case 1:
-      lane_xor = 2;
-      break;
-    case 2:
-      lane_xor = 3;
-      break;
-    default:
+    if (*kind > 2)
       return createError("dx.op quadOp has an unknown swap kind");
-    }
-    return emitAIR(
-      builder, airSymbol(air_builder, "air.quad_shuffle_xor", type, air::Signedness::Unsigned),
-      {value, builder.getInt16(lane_xor)}, type, convergent
-    );
+    return exchange("air.quad_shuffle_xor", value, builder.getInt16(*kind + 1));
   }
   case OpWaveAllBitCount:
   case OpWavePrefixBitCount: {
@@ -1462,16 +2021,107 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
     Value *condition = call.getArgOperand(1);
     if (!condition->getType()->isIntegerTy(1) || !call.getType()->isIntegerTy(32))
       return createError("dx.op wave bit count operates on i1 and returns i32");
-    /* Counting true lanes is a sum of 0/1 across the wave, so the verified
-     * sum/scan reductions implement it exactly without a ballot or lane index. */
-    Value *counted = builder.CreateZExt(condition, builder.getInt32Ty());
-    return emitAIR(
-      builder, opcode == OpWaveAllBitCount ? "air.simd_sum.u.i32" : "air.simd_prefix_exclusive_sum.u.i32", {counted},
-      call.getType(), convergent
-    );
+    Value *votes = ballot(participates(condition));
+    if (opcode == OpWavePrefixBitCount)
+      votes = builder.CreateAnd(votes, lanes_below(lane_id()));
+    return popcount(votes);
   }
   default:
     return unsupported(("unhandled dx.op wave opcode " + Twine(opcode)).str());
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* SM 6.4 / 6.6 packed math                                                   */
+/* -------------------------------------------------------------------------- */
+
+Expected<Value *>
+OperationLowerer::lowerPacked(CallInst &call, uint32_t opcode, IRBuilder<> &builder) {
+  Type *i32 = builder.getInt32Ty();
+  auto byte_of = [&](Value *packed, unsigned index, bool is_signed, Type *type) {
+    Value *byte = builder.CreateTrunc(builder.CreateLShr(packed, index * 8), builder.getInt8Ty());
+    return is_signed ? builder.CreateSExt(byte, type) : builder.CreateZExt(byte, type);
+  };
+  switch (opcode) {
+  case OpDot2AddHalf: {
+    /* dot2AddHalf (acc, ax, ay, bx, by): acc + ax*bx + ay*by, with the half
+     * products formed exactly in float (a half product is exact in float). */
+    if (Error error = expectArgs(call, 5, "dx.op dot2AddHalf"))
+      return std::move(error);
+    Type *f32 = builder.getFloatTy();
+    if (!call.getType()->isFloatTy() || !call.getArgOperand(1)->getType()->isFloatTy())
+      return createError("dx.op dot2AddHalf accumulator must be f32");
+    for (unsigned i = 2; i <= 5; ++i)
+      if (!call.getArgOperand(i)->getType()->isHalfTy())
+        return createError("dx.op dot2AddHalf operands must be f16");
+    Value *x = builder.CreateFMul(builder.CreateFPExt(call.getArgOperand(2), f32),
+                                  builder.CreateFPExt(call.getArgOperand(4), f32));
+    Value *y = builder.CreateFMul(builder.CreateFPExt(call.getArgOperand(3), f32),
+                                  builder.CreateFPExt(call.getArgOperand(5), f32));
+    return builder.CreateFAdd(builder.CreateFAdd(call.getArgOperand(1), x), y);
+  }
+  case OpDot4AddI8Packed:
+  case OpDot4AddU8Packed: {
+    /* dot4AddPacked (acc, a, b): acc + sum of the four byte products, wrapping. */
+    if (Error error = expectArgs(call, 3, "dx.op dot4AddPacked"))
+      return std::move(error);
+    for (unsigned i = 1; i <= 3; ++i)
+      if (!call.getArgOperand(i)->getType()->isIntegerTy(32))
+        return createError("dx.op dot4AddPacked operands must be i32");
+    const bool is_signed = opcode == OpDot4AddI8Packed;
+    Value *sum = call.getArgOperand(1);
+    for (unsigned i = 0; i < 4; ++i)
+      sum = builder.CreateAdd(sum, builder.CreateMul(byte_of(call.getArgOperand(2), i, is_signed, i32),
+                                                     byte_of(call.getArgOperand(3), i, is_signed, i32)));
+    return sum;
+  }
+  case OpUnpack4x8: {
+    /* unpack4x8 (mode, packed): mode 0 zero extends, 1 sign extends each byte. */
+    if (Error error = expectArgs(call, 2, "dx.op unpack4x8"))
+      return std::move(error);
+    const auto *mode = dyn_cast<ConstantInt>(call.getArgOperand(1));
+    if (!mode || mode->getZExtValue() > 1)
+      return createError("dx.op unpack4x8 mode must be a constant 0 or 1");
+    auto *result = dyn_cast<StructType>(call.getType());
+    if (!result || result->getNumElements() != 4 || !result->getElementType(0)->isIntegerTy() ||
+        !call.getArgOperand(2)->getType()->isIntegerTy(32))
+      return createError("dx.op unpack4x8 has unexpected types");
+    SmallVector<Value *, 4> lanes;
+    for (unsigned i = 0; i < 4; ++i)
+      lanes.push_back(byte_of(call.getArgOperand(2), i, mode->isOne(), result->getElementType(0)));
+    return buildAggregate(builder, call.getType(), lanes);
+  }
+  case OpPack4x8: {
+    /* pack4x8 (mode, x, y, z, w): 0 truncates, 1 clamps to [0, 255], 2 clamps to
+     * [-128, 127]; the inputs are signed. */
+    if (Error error = expectArgs(call, 5, "dx.op pack4x8"))
+      return std::move(error);
+    const auto *mode = dyn_cast<ConstantInt>(call.getArgOperand(1));
+    if (!mode || mode->getZExtValue() > 2)
+      return createError("dx.op pack4x8 mode must be a constant 0, 1 or 2");
+    Type *type = call.getArgOperand(2)->getType();
+    if (!call.getType()->isIntegerTy(32) || !type->isIntegerTy() || type->getIntegerBitWidth() < 8)
+      return createError("dx.op pack4x8 has unexpected types");
+    Value *packed = builder.getInt32(0);
+    for (unsigned i = 0; i < 4; ++i) {
+      Value *lane = call.getArgOperand(2 + i);
+      if (lane->getType() != type)
+        return createError("dx.op pack4x8 operand types do not agree");
+      if (!mode->isZero()) {
+        const int64_t low = mode->getZExtValue() == 1 ? 0 : -128;
+        const int64_t high = mode->getZExtValue() == 1 ? 255 : 127;
+        lane = builder.CreateSelect(builder.CreateICmpSLT(lane, ConstantInt::getSigned(type, low)),
+                                    ConstantInt::getSigned(type, low), lane);
+        lane = builder.CreateSelect(builder.CreateICmpSGT(lane, ConstantInt::getSigned(type, high)),
+                                    ConstantInt::getSigned(type, high), lane);
+      }
+      Value *byte = builder.CreateZExt(builder.CreateTrunc(lane, builder.getInt8Ty()), i32);
+      packed = builder.CreateOr(packed, builder.CreateShl(byte, i * 8));
+    }
+    return packed;
+  }
+  default:
+    return unsupported(("unhandled dx.op packed opcode " + Twine(opcode)).str());
   }
 }
 

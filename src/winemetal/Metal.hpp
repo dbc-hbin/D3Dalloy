@@ -226,6 +226,11 @@ public:
 
 class Texture : public Resource {
 public:
+  WMTSparseTextureTail
+  sparseTail() const {
+    return MTLTexture_sparseTail(handle);
+  }
+
   Reference<Texture>
   newTextureView(
       WMTPixelFormat format, WMTTextureType texture_type, uint16_t level_start, uint16_t level_count,
@@ -293,6 +298,13 @@ public:
   Reference<Texture>
   newTexture(WMTTextureInfo &info, uint64_t offset, uint64_t bytes_per_row) {
     return Reference<Texture>(MTLBuffer_newTexture(handle, &info, offset, bytes_per_row));
+  }
+
+  Reference<Texture>
+  newPlacementSparseTextureView(
+      WMTTextureInfo &info, uint64_t offset, uint64_t bytes_per_row, WMTSparsePageSize page_size
+  ) {
+    return Reference<Texture>(MTLBuffer_newPlacementSparseTextureView(handle, &info, offset, bytes_per_row, page_size));
   }
 
   void
@@ -805,8 +817,35 @@ public:
   }
 };
 
+class PresentationObserver : public Object {
+public:
+  int32_t wait(WMTPresentationEvent &event) const {
+    return WMTPresentationObserver_wait(handle, &event);
+  }
+
+  void cancel(uint64_t present_id) const {
+    WMTPresentationObserver_cancel(handle, present_id);
+  }
+
+  void close() const {
+    WMTPresentationObserver_close(handle);
+  }
+
+  bool setView(obj_handle_t view) const {
+    return WMTPresentationObserver_setView(handle, view);
+  }
+
+  bool getRefreshSample(WMTDisplayRefreshSample &sample) const {
+    return WMTPresentationObserver_getRefreshSample(handle, &sample);
+  }
+};
+
 class MetalDrawable : public Object {
 public:
+  bool observePresentation(PresentationObserver observer, uint64_t present_id) const {
+    return MetalDrawable_observePresentation(handle, observer, present_id);
+  }
+
   Texture
   texture() {
     return Texture{MetalDrawable_texture(handle)};
@@ -967,6 +1006,12 @@ public:
   }
 
   void
+  presentDrawableIfCurrent(MetalDrawable drawable, SharedEvent token, uint64_t epoch, double after,
+                           PresentationObserver observer, uint64_t present_id) {
+    MTLCommandBuffer_presentDrawableIfCurrent(handle, drawable, token, epoch, after, observer, present_id);
+  }
+
+  void
   encodeSpatialScale(FXSpatialScaler scaler, Texture color, Texture output, Fence fence) {
     MTLCommandBuffer_encodeSpatialScale(handle, scaler, color, output, fence);
   }
@@ -977,6 +1022,30 @@ public:
       Fence fence, const WMTFXTemporalScalerProps &props
   ) {
     MTLCommandBuffer_encodeTemporalScale(handle, scaler, color, output, depth, motion, exposure, fence, &props);
+  }
+};
+
+/* A Metal 4 command queue, used here only to apply sparse mapping updates. */
+class MTL4CommandQueue : public Object {
+public:
+  void
+  addResidencySet(ResidencySet residency_set) {
+    MTL4CommandQueue_addResidencySet(handle, residency_set.handle);
+  }
+
+  void
+  updateBufferMappings(Buffer buffer, Heap heap, const WMTSparseBufferMapping *mappings, uint64_t count) {
+    MTL4CommandQueue_updateBufferMappings(handle, buffer.handle, heap.handle, mappings, count);
+  }
+
+  void
+  updateTextureMappings(Texture texture, Heap heap, const WMTSparseTextureMapping *mappings, uint64_t count) {
+    MTL4CommandQueue_updateTextureMappings(handle, texture.handle, heap.handle, mappings, count);
+  }
+
+  void
+  signalEvent(Event event, uint64_t value) {
+    MTL4CommandQueue_signalEvent(handle, event.handle, value);
   }
 };
 
@@ -1199,6 +1268,41 @@ public:
     return Reference<Heap>(MTLDevice_newHeap(handle, &info));
   }
 
+  bool
+  supportsPlacementSparse() const {
+    return MTLDevice_supportsPlacementSparse(handle);
+  }
+
+  Reference<Heap>
+  newPlacementHeap(const WMTHeapInfo &info, WMTSparsePageSize max_sparse_page_size) {
+    return Reference<Heap>(MTLDevice_newPlacementHeap(handle, &info, max_sparse_page_size));
+  }
+
+  Reference<Buffer>
+  newPlacementSparseBuffer(WMTBufferInfo &info, WMTSparsePageSize page_size) {
+    return Reference<Buffer>(MTLDevice_newPlacementSparseBuffer(handle, &info, page_size));
+  }
+
+  Reference<Texture>
+  newPlacementSparseTexture(WMTTextureInfo &info, WMTSparsePageSize page_size) {
+    return Reference<Texture>(MTLDevice_newPlacementSparseTexture(handle, &info, page_size));
+  }
+
+  WMTSparseTileShape
+  sparseTileSize(WMTTextureType type, WMTPixelFormat format, uint32_t sample_count, WMTSparsePageSize page_size) {
+    return MTLDevice_sparseTileSize(handle, type, format, sample_count, page_size);
+  }
+
+  Reference<MTL4CommandQueue>
+  newMTL4CommandQueue() {
+    return Reference<MTL4CommandQueue>(MTLDevice_newMTL4CommandQueue(handle));
+  }
+
+  Reference<SamplerState>
+  newSamplerStateWithReduction(WMTSamplerInfo &info, uint32_t reduction) {
+    return Reference<SamplerState>(MTLDevice_newSamplerStateWithReduction(handle, &info, reduction));
+  }
+
   WMTSizeAndAlign
   heapBufferSizeAndAlign(uint64_t length, WMTResourceOptions options) {
     return MTLDevice_heapBufferSizeAndAlign(handle, length, options);
@@ -1227,6 +1331,16 @@ public:
   bool
   supportsTextureSampleCount(uint8_t sample_count) {
     return MTLDevice_supportsTextureSampleCount(handle, sample_count);
+  }
+
+  bool
+  programmableSamplePositionsSupported() {
+    return MTLDevice_programmableSamplePositionsSupported(handle);
+  }
+
+  uint32_t
+  gpuCoreCount() {
+    return MTLDevice_gpuCoreCount(handle);
   }
 
   bool

@@ -20,6 +20,10 @@ airconv_src = files([
  'dxil_rt_operations.cpp',
  'dxil_rt_callbacks.cpp',
  'dxil_raytracing.cpp',
+ 'dxil_pipeline.cpp',
+ 'dxil_pipeline_ts.cpp',
+ 'msaa_pixel.cpp',
+ 'msaa_vertex.cpp',
  'metallib_writer.cpp',
  'nt/air_builder.cpp',
  'nt/dxbc_converter_base.cpp',
@@ -82,7 +86,14 @@ airconv_shaders_ir = metalir_generator.process(
 )
 airconv_shaders_header = hexdump_generator.process(airconv_shaders_ir)
 
-airconv_src += airconv_shaders_header
+# The fp32 denorm-preserve helpers rely on every step being IEEE exact.
+airconv_denorm_ir = metalir_generator.process(
+  'shaders/air_denorm.metal',
+  extra_args: ['-std=metal3.1', '--target=air64-apple-macos14.0', '-fno-fast-math'],
+)
+airconv_denorm_header = hexdump_generator.process(airconv_denorm_ir)
+
+airconv_src += [airconv_shaders_header, airconv_denorm_header]
 
 build_airconv_for_windows = get_option('build_airconv_for_windows')
 

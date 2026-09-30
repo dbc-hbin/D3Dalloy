@@ -5,6 +5,9 @@
 
 namespace dxmt::dxbc {
 
+struct ShaderResourceViewInfo;
+struct UnorderedAccessViewInfo;
+
 struct ConstantBufferDescriptor {
   llvm::Value *Pointer;
   llvm::Value *Metadata; // may be null
@@ -24,6 +27,19 @@ struct TextureDescirptor {
   llvm::air::Texture::ResourceKind ResourceKindLogical;
   llvm::air::Texture::MemoryAccess MemoryAccess;
   llvm::air::Texture::SampleType SampleType;
+  // Only D3D12 texture3D UAVs pack FirstWSlice/WSize in the high metadata word.
+  bool Scoped3DUAV = false;
+  // D3D12-only RGB32 typed-buffer descriptor slots q2/q3. Legacy SM50 binding
+  // tables do not carry this metadata and leave the fields null.
+  llvm::Value *EmulationAddress = nullptr;
+  llvm::Value *EmulationTag = nullptr;
+  // Typed buffer views of reserved buffers: the same q2/q3 as residency status (StatusBase = the
+  // buffer's biased residency base, StatusView = first byte address << 8 | log2(texel) << 1, bit 0
+  // clear; bit 0 set means q2/q3 are the RGB32 slots above). Only status queries read them.
+  llvm::Value *StatusBase = nullptr;
+  llvm::Value *StatusView = nullptr;
+  // RGB32 SRVs: q0 (unused as a texture handle) is the reserved buffer's biased residency base.
+  llvm::Value *RGB32StatusBase = nullptr;
 
 };
 
@@ -32,6 +48,9 @@ struct BufferDescriptor {
   llvm::Value *Metadata;
   uint32_t StructureStride;
   bool GlobalCoherent;
+  /* i64 biased tile-residency base of a reserved buffer (descriptor qword 3), 0 when always mapped;
+     null for root descriptors, which are always reported fully mapped. Read only by status queries. */
+  llvm::Value *StatusBase = nullptr;
 };
 
 /**
@@ -71,6 +90,72 @@ public:
   GetUAVBuffer(llvm::air::AIRBuilder &Builder, RangeId Range, llvm::Value *Index) = 0;
   virtual llvm::Optional<CounterDescriptor>
   GetUAVCounter(llvm::air::AIRBuilder &Builder, RangeId Range, llvm::Value *Index) = 0;
+
+  /*
+   * SM 6.6 dynamic resources: descriptors fetched straight out of the bound
+   * CBV_SRV_UAV / sampler heap by absolute heap index (`dx.op.createHandleFromHeap`).
+   *
+   * The shape of a heap descriptor is not declared anywhere but at the use site, so the
+   * caller hands the view info in (`range` is ignored). Only a root-signature map whose
+   * signature sets D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED /
+   * SAMPLER_HEAP_DIRECTLY_INDEXED can resolve them; every other map returns none, which
+   * the caller reports as a shader / root signature mismatch.
+   *
+   * An index at or past the bound heap's size, or no heap bound at all, reads the all-zero
+   * null descriptor, so a stray index is a null access instead of a GPU fault.
+   */
+  virtual llvm::Optional<ConstantBufferDescriptor>
+  GetHeapConstantBuffer(llvm::air::AIRBuilder &Builder, llvm::Value *Index) {
+    (void)Builder;
+    (void)Index;
+    return llvm::None;
+  }
+  virtual llvm::Optional<SamplerDescriptor>
+  GetHeapSampler(llvm::air::AIRBuilder &Builder, llvm::Value *Index) {
+    (void)Builder;
+    (void)Index;
+    return llvm::None;
+  }
+  virtual llvm::Optional<TextureDescirptor>
+  GetHeapSRVTexture(llvm::air::AIRBuilder &Builder, const ShaderResourceViewInfo &Info, llvm::Value *Index) {
+    (void)Builder;
+    (void)Info;
+    (void)Index;
+    return llvm::None;
+  }
+  virtual llvm::Optional<TextureDescirptor>
+  GetHeapUAVTexture(llvm::air::AIRBuilder &Builder, const UnorderedAccessViewInfo &Info, llvm::Value *Index) {
+    (void)Builder;
+    (void)Info;
+    (void)Index;
+    return llvm::None;
+  }
+  virtual llvm::Optional<BufferDescriptor>
+  GetHeapSRVBuffer(llvm::air::AIRBuilder &Builder, const ShaderResourceViewInfo &Info, llvm::Value *Index) {
+    (void)Builder;
+    (void)Info;
+    (void)Index;
+    return llvm::None;
+  }
+  virtual llvm::Optional<BufferDescriptor>
+  GetHeapUAVBuffer(llvm::air::AIRBuilder &Builder, const UnorderedAccessViewInfo &Info, llvm::Value *Index) {
+    (void)Builder;
+    (void)Info;
+    (void)Index;
+    return llvm::None;
+  }
+  virtual llvm::Optional<CounterDescriptor>
+  GetHeapUAVCounter(llvm::air::AIRBuilder &Builder, llvm::Value *Index) {
+    (void)Builder;
+    (void)Index;
+    return llvm::None;
+  }
+  virtual llvm::Optional<AccelerationStructureDescriptor>
+  GetHeapAccelerationStructure(llvm::air::AIRBuilder &Builder, llvm::Value *Index) {
+    (void)Builder;
+    (void)Index;
+    return llvm::None;
+  }
   /**
    * The acceleration structure a raytracing export traces against. Only a
    * raytracing binding map implements it; the SM 5.x table2 map has no raytracing

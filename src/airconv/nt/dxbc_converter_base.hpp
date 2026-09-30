@@ -51,6 +51,12 @@ struct TextureResourceHandle {
   llvm::Value *Metadata;
   Swizzle Swizzle;
   bool GlobalCoherent;
+  bool Scoped3DUAV = false;
+  llvm::Value *EmulationAddress = nullptr;
+  llvm::Value *EmulationTag = nullptr;
+  llvm::Value *StatusBase = nullptr; // reserved texel buffer residency, see TextureDescirptor
+  llvm::Value *StatusView = nullptr;
+  llvm::Value *RGB32StatusBase = nullptr;
 };
 
 struct BufferResourceHandle {
@@ -59,6 +65,7 @@ struct BufferResourceHandle {
   uint32_t StructureStride; // 0 if not structured
   Swizzle Swizzle;
   bool GlobalCoherent;
+  llvm::Value *StatusBase = nullptr; // reserved buffer residency, see BufferDescriptor
 };
 
 struct AtomicBufferResourceHandle {
@@ -79,10 +86,7 @@ struct SamplerHandle {
   llvm::Value *Bias;
 };
 
-struct InterpolantHandle {
-  llvm::Value *Handle;
-  bool Perspective;
-};
+enum class InterpolationLocation { Centroid, Sample, Offset };
 
 enum class TessellatorPartitioning {
   integer,
@@ -114,6 +118,7 @@ public:
   }
   llvm::Value *LoadOperandIndex(const IndexByIndexableTempComponent &SrcOpIndex);
   llvm::Value *LoadOperandIndex(const IndexByTempComponent &SrcOpIndex);
+  llvm::Value *LoadOperandIndex(const IndexByAttribute &SrcOpIndex);
 
   llvm::Value *
   LoadOperandIndex(const OperandIndex &SrcOpIndex) {
@@ -180,7 +185,8 @@ public:
 
   llvm::Value *LoadAtomicOpAddress(const AtomicBufferResourceHandle &Handle, const SrcOperand &Address);
 
-  llvm::Optional<InterpolantHandle> LoadInterpolant(uint32_t Index);
+  llvm::Value *InterpolateRegister(uint32_t Index, InterpolationLocation location,
+                                   llvm::Value *argument = nullptr);
 
   /* Store Operands */
 
@@ -201,6 +207,14 @@ public:
   void StoreOperand(const DstOperandIndexableTemp &DstOp, llvm::Value *Value);
   void StoreOperandHull(const DstOperandOutput &DstOp, llvm::Value *Value);
   void StoreOperandHull(const DstOperandIndexableOutput &DstOp, llvm::Value *Value);
+
+  /* Writes the status of a *_FEEDBACK access: `Status` is an i8 AIR residency flag (bit 0 = not resident)
+   * or an i32 tile status (nonzero = fully mapped); null means always mapped. */
+  void StoreFeedback(const std::optional<DstOperand> &DstOp, llvm::Value *Status);
+  /* Status of a reserved buffer access over GPU byte addresses [First, Last]; null when not reserved. */
+  llvm::Value *BufferTileStatus(llvm::Value *StatusBase, llvm::Value *First, llvm::Value *Last);
+  llvm::Value *TexelBufferStatus(const TextureResourceHandle &Tex, llvm::Value *Element);
+  llvm::Value *RawBufferStatus(const BufferResourceHandle &Buf, llvm::Value *FirstDword, llvm::Value *LastDword);
 
   void
   StoreOperand(const DstOperand &DstOp, llvm::Value *Value, bool Saturate = false) {
@@ -463,6 +477,25 @@ public:
   }
 
   llvm::Value *
+  DecodeScoped3DUAVFirst(llvm::Value *Metadata) {
+    return ir.CreateAnd(DecodeTextureArrayLength(Metadata), ir.getInt32(0xffff));
+  }
+
+  llvm::Value *
+  DecodeScoped3DUAVCount(llvm::Value *Metadata) {
+    return ir.CreateLShr(DecodeTextureArrayLength(Metadata), 16);
+  }
+
+  llvm::Value *
+  Scoped3DUAVAddress(llvm::Value *Address, llvm::Value *Metadata) {
+    auto *z = ir.CreateExtractElement(Address, 2);
+    return ir.CreateInsertElement(Address, ir.CreateAdd(z, DecodeScoped3DUAVFirst(Metadata)), 2);
+  }
+
+  llvm::Value *
+  GuardScoped3DUAV(llvm::Value *Valid, llvm::Type *ResultType, llvm::function_ref<llvm::Value *()> Emit);
+
+  llvm::Value *
   DecodeRawBufferByteLength(llvm::Value *Metadata) {
     return ir.CreateTrunc(Metadata, air.getIntTy());
   }
@@ -474,15 +507,27 @@ public:
 
   llvm::Value *ClampArrayIndex(llvm::Value *ShaderValue, llvm::Value *Metadata);
 
-  void HullGenerateWorkloadForTriangle(
+  /* Returns the number of unique domain points (0 for a culled patch). `Points`: point-output workloads that
+   * cover every unique domain point exactly once. */
+  llvm::Value *HullGenerateWorkloadForTriangle(
       llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
+      bool Points,
       llvm::Value *TessFactorIn, llvm::Value *TessFactorOut0, llvm::Value *TessFactorOut1, llvm::Value *TessFactorOut2
   );
 
-  void HullGenerateWorkloadForQuad(
+  /* Returns the number of unique domain points (0 for a culled patch); see HullGenerateWorkloadForTriangle. */
+  llvm::Value *HullGenerateWorkloadForQuad(
       llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
+      bool Points,
       llvm::Value *TessFactorIn0, llvm::Value *TessFactorIn1, llvm::Value *TessFactorOut0, llvm::Value *TessFactorOut1,
       llvm::Value *TessFactorOut2, llvm::Value *TessFactorOut3
+  );
+
+  /* Isoline domain: TessFactorDetail is the line detail, TessFactorDensity the line density. Returns the number of
+   * domain points (0 for a culled patch). */
+  llvm::Value *HullGenerateWorkloadForIsoline(
+      llvm::Value *PatchIndex, llvm::Value *CountPtr, llvm::Value *DataPtr, TessellatorPartitioning Partitioning,
+      llvm::Value *TessFactorDetail, llvm::Value *TessFactorDensity
   );
 
   llvm::Value *DomainGetPatchIndex(llvm::Value *WorkloadIndex, llvm::Value *DataPtr);
@@ -491,8 +536,16 @@ public:
       llvm::Value *WorkloadIndex, llvm::Value *ThreadIndex, llvm::Value *DataPtr, TessellatorPartitioning Partitioning
   );
 
-  void
+  /* Writes the workload's mesh indices and primitive count; returns that count. */
+  llvm::Value *
   DomainGeneratePrimitives(llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive);
+
+  /* TS->GS pass 1: writes the workload's primitive indices to IndicesPtr (device uint *) and returns the count. */
+  llvm::Value *DomainGeneratePrimitivesCapture(
+      llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive, llvm::Value *IndicesPtr
+  );
+
+  llvm::Value *DomainGetWorkloadRank(llvm::Value *WorkloadIndex, llvm::Value *DataPtr);
 
   llvm::Value * CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Value* Index);
 

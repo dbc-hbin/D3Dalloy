@@ -4,7 +4,6 @@
 #include "d3d11_private.h"
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
-#include "dxgi_output.hpp"
 #include "d3d11_context.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_hud_state.hpp"
@@ -162,6 +161,7 @@ public:
 
     if (pFullscreenDesc) {
       fullscreen_desc_ = *pFullscreenDesc;
+      fullscreen_desc_.Windowed = TRUE;
     } else {
       fullscreen_desc_.Windowed = true;
     }
@@ -201,8 +201,6 @@ public:
 
     // FIXME: check HRESULT!
     ResizeBuffers(0, desc_.Width, desc_.Height, DXGI_FORMAT_UNKNOWN, desc_.Flags);
-    if (!fullscreen_desc_.Windowed)
-      EnterFullscreenMode(nullptr);
   };
 
   ~MTLD3D11SwapChain() {
@@ -265,18 +263,49 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   SetFullscreenState(BOOL Fullscreen, IDXGIOutput *pTarget) final {
+    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
+    if (modeset_inprogress)
+      return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
+    if (!Fullscreen && pTarget)
+      return DXGI_ERROR_INVALID_CALL;
+
     Com<IDXGIOutput1> target;
 
     if (pTarget) {
       DXGI_OUTPUT_DESC desc;
 
-      pTarget->QueryInterface(IID_PPV_ARGS(&target));
-      target->GetDesc(&desc);
+      HRESULT hr = pTarget->QueryInterface(IID_PPV_ARGS(&target));
+      if (FAILED(hr))
+        return hr;
+      hr = target->GetDesc(&desc);
+      if (FAILED(hr))
+        return hr;
 
       if (!fullscreen_desc_.Windowed && Fullscreen && monitor_ != desc.Monitor) {
-        HRESULT hr = LeaveFullscreenMode();
+        const auto old_target = target_;
+        const auto old_monitor = monitor_;
+        const auto old_window_state = window_state_;
+        const auto old_refresh_rate = init_refresh_rate_;
+        wsi::WsiMode old_mode = {};
+        if (!wsi::getCurrentDisplayMode(old_monitor, &old_mode))
+          return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+
+        hr = LeaveFullscreenMode();
         if (FAILED(hr))
           return hr;
+        hr = EnterFullscreenMode(target.ptr());
+        if (FAILED(hr)) {
+          if (FAILED(EnterFullscreenMode(old_target.ptr())))
+            ERR("DXGI: Failed to restore previous fullscreen output");
+          if (!wsi::setWindowMode(old_monitor, hWnd, old_mode))
+            ERR("DXGI: Failed to restore previous display mode");
+          window_state_ = old_window_state;
+          init_refresh_rate_ = old_refresh_rate;
+          monitor_ = old_monitor;
+          target_ = old_target;
+          fullscreen_desc_.Windowed = FALSE;
+        }
+        return hr;
       }
     }
 
@@ -289,10 +318,6 @@ public:
   };
 
   HRESULT EnterFullscreenMode(IDXGIOutput1* pTarget) {
-    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
-    if (modeset_inprogress)
-      return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
-
     Com<IDXGIOutput1> output = pTarget;
 
     if (!wsi::isWindow(hWnd))
@@ -305,7 +330,14 @@ public:
       }
     }
 
-    std::unique_lock<dxmt::mutex> lock(mutex_);
+    DXGI_OUTPUT_DESC output_desc = {};
+    HRESULT hr = output->GetDesc(&output_desc);
+    if (FAILED(hr))
+      return hr;
+    wsi::WsiMode old_mode = {};
+    if (!wsi::getCurrentDisplayMode(output_desc.Monitor, &old_mode))
+      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    const double old_refresh_rate = init_refresh_rate_;
 
     DXGI_MODE_DESC1 preferred_display_mode = {
         desc_.Width,
@@ -315,58 +347,53 @@ public:
         DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
         DXGI_MODE_SCALING_UNSPECIFIED
     };
-    if (FAILED(ChangeDisplayMode(output.ptr(), &preferred_display_mode))) {
+    hr = ChangeDisplayMode(output.ptr(), &preferred_display_mode);
+    if (FAILED(hr)) {
       ERR("DXGI: EnterFullscreenMode: Failed to change display mode");
-      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      if (!wsi::setWindowMode(output_desc.Monitor, hWnd, old_mode))
+        ERR("DXGI: EnterFullscreenMode: Failed to restore display mode");
+      init_refresh_rate_ = old_refresh_rate;
+      return hr;
     }
 
-    // Update swap chain description
-    fullscreen_desc_.Windowed = FALSE;
-    
-    // Move the window so that it covers the entire output
     bool modeSwitch = (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) != 0u;
-
-    DXGI_OUTPUT_DESC desc;
-    output->GetDesc(&desc);
-
-    monitor_ = desc.Monitor;
-    target_  = std::move(output);
-
-    lock = {};
-
-    if (!wsi::enterFullscreenMode(desc.Monitor, hWnd, &window_state_, modeSwitch)) {
+    if (!wsi::enterFullscreenMode(output_desc.Monitor, hWnd, &window_state_, modeSwitch)) {
       ERR("DXGI: EnterFullscreenMode: Failed to enter fullscreen mode");
+      if (!wsi::setWindowMode(output_desc.Monitor, hWnd, old_mode))
+        ERR("DXGI: EnterFullscreenMode: Failed to restore display mode");
+      init_refresh_rate_ = old_refresh_rate;
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
 
+    monitor_ = output_desc.Monitor;
+    target_ = std::move(output);
+    fullscreen_desc_.Windowed = FALSE;
     return S_OK;
   }
   
   
   HRESULT LeaveFullscreenMode() {
-    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
-    if (modeset_inprogress)
-      return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
+    wsi::WsiMode old_mode = {};
+    if (!wsi::getCurrentDisplayMode(monitor_, &old_mode))
+      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    const double old_refresh_rate = init_refresh_rate_;
+    HRESULT hr = RestoreDisplayMode(monitor_);
+    if (FAILED(hr))
+      return hr;
 
-    std::lock_guard<dxmt::mutex> lock(mutex_);
-
-    if (FAILED(RestoreDisplayMode(monitor_)))
-      WARN("DXGI: LeaveFullscreenMode: Failed to restore display mode");
-
-    // Restore internal state
-    fullscreen_desc_.Windowed = TRUE;
-    target_  = nullptr;
-    monitor_ = wsi::getWindowMonitor(hWnd);
-    
-    if (!wsi::isWindow(hWnd))
-      return S_OK;
-    
-    if (!wsi::leaveFullscreenMode(hWnd, &window_state_, true)) {
+    if (wsi::isWindow(hWnd) && !wsi::leaveFullscreenMode(hWnd, &window_state_, true)) {
       ERR("DXGI: LeaveFullscreenMode: Failed to exit fullscreen mode");
+      if (!wsi::setWindowMode(monitor_, hWnd, old_mode))
+        ERR("DXGI: LeaveFullscreenMode: Failed to restore fullscreen display mode");
+      init_refresh_rate_ = old_refresh_rate;
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
-    
+
+    fullscreen_desc_.Windowed = TRUE;
+    target_ = nullptr;
+    monitor_ = wsi::getWindowMonitor(hWnd);
     presenter->changeGammaRamp(nullptr);
+    gamma_initialized_ = false;
 
     return S_OK;
   }
@@ -407,7 +434,9 @@ public:
       selected_mode.RefreshRate.Denominator = 1;
 
     DXGI_OUTPUT_DESC output_desc;
-    pOutput->GetDesc(&output_desc);
+    hr = pOutput->GetDesc(&output_desc);
+    if (FAILED(hr))
+      return hr;
     wsi::WsiMode wsi_mode{
         selected_mode.Width,
         selected_mode.Height,
@@ -545,10 +574,11 @@ public:
     if (!pDesc)
       return DXGI_ERROR_INVALID_CALL;
 
+    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
+    if (modeset_inprogress)
+      return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
     if (!wsi::isWindow(hWnd))
       return DXGI_ERROR_INVALID_CALL;
-
-    std::unique_lock<dxmt::mutex> lock(mutex_);
 
     // Promote display mode
     DXGI_MODE_DESC1 newDisplayMode = {};
@@ -559,22 +589,33 @@ public:
     newDisplayMode.ScanlineOrdering = pDesc->ScanlineOrdering;
     newDisplayMode.Scaling = pDesc->Scaling;
 
-    // Update the swap chain description
-    if (newDisplayMode.RefreshRate.Numerator != 0)
-      fullscreen_desc_.RefreshRate = newDisplayMode.RefreshRate;
-
-    fullscreen_desc_.ScanlineOrdering = newDisplayMode.ScanlineOrdering;
-    fullscreen_desc_.Scaling = newDisplayMode.Scaling;
-
     if (fullscreen_desc_.Windowed) {
-      wsi::resizeWindow(hWnd, &window_state_, newDisplayMode.Width,
-                        newDisplayMode.Height);
+      if (!wsi::resizeWindow(hWnd, &window_state_, newDisplayMode.Width, newDisplayMode.Height))
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     } else {
-      ChangeDisplayMode(target_.ptr(), &newDisplayMode);
-      lock = {};
-      wsi::updateFullscreenWindow(monitor_, hWnd, false);
+      wsi::WsiMode old_mode = {};
+      if (!wsi::getCurrentDisplayMode(monitor_, &old_mode))
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      const double old_refresh_rate = init_refresh_rate_;
+      HRESULT hr = ChangeDisplayMode(target_.ptr(), &newDisplayMode);
+      if (FAILED(hr)) {
+        if (!wsi::setWindowMode(monitor_, hWnd, old_mode))
+          ERR("DXGI: ResizeTarget: Failed to restore display mode");
+        init_refresh_rate_ = old_refresh_rate;
+        return hr;
+      }
+      if (!wsi::updateFullscreenWindow(monitor_, hWnd, false)) {
+        if (!wsi::setWindowMode(monitor_, hWnd, old_mode))
+          ERR("DXGI: ResizeTarget: Failed to restore display mode");
+        init_refresh_rate_ = old_refresh_rate;
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      }
     }
 
+    if (newDisplayMode.RefreshRate.Numerator != 0)
+      fullscreen_desc_.RefreshRate = newDisplayMode.RefreshRate;
+    fullscreen_desc_.ScanlineOrdering = newDisplayMode.ScanlineOrdering;
+    fullscreen_desc_.Scaling = newDisplayMode.Scaling;
     return S_OK;
   };
 
@@ -605,7 +646,9 @@ public:
 
     for (uint32_t i = 0; SUCCEEDED(adapter->EnumOutputs(i, &output)); i++) {
       DXGI_OUTPUT_DESC outputDesc;
-      output->GetDesc(&outputDesc);
+      HRESULT hr = output->GetDesc(&outputDesc);
+      if (FAILED(hr))
+        return hr;
       
       if (outputDesc.Monitor == Monitor)
         return output->QueryInterface(IID_PPV_ARGS(ppOutput));
@@ -758,6 +801,32 @@ public:
 
     std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
 
+    if (hr == S_OK && target_) {
+      DXGI_GAMMA_CONTROL control = {};
+      HRESULT gamma_hr = target_->GetGammaControl(&control);
+      if (FAILED(gamma_hr))
+        return gamma_hr;
+
+      bool changed = !gamma_initialized_;
+      for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+        const auto &color = control.GammaCurve[i];
+        changed |= gamma_ramp_.red[i] != color.Red ||
+                   gamma_ramp_.green[i] != color.Green ||
+                   gamma_ramp_.blue[i] != color.Blue;
+      }
+      if (changed) {
+        for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+          const auto &color = control.GammaCurve[i];
+          gamma_ramp_.red[i] = color.Red;
+          gamma_ramp_.green[i] = color.Green;
+          gamma_ramp_.blue[i] = color.Blue;
+        }
+        ++gamma_ramp_.version;
+        gamma_initialized_ = true;
+      }
+      presenter->changeGammaRamp(&gamma_ramp_);
+    }
+
     device_context_->PrepareFlush();
     if (hr == DXGI_STATUS_OCCLUDED) {
       // flush commands without presenting
@@ -774,10 +843,6 @@ public:
     auto &cmd_queue = device_->GetDXMTDevice().queue();
     auto chunk = cmd_queue.CurrentChunk();
     chunk->signal_frame_latency_fence_ = cmd_queue.CurrentFrameSeq();
-    if (target_) {
-      auto output = static_cast<MTLDXGIOutput *>(target_.ptr());
-      presenter->changeGammaRamp(output->GetGammaRamp());
-    }
     if constexpr (EnableMetalFX) {
       chunk->emitcc([
         this, vsync_duration, backbuffer = backbuffer_->texture(),
@@ -1075,6 +1140,8 @@ private:
   HWND hWnd;
   HMONITOR monitor_;
   Com<IDXGIOutput1> target_;
+  DXMTGammaRamp gamma_ramp_ = {};
+  bool gamma_initialized_ = false;
   wsi::DXMTWindowState window_state_;
   uint32_t frame_latency;
   DXGI_COLOR_SPACE_TYPE colorspace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
@@ -1122,17 +1189,29 @@ CreateSwapChain(
   }
   if (env::getEnvVar("DXMT_METALFX_SPATIAL_SWAPCHAIN") == "1") {
     if (pDevice->GetMTLDevice().supportsFXSpatialScaler()) {
-      *ppSwapChain = new MTLD3D11SwapChain<true>(
+      Com<IDXGISwapChain1> swapchain = new MTLD3D11SwapChain<true>(
           pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
       );
+      if (pFullscreenDesc && !pFullscreenDesc->Windowed) {
+        HRESULT hr = swapchain->SetFullscreenState(TRUE, nullptr);
+        if (FAILED(hr))
+          return hr;
+      }
+      *ppSwapChain = swapchain.ref();
       return S_OK;
     } else {
       WARN("MetalFX spatial scaler is not supported on this device");
     }
   }
-  *ppSwapChain = new MTLD3D11SwapChain<false>(
+  Com<IDXGISwapChain1> swapchain = new MTLD3D11SwapChain<false>(
       pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
   );
+  if (pFullscreenDesc && !pFullscreenDesc->Windowed) {
+    HRESULT hr = swapchain->SetFullscreenState(TRUE, nullptr);
+    if (FAILED(hr))
+      return hr;
+  }
+  *ppSwapChain = swapchain.ref();
   return S_OK;
 };
 

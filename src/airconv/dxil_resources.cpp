@@ -48,6 +48,8 @@
 
 #include "dxil_converter.hpp"
 
+#include <functional>
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -84,6 +86,7 @@ enum Opcode : uint32_t {
   kBufferLoad = 68,
   kBufferStore = 69,
   kBufferUpdateCounter = 70,
+  kCheckAccessFullyMapped = 71,
   kGetDimensions = 72,
   kTextureGather = 73,
   kTextureGatherCmp = 74,
@@ -98,7 +101,66 @@ enum Opcode : uint32_t {
   kCreateHandleForLib = 160,
   kAnnotateHandle = 216,
   kCreateHandleFromBinding = 217,
+  kTextureGatherRaw = 223,
+  kSampleCmpLevel = 224,
+  kTextureStoreSample = 225,
+  kBarrierByMemoryHandle = 245,
+  kSampleCmpGrad = 254,
+  kSampleCmpBias = 255,
+  kCreateHandleFromHeap = 218,
 };
+
+/* DxilResourceProperties dword 0 (DirectXShaderCompiler DxilResourceProperties.h). */
+constexpr uint32_t kPropertyKindMask = 0xffu;
+constexpr uint32_t kPropertyIsUAV = 1u << 12;
+constexpr uint32_t kPropertyIsROV = 1u << 13;
+constexpr uint32_t kPropertyGloballyCoherent = 1u << 14;
+
+/* How a heap-indexed handle is used; its view shape is only known from these. */
+struct HeapUsage {
+  bool read = false;
+  bool written = false;
+  bool sampled = false;
+  bool compared = false;
+};
+
+HeapUsage
+HeapUsageOfOpcode(uint32_t opcode) {
+  HeapUsage usage;
+  switch (opcode) {
+  case 60: /* Sample */
+  case 61: /* SampleBias */
+  case 62: /* SampleLevel */
+  case 63: /* SampleGrad */
+  case 73: /* TextureGather */
+  case 81: /* CalculateLOD */
+    usage.read = usage.sampled = true;
+    break;
+  case 64:  /* SampleCmp */
+  case 65:  /* SampleCmpLevelZero */
+  case 74:  /* TextureGatherCmp */
+  case 224: /* SampleCmpLevel */
+  case 254: /* SampleCmpGrad */
+  case 255: /* SampleCmpBias */
+    usage.read = usage.sampled = usage.compared = true;
+    break;
+  case 67:  /* TextureStore */
+  case 69:  /* BufferStore */
+  case 140: /* RawBufferStore */
+  case 225: /* TextureStoreSample */
+    usage.written = true;
+    break;
+  case 70: /* BufferUpdateCounter */
+  case 78: /* AtomicBinOp */
+  case 79: /* AtomicCompareExchange */
+    usage.read = usage.written = true;
+    break;
+  default:
+    usage.read = true;
+    break;
+  }
+  return usage;
+}
 
 /* DXIL::AtomicBinOpCode. */
 enum AtomicOperation : uint32_t {
@@ -256,11 +318,17 @@ private:
   llvm::raw_null_ostream nulldbg;
   llvm::air::AIRBuilder air;
   bool coherent_access;
+  /* The AIR entry is a kernel: implicit derivatives come from compute quads (SM 6.6). */
+  bool kernel_stage = false;
 
   /* Resolved handle values, keyed by the SSA value that produces them. */
   llvm::DenseMap<llvm::Value *, ResourceHandle> resolved;
   /* dx.op.annotateHandle shapes, keyed by the annotated handle value. */
   llvm::DenseMap<llvm::Value *, ResourceKind> annotations;
+  /* Both dx.types.ResourceProperties dwords of every annotated handle. */
+  llvm::DenseMap<llvm::Value *, std::pair<uint32_t, uint32_t>> annotation_properties;
+  /* Combined usage of each createHandleFromHeap, through every phi/select it reaches. */
+  llvm::DenseMap<llvm::Value *, HeapUsage> heap_usage;
   /* Handle values consumed by dx.op.bufferUpdateCounter. */
   llvm::DenseSet<llvm::Value *> counter_handles;
 
@@ -269,16 +337,20 @@ private:
   llvm::Value *Low32(llvm::Value *metadata);
   llvm::Value *High32(llvm::Value *metadata);
   llvm::Value *Low32AsFloat(llvm::Value *metadata);
+  llvm::Value *scoped3DUAVAddress(const dxbc::TextureDescirptor &descriptor, llvm::Value *address);
+  llvm::Value *scoped3DUAVInBounds(const dxbc::TextureDescirptor &descriptor, llvm::Value *address);
 
   /* ---- handle resolution ---- */
 
   void collectAnnotations();
   void collectCounterHandles();
+  void collectHeapUsage();
   void markCounterHandle(llvm::Value *value);
 
   llvm::Expected<ResourceHandle> resolve(llvm::Value *handle);
   llvm::Expected<ResourceHandle> materialise(llvm::CallInst *call);
   llvm::Expected<ResourceHandle> lookupDescriptors(const HandleSite &site, bool needs_counter);
+  llvm::Expected<ResourceHandle> lookupHeapDescriptors(llvm::CallInst *call, bool needs_counter);
   llvm::Expected<HandleSite> siteFromCreateHandle(llvm::CallInst *call);
   llvm::Expected<HandleSite> siteFromCreateHandleFromBinding(llvm::CallInst *call);
   llvm::Expected<HandleSite> siteFromCreateHandleForLib(llvm::CallInst *call);
@@ -298,6 +370,7 @@ private:
   /* ---- operations ---- */
 
   llvm::Error lowerCall(llvm::CallInst *call);
+  llvm::Error guardNullDescriptors(llvm::CallInst *call);
   llvm::Error lowerCBufferLoadLegacy(llvm::CallInst *call);
   llvm::Error lowerTextureLoad(llvm::CallInst *call);
   llvm::Error lowerTextureStore(llvm::CallInst *call);
@@ -316,6 +389,8 @@ private:
   llvm::Error lowerSampleLevel(llvm::CallInst *call);
   llvm::Error lowerSampleGrad(llvm::CallInst *call);
   llvm::Error lowerSampleCmp(llvm::CallInst *call, bool level_zero);
+  llvm::Error lowerSampleCmpExtended(llvm::CallInst *call, uint32_t opcode);
+  llvm::Error lowerGatherRaw(llvm::CallInst *call);
   llvm::Error lowerGetDimensions(llvm::CallInst *call);
   llvm::Error lowerBufferUpdateCounter(llvm::CallInst *call);
   llvm::Error lowerAtomicBinOp(llvm::CallInst *call);
@@ -334,6 +409,16 @@ private:
   llvm::Value *clampArrayIndex(llvm::Value *value, llvm::Value *metadata);
   void appendTexel(llvm::SmallVectorImpl<llvm::Value *> &components, llvm::Value *texel, llvm::Type *element_type);
   llvm::Value *buildResult(llvm::CallInst *call, llvm::ArrayRef<llvm::Value *> components);
+  /*
+   * Residency status (i32, nonzero = fully mapped) that the next buildResult stores in the status
+   * member of a resource operation's result; null means fully mapped. Consumed by buildResult.
+   */
+  llvm::Value *pending_status_ = nullptr;
+  void setStatusFromResidency(llvm::Value *residency);
+  llvm::Value *bufferTileStatus(llvm::Value *status_base, llvm::Value *first_byte, llvm::Value *last_byte);
+  llvm::Error lowerCheckAccessFullyMapped(llvm::CallInst *call);
+  bool usesStatus(llvm::CallInst *call);
+  llvm::Value *texelBufferStatus(const dxbc::TextureDescirptor &descriptor, llvm::Value *element);
 
   llvm::Value *
   texelBufferAddress(const dxbc::TextureDescirptor &texture, llvm::Value *element_index, llvm::Value *offset);
@@ -343,6 +428,9 @@ private:
       llvm::Value *condition, llvm::Instruction *where, llvm::ArrayRef<llvm::Type *> result_types,
       llvm::function_ref<llvm::SmallVector<llvm::Value *, 4>()> emit
   );
+  llvm::Value *bufferByteOffset(llvm::Value *c0, llvm::Value *c1, uint32_t structure_stride);
+  llvm::Value *bufferBytesInBounds(const dxbc::BufferDescriptor &buffer, llvm::Value *byte, unsigned bytes);
+  llvm::Value *bufferBytePointer(const dxbc::BufferDescriptor &buffer, llvm::Value *byte, llvm::Type *type);
   llvm::Error loadBufferWords(
       llvm::CallInst *call, const dxbc::BufferDescriptor &buffer, llvm::Value *c0, llvm::Value *c1, uint32_t mask
   );
@@ -362,6 +450,12 @@ private:
   /* atomics */
   llvm::Value *atomicAddress(const ResourceHandle &handle, llvm::CallInst *call, unsigned first_coordinate);
   llvm::Value *atomicArrayIndex(const ResourceHandle &handle, llvm::CallInst *call, unsigned first_coordinate);
+  llvm::Value *atomicLockTable();
+  llvm::Value *emitLockedAtomic64(
+      llvm::Value *pointer, llvm::function_ref<llvm::Value *(llvm::Value *old)> update
+  );
+  llvm::Error lowerBarrierByMemoryHandle(llvm::CallInst *call);
+  llvm::Error lowerBufferAtomic64(llvm::CallInst *call, const ResourceHandle &handle, bool compare_exchange);
   llvm::Constant *offsetVector(llvm::air::Texture::ResourceKind kind, const int32_t offsets[3]);
 
   /* sampling */
@@ -373,6 +467,14 @@ private:
       llvm::Value *c2, llvm::Value *c3, llvm::Value *&coord, llvm::Value *&array_index, llvm::Value *&sampler_handle
   );
   uint32_t gradientCount(llvm::air::Texture::ResourceKind kind);
+  /* Fine quad derivatives of a sample coordinate (compute shaders, SM 6.6). */
+  std::pair<llvm::Value *, llvm::Value *> quadGradients(llvm::Value *coord, uint32_t components);
+  /* `sample` with the implicit LOD of a compute quad; `bias` is added to that LOD. */
+  std::pair<llvm::Value *, llvm::Value *> sampleInKernel(
+      const dxbc::TextureDescirptor &descriptor, llvm::Value *sampler_value, llvm::Value *coord,
+      llvm::Value *array_index, const int32_t offsets[3], llvm::Value *bias, llvm::Value *min_lod,
+      llvm::Value *reference
+  );
 };
 
 /* ----------------------------------------------------------------------- */
@@ -392,6 +494,19 @@ ResourceLowering::High32(llvm::Value *metadata) {
 llvm::Value *
 ResourceLowering::Low32AsFloat(llvm::Value *metadata) {
   return builder.CreateBitCast(builder.CreateTrunc(metadata, air.getIntTy()), air.getFloatTy());
+}
+
+llvm::Value *
+ResourceLowering::scoped3DUAVAddress(const dxbc::TextureDescirptor &descriptor, llvm::Value *address) {
+  auto *first = builder.CreateAnd(High32(descriptor.Metadata), air.getInt(0xffff));
+  auto *z = builder.CreateExtractElement(address, 2);
+  return builder.CreateInsertElement(address, builder.CreateAdd(z, first), 2);
+}
+
+llvm::Value *
+ResourceLowering::scoped3DUAVInBounds(const dxbc::TextureDescirptor &descriptor, llvm::Value *address) {
+  auto *count = builder.CreateLShr(High32(descriptor.Metadata), 16);
+  return builder.CreateICmpULT(builder.CreateExtractElement(address, 2), count);
 }
 
 llvm::air::Texture
@@ -488,11 +603,111 @@ ResourceLowering::buildResult(llvm::CallInst *call, llvm::ArrayRef<llvm::Value *
   for (unsigned i = 0; i < components.size(); i++)
     result = builder.CreateInsertValue(result, components[i], {i});
   if (type->getNumElements() == components.size() + 1) {
-    /* Last component is the residency status of a resource operation. DXMT has
-     * no tiled resource support, so every access is fully mapped. */
-    result = builder.CreateInsertValue(result, builder.getInt32(1), {type->getNumElements() - 1});
+    /* Last component is the residency status of a resource operation: nonzero when every texel or
+     * byte the operation touched is mapped. Only reserved resources ever report zero. */
+    llvm::Value *status = pending_status_ ? pending_status_ : builder.getInt32(1);
+    result = builder.CreateInsertValue(result, status, {type->getNumElements() - 1});
   }
+  pending_status_ = nullptr;
   return result;
+}
+
+/* CheckAccessFullyMapped(status): status is the i32 an access stored, nonzero when fully mapped. */
+llvm::Error
+ResourceLowering::lowerCheckAccessFullyMapped(llvm::CallInst *call) {
+  if (call->arg_size() < 2)
+    return createError("dxil: CheckAccessFullyMapped without a status operand");
+  builder.SetInsertPoint(call);
+  auto *status = call->getArgOperand(1);
+  auto *mapped = builder.CreateICmpNE(status, llvm::ConstantInt::get(status->getType(), 0));
+  call->replaceAllUsesWith(mapped);
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+/* Whether any user of a resource operation's result reads its status member. */
+bool
+ResourceLowering::usesStatus(llvm::CallInst *call) {
+  auto *type = llvm::dyn_cast<llvm::StructType>(call->getType());
+  if (!type || type->getNumElements() < 2)
+    return false;
+  const unsigned status = type->getNumElements() - 1;
+  for (auto *user : call->users()) {
+    auto *extract = llvm::dyn_cast<llvm::ExtractValueInst>(user);
+    if (!extract || (extract->getNumIndices() == 1 && extract->getIndices()[0] == status))
+      return true;
+  }
+  return false;
+}
+
+/*
+ * Typed buffer view status: the view's q2 is the reserved buffer's biased residency base and q3 its
+ * first byte address << 8 | log2(texel) << 1. Bit 0 marks RGB32 views, whose status base is q0 instead.
+ */
+llvm::Value *
+ResourceLowering::texelBufferStatus(const dxbc::TextureDescirptor &descriptor, llvm::Value *element) {
+  if (!descriptor.StatusBase || !descriptor.StatusView)
+    return nullptr;
+  auto *view = descriptor.StatusView;
+  auto *rgb32 = builder.CreateICmpNE(builder.CreateAnd(view, builder.getInt64(1)), builder.getInt64(0));
+  /* Out-of-bounds elements (all ones, see texelBufferAddress) read zero and never touch a tile. */
+  auto *out_of_bounds = builder.CreateICmpEQ(element, llvm::ConstantInt::getAllOnesValue(element->getType()));
+  auto *base = builder.CreateSelect(builder.CreateOr(rgb32, out_of_bounds), builder.getInt64(0), descriptor.StatusBase);
+  auto *log2 = builder.CreateAnd(builder.CreateLShr(view, 1), builder.getInt64(127));
+  auto *first = builder.CreateAdd(builder.CreateLShr(view, 8),
+                                  builder.CreateShl(builder.CreateZExt(element, builder.getInt64Ty()), log2));
+  auto *last = builder.CreateSub(builder.CreateAdd(first, builder.CreateShl(builder.getInt64(1), log2)),
+                                 builder.getInt64(1));
+  if (descriptor.RGB32StatusBase) {
+    /* RGB32 views: 12 byte elements from q2 (EmulationAddress), status base in q0; bounded by q1. */
+    auto *in_bounds = builder.CreateICmpULT(element, High32(descriptor.Metadata));
+    auto *rgb_first = builder.CreateAdd(descriptor.EmulationAddress,
+                                        builder.CreateMul(builder.CreateZExt(element, builder.getInt64Ty()),
+                                                          builder.getInt64(12)));
+    first = builder.CreateSelect(rgb32, rgb_first, first);
+    last = builder.CreateSelect(rgb32, builder.CreateAdd(rgb_first, builder.getInt64(11)), last);
+    base = builder.CreateSelect(rgb32,
+                                builder.CreateSelect(in_bounds, descriptor.RGB32StatusBase, builder.getInt64(0)), base);
+  }
+  return bufferTileStatus(base, first, last);
+}
+
+void
+ResourceLowering::setStatusFromResidency(llvm::Value *residency) {
+  /* AIR texture results carry an i8 whose bit 0 is set when a texel was NOT resident (Metal lowers
+   * sparse_color::resident() to !(flag & 1)). */
+  if (!residency) {
+    pending_status_ = nullptr;
+    return;
+  }
+  auto *missing = builder.CreateAnd(residency, llvm::ConstantInt::get(residency->getType(), 1));
+  pending_status_ = builder.CreateZExt(builder.CreateICmpEQ(missing, llvm::ConstantInt::get(residency->getType(), 0)),
+                                       builder.getInt32Ty());
+}
+
+/*
+ * Status of a buffer access touching GPU addresses [first_byte, last_byte] (i64): the byte-per-tile
+ * residency array a reserved buffer's descriptor points at, biased so that the tile of address `va`
+ * is at status_base + (va >> 16). A zero base means an ordinary, always-mapped buffer.
+ */
+llvm::Value *
+ResourceLowering::bufferTileStatus(llvm::Value *status_base, llvm::Value *first_byte, llvm::Value *last_byte) {
+  if (!status_base)
+    return nullptr;
+  auto *reserved = builder.CreateICmpNE(status_base, builder.getInt64(0));
+  auto *where = &*builder.GetInsertPoint();
+  auto loaded = emitGuardedAccess(reserved, where, {builder.getInt32Ty()}, [&]() -> llvm::SmallVector<llvm::Value *, 4> {
+    auto *byte_ptr = builder.getInt8Ty()->getPointerTo(1);
+    auto tile_byte = [&](llvm::Value *address) {
+      auto *pointer = builder.CreateIntToPtr(builder.CreateAdd(status_base, builder.CreateLShr(address, 16)), byte_ptr);
+      return builder.CreateICmpNE(builder.CreateLoad(builder.getInt8Ty(), pointer), builder.getInt8(0));
+    };
+    /* An access never spans more than two 64KB tiles (at most 16 bytes). */
+    auto *mapped = builder.CreateAnd(tile_byte(first_byte), tile_byte(last_byte));
+    return {builder.CreateZExt(mapped, builder.getInt32Ty())};
+  });
+  /* An unreserved buffer takes the other branch, whose phi value is 0: turn that into 1. */
+  return builder.CreateSelect(reserved, loaded[0], builder.getInt32(1));
 }
 
 /* ----------------------------------------------------------------------- */
@@ -559,10 +774,12 @@ ResourceLowering::emitGuardedAccess(
    * rest move to the continuation block, so the access is emitted between them. */
   auto *head = where->getParent();
   auto *then_term = llvm::SplitBlockAndInsertIfThen(condition, where, /*Unreachable=*/false);
-  auto *then_block = then_term->getParent();
   auto *continuation = where->getParent();
   builder.SetInsertPoint(then_term);
   auto values = emit();
+  /* `emit` may create its own control flow (the 64 bit atomic lock loop); the
+   * values reach the continuation from whichever block it finished in. */
+  auto *then_block = builder.GetInsertBlock();
   builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
   llvm::SmallVector<llvm::Value *, 4> merged;
   for (unsigned index = 0; index < values.size(); index++) {
@@ -574,41 +791,93 @@ ResourceLowering::emitGuardedAccess(
   return merged;
 }
 
+/*
+ * Raw and structured buffer element access at the lane width of the dx.op overload
+ * (SM 6.2 16 bit and SM 6.3 64 bit raw buffer access). The element is addressed in
+ * bytes: DXIL guarantees 16 bit lanes are 2 byte aligned and 64 bit lanes only 4
+ * byte aligned, so a 64 bit lane is moved as two dwords. An element that does not
+ * lie entirely inside the view is an out-of-range access: it reads zero and is not
+ * written.
+ */
+llvm::Value *
+ResourceLowering::bufferByteOffset(llvm::Value *c0, llvm::Value *c1, uint32_t structure_stride) {
+  if (!structure_stride)
+    return c0;
+  return builder.CreateAdd(builder.CreateMul(c0, air.getInt(structure_stride)), c1);
+}
+
+llvm::Value *
+ResourceLowering::bufferBytesInBounds(const dxbc::BufferDescriptor &buffer, llvm::Value *byte, unsigned bytes) {
+  if (!buffer.Metadata)
+    return nullptr;
+  auto *end = builder.CreateAdd(builder.CreateZExt(byte, builder.getInt64Ty()), builder.getInt64(bytes));
+  return builder.CreateICmpULE(end, builder.CreateZExt(Low32(buffer.Metadata), builder.getInt64Ty()));
+}
+
+llvm::Value *
+ResourceLowering::bufferBytePointer(const dxbc::BufferDescriptor &buffer, llvm::Value *byte, llvm::Type *type) {
+  auto *bytes = builder.CreateBitCast(buffer.Pointer, builder.getInt8PtrTy(1));
+  auto *address = builder.CreateGEP(builder.getInt8Ty(), bytes, {byte});
+  return builder.CreateBitCast(address, type->getPointerTo(1));
+}
+
 llvm::Error
 ResourceLowering::loadBufferWords(
     llvm::CallInst *call, const dxbc::BufferDescriptor &buffer, llvm::Value *c0, llvm::Value *c1, uint32_t mask
 ) {
   bool coherent = buffer.GlobalCoherent && coherent_access;
   auto *lane_type = llvm::cast<llvm::StructType>(call->getType())->getElementType(0);
-  if (lane_type->getPrimitiveSizeInBits() != 32)
-    return createError("dxil: non-32-bit raw buffer load is not supported");
-  auto *dword_index = bufferDwordIndex(c0, c1, buffer.StructureStride);
-  /* The index and its bound condition are emitted before any block split so they
-   * dominate the guarded access; only the access itself moves behind the branch. */
+  const unsigned width = lane_type->getPrimitiveSizeInBits();
+  if (width != 16 && width != 32 && width != 64)
+    return createError("dxil: raw buffer load lane must be 16, 32 or 64 bits wide");
+  auto *lane_int = builder.getIntNTy(width);
+  auto *byte_offset = bufferByteOffset(c0, c1, buffer.StructureStride);
+  /* The addresses and their bound conditions are emitted before any block split so
+   * they dominate the guarded access; only the access itself moves behind the branch. */
   llvm::SmallVector<unsigned, 4> lanes;
-  llvm::SmallVector<llvm::Value *, 4> indices;
+  llvm::SmallVector<llvm::Value *, 4> bytes;
   llvm::SmallVector<llvm::Value *, 4> conditions;
   for (unsigned i = 0; i < 4; i++) {
     if (!(mask & (1u << i)))
       continue;
-    auto *index = builder.CreateAdd(dword_index, air.getInt(i));
+    auto *byte = builder.CreateAdd(byte_offset, air.getInt(i * width / 8));
     lanes.push_back(i);
-    indices.push_back(index);
-    conditions.push_back(bufferInBounds(buffer, index));
+    bytes.push_back(byte);
+    conditions.push_back(bufferBytesInBounds(buffer, byte, width / 8));
   }
+  auto load = [&](llvm::Type *type, llvm::Value *pointer) -> llvm::Value * {
+    return coherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(type, pointer)
+                    : (llvm::Value *)builder.CreateLoad(type, pointer);
+  };
   llvm::SmallVector<llvm::Value *, 4> components(4, llvm::UndefValue::get(lane_type));
   for (unsigned lane = 0; lane < lanes.size(); lane++) {
-    auto *index = indices[lane];
+    auto *byte = bytes[lane];
     auto guarded = emitGuardedAccess(
-        conditions[lane], call, {air.getIntTy()},
+        conditions[lane], call, {lane_int},
         [&]() -> llvm::SmallVector<llvm::Value *, 4> {
-          auto *pointer = builder.CreateGEP(air.getIntTy(), buffer.Pointer, {index});
-          llvm::Value *value = coherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(air.getIntTy(), pointer)
-                                        : (llvm::Value *)builder.CreateLoad(air.getIntTy(), pointer);
-          return {value};
+          if (width != 64)
+            return {load(lane_int, bufferBytePointer(buffer, byte, lane_int))};
+          auto *low = load(air.getIntTy(), bufferBytePointer(buffer, byte, air.getIntTy()));
+          auto *high = load(air.getIntTy(),
+                            bufferBytePointer(buffer, builder.CreateAdd(byte, air.getInt(4)), air.getIntTy()));
+          return {builder.CreateOr(builder.CreateZExt(low, lane_int),
+                                   builder.CreateShl(builder.CreateZExt(high, lane_int), 32))};
         }
     );
     components[lanes[lane]] = builder.CreateBitCast(guarded[0], lane_type);
+  }
+  if (!bytes.empty() && buffer.StatusBase && usesStatus(call)) {
+    /* The descriptor pointer is the view's GPU address; the lanes span [first, last] bytes past it. */
+    /* Out-of-bounds lanes read zero without touching memory, so they must not index the tile array. */
+    llvm::Value *in_bounds = conditions.front();
+    for (auto *condition : conditions)
+      in_bounds = builder.CreateAnd(in_bounds, condition);
+    auto *status_base = builder.CreateSelect(in_bounds, buffer.StatusBase, builder.getInt64(0));
+    auto *base = builder.CreatePtrToInt(buffer.Pointer, builder.getInt64Ty());
+    auto *first = builder.CreateAdd(base, builder.CreateZExt(bytes.front(), builder.getInt64Ty()));
+    auto *last = builder.CreateAdd(base, builder.CreateZExt(builder.CreateAdd(bytes.back(), air.getInt(width / 8 - 1)),
+                                                           builder.getInt64Ty()));
+    pending_status_ = bufferTileStatus(status_base, first, last);
   }
   call->replaceAllUsesWith(buildResult(call, components));
   call->eraseFromParent();
@@ -620,33 +889,43 @@ ResourceLowering::storeBufferWords(
     llvm::CallInst *call, const dxbc::BufferDescriptor &buffer, llvm::Value *c0, llvm::Value *c1, uint32_t mask
 ) {
   bool coherent = buffer.GlobalCoherent && coherent_access;
-  if (call->getArgOperand(4)->getType()->getPrimitiveSizeInBits() != 32)
-    return createError("dxil: non-32-bit raw buffer store is not supported");
-  auto *dword_index = bufferDwordIndex(c0, c1, buffer.StructureStride);
-  llvm::SmallVector<llvm::Value *, 4> indices;
+  const unsigned width = call->getArgOperand(4)->getType()->getPrimitiveSizeInBits();
+  if (width != 16 && width != 32 && width != 64)
+    return createError("dxil: raw buffer store lane must be 16, 32 or 64 bits wide");
+  auto *lane_int = builder.getIntNTy(width);
+  auto *byte_offset = bufferByteOffset(c0, c1, buffer.StructureStride);
+  llvm::SmallVector<llvm::Value *, 4> bytes;
   llvm::SmallVector<llvm::Value *, 4> conditions;
   llvm::SmallVector<llvm::Value *, 4> values;
   for (unsigned i = 0; i < 4; i++) {
     if (!(mask & (1u << i)))
       continue;
-    auto *index = builder.CreateAdd(dword_index, air.getInt(i));
-    indices.push_back(index);
-    conditions.push_back(bufferInBounds(buffer, index));
-    values.push_back(builder.CreateBitCast(call->getArgOperand(4 + i), air.getIntTy()));
+    auto *byte = builder.CreateAdd(byte_offset, air.getInt(i * width / 8));
+    bytes.push_back(byte);
+    conditions.push_back(bufferBytesInBounds(buffer, byte, width / 8));
+    values.push_back(builder.CreateBitCast(call->getArgOperand(4 + i), lane_int));
   }
-  for (unsigned lane = 0; lane < indices.size(); lane++) {
-    auto *index = indices[lane];
+  auto store = [&](llvm::Value *value, llvm::Value *pointer) {
+    if (coherent)
+      air.CreateDeviceCoherentStore(value, pointer);
+    else
+      builder.CreateStore(value, pointer);
+  };
+  for (unsigned lane = 0; lane < bytes.size(); lane++) {
+    auto *byte = bytes[lane];
     auto *value = values[lane];
     /* An out-of-range or unbound store writes nothing, so the store itself must
      * not be issued; a select over a null pointer would still store to zero. */
     emitGuardedAccess(
         conditions[lane], call, {},
         [&]() -> llvm::SmallVector<llvm::Value *, 4> {
-          auto *pointer = builder.CreateGEP(air.getIntTy(), buffer.Pointer, {index});
-          if (coherent)
-            air.CreateDeviceCoherentStore(value, pointer);
-          else
-            builder.CreateStore(value, pointer);
+          if (width != 64) {
+            store(value, bufferBytePointer(buffer, byte, lane_int));
+            return {};
+          }
+          store(builder.CreateTrunc(value, air.getIntTy()), bufferBytePointer(buffer, byte, air.getIntTy()));
+          store(builder.CreateTrunc(builder.CreateLShr(value, 32), air.getIntTy()),
+                bufferBytePointer(buffer, builder.CreateAdd(byte, air.getInt(4)), air.getIntTy()));
           return {};
         }
     );
@@ -661,14 +940,88 @@ ResourceLowering::readTexture(
     llvm::Value *sample_index, llvm::Value *level
 ) {
   auto texture = textureOf(descriptor);
-  auto [texel, residency] = air.CreateRead(
-      texture, descriptor.ResourceHandle, address, array_index, sample_index, level,
-      descriptor.GlobalCoherent && coherent_access
-  );
+  if (descriptor.ResourceKindLogical == llvm::air::Texture::texture_buffer && descriptor.EmulationTag) {
+    auto *rgb32 = builder.CreateICmpNE(builder.CreateAnd(descriptor.EmulationTag, builder.getInt64(1)),
+                                      builder.getInt64(0));
+    auto *in_bounds = builder.CreateICmpULT(address, High32(descriptor.Metadata));
+    auto *non_null = builder.CreateICmpNE(descriptor.EmulationAddress,
+                                         llvm::ConstantInt::getNullValue(descriptor.EmulationAddress->getType()));
+    auto *valid = builder.CreateAnd(rgb32, builder.CreateAnd(in_bounds, non_null));
+    auto *lane_type = llvm::cast<llvm::StructType>(call->getType())->getElementType(0);
+    llvm::SmallVector<llvm::Type *, 4> word_types(4, air.getIntTy());
+    auto words = emitGuardedAccess(valid, call, word_types,
+        [&]() -> llvm::SmallVector<llvm::Value *, 4> {
+          auto *pointer = builder.CreateIntToPtr(descriptor.EmulationAddress, air.getIntTy()->getPointerTo(1));
+          auto *base = builder.CreateMul(builder.CreateZExt(address, builder.getInt64Ty()), builder.getInt64(3));
+          llvm::SmallVector<llvm::Value *, 4> result;
+          for (unsigned channel = 0; channel < 3; ++channel)
+            result.push_back(builder.CreateLoad(air.getIntTy(),
+                builder.CreateGEP(air.getIntTy(), pointer, builder.CreateAdd(base, builder.getInt64(channel)))));
+          result.push_back(air.getInt(lane_type->isFloatingPointTy() ? 0x3f800000u : 1u));
+          auto *mapping = builder.CreateTrunc(builder.CreateLShr(descriptor.EmulationTag, 32), air.getIntTy());
+          llvm::SmallVector<llvm::Value *, 4> mapped;
+          for (unsigned channel = 0; channel < 4; ++channel) {
+            auto *selector = builder.CreateAnd(builder.CreateLShr(mapping, channel * 3), air.getInt(7));
+            llvm::Value *word = air.getInt(0);
+            for (unsigned component = 0; component < 4; ++component)
+              word = builder.CreateSelect(builder.CreateICmpEQ(selector, air.getInt(component)),
+                                          result[component], word);
+            mapped.push_back(builder.CreateSelect(builder.CreateICmpEQ(selector, air.getInt(5)),
+                                                  result[3], word));
+          }
+          return mapped;
+        });
+    llvm::SmallVector<llvm::Type *, 4> lane_types(4, lane_type);
+    auto native = emitGuardedAccess(builder.CreateNot(rgb32), call, lane_types,
+        [&]() -> llvm::SmallVector<llvm::Value *, 4> {
+          auto [texel, residency] = air.CreateRead(texture, descriptor.ResourceHandle, address, array_index,
+                                                   sample_index, level, false);
+          llvm::SmallVector<llvm::Value *, 4> values;
+          appendTexel(values, texel, lane_type);
+          return values;
+        });
+    llvm::SmallVector<llvm::Value *, 4> components;
+    for (unsigned channel = 0; channel < 4; ++channel)
+      components.push_back(builder.CreateSelect(rgb32, builder.CreateBitCast(words[channel], lane_type), native[channel]));
+    if (usesStatus(call))
+      pending_status_ = texelBufferStatus(descriptor, address);
+    call->replaceAllUsesWith(buildResult(call, components));
+    call->eraseFromParent();
+    return llvm::Error::success();
+  }
+  llvm::Value *texel = nullptr;
+  if (texture.memory_access == llvm::air::Texture::acesss_readwrite)
+    air.CreateTextureFence(texture, descriptor.ResourceHandle);
+  if (descriptor.Scoped3DUAV) {
+    auto *valid = scoped3DUAVInBounds(descriptor, address);
+    address = scoped3DUAVAddress(descriptor, address);
+    auto *type = llvm::FixedVectorType::get(llvm::cast<llvm::StructType>(call->getType())->getElementType(0), 4);
+    bool read_supported = true;
+    texel = emitGuardedAccess(valid, call, {type}, [&]() -> llvm::SmallVector<llvm::Value *, 4> {
+      auto *value = air.CreateRead(texture, descriptor.ResourceHandle, address, array_index, sample_index, level,
+                                   descriptor.GlobalCoherent && coherent_access).first;
+      if (!value) {
+        read_supported = false;
+        return {llvm::PoisonValue::get(type)};
+      }
+      return {value};
+    })[0];
+    if (!read_supported)
+      return createError("dxil: AIR texture read failed");
+  } else {
+    auto read = air.CreateRead(texture, descriptor.ResourceHandle, address, array_index, sample_index, level,
+                               descriptor.GlobalCoherent && coherent_access);
+    texel = read.first;
+    /* Buffer views read through texture_buffer have no native residency: use the tile bitmap. */
+    if (descriptor.ResourceKindLogical != llvm::air::Texture::texture_buffer)
+      setStatusFromResidency(read.second);
+  }
   if (!texel)
     return createError("dxil: AIR texture read failed");
   llvm::SmallVector<llvm::Value *, 4> components;
   appendTexel(components, texel, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  if (descriptor.ResourceKindLogical == llvm::air::Texture::texture_buffer && usesStatus(call))
+    pending_status_ = texelBufferStatus(descriptor, address);
   call->replaceAllUsesWith(buildResult(call, components));
   call->eraseFromParent();
   return llvm::Error::success();
@@ -680,10 +1033,18 @@ ResourceLowering::writeTexture(
     llvm::Value *value
 ) {
   auto texture = textureOf(descriptor);
-  air.CreateWrite(
-      texture, descriptor.ResourceHandle, address, array_index, nullptr, air.getInt(0), value,
-      descriptor.GlobalCoherent && coherent_access
-  );
+  if (descriptor.Scoped3DUAV) {
+    auto *valid = scoped3DUAVInBounds(descriptor, address);
+    address = scoped3DUAVAddress(descriptor, address);
+    emitGuardedAccess(valid, call, {}, [&]() -> llvm::SmallVector<llvm::Value *, 4> {
+      air.CreateWrite(texture, descriptor.ResourceHandle, address, array_index, nullptr, air.getInt(0), value,
+                      descriptor.GlobalCoherent && coherent_access);
+      return {};
+    });
+  } else {
+    air.CreateWrite(texture, descriptor.ResourceHandle, address, array_index, nullptr, air.getInt(0), value,
+                    descriptor.GlobalCoherent && coherent_access);
+  }
   return llvm::Error::success();
 }
 
@@ -712,6 +1073,11 @@ ResourceLowering::collectAnnotations() {
         if (kind == 0 || kind >= 19)
           continue;
         auto *handle = call->getArgOperand(1);
+        uint32_t dword1 = 0;
+        if (properties->getNumOperands() >= 2)
+          if (auto *second = llvm::dyn_cast<llvm::ConstantInt>(properties->getOperand(1)))
+            dword1 = second->getZExtValue();
+        annotation_properties.try_emplace(handle, uint32_t(shape->getZExtValue()), dword1);
         auto entry = annotations.find(handle);
         if (entry != annotations.end() && entry->second != (ResourceKind)kind)
           continue; /* the validator guarantees one shape; keep the first */
@@ -781,7 +1147,8 @@ ResourceLowering::resolve(llvm::Value *handle) {
     }
     case kCreateHandle:
     case kCreateHandleFromBinding:
-    case kCreateHandleForLib: {
+    case kCreateHandleForLib:
+    case kCreateHandleFromHeap: {
       auto result = materialise(call);
       if (!result)
         return result.takeError();
@@ -956,12 +1323,16 @@ ResourceLowering::siteFromCreateHandle(llvm::CallInst *call) {
 
 llvm::Expected<HandleSite>
 ResourceLowering::siteFromCreateHandleFromBinding(llvm::CallInst *call) {
-  auto *bind = llvm::dyn_cast<llvm::ConstantAggregate>(call->getArgOperand(1));
-  if (!bind || bind->getNumOperands() < 4)
+  // %dx.types.ResBind = { i32 rangeLowerBound, i32 rangeUpperBound, i32 spaceID, i8 resourceClass }. DXC folds
+  // t0 space0 (every field zero) to zeroinitializer, a ConstantAggregateZero.
+  auto *bind = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(1));
+  auto *bind_type = bind ? llvm::dyn_cast<llvm::StructType>(bind->getType()) : nullptr;
+  if (!bind_type || bind_type->getNumElements() < 4 ||
+      !(llvm::isa<llvm::ConstantAggregate>(bind) || llvm::isa<llvm::ConstantAggregateZero>(bind)))
     return createError("dxil: dx.op.createHandleFromBinding needs a constant %dx.types.ResBind");
-  auto *space = llvm::dyn_cast<llvm::ConstantInt>(bind->getOperand(0));
-  auto *lower = llvm::dyn_cast<llvm::ConstantInt>(bind->getOperand(1));
-  auto *klass = llvm::dyn_cast<llvm::ConstantInt>(bind->getOperand(3));
+  auto *lower = llvm::dyn_cast_or_null<llvm::ConstantInt>(bind->getAggregateElement(0u));
+  auto *space = llvm::dyn_cast_or_null<llvm::ConstantInt>(bind->getAggregateElement(2u));
+  auto *klass = llvm::dyn_cast_or_null<llvm::ConstantInt>(bind->getAggregateElement(3u));
   if (!space || !lower || !klass)
     return createError("dxil: dx.op.createHandleFromBinding needs constant binding fields");
   HandleSite site;
@@ -1132,11 +1503,208 @@ ResourceLowering::lookupDescriptors(const HandleSite &site, bool needs_counter) 
   }
 }
 
+/*
+ * The usage of every heap-indexed handle.
+ *
+ * A `ResourceDescriptorHeap[i]` object has no `!dx.resources` declaration, so the view
+ * facts the SM 5.x maps carry (read/written/sampled/compared) come from its uses. Handles
+ * that meet in a phi or select become one SSA value, and their descriptors must then have
+ * one AIR type, so usage is merged across each connected handle graph.
+ */
+void
+ResourceLowering::collectHeapUsage() {
+  llvm::DenseMap<llvm::Value *, llvm::Value *> parent;
+  std::function<llvm::Value *(llvm::Value *)> find = [&](llvm::Value *value) -> llvm::Value * {
+    auto entry = parent.find(value);
+    if (entry == parent.end() || entry->second == value)
+      return value;
+    auto *root = find(entry->second);
+    parent[value] = root;
+    return root;
+  };
+  auto unite = [&](llvm::Value *a, llvm::Value *b) {
+    parent.try_emplace(a, a);
+    parent.try_emplace(b, b);
+    auto *ra = find(a);
+    auto *rb = find(b);
+    if (ra != rb)
+      parent[ra] = rb;
+  };
+  llvm::SmallVector<llvm::CallInst *, 16> heap_calls;
+  llvm::SmallVector<std::pair<llvm::Value *, uint32_t>, 32> consumers;
+  for (auto &function : *info.module) {
+    for (auto &block : function) {
+      for (auto &instruction : block) {
+        auto *type = llvm::dyn_cast<llvm::StructType>(instruction.getType());
+        const bool handle_type = type && type->hasName() && type->getName() == "dx.types.Handle";
+        if (handle_type) {
+          if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction))
+            for (auto &incoming : phi->incoming_values())
+              unite(phi, incoming.get());
+          else if (auto *select = llvm::dyn_cast<llvm::SelectInst>(&instruction)) {
+            unite(select, select->getTrueValue());
+            unite(select, select->getFalseValue());
+          }
+        }
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        uint32_t opcode;
+        if (!call || !IsDxilCall(call, opcode))
+          continue;
+        if (opcode == kCreateHandleFromHeap) {
+          heap_calls.push_back(call);
+          parent.try_emplace(call, call);
+        } else if (opcode == kAnnotateHandle) {
+          unite(call, call->getArgOperand(1));
+        } else if (call->arg_size() >= 2) {
+          auto *operand = call->getArgOperand(1);
+          auto *operand_type = llvm::dyn_cast<llvm::StructType>(operand->getType());
+          if (operand_type && operand_type->hasName() && operand_type->getName() == "dx.types.Handle")
+            consumers.emplace_back(operand, opcode);
+        }
+      }
+    }
+  }
+  if (heap_calls.empty())
+    return;
+  llvm::DenseMap<llvm::Value *, HeapUsage> by_root;
+  for (auto [handle, opcode] : consumers) {
+    auto usage = HeapUsageOfOpcode(opcode);
+    auto &merged = by_root[find(handle)];
+    merged.read |= usage.read;
+    merged.written |= usage.written;
+    merged.sampled |= usage.sampled;
+    merged.compared |= usage.compared;
+  }
+  for (auto *call : heap_calls)
+    heap_usage[call] = by_root.lookup(find(call));
+}
+
+/*
+ * `dx.op.createHandleFromHeap(i32 218, i32 index, i1 samplerHeap, i1 nonUniform)`.
+ *
+ * The view shape is the `dx.op.annotateHandle` DXC always wraps the result in (the
+ * validator requires it). Every lane loads its own 32 byte descriptor from the bound
+ * heap, so a non-uniform index needs no waterfall: NonUniformResourceIndex is honoured
+ * by construction and its marker is ignored.
+ */
+llvm::Expected<ResourceHandle>
+ResourceLowering::lookupHeapDescriptors(llvm::CallInst *call, bool needs_counter) {
+  auto *index = call->getArgOperand(1);
+  auto *sampler_heap = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2));
+  if (!sampler_heap)
+    return createError("dxil: dx.op.createHandleFromHeap needs a constant heap selector");
+  auto properties = annotation_properties.find(call);
+  if (properties == annotation_properties.end())
+    return createError("dxil: dx.op.createHandleFromHeap result is not annotated with its resource properties");
+  const uint32_t dword0 = properties->second.first;
+  const uint32_t dword1 = properties->second.second;
+  ResourceHandle handle;
+  handle.kind = static_cast<ResourceKind>(dword0 & kPropertyKindMask);
+  const auto usage = heap_usage.lookup(call);
+  const char *heap_name = sampler_heap->isOne() ? "SamplerDescriptorHeap" : "ResourceDescriptorHeap";
+  auto unbound = [&]() {
+    return createError(
+        llvm::Twine("dxil: ") + heap_name +
+        " is indexed, but the root signature does not set the matching HEAP_DIRECTLY_INDEXED flag"
+    );
+  };
+
+  if (sampler_heap->isOne()) {
+    if (handle.kind != ResourceKind::Sampler)
+      return createError("dxil: SamplerDescriptorHeap can only produce samplers");
+    auto descriptor = binding.GetHeapSampler(air, index);
+    if (!descriptor)
+      return unbound();
+    handle.sampler = *descriptor;
+    return handle;
+  }
+
+  if (handle.kind == ResourceKind::Sampler || handle.kind == ResourceKind::Invalid)
+    return createError("dxil: ResourceDescriptorHeap cannot produce this resource shape");
+  if (handle.kind == ResourceKind::CBuffer) {
+    auto descriptor = binding.GetHeapConstantBuffer(air, index);
+    if (!descriptor)
+      return unbound();
+    handle.cbuffer = *descriptor;
+    return handle;
+  }
+  if (handle.kind == ResourceKind::RTAccelerationStructure) {
+    auto descriptor = binding.GetHeapAccelerationStructure(air, index);
+    if (!descriptor)
+      return unbound();
+    handle.acceleration_structure = *descriptor;
+    return handle;
+  }
+
+  const bool uav = (dword0 & kPropertyIsUAV) != 0;
+  const bool typed = IsTextureKind(handle.kind);
+  const auto component = typed ? static_cast<ComponentType>(dword1 & 0xffu) : ComponentType::Invalid;
+  const uint32_t stride = handle.kind == ResourceKind::StructuredBuffer ? dword1 : 0;
+  const dxbc::ResourceRange range{0, 0, ~0u, 0};
+  if (uav) {
+    dxbc::UnorderedAccessViewInfo view{};
+    view.range = range;
+    view.resource_type = to_resource_type(handle.kind);
+    view.scaler_type = to_scaler_type(component);
+    view.read = usage.read;
+    view.written = usage.written;
+    view.global_coherent = (dword0 & kPropertyGloballyCoherent) != 0;
+    view.rasterizer_order = (dword0 & kPropertyIsROV) != 0;
+    view.structure_stride = stride;
+    view.with_counter = needs_counter;
+    if (view.rasterizer_order && info.stage != Stage::Pixel)
+      return createError("dxil: a rasterizer ordered view is only valid in a pixel shader");
+    if (typed) {
+      auto descriptor = binding.GetHeapUAVTexture(air, view, index);
+      if (!descriptor)
+        return unbound();
+      handle.texture = *descriptor;
+      return handle;
+    }
+    auto descriptor = binding.GetHeapUAVBuffer(air, view, index);
+    if (!descriptor)
+      return unbound();
+    handle.buffer = *descriptor;
+    if (needs_counter) {
+      auto counter = binding.GetHeapUAVCounter(air, index);
+      if (!counter)
+        return unbound();
+      handle.counter = counter->Pointer;
+    }
+    return handle;
+  }
+  dxbc::ShaderResourceViewInfo view{};
+  view.range = range;
+  view.resource_type = to_resource_type(handle.kind);
+  view.scaler_type = to_scaler_type(component);
+  view.read = usage.read;
+  view.sampled = usage.sampled;
+  view.compared = usage.compared;
+  view.structure_stride = stride;
+  if (typed) {
+    auto descriptor = binding.GetHeapSRVTexture(air, view, index);
+    if (!descriptor)
+      return unbound();
+    handle.texture = *descriptor;
+    return handle;
+  }
+  auto descriptor = binding.GetHeapSRVBuffer(air, view, index);
+  if (!descriptor)
+    return unbound();
+  handle.buffer = *descriptor;
+  return handle;
+}
+
 llvm::Expected<ResourceHandle>
 ResourceLowering::materialise(llvm::CallInst *call) {
   uint32_t opcode;
   if (!IsDxilCall(call, opcode))
     return createError("dxil: internal error, not a dx.op call");
+
+  if (opcode == kCreateHandleFromHeap) {
+    builder.SetInsertPoint(call);
+    return lookupHeapDescriptors(call, counter_handles.contains(call));
+  }
 
   llvm::Expected<HandleSite> site = [&]() -> llvm::Expected<HandleSite> {
     switch (opcode) {
@@ -1182,6 +1750,11 @@ ResourceLowering::resolveCounter(llvm::Value *handle) {
       return nullptr;
     if (opcode == kAnnotateHandle)
       return remember(resolveCounter(call->getArgOperand(1)));
+    if (opcode == kCreateHandleFromHeap) {
+      builder.SetInsertPoint(call);
+      auto counter = binding.GetHeapUAVCounter(air, call->getArgOperand(1));
+      return counter ? remember(counter->Pointer) : nullptr;
+    }
     if (opcode != kCreateHandle && opcode != kCreateHandleFromBinding && opcode != kCreateHandleForLib)
       return nullptr;
     auto site = opcode == kCreateHandle
@@ -1413,8 +1986,8 @@ ResourceLowering::lowerBufferLoad(llvm::CallInst *call) {
   auto buffer = bufferDescriptor(*handle, "bufferLoad");
   if (!buffer)
     return buffer.takeError();
-  if (buffer->StructureStride % 4)
-    return createError("dxil: structured buffer stride must be a multiple of 4 bytes");
+  if (buffer->StructureStride % 2)
+    return createError("dxil: structured buffer stride must be a multiple of 2 bytes");
   return loadBufferWords(call, *buffer, c0, c1, usedComponents(call));
 }
 
@@ -1446,8 +2019,8 @@ ResourceLowering::lowerBufferStore(llvm::CallInst *call) {
   auto buffer = bufferDescriptor(*handle, "bufferStore");
   if (!buffer)
     return buffer.takeError();
-  if (buffer->StructureStride % 4)
-    return createError("dxil: structured buffer stride must be a multiple of 4 bytes");
+  if (buffer->StructureStride % 2)
+    return createError("dxil: structured buffer stride must be a multiple of 2 bytes");
   if (mask != 0b1 && mask != 0b11 && mask != 0b111 && mask != 0b1111)
     return createError("dxil: buffer store mask must be contiguous starting at x");
   return storeBufferWords(call, *buffer, c0, c1, mask);
@@ -1464,8 +2037,8 @@ ResourceLowering::lowerRawBufferLoad(llvm::CallInst *call) {
   auto *mask_value = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(4));
   if (!mask_value)
     return createError("dxil: rawBufferLoad needs a constant read mask");
-  if (buffer->StructureStride % 4)
-    return createError("dxil: structured buffer stride must be a multiple of 4 bytes");
+  if (buffer->StructureStride % 2)
+    return createError("dxil: structured buffer stride must be a multiple of 2 bytes");
   builder.SetInsertPoint(call);
   auto *c1 = buffer->StructureStride ? call->getArgOperand(3) : nullptr;
   return loadBufferWords(call, *buffer, call->getArgOperand(2), c1, mask_value->getZExtValue());
@@ -1485,8 +2058,8 @@ ResourceLowering::lowerRawBufferStore(llvm::CallInst *call) {
   uint32_t mask = mask_value->getZExtValue();
   if (mask != 0b1 && mask != 0b11 && mask != 0b111 && mask != 0b1111)
     return createError("dxil: raw buffer store mask must be contiguous starting at x");
-  if (buffer->StructureStride % 4)
-    return createError("dxil: structured buffer stride must be a multiple of 4 bytes");
+  if (buffer->StructureStride % 2)
+    return createError("dxil: structured buffer stride must be a multiple of 2 bytes");
   builder.SetInsertPoint(call);
   auto *c1 = buffer->StructureStride ? call->getArgOperand(3) : nullptr;
   return storeBufferWords(call, *buffer, call->getArgOperand(2), c1, mask);
@@ -1555,7 +2128,9 @@ ResourceLowering::lowerGetDimensions(llvm::CallInst *call) {
         break;
       case llvm::air::Texture::texture3d:
         y = air.CreateTextureQuery(texture, descriptor.ResourceHandle, llvm::air::Texture::height, level);
-        z = air.CreateTextureQuery(texture, descriptor.ResourceHandle, llvm::air::Texture::depth, level);
+        z = descriptor.Scoped3DUAV
+                ? builder.CreateLShr(High32(descriptor.Metadata), 16)
+                : air.CreateTextureQuery(texture, descriptor.ResourceHandle, llvm::air::Texture::depth, level);
         break;
       default:
         return createError("dxil: getDimensions on an unsupported resource shape");
@@ -1658,7 +2233,9 @@ ResourceLowering::atomicAddress(const ResourceHandle &handle, llvm::CallInst *ca
   case llvm::air::Texture::texture2d:
     return makeVector({c[0], c[1]});
   case llvm::air::Texture::texture3d:
-    return makeVector({c[0], c[1], c[2]});
+    return descriptor.Scoped3DUAV
+               ? scoped3DUAVAddress(descriptor, makeVector({c[0], c[1], c[2]}))
+               : makeVector({c[0], c[1], c[2]});
   default:
     return nullptr;
   }
@@ -1676,6 +2253,241 @@ ResourceLowering::atomicArrayIndex(const ResourceHandle &handle, llvm::CallInst 
   default:
     return nullptr;
   }
+}
+
+/*
+ * 64 bit atomics on raw and structured UAVs (required by Shader Model 6.6).
+ *
+ * Apple GPUs only provide non-returning 64 bit min/max, so every returning 64 bit
+ * operation - and, for mutual atomicity, min/max too - takes a spin lock from a
+ * device-global table of SM50_ATOMIC_LOCK_TABLE_ENTRIES 32 bit words, indexed by a
+ * hash of the target's device address. Aliasing views, concurrent dispatches and
+ * queues on the same MTLDevice therefore serialize on the same lock; a hash
+ * collision only costs time.
+ *
+ * The lane-safe loop acquires, updates and releases inside the same iteration:
+ *
+ *   do { if (cas32(lock, 0, 1)) { fence; old = load64; store64(f(old)); fence;
+ *        store32(lock, 0); done = true; } } while (!done);
+ *
+ * so a lane that owns the lock never waits on a lane of its own SIMD group that is
+ * spinning. The 64 bit value moves as two relaxed 32 bit atomic accesses bracketed
+ * by device-scope fences, which keeps the compiler from moving them out of the
+ * critical section.
+ */
+llvm::Value *
+ResourceLowering::atomicLockTable() {
+  auto &module = *info.module;
+  auto *global = module.getNamedGlobal(kAtomicLockTableGlobal);
+  if (!global) {
+    global = new llvm::GlobalVariable(module, builder.getInt64Ty(), /*isConstant=*/true,
+                                      llvm::GlobalValue::InternalLinkage, builder.getInt64(0),
+                                      kAtomicLockTableGlobal, nullptr, llvm::GlobalValue::NotThreadLocal, 2);
+    /* The runtime patches the table address in; its initializer must never be folded. */
+    global->setExternallyInitialized(true);
+    global->setAlignment(llvm::Align(8));
+  }
+  auto *address = builder.CreateLoad(builder.getInt64Ty(), global);
+  return builder.CreateIntToPtr(address, air.getIntTy()->getPointerTo(1));
+}
+
+/*
+ * SM 6.8 barrierByMemoryHandle(handle, SemanticFlags): orders the memory of one UAV.
+ * Metal fences whole address spaces, so the handle selects device + texture memory
+ * (a superset of the one resource); semantics 1 group sync, 2 group scope, 4 device
+ * scope, 8 reorder scope (no memory effect).
+ */
+llvm::Error
+ResourceLowering::lowerBarrierByMemoryHandle(llvm::CallInst *call) {
+  /* The DXIL validator guarantees a UAV handle; the fence does not need its descriptor. */
+  const auto *semantics = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2));
+  if (!semantics)
+    return createError("dxil: barrierByMemoryHandle semantic flags must be constant");
+  const uint32_t bits = static_cast<uint32_t>(semantics->getZExtValue());
+  if (bits & ~0xfu)
+    return createError("dxil: barrierByMemoryHandle has unknown semantic flag bits");
+  builder.SetInsertPoint(call);
+  const auto memory = static_cast<llvm::air::MemFlags>(static_cast<uint32_t>(llvm::air::MemFlags::Device) |
+                                                       static_cast<uint32_t>(llvm::air::MemFlags::Texture));
+  auto scope = static_cast<uint32_t>(llvm::air::ThreadScope::Threadgroup);
+  if (bits & 4u)
+    scope |= static_cast<uint32_t>(llvm::air::ThreadScope::Device);
+  if (!(bits & 1u) || (bits & 4u))
+    air.CreateAtomicFence(memory, llvm::air::ThreadScope(scope));
+  if (bits & 1u)
+    air.CreateBarrier(memory, /*SimdGroup=*/false);
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+llvm::Value *
+ResourceLowering::emitLockedAtomic64(llvm::Value *pointer, llvm::function_ref<llvm::Value *(llvm::Value *old)> update) {
+  auto *i1 = builder.getInt1Ty();
+  auto *i32 = air.getIntTy();
+  auto *i64 = builder.getInt64Ty();
+  auto *pointer32 = i32->getPointerTo(1);
+  /* Every access in and out of the critical section is a device-coherent read-modify-write
+   * (`or 0` reads, `xchg` writes): the AIR 2.7 air.atomic.global.{load,store}.i32 intrinsics
+   * crash the Metal compiler service (XPC_ERROR_CONNECTION_INTERRUPTED, M5 Pro / macOS 27),
+   * and generic atomic loads/stores are not coherent across threadgroups, which left the lock
+   * release invisible and hung contended dispatches. */
+  auto load32 = [&](llvm::Value *address) {
+    auto *rmw = builder.CreateAtomicRMW(llvm::AtomicRMWInst::Or, address, air.getInt(0), llvm::MaybeAlign(4),
+                                        llvm::AtomicOrdering::Monotonic);
+    rmw->setVolatile(true);
+    return rmw;
+  };
+  auto store32 = [&](llvm::Value *address, llvm::Value *value) {
+    auto *rmw = builder.CreateAtomicRMW(llvm::AtomicRMWInst::Xchg, address, value, llvm::MaybeAlign(4),
+                                        llvm::AtomicOrdering::Monotonic);
+    rmw->setVolatile(true);
+  };
+  auto fence = [&]() {
+    air.CreateAtomicFence(llvm::air::MemFlags::Device, llvm::air::ThreadScope::Device);
+  };
+
+  auto *low = builder.CreateBitCast(pointer, pointer32);
+  auto *high = builder.CreateGEP(i32, low, {air.getInt(1)});
+  auto *address = builder.CreatePtrToInt(pointer, i64);
+  auto *hash = builder.CreateXor(builder.CreateLShr(address, 3), builder.CreateLShr(address, 19));
+  auto *slot = builder.CreateAnd(builder.CreateTrunc(hash, i32), air.getInt(SM50_ATOMIC_LOCK_TABLE_ENTRIES - 1));
+  auto *lock = builder.CreateGEP(i32, atomicLockTable(), {slot});
+
+  /* One lane of a simdgroup at a time tries the lock, and it tries once per round: every
+   * round the pending lanes vote, the lowest pending lane makes a single compare-exchange,
+   * and on success updates and releases before the group votes again. No lane ever waits
+   * inside divergent control flow, so progress never depends on the scheduler running a
+   * diverged lane. Per-lane spinning (or an elected lane spinning in an inner loop) hangs
+   * Apple fragment functions (kIOGPUCommandBufferCallbackErrorHang, M5 Pro / macOS 27). */
+  auto attributes = llvm::AttributeList::get(
+      ctx, {{~0U, llvm::Attribute::get(ctx, llvm::Attribute::Convergent)},
+            {~0U, llvm::Attribute::get(ctx, llvm::Attribute::NoUnwind)},
+            {~0U, llvm::Attribute::get(ctx, llvm::Attribute::WillReturn)}});
+  auto ballot = info.module->getOrInsertFunction("air.simd_ballot.i64", llvm::FunctionType::get(i64, {i1}, false),
+                                                 attributes);
+  auto lane_index = info.module->getOrInsertFunction(
+      "air.get_thread_index_in_simdgroup.i32", llvm::FunctionType::get(i32, false), attributes);
+
+  auto *function = builder.GetInsertBlock()->getParent();
+  auto *head = builder.GetInsertBlock();
+  auto *tail = head->splitBasicBlock(builder.GetInsertPoint(), "atomic64.done");
+  head->getTerminator()->eraseFromParent();
+  auto *vote = llvm::BasicBlock::Create(ctx, "atomic64.vote", function, tail);
+  auto *elected = llvm::BasicBlock::Create(ctx, "atomic64.elected", function, tail);
+  auto *attempt = llvm::BasicBlock::Create(ctx, "atomic64.try", function, tail);
+  auto *critical = llvm::BasicBlock::Create(ctx, "atomic64.locked", function, tail);
+  auto *next_round = llvm::BasicBlock::Create(ctx, "atomic64.next", function, tail);
+  builder.SetInsertPoint(head);
+  auto *lane = builder.CreateCall(lane_index);
+  builder.CreateBr(vote);
+
+  builder.SetInsertPoint(vote);
+  auto *pending = builder.CreatePHI(i1, 2);
+  auto *result = builder.CreatePHI(i64, 2);
+  pending->addIncoming(builder.getTrue(), head);
+  result->addIncoming(llvm::UndefValue::get(i64), head);
+  auto *mask = builder.CreateTrunc(builder.CreateCall(ballot, {pending}), i32);
+  auto *leader = air.CreateCountZero(mask, /*TrailingZero=*/true);
+  auto *mine = builder.CreateAnd(pending, builder.CreateICmpEQ(lane, leader));
+  builder.CreateCondBr(builder.CreateICmpNE(mask, air.getInt(0)), elected, tail);
+
+  builder.SetInsertPoint(elected);
+  builder.CreateCondBr(mine, attempt, next_round);
+
+  builder.SetInsertPoint(attempt);
+  auto *claim = builder.CreateAtomicCmpXchg(lock, air.getInt(0), air.getInt(1), llvm::MaybeAlign(4),
+                                            llvm::AtomicOrdering::Monotonic, llvm::AtomicOrdering::Monotonic);
+  claim->setVolatile(true);
+  builder.CreateCondBr(builder.CreateExtractValue(claim, 1), critical, next_round);
+
+  builder.SetInsertPoint(critical);
+  fence();
+  auto *old = builder.CreateOr(builder.CreateZExt(load32(low), i64),
+                               builder.CreateShl(builder.CreateZExt(load32(high), i64), 32));
+  auto *next = update(old);
+  store32(low, builder.CreateTrunc(next, i32));
+  store32(high, builder.CreateTrunc(builder.CreateLShr(next, 32), i32));
+  fence();
+  store32(lock, air.getInt(0));
+  builder.CreateBr(next_round);
+
+  builder.SetInsertPoint(next_round);
+  auto *still_pending = builder.CreatePHI(i1, 3);
+  still_pending->addIncoming(builder.getFalse(), critical);
+  still_pending->addIncoming(pending, attempt);
+  still_pending->addIncoming(pending, elected);
+  auto *value = builder.CreatePHI(i64, 3);
+  value->addIncoming(old, critical);
+  value->addIncoming(result, attempt);
+  value->addIncoming(result, elected);
+  pending->addIncoming(still_pending, next_round);
+  result->addIncoming(value, next_round);
+  builder.CreateBr(vote);
+
+  builder.SetInsertPoint(tail, tail->getFirstInsertionPt());
+  return result;
+}
+
+llvm::Error
+ResourceLowering::lowerBufferAtomic64(llvm::CallInst *call, const ResourceHandle &handle, bool compare_exchange) {
+  const auto &buffer = *handle.buffer;
+  /* atomicBinOp (handle, op, c0, c1, c2, value); atomicCompareExchange (handle, c0,
+   * c1, c2, compare, value). */
+  const unsigned c0_index = compare_exchange ? 2 : 3;
+  auto *c1 = buffer.StructureStride ? call->getArgOperand(c0_index + 1) : nullptr;
+  auto *byte = bufferByteOffset(call->getArgOperand(c0_index), c1, buffer.StructureStride);
+  auto *value = call->getArgOperand(6);
+  auto *comparison = compare_exchange ? call->getArgOperand(5) : nullptr;
+  uint64_t operation = 0;
+  if (!compare_exchange) {
+    auto *constant = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2));
+    if (!constant || constant->getZExtValue() > kAtomicExchange)
+      return createError("dxil: unknown 64 bit atomicBinOp operation");
+    operation = constant->getZExtValue();
+  }
+  auto update = [&](llvm::Value *old) -> llvm::Value * {
+    if (compare_exchange)
+      return builder.CreateSelect(builder.CreateICmpEQ(old, comparison), value, old);
+    switch (operation) {
+    case kAtomicAdd:
+      return builder.CreateAdd(old, value);
+    case kAtomicAnd:
+      return builder.CreateAnd(old, value);
+    case kAtomicOr:
+      return builder.CreateOr(old, value);
+    case kAtomicXor:
+      return builder.CreateXor(old, value);
+    case kAtomicIMin:
+      return builder.CreateSelect(builder.CreateICmpSLT(value, old), value, old);
+    case kAtomicIMax:
+      return builder.CreateSelect(builder.CreateICmpSGT(value, old), value, old);
+    case kAtomicUMin:
+      return builder.CreateSelect(builder.CreateICmpULT(value, old), value, old);
+    case kAtomicUMax:
+      return builder.CreateSelect(builder.CreateICmpUGT(value, old), value, old);
+    default:
+      return value; /* exchange */
+    }
+  };
+  /* The lock table is only safe where threadgroups are guaranteed forward progress. In
+   * fragment functions a contended spin lock hangs the GPU intermittently
+   * (kIOGPUCommandBufferCallbackErrorHang: 46/200 and 23/200 runs of native MSL fragment spin
+   * locks, 3/200 of this lowering, M5 Pro / macOS 27), and Metal's only native 64 bit
+   * buffer atomics (non-returning u64 min/max) need AIR 2.9. Graphics stages therefore
+   * reject 64 bit atomics and SM 6.6 is not reported. */
+  if (!kernel_stage)
+    return createError("dxil: 64 bit atomics are only supported in compute shaders "
+                       "(a graphics-stage lock cannot guarantee forward progress)");
+  /* An atomic on an out-of-range or unbound descriptor does nothing and reads zero. */
+  auto guarded = emitGuardedAccess(
+      bufferBytesInBounds(buffer, byte, 8), call, {builder.getInt64Ty()},
+      [&]() -> llvm::SmallVector<llvm::Value *, 4> {
+        return {emitLockedAtomic64(bufferBytePointer(buffer, byte, builder.getInt64Ty()), update)};
+      }
+  );
+  call->replaceAllUsesWith(guarded[0]);
+  call->eraseFromParent();
+  return llvm::Error::success();
 }
 
 llvm::Error
@@ -1723,6 +2535,11 @@ ResourceLowering::lowerAtomicBinOp(llvm::CallInst *call) {
     return createError("dxil: atomicBinOp requires a UAV handle");
   builder.SetInsertPoint(call);
   auto *value = call->getArgOperand(6);
+  if (value->getType()->isIntegerTy(64)) {
+    if (!handle->buffer)
+      return unsupported("64 bit atomic on a typed resource (AtomicInt64OnTypedResourceSupported is not reported)");
+    return lowerBufferAtomic64(call, *handle, false);
+  }
 
   llvm::Value *result = nullptr;
   if (handle->buffer) {
@@ -1742,13 +2559,22 @@ ResourceLowering::lowerAtomicBinOp(llvm::CallInst *call) {
     if (!address)
       return createError("dxil: atomicBinOp on an unsupported resource shape");
     auto *value_vector = builder.CreateVectorSplat(4, value);
-    result = air.CreateAtomicRMW(
-        textureOf(*handle->texture), handle->texture->ResourceHandle, binop, address, value_vector,
-        atomicArrayIndex(*handle, call, 3)
-    );
+    if (handle->texture->Scoped3DUAV) {
+      auto *count = builder.CreateLShr(High32(handle->texture->Metadata), 16);
+      auto *valid = builder.CreateICmpULT(call->getArgOperand(5), count);
+      result = emitGuardedAccess(valid, call, {air.getIntTy(4)}, [&]() -> llvm::SmallVector<llvm::Value *, 4> {
+        return {air.CreateAtomicRMW(textureOf(*handle->texture), handle->texture->ResourceHandle, binop,
+                                    address, value_vector, nullptr)};
+      })[0];
+    } else {
+      result = air.CreateAtomicRMW(textureOf(*handle->texture), handle->texture->ResourceHandle, binop,
+                                   address, value_vector, atomicArrayIndex(*handle, call, 3));
+    }
     if (!result)
       return createError("dxil: AIR texture atomic failed");
   }
+  if (handle->texture && result->getType()->isVectorTy())
+    result = builder.CreateExtractElement(result, 0ull);
   call->replaceAllUsesWith(result);
   call->eraseFromParent();
   return llvm::Error::success();
@@ -1764,6 +2590,11 @@ ResourceLowering::lowerAtomicCompareExchange(llvm::CallInst *call) {
   builder.SetInsertPoint(call);
   auto *comparison = call->getArgOperand(5);
   auto *value = call->getArgOperand(6);
+  if (value->getType()->isIntegerTy(64)) {
+    if (!handle->buffer)
+      return unsupported("64 bit atomic on a typed resource (AtomicInt64OnTypedResourceSupported is not reported)");
+    return lowerBufferAtomic64(call, *handle, true);
+  }
 
   if (handle->buffer) {
     auto *index = atomicAddress(*handle, call, 2);
@@ -1787,13 +2618,27 @@ ResourceLowering::lowerAtomicCompareExchange(llvm::CallInst *call) {
   auto *address = atomicAddress(*handle, call, 2);
   if (!address)
     return createError("dxil: atomicCompareExchange on an unsupported resource shape");
-  auto result = air.CreateAtomicCmpXchg(
-      textureOf(*handle->texture), handle->texture->ResourceHandle, address, builder.CreateVectorSplat(4, comparison),
-      builder.CreateVectorSplat(4, value), atomicArrayIndex(*handle, call, 2)
-  );
-  if (!result.first)
+  llvm::Value *result = nullptr;
+  if (handle->texture->Scoped3DUAV) {
+    auto *count = builder.CreateLShr(High32(handle->texture->Metadata), 16);
+    auto *valid = builder.CreateICmpULT(call->getArgOperand(4), count);
+    result = emitGuardedAccess(valid, call, {air.getIntTy(4)}, [&]() -> llvm::SmallVector<llvm::Value *, 4> {
+      auto [old, exchanged] = air.CreateAtomicCmpXchg(
+          textureOf(*handle->texture), handle->texture->ResourceHandle, address,
+          builder.CreateVectorSplat(4, comparison), builder.CreateVectorSplat(4, value), nullptr);
+      return {old};
+    })[0];
+  } else {
+    result = air.CreateAtomicCmpXchg(
+        textureOf(*handle->texture), handle->texture->ResourceHandle, address,
+        builder.CreateVectorSplat(4, comparison), builder.CreateVectorSplat(4, value),
+        atomicArrayIndex(*handle, call, 2)).first;
+  }
+  if (!result)
     return createError("dxil: AIR texture compare exchange failed");
-  call->replaceAllUsesWith(result.first);
+  if (result->getType()->isVectorTy())
+    result = builder.CreateExtractElement(result, 0ull);
+  call->replaceAllUsesWith(result);
   call->eraseFromParent();
   return llvm::Error::success();
 }
@@ -1850,10 +2695,10 @@ ResourceLowering::sampleTarget(
 ) {
   switch (descriptor.ResourceKindLogical) {
   case llvm::air::Texture::texture1d:
-    coord = padVector(c0, 2, air.getFloat(0));
+    coord = padVector(c0, 2, air.getFloat(0.5f));
     break;
   case llvm::air::Texture::texture1d_array:
-    coord = padVector(c0, 2, air.getFloat(0));
+    coord = padVector(c0, 2, air.getFloat(0.5f));
     array_index = clampArrayIndex(c1, descriptor.Metadata);
     break;
   case llvm::air::Texture::texture2d:
@@ -1883,6 +2728,66 @@ ResourceLowering::sampleTarget(
     return createError("dxil: sampling an unsupported resource shape");
   }
   return llvm::Error::success();
+}
+
+/*
+ * SM 6.6 compute derivatives for implicit-LOD sampling. Metal only computes implicit
+ * derivatives in fragment functions, so a compute shader samples with explicit
+ * gradients formed from the quad (Z ordered: lane q = 2*y + x, laid out by the
+ * stage signature): d/dx = value(q|1) - value(q&~1), d/dy = value(q|2) - value(q&~2).
+ * Bias is folded in by scaling the gradients by 2^bias, which raises the LOD by
+ * exactly `bias` for Metal's isotropic LOD computation.
+ */
+std::pair<llvm::Value *, llvm::Value *>
+ResourceLowering::quadGradients(llvm::Value *coord, uint32_t components) {
+  auto *type = coord->getType();
+  auto *lane_type = type->getScalarType();
+  std::string suffix = air.getTypeOverloadSuffix(type, llvm::air::Signedness::DontCare);
+  auto attributes = llvm::AttributeList::get(
+      ctx, {{~0U, llvm::Attribute::get(ctx, llvm::Attribute::Convergent)},
+            {~0U, llvm::Attribute::get(ctx, llvm::Attribute::NoUnwind)},
+            {~0U, llvm::Attribute::get(ctx, llvm::Attribute::WillReturn)}});
+  auto shuffle = info.module->getOrInsertFunction(
+      "air.quad_shuffle" + suffix, llvm::FunctionType::get(type, {type, builder.getInt16Ty()}, false), attributes);
+  auto *lane = builder.CreateCall(
+      info.module->getOrInsertFunction("air.get_thread_index_in_simdgroup.i32", llvm::FunctionType::get(air.getIntTy(), false),
+                                       attributes));
+  auto *quad_lane = builder.CreateTrunc(builder.CreateAnd(lane, air.getInt(3)), builder.getInt16Ty());
+  auto read = [&](llvm::Value *index) { return builder.CreateCall(shuffle, {coord, index}); };
+  auto *dx = builder.CreateFSub(read(builder.CreateOr(quad_lane, builder.getInt16(1))),
+                                read(builder.CreateAnd(quad_lane, builder.getInt16(2))));
+  auto *dy = builder.CreateFSub(read(builder.CreateOr(quad_lane, builder.getInt16(2))),
+                                read(builder.CreateAnd(quad_lane, builder.getInt16(1))));
+  if (components == 1 && type->isVectorTy()) {
+    /* 1D textures carry a padded 2 component coordinate. */
+    dx = builder.CreateExtractElement(dx, uint64_t(0));
+    dy = builder.CreateExtractElement(dy, uint64_t(0));
+  } else if (auto *vector = llvm::dyn_cast<llvm::FixedVectorType>(type); vector && vector->getNumElements() != components) {
+    llvm::SmallVector<int, 3> mask;
+    for (unsigned i = 0; i < components; ++i)
+      mask.push_back(i);
+    dx = builder.CreateShuffleVector(dx, dx, mask);
+    dy = builder.CreateShuffleVector(dy, dy, mask);
+  }
+  (void)lane_type;
+  return {dx, dy};
+}
+
+std::pair<llvm::Value *, llvm::Value *>
+ResourceLowering::sampleInKernel(
+    const dxbc::TextureDescirptor &descriptor, llvm::Value *sampler_value, llvm::Value *coord,
+    llvm::Value *array_index, const int32_t offsets[3], llvm::Value *bias, llvm::Value *min_lod, llvm::Value *reference
+) {
+  auto [dx, dy] = quadGradients(coord, gradientCount(descriptor.ResourceKindLogical));
+  if (bias) {
+    auto *scale = air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, bias);
+    if (dx->getType()->isVectorTy())
+      scale = builder.CreateVectorSplat(llvm::cast<llvm::FixedVectorType>(dx->getType())->getNumElements(), scale);
+    dx = builder.CreateFMul(dx, scale);
+    dy = builder.CreateFMul(dy, scale);
+  }
+  return air.CreateSampleGrad(textureOf(descriptor), descriptor.ResourceHandle, sampler_value, coord, array_index, dx,
+                              dy, min_lod, offsets, reference);
 }
 
 llvm::Error
@@ -1919,14 +2824,19 @@ ResourceLowering::lowerSample(llvm::CallInst *call) {
   if (!IsUndefOrPoison(clamp))
     min_lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, min_lod, clamp);
 
-  auto [texel, residency] = air.CreateSample(
-      textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord, array_index, offsets,
-      llvm::air::sample_bias{samplerBias(*sampler_handle->sampler)}, llvm::air::sample_min_lod_clamp{min_lod}
-  );
+  auto [texel, residency] =
+      kernel_stage
+          ? sampleInKernel(*descriptor, sampler_value, coord, array_index, offsets,
+                           samplerBias(*sampler_handle->sampler), min_lod, nullptr)
+          : air.CreateSample(
+                textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord, array_index, offsets,
+                llvm::air::sample_bias{samplerBias(*sampler_handle->sampler)}, llvm::air::sample_min_lod_clamp{min_lod}
+            );
   if (!texel)
     return createError("dxil: AIR sample failed");
   llvm::SmallVector<llvm::Value *, 4> components;
   appendTexel(components, texel, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  setStatusFromResidency(residency);
   call->replaceAllUsesWith(buildResult(call, components));
   call->eraseFromParent();
   return llvm::Error::success();
@@ -1972,6 +2882,7 @@ ResourceLowering::lowerGather(llvm::CallInst *call) {
     return createError("dxil: AIR gather failed");
   llvm::SmallVector<llvm::Value *, 4> components;
   appendTexel(components, texel, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  setStatusFromResidency(residency);
   call->replaceAllUsesWith(buildResult(call, components));
   call->eraseFromParent();
   return llvm::Error::success();
@@ -2017,6 +2928,7 @@ ResourceLowering::lowerGatherCmp(llvm::CallInst *call) {
     return createError("dxil: AIR gather compare failed");
   llvm::SmallVector<llvm::Value *, 4> components;
   appendTexel(components, result.first, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  setStatusFromResidency(result.second);
   call->replaceAllUsesWith(buildResult(call, components));
   call->eraseFromParent();
   return llvm::Error::success();
@@ -2038,6 +2950,9 @@ ResourceLowering::lowerTexture2DMSGetSamplePosition(llvm::CallInst *call) {
       textureOf(*descriptor), descriptor->ResourceHandle, llvm::air::Texture::num_samples, air.getInt(0)
   );
   auto *position = air.CreateGetSamplePosition(count, call->getArgOperand(2));
+  auto *center = builder.CreateICmpEQ(builder.CreateTrunc(descriptor->Metadata, builder.getInt32Ty()),
+                                      builder.getInt32(1));
+  position = builder.CreateSelect(center, llvm::ConstantAggregateZero::get(air.getFloatTy(2)), position);
   llvm::Value *result = llvm::UndefValue::get(call->getType());
   result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, (uint64_t)0), 0);
   result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, 1), 1);
@@ -2050,6 +2965,8 @@ llvm::Error
 ResourceLowering::lowerRenderTargetGetSamplePosition(llvm::CallInst *call) {
   builder.SetInsertPoint(call);
   auto *position = air.CreateGetSamplePosition(air.CreateGetNumSamples(), call->getArgOperand(1));
+  if (auto *sample_call = llvm::dyn_cast<llvm::CallInst>(position))
+    sample_call->setMetadata("dxmt.rt_sample_pos", llvm::MDNode::get(builder.getContext(), {}));
   llvm::Value *result = llvm::UndefValue::get(call->getType());
   result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, (uint64_t)0), 0);
   result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, 1), 1);
@@ -2090,7 +3007,38 @@ ResourceLowering::lowerCalculateLOD(llvm::CallInst *call) {
   );
   if (target_error)
     return target_error;
-  auto lod = air.CreateCalculateLOD(textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord);
+  std::pair<llvm::Value *, llvm::Value *> lod;
+  if (!kernel_stage) {
+    lod = air.CreateCalculateLOD(textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord);
+  } else {
+    /* Metal's calculate_*_lod returns 0 in a kernel (measured on the GPU): derive the
+     * LOD from the compute quad, log2 of the largest texel-space gradient length, and
+     * clamp it to the view's mip range for the clamped form (sampler clamps are not
+     * visible to the shader and are applied by the sample itself). */
+    const uint32_t components = gradientCount(descriptor->ResourceKindLogical);
+    auto [dx, dy] = quadGradients(coord, components);
+    auto texture = textureOf(*descriptor);
+    llvm::Value *dx_length = air.getFloat(0), *dy_length = air.getFloat(0);
+    static constexpr llvm::air::Texture::Query queries[] = {
+        llvm::air::Texture::width, llvm::air::Texture::height, llvm::air::Texture::depth};
+    for (uint32_t i = 0; i < components && i < 3; ++i) {
+      auto *extent = builder.CreateUIToFP(
+          air.CreateTextureQuery(texture, descriptor->ResourceHandle, queries[i], air.getInt(0)), air.getFloatTy());
+      auto *x = builder.CreateFMul(components == 1 ? dx : builder.CreateExtractElement(dx, i), extent);
+      auto *y = builder.CreateFMul(components == 1 ? dy : builder.CreateExtractElement(dy, i), extent);
+      dx_length = builder.CreateFAdd(dx_length, builder.CreateFMul(x, x));
+      dy_length = builder.CreateFAdd(dy_length, builder.CreateFMul(y, y));
+    }
+    auto *rho2 = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, dx_length, dy_length);
+    auto *unclamped = builder.CreateFMul(air.CreateFPUnOp(llvm::air::AIRBuilder::log2, rho2), air.getFloat(0.5f));
+    auto *levels = builder.CreateUIToFP(
+        air.CreateTextureQuery(texture, descriptor->ResourceHandle, llvm::air::Texture::num_mip_levels, air.getInt(0)),
+        air.getFloatTy());
+    auto *clamped_lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, unclamped, air.getFloat(0));
+    clamped_lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, clamped_lod,
+                                    builder.CreateFSub(levels, air.getFloat(1)));
+    lod = {clamped_lod, unclamped};
+  }
   lod.first = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, minLodClamp(*descriptor), lod.first);
   auto *clamped = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(6));
   if (!clamped)
@@ -2135,14 +3083,17 @@ ResourceLowering::lowerSampleBias(llvm::CallInst *call) {
   if (!IsUndefOrPoison(clamp))
     min_lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, min_lod, clamp);
 
-  auto [texel, residency] = air.CreateSample(
-      textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord, array_index, offsets,
-      llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod}
-  );
+  auto [texel, residency] =
+      kernel_stage ? sampleInKernel(*descriptor, sampler_value, coord, array_index, offsets, bias, min_lod, nullptr)
+                   : air.CreateSample(
+                         textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord, array_index,
+                         offsets, llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod}
+                     );
   if (!texel)
     return createError("dxil: AIR sampleBias failed");
   llvm::SmallVector<llvm::Value *, 4> components;
   appendTexel(components, texel, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  setStatusFromResidency(residency);
   call->replaceAllUsesWith(buildResult(call, components));
   call->eraseFromParent();
   return llvm::Error::success();
@@ -2179,6 +3130,7 @@ ResourceLowering::lowerSampleLevel(llvm::CallInst *call) {
 
   /* The sampler LOD bias applies exactly once, on top of the explicit LOD. */
   auto *lod = builder.CreateFAdd(call->getArgOperand(10), samplerBias(*sampler_handle->sampler));
+  lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, lod, minLodClamp(*descriptor));
   auto [texel, residency] = air.CreateSample(
       textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord, array_index, offsets,
       llvm::air::sample_level{lod}
@@ -2187,6 +3139,7 @@ ResourceLowering::lowerSampleLevel(llvm::CallInst *call) {
     return createError("dxil: AIR sampleLevel failed");
   llvm::SmallVector<llvm::Value *, 4> components;
   appendTexel(components, texel, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  setStatusFromResidency(residency);
   call->replaceAllUsesWith(buildResult(call, components));
   call->eraseFromParent();
   return llvm::Error::success();
@@ -2241,6 +3194,7 @@ ResourceLowering::lowerSampleGrad(llvm::CallInst *call) {
     return createError("dxil: AIR sampleGrad failed");
   llvm::SmallVector<llvm::Value *, 4> components;
   appendTexel(components, texel, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  setStatusFromResidency(residency);
   call->replaceAllUsesWith(buildResult(call, components));
   call->eraseFromParent();
   return llvm::Error::success();
@@ -2280,22 +3234,180 @@ ResourceLowering::lowerSampleCmp(llvm::CallInst *call, bool level_zero) {
   if (level_zero) {
     result = air.CreateSampleCmp(
         textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord, array_index, reference, offsets,
-        llvm::air::sample_level{air.getFloat(0)}
+        llvm::air::sample_level{air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, air.getFloat(0), minLodClamp(*descriptor))}
     );
   } else {
     auto *min_lod = minLodClamp(*descriptor);
     auto *clamp = call->getArgOperand(11);
     if (!IsUndefOrPoison(clamp))
       min_lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, min_lod, clamp);
-    result = air.CreateSampleCmp(
-        textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord, array_index, reference, offsets,
-        llvm::air::sample_bias{samplerBias(*sampler_handle->sampler)}, llvm::air::sample_min_lod_clamp{min_lod}
-    );
+    result = kernel_stage
+                 ? sampleInKernel(*descriptor, sampler_value, coord, array_index, offsets,
+                                  samplerBias(*sampler_handle->sampler), min_lod, reference)
+                 : air.CreateSampleCmp(
+                       textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord, array_index,
+                       reference, offsets, llvm::air::sample_bias{samplerBias(*sampler_handle->sampler)},
+                       llvm::air::sample_min_lod_clamp{min_lod}
+                   );
   }
   if (!result.first)
     return createError("dxil: AIR sampleCmp failed");
   llvm::SmallVector<llvm::Value *, 4> components;
   appendTexel(components, result.first, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  setStatusFromResidency(result.second);
+  call->replaceAllUsesWith(buildResult(call, components));
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+/*
+ * SM 6.7 SampleCmpLevel (224) and SM 6.8 SampleCmpBias (255) / SampleCmpGrad (254).
+ * Operands after the shared (srv, sampler, c0..c3, o0..o2, compare) prefix:
+ *   level: lod;  bias: bias, clamp;  grad: ddx0..2, ddy0..2, clamp.
+ * The sampler LOD bias is applied exactly as for the non-compare forms.
+ */
+llvm::Error
+ResourceLowering::lowerSampleCmpExtended(llvm::CallInst *call, uint32_t opcode) {
+  auto texture_handle = resolve(call->getArgOperand(1));
+  if (!texture_handle)
+    return texture_handle.takeError();
+  auto descriptor = textureDescriptor(*texture_handle, "sampleCmp");
+  if (!descriptor)
+    return descriptor.takeError();
+  auto sampler_handle = resolve(call->getArgOperand(2));
+  if (!sampler_handle)
+    return sampler_handle.takeError();
+  if (!sampler_handle->sampler)
+    return createError("dxil: sampleCmp requires a sampler handle");
+  builder.SetInsertPoint(call);
+
+  llvm::Value *coord = nullptr;
+  llvm::Value *array_index = nullptr;
+  llvm::Value *sampler_value = sampler_handle->sampler->SamplerHandle;
+  if (auto error = sampleTarget(
+          *descriptor, sampler_handle->sampler->CubeSamplerHandle, call->getArgOperand(3), call->getArgOperand(4),
+          call->getArgOperand(5), call->getArgOperand(6), coord, array_index, sampler_value
+      ))
+    return error;
+  int32_t offsets[3];
+  if (auto error = sampleOffsets(call, 7, offsets))
+    return error;
+  auto *reference = call->getArgOperand(10);
+  auto *min_lod = minLodClamp(*descriptor);
+  auto clamped = [&](unsigned operand) {
+    auto *clamp = call->getArgOperand(operand);
+    return IsUndefOrPoison(clamp) ? min_lod : air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, min_lod, clamp);
+  };
+
+  std::pair<llvm::Value *, llvm::Value *> result;
+  switch (opcode) {
+  case kSampleCmpLevel: {
+    auto *lod = builder.CreateFAdd(call->getArgOperand(11), samplerBias(*sampler_handle->sampler));
+    lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, lod, min_lod);
+    result = air.CreateSampleCmp(textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord,
+                                 array_index, reference, offsets, llvm::air::sample_level{lod});
+    break;
+  }
+  case kSampleCmpBias: {
+    auto *bias = builder.CreateFAdd(samplerBias(*sampler_handle->sampler), call->getArgOperand(11));
+    result = kernel_stage ? sampleInKernel(*descriptor, sampler_value, coord, array_index, offsets, bias,
+                                           clamped(12), reference)
+                          : air.CreateSampleCmp(textureOf(*descriptor), descriptor->ResourceHandle, sampler_value,
+                                                coord, array_index, reference, offsets, llvm::air::sample_bias{bias},
+                                                llvm::air::sample_min_lod_clamp{clamped(12)});
+    break;
+  }
+  default: {
+    const uint32_t gradients = gradientCount(descriptor->ResourceKindLogical);
+    llvm::SmallVector<llvm::Value *, 3> derivative_x;
+    llvm::SmallVector<llvm::Value *, 3> derivative_y;
+    for (unsigned i = 0; i < gradients; i++) {
+      derivative_x.push_back(call->getArgOperand(11 + i));
+      derivative_y.push_back(call->getArgOperand(14 + i));
+    }
+    result = air.CreateSampleGrad(textureOf(*descriptor), descriptor->ResourceHandle, sampler_value, coord,
+                                  array_index, makeVector(derivative_x), makeVector(derivative_y), clamped(17),
+                                  offsets, reference);
+    break;
+  }
+  }
+  if (!result.first)
+    return createError("dxil: AIR sample compare failed (the resource must be a depth-compatible 2D or cube view)");
+  llvm::SmallVector<llvm::Value *, 4> components;
+  appendTexel(components, result.first, llvm::cast<llvm::StructType>(call->getType())->getElementType(0));
+  setStatusFromResidency(result.second);
+  call->replaceAllUsesWith(buildResult(call, components));
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+/*
+ * SM 6.7 TextureGatherRaw (223): the four texels' red channels as raw unsigned bits.
+ * The view must be an R16_UINT / R32_UINT / R32G32_UINT view (D3D validates that), so
+ * gathering component 0 of the integer view already is the raw texel; a 64 bit view
+ * is gathered as two 32 bit channels and recombined.
+ */
+llvm::Error
+ResourceLowering::lowerGatherRaw(llvm::CallInst *call) {
+  auto texture_handle = resolve(call->getArgOperand(1));
+  if (!texture_handle)
+    return texture_handle.takeError();
+  auto descriptor = textureDescriptor(*texture_handle, "textureGatherRaw");
+  if (!descriptor)
+    return descriptor.takeError();
+  auto sampler_handle = resolve(call->getArgOperand(2));
+  if (!sampler_handle)
+    return sampler_handle.takeError();
+  if (!sampler_handle->sampler)
+    return createError("dxil: textureGatherRaw requires a sampler handle");
+  auto texture = textureOf(*descriptor);
+  if (texture.sample_type != llvm::air::Texture::sample_uint)
+    return createError("dxil: textureGatherRaw requires an unsigned integer view");
+  builder.SetInsertPoint(call);
+
+  llvm::Value *coord = nullptr;
+  llvm::Value *array_index = nullptr;
+  llvm::Value *sampler_value = sampler_handle->sampler->SamplerHandle;
+  if (auto error = sampleTarget(
+          *descriptor, sampler_handle->sampler->CubeSamplerHandle, call->getArgOperand(3), call->getArgOperand(4),
+          call->getArgOperand(5), call->getArgOperand(6), coord, array_index, sampler_value
+      ))
+    return error;
+  int32_t offsets[3] = {};
+  for (unsigned i = 0; i < 2; ++i) {
+    auto offset = constantOperand(call->getArgOperand(7 + i), "gather raw offset");
+    if (!offset)
+      return offset.takeError();
+    offsets[i] = *offset;
+  }
+  auto *lane_type = llvm::cast<llvm::StructType>(call->getType())->getElementType(0);
+  llvm::Value *residency = nullptr;
+  auto gather = [&](unsigned component) {
+    auto result = air.CreateGather(texture, descriptor->ResourceHandle, sampler_value, coord, array_index, offsets,
+                                   air.getInt(component));
+    if (!residency)
+      residency = result.second;
+    return result.first;
+  };
+  auto *red = gather(0);
+  if (!red)
+    return createError("dxil: AIR gather failed");
+  llvm::SmallVector<llvm::Value *, 4> components;
+  for (unsigned i = 0; i < 4; ++i) {
+    llvm::Value *lane = builder.CreateExtractElement(red, i);
+    if (lane_type->isIntegerTy(64)) {
+      auto *green = gather(1);
+      if (!green)
+        return createError("dxil: AIR gather failed");
+      lane = builder.CreateOr(builder.CreateZExt(lane, lane_type),
+                              builder.CreateShl(builder.CreateZExt(builder.CreateExtractElement(green, i), lane_type),
+                                                32));
+    } else if (lane_type != lane->getType()) {
+      lane = builder.CreateTrunc(lane, lane_type);
+    }
+    components.push_back(lane);
+  }
+  setStatusFromResidency(residency);
   call->replaceAllUsesWith(buildResult(call, components));
   call->eraseFromParent();
   return llvm::Error::success();
@@ -2305,11 +3417,68 @@ ResourceLowering::lowerSampleCmp(llvm::CallInst *call, bool level_zero) {
 /* driver                                                                  */
 /* ----------------------------------------------------------------------- */
 
+/*
+ * A null texture or sampler descriptor must not reach Metal.
+ *
+ * D3D12 defines a read through a null SRV/UAV as zero and a write as dropped; with
+ * Resource Binding Tier 3 and SM 6.6 heap indexing the descriptor can be null (created
+ * with a null resource, or an index past the bound heap resolving to the null
+ * descriptor) wherever a texture is used. Metal forbids touching a null texture handle
+ * ("Null texture access" under shader validation), so the whole operation runs only
+ * while its texture - and its sampler, if it takes one - is non-null, and every value it
+ * produces is zero otherwise. An RGB32 typed-buffer view has no native texture by design
+ * (its data is read through the emulation address), so it counts as present.
+ */
+llvm::Error
+ResourceLowering::guardNullDescriptors(llvm::CallInst *call) {
+  auto is_handle = [](llvm::Value *value) {
+    auto *type = llvm::dyn_cast<llvm::StructType>(value->getType());
+    return type && type->hasName() && type->getName() == "dx.types.Handle";
+  };
+  if (call->arg_size() < 2 || !is_handle(call->getArgOperand(1)))
+    return llvm::Error::success();
+  auto handle = resolve(call->getArgOperand(1));
+  if (!handle)
+    return handle.takeError();
+  if (!handle->texture)
+    return llvm::Error::success();
+  builder.SetInsertPoint(call);
+  llvm::Value *present = builder.CreateIsNotNull(handle->texture->ResourceHandle);
+  if (handle->texture->EmulationTag)
+    present = builder.CreateOr(
+        present, builder.CreateTrunc(handle->texture->EmulationTag, builder.getInt1Ty())
+    );
+  if (call->arg_size() > 2 && is_handle(call->getArgOperand(2))) {
+    auto sampler = resolve(call->getArgOperand(2));
+    if (!sampler)
+      return sampler.takeError();
+    builder.SetInsertPoint(call);
+    if (sampler->sampler)
+      present = builder.CreateAnd(present, builder.CreateIsNotNull(sampler->sampler->SamplerHandle));
+  }
+  auto *head = call->getParent();
+  auto *then_term = llvm::SplitBlockAndInsertIfThen(present, call, /*Unreachable=*/false);
+  auto *then_block = then_term->getParent();
+  auto *continuation = call->getParent();
+  call->moveBefore(then_term);
+  if (!call->getType()->isVoidTy()) {
+    builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
+    auto *merged = builder.CreatePHI(call->getType(), 2);
+    call->replaceUsesWithIf(merged, [&](llvm::Use &use) { return use.getUser() != merged; });
+    merged->addIncoming(call, then_block);
+    merged->addIncoming(llvm::Constant::getNullValue(call->getType()), head);
+  }
+  return llvm::Error::success();
+}
+
 llvm::Error
 ResourceLowering::lowerCall(llvm::CallInst *call) {
   uint32_t opcode;
   if (!IsDxilCall(call, opcode))
     return createError("dxil: internal error, not a dx.op call");
+  if (opcode != kBarrierByMemoryHandle && opcode != kTextureStoreSample)
+    if (auto error = guardNullDescriptors(call))
+      return error;
   switch (opcode) {
   case kCBufferLoadLegacy:
     return lowerCBufferLoadLegacy(call);
@@ -2349,6 +3518,12 @@ ResourceLowering::lowerCall(llvm::CallInst *call) {
     return lowerSampleCmp(call, false);
   case kSampleCmpLevelZero:
     return lowerSampleCmp(call, true);
+  case kSampleCmpLevel:
+  case kSampleCmpBias:
+  case kSampleCmpGrad:
+    return lowerSampleCmpExtended(call, opcode);
+  case kTextureGatherRaw:
+    return lowerGatherRaw(call);
   case kGetDimensions:
     return lowerGetDimensions(call);
   case kBufferUpdateCounter:
@@ -2357,6 +3532,12 @@ ResourceLowering::lowerCall(llvm::CallInst *call) {
     return lowerAtomicBinOp(call);
   case kAtomicCompareExchange:
     return lowerAtomicCompareExchange(call);
+  case kBarrierByMemoryHandle:
+    return lowerBarrierByMemoryHandle(call);
+  case kTextureStoreSample:
+    /* Metal's texture2d_ms only has access::read (metal_texture: texture2d_ms static_asserts
+     * access::read), so WriteableMSAATexturesSupported is not reported. */
+    return createError("dxil: textureStoreSample requires WriteableMSAATexturesSupported, which is not reported");
   default:
     return createError(llvm::Twine("dxil: unsupported resource operation ") + call->getCalledFunction()->getName());
   }
@@ -2364,8 +3545,11 @@ ResourceLowering::lowerCall(llvm::CallInst *call) {
 
 llvm::Error
 ResourceLowering::run() {
+  if (auto *kernels = info.module->getNamedMetadata("air.kernel"))
+    kernel_stage = kernels->getNumOperands() != 0;
   collectAnnotations();
   collectCounterHandles();
+  collectHeapUsage();
 
   llvm::SmallVector<llvm::CallInst *, 64> worklist;
   for (auto &function : *info.module) {
@@ -2399,10 +3583,16 @@ ResourceLowering::run() {
         case kSampleGrad:
         case kSampleCmp:
         case kSampleCmpLevelZero:
+        case kSampleCmpLevel:
+        case kSampleCmpBias:
+        case kSampleCmpGrad:
+        case kTextureGatherRaw:
         case kGetDimensions:
         case kBufferUpdateCounter:
         case kAtomicBinOp:
         case kAtomicCompareExchange:
+        case kBarrierByMemoryHandle:
+        case kTextureStoreSample:
           worklist.push_back(call);
           break;
         default:
@@ -2416,6 +3606,23 @@ ResourceLowering::run() {
     if (auto error = lowerCall(call))
       return error;
   }
+
+  /* CheckAccessFullyMapped consumes the status member the resource operations above just built. */
+  llvm::SmallVector<llvm::CallInst *, 8> status_checks;
+  for (auto &function : *info.module) {
+    if (function.isDeclaration())
+      continue;
+    for (auto &block : function)
+      for (auto &instruction : block)
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          uint32_t opcode;
+          if (IsDxilCall(call, opcode) && opcode == kCheckAccessFullyMapped)
+            status_checks.push_back(call);
+        }
+  }
+  for (auto *call : status_checks)
+    if (auto error = lowerCheckAccessFullyMapped(call))
+      return error;
 
   /* Resource consumers now use native descriptors. Remove the whole obsolete
    * handle graph, including phi/select and annotation chains, but never erase
@@ -2439,7 +3646,7 @@ ResourceLowering::run() {
         if (!IsDxilCall(call, opcode))
           continue;
         if (opcode == kCreateHandle || opcode == kCreateHandleForLib || opcode == kAnnotateHandle ||
-            opcode == kCreateHandleFromBinding)
+            opcode == kCreateHandleFromBinding || opcode == kCreateHandleFromHeap)
           handle_nodes.insert(call);
       }
     }

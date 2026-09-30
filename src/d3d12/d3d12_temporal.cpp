@@ -69,7 +69,7 @@ WMTPixelFormat motionFormat(WMTPixelFormat format) {
 }
 
 HRESULT retainTexture(MTLD3D12Device *device, ID3D12Resource *input,
-                      Com<MTLD3D12Resource> &resource, TextureViewRef &view,
+                      Com<MTLD3D12Resource, false> &resource, TextureViewRef &view,
                       WMTPixelFormat format = WMTPixelFormatInvalid) {
   if (!input)
     return E_INVALIDARG;
@@ -98,7 +98,7 @@ struct OwnedTemporalFrame {
   std::shared_ptr<Core> core;
   std::shared_ptr<Generation> generation;
   const uint64_t id = owned_graphics::NewObjectId();
-  std::array<Com<MTLD3D12Resource>, 5> resources;
+  std::array<Com<MTLD3D12Resource, false>, 5> resources;
   TextureViewRef color, depth, motion, output, exposure;
   WMT::Reference<WMT::Texture> scratch_output;
   WMTFXTemporalScalerProps props{};
@@ -308,6 +308,11 @@ HRESULT PrepareOwnedTemporalFrame(MTLD3D12Device *device, IMTLD3D12TemporalUpsca
   } catch (const std::bad_alloc &) {
     return E_OUTOFMEMORY;
   }
+}
+
+std::array<MTLD3D12Resource *, 5> GetOwnedTemporalFrameResources(const std::shared_ptr<OwnedTemporalFrame> &frame) {
+  return {frame->resources[0].ptr(), frame->resources[1].ptr(), frame->resources[2].ptr(),
+          frame->resources[3].ptr(), frame->resources[4].ptr()};
 }
 
 void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,

@@ -19,6 +19,8 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
   layer_props_.display_sync_enabled = false;
   layer_props_.framebuffer_only = false; // how strangely setting it true results in worse performance
   layer_props_.contents_scale = layer_props_.contents_scale * scale_factor;
+  present_order_event_ = device.newSharedEvent();
+  restart_token_ = device.newSharedEvent();
 
   WMTTextureInfo texture_info;
   texture_info.type = WMTTextureType2D;
@@ -40,6 +42,7 @@ Presenter::changeLayerProperties(
 ) {
   bool should_invalidated = colorspace_ != colorspace;
   should_invalidated |= source_format_ != format;
+  should_invalidated |= layer_props_.drawable_width != width || layer_props_.drawable_height != height;
   source_format_ = format;
   should_invalidated |= sample_count_ != sample_count;
   sample_count_ = sample_count;
@@ -66,9 +69,10 @@ Presenter::changeLayerColorSpace(WMTColorSpace colorspace) {
 void
 Presenter::changeHDRMetadata(const WMTHDRMetadata *metadata) {
   if (metadata) {
+    if (!has_hdr_metadata_)
+      pso_valid.clear();
     has_hdr_metadata_ = true;
     hdr_metadata_ = *metadata;
-    pso_valid.clear();
   } else {
     if (has_hdr_metadata_) {
       has_hdr_metadata_ = false;
@@ -102,12 +106,31 @@ Presenter::changeGammaRamp(const DXMTGammaRamp *gamma_ramp) {
 }
 
 Presenter::PresentState
-Presenter::synchronizeLayerProperties() {
+Presenter::synchronizeLayerProperties(bool wait_for_gpu_completion) {
+  return std::move(*synchronizeLayerPropertiesImpl(wait_for_gpu_completion, false));
+}
+
+std::optional<Presenter::PresentState>
+Presenter::trySynchronizeLayerProperties() {
+  return synchronizeLayerPropertiesImpl(true, true);
+}
+
+std::optional<Presenter::PresentState>
+Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_not_wait) {
   uint64_t display_setting_version = 0;
+  WMTColorSpace display_colorspace = display_colorspace_;
+  WMTHDRMetadata display_hdr_metadata = display_hdr_metadata_;
+  WMTEDRValue display_edr_value = display_edr_value_;
 
   WMTQueryDisplaySettingForLayer(
-      layer_.handle, &display_setting_version, &display_colorspace_, &display_hdr_metadata_, &display_edr_value_
+      layer_.handle, &display_setting_version, &display_colorspace, &display_hdr_metadata, &display_edr_value
   );
+  if (do_not_wait && (display_setting_version != display_setting_version_ || !pso_valid.test()) &&
+      frames_completed_.load(std::memory_order_acquire) < frame_requested_)
+    return std::nullopt;
+  display_colorspace_ = display_colorspace;
+  display_hdr_metadata_ = display_hdr_metadata;
+  display_edr_value_ = display_edr_value;
 
   if (display_setting_version != display_setting_version_) {
     display_setting_version_ = display_setting_version;
@@ -120,13 +143,18 @@ Presenter::synchronizeLayerProperties() {
                       : has_hdr_metadata_          ? &hdr_metadata_
                                                    : nullptr;
   if (unlikely(!pso_valid.test_and_set())) {
-    frame_presented_.wait(frame_requested_);
+    if (!do_not_wait) {
+      if (wait_for_gpu_completion)
+        waitPresentsCompleted();
+      else
+        waitPresentsEncoded();
+    }
     buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1, gamma_version_ != 0);
     layer_.setProps(layer_props_);
     layer_.setColorSpace(final_colorspace);
   }
 
-  DXMTPresentMetadata metadata;
+  DXMTPresentMetadata metadata{};
 
   metadata.edr_scale = 1.0;
   metadata.max_content_luminance = 10000;
@@ -147,7 +175,7 @@ Presenter::synchronizeLayerProperties() {
   if (final_colorspace == WMTColorSpaceHDR_scRGB)
     metadata.edr_scale *= 0.8;
 
-  return {metadata, ++frame_requested_, this};
+  return std::optional<PresentState>(std::in_place, metadata, ++frame_requested_, this);
 }
 
 WMT::MetalDrawable
@@ -172,7 +200,11 @@ Presenter::encodeCommands(
   double height = layer_props_.drawable_height;
 
   encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
-  if (backbuffer.width() == (uint64_t)width && backbuffer.height() == (uint64_t)height) {
+  const auto &geometry = metadata.geometry;
+  const bool full_source = geometry.source_width == 0 ||
+      (geometry.source_width == backbuffer.width() && geometry.source_height == backbuffer.height());
+  if (backbuffer.width() == (uint64_t)width && backbuffer.height() == (uint64_t)height &&
+      full_source && geometry.rotation <= 1 && !geometry.scaling_none && !geometry.restrict_output) {
     encoder.setRenderPipelineState(present_blit_);
   } else {
     encoder.setRenderPipelineState(present_scale_);

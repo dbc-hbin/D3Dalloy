@@ -508,6 +508,20 @@ MTLCommandBuffer_presentDrawableAfterMinimumDuration(obj_handle_t cmdbuf, obj_ha
   UNIX_CALL(48, &params);
 };
 
+WINEMETAL_API void
+MTLCommandBuffer_presentDrawableIfCurrent(obj_handle_t cmdbuf, obj_handle_t drawable, obj_handle_t token,
+                                          uint64_t epoch, double after, obj_handle_t observer, uint64_t present_id) {
+  struct unixcall_mtlcommandbuffer_present_if_current params;
+  params.cmdbuf = cmdbuf;
+  params.drawable = drawable;
+  params.token = token;
+  params.epoch = epoch;
+  params.after = after;
+  params.observer = observer;
+  params.present_id = present_id;
+  UNIX_CALL(214, &params);
+}
+
 WINEMETAL_API bool
 MTLDevice_supportsFamily(obj_handle_t device, enum WMTGPUFamily gpu_family) {
   struct unixcall_generic_obj_uint64_uint64_ret params;
@@ -535,6 +549,24 @@ MTLDevice_supportsTextureSampleCount(obj_handle_t device, uint8_t sample_count) 
   params.ret = 0;
   UNIX_CALL(51, &params);
   return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_programmableSamplePositionsSupported(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(213, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint32_t
+MTLDevice_gpuCoreCount(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(256, &params);
+  return (uint32_t)params.ret;
 }
 
 WINEMETAL_API bool
@@ -1129,6 +1161,67 @@ MTLDevice_newSharedEventWithMachPort(obj_handle_t device, mach_port_t mach_port)
 }
 
 WINEMETAL_API uint64_t
+WMTShareRendezvousCreate(mach_port_t object_port, char *name_out) {
+  struct unixcall_share_rendezvous params = {};
+  params.port = object_port;
+  NTSTATUS status = WINE_UNIX_CALL(232, &params);
+  if (status || !params.handle) {
+    name_out[0] = '\0';
+    return 0;
+  }
+  memcpy(name_out, params.name, sizeof(params.name));
+  name_out[sizeof(params.name) - 1] = '\0';
+  return params.handle;
+}
+
+WINEMETAL_API void
+WMTShareRendezvousDestroy(uint64_t rendezvous) {
+  struct unixcall_share_rendezvous params = {};
+  params.handle = rendezvous;
+  UNIX_CALL(233, &params);
+}
+
+WINEMETAL_API bool
+WMTShareRendezvousLookUp(const char *name, mach_port_t *object_port) {
+  struct unixcall_share_rendezvous params = {};
+  strncpy(params.name, name, sizeof(params.name) - 1);
+  NTSTATUS status = WINE_UNIX_CALL(234, &params);
+  *object_port = status ? 0 : params.port;
+  return !status && params.port;
+}
+
+WINEMETAL_API uint64_t
+WMTShareObjectIdentity(obj_handle_t object, uint32_t kind) {
+  struct unixcall_share_identity params = {};
+  params.object = object;
+  params.kind = kind;
+  NTSTATUS status = WINE_UNIX_CALL(235, &params);
+  return status ? 0 : params.ret;
+}
+
+WINEMETAL_API void
+WMTMachPortDeallocate(mach_port_t port) {
+  struct unixcall_share_rendezvous params = {};
+  params.port = port;
+  UNIX_CALL(236, &params);
+}
+
+WINEMETAL_API bool
+WMTShareHashName(const uint16_t *name, uint32_t length, char *hash_out) {
+  struct unixcall_share_hashname params = {};
+  hash_out[0] = '\0';
+  if (!length || length > sizeof(params.name) / sizeof(params.name[0]))
+    return false;
+  memcpy(params.name, name, length * sizeof(uint16_t));
+  params.length = length;
+  if (WINE_UNIX_CALL(237, &params))
+    return false;
+  memcpy(hash_out, params.hash, 33);
+  hash_out[32] = '\0';
+  return true;
+}
+
+WINEMETAL_API uint64_t
 MTLDevice_registryID(obj_handle_t device) {
   struct unixcall_generic_obj_uint64_ret params;
   params.handle = device;
@@ -1684,6 +1777,74 @@ MTLResidencySet_allocatedSize(obj_handle_t residency_set) {
   return params.ret;
 }
 
+WINEMETAL_API obj_handle_t
+WMTPresentationObserver_create(void) {
+  struct unixcall_generic_obj_ret params = {0};
+  UNIX_CALL(204, &params);
+  return params.ret;
+}
+
+WINEMETAL_API bool
+MetalDrawable_observePresentation(obj_handle_t drawable, obj_handle_t observer, uint64_t present_id) {
+  struct unixcall_wmt_presentation_observe params = {0};
+  params.drawable = drawable;
+  params.observer = observer;
+  params.present_id = present_id;
+  UNIX_CALL(205, &params);
+  return params.ret != 0;
+}
+
+WINEMETAL_API int32_t
+WMTPresentationObserver_wait(obj_handle_t observer, struct WMTPresentationEvent *event) {
+  struct unixcall_wmt_presentation_wait params = {0};
+  params.observer = observer;
+  UNIX_CALL(206, &params);
+  if (params.ret == 1)
+    *event = params.event;
+  return params.ret;
+}
+
+WINEMETAL_API void
+WMTPresentationObserver_cancel(obj_handle_t observer, uint64_t present_id) {
+  struct unixcall_wmt_presentation_cancel params = {0};
+  params.observer = observer;
+  params.present_id = present_id;
+  UNIX_CALL(207, &params);
+}
+
+WINEMETAL_API void
+WMTPresentationObserver_close(obj_handle_t observer) {
+  struct unixcall_generic_obj_noret params = {0};
+  params.handle = observer;
+  UNIX_CALL(208, &params);
+}
+
+WINEMETAL_API double
+WMTClockSampleHostSeconds(void) {
+  struct unixcall_wmt_clock_sample params = {0};
+  UNIX_CALL(209, &params);
+  return params.host_seconds;
+}
+
+WINEMETAL_API bool
+WMTPresentationObserver_setView(obj_handle_t observer, obj_handle_t view) {
+  struct unixcall_wmt_observer_view params = {0};
+  params.observer = observer;
+  params.view = view;
+  UNIX_CALL(210, &params);
+  return params.ret != 0;
+}
+
+WINEMETAL_API bool
+WMTPresentationObserver_getRefreshSample(obj_handle_t observer, struct WMTDisplayRefreshSample *sample) {
+  struct unixcall_wmt_refresh_sample params = {0};
+  params.observer = observer;
+  UNIX_CALL(211, &params);
+  if (params.ret)
+    *sample = params.sample;
+  return params.ret != 0;
+}
+
 WINEMETAL_API void
 MTLDevice_sampleTimestamps(obj_handle_t device, uint64_t *cpu_timestamp, uint64_t *gpu_timestamp) {
   struct unixcall_mtldevice_sampletimestamps params;
@@ -1720,4 +1881,154 @@ MTLComputeCommandEncoder_setIntersectionFunctionTable(obj_handle_t encoder, obj_
   params.table = table;
   params.index = index;
   UNIX_CALL(195, &params);
+}
+
+WINEMETAL_API bool
+MTLDevice_supportsPlacementSparse(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(216, &params);
+  return params.ret != 0;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newPlacementHeap(
+    obj_handle_t device, const struct WMTHeapInfo *info, enum WMTSparsePageSize max_sparse_page_size
+) {
+  struct unixcall_mtldevice_newplacementheap params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.max_sparse_page_size = max_sparse_page_size;
+  params.ret = 0;
+  UNIX_CALL(217, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newPlacementSparseBuffer(obj_handle_t device, struct WMTBufferInfo *info, enum WMTSparsePageSize page_size) {
+  struct unixcall_mtldevice_newplacementsparseresource params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.page_size = page_size;
+  params.ret = 0;
+  UNIX_CALL(218, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newPlacementSparseTexture(
+    obj_handle_t device, struct WMTTextureInfo *info, enum WMTSparsePageSize page_size
+) {
+  struct unixcall_mtldevice_newplacementsparseresource params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.page_size = page_size;
+  params.ret = 0;
+  UNIX_CALL(219, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLBuffer_newPlacementSparseTextureView(
+    obj_handle_t buffer, struct WMTTextureInfo *info, uint64_t offset, uint64_t bytes_per_row,
+    enum WMTSparsePageSize page_size
+) {
+  struct unixcall_mtlbuffer_newplacementsparsetextureview params;
+  params.buffer = buffer;
+  WMT_MEMPTR_SET(params.info, info);
+  params.offset = offset;
+  params.bytes_per_row = bytes_per_row;
+  params.page_size = page_size;
+  params.ret = 0;
+  UNIX_CALL(220, &params);
+  return params.ret;
+}
+
+WINEMETAL_API struct WMTSparseTileShape
+MTLDevice_sparseTileSize(
+    obj_handle_t device, enum WMTTextureType type, enum WMTPixelFormat format, uint32_t sample_count,
+    enum WMTSparsePageSize page_size
+) {
+  struct unixcall_mtldevice_sparsetilesize params = {};
+  params.device = device;
+  params.type = type;
+  params.format = format;
+  params.sample_count = sample_count;
+  params.page_size = page_size;
+  UNIX_CALL(221, &params);
+  return params.ret;
+}
+
+WINEMETAL_API struct WMTSparseTextureTail
+MTLTexture_sparseTail(obj_handle_t texture) {
+  struct unixcall_mtltexture_sparsetail params = {};
+  params.texture = texture;
+  UNIX_CALL(222, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newMTL4CommandQueue(obj_handle_t device) {
+  struct unixcall_generic_obj_obj_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(223, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTL4CommandQueue_addResidencySet(obj_handle_t queue, obj_handle_t residency_set) {
+  struct unixcall_generic_obj_obj_noret params;
+  params.handle = queue;
+  params.arg = residency_set;
+  UNIX_CALL(224, &params);
+}
+
+WINEMETAL_API void
+MTL4CommandQueue_updateBufferMappings(
+    obj_handle_t queue, obj_handle_t buffer, obj_handle_t heap, const struct WMTSparseBufferMapping *mappings,
+    uint64_t count
+) {
+  struct unixcall_mtl4commandqueue_updatemappings params;
+  params.queue = queue;
+  params.resource = buffer;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.mappings, mappings);
+  params.count = count;
+  UNIX_CALL(225, &params);
+}
+
+WINEMETAL_API void
+MTL4CommandQueue_updateTextureMappings(
+    obj_handle_t queue, obj_handle_t texture, obj_handle_t heap, const struct WMTSparseTextureMapping *mappings,
+    uint64_t count
+) {
+  struct unixcall_mtl4commandqueue_updatemappings params;
+  params.queue = queue;
+  params.resource = texture;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.mappings, mappings);
+  params.count = count;
+  UNIX_CALL(226, &params);
+}
+
+WINEMETAL_API void
+MTL4CommandQueue_signalEvent(obj_handle_t queue, obj_handle_t event, uint64_t value) {
+  struct unixcall_mtl4commandqueue_signalevent params;
+  params.queue = queue;
+  params.event = event;
+  params.value = value;
+  UNIX_CALL(227, &params);
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newSamplerStateWithReduction(obj_handle_t device, struct WMTSamplerInfo *info, uint32_t reduction) {
+  struct unixcall_mtldevice_newsamplerstatewithreduction params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.reduction = reduction;
+  params.ret = 0;
+  UNIX_CALL(228, &params);
+  return params.ret;
 }

@@ -21,7 +21,9 @@ winemetal_unix_ld_args = [
   '-weak_framework', 'CoreFoundation', '-weak_framework', 'Metal',
   '-framework', 'MetalFX', '-weak_framework', 'Foundation',
   '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
+  '-weak_framework', 'CoreVideo', '-weak_framework', 'IOKit',
   '-weak_framework', 'ColorSync',  '-weak_framework', 'Cocoa',
+  '-weak_framework', 'IOSurface',
   '-lsqlite3',
 ]
 winemetal_unix_link_depends = []

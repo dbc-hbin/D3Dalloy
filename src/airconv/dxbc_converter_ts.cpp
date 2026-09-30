@@ -110,14 +110,20 @@ get_max_potential_workload_count(uint32_t max_tess_factor, SM50ShaderInternal *p
 
   switch (pHullStage->tessellation_domain) {
   case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_UNDEFINED:
-  case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_ISOLINE:
     return 0;
+  case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_ISOLINE:
+    // Two lines per workload. MaxTessFactor also clamps the line density, and ceil(density) <= max_tess_factor.
+    return std::min<uint32_t>(32, (max_tess_factor + 1) / 2);
   case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_TRI:
+    if (pHullStage->tessellator_output_primitive == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_POINT)
+      return (3 * (max_tess_factor / 2 + 1) + 1 + 1) / 2; // one workload per two ring sides (+ centre)
     return std::ceil((max_tess_factor - 1) / 4.0) * 3 + (max_tess_factor & 1);
   case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_QUAD:
+    if (pHullStage->tessellator_output_primitive == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_POINT)
+      return 2 * (max_tess_factor / 2 + 1) + 1; // four ring sides per ring (+ centre line)
     return std::ceil((max_tess_factor - 1) / 4.0) * 4 + (max_tess_factor & 1);
-    ;
   }
+  return 0;
 }
 
 size_t
@@ -133,7 +139,8 @@ estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint32_t pat
   uint32_t max_workload_count = get_max_potential_workload_count(factor_int, pHullStage);
   constexpr uint32_t size_workload_info = sizeof(TessMeshWorkload);
 
-  return cp_size_per_group + pc_size_per_group + sizeof(uint32_t) +
+  // batched_patch_start + instance_id (payload fields 2 and 4)
+  return cp_size_per_group + pc_size_per_group + 2 * sizeof(uint32_t) +
          max_workload_count * patch_per_group * size_workload_info;
 };
 
@@ -213,6 +220,8 @@ convert_dxbc_vertex_hull_shader(
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig_vs = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE2, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig_vs);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *stats = nullptr;
+  args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &stats);
 
   bool is_indexed_draw = ia_layout && ia_layout->index_buffer_format > 0;
 
@@ -236,6 +245,8 @@ convert_dxbc_vertex_hull_shader(
   {
     SignatureContext sig_ctx_vs(prologue_vs, epilogue_vs, func_signature, resource_map_vs);
     sig_ctx_vs.ia_layout = ia_layout;
+    // D3D12 (root-signature) vertex tables are indexed by slot, D3D11 tables are compacted.
+    sig_ctx_vs.dense_vertex_table = rootsig_vs != nullptr;
     sig_ctx_vs.skip_vertex_output = true;
     for (auto &p : pVertexStage->signature_handlers) {
       p(sig_ctx_vs);
@@ -259,6 +270,7 @@ convert_dxbc_vertex_hull_shader(
                                       rootsig->bytecode, rootsig->bytecode_length
                                   )
                                 : setup_binding_table2(&hull_shader_info, func_signature, module);
+  const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
 
   uint32_t threads_per_patch = next_pow2(pHullStage->hull_maximum_threads_per_patch);
   uint32_t patch_per_group = next_pow2(32 / threads_per_patch);
@@ -284,10 +296,11 @@ convert_dxbc_vertex_hull_shader(
 
   constexpr uint32_t size_workload_info = sizeof(TessMeshWorkload);
 
+  // Field 4: instance_id, read by the TS->GS capture DS (appended; keeps field indices 0..3).
   auto payload_struct_type = llvm::StructType::create(
       context,
       {hs_output_per_group_type, hs_pcout_per_group_scaler_type, types._int,
-       llvm::ArrayType::get(types._int, max_workload_count * patch_per_group * size_workload_info / 4)},
+       llvm::ArrayType::get(types._int, max_workload_count * patch_per_group * size_workload_info / 4), types._int},
       "payload"
   );
   uint32_t payload_struct_size = module.getDataLayout().getTypeAllocSize(payload_struct_type);
@@ -443,6 +456,10 @@ convert_dxbc_vertex_hull_shader(
         active, vertex_stage_end
     );
     builder.SetInsertPoint(active);
+    if (stats_arg != ~0u) {
+      increment_pipeline_statistics(builder, air, function, stats_arg, 0); // IAVertices
+      increment_pipeline_statistics(builder, air, function, stats_arg, 4); // VSInvocations
+    }
 
     if (index_buffer_idx != ~0u) {
       auto start_index = builder.CreateExtractValue(draw_arguments, 2);
@@ -468,7 +485,7 @@ convert_dxbc_vertex_hull_shader(
     if (auto err = prologue.build(ctx).takeError()) {
       return err;
     }
-    auto real_entry = convert_basicblocks(pVertexStage->entry(), ctx, epilogue_bb);
+    auto real_entry = convert_stage_body(*pVertexStage, ctx, epilogue_bb);
     if (auto err = real_entry.takeError()) {
       return err;
     }
@@ -612,7 +629,7 @@ convert_dxbc_vertex_hull_shader(
     if (auto err = prologue.build(ctx).takeError()) {
       return err;
     }
-    auto real_entry = convert_basicblocks(pHullStage->entry(), ctx, epilogue_bb);
+    auto real_entry = convert_stage_body(*pHullStage, ctx, epilogue_bb);
     if (auto err = real_entry.takeError()) {
       return err;
     }
@@ -632,6 +649,10 @@ convert_dxbc_vertex_hull_shader(
     );
 
     builder.SetInsertPoint(write_patch_constant);
+    if (stats_arg != ~0u) {
+      increment_pipeline_statistics(builder, air, function, stats_arg, 2);  // IAPrimitives
+      increment_pipeline_statistics(builder, air, function, stats_arg, 16); // HSInvocations
+    }
     if (auto err = epilogue.build(ctx).takeError()) {
       return err;
     }
@@ -673,30 +694,42 @@ convert_dxbc_vertex_hull_shader(
     // clear value
     air.CreateAtomicRMW(llvm::AtomicRMWInst::And, workload_count, builder.getInt32(0));
 
+    llvm::Value *domain_points = nullptr;
+    const bool points_output =
+        pHullStage->tessellator_output_primitive == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_POINT;
     switch (pHullStage->tessellation_domain) {
     case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_ISOLINE:
-      // TESS TODO
-      break;
-    case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_QUAD:
-      dxbc.HullGenerateWorkloadForQuad(
+      // SV_TessFactor[0] = line detail, [1] = line density (D3D11_SB_NAME_FINAL_LINE_*_TESSFACTOR).
+      domain_points = dxbc.HullGenerateWorkloadForIsoline(
           patch_offset_in_group, workload_count,
           builder.CreateGEP(
               payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(3), builder.getInt32(0)}
           ),
-          get_partitioning(pHullStage), tess_factors[4], tess_factors[5], tess_factors[0], tess_factors[1],
+          get_partitioning(pHullStage), tess_factors[0], tess_factors[1]
+      );
+      break;
+    case microsoft::D3D11_SB_TESSELLATOR_DOMAIN_QUAD:
+      domain_points = dxbc.HullGenerateWorkloadForQuad(
+          patch_offset_in_group, workload_count,
+          builder.CreateGEP(
+              payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(3), builder.getInt32(0)}
+          ),
+          get_partitioning(pHullStage), points_output, tess_factors[4], tess_factors[5], tess_factors[0], tess_factors[1],
           tess_factors[2], tess_factors[3]
       );
       break;
     default: {
-      dxbc.HullGenerateWorkloadForTriangle(
+      domain_points = dxbc.HullGenerateWorkloadForTriangle(
           patch_offset_in_group, workload_count,
           builder.CreateGEP(
               payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(3), builder.getInt32(0)}
           ),
-          get_partitioning(pHullStage), tess_factors[3], tess_factors[0], tess_factors[1], tess_factors[2]
+          get_partitioning(pHullStage), points_output, tess_factors[3], tess_factors[0], tess_factors[1], tess_factors[2]
       );
     }
     }
+
+    (void)domain_points; // unique point count; DSInvocations counts actual DS executions (mesh stage)
 
     builder.CreateCondBr(
         builder.CreateICmp(llvm::CmpInst::ICMP_EQ, patch_offset_in_group, builder.getInt32(0)), dispatch_mesh,
@@ -715,6 +748,9 @@ convert_dxbc_vertex_hull_shader(
     builder.CreateStore(
         batched_patch_start,
         builder.CreateGEP(payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(2)})
+    );
+    builder.CreateStore(
+        instance_id, builder.CreateGEP(payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(4)})
     );
 
     builder.CreateBr(real_return);
@@ -753,6 +789,17 @@ convert_dxbc_tesselator_domain_shader(
   }
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *stats = nullptr;
+  args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &stats);
+  SM50_SHADER_D3D12_TESS_CAPTURE_DATA *tess_capture = nullptr;
+  const bool capture =
+      args_get_data<SM50_SHADER_D3D12_TESS_CAPTURE, SM50_SHADER_D3D12_TESS_CAPTURE_DATA>(pArgs, &tess_capture);
+  if (capture) {
+    /* TS->GS pass 1 (tsgs-design §1): no rasterization, only [[position]] is declared so the mesh is legal; the DS
+     * outputs go to the capture scratch instead of the mesh. */
+    rasterization_disabled = true;
+    gs_passthrough = nullptr;
+  }
 
   auto [final_maxtessfactor, factor_int] = get_final_maxtessfactor(pHullStage, pArgs);
 
@@ -764,6 +811,11 @@ convert_dxbc_tesselator_domain_shader(
   io_binding_map resource_map;
   air::AirType types(context);
 
+  if (capture) {
+    // The DS signature parse only declares mesh outputs; drop them and keep [[position]] alone.
+    func_signature = air::FunctionSignatureBuilder{};
+    func_signature.DefineMeshVertexOutput(air::OutputPosition{.type = air::msl_float4});
+  }
   {
     SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
     for (auto &p : pShaderInternal->signature_handlers) {
@@ -780,6 +832,7 @@ convert_dxbc_tesselator_domain_shader(
                                    rootsig->bytecode_length
                                )
                              : setup_binding_table2(shader_info, func_signature, module);
+  const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
 
   uint32_t rta_idx_out = ~0u;
   if (gs_passthrough && gs_passthrough->Data.RenderTargetArrayIndexReg != 255) {
@@ -814,7 +867,7 @@ convert_dxbc_tesselator_domain_shader(
   auto payload_struct_type = llvm::StructType::create(
       context,
       {hs_output_per_group_type, hs_pcout_per_group_scaler_type, types._int,
-       llvm::ArrayType::get(types._int, max_workload_count * patch_per_group * size_workload_info / 4)},
+       llvm::ArrayType::get(types._int, max_workload_count * patch_per_group * size_workload_info / 4), types._int},
       "payload"
   );
   uint32_t payload_struct_size = module.getDataLayout().getTypeAllocSize(payload_struct_type);
@@ -822,37 +875,72 @@ convert_dxbc_tesselator_domain_shader(
   uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = payload_struct_size});
 
   bool point_rasterization = false;
+  uint32_t mesh_max_vertices = 0, mesh_max_primitives = 0, primitive_vertices = 0;
+  air::MeshOutputTopology mesh_topology = air::MeshOutputTopology::Triangle;
 
   switch (pHullStage->tessellator_output_primitive) {
   case microsoft::D3D11_SB_TESSELLATOR_OUTPUT_POINT: {
-    func_signature.DefineInput(
-        air::InputMesh{(uint32_t)max_edge_point * 2, (uint32_t)max_edge_point * 2, air::MeshOutputTopology::Point}
-    );
-    point_rasterization = true; // TESS TODO: not necessary... if combined with GS/SO
+    // A point workload is two edges of at most max_edge_point points each.
+    mesh_max_vertices = mesh_max_primitives = max_edge_point * 2;
+    primitive_vertices = 1;
+    mesh_topology = air::MeshOutputTopology::Point;
+    point_rasterization = !capture; // TESS TODO: not necessary... if combined with GS/SO
     break;
   }
   case microsoft::D3D11_SB_TESSELLATOR_OUTPUT_LINE: {
-    // TESS TODO
-    func_signature.DefineInput(
-        air::InputMesh{(uint32_t)max_edge_point, (uint32_t)max_edge_point - 1, air::MeshOutputTopology::Line}
-    );
+    // Isoline: a workload is up to two lines of max_edge_point points (generatePrimitiveLine).
+    mesh_max_vertices = max_edge_point * 2;
+    mesh_max_primitives = (max_edge_point - 1) * 2;
+    primitive_vertices = 2;
+    mesh_topology = air::MeshOutputTopology::Line;
     break;
   }
   default: {
-    func_signature.DefineInput(air::InputMesh{
-        (uint32_t)(max_edge_point + 2 - (max_edge_point & 1)) * 2 + 1,
-        (uint32_t)(max_edge_point + 2 - (max_edge_point & 1)) * 2 + 1,
-        air::MeshOutputTopology::Triangle
-    });
+    mesh_max_vertices = mesh_max_primitives = (max_edge_point + 2 - (max_edge_point & 1)) * 2 + 1;
+    primitive_vertices = 3;
     break;
   }
   }
+  func_signature.DefineInput(air::InputMesh{mesh_max_vertices, mesh_max_primitives, mesh_topology});
 
   if (point_rasterization) {
     func_signature.DefineMeshVertexOutput(air::OutputPointSize {});
   }
 
-  if (pShaderInternal->clip_distance_scalars.size() > 0) {
+  uint32_t capture_scratch_idx = ~0u, capture_control_idx = ~0u;
+  if (capture) {
+    capture_scratch_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .buffer_size = {},
+        .location_index = SM50_BINDING_INDEX_TESS_CAPTURE,
+        .array_size = 0,
+        .memory_access = air::MemoryAccess::read_write,
+        .address_space = air::AddressSpace::device,
+        .type = air::MSLUint{},
+        .arg_name = "tess_capture",
+        .raster_order_group = {}
+    });
+    capture_control_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .buffer_size = {},
+        .location_index = SM50_BINDING_INDEX_TESS_CAPTURE_CONTROL,
+        .array_size = 0,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .type = air::MSLUint{},
+        .arg_name = "tess_capture_control",
+        .raster_order_group = {}
+    });
+    if (tess_capture->layout_out) {
+      *tess_capture->layout_out = SM50_TESS_CAPTURE_LAYOUT{
+          .max_workloads = max_workload_count,
+          .max_vertices = mesh_max_vertices,
+          .max_primitives = mesh_max_primitives,
+          .vertex_registers = max_output_register,
+          .primitive_vertices = primitive_vertices,
+      };
+    }
+  }
+
+  if (!capture && pShaderInternal->clip_distance_scalars.size() > 0) {
     func_signature.DefineMeshVertexOutput(
         air::OutputClipDistance{.count = pShaderInternal->clip_distance_scalars.size()}
     );
@@ -913,6 +1001,42 @@ convert_dxbc_tesselator_domain_shader(
   auto patch_index = dxbc.DomainGetPatchIndex(workload_index, data);
 
   resource_map.patch_id = builder.CreateAdd(batched_patch_start, patch_index);
+
+  /* TS->GS capture slot (tsgs-design §1): s = (instance * patch_count + patch_id) * W + rank. */
+  llvm::Value *capture_valid = nullptr, *capture_slot = nullptr, *capture_vertex_base = nullptr,
+              *capture_index_base = nullptr, *capture_scratch = nullptr;
+  if (capture) {
+    auto control = function->getArg(capture_control_idx);
+    auto load_control = [&](size_t offset) {
+      return builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, control, offset / 4));
+    };
+    auto slot_count = load_control(offsetof(SM50_TESS_CAPTURE_CONTROL, slot_count));
+    auto patch_count = load_control(offsetof(SM50_TESS_CAPTURE_CONTROL, patch_count));
+    auto instance = builder.CreateLoad(
+        types._int, builder.CreateGEP(payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(4)})
+    );
+    auto rank = dxbc.DomainGetWorkloadRank(workload_index, data);
+    capture_slot = builder.CreateAdd(
+        builder.CreateMul(
+            builder.CreateAdd(builder.CreateMul(instance, patch_count), resource_map.patch_id),
+            builder.getInt32(max_workload_count)
+        ),
+        rank
+    );
+    capture_valid = builder.CreateICmpULT(capture_slot, slot_count);
+    capture_scratch = function->getArg(capture_scratch_idx);
+    // A = align_up(slot_count, 4); B = A + slot_count * V * R * 4
+    auto region_a = builder.CreateAnd(builder.CreateAdd(slot_count, builder.getInt32(3)), builder.getInt32(~3u));
+    auto region_b = builder.CreateAdd(
+        region_a, builder.CreateMul(slot_count, builder.getInt32(mesh_max_vertices * max_output_register * 4))
+    );
+    capture_vertex_base = builder.CreateAdd(
+        region_a, builder.CreateMul(capture_slot, builder.getInt32(mesh_max_vertices * max_output_register * 4))
+    );
+    capture_index_base = builder.CreateAdd(
+        region_b, builder.CreateMul(capture_slot, builder.getInt32(mesh_max_primitives * primitive_vertices))
+    );
+  }
 
   resource_map.input.ptr_int4 = builder.CreateGEP(
       payload_struct_type, payload,
@@ -982,57 +1106,88 @@ convert_dxbc_tesselator_domain_shader(
     resource_map.domain = domain_bary;
   }
 
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, vertex_emit);
+  auto real_entry = convert_stage_body(*pShaderInternal, ctx, vertex_emit);
   if (auto err = real_entry.takeError()) {
     return err;
   }
-  builder.CreateCondBr(active, real_entry.get(), vertex_end);
+  if (stats_arg != ~0u) {
+    // D3D11.3 20.4: with line/triangle output every generated (possibly repeated) point is a DS invocation.
+    auto count_invocation = llvm::BasicBlock::Create(context, "ds_count_invocation", function);
+    builder.CreateCondBr(active, count_invocation, vertex_end);
+    builder.SetInsertPoint(count_invocation);
+    increment_pipeline_statistics(builder, air, function, stats_arg, 18); // DSInvocations
+    builder.CreateBr(real_entry.get());
+  } else {
+    builder.CreateCondBr(active, real_entry.get(), vertex_end);
+  }
 
   builder.SetInsertPoint(vertex_emit);
 
   auto vertex_id = actual_thread_index;
   auto primitive_id = actual_thread_index; // 
-  MeshOutputContext gs_out_ctx{vertex_id, primitive_id};
-  for (auto &h : ds_output_handlers) {
-    if (auto err = h(gs_out_ctx).build(ctx).takeError()) {
-      return err;
+  if (capture) {
+    // Vertex v of slot s: all R output registers at dword A + ((s * V + v) * R + r) * 4.
+    auto vertex_capture = llvm::BasicBlock::Create(context, "vertex_capture", function);
+    builder.CreateCondBr(capture_valid, vertex_capture, vertex_end);
+    builder.SetInsertPoint(vertex_capture);
+    auto vertex_base = builder.CreateAdd(
+        capture_vertex_base, builder.CreateMul(vertex_id, builder.getInt32(max_output_register * 4))
+    );
+    auto dst = builder.CreateBitCast(
+        builder.CreateGEP(types._int, capture_scratch, {vertex_base}),
+        types._int4->getPointerTo((uint32_t)air::AddressSpace::device)
+    );
+    auto src_type = llvm::ArrayType::get(types._int4, max_output_register);
+    for (uint32_t r = 0; r < max_output_register; r++) {
+      auto value = builder.CreateLoad(
+          types._int4, builder.CreateConstInBoundsGEP2_32(src_type, resource_map.output.ptr_int4, 0, r)
+      );
+      builder.CreateAlignedStore(value, builder.CreateConstInBoundsGEP1_32(types._int4, dst, r), llvm::Align(4));
     }
-  }
+    builder.CreateBr(vertex_end);
+  } else {
+    MeshOutputContext gs_out_ctx{vertex_id, primitive_id};
+    for (auto &h : ds_output_handlers) {
+      if (auto err = h(gs_out_ctx).build(ctx).takeError()) {
+        return err;
+      }
+    }
 
-  for (auto x : llvm::enumerate(pShaderInternal->clip_distance_scalars)) {
-    if (x.value().reg >= max_output_register)
-      continue;
-    auto src_ptr = builder.CreateGEP(
-        llvm::ArrayType::get(types._float4, max_output_register), resource_map.output.ptr_float4,
-        {builder.getInt32(0), builder.getInt32(x.value().reg), builder.getInt32(x.value().component)}
-    );
-    air.CreateSetMeshClipDistance(
-        vertex_id, builder.getInt32(x.index()), builder.CreateLoad(types._float, src_ptr)
-    );
-  }
+    for (auto x : llvm::enumerate(pShaderInternal->clip_distance_scalars)) {
+      if (x.value().reg >= max_output_register)
+        continue;
+      auto src_ptr = builder.CreateGEP(
+          llvm::ArrayType::get(types._float4, max_output_register), resource_map.output.ptr_float4,
+          {builder.getInt32(0), builder.getInt32(x.value().reg), builder.getInt32(x.value().component)}
+      );
+      air.CreateSetMeshClipDistance(
+          vertex_id, builder.getInt32(x.index()), builder.CreateLoad(types._float, src_ptr)
+      );
+    }
 
-  if (rta_idx_out != ~0u) {
-    auto src_ptr = builder.CreateGEP(
-        resource_map.output.ptr_int4->getType()->getNonOpaquePointerElementType(), resource_map.output.ptr_int4,
-        {builder.getInt32(0), builder.getInt32(gs_passthrough->Data.RenderTargetArrayIndexReg),
-         builder.getInt32(gs_passthrough->Data.RenderTargetArrayIndexComponent)}
-    );
-    air.CreateSetMeshRenderTargetArrayIndex(primitive_id, builder.CreateLoad(types._int, src_ptr));
-  }
-  if (va_idx_out != ~0u) {
-    auto src_ptr = builder.CreateGEP(
-        resource_map.output.ptr_int4->getType()->getNonOpaquePointerElementType(), resource_map.output.ptr_int4,
-        {builder.getInt32(0), builder.getInt32(gs_passthrough->Data.ViewportArrayIndexReg),
-         builder.getInt32(gs_passthrough->Data.ViewportArrayIndexComponent)}
-    );
-    air.CreateSetMeshViewportArrayIndex(primitive_id, builder.CreateLoad(types._int, src_ptr));
-  }
+    if (rta_idx_out != ~0u) {
+      auto src_ptr = builder.CreateGEP(
+          resource_map.output.ptr_int4->getType()->getNonOpaquePointerElementType(), resource_map.output.ptr_int4,
+          {builder.getInt32(0), builder.getInt32(gs_passthrough->Data.RenderTargetArrayIndexReg),
+           builder.getInt32(gs_passthrough->Data.RenderTargetArrayIndexComponent)}
+      );
+      air.CreateSetMeshRenderTargetArrayIndex(primitive_id, builder.CreateLoad(types._int, src_ptr));
+    }
+    if (va_idx_out != ~0u) {
+      auto src_ptr = builder.CreateGEP(
+          resource_map.output.ptr_int4->getType()->getNonOpaquePointerElementType(), resource_map.output.ptr_int4,
+          {builder.getInt32(0), builder.getInt32(gs_passthrough->Data.ViewportArrayIndexReg),
+           builder.getInt32(gs_passthrough->Data.ViewportArrayIndexComponent)}
+      );
+      air.CreateSetMeshViewportArrayIndex(primitive_id, builder.CreateLoad(types._int, src_ptr));
+    }
 
-  if (point_rasterization) {
-    air.CreateSetMeshPointSize(vertex_id, air.getFloat(1.0));
-  }
+    if (point_rasterization) {
+      air.CreateSetMeshPointSize(vertex_id, air.getFloat(1.0));
+    }
 
-  builder.CreateBr(vertex_end);
+    builder.CreateBr(vertex_end);
+  }
 
   builder.SetInsertPoint(vertex_end);
   phi_thread_index_base->addIncoming(builder.CreateAdd(phi_thread_index_base, air.getInt(32)), vertex_end);
@@ -1044,7 +1199,28 @@ convert_dxbc_tesselator_domain_shader(
   );
   builder.SetInsertPoint(generate_primitive);
 
-  dxbc.DomainGeneratePrimitives(workload_index, data, get_output_primitive(pHullStage));
+  if (capture) {
+    // Indices of slot s at dword B + (s * P + p) * K + k, then prim_count[s] (dword s).
+    auto capture_primitive = llvm::BasicBlock::Create(context, "capture_primitive", function);
+    builder.CreateCondBr(capture_valid, capture_primitive, real_return);
+    builder.SetInsertPoint(capture_primitive);
+    auto indices = builder.CreateGEP(types._int, capture_scratch, {capture_index_base});
+    auto count = dxbc.DomainGeneratePrimitivesCapture(workload_index, data, get_output_primitive(pHullStage), indices);
+    builder.CreateStore(count, builder.CreateGEP(types._int, capture_scratch, {capture_slot}));
+    builder.CreateBr(real_return);
+    builder.SetInsertPoint(real_return);
+    builder.CreateRetVoid();
+
+    module.getOrInsertNamedMetadata("air.mesh")->addOperand(function_metadata);
+    return llvm::Error::success();
+  }
+
+  auto generated_primitives = dxbc.DomainGeneratePrimitives(workload_index, data, get_output_primitive(pHullStage));
+  if (stats_arg != ~0u && !rasterization_disabled) {
+    // See the GS mesh stage: a primitive split by a clip plane counts once.
+    add_pipeline_statistics(builder, air, function, stats_arg, 10, generated_primitives); // CInvocations
+    add_pipeline_statistics(builder, air, function, stats_arg, 12, generated_primitives); // CPrimitives
+  }
 
   builder.CreateBr(real_return);
   builder.SetInsertPoint(real_return);

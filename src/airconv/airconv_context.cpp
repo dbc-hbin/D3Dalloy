@@ -30,6 +30,7 @@
 #include "air_msad.h"
 #include "air_samplepos.h"
 #include "air_tessellation.h"
+#include "air_denorm.h"
 
 #include "transforms/lower_16bit_texread.hpp"
 #include "transforms/simdgroup_implicit_membarrier.hpp"
@@ -227,6 +228,11 @@ linkSamplePos(llvm::Module &M) {
 void
 linkTessellation(llvm::Module &M) {
   linkShader(M, air_tessellation);
+}
+
+void
+linkDenorm(llvm::Module &M) {
+  linkShader(M, air_denorm);
 }
 
 } // namespace dxmt

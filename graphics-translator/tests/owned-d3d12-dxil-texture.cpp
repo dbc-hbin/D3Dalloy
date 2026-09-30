@@ -259,6 +259,75 @@ int runTextureOps(int argc, wchar_t **argv) {
   readback->Unmap(0, nullptr);
   if (!ok)
     return fail("texture opcode readback mismatch");
+  // Resource GetSamplePosition follows the SRV's quality, while the target
+  // intrinsic follows the active PSO. Cross the two qualities in both
+  // directions rather than only comparing matching source and target pairs.
+  auto patternCase = [&](UINT count, UINT targetQuality, ID3D12Resource *source,
+                         ID3D12Resource *renderTarget, bool centerSource) {
+    auto patternOutput = createBuffer(device.Get(), 5 * sizeof(float) * 4, D3D12_HEAP_TYPE_DEFAULT,
+                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    auto patternReadback = createBuffer(device.Get(), 5 * sizeof(float) * 4, D3D12_HEAP_TYPE_READBACK,
+                                        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto sourceSrv = heap->GetCPUDescriptorHandleForHeapStart();
+    sourceSrv.ptr += stride;
+    srv = {};
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = DXGI_FORMAT_R32_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    device->CreateShaderResourceView(source, &srv, sourceSrv);
+    device->CreateUnorderedAccessView(patternOutput.Get(), nullptr, &uav, cpu);
+    device->CreateRenderTargetView(renderTarget, &rtvDesc, rtv);
+    psoDesc.SampleDesc = {count, targetQuality};
+    ComPtr<ID3D12PipelineState> patternPSO;
+    check(device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&patternPSO)), "pattern DXIL PSO");
+    Context patternContext(device.Get());
+    patternContext.list->SetDescriptorHeaps(1, heaps);
+    patternContext.list->SetPipelineState(patternPSO.Get());
+    patternContext.list->SetGraphicsRootSignature(root.Get());
+    patternContext.list->SetGraphicsRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    patternContext.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    patternContext.list->RSSetViewports(1, &viewport);
+    patternContext.list->RSSetScissorRects(1, &scissor);
+    patternContext.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    patternContext.list->DrawInstanced(3, 1, 0, 0);
+    transition(patternContext.list.Get(), patternOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    patternContext.list->CopyBufferRegion(patternReadback.Get(), 0, patternOutput.Get(), 0,
+                                          5 * sizeof(float) * 4);
+    patternContext.submitAndWait();
+    void *patternMapped = nullptr;
+    check(patternReadback->Map(0, &mapRange, &patternMapped), "pattern DXIL readback");
+    const float *values = static_cast<const float *>(patternMapped);
+    const bool centerTarget = targetQuality == 0xfffffffeu;
+    const bool positionsOK = closeFloat(values[12], centerSource ? 0.f : -0.375f) &&
+                             closeFloat(values[13], centerSource ? 0.f : 0.125f) &&
+                             closeFloat(values[14], centerTarget ? 0.f : 0.375f) &&
+                             closeFloat(values[15], centerTarget ? 0.f : -0.125f) &&
+                             closeFloat(values[16], float(count));
+    patternReadback->Unmap(0, nullptr);
+    if (!positionsOK)
+      return fail("DXIL resource/target sample pattern independence");
+    std::printf("OWNED_D3D12_DXIL_TEXTURE_PATTERN_PASS count=%u target=%u source=%u\n",
+                count, targetQuality, centerSource ? 0xfffffffeu : 0u);
+    return 0;
+  };
+  for (UINT count : {2u, 4u, 8u}) {
+    // The DXIL SRV is declared Texture2DMS<float, 4>; only the target varies.
+    auto centerDesc = texture2DDesc(4, 4, 1, 4, DXGI_FORMAT_R32_FLOAT,
+                                    D3D12_RESOURCE_FLAG_NONE);
+    centerDesc.SampleDesc.Quality = 0xfffffffeu;
+    auto centerTexture = createTexture(device.Get(), centerDesc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    auto centerTargetDesc = texture2DDesc(8, 8, 1, count, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    centerTargetDesc.SampleDesc.Quality = 0xfffffffeu;
+    auto centerTarget = createTexture(device.Get(), centerTargetDesc, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (patternCase(count, 0xfffffffeu, centerTexture.Get(), centerTarget.Get(), true) ||
+        patternCase(count, 0xfffffffeu, multisample.Get(), centerTarget.Get(), false))
+      return 1;
+    if (count == 4 && patternCase(count, 0u, centerTexture.Get(), target.Get(), true))
+      return 1;
+  }
   std::puts("OWNED_D3D12_DXIL_TEXTURE_PASS");
   return 0;
 }

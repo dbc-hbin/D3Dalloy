@@ -323,6 +323,124 @@ int testRegisterSpaces(ID3D12Device *device, Context &ctx, const std::vector<uin
   return ok ? 0 : fail("distinct register spaces aliased");
 }
 
+int testStaticDescriptorBounds(ID3D12Device *device, Context &ctx, const std::vector<uint8_t> &cs) {
+  constexpr UINT bufferBytes = 65536;
+  constexpr UINT sentinel = 0x89abcdef;
+  const auto keepBounds = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS;
+  const D3D12_DESCRIPTOR_RANGE1 ranges[] = {
+      {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, keepBounds, 0},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, keepBounds, 1},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, keepBounds, 3},
+  };
+  D3D12_ROOT_PARAMETER1 params[2] = {};
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[0].DescriptorTable = {static_cast<UINT>(std::size(ranges)), ranges};
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  params[1].Descriptor.ShaderRegister = 3;
+  D3D12_VERSIONED_ROOT_SIGNATURE_DESC rootDesc = {};
+  rootDesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  rootDesc.Desc_1_1 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  ComPtr<ID3DBlob> blob;
+  check(D3D12SerializeVersionedRootSignature(&rootDesc, &blob, nullptr), "serialize static bounds root");
+  ComPtr<ID3D12RootSignature> root;
+  check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+        "create static bounds root");
+  D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+  psoDesc.pRootSignature = root.Get();
+  psoDesc.CS = {cs.data(), cs.size()};
+  ComPtr<ID3D12PipelineState> pso;
+  check(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso)), "static bounds PSO");
+
+  auto bounded = createBuffer(device, bufferBytes, D3D12_HEAP_TYPE_DEFAULT,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto result = createBuffer(device, 32, D3D12_HEAP_TYPE_DEFAULT,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto rootBuffer = createBuffer(device, 4, D3D12_HEAP_TYPE_DEFAULT,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto upload = createBuffer(device, bufferBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto readback = createBuffer(device, bufferBytes + 32, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+  UINT *mapped = nullptr;
+  check(upload->Map(0, nullptr, reinterpret_cast<void **>(&mapped)), "static bounds upload map");
+  for (UINT i = 0; i < bufferBytes / sizeof(UINT); ++i)
+    mapped[i] = sentinel;
+  upload->Unmap(0, nullptr);
+  ctx.list->CopyBufferRegion(bounded.Get(), 0, upload.Get(), 0, bufferBytes);
+  transition(ctx.list.Get(), bounded.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+  D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+  heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  heapDesc.NumDescriptors = 6;
+  heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> heap;
+  check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)), "static bounds descriptor heap");
+  const UINT stride = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
+  auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+  device->CreateConstantBufferView(nullptr, cpu);
+  cpu.ptr += stride;
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Format = DXGI_FORMAT_R32_TYPELESS;
+  srv.Buffer.NumElements = 4;
+  srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+  device->CreateShaderResourceView(nullptr, &srv, cpu);
+  cpu.ptr += stride;
+  srv.Format = DXGI_FORMAT_UNKNOWN;
+  srv.Buffer.StructureByteStride = 4;
+  srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+  device->CreateShaderResourceView(nullptr, &srv, cpu);
+  cpu.ptr += stride;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Format = DXGI_FORMAT_R32_TYPELESS;
+  uav.Buffer.NumElements = 4;
+  uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  device->CreateUnorderedAccessView(nullptr, nullptr, &uav, cpu);
+  cpu.ptr += stride;
+  // Offset 4096 is outside this 16-byte view, but inside the initialized 64-KiB allocation.
+  device->CreateUnorderedAccessView(bounded.Get(), nullptr, &uav, cpu);
+  cpu.ptr += stride;
+  uav.Buffer.NumElements = 8;
+  device->CreateUnorderedAccessView(result.Get(), nullptr, &uav, cpu);
+  ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+  ctx.list->SetDescriptorHeaps(1, heaps);
+  ctx.list->SetPipelineState(pso.Get());
+  ctx.list->SetComputeRootSignature(root.Get());
+  ctx.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+  ctx.list->SetComputeRootUnorderedAccessView(1, rootBuffer->GetGPUVirtualAddress());
+  ctx.list->Dispatch(1, 1, 1);
+  transition(ctx.list.Get(), bounded.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  transition(ctx.list.Get(), result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  ctx.list->CopyBufferRegion(readback.Get(), 0, bounded.Get(), 0, bufferBytes);
+  ctx.list->CopyBufferRegion(readback.Get(), bufferBytes, result.Get(), 0, 32);
+  ctx.submitAndWait();
+
+  D3D12_RANGE mapRange = {0, bufferBytes + 32};
+  check(readback->Map(0, &mapRange, reinterpret_cast<void **>(&mapped)), "static bounds readback map");
+  const UINT expected[] = {0, 0, 0, 0x11223344, 0, 0, 0xa5a5a5a5, 0xcafef00d};
+  bool ok = std::memcmp(mapped + bufferBytes / sizeof(UINT), expected, sizeof(expected)) == 0;
+  for (UINT i = 0; i < bufferBytes / sizeof(UINT); ++i) {
+    if (mapped[i] != sentinel) {
+      std::fprintf(stderr, "static bounds sentinel word=%u expected=%08x actual=%08x\n", i, sentinel, mapped[i]);
+      ok = false;
+      break;
+    }
+  }
+  if (!ok) {
+    const UINT *actual = mapped + bufferBytes / sizeof(UINT);
+    for (UINT i = 0; i < std::size(expected); ++i)
+      std::fprintf(stderr, "static bounds result word=%u expected=%08x actual=%08x\n", i, expected[i], actual[i]);
+  }
+  readback->Unmap(0, nullptr);
+  if (!ok)
+    return fail("static descriptor bounds readback mismatch");
+  std::puts("OWNED_D3D12_DXIL_STATIC_BOUNDS_PASS null_reads=zero oob_atomic=zero "
+            "oob_writes=dropped sentinels=preserved in_range=exact root_uav=exact");
+  return 0;
+}
+
 int testGraphics(ID3D12Device *device, Context &ctx,
                  const std::vector<uint8_t> &vs, const std::vector<uint8_t> &ps) {
   std::array<D3D12_ROOT_PARAMETER, 2> params{};
@@ -501,6 +619,8 @@ int run(int argc, wchar_t **argv) {
   failures += testRegisterSpaces(device.Get(), context, readFile(L"register-space.dxil"));
   context.reset();
   failures += testDescriptorTable(device.Get(), context, cs);
+  context.reset();
+  failures += testStaticDescriptorBounds(device.Get(), context, readFile(L"null-descriptor.dxil"));
   context.reset();
   failures += testCompute(device.Get(), context, cs);
   context.reset();

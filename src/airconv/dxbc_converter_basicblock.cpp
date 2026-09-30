@@ -24,6 +24,7 @@
 #include "llvm/IR/Type.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
+#include <array>
 #include <stack>
 
 char dxmt::UnsupportedFeature::ID;
@@ -212,6 +213,20 @@ IREffect store_at_vec4_array_masked(
   };
 };
 
+// Metal varyings are semantic-local vectors; D3D signature masks address
+// components in stage-local registers. Their positions can differ across VS/PS.
+std::array<int, 4> semantic_shuffle(uint32_t mask, bool to_semantic) {
+  std::array<int, 4> lanes{4, 4, 4, 4};
+  unsigned local = 0;
+  for (unsigned physical = 0; physical < 4; ++physical)
+    if (mask & (1u << physical)) {
+      if (to_semantic) lanes[local] = physical;
+      else lanes[physical] = local;
+      ++local;
+    }
+  return lanes;
+}
+
 IREffect init_input_reg(
   uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask,
   bool fix_w_component
@@ -258,9 +273,24 @@ IREffect init_input_reg(
   });
 };
 
-IREffect init_input_reg_with_interpolation(
+IREffect init_input_reg_semantic(uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask) {
+  return make_effect_bind([=](context ctx) -> IREffect {
+    auto *arg = ctx.function->getArg(with_fnarg_at);
+    auto *type = llvm::dyn_cast<llvm::FixedVectorType>(arg->getType());
+    if (!type || type->getNumElements() != 4)
+      return throwUnsupported("Semantic interpolant is not a four-component vector");
+    auto *scattered = ctx.builder.CreateShuffleVector(
+      arg, llvm::ConstantAggregateZero::get(type), semantic_shuffle(mask, false)
+    );
+    auto *array = type->getElementType()->isFloatTy()
+      ? ctx.resource.input.ptr_float4 : ctx.resource.input.ptr_int4;
+    return store_at_vec4_array_masked(array, ctx.builder.getInt32(to_reg), scattered, mask);
+  });
+}
+
+static IREffect init_input_reg_with_interpolation_impl(
   uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask,
-  air::Interpolation interpolation, uint32_t sampleidx_at
+  air::Interpolation interpolation, uint32_t sampleidx_at, bool semantic_packed
 ) {
   return make_effect_bind([=](context ctx) -> IREffect {
     pvalue interpolant = ctx.function->getArg(with_fnarg_at);
@@ -291,10 +321,33 @@ IREffect init_input_reg_with_interpolation(
       assert(0 && "unhandled interpolant mode");
       break;
     }
+    if (semantic_packed)
+      interpolated_val = ctx.builder.CreateShuffleVector(
+        interpolated_val, llvm::ConstantAggregateZero::get(interpolated_val->getType()),
+        semantic_shuffle(mask, false)
+      );
     co_return co_yield store_at_vec4_array_masked(
         ctx.resource.input.ptr_float4, const_index, interpolated_val, mask
     );
   });
+}
+
+IREffect init_input_reg_with_interpolation(
+  uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask,
+  air::Interpolation interpolation, uint32_t sampleidx_at
+) {
+  return init_input_reg_with_interpolation_impl(
+    with_fnarg_at, to_reg, mask, interpolation, sampleidx_at, false
+  );
+}
+
+IREffect init_input_reg_with_interpolation_semantic(
+  uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask,
+  air::Interpolation interpolation, uint32_t sampleidx_at
+) {
+  return init_input_reg_with_interpolation_impl(
+    with_fnarg_at, to_reg, mask, interpolation, sampleidx_at, true
+  );
 }
 
 std::function<IRValue(pvalue)>
@@ -313,6 +366,38 @@ pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
                  return ctx.builder.CreateInsertValue(ret, value, {to_element});
                };
       };
+    });
+  };
+}
+
+std::function<IRValue(pvalue)>
+pop_output_reg_semantic(uint32_t from_reg, uint32_t mask, uint32_t to_element,
+                        bool sanitize_distance) {
+  return [=](pvalue ret) {
+    return make_irvalue_bind([=](context ctx) -> IRValue {
+      auto *ivec4 = co_yield load_from_array_at(
+        ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg)
+      );
+      auto *desired = ctx.function->getReturnType()->getStructElementType(to_element);
+      auto *value = co_yield to_desired_type_from_int_vec4(ivec4, desired, 0xf);
+      value = ctx.builder.CreateShuffleVector(
+        value, llvm::ConstantAggregateZero::get(desired), semantic_shuffle(mask, true)
+      );
+      if (sanitize_distance && !ctx.capture_raw_distance_output) {
+        // Native fragment interpolants reject non-finite values. Capture
+        // preserves the raw distance in the vertex record for pixel evaluation.
+        auto *absolute = ctx.builder.CreateAnd(
+          ctx.builder.CreateBitCast(value, ctx.types._int4),
+          ctx.builder.CreateVectorSplat(4, ctx.builder.getInt32(0x7fffffffu))
+        );
+        auto *nonfinite = ctx.builder.CreateICmpUGE(
+          absolute, ctx.builder.CreateVectorSplat(4, ctx.builder.getInt32(0x7f800000u))
+        );
+        value = ctx.builder.CreateSelect(
+          nonfinite, llvm::ConstantAggregateZero::get(ctx.types._float4), value
+        );
+      }
+      co_return ctx.builder.CreateInsertValue(ret, value, {to_element});
     });
   };
 }
@@ -376,13 +461,18 @@ pop_mesh_output_vertex_data(
       co_yield load_from_vec4_array_masked(ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg), mask),
       air::get_llvm_type(desired_type, ctx.llvm), mask
   );
+  // This is the final mesh -> fragment user varying. Keep the internal
+  // control-point registers packed, but publish semantic-local lanes here.
+  result = ctx.builder.CreateShuffleVector(
+    result, llvm::ConstantAggregateZero::get(result->getType()), semantic_shuffle(mask, true)
+  );
   ctx.air.CreateSetMeshVertexData(vertex_id, idx, result);
   co_return {};
 }
 
 IREffect pull_vertex_input(
   air::FunctionSignatureBuilder &func_signature, uint32_t to_reg, uint32_t mask,
-  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask
+  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask, bool dense_vertex_table
 ) {
   auto vbuf_table = func_signature.DefineInput(air::ArgumentBindingBuffer{
     .buffer_size = {},
@@ -423,15 +513,16 @@ IREffect pull_vertex_input(
         )air::AddressSpace::constant)
       );
     }
-    unsigned int shift = 32u - element_info.slot;
-    unsigned int vertex_buffer_entry_index =
-      element_info.slot ? __builtin_popcount((slot_mask << shift) >> shift) : 0;
     auto vertex_buffer_table = ctx.resource.vertex_buffer_table;
+    const unsigned shift = 32u - element_info.slot;
+    const unsigned compact_index = element_info.slot
+      ? __builtin_popcount((slot_mask << shift) >> shift) : 0;
+    const unsigned entry_index = dense_vertex_table ? element_info.slot : compact_index;
     auto vertex_buffer_entry = builder.CreateLoad(
       types._dxmt_vertex_buffer_entry,
       builder.CreateConstGEP1_32(
         types._dxmt_vertex_buffer_entry, vertex_buffer_table,
-        vertex_buffer_entry_index
+        entry_index
       )
     );
     auto base_addr = builder.CreateExtractValue(vertex_buffer_entry, {0});

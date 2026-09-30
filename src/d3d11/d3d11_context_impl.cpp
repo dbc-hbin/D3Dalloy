@@ -1429,42 +1429,65 @@ public:
     });
   }
 
+  /* Instances per mesh draw so one draw's object-threadgroup grid stays within the device limit
+   * (1024 below Apple7); 0 when a single instance already exceeds it. */
+  static UINT
+  MeshInstancesPerDraw(uint64_t groups_per_instance, UINT instance_count, uint64_t max_object_threadgroups) {
+    if (!groups_per_instance || groups_per_instance * instance_count <= max_object_threadgroups)
+      return instance_count;
+    return UINT(std::min<uint64_t>(instance_count, max_object_threadgroups / groups_per_instance));
+  }
+
+  /* Upper bound of MeshInstancesPerDraw chunks for any groups_per_instance <= max_groups_per_instance. When one
+   * instance may exceed the limit at the bound, the actual (smaller) group count can still split into up to one
+   * chunk per instance. */
+  static UINT
+  MeshDrawChunks(uint64_t max_groups_per_instance, UINT instance_count, uint64_t max_object_threadgroups) {
+    const UINT chunk = MeshInstancesPerDraw(max_groups_per_instance, instance_count, max_object_threadgroups);
+    return chunk ? (instance_count - 1) / chunk + 1 : std::max(instance_count, 1u);
+  }
+
   void
   TessellationDraw(
       UINT NumControlPoint, UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation,
       UINT StartInstanceLocation
   ) {
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
+    // Each chunk of instances is its own draw with its own argument block (SV_InstanceID stays exact:
+    // StartInstance advances with the chunk). Groups per instance depend on encoder state, but never exceed
+    // the patch count, which bounds the number of chunks reserved here.
+    const UINT blocks = MeshDrawChunks(VertexCountPerInstance / NumControlPoint, InstanceCount, max_object_threadgroups);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS) * blocks, 32);
     EmitOP([=](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
-      draw_argument->StartVertex = StartVertexLocation;
-      draw_argument->VertexCount = VertexCountPerInstance;
-      draw_argument->InstanceCount = InstanceCount;
-      draw_argument->StartInstance = StartInstanceLocation;
-
       auto PatchCountPerInstance = VertexCountPerInstance / NumControlPoint;
       auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
       auto ThreadsPerPatch = enc.tess_threads_per_patch;
       auto PatchPerObjectInstance = (PatchCountPerInstance - 1) / PatchPerGroup + 1;
 
-      if (PatchPerObjectInstance * InstanceCount > max_object_threadgroups) {
-        WARN(
-            "Omitted mesh draw (TS) because of too many object threadgroups (", PatchPerObjectInstance, "x",
-            InstanceCount, ")"
-        );
+      const UINT chunk = MeshInstancesPerDraw(PatchPerObjectInstance, InstanceCount, max_object_threadgroups);
+      if (!chunk) {
+        WARN("Omitted mesh draw (TS) because one instance needs ", PatchPerObjectInstance, " object threadgroups");
         return;
       }
+      for (UINT first = 0, block = 0; first < InstanceCount; first += chunk, ++block) {
+        const UINT count = std::min(chunk, InstanceCount - first);
+        const auto offset = draw_arguments_offset + block * sizeof(DXMT_DRAW_ARGUMENTS);
+        DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(offset);
+        draw_argument->StartVertex = StartVertexLocation;
+        draw_argument->VertexCount = VertexCountPerInstance;
+        draw_argument->InstanceCount = count;
+        draw_argument->StartInstance = StartInstanceLocation + first;
 
-      enc.bumpVisibilityResultOffset();
-      enc.resolveRenderPassBarrier();
-      auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
-      cmd.type = WMTRenderCommandDXMTTessellationMeshDraw;
-      cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      cmd.instance_count = InstanceCount;
-      cmd.threads_per_patch = ThreadsPerPatch;
-      cmd.patch_per_group = PatchPerGroup;
-      cmd.patch_per_mesh_instance = PatchPerObjectInstance;
+        enc.bumpVisibilityResultOffset();
+        enc.resolveRenderPassBarrier();
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
+        cmd.type = WMTRenderCommandDXMTTessellationMeshDraw;
+        cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(offset);
+        cmd.instance_count = count;
+        cmd.threads_per_patch = ThreadsPerPatch;
+        cmd.patch_per_group = PatchPerGroup;
+        cmd.patch_per_mesh_instance = PatchPerObjectInstance;
+      }
     });
   }
 
@@ -1474,41 +1497,43 @@ public:
       UINT InstanceCount, UINT BaseInstance
   ) {
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
+    const UINT blocks = MeshDrawChunks(IndexCountPerInstance / NumControlPoint, InstanceCount, max_object_threadgroups);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS) * blocks, 32);
     EmitOP([=](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
-      draw_argument->BaseVertex = BaseVertexLocation;
-      draw_argument->IndexCount = IndexCountPerInstance;
-      draw_argument->StartIndex = StartIndexLocation;
-      draw_argument->InstanceCount = InstanceCount;
-      draw_argument->StartInstance = BaseInstance;
-
       auto PatchCountPerInstance = IndexCountPerInstance / NumControlPoint;
       auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
       auto ThreadsPerPatch = enc.tess_threads_per_patch;
       auto PatchPerObjectInstance = (PatchCountPerInstance - 1) / PatchPerGroup + 1;
 
-      if (PatchPerObjectInstance * InstanceCount > max_object_threadgroups) {
-        WARN(
-            "Omitted mesh draw (TS) because of too many object threadgroups (", PatchPerObjectInstance, "x",
-            InstanceCount, ")"
-        );
+      const UINT chunk = MeshInstancesPerDraw(PatchPerObjectInstance, InstanceCount, max_object_threadgroups);
+      if (!chunk) {
+        WARN("Omitted mesh draw (TS) because one instance needs ", PatchPerObjectInstance, " object threadgroups");
         return;
       }
-
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
-      enc.bumpVisibilityResultOffset();
-      enc.resolveRenderPassBarrier();
-      auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
-      cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
-      cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      cmd.instance_count = InstanceCount;
-      cmd.threads_per_patch = ThreadsPerPatch;
-      cmd.patch_per_group = PatchPerGroup;
-      cmd.patch_per_mesh_instance = PatchPerObjectInstance;
-      cmd.index_buffer = index_buffer;
-      cmd.index_buffer_offset = IndexBufferOffset + index_sub_offset;
+      for (UINT first = 0, block = 0; first < InstanceCount; first += chunk, ++block) {
+        const UINT count = std::min(chunk, InstanceCount - first);
+        const auto offset = draw_arguments_offset + block * sizeof(DXMT_DRAW_INDEXED_ARGUMENTS);
+        DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(offset);
+        draw_argument->BaseVertex = BaseVertexLocation;
+        draw_argument->IndexCount = IndexCountPerInstance;
+        draw_argument->StartIndex = StartIndexLocation;
+        draw_argument->InstanceCount = count;
+        draw_argument->StartInstance = BaseInstance + first;
+
+        enc.bumpVisibilityResultOffset();
+        enc.resolveRenderPassBarrier();
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
+        cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
+        cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(offset);
+        cmd.instance_count = count;
+        cmd.threads_per_patch = ThreadsPerPatch;
+        cmd.patch_per_group = PatchPerGroup;
+        cmd.patch_per_mesh_instance = PatchPerObjectInstance;
+        cmd.index_buffer = index_buffer;
+        cmd.index_buffer_offset = IndexBufferOffset + index_sub_offset;
+      }
     });
   }
 
@@ -1517,31 +1542,36 @@ public:
       UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation,
       UINT StartInstanceLocation
   ) {
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
-    EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
-      draw_argument->StartVertex = StartVertexLocation;
-      draw_argument->VertexCount = VertexCountPerInstance;
-      draw_argument->InstanceCount = InstanceCount;
-      draw_argument->StartInstance = StartInstanceLocation;
+    auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(state_.InputAssembler.Topology);
+    const uint64_t warp_count = (VertexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
+    // Split over instances so each draw stays within the object-threadgroup limit.
+    const UINT chunk = MeshInstancesPerDraw(warp_count, InstanceCount, max_object_threadgroups);
+    if (!chunk) {
+      WARN("Omitted mesh draw (GS) because one instance needs ", warp_count, " object threadgroups");
+      return;
+    }
+    const UINT blocks = (InstanceCount - 1) / chunk + 1;
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS) * blocks, 32);
+    EmitOP([=, vertex_per_warp = vertex_per_warp](ArgumentEncodingContext &enc) {
+      for (UINT first = 0, block = 0; first < InstanceCount; first += chunk, ++block) {
+        const UINT count = std::min(chunk, InstanceCount - first);
+        const auto offset = draw_arguments_offset + block * sizeof(DXMT_DRAW_ARGUMENTS);
+        DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(offset);
+        draw_argument->StartVertex = StartVertexLocation;
+        draw_argument->VertexCount = VertexCountPerInstance;
+        draw_argument->InstanceCount = count;
+        draw_argument->StartInstance = StartInstanceLocation + first;
 
-      auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
-      auto warp_count = (VertexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
-
-      if (warp_count * InstanceCount > max_object_threadgroups) {
-        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", InstanceCount, ")");
-        return;
+        enc.bumpVisibilityResultOffset();
+        enc.resolveRenderPassBarrier();
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
+        cmd.type = WMTRenderCommandDXMTGeometryDraw;
+        cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(offset);
+        cmd.instance_count = count;
+        cmd.warp_count = warp_count;
+        cmd.vertex_per_warp = vertex_per_warp;
       }
-
-      enc.bumpVisibilityResultOffset();
-      enc.resolveRenderPassBarrier();
-      auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
-      cmd.type = WMTRenderCommandDXMTGeometryDraw;
-      cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      cmd.instance_count = InstanceCount;
-      cmd.warp_count = warp_count;
-      cmd.vertex_per_warp = vertex_per_warp;
     });
   }
 
@@ -1551,35 +1581,39 @@ public:
       UINT InstanceCount, UINT BaseInstance
   ) {
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
-    EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
-      DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
-      draw_argument->BaseVertex = BaseVertexLocation;
-      draw_argument->IndexCount = IndexCountPerInstance;
-      draw_argument->StartIndex = StartIndexLocation;
-      draw_argument->InstanceCount = InstanceCount;
-      draw_argument->StartInstance = BaseInstance;
-
+    auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(state_.InputAssembler.Topology);
+    const uint64_t warp_count = (IndexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
+    const UINT chunk = MeshInstancesPerDraw(warp_count, InstanceCount, max_object_threadgroups);
+    if (!chunk) {
+      WARN("Omitted mesh draw (GS) because one instance needs ", warp_count, " object threadgroups");
+      return;
+    }
+    const UINT blocks = (InstanceCount - 1) / chunk + 1;
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS) * blocks, 32);
+    EmitOP([=, vertex_per_warp = vertex_per_warp](ArgumentEncodingContext &enc) {
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
-      auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
-      auto warp_count = (IndexCountPerInstance - 1) / vertex_increment_per_wrap + 1;
+      for (UINT first = 0, block = 0; first < InstanceCount; first += chunk, ++block) {
+        const UINT count = std::min(chunk, InstanceCount - first);
+        const auto offset = draw_arguments_offset + block * sizeof(DXMT_DRAW_INDEXED_ARGUMENTS);
+        DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(offset);
+        draw_argument->BaseVertex = BaseVertexLocation;
+        draw_argument->IndexCount = IndexCountPerInstance;
+        draw_argument->StartIndex = StartIndexLocation;
+        draw_argument->InstanceCount = count;
+        draw_argument->StartInstance = BaseInstance + first;
 
-      if (warp_count * InstanceCount > max_object_threadgroups) {
-        WARN("Omitted mesh draw (GS) because of too many object threadgroups(", warp_count, "x", InstanceCount, ")");
-        return;
+        enc.bumpVisibilityResultOffset();
+        enc.resolveRenderPassBarrier();
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
+        cmd.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+        cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(offset);
+        cmd.instance_count = count;
+        cmd.warp_count = warp_count;
+        cmd.vertex_per_warp = vertex_per_warp;
+        cmd.index_buffer = index_buffer;
+        cmd.index_buffer_offset = IndexBufferOffset + index_sub_offset;
       }
-
-      enc.bumpVisibilityResultOffset();
-      enc.resolveRenderPassBarrier();
-      auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
-      cmd.type = WMTRenderCommandDXMTGeometryDrawIndexed;
-      cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
-      cmd.instance_count = InstanceCount;
-      cmd.warp_count = warp_count;
-      cmd.vertex_per_warp = vertex_per_warp;
-      cmd.index_buffer = index_buffer;
-      cmd.index_buffer_offset = IndexBufferOffset + index_sub_offset;
     });
   }
 

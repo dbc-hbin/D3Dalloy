@@ -20,6 +20,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/InstIterator.h"
 
 #include <bit>
 #include <cassert>
@@ -46,6 +47,9 @@ constexpr uint8_t NAME_PRIMITIVE_ID = 7;
 constexpr uint8_t NAME_INSTANCE_ID = 8;
 constexpr uint8_t NAME_IS_FRONT_FACE = 9;
 constexpr uint8_t NAME_SAMPLE_INDEX = 10;
+/* D3D_NAME_BARYCENTRICS (SM 6.1): the signature chunks carry D3D_NAME values, not
+ * DXIL::SemanticKind (where Barycentrics is 28). */
+constexpr uint8_t NAME_BARYCENTRICS = 23;
 constexpr uint8_t NAME_TARGET = 64;
 constexpr uint8_t NAME_DEPTH = 65;
 constexpr uint8_t NAME_COVERAGE = 66;
@@ -93,7 +97,28 @@ bool is_sample_interpolation(uint8_t mode) {
   return mode == INTERP_LINEAR_SAMPLE || mode == INTERP_LINEAR_NOPERSPECTIVE_SAMPLE;
 }
 
+/* D3D_REGISTER_COMPONENT_{UINT16,SINT16,FLOAT16} (SM 6.2 native 16 bit stage I/O). Each
+ * 16 bit component travels in a full 32 bit register lane, widened on storeOutput and
+ * narrowed on loadInput, so the varying is interpolated at no less than half precision. */
+constexpr uint8_t kComponentUint16 = 4;
+constexpr uint8_t kComponentSint16 = 5;
+constexpr uint8_t kComponentFloat16 = 6;
+
+uint8_t widen_component_type(uint8_t component_type) {
+  switch (component_type) {
+  case kComponentUint16:
+    return (uint8_t)dxbc::RegisterComponentType::Uint;
+  case kComponentSint16:
+    return (uint8_t)dxbc::RegisterComponentType::Int;
+  case kComponentFloat16:
+    return (uint8_t)dxbc::RegisterComponentType::Float;
+  default:
+    return component_type;
+  }
+}
+
 dxbc::RegisterComponentType to_register_component_type(uint8_t component_type) {
+  component_type = widen_component_type(component_type);
   if (component_type < (uint8_t)dxbc::RegisterComponentType::Uint ||
       component_type > (uint8_t)dxbc::RegisterComponentType::Float)
     return dxbc::RegisterComponentType::Unknown;
@@ -101,13 +126,37 @@ dxbc::RegisterComponentType to_register_component_type(uint8_t component_type) {
 }
 
 air::InputAttributeComponentType to_attribute_component_type(uint8_t component_type) {
+  component_type = widen_component_type(component_type);
   if (component_type < (uint8_t)dxbc::RegisterComponentType::Uint ||
       component_type > (uint8_t)dxbc::RegisterComponentType::Float)
     return air::InputAttributeComponentType::Unknown;
   return (air::InputAttributeComponentType)component_type;
 }
 
-/** Cross stage varying name, identical to dxbc::Signature::consistentAttributeName. */
+/* A register-file lane (i32 or float) converted to the dx.op I/O value type. */
+llvm::Value *narrow_io_value(llvm::IRBuilder<> &builder, llvm::Value *value, llvm::Type *type) {
+  if (value->getType() == type)
+    return value;
+  if (type->isHalfTy())
+    return builder.CreateFPTrunc(value->getType()->isFloatTy() ? value : builder.CreateBitCast(value, builder.getFloatTy()),
+                                 type);
+  if (type->isIntegerTy(16) || type->isIntegerTy(1))
+    return builder.CreateTrunc(value->getType()->isIntegerTy() ? value : builder.CreateBitCast(value, builder.getInt32Ty()),
+                               type);
+  return builder.CreateBitCast(value, type);
+}
+
+/* A dx.op I/O value widened to a 32 bit register lane of the element's component type. */
+llvm::Value *widen_io_value(llvm::IRBuilder<> &builder, llvm::Value *value, uint8_t component_type) {
+  if (value->getType()->isHalfTy())
+    return builder.CreateFPExt(value, builder.getFloatTy());
+  if (value->getType()->isIntegerTy(16))
+    return component_type == kComponentSint16 ? builder.CreateSExt(value, builder.getInt32Ty())
+                                              : builder.CreateZExt(value, builder.getInt32Ty());
+  return value;
+}
+
+/** Stage-local vertex attribute name; varyings use their D3D semantic instead. */
 std::string consistent_attribute_name(uint32_t reg, uint32_t mask) {
   return "reg" + std::to_string(reg) + "_" + std::to_string(std::countr_zero(mask & 0xFu));
 }
@@ -124,7 +173,7 @@ uint32_t element_start_col(const SigElement &element) {
   return element.start_col;
 }
 
-SignatureSlot make_slot(const SigElement &element, uint32_t air_index) {
+SignatureSlot make_slot(const SigElement &element, uint32_t air_index, bool pull_mode = false) {
   SignatureSlot slot;
   slot.element_id = element.id;
   slot.semantic_index = element.semantic_index;
@@ -133,6 +182,8 @@ SignatureSlot make_slot(const SigElement &element, uint32_t air_index) {
   slot.start_col = element_start_col(element);
   slot.mask = element_mask(element);
   slot.air_index = air_index;
+  slot.pull_mode = pull_mode;
+  slot.interpolation = element.interp;
   slot.comp_type = element.comp_type;
   slot.semantic_kind = element.semantic_kind;
   return slot;
@@ -242,7 +293,7 @@ void declare_vertex_signature(
           if (element_info.reg != reg)
             continue;
           prologue << dxbc::pull_vertex_input(
-            func_signature, reg, mask, element_info, ia_layout->slot_mask
+            func_signature, reg, mask, element_info, ia_layout->slot_mask, true
           );
           break;
         }
@@ -285,10 +336,11 @@ void declare_vertex_signature(
     uint32_t reg = element.start_row;
     uint32_t mask = element_mask(element);
     uint32_t air_index;
+    std::function<dxbc::IRValue(dxbc::pvalue)> pop;
     switch (element.semantic_kind) {
     case NAME_POSITION: {
       air_index = func_signature.DefineOutput(air::OutputPosition{.type = air::msl_float4});
-      epilogue >> dxbc::pop_output_reg_sanitize_pos(reg, mask, air_index);
+      pop = dxbc::pop_output_reg_sanitize_pos(reg, mask, air_index);
       break;
     }
     case NAME_CLIP_DISTANCE:
@@ -300,31 +352,35 @@ void declare_vertex_signature(
             .push_back({.component = (uint8_t)i, .reg = (uint8_t)reg});
       }
       air_index = func_signature.DefineOutput(air::OutputVertex{
-        .user = std::string(cull ? "SV_CullDistance" : "SV_ClipDistance") + std::to_string(reg),
+        .user = dxbc::varyingAttributeName(element.name, element.semantic_index),
         .type = air::msl_float4,
       });
-      epilogue >> dxbc::pop_output_reg(reg, mask, air_index);
+      pop = dxbc::pop_output_reg_semantic(reg, mask, air_index, true);
       break;
     }
     case NAME_RENDER_TARGET_ARRAY_INDEX: {
       air_index = func_signature.DefineOutput(air::OutputRenderTargetArrayIndex{});
-      epilogue >> dxbc::pop_output_reg(reg, mask, air_index);
+      pop = dxbc::pop_output_reg(reg, mask, air_index);
       break;
     }
     case NAME_VIEWPORT_ARRAY_INDEX: {
       air_index = func_signature.DefineOutput(air::OutputViewportArrayIndex{});
-      epilogue >> dxbc::pop_output_reg(reg, mask, air_index);
+      pop = dxbc::pop_output_reg(reg, mask, air_index);
       break;
     }
     default: {
       air_index = func_signature.DefineOutput(air::OutputVertex{
-        .user = consistent_attribute_name(reg, mask),
+        .user = dxbc::varyingAttributeName(element.name, element.semantic_index),
         .type = dxbc::to_msl_type(to_register_component_type(element.comp_type)),
       });
-      epilogue >> dxbc::pop_output_reg(reg, mask, air_index);
+      pop = dxbc::pop_output_reg_semantic(reg, mask, air_index);
       break;
     }
     }
+    /* Without rasterization the AIR vertex function returns void (Metal rejects
+     * any output); the outputs are still declared so storeOutput resolves. */
+    if (!sig_ctx.skip_vertex_output)
+      epilogue >> std::move(pop);
     outputs.push_back(make_slot(element, air_index));
   }
 }
@@ -340,12 +396,47 @@ void declare_pixel_signature(
   auto &inputs = out_signature.inputs;
   auto &outputs = out_signature.outputs;
 
+  /* Elements read per vertex through dx.op.attributeAtVertex (SM 6.1 GetAttributeAtVertex). */
+  llvm::DenseSet<uint32_t> per_vertex_elements;
+  for (auto &instruction : llvm::instructions(*module.entry)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+    if (!call || !call->getCalledFunction() || call->arg_size() < 2 ||
+        !call->getCalledFunction()->getName().startswith("dx.op.attributeAtVertex."))
+      continue;
+    if (auto *id = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1)))
+      per_vertex_elements.insert(static_cast<uint32_t>(id->getZExtValue()));
+  }
+
   for (auto &element : module.input_sig) {
+    if (element.semantic_kind == NAME_SAMPLE_INDEX && element.start_row == ~0u) {
+      // Intrinsic-only signature elements have no packed register or column.
+      func_signature.DefineInput(air::InputSampleIndex{});
+      continue;
+    }
+    if (element.semantic_kind == NAME_BARYCENTRICS) {
+      /* SV_Barycentrics has no packed register: loadInput reads the AIR argument. */
+      const bool perspective = element.interp == INTERP_LINEAR || element.interp == INTERP_LINEAR_CENTROID ||
+                               element.interp == INTERP_LINEAR_SAMPLE;
+      inputs.push_back(make_slot(element, func_signature.DefineInput(air::InputBarycentric{perspective})));
+      continue;
+    }
+    if (per_vertex_elements.contains(element.id)) {
+      /* A per-vertex attribute is bound as `vertex_value<T>`; plain reads of it take the
+       * provoking (first) vertex, which is the value D3D's nointerpolation delivers. */
+      auto slot = make_slot(element, ~0u);
+      slot.vertex_value_index = func_signature.DefineInput(air::InputVertexValue{
+        .user = dxbc::varyingAttributeName(element.name, element.semantic_index),
+        .type = dxbc::to_msl_type(to_register_component_type(element.comp_type)),
+      });
+      inputs.push_back(slot);
+      continue;
+    }
     uint32_t reg = element.start_row;
     uint32_t mask = element_mask(element);
     uint32_t air_index;
     bool init_plain = true;
     bool fix_w_component = false;
+    bool element_pull_mode = false;
     switch (element.semantic_kind) {
     case NAME_POSITION: {
       air_index = func_signature.DefineInput(air::InputPosition{
@@ -365,14 +456,13 @@ void declare_pixel_signature(
     case NAME_CLIP_DISTANCE:
     case NAME_CULL_DISTANCE: {
       air_index = func_signature.DefineInput(air::InputFragmentStageIn{
-        .user = std::string(
-                  element.semantic_kind == NAME_CULL_DISTANCE ? "SV_CullDistance" : "SV_ClipDistance"
-                ) +
-                std::to_string(reg),
+        .user = dxbc::varyingAttributeName(element.name, element.semantic_index),
         .type = air::msl_float4,
         .interpolation = to_air_interpolation(element.interp),
         .pull_mode = false,
       });
+      init_plain = false;
+      prologue << dxbc::init_input_reg_semantic(air_index, reg, mask);
       break;
     }
     case NAME_IS_FRONT_FACE: {
@@ -400,18 +490,19 @@ void declare_pixel_signature(
       auto interpolation = to_air_interpolation(element.interp);
       bool pull_mode = bool(sig_ctx.pull_mode_reg_mask & (1u << reg)) &&
                        interpolation != air::Interpolation::flat;
+      element_pull_mode = pull_mode;
       air_index = func_signature.DefineInput(air::InputFragmentStageIn{
-        .user = consistent_attribute_name(reg, mask),
+        .user = dxbc::varyingAttributeName(element.name, element.semantic_index),
         .type = dxbc::to_msl_type(to_register_component_type(element.comp_type)),
         .interpolation = interpolation,
         .pull_mode = pull_mode,
       });
       init_plain = false;
       if (!pull_mode) {
-        prologue << dxbc::init_input_reg(air_index, reg, mask);
+        prologue << dxbc::init_input_reg_semantic(air_index, reg, mask);
         break;
       }
-      resource.interpolant_map[reg] = dxbc::interpolant_descriptor{
+      resource.interpolant_map[reg].push_back(dxbc::interpolant_descriptor{
         [=](auto) {
           return dxbc::make_irvalue([=](dxbc::context ctx) {
             return ctx.function->getArg(air_index);
@@ -420,11 +511,12 @@ void declare_pixel_signature(
         interpolation == air::Interpolation::sample_perspective ||
           interpolation == air::Interpolation::center_perspective ||
           interpolation == air::Interpolation::centroid_perspective,
-      };
+        static_cast<uint8_t>(mask),
+      });
       uint32_t sampleidx_at = ~0u;
       if (is_sample_interpolation(element.interp))
         sampleidx_at = func_signature.DefineInput(air::InputSampleIndex{});
-      prologue << dxbc::init_input_reg_with_interpolation(
+      prologue << dxbc::init_input_reg_with_interpolation_semantic(
         air_index, reg, mask, interpolation, sampleidx_at
       );
       break;
@@ -432,7 +524,7 @@ void declare_pixel_signature(
     }
     if (init_plain)
       prologue << dxbc::init_input_reg(air_index, reg, mask, fix_w_component);
-    inputs.push_back(make_slot(element, air_index));
+    inputs.push_back(make_slot(element, air_index, element_pull_mode));
   }
 
   for (auto &element : module.output_sig) {
@@ -558,6 +650,7 @@ void declare_compute_signature(
   auto &func_signature = sig_ctx.func_signature;
   auto &prologue = sig_ctx.prologue;
   bool used[4] = {};
+  bool quad_semantics = false;
   for (auto &function : *module.module)
     for (auto &block : function)
       for (auto &instruction : block) {
@@ -568,7 +661,31 @@ void declare_compute_signature(
         auto *opcode = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0));
         if (opcode && opcode->getZExtValue() >= 93 && opcode->getZExtValue() <= 96)
           used[opcode->getZExtValue() - 93] = true;
+        /* Derivatives, implicit-LOD sampling and quad operations (SM 6.6 compute quads). */
+        switch (opcode ? opcode->getZExtValue() : 0) {
+        case 60: case 61: case 64: case 81: case 83: case 84: case 85: case 86: case 122: case 123: case 222:
+          quad_semantics = true;
+          break;
+        default:
+          break;
+        }
       }
+
+  /*
+   * SM 6.6 compute quads: with numthreads X and Y even (and not the 1D X%4, Y=Z=1
+   * layout), a quad is (x, y), (x+1, y), (x, y+1), (x+1, y+1). Metal assigns simdgroup
+   * lanes in linear thread index order, which already satisfies the 1D rule; for the
+   * 2D rule the thread IDs are re-derived from the linear index so that every 4
+   * consecutive lanes form one 2x2 quad in Z order. D3D does not define any other
+   * mapping between thread IDs and lanes, so the remap is invisible otherwise.
+   */
+  const uint32_t X = module.num_threads[0], Y = module.num_threads[1], Z = module.num_threads[2];
+  const bool linear_quads = X % 4 == 0 && Y == 1 && Z == 1;
+  const bool remap = quad_semantics && !linear_quads && X % 2 == 0 && Y % 2 == 0;
+  if (remap) {
+    used[1] = true;
+    used[3] = true;
+  }
 
   for (unsigned index = 0; index < 4; ++index) {
     if (!used[index])
@@ -597,6 +714,29 @@ void declare_compute_signature(
     }
     prologue << dxbc::make_effect([=](dxbc::context ctx) {
       ctx.resource.*binding = ctx.function->getArg(air_index);
+      return std::monostate{};
+    });
+  }
+  if (remap) {
+    prologue << dxbc::make_effect([=](dxbc::context ctx) {
+      auto &b = ctx.builder;
+      auto *linear = ctx.resource.thread_id_in_group_flat_arg;
+      auto *quad = b.CreateLShr(linear, 2);
+      auto *within = b.CreateAnd(linear, 3);
+      auto *qx = b.CreateURem(quad, b.getInt32(X / 2));
+      auto *qy = b.CreateURem(b.CreateUDiv(quad, b.getInt32(X / 2)), b.getInt32(Y / 2));
+      auto *z = b.CreateUDiv(quad, b.getInt32(X / 2 * Y / 2));
+      auto *x = b.CreateOr(b.CreateShl(qx, 1), b.CreateAnd(within, 1));
+      auto *y = b.CreateOr(b.CreateShl(qy, 1), b.CreateLShr(within, 1));
+      llvm::Value *local = llvm::UndefValue::get(llvm::FixedVectorType::get(b.getInt32Ty(), 3));
+      local = b.CreateInsertElement(local, x, uint64_t(0));
+      local = b.CreateInsertElement(local, y, 1);
+      local = b.CreateInsertElement(local, z, 2);
+      ctx.resource.thread_id_in_group_arg = local;
+      ctx.resource.thread_id_in_group_flat_arg =
+        b.CreateAdd(b.CreateMul(z, b.getInt32(X * Y)), b.CreateAdd(b.CreateMul(y, b.getInt32(X)), x));
+      auto *size = llvm::ConstantVector::get({b.getInt32(X), b.getInt32(Y), b.getInt32(Z)});
+      ctx.resource.thread_id_arg = b.CreateAdd(b.CreateMul(ctx.resource.thread_group_id_arg, size), local);
       return std::monostate{};
     });
   }
@@ -704,6 +844,52 @@ resolve_slot(
   return slot;
 }
 
+/* Component `component` of per-vertex attribute `element` at triangle vertex `vertex`
+ * (air.get_vertex_value; the argument's type is the element's full register type). */
+llvm::Value *load_vertex_value(dxbc::context &ctx, const SignatureSlot &element, uint32_t component,
+                               llvm::Value *vertex) {
+  auto &builder = ctx.builder;
+  const bool is_float = to_register_component_type(element.comp_type) == dxbc::RegisterComponentType::Float;
+  const bool is_signed = to_register_component_type(element.comp_type) == dxbc::RegisterComponentType::Int;
+  auto *lane = is_float ? builder.getFloatTy() : builder.getInt32Ty();
+  auto *type = llvm::FixedVectorType::get(lane, 4);
+  auto *argument = ctx.function->getArg(element.vertex_value_index);
+  std::string name = "air.get_vertex_value.";
+  name += is_float ? "v4f32" : is_signed ? "s.v4i32" : "u.v4i32";
+  auto attributes = llvm::AttributeList::get(
+    ctx.llvm, {{~0U, llvm::Attribute::get(ctx.llvm, llvm::Attribute::ReadOnly)},
+               {~0U, llvm::Attribute::get(ctx.llvm, llvm::Attribute::NoUnwind)},
+               {~0U, llvm::Attribute::get(ctx.llvm, llvm::Attribute::WillReturn)}});
+  auto callee = ctx.module.getOrInsertFunction(
+    name, llvm::FunctionType::get(type, {argument->getType(), builder.getInt32Ty()}, false), attributes);
+  auto *values = builder.CreateCall(callee, {argument, vertex});
+  return builder.CreateExtractElement(values, element.start_col + component);
+}
+
+/* dx.op.attributeAtVertex (137): (element id, row, column, vertex). */
+llvm::Error lower_attribute_at_vertex(dxbc::context &ctx, const StageSignature &signature, llvm::CallInst &call) {
+  auto id = constant_operand(call, 1);
+  auto row = constant_operand(call, 2);
+  auto component = constant_operand(call, 3);
+  if (!id) return id.takeError();
+  if (!row) return row.takeError();
+  if (!component) return component.takeError();
+  auto slot = resolve_slot(call, signature.find_input(*id), *component, *row);
+  if (!slot) return slot.takeError();
+  if ((*slot)->vertex_value_index == ~0u || *row != 0)
+    return createError("dx.op.attributeAtVertex reads an element that is not bound per vertex");
+  auto &builder = ctx.builder;
+  builder.SetInsertPoint(&call);
+  auto *vertex = builder.CreateZExt(call.getArgOperand(4), builder.getInt32Ty());
+  /* D3D names the vertices in the order the primitive was submitted, which is also
+   * Metal's vertex_index order; out-of-range indices are undefined in D3D. */
+  vertex = builder.CreateSelect(builder.CreateICmpULT(vertex, builder.getInt32(3)), vertex, builder.getInt32(0));
+  llvm::Value *value = narrow_io_value(builder, load_vertex_value(ctx, **slot, *component, vertex), call.getType());
+  call.replaceAllUsesWith(value);
+  call.eraseFromParent();
+  return llvm::Error::success();
+}
+
 llvm::Error lower_load_input(
   dxbc::context &ctx, const StageSignature &signature, llvm::CallInst &call
 ) {
@@ -726,7 +912,12 @@ llvm::Error lower_load_input(
   builder.SetInsertPoint(&call);
 
   llvm::Value *value;
-  if (element->semantic_kind == NAME_COVERAGE) {
+  if (element->semantic_kind == NAME_BARYCENTRICS) {
+    value = builder.CreateExtractElement(ctx.function->getArg(element->air_index), element->start_col + *component);
+  } else if (element->vertex_value_index != ~0u) {
+    /* A plain read of a per-vertex (nointerpolation) attribute is the provoking vertex. */
+    value = load_vertex_value(ctx, *element, *component, builder.getInt32(0));
+  } else if (element->semantic_kind == NAME_COVERAGE) {
     /* Coverage arrives as a scalar argument; the DX 5.x path keeps it in
      * io_binding_map instead of the input register file. */
     if (!ctx.resource.coverage_mask_arg)
@@ -752,8 +943,7 @@ llvm::Error lower_load_input(
       )
     );
   }
-  if (value->getType() != call.getType())
-    value = builder.CreateBitCast(value, call.getType());
+  value = narrow_io_value(builder, value, call.getType());
 
   call.replaceAllUsesWith(value);
   call.eraseFromParent();
@@ -824,6 +1014,7 @@ llvm::Error lower_store_output(
     return llvm::Error::success();
   }
 
+  value = widen_io_value(builder, value, element->comp_type);
   auto *registers =
     value->getType()->isFloatTy() ? ctx.resource.output.ptr_float4 : ctx.resource.output.ptr_int4;
   auto *registers_type =
@@ -836,6 +1027,66 @@ llvm::Error lower_store_output(
        builder.getInt32(element->start_col + component.get())}
     )
   );
+  call.eraseFromParent();
+  return llvm::Error::success();
+}
+
+llvm::Error lower_evaluate_input(dxbc::context &ctx, const StageSignature &signature,
+                                 llvm::CallInst &call) {
+  auto id = constant_operand(call, 1);
+  auto row = constant_operand(call, 2);
+  auto component = constant_operand(call, 3);
+  if (!id) return id.takeError();
+  if (!row) return row.takeError();
+  if (!component) return component.takeError();
+  auto slot = resolve_slot(call, signature.find_input(*id), *component, *row);
+  if (!slot) return slot.takeError();
+  auto *element = *slot;
+  auto &builder = ctx.builder;
+  builder.SetInsertPoint(&call);
+  ctx.air.builder.SetInsertPoint(&call);
+  if (!element->pull_mode) {
+    // Constant interpolation is independent of sample and snapped offset.
+    if (element->air_index == ~0u) return createError("DXIL evaluate input is not interpolatable");
+    auto *registers = ctx.resource.input.ptr_float4;
+    auto *type = cast<llvm::PointerType>(registers->getType())->getNonOpaquePointerElementType();
+    auto *value = builder.CreateLoad(builder.getFloatTy(), builder.CreateGEP(type, registers,
+      {builder.getInt32(0), builder.getInt32(element->reg + *row),
+       builder.getInt32(element->start_col + *component)}));
+    call.replaceAllUsesWith(value);
+    call.eraseFromParent();
+    return llvm::Error::success();
+  }
+  // The input register can contain several independently packed semantics;
+  // the dx.op element id, not its register number, identifies the interpolant.
+  auto *interpolant = ctx.function->getArg(element->air_index);
+  bool perspective = element->interpolation == INTERP_LINEAR ||
+                     element->interpolation == INTERP_LINEAR_CENTROID ||
+                     element->interpolation == INTERP_LINEAR_SAMPLE;
+  auto *callee = call.getCalledFunction();
+  if (!callee) return createError("DXIL evaluate input is an indirect call");
+  llvm::Value *value = nullptr;
+  if (callee->getName().startswith("dx.op.evalSampleIndex.")) {
+    value = ctx.air.CreateInterpolateAtSample(interpolant, call.getArgOperand(4), perspective);
+  } else if (callee->getName().startswith("dx.op.evalCentroid.")) {
+    value = ctx.air.CreateInterpolateAtCentroid(interpolant, perspective);
+  } else if (callee->getName().startswith("dx.op.evalSnapped.")) {
+    llvm::Value *offset = llvm::UndefValue::get(llvm::FixedVectorType::get(builder.getFloatTy(), 2));
+    for (unsigned i = 0; i < 2; ++i) {
+      auto *snapped = builder.CreateAnd(builder.CreateAdd(call.getArgOperand(4 + i), builder.getInt32(8)),
+                                         builder.getInt32(15));
+
+      // D3D offsets are relative to the pixel center; AIR/Metal offsets are
+      // measured from its upper-left corner.
+      auto *floatOffset = builder.CreateFMul(builder.CreateUIToFP(snapped, builder.getFloatTy()),
+                                             llvm::ConstantFP::get(builder.getFloatTy(), 1.0 / 16.0));
+      offset = builder.CreateInsertElement(offset, floatOffset, builder.getInt32(i));
+    }
+    value = ctx.air.CreateInterpolateAtOffset(interpolant, offset, perspective);
+  } else return createError("unknown DXIL evaluate opcode");
+  auto *lane = builder.CreateExtractElement(value, builder.getInt32(*component));
+  if (lane->getType() != call.getType()) lane = builder.CreateBitCast(lane, call.getType());
+  call.replaceAllUsesWith(lane);
   call.eraseFromParent();
   return llvm::Error::success();
 }
@@ -863,8 +1114,7 @@ llvm::Error lower_thread_id(
       return createError(llvm::Twine(what) + " component is out of range");
     value = builder.CreateExtractElement(value, component.get());
   }
-  if (value->getType() != call.getType())
-    value = builder.CreateBitCast(value, call.getType());
+  value = narrow_io_value(builder, value, call.getType());
   call.replaceAllUsesWith(value);
   call.eraseFromParent();
   return llvm::Error::success();
@@ -874,11 +1124,14 @@ llvm::Error lower_thread_id(
 
 llvm::Error LowerStageIO(dxbc::context &ctx, const StageSignature &signature) {
   llvm::SmallVector<llvm::CallInst *, 16> load_inputs;
+  llvm::SmallVector<llvm::CallInst *, 16> eval_inputs;
   llvm::SmallVector<llvm::CallInst *, 16> store_outputs;
   llvm::SmallVector<llvm::CallInst *, 16> thread_ids;
   llvm::SmallVector<llvm::CallInst *, 16> group_ids;
   llvm::SmallVector<llvm::CallInst *, 16> thread_id_in_groups;
   llvm::SmallVector<llvm::CallInst *, 16> flattened_thread_ids;
+  llvm::SmallVector<llvm::CallInst *, 16> attribute_at_vertex;
+  llvm::SmallVector<llvm::CallInst *, 4> command_values;
 
   for (auto &block : *ctx.function) {
     for (auto &instruction : block) {
@@ -889,6 +1142,10 @@ llvm::Error LowerStageIO(dxbc::context &ctx, const StageSignature &signature) {
       llvm::StringRef name_ref(name);
       if (name_ref.startswith(LOAD_INPUT_PREFIX))
         load_inputs.push_back(call);
+      else if (name_ref.startswith("dx.op.evalSnapped.") ||
+               name_ref.startswith("dx.op.evalSampleIndex.") ||
+               name_ref.startswith("dx.op.evalCentroid."))
+        eval_inputs.push_back(call);
       else if (name_ref.startswith(STORE_OUTPUT_PREFIX))
         store_outputs.push_back(call);
       else if (name_ref.startswith(THREAD_ID_PREFIX))
@@ -899,11 +1156,48 @@ llvm::Error LowerStageIO(dxbc::context &ctx, const StageSignature &signature) {
         thread_id_in_groups.push_back(call);
       else if (name_ref.startswith(FLATTENED_THREAD_ID_IN_GROUP_PREFIX))
         flattened_thread_ids.push_back(call);
+      else if (name_ref.startswith("dx.op.attributeAtVertex."))
+        attribute_at_vertex.push_back(call);
+      else if (name_ref.startswith("dx.op.startVertexLocation.") ||
+               name_ref.startswith("dx.op.startInstanceLocation.") || name_ref.startswith("dx.op.viewID."))
+        command_values.push_back(call);
     }
+  }
+
+  for (auto *call : attribute_at_vertex) {
+    if (auto err = lower_attribute_at_vertex(ctx, signature, *call))
+      return err;
+  }
+  for (auto *call : command_values) {
+    auto &builder = ctx.builder;
+    builder.SetInsertPoint(call);
+    llvm::Value *value = nullptr;
+    auto name = callee_name(*call);
+    llvm::StringRef name_ref(name);
+    if (name_ref.startswith("dx.op.viewID.")) {
+      /* ViewInstancingTier is NOT_SUPPORTED: every draw is view 0. */
+      value = builder.getInt32(0);
+    } else {
+      /* SM 6.8 SV_StartVertexLocation is BaseVertexLocation (indexed) or
+       * StartVertexLocation (non-indexed), exactly Metal's [[base_vertex]];
+       * SV_StartInstanceLocation is Metal's [[base_instance]]. */
+      const bool vertex = name_ref.startswith("dx.op.startVertexLocation.");
+      value = vertex ? ctx.resource.base_vertex_id : ctx.resource.base_instance_id;
+      if (!value)
+        return createError(llvm::Twine(name_ref) + " outside a vertex shader");
+    }
+    if (value->getType() != call->getType())
+      value = builder.CreateZExtOrTrunc(value, call->getType());
+    call->replaceAllUsesWith(value);
+    call->eraseFromParent();
   }
 
   for (auto *call : load_inputs) {
     if (auto err = lower_load_input(ctx, signature, *call))
+      return err;
+  }
+  for (auto *call : eval_inputs) {
+    if (auto err = lower_evaluate_input(ctx, signature, *call))
       return err;
   }
   for (auto *call : store_outputs) {
@@ -952,6 +1246,19 @@ TransplantEntryBody(llvm::Function &entry, llvm::Function &function, llvm::Basic
     auto *ret = dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator());
     if (ret && ret->getNumOperands())
       return createError("DXIL entry point '" + entry.getName() + "' returns a value");
+  }
+
+  /* SM 6.2 "fp32-denorm-mode" is an attribute of the DXIL entry; the body now runs in
+   * `function`, where LowerOperations reads it. Bodies that share one Metal function
+   * (VS+HS) must agree, except that "any" admits either mode. */
+  if (auto mode = entry.getFnAttribute("fp32-denorm-mode"); mode.isStringAttribute()) {
+    const llvm::StringRef incoming = mode.getValueAsString();
+    auto existing = function.getFnAttribute("fp32-denorm-mode");
+    if (!existing.isStringAttribute() || existing.getValueAsString() == "any")
+      function.addFnAttr("fp32-denorm-mode", incoming);
+    else if (incoming != "any" && incoming != existing.getValueAsString())
+      return createError("DXIL stages sharing one Metal function declare different fp32 denorm modes (" +
+                         existing.getValueAsString() + ", " + incoming + ")");
   }
 
   auto *body_entry = &entry.front();
@@ -1014,6 +1321,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   dxbc::args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(args, &rootsig);
   if (!rootsig)
     return createError("DXIL shader requires a root signature");
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *stats = nullptr;
+  dxbc::args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(args, &stats);
 
   uint32_t pso_sample_mask = 0xffffffff;
   bool pso_dual_source_blending = false;
@@ -1041,6 +1350,56 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
         args, &vertex_so
       ))
     return unsupported("stream output for a DXIL vertex shader");
+  /* Same contract as the DXBC vertex path: without rasterization the AIR vertex
+   * function returns void, which is what a rasterization-disabled Metal
+   * pipeline requires. */
+  SM50_SHADER_GS_PASS_THROUGH_DATA *gs_passthrough = nullptr;
+  bool rasterization_disabled =
+    module.stage == Stage::Vertex &&
+    dxbc::args_get_data<SM50_SHADER_GS_PASS_THROUGH, SM50_SHADER_GS_PASS_THROUGH_DATA>(args, &gs_passthrough) &&
+    gs_passthrough->RasterizationDisabled;
+  SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *so_capture = nullptr;
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *index_pull = nullptr;
+  if (dxbc::args_get_data<SM50_SHADER_D3D12_INDEX_PULL, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(args, &index_pull) &&
+      module.stage != Stage::Vertex)
+    return unsupported("index pulling outside a vertex shader");
+  std::vector<dxbc::StreamOutputCaptureRun> so_capture_runs;
+  if (dxbc::args_get_data<
+        SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE, SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA>(
+        args, &so_capture
+      )) {
+    if (module.stage != Stage::Vertex)
+      return unsupported("stream output capture outside a vertex shader");
+    SM50_SHADER_D3D12_MSAA_VERTEX_DATA *msaa_vertex = nullptr;
+    dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_VERTEX, SM50_SHADER_D3D12_MSAA_VERTEX_DATA>(args, &msaa_vertex);
+    if (index_pull && !(msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE))
+      return unsupported("standalone index pulling and stream output on the same vertex shader");
+    for (uint32_t i = 0; i < so_capture->num_elements; i++) {
+      auto &element = so_capture->elements[i];
+      if (!element.semantic_name)
+        return unsupported("stream output capture element has no semantic name");
+      auto output = std::find_if(
+        module.output_sig.begin(), module.output_sig.end(), [&](const SigElement &sig) {
+          return sig.stream == 0 && sig.semantic_index == element.semantic_index &&
+                 llvm::StringRef(sig.name).equals_insensitive(element.semantic_name);
+        }
+      );
+      if (output == module.output_sig.end())
+        return unsupported(
+          (llvm::Twine("stream output capture element ") + element.semantic_name +
+           llvm::Twine(element.semantic_index) + " is not a vertex shader output")
+            .str()
+        );
+      /* Matches the storeOutput lowering: element row 0 lives at start_row and
+       * its components at the mask's columns of the packed output registers. */
+      auto run = dxbc::resolve_stream_output_capture(
+        *so_capture, element, output->start_row, element_mask(*output)
+      );
+      if (!run)
+        return run.takeError();
+      so_capture_runs.push_back(*run);
+    }
+  }
 
   auto shader_type = to_program_type(module.stage);
   shader.shader_type = shader_type;
@@ -1051,6 +1410,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   auto &func_signature = shader.func_signature;
 
   dxbc::IREffect prologue([](auto) { return std::monostate(); });
+  if (module.stage == Stage::Pixel && module.force_early_depth_stencil)
+    func_signature.UseEarlyFragmentTests();
   dxbc::IRValue epilogue([](dxbc::context ctx) -> dxbc::pvalue {
     auto *return_type = ctx.function->getReturnType();
     if (return_type->isVoidTy())
@@ -1061,13 +1422,37 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   dxbc::io_binding_map resource_map;
   air::AirType types(llvm_context);
   StageSignature signature;
+  if (module.stage == Stage::Pixel) {
+    for (auto &instruction : llvm::instructions(*module.entry)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+      if (!call || call->arg_size() < 4) continue;
+      auto name = callee_name(*call);
+      llvm::StringRef name_ref(name);
+      if (!name_ref.startswith("dx.op.evalSnapped.") &&
+          !name_ref.startswith("dx.op.evalSampleIndex.") &&
+          !name_ref.startswith("dx.op.evalCentroid.")) continue;
+      auto *id = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+      if (!id) return createError("DXIL evaluated input has a dynamic signature element");
+      auto found = std::find_if(module.input_sig.begin(), module.input_sig.end(),
+        [&](const SigElement &element) { return element.id == id->getZExtValue(); });
+      if (found == module.input_sig.end()) return createError("DXIL evaluated input has no signature element");
+      for (unsigned row = 0; row < found->rows; ++row) {
+        if (found->start_row + row >= 32) return createError("DXIL pull input register exceeds mask");
+        if (found->interp != INTERP_CONSTANT)
+          shader.shader_info.pull_mode_reg_mask |= 1u << (found->start_row + row);
+      }
+    }
+  }
 
   {
     dxbc::SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
     sig_ctx.ia_layout = ia_layout;
+    sig_ctx.skip_vertex_output = rasterization_disabled;
     sig_ctx.dual_source_blending = pso_dual_source_blending;
     sig_ctx.disable_depth_output = pso_disable_depth_output;
-    sig_ctx.pull_mode_reg_mask = shader.shader_info.pull_mode_reg_mask;
+    SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel = nullptr;
+    dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(args, &msaa_pixel);
+    sig_ctx.pull_mode_reg_mask = msaa_pixel ? 0xffffffffu : shader.shader_info.pull_mode_reg_mask;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
       memcpy(sig_ctx.pixel_formats, pso_pixel_formats, sizeof(sig_ctx.pixel_formats));
@@ -1075,20 +1460,46 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
       return std::move(err);
   }
 
+  // DXIL carries SV_SampleIndex as a dedicated intrinsic, not a loadInput
+  // signature element. Share the AIR argument with sample-interpolated inputs.
+  llvm::SmallVector<llvm::CallInst *, 4> sample_indices;
+  if (auto *intrinsic = module_ir.getFunction("dx.op.sampleIndex.i32")) {
+    for (auto *user : intrinsic->users()) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (module.stage != Stage::Pixel || !call || call->getFunction() != module.entry ||
+          call->arg_size() != 1 || !call->getType()->isIntegerTy(32))
+        return createError("invalid dx.op.sampleIndex use");
+      auto opcode = constant_operand(*call, 0);
+      if (!opcode)
+        return opcode.takeError();
+      if (*opcode != 90)
+        return createError("invalid dx.op.sampleIndex opcode");
+      sample_indices.push_back(call);
+    }
+  }
+  const auto sample_index_arg = sample_indices.empty() ? ~0u : func_signature.DefineInput(air::InputSampleIndex{});
+
   /* Vertex stages always declare the four IA values: they are what the AIR
    * stage_in metadata carries for [[vertex_id]] / [[instance_id]] and what the
    * input assembly pull needs to index the vertex buffers. */
   uint32_t vertex_idx = 0, base_vertex_idx = 0, instance_idx = 0, base_instance_idx = 0;
+  dxbc::VertexIndexPullArgs vertex_index_args;
   uint32_t clip_distance_out_idx = ~0u;
   if (module.stage == Stage::Vertex) {
     vertex_idx = func_signature.DefineInput(air::InputVertexID{});
     base_vertex_idx = func_signature.DefineInput(air::InputBaseVertex{});
     instance_idx = func_signature.DefineInput(air::InputInstanceID{});
     base_instance_idx = func_signature.DefineInput(air::InputBaseInstance{});
-    if (!shader.clip_distance_scalars.empty())
+    if (!rasterization_disabled && !shader.clip_distance_scalars.empty())
       clip_distance_out_idx = func_signature.DefineOutput(
         air::OutputClipDistance{shader.clip_distance_scalars.size()}
       );
+    if (so_capture)
+      vertex_index_args = dxbc::define_stream_output_capture(
+        func_signature, epilogue, std::move(so_capture_runs), so_capture->record_dwords
+      );
+    else if (index_pull)
+      vertex_index_args = dxbc::define_vertex_index_pull(func_signature);
   }
 
   if (module.stage == Stage::Pixel && pso_sample_mask != 0xffffffff) {
@@ -1104,6 +1515,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     };
   }
 
+  const auto stats_arg = stats ? dxbc::define_pipeline_statistics(func_signature) : ~0u;
   auto binding_map = dxbc::setup_binding_rootsig(
     &shader.shader_info, func_signature, module_ir, shader_type, rootsig->bytecode,
     rootsig->bytecode_length
@@ -1115,7 +1527,11 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
    * to give the name up before the AIR function is created. */
   module.entry->setName(llvm::Twine(function_name) + ".dxil");
   auto [function, function_metadata] =
-    func_signature.CreateFunction(function_name, llvm_context, module_ir, 0, false);
+    func_signature.CreateFunction(function_name, llvm_context, module_ir, 0, rasterization_disabled);
+  for (auto *call : sample_indices) {
+    call->replaceAllUsesWith(function->getArg(sample_index_arg));
+    call->eraseFromParent();
+  }
 
   auto *entry_bb = llvm::BasicBlock::Create(llvm_context, "entry", function);
   auto *epilogue_bb = llvm::BasicBlock::Create(llvm_context, "epilogue", function);
@@ -1179,8 +1595,20 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     .metal_version = metal_version,
   };
 
+  if (so_capture)
+    resource_map.so_capture_key = resource_map.vertex_id;
+  if (so_capture || index_pull)
+    dxbc::apply_vertex_index_pull(
+      builder, function, vertex_index_args, resource_map,
+      so_capture ? offsetof(SM50_SO_CAPTURE_CONTROL, index_size) / 4 : 0
+    );
   if (auto err = prologue.build(ctx).takeError())
     return std::move(err);
+  if (stats)
+    dxbc::increment_pipeline_statistics(
+      builder, air, function, stats_arg,
+      module.stage == Stage::Vertex ? 4 : module.stage == Stage::Pixel ? 14 : 20
+    );
 
   auto body_entry = TransplantEntryBody(*module.entry, *function, *epilogue_bb);
   if (!body_entry)

@@ -26,6 +26,442 @@
 using namespace metal;
 using namespace dxmt;
 
+// D3D12 R24G8 placed depth plane is D24X8 (low 24 bits, high byte zero),
+// while Metal's emulated D24 texture stores its depth plane as float32.
+kernel void d3d12_d24_to_float(device const uchar *source [[buffer(0)]],
+                                device uchar *destination [[buffer(1)]],
+                                constant uint4 &layout [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+  if (index >= layout.z * layout.w) return;
+  const uint row = index / layout.z, column = index % layout.z;
+  const uint packed = *reinterpret_cast<device const uint *>(source + row * layout.x + column * 4);
+  *reinterpret_cast<device float *>(destination + row * layout.y + column * 4) =
+      precise::divide(float(packed & 0xffffffu), 16777215.0f);
+}
+
+kernel void d3d12_float_to_d24(device const uchar *source [[buffer(0)]],
+                                device uchar *destination [[buffer(1)]],
+                                constant uint4 &layout [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+  if (index >= layout.z * layout.w) return;
+  const uint row = index / layout.z, column = index % layout.z;
+  const float depth = *reinterpret_cast<device const float *>(source + row * layout.x + column * 4);
+  const float normalized = clamp(depth, 0.0f, 1.0f);
+  // Scaling by 2^24 is exact for a float32 source. Decompose the fractional
+  // part before subtracting depth, so float32 cannot round the large product
+  // with 0xffffff to an integer (losing the D24 half-step).
+  const float scaled = normalized * 16777216.0f;
+  int packed = int(scaled);
+  const float delta = (scaled - float(packed)) - normalized;
+  if (delta > 0.5f || (delta == 0.5f && (packed & 1)))
+    ++packed;
+  else if (delta < -0.5f || (delta == -0.5f && (packed & 1)))
+    --packed;
+  *reinterpret_cast<device uint *>(destination + row * layout.y + column * 4) =
+      min(0xffffffu, uint(packed));
+}
+
+// D3D12-only logical texture layouts. Each invocation owns one RGB texel or
+// one packed 4:2:2 pair, so readback never races another invocation on a row.
+kernel void d3d12_rgb32_expand(device const uchar *source [[buffer(0)]],
+                               device uchar *destination [[buffer(1)]],
+                               constant uint4 &layout [[buffer(2)]],
+                               uint index [[thread_position_in_grid]]) {
+  if (index >= layout.z * layout.w) return;
+  const uint row = index / layout.z, x = index % layout.z;
+  device const uint *src = reinterpret_cast<device const uint *>(source + row * layout.x + x * 12);
+  device uint *dst = reinterpret_cast<device uint *>(destination + row * layout.y + x * 16);
+  dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 0;
+}
+
+kernel void d3d12_rgb32_compact(device const uchar *source [[buffer(0)]],
+                                device uchar *destination [[buffer(1)]],
+                                constant uint4 &layout [[buffer(2)]],
+                                uint index [[thread_position_in_grid]]) {
+  if (index >= layout.z * layout.w) return;
+  const uint row = index / layout.z, x = index % layout.z;
+  device const uint *src = reinterpret_cast<device const uint *>(source + row * layout.x + x * 16);
+  device uint *dst = reinterpret_cast<device uint *>(destination + row * layout.y + x * 12);
+  dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+}
+
+// layout.z is logical pixel width, layout.w is row count. The first member of
+// each pair owns R/B; the two G bytes belong to consecutive logical pixels.
+kernel void d3d12_packed422_expand(device const uchar *source [[buffer(0)]],
+                                   device uchar *destination [[buffer(1)]],
+                                   constant uint4 &layout [[buffer(2)]],
+                                   constant uint &variant [[buffer(3)]],
+                                   uint index [[thread_position_in_grid]]) {
+  const uint pairs = (layout.z + 1) / 2;
+  if (index >= pairs * layout.w) return;
+  const uint row = index / pairs, pair = index % pairs;
+  device const uchar *src = source + row * layout.x + pair * 4;
+  device uchar *left = destination + row * layout.y + pair * 8;
+  const uchar r = variant ? src[1] : src[0];
+  const uchar b = variant ? src[3] : src[2];
+  left[0] = r; left[1] = variant ? src[0] : src[1]; left[2] = b; left[3] = 255;
+  if (pair * 2 + 1 < layout.z) {
+    left[4] = r; left[5] = variant ? src[2] : src[3]; left[6] = b; left[7] = 255;
+  }
+}
+
+kernel void d3d12_packed422_compact(device const uchar *source [[buffer(0)]],
+                                    device uchar *destination [[buffer(1)]],
+                                    constant uint4 &layout [[buffer(2)]],
+                                    constant uint &variant [[buffer(3)]],
+                                    uint index [[thread_position_in_grid]]) {
+  const uint pairs = (layout.z + 1) / 2;
+  if (index >= pairs * layout.w) return;
+  const uint row = index / pairs, pair = index % pairs;
+  device const uchar *left = source + row * layout.x + pair * 8;
+  device uchar *dst = destination + row * layout.y + pair * 4;
+  const uchar g1 = pair * 2 + 1 < layout.z ? left[5] : 0;
+  if (variant) {
+    dst[0] = left[1]; dst[1] = left[0]; dst[2] = g1; dst[3] = left[2];
+  } else {
+    dst[0] = left[0]; dst[1] = left[1]; dst[2] = left[2]; dst[3] = g1;
+  }
+}
+
+[[vertex]] float4 msaa_fullscreen_vertex(uint vertex_id [[vertex_id]]) {
+  const float2 corner = float2((vertex_id << 1) & 2, vertex_id & 2);
+  return float4(corner * 2.0f - 1.0f, 0.0f, 1.0f);
+}
+
+struct DXMTMSAAFullscreenLayerVertex {
+  float4 position [[position]];
+  uint layer [[render_target_array_index]];
+};
+
+[[vertex]] DXMTMSAAFullscreenLayerVertex msaa_fullscreen_layer_vertex(
+    uint vertex_id [[vertex_id]], constant uint &layer [[buffer(23)]]) {
+  const float2 corner = float2((vertex_id << 1) & 2, vertex_id & 2);
+  return {float4(corner * 2.0f - 1.0f, 0.0f, 1.0f), layer};
+}
+
+[[fragment]] uint msaa_clear_coverage() {
+  return 0;
+}
+
+struct DXMTMSAANoPixelInput {
+  float4 position [[position]];
+  interpolant<float, interpolation::no_perspective> ndc_depth [[user(msaa_ndc_depth)]];
+};
+
+struct DXMTMSAALineInput {
+  float4 position [[position]];
+  interpolant<float, interpolation::no_perspective> ndc_depth [[user(msaa_ndc_depth)]];
+  float2 start [[user(msaa_line_start)]];
+  float2 end [[user(msaa_line_end)]];
+  float2 depth_pair [[user(msaa_line_depth_pair)]];
+  interpolant<float2, interpolation::no_perspective> carrier_screen [[user(msaa_carrier_screen)]];
+};
+
+struct DXMTMSAATile {
+  uint x, y, sample_count, sample_mask;
+  float min_depth, max_depth;
+  uint primitive_id;
+  uint primitive_slot;
+  float viewport_origin_x, viewport_origin_y, viewport_width, viewport_height;
+};
+
+struct DXMTMSAAPixelLayout {
+  uint input_record_dwords, output_record_dwords;
+  uint input_claim_dword, input_coverage_dword;
+  uint output_valid_dword, output_coverage_dword;
+  uint flags, tile_width, input_record_count, helper_record_base;
+  uint center_z_dword, sample_z_dword, z_claim_dword, z_anchor_dword;
+  uint line_mode, line_mask_dword, line_alpha_dword;
+};
+
+struct DXMTMSAAQueryCoverage {
+  uint mask [[sample_mask]];
+};
+
+inline uint4 msaa_coverage_read(texture2d_ms<uint, access::read> coverage, uint2 xy, uint sample) {
+  return coverage.read(xy, sample);
+}
+
+inline uint4 msaa_coverage_read(texture2d<uint, access::read> coverage, uint2 xy, uint) {
+  return coverage.read(xy, 0); // mip zero, not a multisample sample index
+}
+
+// Visibility counts raster samples, not samples in a single-sample RTV.
+// The original PS has already run into the output record; never invoke it a
+// second time just to answer a query.
+template<typename Coverage>
+inline DXMTMSAAQueryCoverage msaa_query_coverage_impl(
+    float4 position, uint sample, constant DXMTMSAATile &tile,
+    constant DXMTMSAAPixelLayout &layout, device const uint *outputs, Coverage coverage) {
+  const uint2 xy = uint2(position.xy);
+  if (xy.x < tile.x || xy.y < tile.y || xy.x >= tile.x + 8 ||
+      xy.y >= tile.y + 8 || sample >= tile.sample_count) return {0};
+  const uint2 local = xy - uint2(tile.x, tile.y);
+  const device uint *record = outputs + (local.y * 8 + local.x) * layout.output_record_dwords;
+  // For a 1x RTV only output sample zero enables an OM write. D3D permits
+  // either zero or full raster coverage when every output sample is masked;
+  // consistently choose zero as recommended by the functional spec.
+  const bool writes = (tile.sample_mask & 1u) && record[0] && (record[1] & 1u);
+  return {writes && msaa_coverage_read(coverage, xy, sample).x ? 1u << sample : 0u};
+}
+
+[[fragment]] DXMTMSAAQueryCoverage msaa_query_coverage(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant DXMTMSAATile &tile [[buffer(23)]],
+    constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *outputs [[buffer(22)]],
+    texture2d_ms<uint, access::read> coverage [[texture(24)]]) {
+  return msaa_query_coverage_impl(position, sample, tile, layout, outputs, coverage);
+}
+
+[[fragment]] DXMTMSAAQueryCoverage msaa_query_coverage_single(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant DXMTMSAATile &tile [[buffer(23)]],
+    constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *outputs [[buffer(22)]],
+    texture2d<uint, access::read> coverage [[texture(24)]]) {
+  return msaa_query_coverage_impl(position, sample, tile, layout, outputs, coverage);
+}
+
+struct DXMTMSAAMarker {
+  uint value [[color(0)]];
+  uint mask [[sample_mask]];
+};
+
+// Diamond exit, not a nearest-distance test: an endpoint inside the last
+// diamond cannot light that pixel. Rotating by 45 degrees makes four diamond
+// half-planes into two independent slabs.
+inline bool dxmt_line_diamond_exit(float2 start, float2 end, float2 center) {
+  const float2 a = float2(start.x + start.y - center.x - center.y,
+                         start.x - start.y - center.x + center.y);
+  const float2 b = float2(end.x + end.y - center.x - center.y,
+                         end.x - end.y - center.x + center.y);
+  float enter = 0.0f, exit = 1.0f;
+  for (uint axis = 0; axis < 2; axis++) {
+    const float delta = b[axis] - a[axis];
+    if (delta == 0.0f) {
+      if (a[axis] < -0.5f || a[axis] > 0.5f) return false;
+      continue;
+    }
+    const float first = (-0.5f - a[axis]) / delta;
+    const float second = (0.5f - a[axis]) / delta;
+    enter = max(enter, min(first, second));
+    exit = min(exit, max(first, second));
+  }
+  return enter < exit && exit < 1.0f;
+}
+
+// Exact area of the unit-width butt-capped line rectangle intersected with
+// this pixel's unit square. The specification permits implementation-specific
+// AA filters; this geometric coverage is deterministic and preserves junctions.
+inline float dxmt_line_alpha_area(float2 start, float2 end, float2 pixel) {
+  // Work in pixel-local coordinates: the shoelace sum otherwise cancels
+  // large screen-space products and loses coverage on distant render targets.
+  start -= pixel;
+  end -= pixel;
+  const float2 direction = end - start;
+  const float length = metal::length(direction);
+  if (!(length > 0.0f) || !isfinite(length)) return 0.0f;
+  const float2 normal = float2(-direction.y, direction.x) * (0.5f / length);
+  float2 polygon[12] = {start - normal, start + normal, end + normal, end - normal};
+  float2 clipped[12];
+  uint count = 4;
+  for (uint edge = 0; edge < 4; edge++) {
+    uint next_count = 0;
+    const uint axis = edge & 1;
+    const float boundary = edge >= 2 ? 1.0f : 0.0f;
+    for (uint i = 0; i < count; i++) {
+      const float2 a = polygon[i], b = polygon[(i + 1) % count];
+      const bool inside_a = edge >= 2 ? a[axis] <= boundary : a[axis] >= boundary;
+      const bool inside_b = edge >= 2 ? b[axis] <= boundary : b[axis] >= boundary;
+      if (inside_a != inside_b) {
+        const float t = (boundary - a[axis]) / (b[axis] - a[axis]);
+        clipped[next_count++] = mix(a, b, t);
+      }
+      if (inside_b) clipped[next_count++] = b;
+    }
+    count = next_count;
+    for (uint i = 0; i < count; i++) polygon[i] = clipped[i];
+    if (!count) return 0.0f;
+  }
+  float twice_area = 0.0f;
+  for (uint i = 0; i < count; i++) {
+    const float2 a = polygon[i], b = polygon[(i + 1) % count];
+    twice_area += a.x * b.y - a.y * b.x;
+  }
+  return clamp(abs(twice_area) * 0.5f, 0.0f, 1.0f);
+}
+
+inline DXMTMSAAMarker msaa_gather_depth_impl(
+    float4 position, float center, thread const float *sample_depths,
+    float2 line_start, float2 line_end, uint native_coverage,
+    constant DXMTMSAATile &tile, constant DXMTMSAAPixelLayout &layout,
+    device uint *records) {
+  const uint2 xy = uint2(position.xy) - uint2(tile.x, tile.y);
+  const uint pixel = xy.y * 8 + xy.x;
+  const float alpha = layout.line_mode == 2
+      ? dxmt_line_alpha_area(line_start, line_end, floor(position.xy)) : 1.0f;
+  const uint geometric = layout.line_mode == 1
+      ? (dxmt_line_diamond_exit(line_start, line_end, floor(position.xy) + 0.5f)
+             ? (1u << tile.sample_count) - 1u : 0u)
+      : layout.line_mode == 2 ? (alpha > 0.0f ? (1u << tile.sample_count) - 1u : 0u)
+      : native_coverage;
+  const uint coverage = geometric & tile.sample_mask;
+  const float anchor = layout.line_mode
+      ? fma(center, tile.max_depth - tile.min_depth, tile.min_depth) : position.z;
+  float sample_z[8];
+  float derivative_x[9], derivative_y[9];
+  derivative_x[0] = dfdx(center);
+  derivative_y[0] = dfdy(center);
+  for (uint sample = 0; sample < tile.sample_count; ++sample) {
+    const float ndc = sample_depths[sample];
+    sample_z[sample] = layout.line_mode
+        ? fma(ndc, tile.max_depth - tile.min_depth, tile.min_depth)
+        : fma(ndc - center, tile.max_depth - tile.min_depth, anchor);
+    derivative_x[sample + 1] = dfdx(ndc);
+    derivative_y[sample + 1] = dfdy(ndc);
+  }
+  uint2 helper_xy[4];
+  float helper_center_z[4], helper_sample_z[4][8];
+  for (ushort lane = 0; lane < 4; ++lane) {
+    helper_xy[lane] = uint2(quad_shuffle(position.xy, lane)) - uint2(tile.x, tile.y);
+    helper_center_z[lane] = quad_shuffle(anchor, lane);
+    for (uint sample = 0; sample < tile.sample_count; ++sample)
+      helper_sample_z[lane][sample] = quad_shuffle(sample_z[sample], lane);
+  }
+  if (xy.x < 8 && xy.y < 8) {
+    device uint *record = records + pixel * layout.input_record_dwords;
+    if (layout.line_mask_dword != 0xffffffffu)
+      atomic_store_explicit((device atomic_uint *)(record + layout.line_mask_dword),
+                            geometric, memory_order_relaxed);
+    if (layout.line_alpha_dword != 0xffffffffu)
+      atomic_store_explicit((device atomic_uint *)(record + layout.line_alpha_dword),
+                            as_type<uint>(alpha), memory_order_relaxed);
+    for (uint i = 0; i <= tile.sample_count; ++i) {
+      atomic_store_explicit((device atomic_uint *)(record + layout.z_anchor_dword + i * 2),
+                            as_type<uint>(derivative_x[i]), memory_order_relaxed);
+      atomic_store_explicit((device atomic_uint *)(record + layout.z_anchor_dword + i * 2 + 1),
+                            as_type<uint>(derivative_y[i]), memory_order_relaxed);
+    }
+    if (atomic_exchange_explicit((device atomic_uint *)(record + layout.z_claim_dword),
+                                 1u, memory_order_relaxed) == 0u) {
+      record[layout.center_z_dword] = as_type<uint>(anchor);
+      for (uint sample = 0; sample < tile.sample_count; ++sample)
+        record[layout.sample_z_dword + sample] = as_type<uint>(sample_z[sample]);
+    }
+  }
+  // Helpers cannot store directly; active quad lanes transfer each neighbor's
+  // separately captured values into a distinct helper-record bank.
+  for (ushort lane = 0; lane < 4; ++lane) {
+    const uint2 target = helper_xy[lane];
+    if (target.x >= 8 || target.y >= 8) continue;
+    device uint *helper = records + (layout.helper_record_base + target.y * 8 + target.x) *
+                                   layout.input_record_dwords;
+    if (atomic_exchange_explicit((device atomic_uint *)(helper + layout.z_claim_dword),
+                                 1u, memory_order_relaxed) != 0u) continue;
+    helper[layout.center_z_dword] = as_type<uint>(helper_center_z[lane]);
+    for (uint sample = 0; sample < tile.sample_count; ++sample)
+      helper[layout.sample_z_dword + sample] = as_type<uint>(helper_sample_z[lane][sample]);
+  }
+  return {xy.x < 8 && xy.y < 8 ? 1u : 0u, coverage};
+}
+
+[[fragment]] DXMTMSAAMarker msaa_gather_depth(
+    DXMTMSAANoPixelInput input [[stage_in]], uint native_coverage [[sample_mask]],
+    constant DXMTMSAATile &tile [[buffer(23)]],
+    constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
+    device uint *records [[buffer(21)]]) {
+  float depths[8];
+  for (uint sample = 0; sample < tile.sample_count; ++sample)
+    depths[sample] = input.ndc_depth.interpolate_at_sample(sample);
+  return msaa_gather_depth_impl(input.position, input.ndc_depth.interpolate_at_center(), depths,
+                                float2(0), float2(0),
+                                native_coverage, tile, layout, records);
+}
+
+[[fragment]] DXMTMSAAMarker msaa_gather_line_depth(
+    DXMTMSAALineInput input [[stage_in]], uint native_coverage [[sample_mask]],
+    constant DXMTMSAATile &tile [[buffer(23)]],
+    constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
+    device uint *records [[buffer(21)]]) {
+  const float2 direction = input.end - input.start;
+  const float length_squared = dot(direction, direction);
+  const float inverse_length_squared = length_squared > 0.0f ? 1.0f / length_squared : 0.0f;
+  const float2 screen_center = input.carrier_screen.interpolate_at_center();
+  const float q = dot(screen_center - input.start, direction) * inverse_length_squared;
+  const float center = mix(input.depth_pair.x, input.depth_pair.y, q);
+  float depths[8];
+  for (uint sample = 0; sample < tile.sample_count; ++sample) {
+    const float2 screen_sample = input.carrier_screen.interpolate_at_sample(sample);
+    const float sample_q = dot(screen_sample - input.start, direction) * inverse_length_squared;
+    depths[sample] = mix(input.depth_pair.x, input.depth_pair.y, sample_q);
+  }
+  return msaa_gather_depth_impl(input.position, center, depths, input.start, input.end,
+                                native_coverage, tile, layout, records);
+}
+
+struct DXMTMSAADepthMarker {
+  uint value [[color(0)]];
+  float depth [[depth(any)]];
+  uint mask [[sample_mask]];
+};
+
+template<typename Coverage>
+inline DXMTMSAADepthMarker msaa_explicit_depth_impl(
+    float4 position, uint sample, constant DXMTMSAATile &tile,
+    constant DXMTMSAAPixelLayout &layout, device const uint *records, Coverage coverage) {
+  const uint2 xy = uint2(position.xy);
+  const uint mask = msaa_coverage_read(coverage, xy, sample).x ? 1u << sample : 0u;
+  const uint2 local = xy - uint2(tile.x, tile.y);
+  if (local.x >= 8 || local.y >= 8 || sample >= tile.sample_count) return {0, 0, 0};
+  const device uint *record = records + (local.y * 8 + local.x) * layout.input_record_dwords;
+  const float raw_z = as_type<float>(record[layout.sample_z_dword + sample]);
+  return {1u, clamp(raw_z, tile.min_depth, tile.max_depth), mask};
+}
+
+[[fragment]] DXMTMSAADepthMarker msaa_explicit_depth(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant DXMTMSAATile &tile [[buffer(23)]],
+    constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *records [[buffer(21)]],
+    texture2d_ms<uint, access::read> coverage [[texture(24)]]) {
+  return msaa_explicit_depth_impl(position, sample, tile, layout, records, coverage);
+}
+
+[[fragment]] DXMTMSAADepthMarker msaa_explicit_depth_single(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant DXMTMSAATile &tile [[buffer(23)]],
+    constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *records [[buffer(21)]],
+    texture2d<uint, access::read> coverage [[texture(24)]]) {
+  return msaa_explicit_depth_impl(position, sample, tile, layout, records, coverage);
+}
+
+struct DXMTMSAADepthOnly {
+  float depth [[depth(any)]];
+  uint mask [[sample_mask]];
+};
+
+[[fragment]] DXMTMSAADepthOnly msaa_explicit_depth_only(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant DXMTMSAATile &tile [[buffer(23)]],
+    constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *records [[buffer(21)]],
+    texture2d_ms<uint, access::read> coverage [[texture(24)]]) {
+  const auto result = msaa_explicit_depth_impl(position, sample, tile, layout, records, coverage);
+  return {result.depth, result.mask};
+}
+
+[[fragment]] DXMTMSAADepthOnly msaa_explicit_depth_only_single(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant DXMTMSAATile &tile [[buffer(23)]],
+    constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *records [[buffer(21)]],
+    texture2d<uint, access::read> coverage [[texture(24)]]) {
+  const auto result = msaa_explicit_depth_impl(position, sample, tile, layout, records, coverage);
+  return {result.depth, result.mask};
+}
+
 [[kernel]] void clear_texture_1d_uint(
     texture1d<uint, access::read_write> tex [[texture(0)]],
     constant uint4& value [[buffer(1)]],
@@ -122,6 +558,764 @@ struct DXMTClearTextureBufferUInt {
     uint pos [[thread_position_in_grid]]
 ) {
   destination[pos] = source[pos] ? 1ul : 0ul;
+}
+
+// D3D12 vertex stream output (see d3d12_command_encoder.hpp StreamOutputDrawData).
+struct DXMTSOIndirectPreflightParams {
+  device const uchar *argument_buffer;
+  device const uint *count_buffer;
+  device const ulong *predicate;
+  device const uchar *index_buffer;
+  uint max_count;
+  uint stride;
+  uint draw_offset;
+  uint ib_offset;
+  uint predicate_op;
+  uint indexed;
+  uint index_format;
+  uint count_only;
+};
+
+struct DXMTSOIndirectPreflightResult {
+  uint effective_count;
+  uint padding[3];
+};
+
+struct DXMTSOIndirectPreflightRecord {
+  uint vertex_count;
+  uint instance_count;
+  uint start_location;
+  uint start_instance;
+  int base_vertex;
+  uint index_format;
+  ulong index_address;
+};
+
+// The queue reads these compact draw fields only after the producing segment retires.
+// Each command is allocated exact-size scratch before its VS is run, without replaying the VS.
+[[kernel]] void so_indirect_preflight(
+    constant DXMTSOIndirectPreflightParams &params [[buffer(0)]],
+    device DXMTSOIndirectPreflightResult *output [[buffer(1)]]
+) {
+  uint count = params.count_buffer ? min(params.count_buffer[0], params.max_count) : params.max_count;
+  if (params.predicate && (params.predicate_op ? params.predicate[0] != 0 : params.predicate[0] == 0))
+    count = 0;
+  output->effective_count = count;
+  if (params.count_only)
+    return;
+  device DXMTSOIndirectPreflightRecord *records =
+      reinterpret_cast<device DXMTSOIndirectPreflightRecord *>(output + 1);
+  for (uint i = 0; i < count; i++) {
+    device const uint *draw = reinterpret_cast<device const uint *>(
+        params.argument_buffer + ulong(i) * params.stride + params.draw_offset);
+    DXMTSOIndirectPreflightRecord record;
+    record.vertex_count = draw[0];
+    record.instance_count = draw[1];
+    record.start_location = draw[2];
+    record.base_vertex = params.indexed ? int(draw[3]) : 0;
+    record.start_instance = draw[params.indexed ? 4 : 3];
+    record.index_format = params.index_format;
+    record.index_address = ulong(params.index_buffer);
+    if (params.indexed && params.ib_offset != 0xffffffffu) {
+      // D3D12_INDEX_BUFFER_VIEW is packed and may be only 4-byte aligned after
+      // preceding signature arguments: load its GPU VA as two 32-bit words.
+      device const uint *ib = reinterpret_cast<device const uint *>(
+          params.argument_buffer + ulong(i) * params.stride + params.ib_offset);
+      record.index_address = ulong(ib[0]) | (ulong(ib[1]) << 32);
+      record.index_format = ib[3];
+    }
+    records[i] = record;
+  }
+}
+
+struct DXMTSOElement {
+  uint slot;
+  uint byte_offset;
+  uint dword_offset;
+  uint component_count;
+};
+
+struct DXMTSOAssembly {
+  uint topology; // 0 point list, 1 line list, 2 line strip, 3 triangle list, 4 triangle strip
+  uint indexed;
+  uint index_size; // 2 or 4
+  uint cut_enabled; // strip topology with a matching D3D12 IBStripCutValue
+  uint cut_value;
+  uint vertex_count; // per instance: VertexCountPerInstance / IndexCountPerInstance
+  uint instance_count;
+  uint record_dwords;
+  uint element_count;
+  uint referenced_mask;
+  uint bound_mask;
+  uint predicate_enabled;
+  uint predicate_not_equal;
+  uint index_skip; // bytes from the 4-aligned index binding to the first index
+  uint padding[2];
+  ulong size[4];
+  uint stride[4];
+  DXMTSOElement elements[128];
+  // Capture tail: float4 SV_Position, float[8] SV_ClipDistance, float[8] SV_CullDistance.
+  uint statistics_capture_offset; // dwords from the start of each captured record
+  uint clip_mask;
+  uint cull_mask;
+  uint statistics_enabled;
+  uint rasterization_enabled;
+  uint depth_clip_enabled;
+  uint stream_output_enabled;
+  uint statistics_padding;
+};
+
+struct DXMTSOControl {
+  uint positions_per_instance;
+  uint first_position;
+  uint record_count;
+  uint index_size;
+  uint index_first;
+  int base_vertex;
+  uint padding[2];
+};
+
+inline uint dxmt_so_read_index(device const uchar *indices, uint size, uint k) {
+  if (size == 2)
+    return uint(indices[2 * k]) | (uint(indices[2 * k + 1]) << 8);
+  return uint(indices[4 * k]) | (uint(indices[4 * k + 1]) << 8) | (uint(indices[4 * k + 2]) << 16) |
+         (uint(indices[4 * k + 3]) << 24);
+}
+
+// IA positions of an indexed stream-output draw: the draw is issued over this uint32 buffer so
+// Metal's vertex id is the position k; a D3D12 strip cut (strip topologies only) becomes Metal's
+// 0xFFFFFFFF restart, and every other index value, 0xFFFF included, is an ordinary vertex.
+[[kernel]] void so_index_positions(
+    constant DXMTSOAssembly &params [[buffer(0)]],
+    device const uchar *indices [[buffer(1)]],
+    device uint *positions [[buffer(2)]],
+    uint k [[thread_position_in_grid]]
+) {
+  if (k >= params.vertex_count)
+    return;
+  indices += params.index_skip;
+  const uint index = dxmt_so_read_index(indices, params.index_size, k);
+  positions[k] = params.cut_enabled && index == params.cut_value ? 0xffffffffu : k;
+}
+
+// Mirrors MSAAPrimitiveAssemblyParams and MSAAPrimitiveIndirectArguments. The output
+// reserves one indirect draw per possible complete primitive. Empty slots are safe to
+// submit without asking the CPU whether an indirect count, predicate or cut removed them.
+struct DXMTMSAAPrimitiveAssembly {
+  uint topology;
+  uint indexed;
+  uint index_size;
+  uint cut_enabled;
+  uint cut_value;
+  uint vertex_count;
+  uint instance_count;
+  uint first_index;
+  uint positions_per_instance;
+  uint first_position;
+  uint max_primitives;
+  uint predicate_enabled;
+  uint predicate_not_equal;
+  uint index_skip;
+  uint line_mode;
+  uint padding;
+};
+
+struct DXMTMSAAPrimitiveDraw {
+  uint index_count;
+  uint instance_count;
+  uint index_start;
+  int base_vertex;
+  uint base_instance;
+  uint primitive_id;
+};
+
+// This single ordered scan is necessary for strip restart and parity: parallel
+// independent windows cannot determine the first vertex after an arbitrary cut.
+[[kernel]] void msaa_assemble_primitives(
+    constant DXMTMSAAPrimitiveAssembly &params [[buffer(0)]],
+    device const uchar *indices [[buffer(1)]],
+    device const ulong *predicate [[buffer(2)]],
+    device uint *replay_indices [[buffer(3)]],
+    device DXMTMSAAPrimitiveDraw *draws [[buffer(4)]],
+    device uint3 *capture_dispatch [[buffer(5)]]
+) {
+  const bool line_quad = params.line_mode && (params.topology == 1 || params.topology == 2);
+  const uint index_stride = line_quad ? 20 : 3;
+  for (uint i = 0; i < params.max_primitives; i++)
+    draws[i] = {0, 0, index_stride * i, 0, 0, 0};
+  capture_dispatch[0] = uint3(uint((ulong(params.vertex_count) * params.instance_count + 63) / 64), 1, 1);
+  if (params.predicate_enabled &&
+      (params.predicate_not_equal ? predicate[0] != 0 : predicate[0] == 0)) {
+    capture_dispatch[0].x = 0;
+    return;
+  }
+  indices += params.index_skip;
+  const uint vpp = params.topology == 0 ? 1 : params.topology <= 2 ? 2 : 3;
+  const bool strip = params.topology == 2 || params.topology == 4;
+  uint slot = 0;
+  for (uint instance = 0; instance < params.instance_count; instance++) {
+    uint primitive_id = 0;
+    uint window[3];
+    uint count = 0;
+    uint strip_index = 0;
+    for (uint k = 0; k < params.vertex_count; k++) {
+      if (params.cut_enabled && params.indexed &&
+          dxmt_so_read_index(indices, params.index_size, params.first_index + k) == params.cut_value) {
+        count = 0;
+        strip_index = 0;
+        continue;
+      }
+      const uint ordinal = instance * params.positions_per_instance + k - params.first_position;
+      uint primitive[3];
+      bool complete = false;
+      if (!strip) {
+        window[count++] = ordinal;
+        if (count == vpp) {
+          for (uint v = 0; v < vpp; v++) primitive[v] = window[v];
+          count = 0;
+          complete = true;
+        }
+      } else if (params.topology == 2) {
+        if (!count) {
+          window[0] = ordinal;
+          count = 1;
+        } else {
+          primitive[0] = window[0];
+          primitive[1] = ordinal;
+          window[0] = ordinal;
+          strip_index++;
+          complete = true;
+        }
+      } else if (count < 2) {
+        window[count++] = ordinal;
+      } else {
+        primitive[0] = window[0];
+        primitive[1] = (strip_index & 1) ? ordinal : window[1];
+        primitive[2] = (strip_index & 1) ? window[1] : ordinal;
+        window[0] = window[1];
+        window[1] = ordinal;
+        strip_index++;
+        complete = true;
+      }
+      if (!complete) continue;
+      if (slot >= params.max_primitives) { primitive_id++; continue; }
+      if (line_quad) {
+        const uint corners[18] = {0, 1, 2, 2, 1, 3,
+                                  2, 3, 4, 4, 3, 5,
+                                  4, 5, 6, 6, 5, 7};
+        const uint first = params.line_mode == 3 ? 6 : 0;
+        const uint count = params.line_mode == 3 ? 6 : 18;
+        for (uint v = 0; v < count; v++)
+          replay_indices[20 * slot + v] = 8 * slot + corners[first + v];
+        replay_indices[20 * slot + 18] = primitive[0];
+        replay_indices[20 * slot + 19] = primitive[1];
+      } else {
+        for (uint v = 0; v < vpp; v++) replay_indices[3 * slot + v] = primitive[v];
+      }
+      draws[slot] = {line_quad ? (params.line_mode == 3 ? 6u : 18u) : vpp,
+                     1, index_stride * slot, 0, 0, primitive_id++};
+      slot++;
+    }
+  }
+}
+
+struct DXMTMSAABoundsParams {
+  uint record_dwords;
+  uint position_offset;
+  uint viewport_index_offset;
+  uint target_width;
+  uint target_height;
+  uint viewport_count;
+  uint scissor_count;
+  uint max_primitives;
+  uint render_target_array_index_offset;
+  uint target_array_length;
+  uint line_mode;
+  uint padding;
+  float4 viewports[16];
+  uint4 scissors[16];
+};
+
+struct DXMTMSAATileBounds {
+  uint left, top, right, bottom, viewport_index, target_layer, primitive_id;
+};
+
+// Execute after VS capture and primitive assembly. This buffer is read only by
+// the queue's FIFO worker after the GPU producer has retired, never by the API
+// caller. Ambiguous projection/clipping intentionally falls back to a viewport
+// bound instead of dropping a sample at an edge.
+[[kernel]] void msaa_primitive_bounds(
+    constant DXMTMSAABoundsParams &params [[buffer(0)]],
+    device const uint *vertices [[buffer(1)]],
+    device const uint *indices [[buffer(2)]],
+    device const DXMTMSAAPrimitiveDraw *draws [[buffer(3)]],
+    device DXMTMSAATileBounds *bounds [[buffer(4)]],
+    uint primitive [[thread_position_in_grid]]
+) {
+  if (primitive >= params.max_primitives) return;
+  DXMTMSAATileBounds result = {0, 0, 0, 0, 0, 0, 0};
+  const uint count = params.line_mode && draws[primitive].index_count ? 2 : draws[primitive].index_count;
+  if (!count || !params.viewport_count || !params.target_width || !params.target_height) {
+    bounds[primitive] = result;
+    return;
+  }
+  const uint index_base = params.line_mode ? 20 * primitive + 18 : 3 * primitive;
+  const uint first = indices[index_base];
+  uint viewport_index = 0;
+  if (params.viewport_index_offset != 0xffffffffu)
+    viewport_index = vertices[ulong(first) * params.record_dwords + params.viewport_index_offset];
+  viewport_index = min(viewport_index, params.viewport_count - 1);
+  result.viewport_index = viewport_index;
+  result.primitive_id = draws[primitive].primitive_id;
+  if (params.render_target_array_index_offset != 0xffffffffu)
+    result.target_layer = min(vertices[ulong(first) * params.record_dwords +
+                                       params.render_target_array_index_offset],
+                              max(1u, params.target_array_length) - 1);
+  const float4 viewport = params.viewports[viewport_index];
+  float2 low = float2(INFINITY);
+  float2 high = float2(-INFINITY);
+  bool uncertain = params.position_offset == 0xffffffffu;
+  for (uint i = 0; i < count && !uncertain; i++) {
+    device const uint *record = vertices + ulong(indices[index_base + i]) * params.record_dwords;
+    const uint offset = params.position_offset;
+    const float4 position = float4(as_type<float>(record[offset]), as_type<float>(record[offset + 1]),
+                                   as_type<float>(record[offset + 2]), as_type<float>(record[offset + 3]));
+    if (!all(isfinite(position)) || position.w <= 0.0f) {
+      uncertain = true;
+      break;
+    }
+    const float2 ndc = position.xy / position.w;
+    const float2 screen = viewport.xy + float2((ndc.x + 1.0f) * viewport.z * 0.5f,
+                                                (1.0f - ndc.y) * viewport.w * 0.5f);
+    low = min(low, screen);
+    high = max(high, screen);
+  }
+  if (uncertain) {
+    low = min(viewport.xy, viewport.xy + viewport.zw);
+    high = max(viewport.xy, viewport.xy + viewport.zw);
+  }
+  // Two-pixel conservative fringe includes sample locations, line diamond
+  // exit and finite float-to-fixed raster coordinate conversion.
+  const float2 fringe = float2(2.0f);
+  low = clamp(floor(low - fringe), float2(0.0f), float2(params.target_width, params.target_height));
+  high = clamp(ceil(high + fringe), float2(0.0f), float2(params.target_width, params.target_height));
+  uint4 rect = uint4(uint2(low), uint2(high));
+  if (viewport_index < params.scissor_count) {
+    const uint4 scissor = params.scissors[viewport_index];
+    rect.xy = max(rect.xy, scissor.xy);
+    rect.zw = min(rect.zw, scissor.zw);
+  }
+  if (any(rect.zw <= rect.xy)) {
+    bounds[primitive] = result;
+    return;
+  }
+  result.left = rect.x & ~7u;
+  result.top = rect.y & ~7u;
+  result.right = min((rect.z + 7u) & ~7u, params.target_width);
+  result.bottom = min((rect.w + 7u) & ~7u, params.target_height);
+  bounds[primitive] = result;
+}
+
+inline void dxmt_so_store_dword(device uchar *target, ulong offset, uint value) {
+  target[offset] = uchar(value);
+  target[offset + 1] = uchar(value >> 8);
+  target[offset + 2] = uchar(value >> 16);
+  target[offset + 3] = uchar(value >> 24);
+}
+
+inline uint dxmt_so_load_dword(device const uchar *source, ulong offset) {
+  return uint(source[offset]) | (uint(source[offset + 1]) << 8) | (uint(source[offset + 2]) << 16) |
+         (uint(source[offset + 3]) << 24);
+}
+
+#pragma METAL fp math_mode(safe)
+
+struct DXMTClipVertex {
+  float4 position;
+  float clip[8];
+};
+
+inline float dxmt_clip_plane(DXMTClipVertex point, uint plane) {
+  if (plane == 0) return point.position.z;
+  if (plane == 1) return point.position.w - point.position.z;
+  if (plane == 2) return point.position.w;
+  return point.clip[plane - 3];
+}
+
+inline bool dxmt_clip_active(constant DXMTSOAssembly &params, uint plane) {
+  return plane == 2 || (plane < 2 && params.depth_clip_enabled) ||
+         (plane >= 3 && (params.clip_mask & (1u << (plane - 3))));
+}
+
+inline bool dxmt_clip_inside(float distance, uint plane) {
+  return plane == 2 ? distance > 0.0f : distance >= 0.0f;
+}
+
+inline DXMTClipVertex dxmt_clip_interpolate(DXMTClipVertex a, DXMTClipVertex b, float t) {
+  DXMTClipVertex out;
+  out.position = mix(a.position, b.position, t);
+  for (uint i = 0; i < 8; i++) out.clip[i] = mix(a.clip[i], b.clip[i], t);
+  return out;
+}
+
+// A primitive reaches the clipper before face/zero-area culling. X/Y clipping is left to Metal's
+// guard band (its width is implementation-dependent); Z and user planes are independent of it.
+inline uint dxmt_clipped_primitives(constant DXMTSOAssembly &params,
+                                    device const uint *scratch, thread const uint *primitive, uint vpp) {
+  DXMTClipVertex vertices[3];
+  device const uint *records[3];
+  for (uint v = 0; v < vpp; v++) {
+    records[v] = scratch + ulong(primitive[v]) * params.record_dwords + params.statistics_capture_offset;
+    for (uint c = 0; c < 4; c++) vertices[v].position[c] = as_type<float>(records[v][c]);
+    if (any(isnan(vertices[v].position))) return 0;
+    // FS 15.4 permits discarding XYZ-infinite input. Do not replace its finite Z/W
+    // components with AIR's rasterization workaround and invent surviving geometry.
+    if (any(isinf(vertices[v].position.xyz))) return 0;
+    for (uint c = 0; c < 8; c++) {
+      vertices[v].clip[c] = (params.clip_mask & (1u << c)) ? as_type<float>(records[v][4 + c]) : 0.0f;
+      if ((params.clip_mask & (1u << c)) && isnan(vertices[v].clip[c])) return 0;
+    }
+  }
+  // A cull plane discards the whole primitive iff every vertex is outside that plane.
+  // NaN is outside, rather than an intersection with a well-defined boundary.
+  for (uint c = 0; c < 8; c++) {
+    if (!(params.cull_mask & (1u << c))) continue;
+    bool all_outside = true;
+    for (uint v = 0; v < vpp; v++)
+      all_outside = all_outside && !(as_type<float>(records[v][12 + c]) >= 0.0f);
+    if (all_outside) return 0;
+  }
+
+  if (vpp == 1) {
+    for (uint p = 0; p < 11; p++)
+      if (dxmt_clip_active(params, p) && !dxmt_clip_inside(dxmt_clip_plane(vertices[0], p), p))
+        return 0;
+    return 1;
+  }
+  if (vpp == 2) {
+    float begin = 0.0f, end = 1.0f;
+    for (uint p = 0; p < 11; p++) {
+      if (!dxmt_clip_active(params, p)) continue;
+      float a = dxmt_clip_plane(vertices[0], p), b = dxmt_clip_plane(vertices[1], p);
+      bool inside_a = dxmt_clip_inside(a, p), inside_b = dxmt_clip_inside(b, p);
+      if (!inside_a && !inside_b) return 0;
+      if (inside_a == inside_b) continue;
+      float t = a / (a - b);
+      if (!inside_a) begin = max(begin, t);
+      else end = min(end, t);
+      if (begin > end) return 0;
+    }
+    // W is a strict half-space: a segment reduced to its W=0 intersection is empty.
+    float w0 = vertices[0].position.w, w1 = vertices[1].position.w;
+    if (w0 <= 0.0f && w1 > 0.0f && end <= -w0 / (w1 - w0)) return 0;
+    if (w0 > 0.0f && w1 <= 0.0f && begin >= -w0 / (w1 - w0)) return 0;
+    return any(isnan(dxmt_clip_interpolate(vertices[0], vertices[1], begin).position)) ||
+           any(isnan(dxmt_clip_interpolate(vertices[0], vertices[1], end).position)) ? 0 : 1;
+  }
+
+  // Convex polygon clipping. Each plane can add at most one vertex; three input vertices plus
+  // 2 depth, W, and 8 user planes fit in these 16-element arrays.
+  DXMTClipVertex polygon[16], next[16];
+  for (uint v = 0; v < 3; v++) polygon[v] = vertices[v];
+  uint count = 3;
+  for (uint p = 0; p < 11 && count; p++) {
+    if (!dxmt_clip_active(params, p)) continue;
+    uint output_count = 0;
+    for (uint v = 0; v < count; v++) {
+      DXMTClipVertex a = polygon[v], b = polygon[(v + 1) % count];
+      float da = dxmt_clip_plane(a, p), db = dxmt_clip_plane(b, p);
+      bool inside_a = dxmt_clip_inside(da, p), inside_b = dxmt_clip_inside(db, p);
+      if (inside_a) next[output_count++] = a;
+      if (inside_a != inside_b)
+        next[output_count++] = dxmt_clip_interpolate(a, b, da / (da - db));
+    }
+    count = output_count;
+    for (uint v = 0; v < count; v++) polygon[v] = next[v];
+  }
+  bool positive_w = false;
+  for (uint v = 0; v < count; v++) {
+    positive_w = positive_w || polygon[v].position.w > 0.0f;
+    if (any(isnan(polygon[v].position))) return 0;
+    for (uint c = 0; c < 8; c++)
+      if ((params.clip_mask & (1u << c)) && isnan(polygon[v].clip[c])) return 0;
+  }
+  return count >= 3 && positive_w ? count - 2 : 0;
+}
+
+#pragma METAL fp math_mode(fast)
+
+// Assembles the captured records of one draw into complete list primitives in IA order and appends
+// them to the bound targets (D3D11.3 FS 14.5/14.6). Runs as a single thread so primitive order and
+// the BufferFilledSize dependency between consecutive draws are exactly the API order.
+[[kernel]] void so_assemble(
+    constant DXMTSOAssembly &params [[buffer(0)]],
+    constant DXMTSOControl &control [[buffer(1)]],
+    device const uint *scratch [[buffer(2)]],
+    device const uchar *indices [[buffer(3)]],
+    device ulong2 *counters [[buffer(4)]],
+    device const ulong *predicate [[buffer(5)]],
+    device uchar *target0 [[buffer(6)]],
+    device uchar *target1 [[buffer(7)]],
+    device uchar *target2 [[buffer(8)]],
+    device uchar *target3 [[buffer(9)]],
+    device uchar *filled0 [[buffer(10)]],
+    device uchar *filled1 [[buffer(11)]],
+    device uchar *filled2 [[buffer(12)]],
+    device uchar *filled3 [[buffer(13)]],
+    device uint *status [[buffer(14)]],
+    device ulong *statistics [[buffer(15)]]
+) {
+  status[0] = 0;
+  if (params.predicate_enabled && (params.predicate_not_equal ? predicate[0] != 0 : predicate[0] == 0))
+    return;
+  indices += params.index_skip;
+  device uchar *targets[4] = {target0, target1, target2, target3};
+  device uchar *filled_sizes[4] = {filled0, filled1, filled2, filled3};
+  ulong filled[4] = {0, 0, 0, 0};
+  if (params.stream_output_enabled)
+    for (uint s = 0; s < 4; s++)
+      if (params.bound_mask & (1u << s))
+        filled[s] = dxmt_so_load_dword(filled_sizes[s], 0);
+
+  const uint topology = params.topology;
+  const uint vpp = topology == 0 ? 1 : topology <= 2 ? 2 : 3;
+  const bool strip = topology == 2 || topology == 4;
+  // A slot the declaration writes but no buffer is bound to counts as full (14.6).
+  bool stopped = (params.referenced_mask & ~params.bound_mask) != 0;
+  ulong written = 0, needed = 0, unclaimed = 0;
+  ulong ia_vertices = 0, ia_primitives = 0, clip_invocations = 0, clip_primitives = 0;
+
+  for (uint instance = 0; instance < params.instance_count; instance++) {
+    uint window[3];
+    uint count = 0;   // vertices collected in the current list primitive / strip
+    uint strip_index = 0;
+    for (uint k = 0; k < params.vertex_count; k++) {
+      // Records are keyed by IA position; the index value only decides strip cuts.
+      if (params.cut_enabled && dxmt_so_read_index(indices, params.index_size, k) == params.cut_value) {
+        count = 0;
+        strip_index = 0;
+        continue;
+      }
+      const uint record = instance * control.positions_per_instance + k - control.first_position;
+      uint primitive[3];
+      bool complete = false;
+      if (!strip) {
+        window[count++] = record;
+        if (count == vpp) {
+          for (uint v = 0; v < vpp; v++)
+            primitive[v] = window[v];
+          count = 0;
+          complete = true;
+        }
+      } else if (topology == 2) {
+        if (count == 0) {
+          window[0] = record;
+          count = 1;
+        } else {
+          primitive[0] = window[0];
+          primitive[1] = record;
+          window[0] = record;
+          strip_index++;
+          complete = true;
+        }
+      } else {
+        if (count < 2) {
+          window[count++] = record;
+        } else {
+          // D3D triangle strips keep the first vertex leading: triangle i is (i, i+1, i+2) for even i
+          // and (i, i+2, i+1) for odd i, so every triangle has the same winding.
+          primitive[0] = window[0];
+          primitive[1] = (strip_index & 1) ? record : window[1];
+          primitive[2] = (strip_index & 1) ? window[1] : record;
+          window[0] = window[1];
+          window[1] = record;
+          strip_index++;
+          complete = true;
+        }
+      }
+      if (!complete)
+        continue;
+      if (params.statistics_enabled) {
+        ia_primitives++;
+        // Strip vertices are consumed once, not once per overlapping primitive. An incomplete
+        // run does not contribute, and a restart starts a new run.
+        ia_vertices += !strip || strip_index == 1u ? vpp : 1u;
+      }
+      if (!params.stream_output_enabled && !params.statistics_enabled)
+        continue;
+      if (params.stream_output_enabled) needed++;
+      // Captured clipper inputs are independent of SO buffer exhaustion. The claim check must
+      // likewise precede the SO-only overflow path when pipeline statistics are requested.
+      bool valid = true;
+      if (params.statistics_enabled || !stopped) {
+        for (uint v = 0; v < vpp; v++)
+          valid = valid && primitive[v] < control.record_count;
+        device const uint *claims = scratch + ulong(control.record_count) * params.record_dwords;
+        for (uint v = 0; v < vpp && valid; v++)
+          valid = claims[primitive[v]] != 0;
+        if (!valid) unclaimed++;
+      }
+      if (params.statistics_enabled && valid && params.rasterization_enabled) {
+        clip_invocations++;
+        clip_primitives += dxmt_clipped_primitives(params, scratch, primitive, vpp);
+      }
+      if (!params.stream_output_enabled) continue;
+      if (!stopped) {
+        for (uint s = 0; s < 4; s++) {
+          if ((params.referenced_mask & (1u << s)) &&
+              (filled[s] > params.size[s] || ulong(vpp) * params.stride[s] > params.size[s] - filled[s]))
+            stopped = true;
+        }
+      }
+      if (stopped)
+        continue;
+      // Every vertex of a complete primitive is shaded, so its record is claimed. A missing claim is
+      // a translator invariant failure: it is reported through `status` (logged by the queue) and
+      // the primitive is neither written nor counted as written.
+      if (!valid) {
+        continue;
+      }
+      for (uint v = 0; v < vpp; v++) {
+        device const uint *source = scratch + ulong(primitive[v]) * params.record_dwords;
+        for (uint e = 0; e < params.element_count; e++) {
+          const DXMTSOElement element = params.elements[e];
+          const ulong base = filled[element.slot] + ulong(v) * params.stride[element.slot] + element.byte_offset;
+          for (uint c = 0; c < element.component_count; c++)
+            dxmt_so_store_dword(targets[element.slot], base + 4 * c, source[element.dword_offset + c]);
+        }
+      }
+      for (uint s = 0; s < 4; s++)
+        if (params.referenced_mask & (1u << s))
+          filled[s] += ulong(vpp) * params.stride[s];
+      written++;
+    }
+  }
+  if (params.stream_output_enabled) {
+    for (uint s = 0; s < 4; s++)
+      if ((params.referenced_mask & params.bound_mask) & (1u << s))
+        dxmt_so_store_dword(filled_sizes[s], 0, uint(filled[s]));
+    counters[0] += ulong2(written, needed);
+  }
+  if (params.statistics_enabled) {
+    statistics[0] += ia_vertices;
+    statistics[1] += ia_primitives;
+    statistics[5] += clip_invocations;
+    statistics[6] += clip_primitives;
+  }
+  status[0] = uint(unclaimed);
+}
+
+/* Stream output after a GS (stream 0), run once after the draw's render pass. The GS mesh function captures,
+ * per invocation key ((draw instance * primitives per instance + primitive id) * GS instances + GS instance, the
+ * D3D output order), up to dcl_maxout (`params.vertex_count`) records of record_dwords + 1 dwords; the extra dword
+ * is the vertex's index inside its output strip. One header word per key follows all records and holds the
+ * number of captured vertices. `control.record_count` is the number of keys. Output strips are written as lists
+ * with the IA strip order (triangle i: (i, i+1, i+2), odd i: (i, i+2, i+1)), appended in key order (FS 14.5/14.6).
+ * `params.topology` is the GS output topology: 0 point list, 2 line strip, 4 triangle strip. */
+[[kernel]] void so_assemble_gs(
+    constant DXMTSOAssembly &params [[buffer(0)]],
+    constant DXMTSOControl &control [[buffer(1)]],
+    device const uint *scratch [[buffer(2)]],
+    device const uchar *unused [[buffer(3)]],
+    device ulong2 *counters [[buffer(4)]],
+    device const ulong *predicate [[buffer(5)]],
+    device uchar *target0 [[buffer(6)]],
+    device uchar *target1 [[buffer(7)]],
+    device uchar *target2 [[buffer(8)]],
+    device uchar *target3 [[buffer(9)]],
+    device uchar *filled0 [[buffer(10)]],
+    device uchar *filled1 [[buffer(11)]],
+    device uchar *filled2 [[buffer(12)]],
+    device uchar *filled3 [[buffer(13)]],
+    device uint *status [[buffer(14)]]
+) {
+  status[0] = 0;
+  if (params.predicate_enabled && (params.predicate_not_equal ? predicate[0] != 0 : predicate[0] == 0))
+    return;
+  device uchar *targets[4] = {target0, target1, target2, target3};
+  device uchar *filled_sizes[4] = {filled0, filled1, filled2, filled3};
+  ulong filled[4] = {0, 0, 0, 0};
+  for (uint s = 0; s < 4; s++)
+    if (params.bound_mask & (1u << s))
+      filled[s] = dxmt_so_load_dword(filled_sizes[s], 0);
+  const uint topology = params.topology;
+  const uint vpp = topology == 0 ? 1 : topology == 2 ? 2 : 3;
+  const uint max_vertices = params.vertex_count; // dcl_maxout
+  const uint stride = params.record_dwords + 1;
+  device const uint *headers = scratch + ulong(control.record_count) * max_vertices * stride;
+  bool stopped = (params.referenced_mask & ~params.bound_mask) != 0;
+  ulong written = 0, needed = 0;
+  for (uint key = 0; key < control.record_count; key++) {
+    const uint count = min(headers[key], max_vertices);
+    device const uint *records = scratch + ulong(key) * max_vertices * stride;
+    uint run_start = 0;
+    for (uint v = 0; v < count; v++) {
+      const uint position = records[ulong(v) * stride + params.record_dwords];
+      if (position == 0)
+        run_start = v;
+      uint primitive[3];
+      bool complete = false;
+      if (topology == 0) {
+        primitive[0] = v;
+        complete = true;
+      } else if (topology == 2 && position >= 1) {
+        primitive[0] = v - 1;
+        primitive[1] = v;
+        complete = true;
+      } else if (topology == 4 && position >= 2) {
+        const uint i = position - 2;
+        primitive[0] = run_start + i;
+        primitive[1] = (i & 1) ? v : run_start + i + 1;
+        primitive[2] = (i & 1) ? run_start + i + 1 : v;
+        complete = true;
+      }
+      if (!complete)
+        continue;
+      needed++;
+      if (!stopped) {
+        for (uint s = 0; s < 4; s++)
+          if ((params.referenced_mask & (1u << s)) &&
+              (filled[s] > params.size[s] || ulong(vpp) * params.stride[s] > params.size[s] - filled[s]))
+            stopped = true;
+      }
+      if (stopped)
+        continue;
+      for (uint p = 0; p < vpp; p++) {
+        device const uint *source = records + ulong(primitive[p]) * stride;
+        for (uint e = 0; e < params.element_count; e++) {
+          const DXMTSOElement element = params.elements[e];
+          const ulong base = filled[element.slot] + ulong(p) * params.stride[element.slot] + element.byte_offset;
+          for (uint c = 0; c < element.component_count; c++)
+            dxmt_so_store_dword(targets[element.slot], base + 4 * c, source[element.dword_offset + c]);
+        }
+      }
+      for (uint s = 0; s < 4; s++)
+        if (params.referenced_mask & (1u << s))
+          filled[s] += ulong(vpp) * params.stride[s];
+      written++;
+    }
+  }
+  for (uint s = 0; s < 4; s++)
+    if ((params.referenced_mask & params.bound_mask) & (1u << s))
+      dxmt_so_store_dword(filled_sizes[s], 0, uint(filled[s]));
+  counters[0] += ulong2(written, needed);
+}
+
+// D3D12_QUERY_DATA_PIPELINE_STATISTICS is eleven consecutive 64-bit counters.
+[[kernel]] void query_pipeline_statistics_end(
+    device const ulong *counter [[buffer(0)]],
+    device const ulong *begin [[buffer(1)]],
+    device ulong *result [[buffer(2)]]) {
+  for (uint i = 0; i < 11; i++) result[i] = counter[i] - begin[i];
+}
+
+// D3D12 SO statistics EndQuery: result = stream counters now - counters at BeginQuery.
+[[kernel]] void query_so_statistics_end(
+    device const ulong2* counter [[buffer(0)]],
+    device const ulong2* begin [[buffer(1)]],
+    device ulong2* result [[buffer(2)]]
+) {
+  result[0] = counter[0] - begin[0];
 }
 
 [[kernel]] void query_accumulate_visibility(
@@ -300,7 +1494,10 @@ float EETF(float E, float Lw, float Lb, float Lmax, float Lmin) {
   E = (E - pq_Lb) / pqdiff_LwLb;
   float KS = 1.5 * max_lum - 0.5;
   float b = min_lum;
-  if (E >= KS) {
+  // When the display reaches the content peak, KS >= 1: there is no
+  // highlight shoulder, and at equality its peak T would be 0/0. Keep the
+  // black-level lift below, which still maps Lb to Lmin.
+  if (KS < 1.0f && E >= KS) {
     float T = (E - KS) /  (1 - KS);
     float T_2 = T * T;
     float T_3 = T_2 * T;
@@ -327,6 +1524,14 @@ struct DXMTPresentMetadata {
   float edr_scale;
   float max_content_luminance;
   float max_display_luminance;
+  struct {
+    float source_width, source_height;
+    float destination_width, destination_height;
+    uint rotation, scaling_none, right_to_left;
+    float background[4];
+    uint restrict_output;
+    float output_clip[4];
+  } geometry;
 };
 
 float3 to_srgb(float3 linear) {
@@ -341,16 +1546,45 @@ float3 to_srgb(float3 linear) {
     constant DXMTPresentMetadata& meta [[buffer(0)]]
 ) {
   float4 output = float4(0);
+  if (meta.geometry.restrict_output &&
+      (input.position.x < meta.geometry.output_clip[0] ||
+       input.position.y < meta.geometry.output_clip[1] ||
+       input.position.x >= meta.geometry.output_clip[2] ||
+       input.position.y >= meta.geometry.output_clip[3]))
+    return float4(0);
+  float2 sample_position = input.position.xy;
+  if (meta.geometry.source_width > 0) {
+    float2 source_size = float2(meta.geometry.source_width, meta.geometry.source_height);
+    float2 target_size = float2(meta.geometry.destination_width, meta.geometry.destination_height);
+    bool quarter_turn = meta.geometry.rotation == 2 || meta.geometry.rotation == 4;
+    float2 rotated_size = quarter_turn ? source_size.yx : source_size;
+    float2 image_size = meta.geometry.scaling_none ? rotated_size : target_size;
+    float2 origin = float2(meta.geometry.scaling_none && meta.geometry.right_to_left
+                                ? target_size.x - rotated_size.x : 0.0f, 0.0f);
+    float2 uv = (input.position.xy - origin) / image_size;
+    if (any(uv < 0.0f) || any(uv >= 1.0f))
+      return float4(meta.geometry.background[0], meta.geometry.background[1],
+                    meta.geometry.background[2], meta.geometry.background[3]);
+    if (meta.geometry.rotation == 2)
+      uv = float2(uv.y, 1.0f - uv.x);
+    else if (meta.geometry.rotation == 3)
+      uv = 1.0f - uv;
+    else if (meta.geometry.rotation == 4)
+      uv = float2(1.0f - uv.y, uv.x);
+    sample_position = uv * source_size;
+  }
   if (present_backbuffer_is_ms) {
     const uint count = source_ms.get_num_samples();
     for (uint i = 0; i < count; i++) {
-      output += source_ms.read(uint2(input.position.xy), i);
+      output += source_ms.read(uint2(sample_position), i);
     }
     output /= count;
   } else {
     output = present_backbuffer_size_matched
-      ? source.read(uint2(input.position.xy))
-      : source.sample(s, input.uv);
+      ? source.read(uint2(sample_position))
+      : source.sample(s, meta.geometry.source_width > 0
+                             ? sample_position / float2(source.get_width(), source.get_height())
+                             : input.uv);
   }
   float3 output_rgb = output.xyz;
   if (present_gamma_enabled && !present_hdr_pq && !present_with_hdr_metadata) {
@@ -582,15 +1816,11 @@ struct DXMTClearUintMetadata {
 [[kernel]] void cs_clear_texture3d_float(
     texture3d<float, access::write> tex [[texture(0)]],
     constant DXMTClearFloatMetadata& meta [[buffer(1)]],
-    uint2 pos [[thread_position_in_grid]]
+    constant uint& first_w_slice [[buffer(2)]],
+    uint3 pos [[thread_position_in_grid]]
 ) {
-  if (!all(pos < meta.size))
-    return;
-  auto depth = tex.get_depth();
-  for (uint i = 0; i < depth; i++) {
-    uint2 final_pos = meta.offset + pos;
-    tex.write(meta.value, uint3(final_pos.x, final_pos.y, i));
-  }
+  if (all(pos.xy < meta.size))
+    tex.write(meta.value, uint3(meta.offset + pos.xy, first_w_slice + pos.z));
 }
 
 [[kernel]] void cs_clear_texture2d_uint(
@@ -614,15 +1844,11 @@ struct DXMTClearUintMetadata {
 [[kernel]] void cs_clear_texture3d_uint(
     texture3d<uint, access::write> tex [[texture(0)]],
     constant DXMTClearUintMetadata& meta [[buffer(1)]],
-    uint2 pos [[thread_position_in_grid]]
+    constant uint& first_w_slice [[buffer(2)]],
+    uint3 pos [[thread_position_in_grid]]
 ) {
-  if (!all(pos < meta.size))
-    return;
-  auto depth = tex.get_depth();
-  for (uint i = 0; i < depth; i++) {
-    uint2 final_pos = meta.offset + pos;
-    tex.write(meta.value, uint3(final_pos.x, final_pos.y, i));
-  }
+  if (all(pos.xy < meta.size))
+    tex.write(meta.value, uint3(meta.offset + pos.xy, first_w_slice + pos.z));
 }
 
 [[kernel]] void cs_clear_tbuffer_float(
@@ -782,6 +2008,177 @@ struct DXMTStencilResolveOutput {
                                  : (value > next ? value : next);
   }
   return {value};
+}
+
+#include "../d3d12/d3d12_standard_swizzle_gpu.hpp"
+
+static uint d3d12_deposit_tile_bits(uint value, uint mask) {
+  uint result = 0;
+  for (uint bit = 1; bit < 65536; bit <<= 1) {
+    if (mask & bit) {
+      if (value & 1) result |= bit;
+      value >>= 1;
+    }
+  }
+  return result;
+}
+
+static ulong d3d12_standard_swizzle_offset(constant D3D12StandardSwizzleParams &p, uint3 coord) {
+  const ulong tile = p.first_tile +
+      ((ulong(coord.z / p.tile_depth) * p.tiles_y + coord.y / p.tile_height) * p.tiles_x +
+       coord.x / p.tile_width);
+  const uint inside = d3d12_deposit_tile_bits((coord.x % p.tile_width) * p.bytes_per_unit, p.x_mask) |
+                      d3d12_deposit_tile_bits(coord.y % p.tile_height, p.y_mask) |
+                      d3d12_deposit_tile_bits(coord.z % p.tile_depth, p.z_mask);
+  return tile * 65536ul + inside;
+}
+
+// Both kernels copy opaque format units. The native-texture blit before/after
+// these kernels supplies the linear staging representation, so BC blocks and
+// typed integer/float/sRGB texels keep their exact bits without shader sampling.
+kernel void d3d12_swizzle_import(device const uchar *canonical [[buffer(0)]],
+                                  device uchar *linear [[buffer(1)]],
+                                  constant D3D12StandardSwizzleParams &p [[buffer(2)]],
+                                  uint3 coord [[thread_position_in_grid]]) {
+  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord + uint3(p.origin_x, p.origin_y, p.origin_z));
+  const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch +
+                    ulong(coord.x) * p.bytes_per_unit;
+  for (uint byte = 0; byte < p.bytes_per_unit; ++byte) linear[row + byte] = canonical[tiled + byte];
+}
+
+kernel void d3d12_swizzle_export(device const uchar *linear [[buffer(0)]],
+                                  device uchar *canonical [[buffer(1)]],
+                                  constant D3D12StandardSwizzleParams &p [[buffer(2)]],
+                                  uint3 coord [[thread_position_in_grid]]) {
+  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord + uint3(p.origin_x, p.origin_y, p.origin_z));
+  const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch +
+                    ulong(coord.x) * p.bytes_per_unit;
+  for (uint byte = 0; byte < p.bytes_per_unit; ++byte) canonical[tiled + byte] = linear[row + byte];
+}
+
+// A descriptor-table UAV can name an inactive placed alias. Compare each
+// potential writer against a pre-pass canonical snapshot before exporting;
+// comparing to live canonical bytes would misclassify an active buffer alias.
+kernel void d3d12_swizzle_dirty(device const uchar *linear [[buffer(0)]],
+                                 device const uchar *canonical [[buffer(1)]],
+                                 constant D3D12StandardSwizzleParams &p [[buffer(2)]],
+                                 device atomic_uint *dirty [[buffer(3)]],
+                                 uint3 coord [[thread_position_in_grid]]) {
+  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord + uint3(p.origin_x, p.origin_y, p.origin_z));
+  const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch +
+                    ulong(coord.x) * p.bytes_per_unit;
+  for (uint byte = 0; byte < p.bytes_per_unit; ++byte)
+    if (linear[row + byte] != canonical[tiled + byte]) {
+      atomic_store_explicit(dirty, 1u, memory_order_relaxed);
+      break;
+    }
+}
+
+kernel void d3d12_swizzle_export_if_dirty(device const uchar *linear [[buffer(0)]],
+                                           device uchar *canonical [[buffer(1)]],
+                                           constant D3D12StandardSwizzleParams &p [[buffer(2)]],
+                                           device atomic_uint *dirty [[buffer(3)]],
+                                           uint3 coord [[thread_position_in_grid]]) {
+  if (!atomic_load_explicit(dirty, memory_order_relaxed) ||
+      coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord + uint3(p.origin_x, p.origin_y, p.origin_z));
+  const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch +
+                    ulong(coord.x) * p.bytes_per_unit;
+  for (uint byte = 0; byte < p.bytes_per_unit; ++byte) canonical[tiled + byte] = linear[row + byte];
+}
+
+// The two 4:2:2 DXGI formats store one four-byte pair in the STANDARD tile.
+// Their native backing is two RGBA8 pixels, with shared R/B and separate G.
+kernel void d3d12_swizzle_packed422_import(device const uchar *canonical [[buffer(0)]],
+                                            device uchar *linear [[buffer(1)]],
+                                            constant D3D12StandardSwizzleParams &p [[buffer(2)]],
+                                            uint3 coord [[thread_position_in_grid]]) {
+  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
+  const uint3 unit = coord + uint3(p.origin_x, p.origin_y, p.origin_z);
+  const ulong tiled = d3d12_standard_swizzle_offset(p, unit);
+  const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch + ulong(coord.x) * 8ul;
+  const uchar r = canonical[tiled + (p.packed422_variant ? 1 : 0)];
+  const uchar b = canonical[tiled + (p.packed422_variant ? 3 : 2)];
+  linear[row + 0] = r;
+  linear[row + 1] = canonical[tiled + (p.packed422_variant ? 0 : 1)];
+  linear[row + 2] = b;
+  linear[row + 3] = 255;
+  if (unit.x * 2 + 1 < p.physical_width) {
+    linear[row + 4] = r;
+    linear[row + 5] = canonical[tiled + (p.packed422_variant ? 2 : 3)];
+    linear[row + 6] = b;
+    linear[row + 7] = 255;
+  }
+}
+
+kernel void d3d12_swizzle_packed422_export(device const uchar *linear [[buffer(0)]],
+                                            device uchar *canonical [[buffer(1)]],
+                                            constant D3D12StandardSwizzleParams &p [[buffer(2)]],
+                                            uint3 coord [[thread_position_in_grid]]) {
+  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
+  const uint3 unit = coord + uint3(p.origin_x, p.origin_y, p.origin_z);
+  const ulong tiled = d3d12_standard_swizzle_offset(p, unit);
+  const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch + ulong(coord.x) * 8ul;
+  const uchar g1 = unit.x * 2 + 1 < p.physical_width
+      ? linear[row + 5] : canonical[tiled + (p.packed422_variant ? 2 : 3)];
+  if (p.packed422_variant) {
+    canonical[tiled + 0] = linear[row + 1];
+    canonical[tiled + 1] = linear[row + 0];
+    canonical[tiled + 2] = g1;
+    canonical[tiled + 3] = linear[row + 2];
+  } else {
+    canonical[tiled + 0] = linear[row + 0];
+    canonical[tiled + 1] = linear[row + 1];
+    canonical[tiled + 2] = linear[row + 2];
+    canonical[tiled + 3] = g1;
+  }
+}
+
+kernel void d3d12_swizzle_packed422_dirty(device const uchar *linear [[buffer(0)]],
+                                           device const uchar *canonical [[buffer(1)]],
+                                           constant D3D12StandardSwizzleParams &p [[buffer(2)]],
+                                           device atomic_uint *dirty [[buffer(3)]],
+                                           uint3 coord [[thread_position_in_grid]]) {
+  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
+  const uint3 unit = coord + uint3(p.origin_x, p.origin_y, p.origin_z);
+  const ulong tiled = d3d12_standard_swizzle_offset(p, unit);
+  const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch + ulong(coord.x) * 8ul;
+  const bool changed = p.packed422_variant
+      ? linear[row + 1] != canonical[tiled + 0] || linear[row + 0] != canonical[tiled + 1] ||
+        linear[row + 2] != canonical[tiled + 3] ||
+        (unit.x * 2 + 1 < p.physical_width && linear[row + 5] != canonical[tiled + 2])
+      : linear[row + 0] != canonical[tiled + 0] || linear[row + 1] != canonical[tiled + 1] ||
+        linear[row + 2] != canonical[tiled + 2] ||
+        (unit.x * 2 + 1 < p.physical_width && linear[row + 5] != canonical[tiled + 3]);
+  if (changed) atomic_store_explicit(dirty, 1u, memory_order_relaxed);
+}
+
+kernel void d3d12_swizzle_packed422_export_if_dirty(device const uchar *linear [[buffer(0)]],
+                                                     device uchar *canonical [[buffer(1)]],
+                                                     constant D3D12StandardSwizzleParams &p [[buffer(2)]],
+                                                     device atomic_uint *dirty [[buffer(3)]],
+                                                     uint3 coord [[thread_position_in_grid]]) {
+  if (!atomic_load_explicit(dirty, memory_order_relaxed) ||
+      coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
+  const uint3 unit = coord + uint3(p.origin_x, p.origin_y, p.origin_z);
+  const ulong tiled = d3d12_standard_swizzle_offset(p, unit);
+  const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch + ulong(coord.x) * 8ul;
+  const uchar g1 = unit.x * 2 + 1 < p.physical_width
+      ? linear[row + 5] : canonical[tiled + (p.packed422_variant ? 2 : 3)];
+  if (p.packed422_variant) {
+    canonical[tiled + 0] = linear[row + 1];
+    canonical[tiled + 1] = linear[row + 0];
+    canonical[tiled + 2] = g1;
+    canonical[tiled + 3] = linear[row + 2];
+  } else {
+    canonical[tiled + 0] = linear[row + 0];
+    canonical[tiled + 1] = linear[row + 1];
+    canonical[tiled + 2] = linear[row + 2];
+    canonical[tiled + 3] = g1;
+  }
 }
 
 // Keep the acceleration-structure helper kernels in the same metallib as the existing

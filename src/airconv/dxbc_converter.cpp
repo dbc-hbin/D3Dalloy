@@ -3,17 +3,21 @@
 #include "DXBCParser/ShaderBinary.h"
 #include "airconv_error.hpp"
 #include "dxil_converter.hpp"
+#include "dxil_pipeline.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/FMF.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <bit>
 #include <memory>
 #include <string>
@@ -24,6 +28,8 @@
 #include "shader_common.hpp"
 
 #include "airconv_context.hpp"
+#include "msaa_pixel.hpp"
+#include "msaa_vertex.hpp"
 
 #include "ftl.hpp"
 
@@ -53,6 +59,31 @@ static void reportError(llvm::Error error, llvm::raw_ostream &errorOut) {
   );
   stream.flush();
   errorOut << message << '\0';
+}
+
+/**
+ * Multi-stage pipeline function with at least one Shader Model 6.x stage: the DXIL
+ * front end builds it through the same converters (dxil_pipeline.cpp). Returns -1 when
+ * both stages are DXBC so the caller continues on the SM 5.x path.
+ */
+static int compileDXILPipelineStage(
+  dxmt::dxil::PipelineKind kind, sm50_shader_t first, sm50_shader_t second,
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *args, const char *name, sm50_bitcode_t *ppBitcode,
+  SM50ErrorInternal *errorObj, llvm::raw_ostream &errorOut, sm50_error_t *ppError
+) {
+  if (!dxmt::dxil::IsDXILShader(first) && !dxmt::dxil::IsDXILShader(second))
+    return -1;
+  auto compiled = dxmt::dxil::CompilePipelineStage(
+    kind, (dxmt::dxbc::SM50ShaderInternal *)first, (dxmt::dxbc::SM50ShaderInternal *)second, args, name
+  );
+  if (!compiled) {
+    reportError(compiled.takeError(), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
+  delete errorObj;
+  *ppBitcode = (sm50_bitcode_t)compiled->release();
+  return 0;
 }
 
 namespace dxmt::dxbc {
@@ -253,6 +284,239 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
   }
 }
 
+llvm::Expected<StreamOutputCaptureRun> resolve_stream_output_capture(
+  const SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA &capture, const SM50_SO_CAPTURE_ELEMENT &element,
+  uint32_t reg, uint32_t mask
+) {
+  auto describe = [&] {
+    return std::string(element.semantic_name) + std::to_string(element.semantic_index);
+  };
+  mask &= 0xFu;
+  if (!mask)
+    return llvm::make_error<UnsupportedFeature>("stream output capture element " + describe() + " has no components");
+  if (element.component_count == 0 || element.component_count > 4)
+    return llvm::make_error<UnsupportedFeature>(
+      "stream output capture element " + describe() + " has an invalid component count"
+    );
+  uint32_t first = std::countr_zero(mask) + element.start_component;
+  uint32_t range = ((1u << element.component_count) - 1u) << first;
+  if (first + element.component_count > 4 || (range & mask) != range)
+    return llvm::make_error<UnsupportedFeature>(
+      "stream output capture element " + describe() + " selects components outside the output mask"
+    );
+  if (element.dword_offset > capture.record_dwords ||
+      element.component_count > capture.record_dwords - element.dword_offset)
+    return llvm::make_error<UnsupportedFeature>(
+      "stream output capture element " + describe() + " does not fit the capture record"
+    );
+  return StreamOutputCaptureRun{
+    .reg = reg,
+    .component = first,
+    .count = element.component_count,
+    .dword_offset = element.dword_offset,
+  };
+}
+
+VertexIndexPullArgs define_vertex_index_pull(air::FunctionSignatureBuilder &func_signature) {
+  VertexIndexPullArgs args;
+  args.control = func_signature.DefineInput(air::ArgumentBindingBuffer{
+    .buffer_size = {},
+    .location_index = SM50_BINDING_INDEX_VERTEX_INDEX_CONTROL,
+    .array_size = 0,
+    .memory_access = air::MemoryAccess::read,
+    .address_space = air::AddressSpace::constant,
+    .type = air::MSLUint{},
+    .arg_name = "vertex_index_control",
+    .raster_order_group = {}
+  });
+  args.indices = func_signature.DefineInput(air::ArgumentBindingBuffer{
+    .buffer_size = {},
+    .location_index = SM50_BINDING_INDEX_VERTEX_INDICES,
+    .array_size = 0,
+    .memory_access = air::MemoryAccess::read,
+    .address_space = air::AddressSpace::device,
+    .type = air::MSLUshort{},
+    .arg_name = "vertex_indices",
+    .raster_order_group = {}
+  });
+  return args;
+}
+
+uint32_t define_pipeline_statistics(air::FunctionSignatureBuilder &func_signature) {
+  return func_signature.DefineInput(air::ArgumentBindingBuffer{
+    .buffer_size = {},
+    .location_index = SM50_BINDING_INDEX_PIPELINE_STATISTICS,
+    .array_size = 0,
+    .memory_access = air::MemoryAccess::read_write,
+    .address_space = air::AddressSpace::device,
+    .type = air::MSLUint{},
+    .arg_name = "pipeline_statistics",
+    .raster_order_group = {}
+  });
+}
+
+void increment_pipeline_statistics(
+  llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Function *function,
+  uint32_t argument, uint32_t low_word
+) {
+  add_pipeline_statistics(builder, air, function, argument, low_word, builder.getInt32(1));
+}
+
+void add_pipeline_statistics(
+  llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Function *function,
+  uint32_t argument, uint32_t low_word, llvm::Value *amount
+) {
+  /* Each D3D12 UINT64 is a pair of adjacent atomic uint32 words. Increment
+   * high exactly once when low wraps, including with concurrent invocations. */
+  auto *words = function->getArg(argument);
+  auto *low = builder.CreateConstInBoundsGEP1_32(builder.getInt32Ty(), words, low_word);
+  auto *previous = air.CreateAtomicRMW(llvm::AtomicRMWInst::Add, low, amount);
+  auto *carry = llvm::BasicBlock::Create(builder.getContext(), "statistics_carry", function);
+  auto *body = llvm::BasicBlock::Create(builder.getContext(), "statistics_body", function);
+  // The add wrapped iff the new low word is below the amount added.
+  builder.CreateCondBr(builder.CreateICmpULT(builder.CreateAdd(previous, amount), amount), carry, body);
+  builder.SetInsertPoint(carry);
+  auto *high = builder.CreateConstInBoundsGEP1_32(builder.getInt32Ty(), words, low_word + 1);
+  air.CreateAtomicRMW(llvm::AtomicRMWInst::Add, high, builder.getInt32(1));
+  builder.CreateBr(body);
+  builder.SetInsertPoint(body);
+}
+
+VertexIndexPullArgs define_stream_output_capture(
+  air::FunctionSignatureBuilder &func_signature, IRValue &epilogue, std::vector<StreamOutputCaptureRun> runs,
+  uint32_t record_dwords
+) {
+  auto args = define_vertex_index_pull(func_signature);
+  auto scratch_arg = func_signature.DefineInput(air::ArgumentBindingBuffer{
+    .buffer_size = {},
+    .location_index = SM50_BINDING_INDEX_SO_CAPTURE_SCRATCH,
+    .array_size = 0,
+    .memory_access = air::MemoryAccess::read_write,
+    .address_space = air::AddressSpace::device,
+    .type = air::MSLUint{},
+    .arg_name = "so_capture_scratch",
+    .raster_order_group = {}
+  });
+  epilogue >> [=, runs = std::move(runs)](pvalue value) -> IRValue {
+    return make_irvalue([=](context ctx) -> pvalue {
+      auto &builder = ctx.builder;
+      auto *int_ty = ctx.types._int;
+      auto *control = ctx.function->getArg(args.control);
+      auto *scratch = ctx.function->getArg(scratch_arg);
+      auto load_control = [&](unsigned index) {
+        return builder.CreateLoad(int_ty, builder.CreateConstInBoundsGEP1_32(int_ty, control, index));
+      };
+      auto *positions_per_instance = load_control(offsetof(SM50_SO_CAPTURE_CONTROL, positions_per_instance) / 4);
+      auto *first_position = load_control(offsetof(SM50_SO_CAPTURE_CONTROL, first_position) / 4);
+      auto *record_count = load_control(offsetof(SM50_SO_CAPTURE_CONTROL, record_count) / 4);
+      /* The key is the IA position (see SM50_SO_CAPTURE_CONTROL); the arithmetic
+       * wraps, so one unsigned compare rejects keys on both sides. */
+      auto *record = builder.CreateSub(
+        builder.CreateAdd(builder.CreateMul(ctx.resource.instance_id, positions_per_instance), ctx.resource.so_capture_key),
+        first_position
+      );
+      auto *claim_bb = llvm::BasicBlock::Create(ctx.llvm, "so_capture_claim", ctx.function);
+      auto *capture_bb = llvm::BasicBlock::Create(ctx.llvm, "so_capture", ctx.function);
+      auto *done_bb = llvm::BasicBlock::Create(ctx.llvm, "so_capture_done", ctx.function);
+      builder.CreateCondBr(builder.CreateICmpULT(record, record_count), claim_bb, done_bb);
+
+      /* One invocation per key owns the record: a vertex shaded more than once
+       * (with possibly different outputs, e.g. UAV-dependent) never mixes the
+       * components of two invocations. */
+      builder.SetInsertPoint(claim_bb);
+      auto *record64 = builder.CreateZExt(record, builder.getInt64Ty());
+      auto *claim_index = builder.CreateAdd(
+        builder.CreateMul(builder.CreateZExt(record_count, builder.getInt64Ty()), builder.getInt64(record_dwords)),
+        record64
+      );
+      auto *claim = builder.CreateAtomicCmpXchg(
+        builder.CreateGEP(int_ty, scratch, {claim_index}), builder.getInt32(0), builder.getInt32(1), llvm::MaybeAlign(),
+        llvm::AtomicOrdering::Monotonic, llvm::AtomicOrdering::Monotonic
+      );
+      builder.CreateCondBr(builder.CreateExtractValue(claim, 1), capture_bb, done_bb);
+
+      builder.SetInsertPoint(capture_bb);
+      auto *record_base = builder.CreateMul(record64, builder.getInt64(record_dwords));
+      auto *registers = ctx.resource.output.ptr_int4;
+      auto *registers_type = registers->getType()->getNonOpaquePointerElementType();
+      for (auto &run : runs) {
+        for (uint32_t i = 0; i < run.count; i++) {
+          auto *source = builder.CreateGEP(
+            registers_type, registers,
+            {builder.getInt32(0), builder.getInt32(run.reg), builder.getInt32(run.component + i)}
+          );
+          auto *dword = builder.CreateAdd(record_base, builder.getInt64(run.dword_offset + i));
+          builder.CreateStore(builder.CreateLoad(int_ty, source), builder.CreateGEP(int_ty, scratch, {dword}));
+        }
+      }
+      builder.CreateBr(done_bb);
+      builder.SetInsertPoint(done_bb);
+      return value;
+    });
+  };
+  return args;
+}
+
+void apply_vertex_index_pull(
+  llvm::IRBuilder<> &builder, llvm::Function *function, const VertexIndexPullArgs &args, io_binding_map &resource,
+  uint32_t control_dword_offset
+) {
+  /* Native vertex ids are IA positions, from a non-indexed draw or SO position
+   * buffer. The application's index value becomes the D3D
+   * SV_VertexID and, with BaseVertexLocation added, the vertex fetch index. */
+  auto *int_ty = builder.getInt32Ty();
+  auto *short_ty = builder.getInt16Ty();
+  auto *control = function->getArg(args.control);
+  auto *indices = function->getArg(args.indices);
+  auto load_control = [&](unsigned index) {
+    return builder.CreateLoad(
+      int_ty, builder.CreateConstInBoundsGEP1_32(int_ty, control, control_dword_offset + index)
+    );
+  };
+  auto *key = resource.vertex_id;
+  auto *index_size = load_control(offsetof(SM50_INDEX_PULL_CONTROL, index_size) / 4);
+  auto *index_first = load_control(offsetof(SM50_INDEX_PULL_CONTROL, index_first) / 4);
+  auto *base_vertex = load_control(offsetof(SM50_INDEX_PULL_CONTROL, base_vertex) / 4);
+  auto *entry = builder.GetInsertBlock();
+  auto *pull_bb = llvm::BasicBlock::Create(builder.getContext(), "vertex_index_pull", function);
+  auto *join_bb = llvm::BasicBlock::Create(builder.getContext(), "vertex_index_join", function);
+  builder.CreateCondBr(builder.CreateICmpNE(index_size, builder.getInt32(0)), pull_bb, join_bb);
+
+  builder.SetInsertPoint(pull_bb);
+  auto *wide = builder.CreateICmpEQ(index_size, builder.getInt32(4));
+  auto *word = builder.CreateAdd(index_first, builder.CreateSelect(wide, builder.CreateShl(key, 1), key));
+  auto load_word = [&](llvm::Value *at) {
+    return builder.CreateZExt(
+      builder.CreateLoad(short_ty, builder.CreateGEP(short_ty, indices, {builder.CreateZExt(at, builder.getInt64Ty())})),
+      int_ty
+    );
+  };
+  auto *low = load_word(word);
+  auto *high_bb = llvm::BasicBlock::Create(builder.getContext(), "vertex_index_high", function);
+  auto *merge_bb = llvm::BasicBlock::Create(builder.getContext(), "vertex_index_merge", function);
+  auto *low_end = builder.GetInsertBlock();
+  builder.CreateCondBr(wide, high_bb, merge_bb);
+  builder.SetInsertPoint(high_bb);
+  auto *combined = builder.CreateOr(low, builder.CreateShl(load_word(builder.CreateAdd(word, builder.getInt32(1))), 16));
+  builder.CreateBr(merge_bb);
+  builder.SetInsertPoint(merge_bb);
+  auto *index = builder.CreatePHI(int_ty, 2);
+  index->addIncoming(low, low_end);
+  index->addIncoming(combined, high_bb);
+  auto *with_base = builder.CreateAdd(index, base_vertex);
+  builder.CreateBr(join_bb);
+
+  builder.SetInsertPoint(join_bb);
+  auto *vertex_id = builder.CreatePHI(int_ty, 2);
+  vertex_id->addIncoming(key, entry);
+  vertex_id->addIncoming(index, merge_bb);
+  auto *vertex_id_with_base = builder.CreatePHI(int_ty, 2);
+  vertex_id_with_base->addIncoming(resource.vertex_id_with_base, entry);
+  vertex_id_with_base->addIncoming(with_base, merge_bb);
+  resource.vertex_id = vertex_id;
+  resource.vertex_id_with_base = vertex_id_with_base;
+}
+
 RegisterComponentType
 component_type_from_pixel_format(air::MTLPixelFormat format) {
   switch (format) {
@@ -368,6 +632,10 @@ llvm::Error convert_dxbc_pixel_shader(
   }
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *stats = nullptr;
+  args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &stats);
+  SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel = nullptr;
+  args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(pArgs, &msaa_pixel);
 
   IREffect prologue([](auto) { return std::monostate(); });
   IRValue epilogue([](struct context ctx) -> pvalue {
@@ -385,7 +653,7 @@ llvm::Error convert_dxbc_pixel_shader(
     SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
     sig_ctx.dual_source_blending = pso_dual_source_blending;
     sig_ctx.disable_depth_output = pso_disable_depth_output;
-    sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
+    sig_ctx.pull_mode_reg_mask = msaa_pixel ? 0xffffffffu : shader_info->pull_mode_reg_mask;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
       memcpy(sig_ctx.pixel_formats, pso_pixel_formats, sizeof(sig_ctx.pixel_formats));
@@ -408,6 +676,7 @@ llvm::Error convert_dxbc_pixel_shader(
     };
   }
 
+  const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
                                    rootsig->bytecode_length
@@ -469,6 +738,8 @@ llvm::Error convert_dxbc_pixel_shader(
   if (auto err = prologue.build(ctx).takeError()) {
     return err;
   }
+  if (stats)
+    increment_pipeline_statistics(builder, air, function, stats_arg, 14);
   auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
@@ -512,6 +783,8 @@ llvm::Error convert_dxbc_compute_shader(
   }
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *stats = nullptr;
+  args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &stats);
 
   IREffect prologue([](auto) { return std::monostate(); });
   IRValue epilogue([](struct context ctx) -> pvalue {
@@ -532,6 +805,7 @@ llvm::Error convert_dxbc_compute_shader(
     }
   }
 
+  const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D11_SB_COMPUTE_SHADER, rootsig->bytecode,
                                    rootsig->bytecode_length
@@ -577,6 +851,8 @@ llvm::Error convert_dxbc_compute_shader(
   if (auto err = prologue.build(ctx).takeError()) {
     return err;
   }
+  if (stats)
+    increment_pipeline_statistics(builder, air, function, stats_arg, 20);
   auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
@@ -627,6 +903,45 @@ llvm::Error convert_dxbc_vertex_shader(
   }
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *stats = nullptr;
+  args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &stats);
+  SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *so_capture = nullptr;
+  args_get_data<SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE, SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA>(
+      pArgs, &so_capture
+  );
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *index_pull = nullptr;
+  args_get_data<SM50_SHADER_D3D12_INDEX_PULL, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &index_pull);
+  SM50_SHADER_D3D12_MSAA_VERTEX_DATA *msaa_vertex = nullptr;
+  args_get_data<SM50_SHADER_D3D12_MSAA_VERTEX, SM50_SHADER_D3D12_MSAA_VERTEX_DATA>(pArgs, &msaa_vertex);
+  if (index_pull && (so_capture || vertex_so) &&
+      !(msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE && so_capture && !vertex_so))
+    return llvm::make_error<UnsupportedFeature>("standalone index pulling and stream output on the same vertex shader");
+  std::vector<StreamOutputCaptureRun> so_capture_runs;
+  if (so_capture) {
+    if (vertex_so)
+      return llvm::make_error<UnsupportedFeature>("D3D11 and D3D12 stream output on the same vertex shader");
+    for (uint32_t i = 0; i < so_capture->num_elements; i++) {
+      auto &element = so_capture->elements[i];
+      if (!element.semantic_name)
+        return llvm::make_error<UnsupportedFeature>("stream output capture element has no semantic name");
+      auto output = std::find_if(
+          pShaderInternal->output_signature.begin(), pShaderInternal->output_signature.end(),
+          [&](const Signature &sig) {
+            return sig.semanticIndex() == element.semantic_index &&
+                   llvm::StringRef(sig.semanticName()).equals_insensitive(element.semantic_name);
+          }
+      );
+      if (output == pShaderInternal->output_signature.end())
+        return llvm::make_error<UnsupportedFeature>(
+            "stream output capture element " + std::string(element.semantic_name) +
+            std::to_string(element.semantic_index) + " is not a vertex shader output"
+        );
+      auto run = resolve_stream_output_capture(*so_capture, element, output->reg(), output->mask());
+      if (!run)
+        return run.takeError();
+      so_capture_runs.push_back(*run);
+    }
+  }
 
   IREffect prologue([](auto) { return std::monostate(); });
   IRValue epilogue([](struct context ctx) -> pvalue {
@@ -643,6 +958,7 @@ llvm::Error convert_dxbc_vertex_shader(
   {
     SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
     sig_ctx.ia_layout = ia_layout;
+    sig_ctx.dense_vertex_table = rootsig != nullptr;
     sig_ctx.skip_vertex_output = rasterization_disabled;
     for (auto &p : pShaderInternal->signature_handlers) {
       p(sig_ctx);
@@ -651,7 +967,7 @@ llvm::Error convert_dxbc_vertex_shader(
     for (auto& out : pShaderInternal->output_signature) {
       if(out.isSystemValue()) continue;
       func_signature.DefineOutput(air::OutputVertex{
-        .user = out.consistentAttributeName(),
+        .user = out.varyingAttributeName(),
         .type = to_msl_type(out.componentType()),
       });
     }
@@ -709,6 +1025,12 @@ llvm::Error convert_dxbc_vertex_shader(
       return nullptr;
     });
   }
+  VertexIndexPullArgs vertex_index_args;
+  if (so_capture)
+    vertex_index_args =
+      define_stream_output_capture(func_signature, epilogue, std::move(so_capture_runs), so_capture->record_dwords);
+  else if (index_pull)
+    vertex_index_args = define_vertex_index_pull(func_signature);
 
   uint32_t vertex_idx = func_signature.DefineInput(air::InputVertexID{});
   uint32_t base_vertex_idx = func_signature.DefineInput(air::InputBaseVertex{});
@@ -717,12 +1039,13 @@ llvm::Error convert_dxbc_vertex_shader(
     func_signature.DefineInput(air::InputBaseInstance{});
 
   uint32_t clip_distance_out_idx = ~0u;
-  if (pShaderInternal->clip_distance_scalars.size()) {
+  if (!rasterization_disabled && pShaderInternal->clip_distance_scalars.size()) {
     clip_distance_out_idx = func_signature.DefineOutput(
       air::OutputClipDistance{pShaderInternal->clip_distance_scalars.size()}
     );
   };
 
+  const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_VERTEX_SHADER, rootsig->bytecode,
                                    rootsig->bytecode_length
@@ -802,11 +1125,21 @@ llvm::Error convert_dxbc_vertex_shader(
       .pso_sample_mask = 0xffffffff,
       .shader_type = pShaderInternal->shader_type,
       .metal_version = metal_version,
+      .capture_raw_distance_output = msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE,
   };
 
+  if (so_capture)
+    resource_map.so_capture_key = resource_map.vertex_id;
+  if (so_capture || index_pull)
+    apply_vertex_index_pull(
+      builder, function, vertex_index_args, resource_map,
+      so_capture ? offsetof(SM50_SO_CAPTURE_CONTROL, index_size) / 4 : 0
+    );
   if (auto err = prologue.build(ctx).takeError()) {
     return err;
   }
+  if (stats)
+    increment_pipeline_statistics(builder, air, function, stats_arg, 4);
   auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
@@ -820,7 +1153,8 @@ llvm::Error convert_dxbc_vertex_shader(
   }
   auto value = epilogue_result.get();
 
-  if (pShaderInternal->clip_distance_scalars.size()) {
+  /* A rasterization-disabled vertex function returns void: no clip distances. */
+  if (clip_distance_out_idx != ~0u) {
     auto clip_distance_ty = llvm::ArrayType::get(
       types._float, pShaderInternal->clip_distance_scalars.size()
     );
@@ -1277,10 +1611,14 @@ pRefl->ConstanttBufferTableBindIndex =
       );
     }
     pRefl->GeometryShader.Primitive = shader->gs_input_primitive;
+    pRefl->GeometryShader.MaxOutputVertexCount = uint16_t(shader->gs_max_vertex_output);
+    pRefl->GeometryShader.OutputTopology = uint8_t(shader->gs_output_topology);
+    pRefl->GeometryShader.InstanceCount = uint8_t(shader->gs_instance_count);
   }
   if (shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
     pRefl->PixelShader.ValidRenderTargets = shader->pso_valid_output_reg_mask;
     pRefl->PixelShader.HasCoverageOutput = shader->ps_has_coverage_output;
+    pRefl->PixelShader.SampleFrequency = shader->ps_sample_frequency;
   }
   pRefl->NumOutputElement = shader->max_output_register;
   pRefl->ArgumentTableQwords = shader->shader_info.binding_table.Size();
@@ -1427,6 +1765,207 @@ AIRCONV_API void SM50Destroy(sm50_shader_t pShader) {
   delete (dxmt::dxbc::SM50ShaderInternal *)pShader;
 }
 
+// A raster-ordered buffer reached through a nested argument buffer does not
+// activate Metal's fragment ROG scheduler by itself. An actual read/write of
+// a same-ROG texture does; the scratch texel is private to the physical pixel,
+// render layer, and native sample. It is bound outside the application's root
+// signature, so unbounded descriptor tables retain their layout and range.
+static llvm::Error activateRasterOrderedBuffers(llvm::Module &module, unsigned samples,
+                                                uint32_t sampleMask) {
+  using namespace llvm;
+  if (samples != 1 && samples != 2 && samples != 4 && samples != 8)
+    return createStringError(inconvertibleErrorCode(), "ROV marker: invalid native sample count");
+  auto *fragments = module.getNamedMetadata("air.fragment");
+  if (!fragments || fragments->getNumOperands() != 1)
+    return createStringError(inconvertibleErrorCode(), "ROV marker: missing native fragment");
+  auto *signature = fragments->getOperand(0);
+  auto *original = dyn_cast<Function>(cast<ValueAsMetadata>(signature->getOperand(0))->getValue());
+  auto *inputs = dyn_cast<MDTuple>(signature->getOperand(2));
+  if (!original || !inputs || inputs->getNumOperands() != original->arg_size())
+    return createStringError(inconvertibleErrorCode(), "ROV marker: invalid fragment signature");
+  CallInst *logicalCall = nullptr;
+  Value *logicalActive = nullptr;
+  for (auto &block : *original)
+    for (auto &instruction : block)
+      if (auto *call = dyn_cast<CallInst>(&instruction))
+        if (auto *metadata = call->getMetadata("dxmt.rov.logical_active")) {
+          auto *argument = metadata->getNumOperands() == 1
+            ? mdconst::dyn_extract<ConstantInt>(metadata->getOperand(0)) : nullptr;
+          if (logicalCall || !argument || !argument->getType()->isIntegerTy(32))
+            return createStringError(inconvertibleErrorCode(), "ROV marker: invalid logical coverage");
+          const auto argument_index = argument->getZExtValue();
+          if (argument_index >= call->arg_size())
+            return createStringError(inconvertibleErrorCode(), "ROV marker: invalid logical coverage");
+          logicalActive = call->getArgOperand(argument_index);
+          if (!logicalActive->getType()->isIntegerTy(1))
+            return createStringError(inconvertibleErrorCode(), "ROV marker: invalid logical coverage");
+          logicalCall = call;
+          call->setMetadata("dxmt.rov.logical_active", nullptr);
+        }
+
+  LLVMContext &context = module.getContext();
+  auto *i32 = Type::getInt32Ty(context);
+  auto *float4 = FixedVectorType::get(Type::getFloatTy(context), 4);
+  auto *textureType = StructType::getTypeByName(context, "struct._texture_2d_array_t");
+  if (!textureType) textureType = StructType::create(context, "struct._texture_2d_array_t");
+  auto *texturePointer = textureType->getPointerTo(1);
+  auto *arrayType = ArrayType::get(texturePointer, samples);
+  Type *bindingType = samples == 1 ? static_cast<Type *>(texturePointer)
+                                   : arrayType->getPointerTo();
+
+  SmallVector<Type *, 24> parameters;
+  SmallVector<Metadata *, 24> attributes(inputs->op_begin(), inputs->op_end());
+  for (auto &arg : original->args()) parameters.push_back(arg.getType());
+  const unsigned textureArg = parameters.size();
+  parameters.push_back(bindingType);
+  attributes.push_back(MDTuple::get(context, {
+    ConstantAsMetadata::get(ConstantInt::get(i32, textureArg)),
+    MDString::get(context, "air.texture"), MDString::get(context, "air.location_index"),
+    ConstantAsMetadata::get(ConstantInt::get(i32, 31)),
+    ConstantAsMetadata::get(ConstantInt::get(i32, samples)),
+    MDString::get(context, "air.read_write"), MDString::get(context, "air.raster_order_group"),
+    ConstantAsMetadata::get(ConstantInt::get(i32, 1)), MDString::get(context, "air.arg_type_name"),
+    MDString::get(context, samples == 1 ? "texture2d_array<uint, read_write>" :
+      ("array<texture2d_array<uint, read_write>, " + std::to_string(samples) + ">")),
+    MDString::get(context, "air.arg_name"), MDString::get(context, "rov_marker")
+  }));
+  auto findBuiltin = [&](StringRef name) {
+    for (unsigned i = 0; i < inputs->getNumOperands(); ++i) {
+      auto *node = cast<MDNode>(inputs->getOperand(i));
+      if (auto *kind = dyn_cast<MDString>(node->getOperand(1)); kind && kind->getString() == name)
+        return i;
+    }
+    return ~0u;
+  };
+  auto addBuiltin = [&](StringRef name, StringRef type, StringRef arg, Type *valueType) {
+    unsigned index = parameters.size();
+    parameters.push_back(valueType);
+    attributes.push_back(MDTuple::get(context, {
+      ConstantAsMetadata::get(ConstantInt::get(i32, index)),
+      MDString::get(context, name), MDString::get(context, "air.arg_type_name"),
+      MDString::get(context, type), MDString::get(context, "air.arg_name"),
+      MDString::get(context, arg)
+    }));
+    return index;
+  };
+  unsigned positionArg = findBuiltin("air.position");
+  if (positionArg == ~0u) {
+    positionArg = parameters.size();
+    parameters.push_back(float4);
+    attributes.push_back(MDTuple::get(context, {
+      ConstantAsMetadata::get(ConstantInt::get(i32, positionArg)),
+      MDString::get(context, "air.position"), MDString::get(context, "air.center"),
+      MDString::get(context, "air.no_perspective"), MDString::get(context, "air.arg_type_name"),
+      MDString::get(context, "float4"), MDString::get(context, "air.arg_name"),
+      MDString::get(context, "rov_native_position")
+    }));
+  }
+  unsigned layerArg = findBuiltin("air.render_target_array_index");
+  if (layerArg == ~0u)
+    layerArg = addBuiltin("air.render_target_array_index", "uint", "rov_native_layer", i32);
+  unsigned sampleArg = findBuiltin("air.sample_id");
+  if (samples > 1 && sampleArg == ~0u)
+    sampleArg = addBuiltin("air.sample_id", "uint", "rov_native_sample", i32);
+
+  auto name = original->getName().str();
+  original->setName(name + ".rov_body");
+  auto *wrapper = Function::Create(FunctionType::get(original->getReturnType(), parameters, false),
+    Function::ExternalLinkage, name, module);
+  wrapper->setCallingConv(original->getCallingConv());
+  original->setLinkage(Function::InternalLinkage);
+  if (samples > 1)
+    wrapper->addParamAttr(textureArg, Attribute::getWithByValType(context, arrayType));
+
+  SmallVector<Metadata *, 3> fields(signature->op_begin(), signature->op_end());
+  fields[0] = ValueAsMetadata::get(wrapper);
+  fields[2] = MDTuple::get(context, attributes);
+  fragments->setOperand(0, MDTuple::get(context, fields));
+
+  // Keep the native fragment body in the native entry. Metal cannot always
+  // compile a raster-ordered access before a separate internal fragment-body
+  // call; splitting here also avoids moving derivatives into divergent code.
+  for (unsigned i = 0; i < original->arg_size(); ++i)
+    original->getArg(i)->replaceAllUsesWith(wrapper->getArg(i));
+  wrapper->getBasicBlockList().splice(wrapper->begin(), original->getBasicBlockList());
+  original->eraseFromParent();
+  // Virtual sample APP computes its logical coverage before its body call.
+  // Ordinary shaders mark at their entry, before any application UAV access.
+  auto *continuation = logicalCall ? logicalCall->getParent()->splitBasicBlock(
+    logicalCall->getIterator(), "rov_body") : wrapper->getEntryBlock().splitBasicBlock(
+      wrapper->getEntryBlock().begin(), "rov_body");
+  auto *entry = continuation->getSinglePredecessor();
+  auto *mark = BasicBlock::Create(context, "rov_mark", wrapper, continuation);
+  entry->getTerminator()->eraseFromParent();
+  IRBuilder<> builder(entry);
+  auto helper = module.getOrInsertFunction("air.simd_is_helper_thread",
+    FunctionType::get(builder.getInt1Ty(), {}, false));
+  Value *active = builder.CreateNot(builder.CreateCall(helper));
+  if (logicalCall) active = builder.CreateAnd(active, logicalActive);
+  else if (sampleMask != 0xffffffffu) {
+    Value *nativeSample = samples > 1 ? static_cast<Value *>(wrapper->getArg(sampleArg))
+                                      : builder.getInt32(0);
+    active = builder.CreateAnd(active, builder.CreateICmpNE(builder.CreateAnd(
+      builder.CreateLShr(builder.getInt32(sampleMask), nativeSample), builder.getInt32(1)),
+      builder.getInt32(0)));
+  }
+  builder.CreateCondBr(active, mark, continuation);
+  builder.SetInsertPoint(mark);
+  auto *texture = samples == 1 ? static_cast<Value *>(wrapper->getArg(textureArg)) :
+    builder.CreateLoad(texturePointer, builder.CreateInBoundsGEP(arrayType,
+      wrapper->getArg(textureArg), {builder.getInt32(0), wrapper->getArg(sampleArg)}));
+  auto *position = wrapper->getArg(positionArg);
+  Value *coordinate = PoisonValue::get(FixedVectorType::get(i32, 2));
+  for (unsigned axis = 0; axis < 2; ++axis)
+    coordinate = builder.CreateInsertElement(coordinate,
+      builder.CreateFPToUI(builder.CreateExtractElement(position, builder.getInt32(axis)), i32),
+      builder.getInt32(axis));
+  auto *rgba = FixedVectorType::get(i32, 4);
+  auto *readResult = StructType::get(context, {rgba, Type::getInt8Ty(context)});
+  auto *version = module.getNamedMetadata("air.version");
+  auto *minor = version && version->getNumOperands() == 1 &&
+      version->getOperand(0)->getNumOperands() == 3
+    ? mdconst::dyn_extract<ConstantInt>(version->getOperand(0)->getOperand(1)) : nullptr;
+  if (!minor)
+    return createStringError(inconvertibleErrorCode(), "ROV marker: missing AIR version");
+  // AIR 2.8's array-texture read carries a sampler and a uint2 offset;
+  // AIR 2.7 uses the five-argument form. Mismatching the version can load
+  // normally but crash the Metal ShaderValidation PSO compiler.
+  const bool extendedRead = minor->getZExtValue() >= 8;
+  SmallVector<Type *, 7> readTypes{texturePointer};
+  SmallVector<Value *, 7> readArgs{texture};
+  if (extendedRead) {
+    auto *samplerType = StructType::getTypeByName(context, "struct._sampler_t");
+    if (!samplerType) samplerType = StructType::create(context, "struct._sampler_t");
+    auto sampler = module.getOrInsertFunction("air.get_read_sampler",
+      FunctionType::get(samplerType->getPointerTo(2), {}, false));
+    readTypes.push_back(samplerType->getPointerTo(2));
+    readArgs.push_back(builder.CreateCall(sampler));
+  }
+  readTypes.append({coordinate->getType(), i32});
+  readArgs.append({coordinate, wrapper->getArg(layerArg)});
+  if (extendedRead) {
+    readTypes.push_back(coordinate->getType());
+    readArgs.push_back(Constant::getNullValue(coordinate->getType()));
+  }
+  readTypes.append({i32, i32});
+  readArgs.append({builder.getInt32(0), builder.getInt32(3)});
+  auto read = module.getOrInsertFunction("air.read_texture_2d_array.u.v4i32",
+    FunctionType::get(readResult, readTypes, false));
+  auto write = module.getOrInsertFunction("air.write_texture_2d_array.u.v4i32",
+    FunctionType::get(builder.getVoidTy(), {texturePointer, coordinate->getType(),
+      i32, rgba, i32, i32}, false));
+  auto *oldValue = builder.CreateCall(read, readArgs);
+  auto *newValue = builder.CreateAdd(builder.CreateExtractElement(
+    builder.CreateExtractValue(oldValue, 0), builder.getInt32(0)), builder.getInt32(1));
+  auto *color = builder.CreateInsertElement(PoisonValue::get(rgba), newValue, builder.getInt32(0));
+  for (unsigned axis = 1; axis < 4; ++axis)
+    color = builder.CreateInsertElement(color, builder.getInt32(0), builder.getInt32(axis));
+  builder.CreateCall(write, {texture, coordinate, wrapper->getArg(layerArg), color,
+    builder.getInt32(0), builder.getInt32(3)});
+  builder.CreateBr(continuation);
+  return Error::success();
+}
+
 AIRCONV_API int SM50Compile(
   sm50_shader_t pShader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
@@ -1451,6 +1990,37 @@ AIRCONV_API int SM50Compile(
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
   auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->shader_info;
+  SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(pArgs, &msaa_pixel);
+  SM50_SHADER_D3D12_MSAA_VERTEX_DATA *msaa_vertex = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_VERTEX, SM50_SHADER_D3D12_MSAA_VERTEX_DATA>(pArgs, &msaa_vertex);
+  SM50_SHADER_PSO_PIXEL_SHADER_DATA *pixel_pso = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_PSO_PIXEL_SHADER, SM50_SHADER_PSO_PIXEL_SHADER_DATA>(pArgs, &pixel_pso);
+  SM50_SHADER_ROOT_SIGNATURE_DATA *root_signature = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &root_signature);
+  const uint32_t sample_frequency_mask = !msaa_pixel && !msaa_vertex && pixel_pso &&
+    ((dxmt::dxbc::SM50ShaderInternal *)pShader)->ps_sample_frequency
+      ? pixel_pso->sample_mask : 0xffffffffu;
+  const bool mark_rov_buffers = !msaa_vertex &&
+    (!msaa_pixel || msaa_pixel->variant == SM50_MSAA_PIXEL ||
+      msaa_pixel->variant == SM50_MSAA_SAMPLE_APP) &&
+    root_signature && SM50NeedsRasterOrderedBufferMarker(pShader, root_signature->bytecode,
+      root_signature->bytecode_length);
+  const uint32_t marker_samples = pixel_pso && pixel_pso->native_sample_count
+    ? pixel_pso->native_sample_count : 1;
+  if (msaa_pixel && msaa_vertex) {
+    errorOut << "MSAA pixel and vertex variants cannot be combined\0";
+    failCall(errorObj, ppError);
+    return 1;
+  }
+  SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *existing_capture = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE, SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA>(pArgs, &existing_capture);
+  SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA synthetic_capture{};
+  if (msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE && !existing_capture) {
+    synthetic_capture.next = pArgs;
+    synthetic_capture.type = SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE;
+    pArgs = (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&synthetic_capture;
+  }
 
   if (auto *sm50_shader = (dxmt::dxbc::SM50ShaderInternal *)pShader;
       sm50_shader->dxil_bytecode) {
@@ -1464,6 +2034,32 @@ AIRCONV_API int SM50Compile(
     }
     auto info = std::move(*lowered);
     auto &pModule = info->module;
+    if (msaa_pixel) {
+      if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel)) {
+        reportError(std::move(error), errorOut);
+        failCall(errorObj, ppError);
+        return 1;
+      }
+    } else if (msaa_vertex) {
+      if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex)) {
+        reportError(std::move(error), errorOut);
+        failCall(errorObj, ppError);
+        return 1;
+      }
+    } else if (sample_frequency_mask != 0xffffffffu) {
+      if (auto error = dxmt::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
+        reportError(std::move(error), errorOut);
+        failCall(errorObj, ppError);
+        return 1;
+      }
+    }
+    if (mark_rov_buffers) {
+      if (auto error = activateRasterOrderedBuffers(*pModule, marker_samples, sample_frequency_mask)) {
+        reportError(std::move(error), errorOut);
+        failCall(errorObj, ppError);
+        return 1;
+      }
+    }
 
     if (shader_info.use_msad)
       linkMSAD(*pModule);
@@ -1501,6 +2097,32 @@ AIRCONV_API int SM50Compile(
     });
     failCall(errorObj, ppError);
     return 1;
+  }
+  if (msaa_pixel) {
+    if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  } else if (msaa_vertex) {
+    if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  } else if (sample_frequency_mask != 0xffffffffu) {
+    if (auto error = dxmt::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  }
+  if (mark_rov_buffers) {
+    if (auto error = activateRasterOrderedBuffers(*pModule, marker_samples, sample_frequency_mask)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
   }
 
   if (shader_info.use_msad)
@@ -1544,18 +2166,12 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
     return 1;
   }
 
-  /* Multi-stage pipelines are SM 5.x only: DXIL stages compile through
-   * SM50Compile individually. */
-  {
-    sm50_shader_t stages[] = {pVertexShader, pHullShader};
-    for (sm50_shader_t stage : stages) {
-      if (stage && ((dxmt::dxbc::SM50ShaderInternal *)stage)->dxil_bytecode) {
-        errorOut << "DXIL multi-stage compilation is not supported yet\0";
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    }
-  }
+  if (int dxil = compileDXILPipelineStage(
+        dxmt::dxil::PipelineKind::TessellationObject, pVertexShader, pHullShader, pHullShaderArgs, FunctionName,
+        ppBitcode, errorObj, errorOut, ppError
+      );
+      dxil >= 0)
+    return dxil;
 
   // pArgs is ignored for now
   LLVMContext context;
@@ -1621,18 +2237,12 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
     return 1;
   }
 
-  /* Multi-stage pipelines are SM 5.x only: DXIL stages compile through
-   * SM50Compile individually. */
-  {
-    sm50_shader_t stages[] = {pHullShader, pDomainShader};
-    for (sm50_shader_t stage : stages) {
-      if (stage && ((dxmt::dxbc::SM50ShaderInternal *)stage)->dxil_bytecode) {
-        errorOut << "DXIL multi-stage compilation is not supported yet\0";
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    }
-  }
+  if (int dxil = compileDXILPipelineStage(
+        dxmt::dxil::PipelineKind::TessellationMesh, pHullShader, pDomainShader, pDomainShaderArgs, FunctionName,
+        ppBitcode, errorObj, errorOut, ppError
+      );
+      dxil >= 0)
+    return dxil;
 
   // pArgs is ignored for now
   LLVMContext context;
@@ -1699,18 +2309,12 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
     return 1;
   }
 
-  /* Multi-stage pipelines are SM 5.x only: DXIL stages compile through
-   * SM50Compile individually. */
-  {
-    sm50_shader_t stages[] = {pVertexShader, pGeometryShader};
-    for (sm50_shader_t stage : stages) {
-      if (stage && ((dxmt::dxbc::SM50ShaderInternal *)stage)->dxil_bytecode) {
-        errorOut << "DXIL multi-stage compilation is not supported yet\0";
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    }
-  }
+  if (int dxil = compileDXILPipelineStage(
+        dxmt::dxil::PipelineKind::GeometryObject, pVertexShader, pGeometryShader, pVertexShaderArgs, FunctionName,
+        ppBitcode, errorObj, errorOut, ppError
+      );
+      dxil >= 0)
+    return dxil;
 
   // pArgs is ignored for now
   LLVMContext context;
@@ -1722,7 +2326,15 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
 
-  if (auto err = dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
+  SM50_SHADER_GS_TESSELLATION_INPUT_DATA *tess_input = nullptr;
+  const bool tessellation_input =
+      dxmt::dxbc::args_get_data<SM50_SHADER_GS_TESSELLATION_INPUT, SM50_SHADER_GS_TESSELLATION_INPUT_DATA>(
+          pVertexShaderArgs, &tess_input
+      );
+  // With tessellation input the first stage is the DS and the object fetches the pass-1 capture.
+  auto convert = tessellation_input ? dxmt::dxbc::convert_dxbc_domain_for_geometry_shader
+                                    : dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader;
+  if (auto err = convert(
         (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName,
         (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule,
         pVertexShaderArgs
@@ -1775,18 +2387,12 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
     return 1;
   }
 
-  /* Multi-stage pipelines are SM 5.x only: DXIL stages compile through
-   * SM50Compile individually. */
-  {
-    sm50_shader_t stages[] = {pVertexShader, pGeometryShader};
-    for (sm50_shader_t stage : stages) {
-      if (stage && ((dxmt::dxbc::SM50ShaderInternal *)stage)->dxil_bytecode) {
-        errorOut << "DXIL multi-stage compilation is not supported yet\0";
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    }
-  }
+  if (int dxil = compileDXILPipelineStage(
+        dxmt::dxil::PipelineKind::GeometryMesh, pVertexShader, pGeometryShader, pGeometryShaderArgs, FunctionName,
+        ppBitcode, errorObj, errorOut, ppError
+      );
+      dxil >= 0)
+    return dxil;
 
   // pArgs is ignored for now
   LLVMContext context;
@@ -1847,12 +2453,50 @@ AIRCONV_API void SM50GetCompiledBitcode(
   pData->ConstantRelocationCount = pBitcodeInternal->constant_relocations.size();
 }
 
+AIRCONV_API int SM50CopyCompiledBitcode(
+  sm50_bitcode_t pBitcode, SM50_COMPILED_BITCODE_PART Part, void *pDestination, uint64_t Size
+) {
+  auto pBitcodeInternal = (SM50CompiledBitcodeInternal *)pBitcode;
+  const void *source;
+  uint64_t size;
+  switch (Part) {
+  case SM50_COMPILED_BITCODE_PART_LIBRARY:
+    source = pBitcodeInternal->vec.data();
+    size = pBitcodeInternal->vec.size();
+    break;
+  case SM50_COMPILED_BITCODE_PART_CONSTANTS:
+    source = pBitcodeInternal->constants.data();
+    size = pBitcodeInternal->constants.size();
+    break;
+  case SM50_COMPILED_BITCODE_PART_RELOCATIONS:
+    source = pBitcodeInternal->constant_relocations.data();
+    size = pBitcodeInternal->constant_relocations.size() * sizeof(SM50_CONSTANT_RELOCATION);
+    break;
+  default:
+    return 1;
+  }
+  if (Size != size || (size && !pDestination))
+    return 1;
+  if (size)
+    memcpy(pDestination, source, size);
+  return 0;
+}
+
 AIRCONV_API void SM50DestroyBitcode(sm50_bitcode_t pBitcode) {
   auto pBitcodeInternal = (SM50CompiledBitcodeInternal *)pBitcode;
   delete pBitcodeInternal;
 }
 
 AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_t BufferSize) {
+  if (!pBuffer || !BufferSize)
+    return 0;
+  if (!pError) {
+    constexpr char message[] = "Out of memory converting shader arguments";
+    auto str_len = std::min(sizeof(message) - 1, BufferSize - 1);
+    memcpy(pBuffer, message, str_len);
+    pBuffer[str_len] = '\0';
+    return str_len;
+  }
   auto pInternal = (SM50ErrorInternal *)pError;
   auto str_len = std::min(pInternal->buf.size(), BufferSize - 1);
   memcpy(pBuffer, pInternal->buf.data(), str_len);

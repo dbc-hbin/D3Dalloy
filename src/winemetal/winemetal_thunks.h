@@ -357,6 +357,27 @@ struct unixcall_bootstrap {
   uint32_t reserved;
 };
 
+/* Fixed-width for WoW64: shared by the 64-bit and 32-bit tables (232..237). */
+struct unixcall_share_rendezvous {
+  char name[64];   // out (create) / in (lookup)
+  uint64_t handle; // rendezvous owner handle
+  uint32_t port;   // in (create: object send right) / out (lookup: object send right)
+  uint32_t reserved;
+};
+
+struct unixcall_share_identity {
+  obj_handle_t object;
+  uint32_t kind; // 0: MTLSharedEvent, 1: shareable MTLTexture
+  uint32_t reserved;
+  uint64_t ret;
+};
+
+struct unixcall_share_hashname {
+  uint16_t name[256];
+  uint32_t length; // UTF-16 code units, 1..256
+  char hash[36];   // out: 32 hex digits
+};
+
 struct unixcall_mtlsharedevent_waituntilsignaledvalue {
   obj_handle_t event;
   uint64_t value;
@@ -503,10 +524,113 @@ struct unixcall_mtldevice_sampletimestamps {
   uint64_t gpu_timestamp;
 };
 
+struct unixcall_wmt_presentation_observe {
+  obj_handle_t drawable;
+  obj_handle_t observer;
+  uint64_t present_id;
+  uint32_t ret;
+};
+
+struct unixcall_wmt_presentation_wait {
+  obj_handle_t observer;
+  struct WMTPresentationEvent event;
+  int32_t ret;
+};
+
+/* All fields are 8 bytes, so the layout is identical for WoW64 callers. */
+struct unixcall_mtlcommandbuffer_present_if_current {
+  obj_handle_t cmdbuf;
+  obj_handle_t drawable;
+  obj_handle_t token;
+  uint64_t epoch;
+  double after;
+  obj_handle_t observer;
+  uint64_t present_id;
+};
+
+struct unixcall_wmt_presentation_cancel {
+  obj_handle_t observer;
+  uint64_t present_id;
+};
+
+struct unixcall_wmt_clock_sample {
+  double host_seconds;
+};
+
+struct unixcall_wmt_observer_view {
+  obj_handle_t observer;
+  obj_handle_t view;
+  uint32_t ret;
+};
+
+struct unixcall_wmt_refresh_sample {
+  obj_handle_t observer;
+  struct WMTDisplayRefreshSample sample;
+  uint32_t ret;
+};
+
 struct unixcall_mtlcomputeencoder_functiontable {
   obj_handle_t encoder;
   obj_handle_t table;
   uint64_t index;
+};
+
+struct unixcall_mtldevice_newplacementheap {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  uint64_t max_sparse_page_size;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtldevice_newplacementsparseresource {
+  obj_handle_t device;
+  struct WMTMemoryPointer info;
+  uint64_t page_size;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtlbuffer_newplacementsparsetextureview {
+  obj_handle_t buffer;
+  struct WMTMemoryPointer info;
+  uint64_t offset;
+  uint64_t bytes_per_row;
+  uint64_t page_size;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtldevice_sparsetilesize {
+  obj_handle_t device;
+  uint32_t type;
+  uint32_t format;
+  uint32_t sample_count;
+  uint32_t page_size;
+  struct WMTSparseTileShape ret;
+};
+
+struct unixcall_mtltexture_sparsetail {
+  obj_handle_t texture;
+  struct WMTSparseTextureTail ret;
+};
+
+struct unixcall_mtl4commandqueue_updatemappings {
+  obj_handle_t queue;
+  obj_handle_t resource;
+  obj_handle_t heap;
+  struct WMTConstMemoryPointer mappings;
+  uint64_t count;
+};
+
+struct unixcall_mtl4commandqueue_signalevent {
+  obj_handle_t queue;
+  obj_handle_t event;
+  uint64_t value;
+};
+
+struct unixcall_mtldevice_newsamplerstatewithreduction {
+  obj_handle_t device;
+  struct WMTMemoryPointer info;
+  uint64_t reduction;
+  obj_handle_t ret;
 };
 
 #pragma pack(pop)

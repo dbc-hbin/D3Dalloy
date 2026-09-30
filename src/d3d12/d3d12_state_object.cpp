@@ -693,7 +693,7 @@ class MTLD3D12StateObjectImpl final
 
     WMT::Reference<WMT::Error> metal_error;
     auto library = device_->GetMTLDevice().newLibrary(
-        WMT::MakeDispatchData(const_cast<void *>(metallib.Data), metallib.Size), metal_error
+        WMT::MakeDispatchData(metallib.Data, metallib.Size), metal_error
     );
     if (!library) {
       ERR("RT metallib load failed: ", metal_error ? metal_error.description().getUTF8String() : "no Metal error");

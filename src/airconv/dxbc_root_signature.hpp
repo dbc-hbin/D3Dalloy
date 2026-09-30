@@ -18,10 +18,12 @@
 
 #pragma once
 #include "d3d12.h"
+#include "../d3d12/d3d12_interfaces_ext.hpp"
 
 #include <cstring>
-#include <vector>
 #include <cstdint>
+#include <type_traits>
+#include <vector>
 
 namespace dxmt {
 
@@ -146,7 +148,7 @@ public:
     Output.NumStaticSamplers = raw_root_sig_->NumStaticSamplers;
     Output.pStaticSamplers =
         Output.NumStaticSamplers
-            ? (const D3D12_STATIC_SAMPLER_DESC *)((char *)raw_root_sig_ + raw_root_sig_->StaticSamplersOffset)
+            ? (decltype(Output.pStaticSamplers))((char *)raw_root_sig_ + raw_root_sig_->StaticSamplersOffset)
             : nullptr;
 
     return S_OK;
@@ -211,8 +213,35 @@ public:
     return S_OK;
   }
 
+  /**
+   * Convert a static sampler array between the 1.0/1.1 and the 1.2 layouts.
+   *
+   * RTS0 stores the samplers of a 1.2 signature as D3D12_STATIC_SAMPLER_DESC1 (the
+   * 1.1 layout plus the D3D12_SAMPLER_FLAGS word); every other version stores the
+   * flagless layout. Down-conversion drops the flags, up-conversion zero-fills them.
+   */
+  template <typename TO, typename FROM>
+  const TO *
+  ConvertStaticSamplers(const FROM *From, UINT Count) {
+    if (!Count)
+      return nullptr;
+    auto *To = AllocateBuffer<TO>(Count);
+    if (!To)
+      return nullptr;
+    for (UINT i = 0; i < Count; ++i) {
+      std::memset(&To[i], 0, sizeof(TO));
+      std::memcpy(&To[i], &From[i], sizeof(D3D12_STATIC_SAMPLER_DESC));
+      if constexpr (std::is_same_v<TO, D3D12_STATIC_SAMPLER_DESC1> &&
+                    std::is_same_v<FROM, D3D12_STATIC_SAMPLER_DESC1>)
+        To[i].Flags = From[i].Flags;
+    }
+    return To;
+  }
+
   HRESULT
   Deserialize(const void *pBytecode, SIZE_T DataSize) {
+    if (!pBytecode || DataSize < sizeof(RawRootSignatureDesc))
+      return E_INVALIDARG;
     raw_root_sig_ = AllocateBuffer<RawRootSignatureDesc>(1, DataSize);
     if (!raw_root_sig_)
       return E_OUTOFMEMORY;
@@ -221,6 +250,7 @@ public:
 
     desc_1_0_.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
     desc_1_1_.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    desc_1_2_.Version = kRootSignatureVersion_1_2;
 
     HRESULT hr;
     switch (raw_root_sig_->Version) {
@@ -242,10 +272,32 @@ public:
         return hr;
       break;
     }
+    case kRootSignatureVersion_1_2: {
+      hr = DeserializeVersionedRootSignatureImpl(desc_1_2_.Desc_1_2);
+      if (FAILED(hr))
+        return hr;
+      const auto &Desc = desc_1_2_.Desc_1_2;
+      desc_1_1_.Desc_1_1 = {Desc.NumParameters, Desc.pParameters, Desc.NumStaticSamplers, nullptr, Desc.Flags};
+      desc_1_1_.Desc_1_1.pStaticSamplers =
+          ConvertStaticSamplers<D3D12_STATIC_SAMPLER_DESC>(Desc.pStaticSamplers, Desc.NumStaticSamplers);
+      if (Desc.NumStaticSamplers && !desc_1_1_.Desc_1_1.pStaticSamplers)
+        return E_OUTOFMEMORY;
+      hr = ConvertVersionedRootSignature(desc_1_1_.Desc_1_1, desc_1_0_.Desc_1_0);
+      if (FAILED(hr))
+        return hr;
+      return S_OK;
+    }
     default:
-      hr = E_INVALIDARG;
+      return E_INVALIDARG;
     }
 
+    /* A 1.0/1.1 signature seen at version 1.2: same parameters, flagless samplers. */
+    const auto &Desc = desc_1_1_.Desc_1_1;
+    desc_1_2_.Desc_1_2 = {Desc.NumParameters, Desc.pParameters, Desc.NumStaticSamplers, nullptr, Desc.Flags};
+    desc_1_2_.Desc_1_2.pStaticSamplers =
+        ConvertStaticSamplers<D3D12_STATIC_SAMPLER_DESC1>(Desc.pStaticSamplers, Desc.NumStaticSamplers);
+    if (Desc.NumStaticSamplers && !desc_1_2_.Desc_1_2.pStaticSamplers)
+      return E_OUTOFMEMORY;
     return hr;
   }
 
@@ -259,7 +311,9 @@ public:
 
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc_1_0_;
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc_1_1_;
-  RawRootSignatureDesc *raw_root_sig_;
+  /* The signature at version 1.2, whose static samplers carry D3D12_SAMPLER_FLAGS. */
+  VersionedRootSignatureDesc desc_1_2_;
+  RawRootSignatureDesc *raw_root_sig_ = nullptr;
 
 private:
   std::vector<void *> malloc_ptrs_;

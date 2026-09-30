@@ -17,6 +17,48 @@
 
 namespace dxmt::wsi {
 
+static bool getWindowLong(HWND hWindow, int index, LONG *value) {
+  ::SetLastError(0);
+  LONG result = ::GetWindowLongW(hWindow, index);
+  if (result == 0 && ::GetLastError() != 0)
+    return false;
+  *value = result;
+  return true;
+}
+
+static bool setWindowLong(HWND hWindow, int index, LONG value) {
+  ::SetLastError(0);
+  return ::SetWindowLongW(hWindow, index, value) != 0 || ::GetLastError() == 0;
+}
+
+struct NativeWindowState {
+  RECT rect;
+  LONG style;
+  LONG exstyle;
+};
+
+static bool getNativeWindowState(HWND hWindow, NativeWindowState *state) {
+  return ::GetWindowRect(hWindow, &state->rect) &&
+         getWindowLong(hWindow, GWL_STYLE, &state->style) &&
+         getWindowLong(hWindow, GWL_EXSTYLE, &state->exstyle);
+}
+
+static void restoreNativeWindowState(HWND hWindow,
+                                     const NativeWindowState &state) {
+  if (!::IsWindow(hWindow))
+    return;
+
+  setWindowLong(hWindow, GWL_STYLE, state.style);
+  setWindowLong(hWindow, GWL_EXSTYLE, state.exstyle);
+  ::SetWindowPos(hWindow, (state.exstyle & WS_EX_TOPMOST) ? HWND_TOPMOST
+                                                       : HWND_NOTOPMOST,
+                 state.rect.left, state.rect.top,
+                 state.rect.right - state.rect.left,
+                 state.rect.bottom - state.rect.top,
+                 SWP_FRAMECHANGED | SWP_NOACTIVATE |
+                     ((state.style & WS_VISIBLE) ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+}
+
 static bool getMonitorDisplayMode(HMONITOR hMonitor, DWORD modeNum,
                                   DEVMODEW *pMode) {
   ::MONITORINFOEXW monInfo;
@@ -82,21 +124,28 @@ void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
     *pHeight = rect.bottom - rect.top;
 }
 
-void resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
+bool resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
                   uint32_t height) {
   // Adjust window position and size
   RECT newRect = {0, 0, 0, 0};
-  RECT oldRect = {0, 0, 0, 0};
+  NativeWindowState oldState = {};
 
-  ::GetWindowRect(hWindow, &oldRect);
+  if (!getNativeWindowState(hWindow, &oldState))
+    return false;
+
   ::SetRect(&newRect, 0, 0, width, height);
-  ::AdjustWindowRectEx(&newRect, ::GetWindowLongW(hWindow, GWL_STYLE), FALSE,
-                       ::GetWindowLongW(hWindow, GWL_EXSTYLE));
+  if (!::AdjustWindowRectEx(&newRect, oldState.style, FALSE, oldState.exstyle))
+    return false;
   ::SetRect(&newRect, 0, 0, newRect.right - newRect.left,
             newRect.bottom - newRect.top);
-  ::OffsetRect(&newRect, oldRect.left, oldRect.top);
-  ::MoveWindow(hWindow, newRect.left, newRect.top, newRect.right - newRect.left,
-               newRect.bottom - newRect.top, TRUE);
+  ::OffsetRect(&newRect, oldState.rect.left, oldState.rect.top);
+  if (!::MoveWindow(hWindow, newRect.left, newRect.top,
+                    newRect.right - newRect.left, newRect.bottom - newRect.top,
+                    TRUE)) {
+    restoreNativeWindowState(hWindow, oldState);
+    return false;
+  }
+  return true;
 }
 
 bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
@@ -128,7 +177,26 @@ bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
                          DXMTWindowState *pState,
                          [[maybe_unused]] bool modeSwitch) {
   RECT rect = {};
-  getDesktopCoordinates(hMonitor, &rect);
+  NativeWindowState oldState = {};
+  if (!getDesktopCoordinates(hMonitor, &rect) ||
+      !getNativeWindowState(hWindow, &oldState))
+    return false;
+
+  // Publish the saved window state only after the native transition succeeds.
+  if (!setWindowLong(hWindow, GWL_STYLE,
+                     oldState.style & ~WS_OVERLAPPEDWINDOW) ||
+      !setWindowLong(hWindow, GWL_EXSTYLE,
+                     oldState.exstyle & ~WS_EX_OVERLAPPEDWINDOW) ||
+      !::SetWindowPos(hWindow, HWND_TOPMOST, rect.left, rect.top,
+                      rect.right - rect.left, rect.bottom - rect.top,
+                      SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE)) {
+    restoreNativeWindowState(hWindow, oldState);
+    return false;
+  }
+
+  pState->rect = oldState.rect;
+  pState->style = oldState.style;
+  pState->exstyle = oldState.exstyle;
 
   D3DKMT_ESCAPE escape = {};
   escape.Type = D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE;
@@ -137,41 +205,44 @@ bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
   escape.hContext = HandleToUlong(hWindow);
   D3DKMTEscape(&escape);
 
-  // Find a display mode that matches what we need
-  ::GetWindowRect(hWindow, &pState->rect);
-
-  // Change the window flags to remove the decoration etc.
-  LONG style = ::GetWindowLongW(hWindow, GWL_STYLE);
-  LONG exstyle = ::GetWindowLongW(hWindow, GWL_EXSTYLE);
-
-  pState->style = style;
-  pState->exstyle = exstyle;
-
-  style &= ~WS_OVERLAPPEDWINDOW;
-  exstyle &= ~WS_EX_OVERLAPPEDWINDOW;
-
-  ::SetWindowLongW(hWindow, GWL_STYLE, style);
-  ::SetWindowLongW(hWindow, GWL_EXSTYLE, exstyle);
-
-  ::SetWindowPos(hWindow, HWND_TOPMOST, rect.left, rect.top,
-                 rect.right - rect.left, rect.bottom - rect.top,
-                 SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-
   return true;
 }
 
 bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
                          bool restoreCoordinates) {
+  NativeWindowState oldState = {};
+  if (!getNativeWindowState(hWindow, &oldState))
+    return false;
+
   // Only restore the window style if the application hasn't
   // changed them. This is in line with what native DXGI does.
-  LONG curStyle = ::GetWindowLongW(hWindow, GWL_STYLE) & ~WS_VISIBLE;
-  LONG curExstyle = ::GetWindowLongW(hWindow, GWL_EXSTYLE) & ~WS_EX_TOPMOST;
+  LONG curStyle = oldState.style & ~WS_VISIBLE;
+  LONG curExstyle = oldState.exstyle & ~WS_EX_TOPMOST;
 
   if (curStyle == (pState->style & ~(WS_VISIBLE | WS_OVERLAPPEDWINDOW)) &&
       curExstyle ==
           (pState->exstyle & ~(WS_EX_TOPMOST | WS_EX_OVERLAPPEDWINDOW))) {
-    ::SetWindowLongW(hWindow, GWL_STYLE, pState->style);
-    ::SetWindowLongW(hWindow, GWL_EXSTYLE, pState->exstyle);
+    if (!setWindowLong(hWindow, GWL_STYLE, pState->style) ||
+        !setWindowLong(hWindow, GWL_EXSTYLE, pState->exstyle)) {
+      restoreNativeWindowState(hWindow, oldState);
+      return false;
+    }
+  }
+
+  // Restore window position and apply the style
+  UINT flags = SWP_FRAMECHANGED | SWP_NOACTIVATE;
+  const RECT rect = pState->rect;
+
+  if (!restoreCoordinates)
+    flags |= SWP_NOSIZE | SWP_NOMOVE;
+
+  if (!::SetWindowPos(hWindow,
+                      (pState->exstyle & WS_EX_TOPMOST) ? HWND_TOPMOST
+                                                        : HWND_NOTOPMOST,
+                      rect.left, rect.top, rect.right - rect.left,
+                      rect.bottom - rect.top, flags)) {
+    restoreNativeWindowState(hWindow, oldState);
+    return false;
   }
 
   RECT empty = {};
@@ -182,26 +253,16 @@ bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
   escape.hContext = HandleToUlong(hWindow);
   D3DKMTEscape(&escape);
 
-  // Restore window position and apply the style
-  UINT flags = SWP_FRAMECHANGED | SWP_NOACTIVATE;
-  const RECT rect = pState->rect;
-
-  if (!restoreCoordinates)
-    flags |= SWP_NOSIZE | SWP_NOMOVE;
-
-  ::SetWindowPos(hWindow,
-                 (pState->exstyle & WS_EX_TOPMOST) ? HWND_TOPMOST
-                                                   : HWND_NOTOPMOST,
-                 rect.left, rect.top, rect.right - rect.left,
-                 rect.bottom - rect.top, flags);
-
   return true;
 }
 
 bool restoreDisplayMode(HMONITOR hMonitor) {
-  WCHAR device_name[32];
-  DEVMODEW current_mode, registry_mode;
-  getDisplayName(hMonitor, device_name);
+  WCHAR device_name[32] = {};
+  DEVMODEW current_mode = {}, registry_mode = {};
+  current_mode.dmSize = sizeof(current_mode);
+  registry_mode.dmSize = sizeof(registry_mode);
+  if (!getDisplayName(hMonitor, device_name))
+    return false;
   if (!EnumDisplaySettingsExW(device_name, ENUM_CURRENT_SETTINGS, &current_mode, 0))
     return false;
   if (!EnumDisplaySettingsExW(device_name, ENUM_REGISTRY_SETTINGS, &registry_mode, 0))
@@ -236,10 +297,31 @@ HMONITOR getWindowMonitor(HWND hWindow) {
 
 bool isWindow(HWND hWindow) { return ::IsWindow(hWindow); }
 
-void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow,
+bool updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow,
                             bool forceTopmost) {
   RECT bounds = {};
-  wsi::getDesktopCoordinates(hMonitor, &bounds);
+  NativeWindowState oldState = {};
+  if (!wsi::getDesktopCoordinates(hMonitor, &bounds) ||
+      !getNativeWindowState(hWindow, &oldState))
+    return false;
+
+  // In D3D9, changing display modes re-forces the window
+  // to become top most, whereas in DXGI, it does not.
+  if (forceTopmost) {
+    if (!::SetWindowPos(hWindow, HWND_TOPMOST, bounds.left, bounds.top,
+                        bounds.right - bounds.left, bounds.bottom - bounds.top,
+                        SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE)) {
+      restoreNativeWindowState(hWindow, oldState);
+      return false;
+    }
+  } else {
+    if (!::MoveWindow(hWindow, bounds.left, bounds.top,
+                      bounds.right - bounds.left, bounds.bottom - bounds.top,
+                      TRUE)) {
+      restoreNativeWindowState(hWindow, oldState);
+      return false;
+    }
+  }
 
   D3DKMT_ESCAPE escape = {};
   escape.Type = D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE;
@@ -247,17 +329,7 @@ void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow,
   escape.PrivateDriverDataSize = sizeof(bounds);
   escape.hContext = HandleToUlong(hWindow);
   D3DKMTEscape(&escape);
-
-  // In D3D9, changing display modes re-forces the window
-  // to become top most, whereas in DXGI, it does not.
-  if (forceTopmost) {
-    ::SetWindowPos(hWindow, HWND_TOPMOST, bounds.left, bounds.top,
-                   bounds.right - bounds.left, bounds.bottom - bounds.top,
-                   SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-  } else {
-    ::MoveWindow(hWindow, bounds.left, bounds.top, bounds.right - bounds.left,
-                 bounds.bottom - bounds.top, TRUE);
-  }
+  return true;
 }
 
 bool isForeground(HWND hWindow) {

@@ -1101,8 +1101,10 @@ struct OppositeOrderCallerContext {
     ID3D12Fence* start = nullptr;
     ID3D12Fence* completionA = nullptr;
     ID3D12Fence* completionB = nullptr;
-    Recording* recordingA = nullptr;
-    Recording* recordingB = nullptr;
+    // D3D12 drops re-execution of a list whose previous execution has not completed, and every
+    // submission here waits behind the start gate; each iteration therefore owns its recording.
+    Recording* recordingsA = nullptr;
+    Recording* recordingsB = nullptr;
 };
 
 DWORD WINAPI runOppositeOrderCallerThread(LPVOID opaque) {
@@ -1113,8 +1115,8 @@ DWORD WINAPI runOppositeOrderCallerThread(LPVOID opaque) {
           "opposite-order B.Wait(start,1)");
 
     for (UINT iteration = 0; iteration < kOppositeOrderIterations; ++iteration) {
-        ID3D12CommandList* listsA[] = {context->recordingA->list.Get()};
-        ID3D12CommandList* listsB[] = {context->recordingB->list.Get()};
+        ID3D12CommandList* listsA[] = {context->recordingsA[iteration].list.Get()};
+        ID3D12CommandList* listsB[] = {context->recordingsB[iteration].list.Get()};
         context->queueA->ExecuteCommandLists(1, listsA);
         context->queueB->ExecuteCommandLists(1, listsB);
     }
@@ -1171,12 +1173,16 @@ void runOppositeFeatureOrder(Gpu& gpu,
     auto descXB = makeFrameDesc(
         colorXB.Get(), outputXB.resource.Get(), depthXB.Get(), motionXB.Get(), FALSE);
 
-    Recording recordingA = recordTemporalPair(
-        gpu, stateX.Get(), descXA, outputXA,
-        stateY.Get(), descYA, outputYA);
-    Recording recordingB = recordTemporalPair(
-        gpu, stateY.Get(), descYB, outputYB,
-        stateX.Get(), descXB, outputXB);
+    Recording recordingsA[kOppositeOrderIterations];
+    Recording recordingsB[kOppositeOrderIterations];
+    for (UINT iteration = 0; iteration < kOppositeOrderIterations; ++iteration) {
+        recordingsA[iteration] = recordTemporalPair(
+            gpu, stateX.Get(), descXA, outputXA,
+            stateY.Get(), descYA, outputYA);
+        recordingsB[iteration] = recordTemporalPair(
+            gpu, stateY.Get(), descYB, outputYB,
+            stateX.Get(), descXB, outputXB);
+    }
 
     ComPtr<ID3D12CommandQueue> queueA =
         createDirectQueue(gpu.device.Get(), "CreateCommandQueue(opposite-order A)");
@@ -1197,7 +1203,7 @@ void runOppositeFeatureOrder(Gpu& gpu,
 
     OppositeOrderCallerContext context{
         queueA.Get(), queueB.Get(), start.Get(), completionA.Get(), completionB.Get(),
-        &recordingA, &recordingB};
+        recordingsA, recordingsB};
     runThreadBounded(runOppositeOrderCallerThread, &context,
                      "opposite-order caller API sequence timeout");
     waitForFenceValue(

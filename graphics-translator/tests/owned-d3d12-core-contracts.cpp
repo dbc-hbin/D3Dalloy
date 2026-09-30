@@ -202,6 +202,92 @@ int run() {
   failures += expectHr(D3D12SerializeVersionedRootSignature(&invalidVersioned, &rootBlob, nullptr),
                        E_INVALIDARG, "invalid 1.1 descriptor range flags");
 
+  constexpr UINT volatileDescriptors = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+  constexpr UINT volatileData = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+  constexpr UINT executeStaticData = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
+  constexpr UINT staticData = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC;
+  constexpr UINT keepBounds = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS;
+  struct RangeCase {
+    D3D12_DESCRIPTOR_RANGE_TYPE type;
+    UINT flags;
+    bool valid;
+  };
+  constexpr RangeCase rangeCases[] = {
+      {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, volatileDescriptors, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, volatileDescriptors | volatileData, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, volatileDescriptors | executeStaticData, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, volatileData, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, executeStaticData, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, staticData, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, keepBounds, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, keepBounds | volatileData, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, keepBounds | executeStaticData, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, keepBounds | staticData, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 0, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, volatileDescriptors, true},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, volatileDescriptors | staticData, false},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, volatileDescriptors | keepBounds, false},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, volatileDescriptors | keepBounds | volatileData, false},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, volatileData | executeStaticData, false},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, executeStaticData | staticData, false},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, volatileData, false},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, keepBounds, false},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, volatileDescriptors | keepBounds, false},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 0x10, false},
+  };
+  invalidRange.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+  invalidRange.NumDescriptors = 2;
+  invalidRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+  const int rangeFailuresBefore = failures;
+  for (const auto &rangeCase : rangeCases) {
+    invalidRange.RangeType = rangeCase.type;
+    invalidRange.Flags = static_cast<D3D12_DESCRIPTOR_RANGE_FLAGS>(rangeCase.flags);
+    rootBlob.Reset();
+    const HRESULT serializeHr = D3D12SerializeVersionedRootSignature(&invalidVersioned, &rootBlob, nullptr);
+    if (!rangeCase.valid) {
+      if (serializeHr != E_INVALIDARG) {
+        std::fprintf(stderr, "invalid range type=%u flags=0x%x serialize hr=0x%08lx\n",
+                     static_cast<UINT>(rangeCase.type), rangeCase.flags, static_cast<unsigned long>(serializeHr));
+        ++failures;
+      }
+      continue;
+    }
+    if (FAILED(serializeHr) || !rootBlob) {
+      std::fprintf(stderr, "valid range type=%u flags=0x%x serialize hr=0x%08lx\n",
+                   static_cast<UINT>(rangeCase.type), rangeCase.flags, static_cast<unsigned long>(serializeHr));
+      ++failures;
+      continue;
+    }
+    ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
+    hr = D3D12CreateVersionedRootSignatureDeserializer(rootBlob->GetBufferPointer(), rootBlob->GetBufferSize(),
+                                                        IID_PPV_ARGS(&deserializer));
+    if (FAILED(hr)) {
+      failures += fail("deserialize valid 1.1 range", hr);
+      continue;
+    }
+    const auto *roundTrip = deserializer->GetUnconvertedRootSignatureDesc();
+    if (!roundTrip || roundTrip->Version != D3D_ROOT_SIGNATURE_VERSION_1_1 ||
+        roundTrip->Desc_1_1.NumParameters != 1 ||
+        roundTrip->Desc_1_1.pParameters[0].DescriptorTable.NumDescriptorRanges != 1 ||
+        roundTrip->Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges[0].NumDescriptors != 2 ||
+        roundTrip->Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges[0].OffsetInDescriptorsFromTableStart !=
+            D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND ||
+        roundTrip->Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges[0].Flags != invalidRange.Flags ||
+        roundTrip->Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges[0].RangeType != rangeCase.type)
+      failures += fail("round-trip 1.1 descriptor table bounds, flags and type");
+    ComPtr<ID3D12RootSignature> rangeRoot;
+    hr = device->CreateRootSignature(0, rootBlob->GetBufferPointer(), rootBlob->GetBufferSize(),
+                                     IID_PPV_ARGS(&rangeRoot));
+    if (FAILED(hr)) {
+      std::fprintf(stderr, "valid range type=%u flags=0x%x CreateRootSignature hr=0x%08lx\n",
+                   static_cast<UINT>(rangeCase.type), rangeCase.flags, static_cast<unsigned long>(hr));
+      ++failures;
+    }
+  }
+  if (failures == rangeFailuresBefore)
+    std::puts("OWNED_D3D12_CORE_CONTRACTS_RANGE_FLAGS_PASS");
+
   D3D12_ROOT_PARAMETER constants{};
   constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   constants.Constants.Num32BitValues = 2;

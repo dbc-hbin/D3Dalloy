@@ -120,6 +120,43 @@ convert_dxbc_geometry_shader(
   }
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *stats = nullptr;
+  args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &stats);
+  /* TS+GS pass 2: the input primitives are the compacted pass-1 capture (tessellator output is never a strip). */
+  SM50_SHADER_GS_TESSELLATION_INPUT_DATA *tess_input = nullptr;
+  if (args_get_data<SM50_SHADER_GS_TESSELLATION_INPUT, SM50_SHADER_GS_TESSELLATION_INPUT_DATA>(pArgs, &tess_input))
+    is_strip = false;
+  SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *so_capture = nullptr;
+  args_get_data<SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE, SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA>(
+      pArgs, &so_capture
+  );
+  /* Stream-0 capture (see SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA): every GS invocation owns
+   * gs_max_vertex_output records of record_dwords + 1 dwords (the extra dword is the vertex's position in its
+   * output strip), then a header word per invocation holds the number of captured vertices. */
+  std::vector<StreamOutputCaptureRun> so_runs;
+  if (so_capture) {
+    for (uint32_t i = 0; i < so_capture->num_elements; i++) {
+      auto &element = so_capture->elements[i];
+      if (!element.semantic_name)
+        return llvm::make_error<UnsupportedFeature>("stream output capture element has no semantic name");
+      auto output = std::find_if(
+          pShaderInternal->output_signature.begin(), pShaderInternal->output_signature.end(),
+          [&](const Signature &sig) {
+            return sig.stream() == 0 && sig.semanticIndex() == element.semantic_index &&
+                   llvm::StringRef(sig.semanticName()).equals_insensitive(element.semantic_name);
+          }
+      );
+      if (output == pShaderInternal->output_signature.end())
+        return llvm::make_error<UnsupportedFeature>(
+            "stream output capture element " + std::string(element.semantic_name) +
+            std::to_string(element.semantic_index) + " is not a geometry shader stream 0 output"
+        );
+      auto run = resolve_stream_output_capture(*so_capture, element, output->reg(), output->mask());
+      if (!run)
+        return run.takeError();
+      so_runs.push_back(*run);
+    }
+  }
 
   IREffect prologue([](auto) { return std::monostate(); });
   IRValue epilogue([](struct context ctx) -> pvalue { return nullptr; });
@@ -134,6 +171,7 @@ convert_dxbc_geometry_shader(
     }
   }
   auto& gs_output_handlers = pShaderInternal->mesh_output_handlers;
+  const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
 
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_GEOMETRY_SHADER, rootsig->bytecode,
@@ -161,14 +199,45 @@ convert_dxbc_geometry_shader(
   // it's intended to declare a bit more max primitive count
   auto mesh_idx = func_signature.DefineInput(air::InputMesh{(uint32_t)max_vertex_out, (uint32_t)max_vertex_out, topology});
   uint32_t tg_in_grid_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
+  uint32_t so_control_idx = ~0u, so_scratch_idx = ~0u;
+  if (so_capture) {
+    so_control_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .buffer_size = {},
+        .location_index = SM50_BINDING_INDEX_VERTEX_INDEX_CONTROL,
+        .array_size = 0,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .type = air::MSLUint{},
+        .arg_name = "so_capture_control",
+        .raster_order_group = {}
+    });
+    so_scratch_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .buffer_size = {},
+        .location_index = SM50_BINDING_INDEX_SO_CAPTURE_SCRATCH,
+        .array_size = 0,
+        .memory_access = air::MemoryAccess::read_write,
+        .address_space = air::AddressSpace::device,
+        .type = air::MSLUint{},
+        .arg_name = "so_capture_scratch",
+        .raster_order_group = {}
+    });
+  }
 
   if (pShaderInternal->clip_distance_scalars.size() > 0) {
     func_signature.DefineMeshVertexOutput(
         air::OutputClipDistance{.count = pShaderInternal->clip_distance_scalars.size()}
     );
   }
+  // D3D rasterizes point primitives as 1x1 pixel squares; Metal point primitives need an explicit size.
+  if (topology == air::MeshOutputTopology::Point)
+    func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
 
-  auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, false);
+  SM50_SHADER_GS_PASS_THROUGH_DATA *pass_through = nullptr;
+  const bool rasterization_disabled =
+      args_get_data<SM50_SHADER_GS_PASS_THROUGH, SM50_SHADER_GS_PASS_THROUGH_DATA>(pArgs, &pass_through) &&
+      pass_through->RasterizationDisabled;
+  auto [function, function_metadata] =
+      func_signature.CreateFunction(name, context, module, 0, rasterization_disabled);
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
   auto active_ = llvm::BasicBlock::Create(context, "active", function);
@@ -199,6 +268,54 @@ convert_dxbc_geometry_shader(
   builder.CreateStore(zero_const, vertex_offset);
   auto primitive_count = builder.CreateAlloca(types._int, nullptr, "primitive_count");
   builder.CreateStore(zero_const, primitive_count);
+  /* Stream-0 capture state: the invocation key and the number of vertices captured so far. */
+  auto so_key = builder.CreateAlloca(types._int, nullptr, "so_key");
+  builder.CreateStore(builder.getInt32(-1), so_key);
+  auto so_emitted = builder.CreateAlloca(types._int, nullptr, "so_emitted");
+  builder.CreateStore(zero_const, so_emitted);
+  const uint32_t so_record_stride = so_capture ? so_capture->record_dwords + 1 : 0;
+  /* Captures the current output registers as the next vertex of this invocation; `strip_position` is the
+   * vertex's index inside its output strip (0 for point output). Vertices past dcl_maxout are dropped. */
+  auto capture_vertex = [&](llvm::Value *strip_position) {
+    if (!so_capture)
+      return;
+    auto *control = function->getArg(so_control_idx);
+    auto *scratch = function->getArg(so_scratch_idx);
+    auto *record_count = builder.CreateLoad(
+        types._int, builder.CreateConstInBoundsGEP1_32(
+                        types._int, control, offsetof(SM50_SO_CAPTURE_CONTROL, record_count) / 4));
+    auto *key = builder.CreateLoad(types._int, so_key);
+    auto *emitted = builder.CreateLoad(types._int, so_emitted);
+    auto *capture_bb = llvm::BasicBlock::Create(context, "so_capture", function);
+    auto *done_bb = llvm::BasicBlock::Create(context, "so_capture_done", function);
+    builder.CreateCondBr(
+        builder.CreateAnd(builder.CreateICmpULT(key, record_count),
+                          builder.CreateICmpULT(emitted, builder.getInt32(max_vertex_out))),
+        capture_bb, done_bb);
+    builder.SetInsertPoint(capture_bb);
+    auto *record = builder.CreateAdd(
+        builder.CreateMul(builder.CreateZExt(key, builder.getInt64Ty()), builder.getInt64(max_vertex_out)),
+        builder.CreateZExt(emitted, builder.getInt64Ty()));
+    auto *base = builder.CreateMul(record, builder.getInt64(so_record_stride));
+    auto *registers = resource_map.output.ptr_int4;
+    auto *registers_type = registers->getType()->getNonOpaquePointerElementType();
+    for (auto &run : so_runs) {
+      for (uint32_t i = 0; i < run.count; i++) {
+        auto *source = builder.CreateGEP(
+            registers_type, registers,
+            {builder.getInt32(0), builder.getInt32(run.reg), builder.getInt32(run.component + i)});
+        builder.CreateStore(
+            builder.CreateLoad(types._int, source),
+            builder.CreateGEP(types._int, scratch, {builder.CreateAdd(base, builder.getInt64(run.dword_offset + i))}));
+      }
+    }
+    builder.CreateStore(
+        strip_position,
+        builder.CreateGEP(types._int, scratch, {builder.CreateAdd(base, builder.getInt64(so_capture->record_dwords))}));
+    builder.CreateStore(builder.CreateAdd(emitted, one_const), so_emitted);
+    builder.CreateBr(done_bb);
+    builder.SetInsertPoint(done_bb);
+  };
 
   auto mesh_ptr = function->getArg(mesh_idx);
 
@@ -229,6 +346,7 @@ convert_dxbc_geometry_shader(
           builder.CreateICmpEQ(zero_const, builder.CreateAnd(current_write_vertex, one_const)), types._int
       );
 
+      capture_vertex(current_write_vertex);
       MeshOutputContext gs_out_ctx{current_vertex_with_offset, current_primitive_idx};
       for (auto &h : gs_output_handlers) {
         co_yield h(gs_out_ctx);
@@ -280,6 +398,7 @@ convert_dxbc_geometry_shader(
       auto current_primitive_count = builder.CreateLoad(types._int, primitive_count);
       auto current_primitive_idx = builder.CreateAdd(current_primitive_count, current_write_vertex);
 
+      capture_vertex(current_write_vertex);
       MeshOutputContext gs_out_ctx{current_vertex_with_offset, current_primitive_idx};
       for (auto &h : gs_output_handlers) {
         co_yield h(gs_out_ctx);
@@ -316,15 +435,18 @@ convert_dxbc_geometry_shader(
     };
   } else {
     resource_map.call_emit = [&]() -> IREffect {
-      // only one accumulator to maintain, simple one ~
+      // Every emitted point is one primitive; vertex and primitive indices coincide.
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
       builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), next_write_vertex);
+      builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), primitive_count);
 
+      capture_vertex(zero_const);
       MeshOutputContext gs_out_ctx{current_write_vertex, current_write_vertex};
       for (auto &h : gs_output_handlers) {
         co_yield h(gs_out_ctx);
       }
       emit_clip_distances(current_write_vertex);
+      air.CreateSetMeshPointSize(current_write_vertex, air.getFloat(1.0));
       air.CreateSetMeshIndex(current_write_vertex, current_write_vertex);
       co_return {};
     };
@@ -340,7 +462,41 @@ convert_dxbc_geometry_shader(
   auto warp_id =
       builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 2));
 
-  resource_map.patch_id = builder.CreateAdd(builder.CreateMul(warp_id, builder.getInt32(warp_primitive_count)), primitive_id_in_warp);
+  // Flat input primitive index of this invocation.
+  auto *flat_primitive =
+      builder.CreateAdd(builder.CreateMul(warp_id, builder.getInt32(warp_primitive_count)), primitive_id_in_warp);
+  if (tess_input) {
+    /* The GS object stores each primitive's DS patch ID after the Wv vertices (see
+     * convert_dxbc_domain_for_geometry_shader). */
+    resource_map.patch_id = builder.CreateLoad(
+        types._int,
+        builder.CreateGEP(
+            types._int, payload,
+            {builder.CreateAdd(
+                builder.getInt32(4 + warp_vertex_count * pVertexStage->max_output_register * 4), primitive_id_in_warp
+            )}
+        )
+    );
+  } else {
+    resource_map.patch_id = flat_primitive;
+  }
+  if (so_capture) {
+    /* key = ((draw instance * primitives per instance) + primitive id) * GS instances + GS instance: the D3D
+     * stream-output order (SM50_SO_CAPTURE_CONTROL::positions_per_instance bounds the primitive id). With
+     * tessellation input the draw instance is 0 and the flat index already spans every instance. */
+    auto *per_instance = builder.CreateLoad(
+        types._int, builder.CreateConstInBoundsGEP1_32(
+                        types._int, function->getArg(so_control_idx),
+                        offsetof(SM50_SO_CAPTURE_CONTROL, positions_per_instance) / 4));
+    auto *draw_instance = builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
+    auto *primitive = builder.CreateAdd(builder.CreateMul(draw_instance, per_instance), flat_primitive);
+    auto *key = builder.CreateAdd(builder.CreateMul(primitive, builder.getInt32(pShaderInternal->gs_instance_count)),
+                                  resource_map.gs_instance_id);
+    // A primitive id past the per-instance bound belongs to no record (it would alias the next draw instance).
+    builder.CreateStore(
+        builder.CreateSelect(builder.CreateICmpULT(flat_primitive, per_instance), key, builder.getInt32(-1)),
+        so_key);
+  }
 
   auto input_per_vertex_type = llvm::ArrayType::get(types._int4, pVertexStage->max_output_register);
   auto input_per_vertex_type_float = llvm::ArrayType::get(types._float4, pVertexStage->max_output_register);
@@ -369,6 +525,8 @@ convert_dxbc_geometry_shader(
       active_, epilogue_bb
   );
   builder.SetInsertPoint(active_);
+  if (stats_arg != ~0u)
+    increment_pipeline_statistics(builder, air, function, stats_arg, 6); // GSInvocations
 
   auto vertices_ptr = builder.CreateBitCast(
       builder.CreateConstInBoundsGEP1_32(types._int, function->getArg(payload_idx), 4),
@@ -496,7 +654,7 @@ convert_dxbc_geometry_shader(
     return err;
   }
 
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  auto real_entry = convert_stage_body(*pShaderInternal, ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
@@ -509,7 +667,37 @@ convert_dxbc_geometry_shader(
   if (auto err = resource_map.call_cut().build(ctx).takeError()) {
     return err;
   }
-  air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, primitive_count));
+  if (so_capture) {
+    // Header word of this invocation: its captured vertex count (0 for an inactive or silent invocation).
+    auto *control = function->getArg(so_control_idx);
+    auto *scratch = function->getArg(so_scratch_idx);
+    auto *record_count = builder.CreateLoad(
+        types._int, builder.CreateConstInBoundsGEP1_32(
+                        types._int, control, offsetof(SM50_SO_CAPTURE_CONTROL, record_count) / 4));
+    auto *key = builder.CreateLoad(types._int, so_key);
+    auto *header_bb = llvm::BasicBlock::Create(context, "so_header", function);
+    auto *after_bb = llvm::BasicBlock::Create(context, "so_header_done", function);
+    builder.CreateCondBr(builder.CreateICmpULT(key, record_count), header_bb, after_bb);
+    builder.SetInsertPoint(header_bb);
+    auto *headers = builder.CreateMul(builder.CreateZExt(record_count, builder.getInt64Ty()),
+                                      builder.getInt64(uint64_t(max_vertex_out) * so_record_stride));
+    builder.CreateStore(
+        builder.CreateLoad(types._int, so_emitted),
+        builder.CreateGEP(types._int, scratch, {builder.CreateAdd(headers, builder.CreateZExt(key, builder.getInt64Ty()))}));
+    builder.CreateBr(after_bb);
+    builder.SetInsertPoint(after_bb);
+  }
+  auto emitted_primitives = builder.CreateLoad(types._int, primitive_count);
+  if (stats_arg != ~0u) {
+    add_pipeline_statistics(builder, air, function, stats_arg, 8, emitted_primitives); // GSPrimitives
+    /* Every emitted primitive reaches the rasterizer stage. Mesh output has no clipper read-back, so a
+     * primitive split by a clip plane counts once (exact for primitives inside the view volume). */
+    if (!rasterization_disabled) {
+      add_pipeline_statistics(builder, air, function, stats_arg, 10, emitted_primitives); // CInvocations
+      add_pipeline_statistics(builder, air, function, stats_arg, 12, emitted_primitives); // CPrimitives
+    }
+  }
+  air.CreateSetMeshPrimitiveCount(emitted_primitives);
 
   builder.CreateRetVoid();
   module.getOrInsertNamedMetadata("air.mesh")->addOperand(function_metadata);
@@ -544,6 +732,8 @@ convert_dxbc_vertex_for_geometry_shader(
   }
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *stats = nullptr;
+  args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &stats);
 
   bool is_triadj_strip = is_strip && pGeometryStage->gs_input_primitive == D3D10_SB_PRIMITIVE_TRIANGLE_ADJ;
   bool is_indexed_draw = ia_layout && ia_layout->index_buffer_format > 0;
@@ -563,6 +753,8 @@ convert_dxbc_vertex_for_geometry_shader(
   {
     SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
     sig_ctx.ia_layout = ia_layout;
+    // D3D12 (root-signature) vertex tables are indexed by slot, D3D11 tables are compacted.
+    sig_ctx.dense_vertex_table = rootsig != nullptr;
     sig_ctx.skip_vertex_output = true;
     for (auto &p : pShaderInternal->signature_handlers) {
       p(sig_ctx);
@@ -574,6 +766,7 @@ convert_dxbc_vertex_for_geometry_shader(
                                    rootsig->bytecode_length
                                )
                              : setup_binding_table2(shader_info, func_signature, module);
+  const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
 
   uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = 16256});
   // (warp_size, 1, 1)
@@ -778,7 +971,7 @@ convert_dxbc_vertex_for_geometry_shader(
     return err;
   }
 
-  auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
+  auto real_entry = convert_stage_body(*pShaderInternal, ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
   }
@@ -870,6 +1063,17 @@ convert_dxbc_vertex_for_geometry_shader(
 
   builder.CreateStore(warp_id, builder.CreateConstInBoundsGEP1_32(types._int, payload, 2));
 
+  if (stats_arg != ~0u) {
+    /* A warp shades up to 32 lanes but advances by warp_vertex_count (strips overlap the next warp).
+     * Count only the lanes this warp owns, so every IA vertex is counted exactly once. */
+    const uint32_t owned_mask = warp_vertex_count >= 32 ? ~0u : (1u << warp_vertex_count) - 1;
+    auto owned = air.CreateIntUnOp(llvm::air::AIRBuilder::popcount,
+                                   builder.CreateAnd(valid_vertex_result, builder.getInt32(owned_mask)));
+    add_pipeline_statistics(builder, air, function, stats_arg, 0, owned); // IAVertices
+    add_pipeline_statistics(builder, air, function, stats_arg, 4, owned); // VSInvocations
+    add_pipeline_statistics(builder, air, function, stats_arg, 2,          // IAPrimitives
+                            air.CreateIntUnOp(llvm::air::AIRBuilder::popcount, valid_primitive_mask));
+  }
   air.CreateSetMeshProperties(air.getInt3(warp_primitive_count, pGeometryStage->gs_instance_count, 1));
 
   builder.CreateBr(return_);
@@ -881,6 +1085,214 @@ convert_dxbc_vertex_for_geometry_shader(
   module.getOrInsertNamedMetadata("air.object")->addOperand(function_metadata);
   return llvm::Error::success();
 };
+
+/* TS+GS pass 2 object function: a pure fetch of the compacted pass-1 capture (no shader body runs). Each warp
+ * (threadgroup) gathers Q flat primitives of the list into the same payload layout as
+ * convert_dxbc_vertex_for_geometry_shader, plus each primitive's DS patch ID after the Wv vertices. */
+llvm::Error
+convert_dxbc_domain_for_geometry_shader(
+    const SM50ShaderInternal *pDomainStage, const char *name, const SM50ShaderInternal *pGeometryStage,
+    llvm::LLVMContext &context, llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+) {
+  SM50_SHADER_GS_TESSELLATION_INPUT_DATA *tess_input = nullptr;
+  if (!args_get_data<SM50_SHADER_GS_TESSELLATION_INPUT, SM50_SHADER_GS_TESSELLATION_INPUT_DATA>(pArgs, &tess_input))
+    return llvm::make_error<UnsupportedFeature>("domain-for-geometry object requires the tessellation input layout");
+  const SM50_TESS_CAPTURE_LAYOUT layout = tess_input->layout;
+
+  SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
+  if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common))
+    metal_version = sm50_common->metal_version;
+
+  switch (pGeometryStage->gs_input_primitive) {
+  case D3D10_SB_PRIMITIVE_POINT:
+  case D3D10_SB_PRIMITIVE_LINE:
+  case D3D10_SB_PRIMITIVE_TRIANGLE:
+    break;
+  default:
+    return llvm::make_error<UnsupportedFeature>(std::format(
+        "unsupported geometry shader input primitive for tessellation input: {}",
+        (uint32_t)pGeometryStage->gs_input_primitive
+    ));
+  }
+  auto [warp_vertex_count, warp_primitive_count, vertex_per_primitive] =
+      get_vertex_primitive_count_in_warp(pGeometryStage->gs_input_primitive, false);
+  const uint32_t R = pDomainStage->max_output_register;
+  const uint32_t V = layout.max_vertices, P = layout.max_primitives, W = layout.max_workloads;
+  if (vertex_per_primitive != layout.primitive_vertices)
+    return llvm::make_error<UnsupportedFeature>(std::format(
+        "geometry shader input primitive has {} vertices, tessellator output has {}", vertex_per_primitive,
+        layout.primitive_vertices
+    ));
+  // The GS mesh reads R registers per vertex (pVertexStage->max_output_register), so it must match the capture.
+  if (layout.vertex_registers != R || V == 0 || P == 0 || W == 0)
+    return llvm::make_error<UnsupportedFeature>("tessellation capture layout does not match the domain shader");
+  constexpr uint32_t payload_size = 16256;
+  const uint32_t patch_id_dword = 4 + warp_vertex_count * R * 4;
+  if (uint64_t(patch_id_dword) + warp_primitive_count > payload_size / 4)
+    return llvm::make_error<UnsupportedFeature>("tessellation input payload exceeds the object payload size");
+
+  air::FunctionSignatureBuilder func_signature;
+  air::AirType types(context);
+  uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = payload_size});
+  // (32, 1, 1)
+  uint32_t thread_id_idx = func_signature.DefineInput(air::InputThreadPositionInThreadgroup{});
+  // (ceil(total / Q), 1, 1) from the compaction kernel's indirect arguments
+  uint32_t tg_id_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
+  func_signature.DefineInput(air::InputMeshGridProperties{});
+  uint32_t scratch_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = {},
+      .location_index = SM50_BINDING_INDEX_TESS_CAPTURE,
+      .array_size = 0,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::device,
+      .type = air::MSLUint{},
+      .arg_name = "tess_capture",
+      .raster_order_group = {}
+  });
+  uint32_t list_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = {},
+      .location_index = SM50_BINDING_INDEX_TESS_CAPTURE_LIST,
+      .array_size = 0,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::device,
+      .type = air::MSLUint{},
+      .arg_name = "tess_capture_list",
+      .raster_order_group = {}
+  });
+  uint32_t control_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = {},
+      .location_index = SM50_BINDING_INDEX_TESS_CAPTURE_CONTROL,
+      .array_size = 0,
+      .memory_access = air::MemoryAccess::read,
+      .address_space = air::AddressSpace::constant,
+      .type = air::MSLUint{},
+      .arg_name = "tess_capture_control",
+      .raster_order_group = {}
+  });
+
+  auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, true);
+
+  auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
+  auto fetch_bb = llvm::BasicBlock::Create(context, "fetch", function);
+  auto patch_id_bb = llvm::BasicBlock::Create(context, "patch_id", function);
+  auto fetched_bb = llvm::BasicBlock::Create(context, "fetched", function);
+  auto dispatch_bb = llvm::BasicBlock::Create(context, "dispatch", function);
+  auto return_bb = llvm::BasicBlock::Create(context, "return", function);
+  llvm::IRBuilder<> builder(entry_bb);
+  llvm::raw_null_ostream nulldbg{};
+  llvm::air::AIRBuilder air({}, builder, nulldbg);
+  setup_metal_version(module, metal_version);
+
+  auto *payload = function->getArg(payload_idx);
+  auto *scratch = function->getArg(scratch_idx);
+  auto *list = function->getArg(list_idx);
+  auto *control = function->getArg(control_idx);
+  auto *thread_id = builder.CreateExtractElement(function->getArg(thread_id_idx), (uint32_t)0);
+  auto *warp_id = builder.CreateExtractElement(function->getArg(tg_id_idx), (uint32_t)0);
+
+  auto load_dword = [&](llvm::Value *buffer, llvm::Value *index) {
+    return builder.CreateLoad(types._int, builder.CreateGEP(types._int, buffer, {index}));
+  };
+  auto *i64 = builder.getInt64Ty();
+  auto widen = [&](llvm::Value *v) { return builder.CreateZExt(v, i64); };
+
+  auto *total = load_dword(list, builder.getInt32(0));
+  auto *warp_base = builder.CreateMul(warp_id, builder.getInt32(warp_primitive_count));
+  auto *q = builder.CreateUDiv(thread_id, builder.getInt32(vertex_per_primitive));
+  auto *k = builder.CreateURem(thread_id, builder.getInt32(vertex_per_primitive));
+  auto *flat = builder.CreateAdd(warp_base, q);
+  builder.CreateCondBr(
+      builder.CreateAnd(
+          builder.CreateICmpULT(thread_id, builder.getInt32(warp_vertex_count)), builder.CreateICmpULT(flat, total)
+      ),
+      fetch_bb, fetched_bb
+  );
+
+  builder.SetInsertPoint(fetch_bb);
+  auto *slot_count = widen(load_dword(
+      control, builder.getInt32(offsetof(SM50_TESS_CAPTURE_CONTROL, slot_count) / 4)
+  ));
+  auto *vertex_region = builder.CreateAnd(builder.CreateAdd(slot_count, builder.getInt64(3)), builder.getInt64(~3ull));
+  auto *index_region = builder.CreateAdd(
+      vertex_region, builder.CreateMul(slot_count, builder.getInt64(uint64_t(V) * R * 4))
+  );
+  auto *entry = load_dword(list, builder.CreateAdd(builder.getInt32(4), flat));
+  auto *slot = builder.CreateUDiv(entry, builder.getInt32(P));
+  auto *vertex_index = load_dword(
+      scratch, builder.CreateAdd(
+                   index_region, builder.CreateAdd(
+                                     builder.CreateMul(widen(entry), builder.getInt64(vertex_per_primitive)), widen(k)
+                                 )
+               )
+  );
+  auto *source = builder.CreateBitCast(
+      builder.CreateGEP(
+          types._int, scratch,
+          {builder.CreateAdd(
+              vertex_region,
+              builder.CreateMul(
+                  builder.CreateAdd(builder.CreateMul(widen(slot), builder.getInt64(V)), widen(vertex_index)),
+                  builder.getInt64(uint64_t(R) * 4)
+              )
+          )}
+      ),
+      types._int4->getPointerTo((uint32_t)air::AddressSpace::device)
+  );
+  auto *destination = builder.CreateBitCast(
+      builder.CreateGEP(
+          types._int, payload,
+          {builder.CreateAdd(builder.getInt32(4), builder.CreateMul(thread_id, builder.getInt32(R * 4)))}
+      ),
+      types._int4->getPointerTo((uint32_t)air::AddressSpace::object_data)
+  );
+  for (uint32_t reg = 0; reg < R; reg++) {
+    builder.CreateStore(
+        builder.CreateLoad(types._int4, builder.CreateConstInBoundsGEP1_32(types._int4, source, reg)),
+        builder.CreateConstInBoundsGEP1_32(types._int4, destination, reg)
+    );
+  }
+  builder.CreateCondBr(builder.CreateICmpEQ(k, builder.getInt32(0)), patch_id_bb, fetched_bb);
+
+  builder.SetInsertPoint(patch_id_bb);
+  auto *patch_count =
+      load_dword(control, builder.getInt32(offsetof(SM50_TESS_CAPTURE_CONTROL, patch_count) / 4));
+  builder.CreateStore(
+      builder.CreateURem(builder.CreateUDiv(slot, builder.getInt32(W)), patch_count),
+      builder.CreateGEP(types._int, payload, {builder.CreateAdd(builder.getInt32(patch_id_dword), q)})
+  );
+  builder.CreateBr(fetched_bb);
+
+  builder.SetInsertPoint(fetched_bb);
+  builder.CreateCondBr(builder.CreateICmpEQ(thread_id, builder.getInt32(0)), dispatch_bb, return_bb);
+
+  builder.SetInsertPoint(dispatch_bb);
+  /* Primitive q is valid iff warp_base + q < total: the low min(total - warp_base, Q) bits (Q <= 32). The grid
+   * covers exactly ceil(total / Q) warps, so warp_base < total. */
+  auto *remaining = builder.CreateSub(total, warp_base);
+  auto *valid_count = builder.CreateSelect(
+      builder.CreateICmpULT(remaining, builder.getInt32(warp_primitive_count)), remaining,
+      builder.getInt32(warp_primitive_count)
+  );
+  auto *valid_primitive_mask = builder.CreateSelect(
+      builder.CreateICmpUGE(valid_count, builder.getInt32(32)), builder.getInt32(-1),
+      builder.CreateSub(builder.CreateShl(builder.getInt32(1), valid_count), builder.getInt32(1))
+  );
+  // No draw-instance term: the flat primitive index already spans every draw instance.
+  builder.CreateStore(builder.getInt32(0), builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
+  builder.CreateStore(valid_primitive_mask, builder.CreateConstInBoundsGEP1_32(types._int, payload, 1));
+  builder.CreateStore(warp_id, builder.CreateConstInBoundsGEP1_32(types._int, payload, 2));
+  builder.CreateStore(builder.getInt32(0), builder.CreateConstInBoundsGEP1_32(types._int, payload, 3));
+  // IA/VS/HS/DS statistics were counted by pass 1.
+  air.CreateSetMeshProperties(air.getInt3(warp_primitive_count, pGeometryStage->gs_instance_count, 1));
+  builder.CreateBr(return_bb);
+
+  builder.SetInsertPoint(return_bb);
+  builder.CreateRetVoid();
+
+  module.getOrInsertNamedMetadata("air.object")->addOperand(function_metadata);
+  return llvm::Error::success();
+}
 
 } // namespace dxmt::dxbc
 

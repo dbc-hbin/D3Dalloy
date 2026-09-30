@@ -22,6 +22,11 @@ WINDOWS_DIR = Path("lib/wine/x86_64-windows")
 UNIX_DIR = Path("lib/wine/x86_64-unix")
 DXMT_WINDOWS_DIR = Path("x86_64-windows")
 DXMT_UNIX_DIR = Path("x86_64-unix")
+# New-style WoW64: 32-bit PE modules run in i386-windows and reach the single
+# x86_64 winemetal.so through Wine's 32-bit unix-call thunks.
+WOW64_WINDOWS_DIR = Path("lib/wine/i386-windows")
+DXMT_WOW64_DIR = Path("i386-windows")
+PE_MACHINE_I386 = 0x14C
 NATIVE_MODULE = "winemetal.so"
 # The owned DXIL shader compiler is compiled from the owned patch series into
 # airconv and linked into winemetal.so, so no owned graphics artifact may depend
@@ -172,6 +177,22 @@ def regular_file(path: Path, label: str) -> None:
         raise ValueError(f"expected regular non-symlink {label}: {path}")
 
 
+def pe_machine(path: Path) -> int:
+    with path.open("rb") as stream:
+        header = stream.read(0x40)
+        if len(header) < 0x40 or header[:2] != b"MZ":
+            raise ValueError(f"not a PE file: {path}")
+        stream.seek(struct.unpack_from("<I", header, 0x3C)[0])
+        signature = stream.read(6)
+    if len(signature) < 6 or signature[:4] != b"PE\0\0":
+        raise ValueError(f"invalid PE signature: {path}")
+    return struct.unpack_from("<H", signature, 4)[0]
+
+
+def wow64_artifacts(with_wow64: bool) -> tuple[Path, ...]:
+    return tuple(WOW64_WINDOWS_DIR / name for name in WINDOWS_MODULES) if with_wow64 else ()
+
+
 def pe_exports(path: Path) -> set[str]:
     """Read PE export names without depending on external objdump tooling."""
     data = path.read_bytes()
@@ -280,6 +301,25 @@ def reject_removed_sdk_artifacts(dxmt_install: Path) -> None:
             "DXMT install still contains artifacts of the removed external DXIL compiler: "
             + ", ".join(leftovers)
         )
+
+
+def resolve_wow64_artifacts(dxmt_install32: Path) -> dict[Path, Path]:
+    """Resolve a 32-bit Meson install prefix (i386-windows) into the runtime's WoW64 module directory."""
+    if dxmt_install32.is_symlink() or not dxmt_install32.is_dir():
+        raise ValueError(f"dxmt-install32 must be a real Meson install directory: {dxmt_install32}")
+    reject_removed_sdk_artifacts(dxmt_install32)
+    result: dict[Path, Path] = {}
+    for name in WINDOWS_MODULES:
+        source = dxmt_install32 / DXMT_WOW64_DIR / name
+        regular_file(source, f"32-bit DXMT {name}")
+        if pe_machine(source) != PE_MACHINE_I386:
+            raise ValueError(f"32-bit DXMT {name} is not an i386 PE image: {source}")
+        if WINE_BUILTIN_MARKER not in source.read_bytes():
+            raise ValueError(f"32-bit DXMT {name} lacks the Wine builtin marker; winebuild --builtin did not run")
+        result[WOW64_WINDOWS_DIR / name] = source
+    if OWNED_D3D12_MARKER not in (dxmt_install32 / DXMT_WOW64_DIR / "d3d12.dll").read_bytes():
+        raise ValueError("32-bit d3d12.dll is missing the owned backend marker; refusing an unowned/stale DXMT build")
+    return result
 
 
 def resolve_dxmt_artifacts(
@@ -516,6 +556,7 @@ def verify_runtime(runtime: Path) -> list[str]:
     optional = data.get("optional_modules", {})
     with_nvngx = optional.get("nvngx") is True
     with_nvapi = optional.get("nvapi64") is True
+    with_wow64 = optional.get("wow64") is True
     native_record = data.get("native_compiler")
     if "dxil_compiler" in data:
         problems.append("manifest still records the removed external DXIL compiler")
@@ -537,7 +578,7 @@ def verify_runtime(runtime: Path) -> list[str]:
     if not isinstance(recorded, dict):
         problems.append("manifest artifact inventory is missing")
         return problems
-    expected = {str(path) for path in (*runtime_artifacts(with_nvngx, with_nvapi),
+    expected = {str(path) for path in (*runtime_artifacts(with_nvngx, with_nvapi, wow64_artifacts(with_wow64)),
                                        Path("bin/wine"), Path("bin/wine.real"))}
     if set(recorded) != expected:
         problems.append("manifest artifact inventory is incomplete or contains unknown entries")
@@ -565,6 +606,21 @@ def verify_runtime(runtime: Path) -> list[str]:
         module = runtime / WINDOWS_DIR / name
         if module.is_file() and not module.is_symlink() and WINE_BUILTIN_MARKER not in module.read_bytes():
             problems.append(f"staged {name} lacks the Wine builtin marker; winebuild --builtin postprocess did not run")
+    for relative in wow64_artifacts(with_wow64):
+        module = runtime / relative
+        if not module.is_file() or module.is_symlink():
+            continue
+        try:
+            if pe_machine(module) != PE_MACHINE_I386:
+                problems.append(f"staged {relative} is not an i386 PE image")
+        except (OSError, ValueError) as error:
+            problems.append(str(error))
+        if WINE_BUILTIN_MARKER not in module.read_bytes():
+            problems.append(f"staged {relative} lacks the Wine builtin marker; winebuild --builtin postprocess did not run")
+    if with_wow64:
+        d3d12_32 = runtime / WOW64_WINDOWS_DIR / "d3d12.dll"
+        if d3d12_32.is_file() and OWNED_D3D12_MARKER not in d3d12_32.read_bytes():
+            problems.append("staged 32-bit d3d12.dll no longer carries the owned backend marker")
     if with_nvngx:
         nvngx = runtime / WINDOWS_DIR / "nvngx.dll"
         if nvngx.is_file() and not nvngx.is_symlink():
@@ -603,11 +659,21 @@ def verify_runtime(runtime: Path) -> list[str]:
 
 
 def stage(
-    dxmt_install: Path, wine_source: Path, dest: Path, with_nvngx: bool = False, with_nvapi: bool = False
+    dxmt_install: Path, wine_source: Path, dest: Path, with_nvngx: bool = False, with_nvapi: bool = False,
+    dxmt_install32: Path | None = None,
 ) -> None:
     validate_destination(dest, wine_source, dxmt_install)
+    if dxmt_install32 is not None:
+        validate_destination(dest, wine_source, dxmt_install32)
     validate_source_runtime(wine_source)
+    with_wow64 = dxmt_install32 is not None
+    if with_wow64:
+        wow64_dir = wine_source / WOW64_WINDOWS_DIR
+        if wow64_dir.is_symlink() or not wow64_dir.is_dir():
+            raise ValueError(f"missing Wine WoW64 runtime directory: {wow64_dir}")
     dxmt_artifacts = resolve_dxmt_artifacts(dxmt_install, with_nvngx, with_nvapi)
+    if with_wow64:
+        dxmt_artifacts.update(resolve_wow64_artifacts(dxmt_install32))
     winemetal_source = dxmt_artifacts[UNIX_DIR / NATIVE_MODULE]
     dependencies = macho_dependencies(winemetal_source)
     problems = dependency_problems(dependencies)
@@ -627,12 +693,13 @@ def stage(
             if target.exists():
                 target.unlink()
             shutil.copy2(source, target)
-        records = artifact_records(temporary, with_nvngx, with_nvapi)
+        records = artifact_records(temporary, with_nvngx, with_nvapi, wow64_artifacts(with_wow64))
         manifest = {
             "schema": SCHEMA,
             "implementation": "owned-dxmt-derived",
             "source": {
                 "dxmt_install": str(dxmt_install),
+                "dxmt_install32": str(dxmt_install32) if with_wow64 else None,
                 "wine_source": str(wine_source),
             },
             "loader": {
@@ -642,6 +709,7 @@ def stage(
             "optional_modules": {
                 "nvngx": with_nvngx,
                 "nvapi64": with_nvapi,
+                "wow64": with_wow64,
             },
             "artifacts": records,
             "winemetal_dependencies": dependencies,
@@ -675,6 +743,7 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     stage_parser = subparsers.add_parser("stage", help="create a new isolated owned-graphics Wine runtime")
     stage_parser.add_argument("--dxmt-install", required=True, type=Path, help="Meson install prefix containing x86_64-windows and x86_64-unix")
+    stage_parser.add_argument("--dxmt-install32", type=Path, help="optional 32-bit Meson install prefix containing i386-windows; stages WoW64 modules into lib/wine/i386-windows")
     stage_parser.add_argument("--wine-source", required=True, type=Path, help="untouched Wine runtime to copy")
     stage_parser.add_argument("--wine-dest", required=True, type=Path, help="new destination; must not already exist")
     stage_parser.add_argument("--with-nvngx", action="store_true", help="require and stage owned nvngx.dll only if D3D12 exports/marker validate")
@@ -696,7 +765,8 @@ def main() -> int:
     dxmt_install = args.dxmt_install.expanduser().resolve()
     wine_source = args.wine_source.expanduser().resolve()
     dest = args.wine_dest.expanduser().absolute()
-    stage(dxmt_install, wine_source, dest, args.with_nvngx, args.with_nvapi)
+    dxmt_install32 = args.dxmt_install32.expanduser().resolve() if args.dxmt_install32 else None
+    stage(dxmt_install, wine_source, dest, args.with_nvngx, args.with_nvapi, dxmt_install32)
     print(f"PRIVATE owned-graphics runtime staged: {dest}")
     print("Use it only with an explicit isolated WINEPREFIX; the wrapper forces owned builtin graphics modules.")
     print(f"Verify later with: {Path(__file__).name} verify --runtime {dest}")

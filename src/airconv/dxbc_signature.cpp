@@ -17,7 +17,6 @@
  */
 
 #include "dxbc_converter.hpp"
-#include <format>
 
 using namespace microsoft;
 using namespace dxmt::air;
@@ -139,7 +138,7 @@ void handle_signature_vs(
               if (ctx.ia_layout->elements[i].reg == reg) {
                 ctx.prologue << pull_vertex_input(
                   ctx.func_signature, reg, mask, ctx.ia_layout->elements[i],
-                  ctx.ia_layout->slot_mask
+                  ctx.ia_layout->slot_mask, ctx.dense_vertex_table
                 );
                 break;
               }
@@ -166,6 +165,9 @@ void handle_signature_vs(
     auto siv = Inst.m_OutputDeclSIV.Name;
     switch (siv) {
     case D3D10_SB_NAME_CLIP_DISTANCE: {
+      auto sig = findOutputElement([=](const Signature &element) {
+        return element.reg() == reg && (element.mask() & mask) != 0;
+      });
       for (unsigned i = 0; i < 4; i++) {
         if (mask & (1 << i)) {
           sm50_shader->clip_distance_scalars.push_back(
@@ -174,18 +176,21 @@ void handle_signature_vs(
         }
       }
       uint32_t assigned_index = func_signature.DefineOutput(OutputVertex{
-        .user = std::format("SV_ClipDistance{}", reg),
+        .user = varyingAttributeName("SV_ClipDistance", sig.semanticIndex()),
         .type = msl_float4,
       });
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
           return;
-        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+        ctx.epilogue >> pop_output_reg_semantic(reg, mask, assigned_index, true);
       });
       max_output_register = std::max(reg + 1, max_output_register);
       break;
     }
     case D3D10_SB_NAME_CULL_DISTANCE: {
+      auto sig = findOutputElement([=](const Signature &element) {
+        return element.reg() == reg && (element.mask() & mask) != 0;
+      });
       for (unsigned i = 0; i < 4; i++) {
         if (mask & (1 << i)) {
           sm50_shader->cull_distance_scalars.push_back(
@@ -194,13 +199,13 @@ void handle_signature_vs(
         }
       }
       uint32_t assigned_index = func_signature.DefineOutput(OutputVertex{
-        .user = std::format("SV_CullDistance{}", reg),
+        .user = varyingAttributeName("SV_CullDistance", sig.semanticIndex()),
         .type = msl_float4,
       });
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
           return;
-        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+        ctx.epilogue >> pop_output_reg_semantic(reg, mask, assigned_index, true);
       });
       max_output_register = std::max(reg + 1, max_output_register);
       break;
@@ -255,13 +260,13 @@ void handle_signature_vs(
       max_output_register = std::max(reg + 1, max_output_register);
       if (sig.mask() == 0) break;
       uint32_t assigned_index = func_signature.DefineOutput(OutputVertex{
-        .user = sig.consistentAttributeName(),
+        .user = sig.varyingAttributeName(),
         .type = to_msl_type(sig.componentType()),
       });
       signature_handlers.push_back([=](SignatureContext &ctx) {
         if (ctx.skip_vertex_output)
           return;
-        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+        ctx.epilogue >> pop_output_reg_semantic(reg, mask, assigned_index);
       });
       break;
     }
@@ -348,6 +353,9 @@ void handle_signature_ps(
       return;
     }
     auto interpolation = *interpolation_result;
+    if (interpolation == Interpolation::sample_perspective ||
+        interpolation == Interpolation::sample_no_perspective)
+      sm50_shader->ps_sample_frequency = 1;
     uint32_t assigned_index;
     switch (siv) {
     case D3D10_SB_NAME_POSITION:
@@ -376,30 +384,39 @@ void handle_signature_ps(
       }
       assigned_index = func_signature.DefineInput(InputViewportArrayIndex{});
       break;
-    case D3D10_SB_NAME_CLIP_DISTANCE:
+    case D3D10_SB_NAME_CLIP_DISTANCE: {
+      auto sig = findInputElement([=](const Signature &element) {
+        return element.reg() == reg && (element.mask() & mask) != 0;
+      });
       assigned_index = func_signature.DefineInput(InputFragmentStageIn{
-        .user = std::format("SV_ClipDistance{}", reg),
+        .user = varyingAttributeName("SV_ClipDistance", sig.semanticIndex()),
         .type = msl_float4,
         .interpolation = interpolation,
         .pull_mode = false
       });
       break;
-    case D3D10_SB_NAME_CULL_DISTANCE:
+    }
+    case D3D10_SB_NAME_CULL_DISTANCE: {
+      auto sig = findInputElement([=](const Signature &element) {
+        return element.reg() == reg && (element.mask() & mask) != 0;
+      });
       assigned_index = func_signature.DefineInput(InputFragmentStageIn{
-        .user = std::format("SV_CullDistance{}", reg),
+        .user = varyingAttributeName("SV_CullDistance", sig.semanticIndex()),
         .type = msl_float4,
         .interpolation = interpolation,
         .pull_mode = false
       });
       break;
+    }
     default:
       sm50_shader->initialization_error = "Unsupported DXBC pixel shader system-value input";
       return;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
-      ctx.prologue << init_input_reg(
-        assigned_index, reg, mask, siv == D3D10_SB_NAME_POSITION
-      );
+      if (siv == D3D10_SB_NAME_CLIP_DISTANCE || siv == D3D10_SB_NAME_CULL_DISTANCE)
+        ctx.prologue << init_input_reg_semantic(assigned_index, reg, mask);
+      else
+        ctx.prologue << init_input_reg(assigned_index, reg, mask, siv == D3D10_SB_NAME_POSITION);
     });
     max_input_register = std::max(reg + 1, max_input_register);
     break;
@@ -417,6 +434,9 @@ void handle_signature_ps(
       return;
     }
     auto interpolation = *interpolation_result;
+    if (interpolation == Interpolation::sample_perspective ||
+        interpolation == Interpolation::sample_no_perspective)
+      sm50_shader->ps_sample_frequency = 1;
     uint32_t assigned_index;
     switch (siv) {
     case microsoft::D3D10_SB_NAME_IS_FRONT_FACE:
@@ -432,6 +452,7 @@ void handle_signature_ps(
         return;
       }
       assigned_index = func_signature.DefineInput(InputSampleIndex{});
+      sm50_shader->ps_sample_frequency = 1;
       break;
     case microsoft::D3D10_SB_NAME_PRIMITIVE_ID:
       if (interpolation != Interpolation::flat) {
@@ -459,12 +480,15 @@ void handle_signature_ps(
       return;
     }
     auto interpolation = *interpolation_result;
+    if (interpolation == Interpolation::sample_perspective ||
+        interpolation == Interpolation::sample_no_perspective)
+      sm50_shader->ps_sample_frequency = 1;
     auto sig = findInputElement([=](Signature sig) {
       return (sig.reg() == reg) && ((sig.mask() & mask) != 0);
     });
     max_input_register = std::max(reg + 1, max_input_register);
     if (sig.mask() == 0) break;
-    signature_handlers.push_back([=, type = sig.componentType(), name = sig.consistentAttributeName()]
+    signature_handlers.push_back([=, type = sig.componentType(), name = sig.varyingAttributeName()]
     (SignatureContext &ctx) {
       bool pull_mode = bool(ctx.pull_mode_reg_mask & (1 << reg)) && interpolation != air::Interpolation::flat;
       auto assigned_index = ctx.func_signature.DefineInput(InputFragmentStageIn{
@@ -472,7 +496,7 @@ void handle_signature_ps(
       });
       if (pull_mode) {
         assert(type == RegisterComponentType::Float && "otherwise the input register contains mixed data type");
-        ctx.resource.interpolant_map[reg] = interpolant_descriptor{
+        ctx.resource.interpolant_map[reg].push_back(interpolant_descriptor{
           [=](auto) {
             return make_irvalue([=](struct context ctx) {
               return ctx.function->getArg(assigned_index);
@@ -480,8 +504,9 @@ void handle_signature_ps(
           },
           (interpolation == air::Interpolation::sample_perspective ||
            interpolation == air::Interpolation::center_perspective ||
-           interpolation == air::Interpolation::centroid_perspective)
-        };
+           interpolation == air::Interpolation::centroid_perspective),
+          static_cast<uint8_t>(mask)
+        });
         uint32_t sampleidx_at = ~0u;
         switch (interpolation) {
         case Interpolation::sample_perspective:
@@ -491,9 +516,9 @@ void handle_signature_ps(
         default:
           break;
         }
-        ctx.prologue << init_input_reg_with_interpolation(assigned_index, reg, mask, interpolation, sampleidx_at);
+        ctx.prologue << init_input_reg_with_interpolation_semantic(assigned_index, reg, mask, interpolation, sampleidx_at);
       } else {
-        ctx.prologue << init_input_reg(assigned_index, reg, mask);
+        ctx.prologue << init_input_reg_semantic(assigned_index, reg, mask);
       }
     });
     break;
@@ -685,8 +710,8 @@ void handle_signature_hs(
     auto sgv = Inst.m_InputDeclSGV.Name;
     switch (sgv) {
     default:
-      assert(0 && "Unexpected/unhandled hull shader sgv");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC hull shader system-value input";
+      return;
     }
     max_input_register = std::max(reg + 1, max_input_register);
     break;
@@ -716,15 +741,14 @@ void handle_signature_hs(
     }
 
     default:
-      assert(0 && "unhandled hull shader input");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC hull shader input declaration";
+      return;
     }
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "dcl_output_sgv should not happen for now");
-    // only GS PrimitiveID uses this, but we don't support GS for now
-    break;
+    sm50_shader->initialization_error = "Unsupported DXBC hull shader system-value output";
+    return;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SIV: {
     unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
@@ -777,8 +801,8 @@ void handle_signature_hs(
       break;
     }
     default:
-      assert(0 && "Unexpected/unhandled hull shader output siv");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC hull shader system-value output";
+      return;
     }
     if (phase != ~0u) {
       max_patch_constant_output_register =
@@ -796,9 +820,10 @@ void handle_signature_hs(
       auto reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
       auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
       if (phase != ~0u) {
-        assert(
-          Inst.m_Operands[0].m_IndexDimension == D3D10_SB_OPERAND_INDEX_1D
-        );
+        if (Inst.m_Operands[0].m_IndexDimension != D3D10_SB_OPERAND_INDEX_1D) {
+          sm50_shader->initialization_error = "Invalid DXBC hull shader patch-constant output";
+          return;
+        }
         for (unsigned i = 0; i < 4; i++) {
           if (mask & (1 << i)) {
             sm50_shader->patch_constant_scalars.push_back(
@@ -814,14 +839,14 @@ void handle_signature_hs(
       break;
     }
     default:
-      assert(0 && "unhandled hull shader output");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC hull shader output declaration";
+      return;
     }
     break;
   }
   default:
-    assert(0);
-    break;
+    sm50_shader->initialization_error = "Unsupported DXBC hull shader signature declaration";
+    return;
   }
 };
 
@@ -869,14 +894,15 @@ void handle_signature_ds(
       break;
     }
     default:
-      assert(0 && "unhandled dcl_input_siv in domain shader");
+      sm50_shader->initialization_error = "Unsupported DXBC domain shader system-value input";
+      return;
     }
 
     break;
   }
   case D3D10_SB_OPCODE_DCL_INPUT_SGV: {
-    assert(0);
-    break;
+    sm50_shader->initialization_error = "Unsupported DXBC domain shader system-value input";
+    return;
   }
   case D3D10_SB_OPCODE_DCL_INPUT: {
     D3D10_SB_OPERAND_TYPE RegType = Inst.m_Operands[0].m_Type;
@@ -891,26 +917,28 @@ void handle_signature_ds(
       break;
     }
     case D3D10_SB_OPERAND_TYPE_INPUT:
-      assert(0);
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC domain shader input declaration";
+      return;
     case D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT: {
       unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
-      assert(Inst.m_Operands[0].m_IndexDimension == D3D10_SB_OPERAND_INDEX_1D);
+      if (Inst.m_Operands[0].m_IndexDimension != D3D10_SB_OPERAND_INDEX_1D) {
+        sm50_shader->initialization_error = "Invalid DXBC domain shader patch-constant input";
+        return;
+      }
       max_input_register = std::max(reg + 1, max_input_register);
       break;
     }
     case D3D11_SB_OPERAND_TYPE_INPUT_CONTROL_POINT:
       break;
     default:
-      assert(0 && "unhandeld domain shader input");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC domain shader input declaration";
+      return;
     }
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "dcl_output_sgv should not happen for now");
-    // only GS PrimitiveID uses this, but we don't support GS for now
-    break;
+    sm50_shader->initialization_error = "Unsupported DXBC domain shader system-value output";
+    return;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SIV: {
     unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
@@ -961,8 +989,8 @@ void handle_signature_ds(
       break;
     }
     default:
-      assert(0 && "Unexpected/unhandled input system value");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC domain shader system-value output";
+      return;
     }
     max_output_register = std::max(reg + 1, max_output_register);
     break;
@@ -982,7 +1010,7 @@ void handle_signature_ds(
       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
       auto const type = to_msl_type(sig.componentType());
       func_signature.DefineMeshVertexOutput(OutputMeshData{
-        .user = sig.consistentAttributeName(),
+        .user = sig.varyingAttributeName(),
         .type = type,
         .index = mesh_vertex_data_index
       });
@@ -992,14 +1020,14 @@ void handle_signature_ds(
       break;
     }
     default:
-      assert(0 && "unhandled domain shader output");
-      break;
+      sm50_shader->initialization_error = "Unsupported DXBC domain shader output declaration";
+      return;
     }
     break;
   }
   default:
-    assert(0);
-    break;
+    sm50_shader->initialization_error = "Unsupported DXBC domain shader signature declaration";
+    return;
   }
 };
 
@@ -1108,7 +1136,8 @@ handle_signature_gs(
     auto sgv = Inst.m_InputDeclSGV.Name;
     switch (sgv) {
     default:
-      assert(0 && "Unexpected/unhandled geometry shader sgv");
+      sm50_shader->initialization_error = "Unsupported DXBC geometry shader system-value input";
+      return;
       break;
     }
     break;
@@ -1122,7 +1151,8 @@ handle_signature_gs(
     case D3D10_SB_NAME_CLIP_DISTANCE:
       break;
     default:
-      assert(0 && "Unexpected/unhandled geometry shader siv");
+      sm50_shader->initialization_error = "Unsupported DXBC geometry shader system-value input";
+      return;
       break;
     }
     break;
@@ -1132,19 +1162,25 @@ handle_signature_gs(
 
     switch (RegType) {
     case microsoft::D3D10_SB_OPERAND_TYPE_INPUT: {
-      assert(Inst.m_Operands[0].m_IndexDimension == microsoft::D3D10_SB_OPERAND_INDEX_2D);
+      if (Inst.m_Operands[0].m_IndexDimension != microsoft::D3D10_SB_OPERAND_INDEX_2D) {
+        sm50_shader->initialization_error = "Invalid DXBC geometry shader input declaration";
+        return;
+      }
       break;
     }
     case microsoft::D3D10_SB_OPERAND_TYPE_INPUT_PRIMITIVEID:
+    case microsoft::D3D11_SB_OPERAND_TYPE_INPUT_GS_INSTANCE_ID:
       break;
     default:
-      assert(0 && "unhandled geometry shader input");
+      sm50_shader->initialization_error = "Unsupported DXBC geometry shader input declaration";
+      return;
       break;
     }
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SGV: {
-    assert(0 && "unhandled geometry shader output sgv");
+    sm50_shader->initialization_error = "Unsupported DXBC geometry shader system-value output";
+    return;
     break;
   }
   case D3D10_SB_OPCODE_DCL_OUTPUT_SIV: {
@@ -1192,7 +1228,8 @@ handle_signature_gs(
       break;
     }
     default:
-      assert(0 && "Unexpected/unhandled geometry shader output siv");
+      sm50_shader->initialization_error = "Unsupported DXBC geometry shader system-value output";
+      return;
       break;
     }
     max_output_register = std::max(reg + 1, max_output_register);
@@ -1213,7 +1250,7 @@ handle_signature_gs(
       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
       auto const type = to_msl_type(sig.componentType());
       func_signature.DefineMeshVertexOutput(OutputMeshData{
-        .user = sig.consistentAttributeName(),
+        .user = sig.varyingAttributeName(),
         .type = type,
         .index = mesh_vertex_data_index
       });
@@ -1223,14 +1260,15 @@ handle_signature_gs(
       break;
     }
     default:
-      assert(0 && "unhandled geometry shader output");
+      sm50_shader->initialization_error = "Unsupported DXBC geometry shader output declaration";
+      return;
       break;
     }
     break;
   }
   default:
-    assert(0);
-    break;
+    sm50_shader->initialization_error = "Unsupported DXBC geometry shader signature declaration";
+    return;
   }
 };
 

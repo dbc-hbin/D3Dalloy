@@ -127,6 +127,19 @@ enum WMTResourceOptions : uint64_t {
   WMTResourceOptionCPUCacheModeWriteCombined = 1,
 };
 
+/*
+ * WoW64 only: a CPU-visible device buffer (MTLDevice_newBuffer without caller storage) whose CPU
+ * mapping the 32-bit caller dereferences. Metal places such storage above 4 GiB, so the unix side
+ * backs it with Wine memory below 2 GiB instead. Not a Metal option bit; the unix side strips it.
+ * It is 0 in 64-bit images, where every mapping is addressable.
+ */
+#if defined(__i386__)
+#define WMT_RESOURCE_CPU_ADDRESSABLE ((enum WMTResourceOptions)(1ull << 62))
+#else
+#define WMT_RESOURCE_CPU_ADDRESSABLE ((enum WMTResourceOptions)0)
+#endif
+#define WMT_RESOURCE_CPU_ADDRESSABLE_BIT (1ull << 62)
+
 struct WMTMemoryPointer {
   void *ptr;
 #if defined(__i386__)
@@ -812,6 +825,9 @@ struct WMTRenderPassInfo {
   uint32_t render_target_height;
   uint32_t render_target_width;
   obj_handle_t visibility_buffer;
+  // All sample locations are (0.5, 0.5) when this pass uses the fixed
+  // D3D12 center pattern. Zero preserves Metal's default sample positions.
+  uint8_t center_sample_pattern;
 };
 
 WINEMETAL_API obj_handle_t MTLCommandBuffer_renderCommandEncoder(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info);
@@ -1369,6 +1385,7 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetBlendFactor,
   WMTRenderCommandSetStencilRef,
   WMTRenderCommandSetDepthStencilState,
+  WMTRenderCommandSetStencilRefFrontBack,
 };
 
 struct wmtcmd_render_nop {
@@ -1644,6 +1661,15 @@ struct wmtcmd_render_setstencilref {
   uint8_t stencil_ref;
 };
 
+/* setStencilFrontReferenceValue:backReferenceValue: */
+struct wmtcmd_render_setstencilref_front_back {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  uint32_t front_stencil_ref;
+  uint32_t back_stencil_ref;
+};
+
 struct wmtcmd_render_dxmt_geometry_draw {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
@@ -1789,6 +1815,15 @@ WINEMETAL_API void MTLCommandBuffer_presentDrawable(obj_handle_t cmdbuf, obj_han
 WINEMETAL_API void
 MTLCommandBuffer_presentDrawableAfterMinimumDuration(obj_handle_t cmdbuf, obj_handle_t drawable, double after);
 
+/* Presents `drawable` from the command buffer's completion handler, only if the shared event
+   `token` still reads `epoch` then; otherwise the drawable is released unpresented and, when
+   `observer` is non-null, its `present_id` observation is canceled.
+   `after` > 0 selects presentAfterMinimumDuration. */
+WINEMETAL_API void MTLCommandBuffer_presentDrawableIfCurrent(
+    obj_handle_t cmdbuf, obj_handle_t drawable, obj_handle_t token, uint64_t epoch, double after,
+    obj_handle_t observer, uint64_t present_id
+);
+
 enum WMTGPUFamily {
   WMTGPUFamilyApple1 = 1001,
   WMTGPUFamilyApple2 = 1002,
@@ -1814,6 +1849,11 @@ WINEMETAL_API bool MTLDevice_supportsFamily(obj_handle_t device, enum WMTGPUFami
 WINEMETAL_API bool MTLDevice_supportsBCTextureCompression(obj_handle_t device);
 
 WINEMETAL_API bool MTLDevice_supportsTextureSampleCount(obj_handle_t device, uint8_t sample_count);
+
+WINEMETAL_API bool MTLDevice_programmableSamplePositionsSupported(obj_handle_t device);
+
+/* GPU core count of the device's IOKit accelerator entry; 0 when unknown. */
+WINEMETAL_API uint32_t MTLDevice_gpuCoreCount(obj_handle_t device);
 
 WINEMETAL_API bool MTLDevice_hasUnifiedMemory(obj_handle_t device);
 
@@ -2116,6 +2156,55 @@ WINEMETAL_API void SharedEventListener_start(obj_handle_t shared_event_listener)
 
 WINEMETAL_API void SharedEventListener_destroy(obj_handle_t shared_event_listener);
 
+/* A drawable's callback may arrive after GPU completion, or with presentedTime == 0
+ * when a frame is skipped. This observer delivers native results to a waiting Wine
+ * thread without calling into PE code from the Metal callback thread. */
+enum WMTPresentationOutcome {
+  WMTPresentationPresented = 1,
+  WMTPresentationSkipped = 2,
+};
+
+struct WMTPresentationEvent {
+  uint64_t present_id;
+  uint64_t drawable_id;
+  double presented_host_seconds;
+  uint64_t refresh_sequence;
+  uint64_t refresh_generation;
+  uint32_t outcome;
+  uint32_t reserved;
+  uint64_t refresh_output_host_ticks;
+  int64_t refresh_video_time;
+};
+
+/* CoreVideo's output timestamp pairs video_time with predicted output_host_ticks.
+ * Both are shared by observers of the same display; a new generation invalidates
+ * comparisons across display switches and timing discontinuities. */
+struct WMTDisplayRefreshSample {
+  uint64_t refresh_sequence;
+  uint64_t refresh_generation;
+  uint64_t output_host_ticks;
+  uint64_t host_frequency;
+  int64_t video_time;
+  int64_t video_refresh_period;
+  double rate_scalar;
+  uint64_t cv_flags;
+  uint32_t display_id;
+  int32_t video_time_scale;
+};
+
+WINEMETAL_API obj_handle_t WMTPresentationObserver_create(void);
+WINEMETAL_API bool MetalDrawable_observePresentation(obj_handle_t drawable, obj_handle_t observer,
+                                                      uint64_t present_id);
+/* 1 = event, 0 = closed, -1 = allocation failure. */
+WINEMETAL_API int32_t WMTPresentationObserver_wait(obj_handle_t observer, struct WMTPresentationEvent *event);
+WINEMETAL_API void WMTPresentationObserver_cancel(obj_handle_t observer, uint64_t present_id);
+/* Close wakes waiters; the caller then joins its worker before dropping its observer reference. */
+WINEMETAL_API void WMTPresentationObserver_close(obj_handle_t observer);
+WINEMETAL_API double WMTClockSampleHostSeconds(void);
+WINEMETAL_API bool WMTPresentationObserver_setView(obj_handle_t observer, obj_handle_t view);
+WINEMETAL_API bool WMTPresentationObserver_getRefreshSample(obj_handle_t observer,
+                                                            struct WMTDisplayRefreshSample *sample);
+
 WINEMETAL_API void WMTGetOSVersion(uint64_t *major, uint64_t *minor, uint64_t *patch);
 
 enum WMTMetalVersion : uint32_t {
@@ -2156,6 +2245,22 @@ WINEMETAL_API bool WMTBootstrapLookUp(const char *name, mach_port_t *mach_port);
 WINEMETAL_API mach_port_t MTLSharedEvent_createMachPort(obj_handle_t event);
 
 WINEMETAL_API obj_handle_t MTLDevice_newSharedEventWithMachPort(obj_handle_t device, mach_port_t mach_port);
+
+/*
+ * D3D12 sharing rendezvous. Create registers a private receive right under a
+ * fresh `dxmt.share.<pid>.<128-bit random>` bootstrap name (name_out >= 64
+ * bytes) that answers lookups with a copy of `object_port`; destroy
+ * unregisters it. LookUp returns an owned send right, released with
+ * WMTMachPortDeallocate.
+ */
+WINEMETAL_API uint64_t WMTShareRendezvousCreate(mach_port_t object_port, char *name_out);
+WINEMETAL_API void WMTShareRendezvousDestroy(uint64_t rendezvous);
+WINEMETAL_API bool WMTShareRendezvousLookUp(const char *name, mach_port_t *object_port);
+/* Cross-process identity: 0 = MTLSharedEvent trace id, 1 = shared texture IOSurfaceID. 0 on failure. */
+WINEMETAL_API uint64_t WMTShareObjectIdentity(obj_handle_t object, uint32_t kind);
+WINEMETAL_API void WMTMachPortDeallocate(mach_port_t port);
+/* Salted per-user hash of a D3D object name; hash_out >= 33 bytes. */
+WINEMETAL_API bool WMTShareHashName(const uint16_t *name, uint32_t length, char *hash_out);
 
 WINEMETAL_API uint64_t MTLDevice_registryID(obj_handle_t device);
 
@@ -2260,6 +2365,104 @@ MTLDevice_heapTextureSizeAndAlign(obj_handle_t device, struct WMTTextureInfo *in
 WINEMETAL_API obj_handle_t MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset);
 
 WINEMETAL_API obj_handle_t MTLHeap_newTexture(obj_handle_t heap, struct WMTTextureInfo *info, uint64_t offset);
+
+/*
+ * Placement sparse resources (Metal 4, macOS 26+). A placement heap created with
+ * `max_sparse_page_size` backs tiles of placement sparse buffers and textures created with a page
+ * size no larger than it. Unmapped ranges read zero and drop writes.
+ */
+WINEMETAL_API bool MTLDevice_supportsPlacementSparse(obj_handle_t device);
+
+WINEMETAL_API obj_handle_t MTLDevice_newPlacementHeap(
+    obj_handle_t device, const struct WMTHeapInfo *info, enum WMTSparsePageSize max_sparse_page_size
+);
+
+/* info->gpu_address is filled in; the buffer's storage is private. */
+WINEMETAL_API obj_handle_t MTLDevice_newPlacementSparseBuffer(
+    obj_handle_t device, struct WMTBufferInfo *info, enum WMTSparsePageSize page_size
+);
+
+WINEMETAL_API obj_handle_t MTLDevice_newPlacementSparseTexture(
+    obj_handle_t device, struct WMTTextureInfo *info, enum WMTSparsePageSize page_size
+);
+
+/* A texture-buffer view of a placement sparse buffer (it must carry the buffer's page size). */
+WINEMETAL_API obj_handle_t MTLBuffer_newPlacementSparseTextureView(
+    obj_handle_t buffer, struct WMTTextureInfo *info, uint64_t offset, uint64_t bytes_per_row,
+    enum WMTSparsePageSize page_size
+);
+
+struct WMTSparseTileShape {
+  uint32_t width;
+  uint32_t height;
+  uint32_t depth;
+  uint32_t reserved;
+};
+
+WINEMETAL_API struct WMTSparseTileShape MTLDevice_sparseTileSize(
+    obj_handle_t device, enum WMTTextureType type, enum WMTPixelFormat format, uint32_t sample_count,
+    enum WMTSparsePageSize page_size
+);
+
+struct WMTSparseTextureTail {
+  uint64_t first_mipmap_in_tail;
+  uint64_t tail_size_in_bytes;
+};
+
+WINEMETAL_API struct WMTSparseTextureTail MTLTexture_sparseTail(obj_handle_t texture);
+
+WINEMETAL_API obj_handle_t MTLDevice_newMTL4CommandQueue(obj_handle_t device);
+
+WINEMETAL_API void MTL4CommandQueue_addResidencySet(obj_handle_t queue, obj_handle_t residency_set);
+
+enum WMTSparseMappingMode : uint32_t {
+  WMTSparseMappingModeMap = 0,
+  WMTSparseMappingModeUnmap = 1,
+};
+
+/* Tile units throughout. `heap_offset` is ignored for unmaps. */
+struct WMTSparseBufferMapping {
+  enum WMTSparseMappingMode mode;
+  uint32_t reserved;
+  uint64_t first_tile;
+  uint64_t tile_count;
+  uint64_t heap_offset;
+};
+
+STATIC_ASSERT(sizeof(struct WMTSparseBufferMapping) == 32);
+
+struct WMTSparseTextureMapping {
+  enum WMTSparseMappingMode mode;
+  uint32_t level;
+  uint32_t slice;
+  uint32_t reserved;
+  struct WMTOrigin origin;
+  struct WMTSize size;
+  uint64_t heap_offset;
+};
+
+STATIC_ASSERT(sizeof(struct WMTSparseTextureMapping) == 72);
+
+/*
+ * Enqueue mapping updates on an MTL4 command queue. Metal applies them when enqueued; they are not
+ * ordered by the queue's event waits, so callers order them against GPU work themselves.
+ */
+WINEMETAL_API void MTL4CommandQueue_updateBufferMappings(
+    obj_handle_t queue, obj_handle_t buffer, obj_handle_t heap, const struct WMTSparseBufferMapping *mappings,
+    uint64_t count
+);
+
+WINEMETAL_API void MTL4CommandQueue_updateTextureMappings(
+    obj_handle_t queue, obj_handle_t texture, obj_handle_t heap, const struct WMTSparseTextureMapping *mappings,
+    uint64_t count
+);
+
+WINEMETAL_API void MTL4CommandQueue_signalEvent(obj_handle_t queue, obj_handle_t event, uint64_t value);
+
+/* Sampler reduction (min/max filtering), macOS 26+. 0 weighted average, 1 minimum, 2 maximum. */
+WINEMETAL_API obj_handle_t MTLDevice_newSamplerStateWithReduction(
+    obj_handle_t device, struct WMTSamplerInfo *info, uint32_t reduction
+);
 
 enum WMTIndirectCommandType {
   WMTIndirectCommandTypeDraw = (1 << 0),

@@ -316,6 +316,47 @@ class StagingPolicyTests(unittest.TestCase):
             problems = stage_owned_graphics.verify_runtime(self.dest)
             self.assertTrue(any("self-owned native compiler" in problem for problem in problems), problems)
 
+    @staticmethod
+    def pe_image(machine: int, payload: bytes) -> bytes:
+        header = bytearray(0x40)
+        header[:2] = b"MZ"
+        header[0x3C:0x40] = (0x40).to_bytes(4, "little")
+        return bytes(header) + b"PE\0\0" + machine.to_bytes(2, "little") + b"\0" * 18 + payload
+
+    def test_wow64_modules_are_staged_machine_checked_and_reverified(self) -> None:
+        dxmt32 = self.root / "dxmt-install32"
+        (dxmt32 / stage_owned_graphics.DXMT_WOW64_DIR).mkdir(parents=True)
+        (self.wine / stage_owned_graphics.WOW64_WINDOWS_DIR).mkdir(parents=True)
+        for name in stage_owned_graphics.WINDOWS_MODULES:
+            payload = name.encode() + b"-" + stage_owned_graphics.WINE_BUILTIN_MARKER
+            if name == "d3d12.dll":
+                payload += b"-" + stage_owned_graphics.OWNED_D3D12_MARKER
+            (dxmt32 / stage_owned_graphics.DXMT_WOW64_DIR / name).write_bytes(
+                self.pe_image(stage_owned_graphics.PE_MACHINE_I386, payload))
+        dependencies = ["@rpath/winemetal.so", "@rpath/winemac.so", "@rpath/ntdll.so", "/usr/lib/libSystem.B.dylib"]
+        with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=dependencies), \
+             mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
+            # An x86_64 image in the 32-bit prefix is a mislabeled build, not a WoW64 module.
+            amd64 = dxmt32 / stage_owned_graphics.DXMT_WOW64_DIR / "dxgi.dll"
+            good = amd64.read_bytes()
+            amd64.write_bytes(self.pe_image(0x8664, good[0x40 + 24:]))
+            with self.assertRaisesRegex(ValueError, "not an i386 PE image"):
+                stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, dxmt_install32=dxmt32)
+            self.assertFalse(self.dest.exists())
+            amd64.write_bytes(good)
+
+            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, dxmt_install32=dxmt32)
+            self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
+            staged = self.dest / stage_owned_graphics.WOW64_WINDOWS_DIR / "d3d12.dll"
+            self.assertEqual(staged.read_bytes(), (dxmt32 / "i386-windows/d3d12.dll").read_bytes())
+            manifest = json.loads((self.dest / stage_owned_graphics.MANIFEST).read_text())
+            self.assertIs(manifest["optional_modules"]["wow64"], True)
+            self.assertIn(str(stage_owned_graphics.WOW64_WINDOWS_DIR / "d3d12.dll"), manifest["artifacts"])
+            # A staged 32-bit module replaced after staging must fail reverification.
+            staged.write_bytes(self.pe_image(stage_owned_graphics.PE_MACHINE_I386, b"stale"))
+            problems = stage_owned_graphics.verify_runtime(self.dest)
+            self.assertTrue(any("hash changed: lib/wine/i386-windows/d3d12.dll" in p for p in problems), problems)
+
     def test_artifact_hash_detects_mutation(self) -> None:
         artifact = self.root / "artifact"
         artifact.write_bytes(b"one")

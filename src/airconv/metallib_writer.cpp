@@ -24,6 +24,15 @@ struct InputAttribute {
 
 void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
 
+  uint16_t airVersionMajor = 2, airVersionMinor = 6;
+  if (auto *version = module.getNamedMetadata("air.version"); version && version->getNumOperands()) {
+    auto *fields = version->getOperand(0);
+    if (fields->getNumOperands() >= 2) {
+      airVersionMajor = cast<ConstantInt>(cast<ConstantAsMetadata>(fields->getOperand(0))->getValue())->getZExtValue();
+      airVersionMinor = cast<ConstantInt>(cast<ConstantAsMetadata>(fields->getOperand(1))->getValue())->getZExtValue();
+    }
+  }
+
   SmallVector<char, 0> bitcode;
   SmallVector<char, 0> public_metadata;
   SmallVector<char, 0> private_metadata;
@@ -115,11 +124,11 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = compiled.offset,
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
-        });
+                  .airVersionMajor = airVersionMajor,
+                  .airVersionMinor = airVersionMinor,
+                  .languageVersionMajor = 3,
+                  .languageVersionMinor = 1,
+                });
         while (fn->getNumOperands() > 3 && isa<MDTuple>(fn->getOperand(3).get())
         ) {
           auto maybe_patch_tuple = cast<MDTuple>(fn->getOperand(3).get());
@@ -239,11 +248,11 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = compiled.offset,
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
-        });
+                  .airVersionMajor = airVersionMajor,
+                  .airVersionMinor = airVersionMinor,
+                  .languageVersionMajor = 3,
+                  .languageVersionMinor = 1,
+                });
         function_def_stream << "ENDT";
         const auto recordSize = uint32_t(function_def_stream.tell() - recordOffset);
         std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));
@@ -288,11 +297,11 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = compiled.offset,
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
-        });
+                  .airVersionMajor = airVersionMajor,
+                  .airVersionMinor = airVersionMinor,
+                  .languageVersionMajor = 3,
+                  .languageVersionMinor = 1,
+                });
         function_def_stream << "ENDT";
         const auto recordSize = uint32_t(function_def_stream.tell() - recordOffset);
         std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));
@@ -325,11 +334,11 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = compiled.offset,
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
-        });
+                  .airVersionMajor = airVersionMajor,
+                  .airVersionMinor = airVersionMinor,
+                  .languageVersionMajor = 3,
+                  .languageVersionMinor = 1,
+                });
         function_def_stream << "ENDT";
         const auto recordSize = uint32_t(function_def_stream.tell() - recordOffset);
         std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));
@@ -371,11 +380,11 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = compiled.offset,
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
-        });
+                  .airVersionMajor = airVersionMajor,
+                  .airVersionMinor = airVersionMinor,
+                  .languageVersionMajor = 3,
+                  .languageVersionMinor = 1,
+                });
         function_def_stream << "ENDT";
         const auto recordSize = uint32_t(function_def_stream.tell() - recordOffset);
         std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));

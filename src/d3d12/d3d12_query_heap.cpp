@@ -21,15 +21,14 @@
 
 namespace dxmt {
 
+static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 88);
+
 class MTLD3D12QueryHeapImpl : public MTLD3D12Pageable<MTLD3D12QueryHeap> {
 public:
   MTLD3D12QueryHeapImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12QueryHeap>(pDevice) {}
 
   HRESULT
   Initialize(const D3D12_QUERY_HEAP_DESC *pDesc) {
-    if (!pDesc || !pDesc->Count || pDesc->NodeMask > 1)
-      return E_INVALIDARG;
-
     desc = *pDesc;
     switch (desc.Type) {
     case D3D12_QUERY_HEAP_TYPE_TIMESTAMP: {
@@ -68,13 +67,41 @@ public:
         return E_FAIL;
       break;
     }
+    case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS: {
+      // Results (Count entries) followed by BeginQuery snapshots (Count entries).
+      WMTBufferInfo info{};
+      info.length = uint64_t(desc.Count) * 2 * sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
+      info.options = WMTResourceHazardTrackingModeUntracked | WMT_RESOURCE_CPU_ADDRESSABLE;
+      so_statistics = device_->GetMTLDevice().newBuffer(info);
+      if (!so_statistics)
+        return E_OUTOFMEMORY;
+      if (auto *memory = info.memory.get_accessible_or_null())
+        memset(memory, 0, info.length);
+      auto function = device_->GetLib().getLibrary().newFunction("query_so_statistics_end");
+      WMT::Reference<WMT::Error> error;
+      so_statistics_end_pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
+      if (!so_statistics_end_pipeline)
+        return E_FAIL;
+      break;
+    }
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS: {
+      WMTBufferInfo info{};
+      info.length = uint64_t(desc.Count) * 2 * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
+      info.options = WMTResourceHazardTrackingModeUntracked;
+      pipeline_statistics = device_->GetMTLDevice().newBuffer(info);
+      if (!pipeline_statistics)
+        return E_OUTOFMEMORY;
+      auto function = device_->GetLib().getLibrary().newFunction("query_pipeline_statistics_end");
+      WMT::Reference<WMT::Error> error;
+      pipeline_statistics_end_pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
+      if (!pipeline_statistics_end_pipeline)
+        return E_FAIL;
+      break;
+    }
     default:
       return E_NOTIMPL;
     }
-    WMT::Allocation allocation = desc.Type == D3D12_QUERY_HEAP_TYPE_TIMESTAMP
-                                     ? WMT::Allocation(timestamp_dummy)
-                                     : WMT::Allocation(visibility_results);
-    HRESULT hr = device_->RegisterResidency(allocation, this);
+    HRESULT hr = device_->RegisterResidency(ResidencyAllocation(), this);
     if (FAILED(hr))
       return hr;
     owned_graphics::Trace("query_heap_create", ",\"heap\":", owned_id,
@@ -82,10 +109,22 @@ public:
     return S_OK;
   }
 
+  WMT::Allocation
+  ResidencyAllocation() const {
+    switch (desc.Type) {
+    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+      return WMT::Allocation(timestamp_dummy);
+    case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
+      return WMT::Allocation(so_statistics);
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
+      return WMT::Allocation(pipeline_statistics);
+    default:
+      return WMT::Allocation(visibility_results);
+    }
+  }
+
   ~MTLD3D12QueryHeapImpl() {
-    WMT::Allocation allocation = desc.Type == D3D12_QUERY_HEAP_TYPE_TIMESTAMP
-                                     ? WMT::Allocation(timestamp_dummy)
-                                     : WMT::Allocation(visibility_results);
+    WMT::Allocation allocation = ResidencyAllocation();
     if (allocation)
       device_->UnregisterResidency(allocation, this);
   }
@@ -116,7 +155,7 @@ HRESULT
 CreateQueryHeap(MTLD3D12Device *pDevice, const D3D12_QUERY_HEAP_DESC *pDesc, REFIID riid, void **ppQueryHeap) {
   if (ppQueryHeap)
     *ppQueryHeap = nullptr;
-  if (!pDesc)
+  if (!pDesc || !pDesc->Count || pDesc->NodeMask > 1)
     return E_INVALIDARG;
   auto heap = Com(new MTLD3D12QueryHeapImpl(pDevice));
   HRESULT hr = heap->Initialize(pDesc);

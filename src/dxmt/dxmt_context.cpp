@@ -1820,4 +1820,16 @@ SimpleCommandContext<ArgumentEncodingContext>::draw(
   draw.instance_count = instance_count;
 }
 
+template <>
+void
+SimpleCommandContext<ArgumentEncodingContext>::drawIndirect(
+    WMTPrimitiveType primitive, WMT::Buffer arguments, uint64_t offset
+) {
+  auto &draw = ctx.encodeRenderCommand<wmtcmd_render_draw_indirect>();
+  draw.type = WMTRenderCommandDrawIndirect;
+  draw.primitive_type = primitive;
+  draw.indirect_args_buffer = arguments;
+  draw.indirect_args_offset = offset;
+}
+
 } // namespace dxmt

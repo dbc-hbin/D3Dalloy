@@ -108,6 +108,8 @@ public:
 
     if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
       return DXGI_ERROR_INVALID_CALL;
+    if (!wsi::isWindow(hWnd))
+      return DXGI_ERROR_INVALID_CALL;
 
     Com<IMTLSwapChainFactory> swapchain_factory;
     if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&swapchain_factory)))) {
@@ -134,8 +136,11 @@ public:
       fsDesc.Windowed = TRUE;
     }
 
-    return swapchain_factory->CreateSwapChain(this, hWnd, &desc, &fsDesc,
-                                              ppSwapChain);
+    Com<IMTLD3D12SwapChainFactory> d3d12_factory;
+    if (SUCCEEDED(pDevice->QueryInterface(IID_PPV_ARGS(&d3d12_factory))))
+      return d3d12_factory->CreateSwapChainWithOutput(this, hWnd, &desc, &fsDesc,
+                                                       pRestrictToOutput, ppSwapChain);
+    return swapchain_factory->CreateSwapChain(this, hWnd, &desc, &fsDesc, ppSwapChain);
   }
 
   DXMT_HOTPATCHABLE

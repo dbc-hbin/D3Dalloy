@@ -67,7 +67,7 @@ constexpr WMTSamplerAddressMode kAddressModeMap[] = {
 };
 
 void
-PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC_SAMPLER_DESC const &Desc) {
+PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC_SAMPLER_DESC1 const &Desc) {
 
   InfoOut.lod_average = false;
   InfoOut.mip_filter = WMTSamplerMipFilterNotMipmapped;
@@ -118,11 +118,15 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC
       InfoOut.compare_function = kCompareFunctionMap[Desc.ComparisonFunc];
     }
   }
-  switch (Desc.BorderColor) {
+  // The *_UINT static border colors are the integer {0,0,0,1} / {1,1,1,1}. Metal's
+  // predefined border colors return exactly those integers when sampling an integer
+  // texture, so they map onto the same enumerators as their float counterparts.
+  switch (static_cast<UINT>(Desc.BorderColor)) {
   case D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK:
     InfoOut.border_color = WMTSamplerBorderColorTransparentBlack;
     break;
   case D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK:
+  case kStaticBorderColorOpaqueBlackUint:
     InfoOut.border_color = WMTSamplerBorderColorOpaqueBlack;
     break;
   default:
@@ -130,7 +134,14 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC
     break;
   }
   InfoOut.support_argument_buffers = true;
-  InfoOut.normalized_coords = true;
+  // Root signature validation restricts NON_NORMALIZED_COORDINATES to the subset Metal
+  // defines for normalizedCoordinates = NO (1D/2D, min=mag, point mips, LOD 0).
+  InfoOut.normalized_coords = !(Desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES);
+  if (!InfoOut.normalized_coords) {
+    // Metal requires a non-mipmapped sampler for unnormalized coordinates.
+    InfoOut.mip_filter = WMTSamplerMipFilterNotMipmapped;
+    InfoOut.max_anisotroy = 1;
+  }
 }
 
 void

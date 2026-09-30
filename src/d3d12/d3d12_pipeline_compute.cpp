@@ -37,6 +37,12 @@ class MTLD3D12ComputePipelineStateImpl : public MTLD3D12Pageable<MTLD3D12Compute
   WMT::Reference<WMT::Function> indirect_compute_function;
   WMT::Reference<WMT::ComputePipelineState> indirect_pso;
   std::mutex indirect_pso_mutex;
+  std::vector<uint8_t> statistics_cs_bytecode;
+  std::vector<uint8_t> statistics_root_blob;
+  WMT::Reference<WMT::ComputePipelineState> statistics_pso;
+  WMT::Reference<WMT::ComputePipelineState> statistics_indirect_pso;
+  WMT::Reference<WMT::Function> statistics_function;
+  std::mutex statistics_pso_mutex;
 
 public:
   MTLD3D12ComputePipelineStateImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12ComputePipelineState>(pDevice) {
@@ -64,6 +70,11 @@ public:
       rootsig.bytecode_length = pDesc->CS.BytecodeLength;
     }
     rootsig.next = nullptr;
+    const auto *cs_source = static_cast<const uint8_t *>(pDesc->CS.pShaderBytecode);
+    statistics_cs_bytecode.assign(cs_source, cs_source + pDesc->CS.BytecodeLength);
+    const auto *root_source = static_cast<const uint8_t *>(rootsig.bytecode);
+    if (pDesc->pRootSignature)
+      statistics_root_blob.assign(root_source, root_source + rootsig.bytecode_length);
 
     SM50_SHADER_COMMON_DATA common;
     common.flags = {};
@@ -78,7 +89,7 @@ public:
 
     if (!cache_.loaded() && SM50Compile(shader_cs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main",
                                        cache_.output(PipelineCache::Compute), &sm50_err)) {
-      ERR("Failed to compile cs shader");
+      ERR("Failed to compile cs shader: ", SM50GetErrorMessageString(sm50_err));
       return E_FAIL;
     }
 
@@ -86,7 +97,7 @@ public:
 
     auto cs_data = WMT::MakeDispatchData(cs_bitcode_compiled.Data, cs_bitcode_compiled.Size);
 
-    if (HRESULT hr = compute_constants.Initialize(metal, cs_bitcode_compiled); FAILED(hr))
+    if (HRESULT hr = compute_constants.Initialize(device_, cs_bitcode_compiled, cache_.bitcode(PipelineCache::Compute)); FAILED(hr))
       return hr;
 
     WMT::Reference<WMT::Error> err;
@@ -138,6 +149,62 @@ public:
     return indirect_pso;
   }
 
+  WMT::ComputePipelineState
+  GetPipelineStatisticsPipelineState(bool indirect) override {
+    std::lock_guard<std::mutex> lock(statistics_pso_mutex);
+    auto metal = device_->GetMTLDevice();
+    WMT::Reference<WMT::Error> error;
+    if (!statistics_function) {
+      SM50Shader shader;
+      SM50Error compile_error;
+      if (FAILED(InitializeShader(
+              "CS-statistics", {statistics_cs_bytecode.data(), statistics_cs_bytecode.size()}, &shader, nullptr)))
+        return {};
+      SM50_SHADER_COMMON_DATA common{};
+      common.type = SM50_SHADER_COMMON;
+      common.metal_version = kD3D12ShaderMetalVersion;
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics{};
+      statistics.type = SM50_SHADER_D3D12_PIPELINE_STATS;
+      statistics.next = &common;
+      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
+      root.type = SM50_SHADER_ROOT_SIGNATURE;
+      root.bytecode = statistics_root_blob.empty() ? statistics_cs_bytecode.data() : statistics_root_blob.data();
+      root.bytecode_length = statistics_root_blob.empty() ? statistics_cs_bytecode.size()
+                                                         : statistics_root_blob.size();
+      root.next = &statistics;
+      SM50ShaderBitcode compiled;
+      if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+                      "cs_main", &compiled, &compile_error)) {
+        ERR("Failed to compile statistics CS: ", SM50GetErrorMessageString(compile_error));
+        return {};
+      }
+      SM50_COMPILED_BITCODE bytecode{};
+      SM50GetCompiledBitcode(compiled, &bytecode);
+      if (FAILED(pipeline_statistics_compute_constants.Initialize(device_, bytecode, compiled)))
+        return {};
+      auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
+      auto lib = metal.newLibrary(data, error);
+      if (!lib)
+        return {};
+      statistics_function = lib.newFunction("cs_main");
+      if (!statistics_function)
+        return {};
+    }
+    auto &variant = indirect ? statistics_indirect_pso : statistics_pso;
+    if (!variant) {
+      auto info = indirect_info;
+      info.compute_function = statistics_function.handle;
+      info.support_indirect_command_buffers = indirect;
+      info.immutable_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
+      if (pipeline_statistics_compute_constants.buffer)
+        info.immutable_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+      variant = metal.newComputePipelineState(info, error);
+      if (!variant)
+        ERR("Failed to create statistics compute PSO: ", error.description().getUTF8String());
+    }
+    return variant;
+  }
+
   HRESULT
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) override {
@@ -171,6 +238,7 @@ CreateComputePipelineState(
 ) {
   InitReturnPtr(ppPipelineState);
   if (!ppPipelineState || !pDesc || pDesc->NodeMask > 1 || !pDesc->CS.pShaderBytecode || !pDesc->CS.BytecodeLength ||
+      (static_cast<UINT>(pDesc->Flags) & ~static_cast<UINT>(D3D12_PIPELINE_STATE_FLAG_DEBUG)) ||
       (pDesc->CachedPSO.CachedBlobSizeInBytes && !pDesc->CachedPSO.pCachedBlob))
     return E_INVALIDARG;
   if (pDesc->pRootSignature) {

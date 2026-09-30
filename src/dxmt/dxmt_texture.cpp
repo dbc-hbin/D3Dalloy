@@ -91,7 +91,8 @@ TextureAllocation::TextureAllocation(
 void
 TextureAllocation::free(){
 #ifdef __i386__
-  wsi::aligned_free(mappedMemory);
+  if (!placed_memory_)
+    wsi::aligned_free(mappedMemory);
 #endif
   delete this;
 };
@@ -204,6 +205,28 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
 }
 
 Rc<TextureAllocation>
+Texture::allocate(Flags<TextureAllocationFlag> flags, void *placed_memory) {
+  if (!bytes_per_image_ || !placed_memory)
+    return nullptr;
+  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+  if (flags.test(TextureAllocationFlag::CpuWriteCombined))
+    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+  WMTTextureInfo info = info_; // copy
+  info.mach_port = 0;
+  info.options = options;
+  WMTBufferInfo buffer_info;
+  buffer_info.length = bytes_per_image_;
+  buffer_info.options = options;
+  buffer_info.memory.set(placed_memory);
+  auto buffer = device_.newBuffer(buffer_info);
+  if (!buffer)
+    return nullptr;
+  auto *allocation = new TextureAllocation(this, std::move(buffer), placed_memory, info, bytes_per_row_, flags);
+  allocation->placed_memory_ = true;
+  return allocation;
+}
+
+Rc<TextureAllocation>
 Texture::allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset) {
   WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
   WMTTextureInfo info = info_; // copy
@@ -220,6 +243,18 @@ Texture::allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t h
   info.options = options;
   flags.set(TextureAllocationFlag::AllocatedOnHeap);
   return new TextureAllocation(this, heap.newTexture(info, heap_offset), info, flags);
+}
+
+Rc<TextureAllocation>
+Texture::allocateSparse(WMTSparsePageSize page_size) {
+  WMTTextureInfo info = info_; // copy
+  info.mach_port = 0;
+  info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
+  Flags<TextureAllocationFlag> flags;
+  flags.set(TextureAllocationFlag::GpuPrivate);
+  flags.set(TextureAllocationFlag::PlacementSparse);
+  auto texture = device_.newPlacementSparseTexture(info, page_size);
+  return new TextureAllocation(this, std::move(texture), info, flags);
 }
 
 Rc<TextureAllocation>
@@ -243,7 +278,7 @@ Texture::import(mach_port_t mach_port) {
     flags.set(TextureAllocationFlag::Shared);
     return new TextureAllocation(this, std::move(texture), info, flags);
   }
-  assert(texture && "failed to import shared texture");
+  // A failed import (dead or foreign port) is reported to the caller, never aborts.
   return nullptr;
 }
 

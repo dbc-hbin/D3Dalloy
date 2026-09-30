@@ -519,10 +519,14 @@ AIRBuilder::CreateSampleCmpCommon(
 std::pair<Value *, Value *>
 AIRBuilder::CreateSampleGrad(
     const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
-    Value *DerivY, Value *MinLOD, const int32_t Offset[3]
+    Value *DerivY, Value *MinLOD, const int32_t Offset[3], Value *Reference
 ) {
   assert(Texture.kind <= Texture::last_resource_kind);
   auto &TexInfo = TextureInfo[Texture.kind];
+  if (Reference && !TexInfo.is_depth) {
+    debug << "invalid operation: compare on non depth texture.\n";
+    return {nullptr, nullptr};
+  }
 
   auto &Context = getContext();
   auto Attrs = AttributeList::get(
@@ -563,6 +567,13 @@ AIRBuilder::CreateSampleGrad(
   if (TexInfo.is_array) {
     Tys.push_back(getIntTy());
     Ops.push_back(ArrayIndex);
+  }
+
+  /* `air.sample_compare_<depth>_grad` carries the reference right after the coordinate
+   * (and array index), exactly as Metal's own `sample_compare(..., gradient2d)` does. */
+  if (Reference) {
+    Tys.push_back(getFloatTy());
+    Ops.push_back(Reference);
   }
 
   Tys.push_back(getTextureSampleCoordType(Texture));
@@ -609,7 +620,7 @@ AIRBuilder::CreateSampleGrad(
   Tys.push_back(getIntTy());
   Ops.push_back(getInt(0));
 
-  std::string FnName = "air.sample_";
+  std::string FnName = Reference ? "air.sample_compare_" : "air.sample_";
   FnName += TexInfo.air_symbol_suffix;
   FnName += "_grad";
   FnName += getTypeOverloadSuffix(getTexelType(Texture), getTexelSign(Texture));
@@ -1497,7 +1508,7 @@ AIRBuilder::CreateInterpolateAtOffset(Value *Interpoant, Value *Offset, bool Per
 
   auto Fn = getModule()->getOrInsertFunction(
       Perspective ? "air.interpolate_offset_perspective.v4f32" : "air.interpolate_offset_no_perspective.v4f32",
-      FunctionType::get(getFloatTy(4), {Interpoant->getType(), getIntTy(2)}, false), Attrs
+      FunctionType::get(getFloatTy(4), {Interpoant->getType(), getFloatTy(2)}, false), Attrs
   );
 
   return builder.CreateCall(Fn, {Interpoant, Offset});

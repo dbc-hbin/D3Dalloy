@@ -440,10 +440,10 @@ public:
     MSLRepresentableType type, uint32_t location_index = UINT32_MAX,
     std::optional<uint32_t> raster_order_group = std::nullopt
   );
-  // uint32_t DefineIndirectBuffer(
-  //   std::string name, llvm::StructType* struct_type, llvm::Metadata*
-  //   struct_type_metadata
-  // );
+  uint32_t DefineIndirectBuffer(
+    std::string name, llvm::StructType *struct_type, llvm::Metadata *struct_type_info,
+    uint32_t location_index = UINT32_MAX
+  );
   uint32_t DefineTexture(
     std::string name, TextureKind kind, MemoryAccess access,
     MSLScalerType scaler_type, uint32_t location_index = UINT32_MAX,
@@ -465,6 +465,20 @@ private:
   std::vector<ArgumentBufferArguments> fieldsType;
   std::unordered_set<std::string> fields;
 };
+
+/* A table still occupies one root qword; each heap descriptor remains 32 bytes.
+ * Ranges must be sorted by non-overlapping descriptor offsets. */
+struct RasterOrderedDescriptorRange {
+  uint32_t descriptor_offset;
+  uint32_t descriptor_count;
+  std::optional<MSLTexture> texture; // otherwise a device-buffer UAV
+  bool with_counter;
+};
+
+std::tuple<llvm::StructType *, llvm::MDNode *> BuildRasterOrderedDescriptorTable(
+  llvm::ArrayRef<RasterOrderedDescriptorRange> ranges, llvm::LLVMContext &context,
+  const llvm::DataLayout &layout
+);
 
 enum class InputAttributeComponentType : uint32_t {
   Unknown,
@@ -518,6 +532,15 @@ struct InputPrimitiveID {};
 struct InputFrontFacing {};
 struct InputInputCoverage {};
 struct InputSampleIndex {};
+/** `[[barycentric_coord]]`, float3, perspective or no-perspective at the pixel center. */
+struct InputBarycentric {
+  bool perspective;
+};
+/** `vertex_value<T> [[user(name)]]`: the un-interpolated per-vertex attribute (air.get_vertex_value). */
+struct InputVertexValue {
+  std::string user;
+  MSLScalerOrVectorType type;
+};
 
 struct InputPayload {
   uint32_t size;
@@ -717,7 +740,7 @@ using FunctionInput = template_concat_t<
     /* fragment */
     InputPrimitiveID, InputViewportArrayIndex, InputRenderTargetArrayIndex,
     InputFrontFacing, InputPosition, InputSampleIndex, //
-    InputFragmentStageIn, InputInputCoverage,
+    InputFragmentStageIn, InputInputCoverage, InputBarycentric, InputVertexValue,
     /* object & mesh */
     InputPayload, InputMeshGridProperties, InputMesh,
     /* kernel */

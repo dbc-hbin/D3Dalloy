@@ -38,45 +38,32 @@ void testLogicalFenceRewindAndOverlap() {
   timeline.signalCpu(5);
   require(timeline.completedValue() == 5, "CPU rewind did not become current completion");
 
-  bool blocked_done = false;
-  bool qualifying_done = false;
-  auto blocked = timeline.prepare(5, [&] { return blocked_done; });
-  auto qualifying = timeline.prepare(10, [&] { return qualifying_done; });
-  timeline.publish(blocked);
-  timeline.publish(qualifying);
+  auto blocked = timeline.prepare(5);
+  auto qualifying = timeline.prepare(10);
 
   auto latch = std::make_shared<FenceCompletionLatch>();
   require(timeline.addCompletionWaiter(10, [latch] { latch->signal(); }), "future completion waiter allocation failed");
   require(!latch->ready(), "future waiter used stale initial completion after rewind");
 
-  qualifying_done = true;
-  timeline.reconcile();
+  timeline.complete(qualifying);
   require(latch->ready(), "qualifying producer was pinned behind blocked producer");
   require(timeline.completedValue() == 10, "actual qualifying completion was not published");
 
-  blocked_done = true;
-  timeline.reconcile();
+  timeline.complete(blocked);
   require(timeline.completedValue() == 5, "late rewind completion did not become current value");
   require(latch->ready(), "completion latch was undone by rewind");
   std::puts("QUEUE_ORDER_LOGICAL_PASS cpu_rewind=1 overlap=1 any_producer=1 latch=1");
 }
 
-void testCompletionRegistrationAndRollback() {
+void testCompletionRegistrationAcrossRewind() {
   FenceOrderEpoch timeline(12, 0);
-  bool cancelled_done = false;
-  auto cancelled = timeline.prepare(99, [&] { return cancelled_done; });
-  timeline.cancel(cancelled);
-  cancelled_done = true;
-  timeline.reconcile();
-  require(timeline.completedValue() == 0, "cancelled enqueue changed logical completion");
-
   auto latch = std::make_shared<FenceCompletionLatch>();
   require(timeline.addCompletionWaiter(7, [latch] { latch->signal(); }), "completion registration failed");
   timeline.signalCpu(7);
   timeline.signalCpu(2);
   require(latch->ready(), "registered completion did not survive later rewind");
   require(timeline.completedValue() == 2, "CPU rewind final value mismatch");
-  std::puts("QUEUE_ORDER_REGISTRATION_PASS rollback=1 crossing_latched=1 final=2");
+  std::puts("QUEUE_ORDER_REGISTRATION_PASS crossing_latched=1 final=2");
 }
 
 void testCloseDrainsFifo() {
@@ -94,6 +81,36 @@ void testCloseDrainsFifo() {
   for (unsigned i = 0; i < drained.size(); ++i)
     require(drained[i] == i, "FIFO order changed while draining");
   std::puts("QUEUE_ORDER_FIFO_PASS tasks=64 close=drain order=exact");
+}
+
+void testDeviceRemovalTerminatesFence() {
+  FenceOrderEpoch timeline(13, 2);
+  auto gpu = timeline.prepare(7);
+  unsigned future = 0, maximum = 0, late = 0;
+  require(timeline.addCompletionWaiter(8, [&] { ++future; }), "register future removal waiter");
+  require(timeline.addCompletionWaiter(UINT64_MAX, [&] { ++maximum; }), "register maximum removal waiter");
+  require(future == 0 && maximum == 0, "incomplete fence fired before removal");
+  timeline.remove();
+  require(timeline.completedValue() == UINT64_MAX, "removed fence did not expose UINT64_MAX");
+  require(future == 1 && maximum == 1, "removal did not release every pending waiter");
+
+  // CPU signals, a delayed native completion, and an enqueue racing removal
+  // must never lower the terminal value or fire the old registrations again.
+  timeline.signalCpu(0);
+  timeline.complete(gpu);
+  auto racing = timeline.prepare(3);
+  timeline.complete(racing);
+  timeline.remove();
+  require(timeline.completedValue() == UINT64_MAX, "late signal rewound a removed fence");
+  require(future == 1 && maximum == 1, "removal fired a waiter twice");
+  require(timeline.addCompletionWaiter(UINT64_MAX, [&] { ++late; }) && late == 1,
+          "late waiter did not observe removal immediately");
+
+  FenceOrderEpoch healthy(14);
+  healthy.signalCpu(UINT64_MAX);
+  healthy.signalCpu(1);
+  require(healthy.completedValue() == 1, "ordinary maximum signal was mistaken for removal");
+  std::puts("QUEUE_ORDER_REMOVAL_PASS pending_and_late_waiters=1 terminal=1 ordinary_rewind=1");
 }
 
 void testTaskRetainsSubmissionStorage() {
@@ -185,8 +202,7 @@ void testFutureSignalDoesNotBlockCallerAndDefersConsumerEncoding() {
   //   B.Wait(F1) -> B.Execute(temporalB) -> A.Execute(temporalA) -> A.Signal(F1)
   // Enqueue calls all return; only B's worker waits. A is free to encode first.
   require(queue_b.push([&] {
-    while (!producer_latch->waitFor(2ms))
-      producer->reconcile();
+    producer_latch->wait();
     record("B_WAIT_ENCODE");
   }), "enqueue B.Wait");
   require(queue_b.push([&] { record("B_EXECUTE_TEMPORAL"); }), "enqueue B.Execute");
@@ -220,7 +236,8 @@ void testFutureSignalDoesNotBlockCallerAndDefersConsumerEncoding() {
 
 int main() {
   testLogicalFenceRewindAndOverlap();
-  testCompletionRegistrationAndRollback();
+  testCompletionRegistrationAcrossRewind();
+  testDeviceRemovalTerminatesFence();
   testCloseDrainsFifo();
   testTaskRetainsSubmissionStorage();
   testRecordHeadAddressStabilityAcrossListReset();

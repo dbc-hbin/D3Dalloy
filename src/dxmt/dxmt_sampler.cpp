@@ -15,11 +15,15 @@ Sampler::decRef() {
 };
 
 Rc<Sampler>
-Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod_bias) {
+Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod_bias, uint32_t reduction) {
   Rc<Sampler> ret = new Sampler();
   ret->info_ = info;
+  auto create = [&](WMTSamplerInfo &sampler_info) {
+    return reduction ? device.newSamplerStateWithReduction(sampler_info, reduction)
+                     : device.newSamplerState(sampler_info);
+  };
 
-  ret->sampler_state = device.newSamplerState(ret->info_);
+  ret->sampler_state = create(ret->info_);
   if (!ret->sampler_state) {
     return nullptr;
   }
@@ -37,7 +41,7 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
     cube_sampler_info.t_address_mode = WMTSamplerAddressModeClampToEdge;
     cube_sampler_info.r_address_mode = WMTSamplerAddressModeClampToEdge;
   }
-  ret->sampler_state_cube = device.newSamplerState(cube_sampler_info);
+  ret->sampler_state_cube = create(cube_sampler_info);
   if (!ret->sampler_state_cube) {
     return nullptr;
   }
