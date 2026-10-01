@@ -22,6 +22,7 @@
 namespace dxmt {
 
 static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 88);
+static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1) == 112);
 
 class MTLD3D12QueryHeapImpl : public MTLD3D12Pageable<MTLD3D12QueryHeap> {
 public:
@@ -84,14 +85,19 @@ public:
         return E_FAIL;
       break;
     }
-    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS: {
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1: {
+      const bool mesh = desc.Type == D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1;
+      pipeline_statistics_record = mesh ? sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1)
+                                        : sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
       WMTBufferInfo info{};
-      info.length = uint64_t(desc.Count) * 2 * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
+      info.length = uint64_t(desc.Count) * 2 * pipeline_statistics_record;
       info.options = WMTResourceHazardTrackingModeUntracked;
       pipeline_statistics = device_->GetMTLDevice().newBuffer(info);
       if (!pipeline_statistics)
         return E_OUTOFMEMORY;
-      auto function = device_->GetLib().getLibrary().newFunction("query_pipeline_statistics_end");
+      auto function = device_->GetLib().getLibrary().newFunction(
+          mesh ? "query_pipeline_statistics1_end" : "query_pipeline_statistics_end");
       WMT::Reference<WMT::Error> error;
       pipeline_statistics_end_pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
       if (!pipeline_statistics_end_pipeline)
@@ -117,6 +123,7 @@ public:
     case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
       return WMT::Allocation(so_statistics);
     case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1:
       return WMT::Allocation(pipeline_statistics);
     default:
       return WMT::Allocation(visibility_results);

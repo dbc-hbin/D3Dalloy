@@ -106,7 +106,7 @@ struct Probe {
     state.metadata.geometry = geometry;
     WMTBufferInfo info{};
     info.length = width * height * 4 * sizeof(unsigned short);
-    info.options = WMTResourceStorageModeShared;
+    info.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE;
     auto buffer = device.newBuffer(info);
     require(buffer && info.memory.get(), "readback-buffer");
     auto command = queue.commandBuffer();

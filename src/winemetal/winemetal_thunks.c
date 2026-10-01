@@ -1562,10 +1562,10 @@ WMTASPack(struct unixcall_wmt_as *params, const uint64_t *args, unsigned count) 
 }
 
 WINEMETAL_API obj_handle_t
-WMTASDescriptor_new(uint32_t top_level, uint32_t geometry_count) {
+WMTASDescriptor_new(obj_handle_t device, uint32_t top_level, uint32_t geometry_count) {
   struct unixcall_wmt_as params;
-  const uint64_t args[] = {top_level, geometry_count};
-  UNIX_CALL(172, WMTASPack(&params, args, 2));
+  const uint64_t args[] = {top_level, geometry_count, device};
+  UNIX_CALL(172, WMTASPack(&params, args, 3));
   return params.ret[0];
 }
 
@@ -1581,13 +1581,14 @@ WMTASDescriptor_setTriangles(
     obj_handle_t descriptor, uint32_t index, obj_handle_t vertices, uint64_t vertex_offset,
     uint64_t vertex_stride, obj_handle_t indices, uint64_t index_offset, uint32_t index_type,
     obj_handle_t transform, uint64_t transform_offset, uint64_t triangle_count,
-    uint32_t intersection_function_table_offset, uint32_t geometry_flags
+    uint32_t intersection_function_table_offset, uint32_t geometry_flags, uint32_t vertex_format
 ) {
   struct unixcall_wmt_as params;
   const uint64_t args[] = {
       descriptor, index, vertices, vertex_offset, vertex_stride, indices, index_offset, index_type,
-      transform, transform_offset, triangle_count, intersection_function_table_offset, geometry_flags};
-  UNIX_CALL(174, WMTASPack(&params, args, 13));
+      transform, transform_offset, triangle_count, intersection_function_table_offset, geometry_flags,
+      vertex_format};
+  UNIX_CALL(174, WMTASPack(&params, args, 14));
   return params.ret[0];
 }
 
@@ -1650,6 +1651,16 @@ WMT_AS_SIDECAR_THUNK(WMTASSidecar_contributionBuffer, 181)
 WMT_AS_SIDECAR_THUNK(WMTASSidecar_resourceID, 182)
 WMT_AS_SIDECAR_THUNK(WMTASSidecar_contributionGPUAddress, 183)
 WMT_AS_SIDECAR_THUNK(WMTASSidecar_size, 184)
+WMT_AS_SIDECAR_THUNK(WMTASSidecar_instanceCount, 269)
+WMT_AS_SIDECAR_THUNK(WMTASSidecar_generations, 270)
+
+WINEMETAL_API bool
+WMTASSidecar_allocate(obj_handle_t sidecar, obj_handle_t device, uint64_t size, uint64_t count) {
+  struct unixcall_wmt_as params;
+  const uint64_t args[] = {sidecar, device, size, count};
+  UNIX_CALL(268, WMTASPack(&params, args, 4));
+  return params.ret[0] != 0;
+}
 WMT_AS_SIDECAR_THUNK(WMTCommandBuffer_accelerationStructureCommandEncoder, 185)
 
 #undef WMT_AS_SIDECAR_THUNK
@@ -1732,27 +1743,7 @@ WMTComputeEncoder_encodeASPrepass(
   return params.ret[0];
 }
 
-WINEMETAL_API bool
-WMTComputeEncoder_encodeASWriteU64(
-    obj_handle_t encoder, obj_handle_t pipeline, obj_handle_t destination_buffer,
-    uint64_t destination_offset, uint64_t value
-) {
-  struct unixcall_wmt_as params;
-  const uint64_t args[] = {encoder, pipeline, destination_buffer, destination_offset, value};
-  UNIX_CALL(191, WMTASPack(&params, args, 5));
-  return params.ret[0];
-}
 
-WINEMETAL_API bool
-WMTComputeEncoder_encodeASFinalizeCompactedSize(
-    obj_handle_t encoder, obj_handle_t pipeline, obj_handle_t destination_buffer,
-    uint64_t destination_offset
-) {
-  struct unixcall_wmt_as params;
-  const uint64_t args[] = {encoder, pipeline, destination_buffer, destination_offset};
-  UNIX_CALL(192, WMTASPack(&params, args, 4));
-  return params.ret[0];
-}
 
 WINEMETAL_API void
 WMTASEncoder_fence(obj_handle_t encoder, obj_handle_t fence, bool update) {

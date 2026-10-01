@@ -31,6 +31,7 @@ namespace dxmt::dxil {
 struct SignatureSlot {
   /** `!dx.entryPoints` element id, i.e. `dx.op` operand 1. */
   uint32_t element_id = 0;
+  uint32_t element_row = 0;
   uint32_t semantic_index = 0;
   /** Register of the element (signature start row). */
   uint32_t reg = 0;
@@ -59,8 +60,8 @@ struct StageSignature {
   std::vector<SignatureSlot> inputs;
   std::vector<SignatureSlot> outputs;
 
-  const SignatureSlot *find_input(uint32_t element_id) const;
-  const SignatureSlot *find_output(uint32_t element_id) const;
+  const SignatureSlot *find_input(uint32_t element_id, uint32_t row) const;
+  const SignatureSlot *find_output(uint32_t element_id, uint32_t row) const;
 };
 
 /**
@@ -71,6 +72,12 @@ llvm::Error DeclareStageSignature(
   const ModuleInfo &module, dxbc::SM50ShaderInternal &shader, dxbc::SignatureContext &sig_ctx,
   StageSignature &out_signature
 );
+
+/** SV_ViewID of the current invocation: the root view-id qword, or 0 without root arguments. */
+llvm::Value *ViewInstanceId(dxbc::context &ctx);
+
+/** Lower every `dx.op.viewID` of the AIR function (stages whose I/O is not lowered by LowerStageIO). */
+llvm::Error LowerViewInstanceId(dxbc::context &ctx);
 
 /** Lower every `dx.op.loadInput` / `dx.op.storeOutput` of the AIR function. */
 llvm::Error LowerStageIO(dxbc::context &ctx, const StageSignature &signature);

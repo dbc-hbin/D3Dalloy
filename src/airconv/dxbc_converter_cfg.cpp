@@ -538,6 +538,7 @@ read_control_flow(
     case D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS: {
       if (Inst.m_GlobalFlagsDecl.Flags & D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL) {
         func_signature.UseEarlyFragmentTests();
+        sm50_shader->ps_force_early_depth_stencil = 1;
       }
       if (Inst.m_GlobalFlagsDecl.Flags & D3D11_1_SB_GLOBAL_FLAG_SKIP_OPTIMIZATION) {
         shader_info.skipOptimization = true;
@@ -585,7 +586,15 @@ read_control_flow(
     case D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT:
       sm50_shader->gs_instance_count = Inst.m_GSInstanceCountDecl.InstanceCount;
       break;
-    case D3D11_SB_OPCODE_DCL_STREAM:
+    case D3D11_SB_OPCODE_DCL_STREAM: {
+      const uint32_t stream = Inst.m_Operands[0].m_Index[0].m_RegIndex;
+      if (stream >= 4) {
+        sm50_shader->initialization_error = "Invalid DXBC geometry shader stream declaration";
+        break;
+      }
+      sm50_shader->gs_declaring_stream = stream;
+      break;
+    }
     case D3D11_SB_OPCODE_DCL_INTERFACE:
     case D3D11_SB_OPCODE_DCL_FUNCTION_TABLE:
     case D3D11_SB_OPCODE_DCL_FUNCTION_BODY:
@@ -636,19 +645,16 @@ read_control_flow(
       break;
     }
     case D3D11_SB_OPCODE_EMIT_STREAM: {
-      assert(Inst.m_Operands[0].m_Value[0] == 0 && "multiple streams not supported");
-      bb_current->instructions.push_back(InstEmit{});
+      bb_current->instructions.push_back(InstEmit{Inst.m_Operands[0].m_Index[0].m_RegIndex});
       break;
     }
     case D3D11_SB_OPCODE_EMITTHENCUT_STREAM: {
-      assert(Inst.m_Operands[0].m_Value[0] == 0 && "multiple streams not supported");
-      bb_current->instructions.push_back(InstEmit{});
-      bb_current->instructions.push_back(InstCut{});
+      bb_current->instructions.push_back(InstEmit{Inst.m_Operands[0].m_Index[0].m_RegIndex});
+      bb_current->instructions.push_back(InstCut{Inst.m_Operands[0].m_Index[0].m_RegIndex});
       break;
     }
     case D3D11_SB_OPCODE_CUT_STREAM: {
-      assert(Inst.m_Operands[0].m_Value[0] == 0 && "multiple streams not supported");
-      bb_current->instructions.push_back(InstCut{});
+      bb_current->instructions.push_back(InstCut{Inst.m_Operands[0].m_Index[0].m_RegIndex});
       break;
     }
     default:

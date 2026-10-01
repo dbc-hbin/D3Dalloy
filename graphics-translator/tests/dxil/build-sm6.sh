@@ -39,12 +39,8 @@ compile sm6-reject.hlsl cs_6_6 cs_gs64
 compile sm6-reject.hlsl cs_6_9 cs_sm69
 compile sm6.hlsl vs_6_1 vs_viewid
 compile sm6.hlsl ps_6_1 ps_viewid
-compile sm6-reject.hlsl vs_6_4 vs_shadingrate
-compile sm6-reject.hlsl ps_6_4 ps_shadingrate
-compile sm6-reject.hlsl cs_6_5 cs_rayquery
-compile sm6-reject.hlsl ps_6_5 ps_feedback
+
 compile sm6-reject.hlsl ps_6_1 ps_viewid_vi
-compile sm6-reject.hlsl ms_6_5 ms_mesh
 compile sm6-denorm.hlsl cs_6_2 cs_denorm_any -denorm any
 compile sm6-denorm.hlsl cs_6_2 cs_denorm_ftz -denorm ftz
 compile sm6-denorm.hlsl cs_6_2 cs_denorm_preserve -denorm preserve

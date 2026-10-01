@@ -16,12 +16,20 @@ compile() {
     status=1
   fi
 }
-for entry in vs_pass gs_quad gs_tri gs_linein gs_lineadj gs_triadj gs_line gs_points ps_color; do
+for entry in vs_pass gs_quad gs_tri gs_linein gs_lineadj gs_triadj gs_line gs_points gs_streams2 gs_streams4 ps_color \
+  ps_early; do
   compile geometry "$entry"
 done
-for entry in vs_pass ps_color ds_tri ds_quad ds_isoline ds_patch gs_tsgs \
+# owned-d3d12-stream-output.cpp GS multi-stream cases.
+for entry in vs_gs gs_multi; do
+  compile stream-output-gs "$entry"
+done
+for entry in vs_pass ps_color ps_early ps_tsgs_early ds_tri ds_quad ds_isoline ds_patch gs_tsgs \
   hs_patch1 hs_patch2 hs_patch5 hs_patch8 hs_patch11 hs_patch16 hs_patch17 hs_patch32; do
   compile tessellation "$entry"
+done
+for entry in vs_main gs_point gs_strip gs_adj hs_main ds_main gs_tri ps_main; do
+  compile gsindirect "$entry"
 done
 for partition in integer pow2 fractional_odd fractional_even; do
   compile tessellation "hs_tri_$partition"

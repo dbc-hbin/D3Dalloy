@@ -728,17 +728,25 @@ bool checkStress(const char *name, const std::vector<uint8_t> &out, const std::v
   return g_case_mismatches == before;
 }
 
+/* One pipeline state stream subobject, pointer aligned as D3D12 requires. */
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Value> struct alignas(void *) Subobject {
+  D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+  Value value;
+};
+
 struct Graphics {
   Gpu &gpu;
   ComPtr<ID3D12RootSignature> root;
   /* Vertices per draw (point list when not 3). */
   UINT vertex_count = 3;
 
-  /* Draws `count` vertices with vs/ps into a width x height RGBA8 target; u0 = out, u1 = raw. */
+  /* Draws `count` vertices with vs/ps into a width x height RGBA8 target; u0 = out, u1 = raw. With `views`, the
+   * pipeline is created from a stream carrying that VIEW_INSTANCING subobject and the list sets `view_mask`. */
   std::vector<std::vector<uint8_t>> draw(const char *vs, const char *ps, UINT width, UINT height,
                                          std::vector<uint8_t> out, std::vector<uint8_t> raw,
                                          std::array<uint32_t, 4> p0, bool indexed, UINT start_vertex,
-                                         UINT start_instance, double *elapsed = nullptr) {
+                                         UINT start_instance, double *elapsed = nullptr,
+                                         const D3D12_VIEW_INSTANCING_DESC *views = nullptr, UINT view_mask = 0) {
     const auto vs_code = shader(vs), ps_code = shader(ps);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root.Get();
@@ -755,7 +763,32 @@ struct Graphics {
     desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pso;
-    if (FAILED(gpu.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)))) {
+    HRESULT created;
+    if (views) {
+      // The same pipeline as `desc`, as a stream with the VIEW_INSTANCING subobject.
+      ComPtr<ID3D12Device2> device2;
+      check(gpu.device.As(&device2), "QueryInterface(ID3D12Device2)");
+      D3D12_RT_FORMAT_ARRAY formats{};
+      formats.RTFormats[0] = desc.RTVFormats[0];
+      formats.NumRenderTargets = 1;
+      struct {
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> root;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> formats;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC> views;
+      } stream{{.value = desc.pRootSignature}, {.value = desc.VS},          {.value = desc.PS},
+               {.value = desc.RasterizerState}, {.value = desc.DepthStencilState},
+               {.value = desc.PrimitiveTopologyType}, {.value = formats}, {.value = *views}};
+      const D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream), &stream};
+      created = device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(&pso));
+    } else {
+      created = gpu.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+    }
+    if (FAILED(created)) {
       std::printf("OWNED_D3D12_SM6_MISMATCH case=%s field=CreateGraphicsPipelineState\n", ps);
       ++g_case_mismatches;
       return {};
@@ -787,6 +820,11 @@ struct Graphics {
     ID3D12DescriptorHeap *heaps[] = {gpu.heap.Get()};
     gpu.list->SetDescriptorHeaps(1, heaps);
     gpu.list->SetPipelineState(pso.Get());
+    if (views) {
+      ComPtr<ID3D12GraphicsCommandList1> list1;
+      check(gpu.list.As(&list1), "QueryInterface(ID3D12GraphicsCommandList1)");
+      list1->SetViewInstanceMask(view_mask);
+    }
     gpu.list->SetGraphicsRootSignature(root.Get());
     gpu.list->SetGraphicsRoot32BitConstants(0, 4, p0.data(), 0);
     gpu.list->SetGraphicsRootDescriptorTable(1, gpu.gpu(0));
@@ -1348,102 +1386,26 @@ void testViewId(Graphics &g) {
   end("sv_viewid");
 }
 
-/* One pipeline state stream subobject, pointer aligned as D3D12 requires. */
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Value> struct alignas(void *) Subobject {
-  D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
-  Value value;
-};
-
-/* Features whose caps the device does not report fail pipeline creation with E_FAIL or E_INVALIDARG. */
-void testCapRejections(Graphics &g, Compute &c) {
+/* SV_ViewID under VIEW_INSTANCING (count 2, masking, mask 0b10): only view 1 runs, so VS and PS both read 1. */
+void testViewIdInstanced(Graphics &g) {
   begin();
-  auto report = [](const char *entry, HRESULT hr, const ComPtr<ID3D12PipelineState> &pso) {
-    std::printf("OWNED_D3D12_SM6_REJECT entry=%s hr=0x%08lx\n", entry, static_cast<unsigned long>(hr));
-    if ((hr != E_FAIL && hr != E_INVALIDARG) || pso)
-      mismatch("cap_rejected", entry, 0, static_cast<uint32_t>(hr), 0x80070057u);
-  };
-  auto graphicsDesc = [](ID3D12RootSignature *root, const std::vector<uint8_t> &vs, const std::vector<uint8_t> &ps) {
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-    desc.pRootSignature = root;
-    desc.VS = {vs.data(), vs.size()};
-    desc.PS = {ps.data(), ps.size()};
-    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    desc.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
-    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    desc.NumRenderTargets = 1;
-    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    return desc;
-  };
-  ID3D12Device *device = g.gpu.device.Get();
-  {
-    /* SV_ShadingRate: VariableShadingRateTier is NOT_SUPPORTED. */
-    const auto vs = shader("vs_shadingrate"), ps = shader("ps_shadingrate");
-    const auto desc = graphicsDesc(g.root.Get(), vs, ps);
-    ComPtr<ID3D12PipelineState> pso;
-    report("ps_shadingrate", device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), pso);
+  static const D3D12_VIEW_INSTANCE_LOCATION locations[2] = {{0, 0}, {0, 0}};
+  const D3D12_VIEW_INSTANCING_DESC views{2, locations, D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING};
+  auto r = g.draw("vs_viewid", "ps_viewid_vi", 8, 8, filled(64 + 64 * 8), filled(64), {0, 0, 0, 0}, false, 0, 0,
+                  nullptr, &views, 0b10);
+  if (!r.empty()) {
+    for (uint32_t vid = 0; vid < 3; ++vid)
+      EXPECT_EQ("sv_viewid_instanced", "vs.SV_ViewID", vid, load<uint32_t>(r[0], vid * 4), 1);
+    for (uint32_t i = 12; i < 64; i += 4)
+      EXPECT_EQ("sv_viewid_instanced", "untouched", i, load<uint32_t>(r[0], i), kSentinel);
+    for (uint32_t pixel = 0; pixel < 64; ++pixel) {
+      EXPECT_EQ("sv_viewid_instanced", "ps.SV_ViewID", pixel, load<uint32_t>(r[0], 64 + pixel * 8), 1);
+      EXPECT_EQ("sv_viewid_instanced", "vs.SV_ViewID.varying", pixel, load<uint32_t>(r[0], 64 + pixel * 8 + 4), 1);
+    }
   }
-  {
-    /* Inline raytracing: RaytracingTier is NOT_SUPPORTED. */
-    ComPtr<ID3D12PipelineState> pso;
-    report("cs_rayquery", computePso(device, c.root.Get(), shader("cs_rayquery"), pso), pso);
-  }
-  {
-    /* WriteSamplerFeedback: SamplerFeedbackTier is NOT_SUPPORTED. The compute layout has t0, s0 and u2. */
-    const auto vs = shader("vs_main"), ps = shader("ps_feedback");
-    const auto desc = graphicsDesc(c.root.Get(), vs, ps);
-    ComPtr<ID3D12PipelineState> pso;
-    report("ps_feedback", device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), pso);
-  }
-  ComPtr<ID3D12Device2> device2;
-  check(g.gpu.device.As(&device2), "QueryInterface(ID3D12Device2)");
-  {
-    /* SV_ViewID with two views: ViewInstancingTier is NOT_SUPPORTED. */
-    const auto vs = shader("vs_viewid"), ps = shader("ps_viewid_vi");
-    static const D3D12_VIEW_INSTANCE_LOCATION locations[2] = {{0, 0}, {0, 0}};
-    D3D12_RT_FORMAT_ARRAY formats{};
-    formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    formats.NumRenderTargets = 1;
-    struct {
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> root;
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> formats;
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC> views;
-    } stream{{.value = g.root.Get()},
-             {.value = {vs.data(), vs.size()}},
-             {.value = {ps.data(), ps.size()}},
-             {.value = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE},
-             {.value = formats},
-             {.value = {2, locations, D3D12_VIEW_INSTANCING_FLAG_NONE}}};
-    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
-    ComPtr<ID3D12PipelineState> pso;
-    report("ps_viewid_vi", device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pso)), pso);
-  }
-  {
-    /* A mesh shader stage: MeshShaderTier is NOT_SUPPORTED. */
-    const auto ms = shader("ms_mesh"), ps = shader("ps_null");
-    D3D12_RT_FORMAT_ARRAY formats{};
-    formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    formats.NumRenderTargets = 1;
-    struct {
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature *> root;
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
-      Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> formats;
-    } stream{{.value = g.root.Get()},
-             {.value = {ms.data(), ms.size()}},
-             {.value = {ps.data(), ps.size()}},
-             {.value = formats}};
-    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
-    ComPtr<ID3D12PipelineState> pso;
-    report("ms_mesh", device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pso)), pso);
-  }
-  end("cap_rejected");
+  end("sv_viewid_instanced");
 }
+
 
 /*
  * ---- SM 6.2 fp32 denorm modes (cs_denorm_any / _ftz / _preserve, same body) ----
@@ -1680,7 +1642,7 @@ int run(int argc, wchar_t **argv) {
   testVertexWave(graphics);
   testGraphicsAtomic64Rejected(graphics);
   testViewId(graphics);
-  testCapRejections(graphics, compute);
+  testViewIdInstanced(graphics);
   testDenorm(compute);
   testStress(compute, reps);
 

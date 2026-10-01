@@ -945,25 +945,22 @@ void handle_signature_ds(
     auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
     auto siv = Inst.m_OutputDeclSIV.Name;
     switch (siv) {
-    case D3D10_SB_NAME_CLIP_DISTANCE: {
-      for (unsigned i = 0; i < 4; i++) {
-        if (mask & (1 << i)) {
-          sm50_shader->clip_distance_scalars.push_back(
-            {.component = (uint8_t)(i), .reg = (uint8_t)reg}
-          );
-        }
-      }
-      max_output_register = std::max(reg + 1, max_output_register);
-      break;
-    }
+    case D3D10_SB_NAME_CLIP_DISTANCE:
     case D3D10_SB_NAME_CULL_DISTANCE: {
-      for (unsigned i = 0; i < 4; i++) {
-        if (mask & (1 << i)) {
-          sm50_shader->cull_distance_scalars.push_back(
-            {.component = (uint8_t)(i), .reg = (uint8_t)reg}
-          );
-        }
-      }
+      const bool clip = siv == D3D10_SB_NAME_CLIP_DISTANCE;
+      for (unsigned i = 0; i < 4; ++i)
+        if (mask & (1 << i))
+          (clip ? sm50_shader->clip_distance_scalars : sm50_shader->cull_distance_scalars)
+              .push_back({.component = (uint8_t)i, .reg = (uint8_t)reg});
+      const auto sig = findOutputElement([=](const Signature &element) {
+        return element.reg() == reg && (element.mask() & mask) != 0;
+      });
+      const auto user = varyingAttributeName(clip ? "SV_ClipDistance" : "SV_CullDistance", sig.semanticIndex());
+      const auto index = num_mesh_vertex_data++;
+      func_signature.DefineMeshVertexOutput(OutputMeshData{.user = user, .type = msl_float4, .index = index});
+      mesh_output_handlers.push_back([=](MeshOutputContext &output) -> IREffect {
+        return pop_mesh_output_vertex_data(reg, mask, index, output.vertex_id, msl_float4, true);
+      });
       max_output_register = std::max(reg + 1, max_output_register);
       break;
     }
@@ -1113,9 +1110,6 @@ handle_signature_gs(
     SM50ShaderInternal *sm50_shader, uint32_t phase
 ) {
   uint32_t &max_output_register = sm50_shader->max_output_register;
-  auto &func_signature = sm50_shader->func_signature;
-  auto &mesh_output_handlers = sm50_shader->mesh_output_handlers;
-  uint32_t &num_mesh_vertex_data = sm50_shader->num_mesh_vertex_data;
 
   auto findOutputElement = [&](auto matcher) -> Signature {
     const D3D11_SIGNATURE_PARAMETER *parameters;
@@ -1127,6 +1121,22 @@ handle_signature_gs(
       }
     }
     return Signature();
+  };
+  // See the output declaration cases below.
+  auto claim_output = [&](uint32_t reg, uint32_t mask, D3D10_SB_NAME system_value) {
+    const D3D11_SIGNATURE_PARAMETER *parameters;
+    const UINT count = outputParser.GetParameters(&parameters);
+    uint32_t stream_mask = 0;
+    for (UINT i = 0; i < count; i++)
+      if (parameters[i].Register == reg && parameters[i].SystemValue == system_value)
+        stream_mask |= parameters[i].Mask & 0xf;
+    if (reg >= 32 || !mask)
+      return false;
+    auto &declared = sm50_shader->gs_declared_components[sm50_shader->gs_declaring_stream][reg];
+    if ((mask & ~stream_mask) || (declared & mask))
+      return false;
+    declared |= mask;
+    return true;
   };
 
   switch (Inst.m_OpCode) {
@@ -1183,47 +1193,63 @@ handle_signature_gs(
     return;
     break;
   }
+  /* Output declarations: every stream writes the same output register file, so the register count is shared.
+   * The mesh outputs a declaration defines are recorded for each stream whose signature has the declared components
+   * of that register and has not declared them yet, and are defined by the GS converter for the stream that drives
+   * the mesh output. */
   case D3D10_SB_OPCODE_DCL_OUTPUT_SIV: {
     unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
     auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
     auto siv = Inst.m_OutputDeclSIV.Name;
-    switch (siv) {
-    case D3D10_SB_NAME_CLIP_DISTANCE: {
-      for (unsigned i = 0; i < 4; i++) {
-        if (mask & (1 << i)) {
-          sm50_shader->clip_distance_scalars.push_back({.component = (uint8_t)(i), .reg = (uint8_t)reg});
-        }
-      }
-      max_output_register = std::max(reg + 1, max_output_register);
+    auto &declarations = sm50_shader->gs_stream_declarations[sm50_shader->gs_declaring_stream];
+    max_output_register = std::max(reg + 1, max_output_register);
+    if (!claim_output(reg, mask, siv))
       break;
-    }
+    switch (siv) {
+    case D3D10_SB_NAME_CLIP_DISTANCE:
     case D3D10_SB_NAME_CULL_DISTANCE: {
-      for (unsigned i = 0; i < 4; i++) {
-        if (mask & (1 << i)) {
-          sm50_shader->cull_distance_scalars.push_back({.component = (uint8_t)(i), .reg = (uint8_t)reg});
-        }
-      }
-      max_output_register = std::max(reg + 1, max_output_register);
+      const bool clip = siv == D3D10_SB_NAME_CLIP_DISTANCE;
+      auto sig = findOutputElement([=](const Signature &element) {
+        return element.reg() == reg && (element.mask() & mask) != 0;
+      });
+      const auto user = varyingAttributeName(clip ? "SV_ClipDistance" : "SV_CullDistance", sig.semanticIndex());
+      declarations.push_back([=](GSStreamOutputs &out) {
+        for (unsigned i = 0; i < 4; i++)
+          if (mask & (1 << i))
+            (clip ? out.clip_distance_scalars : out.cull_distance_scalars)
+                .push_back({.component = (uint8_t)(i), .reg = (uint8_t)reg});
+        const auto index = out.num_mesh_vertex_data++;
+        out.func_signature.DefineMeshVertexOutput(OutputMeshData{.user = user, .type = msl_float4, .index = index});
+        out.mesh_output_handlers.push_back([=](MeshOutputContext &output) -> IREffect {
+          return pop_mesh_output_vertex_data(reg, mask, index, output.vertex_id, msl_float4, true);
+        });
+      });
       break;
     }
     case D3D10_SB_NAME_POSITION: {
-      func_signature.DefineMeshVertexOutput(OutputPosition{.type = msl_float4});
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_position(reg, mask, output.vertex_id);
+      declarations.push_back([=](GSStreamOutputs &out) {
+        out.func_signature.DefineMeshVertexOutput(OutputPosition{.type = msl_float4});
+        out.mesh_output_handlers.push_back([=](MeshOutputContext &output) -> IREffect {
+          return pop_mesh_output_position(reg, mask, output.vertex_id);
+        });
       });
       break;
     }
     case D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX: {
-      func_signature.DefineMeshPrimitiveOutput(OutputRenderTargetArrayIndex{});
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_render_target_array_index(reg, mask, output.primitive_id);
+      declarations.push_back([=](GSStreamOutputs &out) {
+        out.func_signature.DefineMeshPrimitiveOutput(OutputRenderTargetArrayIndex{});
+        out.mesh_output_handlers.push_back([=](MeshOutputContext &output) -> IREffect {
+          return pop_mesh_output_render_target_array_index(reg, mask, output.primitive_id);
+        });
       });
       break;
     }
     case D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX: {
-      func_signature.DefineMeshPrimitiveOutput(OutputViewportArrayIndex{});
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_viewport_array_index(reg, mask, output.primitive_id);
+      declarations.push_back([=](GSStreamOutputs &out) {
+        out.func_signature.DefineMeshPrimitiveOutput(OutputViewportArrayIndex{});
+        out.mesh_output_handlers.push_back([=](MeshOutputContext &output) -> IREffect {
+          return pop_mesh_output_viewport_array_index(reg, mask, output.primitive_id);
+        });
       });
       break;
     }
@@ -1243,19 +1269,22 @@ handle_signature_gs(
       auto reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
       auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
       auto sig = findOutputElement([=](Signature sig) {
-        return (sig.reg() == reg) && ((sig.mask() & mask) != 0);
+        return (sig.reg() == reg) && ((sig.mask() & mask) != 0) && !sig.isSystemValue();
       });
       max_output_register = std::max(reg + 1, max_output_register);
-      if (sig.mask() == 0) break;
-      auto const mesh_vertex_data_index = num_mesh_vertex_data++;
+      if (sig.mask() == 0 || !claim_output(reg, mask, D3D10_SB_NAME_UNDEFINED)) break;
       auto const type = to_msl_type(sig.componentType());
-      func_signature.DefineMeshVertexOutput(OutputMeshData{
-        .user = sig.varyingAttributeName(),
-        .type = type,
-        .index = mesh_vertex_data_index
-      });
-      mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
-        return pop_mesh_output_vertex_data(reg, mask, mesh_vertex_data_index, output.vertex_id, type);
+      auto const user = sig.varyingAttributeName();
+      sm50_shader->gs_stream_declarations[sm50_shader->gs_declaring_stream].push_back([=](GSStreamOutputs &out) {
+        auto const mesh_vertex_data_index = out.num_mesh_vertex_data++;
+        out.func_signature.DefineMeshVertexOutput(OutputMeshData{
+          .user = user,
+          .type = type,
+          .index = mesh_vertex_data_index
+        });
+        out.mesh_output_handlers.push_back([=](MeshOutputContext &output) -> IREffect {
+          return pop_mesh_output_vertex_data(reg, mask, mesh_vertex_data_index, output.vertex_id, type);
+        });
       });
       break;
     }
@@ -1289,8 +1318,20 @@ void handle_signature(
     return handle_signature_ds(inputParser, *outputParser.Signature(0), Inst, shader, phase);
   case D3D11_SB_COMPUTE_SHADER:
     return handle_signature_cs(inputParser, *outputParser.Signature(0), Inst, shader, phase);
-  case D3D10_SB_GEOMETRY_SHADER:
-    return handle_signature_gs(inputParser, *outputParser.Signature(0), Inst, shader, phase);
+  case D3D10_SB_GEOMETRY_SHADER: {
+    /* A declaration belongs to every stream whose output signature has the declared register (vkd3d emits all
+     * dcl_stream before the output declarations, so declaration order does not identify the stream). Inputs and
+     * other declarations are handled once. */
+    const bool output = Inst.m_OpCode == D3D10_SB_OPCODE_DCL_OUTPUT || Inst.m_OpCode == D3D10_SB_OPCODE_DCL_OUTPUT_SIV ||
+                        Inst.m_OpCode == D3D10_SB_OPCODE_DCL_OUTPUT_SGV;
+    const UINT streams = output ? std::max(outputParser.NumStreams(), 1u) : 1;
+    for (UINT s = 0; s < streams && shader->initialization_error.empty(); s++) {
+      shader->gs_declaring_stream = s;
+      handle_signature_gs(inputParser, *outputParser.Signature(s), Inst, shader, phase);
+    }
+    shader->gs_declaring_stream = 0;
+    return;
+  }
   default:
     assert(0);
     break;

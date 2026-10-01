@@ -177,6 +177,9 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
       case EncoderType::Query:
         reinterpret_cast<QueryEncoderData *>(next)->~QueryEncoderData();
         break;
+      case EncoderType::WorkGraph:
+        reinterpret_cast<WorkGraphEncoderData *>(next)->~WorkGraphEncoderData();
+        break;
       case EncoderType::StandardSwizzle: {
         auto *record = reinterpret_cast<StandardSwizzleEncoderData *>(next);
         if (record->resource)
@@ -395,6 +398,14 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     cmd_use_icb.stages = WMTRenderStageVertex;
     cmd_use_icb.usage = WMTResourceUsageRead | WMTResourceUsageWrite;
     cmd_use_icb.resource = icb;
+
+    // ICB draws bind root arguments, static samplers and vertex tables inside the GPU heap by address; the
+    // fragment stage only sees them when the heap is resident for it (the resolver binds it to the vertex stage).
+    auto &cmd_use_heap = EncodeRenderCommand<wmtcmd_render_useresource>();
+    cmd_use_heap.type = WMTRenderCommandUseResource;
+    cmd_use_heap.stages = WMTRenderStages(WMTRenderStageVertex | WMTRenderStageFragment);
+    cmd_use_heap.usage = WMTResourceUsageRead;
+    cmd_use_heap.resource = gpu_heap_buffer_;
 
     auto &cmd_setpso_res = EncodeRenderCommand<wmtcmd_render_setpso>();
     cmd_setpso_res.type = WMTRenderCommandSetPSO;

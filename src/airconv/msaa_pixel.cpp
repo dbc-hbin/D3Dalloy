@@ -1,4 +1,5 @@
 #include "msaa_pixel.hpp"
+#include "msaa_coarse.hpp"
 
 #include <algorithm>
 #include <array>
@@ -143,11 +144,12 @@ MDNode *lineEndpointInput(unsigned index, StringRef name, LLVMContext &context) 
   });
 }
 
-MDNode *textureMetadata(unsigned index, LLVMContext &context, bool multisampled) {
+MDNode *textureMetadata(unsigned index, LLVMContext &context, bool multisampled,
+                        unsigned binding = SM50_BINDING_INDEX_MSAA_COVERAGE) {
   return MDTuple::get(context, {
     ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), index)),
     MDString::get(context, "air.texture"), MDString::get(context, "air.location_index"),
-    ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), SM50_BINDING_INDEX_MSAA_COVERAGE)),
+    ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), binding)),
     ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 1)),
     MDString::get(context, "air.read"), MDString::get(context, "air.arg_type_name"),
     MDString::get(context, multisampled ? "texture2d_ms<uint, read>" : "texture2d<uint, read>"),
@@ -236,6 +238,9 @@ struct PulledInput {
   bool perspective;
   unsigned offset[4] = {~0u, ~0u, ~0u, ~0u};
   unsigned anchor[4] = {~0u, ~0u, ~0u, ~0u};
+  unsigned vertex_offset = ~0u;
+  unsigned vertex_bytes = 0;
+  bool flat = false;
 };
 
 struct LineInput {
@@ -389,7 +394,10 @@ Value *distanceInterpolate(IRBuilder<> &b, ArrayRef<Value *> values,
   Value *result = nullptr;
   for (unsigned i = 0; i < 3; ++i) {
     auto *weight = b.CreateFDiv(weights[i], denominator);
-    auto *v = b.CreateFMul(values[i], b.CreateVectorSplat(4, weight));
+    Value *factor = weight;
+    if (auto *vector = dyn_cast<FixedVectorType>(values[i]->getType()))
+      factor = b.CreateVectorSplat(vector->getNumElements(), weight);
+    auto *v = b.CreateFMul(values[i], factor);
     result = result ? b.CreateFAdd(result, v) : v;
   }
   return result;
@@ -406,14 +414,45 @@ Value *lineCenterXY(IRBuilder<> &b, Value *position) {
   return xy;
 }
 
+// D3D standard 16x sample pattern, 1/16 pixel from center. ForcedSampleCount 16 rasterizes as two native 8x
+// halves with samples [0,8) and [8,16) programmed (bit-exact vs a fixed-point top-left reference, probe pos16.m).
+constexpr int8_t kSampleX16[] = {1, -1, -3, 4, -5, 2, 5, 3, -2, 0, -4, -6, -8, 7, 6, -7};
+constexpr int8_t kSampleY16[] = {1, -3, 2, -1, -2, 5, 3, -5, 6, -7, -6, 4, 0, -4, 7, -8};
+
+// Split 16x pull-model interpolation: native sample interpolation only sees the current 8x half, so logical
+// sample `index` is evaluated through interpolate_at_offset at its pattern position (Metal offsets are relative
+// to the pixel's top-left corner).
+Value *splitSampleOffset(IRBuilder<> &b, Value *index) {
+  Value *xy = UndefValue::get(FixedVectorType::get(b.getFloatTy(), 2));
+  for (unsigned axis = 0; axis < 2; ++axis) {
+    Value *offset = ConstantFP::get(b.getFloatTy(), .5);
+    for (unsigned i = 0; i < 16; ++i)
+      offset = b.CreateSelect(b.CreateICmpEQ(index, b.getInt32(i)), ConstantFP::get(b.getFloatTy(),
+        double(8 + (axis ? kSampleY16[i] : kSampleX16[i])) / 16.0), offset);
+    xy = b.CreateInsertElement(xy, offset, b.getInt32(axis));
+  }
+  return xy;
+}
+
+// Calls `<prefix>sample_<suffix>(interpolant, index)`, or the offset form at the 16x position when split.
+Value *interpolateSample(IRBuilder<> &b, Module &module, StringRef perspective, Type *type, Value *interpolant,
+                         Value *index, bool split, StringRef suffix) {
+  if (!split)
+    return b.CreateCall(module.getOrInsertFunction(("air.interpolate_sample_" + perspective + suffix).str(),
+      FunctionType::get(type, {interpolant->getType(), b.getInt32Ty()}, false)), {interpolant, index});
+  auto *offset = splitSampleOffset(b, index);
+  return b.CreateCall(module.getOrInsertFunction(("air.interpolate_offset_" + perspective + suffix).str(),
+    FunctionType::get(type, {interpolant->getType(), offset->getType()}, false)), {interpolant, offset});
+}
+
 Value *lineSampleXY(IRBuilder<> &b, Value *position, Value *sample, unsigned count, bool centerPattern) {
   constexpr int8_t x1[] = {0}, y1[] = {0};
   constexpr int8_t x2[] = {4, -4}, y2[] = {4, -4};
   constexpr int8_t x4[] = {-2, 6, -6, 2}, y4[] = {-6, -2, 2, 6};
   constexpr int8_t x8[] = {1, -1, 5, -3, -5, -7, 3, 7};
   constexpr int8_t y8[] = {-3, 3, 1, -5, 5, -1, 7, -7};
-  const int8_t *sx = count == 1 ? x1 : count == 2 ? x2 : count == 4 ? x4 : x8;
-  const int8_t *sy = count == 1 ? y1 : count == 2 ? y2 : count == 4 ? y4 : y8;
+  const int8_t *sx = count == 1 ? x1 : count == 2 ? x2 : count == 4 ? x4 : count == 8 ? x8 : kSampleX16;
+  const int8_t *sy = count == 1 ? y1 : count == 2 ? y2 : count == 4 ? y4 : count == 8 ? y8 : kSampleY16;
   Value *xy = UndefValue::get(FixedVectorType::get(b.getFloatTy(), 2));
   for (unsigned axis = 0; axis < 2; ++axis) {
     Value *coordinate = b.CreateExtractElement(position, b.getInt32(axis));
@@ -573,38 +612,74 @@ void conditionalStore(IRBuilder<> &builder, Function &entry, Value *predicate, V
   builder.SetInsertPoint(join);
 }
 
+Value *readUintTexture(IRBuilder<> &b, Module &module, Value *texture, Value *xy, Value *sample = nullptr) {
+  auto *version = module.getNamedMetadata("air.version");
+  auto *minor = mdconst::extract<ConstantInt>(version->getOperand(0)->getOperand(1));
+  const bool extended = minor->getZExtValue() >= 8;
+  SmallVector<Type *, 6> types{texture->getType()};
+  SmallVector<Value *, 6> args{texture};
+  // AIR 2.8 adds the read sampler (and non-MS texel offset). The older ABI must not
+  // carry those operands: it loads as a library but crashes ShaderValidation PSO compilation.
+  if (extended) {
+    auto *sampler = StructType::getTypeByName(module.getContext(), "struct._sampler_t");
+    if (!sampler) sampler = StructType::create(module.getContext(), "struct._sampler_t");
+    auto getter = module.getOrInsertFunction("air.get_read_sampler",
+      FunctionType::get(sampler->getPointerTo(2), {}, false));
+    types.push_back(sampler->getPointerTo(2)); args.push_back(b.CreateCall(getter));
+  }
+  types.push_back(xy->getType()); args.push_back(xy);
+  if (extended && !sample) {
+    types.push_back(xy->getType()); args.push_back(Constant::getNullValue(xy->getType()));
+  }
+  types.append({b.getInt32Ty(), b.getInt32Ty()});
+  args.append({sample ? sample : b.getInt32(0), b.getInt32(1)});
+  auto *response = StructType::get(module.getContext(), {FixedVectorType::get(b.getInt32Ty(), 4), b.getInt8Ty()});
+  auto read = module.getOrInsertFunction(sample ? "air.read_texture_2d_ms.u.v4i32" : "air.read_texture_2d.u.v4i32",
+    FunctionType::get(response, types, false));
+  return b.CreateExtractValue(b.CreateCall(read, args), 0);
+}
+
 Value *postMask(IRBuilder<> &builder, Module &module, Value *texture, Value *position, unsigned sampleCount) {
   Value *xy = UndefValue::get(FixedVectorType::get(builder.getInt32Ty(), 2));
   for (unsigned i = 0; i < 2; ++i)
     xy = builder.CreateInsertElement(xy, builder.CreateFPToUI(
       builder.CreateExtractElement(position, builder.getInt32(i)), builder.getInt32Ty()), builder.getInt32(i));
   Value *mask = builder.getInt32(0);
-  auto *sampler = StructType::getTypeByName(module.getContext(), "struct._sampler_t");
-  if (!sampler) sampler = StructType::create(module.getContext(), "struct._sampler_t");
-  auto samplerGetter = module.getOrInsertFunction("air.get_read_sampler",
-    FunctionType::get(sampler->getPointerTo(2), {}, false));
-  auto *response = StructType::get(module.getContext(), {FixedVectorType::get(builder.getInt32Ty(), 4), builder.getInt8Ty()});
   if (sampleCount == 1) {
-    auto read = module.getOrInsertFunction("air.read_texture_2d.u.v4i32",
-      FunctionType::get(response, {texture->getType(), sampler->getPointerTo(2), xy->getType(),
-                                   xy->getType(), builder.getInt32Ty(), builder.getInt32Ty()}, false));
-    auto *value = builder.CreateCall(read, {texture, builder.CreateCall(samplerGetter), xy,
-      Constant::getNullValue(xy->getType()), builder.getInt32(0), builder.getInt32(1)});
+    auto *value = readUintTexture(builder, module, texture, xy);
     return builder.CreateSelect(builder.CreateICmpNE(builder.CreateExtractElement(
-      builder.CreateExtractValue(value, 0), builder.getInt32(0)), builder.getInt32(0)),
+      value, builder.getInt32(0)), builder.getInt32(0)),
       builder.getInt32(1), builder.getInt32(0));
   }
-  auto read = module.getOrInsertFunction("air.read_texture_2d_ms.u.v4i32",
-    FunctionType::get(response, {texture->getType(), sampler->getPointerTo(2), xy->getType(),
-                                 builder.getInt32Ty(), builder.getInt32Ty()}, false));
   for (unsigned sample = 0; sample < sampleCount; ++sample) {
-    auto *value = builder.CreateCall(read, {texture, builder.CreateCall(samplerGetter),
-                                             xy, builder.getInt32(sample), builder.getInt32(1)});
-    auto *covered = builder.CreateICmpNE(builder.CreateExtractElement(builder.CreateExtractValue(value, 0),
+    auto *value = readUintTexture(builder, module, texture, xy, builder.getInt32(sample));
+    auto *covered = builder.CreateICmpNE(builder.CreateExtractElement(value,
                                              builder.getInt32(0)), builder.getInt32(0));
     mask = builder.CreateOr(mask, builder.CreateSelect(covered, builder.getInt32(1u << sample), builder.getInt32(0)));
   }
   return mask;
+}
+
+Value *rateImage(IRBuilder<> &b, Module &module, Function &entry, Value *texture, Value *control) {
+  auto load = [&](unsigned word) {
+    return b.CreateLoad(b.getInt32Ty(), b.CreateConstGEP1_32(b.getInt32Ty(), control, word));
+  };
+  Value *x = b.CreateLShr(load(0), 3), *y = b.CreateLShr(load(1), 3);
+  Value *enabled = b.CreateICmpNE(b.CreateAnd(load(14), b.getInt32(1u << 13)), b.getInt32(0));
+  enabled = b.CreateAnd(enabled, b.CreateAnd(b.CreateICmpULT(x, load(15)), b.CreateICmpULT(y, load(16))));
+  auto *before = b.GetInsertBlock();
+  auto *readBlock = BasicBlock::Create(module.getContext(), "read_rate_image", &entry);
+  auto *join = BasicBlock::Create(module.getContext(), "rate_image_value", &entry);
+  b.CreateCondBr(enabled, readBlock, join);
+  b.SetInsertPoint(readBlock);
+  Value *xy = UndefValue::get(FixedVectorType::get(b.getInt32Ty(), 2));
+  xy = b.CreateInsertElement(xy, x, b.getInt32(0));
+  xy = b.CreateInsertElement(xy, y, b.getInt32(1));
+  Value *rate = b.CreateExtractElement(readUintTexture(b, module, texture, xy), b.getInt32(0));
+  b.CreateBr(join); b.SetInsertPoint(join);
+  auto *result = b.CreatePHI(b.getInt32Ty(), 2);
+  result->addIncoming(b.getInt32(0), before); result->addIncoming(rate, readBlock);
+  return result;
 }
 
 Value *clampDepth(IRBuilder<> &builder, Module &module, Value *control, Value *depth) {
@@ -690,10 +765,16 @@ Error maskSampleFrequency(Module &module, uint32_t sampleMask) {
   return Error::success();
 }
 
-Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options) {
+Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options, bool coarseRequested,
+                     bool conservative) {
   if (options.sample_count != 1 && options.sample_count != 2 &&
-      options.sample_count != 4 && options.sample_count != 8)
-    return invalid("sample count must be 1, 2, 4 or 8");
+      options.sample_count != 4 && options.sample_count != 8 && options.sample_count != 16)
+    return invalid("sample count must be 1, 2, 4, 8 or 16");
+  // ForcedSampleCount 16 runs as two native 8x halves with the D3D 16x pattern halves programmed; the native
+  // passes see 8 samples and tile.sample_base (0 or 8) maps them to logical samples. Records use 16 slots.
+  const bool split = options.sample_count == 16;
+  if (split && (options.variant == SM50_MSAA_SAMPLE_APP || options.depth_attachment))
+    return invalid("16 logical samples support pixel-frequency shading without depth only");
   if (options.variant < SM50_MSAA_COVERAGE ||
       (options.variant > SM50_MSAA_REPLAY && options.variant != SM50_MSAA_SAMPLE_APP))
     return invalid("invalid fragment variant");
@@ -739,12 +820,12 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         hash *= 1099511628211ull;
       }
       if (noPerspective) {
-        if (interpolation.no_perspective_count == 64)
+        if (interpolation.no_perspective_count == 128)
           return invalid("too many no-perspective line varyings");
         interpolation.no_perspective_user_hashes[interpolation.no_perspective_count++] = hash;
       }
       if (flat) {
-        if (interpolation.flat_count == 64)
+        if (interpolation.flat_count == 128)
           return invalid("too many flat line varyings");
         interpolation.flat_user_hashes[interpolation.flat_count++] = hash;
       }
@@ -753,6 +834,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   auto &context = module.getContext();
   const auto &layout = module.getDataLayout();
   unsigned positionOld = ~0u, sampleOld = ~0u, coverageOld = ~0u, primitiveOld = ~0u;
+  unsigned shadingRateOld = ~0u;
   bool centroidPosition = false;
   bool samplePosition = false;
   SmallVector<bool, 24> centroidInput(original->arg_size(), false);
@@ -762,6 +844,9 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   for (unsigned i = 0; i < original->arg_size(); ++i) {
     auto *md = cast<MDNode>(oldInputs->getOperand(i));
     auto type = kind(*md);
+    if (type == "air.fragment_input" && md->getNumOperands() > 2)
+      if (auto *name = dyn_cast<MDString>(md->getOperand(2));
+          name && name->getString() == "user(dxmt_resolved_shading_rate)") shadingRateOld = i;
     if (type == "air.position") {
       positionOld = i;
       for (unsigned j = 2; j < md->getNumOperands(); ++j)
@@ -806,6 +891,44 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     if (type == "air.stencil") flags |= SM50_MSAA_PIXEL_STENCIL;
     if (type == "air.sample_mask") flags |= SM50_MSAA_PIXEL_COVERAGE;
   }
+  // Coarse shading: D3D12 shades at fine rate when the PS exports depth or stencil or runs per sample, and has no
+  // coarse rate above 4 samples. Lines and clip/cull-distance inputs keep their analytic fine-rate capture.
+  // Tier 2 evaluates pull-model inputs and coverage in the coarse pixel domain.
+  const bool clipDistanceInput = std::any_of(oldInputs->op_begin(), oldInputs->op_end(), [](const auto &operand) {
+    auto *md = cast<MDNode>(operand.get());
+    auto *semantic = md->getNumOperands() >= 3 ? dyn_cast<MDString>(md->getOperand(2)) : nullptr;
+    return semantic && distanceSemantic(semantic->getString());
+  });
+  const bool capturedTriangle = options.distance_vertex_count == 3 && !clipDistanceInput;
+  const bool coarseShading = coarseRequested && coarse::supported(options.sample_count) &&
+      options.line_mode == SM50_MSAA_LINE_NONE && (!options.distance_vertex_count || capturedTriangle) &&
+      !(flags & (SM50_MSAA_PIXEL_SAMPLE_FREQUENCY | SM50_MSAA_PIXEL_DEPTH | SM50_MSAA_PIXEL_STENCIL));
+  if (!coarseShading && module.getModuleFlag("dxmt.coarse.snapped"))
+    for (auto &instruction : instructions(*original)) {
+      auto *call = dyn_cast<CallInst>(&instruction);
+      if (!call || !call->getCalledFunction() || pullLocation(call->getCalledFunction()->getName()) != PullOffset)
+        continue;
+      IRBuilder<> b(call);
+      Value *offset = call->getArgOperand(1);
+      auto *scale = ConstantVector::getSplat(ElementCount::getFixed(2), ConstantFP::get(b.getFloatTy(), 16.0));
+      auto *raw = b.CreateFPToSI(b.CreateFMul(offset, scale), FixedVectorType::get(b.getInt32Ty(), 2));
+      raw = b.CreateAnd(raw, ConstantVector::getSplat(ElementCount::getFixed(2), b.getInt32(15)));
+      call->setArgOperand(1, b.CreateFDiv(b.CreateUIToFP(raw, offset->getType()), scale));
+    }
+  if (coarseShading) flags |= SM50_MSAA_PIXEL_COARSE;
+  coarse::Planes planes;
+  const auto *capturedVertices = options.distance_vertex_layout;
+  auto spilledField = [&](MDNode *md) {
+    const SM50_MSAA_CAPTURED_USER *matched = nullptr;
+    if (!capturedVertices || md->getNumOperands() < 3) return matched;
+    auto *name = dyn_cast<MDString>(md->getOperand(2));
+    if (!name) return matched;
+    const auto hash = userHash(name->getString());
+    for (unsigned u = 0; u < capturedVertices->user_count; ++u)
+      if (capturedVertices->users[u].hash == hash && (capturedVertices->users[u].flags & 1))
+        matched = &capturedVertices->users[u];
+    return matched;
+  };
   SmallVector<PulledInput, 8> pulled;
   for (unsigned i = 0; i < original->arg_size(); ++i) {
     auto *md = cast<MDNode>(oldInputs->getOperand(i));
@@ -816,7 +939,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       if (auto *name = dyn_cast<MDString>(md->getOperand(j)); name &&
           name->getString() == "air.no_perspective") perspective = false;
     pulled.push_back({.argument = i, .perspective = perspective});
+    if (coarseShading) planes.inputs.push_back({.argument = i, .perspective = perspective});
     auto &plan = pulled.back();
+    if (auto *field = spilledField(md)) {
+      plan.vertex_offset = field->offset_dwords;
+      plan.vertex_bytes = field->size_bytes;
+      plan.flat = field->flags & 2;
+    }
     for (auto &instruction : instructions(*original)) {
       auto *call = dyn_cast<CallInst>(&instruction);
       if (!call || call->arg_size() == 0 ||
@@ -827,7 +956,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       if (location == ~0u) return invalid("opaque interpolant escapes native interpolation");
       if (callee->getName().contains("no_perspective") == perspective)
         return invalid("native pull perspective mode differs from AIR metadata");
-      if (plan.offset[location] == ~0u) {
+      // Coarse variants evaluate every pull from the primitive's planes instead of per-pixel records.
+      if (plan.offset[location] == ~0u && !coarseShading) {
         plan.offset[location] = inputWords;
         unsigned count = location == PullOffset ? 256 : location == PullSample ? options.sample_count :
                          location == PullCentroid ? options.sample_count + 1 : 1;
@@ -841,21 +971,23 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   if (options.distance_vertex_count) {
     auto *vertices = options.distance_vertex_layout;
     if (options.distance_vertex_count > 3 || !vertices || !vertices->record_dwords ||
-        vertices->position_offset_dwords == ~0u || vertices->user_count > 64)
+        vertices->position_offset_dwords == ~0u || vertices->user_count > 128)
       return invalid("distance interpolation requires captured primitive vertex output");
     for (unsigned i = 0; i < original->arg_size(); ++i) {
       auto *md = cast<MDNode>(oldInputs->getOperand(i));
       if (kind(*md) != "air.fragment_input" || md->getNumOperands() < 3) continue;
       auto *semantic = dyn_cast<MDString>(md->getOperand(2));
-      if (!semantic || !distanceSemantic(semantic->getString())) continue;
+      const auto *spill = spilledField(md);
+      if (!semantic || (!distanceSemantic(semantic->getString()) && !spill)) continue;
       auto *type = original->getArg(i)->getType();
-      if (type != FixedVectorType::get(Type::getFloatTy(context), 4) || offsets[i] == ~0u)
-        return invalid("distance input must be a plain float4 varying");
+      if (type->isPointerTy() && spill) continue;
+      if (offsets[i] == ~0u) return invalid("captured input must be a plain scalar/vector varying");
       uint64_t hash = userHash(semantic->getString());
       auto *matched = std::find_if(vertices->users, vertices->users + vertices->user_count,
         [hash](const auto &user) { return user.hash == hash; });
-      if (matched == vertices->users + vertices->user_count || matched->size_bytes < 16 ||
-          matched->offset_dwords + 4 > vertices->record_dwords ||
+      const unsigned words = dwords(type, layout);
+      if (matched == vertices->users + vertices->user_count || matched->size_bytes < words * 4 ||
+          matched->offset_dwords + words > vertices->record_dwords ||
           vertices->position_offset_dwords + 4 > vertices->record_dwords)
         return invalid("distance input has no matching captured vertex field");
       bool noPerspective = false, flat = false;
@@ -864,12 +996,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           noPerspective |= tag->getString() == "air.no_perspective";
           flat |= tag->getString() == "air.flat";
         }
+      flat |= matched->flags & 2;
       unsigned sampleOffset = inputWords;
-      inputWords += 4 * options.sample_count;
+      inputWords += words * options.sample_count;
       distanceInputs.push_back({i, matched->offset_dwords, sampleOffset,
         noPerspective, flat, centroidInput[i]});
     }
-    if (distanceInputs.empty())
+    if (distanceInputs.empty() && !vertices->spill_count)
       return invalid("distance interpolation requested without a distance fragment input");
     flags |= SM50_MSAA_PIXEL_DISTANCE_INPUTS;
   }
@@ -878,7 +1011,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   if (line) {
     auto *vertices = options.line_vertex_layout;
     if (!vertices || vertices->record_dwords == 0 ||
-        vertices->position_offset_dwords == ~0u || vertices->user_count > 64)
+        vertices->position_offset_dwords == ~0u || vertices->user_count > 128)
       return invalid("line pixel shader requires captured vertex output layout");
     for (unsigned i = 0; i < original->arg_size(); ++i) {
       if (std::any_of(distanceInputs.begin(), distanceInputs.end(),
@@ -914,6 +1047,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     }
   }
   const bool positionPull = centroidPosition || samplePosition;
+  // Split 16x: analytic inputs evaluate all 16 logical samples per capture; native pull interpolation is
+  // routed through interpolate_at_offset at the 16x positions (interpolateSample) so both halves agree.
   const unsigned clipPositionOffset = positionPull && !line ? inputWords : ~0u;
   if (positionPull && !line) inputWords += 4 * (options.sample_count + 1);
   const unsigned clipAnchorOffset = positionPull && !line ? inputWords : ~0u;
@@ -928,26 +1063,45 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   const unsigned zClaimOffset = inputWords++;
   const unsigned zAnchorOffset = inputWords;
   inputWords += 2 * (options.sample_count + 1);
-  const unsigned lineMaskOffset = options.line_mode == SM50_MSAA_LINE_ALIASED ||
+  // Conservative rasterization: the gather pass publishes its exact geometric (full or empty) mask here too.
+  const unsigned lineMaskOffset = conservative || options.line_mode == SM50_MSAA_LINE_ALIASED ||
       options.line_mode == SM50_MSAA_LINE_ALPHA_AA ? inputWords++ : ~0u;
   const unsigned lineAlphaOffset = options.line_mode == SM50_MSAA_LINE_ALPHA_AA ? inputWords++ : ~0u;
   unsigned outputWords = 2;
   if (!original->getReturnType()->isVoidTy())
     outputWords += dwords(original->getReturnType(), layout);
   if (centroidPosition) flags |= SM50_MSAA_PIXEL_CENTROID_POSITION;
+  if (coarseShading) inputWords = coarse::allocate(planes, inputWords);
   if (options.layout_out)
-    *options.layout_out = {inputWords, outputWords, 0, 1, 0, 1, flags, 8, 128, 64,
+    *options.layout_out = {inputWords, outputWords, 0, 1, 0, 1, flags, 8,
+                           coarseShading ? coarse::kRecordCount : 128, 64,
                            centerZOffset, sampleZOffset, zClaimOffset, zAnchorOffset,
                            options.line_mode, lineMaskOffset, lineAlphaOffset};
 
   const unsigned variant = options.variant;
+  // Finalize the AIR target before emitting any version-dependent texture intrinsics.
+  // Non-coverage MSAA passes require AIR 2.8 on macOS 27 AGX and interoperate with
+  // replay vertex AIR 2.6; coverage stays at its original target.
+  if (variant != SM50_MSAA_COVERAGE) {
+    module.setTargetTriple("air64_v28-apple-macosx26.0");
+    auto *version = module.getOrInsertNamedMetadata("air.version");
+    version->clearOperands();
+    version->addOperand(MDTuple::get(context, {
+      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 2)),
+      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 8)),
+      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 0))
+    }));
+  }
   SmallVector<Type *, 32> parameters;
   SmallVector<Metadata *, 32> metadata;
   SmallVector<unsigned, 32> originalArgs;
   for (unsigned i = 0; i < original->arg_size(); ++i) {
     auto type = kind(*cast<MDNode>(oldInputs->getOperand(i)));
+    if (i == shadingRateOld) continue;
     if (std::any_of(distanceInputs.begin(), distanceInputs.end(),
         [i](const DistanceInput &input) { return input.argument == i; })) continue;
+    if (std::any_of(pulled.begin(), pulled.end(),
+        [i](const PulledInput &input) { return input.argument == i && input.vertex_offset != ~0u; })) continue;
     if (variant != SM50_MSAA_COVERAGE &&
         !(variant == SM50_MSAA_SAMPLE_APP && type == "air.fragment_input" && !centroidInput[i]) &&
         !((variant == SM50_MSAA_SAMPLE_APP || variant == SM50_MSAA_PIXEL) && resourceInput(type)))
@@ -971,7 +1125,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     outputArg = addBuffer(SM50_BINDING_INDEX_MSAA_PIXEL_OUTPUTS, variant == SM50_MSAA_PIXEL,
                           "msaa_output_records", unsigned(air::AddressSpace::device));
   unsigned lineRecordsArg = ~0u, lineIndicesArg = ~0u;
-  if ((line || !distanceInputs.empty()) && variant == SM50_MSAA_COVERAGE) {
+  if ((line || options.distance_vertex_count || coarseShading) && variant == SM50_MSAA_COVERAGE) {
     lineRecordsArg = addBuffer(SM50_BINDING_INDEX_MSAA_VERTEX_RECORDS, false,
       "msaa_line_original_vertices", unsigned(air::AddressSpace::device));
     lineIndicesArg = addBuffer(24, false, "msaa_line_original_indices",
@@ -981,6 +1135,14 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   parameters.push_back(PointerType::get(Type::getInt32Ty(context), unsigned(air::AddressSpace::constant)));
   metadata.push_back(air::BuildBufferArgumentMetadata(controlArg, controlBinding(), context, layout));
   unsigned textureArg = ~0u;
+  unsigned rateImageArg = ~0u;
+  if (coarseShading && variant == SM50_MSAA_COVERAGE) {
+    auto *textureType = StructType::getTypeByName(context, "struct._texture_2d_t");
+    if (!textureType) textureType = StructType::create(context, "struct._texture_2d_t");
+    rateImageArg = parameters.size();
+    parameters.push_back(textureType->getPointerTo(1));
+    metadata.push_back(textureMetadata(rateImageArg, context, false, 13));
+  }
   if (variant != SM50_MSAA_COVERAGE) {
     textureArg = parameters.size();
     StringRef textureName = options.sample_count == 1 ? "struct._texture_2d_t" : "struct._texture_2d_ms_t";
@@ -1022,6 +1184,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     if (!interpolant) interpolant = StructType::create(context, "struct._interpolant_t");
     parameters.push_back(interpolant->getPointerTo(1));
     metadata.push_back(clipPositionInput(clipArg, context));
+    reciprocalWArg = parameters.size();
+    parameters.push_back(interpolant->getPointerTo(1));
+    metadata.push_back(reciprocalWInput(reciprocalWArg, context));
+  }
+  if (variant == SM50_MSAA_COVERAGE && coarseShading && reciprocalWArg == ~0u) {
+    auto *interpolant = StructType::getTypeByName(context, "struct._interpolant_t");
+    if (!interpolant) interpolant = StructType::create(context, "struct._interpolant_t");
     reciprocalWArg = parameters.size();
     parameters.push_back(interpolant->getPointerTo(1));
     metadata.push_back(reciprocalWInput(reciprocalWArg, context));
@@ -1078,6 +1247,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     builder.CreateRet(Constant::getNullValue(returnType));
   builder.SetInsertPoint(valid);
   auto *pixel = pixelIndex(builder, position, control);
+  // Split 16x has no single native coverage texture: both 8x halves OR their logical coverage into record
+  // dword 1 (no depth/stencil is allowed with forced samples), so the post-raster mask is that union & SampleMask.
+  auto logicalMask = [&](Value *record) -> Value * {
+    return builder.CreateAnd(builder.CreateLoad(builder.getInt32Ty(),
+      recordPointer(builder, entry->getArg(inputArg), record, inputWords, 1)),
+      builder.CreateLoad(builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3)));
+  };
   auto lineAlpha = [&](Value *value) -> Value * {
     if (lineAlphaOffset == ~0u || !value || value->getType()->isVoidTy()) return value;
     auto *word = recordPointer(builder, entry->getArg(inputArg), pixel, inputWords, lineAlphaOffset);
@@ -1107,6 +1283,15 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     if (lineMaskOffset != ~0u)
       geometricCoverage = builder.CreateLoad(builder.getInt32Ty(),
         recordPointer(builder, scratch, pixel, inputWords, lineMaskOffset));
+    // Native coverage of this pass's 8 samples; split 16x maps it to logical samples [sample_base, +8).
+    // Line masks are written by the gather pass in logical bits already.
+    Value *sampleBase = split ? static_cast<Value *>(builder.CreateLoad(builder.getInt32Ty(),
+      builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 13))) : nullptr;
+    Value *nativeCoverage = geometricCoverage;
+    if (split && lineMaskOffset != ~0u)
+      nativeCoverage = builder.CreateAnd(builder.CreateLShr(geometricCoverage, sampleBase), builder.getInt32(0xff));
+    else if (split)
+      geometricCoverage = builder.CreateShl(geometricCoverage, sampleBase);
     auto *claim = recordPointer(builder, scratch, pixel, inputWords, 0);
     auto *won = builder.CreateAtomicCmpXchg(claim, builder.getInt32(0), builder.getInt32(1),
       MaybeAlign(), AtomicOrdering::Monotonic, AtomicOrdering::Monotonic);
@@ -1170,7 +1355,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     };
     SmallVector<Value *, 3> distanceRecords;
     SmallVector<std::array<Value *, 3>, 3> distanceVertices;
-    if (!distanceInputs.empty()) {
+    if (options.distance_vertex_count) {
       auto *vertices = options.distance_vertex_layout;
       if (line) {
         if (options.distance_vertex_count != 2 ||
@@ -1211,34 +1396,43 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         }
       }
     }
-    auto distanceInputValue = [&](const DistanceInput &input, Value *xy) {
+    auto capturedInputValue = [&](unsigned vertexOffset, Type *type, unsigned bytes, bool noPerspective,
+                                  bool flat, Value *xy) {
       SmallVector<Value *, 3> values;
       for (auto *record : distanceRecords) {
-        auto *word = builder.CreateConstGEP1_32(builder.getInt32Ty(), record, input.vertex_offset);
-        values.push_back(builder.CreateAlignedLoad(FixedVectorType::get(builder.getFloatTy(), 4),
-          builder.CreateBitCast(word, PointerType::get(FixedVectorType::get(builder.getFloatTy(), 4),
-            unsigned(air::AddressSpace::device))), Align(4)));
+        auto *word = builder.CreateConstGEP1_32(builder.getInt32Ty(), record, vertexOffset);
+        if (bytes >= dwords(type, layout) * 4) {
+          values.push_back(builder.CreateAlignedLoad(type, builder.CreateBitCast(word,
+            PointerType::get(type, unsigned(air::AddressSpace::device))), Align(4)));
+        } else {
+          auto *vector = cast<FixedVectorType>(type);
+          Value *value = Constant::getNullValue(type);
+          for (unsigned c = 0; c < bytes / 4; ++c)
+            value = builder.CreateInsertElement(value, builder.CreateAlignedLoad(vector->getElementType(),
+              builder.CreateBitCast(builder.CreateConstGEP1_32(builder.getInt32Ty(), word, c),
+                PointerType::get(vector->getElementType(), unsigned(air::AddressSpace::device))), Align(4)), c);
+          values.push_back(value);
+        }
       }
       if (line)
         return lineValue(builder, values[0], values[1], entry->getArg(lineStartArg),
           entry->getArg(lineEndArg), entry->getArg(lineIntervalArg), xy, lineW0, lineW1,
-          input.no_perspective, input.flat);
+          noPerspective, flat);
       return distanceInterpolate(builder, values, distanceVertices, xy,
-        input.no_perspective, input.flat);
+        noPerspective, flat);
     };
     if (positionPull && !line) {
       auto *clip = entry->getArg(clipArg);
       auto *clipType = FixedVectorType::get(builder.getFloatTy(), 4);
       auto center = module.getOrInsertFunction("air.interpolate_center_perspective.v4f32",
         FunctionType::get(clipType, {clip->getType()}, false));
-      auto sample = module.getOrInsertFunction("air.interpolate_sample_perspective.v4f32",
-        FunctionType::get(clipType, {clip->getType(), builder.getInt32Ty()}, false));
       auto dx = module.getOrInsertFunction("air.dfdx.v4f32",
         FunctionType::get(clipType, {clipType}, false));
       auto dy = module.getOrInsertFunction("air.dfdy.v4f32",
         FunctionType::get(clipType, {clipType}, false));
       for (unsigned location = 0; location <= options.sample_count; ++location) {
-        auto *value = location ? builder.CreateCall(sample, {clip, builder.getInt32(location - 1)}) :
+        auto *value = location ? interpolateSample(builder, module, "perspective", clipType, clip,
+                                   builder.getInt32(location - 1), split, ".v4f32") :
                                  builder.CreateCall(center, {clip});
         auto *gradientX = builder.CreateCall(dx, {value});
         auto *gradientY = builder.CreateCall(dy, {value});
@@ -1263,10 +1457,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         auto *reciprocalW = entry->getArg(reciprocalWArg);
         auto reciprocalCenter = module.getOrInsertFunction("air.interpolate_center_no_perspective.f32",
           FunctionType::get(builder.getFloatTy(), {reciprocalW->getType()}, false));
-        auto reciprocalSample = module.getOrInsertFunction("air.interpolate_sample_no_perspective.f32",
-          FunctionType::get(builder.getFloatTy(), {reciprocalW->getType(), builder.getInt32Ty()}, false));
-        auto *q = location ? builder.CreateCall(reciprocalSample,
-          {reciprocalW, builder.getInt32(location - 1)}) :
+        auto *q = location ? interpolateSample(builder, module, "no_perspective", builder.getFloatTy(),
+          reciprocalW, builder.getInt32(location - 1), split, ".f32") :
           builder.CreateCall(reciprocalCenter, {reciprocalW});
         auto scalarDx = module.getOrInsertFunction("air.dfdx.f32",
           FunctionType::get(builder.getFloatTy(), {builder.getFloatTy()}, false));
@@ -1359,8 +1551,10 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       for (unsigned location = 0; location <= options.sample_count; ++location) {
         Value *xy = location ? lineSampleXY(builder, position, builder.getInt32(location - 1),
           options.sample_count, options.center_pattern) : lineCenterXY(builder, position);
-        auto *value = distanceInputValue(input, xy);
-        unsigned offset = location ? input.sample_offset + (location - 1) * 4 : offsets[input.argument];
+        Type *type = original->getArg(input.argument)->getType();
+        auto *value = capturedInputValue(input.vertex_offset, type, dwords(type, layout) * 4,
+          input.no_perspective, input.flat, xy);
+        unsigned offset = location ? input.sample_offset + (location - 1) * dwords(type, layout) : offsets[input.argument];
         for (unsigned lane = 0; lane < 4; ++lane) {
           auto *helper = builder.CreateBitCast(recordPointer(builder, scratch,
             helperPixels[lane], inputWords, offset),
@@ -1379,7 +1573,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       unsigned argument = ~0u;
       for (unsigned i = 0; i < originalArgs.size(); ++i)
         if (originalArgs[i] == plan.argument) argument = i;
-      if (argument == ~0u) return invalid("coverage variant lost its native interpolant");
+      if (argument == ~0u && plan.vertex_offset == ~0u) return invalid("coverage variant lost its native interpolant");
       auto lineInput = std::find_if(lineInputs.begin(), lineInputs.end(),
         [&plan](const LineInput &input) { return input.argument == plan.argument; });
       for (unsigned location = 0; location < 4; ++location) {
@@ -1396,8 +1590,9 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         StringRef modes[] = {"center", "centroid", "sample", "offset"};
         std::string symbol = ("air.interpolate_" + modes[location] +
           (plan.perspective ? "_perspective.v4f32" : "_no_perspective.v4f32")).str();
-        SmallVector<Type *, 2> types = {entry->getArg(argument)->getType()};
-        SmallVector<Value *, 2> args = {entry->getArg(argument)};
+        SmallVector<Type *, 2> types;
+        SmallVector<Value *, 2> args;
+        if (argument != ~0u) {types.push_back(entry->getArg(argument)->getType()); args.push_back(entry->getArg(argument));}
         if (location == PullSample) {types.push_back(builder.getInt32Ty()); args.push_back(index);}
         if (location == PullOffset) {
           auto *offset = UndefValue::get(FixedVectorType::get(builder.getFloatTy(), 2));
@@ -1413,8 +1608,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         }
         auto *pullType = FixedVectorType::get(builder.getFloatTy(), 4);
         Value *value = PoisonValue::get(pullType);
-        if (line) {
-          if (lineInput == lineInputs.end()) return invalid("line pull input has no captured output");
+        if (line || plan.vertex_offset != ~0u) {
+          if (line && lineInput == lineInputs.end()) return invalid("line pull input has no captured output");
           Value *xy = lineCenterXY(builder, position);
           if (location == PullSample || location == PullCentroid) {
             Value *sample = location == PullSample ? static_cast<Value *>(index) :
@@ -1435,19 +1630,18 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
             }
             xy = corner;
           }
-          value = lineInputValue(*lineInput, pullType, xy);
+          value = line ? lineInputValue(*lineInput, pullType, xy)
+              : capturedInputValue(plan.vertex_offset, pullType, plan.vertex_bytes, !plan.perspective, plan.flat, xy);
+        } else if (location == PullSample) {
+          value = interpolateSample(builder, module, plan.perspective ? "perspective" : "no_perspective",
+            pullType, entry->getArg(argument), index, split, ".v4f32");
         } else if (location != PullCentroid) {
           auto fn = module.getOrInsertFunction(symbol, FunctionType::get(pullType, types, false));
           value = builder.CreateCall(fn, args);
         }
-        if (!line && location == PullCentroid) {
+        if (!line && plan.vertex_offset == ~0u && location == PullCentroid) {
           // Capture every finite native value now; choose only after all
           // native invocations have contributed their geometric coverage.
-          auto sampleFn = module.getOrInsertFunction(
-            plan.perspective ? "air.interpolate_sample_perspective.v4f32" :
-                               "air.interpolate_sample_no_perspective.v4f32",
-            FunctionType::get(value->getType(),
-              {entry->getArg(argument)->getType(), builder.getInt32Ty()}, false));
           auto centerFn = module.getOrInsertFunction(
             plan.perspective ? "air.interpolate_center_perspective.v4f32" :
                                "air.interpolate_center_no_perspective.v4f32",
@@ -1461,8 +1655,9 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           auto *atCenter = builder.CreateCall(centerFn, {entry->getArg(argument)});
           builder.CreateBr(chosenBlock);
           builder.SetInsertPoint(atSampleBlock);
-          auto *atSample = builder.CreateCall(sampleFn,
-            {entry->getArg(argument), builder.CreateSub(index, builder.getInt32(1))});
+          auto *atSample = interpolateSample(builder, module,
+            plan.perspective ? "perspective" : "no_perspective", pullType, entry->getArg(argument),
+            builder.CreateSub(index, builder.getInt32(1)), split, ".v4f32");
           builder.CreateBr(chosenBlock);
           builder.SetInsertPoint(chosenBlock);
           auto *chosen = builder.CreatePHI(pullType, 2);
@@ -1497,13 +1692,144 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       }
     }
     auto *sampleMask = builder.CreateLoad(builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3));
-    auto *covered = builder.CreateAnd(geometricCoverage, sampleMask);
+    if (coarseShading) {
+      SmallVector<Value *, 8> interpolants;
+      for (unsigned index = 0; index < planes.inputs.size(); ++index) {
+        const auto &input = planes.inputs[index];
+        Value *interpolant = nullptr;
+        for (unsigned i = 0; i < originalArgs.size(); ++i)
+          if (originalArgs[i] == input.argument) interpolant = entry->getArg(i);
+        if (!interpolant && pulled[index].vertex_offset == ~0u)
+          return invalid("coarse coverage lost a captured input");
+        interpolants.push_back(interpolant);
+      }
+      Value *primitiveRate = builder.getInt32(0);
+      const auto *vertices = options.coarse_vertex_layout;
+      if (vertices && vertices->shading_rate_offset_dwords != ~0u) {
+        Value *slot = builder.CreateLoad(builder.getInt32Ty(),
+          builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 7));
+        Value *index = builder.CreateAdd(builder.CreateMul(slot, builder.getInt32(conservative ? 24 : 3)),
+                                        builder.getInt32(conservative ? 18 : 0));
+        Value *ordinal = builder.CreateLoad(builder.getInt32Ty(),
+          builder.CreateGEP(builder.getInt32Ty(), entry->getArg(lineIndicesArg), index));
+        Value *word = builder.CreateAdd(builder.CreateMul(builder.CreateZExt(ordinal, builder.getInt64Ty()),
+          builder.getInt64(vertices->record_dwords)), builder.getInt64(vertices->shading_rate_offset_dwords));
+        primitiveRate = builder.CreateLoad(builder.getInt32Ty(),
+          builder.CreateGEP(builder.getInt32Ty(), entry->getArg(lineRecordsArg), word));
+      }
+      Value *imageRate = rateImage(builder, module, *entry, entry->getArg(rateImageArg), control);
+      auto *rate = coarse::resolveRate(builder, control, options.sample_count, primitiveRate, imageRate);
+      // Per-primitive (flat and system) inputs are stored once with the planes, at their fine-record offsets.
+      SmallVector<std::pair<unsigned, Value *>, 8> constants;
+      for (unsigned i = 0; i < originalArgs.size(); ++i) {
+        unsigned old = originalArgs[i];
+        if (offsets[old] != ~0u && old != positionOld && old != coverageOld)
+          constants.push_back({offsets[old], entry->getArg(i)});
+      }
+      for (const auto &input : distanceInputs)
+        if (input.flat && offsets[input.argument] != ~0u) {
+          Type *type = original->getArg(input.argument)->getType();
+          auto *word = recordPointer(builder, scratch, pixel, inputWords, offsets[input.argument]);
+          auto *value = builder.CreateAlignedLoad(type, builder.CreateBitCast(word,
+            PointerType::get(type, unsigned(air::AddressSpace::device))), Align(4));
+          constants.push_back({offsets[input.argument], value});
+        }
+      coarse::capture(builder, module, *entry, scratch, inputWords, position, control, pixel, centerZOffset,
+                      planes, interpolants, entry->getArg(reciprocalWArg), rate, constants,
+        [&](unsigned index, Value *xy) {
+          // Pull plans and coarse planes are appended together in fragment-input order.
+          const auto &plan = pulled[index];
+          return capturedInputValue(plan.vertex_offset, FixedVectorType::get(builder.getFloatTy(), 4),
+            plan.vertex_bytes, !plan.perspective, plan.flat, xy);
+        });
+    }
+    // The marker covers native samples of this pass; split 16x selects this half's bits of the logical mask.
+    auto *covered = split
+      ? builder.CreateAnd(nativeCoverage, builder.CreateLShr(sampleMask, sampleBase))
+      : builder.CreateAnd(geometricCoverage, sampleMask);
     auto *result = builder.CreateInsertValue(PoisonValue::get(returnType), builder.getInt32(1), {0});
     result = builder.CreateInsertValue(result, covered, {1});
     builder.CreateRet(result);
+  } else if (variant == SM50_MSAA_PIXEL && coarseShading) {
+    // One invocation per coarse pixel of the virtual grid; `pixel` is the coarse pixel's output record.
+    auto *scratch = entry->getArg(inputArg);
+    auto *rate = coarse::load(builder, scratch, inputWords, coarse::kRateRecordDword, builder.getInt32Ty());
+    auto grid = coarse::grid(builder, position, control, rate);
+    auto coverage = coarse::coverage(builder, grid, control, scratch, inputWords, options.sample_count,
+      [&](Value *at) { return postMask(builder, module, entry->getArg(textureArg), at, options.sample_count); });
+    auto *mask = coverage.post;
+    auto *covered = builder.CreateICmpNE(mask, builder.getInt32(0));
+    auto *shade = BasicBlock::Create(context, "shade_coarse", entry);
+    auto *discard = BasicBlock::Create(context, "no_covered_coarse_samples", entry);
+    builder.CreateCondBr(covered, shade, discard);
+    builder.SetInsertPoint(discard);
+    builder.CreateCall(module.getOrInsertFunction("air.discard_fragment", FunctionType::get(builder.getVoidTy(), {}, false)));
+    builder.CreateBr(shade);
+    builder.SetInsertPoint(shade);
+    SmallVector<Value *, 32> callArgs(original->arg_size());
+    for (unsigned i = 0; i < originalArgs.size(); ++i)
+      callArgs[originalArgs[i]] = entry->getArg(i);
+    for (unsigned i = 0; i < original->arg_size(); ++i) {
+      if (callArgs[i]) continue;
+      if (i == shadingRateOld) callArgs[i] = rate;
+      else if (i == coverageOld) callArgs[i] = mask;
+      else if (i == primitiveOld)
+        callArgs[i] = builder.CreateLoad(builder.getInt32Ty(),
+          builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 6));
+      else if (i == positionOld)
+        callArgs[i] = coarse::position(builder, scratch, inputWords, planes, control, grid.center);
+      else if (offsets[i] != ~0u)
+        callArgs[i] = coarse::load(builder, scratch, inputWords, offsets[i], original->getArg(i)->getType());
+      else if (std::any_of(planes.inputs.begin(), planes.inputs.end(),
+                           [i](const coarse::PlaneInput &input) { return input.argument == i; }))
+        callArgs[i] = UndefValue::get(original->getArg(i)->getType());
+      else
+        return invalid("uncaptured coarse pixel input");
+    }
+    Function *body = original;
+    if (!planes.inputs.empty()) {
+      SmallVector<Type *, 32> bodyTypes(original->getFunctionType()->param_begin(),
+                                         original->getFunctionType()->param_end());
+      for (auto *type : coarse::bodyTypes(scratch->getType(), control->getType())) bodyTypes.push_back(type);
+      body = Function::Create(FunctionType::get(original->getReturnType(), bodyTypes, false),
+                              Function::InternalLinkage, originalName + ".coarse_pull", module);
+      body->copyAttributesFrom(original);
+      for (unsigned i = 0; i < original->arg_size(); ++i)
+        original->getArg(i)->replaceAllUsesWith(body->getArg(i));
+      body->getBasicBlockList().splice(body->begin(), original->getBasicBlockList());
+      if (auto error = coarse::rewritePulls(*body, original->arg_size(), planes, inputWords,
+                                            options.sample_count, options.center_pattern, conservative))
+        return error;
+      for (auto *value : coarse::bodyArguments(builder, scratch, control, grid, coverage.geometric))
+        callArgs.push_back(value);
+    }
+    for (auto &instruction : make_early_inc_range(instructions(*body))) {
+      auto *call = dyn_cast<CallInst>(&instruction);
+      if (!call || !call->getCalledFunction() ||
+          call->getCalledFunction()->getName() != "air.get_num_samples.i32") continue;
+      call->replaceAllUsesWith(builder.getInt32(options.sample_count));
+      call->eraseFromParent();
+    }
+    auto *result = builder.CreateCall(body, callArgs);
+    auto *out = entry->getArg(outputArg);
+    if (!original->getReturnType()->isVoidTy()) {
+      auto *ptr = builder.CreateBitCast(recordPointer(builder, out, pixel, outputWords, 2),
+                             PointerType::get(original->getReturnType(), unsigned(air::AddressSpace::device)));
+      conditionalStore(builder, *entry, covered, ptr, result);
+    }
+    // SV_Coverage output in coarse order; the replay selects each fine pixel's bits.
+    Value *outputMask = builder.getInt32(~0u);
+    if (!original->getReturnType()->isVoidTy())
+      for (unsigned i = 0; i < oldOutputs->getNumOperands(); ++i)
+        if (outputKind(*cast<MDNode>(oldOutputs->getOperand(i))) == "air.sample_mask")
+          outputMask = builder.CreateExtractValue(result, {i});
+    conditionalStore(builder, *entry, covered, recordPointer(builder, out, pixel, outputWords, 1), outputMask);
+    conditionalStore(builder, *entry, covered, recordPointer(builder, out, pixel, outputWords, 0), builder.getInt32(1));
+    builder.CreateRetVoid();
   } else if (variant == SM50_MSAA_PIXEL) {
     auto *scratch = entry->getArg(inputArg);
-    auto *mask = postMask(builder, module, entry->getArg(textureArg), position, options.sample_count);
+    auto *mask = split ? logicalMask(pixel)
+                       : postMask(builder, module, entry->getArg(textureArg), position, options.sample_count);
     auto *covered = builder.CreateICmpNE(mask, builder.getInt32(0));
     auto *shade = BasicBlock::Create(context, "shade_once", entry);
     auto *discard = BasicBlock::Create(context, "no_covered_samples", entry);
@@ -1550,7 +1876,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           distance->sample_offset);
         auto *sample = builder.CreateAlignedLoad(original->getArg(i)->getType(),
           builder.CreateBitCast(builder.CreateGEP(builder.getInt32Ty(), word,
-            builder.CreateMul(sampleIndex, builder.getInt32(4))),
+            builder.CreateMul(sampleIndex, builder.getInt32(dwords(original->getArg(i)->getType(), layout)))),
             PointerType::get(original->getArg(i)->getType(), unsigned(air::AddressSpace::device))), Align(4));
         callArgs[i] = builder.CreateSelect(builder.CreateICmpEQ(slot, builder.getInt32(0)), callArgs[i], sample);
       }
@@ -1581,9 +1907,9 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         const int8_t sampleX8[] = {1, -1, 5, -3, -5, -7, 3, 7};
         const int8_t sampleY8[] = {-3, 3, 1, -5, 5, -1, 7, -7};
         const int8_t *sampleX = options.sample_count == 1 ? sampleX1 : options.sample_count == 2 ? sampleX2 :
-          options.sample_count == 4 ? sampleX4 : sampleX8;
+          options.sample_count == 4 ? sampleX4 : options.sample_count == 8 ? sampleX8 : kSampleX16;
         const int8_t *sampleY = options.sample_count == 1 ? sampleY1 : options.sample_count == 2 ? sampleY2 :
-          options.sample_count == 4 ? sampleY4 : sampleY8;
+          options.sample_count == 4 ? sampleY4 : options.sample_count == 8 ? sampleY8 : kSampleY16;
         auto *originalPos = callArgs[i];
         Value *fixedPos = originalPos;
         for (unsigned axis = 0; axis < 2; ++axis) {
@@ -1688,15 +2014,30 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     conditionalStore(builder, *entry, covered, recordPointer(builder, out, pixel, outputWords, 0), builder.getInt32(1));
     builder.CreateRetVoid();
   } else {
-    auto *mask = postMask(builder, module, entry->getArg(textureArg), position, options.sample_count);
+    auto *mask = split ? logicalMask(pixel)
+                       : postMask(builder, module, entry->getArg(textureArg), position, options.sample_count);
+    // Coarse replay reads the output record of the fine pixel's coarse pixel.
+    Value *outputRecord = pixel, *coarseShift = nullptr;
+    if (coarseShading && variant == SM50_MSAA_REPLAY) {
+      auto replay = coarse::replay(builder, position, control,
+        coarse::load(builder, entry->getArg(inputArg), inputWords, coarse::kRateRecordDword, builder.getInt32Ty()),
+        options.sample_count);
+      outputRecord = replay.record;
+      coarseShift = replay.shift;
+    }
+    // Split 16x replays each 8x half natively: logical sample = native sample id + tile.sample_base.
+    Value *halfBase = split ? static_cast<Value *>(builder.CreateLoad(builder.getInt32Ty(),
+      builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 13))) : nullptr;
+    Value *logicalSample = sampleArg == ~0u ? nullptr : split
+      ? builder.CreateAdd(entry->getArg(sampleArg), halfBase) : static_cast<Value *>(entry->getArg(sampleArg));
     auto *validPixel = variant == SM50_MSAA_REPLAY && options.single_sample_target
       ? builder.CreateICmpNE(mask, builder.getInt32(0))
       : builder.CreateICmpNE(builder.CreateAnd(mask,
-          builder.CreateShl(builder.getInt32(1), entry->getArg(sampleArg))), builder.getInt32(0));
+          builder.CreateShl(builder.getInt32(1), logicalSample)), builder.getInt32(0));
     auto *out = variant == SM50_MSAA_REPLAY ? entry->getArg(outputArg) : nullptr;
     auto *published = variant == SM50_MSAA_REPLAY
       ? builder.CreateICmpNE(builder.CreateLoad(builder.getInt32Ty(),
-          recordPointer(builder, out, pixel, outputWords, 0)), builder.getInt32(0))
+          recordPointer(builder, out, outputRecord, outputWords, 0)), builder.getInt32(0))
       : builder.getTrue();
     auto *present = BasicBlock::Create(context, "replay_sample", entry);
     auto *masked = BasicBlock::Create(context, "replay_masked", entry);
@@ -1739,7 +2080,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           builder.CreateICmpEQ(slot, builder.getInt32(0)), builder.getInt32(0),
           builder.CreateSub(slot, builder.getInt32(1))) : slot;
         auto *pointer = builder.CreateBitCast(builder.CreateGEP(builder.getInt32Ty(), word,
-          builder.CreateMul(sampleIndex, builder.getInt32(4))),
+          builder.CreateMul(sampleIndex, builder.getInt32(dwords(original->getArg(input.argument)->getType(), layout)))),
           PointerType::get(original->getArg(input.argument)->getType(),
             unsigned(air::AddressSpace::device)));
         Value *sampleValue = builder.CreateAlignedLoad(original->getArg(input.argument)->getType(), pointer, Align(4));
@@ -1938,7 +2279,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     else {
       Value *value = PoisonValue::get(returnType);
       if (!original->getReturnType()->isVoidTy()) {
-        auto *ptr = builder.CreateBitCast(recordPointer(builder, out, pixel, outputWords, 2),
+        auto *ptr = builder.CreateBitCast(recordPointer(builder, out, outputRecord, outputWords, 2),
                            PointerType::get(original->getReturnType(), unsigned(air::AddressSpace::device)));
         auto *saved = builder.CreateAlignedLoad(original->getReturnType(), ptr, Align(4));
         for (unsigned i = 0; i < oldOutputs->getNumOperands(); ++i)
@@ -1946,15 +2287,20 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       }
       for (unsigned i = 0; i < oldOutputs->getNumOperands(); ++i)
         if (outputKind(*cast<MDNode>(oldOutputs->getOperand(i))) == "air.sample_mask") {
-          auto *appMask = builder.CreateExtractValue(value, {i});
+          Value *appMask = builder.CreateExtractValue(value, {i});
+          if (coarseShift)
+            appMask = builder.CreateAnd(builder.CreateLShr(appMask, coarseShift),
+                                        builder.getInt32((1u << options.sample_count) - 1));
           Value *effective = builder.CreateAnd(appMask, mask);
           if (options.single_sample_target) {
-            // The RTV has only output sample zero, while mask describes the
-            // virtual raster samples. Any covered raster sample can write it.
-            auto *outputEnabled = builder.CreateICmpNE(
-                builder.CreateAnd(appMask, builder.getInt32(1)), builder.getInt32(0));
+            // Forced raster pattern != RTV samples: mask describes the forced raster samples, while the app
+            // mask (with SampleMask) selects output samples. Any covered raster sample writes the enabled
+            // output samples; Metal ANDs this with the replayed native output sample.
             auto *rasterCovered = builder.CreateICmpNE(mask, builder.getInt32(0));
-            effective = builder.CreateZExt(builder.CreateAnd(outputEnabled, rasterCovered), builder.getInt32Ty());
+            effective = builder.CreateSelect(rasterCovered, appMask, builder.getInt32(0));
+          } else if (split) {
+            // The native 8x half sees logical samples [sample_base, sample_base + 8).
+            effective = builder.CreateLShr(effective, halfBase);
           }
           value = builder.CreateInsertValue(value, effective, {i});
         }
@@ -1975,19 +2321,6 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   }
   original->setLinkage(Function::InternalLinkage);
   fragments->setOperand(0, entryMetadata(*entry, *oldEntry, metadata, variant, defaultDepth));
-  // MSAA uint texture reads crash the macOS 27 AGX compiler when encoded as
-  // AIR 2.6, even though the metallib itself loads. AIR 2.8 is the earliest
-  // proven target for 1x reads and interoperates with replay vertex AIR 2.6.
-  if (variant != SM50_MSAA_COVERAGE) {
-    module.setTargetTriple("air64_v28-apple-macosx26.0");
-    auto *version = module.getOrInsertNamedMetadata("air.version");
-    version->clearOperands();
-    version->addOperand(MDTuple::get(context, {
-      ConstantAsMetadata::get(builder.getInt32(2)),
-      ConstantAsMetadata::get(builder.getInt32(8)),
-      ConstantAsMetadata::get(builder.getInt32(0))
-    }));
-  }
   return Error::success();
 }
 

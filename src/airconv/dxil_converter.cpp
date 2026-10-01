@@ -308,6 +308,8 @@ llvm::Error PrepareShader(
   case Stage::Geometry:
   case Stage::Hull:
   case Stage::Domain:
+  case Stage::Mesh:
+  case Stage::Amplification:
     break;
   default:
     return unsupported("DXIL shader model 6 stage is not supported by the graphics pipeline");
@@ -339,6 +341,8 @@ llvm::Error PrepareShader(
   if (metadata->stage == Stage::Domain)
     if (auto error = PrepareDomainShader(*metadata, shader))
       return error;
+  if (metadata->stage == Stage::Pixel)
+    shader.ps_force_early_depth_stencil = metadata->force_early_depth_stencil ? 1 : 0;
   if (metadata->stage == Stage::Pixel)
     for (const auto &input : metadata->input_sig)
       if (input.semantic_kind == microsoft::D3D10_SB_NAME_SAMPLE_INDEX ||
@@ -611,7 +615,7 @@ llvm::Error LowerImmutableConstants(llvm::Module &module, SM50CompiledBitcodeInt
       call->eraseFromParent();
     }
 
-  for (const char *kind : {"air.vertex", "air.fragment", "air.kernel"}) {
+  for (const char *kind : {"air.vertex", "air.fragment", "air.kernel", "air.object", "air.mesh"}) {
     auto *entries = module.getNamedMetadata(kind);
     if (!entries)
       continue;

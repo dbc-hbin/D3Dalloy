@@ -124,6 +124,36 @@ bool presentCompletes(IDXGISwapChain3 *swapchain, HANDLE waitable, DWORD timeout
   return WaitForSingleObject(waitable, timeout) == WAIT_OBJECT_0;
 }
 
+struct PendingPresent {
+  IDXGISwapChain3 *chain;
+  HANDLE started;
+  HANDLE finished;
+  HRESULT result;
+};
+
+DWORD WINAPI runPendingPresent(void *value) {
+  auto &attempt = *static_cast<PendingPresent *>(value);
+  SetEvent(attempt.started);
+  attempt.result = attempt.chain->Present(0, 0);
+  SetEvent(attempt.finished);
+  return 0;
+}
+
+struct PendingWait {
+  HANDLE waitable;
+  HANDLE started;
+  HANDLE finished;
+  DWORD result;
+};
+
+DWORD WINAPI runPendingWait(void *value) {
+  auto &attempt = *static_cast<PendingWait *>(value);
+  SetEvent(attempt.started);
+  attempt.result = WaitForSingleObject(attempt.waitable, INFINITE);
+  SetEvent(attempt.finished);
+  return 0;
+}
+
 void run() {
   ComPtr<IDXGIFactory4> factory;
   check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "factory");
@@ -679,40 +709,18 @@ void run() {
   check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stalled)), "removal-stall-fence");
   check(queueA->Wait(stalled.Get(), 1), "stall-present-for-removal");
   check(swapchain->Present(0, 0), "accept-stalled-present");
-  struct PendingPresent {
-    IDXGISwapChain3 *chain;
-    HANDLE started;
-    HANDLE finished;
-    HRESULT result;
-  } pending{swapchain.Get(), CreateEventW(nullptr, FALSE, FALSE, nullptr),
+  PendingPresent pending{swapchain.Get(), CreateEventW(nullptr, FALSE, FALSE, nullptr),
             CreateEventW(nullptr, FALSE, FALSE, nullptr), E_FAIL};
   require(pending.started && pending.finished, "removal-thread-events");
-  HANDLE presentThread = CreateThread(nullptr, 0, [](void *value) -> DWORD {
-    auto &attempt = *static_cast<PendingPresent *>(value);
-    SetEvent(attempt.started);
-    attempt.result = attempt.chain->Present(0, 0);
-    SetEvent(attempt.finished);
-    return 0;
-  }, &pending, 0, nullptr);
+  HANDLE presentThread = CreateThread(nullptr, 0, runPendingPresent, &pending, 0, nullptr);
   require(presentThread != nullptr, "removal-present-thread");
   require(WaitForSingleObject(pending.started, kCompletionTimeoutMs) == WAIT_OBJECT_0 &&
           WaitForSingleObject(pending.finished, kBlockedProbeMs) == WAIT_TIMEOUT,
           "second-present-blocks-at-latency-limit");
-  struct PendingWait {
-    HANDLE waitable;
-    HANDLE started;
-    HANDLE finished;
-    DWORD result;
-  } publicWait{unscaledWaitable, CreateEventW(nullptr, FALSE, FALSE, nullptr),
+  PendingWait publicWait{unscaledWaitable, CreateEventW(nullptr, FALSE, FALSE, nullptr),
                CreateEventW(nullptr, FALSE, FALSE, nullptr), WAIT_FAILED};
   require(publicWait.started && publicWait.finished, "public-wait-thread-events");
-  HANDLE waitThread = CreateThread(nullptr, 0, [](void *value) -> DWORD {
-    auto &attempt = *static_cast<PendingWait *>(value);
-    SetEvent(attempt.started);
-    attempt.result = WaitForSingleObject(attempt.waitable, INFINITE);
-    SetEvent(attempt.finished);
-    return 0;
-  }, &publicWait, 0, nullptr);
+  HANDLE waitThread = CreateThread(nullptr, 0, runPendingWait, &publicWait, 0, nullptr);
   require(waitThread != nullptr, "public-wait-thread");
   require(WaitForSingleObject(publicWait.started, kCompletionTimeoutMs) == WAIT_OBJECT_0 &&
           WaitForSingleObject(publicWait.finished, kBlockedProbeMs) == WAIT_TIMEOUT,

@@ -120,11 +120,12 @@ int run() {
                 static_cast<unsigned>(options.TiledResourcesTier),
                 options.TypedUAVLoadAdditionalFormats, options.OutputMergerLogicOp);
 
-    const std::array<D3D_FEATURE_LEVEL, 4> requestedLevels{
+    const std::array<D3D_FEATURE_LEVEL, 5> requestedLevels{
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_12_0,
         D3D_FEATURE_LEVEL_12_1,
+        D3D_FEATURE_LEVEL_12_2,
     };
     D3D12_FEATURE_DATA_FEATURE_LEVELS levels{};
     levels.NumFeatureLevels = static_cast<UINT>(requestedLevels.size());
@@ -138,13 +139,35 @@ int run() {
                 static_cast<unsigned>(levels.MaxSupportedFeatureLevel));
 
     int contractFailures = 0;
+    // The feature-level and conservative-raster suites verify the FL 12_1 execution requirements.
+    if (levels.MaxSupportedFeatureLevel != D3D_FEATURE_LEVEL_12_1)
+        contractFailures += fail("MaxSupportedFeatureLevel is not 12_1");
+    const HRESULT fl111Probe = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_1,
+                                                 __uuidof(ID3D12Device), nullptr);
     const HRESULT fl12Probe = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0,
                                                 __uuidof(ID3D12Device), nullptr);
-    std::printf("OWNED_CAPABILITIES_FL12_PROBE hr=0x%08lx max_reported=0x%04x\n",
-                static_cast<unsigned long>(fl12Probe),
-                static_cast<unsigned>(levels.MaxSupportedFeatureLevel));
-    if (levels.MaxSupportedFeatureLevel < D3D_FEATURE_LEVEL_12_0 && SUCCEEDED(fl12Probe))
-        contractFailures += fail("FL12_0 probe succeeded above reported max feature level", fl12Probe);
+    const HRESULT fl121Probe = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_1,
+                                                 __uuidof(ID3D12Device), nullptr);
+    const HRESULT fl122Probe = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_2,
+                                                 __uuidof(ID3D12Device), nullptr);
+    std::printf("OWNED_CAPABILITIES_FL12_PROBE fl11_1=0x%08lx fl12_0=0x%08lx fl12_1=0x%08lx max_reported=0x%04x\n",
+                static_cast<unsigned long>(fl111Probe), static_cast<unsigned long>(fl12Probe),
+                static_cast<unsigned long>(fl121Probe), static_cast<unsigned>(levels.MaxSupportedFeatureLevel));
+    // A null device pointer probes support: S_FALSE when the level is supported.
+    if (fl111Probe != S_FALSE)
+        contractFailures += fail("FL11_1 probe", fl111Probe);
+    if (fl12Probe != S_FALSE)
+        contractFailures += fail("FL12_0 probe", fl12Probe);
+    if (fl121Probe != S_FALSE)
+        contractFailures += fail("FL12_1 probe", fl121Probe);
+    if (SUCCEEDED(fl122Probe))
+        contractFailures += fail("FL12_2 probe succeeded above reported max feature level", fl122Probe);
+    if (!options.OutputMergerLogicOp || !options.TypedUAVLoadAdditionalFormats ||
+        options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_2 ||
+        options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2)
+        contractFailures += fail("FL12_0 required D3D12_OPTIONS caps");
+    if (!options.ROVsSupported || options.ConservativeRasterizationTier < D3D12_CONSERVATIVE_RASTERIZATION_TIER_1)
+        contractFailures += fail("FL12_1 required D3D12_OPTIONS caps");
 
     D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{D3D_SHADER_MODEL_6_7};
     hr = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel));

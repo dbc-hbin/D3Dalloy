@@ -454,7 +454,8 @@ pop_mesh_output_position(uint32_t from_reg, uint32_t mask, pvalue vertex_id) {
 
 IREffect
 pop_mesh_output_vertex_data(
-    uint32_t from_reg, uint32_t mask, uint32_t idx, pvalue vertex_id, air::MSLScalerOrVectorType desired_type
+    uint32_t from_reg, uint32_t mask, uint32_t idx, pvalue vertex_id, air::MSLScalerOrVectorType desired_type,
+    bool sanitize_distance
 ) {
   auto ctx = co_yield get_context();
   auto result = co_yield to_desired_type_from_int_vec4(
@@ -463,9 +464,18 @@ pop_mesh_output_vertex_data(
   );
   // This is the final mesh -> fragment user varying. Keep the internal
   // control-point registers packed, but publish semantic-local lanes here.
-  result = ctx.builder.CreateShuffleVector(
-    result, llvm::ConstantAggregateZero::get(result->getType()), semantic_shuffle(mask, true)
-  );
+  // System outputs such as SV_ShadingRate are scalar and already extracted.
+  if (llvm::isa<llvm::FixedVectorType>(result->getType()))
+    result = ctx.builder.CreateShuffleVector(
+      result, llvm::ConstantAggregateZero::get(result->getType()), semantic_shuffle(mask, true)
+    );
+  if (sanitize_distance && !ctx.capture_raw_distance_output) {
+    auto *absolute = ctx.builder.CreateAnd(ctx.builder.CreateBitCast(result, ctx.types._int4),
+      ctx.builder.CreateVectorSplat(4, ctx.builder.getInt32(0x7fffffffu)));
+    auto *nonfinite = ctx.builder.CreateICmpUGE(absolute,
+      ctx.builder.CreateVectorSplat(4, ctx.builder.getInt32(0x7f800000u)));
+    result = ctx.builder.CreateSelect(nonfinite, llvm::Constant::getNullValue(ctx.types._float4), result);
+  }
   ctx.air.CreateSetMeshVertexData(vertex_id, idx, result);
   co_return {};
 }

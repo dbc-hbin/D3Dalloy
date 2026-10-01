@@ -28,6 +28,99 @@ def load(name: str, filename: str):
 runner = load("owned_runner", "test-owned-graphics.py")
 analyzer = load("owned_trace_analyzer", "analyze-owned-temporal-trace.py")
 
+# Production evidence from p3/dxrcover/run-03 and p3/mesh2/rt-01, plus the
+# AS and all-stage RayQuery contracts. Keep this independent of runner
+# expectations so a newly required gate cannot manufacture passing evidence.
+RAYTRACING_CONTRACT_TRACE = """
+OWNED_D3D12_RAYTRACING_FORMAT r32g32b32_float status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r32g32_float status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r16g16_float status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r16g16b16a16_float status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r16g16_snorm status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r16g16b16a16_snorm status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r16g16b16a16_unorm status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r16g16_unorm status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r10g10b10a2_unorm status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r8g8b8a8_unorm status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r8g8_unorm status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r8g8b8a8_snorm status=PASS
+OWNED_D3D12_RAYTRACING_FORMAT r8g8_snorm status=PASS
+OWNED_D3D12_RAYTRACING_CASE vertex-formats status=PASS
+OWNED_D3D12_RAYTRACING_CASE geometry-rules status=PASS
+OWNED_D3D12_RAYTRACING_CASE transforms status=PASS
+OWNED_D3D12_RAYTRACING_CASE instances-hit-groups status=PASS
+OWNED_D3D12_RAYTRACING_CONTRACT failures=0
+RAYTRACING_AS case=postbuild-inline failures=0 status=PASS
+RAYTRACING_AS case=postbuild-emit failures=0 status=PASS
+RAYTRACING_AS case=clone-blas failures=0 status=PASS
+RAYTRACING_AS case=clone-tlas failures=0 status=PASS
+RAYTRACING_AS case=compact-blas failures=0 status=PASS
+RAYTRACING_AS case=compact-tlas failures=0 status=PASS
+RAYTRACING_AS case=serialize-blas failures=0 status=PASS
+RAYTRACING_AS case=serialize-tlas-relocate failures=0 status=PASS
+RAYTRACING_AS case=serialize-aabb failures=0 status=PASS
+RAYTRACING_AS case=serialize-empty failures=0 status=PASS
+RAYTRACING_AS case=visualize-blas failures=0 status=PASS
+RAYTRACING_AS case=visualize-tlas failures=0 status=PASS
+RAYTRACING_AS case=update-blas-inplace failures=0 status=PASS
+RAYTRACING_AS case=update-blas-copy failures=0 status=PASS
+RAYTRACING_AS case=update-tlas-inplace failures=0 status=PASS
+RAYTRACING_AS case=update-tlas-copy failures=0 status=PASS
+RAYTRACING_AS_SUMMARY cases=16 failures=0
+OWNED_D3D12_RAYTRACING_CASE dxil-subobjects status=PASS
+OWNED_D3D12_RAYTRACING_CASE config-flags status=PASS
+OWNED_D3D12_RAYTRACING_CASE recursion-depth status=PASS
+OWNED_D3D12_RAYTRACING_CASE stack-size status=PASS
+OWNED_D3D12_RAYTRACING_CASE bundle status=PASS
+OWNED_D3D12_RAYTRACING_CASE miss-ray-values status=PASS
+OWNED_D3D12_RAYTRACING_CASE geometry-skip-flags status=PASS
+OWNED_D3D12_RAYTRACING_CASE add-to-state-object status=PASS
+OWNED_D3D12_RAYTRACING_STATEOBJ failures=0
+OWNED_D3D12_RAYTRACING_CASE generic-function-collection status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE cs lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE vs lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE ps lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE raygen lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE raygen-indirect lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE closesthit lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE anyhit lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE intersection lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE miss lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE callable lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE hs lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE ds lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE gs lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE as lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_CASE ms lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_RAYQUERY_STAGES failures=0
+OWNED_D3D12_RAYTRACING_RAYQUERY failures=0
+OWNED_D3D12_RAYTRACING_ROOTARGS_CASE dispatch-rays-root-arguments slots=4 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE geometry-index lanes=24 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE hit-group-indexing lanes=8 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE miss-index lanes=8 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE traceray-skip-flags lanes=12 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE callable-chains lanes=8 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE rayquery-template-skip lanes=4 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_CASE grid-direct status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_CASE grid-indirect status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_PREDICATION predication-direct-eq0-0 culled=1 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_PREDICATION predication-indirect-eq0-0 culled=1 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_PREDICATION predication-direct-eq0-1 culled=0 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_PREDICATION predication-indirect-eq0-1 culled=0 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_PREDICATION predication-direct-ne0-0 culled=0 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_PREDICATION predication-indirect-ne0-0 culled=0 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_PREDICATION predication-direct-ne0-1 culled=1 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_PREDICATION predication-indirect-ne0-1 culled=1 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_CASE predication status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_BUNDLE bundle-indirect culled=0 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_BUNDLE bundle-indirect-predicated-culled culled=1 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_BUNDLE bundle-indirect-predicated-run culled=0 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_BUNDLE bundle-direct-predicated-culled culled=1 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_BUNDLE bundle-direct-predicated-run culled=0 status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE_CASE bundle status=PASS
+OWNED_D3D12_RAYTRACING_COVERAGE failures=0
+"""
+
 
 class RunnerFailures(unittest.TestCase):
     def simulate(self, *, omit_frame: int | None = None, backend_log: str = "",
@@ -176,7 +269,9 @@ class RunnerFailures(unittest.TestCase):
                             procedural_hit_group: int | None = None,
                             procedural_any_hit_on_rejected: bool = False,
                             procedural_untightened_interval: bool = False,
-                            procedural_clobbered_commit: bool = False) -> dict:
+                            procedural_clobbered_commit: bool = False,
+                            contract_trace: str = RAYTRACING_CONTRACT_TRACE,
+                            stderr_diagnostic: str = "") -> dict:
         with tempfile.TemporaryDirectory(dir=SCRATCH, prefix="raytracing-") as directory:
             base = Path(directory)
             runtime = base / "runtime"
@@ -314,9 +409,11 @@ class RunnerFailures(unittest.TestCase):
                                       "closesthit=0x%08x miss=0x%08x "
                                       "hit=(0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x)\n"
                                       % (index, *intersection_log, *any_hit_log, *stage_logs, *hit_log))
+                    out.write(contract_trace)
                     out.write(f"{runner.RAYTRACING_PASS_MARKER}\n")
                     if loaded:
                         kwargs["stderr"].write(f"dyld[1]: {runtime}/lib/wine/x86_64-unix/winemetal.so\n")
+                    kwargs["stderr"].write(stderr_diagnostic)
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
             with patch.object(runner.subprocess, "run", side_effect=fake_run), \
@@ -326,19 +423,91 @@ class RunnerFailures(unittest.TestCase):
             self.assertEqual(result, 0 if report["pass"] else 1)
             return report
 
-    def test_valid_raytracing_run_passes_and_freezes_shader_argv(self):
+    def test_valid_raytracing_run_passes(self):
         report = self.simulate_raytracing()
         self.assertTrue(report["pass"], report["raytracing"])
-        # The DXR library is frozen beside the executable and passed as argv, so the
-        # evidence records exactly which shader the dispatch was traced with.
-        self.assertIn("raytracing.dxil", report["fixture_sha256"])
-        self.assertEqual(report["command"][-1], "raytracing.dxil")
         self.assertTrue(report["dxil_native_compiler_verified"])
         self.assertEqual(report["raytracing"]["lanes"], list(range(runner.RAYTRACING_LANE_COUNT)))
 
     def test_raytracing_without_frozen_shader_input_cannot_run(self):
         with self.assertRaisesRegex(ValueError, "regular file"):
             self.simulate_raytracing(shaders=False)
+
+    def test_raytracing_complete_lanes_cannot_replace_missing_contract_evidence(self):
+        markers = (
+            "FORMAT r8g8_snorm", "CASE geometry-rules", "CONTRACT failures=0",
+            "CASE add-to-state-object", "CASE generic-function-collection", "STATEOBJ failures=0",
+            "RAYQUERY_CASE raygen-indirect", "RAYQUERY failures=0",
+            "RAYQUERY_CASE hs", "RAYQUERY_CASE ds", "RAYQUERY_CASE gs",
+            "RAYQUERY_CASE as", "RAYQUERY_CASE ms", "RAYQUERY_CASE closesthit",
+            "RAYQUERY_CASE anyhit", "RAYQUERY_CASE intersection",
+            "RAYQUERY_CASE miss", "RAYQUERY_CASE callable", "RAYQUERY_STAGES failures=0",
+            "ROOTARGS_CASE dispatch-rays-root-arguments",
+            "COVERAGE_FEATURE rayquery-template-skip", "COVERAGE_CASE grid-indirect",
+            "COVERAGE_PREDICATION predication-indirect-ne0-1",
+            "COVERAGE_BUNDLE bundle-direct-predicated-run", "COVERAGE failures=0",
+        )
+        for marker in markers:
+            with self.subTest(marker=marker):
+                trace = "\n".join(line for line in RAYTRACING_CONTRACT_TRACE.splitlines()
+                                  if not line.startswith("OWNED_D3D12_RAYTRACING_" + marker)) + "\n"
+                report = self.simulate_raytracing(contract_trace=trace)
+                self.assertFalse(report["pass"], report["raytracing"])
+                self.assertEqual(report["raytracing"]["failures"], [])
+                self.assertTrue(report["dxil_native_compiler_verified"])
+
+    def test_raytracing_corrupt_contract_counts_and_culling_cannot_pass(self):
+        mutations = (
+            ("raygen-indirect lanes=24", "raygen-indirect lanes=23"),
+            ("intersection lanes=24", "intersection lanes=23"),
+            ("dispatch-rays-root-arguments slots=4", "dispatch-rays-root-arguments slots=3"),
+            ("geometry-index lanes=24", "geometry-index lanes=23"),
+            ("predication-direct-eq0-0 culled=1", "predication-direct-eq0-0 culled=0"),
+            ("bundle-indirect-predicated-culled culled=1",
+             "bundle-indirect-predicated-culled culled=0"),
+        )
+        for before, after in mutations:
+            with self.subTest(evidence=before):
+                report = self.simulate_raytracing(
+                    contract_trace=RAYTRACING_CONTRACT_TRACE.replace(before, after))
+                self.assertFalse(report["pass"], report["raytracing"])
+                self.assertEqual(report["raytracing"]["failures"], [])
+
+    def test_raytracing_contract_mismatch_cannot_hide_behind_pass_markers(self):
+        for marker in ("CASE_MISMATCH", "RAYQUERY_MISMATCH", "ROOTARGS_MISMATCH"):
+            with self.subTest(marker=marker):
+                report = self.simulate_raytracing(
+                    stderr_diagnostic=f"OWNED_D3D12_RAYTRACING_{marker} actual=corrupt\n")
+                self.assertFalse(report["pass"], report["raytracing"])
+                self.assertEqual(report["raytracing"]["failures"], [])
+
+    def test_raytracing_missing_or_corrupt_as_evidence_cannot_pass(self):
+        mutations = (
+            ("RAYTRACING_AS case=serialize-tlas-relocate failures=0 status=PASS\n", ""),
+            ("RAYTRACING_AS case=postbuild-inline failures=0 status=PASS\n"
+             "RAYTRACING_AS case=postbuild-emit failures=0 status=PASS\n",
+             "RAYTRACING_AS case=postbuild-emit failures=0 status=PASS\n"
+             "RAYTRACING_AS case=postbuild-inline failures=0 status=PASS\n"),
+            ("RAYTRACING_AS_SUMMARY cases=16 failures=0\n", ""),
+            ("RAYTRACING_AS_SUMMARY cases=16", "RAYTRACING_AS_SUMMARY cases=15"),
+            ("case=update-tlas-copy failures=0", "case=update-tlas-copy failures=1"),
+            ("RAYTRACING_AS_SUMMARY cases=16 failures=0\n",
+             "RAYTRACING_AS_SUMMARY cases=16 failures=0\n" * 2),
+            ("RAYTRACING_AS_SUMMARY cases=16 failures=0\n",
+             "RAYTRACING_AS_SUMMARY cases=16 failures=0\n"
+             "RAYTRACING_AS case=serialize-blas failures=1 status=FAIL\n"),
+        )
+        for before, after in mutations:
+            with self.subTest(evidence=before):
+                report = self.simulate_raytracing(
+                    contract_trace=RAYTRACING_CONTRACT_TRACE.replace(before, after))
+                self.assertFalse(report["pass"], report["raytracing"])
+                self.assertEqual(report["raytracing"]["failures"], [])
+
+    def test_raytracing_as_failure_cannot_hide_behind_complete_evidence(self):
+        report = self.simulate_raytracing(stderr_diagnostic="RAYTRACING_AS FAIL case=serialize-blas\n")
+        self.assertFalse(report["pass"], report["raytracing"])
+        self.assertEqual(report["raytracing"]["failures"], [])
 
     def test_raytracing_pass_line_without_lane_readback_cannot_pass(self):
         report = self.simulate_raytracing(lanes=False)

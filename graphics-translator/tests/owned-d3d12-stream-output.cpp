@@ -1564,6 +1564,9 @@ void runPackedPipelineCases(const GpuContext &gpu) {
          "pso_embedded_root_without_allow_stream_output");
 }
 
+void runGSStreamCases(GpuContext &gpu, const std::vector<std::uint8_t> &dxilVs,
+                      const std::vector<std::uint8_t> &dxilGs);
+
 void runCaptureCases(ID3D12Device *device, std::vector<std::uint8_t> packedVs) {
   GpuContext gpu;
   gpu.init(device, std::move(packedVs));
@@ -1840,6 +1843,280 @@ void runCaptureCases(ID3D12Device *device, std::vector<std::uint8_t> packedVs) {
   for (const auto &c : distanceCases)
     gpu.runCase(c);
   std::printf("OWNED_D3D12_STREAM_OUTPUT_NO_RASTER_DISTANCE_PASS cases=%zu\n", distanceCases.size());
+  runGSStreamCases(gpu, readFile("stream-output-gs-vs_gs.dxil"), readFile("stream-output-gs-gs_multi.dxil"));
+}
+
+/*
+ * GS stream output to several streams (stream-output-gs.hlsl, DXBC from D3DCompile and frozen DXIL). Each case
+ * declares a subset of the GS streams with mixed formats, components, gaps and multi-slot streams, draws N points
+ * twice (the second draw appends after the first's BufferFilledSize) and checks against a CPU model:
+ *   - every slot's bytes (records, gaps untouched = kFill, the bytes after the filled size untouched),
+ *   - every slot's BufferFilledSize,
+ *   - SO_STATISTICS_STREAM0..3 (NumPrimitivesWritten, PrimitivesStorageNeeded) around both draws; a stream
+ *     without a declaration counts neither, and a stream overflows alone (D3D11.3 14.5).
+ * Records of input point p, emission k (all point lists):
+ *   stream 0: VALUE.xyzw = (p, 0, 0, 0xa0) as uint
+ *   stream 1: TEX.xy = (float(p), float(k)), k < 2
+ *   stream 3: IDA = 10p + k, IDB.xy = (10p + k + 100, 7), k < 3
+ */
+struct GSStreamCase {
+  const char *name;
+  std::vector<D3D12_SO_DECLARATION_ENTRY> entries;
+  std::vector<UINT> strides;
+  UINT rasterized;
+  std::array<UINT, 4> capacity; // slot sizes in bytes
+};
+
+struct GSStreamModel {
+  std::array<std::vector<std::uint8_t>, 4> slots;
+  std::array<UINT, 4> filled{};
+  std::array<UINT64, 4> written{}, needed{};
+};
+
+// The dwords of component `c` of `semantic` for point p, emission k on `stream`.
+std::uint32_t gsComponent(UINT stream, const char *semantic, UINT c, UINT p, UINT k) {
+  auto f = [](float v) {
+    std::uint32_t u;
+    std::memcpy(&u, &v, 4);
+    return u;
+  };
+  if (stream == 0 && !std::strcmp(semantic, "VALUE"))
+    return std::array<std::uint32_t, 4>{p, 0, 0, 0xa0}[c];
+  if (stream == 1 && !std::strcmp(semantic, "TEX"))
+    return c == 0 ? f(float(p)) : f(float(k));
+  if (stream == 3 && !std::strcmp(semantic, "IDA"))
+    return 10 * p + k;
+  if (stream == 3 && !std::strcmp(semantic, "IDB"))
+    return c == 0 ? 10 * p + k + 100 : 7;
+  fail("gs-stream-model-semantic");
+}
+
+void modelGSDraw(const GSStreamCase &c, UINT points, UINT firstPoint, GSStreamModel &m) {
+  constexpr UINT kEmitted[4] = {1, 2, 1, 3};
+  for (UINT stream = 0; stream < 4; ++stream) {
+    std::array<UINT, 4> slotBytes{};
+    bool declared = false;
+    for (const auto &e : c.entries)
+      if (e.Stream == stream) {
+        slotBytes[e.OutputSlot] += 4 * e.ComponentCount;
+        declared = true;
+      }
+    if (!declared)
+      continue;
+    for (UINT p = firstPoint; p < firstPoint + points; ++p)
+      for (UINT k = 0; k < kEmitted[stream]; ++k) {
+        ++m.needed[stream];
+        bool fits = true;
+        for (UINT slot = 0; slot < 4; ++slot)
+          if (slotBytes[slot] && m.filled[slot] + c.strides[slot] > c.capacity[slot])
+            fits = false;
+        if (!fits)
+          continue;
+        std::array<UINT, 4> offset{};
+        for (const auto &e : c.entries) {
+          if (e.Stream != stream)
+            continue;
+          for (UINT i = 0; i < e.ComponentCount; ++i)
+            if (e.SemanticName) {
+              const std::uint32_t word = gsComponent(stream, e.SemanticName, e.StartComponent + i, p, k);
+              std::memcpy(m.slots[e.OutputSlot].data() + m.filled[e.OutputSlot] + offset[e.OutputSlot] + 4 * i,
+                          &word, 4);
+            }
+          offset[e.OutputSlot] += 4 * e.ComponentCount;
+        }
+        for (UINT slot = 0; slot < 4; ++slot)
+          if (slotBytes[slot])
+            m.filled[slot] += c.strides[slot];
+        ++m.written[stream];
+      }
+  }
+}
+
+void runGSStreamCases(GpuContext &gpu, const std::vector<std::uint8_t> &dxilVs,
+                      const std::vector<std::uint8_t> &dxilGs) {
+  ID3D12Device *device = gpu.device;
+  static constexpr char kSource[] = R"hlsl(
+struct VSOut { float4 position : SV_Position; uint id : VERTEXID; };
+VSOut vs_gs(uint id : SV_VertexID) { VSOut o; o.position = float4(float(id), 0, 0, 1); o.id = id; return o; }
+struct S0 { float4 position : SV_Position; uint4 value : VALUE; };
+struct S1 { float2 tex : TEX; };
+struct S3 { uint a : IDA; uint2 b : IDB; };
+[maxvertexcount(7)]
+void gs_multi(point VSOut input[1], inout PointStream<S0> s0, inout PointStream<S1> s1, inout PointStream<S0> s2,
+              inout PointStream<S3> s3) {
+  const uint p = input[0].id;
+  S0 a; a.position = input[0].position; a.value = uint4(p, 0, 0, 0xa0); s0.Append(a);
+  [unroll] for (uint k = 0; k < 2; ++k) { S1 b; b.tex = float2(p, k); s1.Append(b); }
+  s2.Append(a);
+  [unroll] for (uint j = 0; j < 3; ++j) { S3 c; c.a = 10 * p + j; c.b = uint2(10 * p + j + 100, 7); s3.Append(c); }
+}
+)hlsl";
+  auto compileGS = [&](const char *entry, const char *target) {
+    ComPtr<ID3DBlob> code, errors;
+    const HRESULT hr = D3DCompile(kSource, sizeof(kSource) - 1, nullptr, nullptr, nullptr, entry, target,
+                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+    if (FAILED(hr)) {
+      if (errors)
+        std::fwrite(errors->GetBufferPointer(), 1, errors->GetBufferSize(), stderr);
+      fail("D3DCompile(gs-streams)", hr);
+    }
+    const auto *bytes = static_cast<const std::uint8_t *>(code->GetBufferPointer());
+    return std::vector<std::uint8_t>(bytes, bytes + code->GetBufferSize());
+  };
+  const std::vector<std::uint8_t> dxbcVs = compileGS("vs_gs", "vs_5_0"), dxbcGs = compileGS("gs_multi", "gs_5_0");
+
+  D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+  rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT;
+  ComPtr<ID3DBlob> rootBlob, rootErrors;
+  check(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &rootBlob, &rootErrors),
+        "gs-streams-root-serialize");
+  ComPtr<ID3D12RootSignature> root;
+  check(device->CreateRootSignature(0, rootBlob->GetBufferPointer(), rootBlob->GetBufferSize(), IID_PPV_ARGS(&root)),
+        "gs-streams-root");
+
+  const std::vector<GSStreamCase> cases = {
+      // Streams 0 and 1 to one slot each; no rasterized stream.
+      {"gs-streams-0-1", {{0, "VALUE", 0, 0, 4, 0}, {1, "TEX", 0, 0, 2, 1}}, {16, 8},
+       D3D12_SO_NO_RASTERIZED_STREAM, {1024, 1024, 0, 0}},
+      // Stream 3 split over slots 0 and 2 with a gap, stream 1 partial components to slot 3; stream 0 undeclared.
+      {"gs-streams-3-split-1",
+       {{3, "IDB", 0, 1, 1, 0}, {3, nullptr, 0, 0, 1, 0}, {3, "IDA", 0, 0, 1, 2}, {1, "TEX", 0, 1, 1, 3}},
+       {12, 0, 4, 4}, D3D12_SO_NO_RASTERIZED_STREAM, {1024, 0, 1024, 1024}},
+      // All declared streams; stream 3 overflows on slot 2 alone (5 of 18 records fit), stream 1 is exact.
+      {"gs-streams-overflow",
+       {{0, "VALUE", 0, 0, 4, 0}, {1, "TEX", 0, 0, 2, 1}, {3, "IDA", 0, 0, 1, 2}, {3, "IDB", 0, 0, 2, 3}},
+       {16, 8, 4, 8}, D3D12_SO_NO_RASTERIZED_STREAM, {1024, 96, 20, 1024}},
+      // Rasterized stream 0 (stream 2 is never streamed out; its outputs only feed nothing).
+      {"gs-streams-raster0", {{1, "TEX", 0, 0, 2, 0}, {3, "IDA", 0, 0, 1, 1}}, {8, 4}, 0, {1024, 1024, 0, 0}},
+  };
+  constexpr UINT kPoints = 3, kSlotBytes = 1024, kFilledAt = 4 * kSlotBytes, kBytes = kFilledAt + 64;
+  constexpr std::uint8_t kFillByte = 0xcd;
+
+  for (int dxil = 0; dxil < 2; ++dxil) {
+    const auto &vs = dxil ? dxilVs : dxbcVs;
+    const auto &gs = dxil ? dxilGs : dxbcGs;
+    for (const auto &c : cases) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+      desc.pRootSignature = root.Get();
+      desc.VS = {vs.data(), vs.size()};
+      desc.GS = {gs.data(), gs.size()};
+      desc.StreamOutput = {c.entries.data(), UINT(c.entries.size()), c.strides.data(), UINT(c.strides.size()),
+                           c.rasterized};
+      desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+      desc.SampleMask = UINT_MAX;
+      desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      desc.RasterizerState.DepthClipEnable = TRUE;
+      desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+      desc.SampleDesc.Count = 1;
+      ComPtr<ID3D12PipelineState> pso;
+      check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), c.name);
+
+      auto upload = createBuffer(device, kBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+      {
+        std::uint8_t *mapped = nullptr;
+        check(upload->Map(0, nullptr, reinterpret_cast<void **>(&mapped)), "gs-streams-upload-map");
+        std::memset(mapped, kFillByte, kFilledAt);
+        std::memset(mapped + kFilledAt, 0, kBytes - kFilledAt);
+        upload->Unmap(0, nullptr);
+      }
+      auto target = createBuffer(device, kBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+      auto readback = createBuffer(device, kBytes + 128, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+      D3D12_QUERY_HEAP_DESC heapDesc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 4, 0};
+      ComPtr<ID3D12QueryHeap> queries;
+      check(device->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(&queries)), "gs-streams-query-heap");
+
+      ComPtr<ID3D12CommandAllocator> allocator;
+      ComPtr<ID3D12GraphicsCommandList> list;
+      check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+            "gs-streams-allocator");
+      check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pso.Get(),
+                                      IID_PPV_ARGS(&list)), "gs-streams-list");
+      list->CopyBufferRegion(target.Get(), 0, upload.Get(), 0, kBytes);
+      D3D12_RESOURCE_BARRIER barrier = {};
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition = {target.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_STREAM_OUT};
+      list->ResourceBarrier(1, &barrier);
+      list->SetGraphicsRootSignature(root.Get());
+      list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+      D3D12_STREAM_OUTPUT_BUFFER_VIEW views[4] = {};
+      for (UINT slot = 0; slot < c.strides.size(); ++slot)
+        if (c.capacity[slot]) {
+          const auto base = target->GetGPUVirtualAddress() + slot * kSlotBytes;
+          views[slot] = {base, c.capacity[slot], target->GetGPUVirtualAddress() + kFilledAt + 16 * slot};
+        }
+      list->SOSetTargets(0, 4, views);
+      for (UINT s = 0; s < 4; ++s)
+        list->BeginQuery(queries.Get(), D3D12_QUERY_TYPE(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + s), s);
+      // The second draw appends after the first's BufferFilledSize (StartVertexLocation only moves the fetch).
+      list->DrawInstanced(kPoints, 1, 0, 0);
+      list->DrawInstanced(kPoints, 1, kPoints, 0);
+      for (UINT s = 0; s < 4; ++s) {
+        list->EndQuery(queries.Get(), D3D12_QUERY_TYPE(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + s), s);
+        list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + s), s, 1,
+                               readback.Get(), kBytes + 16 * s);
+      }
+      list->SOSetTargets(0, 0, nullptr);
+      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_STREAM_OUT;
+      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      list->ResourceBarrier(1, &barrier);
+      list->CopyBufferRegion(readback.Get(), 0, target.Get(), 0, kBytes);
+      check(list->Close(), "gs-streams-close");
+      gpu.execute({list.Get()});
+      check(device->GetDeviceRemovedReason(), "gs-streams-removed");
+
+      GSStreamModel m;
+      for (auto &slot : m.slots)
+        slot.assign(kSlotBytes, kFillByte);
+      modelGSDraw(c, kPoints, 0, m);
+      modelGSDraw(c, kPoints, 0, m); // non-indexed SV_VertexID is 0-based in each draw (FS 8.16)
+
+      const D3D12_RANGE range{0, SIZE_T(kBytes + 64)};
+      const std::uint8_t *bytes = nullptr;
+      check(readback->Map(0, &range, reinterpret_cast<void **>(const_cast<std::uint8_t **>(&bytes))),
+            "gs-streams-map");
+      bool ok = true;
+      for (UINT slot = 0; slot < 4; ++slot) {
+        for (UINT i = 0; i < kSlotBytes; ++i)
+          if (bytes[slot * kSlotBytes + i] != m.slots[slot][i]) {
+            std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_GS_STREAM_MISMATCH case=%s dxil=%d slot=%u byte=%u "
+                         "got=0x%02x want=0x%02x\n", c.name, dxil, slot, i, bytes[slot * kSlotBytes + i],
+                         m.slots[slot][i]);
+            ok = false;
+            break;
+          }
+        std::uint32_t filled = 0;
+        std::memcpy(&filled, bytes + kFilledAt + 16 * slot, 4);
+        if (filled != m.filled[slot]) {
+          std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_GS_STREAM_FILLED case=%s dxil=%d slot=%u got=%u want=%u\n",
+                       c.name, dxil, slot, filled, m.filled[slot]);
+          ok = false;
+        }
+      }
+      D3D12_QUERY_DATA_SO_STATISTICS stats[4];
+      std::memcpy(stats, bytes + kBytes, sizeof(stats));
+      for (UINT s = 0; s < 4; ++s)
+        if (stats[s].NumPrimitivesWritten != m.written[s] || stats[s].PrimitivesStorageNeeded != m.needed[s]) {
+          std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_GS_STREAM_QUERY case=%s dxil=%d stream=%u got=(%llu,%llu) "
+                       "want=(%llu,%llu)\n", c.name, dxil, s, (unsigned long long)stats[s].NumPrimitivesWritten,
+                       (unsigned long long)stats[s].PrimitivesStorageNeeded, (unsigned long long)m.written[s],
+                       (unsigned long long)m.needed[s]);
+          ok = false;
+        }
+      const D3D12_RANGE none{0, 0};
+      readback->Unmap(0, &none);
+      if (!ok)
+        fail(c.name);
+      ++g_cases;
+      std::printf("OWNED_D3D12_STREAM_OUTPUT_GS_STREAM_PASS case=%s shader=%s written=%llu,%llu,%llu,%llu "
+                  "needed=%llu,%llu,%llu,%llu filled=%u,%u,%u,%u\n", c.name, dxil ? "dxil" : "dxbc",
+                  (unsigned long long)m.written[0], (unsigned long long)m.written[1], (unsigned long long)m.written[2],
+                  (unsigned long long)m.written[3], (unsigned long long)m.needed[0], (unsigned long long)m.needed[1],
+                  (unsigned long long)m.needed[2], (unsigned long long)m.needed[3], m.filled[0], m.filled[1],
+                  m.filled[2], m.filled[3]);
+    }
+  }
 }
 
 } // namespace

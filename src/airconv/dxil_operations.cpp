@@ -2129,6 +2129,9 @@ OperationLowerer::lowerPacked(CallInst &call, uint32_t opcode, IRBuilder<> &buil
 
 llvm::Error
 LowerOperations(llvm::Module &module) {
+  /* Inline RayQuery objects (any stage); their structures were resolved by the resource pass. */
+  if (Error error = LowerRayQueries(module))
+    return error;
   OperationLowerer lowerer(module);
   return lowerer.run();
 }

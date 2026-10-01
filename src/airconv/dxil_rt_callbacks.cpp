@@ -408,7 +408,12 @@ llvm::Value *EmitAnyHitCandidate(
   if (context.any_hit_index == SM50_RT_INDEX_NONE)
     return builder.getInt1(true);
 
-  if (!entry.visible_function_table)
+  Value *visible_function_table = entry.visible_function_table;
+  if (!visible_function_table && context.query_callbacks) {
+    Value *address = loadField(builder, block, offsetof(SM50_RT_FRAME, VisibleFunctionTable), builder.getInt64Ty());
+    visible_function_table = builder.CreateIntToPtr(address, visibleFunctionTableType(builder.getContext()));
+  }
+  if (!visible_function_table)
     return nullptr;
   /*
    * The any-hit shader is invoked through the visible function table, exactly like a
@@ -427,23 +432,27 @@ llvm::Value *EmitAnyHitCandidate(
     Value *field = builder.CreateGEP(
       Type::getInt8Ty(llvm_context), bytePointer(builder, block), builder.getInt32(byte_offset)
     );
-    return builder.CreateAddrSpaceCast(
-      field, Type::getInt8PtrTy(llvm_context, kRtRayDataAddressSpace)
-    );
+    if (context.query_callbacks)
+      return field;
+    return builder.CreateAddrSpaceCast(field, Type::getInt8PtrTy(llvm_context, kRtRayDataAddressSpace));
   };
   Value *payload = rayDataPointer(layout.frame_size);
   Value *hit_state = rayDataPointer(layout.hit_state);
-  if (!EmitVisibleFunctionCall(
-        module, entry.visible_function_table,
-        builder.getInt32(context.any_hit_index), invocationDepth(builder, block), payload,
-        hit_state, builder
-      ))
+  Value *skip = context.query_callbacks
+    ? builder.CreateICmpNE(loadField(builder, control, kRtCandidateSkipAnyHit, builder.getInt32Ty()), builder.getInt32(0))
+    : builder.getFalse();
+  bool failed = false;
+  emitConditional(builder, builder.CreateNot(skip), "rt.anyhit", [&](IRBuilder<> &b) {
+    failed = !EmitVisibleFunctionCall(module, visible_function_table, b.getInt32(context.any_hit_index),
+                                     invocationDepth(b, block), payload, hit_state, b);
+  });
+  if (failed)
     return nullptr;
 
   Value *decision = loadField(
     builder, control, kRtCandidateDecision, builder.getInt32Ty()
   );
-  return builder.CreateICmpNE(decision, builder.getInt32(kRtCandidateReject));
+  return builder.CreateOr(skip, builder.CreateICmpNE(decision, builder.getInt32(kRtCandidateReject)));
 }
 
 void EmitCandidateCommit(
@@ -740,9 +749,17 @@ llvm::Error LowerReportHitCall(
   /* Everything that can fail is resolved before a single instruction is emitted */
   /* ------------------------------------------------------------------------ */
   CandidateIds ids;
-  if (llvm::Error error = resolveCandidateIds(module, entry, ids))
+  if (context.query_callbacks) {
+    IRBuilder<> inputs(&call);
+    Value *state = inputs.CreateGEP(inputs.getInt8Ty(), bytePointer(inputs, block), inputs.getInt32(context.hitStateOffset()));
+    ids.primitive_id = loadField(inputs, state, offsetof(SM50_RT_HIT_STATE, PrimitiveIndex), inputs.getInt32Ty());
+    ids.geometry_id = loadField(inputs, state, offsetof(SM50_RT_HIT_STATE, GeometryIndex), inputs.getInt32Ty());
+    ids.instance_index = loadField(inputs, state, offsetof(SM50_RT_HIT_STATE, InstanceIndex), inputs.getInt32Ty());
+    ids.instance_id = loadField(inputs, state, offsetof(SM50_RT_HIT_STATE, InstanceID), inputs.getInt32Ty());
+  } else if (llvm::Error error = resolveCandidateIds(module, entry, ids)) {
     return error;
-  if (context.any_hit_index != SM50_RT_INDEX_NONE && !entry.visible_function_table)
+  }
+  if (context.any_hit_index != SM50_RT_INDEX_NONE && !entry.visible_function_table && !context.query_callbacks)
     return createError(
       "dxil: dx.op.reportHit must run the hit group's any-hit shader for every "
       "candidate, but this intersection export has no visible function table argument"
@@ -840,6 +857,93 @@ llvm::Error LowerReportHitCall(
   call.replaceAllUsesWith(result);
   call.eraseFromParent();
   return llvm::Error::success();
+}
+
+RtShaderRecord EmitShaderRecordLookup(
+  IRBuilder<> &builder, Value *dispatch, RtShaderTable table, Value *index
+) {
+  LLVMContext &context = builder.getContext();
+  Type *i32 = builder.getInt32Ty();
+  Type *i64 = builder.getInt64Ty();
+  struct Fields {
+    uint32_t base, stride, count;
+  };
+  /* The ray generation record is a single record (stride 0, count 1). */
+  constexpr uint32_t kNone = ~0u;
+  Fields fields{};
+  switch (table) {
+  case RtShaderTable::RayGeneration:
+    fields = {offsetof(SM50_RT_DISPATCH_ARGUMENTS, RayGenerationRecord), kNone, kNone};
+    break;
+  case RtShaderTable::Miss:
+    fields = {offsetof(SM50_RT_DISPATCH_ARGUMENTS, MissRecordBase),
+              offsetof(SM50_RT_DISPATCH_ARGUMENTS, MissRecordStride),
+              offsetof(SM50_RT_DISPATCH_ARGUMENTS, MissRecordCount)};
+    break;
+  case RtShaderTable::HitGroup:
+    fields = {offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordBase),
+              offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordStride),
+              offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordCount)};
+    break;
+  case RtShaderTable::Callable:
+    fields = {offsetof(SM50_RT_DISPATCH_ARGUMENTS, CallableRecordBase),
+              offsetof(SM50_RT_DISPATCH_ARGUMENTS, CallableRecordStride),
+              offsetof(SM50_RT_DISPATCH_ARGUMENTS, CallableRecordCount)};
+    break;
+  }
+  Value *base = loadField(builder, dispatch, fields.base, i64);
+  Value *stride = fields.stride == kNone ? builder.getInt32(0) : loadField(builder, dispatch, fields.stride, i32);
+  Value *count = fields.count == kNone ? builder.getInt32(1) : loadField(builder, dispatch, fields.count, i32);
+  Value *export_count = loadField(builder, dispatch, offsetof(SM50_RT_DISPATCH_ARGUMENTS, ExportCount), i32);
+  Value *token = loadField(builder, dispatch, offsetof(SM50_RT_DISPATCH_ARGUMENTS, PipelineToken), i32);
+  /* A stride of 0 resolves every index to the table's single record. */
+  Value *in_table = builder.CreateAnd(
+    builder.CreateICmpNE(base, builder.getInt64(0)),
+    builder.CreateOr(builder.CreateICmpEQ(stride, builder.getInt32(0)), builder.CreateICmpULT(index, count))
+  );
+  Value *record = builder.CreateAdd(
+    base, builder.CreateMul(builder.CreateZExt(index, i64), builder.CreateZExt(stride, i64))
+  );
+
+  /* OwnedShaderIdentifier (d3d12_state_object.hpp): magic, version | kind << 16, token, export. */
+  BasicBlock *head = builder.GetInsertBlock();
+  Function *function = head->getParent();
+  BasicBlock *continuation = nullptr;
+  if (builder.GetInsertPoint() != head->end())
+    continuation = head->splitBasicBlock(builder.GetInsertPoint(), "rt.record.cont");
+  if (head->getTerminator())
+    head->getTerminator()->eraseFromParent();
+  if (!continuation)
+    continuation = BasicBlock::Create(context, "rt.record.cont", function);
+  BasicBlock *read = BasicBlock::Create(context, "rt.record", function, continuation);
+  builder.SetInsertPoint(head);
+  builder.CreateCondBr(in_table, read, continuation);
+  builder.SetInsertPoint(read);
+  Value *words = builder.CreateIntToPtr(record, Type::getInt32PtrTy(context, 1));
+  auto word = [&](uint32_t i) {
+    return builder.CreateAlignedLoad(i32, builder.CreateGEP(i32, words, builder.getInt32(i)), Align(4));
+  };
+  Value *ours = builder.CreateAnd(
+    builder.CreateAnd(builder.CreateICmpEQ(word(0), builder.getInt32(0x544D5844u)),
+                      builder.CreateICmpEQ(word(1), builder.getInt32(1u | (1u << 16)))),
+    builder.CreateICmpEQ(word(2), token)
+  );
+  Value *candidate = word(3);
+  Value *valid = builder.CreateAnd(ours, builder.CreateICmpULT(candidate, export_count));
+  Value *read_export = builder.CreateSelect(valid, candidate, builder.getInt32(SM50_RT_INDEX_NONE));
+  Value *read_entry = builder.CreateSelect(
+    valid, builder.CreateAdd(record, builder.getInt64(32)), builder.getInt64(0)
+  );
+  BasicBlock *read_end = builder.GetInsertBlock();
+  builder.CreateBr(continuation);
+  builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
+  PHINode *export_index = builder.CreatePHI(i32, 2, "rt.record.export");
+  export_index->addIncoming(builder.getInt32(SM50_RT_INDEX_NONE), head);
+  export_index->addIncoming(read_export, read_end);
+  PHINode *local_entry = builder.CreatePHI(i64, 2, "rt.record.entry");
+  local_entry->addIncoming(builder.getInt64(0), head);
+  local_entry->addIncoming(read_entry, read_end);
+  return {export_index, local_entry};
 }
 
 } // namespace dxmt::dxil

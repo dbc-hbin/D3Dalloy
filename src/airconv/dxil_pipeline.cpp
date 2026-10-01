@@ -28,6 +28,7 @@
 #include "airconv_context.hpp"
 #include "dxbc_converter.hpp"
 #include "metallib_writer.hpp"
+#include "msaa_mesh.hpp"
 
 namespace dxmt::dxil {
 
@@ -40,6 +41,7 @@ constexpr uint8_t KIND_RENDER_TARGET_ARRAY_INDEX = 4;
 constexpr uint8_t KIND_VIEWPORT_ARRAY_INDEX = 5;
 constexpr uint8_t KIND_CLIP_DISTANCE = 6;
 constexpr uint8_t KIND_CULL_DISTANCE = 7;
+constexpr uint8_t KIND_SHADING_RATE = 29;
 
 /* DXIL::ComponentType */
 constexpr uint8_t COMPONENT_I1 = 1;
@@ -128,10 +130,10 @@ dxbc::RegisterComponentType register_type(uint8_t component_type) {
 }
 
 /* Register rows spanned by the given signature chunk elements (one entry per row). */
-uint32_t register_count(const std::vector<SigElement> &elements, bool stream0_only = false) {
+uint32_t register_count(const std::vector<SigElement> &elements) {
   uint32_t count = 0;
   for (auto &element : elements) {
-    if (element.start_row == ~0u || (stream0_only && element.stream != 0))
+    if (element.start_row == ~0u)
       continue;
     count = std::max(count, element.start_row + element.rows);
   }
@@ -371,6 +373,9 @@ llvm::Error LowerStageResources(PipelineStage &stage, dxbc::context &ctx) {
   auto &info = *stage.info;
   if (info.module && info.module.get() != &ctx.module)
     return createError("DXIL " + stage.tag + " stage is lowered before it is linked");
+  /* SV_ViewID of GS/HS/DS bodies (the VS body lowers it with its stage I/O). */
+  if (auto error = LowerViewInstanceId(ctx))
+    return error;
   /* ModuleInfo owns its module; a linked stage lowers the pipeline module without owning it. */
   const bool borrowed = !info.module;
   if (borrowed)
@@ -441,11 +446,12 @@ llvm::Error PrepareGeometryShader(const ShaderMetadata &metadata, dxbc::SM50Shad
   default:
     return unsupported("DXIL geometry shader output topology " + std::to_string(state.output_topology));
   }
-  if (state.stream_mask & ~1u)
-    return unsupported(
-      "DXIL geometry shader writes stream " + std::to_string(std::countr_zero(state.stream_mask & ~1u)) +
-      "; only stream 0 is supported"
-    );
+  if (state.stream_mask & ~0xfu)
+    return createError("DXIL geometry shader has an invalid stream mask");
+  /* D3D11.3 13.5.2: a GS writing more than one stream outputs point lists only. */
+  if ((state.stream_mask & (state.stream_mask - 1)) &&
+      state.output_topology != microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_POINTLIST)
+    return createError("DXIL geometry shader writes multiple streams with non-point output");
   if (state.max_vertex_count == 0 || state.instance_count == 0 || state.instance_count > 32)
     return createError("DXIL geometry shader has an invalid maxvertexcount or instance count");
   shader.gs_input_primitive = (microsoft::D3D10_SB_PRIMITIVE)state.input_primitive;
@@ -453,7 +459,8 @@ llvm::Error PrepareGeometryShader(const ShaderMetadata &metadata, dxbc::SM50Shad
   shader.gs_max_vertex_output = state.max_vertex_count;
   shader.gs_instance_count = state.instance_count;
   shader.max_input_register = register_count(metadata.input_sig);
-  shader.max_output_register = register_count(metadata.output_sig, true);
+  /* Every stream writes the one output register file. */
+  shader.max_output_register = register_count(metadata.output_sig);
   return llvm::Error::success();
 }
 
@@ -492,8 +499,6 @@ llvm::Error lower_geometry_body(PipelineStage &stage, dxbc::context &ctx) {
     const IOElement *element = FindElement(signature.outputs, *id);
     if (!element || element->start_row < 0)
       return createError("DXIL geometry shader stores output element " + llvm::Twine(*id) + " that has no register");
-    if (element->stream != 0)
-      return unsupported("DXIL geometry shader stream " + std::to_string(element->stream) + " output");
     builder.SetInsertPoint(call);
     auto *value = WidenLane(builder, call->getArgOperand(4), element->component_type == COMPONENT_I16);
     const bool as_float = value->getType()->isFloatTy();
@@ -509,9 +514,8 @@ llvm::Error lower_geometry_body(PipelineStage &stage, dxbc::context &ctx) {
       auto stream = ConstantOperand(*call, 1);
       if (!opcode) return opcode.takeError();
       if (!stream) return stream.takeError();
-      if (*stream != 0)
-        return unsupported("DXIL geometry shader emits to stream " + std::to_string(*stream) +
-                           "; only stream 0 is supported");
+      if (*stream >= 4)
+        return createError("DXIL geometry shader emits to stream " + std::to_string(*stream));
       /* The converter's emit/cut may build control flow of its own (stream output capture), so
        * it runs at the end of a block of its own, which then continues with the rest. */
       llvm::BasicBlock *head = call->getParent();
@@ -519,10 +523,10 @@ llvm::Error lower_geometry_body(PipelineStage &stage, dxbc::context &ctx) {
       head->getTerminator()->eraseFromParent();
       builder.SetInsertPoint(head);
       if (*opcode == OP_EMIT_STREAM || *opcode == OP_EMIT_THEN_CUT_STREAM)
-        if (auto error = ctx.resource.call_emit().build(ctx).takeError())
+        if (auto error = ctx.resource.call_emit(uint32_t(*stream)).build(ctx).takeError())
           return error;
       if (*opcode == OP_CUT_STREAM || *opcode == OP_EMIT_THEN_CUT_STREAM)
-        if (auto error = ctx.resource.call_cut().build(ctx).takeError())
+        if (auto error = ctx.resource.call_cut(uint32_t(*stream)).build(ctx).takeError())
           return error;
       builder.CreateBr(tail);
       call->eraseFromParent();
@@ -551,54 +555,65 @@ llvm::Error BindGeometryStage(PipelineStage &stage) {
   view.clip_distance_scalars.clear();
   view.cull_distance_scalars.clear();
   view.num_mesh_vertex_data = 0;
+  for (auto &declarations : view.gs_stream_declarations)
+    declarations.clear();
 
-  /* The mesh outputs of stream 0, exactly as handle_signature_gs declares them. */
+  /* The mesh outputs of each stream, exactly as handle_signature_gs declares them; the GS converter defines
+   * those of the stream that drives the mesh output. */
   for (auto &element : stage.signature.outputs) {
-    if (element.stream != 0)
-      continue;
+    if (element.stream >= 4)
+      return createError("DXIL geometry shader output " + element.name + " has an invalid stream");
     if (element.start_row < 0)
       return unsupported("DXIL geometry shader output " + element.name + " has no register");
+    auto &declarations = view.gs_stream_declarations[element.stream];
     for (uint32_t r = 0; r < element.rows; r++) {
       const uint32_t reg = element.start_row + r;
       const uint32_t mask = register_mask(element);
       const uint32_t semantic_index = r < element.semantic_indices.size() ? element.semantic_indices[r] : r;
+      const std::string user = dxbc::varyingAttributeName(element.name, semantic_index);
       auto define_varying = [&](air::MSLScalerOrVectorType type) {
-        const uint32_t index = view.num_mesh_vertex_data++;
-        view.func_signature.DefineMeshVertexOutput(air::OutputMeshData{
-          .user = dxbc::varyingAttributeName(element.name, semantic_index),
-          .type = type,
-          .index = index,
-        });
-        view.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
-          return dxbc::pop_mesh_output_vertex_data(reg, mask, index, output.vertex_id, type);
+        declarations.push_back([=](dxbc::GSStreamOutputs &out) {
+          const uint32_t index = out.num_mesh_vertex_data++;
+          out.func_signature.DefineMeshVertexOutput(air::OutputMeshData{.user = user, .type = type, .index = index});
+          out.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
+            return dxbc::pop_mesh_output_vertex_data(reg, mask, index, output.vertex_id, type);
+          });
         });
       };
       switch (element.semantic_kind) {
       case KIND_POSITION:
-        view.func_signature.DefineMeshVertexOutput(air::OutputPosition{.type = air::msl_float4});
-        view.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
-          return dxbc::pop_mesh_output_position(reg, mask, output.vertex_id);
+        declarations.push_back([=](dxbc::GSStreamOutputs &out) {
+          out.func_signature.DefineMeshVertexOutput(air::OutputPosition{.type = air::msl_float4});
+          out.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
+            return dxbc::pop_mesh_output_position(reg, mask, output.vertex_id);
+          });
         });
         break;
       case KIND_RENDER_TARGET_ARRAY_INDEX:
-        view.func_signature.DefineMeshPrimitiveOutput(air::OutputRenderTargetArrayIndex{});
-        view.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
-          return dxbc::pop_mesh_output_render_target_array_index(reg, mask, output.primitive_id);
+        declarations.push_back([=](dxbc::GSStreamOutputs &out) {
+          out.func_signature.DefineMeshPrimitiveOutput(air::OutputRenderTargetArrayIndex{});
+          out.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
+            return dxbc::pop_mesh_output_render_target_array_index(reg, mask, output.primitive_id);
+          });
         });
         break;
       case KIND_VIEWPORT_ARRAY_INDEX:
-        view.func_signature.DefineMeshPrimitiveOutput(air::OutputViewportArrayIndex{});
-        view.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
-          return dxbc::pop_mesh_output_viewport_array_index(reg, mask, output.primitive_id);
+        declarations.push_back([=](dxbc::GSStreamOutputs &out) {
+          out.func_signature.DefineMeshPrimitiveOutput(air::OutputViewportArrayIndex{});
+          out.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
+            return dxbc::pop_mesh_output_viewport_array_index(reg, mask, output.primitive_id);
+          });
         });
         break;
       case KIND_CLIP_DISTANCE:
       case KIND_CULL_DISTANCE: {
-        auto &scalars = element.semantic_kind == KIND_CLIP_DISTANCE ? view.clip_distance_scalars
-                                                                     : view.cull_distance_scalars;
-        for (unsigned c = 0; c < 4; c++)
-          if (mask & (1u << c))
-            scalars.push_back({.component = (uint8_t)c, .reg = (uint8_t)reg});
+        const bool clip = element.semantic_kind == KIND_CLIP_DISTANCE;
+        declarations.push_back([=](dxbc::GSStreamOutputs &out) {
+          for (unsigned c = 0; c < 4; c++)
+            if (mask & (1u << c))
+              (clip ? out.clip_distance_scalars : out.cull_distance_scalars)
+                .push_back({.component = (uint8_t)c, .reg = (uint8_t)reg});
+        });
         /* Also a varying, so a pixel shader that reads the distance links (the DXIL vertex
          * path exports it the same way). */
         define_varying(air::msl_float4);
@@ -606,6 +621,17 @@ llvm::Error BindGeometryStage(PipelineStage &stage) {
       }
       case KIND_ARBITRARY:
         define_varying(dxbc::to_msl_type(register_type(element.component_type)));
+        break;
+      case KIND_SHADING_RATE:
+        declarations.push_back([=](dxbc::GSStreamOutputs &out) {
+          const uint32_t index = out.num_mesh_vertex_data++;
+          out.func_signature.DefineMeshVertexOutput(air::OutputMeshData{
+            .user = "dxmt_shading_rate", .type = air::msl_uint, .index = index
+          });
+          out.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
+            return dxbc::pop_mesh_output_vertex_data(reg, mask, index, output.vertex_id, air::msl_uint);
+          });
+        });
         break;
       default:
         return unsupported("DXIL geometry shader system-value output " + element.name);
@@ -716,6 +742,12 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
     initializeModule(*fresh_module);
     module = fresh_module.get();
   }
+  // Reserve the wrapper name before creating it, but retain stage-local modules
+  // until their bodies lower: resources from another stage must not be visited
+  // with this stage's binding map.
+  for (auto &stage : stages)
+    if (stage.info && stage.info->entry)
+      stage.info->entry->setName("dxmt.dxil." + stage.tag);
 
   auto convert = [&]() -> llvm::Error {
     switch (kind) {
@@ -774,6 +806,12 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
   }
   if (kind == PipelineKind::TessellationObject || kind == PipelineKind::TessellationMesh)
     linkTessellation(*module);
+  SM50_SHADER_D3D12_MSAA_MESH_DATA *msaa_mesh = nullptr;
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *conservative = nullptr;
+  dxbc::args_get_data<SM50_SHADER_D3D12_CONSERVATIVE_RASTER, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(args, &conservative);
+  if (dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_MESH, SM50_SHADER_D3D12_MSAA_MESH_DATA>(args, &msaa_mesh))
+    if (auto error = msaa::transformMesh(*module, *msaa_mesh, conservative != nullptr))
+      return std::move(error);
 
   runOptimizationPasses(*module);
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();

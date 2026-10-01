@@ -109,6 +109,8 @@ enum class ShaderVisibleDescriptorType {
   SRVRGB32Buffer,
   SRVBuffer,
   AccelerationStructure,
+  /* A sampler feedback UAV (CreateSamplerFeedbackUnorderedAccessView): UAVBuffer storage over the map cells. */
+  SamplerFeedback,
 };
 
 struct SRVTextureCPUStorage {
@@ -169,6 +171,7 @@ struct ShaderVisibleDescriptorCPUStorage {
     SRVBufferCPUStorage SRVRGB32Buffer;
     SRVBufferCPUStorage SRVBuffer;
     AccelerationStructureCPUStorage AccelerationStructure;
+    UAVBufferCPUStorage SamplerFeedback;
   };
 
   ShaderVisibleDescriptorCPUStorage() : type(ShaderVisibleDescriptorType::Null) {}
@@ -216,6 +219,13 @@ public:
    * address is D3D12's null acceleration structure: a null descriptor, not an error.
    */
   virtual HRESULT AddAccelerationStructure(UINT Index, UINT64 Address) = 0;
+
+  /**
+   * A sampler feedback UAV: q0 = the map's cell array address (0 when the paired texture is null,
+   * so feedback writes are dropped), q1 = its layout word (d3d12_sampler_feedback.hpp).
+   */
+  virtual HRESULT AddSamplerFeedbackView(UINT Index, Buffer *Cells, uint64_t CellBytes, bool Paired,
+                                         uint64_t LayoutWord) = 0;
 
   virtual ShaderVisibleDescriptorCPUStorage const &GetDescriptor(UINT Index) = 0;
 

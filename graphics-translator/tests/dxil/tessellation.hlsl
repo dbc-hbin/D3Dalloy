@@ -165,6 +165,12 @@ float4 ps_color(DSOut input) : SV_Target {
   return float4(0, 1, 0, 1);
 }
 
+// Forced early depth/stencil (PSInvocations under MSAA count once per (pixel, primitive) with a surviving sample).
+[earlydepthstencil]
+float4 ps_early(DSOut input) : SV_Target {
+  return float4(0, 1, 0, 1);
+}
+
 // N-control-point patch lists: the HS reads every input control point (N in {1, 2, 5, 8, 11, 16, 17, 32}) and outputs one control point at
 // the patch's mean position; factors are 1, so every patch is one quad of 4 domain points. ds_patch logs
 // (SV_PrimitiveID, control-point count) for every domain point, so the fixture checks patch assembly and count.
@@ -562,6 +568,12 @@ void gs_tsgs(triangle DSOut v[3], uint id : SV_PrimitiveID, inout TriangleStream
     }
     stream.RestartStrip();
   }
+}
+
+// Forced early depth after the GS (MSAA PSInvocations by the claim buffer).
+[earlydepthstencil]
+float4 ps_tsgs_early(GSOut input) : SV_Target {
+  return float4(0, 1, 0, 1);
 }
 
 [domain("isoline")]

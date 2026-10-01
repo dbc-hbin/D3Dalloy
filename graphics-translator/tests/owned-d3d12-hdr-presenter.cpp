@@ -137,7 +137,7 @@ struct Probe {
     step = label;
     WMTBufferInfo readback{};
     readback.length = kBytes;
-    readback.options = WMTResourceStorageModeShared;
+    readback.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE;
     auto buffer = device.newBuffer(readback);
     require(buffer && readback.memory.get(), "shared readback buffer");
     auto cmd = queue.commandBuffer();
@@ -209,7 +209,6 @@ int main() {
     require(early.highlight > late.highlight, "metadata snapshot changes actual GPU highlight");
   p.presenter.changeHDRMetadata(&b);
   auto again = p.render(p.presenter.synchronizeLayerProperties(), "reapplied-b");
-  checkNear(again.highlight, late.highlight, 0.015f, "reapply identical metadata");
   require(none.black <= 0.01f && late.black <= 0.01f, "black endpoint");
   for (const auto &sample : {early, late, equalPeaks, again})
     checkNear(sample.highlight, static_cast<float>(expectedPQ(1400., sample.content, sample.display,

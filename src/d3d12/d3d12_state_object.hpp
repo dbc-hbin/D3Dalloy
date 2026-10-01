@@ -42,6 +42,7 @@ namespace dxmt {
 
 /** DXIL entry point shader kind, as stored in the DXIL entry point tag. */
 enum OwnedRTStage : uint32_t {
+  kOwnedRTStageLibrary = 6,
   kOwnedRTStageRayGeneration = 7,
   kOwnedRTStageIntersection = 8,
   kOwnedRTStageAnyHit = 9,
@@ -107,6 +108,8 @@ public:
     std::wstring entry_point;
     uint32_t stage = kOwnedRTStageInvalid;
     size_t library_index = 0;
+    /** Namespace and dependency permissions of the defining collection (zero for direct libraries). */
+    uint32_t scope = 0, collection_flags = 0;
 
     bool hit_group = false;
     D3D12_HIT_GROUP_TYPE hit_group_type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
@@ -118,13 +121,34 @@ public:
     std::wstring any_hit_name;
     std::wstring intersection_name;
 
+    /**
+     * An export compiled into the pipeline that the application cannot name: a member of a
+     * hit group imported from a collection whose export list did not list the member. It
+     * has no shader identifier and is not found by FindExport(name).
+     */
+    bool hidden = false;
+    /**
+     * Imported from an existing collection: its associations are the collection's and are
+     * final. `collection` identifies the source only while the importing description is being
+     * resolved; `collection_name` is the export's name inside that collection.
+     */
+    bool from_collection = false;
+    const void *collection = nullptr;
+    std::wstring collection_name;
+
     /** Local root signature of the export, null when the export has none. */
     MTLD3D12RootSignature *local_root_signature = nullptr;
-    /** Local root data the application writes after the identifier, in bytes. */
-    uint32_t local_root_data_size = 0;
+    /** Global root signature associated with the export, null when none is. */
+    MTLD3D12RootSignature *global_root_signature = nullptr;
 
     bool has_shader_config = false;
     D3D12_RAYTRACING_SHADER_CONFIG shader_config{};
+    /**
+     * Raytracing pipeline config (CONFIG or CONFIG1, the former with no flags) associated with
+     * the export. D3D12 requires it on every export of a pipeline, matching across all of them.
+     */
+    bool has_pipeline_config = false;
+    D3D12_RAYTRACING_PIPELINE_CONFIG1 pipeline_config{};
 
     /** Compiled Metal function name, empty until the pipeline is compiled. */
     std::string metal_function;
@@ -195,21 +219,18 @@ public:
    * above, so they do not occupy a slot here.
    */
   virtual WMT::Reference<WMT::VisibleFunctionTable> GetVisibleFunctionTable() const = 0;
-
-  /**
-   * Kernel that turns the application's shader records into the export index
-   * arrays and materialized local root argument tables the traversal reads.
-   * Compiled on first use from the runtime's own Metal source.
-   */
-  virtual WMT::Reference<WMT::ComputePipelineState> GetShaderTablePreparePipeline() = 0;
-  /** Per export local root argument translation tables, indexed by export index. */
-  virtual const std::vector<raytracing::LocalRootLayout> &GetLocalRootLayouts() const = 0;
-  virtual const std::vector<raytracing::LocalRootCopy> &GetLocalRootCopies() const = 0;
-  /** Byte distance between materialized local root entries. */
-  virtual uint32_t GetLocalRootEntryStride() const = 0;
 };
 
 HRESULT
 CreateStateObject(MTLD3D12Device *device, const D3D12_STATE_OBJECT_DESC *desc, REFIID riid, void **state_object);
+
+/**
+ * ID3D12Device7::AddToStateObject: a new raytracing pipeline holding every export of
+ * `parent` with its identifier unchanged, plus the exports `addition` defines.
+ */
+HRESULT AddToStateObject(
+    MTLD3D12Device *device, const D3D12_STATE_OBJECT_DESC *addition, ID3D12StateObject *parent, REFIID riid,
+    void **state_object
+);
 
 } // namespace dxmt

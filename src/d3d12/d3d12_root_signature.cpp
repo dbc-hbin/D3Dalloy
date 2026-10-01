@@ -22,6 +22,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_device_child.hpp"
+#include "d3d12_sampler_feedback.hpp"
 #include "dxmt_sampler.hpp"
 #include "util_math.hpp"
 #include "util_md5.hpp"
@@ -35,6 +36,34 @@
 #include "../airconv/dxbc_root_signature.hpp"
 
 namespace dxmt {
+
+/* Every global/local root used by one program shares this register-keyed immutable table. */
+HRESULT AppendRootStaticSamplers(
+    MTLD3D12RootSignature *root, std::vector<D3D12_STATIC_SAMPLER_DESC> &table, UINT *appended
+) {
+  *appended = 0;
+  if (!root) return S_OK;
+  const void *blob = nullptr, *raw = nullptr;
+  const UINT blob_size = root->GetBlob(&blob); UINT raw_size = 0;
+  if (!blob_size || !blob || FAILED(microsoft::DXBCGetRootSignature(blob, &raw, &raw_size))) return E_INVALIDARG;
+  RootSignatureDeserializer deserializer;
+  if (FAILED(deserializer.Deserialize(raw, raw_size))) return E_INVALIDARG;
+  const auto &desc = deserializer.desc_1_1_.Desc_1_1;
+  for (UINT i = 0; i < desc.NumStaticSamplers; ++i) {
+    const auto &state = desc.pStaticSamplers[i];
+    bool known = false;
+    for (const auto &existing : table) {
+      if (existing.RegisterSpace != state.RegisterSpace || existing.ShaderRegister != state.ShaderRegister) continue;
+      if (std::memcmp(&existing, &state, sizeof(state))) {
+        ERR("Root signature static sampler definitions conflict"); return E_INVALIDARG;
+      }
+      known = true; break;
+    }
+    if (known) continue;
+    table.push_back(state); ++*appended;
+  }
+  return S_OK;
+}
 
 namespace {
 
@@ -60,7 +89,8 @@ inline D3D12_ROOT_DESCRIPTOR_FLAGS DescriptorFlags(const D3D12_ROOT_DESCRIPTOR1 
 }
 
 bool ValidVisibility(D3D12_SHADER_VISIBILITY visibility) {
-  return visibility >= D3D12_SHADER_VISIBILITY_ALL && visibility <= D3D12_SHADER_VISIBILITY_PIXEL;
+  // AMPLIFICATION (6) and MESH (7) exist with MeshShaderTier 1.
+  return visibility >= D3D12_SHADER_VISIBILITY_ALL && visibility <= D3D12_SHADER_VISIBILITY_MESH;
 }
 bool VisibilitiesOverlap(D3D12_SHADER_VISIBILITY a, D3D12_SHADER_VISIBILITY b) {
   return a == D3D12_SHADER_VISIBILITY_ALL || b == D3D12_SHADER_VISIBILITY_ALL || a == b;
@@ -135,8 +165,7 @@ HRESULT ValidateRootSignatureDesc(const ROOT_SIGNATURE_DESC &desc) {
   // 0x400/0x800 are the SM 6.6 heap-directly-indexed flags; like every other flag they
   // are rejected on a local root signature, which must carry exactly 0x80.
   if ((desc.NumParameters && !desc.pParameters) || (desc.NumStaticSamplers && !desc.pStaticSamplers) ||
-      (signature_flags & ~0xfffu) || ((signature_flags & 0x80u) && signature_flags != 0x80u) ||
-      ((signature_flags & 0x80u) && desc.NumStaticSamplers))
+      (signature_flags & ~0xfffu) || ((signature_flags & 0x80u) && signature_flags != 0x80u))
     return E_INVALIDARG;
 
   const bool local = (signature_flags & 0x80u) != 0;
@@ -627,7 +656,6 @@ class MTLD3D12RootSignatureImpl : public MTLD3D12DeviceChild<MTLD3D12RootSignatu
   std::vector<UINT> parameter_constant_counts_;
   std::vector<TableRange> table_ranges_;
   std::vector<std::pair<uint32_t, uint32_t>> table_range_spans_;
-  std::vector<raytracing::LocalRootCopy> local_root_copies_;
 
   std::vector<Rc<Sampler>> static_samplers_; // which is not really "static"
   /**
@@ -732,10 +760,13 @@ public:
                                                 SamplerReductionMode(desc_1_2.pStaticSamplers[i].Filter));
           if (!sampler)
             return E_OUTOFMEMORY;
+          const auto &static_desc = desc_1_2.pStaticSamplers[i];
           static_samplers_encoded_.push_back(sampler->sampler_state_handle);
           static_samplers_encoded_.push_back(sampler->sampler_state_cube_handle);
-          static_samplers_encoded_.push_back((uint64_t)std::bit_cast<uint32_t>(sampler->lod_bias));
-          static_samplers_encoded_.push_back(0 /* padding */);
+          static_samplers_encoded_.push_back(sampler_feedback::SamplerMetadata(
+              sampler->lod_bias, sampler_feedback::SamplerFlags(static_desc.Filter, static_desc.AddressU,
+                                                                static_desc.AddressV, static_desc.MaxAnisotropy)));
+          static_samplers_encoded_.push_back(sampler_feedback::SamplerLodRange(static_desc.MinLOD, static_desc.MaxLOD));
 
           static_samplers_.emplace_back(std::move(sampler));
         }
@@ -770,6 +801,7 @@ public:
       }
       table_range_spans_.emplace_back(begin, table_ranges_.size() - begin);
     }
+    ParameterQwords = total_qwords;
     if (Flags & kRootSignatureFlagsDirectlyIndexed) {
       HeapQwordOffset = total_qwords;
       total_qwords += kHeapQwords;
@@ -782,47 +814,13 @@ public:
           status_qword_offsets_[i] = total_qwords++;
     }
     StatusQwordOffsets = status_qword_offsets_.data();
+    if (!IsLocal)
+      ViewIdQwordOffset = total_qwords++;
     UploadQwords = total_qwords;
     ParameterSlots = qword_offsets_.size();
     SlotQwordOffsets = qword_offsets_.data();
     ParameterTypes = parameter_types_.data();
     ParameterConstantCounts = parameter_constant_counts_.data();
-
-    /*
-     * Local root argument translation for raytracing shader records. The
-     * application writes the parameters after the 32 byte shader identifier in the
-     * D3D12 local root argument layout: root constants 4 byte packed, root
-     * descriptors and descriptor tables 8 byte aligned. Every range that has to
-     * move is recorded here so the pipeline can materialize the qword layout.
-     */
-    uint32_t source_offset = 0;
-    for (unsigned i = 0; i < desc.NumParameters; i++) {
-      auto &parameter = desc.pParameters[i];
-      uint32_t size = 0;
-      switch (parameter.ParameterType) {
-      case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
-        size = parameter.Constants.Num32BitValues * 4;
-        break;
-      case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
-      case D3D12_ROOT_PARAMETER_TYPE_CBV:
-      case D3D12_ROOT_PARAMETER_TYPE_SRV:
-      case D3D12_ROOT_PARAMETER_TYPE_UAV:
-        size = sizeof(uint64_t);
-        source_offset = (source_offset + 7) & ~7u;
-        break;
-      default:
-        return E_INVALIDARG;
-      }
-      if (!size)
-        continue;
-      local_root_copies_.push_back(
-          {source_offset, size, qword_offsets_[i] * static_cast<uint32_t>(sizeof(uint64_t)), 0}
-      );
-      source_offset += size;
-    }
-    LocalRootDataSize = (source_offset + 7) & ~7u;
-    LocalRootCopyCount = local_root_copies_.size();
-    LocalRootCopies = local_root_copies_.data();
 
     return S_OK;
   }

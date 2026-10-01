@@ -34,13 +34,13 @@ int main() {
   assert(!CheckedMul(UINT64_MAX, 2, value));
 
   FootprintLayout footprint{};
-  assert(ValidateFootprintRange(64, 64, 1, 4, 1, 256, 0, 16384, 512, 256, footprint));
+  assert(ValidateFootprintRange(64, 64, 1, 4, 1, 1, 256, 0, 16384, 512, 256, footprint));
   assert(footprint.row_size == 256 && footprint.row_count == 64 && footprint.slice_pitch == 16384);
-  assert(ValidateFootprintRange(64, 64, 1, 4, 1, 512, 0, 32512, 512, 256, footprint));
-  assert(!ValidateFootprintRange(64, 64, 1, 4, 1, 384, 0, 65536, 512, 256, footprint));
-  assert(!ValidateFootprintRange(64, 64, 1, 4, 1, 256, 256, 65536, 512, 256, footprint));
-  assert(!ValidateFootprintRange(64, 64, 1, 4, 1, 512, 0, 32511, 512, 256, footprint));
-  assert(ValidateFootprintRange(5, 5, 1, 16, 4, 256, 512, 2048, 512, 256, footprint));
+  assert(ValidateFootprintRange(64, 64, 1, 4, 1, 1, 512, 0, 32512, 512, 256, footprint));
+  assert(!ValidateFootprintRange(64, 64, 1, 4, 1, 1, 384, 0, 65536, 512, 256, footprint));
+  assert(!ValidateFootprintRange(64, 64, 1, 4, 1, 1, 256, 256, 65536, 512, 256, footprint));
+  assert(!ValidateFootprintRange(64, 64, 1, 4, 1, 1, 512, 0, 32511, 512, 256, footprint));
+  assert(ValidateFootprintRange(5, 5, 1, 16, 4, 4, 256, 512, 2048, 512, 256, footprint));
   assert(footprint.row_size == 32 && footprint.row_count == 2 && footprint.slice_pitch == 512);
 
   std::puts("D3D12_RESOURCE_CONTRACTS_CPU_PASS ranges=1 placement=1 overflow=1 footprint=1 pitch512=1");

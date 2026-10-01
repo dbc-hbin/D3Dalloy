@@ -36,12 +36,16 @@ enum SM50_BINDING_INDEX: uint32_t {
   SM50_BINDING_INDEX_TESS_CAPTURE = 8,
   SM50_BINDING_INDEX_TESS_CAPTURE_LIST = 9,
   SM50_BINDING_INDEX_TESS_CAPTURE_CONTROL = 10,
+  /* Fragment stage, SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM: SM50_STATISTICS_CLAIM_HEADER and the
+   * per-pixel key entries (raster_order_group(0)). */
+  SM50_BINDING_INDEX_STATISTICS_CLAIM = 7,
 
   SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
   /* D3D12 pipeline statistics: eleven low/high atomic uint32 pairs. */
   SM50_BINDING_INDEX_PIPELINE_STATISTICS = 25,
   SM50_BINDING_INDEX_MSAA_VERTEX_RECORDS = 20,
+  SM50_BINDING_INDEX_MSAA_MESH_CONTROL = 13,
   SM50_BINDING_INDEX_MSAA_PIXEL_INPUTS = 21,
   SM50_BINDING_INDEX_MSAA_PIXEL_OUTPUTS = 22,
   SM50_BINDING_INDEX_MSAA_TILE_CONTROL = 23,
@@ -54,6 +58,8 @@ enum SM50_BINDING_INDEX: uint32_t {
   SM50_BINDING_INDEX_SO_CAPTURE_SCRATCH = 28,
   /* Normal DXIL stages; slot 30 is reserved for indirect-command resolution. */
   SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS = 29,
+  /* D3D12 work graph node kernels: SM50_WG_NODE_CONTEXT (dxil_workgraph.h). */
+  SM50_BINDING_INDEX_WORK_GRAPH_CONTEXT = 18,
 };
 
 enum MTL_SM50_SHADER_ARGUMENT_FLAG : uint32_t {
@@ -148,6 +154,8 @@ struct MTL_SHADER_REFLECTION {
   uint32_t NumOutputElement;
   uint32_t ThreadsPerPatch;
   uint32_t ArgumentTableQwords;
+  /* Pixel shader: D3D11 ForceEarlyDepthStencil (DXBC global flag / DXIL shader flag). */
+  uint32_t PSForceEarlyDepthStencil;
 };
 
 #if defined(__LP64__) || defined(_WIN64)
@@ -267,6 +275,42 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
   SM50_SHADER_D3D12_MSAA_VERTEX = 14,
   SM50_SHADER_D3D12_TESS_CAPTURE = 15,
   SM50_SHADER_GS_TESSELLATION_INPUT = 16,
+  /* GS mesh: per-stream stream-output capture and rasterized-stream selection (SM50_SHADER_D3D12_GS_STREAMS_DATA).
+   * The GS mesh function takes this instead of SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE. */
+  SM50_SHADER_D3D12_GS_STREAMS = 17,
+  /* Header-only argument, with SM50_SHADER_D3D12_PIPELINE_STATS on a pixel-frequency PS that runs natively
+   * multisampled: count PSInvocations once per covered pixel. Metal runs such a PS once per covered sample, all
+   * with the same [[sample_mask]]; only the invocation of the lowest covered sample counts. Not valid with
+   * [[early_fragment_tests]] (the runtime rejects that combination: the lowest covered sample may not run). */
+  SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL = 18,
+  /* PS: apply an output-merger logic op in the epilogue by framebuffer fetch (SM50_SHADER_D3D12_LOGIC_OP_DATA). */
+  SM50_SHADER_D3D12_LOGIC_OP = 19,
+  /* Header-only argument, with SM50_SHADER_D3D12_MSAA_PIXEL (COVERAGE/PIXEL/REPLAY variants): variable-rate coarse
+   * pixel shading. SM50_MSAA_TILE_CONTROL.shading_rate (a D3D12_SHADING_RATE) selects the coarse pixel size of the
+   * tile; coarse pixels are aligned to the 8x8 tile. Input records are indexed by coarse pixel, inputs are
+   * evaluated at the coarse pixel center, the pixel pass runs once per coarse pixel on a virtual coarse grid in the
+   * tile's top-left corner, and the replay broadcasts the coarse output to every covered fine sample. Ignored
+   * (fine shading, layout flag clear) for shaders D3D12 always shades at fine rate. */
+  SM50_SHADER_D3D12_COARSE_SHADING = 31,
+  /* Header-only argument, with SM50_SHADER_D3D12_MSAA_VERTEX (replay) or SM50_SHADER_D3D12_MSAA_PIXEL: D3D12
+   * conservative rasterization of triangles. The replay vertex function reads 12-word index slots (9 polygon
+   * corner ids slot * 8 + corner, then the 3 original ordinals) and emits the screen rectangle around the
+   * primitive, clipped to positive W, with every output extrapolated on the primitive's plane; it also outputs
+   * the primitive's clip positions for msaa_gather_conservative_depth. The pixel variants read their geometric
+   * coverage from SM50_MSAA_PIXEL_LAYOUT.line_mask_dword. */
+  SM50_SHADER_D3D12_CONSERVATIVE_RASTER = 29,
+  /* Post-raster-stage mesh output capture and captured vertex replay (GS, DS and application MS). */
+  SM50_SHADER_D3D12_MSAA_MESH = 30,
+  /* Header-only argument for natively multisampled GS/DS mesh draws under pipeline statistics whose PS uses
+   * ForceEarlyDepthStencil with depth or stencil: early tests then run an arbitrary subset of a pixel's covered
+   * samples, so the lowest-covered-sample rule of PIPELINE_STATS_PER_PIXEL does not hold.
+   * GS/DS mesh function (with SM50_SHADER_D3D12_PIPELINE_STATS): every output primitive carries a flat uint4 key
+   * in primitive data 0 (user(dxmt_statistics_key)), unique among the draw's primitives and never all-zero.
+   * PS (with SM50_SHADER_D3D12_PIPELINE_STATS, instead of PER_PIXEL): reads that key and, under
+   * raster_order_group(0), claims its masked samples in the fragment buffer at
+   * SM50_BINDING_INDEX_STATISTICS_CLAIM; PSInvocations counts once per (pixel, primitive) that ran at least one
+   * invocation (see SM50_STATISTICS_CLAIM_HEADER). */
+  SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM = 42,
   SM50_SHADER_ARGUMENT_TYPE_MAX = 0xffffffff,
 };
 
@@ -343,6 +387,34 @@ struct SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA {
   const struct SM50_SO_CAPTURE_ELEMENT *elements;
 };
 
+/*
+ * D3D12 stream output and rasterized-stream selection after a GS (mesh function).
+ *
+ * `rasterized_stream` (0-3, or ~0u for none) selects the stream whose emits and output
+ * declarations become the mesh output; with none, stream 0 still drives the (unrasterized)
+ * mesh output. Every stream s with streams[s].num_elements != 0 is captured: each GS
+ * invocation key (see SM50_SO_CAPTURE_CONTROL; record_count is the key count K) owns
+ * dcl_maxout records of streams[s].record_dwords + 1 dwords (the last is the vertex's
+ * position inside its output strip), followed by K header words holding the number of
+ * captured vertices. The regions of the captured streams follow each other in stream order
+ * in the one scratch buffer: stream s starts at dword
+ *   K * sum over captured t < s of (dcl_maxout * (streams[t].record_dwords + 1) + 1).
+ * At most dcl_maxout vertices are captured per invocation and stream.
+ * Element names refer to the output signature of their stream.
+ */
+struct SM50_GS_STREAM_CAPTURE {
+  uint32_t record_dwords;
+  uint32_t num_elements;
+  const struct SM50_SO_CAPTURE_ELEMENT *elements;
+};
+
+struct SM50_SHADER_D3D12_GS_STREAMS_DATA {
+  void *next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t rasterized_stream;
+  struct SM50_GS_STREAM_CAPTURE streams[4];
+};
+
 /* Index size 0 preserves native vertex IDs; 2/4 pulls a R16/R32 application
  * index. index_first is in 16-bit words relative to the bound index buffer.
  * Native non-indexed draws start at vertex 0; BaseVertexLocation affects
@@ -384,6 +456,8 @@ enum SM50_MSAA_VARIANT {
   SM50_MSAA_VERTEX_CAPTURE = 4,
   SM50_MSAA_VERTEX_REPLAY = 5,
   SM50_MSAA_SAMPLE_APP = 6,
+  SM50_MSAA_OBJECT_CAPTURE = 7,
+  SM50_MSAA_OBJECT_REPLAY = 8,
 };
 
 enum SM50_MSAA_LINE_MODE {
@@ -395,9 +469,9 @@ enum SM50_MSAA_LINE_MODE {
 
 struct SM50_MSAA_INTERPOLATION_LAYOUT {
   uint32_t no_perspective_count;
-  uint64_t no_perspective_user_hashes[64];
+  uint64_t no_perspective_user_hashes[128];
   uint32_t flat_count;
-  uint64_t flat_user_hashes[64];
+  uint64_t flat_user_hashes[128];
 };
 
 struct SM50_MSAA_TILE_CONTROL {
@@ -413,6 +487,13 @@ struct SM50_MSAA_TILE_CONTROL {
   float viewport_origin_y;
   float viewport_width;
   float viewport_height;
+  /* Forced-sample draws: PSO SampleMask restricted to the output samples (occlusion of forced-1 MSAA RTVs). */
+  uint32_t output_mask;
+  /* ForcedSampleCount 16 runs two native 8x halves; logical sample index of this pass's native sample 0. */
+  uint32_t sample_base;
+  /* Coarse shading variants: D3D12_SHADING_RATE of this tile (log2 width << 2 | log2 height); 0 = 1x1. */
+  uint32_t shading_rate;
+  uint32_t shading_rate_image_width, shading_rate_image_height;
 };
 
 struct SM50_MSAA_PIXEL_LAYOUT {
@@ -444,6 +525,8 @@ enum SM50_MSAA_PIXEL_FLAG {
   SM50_MSAA_PIXEL_PULL_INPUT = 1 << 5,
   SM50_MSAA_PIXEL_CENTROID_POSITION = 1 << 6,
   SM50_MSAA_PIXEL_DISTANCE_INPUTS = 1 << 7,
+  /* Compiled with SM50_SHADER_D3D12_COARSE_SHADING and eligible: tile.shading_rate is honored. */
+  SM50_MSAA_PIXEL_COARSE = 1 << 8,
 };
 
 struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA {
@@ -460,6 +543,14 @@ struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA {
   bool center_pattern;
   const struct SM50_MSAA_VERTEX_LAYOUT *distance_vertex_layout;
   uint32_t distance_vertex_count;
+  const struct SM50_MSAA_VERTEX_LAYOUT *coarse_vertex_layout;
+};
+
+struct SM50_MSAA_CAPTURED_USER {
+  uint64_t hash;
+  uint32_t offset_dwords;
+  uint32_t size_bytes;
+  uint32_t flags; /* bit 0: spilled; bit 1: per-primitive (always flat). */
 };
 
 struct SM50_MSAA_VERTEX_LAYOUT {
@@ -470,12 +561,10 @@ struct SM50_MSAA_VERTEX_LAYOUT {
   uint32_t clip_distance_offset_dwords;
   uint32_t cull_distance_offset_dwords;
   uint32_t user_count;
-  uint32_t user_reserved;
-  struct {
-    uint64_t hash;
-    uint32_t offset_dwords;
-    uint32_t size_bytes;
-  } users[64];
+  uint32_t shading_rate_offset_dwords; /* ~0u when SV_ShadingRate is not written. */
+  uint32_t primitive_id_offset_dwords; /* ~0u when the stage does not export a primitive ID. */
+  uint32_t spill_count; /* Whole user fields reconstructed from capture rather than native interpolants. */
+  struct SM50_MSAA_CAPTURED_USER users[128];
 };
 
 struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA {
@@ -487,6 +576,43 @@ struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA {
   uint32_t line_mode;
   const struct SM50_MSAA_INTERPOLATION_LAYOUT *interpolation;
   bool depth_clip_enable;
+};
+
+struct SM50_MSAA_MESH_LAYOUT {
+  uint32_t max_vertices;
+  uint32_t max_primitives;
+  uint32_t vertices_per_primitive;
+  uint32_t threads_per_group;
+  /* Output records first, then device-memory output staging, indices, count and cull flags. */
+  uint32_t capture_dwords_per_group;
+  uint32_t max_workloads; /* DS workloads per patch; GS instances are supplied by the PSO. */
+};
+
+/* Slot 13, constant uint4. GS/DS use groups_x as the input primitive/patch count.
+ * Application MS uses groups_x/y to flatten the native group position. The stage-specific
+ * dxmt.msaa.mesh.slot marker overrides that flattening for GS/DS. */
+struct SM50_MSAA_MESH_CONTROL {
+  uint32_t groups_x;
+  uint32_t groups_y;
+  uint32_t group_base;
+  uint32_t total_slots;
+};
+
+struct SM50_SHADER_D3D12_MSAA_MESH_DATA {
+  void *next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t variant; /* SM50_MSAA_VERTEX_CAPTURE or SM50_MSAA_VERTEX_REPLAY */
+  struct SM50_MSAA_VERTEX_LAYOUT *layout_out;
+  struct SM50_MSAA_MESH_LAYOUT *mesh_layout_out;
+  uint32_t line_mode;
+  const struct SM50_MSAA_INTERPOLATION_LAYOUT *interpolation;
+  bool depth_clip_enable;
+  struct SM50_MSAA_OBJECT_LAYOUT *object_layout_out;
+};
+
+struct SM50_MSAA_OBJECT_LAYOUT {
+  uint32_t payload_bytes;
+  uint32_t record_dwords; /* uint4 child grid followed by byte-exact payload. */
 };
 
 /* D3D12 TS+GS two-pass capture layout (per PSO, compile-time constants).
@@ -503,6 +629,25 @@ typedef struct SM50_TESS_CAPTURE_LAYOUT {
   uint32_t primitive_vertices; /* K */
 } SM50_TESS_CAPTURE_LAYOUT;
 
+/* SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM: bound at SM50_BINDING_INDEX_STATISTICS_CLAIM (fragment, device).
+ * `entries` is the dword offset from the header of the per-sample entries: 4 dwords {key.xyz, epoch} per sample,
+ * sample s of pixel (x, y, layer) at entries + (((layer * height + y) * width + x) * samples + s) * 4, zero-filled
+ * before their first draw. `epoch` (never 0) separates draws sharing the entries.
+ * Metal runs a pixel-frequency PS once per covered sample, every invocation with the same [[sample_mask]], and
+ * raster order groups only order invocations whose samples overlap, so two primitives with disjoint masks may
+ * interleave in one pixel (probe build/local/p3/p2last/probe/quads3.mm). The claim therefore writes the key to every
+ * masked sample and an invocation counts unless one of its masked samples already holds its key (quads4.mm). */
+typedef struct SM50_STATISTICS_CLAIM_HEADER {
+  uint32_t width;
+  uint32_t height;
+  uint32_t layers;
+  uint32_t epoch;
+  int32_t entries;
+  uint32_t mesh_groups; /* mesh-shader key counter: 0 before the draw; each MS threadgroup takes one value */
+  uint32_t samples;     /* raster sample count (entries per pixel) */
+  uint32_t reserved;
+} SM50_STATISTICS_CLAIM_HEADER;
+
 /* Bound at SM50_BINDING_INDEX_TESS_CAPTURE_CONTROL (constant address space). */
 typedef struct SM50_TESS_CAPTURE_CONTROL {
   uint32_t slot_count;   /* instance_count * patch_count * W */
@@ -511,7 +656,8 @@ typedef struct SM50_TESS_CAPTURE_CONTROL {
   uint32_t reserved;
 } SM50_TESS_CAPTURE_CONTROL;
 
-/* DS mesh in capture mode (pass 1). */
+/* DS mesh in capture mode (pass 1). When paired with STREAM_OUTPUT_CAPTURE, this only returns the SO scratch
+ * layout: max_vertices counts expanded primitive records plus vertex/index staging; rasterization is independent. */
 typedef struct SM50_SHADER_D3D12_TESS_CAPTURE_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -554,6 +700,18 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
   uint32_t pixel_formats[8];
   /** Actual Metal sample count for this native pixel entry (1 for virtual APP passes). */
   uint32_t native_sample_count;
+};
+
+/* Output-merger logic op by framebuffer fetch. For every render target bit in rt_mask the PS output is replaced by
+ * op(output, [[color(n)]]) masked to component_bits[n][c] (0 = component absent). The fetch makes Metal run the
+ * fragment at sample rate on multisampled targets, so the PS must have no side effects (callers enforce). */
+struct SM50_SHADER_D3D12_LOGIC_OP_DATA {
+  void *next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  /** D3D12_LOGIC_OP */
+  uint32_t op;
+  uint32_t rt_mask;
+  uint8_t component_bits[8][4];
 };
 
 struct SM50_IA_INPUT_ELEMENT {

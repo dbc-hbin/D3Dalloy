@@ -31,6 +31,8 @@
 #include "air_samplepos.h"
 #include "air_tessellation.h"
 #include "air_denorm.h"
+#include "air_sampler_feedback.h"
+#include "air_conservative.h"
 
 #include "transforms/lower_16bit_texread.hpp"
 #include "transforms/simdgroup_implicit_membarrier.hpp"
@@ -233,6 +235,16 @@ linkTessellation(llvm::Module &M) {
 void
 linkDenorm(llvm::Module &M) {
   linkShader(M, air_denorm);
+}
+
+void
+linkSamplerFeedback(llvm::Module &M) {
+  linkShader(M, air_sampler_feedback);
+}
+
+void
+linkConservative(llvm::Module &M) {
+  linkShader(M, air_conservative);
 }
 
 } // namespace dxmt

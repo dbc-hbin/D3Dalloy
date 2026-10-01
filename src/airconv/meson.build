@@ -19,11 +19,17 @@ airconv_src = files([
  'dxil_operations.cpp',
  'dxil_rt_operations.cpp',
  'dxil_rt_callbacks.cpp',
+ 'dxil_rt_query.cpp',
  'dxil_raytracing.cpp',
  'dxil_pipeline.cpp',
  'dxil_pipeline_ts.cpp',
+ 'dxil_mesh.cpp',
+ 'dxil_workgraph.cpp',
  'msaa_pixel.cpp',
+ 'msaa_coarse.cpp',
  'msaa_vertex.cpp',
+ 'msaa_mesh.cpp',
+ 'logic_op.cpp',
  'metallib_writer.cpp',
  'nt/air_builder.cpp',
  'nt/dxbc_converter_base.cpp',
@@ -93,7 +99,30 @@ airconv_denorm_ir = metalir_generator.process(
 )
 airconv_denorm_header = hexdump_generator.process(airconv_denorm_ir)
 
-airconv_src += [airconv_shaders_header, airconv_denorm_header]
+# Sampler feedback LOD selection must match the CPU-side D3D12 footprint math exactly.
+airconv_sampler_feedback_ir = metalir_generator.process(
+  'shaders/air_sampler_feedback.metal',
+  extra_args: ['-std=metal3.1', '--target=air64-apple-macos14.0', '-fno-fast-math'],
+)
+airconv_sampler_feedback_header = hexdump_generator.process(airconv_sampler_feedback_ir)
+
+# Conservative rasterization: the snapped polygon must match msaa_gather_conservative_depth bit for bit
+# (src/airconv/shaders/conservative_polygon.h is shared with src/dxmt/dxmt_command.metal).
+airconv_conservative_ir = metalir_generator.process(
+  'shaders/air_conservative.metal',
+  extra_args: ['-std=metal3.1', '--target=air64-apple-macos14.0', '-fno-fast-math'],
+)
+airconv_conservative_header = hexdump_generator.process(airconv_conservative_ir)
+
+# D3D12 work graph node kernel run-time helpers (dxil_workgraph.cpp).
+airconv_workgraph_ir = metalir_generator.process(
+  'shaders/air_workgraph.metal',
+  extra_args: ['-std=metal3.1', '--target=air64-apple-macos14.0'],
+)
+airconv_workgraph_header = hexdump_generator.process(airconv_workgraph_ir)
+
+airconv_src += [airconv_shaders_header, airconv_denorm_header, airconv_sampler_feedback_header,
+                airconv_conservative_header, airconv_workgraph_header]
 
 build_airconv_for_windows = get_option('build_airconv_for_windows')
 

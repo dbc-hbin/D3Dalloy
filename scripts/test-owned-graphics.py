@@ -76,6 +76,18 @@ SUITE_PREFIXES = {
     "sm6": "OWNED_D3D12_SM6",
     # SHARING: shared heaps/resources/fences across devices and processes.
     "sharing": "OWNED_D3D12_SHARING",
+    # FL: feature level 11_1/12_0 requirements (logic ops, forced sample counts, TIR).
+    "feature-level": "OWNED_D3D12_FEATURE_LEVEL",
+    "conservative-raster": "OWNED_D3D12_CONSERVATIVE_RASTER",
+    # VIEWINST: ViewInstancingTier 1 (draw-level looping) with exact pixels.
+    "view-instancing": "OWNED_D3D12_VIEW_INSTANCING",
+    # MESH: MeshShaderTier 1 (AS/MS pipelines, DispatchMesh, ExecuteIndirect DISPATCH_MESH) with exact pixels.
+    "mesh-shader": "OWNED_D3D12_MESH_SHADER",
+    # FEEDBACK: SamplerFeedbackTier 1.0 (feedback maps, WriteSamplerFeedback*, transcoding) against a CPU oracle.
+    "sampler-feedback": "OWNED_D3D12_SAMPLER_FEEDBACK",
+    "work-graphs": "OWNED_D3D12_WORK_GRAPHS",
+    # VRS: Tier2 per-draw, primitive and image rates against exact coarse-pixel references.
+    "vrs": "OWNED_D3D12_VRS",
 }
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SHARING_CASES = (
@@ -105,6 +117,8 @@ DXIL_TEXTURE_SHADERS = ("basic-texture-vs.dxil", "basic-texture-ps.dxil")
 PREDICATION_INDIRECT_SHADERS = ("predication-indirect-cs.dxil", "predication-indirect-vs.dxil")
 ATOMIC_COPY_SHADERS = ("atomic-copy-reader.dxil",)
 STREAM_OUTPUT_SHADERS = ("stream-output-packed-vs.dxil",)
+# GS multi-stream cases load these by name beside the fixture (not passed on the command line).
+STREAM_OUTPUT_GS_INPUTS = ("stream-output-gs-vs_gs.dxil", "stream-output-gs-gs_multi.dxil")
 PARTIAL_3D_UAV_SHADERS = ("partial-3d-uav.dxil",)
 # SM: frozen DXIL read by name (sm6-<entry>.dxil) beside the executable; the HLSL and
 # its build script are frozen with them so the evidence names the exact sources.
@@ -113,18 +127,40 @@ SM6_ENTRIES = (
     "cs_wave", "cs_divergent", "cs_int64", "cs_atomic64", "cs_atomic64_ops", "cs_atomic64_heap", "cs_minprec",
     "cs_quad_deriv", "vs_main", "ps_main", "ps_helper", "ps_helper_all", "vs_tiny", "ps_atomic64", "ps_umax64",
     "vs_int64", "ps_int64", "vs_wave", "ps_null", "cs_16bit", "cs_packed", "vs_16bit", "ps_16bit", "cs_wavesize32", "cs_wavesize64",
-    "cs_fp64", "cs_gs64", "cs_sm69", "vs_viewid", "ps_viewid", "vs_shadingrate", "ps_shadingrate", "cs_rayquery",
-    "ps_feedback", "ps_viewid_vi", "ms_mesh", "cs_denorm_any", "cs_denorm_ftz", "cs_denorm_preserve",
+    "cs_fp64", "cs_gs64", "cs_sm69", "vs_viewid", "ps_viewid",
+    "ps_viewid_vi", "cs_denorm_any", "cs_denorm_ftz", "cs_denorm_preserve",
 )
 SM6_CASES = (
     "wave", "divergent", "int64", "atomic64_ops", "atomic64_heap", "16bit", "minprec", "packed", "quad_deriv",
     "rejections", "wavesize32", "barycentrics", "barycentrics_indexed", "helper_lanes", "helper_lanes_included",
-    "16bit_io", "graphics_int64", "vs_wave", "graphics_atomic64_rejected", "sv_viewid",
-    "cap_rejected", "denorm_any", "denorm_ftz", "denorm_preserve", "cs_atomic64_stress_1", "cs_atomic64_stress_16",
+    "16bit_io", "graphics_int64", "vs_wave", "graphics_atomic64_rejected", "sv_viewid", "sv_viewid_instanced",
+    "denorm_any", "denorm_ftz", "denorm_preserve", "cs_atomic64_stress_1", "cs_atomic64_stress_16",
 )
-SM6_REJECTS = ["cs_wavesize64", "cs_fp64", "cs_gs64", "cs_sm69", "ps_atomic64", "ps_umax64", "ps_shadingrate",
-                "cs_rayquery", "ps_feedback", "ps_viewid_vi", "ms_mesh"]
+SM6_REJECTS = ["cs_wavesize64", "cs_fp64", "cs_gs64", "cs_sm69", "ps_atomic64", "ps_umax64"]
 SM6_STRESS_REPS = 20
+# MESH: frozen DXIL read by name (mesh-shader-<entry>.dxil) beside the executable, with its sources.
+MESH_SHADER_SOURCES = ("mesh-shader.hlsl", "mesh-shader-contract.hlsl", "build-mesh-shader.sh")
+MESH_SHADER_ENTRIES = (
+    "ms_basic", "ms_grid", "ms_payload", "ms_cull", "ms_prim", "ms_layer", "ms_lines", "ms_max", "ms_count",
+    "ms_partial", "ms_viewid", "ms_rtai", "ms_rootk", "ms_early", "as_main", "as_count", "ps_color", "ps_prim",
+    "ps_layer", "ps_max", "ps_rows", "ps_early",
+    "ms_contract124", "ms_contract125", "ms_contract128_perspective", "ms_contract128_affine",
+    "ms_contract128_flat", "ms_contract128_scalars", "ms_contract128_budget", "ms_contract_cull", "ps_contract124", "ps_contract125",
+    "ps_contract128_perspective", "ps_contract128_affine", "ps_contract128_flat", "ps_contract128_scalars", "ps_contract_cull",
+    "ps_contract128_pull_perspective", "ps_contract128_pull_affine",
+    "ms_contract128_split", "ps_contract128_split", "ms_contract_cull_line",
+)
+MESH_SHADER_CASES = (
+    "ms_basic", "ms_grid", "as_payload", "ms_cull", "ms_primitive_attributes", "ms_layer_viewport", "ms_lines",
+    "ms_max_256", "ms_partial_clip", "ms_indirect", "ms_basic_msaa4", "ms_cull_msaa4", "grid_limits", "rejects",
+    "ms_statistics", "ms_statistics_early_depth_msaa", "ms_predication", "ms_pso_cache", "ms_view_instancing",
+    "ms_indirect_root_constants",
+    "ms_full_range_rtai",
+    "ms_output124", "ms_output125", "ms_output128_perspective", "ms_output128_affine", "ms_output128_flat",
+    "ms_output128_scalars", "ms_output128_pull_perspective", "ms_output128_pull_affine", "ms_output128_budget",
+    "ms_output128_split",
+    "ms_output128_coarse", "ms_output129_reject", "ms_cull_distance",
+)
 TILED_INPUTS = ("tiled.hlsl", "tiled-fxc.hlsl")
 TILED_SHADERS = ("tiled-write.dxil", "tiled-buffer-status.dxil", "tiled-texture-status.dxil",
                  "tiled-dxbc-status.dxbc", "tiled-fxc-cs.dxbc", "tiled-fxc-vs.dxbc", "tiled-fxc-ps.dxbc",
@@ -161,6 +197,73 @@ GEOMETRY_INPUTS = ("geometry.hlsl",)
 TESSELLATION_INPUTS = ("tessellation.hlsl",)
 PIPELINE_STATISTICS_SHADERS = ("pipeline-statistics-vs.dxil", "pipeline-statistics-ps.dxil",
                                "pipeline-statistics-cs.dxil")
+# FL: frozen by dxil/build-feature-level.sh; the fixture reads feature-level-<entry>.dxil by name.
+FEATURE_LEVEL_INPUTS = ("feature-level.hlsl", "build-feature-level.sh") + tuple(
+    f"feature-level-{entry}.dxil" for entry in ("vs_main", "ps_coverage", "ps_color"))
+# CONSRAST: frozen by dxil/build-conservative-raster.sh; the fixture reads conservative-raster-<entry>.dxil and
+# compiles DXBC from the HLSL.
+CONSERVATIVE_RASTER_INPUTS = ("conservative-raster.hlsl", "conservative-distance.hlsl", "build-conservative-raster.sh") + tuple(
+    f"{source}-{entry}.dxil" for source in ("conservative-raster", "conservative-distance") for entry in
+    ("vs_main", "ps_main", "gs_main", "hs_main", "ds_main", "ms_main", "ms_as", "as_main"))
+CONSERVATIVE_RASTER_PATHS = ("vs_dxil", "vs_dxbc", "vs_gs_dxil", "vs_gs_dxbc", "vs_hs_ds_dxil", "vs_hs_ds_dxbc",
+                             "vs_hs_ds_gs_dxil", "vs_hs_ds_gs_dxbc", "ms_dxil", "as_ms_dxil")
+# VIEWINST: frozen by dxil/build-view-instancing.sh; the fixture reads view-instancing-<entry>.dxil by name.
+VIEW_INSTANCING_INPUTS = ("view-instancing.hlsl", "build-view-instancing.sh") + tuple(
+    f"view-instancing-{entry}.dxil"
+    for entry in ("vs_main", "ps_uint", "ps_unorm", "gs_view", "vs_tess", "hs_view", "ds_view"))
+VIEW_INSTANCING_CASES = (
+    "rtai_2_views", "rtai_4_views", "rtai_out_of_range_to_0", "vpai_2_views", "vpai_4_views",
+    "vpai_out_of_range_to_0", "mask_flag_0b1010", "mask_flag_upper_bits_ignored", "mask_flag_zero_draws_nothing",
+    "mask_without_flag_ignored", "gs_rtai_2_views", "tess_rtai_2_views",
+    "no_subobject_reads_zero_after_instanced_draw", "count0_reads_zero", "count1_location_slice2",
+    "msaa4x_rtai_3_views_out_of_range_to_0", "msaa4x_vpai_3_views_out_of_range_to_0", "msaa4x_mask_0b10",
+    "execute_indirect_2_views_2_commands", "bundle_mask_reset_and_leak", "bundle_starts_with_mask_0",
+    "pipeline_statistics_count_views", "invalid_descs_rejected",
+)
+# VRS: frozen by dxil/build-vrs.sh; the fixture reads vrs-<entry>.dxil by name.
+VRS_INPUTS = ("vrs.hlsl", "build-vrs.sh") + tuple(
+    f"vrs-{entry}.dxil"
+    for entry in ("vs_main", "ps_main", "ps_snapped", "ps_discard", "ps_coverage", "ps_depth", "ps_flat",
+                  "vs_rate", "ps_rate", "ps_centroid", "ps_sample", "ps_wide_snapped",
+                  "gs_main", "hs_main", "ds_main", "ms_main", "as_main", "ms_as", "gs_rate", "ms_rate", "ms_as_rate",
+                  "vs_rate_view", "gs_rate_view", "ms_rate_view", "ms_as_rate_view"))
+VRS_CASES = (
+    "rate_1x1", "rate_1x2", "rate_2x1", "rate_2x2", "rate_2x4", "rate_4x2", "rate_4x4",
+    "msaa2x_rate_2x2", "msaa2x_rate_2x4", "msaa4x_rate_1x2", "msaa4x_rate_2x2",
+    "msaa4x_rate_2x4_sanitized_2x2", "msaa4x_rate_4x4_sanitized_2x2", "msaa2x_rate_4x4_sanitized_2x4",
+    "msaa8x_rate_2x2_fine", "combiner_override_1x1", "combiner_min_1x1", "combiner_max_keeps_base",
+    "combiner_sum_keeps_base", "discard_whole_coarse_pixels", "msaa4x_2x2_per_sample_depth",
+    "msaa4x_partial_sample_mask_coarse", "depth_export_fine",
+    "bundle_rate_persists", "clear_state_resets_rate",
+) + tuple(
+    f"stage_{stage}_{case}"
+    for stage in ("gs", "ts", "tsgs", "ms", "as_ms")
+    for case in ("rate_1x1", "rate_1x2", "rate_2x1", "rate_2x2", "rate_2x4", "rate_4x2", "rate_4x4", "stats_2x2")
+        + (("indexed_2x2",) if stage in ("gs", "ts", "tsgs") else ())
+        + ("indirect_2x2", "indirect_count_zero", "view_2x2")
+) + ("stage_gs_so_2x2", "tier2_image_shapes") + tuple(f"tier2_combiners_{first}_{second}" for first in range(5) for second in range(5)) + (
+    "tier2_null_image", "tier2_unbind_image", "tier2_clear_image",
+    "tier2_small_image", "tier2_enhanced_image", "tier2_deny_srv_image",
+    "tier2_stage_gs", "tier2_stage_ts", "tier2_stage_tsgs", "tier2_stage_ms", "tier2_stage_as_ms",
+    "tier2_centroid_full", "tier2_centroid_partial", "tier2_wide_snapped", "tier2_snapped_negative",
+) + tuple(f"tier2_sample_{sample}" for sample in range(16)) + ("tier2_coverage_input",) + tuple(
+    f"tier2_viewport_{stage}" for stage in ("vs", "gs", "ms", "as_ms"))
+# FEEDBACK: frozen by dxil/build-sampler-feedback.sh; the fixture reads sampler-feedback-<entry>.dxil by name.
+SAMPLER_FEEDBACK_INPUTS = ("sampler-feedback.hlsl", "build-sampler-feedback.sh", "sampler-feedback-vs_main.dxil") + tuple(
+    f"sampler-feedback-{shader}_{kind}{array}.dxil"
+    for kind in ("minmip", "used") for array in ("", "_array")
+    for shader in ("cs_main", "ps_implicit", "ps_clamp", "ps_bias"))
+_SF_SAMPLERS = ("point_clamp", "linear_wrap", "aniso4", "linear_border", "mippoint_mirror_lod",
+                "magpoint_mirroronce_bias")
+_SF_SHAPES = ("pow2_minmip", "pow2_used", "npot_minmip", "npot_used", "array_minmip", "array_used")
+SAMPLER_FEEDBACK_CASES = (
+    "caps_and_format_support", "creation_validation", "clear_decodes_ff_and_0", "placed_map_clear",
+    "encode_decode_round_trips", "copy_resource_allowed_copy_texture_region_rejected",
+) + tuple(f"cs_{shape}_{sampler}" for shape in _SF_SHAPES for sampler in _SF_SAMPLERS) + (
+    "cs_srv_subrange_minmip", "cs_srv_subrange_used", "cs_srv_array_subrange_used", "cs_static_sampler_used",
+    "cs_null_paired_texture_drops_writes",
+) + tuple(f"{op}_{_SF_SHAPES[shape]}_{_SF_SAMPLERS[sampler]}"
+          for shape in (0, 1, 4, 5) for sampler in (1, 2, 4) for op in ("ps_implicit", "ps_bias", "ps_clamp"))
 PIPELINE_STATISTICS_STAGE_INPUTS = (
     "pipeline-statistics-stages.hlsl",
 
@@ -225,7 +328,62 @@ DXIL_DESCRIPTOR_TABLE_VALUE = "2468ace0"
 # capability report, a dispatch that traced nothing, or a stale fixture cannot produce
 # it. Where DXR leaves the candidate enumeration order unspecified the fixture lists
 # every admissible outcome and the runner accepts exactly that set.
-RAYTRACING_SHADERS = ("raytracing.dxil",)
+RAYTRACING_SHADERS = ("raytracing.dxil", "raytracing-contract.dxil", "raytracing-stateobj.dxil",
+                      "raytracing-rayquery-cs.dxil", "raytracing-rayquery-vs.dxil", "raytracing-rayquery-fs.dxil",
+                      "raytracing-rayquery-ps.dxil", "raytracing-rayquery-lib.dxil", "raytracing-rayquery-args.dxil",
+                      "raytracing-coverage.dxil", "raytracing-rootargs.dxil",
+                      "raytracing-rayquery-stages-vs.dxil", "raytracing-rayquery-stages-hs.dxil",
+                      "raytracing-rayquery-stages-hs-pass.dxil", "raytracing-rayquery-stages-ds.dxil",
+                      "raytracing-rayquery-stages-ds-pass.dxil", "raytracing-rayquery-stages-gs.dxil",
+                      "raytracing-rayquery-stages-as.dxil", "raytracing-rayquery-stages-ms.dxil",
+                      "raytracing-rayquery-stages-ms-sink.dxil", "raytracing-rayquery-stages-lib.dxil",
+                      "raytracing-linkage-consumer.dxil", "raytracing-linkage-helper.dxil",
+                      "raytracing-linkage-final.dxil")
+# Root-argument-changing ExecuteIndirect(DISPATCH_RAYS) of tests/owned-d3d12-raytracing-rootargs.inc.
+RAYTRACING_ROOTARGS_CASES = ("dispatch-rays-root-arguments",)
+# Coverage cases of tests/owned-d3d12-raytracing-coverage.inc (8x4x2 grids, every table at a
+# non-default offset/stride with local root constants and descriptor tables), in fixture order.
+RAYTRACING_COVERAGE_CASES = ("grid-direct", "grid-indirect", "predication", "bundle")
+# Per-feature lane groups of the grid-direct case, each compared word by word by the fixture.
+RAYTRACING_COVERAGE_FEATURES = (
+    ("geometry-index", 24), ("hit-group-indexing", 8), ("miss-index", 8), ("traceray-skip-flags", 12),
+    ("callable-chains", 8), ("rayquery-template-skip", 4),
+)
+# Every predicated dispatch: DispatchRays / ExecuteIndirect(DISPATCH_RAYS), both ops, predicate 0/1.
+# EQUAL_ZERO culls on 0, NOT_EQUAL_ZERO culls on 1.
+RAYTRACING_COVERAGE_PREDICATION = tuple(
+    (f"predication-{kind}-{op}-{value}", int((op == "eq0") == (value == 0)))
+    for op in ("eq0", "ne0") for value in (0, 1) for kind in ("direct", "indirect"))
+RAYTRACING_COVERAGE_BUNDLE = (
+    ("bundle-indirect", 0), ("bundle-indirect-predicated-culled", 1), ("bundle-indirect-predicated-run", 0),
+    ("bundle-direct-predicated-culled", 1), ("bundle-direct-predicated-run", 0),
+)
+# Inline RayQuery cases of tests/owned-d3d12-raytracing-rayquery.inc (one per shader stage, plus the
+# raygen dispatched through ExecuteIndirect(DISPATCH_RAYS) with GPU-written arguments), in fixture order.
+RAYTRACING_RAYQUERY_CASES = ("cs", "vs", "ps", "raygen", "raygen-indirect",
+                           "closesthit", "anyhit", "intersection", "miss", "callable",
+                           "hs", "ds", "gs", "as", "ms")
+# State-object cases of tests/owned-d3d12-raytracing-stateobj.inc, in fixture order.
+RAYTRACING_STATEOBJ_CASES = (
+    "dxil-subobjects", "config-flags", "recursion-depth", "stack-size", "bundle",
+    "miss-ray-values", "geometry-skip-flags", "add-to-state-object",
+    "generic-function-collection",
+)
+# Contract cases of tests/owned-d3d12-raytracing-contract.inc, in the order the fixture runs them.
+RAYTRACING_CONTRACT_CASES = (
+    "vertex-formats", "geometry-rules", "transforms", "instances-hit-groups",
+)
+RAYTRACING_AS_CASES = (
+    "postbuild-inline", "postbuild-emit", "clone-blas", "clone-tlas", "compact-blas", "compact-tlas",
+    "serialize-blas", "serialize-tlas-relocate", "serialize-aabb", "serialize-empty",
+    "visualize-blas", "visualize-tlas", "update-blas-inplace", "update-blas-copy",
+    "update-tlas-inplace", "update-tlas-copy",
+)
+RAYTRACING_VERTEX_FORMATS = (
+    "r32g32b32_float", "r32g32_float", "r16g16_float", "r16g16b16a16_float", "r16g16_snorm",
+    "r16g16b16a16_snorm", "r16g16b16a16_unorm", "r16g16_unorm", "r10g10b10a2_unorm", "r8g8b8a8_unorm",
+    "r8g8_unorm", "r8g8b8a8_snorm", "r8g8_snorm",
+)
 # BARRIERS: DXIL library of root signature subobjects for ID3D12Device14, read beside the fixture.
 ENHANCED_BARRIERS_INPUTS = ("enhanced-barriers-rs-library.dxil",)
 # BINDLESS: argv order is the fixture contract.
@@ -717,7 +875,7 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
     if suite == "enhanced-barriers":
         return [dxil_dir / name for name in ENHANCED_BARRIERS_INPUTS]
     if suite == "stream-output":
-        return [dxil_dir / name for name in STREAM_OUTPUT_SHADERS]
+        return [dxil_dir / name for name in STREAM_OUTPUT_SHADERS + STREAM_OUTPUT_GS_INPUTS]
     if suite == "partial-3d-uav-dxil":
         return [dxil_dir / name for name in PARTIAL_3D_UAV_SHADERS]
     if suite == "tiled":
@@ -733,13 +891,30 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
     if suite in ("geometry", "tessellation"):
         stem = suite
         names = GEOMETRY_INPUTS if suite == "geometry" else TESSELLATION_INPUTS
-        return [dxil_dir / name for name in names] + sorted(dxil_dir.glob(f"{stem}-*.dxil"))
+        return ([dxil_dir / name for name in names] + sorted(dxil_dir.glob(f"{stem}-*.dxil"))
+                + [dxil_dir / "gsindirect.hlsl"] + sorted(dxil_dir.glob("gsindirect-*.dxil")))
     if suite == "bindless":
         return [dxil_dir / name for name in BINDLESS_SHADERS + BINDLESS_INPUTS]
     if suite == "pipeline-statistics":
         return [dxil_dir / name for name in PIPELINE_STATISTICS_SHADERS + PIPELINE_STATISTICS_STAGE_INPUTS]
     if suite == "sm6":
         return [dxil_dir / f"sm6-{entry}.dxil" for entry in SM6_ENTRIES] + [dxil_dir / name for name in SM6_SOURCES]
+    if suite == "mesh-shader":
+        return ([dxil_dir / f"mesh-shader-{entry}.dxil" for entry in MESH_SHADER_ENTRIES]
+                + [dxil_dir / name for name in MESH_SHADER_SOURCES])
+    if suite == "view-instancing":
+        return [dxil_dir / name for name in VIEW_INSTANCING_INPUTS]
+    if suite == "work-graphs":
+        return [dxil_dir / name for name in ("work-graphs.hlsl", "work-graphs-sharing.hlsl", "work-graphs-linkage.hlsl", "build-work-graphs.sh",
+                                           "work-graphs-nodes.dxil", "work-graphs-sharing.dxil", "work-graphs-link-nodes.dxil", "work-graphs-link-helpers.dxil", "work-graphs-root-subobjects.dxil")]
+    if suite == "vrs":
+        return [dxil_dir / name for name in VRS_INPUTS]
+    if suite == "sampler-feedback":
+        return [dxil_dir / name for name in SAMPLER_FEEDBACK_INPUTS]
+    if suite == "feature-level":
+        return [dxil_dir / name for name in FEATURE_LEVEL_INPUTS]
+    if suite == "conservative-raster":
+        return [dxil_dir / name for name in CONSERVATIVE_RASTER_INPUTS]
     return []
 
 
@@ -916,7 +1091,7 @@ def run(args: argparse.Namespace) -> int:
                    and stdout.count("OWNED_D3D12_ENHANCED_BARRIERS_CASE_PASS ") == 19
                    and "OWNED_D3D12_ENHANCED_BARRIERS_INVALID_BARRIERS_PASS rejected=10" in stdout
                    and "OWNED_D3D12_ENHANCED_BARRIERS_STENCIL front=11 back=f2" in stdout
-                   and "OWNED_D3D12_ENHANCED_BARRIERS_INTERFACES device14=1 command_list9=1 command_list10=0" in stdout
+                   and "OWNED_D3D12_ENHANCED_BARRIERS_INTERFACES device14=1 command_list9=1" in stdout
                    and "OWNED_D3D12_ENHANCED_BARRIERS_PASS cases=19" in stdout
                    and "_FAIL" not in stdout)
     if args.suite == "multiqueue":
@@ -974,13 +1149,26 @@ def run(args: argparse.Namespace) -> int:
                    and all(reps == exact == str(SM6_STRESS_REPS) for _, _, reps, exact in stress)
                    and rejects == SM6_REJECTS and not gpu_hang
                    and re.search(r"^OWNED_D3D12_SM6_CAPS shader_model=0x65/0x0 double=0 minprec=2 wave=1 "
-                                 r"lanes=32-32 total_lanes=\d+ int64=1 barycentrics=1 view_instancing=0 "
+                                 r"lanes=32-32 total_lanes=\d+ int64=1 barycentrics=1 view_instancing=1 "
                                  r"native16=1 atomic64_typed=0 atomic64_groupshared=0 atomic64_heap=0 "
                                  r"wave_mma=0$", stdout, re.MULTILINE)
                    and f"OWNED_D3D12_SM6_PASS stress_reps={SM6_STRESS_REPS}" in stdout
                    and "OWNED_D3D12_SM6_MISMATCH" not in stdout
                    and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
                    and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr)
+    if args.suite == "mesh-shader":
+        # Every case passes in order with exact pixels/counters; the caps line is exactly what was verified.
+        dxil_compiler_loaded = native_compiler_proof
+        cases = re.findall(r"^OWNED_D3D12_MESH_SHADER_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+        success = (success and dxil_compiler_loaded and tuple(cases) == MESH_SHADER_CASES
+                   and "kIOGPUCommandBufferCallbackError" not in stderr
+                   and re.search(r"^OWNED_D3D12_MESH_SHADER_CAPS tier=10 stats=1 full_range_rtai=1 derivatives=0 "
+                                 r"ms_primitives_culled=0$", stdout, re.MULTILINE)
+                   and "OWNED_D3D12_MESH_SHADER_PASS" in stdout
+                   and "OWNED_D3D12_MESH_SHADER_MISMATCH" not in stdout
+                   and "OWNED_D3D12_MESH_SHADER_CASE_FAIL" not in stdout
+                   and "OWNED_D3D12_MESH_SHADER_PSO_FAIL" not in stdout
+                   and "OWNED_D3D12_MESH_SHADER_FAIL" not in stdout + stderr)
     if args.suite == "raster-order":
         dxil_compiler_loaded = native_compiler_proof
         cases = re.findall(r"^RASTER_ORDER_CASE ([\w-]+) status=PASS$", stdout, re.MULTILINE)
@@ -997,6 +1185,123 @@ def run(args: argparse.Namespace) -> int:
                    and stdout.count("RASTER_ORDER_LAYERS values=27,27,90,90 expected=27,27,90,90") == 1
                    and stdout.count("OWNED_D3D12_RASTER_ORDER_PASS") == 1
                    and "status=FAIL" not in stdout + stderr)
+    if args.suite == "feature-level":
+        # FL 11_1/12_0: OutputMergerLogicOp (16 ops x 7 UINT formats + R32G32B32A32_UINT MRT), UAV-only
+        # ForcedSampleCount 1/4/8/16 (16 = two programmed 8x halves) with exact coverage/invocation/occlusion,
+        # ForcedSampleCount 1 on 4x/8x RTVs with SampleMask/occlusion/statistics, and the 18 required typed UAV
+        # load formats exact through texture2d and buffer views.
+        logic = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_LOGIC_OP format=(\w+) ops=16 pixels=16 "
+                           r"mrt=R32G32B32A32_UINT", stdout)
+        forced = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_UAV_ONLY_FORCED samples=(\d+) triangles=40 "
+                            r"pixels=10240 partial=(\d+)", stdout)
+        forced1 = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_FORCED1_MSAA_RTV samples=(\d) mask=(0x[0-9a-f]+) "
+                             r"triangles=6", stdout)
+        typed = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_TYPED_UAV_LOAD format=(\w+) texels=32 "
+                           r"views=texture2d,buffer", stdout)
+        cases = re.findall(r"^OWNED_D3D12_FEATURE_LEVEL_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+        success = (success and logic == ["R8G8B8A8_UINT", "R16G16_UINT", "R32_UINT", "R10G10B10A2_UINT",
+                                         "R8_UINT", "R16_UINT", "R8G8_UINT"]
+                   and [samples for samples, _ in forced] == ["1", "4", "8", "16"]
+                   and all(int(partial) > 0 for samples, partial in forced if samples != "1")
+                   and forced1 == [("4", "0xffffffff"), ("4", "0x5"), ("8", "0xffffffff"), ("8", "0x81"),
+                                   ("4", "0x0")]
+                   and len(typed) == 18 and len(set(typed)) == 18
+                   and re.search(r"OWNED_D3D12_FEATURE_LEVEL_TIR16_RTV triangles=40 partial=[1-9]\d*", stdout)
+                   and cases == ["logic_ops_16_uint_formats_7_mrt_and_rejections",
+                                 "uav_only_forced_1_4_8_16_and_tir16_rtv_coverage_invocation_occlusion_exact",
+                                 "forced1_multisample_rtv_4x_8x_samplemask_occlusion_statistics",
+                                 "typed_uav_load_18_required_formats_texture2d_and_buffer_exact"]
+                   and stdout.count("OWNED_D3D12_FEATURE_LEVEL_PASS cases=4") == 1
+                   and "OWNED_D3D12_FEATURE_LEVEL_FAIL" not in stdout + stderr)
+    if args.suite == "conservative-raster":
+        # CONSRAST: the spec bring-up, 1/2 pixel, TIR and 4x MSAA examples, then every pipeline path at 1x and 8x
+        # against the CPU oracle (exact outside the 1/128 px float-projection band), back-face culling and per-sample
+        # depth extrapolated and clamped to the viewport, distances, view masks and SO/statistics/indirect
+        # composition. Every family must pass; Tier 0 remains valid until the proof permits publication.
+        cases = re.findall(r"^OWNED_D3D12_CONSERVATIVE_RASTER_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+        oracle = re.findall(r"^OWNED_D3D12_CONSERVATIVE_RASTER_ORACLE path=(\w+) samples=(\d) triangles=64 "
+                            r"covered=(\d+) ambiguous=\d+ invocations=\d+$", stdout, re.MULTILINE)
+        rejected = re.findall(r"^OWNED_D3D12_CONSERVATIVE_RASTER_PATH_REJECTED path=(\w+)$", stdout, re.MULTILINE)
+        passed = [path for path in CONSERVATIVE_RASTER_PATHS if path not in rejected]
+        caps = re.findall(r"^OWNED_D3D12_CONSERVATIVE_RASTER_CAPS tier=(1)$", stdout, re.MULTILINE)
+        tier = caps[0] if len(caps) == 1 else "invalid"
+        distances = re.findall(r"^OWNED_D3D12_CONSERVATIVE_RASTER_DISTANCE path=(\w+) samples=(\d) covered=\d+ invocations=\d+$", stdout, re.MULTILINE)
+        interpolation = re.findall(r"^OWNED_D3D12_CONSERVATIVE_RASTER_DISTANCE_INTERPOLATION path=(\w+) samples=8 indirect=1 mask=2 invocations=\d+$", stdout, re.MULTILINE)
+        views = re.findall(r"^OWNED_D3D12_CONSERVATIVE_RASTER_VIEW path=(\w+) mask=(\d) samples=8 invocations=\d+$", stdout, re.MULTILINE)
+        combinations = re.findall(r"^OWNED_D3D12_CONSERVATIVE_RASTER_COMBINATION path=(\w+) indirect=([01]) samples=8 .*", stdout, re.MULTILINE)
+        success = (success and not rejected and len(passed) == 10 and len(caps) == 1
+                   and distances == [(path, samples) for path in passed for samples in ("1", "8")]
+                   and interpolation == passed
+                   and views == [(path, mask) for path in passed for mask in ("0", "2", "3")]
+                   and combinations == [(path, indirect) for path in passed for indirect in ("0", "1")]
+                   and [(path, samples) for path, samples, _ in oracle]
+                       == [(path, samples) for path in passed for samples in ("1", "8")]
+                   and cases == ["ia_capture_parameter_integrity", "pso_validation", "spec_bring_up", "spec_half_pixel",
+                                 "spec_tir_forced4_coverage_0xf", "spec_msaa4_coverage_0xf_samplemask_0x5"]
+                                + [f"oracle_{path}" for path in passed]
+                                + ["cull_back", "depth_extrapolated_per_sample_clamped"]
+                   and re.search(r"OWNED_D3D12_CONSERVATIVE_RASTER_DEPTH samples=4 checked=\d+ clamped=[1-9]", stdout)
+                   and f"OWNED_D3D12_CONSERVATIVE_RASTER_CAPS tier={tier}" in stdout
+                   and stdout.count(f"OWNED_D3D12_CONSERVATIVE_RASTER_PASS paths={len(passed)} "
+                                    f"rejected={len(rejected)} tier={tier}") == 1
+                   and "OWNED_D3D12_CONSERVATIVE_RASTER_FAIL" not in stdout + stderr)
+    if args.suite == "work-graphs":
+        dxil_compiler_loaded = native_compiler_proof
+        cases = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+        results = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_RESULT mode=(\d) sum=(\d+) expected_sum=(\d+) "
+                             r"count=(\d+) expected_count=(\d+)$", stdout, re.MULTILINE)
+        linked_results = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_LINK_RESULT program=([AB]) exact_min=(\d+) "
+                                    r"sum=(\d+) expected_sum=(\d+) count=(\d+) expected_count=4 "
+                                    r"helper_sum=(\d+) expected_helper_sum=54 helper_count=(\d+) expected_helper_count=4$",
+                                    stdout, re.MULTILINE)
+        sampler_results = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_SAMPLER_RESULT exact_min=(\d+) "
+                                     r"sum=(\d+) expected_sum=68 count=(\d+) expected_count=4 local_argument_bytes=0$",
+                                     stdout, re.MULTILINE)
+        success = (success and dxil_compiler_loaded
+                   and cases == [f"mode_{mode}_min_backing_depth32_fanout16" for mode in range(4)] +
+                       ["shared_budget_sparse_array_input_sharing_local_roots_cross_group", "collection_external_namespace_root_contract_negatives",
+                        "global_roots_collection_functions_program_A", "global_roots_collection_functions_program_B", "local_static_sampler_union_exact"]
+                   and [mode for mode, *_ in results] == ["0", "1", "2", "3", "4"]
+                   and all(actual == expected and count == expected_count
+                       for _, actual, expected, count, expected_count in results)
+                   and [program for program, *_ in linked_results] == ["A", "B"]
+                   and all(actual == expected and count == "4" and helper_sum == "54" and helper_count == "4"
+                       for _, minimum, actual, expected, count, helper_sum, helper_count in linked_results)
+                   and len(sampler_results) == 1 and sampler_results[0][1:] == ("68", "4")
+                   and stdout.count("OWNED_D3D12_WORK_GRAPHS_CAPS tier=10 options21_bytes=16") == 1
+                   and "OWNED_D3D12_WORK_GRAPHS_PASS cases=9 tier=1_0" in stdout
+                   and "OWNED_D3D12_WORK_GRAPHS_FAIL" not in stdout + stderr)
+    if args.suite == "view-instancing":
+        # VIEWINST: every case passes in order with exact pixels, Tier 1 statistics count one draw per enabled
+        # view, and the device reports exactly ViewInstancingTier 1.
+        dxil_compiler_loaded = native_compiler_proof
+        cases = re.findall(r"^OWNED_D3D12_VIEW_INSTANCING_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+        statistics = re.findall(r"^OWNED_D3D12_VIEW_INSTANCING_STATISTICS views=(\d) ia_vertices=(\d+) "
+                                r"ia_primitives=(\d+) vs=(\d+) c_invocations=(\d+) c_primitives=(\d+) ps=(\d+)$",
+                                stdout, re.MULTILINE)
+        success = (success and dxil_compiler_loaded and tuple(cases) == VIEW_INSTANCING_CASES
+                   and statistics == [("3", "9", "3", "9", "3", "3", "192"), ("2", "6", "2", "6", "2", "2", "128")]
+                   and f"OWNED_D3D12_VIEW_INSTANCING_PASS cases={len(VIEW_INSTANCING_CASES)} tier=1" in stdout
+                   and "OWNED_D3D12_VIEW_INSTANCING_MISMATCH" not in stderr
+                   and "OWNED_D3D12_VIEW_INSTANCING_FAIL" not in stdout + stderr)
+    if args.suite == "vrs":
+        # VRS: the advertised Tier2 contract must pass every stage, source, viewport and submission case.
+        dxil_compiler_loaded = native_compiler_proof
+        cases = re.findall(r"^OWNED_D3D12_VRS_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+        success = (success and dxil_compiler_loaded and tuple(cases) == VRS_CASES
+                   and "OWNED_D3D12_VRS_COMMON_SUBMISSION_PASS capture=S_OK submission=887a0005 promotion=0" in stdout
+                   and "OWNED_D3D12_VRS_CAPS tier=2 additional=1 tile=8 per_primitive_viewports=1" in stdout
+                   and f"OWNED_D3D12_VRS_PASS cases={len(VRS_CASES)}" in stdout
+                   and "OWNED_D3D12_VRS_MISMATCH" not in stderr
+                   and "OWNED_D3D12_VRS_FAIL" not in stdout + stderr)
+    if args.suite == "sampler-feedback":
+        # FEEDBACK: every case passes in order against the CPU oracle and the device reports SamplerFeedbackTier 1.0.
+        dxil_compiler_loaded = native_compiler_proof
+        cases = re.findall(r"^OWNED_D3D12_SAMPLER_FEEDBACK_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+        success = (success and dxil_compiler_loaded and tuple(cases) == SAMPLER_FEEDBACK_CASES
+                   and f"OWNED_D3D12_SAMPLER_FEEDBACK_PASS cases={len(SAMPLER_FEEDBACK_CASES)} tier=100" in stdout
+                   and "OWNED_D3D12_SAMPLER_FEEDBACK_MISMATCH" not in stderr
+                   and "OWNED_D3D12_SAMPLER_FEEDBACK_FAIL" not in stdout + stderr)
     if args.suite == "stencil-reference":
         dxil_compiler_loaded = native_compiler_proof
         cases = re.findall(r"^STENCIL_REFERENCE_CASE (dxbc|dxil) status=PASS$", stdout, re.MULTILINE)
@@ -1132,7 +1437,19 @@ def run(args: argparse.Namespace) -> int:
                    and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_INVALID_CREATION api=(d3d11|d3d12) "
                                          r"rejected=1 null_output=1", stdout)) == ["d3d11", "d3d12"])
     if args.suite == "stream-output":
-        success = (success and stdout.count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=104") == 1
+        # GS streams 0-3: per-stream slot bytes, BufferFilledSize and SO_STATISTICS_STREAM0..3, DXBC then DXIL
+        # (3 + 3 points; emissions per point: stream 0 one, 1 two, 2 one (never declared), 3 three).
+        gs_streams = [
+            ("gs-streams-0-1", "6,12,0,0", "6,12,0,0", "96,96,0,0"),
+            ("gs-streams-3-split-1", "0,12,0,18", "0,12,0,18", "216,0,72,48"),
+            ("gs-streams-overflow", "6,12,0,5", "6,12,0,18", "96,96,20,40"),
+            ("gs-streams-raster0", "0,12,0,18", "0,12,0,18", "96,72,0,0"),
+        ]
+        found_gs = re.findall(r"^OWNED_D3D12_STREAM_OUTPUT_GS_STREAM_PASS case=([\w-]+) shader=(dxbc|dxil) "
+                              r"written=([\d,]+) needed=([\d,]+) filled=([\d,]+)$", stdout, re.MULTILINE)
+        success = success and found_gs == [(name, shader, *rest) for shader in ("dxbc", "dxil")
+                                           for name, *rest in gs_streams]
+        success = (success and stdout.count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=112") == 1
                    and stdout.count("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=43") == 1
                    and stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS ") == 45
                    and stdout.count("OWNED_D3D12_STREAM_OUTPUT_NO_RASTER_DISTANCE_PASS cases=2") == 1
@@ -1221,7 +1538,7 @@ def run(args: argparse.Namespace) -> int:
         # GSTS: the DXBC matrix always runs; once frozen <suite>-*.dxil inputs exist the DXIL matrix must pass with
         # exactly the DXBC case list.
         prefix = SUITE_PREFIXES[args.suite]
-        matrix_cases = {"geometry": 41, "tessellation": 146}[args.suite]
+        matrix_cases = {"geometry": 87, "tessellation": 166}[args.suite]
         dxil_frozen = (args.dxil_dir / f"{args.suite}-vs_pass.dxil").exists()
         # A case is identified by its name plus the tessellation domain/partition it ran with.
         case_names = [(shader, name + qualifier) for shader, name, qualifier in re.findall(
@@ -1239,6 +1556,72 @@ def run(args: argparse.Namespace) -> int:
                    and re.findall(rf"^{prefix}_PASS$", stdout, re.MULTILINE) == [f"{prefix}_PASS"]
                    and f"{prefix}_CASE_FAIL" not in stdout + stderr
                    and f"{prefix}_MISMATCH" not in stdout + stderr)
+        mutation_kinds = ["gs", "stripcut", "adjacency"] if args.suite == "geometry" else ["ts", "tsgs"]
+        mutation_cases = [f"indirect-mutation-{kind}{suffix}" for kind in mutation_kinds for suffix in ("", "-so")]
+        if args.suite == "tessellation":
+            mutation_cases += ["indirect-mutation-ts-so-no-raster", "indirect-mutation-ts-so-overflow",
+                               "indirect-mutation-ts-so-no-raster-overflow",
+                               "ds-so-fractional-tri-order", "ds-so-fractional-quad-order",
+                               "ds-so-isoline-points", "ds-so-isoline-lines"]
+            domain_so = re.findall(rf"^{prefix}_DOMAIN_SO shader=(dxbc|dxil) case=([\w-]+) bytes=(\d+) "
+                                   rf"written=(\d+) needed=(\d+) ds=(\d+) c=(\d+) ps=(\d+)$",
+                                   stdout, re.MULTILINE)
+            expected_domain_so = [(shader, "indirect-mutation-ts-so" + suffix, size, written, "2", "6", clip, ps)
+                                  for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+                                  for suffix, size, written, clip, ps in (
+                                      ("", "192", "2", "2", "2"),
+                                      ("-no-raster", "192", "2", "0", "0"),
+                                      ("-overflow", "96", "1", "2", "2"),
+                                      ("-no-raster-overflow", "96", "1", "0", "0"))]
+            success = success and sorted(domain_so) == sorted(expected_domain_so)
+        success = success and all(dxbc_cases.count(case) == 1 for case in mutation_cases)
+        if args.suite == "geometry":
+            # GS streams 0-3: per-stream written/needed counters, GSPrimitives over every stream and the clipper
+            # count of the rasterized stream, for both shader kinds.
+            multi_stream = [
+                ("so-streams2-raster0", "2,4,0,0", "2,4,0,0", "6", "2"),
+                ("so-streams2-raster1", "2,4,0,0", "2,4,0,0", "6", "4"),
+                ("so-streams4-raster2", "2,4,6,8", "2,4,6,8", "20", "6"),
+                ("so-streams4-no-raster", "2,4,6,8", "2,4,6,8", "20", "0"),
+                ("so-streams4-overflow", "2,3,6,5", "2,4,6,8", "20", "8"),
+                # ExecuteIndirect: two GPU-counted commands of both points append in API order.
+                ("so-streams2-indirect", "4,8,0,0", "4,8,0,0", "12", "8"),
+                ("so-streams4-indirect-overflow", "4,3,8,5", "4,8,12,16", "40", "16"),
+            ]
+            found = re.findall(rf"^{prefix}_CASE_PASS shader=(dxbc|dxil) case=(so-streams[\w-]+) written=([\d,]+) "
+                               rf"needed=([\d,]+) gs=(\d+) c=(\d+)$", stdout, re.MULTILINE)
+            success = success and found == [(shader, *case) for shader in
+                                            (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+                                            for case in multi_stream]
+            # MSAA GS draws with a forced-early-depth PS (claim buffer): PSInvocations of the direct, indirect and
+            # indirect-SO draws with an occluder, and of the direct draw without it, equal the CPU oracle.
+            early = re.findall(rf"^{prefix}_EARLY_DEPTH_STATISTICS shader=(dxbc|dxil) samples=(\d) "
+                               rf"ps=([\d,]+) oracle=([\d,]+)$", stdout, re.MULTILINE)
+            expected_early = [("2", "57,57,57,75", "57,75"), ("4", "71,71,71,95", "71,95"),
+                              ("8", "86,86,86,113", "86,113")]
+            # Indirect GS strips with a cut / triangle strip with adjacency: indirect == direct (filled SO bytes).
+            strips = re.findall(rf"^{prefix}_STRIP_EXPANSION shader=(dxbc|dxil) case=([\w-]+) .* "
+                                rf"filled=(\d+)/(\d+)$", stdout, re.MULTILINE)
+            expected_strips = [("indirect-strip-cut", "0", "0"), ("indirect-strip-cut-so", "2304", "2304"),
+                               ("indirect-triadj-strip", "0", "0"), ("indirect-triadj-strip-so", "1920", "1920")]
+            shaders = ("dxbc", "dxil") if dxil_frozen else ("dxbc",)
+            success = (success
+                       and early == [(shader, *case) for shader in shaders for case in expected_early]
+                       and strips == [(shader, *case) for shader in shaders for case in expected_strips])
+        if args.suite == "tessellation":
+            # MSAA HS/DS and HS/DS/GS draws with a forced-early-depth PS (claim buffer): direct and indirect
+            # PSInvocations equal the CPU oracle at 2x/4x/8x.
+            early = re.findall(rf"^{prefix}_EARLY_DEPTH_STATISTICS shader=(dxbc|dxil) case=([\w-]+) "
+                               rf"ps=([\d,]+) oracle=(\d+) c=(\d+)$", stdout, re.MULTILINE)
+            expected_early = [("ds-early-depth-msaa2", "269,269", "269", "4"),
+                              ("tsgs-early-depth-msaa2", "538,538", "538", "8"),
+                              ("ds-early-depth-msaa4", "287,287", "287", "4"),
+                              ("tsgs-early-depth-msaa4", "574,574", "574", "8"),
+                              ("ds-early-depth-msaa8", "301,301", "301", "4"),
+                              ("tsgs-early-depth-msaa8", "602,602", "602", "8")]
+            success = success and early == [(shader, *case) for shader in
+                                             (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+                                             for case in expected_early]
     if args.suite == "indexed-restart":
         dxil_compiler_loaded = native_compiler_proof
         case_passes = re.findall(
@@ -1363,7 +1746,58 @@ def run(args: argparse.Namespace) -> int:
                                "procedural_lanes": [int(lane[0]) for lane in
                                                     RAYTRACING_PROCEDURAL_PATTERN.findall(stdout)],
                                "failures": raytracing_failures_found}
+        contract_cases = tuple(re.findall(r"^OWNED_D3D12_RAYTRACING_CASE ([\w.-]+) status=PASS$", stdout,
+                                          re.MULTILINE))
+        vertex_formats = tuple(re.findall(r"^OWNED_D3D12_RAYTRACING_FORMAT ([\w.-]+) status=PASS$", stdout,
+                                          re.MULTILINE))
+        raytracing_evidence["contract_cases"] = list(contract_cases)
+        raytracing_evidence["vertex_formats"] = list(vertex_formats)
+        as_cases = tuple(re.findall(r"^RAYTRACING_AS case=([\w-]+) failures=0 status=PASS$",
+                                    stdout, re.MULTILINE))
+        raytracing_evidence["as_cases"] = list(as_cases)
+        success = (success and as_cases == RAYTRACING_AS_CASES
+                   and stdout.count("RAYTRACING_AS_SUMMARY cases=16 failures=0") == 1
+                   and not re.search(r"^RAYTRACING_AS .*status=FAIL$", stdout, re.MULTILINE)
+                   and "RAYTRACING_AS FAIL" not in stderr)
+        # Inline RayQuery: every stage's 24 lanes compared word by word by the fixture.
+        rayquery_cases = tuple(re.findall(r"^OWNED_D3D12_RAYTRACING_RAYQUERY_CASE ([\w-]+) lanes=24 status=PASS$",
+                                          stdout, re.MULTILINE))
+        raytracing_evidence["rayquery_cases"] = list(rayquery_cases)
+        coverage_cases = tuple(re.findall(r"^OWNED_D3D12_RAYTRACING_COVERAGE_CASE ([\w-]+) status=PASS$",
+                                          stdout, re.MULTILINE))
+        coverage_features = tuple((name, int(lanes)) for name, lanes in re.findall(
+            r"^OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE ([\w-]+) lanes=(\d+) status=PASS$", stdout, re.MULTILINE))
+        coverage_predication = tuple((name, int(flag)) for name, flag in re.findall(
+            r"^OWNED_D3D12_RAYTRACING_COVERAGE_PREDICATION ([\w-]+) culled=(\d) status=PASS$", stdout, re.MULTILINE))
+        coverage_bundle = tuple((name, int(flag)) for name, flag in re.findall(
+            r"^OWNED_D3D12_RAYTRACING_COVERAGE_BUNDLE ([\w-]+) culled=(\d) status=PASS$", stdout, re.MULTILINE))
+        raytracing_evidence["coverage_cases"] = list(coverage_cases)
+        raytracing_evidence["coverage_features"] = [name for name, _ in coverage_features]
+        raytracing_evidence["coverage_predication"] = [name for name, _ in coverage_predication]
+        raytracing_evidence["coverage_bundle"] = [name for name, _ in coverage_bundle]
+        success = (success and coverage_cases == RAYTRACING_COVERAGE_CASES
+                   and coverage_features == RAYTRACING_COVERAGE_FEATURES
+                   and coverage_predication == RAYTRACING_COVERAGE_PREDICATION
+                   and coverage_bundle == RAYTRACING_COVERAGE_BUNDLE
+                   and "OWNED_D3D12_RAYTRACING_COVERAGE failures=0" in stdout)
+        # Root-argument-changing ExecuteIndirect(DISPATCH_RAYS): per-slot root constants and root UAV.
+        rootargs_cases = tuple(re.findall(
+            r"^OWNED_D3D12_RAYTRACING_ROOTARGS_CASE ([\w-]+) slots=4 status=PASS$", stdout, re.MULTILINE))
+        raytracing_evidence["rootargs_cases"] = list(rootargs_cases)
+        success = (success and rootargs_cases == RAYTRACING_ROOTARGS_CASES
+                   and "OWNED_D3D12_RAYTRACING_ROOTARGS_MISMATCH" not in stderr)
         success = (success and dxil_compiler_loaded and not raytracing_failures_found
+                   and rayquery_cases == RAYTRACING_RAYQUERY_CASES
+                   and "OWNED_D3D12_RAYTRACING_RAYQUERY failures=0" in stdout
+                   and "OWNED_D3D12_RAYTRACING_RAYQUERY_STAGES failures=0" in stdout
+                   and "OWNED_D3D12_RAYTRACING_RAYQUERY_MISMATCH" not in stderr
+                   and contract_cases[:len(RAYTRACING_CONTRACT_CASES)] == RAYTRACING_CONTRACT_CASES
+                   and contract_cases[len(RAYTRACING_CONTRACT_CASES):][:len(RAYTRACING_STATEOBJ_CASES)]
+                   == RAYTRACING_STATEOBJ_CASES
+                   and vertex_formats == RAYTRACING_VERTEX_FORMATS
+                   and "OWNED_D3D12_RAYTRACING_CONTRACT failures=0" in stdout
+                   and "OWNED_D3D12_RAYTRACING_STATEOBJ failures=0" in stdout
+                   and "OWNED_D3D12_RAYTRACING_CASE_MISMATCH" not in stderr
                    and stdout.count(RAYTRACING_PASS_MARKER) == 1)
     if args.suite == "smoke" and args.mode == "present":
         success = success and (stdout.count("present_backbuffer=exact present=ok") == 8

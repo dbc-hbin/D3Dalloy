@@ -320,6 +320,10 @@ public:
 
   CallInst *CreateSetMeshPointSize(Value *Vertex, Value *Size);
 
+  CallInst *CreateSetMeshPrimitiveID(Value *Primitive, Value *ID);
+
+  CallInst *CreateSetMeshPrimitiveCulled(Value *Primitive, Value *Culled);
+
   enum FPUnOp {
     saturate,
     log2,

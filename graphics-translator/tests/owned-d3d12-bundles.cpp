@@ -203,8 +203,8 @@ void testGraphics(ID3D12Device *device) {
   rejectPso("render target write mask");
   desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
   desc.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
-  desc.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_CLEAR;
-  rejectPso("unsupported logic op");
+  desc.BlendState.RenderTarget[0].LogicOp = static_cast<D3D12_LOGIC_OP>(16);
+  rejectPso("logic op out of range");
   desc.BlendState.RenderTarget[0].LogicOpEnable = FALSE;
   desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
   desc.BlendState.RenderTarget[0].SrcBlend = static_cast<D3D12_BLEND>(UINT_MAX);

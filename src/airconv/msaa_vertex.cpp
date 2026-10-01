@@ -1,5 +1,6 @@
 #include "msaa_vertex.hpp"
 
+#include "airconv_context.hpp"
 #include "air_signature.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
@@ -10,6 +11,8 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
+
+#include <functional>
 
 using namespace llvm;
 
@@ -244,9 +247,18 @@ Value *expandedLine(IRBuilder<> &b, Value *encoded, Value *records, Value *indic
     if (cast<MDString>(field->getOperand(0))->getString() == "air.viewport_array_index")
       viewport = b.CreateExtractValue(a, i);
   }
+  // View instance location (MSAAPrimitiveBoundsParams::view_*): the replay pipeline's amplification mapping adds
+  // the offset to the emitted index (out of range -> 0), so emit the shader's index unchanged and expand the line
+  // in the effective viewport.
+  Value *viewOffsets = b.CreateICmpNE(loadBound(142), b.getInt32(0));
+  Value *rawViewport = viewport;
+  Value *offsetViewport = b.CreateAdd(viewport, loadBound(140));
+  offsetViewport = b.CreateSelect(b.CreateICmpULT(offsetViewport, viewportCount), offsetViewport, b.getInt32(0));
+  viewport = b.CreateSelect(viewOffsets, offsetViewport, viewport);
   viewport = b.CreateSelect(b.CreateICmpULT(viewport, viewportCount), viewport,
                             b.CreateSub(viewportCount, b.getInt32(1)));
   viewport = b.CreateSelect(b.CreateICmpULT(viewport, b.getInt32(16)), viewport, b.getInt32(0));
+  Value *emittedViewport = b.CreateSelect(viewOffsets, rawViewport, viewport);
   Value *viewportOffset = b.CreateAdd(b.CreateMul(viewport, b.getInt32(4)), b.getInt32(12));
   Value *floats = b.CreateBitCast(bounds, PointerType::get(b.getFloatTy(), unsigned(air::AddressSpace::constant)));
   auto vp = [&](unsigned index) -> Value * {
@@ -320,7 +332,7 @@ Value *expandedLine(IRBuilder<> &b, Value *encoded, Value *records, Value *indic
     Value *field = nullptr;
     auto *kind = cast<MDString>(cast<MDTuple>(outputs->getOperand(i))->getOperand(0));
     if (i == positionField) field = position;
-    else if (kind->getString() == "air.viewport_array_index") field = viewport;
+    else if (kind->getString() == "air.viewport_array_index") field = emittedViewport;
     else if (flat(options, *cast<MDNode>(outputs->getOperand(i))))
       field = b.CreateExtractValue(a, i);
     else {
@@ -351,16 +363,199 @@ Value *expandedLine(IRBuilder<> &b, Value *encoded, Value *records, Value *indic
   return result;
 }
 
+constexpr unsigned kConservativeClipVectors = 6;
+
+/*
+ * Conservative triangle replay (SM50_SHADER_D3D12_CONSERVATIVE_RASTER). `encoded` = 16 * slot + corner of a
+ * 24-word slot (18 fan corners, then the 3 original ordinals in D3D order). dxmt.conservative.corner returns the
+ * affine plane weights of the corner and dxmt.conservative.corner_position its clip position
+ * (air_conservative.metal); every other output is the affine combination of the three captured outputs, so
+ * perspective-correct native interpolation is the exact plane extrapolation. Flat and integral outputs keep the
+ * leading vertex. The primitive's clip positions, clip distances and flags are flat
+ * outputs for msaa_gather_conservative_depth.
+ */
+Value *expandedConservative(IRBuilder<> &b, Value *encoded, Value *records, Value *indices,
+                            Value *bounds, StructType *native, StructType *resultType,
+                            unsigned positionField, MDTuple *outputs, unsigned stride,
+                            const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &options) {
+  Module &module = *b.GetInsertBlock()->getModule();
+  Value *slot = b.CreateUDiv(encoded, b.getInt32(16));
+  Value *corner = b.CreateURem(encoded, b.getInt32(16));
+  Value *indexBase = b.CreateMul(b.CreateZExt(slot, b.getInt64Ty()), b.getInt64(24));
+  Value *captured[3];
+  for (unsigned v = 0; v < 3; ++v) {
+    Value *ordinal = b.CreateLoad(b.getInt32Ty(), b.CreateGEP(b.getInt32Ty(), indices,
+      b.CreateAdd(indexBase, b.getInt64(18 + v))));
+    Value *word = b.CreateMul(b.CreateZExt(ordinal, b.getInt64Ty()), b.getInt64(stride));
+    captured[v] = b.CreateAlignedLoad(native, b.CreateBitCast(b.CreateGEP(b.getInt32Ty(), records, word),
+      PointerType::get(native, unsigned(air::AddressSpace::device))), Align(4));
+  }
+  Value *p[3];
+  for (unsigned v = 0; v < 3; ++v) p[v] = b.CreateExtractValue(captured[v], positionField);
+  // Viewport of the leading vertex, as msaa_primitive_bounds selects it (view-instance offset included).
+  auto loadBound = [&](unsigned index) -> Value * {
+    return b.CreateLoad(b.getInt32Ty(), b.CreateConstGEP1_32(b.getInt32Ty(), bounds, index));
+  };
+  Value *viewportCount = loadBound(5);
+  Value *viewport = b.getInt32(0);
+  for (unsigned i = 0; i < outputs->getNumOperands(); ++i)
+    if (cast<MDString>(cast<MDTuple>(outputs->getOperand(i))->getOperand(0))->getString() ==
+        "air.viewport_array_index")
+      viewport = b.CreateExtractValue(captured[0], i);
+  Value *viewOffsets = b.CreateICmpNE(loadBound(142), b.getInt32(0));
+  Value *rawViewport = viewport;
+  Value *offsetViewport = b.CreateAdd(viewport, loadBound(140));
+  offsetViewport = b.CreateSelect(b.CreateICmpULT(offsetViewport, viewportCount), offsetViewport, b.getInt32(0));
+  viewport = b.CreateSelect(viewOffsets, offsetViewport, viewport);
+  viewport = b.CreateSelect(b.CreateICmpULT(viewport, viewportCount), viewport,
+                            b.CreateSub(viewportCount, b.getInt32(1)));
+  viewport = b.CreateSelect(b.CreateICmpULT(viewport, b.getInt32(16)), viewport, b.getInt32(0));
+  Value *emittedViewport = b.CreateSelect(viewOffsets, rawViewport, viewport);
+  Value *floats = b.CreateBitCast(bounds, PointerType::get(b.getFloatTy(), unsigned(air::AddressSpace::constant)));
+  Value *viewportRect = UndefValue::get(FixedVectorType::get(b.getFloatTy(), 4));
+  for (unsigned i = 0; i < 4; ++i)
+    viewportRect = b.CreateInsertElement(viewportRect, b.CreateLoad(b.getFloatTy(), b.CreateGEP(b.getFloatTy(),
+      floats, b.CreateAdd(b.CreateAdd(b.CreateMul(viewport, b.getInt32(4)), b.getInt32(12)), b.getInt32(i)))),
+      b.getInt32(i));
+  // Clip distances (native air.clip_distance array) and cull distances (user float4 rows) of every vertex.
+  auto *float4Type = FixedVectorType::get(b.getFloatTy(), 4);
+  SmallVector<Value *, 24> clip(24, ConstantFP::get(b.getFloatTy(), 0));
+  SmallVector<Value *, 24> cull;
+  unsigned clipCount = 0;
+  for (unsigned i = 0; i < outputs->getNumOperands(); ++i) {
+    auto *field = cast<MDTuple>(outputs->getOperand(i));
+    auto kind = cast<MDString>(field->getOperand(0))->getString();
+    auto *name = field->getNumOperands() > 1 ? dyn_cast<MDString>(field->getOperand(1)) : nullptr;
+    if (kind == "air.clip_distance") {
+      auto *type = dyn_cast<ArrayType>(native->getElementType(i));
+      if (!type) continue;
+      clipCount = std::min<unsigned>(type->getNumElements(), 8);
+      for (unsigned v = 0; v < 3; ++v)
+        for (unsigned k = 0; k < clipCount; ++k)
+          clip[v * 8 + k] = b.CreateExtractValue(b.CreateExtractValue(captured[v], i), k);
+    } else if (kind == "air.vertex_output" && name &&
+               name->getString().startswith("user(semantic_sv_culldistance_") &&
+               native->getElementType(i) == float4Type) {
+      for (unsigned c = 0; c < 4; ++c) {
+        Value *outside = b.getTrue();
+        for (unsigned v = 0; v < 3; ++v)
+          outside = b.CreateAnd(outside, b.CreateFCmpOLT(component(b,
+            b.CreateExtractValue(captured[v], i), c), ConstantFP::get(b.getFloatTy(), 0)));
+        cull.push_back(outside);
+      }
+    }
+  }
+  // A culled primitive emits an all-zero corner, which the helper also returns for any rejected primitive.
+  Value *culled = b.getFalse();
+  for (auto *outside : cull) culled = b.CreateOr(culled, outside);
+  // Gather flags: bit 3 depth clipping, bits 4-7 the clip distance count. Corner flags: bit 4 depth clipping.
+  const unsigned flags = (options.depth_clip_enable ? 8u : 0u) | (clipCount << 4);
+  auto *cornerType = FunctionType::get(float4Type, {float4Type, float4Type, float4Type, float4Type, b.getInt32Ty()},
+                                       false);
+  Value *cornerFlags = b.CreateOr(corner, b.getInt32(options.depth_clip_enable ? 16u : 0u));
+  Value *weights = b.CreateCall(module.getOrInsertFunction("dxmt.conservative.corner", cornerType),
+                                {p[0], p[1], p[2], viewportRect, cornerFlags});
+  Value *cornerPosition = b.CreateCall(module.getOrInsertFunction("dxmt.conservative.corner_position", cornerType),
+                                       {p[0], p[1], p[2], viewportRect, cornerFlags});
+  Value *valid = b.CreateAnd(b.CreateNot(culled),
+    b.CreateFCmpOEQ(component(b, weights, 3), ConstantFP::get(b.getFloatTy(), 1)));
+  Value *alpha[3] = {component(b, weights, 0), component(b, weights, 1), component(b, weights, 2)};
+  // Affine combination of the three captured values. Integral (flat) components use the leading vertex.
+  std::function<Value *(Value *, Value *, Value *)> combine = [&](Value *a, Value *c, Value *d) -> Value * {
+    Type *type = a->getType();
+    if (type->isFloatingPointTy() || (type->isVectorTy() && type->getScalarType()->isFloatingPointTy())) {
+      auto weight = [&](Value *w) -> Value * {
+        Value *scalar = b.CreateFPCast(w, type->getScalarType());
+        if (auto *vector = dyn_cast<FixedVectorType>(type))
+          return b.CreateVectorSplat(vector->getNumElements(), scalar);
+        return scalar;
+      };
+      return b.CreateFAdd(b.CreateFAdd(b.CreateFMul(a, weight(alpha[0])), b.CreateFMul(c, weight(alpha[1]))),
+                          b.CreateFMul(d, weight(alpha[2])));
+    }
+    if (auto *array = dyn_cast<ArrayType>(type)) {
+      Value *out = UndefValue::get(type);
+      for (unsigned i = 0; i < array->getNumElements(); ++i)
+        out = b.CreateInsertValue(out, combine(b.CreateExtractValue(a, i), b.CreateExtractValue(c, i),
+                                               b.CreateExtractValue(d, i)), i);
+      return out;
+    }
+    return a;
+  };
+  Value *result = UndefValue::get(resultType);
+  Value *outside = ConstantVector::get({ConstantFP::get(b.getFloatTy(), -2),
+    ConstantFP::get(b.getFloatTy(), -2), ConstantFP::get(b.getFloatTy(), 0),
+    ConstantFP::get(b.getFloatTy(), 1)});
+  Value *position = nullptr;
+  for (unsigned i = 0; i < native->getNumElements(); ++i) {
+    auto *kind = cast<MDString>(cast<MDTuple>(outputs->getOperand(i))->getOperand(0));
+    Value *field;
+    if (kind->getString() == "air.viewport_array_index")
+      field = emittedViewport;
+    else if (kind->getString() == "air.clip_distance") {
+      // The exact clip-distance test is part of the coverage polygon; native clipping would cut covered pixels.
+      Type *type = native->getElementType(i);
+      if (auto *array = dyn_cast<ArrayType>(type))
+        field = ConstantArray::get(array, SmallVector<Constant *, 8>(array->getNumElements(),
+          ConstantFP::get(array->getElementType(), 1.0)));
+      else
+        field = ConstantFP::get(type, 1.0);
+    } else if (flat(options, *cast<MDNode>(outputs->getOperand(i))))
+      field = b.CreateExtractValue(captured[0], i);
+    else
+      field = combine(b.CreateExtractValue(captured[0], i), b.CreateExtractValue(captured[1], i),
+                      b.CreateExtractValue(captured[2], i));
+    if (i == positionField) {
+      // Native clipping must not cut the extrapolated plane: depth is clamped by the replay raster state and the
+      // exact depth-clip test is part of the coverage polygon.
+      field = b.CreateSelect(valid, cornerPosition, outside);
+      position = field;
+    }
+    result = b.CreateInsertValue(result, field, i);
+  }
+  unsigned n = native->getNumElements();
+  result = b.CreateInsertValue(result, position, n);
+  result = b.CreateInsertValue(result, b.CreateFDiv(ConstantFP::get(b.getFloatTy(), 1), component(b, position, 3)),
+                               n + 1);
+  result = b.CreateInsertValue(result, b.CreateFDiv(component(b, position, 2), component(b, position, 3)), n + 2);
+  for (unsigned v = 0; v < 3; ++v) result = b.CreateInsertValue(result, p[v], n + 3 + v);
+  for (unsigned r = 0; r < kConservativeClipVectors; ++r) {
+    Value *row = UndefValue::get(float4Type);
+    for (unsigned c = 0; c < 4; ++c) row = b.CreateInsertElement(row, clip[r * 4 + c], b.getInt32(c));
+    result = b.CreateInsertValue(result, row, n + 6 + r);
+  }
+  result = b.CreateInsertValue(result, b.getInt32(flags), n + 6 + kConservativeClipVectors);
+  Value *screen = UndefValue::get(FixedVectorType::get(b.getFloatTy(), 2));
+  for (unsigned axis = 0; axis < 2; ++axis) {
+    Value *ndc = b.CreateFDiv(component(b, position, axis), component(b, position, 3));
+    Value *unit = axis ? b.CreateFSub(ConstantFP::get(b.getFloatTy(), 1), ndc)
+                      : b.CreateFAdd(ndc, ConstantFP::get(b.getFloatTy(), 1));
+    screen = b.CreateInsertElement(screen, b.CreateFAdd(component(b, viewportRect, axis),
+      b.CreateFMul(b.CreateFMul(unit, component(b, viewportRect, axis + 2)),
+        ConstantFP::get(b.getFloatTy(), .5))), b.getInt32(axis));
+  }
+  return b.CreateInsertValue(result, screen, n + 7 + kConservativeClipVectors);
+}
+
+MDNode *conservativeOutput(LLVMContext &context, StringRef name, StringRef type) {
+  return MDTuple::get(context, {
+    MDString::get(context, "air.vertex_output"), MDString::get(context, ("user(" + name + ")").str()),
+    MDString::get(context, "air.arg_type_name"), MDString::get(context, type),
+    MDString::get(context, "air.arg_name"), MDString::get(context, name)
+  });
+}
+
 // Capture stores the exact packed native AIR return, not a reconstruction from
 // DXIL/DXBC registers. Ordinary replay returns it unchanged; line replay clips
 // the original pair and expands it without invoking the application VS again.
-Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &options, bool capture) {
+Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &options, bool capture,
+                bool conservative) {
   if (options.line_mode != SM50_MSAA_LINE_NONE && options.line_mode != SM50_MSAA_LINE_ALIASED &&
       options.line_mode != SM50_MSAA_LINE_ALPHA_AA && options.line_mode != SM50_MSAA_LINE_QUADRILATERAL)
     return invalid("unknown line raster mode");
   if (!capture && options.line_mode != SM50_MSAA_LINE_NONE &&
-      (!options.interpolation || options.interpolation->no_perspective_count > 64 ||
-       options.interpolation->flat_count > 64))
+      (!options.interpolation || options.interpolation->no_perspective_count > 128 ||
+       options.interpolation->flat_count > 128))
     return invalid("line replay requires bounded pixel interpolation metadata");
   NamedMDNode *vertices = module.getNamedMetadata("air.vertex");
   if (!vertices || vertices->getNumOperands() != 1)
@@ -386,6 +581,8 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     .render_target_array_index_offset_dwords = ~0u,
     .clip_distance_offset_dwords = ~0u,
     .cull_distance_offset_dwords = ~0u,
+    .shading_rate_offset_dwords = ~0u,
+    .primitive_id_offset_dwords = ~0u,
   };
   auto *structLayout = module.getDataLayout().getStructLayout(nativeStruct);
   unsigned positionField = ~0u;
@@ -406,13 +603,13 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     if (kind->getString() == "air.position") positionField = i;
     if (kind->getString() == "air.vertex_output") {
       auto *name = field->getNumOperands() > 1 ? dyn_cast<MDString>(field->getOperand(1)) : nullptr;
-      const bool lineUser = options.line_mode != SM50_MSAA_LINE_NONE;
-      const bool distanceUser = capture && name &&
-        (name->getString().startswith("user(semantic_sv_clipdistance_") ||
-         name->getString().startswith("user(semantic_sv_culldistance_"));
-      if (!lineUser && !distanceUser) continue;
-      if (!name || !name->getString().startswith("user(") || layout.user_count == 64)
-        return invalid("captured vertex user output map is malformed or exceeds 64 fields");
+      if (name && name->getString() == "user(dxmt_primitive_id)")
+        layout.primitive_id_offset_dwords = uint32_t(offset / 4);
+      if (name && name->getString() == "user(dxmt_shading_rate)")
+        layout.shading_rate_offset_dwords = uint32_t(offset / 4);
+
+      if (!name || !name->getString().startswith("user(") || layout.user_count == 128)
+        return invalid("captured vertex user output map is malformed or exceeds 128 fields");
       uint64_t size = module.getDataLayout().getTypeStoreSize(nativeStruct->getElementType(i)).getFixedValue();
       if (size > UINT32_MAX)
         return invalid("native vertex user output exceeds the fragment record format");
@@ -421,6 +618,17 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
       user.offset_dwords = uint32_t(offset / 4);
       user.size_bytes = uint32_t(size);
     }
+  }
+  // Native vertex/fragment linkage carries 124 user scalars. Replay also needs six
+  // scalar helpers (clip position, reciprocal W, depth); reserve eight for whole-row
+  // alignment and reconstruct only the rare excess fields from their exact records.
+  uint32_t user_scalars = 0;
+  for (uint32_t i = 0; i < layout.user_count; ++i)
+    user_scalars += (layout.users[i].size_bytes + 3) / 4;
+  for (uint32_t i = layout.user_count; i-- && user_scalars > 116;) {
+    layout.users[i].flags |= 1;
+    ++layout.spill_count;
+    user_scalars -= (layout.users[i].size_bytes + 3) / 4;
   }
   if (layout.position_offset_dwords == ~0u)
     return invalid("rasterizing vertex shader has no position output");
@@ -477,7 +685,8 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
                                                       module.getDataLayout()));
   unsigned boundsArg = ~0u, replayIndicesArg = ~0u;
   const bool line = !capture && options.line_mode != SM50_MSAA_LINE_NONE;
-  if (line) {
+  const bool conservativeTriangles = !capture && !line && conservative;
+  if (line || conservativeTriangles) {
     boundsArg = parameters.size();
     parameters.push_back(PointerType::get(Type::getInt32Ty(context), unsigned(air::AddressSpace::constant)));
     metadata.push_back(air::BuildBufferArgumentMetadata(boundsArg,
@@ -512,10 +721,29 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
       replayFields.push_back(FixedVectorType::get(Type::getFloatTy(context), 2));
       replayFields.push_back(FixedVectorType::get(Type::getFloatTy(context), 2));
     }
+    if (conservativeTriangles) {
+      for (unsigned i = 0; i < 3 + kConservativeClipVectors; ++i)
+        replayFields.push_back(FixedVectorType::get(Type::getFloatTy(context), 4));
+      replayFields.push_back(Type::getInt32Ty(context));
+      replayFields.push_back(FixedVectorType::get(Type::getFloatTy(context), 2));
+    }
   }
   auto *replayReturn = StructType::get(context, replayFields, true);
+  SmallVector<unsigned, 40> keptFields;
+  SmallVector<Type *, 40> compactFields;
+  for (unsigned i = 0; i < replayFields.size(); ++i) {
+    bool spilled = false;
+    if (i < oldOutputs->getNumOperands()) {
+      auto *field = cast<MDNode>(oldOutputs->getOperand(i));
+      auto *name = field->getNumOperands() > 1 ? dyn_cast<MDString>(field->getOperand(1)) : nullptr;
+      if (name) for (uint32_t u = 0; u < layout.user_count; ++u)
+        spilled |= (layout.users[u].flags & 1) && layout.users[u].hash == userHash(name->getString());
+    }
+    if (!spilled) { keptFields.push_back(i); compactFields.push_back(replayFields[i]); }
+  }
+  auto *compactReturn = StructType::get(context, compactFields, true);
   auto *entry = Function::Create(FunctionType::get(capture ? Type::getVoidTy(context)
-                                                          : replayReturn, parameters, false),
+                                                          : compactReturn, parameters, false),
                                  Function::ExternalLinkage, originalName, module);
   entry->setCallingConv(original->getCallingConv());
   auto *first = BasicBlock::Create(context, "entry", entry);
@@ -617,6 +845,10 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
       result = expandedLine(builder, ordinal, records, entry->getArg(replayIndicesArg),
                             entry->getArg(boundsArg), nativeStruct, replayReturn,
                             positionField, oldOutputs, stride, options);
+    } else if (conservativeTriangles) {
+      result = expandedConservative(builder, ordinal, records, entry->getArg(replayIndicesArg),
+                                    entry->getArg(boundsArg), nativeStruct, replayReturn,
+                                    positionField, oldOutputs, stride, options);
     } else {
       auto *value = builder.CreateAlignedLoad(original->getReturnType(), record, Align(4));
       result = UndefValue::get(replayReturn);
@@ -652,7 +884,10 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
       result = builder.CreateInsertValue(result, builder.CreateSelect(nonfinite,
         Constant::getNullValue(type), raw), i);
     }
-    builder.CreateRet(result);
+    Value *compact = UndefValue::get(compactReturn);
+    for (unsigned i = 0; i < keptFields.size(); ++i)
+      compact = builder.CreateInsertValue(compact, builder.CreateExtractValue(result, keptFields[i]), i);
+    builder.CreateRet(compact);
     auto *clipOutput = MDTuple::get(context, {
       MDString::get(context, "air.vertex_output"), MDString::get(context, "user(msaa_clip_position)"),
       MDString::get(context, "air.arg_type_name"), MDString::get(context, "float4"),
@@ -676,7 +911,21 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
       extra.push_back(lineOutput(context, "msaa_line_depth_pair"));
       extra.push_back(lineOutput(context, "msaa_carrier_screen"));
     }
-    vertices->setOperand(0, entryMetadata(*entry, *oldMetadata, metadata, true, extra));
+    if (conservativeTriangles) {
+      for (const char *name : {"msaa_conservative_p0", "msaa_conservative_p1", "msaa_conservative_p2",
+                               "msaa_conservative_clip0", "msaa_conservative_clip1", "msaa_conservative_clip2",
+                               "msaa_conservative_clip3", "msaa_conservative_clip4", "msaa_conservative_clip5"})
+        extra.push_back(conservativeOutput(context, name, "float4"));
+      extra.push_back(conservativeOutput(context, "msaa_conservative_flags", "uint"));
+      extra.push_back(conservativeOutput(context, "msaa_carrier_screen", "float2"));
+    }
+    auto *finalMetadata = entryMetadata(*entry, *oldMetadata, metadata, true, extra);
+    auto *fullOutputs = cast<MDNode>(finalMetadata->getOperand(1));
+    SmallVector<Metadata *, 40> compactOutputs;
+    for (unsigned i : keptFields) compactOutputs.push_back(fullOutputs->getOperand(i));
+    SmallVector<Metadata *, 8> finalFields(finalMetadata->op_begin(), finalMetadata->op_end());
+    finalFields[1] = MDTuple::get(context, compactOutputs);
+    vertices->setOperand(0, MDTuple::get(context, finalFields));
     original->dropAllReferences();
     original->eraseFromParent();
   }
@@ -687,11 +936,16 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
 
 } // namespace
 
-Error transformVertex(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &options) {
+Error transformVertex(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &options, bool conservative) {
   if (options.variant == SM50_MSAA_VERTEX_CAPTURE)
-    return transform(module, options, true);
-  if (options.variant == SM50_MSAA_VERTEX_REPLAY)
-    return transform(module, options, false);
+    return transform(module, options, true, false);
+  if (options.variant == SM50_MSAA_VERTEX_REPLAY) {
+    if (auto error = transform(module, options, false, conservative))
+      return error;
+    if (conservative && options.line_mode == SM50_MSAA_LINE_NONE)
+      linkConservative(module);
+    return Error::success();
+  }
   return invalid("unknown vertex variant");
 }
 

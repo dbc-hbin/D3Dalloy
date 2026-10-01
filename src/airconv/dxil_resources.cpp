@@ -50,6 +50,7 @@
 
 #include <functional>
 
+#include "airconv_context.hpp"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -99,6 +100,10 @@ enum Opcode : uint32_t {
   kRawBufferLoad = 139,
   kRawBufferStore = 140,
   kCreateHandleForLib = 160,
+  kWriteSamplerFeedback = 174,
+  kWriteSamplerFeedbackBias = 175,
+  kWriteSamplerFeedbackLevel = 176,
+  kWriteSamplerFeedbackGrad = 177,
   kAnnotateHandle = 216,
   kCreateHandleFromBinding = 217,
   kTextureGatherRaw = 223,
@@ -108,6 +113,8 @@ enum Opcode : uint32_t {
   kSampleCmpGrad = 254,
   kSampleCmpBias = 255,
   kCreateHandleFromHeap = 218,
+  /* Its structure handle is resolved here; the query itself is LowerRayQueries' (dxil_rt_query.cpp). */
+  kRayQueryTraceRayInline = 179,
 };
 
 /* DxilResourceProperties dword 0 (DirectXShaderCompiler DxilResourceProperties.h). */
@@ -153,6 +160,10 @@ HeapUsageOfOpcode(uint32_t opcode) {
   case 70: /* BufferUpdateCounter */
   case 78: /* AtomicBinOp */
   case 79: /* AtomicCompareExchange */
+  case 174: /* WriteSamplerFeedback* (the feedback map is arg 1) */
+  case 175:
+  case 176:
+  case 177:
     usage.read = usage.written = true;
     break;
   default:
@@ -189,7 +200,9 @@ enum Slot : unsigned {
   kSlotAux = 1,
   kSlotMetadata = 2,
   kSlotCounter = 3,
-  kSlotCount = 4,
+  /* Texture SRV view range / sampler LOD range words (sampler feedback only). */
+  kSlotExtra = 4,
+  kSlotCount = 5,
 };
 
 using SlotArray = std::array<llvm::Value *, kSlotCount>;
@@ -232,8 +245,6 @@ IsTextureKind(ResourceKind kind) {
   case ResourceKind::TextureCubeArray:
   case ResourceKind::TypedBuffer:
   case ResourceKind::TBuffer:
-  case ResourceKind::FeedbackTexture2D:
-  case ResourceKind::FeedbackTexture2DArray:
     return true;
   default:
     return false;
@@ -395,6 +406,9 @@ private:
   llvm::Error lowerBufferUpdateCounter(llvm::CallInst *call);
   llvm::Error lowerAtomicBinOp(llvm::CallInst *call);
   llvm::Error lowerAtomicCompareExchange(llvm::CallInst *call);
+  /* WriteSamplerFeedback{,Bias,Level,Grad}: dxmt.sampler_feedback.write (air_sampler_feedback.metal). */
+  llvm::Error lowerWriteSamplerFeedback(llvm::CallInst *call, uint32_t opcode);
+  bool uses_sampler_feedback = false;
 
   /* ---- shared helpers ---- */
 
@@ -455,6 +469,7 @@ private:
       llvm::Value *pointer, llvm::function_ref<llvm::Value *(llvm::Value *old)> update
   );
   llvm::Error lowerBarrierByMemoryHandle(llvm::CallInst *call);
+  llvm::Error lowerRayQueryTraceInline(llvm::CallInst *call);
   llvm::Error lowerBufferAtomic64(llvm::CallInst *call, const ResourceHandle &handle, bool compare_exchange);
   llvm::Constant *offsetVector(llvm::air::Texture::ResourceKind kind, const int32_t offsets[3]);
 
@@ -1174,6 +1189,7 @@ ResourceLowering::slotsOf(const ResourceHandle &handle) {
   if (handle.texture) {
     slots[kSlotPrimary] = handle.texture->ResourceHandle;
     slots[kSlotMetadata] = handle.texture->Metadata;
+    slots[kSlotExtra] = handle.texture->ViewRange;
   } else if (handle.buffer) {
     slots[kSlotPrimary] = handle.buffer->Pointer;
     slots[kSlotMetadata] = handle.buffer->Metadata;
@@ -1184,6 +1200,9 @@ ResourceLowering::slotsOf(const ResourceHandle &handle) {
     slots[kSlotPrimary] = handle.sampler->SamplerHandle;
     slots[kSlotAux] = handle.sampler->CubeSamplerHandle;
     slots[kSlotMetadata] = handle.sampler->Metadata;
+    slots[kSlotExtra] = handle.sampler->LodRange;
+  } else if (handle.acceleration_structure) {
+    slots[kSlotPrimary] = handle.acceleration_structure->GpuVA;
   }
   slots[kSlotCounter] = handle.counter;
   return slots;
@@ -1195,6 +1214,7 @@ ResourceLowering::rebuild(const ResourceHandle &model, const SlotArray &slots) {
   if (result.texture) {
     result.texture->ResourceHandle = slots[kSlotPrimary];
     result.texture->Metadata = slots[kSlotMetadata];
+    result.texture->ViewRange = slots[kSlotExtra];
   } else if (result.buffer) {
     result.buffer->Pointer = slots[kSlotPrimary];
     result.buffer->Metadata = slots[kSlotMetadata];
@@ -1205,6 +1225,9 @@ ResourceLowering::rebuild(const ResourceHandle &model, const SlotArray &slots) {
     result.sampler->SamplerHandle = slots[kSlotPrimary];
     result.sampler->CubeSamplerHandle = slots[kSlotAux];
     result.sampler->Metadata = slots[kSlotMetadata];
+    result.sampler->LodRange = slots[kSlotExtra];
+  } else if (result.acceleration_structure) {
+    result.acceleration_structure->GpuVA = slots[kSlotPrimary];
   }
   result.counter = slots[kSlotCounter];
   return result;
@@ -2297,6 +2320,24 @@ ResourceLowering::atomicLockTable() {
  * (a superset of the one resource); semantics 1 group sync, 2 group scope, 4 device
  * scope, 8 reorder scope (no memory effect).
  */
+/*
+ * dx.op.rayQuery_TraceRayInline(i32, i32 query, %dx.types.Handle structure, ...): the
+ * structure is resolved like any other SRV (root SRV, descriptor table or heap), and the
+ * D3D12 GPU virtual address its descriptor holds replaces the handle; the query is lowered
+ * by LowerRayQueries in LowerOperations.
+ */
+llvm::Error
+ResourceLowering::lowerRayQueryTraceInline(llvm::CallInst *call) {
+  if (call->arg_size() != 13)
+    return createError("dxil: dx.op.rayQuery_TraceRayInline expects 12 operands");
+  auto handle = resolve(call->getArgOperand(2));
+  if (!handle)
+    return handle.takeError();
+  if (handle->kind != ResourceKind::RTAccelerationStructure || !handle->acceleration_structure)
+    return createError("dxil: rayQuery_TraceRayInline's structure is not a RaytracingAccelerationStructure");
+  return RewriteTraceRayInline(*call, handle->acceleration_structure->GpuVA);
+}
+
 llvm::Error
 ResourceLowering::lowerBarrierByMemoryHandle(llvm::CallInst *call) {
   /* The DXIL validator guarantees a UAV handle; the fence does not need its descriptor. */
@@ -3418,6 +3459,125 @@ ResourceLowering::lowerGatherRaw(llvm::CallInst *call) {
 /* ----------------------------------------------------------------------- */
 
 /*
+ * `dx.op.writeSamplerFeedback*(op, feedback, texture, sampler, c0, c1, c2, c3, ...)`:
+ *   174: clamp; 175: bias, clamp; 176: lod; 177: ddx0..2, ddy0..2, clamp.
+ *
+ * The feedback map is bound as a buffer: q0 is its u32 cell array, q1 the layout word
+ * (src/d3d12/d3d12_sampler_feedback.hpp). dxmt.sampler_feedback.write re-establishes the
+ * paired Sample's footprint from the texture SRV (q1 min LOD clamp and array size, q2 view
+ * range) and the sampler words (q2 bias and state flags, q3 MinLOD/MaxLOD), so pixel and
+ * compute stages share one LOD formula. A null map, a null paired texture and a helper
+ * lane record nothing.
+ */
+llvm::Error
+ResourceLowering::lowerWriteSamplerFeedback(llvm::CallInst *call, uint32_t opcode) {
+  auto feedback_handle = resolve(call->getArgOperand(1));
+  if (!feedback_handle)
+    return feedback_handle.takeError();
+  if (feedback_handle->kind != ResourceKind::FeedbackTexture2D &&
+      feedback_handle->kind != ResourceKind::FeedbackTexture2DArray)
+    return createError("dxil: writeSamplerFeedback requires a FeedbackTexture2D handle");
+  auto feedback = bufferDescriptor(*feedback_handle, "writeSamplerFeedback");
+  if (!feedback)
+    return feedback.takeError();
+  auto texture_handle = resolve(call->getArgOperand(2));
+  if (!texture_handle)
+    return texture_handle.takeError();
+  auto texture = textureDescriptor(*texture_handle, "writeSamplerFeedback");
+  if (!texture)
+    return texture.takeError();
+  auto sampler_handle = resolve(call->getArgOperand(3));
+  if (!sampler_handle)
+    return sampler_handle.takeError();
+  if (!sampler_handle->sampler)
+    return createError("dxil: writeSamplerFeedback requires a sampler handle");
+  builder.SetInsertPoint(call);
+
+  auto *i64 = builder.getInt64Ty();
+  auto *f32 = air.getFloatTy();
+  auto *i32 = air.getIntTy();
+  auto operand = [&](unsigned index, float fallback) -> llvm::Value * {
+    auto *value = call->getArgOperand(index);
+    return IsUndefOrPoison(value) ? static_cast<llvm::Value *>(air.getFloat(fallback)) : value;
+  };
+  auto word = [&](llvm::Value *value) -> llvm::Value * {
+    return value ? builder.CreateZExtOrTrunc(value, i64) : static_cast<llvm::Value *>(builder.getInt64(0));
+  };
+
+  llvm::Value *u = operand(4, 0.0f), *v = operand(5, 0.0f);
+  llvm::Value *layer =
+      feedback_handle->kind == ResourceKind::FeedbackTexture2DArray ? operand(6, 0.0f) : air.getFloat(0.0f);
+  llvm::Value *dudx = air.getFloat(0.0f), *dvdx = air.getFloat(0.0f);
+  llvm::Value *dudy = air.getFloat(0.0f), *dvdy = air.getFloat(0.0f);
+  llvm::Value *value = air.getFloat(0.0f);
+  llvm::Value *clamp = air.getFloat(-3.402823466e+38f);
+  uint32_t explicit_level = 0;
+  switch (opcode) {
+  case kWriteSamplerFeedback:
+  case kWriteSamplerFeedbackBias: {
+    if (opcode == kWriteSamplerFeedbackBias) {
+      value = operand(8, 0.0f);
+      clamp = operand(9, -3.402823466e+38f);
+    } else {
+      clamp = operand(8, -3.402823466e+38f);
+    }
+    if (info.stage == Stage::Pixel) {
+      dudx = air.CreateDerivative(u, false);
+      dvdx = air.CreateDerivative(v, false);
+      dudy = air.CreateDerivative(u, true);
+      dvdy = air.CreateDerivative(v, true);
+    } else {
+      auto [dx, dy] = quadGradients(makeVector({u, v}), 2);
+      dudx = builder.CreateExtractElement(dx, uint64_t(0));
+      dvdx = builder.CreateExtractElement(dx, uint64_t(1));
+      dudy = builder.CreateExtractElement(dy, uint64_t(0));
+      dvdy = builder.CreateExtractElement(dy, uint64_t(1));
+    }
+    break;
+  }
+  case kWriteSamplerFeedbackLevel:
+    value = operand(8, 0.0f);
+    explicit_level = 1;
+    break;
+  case kWriteSamplerFeedbackGrad:
+    dudx = operand(8, 0.0f);
+    dvdx = operand(9, 0.0f);
+    dudy = operand(11, 0.0f);
+    dvdy = operand(12, 0.0f);
+    clamp = operand(14, -3.402823466e+38f);
+    break;
+  default:
+    return createError("dxil: internal error, not a writeSamplerFeedback operation");
+  }
+
+  llvm::Value *skip = builder.CreateIsNull(texture->ResourceHandle);
+  if (info.stage == Stage::Pixel) {
+    auto helper = info.module->getOrInsertFunction(
+        "air.simd_is_helper_thread", llvm::FunctionType::get(builder.getInt1Ty(), {}, false));
+    skip = builder.CreateOr(skip, builder.CreateCall(helper));
+  }
+
+  auto *cells_type = i32->getPointerTo(1);
+  auto write = info.module->getOrInsertFunction(
+      "dxmt.sampler_feedback.write",
+      llvm::FunctionType::get(
+          builder.getVoidTy(),
+          {cells_type, i64, i64, i64, i64, i64, f32, f32, f32, f32, f32, f32, f32, f32, f32, i32, i32}, false
+      )
+  );
+  const auto &sampler = *sampler_handle->sampler;
+  builder.CreateCall(
+      write, {builder.CreatePointerCast(feedback->Pointer, cells_type), word(feedback->Metadata),
+              word(sampler.Metadata), word(sampler.LodRange), word(texture->Metadata), word(texture->ViewRange), u, v,
+              layer, dudx, dvdx, dudy, dvdy, value, clamp, air.getInt(explicit_level),
+              builder.CreateZExt(skip, i32)}
+  );
+  uses_sampler_feedback = true;
+  call->eraseFromParent();
+  return llvm::Error::success();
+}
+
+/*
  * A null texture or sampler descriptor must not reach Metal.
  *
  * D3D12 defines a read through a null SRV/UAV as zero and a write as dropped; with
@@ -3532,8 +3692,15 @@ ResourceLowering::lowerCall(llvm::CallInst *call) {
     return lowerAtomicBinOp(call);
   case kAtomicCompareExchange:
     return lowerAtomicCompareExchange(call);
+  case kWriteSamplerFeedback:
+  case kWriteSamplerFeedbackBias:
+  case kWriteSamplerFeedbackLevel:
+  case kWriteSamplerFeedbackGrad:
+    return lowerWriteSamplerFeedback(call, opcode);
   case kBarrierByMemoryHandle:
     return lowerBarrierByMemoryHandle(call);
+  case kRayQueryTraceRayInline:
+    return lowerRayQueryTraceInline(call);
   case kTextureStoreSample:
     /* Metal's texture2d_ms only has access::read (metal_texture: texture2d_ms static_asserts
      * access::read), so WriteableMSAATexturesSupported is not reported. */
@@ -3591,7 +3758,12 @@ ResourceLowering::run() {
         case kBufferUpdateCounter:
         case kAtomicBinOp:
         case kAtomicCompareExchange:
+        case kWriteSamplerFeedback:
+        case kWriteSamplerFeedbackBias:
+        case kWriteSamplerFeedbackLevel:
+        case kWriteSamplerFeedbackGrad:
         case kBarrierByMemoryHandle:
+        case kRayQueryTraceRayInline:
         case kTextureStoreSample:
           worklist.push_back(call);
           break;
@@ -3674,6 +3846,8 @@ ResourceLowering::run() {
   for (auto *declaration : dead_declarations)
     declaration->eraseFromParent();
 
+  if (uses_sampler_feedback)
+    dxmt::linkSamplerFeedback(*info.module);
   return llvm::Error::success();
 }
 

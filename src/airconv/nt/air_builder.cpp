@@ -1700,6 +1700,38 @@ AIRBuilder::CreateSetMeshPointSize(Value *Vertex, Value *Size) {
   return builder.CreateCall(Fn, {getMeshHandle(), Vertex, Size});
 }
 
+CallInst *
+AIRBuilder::CreateSetMeshPrimitiveID(Value *Primitive, Value *ID) {
+  auto &Context = getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{1U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::ArgMemOnly)}}
+  );
+  auto Fn = getModule()->getOrInsertFunction(
+      "air.set_primitive_id_mesh",
+      FunctionType::get(getVoidTy(), {getMeshHandleType(), getIntTy(), getIntTy()}, false), Attrs
+  );
+  return builder.CreateCall(Fn, {getMeshHandle(), Primitive, ID});
+}
+
+CallInst *
+AIRBuilder::CreateSetMeshPrimitiveCulled(Value *Primitive, Value *Culled) {
+  auto &Context = getContext();
+  auto Attrs = AttributeList::get(
+      Context, {{1U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)},
+                {~0U, Attribute::get(Context, Attribute::AttrKind::ArgMemOnly)}}
+  );
+  auto Fn = getModule()->getOrInsertFunction(
+      "air.set_primitive_culled_mesh",
+      FunctionType::get(getVoidTy(), {getMeshHandleType(), getIntTy(), builder.getInt1Ty()}, false), Attrs
+  );
+  return builder.CreateCall(Fn, {getMeshHandle(), Primitive, Culled});
+}
+
 Value *
 AIRBuilder::CreateFPUnOp(FPUnOp Op, Value *Operand, bool FastVariant) {
   static char const *FnNames[] = {

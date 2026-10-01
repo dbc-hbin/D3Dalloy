@@ -226,3 +226,246 @@ __CRT_UUID_DECL(ID3D12GraphicsCommandList9, 0x34ed2808, 0xffe6, 0x4c2b, 0xb1, 0x
 #endif // __ID3D12Device10_INTERFACE_DEFINED__
 
 // ---- end BARRIERS ----
+
+// ---- WORKGRAPH: work graph state objects, ID3D12WorkGraphProperties, ID3D12GraphicsCommandList10 ----
+//
+// Copied from microsoft/DirectX-Headers commit adbd6f3ba40795c46a8d0f33af00bcb57ff0f0a4
+// (include/directx/d3d12.h). The llvm-mingw d3d12.h has none of the work graph declarations;
+// enum values it lacks are dxmt:: constants so no out-of-range enum cast is needed.
+
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+
+#ifndef DXMT_D3D12_WORK_GRAPHS_DECLARED
+#define DXMT_D3D12_WORK_GRAPHS_DECLARED
+
+typedef enum D3D12_WORK_GRAPHS_TIER {
+  D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED = 0,
+  D3D12_WORK_GRAPHS_TIER_1_0 = 10,
+} D3D12_WORK_GRAPHS_TIER;
+typedef enum D3D12_EXECUTE_INDIRECT_TIER {
+  D3D12_EXECUTE_INDIRECT_TIER_1_0 = 10,
+  D3D12_EXECUTE_INDIRECT_TIER_1_1 = 11,
+} D3D12_EXECUTE_INDIRECT_TIER;
+typedef struct D3D12_FEATURE_DATA_D3D12_OPTIONS21 {
+  D3D12_WORK_GRAPHS_TIER WorkGraphsTier;
+  D3D12_EXECUTE_INDIRECT_TIER ExecuteIndirectTier;
+  BOOL SampleCmpGradientAndBiasSupported;
+  BOOL ExtendedCommandInfoSupported;
+} D3D12_FEATURE_DATA_D3D12_OPTIONS21;
+
+typedef struct D3D12_PROGRAM_IDENTIFIER {
+  UINT64 OpaqueData[4];
+} D3D12_PROGRAM_IDENTIFIER;
+
+typedef struct D3D12_NODE_ID {
+  LPCWSTR Name;
+  UINT ArrayIndex;
+} D3D12_NODE_ID;
+
+typedef struct D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS {
+  UINT64 MinSizeInBytes;
+  UINT64 MaxSizeInBytes;
+  UINT SizeGranularityInBytes;
+} D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS;
+
+typedef struct D3D12_NODE_OUTPUT_OVERRIDES {
+  UINT OutputIndex;
+  const D3D12_NODE_ID *pNewName;
+  const BOOL *pAllowSparseNodes;
+  const UINT *pMaxRecords;
+  const UINT *pMaxRecordsSharedWithOutputIndex;
+} D3D12_NODE_OUTPUT_OVERRIDES;
+
+typedef struct D3D12_BROADCASTING_LAUNCH_OVERRIDES {
+  const UINT *pLocalRootArgumentsTableIndex;
+  const BOOL *pProgramEntry;
+  const D3D12_NODE_ID *pNewName;
+  const D3D12_NODE_ID *pShareInputOf;
+  const UINT *pDispatchGrid;
+  const UINT *pMaxDispatchGrid;
+  UINT NumOutputOverrides;
+  const D3D12_NODE_OUTPUT_OVERRIDES *pOutputOverrides;
+} D3D12_BROADCASTING_LAUNCH_OVERRIDES;
+
+/* The coalescing, thread and common-compute override structs share one layout. */
+typedef struct D3D12_COMMON_COMPUTE_NODE_OVERRIDES {
+  const UINT *pLocalRootArgumentsTableIndex;
+  const BOOL *pProgramEntry;
+  const D3D12_NODE_ID *pNewName;
+  const D3D12_NODE_ID *pShareInputOf;
+  UINT NumOutputOverrides;
+  const D3D12_NODE_OUTPUT_OVERRIDES *pOutputOverrides;
+} D3D12_COMMON_COMPUTE_NODE_OVERRIDES;
+typedef D3D12_COMMON_COMPUTE_NODE_OVERRIDES D3D12_COALESCING_LAUNCH_OVERRIDES;
+typedef D3D12_COMMON_COMPUTE_NODE_OVERRIDES D3D12_THREAD_LAUNCH_OVERRIDES;
+
+typedef struct D3D12_SHADER_NODE {
+  LPCWSTR Shader;
+  UINT OverridesType; /* D3D12_NODE_OVERRIDES_TYPE */
+  union {
+    const D3D12_BROADCASTING_LAUNCH_OVERRIDES *pBroadcastingLaunchOverrides;
+    const D3D12_COALESCING_LAUNCH_OVERRIDES *pCoalescingLaunchOverrides;
+    const D3D12_THREAD_LAUNCH_OVERRIDES *pThreadLaunchOverrides;
+    const D3D12_COMMON_COMPUTE_NODE_OVERRIDES *pCommonComputeNodeOverrides;
+  };
+} D3D12_SHADER_NODE;
+
+typedef struct D3D12_NODE {
+  UINT NodeType; /* D3D12_NODE_TYPE */
+  union {
+    D3D12_SHADER_NODE Shader;
+  };
+} D3D12_NODE;
+
+typedef struct D3D12_WORK_GRAPH_DESC {
+  LPCWSTR ProgramName;
+  UINT Flags; /* D3D12_WORK_GRAPH_FLAGS */
+  UINT NumEntrypoints;
+  const D3D12_NODE_ID *pEntrypoints;
+  UINT NumExplicitlyDefinedNodes;
+  const D3D12_NODE *pExplicitlyDefinedNodes;
+} D3D12_WORK_GRAPH_DESC;
+
+typedef struct D3D12_SET_WORK_GRAPH_DESC {
+  D3D12_PROGRAM_IDENTIFIER ProgramIdentifier;
+  UINT Flags; /* D3D12_SET_WORK_GRAPH_FLAGS */
+  D3D12_GPU_VIRTUAL_ADDRESS_RANGE BackingMemory;
+  D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE NodeLocalRootArgumentsTable;
+} D3D12_SET_WORK_GRAPH_DESC;
+
+typedef struct D3D12_SET_PROGRAM_DESC {
+  UINT Type; /* D3D12_PROGRAM_TYPE */
+  union {
+    D3D12_PROGRAM_IDENTIFIER GenericPipeline;
+    D3D12_PROGRAM_IDENTIFIER RaytracingPipeline;
+    D3D12_SET_WORK_GRAPH_DESC WorkGraph;
+  };
+} D3D12_SET_PROGRAM_DESC;
+
+typedef struct D3D12_NODE_CPU_INPUT {
+  UINT EntrypointIndex;
+  UINT NumRecords;
+  const void *pRecords;
+  UINT64 RecordStrideInBytes;
+} D3D12_NODE_CPU_INPUT;
+
+typedef struct D3D12_NODE_GPU_INPUT {
+  UINT EntrypointIndex;
+  UINT NumRecords;
+  D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE Records;
+} D3D12_NODE_GPU_INPUT;
+
+typedef struct D3D12_MULTI_NODE_CPU_INPUT {
+  UINT NumNodeInputs;
+  const D3D12_NODE_CPU_INPUT *pNodeInputs;
+  UINT64 NodeInputStrideInBytes;
+} D3D12_MULTI_NODE_CPU_INPUT;
+
+typedef struct D3D12_MULTI_NODE_GPU_INPUT {
+  UINT NumNodeInputs;
+  D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE NodeInputs;
+} D3D12_MULTI_NODE_GPU_INPUT;
+
+typedef struct D3D12_DISPATCH_GRAPH_DESC {
+  UINT Mode; /* D3D12_DISPATCH_MODE */
+  union {
+    D3D12_NODE_CPU_INPUT NodeCPUInput;
+    D3D12_GPU_VIRTUAL_ADDRESS NodeGPUInput;
+    D3D12_MULTI_NODE_CPU_INPUT MultiNodeCPUInput;
+    D3D12_GPU_VIRTUAL_ADDRESS MultiNodeGPUInput;
+  };
+} D3D12_DISPATCH_GRAPH_DESC;
+
+#endif // DXMT_D3D12_WORK_GRAPHS_DECLARED
+
+namespace dxmt {
+
+constexpr UINT kFeatureD3D12Options21 = 53;
+constexpr UINT kWorkGraphsTier1_0 = 10;
+constexpr UINT kStateObjectTypeExecutable = 4;
+constexpr UINT kStateSubobjectTypeWorkGraph = 13;
+constexpr UINT kWorkGraphFlagIncludeAllAvailableNodes = 0x1;
+constexpr UINT kNodeTypeShader = 0;
+constexpr UINT kNodeOverridesNone = 0;
+constexpr UINT kNodeOverridesBroadcasting = 1;
+constexpr UINT kNodeOverridesCoalescing = 2;
+constexpr UINT kNodeOverridesThread = 3;
+constexpr UINT kNodeOverridesCommonCompute = 4;
+constexpr UINT kProgramTypeWorkGraph = 5;
+constexpr UINT kSetWorkGraphFlagInitialize = 0x1;
+constexpr UINT kDispatchModeNodeCPUInput = 0;
+constexpr UINT kDispatchModeNodeGPUInput = 1;
+constexpr UINT kDispatchModeMultiNodeCPUInput = 2;
+constexpr UINT kDispatchModeMultiNodeGPUInput = 3;
+constexpr UINT kWorkGraphsBackingMemoryAlignment = 8;
+constexpr UINT kWorkGraphsMaxNodeDepth = 32;
+
+} // namespace dxmt
+
+#if defined(__cplusplus) && !defined(CINTERFACE)
+
+#ifndef __ID3D12StateObjectProperties1_INTERFACE_DEFINED__
+#define __ID3D12StateObjectProperties1_INTERFACE_DEFINED__
+MIDL_INTERFACE("460caac7-1d24-446a-a184-ca67db494138")
+ID3D12StateObjectProperties1 : public ID3D12StateObjectProperties {
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+  virtual D3D12_PROGRAM_IDENTIFIER *STDMETHODCALLTYPE GetProgramIdentifier(D3D12_PROGRAM_IDENTIFIER *__ret,
+                                                                          LPCWSTR program_name) = 0;
+#else
+  virtual D3D12_PROGRAM_IDENTIFIER STDMETHODCALLTYPE GetProgramIdentifier(LPCWSTR program_name) = 0;
+#endif
+};
+__CRT_UUID_DECL(ID3D12StateObjectProperties1, 0x460caac7, 0x1d24, 0x446a, 0xa1, 0x84, 0xca, 0x67, 0xdb, 0x49, 0x41,
+                0x38)
+#endif
+
+#ifndef __ID3D12WorkGraphProperties_INTERFACE_DEFINED__
+#define __ID3D12WorkGraphProperties_INTERFACE_DEFINED__
+MIDL_INTERFACE("065acf71-f863-4b89-82f4-02e4d5886757")
+ID3D12WorkGraphProperties : public IUnknown {
+  virtual UINT STDMETHODCALLTYPE GetNumWorkGraphs() = 0;
+  virtual LPCWSTR STDMETHODCALLTYPE GetProgramName(UINT work_graph_index) = 0;
+  virtual UINT STDMETHODCALLTYPE GetWorkGraphIndex(LPCWSTR program_name) = 0;
+  virtual UINT STDMETHODCALLTYPE GetNumNodes(UINT work_graph_index) = 0;
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+  virtual D3D12_NODE_ID *STDMETHODCALLTYPE GetNodeID(D3D12_NODE_ID *__ret, UINT work_graph_index,
+                                                     UINT node_index) = 0;
+#else
+  virtual D3D12_NODE_ID STDMETHODCALLTYPE GetNodeID(UINT work_graph_index, UINT node_index) = 0;
+#endif
+  virtual UINT STDMETHODCALLTYPE GetNodeIndex(UINT work_graph_index, D3D12_NODE_ID node_id) = 0;
+  virtual UINT STDMETHODCALLTYPE GetNodeLocalRootArgumentsTableIndex(UINT work_graph_index, UINT node_index) = 0;
+  virtual UINT STDMETHODCALLTYPE GetNumEntrypoints(UINT work_graph_index) = 0;
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+  virtual D3D12_NODE_ID *STDMETHODCALLTYPE GetEntrypointID(D3D12_NODE_ID *__ret, UINT work_graph_index,
+                                                           UINT entrypoint_index) = 0;
+#else
+  virtual D3D12_NODE_ID STDMETHODCALLTYPE GetEntrypointID(UINT work_graph_index, UINT entrypoint_index) = 0;
+#endif
+  virtual UINT STDMETHODCALLTYPE GetEntrypointIndex(UINT work_graph_index, D3D12_NODE_ID node_id) = 0;
+  virtual UINT STDMETHODCALLTYPE GetEntrypointRecordSizeInBytes(UINT work_graph_index, UINT entrypoint_index) = 0;
+  virtual void STDMETHODCALLTYPE GetWorkGraphMemoryRequirements(
+      UINT work_graph_index, D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS *requirements) = 0;
+  virtual UINT STDMETHODCALLTYPE GetEntrypointRecordAlignmentInBytes(UINT work_graph_index,
+                                                                     UINT entrypoint_index) = 0;
+};
+__CRT_UUID_DECL(ID3D12WorkGraphProperties, 0x065acf71, 0xf863, 0x4b89, 0x82, 0xf4, 0x02, 0xe4, 0xd5, 0x88, 0x67,
+                0x57)
+#endif
+
+#ifndef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
+#define __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
+MIDL_INTERFACE("7013c015-d161-4b63-a08c-238552dd8acc")
+ID3D12GraphicsCommandList10 : public ID3D12GraphicsCommandList9 {
+  virtual void STDMETHODCALLTYPE SetProgram(const D3D12_SET_PROGRAM_DESC *desc) = 0;
+  virtual void STDMETHODCALLTYPE DispatchGraph(const D3D12_DISPATCH_GRAPH_DESC *desc) = 0;
+};
+__CRT_UUID_DECL(ID3D12GraphicsCommandList10, 0x7013c015, 0xd161, 0x4b63, 0xa0, 0x8c, 0x23, 0x85, 0x52, 0xdd, 0x8a,
+                0xcc)
+#endif
+
+#endif // __cplusplus && !CINTERFACE
+
+#endif // __ID3D12Device10_INTERFACE_DEFINED__
+
+// ---- end WORKGRAPH ----

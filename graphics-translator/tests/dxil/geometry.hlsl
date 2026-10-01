@@ -111,3 +111,37 @@ void gs_points(point VSOut input[1], inout PointStream<GSOut> stream) {
 float4 ps_color(GSOut input) : SV_Target {
   return input.color;
 }
+
+// Forced early depth/stencil (PSInvocations under MSAA count once per (pixel, primitive) with a surviving sample).
+[earlydepthstencil]
+float4 ps_early(GSOut input) : SV_Target {
+  return input.color;
+}
+
+// Multi-stream output (point lists only, D3D11.3 13.5.2). Vertex k of stream s sits 2k pixels right and 2s pixels
+// below the input point and records (input id, s, k): stream s emits s + 1 points per input point.
+GSOut stream_point(VSOut v, uint s, uint k) {
+  GSOut o;
+  o.position = v.position + float4(2 * k * kPixel, -2.0 * s * kPixel, 0, 0);
+  o.color = float4(encode(v.id), encode(s), encode(k), 1);
+  return o;
+}
+
+[maxvertexcount(3)]
+void gs_streams2(point VSOut input[1], inout PointStream<GSOut> s0, inout PointStream<GSOut> s1) {
+  s0.Append(stream_point(input[0], 0, 0));
+  [unroll] for (uint k = 0; k < 2; ++k)
+    s1.Append(stream_point(input[0], 1, k));
+}
+
+[maxvertexcount(10)]
+void gs_streams4(point VSOut input[1], inout PointStream<GSOut> s0, inout PointStream<GSOut> s1,
+                 inout PointStream<GSOut> s2, inout PointStream<GSOut> s3) {
+  s0.Append(stream_point(input[0], 0, 0));
+  [unroll] for (uint a = 0; a < 2; ++a)
+    s1.Append(stream_point(input[0], 1, a));
+  [unroll] for (uint b = 0; b < 3; ++b)
+    s2.Append(stream_point(input[0], 2, b));
+  [unroll] for (uint c = 0; c < 4; ++c)
+    s3.Append(stream_point(input[0], 3, c));
+}

@@ -248,6 +248,8 @@ llvm::Error parseSignatureChunk(const ChunkView &chunk, std::vector<SigElement> 
 /* ------------------------------------------------------------------ */
 
 struct MetadataSignatureElement {
+  uint32_t id = 0;
+  std::string name;
   uint32_t interp = 0;
   uint32_t rows = 1;
   uint32_t cols = 1;
@@ -271,6 +273,8 @@ std::vector<MetadataSignatureElement> parseMetadataSignature(llvm::MDNode *list)
     llvm::MDNode *parameter = getNode(list, i);
     MetadataSignatureElement element;
     if (parameter) {
+      element.id = getU32Or(parameter, 0, i);
+      element.name = getString(parameter, 1);
       element.interp = getU32Or(parameter, 5, 0);
       element.rows = getU32Or(parameter, 6, 1);
       element.cols = getU32Or(parameter, 7, 1);
@@ -289,19 +293,18 @@ std::vector<MetadataSignatureElement> parseMetadataSignature(llvm::MDNode *list)
 void applyMetadataSignature(
   const std::vector<MetadataSignatureElement> &metadata, std::vector<SigElement> &signature
 ) {
-  if (metadata.size() != signature.size())
-    return;
-  for (size_t i = 0; i < signature.size(); i++) {
-    const auto &element = metadata[i];
-    signature[i].interp = static_cast<uint8_t>(element.interp);
-    if (element.rows > 0)
-      signature[i].rows = element.rows;
-    if (element.cols > 0 && element.cols <= 4) {
-      signature[i].cols = element.cols;
-      if (element.start_col < 4)
-        signature[i].start_col = element.start_col;
-      if (signature[i].mask == 0)
-        signature[i].mask = ((1u << element.cols) - 1u) << signature[i].start_col;
+  // Container signatures flatten arrays into rows; DXIL instructions address the
+  // original metadata element ID plus a row. Match packing, not list ordinals.
+  for (auto &row : signature) {
+    for (const auto &element : metadata) {
+      if (!llvm::StringRef(row.name).equals_insensitive(element.name)) continue;
+      if (row.start_row != element.start_row &&
+          (row.start_row < element.start_row || row.start_row - element.start_row >= element.rows)) continue;
+      if (row.start_col != element.start_col) continue;
+      row.id = element.id;
+      row.element_row = row.start_row == element.start_row ? 0 : row.start_row - element.start_row;
+      row.interp = static_cast<uint8_t>(element.interp);
+      break;
     }
   }
 }
@@ -480,6 +483,10 @@ OpUsage usageOfOpcode(uint32_t opcode) {
     break;
   case 78: /* AtomicBinOp */
   case 79: /* AtomicCompareExchange */
+  case 174: /* WriteSamplerFeedback (the feedback map is arg 1) */
+  case 175: /* WriteSamplerFeedbackBias */
+  case 176: /* WriteSamplerFeedbackLevel */
+  case 177: /* WriteSamplerFeedbackGrad */
     usage.read = true;
     usage.written = true;
     break;
@@ -772,14 +779,15 @@ llvm::Error extractMetadata(
   readVersion(module, "dx.valver", out.valver_major, out.valver_minor);
 
   llvm::MDNode *entry = selectEntryPoint(module, requested_entry);
-  if (!entry)
+  if (!entry && out.stage != Stage::Library)
     return requested_entry && requested_entry[0]
       ? createError(llvm::Twine("DXIL entry point not found: ") + requested_entry)
       : createError("DXIL module has no entry point");
-  out.entry = llvm::dyn_cast_or_null<llvm::Function>(getValue(entry, 0));
-  if (!out.entry)
+  out.entry = entry ? llvm::dyn_cast_or_null<llvm::Function>(getValue(entry, 0)) :
+      (requested_entry && requested_entry[0] ? module.getFunction(requested_entry) : nullptr);
+  if (!out.entry && (entry || (requested_entry && requested_entry[0])))
     return createError("DXIL entry point does not reference a function");
-  out.entry_name = getString(entry, 1);
+  out.entry_name = entry ? getString(entry, 1) : (requested_entry ? requested_entry : "");
   readThreadGroupSize(getNode(entry, 4), out.num_threads);
   /* [WaveSize(n)] (tag 11) and SM 6.8 [WaveSize(min, max, preferred)] (tag 23): Apple
    * simdgroups are always 32 lanes, so only a declaration that admits 32 compiles. */
@@ -857,6 +865,21 @@ llvm::Error extractMetadata(
         out.hull.output_primitive = getU32Or(state, 5, 0);
         if (auto *factor = llvm::dyn_cast_or_null<llvm::ConstantFP>(getValue(state, 6)))
           out.hull.max_tess_factor = factor->getValueAPF().convertToFloat();
+      } else if (tag == 9 && out.stage == Stage::Mesh) {
+        /* {numthreads, max vertices, max primitives, topology, payload bytes} (kDxilMSStateTag). */
+        if (llvm::MDNode *threads = getNode(state, 0))
+          for (unsigned c = 0; c < 3; c++)
+            out.num_threads[c] = getU32Or(threads, c, 1);
+        out.mesh.max_vertices = getU32Or(state, 1, 0);
+        out.mesh.max_primitives = getU32Or(state, 2, 0);
+        out.mesh.output_topology = getU32Or(state, 3, 0);
+        out.mesh.payload_size = getU32Or(state, 4, 0);
+      } else if (tag == 10 && out.stage == Stage::Amplification) {
+        /* {numthreads, payload bytes} (kDxilASStateTag). */
+        if (llvm::MDNode *threads = getNode(state, 0))
+          for (unsigned c = 0; c < 3; c++)
+            out.num_threads[c] = getU32Or(threads, c, 1);
+        out.mesh.payload_size = getU32Or(state, 1, 0);
       }
     }
   }
@@ -892,9 +915,9 @@ llvm::Error extractMetadata(
     if (auto err = parseSignatureChunk(chunk, out.output_sig))
       return err;
   }
-  /* DXIL containers store the hull/domain patch-constant signature as PSG1 (DXC's
-   * DFCC_PatchConstantSignature); PCSG is the DXBC name. */
-  const bool patch_stage = out.stage == Stage::Hull || out.stage == Stage::Domain;
+  /* DXIL containers store the hull/domain patch-constant signature, and the mesh shader's primitive
+   * output signature, as PSG1 (DXC's DFCC_PatchConstantSignature); PCSG is the DXBC name. */
+  const bool patch_stage = out.stage == Stage::Hull || out.stage == Stage::Domain || out.stage == Stage::Mesh;
   if ((patch_stage && tryFindChunk(bytecode, size, "PSG1", chunk)) ||
       tryFindChunk(bytecode, size, "PCSG", chunk)) {
     if (auto err = parseSignatureChunk(chunk, out.patch_constant_sig))
@@ -921,26 +944,6 @@ llvm::Error extractMetadata(
   applyMetadataSignature(metadata_output, out.output_sig);
   applyMetadataSignature(metadata_patch, out.patch_constant_sig);
 
-  /* Capabilities the device reports as unsupported. SV_ShadingRate is D3D_NAME_SHADINGRATE (24) in the
-   * signature chunks and DXIL::SemanticKind::ShadingRate (29) in the entry metadata. */
-  auto shading_rate = [](const std::vector<SigElement> &sig) {
-    return std::any_of(sig.begin(), sig.end(), [](const SigElement &e) { return e.semantic_kind == 24; });
-  };
-  bool metadata_shading_rate = false;
-  for (unsigned list = 0; signature && list < 3; list++)
-    if (llvm::MDNode *elements = getNode(signature, list))
-      for (unsigned i = 0; i < elements->getNumOperands(); i++)
-        metadata_shading_rate |= getU32Or(getNode(elements, i), 3, 0) == 29;
-  if (metadata_shading_rate || shading_rate(out.input_sig) || shading_rate(out.output_sig))
-    return createError("DXIL SV_ShadingRate is not supported (VariableShadingRateTier is NOT_SUPPORTED)");
-  for (const ResourceBinding &binding : out.resources)
-    if (binding.kind == ResourceKind::FeedbackTexture2D || binding.kind == ResourceKind::FeedbackTexture2DArray)
-      return createError("DXIL sampler feedback is not supported (SamplerFeedbackTier is NOT_SUPPORTED)");
-  /* Inline raytracing: dx.op.allocateRayQuery (178, 258) and the dx.op.rayQuery_* methods (179..215). */
-  for (const llvm::Function &function : module)
-    if (function.isDeclaration() && (function.getName().startswith("dx.op.allocateRayQuery") ||
-                                     function.getName().startswith("dx.op.rayQuery_")))
-      return createError("DXIL inline raytracing (RayQuery) is not supported (RaytracingTier is NOT_SUPPORTED)");
 
   scanUsage(module, out.resources);
   scanOutputWrites(module, out);
@@ -1056,12 +1059,14 @@ ParseMetadata(const void *bytecode, size_t size, const char *entry_name) {
   metadata.output_register_mask = (*info)->output_register_mask;
   metadata.max_output_register = (*info)->max_output_register;
   metadata.has_coverage_output = (*info)->has_coverage_output;
+  metadata.force_early_depth_stencil = (*info)->force_early_depth_stencil;
   metadata.input_sig = std::move((*info)->input_sig);
   metadata.output_sig = std::move((*info)->output_sig);
   metadata.patch_constant_sig = std::move((*info)->patch_constant_sig);
   metadata.geometry = (*info)->geometry;
   metadata.hull = (*info)->hull;
   metadata.domain = (*info)->domain;
+  metadata.mesh = (*info)->mesh;
   metadata.resources = std::move((*info)->resources);
   return metadata;
 }

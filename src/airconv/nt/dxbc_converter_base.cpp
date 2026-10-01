@@ -2922,7 +2922,9 @@ void
 Converter::operator()(const InstInterpolateOffset &eval) {
   auto Offset = LoadOperand(eval.offset, kMaskVecXY);
   // Truncate to the D3D signed [-8, 7] sixteenth-pixel offset domain.
-  auto Truncated = ir.CreateAnd(ir.CreateAdd(Offset, air.getInt2(8, 8)), air.getInt2(0b1111, 0b1111));
+  llvm::Value *Truncated = ir.CreateAdd(Offset, air.getInt2(8, 8));
+  if (!ir.GetInsertBlock()->getModule()->getModuleFlag("dxmt.coarse.snapped"))
+    Truncated = ir.CreateAnd(Truncated, air.getInt2(0b1111, 0b1111));
   // D3D offsets are center-relative; Metal's interpolate_at_offset uses the pixel corner.
   auto OffsetFloat = ir.CreateFMul(air.CreateConvertToFloat(Truncated), air.getFloat2(1.0f / 16.0f, 1.0f / 16.0f));
   auto Value = InterpolateRegister(eval.regid, InterpolationLocation::Offset, OffsetFloat);
@@ -2967,14 +2969,14 @@ Converter::operator()(const InstMaskedSumOfAbsDiff &msad) {
 }
 
 void
-Converter::operator()(const InstEmit &) {
-  if (res.call_emit().build(ctx).takeError()) {
+Converter::operator()(const InstEmit &emit) {
+  if (res.call_emit(emit.stream).build(ctx).takeError()) {
     // TODO
   }
 }
 void
-Converter::operator()(const InstCut &) {
-  if (res.call_cut().build(ctx).takeError()) {
+Converter::operator()(const InstCut &cut) {
+  if (res.call_cut(cut.stream).build(ctx).takeError()) {
     // TODO
   }
 }

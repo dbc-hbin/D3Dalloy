@@ -22,6 +22,7 @@
 #include <metal_texture>
 #include <metal_math>
 #include "dxmt_command_constants.hpp"
+#include "../airconv/shaders/conservative_polygon.h"
 
 using namespace metal;
 using namespace dxmt;
@@ -163,6 +164,9 @@ struct DXMTMSAATile {
   uint primitive_id;
   uint primitive_slot;
   float viewport_origin_x, viewport_origin_y, viewport_width, viewport_height;
+  uint output_mask, sample_base;
+  uint shading_rate;
+  uint shading_rate_image_width, shading_rate_image_height;
 };
 
 struct DXMTMSAAPixelLayout {
@@ -192,17 +196,23 @@ inline uint4 msaa_coverage_read(texture2d<uint, access::read> coverage, uint2 xy
 template<typename Coverage>
 inline DXMTMSAAQueryCoverage msaa_query_coverage_impl(
     float4 position, uint sample, constant DXMTMSAATile &tile,
-    constant DXMTMSAAPixelLayout &layout, device const uint *outputs, Coverage coverage) {
+    constant DXMTMSAAPixelLayout &layout, device const uint *outputs, Coverage coverage,
+    device const uint *inputs) {
   const uint2 xy = uint2(position.xy);
   if (xy.x < tile.x || xy.y < tile.y || xy.x >= tile.x + 8 ||
-      xy.y >= tile.y + 8 || sample >= tile.sample_count) return {0};
+      xy.y >= tile.y + 8 || sample >= min(tile.sample_count, 8u)) return {0};
   const uint2 local = xy - uint2(tile.x, tile.y);
   const device uint *record = outputs + (local.y * 8 + local.x) * layout.output_record_dwords;
-  // For a 1x RTV only output sample zero enables an OM write. D3D permits
-  // either zero or full raster coverage when every output sample is masked;
-  // consistently choose zero as recommended by the functional spec.
-  const bool writes = (tile.sample_mask & 1u) && record[0] && (record[1] & 1u);
-  return {writes && msaa_coverage_read(coverage, xy, sample).x ? 1u << sample : 0u};
+  // Writes are enabled when any output sample in SampleMask & the PS coverage output survives (tile.output_mask
+  // holds SampleMask restricted to the RTV samples). D3D permits either zero or full raster coverage when every
+  // output sample is masked; consistently choose zero as recommended by the functional spec.
+  const bool writes = record[0] && (record[1] & tile.output_mask);
+  // Split 16x: the coverage texture holds only the last half; the input record has the logical union.
+  const bool covered = tile.sample_count > 8
+      ? ((inputs[(local.y * 8 + local.x) * layout.input_record_dwords + layout.input_coverage_dword] &
+          tile.sample_mask) >> (sample + tile.sample_base)) & 1u
+      : msaa_coverage_read(coverage, xy, sample).x != 0;
+  return {writes && covered ? 1u << sample : 0u};
 }
 
 [[fragment]] DXMTMSAAQueryCoverage msaa_query_coverage(
@@ -210,8 +220,9 @@ inline DXMTMSAAQueryCoverage msaa_query_coverage_impl(
     constant DXMTMSAATile &tile [[buffer(23)]],
     constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
     device const uint *outputs [[buffer(22)]],
+    device const uint *inputs [[buffer(21)]],
     texture2d_ms<uint, access::read> coverage [[texture(24)]]) {
-  return msaa_query_coverage_impl(position, sample, tile, layout, outputs, coverage);
+  return msaa_query_coverage_impl(position, sample, tile, layout, outputs, coverage, inputs);
 }
 
 [[fragment]] DXMTMSAAQueryCoverage msaa_query_coverage_single(
@@ -219,8 +230,9 @@ inline DXMTMSAAQueryCoverage msaa_query_coverage_impl(
     constant DXMTMSAATile &tile [[buffer(23)]],
     constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
     device const uint *outputs [[buffer(22)]],
+    device const uint *inputs [[buffer(21)]],
     texture2d<uint, access::read> coverage [[texture(24)]]) {
-  return msaa_query_coverage_impl(position, sample, tile, layout, outputs, coverage);
+  return msaa_query_coverage_impl(position, sample, tile, layout, outputs, coverage, inputs);
 }
 
 struct DXMTMSAAMarker {
@@ -296,37 +308,47 @@ inline DXMTMSAAMarker msaa_gather_depth_impl(
     float4 position, float center, thread const float *sample_depths,
     float2 line_start, float2 line_end, uint native_coverage,
     constant DXMTMSAATile &tile, constant DXMTMSAAPixelLayout &layout,
-    device uint *records) {
+    device uint *records, bool conservative = false, bool conservative_covered = false) {
   const uint2 xy = uint2(position.xy) - uint2(tile.x, tile.y);
   const uint pixel = xy.y * 8 + xy.x;
+  // ForcedSampleCount 16 gathers in two native 8x halves: native sample s is logical sample s + base.
+  const uint native_count = min(tile.sample_count, 8u);
+  const uint base = tile.sample_count > 8 ? tile.sample_base : 0u;
+  const uint logical_full = tile.sample_count >= 32 ? ~0u : (1u << tile.sample_count) - 1u;
   const float alpha = layout.line_mode == 2
       ? dxmt_line_alpha_area(line_start, line_end, floor(position.xy)) : 1.0f;
-  const uint geometric = layout.line_mode == 1
-      ? (dxmt_line_diamond_exit(line_start, line_end, floor(position.xy) + 0.5f)
-             ? (1u << tile.sample_count) - 1u : 0u)
-      : layout.line_mode == 2 ? (alpha > 0.0f ? (1u << tile.sample_count) - 1u : 0u)
-      : native_coverage;
-  const uint coverage = geometric & tile.sample_mask;
+  // Conservative rasterization covers every sample of a rasterized pixel (the replay geometry covers them all).
+  const uint geometric = conservative ? (conservative_covered ? logical_full : 0u)
+      : layout.line_mode == 1
+      ? (dxmt_line_diamond_exit(line_start, line_end, floor(position.xy) + 0.5f) ? logical_full : 0u)
+      : layout.line_mode == 2 ? (alpha > 0.0f ? logical_full : 0u)
+      : native_coverage << base;
+  const uint coverage = ((geometric & tile.sample_mask) >> base) & ((1u << native_count) - 1u);
   const float anchor = layout.line_mode
       ? fma(center, tile.max_depth - tile.min_depth, tile.min_depth) : position.z;
+  // Conservative rasterization extrapolates the plane beyond the primitive; D3D clamps it to the viewport range
+  // (the Clamp-mode fragment position is not clamped, clampz probe).
+  const float depth_low = min(tile.min_depth, tile.max_depth), depth_high = max(tile.min_depth, tile.max_depth);
   float sample_z[8];
   float derivative_x[9], derivative_y[9];
   derivative_x[0] = dfdx(center);
   derivative_y[0] = dfdy(center);
-  for (uint sample = 0; sample < tile.sample_count; ++sample) {
+  for (uint sample = 0; sample < native_count; ++sample) {
     const float ndc = sample_depths[sample];
     sample_z[sample] = layout.line_mode
         ? fma(ndc, tile.max_depth - tile.min_depth, tile.min_depth)
         : fma(ndc - center, tile.max_depth - tile.min_depth, anchor);
+    if (conservative) sample_z[sample] = clamp(sample_z[sample], depth_low, depth_high);
     derivative_x[sample + 1] = dfdx(ndc);
     derivative_y[sample + 1] = dfdy(ndc);
   }
+  const float published_anchor = conservative ? clamp(anchor, depth_low, depth_high) : anchor;
   uint2 helper_xy[4];
   float helper_center_z[4], helper_sample_z[4][8];
   for (ushort lane = 0; lane < 4; ++lane) {
     helper_xy[lane] = uint2(quad_shuffle(position.xy, lane)) - uint2(tile.x, tile.y);
-    helper_center_z[lane] = quad_shuffle(anchor, lane);
-    for (uint sample = 0; sample < tile.sample_count; ++sample)
+    helper_center_z[lane] = quad_shuffle(published_anchor, lane);
+    for (uint sample = 0; sample < native_count; ++sample)
       helper_sample_z[lane][sample] = quad_shuffle(sample_z[sample], lane);
   }
   if (xy.x < 8 && xy.y < 8) {
@@ -337,17 +359,21 @@ inline DXMTMSAAMarker msaa_gather_depth_impl(
     if (layout.line_alpha_dword != 0xffffffffu)
       atomic_store_explicit((device atomic_uint *)(record + layout.line_alpha_dword),
                             as_type<uint>(alpha), memory_order_relaxed);
-    for (uint i = 0; i <= tile.sample_count; ++i) {
-      atomic_store_explicit((device atomic_uint *)(record + layout.z_anchor_dword + i * 2),
+    for (uint i = 0; i <= native_count; ++i) {
+      if (i == 0 && base) continue;
+      const uint slot = i ? i + base : 0u;
+      atomic_store_explicit((device atomic_uint *)(record + layout.z_anchor_dword + slot * 2),
                             as_type<uint>(derivative_x[i]), memory_order_relaxed);
-      atomic_store_explicit((device atomic_uint *)(record + layout.z_anchor_dword + i * 2 + 1),
+      atomic_store_explicit((device atomic_uint *)(record + layout.z_anchor_dword + slot * 2 + 1),
                             as_type<uint>(derivative_y[i]), memory_order_relaxed);
     }
-    if (atomic_exchange_explicit((device atomic_uint *)(record + layout.z_claim_dword),
-                                 1u, memory_order_relaxed) == 0u) {
-      record[layout.center_z_dword] = as_type<uint>(anchor);
-      for (uint sample = 0; sample < tile.sample_count; ++sample)
-        record[layout.sample_z_dword + sample] = as_type<uint>(sample_z[sample]);
+    // The claim makes the first native invocation of a pass publish Z. The second 16x half has its own samples
+    // and stores them unconditionally: every invocation interpolates the identical plane.
+    if (base || atomic_exchange_explicit((device atomic_uint *)(record + layout.z_claim_dword),
+                                         1u, memory_order_relaxed) == 0u) {
+      if (!base) record[layout.center_z_dword] = as_type<uint>(published_anchor);
+      for (uint sample = 0; sample < native_count; ++sample)
+        record[layout.sample_z_dword + base + sample] = as_type<uint>(sample_z[sample]);
     }
   }
   // Helpers cannot store directly; active quad lanes transfer each neighbor's
@@ -357,11 +383,11 @@ inline DXMTMSAAMarker msaa_gather_depth_impl(
     if (target.x >= 8 || target.y >= 8) continue;
     device uint *helper = records + (layout.helper_record_base + target.y * 8 + target.x) *
                                    layout.input_record_dwords;
-    if (atomic_exchange_explicit((device atomic_uint *)(helper + layout.z_claim_dword),
-                                 1u, memory_order_relaxed) != 0u) continue;
-    helper[layout.center_z_dword] = as_type<uint>(helper_center_z[lane]);
-    for (uint sample = 0; sample < tile.sample_count; ++sample)
-      helper[layout.sample_z_dword + sample] = as_type<uint>(helper_sample_z[lane][sample]);
+    if (!base && atomic_exchange_explicit((device atomic_uint *)(helper + layout.z_claim_dword),
+                                          1u, memory_order_relaxed) != 0u) continue;
+    if (!base) helper[layout.center_z_dword] = as_type<uint>(helper_center_z[lane]);
+    for (uint sample = 0; sample < native_count; ++sample)
+      helper[layout.sample_z_dword + base + sample] = as_type<uint>(helper_sample_z[lane][sample]);
   }
   return {xy.x < 8 && xy.y < 8 ? 1u : 0u, coverage};
 }
@@ -372,7 +398,7 @@ inline DXMTMSAAMarker msaa_gather_depth_impl(
     constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
     device uint *records [[buffer(21)]]) {
   float depths[8];
-  for (uint sample = 0; sample < tile.sample_count; ++sample)
+  for (uint sample = 0; sample < min(tile.sample_count, 8u); ++sample)
     depths[sample] = input.ndc_depth.interpolate_at_sample(sample);
   return msaa_gather_depth_impl(input.position, input.ndc_depth.interpolate_at_center(), depths,
                                 float2(0), float2(0),
@@ -391,13 +417,75 @@ inline DXMTMSAAMarker msaa_gather_depth_impl(
   const float q = dot(screen_center - input.start, direction) * inverse_length_squared;
   const float center = mix(input.depth_pair.x, input.depth_pair.y, q);
   float depths[8];
-  for (uint sample = 0; sample < tile.sample_count; ++sample) {
+  for (uint sample = 0; sample < min(tile.sample_count, 8u); ++sample) {
     const float2 screen_sample = input.carrier_screen.interpolate_at_sample(sample);
     const float sample_q = dot(screen_sample - input.start, direction) * inverse_length_squared;
     depths[sample] = mix(input.depth_pair.x, input.depth_pair.y, sample_q);
   }
   return msaa_gather_depth_impl(input.position, center, depths, input.start, input.end,
                                 native_coverage, tile, layout, records);
+}
+
+/* Flat replay outputs of a conservative triangle (msaa_vertex.cpp expandedConservative): the primitive's clip
+ * positions, its clip distances (vertex v, distance k at component v * 8 + k) and flags (bit 3 depth clipping,
+ * bits 4-7 clip distance count). */
+struct DXMTMSAAConservativeInput {
+  float4 position [[position]];
+  float4 p0 [[user(msaa_conservative_p0), flat]];
+  float4 p1 [[user(msaa_conservative_p1), flat]];
+  float4 p2 [[user(msaa_conservative_p2), flat]];
+  float4 clip0 [[user(msaa_conservative_clip0), flat]];
+  float4 clip1 [[user(msaa_conservative_clip1), flat]];
+  float4 clip2 [[user(msaa_conservative_clip2), flat]];
+  float4 clip3 [[user(msaa_conservative_clip3), flat]];
+  float4 clip4 [[user(msaa_conservative_clip4), flat]];
+  float4 clip5 [[user(msaa_conservative_clip5), flat]];
+  uint flags [[user(msaa_conservative_flags), flat]];
+  interpolant<float2, interpolation::no_perspective> carrier_screen [[user(msaa_carrier_screen)]];
+};
+
+// Conservative rasterization: a pixel is covered (every sample) when its square overlaps the clipped, snapped
+// primitive (conservative_polygon.h). Depth is the primitive's plane, extrapolated to every sample.
+[[fragment]] DXMTMSAAMarker msaa_gather_conservative_depth(
+    DXMTMSAAConservativeInput input [[stage_in]], uint native_coverage [[sample_mask]],
+    constant DXMTMSAATile &tile [[buffer(23)]],
+    constant DXMTMSAAPixelLayout &layout [[buffer(28)]],
+    device uint *records [[buffer(21)]]) {
+  const float4 clip_vectors[6] = {input.clip0, input.clip1, input.clip2, input.clip3, input.clip4, input.clip5};
+  float clip[24];
+  for (uint i = 0; i < 24; i++) clip[i] = clip_vectors[i / 4][i % 4];
+  const float4 viewport = float4(tile.viewport_origin_x, tile.viewport_origin_y, tile.viewport_width,
+                                 tile.viewport_height);
+  float det;
+  float2 polygon[dxmt_conservative::kMaxVertices];
+  const uint count = dxmt_conservative::clipped_polygon(input.p0, input.p1, input.p2, viewport, clip,
+                                                        (input.flags >> 4) & 15, input.flags & 8, polygon, det);
+  const bool covered = count && dxmt_conservative::square_overlaps(polygon, count, floor(input.position.xy));
+  // Native depth interpolation on the expanded fan quantizes its plane independently.
+  // Derive the D3D plane from the original snapped vertices instead, using the
+  // carrier only to recover the render pass's actual sample locations.
+  const float4 positions[3] = {input.p0, input.p1, input.p2};
+  float3 screen[3];
+  for (uint i = 0; i < 3; ++i) {
+    const float4 p = positions[i];
+    float2 numerator = viewport.xy * p.w + float2(p.x + p.w, p.w - p.y) * viewport.zw * 0.5f;
+    if (p.w != 0.0f) numerator = rint(numerator / p.w * 256.0f) / 256.0f * p.w;
+    screen[i] = float3(numerator, p.w);
+  }
+  const float3 c0 = cross(screen[1], screen[2]);
+  const float3 plane = (c0 * input.p0.z + cross(screen[2], screen[0]) * input.p1.z +
+                        cross(screen[0], screen[1]) * input.p2.z) / dot(screen[0], c0);
+  const float2 gradient = plane.xy;
+  const float2 center_xy = floor(input.position.xy) + 0.5f;
+  const float center = dot(float3(center_xy, 1.0f), plane);
+  const float2 carrier_center = input.carrier_screen.interpolate_at_center();
+  float depths[8];
+  for (uint sample = 0; sample < min(tile.sample_count, 8u); ++sample)
+    depths[sample] = center + dot(input.carrier_screen.interpolate_at_sample(sample) - carrier_center, gradient);
+  float4 position = input.position;
+  position.z = fma(center, tile.max_depth - tile.min_depth, tile.min_depth);
+  return msaa_gather_depth_impl(position, center, depths,
+                                float2(0), float2(0), native_coverage, tile, layout, records, true, covered);
 }
 
 struct DXMTMSAADepthMarker {
@@ -717,7 +805,8 @@ struct DXMTMSAAPrimitiveAssembly {
   uint predicate_not_equal;
   uint index_skip;
   uint line_mode;
-  uint padding;
+  /* Triangles: 24-word slots of 18 replay fan corners (16 * slot + corner), the 3 original ordinals, 3 unused. */
+  uint conservative;
 };
 
 struct DXMTMSAAPrimitiveDraw {
@@ -740,7 +829,8 @@ struct DXMTMSAAPrimitiveDraw {
     device uint3 *capture_dispatch [[buffer(5)]]
 ) {
   const bool line_quad = params.line_mode && (params.topology == 1 || params.topology == 2);
-  const uint index_stride = line_quad ? 20 : 3;
+  const bool conservative = params.conservative && params.topology >= 3;
+  const uint index_stride = line_quad ? 20 : conservative ? 24 : 3;
   for (uint i = 0; i < params.max_primitives; i++)
     draws[i] = {0, 0, index_stride * i, 0, 0, 0};
   capture_dispatch[0] = uint3(uint((ulong(params.vertex_count) * params.instance_count + 63) / 64), 1, 1);
@@ -809,10 +899,18 @@ struct DXMTMSAAPrimitiveDraw {
           replay_indices[20 * slot + v] = 8 * slot + corners[first + v];
         replay_indices[20 * slot + 18] = primitive[0];
         replay_indices[20 * slot + 19] = primitive[1];
+      } else if (conservative) {
+        // Fans (0, 1, 2), (0, 2, 3), (0, 3, 4) over corners 0-4 and 5-9 of the replay geometry
+        // (dxmt.conservative.corner).
+        const uint corners[9] = {0, 1, 2, 0, 2, 3, 0, 3, 4};
+        for (uint v = 0; v < 18; v++)
+          replay_indices[24 * slot + v] = 16 * slot + corners[v % 9] + (v < 9 ? 0 : 5);
+        for (uint v = 0; v < 3; v++)
+          replay_indices[24 * slot + 18 + v] = primitive[v];
       } else {
         for (uint v = 0; v < vpp; v++) replay_indices[3 * slot + v] = primitive[v];
       }
-      draws[slot] = {line_quad ? (params.line_mode == 3 ? 6u : 18u) : vpp,
+      draws[slot] = {line_quad ? (params.line_mode == 3 ? 6u : 18u) : conservative ? 18u : vpp,
                      1, index_stride * slot, 0, 0, primitive_id++};
       slot++;
     }
@@ -831,9 +929,14 @@ struct DXMTMSAABoundsParams {
   uint render_target_array_index_offset;
   uint target_array_length;
   uint line_mode;
-  uint padding;
+  /* Triangles use 24-word conservative slots (MSAAPrimitiveAssemblyParams::conservative). */
+  uint conservative;
   float4 viewports[16];
   uint4 scissors[16];
+  uint view_viewport_offset;
+  uint view_layer_offset;
+  uint view_offsets_enabled;
+  uint primitive_id_offset;
 };
 
 struct DXMTMSAATileBounds {
@@ -854,23 +957,45 @@ struct DXMTMSAATileBounds {
 ) {
   if (primitive >= params.max_primitives) return;
   DXMTMSAATileBounds result = {0, 0, 0, 0, 0, 0, 0};
-  const uint count = params.line_mode && draws[primitive].index_count ? 2 : draws[primitive].index_count;
+  const uint count = params.line_mode && draws[primitive].index_count ? 2
+      : params.conservative && draws[primitive].index_count ? 3 : draws[primitive].index_count;
   if (!count || !params.viewport_count || !params.target_width || !params.target_height) {
     bounds[primitive] = result;
     return;
   }
-  const uint index_base = params.line_mode ? 20 * primitive + 18 : 3 * primitive;
+  const uint index_base = params.line_mode ? 20 * primitive + 18
+      : params.conservative ? 24 * primitive + 18 : 3 * primitive;
   const uint first = indices[index_base];
+  // Native mesh capture leaves unused primitive slots zeroed. A zero homogeneous
+  // position for every vertex cannot survive D3D clipping; do not replay that slot.
+  if (params.position_offset != 0xffffffffu) {
+    bool empty = true;
+    for (uint i = 0; i < count && empty; ++i) {
+      device const uint *position = vertices + ulong(indices[index_base + i]) * params.record_dwords + params.position_offset;
+      empty = !(position[0] | position[1] | position[2] | position[3]);
+    }
+    if (empty) { bounds[primitive] = result; return; }
+  }
   uint viewport_index = 0;
   if (params.viewport_index_offset != 0xffffffffu)
     viewport_index = vertices[ulong(first) * params.record_dwords + params.viewport_index_offset];
+  uint target_layer = 0;
+  if (params.render_target_array_index_offset != 0xffffffffu)
+    target_layer = vertices[ulong(first) * params.record_dwords + params.render_target_array_index_offset];
+  const uint layer_count = max(1u, params.target_array_length);
+  if (params.view_offsets_enabled) {
+    // View instance location: the sum selects index 0 when out of range, exactly as the amplification
+    // mapping of the replay pipelines does.
+    viewport_index += params.view_viewport_offset;
+    target_layer += params.view_layer_offset;
+    if (viewport_index >= params.viewport_count) viewport_index = 0;
+    if (target_layer >= layer_count) target_layer = 0;
+  }
   viewport_index = min(viewport_index, params.viewport_count - 1);
   result.viewport_index = viewport_index;
-  result.primitive_id = draws[primitive].primitive_id;
-  if (params.render_target_array_index_offset != 0xffffffffu)
-    result.target_layer = min(vertices[ulong(first) * params.record_dwords +
-                                       params.render_target_array_index_offset],
-                              max(1u, params.target_array_length) - 1);
+  result.primitive_id = params.primitive_id_offset == 0xffffffffu ? draws[primitive].primitive_id
+      : vertices[ulong(first) * params.record_dwords + params.primitive_id_offset];
+  result.target_layer = min(target_layer, layer_count - 1);
   const float4 viewport = params.viewports[viewport_index];
   float2 low = float2(INFINITY);
   float2 high = float2(-INFINITY);
@@ -1307,6 +1432,14 @@ inline uint dxmt_clipped_primitives(constant DXMTSOAssembly &params,
     device const ulong *begin [[buffer(1)]],
     device ulong *result [[buffer(2)]]) {
   for (uint i = 0; i < 11; i++) result[i] = counter[i] - begin[i];
+}
+
+// D3D12_QUERY_DATA_PIPELINE_STATISTICS1: the eleven counters plus AS/MS invocations and MS primitives.
+[[kernel]] void query_pipeline_statistics1_end(
+    device const ulong *counter [[buffer(0)]],
+    device const ulong *begin [[buffer(1)]],
+    device ulong *result [[buffer(2)]]) {
+  for (uint i = 0; i < 14; i++) result[i] = counter[i] - begin[i];
 }
 
 // D3D12 SO statistics EndQuery: result = stream counters now - counters at BeginQuery.
@@ -2183,5 +2316,38 @@ kernel void d3d12_swizzle_packed422_export_if_dirty(device const uchar *linear [
 
 // Keep the acceleration-structure helper kernels in the same metallib as the existing
 // internal kernels: InternalCommandLibrary loads this one library before asking for
-// dxmt_as_prepass / dxmt_as_write_u64 / dxmt_as_finalize_compacted_size.
+// the AS prepass, shadow, postbuild, serialization and visualization kernels.
 #include "../winemetal/unix/rt_as_prepass.metal"
+
+// Sampler feedback transcoding (src/d3d12/d3d12_sampler_feedback.hpp). A map is u32 cells:
+// MIN_MIP holds 255 - mip (0 = no mip requested, decoded 0xFF); MIP_REGION_USED holds 0 or 1
+// (decoded 0 or 0xFF). One invocation per decoded R8_UINT texel of the rect.
+struct d3d12_feedback_transcode {
+  uint cell_base;  // first cell of the subresource grid
+  uint grid_w;     // cells per row of the subresource grid
+  uint src_x, src_y, width, height;
+  uint dst_x, dst_y;
+  uint row_pitch;  // bytes per row of the R8 side
+  uint min_mip;
+};
+
+kernel void d3d12_feedback_decode(device const uint *cells [[buffer(0)]],
+                                  device uchar *decoded [[buffer(1)]],
+                                  constant d3d12_feedback_transcode &p [[buffer(2)]],
+                                  uint index [[thread_position_in_grid]]) {
+  if (index >= p.width * p.height) return;
+  const uint x = index % p.width, y = index / p.width;
+  const uint cell = cells[p.cell_base + (p.src_y + y) * p.grid_w + p.src_x + x];
+  decoded[(p.dst_y + y) * p.row_pitch + p.dst_x + x] =
+      p.min_mip ? uchar(255u - min(cell, 255u)) : (cell ? uchar(0xff) : uchar(0));
+}
+
+kernel void d3d12_feedback_encode(device const uchar *decoded [[buffer(0)]],
+                                  device uint *cells [[buffer(1)]],
+                                  constant d3d12_feedback_transcode &p [[buffer(2)]],
+                                  uint index [[thread_position_in_grid]]) {
+  if (index >= p.width * p.height) return;
+  const uint x = index % p.width, y = index / p.width;
+  const uint value = decoded[(p.src_y + y) * p.row_pitch + p.src_x + x];
+  cells[p.cell_base + (p.dst_y + y) * p.grid_w + p.dst_x + x] = p.min_mip ? 255u - value : uint(value != 0);
+}

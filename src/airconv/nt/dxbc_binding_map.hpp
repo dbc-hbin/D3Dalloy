@@ -17,6 +17,8 @@ struct SamplerDescriptor {
   llvm::Value *SamplerHandle;
   llvm::Value *CubeSamplerHandle;
   llvm::Value *Metadata;
+  // D3D12 sampler descriptor q3 (MinLOD | MaxLOD << 32); only sampler feedback reads it.
+  llvm::Value *LodRange = nullptr;
 };
 
 struct TextureDescirptor {
@@ -40,6 +42,8 @@ struct TextureDescirptor {
   llvm::Value *StatusView = nullptr;
   // RGB32 SRVs: q0 (unused as a texture handle) is the reserved buffer's biased residency base.
   llvm::Value *RGB32StatusBase = nullptr;
+  // D3D12 texture SRVs: q2 view range for sampler feedback (bit 63 valid; mips/slices packed).
+  llvm::Value *ViewRange = nullptr;
 
 };
 
@@ -214,6 +218,15 @@ public:
    * arguments it was handed by these positions. Only a root-signature binding map
    * declares them, so the default is "none".
    */
+  /**
+   * SV_ViewID (view instancing): the view-id qword the runtime appends last to a non-local root signature's
+   * entry (MTLD3D12RootSignature::ViewIdQwordOffset), truncated to 32 bits. Null for a map without root
+   * arguments; the caller then reads 0, which is what a PSO without view instancing requires.
+   */
+  virtual llvm::Value *ViewInstanceId(llvm::air::AIRBuilder &Builder) {
+    (void)Builder;
+    return nullptr;
+  }
   virtual uint32_t RootSignatureArgumentIndex() const { return ~0u; }
   virtual uint32_t StaticSamplerArgumentIndex() const { return ~0u; }
 };

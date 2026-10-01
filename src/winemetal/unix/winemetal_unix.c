@@ -548,7 +548,8 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   }
 
   descriptor.defaultRasterSampleCount = info->default_raster_sample_count;
-  descriptor.renderTargetArrayLength = info->render_target_array_length;
+  descriptor.renderTargetArrayLength =
+      info->render_target_array_length | ((NSUInteger)info->render_target_array_length_high << 8);
   descriptor.renderTargetHeight = info->render_target_height;
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
@@ -572,6 +573,21 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     for (NSUInteger i = 0; i < sample_count; i++)
       positions[i] = MTLSamplePositionMake(0.5f, 0.5f);
     [descriptor setSamplePositions:positions count:sample_count];
+  }
+  if (info->forced16_half) {
+    // D3D 16x standard pattern (1/16 pixel from center); probe pos16.m proves the two programmed 8x halves give
+    // bit-exact D3D 16x coverage.
+    static const int x16[16] = {1, -1, -3, 4, -5, 2, 5, 3, -2, 0, -4, -6, -8, 7, 6, -7};
+    static const int y16[16] = {1, -3, 2, -1, -2, 5, 3, -5, 6, -7, -6, 4, 0, -4, 7, -8};
+    if (info->forced16_half > 2 || info->default_raster_sample_count != 8 || info->center_sample_pattern) {
+      [descriptor release];
+      return STATUS_UNSUCCESSFUL;
+    }
+    const unsigned base = (info->forced16_half - 1) * 8;
+    MTLSamplePosition positions[8];
+    for (unsigned i = 0; i < 8; i++)
+      positions[i] = MTLSamplePositionMake(0.5f + x16[base + i] / 16.0f, 0.5f + y16[base + i] / 16.0f);
+    [descriptor setSamplePositions:positions count:8];
   }
 
   if (info->tile_height && info->tile_width) {
@@ -676,6 +692,8 @@ _MTLDevice_newRenderPipelineState(void *obj) {
   descriptor.vertexFunction = (id<MTLFunction>)info->vertex_function;
   descriptor.fragmentFunction = (id<MTLFunction>)info->fragment_function;
   descriptor.supportIndirectCommandBuffers = info->support_indirect_command_buffers;
+  if (info->max_vertex_amplification_count)
+    descriptor.maxVertexAmplificationCount = info->max_vertex_amplification_count;
 
   if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
     descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
@@ -743,6 +761,8 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
   descriptor.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->mesh_tgsize_is_multiple_of_sgwidth;
   descriptor.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->object_tgsize_is_multiple_of_sgwidth;
   descriptor.supportIndirectCommandBuffers = info->support_indirect_command_buffers;
+  if (info->max_vertex_amplification_count)
+    descriptor.maxVertexAmplificationCount = info->max_vertex_amplification_count;
 
   MTLPipelineOption options = MTLPipelineOptionNone;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
@@ -1138,6 +1158,12 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetStencilRefFrontBack: {
       struct wmtcmd_render_setstencilref_front_back *body = (struct wmtcmd_render_setstencilref_front_back *)next;
       [encoder setStencilFrontReferenceValue:body->front_stencil_ref backReferenceValue:body->back_stencil_ref];
+      break;
+    }
+    case WMTRenderCommandSetVertexAmplification: {
+      struct wmtcmd_render_set_vertex_amplification *body = (struct wmtcmd_render_set_vertex_amplification *)next;
+      MTLVertexAmplificationViewMapping mapping = {body->viewport_offset, body->render_target_array_offset};
+      [encoder setVertexAmplificationCount:1 viewMappings:&mapping];
       break;
     }
     case WMTRenderCommandSetVisibilityMode: {
@@ -2085,6 +2111,25 @@ thunk_SM50RTCompileRaytracingPipeline(void *args) {
   return STATUS_SUCCESS;
 }
 
+/* D3D12 work graph node shaders (dxil_workgraph.h): forwarded verbatim. */
+static NTSTATUS
+thunk_SM50WGReflectLibrary(void *args) {
+  struct sm50_wg_reflect_library_params *params = args;
+  params->ret = SM50WGReflectLibrary(
+      params->bytecode, params->bytecode_size, params->nodes, params->node_capacity, params->outputs,
+      params->output_capacity, params->names, params->names_size, params->node_count, params->output_count,
+      params->names_size_out, params->error
+  );
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_SM50WGCompileNode(void *args) {
+  struct sm50_wg_compile_node_params *params = args;
+  params->ret = SM50WGCompileNode(params->desc, params->bitcode, params->metallib, params->info, params->error);
+  return STATUS_SUCCESS;
+}
+
 static inline void *
 UInt32ToPtr(uint32_t v) {
   return (void *)(uint64_t)v;
@@ -2191,6 +2236,20 @@ struct SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA32 {
   uint32_t elements;
 };
 
+struct SM50_GS_STREAM_CAPTURE32 {
+  uint32_t record_dwords;
+  uint32_t num_elements;
+  uint32_t elements;
+};
+
+struct SM50_SHADER_D3D12_GS_STREAMS_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t rasterized_stream;
+  struct SM50_GS_STREAM_CAPTURE32 streams[4];
+};
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_GS_STREAMS_DATA32) == 60, "Wine32 GS streams argument size");
+
 struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32 {
   uint32_t next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -2205,13 +2264,23 @@ struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32 {
   uint8_t center_pattern;
   uint32_t distance_vertex_layout;
   uint32_t distance_vertex_count;
+  uint32_t coarse_vertex_layout;
 };
 _Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32, distance_vertex_layout) == 40,
                "Wine32 MSAA distance layout pointer offset");
 _Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32, distance_vertex_count) == 44,
                "Wine32 MSAA distance vertex count offset");
-_Static_assert(sizeof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32) == 48,
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32) == 52,
                "Wine32 MSAA pixel argument size");
+
+struct SM50_SHADER_D3D12_LOGIC_OP_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t op;
+  uint32_t rt_mask;
+  uint8_t component_bits[8][4];
+};
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_LOGIC_OP_DATA32) == 48, "Wine32 logic op argument size");
 
 struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA32 {
   uint32_t next;
@@ -2223,6 +2292,20 @@ struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA32 {
   uint32_t interpolation;
   uint8_t depth_clip_enable;
 };
+
+struct SM50_SHADER_D3D12_MSAA_MESH_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t variant;
+  uint32_t layout_out;
+  uint32_t mesh_layout_out;
+  uint32_t line_mode;
+  uint32_t interpolation;
+  uint8_t depth_clip_enable;
+  uint32_t object_layout_out;
+};
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_MSAA_MESH_DATA32) == 36, "Wine32 MSAA mesh argument size");
+_Static_assert(sizeof(struct SM50_MSAA_MESH_CONTROL) == 16, "MSAA mesh capture control size");
 
 struct SM50_SHADER_D3D12_TESS_CAPTURE_DATA32 {
   uint32_t next;
@@ -2390,8 +2473,56 @@ sm50_compilation_argument32_convert(
       }
       break;
     }
+    case SM50_SHADER_D3D12_GS_STREAMS: {
+      const struct SM50_SHADER_D3D12_GS_STREAMS_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_D3D12_GS_STREAMS_DATA *data = calloc(1, sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = (void *)data;
+      data->type = src->type;
+      data->rasterized_stream = src->rasterized_stream;
+      for (uint32_t s = 0; s < 4; ++s) {
+        const struct SM50_SO_CAPTURE_ELEMENT32 *src_elements = UInt32ToPtr(src->streams[s].elements);
+        data->streams[s].record_dwords = src->streams[s].record_dwords;
+        data->streams[s].num_elements = src->streams[s].num_elements;
+        if (!src->streams[s].num_elements)
+          continue;
+        struct SM50_SO_CAPTURE_ELEMENT *elements = calloc(src->streams[s].num_elements, sizeof(*elements));
+        if (!elements)
+          return false;
+        data->streams[s].elements = elements;
+        for (uint32_t i = 0; i < src->streams[s].num_elements; ++i) {
+          const char *name = UInt32ToPtr(src_elements[i].semantic_name);
+          if (name && !(elements[i].semantic_name = strdup(name)))
+            return false;
+          elements[i].semantic_index = src_elements[i].semantic_index;
+          elements[i].start_component = src_elements[i].start_component;
+          elements[i].component_count = src_elements[i].component_count;
+          elements[i].dword_offset = src_elements[i].dword_offset;
+        }
+      }
+      break;
+    }
+    case SM50_SHADER_D3D12_LOGIC_OP: {
+      const struct SM50_SHADER_D3D12_LOGIC_OP_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_D3D12_LOGIC_OP_DATA *data = calloc(1, sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = (void *)data;
+      data->type = src->type;
+      data->op = src->op;
+      data->rt_mask = src->rt_mask;
+      memcpy(data->component_bits, src->component_bits, sizeof(data->component_bits));
+      break;
+    }
     case SM50_SHADER_D3D12_INDEX_PULL:
-    case SM50_SHADER_D3D12_PIPELINE_STATS: {
+    case SM50_SHADER_D3D12_PIPELINE_STATS:
+    case SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL:
+    case SM50_SHADER_D3D12_COARSE_SHADING:
+    case SM50_SHADER_D3D12_CONSERVATIVE_RASTER:
+    case SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM: {
       struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data = malloc(sizeof(*data));
       if (!data)
         return false;
@@ -2420,6 +2551,7 @@ sm50_compilation_argument32_convert(
       data->center_pattern = src->center_pattern;
       data->distance_vertex_layout = UInt32ToPtr(src->distance_vertex_layout);
       data->distance_vertex_count = src->distance_vertex_count;
+      data->coarse_vertex_layout = UInt32ToPtr(src->coarse_vertex_layout);
       break;
     }
     case SM50_SHADER_D3D12_MSAA_VERTEX: {
@@ -2449,6 +2581,24 @@ sm50_compilation_argument32_convert(
       data->layout_out = UInt32ToPtr(src->layout_out);
       break;
     }
+    case SM50_SHADER_D3D12_MSAA_MESH: {
+      const struct SM50_SHADER_D3D12_MSAA_MESH_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_D3D12_MSAA_MESH_DATA *data = calloc(1, sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = (void *)data;
+      data->type = src->type;
+      data->variant = src->variant;
+      data->layout_out = UInt32ToPtr(src->layout_out);
+      data->mesh_layout_out = UInt32ToPtr(src->mesh_layout_out);
+      data->line_mode = src->line_mode;
+      data->interpolation = UInt32ToPtr(src->interpolation);
+      data->depth_clip_enable = src->depth_clip_enable;
+      data->object_layout_out = UInt32ToPtr(src->object_layout_out);
+      break;
+    }
+
     case SM50_SHADER_GS_TESSELLATION_INPUT: {
       const struct SM50_SHADER_GS_TESSELLATION_INPUT_DATA32 *src = (void *)args32;
       struct SM50_SHADER_GS_TESSELLATION_INPUT_DATA *data = calloc(1, sizeof(*data));
@@ -2479,6 +2629,14 @@ sm50_compilation_argument32_free(struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *f
       for (uint32_t i = 0; capture->elements && i < capture->num_elements; ++i)
         free((void *)capture->elements[i].semantic_name);
       free((void *)capture->elements);
+    }
+    if (arg->type == SM50_SHADER_D3D12_GS_STREAMS) {
+      struct SM50_SHADER_D3D12_GS_STREAMS_DATA *streams = (void *)arg;
+      for (uint32_t s = 0; s < 4; ++s) {
+        for (uint32_t i = 0; streams->streams[s].elements && i < streams->streams[s].num_elements; ++i)
+          free((void *)streams->streams[s].elements[i].semantic_name);
+        free((void *)streams->streams[s].elements);
+      }
     }
     free(arg);
     arg = next;
@@ -2649,24 +2807,115 @@ static NTSTATUS
 thunk32_SM50RTCompileRaytracingPipeline(void *args) {
   struct sm50_rt_compile_pipeline_params32 *params = args;
 
-  /*
-   * The pipeline description is not a flat pointer block: it nests SM50_RT_LIBRARY
-   * and SM50_RT_EXPORT arrays whose own pointer members are 64 bit in the ABI the
-   * compiler reads, so a 32 bit description cannot be handed to it without a
-   * full width conversion that no 32 bit client in this build can exercise.
-   * Reporting a compilation failure keeps the entry from being a NULL indirect
-   * call and never lets the caller mistake it for a compiled pipeline.
-   */
-  (void)params;
-  fprintf(stderr, "32 bit raytracing pipeline compilation is not supported\n");
   params->ret = 0;
-  /*
-   * The caller's error slot is a 32 bit pointer, so it has to be cleared at its
-   * own width; leaving it untouched would let the caller free a stale pointer.
-   */
+  if (params->bitcode)
+    *(sm50_bitcode_t *)UInt32ToPtr(params->bitcode) = 0;
   if (params->error)
-    *(uint32_t *)UInt32ToPtr(params->error) = 0;
+    *(sm50_error_t *)UInt32ToPtr(params->error) = 0;
+  if (params->function_count)
+    *(uint32_t *)UInt32ToPtr(params->function_count) = 0;
+  const struct sm50_rt_pipeline_desc32 *source = UInt32ToPtr(params->desc);
+  if (!source || !params->functions || !params->bitcode || !params->metallib || !params->function_count ||
+      (source->LibraryCount && !source->Libraries) || (source->ExportCount && !source->Exports) ||
+      (source->LinkExportCount && !source->LinkExports))
+    return STATUS_SUCCESS;
+  struct SM50_RT_LIBRARY *libraries = calloc(source->LibraryCount, sizeof(*libraries));
+  struct SM50_RT_EXPORT *exports = calloc(source->ExportCount, sizeof(*exports));
+  struct SM50_WG_EXPORT *link_exports = calloc(source->LinkExportCount, sizeof(*link_exports));
+  struct SM50_RT_FUNCTION_INFO *functions = calloc(params->function_capacity, sizeof(*functions));
+  if ((source->LibraryCount && !libraries) || (source->ExportCount && !exports) ||
+      (source->LinkExportCount && !link_exports) || (params->function_capacity && !functions))
+    goto done;
+  const struct sm50_rt_library32 *libraries32 = UInt32ToPtr(source->Libraries);
+  const struct sm50_rt_export32 *exports32 = UInt32ToPtr(source->Exports);
+  const struct sm50_wg_export32 *link_exports32 = UInt32ToPtr(source->LinkExports);
+  for (uint32_t i = 0; i < source->LibraryCount; ++i)
+    libraries[i] = (struct SM50_RT_LIBRARY){UInt32ToPtr(libraries32[i].Bytecode), libraries32[i].Size};
+  for (uint32_t i = 0; i < source->ExportCount; ++i) {
+    const struct sm50_rt_export32 *entry = &exports32[i];
+    exports[i] = (struct SM50_RT_EXPORT){
+      .Stage = entry->Stage, .LibraryIndex = entry->LibraryIndex, .HitGroupType = entry->HitGroupType,
+      .ClosestHitIndex = entry->ClosestHitIndex, .AnyHitIndex = entry->AnyHitIndex,
+      .IntersectionIndex = entry->IntersectionIndex, .EntryPoint = UInt32ToPtr(entry->EntryPoint),
+      .ContainerEntryPoint = UInt32ToPtr(entry->ContainerEntryPoint),
+      .LocalRootSignature = UInt32ToPtr(entry->LocalRootSignature), .LocalRootSignatureSize = entry->LocalRootSignatureSize};
+  }
+  for (uint32_t i = 0; i < source->LinkExportCount; ++i) {
+    const struct sm50_wg_export32 *entry = &link_exports32[i];
+    link_exports[i] = (struct SM50_WG_EXPORT){UInt32ToPtr(entry->Name), UInt32ToPtr(entry->EntryPoint),
+      entry->LibraryIndex, entry->Scope, entry->Flags, entry->Reserved,
+      UInt32ToPtr(entry->GlobalRootSignature), entry->GlobalRootSignatureSize,
+      UInt32ToPtr(entry->LocalRootSignature), entry->LocalRootSignatureSize};
+  }
+  struct SM50_RT_PIPELINE_DESC desc = {
+    .Libraries = libraries, .LibraryCount = source->LibraryCount, .Exports = exports, .ExportCount = source->ExportCount,
+    .GlobalRootSignature = UInt32ToPtr(source->GlobalRootSignature), .GlobalRootSignatureSize = source->GlobalRootSignatureSize,
+    .MaxRecursionDepth = source->MaxRecursionDepth, .MaxPayloadSize = source->MaxPayloadSize,
+    .MaxAttributeSize = source->MaxAttributeSize, .Flags = source->Flags, .MetalVersion = source->MetalVersion,
+    .LinkExports = link_exports, .LinkExportCount = source->LinkExportCount,
+    .FunctionNames = UInt32ToPtr(source->FunctionNames), .FunctionNamesSize = source->FunctionNamesSize};
+  uint32_t count = 0;
+  params->ret = SM50CompileRaytracingPipeline(&desc, UInt32ToPtr(params->bitcode), UInt32ToPtr(params->metallib),
+      functions, params->function_capacity, &count, UInt32ToPtr(params->error));
+  if (params->ret) {
+    struct sm50_rt_function_info32 *out = UInt32ToPtr(params->functions);
+    for (uint32_t i = 0; i < count; ++i)
+      out[i] = (struct sm50_rt_function_info32){(uint32_t)(uintptr_t)functions[i].Name, (uint32_t)(uintptr_t)functions[i].ExportName,
+          functions[i].Kind, functions[i].ExportIndex, functions[i].TableIndex, functions[i].IsDispatchEntry};
+    *(uint32_t *)UInt32ToPtr(params->function_count) = count;
+  }
+done:
+  free(functions);
+  free(link_exports);
+  free(exports);
+  free(libraries);
+  return STATUS_SUCCESS;
+}
+static NTSTATUS
+thunk32_SM50WGReflectLibrary(void *args) {
+  struct sm50_wg_reflect_library_params32 *params = args;
+  params->ret = SM50WGReflectLibrary(UInt32ToPtr(params->bytecode), params->bytecode_size,
+      UInt32ToPtr(params->nodes), params->node_capacity, UInt32ToPtr(params->outputs), params->output_capacity,
+      UInt32ToPtr(params->names), params->names_size, UInt32ToPtr(params->node_count),
+      UInt32ToPtr(params->output_count), UInt32ToPtr(params->names_size_out), UInt32ToPtr(params->error));
+  return STATUS_SUCCESS;
+}
 
+static NTSTATUS
+thunk32_SM50WGCompileNode(void *args) {
+  struct sm50_wg_compile_node_params32 *params = args;
+  struct sm50_wg_node_compile_desc32 *source = UInt32ToPtr(params->desc);
+  if (!source) { params->ret = 0; return STATUS_SUCCESS; }
+  struct SM50_WG_LIBRARY *libraries = calloc(source->LibraryCount, sizeof(*libraries));
+  struct SM50_WG_EXPORT *exports = calloc(source->ExportCount, sizeof(*exports));
+  if ((source->LibraryCount && (!source->Libraries || !libraries)) || (source->ExportCount && (!source->Exports || !exports))) {
+    free(libraries); free(exports); params->ret = 0;
+    if (params->error) *(uint64_t *)UInt32ToPtr(params->error) = 0;
+    return STATUS_SUCCESS;
+  }
+  const struct sm50_wg_library32 *source_libraries = UInt32ToPtr(source->Libraries);
+  const struct sm50_wg_export32 *source_exports = UInt32ToPtr(source->Exports);
+  for (uint32_t i = 0; i < source->LibraryCount; ++i)
+    libraries[i] = (struct SM50_WG_LIBRARY){UInt32ToPtr(source_libraries[i].Bytecode), source_libraries[i].Size};
+  for (uint32_t i = 0; i < source->ExportCount; ++i) {
+    const struct sm50_wg_export32 *exp = &source_exports[i];
+    exports[i] = (struct SM50_WG_EXPORT){UInt32ToPtr(exp->Name), UInt32ToPtr(exp->EntryPoint), exp->LibraryIndex, exp->Scope, exp->Flags, exp->Reserved,
+        UInt32ToPtr(exp->GlobalRootSignature), exp->GlobalRootSignatureSize, UInt32ToPtr(exp->LocalRootSignature), exp->LocalRootSignatureSize};
+  }
+  struct SM50_WG_NODE_COMPILE_DESC desc = {
+    .Library = UInt32ToPtr(source->Library), .LibrarySize = source->LibrarySize,
+    .EntryPoint = UInt32ToPtr(source->EntryPoint), .FunctionName = UInt32ToPtr(source->FunctionName),
+    .GlobalRootSignature = UInt32ToPtr(source->GlobalRootSignature), .GlobalRootSignatureSize = source->GlobalRootSignatureSize,
+    .LocalRootSignature = UInt32ToPtr(source->LocalRootSignature), .LocalRootSignatureSize = source->LocalRootSignatureSize,
+    .MetalVersion = source->MetalVersion, .Launch = source->Launch, .OutputCount = source->OutputCount,
+    .Reserved = source->Reserved,
+    .OutputElementBase = UInt32ToPtr(source->OutputElementBase), .OutputElementCount = UInt32ToPtr(source->OutputElementCount),
+    .Libraries = libraries, .Exports = exports, .LibraryCount = source->LibraryCount, .ExportCount = source->ExportCount,
+    .EntryLibraryIndex = source->EntryLibraryIndex, .AllowUnresolved = source->AllowUnresolved, .EntryExportIndex = source->EntryExportIndex,
+  };
+  params->ret = SM50WGCompileNode(&desc, UInt32ToPtr(params->bitcode), UInt32ToPtr(params->metallib),
+                                UInt32ToPtr(params->info), UInt32ToPtr(params->error));
+  free(exports); free(libraries);
   return STATUS_SUCCESS;
 }
 #endif /* DXMT_NATIVE */
@@ -3791,7 +4040,7 @@ _MTLIntersectionFunctionTable_setVisibleFunctionTable(void *obj) {
 static NTSTATUS
 _WMTASDescriptor_new(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_descriptor_new((uint32_t)params->args[0], (uint32_t)params->args[1]);
+  params->ret[0] = dxmt_as_descriptor_new(params->args[2], (uint32_t)params->args[0], (uint32_t)params->args[1]);
   return STATUS_SUCCESS;
 }
 
@@ -3808,7 +4057,7 @@ _WMTASDescriptor_setTriangles(void *obj) {
   params->ret[0] = dxmt_as_descriptor_set_triangles(
       params->args[0], (uint32_t)params->args[1], params->args[2], params->args[3], params->args[4],
       params->args[5], params->args[6], (uint32_t)params->args[7], params->args[8], params->args[9],
-      params->args[10], (uint32_t)params->args[11], (uint32_t)params->args[12]
+      params->args[10], (uint32_t)params->args[11], (uint32_t)params->args[12], (uint32_t)params->args[13]
   );
   return STATUS_SUCCESS;
 }
@@ -3862,6 +4111,15 @@ WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_contributionBuffer, dxmt_as_sidecar_contribu
 WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_resourceID, dxmt_as_sidecar_resource_id)
 WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_contributionGPUAddress, dxmt_as_sidecar_contribution_gpu_address)
 WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_size, dxmt_as_sidecar_size)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_instanceCount, dxmt_as_sidecar_instance_count)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_generations, dxmt_as_sidecar_generations)
+
+static NTSTATUS
+_WMTASSidecar_allocate(void *obj) {
+  struct unixcall_wmt_as *params = obj;
+  params->ret[0] = dxmt_as_sidecar_allocate(params->args[0], params->args[1], params->args[2], params->args[3]);
+  return STATUS_SUCCESS;
+}
 
 #undef WMT_AS_SIDECAR_HANDLE
 
@@ -3935,23 +4193,7 @@ _WMTASEncoder_fence(void *obj) {
   return STATUS_SUCCESS;
 }
 
-static NTSTATUS
-_WMTComputeEncoder_encodeASWriteU64(void *obj) {
-  struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_encode_write_u64(
-      params->args[0], params->args[1], params->args[2], params->args[3], params->args[4]
-  );
-  return STATUS_SUCCESS;
-}
 
-static NTSTATUS
-_WMTComputeEncoder_encodeASFinalizeCompactedSize(void *obj) {
-  struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_encode_finalize_compacted_size(
-      params->args[0], params->args[1], params->args[2], params->args[3]
-  );
-  return STATUS_SUCCESS;
-}
 
 /* gpuResourceID is declared by the concrete Metal resource protocols (function tables,
  * acceleration structures, ...), not by MTLResource itself, so name the requirement here and
@@ -5171,8 +5413,8 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTASEncoder_copy,
     &_WMTASEncoder_compactedSize,
     &_WMTComputeEncoder_encodeASPrepass,
-    &_WMTComputeEncoder_encodeASWriteU64,
-    &_WMTComputeEncoder_encodeASFinalizeCompactedSize,
+    &_WMTUnimplemented, /* 191: retired DXR scalar postbuild helper */
+    &_WMTUnimplemented, /* 192: retired DXR scalar compaction helper */
     &_MTLResource_gpuResourceID,
     &_MTLComputeCommandEncoder_setVisibleFunctionTable,
     &_MTLComputeCommandEncoder_setIntersectionFunctionTable,
@@ -5238,6 +5480,63 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTUnimplemented, /* 254: reserved (gsts) */
     &_WMTUnimplemented, /* 255: reserved (gsts) */
     &_MTLDevice_gpuCoreCount, /* 256: IOKit gpu-core-count of the device's accelerator (0 if unknown). */
+    &_WMTUnimplemented, /* 257: reserved (FL) */
+    &_WMTUnimplemented, /* 258: reserved (FL) */
+    &_WMTUnimplemented, /* 259: reserved (FL) */
+    &_WMTUnimplemented, /* 260: reserved (FL) */
+    &_WMTUnimplemented, /* 261: reserved (FL) */
+    &_WMTUnimplemented, /* 262: reserved (FL) */
+    &_WMTUnimplemented, /* 263: reserved (FL) */
+    &_WMTUnimplemented, /* 264: reserved (DXR) */
+    &_WMTUnimplemented, /* 265: reserved (DXR) */
+    &_WMTUnimplemented, /* 266: reserved (DXR) */
+    &_WMTUnimplemented, /* 267: reserved (DXR) */
+    &_WMTASSidecar_allocate, /* 268: DXR deferred sidecar allocation (fixed-width) */
+    &_WMTASSidecar_instanceCount, /* 269: DXR sidecar instance count (fixed-width) */
+    &_WMTASSidecar_generations, /* 270: DXR retained sidecar generations (fixed-width) */
+    &_WMTUnimplemented, /* 271: reserved (DXR) */
+    &_WMTUnimplemented, /* 272: reserved (DXR) */
+    &_WMTUnimplemented, /* 273: reserved (DXR) */
+    &_WMTUnimplemented, /* 274: reserved (DXR) */
+    &_WMTUnimplemented, /* 275: reserved (DXR) */
+    &_WMTUnimplemented, /* 276: reserved (DXR) */
+    &_WMTUnimplemented, /* 277: reserved (DXR) */
+    &_WMTUnimplemented, /* 278: reserved (DXR) */
+    &_WMTUnimplemented, /* 279: reserved (DXR) */
+    &_WMTUnimplemented, /* 280: reserved (MESH) */
+    &_WMTUnimplemented, /* 281: reserved (MESH) */
+    &_WMTUnimplemented, /* 282: reserved (MESH) */
+    &_WMTUnimplemented, /* 283: reserved (MESH) */
+    &_WMTUnimplemented, /* 284: reserved (MESH) */
+    &_WMTUnimplemented, /* 285: reserved (MESH) */
+    &_WMTUnimplemented, /* 286: reserved (MESH) */
+    &_WMTUnimplemented, /* 287: reserved (MESH) */
+    &_WMTUnimplemented, /* 288: reserved (CONSRAST) */
+    &_WMTUnimplemented, /* 289: reserved (CONSRAST) */
+    &_WMTUnimplemented, /* 290: reserved (CONSRAST) */
+    &_WMTUnimplemented, /* 291: reserved (CONSRAST) */
+    &_WMTUnimplemented, /* 292: reserved (VRS) */
+    &_WMTUnimplemented, /* 293: reserved (VRS) */
+    &_WMTUnimplemented, /* 294: reserved (VRS) */
+    &_WMTUnimplemented, /* 295: reserved (VRS) */
+    &_WMTUnimplemented, /* 296: reserved (VRS) */
+    &_WMTUnimplemented, /* 297: reserved (VRS) */
+    &_WMTUnimplemented, /* 298: reserved (VRS) */
+    &_WMTUnimplemented, /* 299: reserved (VRS) */
+    &_WMTUnimplemented, /* 300: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 301: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 302: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 303: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 304: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 305: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 306: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 307: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 308: reserved (VIEWINST) */
+    &_WMTUnimplemented, /* 309: reserved (VIEWINST) */
+    &_WMTUnimplemented, /* 310: reserved (VIEWINST) */
+    &_WMTUnimplemented, /* 311: reserved (VIEWINST) */
+    &thunk_SM50WGReflectLibrary, /* 312: work graph library reflection */
+    &thunk_SM50WGCompileNode, /* 313: work graph node compilation */
 };
 
 #ifndef DXMT_NATIVE
@@ -5422,8 +5721,8 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTASEncoder_copy,
     &_WMTASEncoder_compactedSize,
     &_WMTComputeEncoder_encodeASPrepass,
-    &_WMTComputeEncoder_encodeASWriteU64,
-    &_WMTComputeEncoder_encodeASFinalizeCompactedSize,
+    &_WMTUnimplemented, /* 191: retired DXR scalar postbuild helper */
+    &_WMTUnimplemented, /* 192: retired DXR scalar compaction helper */
     &_MTLResource_gpuResourceID,
     &_MTLComputeCommandEncoder_setVisibleFunctionTable,
     &_MTLComputeCommandEncoder_setIntersectionFunctionTable,
@@ -5433,7 +5732,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTASEncoder_fence,
     &_WMTGetPipelineCacheIdentity,
     &_MTLDevice_maxBufferLength,
-    NULL, /* 201: sampleTimestamps uses pointer outputs and has no WoW64 thunk. */
+    &_MTLDevice_sampleTimestamps, /* 201: timestamps return in the shared fixed-width POD. */
     &_MTLAllocation_allocatedSize,
     &_MTLResidencySet_allocatedSize,
     &_WMTPresentationObserver_create,
@@ -5490,5 +5789,62 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTUnimplemented, /* 254: reserved (gsts) */
     &_WMTUnimplemented, /* 255: reserved (gsts) */
     &_MTLDevice_gpuCoreCount, /* 256: IOKit gpu-core-count of the device's accelerator (0 if unknown). */
+    &_WMTUnimplemented, /* 257: reserved (FL) */
+    &_WMTUnimplemented, /* 258: reserved (FL) */
+    &_WMTUnimplemented, /* 259: reserved (FL) */
+    &_WMTUnimplemented, /* 260: reserved (FL) */
+    &_WMTUnimplemented, /* 261: reserved (FL) */
+    &_WMTUnimplemented, /* 262: reserved (FL) */
+    &_WMTUnimplemented, /* 263: reserved (FL) */
+    &_WMTUnimplemented, /* 264: reserved (DXR) */
+    &_WMTUnimplemented, /* 265: reserved (DXR) */
+    &_WMTUnimplemented, /* 266: reserved (DXR) */
+    &_WMTUnimplemented, /* 267: reserved (DXR) */
+    &_WMTASSidecar_allocate, /* 268: DXR deferred sidecar allocation (fixed-width) */
+    &_WMTASSidecar_instanceCount, /* 269: DXR sidecar instance count (fixed-width) */
+    &_WMTASSidecar_generations, /* 270: DXR retained sidecar generations (fixed-width) */
+    &_WMTUnimplemented, /* 271: reserved (DXR) */
+    &_WMTUnimplemented, /* 272: reserved (DXR) */
+    &_WMTUnimplemented, /* 273: reserved (DXR) */
+    &_WMTUnimplemented, /* 274: reserved (DXR) */
+    &_WMTUnimplemented, /* 275: reserved (DXR) */
+    &_WMTUnimplemented, /* 276: reserved (DXR) */
+    &_WMTUnimplemented, /* 277: reserved (DXR) */
+    &_WMTUnimplemented, /* 278: reserved (DXR) */
+    &_WMTUnimplemented, /* 279: reserved (DXR) */
+    &_WMTUnimplemented, /* 280: reserved (MESH) */
+    &_WMTUnimplemented, /* 281: reserved (MESH) */
+    &_WMTUnimplemented, /* 282: reserved (MESH) */
+    &_WMTUnimplemented, /* 283: reserved (MESH) */
+    &_WMTUnimplemented, /* 284: reserved (MESH) */
+    &_WMTUnimplemented, /* 285: reserved (MESH) */
+    &_WMTUnimplemented, /* 286: reserved (MESH) */
+    &_WMTUnimplemented, /* 287: reserved (MESH) */
+    &_WMTUnimplemented, /* 288: reserved (CONSRAST) */
+    &_WMTUnimplemented, /* 289: reserved (CONSRAST) */
+    &_WMTUnimplemented, /* 290: reserved (CONSRAST) */
+    &_WMTUnimplemented, /* 291: reserved (CONSRAST) */
+    &_WMTUnimplemented, /* 292: reserved (VRS) */
+    &_WMTUnimplemented, /* 293: reserved (VRS) */
+    &_WMTUnimplemented, /* 294: reserved (VRS) */
+    &_WMTUnimplemented, /* 295: reserved (VRS) */
+    &_WMTUnimplemented, /* 296: reserved (VRS) */
+    &_WMTUnimplemented, /* 297: reserved (VRS) */
+    &_WMTUnimplemented, /* 298: reserved (VRS) */
+    &_WMTUnimplemented, /* 299: reserved (VRS) */
+    &_WMTUnimplemented, /* 300: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 301: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 302: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 303: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 304: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 305: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 306: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 307: reserved (FEEDBACK) */
+    &_WMTUnimplemented, /* 308: reserved (VIEWINST) */
+    &_WMTUnimplemented, /* 309: reserved (VIEWINST) */
+    &_WMTUnimplemented, /* 310: reserved (VIEWINST) */
+    &_WMTUnimplemented, /* 311: reserved (VIEWINST) */
+    &thunk32_SM50WGReflectLibrary, /* 312: work graph library reflection */
+    &thunk32_SM50WGCompileNode, /* 313: work graph node compilation */
 };
 #endif

@@ -1,6 +1,7 @@
 #include "stddef.h"
 #include "airconv_public.h"
 #include "dxil_raytracing.h"
+#include "dxil_workgraph.h"
 
 #ifndef __WINEMETAL_AIRCONV_THUNKS_H
 #define __WINEMETAL_AIRCONV_THUNKS_H
@@ -28,6 +29,9 @@ enum airconv_unixcalls {
   unix_sm50_rt_compile_pipeline,
   unix_sm50_needs_raster_ordered_buffer_marker = 212,
   unix_sm50_copy_compiled_bitcode = 215,
+  /* D3D12 work graph node shaders (dxil_workgraph.h). */
+  unix_sm50_wg_reflect_library = 312,
+  unix_sm50_wg_compile_node = 313,
 };
 
 /** One export of a DXIL library, as reported by SM50RTEnumerateLibraryExports. */
@@ -59,6 +63,33 @@ struct sm50_rt_compile_pipeline_params {
   void *functions;
   uint32_t function_capacity;
   uint32_t *function_count;
+  sm50_error_t *error;
+  int ret;
+};
+
+/** SM50WGReflectLibrary; the arrays are the dxil_workgraph.h types, opaque here. */
+struct sm50_wg_reflect_library_params {
+  const void *bytecode;
+  uint64_t bytecode_size;
+  void *nodes;
+  uint32_t node_capacity;
+  void *outputs;
+  uint32_t output_capacity;
+  char *names;
+  uint64_t names_size;
+  uint32_t *node_count;
+  uint32_t *output_count;
+  uint64_t *names_size_out;
+  sm50_error_t *error;
+  int ret;
+};
+
+/** SM50WGCompileNode; the description is forwarded verbatim. */
+struct sm50_wg_compile_node_params {
+  const void *desc;
+  sm50_bitcode_t *bitcode;
+  struct SM50_COMPILED_BITCODE *metallib;
+  void *info;
   sm50_error_t *error;
   int ret;
 };
@@ -327,6 +358,72 @@ struct sm50_rt_compile_pipeline_params32 {
 };
 
 COMPATIBLE_STRUCT32(sm50_rt_compile_pipeline_params, 32)
+
+struct sm50_rt_pipeline_desc32 {
+  uint32_t Libraries, LibraryCount, Exports, ExportCount, GlobalRootSignature;
+  uint64_t GlobalRootSignatureSize;
+  uint32_t MaxRecursionDepth, MaxPayloadSize, MaxAttributeSize, Flags, MetalVersion;
+  uint32_t LinkExports, LinkExportCount, FunctionNames;
+  uint64_t FunctionNamesSize;
+};
+struct sm50_rt_library32 { uint32_t Bytecode; uint64_t Size; };
+struct sm50_rt_export32 {
+  uint32_t Stage, LibraryIndex, HitGroupType, ClosestHitIndex, AnyHitIndex, IntersectionIndex;
+  uint32_t EntryPoint, ContainerEntryPoint, LocalRootSignature;
+  uint64_t LocalRootSignatureSize;
+};
+struct sm50_rt_function_info32 {
+  uint32_t Name, ExportName, Kind, ExportIndex, TableIndex, IsDispatchEntry;
+};
+_Static_assert(sizeof(struct sm50_rt_pipeline_desc32) == 72, "raytracing pipeline description ABI");
+_Static_assert(sizeof(struct sm50_rt_export32) == 48, "raytracing export ABI");
+#if !defined(__LP64__) && !defined(_WIN64)
+_Static_assert(sizeof(struct SM50_RT_PIPELINE_DESC) == sizeof(struct sm50_rt_pipeline_desc32), "raytracing caller description ABI");
+_Static_assert(sizeof(struct SM50_RT_EXPORT) == sizeof(struct sm50_rt_export32), "raytracing caller export ABI");
+_Static_assert(sizeof(struct SM50_RT_LIBRARY) == sizeof(struct sm50_rt_library32), "raytracing caller library ABI");
+_Static_assert(sizeof(struct SM50_RT_FUNCTION_INFO) == sizeof(struct sm50_rt_function_info32), "raytracing caller reflection ABI");
+#endif
+
+struct sm50_wg_reflect_library_params32 {
+  uint32_t bytecode;
+  uint64_t bytecode_size;
+  uint32_t nodes, node_capacity, outputs, output_capacity, names;
+  uint64_t names_size;
+  uint32_t node_count, output_count, names_size_out, error;
+  int ret;
+};
+COMPATIBLE_STRUCT32(sm50_wg_reflect_library_params, 72)
+
+struct sm50_wg_compile_node_params32 {
+  uint32_t desc, bitcode, metallib, info, error;
+  int ret;
+};
+COMPATIBLE_STRUCT32(sm50_wg_compile_node_params, 24)
+
+struct sm50_wg_node_compile_desc32 {
+  uint32_t Library;
+  uint64_t LibrarySize;
+  uint32_t EntryPoint, FunctionName, GlobalRootSignature;
+  uint64_t GlobalRootSignatureSize;
+  uint32_t LocalRootSignature;
+  uint64_t LocalRootSignatureSize;
+  uint32_t MetalVersion, Launch, OutputCount, Reserved, OutputElementBase, OutputElementCount;
+  uint32_t Libraries, Exports, LibraryCount, ExportCount, EntryLibraryIndex, AllowUnresolved, EntryExportIndex;
+};
+_Static_assert(sizeof(struct sm50_wg_node_compile_desc32) == 112, "work graph node description ABI");
+struct sm50_wg_library32 { uint32_t Bytecode; uint64_t Size; };
+struct sm50_wg_export32 {
+  uint32_t Name, EntryPoint, LibraryIndex, Scope, Flags, Reserved;
+  uint32_t GlobalRootSignature; uint64_t GlobalRootSignatureSize;
+  uint32_t LocalRootSignature; uint64_t LocalRootSignatureSize;
+};
+_Static_assert(sizeof(struct sm50_wg_export32) == 56, "work graph export description ABI");
+
+#if !defined(__LP64__) && !defined(_WIN64)
+_Static_assert(sizeof(struct SM50_WG_NODE_COMPILE_DESC) == 112, "work graph caller node description ABI");
+_Static_assert(sizeof(struct SM50_WG_LIBRARY) == sizeof(struct sm50_wg_library32), "work graph caller library ABI");
+_Static_assert(sizeof(struct SM50_WG_EXPORT) == sizeof(struct sm50_wg_export32), "work graph caller export ABI");
+#endif
 
 #define UNIX_CALL(code, params) WINE_UNIX_CALL(unix_##code, params)
 

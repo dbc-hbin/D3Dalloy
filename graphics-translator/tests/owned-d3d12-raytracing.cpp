@@ -79,6 +79,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -1459,9 +1460,23 @@ int testRaytracing(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8
   return 0;
 }
 
+} // namespace
+
+#include "owned-d3d12-raytracing-contract.inc"
+#include "owned-d3d12-raytracing-stateobj.inc"
+#include "owned-d3d12-raytracing-asserialize.inc"
+#include "owned-d3d12-raytracing-rayquery.inc"
+#include "owned-d3d12-raytracing-rootargs.inc"
+#include "owned-d3d12-raytracing-coverage.inc"
+#include "owned-d3d12-raytracing-rayquery-stages.inc"
+#include "owned-d3d12-raytracing-linkage.inc"
+
+namespace {
+
 int run(int argc, wchar_t **argv) {
-  if (argc != 2) {
-    std::fprintf(stderr, "usage: owned-d3d12-raytracing.exe <raytracing.dxil>\n");
+  if (argc < 4) {
+    std::fprintf(stderr, "usage: owned-d3d12-raytracing.exe <raytracing.dxil> <raytracing-contract.dxil> "
+                         "<raytracing-stateobj.dxil> [further suite DXIL]\n");
     return 2;
   }
 
@@ -1497,8 +1512,56 @@ int run(int argc, wchar_t **argv) {
 
   const auto dxil = readFile(argv[1]);
 
+  const auto contractDxil = readFile(argv[2]);
+  const auto stateobjDxil = readFile(argv[3]);
+
   Context context(device.Get());
-  const int failures = testRaytracing(device5.Get(), context, dxil);
+  int failures = testRaytracing(device5.Get(), context, dxil);
+  // The base workload leaves its list closed; the contract cases record on a fresh one.
+  check(context.allocator->Reset(), "CommandAllocator::Reset(contract)");
+  check(context.list->Reset(context.allocator.Get(), nullptr), "CommandList::Reset(contract)");
+  failures += contract::runAll(device5.Get(), context, contractDxil);
+  {
+    // The state-object cases build their scenes through a contract runner's geometry helpers.
+    contract::Runner geometry(device5.Get(), context, contractDxil);
+    failures += stateobj::runAll(device5.Get(), context, stateobjDxil, geometry);
+  }
+  failures += asserialize::runAll(device5.Get(), context, contractDxil);
+  if (argc < 10) {
+    std::fprintf(stderr,
+                 "OWNED_D3D12_RAYTRACING_FAIL step=rayquery: missing raytracing-rayquery-{cs,vs,fs,ps,lib,args}.dxil\n");
+    ++failures;
+  } else {
+    failures += rayquery::runAll(device5.Get(), context, readFile(argv[4]), readFile(argv[5]), readFile(argv[6]),
+                                 readFile(argv[7]), readFile(argv[8]), readFile(argv[9]));
+  }
+  if (argc < 12) {
+    std::fprintf(stderr, "OWNED_D3D12_RAYTRACING_FAIL step=rootargs: missing raytracing-rootargs.dxil\n");
+    ++failures;
+  } else {
+    failures += rootargs::run(device5.Get(), context, readFile(argv[11]));
+  }
+  if (argc < 11) {
+    std::fprintf(stderr, "OWNED_D3D12_RAYTRACING_FAIL step=coverage: missing raytracing-coverage.dxil\n");
+    ++failures;
+  } else {
+    contract::Runner geometry(device5.Get(), context, contractDxil);
+    failures += coverage::runAll(device5.Get(), context, readFile(argv[10]), geometry);
+  }
+  if (argc < 22) {
+    std::fprintf(stderr, "OWNED_D3D12_RAYTRACING_FAIL step=rayquery-stages: missing frozen stage DXIL\n");
+    ++failures;
+  } else {
+    failures += rayquery_stages::runAll(device5.Get(), context, argv);
+  }
+  if (argc < 25) {
+    std::fprintf(stderr, "OWNED_D3D12_RAYTRACING_FAIL step=linkage: missing frozen function libraries\n");
+    ++failures;
+  } else {
+    contract::Runner geometry(device5.Get(), context, contractDxil);
+    failures += linkage::run(device5.Get(), context, stateobjDxil, geometry, readFile(argv[22]),
+                             readFile(argv[23]), readFile(argv[24]));
+  }
   if (!failures)
     std::puts("OWNED_D3D12_RAYTRACING_PASS");
   return failures ? 1 : 0;

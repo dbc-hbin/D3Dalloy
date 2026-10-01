@@ -173,17 +173,9 @@ public:
           llvm::cast<llvm::PointerType>(LocalRootArgumentPointer->getType())->getAddressSpace();
       return B.CreateBitCast(LocalRootArgumentPointer, LocalRootArgumentsType->getPointerTo(Space));
     }
-    /*
-     * A stage that declares the local root table reads its own record's entry
-     * straight out of the table the runtime binds: the ray generation shader is the
-     * single record of its table, so its entry is the table's base, and an
-     * intersection shader's record is selected the same way. A visible function
-     * cannot declare the table (fixed ABI), so it takes the entry the caller
-     * selected instead - the pointer above.
-     */
-    if (~LocalRootArgumentSlot == 0)
-      return nullptr;
-    return AIR.builder.GetInsertBlock()->getParent()->getArg(LocalRootArgumentSlot);
+    /* Every stage takes its record's local root arguments from the pointer above; the
+     * stage builder resolves it straight out of the application's shader table. */
+    return nullptr;
   };
 
   /**
@@ -195,6 +187,17 @@ public:
    * arguments it was handed, i.e. by position. `~0u` means the argument was not
    * declared.
    */
+  /** Field index of the view-id qword in the global entry, or ~0u (local-only / no signature). */
+  uint32_t ViewIdFieldIndex = ~0u;
+
+  virtual llvm::Value *
+  ViewInstanceId(llvm::air::AIRBuilder &AIR) {
+    auto Entry = GlobalRootArguments(AIR);
+    if (!Entry || ViewIdFieldIndex == ~0u)
+      return nullptr;
+    return AIR.builder.CreateTrunc(GetEntryField(AIR, Entry, ViewIdFieldIndex), AIR.builder.getInt32Ty());
+  }
+
   virtual uint32_t RootSignatureArgumentIndex() const { return RootSignatureArgumentSlot; }
   virtual uint32_t StaticSamplerArgumentIndex() const { return StaticSamplerArgumentSlot; }
 
@@ -256,9 +259,9 @@ public:
     auto Table = StaticSamplerTable(Builder);
     if (!Table)
       return {};
-    auto [SamplerH, CubeSampler, Metadata] =
+    auto [SamplerH, CubeSampler, Metadata, LodRange] =
         GetSamplerDescriptor(Builder, Table, Index, Sampler.range.lower_bound, Sampler.arg_index);
-    return SamplerDescriptor{SamplerH, CubeSampler, Metadata};
+    return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange};
   }
 
   llvm::Optional<SamplerDescriptor>
@@ -267,9 +270,9 @@ public:
       uint64_t DescriptorOffset, llvm::Value *Index
   ) {
     auto HeapPointer = GetEntryField(Builder, Entry, Sampler.arg_index);
-    auto [SamplerH, CubeSampler, Metadata] =
+    auto [SamplerH, CubeSampler, Metadata, LodRange] =
         GetSamplerDescriptor(Builder, HeapPointer, Index, Sampler.range.lower_bound, DescriptorOffset);
-    return SamplerDescriptor{SamplerH, CubeSampler, Metadata};
+    return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange};
   }
 
   llvm::Optional<TextureDescirptor>
@@ -318,6 +321,8 @@ public:
       result.StatusBase = EmulationAddress;
       result.StatusView = EmulationTag;
       result.RGB32StatusBase = GetDescriptorQword0(Builder, HeapPointer, Index, First, DescriptorOffset);
+    } else {
+      result.ViewRange = EmulationAddress;
     }
     return result;
   }
@@ -573,7 +578,7 @@ public:
     );
   }
 
-  std::tuple<llvm::Value *, llvm::Value *, llvm::Value *>
+  std::tuple<llvm::Value *, llvm::Value *, llvm::Value *, llvm::Value *>
   GetSamplerDescriptor(
       llvm::air::AIRBuilder &AIR, llvm::Value *IntPtr, llvm::Value *Index, RangeId RangeId, uint32_t DescriptorOffset
   ) {
@@ -605,6 +610,13 @@ public:
             B.CreateGEP(
                 TySamplerDescriptor, B.CreatePointerCast(IntPtr, TySamplerDescriptor->getPointerTo(Space)),
                 {IdxDescriptor, AIR.getInt(2) /* metadata*/}
+            )
+        ),
+        B.CreateLoad(
+            llvm::Type::getInt64Ty(AIR.getContext()),
+            B.CreateGEP(
+                TySamplerDescriptor, B.CreatePointerCast(IntPtr, TySamplerDescriptor->getPointerTo(Space)),
+                {IdxDescriptor, AIR.getInt(3) /* lod range (sampler feedback) */}
             )
         )
     };
@@ -834,14 +846,12 @@ public:
 
   /*
    * Argument positions of the two entries a shader that declares signature
-   * arguments reads directly, and of the local root table a ray generation or
-   * intersection stage reads its own record's entry from. `~0u` means the
-   * argument was not declared (the shader resolves the entry through a pointer the
-   * stage builder handed in instead, or has no such entry at all).
+   * arguments reads directly. `~0u` means the argument was not declared (the
+   * shader resolves the entry through a pointer the stage builder handed in
+   * instead).
    */
   uint32_t RootSignatureArgumentSlot = ~0u;
   uint32_t StaticSamplerArgumentSlot = ~0u;
-  uint32_t LocalRootArgumentSlot = ~0u;
 
   /**
    * Entry type of the global root signature, i.e. of the command list's root
@@ -947,8 +957,8 @@ public:
     auto [Heap, Slot] = HeapSlot(Builder, true, Index);
     if (!Heap)
       return {};
-    auto [SamplerH, CubeSampler, Metadata] = GetSamplerDescriptor(Builder, Heap, Slot, 0, 0);
-    return SamplerDescriptor{SamplerH, CubeSampler, Metadata};
+    auto [SamplerH, CubeSampler, Metadata, LodRange] = GetSamplerDescriptor(Builder, Heap, Slot, 0, 0);
+    return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange};
   }
 
   virtual llvm::Optional<TextureDescirptor>
@@ -1184,7 +1194,7 @@ setup_binding_rootsig(
     microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type, const void *bytecode, size_t bytecode_length,
     uint32_t root_sig_slot, uint32_t static_sampler_slot,
     const void *local_bytecode, size_t local_bytecode_length,
-    bool bind_signature_arguments, uint32_t local_root_slot
+    bool bind_signature_arguments
 ) {
   using namespace microsoft;
   using namespace dxmt::dxbc;
@@ -1231,6 +1241,14 @@ setup_binding_rootsig(
       break;
     case D3D12_SHADER_VISIBILITY_PIXEL:
       if (shader_type == D3D10_SB_PIXEL_SHADER)
+        return true;
+      break;
+    case 6: /* D3D12_SHADER_VISIBILITY_AMPLIFICATION */
+      if (shader_type == D3D12_SB_AMPLIFICATION_SHADER)
+        return true;
+      break;
+    case 7: /* D3D12_SHADER_VISIBILITY_MESH */
+      if (shader_type == D3D12_SB_MESH_SHADER)
         return true;
       break;
     default:
@@ -1437,13 +1455,23 @@ setup_binding_rootsig(
       }
       case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS: {
         auto &constants = Parameter.Constants;
-        auto qwords = (constants.Num32BitValues >> 1) + (constants.Num32BitValues & 1);
-        auto first = entry_builder.DefineInteger64("root_constant" + std::to_string(i), attribute_index++);
-        for (unsigned x = 1; x < qwords; x++) {
-          entry_builder.DefineInteger64(
-              "root_constant" + std::to_string(i) + "_" + std::to_string(x), attribute_index++
-          );
-        }
+        /*
+         * A local root signature's entry is the application's own shader record bytes, in
+         * the D3D12 local root layout: root constants 4 byte packed, root descriptors and
+         * tables 8 byte aligned. One i32 field per constant reproduces that exactly, since
+         * the struct's natural alignment places the next pointer field on 8 bytes. The
+         * global entry is the runtime's qword layout.
+         */
+        const bool local_layout = &ranges == &binding_map->Local;
+        const auto fields = local_layout ? constants.Num32BitValues
+                                         : (constants.Num32BitValues >> 1) + (constants.Num32BitValues & 1);
+        auto define = [&](std::string name) {
+          return local_layout ? entry_builder.DefineInteger32(std::move(name), attribute_index++)
+                              : entry_builder.DefineInteger64(std::move(name), attribute_index++);
+        };
+        auto first = define("root_constant" + std::to_string(i));
+        for (unsigned x = 1; x < fields; x++)
+          define("root_constant" + std::to_string(i) + "_" + std::to_string(x));
         if (!check_visibility(Parameter.ShaderVisibility))
           break;
         for (auto &[_, cbuf] : shader_info->cbufferMap) {
@@ -1604,6 +1632,13 @@ setup_binding_rootsig(
     }
   }
 
+  /*
+   * View instancing: one qword after everything else, written by the command list with the view each replayed
+   * draw renders (MTLD3D12RootSignature::ViewIdQwordOffset). Local root signatures have none.
+   */
+  if (root_sig && !(static_cast<UINT>(root_sig->Flags) & 0x80u /* LOCAL_ROOT_SIGNATURE */))
+    binding_map->ViewIdFieldIndex = builder.DefineInteger64("view_id", inc_attribute_index++);
+
   auto [type, metadata] = builder.Build(module.getContext(), module.getDataLayout());
   binding_map->GlobalRootArgumentsType = type;
 
@@ -1678,29 +1713,9 @@ setup_binding_rootsig(
         ))
       return {};
 
-    auto [local_type, local_type_info] = local_builder.Build(module.getContext(), module.getDataLayout());
+    auto [local_type, local_type_info_unused] = local_builder.Build(module.getContext(), module.getDataLayout());
+    (void)local_type_info_unused;
     binding_map->LocalRootArgumentsType = local_type;
-
-    /*
-     * The local root table itself, for the stages that take signature arguments.
-     *
-     * The runtime binds the buffer holding every record's materialized local root
-     * entry at `local_root_slot` for every DispatchRays, and nothing declared it
-     * before, so the binding was dead. Declaring it is what lets a ray generation
-     * shader (the single record of its own table, i.e. the table base) read its own
-     * local root arguments; a visible function cannot declare it - its ABI is fixed -
-     * so it takes the entry its caller selected, through the pointer above.
-     */
-    if (bind_signature_arguments && ~local_root_slot)
-      binding_map->LocalRootArgumentSlot = func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
-          .location_index = local_root_slot, // SM50_RT_BINDING_INDEX_LOCAL_ROOT_TABLE
-          .array_size = 1,
-          .memory_access = air::MemoryAccess::read,
-          .address_space = air::AddressSpace::constant,
-          .struct_type = binding_map->LocalRootArgumentsType,
-          .struct_type_info = local_type_info,
-          .arg_name = "local_roots",
-      });
 
     /*
      * A static sampler of the local signature is pipeline state, not a record

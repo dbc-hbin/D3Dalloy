@@ -28,6 +28,7 @@
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/DXBCUtils.h"
 #include <atomic>
+#include <bit>
 
 namespace dxmt {
 
@@ -94,6 +95,39 @@ constexpr WMTLogicOperation kLogicOpMap[] = {
     WMTLogicOperationAndReverse,   WMTLogicOperationAndInverted, WMTLogicOperationOrReverse,
     WMTLogicOperationOrInverted,
 };
+
+/* A logic-op PSO with any RGB10A2_UINT target applies the op in the PS epilogue (framebuffer fetch) for every
+ * target: Metal's native logic op saturates RGB10A2Uint results whose bits exceed the component width. */
+inline bool LogicOpNeedsFetch(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
+  if (pDesc->BlendState.IndependentBlendEnable || !pDesc->BlendState.RenderTarget[0].LogicOpEnable)
+    return false;
+  for (UINT i = 0; i < pDesc->NumRenderTargets && i < 8; ++i)
+    if (pDesc->RTVFormats[i] == DXGI_FORMAT_R10G10B10A2_UINT)
+      return true;
+  return false;
+}
+
+/* Component widths of a UINT render-target format for the fetch logic op; false for any non-UINT format. */
+inline bool LogicOpComponentBits(DXGI_FORMAT format, uint8_t (&bits)[4]) {
+  const auto set = [&](uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    bits[0] = r, bits[1] = g, bits[2] = b, bits[3] = a;
+    return true;
+  };
+  switch (format) {
+  case DXGI_FORMAT_R32G32B32A32_UINT: return set(32, 32, 32, 32);
+  case DXGI_FORMAT_R32G32B32_UINT: return set(32, 32, 32, 0);
+  case DXGI_FORMAT_R16G16B16A16_UINT: return set(16, 16, 16, 16);
+  case DXGI_FORMAT_R32G32_UINT: return set(32, 32, 0, 0);
+  case DXGI_FORMAT_R10G10B10A2_UINT: return set(10, 10, 10, 2);
+  case DXGI_FORMAT_R8G8B8A8_UINT: return set(8, 8, 8, 8);
+  case DXGI_FORMAT_R16G16_UINT: return set(16, 16, 0, 0);
+  case DXGI_FORMAT_R32_UINT: return set(32, 0, 0, 0);
+  case DXGI_FORMAT_R8G8_UINT: return set(8, 8, 0, 0);
+  case DXGI_FORMAT_R16_UINT: return set(16, 0, 0, 0);
+  case DXGI_FORMAT_R8_UINT: return set(8, 0, 0, 0);
+  default: return false;
+  }
+}
 
 constexpr WMTBlendFactor kBlendFactorMap[] = {
     WMTBlendFactorZero, // padding 0
@@ -270,7 +304,7 @@ ExtractMTLInputLayoutElements(
 }
 
 /*
- * Validate a D3D12_STREAM_OUTPUT_DESC for a VS-only pipeline and build its owned layout.
+ * Validate a D3D12_STREAM_OUTPUT_DESC against the last active pre-rasterization stage.
  * Rules follow D3D11.3 FS ch.14 (14.1, 14.3 DDI comments) and the D3D12 SO structure
  * docs; the D3D12 runtime reports every violation as E_INVALIDARG.
  * StartComponent/ComponentCount address the components of the named output register,
@@ -289,11 +323,14 @@ BuildStreamOutputLayout(
     WARN("CreatePipelineState: SO entry/stride count out of range");
     return E_INVALIDARG;
   }
-  if (desc.RasterizedStream != 0 && desc.RasterizedStream != D3D12_SO_NO_RASTERIZED_STREAM) {
-    // Streams 1..3 only exist when a GS emits them; GS multi-stream output is not implemented.
-    WARN("CreatePipelineState: RasterizedStream ", desc.RasterizedStream,
-         geometry ? " (GS streams 1-3 are not implemented)" : " requires a geometry shader");
-    return geometry && desc.RasterizedStream < D3D12_SO_STREAM_COUNT ? E_NOTIMPL : E_INVALIDARG;
+  if (desc.RasterizedStream >= D3D12_SO_STREAM_COUNT && desc.RasterizedStream != D3D12_SO_NO_RASTERIZED_STREAM) {
+    WARN("CreatePipelineState: invalid RasterizedStream ", desc.RasterizedStream);
+    return E_INVALIDARG;
+  }
+  if (!geometry && desc.RasterizedStream != 0 && desc.RasterizedStream != D3D12_SO_NO_RASTERIZED_STREAM) {
+    // Streams 1..3 only exist when a GS emits them.
+    WARN("CreatePipelineState: RasterizedStream ", desc.RasterizedStream, " requires a geometry shader");
+    return E_INVALIDARG;
   }
   for (UINT i = 0; i < desc.NumStrides; i++) {
     const UINT stride = desc.pBufferStrides[i];
@@ -303,18 +340,18 @@ BuildStreamOutputLayout(
     }
   }
 
-  // `vs` is the last pre-rasterization stage: the VS, or the GS (stream 0 of its OSG5 signature).
+  // `vs` is the last pre-rasterization stage: GS, otherwise DS, otherwise VS.
   CSignatureParser5 parser;
   if (FAILED(DXBCGetOutputSignature(vs.pShaderBytecode, &parser)) || !parser.Signature(0)) {
     WARN("CreatePipelineState: SO requires an output signature");
     return E_INVALIDARG;
   }
-  const D3D11_SIGNATURE_PARAMETER *parameters;
-  const UINT parameter_count = parser.Signature(0)->GetParameters(&parameters);
 
   std::array<uint32_t, D3D12_SO_BUFFER_SLOT_COUNT> slot_components{};
   std::array<uint32_t, D3D12_SO_BUFFER_SLOT_COUNT> slot_elements{};
-  uint32_t stream_components = 0;
+  // The stream each slot belongs to; every output buffer is written by exactly one stream.
+  std::array<uint32_t, D3D12_SO_BUFFER_SLOT_COUNT> slot_stream{~0u, ~0u, ~0u, ~0u};
+  std::array<uint32_t, D3D12_SO_STREAM_COUNT> stream_components{};
   try {
     layout.elements.reserve(desc.NumEntries);
   } catch (const std::bad_alloc &) {
@@ -322,12 +359,8 @@ BuildStreamOutputLayout(
   }
   for (UINT i = 0; i < desc.NumEntries; i++) {
     const auto &entry = desc.pSODeclaration[i];
-    if (entry.Stream != 0) {
-      if (geometry && entry.Stream < D3D12_SO_STREAM_COUNT) {
-        WARN("CreatePipelineState: GS stream output to stream ", entry.Stream, " is not implemented");
-        return E_NOTIMPL;
-      }
-      WARN("CreatePipelineState: SO stream ", entry.Stream, " requires a geometry shader");
+    if (entry.Stream >= D3D12_SO_STREAM_COUNT || (entry.Stream != 0 && !geometry)) {
+      WARN("CreatePipelineState: SO stream ", entry.Stream, geometry ? " is out of range" : " requires a geometry shader");
       return E_INVALIDARG;
     }
     if (entry.OutputSlot >= D3D12_SO_BUFFER_SLOT_COUNT || !entry.ComponentCount) {
@@ -335,6 +368,13 @@ BuildStreamOutputLayout(
       return E_INVALIDARG;
     }
     const uint32_t slot = entry.OutputSlot;
+    const uint32_t stream = entry.Stream;
+    if (slot_stream[slot] != ~0u && slot_stream[slot] != stream) {
+      WARN("CreatePipelineState: SO slot ", slot, " is written by streams ", slot_stream[slot], " and ", stream);
+      return E_INVALIDARG;
+    }
+    slot_stream[slot] = stream;
+    auto &stream_layout = layout.streams[stream];
     if (!entry.SemanticName) {
       // A gap skips ComponentCount dwords (may exceed 4) and has no semantic.
       if (entry.SemanticIndex || entry.StartComponent) {
@@ -346,8 +386,10 @@ BuildStreamOutputLayout(
         WARN("CreatePipelineState: invalid SO component range at entry ", i);
         return E_INVALIDARG;
       }
+      const D3D11_SIGNATURE_PARAMETER *parameters;
+      const UINT parameter_count = parser.Signature(stream)->GetParameters(&parameters);
       auto signature = std::find_if(parameters, parameters + parameter_count, [&](const auto &parameter) {
-        return parameter.Stream == 0 && parameter.SemanticIndex == entry.SemanticIndex &&
+        return parameter.Stream == stream && parameter.SemanticIndex == entry.SemanticIndex &&
                strcasecmp(parameter.SemanticName, entry.SemanticName) == 0;
       });
       // StartComponent counts from the element's first component, not from .x of the packed
@@ -357,12 +399,12 @@ BuildStreamOutputLayout(
       const uint32_t mask = ((1u << entry.ComponentCount) - 1) << (first + entry.StartComponent);
       if (!element_mask || first + entry.StartComponent + entry.ComponentCount > 4 || (mask & ~element_mask)) {
         WARN("CreatePipelineState: SO element ", entry.SemanticName, entry.SemanticIndex,
-             " is not written by the vertex shader");
+             " is not written to stream ", stream, " by the shader");
         return E_INVALIDARG;
       }
       for (const auto &other : layout.elements) {
         const uint32_t other_mask = ((1u << other.component_count) - 1) << (first + other.start_component);
-        if (other.semantic_index == entry.SemanticIndex &&
+        if (other.stream == stream && other.semantic_index == entry.SemanticIndex &&
             strcasecmp(other.semantic_name.c_str(), entry.SemanticName) == 0 && (other_mask & mask)) {
           WARN("CreatePipelineState: overlapping SO element at entry ", i);
           return E_INVALIDARG;
@@ -371,23 +413,25 @@ BuildStreamOutputLayout(
       try {
         layout.elements.push_back(StreamOutputLayout::Element{
             entry.SemanticName, entry.SemanticIndex, entry.StartComponent, entry.ComponentCount, slot,
-            slot_components[slot] * 4, layout.record_dwords});
+            slot_components[slot] * 4, stream_layout.record_dwords, stream});
       } catch (const std::bad_alloc &) {
         return E_OUTOFMEMORY;
       }
-      layout.record_dwords += entry.ComponentCount;
+      stream_layout.record_dwords += entry.ComponentCount;
       slot_elements[slot]++;
     }
     slot_components[slot] += entry.ComponentCount;
-    stream_components += entry.ComponentCount;
-    layout.referenced_slot_mask |= 1u << slot;
-    if (stream_components > D3D12_SO_OUTPUT_COMPONENT_COUNT) {
-      WARN("CreatePipelineState: SO declaration exceeds ", D3D12_SO_OUTPUT_COMPONENT_COUNT, " components");
+    stream_components[stream] += entry.ComponentCount;
+    stream_layout.referenced_slot_mask |= 1u << slot;
+    layout.stream_mask |= 1u << stream;
+    if (stream_components[stream] > D3D12_SO_OUTPUT_COMPONENT_COUNT) {
+      WARN("CreatePipelineState: SO declaration of stream ", stream, " exceeds ", D3D12_SO_OUTPUT_COMPONENT_COUNT,
+           " components");
       return E_INVALIDARG;
     }
   }
   for (uint32_t slot = 0; slot < D3D12_SO_BUFFER_SLOT_COUNT; slot++) {
-    if (!(layout.referenced_slot_mask & (1u << slot)))
+    if (slot_stream[slot] == ~0u)
       continue;
     const uint32_t bytes = slot_components[slot] * 4;
     // 14.1: at most 512 bytes written per vertex to one buffer; the stride must cover it.
@@ -528,6 +572,9 @@ protected:
   uint32_t statistics_ps_sample_mask = 0;
   bool statistics_ps_dual_source_blending = false;
   std::array<uint32_t, 8> statistics_ps_formats{};
+  /* Framebuffer-fetch logic op (LogicOpNeedsFetch); chained into every PS variant that writes render targets. */
+  SM50_SHADER_D3D12_LOGIC_OP_DATA fetch_logic_op{};
+  bool use_fetch_logic_op = false;
   WMT::Reference<WMT::Function> statistics_vertex_function;
   WMT::Reference<WMT::Function> statistics_fragment_function;
   WMT::Reference<WMT::RenderPipelineState> statistics_pso;
@@ -538,12 +585,17 @@ protected:
   bool msaa_variants_attempted = false;
   std::unique_ptr<MSAAPipelineVariants> msaa_statistics_variants;
   bool msaa_statistics_variants_attempted = false;
+  /* Coarse shading variants, indexed by statistics_enabled. */
+  std::array<std::unique_ptr<MSAAPipelineVariants>, 2> msaa_coarse_variants;
+  std::array<bool, 2> msaa_coarse_variants_attempted{};
   WMTRenderPipelineInfo msaa_original_info{};
   bool msaa_dual_source = false;
   std::mutex mesh_pso_mutex;
   std::map<uint32_t, MeshPipelineVariant> mesh_variants;
   /* Everything a mesh variant is compiled from. Stage bytecode is owned: variants are built lazily. */
   std::vector<uint8_t> mesh_gs_bytecode, mesh_hs_bytecode, mesh_ds_bytecode;
+  /* MeshShader: AS (empty without one) and MS bytecode, and the root signature blob (empty: embedded in MS). */
+  std::vector<uint8_t> mesh_as_bytecode, mesh_ms_bytecode;
   WMTMeshRenderPipelineInfo mesh_info{};
   uint32_t mesh_max_potential_tess_factor = 0;
   bool mesh_rasterization_disabled = false;
@@ -563,10 +615,64 @@ protected:
       return hr;
     WMT::Reference<WMT::Error> err;
     auto lib = device_->GetMTLDevice().newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), err);
-    if (!lib)
+    if (!lib) {
       return E_FAIL;
+    }
     function = lib.newFunction(name);
     return function ? S_OK : E_FAIL;
+  }
+
+  /* Validates and retains the AS/MS of a mesh-shader pipeline (MeshShaderTier 1). */
+  HRESULT InitializeMeshShaderStages(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, const GraphicsPipelineExtras &extras) {
+    auto stage = [&](const char *name, const D3D12_SHADER_BYTECODE &bytecode, std::vector<uint8_t> &out,
+                     std::array<uint32_t, 3> &threads) -> HRESULT {
+      MTL_SHADER_REFLECTION reflection{};
+      SM50Shader shader;
+      if (HRESULT hr = InitializeShader(name, bytecode, &shader, &reflection); FAILED(hr))
+        return hr;
+      threads = {reflection.ThreadgroupSize[0], reflection.ThreadgroupSize[1], reflection.ThreadgroupSize[2]};
+      const auto *source = static_cast<const uint8_t *>(bytecode.pShaderBytecode);
+      out.assign(source, source + bytecode.BytecodeLength);
+      return S_OK;
+    };
+    HRESULT hr;
+    if (extras.as.pShaderBytecode && FAILED(hr = stage("AS", extras.as, mesh_as_bytecode, as_threads)))
+      return hr;
+    if (FAILED(hr = stage("MS", extras.ms, mesh_ms_bytecode, ms_threads)))
+      return hr;
+    uint32_t native_scalars = 0;
+    microsoft::CDXBCParser container;
+    if (FAILED(hr = container.ReadDXBC(extras.ms.pShaderBytecode, extras.ms.BytecodeLength))) return hr;
+    for (bool primitive : {false, true}) {
+      // A valid MS with no primitive attributes has no PSG1 chunk at all.
+      if (primitive && container.FindNextMatchingBlob(microsoft::DXBC_PatchConstantSignature11_1) == DXBC_BLOB_NOT_FOUND &&
+          container.FindNextMatchingBlob(microsoft::DXBC_PatchConstantSignature) == DXBC_BLOB_NOT_FOUND) continue;
+      microsoft::CSignatureParser signature;
+      hr = primitive ? microsoft::DXBCGetPatchConstantSignature(extras.ms.pShaderBytecode, &signature)
+                     : microsoft::DXBCGetOutputSignature(extras.ms.pShaderBytecode, &signature);
+      if (FAILED(hr)) return hr;
+      const microsoft::D3D11_SIGNATURE_PARAMETER *parameters;
+      const uint32_t count = signature.GetParameters(&parameters);
+      for (uint32_t i = 0; i < count; ++i) {
+        const auto &parameter = parameters[i];
+        if (primitive && !std::strcmp(parameter.SemanticName, "SV_CullPrimitive")) continue;
+        if (!parameter.Mask) continue;
+        // CullPrimitive is not packed into the D3D output signature. All other fields
+        // (including Position) must fit the combined vertex/primitive 32-row signature.
+        if (parameter.Register >= 32) return E_INVALIDARG;
+        const uint32_t lanes = std::popcount(uint32_t(parameter.Mask & 15));
+        // User rows are expanded to float4 AIR fields even for a packed scalar.
+        // Count the actual native signature, not only the D3D write mask.
+        native_scalars += parameter.SystemValue == microsoft::D3D10_SB_NAME_UNDEFINED ? 4 : lanes;
+        if (parameter.SystemValue == microsoft::D3D10_SB_NAME_CLIP_DISTANCE)
+          native_scalars += 4; // Native clip distance plus its PS-readable float4 copy.
+        if (parameter.SystemValue == microsoft::D3D10_SB_NAME_CULL_DISTANCE)
+          owned_mesh_output_replay = true;
+      }
+    }
+    owned_mesh_output_replay |= native_scalars > 124;
+    // Mesh/amplification shaders are DXIL-only (ms_6_5 / as_6_5); InitializeShader rejects other stages there.
+    return ms_threads[0] ? S_OK : E_INVALIDARG;
   }
 
   /* Validates and retains the GS or HS/DS stages of a mesh pipeline. */
@@ -641,10 +747,126 @@ protected:
   }
 
   /*
+   * D3D12 mesh-shader pipeline: the AS (if any) is the object function, the MS the mesh function, both through
+   * the ordinary SM50Compile DXIL path (dxil_mesh.cpp). Both read the graphics root signature.
+   */
+  HRESULT BuildMeshShaderPipeline(MeshPipelineVariant &variant, uint32_t key,
+                                  const SM50_MSAA_INTERPOLATION_LAYOUT *interpolation) {
+    const bool statistics = key & 8;
+    const bool capture_pixels = key & kMeshMSAACapture;
+    const bool replay_pixels = key & kMeshMSAAReplay;
+    SM50_SHADER_COMMON_DATA common{};
+    common.type = SM50_SHADER_COMMON;
+    common.metal_version = kD3D12ShaderMetalVersion;
+    // The statistics variant counts AS/MS invocations, MS primitives and the clipper (dxil_mesh.cpp).
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA stats{};
+    stats.type = SM50_SHADER_D3D12_PIPELINE_STATS;
+    stats.next = &common;
+    // The MS emits the per-primitive key the claiming statistics PS reads (the AS ignores it).
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA claim{};
+    claim.type = SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM;
+    claim.next = &common;
+    if (mesh_statistics_claim)
+      stats.next = &claim;
+    auto compile = [&](const char *stage, const char *name, const std::vector<uint8_t> &bytecode,
+                       ShaderImmutableConstants &constants, SM50ShaderBitcode &bitcode,
+                       WMT::Reference<WMT::Function> &function) -> HRESULT {
+      SM50Shader shader;
+      if (FAILED(InitializeShader(stage, {bytecode.data(), bytecode.size()}, &shader, nullptr)))
+        return E_FAIL;
+      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
+      root.type = SM50_SHADER_ROOT_SIGNATURE;
+      root.bytecode = pull_root_blob.empty() ? bytecode.data() : pull_root_blob.data();
+      root.bytecode_length = pull_root_blob.empty() ? bytecode.size() : pull_root_blob.size();
+      root.next = statistics && !(stage[0] == 'A' && (key & kMeshObjectReplay))
+          ? static_cast<void *>(&stats) : static_cast<void *>(&common);
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA conservative{};
+      conservative.type = SM50_SHADER_D3D12_CONSERVATIVE_RASTER;
+      conservative.next = root.next;
+      if (stage[0] == 'M' && replay_pixels && owned_conservative) root.next = &conservative;
+      SM50_SHADER_D3D12_MSAA_MESH_DATA capture{};
+      if (stage[0] == 'M' && (capture_pixels || replay_pixels)) {
+        capture.type = SM50_SHADER_D3D12_MSAA_MESH;
+        capture.variant = capture_pixels ? SM50_MSAA_VERTEX_CAPTURE : SM50_MSAA_VERTEX_REPLAY;
+        capture.layout_out = &variant.vertex_layout;
+        capture.mesh_layout_out = &variant.capture_layout;
+        capture.line_mode = owned_line_mode;
+        capture.interpolation = interpolation;
+        capture.depth_clip_enable = depth_clip_mode == WMTDepthClipModeClip;
+        capture.next = root.next;
+        root.next = &capture;
+        variant.capture_layout.threads_per_group = ms_threads[0] * ms_threads[1] * ms_threads[2];
+      }
+      if (stage[0] == 'A' && (key & (kMeshObjectCapture | kMeshObjectReplay))) {
+        capture.type = SM50_SHADER_D3D12_MSAA_MESH;
+        capture.variant = key & kMeshObjectCapture ? SM50_MSAA_OBJECT_CAPTURE : SM50_MSAA_OBJECT_REPLAY;
+        capture.object_layout_out = &variant.object_capture_layout;
+        capture.next = root.next;
+        root.next = &capture;
+      }
+      return CompileMeshStage(name, &bitcode, constants, function, [&](sm50_bitcode_t *out, sm50_error_t *error) {
+        return SM50Compile(shader, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&root, name, out, error);
+      });
+    };
+    SM50ShaderBitcode object_bitcode, mesh_bitcode;
+    WMT::Reference<WMT::Function> object_function, mesh_function;
+    HRESULT hr;
+    if (!replay_pixels && !mesh_as_bytecode.empty() &&
+        FAILED(hr = compile("AS", "as_main", mesh_as_bytecode, variant.object_constants, object_bitcode,
+                            object_function)))
+      return hr;
+    if (FAILED(hr = compile("MS", "ms_main", mesh_ms_bytecode, variant.mesh_constants, mesh_bitcode, mesh_function)))
+      return hr;
+    if (replay_pixels) {
+      variant.replay_function = mesh_function;
+      return S_OK;
+    }
+    auto info = mesh_info;
+    info.object_function = object_function.handle;
+    info.mesh_function = mesh_function.handle;
+    info.fragment_function = indirect_fragment_function.handle;
+    if (statistics && !capture_pixels) {
+      if (!EnsureStatisticsFragmentFunction())
+        return E_FAIL;
+      info.fragment_function = statistics_fragment_function.handle;
+    }
+    const auto &fragment = statistics ? pipeline_statistics_fragment_constants : fragment_constants;
+    info.immutable_fragment_buffers = fragment.buffer ? 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS : 0;
+    if (variant.object_constants.buffer)
+      info.immutable_object_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+    if (variant.mesh_constants.buffer)
+      info.immutable_mesh_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+    if (capture_pixels) {
+      info.rasterization_enabled = false;
+      info.fragment_function = {};
+      info.immutable_fragment_buffers = 0;
+      for (auto &color : info.colors) color = {};
+      info.depth_pixel_format = WMTPixelFormatInvalid;
+      info.stencil_pixel_format = WMTPixelFormatInvalid;
+      info.raster_sample_count = 1;
+      info.alpha_to_coverage_enabled = false;
+    }
+    WMT::Reference<WMT::Error> err;
+    {
+      static std::mutex creation_mutex;
+      std::lock_guard<std::mutex> lock(creation_mutex);
+      variant.pso = device_->GetMTLDevice().newRenderPipelineState(info, err);
+    }
+    if (!variant.pso) {
+      ERR("Failed to create mesh shader PSO: ", err ? err.description().getUTF8String() : "");
+      return E_INVALIDARG;
+    }
+    return S_OK;
+  }
+
+  /*
    * One object+mesh variant: key = MeshVariantKey(index format, GS strip input, statistics).
    * The VS (+HS) runs as the object function, the GS or DS as the mesh function.
    */
-  HRESULT BuildMeshPipeline(uint32_t key, MeshPipelineVariant &variant) {
+  HRESULT BuildMeshPipeline(uint32_t key, MeshPipelineVariant &variant,
+                            const SM50_MSAA_INTERPOLATION_LAYOUT *interpolation = nullptr) {
+    if (mesh_kind == MeshPipelineKind::MeshShader)
+      return BuildMeshShaderPipeline(variant, key, interpolation);
     const auto index_format = SM50_INDEX_BUFFER_FORMAT(key & 3);
     const bool strip = key & 4;
     const bool statistics = key & 8;
@@ -672,7 +894,29 @@ protected:
     SM50_SHADER_COMPILATION_ARGUMENT_DATA stats{};
     stats.type = SM50_SHADER_D3D12_PIPELINE_STATS;
     stats.next = &common;
+    // The GS/DS mesh function emits the per-primitive key the claiming statistics PS reads.
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA claim{};
+    claim.type = SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM;
+    claim.next = &common;
+    if (mesh_statistics_claim)
+      stats.next = &claim;
     void *tail = statistics ? static_cast<void *>(&stats) : static_cast<void *>(&common);
+    const bool capture_pixels = key & kMeshMSAACapture;
+    const bool replay_vertices = key & kMeshMSAAReplay;
+    SM50_SHADER_D3D12_MSAA_MESH_DATA msaa_mesh{};
+    msaa_mesh.type = SM50_SHADER_D3D12_MSAA_MESH;
+    msaa_mesh.variant = replay_vertices ? SM50_MSAA_VERTEX_REPLAY : SM50_MSAA_VERTEX_CAPTURE;
+    msaa_mesh.layout_out = &variant.vertex_layout;
+    msaa_mesh.mesh_layout_out = &variant.capture_layout;
+    variant.capture_layout.threads_per_group = gs_pass ? 1 : 32;
+    variant.capture_layout.max_workloads = gs_pass ? gs_instance_count : 0;
+    msaa_mesh.line_mode = owned_line_mode;
+    msaa_mesh.interpolation = interpolation;
+    msaa_mesh.depth_clip_enable = depth_clip_mode == WMTDepthClipModeClip;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA conservative{};
+    conservative.type = SM50_SHADER_D3D12_CONSERVATIVE_RASTER;
+    conservative.next = tail;
+    msaa_mesh.next = owned_conservative && replay_vertices ? static_cast<void *>(&conservative) : tail;
     const void *root_blob = pull_root_blob.empty() ? nullptr : pull_root_blob.data();
     const size_t root_length = pull_root_blob.size();
     auto root = [&](SM50_SHADER_ROOT_SIGNATURE_DATA &data, SM50_SHADER_COMPILATION_ARGUMENT_TYPE type,
@@ -716,25 +960,33 @@ protected:
                                        })))
         return hr;
       SM50_SHADER_PSO_GEOMETRY_SHADER_DATA pso_gs_mesh = pso_gs;
-      // Stream output after the GS: the mesh function captures stream 0 (see so_assemble_gs).
+      // Stream output after the GS: the mesh function captures every declared stream and rasterizes the
+      // selected one (see so_assemble_gs and SM50_SHADER_D3D12_GS_STREAMS_DATA).
       std::vector<SM50_SO_CAPTURE_ELEMENT> capture_elements;
-      SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA capture{};
+      SM50_SHADER_D3D12_GS_STREAMS_DATA streams{};
       if (stream_output.active) {
         try {
           capture_elements.reserve(stream_output.elements.size());
         } catch (const std::bad_alloc &) {
           return E_OUTOFMEMORY;
         }
-        for (const auto &element : stream_output.elements)
-          capture_elements.push_back(SM50_SO_CAPTURE_ELEMENT{
-              element.semantic_name.c_str(), element.semantic_index, element.start_component,
-              element.component_count, element.dword_offset});
-        capture.type = SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE;
-        capture.record_dwords = stream_output.record_dwords;
-        capture.num_elements = capture_elements.size();
-        capture.elements = capture_elements.data();
-        capture.next = pso_gs_mesh.next;
-        pso_gs_mesh.next = &capture;
+        // Grouped by stream, so each stream's elements are one contiguous run.
+        for (uint32_t s = 0; s < D3D12_SO_STREAM_COUNT; s++) {
+          const size_t first = capture_elements.size();
+          for (const auto &element : stream_output.elements)
+            if (element.stream == s)
+              capture_elements.push_back(SM50_SO_CAPTURE_ELEMENT{
+                  element.semantic_name.c_str(), element.semantic_index, element.start_component,
+                  element.component_count, element.dword_offset});
+          streams.streams[s].record_dwords = stream_output.streams[s].record_dwords;
+          streams.streams[s].num_elements = uint32_t(capture_elements.size() - first);
+          streams.streams[s].elements = capture_elements.data() + first;
+        }
+        streams.type = SM50_SHADER_D3D12_GS_STREAMS;
+        streams.rasterized_stream = stream_output.rasterized_stream == D3D12_SO_NO_RASTERIZED_STREAM
+                                        ? ~0u : stream_output.rasterized_stream;
+        streams.next = pso_gs_mesh.next;
+        pso_gs_mesh.next = &streams;
       }
       SM50_SHADER_GS_PASS_THROUGH_DATA gs_no_raster{};
       if (mesh_rasterization_disabled) {
@@ -745,6 +997,14 @@ protected:
         pso_gs_mesh.next = &gs_no_raster;
       }
       SM50_SHADER_ROOT_SIGNATURE_DATA gs_root{};
+      if (capture_pixels || replay_vertices) {
+        msaa_mesh.next = pso_gs_mesh.next;
+        if (owned_conservative && replay_vertices) {
+          conservative.next = msaa_mesh.next;
+          msaa_mesh.next = &conservative;
+        }
+        pso_gs_mesh.next = &msaa_mesh;
+      }
       root(gs_root, SM50_SHADER_ROOT_SIGNATURE, mesh_gs_bytecode, &pso_gs_mesh);
       if (FAILED(hr = CompileMeshStage("gs_main", &mesh_bitcode, variant.mesh_constants, mesh_function,
                                        [&](sm50_bitcode_t *out, sm50_error_t *error) {
@@ -777,11 +1037,38 @@ protected:
       capture.type = SM50_SHADER_D3D12_TESS_CAPTURE;
       capture.layout_out = &captured;
       capture.next = &pso_tess_mesh;
+      const bool domain_so = stream_output.active && !tess_geometry;
+      std::vector<SM50_SO_CAPTURE_ELEMENT> so_elements;
+      SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA so_capture{};
+      if (domain_so && !replay_vertices) {
+        try {
+          so_elements.reserve(stream_output.elements.size());
+        } catch (const std::bad_alloc &) {
+          return E_OUTOFMEMORY;
+        }
+        for (const auto &element : stream_output.elements)
+          so_elements.push_back({element.semantic_name.c_str(), element.semantic_index, element.start_component,
+                                 element.component_count, element.dword_offset});
+        so_capture.type = SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE;
+        so_capture.record_dwords = stream_output.streams[0].record_dwords;
+        so_capture.num_elements = so_elements.size();
+        so_capture.elements = so_elements.data();
+        so_capture.next = &capture;
+      }
       SM50_SHADER_GS_PASS_THROUGH_DATA pass_through{};
       pass_through.type = SM50_SHADER_GS_PASS_THROUGH;
       pass_through.DataEncoded = ~0u;
       pass_through.RasterizationDisabled = mesh_rasterization_disabled || tess_geometry;
-      pass_through.next = tess_geometry ? static_cast<void *>(&capture) : &pso_tess_mesh;
+      pass_through.next = tess_geometry ? static_cast<void *>(&capture) :
+          domain_so && !replay_vertices ? static_cast<void *>(&so_capture) : &pso_tess_mesh;
+      if ((capture_pixels || replay_vertices) && !tess_geometry) {
+        msaa_mesh.next = pass_through.next;
+        if (owned_conservative && replay_vertices) {
+          conservative.next = msaa_mesh.next;
+          msaa_mesh.next = &conservative;
+        }
+        pass_through.next = &msaa_mesh;
+      }
       const char *mesh_name = tess_geometry ? "ds_capture" : "ds_main";
       SM50_SHADER_ROOT_SIGNATURE_DATA ds_root{};
       root(ds_root, SM50_SHADER_ROOT_SIGNATURE, mesh_ds_bytecode, &pass_through);
@@ -792,10 +1079,18 @@ protected:
                                              mesh_name, out, error);
                                        })))
         return hr;
-      if (tess_geometry)
+      if (tess_geometry || (domain_so && !replay_vertices))
         tess_capture_layout = captured;
+      if (domain_so && !replay_vertices) {
+        gs_max_output_vertices = captured.max_vertices;
+        gs_output_topology = captured.primitive_vertices == 1 ? 1 : captured.primitive_vertices == 2 ? 3 : 5;
+      }
     }
 
+    if (replay_vertices) {
+      variant.replay_function = mesh_function;
+      return S_OK;
+    }
     auto info = mesh_info;
     info.object_function = object_function.handle;
     info.mesh_function = mesh_function.handle;
@@ -807,12 +1102,19 @@ protected:
     }
     const auto &fragment = statistics ? pipeline_statistics_fragment_constants : fragment_constants;
     info.immutable_fragment_buffers = fragment.buffer ? 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS : 0;
-    if (tess_geometry && !gs_pass) {
+    if (capture_pixels || (tess_geometry && !gs_pass)) {
       // The capture pass never rasterizes; its render pass still carries the draw's attachments.
       info.rasterization_enabled = false;
       info.fragment_function = {};
       info.immutable_fragment_buffers = 0;
-    } else if (tess_geometry) {
+      if (capture_pixels) {
+        for (auto &color : info.colors) color = {};
+        info.depth_pixel_format = WMTPixelFormatInvalid;
+        info.stencil_pixel_format = WMTPixelFormatInvalid;
+        info.raster_sample_count = 1;
+      }
+    }
+    if (tess_geometry && gs_pass) {
       // The GS pass has the GS pipeline shape: 16256-byte payload, (1, 1, 1) mesh threadgroups.
       info.payload_memory_length = 16256;
       info.mesh_tgsize_is_multiple_of_sgwidth = false;
@@ -849,8 +1151,8 @@ public:
       return E_INVALIDARG;
     const D3D11_SIGNATURE_PARAMETER *parameters;
     const UINT count = parser.GetParameters(&parameters);
-    pipeline_statistics_capture.capture_offset = stream_output.record_dwords;
-    pipeline_statistics_capture.record_dwords = stream_output.record_dwords + 20;
+    pipeline_statistics_capture.capture_offset = stream_output.streams[0].record_dwords;
+    pipeline_statistics_capture.record_dwords = stream_output.streams[0].record_dwords + 20;
     pipeline_statistics_capture.rasterization_enabled = rasterization_enabled;
     statistics_capture_elements = stream_output.elements;
 
@@ -993,6 +1295,15 @@ public:
     if (dual_source_blending && effective_dual_source_rtvs > 1)
       return E_INVALIDARG;
 
+    // D3D12 logic ops come from RenderTarget[0] with IndependentBlendEnable FALSE and apply to every RT.
+    // Metal's logic op is bit-exact on every UINT format except RGB10A2Uint, where it saturates a result
+    // with bits above the component width (NAND/OR_REVERSE/... cannot be remapped). RGB10A2_UINT targets
+    // therefore use the exact framebuffer-fetch epilogue (SM50_SHADER_D3D12_LOGIC_OP) and are excluded here.
+    const auto &logic_target = pDesc->BlendState.RenderTarget[0];
+    info.logic_operation_enabled = !pDesc->BlendState.IndependentBlendEnable && logic_target.LogicOpEnable &&
+                                   !LogicOpNeedsFetch(pDesc);
+    info.logic_operation = info.logic_operation_enabled ? kLogicOpMap[logic_target.LogicOp] : WMTLogicOperationClear;
+
     if (pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN) {
       if (FAILED(hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), pDesc->DSVFormat, format_desc))) {
         return hr;
@@ -1026,8 +1337,9 @@ public:
       }
     }
 
+    // ForcedSampleCount 16 has no native raster: it always runs the MSAA capture path as two programmed 8x halves.
     info.raster_sample_count = pDesc->RasterizerState.ForcedSampleCount
-                                   ? pDesc->RasterizerState.ForcedSampleCount : pDesc->SampleDesc.Count;
+                                   ? std::min(pDesc->RasterizerState.ForcedSampleCount, 8u) : pDesc->SampleDesc.Count;
     /* The indirect-command-buffer variant is built separately, on demand:
      * GetIndirectCommandBufferPipelineState. */
     info.support_indirect_command_buffers = false;
@@ -1144,6 +1456,7 @@ public:
         : pDesc->RasterizerState.AntialiasedLineEnable ? SM50_MSAA_LINE_ALPHA_AA
         : SM50_MSAA_LINE_ALIASED
         : SM50_MSAA_LINE_NONE;
+    owned_conservative = pDesc->RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
   }
 
   virtual HRESULT
@@ -1157,10 +1470,30 @@ public:
     owned_dsv_format = pDesc->DSVFormat;
     owned_sample_desc = pDesc->SampleDesc;
     owned_sample_mask = pDesc->SampleMask;
+    // FS 3.5.6.4: with UAV-only forced rasterization (no RTVs) the SampleMask does not affect rasterization.
+    if (pDesc->RasterizerState.ForcedSampleCount &&
+        std::all_of(pDesc->RTVFormats, pDesc->RTVFormats + pDesc->NumRenderTargets,
+                    [](DXGI_FORMAT format) { return format == DXGI_FORMAT_UNKNOWN; }))
+      owned_sample_mask = UINT_MAX;
+    if (extras.view_instancing) {
+      view_instancing = *extras.view_instancing;
+      for (UINT i = 0; i < view_instancing.count; ++i)
+        view_location_offsets |= view_instancing.locations[i].ViewportArrayIndex ||
+                                 view_instancing.locations[i].RenderTargetArrayIndex;
+    }
+    // A one-view amplification mapping adds the view location to the primitive's viewport / render target array
+    // index only on pipelines whose maximum amplification count exceeds 1 (native probe, see the view-instancing
+    // suite); the draw still runs with an amplification count of 1.
+    const uint8_t max_vertex_amplification = view_location_offsets ? 2 : 0;
     owned_has_pixel_shader = pDesc->PS.pShaderBytecode != nullptr;
     ib_strip_cut_value = pDesc->IBStripCutValue;
     HRESULT hr;
-    if (pDesc->HS.pShaderBytecode || pDesc->DS.pShaderBytecode) {
+    if (extras.ms.pShaderBytecode) {
+      // The stream parser rejected VS/HS/DS/GS/IA/SO next to an MS.
+      mesh_kind = MeshPipelineKind::MeshShader;
+      if (FAILED(hr = InitializeMeshShaderStages(pDesc, extras)))
+        return hr;
+    } else if (pDesc->HS.pShaderBytecode || pDesc->DS.pShaderBytecode) {
       // HS and DS come as a pair on a patch-list pipeline.
       if (!pDesc->HS.pShaderBytecode || !pDesc->DS.pShaderBytecode ||
           pDesc->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
@@ -1173,18 +1506,26 @@ public:
     } else if (pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
       return E_INVALIDARG;
     }
-    if (mesh_kind != MeshPipelineKind::None && FAILED(hr = InitializeMeshStages(pDesc)))
+    if (mesh_kind != MeshPipelineKind::None && mesh_kind != MeshPipelineKind::MeshShader &&
+        FAILED(hr = InitializeMeshStages(pDesc)))
       return hr;
     const bool mesh = mesh_kind != MeshPipelineKind::None;
-    if (mesh_kind == MeshPipelineKind::Tessellation && pDesc->StreamOutput.NumEntries) {
-      ERR("CreatePipelineState: stream output after DS is not implemented");
-      return E_NOTIMPL;
-    }
     const bool geometry_so =
         mesh_kind == MeshPipelineKind::Geometry || mesh_kind == MeshPipelineKind::TessellationGeometry;
-    if (FAILED(hr = BuildStreamOutputLayout(pDesc->StreamOutput, geometry_so ? pDesc->GS : pDesc->VS,
+    if (FAILED(hr = BuildStreamOutputLayout(pDesc->StreamOutput, geometry_so ? pDesc->GS :
+                                            pDesc->DS.pShaderBytecode ? pDesc->DS : pDesc->VS,
                                             stream_output, geometry_so)))
       return hr;
+    // D3D11.3 13.5.2: a GS using more than one stream (streamed out or rasterized) outputs point lists only.
+    if (stream_output.active) {
+      uint32_t used = stream_output.stream_mask;
+      if (stream_output.rasterized_stream != D3D12_SO_NO_RASTERIZED_STREAM)
+        used |= 1u << stream_output.rasterized_stream;
+      if ((used & (used - 1)) && gs_output_topology != microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_POINTLIST) {
+        WARN("CreatePipelineState: GS stream output to multiple streams requires point-list output");
+        return E_INVALIDARG;
+      }
+    }
     if (stream_output.active) {
       // Stream output requires D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT on the explicit or
       // the VS-embedded root signature.
@@ -1275,7 +1616,7 @@ public:
               element.semantic_name.c_str(), element.semantic_index, element.start_component,
               element.component_count, element.dword_offset});
         data_capture.type = SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE;
-        data_capture.record_dwords = stream_output.record_dwords;
+        data_capture.record_dwords = stream_output.streams[0].record_dwords;
         data_capture.num_elements = capture_elements.size();
         data_capture.elements = capture_elements.data();
         data_capture.next = data_ia_layout.next;
@@ -1327,6 +1668,13 @@ public:
         if (!vs_func)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
       }
+    } else if (mesh_kind == MeshPipelineKind::MeshShader) {
+      // The MS root signature: explicit, else embedded in the MS (BuildMeshShaderPipeline reads either).
+      if (pDesc->pRootSignature) {
+        const void *blob = nullptr;
+        const size_t size = static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&blob);
+        pull_root_blob.assign(static_cast<const uint8_t *>(blob), static_cast<const uint8_t *>(blob) + size);
+      }
     } else {
       ERR("no vertex shader");
       return E_INVALIDARG;
@@ -1342,6 +1690,11 @@ public:
     if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader("PS", pDesc->PS, &shader_ps, &ref_ps)))
       return hr;
     owned_sample_frequency_pixel_shader = ref_ps.PixelShader.SampleFrequency;
+    owned_force_early_pixel_shader = pDesc->PS.pShaderBytecode && ref_ps.PSForceEarlyDepthStencil;
+    mesh_statistics_claim =
+        mesh_kind != MeshPipelineKind::None && EffectiveRasterSampleCount() > 1 &&
+        owned_force_early_pixel_shader && !owned_sample_frequency_pixel_shader &&
+        (pDesc->DepthStencilState.DepthEnable || pDesc->DepthStencilState.StencilEnable);
     if (pDesc->PS.pShaderBytecode) {
       microsoft::CSignatureParser input_signature;
       if (FAILED(hr = microsoft::DXBCGetInputSignature(pDesc->PS.pShaderBytecode, &input_signature)))
@@ -1351,11 +1704,12 @@ public:
       // select the captured-pixel draw path.
       const auto count = use_fragment ? input_signature.GetParameters(&parameters) : 0u;
       for (uint32_t i = 0; i < count; ++i) {
+        if (uint32_t(parameters[i].SystemValue) == 24) owned_shading_rate_pixel_shader = true;
         if (parameters[i].Mask &&
             (parameters[i].SystemValue == microsoft::D3D10_SB_NAME_CLIP_DISTANCE ||
              parameters[i].SystemValue == microsoft::D3D10_SB_NAME_CULL_DISTANCE)) {
           owned_distance_interpolation = true;
-          break;
+          continue;
         }
       }
       const void *root_blob = pDesc->PS.pShaderBytecode;
@@ -1389,12 +1743,25 @@ public:
       data_ps.dual_source_blending = dual_source_blending;
       data_ps.disable_depth_output = false;
       data_ps.unorm_output_reg_mask = 0;
-      data_ps.sample_mask = pDesc->SampleMask;
+      data_ps.sample_mask = owned_sample_mask;
       data_ps.native_sample_count = owned_sample_frequency_pixel_shader ? EffectiveRasterSampleCount() : 1;
       data_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
       data_ps.next = &common;
+      if (LogicOpNeedsFetch(pDesc)) {
+        use_fetch_logic_op = true;
+        fetch_logic_op.type = SM50_SHADER_D3D12_LOGIC_OP;
+        fetch_logic_op.op = pDesc->BlendState.RenderTarget[0].LogicOp;
+        for (UINT i = 0; i < pDesc->NumRenderTargets && i < 8; ++i) {
+          // Logic ops apply to UINT targets only (FS 17.7.1); other formats keep the plain PS output.
+          if (!LogicOpComponentBits(pDesc->RTVFormats[i], fetch_logic_op.component_bits[i]))
+            continue;
+          fetch_logic_op.rt_mask |= 1u << i;
+        }
+        fetch_logic_op.next = &common;
+        data_ps.next = &fetch_logic_op;
+      }
       statistics_ps_name = ps_name;
-      statistics_ps_sample_mask = pDesc->SampleMask;
+      statistics_ps_sample_mask = owned_sample_mask;
       statistics_ps_dual_source_blending = dual_source_blending;
 
       memset(data_ps.pixel_formats, 0, sizeof(data_ps.pixel_formats));
@@ -1427,13 +1794,18 @@ public:
       const auto ps_bitcode_compiled = cache_.view(PipelineCache::Fragment);
       if (FAILED(hr = fragment_constants.Initialize(device_, ps_bitcode_compiled, cache_.bitcode(PipelineCache::Fragment))))
         return hr;
-      auto ps_data = WMT::MakeDispatchData(ps_bitcode_compiled.Data, ps_bitcode_compiled.Size);
-      auto ps_lib = metal.newLibrary(ps_data, err);
-      if (!ps_lib)
-        return cache_.loaded() ? E_INVALIDARG : E_FAIL;
-      ps_func = ps_lib.newFunction(ps_name.c_str());
-      if (!ps_func)
-        return cache_.loaded() ? E_INVALIDARG : E_FAIL;
+      // Wide MS output is linked only to the compact captured-pixel variants.
+      // Retain its compiled AIR/cache data, but never ask Metal to link the
+      // original over-limit fragment signature.
+      if (!owned_mesh_output_replay) {
+        auto ps_data = WMT::MakeDispatchData(ps_bitcode_compiled.Data, ps_bitcode_compiled.Size);
+        auto ps_lib = metal.newLibrary(ps_data, err);
+        if (!ps_lib)
+          return cache_.loaded() ? E_INVALIDARG : E_FAIL;
+        ps_func = ps_lib.newFunction(ps_name.c_str());
+        if (!ps_func)
+          return cache_.loaded() ? E_INVALIDARG : E_FAIL;
+      }
     }
 
     // PSO
@@ -1449,6 +1821,8 @@ public:
       mesh_info.stencil_pixel_format = info.stencil_pixel_format;
       if (mesh_kind == MeshPipelineKind::Geometry) {
         mesh_info.payload_memory_length = 16256;
+      } else if (mesh_kind == MeshPipelineKind::MeshShader) {
+        // Arbitrary [numthreads]; Metal infers the payload size from the object/mesh functions.
       } else {
         mesh_info.mesh_tgsize_is_multiple_of_sgwidth = true;
         mesh_info.object_tgsize_is_multiple_of_sgwidth = true;
@@ -1456,10 +1830,12 @@ public:
           mesh_info.payload_memory_length = 16384;
       }
       mesh_rasterization_disabled = !info.rasterization_enabled;
+      mesh_info.max_vertex_amplification_count = max_vertex_amplification;
       indirect_fragment_function = ps_func;
       indirect_info = info;
       // Compile the default (non-indexed) variant now so invalid shader combinations fail creation.
-      if (!GetMeshPipeline(MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, false)))
+      if (!GetMeshPipeline(MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, false) |
+                           (owned_mesh_output_replay ? kMeshMSAACapture : 0)))
         return E_INVALIDARG;
       // TS+GS: pass 2 is built from the capture layout pass 1 just reported.
       if (mesh_kind == MeshPipelineKind::TessellationGeometry &&
@@ -1472,6 +1848,7 @@ public:
         info.immutable_vertex_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
       if (fragment_constants.buffer)
         info.immutable_fragment_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+      info.max_vertex_amplification_count = max_vertex_amplification;
 
       pso = metal.newRenderPipelineState(info, err);
 
@@ -1695,9 +2072,22 @@ public:
       SM50_SHADER_COMMON_DATA common{};
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
+      SM50_SHADER_D3D12_LOGIC_OP_DATA logic_op = fetch_logic_op;
+      logic_op.next = &common;
+      void *tail = use_fetch_logic_op ? static_cast<void *>(&logic_op) : static_cast<void *>(&common);
       SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics{};
       statistics.type = SM50_SHADER_D3D12_PIPELINE_STATS;
-      statistics.next = &common;
+      statistics.next = tail;
+      /* Only mesh draws run this variant natively multisampled (other MSAA draws use the captured-pixel path):
+       * a pixel-frequency PS then counts once per covered pixel, not once per covered sample. */
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA per_pixel{};
+      if (EffectiveRasterSampleCount() > 1 && !owned_sample_frequency_pixel_shader) {
+        // Forced-early depth/stencil: count once per (pixel, primitive) by the claim buffer.
+        per_pixel.type = mesh_statistics_claim ? SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM
+                                               : SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL;
+        per_pixel.next = tail;
+        statistics.next = &per_pixel;
+      }
       SM50_SHADER_PSO_PIXEL_SHADER_DATA pixel{};
       pixel.type = SM50_SHADER_PSO_PIXEL_SHADER;
       pixel.dual_source_blending = statistics_ps_dual_source_blending;
@@ -1749,15 +2139,17 @@ public:
     return &variant;
   }
 
-  const MSAAPipelineVariants *GetMSAAPipelineVariants(bool statistics_enabled) override {
+  const MSAAPipelineVariants *GetMSAAPipelineVariants(bool statistics_enabled, bool coarse) override {
     std::lock_guard<std::mutex> lock(msaa_pso_mutex);
-    auto &cached = statistics_enabled ? msaa_statistics_variants : msaa_variants;
-    auto &attempted = statistics_enabled ? msaa_statistics_variants_attempted : msaa_variants_attempted;
+    auto &cached = coarse ? msaa_coarse_variants[statistics_enabled]
+        : statistics_enabled ? msaa_statistics_variants : msaa_variants;
+    auto &attempted = coarse ? msaa_coarse_variants_attempted[statistics_enabled]
+        : statistics_enabled ? msaa_statistics_variants_attempted : msaa_variants_attempted;
     if (attempted)
       return cached.get();
     attempted = true;
     const uint32_t sample_count = EffectiveRasterSampleCount();
-    if (!RequiresMSAAExecution())
+    if (!RequiresMSAAExecution() && !coarse && !(statistics_enabled && mesh_kind == MeshPipelineKind::MeshShader))
       return nullptr;
     auto variants = std::make_unique<MSAAPipelineVariants>();
     const bool has_pixel_shader = !statistics_ps_bytecode.empty();
@@ -1772,7 +2164,8 @@ public:
       variants->layout.input_record_dwords = variants->layout.z_anchor_dword +
                                              2 * (sample_count + 1);
       variants->layout.line_mode = owned_line_mode;
-      variants->layout.line_mask_dword = owned_line_mode == SM50_MSAA_LINE_ALIASED ||
+      // Conservative gathers publish their exact full/empty geometric mask like aliased lines.
+      variants->layout.line_mask_dword = owned_conservative || owned_line_mode == SM50_MSAA_LINE_ALIASED ||
           owned_line_mode == SM50_MSAA_LINE_ALPHA_AA ? variants->layout.input_record_dwords++ : ~0u;
       variants->layout.line_alpha_dword = owned_line_mode == SM50_MSAA_LINE_ALPHA_AA
           ? variants->layout.input_record_dwords++ : ~0u;
@@ -1798,6 +2191,7 @@ public:
     ShaderImmutableConstants *fragment_constants[] = {&variants->coverage_constants,
         &variants->pixel_constants, &variants->replay_fragment_constants,
         &variants->sample_fragment_constants};
+    auto captured_topology = msaa_original_info.input_primitive_topology;
     auto compile_pixel = [&]() -> bool {
       for (uint32_t i = 0; has_pixel_shader && i < (variants->sample_frequency ? 4u : 3u); i++) {
       if (variants->sample_frequency && (i == 1 || i == 2)) continue;
@@ -1812,22 +2206,36 @@ public:
       msaa.sample_count = sample_count;
       msaa.center_pattern = owned_sample_desc.Quality == 0xfffffffeu;
       msaa.layout_out = &variants->layout;
+      msaa.coarse_vertex_layout = &variants->vertex_layout;
       msaa.depth_attachment = msaa_original_info.depth_pixel_format != WMTPixelFormatInvalid;
-      msaa.single_sample_target = i == 2 && forced_sample_count > 1 && owned_sample_desc.Count == 1 &&
-                                  owned_rt_count != 0;
+      msaa.single_sample_target = i == 2 && ForcedSampleReplay();
       msaa.line_mode = owned_line_mode;
       msaa.interpolation_out = owned_line_mode != SM50_MSAA_LINE_NONE ? &line_interpolation : nullptr;
       msaa.line_vertex_layout = owned_line_mode != SM50_MSAA_LINE_NONE
           ? &variants->vertex_layout : nullptr;
-      msaa.distance_vertex_layout = owned_distance_interpolation ? &variants->vertex_layout : nullptr;
-      msaa.distance_vertex_count = !owned_distance_interpolation ? 0
-          : msaa_original_info.input_primitive_topology == WMTPrimitiveTopologyClassPoint ? 1
-          : msaa_original_info.input_primitive_topology == WMTPrimitiveTopologyClassLine ? 2 : 3;
+      const bool captured_inputs = owned_distance_interpolation || variants->vertex_layout.spill_count;
+      msaa.distance_vertex_layout = captured_inputs ? &variants->vertex_layout : nullptr;
+      msaa.distance_vertex_count = !captured_inputs ? 0
+          : captured_topology == WMTPrimitiveTopologyClassPoint ? 1
+          : captured_topology == WMTPrimitiveTopologyClassLine ? 2 : 3;
       SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics{};
       statistics.type = SM50_SHADER_D3D12_PIPELINE_STATS;
       statistics.next = &common;
-      msaa.next = statistics_enabled && (i == 1 || i == 3) ? static_cast<void *>(&statistics)
-                                                 : static_cast<void *>(&common);
+      SM50_SHADER_D3D12_LOGIC_OP_DATA logic_op = fetch_logic_op;
+      logic_op.next = &common;
+      // Replay (2) and sample-frequency (3) variants write the application RTs; logic ops apply per sample.
+      void *tail = use_fetch_logic_op && (i == 2 || i == 3) ? static_cast<void *>(&logic_op)
+                                                             : static_cast<void *>(&common);
+      statistics.next = tail;
+      msaa.next = statistics_enabled && (i == 1 || i == 3) ? static_cast<void *>(&statistics) : tail;
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA coarse_shading{};
+      coarse_shading.type = SM50_SHADER_D3D12_COARSE_SHADING;
+      coarse_shading.next = msaa.next;
+      if (coarse) msaa.next = &coarse_shading;
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA conservative_raster{};
+      conservative_raster.type = SM50_SHADER_D3D12_CONSERVATIVE_RASTER;
+      conservative_raster.next = msaa.next;
+      if (owned_conservative) msaa.next = &conservative_raster;
       SM50_SHADER_PSO_PIXEL_SHADER_DATA pixel{};
       pixel.type = SM50_SHADER_PSO_PIXEL_SHADER;
       pixel.dual_source_blending = (i == 2 || i == 3) && msaa_dual_source;
@@ -1863,6 +2271,26 @@ public:
       return true;
     };
     auto compile_vertex = [&](uint32_t i) -> bool {
+      if (mesh_kind != MeshPipelineKind::None) {
+        const uint32_t pass = mesh_kind == MeshPipelineKind::TessellationGeometry
+            ? kMeshTessellationGeometryPass : 0;
+        if (!i) {
+          const auto *capture = GetMeshPipeline(MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false,
+                                                              statistics_enabled) | pass | kMeshMSAACapture);
+          if (!capture) return false;
+          variants->vertex_layout = capture->vertex_layout;
+          captured_topology = capture->capture_layout.vertices_per_primitive == 1 ? WMTPrimitiveTopologyClassPoint
+              : capture->capture_layout.vertices_per_primitive == 2 ? WMTPrimitiveTopologyClassLine
+                                                                    : WMTPrimitiveTopologyClassTriangle;
+          return true;
+        }
+        MeshPipelineVariant replay;
+        if (FAILED(BuildMeshPipeline(pass | (statistics_enabled ? 8 : 0) | kMeshMSAAReplay, replay, &line_interpolation))) return false;
+        variants->vertex_layout = replay.vertex_layout;
+        variants->replay_vertex_constants = std::move(replay.mesh_constants);
+        vertex_replay = replay.replay_function;
+        return bool(vertex_replay);
+      }
       SM50Shader shader;
       SM50Error compile_error;
       if (FAILED(InitializeShader("VS-msaa", {pull_vs_bytecode.data(), pull_vs_bytecode.size()},
@@ -1881,6 +2309,10 @@ public:
       statistics.next = &common;
       msaa.next = statistics_enabled && !i ? static_cast<void *>(&statistics)
                                               : static_cast<void *>(&common);
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA conservative_raster{};
+      conservative_raster.type = SM50_SHADER_D3D12_CONSERVATIVE_RASTER;
+      conservative_raster.next = msaa.next;
+      if (owned_conservative && i) msaa.next = &conservative_raster;
       SM50_SHADER_IA_INPUT_LAYOUT_DATA layout{};
       layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
       layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
@@ -1899,7 +2331,7 @@ public:
               element.component_count, element.dword_offset});
         capture.type = SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE;
         capture.record_dwords = statistics_enabled ? pipeline_statistics_capture.record_dwords
-                                                   : stream_output.record_dwords;
+                                                   : stream_output.streams[0].record_dwords;
         capture.num_elements = capture_elements.size();
         capture.elements = capture_elements.data();
         capture.next = &msaa;
@@ -1938,15 +2370,21 @@ public:
         variants->layout.helper_record_base + 64 > variants->layout.input_record_count)
       return nullptr;
     auto coverage_info = msaa_original_info;
+    coverage_info.input_primitive_topology = captured_topology;
     for (auto &color : coverage_info.colors) color = {};
+    // The application logic op applies to replayed RT writes only, never to internal coverage targets.
+    coverage_info.logic_operation_enabled = false;
     coverage_info.colors[0].pixel_format = WMTPixelFormatR32Uint;
     coverage_info.colors[0].write_mask = WMTColorWriteMaskAll;
     coverage_info.vertex_function = vertex_replay;
+    // Captured-vertex replay pipelines apply the view location through the amplification mapping (see
+    // view_location_offsets); fullscreen variants below reset it to a maximum of 1.
+    coverage_info.max_vertex_amplification_count = view_location_offsets ? 2 : 0;
     if (owned_line_mode != SM50_MSAA_LINE_NONE)
       coverage_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
     auto internal = device_->GetLib().getLibrary();
-    auto gather_fragment = internal.newFunction(owned_line_mode == SM50_MSAA_LINE_NONE
-        ? "msaa_gather_depth" : "msaa_gather_line_depth");
+    auto gather_fragment = internal.newFunction(owned_conservative ? "msaa_gather_conservative_depth"
+        : owned_line_mode == SM50_MSAA_LINE_NONE ? "msaa_gather_depth" : "msaa_gather_line_depth");
     auto explicit_depth_fragment = internal.newFunction(sample_count == 1
         ? "msaa_explicit_depth_single" : "msaa_explicit_depth");
     auto depth_only_fragment = internal.newFunction(sample_count == 1
@@ -1982,6 +2420,7 @@ public:
     if (!fullscreen_vertex || !clear_fragment)
       return nullptr;
     clear_info.vertex_function = fullscreen_vertex;
+    clear_info.max_vertex_amplification_count = 0;
     clear_info.fragment_function = clear_fragment;
     clear_info.depth_pixel_format = WMTPixelFormatInvalid;
     clear_info.stencil_pixel_format = WMTPixelFormatInvalid;
@@ -2024,6 +2463,7 @@ public:
     pixel_info.stencil_pixel_format = WMTPixelFormatInvalid;
     pixel_info.raster_sample_count = 1;
     pixel_info.vertex_function = fullscreen_vertex;
+    pixel_info.max_vertex_amplification_count = 0;
     pixel_info.fragment_function = fragments[1];
     pixel_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
     pixel_info.immutable_vertex_buffers = 0;
@@ -2037,15 +2477,19 @@ public:
       return nullptr;
     }
     auto replay_info = msaa_original_info;
+    replay_info.input_primitive_topology = captured_topology;
     if (owned_line_mode != SM50_MSAA_LINE_NONE)
       replay_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
-    const bool single_sample_replay = forced_sample_count > 1 && owned_sample_desc.Count == 1 && owned_rt_count;
+    const bool single_sample_replay = ForcedSampleReplay();
     if (single_sample_replay) {
-      replay_info.raster_sample_count = 1;
+      // The fullscreen replay rasterizes at the RTV sample count (1 for forced > 1, N for forced 1 on N-sample RTVs).
+      replay_info.raster_sample_count = owned_sample_desc.Count;
       replay_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
       replay_info.immutable_vertex_buffers = 0;
     }
     replay_info.vertex_function = single_sample_replay ? fullscreen_vertex : vertex_replay;
+    // Fullscreen (single-sample) replay takes the already offset layer from the primitive bounds.
+    replay_info.max_vertex_amplification_count = view_location_offsets && !single_sample_replay ? 2 : 0;
     replay_info.fragment_function = fragments[2];
     replay_info.immutable_vertex_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
     replay_info.immutable_fragment_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
@@ -2135,7 +2579,7 @@ CreateGraphicsPipelineState(
                                            kPipelineStateFlagDynamicIndexBufferStripCut)) ||
       !IsD3D12SampleCountSupported(pDevice, pDesc->SampleDesc.Count) ||
       !IsD3D12SampleQualitySupported(pDevice, pDesc->SampleDesc.Count, pDesc->SampleDesc.Quality) ||
-      !pDesc->VS.pShaderBytecode || !pDesc->VS.BytecodeLength ||
+      ((!pDesc->VS.pShaderBytecode || !pDesc->VS.BytecodeLength) && !(extras && extras->ms.pShaderBytecode)) ||
       (!pDesc->PS.pShaderBytecode != !pDesc->PS.BytecodeLength) ||
       (!pDesc->DS.pShaderBytecode != !pDesc->DS.BytecodeLength) ||
       (!pDesc->HS.pShaderBytecode != !pDesc->HS.BytecodeLength) ||
@@ -2150,10 +2594,12 @@ CreateGraphicsPipelineState(
       pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE)
     return E_INVALIDARG;
   const UINT forced_samples = raster.ForcedSampleCount;
+  // FS 3.5.6: ForcedSampleCount 1, 4, 8 or 16 (16 is emulated by two programmed 8x halves). Counts above 1 need
+  // single-sample RTVs; 1 allows any RTV sample count. No DSV, depth test or PS depth output.
   if (forced_samples &&
-      ((forced_samples != 1 && forced_samples != 4 && forced_samples != 8) ||
-       !IsD3D12SampleCountSupported(pDevice, forced_samples) ||
-       pDesc->SampleDesc.Count != 1 || pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN ||
+      ((forced_samples != 1 && forced_samples != 4 && forced_samples != 8 && forced_samples != 16) ||
+       (forced_samples != 16 && !IsD3D12SampleCountSupported(pDevice, forced_samples)) ||
+       (forced_samples > 1 && pDesc->SampleDesc.Count != 1) || pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN ||
        pDesc->DepthStencilState.DepthEnable))
     return E_INVALIDARG;
   if (forced_samples && pDesc->PS.pShaderBytecode) {
@@ -2174,11 +2620,20 @@ CreateGraphicsPipelineState(
   }
   if ((raster.FillMode != D3D12_FILL_MODE_SOLID && raster.FillMode != D3D12_FILL_MODE_WIREFRAME) ||
       (raster.CullMode < D3D12_CULL_MODE_NONE || raster.CullMode > D3D12_CULL_MODE_BACK) ||
-      raster.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF ||
+      raster.ConservativeRaster > D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON ||
       pDesc->IBStripCutValue > D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF ||
-      pDesc->PrimitiveTopologyType < D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT ||
+      (pDesc->PrimitiveTopologyType < D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT &&
+       !(extras && extras->ms.pShaderBytecode)) || // the MS declares its own output topology
       pDesc->PrimitiveTopologyType > D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
     return E_INVALIDARG;
+  // Conservative rasterization applies to the final solid triangles, including GS/DS/MS outputs.
+  if (raster.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON) {
+    if (raster.FillMode != D3D12_FILL_MODE_SOLID ||
+        (pDesc->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
+         pDesc->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
+         !(extras && extras->ms.pShaderBytecode)))
+      return E_INVALIDARG;
+  }
   const auto valid_compare = [](D3D12_COMPARISON_FUNC value) {
     return value >= D3D12_COMPARISON_FUNC_NEVER && value <= D3D12_COMPARISON_FUNC_ALWAYS;
   };
@@ -2198,14 +2653,19 @@ CreateGraphicsPipelineState(
     const auto n = static_cast<UINT>(value);
     return n >= D3D12_BLEND_ZERO && n < std::size(kBlendFactorMap) && n != 12 && n != 13;
   };
+  const auto &logic_target = pDesc->BlendState.RenderTarget[0];
+  if (logic_target.LogicOpEnable &&
+      (logic_target.BlendEnable || pDesc->BlendState.IndependentBlendEnable ||
+       logic_target.LogicOp < D3D12_LOGIC_OP_CLEAR || logic_target.LogicOp > D3D12_LOGIC_OP_OR_INVERTED))
+    return E_INVALIDARG;
   for (UINT i = 0; i < pDesc->NumRenderTargets; ++i) {
     if (pDesc->RTVFormats[i] == DXGI_FORMAT_UNKNOWN)
       continue;
     const auto &rt = pDesc->BlendState.RenderTarget[pDesc->BlendState.IndependentBlendEnable ? i : 0];
     if (rt.RenderTargetWriteMask & ~D3D12_COLOR_WRITE_ENABLE_ALL)
       return E_INVALIDARG;
-    // This device reports OutputMergerLogicOp=FALSE. Never create a PSO that silently ignores it.
-    if (rt.LogicOpEnable)
+    // Logic ops are configured only through RenderTarget[0] with IndependentBlendEnable FALSE.
+    if (pDesc->BlendState.IndependentBlendEnable && rt.LogicOpEnable)
       return E_INVALIDARG;
     if (rt.BlendEnable &&
         (!valid_blend(rt.SrcBlend) || !valid_blend(rt.DestBlend) ||

@@ -50,6 +50,7 @@ constexpr uint8_t NAME_SAMPLE_INDEX = 10;
 /* D3D_NAME_BARYCENTRICS (SM 6.1): the signature chunks carry D3D_NAME values, not
  * DXIL::SemanticKind (where Barycentrics is 28). */
 constexpr uint8_t NAME_BARYCENTRICS = 23;
+constexpr uint8_t NAME_SHADINGRATE = 24;
 constexpr uint8_t NAME_TARGET = 64;
 constexpr uint8_t NAME_DEPTH = 65;
 constexpr uint8_t NAME_COVERAGE = 66;
@@ -176,8 +177,9 @@ uint32_t element_start_col(const SigElement &element) {
 SignatureSlot make_slot(const SigElement &element, uint32_t air_index, bool pull_mode = false) {
   SignatureSlot slot;
   slot.element_id = element.id;
+  slot.element_row = element.element_row;
   slot.semantic_index = element.semantic_index;
-  slot.reg = element.start_row;
+  slot.reg = element.start_row - element.element_row;
   slot.rows = element.rows;
   slot.start_col = element_start_col(element);
   slot.mask = element_mask(element);
@@ -249,17 +251,17 @@ void PrepareModuleStorage(llvm::Module &module) {
   }
 }
 
-const SignatureSlot *StageSignature::find_input(uint32_t element_id) const {
+const SignatureSlot *StageSignature::find_input(uint32_t element_id, uint32_t row) const {
   for (auto &slot : inputs) {
-    if (slot.element_id == element_id)
+    if (slot.element_id == element_id && row >= slot.element_row && row - slot.element_row < slot.rows)
       return &slot;
   }
   return nullptr;
 }
 
-const SignatureSlot *StageSignature::find_output(uint32_t element_id) const {
+const SignatureSlot *StageSignature::find_output(uint32_t element_id, uint32_t row) const {
   for (auto &slot : outputs) {
-    if (slot.element_id == element_id)
+    if (slot.element_id == element_id && row >= slot.element_row && row - slot.element_row < slot.rows)
       return &slot;
   }
   return nullptr;
@@ -363,6 +365,13 @@ void declare_vertex_signature(
       pop = dxbc::pop_output_reg(reg, mask, air_index);
       break;
     }
+    case NAME_SHADINGRATE: {
+      air_index = func_signature.DefineOutput(air::OutputVertex{
+        .user = "dxmt_shading_rate", .type = air::msl_uint,
+      });
+      pop = dxbc::pop_output_reg(reg, mask, air_index);
+      break;
+    }
     case NAME_VIEWPORT_ARRAY_INDEX: {
       air_index = func_signature.DefineOutput(air::OutputViewportArrayIndex{});
       pop = dxbc::pop_output_reg(reg, mask, air_index);
@@ -438,6 +447,14 @@ void declare_pixel_signature(
     bool fix_w_component = false;
     bool element_pull_mode = false;
     switch (element.semantic_kind) {
+    case NAME_SHADINGRATE: {
+      air_index = sig_ctx.captured_pixel ? func_signature.DefineInput(air::InputFragmentStageIn{
+        .user = "dxmt_resolved_shading_rate", .type = air::msl_uint,
+        .interpolation = air::Interpolation::flat, .pull_mode = false,
+      }) : ~0u;
+      init_plain = false;
+      break;
+    }
     case NAME_POSITION: {
       air_index = func_signature.DefineInput(air::InputPosition{
         .interpolation = to_air_interpolation(element.interp),
@@ -772,6 +789,8 @@ llvm::Error DeclareStageSignature(
     declare_pixel_signature(module, shader, sig_ctx, out_signature);
     break;
   case Stage::Compute:
+  case Stage::Mesh:
+  case Stage::Amplification:
     if (module.num_threads[0] * module.num_threads[1] * module.num_threads[2] == 0)
       return createError("DXIL compute shader has no numthreads");
     declare_compute_signature(module, shader, sig_ctx, out_signature);
@@ -836,7 +855,7 @@ resolve_slot(
       "dx.op I/O instruction references unknown signature element " +
       llvm::Twine(cast<llvm::ConstantInt>(call.getArgOperand(1))->getZExtValue())
     );
-  if (row >= slot->rows || slot->start_col + component > 3)
+  if (row < slot->element_row || row - slot->element_row >= slot->rows || slot->start_col + component > 3)
     return createError(
       "dx.op I/O instruction addresses signature element " + llvm::Twine(slot->element_id) +
       " out of range"
@@ -874,9 +893,9 @@ llvm::Error lower_attribute_at_vertex(dxbc::context &ctx, const StageSignature &
   if (!id) return id.takeError();
   if (!row) return row.takeError();
   if (!component) return component.takeError();
-  auto slot = resolve_slot(call, signature.find_input(*id), *component, *row);
+  auto slot = resolve_slot(call, signature.find_input(*id, *row), *component, *row);
   if (!slot) return slot.takeError();
-  if ((*slot)->vertex_value_index == ~0u || *row != 0)
+  if ((*slot)->vertex_value_index == ~0u)
     return createError("dx.op.attributeAtVertex reads an element that is not bound per vertex");
   auto &builder = ctx.builder;
   builder.SetInsertPoint(&call);
@@ -896,23 +915,27 @@ llvm::Error lower_load_input(
   auto element_id = constant_operand(call, 1);
   if (!element_id)
     return element_id.takeError();
-  auto row = constant_operand(call, 2);
-  if (!row)
-    return row.takeError();
+  auto *constant_row = llvm::dyn_cast<llvm::ConstantInt>(call.getArgOperand(2));
+  const uint32_t row = constant_row ? uint32_t(constant_row->getZExtValue()) : 0;
   auto component = constant_operand(call, 3);
   if (!component)
     return component.takeError();
 
-  auto slot = resolve_slot(call, signature.find_input(element_id.get()), component.get(), row.get());
+  auto slot = resolve_slot(call, signature.find_input(element_id.get(), row), component.get(), row);
   if (!slot)
     return slot.takeError();
   auto *element = slot.get();
+  if (!constant_row && (element->semantic_kind != NAME_UNDEFINED || element->vertex_value_index != ~0u))
+    return createError("DXIL dynamic input row requires a packed user varying");
 
   auto &builder = ctx.builder;
   builder.SetInsertPoint(&call);
 
   llvm::Value *value;
-  if (element->semantic_kind == NAME_BARYCENTRICS) {
+  if (element->semantic_kind == NAME_SHADINGRATE) {
+    value = element->air_index == ~0u ? static_cast<llvm::Value *>(builder.getInt32(0))
+                                    : ctx.function->getArg(element->air_index);
+  } else if (element->semantic_kind == NAME_BARYCENTRICS) {
     value = builder.CreateExtractElement(ctx.function->getArg(element->air_index), element->start_col + *component);
   } else if (element->vertex_value_index != ~0u) {
     /* A plain read of a per-vertex (nointerpolation) attribute is the provoking vertex. */
@@ -938,7 +961,7 @@ llvm::Error lower_load_input(
       lane_type,
       builder.CreateGEP(
         registers_type, registers,
-        {builder.getInt32(0), builder.getInt32(element->reg + row.get()),
+        {builder.getInt32(0), builder.CreateAdd(builder.getInt32(element->reg), call.getArgOperand(2)),
          builder.getInt32(element->start_col + component.get())}
       )
     );
@@ -964,7 +987,7 @@ llvm::Error lower_store_output(
     return component.takeError();
 
   auto slot =
-    resolve_slot(call, signature.find_output(element_id.get()), component.get(), row.get());
+    resolve_slot(call, signature.find_output(element_id.get(), row.get()), component.get(), row.get());
   if (!slot)
     return slot.takeError();
   auto *element = slot.get();
@@ -1039,7 +1062,7 @@ llvm::Error lower_evaluate_input(dxbc::context &ctx, const StageSignature &signa
   if (!id) return id.takeError();
   if (!row) return row.takeError();
   if (!component) return component.takeError();
-  auto slot = resolve_slot(call, signature.find_input(*id), *component, *row);
+  auto slot = resolve_slot(call, signature.find_input(*id, *row), *component, *row);
   if (!slot) return slot.takeError();
   auto *element = *slot;
   auto &builder = ctx.builder;
@@ -1073,12 +1096,13 @@ llvm::Error lower_evaluate_input(dxbc::context &ctx, const StageSignature &signa
   } else if (callee->getName().startswith("dx.op.evalSnapped.")) {
     llvm::Value *offset = llvm::UndefValue::get(llvm::FixedVectorType::get(builder.getFloatTy(), 2));
     for (unsigned i = 0; i < 2; ++i) {
-      auto *snapped = builder.CreateAnd(builder.CreateAdd(call.getArgOperand(4 + i), builder.getInt32(8)),
-                                         builder.getInt32(15));
+      llvm::Value *snapped = builder.CreateAdd(call.getArgOperand(4 + i), builder.getInt32(8));
+      const bool wide = ctx.function->getParent()->getModuleFlag("dxmt.coarse.snapped") != nullptr;
+      if (!wide) snapped = builder.CreateAnd(snapped, builder.getInt32(15));
 
       // D3D offsets are relative to the pixel center; AIR/Metal offsets are
       // measured from its upper-left corner.
-      auto *floatOffset = builder.CreateFMul(builder.CreateUIToFP(snapped, builder.getFloatTy()),
+      auto *floatOffset = builder.CreateFMul(builder.CreateSIToFP(snapped, builder.getFloatTy()),
                                              llvm::ConstantFP::get(builder.getFloatTy(), 1.0 / 16.0));
       offset = builder.CreateInsertElement(offset, floatOffset, builder.getInt32(i));
     }
@@ -1121,6 +1145,29 @@ llvm::Error lower_thread_id(
 }
 
 } // namespace
+
+llvm::Value *ViewInstanceId(dxbc::context &ctx) {
+  /* The view the command list replays this draw for (view instancing, Tier 1 draw looping); it writes 0 for a
+   * PSO without view instancing, which is the value SV_ViewID must then read. */
+  if (auto *view = ctx.binding.ViewInstanceId(ctx.air))
+    return view;
+  return ctx.builder.getInt32(0);
+}
+
+llvm::Error LowerViewInstanceId(dxbc::context &ctx) {
+  llvm::SmallVector<llvm::CallInst *, 4> calls;
+  for (auto &instruction : llvm::instructions(*ctx.function))
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        call && llvm::StringRef(callee_name(*call)).startswith("dx.op.viewID."))
+      calls.push_back(call);
+  for (auto *call : calls) {
+    ctx.builder.SetInsertPoint(call);
+    auto *value = ctx.builder.CreateZExtOrTrunc(ViewInstanceId(ctx), call->getType());
+    call->replaceAllUsesWith(value);
+    call->eraseFromParent();
+  }
+  return llvm::Error::success();
+}
 
 llvm::Error LowerStageIO(dxbc::context &ctx, const StageSignature &signature) {
   llvm::SmallVector<llvm::CallInst *, 16> load_inputs;
@@ -1175,8 +1222,7 @@ llvm::Error LowerStageIO(dxbc::context &ctx, const StageSignature &signature) {
     auto name = callee_name(*call);
     llvm::StringRef name_ref(name);
     if (name_ref.startswith("dx.op.viewID.")) {
-      /* ViewInstancingTier is NOT_SUPPORTED: every draw is view 0. */
-      value = builder.getInt32(0);
+      value = ViewInstanceId(ctx);
     } else {
       /* SM 6.8 SV_StartVertexLocation is BaseVertexLocation (indexed) or
        * StartVertexLocation (non-indexed), exactly Metal's [[base_vertex]];
@@ -1298,6 +1344,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
 ) {
   if (!module.module || !module.entry)
     return createError("DXIL module was not parsed");
+  if (module.stage == Stage::Mesh || module.stage == Stage::Amplification)
+    return LowerMeshStage(module, shader, function_name, args);
   if (module.stage != Stage::Vertex && module.stage != Stage::Pixel &&
       module.stage != Stage::Compute)
     return unsupported("DXIL entry point stage");
@@ -1339,6 +1387,13 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     pso_sample_mask = pso_data->sample_mask;
     pso_pixel_formats = pso_data->pixel_formats;
   }
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *coarse_mask_args = nullptr;
+  const bool coarse_mask_output = pso_sample_mask != 0xffffffff &&
+    dxbc::args_get_data<SM50_SHADER_D3D12_COARSE_SHADING, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(args, &coarse_mask_args);
+  // The captured path applies SampleMask per fine pixel. Applying it to the original
+  // body would truncate coarse SV_Coverage to the first fine pixel's samples. Keep
+  // the implicit output shape, but let coverage capture/replay apply the actual mask.
+  if (coarse_mask_output) pso_sample_mask = 0xffffffff;
   SM50_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout = nullptr;
   dxbc::args_get_data<SM50_SHADER_IA_INPUT_LAYOUT, SM50_SHADER_IA_INPUT_LAYOUT_DATA>(
     args, &ia_layout
@@ -1452,6 +1507,10 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     sig_ctx.disable_depth_output = pso_disable_depth_output;
     SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel = nullptr;
     dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(args, &msaa_pixel);
+    sig_ctx.captured_pixel = msaa_pixel != nullptr;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA *coarse = nullptr;
+    dxbc::args_get_data<SM50_SHADER_D3D12_COARSE_SHADING, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(args, &coarse);
+    if (coarse) module_ir.addModuleFlag(llvm::Module::Error, "dxmt.coarse.snapped", 1);
     sig_ctx.pull_mode_reg_mask = msaa_pixel ? 0xffffffffu : shader.shader_info.pull_mode_reg_mask;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
@@ -1478,6 +1537,25 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     }
   }
   const auto sample_index_arg = sample_indices.empty() ? ~0u : func_signature.DefineInput(air::InputSampleIndex{});
+  // SV_Coverage input is the dx.op.coverage intrinsic (opcode 91) in DXIL; like DXBC's vCoverage it reads the
+  // native [[sample_mask]] input ANDed with the PSO SampleMask.
+  llvm::SmallVector<llvm::CallInst *, 4> coverage_inputs;
+  if (auto *intrinsic = module_ir.getFunction("dx.op.coverage.i32")) {
+    for (auto *user : intrinsic->users()) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (module.stage != Stage::Pixel || !call || call->getFunction() != module.entry ||
+          call->arg_size() != 1 || !call->getType()->isIntegerTy(32))
+        return createError("invalid dx.op.coverage use");
+      auto opcode = constant_operand(*call, 0);
+      if (!opcode)
+        return opcode.takeError();
+      if (*opcode != 91)
+        return createError("invalid dx.op.coverage opcode");
+      coverage_inputs.push_back(call);
+    }
+  }
+  const auto coverage_input_arg =
+    coverage_inputs.empty() ? ~0u : func_signature.DefineInput(air::InputInputCoverage{});
 
   /* Vertex stages always declare the four IA values: they are what the AIR
    * stage_in metadata carries for [[vertex_id]] / [[instance_id]] and what the
@@ -1502,7 +1580,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
       vertex_index_args = dxbc::define_vertex_index_pull(func_signature);
   }
 
-  if (module.stage == Stage::Pixel && pso_sample_mask != 0xffffffff) {
+  if (module.stage == Stage::Pixel && (pso_sample_mask != 0xffffffff || coarse_mask_output)) {
     auto assigned_index = func_signature.DefineOutput(air::OutputCoverageMask{});
     epilogue >> [=](dxbc::pvalue value) -> dxbc::IRValue {
       return dxbc::make_irvalue([=](dxbc::context ctx) {
@@ -1516,6 +1594,20 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   }
 
   const auto stats_arg = stats ? dxbc::define_pipeline_statistics(func_signature) : ~0u;
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *per_pixel = nullptr;
+  dxbc::args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
+    args, &per_pixel
+  );
+  std::optional<dxbc::PixelStatisticsDedupe> stats_dedupe;
+  if (stats && per_pixel && module.stage == Stage::Pixel)
+    stats_dedupe = dxbc::define_pixel_statistics_dedupe(func_signature);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *claim_arg = nullptr;
+  dxbc::args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
+    args, &claim_arg
+  );
+  std::optional<dxbc::PixelStatisticsClaim> stats_claim;
+  if (stats && claim_arg && module.stage == Stage::Pixel)
+    stats_claim = dxbc::define_pixel_statistics_claim(func_signature);
   auto binding_map = dxbc::setup_binding_rootsig(
     &shader.shader_info, func_signature, module_ir, shader_type, rootsig->bytecode,
     rootsig->bytecode_length
@@ -1530,6 +1622,14 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     func_signature.CreateFunction(function_name, llvm_context, module_ir, 0, rasterization_disabled);
   for (auto *call : sample_indices) {
     call->replaceAllUsesWith(function->getArg(sample_index_arg));
+    call->eraseFromParent();
+  }
+  for (auto *call : coverage_inputs) {
+    llvm::Value *coverage = function->getArg(coverage_input_arg);
+    if (pso_sample_mask != 0xffffffff)
+      coverage = llvm::BinaryOperator::CreateAnd(coverage, llvm::ConstantInt::get(coverage->getType(),
+                                                 pso_sample_mask), "coverage", call);
+    call->replaceAllUsesWith(coverage);
     call->eraseFromParent();
   }
 
@@ -1604,10 +1704,13 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     );
   if (auto err = prologue.build(ctx).takeError())
     return std::move(err);
-  if (stats)
+  if (stats_claim)
+    dxbc::claim_pixel_invocation(builder, air, function, stats_arg, *stats_claim);
+  else if (stats && module.stage == Stage::Pixel)
+    dxbc::increment_pixel_invocations(builder, air, function, stats_arg, stats_dedupe ? &*stats_dedupe : nullptr);
+  else if (stats)
     dxbc::increment_pipeline_statistics(
-      builder, air, function, stats_arg,
-      module.stage == Stage::Vertex ? 4 : module.stage == Stage::Pixel ? 14 : 20
+      builder, air, function, stats_arg, module.stage == Stage::Vertex ? 4 : 20
     );
 
   auto body_entry = TransplantEntryBody(*module.entry, *function, *epilogue_bb);

@@ -179,6 +179,21 @@ uint32_t ArgumentBufferBuilder::DefineInteger64(
   return element_index;
 };
 
+uint32_t ArgumentBufferBuilder::DefineInteger32(
+  std::string name, uint32_t location_index
+) {
+  auto element_index = fieldsType.size();
+  assert(!fields.count(name) && "otherwise duplicated field name");
+  fieldsType.push_back(ArgumentBindingIndirectConstant{
+    .location_index =
+      location_index == UINT32_MAX ? (uint32_t)element_index : location_index,
+    .array_size = 1,
+    .type = msl_uint,
+    .arg_name = name
+  });
+  return element_index;
+};
+
 auto build_argument_binding_buffer(
   StreamMDHelper &md, const ArgumentBindingBuffer &buffer,
   llvm::LLVMContext &context, const llvm::DataLayout &layout
@@ -747,6 +762,20 @@ auto FunctionSignatureBuilder::CreateFunction(
                   ->string("air.arg_name")
                   ->string("mtl_viewport_array_index");
             },
+            [&](const OutputPrimitiveID) {
+              md.string("air.primitive_id")
+                  ->string("air.arg_type_name")
+                  ->string("uint")
+                  ->string("air.arg_name")
+                  ->string("mtl_primitive_id");
+            },
+            [&](const OutputPrimitiveCulled) {
+              md.string("air.primitive_culled")
+                  ->string("air.arg_type_name")
+                  ->string("bool")
+                  ->string("air.arg_name")
+                  ->string("mtl_primitive_culled");
+            },
         },
         output
     );
@@ -1014,7 +1043,9 @@ auto FunctionSignatureBuilder::CreateFunction(
             ->integer(1)
             ->string(table.memory_access == MemoryAccess::read ? "air.read" : "air.read_write")
             ->string("air.arg_type_name")
-            ->string("intersection_function_table<instancing, triangle_data>")
+            /* world_space_data: the traversal reports the instance transforms (ObjectToWorld /
+             * WorldToObject), so every table function carries the same tag. */
+            ->string("intersection_function_table<instancing, triangle_data, world_space_data>")
             ->string("air.arg_name")
             ->string(table.arg_name);
           return getOrCreateStructType("struct._intersection_function_table_t", context)
@@ -1074,6 +1105,12 @@ auto FunctionSignatureBuilder::CreateFunction(
             return FixedVectorType::get(Type::getFloatTy(context), 3);
           if (value.type_name == "float4")
             return FixedVectorType::get(Type::getFloatTy(context), 4);
+          /* `[[object_to_world_transform]]` / `[[world_to_object_transform]]`: Metal passes
+           * the float4x3 by value as a `[4 x <3 x float>]*` byval pointer (the front end's own
+           * output for an `[[intersection(..., world_space_data)]]` function). The byval
+           * attribute is attached by CreateFunction. */
+          if (value.type_name == "float4x3")
+            return ArrayType::get(FixedVectorType::get(Type::getFloatTy(context), 3), 4)->getPointerTo();
           /* Everything else is a byte block the traversal carries: the payload and
            * the hit state the ray generation shader publishes. A block the traversal
            * owns lives in the ray-data space, so the declared space is honored rather
@@ -1249,6 +1286,15 @@ auto FunctionSignatureBuilder::CreateFunction(
     FunctionType::get(output_struct_type, type_input, false),
     llvm::Function::LinkageTypes::ExternalLinkage, name, module
   );
+  for (auto &item : enumerate(inputs)) {
+    auto *value = std::get_if<InputRaytracingValue>(&item.value());
+    if (!value || value->type_name != "float4x3")
+      continue;
+    Type *matrix = ArrayType::get(FixedVectorType::get(Type::getFloatTy(context), 3), 4);
+    function->addParamAttr(item.index(), Attribute::getWithByValType(context, matrix));
+    function->addParamAttr(item.index(), Attribute::NoCapture);
+    function->addParamAttr(item.index(), Attribute::ReadOnly);
+  }
   auto metadata_output_tuple = MDTuple::get(context, metadata_output);
   auto metadata_input_tuple = MDTuple::get(context, metadata_input);
   std::vector<Metadata *> function_def_tuple = {

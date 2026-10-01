@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "owned-d3d12-tessellation-oracle.inc"
+#include "owned-d3d12-early-depth-oracle.inc"
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -781,34 +782,22 @@ int runPatchCases(Context &c, const std::vector<uint8_t> &vs, const std::vector<
   indirectIndexed.indirect = true;
   cases += checkPatches("indirect-indexed", drawPatches(c, pso.Get(), indirectIndexed), 5, 2, 1, {{20, 4}, {4, 4}});
 
-  // 4x MSAA: pixel-aligned quads resolve to exactly the 1x image; statistics over an MSAA mesh draw: E_NOTIMPL.
+  // 4x MSAA: pixel-aligned quads resolve to exactly the 1x image. Statistics over the native MSAA mesh draw count
+  // PSInvocations per (triangle, pixel) with coverage: each 2x2 quad's diagonal splits its two diagonal pixels
+  // between both triangles (standard 4x positions put samples on both sides), so 6 per patch, 18 for 3 patches
+  // (the 1x count is 12, the covered-sample count 48).
   createTarget(c, 4);
   auto msaa = pipeline(c, vs, hs, ds, ps);
   PatchDraw resolved = base;
   resolved.statistics = false;
   cases += checkPatches("msaa4", drawPatches(c, msaa.Get(), resolved), 5, 3, 1, {{4, 4}, {12, 4}, {20, 4}}, false);
   {
-    c.begin();
-    c.list->SetGraphicsRootSignature(c.root.Get());
-    c.list->SetPipelineState(msaa.Get());
-    auto rtv = c.rtvs->GetCPUDescriptorHandleForHeapStart();
-    c.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    c.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_5_CONTROL_POINT_PATCHLIST);
-    c.list->BeginQuery(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
-    c.list->DrawInstanced(5, 1, 0, 0);
-    c.list->EndQuery(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
-    const HRESULT hr = c.list->Close();
-    if (hr != E_NOTIMPL) {
-      std::fprintf(stderr, "%s_CLOSE hr=0x%08lx expected E_NOTIMPL\n", kPrefix, static_cast<unsigned long>(hr));
-      fail("msaa4-statistics");
-    }
-    c.list.Reset();
-    check(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, c.allocator.Get(), nullptr,
-                                      IID_PPV_ARGS(&c.list)),
-          "list-recreate");
-    check(c.list->Close(), "list-recreate-close");
-    casePass("msaa4-statistics-notimpl");
-    ++cases;
+    PatchDraw counted = base;
+    auto r = drawPatches(c, msaa.Get(), counted);
+    cases += checkPatches("msaa4-statistics", r, 5, 3, 1, {{4, 4}, {12, 4}, {20, 4}});
+    const auto &s = r.statistics;
+    if (s.PSInvocations != 18 || s.CInvocations != s.CPrimitives || s.CInvocations != 6)
+      caseFail("msaa4-statistics-ps", r);
   }
   createTarget(c, 1);
   return cases;
@@ -821,7 +810,7 @@ int runPatchCases(Context &c, const std::vector<uint8_t> &vs, const std::vector<
  * draw's CPrimitives) with SV_PrimitiveID = the patch, stream output holds the triangles in D3D order (patch order,
  * each triangle's two copies adjacent) and the copy-0 triangles tile each patch exactly (area sum).
  */
-constexpr UINT kSoBytes = 64 * 1024;
+constexpr UINT kSoBytes = 96 * 1024;
 constexpr UINT kSoRecordFloats = 6; // SV_Position.xyzw, TAG.xy
 
 struct TsgsContext {
@@ -883,7 +872,7 @@ HRESULT tsgsPipeline(Context &c, TsgsContext &t, const std::vector<uint8_t> &vs,
     d.GS = {gs->data(), gs->size()};
   d.PS = {ps.data(), ps.size()};
   if (so)
-    d.StreamOutput = {entries, 2, &stride, 1, 0};
+    d.StreamOutput = {entries, gs ? 2u : 1u, &stride, 1, 0};
   d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
   d.SampleMask = UINT_MAX;
   d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -907,8 +896,19 @@ std::vector<float> tsgsVertices(bool quad) {
   return v;
 }
 
+/* How drawTsgs issues the two patches. The indirect modes take their arguments and count from DEFAULT buffers the
+ * same command list writes on the GPU; commands past the count hold a draw far beyond any capture limit, so a
+ * dropped count or a CPU-sized capture would fail or overflow. */
+enum class TsgsDraw {
+  Direct,          // DrawInstanced(both patches)
+  DirectTwice,     // DrawInstanced(both patches) twice
+  Indirect,        // ExecuteIndirect(4): {both patches}, {0 vertices}, beyond count x2; count 2
+  IndirectTwice,   // ExecuteIndirect(4): {both patches} x2, beyond count x2; count 2
+};
+
 TsgsResult drawTsgs(Context &c, TsgsContext &t, ID3D12PipelineState *pso, bool quad,
-                    const tess_oracle::Factors &factors, bool so, bool statistics) {
+                    const tess_oracle::Factors &factors, bool so, bool statistics, TsgsDraw mode = TsgsDraw::Direct,
+                    UINT instances = 1) {
   TsgsResult result;
   const auto vertices = tsgsVertices(quad);
   auto vb = buffer(c.device.Get(), vertices.size() * sizeof(float), D3D12_HEAP_TYPE_UPLOAD,
@@ -917,7 +917,42 @@ TsgsResult drawTsgs(Context &c, TsgsContext &t, ID3D12PipelineState *pso, bool q
   check(vb->Map(0, nullptr, &mapped), "tsgs-map-vertices");
   std::memcpy(mapped, vertices.data(), vertices.size() * sizeof(float));
   vb->Unmap(0, nullptr);
+  const UINT vertexCount = UINT(vertices.size() / 2);
+  const bool indirect = mode == TsgsDraw::Indirect || mode == TsgsDraw::IndirectTwice;
+  ComPtr<ID3D12Resource> argsUpload, args;
+  ComPtr<ID3D12CommandSignature> signature;
+  constexpr UINT kCommands = 4, kArgBytes = kCommands * sizeof(D3D12_DRAW_ARGUMENTS) + 16;
+  if (indirect) {
+    struct {
+      D3D12_DRAW_ARGUMENTS commands[kCommands];
+      UINT count[4];
+    } words = {{{vertexCount, instances, 0, 0},
+                {mode == TsgsDraw::IndirectTwice ? vertexCount : 0, instances, 0, 0},
+                {0x40000000u, 0x10000u, 0, 0},
+                {0x40000000u, 0x10000u, 0, 0}},
+               {2, 0, 0, 0}};
+    static_assert(sizeof(words) == kArgBytes);
+    argsUpload = buffer(c.device.Get(), kArgBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    check(argsUpload->Map(0, nullptr, &mapped), "tsgs-map-indirect-args");
+    std::memcpy(mapped, &words, kArgBytes);
+    argsUpload->Unmap(0, nullptr);
+    args = buffer(c.device.Get(), kArgBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC desc = {};
+    desc.ByteStride = sizeof(D3D12_DRAW_ARGUMENTS);
+    desc.NumArgumentDescs = 1;
+    desc.pArgumentDescs = &argument;
+    check(c.device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&signature)), "tsgs-indirect-signature");
+  }
   c.begin();
+  if (indirect) {
+    // GPU-written arguments and count: the recording cannot know either.
+    c.list->CopyBufferRegion(args.Get(), 0, argsUpload.Get(), 0, kArgBytes);
+    D3D12_RESOURCE_BARRIER to_args =
+        transition(args.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    c.list->ResourceBarrier(1, &to_args);
+  }
   c.list->CopyBufferRegion(c.log.Get(), 0, c.zero.Get(), 0, kLogBytes);
   c.list->CopyBufferRegion(t.gsLog.Get(), 0, c.zero.Get(), 0, kLogBytes);
   D3D12_RESOURCE_BARRIER to_uav[3] = {
@@ -954,7 +989,12 @@ TsgsResult drawTsgs(Context &c, TsgsContext &t, ID3D12PipelineState *pso, bool q
     c.list->SOSetTargets(0, 1, &target);
   if (statistics)
     c.list->BeginQuery(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
-  c.list->DrawInstanced(UINT(vertices.size() / 2), 1, 0, 0);
+  if (indirect)
+    c.list->ExecuteIndirect(signature.Get(), kCommands, args.Get(), 0, args.Get(),
+                            kCommands * sizeof(D3D12_DRAW_ARGUMENTS));
+  else
+    for (int i = 0; i < (mode == TsgsDraw::DirectTwice ? 2 : 1); ++i)
+      c.list->DrawInstanced(vertexCount, instances, 0, 0);
   if (statistics) {
     c.list->EndQuery(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
     c.list->ResolveQueryData(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1,
@@ -1037,7 +1077,7 @@ int runTsgsCase(Context &c, TsgsContext &t, const char *name, const std::vector<
                 const std::vector<uint8_t> &hs, const std::vector<uint8_t> &ds, const std::vector<uint8_t> &gs,
                 const std::vector<uint8_t> &ps, bool quad, tess_oracle::Partitioning partition,
                 const tess_oracle::Factors &factors, bool so) {
-  const bool statistics = c.samples == 1; // statistics over an MSAA mesh draw: E_NOTIMPL (msaa4-statistics-notimpl)
+  const bool statistics = true; // 1x and native 4x MSAA (PSInvocations per covered pixel)
   ComPtr<ID3D12PipelineState> reference_pso, pso;
   check(tsgsPipeline(c, t, vs, hs, ds, nullptr, ps, false, reference_pso), "tsgs-reference-pso");
   check(tsgsPipeline(c, t, vs, hs, ds, &gs, ps, so, pso), "tsgs-pso");
@@ -1073,7 +1113,9 @@ int runTsgsCase(Context &c, TsgsContext &t, const char *name, const std::vector<
             s.HSInvocations == patches && s.DSInvocations == got.dsInvocations &&
             s.DSInvocations == r.DSInvocations && s.GSInvocations == invocations &&
             s.GSPrimitives == 2ull * invocations && s.CInvocations == 2ull * invocations &&
-            s.CPrimitives == 2ull * invocations && s.PSInvocations > 0 && s.CSInvocations == 0;
+            s.CPrimitives == 2ull * invocations && s.PSInvocations > 0 && s.CSInvocations == 0 &&
+            // Both GS copies cover the same pixels as the reference's one triangle, at every sample count.
+            s.PSInvocations == 2 * r.PSInvocations;
   }
   bool output = true;
   double area[2] = {};
@@ -1121,6 +1163,49 @@ int runTsgsCase(Context &c, TsgsContext &t, const char *name, const std::vector<
   return 1;
 }
 
+/* ExecuteIndirect with a TS+GS PSO, GPU-written arguments and count, against the same draws issued directly: the
+ * image, the stream output (bytes and BufferFilledSize, API order across commands), the pipeline statistics, the
+ * DS domain points and the GS primitive ids are identical. */
+int runTsgsIndirectCase(Context &c, TsgsContext &t, const char *name, const std::vector<uint8_t> &vs,
+                        const std::vector<uint8_t> &hs, const std::vector<uint8_t> &ds, const std::vector<uint8_t> &gs,
+                        const std::vector<uint8_t> &ps, bool quad, const tess_oracle::Factors &factors, bool so,
+                        bool twice) {
+  ComPtr<ID3D12PipelineState> pso;
+  check(tsgsPipeline(c, t, vs, hs, ds, &gs, ps, so, pso), "tsgs-indirect-pso");
+  const TsgsResult direct =
+      drawTsgs(c, t, pso.Get(), quad, factors, so, true, twice ? TsgsDraw::DirectTwice : TsgsDraw::Direct);
+  const TsgsResult got =
+      drawTsgs(c, t, pso.Get(), quad, factors, so, true, twice ? TsgsDraw::IndirectTwice : TsgsDraw::Indirect);
+  auto sorted = [](std::vector<uint32_t> v) {
+    std::sort(v.begin(), v.end());
+    return v;
+  };
+  const auto &r = direct.statistics, &s = got.statistics;
+  const bool image = got.texels == direct.texels &&
+                     std::any_of(got.texels.begin(), got.texels.end(), [](uint32_t t) { return t == 0xff00ff00u; });
+  const bool output = got.filled == direct.filled && got.records == direct.records && (!so || got.filled > 0);
+  const bool stats = std::memcmp(&r, &s, sizeof(r)) == 0 && s.GSInvocations > 0 &&
+                     s.HSInvocations == (twice ? 4u : 2u);
+  const bool shaders = got.points == direct.points && got.dsInvocations == direct.dsInvocations &&
+                       got.gsInvocations == direct.gsInvocations && sorted(got.ids) == sorted(direct.ids);
+  if (!(image && output && stats && shaders)) {
+    std::fprintf(stderr,
+                 "%s_MISMATCH shader=%s case=%s domain=%s image=%d so=%d stats=%d shaders=%d filled=%llu/%llu "
+                 "gs=%u/%u ds=%u/%u gsinv=%llu/%llu cprim=%llu/%llu ps=%llu/%llu hs=%llu/%llu ia=%llu/%llu\n",
+                 kPrefix, useDxil ? "dxil" : "dxbc", name, quad ? "quad" : "tri", image, output, stats, shaders,
+                 (unsigned long long)got.filled, (unsigned long long)direct.filled, got.gsInvocations,
+                 direct.gsInvocations, got.dsInvocations, direct.dsInvocations, s.GSInvocations, r.GSInvocations,
+                 s.CPrimitives, r.CPrimitives, s.PSInvocations, r.PSInvocations, s.HSInvocations, r.HSInvocations,
+                 s.IAVertices, r.IAVertices);
+    fail(name);
+  }
+  std::printf("%s_CASE_PASS shader=%s case=%s domain=%s samples=%u commands=%u gs=%u so_vertices=%llu ps=%llu\n",
+              kPrefix, useDxil ? "dxil" : "dxbc", name, quad ? "quad" : "tri", c.samples, twice ? 2u : 1u,
+              got.gsInvocations, (unsigned long long)(got.filled / (kSoRecordFloats * 4)),
+              (unsigned long long)s.PSInvocations);
+  return 1;
+}
+
 int runTsgsCases(Context &c, const std::vector<uint8_t> &vs, const std::vector<uint8_t> &ps,
                  const std::vector<uint8_t> &ds_tri, const std::vector<uint8_t> &ds_quad) {
   TsgsContext t;
@@ -1159,46 +1244,296 @@ int runTsgsCases(Context &c, const std::vector<uint8_t> &vs, const std::vector<u
     casePass("tsgs-output-mismatch");
     ++cases;
   }
-  // ExecuteIndirect: the capture is sized from CPU-known patch counts, so an indirect TS+GS draw is E_NOTIMPL.
-  {
+  // ExecuteIndirect with GPU-written arguments and count (one or two active commands, an empty command and
+  // huge commands past the count) equals the same direct draws: image, SO, statistics.
+  cases += runTsgsIndirectCase(c, t, "tsgs-indirect", vs, hs_tri, ds_tri, gs, ps, false, integral, false, false);
+  cases += runTsgsIndirectCase(c, t, "tsgs-indirect-so", vs, hs_tri, ds_tri, gs, ps, false, integral, true, true);
+  cases += runTsgsIndirectCase(c, t, "tsgs-indirect-so-fractional", vs, hs_quad_odd, ds_quad, gs, ps, true, fractional,
+                               true, false);
+  createTarget(c, 4);
+  cases += runTsgsIndirectCase(c, t, "tsgs-indirect-msaa4", vs, hs_quad, ds_quad, gs, ps, true, integral, true, true);
+  createTarget(c, 1);
+  // DS-only SO preserves the tessellator primitive order across workloads, patches, instances and commands.
+  // The existing GS emits two exact copies of each triangle: copy zero is a second consumer of the same DS output.
+  for (bool quad : {false, true}) {
+    const auto &hs = quad ? hs_quad_odd : hs_tri_odd;
+    const auto &ds = quad ? ds_quad : ds_tri;
+    ComPtr<ID3D12PipelineState> domain_pso, geometry_pso;
+    check(tsgsPipeline(c, t, vs, hs, ds, nullptr, ps, true, domain_pso), "domain-so-fractional-pso");
+    check(tsgsPipeline(c, t, vs, hs, ds, &gs, ps, true, geometry_pso), "domain-so-order-reference-pso");
+    const auto direct = drawTsgs(c, t, domain_pso.Get(), quad, fractional, true, true, TsgsDraw::DirectTwice, 2);
+    const auto indirect = drawTsgs(c, t, domain_pso.Get(), quad, fractional, true, true, TsgsDraw::IndirectTwice, 2);
+    const auto reference = drawTsgs(c, t, geometry_pso.Get(), quad, fractional, true, true, TsgsDraw::DirectTwice, 2);
+    require(direct.records == indirect.records && direct.filled == indirect.filled &&
+            direct.texels == indirect.texels && direct.texels == reference.texels, "domain-so-fractional-exact");
+    require(direct.filled == direct.statistics.CPrimitives * 3 * kSoRecordFloats * 4 &&
+            reference.filled == direct.filled * 2 && direct.statistics.HSInvocations == 8 &&
+            direct.statistics.GSInvocations == 0 &&
+            std::memcmp(&direct.statistics, &indirect.statistics, sizeof(direct.statistics)) == 0,
+            "domain-so-fractional-size-statistics");
+    const size_t primitives = direct.records.size() / (3 * kSoRecordFloats);
+    for (size_t p = 0; p < primitives; ++p)
+      for (size_t v = 0; v < 3; ++v)
+        require(std::memcmp(direct.records.data() + (p*3 + v)*kSoRecordFloats,
+                            reference.records.data() + (p*6 + v)*kSoRecordFloats, 16) == 0,
+                "domain-so-fractional-workload-order");
+    casePass(quad ? "ds-so-fractional-quad-order" : "ds-so-fractional-tri-order");
+    ++cases;
+  }
+  for (bool points : {false, true}) {
+    const auto hs = shader(points ? "hs_isoline_integer_point" : "hs_isoline_integer_line", "hs_5_0");
+    const auto ds = shader("ds_isoline", "ds_5_0");
     ComPtr<ID3D12PipelineState> pso;
-    check(tsgsPipeline(c, t, vs, hs_tri, ds_tri, &gs, ps, false, pso), "tsgs-indirect-pso");
-    D3D12_INDIRECT_ARGUMENT_DESC argument = {};
-    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
-    D3D12_COMMAND_SIGNATURE_DESC desc = {};
-    desc.ByteStride = sizeof(D3D12_DRAW_ARGUMENTS);
-    desc.NumArgumentDescs = 1;
-    desc.pArgumentDescs = &argument;
-    ComPtr<ID3D12CommandSignature> signature;
-    check(c.device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&signature)), "tsgs-signature");
-    const D3D12_DRAW_ARGUMENTS arguments = {6, 1, 0, 0};
-    auto args = buffer(c.device.Get(), sizeof(arguments), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    void *mapped = nullptr;
-    check(args->Map(0, nullptr, &mapped), "tsgs-map-args");
-    std::memcpy(mapped, &arguments, sizeof(arguments));
-    args->Unmap(0, nullptr);
-    c.begin();
-    c.list->SetGraphicsRootSignature(t.root.Get());
-    c.list->SetPipelineState(pso.Get());
-    auto rtv = c.rtvs->GetCPUDescriptorHandleForHeapStart();
-    c.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    c.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
-    c.list->ExecuteIndirect(signature.Get(), 1, args.Get(), 0, nullptr, 0);
-    const HRESULT hr = c.list->Close();
-    if (hr != E_NOTIMPL) {
-      std::fprintf(stderr, "%s_CLOSE hr=0x%08lx expected E_NOTIMPL\n", kPrefix, static_cast<unsigned long>(hr));
-      fail("tsgs-indirect-notimpl");
-    }
-    c.list.Reset();
-    check(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, c.allocator.Get(), nullptr,
-                                      IID_PPV_ARGS(&c.list)),
-          "tsgs-list-recreate");
-    check(c.list->Close(), "tsgs-list-recreate-close");
-    casePass("tsgs-indirect-notimpl");
+    check(tsgsPipeline(c, t, vs, hs, ds, nullptr, ps, true, pso), "domain-so-isoline-pso");
+    const tess_oracle::Factors factors{{2, 2, 0, 0}, {0, 0}};
+    const auto direct = drawTsgs(c, t, pso.Get(), true, factors, true, true);
+    const auto indirect = drawTsgs(c, t, pso.Get(), true, factors, true, true, TsgsDraw::Indirect);
+    const uint32_t vertices_per_patch = points ? 6 : 8;
+    require(direct.records == indirect.records && direct.filled == indirect.filled &&
+            direct.texels == indirect.texels && direct.filled == 2*vertices_per_patch*kSoRecordFloats*4 &&
+            direct.statistics.CPrimitives == (points ? 12u : 8u) && direct.statistics.GSInvocations == 0 &&
+            std::memcmp(&direct.statistics, &indirect.statistics, sizeof(direct.statistics)) == 0,
+            "domain-so-isoline-bytes-size-statistics");
+    for (uint32_t patch = 0; patch < 2; ++patch)
+      for (uint32_t line = 0; line < 2; ++line)
+        for (uint32_t v = 0; v < (points ? 3u : 4u); ++v) {
+          const uint32_t x_index = points ? v : v == 3 ? 2 : v == 0 ? 0 : 1;
+          const auto *record = direct.records.data() +
+              (patch*vertices_per_patch + line*(points ? 3u : 4u) + v)*kSoRecordFloats;
+          const float expected_x = (patch ? 0.05f : -0.75f) + float(x_index)*0.35f;
+          require(std::abs(record[0]-expected_x) < 0.000001f && record[1] == (line ? 0.0f : 0.75f) &&
+                  record[2] == 0 && record[3] == 1, "domain-so-isoline-connectivity");
+        }
+    casePass(points ? "ds-so-isoline-points" : "ds-so-isoline-lines");
     ++cases;
   }
   return cases;
 }
+
+/*
+ * PSInvocations of native MSAA HS/DS and HS/DS/GS draws whose PS forces early depth with a depth test (counted once
+ * per (pixel, primitive) by the claim buffer). Tri patches with factor 1 tessellate to exactly their input triangle,
+ * so the counted primitives are known exactly: the DS-only draw rasterizes each patch triangle, the TS+GS draw each
+ * one twice (gs_tsgs emits two copies, equal depth, LESS_EQUAL). An occluder (no query, depth 0.25) is drawn first;
+ * the counted draws are at depth 0.5 (viewport depth range). Oracle: early_depth_oracle. Each pipeline runs
+ * directly and through ExecuteIndirect with GPU-written arguments and count ({all patches}, {0}, beyond the count),
+ * at 2x, 4x and 8x; the indirect image and statistics equal the direct draw's.
+ */
+int runEarlyDepthCases(Context &c, const std::vector<uint8_t> &vs, const std::vector<uint8_t> &ps) {
+  TsgsContext t;
+  initTsgs(c, t);
+  int cases = 0;
+  auto hs = shader("hs_tri_integer", "hs_5_0"), ds = shader("ds_tri", "ds_5_0"), gs = shader("gs_tsgs", "gs_5_0");
+  auto early = shader("ps_early", "ps_5_0"), gsEarly = shader("ps_tsgs_early", "ps_5_0");
+  using early_depth_oracle::Triangle;
+  // Pixel-space triangles on the 1/256-pixel grid (values below are n / 256, exact in float clip space); every
+  // 2x/4x/8x sample is at least 0.004 pixel from every edge, so rasterization matches the oracle without ties.
+  constexpr double g = 1.0 / 256;
+  const std::vector<Triangle> patches = {
+      {{{852 * g, 712 * g, 0.5}, {3705 * g, 1029 * g, 0.5}, {1592 * g, 3675 * g, 0.5}}},
+      {{{2297 * g, 1622 * g, 0.5}, {5286 * g, 2476 * g, 0.5}, {2846 * g, 4917 * g, 0.5}}},
+      {{{4425 * g, 3955 * g, 0.5}, {7571 * g, 4740 * g, 0.5}, {5545 * g, 7874 * g, 0.5}}},
+      {{{696 * g, 5503 * g, 0.5}, {3372 * g, 4660 * g, 0.5}, {2258 * g, 7630 * g, 0.5}}},
+  };
+  const std::vector<Triangle> occluders = {
+      {{{0.0, 0.0, 0.25}, {3122 * g, 0.0, 0.25}, {0.0, 6904 * g, 0.25}}},
+  };
+  auto toVertices = [](const std::vector<Triangle> &tris) {
+    std::vector<float> v;
+    for (const auto &tri : tris)
+      for (const auto &p : tri.v) {
+        v.push_back(float(p.x / 16.0 - 1.0));
+        v.push_back(float(1.0 - p.y / 16.0));
+      }
+    return v;
+  };
+  for (UINT samples : {2u, 4u, 8u}) {
+    createTarget(c, samples);
+    D3D12_RESOURCE_DESC dd = c.target->GetDesc();
+    dd.Format = DXGI_FORMAT_D32_FLOAT;
+    dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    auto h = heap(D3D12_HEAP_TYPE_DEFAULT);
+    D3D12_CLEAR_VALUE depthClear = {};
+    depthClear.Format = DXGI_FORMAT_D32_FLOAT;
+    depthClear.DepthStencil.Depth = 1;
+    ComPtr<ID3D12Resource> depth;
+    check(c.device->CreateCommittedResource(&h, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                            &depthClear, IID_PPV_ARGS(&depth)),
+          "early-depth-dsv");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    hd.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> dsvs;
+    check(c.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsvs)), "early-depth-dsv-heap");
+    const auto dsv = dsvs->GetCPUDescriptorHandleForHeapStart();
+    c.device->CreateDepthStencilView(depth.Get(), nullptr, dsv);
+    auto makePso = [&](ID3D12RootSignature *root, const std::vector<uint8_t> *gsCode, const std::vector<uint8_t> &psCode) {
+      D3D12_INPUT_ELEMENT_DESC element = {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+                                          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
+      d.pRootSignature = root;
+      d.VS = {vs.data(), vs.size()};
+      d.HS = {hs.data(), hs.size()};
+      d.DS = {ds.data(), ds.size()};
+      if (gsCode)
+        d.GS = {gsCode->data(), gsCode->size()};
+      d.PS = {psCode.data(), psCode.size()};
+      d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+      d.SampleMask = UINT_MAX;
+      d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      d.RasterizerState.DepthClipEnable = TRUE;
+      d.DepthStencilState.DepthEnable = TRUE;
+      d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+      d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+      d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+      d.InputLayout = {&element, 1};
+      d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+      d.NumRenderTargets = 1;
+      d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+      d.SampleDesc.Count = samples;
+      ComPtr<ID3D12PipelineState> pso;
+      check(c.device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)), "early-depth-pso");
+      return pso;
+    };
+    for (bool geometry : {false, true}) {
+      ID3D12RootSignature *root = geometry ? t.root.Get() : c.root.Get();
+      auto counted = geometry ? makePso(root, &gs, gsEarly) : makePso(root, nullptr, early);
+      auto occluderPso = makePso(root, nullptr, ps);
+      auto run = [&](bool indirect, D3D12_QUERY_DATA_PIPELINE_STATISTICS &stats) {
+        std::array<uint32_t, kSize * kSize> texels{};
+        const auto occluderVertices = toVertices(occluders), vertices = toVertices(patches);
+        auto upload = [&](const void *data, size_t size) {
+          auto r = buffer(c.device.Get(), std::max<size_t>(size, 16), D3D12_HEAP_TYPE_UPLOAD,
+                          D3D12_RESOURCE_STATE_GENERIC_READ);
+          void *mapped = nullptr;
+          check(r->Map(0, nullptr, &mapped), "early-depth-upload");
+          std::memcpy(mapped, data, size);
+          r->Unmap(0, nullptr);
+          return r;
+        };
+        auto occluderVb = upload(occluderVertices.data(), occluderVertices.size() * 4);
+        auto vb = upload(vertices.data(), vertices.size() * 4);
+        struct {
+          D3D12_DRAW_ARGUMENTS commands[4];
+          UINT count[4];
+        } words = {{{UINT(vertices.size() / 2), 1, 0, 0}, {0, 1, 0, 0}, {0x40000000u, 0x10000u, 0, 0},
+                    {0x40000000u, 0x10000u, 0, 0}},
+                   {2, 0, 0, 0}};
+        auto argsUpload = upload(&words, sizeof(words));
+        auto args = buffer(c.device.Get(), sizeof(words), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+        argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        D3D12_COMMAND_SIGNATURE_DESC sd = {};
+        sd.ByteStride = sizeof(D3D12_DRAW_ARGUMENTS);
+        sd.NumArgumentDescs = 1;
+        sd.pArgumentDescs = &argument;
+        ComPtr<ID3D12CommandSignature> signature;
+        check(c.device->CreateCommandSignature(&sd, nullptr, IID_PPV_ARGS(&signature)), "early-depth-signature");
+        c.begin();
+        c.list->CopyBufferRegion(args.Get(), 0, argsUpload.Get(), 0, sizeof(words));
+        D3D12_RESOURCE_BARRIER to[3] = {
+            transition(args.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+            transition(c.log.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(t.gsLog.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+        c.list->ResourceBarrier(3, to);
+        auto rtv = c.rtvs->GetCPUDescriptorHandleForHeapStart();
+        const float zero[4] = {};
+        c.list->ClearRenderTargetView(rtv, zero, 0, nullptr);
+        c.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+        c.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        D3D12_RECT scissor = {0, 0, LONG(kSize), LONG(kSize)};
+        c.list->RSSetScissorRects(1, &scissor);
+        c.list->SetGraphicsRootSignature(root);
+        const float constants[8] = {1, 1, 1, 1, 1, 1, 0, 0};
+        c.list->SetGraphicsRoot32BitConstants(0, 8, constants, 0);
+        c.list->SetGraphicsRootUnorderedAccessView(1, c.log->GetGPUVirtualAddress());
+        if (geometry)
+          c.list->SetGraphicsRootUnorderedAccessView(2, t.gsLog->GetGPUVirtualAddress());
+        c.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+        D3D12_VIEWPORT occluderViewport = {0, 0, float(kSize), float(kSize), 0.25f, 0.25f};
+        c.list->RSSetViewports(1, &occluderViewport);
+        c.list->SetPipelineState(occluderPso.Get());
+        D3D12_VERTEX_BUFFER_VIEW occluderView = {occluderVb->GetGPUVirtualAddress(),
+                                                 UINT(occluderVertices.size() * 4), 8};
+        c.list->IASetVertexBuffers(0, 1, &occluderView);
+        c.list->DrawInstanced(UINT(occluderVertices.size() / 2), 1, 0, 0);
+        D3D12_VIEWPORT viewport = {0, 0, float(kSize), float(kSize), 0.5f, 0.5f};
+        c.list->RSSetViewports(1, &viewport);
+        c.list->SetPipelineState(counted.Get());
+        D3D12_VERTEX_BUFFER_VIEW view = {vb->GetGPUVirtualAddress(), UINT(vertices.size() * 4), 8};
+        c.list->IASetVertexBuffers(0, 1, &view);
+        c.list->BeginQuery(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+        if (indirect)
+          c.list->ExecuteIndirect(signature.Get(), 4, args.Get(), 0, args.Get(), 4 * sizeof(D3D12_DRAW_ARGUMENTS));
+        else
+          c.list->DrawInstanced(UINT(vertices.size() / 2), 1, 0, 0);
+        c.list->EndQuery(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+        c.list->ResolveQueryData(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1,
+                                 c.statisticsReadback.Get(), 0);
+        D3D12_RESOURCE_BARRIER before[3] = {
+            transition(c.log.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition(t.gsLog.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition(c.target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE)};
+        c.list->ResourceBarrier(3, before);
+        c.list->ResolveSubresource(c.resolved.Get(), 0, c.target.Get(), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+        D3D12_RESOURCE_BARRIER after[2] = {
+            transition(c.target.Get(), D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            transition(c.resolved.Get(), D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+        c.list->ResourceBarrier(2, after);
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = c.readback.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, kSize, kSize, 1, kPitch};
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = c.resolved.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        c.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        auto back = transition(c.resolved.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        c.list->ResourceBarrier(1, &back);
+        c.submit();
+        void *mapped = nullptr;
+        D3D12_RANGE range = {0, sizeof(stats)}, none = {};
+        check(c.statisticsReadback->Map(0, &range, &mapped), "early-depth-map-statistics");
+        std::memcpy(&stats, mapped, sizeof(stats));
+        c.statisticsReadback->Unmap(0, &none);
+        range = {0, kPitch * kSize};
+        check(c.readback->Map(0, &range, &mapped), "early-depth-map-readback");
+        for (UINT y = 0; y < kSize; ++y)
+          std::memcpy(texels.data() + y * kSize, static_cast<uint8_t *>(mapped) + y * kPitch, kSize * 4);
+        c.readback->Unmap(0, &none);
+        return texels;
+      };
+      std::vector<Triangle> drawn;
+      for (const auto &tri : patches)
+        for (int copy = 0; copy < (geometry ? 2 : 1); ++copy)
+          drawn.push_back(tri);
+      const uint64_t want = early_depth_oracle::ps_invocations(kSize, kSize, samples, occluders, drawn);
+      D3D12_QUERY_DATA_PIPELINE_STATISTICS direct{}, indirect{};
+      const auto directImage = run(false, direct), indirectImage = run(true, indirect);
+      const std::string name = std::string(geometry ? "tsgs" : "ds") + "-early-depth-msaa" + std::to_string(samples);
+      const uint64_t n = patches.size();
+      const bool ok = direct.PSInvocations == want && indirect.PSInvocations == want && directImage == indirectImage &&
+                      direct.IAPrimitives == n && direct.HSInvocations == n && direct.DSInvocations == 3 * n &&
+                      direct.GSInvocations == (geometry ? n : 0) && direct.CPrimitives == (geometry ? 2 : 1) * n &&
+                      indirect.IAPrimitives == direct.IAPrimitives && indirect.HSInvocations == direct.HSInvocations &&
+                      indirect.DSInvocations == direct.DSInvocations && indirect.GSInvocations == direct.GSInvocations &&
+                      indirect.CPrimitives == direct.CPrimitives;
+      std::printf("%s_EARLY_DEPTH_STATISTICS shader=%s case=%s ps=%llu,%llu oracle=%llu c=%llu\n", kPrefix,
+                  useDxil ? "dxil" : "dxbc", name.c_str(), (unsigned long long)direct.PSInvocations,
+                  (unsigned long long)indirect.PSInvocations, (unsigned long long)want,
+                  (unsigned long long)direct.CPrimitives);
+      if (!ok)
+        fail(name.c_str());
+      casePass(name.c_str());
+      ++cases;
+    }
+  }
+  createTarget(c, 1);
+  return cases;
+}
+
+#include "owned-d3d12-gsindirect-contract.inc"
 
 int runShaderSet(Context &c) {
   createTarget(c, 1);
@@ -1229,6 +1564,8 @@ int runShaderSet(Context &c) {
   cases += runOutputMatrix(c, vs, ps, ds_tri, ds_quad);
   cases += runPatchCases(c, vs, ps);
   cases += runTsgsCases(c, vs, ps, ds_tri, ds_quad);
+  cases += runEarlyDepthCases(c, vs, ps);
+  cases += casesIndirectMutation(c, true);
   std::printf("%s_MATRIX_PASS shader=%s cases=%d\n", kPrefix, useDxil ? "dxil" : "dxbc", cases);
   return cases;
 }

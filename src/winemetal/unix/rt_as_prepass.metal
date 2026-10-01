@@ -6,15 +6,16 @@
  * against GPU work (a rebuild at the same D3D12 address can never clobber the header of an
  * in-flight frame from the CPU).
  *
- * Two jobs:
- *  1. dxmt_as_prepass - write the dxmt acceleration-structure GPU header (DXMTASHeader,
- *     64 bytes) that our own ray-tracing shaders dereference (the D3D12
+ * Ordered GPU jobs:
+ *  1. dxmt_as_prepass - publish the native identifiers in the 64-byte ASHeader
+ *     that our own ray-tracing shaders dereference (the D3D12
  *     acceleration-structure GPUVA *is* the address of this header), and, for top-level
  *     builds, translate the application's D3D12_RAYTRACING_INSTANCE_DESC array into the
  *     MTLIndirectAccelerationStructureInstanceDescriptor array Metal's TLAS build consumes
  *     plus the per-instance contribution words our ray-tracing shaders read.
- *  2. dxmt_as_write_u64 - emit a postbuild-info value into an application buffer without
- *     assuming anything about its alignment.
+ *  2. dxmt_as_shadow - preserve self-contained build inputs and query metadata.
+ *  3. dxmt_as_postbuild / serialize / deserialize / visualize - consume that shadow
+ *     in application GPU command order, including public TLAS relocation pointers.
  *
  * D3D12_RAYTRACING_INSTANCE_DESC (64 B) is NOT layout-compatible with any Metal instance
  * descriptor: Metal puts options @48, mask @52, IFT offset @56, userID @60 and the
@@ -27,6 +28,138 @@
 
 #include <metal_stdlib>
 using namespace metal;
+struct ASHeader {
+  ulong resourceID, contributionsAddress;
+  uint magic, type, flags, descCount;
+  ulong shadowSize, currentSize;
+  uint nativeCompactedSize, reserved0;
+  ulong deserializedSize;
+};
+struct ShadowGeometry {
+  uint type, flags, vertexFormat, indexFormat, vertexCount, indexCount, primitiveCount, strideAndTransform;
+  ulong dataOffset, indexOffset, transformOffset, reserved;
+};
+struct ShadowJob {
+  ulong source, destinationOffset, sourceStride;
+  uint elementSize, destinationStride, count, mode, reserved;
+};
+struct ShadowMetadata {
+  uint magic, type, flags, descCount;
+  ulong shadowSize, currentSize;
+  uint compacted, reserved0;
+  ulong deserializedSize;
+};
+struct ShadowParams {
+  ulong asAddress, metadataSource;
+  uint jobCount, metadataMode;
+  ShadowMetadata metadata;
+};
+
+kernel void dxmt_as_shadow(constant ShadowParams &p [[buffer(0)]],
+    device const ShadowGeometry *geometries [[buffer(1)]], device const ShadowJob *jobs [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]) {
+  device ASHeader *dst = (device ASHeader *)p.asAddress;
+  if (p.metadataMode == 1) {
+    device const ASHeader *src = (device const ASHeader *)p.metadataSource;
+    // resourceID and contribution pointer belong to the destination sidecar.
+    for (ulong i = 16 + tid; i < 64 + src->shadowSize; i += 4096)
+      ((device uchar *)dst)[i] = ((device const uchar *)src)[i];
+  } else {
+    if (tid == 0)
+      *((device ShadowMetadata *)((device uchar *)dst + 16)) = p.metadata;
+    for (uint i = tid; i < p.metadata.descCount && p.metadata.type == 1; i += 4096)
+      ((device ShadowGeometry *)((device uchar *)dst + 64))[i] = geometries[i];
+    for (uint j = 0; j < p.jobCount; ++j) {
+      const ShadowJob job = jobs[j];
+      for (ulong i = tid; i < (ulong)job.count * job.destinationStride; i += 4096) {
+        uint element = uint(i / job.destinationStride);
+        uint byte = uint(i % job.destinationStride);
+        device const uchar *src = job.mode == 1
+          ? (device const uchar *)((device const ulong *)job.source)[element]
+          : (device const uchar *)(job.source + (ulong)element * job.sourceStride);
+        ((device uchar *)dst)[job.destinationOffset + i] = byte < job.elementSize && src ? src[byte] : 0;
+      }
+    }
+  }
+}
+
+struct PostbuildParams { ulong asAddress, destination; uint operation, reserved; };
+kernel void dxmt_as_postbuild(constant PostbuildParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+  if (tid) return;
+  device ASHeader *h = (device ASHeader *)p.asAddress;
+  device ulong *out = (device ulong *)p.destination;
+  const ulong compacted = (ulong(h->nativeCompactedSize) + 64 + h->shadowSize + 255) & ~255ul;
+  if (p.operation == 0) out[0] = compacted;
+  else if (p.operation == 1) out[0] = 8 + h->shadowSize;
+  else if (p.operation == 2) {
+    out[0] = 56 + (h->type == 0 ? ulong(h->descCount) * 8 : 0) + 64 + h->shadowSize;
+    out[1] = h->type == 0 ? h->descCount : 0;
+  } else if (p.operation == 3) out[0] = h->currentSize;
+  else if (p.operation == 0x100) h->currentSize = compacted;
+}
+struct SerializeParams { ulong source, destination; uint identifier[8]; };
+kernel void dxmt_as_serialize(constant SerializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+  device const ASHeader *h = (device const ASHeader *)p.source;
+  const ulong pointers = h->type == 0 ? h->descCount : 0;
+  const ulong offset = 56 + pointers * 8;
+  device uchar *dst = (device uchar *)p.destination;
+  if (tid == 0) {
+    for (uint i = 0; i < 8; ++i) ((device uint *)dst)[i] = p.identifier[i];
+    ((device ulong *)dst)[4] = offset + 64 + h->shadowSize;
+    ((device ulong *)dst)[5] = h->deserializedSize;
+    ((device ulong *)dst)[6] = pointers;
+  }
+  for (ulong i = tid; i < pointers; i += 4096)
+    ((device ulong *)(dst + 56))[i] = ((device const ulong *)(p.source + 64 + i * 64))[7];
+  for (ulong i = tid; i < 64 + h->shadowSize; i += 4096)
+    dst[offset + i] = ((device const uchar *)h)[i];
+}
+struct DeserializeParams { ulong source, destination, currentSize; };
+kernel void dxmt_as_deserialize(constant DeserializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+  device const ulong *src = (device const ulong *)p.source;
+  const ulong pointers = src[6];
+  device const ASHeader *h = (device const ASHeader *)(p.source + 56 + pointers * 8);
+  device ASHeader *dst = (device ASHeader *)p.destination;
+  for (ulong i = 16 + tid; i < 64 + h->shadowSize; i += 4096) {
+    if ((i >= 40 && i < 48) || (pointers && i >= 64 && (i - 64) % 64 >= 56)) continue;
+    ((device uchar *)dst)[i] = ((device const uchar *)h)[i];
+  }
+  // TLAS pointers are the public relocation table, not the stale copies in the shadow.
+  for (ulong i = tid; i < pointers; i += 4096)
+    ((device ulong *)(p.destination + 64 + i * 64))[7] = src[7 + i];
+  if (tid == 0) dst->currentSize = p.currentSize;
+}
+struct VisualizeParams { ulong source, destination; };
+kernel void dxmt_as_visualize(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+  device const ASHeader *h = (device const ASHeader *)p.source;
+  device uchar *dst = (device uchar *)p.destination;
+  if (tid == 0) { ((device uint *)dst)[0] = h->type; ((device uint *)dst)[1] = h->descCount; }
+  // BLAS geometry descriptors are written by a separate invocation after this payload copy.
+  for (ulong i = tid; i < h->shadowSize; i += 4096)
+    dst[8 + i] = ((device const uchar *)h)[64 + i];
+}
+kernel void dxmt_as_visualize_descriptors(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+  device const ASHeader *h = (device const ASHeader *)p.source;
+  if (h->type != 1) return;
+  device const ShadowGeometry *g = (device const ShadowGeometry *)(p.source + 64);
+  for (uint i = tid; i < h->descCount; i += 4096) {
+    device uint *d = (device uint *)(p.destination + 8 + ulong(i) * 56);
+    d[0] = g[i].type; d[1] = g[i].flags;
+    for (uint k = 2; k < 14; ++k) d[k] = 0;
+    if (g[i].type == 0) {
+      ((device ulong *)d)[1] = g[i].strideAndTransform & 0x80000000u ? p.destination + g[i].transformOffset - 56 : 0;
+      d[4] = g[i].indexFormat == 57 ? 42 : g[i].indexFormat; // R16_UINT -> padded R32_UINT
+      d[5] = g[i].vertexFormat; d[6] = g[i].indexCount; d[7] = g[i].vertexCount;
+      ((device ulong *)d)[4] = g[i].indexFormat != 0 ? p.destination + g[i].indexOffset - 56 : 0;
+      ((device ulong *)d)[5] = p.destination + g[i].dataOffset - 56;
+      ((device ulong *)d)[6] = g[i].strideAndTransform & 0x7fffffffu;
+    } else {
+      ((device ulong *)d)[1] = g[i].primitiveCount;
+      ((device ulong *)d)[2] = p.destination + g[i].dataOffset - 56;
+      ((device ulong *)d)[3] = 24;
+    }
+  }
+}
 
 struct DXMTASPrepassParams
 {
@@ -50,21 +183,6 @@ struct DXMTASPrepassParams
     uint liveMirrorSlot;
 };
 
-/* dxmt acceleration-structure GPU header: 64 bytes living at the D3D12 GPU virtual address of
- * every acceleration structure dxmt builds. It is the only extra state dxmt keeps, and it is
- * written on the GPU by the prepass so it is always ordered against the build/refit/copy that
- * publishes it. Ray-tracing shaders read the native structure through this header. */
-struct DXMTASHeader
-{
-    /* MTLAccelerationStructure.gpuResourceID written into the header (opaque resource id). */
-    ulong resourceID;
-    /* GPU address of the header's instance-contribution array (0 when there is none). */
-    ulong contributionsAddress;
-    ulong reserved[6];
-};
-
-#define DXMT_AS_HEADER_QWORDS (sizeof(struct DXMTASHeader) / sizeof(ulong))
-
 kernel void
 dxmt_as_prepass(
     device const uchar *srcInstances [[buffer(0)]], device uchar *dstInstances [[buffer(1)]],
@@ -75,8 +193,7 @@ dxmt_as_prepass(
   if (tid == 0) {
     header[0] = params.asResourceID;
     header[1] = params.contributionsAddress;
-    for (uint k = 2; k < DXMT_AS_HEADER_QWORDS; ++k)
-      header[k] = 0;
+
     /*
      * The version this build publishes, written beside the header in the same instruction
      * stream. The host reads it back through a shared page once this submission completes, so
@@ -88,13 +205,22 @@ dxmt_as_prepass(
   if (params.convertInstances == 0 || tid >= params.instanceCount)
     return;
 
-  const ulong src = (ulong)params.srcInstanceOffset + (ulong)tid * (ulong)params.srcInstanceStride;
+  /* convertInstances 1: srcInstances is the D3D12_RAYTRACING_INSTANCE_DESC array.
+   * convertInstances 2 (D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS): srcInstances is an array of
+   * D3D12 GPU virtual addresses, which are Metal device addresses, one per instance desc. */
+  device const uchar *instance;
+  if (params.convertInstances == 2) {
+    device const ulong *pointers = (device const ulong *)(srcInstances + params.srcInstanceOffset);
+    instance = (device const uchar *)(pointers[tid]);
+  } else {
+    instance = srcInstances + (ulong)params.srcInstanceOffset + (ulong)tid * (ulong)params.srcInstanceStride;
+  }
   const ulong dst = (ulong)tid * (ulong)params.dstInstanceStride;
 
   /* D3D12 float Transform[3][4] is row-major 3x4; Metal's PackedFloat4x3 stores FOUR columns
    * of three floats, columns[k] = {T[0][k], T[1][k], T[2][k]} (k = 0..3), so the D3D
    * translation T[*][3] lands in columns[3]. */
-  device const float *tf = (device const float *)(srcInstances + src);
+  device const float *tf = (device const float *)(instance);
   device float *out = (device float *)(dstInstances + dst);
   out[0] = tf[0];
   out[1] = tf[4];
@@ -110,7 +236,7 @@ dxmt_as_prepass(
   out[11] = tf[11];
 
   /* word0: InstanceID:24 | InstanceMask:8 ; word1: Contribution:24 | Flags:8 (little endian). */
-  device const uint *words = (device const uint *)(srcInstances + src + 48);
+  device const uint *words = (device const uint *)(instance + 48);
   const uint instance_id = words[0] & 0xFFFFFFu;
   const uint instance_mask = words[0] >> 24;
   const uint contribution = words[1] & 0xFFFFFFu;
@@ -129,35 +255,11 @@ dxmt_as_prepass(
   /* AccelerationStructure field: D3D12_GPU_VIRTUAL_ADDRESS of the bottom-level structure. Every
    * acceleration-structure address dxmt builds into holds the dxmt header, whose first 8 bytes
    * are the Metal resource id the TLAS build needs. */
-  device const ulong *as_address = (device const ulong *)(srcInstances + src + 56);
-  device const ulong *blas_header = (device const ulong *)(as_address[0]);
+  device const ulong *as_address = (device const ulong *)(instance + 56);
   device ulong *resource_id = (device ulong *)(dstInstances + dst + 64);
-  resource_id[0] = blas_header[0];
+  /* A NULL bottom-level address is a legal, inactive instance: resource id 0 is never
+   * intersected (and the instance still occupies its InstanceIndex). */
+  resource_id[0] = as_address[0] ? ((device const ulong *)(as_address[0]))[0] : 0ul;
 
   contributions[tid] = contribution;
-}
-
-kernel void
-dxmt_as_write_u64(
-    device uchar *dst [[buffer(0)]], constant ulong &value [[buffer(1)]],
-    constant uint &byteOffset [[buffer(2)]], uint tid [[thread_position_in_grid]]
-) {
-  if (tid != 0)
-    return;
-  for (uint k = 0; k < 8; ++k)
-    dst[byteOffset + k] = (uchar)((value >> (k * 8u)) & 0xFFu);
-}
-
-/* Metal reports its private compacted byte count. D3D12's compacted AS allocation also has to
- * contain the dxmt header and satisfy the AS alignment. Run this after ending the AS encoder
- * that wrote the raw value. */
-kernel void
-dxmt_as_finalize_compacted_size(
-    device uchar *dst [[buffer(0)]], constant uint &byteOffset [[buffer(1)]],
-    uint tid [[thread_position_in_grid]]
-) {
-  if (tid != 0)
-    return;
-  device ulong *value = (device ulong *)(dst + byteOffset);
-  value[0] = (value[0] + (ulong)sizeof(struct DXMTASHeader) + 255ul) & ~255ul;
 }

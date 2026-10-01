@@ -220,8 +220,9 @@ struct io_binding_map {
 
   // geometry shader ops
   llvm::Value *mesh = nullptr;
-  std::function<IREffect()> call_emit;
-  std::function<IREffect()> call_cut;
+  /* GS emit/cut on an output stream (0..3). */
+  std::function<IREffect(uint32_t)> call_emit;
+  std::function<IREffect(uint32_t)> call_cut;
 };
 
 struct context {
@@ -302,7 +303,8 @@ IREffect pop_mesh_output_render_target_array_index(uint32_t from_reg, uint32_t m
 IREffect pop_mesh_output_viewport_array_index(uint32_t from_reg, uint32_t mask, pvalue primitive_id);
 IREffect pop_mesh_output_position(uint32_t from_reg, uint32_t mask, pvalue vertex_id);
 IREffect
-pop_mesh_output_vertex_data(uint32_t from_reg, uint32_t mask, uint32_t idx, pvalue vertex_id, air::MSLScalerOrVectorType desired_type);
+pop_mesh_output_vertex_data(uint32_t from_reg, uint32_t mask, uint32_t idx, pvalue vertex_id,
+                            air::MSLScalerOrVectorType desired_type, bool sanitize_distance = false);
 
 /**
  * One SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE element resolved to the output
@@ -332,6 +334,38 @@ uint32_t define_pipeline_statistics(air::FunctionSignatureBuilder &func_signatur
 void increment_pipeline_statistics(
   llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Function *function,
   uint32_t argument, uint32_t low_word
+);
+/** SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL: [[sample_id]] and [[sample_mask]] argument indices. */
+struct PixelStatisticsDedupe {
+  uint32_t sample_index;
+  uint32_t coverage;
+};
+PixelStatisticsDedupe define_pixel_statistics_dedupe(air::FunctionSignatureBuilder &func_signature);
+/** PSInvocations: unconditionally, or (with `dedupe`) only in the lowest covered sample's invocation. */
+void increment_pixel_invocations(
+  llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Function *function, uint32_t argument,
+  const PixelStatisticsDedupe *dedupe
+);
+/** SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM: the PS's key, position, layer and claim-buffer arguments. */
+struct PixelStatisticsClaim {
+  uint32_t key;
+  uint32_t position;
+  uint32_t layer;
+  uint32_t coverage;
+  uint32_t claim;
+};
+PixelStatisticsClaim define_pixel_statistics_claim(air::FunctionSignatureBuilder &func_signature);
+/** PSInvocations once per (pixel, primitive): swap the primitive key into the pixel's claim entry. */
+void claim_pixel_invocation(
+  llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Function *function, uint32_t argument,
+  const PixelStatisticsClaim &claim
+);
+/** The mesh primitive data a PRIMITIVE_CLAIM mesh function writes: declare it (at `data_index`, the first free
+ * primitive data index) and set it. */
+void define_mesh_statistics_key(air::FunctionSignatureBuilder &func_signature, uint32_t data_index = 0);
+void set_mesh_statistics_key(
+  llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Value *primitive, llvm::Value *key0,
+  llvm::Value *key1, llvm::Value *key2, uint32_t data_index = 0
 );
 /* Adds a (runtime, possibly zero) 32-bit amount to one 64-bit pipeline-statistics counter. */
 void add_pipeline_statistics(
@@ -412,6 +446,7 @@ struct SignatureContext {
   bool dual_source_blending;
   bool disable_depth_output;
   bool skip_vertex_output;
+  bool captured_pixel = false;
   uint32_t pull_mode_reg_mask;
   uint32_t unorm_output_reg_mask;
   // it is considered optional (as a hint)
@@ -440,6 +475,15 @@ RegisterComponentType component_type_from_pixel_format(air::MTLPixelFormat forma
 struct MeshOutputContext {
   llvm::Value *vertex_id;
   llvm::Value *primitive_id;
+};
+
+/* The mesh-output state one GS stream's output declarations define (SM50ShaderInternal::gs_stream_declarations). */
+struct GSStreamOutputs {
+  air::FunctionSignatureBuilder &func_signature;
+  std::vector<std::function<IREffect(MeshOutputContext &)>> &mesh_output_handlers;
+  uint32_t &num_mesh_vertex_data;
+  std::vector<ScalarInfo> &clip_distance_scalars;
+  std::vector<ScalarInfo> &cull_distance_scalars;
 };
 
 // VS outputs and PS inputs have independent register allocation. Link AIR user
@@ -552,11 +596,20 @@ public:
   microsoft::D3D10_SB_PRIMITIVE gs_input_primitive = {};
   std::vector<std::function<IREffect(MeshOutputContext &)>> mesh_output_handlers;
   uint32_t num_mesh_vertex_data = 0;
+  /* DXBC GS: the output declarations of each stream, replayed by the GS converter for the stream that drives
+   * the mesh output (the rasterized stream). A declaration belongs to every stream whose output signature has its
+   * register; `gs_declaring_stream` is the stream it is being recorded for. */
+  std::array<std::vector<std::function<void(GSStreamOutputs &)>>, 4> gs_stream_declarations;
+  uint32_t gs_declaring_stream = 0;
+  /* [s][r]: components of output register r already declared for stream s. */
+  std::array<std::array<uint8_t, 32>, 4> gs_declared_components{};
   microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY gs_output_topology = {};
   uint32_t gs_max_vertex_output = 0;
   uint32_t gs_instance_count = 1;
   uint32_t ps_has_coverage_output = 0;
   uint32_t ps_sample_frequency = 0;
+  /* Pixel shader declares ForceEarlyDepthStencil. */
+  uint32_t ps_force_early_depth_stencil = 0;
   /**
    * Stage body of a Shader Model 6.x stage inside a multi-stage (mesh) pipeline. DXIL stages
    * carry no DXBC basic blocks; the DXIL front end emits the lowered entry body into the
@@ -663,12 +716,6 @@ std::unique_ptr<BindingMap> setup_binding_table2(
  * before the resource lowering runs, and a range of either entry is reported
  * unbound until it does. Raster and compute shaders take the default, which is
  * every existing caller's configuration.
- *
- * `local_root_slot` is the binding slot of the buffer holding every shader
- * record's materialized local root entry, for a stage that declares its signature
- * arguments (the ray generation and intersection stages, which read their own
- * record out of it). The default declares no such argument, which is every
- * existing caller's configuration.
  */
 std::unique_ptr<BindingMap> setup_binding_rootsig(
     const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
@@ -676,7 +723,7 @@ std::unique_ptr<BindingMap> setup_binding_rootsig(
     uint32_t root_sig_slot = SM50_BINDING_INDEX_ROOT_ARGUMENTS,
     uint32_t static_sampler_slot = SM50_BINDING_INDEX_STATIC_SAMPLERS,
     const void *local_bytecode = nullptr, size_t local_bytecode_length = 0,
-    bool bind_signature_arguments = true, uint32_t local_root_slot = ~0u
+    bool bind_signature_arguments = true
 );
 
 void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version);

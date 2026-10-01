@@ -159,7 +159,9 @@ struct RtCandidateControl {
   uint32_t CommittedGeometryIndex;
   uint32_t CommittedInstanceIndex;
   uint32_t CommittedInstanceID;
-  uint32_t Reserved[2];
+  /** Kernel-side traversal: an opaque procedural candidate suppresses any-hit. */
+  uint32_t SkipAnyHit;
+  uint32_t Reserved;
 };
 
 static_assert(
@@ -199,6 +201,7 @@ enum RtCandidateField : uint32_t {
   kRtCandidateCommittedGeometryIndex = offsetof(RtCandidateControl, CommittedGeometryIndex),
   kRtCandidateCommittedInstanceIndex = offsetof(RtCandidateControl, CommittedInstanceIndex),
   kRtCandidateCommittedInstanceID = offsetof(RtCandidateControl, CommittedInstanceID),
+  kRtCandidateSkipAnyHit = offsetof(RtCandidateControl, SkipAnyHit),
 };
 
 /* -------------------------------------------------------------------------- */
@@ -398,6 +401,34 @@ llvm::Error LowerAnyHitControlCall(
 llvm::Error LowerReportHitCall(
   llvm::Module &module, const RaytracingEntryArguments &entry, llvm::Value *block,
   const RaytracingExportContext &context, llvm::CallInst &call
+);
+
+/** The four D3D12 shader tables a dispatch names (SM50_RT_DISPATCH_ARGUMENTS). */
+enum class RtShaderTable { RayGeneration, Miss, HitGroup, Callable };
+
+/**
+ * One shader record, resolved on the GPU straight out of the application's table.
+ *
+ * `export_index` is the export the record's 32 byte identifier names, or
+ * SM50_RT_INDEX_NONE when the table is absent, the index is outside the table, or the
+ * identifier was not handed out by the pipeline being dispatched (magic, version,
+ * kind, SM50_RT_DISPATCH_ARGUMENTS::PipelineToken, export < ExportCount).
+ * `local_entry` is the D3D12 GPU virtual address of the record's local root
+ * arguments (the record + 32, in the D3D12 local root layout the compiled local root
+ * signature uses), or 0 together with an invalid export.
+ */
+struct RtShaderRecord {
+  llvm::Value *export_index = nullptr;
+  llvm::Value *local_entry = nullptr;
+};
+
+/**
+ * Resolve record `index` of `table` through the dispatch constants `dispatch` (an i8
+ * pointer in any address space). A table with a stride of 0 resolves every index to its
+ * single record, as D3D12 defines it. No load is issued through an absent table.
+ */
+RtShaderRecord EmitShaderRecordLookup(
+  llvm::IRBuilder<> &builder, llvm::Value *dispatch, RtShaderTable table, llvm::Value *index
 );
 
 } // namespace dxmt::dxil

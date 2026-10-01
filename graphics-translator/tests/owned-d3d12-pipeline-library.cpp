@@ -486,9 +486,13 @@ void testStreamCoverage(Fixture &f) {
   split.back.readMask = 0x0f;
   // IndependentFrontAndBackStencilRefMaskSupported is TRUE: split masks are a valid PSO.
   create(base().add(kDepthStencil2, split), S_OK, "independent_stencil_masks");
-  D3D12_VIEW_INSTANCE_LOCATION locations[2]{};
-  create(base().add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC{2, locations}),
-         E_INVALIDARG, "view_instancing");
+  // ViewInstancingTier 1: more than D3D12_MAX_VIEW_INSTANCE_COUNT views, or unknown flags, are invalid.
+  D3D12_VIEW_INSTANCE_LOCATION locations[5]{};
+  create(base().add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_VIEW_INSTANCING_DESC{5, locations}),
+         E_INVALIDARG, "view_instancing_count_5");
+  create(base().add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING,
+                    D3D12_VIEW_INSTANCING_DESC{2, locations, static_cast<D3D12_VIEW_INSTANCING_FLAGS>(2)}),
+         E_INVALIDARG, "view_instancing_flags");
   create(base().add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(f.shaders.vs.Get())), E_INVALIDARG, "mesh_shader");
   create(base().add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, code(f.shaders.vs.Get())), E_INVALIDARG,
          "amplification_shader");

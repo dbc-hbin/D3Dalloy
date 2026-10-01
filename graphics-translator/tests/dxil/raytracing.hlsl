@@ -3,15 +3,12 @@
 // Rebuild with upstream Microsoft DXC. No Apple Metal Shader Converter, no
 // D3DMetal/GPTK compiler and no MSC-based fallback is involved at any point:
 //
-//   dxc -T lib_6_5 -HV 2021 -O0 -Fo raytracing.dxil raytracing.hlsl
+//   dxc -T lib_6_5 -HV 2021 -O0 -D RQ_NESTED_CALLBACKS \
+//       -Fo raytracing.dxil raytracing.hlsl
 //
-// The repository's thin DXC frontend helper does exactly that (it links
-// libdxcompiler.dylib and passes "-T lib_6_5 -HV 2021 -O0" with no -E, so every
-// entry point is kept):
-//
-//   build/owned-continuation-20260919/raytracing-contract/lrs-probe-work/compile-hlsl \
-//     graphics-translator/tests/dxil/raytracing.hlsl \
-//     graphics-translator/tests/dxil/raytracing.dxil
+// build-raytracing-rayquery-stages.sh freezes this library with DXC 1.9 alongside
+// the all-stage query fixtures. Omitting RQ_NESTED_CALLBACKS selects the native
+// intersection-callback path with the identical outer callback-control oracle.
 //
 // Contract this library pins down. Every item is asserted from a GPU readback by the
 // fixture, never from "the call returned success":
@@ -74,7 +71,10 @@
 //         kind, attributes and local root constant the closest hit observes are all the first
 //         report's, while the rejecting invocation's payload writes survive alongside them.
 //
-// Deliberately NOT used: RayQuery, SM 6.6 features, wave intrinsics, and
+// RQ_NESTED_CALLBACKS adds inline queries in the existing callback-control cases,
+// requiring their real accepted hit before payload writes or ReportHit. This keeps
+// the same exact oracle on the kernel-side callback traversal path.
+// Deliberately NOT used: SM 6.6 features, wave intrinsics, and
 // D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE geometry - opaque geometry suppresses any-hit
 // invocation, which this fixture has to exercise.
 
@@ -114,6 +114,10 @@ RaytracingAccelerationStructure Scene : register(t0);
 // UAV (DXGI_FORMAT_UNKNOWN with StructureByteStride 4), which is unambiguous on a
 // native D3D12 driver.
 RWStructuredBuffer<uint> Output : register(u0);
+
+#ifdef RQ_NESTED_CALLBACKS
+#include "raytracing-rayquery-callback-contract.hlsl"
+#endif
 
 // Root constants, not a CBV: the hit-group local root signature declares a three-dword
 // 32-bit-constants parameter at (b0, space16), so 12 bytes land immediately after the
@@ -361,6 +365,9 @@ static const uint kRejectPrimitiveNone = 0xffu;
 [shader("anyhit")]
 void AnyHit(inout RayPayload payload, in BuiltInTriangleIntersectionAttributes attributes)
 {
+#ifdef RQ_NESTED_CALLBACKS
+    if (!callbackQueryAccepted()) return;
+#endif
     const uint lane = payload.lane;
     const uint primitive = PrimitiveIndex();
 
@@ -554,6 +561,9 @@ float3 shapeMaximum(uint primitive, uint crossing)
 [shader("intersection")]
 void ProceduralIntersection()
 {
+#ifdef RQ_NESTED_CALLBACKS
+    if (!callbackQueryAccepted()) return;
+#endif
     const uint primitive = PrimitiveIndex();
     const float3 origin = WorldRayOrigin();
     const float3 direction = WorldRayDirection();
@@ -622,6 +632,9 @@ uint crossingOfDistance(uint primitive, float distance)
 [shader("anyhit")]
 void ProceduralAnyHit(inout RayPayload payload, in ProceduralAttributes attributes)
 {
+#ifdef RQ_NESTED_CALLBACKS
+    if (!callbackQueryAccepted()) return;
+#endif
     const uint lane = payload.lane;
     const uint primitive = PrimitiveIndex();
     const uint crossing = crossingOfDistance(primitive, attributes.distance);

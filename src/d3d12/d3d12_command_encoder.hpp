@@ -42,12 +42,18 @@ enum class EncoderType {
   Query,
   Raytracing,
   StandardSwizzle,
+  WorkGraph,
 };
 
 struct EncoderData {
   EncoderType type;
   EncoderData *next = nullptr;
   uint64_t id;
+};
+
+struct WorkGraphDispatch;
+struct WorkGraphEncoderData : EncoderData {
+  std::shared_ptr<WorkGraphDispatch> dispatch;
 };
 
 class MTLD3D12Resource;
@@ -186,7 +192,8 @@ struct MSAAPrimitiveAssemblyParams {
   uint32_t predicate_not_equal;
   uint32_t index_skip;
   uint32_t line_mode;
-  uint32_t padding;
+  /* Conservative triangles: 24 replay words per primitive (18 fan corners, 3 original ordinals, 3 unused). */
+  uint32_t conservative;
 };
 static_assert(sizeof(MSAAPrimitiveAssemblyParams) == 64);
 
@@ -212,11 +219,18 @@ struct MSAAPrimitiveBoundsParams {
   uint32_t render_target_array_index_offset;
   uint32_t target_array_length;
   uint32_t line_mode;
-  uint32_t padding;
+  uint32_t conservative;
   float viewports[16][4]; // x, y, width, height
   uint32_t scissors[16][4]; // left, top, right, bottom
+  /* View instancing: the replayed view's location. When enabled, the effective viewport / render target array
+   * index is the shader's value plus the offset, and an out-of-range sum selects 0 (the D3D rule, which is also
+   * what the native amplification mapping applies to the replay pipelines). */
+  uint32_t view_viewport_offset;
+  uint32_t view_layer_offset;
+  uint32_t view_offsets_enabled;
+  uint32_t primitive_id_offset = ~0u;
 };
-static_assert(sizeof(MSAAPrimitiveBoundsParams) == 560);
+static_assert(sizeof(MSAAPrimitiveBoundsParams) == 576);
 
 struct MSAAPrimitiveTileBounds {
   uint32_t left;
@@ -348,6 +362,14 @@ struct StreamOutputDrawData {
   bool indexed = false;
   uint32_t vertex_count = 0;
   const uint32_t *status_cpu = nullptr;
+  /* GS stream output: `scratch` is shared by every captured stream of the draw. This draw assembles
+   * stream `stream`, whose capture region starts `scratch_offset` bytes into `scratch`, i.e.
+   * keys * scratch_prefix_dwords dwords (SM50_SHADER_D3D12_GS_STREAMS_DATA layout). `next_stream`
+   * is the next captured stream of the same draw (assembled after this one); null otherwise. */
+  uint32_t stream = 0;
+  uint64_t scratch_offset = 0;
+  uint64_t scratch_prefix_dwords = 0;
+  std::shared_ptr<StreamOutputDrawData> next_stream;
 };
 
 /* The recorded SO ExecuteIndirect is immutable; the submission worker produces
@@ -368,10 +390,91 @@ struct SOIndirectEncoderData {
   bool msaa = false;
 };
 
+/*
+ * ExecuteIndirect whose captures are sized from the draw arguments: a VS+HS+DS+GS PSO (tsgs-design) or a VS+GS PSO
+ * with stream output. The recording holds render passes that carry only the pipeline state. Per execution the
+ * queue runs the GPU argument preflight, waits for it, sizes every command's captures exactly from its GPU-written
+ * vertex and instance counts (the same sizes a direct draw of those arguments gets), then injects the per-command
+ * draws. TS+GS: pass 1 (VS+HS / DS capture, never rasterized), the compaction dispatches, pass 2 (capture fetch /
+ * GS) in API order. GS: one pass (`geometry`). Stream output is assembled per command in API order.
+ */
+struct MeshCaptureIndirectData {
+  bool domain_only = false;
+  SM50_MSAA_MESH_LAYOUT msaa_layout{};
+  /* Mirrors DXMTMeshStripCutControl (dxmt_mesh_strip_cut, d3d12_command_list.cpp). */
+  struct StripCutControl {
+    uint64_t max_threadgroups;
+    uint32_t topology, index_size, cut_value, count, instances;
+    int32_t base_vertex;
+    uint32_t start_instance, index_skip, predicate_enabled, predicate_not_equal, statistics_enabled, per_group;
+    uint32_t cut_enabled;
+  };
+  SOIndirectPreflightParams preflight{};
+  WMT::Reference<WMT::ComputePipelineState> preflight_pipeline;
+  WMT::Reference<WMT::ComputePipelineState> compact_pipeline;
+  /* Stream output after the GS: the recorded draw (chained per captured stream) whose assembly params live in
+   * `so_template->heap`. Every command copies it with its own scratch, params, control and status; the SO
+   * counters, predicate snapshot and targets stay shared, so commands append in API order. */
+  std::shared_ptr<StreamOutputDrawData> so_template;
+  std::vector<StreamOutputAssemblyParams> so_params;  // per chained stream, copied from the recording heap
+  WMT::Buffer index_buffer;
+  uint64_t index_offset = 0;
+  WMT::Buffer binding_heap;
+  uint64_t root_offset = 0, root_stride = 0, vertex_offset = 0, vertex_stride = 0;
+  const uint8_t *binding_memory = nullptr;
+  std::vector<uint32_t> root_view_offsets;
+  uint32_t vertex_mask = 0;
+  bool update_index = false;
+  D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut_value = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+  struct IndexVariant {
+    WMT::Reference<WMT::RenderPipelineState> pipeline;
+    WMT::Reference<WMT::Buffer> object_constants, mesh_constants;
+    uint64_t object_offset = 0, mesh_offset = 0;
+  };
+  std::array<IndexVariant, 2> index_variants;
+  SM50_TESS_CAPTURE_LAYOUT layout{};
+  uint32_t control_points = 0;
+  uint32_t threads_per_patch = 0;
+  uint32_t per_group = 0;  // GS input primitives per pass-2 object threadgroup
+  uint32_t gs_instances = 0;
+  // GS (`geometry`): D3D_PRIMITIVE_TOPOLOGY of the draw and its object-threadgroup shape (GeometryWarpShape).
+  uint32_t topology = 0;
+  uint32_t vertex_per_warp = 0;
+  uint32_t warp_increment = 0;
+  bool geometry = false;
+  bool indexed = false;
+  /* GS over an indexed strip with an active cut, or over a triangle strip with adjacency: before the pass every
+   * command is expanded on the GPU into the equivalent list (dxmt_mesh_strip_cut, as a direct draw of the same
+   * arguments), drawn with the list variant; `topology` is then the strip topology, `vertex_per_warp` and
+   * `warp_increment` the list's. */
+  bool strip_expand = false;
+
+  uint32_t strip_vertices_per_primitive = 0;
+  WMT::Reference<WMT::ComputePipelineState> strip_cut_pipeline;
+  WMT::Buffer statistics_buffer;  // IAVertices accounting of the expansion (statistics queries only)
+  uint64_t statistics_offset = 0;
+  uint64_t max_threadgroups = 0;
+  /* PRIMITIVE_CLAIM statistics: per-command claim headers (command i at statistics_claim_offset + 32 * i), bound
+   * to the fragment stage before each command's rasterizing draw. Empty: none. */
+  WMT::Buffer statistics_claim;
+  uint64_t statistics_claim_offset = 0;
+};
+
 /* One recorded MSAA draw. The queue creates its own capture,
  * tile and primitive buffers for every execution; only immutable recorded state
  * and native pipeline handles live here. A bundle replays into a fresh record. */
 struct MSAADrawData {
+  WMT::Buffer statistics_claim;
+  uint64_t statistics_claim_offset = 0;
+  bool mesh_capture = false;
+  SM50_MSAA_MESH_LAYOUT mesh_layout{};
+  SM50_MSAA_MESH_CONTROL mesh_control{};
+  SM50_MSAA_OBJECT_LAYOUT object_layout{};
+  WMT::Reference<WMT::RenderPipelineState> object_replay_pipeline;
+  WMT::Reference<WMT::Buffer> object_records;
+  uint64_t object_record_offset = 0;
+  WMT::Reference<WMT::Buffer> mesh_grid_buffer;
+  uint64_t mesh_grid_offset = 0;
   WMT::Reference<WMT::ComputePipelineState> capture_pipeline;
   WMT::Reference<WMT::ComputePipelineState> assembly_pipeline;
   WMT::Reference<WMT::ComputePipelineState> bounds_pipeline;
@@ -410,6 +513,8 @@ struct MSAADrawData {
   uint32_t sample_count = 0;
   uint32_t rov_marker_sample_count = 0;
   uint32_t sample_mask = 0;
+  /* PSO SampleDesc.Count: the RTV (output) samples; differs from sample_count under a forced raster pattern. */
+  uint32_t output_sample_count = 1;
   SM50_MSAA_LINE_MODE line_mode = SM50_MSAA_LINE_NONE;
   bool depth_clip_enabled = true;
   uint32_t start_vertex = 0;
@@ -420,7 +525,19 @@ struct MSAADrawData {
   bool needs_stream_assembly = false;
   bool single_sample_replay = false;
   bool center_sample_pattern = false;
+  /* Variable-rate shading state for coarse variants (SM50_MSAA_TILE_CONTROL.shading_rate, msaa_coarse.hpp
+   * kRate* encoding); 0 for fine-rate variants. */
+  uint32_t shading_rate = 0;
+  WMT::Reference<WMT::Texture> shading_rate_image;
+  uint32_t shading_rate_image_width = 0, shading_rate_image_height = 0;
+  /* D3D12 conservative rasterization of a triangle draw (SM50_SHADER_D3D12_CONSERVATIVE_RASTER variants). */
+  bool conservative = false;
 };
+
+/* Replay index words per primitive slot: line quads 20, conservative triangles 24, otherwise 3. */
+inline uint32_t MSAAIndexStride(SM50_MSAA_LINE_MODE line_mode, bool conservative) {
+  return line_mode != SM50_MSAA_LINE_NONE ? 20 : conservative ? 24 : 3;
+}
 
 struct RenderEncoderData : EncoderData {
   std::array<RenderEncoderColorAttachmentData, 8> colors;
@@ -452,6 +569,10 @@ struct RenderEncoderData : EncoderData {
   std::unique_ptr<SOIndirectEncoderData> so_indirect;
   std::unique_ptr<MSAADrawData> msaa_draw;
   std::unique_ptr<std::vector<StandardSwizzleTableUse>> swizzle_tables;
+  /* Capture-sized ExecuteIndirect: pass 1 or 2 of a TS+GS `capture_indirect`, or 1 (its only pass) of a GS one;
+   * 0: none. The queue appends the per-command draws. */
+  std::shared_ptr<const MeshCaptureIndirectData> capture_indirect;
+  uint8_t capture_indirect_pass = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
 };
@@ -484,7 +605,6 @@ struct ComputeEncoderData : EncoderData {
    * queue worker encodes it.
    */
   WMT::Reference<WMT::VisibleFunctionTable> rt_visible_function_table;
-  small_vector<WMT::Reference<WMT::Buffer>, 4> rt_buffers;
 };
 struct PredicatedTextureCopyEncoderData : EncoderData {
   WMT::Reference<WMT::Texture> source;
@@ -560,6 +680,8 @@ struct QueryEncoderData : EncoderData {
   uint32_t start_index = 0;
   uint32_t query_count = 0;
   uint64_t destination_offset = 0;
+  /* Pipeline-statistics ops: bytes per query record (88 for PIPELINE_STATISTICS, 112 for STATISTICS1). */
+  uint32_t record_bytes = 0;
 };
 
 enum class RTASOperation : uint8_t {
@@ -568,17 +690,28 @@ enum class RTASOperation : uint8_t {
   Clone,
   Compact,
   Emit,
+  Serialize,
+  Deserialize,
+  Visualize,
 };
 
 struct RTASPostbuildInfo {
   D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_TYPE type{};
   WMT::Reference<WMT::Buffer> destination;
   uint64_t offset = 0;
+  uint64_t address = 0;
 };
 
 /* One acceleration-structure command. It carries everything the queue needs to run the GPU
  * prepass and then encode the native build/refit/copy on the application's own command buffer. */
 struct RTASEncoderData : EncoderData {
+  RTASComputePipelines pipelines;
+  raytracing::ShadowPlan shadowPlan;
+  raytracing::ShadowMetadata metadata{};
+  bool deferredUpdate = false;
+  uint64_t nativeCapacity = 0;
+  raytracing::BuildInputs deferredInputs;
+  raytracing::BufferLocation sourceLocation{}, destinationLocation{};
   RTASOperation operation{};
   WMT::Reference<WMT::AccelerationStructureDescriptor> descriptor;
   WMT::Reference<WMT::AccelerationStructureSidecar> source;
@@ -586,13 +719,13 @@ struct RTASEncoderData : EncoderData {
   WMT::Reference<WMT::Buffer> sourceInstances;
   WMT::Reference<WMT::Buffer> header;
   WMT::Reference<WMT::Buffer> scratch;
-  WMT::Reference<WMT::ComputePipelineState> prepassPipeline;
-  WMT::Reference<WMT::ComputePipelineState> writeU64Pipeline;
-  WMT::Reference<WMT::ComputePipelineState> finalizeCompactedSizePipeline;
+
   uint64_t sourceInstancesOffset = 0;
   uint64_t destinationOffset = 0;
   uint64_t scratchOffset = 0;
   uint32_t instanceCount = 0;
+  /* raytracing::InstanceLayout of sourceInstances (Build/Refit of a top-level structure). */
+  uint32_t instanceLayout = 1;
   /*
    * The version this build publishes, and where the prepass publishes it. The queue reports the
    * mirror value to the device once this submission completes, which is what tells the device

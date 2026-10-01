@@ -19,6 +19,7 @@
 #include "d3d12_device.hpp"
 #include "d3d12_descriptor_heap.hpp"
 #include "d3d12_pageable.hpp"
+#include "d3d12_sampler_feedback.hpp"
 #include "com/com_pointer.hpp"
 #include "dxmt_sampler.hpp"
 #include "log/log.hpp"
@@ -332,7 +333,10 @@ public:
       gpu_storage.SRVTexture.metadata = TextureMetadata(
           Texture->arrayLength(View) / (CubeView ? 6 : 1),
           CenterSamplePattern ? std::bit_cast<float>(uint32_t(1)) : ResourceMinLODClamp);
-      gpu_storage.SRVTexture.padding[0] = gpu_storage.SRVTexture.padding[1] = 0;
+      // q2: the view's mip and slice range, read only by WriteSamplerFeedback (d3d12_sampler_feedback.hpp).
+      gpu_storage.SRVTexture.padding[0] = (1ull << 63) | (uint64_t(View.array_start) << 16) |
+                                          (uint64_t(View.mip_end) << 8) | uint64_t(View.mip_start);
+      gpu_storage.SRVTexture.padding[1] = 0;
     }
     return S_OK;
   }
@@ -525,6 +529,24 @@ public:
       gpu_storage.SRVBuffer.metadata = 0;
       gpu_storage.SRVBuffer.counter_pointer = 0;
       gpu_storage.SRVBuffer.padding = 0;
+    }
+    return S_OK;
+  }
+
+  virtual HRESULT
+  AddSamplerFeedbackView(UINT Index, Buffer *Cells, uint64_t CellBytes, bool Paired, uint64_t LayoutWord) {
+    if (Index >= descriptors_.size())
+      return E_INVALIDARG;
+    auto &cpu_storage = descriptors_[Index];
+    cpu_storage.type = ShaderVisibleDescriptorType::SamplerFeedback;
+    cpu_storage.SamplerFeedback.buffer = Cells;
+    cpu_storage.SamplerFeedback.slice = {0, CellBytes, 0, uint32_t(CellBytes / 4)};
+    if (mapped_argument_buffer_) {
+      auto &gpu_storage = mapped_argument_buffer_[Index];
+      gpu_storage.UAVBuffer.pointer = Paired ? Cells->current()->gpuAddress() : 0;
+      gpu_storage.UAVBuffer.metadata = LayoutWord;
+      gpu_storage.UAVBuffer.counter_pointer = 0;
+      gpu_storage.UAVBuffer.padding = 0;
     }
     return S_OK;
   }
@@ -796,7 +818,10 @@ public:
       auto &gpu_storage = mapped_argument_buffer_[Index];
       gpu_storage.sampler = sampler->sampler_state_handle;
       gpu_storage.cube_sampler = sampler->sampler_state_cube_handle;
-      gpu_storage.metadata = (uint64_t)std::bit_cast<uint32_t>(sampler->lod_bias);
+      gpu_storage.metadata = sampler_feedback::SamplerMetadata(
+          sampler->lod_bias,
+          sampler_feedback::SamplerFlags(pDesc->Filter, pDesc->AddressU, pDesc->AddressV, pDesc->MaxAnisotropy));
+      gpu_storage.padding = sampler_feedback::SamplerLodRange(pDesc->MinLOD, pDesc->MaxLOD);
     }
 
     return S_OK;

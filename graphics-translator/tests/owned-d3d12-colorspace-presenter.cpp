@@ -148,7 +148,7 @@ struct Probe {
     const unsigned row = size * 4 * sizeof(unsigned short);
     WMTBufferInfo readback{};
     readback.length = row * size;
-    readback.options = WMTResourceStorageModeShared;
+    readback.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE;
     auto buffer = device.newBuffer(readback);
     require(buffer && readback.memory.get(), "shared readback buffer");
     auto cmd = queue.commandBuffer();

@@ -410,7 +410,9 @@ PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_
     Usage |= WMTTextureUsageRenderTarget;
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
     Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
-  if (!(Desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || Desc.SampleDesc.Count > 1)
+  // R8_UINT can be a shading-rate source even with DENY_SHADER_RESOURCE (VRS explicitly permits it).
+  if (!(Desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || Desc.SampleDesc.Count > 1 ||
+      IsShadingRateImageDesc(Desc))
     Usage |= WMTTextureUsageShaderRead;
   InfoOut.usage = Usage;
 

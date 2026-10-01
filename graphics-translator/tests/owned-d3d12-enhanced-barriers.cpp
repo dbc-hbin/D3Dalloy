@@ -1157,15 +1157,9 @@ void capabilities() {
       !o14.IndependentFrontAndBackStencilRefMaskSupported || !o15.DynamicIndexBufferStripCutSupported ||
       o15.TriangleFanSupported || !o16.DynamicDepthBiasSupported || !o16.GPUUploadHeapSupported)
     fail("capabilities");
-  // Work graphs (ID3D12GraphicsCommandList10) are not implemented, so the interface is absent.
-  static const GUID kList10 = {0x7013c015, 0xd161, 0x4b63, {0xa0, 0x8c, 0x23, 0x85, 0x52, 0xdd, 0x8a, 0xcc}};
-  ComPtr<IUnknown> unknown;
-  auto l = list(dev.Get());
-  expect(l.list->QueryInterface(kList10, reinterpret_cast<void **>(unknown.GetAddressOf())), E_NOINTERFACE,
-         "no-command-list10");
   ComPtr<ID3D12Device14> device14;
   check(dev.As(&device14), "QI ID3D12Device14");
-  std::printf("%s_INTERFACES device14=1 command_list9=1 command_list10=0\n", kPrefix);
+  std::printf("%s_INTERFACES device14=1 command_list9=1\n", kPrefix);
   pass("capabilities");
 }
 

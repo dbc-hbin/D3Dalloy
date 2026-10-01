@@ -10,7 +10,9 @@ namespace {
 
 constexpr uint64_t kMagic = 0x004f5350544d5844; // "DXMTPSO\0", little endian.
 // 2: graphics key covers the stream-output declaration. 3: it covers GS/HS/DS bytecode.
-constexpr uint32_t kVersion = 3;
+// 4: P3 hidden-resource/signature AIR ABI changed even for unchanged shader/PSO inputs.
+// Serialized pipeline libraries validate this revision for every embedded PSO blob.
+constexpr uint32_t kVersion = 4;
 
 struct StageRecord {
   uint64_t library_size;
@@ -140,8 +142,9 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
   KeyBuilder hash;
   // Shader-visible ROV buffer ordering now has a hidden native resource. Old
   // cached AIR lacks its access and cannot be paired with the runtime marker.
-  // 4: geometry and tessellation stages select their own AIR, so their bytecode is part of the key.
-  hash.add(uint32_t(4), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  // 5: DXIL array and packed semantic rows map to metadata element IDs, not chunk ordinals.
+  // Old cached AIR can read the wrong signature lanes after this correction.
+  hash.add(uint32_t(5), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.VS);
   hash.shader(desc.PS);
@@ -176,6 +179,17 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
              bool(extras->back_stencil_read_write_mask));
     if (extras->back_stencil_read_write_mask)
       hash.add(extras->back_stencil_read_write_mask->first, extras->back_stencil_read_write_mask->second);
+    if (extras->view_instancing) {
+      hash.add(uint32_t(0x56494e53), extras->view_instancing->count, extras->view_instancing->masking);
+      for (UINT i = 0; i < extras->view_instancing->count; ++i)
+        hash.add(extras->view_instancing->locations[i].ViewportArrayIndex,
+                 extras->view_instancing->locations[i].RenderTargetArrayIndex);
+    }
+    if (extras->ms.pShaderBytecode) {
+      hash.add(uint32_t(0x4d455348));
+      hash.shader(extras->as);
+      hash.shader(extras->ms);
+    }
   }
   hash.add(desc.InputLayout.NumElements);
   for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {

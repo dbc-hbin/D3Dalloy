@@ -453,6 +453,8 @@ public:
   DefineSampler(std::string name, uint32_t location_index = UINT32_MAX);
   uint32_t
   DefineInteger64(std::string name, uint32_t location_index = UINT32_MAX);
+  uint32_t
+  DefineInteger32(std::string name, uint32_t location_index = UINT32_MAX);
 
   auto Build(llvm::LLVMContext &context, const llvm::DataLayout &layout) const
     -> std::tuple<llvm::StructType *, llvm::MDNode *>;
@@ -763,7 +765,18 @@ using FunctionOutput = std::variant<
 
 using MeshVertexOutput = std::variant<OutputMeshData, OutputPosition, OutputClipDistance, OutputPointSize>;
 
-using MeshPrimitiveOutput = std::variant<OutputMeshData, OutputRenderTargetArrayIndex, OutputViewportArrayIndex>;
+/* Per-primitive `[[primitive_id]]` and `[[primitive_culled]]` of a mesh function (D3D12 SV_PrimitiveID and
+ * SV_CullPrimitive written by a mesh shader). */
+struct OutputPrimitiveID {
+  bool operator==(OutputPrimitiveID const& rhs) const { return true; }
+};
+
+struct OutputPrimitiveCulled {
+  bool operator==(OutputPrimitiveCulled const& rhs) const { return true; }
+};
+
+using MeshPrimitiveOutput = std::variant<OutputMeshData, OutputRenderTargetArrayIndex, OutputViewportArrayIndex,
+                                         OutputPrimitiveID, OutputPrimitiveCulled>;
 
 class FunctionSignatureBuilder {
 public:

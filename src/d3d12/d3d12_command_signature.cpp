@@ -131,6 +131,103 @@ class MTLD3D12CommandSignatureImpl : public MTLD3D12Pageable<MTLD3D12CommandSign
 public:
   MTLD3D12CommandSignatureImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12CommandSignature>(pDevice) {}
 
+  /*
+   * DISPATCH_MESH / DISPATCH_RAYS. `source` holds the shared header and the packed `d3d12_arguments` struct. With
+   * root argument updates, `resolve_root_arguments` (one thread per slot) writes each executed slot's constants
+   * and root views into that slot's copy of the root arguments (`dxmt_slot_root_control`); the command list
+   * binds slot i's copy for slot i's dispatch. Validation matches the ICB path.
+   */
+  HRESULT
+  InitializeSlotDispatch(const D3D12_COMMAND_SIGNATURE_DESC *pDesc, ID3D12RootSignature *pRootSignature,
+                         std::stringstream source) {
+    if (!UpdateRootArguments)
+      return S_OK;
+    if (!pRootSignature)
+      return E_INVALIDARG;
+    auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
+    source << "struct dxmt_slot_root_control {\n"
+              "  device char *arguments;\n"
+              "  device const uint *count;\n"
+              "  device const ulong *predicate;\n"
+              "  device ulong *roots;\n"
+              "  uint max_commands;\n"
+              "  uint roots_stride;\n"
+              "  uint predicate_not_equal;\n"
+              "};\n"
+              "kernel void resolve_root_arguments(uint i [[thread_position_in_grid]],\n"
+              "    constant dxmt_slot_root_control &control [[buffer(0)]]) {\n"
+              "  if (i >= control.max_commands) return;\n"
+              "  uint limit = control.count ? control.count[0] : control.max_commands;\n"
+              "  if (i >= limit) return;\n"
+              "  if (control.predicate && (control.predicate_not_equal ? control.predicate[0] != 0 "
+              ": control.predicate[0] == 0)) return;\n"
+              "  device d3d12_arguments &arg = *reinterpret_cast<device d3d12_arguments *>(control.arguments + "
+              "ulong(i) * " << pDesc->ByteStride << ");\n"
+              "  device ulong *rootsig_qwords = control.roots + ulong(i) * control.roots_stride;\n";
+    auto view = [&](UINT parameter_index, D3D12_ROOT_PARAMETER_TYPE type, const char *field, unsigned i) {
+      if (parameter_index >= rootsig->ParameterSlots || parameter_index >= 64 ||
+          rootsig->ParameterTypes[parameter_index] != type)
+        return false;
+      RootParameterMask |= uint64_t(1) << parameter_index;
+      source << "  rootsig_qwords[" << rootsig->SlotQwordOffsets[parameter_index] << "] = arg." << field << i
+             << ";\n";
+      /* TILED: an indirect root view reports fully mapped, as on the ICB path. */
+      if (type != D3D12_ROOT_PARAMETER_TYPE_CBV && rootsig->StatusQwordOffsets[parameter_index] != ~0u)
+        source << "  rootsig_qwords[" << rootsig->StatusQwordOffsets[parameter_index] << "] = 0;\n";
+      return true;
+    };
+    for (unsigned i = 0; i < pDesc->NumArgumentDescs; i++) {
+      const auto &arg = pDesc->pArgumentDescs[i];
+      switch (arg.Type) {
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
+        const auto parameter_index = arg.Constant.RootParameterIndex;
+        if (parameter_index >= rootsig->ParameterSlots || parameter_index >= 64 ||
+            rootsig->ParameterTypes[parameter_index] != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
+            arg.Constant.DestOffsetIn32BitValues > rootsig->ParameterConstantCounts[parameter_index] ||
+            arg.Constant.Num32BitValuesToSet >
+                rootsig->ParameterConstantCounts[parameter_index] - arg.Constant.DestOffsetIn32BitValues)
+          return E_INVALIDARG;
+        RootParameterMask |= uint64_t(1) << parameter_index;
+        for (unsigned j = 0; j < arg.Constant.Num32BitValuesToSet; j++)
+          source << "  reinterpret_cast<device uint *>(rootsig_qwords + " << rootsig->SlotQwordOffsets[parameter_index]
+                 << ")[" << (j + arg.Constant.DestOffsetIn32BitValues) << "] = arg.constant_" << i << "_" << j
+                 << ";\n";
+        break;
+      }
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+        if (!view(arg.ConstantBufferView.RootParameterIndex, D3D12_ROOT_PARAMETER_TYPE_CBV, "cb_", i))
+          return E_INVALIDARG;
+        break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+        if (!view(arg.ShaderResourceView.RootParameterIndex, D3D12_ROOT_PARAMETER_TYPE_SRV, "srv_", i))
+          return E_INVALIDARG;
+        break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+        if (!view(arg.UnorderedAccessView.RootParameterIndex, D3D12_ROOT_PARAMETER_TYPE_UAV, "uav_", i))
+          return E_INVALIDARG;
+        break;
+      default:
+        break;
+      }
+    }
+    source << "}\n";
+    WMT::Reference<WMT::Error> err;
+    auto lib = device_->GetMTLDevice().newLibraryWithSource(source.view(), err);
+    if (!lib) {
+      ERR("Failed to compile command signature root argument resolver: ", err.description().getUTF8String());
+      return E_FAIL;
+    }
+    auto function = lib.newFunction("resolve_root_arguments");
+    if (!function)
+      return E_FAIL;
+    root_argument_resolver = device_->GetMTLDevice().newComputePipelineState(function, err);
+    if (!root_argument_resolver) {
+      ERR("Failed to create command signature root argument resolver pso");
+      return E_FAIL;
+    }
+    return S_OK;
+  }
+
   HRESULT
   Initialize(const D3D12_COMMAND_SIGNATURE_DESC *pDesc, ID3D12RootSignature *pRootSignature) {
     if (!pDesc || !pDesc->NumArgumentDescs || !pDesc->pArgumentDescs || !pDesc->ByteStride ||
@@ -157,6 +254,19 @@ public:
     DrawArgumentOffset = ~0u;
     IndexBufferArgumentOffset = ~0u;
 
+    /*
+     * DISPATCH_MESH and DISPATCH_RAYS use per-slot dispatch arguments rather than an indirect command buffer.
+     * Their root updates, and the roots of GS/HS/DS draw signatures, are applied by root_argument_resolver
+     * to the slot's complete root table, including status and view-id suffixes. Vertex/index views remain draw-only.
+     * DrawArgumentOffset locates the final draw or dispatch arguments after the signature's binding mutations.
+     */
+    bool slot_dispatch = false;
+    for (unsigned i = 0; i < pDesc->NumArgumentDescs; i++) {
+      const auto type = pDesc->pArgumentDescs[i].Type;
+      slot_dispatch |= type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH ||
+                       type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS;
+    }
+
     source << kSharedHeader;
 
     source << "struct __attribute__ ((packed)) d3d12_arguments {\n";
@@ -170,6 +280,20 @@ public:
         side_effect = arg.Type;
         packed_size += sizeof(D3D12_DISPATCH_ARGUMENTS);
         source << "packed_uint3 dispatch;\n";
+        break;
+      }
+      case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: {
+        side_effect = arg.Type;
+        DrawArgumentOffset = packed_size;
+        packed_size += sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
+        source << "packed_uint3 dispatch_mesh;\n";
+        break;
+      }
+      case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS: {
+        side_effect = arg.Type;
+        DrawArgumentOffset = packed_size;
+        packed_size += sizeof(D3D12_DISPATCH_RAYS_DESC);
+        source << "char dispatch_rays[" << sizeof(D3D12_DISPATCH_RAYS_DESC) << "];\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: {
@@ -233,10 +357,6 @@ public:
         source << "ulong uav_" << i << ";\n";
         break;
       }
-      case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS:
-      case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
-        ERR("D3D12CommandSignatuer: unsupported rays/mesh dispatch");
-        return E_NOTIMPL;
       default:
         return E_INVALIDARG;
       }
@@ -247,11 +367,21 @@ public:
       return E_INVALIDARG;
     bool is_compute = side_effect == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
     if ((is_compute && (UpdateVertexBuffers || ib_index != ~0u)) ||
+        (slot_dispatch && (UpdateVertexBuffers || ib_index != ~0u)) ||
         (ib_index != ~0u && side_effect != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED))
       return E_INVALIDARG;
     CommandType = side_effect;
     ByteStride = pDesc->ByteStride;
     UpdateIndexBuffer = ib_index != ~0u;
+    if (slot_dispatch)
+      return InitializeSlotDispatch(pDesc, pRootSignature, std::move(source));
+    if (!is_compute && UpdateRootArguments) {
+      std::stringstream root_source;
+      root_source << source.view();
+      const HRESULT hr = InitializeSlotDispatch(pDesc, pRootSignature, std::move(root_source));
+      if (FAILED(hr))
+        return hr;
+    }
     const bool updates_graphics_bindings = !is_compute && (UpdateRootArguments || UpdateVertexBuffers);
     std::stringstream graphics_updates;
     if (updates_graphics_bindings)

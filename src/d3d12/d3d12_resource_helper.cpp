@@ -401,10 +401,20 @@ constexpr D3D12_RESOURCE_STATES kExclusiveWrite =
     D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE | D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE |
     D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE;
 
+bool IsShadingRateImageDesc(const D3D12_RESOURCE_DESC &desc) {
+  return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Format == DXGI_FORMAT_R8_UINT &&
+         desc.DepthOrArraySize == 1 && desc.MipLevels == 1 && desc.SampleDesc.Count == 1 &&
+         desc.SampleDesc.Quality == 0 && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+         !(desc.Flags & ~(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE));
+}
+
 HRESULT
 ValidateResourceStates(D3D12_RESOURCE_STATES State, const D3D12_HEAP_PROPERTIES *pHeapProps,
                        const D3D12_RESOURCE_DESC *pDesc) {
   if (!pHeapProps || !pDesc)
+    return E_INVALIDARG;
+  if ((State & D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE) &&
+      (State != D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE || !IsShadingRateImageDesc(*pDesc)))
     return E_INVALIDARG;
   if (State & kExclusiveWrite) {
     if (State & ~kExclusiveWrite)

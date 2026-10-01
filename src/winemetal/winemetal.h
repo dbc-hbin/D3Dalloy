@@ -680,13 +680,14 @@ struct WMTAccelerationStructureSizes {
   uint64_t refit_scratch_size;
 };
 
-WINEMETAL_API obj_handle_t WMTASDescriptor_new(uint32_t top_level, uint32_t geometry_count);
+WINEMETAL_API obj_handle_t WMTASDescriptor_new(obj_handle_t device, uint32_t top_level, uint32_t geometry_count);
 WINEMETAL_API void WMTASDescriptor_setUsage(obj_handle_t descriptor, uint32_t usage);
+/* A null `vertices` is legal only with triangle_count 0; vertex_format is a WMTAttributeFormat. */
 WINEMETAL_API bool WMTASDescriptor_setTriangles(obj_handle_t descriptor, uint32_t index,
     obj_handle_t vertices, uint64_t vertex_offset, uint64_t vertex_stride,
     obj_handle_t indices, uint64_t index_offset, uint32_t index_type,
     obj_handle_t transform, uint64_t transform_offset, uint64_t triangle_count,
-    uint32_t intersection_function_table_offset, uint32_t geometry_flags);
+    uint32_t intersection_function_table_offset, uint32_t geometry_flags, uint32_t vertex_format);
 WINEMETAL_API bool WMTASDescriptor_setAABBs(obj_handle_t descriptor, uint32_t index,
     obj_handle_t boxes, uint64_t box_offset, uint64_t box_stride, uint64_t box_count,
     uint32_t intersection_function_table_offset, uint32_t geometry_flags);
@@ -701,6 +702,9 @@ WINEMETAL_API obj_handle_t WMTASSidecar_contributionBuffer(obj_handle_t sidecar)
 WINEMETAL_API uint64_t WMTASSidecar_resourceID(obj_handle_t sidecar);
 WINEMETAL_API uint64_t WMTASSidecar_contributionGPUAddress(obj_handle_t sidecar);
 WINEMETAL_API uint64_t WMTASSidecar_size(obj_handle_t sidecar);
+WINEMETAL_API bool WMTASSidecar_allocate(obj_handle_t sidecar, obj_handle_t device, uint64_t native_size, uint64_t instance_count);
+WINEMETAL_API uint64_t WMTASSidecar_instanceCount(obj_handle_t sidecar);
+WINEMETAL_API obj_handle_t WMTASSidecar_generations(obj_handle_t sidecar);
 WINEMETAL_API obj_handle_t WMTCommandBuffer_accelerationStructureCommandEncoder(obj_handle_t cmdbuf);
 WINEMETAL_API bool WMTASEncoder_build(obj_handle_t encoder, obj_handle_t descriptor,
     obj_handle_t destination_sidecar, obj_handle_t scratch, uint64_t scratch_offset);
@@ -741,10 +745,7 @@ WINEMETAL_API bool WMTComputeEncoder_encodeASPrepass(obj_handle_t encoder, obj_h
     obj_handle_t contribution_buffer, uint64_t contribution_offset,
     obj_handle_t live_mirror_buffer, uint64_t live_mirror_offset,
     const struct WMTASPrepassInfo *info);
-WINEMETAL_API bool WMTComputeEncoder_encodeASWriteU64(obj_handle_t encoder, obj_handle_t pipeline,
-    obj_handle_t destination_buffer, uint64_t destination_offset, uint64_t value);
-WINEMETAL_API bool WMTComputeEncoder_encodeASFinalizeCompactedSize(obj_handle_t encoder,
-    obj_handle_t pipeline, obj_handle_t destination_buffer, uint64_t destination_offset);
+
 
 WINEMETAL_API void WMTASEncoder_fence(obj_handle_t encoder, obj_handle_t fence, bool update);
 
@@ -828,6 +829,12 @@ struct WMTRenderPassInfo {
   // All sample locations are (0.5, 0.5) when this pass uses the fixed
   // D3D12 center pattern. Zero preserves Metal's default sample positions.
   uint8_t center_sample_pattern;
+  // ForcedSampleCount 16 emulation: 1 or 2 programs the first or second half of the D3D 16x standard pattern
+  // as the 8 native sample positions (requires 8 raster samples). Zero keeps the default positions.
+  uint8_t forced16_half;
+  // High byte of render_target_array_length (D3D12 arrays reach 2048 slices). Carved from trailing padding: the
+  // struct keeps its size and 32/64-bit layout. Write both through WMT::SetRenderTargetArrayLength.
+  uint8_t render_target_array_length_high;
 };
 
 WINEMETAL_API obj_handle_t MTLCommandBuffer_renderCommandEncoder(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info);
@@ -960,7 +967,9 @@ struct WMTRenderPipelineInfo {
   uint8_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
   bool support_indirect_command_buffers;
-  uint8_t padding[5];
+  /* maxVertexAmplificationCount; 0 means Metal's default (1). */
+  uint8_t max_vertex_amplification_count;
+  uint8_t padding[4];
 };
 
 struct WMTMeshRenderPipelineInfo {
@@ -986,7 +995,9 @@ struct WMTMeshRenderPipelineInfo {
   uint8_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
   bool support_indirect_command_buffers;
-  uint8_t padding[5];
+  /* maxVertexAmplificationCount; 0 means Metal's default (1). */
+  uint8_t max_vertex_amplification_count;
+  uint8_t padding[4];
 };
 
 WINEMETAL_API obj_handle_t
@@ -1386,6 +1397,7 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetStencilRef,
   WMTRenderCommandSetDepthStencilState,
   WMTRenderCommandSetStencilRefFrontBack,
+  WMTRenderCommandSetVertexAmplification,
 };
 
 struct wmtcmd_render_nop {
@@ -1668,6 +1680,19 @@ struct wmtcmd_render_setstencilref_front_back {
   struct WMTMemoryPointer next;
   uint32_t front_stencil_ref;
   uint32_t back_stencil_ref;
+};
+
+/*
+ * setVertexAmplificationCount:1 viewMappings:{viewport_offset, render_target_array_offset}. On a pipeline whose
+ * maxVertexAmplificationCount is above 1 the offsets are added to the primitive's viewport/render target array
+ * index (an out-of-range sum selects index 0); a pipeline with the default maximum of 1 ignores them.
+ */
+struct wmtcmd_render_set_vertex_amplification {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  uint32_t viewport_offset;
+  uint32_t render_target_array_offset;
 };
 
 struct wmtcmd_render_dxmt_geometry_draw {

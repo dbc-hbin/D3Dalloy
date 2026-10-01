@@ -72,8 +72,13 @@ constexpr GUID kIID_IMTLD3D12GraphicsCommandListExt = {
     0xd7bc6ed0, 0x6a8a, 0x4a0e, {0x84, 0x08, 0x5a, 0x26, 0xc0, 0xb0, 0x6d, 0x0e}};
 
 static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC) == 36);
+#ifdef _WIN64
 static_assert(offsetof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC, Color) == 8);
 static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 144);
+#else
+static_assert(offsetof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC, Color) == 4);
+static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 108);
+#endif
 
 namespace {
 

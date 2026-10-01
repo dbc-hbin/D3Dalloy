@@ -58,6 +58,7 @@
  */
 
 #include "dxil_raytracing.h"
+#include "dxil_workgraph.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -240,29 +241,18 @@ bool readEntryProperty(MDNode *properties, uint32_t wanted, uint32_t &value) {
   return false;
 }
 
-/** The raytracing stage of one `!dx.entryPoints` node, or false when it is not one. */
+/** Shader kind of one `!dx.entryPoints` node; ordinary functions have no such node. */
 bool stageOfEntry(MDNode *entry, uint32_t &stage) {
   if (!entry || entry->getNumOperands() < 5)
     return false;
   uint32_t kind = 0;
   if (!readEntryProperty(dyn_cast<MDNode>(entry->getOperand(4)), kDxilShaderKindTag, kind))
     return false;
-  switch (kind) {
-  case SM50_RT_STAGE_RAYGEN:
-  case SM50_RT_STAGE_INTERSECTION:
-  case SM50_RT_STAGE_ANY_HIT:
-  case SM50_RT_STAGE_CLOSEST_HIT:
-  case SM50_RT_STAGE_MISS:
-  case SM50_RT_STAGE_CALLABLE:
-    stage = kind;
-    return true;
-  default:
-    /* Mesh / amplification / library-kind entries are not raytracing exports. */
-    return false;
-  }
+  stage = kind;
+  return true;
 }
 
-/** Enumerate the raytracing exports of one container, in container order. */
+/** Enumerate shader and ordinary function exports of one container, in container order. */
 llvm::Error enumerateExports(
   const void *bytecode, uint64_t size, std::vector<LibraryExport> &exports
 ) {
@@ -319,6 +309,16 @@ llvm::Error enumerateExports(
     auto published = have_public_names ? public_names.find(record.entry_point) : public_names.end();
     record.name = published != public_names.end() ? published->second : record.entry_point;
     exports.push_back(std::move(record));
+  }
+  // Ordinary externally visible definitions have no shader entry-point metadata.
+  for (const auto &function : **module) {
+    if (function.isDeclaration() || function.hasLocalLinkage())
+      continue;
+    const std::string symbol = function.getName().str();
+    if (std::any_of(exports.begin(), exports.end(), [&](const auto &entry) { return entry.entry_point == symbol; }))
+      continue;
+    auto published = public_names.find(symbol);
+    exports.push_back({SM50_RT_STAGE_LIBRARY, published != public_names.end() ? published->second : symbol, symbol});
   }
   return llvm::Error::success();
 }
@@ -582,11 +582,12 @@ Value *emitGuardedValue(
   builder.CreateCondBr(condition, guarded, continuation);
   builder.SetInsertPoint(guarded);
   Value *produced = body(builder);
+  BasicBlock *guarded_end = builder.GetInsertBlock();
   builder.CreateBr(continuation);
   builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
   PHINode *merged = builder.CreatePHI(fallback->getType(), 2, name + ".value");
   merged->addIncoming(fallback, head);
-  merged->addIncoming(produced, guarded);
+  merged->addIncoming(produced, guarded_end);
   return merged;
 }
 
@@ -602,6 +603,35 @@ Value *emitGuardedValue(
  * the address is a device address and address space 1 has no address zero, so the
  * load is issued only when it is non-zero.
  */
+/**
+ * Copy the two byval float4x3 instance transforms an `[[intersection(..., world_space_data)]]`
+ * function receives into SM50_RT_HIT_STATE::ObjectToWorld / WorldToObject (column-major, four
+ * columns of three floats - the same layout the traversal result reports).
+ */
+void StoreInstanceTransforms(
+  IRBuilder<> &builder, Value *hit_state, Value *object_to_world, Value *world_to_object
+) {
+  LLVMContext &llvm_context = builder.getContext();
+  Type *column = FixedVectorType::get(Type::getFloatTy(llvm_context), 3);
+  Type *matrix = ArrayType::get(column, 4);
+  const unsigned space = cast<PointerType>(hit_state->getType())->getAddressSpace();
+  const std::pair<Value *, uint32_t> sources[] = {
+    {object_to_world, (uint32_t)offsetof(SM50_RT_HIT_STATE, ObjectToWorld)},
+    {world_to_object, (uint32_t)offsetof(SM50_RT_HIT_STATE, WorldToObject)},
+  };
+  for (const auto &[source, offset] : sources) {
+    for (uint32_t c = 0; c < 4; ++c) {
+      Value *value = builder.CreateLoad(
+        column, builder.CreateConstInBoundsGEP2_32(matrix, source, 0, c)
+      );
+      Value *field = builder.CreateGEP(
+        Type::getInt8Ty(llvm_context), hit_state, builder.getInt32(offset + c * 12)
+      );
+      builder.CreateAlignedStore(value, builder.CreateBitCast(field, column->getPointerTo(space)), Align(1));
+    }
+  }
+}
+
 Value *frameInstanceContribution(
   IRBuilder<> &builder, Value *block, Value *instance_index
 ) {
@@ -617,64 +647,16 @@ Value *frameInstanceContribution(
   );
 }
 
-/** Read one field of the dispatch constants through their D3D12 GPU virtual address. */
-Value *loadDispatchFieldAt(
-  IRBuilder<> &builder, Value *address, uint32_t byte_offset, Type *type
-) {
-  LLVMContext &context = builder.getContext();
-  Value *bytes = builder.CreateIntToPtr(address, Type::getInt8PtrTy(context, 1));
-  Value *field = builder.CreateGEP(
-    Type::getInt8Ty(context), bytes, builder.getInt32(byte_offset)
-  );
-  return builder.CreateLoad(type, builder.CreateBitCast(field, type->getPointerTo(1)));
-}
-
 /**
- * The local root entry the runtime materialized for one shader record: the table's
- * base plus the record's own position times the entry stride.
- *
- * `record` is the position of the record inside its own shader table, never an export
- * index: D3D12 indexes local root arguments by the record, and the two differ for
- * every table but the ray generation shader's single one. The position of a hit group
- * record is the D3D12 hit group index,
- * `InstanceContributionToHitGroupIndex + RayContributionToHitGroupIndex +
- * GeometryIndex * MultiplierForGeometryContributionToHitGroupIndex`, which the
- * traversal has not produced yet while a per-candidate callback or an intersection
- * shader runs - so the tracing shader publishes the ray and geometry halves into the
- * invocation block before the traversal, and the contribution array address with them.
- *
- * Zero when the pipeline has no such table (the runtime publishes a zero base for an
- * empty table) and zero when `record` is the invalid-record sentinel, which is what a
- * caller passes for a record that resolved to no shader: a table base is a device
- * address and address zero is not a valid entry, so no load is issued for either. Zero
- * reads as "no local root arguments" - never as the global root arguments and never as
- * the ray generation shader's own record.
- */
-Value *localRootEntry(IRBuilder<> &builder, Value *base, Value *stride, Value *record) {
-  Type *i64 = builder.getInt64Ty();
-  /*
-   * The record is a table position, a `uint32_t`; it is widened before the multiply so
-   * a record past 2^32/stride cannot wrap.
-   */
-  Value *offset = builder.CreateMul(
-    builder.CreateZExt(record, i64), builder.CreateZExt(stride, i64)
-  );
-  Value *usable = builder.CreateAnd(
-    builder.CreateICmpNE(base, builder.getInt64(0)),
-    builder.CreateICmpNE(record, builder.getInt32(SM50_RT_INDEX_NONE))
-  );
-  return builder.CreateSelect(usable, builder.CreateAdd(base, offset), builder.getInt64(0));
-}
-
-/**
- * The local root entry of one hit group record, read out of the dispatch constants
- * through their D3D12 GPU virtual address.
+ * The local root arguments of one hit group record, i.e. the bytes after the record's
+ * identifier in the application's table, resolved through the dispatch constants' D3D12
+ * GPU virtual address (EmitShaderRecordLookup).
  *
  * This is the path an intersection shader takes: it has no bound arguments, so the
- * constants' address travels in its invocation frame (see SM50_RT_FRAME) and the four
- * tables' bases and strides are read from there. A zero address means nothing
- * published the constants, so no load is issued at all (address space 1 has no address
- * zero) and the entry is zero - "no local root arguments".
+ * constants' address travels in its invocation frame (see SM50_RT_FRAME). A zero address
+ * means nothing published the constants, so no load is issued at all (address space 1 has
+ * no address zero) and the entry is zero - "no local root arguments", never the global
+ * root arguments and never the ray generation shader's own record.
  */
 Value *hitGroupLocalRootEntryAt(
   IRBuilder<> &builder, Value *dispatch_address, Value *hit_group
@@ -683,20 +665,8 @@ Value *hitGroupLocalRootEntryAt(
     builder, builder.CreateICmpNE(dispatch_address, builder.getInt64(0)),
     builder.getInt64(0), "rt.hit_group_entry",
     [&](IRBuilder<> &inner) -> Value * {
-      return localRootEntry(
-        inner,
-        loadDispatchFieldAt(
-          inner, dispatch_address,
-          offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordLocalRootTableBase),
-          inner.getInt64Ty()
-        ),
-        loadDispatchFieldAt(
-          inner, dispatch_address,
-          offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordLocalRootTableStride),
-          inner.getInt32Ty()
-        ),
-        hit_group
-      );
+      Value *dispatch = inner.CreateIntToPtr(dispatch_address, Type::getInt8PtrTy(inner.getContext(), 1));
+      return EmitShaderRecordLookup(inner, dispatch, RtShaderTable::HitGroup, hit_group).local_entry;
     }
   );
 }
@@ -744,6 +714,10 @@ void handOverFrameEntries(
 
 /* -------------------------------------------------------------------------- */
 /* Stage lowering                                                             */
+
+bool ReadLibraryFunctionNames(const void *bytecode, uint64_t size, std::map<std::string, std::string> &names) {
+  return readRuntimeDataPublicNames(bytecode, size, names);
+}
 /* -------------------------------------------------------------------------- */
 
 llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
@@ -808,6 +782,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
   dxbc::io_binding_map resource_map;
 
   const uint32_t stage = context.stage;
+  const bool hardware_intersection = stage == SM50_RT_STAGE_INTERSECTION && !context.query_callbacks;
   /*
    * The ray generation shader allocates the *whole* invocation block - frame, user
    * payload, hit state, committed attributes and the per-candidate region - because
@@ -833,9 +808,14 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
   uint32_t geometry_index = ~0u;
   uint32_t instance_index = ~0u;
   uint32_t user_instance_index = ~0u;
+  uint32_t world_origin_index = ~0u;
+  uint32_t world_direction_index = ~0u;
+  uint32_t object_to_world_index = ~0u;
+  uint32_t world_to_object_index = ~0u;
+  uint32_t dispatch_arguments_index = ~0u;
 
   if (stage == SM50_RT_STAGE_RAYGEN) {
-    func_signature.DefineInput(air::InputRaytracingDispatchArguments{
+    dispatch_arguments_index = func_signature.DefineInput(air::InputRaytracingDispatchArguments{
       .location_index = context.dispatch_arguments_slot,
       .size = (uint32_t)sizeof(SM50_RT_DISPATCH_ARGUMENTS),
       .arg_name = "dispatch",
@@ -852,7 +832,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
     });
     func_signature.DefineInput(air::InputThreadPositionInGrid{});
     func_signature.UseMaxWorkgroupSize(1);
-  } else if (stage == SM50_RT_STAGE_INTERSECTION) {
+  } else if (hardware_intersection) {
     /*
      * Metal's own intersection contract, read back from the public front end
      * (/tmp/rtfix/c1.ll):
@@ -919,13 +899,33 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
       .memory_access = air::MemoryAccess::read,
       .arg_name = "vft",
     });
+    /*
+     * `air.origin` / `air.direction` above are the ray in the candidate instance's OBJECT
+     * space (GPU-verified: build/local/p3/dxr/probes/wsprobe.m). World*RayOrigin and the
+     * instance transforms come from the world_space_data inputs, appended after the table so
+     * the fixed argument positions the bounding-box dispatcher forwards (3, 5, 6, 8) hold.
+     */
+    world_origin_index = func_signature.DefineInput(air::InputRaytracingValue{
+      .kind = "air.world_space_origin", .type_name = "float3", .arg_name = "world_origin",
+    });
+    world_direction_index = func_signature.DefineInput(air::InputRaytracingValue{
+      .kind = "air.world_space_direction", .type_name = "float3", .arg_name = "world_direction",
+    });
+    object_to_world_index = func_signature.DefineInput(air::InputRaytracingValue{
+      .kind = "air.object_to_world_transform", .type_name = "float4x3", .arg_name = "object_to_world",
+    });
+    world_to_object_index = func_signature.DefineInput(air::InputRaytracingValue{
+      .kind = "air.world_to_object_transform", .type_name = "float4x3", .arg_name = "world_to_object",
+    });
     /* `{ float distance, i1 accept, i1 continue_search }`: the reported distance, the
      * accept flag of a committed `dx.op.reportHit`, and whether
      * `dx.op.acceptHitAndEndSearch` ended the search. */
     func_signature.DefineOutput(air::OutputDistance{});
     func_signature.DefineOutput(air::OutputAcceptIntersection{});
     func_signature.DefineOutput(air::OutputContinueSearch{});
-    func_signature.UseFunctionTags({"air.bounding_box", "air.instancing", "air.triangle_data"});
+    func_signature.UseFunctionTags(
+      {"air.bounding_box", "air.instancing", "air.triangle_data", "air.world_space_data"}
+    );
   } else {
     /* Miss / closest-hit / any-hit / callable: an ordinary visible function called
      * through the visible function table. */
@@ -935,13 +935,13 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
       .arg_name = "payload",
       /* Only any-hit is invoked on hardware ray-data storage. Other visible
        * stages receive the tracing/calling shader's thread-local child block. */
-      .address_space = stage == SM50_RT_STAGE_ANY_HIT ? 5u : 0u,
+      .address_space = stage == SM50_RT_STAGE_ANY_HIT && !context.query_callbacks ? 5u : 0u,
     });
     hit_state_index = func_signature.DefineInput(air::InputRaytracingValue{
       .kind = "air.visible_input",
       .type_name = "hit_state",
       .arg_name = "hit_state",
-      .address_space = stage == SM50_RT_STAGE_ANY_HIT ? 5u : 0u,
+      .address_space = stage == SM50_RT_STAGE_ANY_HIT && !context.query_callbacks ? 5u : 0u,
     });
     record_index = func_signature.DefineInput(air::InputRaytracingValue{
       .kind = "air.visible_input",
@@ -994,11 +994,12 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
    * map below.
    */
   const bool takes_signature_arguments = stage == SM50_RT_STAGE_RAYGEN;
+  /* No stage declares a local root table: every record's local root arguments are read in
+   * place from the application's shader table (EmitShaderRecordLookup). */
   auto binding_map = dxbc::setup_binding_rootsig(
     &shader_info, func_signature, module_ir, shader.shader_type, global.data, global.size,
     SM50_BINDING_INDEX_ROOT_ARGUMENTS, SM50_BINDING_INDEX_STATIC_SAMPLERS,
-    local.data, local.size, takes_signature_arguments,
-    takes_signature_arguments ? context.local_root_table_slot : ~0u
+    local.data, local.size, takes_signature_arguments
   );
   if (!binding_map)
     return createError("a raytracing export has an invalid root signature");
@@ -1029,7 +1030,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
       Type::getInt8Ty(llvm_context), payload,
       builder.getInt32((int32_t)context.hitStateOffset())
     );
-  } else if (stage == SM50_RT_STAGE_INTERSECTION) {
+  } else if (hardware_intersection) {
     block = function->getArg(payload_index);
     payload = builder.CreateGEP(
       Type::getInt8Ty(llvm_context), block,
@@ -1063,7 +1064,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
     storeState(
       offsetof(SM50_RT_HIT_STATE, WorldRayOrigin),
       builder.CreateShuffleVector(
-        function->getArg(origin_index), PoisonValue::get(
+        function->getArg(world_origin_index), PoisonValue::get(
           FixedVectorType::get(builder.getFloatTy(), 3)
         ),
         ArrayRef<int>{0, 1, 2, 3}
@@ -1072,11 +1073,16 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
     storeState(
       offsetof(SM50_RT_HIT_STATE, WorldRayDirection),
       builder.CreateShuffleVector(
-        function->getArg(direction_index), PoisonValue::get(
+        function->getArg(world_direction_index), PoisonValue::get(
           FixedVectorType::get(builder.getFloatTy(), 3)
         ),
         ArrayRef<int>{0, 1, 2, 3}
       )
+    );
+    storeState(offsetof(SM50_RT_HIT_STATE, ObjectRayOrigin), function->getArg(origin_index));
+    storeState(offsetof(SM50_RT_HIT_STATE, ObjectRayDirection), function->getArg(direction_index));
+    StoreInstanceTransforms(
+      builder, state, function->getArg(object_to_world_index), function->getArg(world_to_object_index)
     );
     storeState(offsetof(SM50_RT_HIT_STATE, RayTMin), function->getArg(min_distance_index));
     /* RayTCurrent starts at the ray's upper bound: nothing has been reported yet, so the
@@ -1127,7 +1133,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
    */
   if (stage != SM50_RT_STAGE_RAYGEN) {
     Value *local_entry = nullptr;
-    if (stage == SM50_RT_STAGE_INTERSECTION) {
+    if (hardware_intersection) {
       Value *control = CandidateControlPointer(module_ir, context, block, builder);
       Value *hit_group = builder.CreateAdd(
         builder.CreateAdd(
@@ -1152,6 +1158,15 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
         loadBlockQword(builder, block, offsetof(SM50_RT_FRAME, LocalRootEntry));
     }
     handOverFrameEntries(*binding_map, builder, block, local_entry);
+  } else {
+    /* The ray generation shader's local root arguments follow its own record's identifier. */
+    Value *dispatch = function->getArg(dispatch_arguments_index);
+    Value *bytes = builder.CreateBitCast(
+      dispatch, Type::getInt8PtrTy(llvm_context, cast<PointerType>(dispatch->getType())->getAddressSpace())
+    );
+    Value *local_entry =
+      EmitShaderRecordLookup(builder, bytes, RtShaderTable::RayGeneration, builder.getInt32(0)).local_entry;
+    binding_map->SetLocalRootArgumentPointer(builder.CreateIntToPtr(local_entry, Type::getInt8PtrTy(llvm_context, 1)));
   }
 
   /*
@@ -1277,7 +1292,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
    * handed this function.
    */
   IRBuilder<> epilogue(epilogue_bb);
-  if (stage == SM50_RT_STAGE_INTERSECTION) {
+  if (hardware_intersection) {
     /* `block` is the head the prologue already computed in the entry block, which
      * dominates this one. */
     Value *control = CandidateControlPointer(module_ir, context, block, epilogue);
@@ -1311,7 +1326,9 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
   } else {
     epilogue.CreateRetVoid();
   }
-  module_ir.getOrInsertNamedMetadata(entryKindOfStage(stage))->addOperand(function_metadata);
+  module_ir.getOrInsertNamedMetadata(
+    context.query_callbacks && stage == SM50_RT_STAGE_INTERSECTION ? "air.visible" : entryKindOfStage(stage)
+  )->addOperand(function_metadata);
   return std::move(binding_map);
 }
 
@@ -1424,9 +1441,22 @@ static llvm::Error EmitDispatchCallback(
     .address_space = 5,
     .arg_name = "payload",
   });
+  /* The candidate instance's transforms and the ray in its object space (world_space_data). */
+  const uint32_t object_origin_index = signature.DefineInput(air::InputRaytracingValue{
+    .kind = "air.origin", .type_name = "float3", .arg_name = "origin",
+  });
+  const uint32_t object_direction_index = signature.DefineInput(air::InputRaytracingValue{
+    .kind = "air.direction", .type_name = "float3", .arg_name = "direction",
+  });
+  const uint32_t object_to_world_index = signature.DefineInput(air::InputRaytracingValue{
+    .kind = "air.object_to_world_transform", .type_name = "float4x3", .arg_name = "object_to_world",
+  });
+  const uint32_t world_to_object_index = signature.DefineInput(air::InputRaytracingValue{
+    .kind = "air.world_to_object_transform", .type_name = "float4x3", .arg_name = "world_to_object",
+  });
   signature.DefineOutput(air::OutputAcceptIntersection{});
   signature.DefineOutput(air::OutputContinueSearch{});
-  signature.UseFunctionTags({"air.triangle", "air.instancing", "air.triangle_data"});
+  signature.UseFunctionTags({"air.triangle", "air.instancing", "air.triangle_data", "air.world_space_data"});
 
   auto [function, metadata] =
     signature.CreateFunction(name.str(), llvm_context, module, 0, false);
@@ -1494,6 +1524,17 @@ static llvm::Error EmitDispatchCallback(
     builder, hit_state, offsetof(SM50_RT_HIT_STATE, FrontFace), builder.getInt32Ty(),
     front_facing
   );
+  storeBlockField(
+    builder, hit_state, offsetof(SM50_RT_HIT_STATE, ObjectRayOrigin),
+    FixedVectorType::get(builder.getFloatTy(), 3), function->getArg(object_origin_index)
+  );
+  storeBlockField(
+    builder, hit_state, offsetof(SM50_RT_HIT_STATE, ObjectRayDirection),
+    FixedVectorType::get(builder.getFloatTy(), 3), function->getArg(object_direction_index)
+  );
+  StoreInstanceTransforms(
+    builder, hit_state, function->getArg(object_to_world_index), function->getArg(world_to_object_index)
+  );
 
   /* Hit group -> export index, through the record index table the runtime's
    * preparation pass built. A pipeline with no hit-group table publishes a zero base
@@ -1520,41 +1561,18 @@ static llvm::Error EmitDispatchCallback(
   );
   /*
    * SM50_RT_DISPATCH_ARGUMENTS is a plain constant buffer the runtime binds at the
-   * callback's own argument index, so its fields are reached through a byte pointer in
-   * the argument's own address space rather than through the argument's (dword-array)
-   * type.
+   * callback's own argument index; the hit group record is resolved straight out of the
+   * application's table (EmitShaderRecordLookup), which also yields the record's local
+   * root arguments - the bytes after its identifier.
    */
   const unsigned dispatch_space =
     cast<PointerType>(dispatch->getType())->getAddressSpace();
   Value *dispatch_bytes = builder.CreateBitCast(
     dispatch, Type::getInt8PtrTy(llvm_context, dispatch_space)
   );
-  auto dispatchField = [&](uint32_t byte_offset, Type *type) -> Value * {
-    Value *field = builder.CreateGEP(
-      Type::getInt8Ty(llvm_context), dispatch_bytes, builder.getInt32(byte_offset)
-    );
-    return builder.CreateLoad(
-      type, builder.CreateBitCast(field, type->getPointerTo(dispatch_space))
-    );
-  };
-  Value *record_base = dispatchField(
-    offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordIndexBase),
-    builder.getInt64Ty()
-  );
-  Value *has_table = builder.CreateICmpNE(record_base, builder.getInt64(0));
-  /* The runtime publishes a uint32 export index per SBT record; address space 1 has no
-   * address zero, so the load is issued only when a table exists. */
-  Value *record = emitGuardedValue(
-    builder, has_table, builder.getInt32(SM50_RT_INDEX_NONE), "rt.dispatch.record",
-    [&](IRBuilder<> &inner) -> Value * {
-      Value *slot = inner.CreateIntToPtr(
-        record_base, Type::getInt32PtrTy(inner.getContext(), 1)
-      );
-      return inner.CreateLoad(
-        inner.getInt32Ty(), inner.CreateGEP(inner.getInt32Ty(), slot, group)
-      );
-    }
-  );
+  RtShaderRecord hit_group_record =
+    EmitShaderRecordLookup(builder, dispatch_bytes, RtShaderTable::HitGroup, group);
+  Value *record = hit_group_record.export_index;
   Value *valid = builder.CreateAnd(
     builder.CreateICmpNE(record, builder.getInt32(SM50_RT_INDEX_NONE)),
     builder.CreateICmpULT(record, builder.getInt32(export_count))
@@ -1574,29 +1592,13 @@ static llvm::Error EmitDispatchCallback(
     valid, builder.CreateICmpNE(any_hit, builder.getInt32(SM50_RT_INDEX_NONE))
   );
   /*
-   * The local root arguments of the record this candidate's hit group runs as.
-   *
-   * The any-hit shader is a visible function, so it cannot declare the local root
-   * table; the entry the runtime materialized for its record is the table base plus
-   * the record's own position (the hit group index, instance contribution included)
-   * times the table stride, and this callback is the only party that knows that
-   * position while the traversal runs. It is published into the frame the any-hit
-   * shader reads - never the global root arguments, and never the ray generation
-   * shader's own record. A zero base means the pipeline has no materialized local root
-   * table for hit groups, which reads as "no local root arguments".
+   * The local root arguments of the record this candidate's hit group runs as, published
+   * into the frame the any-hit shader reads: this callback is the only party that knows
+   * the record's position (the hit group index, instance contribution included) while
+   * the traversal runs. Never the global root arguments, never the ray generation
+   * shader's own record; zero for an unresolved record.
    */
-  Value *any_hit_entry = localRootEntry(
-    builder,
-    dispatchField(
-      offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordLocalRootTableBase),
-      builder.getInt64Ty()
-    ),
-    dispatchField(
-      offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordLocalRootTableStride),
-      builder.getInt32Ty()
-    ),
-    group
-  );
+  Value *any_hit_entry = hit_group_record.local_entry;
   {
     LLVMContext &context = builder.getContext();
     Function *function = builder.GetInsertBlock()->getParent();
@@ -1665,7 +1667,6 @@ static llvm::Error EmitBoundingBoxDispatch(
   Value *dispatch = b.CreateIntToPtr(
     loadBlockQword(b, block, offsetof(SM50_RT_FRAME, DispatchArguments)),
     Type::getInt8PtrTy(ctx, 1));
-  Value *base = loadBlockQword(b, dispatch, offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordIndexBase));
   BasicBlock *reject = BasicBlock::Create(ctx, "no_record", callback);
   IRBuilder<> no_record(reject);
   Value *result = PoisonValue::get(callback->getReturnType());
@@ -1673,11 +1674,8 @@ static llvm::Error EmitBoundingBoxDispatch(
   result = no_record.CreateInsertValue(result, no_record.getFalse(), 1);
   result = no_record.CreateInsertValue(result, no_record.getTrue(), 2);
   no_record.CreateRet(result);
-  BasicBlock *lookup = BasicBlock::Create(ctx, "lookup", callback);
-  b.CreateCondBr(b.CreateICmpNE(base, b.getInt64(0)), lookup, reject);
-  b.SetInsertPoint(lookup);
-  Value *records = b.CreateIntToPtr(base, Type::getInt32PtrTy(ctx, 1));
-  Value *record = b.CreateAlignedLoad(b.getInt32Ty(), b.CreateGEP(b.getInt32Ty(), records, group), Align(4));
+  /* An unresolved record (SM50_RT_INDEX_NONE) takes the switch's default: no candidate. */
+  Value *record = EmitShaderRecordLookup(b, dispatch, RtShaderTable::HitGroup, group).export_index;
   SwitchInst *select = b.CreateSwitch(record, reject, targets.size());
   SmallVector<Value *, 12> arguments;
   for (Argument &argument : callback->args())
@@ -1980,17 +1978,11 @@ static llvm::Error EmitRayGenerationDispatch(
   Value *dispatch = dispatcher->getArg(dispatch_index);
   unsigned space = cast<PointerType>(dispatch->getType())->getAddressSpace();
   Value *bytes = b.CreateBitCast(dispatch, Type::getInt8PtrTy(ctx, space));
-  Value *field = b.CreateGEP(b.getInt8Ty(), bytes,
-    b.getInt32(offsetof(SM50_RT_DISPATCH_ARGUMENTS, RayGenerationIndexBase)));
-  Value *address = b.CreateAlignedLoad(b.getInt64Ty(),
-    b.CreateBitCast(field, Type::getInt64PtrTy(ctx, space)), Align(1));
   BasicBlock *done = BasicBlock::Create(ctx, "done", dispatcher);
   IRBuilder<>(done).CreateRetVoid();
-  BasicBlock *lookup = BasicBlock::Create(ctx, "lookup", dispatcher);
-  b.CreateCondBr(b.CreateICmpNE(address, b.getInt64(0)), lookup, done);
-  b.SetInsertPoint(lookup);
-  Value *record = b.CreateAlignedLoad(b.getInt32Ty(),
-    b.CreateIntToPtr(address, Type::getInt32PtrTy(ctx, 1)), Align(4));
+  /* The identifier of the application's ray generation record names the raygen to run;
+   * a record of another pipeline (SM50_RT_INDEX_NONE) takes the default: nothing runs. */
+  Value *record = EmitShaderRecordLookup(b, bytes, dxmt::dxil::RtShaderTable::RayGeneration, b.getInt32(0)).export_index;
   SwitchInst *select = b.CreateSwitch(record, done, targets.size());
   for (unsigned i = 0; i < targets.size(); ++i) {
     Function *target = targets[i];
@@ -2102,6 +2094,8 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
       return 0;
     }
     switch (export_desc.Stage) {
+    case SM50_RT_STAGE_LIBRARY:
+      break;
     case SM50_RT_STAGE_RAYGEN:
       have_raygen = true;
       raygen_indices.push_back(i);
@@ -2177,13 +2171,73 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
   std::vector<std::string> function_names;
   function_names.reserve(reflection_count);
   std::vector<uint32_t> continuations(pDesc->ExportCount, SM50_RT_INDEX_NONE);
+  std::vector<uint32_t> any_hits;
+  std::vector<uint32_t> intersections;
+  std::vector<std::unique_ptr<dxil::ModuleInfo>> callback_modules(pDesc->ExportCount);
+  std::vector<SM50_WG_LIBRARY> link_libraries;
+  link_libraries.reserve(pDesc->LibraryCount);
+  for (uint32_t i = 0; i < pDesc->LibraryCount; ++i)
+    link_libraries.push_back({pDesc->Libraries[i].Bytecode, pDesc->Libraries[i].Size});
+  SM50_WG_NODE_COMPILE_DESC linkage{};
+  linkage.Libraries = link_libraries.data();
+  linkage.LibraryCount = pDesc->LibraryCount;
+  linkage.Exports = pDesc->LinkExports;
+  linkage.ExportCount = pDesc->LinkExportCount;
+  bool query_callbacks = false;
   for (uint32_t i = 0; i < pDesc->ExportCount; ++i) {
     if (pDesc->Exports[i].ClosestHitIndex != SM50_RT_INDEX_NONE)
       continuations[i] = i;
+    const auto &entry = pDesc->Exports[i];
+    if (entry.Stage != SM50_RT_STAGE_ANY_HIT && entry.Stage != SM50_RT_STAGE_INTERSECTION)
+      continue;
+    const auto &library = pDesc->Libraries[entry.LibraryIndex];
+    auto parsed = dxil::ModuleInfo::Parse(library.Bytecode, size_t(library.Size), entry.ContainerEntryPoint);
+    if (!parsed) {
+      reportError(parsed.takeError(), ppError);
+      return 0;
+    }
+    callback_modules[i] = std::move(*parsed);
+    auto &info = *callback_modules[i];
+    linkage.EntryLibraryIndex = entry.LibraryIndex;
+    linkage.EntryExportIndex = SM50_RT_INDEX_NONE;
+    for (uint32_t function = 0; function < linkage.ExportCount; ++function) {
+      const auto &candidate = linkage.Exports[function];
+      if (candidate.LibraryIndex != entry.LibraryIndex ||
+          std::strcmp(candidate.EntryPoint, entry.ContainerEntryPoint) != 0)
+        continue;
+      linkage.EntryExportIndex = function;
+      if (std::strcmp(candidate.Name, entry.EntryPoint) == 0)
+        break;
+    }
+    if (auto failure = dxil::LinkLibraryDependencies(info, linkage)) {
+      reportError(std::move(failure), ppError);
+      return 0;
+    }
+    dxmt::dxil::IsolateSelectedExport(*info.module, *info.entry);
+    if (query_callbacks)
+      continue;
+    for (const auto &function : *info.module)
+      if (!function.isDeclaration())
+        for (const auto &block : function)
+          for (const auto &instruction : block)
+            if (const auto *call = dyn_cast<CallInst>(&instruction))
+              if (const auto *callee = call->getCalledFunction())
+                query_callbacks |= callee->getName().startswith("dx.op.allocateRayQuery");
+  }
+  if (query_callbacks) {
+    any_hits.resize(pDesc->ExportCount, SM50_RT_INDEX_NONE);
+    intersections.resize(pDesc->ExportCount, SM50_RT_INDEX_NONE);
+    for (uint32_t i = 0; i < pDesc->ExportCount; ++i) {
+      any_hits[i] = pDesc->Exports[i].AnyHitIndex;
+      if (pDesc->Exports[i].Stage == SM50_RT_STAGE_INTERSECTION)
+        intersections[i] = pDesc->ExportCount + i;
+    }
   }
 
   for (uint32_t i = 0; i < pDesc->ExportCount; ++i) {
     const SM50_RT_EXPORT &group = pDesc->Exports[i];
+    if (group.Stage == SM50_RT_STAGE_LIBRARY)
+      continue;
     const uint32_t variants = group.Stage == SM50_RT_STAGE_INTERSECTION &&
       group.ClosestHitIndex != SM50_RT_INDEX_NONE ? 2 : 1;
     for (uint32_t variant = 0; variant < variants; ++variant) {
@@ -2199,7 +2253,9 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
       dxil::RaytracingExportContext export_context;
       export_context.stage = export_desc.Stage;
       export_context.export_index = i;
-      export_context.local_root_table_slot = SM50_RT_BINDING_INDEX_LOCAL_ROOT_TABLE;
+      export_context.query_callbacks = query_callbacks;
+      export_context.hit_group_any_hits = any_hits.data();
+      export_context.hit_group_intersections = intersections.data();
       export_context.dispatch_arguments_slot = SM50_RT_BINDING_INDEX_DISPATCH;
       export_context.intersection_function_table_slot =
         SM50_RT_BINDING_INDEX_INTERSECTION_FUNCTION_TABLE;
@@ -2229,7 +2285,8 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
       export_context.intersection_index = export_desc.IntersectionIndex;
       export_context.hit_group_continuations = continuations.data();
       export_context.hit_group_continuation_count = continuations.size();
-      export_context.max_recursion_depth = pDesc->MaxRecursionDepth ? pDesc->MaxRecursionDepth : 1;
+      /* 0 is a legal depth: D3D12 then disallows TraceRay altogether. */
+      export_context.max_recursion_depth = pDesc->MaxRecursionDepth;
       export_context.pipeline_flags = pDesc->Flags;
       export_context.global_root_signature = pDesc->GlobalRootSignature;
       export_context.global_root_signature_size = pDesc->GlobalRootSignatureSize;
@@ -2253,12 +2310,30 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
         return 0;
       }
 
-      auto info = dxil::ModuleInfo::Parse(
-        library.Bytecode, static_cast<size_t>(library.Size), export_desc.ContainerEntryPoint
-      );
+      const bool linked_callback = !variant && callback_modules[i];
+      auto info = linked_callback
+        ? llvm::Expected<std::unique_ptr<dxil::ModuleInfo>>(std::move(callback_modules[i]))
+        : dxil::ModuleInfo::Parse(library.Bytecode, static_cast<size_t>(library.Size), export_desc.ContainerEntryPoint);
       if (!info) {
         reportError(info.takeError(), ppError);
         return 0;
+      }
+      linkage.EntryLibraryIndex = export_desc.LibraryIndex;
+      linkage.EntryExportIndex = SM50_RT_INDEX_NONE;
+      for (uint32_t function = 0; function < linkage.ExportCount; ++function) {
+        const auto &candidate = linkage.Exports[function];
+        if (candidate.LibraryIndex != export_desc.LibraryIndex ||
+            std::strcmp(candidate.EntryPoint, export_desc.ContainerEntryPoint) != 0)
+          continue;
+        linkage.EntryExportIndex = function;
+        if (std::strcmp(candidate.Name, export_desc.EntryPoint) == 0)
+          break;
+      }
+      if (!linked_callback) {
+        if (auto failure = dxil::LinkLibraryDependencies(**info, linkage)) {
+          reportError(std::move(failure), ppError);
+          return 0;
+        }
       }
 
       /*
@@ -2351,9 +2426,12 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
       function.Name = nullptr; /* filled once the vector stops reallocating */
       function.ExportName = export_desc.EntryPoint;
       function.Kind = dxil::functionKindOfStage(export_desc.Stage);
+      if (query_callbacks && export_desc.Stage == SM50_RT_STAGE_INTERSECTION)
+        function.Kind = SM50_RT_FUNCTION_VISIBLE;
       function.ExportIndex = i;
       /* Export bodies have no hardware IFT slot: shared callbacks select them on GPU. */
-      function.TableIndex = SM50_RT_INDEX_NONE;
+      function.TableIndex = query_callbacks && export_desc.Stage == SM50_RT_STAGE_INTERSECTION
+        ? pDesc->ExportCount + i + 1 : SM50_RT_INDEX_NONE;
       function.IsDispatchEntry = export_context.is_dispatch_entry ? 1u : 0u;
       functions.push_back(function);
     }
@@ -2376,8 +2454,17 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
     callback_context.hit_state_size = (uint32_t)sizeof(SM50_RT_HIT_STATE);
     callback_context.candidate_size = dxil::kRtCandidateRegionSize(pDesc->MaxAttributeSize);
 
+    // Preserve the bound IFT ABI without linking hit shaders into native callbacks
+    // when nested queries require candidate traversal in the kernel.
+    std::vector<SM50_RT_EXPORT> native_exports;
+    SM50_RT_PIPELINE_DESC native_desc = *pDesc;
+    if (query_callbacks) {
+      native_exports.assign(pDesc->Exports, pDesc->Exports + pDesc->ExportCount);
+      for (auto &entry : native_exports) entry.AnyHitIndex = SM50_RT_INDEX_NONE;
+      native_desc.Exports = native_exports.data();
+    }
     if (auto failure = dxmt::dxil::EmitDispatchCallback(
-          air_module, *pDesc, callback_context, "dxmt.rt.candidate"
+          air_module, native_desc, callback_context, "dxmt.rt.candidate"
         )) {
       reportError(std::move(failure), ppError);
       return 0;
@@ -2392,7 +2479,7 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
     function.TableIndex = 0;
     function.IsDispatchEntry = 0;
     functions.push_back(function);
-    if (has_intersection) {
+    if (has_intersection && !query_callbacks) {
       if (auto failure = dxmt::dxil::EmitBoundingBoxDispatch(
             air_module, *pDesc, callback_context, "dxmt.rt.bounding_box")) {
         reportError(std::move(failure), ppError);
@@ -2426,10 +2513,6 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
     functions.push_back(function);
   }
 
-  /*
-   * The names the reflection points at have to outlive this call, so they move into the
-   * object the caller owns through `sm50_bitcode_t` before the pointers are published.
-   */
 
   if (llvm::verifyModule(air_module, &llvm::errs())) {
     llvm::errs() << "OWNED_RT_INVALID_IR_BEGIN\n";
@@ -2439,10 +2522,21 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
     return 0;
   }
 
+  uint64_t names_size = 0;
+  for (const auto &name : function_names)
+    names_size += name.size() + 1;
+  if (!pDesc->FunctionNames || pDesc->FunctionNamesSize < names_size) {
+    reportMessage("raytracing function name storage is too small", ppError);
+    return 0;
+  }
+  char *next_name = pDesc->FunctionNames;
+  for (size_t i = 0; i < functions.size(); ++i) {
+    const auto &name = function_names[i];
+    std::memcpy(next_name, name.c_str(), name.size() + 1);
+    functions[i].Name = next_name;
+    next_name += name.size() + 1;
+  }
   auto compiled = new dxil::SM50CompiledBitcodeInternal();
-  compiled->function_names = std::move(function_names);
-  for (size_t i = 0; i < functions.size(); ++i)
-    functions[i].Name = compiled->function_names[i].c_str();
 
   /*
    * The merged module is optimized as a whole, exactly as a raster shader is after its

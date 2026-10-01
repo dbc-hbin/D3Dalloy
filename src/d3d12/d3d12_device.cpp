@@ -18,6 +18,7 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_device_child.hpp"
+#include "d3d12_dxil_subobjects.hpp"
 #include "d3d12_enhanced_barrier.hpp"
 #include "d3d12_format_support.hpp"
 #include "d3d12_pageable.hpp"
@@ -70,92 +71,33 @@ HRESULT PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, cons
 
 /*
  * Serialized root signature of a GlobalRootSignature/LocalRootSignature subobject declared in a
- * DXIL library (ID3D12Device14::CreateRootSignatureFromSubobjectInLibrary). The subobject table is
- * the container's RDAT part 6 (DXC DxilRuntimeReflection.h RuntimeDataPartType::SubobjectTable);
- * each record is RuntimeDataSubobjectInfo from RDAT_SubobjectTypes.inl:
- *   { u32 Kind; u32 Name (string table offset); union { ..., RootSignature_t { u32 Data; u32 Size } } }
- * where Data is an offset into the RawBytes part (5). Kinds: GlobalRootSignature = 1,
- * LocalRootSignature = 2 (DxilConstants.h SubobjectKind). A null name selects the only root
- * signature subobject, and is ambiguous (E_INVALIDARG) when there are several.
+ * DXIL library (ID3D12Device14::CreateRootSignatureFromSubobjectInLibrary), read through the
+ * shared RDAT subobject reader. A null name selects the only root signature subobject, and is
+ * ambiguous (E_INVALIDARG) when there are several.
  */
 static HRESULT
-FindLibraryRootSignature(const void *blob, SIZE_T size, LPCWSTR name, const void *&data, SIZE_T &data_size) {
-  constexpr uint32_t kPartStrings = 1, kPartRawBytes = 5, kPartSubobjects = 6;
-  constexpr uint32_t kGlobalRootSignature = 1, kLocalRootSignature = 2;
-  microsoft::CDXBCParser parser;
-  if (!blob || !size || size > UINT32_MAX || FAILED(parser.ReadDXBC(blob, UINT32(size))))
-    return E_INVALIDARG;
-  const UINT32 index = parser.FindNextMatchingBlob(microsoft::DXBCFourCC(UINT('R') | UINT('D') << 8 | UINT('A') << 16 | UINT('T') << 24));
-  if (index == DXBC_BLOB_NOT_FOUND)
-    return E_INVALIDARG;
-  const auto *rdat = static_cast<const uint8_t *>(parser.GetBlob(index));
-  const size_t rdat_size = parser.GetBlobSize(index);
-  auto u32 = [](const uint8_t *p) {
-    uint32_t value;
-    std::memcpy(&value, p, sizeof(value));
-    return value;
-  };
-  if (!rdat || rdat_size < 8)
-    return E_INVALIDARG;
-  const uint32_t part_count = u32(rdat + 4);
-  if (8 + uint64_t(part_count) * 4 > rdat_size)
-    return E_INVALIDARG;
-  const uint8_t *strings = nullptr, *raw = nullptr, *table = nullptr;
-  size_t strings_size = 0, raw_size = 0, table_size = 0;
-  for (uint32_t i = 0; i < part_count; ++i) {
-    const uint32_t offset = u32(rdat + 8 + 4 * i);
-    if (offset > rdat_size || rdat_size - offset < 8)
-      return E_INVALIDARG;
-    const uint32_t type = u32(rdat + offset), part_size = u32(rdat + offset + 4);
-    if (part_size > rdat_size - offset - 8)
-      return E_INVALIDARG;
-    const uint8_t *part = rdat + offset + 8;
-    if (type == kPartStrings)
-      strings = part, strings_size = part_size;
-    else if (type == kPartRawBytes)
-      raw = part, raw_size = part_size;
-    else if (type == kPartSubobjects)
-      table = part, table_size = part_size;
-  }
-  if (!table || table_size < 8 || !strings)
-    return E_INVALIDARG;
-  const uint32_t count = u32(table), stride = u32(table + 4);
-  if (stride < 16 || 8 + uint64_t(count) * stride > table_size)
-    return E_INVALIDARG;
-  const uint8_t *match = nullptr;
-  for (uint32_t i = 0; i < count; ++i) {
-    const uint8_t *record = table + 8 + size_t(i) * stride;
-    const uint32_t kind = u32(record);
-    if (kind != kGlobalRootSignature && kind != kLocalRootSignature)
+FindLibraryRootSignature(const void *blob, SIZE_T size, LPCWSTR name, std::vector<uint8_t> &payload) {
+  std::vector<DxilSubobject> subobjects;
+  if (HRESULT hr = ReadDxilLibrarySubobjects(blob, size, subobjects); FAILED(hr))
+    return hr == E_OUTOFMEMORY ? hr : E_INVALIDARG;
+  const DxilSubobject *match = nullptr;
+  for (const auto &subobject : subobjects) {
+    if (subobject.kind != DxilSubobjectKind::GlobalRootSignature &&
+        subobject.kind != DxilSubobjectKind::LocalRootSignature)
       continue;
     if (name) {
-      const uint32_t name_offset = u32(record + 4);
-      if (name_offset >= strings_size)
-        return E_INVALIDARG;
-      const char *utf8 = reinterpret_cast<const char *>(strings + name_offset);
-      const size_t length = strnlen(utf8, strings_size - name_offset);
-      if (length == strings_size - name_offset)
-        return E_INVALIDARG;
-      // Subobject names are HLSL identifiers (ASCII); compare code units exactly.
-      size_t j = 0;
-      while (j < length && name[j] && name[j] == static_cast<unsigned char>(utf8[j]))
-        ++j;
-      if (j != length || name[j])
+      if (subobject.name != name)
         continue;
-    } else if (match) {
-      return E_INVALIDARG;
-    }
-    match = record;
-    if (name)
+      match = &subobject;
       break;
+    }
+    if (match)
+      return E_INVALIDARG;
+    match = &subobject;
   }
   if (!match)
     return E_INVALIDARG;
-  const uint32_t offset = u32(match + 8), bytes = u32(match + 12);
-  if (!raw || !bytes || offset > raw_size || bytes > raw_size - offset)
-    return E_INVALIDARG;
-  data = raw + offset;
-  data_size = bytes;
+  payload = match->root_signature;
   return S_OK;
 }
 
@@ -522,7 +464,13 @@ public:
     if (!pFeatureData)
       return E_INVALIDARG;
     auto metal = GetMTLDevice();
-    switch (Feature) {
+    switch (UINT(Feature)) {
+    case kFeatureD3D12Options21: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21)) return E_INVALIDARG;
+      auto *out = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS21 *>(pFeatureData);
+      *out = {D3D12_WORK_GRAPHS_TIER_1_0, D3D12_EXECUTE_INDIRECT_TIER_1_0, FALSE, FALSE};
+      return S_OK;
+    }
     case D3D12_FEATURE_ARCHITECTURE: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_ARCHITECTURE))
         return E_INVALIDARG;
@@ -609,7 +557,7 @@ public:
        if (DataSize != sizeof(D3D12_FEATURE_DATA_FORMAT_INFO))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_FORMAT_INFO *>(pFeatureData);
-      if (out->Format == DXGI_FORMAT_UNKNOWN) {
+      if (out->Format == DXGI_FORMAT_UNKNOWN || sampler_feedback::IsFeedbackFormat(out->Format)) {
         out->PlaneCount = 1;
         return S_OK;
       }
@@ -645,7 +593,9 @@ public:
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS *>(pFeatureData);
       out->DoublePrecisionFloatShaderOps = FALSE;
-      out->OutputMergerLogicOp = FALSE;
+      // All 16 ops on every renderable UINT format (feature-level suite): native Metal logic op, or the exact
+      // framebuffer-fetch PS epilogue when an RGB10A2_UINT target is bound (Metal saturates that format).
+      out->OutputMergerLogicOp = TRUE;
       out->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT;
       /*
        * Tier 2 (tiled suite): reserved buffers and 2D textures over Metal 64KB placement sparse pages,
@@ -662,7 +612,7 @@ public:
       out->PSSpecifiedStencilRefSupported = TRUE;
       out->TypedUAVLoadAdditionalFormats = TRUE;
       out->ROVsSupported = TRUE;
-      out->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
+      out->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_1;
       out->MaxGPUVirtualAddressBitsPerResource = 48;
       out->StandardSwizzle64KBSupported = TRUE;
       out->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
@@ -743,7 +693,9 @@ public:
       // vertex_value<T> (sm6 suite: barycentrics, barycentrics_indexed).
       out->BarycentricsSupported = TRUE;
       out->CopyQueueTimestampQueriesSupported = FALSE;
-      out->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+      // Draw-level looping with exact view locations (view-instancing suite); Tier 2/3 need instancing below
+      // draw level.
+      out->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_1;
       out->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAGS(
           D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |
           D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY | D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE);
@@ -771,8 +723,10 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(pFeatureData);
-      out->MeshShaderPipelineStatsSupported = FALSE;
-      out->MeshShaderSupportsFullRangeRenderTargetArrayIndex = FALSE;
+      // Mesh draws count AS/MS invocations, MS primitives and the clipper/PS stages exactly (PIPELINE_STATISTICS1);
+      // an MS writes any SV_RenderTargetArrayIndex up to 2047. Both GPU-verified by the mesh-shader suite.
+      out->MeshShaderPipelineStatsSupported = TRUE;
+      out->MeshShaderSupportsFullRangeRenderTargetArrayIndex = TRUE;
       // Apple GPUs have no returning 64 bit texture atomics or threadgroup 64 bit atomics
       // (the Metal compiler rejects them); airconv refuses both at compile time.
       out->AtomicInt64OnTypedResourceSupported = FALSE;
@@ -798,6 +752,7 @@ public:
       // the relaxed-casting contract requires. Format lists without those casts still work.
       out->RelaxedFormatCastingSupported = FALSE;
       out->EnhancedBarriersSupported = kReportLayoutFeatures;
+      // MSPrimitives counts declared primitives minus those SV_CullPrimitive culls (dxil_mesh.cpp).
       out->MSPrimitivesPipelineStatisticIncludesCulledPrimitives = D3D12_TRI_STATE_FALSE;
       return S_OK;
     }
@@ -817,9 +772,9 @@ public:
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5 *>(pFeatureData);
       out->SRVOnlyTiledResourceTier3 = FALSE;
-      // Advertised only once the whole acceleration-structure path (build/refit/copy plus
-      // ray dispatch) is complete; the AS commands themselves already validate and execute.
-      out->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+      // AS build/refit/copy/serialization, state-object extension, indirect dispatch and
+      // RayQuery in every shader stage are verified by the raytracing GPU suite.
+      out->RaytracingTier = D3D12_RAYTRACING_TIER_1_1;
       out->RenderPassesTier = D3D12_RENDER_PASS_TIER_0;
       return S_OK;
     }
@@ -827,8 +782,21 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(pFeatureData);
-      out->MeshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
-      out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+      // Wide outputs use captured replay to preserve all 128 scalars and clip/cull distances
+      // beyond the native mesh varying limit; the mesh suite covers both execution paths.
+      out->MeshShaderTier = D3D12_MESH_SHADER_TIER_1;
+      out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_1_0;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS6: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6))
+        return E_INVALIDARG;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6 *>(pFeatureData);
+      *out = {};
+      out->VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_2;
+      out->AdditionalShadingRatesSupported = TRUE;
+      out->ShadingRateImageTileSize = 8;
+      out->PerPrimitiveShadingRateSupportedWithViewportIndexing = TRUE;
       return S_OK;
     }
     case D3D12_FEATURE_SHADER_CACHE: {
@@ -865,6 +833,12 @@ public:
       out->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
       out->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
 
+      if (sampler_feedback::IsFeedbackFormat(out->Format)) {
+        // Opaque feedback maps: 2D, bound only through CreateSamplerFeedbackUnorderedAccessView.
+        out->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D;
+        out->Support2 = D3D12_FORMAT_SUPPORT2_SAMPLER_FEEDBACK;
+        return S_OK;
+      }
       MTL_DXGI_FORMAT_DESC format_desc;
       if (FAILED(MTLQueryDXGIFormat(metal, out->Format, format_desc)))
         return E_INVALIDARG;
@@ -1856,6 +1830,11 @@ public:
     /* No protected sessions are created by this device, so none can be passed in. */
     if (!pDesc || pSession || !GetMTLDevice().supportsPlacementSparse())
       return E_INVALIDARG;
+    /* Sampler feedback maps cannot be reserved resources (SamplerFeedback spec, resource properties). */
+    if (sampler_feedback::IsFeedbackFormat(pDesc->Format)) {
+      ERR("CreateReservedResource: a sampler feedback map cannot be a reserved resource");
+      return E_INVALIDARG;
+    }
     /*
      * Reserved resources live on no heap; they get the default heap's rules. Textures must use
      * 64KB_UNDEFINED_SWIZZLE, which the common validator does not know, so it sees UNKNOWN instead.
@@ -1992,10 +1971,9 @@ public:
       void **ppNewStateObject
   ) {
     InitReturnPtr(ppNewStateObject);
-    // State objects are compiled as whole pipelines; incremental additions are not supported
-    // (RaytracingTier is NOT_SUPPORTED, and 1.1 additions are the only producer of this call).
-    ERR("AddToStateObject: state object additions are not supported");
-    return E_NOTIMPL;
+    if (RemovedReason() != S_OK)
+      return DXGI_ERROR_DEVICE_REMOVED;
+    return dxmt::AddToStateObject(this, pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -2008,18 +1986,42 @@ public:
 
   /* ---- ID3D12Device8 ---- */
 
-  /* D3D12_RESOURCE_DESC1 without sampler feedback (not supported) is a D3D12_RESOURCE_DESC. */
+  /* D3D12_RESOURCE_DESC1 of a non-feedback resource (a zero mip region) is a D3D12_RESOURCE_DESC. */
   static HRESULT
   NarrowResourceDesc(const D3D12_RESOURCE_DESC1 *in, D3D12_RESOURCE_DESC &out) {
     if (!in)
       return E_INVALIDARG;
-    if (in->SamplerFeedbackMipRegion.Width || in->SamplerFeedbackMipRegion.Height ||
-        in->SamplerFeedbackMipRegion.Depth) {
-      ERR("CreateResource: sampler feedback mip regions are not supported");
+    if (sampler_feedback::IsFeedbackFormat(in->Format) || in->SamplerFeedbackMipRegion.Width ||
+        in->SamplerFeedbackMipRegion.Height || in->SamplerFeedbackMipRegion.Depth)
       return E_INVALIDARG;
-    }
     out = {in->Dimension, in->Alignment, in->Width,  in->Height,     in->DepthOrArraySize,
            in->MipLevels, in->Format,    in->SampleDesc, in->Layout, in->Flags};
+    return S_OK;
+  }
+
+  /*
+   * Validates the common creation contract of a sampler feedback map (MakeLayout validates the
+   * description): a GPU-only heap, no clear value, a state from the spec's permitted set.
+   */
+  static HRESULT
+  ValidateSamplerFeedbackMap(const D3D12_RESOURCE_DESC1 &desc, const D3D12_HEAP_PROPERTIES &heap,
+                             D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear,
+                             sampler_feedback::Layout &layout, D3D12_RESOURCE_DESC &narrowed) {
+    constexpr D3D12_RESOURCE_STATES permitted =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_RESOLVE_SOURCE |
+        D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_COPY_DEST;
+    if (!sampler_feedback::MakeLayout(desc, layout) || clear || IsCpuVisibleHeap(&heap) ||
+        (heap.Type != D3D12_HEAP_TYPE_DEFAULT && heap.Type != D3D12_HEAP_TYPE_CUSTOM) ||
+        (state & ~permitted) ||
+        ((state & (D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_RESOLVE_DEST |
+                   D3D12_RESOURCE_STATE_COPY_DEST)) &&
+         std::popcount(uint32_t(state)) != 1) ||
+        (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)) {
+      ERR("CreateResource: invalid sampler feedback map");
+      return E_INVALIDARG;
+    }
+    narrowed = {desc.Dimension, desc.Alignment, desc.Width,      desc.Height, desc.DepthOrArraySize,
+                desc.MipLevels, desc.Format,    desc.SampleDesc, desc.Layout, desc.Flags};
     return S_OK;
   }
 
@@ -2039,6 +2041,22 @@ public:
       ID3D12ProtectedResourceSession *pProtectedSession, REFIID riidResource, void **ppvResource
   ) {
     InitReturnPtr(ppvResource);
+    if (pDesc && sampler_feedback::IsFeedbackFormat(pDesc->Format)) {
+      if (RemovedReason() != S_OK)
+        return DXGI_ERROR_DEVICE_REMOVED;
+      if (pProtectedSession)
+        return E_NOTIMPL;
+      sampler_feedback::Layout layout;
+      D3D12_RESOURCE_DESC desc;
+      HRESULT hr = ValidateHeapProperties(pHeapProperties, HeapFlags, advertise_numa_);
+      if (FAILED(hr) || FAILED(hr = ValidateSamplerFeedbackMap(*pDesc, *pHeapProperties, InitialResourceState,
+                                                               pOptimizedClearValue, layout, desc)))
+        return hr;
+      if (HeapFlags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER))
+        return E_INVALIDARG;
+      return CreateSamplerFeedbackMap(this, *pHeapProperties, HeapFlags, desc, layout, nullptr, 0,
+                                      InitialResourceState, riidResource, ppvResource);
+    }
     D3D12_RESOURCE_DESC desc;
     if (HRESULT hr = NarrowResourceDesc(pDesc, desc); FAILED(hr))
       return hr;
@@ -2052,18 +2070,69 @@ public:
       const D3D12_CLEAR_VALUE *pOptimizedClearValue, REFIID riid, void **ppvResource
   ) {
     InitReturnPtr(ppvResource);
+    if (pDesc && sampler_feedback::IsFeedbackFormat(pDesc->Format)) {
+      if (RemovedReason() != S_OK)
+        return DXGI_ERROR_DEVICE_REMOVED;
+      auto *heap = pHeap ? dynamic_cast<MTLD3D12Heap *>(pHeap) : nullptr;
+      Com<ID3D12Device> heap_device;
+      if (!heap || FAILED(pHeap->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&heap_device))) ||
+          heap_device.ptr() != static_cast<ID3D12Device *>(this))
+        return E_INVALIDARG;
+      const auto heap_desc = heap->GetDesc();
+      sampler_feedback::Layout layout;
+      D3D12_RESOURCE_DESC desc;
+      if (HRESULT hr = ValidateSamplerFeedbackMap(*pDesc, heap_desc.Properties, InitialState, pOptimizedClearValue,
+                                                  layout, desc);
+          FAILED(hr))
+        return hr;
+      if (heap_desc.Flags & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)
+        return E_INVALIDARG;
+      D3D12_RESOURCE_ALLOCATION_INFO1 info{};
+      if (FAILED(SamplerFeedbackAllocationInfo(this, layout, info)) ||
+          !resource_contract::PlacementFits(HeapOffset, info.SizeInBytes, heap_desc.SizeInBytes, info.Alignment, 0))
+        return E_INVALIDARG;
+      return CreateSamplerFeedbackMap(this, heap_desc.Properties, heap_desc.Flags, desc, layout, heap, HeapOffset,
+                                      InitialState, riid, ppvResource);
+    }
     D3D12_RESOURCE_DESC desc;
     if (HRESULT hr = NarrowResourceDesc(pDesc, desc); FAILED(hr))
       return hr;
     return CreatePlacedResource(pHeap, HeapOffset, &desc, InitialState, pOptimizedClearValue, riid, ppvResource);
   }
 
+  /*
+   * The feedback UAV (d3d12_sampler_feedback.hpp): q0 = cell array, q1 = layout word. A null paired
+   * texture makes feedback writes no-ops (q0 = 0); a null feedback map is a null descriptor. The
+   * paired texture must be a single-sampled TEXTURE2D matching the map's size, mips and array size.
+   */
   void STDMETHODCALLTYPE
   CreateSamplerFeedbackUnorderedAccessView(
       ID3D12Resource *pTargetedResource, ID3D12Resource *pFeedbackResource, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor
   ) {
-    // SamplerFeedbackTier is NOT_SUPPORTED, so no feedback resource can exist; the descriptor is left untouched.
-    ERR("CreateSamplerFeedbackUnorderedAccessView: sampler feedback is not supported");
+    auto [heap, index] = GetShaderVisibleDescriptorHeap(this, DestDescriptor);
+    auto *map = static_cast<MTLD3D12Resource *>(pFeedbackResource);
+    if (!map) {
+      heap->AddUnorderedAccessView(index, static_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC *>(nullptr));
+      return;
+    }
+    if (!map->feedback || !map->buffer) {
+      ERR("CreateSamplerFeedbackUnorderedAccessView: not a sampler feedback map");
+      return;
+    }
+    const auto &layout = *map->feedback;
+    if (pTargetedResource) {
+      const auto paired = pTargetedResource->GetDesc();
+      const UINT paired_mips = paired.MipLevels
+          ? paired.MipLevels : UINT(std::bit_width(std::max<uint64_t>(paired.Width, paired.Height)));
+      if (paired.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || paired.SampleDesc.Count != 1 ||
+          paired.Width != layout.width || paired.Height != layout.height || paired_mips != layout.mips ||
+          paired.DepthOrArraySize != layout.slices) {
+        ERR("CreateSamplerFeedbackUnorderedAccessView: the paired texture does not match the feedback map");
+        return;
+      }
+    }
+    heap->AddSamplerFeedbackView(index, map->buffer.ptr(), layout.totalCells() * 4, pTargetedResource != nullptr,
+                                 layout.word());
   }
 
   void STDMETHODCALLTYPE
@@ -2168,9 +2237,7 @@ public:
       return E_INVALIDARG;
     if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && layout != D3D12_BARRIER_LAYOUT_COMMON)
       return E_INVALIDARG;
-    // Shading rate images need VariableShadingRateTier 2, which is not reported.
-    if (layout == D3D12_BARRIER_LAYOUT_SHADING_RATE_SOURCE)
-      return E_INVALIDARG;
+
     legacy_state = enhanced_barrier::LegacyStateFromLayout(layout);
     return ValidateResourceStates(legacy_state, &heap, &desc);
   }
@@ -2336,32 +2403,16 @@ public:
     InitReturnPtr(ppvRootSignature);
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    const void *data = nullptr;
-    SIZE_T data_size = 0;
-    if (HRESULT hr = FindLibraryRootSignature(pLibraryBlob, blobLengthInBytes, subobjectName, data, data_size);
+    std::vector<uint8_t> payload;
+    if (HRESULT hr = FindLibraryRootSignature(pLibraryBlob, blobLengthInBytes, subobjectName, payload);
         FAILED(hr)) {
       ERR("CreateRootSignatureFromSubobjectInLibrary: no matching root signature subobject");
       return hr;
     }
-    // RDAT stores the bare RTS0 payload; CreateRootSignature takes a container, so wrap it in a
-    // one-part DXBC container (header, one part offset, part header). The hash is not validated.
+    // RDAT stores the bare RTS0 payload; CreateRootSignature takes a container.
     std::vector<uint8_t> container;
-    try {
-      container.resize(sizeof(microsoft::DXBCHeader) + 4 + sizeof(microsoft::DXBCBlobHeader) + data_size);
-    } catch (const std::bad_alloc &) {
-      return E_OUTOFMEMORY;
-    }
-    microsoft::DXBCHeader header{};
-    header.DXBCHeaderFourCC = microsoft::DXBC_FOURCC_NAME;
-    header.Version = {DXBC_MAJOR_VERSION, DXBC_MINOR_VERSION};
-    header.ContainerSizeInBytes = UINT32(container.size());
-    header.BlobCount = 1;
-    const UINT32 part_offset = sizeof(header) + 4;
-    const microsoft::DXBCBlobHeader part{microsoft::DXBC_RootSignature, UINT32(data_size)};
-    std::memcpy(container.data(), &header, sizeof(header));
-    std::memcpy(container.data() + sizeof(header), &part_offset, 4);
-    std::memcpy(container.data() + part_offset, &part, sizeof(part));
-    std::memcpy(container.data() + part_offset + sizeof(part), data, data_size);
+    if (HRESULT hr = WrapRootSignaturePayload(payload.data(), payload.size(), container); FAILED(hr))
+      return hr;
     return dxmt::CreateRootSignature(this, nodeMask, container.data(), container.size(), riid, ppvRootSignature);
   }
 
@@ -2386,7 +2437,12 @@ public:
     } catch (const std::bad_alloc &) {
       return invalid();
     }
+    bool any_feedback = false;
     for (UINT i = 0; i < NumResourceDescs; ++i) {
+      if (sampler_feedback::IsFeedbackFormat(pResourceDescs[i].Format)) {
+        any_feedback = true;
+        continue;
+      }
       if (FAILED(NarrowResourceDesc(&pResourceDescs[i], descs[i])))
         return invalid();
       const UINT32 count = pNumCastableFormats ? pNumCastableFormats[i] : 0;
@@ -2394,7 +2450,42 @@ public:
         return invalid();
     }
     // Castable formats only widen view usage; Metal texture sizes already include PixelFormatView.
-    return GetResourceAllocationInfo1(__ret, VisibleMask, NumResourceDescs, descs.data(), pResourceAllocationInfo1);
+    if (!any_feedback)
+      return GetResourceAllocationInfo1(__ret, VisibleMask, NumResourceDescs, descs.data(), pResourceAllocationInfo1);
+    // Sampler feedback maps are buffers of cells; lay every description out one after another.
+    if (VisibleMask > 1)
+      return invalid();
+    __ret->SizeInBytes = 0;
+    __ret->Alignment = 1;
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    for (UINT i = 0; i < NumResourceDescs; ++i) {
+      D3D12_RESOURCE_ALLOCATION_INFO1 info{};
+      if (sampler_feedback::IsFeedbackFormat(pResourceDescs[i].Format)) {
+        sampler_feedback::Layout layout;
+        D3D12_RESOURCE_DESC unused;
+        if ((pNumCastableFormats && pNumCastableFormats[i]) ||
+            FAILED(ValidateSamplerFeedbackMap(pResourceDescs[i], default_heap, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                              layout, unused)) ||
+            FAILED(SamplerFeedbackAllocationInfo(this, layout, info)))
+          return invalid();
+      } else {
+        D3D12_RESOURCE_ALLOCATION_INFO single;
+        GetResourceAllocationInfo1(&single, VisibleMask, 1, &descs[i], &info);
+        if (single.SizeInBytes == UINT64_MAX)
+          return invalid();
+        info.SizeInBytes = single.SizeInBytes;
+        info.Alignment = single.Alignment;
+      }
+      if (!resource_contract::CheckedAlign(__ret->SizeInBytes, info.Alignment, info.Offset) ||
+          !resource_contract::CheckedAdd(info.Offset, info.SizeInBytes, __ret->SizeInBytes))
+        return invalid();
+      __ret->Alignment = std::max(__ret->Alignment, info.Alignment);
+      if (pResourceAllocationInfo1)
+        pResourceAllocationInfo1[i] = info;
+    }
+    if (!resource_contract::CheckedAlign(__ret->SizeInBytes, __ret->Alignment, __ret->SizeInBytes))
+      return invalid();
+    return __ret;
   }
 
   WMT::ResidencySet
@@ -2592,6 +2683,15 @@ public:
   UnregisterRTASResidency(RTASState &state) {
     if (!state.sidecar)
       return;
+    // In-place refits publish a new version of the same native object. Sweeping the
+    // previous version must not make the current one nonresident.
+    bool stillReferenced = false;
+    rtas_.ForEachKey([&](const raytracing::ArenaKey &key) {
+      const auto *current = rtas_.FindRecorded(key);
+      stillReferenced |= current && current->sidecar == state.sidecar;
+    });
+    if (stillReferenced)
+      return;
     WMT::Allocation structure = state.sidecar.accelerationStructure();
     if (structure)
       residency_set_.removeAllocations(&structure, 1);
@@ -2601,6 +2701,11 @@ public:
     WMT::Allocation contributions = state.sidecar.contributionBuffer();
     if (contributions)
       residency_set_.removeAllocations(&contributions, 1);
+    const auto generations = state.sidecar.generations();
+    for (uint64_t i = 0; i < generations.count(); ++i) {
+      auto allocation = generations.object(i);
+      residency_set_.removeAllocations(&allocation, 1);
+    }
   }
 
   HRESULT
@@ -2788,6 +2893,16 @@ public:
   }
 
   /** Add one version's native structure and translation buffers to the residency set. */
+  bool AllocateRTAS(WMT::AccelerationStructureSidecar sidecar, uint64_t size, uint64_t count) final {
+    std::lock_guard<dxmt::mutex> lock(residency_lock_);
+    if (!sidecar.allocate(GetMTLDevice(), size, count))
+      return false;
+    AddRTASResidency({sidecar, size, uint32_t(count), {}});
+    residency_set_.commit();
+    return true;
+  }
+
+  /** Add one version's native structure and translation buffers to the residency set. */
   void
   AddRTASResidency(const RTASState &state) {
     if (!state.sidecar)
@@ -2873,22 +2988,23 @@ public:
       auto library = command_library.getLibrary();
       WMT::Reference<WMT::Error> error;
       auto prepass_function = library.newFunction("dxmt_as_prepass");
-      auto write_function = library.newFunction("dxmt_as_write_u64");
-      auto finalize_function = library.newFunction("dxmt_as_finalize_compacted_size");
       auto prepass = GetMTLDevice().newComputePipelineState(prepass_function, error);
       if (error || !prepass)
         return E_FAIL;
-      error = {};
-      auto write_u64 = GetMTLDevice().newComputePipelineState(write_function, error);
-      if (error || !write_u64)
-        return E_FAIL;
-      error = {};
-      auto finalize = GetMTLDevice().newComputePipelineState(finalize_function, error);
-      if (error || !finalize)
-        return E_FAIL;
       rtas_pipelines_.prepass = std::move(prepass);
-      rtas_pipelines_.writeU64 = std::move(write_u64);
-      rtas_pipelines_.finalizeCompactedSize = std::move(finalize);
+      const char *names[] = {"dxmt_as_shadow", "dxmt_as_postbuild", "dxmt_as_serialize",
+          "dxmt_as_deserialize", "dxmt_as_visualize", "dxmt_as_visualize_descriptors"};
+      WMT::Reference<WMT::ComputePipelineState> *states[] = {&rtas_pipelines_.shadow, &rtas_pipelines_.postbuild,
+          &rtas_pipelines_.serialize, &rtas_pipelines_.deserialize, &rtas_pipelines_.visualize,
+          &rtas_pipelines_.visualizeDescriptors};
+      for (uint32_t i = 0; i < 6; ++i) {
+        error = {};
+        *states[i] = GetMTLDevice().newComputePipelineState(library.newFunction(names[i]), error);
+        if (error || !*states[i]) {
+          rtas_pipelines_ = {};
+          return E_FAIL;
+        }
+      }
     }
     pipelines = rtas_pipelines_;
     return S_OK;
@@ -2953,22 +3069,24 @@ public:
     if (!desc)
       return;
     raytracing::BuildInputs inputs;
-    if (FAILED(raytracing::ConvertBuildInputs(*desc, ResolveRTASGPUVA, this, inputs)))
+    if (FAILED(raytracing::ConvertBuildInputs(*desc, nullptr, nullptr, inputs)))
       return;
     raytracing::NativeSizes native;
     if (FAILED(QueryRTASSizes(inputs, native)))
       return;
-    if (!raytracing::CalculatePrebuildInfo(native, &info->ResultDataMaxSizeInBytes,
+    raytracing::ShadowPlan plan;
+    if (!raytracing::PlanShadow(inputs, plan))
+      return;
+    if (!raytracing::CalculatePrebuildInfo(native, plan.size, &info->ResultDataMaxSizeInBytes,
             &info->ScratchDataSizeInBytes, &info->UpdateScratchDataSizeInBytes))
       *info = {};
   }
 
   D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE
   CheckDriverMatchingIdentifier(
-      D3D12_SERIALIZED_DATA_TYPE, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER *identifier
+      D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER *identifier
   ) final {
-    return identifier ? D3D12_DRIVER_MATCHING_IDENTIFIER_INCOMPATIBLE_VERSION
-                      : D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+    return raytracing::CheckDriverMatchingIdentifier(GetMTLDevice().registryID(), type, identifier);
   }
 };
 

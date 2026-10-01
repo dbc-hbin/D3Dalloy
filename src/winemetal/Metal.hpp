@@ -331,11 +331,13 @@ public:
   setTriangles(
       uint32_t index, Buffer vertices, uint64_t vertex_offset, uint64_t vertex_stride, Buffer indices,
       uint64_t index_offset, uint32_t index_type, Buffer transform, uint64_t transform_offset,
-      uint64_t triangle_count, uint32_t intersection_function_table_offset, uint32_t geometry_flags
+      uint64_t triangle_count, uint32_t intersection_function_table_offset, uint32_t geometry_flags,
+      WMTAttributeFormat vertex_format
   ) {
     return WMTASDescriptor_setTriangles(
         handle, index, vertices, vertex_offset, vertex_stride, indices, index_offset, index_type,
-        transform, transform_offset, triangle_count, intersection_function_table_offset, geometry_flags
+        transform, transform_offset, triangle_count, intersection_function_table_offset, geometry_flags,
+        vertex_format
     );
   }
 
@@ -358,6 +360,11 @@ public:
 
 class AccelerationStructureSidecar : public Object {
 public:
+  bool allocate(obj_handle_t device, uint64_t size, uint64_t count) {
+    return WMTASSidecar_allocate(handle, device, size, count);
+  }
+  uint64_t instanceCount() const { return WMTASSidecar_instanceCount(handle); }
+  Array<Allocation> generations() const { return Array<Allocation>{WMTASSidecar_generations(handle)}; }
   /**
    * The MTLAccelerationStructure this sidecar owns, as an allocation so callers can
    * register it in a residency set: Metal acceleration structures are resources but
@@ -769,15 +776,7 @@ public:
     );
   }
 
-  bool
-  encodeASWriteU64(ComputePipelineState pipeline, Buffer destination, uint64_t offset, uint64_t value) {
-    return WMTComputeEncoder_encodeASWriteU64(handle, pipeline, destination, offset, value);
-  }
 
-  bool
-  encodeASFinalizeCompactedSize(ComputePipelineState pipeline, Buffer destination, uint64_t offset) {
-    return WMTComputeEncoder_encodeASFinalizeCompactedSize(handle, pipeline, destination, offset);
-  }
 };
 
 class AccelerationStructureCommandEncoder : public CommandEncoder {
@@ -1223,7 +1222,7 @@ public:
 
   Reference<AccelerationStructureDescriptor>
   newAccelerationStructureDescriptor(bool top_level, uint32_t geometry_count) {
-    return Reference<AccelerationStructureDescriptor>(WMTASDescriptor_new(top_level, geometry_count));
+    return Reference<AccelerationStructureDescriptor>(WMTASDescriptor_new(handle, top_level, geometry_count));
   }
 
   WMTAccelerationStructureSizes
@@ -1520,6 +1519,13 @@ InitializeRenderPassInfo(WMTRenderPassInfo &info) {
   info.depth.clear_depth = 1.0f;
 };
 
+/* renderTargetArrayLength is 11 bits (D3D12: up to 2048 slices), split over two bytes of WMTRenderPassInfo. */
+inline void
+SetRenderTargetArrayLength(WMTRenderPassInfo &info, uint32_t length) {
+  info.render_target_array_length = uint8_t(length);
+  info.render_target_array_length_high = uint8_t(length >> 8);
+}
+
 inline void
 InitializeRenderPipelineInfo(WMTRenderPipelineInfo &info) {
   for (unsigned i = 0; i < 8; i++) {
@@ -1556,6 +1562,7 @@ InitializeRenderPipelineInfo(WMTRenderPipelineInfo &info) {
   info.num_binary_archives_for_lookup = 0;
   info.fail_on_binary_archive_miss = false;
   info.support_indirect_command_buffers = false;
+  info.max_vertex_amplification_count = 0;
 }
 
 inline void
@@ -1606,6 +1613,7 @@ InitializeMeshRenderPipelineInfo(WMTMeshRenderPipelineInfo &info) {
   info.num_binary_archives_for_lookup = 0;
   info.fail_on_binary_archive_miss = false;
   info.support_indirect_command_buffers = false;
+  info.max_vertex_amplification_count = 0;
 }
 
 inline void

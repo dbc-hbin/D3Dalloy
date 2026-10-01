@@ -133,6 +133,12 @@ struct SM50_RT_PIPELINE_DESC {
   uint32_t Flags; /* SM50_RT_PIPELINE_FLAG */
   /** SM50_SHADER_METAL_VERSION, from SM50_SHADER_COMMON_DATA. */
   uint32_t MetalVersion;
+  /** Public library namespace, including ordinary functions; shared with work-graph linking. */
+  const struct SM50_WG_EXPORT *LinkExports;
+  uint32_t LinkExportCount;
+  /** Caller-owned name storage, retained while consuming function reflection (also WoW64-safe). */
+  char *FunctionNames;
+  uint64_t FunctionNamesSize;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -154,15 +160,6 @@ enum SM50_RT_BINDING_INDEX : uint32_t {
   SM50_RT_BINDING_INDEX_DISPATCH = 20,
   /** intersection_function_table<triangle_data, instancing>. */
   SM50_RT_BINDING_INDEX_INTERSECTION_FUNCTION_TABLE = 21,
-  /**
-   * Base of the per-record translated local root argument tables (see
-   * SM50_RT_DISPATCH_ARGUMENTS::RayGenerationLocalRootTable). Bound as a constant
-   * address space buffer, exactly like SM50_BINDING_INDEX_ROOT_ARGUMENTS: a
-   * record's entry is selected from it with the record's own position and the
-   * table's stride, and is read through the same qword root argument layout the
-   * global root arguments use.
-   */
-  SM50_RT_BINDING_INDEX_LOCAL_ROOT_TABLE = 22,
   /**
    * MTLVisibleFunctionTable holding every lowered RT shader. Bound with
    * MTLComputeCommandEncoder setVisibleFunctionTable:atBufferIndex: at index 23.
@@ -202,34 +199,19 @@ struct SM50_RT_DISPATCH_ARGUMENTS {
   /** +0x18 CallableShaderTable.StartAddress. */
   uint64_t CallableRecordBase;
   /**
-   * +0x20 Array of `uint32_t` export indices, one per SBT record, laid out
-   * raygen, miss, hit group, callable in that order with the matching strides
-   * below. The runtime builds it from the identifiers it handed out, which is what
-   * turns D3D12's opaque 32 byte identifier back into a compile-time function
-   * index. Element size is always 4 bytes, so the array is contiguous at
-   * `HitGroupRecordIndexBase + record_index` etc.
+   * +0x20 D3D12_RAYTRACING_SHADER_TABLE strides (0 = every index reads the first
+   * record) and record counts (SizeInBytes / stride, 1 for stride 0, 0 when the
+   * table is absent). The traversal resolves a record straight out of the
+   * application's table: its identifier names the export and the bytes after it
+   * are the export's local root arguments, read in place.
    */
-  uint64_t RayGenerationIndexBase;
-  uint64_t MissRecordIndexBase;
-  uint64_t HitGroupRecordIndexBase;
-  uint64_t CallableRecordIndexBase;
-  /** +0x40 Local root argument table for the raygen record (see below). */
-  uint64_t RayGenerationLocalRootTable;
-  uint64_t MissRecordLocalRootTableBase;
-  uint64_t HitGroupRecordLocalRootTableBase;
-  uint64_t CallableRecordLocalRootTableBase;
-  /** +0x60 D3D12_RAYTRACING_SHADER_TABLE strides, all 4 byte multiples. */
-  uint32_t RayGenerationLocalRootTableSize;
   uint32_t MissRecordStride;
   uint32_t MissRecordCount;
   uint32_t HitGroupRecordStride;
   uint32_t HitGroupRecordCount;
   uint32_t CallableRecordStride;
   uint32_t CallableRecordCount;
-  uint32_t MissRecordLocalRootTableStride;
-  uint32_t HitGroupRecordLocalRootTableStride;
-  uint32_t CallableRecordLocalRootTableStride;
-  /** +0x88 SM50_RT_EXPORT count, for bounds checks in CallShader. */
+  /** +0x38 SM50_RT_EXPORT count of the dispatching state object, for record bounds checks. */
   uint32_t ExportCount;
   /** Max recursion depth from the pipeline description. */
   uint32_t RecursionDepth;
@@ -247,14 +229,17 @@ struct SM50_RT_DISPATCH_ARGUMENTS {
    * A shader that receives this block as a bound argument (the ray generation
    * shader, the intersection shader, the shared candidate callback) does not need
    * it, but a visible function does: it has no bound arguments at all, and the
-   * record index tables, the local root entry bases and the recursion limit all
-   * live here, so the address is what lets the shader that issues a trace hand its
+   * shader table bases and the recursion limit live here, so the address is what
+   * lets the shader that issues a trace hand its
    * callee the constants to resolve that callee's own record - and what a nested
    * trace reads the tables through. 0 when nothing filled it.
    */
   uint64_t DispatchArgumentsAddress;
-  /** Value of D3D12_RAYTRACING_INSTANCE_DESC flags that matter for opacity culling. */
-  uint32_t Reserve;
+  /**
+   * OwnedShaderIdentifier::pipeline_token of the state object being dispatched. A record
+   * whose identifier carries another token names no export of this dispatch.
+   */
+  uint32_t PipelineToken;
 };
 
 /**
@@ -270,8 +255,8 @@ struct SM50_RT_DISPATCH_ARGUMENTS {
  * selected by the party that picks the record, and only that party knows which
  * record it picked - a visible function receives its *export* index (which is also
  * its visible function table slot), never the record's position inside its shader
- * table, so the entry the runtime materialized for that record is computed by the
- * caller and handed over as SM50_RT_FRAME::LocalRootEntry. And a visible function
+ * table, so the record's local root arguments are resolved by the caller and
+ * handed over as SM50_RT_FRAME::LocalRootEntry. And a visible function
  * is reached through the visible function table with a fixed argument list - the
  * payload, the hit state, the record and the depth (see EmitVisibleFunctionCall) -
  * so a miss / closest-hit / any-hit / callable export cannot also be handed the
@@ -281,7 +266,7 @@ struct SM50_RT_DISPATCH_ARGUMENTS {
  *
  * Every pointer field is a D3D12 GPU virtual address, read back with an ordinary
  * device load (the same convention dxil_rt_operations.cpp uses for the structure
- * header and the record index tables). They are 0 when nothing published them,
+ * header and the shader records). They are 0 when nothing published them,
  * which every reader treats as "not bound", never as "use the global root
  * arguments" or any other substitute.
  */
@@ -294,21 +279,21 @@ struct SM50_RT_FRAME {
   uint32_t Depth;
   uint32_t Flags;
   /**
-   * The local root entry the runtime materialized for the record this invocation
-   * runs as, i.e. the base of its translated local root arguments - what a D3D12
+   * The local root arguments of the record this invocation runs as: the address of
+   * the bytes right after the record's 32 byte identifier in the application's own
+   * shader table, read in place in the D3D12 local root layout - what a D3D12
    * shader reads as its local root signature's arguments.
    *
-   * The caller computes it as
-   *   table base + record position * table stride
+   * The caller resolves it (EmitShaderRecordLookup) as
+   *   table base + record position * table stride + 32
    * out of the four per-table bases and strides of SM50_RT_DISPATCH_ARGUMENTS: the
    * record position is the miss index for a miss shader, the callable index for a
    * callable, the hit group index
    * (`InstanceContributionToHitGroupIndex + RayContributionToHitGroupIndex +
    * GeometryIndex * MultiplierForGeometryContributionToHitGroupIndex`) for a hit
    * group, and 0 for the ray generation shader, which is the single record of its
-   * own table. 0 means "no local root arguments", which is what a shader whose
-   * local root signature the runtime has not translated reads - never the global
-   * root arguments.
+   * own table. 0 means "no record", which is what an out of range or foreign
+   * record resolves to - never the global root arguments.
    */
   uint64_t LocalRootEntry;
   /**
@@ -402,11 +387,22 @@ struct SM50_RT_HIT_STATE {
   /** BuiltInTriangleIntersectionAttributes barycentrics and the front-face flag. */
   float Barycentrics[2];
   uint32_t FrontFace;
+  /**
+   * ObjectToWorld3x4 / WorldToObject3x4 of the instance being hit, column-major (four
+   * columns of three floats, column 3 the translation) exactly as the world_space_data
+   * traversal and intersection functions report them. Element [r][c] of the D3D12 3x4 matrix
+   * is ObjectToWorld[c * 3 + r].
+   */
+  float ObjectToWorld[12];
+  float WorldToObject[12];
+  /** ObjectRayOrigin / ObjectRayDirection: the ray in the hit instance's object space. */
+  float ObjectRayOrigin[3];
+  float ObjectRayDirection[3];
 };
 
 #ifdef __cplusplus
 static_assert(
-  sizeof(SM50_RT_HIT_STATE) == 76, "SM50_RT_HIT_STATE layout is part of the shader ABI"
+  sizeof(SM50_RT_HIT_STATE) == 196, "SM50_RT_HIT_STATE layout is part of the shader ABI"
 );
 #endif
 
@@ -442,11 +438,11 @@ struct SM50_RT_FUNCTION_INFO {
    */
   uint32_t ExportIndex;
   /**
-   * Intersection function table slot this function must be installed at, or
-   * SM50_RT_INDEX_NONE (never installed).
+   * DISPATCH: intersection table slot (0 triangle, 1 bounding box).
+   * VISIBLE: explicit visible table slot for a kernel-side intersection export,
+   * or SM50_RT_INDEX_NONE for its usual ExportIndex + 1 slot.
    *
-   * Only DISPATCH records have slots: 0 for triangles, 1 for bounding boxes.
-   * Original INTERSECTION exports are internal and never installed separately.
+   * Native INTERSECTION bodies remain internal to their hardware dispatcher.
    */
   uint32_t TableIndex;
   /** Set on the single raygen; the compute function the runtime must select. */

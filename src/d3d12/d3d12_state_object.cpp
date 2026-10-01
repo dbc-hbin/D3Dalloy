@@ -17,6 +17,7 @@
  */
 
 #include "d3d12_state_object.hpp"
+#include "d3d12_work_graph.hpp"
 
 #include "DXBCParser/DXBCUtils.h"
 #include "airconv_public.h"
@@ -25,6 +26,7 @@
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "d3d12_device_child.hpp"
+#include "d3d12_dxil_subobjects.hpp"
 #include "d3d12_pipeline.hpp"
 #include "dxil_raytracing.h"
 #include "log/log.hpp"
@@ -55,11 +57,6 @@ struct Library {
   std::vector<LibraryExport> exports;
 };
 
-struct Association {
-  UINT subobject_index = 0;
-  std::vector<std::wstring> exports;
-};
-
 bool CopyName(const WCHAR *name, std::wstring &out) {
   if (!name || !*name)
     return false;
@@ -78,6 +75,152 @@ bool WideToUtf8(const std::wstring &wide, std::string &out) {
              CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), wide.size(), out.data(), size, nullptr, nullptr
          ) == size;
 }
+
+bool CopyUtf8Name(const char *name, std::wstring &out) {
+  const int bytes = static_cast<int>(std::strlen(name));
+  const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, bytes, nullptr, 0);
+  if (!length)
+    return false;
+  out.resize(length);
+  return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, bytes, out.data(), length) == length;
+}
+
+std::string Utf8Name(const std::wstring &name) {
+  std::string utf8;
+  WideToUtf8(name, utf8);
+  return utf8;
+}
+
+/** The kinds of subobject a subobject-to-exports association attaches to an export. */
+enum class AssociableKind : uint8_t { LocalRoot, GlobalRoot, ShaderConfig, PipelineConfig };
+constexpr AssociableKind kAssociableKinds[] = {
+    AssociableKind::LocalRoot, AssociableKind::GlobalRoot, AssociableKind::ShaderConfig,
+    AssociableKind::PipelineConfig,
+};
+
+const char *AssociableName(AssociableKind kind) {
+  switch (kind) {
+  case AssociableKind::LocalRoot:
+    return "local root signature";
+  case AssociableKind::GlobalRoot:
+    return "global root signature";
+  case AssociableKind::ShaderConfig:
+    return "raytracing shader config";
+  case AssociableKind::PipelineConfig:
+    return "raytracing pipeline config";
+  }
+  return "subobject";
+}
+
+
+/**
+ * One associable subobject of a description: declared directly in it (scope 0) or in its DXIL
+ * library k (scope k + 1, k an index into the state object's library list).
+ */
+struct Associable {
+  AssociableKind kind = AssociableKind::LocalRoot;
+  uint32_t scope = 0;
+  MTLD3D12RootSignature *root = nullptr;
+  D3D12_RAYTRACING_SHADER_CONFIG shader_config{};
+  D3D12_RAYTRACING_PIPELINE_CONFIG1 pipeline_config{};
+  /**
+   * Some association with a nonempty export list, declared in this subobject's own scope,
+   * names it. Without one the subobject is a default association of its scope.
+   */
+  bool explicitly_associated_in_scope = false;
+};
+
+/** A subobject-to-exports association, resolved once every subobject has been read. */
+struct PendingAssociation {
+  /** 0: the description's own scope; k + 1: DXIL library k. */
+  uint32_t scope = 0;
+  /** The API subobject it points at, or UINT_MAX when it names a DXIL subobject. */
+  UINT subobject_index = UINT_MAX;
+  std::wstring subobject_name;
+  /** The Associable it resolves to; SIZE_MAX for a subobject that applies globally. */
+  size_t target = SIZE_MAX;
+  /** Empty: a default association of `scope`. */
+  std::vector<std::wstring> exports;
+};
+
+/** Two root signatures define the same signature: the same object, or byte-identical blobs. */
+bool SameRootSignature(MTLD3D12RootSignature *a, MTLD3D12RootSignature *b) {
+  if (a == b)
+    return true;
+  if (!a || !b)
+    return false;
+  const void *blob_a = nullptr, *blob_b = nullptr;
+  const UINT size_a = a->GetBlob(&blob_a), size_b = b->GetBlob(&blob_b);
+  return size_a == size_b && blob_a && blob_b && std::memcmp(blob_a, blob_b, size_a) == 0;
+}
+
+bool SameAssociable(const Associable &a, const Associable &b) {
+  if (a.kind != b.kind)
+    return false;
+  switch (a.kind) {
+  case AssociableKind::LocalRoot:
+  case AssociableKind::GlobalRoot:
+    return SameRootSignature(a.root, b.root);
+  case AssociableKind::ShaderConfig:
+    return a.shader_config.MaxPayloadSizeInBytes == b.shader_config.MaxPayloadSizeInBytes &&
+           a.shader_config.MaxAttributeSizeInBytes == b.shader_config.MaxAttributeSizeInBytes;
+  case AssociableKind::PipelineConfig:
+    return a.pipeline_config.MaxTraceRecursionDepth == b.pipeline_config.MaxTraceRecursionDepth &&
+           a.pipeline_config.Flags == b.pipeline_config.Flags;
+  }
+  return false;
+}
+
+bool ExportHasAssociable(const MTLD3D12StateObject::Export &entry, AssociableKind kind) {
+  switch (kind) {
+  case AssociableKind::LocalRoot:
+    return entry.local_root_signature;
+  case AssociableKind::GlobalRoot:
+    return entry.global_root_signature;
+  case AssociableKind::ShaderConfig:
+    return entry.has_shader_config;
+  case AssociableKind::PipelineConfig:
+    return entry.has_pipeline_config;
+  }
+  return false;
+}
+
+/** The association an export already carries, as an Associable, for comparison. */
+Associable AssociableOf(const MTLD3D12StateObject::Export &entry, AssociableKind kind) {
+  Associable value;
+  value.kind = kind;
+  value.root = kind == AssociableKind::LocalRoot ? entry.local_root_signature : entry.global_root_signature;
+  value.shader_config = entry.shader_config;
+  value.pipeline_config = entry.pipeline_config;
+  return value;
+}
+
+void ApplyAssociable(MTLD3D12StateObject::Export &entry, const Associable &value) {
+  switch (value.kind) {
+  case AssociableKind::LocalRoot:
+    entry.local_root_signature = value.root;
+    break;
+  case AssociableKind::GlobalRoot:
+    entry.global_root_signature = value.root;
+    break;
+  case AssociableKind::ShaderConfig:
+    entry.shader_config = value.shader_config;
+    entry.has_shader_config = true;
+    break;
+  case AssociableKind::PipelineConfig:
+    entry.pipeline_config = value.pipeline_config;
+    entry.has_pipeline_config = true;
+    break;
+  }
+}
+
+/** A pipeline config's recursion depth (0..31, 0 forbids TraceRay) and flags are in range. */
+bool ValidPipelineConfig(const D3D12_RAYTRACING_PIPELINE_CONFIG1 &config) {
+  return config.MaxTraceRecursionDepth <= D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH &&
+         !(config.Flags & ~(D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES |
+                            D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES));
+}
+
 
 std::string DescribeCompilerError(sm50_error_t error) {
   if (!error)
@@ -112,61 +255,6 @@ HRESULT RejectStateObject(const char *reason) {
   return E_INVALIDARG;
 }
 
-/**
- * Append the static samplers of one root signature to the dispatch's static sampler
- * table, keeping the table's own order.
- *
- * Static samplers are pipeline state, not root arguments: the runtime binds one table
- * for the whole dispatch, and every root signature a dispatch can use has to define a
- * static sampler of a given register identically - that is what lets one slot serve all
- * of them (and what makes the union fit D3D12's static sampler budget). A register the
- * table already holds with a different definition is therefore rejected rather than one
- * of the two winning by precedence.
- *
- * The definitions are copied out of the blob they were read from, so the table does not
- * depend on the deserializer that produced them.
- *
- * `appended` is the number of definitions the signature added that the table did not
- * already hold, which is what tells the caller whether a signature defines anything of
- * its own.
- */
-HRESULT AppendStaticSamplers(
-    MTLD3D12RootSignature *root, std::vector<D3D12_STATIC_SAMPLER_DESC> &table, UINT *appended
-) {
-  *appended = 0;
-  if (!root)
-    return S_OK;
-  const void *blob = nullptr;
-  const UINT blob_size = root->GetBlob(&blob);
-  const void *raw = nullptr;
-  UINT raw_size = 0;
-  if (!blob_size || !blob || FAILED(microsoft::DXBCGetRootSignature(blob, &raw, &raw_size)))
-    return RejectStateObject("a root signature has no readable static sampler table");
-  RootSignatureDeserializer deserializer;
-  if (FAILED(deserializer.Deserialize(raw, raw_size)))
-    return RejectStateObject("a root signature does not deserialize");
-  const auto &desc = deserializer.desc_1_1_.Desc_1_1;
-  for (UINT i = 0; i < desc.NumStaticSamplers; i++) {
-    const auto &state = desc.pStaticSamplers[i];
-    bool known = false;
-    for (const auto &existing : table) {
-      if (existing.RegisterSpace != state.RegisterSpace || existing.ShaderRegister != state.ShaderRegister)
-        continue;
-      if (std::memcmp(&existing, &state, sizeof(state)) != 0)
-        return RejectStateObject(
-            "a local root signature defines a static sampler of a register the pipeline "
-            "already defines differently"
-        );
-      known = true;
-      break;
-    }
-    if (known)
-      continue;
-    table.push_back(state);
-    (*appended)++;
-  }
-  return S_OK;
-}
 
 /**
  * Enumerate the exports of a DXIL library.
@@ -287,7 +375,7 @@ HRESULT EnumerateLibraryExports(const D3D12_SHADER_BYTECODE &bytecode, std::vect
 size_t FindExportIndexByName(
     const std::vector<MTLD3D12StateObject::Export> &exports, const std::wstring &name) {
   for (size_t i = 0; i < exports.size(); ++i) {
-    if (exports[i].name == name)
+    if (!exports[i].hidden && exports[i].name == name)
       return i;
   }
   /*
@@ -297,7 +385,8 @@ size_t FindExportIndexByName(
    * the shader it was built from.
    */
   for (size_t i = 0; i < exports.size(); ++i) {
-    if (!exports[i].hit_group && !exports[i].entry_point.empty() && exports[i].entry_point == name)
+    if (!exports[i].hit_group && !exports[i].hidden && !exports[i].entry_point.empty() &&
+        exports[i].entry_point == name)
       return i;
   }
   return exports.size();
@@ -353,7 +442,6 @@ class MTLD3D12StateObjectImpl final
   WMT::Reference<WMT::ComputePipelineState> pipeline_state_;
   WMT::Reference<WMT::IntersectionFunctionTable> intersection_table_;
   WMT::Reference<WMT::VisibleFunctionTable> visible_function_table_;
-  WMT::Reference<WMT::ComputePipelineState> shader_table_prepare_pipeline_;
   /**
    * What the state object's intersection function table is built from, kept so a
    * dispatch can build its own table with the same functions but its own dispatch
@@ -363,16 +451,58 @@ class MTLD3D12StateObjectImpl final
   uint32_t intersection_callback_slots_ = 0;
   std::vector<std::pair<uint32_t, WMT::Reference<WMT::FunctionHandle>>> intersection_function_handles_;
 
-  std::vector<raytracing::LocalRootLayout> local_root_layouts_;
-  std::vector<raytracing::LocalRootCopy> local_root_copies_;
-  uint32_t local_root_entry_stride_ = 0;
+  /** D3D12_STATE_OBJECT_CONFIG flags of this state object's own description. */
+  D3D12_STATE_OBJECT_FLAGS state_flags_ = D3D12_STATE_OBJECT_FLAG_NONE;
+  /**
+   * Exports [0, first_local_export_) are an AddToStateObject parent's: their associations and
+   * hit groups are final, and the addition's names and associations cannot reach them.
+   */
+  size_t first_local_export_ = 0;
+  /**
+   * Associations of a collection created with ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS
+   * whose subobject or exports the collection could not resolve itself. The state object that
+   * imports the collection resolves them against its own contents.
+   */
+  struct CarriedAssociation {
+    bool has_value = false;
+    Associable value;
+    std::wstring subobject_name;
+    std::vector<std::wstring> exports;
+  };
+  std::vector<CarriedAssociation> carried_associations_;
+  /** Collections the description imports, kept for the duration of Describe. */
+  std::vector<Com<MTLD3D12StateObjectImpl>> imported_collections_;
+  std::vector<Com<MTLD3D12WorkGraph>> imported_function_collections_;
+  std::vector<std::pair<std::wstring, Associable>> exported_root_signatures_;
+  size_t inherited_root_count_ = 0;
+  uint32_t next_collection_scope_ = 1;
 
   HRESULT AddExport(Export entry) {
     if (entry.name.empty())
       return RejectStateObject("an export has an empty name");
-    if (export_indices_.count(entry.name))
-      return RejectStateObject("two exports share a name");
-    export_indices_.emplace(entry.name, exports_.size());
+    if (!entry.hidden) {
+      for (const auto &root : exported_root_signatures_)
+        if (root.first == entry.name)
+          return RejectStateObject("a function and a root signature share an export name");
+      if (export_indices_.count(entry.name)) {
+        for (const auto &other : exports_) {
+          if (other.hidden || other.name != entry.name)
+            continue;
+          std::wstring_view signature = entry.entry_point;
+          std::wstring_view other_signature = other.entry_point;
+          const size_t separator = signature.find(L"@@");
+          const size_t other_separator = other_signature.find(L"@@");
+          if (separator != std::wstring_view::npos)
+            signature.remove_prefix(separator + 2);
+          if (other_separator != std::wstring_view::npos)
+            other_signature.remove_prefix(other_separator + 2);
+          if (entry.stage != kOwnedRTStageLibrary || other.stage != kOwnedRTStageLibrary ||
+              signature == other_signature)
+            return RejectStateObject("two exports share a name and signature");
+        }
+      }
+      export_indices_.emplace(entry.name, exports_.size());
+    }
     entry.identifier.export_index = static_cast<uint32_t>(exports_.size());
     exports_.push_back(std::move(entry));
     return S_OK;
@@ -387,6 +517,28 @@ class MTLD3D12StateObjectImpl final
       return RejectStateObject("a root signature belongs to a different device");
     retained_roots_.emplace_back(root);
     *out = static_cast<MTLD3D12RootSignature *>(root);
+    return S_OK;
+  }
+
+  HRESULT AddRootExport(std::wstring name, MTLD3D12RootSignature *root, uint32_t scope) {
+    if (name.empty() || !root)
+      return RejectStateObject("a root signature export has an empty name or definition");
+    if (export_indices_.count(name))
+      return RejectStateObject("a root signature and a function share an export name");
+    for (size_t i = 0; i < exported_root_signatures_.size(); ++i) {
+      const auto &other = exported_root_signatures_[i];
+      if (other.first == name) {
+        // Re-including a parent library may repeat the same immutable root definition.
+        if (i < inherited_root_count_ && SameRootSignature(other.second.root, root))
+          return S_OK;
+        return RejectStateObject("two root signatures share an export name");
+      }
+    }
+    Associable value;
+    value.kind = root->IsLocal ? AssociableKind::LocalRoot : AssociableKind::GlobalRoot;
+    value.root = root;
+    value.scope = scope;
+    exported_root_signatures_.emplace_back(std::move(name), value);
     return S_OK;
   }
 
@@ -462,7 +614,7 @@ class MTLD3D12StateObjectImpl final
         continue;
       visited.push_back(entry.local_root_signature);
       UINT appended = 0;
-      HRESULT hr = AppendStaticSamplers(entry.local_root_signature, static_samplers, &appended);
+      HRESULT hr = AppendRootStaticSamplers(entry.local_root_signature, static_samplers, &appended);
       if (FAILED(hr))
         return hr;
       added += appended;
@@ -501,49 +653,12 @@ class MTLD3D12StateObjectImpl final
     return S_OK;
   }
 
-  /**
-   * Collect the local root argument translation of every export.
-   *
-   * The application writes the local root arguments of a shader record using the
-   * D3D12 layout (root constants 4 byte packed, descriptors and tables 8 byte
-   * aligned).  The compiled traversal reads the existing qword root argument
-   * layout of the root signature, so each record is materialized once per
-   * dispatch by the shader table preparation pass.
-   */
-  HRESULT BuildLocalRootLayouts() {
-    local_root_layouts_.assign(exports_.size(), {});
-    std::unordered_map<const MTLD3D12RootSignature *, uint32_t> source_sizes;
-    for (size_t i = 0; i < exports_.size(); ++i) {
-      auto &entry = exports_[i];
-      entry.local_root_data_size = 0;
-      auto *root = entry.local_root_signature;
-      if (!root) {
-        continue;
-      }
-      auto known = source_sizes.find(root);
-      if (known != source_sizes.end()) {
-        entry.local_root_data_size = known->second;
-      } else {
-        entry.local_root_data_size = root->LocalRootDataSize;
-        source_sizes.emplace(root, root->LocalRootDataSize);
-      }
-      local_root_layouts_[i].copy_offset = static_cast<uint32_t>(local_root_copies_.size());
-      local_root_layouts_[i].copy_count = root->LocalRootCopyCount;
-      local_root_layouts_[i].source_size = entry.local_root_data_size;
-      local_root_copies_.insert(
-          local_root_copies_.end(), root->LocalRootCopies, root->LocalRootCopies + root->LocalRootCopyCount
-      );
-      const uint32_t entry_bytes = std::max(root->UploadQwords * 8u, AlignUp(entry.local_root_data_size, 8));
-      local_root_entry_stride_ = std::max(local_root_entry_stride_, entry_bytes);
-    }
-    local_root_entry_stride_ = AlignUp(std::max(local_root_entry_stride_, 8u), 8);
-    return S_OK;
-  }
-
   HRESULT CompilePipeline() {
     SM50_RT_PIPELINE_DESC desc{};
     std::vector<SM50_RT_LIBRARY> libraries;
     std::vector<SM50_RT_EXPORT> compiler_exports;
+    std::vector<SM50_WG_EXPORT> link_exports;
+    uint64_t function_names_size = 128;
     std::vector<std::string> entry_names;
     std::vector<std::string> entry_point_names;
     libraries.reserve(libraries_.size());
@@ -574,12 +689,22 @@ class MTLD3D12StateObjectImpl final
         return E_INVALIDARG;
       }
       entry_names[i] = std::move(name);
+      function_names_size += 2 * entry_names[i].size() + 64;
       std::string container_name;
       if (!WideToUtf8(entry.entry_point, container_name)) {
         ERR("RT export ", entry_names[i].c_str(), " has no usable library entry point name");
         return E_INVALIDARG;
       }
       entry_point_names[i] = std::move(container_name);
+      if (!entry.hit_group) {
+        SM50_WG_EXPORT function{entry_names[i].c_str(), entry_point_names[i].c_str(),
+            static_cast<uint32_t>(entry.library_index), entry.scope, entry.collection_flags, entry.hidden ? 1u : 0u};
+        if (entry.global_root_signature)
+          function.GlobalRootSignatureSize = entry.global_root_signature->GetBlob(&function.GlobalRootSignature);
+        if (entry.local_root_signature)
+          function.LocalRootSignatureSize = entry.local_root_signature->GetBlob(&function.LocalRootSignature);
+        link_exports.push_back(function);
+      }
 
       uint32_t stage = entry.stage;
       uint32_t closest_hit = SM50_RT_INDEX_NONE, any_hit = SM50_RT_INDEX_NONE,
@@ -635,6 +760,11 @@ class MTLD3D12StateObjectImpl final
     desc.LibraryCount = static_cast<uint32_t>(libraries.size());
     desc.Exports = compiler_exports.data();
     desc.ExportCount = static_cast<uint32_t>(compiler_exports.size());
+    desc.LinkExports = link_exports.data();
+    desc.LinkExportCount = static_cast<uint32_t>(link_exports.size());
+    std::vector<char> function_names(function_names_size);
+    desc.FunctionNames = function_names.data();
+    desc.FunctionNamesSize = function_names.size();
     /*
      * The compiler is handed the dispatch's root signature, not the application's
      * global one: it is what a DispatchRays of this pipeline binds, so its static
@@ -768,6 +898,8 @@ class MTLD3D12StateObjectImpl final
       return E_FAIL;
     }
     for (const auto &entry : exports_) {
+      if (entry.stage == kOwnedRTStageLibrary)
+        continue;
       if (!entry.compiled) {
         ERR("RT export was not compiled: ", entry.name.c_str());
         return E_FAIL;
@@ -836,7 +968,11 @@ class MTLD3D12StateObjectImpl final
      * The raygen is the pipeline's compute function and is never table referenced,
      * so its export index keeps slot 0 and it is skipped.
      */
-    visible_function_table_ = pipeline_state_.newVisibleFunctionTable(static_cast<uint32_t>(exports_.size()) + 1);
+    uint32_t visible_slots = static_cast<uint32_t>(exports_.size()) + 1;
+    for (const auto &function : functions)
+      if (function.Kind == SM50_RT_FUNCTION_VISIBLE && function.TableIndex != SM50_RT_INDEX_NONE)
+        visible_slots = std::max(visible_slots, function.TableIndex + 1);
+    visible_function_table_ = pipeline_state_.newVisibleFunctionTable(visible_slots);
     if (!visible_function_table_) {
       ERR("RT visible function table creation failed");
       return E_FAIL;
@@ -854,10 +990,14 @@ class MTLD3D12StateObjectImpl final
         ERR("RT visible function handle creation failed: ", function.Name);
         return E_FAIL;
       }
-      visible_function_table_.setFunction(handle, uint64_t(function.ExportIndex) + 1);
+      const uint32_t slot = function.TableIndex == SM50_RT_INDEX_NONE
+        ? function.ExportIndex + 1 : function.TableIndex;
+      visible_function_table_.setFunction(handle, slot);
     }
 
     for (auto &entry : exports_) {
+      if (entry.stage == kOwnedRTStageLibrary)
+        continue;
       OwnedShaderIdentifier identifier{};
       identifier.magic = kOwnedShaderIdentifierMagic;
       identifier.version = kOwnedShaderIdentifierVersion;
@@ -879,461 +1019,805 @@ public:
       MTLD3D12DeviceChild<MTLD3D12StateObject, ID3D12StateObjectProperties>(device),
       pipeline_token_(pipeline_token) {}
 
-  HRESULT Initialize(const D3D12_STATE_OBJECT_DESC *desc) {
+  /**
+   * Build this state object from `desc`.
+   *
+   * `parent` is an AddToStateObject parent: its exports are copied first, with their
+   * identifiers and associations unchanged, and `desc` must stand on its own (D3D12 forbids
+   * it from naming anything the parent defines).
+   */
+  HRESULT Initialize(const D3D12_STATE_OBJECT_DESC *desc, const MTLD3D12StateObjectImpl *parent = nullptr) {
     if (!desc || (desc->NumSubobjects && !desc->pSubobjects) ||
         (desc->Type != D3D12_STATE_OBJECT_TYPE_COLLECTION &&
          desc->Type != D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE))
       return RejectStateObject("the description or its state object type is not a raytracing pipeline");
     is_pipeline_ = desc->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
-
-    std::vector<Association> associations;
-    std::unordered_map<UINT, MTLD3D12RootSignature *> local_roots;
-    std::unordered_map<UINT, D3D12_RAYTRACING_SHADER_CONFIG> shader_configs;
-    bool have_global_root = false;
-    bool have_pipeline_config = false;
-    bool have_state_config = false;
-    bool have_node_mask = false;
+    if (parent && !is_pipeline_)
+      return RejectStateObject("AddToStateObject only adds raytracing pipeline descriptions");
 
     try {
-      for (UINT i = 0; i < desc->NumSubobjects; ++i) {
-        const auto &subobject = desc->pSubobjects[i];
-        if (!subobject.pDesc) {
-          ERR("RT state object rejected: subobject ", i, " of type ", uint32_t(subobject.Type), " has no description");
-          return E_INVALIDARG;
-        }
-        switch (subobject.Type) {
-        case D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG: {
-          if (have_state_config)
-            return RejectStateObject("two state object configs");
-          /**
-           * ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS and
-           * ALLOW_EXTERNAL_DEPENDENCIES_ON_LOCAL_DEFINITIONS describe exports that
-           * resolve against libraries outside this state object, which the
-           * whole-pipeline compiler cannot see; refusing is honest, whereas
-           * accepting would silently drop a shader.
-           */
-          const auto &config = *static_cast<const D3D12_STATE_OBJECT_CONFIG *>(subobject.pDesc);
-          if (config.Flags != D3D12_STATE_OBJECT_FLAG_NONE &&
-              config.Flags != D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) {
-            ERR("RT state object rejected: state object config flags 0x", uint32_t(config.Flags),
-                " need external library resolution");
-            return E_NOTIMPL;
-          }
-          have_state_config = true;
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_NODE_MASK: {
-          if (have_node_mask || *static_cast<const UINT *>(subobject.pDesc) > 1)
-            return RejectStateObject("a duplicate or out-of-range node mask");
-          have_node_mask = true;
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE: {
-          if (have_global_root)
-            return RejectStateObject("two global root signatures");
-          auto root = *static_cast<ID3D12RootSignature *const *>(subobject.pDesc);
-          HRESULT hr = RetainRoot(root, &global_root_);
-          if (FAILED(hr))
-            return hr;
-          have_global_root = true;
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE: {
-          MTLD3D12RootSignature *root = nullptr;
-          HRESULT hr = RetainRoot(*static_cast<ID3D12RootSignature *const *>(subobject.pDesc), &root);
-          if (FAILED(hr))
-            return hr;
-          local_roots.emplace(i, root);
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG: {
-          const auto config = *static_cast<const D3D12_RAYTRACING_SHADER_CONFIG *>(subobject.pDesc);
-          if (config.MaxAttributeSizeInBytes > D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES)
-            return RejectStateObject("a shader config attribute size above D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES");
-          shader_configs.emplace(i, config);
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG: {
-          if (have_pipeline_config)
-            return RejectStateObject("two raytracing pipeline configs");
-          pipeline_config_ = *static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG *>(subobject.pDesc);
-          if (!pipeline_config_.MaxTraceRecursionDepth ||
-              pipeline_config_.MaxTraceRecursionDepth > D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH)
-            return RejectStateObject("a raytracing pipeline config recursion depth outside 1..D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH");
-          have_pipeline_config = true;
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1: {
-          if (have_pipeline_config)
-            return RejectStateObject("two raytracing pipeline configs");
-          const auto &config = *static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG1 *>(subobject.pDesc);
-          pipeline_config_.MaxTraceRecursionDepth = config.MaxTraceRecursionDepth;
-          if (!pipeline_config_.MaxTraceRecursionDepth ||
-              pipeline_config_.MaxTraceRecursionDepth > D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH ||
-              (config.Flags & ~(D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES |
-                                D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES)))
-            return RejectStateObject("a raytracing pipeline config1 depth or flag outside its range");
-          pipeline_flags_ = config.Flags;
-          have_pipeline_config = true;
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY: {
-          const auto &library_desc = *static_cast<const D3D12_DXIL_LIBRARY_DESC *>(subobject.pDesc);
-          if (!library_desc.DXILLibrary.pShaderBytecode || !library_desc.DXILLibrary.BytecodeLength ||
-              (library_desc.NumExports && !library_desc.pExports))
-            return RejectStateObject("a DXIL library subobject has no bytecode, or an export list with no entries");
-          Library library;
-          const auto *bytes = static_cast<const uint8_t *>(library_desc.DXILLibrary.pShaderBytecode);
-          library.bytecode.assign(bytes, bytes + library_desc.DXILLibrary.BytecodeLength);
-          std::vector<LibraryExport> reflected;
-          HRESULT hr = EnumerateLibraryExports(library_desc.DXILLibrary, reflected);
-          if (FAILED(hr))
-            return hr;
-          if (!library_desc.NumExports) {
-            /* Publishing every export requires every export to be a raytracing shader. */
-            for (const auto &reflected_export : reflected) {
-              if (!IsRaytracingStage(reflected_export.stage)) {
-                std::string name;
-                WideToUtf8(reflected_export.name, name);
-                ERR("RT state object rejected: library export ", name.c_str(), " has stage ",
-                    reflected_export.stage, ", which is not a raytracing stage");
-                return E_INVALIDARG;
-              }
-            }
-            library.exports = std::move(reflected);
-          } else {
-            for (UINT j = 0; j < library_desc.NumExports; ++j) {
-              const auto &source = library_desc.pExports[j];
-              LibraryExport target;
-              if (!CopyName(source.Name, target.name))
-                return RejectStateObject("a DXIL library export has an empty name");
-              /*
-               * D3D12 names the library's own export in ExportToRename when that is
-               * present and in Name otherwise, and either spelling is allowed there:
-               * the container's entry point name is the mangled one, while the name
-               * the library publishes is the unmangled one. Both are matched, so
-               * neither spelling is silently unsupported.
-               */
-              const WCHAR *internal = source.ExportToRename ? source.ExportToRename : source.Name;
-              const LibraryExport *match = nullptr;
-              unsigned matches = 0;
-              for (const auto &candidate : reflected) {
-                if (candidate.name == internal || candidate.entry_point == internal) {
-                  match = &candidate;
-                  matches++;
-                }
-              }
-              if (!matches) {
-                std::string name;
-                WideToUtf8(internal, name);
-                ERR("RT state object rejected: the library does not declare entry point ", name.c_str());
-                return E_INVALIDARG;
-              }
-              if (matches > 1) {
-                /*
-                 * Overloads share a public name, so an unmangled request can name
-                 * more than one entry point. Picking one would silently compile the
-                 * wrong shader; D3D12 answers this by requiring the mangled name.
-                 */
-                std::string name;
-                WideToUtf8(internal, name);
-                ERR("RT state object rejected: the name ", name.c_str(), " matches ", matches,
-                    " entry points of the library, so the mangled name is required");
-                return E_INVALIDARG;
-              }
-              if (!IsRaytracingStage(match->stage)) {
-                std::string name;
-                WideToUtf8(internal, name);
-                ERR("RT state object rejected: library export ", name.c_str(), " has stage ", match->stage,
-                    ", which is not a raytracing stage");
-                return E_INVALIDARG;
-              }
-              target.entry_point = match->entry_point;
-              target.stage = match->stage;
-              library.exports.push_back(std::move(target));
-            }
-          }
-          for (const auto &target : library.exports) {
-            Export entry;
-            entry.name = target.name;
-            entry.entry_point = target.entry_point;
-            entry.stage = target.stage;
-            entry.library_index = libraries_.size();
-            hr = AddExport(std::move(entry));
-            if (FAILED(hr))
-              return hr;
-          }
-          libraries_.push_back(std::move(library));
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION: {
-          const auto &collection = *static_cast<const D3D12_EXISTING_COLLECTION_DESC *>(subobject.pDesc);
-          if (!collection.pExistingCollection || (collection.NumExports && !collection.pExports))
-            return RejectStateObject("an existing collection subobject has no collection, or an export list with no entries");
-          Com<ID3D12Device> collection_device;
-          if (FAILED(collection.pExistingCollection->GetDevice(
-                  __uuidof(ID3D12Device), reinterpret_cast<void **>(&collection_device)
-              )) ||
-              collection_device.ptr() != static_cast<ID3D12Device *>(device_))
-            return RejectStateObject("an existing collection belongs to a different device");
-          auto *existing = dynamic_cast<MTLD3D12StateObjectImpl *>(collection.pExistingCollection);
-          if (!existing)
-            return RejectStateObject("an existing collection is not a state object this backend created");
-          if (!collection.NumExports) {
-            for (const auto &source : existing->GetExports()) {
-              Export entry = source;
-              entry.identifier = {};
-              entry.compiled = false;
-              entry.metal_function.clear();
-              HRESULT hr = AddExport(std::move(entry));
-              if (FAILED(hr))
-                return hr;
-            }
-          } else {
-            for (UINT j = 0; j < collection.NumExports; ++j) {
-              const auto &rename = collection.pExports[j];
-              std::wstring public_name;
-              if (!CopyName(rename.Name, public_name))
-                return RejectStateObject("a collection export has an empty name");
-              const WCHAR *source_name = rename.ExportToRename ? rename.ExportToRename : rename.Name;
-              const auto &collection_exports = existing->GetExports();
-              const size_t source_index = FindExportIndexByName(collection_exports, source_name);
-              if (source_index == collection_exports.size())
-                return RejectStateObject("the collection does not hold the export being renamed");
-              Export entry = collection_exports[source_index];
-              entry.name = std::move(public_name);
-              entry.identifier = {};
-              entry.compiled = false;
-              entry.metal_function.clear();
-              HRESULT hr = AddExport(std::move(entry));
-              if (FAILED(hr))
-                return hr;
-            }
-          }
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP: {
-          const auto &hit = *static_cast<const D3D12_HIT_GROUP_DESC *>(subobject.pDesc);
-          Export entry;
-          if (!CopyName(hit.HitGroupExport, entry.name))
-            return RejectStateObject("a hit group has an empty export name");
-          if (hit.Type != D3D12_HIT_GROUP_TYPE_TRIANGLES &&
-              hit.Type != D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE)
-            return RejectStateObject("a hit group type is neither TRIANGLES nor PROCEDURAL_PRIMITIVE");
-          entry.hit_group = true;
-          entry.hit_group_type = hit.Type;
-          if (hit.ClosestHitShaderImport)
-            entry.closest_hit_name = hit.ClosestHitShaderImport;
-          if (hit.AnyHitShaderImport)
-            entry.any_hit_name = hit.AnyHitShaderImport;
-          if (hit.IntersectionShaderImport)
-            entry.intersection_name = hit.IntersectionShaderImport;
-          if (hit.Type == D3D12_HIT_GROUP_TYPE_TRIANGLES && !entry.intersection_name.empty())
-            return RejectStateObject("a triangle hit group names an intersection shader");
-          if (hit.Type == D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE && entry.intersection_name.empty())
-            return RejectStateObject("a procedural hit group names no intersection shader");
-          /** A hit group needs at least one shader to run. */
-          if (entry.closest_hit_name.empty() && entry.any_hit_name.empty() && entry.intersection_name.empty())
-            return RejectStateObject("a hit group names no closest-hit, any-hit or intersection shader");
-          HRESULT hr = AddExport(std::move(entry));
-          if (FAILED(hr))
-            return hr;
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION: {
-          const auto &source = *static_cast<const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION *>(subobject.pDesc);
-          if (source.NumExports && !source.pExports)
-            return RejectStateObject("an association has an export count but no export list");
-          Association association;
-          if (!FindSubobjectIndex(*desc, source.pSubobjectToAssociate, association.subobject_index))
-            return RejectStateObject("an association does not point at a subobject of this description");
-          for (UINT j = 0; j < source.NumExports; ++j) {
-            std::wstring name;
-            if (!CopyName(source.pExports[j], name))
-              return RejectStateObject("an association names an empty export");
-            association.exports.push_back(std::move(name));
-          }
-          associations.push_back(std::move(association));
-          break;
-        }
-        case D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION:
-          /**
-           * This associates a subobject named inside the DXIL (for example
-           * [shader("closesthit")] attributes carrying subobject names).  Resolving
-           * it needs DXIL subobject reflection; treating the name as a runtime
-           * subobject pointer would associate the wrong subobject.
-           */
-          return E_NOTIMPL;
-        default:
-          return E_NOTIMPL;
-        }
+      if (parent) {
+        if (HRESULT hr = InheritParent(*parent); FAILED(hr))
+          return hr;
       }
+      HRESULT hr = Describe(*desc, parent);
+      /* Imported collections are only consulted while resolving; their contents were copied. */
+      imported_collections_.clear();
+      imported_function_collections_.clear();
+      for (auto &entry : exports_)
+        entry.collection = nullptr;
+      return hr;
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
     }
+  }
 
-    /** Resolve hit group imports against the export table. */
-    for (auto &group : exports_) {
-      if (!group.hit_group)
-        continue;
-      struct {
-        std::wstring *name;
-        uint32_t *index;
-        uint32_t stage;
-      } members[] = {
-          {&group.closest_hit_name, &group.closest_hit, kOwnedRTStageClosestHit},
-          {&group.any_hit_name, &group.any_hit, kOwnedRTStageAnyHit},
-          {&group.intersection_name, &group.intersection, kOwnedRTStageIntersection},
-      };
-      for (auto &member : members) {
-        if (member.name->empty())
-          continue;
-        /*
-         * A hit group names its shaders the same way the library does, so either the
-         * exported name or the library's own (mangled) entry point name is accepted.
-         */
-        const size_t index = FindExportIndexByName(exports_, *member.name);
-        if (index == exports_.size()) {
-          std::string name;
-          WideToUtf8(*member.name, name);
-          ERR("RT state object rejected: a hit group member ", name.c_str(), " is not an export of this state object");
-          return E_INVALIDARG;
-        }
-        Export &component = exports_[index];
-        if (component.hit_group || component.stage != member.stage) {
-          std::string name;
-          WideToUtf8(*member.name, name);
-          ERR("RT state object rejected: hit group member ", name.c_str(), " has stage ", component.stage,
-              " where stage ", member.stage, " is required");
-          return E_INVALIDARG;
-        }
-        *member.index = static_cast<uint32_t>(index);
-      }
-      /**
-       * The group compiles as one function: the shader that runs when nothing
-       * rejects the hit. Its library and entry point are the primary member's.
-       */
-      const uint32_t primary = group.hit_group_type == D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE
-          ? group.intersection
-          : (group.closest_hit != kOwnedRTNoExport ? group.closest_hit : group.any_hit);
-      if (primary == kOwnedRTNoExport) {
-        std::string name;
-        WideToUtf8(group.name, name);
-        ERR("RT state object rejected: hit group ", name.c_str(), " resolved no shader to compile");
+private:
+  /**
+   * Take over an AddToStateObject parent: every export (hit groups resolved, associations final,
+   * identifiers kept so the application's shader tables stay valid), its libraries, retained
+   * root signatures and pipeline-wide settings.
+   */
+  HRESULT InheritParent(const MTLD3D12StateObjectImpl &parent) {
+    if (!parent.is_pipeline_ || !(parent.state_flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS))
+      return RejectStateObject(
+          "AddToStateObject grows only raytracing pipelines created with ALLOW_STATE_OBJECT_ADDITIONS"
+      );
+    libraries_ = parent.libraries_;
+    next_collection_scope_ = parent.next_collection_scope_;
+    retained_roots_ = parent.retained_roots_;
+    exported_root_signatures_ = parent.exported_root_signatures_;
+    inherited_root_count_ = exported_root_signatures_.size();
+    global_root_ = parent.global_root_;
+    pipeline_config_ = parent.pipeline_config_;
+    pipeline_flags_ = parent.pipeline_flags_;
+    pipeline_stack_size_ = parent.pipeline_stack_size_;
+    /*
+     * Identifiers carry the pipeline token, and the traversal rejects a record whose token is
+     * not the dispatching pipeline's: the child keeps its parent's token, which is what keeps
+     * every identifier the application already wrote into a shader table valid.
+     */
+    pipeline_token_ = parent.pipeline_token_;
+    for (const auto &source : parent.exports_) {
+      Export entry = source;
+      entry.compiled = false;
+      entry.metal_function.clear();
+      if (HRESULT hr = AddExport(std::move(entry)); FAILED(hr))
+        return hr;
+    }
+    first_local_export_ = exports_.size();
+    return S_OK;
+  }
+
+  /** Read one root signature subobject of a DXIL library into a retained signature. */
+  HRESULT CreateLibraryRootSignature(const DxilSubobject &source, MTLD3D12RootSignature **out) {
+    std::vector<uint8_t> container;
+    if (HRESULT hr = WrapRootSignaturePayload(source.root_signature.data(), source.root_signature.size(), container);
+        FAILED(hr))
+      return hr;
+    ID3D12RootSignature *root = nullptr;
+    HRESULT hr = CreateRootSignature(
+        device_, 0, container.data(), container.size(), __uuidof(ID3D12RootSignature),
+        reinterpret_cast<void **>(&root)
+    );
+    if (FAILED(hr)) {
+      ERR("RT state object rejected: DXIL root signature subobject ", Utf8Name(source.name).c_str(),
+          " does not create a root signature");
+      return E_INVALIDARG;
+    }
+    retained_roots_.push_back(Com<ID3D12RootSignature>::transfer(root));
+    *out = static_cast<MTLD3D12RootSignature *>(root);
+    return S_OK;
+  }
+
+  HRESULT Describe(const D3D12_STATE_OBJECT_DESC &desc, const MTLD3D12StateObjectImpl *parent) {
+    std::vector<Associable> associables;
+    /* API subobject index -> its Associable. */
+    std::unordered_map<UINT, size_t> api_associables;
+    /* DXIL subobject name -> its Associable (names are unique across the description's libraries). */
+    std::map<std::wstring, size_t> dxil_associables;
+    std::vector<PendingAssociation> associations;
+    struct PendingHitGroup {
+      D3D12_HIT_GROUP_DESC desc{};
+      std::wstring name, any_hit, closest_hit, intersection;
+    };
+    std::vector<PendingHitGroup> hit_groups;
+    std::vector<std::wstring> dxil_subobject_names;
+    bool have_state_config = false;
+    bool have_node_mask = false;
+    UINT node_mask = 0;
+
+    auto claim_dxil_name = [&](const std::wstring &name) -> HRESULT {
+      if (std::find(dxil_subobject_names.begin(), dxil_subobject_names.end(), name) != dxil_subobject_names.end()) {
+        ERR("RT state object rejected: two DXIL subobjects are named ", Utf8Name(name).c_str());
         return E_INVALIDARG;
       }
-      group.entry_point = exports_[primary].entry_point;
-      group.library_index = exports_[primary].library_index;
+      dxil_subobject_names.push_back(name);
+      return S_OK;
+    };
+    auto set_state_config = [&](D3D12_STATE_OBJECT_FLAGS flags) -> HRESULT {
+      const UINT known = D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS |
+          D3D12_STATE_OBJECT_FLAG_ALLOW_EXTERNAL_DEPENDENCIES_ON_LOCAL_DEFINITIONS |
+          D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
+      if (flags & ~known)
+        return RejectStateObject("a state object config holds an unknown flag");
+      /* D3D12 requires every state object config of one description to match. */
+      if (have_state_config && flags != state_flags_)
+        return RejectStateObject("two state object configs of one description differ");
+      have_state_config = true;
+      state_flags_ = flags;
+      return S_OK;
+    };
+
+    /* ---- Pass 1: read every subobject ---- */
+    for (UINT i = 0; i < desc.NumSubobjects; ++i) {
+      const auto &subobject = desc.pSubobjects[i];
+      if (!subobject.pDesc) {
+        ERR("RT state object rejected: subobject ", i, " of type ", uint32_t(subobject.Type), " has no description");
+        return E_INVALIDARG;
+      }
+      switch (subobject.Type) {
+      case D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG: {
+        const auto &config = *static_cast<const D3D12_STATE_OBJECT_CONFIG *>(subobject.pDesc);
+        if (HRESULT hr = set_state_config(config.Flags); FAILED(hr))
+          return hr;
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_NODE_MASK: {
+        const UINT mask = static_cast<const D3D12_NODE_MASK *>(subobject.pDesc)->NodeMask;
+        if (mask > 1 || (have_node_mask && mask != node_mask))
+          return RejectStateObject("an out-of-range or mismatching node mask");
+        have_node_mask = true;
+        node_mask = mask;
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE:
+      case D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE: {
+        Associable value;
+        value.kind = subobject.Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE ? AssociableKind::GlobalRoot
+                                                                                         : AssociableKind::LocalRoot;
+        if (HRESULT hr = RetainRoot(*static_cast<ID3D12RootSignature *const *>(subobject.pDesc), &value.root);
+            FAILED(hr))
+          return hr;
+        api_associables.emplace(i, associables.size());
+        associables.push_back(value);
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG: {
+        Associable value;
+        value.kind = AssociableKind::ShaderConfig;
+        value.shader_config = *static_cast<const D3D12_RAYTRACING_SHADER_CONFIG *>(subobject.pDesc);
+        if (value.shader_config.MaxAttributeSizeInBytes > D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES)
+          return RejectStateObject("a shader config attribute size above D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES");
+        api_associables.emplace(i, associables.size());
+        associables.push_back(value);
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG:
+      case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1: {
+        Associable value;
+        value.kind = AssociableKind::PipelineConfig;
+        if (subobject.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG)
+          value.pipeline_config = {
+              static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG *>(subobject.pDesc)->MaxTraceRecursionDepth,
+              D3D12_RAYTRACING_PIPELINE_FLAG_NONE
+          };
+        else
+          value.pipeline_config = *static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG1 *>(subobject.pDesc);
+        if (!ValidPipelineConfig(value.pipeline_config))
+          return RejectStateObject(
+              "a raytracing pipeline config recursion depth outside 0..D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH "
+              "or a flag outside SKIP_TRIANGLES | SKIP_PROCEDURAL_PRIMITIVES"
+          );
+        api_associables.emplace(i, associables.size());
+        associables.push_back(value);
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY: {
+        const auto &library_desc = *static_cast<const D3D12_DXIL_LIBRARY_DESC *>(subobject.pDesc);
+        /*
+         * The library's own subobjects (HLSL GlobalRootSignature, SubobjectToExportsAssociation,
+         * TriangleHitGroup, ...) are part of the state object exactly as if the description
+         * declared them, but in the library's scope for association purposes.
+         */
+        std::vector<DxilSubobject> subobjects;
+        HRESULT hr = library_desc.DXILLibrary.pShaderBytecode
+            ? ReadDxilLibrarySubobjects(
+                  library_desc.DXILLibrary.pShaderBytecode, library_desc.DXILLibrary.BytecodeLength, subobjects
+              )
+            : S_OK;
+        if (hr == E_NOTIMPL)
+          return RejectStateObject("a DXIL library declares a subobject kind this runtime does not read");
+        if (FAILED(hr))
+          return hr == E_OUTOFMEMORY ? hr : RejectStateObject("a DXIL library's RDAT subobject table is malformed");
+        /*
+         * An export list selects shaders and the library's subobjects alike: with one, only the
+         * subobjects it names are part of the state object (and may be renamed).
+         */
+        std::vector<std::pair<std::wstring, std::wstring>> subobject_names;
+        for (const auto &source : subobjects)
+          subobject_names.emplace_back(source.name, source.name);
+        hr = AddLibrary(library_desc, subobject_names);
+        if (FAILED(hr))
+          return hr;
+        const uint32_t scope = static_cast<uint32_t>(libraries_.size());
+        for (size_t k = 0; k < subobjects.size(); ++k)
+          subobjects[k].name = subobject_names[k].second;
+        subobjects.erase(
+            std::remove_if(subobjects.begin(), subobjects.end(), [](const DxilSubobject &v) { return v.name.empty(); }),
+            subobjects.end()
+        );
+        for (const auto &source : subobjects) {
+          if (HRESULT claim = claim_dxil_name(source.name); FAILED(claim))
+            return claim;
+          Associable value;
+          value.scope = scope;
+          switch (source.kind) {
+          case DxilSubobjectKind::StateObjectConfig:
+            if (HRESULT set = set_state_config(source.state_object_flags); FAILED(set))
+              return set;
+            continue;
+          case DxilSubobjectKind::GlobalRootSignature:
+          case DxilSubobjectKind::LocalRootSignature:
+            value.kind = source.kind == DxilSubobjectKind::GlobalRootSignature ? AssociableKind::GlobalRoot
+                                                                                : AssociableKind::LocalRoot;
+            if (HRESULT created = CreateLibraryRootSignature(source, &value.root); FAILED(created))
+              return created;
+            if (HRESULT published = AddRootExport(source.name, value.root, scope); FAILED(published))
+              return published;
+            break;
+          case DxilSubobjectKind::RaytracingShaderConfig:
+            value.kind = AssociableKind::ShaderConfig;
+            value.shader_config = source.shader_config;
+            if (value.shader_config.MaxAttributeSizeInBytes > D3D12_RAYTRACING_MAX_ATTRIBUTE_SIZE_IN_BYTES)
+              return RejectStateObject("a DXIL shader config attribute size above the D3D12 maximum");
+            break;
+          case DxilSubobjectKind::RaytracingPipelineConfig:
+          case DxilSubobjectKind::RaytracingPipelineConfig1:
+            value.kind = AssociableKind::PipelineConfig;
+            value.pipeline_config = source.pipeline_config;
+            if (!ValidPipelineConfig(value.pipeline_config))
+              return RejectStateObject("a DXIL raytracing pipeline config is out of range");
+            break;
+          case DxilSubobjectKind::SubobjectToExportsAssociation: {
+            PendingAssociation association;
+            association.scope = scope;
+            association.subobject_name = source.associated_subobject;
+            association.exports = source.exports;
+            associations.push_back(std::move(association));
+            continue;
+          }
+          case DxilSubobjectKind::HitGroup: {
+            PendingHitGroup group;
+            group.name = source.name;
+            group.desc.Type = source.hit_group_type;
+            group.any_hit = source.any_hit;
+            group.closest_hit = source.closest_hit;
+            group.intersection = source.intersection;
+            hit_groups.push_back(std::move(group));
+            continue;
+          }
+          }
+          dxil_associables.emplace(source.name, associables.size());
+          associables.push_back(value);
+        }
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION: {
+        const size_t root_base = exported_root_signatures_.size();
+        HRESULT hr = AddCollection(*static_cast<const D3D12_EXISTING_COLLECTION_DESC *>(subobject.pDesc));
+        if (FAILED(hr))
+          return hr;
+        for (size_t root = root_base; root < exported_root_signatures_.size(); ++root) {
+          const auto &[name, definition] = exported_root_signatures_[root];
+          if (HRESULT claim = claim_dxil_name(name); FAILED(claim))
+            return claim;
+          auto value = definition;
+          value.scope = 0;
+          value.explicitly_associated_in_scope = true; // Its collection already resolved its defaults.
+          dxil_associables.emplace(name, associables.size());
+          associables.push_back(value);
+        }
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP: {
+        const auto &hit = *static_cast<const D3D12_HIT_GROUP_DESC *>(subobject.pDesc);
+        PendingHitGroup group;
+        group.desc = hit;
+        if (!CopyName(hit.HitGroupExport, group.name))
+          return RejectStateObject("a hit group has an empty export name");
+        if (hit.AnyHitShaderImport)
+          group.any_hit = hit.AnyHitShaderImport;
+        if (hit.ClosestHitShaderImport)
+          group.closest_hit = hit.ClosestHitShaderImport;
+        if (hit.IntersectionShaderImport)
+          group.intersection = hit.IntersectionShaderImport;
+        hit_groups.push_back(std::move(group));
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION: {
+        const auto &source = *static_cast<const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION *>(subobject.pDesc);
+        if (source.NumExports && !source.pExports)
+          return RejectStateObject("an association has an export count but no export list");
+        PendingAssociation association;
+        if (!FindSubobjectIndex(desc, source.pSubobjectToAssociate, association.subobject_index))
+          return RejectStateObject("an association does not point at a subobject of this description");
+        for (UINT j = 0; j < source.NumExports; ++j) {
+          std::wstring name;
+          if (!CopyName(source.pExports[j], name))
+            return RejectStateObject("an association names an empty export");
+          association.exports.push_back(std::move(name));
+        }
+        associations.push_back(std::move(association));
+        break;
+      }
+      case D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION: {
+        const auto &source = *static_cast<const D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION *>(subobject.pDesc);
+        if (source.NumExports && !source.pExports)
+          return RejectStateObject("a DXIL association has an export count but no export list");
+        PendingAssociation association;
+        if (!CopyName(source.SubobjectToAssociate, association.subobject_name))
+          return RejectStateObject("a DXIL association names no subobject");
+        for (UINT j = 0; j < source.NumExports; ++j) {
+          std::wstring name;
+          if (!CopyName(source.pExports[j], name))
+            return RejectStateObject("a DXIL association names an empty export");
+          association.exports.push_back(std::move(name));
+        }
+        associations.push_back(std::move(association));
+        break;
+      }
+      default:
+        ERR("RT state object rejected: subobject type ", uint32_t(subobject.Type), " is not a raytracing subobject");
+        return E_INVALIDARG;
+      }
     }
 
-    /** Apply subobject to exports associations. */
+    /*
+     * D3D12: an executable state object and the part AddToStateObject adds must both opt in with
+     * ALLOW_STATE_OBJECT_ADDITIONS; a collection imported into a pipeline that sets the flag
+     * must set it too, and one imported into a pipeline that does not must not.
+     */
+    if (parent && !(state_flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS))
+      return RejectStateObject("an AddToStateObject addition does not set ALLOW_STATE_OBJECT_ADDITIONS");
+    for (const auto &collection : imported_collections_) {
+      const bool collection_allows = collection->state_flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
+      const bool pipeline_allows = state_flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;
+      if (pipeline_allows && !collection_allows)
+        return RejectStateObject(
+            "a pipeline with ALLOW_STATE_OBJECT_ADDITIONS imports a collection that does not set it"
+        );
+    }
+
+    for (const auto &collection : imported_function_collections_)
+      if ((state_flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) &&
+          !(collection->Flags() & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS))
+        return RejectStateObject("a pipeline with ALLOW_STATE_OBJECT_ADDITIONS imports a collection that does not set it");
+
+    /* ---- Pass 2: hit groups (D3D12 API ones and DXIL-declared ones) ---- */
+    for (auto &group : hit_groups) {
+      Export entry;
+      entry.name = group.name;
+      if (group.desc.Type != D3D12_HIT_GROUP_TYPE_TRIANGLES && group.desc.Type != D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE)
+        return RejectStateObject("a hit group type is neither TRIANGLES nor PROCEDURAL_PRIMITIVE");
+      entry.hit_group = true;
+      entry.hit_group_type = group.desc.Type;
+      entry.any_hit_name = group.any_hit;
+      entry.closest_hit_name = group.closest_hit;
+      entry.intersection_name = group.intersection;
+      if (entry.hit_group_type == D3D12_HIT_GROUP_TYPE_TRIANGLES && !entry.intersection_name.empty())
+        return RejectStateObject("a triangle hit group names an intersection shader");
+      if (entry.hit_group_type == D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE && entry.intersection_name.empty())
+        return RejectStateObject("a procedural hit group names no intersection shader");
+      if (entry.closest_hit_name.empty() && entry.any_hit_name.empty() && entry.intersection_name.empty())
+        return RejectStateObject("a hit group names no closest-hit, any-hit or intersection shader");
+      if (HRESULT hr = AddExport(std::move(entry)); FAILED(hr))
+        return hr;
+    }
+    if (HRESULT hr = ResolveHitGroups(); FAILED(hr))
+      return hr;
+
+    /* ---- Pass 3: associations ---- */
+    for (size_t root = 0; root < inherited_root_count_; ++root) {
+      const auto &[name, definition] = exported_root_signatures_[root];
+      if (dxil_associables.count(name))
+        continue; // An identical root was redeclared by this addition.
+      if (HRESULT claim = claim_dxil_name(name); FAILED(claim))
+        return claim;
+      auto value = definition;
+      value.scope = 0;
+      value.explicitly_associated_in_scope = true;
+      dxil_associables.emplace(name, associables.size());
+      associables.push_back(value);
+    }
+    for (auto &association : associations) {
+      if (association.subobject_index != UINT_MAX) {
+        auto found = api_associables.find(association.subobject_index);
+        if (found != api_associables.end()) {
+          association.target = found->second;
+          continue;
+        }
+        /* Associating a state object config or node mask is legal; both apply to the whole object. */
+        const auto type = desc.pSubobjects[association.subobject_index].Type;
+        if (type != D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG && type != D3D12_STATE_SUBOBJECT_TYPE_NODE_MASK)
+          return RejectStateObject("an association points at a subobject that cannot be associated with exports");
+        continue;
+      }
+      auto found = dxil_associables.find(association.subobject_name);
+      if (found != dxil_associables.end()) {
+        association.target = found->second;
+        continue;
+      }
+      /*
+       * A DXIL subobject that is not an associable one (a hit group, a state object config, an
+       * association) applies to the state object as a whole, so associating it changes nothing.
+       */
+      if (std::find(dxil_subobject_names.begin(), dxil_subobject_names.end(), association.subobject_name) !=
+          dxil_subobject_names.end())
+        continue;
+      /*
+       * Not defined in this description. A collection that allows local dependencies on external
+       * definitions may name a subobject its container will define; anything else is an
+       * unresolved reference, which D3D12 rejects.
+       */
+      if (!is_pipeline_ && (state_flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS)) {
+        CarriedAssociation carried;
+        carried.subobject_name = association.subobject_name;
+        carried.exports = association.exports;
+        carried_associations_.push_back(std::move(carried));
+        association.target = SIZE_MAX;
+        association.subobject_name.clear();
+        association.exports.clear();
+        association.subobject_index = UINT_MAX - 1;
+        continue;
+      }
+      ERR("RT state object rejected: an association names subobject ", Utf8Name(association.subobject_name).c_str(),
+          ", which this description does not define");
+      return E_INVALIDARG;
+    }
     for (const auto &association : associations) {
-      auto local_root = local_roots.find(association.subobject_index);
-      auto shader_config = shader_configs.find(association.subobject_index);
-      if (local_root == local_roots.end() && shader_config == shader_configs.end())
-        return RejectStateObject("an association points at a subobject that is neither a local root signature nor a shader config");
-      auto apply = [&](Export &entry) -> HRESULT {
-        if (local_root != local_roots.end()) {
-          if (entry.local_root_signature && entry.local_root_signature != local_root->second)
-            return RejectStateObject("two local root signatures are associated with the same export");
-          entry.local_root_signature = local_root->second;
-          return S_OK;
-        }
-        if (entry.has_shader_config)
-          return RejectStateObject("two shader configs are associated with the same export");
-        entry.shader_config = shader_config->second;
-        entry.has_shader_config = true;
-        return S_OK;
-      };
-      if (association.exports.empty()) {
-        for (auto &entry : exports_) {
-          HRESULT hr = apply(entry);
-          if (FAILED(hr))
-            return hr;
-        }
-      } else {
-        for (const auto &name : association.exports) {
-          const size_t index = FindExportIndexByName(exports_, name);
-          if (index == exports_.size()) {
-            std::string utf8;
-            WideToUtf8(name, utf8);
-            ERR("RT state object rejected: an association names ", utf8.c_str(), ", which is not an export of this state object");
+      if (association.target == SIZE_MAX || association.exports.empty())
+        continue;
+      auto &target = associables[association.target];
+      if (association.scope == target.scope)
+        target.explicitly_associated_in_scope = true;
+    }
+
+    /*
+     * The association a given export ends up with, per kind, in D3D12's precedence:
+     *  1. explicit associations declared directly in the description (scope 0);
+     *  2. default associations declared directly in the description, which override anything
+     *     a DXIL library declares for the exports of a directly included library
+     *     ("Exception: overriding DXIL library associations");
+     *  3. explicit associations declared in a DXIL library;
+     *  4. default associations of the export's own library scope.
+     * Conflicting definitions at one precedence level reject the description. An imported
+     * collection's exports keep the associations the collection resolved; the description's
+     * own associations can only fill in what the collection left open.
+     */
+    const size_t first_new = first_local_export_;
+    std::vector<std::array<int, 4>> level(exports_.size());
+    for (auto &levels : level)
+      levels.fill(-1);
+    std::vector<std::array<size_t, 4>> chosen(exports_.size());
+    auto offer = [&](size_t index, const Associable &value, size_t associable, int precedence) -> HRESULT {
+      Export &entry = exports_[index];
+      const auto kind = static_cast<size_t>(value.kind);
+      if (entry.from_collection) {
+        /* A collection's resolved association is final; agreeing with it is fine. */
+        if (ExportHasAssociable(entry, value.kind)) {
+          if (precedence == 0 && !SameAssociable(AssociableOf(entry, value.kind), value)) {
+            ERR("RT state object rejected: an association conflicts with the ", AssociableName(value.kind),
+                " collection export ", Utf8Name(entry.name).c_str(), " already has");
             return E_INVALIDARG;
           }
-          HRESULT hr = apply(exports_[index]);
-          if (FAILED(hr))
+          return S_OK;
+        }
+      }
+      int &current = level[index][kind];
+      if (current != -1 && current < precedence)
+        return S_OK;
+      if (current == precedence && !SameAssociable(associables[chosen[index][kind]], value)) {
+        ERR("RT state object rejected: two different ", AssociableName(value.kind), "s are associated with export ",
+            Utf8Name(entry.name).c_str());
+        return E_INVALIDARG;
+      }
+      current = precedence;
+      chosen[index][kind] = associable;
+      return S_OK;
+    };
+    auto candidate = [&](size_t index, uint32_t scope) {
+      const Export &entry = exports_[index];
+      if (index < first_new)
+        return false;
+      /* A default association reaches the exports of its scope and of the scopes it contains. */
+      if (scope == 0)
+        return true;
+      return !entry.from_collection && entry.library_index + 1 == scope;
+    };
+    for (const auto &association : associations) {
+      if (association.target == SIZE_MAX)
+        continue;
+      const Associable &value = associables[association.target];
+      if (!association.exports.empty()) {
+        const int precedence = association.scope == 0 ? 0 : 2;
+        for (const auto &name : association.exports) {
+          const size_t index = FindExportIndexByName(exports_, name);
+          if (index == exports_.size() || index < first_new) {
+            /*
+             * A library's own association may name a library export the description's export
+             * list left out: that export is not part of this state object, so neither is the
+             * association to it.
+             */
+            if (association.scope != 0 && index == exports_.size())
+              continue;
+            if (!is_pipeline_ &&
+                (state_flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS)) {
+              CarriedAssociation carried;
+              carried.has_value = true;
+              carried.value = value;
+              carried.exports = {name};
+              carried_associations_.push_back(std::move(carried));
+              continue;
+            }
+            ERR("RT state object rejected: an association names ", Utf8Name(name).c_str(),
+                ", which is not an export of this state object");
+            return E_INVALIDARG;
+          }
+          if (HRESULT hr = offer(index, value, association.target, precedence); FAILED(hr))
+            return hr;
+          if (exports_[index].stage == kOwnedRTStageLibrary)
+            for (size_t overload = first_new; overload < exports_.size(); ++overload) {
+              const auto &entry = exports_[overload];
+              if (overload != index && !entry.hidden && entry.stage == kOwnedRTStageLibrary &&
+                  (entry.name == name || entry.entry_point == name))
+                if (HRESULT hr = offer(overload, value, association.target, precedence); FAILED(hr))
+                  return hr;
+            }
+        }
+      } else {
+        const int precedence = association.scope == 0 ? 1 : 3;
+        for (size_t index = 0; index < exports_.size(); ++index) {
+          if (!candidate(index, association.scope))
+            continue;
+          if (HRESULT hr = offer(index, value, association.target, precedence); FAILED(hr))
             return hr;
         }
       }
     }
-
-    /**
-     * A shader configuration that no association names applies to every export.
-     * More than one such default is ambiguous and is rejected rather than picked
-     * by declaration order.
-     */
-    const D3D12_RAYTRACING_SHADER_CONFIG *default_shader_config = nullptr;
-    for (const auto &[index, config] : shader_configs) {
-      bool associated = false;
-      for (const auto &association : associations)
-        associated |= association.subobject_index == index;
-      if (!associated) {
-        if (default_shader_config)
-          return RejectStateObject("two shader configs are associated with nothing, so neither is the default");
-        default_shader_config = &config;
+    /* A subobject that no association of its own scope names is a default association of that scope. */
+    for (size_t a = 0; a < associables.size(); ++a) {
+      const Associable &value = associables[a];
+      if (value.explicitly_associated_in_scope)
+        continue;
+      const int precedence = value.scope == 0 ? 1 : 3;
+      for (size_t index = 0; index < exports_.size(); ++index) {
+        if (!candidate(index, value.scope))
+          continue;
+        if (HRESULT hr = offer(index, value, a, precedence); FAILED(hr))
+          return hr;
       }
     }
-    if (default_shader_config) {
-      for (auto &entry : exports_) {
-        if (!entry.has_shader_config) {
-          entry.shader_config = *default_shader_config;
-          entry.has_shader_config = true;
+    /* Associations carried by imported collections resolve against this description's subobjects. */
+    for (const auto &collection : imported_collections_) {
+      for (const auto &carried : collection->carried_associations_) {
+        const Associable *value = carried.has_value ? &carried.value : nullptr;
+        if (!value) {
+          auto found = dxil_associables.find(carried.subobject_name);
+          if (found == dxil_associables.end()) {
+            ERR("RT state object rejected: a collection depends on subobject ", Utf8Name(carried.subobject_name).c_str(),
+                ", which the containing state object does not define");
+            return E_INVALIDARG;
+          }
+          value = &associables[found->second];
+        }
+        for (size_t index = first_new; index < exports_.size(); ++index) {
+          Export &entry = exports_[index];
+          if (!entry.from_collection || entry.collection != collection.ptr())
+            continue;
+          const bool named = carried.exports.empty() ||
+              std::find(carried.exports.begin(), carried.exports.end(), entry.collection_name) != carried.exports.end();
+          if (!named)
+            continue;
+          if (ExportHasAssociable(entry, value->kind)) {
+            if (!SameAssociable(AssociableOf(entry, value->kind), *value))
+              return RejectStateObject("a collection's external association conflicts with one it resolved itself");
+            continue;
+          }
+          ApplyAssociable(entry, *value);
         }
       }
     }
+    /*
+     * An association made to a hit group applies to its members (D3D12 "Subobject associations
+     * for hit groups"), so it wins over anything weaker the members got by default.
+     */
+    for (size_t index = first_new; index < exports_.size(); ++index) {
+      const Export &group = exports_[index];
+      if (!group.hit_group || group.from_collection)
+        continue;
+      for (uint32_t member : {group.closest_hit, group.any_hit, group.intersection}) {
+        if (member == kOwnedRTNoExport || member < first_new)
+          continue;
+        for (AssociableKind kind : kAssociableKinds) {
+          const auto k = static_cast<size_t>(kind);
+          if (level[index][k] != -1 && (level[member][k] == -1 || level[member][k] > level[index][k])) {
+            level[member][k] = level[index][k];
+            chosen[member][k] = chosen[index][k];
+          }
+        }
+      }
+    }
+    for (size_t index = first_new; index < exports_.size(); ++index) {
+      for (AssociableKind kind : kAssociableKinds) {
+        const auto k = static_cast<size_t>(kind);
+        if (level[index][k] != -1)
+          ApplyAssociable(exports_[index], associables[chosen[index][k]]);
+      }
+    }
 
-    /** A hit group shares the local root signature and configuration of its members. */
-    for (auto &group : exports_) {
+    /*
+     * A hit group and its members share every association: what the group has its members get,
+     * and the members of a group without one have to agree with each other.
+     */
+    for (size_t index = first_new; index < exports_.size(); ++index) {
+      Export &group = exports_[index];
       if (!group.hit_group)
         continue;
       const uint32_t members[] = {group.closest_hit, group.any_hit, group.intersection};
-      for (uint32_t index : members) {
-        if (index == kOwnedRTNoExport)
-          continue;
-        Export &component = exports_[index];
-        if (group.local_root_signature) {
-          if (component.local_root_signature && component.local_root_signature != group.local_root_signature)
-            return RejectStateObject("a hit group and one of its members hold different local root signatures");
-          component.local_root_signature = group.local_root_signature;
+      for (AssociableKind kind : kAssociableKinds) {
+        Associable group_value = AssociableOf(group, kind);
+        bool have = ExportHasAssociable(group, kind);
+        for (uint32_t member : members) {
+          if (member == kOwnedRTNoExport || !ExportHasAssociable(exports_[member], kind))
+            continue;
+          const Associable member_value = AssociableOf(exports_[member], kind);
+          if (have && !SameAssociable(group_value, member_value)) {
+            ERR("RT state object rejected: hit group ", Utf8Name(group.name).c_str(), " and a member hold different ",
+                AssociableName(kind), "s");
+            return E_INVALIDARG;
+          }
+          if (!have) {
+            group_value = member_value;
+            have = true;
+          }
         }
-        if (group.has_shader_config) {
-          if (component.has_shader_config &&
-              (component.shader_config.MaxAttributeSizeInBytes != group.shader_config.MaxAttributeSizeInBytes ||
-               component.shader_config.MaxPayloadSizeInBytes != group.shader_config.MaxPayloadSizeInBytes))
-            return RejectStateObject("a hit group and one of its members hold different shader configs");
-          component.shader_config = group.shader_config;
-          component.has_shader_config = true;
+        if (!have)
+          continue;
+        ApplyAssociable(group, group_value);
+        for (uint32_t member : members) {
+          if (member != kOwnedRTNoExport && !ExportHasAssociable(exports_[member], kind))
+            ApplyAssociable(exports_[member], group_value);
         }
       }
     }
 
     if (!is_pipeline_)
-      return S_OK;
+      return ValidateCollection();
+    return FinishPipeline(parent);
+  }
 
-    if (!have_pipeline_config)
-      return RejectStateObject("a raytracing pipeline has no raytracing pipeline config");
+  /**
+   * A collection without ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS has to be complete on
+   * its own: every export needs its shader and pipeline configs, exactly what a pipeline would
+   * require of it. With the flag, anything left open is resolved by the containing pipeline.
+   */
+  HRESULT ValidateCollection() {
+    const bool allow_unresolved = state_flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS;
+    std::vector<SM50_WG_LIBRARY> libraries;
+    for (const auto &library : libraries_)
+      libraries.push_back({library.bytecode.data(), library.bytecode.size()});
+    std::vector<std::string> names(exports_.size()), symbols(exports_.size());
+    std::vector<SM50_WG_EXPORT> functions;
+    for (size_t i = 0; i < exports_.size(); ++i) {
+      const auto &entry = exports_[i];
+      if (entry.hit_group)
+        continue;
+      if (!WideToUtf8(entry.name, names[i]) || !WideToUtf8(entry.entry_point, symbols[i]))
+        return RejectStateObject("a collection function has an invalid name");
+      SM50_WG_EXPORT function{names[i].c_str(), symbols[i].c_str(), static_cast<uint32_t>(entry.library_index),
+          1, state_flags_, entry.hidden ? 1u : 0u};
+      if (entry.global_root_signature)
+        function.GlobalRootSignatureSize = entry.global_root_signature->GetBlob(&function.GlobalRootSignature);
+      if (entry.local_root_signature)
+        function.LocalRootSignatureSize = entry.local_root_signature->GetBlob(&function.LocalRootSignature);
+      functions.push_back(function);
+    }
+    for (const auto &function : functions) {
+      SM50_WG_NODE_COMPILE_DESC desc{};
+      desc.Library = libraries[function.LibraryIndex].Bytecode;
+      desc.LibrarySize = libraries[function.LibraryIndex].Size;
+      desc.EntryPoint = function.EntryPoint;
+      desc.FunctionName = function.Name;
+      desc.GlobalRootSignature = function.GlobalRootSignature;
+      desc.GlobalRootSignatureSize = function.GlobalRootSignatureSize;
+      desc.LocalRootSignature = function.LocalRootSignature;
+      desc.LocalRootSignatureSize = function.LocalRootSignatureSize;
+      desc.Libraries = libraries.data();
+      desc.LibraryCount = libraries.size();
+      desc.Exports = functions.data();
+      desc.ExportCount = functions.size();
+      desc.EntryLibraryIndex = function.LibraryIndex;
+      desc.EntryExportIndex = &function - functions.data();
+      desc.AllowUnresolved = allow_unresolved;
+      desc.Reserved = 1; // Validate dependencies and required resource bindings without emitting AIR.
+
+      SM50ShaderBitcode bitcode;
+      SM50_COMPILED_BITCODE metallib{};
+      SM50_WG_NODE_COMPILED_INFO info{};
+      sm50_error_t error = nullptr;
+      const bool valid = SM50WGCompileNode(&desc, &bitcode, &metallib, &info, &error);
+      if (!valid)
+        ERR("RT collection dependency validation failed: ", DescribeCompilerError(error));
+      SM50FreeError(error);
+      if (!valid)
+        return E_INVALIDARG;
+    }
+    if (allow_unresolved)
+      return S_OK;
     for (const auto &entry : exports_) {
-      if (!entry.has_shader_config) {
-        std::string name;
-        WideToUtf8(entry.name, name);
-        ERR("RT state object rejected: export ", name.c_str(), " has no raytracing shader config");
+      if (entry.stage == kOwnedRTStageLibrary)
+        continue;
+      if (!entry.has_shader_config || !entry.has_pipeline_config) {
+        ERR("RT state object rejected: collection export ", Utf8Name(entry.name).c_str(),
+            " has no raytracing shader or pipeline config, and the collection does not set "
+            "ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS");
         return E_INVALIDARG;
       }
     }
-    /**
-     * DispatchRays selects a ray generation shader through the GPU SBT record.
-     * The pipeline must contain at least one ray generation shader.
+    return S_OK;
+  }
+
+  HRESULT FinishPipeline(const MTLD3D12StateObjectImpl *parent) {
+    /*
+     * Shader and pipeline configs: required on every export and matching across all of them
+     * (D3D12 "Subobject association requirements": full state object scope).
      */
+    const Export *first_config = nullptr;
+    for (const auto &entry : exports_) {
+      if (entry.stage == kOwnedRTStageLibrary)
+        continue;
+      if (!entry.has_shader_config || !entry.has_pipeline_config) {
+        ERR("RT state object rejected: export ", Utf8Name(entry.name).c_str(),
+            " has no raytracing shader config or no raytracing pipeline config");
+        return E_INVALIDARG;
+      }
+      if (!first_config) {
+        first_config = &entry;
+        continue;
+      }
+      if (entry.pipeline_config.MaxTraceRecursionDepth != first_config->pipeline_config.MaxTraceRecursionDepth ||
+          entry.pipeline_config.Flags != first_config->pipeline_config.Flags)
+        return RejectStateObject("the exports of a raytracing pipeline hold different pipeline configs");
+      if (entry.shader_config.MaxPayloadSizeInBytes != first_config->shader_config.MaxPayloadSizeInBytes ||
+          entry.shader_config.MaxAttributeSizeInBytes != first_config->shader_config.MaxAttributeSizeInBytes)
+        return RejectStateObject("the exports of a raytracing pipeline hold different shader configs");
+    }
+    if (!first_config)
+      return RejectStateObject("a raytracing pipeline has no exports");
+    pipeline_config_.MaxTraceRecursionDepth = first_config->pipeline_config.MaxTraceRecursionDepth;
+    pipeline_flags_ = first_config->pipeline_config.Flags;
+
+    /*
+     * One global root signature per pipeline: the compute root signature DispatchRays binds
+     * is the global root signature of every shader the dispatch can reach, and an export with
+     * none uses only its local root signature. Different global root signatures on different
+     * exports would need one compiled pipeline per signature.
+     */
+    MTLD3D12RootSignature *global = nullptr;
+    for (const auto &entry : exports_) {
+      if (!entry.global_root_signature)
+        continue;
+      if (global && !SameRootSignature(global, entry.global_root_signature))
+        return RejectStateObject(
+            "the exports of one raytracing pipeline are associated with different global root signatures"
+        );
+      global = global ? global : entry.global_root_signature;
+    }
+    if (parent && global_root_ && global && !SameRootSignature(global_root_, global))
+      return RejectStateObject("an AddToStateObject addition uses a different global root signature");
+    global_root_ = global ? global : global_root_;
+
     size_t raygen_count = 0;
     for (const auto &entry : exports_) {
       if (!entry.hit_group && entry.stage == kOwnedRTStageRayGeneration)
@@ -1347,12 +1831,374 @@ public:
     HRESULT hr = BuildDispatchRootSignature();
     if (FAILED(hr))
       return hr;
-    hr = BuildLocalRootLayouts();
-    if (FAILED(hr))
-      return hr;
     return CompilePipeline();
   }
 
+  /**
+   * Add one DXIL library subobject's exports. `subobjects` holds (declared name, published
+   * name) for each DXIL subobject of the library; with an export list, a subobject the list
+   * does not name gets an empty published name, and a renamed one its new name.
+   */
+  HRESULT AddLibrary(
+      const D3D12_DXIL_LIBRARY_DESC &library_desc, std::vector<std::pair<std::wstring, std::wstring>> &subobjects
+  ) {
+    if (!library_desc.DXILLibrary.pShaderBytecode || !library_desc.DXILLibrary.BytecodeLength ||
+        (library_desc.NumExports && !library_desc.pExports))
+      return RejectStateObject("a DXIL library subobject has no bytecode, or an export list with no entries");
+    Library library;
+    const auto *bytes = static_cast<const uint8_t *>(library_desc.DXILLibrary.pShaderBytecode);
+    library.bytecode.assign(bytes, bytes + library_desc.DXILLibrary.BytecodeLength);
+    std::vector<LibraryExport> reflected;
+    HRESULT hr = EnumerateLibraryExports(library_desc.DXILLibrary, reflected);
+    if (FAILED(hr))
+      return hr;
+    if (!library_desc.NumExports) {
+      /* Ordinary functions are legal exports but are never shader-table entries. */
+      for (const auto &reflected_export : reflected) {
+        if (!IsRaytracingStage(reflected_export.stage) && reflected_export.stage != kOwnedRTStageLibrary) {
+          ERR("RT state object rejected: library export ", Utf8Name(reflected_export.name).c_str(), " has stage ",
+              reflected_export.stage, ", which is not a raytracing stage");
+          return E_INVALIDARG;
+        }
+      }
+      library.exports = std::move(reflected);
+    } else {
+      std::vector<bool> listed(subobjects.size(), false);
+      std::vector<std::wstring> published(subobjects.size());
+      for (UINT j = 0; j < library_desc.NumExports; ++j) {
+        const auto &source = library_desc.pExports[j];
+        LibraryExport target;
+        if (!CopyName(source.Name, target.name))
+          return RejectStateObject("a DXIL library export has an empty name");
+        /*
+         * D3D12 names the library's own export in ExportToRename when that is present and in
+         * Name otherwise, and either spelling is allowed there: the container's entry point
+         * name is the mangled one, while the name the library publishes is the unmangled one.
+         */
+        const WCHAR *internal = source.ExportToRename ? source.ExportToRename : source.Name;
+        bool is_subobject = false;
+        for (size_t k = 0; k < subobjects.size(); ++k) {
+          if (subobjects[k].first != internal)
+            continue;
+          listed[k] = true;
+          published[k] = target.name;
+          is_subobject = true;
+        }
+        if (is_subobject)
+          continue;
+        const LibraryExport *match = nullptr;
+        unsigned matches = 0;
+        for (const auto &candidate : reflected) {
+          if (candidate.name == internal || candidate.entry_point == internal) {
+            match = &candidate;
+            matches++;
+          }
+        }
+        if (!matches) {
+          ERR("RT state object rejected: the library does not declare entry point ", Utf8Name(internal).c_str());
+          return E_INVALIDARG;
+        }
+        if (matches > 1) {
+          for (const auto &candidate : reflected) {
+            if (candidate.name != internal && candidate.entry_point != internal)
+              continue;
+            if (candidate.stage != kOwnedRTStageLibrary)
+              return RejectStateObject("a shader export name is ambiguous");
+            auto overload = target;
+            overload.entry_point = candidate.entry_point;
+            overload.stage = candidate.stage;
+            library.exports.push_back(std::move(overload));
+          }
+          continue;
+        }
+        if (!IsRaytracingStage(match->stage) && match->stage != kOwnedRTStageLibrary) {
+          ERR("RT state object rejected: library export ", Utf8Name(internal).c_str(), " has stage ", match->stage,
+              ", which is not a raytracing stage");
+          return E_INVALIDARG;
+        }
+        target.entry_point = match->entry_point;
+        target.stage = match->stage;
+        library.exports.push_back(std::move(target));
+      }
+      for (size_t k = 0; k < subobjects.size(); ++k)
+        subobjects[k].second = listed[k] ? published[k] : std::wstring();
+    }
+    for (const auto &target : library.exports) {
+      Export entry;
+      entry.name = target.name;
+      entry.entry_point = target.entry_point;
+      entry.stage = target.stage;
+      entry.library_index = libraries_.size();
+      hr = AddExport(std::move(entry));
+      if (FAILED(hr))
+        return hr;
+    }
+    libraries_.push_back(std::move(library));
+    return S_OK;
+  }
+
+  /**
+   * Import an existing collection. Its exports keep the associations the collection resolved
+   * and its hit groups their members; a hit group whose member the export list leaves out
+   * still compiles that member, as an export the application cannot name.
+   */
+  HRESULT AddCollection(const D3D12_EXISTING_COLLECTION_DESC &collection) {
+    if (!collection.pExistingCollection || (collection.NumExports && !collection.pExports))
+      return RejectStateObject("an existing collection subobject has no collection, or an export list with no entries");
+    Com<ID3D12Device> collection_device;
+    if (FAILED(collection.pExistingCollection->GetDevice(
+            __uuidof(ID3D12Device), reinterpret_cast<void **>(&collection_device)
+        )) ||
+        collection_device.ptr() != static_cast<ID3D12Device *>(device_))
+      return RejectStateObject("an existing collection belongs to a different device");
+    auto *existing = dynamic_cast<MTLD3D12StateObjectImpl *>(collection.pExistingCollection);
+    if (auto *functions = dynamic_cast<MTLD3D12WorkGraph *>(collection.pExistingCollection))
+      return AddFunctionCollection(collection, *functions);
+    if (!existing || existing->is_pipeline_)
+      return RejectStateObject("an existing collection subobject does not hold a collection this backend created");
+    if (!is_pipeline_)
+      return RejectStateObject("a collection cannot be built from another collection");
+    imported_collections_.emplace_back(existing);
+
+    /* The collection's libraries come along; its exports' library indexes are rebased. */
+    const size_t library_base = libraries_.size();
+    const uint32_t scope = next_collection_scope_++;
+    libraries_.insert(libraries_.end(), existing->libraries_.begin(), existing->libraries_.end());
+    retained_roots_.insert(retained_roots_.end(), existing->retained_roots_.begin(), existing->retained_roots_.end());
+
+    const auto &source_exports = existing->exports_;
+    std::vector<size_t> mapped(source_exports.size(), SIZE_MAX);
+    auto import = [&](size_t source_index, std::wstring public_name, bool hidden) -> HRESULT {
+      if (mapped[source_index] != SIZE_MAX) {
+        if (!hidden)
+          return RejectStateObject("a collection export is imported twice");
+        return S_OK;
+      }
+      Export entry = source_exports[source_index];
+      entry.collection_name = entry.name;
+      entry.name = std::move(public_name);
+      entry.hidden = hidden;
+      entry.from_collection = true;
+      entry.collection = existing;
+      entry.scope = scope;
+      entry.collection_flags = existing->state_flags_;
+      entry.library_index += library_base;
+      entry.identifier = {};
+      entry.compiled = false;
+      entry.metal_function.clear();
+      mapped[source_index] = exports_.size();
+      return AddExport(std::move(entry));
+    };
+    if (!collection.NumExports) {
+      for (const auto &[name, value] : existing->exported_root_signatures_)
+        if (HRESULT hr = AddRootExport(name, value.root, scope); FAILED(hr))
+          return hr;
+      for (size_t i = 0; i < source_exports.size(); ++i) {
+        if (HRESULT hr = import(i, source_exports[i].name, source_exports[i].hidden); FAILED(hr))
+          return hr;
+      }
+    } else {
+      for (UINT j = 0; j < collection.NumExports; ++j) {
+        const auto &rename = collection.pExports[j];
+        std::wstring public_name;
+        if (!CopyName(rename.Name, public_name) || rename.Flags != D3D12_EXPORT_FLAG_NONE)
+          return RejectStateObject("a collection export has an invalid name or flags");
+        const WCHAR *source_name = rename.ExportToRename ? rename.ExportToRename : rename.Name;
+        bool root_found = false;
+        for (const auto &[name, value] : existing->exported_root_signatures_) {
+          if (name != source_name)
+            continue;
+          if (HRESULT hr = AddRootExport(public_name, value.root, scope); FAILED(hr))
+            return hr;
+          root_found = true;
+          break;
+        }
+        if (root_found)
+          continue;
+        const size_t index = FindExportIndexByName(source_exports, source_name);
+        if (index == source_exports.size())
+          return RejectStateObject("the collection does not hold the export being imported");
+        if (source_exports[index].stage == kOwnedRTStageLibrary) {
+          for (size_t overload = 0; overload < source_exports.size(); ++overload) {
+            const auto &entry = source_exports[overload];
+            if (!entry.hidden && entry.stage == kOwnedRTStageLibrary &&
+                (entry.name == source_name || entry.entry_point == source_name))
+              if (HRESULT hr = import(overload, public_name, false); FAILED(hr))
+                return hr;
+          }
+        } else if (HRESULT hr = import(index, std::move(public_name), false); FAILED(hr)) {
+          return hr;
+        }
+      }
+    }
+    // Unpublished ordinary functions remain dependencies inside the collection namespace.
+    for (size_t i = 0; i < source_exports.size(); ++i)
+      if (mapped[i] == SIZE_MAX && source_exports[i].stage == kOwnedRTStageLibrary)
+        if (HRESULT hr = import(i, source_exports[i].name, true); FAILED(hr))
+          return hr;
+    /* Members of an imported hit group come along even when the export list left them out. */
+    for (size_t i = 0; i < source_exports.size(); ++i) {
+      if (mapped[i] == SIZE_MAX || !source_exports[i].hit_group)
+        continue;
+      for (uint32_t member : {source_exports[i].closest_hit, source_exports[i].any_hit, source_exports[i].intersection}) {
+        if (member == kOwnedRTNoExport || mapped[member] != SIZE_MAX)
+          continue;
+        std::wstring hidden_name = source_exports[i].name + L"::" + source_exports[member].name;
+        if (HRESULT hr = import(member, std::move(hidden_name), true); FAILED(hr))
+          return hr;
+      }
+    }
+    for (size_t i = 0; i < source_exports.size(); ++i) {
+      if (mapped[i] == SIZE_MAX || !source_exports[i].hit_group)
+        continue;
+      Export &group = exports_[mapped[i]];
+      for (uint32_t *member : {&group.closest_hit, &group.any_hit, &group.intersection}) {
+        if (*member != kOwnedRTNoExport)
+          *member = static_cast<uint32_t>(mapped[*member]);
+      }
+    }
+    return S_OK;
+  }
+
+  HRESULT AddFunctionCollection(const D3D12_EXISTING_COLLECTION_DESC &collection, MTLD3D12WorkGraph &source) {
+    if (!source.IsCollection() || !is_pipeline_)
+      return RejectStateObject("an existing collection subobject does not hold an importable collection");
+    imported_function_collections_.emplace_back(&source);
+    const size_t library_base = libraries_.size();
+    for (const auto &bytes : source.Libraries()) {
+      Library library;
+      library.bytecode = bytes;
+      libraries_.push_back(std::move(library));
+    }
+    const uint32_t scope = next_collection_scope_++;
+    std::vector<bool> imported(source.Exports().size(), false);
+    auto import = [&](const MTLD3D12WorkGraph::Node &function, std::wstring name, bool hidden = false) -> HRESULT {
+      if (function.info.Launch != 0)
+        return RejectStateObject("a raytracing pipeline cannot import a work-graph node");
+      Export entry;
+      entry.name = std::move(name);
+      if (!CopyUtf8Name(function.entry.c_str(), entry.entry_point))
+        return RejectStateObject("a collection function has no usable container symbol");
+      entry.stage = kOwnedRTStageLibrary;
+      entry.library_index = library_base + function.library;
+      entry.scope = scope;
+      entry.collection_flags = source.Flags();
+      entry.from_collection = true;
+      entry.collection = &source;
+      entry.collection_name = function.shader;
+      entry.hidden = hidden;
+      imported[&function - source.Exports().data()] = true;
+      entry.local_root_signature = function.local_root.ptr();
+      entry.global_root_signature = function.global_root.ptr();
+      if (function.local_root)
+        retained_roots_.emplace_back(function.local_root.ptr());
+      if (function.global_root)
+        retained_roots_.emplace_back(function.global_root.ptr());
+      return AddExport(std::move(entry));
+    };
+    if (!collection.NumExports) {
+      for (const auto &root : source.Roots()) {
+        retained_roots_.emplace_back(root.root.ptr());
+        if (HRESULT hr = AddRootExport(root.name, root.root.ptr(), scope); FAILED(hr))
+          return hr;
+      }
+      for (const auto &function : source.Exports())
+        if (function.exported)
+          if (HRESULT hr = import(function, function.shader); FAILED(hr))
+            return hr;
+    } else {
+      for (UINT i = 0; i < collection.NumExports; ++i) {
+        const auto &rename = collection.pExports[i];
+        std::wstring name;
+        if (!CopyName(rename.Name, name) || rename.Flags != D3D12_EXPORT_FLAG_NONE)
+          return RejectStateObject("a collection export has an invalid name or flags");
+        const WCHAR *original = rename.ExportToRename ? rename.ExportToRename : rename.Name;
+        bool found = false;
+        for (const auto &root : source.Roots()) {
+          if (root.name != original)
+            continue;
+          retained_roots_.emplace_back(root.root.ptr());
+          if (HRESULT hr = AddRootExport(name, root.root.ptr(), scope); FAILED(hr))
+            return hr;
+          found = true;
+          break;
+        }
+        if (found)
+          continue;
+        for (const auto &function : source.Exports()) {
+          std::wstring symbol;
+          if (!function.exported || !CopyUtf8Name(function.entry.c_str(), symbol))
+            continue;
+          if (function.shader != original && symbol != original)
+            continue;
+          found = true;
+          if (HRESULT hr = import(function, name); FAILED(hr))
+            return hr;
+        }
+        if (!found)
+          return RejectStateObject("the collection does not hold the export being imported");
+      }
+    }
+    for (size_t i = 0; i < source.Exports().size(); ++i) {
+      const auto &function = source.Exports()[i];
+      if (!imported[i] && function.info.Launch == 0)
+        if (HRESULT hr = import(function, function.shader, true); FAILED(hr))
+          return hr;
+    }
+    return S_OK;
+  }
+
+  /** Resolve the members of every hit group this description declares. */
+  HRESULT ResolveHitGroups() {
+    for (size_t group_index = first_local_export_; group_index < exports_.size(); ++group_index) {
+      auto &group = exports_[group_index];
+      if (!group.hit_group || group.from_collection)
+        continue;
+      struct {
+        std::wstring *name;
+        uint32_t *index;
+        uint32_t stage;
+      } members[] = {
+          {&group.closest_hit_name, &group.closest_hit, kOwnedRTStageClosestHit},
+          {&group.any_hit_name, &group.any_hit, kOwnedRTStageAnyHit},
+          {&group.intersection_name, &group.intersection, kOwnedRTStageIntersection},
+      };
+      for (auto &member : members) {
+        *member.index = kOwnedRTNoExport;
+        if (member.name->empty())
+          continue;
+        /* Exported or library (mangled) name; never an AddToStateObject parent's export. */
+        size_t index = FindExportIndexByName(exports_, *member.name);
+        if (index < first_local_export_)
+          index = exports_.size();
+        if (index == exports_.size()) {
+          ERR("RT state object rejected: a hit group member ", Utf8Name(*member.name).c_str(),
+              " is not an export of this state object");
+          return E_INVALIDARG;
+        }
+        Export &component = exports_[index];
+        if (component.hit_group || component.stage != member.stage) {
+          ERR("RT state object rejected: hit group member ", Utf8Name(*member.name).c_str(), " has stage ",
+              component.stage, " where stage ", member.stage, " is required");
+          return E_INVALIDARG;
+        }
+        *member.index = static_cast<uint32_t>(index);
+      }
+      /* The group compiles as one function, out of its primary member's library and entry point. */
+      const uint32_t primary = group.hit_group_type == D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE
+          ? group.intersection
+          : (group.closest_hit != kOwnedRTNoExport ? group.closest_hit : group.any_hit);
+      if (primary == kOwnedRTNoExport) {
+        ERR("RT state object rejected: hit group ", Utf8Name(group.name).c_str(), " resolved no shader to compile");
+        return E_INVALIDARG;
+      }
+      group.entry_point = exports_[primary].entry_point;
+      group.library_index = exports_[primary].library_index;
+    }
+    return S_OK;
+  }
+
+public:
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
     if (!object)
       return E_POINTER;
@@ -1386,18 +2232,67 @@ public:
   }
 
   /**
-   * No application visible stack: Metal owns the traversal state, so every export
-   * that exists reports a zero sized shader stack and SetPipelineStackSize is
-   * free to keep whatever the application asked for.
+   * D3D12 reports per-shader stack sizes for raygen, miss and callable exports and, through
+   * "hitGroup::closesthit|anyhit|intersection", for each member of a hit group; a hit group
+   * itself, a hit-group member named directly, an unknown name or a shader that is not fully
+   * resolved report 0xffffffff (a 32-bit value, so a sum of them stays detectable).
+   *
+   * The compiled shaders use no application-visible stack: TraceRay/CallShader state lives in
+   * per-call-site invocation blocks of the caller's Metal frame, and recursion is bounded by the
+   * pipeline's Metal max_call_stack_depth, not by SetPipelineStackSize. So every valid query is
+   * exactly 0, and the default pipeline stack size computed from them is 0 as well.
    */
   UINT64 STDMETHODCALLTYPE GetShaderStackSize(const WCHAR *name) override {
-    return FindExport(name) ? 0 : UINT64_MAX;
+    constexpr UINT64 kInvalid = 0xffffffffu;
+    if (!name)
+      return kInvalid;
+    const std::wstring query = name;
+    const size_t separator = query.find(L"::");
+    const Export *entry = nullptr;
+    if (separator == std::wstring::npos) {
+      entry = FindExport(name);
+      if (!entry || entry->hit_group)
+        return kInvalid;
+      switch (entry->stage) {
+      case kOwnedRTStageRayGeneration:
+      case kOwnedRTStageMiss:
+      case kOwnedRTStageCallable:
+        break;
+      default:
+        return kInvalid;
+      }
+    } else {
+      const Export *group = FindExport(query.substr(0, separator).c_str());
+      if (!group || !group->hit_group)
+        return kInvalid;
+      const std::wstring type = query.substr(separator + 2);
+      const uint32_t member = type == L"closesthit" ? group->closest_hit
+          : type == L"anyhit"                       ? group->any_hit
+          : type == L"intersection"                 ? group->intersection
+                                                    : kOwnedRTNoExport;
+      entry = FindExport(member);
+      if (!entry)
+        return kInvalid;
+    }
+    /* A shader is fully resolved once it has its shader and pipeline configs. */
+    if (!entry->has_shader_config || !entry->has_pipeline_config)
+      return kInvalid;
+    return 0;
   }
 
-  UINT64 STDMETHODCALLTYPE GetPipelineStackSize() override { return pipeline_stack_size_; }
+  UINT64 STDMETHODCALLTYPE GetPipelineStackSize() override { return is_pipeline_ ? pipeline_stack_size_ : 0; }
 
-  void STDMETHODCALLTYPE SetPipelineStackSize(UINT64 size) override { pipeline_stack_size_ = size; }
+  /**
+   * D3D12 drops the call on anything but a raytracing pipeline and for sizes >= 0xffffffff
+   * (the likely sum of invalid GetShaderStackSize results), keeping the previous size.
+   */
+  void STDMETHODCALLTYPE SetPipelineStackSize(UINT64 size) override {
+    if (!is_pipeline_ || size >= 0xffffffffu)
+      return;
+    pipeline_stack_size_ = size;
+  }
 
+  /** The export the application names `name`; hidden hit-group members have no public name. */
   const Export *FindExport(const WCHAR *name) const override {
     if (!name)
       return nullptr;
@@ -1453,41 +2348,6 @@ public:
   WMT::Reference<WMT::VisibleFunctionTable> GetVisibleFunctionTable() const override {
     return visible_function_table_;
   }
-
-  WMT::Reference<WMT::ComputePipelineState> GetShaderTablePreparePipeline() override {
-    if (shader_table_prepare_pipeline_)
-      return shader_table_prepare_pipeline_;
-    auto device = device_->GetMTLDevice();
-    WMT::Reference<WMT::Error> error;
-    auto library = device.newLibraryWithSource(
-        std::string_view(raytracing::kShaderTablePrepareMSL, sizeof(raytracing::kShaderTablePrepareMSL) - 1), error
-    );
-    if (!library) {
-      ERR("RT shader table preparation library failed: ",
-          error ? error.description().getUTF8String() : "no Metal error");
-      return {};
-    }
-    auto function = library.newFunction(raytracing::kShaderTablePrepareFunction);
-    if (!function) {
-      ERR("RT shader table preparation function missing");
-      return {};
-    }
-    shader_table_prepare_pipeline_ = device.newComputePipelineState(function, error);
-    if (!shader_table_prepare_pipeline_) {
-      ERR("RT shader table preparation pipeline failed: ",
-          error ? error.description().getUTF8String() : "no Metal error");
-      return {};
-    }
-    return shader_table_prepare_pipeline_;
-  }
-
-  const std::vector<raytracing::LocalRootLayout> &GetLocalRootLayouts() const override {
-    return local_root_layouts_;
-  }
-  const std::vector<raytracing::LocalRootCopy> &GetLocalRootCopies() const override {
-    return local_root_copies_;
-  }
-  uint32_t GetLocalRootEntryStride() const override { return local_root_entry_stride_; }
 };
 
 /** Per device token source so identifiers are unique across state objects. */
@@ -1500,6 +2360,8 @@ uint32_t NextPipelineToken() {
 
 HRESULT
 CreateStateObject(MTLD3D12Device *device, const D3D12_STATE_OBJECT_DESC *desc, REFIID riid, void **state_object) {
+  if (desc && (uint32_t(desc->Type) == kStateObjectTypeExecutable || IsWorkGraphCollection(desc)))
+    return CreateWorkGraphStateObject(device, desc, nullptr, riid, state_object);
   InitReturnPtr(state_object);
   if (!state_object)
     return E_POINTER;
@@ -1507,6 +2369,34 @@ CreateStateObject(MTLD3D12Device *device, const D3D12_STATE_OBJECT_DESC *desc, R
   if (!object)
     return E_OUTOFMEMORY;
   HRESULT hr = object->Initialize(desc);
+  if (FAILED(hr))
+    return hr;
+  return object->QueryInterface(riid, state_object);
+}
+
+HRESULT AddToStateObject(
+    MTLD3D12Device *device, const D3D12_STATE_OBJECT_DESC *addition, ID3D12StateObject *parent, REFIID riid,
+    void **state_object
+) {
+  if (addition && uint32_t(addition->Type) == kStateObjectTypeExecutable)
+    return CreateWorkGraphStateObject(device, addition, parent, riid, state_object);
+  InitReturnPtr(state_object);
+  if (!state_object)
+    return E_POINTER;
+  if (!parent)
+    return RejectStateObject("AddToStateObject has no state object to grow from");
+  Com<ID3D12Device> parent_device;
+  if (FAILED(parent->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&parent_device))) ||
+      parent_device.ptr() != static_cast<ID3D12Device *>(device))
+    return RejectStateObject("AddToStateObject grows a state object of a different device");
+  auto *source = dynamic_cast<MTLD3D12StateObjectImpl *>(parent);
+  if (!source)
+    return RejectStateObject("AddToStateObject grows a state object this backend did not create");
+  /* The child takes the parent's token in Initialize, so no fresh one is drawn here. */
+  auto object = Com(new (std::nothrow) MTLD3D12StateObjectImpl(device, 0));
+  if (!object)
+    return E_OUTOFMEMORY;
+  HRESULT hr = object->Initialize(addition, source);
   if (FAILED(hr))
     return hr;
   return object->QueryInterface(riid, state_object);

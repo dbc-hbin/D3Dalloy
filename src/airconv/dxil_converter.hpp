@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,7 @@
 
 #include "dxbc_converter.hpp"
 #include "shader_common.hpp"
+#include "dxil_workgraph.h"
 
 namespace dxmt::dxil {
 
@@ -182,8 +184,10 @@ shader::common::ResourceType to_resource_type(ResourceKind kind);
 
 /** One ISG1/OSG1/PSG1 signature element. */
 struct SigElement {
-  /** Ordinal inside the signature chunk (0-based). */
+  /** DXIL metadata signature element ID; several packed rows can share this ID. */
   uint32_t id = 0;
+  /** This packed chunk row's relative row within the metadata element. */
+  uint32_t element_row = 0;
   uint32_t semantic_index = 0;
   std::string name;
   /** microsoft::D3D_REGISTER_COMPONENT_TYPE */
@@ -282,6 +286,18 @@ struct DomainState {
   uint32_t input_control_points = 0;
 };
 
+/**
+ * Mesh entry `!dx.entryPoints` tag 9 {numthreads, max vertices, max primitives, output topology
+ * (DXIL::MeshOutputTopology: 1 line, 2 triangle), payload bytes} and amplification entry tag 10
+ * {numthreads, payload bytes}. dxil_mesh.cpp lowers both stages.
+ */
+struct MeshState {
+  uint32_t max_vertices = 0;
+  uint32_t max_primitives = 0;
+  uint32_t output_topology = 0;
+  uint32_t payload_size = 0;
+};
+
 struct ModuleInfo {
   /** Owned context: typed pointers, DXIL bitcode constraints preserved. */
   std::unique_ptr<llvm::LLVMContext> context;
@@ -304,6 +320,7 @@ struct ModuleInfo {
   GeometryState geometry;
   HullState hull;
   DomainState domain;
+  MeshState mesh;
   /** HS only: the patch-constant function named by `!dx.entryPoints` tag 3. */
   llvm::Function *patch_constant_function = nullptr;
 
@@ -346,9 +363,11 @@ struct ShaderMetadata {
   GeometryState geometry;
   HullState hull;
   DomainState domain;
+  MeshState mesh;
   uint32_t output_register_mask = 0;
   uint32_t max_output_register = 0;
   bool has_coverage_output = false;
+  bool force_early_depth_stencil = false;
   std::vector<SigElement> input_sig;
   std::vector<SigElement> output_sig;
   std::vector<SigElement> patch_constant_sig;
@@ -357,6 +376,10 @@ struct ShaderMetadata {
 
 llvm::Expected<ShaderMetadata>
 ParseMetadata(const void *bytecode, size_t size, const char *entry_name = nullptr);
+
+/** RDAT function names, keyed by their exact LLVM/container names (including overloads). */
+bool ReadLibraryFunctionNames(const void *bytecode, uint64_t size, std::map<std::string, std::string> &names);
+llvm::Error LinkLibraryDependencies(ModuleInfo &info, const SM50_WG_NODE_COMPILE_DESC &desc);
 
 // ---------------------------------------------------------------------------
 // Lowering
@@ -368,6 +391,16 @@ ParseMetadata(const void *bytecode, size_t size, const char *entry_name = nullpt
  * and `shader`.
  */
 llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
+  ModuleInfo &module, dxbc::SM50ShaderInternal &shader, const char *function_name,
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *args
+);
+
+/**
+ * Mesh / amplification entry (dxil_mesh.cpp): builds the AIR `[[mesh]]` or `[[object]]`
+ * function, lowers the mesh output, payload and dispatch operations and the thread
+ * system values. LowerStage forwards these stages here.
+ */
+llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
   ModuleInfo &module, dxbc::SM50ShaderInternal &shader, const char *function_name,
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *args
 );
@@ -398,8 +431,11 @@ struct RaytracingExportContext {
   /** Group export -> visible closest-hit slot, or NONE for a group without one. */
   const uint32_t *hit_group_continuations = nullptr;
   uint32_t hit_group_continuation_count = 0;
-  /** Local root table slot/stride the record's local root arguments are read from. */
-  uint32_t local_root_table_slot = 22;
+  /** Metal intersection callbacks cannot trace inline. Such pipelines enumerate
+   * candidates in the calling kernel and invoke their hit shaders as visible functions. */
+  bool query_callbacks = false;
+  const uint32_t *hit_group_any_hits = nullptr;
+  const uint32_t *hit_group_intersections = nullptr;
   /** Binding slots of the pipeline-wide tables (dxil_raytracing.h). */
   uint32_t dispatch_arguments_slot = 20;
   uint32_t intersection_function_table_slot = 21;
@@ -484,6 +520,16 @@ llvm::Error MergeRaytracingExport(
 llvm::Error LowerRaytracingOperations(
   ModuleInfo &info, const RaytracingExportContext &context, llvm::StringRef entry_name
 );
+
+/**
+ * Replace `dx.op.rayQuery_TraceRayInline` by the internal form LowerRayQueries
+ * consumes, with the acceleration structure handle replaced by the i64 D3D12 GPU
+ * virtual address its descriptor holds (dxil_rt_query.cpp).
+ */
+llvm::Error RewriteTraceRayInline(llvm::CallInst &call, llvm::Value *gpu_address);
+
+/** Lower every inline RayQuery operation of a module to AIR intersection_query (any stage). */
+llvm::Error LowerRayQueries(llvm::Module &module);
 
 /**
  * Resolved arguments of a lowered raytracing export, recovered from the AIR entry
@@ -617,17 +663,7 @@ public:
   llvm::SmallVector<uint8_t, 0> constants;
   llvm::SmallVector<SM50_CONSTANT_RELOCATION, 0> constant_relocations;
   uint64_t constant_alignment = 1;
-  /**
-   * The function names the raytracing reflection points at.
-   *
-   * `SM50_RT_FUNCTION_INFO::Name` is a bare `const char *` handed to the caller, so the
-   * strings it points at have to outlive the compile call. A raytracing pipeline builds
-   * them in a local vector, which dies on return and leaves the reflection naming freed
-   * memory - the runtime then sees an unnamed function. The vector is moved into this
-   * object, which the caller owns through `sm50_bitcode_t` until `SM50DestroyBitcode`,
-   * so the pointers stay valid exactly as long as the metallib they describe.
-   */
-  std::vector<std::string> function_names;
+
 };
 
 /** Lift normal-stage immutable storage into an explicit constant buffer.

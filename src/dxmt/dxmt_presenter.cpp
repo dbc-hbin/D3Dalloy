@@ -165,9 +165,10 @@ Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_
                 display_edr_value_.maximum_potential_edr_color_component_value;
 
     if (hdr_metadata) {
-      metadata.max_content_luminance = std::max<uint32_t>(
-          {(uint32_t)metadata.max_display_luminance, hdr_metadata->max_content_light_level,
-           hdr_metadata->max_mastering_luminance, hdr_metadata->max_frame_average_light_level}
+      metadata.max_content_luminance = std::max(
+          {metadata.max_display_luminance, static_cast<float>(hdr_metadata->max_content_light_level),
+           static_cast<float>(hdr_metadata->max_mastering_luminance),
+           static_cast<float>(hdr_metadata->max_frame_average_light_level)}
       );
     }
   }

@@ -253,3 +253,46 @@ SM50CompileRaytracingPipeline(
     return 0;
   return params.ret;
 }
+
+/** D3D12 work graph node shaders; the native side implements dxil_workgraph.h. */
+AIRCONV_API int
+SM50WGReflectLibrary(
+    const void *pBytecode, uint64_t BytecodeSize, struct SM50_WG_NODE_INFO *pNodes, uint32_t NodeCapacity,
+    struct SM50_WG_NODE_IO *pOutputs, uint32_t OutputCapacity, char *pNames, uint64_t NamesSize,
+    uint32_t *pNodeCount, uint32_t *pOutputCount, uint64_t *pNamesSize, sm50_error_t *ppError
+) {
+  struct sm50_wg_reflect_library_params params;
+  params.bytecode = pBytecode;
+  params.bytecode_size = BytecodeSize;
+  params.nodes = pNodes;
+  params.node_capacity = NodeCapacity;
+  params.outputs = pOutputs;
+  params.output_capacity = OutputCapacity;
+  params.names = pNames;
+  params.names_size = NamesSize;
+  params.node_count = pNodeCount;
+  params.output_count = pOutputCount;
+  params.names_size_out = pNamesSize;
+  params.error = ppError;
+  params.ret = 0;
+  if (UNIX_CALL(sm50_wg_reflect_library, &params))
+    return 0;
+  return params.ret;
+}
+
+AIRCONV_API int
+SM50WGCompileNode(
+    const struct SM50_WG_NODE_COMPILE_DESC *pDesc, sm50_bitcode_t *ppBitcode, struct SM50_COMPILED_BITCODE *pMetallib,
+    struct SM50_WG_NODE_COMPILED_INFO *pInfo, sm50_error_t *ppError
+) {
+  struct sm50_wg_compile_node_params params;
+  params.desc = pDesc;
+  params.bitcode = ppBitcode;
+  params.metallib = pMetallib;
+  params.info = pInfo;
+  params.error = ppError;
+  params.ret = 0;
+  if (UNIX_CALL(sm50_wg_compile_node, &params))
+    return 0;
+  return params.ret;
+}

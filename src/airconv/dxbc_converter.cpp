@@ -29,7 +29,9 @@
 
 #include "airconv_context.hpp"
 #include "msaa_pixel.hpp"
+#include "logic_op.hpp"
 #include "msaa_vertex.hpp"
+#include "msaa_mesh.hpp"
 
 #include "ftl.hpp"
 
@@ -382,11 +384,160 @@ void add_pipeline_statistics(
   builder.SetInsertPoint(body);
 }
 
+PixelStatisticsDedupe define_pixel_statistics_dedupe(air::FunctionSignatureBuilder &func_signature) {
+  return {func_signature.DefineInput(air::InputSampleIndex{}), func_signature.DefineInput(air::InputInputCoverage{})};
+}
+
+void increment_pixel_invocations(
+  llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Function *function, uint32_t argument,
+  const PixelStatisticsDedupe *dedupe
+) {
+  if (!dedupe) {
+    increment_pipeline_statistics(builder, air, function, argument, 14);
+    return;
+  }
+  /* The invocation of the lowest covered sample is the pixel's one counted invocation: no covered sample below
+   * [[sample_id]] (SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL). */
+  auto *sample = function->getArg(dedupe->sample_index);
+  auto *coverage = function->getArg(dedupe->coverage);
+  auto *below = builder.CreateSub(builder.CreateShl(builder.getInt32(1), sample), builder.getInt32(1));
+  auto *count_bb = llvm::BasicBlock::Create(builder.getContext(), "statistics_pixel", function);
+  auto *done_bb = llvm::BasicBlock::Create(builder.getContext(), "statistics_pixel_done", function);
+  builder.CreateCondBr(builder.CreateICmpEQ(builder.CreateAnd(coverage, below), builder.getInt32(0)), count_bb,
+                       done_bb);
+  builder.SetInsertPoint(count_bb);
+  increment_pipeline_statistics(builder, air, function, argument, 14);
+  builder.CreateBr(done_bb);
+  builder.SetInsertPoint(done_bb);
+}
+
+/* The flat per-primitive key of SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM (mesh primitive data 0). */
+constexpr const char *kStatisticsKeyUser = "dxmt_statistics_key";
+
+void define_mesh_statistics_key(air::FunctionSignatureBuilder &func_signature, uint32_t data_index) {
+  func_signature.DefineMeshPrimitiveOutput(
+    air::OutputMeshData{.user = kStatisticsKeyUser, .type = air::msl_uint4, .index = data_index}
+  );
+}
+
+void set_mesh_statistics_key(
+  llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Value *primitive, llvm::Value *key0,
+  llvm::Value *key1, llvm::Value *key2, uint32_t data_index
+) {
+  llvm::Value *key = llvm::UndefValue::get(llvm::FixedVectorType::get(builder.getInt32Ty(), 4));
+  key = builder.CreateInsertElement(key, key0, uint64_t(0));
+  key = builder.CreateInsertElement(key, key1, uint64_t(1));
+  key = builder.CreateInsertElement(key, key2, uint64_t(2));
+  key = builder.CreateInsertElement(key, builder.getInt32(0), uint64_t(3));
+  air.CreateSetMeshPrimitiveData(primitive, builder.getInt32(data_index), key);
+}
+
+PixelStatisticsClaim define_pixel_statistics_claim(air::FunctionSignatureBuilder &func_signature) {
+  return {
+    func_signature.DefineInput(air::InputFragmentStageIn{
+      .user = kStatisticsKeyUser, .type = air::msl_uint4, .interpolation = air::Interpolation::flat, .pull_mode = false
+    }),
+    func_signature.DefineInput(air::InputPosition{.interpolation = air::Interpolation::center_no_perspective}),
+    func_signature.DefineInput(air::InputRenderTargetArrayIndex{}),
+    func_signature.DefineInput(air::InputInputCoverage{}),
+    func_signature.DefineInput(air::ArgumentBindingBuffer{
+      .buffer_size = {},
+      .location_index = SM50_BINDING_INDEX_STATISTICS_CLAIM,
+      .array_size = 0,
+      .memory_access = air::MemoryAccess::read_write,
+      .address_space = air::AddressSpace::device,
+      .type = air::MSLUint{},
+      .arg_name = "statistics_claim",
+      .raster_order_group = 0u
+    }),
+  };
+}
+
+void claim_pixel_invocation(
+  llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llvm::Function *function, uint32_t argument,
+  const PixelStatisticsClaim &claim
+) {
+  /* SM50_STATISTICS_CLAIM_HEADER: per sample of every pixel, the {key.xyz, epoch} of the last invocation covering
+   * it. Metal runs the PS once per covered sample, all invocations of one (pixel, primitive) with the same
+   * [[sample_mask]], and raster order groups order invocations only where their samples overlap. An invocation
+   * counts unless one of its masked samples already holds its key, then writes its key to all of them: an earlier
+   * invocation of the same (pixel, primitive) shares every masked sample and is ordered before it. Exact against the
+   * D3D count with disjoint-mask interleaving at 2x/4x/8x (probe build/local/p3/p2last/probe/quads4.mm). */
+  auto *i32 = builder.getInt32Ty();
+  auto *header = function->getArg(claim.claim);
+  auto word = [&](llvm::Value *index) { return builder.CreateGEP(i32, header, {index}); };
+  auto load = [&](llvm::Value *index) { return builder.CreateLoad(i32, word(index)); };
+  auto *width = load(builder.getInt32(0));
+  auto *height = load(builder.getInt32(1));
+  auto *layers = load(builder.getInt32(2));
+  auto *epoch = load(builder.getInt32(3));
+  auto *entries = load(builder.getInt32(4));
+  auto *samples = load(builder.getInt32(6));
+  auto *position = function->getArg(claim.position);
+  auto *x = builder.CreateFPToUI(builder.CreateExtractElement(position, uint64_t(0)), i32);
+  auto *y = builder.CreateFPToUI(builder.CreateExtractElement(position, uint64_t(1)), i32);
+  // An out-of-range render target array index renders to slice 0 (D3D11.3 17.18).
+  auto *rtai = function->getArg(claim.layer);
+  auto *layer = builder.CreateSelect(builder.CreateICmpULT(rtai, layers), rtai, builder.getInt32(0));
+  auto *pixel = builder.CreateAdd(builder.CreateMul(builder.CreateAdd(builder.CreateMul(layer, height), y), width), x);
+  auto *base = builder.CreateAdd(entries, builder.CreateMul(builder.CreateMul(pixel, samples), builder.getInt32(4)));
+  auto *mask = function->getArg(claim.coverage);
+  auto *key = function->getArg(claim.key);
+  llvm::Value *wanted[4] = {builder.CreateExtractElement(key, uint64_t(0)), builder.CreateExtractElement(key, uint64_t(1)),
+                            builder.CreateExtractElement(key, uint64_t(2)), epoch};
+  auto masked = [&](uint32_t s) {
+    return builder.CreateAnd(builder.CreateICmpULT(builder.getInt32(s), samples),
+                             builder.CreateICmpNE(builder.CreateAnd(mask, builder.getInt32(1u << s)), builder.getInt32(0)));
+  };
+  auto entry = [&](uint32_t s, uint32_t i) {
+    return builder.CreateAdd(base, builder.getInt32(s * 4 + i));
+  };
+  // Raster sample counts are 1, 2, 4 or 8. Loads of unmasked samples read in-range entries of this pixel only.
+  llvm::Value *seen = builder.getFalse();
+  for (uint32_t s = 0; s < 8; s++) {
+    auto *check_bb = llvm::BasicBlock::Create(builder.getContext(), "statistics_claim_check", function);
+    auto *next_bb = llvm::BasicBlock::Create(builder.getContext(), "statistics_claim_next", function);
+    auto *from = builder.GetInsertBlock();
+    builder.CreateCondBr(masked(s), check_bb, next_bb);
+    builder.SetInsertPoint(check_bb);
+    llvm::Value *same = builder.getTrue();
+    for (uint32_t i = 0; i < 4; i++)
+      same = builder.CreateAnd(same, builder.CreateICmpEQ(load(entry(s, i)), wanted[i]));
+    auto *checked = builder.CreateOr(seen, same);
+    builder.CreateBr(next_bb);
+    builder.SetInsertPoint(next_bb);
+    auto *phi = builder.CreatePHI(builder.getInt1Ty(), 2);
+    phi->addIncoming(seen, from);
+    phi->addIncoming(checked, check_bb);
+    seen = phi;
+  }
+  for (uint32_t s = 0; s < 8; s++) {
+    auto *write_bb = llvm::BasicBlock::Create(builder.getContext(), "statistics_claim_write", function);
+    auto *next_bb = llvm::BasicBlock::Create(builder.getContext(), "statistics_claim_written", function);
+    builder.CreateCondBr(masked(s), write_bb, next_bb);
+    builder.SetInsertPoint(write_bb);
+    for (uint32_t i = 0; i < 4; i++)
+      builder.CreateStore(wanted[i], word(entry(s, i)));
+    builder.CreateBr(next_bb);
+    builder.SetInsertPoint(next_bb);
+  }
+  auto *count_bb = llvm::BasicBlock::Create(builder.getContext(), "statistics_claim", function);
+  auto *done_bb = llvm::BasicBlock::Create(builder.getContext(), "statistics_claim_done", function);
+  builder.CreateCondBr(seen, done_bb, count_bb);
+  builder.SetInsertPoint(count_bb);
+  increment_pipeline_statistics(builder, air, function, argument, 14);
+  builder.CreateBr(done_bb);
+  builder.SetInsertPoint(done_bb);
+}
+
 VertexIndexPullArgs define_stream_output_capture(
   air::FunctionSignatureBuilder &func_signature, IRValue &epilogue, std::vector<StreamOutputCaptureRun> runs,
   uint32_t record_dwords
 ) {
   auto args = define_vertex_index_pull(func_signature);
+  // MSAA-only capture uses this argument layout to pull IA indices, but has no
+  // stream-output record. It must not claim keys in the caller's fallback buffer.
+  if (!record_dwords) return args;
   auto scratch_arg = func_signature.DefineInput(air::ArgumentBindingBuffer{
     .buffer_size = {},
     .location_index = SM50_BINDING_INDEX_SO_CAPTURE_SCRATCH,
@@ -623,6 +774,12 @@ llvm::Error convert_dxbc_pixel_shader(
     pso_sample_mask = pso_data->sample_mask;
     pso_pixel_formats = pso_data->pixel_formats;
   }
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *coarse_mask_args = nullptr;
+  const bool coarse_mask_output = pso_sample_mask != 0xffffffff &&
+    args_get_data<SM50_SHADER_D3D12_COARSE_SHADING, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &coarse_mask_args);
+  // SampleMask is applied per fine pixel by captured coverage/replay, not to the
+  // packed coarse mask produced or consumed by the original shader body.
+  if (coarse_mask_output) pso_sample_mask = 0xffffffff;
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
   SM50_SHADER_FLAG shader_flags = {};
   SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
@@ -661,7 +818,7 @@ llvm::Error convert_dxbc_pixel_shader(
       p(sig_ctx);
     }
   }
-  if (pso_sample_mask != 0xffffffff) {
+  if (pso_sample_mask != 0xffffffff || coarse_mask_output) {
     auto assigned_index =
       func_signature.DefineOutput(air::OutputCoverageMask{});
     epilogue >> [=](pvalue value) -> IRValue {
@@ -677,6 +834,16 @@ llvm::Error convert_dxbc_pixel_shader(
   }
 
   const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *per_pixel = nullptr;
+  args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &per_pixel);
+  std::optional<PixelStatisticsDedupe> stats_dedupe;
+  if (stats && per_pixel)
+    stats_dedupe = define_pixel_statistics_dedupe(func_signature);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *claim_arg = nullptr;
+  args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &claim_arg);
+  std::optional<PixelStatisticsClaim> stats_claim;
+  if (stats && claim_arg)
+    stats_claim = define_pixel_statistics_claim(func_signature);
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
                                    rootsig->bytecode_length
@@ -738,8 +905,10 @@ llvm::Error convert_dxbc_pixel_shader(
   if (auto err = prologue.build(ctx).takeError()) {
     return err;
   }
-  if (stats)
-    increment_pipeline_statistics(builder, air, function, stats_arg, 14);
+  if (stats_claim)
+    claim_pixel_invocation(builder, air, function, stats_arg, *stats_claim);
+  else if (stats)
+    increment_pixel_invocations(builder, air, function, stats_arg, stats_dedupe ? &*stats_dedupe : nullptr);
   auto real_entry = convert_basicblocks(pShaderInternal->entry(), ctx, epilogue_bb);
   if (auto err = real_entry.takeError()) {
     return err;
@@ -1551,7 +1720,9 @@ pRefl->ConstanttBufferTableBindIndex =
   pRefl->UAVSlotMask = masks.uav;
   pRefl->NumConstantBuffers = shader->args_reflection_cbuffer.size();
   pRefl->NumArguments = shader->args_reflection.size();
-  if (shader->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER) {
+  if (shader->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER ||
+      shader->shader_type == microsoft::D3D12_SB_MESH_SHADER ||
+      shader->shader_type == microsoft::D3D12_SB_AMPLIFICATION_SHADER) {
     pRefl->ThreadgroupSize[0] = shader->threadgroup_size[0];
     pRefl->ThreadgroupSize[1] = shader->threadgroup_size[1];
     pRefl->ThreadgroupSize[2] = shader->threadgroup_size[2];
@@ -1619,6 +1790,7 @@ pRefl->ConstanttBufferTableBindIndex =
     pRefl->PixelShader.ValidRenderTargets = shader->pso_valid_output_reg_mask;
     pRefl->PixelShader.HasCoverageOutput = shader->ps_has_coverage_output;
     pRefl->PixelShader.SampleFrequency = shader->ps_sample_frequency;
+    pRefl->PSForceEarlyDepthStencil = shader->ps_force_early_depth_stencil;
   }
   pRefl->NumOutputElement = shader->max_output_register;
   pRefl->ArgumentTableQwords = shader->shader_info.binding_table.Size();
@@ -1699,10 +1871,13 @@ AIRCONV_API int SM50Initialize(
   sm50_shader->shader_type = CodeParser.ShaderType();
 
   {
-    const D3D11_SIGNATURE_PARAMETER *parameters;
-    outputParser.RastSignature()->GetParameters(&parameters);
-    for (unsigned i = 0; i < outputParser.RastSignature()->GetNumParameters(); i++) {
-      sm50_shader->output_signature.push_back(Signature(parameters[i]));
+    // A GS lists the outputs of every stream (each Signature carries its stream); other stages have stream 0.
+    const UINT streams = CodeParser.ShaderType() == D3D10_SB_GEOMETRY_SHADER ? outputParser.NumStreams() : 1;
+    for (UINT s = 0; s < std::max(streams, 1u); s++) {
+      const D3D11_SIGNATURE_PARAMETER *parameters;
+      const UINT count = outputParser.Signature(s)->GetParameters(&parameters);
+      for (unsigned i = 0; i < count; i++)
+        sm50_shader->output_signature.push_back(Signature(parameters[i]));
     }
   }
 
@@ -1992,12 +2167,22 @@ AIRCONV_API int SM50Compile(
   auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->shader_info;
   SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel = nullptr;
   dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(pArgs, &msaa_pixel);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *coarse_shading = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_COARSE_SHADING, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
+      pArgs, &coarse_shading);
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *conservative_raster = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_CONSERVATIVE_RASTER, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
+      pArgs, &conservative_raster);
   SM50_SHADER_D3D12_MSAA_VERTEX_DATA *msaa_vertex = nullptr;
   dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_VERTEX, SM50_SHADER_D3D12_MSAA_VERTEX_DATA>(pArgs, &msaa_vertex);
+  SM50_SHADER_D3D12_MSAA_MESH_DATA *msaa_mesh = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_MESH, SM50_SHADER_D3D12_MSAA_MESH_DATA>(pArgs, &msaa_mesh);
   SM50_SHADER_PSO_PIXEL_SHADER_DATA *pixel_pso = nullptr;
   dxmt::dxbc::args_get_data<SM50_SHADER_PSO_PIXEL_SHADER, SM50_SHADER_PSO_PIXEL_SHADER_DATA>(pArgs, &pixel_pso);
   SM50_SHADER_ROOT_SIGNATURE_DATA *root_signature = nullptr;
   dxmt::dxbc::args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &root_signature);
+  SM50_SHADER_D3D12_LOGIC_OP_DATA *logic_op = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_LOGIC_OP, SM50_SHADER_D3D12_LOGIC_OP_DATA>(pArgs, &logic_op);
   const uint32_t sample_frequency_mask = !msaa_pixel && !msaa_vertex && pixel_pso &&
     ((dxmt::dxbc::SM50ShaderInternal *)pShader)->ps_sample_frequency
       ? pixel_pso->sample_mask : 0xffffffffu;
@@ -2034,20 +2219,35 @@ AIRCONV_API int SM50Compile(
     }
     auto info = std::move(*lowered);
     auto &pModule = info->module;
+    if (msaa_mesh) {
+      if (auto error = dxmt::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
+        reportError(std::move(error), errorOut);
+        failCall(errorObj, ppError);
+        return 1;
+      }
+    }
     if (msaa_pixel) {
-      if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel)) {
+      if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel, coarse_shading != nullptr,
+                                                   conservative_raster != nullptr)) {
         reportError(std::move(error), errorOut);
         failCall(errorObj, ppError);
         return 1;
       }
     } else if (msaa_vertex) {
-      if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex)) {
+      if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex, conservative_raster != nullptr)) {
         reportError(std::move(error), errorOut);
         failCall(errorObj, ppError);
         return 1;
       }
     } else if (sample_frequency_mask != 0xffffffffu) {
       if (auto error = dxmt::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
+        reportError(std::move(error), errorOut);
+        failCall(errorObj, ppError);
+        return 1;
+      }
+    }
+    if (logic_op) {
+      if (auto error = dxmt::logic_op::applyLogicOp(*pModule, *logic_op)) {
         reportError(std::move(error), errorOut);
         failCall(errorObj, ppError);
         return 1;
@@ -2088,6 +2288,7 @@ AIRCONV_API int SM50Compile(
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
+  if (coarse_shading) pModule->addModuleFlag(Module::Error, "dxmt.coarse.snapped", 1);
 
   if (auto err = dxmt::dxbc::convertDXBC(
         pShader, FunctionName, context, *pModule, pArgs
@@ -2098,20 +2299,35 @@ AIRCONV_API int SM50Compile(
     failCall(errorObj, ppError);
     return 1;
   }
+  if (msaa_mesh) {
+    if (auto error = dxmt::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  }
   if (msaa_pixel) {
-    if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel)) {
+    if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel, coarse_shading != nullptr,
+                                                   conservative_raster != nullptr)) {
       reportError(std::move(error), errorOut);
       failCall(errorObj, ppError);
       return 1;
     }
   } else if (msaa_vertex) {
-    if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex)) {
+    if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex, conservative_raster != nullptr)) {
       reportError(std::move(error), errorOut);
       failCall(errorObj, ppError);
       return 1;
     }
   } else if (sample_frequency_mask != 0xffffffffu) {
     if (auto error = dxmt::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  }
+  if (logic_op) {
+    if (auto error = dxmt::logic_op::applyLogicOp(*pModule, *logic_op)) {
       reportError(std::move(error), errorOut);
       failCall(errorObj, ppError);
       return 1;
@@ -2266,13 +2482,22 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
     failCall(errorObj, ppError);
     return 1;
   }
-
+  SM50_SHADER_D3D12_MSAA_MESH_DATA *msaa_mesh = nullptr;
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *conservative = nullptr;
+  dxbc::args_get_data<SM50_SHADER_D3D12_CONSERVATIVE_RASTER, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
+      pDomainShaderArgs, &conservative);
   if (shader_info.use_msad)
     linkMSAD(*pModule);
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
   linkTessellation(*pModule);
-  
+  if (dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_MESH, SM50_SHADER_D3D12_MSAA_MESH_DATA>(pDomainShaderArgs, &msaa_mesh))
+    if (auto error = msaa::transformMesh(*pModule, *msaa_mesh, conservative != nullptr)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
@@ -2416,6 +2641,16 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
     failCall(errorObj, ppError);
     return 1;
   }
+  SM50_SHADER_D3D12_MSAA_MESH_DATA *msaa_mesh = nullptr;
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *conservative = nullptr;
+  dxbc::args_get_data<SM50_SHADER_D3D12_CONSERVATIVE_RASTER, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
+      pGeometryShaderArgs, &conservative);
+  if (dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_MESH, SM50_SHADER_D3D12_MSAA_MESH_DATA>(pGeometryShaderArgs, &msaa_mesh))
+    if (auto error = msaa::transformMesh(*pModule, *msaa_mesh, conservative != nullptr)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
 
   if (shader_info.use_msad)
     linkMSAD(*pModule);

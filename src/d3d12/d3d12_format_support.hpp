@@ -38,6 +38,25 @@ inline bool IsD3D12ShaderViewFormat(DXGI_FORMAT format, bool typeless) {
   return !IsD3D12DepthStencilStorageFormat(format);
 }
 
+inline bool IsD3D12UintColorFormat(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G32B32A32_UINT:
+  case DXGI_FORMAT_R32G32B32_UINT:
+  case DXGI_FORMAT_R16G16B16A16_UINT:
+  case DXGI_FORMAT_R32G32_UINT:
+  case DXGI_FORMAT_R10G10B10A2_UINT:
+  case DXGI_FORMAT_R8G8B8A8_UINT:
+  case DXGI_FORMAT_R16G16_UINT:
+  case DXGI_FORMAT_R32_UINT:
+  case DXGI_FORMAT_R8G8_UINT:
+  case DXGI_FORMAT_R16_UINT:
+  case DXGI_FORMAT_R8_UINT:
+    return true;
+  default:
+    return false;
+  }
+}
+
 struct D3D12FormatSupportProperties {
   bool mapped = false;
   bool buffer_compatible = false;
@@ -156,6 +175,10 @@ BuildD3D12FormatSupport(DXGI_FORMAT format, const D3D12FormatSupportProperties &
     if (typed) {
       if (properties.color)
         add_support1(D3D12_FORMAT_SUPPORT1_RENDER_TARGET);
+
+      // FS 17.7.1: logic ops are defined for (and must cover) every renderable UINT format.
+      if (properties.color && IsD3D12UintColorFormat(format))
+        add_support2(D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP);
 
       if (properties.blend)
         add_support1(D3D12_FORMAT_SUPPORT1_BLENDABLE);

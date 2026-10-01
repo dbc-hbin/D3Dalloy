@@ -400,21 +400,42 @@ HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_ST
     }
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
       GET_STREAM_DATA(D3D12_VIEW_INSTANCING_DESC);
-      // ViewInstancingTier is NOT_SUPPORTED: only the "no view instancing" description is valid.
-      if (subobject->data.ViewInstanceCount || subobject->data.Flags) {
-        ERR("CreatePipelineState: view instancing is not supported");
+      // ViewInstancingTier 1. ViewInstanceCount 0 disables view instancing (SV_ViewID reads 0).
+      const auto &in = subobject->data;
+      if (in.ViewInstanceCount > D3D12_MAX_VIEW_INSTANCE_COUNT ||
+          (in.Flags & ~D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING) ||
+          (in.ViewInstanceCount && !in.pViewInstanceLocations)) {
+        ERR("CreatePipelineState: invalid view instancing description");
         return E_INVALIDARG;
       }
+      stream.graphics_extras.view_instancing.reset();
+      if (!in.ViewInstanceCount)
+        break;
+      ViewInstancingState state;
+      state.count = in.ViewInstanceCount;
+      state.masking = in.Flags & D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING;
+      for (UINT i = 0; i < in.ViewInstanceCount; ++i) {
+        const auto &location = in.pViewInstanceLocations[i];
+        if (location.ViewportArrayIndex >= D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE ||
+            location.RenderTargetArrayIndex >= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION) {
+          ERR("CreatePipelineState: view instance location out of range");
+          return E_INVALIDARG;
+        }
+        state.locations[i] = location;
+      }
+      stream.graphics_extras.view_instancing = state;
       break;
     }
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: {
       GET_STREAM_DATA(D3D12_SHADER_BYTECODE);
-      // MeshShaderTier is NOT_SUPPORTED; an empty bytecode means the stage is absent.
-      if (subobject->data.pShaderBytecode || subobject->data.BytecodeLength) {
-        ERR("CreatePipelineState: amplification/mesh shaders are not supported");
+      // MeshShaderTier 1. An empty bytecode means the stage is absent.
+      if (!subobject->data.pShaderBytecode != !subobject->data.BytecodeLength) {
+        ERR("CreatePipelineState: invalid amplification/mesh shader bytecode");
         return E_INVALIDARG;
       }
+      (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS ? stream.graphics_extras.as : stream.graphics_extras.ms) =
+          subobject->data;
       break;
     }
     default:
@@ -427,6 +448,20 @@ HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_ST
   stream.compute = desc_cs.CS.pShaderBytecode != nullptr;
   if (stream.compute && (defined_type & (1ull << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS))) {
     ERR("CreatePipelineState: invalid compute pipeline state stream");
+    return E_INVALIDARG;
+  }
+  // A mesh pipeline replaces the whole vertex front end: no VS/HS/DS/GS, input layout or stream
+  // output, and an AS needs an MS.
+  const auto &extras = stream.graphics_extras;
+  if (extras.as.pShaderBytecode && !extras.ms.pShaderBytecode) {
+    ERR("CreatePipelineState: amplification shader without a mesh shader");
+    return E_INVALIDARG;
+  }
+  if (extras.ms.pShaderBytecode &&
+      (stream.compute || desc_graphics.VS.pShaderBytecode || desc_graphics.HS.pShaderBytecode ||
+       desc_graphics.DS.pShaderBytecode || desc_graphics.GS.pShaderBytecode ||
+       desc_graphics.InputLayout.NumElements || desc_graphics.StreamOutput.NumEntries)) {
+    ERR("CreatePipelineState: mesh shader combined with vertex-pipeline state");
     return E_INVALIDARG;
   }
   return S_OK;

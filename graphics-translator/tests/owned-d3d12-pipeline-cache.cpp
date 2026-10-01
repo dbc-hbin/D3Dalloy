@@ -83,10 +83,11 @@ void gpuValue(ID3D12Device *device,ID3D12PipelineState *pso,ID3D12RootSignature 
   std::printf("OWNED_D3D12_PIPELINE_CACHE_GPU case=%s actual=%08x expected=%08x\n",label,actual,expected);
 }
 
-void reject(ID3D12Device *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc,const void *bytes,size_t size,const char *label) {
+void reject(ID3D12Device *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc,const void *bytes,size_t size,const char *label,
+            HRESULT expected=E_INVALIDARG) {
   desc.CachedPSO={bytes,size};void *output=reinterpret_cast<void*>(uintptr_t(1));
   const HRESULT hr=device->CreateComputePipelineState(&desc,__uuidof(ID3D12PipelineState),&output);
-  if(hr!=E_INVALIDARG||output)fail(label,hr);
+  if(hr!=expected||output)fail(label,hr);
   std::printf("OWNED_D3D12_PIPELINE_CACHE_REJECT case=%s hr=%08lx\n",label,static_cast<unsigned long>(hr));
 }
 
@@ -103,6 +104,10 @@ int run(const wchar_t *firstPath,const wchar_t *secondPath) {
   ComPtr<ID3DBlob> blob;check(source->GetCachedBlob(&blob),"export cache");
   const auto *data=static_cast<const uint8_t*>(blob->GetBufferPointer());std::vector<uint8_t> good(data,data+blob->GetBufferSize());
   if(source->GetCachedBlob(nullptr)!=E_POINTER)fail("null cache output");
+  // Version 3 predates the P3 hidden-resource/signature ABI. Applications must
+  // discard those persisted blobs even when shader/root/PSO inputs are unchanged.
+  auto prior=good;const uint32_t priorVersion=3;memcpy(prior.data()+8,&priorVersion,sizeof(priorVersion));
+  reject(device.Get(),desc,prior.data(),prior.size(),"pre_p3_version",D3D12_ERROR_DRIVER_VERSION_MISMATCH);
   reject(device.Get(),desc,nullptr,good.size(),"null_nonempty");
   reject(device.Get(),desc,good.data(),good.size()-1,"truncated");
   auto damaged=good;damaged.back()^=1;reject(device.Get(),desc,damaged.data(),damaged.size(),"corrupt_payload");

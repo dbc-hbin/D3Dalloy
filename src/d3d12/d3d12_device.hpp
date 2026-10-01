@@ -24,6 +24,7 @@
 #include "d3d12_descriptor_heap.hpp"
 #include "d3d12_raytracing_sbt.hpp"
 #include "d3d12_reserved_resource.hpp"
+#include "d3d12_sampler_feedback.hpp"
 #include "d3d12_standard_swizzle.hpp"
 #include "d3d12_sharing.hpp"
 #include "dxgi1_2.h"
@@ -139,18 +140,22 @@ struct BarrierTracker {
   }
 };
 
-// One advertised ceiling shared by creation/probe and feature queries.
-inline constexpr D3D_FEATURE_LEVEL kOwnedMaxFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+// One advertised ceiling shared by creation/probe and feature queries. FL 12_0: every 11_1 requirement
+// (OutputMergerLogicOp, UAV-only ForcedSampleCount 16 via two programmed 8x halves, ForcedSampleCount 1 on
+// multisampled RTVs) plus 12_0's Tiled Tier 2, Resource Binding Tier 2+ and the typed UAV load format set are
+// GPU-verified by the feature-level, tiled and bindless suites. FL 12_1 additionally has ROVs and
+// ConservativeRasterizationTier 1, verified across all shader families by the conservative-raster suite.
+inline constexpr D3D_FEATURE_LEVEL kOwnedMaxFeatureLevel = D3D_FEATURE_LEVEL_12_1;
 /* Highest DXIL shader model the owned compiler accepts (SM50_MAX_DXIL_SHADER_MODEL). */
 inline constexpr D3D_SHADER_MODEL kOwnedMaxShaderModel = static_cast<D3D_SHADER_MODEL>(SM50_MAX_DXIL_SHADER_MODEL);
 /* Intentionally lower than kOwnedMaxShaderModel: SM 6.6 requires 64 bit atomics in every
  * stage and Apple GPUs give a graphics-stage lock no forward-progress guarantee (the
- * emulation is compute-only). Every non-cap-gated SM 6.1-6.5 requirement (SV_ViewID=0,
+ * emulation is compute-only). Every non-cap-gated SM 6.1-6.5 requirement (SV_ViewID,
  * fp32 denorm modes, dot4add, WaveMatch/MultiPrefix, DXIL GS/HS/DS) is GPU verified by
- * the sm6/geometry/tessellation suites; unreported cap-gated features fail PSO creation. */
+ * the sm6/view-instancing/geometry/tessellation suites; unreported cap-gated features fail PSO creation. */
 inline constexpr D3D_SHADER_MODEL kOwnedReportedShaderModel = D3D_SHADER_MODEL_6_5;
 
-class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList9 {
+class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList10 {
 public:
   const uint64_t owned_id = owned_graphics::NewObjectId();
   uint64_t owned_recording = 0;
@@ -198,6 +203,8 @@ public:
   std::shared_ptr<sharing::SharedObject> share;
   // Reserved (tiled) resources only: tiling and queue-ordered tile mapping state.
   std::unique_ptr<ReservedResource> reserved;
+  // Sampler feedback maps only (d3d12_sampler_feedback.hpp): `buffer` holds the u32 cells.
+  std::optional<sampler_feedback::Layout> feedback;
 
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
@@ -267,6 +274,8 @@ public:
   virtual void ReleasePrivate() = 0;
 
   uint32_t UploadQwords = 0;
+  /* Qwords of the parameters alone; the heap, root-view status and view-id qwords follow them. */
+  uint32_t ParameterQwords = 0;
   uint32_t ParameterSlots = 0;
   uint32_t const *SlotQwordOffsets = nullptr;
   D3D12_ROOT_PARAMETER_TYPE const *ParameterTypes = nullptr;
@@ -293,23 +302,20 @@ public:
   uint32_t const *StatusQwordOffsets = nullptr;
   /* At most 32 root descriptors fit in the 64 DWORD root signature budget. */
   static constexpr uint32_t kMaxRootViewStatusQwords = 32;
-  static constexpr uint32_t kMaxRootArgumentQwords = 64 + kHeapQwords + kMaxRootViewStatusQwords;
-
   /**
-   * Local root arguments of a raytracing shader record. The application writes the
-   * parameters of this root signature after the 32 byte shader identifier using the
-   * D3D12 local root argument layout; the raytracing pipeline translates each
-   * record into the qword root argument layout of this signature. `LocalRootCopies`
-   * describes that translation and `LocalRootDataSize` is the number of bytes the
-   * record must carry for it.
+   * The root qword holding the current view instance (SV_ViewID, view instancing) of a non-local signature,
+   * after the parameters, the heap qwords and the root-view status qwords; `~0u` for a local signature.
+   * Included in UploadQwords. The command list writes it per replayed view; it is 0 otherwise.
    */
-  uint32_t LocalRootDataSize;
-  uint32_t LocalRootCopyCount;
-  raytracing::LocalRootCopy const *LocalRootCopies;
+  uint32_t ViewIdQwordOffset = ~0u;
+  static constexpr uint32_t kViewIdQwords = 1;
+  static constexpr uint32_t kMaxRootArgumentQwords = 64 + kHeapQwords + kMaxRootViewStatusQwords + kViewIdQwords;
 
   size_t NumStaticSamplers;
   uint64_t const *EncodedStaticSamplers;
 };
+
+HRESULT AppendRootStaticSamplers(MTLD3D12RootSignature *root, std::vector<D3D12_STATIC_SAMPLER_DESC> &table, UINT *appended);
 
 class MTLD3D12CommandSignature : public ID3D12CommandSignature {
 public:
@@ -326,6 +332,8 @@ public:
   WMT::Reference<WMT::RenderPipelineState> render_resolver;
   WMT::Reference<WMT::ComputePipelineState> graphics_argument_resolver;
   WMT::Reference<WMT::ComputePipelineState> compute_resolver;
+  /* DISPATCH_MESH / DISPATCH_RAYS with root argument updates: per-slot root argument writer (resolve_root_arguments). */
+  WMT::Reference<WMT::ComputePipelineState> root_argument_resolver;
 
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
@@ -349,9 +357,11 @@ public:
    */
   WMT::Reference<WMT::Buffer> so_statistics;
   WMT::Reference<WMT::ComputePipelineState> so_statistics_end_pipeline;
-  /* Results followed by BeginQuery snapshots, each Count * 88 bytes. */
+  /* PIPELINE_STATISTICS(1): results followed by BeginQuery snapshots, each Count * `pipeline_statistics_record`
+   * bytes (sizeof D3D12_QUERY_DATA_PIPELINE_STATISTICS or ..._STATISTICS1). */
   WMT::Reference<WMT::Buffer> pipeline_statistics;
   WMT::Reference<WMT::ComputePipelineState> pipeline_statistics_end_pipeline;
+  uint32_t pipeline_statistics_record = 0;
 };
 
 class MTLD3D12Device;
@@ -378,14 +388,16 @@ public:
 };
 
 /*
- * Validated, owned copy of a graphics PSO's D3D12_STREAM_OUTPUT_DESC (VS-only pipelines:
- * stream 0). `active` is false when the PSO declares no stream output.
+ * Validated, owned copy of a graphics PSO's D3D12_STREAM_OUTPUT_DESC. `active` is false when the PSO
+ * declares no stream output. Without a GS only stream 0 exists; after a GS every declared stream is
+ * captured on its own.
  *
- * Target layout: each slot has the application stride and the bytes one vertex writes
- * (`bytes_per_vertex`, gaps included); every non-gap element records its byte offset
- * inside that slot's vertex. Capture layout: the VS writes each non-gap element's
- * components contiguously, in declaration order, into a private record of
- * `record_dwords` dwords starting at `dword_offset` (SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE).
+ * Target layout: each slot belongs to one stream and has the application stride and the bytes one
+ * vertex writes (`bytes_per_vertex`, gaps included); every non-gap element records its byte offset
+ * inside that slot's vertex. Capture layout: the last pre-rasterization stage writes each non-gap
+ * element of stream s contiguously, in declaration order, into a private record of
+ * `streams[s].record_dwords` dwords starting at `dword_offset` (SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE,
+ * SM50_SHADER_D3D12_GS_STREAMS).
  */
 struct StreamOutputLayout {
   struct Slot {
@@ -400,14 +412,21 @@ struct StreamOutputLayout {
     uint32_t slot = 0;
     uint32_t byte_offset = 0;
     uint32_t dword_offset = 0;
+    uint32_t stream = 0;
+  };
+  struct Stream {
+    /* Bit i: the declaration writes stream s to slot i. A referenced slot with no buffer bound is full. */
+    uint32_t referenced_slot_mask = 0;
+    uint32_t record_dwords = 0;
   };
   bool active = false;
-  /* Bit i: the declaration writes to slot i. A referenced slot with no buffer bound is full. */
-  uint32_t referenced_slot_mask = 0;
-  /* 0 or D3D12_SO_NO_RASTERIZED_STREAM. */
+  /* Bit s: the declaration has entries for stream s. */
+  uint32_t stream_mask = 0;
+  /* 0..3 or D3D12_SO_NO_RASTERIZED_STREAM. */
   uint32_t rasterized_stream = 0;
-  uint32_t record_dwords = 0;
+  std::array<Stream, D3D12_SO_STREAM_COUNT> streams{};
   std::array<Slot, D3D12_SO_BUFFER_SLOT_COUNT> slots{};
+  /* In declaration order; each element's `stream` selects its capture record. */
   std::vector<Element> elements;
 };
 
@@ -456,15 +475,25 @@ enum class MeshPipelineKind : uint8_t {
   /* VS+HS+DS+GS in two passes: VS+HS object / DS capture mesh (rasterization off), a compaction kernel, then a
    * capture-reading object / GS mesh pass (keys with kMeshTessellationGeometryPass). */
   TessellationGeometry,
+  /* D3D12 amplification (object) + mesh shaders, drawn with DispatchMesh. */
+  MeshShader,
 };
 
 /* MeshVariantKey bit selecting the second (GS) pass of a TessellationGeometry pipeline. */
 constexpr uint32_t kMeshTessellationGeometryPass = 16;
+constexpr uint32_t kMeshMSAACapture = 64;
+constexpr uint32_t kMeshMSAAReplay = 128;
+constexpr uint32_t kMeshObjectCapture = 256;
+constexpr uint32_t kMeshObjectReplay = 512;
 
 struct MeshPipelineVariant {
   WMT::Reference<WMT::RenderPipelineState> pso;
   ShaderImmutableConstants object_constants;
   ShaderImmutableConstants mesh_constants;
+  WMT::Reference<WMT::Function> replay_function;
+  SM50_MSAA_VERTEX_LAYOUT vertex_layout{};
+  SM50_MSAA_MESH_LAYOUT capture_layout{};
+  SM50_MSAA_OBJECT_LAYOUT object_capture_layout{};
 };
 
 /* index_format: SM50_INDEX_BUFFER_FORMAT; strip: GS input is a strip topology. */
@@ -472,20 +501,31 @@ constexpr uint32_t MeshVariantKey(uint32_t index_format, bool strip, bool statis
   return index_format | (strip ? 4u : 0u) | (statistics ? 8u : 0u);
 }
 
+/* A VIEW_INSTANCING subobject with ViewInstanceCount >= 1 (validated by the stream parser). */
+struct ViewInstancingState {
+  UINT count = 0;
+  bool masking = false;
+  std::array<D3D12_VIEW_INSTANCE_LOCATION, D3D12_MAX_VIEW_INSTANCE_COUNT> locations{};
+};
+
 class MTLD3D12GraphicsPipelineState : public MTLD3D12PipelineState {
 public:
   WMT::Reference<WMT::RenderPipelineState> pso;
   MeshPipelineKind mesh_kind = MeshPipelineKind::None;
   /* Geometry: GS input primitive (D3D10_SB_PRIMITIVE). */
   uint32_t mesh_input_primitive = 0;
-  /* GS: dcl_maxout, output topology (D3D10_SB_PRIMITIVE_TOPOLOGY) and dcl_gsinstances, for stream output. */
+  /* SO scratch records/key, output topology (D3D10_SB_PRIMITIVE_TOPOLOGY) and GS instances.
+   * GS uses dcl_maxout; DS-only SO includes its workload vertex/index staging and has one instance per key. */
   uint32_t gs_max_output_vertices = 0;
   uint32_t gs_output_topology = 0;
   uint32_t gs_instance_count = 1;
   /* Tessellation: object threads per patch (HS reflection ThreadsPerPatch). */
   uint32_t tess_threads_per_patch = 0;
-  /* TessellationGeometry: the DS capture layout (W, V, P, R, K), fixed when the PSO is created. */
+  /* DS capture layout (W, V, P, R, K), fixed at PSO creation; DS-only SO uses V for its staged SO records. */
   SM50_TESS_CAPTURE_LAYOUT tess_capture_layout{};
+  /* MeshShader: [numthreads] of the AS (all 0 without one) and the MS. */
+  std::array<uint32_t, 3> as_threads{};
+  std::array<uint32_t, 3> ms_threads{};
   /* Null on failure; the caller records E_FAIL. */
   virtual const MeshPipelineVariant *GetMeshPipeline(uint32_t key) = 0;
   StreamOutputLayout stream_output;
@@ -512,13 +552,35 @@ public:
   uint32_t owned_sample_mask = 0xffffffffu;
   SM50_MSAA_LINE_MODE owned_line_mode = SM50_MSAA_LINE_NONE;
   bool owned_has_pixel_shader = false;
+  bool owned_shading_rate_pixel_shader = false;
   bool owned_sample_frequency_pixel_shader = false;
+  /* The PS declares ForceEarlyDepthStencil (reflection PSForceEarlyDepthStencil). */
+  bool owned_force_early_pixel_shader = false;
+  /* GS/HS/DS or MS PSO whose natively multisampled statistics draws count PSInvocations once per (pixel, primitive)
+   * by the claim buffer (SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM): the PS forces early depth/stencil with a depth or
+   * stencil test, which runs an arbitrary subset of a pixel's covered samples (probe:
+   * build/local/p3/p2left/probe/result4.txt), so the lowest-covered-sample rule cannot be used. */
+  bool mesh_statistics_claim = false;
   bool owned_distance_interpolation = false;
+  /* Rare MS signatures beyond Metal's 124 native scalars, or SV_CullDistance: capture the exact
+   * output lanes and replay them instead of rejecting a valid D3D 32-row signature. */
+  bool owned_mesh_output_replay = false;
+  /* D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON: every draw runs the exact captured-pixel path with conservative
+   * replay geometry and per-pixel coverage (SM50_SHADER_D3D12_CONSERVATIVE_RASTER). */
+  bool owned_conservative = false;
   bool needs_rov_buffer_marker = false;
   // D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS / _DYNAMIC_INDEX_BUFFER_STRIP_CUT: the command list
   // may override depth bias / strip cut after SetPipelineState (ID3D12GraphicsCommandList9).
   bool dynamic_depth_bias = false;
   bool dynamic_index_buffer_strip_cut = false;
+  /*
+   * View instancing (ViewInstancingTier 1): every draw is replayed once per enabled view with the view id in the
+   * root signature's view-id qword. `view_location_offsets` is set when some view location is not {0, 0}: the
+   * rasterizing pipelines then carry maxVertexAmplificationCount 2 so a one-view amplification mapping adds the
+   * view's viewport / render target array index to the shader's (an out-of-range sum selects index 0).
+   */
+  ViewInstancingState view_instancing{};
+  bool view_location_offsets = false;
 
   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
 
@@ -532,14 +594,25 @@ public:
   virtual WMT::RenderPipelineState GetIndirectCommandBufferPipelineState() = 0;
   virtual WMT::RenderPipelineState GetIndexPullPipelineState(bool indirect) = 0;
   virtual WMT::RenderPipelineState GetPipelineStatisticsPipelineState(bool indirect) = 0;
-  virtual const MSAAPipelineVariants *GetMSAAPipelineVariants(bool statistics = false) = 0;
+  /* `coarse`: variable-rate coarse shading variants (SM50_SHADER_D3D12_COARSE_SHADING); the layout carries
+   * SM50_MSAA_PIXEL_COARSE when the PS is eligible, otherwise they shade at fine rate. */
+  virtual const MSAAPipelineVariants *GetMSAAPipelineVariants(bool statistics = false, bool coarse = false) = 0;
   uint32_t EffectiveRasterSampleCount() const {
     return forced_sample_count ? forced_sample_count : owned_sample_desc.Count;
   }
   bool RequiresMSAAExecution() {
     // The captured-pixel path also preserves clip/cull interpolants that
-    // Metal cannot carry natively, even on a single-sample target.
-    return EffectiveRasterSampleCount() > 1 || owned_distance_interpolation;
+    // Metal cannot carry natively, even on a single-sample target, and is
+    // the only conservative rasterizer (native MSAA would shade per sample).
+    return EffectiveRasterSampleCount() > 1 || owned_distance_interpolation || ForcedSampleReplay() ||
+           owned_conservative || owned_mesh_output_replay;
+  }
+  /* Target-independent rasterization with RTVs: the forced raster pattern differs from the RTV sample count
+   * (ForcedSampleCount > 1 on 1x RTVs, or ForcedSampleCount 1 on multisampled RTVs). The PS output is replayed
+   * from captured records into every output sample in SampleMask of each pixel the forced pattern covers. */
+  bool ForcedSampleReplay() const {
+    return forced_sample_count && owned_rt_count &&
+           (forced_sample_count > 1 ? owned_sample_desc.Count == 1 : owned_sample_desc.Count > 1);
   }
 
   virtual void AddRefPrivate() = 0;
@@ -574,6 +647,7 @@ struct RTASState {
   WMT::Reference<WMT::AccelerationStructureSidecar> sidecar;
   uint64_t nativeSize = 0;
   uint32_t instanceCount = 0;
+  std::shared_ptr<const raytracing::StructureInfo> info;
 };
 
 /*
@@ -591,11 +665,6 @@ struct RTASState {
  */
 using RTASLifetime = owned_graphics::RTASLifetime<raytracing::ArenaKey, RTASState, RTASKeyHash>;
 
-struct RTASComputePipelines {
-  WMT::Reference<WMT::ComputePipelineState> prepass;
-  WMT::Reference<WMT::ComputePipelineState> writeU64;
-  WMT::Reference<WMT::ComputePipelineState> finalizeCompactedSize;
-};
 
 class MTLD3D12Device : public ID3D12Device14 {
 public:
@@ -655,6 +724,7 @@ public:
 
   /* Sidecar lookup/publish for the acceleration structure at a D3D12 address. */
   virtual bool FindRTAS(const raytracing::ArenaKey &key, RTASState &state) = 0;
+  virtual bool AllocateRTAS(WMT::AccelerationStructureSidecar sidecar, uint64_t size, uint64_t count) = 0;
 
   /**
    * Publish a build for a D3D12 address. `token` receives the version token the prepass must
@@ -789,6 +859,16 @@ CreatePlacedBuffer(
     D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
 );
 
+/* Sampler feedback maps (d3d12_sampler_feedback.cpp); `Layout` comes from sampler_feedback::MakeLayout. */
+HRESULT SamplerFeedbackAllocationInfo(MTLD3D12Device *pDevice, const sampler_feedback::Layout &Layout,
+                                      D3D12_RESOURCE_ALLOCATION_INFO1 &Info);
+
+HRESULT CreateSamplerFeedbackMap(
+    MTLD3D12Device *pDevice, const D3D12_HEAP_PROPERTIES &HeapProps, D3D12_HEAP_FLAGS HeapFlags,
+    const D3D12_RESOURCE_DESC &Desc, const sampler_feedback::Layout &Layout, MTLD3D12Heap *pHeap, UINT64 HeapOffset,
+    D3D12_RESOURCE_STATES InitialState, REFIID riid, void **ppResource
+);
+
 HRESULT
 CreateHeap(MTLD3D12Device *pDevice, const D3D12_HEAP_DESC *pDesc, REFIID riid, void **ppHeap);
 
@@ -843,9 +923,14 @@ CreateCommandSignature(
 struct GraphicsPipelineExtras {
   std::optional<float> depth_bias;
   std::optional<std::pair<UINT8, UINT8>> back_stencil_read_write_mask;
+  std::optional<ViewInstancingState> view_instancing;
+  /* Mesh shader pipeline (MeshShaderTier 1): the MS subobject, and the optional AS. Empty
+   * bytecode means the stage is absent. */
+  D3D12_SHADER_BYTECODE as{};
+  D3D12_SHADER_BYTECODE ms{};
   bool
   empty() const {
-    return !depth_bias && !back_stencil_read_write_mask;
+    return !depth_bias && !back_stencil_read_write_mask && !view_instancing && !ms.pShaderBytecode;
   }
 };
 
@@ -955,6 +1040,7 @@ constexpr auto kDefaultShader4Component = 0b1'011'010'001'000;
 
 HRESULT ValidateResourceStates(D3D12_RESOURCE_STATES State, const D3D12_HEAP_PROPERTIES *pHeapProps,
                                const D3D12_RESOURCE_DESC *pDesc);
+bool IsShadingRateImageDesc(const D3D12_RESOURCE_DESC &desc);
 
 HRESULT ValidateResourceDescs(MTLD3D12Device *device, const D3D12_RESOURCE_DESC *pDesc,
                               const D3D12_HEAP_PROPERTIES *pHeapProps);

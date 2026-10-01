@@ -7,9 +7,12 @@
 @interface DXMTASDescriptor : NSObject
 @property(nonatomic, retain) MTLAccelerationStructureDescriptor *metal;
 @property(nonatomic, retain) NSMutableArray<MTLAccelerationStructureGeometryDescriptor *> *geometries;
+/* Stands in for the vertex / box / instance buffer of a D3D12 input that names no primitives:
+ * Metal requires a non-nil buffer even when the primitive count is 0. Never read. */
+@property(nonatomic, retain) id<MTLBuffer> placeholder;
 @end
 @implementation DXMTASDescriptor
-- (void)dealloc { [_metal release]; [_geometries release]; [super dealloc]; }
+- (void)dealloc { [_metal release]; [_geometries release]; [_placeholder release]; [super dealloc]; }
 @end
 
 @interface DXMTASSidecar : NSObject
@@ -17,12 +20,16 @@
 @property(nonatomic, retain) id<MTLBuffer> instances;
 @property(nonatomic, retain) id<MTLBuffer> contributions;
 @property(nonatomic) uint64_t nativeSize;
+@property(nonatomic) uint64_t instanceCount;
+/* Old generations remain resident while recordings/submissions retain this sidecar. */
+@property(nonatomic, retain) NSMutableArray *generations;
 @end
 @implementation DXMTASSidecar
 - (void)dealloc {
   [_accelerationStructure release];
   [_instances release];
   [_contributions release];
+  [_generations release];
   [super dealloc];
 }
 @end
@@ -37,8 +44,18 @@ static void dxmt_geometry_flags(MTLAccelerationStructureGeometryDescriptor *geom
   geometry.allowDuplicateIntersectionFunctionInvocation = (flags & 2u) == 0;
 }
 
-dxmt_mtl_handle dxmt_as_descriptor_new(uint32_t top_level, uint32_t geometry_count) {
+dxmt_mtl_handle dxmt_as_descriptor_new(dxmt_mtl_handle device, uint32_t top_level, uint32_t geometry_count) {
+  if (!device)
+    return 0;
   DXMTASDescriptor *result = [[DXMTASDescriptor alloc] init];
+  id<MTLBuffer> placeholder = [(id<MTLDevice>)dxmt_obj(device) newBufferWithLength:256
+      options:MTLResourceStorageModePrivate];
+  result.placeholder = placeholder;
+  [placeholder release];
+  if (!result.placeholder) {
+    [result release];
+    return 0;
+  }
   if (top_level) {
     result.metal = [MTLInstanceAccelerationStructureDescriptor descriptor];
   } else {
@@ -47,6 +64,16 @@ dxmt_mtl_handle dxmt_as_descriptor_new(uint32_t top_level, uint32_t geometry_cou
     result.geometries = [NSMutableArray arrayWithCapacity:geometry_count];
     for (uint32_t i = 0; i < geometry_count; ++i)
       [result.geometries addObject:(MTLAccelerationStructureGeometryDescriptor *)[NSNull null]];
+    if (!geometry_count) {
+      /* D3D12 allows a bottom-level structure with no geometry; Metal requires at least one
+       * geometry descriptor, so the empty structure is one geometry with no triangles. */
+      MTLAccelerationStructureTriangleGeometryDescriptor *empty =
+          [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+      empty.vertexBuffer = result.placeholder;
+      empty.vertexStride = 12;
+      empty.triangleCount = 0;
+      [result.geometries addObject:empty];
+    }
     primitive.geometryDescriptors = result.geometries;
     result.metal = primitive;
   }
@@ -70,47 +97,56 @@ int dxmt_as_descriptor_set_triangles(dxmt_mtl_handle descriptor, uint32_t index,
     dxmt_mtl_handle vertices, uint64_t vertex_offset, uint64_t vertex_stride,
     dxmt_mtl_handle indices, uint64_t index_offset, uint32_t index_type,
     dxmt_mtl_handle transform, uint64_t transform_offset, uint64_t triangle_count,
-    uint32_t intersection_function_table_offset, uint32_t geometry_flags) {
-  if (!vertices || !triangle_count || vertex_offset > NSUIntegerMax || vertex_stride > NSUIntegerMax ||
-      index_offset > NSUIntegerMax || transform_offset > NSUIntegerMax || triangle_count > NSUIntegerMax)
+    uint32_t intersection_function_table_offset, uint32_t geometry_flags, uint32_t vertex_format) {
+  DXMTASDescriptor *owner = dxmt_desc(descriptor);
+  if (!owner || !vertex_format || vertex_offset > NSUIntegerMax ||
+      vertex_stride > NSUIntegerMax || index_offset > NSUIntegerMax || transform_offset > NSUIntegerMax ||
+      triangle_count > NSUIntegerMax)
     return 0;
   MTLAccelerationStructureTriangleGeometryDescriptor *geometry =
       [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-  geometry.vertexBuffer = (id<MTLBuffer>)dxmt_obj(vertices);
-  geometry.vertexBufferOffset = (NSUInteger)vertex_offset;
+  /* A geometry with no triangles is legal in D3D12 and still occupies its GeometryIndex. A size
+   * query (prebuild info) has no buffers at all; the sizes depend only on the counts. */
+  geometry.vertexBuffer = vertices ? (id<MTLBuffer>)dxmt_obj(vertices) : (triangle_count ? nil : owner.placeholder);
+  geometry.vertexBufferOffset = vertices ? (NSUInteger)vertex_offset : 0;
   geometry.vertexStride = (NSUInteger)vertex_stride;
-  geometry.vertexFormat = MTLAttributeFormatFloat3;
+  /* WMTAttributeFormat values are MTLAttributeFormat values. */
+  geometry.vertexFormat = (MTLAttributeFormat)vertex_format;
   geometry.triangleCount = (NSUInteger)triangle_count;
-  if (indices) {
-    geometry.indexBuffer = (id<MTLBuffer>)dxmt_obj(indices);
-    geometry.indexBufferOffset = (NSUInteger)index_offset;
+  if (index_type != 0xffffffffu && triangle_count) {
+    /* index_type 0xffffffff: not indexed. A size query has no index buffer yet. */
+    geometry.indexBuffer = indices ? (id<MTLBuffer>)dxmt_obj(indices) : nil;
+    geometry.indexBufferOffset = indices ? (NSUInteger)index_offset : 0;
     geometry.indexType = index_type ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
   }
   if (transform) {
     geometry.transformationMatrixBuffer = (id<MTLBuffer>)dxmt_obj(transform);
     geometry.transformationMatrixBufferOffset = (NSUInteger)transform_offset;
+    /* D3D12 Transform3x4 is a row-major 3x4 matrix. */
+    geometry.transformationMatrixLayout = MTLMatrixLayoutRowMajor;
   }
   geometry.intersectionFunctionTableOffset = intersection_function_table_offset;
   dxmt_geometry_flags(geometry, geometry_flags);
-  return dxmt_set_geometry(dxmt_desc(descriptor), index, geometry);
+  return dxmt_set_geometry(owner, index, geometry);
 }
 
 int dxmt_as_descriptor_set_aabbs(dxmt_mtl_handle descriptor, uint32_t index,
     dxmt_mtl_handle boxes, uint64_t box_offset, uint64_t box_stride,
     uint64_t box_count, uint32_t intersection_function_table_offset, uint32_t geometry_flags) {
-  if (!boxes || !box_count || box_offset > NSUIntegerMax || box_stride > NSUIntegerMax ||
+  DXMTASDescriptor *owner = dxmt_desc(descriptor);
+  if (!owner || box_offset > NSUIntegerMax || box_stride > NSUIntegerMax ||
       box_count > NSUIntegerMax)
     return 0;
   MTLAccelerationStructureBoundingBoxGeometryDescriptor *geometry =
       [MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
-  geometry.boundingBoxBuffer = (id<MTLBuffer>)dxmt_obj(boxes);
-  geometry.boundingBoxBufferOffset = (NSUInteger)box_offset;
+  geometry.boundingBoxBuffer = boxes ? (id<MTLBuffer>)dxmt_obj(boxes) : (box_count ? nil : owner.placeholder);
+  geometry.boundingBoxBufferOffset = boxes ? (NSUInteger)box_offset : 0;
   geometry.boundingBoxStride = (NSUInteger)box_stride;
   geometry.boundingBoxCount = (NSUInteger)box_count;
   geometry.intersectionFunctionTableOffset = intersection_function_table_offset;
   dxmt_geometry_flags(geometry, geometry_flags);
 
-  return dxmt_set_geometry(dxmt_desc(descriptor), index, geometry);
+  return dxmt_set_geometry(owner, index, geometry);
 }
 
 int dxmt_as_descriptor_set_instances(dxmt_mtl_handle descriptor,
@@ -121,8 +157,10 @@ int dxmt_as_descriptor_set_instances(dxmt_mtl_handle descriptor,
     return 0;
   MTLInstanceAccelerationStructureDescriptor *instances =
       (MTLInstanceAccelerationStructureDescriptor *)owner.metal;
-  instances.instanceDescriptorBuffer = (id<MTLBuffer>)dxmt_obj(converted_instances);
-  instances.instanceDescriptorBufferOffset = (NSUInteger)converted_offset;
+  /* An empty top-level structure is legal in D3D12; Metal still needs a buffer. */
+  instances.instanceDescriptorBuffer =
+      converted_instances ? (id<MTLBuffer>)dxmt_obj(converted_instances) : owner.placeholder;
+  instances.instanceDescriptorBufferOffset = converted_instances ? (NSUInteger)converted_offset : 0;
   instances.instanceDescriptorStride = sizeof(MTLIndirectAccelerationStructureInstanceDescriptor);
   instances.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeIndirect;
   instances.instanceCount = (NSUInteger)instance_count;
@@ -138,10 +176,13 @@ struct dxmt_as_sizes dxmt_as_get_sizes(dxmt_mtl_handle device, dxmt_mtl_handle d
 
 dxmt_mtl_handle dxmt_as_sidecar_new(dxmt_mtl_handle device, uint64_t native_size,
     uint64_t instance_count) {
-  if (!device || !native_size || native_size > NSUIntegerMax || instance_count > NSUIntegerMax / 4)
+  if (!device || native_size > NSUIntegerMax || instance_count > NSUIntegerMax / 4)
     return 0;
   id<MTLDevice> metal_device = (id<MTLDevice>)dxmt_obj(device);
   DXMTASSidecar *sidecar = [[DXMTASSidecar alloc] init];
+  sidecar.instanceCount = instance_count;
+  if (!native_size)
+    return dxmt_handle(sidecar);
   id<MTLAccelerationStructure> native =
       [metal_device newAccelerationStructureWithSize:(NSUInteger)native_size];
   sidecar.accelerationStructure = native;
@@ -186,6 +227,40 @@ uint64_t dxmt_as_sidecar_size(dxmt_mtl_handle sidecar) {
   return dxmt_sidecar(sidecar).nativeSize;
 }
 
+uint64_t dxmt_as_sidecar_instance_count(dxmt_mtl_handle sidecar) {
+  return dxmt_sidecar(sidecar).instanceCount;
+}
+
+dxmt_mtl_handle dxmt_as_sidecar_generations(dxmt_mtl_handle sidecar) {
+  return dxmt_handle(dxmt_sidecar(sidecar).generations);
+}
+
+int dxmt_as_sidecar_allocate(dxmt_mtl_handle handle, dxmt_mtl_handle device, uint64_t size, uint64_t count) {
+  DXMTASSidecar *sidecar = dxmt_sidecar(handle);
+  if (!sidecar || !size)
+    return 0;
+  if (sidecar.accelerationStructure && sidecar.nativeSize == size && sidecar.instanceCount == count)
+    return 1;
+  DXMTASSidecar *replacement = dxmt_sidecar(dxmt_as_sidecar_new(device, size, count));
+  if (!replacement)
+    return 0;
+  if (!sidecar.generations)
+    sidecar.generations = [NSMutableArray array];
+  if (sidecar.accelerationStructure)
+    [sidecar.generations addObject:sidecar.accelerationStructure];
+  if (sidecar.instances)
+    [sidecar.generations addObject:sidecar.instances];
+  if (sidecar.contributions)
+    [sidecar.generations addObject:sidecar.contributions];
+  sidecar.accelerationStructure = replacement.accelerationStructure;
+  sidecar.instances = replacement.instances;
+  sidecar.contributions = replacement.contributions;
+  sidecar.nativeSize = size;
+  sidecar.instanceCount = count;
+  [replacement release];
+  return 1;
+}
+
 int dxmt_as_encode_prepass(dxmt_mtl_handle encoder, dxmt_mtl_handle pipeline,
     dxmt_mtl_handle source_instances, uint64_t source_offset,
     dxmt_mtl_handle destination_instances, uint64_t destination_offset,
@@ -222,34 +297,7 @@ int dxmt_as_encode_prepass(dxmt_mtl_handle encoder, dxmt_mtl_handle pipeline,
 
 
 
-int dxmt_as_encode_write_u64(dxmt_mtl_handle encoder, dxmt_mtl_handle pipeline,
-    dxmt_mtl_handle destination_buffer, uint64_t destination_offset, uint64_t value) {
-  if (!encoder || !pipeline || !destination_buffer || destination_offset > NSUIntegerMax)
-    return 0;
-  id<MTLComputeCommandEncoder> compute = (id<MTLComputeCommandEncoder>)dxmt_obj(encoder);
-  [compute setComputePipelineState:(id<MTLComputePipelineState>)dxmt_obj(pipeline)];
-  [compute setBuffer:(id<MTLBuffer>)dxmt_obj(destination_buffer)
-      offset:(NSUInteger)destination_offset atIndex:0];
-  [compute setBytes:&value length:sizeof(value) atIndex:1];
-  uint32_t offset = 0;
-  [compute setBytes:&offset length:sizeof(offset) atIndex:2];
-  [compute dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-  return 1;
-}
 
-int dxmt_as_encode_finalize_compacted_size(dxmt_mtl_handle encoder, dxmt_mtl_handle pipeline,
-    dxmt_mtl_handle destination_buffer, uint64_t destination_offset) {
-  if (!encoder || !pipeline || !destination_buffer || destination_offset > NSUIntegerMax)
-    return 0;
-  id<MTLComputeCommandEncoder> compute = (id<MTLComputeCommandEncoder>)dxmt_obj(encoder);
-  [compute setComputePipelineState:(id<MTLComputePipelineState>)dxmt_obj(pipeline)];
-  [compute setBuffer:(id<MTLBuffer>)dxmt_obj(destination_buffer)
-      offset:(NSUInteger)destination_offset atIndex:0];
-  uint32_t offset = 0;
-  [compute setBytes:&offset length:sizeof(offset) atIndex:1];
-  [compute dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-  return 1;
-}
 
 int dxmt_as_encode_build(dxmt_mtl_handle encoder, dxmt_mtl_handle descriptor,
     dxmt_mtl_handle destination_sidecar, dxmt_mtl_handle scratch, uint64_t scratch_offset) {

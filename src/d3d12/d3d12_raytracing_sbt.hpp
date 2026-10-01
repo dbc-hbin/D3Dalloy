@@ -8,16 +8,15 @@
  * `D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES` identifier bytes returned by
  * ID3D12StateObjectProperties::GetShaderIdentifier followed by the local root
  * arguments of that export, exactly as D3D12 describes them. This backend does
- * not rewrite, mirror, size or read back those records: DispatchRays validates
- * the declared ranges, resolves each table to the owning Metal buffer and lets a
- * small preparation pass on the GPU turn the records into the two views the
- * compiled traversal consumes:
- *
- *   - a `uint32_t` export index per record, which is where D3D12's opaque 32 byte
- *     identifier is resolved back into a compile time function index;
- *   - one local root argument table entry per record, holding the same bytes the
- *     application wrote, translated into the qword root-argument layout the root
- *     signature ABI already uses for every other stage.
+ * not rewrite, mirror, size or read back those records, and it does not
+ * pre-process them either: the compiled traversal resolves a record on the GPU,
+ * straight out of the application's table (EmitShaderRecordLookup in
+ * dxil_rt_callbacks.cpp). The 32 byte identifier names the export (records of
+ * another pipeline name none), and the bytes after it are read in place as the
+ * export's local root arguments, in the D3D12 local root layout the compiled local
+ * root signature uses. DispatchRays only validates the declared ranges and
+ * publishes the table bases, strides and counts; an indirect dispatch has a GPU
+ * kernel publish the same fields from the GPU-written description.
  *
  * The definitions here use plain integer types on purpose: the same header is
  * consumed by the PE runtime and by the native raytracing compiler.
@@ -38,19 +37,11 @@ inline constexpr uint64_t kShaderIdentifierSize = 32;
 inline constexpr uint64_t kMaxShaderRecordSize = 4096;
 // D3D12_RAYTRACING_MAX_RAY_GENERATION_SHADER_THREADS.
 inline constexpr uint32_t kMaxDispatchDimension = 1073741824u;
-/**
- * Written into the record index array when a record does not carry an identifier
- * of the pipeline being dispatched. The compiled traversal treats it as "no such
- * shader", never as a substitute export.
- */
-inline constexpr uint32_t kInvalidRecordIndex = 0xffffffffu;
 
 enum class SbtStatus : uint8_t {
   Ok,
   // The table description violates a D3D12 shader table alignment or size rule.
   InvalidDescription,
-  // A declared range is valid but does not name one whole GPU allocation.
-  UnresolvedAddress,
 };
 
 /** Plain description of one table, mirroring the D3D12 ranges. */
@@ -71,27 +62,17 @@ struct DispatchDescription {
 };
 
 /**
- * Validated view of one D3D12 shader table.
- *
- * `span` bounds how much of a record may be read: for a strided table it is the
- * stride (only complete records inside the declared range are addressable), for a
- * table with a stride of 0 it is the whole declared range, because every index
- * resolves to that single record.
+ * Validated view of one D3D12 shader table. A table with a stride of 0 is one
+ * record every index resolves to (record_count 1, broadcast).
  */
 struct ShaderTable {
   uint64_t base = 0;
   uint64_t size = 0;
   uint64_t stride = 0;
-  uint64_t span = 0;
   uint32_t record_count = 0;
   bool broadcast = false;
 
   bool present() const { return size != 0; }
-  /** Bytes of local root data the record can carry. */
-  uint64_t local_root_capacity() const {
-    const uint64_t record_bytes = broadcast ? span : stride;
-    return record_bytes > kShaderIdentifierSize ? record_bytes - kShaderIdentifierSize : 0;
-  }
 };
 
 struct PreparedDispatch {
@@ -111,7 +92,6 @@ inline SbtStatus ValidateRayGenerationTable(uint64_t address, uint64_t size, Sha
     return SbtStatus::InvalidDescription;
   table.base = address;
   table.size = size;
-  table.span = size;
   table.record_count = 1;
   table.broadcast = true;
   return SbtStatus::Ok;
@@ -132,9 +112,7 @@ inline SbtStatus ValidateShaderTable(uint64_t address, uint64_t size, uint64_t s
   table.base = address;
   table.size = size;
   if (!stride) {
-    // Every index resolves to the same record; the declared range bounds how much
-    // of that record may be read.
-    table.span = size;
+    // Every index resolves to the same record.
     table.record_count = 1;
     table.broadcast = true;
     return SbtStatus::Ok;
@@ -146,7 +124,6 @@ inline SbtStatus ValidateShaderTable(uint64_t address, uint64_t size, uint64_t s
   if (!records || records > std::numeric_limits<uint32_t>::max())
     return SbtStatus::InvalidDescription;
   table.stride = stride;
-  table.span = stride;
   table.record_count = static_cast<uint32_t>(records);
   return SbtStatus::Ok;
 }
@@ -178,148 +155,126 @@ inline SbtStatus PrepareDispatch(const DispatchDescription &desc, PreparedDispat
 }
 
 /* ------------------------------------------------------------------------- */
-/* Local root argument translation                                           */
+/* Indirect DispatchRays (ExecuteIndirect DISPATCH_RAYS)                     */
 /* ------------------------------------------------------------------------- */
 
 /**
- * One contiguous byte range copied out of the application's local root data into
- * the materialized qword layout entry for a record.
+ * Plain parameters of one indirect resolve; matches dxmt_rays_indirect_control in MSL.
  *
- * `source_offset` is relative to the record's local root data (the byte after the
- * 32 byte identifier) and follows the D3D12 local root argument layout: root
- * constants are 4 byte packed, root descriptors and descriptor tables are 8 byte
- * aligned. `destination_offset` is relative to the entry and follows the existing
- * root argument qword layout of the root signature (`SlotQwordOffsets`).
+ * Every slot gets its own SM50_RT_DISPATCH_ARGUMENTS block `arguments_stride` bytes
+ * apart, initialized by the CPU from the dispatch's constant fields (export count,
+ * pipeline token, recursion depth, sizes), and its threadgroup grid (3 x uint, 16 bytes
+ * apart). The kernel fills the table bases, strides, counts, dimensions and the block's
+ * own address from the application's GPU-written D3D12_DISPATCH_RAYS_DESC.
  */
-struct LocalRootCopy {
-  uint32_t source_offset;
-  uint32_t size;
-  uint32_t destination_offset;
-  uint32_t reserved;
+struct RaysIndirectControl {
+  uint64_t arguments;       // D3D12 GPU VA of the first D3D12_DISPATCH_RAYS_DESC
+  uint64_t count;           // count buffer address or 0
+  uint64_t predicate;       // predication snapshot address or 0
+  uint64_t dispatch_blocks; // GPU address of the first SM50_RT_DISPATCH_ARGUMENTS block
+  uint64_t grids;           // GPU address of the first threadgroup grid
+  uint32_t stride;          // command signature ByteStride
+  uint32_t max_commands;
+  uint32_t arguments_stride;
+  uint32_t predicate_not_equal;
 };
-
-/** Per export header of the copy list used by the GPU preparation pass. */
-struct LocalRootLayout {
-  uint32_t copy_offset;
-  uint32_t copy_count;
-  /** Bytes of local root data the export's root signature consumes. */
-  uint32_t source_size;
-  uint32_t reserved;
-};
-
-/* ------------------------------------------------------------------------- */
-/* GPU preparation pass                                                      */
-/* ------------------------------------------------------------------------- */
-
-/** Plain parameters of one preparation pass; matches SbtPrepareParameters in MSL. */
-struct SbtPrepareParameters {
-  uint32_t record_count;
-  /** Byte distance between records; 0 replicates the first record. */
-  uint32_t record_stride;
-  /** Bytes of local root data readable in each record. */
-  uint32_t record_local_root_capacity;
-  /** Byte distance between materialized local root entries. */
-  uint32_t entry_stride;
-  /** Number of exports; identifiers outside this range are rejected. */
-  uint32_t export_count;
-  /** Token of the state object being dispatched; foreign identifiers are rejected. */
-  uint32_t pipeline_token;
-  uint32_t reserved[2];
-};
+static_assert(sizeof(RaysIndirectControl) == 56);
 
 /**
- * Copies each record's identifier payload into the export index array and its
- * local root data into the materialized entry using the per-export copy list.
- * A record whose identifier does not belong to the pipeline gets
- * kInvalidRecordIndex, and the traversal must then skip it rather than fall back
- * to another export.
+ * One thread per command slot. A slot past the count buffer, a slot culled by
+ * predication, and a description that violates the D3D12 shader table rules (the
+ * PrepareDispatch rules above) all dispatch 0 threadgroups; a valid slot dispatches
+ * Width x Height x Depth single-thread groups, which is the traversal's grid.
+ * Field offsets are SM50_RT_DISPATCH_ARGUMENTS's (dxil_raytracing.h), passed in as
+ * the DXMT_* macros so the two cannot disagree.
  */
-inline constexpr const char kShaderTablePrepareMSL[] = R"metal(
+inline constexpr const char kRaysIndirectMSL[] = R"metal(
 #include <metal_stdlib>
 using namespace metal;
 
-struct dxmt_sbt_prepare_parameters {
-  uint record_count;
-  uint record_stride;
-  uint record_local_root_capacity;
-  uint entry_stride;
-  uint export_count;
-  uint pipeline_token;
-  uint reserved[2];
+struct dxmt_rays_indirect_control {
+  ulong arguments;
+  ulong count;
+  ulong predicate;
+  ulong dispatch_blocks;
+  ulong grids;
+  uint stride;
+  uint max_commands;
+  uint arguments_stride;
+  uint predicate_not_equal;
 };
 
-struct dxmt_sbt_local_root_copy {
-  uint source_offset;
-  uint size;
-  uint destination_offset;
-  uint reserved;
+struct dxmt_range { ulong address; ulong size; };
+struct dxmt_strided { ulong address; ulong size; ulong stride; };
+struct dxmt_rays_desc {
+  dxmt_range ray_generation;
+  dxmt_strided miss;
+  dxmt_strided hit_group;
+  dxmt_strided callable;
+  uint width, height, depth;
 };
 
-struct dxmt_sbt_local_root_layout {
-  uint copy_offset;
-  uint copy_count;
-  uint source_size;
-  uint reserved;
-};
+/* ValidateShaderTable above; returns the record count (0 for an absent table) and flags a violation. */
+static uint table_records(dxmt_strided t, thread bool &bad) {
+  if (!t.size) {
+    bad |= t.address != 0 || t.stride != 0;
+    return 0;
+  }
+  if ((t.address & 63) || t.size < 32) { bad = true; return 0; }
+  if (!t.stride) return 1;
+  if ((t.stride & 31) || t.stride > 4096 || t.stride > t.size) { bad = true; return 0; }
+  ulong records = t.size / t.stride;
+  if (records > 0xffffffffull) { bad = true; return 0; }
+  return uint(records);
+}
 
-/* OwnedShaderIdentifier in d3d12_state_object.hpp. */
-struct dxmt_sbt_identifier {
-  uint magic;
-  ushort version;
-  ushort kind;
-  uint pipeline_token;
-  uint export_index;
-  uint flags;
-};
-
-kernel void dxmt_prepare_shader_table(
-    device const uchar *records [[buffer(0)]],
-    device uint *record_indices [[buffer(1)]],
-    device uchar *local_root_entries [[buffer(2)]],
-    constant dxmt_sbt_local_root_layout *layouts [[buffer(3)]],
-    constant dxmt_sbt_local_root_copy *copies [[buffer(4)]],
-    constant dxmt_sbt_prepare_parameters &parameters [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid >= parameters.record_count)
+kernel void dxmt_rays_indirect(constant dxmt_rays_indirect_control &control [[buffer(0)]],
+                               uint slot [[thread_position_in_grid]]) {
+  if (slot >= control.max_commands)
     return;
-
-  device const uchar *record = records + gid * parameters.record_stride;
-  device uchar *entry = local_root_entries + gid * parameters.entry_stride;
-  for (uint i = 0; i < parameters.entry_stride; ++i)
-    entry[i] = 0;
-
-  // Records are 32 byte aligned, so the identifier loads stay naturally aligned.
-  device const dxmt_sbt_identifier *identifier = (device const dxmt_sbt_identifier *)(record);
-  const uint expected_magic = 0x544D5844u;
-  const uint expected_version = 1;
-  const uint expected_kind = 1;
-  if (identifier->magic != expected_magic || identifier->version != expected_version ||
-      identifier->kind != expected_kind || identifier->pipeline_token != parameters.pipeline_token ||
-      identifier->export_index >= parameters.export_count) {
-    // The identifier was not handed out by the pipeline being dispatched. Publishing
-    // the sentinel lets the traversal skip the record instead of running a shader the
-    // application never asked for.
-    record_indices[gid] = 0xffffffffu;
+  device uint *grid = (device uint *)(control.grids + ulong(slot) * 16);
+  const ulong self = control.dispatch_blocks + ulong(slot) * control.arguments_stride;
+  device uchar *block = (device uchar *)self;
+  uint count = control.count ? *(device const uint *)control.count : control.max_commands;
+  bool culled = false;
+  if (control.predicate) {
+    ulong value = *(device const ulong *)control.predicate;
+    culled = control.predicate_not_equal ? value != 0 : value == 0;
+  }
+  dxmt_rays_desc d = *(device const dxmt_rays_desc *)(control.arguments + ulong(slot) * control.stride);
+  bool bad = slot >= count || culled;
+  bad |= !d.width || !d.height || !d.depth || d.width > 1073741824u || d.height > 1073741824u ||
+         d.depth > 1073741824u;
+  bad |= !d.ray_generation.size || (d.ray_generation.address & 63) || d.ray_generation.size < 32 ||
+         d.ray_generation.size > 4096;
+  uint miss = table_records(d.miss, bad);
+  uint hit = table_records(d.hit_group, bad);
+  uint callable = table_records(d.callable, bad);
+  if (bad) {
+    grid[0] = grid[1] = grid[2] = 0;
     return;
   }
-  uint export_index = identifier->export_index;
-  record_indices[gid] = export_index;
-
-  dxmt_sbt_local_root_layout layout = layouts[export_index];
-  for (uint c = 0; c < layout.copy_count; ++c) {
-    dxmt_sbt_local_root_copy copy = copies[layout.copy_offset + c];
-    if (copy.source_offset >= parameters.record_local_root_capacity)
-      continue;
-    uint available = parameters.record_local_root_capacity - copy.source_offset;
-    uint size = min(copy.size, available);
-    for (uint b = 0; b < size; ++b)
-      entry[copy.destination_offset + b] =
-          record[sizeof(uint) * 8 + copy.source_offset + b];
-  }
+  *(device ulong *)(block + DXMT_RAYGEN_RECORD) = d.ray_generation.address;
+  *(device ulong *)(block + DXMT_MISS_BASE) = d.miss.address;
+  *(device ulong *)(block + DXMT_HIT_BASE) = d.hit_group.address;
+  *(device ulong *)(block + DXMT_CALLABLE_BASE) = d.callable.address;
+  *(device uint *)(block + DXMT_MISS_STRIDE) = uint(d.miss.stride);
+  *(device uint *)(block + DXMT_MISS_COUNT) = miss;
+  *(device uint *)(block + DXMT_HIT_STRIDE) = uint(d.hit_group.stride);
+  *(device uint *)(block + DXMT_HIT_COUNT) = hit;
+  *(device uint *)(block + DXMT_CALLABLE_STRIDE) = uint(d.callable.stride);
+  *(device uint *)(block + DXMT_CALLABLE_COUNT) = callable;
+  *(device uint *)(block + DXMT_WIDTH) = d.width;
+  *(device uint *)(block + DXMT_HEIGHT) = d.height;
+  *(device uint *)(block + DXMT_DEPTH) = d.depth;
+  *(device ulong *)(block + DXMT_SELF) = self;
+  grid[0] = d.width;
+  grid[1] = d.height;
+  grid[2] = d.depth;
 }
 )metal";
 
-/** Metal function name of the preparation kernel above. */
-inline constexpr const char kShaderTablePrepareFunction[] = "dxmt_prepare_shader_table";
+/** Metal function name of the indirect resolve kernel above. */
+inline constexpr const char kRaysIndirectFunction[] = "dxmt_rays_indirect";
 
 } // namespace dxmt::raytracing
