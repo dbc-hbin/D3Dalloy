@@ -2141,6 +2141,169 @@ static llvm::Error activateRasterOrderedBuffers(llvm::Module &module, unsigned s
   return Error::success();
 }
 
+static llvm::Error applyIndirectViewLocations(
+  llvm::Module &module, const SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA &options
+) {
+  using namespace llvm;
+  auto invalid = [](const char *message) {
+    return createStringError(inconvertibleErrorCode(), "indirect view locations: %s", message);
+  };
+  if (!options.view_count || options.view_count > 4)
+    return invalid("view count must be in 1..4");
+  auto *vertices = module.getNamedMetadata("air.vertex");
+  if (!vertices || !vertices->getNumOperands()) return Error::success();
+  if (vertices->getNumOperands() != 1) return invalid("expected one native vertex entry");
+  auto *signature = vertices->getOperand(0);
+  if (signature->getNumOperands() < 3) return invalid("incomplete AIR vertex signature");
+  auto *functionMetadata = dyn_cast<ValueAsMetadata>(signature->getOperand(0));
+  auto *original = functionMetadata ? dyn_cast<Function>(functionMetadata->getValue()) : nullptr;
+  if (!original) return invalid("missing AIR vertex function");
+  // Metal forbids outputs on a rasterization-disabled vertex entry. Routing is unused there.
+  if (original->getReturnType()->isVoidTy()) return Error::success();
+  auto *returnType = dyn_cast<StructType>(original->getReturnType());
+  auto *outputs = dyn_cast<MDTuple>(signature->getOperand(1));
+  auto *inputs = dyn_cast<MDTuple>(signature->getOperand(2));
+  if (!returnType || !outputs || !inputs || original->empty() ||
+      returnType->getNumElements() != outputs->getNumOperands() ||
+      original->arg_size() != inputs->getNumOperands())
+    return invalid("inconsistent AIR vertex signature");
+
+  unsigned rootArgument = ~0u, viewField = ~0u;
+  StructType *rootType = nullptr;
+  for (unsigned input = 0; input < inputs->getNumOperands(); ++input) {
+    auto *metadata = dyn_cast<MDNode>(inputs->getOperand(input));
+    if (!metadata || !metadata->getNumOperands()) continue;
+    bool indirectBuffer = false, rootLocation = false;
+    MDNode *structure = nullptr;
+    for (unsigned i = 1; i < metadata->getNumOperands(); ++i) {
+      auto *key = dyn_cast<MDString>(metadata->getOperand(i));
+      if (!key) continue;
+      if (key->getString() == "air.indirect_buffer") indirectBuffer = true;
+      else if (key->getString() == "air.location_index" && i + 1 < metadata->getNumOperands()) {
+        auto *location = mdconst::dyn_extract<ConstantInt>(metadata->getOperand(i + 1));
+        rootLocation = location && location->getZExtValue() == SM50_BINDING_INDEX_ROOT_ARGUMENTS;
+      } else if (key->getString() == "air.struct_type_info" && i + 1 < metadata->getNumOperands())
+        structure = dyn_cast<MDNode>(metadata->getOperand(i + 1));
+    }
+    if (!indirectBuffer || !rootLocation || !structure) continue;
+    auto *argumentIndex = mdconst::dyn_extract<ConstantInt>(metadata->getOperand(0));
+    if (!argumentIndex || argumentIndex->getZExtValue() >= original->arg_size())
+      return invalid("root argument index is out of range");
+    rootArgument = unsigned(argumentIndex->getZExtValue());
+    auto *pointer = dyn_cast<PointerType>(original->getArg(rootArgument)->getType());
+    rootType = pointer ? dyn_cast<StructType>(pointer->getNonOpaquePointerElementType()) : nullptr;
+    // ArgumentBufferBuilder::Build emits seven metadata operands per named struct member.
+    if (!rootType || structure->getNumOperands() != rootType->getNumElements() * 7)
+      return invalid("root argument struct metadata does not match its type");
+    for (unsigned field = 0; field < rootType->getNumElements(); ++field) {
+      auto *name = dyn_cast<MDString>(structure->getOperand(field * 7 + 4));
+      if (!name || name->getString() != "view_id") continue;
+      auto *offset = mdconst::dyn_extract<ConstantInt>(structure->getOperand(field * 7));
+      if (!rootType->getElementType(field)->isIntegerTy(64) || !offset ||
+          offset->getZExtValue() != module.getDataLayout().getStructLayout(rootType)->getElementOffset(field))
+        return invalid("view_id must be a matching root qword");
+      viewField = field;
+      break;
+    }
+    break;
+  }
+  if (rootArgument == ~0u || viewField == ~0u)
+    return invalid("native ICB routing requires the root view_id qword");
+
+  auto &context = module.getContext();
+  const StringRef kinds[] = {"air.viewport_array_index", "air.render_target_array_index"};
+  const StringRef names[] = {"mtl_viewport_array_index", "mtl_render_target_array_index"};
+  unsigned indices[] = {~0u, ~0u};
+  for (unsigned field = 0; field < outputs->getNumOperands(); ++field) {
+    auto *metadata = dyn_cast<MDNode>(outputs->getOperand(field));
+    auto *kind = metadata && metadata->getNumOperands() ? dyn_cast<MDString>(metadata->getOperand(0)) : nullptr;
+    if (!kind) return invalid("malformed AIR vertex output");
+    for (unsigned axis = 0; axis < 2; ++axis) {
+      if (kind->getString() != kinds[axis]) continue;
+      if (indices[axis] != ~0u || !returnType->getElementType(field)->isIntegerTy(32))
+        return invalid("view location output must be a single uint");
+      indices[axis] = field;
+    }
+  }
+  SmallVector<Type *, 48> types(returnType->element_begin(), returnType->element_end());
+  SmallVector<Metadata *, 48> outputMetadata(outputs->op_begin(), outputs->op_end());
+  for (unsigned axis = 0; axis < 2; ++axis) {
+    if (indices[axis] != ~0u) continue;
+    indices[axis] = types.size();
+    types.push_back(Type::getInt32Ty(context));
+    outputMetadata.push_back(MDTuple::get(context, {
+      MDString::get(context, kinds[axis]), MDString::get(context, "air.arg_type_name"),
+      MDString::get(context, "uint"), MDString::get(context, "air.arg_name"), MDString::get(context, names[axis])}));
+  }
+  auto *entry = original;
+  if (types.size() != returnType->getNumElements()) {
+    auto *enlargedReturn = StructType::get(context, types, returnType->isPacked());
+    entry = Function::Create(FunctionType::get(enlargedReturn, original->getFunctionType()->params(), false),
+      original->getLinkage(), original->getAddressSpace(), "", &module);
+    entry->takeName(original);
+    entry->setCallingConv(original->getCallingConv());
+    entry->setAttributes(original->getAttributes());
+    entry->setSubprogram(original->getSubprogram());
+    for (unsigned i = 0; i < original->arg_size(); ++i) {
+      entry->getArg(i)->takeName(original->getArg(i));
+      original->getArg(i)->replaceAllUsesWith(entry->getArg(i));
+    }
+    entry->getBasicBlockList().splice(entry->end(), original->getBasicBlockList());
+  }
+  // Added root reads must not retain inferred no-read/write-only memory attributes.
+  entry->removeFnAttr(Attribute::ReadNone);
+  entry->removeFnAttr(Attribute::WriteOnly);
+  entry->removeFnAttr(Attribute::InaccessibleMemOnly);
+  entry->removeParamAttr(rootArgument, Attribute::ReadNone);
+  entry->removeParamAttr(rootArgument, Attribute::WriteOnly);
+  IRBuilder<> prologue(&*entry->getEntryBlock().getFirstInsertionPt());
+  auto *packedView = prologue.CreateLoad(prologue.getInt64Ty(),
+    prologue.CreateStructGEP(rootType, entry->getArg(rootArgument), viewField));
+  auto *view = prologue.CreateTrunc(packedView, prologue.getInt32Ty());
+  Value *offsets[2], *bounds[2];
+  for (unsigned axis = 0; axis < 2; ++axis) {
+    offsets[axis] = prologue.getInt32(0);
+    for (unsigned logicalView = 0; logicalView < options.view_count; ++logicalView) {
+      uint32_t offset = axis ? options.render_target_offsets[logicalView] : options.viewport_offsets[logicalView];
+      offsets[axis] = prologue.CreateSelect(prologue.CreateICmpEQ(view, prologue.getInt32(logicalView)),
+        prologue.getInt32(offset), offsets[axis]);
+    }
+    bounds[axis] = prologue.CreateTrunc(
+      prologue.CreateAnd(prologue.CreateLShr(packedView, prologue.getInt64(axis ? 48 : 32)),
+        prologue.getInt64(0xffff)), prologue.getInt32Ty());
+  }
+  for (auto &block : *entry) {
+    auto *ret = dyn_cast<ReturnInst>(block.getTerminator());
+    if (!ret) continue;
+    IRBuilder<> builder(ret);
+    auto *oldResult = ret->getReturnValue();
+    if (!oldResult) return invalid("rasterizing vertex return has no value");
+    Value *result = oldResult;
+    if (entry != original) {
+      result = UndefValue::get(entry->getReturnType());
+      for (unsigned field = 0; field < returnType->getNumElements(); ++field)
+        result = builder.CreateInsertValue(result, builder.CreateExtractValue(oldResult, field), field);
+    }
+    for (unsigned axis = 0; axis < 2; ++axis) {
+      Value *base = indices[axis] < returnType->getNumElements()
+        ? builder.CreateExtractValue(oldResult, indices[axis])
+        : builder.getInt32(0);
+      // View Instancing adds shader indices and PSO offsets as wrapping UINT32 before checking bounds.
+      auto *sum = builder.CreateAdd(base, offsets[axis]);
+      auto *clamped = builder.CreateSelect(builder.CreateICmpULT(sum, bounds[axis]),
+        sum, builder.getInt32(0));
+      result = builder.CreateInsertValue(result, clamped, indices[axis]);
+    }
+    ret->setOperand(0, result);
+  }
+  SmallVector<Metadata *, 8> signatureFields(signature->op_begin(), signature->op_end());
+  signatureFields[0] = ValueAsMetadata::get(entry);
+  signatureFields[1] = MDTuple::get(context, outputMetadata);
+  vertices->setOperand(0, MDTuple::get(context, signatureFields));
+  if (entry != original) original->eraseFromParent();
+  return Error::success();
+}
+
 AIRCONV_API int SM50Compile(
   sm50_shader_t pShader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
@@ -2183,6 +2346,9 @@ AIRCONV_API int SM50Compile(
   dxmt::dxbc::args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &root_signature);
   SM50_SHADER_D3D12_LOGIC_OP_DATA *logic_op = nullptr;
   dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_LOGIC_OP, SM50_SHADER_D3D12_LOGIC_OP_DATA>(pArgs, &logic_op);
+  SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA *indirect_views = nullptr;
+  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS,
+    SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA>(pArgs, &indirect_views);
   const uint32_t sample_frequency_mask = !msaa_pixel && !msaa_vertex && pixel_pso &&
     ((dxmt::dxbc::SM50ShaderInternal *)pShader)->ps_sample_frequency
       ? pixel_pso->sample_mask : 0xffffffffu;
@@ -2219,6 +2385,13 @@ AIRCONV_API int SM50Compile(
     }
     auto info = std::move(*lowered);
     auto &pModule = info->module;
+    if (indirect_views) {
+      if (auto error = applyIndirectViewLocations(*pModule, *indirect_views)) {
+        reportError(std::move(error), errorOut);
+        failCall(errorObj, ppError);
+        return 1;
+      }
+    }
     if (msaa_mesh) {
       if (auto error = dxmt::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
         reportError(std::move(error), errorOut);
@@ -2298,6 +2471,13 @@ AIRCONV_API int SM50Compile(
     });
     failCall(errorObj, ppError);
     return 1;
+  }
+  if (indirect_views) {
+    if (auto error = applyIndirectViewLocations(*pModule, *indirect_views)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
   }
   if (msaa_mesh) {
     if (auto error = dxmt::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {

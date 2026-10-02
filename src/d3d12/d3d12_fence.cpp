@@ -21,6 +21,7 @@
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
 #include <new>
+#include <cwchar>
 
 namespace dxmt {
 
@@ -52,13 +53,9 @@ public:
   }
 
   /*
-   * Value mapping: the MTLSharedEvent carries monotonic native tokens, never API
-   * values. Every Signal (CPU or GPU, any device or process) reserves the next
-   * token in the section's SharedFenceTimeline and publishes token -> logical
-   * value before the event can reach that token. The API value of the fence is
-   * the logical value published for the event's current token, so it is the
-   * same in every process and Signal(lower) rewinds it, exactly like a
-   * non-shared fence, while Metal's event timeline only moves forward.
+   * Logical completion lives in the versioned shared section. The Metal event
+   * carries completion-publication serials only to wake observers; producer
+   * reservation order must never become logical completion order.
    */
   HRESULT
   Publish(WMT::Reference<WMT::SharedEvent> event, bool publish_initial, uint64_t initial_value) {
@@ -79,7 +76,15 @@ public:
     if (FAILED(hr))
       return hr;
     auto *timeline = reinterpret_cast<SharedFenceTimeline *>(share->payload());
-    return fence->initializeShared(std::move(event), timeline, share, publish_initial, initial_value) ? S_OK
+    if (!publish_initial && timeline->version != SharedFenceTimeline::kVersion)
+      return E_INVALIDARG;
+    // Use the random section token, not a recyclable native event identity.
+    WCHAR mutex_name[80];
+    const auto *token = share->header().token;
+    std::swprintf(mutex_name, 80, L"Local\\dxmt.fence.%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                  token[0], token[1], token[2], token[3], token[4], token[5], token[6], token[7],
+                  token[8], token[9], token[10], token[11], token[12], token[13], token[14], token[15]);
+    return fence->initializeShared(std::move(event), timeline, share, mutex_name, publish_initial, initial_value) ? S_OK
                                                                                                     : E_OUTOFMEMORY;
   }
 

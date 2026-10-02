@@ -6,23 +6,23 @@
 
 ## P0 — 기존 API 경로의 안전성·계약 완결
 
-아래 네 항목은 구현과 공개 consumer 실행이 모두 끝나야 닫는다. 문서의 계획이나 컴파일 성공만으로 완료 표시하지 않는다.
+**P0-1–4 완료:** 새 `p0-contracts-r5KJ0O/runtime-01`에서 core 공개 fixture x64/WoW64, NGX x64-only, 기존 VRS·sharing 양 ABI GPU consumer를 실행했다. [CORE의 정확한 증거·한계](CORE-IMPLEMENTATION-STATUS.ko.md#p0-공개-계약-정합)를 따른다. 아래는 닫힌 계약 기록이며 다음 실행 우선순위는 **P1의 programmable sample positions**다. 계획·컴파일만으로 닫은 항목이 아니다.
 
-| ID | 작업 | 현재 근거 | 완료 기준 |
+| ID | 작업 | 현재 소스 계약 | 공개 검증 범위 |
 |---|---|---|---|
-| P0-1 | DXGI 보호 콘텐츠 알림 API의 안전한 미지원 처리 | `src/dxgi/dxgi_adapter.cpp`의 Register/UnregisterHardwareContentProtectionTeardownStatus가 assert-only. Assert 활성 시 중단, 비활성 시 HRESULT 반환 누락의 정적 위험 | Native 보호 기능을 가장하지 않는다. 인자·출력·일관된 미지원 결과, unregister의 안전성, caller event 수명/상태 보존을 공개 API에서 확인한다. 전체 protected session 구현은 P4다. |
-| P0-2 | 정확한 adapter LUID 선택 | `src/dxgi/dxgi_factory.cpp::EnumAdapterByLuid`가 불일치 LUID에도 adapter0을 반환. 실제 CPU API probe에서 없는 LUID에 S_OK/non-null/wrong adapter 관찰 | 실제 일치 LUID와 IID는 올바른 COM 객체 반환, 없는 LUID는 DXGI_ERROR_NOT_FOUND와 null output, 잘못된 출력/IID 및 객체 수명 경계를 확인한다. GPU preference의 단일 GPU 정책과 구분한다. |
-| P0-3 | Resource1/Resource2/Heap1 공개 계약 | Resource·Heap 객체 QI가 base interface만 노출. 일부 생성·공유 경로는 확장 IID를 받지만 반환 객체와 불일치 | Resource1/Heap1의 GetProtectedResourceSession, Resource2의 GetDesc1을 실제 구현하고 모든 resource/heap 종류, 생성·QI·공유 handle·IUnknown identity·refcount 계약을 이행한다. WriteToSubresource는 이미 base Resource 메서드다. |
-| P0-4 | Capability 및 NGX discovery 보고 정합 | 일부 알려진 CheckFeatureSupport 질의는 default E_NOTIMPL. NGX GetFeatureRequirements는 adapter의 temporal support를 조회하지 않아 Init과 범위가 다름 | 실제 선택 header의 빠진 질의를 명시적으로 대조하고 구현/명시적 미지원 상태를 정확히 보고한다. 구조 크기·입력·출력·node/queue/optional 기능 경계를 검증한다. NGX는 supported/unsupported adapter discovery와 Init의 공통 native support 기준을 사용한다. 기능 없는 cap을 올리지 않는다. |
+| P0-1 | DXGI 보호 콘텐츠 알림 API의 안전한 미지원 처리 | Register는 supplied cookie를0으로 지우고 null cookie·null/INVALID_HANDLE_VALUE event는 E_INVALIDARG, 그 외는 DXGI_ERROR_UNSUPPORTED. Assert 제거·Unregister는 안전한 no-op | Caller event의 handle 수명·signaled state·manual/auto reset·budget-cookie 분리. Native 보호 기능이나 protected session 지원을 가장하지 않는다. |
+| P0-2 | 정확한 adapter LUID 선택 | 기존 adapter enumeration에서 LUID 양 half가 정확히 일치할 때만 선택 객체 QI. 불일치는 DXGI_ERROR_NOT_FOUND + null output, adapter0 fallback 없음 | 관측 adapter의 IID·IUnknown identity·retained lifetime·D3D12 GetAdapterLuid 및 양 half의 독립 불일치. 단일 GPU preference 정책과 구분한다. |
+| P0-3 | Resource1/Resource2/Heap1 공개 계약 | 실제 확장 vtable·GetDesc1 logical desc/정확한 feedback region·unprotected GetProtectedResourceSession의 E_NOINTERFACE + null | 생성·QI·공유 반환 경로와 retained interface·IUnknown identity·descriptor·GPU readback. Null-output E_POINTER는 프로젝트 경계이며 native differential proof가 아니다. |
+| P0-4 | Capability 및 NGX discovery 보고 정합 | 선택 header의38 public Feature IDs + 기존 private OPTIONS21, 빠진9 query 구현. OPTIONS10 true/true·ExistingHeaps true는 기존 VRS·heap 실행 경로에 근거. NGX discovery와 Init은 동일 native temporal predicate | Exact size·입력·node/queue·unsupported 경계, x64-only NGX의 Success + AdapterUnsupported(4), 기존 VRS·sharing 양 ABI GPU consumer 회귀. 최신 SDK 전체 enum/conformance 선언이 아니다. |
 
-P0-2 수정 전 실행: [`remaining-inventory-stYzia/adapter-luid.log`](../build/local/remaining-inventory-stYzia/adapter-luid.log), 최신 port runtime02 사용. `missing_luid_hr=00000000`, expected `887a0002`, output_nonnull=1, returned_matches_request=0. 이것은 CPU 공개 API 재현이며 GPU 실패나 실제 게임 장애 증거가 아니다. P0-1은 이 문서 작성 당시 정적 확인이지 crash 재현이 아니다.
+수정 전 증거는 보존한다. P0-2의 [`remaining-inventory-stYzia/adapter-luid.log`](../build/local/remaining-inventory-stYzia/adapter-luid.log)는 port runtime02에서 `missing_luid_hr=00000000`, expected `887a0002`, output_nonnull=1, returned_matches_request=0이었다. P0-1은 최초 문서 작성 시 정적 finding이었고 후속 [public before-x64 stderr](../build/local/p0-contracts-r5KJ0O/protection-notification/before-x64-02.stderr.log)에서 assert 중단을 실제 관찰했다. CPU 공개 API 증거이며 GPU/게임 실패로 확대하지 않는다. 후속 완료 판정은 [CORE P0 증거](CORE-IMPLEMENTATION-STATUS.ko.md#p0-공개-계약-정합)를 따른다.
 
-### 병렬 작업 경계
+### 병렬 작업 기록
 
-- P0-1은 DXGI adapter, P0-2는 DXGI factory로 분리한다.
-- P0-3은 resource/heap class·QI·생성/공유 반환을 소유한다.
-- P0-4는 feature-query 계약과 NGX discovery를 소유한다. 공통 `d3d12_device.cpp`의 적용은 단일 편집 소유자가 통합한다.
-- x64/WoW64 core API와 x64-only NGX facade를 구분한다. 현재 staged runtime으로 변경 전 증거를 얻고, 변경 후에는 새 runtime을 stage한다. Caller event·COM 수명과 실제 texture/buffer readback을 포함한다.
+- P0-1은 DXGI adapter, P0-2는 DXGI factory로 분리했다.
+- P0-3은 resource/heap class·QI·생성/공유 반환을 소유했다.
+- P0-4는 feature-query 계약과 NGX discovery를 소유했고 공통 `d3d12_device.cpp` 적용은 단일 편집 소유자가 통합했다.
+- 기존 port runtime02의 변경 전 증거와 fresh runtime-01의 변경 후 증거를 분리했다. x64/WoW64 core API·x64-only NGX facade, caller event·COM 수명·실제 texture/buffer readback 및 기존 VRS·sharing consumer를 각각 검증했다.
 
 ## P1 — 기존 구조를 재사용하는 제한된 확장
 

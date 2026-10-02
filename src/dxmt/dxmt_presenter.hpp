@@ -1,5 +1,7 @@
 #pragma once
 #include "Metal.hpp"
+#include "Metal4.hpp"
+#include "Metal4Pipeline.hpp"
 #include "dxmt_command.hpp"
 #include "rc/util_rc.hpp"
 #include "util_cpu_fence.hpp"
@@ -46,7 +48,8 @@ struct DXMTGammaRamp {
 class Presenter : public RcObject {
 public:
   Presenter(
-      WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count
+      WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count,
+      WMT4::Compiler compiler = {}
   );
 
   bool changeLayerProperties(
@@ -204,12 +207,18 @@ public:
       std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
       std::function<void(WMT::RenderCommandEncoder)> &&update_fences
   );
+  WMT::MetalDrawable encodeCommandsMetal4(
+      WMT::MTL4CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
+      std::function<void(WMT::MTL4RenderCommandEncoder)> &&wait_fences,
+      std::function<void(WMT::MTL4RenderCommandEncoder)> &&update_fences
+  );
 
 private:
   std::optional<PresentState> synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_not_wait);
   void buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable);
 
   WMT::Device device_;
+  WMT::Reference<WMT4::Compiler> compiler_;
   WMT::MetalLayer layer_;
   InternalCommandLibrary &lib_;
   WMTLayerProps layer_props_;

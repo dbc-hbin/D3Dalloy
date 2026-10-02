@@ -403,10 +403,13 @@ private:
   DXMTClearMetadata meta_temp_;
 };
 
-template <typename Context> class ClearRTV {
+template <typename Context, typename PipelineFactory = WMT::Device, typename Library = WMT::Library,
+          typename Function = WMT::Function> class ClearRTV {
 public:
-  ClearRTV(WMT::Device device, Context &ctx) : device_(device), ctx_(ctx) {
-    auto library = ctx_.getDefaultLibrary();
+  ClearRTV(WMT::Device device, Context &ctx) : ClearRTV(device, ctx, device) {}
+
+  ClearRTV(WMT::Device device, Context &ctx, PipelineFactory factory) : device_(factory), ctx_(ctx) {
+    auto library = Library(ctx_.getDefaultLibrary());
     vs_clear_ = library.newFunction("vs_clear_rt");
     fs_clear_depth_ = library.newFunction("fs_clear_rt_depth");
     fs_clear_float_ = library.newFunction("fs_clear_rt_float");
@@ -564,13 +567,13 @@ public:
     clearing_texture_view_ = 0;
   }
 
-  WMT::Device device_;
+  PipelineFactory device_;
   SimpleCommandContext<Context> ctx_;
-  WMT::Reference<WMT::Function> vs_clear_;
-  WMT::Reference<WMT::Function> fs_clear_float_;
-  WMT::Reference<WMT::Function> fs_clear_uint_;
-  WMT::Reference<WMT::Function> fs_clear_sint_;
-  WMT::Reference<WMT::Function> fs_clear_depth_;
+  WMT::Reference<Function> vs_clear_;
+  WMT::Reference<Function> fs_clear_float_;
+  WMT::Reference<Function> fs_clear_uint_;
+  WMT::Reference<Function> fs_clear_sint_;
+  WMT::Reference<Function> fs_clear_depth_;
   WMT::Reference<WMT::DepthStencilState> depth_write_state_;
   WMT::Reference<WMT::DepthStencilState> depth_stencil_write_state_;
   WMT::Reference<WMT::DepthStencilState> stencil_write_state_;

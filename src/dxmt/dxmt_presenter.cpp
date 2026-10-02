@@ -8,8 +8,9 @@
 
 namespace dxmt {
 
-Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count) :
+Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count, WMT4::Compiler compiler) :
     device_(device),
+    compiler_(compiler),
     layer_(layer),
     lib_(lib),
     sample_count_(sample_count) {
@@ -185,6 +186,7 @@ Presenter::encodeCommands(
     std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
     std::function<void(WMT::RenderCommandEncoder)> &&update_fences
 ) {
+  assert(!compiler_ && "D3D12 presentation requires Metal4 encoding");
   auto drawable = layer_.nextDrawable();
 
   WMTRenderPassInfo info;
@@ -218,11 +220,44 @@ Presenter::encodeCommands(
   return drawable;
 }
 
+WMT::MetalDrawable
+Presenter::encodeCommandsMetal4(
+    WMT::MTL4CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
+    std::function<void(WMT::MTL4RenderCommandEncoder)> &&wait_fences,
+    std::function<void(WMT::MTL4RenderCommandEncoder)> &&update_fences
+) {
+  assert(compiler_ && "Metal4 presentation requires a Metal4 compiler");
+  auto drawable = layer_.nextDrawable();
+  WMTRenderPassInfo info;
+  WMT::InitializeRenderPassInfo(info);
+  info.colors[0].load_action = WMTLoadActionDontCare;
+  info.colors[0].store_action = WMTStoreActionStore;
+  info.colors[0].texture = drawable.texture();
+  auto encoder = cmdbuf.renderCommandEncoder(info);
+  wait_fences(encoder);
+  encoder.setFragmentTexture(backbuffer, 0);
+  encoder.setFragmentTexture(gamma_lut_texture_, 1);
+  const double width = layer_props_.drawable_width;
+  const double height = layer_props_.drawable_height;
+  encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
+  const auto &geometry = metadata.geometry;
+  const bool full_source = geometry.source_width == 0 ||
+      (geometry.source_width == backbuffer.width() && geometry.source_height == backbuffer.height());
+  if (backbuffer.width() == uint64_t(width) && backbuffer.height() == uint64_t(height) &&
+      full_source && geometry.rotation <= 1 && !geometry.scaling_none && !geometry.restrict_output)
+    encoder.setRenderPipelineState(present_blit_);
+  else
+    encoder.setRenderPipelineState(present_scale_);
+  encoder.setViewport({0, 0, width, height, 0, 1});
+  encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+  update_fences(encoder);
+  encoder.endEncoding();
+  return drawable;
+}
+
 void
 Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable) {
   auto pool = WMT::MakeAutoreleasePool();
-
-  auto library = lib_.getLibrary();
 
   uint32_t true_data = true, false_data = false;
   WMTFunctionConstant constants[6];
@@ -245,23 +280,32 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
   constants[5].type  = WMTDataTypeBool;
   constants[5].index = kPresentFCIndex_GammaEnabled;
 
-  WMT::Reference<WMT::Error> error;
-  auto vs_present_quad = library.newFunction("vs_present_quad");
-  auto fs_present_quad = library.newFunctionWithConstants("fs_present_quad", constants, std::size(constants), error);
-
-  constants[0].data.set(&false_data);
-  auto fs_present_quad_scaled =
-      library.newFunctionWithConstants("fs_present_quad", constants, std::size(constants), error);
-  {
+  // Both frontends consume the same library/constants but distinct compiler
+  // domains: descriptors for Metal4, MTLFunction objects for classic D3D11.
+  auto build = [&](auto library, auto compile) {
+    WMT::Reference<WMT::Error> error;
+    auto vs_present_quad = library.newFunction("vs_present_quad");
+    auto fs_present_quad = library.newFunctionWithConstants("fs_present_quad", constants, std::size(constants), error);
+    constants[0].data.set(&false_data);
+    auto fs_present_quad_scaled =
+        library.newFunctionWithConstants("fs_present_quad", constants, std::size(constants), error);
     WMTRenderPipelineInfo present_pipeline;
     WMT::InitializeRenderPipelineInfo(present_pipeline);
     present_pipeline.colors[0].pixel_format = layer_props_.pixel_format;
     present_pipeline.vertex_function = vs_present_quad;
     present_pipeline.fragment_function = fs_present_quad;
-    present_blit_ = device_.newRenderPipelineState(present_pipeline, error);
+    present_blit_ = compile(present_pipeline, error);
     present_pipeline.fragment_function = fs_present_quad_scaled;
-    present_scale_ = device_.newRenderPipelineState(present_pipeline, error);
-  }
+    present_scale_ = compile(present_pipeline, error);
+  };
+  if (compiler_)
+    build(WMT4::Library(lib_.getLibrary()), [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
+      return compiler_.newRenderPipelineState(info, error);
+    });
+  else
+    build(lib_.getLibrary(), [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
+      return device_.newRenderPipelineState(info, error);
+    });
 }
 
 } // namespace dxmt

@@ -18,6 +18,8 @@
 
 #include "com/com_pointer.hpp"
 #include "d3d12_pageable.hpp"
+#include "Metal4Pipeline.hpp"
+#include "Metal4Query.hpp"
 
 namespace dxmt {
 
@@ -32,15 +34,12 @@ public:
   Initialize(const D3D12_QUERY_HEAP_DESC *pDesc) {
     desc = *pDesc;
     switch (desc.Type) {
-    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP: {
-      timestamp_samples = device_->GetMTLDevice().newCounterSampleBuffer(desc.Count, true);
+    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+    case D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP: {
+      timestamp_samples = WMT::newTimestampCounterHeap(device_->GetMTLDevice(), desc.Count);
       if (!timestamp_samples)
         return E_NOTIMPL;
-      try {
-        timestamp_producers = std::make_shared<owned_graphics::QueryTimestampProducers>(desc.Count);
-      } catch (const std::bad_alloc &) {
-        return E_OUTOFMEMORY;
-      }
+
       WMTBufferInfo dummy_info{};
       dummy_info.length = 4;
       dummy_info.options = WMTResourceHazardTrackingModeUntracked;
@@ -56,14 +55,14 @@ public:
       visibility_results = device_->GetMTLDevice().newBuffer(visibility_info);
       if (!visibility_results)
         return E_OUTOFMEMORY;
-      auto function = device_->GetLib().getLibrary().newFunction("query_binary_normalize");
+      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction("query_binary_normalize");
       WMT::Reference<WMT::Error> error;
-      binary_normalize_pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
+      binary_normalize_pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!binary_normalize_pipeline)
         return E_FAIL;
-      auto accumulate_function = device_->GetLib().getLibrary().newFunction("query_accumulate_visibility");
+      auto accumulate_function = WMT4::Library(device_->GetLib().getLibrary()).newFunction("query_accumulate_visibility");
       visibility_accumulate_pipeline =
-          device_->GetMTLDevice().newComputePipelineState(accumulate_function, error);
+          device_->GetMetal4Compiler().newComputePipelineState(accumulate_function, error);
       if (!visibility_accumulate_pipeline)
         return E_FAIL;
       break;
@@ -78,9 +77,9 @@ public:
         return E_OUTOFMEMORY;
       if (auto *memory = info.memory.get_accessible_or_null())
         memset(memory, 0, info.length);
-      auto function = device_->GetLib().getLibrary().newFunction("query_so_statistics_end");
+      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction("query_so_statistics_end");
       WMT::Reference<WMT::Error> error;
-      so_statistics_end_pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
+      so_statistics_end_pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!so_statistics_end_pipeline)
         return E_FAIL;
       break;
@@ -96,10 +95,9 @@ public:
       pipeline_statistics = device_->GetMTLDevice().newBuffer(info);
       if (!pipeline_statistics)
         return E_OUTOFMEMORY;
-      auto function = device_->GetLib().getLibrary().newFunction(
-          mesh ? "query_pipeline_statistics1_end" : "query_pipeline_statistics_end");
+      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction(mesh ? "query_pipeline_statistics1_end" : "query_pipeline_statistics_end");
       WMT::Reference<WMT::Error> error;
-      pipeline_statistics_end_pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
+      pipeline_statistics_end_pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!pipeline_statistics_end_pipeline)
         return E_FAIL;
       break;
@@ -119,6 +117,7 @@ public:
   ResidencyAllocation() const {
     switch (desc.Type) {
     case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+    case D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP:
       return WMT::Allocation(timestamp_dummy);
     case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
       return WMT::Allocation(so_statistics);

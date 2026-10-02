@@ -1,7 +1,7 @@
 #pragma once
 
 #include "d3d12.h"
-#include "Metal.hpp"
+#include "Metal4.hpp"
 #include <cstdint>
 #include <vector>
 
@@ -243,7 +243,7 @@ struct PrepassLayout {
 };
 
 struct NativeDescriptor {
-  WMT::Reference<WMT::AccelerationStructureDescriptor> descriptor;
+  WMT::Reference<WMT::MTL4AccelerationStructureDescriptor> descriptor;
   NativeSizes sizes{};
 };
 

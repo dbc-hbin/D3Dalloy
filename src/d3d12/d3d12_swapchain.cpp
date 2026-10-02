@@ -354,7 +354,8 @@ public:
       throw NativeViewUnavailable{};
     }
 
-    presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_, lib, scale_factor, desc_.SampleDesc.Count));
+    presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_, lib, scale_factor,
+                                 desc_.SampleDesc.Count, pDevice->GetMetal4Compiler()));
 
     present_semaphore_ = CreateSemaphore(nullptr, kSwapchainLatency, DXGI_MAX_SWAP_CHAIN_BUFFERS, nullptr);
     if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))

@@ -1,7 +1,8 @@
 winemetal_src = [
   'main.c',
   'airconv_thunks.c',
-  'winemetal_thunks.c'
+  'winemetal_thunks.c',
+  'winemetal_metal4_thunks.c',
 ]
 
 winemetal_ld_args = []
@@ -34,6 +35,12 @@ else
   error('One of the options -Dwine_build_path or -Dwine_install_path is required')
 endif
 
+# Postprocessing is a native build step, not a Windows guest invocation.
+lipo = find_program('/usr/bin/lipo', native: true)
+if run_command(lipo, '-verify_arch', native_compiler_arch, winebuild.full_path(), check: false).returncode() != 0
+  error('winebuild must provide the selected native_arch slice; refusing a translated build helper')
+endif
+
 winemetal_dll = shared_library('winemetal', winemetal_src,
   name_prefix         : '',
   dependencies        : [ lib_winecrt0, lib_ntdll, lib_dbghelp, airconv_forward_dep ],
@@ -57,6 +64,6 @@ custom_target('postprocess_lib',
   build_by_default : true
 )
 
-if cpu_family == 'x86_64' or cpu_family == 'aarch64'
+if build_native_components and (cpu_family == 'x86_64' or cpu_family == 'aarch64')
   subdir('unix')
 endif

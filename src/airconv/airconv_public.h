@@ -311,6 +311,8 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
    * SM50_BINDING_INDEX_STATISTICS_CLAIM; PSInvocations counts once per (pixel, primitive) that ran at least one
    * invocation (see SM50_STATISTICS_CLAIM_HEADER). */
   SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM = 42,
+  /* Native ICB vertex variant: route view locations in shader outputs, not encoder mappings. */
+  SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS = 43,
   SM50_SHADER_ARGUMENT_TYPE_MAX = 0xffffffff,
 };
 
@@ -703,8 +705,12 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
 };
 
 /* Output-merger logic op by framebuffer fetch. For every render target bit in rt_mask the PS output is replaced by
- * op(output, [[color(n)]]) masked to component_bits[n][c] (0 = component absent). The fetch makes Metal run the
- * fragment at sample rate on multisampled targets, so the PS must have no side effects (callers enforce). */
+ * op(output, [[color(n)]]) masked to component_bits[n][c] (0 = component absent). rt_mask contains UINT
+ * attachments only (FS 17.7.1); mixed non-UINT outputs retain their ordinary format conversion/quantization.
+ * Color write masks remain pipeline state. D3D12 requires one op and IndependentBlendEnable FALSE.
+ * Fetch runs at sample rate: pixel-frequency MSAA must execute the application/stats once in MSAA_PIXEL,
+ * save its outputs, and apply this argument only to MSAA_REPLAY. MSAA_SAMPLE_APP may apply it directly.
+ * Single-sample entries apply it directly, including UAV effects, coverage and depth outputs. */
 struct SM50_SHADER_D3D12_LOGIC_OP_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -712,6 +718,20 @@ struct SM50_SHADER_D3D12_LOGIC_OP_DATA {
   uint32_t op;
   uint32_t rt_mask;
   uint8_t component_bits[8][4];
+};
+
+/* Only native ICB vertex variants request this argument; direct draws retain native view mappings.
+ * Offsets are indexed by the logical SV_ViewID, not the ordinal of an enabled view.
+ * The existing root view_id qword packs logical ViewID in bits0..31, effective viewport count
+ * in bits32..47 and effective render-target array length in bits48..63. Each output is its
+ * shader-provided uint index (or0 if absent) plus the selected offset, clamped to0 when out of
+ * its respective unsigned bound. No new root layout or binding is introduced. */
+struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA {
+  void *next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t view_count;
+  uint32_t viewport_offsets[4];
+  uint32_t render_target_offsets[4];
 };
 
 struct SM50_IA_INPUT_ELEMENT {

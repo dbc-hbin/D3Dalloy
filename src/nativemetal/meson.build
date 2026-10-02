@@ -1,8 +1,7 @@
 winemetal_src = [
   '../winemetal/winemetal_thunks.c',
-  '../winemetal/unix/winemetal_unix.c',
-  '../winemetal/unix/cache.c',
-]
+  '../winemetal/winemetal_metal4_thunks.c',
+] + winemetal_unix_sources
 winemetal_link_depends = []
 
 winemetal_ld_args = [
@@ -10,14 +9,17 @@ winemetal_ld_args = [
   '-framework', 'MetalFX', '-weak_framework', 'Foundation',
   '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
   '-weak_framework', 'ColorSync',   '-weak_framework', 'Cocoa',
+  '-weak_framework', 'CoreVideo', '-weak_framework', 'IOKit',
+  '-weak_framework', 'IOSurface',
   '-lsqlite3',
 ]
 
 winemetal_dll = shared_library('winemetal', winemetal_src,
   name_prefix         : '',
   dependencies        : [ airconv_dep_darwin ],
-  include_directories : [ dxmt_include_path, include_directories('.') ],
+  include_directories : [ dxmt_include_path, include_directories('.'), include_directories('../') ],
   c_args              : ['-ObjC', '-DDXMT_NATIVE=1'],
+  objcpp_args         : ['-DDXMT_NATIVE=1'],
   link_args           : winemetal_ld_args,
   build_rpath         : '@loader_path/:@loader_path/../../',
 )

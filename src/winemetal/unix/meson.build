@@ -1,10 +1,3 @@
-winemetal_unix_src = [
-  'winemetal_unix.c',
-  'winemetal_rt.c',
-  'rt_acceleration_structure.c',
-  'cache.c',
-]
-
 if wine_build_path != ''
   winemac_so = join_paths(wine_build_path, 'dlls/winemac.drv/winemac.so')
   ntdll_so = join_paths(wine_build_path, 'dlls/ntdll/ntdll.so')
@@ -14,6 +7,15 @@ elif wine_install_path != ''
 else
   error('One of the options -Dwine_build_path or -Dwine_install_path is required')
 endif
+
+foreach native_wine_library : [winemac_so, ntdll_so]
+  if not fs.is_file(native_wine_library)
+    error('Missing native Wine SDK library: ' + native_wine_library)
+  endif
+  if run_command(lipo, '-verify_arch', native_compiler_arch, native_wine_library, check: false).returncode() != 0
+    error('Wine SDK library does not provide native_arch=' + native_compiler_arch + ': ' + native_wine_library)
+  endif
+endforeach
 
 winemetal_unix_ld_args = [
   '-Wl,-install_name,@rpath/winemetal.so',
@@ -28,10 +30,10 @@ winemetal_unix_ld_args = [
 ]
 winemetal_unix_link_depends = []
 
-shared_library('winemetal', winemetal_unix_src,
+shared_library('winemetal', winemetal_unix_sources,
   name_prefix         : '',
   dependencies        : [ airconv_dep_darwin ],
-  include_directories : dxmt_include_path,
+  include_directories : [dxmt_include_path, include_directories('../../')],
   c_args              : ['-ObjC'],
   link_args           : winemetal_unix_ld_args,
   native              : true,

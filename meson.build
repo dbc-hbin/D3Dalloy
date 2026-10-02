@@ -15,6 +15,21 @@ clang = meson.get_compiler('c', native: true)
 clangpp = meson.get_compiler('cpp', native: true)
 
 cpu_family = host_machine.cpu_family()
+native_compiler_arch = get_option('native_arch')
+native_cpu_family = native_compiler_arch == 'arm64' ? 'aarch64' : 'x86_64'
+native_bridge_only = get_option('native_bridge_only')
+build_native_components = get_option('build_native_components')
+if build_native_components
+  add_languages('objcpp', native: true)
+  add_project_arguments(['-std=c++20', '-arch', native_compiler_arch], language: 'objcpp', native: true)
+  add_project_link_arguments(['-arch', native_compiler_arch], language: 'objcpp', native: true)
+endif
+if not build_native_components and not dxmt_crossbuild
+  error('build_native_components=false is only valid for Windows PE-only cross builds')
+endif
+if native_bridge_only and dxmt_crossbuild
+  error('native_bridge_only requires a native macOS build, not a Windows cross file')
+endif
 
 dxmt_include_dirs = [
   './include',
@@ -173,23 +188,35 @@ if dxmt_crossbuild
     endif
     windows_builtin_install_dir = 'x86_64-windows'
   elif cpu_family == 'aarch64'
+    windows_abi = meson.get_external_property('windows_abi', 'arm64')
+    if windows_abi not in ['arm64', 'arm64ec', 'arm64x']
+      error('Unknown ARM Windows ABI: ' + windows_abi)
+    endif
+    if windows_abi != 'arm64' and not cc.compiles('''
+      #if !defined(__arm64ec__) && !defined(_M_ARM64EC)
+      #error ARM64EC compiler required
+      #endif
+      int abi_check;
+    ''', name: 'ARM64EC compiler ABI')
+      error('ARM64EC/ARM64X requires an ARM64EC PE compiler, not plain ARM64')
+    endif
+    windows_pe_dir = windows_abi == 'arm64ec' ? 'arm64ec-windows' : 'aarch64-windows'
     if wine_builtin_dll
-      windows_native_install_dir = 'aarch64-windows'
+      windows_native_install_dir = windows_pe_dir
     else
       windows_native_install_dir = 'system32'
     endif
-    windows_builtin_install_dir = 'aarch64-windows'
+    # Wine merges native+EC SDK archives under aarch64-windows in ARM64X mode.
+    windows_builtin_install_dir = windows_pe_dir
   else
     error('invalid cpu family')
   endif
 
-  unix_install_dir = cpu_family + '-unix'
+  unix_install_dir = native_cpu_family + '-unix'
 else
   wine_builtin_dll = false
   windows_native_install_dir = ''
 endif
-
-native_compiler_arch = cpu_family == 'aarch64' ? 'arm64' : 'x86_64'
 
 add_project_arguments(cpp.get_supported_arguments(compiler_args), language: 'cpp')
 add_project_arguments(clangpp.get_supported_arguments(native_compiler_args), language: 'cpp', native: true)
@@ -197,11 +224,10 @@ add_project_arguments(cc.get_supported_arguments(compiler_args), language: 'c')
 add_project_arguments(clang.get_supported_arguments(native_compiler_args), language: 'c', native: true)
 add_project_link_arguments(cpp.get_supported_link_arguments(link_args), language: 'cpp')
 add_project_link_arguments(cc.get_supported_link_arguments(link_args), language: 'c')
-if dxmt_crossbuild
-  add_project_arguments(['-arch', native_compiler_arch], language: 'c',  native: true)
-  add_project_arguments(['-arch', native_compiler_arch], language: 'cpp',  native: true)
-  add_project_link_arguments(['-arch', native_compiler_arch], language: 'cpp',  native: true)
-endif
+add_project_arguments(['-arch', native_compiler_arch], language: 'c', native: true)
+add_project_arguments(['-arch', native_compiler_arch], language: 'cpp', native: true)
+add_project_link_arguments(['-arch', native_compiler_arch], language: 'c', native: true)
+add_project_link_arguments(['-arch', native_compiler_arch], language: 'cpp', native: true)
 
 subdir('libs')
 subdir('src')

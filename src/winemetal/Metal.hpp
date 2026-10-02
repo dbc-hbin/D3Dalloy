@@ -9,6 +9,11 @@
 namespace WMT {
 
 class String;
+class MTL4CommandAllocator;
+class MTL4CommandBuffer;
+class MTL4Submission;
+class MTL4ArgumentTable;
+class MTL4AccelerationStructureDescriptor;
 
 class Object {
 public:
@@ -1024,9 +1029,13 @@ public:
   }
 };
 
-/* A Metal 4 command queue, used here only to apply sparse mapping updates. */
+/* Metal 4 queue. Its encoding and completion API is defined in Metal4.hpp. */
 class MTL4CommandQueue : public Object {
 public:
+  Reference<MTL4Submission> commit(const MTL4CommandBuffer *buffers, uint64_t count);
+  void waitForEvent(Event event, uint64_t value);
+  void waitForDrawable(MetalDrawable drawable);
+  void signalDrawable(MetalDrawable drawable);
   void
   addResidencySet(ResidencySet residency_set) {
     MTL4CommandQueue_addResidencySet(handle, residency_set.handle);
@@ -1128,6 +1137,13 @@ public:
   newCommandQueue(uint64_t maxCommandBufferCount) {
     return Reference<CommandQueue>(MTLDevice_newCommandQueue(handle, maxCommandBufferCount));
   }
+
+  bool supportsMetal4();
+  Reference<MTL4CommandAllocator> newMTL4CommandAllocator();
+  Reference<MTL4CommandBuffer> newMTL4CommandBuffer();
+  Reference<MTL4ArgumentTable> newMTL4ArgumentTable(uint32_t buffers, uint32_t textures, uint32_t samplers, bool strides = false);
+  Reference<MTL4AccelerationStructureDescriptor> newMTL4AccelerationStructureDescriptor(bool top_level, uint32_t geometry_count);
+  WMTAccelerationStructureSizes accelerationStructureSizes(MTL4AccelerationStructureDescriptor descriptor);
 
   Reference<SharedEvent>
   newSharedEvent() {

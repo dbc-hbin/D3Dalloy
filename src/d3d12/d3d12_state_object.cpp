@@ -17,6 +17,7 @@
  */
 
 #include "d3d12_state_object.hpp"
+#include "Metal4Pipeline.hpp"
 #include "d3d12_work_graph.hpp"
 
 #include "DXBCParser/DXBCUtils.h"
@@ -437,8 +438,8 @@ class MTLD3D12StateObjectImpl final
   uint32_t max_attribute_size_ = 0;
   bool is_pipeline_ = false;
 
-  std::vector<WMT::Reference<WMT::Library>> metal_libraries_;
-  std::vector<WMT::Reference<WMT::Function>> metal_functions_;
+  std::vector<WMT::Reference<WMT4::Library>> metal_libraries_;
+  std::vector<WMT::Reference<WMT4::Function>> metal_functions_;
   WMT::Reference<WMT::ComputePipelineState> pipeline_state_;
   WMT::Reference<WMT::IntersectionFunctionTable> intersection_table_;
   WMT::Reference<WMT::VisibleFunctionTable> visible_function_table_;
@@ -822,9 +823,7 @@ class MTLD3D12StateObjectImpl final
     functions.resize(function_count);
 
     WMT::Reference<WMT::Error> metal_error;
-    auto library = device_->GetMTLDevice().newLibrary(
-        WMT::MakeDispatchData(metallib.Data, metallib.Size), metal_error
-    );
+    auto library = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(metallib.Data, metallib.Size), metal_error);
     if (!library) {
       ERR("RT metallib load failed: ", metal_error ? metal_error.description().getUTF8String() : "no Metal error");
       return E_FAIL;
@@ -911,9 +910,7 @@ class MTLD3D12StateObjectImpl final
     info.compute_function = dispatch_entry_function;
     info.support_indirect_command_buffers = false;
     info.max_call_stack_depth = std::max<uint32_t>(2, 2 * pipeline_config_.MaxTraceRecursionDepth + 2);
-    pipeline_state_ = device_->GetMTLDevice().newComputePipelineStateWithLinkedFunctions(
-        info, linked.data(), static_cast<uint32_t>(linked.size()), metal_error
-    );
+    pipeline_state_ = device_->GetMetal4Compiler().newComputePipelineStateWithLinkedFunctions(info, linked.data(), static_cast<uint32_t>(linked.size()), metal_error);
     if (!pipeline_state_) {
       ERR("RT pipeline creation failed: ",
           metal_error ? metal_error.description().getUTF8String() : "no Metal error");
@@ -946,7 +943,7 @@ class MTLD3D12StateObjectImpl final
       const auto &function = functions[i];
       if (function.Kind != SM50_RT_FUNCTION_DISPATCH || function.TableIndex == SM50_RT_INDEX_NONE)
         continue;
-      auto handle = pipeline_state_.functionHandle(metal_functions_[i]);
+      auto handle = device_->GetMetal4Compiler().functionHandle(pipeline_state_, metal_functions_[i]);
       if (!handle) {
         ERR("RT intersection dispatch callback handle creation failed: ", function.Name);
         return E_FAIL;
@@ -985,7 +982,7 @@ class MTLD3D12StateObjectImpl final
         ERR("RT reflection returned an export index outside the export table: ", function.ExportIndex);
         return E_FAIL;
       }
-      auto handle = pipeline_state_.functionHandle(metal_functions_[i]);
+      auto handle = device_->GetMetal4Compiler().functionHandle(pipeline_state_, metal_functions_[i]);
       if (!handle) {
         ERR("RT visible function handle creation failed: ", function.Name);
         return E_FAIL;

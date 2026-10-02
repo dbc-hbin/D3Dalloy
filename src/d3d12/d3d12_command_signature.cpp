@@ -217,10 +217,10 @@ public:
       ERR("Failed to compile command signature root argument resolver: ", err.description().getUTF8String());
       return E_FAIL;
     }
-    auto function = lib.newFunction("resolve_root_arguments");
+    auto function = WMT4::Library(lib).newFunction("resolve_root_arguments");
     if (!function)
       return E_FAIL;
-    root_argument_resolver = device_->GetMTLDevice().newComputePipelineState(function, err);
+    root_argument_resolver = device_->GetMetal4Compiler().newComputePipelineState(function, err);
     if (!root_argument_resolver) {
       ERR("Failed to create command signature root argument resolver pso");
       return E_FAIL;
@@ -392,7 +392,7 @@ public:
       source
           << "[[kernel]] void resolve_indirect_commands([[thread_position_in_grid]] uint x, constant dxmt_compute_command_data";
     else
-      source << "[[vertex]] void resolve_indirect_commands(constant dxmt_render_command_data";
+      source << "[[vertex]] void resolve_indirect_commands(uint i [[vertex_id]], constant dxmt_render_command_data";
     source << " &command_data [[buffer(30)]]) {\n";
 
     if (is_compute)
@@ -402,7 +402,8 @@ public:
               "command_data.max_count_buffer[0] : command_data.max_count;\n";
     source << "if (command_data.predicate && (command_data.predicate_op ? command_data.predicate[0] != 0 : "
               "command_data.predicate[0] == 0)) count = 0;\n";
-    source << "for (uint i = 0; i < command_data.max_count; i++) {\n";
+    if (is_compute)
+      source << "for (uint i = 0; i < command_data.max_count; i++) {\n";
     source << "device d3d12_arguments& arg = reinterpret_cast<device d3d12_arguments *>("
               "command_data.argument_buffer + i * "
            << pDesc->ByteStride << ")[0];\n";
@@ -412,10 +413,10 @@ public:
       source << "render_command cmd(command_data.cmd_buf, i);\n";
     }
     source << "cmd.reset();\n";
-    source << "if (i >= count) continue;\n";
+    source << "if (i >= count) " << (is_compute ? "continue" : "return") << ";\n";
     if (!is_compute)
       source << "if (command_data.so_draws && (!command_data.so_draws[i].args.vertex_count || "
-                "!command_data.so_draws[i].args.instance_count)) continue;\n";
+                "!command_data.so_draws[i].args.instance_count)) return;\n";
     source << "device ulong * rootsig_qwords = command_data.rootsig_qwords ? command_data.rootsig_qwords + "
               "(i * command_data.rootsig_qwords_stride) : nullptr;\n";
     if (!is_compute)
@@ -430,7 +431,7 @@ public:
         side_effect == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW) {
       if (!is_compute) {
         if (!(UpdateRootArguments || UpdateVertexBuffers || UpdateIndexBuffer))
-          source << "if (command_data.so_draws || command_data.index_pull_mode != ~0u) {\n";
+          source << "if (command_data.rootsig_qwords || command_data.so_draws || command_data.index_pull_mode != ~0u) {\n";
         source << "cmd.set_vertex_buffer(vertex_buffer," << SM50_BINDING_INDEX_VERTEX_BUFFER << ");\n";
         source << "if (rootsig_qwords) cmd.set_vertex_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
         source << "cmd.set_vertex_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
@@ -621,8 +622,9 @@ public:
       }
     }
 
-    source << "}\n"
-              "};\n";
+    if (is_compute)
+      source << "}\n";
+    source << "};\n";
     if (updates_graphics_bindings) {
       source << "void update_graphics_bindings(device d3d12_arguments &arg, device ulong *rootsig_qwords, "
                 "device dxmt_vertex_buffer *vertex_buffer) {\n"
@@ -648,7 +650,7 @@ public:
       return E_FAIL;
     }
 
-    auto function = lib.newFunction("resolve_indirect_commands");
+    auto function = WMT4::Library(lib).newFunction("resolve_indirect_commands");
 
     if (!function) {
       ERR("Failed to create command signature resolve shader");
@@ -656,13 +658,13 @@ public:
     }
 
     if (is_compute) {
-      compute_resolver = device_->GetMTLDevice().newComputePipelineState(function, err);
+      compute_resolver = device_->GetMetal4Compiler().newComputePipelineState(function, err);
     } else {
       WMTRenderPipelineInfo info;
       WMT::InitializeRenderPipelineInfo(info);
       info.rasterization_enabled = false;
       info.vertex_function = function;
-      render_resolver = device_->GetMTLDevice().newRenderPipelineState(info, err);
+      render_resolver = device_->GetMetal4Compiler().newRenderPipelineState(info, err);
     }
 
     if (err) {
@@ -670,12 +672,12 @@ public:
       return E_FAIL;
     }
     if (updates_graphics_bindings) {
-      auto bindings = lib.newFunction("resolve_graphics_arguments");
+      auto bindings = WMT4::Library(lib).newFunction("resolve_graphics_arguments");
       if (!bindings) {
         ERR("Failed to create graphics argument resolver shader");
         return E_FAIL;
       }
-      graphics_argument_resolver = device_->GetMTLDevice().newComputePipelineState(bindings, err);
+      graphics_argument_resolver = device_->GetMetal4Compiler().newComputePipelineState(bindings, err);
       if (!graphics_argument_resolver) {
         ERR("Failed to compile graphics argument resolver pso: ", err.description().getUTF8String());
         return E_FAIL;

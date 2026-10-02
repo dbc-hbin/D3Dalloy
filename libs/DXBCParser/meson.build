@@ -19,7 +19,7 @@ dxbc_parser_dep = declare_dependency(
   include_directories : [ dxmt_include_path ],
 )
 
-if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild
+if build_native_components and (cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild)
 
 dxbc_parser_native_lib = static_library('DXBCParserNative', dxbc_parser_src,
   include_directories : [ dxmt_native_include_path ],

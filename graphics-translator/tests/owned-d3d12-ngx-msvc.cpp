@@ -105,6 +105,35 @@ void ngx_fixture_set_frame_output_offset(NVSDK_NGX_Parameter* params,
     params->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, output_base_x);
 }
 
+void ngx_fixture_set_create_options(NVSDK_NGX_Parameter* params, unsigned int flags, int output_subrects) {
+    params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, static_cast<int>(flags));
+    params->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, output_subrects);
+}
+
+void ngx_fixture_set_frame_offsets(NVSDK_NGX_Parameter* params, unsigned int input_x,
+                                   unsigned int input_y, unsigned int output_x, unsigned int output_y) {
+    params->Set(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, input_x);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y, input_y);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, input_x);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, input_y);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, input_x);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, input_y);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, output_x);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, output_y);
+}
+
+void ngx_fixture_set_frame_mask(NVSDK_NGX_Parameter* params, ID3D12Resource* mask,
+                                unsigned int x, unsigned int y) {
+    params->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, mask);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X, x);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y, y);
+}
+
+void ngx_fixture_set_frame_scalars(NVSDK_NGX_Parameter* params, float sharpness, float exposure_scale) {
+    params->Set(NVSDK_NGX_Parameter_Sharpness, sharpness);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, exposure_scale);
+}
+
 void ngx_fixture_set_frame_nan_jitter(NVSDK_NGX_Parameter* params) {
     union {
         unsigned int bits;

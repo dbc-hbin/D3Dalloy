@@ -97,10 +97,15 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   void *cpu_heap_ = nullptr;
   size_t cpu_heap_offset_;
 
-  WMT::Reference<WMT::Buffer> gpu_heap_buffer_;
-  void *gpu_heap_ = nullptr;
-  size_t gpu_heap_offset_;
-  uint64_t gpu_heap_buffer_address_;
+  struct GPUHeapChunk {
+    WMT::Reference<WMT::Buffer> buffer;
+    void *memory;
+    uint64_t begin;
+    uint64_t address;
+    size_t capacity;
+    size_t used = 0;
+  };
+  std::vector<GPUHeapChunk> gpu_heap_chunks_;
 
   EncoderData *encoder_last = nullptr;
   EncoderData *encoder_current = nullptr;
@@ -114,7 +119,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   small_vector<WMT::Reference<WMT::IndirectCommandBuffer>, 4> icb_;
 
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
-  ClearRTV<MTLD3D12CommandAllocatorImpl> clear_rtv_;
+  ClearRTV<MTLD3D12CommandAllocatorImpl, WMT4::Compiler, WMT4::Library, WMT4::Function> clear_rtv_;
 
   RingBumpState<GpuPrivateBufferBlockAllocator> copy_temp_allocator_;
   uint64_t copy_temp_version_;
@@ -264,21 +269,55 @@ public:
     return *storage;
   }
 
-  bool CanAllocateGPUHeap(size_t Length, size_t Alignment) const {
-    const std::size_t adjustment = align_forward_adjustment(reinterpret_cast<void *>(gpu_heap_offset_), Alignment);
-    return gpu_heap_offset_ < kGPUHeapSize && adjustment < kGPUHeapSize - gpu_heap_offset_ &&
-           Length < kGPUHeapSize - gpu_heap_offset_ - adjustment;
+  // Reserves contiguous capacity without consuming it. Composite callers reserve
+  // their whole batch before recording any pointers or commands. Earlier chunks
+  // remain immutable until a safely retired allocator Reset.
+  bool ReserveGPUHeap(uint64_t Length, size_t Alignment);
+
+  struct GPUHeapAllocation {
+    void *memory;
+    WMT::Buffer buffer;
+    uint64_t offset;
+    uint64_t address;
+  };
+
+  GPUHeapAllocation ResolveGPUHeap(uint64_t Offset) const;
+
+  uint64_t GPUHeapAddress(uint64_t Offset) {
+    const auto allocation = ResolveGPUHeap(Offset);
+    if (encoder_current && encoder_current->type == EncoderType::Compute) {
+      auto &use = EncodeComputeCommand<wmtcmd_compute_useresource>();
+      use.type = WMTComputeCommandUseResource;
+      use.resource = allocation.buffer;
+      use.usage = WMTResourceUsageRead | WMTResourceUsageWrite;
+    } else if (encoder_current && encoder_current->type == EncoderType::Render) {
+      auto &use = EncodeRenderCommand<wmtcmd_render_useresource>();
+      use.type = WMTRenderCommandUseResource;
+      use.resource = allocation.buffer;
+      use.usage = WMTResourceUsageRead | WMTResourceUsageWrite;
+      use.stages = WMTRenderStageVertex | WMTRenderStageFragment | WMTRenderStageObject | WMTRenderStageMesh;
+    }
+    return allocation.address;
+  }
+
+  template <typename BufferType>
+  void BindGPUHeap(BufferType &Buffer, uint64_t &Offset, uint64_t VirtualOffset) const {
+    const auto allocation = ResolveGPUHeap(VirtualOffset);
+    Buffer = allocation.buffer;
+    Offset = allocation.offset;
   }
 
   std::tuple<void *, size_t>
-  AllocateGPUHeap(size_t Length, size_t Alignment) {
+  AllocateGPUHeap(uint64_t Length, size_t Alignment) {
     if (!Length)
       return {nullptr, 0};
-    std::size_t adjustment = align_forward_adjustment((void *)gpu_heap_offset_, Alignment);
-    auto aligned = gpu_heap_offset_ + adjustment;
-    gpu_heap_offset_ = aligned + Length;
-    assert(gpu_heap_offset_ < kGPUHeapSize);
-    return {ptr_add(gpu_heap_, aligned), aligned};
+    if (!ReserveGPUHeap(Length, Alignment))
+      return {nullptr, SIZE_MAX};
+    auto &chunk = gpu_heap_chunks_.back();
+    const size_t adjustment = (-chunk.used) & (Alignment - 1);
+    const auto aligned = chunk.used + adjustment;
+    chunk.used = aligned + Length;
+    return {ptr_add(chunk.memory, aligned), chunk.begin + aligned};
   }
 
   std::tuple<WMT::Buffer, uint64_t>

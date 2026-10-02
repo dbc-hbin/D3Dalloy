@@ -1,4 +1,5 @@
 #include "d3d12_work_graph.hpp"
+#include "Metal4Pipeline.hpp"
 #include "d3d12_dxil_subobjects.hpp"
 #include "../airconv/dxbc_root_signature.hpp"
 #include "DXBCParser/DXBCUtils.h"
@@ -791,10 +792,10 @@ HRESULT MTLD3D12WorkGraph::Compile(Node &node, MTLD3D12RootSignature *root, bool
   WMT::Reference<WMT::Error> metal_error;
   HRESULT constant_result = node.constants.Initialize(device_, metallib, bitcode);
   if (FAILED(constant_result)) { SM50DestroyBitcode(bitcode); return constant_result; }
-  auto metal_library = device_->GetMTLDevice().newLibrary(WMT::MakeDispatchData(metallib.Data, metallib.Size), metal_error);
+  auto metal_library = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(metallib.Data, metallib.Size), metal_error);
   if (metal_library) {
     auto function = metal_library.newFunction(desc.FunctionName);
-    if (function) node.pipeline = device_->GetMTLDevice().newComputePipelineState(function, metal_error);
+    if (function) node.pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, metal_error);
   }
   SM50DestroyBitcode(bitcode);
   if (!node.pipeline) {
@@ -862,15 +863,30 @@ HRESULT CreateWorkGraphStateObject(MTLD3D12Device *device, const D3D12_STATE_OBJ
 namespace {
 struct GraphExecution {
   MTLD3D12Device *device;
-  WMT::CommandQueue queue;
+  WMT::MTL4CommandQueue queue;
   const WorkGraphDispatch &dispatch;
   const MTLD3D12WorkGraph::Graph &graph;
   WMT::Reference<WMT::Buffer> control, readback, seed_resource;
+  WMT::Reference<WMT::MTL4CommandAllocator> allocator;
   WMTBufferInfo control_info{}, readback_info{};
   uint64_t control_stride = 0, context_offset = 0, batch_offset = 0, sharing_offset = 0;
 
-  bool Complete(WMT::CommandBuffer buffer) {
-    buffer.commit(); buffer.waitUntilCompleted(); return buffer.status() != WMTCommandBufferStatusError;
+  WMT::Reference<WMT::MTL4CommandBuffer> Begin() {
+    auto buffer = device->GetMTLDevice().newMTL4CommandBuffer();
+    if (buffer) {
+      buffer.begin(allocator);
+      buffer.useResidencySet(device->GetGlobalResidencySet());
+    }
+    return buffer;
+  }
+  bool Complete(WMT::MTL4CommandBuffer buffer) {
+    buffer.end();
+    auto submission = queue.commit(&buffer, 1);
+    if (!submission) return false;
+    submission.waitUntilCompleted();
+    const bool success = !submission.error();
+    allocator.reset();
+    return success;
   }
   HRESULT Read(uint64_t address, void *destination, uint64_t size) {
     if (!size) return S_OK;
@@ -882,22 +898,24 @@ struct GraphExecution {
       readback_info.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE; readback = device->GetMTLDevice().newBuffer(readback_info);
       if (!readback) return E_OUTOFMEMORY;
     }
-    auto buffer = queue.commandBuffer(); auto encoder = buffer.blitCommandEncoder();
+    auto buffer = Begin();
+    if (!buffer) return E_OUTOFMEMORY;
+    auto encoder = buffer.blitCommandEncoder();
     wmtcmd_blit_copy_from_buffer_to_buffer copy{}; copy.type = WMTBlitCommandCopyFromBufferToBuffer;
     copy.src = allocation->buffer(); copy.src_offset = offset; copy.dst = readback; copy.dst_offset = 0; copy.copy_length = size;
-    MTLBlitCommandEncoder_encodeCommands(encoder, reinterpret_cast<const wmtcmd_base *>(&copy)); encoder.endEncoding();
+    encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy)); encoder.endEncoding();
     if (!Complete(buffer)) return E_FAIL;
     std::memcpy(destination, readback_info.memory.get_accessible_or_null(), size); return S_OK;
   }
-  void Bind(WMT::ComputeCommandEncoder encoder, WMT::Buffer buffer, uint64_t offset, uint8_t index) {
+  void Bind(WMT::MTL4ComputeCommandEncoder encoder, WMT::Buffer buffer, uint64_t offset, uint8_t index) {
     wmtcmd_compute_setbuffer command{}; command.type = WMTComputeCommandSetBuffer;
     command.buffer = buffer; command.offset = offset; command.index = index;
-    MTLComputeCommandEncoder_encodeCommands(encoder, reinterpret_cast<const wmtcmd_base *>(&command));
+    encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&command));
   }
-  void Use(WMT::ComputeCommandEncoder encoder, WMT::Resource resource) {
+  void Use(WMT::MTL4ComputeCommandEncoder encoder, WMT::Resource resource) {
     wmtcmd_compute_useresource command{}; command.type = WMTComputeCommandUseResource;
     command.resource = resource; command.usage = WMTResourceUsage(WMTResourceUsageRead | WMTResourceUsageWrite);
-    MTLComputeCommandEncoder_encodeCommands(encoder, reinterpret_cast<const wmtcmd_base *>(&command));
+    encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&command));
   }
   HRESULT RunNode(uint32_t index, uint64_t input_address, const uint8_t *input, uint32_t level, uint32_t remaining) {
     const auto &node = graph.nodes[index];
@@ -937,7 +955,9 @@ struct GraphExecution {
           uint64_t(node.info.LocalRootArgumentsTableIndex) * dispatch.program.NodeLocalRootArgumentsTable.StrideInBytes;
       for (uint32_t o = 0; o < node.targets.size(); ++o) context->Outputs[o] =
           node.targets[o] == index && !remaining ? SM50_WG_NONE : node.targets[o];
-      auto buffer = queue.commandBuffer(); auto encoder = buffer.computeCommandEncoder(false);
+      auto buffer = Begin();
+      if (!buffer) return E_OUTOFMEMORY;
+      auto encoder = buffer.computeCommandEncoder(false);
       Use(encoder, control);
       if (seed_resource) Use(encoder, seed_resource);
       wmtcmd_compute_setpso pipeline{}; pipeline.type = WMTComputeCommandSetPSO;
@@ -948,7 +968,7 @@ struct GraphExecution {
       if (node.constants.buffer) Bind(encoder, node.constants.buffer, node.constants.offset, SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
       wmtcmd_compute_dispatch launch{}; launch.type = WMTComputeCommandDispatch; launch.size = {1, 1, 1};
       pipeline.next.set(&launch);
-      MTLComputeCommandEncoder_encodeCommands(encoder, reinterpret_cast<const wmtcmd_base *>(&pipeline));
+      encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&pipeline));
       encoder.endEncoding(); if (!Complete(buffer)) return E_FAIL;
       // Every suspended producer owns one level. Its siblings survive all descendant execution.
       // MaxRecords is a group-wide budget, including per-thread and node-array allocations.
@@ -992,9 +1012,11 @@ struct GraphExecution {
 };
 }
 
-HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::CommandQueue queue, const WorkGraphDispatch &dispatch) {
+HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, const WorkGraphDispatch &dispatch) {
   const auto *graph = dispatch.object->GetGraph(dispatch.graph); if (!graph) return E_INVALIDARG;
   GraphExecution execution{device, queue, dispatch, *graph};
+  execution.allocator = device->GetMTLDevice().newMTL4CommandAllocator();
+  if (!execution.allocator) return E_OUTOFMEMORY;
   uint64_t elements = 0; for (const auto &node : graph->nodes) elements = std::max<uint64_t>(elements, node.targets.size());
   execution.context_offset = (sizeof(SM50_WG_QUEUE) * (graph->nodes.size() + 1) + 63) & ~uint64_t(63);
   execution.batch_offset = (execution.context_offset + offsetof(SM50_WG_NODE_CONTEXT, Outputs) + elements * 4 + 63) & ~uint64_t(63);

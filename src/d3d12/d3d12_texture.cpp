@@ -791,7 +791,8 @@ public:
     *ppvObject = nullptr;
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
-        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource)) {
+        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource) ||
+        riid == __uuidof(ID3D12Resource1) || riid == __uuidof(ID3D12Resource2)) {
       *ppvObject = ref(this);
       return S_OK;
     }

@@ -98,7 +98,8 @@ public:
       return E_POINTER;
     *ppvObject = nullptr;
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
-        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource)) {
+        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource) ||
+        riid == __uuidof(ID3D12Resource1) || riid == __uuidof(ID3D12Resource2)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -199,7 +200,8 @@ SamplerFeedbackAllocationInfo(MTLD3D12Device *pDevice, const sampler_feedback::L
 
 HRESULT
 CreateSamplerFeedbackMap(MTLD3D12Device *pDevice, const D3D12_HEAP_PROPERTIES &HeapProps, D3D12_HEAP_FLAGS HeapFlags,
-                         const D3D12_RESOURCE_DESC &Desc, const sampler_feedback::Layout &Layout, MTLD3D12Heap *pHeap,
+                         const D3D12_RESOURCE_DESC &Desc, const D3D12_MIP_REGION &MipRegion,
+                         const sampler_feedback::Layout &Layout, MTLD3D12Heap *pHeap,
                          UINT64 HeapOffset, D3D12_RESOURCE_STATES InitialState, REFIID riid, void **ppResource) {
   auto *impl = new (std::nothrow) MTLD3D12SamplerFeedbackMap(pDevice);
   if (!impl)
@@ -209,6 +211,7 @@ CreateSamplerFeedbackMap(MTLD3D12Device *pDevice, const D3D12_HEAP_PROPERTIES &H
   if (FAILED(hr))
     return hr;
   resource->owned_initial_state = InitialState;
+  resource->sampler_feedback_mip_region = MipRegion;
   if (!ppResource)
     return S_FALSE;
   return resource->QueryInterface(riid, ppResource);

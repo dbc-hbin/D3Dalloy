@@ -1,0 +1,7 @@
+LIBRARY amd_fidelityfx_framegeneration_dx12.dll
+EXPORTS
+    ffxConfigure @1
+    ffxCreateContext @2
+    ffxDestroyContext @3
+    ffxDispatch @4
+    ffxQuery @5

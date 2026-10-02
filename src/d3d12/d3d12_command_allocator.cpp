@@ -26,7 +26,7 @@ MTLD3D12CommandAllocatorImpl::MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevi
     MTLD3D12Pageable<MTLD3D12CommandAllocator>(pDevice),
     type_(Type),
     clear_uav_(device_->GetMTLDevice(), *this),
-    clear_rtv_(device_->GetMTLDevice(), *this),
+    clear_rtv_(device_->GetMTLDevice(), *this, device_->GetMetal4Compiler()),
     copy_temp_allocator_(
         {device_->GetMTLDevice(), WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate}
     ),
@@ -59,23 +59,16 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
     return E_OUTOFMEMORY;
   cpu_heap_offset_ = 0;
 
-  if (!gpu_heap_)
-    gpu_heap_ = malloc(kGPUHeapSize);
-  if (!gpu_heap_)
-    return E_OUTOFMEMORY;
-  gpu_heap_offset_ = 0;
-
-  WMTBufferInfo buffer_info;
-  buffer_info.memory.set(gpu_heap_);
-  buffer_info.length = kGPUHeapSize;
-  buffer_info.options = WMTResourceHazardTrackingModeUntracked;
-  gpu_heap_buffer_ = device_->GetMTLDevice().newBuffer(buffer_info);
-
-  if (!gpu_heap_buffer_) {
-    ERR("CommandAllocator: failed to allocate gpu buffer");
-    return E_FAIL;
+  for (size_t i = 1; i < gpu_heap_chunks_.size(); ++i) {
+    gpu_heap_chunks_[i].buffer = {};
+    free(gpu_heap_chunks_[i].memory);
   }
-  gpu_heap_buffer_address_ = buffer_info.gpu_address;
+  if (!gpu_heap_chunks_.empty()) {
+    gpu_heap_chunks_.resize(1);
+    gpu_heap_chunks_.front().used = 0;
+  }
+  if (!ReserveGPUHeap(kGPUHeapSize, 16))
+    return E_OUTOFMEMORY;
 
   encoder_current = nullptr;
   encoder_last = nullptr;
@@ -128,9 +121,70 @@ MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
   ClearRecordedCommands();
   free(cpu_heap_);
   cpu_heap_ = nullptr;
-  gpu_heap_buffer_ = {};
-  free(gpu_heap_);
-  gpu_heap_ = nullptr;
+  for (auto &chunk : gpu_heap_chunks_) {
+    chunk.buffer = {};
+    free(chunk.memory);
+  }
+}
+
+bool
+MTLD3D12CommandAllocatorImpl::ReserveGPUHeap(uint64_t Length, size_t Alignment) {
+  const auto maximum = std::min<uint64_t>(device_->GetMTLDevice().maxBufferLength(), SIZE_MAX);
+  if (!Alignment || (Alignment & (Alignment - 1)) || Length > maximum)
+    return false;
+  if (!gpu_heap_chunks_.empty()) {
+    const auto &chunk = gpu_heap_chunks_.back();
+    const size_t adjustment = (-chunk.used) & (Alignment - 1);
+    if (adjustment <= chunk.capacity - chunk.used && Length <= chunk.capacity - chunk.used - adjustment)
+      return true;
+  }
+  const uint64_t capacity = std::max<uint64_t>(Length, kGPUHeapSize);
+  if (capacity > maximum)
+    return false;
+  uint64_t begin = 0;
+  if (!gpu_heap_chunks_.empty()) {
+    const auto &previous = gpu_heap_chunks_.back();
+    begin = previous.begin + previous.capacity;
+  }
+  if (capacity > SIZE_MAX - begin)
+    return false;
+  // Grow metadata first: neither a native allocation nor the current cursor
+  // changes when vector allocation fails. CPU pointers live outside the vector.
+  try {
+    if (gpu_heap_chunks_.size() == gpu_heap_chunks_.capacity())
+      gpu_heap_chunks_.reserve(gpu_heap_chunks_.size() + std::max<size_t>(gpu_heap_chunks_.size(), 1));
+  } catch (const std::bad_alloc &) {
+    return false;
+  }
+  void *memory = malloc(size_t(capacity));
+  if (!memory)
+    return false;
+  WMTBufferInfo info{};
+  info.memory.set(memory);
+  info.length = capacity;
+  info.options = WMTResourceHazardTrackingModeUntracked;
+  auto buffer = device_->GetMTLDevice().newBuffer(info);
+  if (!buffer) {
+    free(memory);
+    return false;
+  }
+  gpu_heap_chunks_.push_back({std::move(buffer), memory, begin, info.gpu_address, size_t(capacity)});
+  return true;
+}
+
+MTLD3D12CommandAllocatorImpl::GPUHeapAllocation
+MTLD3D12CommandAllocatorImpl::ResolveGPUHeap(uint64_t Offset) const {
+  assert(!gpu_heap_chunks_.empty());
+  const auto *chunk = &gpu_heap_chunks_.back();
+  if (Offset < chunk->begin) {
+    const auto next = std::upper_bound(gpu_heap_chunks_.begin(), gpu_heap_chunks_.end(), Offset,
+        [](uint64_t offset, const GPUHeapChunk &candidate) { return offset < candidate.begin; });
+    assert(next != gpu_heap_chunks_.begin());
+    chunk = &*std::prev(next);
+  }
+  const auto local = Offset - chunk->begin;
+  assert(local < chunk->capacity);
+  return {ptr_add(chunk->memory, local), chunk->buffer, local, chunk->address + local};
 }
 
 void
@@ -243,6 +297,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
   auto icb = device_->GetMTLDevice().newIndirectCommandBuffer(info, MaxCount, WMTResourceStorageModeShared);
 
   auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectComputeCommandData), 16);
+  if (!Ptr)
+    return nullptr;
 
   auto data = reinterpret_cast<IndirectComputeCommandData *>(Ptr);
 
@@ -287,8 +343,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
 
     auto &cmd_argbuf_res = EncodeComputeCommand<wmtcmd_compute_setbuffer>();
     cmd_argbuf_res.type = WMTComputeCommandSetBuffer;
-    cmd_argbuf_res.buffer = gpu_heap_buffer_;
-    cmd_argbuf_res.offset = Offset;
+    BindGPUHeap(cmd_argbuf_res.buffer, cmd_argbuf_res.offset, Offset);
     cmd_argbuf_res.index = 30;
 
     auto &cmd_dispatch_res = EncodeComputeCommand<wmtcmd_compute_dispatch>();
@@ -325,7 +380,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   if (!indirect_pso)
     return nullptr;
   WMTIndirectCommandBufferInfo info;
-  info.inherit_buffers = !(index_pull || pCmdSig->UpdateVertexBuffers || pCmdSig->UpdateIndexBuffer || pCmdSig->UpdateRootArguments);
+  info.inherit_buffers = !(index_pull || pCmdSig->UpdateVertexBuffers || pCmdSig->UpdateIndexBuffer ||
+                           pCmdSig->UpdateRootArguments || pPSO->view_location_offsets);
   info.inherit_pso = 1;
   info.inherit_cull_mode = 1;
   info.inherit_fill_mode = 1;
@@ -351,15 +407,20 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   auto icb = device_->GetMTLDevice().newIndirectCommandBuffer(info, MaxCount, WMTResourceStorageModePrivate);
 
   auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectRenderCommandData), 16);
+  if (!Ptr)
+    return nullptr;
 
   auto data = reinterpret_cast<IndirectRenderCommandData *>(Ptr);
 
   data->cmd_buf = info.gpu_resource_id;
   data->max_count = MaxCount;
-  data->vertex_constants = index_pull ? pPSO->index_pull_vertex_constants.gpu_address : pPSO->vertex_constants.gpu_address;
+  auto &vertex_constants = pPSO->view_location_offsets
+      ? index_pull ? pPSO->indirect_view_index_pull_vertex_constants : pPSO->indirect_view_vertex_constants
+      : index_pull ? pPSO->index_pull_vertex_constants : pPSO->vertex_constants;
+  data->vertex_constants = vertex_constants.gpu_address;
   data->fragment_constants = pPSO->fragment_constants.gpu_address;
   for (auto [constants, stage] : {
-         std::pair{index_pull ? &pPSO->index_pull_vertex_constants : &pPSO->vertex_constants, WMTRenderStageVertex},
+         std::pair{&vertex_constants, WMTRenderStageVertex},
          std::pair{&pPSO->fragment_constants, WMTRenderStageFragment}}) {
     if (!constants->buffer)
       continue;
@@ -368,6 +429,11 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     resource.stages = stage;
     resource.usage = WMTResourceUsageRead;
     resource.resource = constants->buffer;
+    auto &retained = static_cast<RenderEncoderData *>(encoder_current)->immutable_constant_buffers;
+    if (std::none_of(retained.begin(), retained.end(), [&](const auto &buffer) {
+          return buffer.handle == constants->buffer.handle;
+        }))
+      retained.push_back(constants->buffer);
   }
 
   {
@@ -405,7 +471,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     cmd_use_heap.type = WMTRenderCommandUseResource;
     cmd_use_heap.stages = WMTRenderStages(WMTRenderStageVertex | WMTRenderStageFragment);
     cmd_use_heap.usage = WMTResourceUsageRead;
-    cmd_use_heap.resource = gpu_heap_buffer_;
+    cmd_use_heap.resource = ResolveGPUHeap(Offset).buffer;
 
     auto &cmd_setpso_res = EncodeRenderCommand<wmtcmd_render_setpso>();
     cmd_setpso_res.type = WMTRenderCommandSetPSO;
@@ -413,23 +479,38 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
 
     auto &cmd_argbuf_res = EncodeRenderCommand<wmtcmd_render_setbuffer>();
     cmd_argbuf_res.type = WMTRenderCommandSetVertexBuffer;
-    cmd_argbuf_res.buffer = gpu_heap_buffer_;
-    cmd_argbuf_res.offset = Offset;
+    BindGPUHeap(cmd_argbuf_res.buffer, cmd_argbuf_res.offset, Offset);
     cmd_argbuf_res.index = 30;
 
     auto &cmd_draw_res = EncodeRenderCommand<wmtcmd_render_draw>();
     cmd_draw_res.type = WMTRenderCommandDraw;
     cmd_draw_res.primitive_type = WMTPrimitiveTypePoint;
     cmd_draw_res.vertex_start = 0;
-    cmd_draw_res.vertex_count = 1;
+    cmd_draw_res.vertex_count = MaxCount;
     cmd_draw_res.base_instance = 0;
     cmd_draw_res.instance_count = 1;
+
+    // The vertex resolver writes both the ICB and any per-command bindings.
+    // Publish those writes before Metal 4 fetches the indirect draw commands.
+    auto &resolved = EncodeRenderCommand<wmtcmd_render_memory_barrier>();
+    resolved.type = WMTRenderCommandMemoryBarrier;
+    resolved.scope = WMTBarrierScopeBuffers;
+    resolved.stages_after = WMTRenderStageVertex;
+    resolved.stages_before = WMTRenderStageVertex;
 
     auto &cmd_setpso = EncodeRenderCommand<wmtcmd_render_setpso>();
     cmd_setpso.type = WMTRenderCommandSetPSO;
     cmd_setpso.pso = indirect_pso;
   }
 
+  if (pPSO->view_location_offsets) {
+    // Routing is shader-owned for ICB draws. Never add native offsets a second time,
+    // even if a future Metal implementation starts inheriting viewMappings.
+    auto &mapping = EncodeRenderCommand<wmtcmd_render_set_vertex_amplification>();
+    mapping.type = WMTRenderCommandSetVertexAmplification;
+    mapping.viewport_offset = 0;
+    mapping.render_target_array_offset = 0;
+  }
   auto &cmd = EncodeRenderCommand<wmtcmd_render_executecommands>();
   cmd.type = WMTRenderCommandExecuteCommandsInBuffer;
   cmd.indirect_command_buffer = icb;
@@ -448,11 +529,11 @@ template <>
 WMT::Reference<WMT::ComputePipelineState>
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::getComputePipeline(std::string name) {
   auto lib = ctx.device_->GetLib().getLibrary();
-  auto func = lib.newFunction(name.c_str());
+  auto func = WMT4::Library(lib).newFunction(name.c_str());
   if (!func)
     return {};
   WMT::Reference<WMT::Error> err;
-  auto pso = ctx.device_->GetMTLDevice().newComputePipelineState(func, err);
+  auto pso = ctx.device_->GetMetal4Compiler().newComputePipelineState(func, err);
   if (err) {
     ERR("Failed to create compute PSO: ", err.description().getUTF8String());
   }

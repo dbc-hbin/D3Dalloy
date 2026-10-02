@@ -140,11 +140,9 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
   if (desc.NumRenderTargets > 8 || (desc.InputLayout.NumElements && !desc.InputLayout.pInputElementDescs))
     return E_INVALIDARG;
   KeyBuilder hash;
-  // Shader-visible ROV buffer ordering now has a hidden native resource. Old
-  // cached AIR lacks its access and cannot be paired with the runtime marker.
-  // 5: DXIL array and packed semantic rows map to metadata element IDs, not chunk ordinals.
-  // Old cached AIR can read the wrong signature lanes after this correction.
-  hash.add(uint32_t(5), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  // 6: Metal 4 compiles UINT logic operations into every owned framebuffer-fetch
+  // epilogue. Serialized AIR/constant-relocation blob layout is unchanged.
+  hash.add(uint32_t(6), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.VS);
   hash.shader(desc.PS);

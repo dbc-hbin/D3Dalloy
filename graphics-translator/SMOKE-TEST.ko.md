@@ -1,5 +1,63 @@
 # Owned D3D12 + DXGI smoke test
 
+> 현재 루트 소스의 후속 P0 fixture는 아래 절을 따른다. 그 뒤의 dated canonical build 기록은 역사적 실행 증거이며 새 runtime/PASS로 재작성하지 않는다.
+
+## P0 공개 계약 fixture 수동 실행
+
+이 네 public fixture는 현재 공용 runner의 신규 suite가 아니라 **직접 Wine 실행** 경로다. README로 현재 양 ABI DLL·NGX를 빌드/install하고 fresh runtime을 stage한 다음 저장소 루트에서 실행한다. 기존 game/live prefix는 쓰지 않는다. Target compiler는 x64의 x86_64, WoW64의 i686이며 모두 main이라 -municode를 넣지 않는다. NGX --ngx는 **x64-only**다.
+
+Resource2의 runtime 구현은 WIDL explicit aggregate-return **GetDesc1(D3D12_RESOURCE_DESC1 *result)** sret ABI를 사용한다. 특히 x86 hidden return-pointer/COM 호출 규약을 수동 cast나 가짜 vtable로 우회하지 않는다. 아래 public consumer는 양 ABI 모두 공식 header의 **GetDesc1()**를 사용하며 **WIDL_EXPLICIT_AGGREGATE_RETURNS를 정의하지 않는다**. Pointer-bearing feature query도 target별 실제 layout(16/12,56/36 bytes)을 따른다.
+
+```sh
+export LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin
+: "${P0_RUNTIME:?새 x64+x86 runtime의 절대 경로; NGX 포함}"
+P0_WORK="$(mktemp -d "$PWD/build/local/p0-public-check.XXXXXX")"
+python3 scripts/stage-owned-graphics.py verify --runtime "$P0_RUNTIME"
+for pair in x64:x86_64 x86:i686; do
+  abi="${pair%%:*}"; target="${pair#*:}"
+  "$LLVM_MINGW/$target-w64-mingw32-clang++" -std=c++20 -O2 -static \
+    -Iinclude/native/directx graphics-translator/tests/owned-dxgi-protection-notification.cpp \
+    -ldxgi -lole32 -o "$P0_WORK/protection-$abi.exe"
+  "$LLVM_MINGW/$target-w64-mingw32-clang++" -std=c++20 -O2 -static \
+    graphics-translator/tests/owned-dxgi-adapter-selection.cpp \
+    -ld3d12 -ldxgi -o "$P0_WORK/selection-$abi.exe"
+  "$LLVM_MINGW/$target-w64-mingw32-clang++" -std=c++20 -O2 -static \
+    graphics-translator/tests/owned-d3d12-resource-interfaces.cpp \
+    -ld3d12 -ldxgi -luuid -o "$P0_WORK/interfaces-$abi.exe"
+  "$LLVM_MINGW/$target-w64-mingw32-g++" -std=c++20 -O2 -static \
+    graphics-translator/tests/owned-d3d12-capability-discovery.cpp \
+    -ld3d12 -ldxgi -lole32 -luuid -o "$P0_WORK/discovery-$abi.exe"
+done
+for row in protection:x64 protection:x86 selection:x64 selection:x86 interfaces:x64 interfaces:x86 discovery:x64 discovery:x86 ngx:x64; do
+  (
+    set -eu
+    kind="${row%%:*}"; abi="${row#*:}"
+    run="$(mktemp -d "$P0_WORK/$kind-$abi.XXXXXX")"
+    export WINEPREFIX="$run/prefix"
+    trap '"$P0_RUNTIME/bin/wineserver" -k; "$P0_RUNTIME/bin/wineserver" -w; rm -rf "$WINEPREFIX"' EXIT
+    env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="${TMPDIR:-/tmp}" \
+      WINEPREFIX="$WINEPREFIX" WINEDEBUG=-all \
+      "$P0_RUNTIME/bin/wine" wineboot -u >"$run/bootstrap.log" 2>&1
+    exe="$P0_WORK/$kind-$abi.exe"; set --
+    if [ "$kind" = ngx ]; then exe="$P0_WORK/discovery-x64.exe"; set -- --ngx; fi
+    set +e
+    env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="${TMPDIR:-/tmp}" \
+      WINEPREFIX="$WINEPREFIX" WINEDEBUG=+loaddll DXMT_LOG_LEVEL=error DXMT_LOG_PATH="$run" \
+      MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
+      OWNED_GRAPHICS_DYLD_AUDIT=1 \
+      "$P0_RUNTIME/bin/wine" "$exe" "$@" >"$run/stdout.log" 2>"$run/stderr.log"
+    status=$?
+    printf 'exit=%s\nruntime=%s\nfixture=%s\n' "$status" "$P0_RUNTIME" "$exe" >"$run/result.txt"
+    exit "$status"
+  ) || exit "$?"
+done
+```
+
+각 exit0 외에 protection의 DXGI_PROTECTION_NOTIFICATION_OK, selection의5 CASE_PASS groups/final PASS, interfaces의31 rows/RESOURCE_INTERFACES_PASS, discovery의80 checks·0 failures, NGX의12 checks·0 failures를 확인한다. Runtime manifest·source/PE hashes·stdout/stderr/result·actual owned load와 no foreign backend·validation/completion 오류도 보존한다. Unknown feature negative checks의 unhandled 메시지는 의도한 E_INVALIDARG 경계이며 blanket stderr-zero gate를 쓰지 않는다. Public query fixture 성공 자체는 positive GPU consumer proof가 아니다. OPTIONS10/ExistingHeaps는 기존 **vrs·sharing** suites를 같은 runtime에서 x64/x86 --validation으로 별도 실행하며 compile 지침은 기존 suite source/runner 패턴을 따른다.
+
+P0-3의 enhanced creation APIs3/6/9는 enhanced COPY_DEST→COPY_SOURCE barrier를 사용한다. Enhanced texture를 legacy ResourceBarrier에 넘기려면 공식 COMMON handoff가 필요하므로 -02의 잘못된 fixture 혼용을 그대로 재사용하지 않는다. 새 실행은 [CORE P0 판정·정확한 한계](CORE-IMPLEMENTATION-STATUS.ko.md#p0-공개-계약-정합)와 비교하되 과거 로그를 새 PASS로 재작성하지 않는다.
+
+
 ## PSO cache 구현과 실행 검증 (2026-09-21)
 
 최신 canonical root는 `build/owned-direct-canonical-cache-20260921/`이다. 기존 17개 patch는 유지하고 `0018-d3d12-pipeline-cache.patch`를 추가했다. Patch SHA-256은 `0340701953bec5d19491ec0a0c66637b6ccb8862f532e517e5cfa3e0837bec2d`, native `winemetal.so` SHA-256은 `ea487e843a1c7990b8bc0d9d297e9fd3e3f46666788921a6d8fda7ce6fd56e37`이다. Upstream부터 새로 적용한 18-patch build는 `complete`이며 canonical install의 전체 module 세트를 staging했다.

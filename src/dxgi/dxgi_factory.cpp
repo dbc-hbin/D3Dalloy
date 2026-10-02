@@ -270,18 +270,22 @@ public:
                                               void **ppAdapter) override {
     InitReturnPtr(ppAdapter);
 
-    // luid ignored, since Apple Silicon has only 1 GPU anyway
-    Com<IDXGIAdapter1> adapter;
-    HRESULT hr = this->EnumAdapters1(0, &adapter);
-    if (FAILED(hr))
-      return hr;
+    if (ppAdapter == nullptr)
+      return DXGI_ERROR_INVALID_CALL;
 
-    DXGI_ADAPTER_DESC desc;
-    adapter->GetDesc(&desc);
-    if (desc.AdapterLuid.HighPart != luid.HighPart || desc.AdapterLuid.LowPart != luid.LowPart)
-      WARN("EnumAdapterByLuid: returning an adapter with mismatched luid");
+    for (UINT index = 0;; index++) {
+      Com<IDXGIAdapter1> adapter;
+      HRESULT hr = this->EnumAdapters1(index, &adapter);
+      if (FAILED(hr))
+        return hr;
 
-    return adapter->QueryInterface(riid, ppAdapter);
+      DXGI_ADAPTER_DESC desc;
+      hr = adapter->GetDesc(&desc);
+      if (FAILED(hr))
+        return hr;
+      if (desc.AdapterLuid.HighPart == luid.HighPart && desc.AdapterLuid.LowPart == luid.LowPart)
+        return adapter->QueryInterface(riid, ppAdapter);
+    }
   }
 
   HRESULT STDMETHODCALLTYPE EnumWarpAdapter(REFIID iid,

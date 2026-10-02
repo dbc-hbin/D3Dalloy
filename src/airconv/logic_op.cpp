@@ -52,6 +52,8 @@ Error applyLogicOp(Module &module, const SM50_SHADER_D3D12_LOGIC_OP_DATA &option
     return invalid("inconsistent AIR fragment signature");
   auto &context = module.getContext();
   auto *returnType = dyn_cast<StructType>(original->getReturnType());
+  if (returnType && returnType->getNumElements() != outputs->getNumOperands())
+    return invalid("inconsistent AIR fragment outputs");
 
   struct Target {
     unsigned field;
@@ -65,9 +67,11 @@ Error applyLogicOp(Module &module, const SM50_SHADER_D3D12_LOGIC_OP_DATA &option
     const unsigned index = cast<ConstantInt>(cast<ConstantAsMetadata>(output->getOperand(1))->getValue())
                                ->getZExtValue();
     if (index >= 8 || !(options.rt_mask & (1u << index))) continue;
-    auto *type = dyn_cast<FixedVectorType>(returnType->getElementType(i));
-    if (!type || !type->getElementType()->isIntegerTy(32))
-      return invalid("logic op render target output is not a 32-bit integer vector");
+    auto *type = returnType->getElementType(i);
+    auto *vector = dyn_cast<FixedVectorType>(type);
+    if (!(vector ? vector->getElementType() : type)->isIntegerTy(32) ||
+        (vector && vector->getNumElements() > 4))
+      return invalid("logic op render target output is not a 32-bit integer scalar/vector");
     targets.push_back({i, index});
   }
   // A PS that writes no logic-op target leaves those targets unchanged: nothing to rewrite.
@@ -86,40 +90,54 @@ Error applyLogicOp(Module &module, const SM50_SHADER_D3D12_LOGIC_OP_DATA &option
         MDString::get(context, "air.render_target"),
         ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), target.index)),
         MDString::get(context, "air.arg_type_name"),
-        MDString::get(context, "uint" + std::to_string(cast<FixedVectorType>(
-            returnType->getElementType(target.field))->getNumElements())),
+        MDString::get(context, isa<FixedVectorType>(returnType->getElementType(target.field))
+            ? "uint" + std::to_string(cast<FixedVectorType>(returnType->getElementType(target.field))->getNumElements())
+            : "uint"),
         MDString::get(context, "air.arg_name"), MDString::get(context, name)}));
   }
-  const auto name = original->getName().str();
-  original->setName(name + ".logic_op_body");
   auto *entry = Function::Create(FunctionType::get(returnType, parameters, false), Function::ExternalLinkage,
-                                 name, module);
+                                 "", module);
+  entry->takeName(original);
   entry->setCallingConv(original->getCallingConv());
-  IRBuilder<> builder(BasicBlock::Create(context, "entry", entry));
-  SmallVector<Value *, 24> args;
-  for (unsigned i = 0; i < original->arg_size(); ++i) args.push_back(entry->getArg(i));
-  Value *result = builder.CreateCall(original, args);
-  for (unsigned t = 0; t < targets.size(); ++t) {
-    const auto &target = targets[t];
-    auto *type = cast<FixedVectorType>(returnType->getElementType(target.field));
-    SmallVector<Constant *, 4> masks;
-    for (unsigned c = 0; c < type->getNumElements(); ++c) {
-      const unsigned bits = c < 4 ? options.component_bits[target.index][c] : 0;
-      masks.push_back(builder.getInt32(bits >= 32 ? ~0u : (1u << bits) - 1));
-    }
-    auto *source = builder.CreateExtractValue(result, {target.field});
-    auto *destination = entry->getArg(fetchArgs[t]);
-    // Only the low format bits take part (FS 17.7.1): the RT stores exactly these, never a clamped value.
-    auto *value = builder.CreateAnd(apply(builder, options.op, source, destination), ConstantVector::get(masks));
-    result = builder.CreateInsertValue(result, value, {target.field});
+  entry->setAttributes(original->getAttributes());
+  for (unsigned i = 0; i < original->arg_size(); ++i) {
+    entry->getArg(i)->takeName(original->getArg(i));
+    original->getArg(i)->replaceAllUsesWith(entry->getArg(i));
   }
-  builder.CreateRet(result);
-  original->setLinkage(Function::InternalLinkage);
+  // Keep the application CFG intact, including discard, derivatives, UAV effects and
+  // MSAA replay's publication/coverage gates. Only its actual return epilogues change.
+  entry->getBasicBlockList().splice(entry->end(), original->getBasicBlockList());
+  SmallVector<Constant *, 8> targetMasks;
+  for (const auto &target : targets) {
+    auto *vector = dyn_cast<FixedVectorType>(returnType->getElementType(target.field));
+    SmallVector<Constant *, 4> masks;
+    for (unsigned c = 0; c < (vector ? vector->getNumElements() : 1); ++c) {
+      const unsigned bits = options.component_bits[target.index][c];
+      masks.push_back(ConstantInt::get(Type::getInt32Ty(context), bits >= 32 ? ~0u : (1u << bits) - 1));
+    }
+    targetMasks.push_back(vector ? ConstantVector::get(masks) : masks.front());
+  }
+  for (auto &block : *entry) {
+    auto *ret = dyn_cast<ReturnInst>(block.getTerminator());
+    if (!ret) continue;
+    IRBuilder<> builder(ret);
+    Value *result = ret->getReturnValue();
+    for (unsigned t = 0; t < targets.size(); ++t) {
+      const auto &target = targets[t];
+      auto *source = builder.CreateExtractValue(result, {target.field});
+      auto *destination = entry->getArg(fetchArgs[t]);
+      // Narrow UINT storage keeps low bits, not Metal's saturating conversion.
+      auto *value = builder.CreateAnd(apply(builder, options.op, source, destination), targetMasks[t]);
+      result = builder.CreateInsertValue(result, value, {target.field});
+    }
+    ret->setOperand(0, result);
+  }
 
   SmallVector<Metadata *, 8> fields(signature->op_begin(), signature->op_end());
   fields[0] = ValueAsMetadata::get(entry);
   fields[2] = MDTuple::get(context, attributes);
   fragments->setOperand(0, MDTuple::get(context, fields));
+  original->eraseFromParent();
   return Error::success();
 }
 

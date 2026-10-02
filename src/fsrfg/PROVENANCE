@@ -1,0 +1,12 @@
+Swapchain, helpers, pacing, UI shaders/composition and adapted provider lifecycle:
+https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/0836aa7f24058b3f8d035a88c0774457d78fc98e/Kits/FidelityFX/framegeneration/fsr3/dx12
+MIT; Copyright (C) 2025 Advanced Micro Devices, Inc.
+Public framegeneration headers from the same revision, under src/fsr/include/framegeneration.
+Owned changes remove legacy foreign-private-C++ ABI calls and AntiLag vendor transport; interpolation uses the DXMT owned MetalFX COM extension.
+
+Public DLL ordinals preserve the reference Wine spec: Configure=1, CreateContext=2, DestroyContext=3, Dispatch=4, Query=5.
+Only the owned D3D12 MetalFX backend is accepted; there is no native-vendor renderer fallback.
+Reference limits remain explicit: one generated output, single-sample 2D resources, a maximum of 64 unretired configured frame IDs, and no tear/reset/debug-view or reserved generation flags.
+ResizeBuffers1 per-buffer presentation queues are unsupported and return DXGI_ERROR_UNSUPPORTED rather than fake success.
+The original MetalFX FG memory query does not report native allocation totals (zero); swapchain memory queries retain the MIT provider accounting.
+Callback and native Present failures suppress unwritten/rejected output while still retiring the existing presentation fence graph; asynchronous failures are observable through the public wait-for-presents dispatch.

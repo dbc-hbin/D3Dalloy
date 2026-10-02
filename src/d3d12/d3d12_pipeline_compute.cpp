@@ -17,6 +17,7 @@
  */
 
 #include "Metal.hpp"
+#include "Metal4Pipeline.hpp"
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
@@ -34,14 +35,14 @@ class MTLD3D12ComputePipelineStateImpl : public MTLD3D12Pageable<MTLD3D12Compute
   /* Everything the indirect-command-buffer variant of this pipeline is rebuilt from.
    * The function is held so its handle stays valid until that variant exists. */
   WMTComputePipelineInfo indirect_info{};
-  WMT::Reference<WMT::Function> indirect_compute_function;
+  WMT::Reference<WMT4::Function> indirect_compute_function;
   WMT::Reference<WMT::ComputePipelineState> indirect_pso;
   std::mutex indirect_pso_mutex;
   std::vector<uint8_t> statistics_cs_bytecode;
   std::vector<uint8_t> statistics_root_blob;
   WMT::Reference<WMT::ComputePipelineState> statistics_pso;
   WMT::Reference<WMT::ComputePipelineState> statistics_indirect_pso;
-  WMT::Reference<WMT::Function> statistics_function;
+  WMT::Reference<WMT4::Function> statistics_function;
   std::mutex statistics_pso_mutex;
 
 public:
@@ -54,8 +55,8 @@ public:
     Sha1Digest key;
     if (HRESULT hr = PipelineCacheKey(*pDesc, key); FAILED(hr))
       return hr;
-    auto metal = device_->GetMTLDevice();
-    if (HRESULT hr = cache_.Initialize(pDesc->CachedPSO, key, 1u << PipelineCache::Compute, metal.registryID()); FAILED(hr))
+    if (HRESULT hr = cache_.Initialize(pDesc->CachedPSO, key, 1u << PipelineCache::Compute,
+                                      device_->GetMTLDevice().registryID()); FAILED(hr))
       return hr;
 
     SM50Shader shader_cs;
@@ -102,7 +103,7 @@ public:
 
     WMT::Reference<WMT::Error> err;
 
-    auto cs_lib = metal.newLibrary(cs_data, err);
+    auto cs_lib = device_->GetMetal4Compiler().newLibrary(cs_data, err);
     if (!cs_lib)
       return cache_.loaded() ? E_INVALIDARG : E_FAIL;
 
@@ -115,13 +116,12 @@ public:
       WMTComputePipelineInfo info;
       WMT::InitializeComputePipelineInfo(info);
       info.compute_function = cs_func;
-      if (compute_constants.buffer)
-        info.immutable_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+      
       /* The indirect-command-buffer variant is built separately, on demand:
        * GetIndirectCommandBufferPipelineState. */
       info.support_indirect_command_buffers = false;
 
-      pso = metal.newComputePipelineState(info, err);
+      pso = device_->GetMetal4Compiler().newComputePipelineState(info, err);
       if (!pso) {
         ERR("Failed to create compute PSO: ", err.description().getUTF8String());
         return E_FAIL;
@@ -142,7 +142,7 @@ public:
       auto info = indirect_info;
       info.compute_function = indirect_compute_function.handle;
       info.support_indirect_command_buffers = true;
-      indirect_pso = device_->GetMTLDevice().newComputePipelineState(info, error);
+      indirect_pso = device_->GetMetal4Compiler().newComputePipelineState(info, error);
       if (!indirect_pso)
         ERR("Failed to create indirect command buffer PSO: ", error.description().getUTF8String());
     }
@@ -152,7 +152,6 @@ public:
   WMT::ComputePipelineState
   GetPipelineStatisticsPipelineState(bool indirect) override {
     std::lock_guard<std::mutex> lock(statistics_pso_mutex);
-    auto metal = device_->GetMTLDevice();
     WMT::Reference<WMT::Error> error;
     if (!statistics_function) {
       SM50Shader shader;
@@ -183,7 +182,7 @@ public:
       if (FAILED(pipeline_statistics_compute_constants.Initialize(device_, bytecode, compiled)))
         return {};
       auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
-      auto lib = metal.newLibrary(data, error);
+      auto lib = device_->GetMetal4Compiler().newLibrary(data, error);
       if (!lib)
         return {};
       statistics_function = lib.newFunction("cs_main");
@@ -195,10 +194,9 @@ public:
       auto info = indirect_info;
       info.compute_function = statistics_function.handle;
       info.support_indirect_command_buffers = indirect;
-      info.immutable_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-      if (pipeline_statistics_compute_constants.buffer)
-        info.immutable_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-      variant = metal.newComputePipelineState(info, error);
+      
+      
+      variant = device_->GetMetal4Compiler().newComputePipelineState(info, error);
       if (!variant)
         ERR("Failed to create statistics compute PSO: ", error.description().getUTF8String());
     }

@@ -17,6 +17,7 @@
  */
 
 #include "d3d12_device.hpp"
+#include "Metal4Pipeline.hpp"
 #include "d3d12_format_support.hpp"
 #include "d3d12_pageable.hpp"
 #include "d3d12_pipeline.hpp"
@@ -87,24 +88,10 @@ constexpr WMTBlendOperation kBlendOpMap[] = {
     WMTBlendOperationMin, WMTBlendOperationMax,
 };
 
-constexpr WMTLogicOperation kLogicOpMap[] = {
-    WMTLogicOperationClear,        WMTLogicOperationSet,         WMTLogicOperationCopy,
-    WMTLogicOperationCopyInverted, WMTLogicOperationNoOp,        WMTLogicOperationInvert,
-    WMTLogicOperationAnd,          WMTLogicOperationNand,        WMTLogicOperationOr,
-    WMTLogicOperationNor,          WMTLogicOperationXor,         WMTLogicOperationEquiv,
-    WMTLogicOperationAndReverse,   WMTLogicOperationAndInverted, WMTLogicOperationOrReverse,
-    WMTLogicOperationOrInverted,
-};
-
-/* A logic-op PSO with any RGB10A2_UINT target applies the op in the PS epilogue (framebuffer fetch) for every
- * target: Metal's native logic op saturates RGB10A2Uint results whose bits exceed the component width. */
+/* Metal 4 has no native logic-op pipeline state. The owned PS epilogue
+ * applies the operation to UINT outputs; other target formats retain their output. */
 inline bool LogicOpNeedsFetch(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
-  if (pDesc->BlendState.IndependentBlendEnable || !pDesc->BlendState.RenderTarget[0].LogicOpEnable)
-    return false;
-  for (UINT i = 0; i < pDesc->NumRenderTargets && i < 8; ++i)
-    if (pDesc->RTVFormats[i] == DXGI_FORMAT_R10G10B10A2_UINT)
-      return true;
-  return false;
+  return !pDesc->BlendState.IndependentBlendEnable && pDesc->BlendState.RenderTarget[0].LogicOpEnable;
 }
 
 /* Component widths of a UINT render-target format for the fetch logic op; false for any non-UINT format. */
@@ -553,15 +540,15 @@ protected:
   /* Everything the indirect-command-buffer variant of this pipeline is rebuilt from.
    * The functions are held so their handles stay valid until that variant exists. */
   WMTRenderPipelineInfo indirect_info{};
-  WMT::Reference<WMT::Function> indirect_vertex_function;
-  WMT::Reference<WMT::Function> indirect_fragment_function;
+  WMT::Reference<WMT4::Function> indirect_vertex_function;
+  WMT::Reference<WMT4::Function> indirect_fragment_function;
   WMT::Reference<WMT::RenderPipelineState> indirect_pso;
   std::mutex indirect_pso_mutex;
   std::vector<uint8_t> pull_vs_bytecode;
   std::vector<uint8_t> pull_root_blob;
   std::vector<SM50_IA_INPUT_ELEMENT> pull_ia_elements;
   bool supports_index_pull = false;
-  WMT::Reference<WMT::Function> pull_vertex_function;
+  WMT::Reference<WMT4::Function> pull_vertex_function;
   WMT::Reference<WMT::RenderPipelineState> pull_pso;
   WMT::Reference<WMT::RenderPipelineState> pull_indirect_pso;
   std::mutex pull_pso_mutex;
@@ -575,10 +562,13 @@ protected:
   /* Framebuffer-fetch logic op (LogicOpNeedsFetch); chained into every PS variant that writes render targets. */
   SM50_SHADER_D3D12_LOGIC_OP_DATA fetch_logic_op{};
   bool use_fetch_logic_op = false;
-  WMT::Reference<WMT::Function> statistics_vertex_function;
-  WMT::Reference<WMT::Function> statistics_fragment_function;
+  WMT::Reference<WMT4::Function> statistics_vertex_function;
+  WMT::Reference<WMT4::Function> statistics_fragment_function;
   WMT::Reference<WMT::RenderPipelineState> statistics_pso;
   WMT::Reference<WMT::RenderPipelineState> statistics_indirect_pso;
+  WMT::Reference<WMT4::Function> view_indirect_vertex_function;
+  WMT::Reference<WMT4::Function> view_pull_indirect_vertex_function;
+  WMT::Reference<WMT4::Function> view_statistics_indirect_vertex_function;
   std::mutex statistics_pso_mutex;
   std::mutex msaa_pso_mutex;
   std::unique_ptr<MSAAPipelineVariants> msaa_variants;
@@ -601,7 +591,7 @@ protected:
   bool mesh_rasterization_disabled = false;
 
   HRESULT CompileMeshStage(const char *name, sm50_bitcode_t *compiled, ShaderImmutableConstants &constants,
-                           WMT::Reference<WMT::Function> &function,
+                           WMT::Reference<WMT4::Function> &function,
                            const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &compile) {
     SM50Error error;
     if (compile(compiled, &error)) {
@@ -614,7 +604,7 @@ protected:
     if (FAILED(hr = constants.Initialize(device_, bytecode, *compiled)))
       return hr;
     WMT::Reference<WMT::Error> err;
-    auto lib = device_->GetMTLDevice().newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), err);
+    auto lib = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), err);
     if (!lib) {
       return E_FAIL;
     }
@@ -770,7 +760,7 @@ protected:
       stats.next = &claim;
     auto compile = [&](const char *stage, const char *name, const std::vector<uint8_t> &bytecode,
                        ShaderImmutableConstants &constants, SM50ShaderBitcode &bitcode,
-                       WMT::Reference<WMT::Function> &function) -> HRESULT {
+                       WMT::Reference<WMT4::Function> &function) -> HRESULT {
       SM50Shader shader;
       if (FAILED(InitializeShader(stage, {bytecode.data(), bytecode.size()}, &shader, nullptr)))
         return E_FAIL;
@@ -809,7 +799,7 @@ protected:
       });
     };
     SM50ShaderBitcode object_bitcode, mesh_bitcode;
-    WMT::Reference<WMT::Function> object_function, mesh_function;
+    WMT::Reference<WMT4::Function> object_function, mesh_function;
     HRESULT hr;
     if (!replay_pixels && !mesh_as_bytecode.empty() &&
         FAILED(hr = compile("AS", "as_main", mesh_as_bytecode, variant.object_constants, object_bitcode,
@@ -830,16 +820,14 @@ protected:
         return E_FAIL;
       info.fragment_function = statistics_fragment_function.handle;
     }
-    const auto &fragment = statistics ? pipeline_statistics_fragment_constants : fragment_constants;
-    info.immutable_fragment_buffers = fragment.buffer ? 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS : 0;
-    if (variant.object_constants.buffer)
-      info.immutable_object_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-    if (variant.mesh_constants.buffer)
-      info.immutable_mesh_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+    
+    
+    
+    
     if (capture_pixels) {
       info.rasterization_enabled = false;
       info.fragment_function = {};
-      info.immutable_fragment_buffers = 0;
+      
       for (auto &color : info.colors) color = {};
       info.depth_pixel_format = WMTPixelFormatInvalid;
       info.stencil_pixel_format = WMTPixelFormatInvalid;
@@ -850,7 +838,7 @@ protected:
     {
       static std::mutex creation_mutex;
       std::lock_guard<std::mutex> lock(creation_mutex);
-      variant.pso = device_->GetMTLDevice().newRenderPipelineState(info, err);
+      variant.pso = device_->GetMetal4Compiler().newRenderPipelineState(info, err);
     }
     if (!variant.pso) {
       ERR("Failed to create mesh shader PSO: ", err ? err.description().getUTF8String() : "");
@@ -935,7 +923,7 @@ protected:
     layout.elements = pull_ia_elements.data();
 
     SM50ShaderBitcode object_bitcode, mesh_bitcode;
-    WMT::Reference<WMT::Function> object_function, mesh_function;
+    WMT::Reference<WMT4::Function> object_function, mesh_function;
     HRESULT hr;
     if (gs_pass) {
       // Pass 2 of TS+GS: the DS stands in for the VS (its outputs are the GS inputs, fetched from the capture).
@@ -1100,13 +1088,13 @@ protected:
         return E_FAIL;
       info.fragment_function = statistics_fragment_function.handle;
     }
-    const auto &fragment = statistics ? pipeline_statistics_fragment_constants : fragment_constants;
-    info.immutable_fragment_buffers = fragment.buffer ? 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS : 0;
+    
+    
     if (capture_pixels || (tess_geometry && !gs_pass)) {
       // The capture pass never rasterizes; its render pass still carries the draw's attachments.
       info.rasterization_enabled = false;
       info.fragment_function = {};
-      info.immutable_fragment_buffers = 0;
+      
       if (capture_pixels) {
         for (auto &color : info.colors) color = {};
         info.depth_pixel_format = WMTPixelFormatInvalid;
@@ -1120,16 +1108,14 @@ protected:
       info.mesh_tgsize_is_multiple_of_sgwidth = false;
       info.object_tgsize_is_multiple_of_sgwidth = false;
     }
-    if (variant.object_constants.buffer)
-      info.immutable_object_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-    if (variant.mesh_constants.buffer)
-      info.immutable_mesh_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+    
+    
     WMT::Reference<WMT::Error> err;
     {
       // Metal's mesh-pipeline compiler is not reentrant for these payload sizes (see D3D11 ts_global_mutex).
       static std::mutex creation_mutex;
       std::lock_guard<std::mutex> lock(creation_mutex);
-      variant.pso = device_->GetMTLDevice().newRenderPipelineState(info, err);
+      variant.pso = device_->GetMetal4Compiler().newRenderPipelineState(info, err);
     }
     if (!variant.pso) {
       ERR("Failed to create mesh PSO: ", err ? err.description().getUTF8String() : "");
@@ -1295,14 +1281,9 @@ public:
     if (dual_source_blending && effective_dual_source_rtvs > 1)
       return E_INVALIDARG;
 
-    // D3D12 logic ops come from RenderTarget[0] with IndependentBlendEnable FALSE and apply to every RT.
-    // Metal's logic op is bit-exact on every UINT format except RGB10A2Uint, where it saturates a result
-    // with bits above the component width (NAND/OR_REVERSE/... cannot be remapped). RGB10A2_UINT targets
-    // therefore use the exact framebuffer-fetch epilogue (SM50_SHADER_D3D12_LOGIC_OP) and are excluded here.
-    const auto &logic_target = pDesc->BlendState.RenderTarget[0];
-    info.logic_operation_enabled = !pDesc->BlendState.IndependentBlendEnable && logic_target.LogicOpEnable &&
-                                   !LogicOpNeedsFetch(pDesc);
-    info.logic_operation = info.logic_operation_enabled ? kLogicOpMap[logic_target.LogicOp] : WMTLogicOperationClear;
+    // Logic operations are compiled into the owned framebuffer-fetch epilogue.
+    info.logic_operation_enabled = false;
+    info.logic_operation = WMTLogicOperationClear;
 
     if (pDesc->DSVFormat != DXGI_FORMAT_UNKNOWN) {
       if (FAILED(hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), pDesc->DSVFormat, format_desc))) {
@@ -1465,6 +1446,9 @@ public:
       return E_INVALIDARG;
     dynamic_depth_bias = static_cast<UINT>(pDesc->Flags) & kPipelineStateFlagDynamicDepthBias;
     dynamic_index_buffer_strip_cut = static_cast<UINT>(pDesc->Flags) & kPipelineStateFlagDynamicIndexBufferStripCut;
+    // Capture selection and initial mesh variants consume forced sampling and
+    // conservative/line state, so establish them before any pipeline is built.
+    InitializeRasterizerState(pDesc, extras);
     owned_rt_count = pDesc->NumRenderTargets;
     std::copy_n(pDesc->RTVFormats, owned_rt_count, owned_rtv_formats.begin());
     owned_dsv_format = pDesc->DSVFormat;
@@ -1564,7 +1548,7 @@ public:
     if (FAILED(hr = cache_.Initialize(pDesc->CachedPSO, key, stages, metal.registryID())))
       return hr;
     WMT::Reference<WMT::Error> err;
-    WMT::Reference<WMT::Function> vs_func, ps_func;
+    WMT::Reference<WMT4::Function> vs_func, ps_func;
 
     SM50_SHADER_COMMON_DATA common;
     common.flags = {};
@@ -1661,7 +1645,7 @@ public:
                                                     cache_.bitcode(PipelineCache::Vertex))))
           return hr;
         auto vs_data = WMT::MakeDispatchData(vs_bitcode_compiled.Data, vs_bitcode_compiled.Size);
-        auto vs_lib = metal.newLibrary(vs_data, err);
+        auto vs_lib = device_->GetMetal4Compiler().newLibrary(vs_data, err);
         if (!vs_lib)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
         vs_func = vs_lib.newFunction("vs_main");
@@ -1799,7 +1783,7 @@ public:
       // original over-limit fragment signature.
       if (!owned_mesh_output_replay) {
         auto ps_data = WMT::MakeDispatchData(ps_bitcode_compiled.Data, ps_bitcode_compiled.Size);
-        auto ps_lib = metal.newLibrary(ps_data, err);
+        auto ps_lib = device_->GetMetal4Compiler().newLibrary(ps_data, err);
         if (!ps_lib)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
         ps_func = ps_lib.newFunction(ps_name.c_str());
@@ -1835,26 +1819,26 @@ public:
       indirect_info = info;
       // Compile the default (non-indexed) variant now so invalid shader combinations fail creation.
       if (!GetMeshPipeline(MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, false) |
-                           (owned_mesh_output_replay ? kMeshMSAACapture : 0)))
+                           (RequiresMSAAExecution() ? kMeshMSAACapture : 0)))
         return E_INVALIDARG;
       // TS+GS: pass 2 is built from the capture layout pass 1 just reported.
       if (mesh_kind == MeshPipelineKind::TessellationGeometry &&
-          !GetMeshPipeline(MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, false) | kMeshTessellationGeometryPass))
+          !GetMeshPipeline(MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, false) | kMeshTessellationGeometryPass |
+                           (RequiresMSAAExecution() ? kMeshMSAACapture : 0)))
         return E_INVALIDARG;
     } else {
       info.vertex_function = vs_func.handle;
       info.fragment_function = ps_func.handle;
-      if (vertex_constants.buffer)
-        info.immutable_vertex_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-      if (fragment_constants.buffer)
-        info.immutable_fragment_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+      
+      
       info.max_vertex_amplification_count = max_vertex_amplification;
 
-      pso = metal.newRenderPipelineState(info, err);
-
-      if (!pso) {
-        ERR("Failed to create PSO: ", err.description().getUTF8String());
-        return E_FAIL;
+      if (!RequiresMSAAExecution()) {
+        pso = device_->GetMetal4Compiler().newRenderPipelineState(info, err);
+        if (!pso) {
+          ERR("Failed to create PSO: ", err.description().getUTF8String());
+          return E_FAIL;
+        }
       }
 
       indirect_vertex_function = vs_func;
@@ -1865,7 +1849,11 @@ public:
     // DSSO
     InitializeDSSO(pDesc, extras);
 
-    InitializeRasterizerState(pDesc, extras);
+    // Captured pipelines never execute the original raster PSO. Validate the
+    // actual capture/pixel/replay combination at creation, rather than linking
+    // an unused fetch shader that would repeat pixel-frequency side effects.
+    if (RequiresMSAAExecution() && !GetMSAAPipelineVariants(false, false))
+      return E_FAIL;
 
     return S_OK;
   }
@@ -1896,6 +1884,100 @@ public:
     return cache_.GetBlob(blob);
   }
 
+  // Caller holds the corresponding ordinary/index-pull/statistics variant mutex.
+  // These uncached ICB entries must not reuse the cached direct VS: Metal 4 ICB
+  // execution does not inherit encoder vertex-amplification view mappings.
+  bool EnsureViewIndirectVertexFunction(bool index_pull, bool statistics) {
+    auto &function = statistics ? view_statistics_indirect_vertex_function
+                               : index_pull ? view_pull_indirect_vertex_function : view_indirect_vertex_function;
+    if (function)
+      return true;
+    auto &constants = statistics ? indirect_view_pipeline_statistics_vertex_constants
+                                : index_pull ? indirect_view_index_pull_vertex_constants : indirect_view_vertex_constants;
+    SM50Shader shader;
+    SM50Error compile_error;
+    if (FAILED(InitializeShader(
+            "VS-indirect-view", {pull_vs_bytecode.data(), pull_vs_bytecode.size()}, &shader, nullptr)))
+      return false;
+    SM50_SHADER_COMMON_DATA common{};
+    common.type = SM50_SHADER_COMMON;
+    common.metal_version = kD3D12ShaderMetalVersion;
+    SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA locations{};
+    locations.type = SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS;
+    locations.next = &common;
+    locations.view_count = view_instancing.count;
+    for (uint32_t i = 0; i < view_instancing.count; ++i) {
+      locations.viewport_offsets[i] = view_instancing.locations[i].ViewportArrayIndex;
+      locations.render_target_offsets[i] = view_instancing.locations[i].RenderTargetArrayIndex;
+    }
+    void *tail = &locations;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA pull{};
+    if (index_pull) {
+      pull.type = SM50_SHADER_D3D12_INDEX_PULL;
+      pull.next = tail;
+      tail = &pull;
+    }
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics_arg{};
+    if (statistics) {
+      statistics_arg.type = SM50_SHADER_D3D12_PIPELINE_STATS;
+      statistics_arg.next = tail;
+      tail = &statistics_arg;
+    }
+    std::vector<SM50_SO_CAPTURE_ELEMENT> elements;
+    SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA capture{};
+    if (statistics || stream_output.active) {
+      const auto &source = statistics ? statistics_capture_elements : stream_output.elements;
+      elements.reserve(source.size());
+      for (const auto &element : source)
+        elements.push_back(SM50_SO_CAPTURE_ELEMENT{element.semantic_name.c_str(), element.semantic_index,
+            element.start_component, element.component_count, element.dword_offset});
+      capture.type = SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE;
+      capture.record_dwords = statistics ? pipeline_statistics_capture.record_dwords
+                                        : stream_output.streams[0].record_dwords;
+      capture.num_elements = elements.size();
+      capture.elements = elements.data();
+      capture.next = tail;
+      tail = &capture;
+    }
+    SM50_SHADER_GS_PASS_THROUGH_DATA no_raster{};
+    if (!indirect_info.rasterization_enabled) {
+      no_raster.type = SM50_SHADER_GS_PASS_THROUGH;
+      no_raster.DataEncoded = ~0u;
+      no_raster.RasterizationDisabled = true;
+      no_raster.next = tail;
+      tail = &no_raster;
+    }
+    SM50_SHADER_IA_INPUT_LAYOUT_DATA layout{};
+    layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+    layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
+    layout.slot_mask = slot_mask;
+    layout.num_elements = pull_ia_elements.size();
+    layout.elements = pull_ia_elements.data();
+    layout.next = tail;
+    SM50_SHADER_ROOT_SIGNATURE_DATA root{};
+    root.type = SM50_SHADER_ROOT_SIGNATURE;
+    root.bytecode = pull_root_blob.empty() ? pull_vs_bytecode.data() : pull_root_blob.data();
+    root.bytecode_length = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
+    root.next = &layout;
+    SM50ShaderBitcode compiled;
+    if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+                    "vs_main", &compiled, &compile_error)) {
+      ERR("Failed to compile indirect view VS: ", SM50GetErrorMessageString(compile_error));
+      return false;
+    }
+    SM50_COMPILED_BITCODE bytecode{};
+    SM50GetCompiledBitcode(compiled, &bytecode);
+    if (FAILED(constants.Initialize(device_, bytecode, compiled)))
+      return false;
+    auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
+    WMT::Reference<WMT::Error> error;
+    auto library = device_->GetMetal4Compiler().newLibrary(data, error);
+    if (!library)
+      return false;
+    function = library.newFunction("vs_main");
+    return bool(function);
+  }
+
   virtual WMT::RenderPipelineState
   GetIndirectCommandBufferPipelineState() override {
     std::lock_guard<std::mutex> lock(indirect_pso_mutex);
@@ -1903,9 +1985,14 @@ public:
       WMT::Reference<WMT::Error> error;
       auto info = indirect_info;
       info.vertex_function = indirect_vertex_function.handle;
+      if (view_location_offsets) {
+        if (!EnsureViewIndirectVertexFunction(false, false))
+          return {};
+        info.vertex_function = view_indirect_vertex_function.handle;
+      }
       info.fragment_function = indirect_fragment_function.handle;
       info.support_indirect_command_buffers = true;
-      indirect_pso = device_->GetMTLDevice().newRenderPipelineState(info, error);
+      indirect_pso = device_->GetMetal4Compiler().newRenderPipelineState(info, error);
       if (!indirect_pso)
         ERR("Failed to create indirect command buffer PSO: ", error.description().getUTF8String());
     }
@@ -1916,9 +2003,8 @@ public:
     std::lock_guard<std::mutex> lock(pull_pso_mutex);
     if (!supports_index_pull)
       return {};
-    auto metal = device_->GetMTLDevice();
     WMT::Reference<WMT::Error> error;
-    if (!pull_vertex_function) {
+    if (!pull_vertex_function && !(indirect && view_location_offsets)) {
       SM50Shader shader;
       SM50Error compile_error;
       if (FAILED(InitializeShader("VS-index-pull", {pull_vs_bytecode.data(), pull_vs_bytecode.size()}, &shader, nullptr)))
@@ -1952,7 +2038,7 @@ public:
       if (FAILED(index_pull_vertex_constants.Initialize(device_, bytecode, compiled)))
         return {};
       auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
-      auto lib = metal.newLibrary(data, error);
+      auto lib = device_->GetMetal4Compiler().newLibrary(data, error);
       if (!lib)
         return {};
       pull_vertex_function = lib.newFunction("vs_main");
@@ -1963,10 +2049,14 @@ public:
     if (!variant) {
       auto info = indirect_info;
       info.vertex_function = pull_vertex_function.handle;
+      if (indirect && view_location_offsets) {
+        if (!EnsureViewIndirectVertexFunction(true, false))
+          return {};
+        info.vertex_function = view_pull_indirect_vertex_function.handle;
+      }
       info.support_indirect_command_buffers = indirect;
-      if (index_pull_vertex_constants.buffer)
-        info.immutable_vertex_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-      variant = metal.newRenderPipelineState(info, error);
+      
+      variant = device_->GetMetal4Compiler().newRenderPipelineState(info, error);
       if (!variant)
         ERR("Failed to create indexed pull PSO: ", error.description().getUTF8String());
     }
@@ -1975,9 +2065,8 @@ public:
 
   WMT::RenderPipelineState GetPipelineStatisticsPipelineState(bool indirect) override {
     std::lock_guard<std::mutex> lock(statistics_pso_mutex);
-    auto metal = device_->GetMTLDevice();
     WMT::Reference<WMT::Error> error;
-    if (!statistics_vertex_function) {
+    if (!statistics_vertex_function && !(indirect && view_location_offsets)) {
       SM50Shader shader;
       SM50Error compile_error;
       if (FAILED(InitializeShader(
@@ -2031,7 +2120,7 @@ public:
       if (FAILED(pipeline_statistics_vertex_constants.Initialize(device_, bytecode, compiled)))
         return {};
       auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
-      auto lib = metal.newLibrary(data, error);
+      auto lib = device_->GetMetal4Compiler().newLibrary(data, error);
       if (!lib)
         return {};
       statistics_vertex_function = lib.newFunction("vs_main");
@@ -2044,15 +2133,18 @@ public:
     if (!variant) {
       auto info = indirect_info;
       info.vertex_function = statistics_vertex_function.handle;
+      if (indirect && view_location_offsets) {
+        if (!EnsureViewIndirectVertexFunction(false, true))
+          return {};
+        info.vertex_function = view_statistics_indirect_vertex_function.handle;
+      }
       info.fragment_function = statistics_fragment_function.handle;
       info.support_indirect_command_buffers = indirect;
-      info.immutable_vertex_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-      info.immutable_fragment_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-      if (pipeline_statistics_vertex_constants.buffer)
-        info.immutable_vertex_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-      if (pipeline_statistics_fragment_constants.buffer)
-        info.immutable_fragment_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-      variant = metal.newRenderPipelineState(info, error);
+      
+      
+      
+      
+      variant = device_->GetMetal4Compiler().newRenderPipelineState(info, error);
       if (!variant)
         ERR("Failed to create statistics graphics PSO: ", error.description().getUTF8String());
     }
@@ -2062,7 +2154,6 @@ public:
   /* The counting PS variant (PSInvocations); caller holds statistics_pso_mutex. */
   bool EnsureStatisticsFragmentFunction() {
     if (!statistics_ps_bytecode.empty() && !statistics_fragment_function) {
-      auto metal = device_->GetMTLDevice();
       WMT::Reference<WMT::Error> error;
       SM50Shader shader;
       SM50Error compile_error;
@@ -2113,7 +2204,7 @@ public:
       if (FAILED(pipeline_statistics_fragment_constants.Initialize(device_, bytecode, compiled)))
         return {};
       auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
-      auto lib = metal.newLibrary(data, error);
+      auto lib = device_->GetMetal4Compiler().newLibrary(data, error);
       if (!lib)
         return {};
       statistics_fragment_function = lib.newFunction(statistics_ps_name.c_str());
@@ -2185,8 +2276,8 @@ public:
                                                             : statistics_ps_root_blob.data();
     const size_t ps_root_size = statistics_ps_root_blob.empty() ? statistics_ps_bytecode.size()
                                                               : statistics_ps_root_blob.size();
-    WMT::Reference<WMT::Function> vertex_replay;
-    WMT::Reference<WMT::Function> fragments[4];
+    WMT::Reference<WMT4::Function> vertex_replay;
+    WMT::Reference<WMT4::Function> fragments[4];
     SM50_MSAA_INTERPOLATION_LAYOUT line_interpolation{};
     ShaderImmutableConstants *fragment_constants[] = {&variants->coverage_constants,
         &variants->pixel_constants, &variants->replay_fragment_constants,
@@ -2262,7 +2353,7 @@ public:
       SM50GetCompiledBitcode(compiled, &bytecode);
       if (FAILED(fragment_constants[i]->Initialize(device_, bytecode, compiled)))
         return false;
-      auto library = metal.newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), error);
+      auto library = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), error);
       if (!library || !(fragments[i] = library.newFunction(statistics_ps_name.c_str()))) {
         ERR("Failed to load MSAA PS variant ", i);
         return false;
@@ -2353,12 +2444,12 @@ public:
       auto &constants = i ? variants->replay_vertex_constants : variants->capture_constants;
       if (FAILED(constants.Initialize(device_, bytecode, compiled)))
         return false;
-      auto library = metal.newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), error);
-      auto function = library ? library.newFunction("vs_main") : WMT::Reference<WMT::Function>();
+      auto library = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), error);
+      auto function = library ? library.newFunction("vs_main") : WMT::Reference<WMT4::Function>();
       if (!function)
         return false;
       if (i) vertex_replay = function;
-      else variants->capture = metal.newComputePipelineState(function, error);
+      else variants->capture = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!i && !variants->capture) return false;
       return true;
     };
@@ -2382,7 +2473,7 @@ public:
     coverage_info.max_vertex_amplification_count = view_location_offsets ? 2 : 0;
     if (owned_line_mode != SM50_MSAA_LINE_NONE)
       coverage_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
-    auto internal = device_->GetLib().getLibrary();
+    auto internal = WMT4::Library(device_->GetLib().getLibrary());
     auto gather_fragment = internal.newFunction(owned_conservative ? "msaa_gather_conservative_depth"
         : owned_line_mode == SM50_MSAA_LINE_NONE ? "msaa_gather_depth" : "msaa_gather_line_depth");
     auto explicit_depth_fragment = internal.newFunction(sample_count == 1
@@ -2393,13 +2484,11 @@ public:
       return nullptr;
     coverage_info.fragment_function = has_pixel_shader ? fragments[0] : gather_fragment;
     coverage_info.alpha_to_coverage_enabled = false;
-    coverage_info.immutable_vertex_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-    coverage_info.immutable_fragment_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-    if (variants->replay_vertex_constants.buffer)
-      coverage_info.immutable_vertex_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-    if (variants->coverage_constants.buffer)
-      coverage_info.immutable_fragment_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-    variants->coverage_with_depth = metal.newRenderPipelineState(coverage_info, error);
+    
+    
+    
+    
+    variants->coverage_with_depth = device_->GetMetal4Compiler().newRenderPipelineState(coverage_info, error);
     if (!variants->coverage_with_depth) {
       ERR("MSAA coverage-with-depth PSO failed: ", error.description().getUTF8String());
       return nullptr;
@@ -2409,14 +2498,14 @@ public:
     // fixed D16 and floating D32 have different native depth-bias units.
     coverage_info.depth_pixel_format = WMTPixelFormatInvalid;
     coverage_info.stencil_pixel_format = WMTPixelFormatInvalid;
-    variants->coverage = metal.newRenderPipelineState(coverage_info, error);
+    variants->coverage = device_->GetMetal4Compiler().newRenderPipelineState(coverage_info, error);
     if (!variants->coverage) {
       ERR("MSAA depthless coverage PSO failed: ", error.description().getUTF8String());
       return nullptr;
     }
     auto clear_info = coverage_info;
-    auto fullscreen_vertex = device_->GetLib().getLibrary().newFunction("msaa_fullscreen_vertex");
-    auto clear_fragment = device_->GetLib().getLibrary().newFunction("msaa_clear_coverage");
+    auto fullscreen_vertex = WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_fullscreen_vertex");
+    auto clear_fragment = WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_clear_coverage");
     if (!fullscreen_vertex || !clear_fragment)
       return nullptr;
     clear_info.vertex_function = fullscreen_vertex;
@@ -2425,9 +2514,9 @@ public:
     clear_info.depth_pixel_format = WMTPixelFormatInvalid;
     clear_info.stencil_pixel_format = WMTPixelFormatInvalid;
     clear_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
-    clear_info.immutable_vertex_buffers = 0;
-    clear_info.immutable_fragment_buffers = 0;
-    variants->clear_coverage = metal.newRenderPipelineState(clear_info, error);
+    
+    
+    variants->clear_coverage = device_->GetMetal4Compiler().newRenderPipelineState(clear_info, error);
     if (!variants->clear_coverage) {
       ERR("MSAA clear PSO failed: ", error.description().getUTF8String());
       return nullptr;
@@ -2438,8 +2527,8 @@ public:
     gather_info.depth_pixel_format = msaa_original_info.depth_pixel_format;
     gather_info.stencil_pixel_format = msaa_original_info.stencil_pixel_format;
     gather_info.fragment_function = gather_fragment;
-    gather_info.immutable_fragment_buffers = 0;
-    variants->gather_depth = metal.newRenderPipelineState(gather_info, error);
+    
+    variants->gather_depth = device_->GetMetal4Compiler().newRenderPipelineState(gather_info, error);
     WMTDepthStencilInfo capture_state{};
     capture_state.depth_compare_function = WMTCompareFunctionAlways;
     capture_state.depth_write_enabled = false;
@@ -2449,11 +2538,11 @@ public:
     if (msaa_original_info.depth_pixel_format != WMTPixelFormatInvalid) {
       auto early_info = gather_info;
       early_info.fragment_function = explicit_depth_fragment;
-      variants->early_depth = metal.newRenderPipelineState(early_info, error);
+      variants->early_depth = device_->GetMetal4Compiler().newRenderPipelineState(early_info, error);
       auto late_info = gather_info;
       for (auto &color : late_info.colors) color = {};
       late_info.fragment_function = depth_only_fragment;
-      variants->late_depth = metal.newRenderPipelineState(late_info, error);
+      variants->late_depth = device_->GetMetal4Compiler().newRenderPipelineState(late_info, error);
       if (!variants->early_depth || !variants->late_depth)
         return nullptr;
     }
@@ -2466,12 +2555,11 @@ public:
     pixel_info.max_vertex_amplification_count = 0;
     pixel_info.fragment_function = fragments[1];
     pixel_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
-    pixel_info.immutable_vertex_buffers = 0;
-    pixel_info.immutable_fragment_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-    if (variants->pixel_constants.buffer)
-      pixel_info.immutable_fragment_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+    
+    
+    
     if (has_pixel_shader && !variants->sample_frequency)
-      variants->pixel = metal.newRenderPipelineState(pixel_info, error);
+      variants->pixel = device_->GetMetal4Compiler().newRenderPipelineState(pixel_info, error);
     if (has_pixel_shader && !variants->sample_frequency && !variants->pixel) {
       ERR("MSAA pixel PSO failed: ", error.description().getUTF8String());
       return nullptr;
@@ -2485,20 +2573,18 @@ public:
       // The fullscreen replay rasterizes at the RTV sample count (1 for forced > 1, N for forced 1 on N-sample RTVs).
       replay_info.raster_sample_count = owned_sample_desc.Count;
       replay_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
-      replay_info.immutable_vertex_buffers = 0;
+      
     }
     replay_info.vertex_function = single_sample_replay ? fullscreen_vertex : vertex_replay;
     // Fullscreen (single-sample) replay takes the already offset layer from the primitive bounds.
     replay_info.max_vertex_amplification_count = view_location_offsets && !single_sample_replay ? 2 : 0;
     replay_info.fragment_function = fragments[2];
-    replay_info.immutable_vertex_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-    replay_info.immutable_fragment_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-    if (variants->replay_vertex_constants.buffer)
-      replay_info.immutable_vertex_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-    if (variants->replay_fragment_constants.buffer)
-      replay_info.immutable_fragment_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+    
+    
+    
+    
     if (has_pixel_shader && !variants->sample_frequency)
-      variants->replay = metal.newRenderPipelineState(replay_info, error);
+      variants->replay = device_->GetMetal4Compiler().newRenderPipelineState(replay_info, error);
     if (has_pixel_shader && !variants->sample_frequency && !variants->replay) {
       ERR("MSAA replay PSO failed: ", error.description().getUTF8String());
       return nullptr;
@@ -2510,7 +2596,7 @@ public:
           ? "msaa_query_coverage_single" : "msaa_query_coverage");
       if (!query_fragment) return nullptr;
       query_info.fragment_function = query_fragment;
-      variants->query_coverage = metal.newRenderPipelineState(query_info, error);
+      variants->query_coverage = device_->GetMetal4Compiler().newRenderPipelineState(query_info, error);
       if (!variants->query_coverage) {
         ERR("MSAA query coverage PSO failed: ", error.description().getUTF8String());
         return nullptr;
@@ -2518,7 +2604,7 @@ public:
       auto layered_vertex = internal.newFunction("msaa_fullscreen_layer_vertex");
       if (!layered_vertex) return nullptr;
       replay_info.vertex_function = layered_vertex;
-      variants->replay_layer = metal.newRenderPipelineState(replay_info, error);
+      variants->replay_layer = device_->GetMetal4Compiler().newRenderPipelineState(replay_info, error);
       if (!variants->replay_layer) {
         ERR("MSAA layered fullscreen replay PSO failed: ", error.description().getUTF8String());
         return nullptr;
@@ -2526,10 +2612,9 @@ public:
     }
     if (variants->sample_frequency) {
       replay_info.fragment_function = fragments[3];
-      replay_info.immutable_fragment_buffers &= ~(1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-      if (variants->sample_fragment_constants.buffer)
-        replay_info.immutable_fragment_buffers |= 1u << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
-      variants->sample_pixel = metal.newRenderPipelineState(replay_info, error);
+      
+      
+      variants->sample_pixel = device_->GetMetal4Compiler().newRenderPipelineState(replay_info, error);
       if (!variants->sample_pixel) {
         ERR("MSAA sample-frequency PSO failed: ", error.description().getUTF8String());
         return nullptr;

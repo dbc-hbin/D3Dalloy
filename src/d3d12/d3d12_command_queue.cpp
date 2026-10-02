@@ -29,11 +29,14 @@
 #include "owned_submission_ring.hpp"
 #include "owned_queue_task_fifo.hpp"
 #include "d3d12_temporal.hpp"
+#include "d3d12_frame_generation.hpp"
 #include "d3d12_work_graph.hpp"
+#include "Metal4FX.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdio>
 #include <new>
 #include <optional>
 #include <unordered_map>
@@ -319,10 +322,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   const uint64_t owned_id_ = owned_graphics::NewObjectId();
   D3D12_COMMAND_QUEUE_DESC desc_;
 
-  WMT::Reference<WMT::CommandQueue> queue_;
+  WMT::Reference<WMT::MTL4CommandQueue> queue_;
   WMT::Reference<WMT::Fence> fence_;
+  WMT::Reference<WMT::Event> timestamp_order_event_;
+  uint64_t timestamp_order_value_ = 0; // submission thread only
   WMT::Reference<WMT::Texture> null_shading_rate_image_; // submission thread only; never sampled
-  WMT::Reference<WMT::Event> query_barrier_event_;
   WMT::Reference<WMT::SharedEvent> tile_mapping_event_;
   uint64_t tile_mapping_value_ = 0; // submission thread only
   /* Signal/wait pairs of this shared event flush sparse page aliases (a plain MTLEvent does not). */
@@ -330,12 +334,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   uint64_t alias_flush_value_ = 0; // submission thread only
 
   void
-  EncodeAliasFlush(WMT::CommandBuffer cmdbuf) {
+  EncodeAliasFlush() {
     const uint64_t value = ++alias_flush_value_;
-    cmdbuf.encodeSignalEvent(alias_flush_event_, value);
-    cmdbuf.encodeWaitForEvent(alias_flush_event_, value);
+    queue_.signalEvent(alias_flush_event_, value);
+    queue_.waitForEvent(alias_flush_event_, value);
   }
-  uint64_t query_barrier_value_ = 0;
   WMT::Reference<WMT::ComputePipelineState> swizzle_import_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> swizzle_export_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> swizzle_packed422_import_pipeline_;
@@ -527,7 +530,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   std::shared_ptr<owned_graphics::FenceCompletionLatch> blocked_wait_;
 
   struct InflightCommandBuffer {
-    WMT::Reference<WMT::CommandBuffer> cmdbuf{};
+    WMT::Reference<WMT::MTL4CommandBuffer> cmdbuf{};
+    WMT::Reference<WMT::MTL4Submission> submission{};
     HANDLE semaphore{};
     std::shared_ptr<DXMTPresentLatency> latency;
     // Allocator GPU argument storage uses newBufferWithBytesNoCopy. Retaining
@@ -547,11 +551,21 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // Prepared commands retain feature history, native views, and private
     // scratch until Metal completion, independently of frontend ReleaseFeature.
     std::vector<std::shared_ptr<OwnedTemporalFrame>> temporal_frames;
-    std::vector<std::pair<std::shared_ptr<owned_graphics::QueryTimestampProducers>, uint32_t>> timestamp_completions;
+    std::vector<std::shared_ptr<OwnedFrameGenerationFrame>> frame_generation_frames;
     std::optional<SignalTask> fence_completion;
     // Retain the presenter until GPU completion, not merely task encoding.
     Rc<Presenter> present_completion;
     std::shared_ptr<DXMTPresentHistory> present_history;
+    struct NativePresent {
+      WMT::Reference<WMT::MetalDrawable> drawable;
+      WMT::Reference<WMT::SharedEvent> restart_token;
+      WMT::Reference<WMT::PresentationObserver> observer;
+      Com<MTLD3D12Resource, false> backbuffer;
+      uint64_t restart_epoch = 0;
+      uint64_t present_id = 0;
+      double after = 0;
+    };
+    std::optional<NativePresent> native_present;
     // Stream-output and pipeline-statistics draws of this submission: their capture buffers
     // stay alive until completion, which checks each assembly's invariant status word.
     std::vector<std::shared_ptr<StreamOutputDrawData>> so_draws;
@@ -572,6 +586,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::vector<Com<MTLD3D12Resource, false>> swizzle_resources;
   };
 
+  struct NativeEncodingSlot {
+    WMT::Reference<WMT::MTL4CommandAllocator> allocator;
+    WMT::Reference<WMT::MTL4CommandBuffer> cmdbuf;
+  };
+  std::array<NativeEncodingSlot, kCommandQueueSize> native_encoding_slots_;
   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
   dxmt::thread inflight_cmdbuf_wait_thread_;
   dxmt::thread submission_thread_;
@@ -589,11 +608,17 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         break;
       auto &inflight = inflight_cmdbuf_pool_[internal_seq % kCommandQueueSize];
 
-      if (inflight.cmdbuf.status() <= WMTCommandBufferStatusScheduled)
-        inflight.cmdbuf.waitUntilCompleted();
-      const bool metal_error = inflight.cmdbuf.status() == WMTCommandBufferStatusError;
+      WMTMetal4SubmissionInfo completion{};
+      if (inflight.submission) {
+        inflight.submission.waitUntilCompleted();
+        inflight.submission.getInfo(completion);
+      }
+      const bool metal_error = !inflight.submission || !completion.completed || completion.error_handle;
       if (metal_error) {
-        ERR("Device error: ", inflight.cmdbuf.error().description().getUTF8String());
+        if (completion.error_handle)
+          ERR("Metal 4 submission failed: ", inflight.submission.error().description().getUTF8String());
+        else
+          ERR("Metal 4 submission did not complete");
         device_->ReportRemoval(DXGI_ERROR_DEVICE_REMOVED);
       } else {
         for (const auto &draw : inflight.so_draws)
@@ -601,12 +626,25 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
             ERR("Draw capture: ", draw->status_cpu[0], " primitives lost an unclaimed capture record");
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
           }
-        for (const auto &[queries, index] : inflight.timestamp_completions)
-          queries->completed(index, inflight.cmdbuf);
       }
 
       owned_graphics::Trace("complete", ",\"queue\":", owned_id_, ",\"submission\":", internal_seq,
-                            ",\"status\":", uint32_t(inflight.cmdbuf.status()));
+                            ",\"status\":", uint32_t(metal_error ? WMTCommandBufferStatusError : WMTCommandBufferStatusCompleted));
+      if (inflight.native_present) {
+        auto &present = *inflight.native_present;
+        const bool current = present.restart_token.signaledValue() == present.restart_epoch;
+        if (!metal_error && current)
+          WMT4::PresentMetal4Drawable(present.drawable, present.after);
+        else if (present.observer)
+          present.observer.cancel(present.present_id);
+        owned_graphics::Trace("present_native_decision", ",\"queue\":", owned_id_,
+                              ",\"present_id\":", present.present_id,
+                              ",\"presented\":", unsigned(!metal_error && current));
+        if (owned_graphics::TraceEnabled())
+          Logger::info(str::format("OWNED_GRAPHICS_NATIVE_PRESENT_DECISION present_id=", present.present_id,
+                                   " presented=", unsigned(!metal_error && current),
+                                   " reason=", !current ? "epoch" : metal_error ? "status" : "current"));
+      }
       if (inflight.present_completion) {
         if (metal_error)
           inflight.present_completion->cancelPresentOrder();
@@ -655,6 +693,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     uint64_t seq;
     InflightCommandBuffer &inflight;
     WMT::Reference<WMT::Object> pool;
+    WMT::Reference<WMT::Event> signal_event;
+    uint64_t signal_value = 0;
+    bool timestamp_predecessors_ordered = false;
+    WMT::Reference<WMT::MetalDrawable> signal_drawable;
     // This stays locked through the destructor's commit(), then releases. No
     // GPU completion or ring-capacity wait occurs while it is held.
     std::unique_lock<std::mutex> temporal_submission_lock;
@@ -665,11 +707,21 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         seq(queue->submission_ring_.reserve()),
         inflight(queue->inflight_cmdbuf_pool_[seq % kCommandQueueSize]),
         pool(WMT::MakeAutoreleasePool()) {
-      inflight.cmdbuf = queue->queue_.commandBuffer();
+      auto &slot = queue->native_encoding_slots_[seq % kCommandQueueSize];
+      // reserve() does not return this slot until its previous submission retired.
+      slot.allocator.reset();
+      slot.cmdbuf.begin(slot.allocator);
+      inflight.cmdbuf = slot.cmdbuf;
     };
 
     ~CommittingScope() {
-      inflight.cmdbuf.commit();
+      inflight.cmdbuf.end();
+      WMT::MTL4CommandBuffer buffer = inflight.cmdbuf;
+      inflight.submission = queue->queue_.commit(&buffer, 1);
+      if (signal_event)
+        queue->queue_.signalEvent(signal_event, signal_value);
+      if (signal_drawable)
+        queue->queue_.signalDrawable(signal_drawable);
       owned_graphics::Trace("submit", ",\"queue\":", queue->owned_id_, ",\"submission\":", seq);
       queue->submission_ring_.publish(seq);
     }
@@ -830,16 +882,24 @@ public:
     desc_.NodeMask = 1; // one physical node
 
     auto metal_device = device_->GetMTLDevice();
-    queue_ = metal_device.newCommandQueue(kCommandQueueSize);
+    queue_ = metal_device.newMTL4CommandQueue();
     if (!queue_)
       return E_FAIL;
     queue_.addResidencySet(device_->GetGlobalResidencySet());
+    // Native allocation failure must precede reserve(): an unpublished ring
+    // reservation would otherwise permanently block retirement and shutdown.
+    for (auto &slot : native_encoding_slots_) {
+      slot.allocator = metal_device.newMTL4CommandAllocator();
+      slot.cmdbuf = metal_device.newMTL4CommandBuffer();
+      if (!slot.allocator || !slot.cmdbuf)
+        return E_OUTOFMEMORY;
+    }
 
     fence_ = metal_device.newFence();
     if (!fence_)
       return E_FAIL;
-    query_barrier_event_ = metal_device.newEvent();
-    if (!query_barrier_event_)
+    timestamp_order_event_ = metal_device.newEvent();
+    if (!timestamp_order_event_)
       return E_FAIL;
     tile_mapping_event_ = metal_device.newSharedEvent();
     if (!tile_mapping_event_)
@@ -847,7 +907,8 @@ public:
     alias_flush_event_ = metal_device.newSharedEvent();
     if (!alias_flush_event_)
       return E_FAIL;
-    owned_graphics::Trace("queue_create", ",\"queue\":", owned_id_, ",\"type\":", uint32_t(desc_.Type));
+    owned_graphics::Trace("queue_create", ",\"queue\":", owned_id_, ",\"type\":", uint32_t(desc_.Type),
+                          ",\"metal_api\":4");
 
     return S_OK;
   }
@@ -1066,7 +1127,7 @@ public:
    * checks their assembly status when it completes.
    */
   void
-  EncodeStreamOutputSetup(WMT::CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
+  EncodeStreamOutputSetup(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                           const std::vector<std::shared_ptr<StreamOutputDrawData>> &draws) {
     auto blit = cmdbuf.blitCommandEncoder();
     blit.waitForFence(fence_);
@@ -1122,7 +1183,7 @@ public:
 
   /* Runs the serial assembly of one captured draw after its render pass (API order). */
   void
-  EncodeStreamOutputAssembly(WMT::CommandBuffer cmdbuf, const StreamOutputDrawData &draw) {
+  EncodeStreamOutputAssembly(WMT::MTL4CommandBuffer cmdbuf, const StreamOutputDrawData &draw) {
     auto encoder = cmdbuf.computeCommandEncoder(false);
     encoder.waitForFence(fence_);
     wmtcmd_compute_nop head{};
@@ -1200,7 +1261,7 @@ public:
   // Reuse a submission's scratch across serial passes, but never let two
   // simultaneous native samples share one texel. The in-flight pool retains
   // every version until GPU completion, including textures replaced by growth.
-  bool PrepareROVMarkers(WMT::CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
+  bool PrepareROVMarkers(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                          uint32_t width, uint32_t height, uint32_t layers, uint32_t samples,
                          std::array<WMT::Texture, 8> &markers) {
     if (!samples || samples > markers.size()) return false;
@@ -1258,7 +1319,7 @@ public:
     return true;
   }
 
-  bool EncodeObjectCapture(WMT::CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
+  bool EncodeObjectCapture(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                            RenderEncoderData &render, const MSAADrawData &draw,
                            WMT::Reference<WMT::Buffer> &records, const uint32_t *&mapped) {
     const uint64_t bytes = uint64_t(draw.mesh_control.total_slots) * draw.object_layout.record_dwords * 4;
@@ -1289,7 +1350,7 @@ public:
     return true;
   }
 
-  void EncodeObjectReplay(WMT::RenderCommandEncoder &encoder, RenderEncoderData &render, const MSAADrawData &draw) {
+  void EncodeObjectReplay(WMT::MTL4RenderCommandEncoder &encoder, RenderEncoderData &render, const MSAADrawData &draw) {
     WMTSize object_threads{1, 1, 1}, mesh_threads{1, 1, 1};
     for (auto *node = static_cast<wmtcmd_base *>(render.cmd_head.next.get()); node;
          node = static_cast<wmtcmd_base *>(node->next.get())) {
@@ -1325,7 +1386,7 @@ public:
   }
 
   struct MeshCaptureExecution;
-  bool EncodeMSAAProducer(WMT::CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
+  bool EncodeMSAAProducer(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                           RenderEncoderData &render, const MSAADrawData &draw,
                           MSAAExecution &execution, const MeshCaptureExecution *capture_indirect = nullptr,
                           uint32_t capture_command = UINT32_MAX) {
@@ -1532,7 +1593,7 @@ public:
     return true;
   }
 
-  bool EncodeMSAARender(WMT::CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
+  bool EncodeMSAARender(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                         RenderEncoderData &render, const MSAADrawData &draw,
                         const MSAAExecution &execution) {
     auto metal = device_->GetMTLDevice();
@@ -1619,7 +1680,7 @@ public:
     auto outputs = pixel_frequency ? make_scratch(output_bytes) : WMT::Reference<WMT::Buffer>{};
     if (!inputs || (pixel_frequency && !outputs)) return false;
     const bool early = draw.pixel_layout.flags & SM50_MSAA_PIXEL_FORCE_EARLY;
-    auto bind_constants = [&](WMT::RenderCommandEncoder &encoder, uint32_t vertex, uint32_t fragment) {
+    auto bind_constants = [&](WMT::MTL4RenderCommandEncoder &encoder, uint32_t vertex, uint32_t fragment) {
       if (draw.constants[vertex])
         encoder.setVertexBuffer(draw.constants[vertex], draw.constant_offsets[vertex],
                                 SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
@@ -1627,15 +1688,15 @@ public:
         encoder.setFragmentBuffer(draw.constants[fragment], draw.constant_offsets[fragment],
                                   SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
     };
-    auto bind_rov_markers = [&](WMT::RenderCommandEncoder &encoder, uint32_t count) {
+    auto bind_rov_markers = [&](WMT::MTL4RenderCommandEncoder &encoder, uint32_t count) {
       for (uint32_t i = 0; i < count; ++i) {
         encoder.setFragmentTexture(rov_markers[i], 31 + i);
         encoder.useResource(rov_markers[i], WMTResourceUsageRead | WMTResourceUsageWrite,
                             WMTRenderStageFragment);
       }
     };
-    auto bind_tile = [&](WMT::RenderCommandEncoder &encoder, const SM50_MSAA_TILE_CONTROL &tile,
-                         uint32_t vertex, uint32_t fragment, bool gather = false) {
+    auto bind_tile = [&](WMT::MTL4RenderCommandEncoder &encoder, const SM50_MSAA_TILE_CONTROL &tile,
+                         uint32_t vertex, uint32_t fragment, bool count_visibility, bool gather = false) {
       // The recorded state chain contains the application's PSO. Binding it to
       // our integer coverage target fails Metal validation even if immediately
       // replaced. Replay every other state command as an isolated node.
@@ -1708,7 +1769,12 @@ public:
         case WMTRenderCommandSetStencilRefFrontBack:
           bind_record.operator()<wmtcmd_render_setstencilref_front_back>();
           break;
-        case WMTRenderCommandSetVisibilityMode: bind_record.operator()<wmtcmd_render_setvisibilitymode>(); break;
+        case WMTRenderCommandSetVisibilityMode:
+          // Enabling counting registers a Reset write even if disabled before
+          // the draw. Only passes that contribute to the query may replay it.
+          if (count_visibility)
+            bind_record.operator()<wmtcmd_render_setvisibilitymode>();
+          break;
         case WMTRenderCommandMemoryBarrier: bind_record.operator()<wmtcmd_render_memory_barrier>(); break;
         // A view location recorded for an earlier native draw; this draw's own location is set below.
         case WMTRenderCommandSetVertexAmplification: break;
@@ -1772,7 +1838,7 @@ public:
                                SM50_BINDING_INDEX_SO_CAPTURE_SCRATCH);
       return true;
     };
-    auto scissor = [&](WMT::RenderCommandEncoder &encoder, const MSAAPrimitiveTileBounds &bounds,
+    auto scissor = [&](WMT::MTL4RenderCommandEncoder &encoder, const MSAAPrimitiveTileBounds &bounds,
                        uint32_t x, uint32_t y, bool fullscreen) {
       std::array<WMTScissorRect, 16> rects{};
       const uint32_t count = fullscreen ? 1 : std::max(1u, draw.bounds.viewport_count);
@@ -1791,13 +1857,7 @@ public:
       setting.rect_count = count;
       encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&setting));
     };
-    auto disable_visibility = [&](WMT::RenderCommandEncoder &encoder) {
-      wmtcmd_render_setvisibilitymode mode{};
-      mode.type = WMTRenderCommandSetVisibilityMode;
-      mode.mode = WMTVisibilityResultModeDisabled;
-      encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&mode));
-    };
-    auto no_cull = [&](WMT::RenderCommandEncoder &encoder) {
+    auto no_cull = [&](WMT::MTL4RenderCommandEncoder &encoder) {
       wmtcmd_render_setrasterizerstate raster{};
       raster.type = WMTRenderCommandSetRasterizerState;
       raster.fill_mode = WMTTriangleFillModeFill;
@@ -1809,7 +1869,7 @@ public:
       raster.winding = WMTWindingCounterClockwise;
       encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&raster));
     };
-    auto draw_primitive = [&](WMT::RenderCommandEncoder &encoder, uint32_t primitive) {
+    auto draw_primitive = [&](WMT::MTL4RenderCommandEncoder &encoder, uint32_t primitive) {
       wmtcmd_render_draw_indexed_indirect command{};
       command.type = WMTRenderCommandDrawIndexedIndirect;
       command.primitive_type = draw.assembly.topology == 0 ? WMTPrimitiveTypePoint
@@ -1926,10 +1986,9 @@ public:
           {
             auto encoder = cmdbuf.renderCommandEncoder(clear_info);
             encoder.waitForFence(fence_, WMTRenderStageFragment);
-            if (!bind_tile(encoder, tile, 1, 2)) { encoder.endEncoding(); return false; }
+            if (!bind_tile(encoder, tile, 1, 2, false)) { encoder.endEncoding(); return false; }
             scissor(encoder, bounds, x, y, true);
             no_cull(encoder);
-            disable_visibility(encoder);
             encoder.setDepthStencilState(draw.no_depth_stencil);
             encoder.setRenderPipelineState(draw.clear_coverage_pipeline);
             encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
@@ -1958,29 +2017,26 @@ public:
           for (uint32_t half = 0; half < halves; ++half) {
             tile.sample_base = half * 8;
             geometry_info.forced16_half = split16 ? half + 1 : 0;
+            const bool gather_visibility = !draw.pixel_pipeline && !draw.sample_pixel_pipeline &&
+                                           !draw.early_depth_pipeline && !draw.late_depth_pipeline;
             {
               auto encoder = cmdbuf.renderCommandEncoder(geometry_info);
               encoder.waitForFence(fence_, WMTRenderStageVertex);
-              if (!bind_tile(encoder, tile, 1, 2, true)) { encoder.endEncoding(); return false; }
+              if (!bind_tile(encoder, tile, 1, 2, gather_visibility, true)) { encoder.endEncoding(); return false; }
               scissor(encoder, bounds, x, y, false);
-              if (draw.pixel_pipeline || draw.sample_pixel_pipeline || draw.early_depth_pipeline ||
-                  draw.late_depth_pipeline)
-                disable_visibility(encoder);
               encoder.setDepthStencilState(draw.capture_depth_state);
               encoder.setRenderPipelineState(draw.gather_depth_pipeline);
               draw_primitive(encoder, primitive);
               encoder.updateFence(fence_, WMTRenderStageFragment);
               encoder.endEncoding();
             }
-            if (!draw.pixel_pipeline && !draw.sample_pixel_pipeline &&
-                !draw.early_depth_pipeline && !draw.late_depth_pipeline)
+            if (gather_visibility)
               fanout_visibility();
             if (draw.pixel_pipeline || draw.sample_pixel_pipeline) {
               auto encoder = cmdbuf.renderCommandEncoder(geometry_info);
               encoder.waitForFence(fence_, WMTRenderStageVertex);
-              if (!bind_tile(encoder, tile, 1, 2)) { encoder.endEncoding(); return false; }
+              if (!bind_tile(encoder, tile, 1, 2, false)) { encoder.endEncoding(); return false; }
               scissor(encoder, bounds, x, y, false);
-              disable_visibility(encoder);
               encoder.setDepthStencilState(draw.capture_depth_state);
               encoder.setRenderPipelineState((render.depth.attachment || render.stencil.attachment)
                                                  ? WMT::RenderPipelineState(draw.coverage_with_depth_pipeline)
@@ -2000,10 +2056,9 @@ public:
             {
               auto encoder = cmdbuf.renderCommandEncoder(clear_post_info);
               encoder.waitForFence(fence_, WMTRenderStageFragment);
-              if (!bind_tile(encoder, tile, 1, 2)) { encoder.endEncoding(); return false; }
+              if (!bind_tile(encoder, tile, 1, 2, false)) { encoder.endEncoding(); return false; }
               scissor(encoder, bounds, x, y, true);
               no_cull(encoder);
-              disable_visibility(encoder);
               encoder.setDepthStencilState(draw.no_depth_stencil);
               encoder.setRenderPipelineState(draw.clear_coverage_pipeline);
               encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
@@ -2015,7 +2070,7 @@ public:
             post_info.colors[0].load_action = WMTLoadActionLoad;
             auto encoder = cmdbuf.renderCommandEncoder(post_info);
             encoder.waitForFence(fence_, WMTRenderStageVertex);
-            if (!bind_tile(encoder, tile, 1, 2)) { encoder.endEncoding(); return false; }
+            if (!bind_tile(encoder, tile, 1, 2, true)) { encoder.endEncoding(); return false; }
             scissor(encoder, bounds, x, y, false);
             encoder.setDepthStencilState(draw.original_depth_stencil);
             encoder.setRenderPipelineState(draw.early_depth_pipeline);
@@ -2035,7 +2090,7 @@ public:
           if (draw.pixel_pipeline) {
             auto encoder = cmdbuf.renderCommandEncoder(pixel_info);
             encoder.waitForFence(fence_, WMTRenderStageFragment);
-            if (!bind_tile(encoder, tile, 1, 3)) { encoder.endEncoding(); return false; }
+            if (!bind_tile(encoder, tile, 1, 3, false)) { encoder.endEncoding(); return false; }
             if (draw.rov_marker_sample_count) bind_rov_markers(encoder, 1);
             if (draw.pixel_layout.flags & SM50_MSAA_PIXEL_COARSE) {
               // The virtual coarse grid occupies the tile's top-left corner; the coverage texture already
@@ -2048,7 +2103,6 @@ public:
               scissor(encoder, bounds, x, y, true);
             }
             no_cull(encoder);
-            disable_visibility(encoder);
             encoder.setDepthStencilState(draw.no_depth_stencil);
             encoder.setRenderPipelineState(draw.pixel_pipeline);
             encoder.setViewport({0, 0, double(render_width), double(render_height), 0, 1});
@@ -2072,7 +2126,7 @@ public:
               query_info.forced16_half = split16 ? half + 1 : 0;
               auto encoder = cmdbuf.renderCommandEncoder(query_info);
               encoder.waitForFence(fence_, WMTRenderStageFragment);
-              if (!bind_tile(encoder, tile, 1, 4)) { encoder.endEncoding(); return false; }
+              if (!bind_tile(encoder, tile, 1, 4, true)) { encoder.endEncoding(); return false; }
               scissor(encoder, bounds, x, y, true);
               no_cull(encoder);
               encoder.setDepthStencilState(draw.no_depth_stencil);
@@ -2081,8 +2135,7 @@ public:
               encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
               encoder.updateFence(fence_, WMTRenderStageFragment);
               encoder.endEncoding();
-              // The following replay binds the original query mode before disabling it.
-              // Metal may reset the visibility result even when that pass draws nothing.
+              // Read this pass's count before the next query contributor resets it.
               fanout_visibility();
             }
             tile.sample_base = 0;
@@ -2141,11 +2194,13 @@ public:
             auto encoder = cmdbuf.renderCommandEncoder(replay_info);
             encoder.waitForFence(fence_, WMTRenderStageVertex);
             const uint32_t fragment = draw.sample_pixel_pipeline ? 5 : 4;
-            if (!bind_tile(encoder, tile, 1, fragment)) { encoder.endEncoding(); return false; }
+            if (!bind_tile(encoder, tile, 1, fragment, !early_depth_executed && !draw.single_sample_replay)) {
+              encoder.endEncoding();
+              return false;
+            }
             if (draw.sample_pixel_pipeline && draw.rov_marker_sample_count)
               bind_rov_markers(encoder, draw.rov_marker_sample_count);
             scissor(encoder, bounds, x, y, draw.single_sample_replay);
-            if (early_depth_executed || draw.single_sample_replay) disable_visibility(encoder);
             encoder.setDepthStencilState(early_depth_executed ? WMT::DepthStencilState(draw.no_depth_stencil)
                                                : WMT::DepthStencilState(draw.original_depth_stencil));
             encoder.setRenderPipelineState(draw.sample_pixel_pipeline ? WMT::RenderPipelineState(draw.sample_pixel_pipeline)
@@ -2183,7 +2238,7 @@ public:
   }
 
   void
-  EncodeMSAAIndirectArguments(WMT::CommandBuffer cmdbuf, const SOIndirectEncoderData &indirect,
+  EncodeMSAAIndirectArguments(WMT::MTL4CommandBuffer cmdbuf, const SOIndirectEncoderData &indirect,
                               const SOIndirectExecution &execution) {
     if (!execution.count || !indirect.argument_resolver)
       return;
@@ -2218,8 +2273,9 @@ public:
   }
 
   bool
-  EncodeSOIndirectPreflight(WMT::CommandBuffer cmdbuf, WMT::ComputePipelineState preflight_pipeline,
+  EncodeSOIndirectPreflight(WMT::MTL4CommandBuffer cmdbuf, WMT::ComputePipelineState preflight_pipeline,
                             SOIndirectPreflightParams params_data, uint32_t record_capacity,
+                            WMT::Buffer predicate,
                             WMT::Reference<WMT::Buffer> &storage, const SOIndirectPreflightResult *&result) {
     auto metal = device_->GetMTLDevice();
     const uint64_t bytes = sizeof(SOIndirectPreflightParams) + sizeof(SOIndirectPreflightResult) +
@@ -2239,6 +2295,10 @@ public:
     encoder.waitForFence(fence_);
     wmtcmd_compute_nop head{};
     head.type = WMTComputeCommandNop;
+    wmtcmd_compute_useresource predicate_use{};
+    predicate_use.type = WMTComputeCommandUseResource;
+    predicate_use.resource = predicate;
+    predicate_use.usage = WMTResourceUsageRead;
     wmtcmd_compute_setpso pso{};
     pso.type = WMTComputeCommandSetPSO;
     pso.pso = preflight_pipeline;
@@ -2256,7 +2316,8 @@ public:
     wmtcmd_compute_dispatch dispatch{};
     dispatch.type = WMTComputeCommandDispatchThreads;
     dispatch.size = {1, 1, 1};
-    head.next.set(&pso);
+    head.next.set(predicate ? reinterpret_cast<wmtcmd_base *>(&predicate_use) : reinterpret_cast<wmtcmd_base *>(&pso));
+    predicate_use.next.set(&pso);
     pso.next.set(&params);
     params.next.set(&output);
     output.next.set(&dispatch);
@@ -2566,13 +2627,13 @@ public:
       };
       if (data->root_stride) {
         const auto *roots = reinterpret_cast<const uint64_t *>(
-            data->binding_memory + data->root_offset + uint64_t(i) * data->root_stride);
+            data->root_memory + uint64_t(i) * data->root_stride);
         for (uint32_t offset : data->root_view_offsets)
           retain_binding(roots[offset]);
       }
       if (data->vertex_stride) {
         const auto *vertices = reinterpret_cast<const uint64_t *>(
-            data->binding_memory + data->vertex_offset + uint64_t(i) * data->vertex_stride);
+            data->vertex_memory + uint64_t(i) * data->vertex_stride);
         for (uint32_t slots = data->vertex_mask; slots; slots &= slots - 1)
           retain_binding(vertices[2 * __builtin_ctz(slots)]);
       }
@@ -2710,7 +2771,7 @@ public:
   /* GS strip expansion (MeshCaptureIndirectData::strip_expand): per command, dxmt_mesh_strip_cut writes the list,
    * its draw arguments and object grid, exactly as RecordMeshStripCut does for a direct draw of the arguments. */
   void
-  EncodeStripExpansion(WMT::CommandBuffer cmdbuf, const MeshCaptureExecution &execution) {
+  EncodeStripExpansion(WMT::MTL4CommandBuffer cmdbuf, const MeshCaptureExecution &execution) {
     const auto &data = *execution.data;
     if (execution.commands.empty() || !data.strip_expand)
       return;
@@ -2753,7 +2814,7 @@ public:
 
   /* Pass 1 setup: zero every command's per-slot primitive counts (slots without a workload keep 0). */
   void
-  EncodeTessGeometryClear(WMT::CommandBuffer cmdbuf, const MeshCaptureExecution &execution) {
+  EncodeTessGeometryClear(WMT::MTL4CommandBuffer cmdbuf, const MeshCaptureExecution &execution) {
     if (execution.commands.empty() || execution.data->geometry || execution.data->domain_only)
       return;
     auto blit = cmdbuf.blitCommandEncoder();
@@ -2775,7 +2836,7 @@ public:
   /* Appends the per-command draws after the recorded pipeline state of the pass, in API order: GS (one pass),
    * or TS+GS pass 1 (VS+HS / DS capture) / pass 2 (capture fetch / GS). */
   void
-  EncodeMeshCaptureDraws(WMT::RenderCommandEncoder encoder, const MeshCaptureExecution &execution, uint8_t pass,
+  EncodeMeshCaptureDraws(WMT::MTL4RenderCommandEncoder encoder, const MeshCaptureExecution &execution, uint8_t pass,
                         uint32_t selected = UINT32_MAX) {
     const auto &data = *execution.data;
     const WMTRenderStages object_mesh = WMTRenderStages(WMTRenderStageObject | WMTRenderStageMesh);
@@ -2788,14 +2849,14 @@ public:
       if (selected != UINT32_MAX && command.slot != selected) continue;
       if (data.root_stride) {
         const uint64_t offset = data.root_offset + uint64_t(command.slot) * data.root_stride;
-        encoder.useResource(data.binding_heap, WMTResourceUsageRead, object_mesh | WMTRenderStageFragment);
-        encoder.setObjectBuffer(data.binding_heap, offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
-        encoder.setMeshBuffer(data.binding_heap, offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
-        encoder.setFragmentBuffer(data.binding_heap, offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
+        encoder.useResource(data.root_heap, WMTResourceUsageRead, object_mesh | WMTRenderStageFragment);
+        encoder.setObjectBuffer(data.root_heap, offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
+        encoder.setMeshBuffer(data.root_heap, offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
+        encoder.setFragmentBuffer(data.root_heap, offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
       }
       if (data.vertex_stride) {
-        encoder.useResource(data.binding_heap, WMTResourceUsageRead, WMTRenderStageObject);
-        encoder.setObjectBuffer(data.binding_heap, data.vertex_offset + uint64_t(command.slot) * data.vertex_stride,
+        encoder.useResource(data.vertex_heap, WMTResourceUsageRead, WMTRenderStageObject);
+        encoder.setObjectBuffer(data.vertex_heap, data.vertex_offset + uint64_t(command.slot) * data.vertex_stride,
                                 SM50_BINDING_INDEX_VERTEX_BUFFER);
       }
       if (data.update_index && !data.strip_expand && pass == 1) {
@@ -2927,7 +2988,7 @@ public:
 
   /* Between the passes: per command, the flat primitive list in D3D order and its GS object grid. */
   void
-  EncodeTessGeometryCompaction(WMT::CommandBuffer cmdbuf, const MeshCaptureExecution &execution) {
+  EncodeTessGeometryCompaction(WMT::MTL4CommandBuffer cmdbuf, const MeshCaptureExecution &execution) {
     if (execution.commands.empty() || execution.data->geometry)
       return;
     auto encoder = cmdbuf.computeCommandEncoder(false);
@@ -3024,7 +3085,7 @@ public:
     return uses;
   }
 
-  bool EncodeStandardSwizzle(WMT::CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
+  bool EncodeStandardSwizzle(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                              MTLD3D12Resource *resource, bool to_canonical,
                              WMT::Buffer dirty_flags = {}, uint64_t dirty_offset = 0, bool compare = false,
                              WMT::Buffer baseline = {}) {
@@ -3045,18 +3106,14 @@ public:
       auto library = device_->GetLib().getLibrary();
       WMT::Reference<WMT::Error> error;
       if (!import_pipeline)
-        import_pipeline = metal.newComputePipelineState(
-            library.newFunction(packed422 ? "d3d12_swizzle_packed422_import" : "d3d12_swizzle_import"), error);
+        import_pipeline = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction(packed422 ? "d3d12_swizzle_packed422_import" : "d3d12_swizzle_import"), error);
       if (!export_pipeline)
-        export_pipeline = metal.newComputePipelineState(
-            library.newFunction(packed422 ? "d3d12_swizzle_packed422_export" : "d3d12_swizzle_export"), error);
+        export_pipeline = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction(packed422 ? "d3d12_swizzle_packed422_export" : "d3d12_swizzle_export"), error);
       if (compare && !dirty_pipeline)
-        dirty_pipeline = metal.newComputePipelineState(
-            library.newFunction(packed422 ? "d3d12_swizzle_packed422_dirty" : "d3d12_swizzle_dirty"), error);
+        dirty_pipeline = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction(packed422 ? "d3d12_swizzle_packed422_dirty" : "d3d12_swizzle_dirty"), error);
       if (dirty_flags && !compare && !conditional_pipeline)
-        conditional_pipeline = metal.newComputePipelineState(
-            library.newFunction(packed422 ? "d3d12_swizzle_packed422_export_if_dirty"
-                                        : "d3d12_swizzle_export_if_dirty"), error);
+        conditional_pipeline = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction(packed422 ? "d3d12_swizzle_packed422_export_if_dirty"
+                                    : "d3d12_swizzle_export_if_dirty"), error);
       if (!import_pipeline || !export_pipeline || (compare && !dirty_pipeline) ||
           (dirty_flags && !compare && !conditional_pipeline))
         return false;
@@ -3213,7 +3270,7 @@ public:
     return true;
   }
 
-  bool BeginStandardSwizzlePass(WMT::CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
+  bool BeginStandardSwizzlePass(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                                 std::vector<SwizzlePassResource> &uses) {
     for (auto &use : uses) {
       // Encoding may fail after earlier transfers have already been queued.
@@ -3253,7 +3310,7 @@ public:
     return true;
   }
 
-  bool EndStandardSwizzlePass(WMT::CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
+  bool EndStandardSwizzlePass(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                               const std::vector<SwizzlePassResource> &uses) {
     // Descriptor tables may include inactive placed UAVs aliasing a texture
     // or a buffer actively written in this pass. Compare each placed shadow
@@ -3303,7 +3360,7 @@ public:
 
   // Internal AS helper kernels use GPU addresses in their POD parameters. Buffers used for
   // variable-length metadata are retained by the same submission as the dispatch.
-  bool EncodeASHelper(WMT::CommandBuffer cmdbuf, WMT::ComputePipelineState pipeline,
+  bool EncodeASHelper(WMT::MTL4CommandBuffer cmdbuf, WMT::ComputePipelineState pipeline,
                       const void *parameters, uint32_t bytes, WMT::Buffer geometries = {}, WMT::Buffer jobs = {},
                       uint64_t jobsOffset = 0) {
     if (!pipeline) return false;
@@ -3357,8 +3414,8 @@ public:
        * version superseded while it is in flight is held until it retires, because this
        * submission may already have encoded a dispatch that reads the old structure.
        *
-       * begin_segment also runs again after a timestamp-resolve segment, so the id is only taken
-       * once per submission; the inflight record survives the segment boundary.
+       * Each segment owns its own in-flight version snapshot, including segments
+       * split for feature history, aliasing, and GPU-produced metadata readback.
        */
       if (!scope->inflight.rtas_submission)
         scope->inflight.rtas_submission = device_->BeginRTASSubmission();
@@ -3487,10 +3544,14 @@ public:
       EncoderData *current = list.entry;
       // Capture-sized ExecuteIndirect: prepared at its pass-1 render pass, consumed by its last render pass.
       std::optional<MeshCaptureExecution> capture_execution;
-      if (ReservedResource::AnyLive())
+      if (ReservedResource::AnyLive()) {
         /* Command lists see each other's writes; for sparse tiles sharing a heap page that needs a
            shared event signal/wait, not only the pass boundary (ReservedResource::AnyLive). */
-        EncodeAliasFlush(scope->inflight.cmdbuf);
+        scope.reset();
+        EncodeAliasFlush();
+        if (!start_segment())
+          return;
+      }
       while (current) {
         if (device_->RemovedReason() != S_OK)
           return;
@@ -3510,45 +3571,10 @@ public:
           current = current->next;
           continue;
         }
-        if (current->type == EncoderType::Query &&
-            static_cast<QueryEncoderData *>(current)->op == QueryEncoderOp::ResolveTimestamp) {
-          auto query = static_cast<QueryEncoderData *>(current);
-          const uint64_t producer_submission = scope->seq;
-          // This is the FIFO worker, never the application's Execute caller.
-          // Release both queue and temporal locks before any completion wait.
-          scope.reset();
-          submission_ring_.waitUntilRetired(producer_submission);
-          if (device_->RemovedReason() != S_OK)
-            return;
-          const auto producers = query->timestamp_producers->snapshot(query->start_index, query->query_count);
-          for (auto producer : producers) {
-            if (!producer)
-              continue;
-            if (producer.status() < WMTCommandBufferStatusCommitted) {
-              ERR("ResolveQueryData: timestamp producer has not been submitted");
-              device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
-              return;
-            }
-            if (producer.status() <= WMTCommandBufferStatusScheduled)
-              producer.waitUntilCompleted();
-            if (producer.status() == WMTCommandBufferStatusError) {
-              ERR("ResolveQueryData: timestamp producer failed");
-              device_->ReportRemoval(DXGI_ERROR_DEVICE_REMOVED);
-              return;
-            }
-          }
-          owned_graphics::Trace("query_resolve_ready", ",\"queue\":", owned_id_,
-                                ",\"completed_submission\":", producer_submission,
-                                ",\"start\":", query->start_index, ",\"count\":", query->query_count);
-          if (!start_segment())
-            return;
-        }
-
         bool execute_predicated_texture_copy = true;
         if (current->type == EncoderType::PredicatedTextureCopy) {
           auto copy = static_cast<PredicatedTextureCopyEncoderData *>(current);
           const uint64_t predicate_submission = scope->seq;
-          auto predicate_producer = scope->inflight.cmdbuf;
           // The submission worker, never the application thread, commits the
           // commands which produced the retained snapshot and waits for their
           // actual completion before consulting CPU-coherent allocator memory.
@@ -3556,11 +3582,6 @@ public:
           submission_ring_.waitUntilRetired(predicate_submission);
           if (device_->RemovedReason() != S_OK)
             return;
-          if (predicate_producer.status() == WMTCommandBufferStatusError) {
-            ERR("PredicatedTextureCopy: predicate producer failed");
-            device_->ReportRemoval(DXGI_ERROR_DEVICE_REMOVED);
-            return;
-          }
           if (!copy->predicate_value) {
             ERR("PredicatedTextureCopy: missing predicate snapshot");
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
@@ -3587,7 +3608,8 @@ public:
             if (params.count_buffer || params.predicate) {
               params.count_only = 1;
               if (!EncodeSOIndirectPreflight(scope->inflight.cmdbuf, render->so_indirect->preflight_pipeline,
-                                             params, 0, preflight_storage, preflight_result)) {
+                                             params, 0, render->so_indirect->draw_template->predicate_heap,
+                                             preflight_storage, preflight_result)) {
                 ERR("Draw capture: indirect count preflight allocation failed");
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
                 return;
@@ -3613,7 +3635,8 @@ public:
               params.predicate = 0;
               params.count_only = 0;
               if (!EncodeSOIndirectPreflight(scope->inflight.cmdbuf, render->so_indirect->preflight_pipeline,
-                                             params, actual_count, preflight_storage, preflight_result)) {
+                                             params, actual_count, render->so_indirect->draw_template->predicate_heap,
+                                             preflight_storage, preflight_result)) {
                 ERR("Draw capture: indirect draw preflight allocation failed");
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
                 return;
@@ -3652,7 +3675,8 @@ public:
             WMT::Reference<WMT::Buffer> preflight_storage;
             const SOIndirectPreflightResult *preflight_result = nullptr;
             if (!EncodeSOIndirectPreflight(scope->inflight.cmdbuf, indirect->preflight_pipeline, indirect->preflight,
-                                           indirect->preflight.max_count, preflight_storage, preflight_result)) {
+                                           indirect->preflight.max_count, indirect->predicate_heap,
+                                           preflight_storage, preflight_result)) {
               ERR("ExecuteIndirect: capture argument preflight allocation failed");
               device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
               return;
@@ -3771,11 +3795,11 @@ public:
                 const auto &command = capture.commands[i];
                 const auto &data = *capture.data;
                 if (data.root_stride) {
-                  draw.root_buffer = data.binding_heap;
+                  draw.root_buffer = data.root_heap;
                   draw.root_offset = data.root_offset + uint64_t(command.slot) * data.root_stride;
                 }
                 if (data.vertex_stride) {
-                  draw.vertex_buffer_table = data.binding_heap;
+                  draw.vertex_buffer_table = data.vertex_heap;
                   draw.vertex_buffer_offset = data.vertex_offset + uint64_t(command.slot) * data.vertex_stride;
                 }
                 const uint64_t primitives = data.geometry
@@ -3840,7 +3864,7 @@ public:
                 draw.vertex_buffer_table = indirect_execution->storage;
                 draw.vertex_buffer_offset = indirect_execution->vertex_offset +
                     uint64_t(i) * indirect_execution->command->vertex_argbuf_stride;
-                draw.static_sampler_buffer = render->so_indirect->draw_template->heap;
+                draw.static_sampler_buffer = render->so_indirect->static_sampler_buffer;
                 draw.static_sampler_offset = render->so_indirect->static_sampler_offset;
               }
               draw.bounds.max_primitives = draw.assembly.max_primitives;
@@ -4249,11 +4273,23 @@ public:
             wmtcmd_render_draw dispatch{};
             dispatch.type = WMTRenderCommandDraw;
             dispatch.primitive_type = WMTPrimitiveTypePoint;
-            dispatch.vertex_count = 1;
+            dispatch.vertex_count = execution.count;
             dispatch.instance_count = 1;
+            // The resolver writes the ICB and its root/VB arguments in the vertex
+            // stage. Metal 4 requires device visibility before the ICB consumes them.
+            wmtcmd_render_memory_barrier resolved{};
+            resolved.type = WMTRenderCommandMemoryBarrier;
+            resolved.scope = WMTBarrierScopeBuffers;
+            resolved.stages_after = WMTRenderStageVertex;
+            resolved.stages_before = WMTRenderStageVertex;
             wmtcmd_render_setpso drawing{};
             drawing.type = WMTRenderCommandSetPSO;
             drawing.pso = data->so_indirect->draw_pipeline;
+            wmtcmd_render_set_vertex_amplification mapping{};
+            mapping.type = WMTRenderCommandSetVertexAmplification;
+            // An ICB view variant owns both offsets in its shader epilogue.
+            mapping.viewport_offset = 0;
+            mapping.render_target_array_offset = 0;
             wmtcmd_render_executecommands execute{};
             execute.type = WMTRenderCommandExecuteCommandsInBuffer;
             execute.indirect_command_buffer = execution.icb;
@@ -4263,11 +4299,17 @@ public:
             use_icb.next.set(&resolver);
             resolver.next.set(&argument);
             argument.next.set(&dispatch);
-            dispatch.next.set(&drawing);
-            drawing.next.set(&execute);
+            dispatch.next.set(&resolved);
+            resolved.next.set(&drawing);
+            drawing.next.set(data->so_indirect->shader_view_locations ? static_cast<void *>(&mapping)
+                                                                    : static_cast<void *>(&execute));
+            mapping.next.set(&execute);
             execute.next.set(nullptr);
             encoder.useResource(execution.storage, WMTResourceUsageRead | WMTResourceUsageWrite,
-                                WMTRenderStageVertex);
+                                WMTRenderStages(WMTRenderStageVertex | WMTRenderStageFragment));
+            if (data->so_indirect->static_sampler_buffer)
+              encoder.useResource(data->so_indirect->static_sampler_buffer, WMTResourceUsageRead,
+                                  WMTRenderStages(WMTRenderStageVertex | WMTRenderStageFragment));
             if (execution.draws.front()->statistics_heap)
               encoder.useResource(execution.draws.front()->statistics_heap,
                                   WMTResourceUsageRead | WMTResourceUsageWrite,
@@ -4430,7 +4472,7 @@ public:
                     encoder.waitForFence(fence_);
                     const bool encoded = deserialize || as_rebuild_update ? encoder.build(as_native.descriptor, data->destination, as_scratch, 0)
                         : operation == RTASOperation::Build ? encoder.build(data->descriptor, data->destination, data->scratch, data->scratchOffset)
-                        : operation == RTASOperation::Refit ? encoder.refit(data->deferredUpdate ? WMT::AccelerationStructureDescriptor(as_native.descriptor) : WMT::AccelerationStructureDescriptor(data->descriptor),
+                        : operation == RTASOperation::Refit ? encoder.refit(data->deferredUpdate ? WMT::MTL4AccelerationStructureDescriptor(as_native.descriptor) : WMT::MTL4AccelerationStructureDescriptor(data->descriptor),
                           data->source, data->destination, as_scratch ? WMT::Buffer(as_scratch) : WMT::Buffer(data->scratch), as_scratch ? 0 : data->scratchOffset)
                         : encoder.copy(data->source, data->destination, operation == RTASOperation::Compact ? 1 : 0);
                     // Every header carries the native compacted size, so standalone postbuild and compact
@@ -4514,20 +4556,48 @@ public:
           break; // Executed at the submission segment boundary above.
         case EncoderType::Temporal: {
           auto data = static_cast<TemporalEncoderData *>(current);
-          scope->inflight.temporal_frames.push_back(data->frame);
+          // History waits precede this feature commit, not application work
+          // already encoded into the prior segment.
+          scope.reset();
+          if (!start_segment())
+            return;
+          auto temporal_cmdbuf = scope->inflight.cmdbuf;
+          if (data->fg_frame) scope->inflight.frame_generation_frames.push_back(data->fg_frame);
+          else scope->inflight.temporal_frames.push_back(data->frame);
           std::vector<SwizzlePassResource> swizzle_uses;
           if (device_->HasStandardSwizzleTextures()) {
-            const auto resources = GetOwnedTemporalFrameResources(data->frame);
-            for (size_t i = 0; i < resources.size(); ++i)
-              if (resources[i] && resources[i]->swizzle_layout)
-                AppendStandardResource(swizzle_uses, Com<MTLD3D12Resource, false>(resources[i]), i == 3);
+            if (data->fg_frame) {
+              const auto resources = GetOwnedFrameGenerationResources(data->fg_frame);
+              const bool generate = IsOwnedFrameGenerationGenerate(data->fg_frame);
+              for (size_t i = 0; i < resources.size(); ++i)
+                if (resources[i] && resources[i]->swizzle_layout)
+                  AppendStandardResource(swizzle_uses, Com<MTLD3D12Resource, false>(resources[i]), generate && i == 1);
+            } else {
+              const auto resources = GetOwnedTemporalFrameResources(data->frame);
+              for (size_t i = 0; i < resources.size(); ++i)
+                if (resources[i] && resources[i]->swizzle_layout)
+                  AppendStandardResource(swizzle_uses, Com<MTLD3D12Resource, false>(resources[i]), i == 3);
+            }
           }
-          if (!BeginStandardSwizzlePass(cmdbuf, scope->inflight, swizzle_uses)) {
+          if (!BeginStandardSwizzlePass(temporal_cmdbuf, scope->inflight, swizzle_uses)) {
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
             return;
           }
-          EncodeOwnedTemporalFrame(data->frame, cmdbuf, fence_, owned_id_, scope->seq, current->id);
-          if (!EndStandardSwizzlePass(cmdbuf, scope->inflight, swizzle_uses)) {
+          const auto wait = [&](WMT::Event event, uint64_t value) { queue_.waitForEvent(event, value); };
+          const auto signal = [&](WMT::Event event, uint64_t value) {
+            scope->signal_event = event;
+            scope->signal_value = value;
+            scope.reset();
+          };
+          if (data->fg_frame)
+            EncodeOwnedFrameGenerationFrame(data->fg_frame, temporal_cmdbuf, fence_, owned_id_, scope->seq, current->id, wait, signal);
+          else
+            EncodeOwnedTemporalFrame(data->frame, temporal_cmdbuf, fence_, owned_id_, scope->seq, current->id, wait, signal);
+          // Reacquire the device submission lock only after the feature mutex
+          // has been released, preserving device-lock then feature-lock order.
+          if (!start_segment())
+            return;
+          if (!EndStandardSwizzlePass(scope->inflight.cmdbuf, scope->inflight, swizzle_uses)) {
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
             return;
           }
@@ -4597,7 +4667,10 @@ public:
           auto data = static_cast<QueryEncoderData *>(current);
           switch (data->op) {
           case QueryEncoderOp::AliasFlush:
-            EncodeAliasFlush(cmdbuf);
+            scope.reset();
+            EncodeAliasFlush();
+            if (!start_segment())
+              return;
             break;
           case QueryEncoderOp::ResetOcclusion: {
             auto encoder = cmdbuf.blitCommandEncoder();
@@ -4629,34 +4702,20 @@ public:
             encoder.endEncoding();
             break;
           }
-          case QueryEncoderOp::SampleTimestamp: {
-            const uint64_t before = ++query_barrier_value_;
-            cmdbuf.encodeSignalEvent(query_barrier_event_, before);
-            cmdbuf.encodeWaitForEvent(query_barrier_event_, before);
-
-            WMTSampleBufferAttachmentInfo sample{};
-            sample.sample_buffer = data->timestamp_samples;
-            sample.start_of_encoder_sample_index = data->start_index;
-            sample.end_of_encoder_sample_index = ~0ull;
-            auto encoder = cmdbuf.blitCommandEncoderWithSampleBuffers(&sample, 1);
-            wmtcmd_blit_fillbuffer fill{};
-            fill.type = WMTBlitCommandFillBuffer;
-            fill.next.set(nullptr);
-            fill.buffer = data->timestamp_dummy;
-            fill.offset = 0;
-            fill.length = 4;
-            fill.value = 0;
-            encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
-            encoder.updateFence(fence_);
-            encoder.endEncoding();
-
-            const uint64_t after = ++query_barrier_value_;
-            cmdbuf.encodeSignalEvent(query_barrier_event_, after);
-            cmdbuf.encodeWaitForEvent(query_barrier_event_, after);
-            data->timestamp_producers->record(data->start_index, cmdbuf);
-            scope->inflight.timestamp_completions.emplace_back(data->timestamp_producers, data->start_index);
+          case QueryEncoderOp::SampleTimestamp:
+            // writeTimestamp waits only for earlier work in this command buffer.
+            // Order all already-committed queue work before this segment too;
+            // the current buffer is committed by scope after this GPU-only pair.
+            // One pair covers every sample in the segment, including an initial
+            // timestamp with no encoder/fence dependency of its own.
+            if (!scope->timestamp_predecessors_ordered) {
+              const uint64_t value = ++timestamp_order_value_;
+              queue_.signalEvent(timestamp_order_event_, value);
+              queue_.waitForEvent(timestamp_order_event_, value);
+              scope->timestamp_predecessors_ordered = true;
+            }
+            WMT::writeTimestamp(cmdbuf, data->timestamp_samples, data->start_index);
             break;
-          }
           case QueryEncoderOp::ResolveOcclusion: {
             auto encoder = cmdbuf.blitCommandEncoder();
             encoder.waitForFence(fence_);
@@ -4820,12 +4879,12 @@ public:
             break;
           }
           case QueryEncoderOp::ResolveTimestamp: {
-            auto encoder = cmdbuf.blitCommandEncoder();
-            encoder.waitForFence(fence_);
-            encoder.resolveCounters(data->timestamp_samples, data->start_index, data->query_count,
-                                    data->destination, data->destination_offset);
-            encoder.updateFence(fence_);
-            encoder.endEncoding();
+            auto barrier = cmdbuf.blitCommandEncoder();
+            barrier.barrierAfterQueueStages(WMTMetal4StageAll, WMTMetal4StageBlit, WMTMetal4VisibilityDevice);
+            barrier.updateFence(fence_);
+            barrier.endEncoding();
+            WMT::resolveTimestampCounters(cmdbuf, data->timestamp_samples, data->start_index, data->query_count,
+                                          data->destination, data->destination_offset, fence_, fence_);
             break;
           }
           }
@@ -4948,15 +5007,8 @@ public:
       {
         auto scope = StartCommitting();
         submission = scope.seq;
-        // Shared fences: the GPU signals the authoritative MTLSharedEvent
-        // after all prior work of this queue, so other devices and processes
-        // (including their GPU waits) order against it without a CPU hop.
-        if (auto event = task.fence->sharedEvent()) {
-          // The native token is reserved at encode time, in queue order; its logical
-          // value is published to every process before the GPU can reach it.
-          task.ticket.native_token = task.fence->reserveSharedToken(task.ticket.value);
-          scope.inflight.cmdbuf.encodeSignalEvent(event, task.ticket.native_token);
-        }
+        // Publish logical signals only on validated retirement. Reserving a
+        // shared native token here would confuse enqueue and completion order.
         scope.inflight.fence_completion.emplace(task);
         owned_graphics::Trace("signal", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
                               ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
@@ -5029,11 +5081,8 @@ public:
 
     try {
       auto scope = StartCommitting();
-      // Shared fences: the CPU latch above was released by a published logical value
-      // >= the wait value; the GPU additionally waits on the native token that
-      // published it, ordering later work behind the remote producer's GPU work.
-      if (auto event = task.fence->sharedEvent())
-        scope.inflight.cmdbuf.encodeWaitForEvent(event, task.fence->observedSharedToken());
+      // The latch requires actual validated completion, including remote
+      // producers. No native-token wait or API-thread blocking is needed.
       owned_graphics::Trace("wait", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
                             ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
                             ",\"generation\":", task.ticket.generation);
@@ -5086,19 +5135,19 @@ public:
   GetTimestampFrequency(UINT64 *pFrequency) {
     if (!pFrequency)
       return E_INVALIDARG;
-    if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc_.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
+    if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc_.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+        desc_.Type != D3D12_COMMAND_LIST_TYPE_COPY)
       return E_FAIL;
-    // Metal timestamp counter samples are MTLTimestamp values, expressed in
-    // nanoseconds. D3D12 reports counter ticks per second, so one tick/ns is 1 GHz.
-    *pFrequency = 1000000000ull;
-    return S_OK;
+    *pFrequency = WMT::queryTimestampFrequency(device_->GetMTLDevice());
+    return *pFrequency ? S_OK : E_FAIL;
   };
 
   HRESULT STDMETHODCALLTYPE
   GetClockCalibration(UINT64 *gpu_timestamp, UINT64 *cpu_timestamp) {
     if (!gpu_timestamp || !cpu_timestamp)
       return E_INVALIDARG;
-    if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc_.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
+    if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc_.Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+        desc_.Type != D3D12_COMMAND_LIST_TYPE_COPY)
       return E_FAIL;
 
     LARGE_INTEGER qpc_before{}, qpc_after{};
@@ -5106,7 +5155,8 @@ public:
     uint64_t metal_gpu_timestamp = 0;
     if (!QueryPerformanceCounter(&qpc_before))
       return E_FAIL;
-    device_->GetMTLDevice().sampleTimestamps(&metal_cpu_timestamp, &metal_gpu_timestamp);
+    if (!WMT::sampleTimestampCalibration(device_->GetMTLDevice(), metal_cpu_timestamp, metal_gpu_timestamp))
+      return E_FAIL;
     if (!QueryPerformanceCounter(&qpc_after) || !metal_cpu_timestamp || !metal_gpu_timestamp)
       return E_FAIL;
 
@@ -5195,7 +5245,7 @@ public:
     // later frame on an idle queue cannot overtake an earlier blocked one.
     auto order_event = task.presenter->presentOrderEvent();
     const uint64_t frame_id = task.state->frame_id;
-    cmdbuf.encodeWaitForEvent(order_event, frame_id - 1);
+    queue_.waitForEvent(order_event, frame_id - 1);
     WMT::Texture present_source = view.texture;
     if (task.composition.history) {
       auto &composition = task.composition;
@@ -5239,7 +5289,7 @@ public:
       present_source = current;
       scope.inflight.present_history = composition.history;
     }
-    auto drawable = task.presenter->encodeCommands(
+    auto drawable = task.presenter->encodeCommandsMetal4(
         cmdbuf, present_source, task.state->metadata,
         [&](auto encoder) { encoder.waitForFence(fence_, WMTRenderStageFragment); },
         [&](auto encoder) { encoder.updateFence(fence_, WMTRenderStageFragment); }
@@ -5260,7 +5310,10 @@ public:
       encoder.updateFence(fence_);
       encoder.endEncoding();
     }
-    cmdbuf.encodeSignalEvent(order_event, frame_id);
+    queue_.waitForDrawable(drawable);
+    scope.signal_event = order_event;
+    scope.signal_value = frame_id;
+    scope.signal_drawable = drawable;
     if (task.observer && !drawable.observePresentation(task.observer, task.present_id)) {
       task.observer.cancel(task.present_id);
       task.observer_fault->store(true, std::memory_order_release);
@@ -5269,8 +5322,9 @@ public:
     // Core Animation receives the drawable only after this command buffer completes, and only if
     // no DXGI_PRESENT_RESTART advanced the epoch since this frame left the queue. A discarded
     // frame withdraws its observation there, like a queue-discarded frame.
-    cmdbuf.presentDrawableIfCurrent(drawable, task.presenter->restartToken(), task.restart_epoch, task.after,
-                                    task.observer, task.present_id);
+    scope.inflight.native_present.emplace(InflightCommandBuffer::NativePresent{
+        drawable, task.presenter->restartToken(), task.observer, task.backbuffer,
+        task.restart_epoch, task.present_id, task.after});
     owned_graphics::Trace("present_encode", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
                           ",\"resource\":", g->owned_id);
     // Encoding completion releases PSO readers. Layer transitions additionally

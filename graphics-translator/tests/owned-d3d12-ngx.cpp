@@ -29,6 +29,10 @@ void ngx_fixture_set_frame_flags74(
     ID3D12Resource*, ID3D12Resource*, int);
 void ngx_fixture_set_frame_output_offset(NVSDK_NGX_Parameter*, unsigned int);
 void ngx_fixture_set_frame_nan_jitter(NVSDK_NGX_Parameter*);
+void ngx_fixture_set_create_options(NVSDK_NGX_Parameter*, unsigned int, int);
+void ngx_fixture_set_frame_offsets(NVSDK_NGX_Parameter*, unsigned int, unsigned int, unsigned int, unsigned int);
+void ngx_fixture_set_frame_mask(NVSDK_NGX_Parameter*, ID3D12Resource*, unsigned int, unsigned int);
+void ngx_fixture_set_frame_scalars(NVSDK_NGX_Parameter*, float, float);
 }
 
 namespace {
@@ -310,6 +314,36 @@ void runOfficialErrorCases(const NgxApi& api, Gpu& gpu,
     }
 }
 
+void runRejectedOutputPreservation(const NgxApi& api, Gpu& gpu,
+                                    NVSDK_NGX_Handle* feature, ID3D12Resource* depth, ID3D12Resource* motion) {
+    auto color = makeColor(gpu, 112);
+    auto output = makeOutput(gpu, 1900);
+    auto recording = gpu.makeRecording();
+    auto* params = allocateParams(api);
+    ngx_fixture_set_frame_flags74(params, color.Get(), output.resource.Get(), depth, motion, 0);
+    ngx_fixture_set_frame_scalars(params, 0, 2);
+    checkNgxResult(api.evaluate(recording.list.Get(), feature, params, nullptr), ngx_fixture_result_unsupported_parameter(),
+                    "nonidentity exposure multiplier unsupported");
+    ngx_fixture_set_frame_flags74(params, color.Get(), output.resource.Get(), depth, motion, 0);
+    ngx_fixture_set_frame_offsets(params, 1, 0, 0, 0);
+    checkNgxResult(api.evaluate(recording.list.Get(), feature, params, nullptr), ngx_fixture_result_invalid_parameter(),
+                    "input color subrect exceeds backing");
+    resetAndDestroyParams(api, params);
+    copyTextureToReadback(recording.list.Get(), output.resource.Get(), output.readback);
+    check(recording.list->Close(), "NGX negative preservation Close");
+    gpu.executeAndWait(recording.list.Get());
+    D3D12_RANGE range{0, static_cast<SIZE_T>(output.readback.totalBytes)};
+    uint8_t* bytes = nullptr;
+    check(output.readback.buffer->Map(0, &range, reinterpret_cast<void**>(&bytes)), "NGX negative pixels Map");
+    for (UINT y = 0; y < kOutputBacking; ++y)
+        for (UINT x = 0; x < kOutputBacking; ++x) {
+            const auto* p = bytes + output.readback.footprint.Offset + size_t(y) * output.readback.footprint.Footprint.RowPitch + x * 4;
+            if (!std::equal(output.sentinel.begin(), output.sentinel.end(), p)) fail("NGX rejected evaluation modified output");
+        }
+    output.readback.buffer->Unmap(0, nullptr);
+    std::puts("OWNED_D3D12_NGX_BEHAVIOR_PASS case=rejected_output_preserved nonidentity_exposure_unsupported=1 invalid_input_bounds=1 sentinel=1");
+}
+
 void runContinuousFrames(const NgxApi& api, Gpu& gpu,
                          ID3D12Resource* depth, ID3D12Resource* motion) {
     NVSDK_NGX_Handle* feature = createFeature(api, gpu);
@@ -320,6 +354,7 @@ void runContinuousFrames(const NgxApi& api, Gpu& gpu,
         ngx_fixture_flags74());
 
     runOfficialErrorCases(api, gpu, depth, motion, feature);
+    runRejectedOutputPreservation(api, gpu, feature, depth, motion);
 
     for (UINT frame = 0; frame < kNgxFrames; ++frame) {
         const std::uint8_t inputTag = static_cast<std::uint8_t>(92u + frame * 8u);
@@ -424,6 +459,98 @@ void runReleaseBeforeExecuteReplay(const NgxApi& api, Gpu& gpu,
         ngx_fixture_result_feature_not_found());
 }
 
+void runOffsetBackingPairs(const NgxApi& api, Gpu& gpu) {
+    std::vector<uint8_t> reference;
+    for (UINT variant = 0; variant < 4; ++variant) {
+        const UINT backing = variant ? 80 : 64;
+        const UINT baseX = variant ? 7 : 0, baseY = variant ? 9 : 0;
+        auto color = createTexture(gpu.device.Get(), backing, backing, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        std::vector<uint8_t> pixels(size_t(backing) * backing * 4, 255);
+        for (UINT y = 0; y < 64; ++y)
+            for (UINT x = 0; x < 64; ++x) {
+                auto* p = pixels.data() + (size_t(y + baseY) * backing + x + baseX) * 4;
+                p[0] = x < 32 ? 64 : 160; p[1] = 96; p[2] = y < 32 ? 80 : 128; p[3] = 255;
+            }
+        uploadTexture(gpu, color.Get(), pixels.data(), backing * 4, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        auto depth = createTexture(gpu.device.Get(), backing, backing, DXGI_FORMAT_R32_FLOAT,
+                                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        std::vector<float> depths(size_t(backing) * backing, 0);
+        for (UINT y = 0; y < 64; ++y)
+            std::fill_n(depths.data() + size_t(y + baseY) * backing + baseX, 64, 0.75f);
+        uploadTexture(gpu, depth.Get(), depths.data(), backing * sizeof(float), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const UINT motionBacking = variant == 2 ? 144 : backing;
+        const UINT motionActive = variant == 2 ? 128 : 64;
+        auto motion = createTexture(gpu.device.Get(), motionBacking, motionBacking, DXGI_FORMAT_R16G16_FLOAT,
+                                     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        std::vector<uint16_t> vectors(size_t(motionBacking) * motionBacking * 2, 0x3c00);
+        for (UINT y = 0; y < motionActive; ++y)
+            std::fill_n(vectors.data() + (size_t(y + baseY) * motionBacking + baseX) * 2, motionActive * 2, 0);
+        uploadTexture(gpu, motion.Get(), vectors.data(), motionBacking * 4, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        auto mask = createTexture(gpu.device.Get(), backing, backing, DXGI_FORMAT_R8_UNORM,
+                                   D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        std::vector<uint8_t> masks(size_t(backing) * backing, 255);
+        for (UINT y = 0; y < 64; ++y)
+            std::fill_n(masks.data() + size_t(y + baseY) * backing + baseX, 64, 0);
+        uploadTexture(gpu, mask.Get(), masks.data(), backing, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        auto* params = allocateParams(api);
+        ngx_fixture_set_create_flags74(params, 64, 64, 128, 128);
+        const UINT flags = variant == 2 ? (ngx_fixture_flags74() & ~2u) | 4u :
+                           variant == 3 ? ngx_fixture_flags74() | 32u : ngx_fixture_flags74();
+        ngx_fixture_set_create_options(params, flags, 1);
+        auto recording = gpu.makeRecording();
+        NVSDK_NGX_Handle* feature = nullptr;
+        checkNgxResult(api.create(recording.list.Get(), ngx_fixture_feature_supersampling(), params, &feature),
+                        ngx_fixture_result_success(), "offset pair create");
+        auto output = makeOutput(gpu, 1600);
+        ngx_fixture_set_frame_flags74(params, color.Get(), output.resource.Get(), depth.Get(), motion.Get(), 1);
+        ngx_fixture_set_frame_offsets(params, baseX, baseY, variant ? 3 : 0, variant ? 5 : 0);
+        ngx_fixture_set_frame_mask(params, mask.Get(), baseX, baseY);
+        if (variant == 3) ngx_fixture_set_frame_scalars(params, 1.0f, 1.0f);
+        transition(recording.list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        checkNgxResult(api.evaluate(recording.list.Get(), feature, params, nullptr), ngx_fixture_result_success(), "offset pair evaluate");
+        resetAndDestroyParams(api, params);
+        transition(recording.list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copyTextureToReadback(recording.list.Get(), output.resource.Get(), output.readback);
+        check(recording.list->Close(), "offset pair Close");
+        checkNgxResult(api.release(feature), ngx_fixture_result_success(), "offset feature release before submit");
+        gpu.executeAndWait(recording.list.Get());
+        D3D12_RANGE range{0, static_cast<SIZE_T>(output.readback.totalBytes)};
+        uint8_t* bytes = nullptr;
+        check(output.readback.buffer->Map(0, &range, reinterpret_cast<void**>(&bytes)), "offset pair Map");
+        std::vector<uint8_t> image(128 * 128 * 4);
+        const UINT ox = variant ? 3 : 0, oy = variant ? 5 : 0;
+        for (UINT y = 0; y < kOutputBacking; ++y)
+            for (UINT x = 0; x < kOutputBacking; ++x) {
+                const auto* p = bytes + output.readback.footprint.Offset + size_t(y) * output.readback.footprint.Footprint.RowPitch + x * 4;
+                if (x >= ox && x < ox + 128 && y >= oy && y < oy + 128)
+                    std::copy_n(p, 4, image.data() + (size_t(y - oy) * 128 + x - ox) * 4);
+                else if (!std::equal(output.sentinel.begin(), output.sentinel.end(), p))
+                    fail("NGX offset output padding modified");
+            }
+        output.readback.buffer->Unmap(0, nullptr);
+        if (!variant) reference = image;
+        else if (variant < 3) {
+            int maxDelta = 0;
+            for (size_t i = 0; i < image.size(); ++i)
+                maxDelta = std::max(maxDelta, std::abs(int(image[i]) - int(reference[i])));
+            if (maxDelta > 1) fail("NGX poison-backed offsets differ from tight input");
+            std::printf("OWNED_D3D12_NGX_BEHAVIOR_PASS case=offset_backing_pair max_byte_delta=%d sentinel=1 released_before_submit=1 highres_jittered=%u\n", maxDelta, variant == 2);
+        } else {
+            uint64_t rgbDifference = 0;
+            for (size_t i = 0; i < image.size(); ++i) {
+                if (i % 4 == 3 && image[i] != reference[i]) fail("NGX sharpening changed native-scaled alpha");
+                if (i % 4 != 3) rgbDifference += std::abs(int(image[i]) - int(reference[i]));
+            }
+            if (!rgbDifference) fail("NGX enabled sharpening was a no-op");
+            std::printf("OWNED_D3D12_NGX_BEHAVIOR_PASS case=sharpen_edge_alpha rgb_byte_delta_sum=%llu alpha_unchanged=1 sentinel=1\n",
+                        static_cast<unsigned long long>(rgbDifference));
+        }
+    }
+}
+
 int runNgxFixture() {
     printModulePath(L"d3d12.dll", "d3d12");
     requireOwnedBackend();
@@ -456,6 +583,7 @@ int runNgxFixture() {
     std::puts("OWNED_D3D12_NGX_FORMAT role=motion dxgi=34 zeros=1");
     std::puts("OWNED_D3D12_NGX_FORMAT role=depth dxgi=20 dsv_clear=1 reverse_depth=1");
 
+    runOffsetBackingPairs(api, gpu);
     runContinuousFrames(api, gpu, depth.Get(), motion.Get());
     runReleaseBeforeExecuteReplay(api, gpu, depth.Get(), motion.Get());
 

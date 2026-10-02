@@ -272,7 +272,7 @@ HRESULT CreateNativeDescriptor(WMT::Device device, const BuildInputs &inputs,
     WMT::Buffer convertedInstances, NativeDescriptor &result) {
   const bool topLevel = inputs.type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
   const uint32_t geometryCount = topLevel ? 0 : static_cast<uint32_t>(inputs.geometries.size());
-  auto descriptor = device.newAccelerationStructureDescriptor(topLevel, geometryCount);
+  auto descriptor = device.newMTL4AccelerationStructureDescriptor(topLevel, geometryCount);
   if (!descriptor)
     return E_OUTOFMEMORY;
   descriptor.setUsage(inputs.metalUsage);

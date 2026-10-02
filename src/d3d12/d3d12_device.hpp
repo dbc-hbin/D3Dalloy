@@ -18,6 +18,8 @@
 
 #pragma once
 #include "d3d12.h"
+#include "Metal4.hpp"
+#include "Metal4Pipeline.hpp"
 #include "d3d12_interfaces_ext.hpp"
 #include "d3d12_acceleration_structure.hpp"
 #include "d3d12_command_encoder.hpp"
@@ -186,8 +188,26 @@ public:
                           std::shared_ptr<DXMTPresentLatency> latency, bool restart, bool borrowed) = 0;
 };
 
-class MTLD3D12Resource : public ID3D12Resource {
+class MTLD3D12Resource : public ID3D12Resource2 {
 public:
+  // GetDesc() is the logical, normalized description, never the Metal backing description.
+  D3D12_MIP_REGION sampler_feedback_mip_region = {};
+
+  HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void **session) final {
+    if (!session)
+      return E_POINTER;
+    *session = nullptr;
+    return E_NOINTERFACE;
+  }
+
+  D3D12_RESOURCE_DESC1 *STDMETHODCALLTYPE GetDesc1(D3D12_RESOURCE_DESC1 *result) final {
+    D3D12_RESOURCE_DESC desc;
+    GetDesc(&desc);
+    *result = {desc.Dimension, desc.Alignment, desc.Width, desc.Height, desc.DepthOrArraySize,
+               desc.MipLevels, desc.Format, desc.SampleDesc, desc.Layout, desc.Flags, sampler_feedback_mip_region};
+    return result;
+  }
+
   const uint64_t owned_id = owned_graphics::NewObjectId();
   D3D12_RESOURCE_STATES owned_initial_state = D3D12_RESOURCE_STATE_COMMON;
   // Set by the ID3D12Device10 creation methods: the resource was created with an initial layout.
@@ -229,8 +249,15 @@ public:
   ) = 0;
 };
 
-class MTLD3D12Heap : public ID3D12Heap {
+class MTLD3D12Heap : public ID3D12Heap1 {
 public:
+  HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void **session) final {
+    if (!session)
+      return E_POINTER;
+    *session = nullptr;
+    return E_NOINTERFACE;
+  }
+
   WMT::Reference<WMT::Heap> heap;
   /* Shared heaps: placed resources alias `share->payload()` through no-copy buffers. */
   std::shared_ptr<sharing::SharedObject> share;
@@ -305,7 +332,9 @@ public:
   /**
    * The root qword holding the current view instance (SV_ViewID, view instancing) of a non-local signature,
    * after the parameters, the heap qwords and the root-view status qwords; `~0u` for a local signature.
-   * Included in UploadQwords. The command list writes it per replayed view; it is 0 otherwise.
+   * Included in UploadQwords. Low 32 bits are the logical view ID. ICB shader-owned view locations additionally
+   * use bits 32..47 for the effective viewport count and bits 48..63 for the render-target array length.
+   * Direct shaders truncate this qword to 32 bits; StageViewId clears the bounds outside an indirect replay.
    */
   uint32_t ViewIdQwordOffset = ~0u;
   static constexpr uint32_t kViewIdQwords = 1;
@@ -343,8 +372,8 @@ class MTLD3D12QueryHeap : public ID3D12QueryHeap {
 public:
   const uint64_t owned_id = owned_graphics::NewObjectId();
   D3D12_QUERY_HEAP_DESC desc{};
-  WMT::Reference<WMT::CounterSampleBuffer> timestamp_samples;
-  std::shared_ptr<owned_graphics::QueryTimestampProducers> timestamp_producers;
+  WMT::Reference<WMT::MTL4CounterHeap> timestamp_samples;
+
   WMT::Reference<WMT::Buffer> timestamp_dummy;
   WMT::Reference<WMT::Buffer> visibility_results;
   WMT::Reference<WMT::ComputePipelineState> binary_normalize_pipeline;
@@ -490,7 +519,7 @@ struct MeshPipelineVariant {
   WMT::Reference<WMT::RenderPipelineState> pso;
   ShaderImmutableConstants object_constants;
   ShaderImmutableConstants mesh_constants;
-  WMT::Reference<WMT::Function> replay_function;
+  WMT::Reference<WMT4::Function> replay_function;
   SM50_MSAA_VERTEX_LAYOUT vertex_layout{};
   SM50_MSAA_MESH_LAYOUT capture_layout{};
   SM50_MSAA_OBJECT_LAYOUT object_capture_layout{};
@@ -536,6 +565,10 @@ public:
   ShaderImmutableConstants fragment_constants;
   ShaderImmutableConstants pipeline_statistics_vertex_constants;
   ShaderImmutableConstants pipeline_statistics_fragment_constants;
+  // ICB view-location epilogues have their own immutable-constant layout, separate from direct variants.
+  ShaderImmutableConstants indirect_view_vertex_constants;
+  ShaderImmutableConstants indirect_view_index_pull_vertex_constants;
+  ShaderImmutableConstants indirect_view_pipeline_statistics_vertex_constants;
   uint32_t slot_mask = 0;
   enum WMTTriangleFillMode fill_mode;
   enum WMTCullMode cull_mode;
@@ -588,7 +621,8 @@ public:
    * The Metal pipeline a recorded indirect command buffer inherits.
    *
    * Direct draws use `pso` without the ICB capability. The indirect variant is
-   * built on first use from the same functions and immutable-buffer contract.
+   * built on first use. View-location variants apply offsets in their vertex epilogue rather than inheriting
+   * encoder viewMappings; their functions and immutable constants remain separate from the direct variant.
    * Null on failure; callers record an error instead of executing with a direct PSO.
    */
   virtual WMT::RenderPipelineState GetIndirectCommandBufferPipelineState() = 0;
@@ -673,6 +707,7 @@ public:
   virtual bool RegisterFenceOrder(const std::shared_ptr<owned_graphics::FenceOrderEpoch> &order) = 0;
 
   virtual WMT::Device GetMTLDevice() = 0;
+  virtual WMT4::Compiler GetMetal4Compiler() = 0;
   virtual bool SupportsCenterSamplePattern() const = 0;
 
   virtual D3D_FEATURE_LEVEL GetFeatureLevel() = 0;
@@ -865,7 +900,8 @@ HRESULT SamplerFeedbackAllocationInfo(MTLD3D12Device *pDevice, const sampler_fee
 
 HRESULT CreateSamplerFeedbackMap(
     MTLD3D12Device *pDevice, const D3D12_HEAP_PROPERTIES &HeapProps, D3D12_HEAP_FLAGS HeapFlags,
-    const D3D12_RESOURCE_DESC &Desc, const sampler_feedback::Layout &Layout, MTLD3D12Heap *pHeap, UINT64 HeapOffset,
+    const D3D12_RESOURCE_DESC &Desc, const D3D12_MIP_REGION &MipRegion, const sampler_feedback::Layout &Layout,
+    MTLD3D12Heap *pHeap, UINT64 HeapOffset,
     D3D12_RESOURCE_STATES InitialState, REFIID riid, void **ppResource
 );
 

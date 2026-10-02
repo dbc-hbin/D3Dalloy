@@ -1,6 +1,7 @@
 #include "com/com_guid.hpp"
 #include "com/com_pointer.hpp"
 #include "dxgi_options.hpp"
+#include "owned_budget_notification.hpp"
 #include "util_string.hpp"
 #include "log/log.hpp"
 #include "wsi_monitor.hpp"
@@ -26,7 +27,8 @@ LUID GetAdapterLuid(WMT::Device device) {
 class MTLDXGIAdapter : public MTLDXGIObject<IMTLDXGIAdapter> {
 public:
   MTLDXGIAdapter(WMT::Device device, IDXGIFactory *factory, Config &config)
-      : device_(device), factory_(factory), options_(config) {
+      : device_(device), factory_(factory), options_(config),
+        budget_notifications_(ReadBudget, this) {
     D3DKMT_OPENADAPTERFROMLUID open = {};
     open.AdapterLuid = GetAdapterLuid(device_);
     if (D3DKMTOpenAdapterFromLuid(&open))
@@ -36,6 +38,7 @@ public:
   };
 
   ~MTLDXGIAdapter() {
+    budget_notifications_.Stop();
     if (local_kmt_) {
       D3DKMT_CLOSEADAPTER close = {};
       close.hAdapter = local_kmt_;
@@ -225,12 +228,20 @@ public:
   HRESULT STDMETHODCALLTYPE
   RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE event,
                                                        DWORD *cookie) override {
-    assert(0 && "TODO");
+    if (!cookie)
+      return E_INVALIDARG;
+    *cookie = 0;
+    if (!event || event == INVALID_HANDLE_VALUE)
+      return E_INVALIDARG;
+
+    // Metal exposes no hardware content protection teardown notifications.
+    // Do not register, retain, or change the caller-owned event.
+    return DXGI_ERROR_UNSUPPORTED;
   }
 
   void STDMETHODCALLTYPE
-  UnregisterHardwareContentProtectionTeardownStatus(DWORD cookie) override {
-    assert(0 && "TODO");
+  UnregisterHardwareContentProtectionTeardownStatus(DWORD) override {
+    // No protection notification cookies are issued. Budget cookies are unrelated.
   }
 
   HRESULT STDMETHODCALLTYPE QueryVideoMemoryInfo(
@@ -244,7 +255,7 @@ public:
       return E_INVALIDARG;
 
     // we don't actually care about MemorySegmentGroup
-    pVideoMemoryInfo->Budget = device_.recommendedMaxWorkingSetSize();
+    pVideoMemoryInfo->Budget = budget_notifications_.QueryBudget();
     pVideoMemoryInfo->CurrentUsage = device_.currentAllocatedSize();
     pVideoMemoryInfo->AvailableForReservation = 0;
     pVideoMemoryInfo->CurrentReservation =
@@ -268,24 +279,28 @@ public:
 
   HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(
       HANDLE event, DWORD *cookie) override {
-    *cookie = 0;
-    return S_OK;
+    return budget_notifications_.Register(event, cookie);
   }
 
   void STDMETHODCALLTYPE
   UnregisterVideoMemoryBudgetChangeNotification(DWORD cookie) override {
-    // no op
+    budget_notifications_.Unregister(cookie);
   }
 
   WMT::Device STDMETHODCALLTYPE GetMTLDevice() final { return device_; }
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() final { return local_kmt_; }
 
 private:
+  static uint64_t ReadBudget(void *context) {
+    return static_cast<MTLDXGIAdapter *>(context)->device_.recommendedMaxWorkingSetSize();
+  }
+
   WMT::Reference<WMT::Device> device_;
   D3DKMT_HANDLE local_kmt_ = 0;
   Com<IDXGIFactory> factory_;
   DxgiOptions options_;
   uint64_t mem_reserved_[2] = {0, 0};
+  DxgiBudgetNotifications budget_notifications_;
 };
 
 Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,

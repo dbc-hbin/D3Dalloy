@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: MIT
+// Host-only adapter for the pinned MIT presentation sources.
+#include "sdk_backend.hpp"
+
+FfxApiResourceDescription ffxGetResourceDescriptionDX12(const ID3D12Resource* resource, FfxApiResourceUsage usage) {
+  return resource ? ffxApiGetResourceDX12(const_cast<ID3D12Resource*>(resource), 0, usage).description : FfxApiResourceDescription{};
+}
+FfxApiResource ffxGetResourceDX12(const ID3D12Resource* resource, FfxApiResourceDescription desc, const wchar_t*, uint32_t state) {
+  return {const_cast<ID3D12Resource*>(resource), desc, state};
+}
+DXGI_FORMAT ffxGetDX12FormatFromSurfaceFormat(FfxApiSurfaceFormat format) {
+  switch (format) {
+  case FFX_API_SURFACE_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_R32G32B32A32_FLOAT: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+  case FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+  case FFX_API_SURFACE_FORMAT_R32G32B32_FLOAT: return DXGI_FORMAT_R32G32B32_FLOAT;
+  case FFX_API_SURFACE_FORMAT_R32G32_FLOAT: return DXGI_FORMAT_R32G32_FLOAT;
+  case FFX_API_SURFACE_FORMAT_R8_UINT: return DXGI_FORMAT_R8_UINT;
+  case FFX_API_SURFACE_FORMAT_R32_UINT: return DXGI_FORMAT_R32_UINT;
+  case FFX_API_SURFACE_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+  case FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+  case FFX_API_SURFACE_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+  case FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+  case FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT: return DXGI_FORMAT_R11G11B10_FLOAT;
+  case FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM: return DXGI_FORMAT_R10G10B10A2_UNORM;
+  case FFX_API_SURFACE_FORMAT_R16G16_FLOAT: return DXGI_FORMAT_R16G16_FLOAT;
+  case FFX_API_SURFACE_FORMAT_R16G16_UINT: return DXGI_FORMAT_R16G16_UINT;
+  case FFX_API_SURFACE_FORMAT_R16G16_SINT: return DXGI_FORMAT_R16G16_SINT;
+  case FFX_API_SURFACE_FORMAT_R16_FLOAT: return DXGI_FORMAT_R16_FLOAT;
+  case FFX_API_SURFACE_FORMAT_R16_UINT: return DXGI_FORMAT_R16_UINT;
+  case FFX_API_SURFACE_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+  case FFX_API_SURFACE_FORMAT_R16_SNORM: return DXGI_FORMAT_R16_SNORM;
+  case FFX_API_SURFACE_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
+  case FFX_API_SURFACE_FORMAT_R8G8_UNORM: return DXGI_FORMAT_R8G8_UNORM;
+  case FFX_API_SURFACE_FORMAT_R8G8_UINT: return DXGI_FORMAT_R8G8_UINT;
+  case FFX_API_SURFACE_FORMAT_R32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+  case FFX_API_SURFACE_FORMAT_R9G9B9E5_SHAREDEXP: return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+  case FFX_API_SURFACE_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_TYPELESS;
+  case FFX_API_SURFACE_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_TYPELESS;
+  default: return DXGI_FORMAT_UNKNOWN;
+  }
+}
+D3D12_RESOURCE_STATES ffxGetDX12StateFromResourceState(FfxApiResourceState state) {
+  UINT bits = 0;
+  if (state & FFX_API_RESOURCE_STATE_UNORDERED_ACCESS) bits |= D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  if (state & FFX_API_RESOURCE_STATE_COMPUTE_READ) bits |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  if (state & FFX_API_RESOURCE_STATE_PIXEL_READ) bits |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  if (state & FFX_API_RESOURCE_STATE_COPY_SRC) bits |= D3D12_RESOURCE_STATE_COPY_SOURCE;
+  if (state & FFX_API_RESOURCE_STATE_COPY_DEST) bits |= D3D12_RESOURCE_STATE_COPY_DEST;
+  if (state & FFX_API_RESOURCE_STATE_INDIRECT_ARGUMENT) bits |= D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+  if (state & FFX_API_RESOURCE_STATE_RENDER_TARGET) bits |= D3D12_RESOURCE_STATE_RENDER_TARGET;
+  if (state & FFX_API_RESOURCE_STATE_DEPTH_ATTACHMENT) bits |= D3D12_RESOURCE_STATE_DEPTH_WRITE;
+  return static_cast<D3D12_RESOURCE_STATES>(bits);
+}
+FfxErrorCode ffxFrameInterpolationSwapchainGetGpuMemoryUsageDX12V2(FfxDevice device, FfxApiDimensions2D* display, FfxApiSurfaceFormat format, uint32_t count, FfxApiDimensions2D* ui, FfxApiSurfaceFormat uiFormat, uint32_t flags, FfxApiEffectMemoryUsage* usage) {
+  if (!device || !display || !ui || !usage || !display->width || !display->height || !count || count > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+    return FFX_ERROR_INVALID_ARGUMENT;
+  auto d = static_cast<ID3D12Device*>(device);
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = display->width; desc.Height = display->height;
+  desc.DepthOrArraySize = 1; desc.MipLevels = 1; desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  desc.Format = ffxGetDX12FormatFromSurfaceFormat(format);
+  if (desc.Format == DXGI_FORMAT_UNKNOWN) return FFX_ERROR_INVALID_ARGUMENT;
+  auto allocation = d->GetResourceAllocationInfo(0, 1, &desc);
+  if (allocation.SizeInBytes == UINT64_MAX) return FFX_ERROR_INVALID_ARGUMENT;
+  usage->totalUsageInBytes = allocation.SizeInBytes * (count + 2);
+  usage->aliasableUsageInBytes = 0;
+  if (uiFormat != FFX_API_SURFACE_FORMAT_UNKNOWN && (flags & FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING)) {
+    desc.Width = ui->width; desc.Height = ui->height; desc.Format = ffxGetDX12FormatFromSurfaceFormat(uiFormat);
+    allocation = d->GetResourceAllocationInfo(0, 1, &desc);
+    if (allocation.SizeInBytes == UINT64_MAX) return FFX_ERROR_INVALID_ARGUMENT;
+    usage->totalUsageInBytes += allocation.SizeInBytes;
+  }
+  return FFX_OK;
+}

@@ -127,6 +127,6 @@ struct WorkGraphDispatch {
 HRESULT CreateWorkGraphStateObject(MTLD3D12Device *device, const D3D12_STATE_OBJECT_DESC *desc,
                                  ID3D12StateObject *parent, REFIID riid, void **object);
 bool IsWorkGraphCollection(const D3D12_STATE_OBJECT_DESC *desc);
-HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::CommandQueue queue, const WorkGraphDispatch &dispatch);
+HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, const WorkGraphDispatch &dispatch);
 
 } // namespace dxmt

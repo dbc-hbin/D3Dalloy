@@ -23,6 +23,7 @@
 #include "d3d12_state_object.hpp"
 #include "d3d12_work_graph.hpp"
 #include "d3d12_temporal.hpp"
+#include "d3d12_frame_generation.hpp"
 #include "com/com_pointer.hpp"
 #include "dxil_raytracing.h"
 #include "dxmt_buffer.hpp"
@@ -268,7 +269,7 @@ to_metal_primitive_type(D3D12_PRIMITIVE_TOPOLOGY topo, WMTPrimitiveType &primiti
 
 // `Graphics`CommandList is a really confusing name
 class MTLD3D12GraphicsCommandListImpl
-    : public MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12GraphicsCommandListExt> {
+    : public MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12GraphicsCommandListExt, IMTLD3D12FrameGenerationCommandList> {
 
   Com<MTLD3D12CommandAllocatorImpl, false> allocator_;
   const D3D12_COMMAND_LIST_TYPE type_;
@@ -556,7 +557,7 @@ class MTLD3D12GraphicsCommandListImpl
     if (!pipeline_statistics_counters_allocated_) {
       constexpr size_t bytes = sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1);
       // The capture assembler also binds this as its unused ulong2 SO counter buffer.
-      if (!allocator_->CanAllocateGPUHeap(bytes, 16)) {
+      if (!allocator_->ReserveGPUHeap(bytes, 16)) {
         RecordError(E_OUTOFMEMORY);
         return {WMT::Buffer{}, 0};
       }
@@ -568,12 +569,12 @@ class MTLD3D12GraphicsCommandListImpl
       auto reset = allocator_->AllocatePass<QueryEncoderData>();
       reset->type = EncoderType::Query;
       reset->op = QueryEncoderOp::ResetPipelineStatistics;
-      reset->counters = allocator_->gpu_heap_buffer_;
-      reset->counters_offset = offset;
+      allocator_->BindGPUHeap(reset->counters, reset->counters_offset, offset);
       reset->record_bytes = bytes;
       allocator_->InvalidateCurrentPass();
     }
-    return {allocator_->gpu_heap_buffer_, pipeline_statistics_counters_offset_};
+    const auto allocation = allocator_->ResolveGPUHeap(pipeline_statistics_counters_offset_);
+    return {allocation.buffer, allocation.offset};
   }
 
   /*
@@ -599,7 +600,7 @@ class MTLD3D12GraphicsCommandListImpl
   SOStreamCounterBuffer() {
     if (!so_counters_allocated_) {
       constexpr size_t bytes = D3D12_SO_STREAM_COUNT * sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
-      if (!allocator_->CanAllocateGPUHeap(bytes, 16)) {
+      if (!allocator_->ReserveGPUHeap(bytes, 16)) {
         RecordError(E_OUTOFMEMORY);
         return {WMT::Buffer{}, 0};
       }
@@ -608,7 +609,8 @@ class MTLD3D12GraphicsCommandListImpl
       so_counters_offset_ = offset;
       so_counters_allocated_ = true;
     }
-    return {allocator_->gpu_heap_buffer_, so_counters_offset_};
+    const auto allocation = allocator_->ResolveGPUHeap(so_counters_offset_);
+    return {allocation.buffer, allocation.offset};
   }
 
   bool QueryObjectOwnedByThisDevice(ID3D12DeviceChild *object) {
@@ -898,34 +900,34 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
     auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
     if (!library)
       return false;
-    auto snapshot = library.newFunction("dxmt_snapshot_predicate");
-    auto arguments = library.newFunction("dxmt_predicate_arguments");
-    auto copy = library.newFunction("dxmt_predicate_copy_bytes");
-    auto mesh_indirect = library.newFunction("dxmt_mesh_indirect_arguments");
-    auto mesh_strip_cut = library.newFunction("dxmt_mesh_strip_cut");
-    auto tess_clear = library.newFunction("dxmt_tess_capture_clear");
-    auto tess_compact = library.newFunction("dxmt_tess_capture_compact");
+    auto snapshot = WMT4::Library(library).newFunction("dxmt_snapshot_predicate");
+    auto arguments = WMT4::Library(library).newFunction("dxmt_predicate_arguments");
+    auto copy = WMT4::Library(library).newFunction("dxmt_predicate_copy_bytes");
+    auto mesh_indirect = WMT4::Library(library).newFunction("dxmt_mesh_indirect_arguments");
+    auto mesh_strip_cut = WMT4::Library(library).newFunction("dxmt_mesh_strip_cut");
+    auto tess_clear = WMT4::Library(library).newFunction("dxmt_tess_capture_clear");
+    auto tess_compact = WMT4::Library(library).newFunction("dxmt_tess_capture_compact");
     if (!snapshot || !arguments || !copy || !mesh_indirect || !mesh_strip_cut || !tess_clear || !tess_compact)
       return false;
-    tess_capture_clear_pipeline_ = device_->GetMTLDevice().newComputePipelineState(tess_clear, error);
+    tess_capture_clear_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(tess_clear, error);
     if (!tess_capture_clear_pipeline_)
       return false;
-    tess_capture_compact_pipeline_ = device_->GetMTLDevice().newComputePipelineState(tess_compact, error);
+    tess_capture_compact_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(tess_compact, error);
     if (!tess_capture_compact_pipeline_)
       return false;
-    mesh_indirect_pipeline_ = device_->GetMTLDevice().newComputePipelineState(mesh_indirect, error);
+    mesh_indirect_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(mesh_indirect, error);
     if (!mesh_indirect_pipeline_)
       return false;
-    mesh_strip_cut_pipeline_ = device_->GetMTLDevice().newComputePipelineState(mesh_strip_cut, error);
+    mesh_strip_cut_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(mesh_strip_cut, error);
     if (!mesh_strip_cut_pipeline_)
       return false;
-    predication_snapshot_pipeline_ = device_->GetMTLDevice().newComputePipelineState(snapshot, error);
+    predication_snapshot_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(snapshot, error);
     if (!predication_snapshot_pipeline_)
       return false;
-    predication_arguments_pipeline_ = device_->GetMTLDevice().newComputePipelineState(arguments, error);
+    predication_arguments_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(arguments, error);
     if (!predication_arguments_pipeline_)
       return false;
-    predication_copy_pipeline_ = device_->GetMTLDevice().newComputePipelineState(copy, error);
+    predication_copy_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(copy, error);
     return bool(predication_copy_pipeline_);
   }
 
@@ -948,6 +950,13 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
     binding.type = WMTComputeCommandSetBuffer;
     binding.buffer = buffer;
     binding.offset = offset;
+    binding.index = index;
+  }
+
+  void BindGPUHeapPredicationBuffer(uint64_t offset, uint8_t index) {
+    auto &binding = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
+    binding.type = WMTComputeCommandSetBuffer;
+    allocator_->BindGPUHeap(binding.buffer, binding.offset, offset);
     binding.index = index;
   }
 
@@ -976,8 +985,12 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
       }
     }
     allocator_->clear_uav_.begin(zero, cells.buffer);
-    allocator_->clear_uav_.clear(0, 0, count, 1, predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
-                                 indirect_offset);
+    {
+              if (FAILED(recording_error_)) return;
+              const auto arguments = predication_enabled_ ? allocator_->ResolveGPUHeap(indirect_offset)
+                  : MTLD3D12CommandAllocatorImpl::GPUHeapAllocation{};
+              allocator_->clear_uav_.clear(0, 0, count, 1, arguments.buffer, arguments.offset);
+            };
     allocator_->clear_uav_.end();
   }
 
@@ -990,11 +1003,11 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
                                  const FeedbackTranscode &control) {
     auto &pipeline = feedback_transcode_pipelines_[encode];
     if (!pipeline) {
-      auto function = device_->GetLib().getLibrary().newFunction(encode ? "d3d12_feedback_encode"
+      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction(encode ? "d3d12_feedback_encode"
                                                                         : "d3d12_feedback_decode");
       WMT::Reference<WMT::Error> error;
       if (function)
-        pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
+        pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!pipeline) {
         RecordError(E_FAIL);
         return false;
@@ -1003,7 +1016,7 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
     const uint32_t texels = control.width * control.height;
     if (!texels)
       return true;
-    if (!allocator_->CanAllocateGPUHeap(sizeof(control), 16)) {
+    if (!allocator_->ReserveGPUHeap(sizeof(control), 16)) {
       RecordError(E_OUTOFMEMORY);
       return false;
     }
@@ -1021,12 +1034,11 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
     BeginPredicationComputePass(pipeline, 64);
     BindPredicationBuffer(encode ? bytes : cells, encode ? bytes_offset : 0, 0);
     BindPredicationBuffer(encode ? cells : bytes, encode ? 0 : bytes_offset, 1);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 2);
+    BindGPUHeapPredicationBuffer(control_offset, 2);
     if (predication_enabled_) {
       auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
       dispatch.type = WMTComputeCommandDispatchIndirect;
-      dispatch.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-      dispatch.indirect_args_offset = indirect_offset;
+      allocator_->BindGPUHeap(dispatch.indirect_args_buffer, dispatch.indirect_args_offset, indirect_offset);
     } else {
       auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
       dispatch.type = WMTComputeCommandDispatch;
@@ -1200,20 +1212,19 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
                        UINT width, UINT height, bool to_native_float) {
     auto &pipeline = to_native_float ? d24_upload_pipeline_ : d24_readback_pipeline_;
     if (!pipeline) {
-      auto function = device_->GetLib().getLibrary().newFunction(
-          to_native_float ? "d3d12_d24_to_float" : "d3d12_float_to_d24");
+      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction(to_native_float ? "d3d12_d24_to_float" : "d3d12_float_to_d24");
       if (!function) {
         RecordError(E_FAIL);
         return false;
       }
       WMT::Reference<WMT::Error> error;
-      pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
+      pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!pipeline) {
         RecordError(E_FAIL);
         return false;
       }
     }
-    if (!allocator_->CanAllocateGPUHeap(4 * sizeof(uint32_t), 16)) {
+    if (!allocator_->ReserveGPUHeap(4 * sizeof(uint32_t), 16)) {
       RecordError(E_OUTOFMEMORY);
       return false;
     }
@@ -1226,7 +1237,7 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
     BeginPredicationComputePass(pipeline, 64);
     BindPredicationBuffer(source, source_offset, 0);
     BindPredicationBuffer(destination, destination_offset, 1);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 2);
+    BindGPUHeapPredicationBuffer(control_offset, 2);
     auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
     dispatch.type = WMTComputeCommandDispatch;
     dispatch.size = {(uint64_t(width) * height + 63) / 64, 1, 1};
@@ -1247,19 +1258,19 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
     if (!pipeline) {
       const char *name = rgb ? (upload ? "d3d12_rgb32_expand" : "d3d12_rgb32_compact") :
                                (upload ? "d3d12_packed422_expand" : "d3d12_packed422_compact");
-      auto function = device_->GetLib().getLibrary().newFunction(name);
+      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction(name);
       if (!function) {
         RecordError(E_FAIL);
         return false;
       }
       WMT::Reference<WMT::Error> error;
-      pipeline = device_->GetMTLDevice().newComputePipelineState(function, error);
+      pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!pipeline) {
         RecordError(E_FAIL);
         return false;
       }
     }
-    if (!allocator_->CanAllocateGPUHeap(5 * sizeof(uint32_t), 16)) {
+    if (!allocator_->ReserveGPUHeap(5 * sizeof(uint32_t), 16)) {
       RecordError(E_OUTOFMEMORY);
       return false;
     }
@@ -1273,9 +1284,9 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
     BeginPredicationComputePass(pipeline, 64);
     BindPredicationBuffer(source, source_offset, 0);
     BindPredicationBuffer(destination, destination_offset, 1);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 2);
+    BindGPUHeapPredicationBuffer(control_offset, 2);
     if (!rgb)
-      BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset + 4 * sizeof(uint32_t), 3);
+      BindGPUHeapPredicationBuffer(control_offset + 4 * sizeof(uint32_t), 3);
     const uint64_t elements = uint64_t(rgb ? width : (width + 1) / 2) * height;
     auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
     dispatch.type = WMTComputeCommandDispatch;
@@ -1288,7 +1299,7 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
                                   uint64_t destination_offset, uint64_t byte_count) {
     while (byte_count) {
       const uint64_t chunk = std::min<uint64_t>(byte_count, UINT32_MAX);
-      if (!allocator_->CanAllocateGPUHeap(2 * sizeof(uint64_t), 8)) {
+      if (!allocator_->ReserveGPUHeap(2 * sizeof(uint64_t), 8)) {
         RecordError(E_OUTOFMEMORY);
         return;
       }
@@ -1297,8 +1308,8 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
       words[0] = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
       words[1] = chunk;
       BeginPredicationComputePass(predication_copy_pipeline_, 64);
-      BindPredicationBuffer(allocator_->gpu_heap_buffer_, predication_snapshot_offset_, 0);
-      BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 1);
+      BindGPUHeapPredicationBuffer(predication_snapshot_offset_, 0);
+      BindGPUHeapPredicationBuffer(control_offset, 1);
       BindPredicationBuffer(source, source_offset, 2);
       BindPredicationBuffer(destination, destination_offset, 3);
       auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
@@ -1312,8 +1323,10 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
   }
 
   uint64_t PreparePredicatedArguments(const void *arguments, UINT byte_count) {
-    if (!allocator_->CanAllocateGPUHeap(size_t(byte_count) * 2 + 32, 16))
+    if (!allocator_->ReserveGPUHeap(size_t(byte_count) * 2 + 32, 16)) {
+      RecordError(E_OUTOFMEMORY);
       return UINT64_MAX;
+    }
     auto [control, control_offset] = allocator_->AllocateGPUHeap(byte_count + 2 * sizeof(uint32_t), 16);
     auto [output, output_offset] = allocator_->AllocateGPUHeap(byte_count, 16);
     auto *words = static_cast<uint32_t *>(control);
@@ -1323,9 +1336,9 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
     memset(output, 0, byte_count);
 
     BeginPredicationComputePass(predication_arguments_pipeline_);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, predication_snapshot_offset_, 0);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 1);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, output_offset, 2);
+    BindGPUHeapPredicationBuffer(predication_snapshot_offset_, 0);
+    BindGPUHeapPredicationBuffer(control_offset, 1);
+    BindGPUHeapPredicationBuffer(output_offset, 2);
     DispatchPredicationKernel();
     return output_offset;
   }
@@ -1362,7 +1375,7 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
 
 public:
   MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type)
-      : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12GraphicsCommandListExt>(pDevice),
+      : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12GraphicsCommandListExt, IMTLD3D12FrameGenerationCommandList>(pDevice),
         type_(Type) {
     entry = nullptr;
     encoder_count = 0;
@@ -1517,6 +1530,11 @@ public:
 
     *ppvObject = nullptr;
 
+    if (riid == __uuidof(IMTLD3D12FrameGenerationCommandList)) {
+      *ppvObject = static_cast<IMTLD3D12FrameGenerationCommandList *>(this);
+      AddRef();
+      return S_OK;
+    }
     if (riid == __uuidof(IMTLD3D12GraphicsCommandListExt)) {
       *ppvObject = static_cast<IMTLD3D12GraphicsCommandListExt *>(this);
       AddRef();
@@ -1551,6 +1569,37 @@ public:
       return E_FAIL;
     return allocator_->type_ == D3D12_COMMAND_LIST_TYPE_DIRECT ||
            allocator_->type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE ? S_OK : E_INVALIDARG;
+  }
+
+  HRESULT STDMETHODCALLTYPE PrepareFrameGeneration(IMTLD3D12FrameGenerationState *state,
+      const MTL_FRAME_GENERATION_PREPARE_DESC *desc) final {
+    auto hr = ValidateRecording();
+    if (FAILED(hr)) return hr;
+    std::shared_ptr<OwnedFrameGenerationFrame> frame;
+    hr = PrepareOwnedFrameGenerationFrame(device_, state, desc, frame);
+    if (hr == S_FALSE) return S_OK;
+    if (FAILED(hr)) return hr;
+    allocator_->InvalidateCurrentPass();
+    auto pass = allocator_->AllocatePass<TemporalEncoderData>();
+    pass->type = EncoderType::Temporal;
+    pass->fg_frame = std::move(frame);
+    allocator_->InvalidateCurrentPass();
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE GenerateFrame(IMTLD3D12FrameGenerationState *state,
+      const MTL_FRAME_GENERATION_GENERATE_DESC *desc) final {
+    auto hr = ValidateRecording();
+    if (FAILED(hr)) return hr;
+    std::shared_ptr<OwnedFrameGenerationFrame> frame;
+    hr = GenerateOwnedFrameGenerationFrame(device_, state, desc, frame);
+    if (FAILED(hr)) return hr;
+    allocator_->InvalidateCurrentPass();
+    auto pass = allocator_->AllocatePass<TemporalEncoderData>();
+    pass->type = EncoderType::Temporal;
+    pass->fg_frame = std::move(frame);
+    allocator_->InvalidateCurrentPass();
+    return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE TemporalUpscale(IMTLD3D12TemporalUpscaleState *state,
@@ -1629,7 +1678,11 @@ public:
     };
     auto stride = align(sizeof(VERTEX_BUFFER_ENTRY) * max_slot, 16);
 
-    auto [mapped, offset] = allocator_->AllocateGPUHeap(stride * Count, 16);
+    auto [mapped, offset] = allocator_->AllocateGPUHeap(uint64_t(stride) * Count, 16);
+    if (!mapped) {
+      RecordError(E_OUTOFMEMORY);
+      return {UINT64_MAX, 0};
+    }
 
     for (unsigned i = 0; i < Count; i++) {
       auto *entries = reinterpret_cast<VERTEX_BUFFER_ENTRY *>(reinterpret_cast<char *>(mapped) + i * stride);
@@ -1953,8 +2006,7 @@ public:
       // DXMTGeometryDraw/TessellationMeshDraw only rebase the draw-argument binding.
       auto &arguments = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
       arguments.type = WMTRenderCommandSetObjectBuffer;
-      arguments.buffer = allocator_->gpu_heap_buffer_;
-      arguments.offset = 0;
+      allocator_->BindGPUHeap(arguments.buffer, arguments.offset, 0);
       arguments.index = SM50_BINDING_INDEX_DRAW_ARGUMENTS;
       // Attachment-free producers must not inherit raster depth tests/writes.
       // RecordMeshPixelReplay preserves the original PSO state for the consumer.
@@ -1963,13 +2015,17 @@ public:
     }
 
     if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
-      auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
-      cmd_setpso.type = WMTRenderCommandSetPSO;
-      cmd_setpso.pso = statistics ? pso_graphics_->GetPipelineStatisticsPipelineState(false)
-                                 : IndexPull ? pso_graphics_->GetIndexPullPipelineState(false) : pso_graphics_->pso;
-      if (!cmd_setpso.pso) {
-        RecordError(E_FAIL);
-        return DrawCallStatus::Invalid;
+      // MSAA producers replay only shader bindings; their capture and pixel
+      // variants are selected by RecordMSAADraw, never this direct raster PSO.
+      if (!RequiresMSAAExecution()) {
+        auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
+        cmd_setpso.type = WMTRenderCommandSetPSO;
+        cmd_setpso.pso = statistics ? pso_graphics_->GetPipelineStatisticsPipelineState(false)
+                                   : IndexPull ? pso_graphics_->GetIndexPullPipelineState(false) : pso_graphics_->pso;
+        if (!cmd_setpso.pso) {
+          RecordError(E_FAIL);
+          return DrawCallStatus::Invalid;
+        }
       }
       auto &retained = static_cast<RenderEncoderData *>(allocator_->encoder_current)->immutable_constant_buffers;
       for (auto [constants, command_type] : {
@@ -2009,6 +2065,8 @@ public:
     }
     if (dirty_state_.test(DirtyState::VertexBuffer) && !SkipResourceBinding) {
       auto [Offset, Stride] = PopulateVertexBufferTable(1);
+      if (Offset == UINT64_MAX)
+        return DrawCallStatus::Invalid;
       if (Stride) {
         // The object stage of GS/HS/DS pipelines pulls vertices from the same table.
         for (auto type : {WMTRenderCommandSetVertexBuffer, WMTRenderCommandSetObjectBuffer}) {
@@ -2016,8 +2074,7 @@ public:
             continue;
           auto &cmd_vsvb = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
           cmd_vsvb.type = type;
-          cmd_vsvb.buffer = allocator_->gpu_heap_buffer_;
-          cmd_vsvb.offset = Offset;
+          allocator_->BindGPUHeap(cmd_vsvb.buffer, cmd_vsvb.offset, Offset);
           cmd_vsvb.index = SM50_BINDING_INDEX_VERTEX_BUFFER;
         }
       }
@@ -2027,6 +2084,8 @@ public:
     if (dirty_state_.test(DirtyState::GraphicsRootArguments) && !SkipResourceBinding) {
       if (rootsig_graphics_) {
         auto Offset = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
+        if (Offset == UINT64_MAX)
+          return DrawCallStatus::Invalid;
         for (auto type : {WMTRenderCommandSetVertexBuffer, WMTRenderCommandSetFragmentBuffer,
                           WMTRenderCommandSetObjectBuffer, WMTRenderCommandSetMeshBuffer}) {
           // Object/mesh stages exist only on GS/HS/DS pipelines (and MSAA replay records none).
@@ -2034,8 +2093,7 @@ public:
             continue;
           auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
           binding.type = type;
-          binding.buffer = allocator_->gpu_heap_buffer_;
-          binding.offset = Offset;
+          allocator_->BindGPUHeap(binding.buffer, binding.offset, Offset);
           binding.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
         }
       }
@@ -2045,6 +2103,8 @@ public:
     if (dirty_state_.test(DirtyState::GraphicsRootSignature) && !SkipResourceBinding) {
       if (rootsig_graphics_) {
         auto Offset = EncodeStaticSamplers(rootsig_graphics_.ptr());
+        if (Offset == UINT64_MAX)
+          return DrawCallStatus::Invalid;
         for (auto type : {WMTRenderCommandSetVertexBuffer, WMTRenderCommandSetFragmentBuffer,
                           WMTRenderCommandSetObjectBuffer, WMTRenderCommandSetMeshBuffer}) {
           // Object/mesh stages exist only on GS/HS/DS pipelines (and MSAA replay records none).
@@ -2052,8 +2112,7 @@ public:
             continue;
           auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
           binding.type = type;
-          binding.buffer = allocator_->gpu_heap_buffer_;
-          binding.offset = Offset;
+          allocator_->BindGPUHeap(binding.buffer, binding.offset, Offset);
           binding.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
         }
       }
@@ -2155,13 +2214,12 @@ public:
       return true;
     WMT::Reference<WMT::Error> error;
     auto library = device_->GetLib().getLibrary();
-    auto metal = device_->GetMTLDevice();
     if (!so_assemble_pipeline_)
-      so_assemble_pipeline_ = metal.newComputePipelineState(library.newFunction("so_assemble"), error);
+      so_assemble_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction("so_assemble"), error);
     if (!so_positions_pipeline_)
-      so_positions_pipeline_ = metal.newComputePipelineState(library.newFunction("so_index_positions"), error);
+      so_positions_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction("so_index_positions"), error);
     if (indirect && !so_indirect_preflight_pipeline_)
-      so_indirect_preflight_pipeline_ = metal.newComputePipelineState(library.newFunction("so_indirect_preflight"), error);
+      so_indirect_preflight_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction("so_indirect_preflight"), error);
     return so_assemble_pipeline_ && so_positions_pipeline_ && (!indirect || so_indirect_preflight_pipeline_);
   }
 
@@ -2212,13 +2270,17 @@ public:
       return false;
     }
     auto [counters, counters_offset] = msaa_only_indirect
-        ? std::tuple<WMT::Buffer, uint64_t>{allocator_->gpu_heap_buffer_, 0}
+        ? std::tuple<WMT::Buffer, uint64_t>{allocator_->ResolveGPUHeap(0).buffer, 0}
         : layout.active || !statistics ? SOStreamCounterBuffer() : PipelineStatisticsCounterBuffer();
     if (!counters)
       return false;
+    auto [statistics_buffer, statistics_offset] = statistics ? PipelineStatisticsCounterBuffer()
+        : std::tuple<WMT::Buffer, uint64_t>{WMT::Buffer{}, 0};
+    if (statistics && !statistics_buffer)
+      return false;
     const size_t kExtra = sizeof(StreamOutputAssemblyParams) +
                           (Indirect ? 0 : sizeof(SM50_SO_CAPTURE_CONTROL) + 16 + 64);
-    if (!allocator_->CanAllocateGPUHeap(kExtra, 16)) {
+    if (!allocator_->ReserveGPUHeap(kExtra, 16)) {
       RecordError(E_OUTOFMEMORY);
       return false;
     }
@@ -2270,11 +2332,8 @@ public:
       params->cull_mask = statistics_layout.cull_mask;
       params->rasterization_enabled = statistics_layout.rasterization_enabled;
       params->depth_clip_enabled = pso_graphics_->depth_clip_mode == WMTDepthClipModeClip;
-      auto [buffer, offset] = PipelineStatisticsCounterBuffer();
-      if (!buffer)
-        return false;
-      draw->statistics_heap = buffer;
-      draw->statistics_offset = offset;
+      draw->statistics_heap = statistics_buffer;
+      draw->statistics_offset = statistics_offset;
     }
     params->element_count = uint32_t(layout.elements.size());
     params->referenced_mask = layout.streams[0].referenced_slot_mask;
@@ -2298,12 +2357,14 @@ public:
     }
     draw->assemble_pipeline = so_assemble_pipeline_;
     draw->positions_pipeline = so_positions_pipeline_;
-    draw->heap = allocator_->gpu_heap_buffer_;
-    draw->counters_heap = allocator_->gpu_heap_buffer_;
-    draw->predicate_heap = allocator_->gpu_heap_buffer_;
-    draw->params_offset = params_offset;
+    allocator_->BindGPUHeap(draw->heap, draw->params_offset, params_offset);
+    draw->params_cpu = params;
+    draw->counters_heap = counters;
     draw->counters_offset = counters_offset;
-    draw->predicate_offset = predication_enabled_ ? predication_snapshot_offset_ : counters_offset;
+    draw->predicate_heap = counters;
+    draw->predicate_offset = counters_offset;
+    if (predication_enabled_)
+      allocator_->BindGPUHeap(draw->predicate_heap, draw->predicate_offset, predication_snapshot_offset_);
     draw->indexed = Indexed;
     if (Indirect) {
       so_pending_ = std::move(draw);
@@ -2326,8 +2387,8 @@ public:
       control->base_vertex = BaseVertexLocation;
     }
     draw->index_buffer = Indexed ? index_buffer : WMT::Buffer{};
-    draw->control_offset = control_offset;
-    draw->status_offset = status_offset;
+    draw->control_offset = allocator_->ResolveGPUHeap(control_offset).offset;
+    draw->status_offset = allocator_->ResolveGPUHeap(status_offset).offset;
     draw->claims_offset = records * record_dwords * sizeof(uint32_t);
     draw->claims_bytes = records * sizeof(uint32_t);
     draw->vertex_count = VertexCount;
@@ -2351,7 +2412,7 @@ public:
     if (!so_assemble_gs_pipeline_) {
       WMT::Reference<WMT::Error> error;
       so_assemble_gs_pipeline_ =
-          metal.newComputePipelineState(device_->GetLib().getLibrary().newFunction("so_assemble_gs"), error);
+          device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(device_->GetLib().getLibrary()).newFunction("so_assemble_gs"), error);
       if (!so_assemble_gs_pipeline_) {
         RecordError(E_FAIL);
         return false;
@@ -2382,13 +2443,13 @@ public:
     const uint64_t scratch_bytes = keys * key_dwords * sizeof(uint32_t);
     const size_t extra = stream_count * (sizeof(StreamOutputAssemblyParams) + 16 + 16) +
                          sizeof(SM50_SO_CAPTURE_CONTROL) + 64;
-    if (!allocator_->CanAllocateGPUHeap(extra, 16)) {
-      RecordError(E_OUTOFMEMORY);
-      return false;
-    }
     auto [counters, counters_offset] = SOStreamCounterBuffer();
     if (!counters)
       return false;
+    if (!allocator_->ReserveGPUHeap(extra, 16)) {
+      RecordError(E_OUTOFMEMORY);
+      return false;
+    }
     WMTBufferInfo info{};
     info.length = std::max<uint64_t>(scratch_bytes, sizeof(uint32_t));
     info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
@@ -2443,14 +2504,16 @@ public:
       memset(status_memory, 0, 16);
       draw->scratch = scratch;
       draw->assemble_pipeline = so_assemble_gs_pipeline_;
-      draw->heap = allocator_->gpu_heap_buffer_;
-      draw->counters_heap = allocator_->gpu_heap_buffer_;
-      draw->predicate_heap = allocator_->gpu_heap_buffer_;
-      draw->params_offset = params_offset;
-      draw->control_offset = control_offset;
+      allocator_->BindGPUHeap(draw->heap, draw->params_offset, params_offset);
+      draw->params_cpu = params;
+      draw->counters_heap = counters;
+      draw->predicate_heap = counters;
+      draw->control_offset = allocator_->ResolveGPUHeap(control_offset).offset;
       draw->counters_offset = counters_offset + uint64_t(s) * sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
-      draw->predicate_offset = predication_enabled_ ? predication_snapshot_offset_ : counters_offset;
-      draw->status_offset = status_offset;
+      draw->predicate_offset = counters_offset;
+      if (predication_enabled_)
+        allocator_->BindGPUHeap(draw->predicate_heap, draw->predicate_offset, predication_snapshot_offset_);
+      draw->status_offset = allocator_->ResolveGPUHeap(status_offset).offset;
       draw->status_cpu = static_cast<const uint32_t *>(status_memory);
       draw->stream = s;
       draw->scratch_prefix_dwords = prefix_dwords;
@@ -2539,8 +2602,7 @@ public:
     }
     if (!msaa_assembly_pipeline_) {
       WMT::Reference<WMT::Error> error;
-      msaa_assembly_pipeline_ = device_->GetMTLDevice().newComputePipelineState(
-          device_->GetLib().getLibrary().newFunction("msaa_assemble_primitives"), error);
+      msaa_assembly_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_assemble_primitives"), error);
       if (!msaa_assembly_pipeline_) {
         RecordError(E_FAIL);
         return false;
@@ -2548,8 +2610,7 @@ public:
     }
     if (!msaa_bounds_pipeline_) {
       WMT::Reference<WMT::Error> error;
-      msaa_bounds_pipeline_ = device_->GetMTLDevice().newComputePipelineState(
-          device_->GetLib().getLibrary().newFunction("msaa_primitive_bounds"), error);
+      msaa_bounds_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_primitive_bounds"), error);
       if (!msaa_bounds_pipeline_) {
         RecordError(E_FAIL);
         return false;
@@ -2621,8 +2682,8 @@ public:
     draw->no_depth_stencil = device_->default_depth_stencil_state;
     draw->index_buffer = indexed ? index_buffer : WMT::Buffer{};
     draw->index_offset = indexed ? index_offset + uint64_t(start_vertex) * (index_type == WMTIndexTypeUInt32 ? 4 : 2) : 0;
-    draw->predicate_buffer = predication_enabled_ ? WMT::Buffer(allocator_->gpu_heap_buffer_) : WMT::Buffer{};
-    draw->predicate_offset = predication_snapshot_offset_;
+    if (predication_enabled_)
+      allocator_->BindGPUHeap(draw->predicate_buffer, draw->predicate_offset, predication_snapshot_offset_);
     draw->stream_output = render->so_draws.empty() ? nullptr : render->so_draws.back();
     draw->pixel_layout = variants->layout;
     draw->vertex_layout = variants->vertex_layout;
@@ -2757,8 +2818,7 @@ public:
       auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indirect>();
       cmd_draw.type = WMTRenderCommandDrawIndirect;
       cmd_draw.primitive_type = primitive_type;
-      cmd_draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-      cmd_draw.indirect_args_offset = predicated_offset;
+      allocator_->BindGPUHeap(cmd_draw.indirect_args_buffer, cmd_draw.indirect_args_offset, predicated_offset);
     } else {
       auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
       cmd_draw.type = WMTRenderCommandDraw;
@@ -2833,7 +2893,7 @@ public:
     const uint64_t header_bytes = uint64_t(slots) * sizeof(SM50_STATISTICS_CLAIM_HEADER);
     const uint64_t entry_bytes = std::max<uint64_t>(uint64_t(width) * height * layers * samples * 16, 16);
     if (header_bytes + entry_bytes > device_->GetMTLDevice().maxBufferLength() ||
-        header_bytes / 4 > uint64_t(INT32_MAX) || !allocator_->CanAllocateGPUHeap(header_bytes, 16)) {
+        header_bytes / 4 > uint64_t(INT32_MAX) || !allocator_->ReserveGPUHeap(header_bytes, 16)) {
       ERR("Pipeline statistics: the claim buffer of a ", width, "x", height, "x", layers, " target exceeds the limit");
       RecordError(E_OUTOFMEMORY);
       return false;
@@ -2856,8 +2916,7 @@ public:
     }
     auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
     copy.type = WMTBlitCommandCopyFromBufferToBuffer;
-    copy.src = allocator_->gpu_heap_buffer_;
-    copy.src_offset = headers_offset;
+    allocator_->BindGPUHeap(copy.src, copy.src_offset, headers_offset);
     copy.dst = buffer;
     copy.dst_offset = offset;
     copy.copy_length = header_bytes;
@@ -2919,7 +2978,7 @@ public:
       uint32_t start_instance, index_skip, predicate_enabled, predicate_not_equal, statistics_enabled, per_group;
       uint32_t cut_enabled;
     };
-    if (!allocator_->CanAllocateGPUHeap(sizeof(Control) + 64 + 16, 16)) {
+    if (!allocator_->ReserveGPUHeap(sizeof(Control) + 64 + 16, 16)) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
@@ -2945,8 +3004,9 @@ public:
     control->predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
     control->statistics_enabled = statistics;
     control->per_group = increment;
-    WMT::Buffer statistics_buffer = allocator_->gpu_heap_buffer_;
-    uint64_t statistics_offset = control_offset;
+    const auto control_binding = allocator_->ResolveGPUHeap(control_offset);
+    WMT::Buffer statistics_buffer = control_binding.buffer;
+    uint64_t statistics_offset = control_binding.offset;
     if (statistics) {
       auto [buffer, offset] = PipelineStatisticsCounterBuffer();
       if (!buffer)
@@ -2955,13 +3015,12 @@ public:
       statistics_offset = offset;
     }
     BeginPredicationComputePass(mesh_strip_cut_pipeline_, 1);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 0);
-    BindPredicationBuffer(indexed ? index_buffer : allocator_->gpu_heap_buffer_, first & ~uint64_t(3), 1);
+    BindGPUHeapPredicationBuffer(control_offset, 0);
+    BindPredicationBuffer(indexed ? index_buffer : control_binding.buffer, indexed ? first & ~uint64_t(3) : 0, 1);
     BindPredicationBuffer(list, list_offset, 2);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, arguments_offset, 3);
+    BindGPUHeapPredicationBuffer(arguments_offset, 3);
     BindPredicationBuffer(statistics_buffer, statistics_offset, 4);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_,
-                          predication_enabled_ ? predication_snapshot_offset_ : control_offset, 5);
+    BindGPUHeapPredicationBuffer(predication_enabled_ ? predication_snapshot_offset_ : control_offset, 5);
     DispatchPredicationKernel();
 
     const bool stream_output = pso_graphics_->stream_output.active;
@@ -2986,11 +3045,9 @@ public:
     cmd.type = WMTRenderCommandDXMTGeometryDrawIndexedIndirect;
     cmd.index_buffer = list;
     cmd.index_buffer_offset = list_offset;
-    cmd.imm_draw_arguments = allocator_->gpu_heap_buffer_;
-    cmd.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-    cmd.indirect_args_offset = arguments_offset;
-    cmd.dispatch_args_buffer = allocator_->gpu_heap_buffer_;
-    cmd.dispatch_args_offset = arguments_offset + 8 * sizeof(uint32_t);
+    allocator_->BindGPUHeap(cmd.indirect_args_buffer, cmd.indirect_args_offset, arguments_offset);
+    cmd.imm_draw_arguments = cmd.indirect_args_buffer;
+    allocator_->BindGPUHeap(cmd.dispatch_args_buffer, cmd.dispatch_args_offset, arguments_offset + 8 * sizeof(uint32_t));
     cmd.vertex_per_warp = vertex_per_warp;
     if (capture_pixels) RecordMeshPixelReplay(key, count, instances);
   }
@@ -3031,7 +3088,7 @@ public:
       uint32_t slot_count, max_primitives, per_group, reserved;
     };
     const size_t heap_bytes = sizeof(SM50_TESS_CAPTURE_CONTROL) + sizeof(CompactControl) + 16 + argument_size + 64;
-    if (!allocator_->CanAllocateGPUHeap(heap_bytes, 16)) {
+    if (!allocator_->ReserveGPUHeap(heap_bytes, 16)) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
@@ -3053,7 +3110,7 @@ public:
 
     // Zero the per-slot primitive counts: slots without a workload keep 0.
     BeginPredicationComputePass(tess_capture_clear_pipeline_, 64);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, compact_offset, 0);
+    BindGPUHeapPredicationBuffer(compact_offset, 0);
     BindPredicationBuffer(scratch, scratch_offset, 1);
     {
       auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
@@ -3065,8 +3122,9 @@ public:
     // Pass 1: VS+HS object, DS capture mesh.
     if (PreDraw(false, false, MeshVariantKey(format, false, statistics)) == DrawCallStatus::Invalid)
       return;
+    const auto capture_binding = allocator_->ResolveGPUHeap(capture_offset);
     const std::pair<WMT::Buffer, uint64_t> pass1[] = {{scratch, scratch_offset},
-                                                      {allocator_->gpu_heap_buffer_, capture_offset}};
+                                                      {capture_binding.buffer, capture_binding.offset}};
     const uint8_t pass1_indices[] = {SM50_BINDING_INDEX_TESS_CAPTURE, SM50_BINDING_INDEX_TESS_CAPTURE_CONTROL};
     for (uint32_t i = 0; i < 2; i++) {
       auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
@@ -3100,10 +3158,10 @@ public:
 
     // Compaction: flat primitive list in D3D order and the GS object grid.
     BeginPredicationComputePass(tess_capture_compact_pipeline_, 1024);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, compact_offset, 0);
+    BindGPUHeapPredicationBuffer(compact_offset, 0);
     BindPredicationBuffer(scratch, scratch_offset, 1);
     BindPredicationBuffer(list, list_offset, 2);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, dispatch_offset, 3);
+    BindGPUHeapPredicationBuffer(dispatch_offset, 3);
     DispatchPredicationKernel();
 
     // Pass 2: capture-fetching object, GS mesh. Primitive ids of the flat list bound the stream-output keys.
@@ -3119,7 +3177,7 @@ public:
       return;
     BindStatisticsClaim(0);
     const std::pair<WMT::Buffer, uint64_t> pass2[] = {
-        {scratch, scratch_offset}, {list, list_offset}, {allocator_->gpu_heap_buffer_, capture_offset}};
+        {scratch, scratch_offset}, {list, list_offset}, {capture_binding.buffer, capture_binding.offset}};
     const uint8_t pass2_indices[] = {SM50_BINDING_INDEX_TESS_CAPTURE, SM50_BINDING_INDEX_TESS_CAPTURE_LIST,
                                      SM50_BINDING_INDEX_TESS_CAPTURE_CONTROL};
     for (uint32_t i = 0; i < 3; i++) {
@@ -3133,8 +3191,7 @@ public:
       return;
     auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups_indirect>();
     draw.type = WMTRenderCommandDrawMeshThreadgroupsIndirect;
-    draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-    draw.indirect_args_offset = dispatch_offset;
+    allocator_->BindGPUHeap(draw.indirect_args_buffer, draw.indirect_args_offset, dispatch_offset);
     draw.object_threadgroup_size = {32, 1, 1};
     draw.mesh_threadgroup_size = {1, 1, 1};
     owned_graphics::Trace("draw_mesh", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
@@ -3238,7 +3295,7 @@ public:
     if (stream_output && !BindGeometryStreamOutput())
       return;
     if (!predication_enabled_) {
-      if (!allocator_->CanAllocateGPUHeap(argument_size, 16)) {
+      if (!allocator_->ReserveGPUHeap(argument_size, 16)) {
         RecordError(E_OUTOFMEMORY);
         return;
       }
@@ -3372,7 +3429,7 @@ public:
       return;
     }
     if (pull_indices) {
-      if (!index_buffer || !allocator_->CanAllocateGPUHeap(sizeof(SM50_INDEX_PULL_CONTROL), 16)) {
+      if (!index_buffer || !allocator_->ReserveGPUHeap(sizeof(SM50_INDEX_PULL_CONTROL), 16)) {
         RecordError(index_buffer ? E_OUTOFMEMORY : E_INVALIDARG);
         return;
       }
@@ -3380,9 +3437,10 @@ public:
       const uint64_t first = index_offset + uint64_t(StartVertexLocation) * index_size;
       auto [memory, offset] = allocator_->AllocateGPUHeap(sizeof(SM50_INDEX_PULL_CONTROL), 16);
       new (memory) SM50_INDEX_PULL_CONTROL{index_size, uint32_t((first & 3) / 2), BaseVertexLocation, 0};
+      const auto control_binding = allocator_->ResolveGPUHeap(offset);
       for (auto [buffer, byte_offset, slot] : {
                std::tuple{index_buffer, first & ~uint64_t(3), uint32_t(SM50_BINDING_INDEX_VERTEX_INDICES)},
-               std::tuple{WMT::Buffer(allocator_->gpu_heap_buffer_), uint64_t(offset),
+               std::tuple{control_binding.buffer, control_binding.offset,
                           uint32_t(SM50_BINDING_INDEX_VERTEX_INDEX_CONTROL)}}) {
         auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
         binding.type = WMTRenderCommandSetVertexBuffer;
@@ -3394,8 +3452,7 @@ public:
         auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indirect>();
         draw.type = WMTRenderCommandDrawIndirect;
         draw.primitive_type = primitive_type;
-        draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-        draw.indirect_args_offset = predicated_offset;
+        allocator_->BindGPUHeap(draw.indirect_args_buffer, draw.indirect_args_offset, predicated_offset);
       } else {
         auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
         draw.type = WMTRenderCommandDraw;
@@ -3423,8 +3480,7 @@ public:
       cmd_draw.index_type = draw_index_type;
       cmd_draw.index_buffer = draw_index_buffer;
       cmd_draw.index_buffer_offset = stream_output ? 0 : index_offset;
-      cmd_draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-      cmd_draw.indirect_args_offset = predicated_offset;
+      allocator_->BindGPUHeap(cmd_draw.indirect_args_buffer, cmd_draw.indirect_args_offset, predicated_offset);
     } else {
       auto &cmd_draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indexed>();
       cmd_draw.type = WMTRenderCommandDrawIndexed;
@@ -3444,7 +3500,13 @@ public:
 
   uint64_t
   EncodeRootArgument(MTLD3D12RootSignature *pRootSig, uint64_t const *pStaging, UINT Count = 1) {
-    auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t) * pRootSig->UploadQwords * Count, 64);
+    if (!pRootSig->UploadQwords || !Count)
+      return 0;
+    auto [Ptr, Offset] = allocator_->AllocateGPUHeap(uint64_t(sizeof(uint64_t)) * pRootSig->UploadQwords * Count, 64);
+    if (!Ptr) {
+      RecordError(E_OUTOFMEMORY);
+      return UINT64_MAX;
+    }
     for (unsigned i = 0; i < Count; i++)
       memcpy(
           reinterpret_cast<uint64_t *>(Ptr) + i * pRootSig->UploadQwords, pStaging,
@@ -3455,8 +3517,14 @@ public:
 
   uint64_t
   EncodeStaticSamplers(MTLD3D12RootSignature *pRootSig) {
-    auto static_sampler_encode_size = sizeof(uint64_t) * pRootSig->NumStaticSamplers * 4;
+    const uint64_t static_sampler_encode_size = uint64_t(sizeof(uint64_t)) * pRootSig->NumStaticSamplers * 4;
+    if (!static_sampler_encode_size)
+      return 0;
     auto [Ptr, Offset] = allocator_->AllocateGPUHeap(static_sampler_encode_size, 64);
+    if (!Ptr) {
+      RecordError(E_OUTOFMEMORY);
+      return UINT64_MAX;
+    }
     memcpy(Ptr, pRootSig->EncodedStaticSamplers, static_sampler_encode_size);
     return Offset;
   }
@@ -3516,10 +3584,11 @@ public:
     if (dirty_state_.test(DirtyState::ComputeRootArguments) && !SkipResourceBinding) {
       if (rootsig_compute_) {
         auto Offset = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_);
+        if (Offset == UINT64_MAX)
+          return false;
         auto &cmd_argbuf = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         cmd_argbuf.type = WMTComputeCommandSetBuffer;
-        cmd_argbuf.buffer = allocator_->gpu_heap_buffer_;
-        cmd_argbuf.offset = Offset;
+        allocator_->BindGPUHeap(cmd_argbuf.buffer, cmd_argbuf.offset, Offset);
         cmd_argbuf.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
       }
       dirty_state_.clr(DirtyState::ComputeRootArguments);
@@ -3528,10 +3597,11 @@ public:
     if (dirty_state_.test(DirtyState::ComputeRootSignature) && !SkipResourceBinding) {
       if (rootsig_compute_) {
         auto Offset = EncodeStaticSamplers(rootsig_compute_.ptr());
+        if (Offset == UINT64_MAX)
+          return false;
         auto &cmd_argbuf = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         cmd_argbuf.type = WMTComputeCommandSetBuffer;
-        cmd_argbuf.buffer = allocator_->gpu_heap_buffer_;
-        cmd_argbuf.offset = Offset;
+        allocator_->BindGPUHeap(cmd_argbuf.buffer, cmd_argbuf.offset, Offset);
         cmd_argbuf.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
       }
       dirty_state_.clr(DirtyState::ComputeRootSignature);
@@ -3569,8 +3639,7 @@ public:
     if (predication_enabled_) {
       auto &cmd_dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
       cmd_dispatch.type = WMTComputeCommandDispatchIndirect;
-      cmd_dispatch.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-      cmd_dispatch.indirect_args_offset = predicated_offset;
+      allocator_->BindGPUHeap(cmd_dispatch.indirect_args_buffer, cmd_dispatch.indirect_args_offset, predicated_offset);
     } else {
       auto &cmd_dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
       cmd_dispatch.type = WMTComputeCommandDispatch;
@@ -3760,10 +3829,19 @@ public:
       dst_extent = GetResourceExtent(dst_desc, dst_level);
     }
 
-    /* The block-alignment rule lets a box end on a partial block when that end
-     * is the logical edge of the region being copied. A texture location's edge
-     * is its mip extent; a buffer location's declared extent is padded to the
-     * copy pitch, so its edge is the end of the copy region instead. */
+    const D3D12_BOX src_logical_extent = full_src_box;
+    const D3D12_BOX dst_logical_extent = dst_extent;
+    // D3D12 boxes address physical BC blocks; Metal textures keep logical sizes.
+    if (src_block_width == 4 && src_block_height == 4) {
+      full_src_box.right = (full_src_box.right + 3) & ~3u;
+      full_src_box.bottom = (full_src_box.bottom + 3) & ~3u;
+    }
+    if (dst_block_width == 4 && dst_block_height == 4) {
+      dst_extent.right = (dst_extent.right + 3) & ~3u;
+      dst_extent.bottom = (dst_extent.bottom + 3) & ~3u;
+    }
+
+    // Packed formats retain their existing logical-edge alignment rule.
     D3D12_BOX src_edge_extent = full_src_box;
     D3D12_BOX dst_edge_extent = dst_extent;
     if (pSrcBox) {
@@ -3772,13 +3850,8 @@ public:
         pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ||
         pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT
     ) {
-      /* A null source box copies the region the two locations share: it starts
-       * at the source origin and ends where either location ends. A placed
-       * footprint declares the extent GetCopyableFootprints padded to the copy
-       * pitch, so a block-compressed tail mip has a footprint extent (4x4) wider
-       * than the mip it holds (2x2). Copying that padded extent would reject a
-       * valid tail copy and ask Metal for more texels than the destination level
-       * holds. */
+      // Copy the shared physical block region, then clamp each native texture
+      // transfer independently below (also covers BC tail mips).
       src_box = OverlapBox(full_src_box, dst_extent, DstX, DstY, DstZ);
       if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
         src_edge_extent = src_box;
@@ -3813,6 +3886,19 @@ public:
     const DXGI_FORMAT src_copy_format = pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
         ? src_desc.Format
         : pSrc->PlacedFootprint.Footprint.Format;
+    WMTSize source_size{src_box.right - src_box.left, src_box.bottom - src_box.top,
+                        src_box.back - src_box.front};
+    WMTSize destination_size = source_size;
+    if (src_block_width == 4 && src_block_height == 4) {
+      if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+        source_size.width = std::min<UINT64>(source_size.width, src_logical_extent.right - src_box.left);
+        source_size.height = std::min<UINT64>(source_size.height, src_logical_extent.bottom - src_box.top);
+      }
+      if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+        destination_size.width = std::min<UINT64>(destination_size.width, dst_logical_extent.right - DstX);
+        destination_size.height = std::min<UINT64>(destination_size.height, dst_logical_extent.bottom - DstY);
+      }
+    }
     const DXGI_FORMAT dst_copy_format = pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
         ? dst_desc.Format : pDst->PlacedFootprint.Footprint.Format;
     if ((resource_contract::GetEmulatedTextureStorage(src_copy_format) != resource_contract::EmulatedTextureStorage::None ||
@@ -3912,10 +3998,10 @@ public:
         copy->type = EncoderType::PredicatedTextureCopy;
         copy->source = source_native_texture;
         copy->destination = destination_native_texture;
-        copy->predicate = allocator_->gpu_heap_buffer_;
-        copy->predicate_value = static_cast<const uint64_t *>(allocator_->gpu_heap_) +
-            predication_snapshot_offset_ / sizeof(uint64_t);
-        copy->predicate_offset = predication_snapshot_offset_;
+        const auto predicate = allocator_->ResolveGPUHeap(predication_snapshot_offset_);
+        copy->predicate = predicate.buffer;
+        copy->predicate_value = static_cast<const uint64_t *>(predicate.memory);
+        copy->predicate_offset = predicate.offset;
         copy->source_origin = {src_box.left, src_box.top, src_box.front};
         copy->destination_origin = {DstX, DstY, DstZ};
         copy->size = {src_box.right - src_box.left, src_box.bottom - src_box.top,
@@ -3989,7 +4075,7 @@ public:
         stage_source.level = source_native_level;
         stage_source.slice = source_native_slice;
         stage_source.origin = {src_box.left, src_box.top, src_box.front};
-        stage_source.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+        stage_source.size = source_size;
         stage_source.dst = source_staging;
         stage_source.offset = source_staging_offset;
         stage_source.bytes_per_row = staging_pitch;
@@ -4010,7 +4096,7 @@ public:
           stage_destination.level = destination_native_level;
           stage_destination.slice = destination_native_slice;
           stage_destination.origin = {DstX, DstY, DstZ};
-          stage_destination.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+          stage_destination.size = destination_size;
           stage_destination.dst = destination_staging;
           stage_destination.offset = destination_staging_offset;
           stage_destination.bytes_per_row = staging_pitch;
@@ -4028,7 +4114,7 @@ public:
           write_destination.src_offset = destination_staging_offset;
           write_destination.bytes_per_row = staging_pitch;
           write_destination.bytes_per_image = dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? staging_slice : 0;
-          write_destination.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+          write_destination.size = destination_size;
           write_destination.dst = destination_native_texture;
           write_destination.level = destination_native_level;
           write_destination.slice = destination_native_slice;
@@ -4088,7 +4174,7 @@ public:
           stage_destination.level = destination_native_level;
           stage_destination.slice = destination_native_slice;
           stage_destination.origin = {DstX, DstY, DstZ};
-          stage_destination.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+          stage_destination.size = destination_size;
           stage_destination.dst = destination_staging;
           stage_destination.offset = destination_staging_offset;
           stage_destination.bytes_per_row = staging_pitch;
@@ -4135,7 +4221,7 @@ public:
           write_destination.src_offset = destination_staging_offset;
           write_destination.bytes_per_row = staging_pitch;
           write_destination.bytes_per_image = dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? staging_slice : 0;
-          write_destination.size = {width, UINT64(src_box.bottom - src_box.top), depth};
+          write_destination.size = destination_size;
           write_destination.dst = destination_native_texture;
           write_destination.level = destination_native_level;
           write_destination.slice = destination_native_slice;
@@ -4261,7 +4347,7 @@ public:
         cmd_cp.src_offset = copy_offset;
         cmd_cp.bytes_per_row = copy_pitch;
         cmd_cp.bytes_per_image = copy_depth_pitch;
-        cmd_cp.size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
+        cmd_cp.size = destination_size;
         cmd_cp.dst = destination_native_texture;
         cmd_cp.level = destination_native_level;
         cmd_cp.slice = destination_native_slice;
@@ -4455,7 +4541,7 @@ public:
         cmd_cp.level = source_native_level;
         cmd_cp.slice = source_native_slice;
         cmd_cp.origin = {src_box.left, src_box.top, src_box.front};
-        cmd_cp.size = {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front};
+        cmd_cp.size = source_size;
         cmd_cp.dst = dst->current()->buffer();
         cmd_cp.offset = pDst->PlacedFootprint.Offset + (DstX / block_width) * dst_format.BytesPerTexel +
                         (DstY / dst_footprint_info.block_height) * pDst->PlacedFootprint.Footprint.RowPitch + DstZ * dst_depth_pitch;
@@ -5145,7 +5231,9 @@ public:
         DrawCallStatus::Invalid)
       return;
     BindStatisticsClaim(0);
-    EncodeMeshShaderDispatch(allocator_->gpu_heap_buffer_, predicated_offset, X, Y, Z);
+    const auto arguments_binding = predication_enabled_ ? allocator_->ResolveGPUHeap(predicated_offset)
+        : MTLD3D12CommandAllocatorImpl::GPUHeapAllocation{nullptr, {}, predicated_offset, 0};
+    EncodeMeshShaderDispatch(arguments_binding.buffer, arguments_binding.offset, X, Y, Z);
     const uint64_t encoder_id = allocator_->encoder_current->id;
     if (capture_pixels && !RecordCapturedMeshDraw(key, X, Y, Z)) return;
     owned_graphics::Trace("dispatch_mesh", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
@@ -6008,6 +6096,18 @@ public:
       staging[rootsig->ViewIdQwordOffset] = view_id;
   }
 
+  // ICB shader-owned routing uses the effective native pass bounds. Keep the
+  // logical ViewID in the low half, unchanged for every application shader.
+  void StageIndirectViewBounds() {
+    if (!rootsig_graphics_ || rootsig_graphics_->ViewIdQwordOffset == ~0u)
+      return;
+    const auto *render = static_cast<const RenderEncoderData *>(allocator_->encoder_current);
+    rootarg_graphics_staging_[rootsig_graphics_->ViewIdQwordOffset] = uint64_t(view_id_) |
+        (uint64_t(std::max(1u, num_viewports)) << 32) |
+        (uint64_t(std::max(1u, uint32_t(render->render_target_array_length))) << 48);
+    dirty_state_.set(DirtyState::GraphicsRootArguments);
+  }
+
   /*
    * View instancing, Tier 1: replay `draw` once per enabled view of the bound PSO, in view order, with SV_ViewID
    * (the root view-id qword) and the view's location set. Returns false when the PSO has no view instancing, and
@@ -6262,11 +6362,12 @@ public:
         const int32_t rect_height = rect.bottom - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
-        allocator_->clear_rtv_.clear(
-            rect_offset_x, rect_offset_y, rect_width, rect_height, Depth, Stencil,
-            predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
-            predication_enabled_ ? indirect_offsets[i] : 0
-        );
+        {
+                  if (FAILED(recording_error_)) return;
+                  const auto arguments = predication_enabled_ ? allocator_->ResolveGPUHeap(predication_enabled_ ? indirect_offsets[i] : 0)
+                      : MTLD3D12CommandAllocatorImpl::GPUHeapAllocation{};
+                  allocator_->clear_rtv_.clear(rect_offset_x, rect_offset_y, rect_width, rect_height, Depth, Stencil, arguments.buffer, arguments.offset);
+                };
       }
       allocator_->clear_rtv_.end();
       return;
@@ -6321,10 +6422,12 @@ public:
             clear_color, AttachmentDesc.BufferResource, AttachmentDesc.BufferView, AttachmentDesc.BufferRange,
             AttachmentDesc.Format
         );
-        allocator_->clear_uav_.clear(
-            AttachmentDesc.BufferRange.firstElement, 0, AttachmentDesc.BufferRange.elementCount, 1,
-            predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{}, indirect_offset
-        );
+        {
+                  if (FAILED(recording_error_)) return;
+                  const auto arguments = predication_enabled_ ? allocator_->ResolveGPUHeap(indirect_offset)
+                      : MTLD3D12CommandAllocatorImpl::GPUHeapAllocation{};
+                  allocator_->clear_uav_.clear(AttachmentDesc.BufferRange.firstElement, 0, AttachmentDesc.BufferRange.elementCount, 1, arguments.buffer, arguments.offset);
+                };
         allocator_->clear_uav_.end();
         return;
       }
@@ -6355,11 +6458,12 @@ public:
         const LONG right = std::clamp(Rects[i].right, LONG(0), maximum_x);
         if (right <= left || Rects[i].bottom <= 0 || Rects[i].top >= 1)
           continue;
-        allocator_->clear_uav_.clear(
-            AttachmentDesc.BufferRange.firstElement + uint32_t(left), 0, uint32_t(right - left), 1,
-            predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
-            predication_enabled_ ? indirect_offsets[i] : 0
-        );
+        {
+                  if (FAILED(recording_error_)) return;
+                  const auto arguments = predication_enabled_ ? allocator_->ResolveGPUHeap(predication_enabled_ ? indirect_offsets[i] : 0)
+                      : MTLD3D12CommandAllocatorImpl::GPUHeapAllocation{};
+                  allocator_->clear_uav_.clear(AttachmentDesc.BufferRange.firstElement + uint32_t(left), 0, uint32_t(right - left), 1, arguments.buffer, arguments.offset);
+                };
       }
       allocator_->clear_uav_.end();
       return;
@@ -6399,11 +6503,13 @@ public:
         const int32_t rect_height = rect.bottom - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
-        allocator_->clear_rtv_.clear(
-            rect_offset_x, rect_offset_y, rect_width, rect_height, AttachmentDesc.RenderTargetArrayLength,
-            clear_color, predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
-            predication_enabled_ ? indirect_offsets[i] : 0
-        );
+        {
+                  if (FAILED(recording_error_)) return;
+                  const auto arguments = predication_enabled_ ? allocator_->ResolveGPUHeap(predication_enabled_ ? indirect_offsets[i] : 0)
+                      : MTLD3D12CommandAllocatorImpl::GPUHeapAllocation{};
+                  allocator_->clear_rtv_.clear(rect_offset_x, rect_offset_y, rect_width, rect_height, AttachmentDesc.RenderTargetArrayLength,
+                  clear_color, arguments.buffer, arguments.offset);
+                };
       }
       allocator_->clear_rtv_.end();
       RecordStandardSwizzleUse(swizzle_resource.ptr(), true);
@@ -6520,11 +6626,12 @@ public:
       const auto rect = ClipUAVClearRect(rects[i], full_rect);
       if (rect.right <= rect.left || rect.bottom <= rect.top)
         continue;
-      allocator_->clear_uav_.clear(
-          buffer_base_x + uint32_t(rect.left), rect.top, rect.right - rect.left, rect.bottom - rect.top,
-          predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
-          predication_enabled_ ? indirect_offsets[i] : 0
-      );
+      {
+                if (FAILED(recording_error_)) return;
+                const auto arguments = predication_enabled_ ? allocator_->ResolveGPUHeap(predication_enabled_ ? indirect_offsets[i] : 0)
+                    : MTLD3D12CommandAllocatorImpl::GPUHeapAllocation{};
+                allocator_->clear_uav_.clear(buffer_base_x + uint32_t(rect.left), rect.top, rect.right - rect.left, rect.bottom - rect.top, arguments.buffer, arguments.offset);
+              };
     }
     allocator_->clear_uav_.end();
     if (Descriptor.type == ShaderVisibleDescriptorType::UAVTexture)
@@ -6621,11 +6728,12 @@ public:
       const auto rect = ClipUAVClearRect(rects[i], full_rect);
       if (rect.right <= rect.left || rect.bottom <= rect.top)
         continue;
-      allocator_->clear_uav_.clear(
-          buffer_base_x + uint32_t(rect.left), rect.top, rect.right - rect.left, rect.bottom - rect.top,
-          predication_enabled_ ? allocator_->gpu_heap_buffer_ : WMT::Buffer{},
-          predication_enabled_ ? indirect_offsets[i] : 0
-      );
+      {
+                if (FAILED(recording_error_)) return;
+                const auto arguments = predication_enabled_ ? allocator_->ResolveGPUHeap(predication_enabled_ ? indirect_offsets[i] : 0)
+                    : MTLD3D12CommandAllocatorImpl::GPUHeapAllocation{};
+                allocator_->clear_uav_.clear(buffer_base_x + uint32_t(rect.left), rect.top, rect.right - rect.left, rect.bottom - rect.top, arguments.buffer, arguments.offset);
+              };
     }
     allocator_->clear_uav_.end();
     if (Descriptor.type == ShaderVisibleDescriptorType::UAVTexture)
@@ -6859,8 +6967,10 @@ public:
       return;
     }
     if (Type == D3D12_QUERY_TYPE_TIMESTAMP) {
-      if ((type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE) ||
-          heap->desc.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP || Index >= heap->desc.Count ||
+      if ((type_ == D3D12_COMMAND_LIST_TYPE_COPY
+               ? heap->desc.Type != D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP
+               : (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE) ||
+                     heap->desc.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP) || Index >= heap->desc.Count ||
           !heap->timestamp_samples || !heap->timestamp_dummy) {
         RecordError();
         return;
@@ -6870,7 +6980,6 @@ public:
       sample->type = EncoderType::Query;
       sample->op = QueryEncoderOp::SampleTimestamp;
       sample->timestamp_samples = heap->timestamp_samples;
-      sample->timestamp_producers = heap->timestamp_producers;
       sample->timestamp_dummy = heap->timestamp_dummy;
       sample->start_index = Index;
       sample->query_count = 1;
@@ -6925,8 +7034,10 @@ public:
                                  type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || !heap->pipeline_statistics)) ||
         (so_statistics && (heap->desc.Type != D3D12_QUERY_HEAP_TYPE_SO_STATISTICS ||
                            type_ != D3D12_COMMAND_LIST_TYPE_DIRECT)) ||
-        (timestamp && (heap->desc.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP ||
-                       (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE))) ||
+        (timestamp && (type_ == D3D12_COMMAND_LIST_TYPE_COPY
+                           ? heap->desc.Type != D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP
+                           : (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE) ||
+                                 heap->desc.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP)) ||
         (occlusion && (heap->desc.Type != D3D12_QUERY_HEAP_TYPE_OCCLUSION ||
                        type_ != D3D12_COMMAND_LIST_TYPE_DIRECT)) ||
         (!timestamp && !occlusion && !so_statistics && !pipeline_statistics)) {
@@ -6979,7 +7090,6 @@ public:
                 : Type == D3D12_QUERY_TYPE_BINARY_OCCLUSION ? QueryEncoderOp::ResolveBinaryOcclusion
                                                               : QueryEncoderOp::ResolveOcclusion;
     resolve->timestamp_samples = heap->timestamp_samples;
-    resolve->timestamp_producers = heap->timestamp_producers;
     resolve->source = pipeline_statistics ? heap->pipeline_statistics
                     : so_statistics       ? heap->so_statistics
                                           : heap->visibility_results;
@@ -7019,7 +7129,7 @@ public:
       return;
     }
 
-    if (!allocator_->CanAllocateGPUHeap(sizeof(uint64_t), alignof(uint64_t))) {
+    if (!allocator_->ReserveGPUHeap(sizeof(uint64_t), alignof(uint64_t))) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
@@ -7027,7 +7137,7 @@ public:
     memset(snapshot, 0, sizeof(uint64_t));
     BeginPredicationComputePass(predication_snapshot_pipeline_);
     BindPredicationBuffer(resource->buffer->current()->buffer(), AlignedBufferOffset, 0);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, snapshot_offset, 1);
+    BindGPUHeapPredicationBuffer(snapshot_offset, 1);
     DispatchPredicationKernel();
     predication_snapshot_offset_ = snapshot_offset;
     predication_op_ = Op;
@@ -7087,7 +7197,7 @@ public:
     const uint64_t vertex_bytes = slots ? uint64_t(16) * (32 - __builtin_clz(slots)) : 0;
     const uint64_t root_bytes = rootsig_graphics_ ? uint64_t(rootsig_graphics_->UploadQwords) * 8 : 0;
     const uint64_t sampler_bytes = rootsig_graphics_ ? uint64_t(rootsig_graphics_->NumStaticSamplers) * 32 : 0;
-    if (!allocator_->CanAllocateGPUHeap(vertex_bytes + root_bytes + sampler_bytes + 128, 64)) {
+    if (!allocator_->ReserveGPUHeap(vertex_bytes + root_bytes + sampler_bytes + 128, 64)) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
@@ -7101,29 +7211,41 @@ public:
     if (PreDraw(true) == DrawCallStatus::Invalid)
       return;
     indirect->draw_template = std::move(so_pending_);
-    indirect->assembly_template = reinterpret_cast<const StreamOutputAssemblyParams *>(
-        static_cast<const char *>(allocator_->gpu_heap_) + indirect->draw_template->params_offset);
+    indirect->assembly_template = indirect->draw_template->params_cpu;
     indirect->preflight_pipeline = so_indirect_preflight_pipeline_;
     indirect->resolver_pipeline = sig->render_resolver;
     indirect->argument_resolver = sig->graphics_argument_resolver;
     indirect->msaa = msaa;
+    indirect->shader_view_locations = !msaa && pso_graphics_->view_location_offsets;
+    if (indirect->shader_view_locations)
+      StageIndirectViewBounds();
     indirect->draw_pipeline = std::move(draw_pipeline);
     indirect->strip_cut = ib_strip_cut_value_;
     auto &command = indirect->command;
     command.max_count = max_count;
     command.max_count_buffer = count_buffer;
     command.argument_buffer = arguments;
-    command.predicate = predication_enabled_ ? allocator_->gpu_heap_buffer_address_ + predication_snapshot_offset_ : 0;
+    command.predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
     command.predicate_op = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
     command.primitive_type = primitive_type;
     command.index_buffer = index_buffer_address;
     command.index_buffer_format = index_type == WMTIndexTypeUInt32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     command.index_pull_mode = ~0u;
-    command.vertex_constants = (statistics ? pso_graphics_->pipeline_statistics_vertex_constants
-                                          : pso_graphics_->vertex_constants).gpu_address;
+    auto &vertex_constants = indirect->shader_view_locations
+        ? statistics ? pso_graphics_->indirect_view_pipeline_statistics_vertex_constants
+                     : pso_graphics_->indirect_view_vertex_constants
+        : statistics ? pso_graphics_->pipeline_statistics_vertex_constants : pso_graphics_->vertex_constants;
+    command.vertex_constants = vertex_constants.gpu_address;
+    if (vertex_constants.buffer) {
+      auto &retained = static_cast<RenderEncoderData *>(allocator_->encoder_current)->immutable_constant_buffers;
+      if (std::none_of(retained.begin(), retained.end(), [&](const auto &buffer) {
+            return buffer.handle == vertex_constants.buffer.handle;
+          }))
+        retained.push_back(vertex_constants.buffer);
+    }
     command.fragment_constants = (statistics ? pso_graphics_->pipeline_statistics_fragment_constants
                                             : pso_graphics_->fragment_constants).gpu_address;
-    command.pipeline_statistics = statistics ? allocator_->gpu_heap_buffer_address_ + pipeline_statistics_counters_offset_ : 0;
+    command.pipeline_statistics = statistics ? allocator_->GPUHeapAddress(pipeline_statistics_counters_offset_) : 0;
     auto &preflight = indirect->preflight;
     preflight.argument_buffer = arguments;
     preflight.count_buffer = count_buffer;
@@ -7141,17 +7263,24 @@ public:
     if (rootsig_graphics_) {
       if (root_bytes) {
         const auto offset = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
-        indirect->root_arguments = static_cast<const char *>(allocator_->gpu_heap_) + offset;
+        if (offset == UINT64_MAX)
+          return;
+        indirect->root_arguments = allocator_->ResolveGPUHeap(offset).memory;
         command.rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
       }
-      if (sampler_bytes)
-        command.static_samplers = allocator_->gpu_heap_buffer_address_ + EncodeStaticSamplers(rootsig_graphics_.ptr());
+      if (sampler_bytes) {
+        const auto offset = EncodeStaticSamplers(rootsig_graphics_.ptr());
+        if (offset == UINT64_MAX)
+          return;
+        command.static_samplers = allocator_->GPUHeapAddress(offset);
+        allocator_->BindGPUHeap(indirect->static_sampler_buffer, indirect->static_sampler_offset, offset);
+      }
     }
-    if (command.static_samplers)
-      indirect->static_sampler_offset = command.static_samplers - allocator_->gpu_heap_buffer_address_;
     auto [vb_offset, vb_stride] = PopulateVertexBufferTable(1, sig->VertexBufferMask);
+    if (vb_offset == UINT64_MAX)
+      return;
     if (vb_stride) {
-      indirect->vertex_buffers = static_cast<const char *>(allocator_->gpu_heap_) + vb_offset;
+      indirect->vertex_buffers = allocator_->ResolveGPUHeap(vb_offset).memory;
       command.vertex_argbuf_stride = vb_stride;
     }
     static_cast<RenderEncoderData *>(allocator_->encoder_current)->so_indirect = std::move(indirect);
@@ -7219,8 +7348,7 @@ public:
           return;
         data->so_template = std::move(so_pending_);
         for (auto *draw = data->so_template.get(); draw; draw = draw->next_stream.get())
-          data->so_params.push_back(*reinterpret_cast<const StreamOutputAssemblyParams *>(
-              static_cast<const char *>(allocator_->gpu_heap_) + draw->params_offset));
+          data->so_params.push_back(*draw->params_cpu);
       }
     } catch (const std::bad_alloc &) {
       RecordError(E_OUTOFMEMORY);
@@ -7230,7 +7358,7 @@ public:
     preflight.argument_buffer = ArgBufferAddress;
     preflight.count_buffer = CountBufferAddress;
     preflight.predicate =
-        predication_enabled_ ? allocator_->gpu_heap_buffer_address_ + predication_snapshot_offset_ : 0;
+        predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
     preflight.index_buffer = index_buffer_address;
     preflight.max_count = MaxCommandCount;
     preflight.stride = sig->ByteStride;
@@ -7245,13 +7373,20 @@ public:
     data->index_offset = indexed ? index_offset : 0;
     data->update_index = sig->UpdateIndexBuffer;
     data->strip_cut_value = ib_strip_cut_value_;
-    data->binding_heap = allocator_->gpu_heap_buffer_;
-    data->binding_memory = static_cast<const uint8_t *>(allocator_->gpu_heap_);
+    if (predication_enabled_)
+      data->predicate_heap = allocator_->ResolveGPUHeap(predication_snapshot_offset_).buffer;
+    uint64_t root_address = 0, root_virtual_offset = 0;
     if (sig->UpdateRootArguments) {
       data->root_offset = StageSlotRootArguments(sig, rootsig_graphics_.ptr(), rootarg_graphics_staging_,
                                                MaxCommandCount, ArgBufferAddress, CountBufferAddress);
       if (data->root_offset == UINT64_MAX)
         return;
+      const auto roots = allocator_->ResolveGPUHeap(data->root_offset);
+      root_virtual_offset = data->root_offset;
+      root_address = roots.address;
+      data->root_heap = roots.buffer;
+      data->root_memory = static_cast<const uint8_t *>(roots.memory);
+      data->root_offset = roots.offset;
       data->root_stride = uint64_t(rootsig_graphics_->UploadQwords) * 8;
       for (uint32_t parameter = 0; parameter < rootsig_graphics_->ParameterSlots; ++parameter) {
         const auto type = rootsig_graphics_->ParameterTypes[parameter];
@@ -7263,24 +7398,31 @@ public:
     if (sig->UpdateVertexBuffers) {
       const uint32_t slots = pso_graphics_->slot_mask | sig->VertexBufferMask;
       const uint64_t bytes = uint64_t(16) * (32 - __builtin_clz(slots)) * MaxCommandCount;
-      if (!allocator_->CanAllocateGPUHeap(bytes + sizeof(IndirectRenderCommandData) + 64, 16)) {
+      if (!allocator_->ReserveGPUHeap(bytes + sizeof(IndirectRenderCommandData) + 64, 16)) {
         RecordError(E_OUTOFMEMORY);
         return;
       }
       auto [offset, stride] = PopulateVertexBufferTable(MaxCommandCount, sig->VertexBufferMask);
-      data->vertex_offset = offset;
+      if (offset == UINT64_MAX)
+        return;
+      const auto vertices = allocator_->ResolveGPUHeap(offset);
+      data->vertex_heap = vertices.buffer;
+      data->vertex_memory = static_cast<const uint8_t *>(vertices.memory);
+      data->vertex_offset = vertices.offset;
       data->vertex_stride = stride;
       data->vertex_mask = slots;
       auto [memory, command_offset] = allocator_->AllocateGPUHeap(sizeof(IndirectRenderCommandData), 16);
       auto *command = new (memory) IndirectRenderCommandData{};
       command->max_count = MaxCommandCount;
       command->argument_buffer = ArgBufferAddress;
-      command->vertex_buffer = allocator_->gpu_heap_buffer_address_ + offset;
-      command->vertex_argbuf_stride = stride;
-      command->rootsig_qwords = data->root_stride ? allocator_->gpu_heap_buffer_address_ + data->root_offset : 0;
-      command->rootsig_qwords_stride = data->root_stride / 8;
       BeginPredicationComputePass(sig->graphics_argument_resolver, 64);
-      BindPredicationBuffer(allocator_->gpu_heap_buffer_, command_offset, 30);
+      command->vertex_buffer = allocator_->GPUHeapAddress(offset);
+      command->vertex_argbuf_stride = stride;
+      command->rootsig_qwords = root_address;
+      command->rootsig_qwords_stride = data->root_stride / 8;
+      if (root_address)
+        allocator_->GPUHeapAddress(root_virtual_offset);
+      BindGPUHeapPredicationBuffer(command_offset, 30);
       auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
       dispatch.type = WMTComputeCommandDispatch;
       dispatch.size = {(uint64_t(MaxCommandCount) + 63) / 64, 1, 1};
@@ -7434,7 +7576,7 @@ public:
       uint32_t stride, max_commands, argument_words, predicate_not_equal, per_group, control_points;
     };
     const uint64_t argument_bytes = uint64_t(MaxCommandCount) * 32, dispatch_bytes = uint64_t(MaxCommandCount) * 16;
-    if (!allocator_->CanAllocateGPUHeap(sizeof(Control) + argument_bytes + dispatch_bytes + 64, 32)) {
+    if (!allocator_->ReserveGPUHeap(sizeof(Control) + argument_bytes + dispatch_bytes + 64, 32)) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
@@ -7450,7 +7592,7 @@ public:
     auto *control = new (control_memory) Control{};
     control->arguments = ArgBufferAddress;
     control->count = CountBufferAddress;
-    control->predicate = predication_enabled_ ? allocator_->gpu_heap_buffer_address_ + predication_snapshot_offset_ : 0;
+    control->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
     // M-series GPUs (Apple7+) have no object-threadgroup grid limit; others are capped at 1024.
     control->max_threadgroups =
         device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple7) ? UINT64_MAX : 1024;
@@ -7462,9 +7604,11 @@ public:
     control->control_points = tessellation ? control_points : 0;
 
     BeginPredicationComputePass(mesh_indirect_pipeline_, 64);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 0);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, arguments_offset, 1);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, dispatch_offset, 2);
+    if (predication_enabled_)
+      allocator_->GPUHeapAddress(predication_snapshot_offset_);
+    BindGPUHeapPredicationBuffer(control_offset, 0);
+    BindGPUHeapPredicationBuffer(arguments_offset, 1);
+    BindGPUHeapPredicationBuffer(dispatch_offset, 2);
     auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
     dispatch.type = WMTComputeCommandDispatch;
     dispatch.size = {(uint64_t(MaxCommandCount) + 63) / 64, 1, 1};
@@ -7491,8 +7635,7 @@ public:
       BindStatisticsClaim(i);
       auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups_indirect>();
       draw.type = WMTRenderCommandDrawMeshThreadgroupsIndirect;
-      draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-      draw.indirect_args_offset = dispatch_offset + uint64_t(i) * 16;
+      allocator_->BindGPUHeap(draw.indirect_args_buffer, draw.indirect_args_offset, dispatch_offset + uint64_t(i) * 16);
       if (tessellation) {
         draw.object_threadgroup_size = {threads_per_patch, patch_per_group, 1};
         draw.mesh_threadgroup_size = {32, 1, 1};
@@ -7523,23 +7666,25 @@ public:
       uint32_t max_commands, roots_stride, predicate_not_equal, padding;
     };
     const uint64_t roots_bytes = uint64_t(rootsig->UploadQwords) * sizeof(uint64_t) * MaxCommandCount;
-    if (!allocator_->CanAllocateGPUHeap(roots_bytes + sizeof(Control) + 128, 64)) {
+    if (!allocator_->ReserveGPUHeap(roots_bytes + sizeof(Control) + 128, 64)) {
       RecordError(E_OUTOFMEMORY);
       return UINT64_MAX;
     }
     const uint64_t roots_offset = EncodeRootArgument(rootsig, staging, MaxCommandCount);
+    if (roots_offset == UINT64_MAX)
+      return UINT64_MAX;
     auto [control_memory, control_offset] = allocator_->AllocateGPUHeap(sizeof(Control), 16);
     auto *control = new (control_memory) Control{};
     control->arguments = ArgBufferAddress;
     control->count = CountBufferAddress;
+    BeginPredicationComputePass(sig->root_argument_resolver, 64);
     control->predicate =
-        predication_enabled_ ? allocator_->gpu_heap_buffer_address_ + predication_snapshot_offset_ : 0;
-    control->roots = allocator_->gpu_heap_buffer_address_ + roots_offset;
+        predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
+    control->roots = allocator_->GPUHeapAddress(roots_offset);
     control->max_commands = MaxCommandCount;
     control->roots_stride = rootsig->UploadQwords;
     control->predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
-    BeginPredicationComputePass(sig->root_argument_resolver, 64);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 0);
+    BindGPUHeapPredicationBuffer(control_offset, 0);
     auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
     dispatch.type = WMTComputeCommandDispatch;
     dispatch.size = {(uint64_t(MaxCommandCount) + 63) / 64, 1, 1};
@@ -7578,7 +7723,7 @@ public:
       uint32_t stride, max_commands, argument_words, predicate_not_equal, per_group, control_points;
     };
     const uint64_t argument_bytes = uint64_t(MaxCommandCount) * 32, dispatch_bytes = uint64_t(MaxCommandCount) * 16;
-    if (!allocator_->CanAllocateGPUHeap(sizeof(Control) + argument_bytes + dispatch_bytes + 64, 32)) {
+    if (!allocator_->ReserveGPUHeap(sizeof(Control) + argument_bytes + dispatch_bytes + 64, 32)) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
@@ -7588,7 +7733,7 @@ public:
     auto *control = new (control_memory) Control{};
     control->arguments = ArgBufferAddress + sig->DrawArgumentOffset;
     control->count = CountBufferAddress;
-    control->predicate = predication_enabled_ ? allocator_->gpu_heap_buffer_address_ + predication_snapshot_offset_ : 0;
+    control->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
     control->max_threadgroups = UINT64_MAX;
     control->stride = sig->ByteStride;
     control->max_commands = MaxCommandCount;
@@ -7597,9 +7742,11 @@ public:
     control->per_group = 0;
 
     BeginPredicationComputePass(mesh_indirect_pipeline_, 64);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 0);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, arguments_offset, 1);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, dispatch_offset, 2);
+    if (predication_enabled_)
+      allocator_->GPUHeapAddress(predication_snapshot_offset_);
+    BindGPUHeapPredicationBuffer(control_offset, 0);
+    BindGPUHeapPredicationBuffer(arguments_offset, 1);
+    BindGPUHeapPredicationBuffer(dispatch_offset, 2);
     auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
     dispatch.type = WMTComputeCommandDispatch;
     dispatch.size = {(uint64_t(MaxCommandCount) + 63) / 64, 1, 1};
@@ -7610,27 +7757,27 @@ public:
     const uint32_t capture_key = MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, statistics) |
         (capture_pixels ? kMeshMSAACapture : 0) |
         (capture_pixels && pso_graphics_->as_threads[0] ? kMeshObjectCapture : 0);
-    if (!capture_pixels && PreDraw(false, false, capture_key) == DrawCallStatus::Invalid) return;
     const uint64_t roots_stride = rootsig_graphics_ ? uint64_t(rootsig_graphics_->UploadQwords) * 8 : 0;
     for (UINT i = 0; i < MaxCommandCount; ++i) {
-      if (capture_pixels) {
-        allocator_->InvalidateCurrentPass();
-        if (PreDraw(false, false, capture_key) == DrawCallStatus::Invalid) return;
-      }
+      // Metal 4 indirect mesh draws within one render encoder do not preserve
+      // the raster overwrite order of consecutive command slots. An encoder
+      // boundary carries the prior mesh/fragment fence and loads its stored
+      // attachments before the next GPU-resolved draw, including empty grids.
+      allocator_->InvalidateCurrentPass();
+      if (PreDraw(false, false, capture_key) == DrawCallStatus::Invalid) return;
       if (roots_offset != UINT64_MAX) {
         for (auto type : {WMTRenderCommandSetObjectBuffer, WMTRenderCommandSetMeshBuffer,
                           WMTRenderCommandSetFragmentBuffer}) {
           auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
           binding.type = type;
-          binding.buffer = allocator_->gpu_heap_buffer_;
-          binding.offset = roots_offset + uint64_t(i) * roots_stride;
+          allocator_->BindGPUHeap(binding.buffer, binding.offset, roots_offset + uint64_t(i) * roots_stride);
           binding.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
         }
       }
       BindStatisticsClaim(i);
-      EncodeMeshShaderDispatch(allocator_->gpu_heap_buffer_, dispatch_offset + uint64_t(i) * 16, 0, 0, 0);
-      if (capture_pixels && !RecordCapturedMeshDraw(capture_key, 1, 1, 1, allocator_->gpu_heap_buffer_,
-                                                    dispatch_offset + uint64_t(i) * 16)) return;
+      const auto arguments = allocator_->ResolveGPUHeap(dispatch_offset + uint64_t(i) * 16);
+      EncodeMeshShaderDispatch(arguments.buffer, arguments.offset, 0, 0, 0);
+      if (capture_pixels && !RecordCapturedMeshDraw(capture_key, 1, 1, 1, arguments.buffer, arguments.offset)) return;
     }
     // The application's root arguments are back in effect after the call (with the updated ones zeroed).
     ResetIndirectState(sig, rootsig_graphics_.ptr(), rootarg_graphics_staging_, false);
@@ -7719,15 +7866,15 @@ public:
       }
 
       uint64_t required_heap = sizeof(IndirectComputeCommandData);
-      if (!sig->UpdateRootArguments && !allocator_->CanAllocateGPUHeap(required_heap, 16)) {
+      if (!sig->UpdateRootArguments && !allocator_->ReserveGPUHeap(required_heap, 16)) {
         RecordError(E_OUTOFMEMORY);
         return;
       }
       if (sig->UpdateRootArguments) {
         const uint64_t per_command = uint64_t(rootsig_compute_->UploadQwords) * sizeof(uint64_t);
         if ((per_command && MaxCommandCount > (SIZE_MAX - required_heap) / per_command) ||
-            !allocator_->CanAllocateGPUHeap(required_heap + per_command * MaxCommandCount +
-                                                uint64_t(rootsig_compute_->NumStaticSamplers) * 4 * sizeof(uint64_t),
+            !allocator_->ReserveGPUHeap(required_heap + per_command * MaxCommandCount +
+                                                uint64_t(rootsig_compute_->NumStaticSamplers) * 4 * sizeof(uint64_t) + 128,
                                             16)) {
           RecordError(E_OUTOFMEMORY);
           return;
@@ -7741,16 +7888,22 @@ public:
       }
       cmd->max_count_buffer = CountBufferAddress;
       cmd->argument_buffer = ArgBufferAddress;
-      cmd->pipeline_statistics = statistics ? allocator_->gpu_heap_buffer_address_ + pipeline_statistics_counters_offset_ : 0;
-      cmd->predicate = predication_enabled_ ? allocator_->gpu_heap_buffer_address_ + predication_snapshot_offset_ : 0;
+      cmd->pipeline_statistics = statistics ? allocator_->GPUHeapAddress(pipeline_statistics_counters_offset_) : 0;
+      cmd->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
       cmd->predicate_op = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
 
       if (sig->UpdateRootArguments) {
         cmd->rootsig_qwords = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_, MaxCommandCount);
-        cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
+        if (cmd->rootsig_qwords == UINT64_MAX)
+          return;
+        if (rootsig_compute_->UploadQwords)
+          cmd->rootsig_qwords = allocator_->GPUHeapAddress(cmd->rootsig_qwords);
         cmd->rootsig_qwords_stride = rootsig_compute_->UploadQwords;
         cmd->static_samplers = EncodeStaticSamplers(rootsig_compute_.ptr());
-        cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
+        if (cmd->static_samplers == UINT64_MAX)
+          return;
+        if (rootsig_compute_->NumStaticSamplers)
+          cmd->static_samplers = allocator_->GPUHeapAddress(cmd->static_samplers);
       }
       ResetIndirectState(sig, rootsig_compute_.ptr(), rootarg_compute_staging_, true);
 
@@ -7792,7 +7945,8 @@ public:
          (index_type == WMTIndexTypeUInt32 && ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF));
     const bool index_pull = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED && strip &&
                             (sig->UpdateIndexBuffer || !matching_cut);
-    bool encode_binding = index_pull || sig->UpdateRootArguments || sig->UpdateIndexBuffer || sig->UpdateVertexBuffers;
+    bool encode_binding = index_pull || sig->UpdateRootArguments || sig->UpdateIndexBuffer ||
+                          sig->UpdateVertexBuffers || (pso_graphics_ && pso_graphics_->view_location_offsets);
     DrawCallStatus status = PreDraw(encode_binding);
     if (status == DrawCallStatus::Invalid)
       return;
@@ -7804,10 +7958,12 @@ public:
       RecordError(E_FAIL);
       return;
     }
+    if (pso_graphics_->view_location_offsets)
+      StageIndirectViewBounds();
 
     uint64_t required_heap = sizeof(IndirectRenderCommandData) +
                              (index_pull ? uint64_t(MaxCommandCount) * sizeof(SM50_INDEX_PULL_CONTROL) : 0);
-    if (!encode_binding && !allocator_->CanAllocateGPUHeap(required_heap, 16)) {
+    if (!encode_binding && !allocator_->ReserveGPUHeap(required_heap, 16)) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
@@ -7822,7 +7978,7 @@ public:
           ? uint64_t(rootsig_graphics_->NumStaticSamplers) * 4 * sizeof(uint64_t)
           : 0;
       if ((per_command && MaxCommandCount > (SIZE_MAX - required_heap - sampler_bytes) / per_command) ||
-          !allocator_->CanAllocateGPUHeap(required_heap + sampler_bytes + per_command * MaxCommandCount, 16)) {
+          !allocator_->ReserveGPUHeap(required_heap + sampler_bytes + per_command * MaxCommandCount + 128, 16)) {
         RecordError(E_OUTOFMEMORY);
         return;
       }
@@ -7834,7 +7990,7 @@ public:
     }
     cmd->max_count_buffer = CountBufferAddress;
     cmd->argument_buffer = ArgBufferAddress;
-    cmd->predicate = predication_enabled_ ? allocator_->gpu_heap_buffer_address_ + predication_snapshot_offset_ : 0;
+    cmd->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
     cmd->predicate_op = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
     cmd->primitive_type = primitive_type;
     cmd->index_buffer = index_buffer_address;
@@ -7843,20 +7999,28 @@ public:
       auto [controls, offset] = allocator_->AllocateGPUHeap(
           uint64_t(MaxCommandCount) * sizeof(SM50_INDEX_PULL_CONTROL), 16);
       memset(controls, 0, uint64_t(MaxCommandCount) * sizeof(SM50_INDEX_PULL_CONTROL));
-      cmd->index_pull_controls = allocator_->gpu_heap_buffer_address_ + offset;
+      cmd->index_pull_controls = allocator_->GPUHeapAddress(offset);
       cmd->index_pull_mode = ib_strip_cut_value_;
     }
     if (!encode_binding)
       return;
     if (rootsig_graphics_) {
       cmd->rootsig_qwords = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_, MaxCommandCount);
-      cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
+      if (cmd->rootsig_qwords == UINT64_MAX)
+        return;
+      if (rootsig_graphics_->UploadQwords)
+        cmd->rootsig_qwords = allocator_->GPUHeapAddress(cmd->rootsig_qwords);
       cmd->rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
       cmd->static_samplers = EncodeStaticSamplers(rootsig_graphics_.ptr());
-      cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
+      if (cmd->static_samplers == UINT64_MAX)
+        return;
+      if (rootsig_graphics_->NumStaticSamplers)
+        cmd->static_samplers = allocator_->GPUHeapAddress(cmd->static_samplers);
     }
     auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount, sig->VertexBufferMask);
-    cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
+    if (VBOffset == UINT64_MAX)
+      return;
+    cmd->vertex_buffer = allocator_->GPUHeapAddress(VBOffset);
     cmd->vertex_argbuf_stride = VBStride;
     ResetIndirectState(sig, rootsig_graphics_.ptr(), rootarg_graphics_staging_, false);
   };
@@ -7886,9 +8050,9 @@ kernel void dxmt_atomic_copy_u32(device atomic_uint *source [[buffer(0)]],
 )";
       WMT::Reference<WMT::Error> error;
       auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
-      auto function = library ? library.newFunction("dxmt_atomic_copy_u32") : WMT::Reference<WMT::Function>();
+      auto function = library ? WMT4::Library(library).newFunction("dxmt_atomic_copy_u32") : WMT::Reference<WMT4::Function>();
       if (function)
-        atomic_copy_u32_pipeline_ = device_->GetMTLDevice().newComputePipelineState(function, error);
+        atomic_copy_u32_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!atomic_copy_u32_pipeline_) {
         ERR("AtomicCopyBufferUINT: failed to create atomic copy pipeline");
         RecordError(E_FAIL);
@@ -7941,9 +8105,9 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
 )";
       WMT::Reference<WMT::Error> error;
       auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
-      auto function = library ? library.newFunction("dxmt_atomic_copy_u64") : WMT::Reference<WMT::Function>();
+      auto function = library ? WMT4::Library(library).newFunction("dxmt_atomic_copy_u64") : WMT::Reference<WMT4::Function>();
       if (function)
-        atomic_copy_u64_pipeline_ = device_->GetMTLDevice().newComputePipelineState(function, error);
+        atomic_copy_u64_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!atomic_copy_u64_pipeline_) {
         ERR("AtomicCopyBufferUINT64: failed to create atomic copy pipeline");
         RecordError(E_FAIL);
@@ -8100,14 +8264,14 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
                                             FormatCapability::Resolve));
     if (!whole_average) {
       auto library = device_->GetLib().getLibrary();
-      auto vertex = library.newFunction("dxmt_resolve_vertex");
+      auto vertex = WMT4::Library(library).newFunction("dxmt_resolve_vertex");
       const bool integer = IsIntegerFormat(format_desc.PixelFormat);
       const bool unsigned_integer = integer && MTLGetUnsignedIntegerFormat(format_desc.PixelFormat) == format_desc.PixelFormat;
       const char *fragment_name = dsv_plane == 1 ? "dxmt_resolve_depth" :
                                   dsv_plane == 2 ? "dxmt_resolve_stencil" :
                                   unsigned_integer ? "dxmt_resolve_uint" :
                                   integer ? "dxmt_resolve_sint" : "dxmt_resolve_float";
-      auto fragment = library.newFunction(fragment_name);
+      auto fragment = WMT4::Library(library).newFunction(fragment_name);
       WMTRenderPipelineInfo pipeline_info;
       WMT::InitializeRenderPipelineInfo(pipeline_info);
       pipeline_info.vertex_function = vertex.handle;
@@ -8122,7 +8286,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       pipeline_info.rasterization_enabled = true;
       pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
       WMT::Reference<WMT::Error> error;
-      resolve->pipeline = device_->GetMTLDevice().newRenderPipelineState(pipeline_info, error);
+      resolve->pipeline = device_->GetMetal4Compiler().newRenderPipelineState(pipeline_info, error);
       if (dsv_plane) {
         WMTDepthStencilInfo depth_stencil_info;
         depth_stencil_info.depth_compare_function = WMTCompareFunctionAlways;
@@ -8156,8 +8320,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
                                  ResolveMode == D3D12_RESOLVE_MODE_MIN ? 1 : 2;
       resolve->parameters.predicate_enabled = predication_enabled_;
       resolve->parameters.predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
-      resolve->predicate = allocator_->gpu_heap_buffer_;
-      resolve->predicate_offset = predication_enabled_ ? predication_snapshot_offset_ : 0;
+      allocator_->BindGPUHeap(resolve->predicate, resolve->predicate_offset, predication_enabled_ ? predication_snapshot_offset_ : 0);
     }
     allocator_->InvalidateCurrentPass();
   }
@@ -8223,11 +8386,14 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       uint64_t destination_offset = 0;
       auto allocation = device_->LookupBufferByVA(pParams[i].Dest, &destination_offset);
       auto [memory, source_offset] = allocator_->AllocateGPUHeap(sizeof(UINT), alignof(UINT));
+      if (!memory) {
+        RecordError(E_OUTOFMEMORY);
+        return;
+      }
       memcpy(memory, &pParams[i].Value, sizeof(UINT));
       auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
       cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
-      cmd.src = allocator_->gpu_heap_buffer_;
-      cmd.src_offset = source_offset;
+      allocator_->BindGPUHeap(cmd.src, cmd.src_offset, source_offset);
       cmd.dst = allocation->buffer();
       cmd.dst_offset = destination_offset;
       cmd.copy_length = sizeof(UINT);
@@ -8768,10 +8934,21 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       } else dispatch->gpu_input = desc->Mode == kDispatchModeNodeGPUInput ? desc->NodeGPUInput : desc->MultiNodeGPUInput;
       auto *root = work_graph_->RootSignature(work_graph_index_);
       const uint64_t bytes = uint64_t(root->UploadQwords) * 8 + uint64_t(root->NumStaticSamplers) * 32 + 128;
-      if (!allocator_->CanAllocateGPUHeap(bytes, 64)) { RecordError(E_OUTOFMEMORY); return; }
-      dispatch->arguments = allocator_->gpu_heap_buffer_;
+      if (!allocator_->ReserveGPUHeap(bytes, 64)) { RecordError(E_OUTOFMEMORY); return; }
       dispatch->roots = EncodeRootArgument(root, rootarg_compute_staging_);
-      if (root->NumStaticSamplers) dispatch->samplers = EncodeStaticSamplers(root);
+      if (dispatch->roots == UINT64_MAX) return;
+      if (root->NumStaticSamplers) {
+        dispatch->samplers = EncodeStaticSamplers(root);
+        if (dispatch->samplers == UINT64_MAX) return;
+      }
+      if (root->UploadQwords || root->NumStaticSamplers) {
+        const auto binding = allocator_->ResolveGPUHeap(root->UploadQwords ? dispatch->roots : dispatch->samplers);
+        dispatch->arguments = binding.buffer;
+        if (root->UploadQwords)
+          dispatch->roots = binding.offset;
+        if (root->NumStaticSamplers)
+          dispatch->samplers = allocator_->ResolveGPUHeap(dispatch->samplers).offset;
+      }
       allocator_->InvalidateCurrentPass();
       auto *pass = allocator_->AllocatePass<WorkGraphEncoderData>(); pass->type = EncoderType::WorkGraph; pass->dispatch = std::move(dispatch);
       allocator_->InvalidateCurrentPass();
@@ -8902,7 +9079,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     arguments->HitGroupRecordCount = prepared.hit_group.record_count;
     arguments->CallableRecordStride = static_cast<uint32_t>(prepared.callable.stride);
     arguments->CallableRecordCount = prepared.callable.record_count;
-    FillRaytracingDispatchConstants(*arguments, *state_object, allocator_->gpu_heap_buffer_address_ + arguments_offset);
+    FillRaytracingDispatchConstants(*arguments, *state_object, allocator_->GPUHeapAddress(arguments_offset));
     arguments->DispatchWidth = desc->Width;
     arguments->DispatchHeight = desc->Height;
     arguments->DispatchDepth = desc->Depth;
@@ -8960,7 +9137,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
             ? uint64_t(dispatch_rootsig->UploadQwords) * sizeof(uint64_t) * MaxCommandCount + 128
             : 0;
     if (!CanStageRaytracingDispatch(MaxCommandCount) ||
-        !allocator_->CanAllocateGPUHeap(sizeof(raytracing::RaysIndirectControl) + blocks_bytes + grids_bytes +
+        !allocator_->ReserveGPUHeap(sizeof(raytracing::RaysIndirectControl) + blocks_bytes + grids_bytes +
                                             slot_root_bytes + 192,
                                         64)) {
       RecordError(E_OUTOFMEMORY);
@@ -8976,25 +9153,26 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     auto [control_memory, control_offset] = allocator_->AllocateGPUHeap(sizeof(raytracing::RaysIndirectControl), 16);
     auto [blocks_memory, blocks_offset] = allocator_->AllocateGPUHeap(blocks_bytes, 64);
     const auto grids_offset = std::get<1>(allocator_->AllocateGPUHeap(grids_bytes, 16));
-    const uint64_t heap = allocator_->gpu_heap_buffer_address_;
+    BeginPredicationComputePass(rays_indirect_pipeline_, 64);
+    const uint64_t blocks_address = allocator_->GPUHeapAddress(blocks_offset);
+    const uint64_t grids_address = allocator_->GPUHeapAddress(grids_offset);
     for (UINT i = 0; i < MaxCommandCount; ++i) {
       auto *arguments = reinterpret_cast<SM50_RT_DISPATCH_ARGUMENTS *>(static_cast<char *>(blocks_memory) + i * kBlockBytes);
       memset(arguments, 0, sizeof(*arguments));
-      FillRaytracingDispatchConstants(*arguments, *state_object, heap + blocks_offset + i * kBlockBytes);
+      FillRaytracingDispatchConstants(*arguments, *state_object, blocks_address + i * kBlockBytes);
     }
     auto *control = new (control_memory) raytracing::RaysIndirectControl{};
     control->arguments = ArgBufferAddress + sig->DrawArgumentOffset;
     control->count = CountBufferAddress;
-    control->predicate = predication_enabled_ ? heap + predication_snapshot_offset_ : 0;
-    control->dispatch_blocks = heap + blocks_offset;
-    control->grids = heap + grids_offset;
+    control->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
+    control->dispatch_blocks = blocks_address;
+    control->grids = grids_address;
     control->stride = sig->ByteStride;
     control->max_commands = MaxCommandCount;
     control->arguments_stride = static_cast<uint32_t>(kBlockBytes);
     control->predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
 
-    BeginPredicationComputePass(rays_indirect_pipeline_, 64);
-    BindPredicationBuffer(allocator_->gpu_heap_buffer_, control_offset, 0);
+    BindGPUHeapPredicationBuffer(control_offset, 0);
     auto &resolve = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
     resolve.type = WMTComputeCommandDispatch;
     resolve.size = {(uint64_t(MaxCommandCount) + 63) / 64, 1, 1};
@@ -9049,10 +9227,10 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
           error ? error.description().getUTF8String() : "no Metal error");
       return false;
     }
-    auto function = library.newFunction(raytracing::kRaysIndirectFunction);
+    auto function = WMT4::Library(library).newFunction(raytracing::kRaysIndirectFunction);
     if (!function)
       return false;
-    rays_indirect_pipeline_ = device_->GetMTLDevice().newComputePipelineState(function, error);
+    rays_indirect_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
     return bool(rays_indirect_pipeline_);
   }
 
@@ -9067,8 +9245,9 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       root_bytes = uint64_t(dispatch_rootsig->UploadQwords) * sizeof(uint64_t) + 64 +
                    uint64_t(dispatch_rootsig->NumStaticSamplers) * 4 * sizeof(uint64_t) + 64;
     const uint64_t per_dispatch = sizeof(SM50_RT_DISPATCH_ARGUMENTS) + 64 + 16;
-    return dispatches <= (kGPUHeapSize / per_dispatch) &&
-           allocator_->CanAllocateGPUHeap(per_dispatch * dispatches + root_bytes + 64, 64);
+    const uint64_t maximum = std::min<uint64_t>(SIZE_MAX, device_->GetMTLDevice().maxBufferLength());
+    return root_bytes + 64 <= maximum && dispatches <= (maximum - root_bytes - 64) / per_dispatch &&
+           allocator_->ReserveGPUHeap(per_dispatch * dispatches + root_bytes + 64, 64);
   }
 
   /** The dispatch constants every raytracing dispatch of `state_object` shares (the tables are the caller's). */
@@ -9106,8 +9285,9 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
      * buffer argument table, and those are per-dispatch values. A fresh table per dispatch keeps a
      * table that is already in flight immutable.
      */
+    const auto arguments_binding = allocator_->ResolveGPUHeap(arguments_offset);
     auto dispatch_intersection_table = state_object->CreateDispatchIntersectionFunctionTable(
-        allocator_->gpu_heap_buffer_, arguments_offset, rt_visible_function_table_
+        arguments_binding.buffer, arguments_binding.offset, rt_visible_function_table_
     );
     if (!dispatch_intersection_table) {
       RecordError(E_FAIL);
@@ -9139,18 +9319,20 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
         // An argument-changing ExecuteIndirect slot passes its own root copy.
         if (root_arguments_offset == ~0ull)
           root_arguments_offset = EncodeRootArgument(dispatch_rootsig, rootarg_compute_staging_);
+        if (root_arguments_offset == UINT64_MAX)
+          return false;
         auto &set_root_arguments = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         set_root_arguments.type = WMTComputeCommandSetBuffer;
-        set_root_arguments.buffer = allocator_->gpu_heap_buffer_;
-        set_root_arguments.offset = root_arguments_offset;
+        allocator_->BindGPUHeap(set_root_arguments.buffer, set_root_arguments.offset, root_arguments_offset);
         set_root_arguments.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
       }
       if (dispatch_rootsig->NumStaticSamplers) {
         auto static_samplers_offset = EncodeStaticSamplers(dispatch_rootsig);
+        if (static_samplers_offset == UINT64_MAX)
+          return false;
         auto &set_static_samplers = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         set_static_samplers.type = WMTComputeCommandSetBuffer;
-        set_static_samplers.buffer = allocator_->gpu_heap_buffer_;
-        set_static_samplers.offset = static_samplers_offset;
+        allocator_->BindGPUHeap(set_static_samplers.buffer, set_static_samplers.offset, static_samplers_offset);
         set_static_samplers.index = SM50_BINDING_INDEX_STATIC_SAMPLERS;
       }
     }
@@ -9162,8 +9344,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
 
     auto &set_arguments = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
     set_arguments.type = WMTComputeCommandSetBuffer;
-    set_arguments.buffer = allocator_->gpu_heap_buffer_;
-    set_arguments.offset = arguments_offset;
+    allocator_->BindGPUHeap(set_arguments.buffer, set_arguments.offset, arguments_offset);
     set_arguments.index = SM50_RT_BINDING_INDEX_DISPATCH;
 
     /* The ray generation shader receives the per-dispatch table as its argument, so it is the one bound. */
@@ -9186,8 +9367,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       /* The traversal runs one thread per threadgroup (threadgroup size 1), so threadgroups are rays. */
       auto &dispatch_rays = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
       dispatch_rays.type = WMTComputeCommandDispatchIndirect;
-      dispatch_rays.indirect_args_buffer = allocator_->gpu_heap_buffer_;
-      dispatch_rays.indirect_args_offset = indirect_grid_offset;
+      allocator_->BindGPUHeap(dispatch_rays.indirect_args_buffer, dispatch_rays.indirect_args_offset, indirect_grid_offset);
     }
     return true;
   }

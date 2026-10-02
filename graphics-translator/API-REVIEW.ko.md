@@ -1,5 +1,25 @@
 # Owned D3D12 temporal / NGX API correctness review
 
+> 아래 후속 절은 현재 루트 소스 계약이다. 그 뒤의 build/owned-graphics-20260919 검토는 해당 과거 snapshot의 기록이며 현행 backlog가 아니다.
+
+## 후속 P0 discovery와 필수 Metal4FX 선행 구현 — 2026-10-02
+
+2026-10-02 현재 루트 `src/nvngx`, `src/d3d12/d3d12_temporal.cpp`, command list/allocator/queue와 Metal 4 FX bridge를 기준으로 정리했다. Source inspection, full SR/FG port의 기존 runtime 증거, 후속 P0 discovery proof를 구분한다. 문서 편집 자체는 새 GPU/game 실행이 아니다.
+
+Create는 `IsHDR` bit를 허용한다. Full SR port는 explicit linear/sRGB/PQ transfer와 GPU 전후처리를 구현했으므로 “transfer selector/변환 전체가 없다”는 과거 판정은 현재 backend에 적용하지 않는다. 다만 NGX HDR bit 하나를 FSR의 explicit transfer/luminance 계약과 동일시하거나 HDR/LDR의 DLSS↔MetalFX 모델·품질 동등성을 주장하지 않는다. Gamma 2.2 같은 임의 보정을 추가할 근거도 없다.
+
+P0-4 수정 후 `GetFeatureRequirements`는 adapter의 owned native Metal device에 대해 Init과 동일한 `WMT4::TemporalFeature::Supports` predicate를 사용한다. 유효한 미지원/비owned adapter의 SuperSampling discovery는 **Success + AdapterUnsupported(4)**이며 native 지원을 가장하지 않는다. Null 인자와 미지원 feature ID의 오류는 별도다. 완료 증거와 scope는 [P0 공개 계약](CORE-IMPLEMENTATION-STATUS.ko.md#p0-공개-계약-정합)을 따른다.
+
+Full SR backend는 runtime MetalFX descriptor의 min/max scale과 texture usage를 조회한다. FSR의 max 초과 output은 균일 배율로 floor한 centered active 영역과 opaque-black margin으로 처리하며 output subrect 밖은 보존한다. 특정 장치의 max3을 고정 [1,3] backend 계약이나 모든 device/OS의 보장으로 해석하지 않는다. NGX quality callback의 별도 sizing policy와 native scaler capability도 구분한다.
+
+Color/depth/MV/mask texture backing extent는 같을 필요가 없다. 현재 계약은 각 active subrect가 해당 view bounds 안에 들어가는 것이다. 현재 full-port fixture의 offset·독립 mask rect·dynamic extent proof를 근거로 삼으며, 과거 classic probe만으로 Metal4FX 지원을 추론하지 않는다.
+
+High-res/jittered MV, reactive/composition masks, 공식 color/depth/MV/mask/output subrect offsets와 RCAS sharpening은 full port로 구현됐다. NGX DoSharpening bit는 native descriptor 기능이 아니라 별도 GPU post-operation을 켠다(비활성 상태의 nonzero Sharpness는 거부). Alpha-upscale bit128·reserved/unknown flags, nonidentity Exposure.Scale과 nonzero MV.Offset.X/Y는 여전히 거부한다. MV 값 bias와 이미 지원하는 MV texture subrect offset을 혼동하지 않는다.
+
+MSVC parameter facade는 **x64-only**다. x86/ARM64/ARM64EC public NGX facade는 현재 지원 선언에 포함하지 않는다. ARM64/FEX guest execution은 사용자 보류 항목이며 이번 P0 작업으로 재개하지 않는다. D3D12 backend WoW64·ARM64 compiler/native proof를 public NGX ABI proof로 바꾸지 않는다.
+
+## 이전 snapshot 검토 기록
+
 이 문서는 `build/owned-graphics-20260919/dxmt`의 owned D3D12 temporal backend와
 `build/owned-graphics-20260919/ngx-work`의 `nvngx.dll` D3D12 frontend를 실제 소스 기준으로
 교차 검토한 결과다. `graphics-translator/NGX-INTEGRATION.ko.md`의 설명보다 현재 소스를 우선했고,

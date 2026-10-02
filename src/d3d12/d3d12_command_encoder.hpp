@@ -23,7 +23,7 @@
 #include "dxmt_buffer.hpp"
 #include "dxmt_texture.hpp"
 #include "util_svector.hpp"
-#include "owned_query_timestamps.hpp"
+#include "Metal4Query.hpp"
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -348,6 +348,7 @@ struct StreamOutputDrawData {
   Rc<BufferAllocation> index_owner;
   uint64_t index_offset = 0;
   uint64_t params_offset = 0;
+  const StreamOutputAssemblyParams *params_cpu = nullptr;
   uint64_t control_offset = 0;
   uint64_t counters_offset = 0;
   uint64_t statistics_offset = 0;
@@ -385,9 +386,11 @@ struct SOIndirectEncoderData {
   WMT::Reference<WMT::RenderPipelineState> resolver_pipeline;
   WMT::Reference<WMT::ComputePipelineState> argument_resolver;
   WMT::Reference<WMT::RenderPipelineState> draw_pipeline;
+  WMT::Buffer static_sampler_buffer;
   uint64_t static_sampler_offset = 0;
   uint32_t strip_cut = 0;
   bool msaa = false;
+  bool shader_view_locations = false;
 };
 
 /*
@@ -419,9 +422,9 @@ struct MeshCaptureIndirectData {
   std::vector<StreamOutputAssemblyParams> so_params;  // per chained stream, copied from the recording heap
   WMT::Buffer index_buffer;
   uint64_t index_offset = 0;
-  WMT::Buffer binding_heap;
+  WMT::Buffer root_heap, vertex_heap, predicate_heap;
   uint64_t root_offset = 0, root_stride = 0, vertex_offset = 0, vertex_stride = 0;
-  const uint8_t *binding_memory = nullptr;
+  const uint8_t *root_memory = nullptr, *vertex_memory = nullptr;
   std::vector<uint32_t> root_view_offsets;
   uint32_t vertex_mask = 0;
   bool update_index = false;
@@ -671,8 +674,7 @@ struct QueryEncoderData : EncoderData {
   WMT::Reference<WMT::Buffer> counters;
   uint64_t counters_offset = 0;
   uint64_t snapshot_offset = 0;
-  WMT::Reference<WMT::CounterSampleBuffer> timestamp_samples;
-  std::shared_ptr<owned_graphics::QueryTimestampProducers> timestamp_producers;
+  WMT::Reference<WMT::MTL4CounterHeap> timestamp_samples;
   WMT::Reference<WMT::Buffer> source;
   WMT::Reference<WMT::Buffer> destination;
   WMT::Reference<WMT::Buffer> timestamp_dummy;
@@ -713,7 +715,7 @@ struct RTASEncoderData : EncoderData {
   raytracing::BuildInputs deferredInputs;
   raytracing::BufferLocation sourceLocation{}, destinationLocation{};
   RTASOperation operation{};
-  WMT::Reference<WMT::AccelerationStructureDescriptor> descriptor;
+  WMT::Reference<WMT::MTL4AccelerationStructureDescriptor> descriptor;
   WMT::Reference<WMT::AccelerationStructureSidecar> source;
   WMT::Reference<WMT::AccelerationStructureSidecar> destination;
   WMT::Reference<WMT::Buffer> sourceInstances;

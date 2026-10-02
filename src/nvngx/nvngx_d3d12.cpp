@@ -4,6 +4,8 @@
 #include "log/log.hpp"
 #include "nvngx_parameter.hpp"
 #include "../d3d12/d3d12_interfaces.hpp"
+#include "dxgi_interfaces.h"
+#include "Metal4FX.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -31,9 +33,10 @@ namespace {
 __attribute__((used)) static const char kOwnedNgxD3D12Marker[] = "own-ngxd3d12";
 
 constexpr uint32_t kFeatureSuperSampling = 1;
+constexpr auto kSupportAdapterUnsupported = static_cast<NVNGX_FEATURE_SUPPORT_RESULT>(4);
 constexpr uint32_t kSupportedCreateFlags =
     NVNGX_DLSS_FLAG_HDR | NVNGX_DLSS_FLAG_MV_LOWRES | NVNGX_DLSS_FLAG_DEPTH_INVERTED |
-    NVNGX_DLSS_FLAG_DO_SHARPENING | NVNGX_DLSS_FLAG_AUTO_EXPOSURE;
+    NVNGX_DLSS_FLAG_MV_JITTERED | NVNGX_DLSS_FLAG_DO_SHARPENING | NVNGX_DLSS_FLAG_AUTO_EXPOSURE;
 
 // Keep the legacy D3D11 shim's historical 0x0bad000x values untouched, but
 // return NVIDIA's actual public ABI values from every new D3D12 entry point.
@@ -65,6 +68,7 @@ struct FeatureState {
   Com<ID3D12Device> device;
   Com<IMTLD3D12TemporalUpscaleState> backend;
   MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC create = {};
+  bool sharpening = false;
 };
 
 struct ParameterState {
@@ -379,9 +383,10 @@ parseCreate(const ParametersImpl *params, ID3D12Device *device, MTL_TEMPORAL_UPS
   if (flags < 0)
     return kResultUnsupportedParameter;
   desc->FeatureFlags = static_cast<uint32_t>(flags);
-  if ((desc->FeatureFlags & ~kSupportedCreateFlags) != 0 ||
-      (desc->FeatureFlags & NVNGX_DLSS_FLAG_MV_LOWRES) == 0)
+  if ((desc->FeatureFlags & ~kSupportedCreateFlags) != 0)
     return kResultUnsupportedParameter;
+  // Sharpening is a ported post-operation, not a MetalFX descriptor feature.
+  desc->FeatureFlags &= ~NVNGX_DLSS_FLAG_DO_SHARPENING;
 
   const int subrects = getOptionalInt(params, "DLSS.Enable.Output.Subrects", 0);
   if (subrects != 0 && subrects != 1)
@@ -414,8 +419,7 @@ parseFrame(
   desc->ExposureTexture = getOptionalResource(params, NVNGX_Parameter_ExposureTexture);
   desc->BiasCurrentColorMask = getOptionalResource(params, NVNGX_Parameter_BiasCurrentColorMask);
   desc->TransparencyMask = getOptionalResource(params, NVNGX_Parameter_TransparencyMask);
-  if (desc->BiasCurrentColorMask || desc->TransparencyMask)
-    return kResultUnsupportedParameter;
+  desc->CombineCompositionMask = desc->TransparencyMask != nullptr;
 
   bool has_width = false, has_height = false;
   desc->InputContentWidth = getOptionalUInt(
@@ -442,21 +446,17 @@ parseFrame(
       {NVNGX_Parameter_DLSS_Motion_Base_Y, &desc->MotionBaseY},
       {NVNGX_Parameter_DLSS_Bias_Base_X, &desc->BiasBaseX},
       {NVNGX_Parameter_DLSS_Bias_Base_Y, &desc->BiasBaseY},
+      {NVNGX_Parameter_DLSS_Translucency_Base_X, &desc->CompositionBaseX},
+      {NVNGX_Parameter_DLSS_Translucency_Base_Y, &desc->CompositionBaseY},
   };
-  for (const auto &offset : offsets) {
+  for (const auto &offset : offsets)
     *offset.value = getOptionalUInt(params, offset.name, 0);
-    if (*offset.value)
-      return kResultUnsupportedParameter;
-  }
   // Output base is only meaningful for a feature created with output subrects
   // enabled. When it is enabled the backend owns logical-output-vs-backing
   // bounds validation; the frontend must not guess or clamp the rectangle.
   desc->OutputBaseX = getOptionalUInt(params, NVNGX_Parameter_DLSS_Output_Base_X, 0);
   desc->OutputBaseY = getOptionalUInt(params, NVNGX_Parameter_DLSS_Output_Base_Y, 0);
   if ((desc->OutputBaseX || desc->OutputBaseY) && !feature.create.OutputSubrectsEnabled)
-    return kResultUnsupportedParameter;
-  if (getOptionalUInt(params, NVNGX_Parameter_DLSS_Translucency_Base_X, 0) ||
-      getOptionalUInt(params, NVNGX_Parameter_DLSS_Translucency_Base_Y, 0))
     return kResultUnsupportedParameter;
 
   desc->JitterOffsetX = getOptionalFloat(params, NVNGX_Parameter_Jitter_Offset_X, 0.0f);
@@ -466,18 +466,25 @@ parseFrame(
   const float raw_pre_exposure = getOptionalFloat(params, NVNGX_Parameter_DLSS_Pre_Exposure, 0.0f);
   const float raw_exposure_scale = getOptionalFloat(params, NVNGX_Parameter_DLSS_Exposure_Scale, 0.0f);
   const float sharpness = getOptionalFloat(params, NVNGX_Parameter_Sharpness, 0.0f);
+  const float motion_offset_x = getOptionalFloat(params, "MV.Offset.X", 0.0f);
+  const float motion_offset_y = getOptionalFloat(params, "MV.Offset.Y", 0.0f);
   if (!std::isfinite(desc->JitterOffsetX) || !std::isfinite(desc->JitterOffsetY) ||
       !std::isfinite(desc->MotionVectorScaleX) || !std::isfinite(desc->MotionVectorScaleY) ||
-      !std::isfinite(raw_pre_exposure) || !std::isfinite(raw_exposure_scale) || !std::isfinite(sharpness))
+      !std::isfinite(raw_pre_exposure) || !std::isfinite(raw_exposure_scale) || !std::isfinite(sharpness) ||
+      !std::isfinite(motion_offset_x) || !std::isfinite(motion_offset_y))
     return kResultInvalidParameter;
   if (desc->MotionVectorScaleX == 0.0f || desc->MotionVectorScaleY == 0.0f || raw_pre_exposure < 0.0f ||
-      raw_exposure_scale < 0.0f)
+      raw_exposure_scale < 0.0f || sharpness < 0.0f || sharpness > 1.0f)
     return kResultInvalidParameter;
 
   desc->PreExposure = raw_pre_exposure == 0.0f ? 1.0f : raw_pre_exposure;
   desc->ExposureScale = raw_exposure_scale == 0.0f ? 1.0f : raw_exposure_scale;
-  if (desc->ExposureScale != 1.0f || sharpness != 0.0f)
+  // The reference has no exposure multiplier or additive MV-offset contract.
+  if (desc->ExposureScale != 1.0f || motion_offset_x != 0.0f || motion_offset_y != 0.0f ||
+      (!feature.sharpening && sharpness != 0.0f))
     return kResultUnsupportedParameter;
+  desc->EnableSharpening = feature.sharpening ? TRUE : FALSE;
+  desc->Sharpness = sharpness;
   desc->ResetHistory = getOptionalInt(params, NVNGX_Parameter_Reset, 0) ? TRUE : FALSE;
   return kResultSuccess;
 }
@@ -691,9 +698,9 @@ NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D12_GetScratchBufferSize(unsigned int feature, const NVNGXParameter *, size_t *out_size) {
   if (!out_size)
     return kResultInvalidParameter;
+  *out_size = 0;
   if (feature != kFeatureSuperSampling)
     return kResultFeatureNotSupported;
-  *out_size = 0;
   return kResultSuccess;
 }
 
@@ -701,9 +708,11 @@ NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D12_CreateFeature(
     ID3D12GraphicsCommandList *list, unsigned int feature, NVNGXParameter *params, NVNGXHandle **out_handle
 ) {
-  if (!list || !params || !out_handle)
+  if (!out_handle)
     return kResultInvalidParameter;
   *out_handle = nullptr;
+  if (!list || !params)
+    return kResultInvalidParameter;
   if (feature != kFeatureSuperSampling)
     return kResultFeatureNotSupported;
 
@@ -734,6 +743,8 @@ NVSDK_NGX_D3D12_CreateFeature(
   state->device = device_entry.device;
   state->backend = std::move(backend);
   state->create = create;
+  state->sharpening = (getOptionalInt(parameter->storage.get(), NVNGX_Parameter_DLSS_Feature_Create_Flags, 0) &
+      NVNGX_DLSS_FLAG_DO_SHARPENING) != 0;
 
   auto *public_handle = allocateFeatureHandle();
   if (!public_handle)
@@ -803,14 +814,16 @@ NVSDK_NGX_D3D12_GetFeatureRequirements(
 ) {
   if (!adapter || !discovery_info || !requirement)
     return kResultInvalidParameter;
+  requirement->FeatureSupported = kSupportAdapterUnsupported;
+  requirement->MinHWArchitecture = 0;
+  requirement->MinOSVersion[0] = 0;
   if (discovery_info->FeatureID != NVNGX_FEATURE_SUPERSAMPLING) {
-    requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_UNSUPPORTED;
-    requirement->MinHWArchitecture = 0;
-    requirement->MinOSVersion[0] = 0;
     return kResultFeatureNotSupported;
   }
+  const auto owned_adapter = Com<IMTLDXGIAdapter>::queryFrom(adapter);
+  if (!owned_adapter || !WMT4::TemporalFeature::Supports(owned_adapter->GetMTLDevice()))
+    return kResultSuccess;
   requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_SUPPORTED;
-  requirement->MinHWArchitecture = 0;
   strcpy_s(requirement->MinOSVersion, "10.0.16299.0");
   return kResultSuccess;
 }

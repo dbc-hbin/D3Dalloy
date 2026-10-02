@@ -22,6 +22,7 @@
 #include <unistd.h>
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
+#include "../winemetal_metal4.h"
 #include "../airconv_thunks.h"
 #include "winemetal_rt.h"
 #include "rt_acceleration_structure.h"
@@ -322,10 +323,6 @@ _MTLDevice_newDepthStencilState(void *obj) {
   params->ret = (obj_handle_t)[device newDepthStencilStateWithDescriptor:desc];
   [desc release];
   return STATUS_SUCCESS;
-}
-
-MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format) {
-  return (MTLPixelFormat)ORIGINAL_FORMAT(format);
 }
 
 void
@@ -2282,6 +2279,34 @@ struct SM50_SHADER_D3D12_LOGIC_OP_DATA32 {
 };
 _Static_assert(sizeof(struct SM50_SHADER_D3D12_LOGIC_OP_DATA32) == 48, "Wine32 logic op argument size");
 
+struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t view_count;
+  uint32_t viewport_offsets[4];
+  uint32_t render_target_offsets[4];
+};
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA32) == 44,
+               "Wine32 indirect view locations argument size");
+_Static_assert(_Alignof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA32) == 4,
+               "Wine32 indirect view locations argument alignment");
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA32, view_count) == 8,
+               "Wine32 indirect view count offset");
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA32, viewport_offsets) == 12,
+               "Wine32 indirect viewport offsets offset");
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA32, render_target_offsets) == 28,
+               "Wine32 indirect render target offsets offset");
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA) == 48,
+               "Native indirect view locations argument size");
+_Static_assert(_Alignof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA) == 8,
+               "Native indirect view locations argument alignment");
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA, view_count) == 12,
+               "Native indirect view count offset");
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA, viewport_offsets) == 16,
+               "Native indirect viewport offsets offset");
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA, render_target_offsets) == 32,
+               "Native indirect render target offsets offset");
+
 struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA32 {
   uint32_t next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
@@ -2515,6 +2540,19 @@ sm50_compilation_argument32_convert(
       data->op = src->op;
       data->rt_mask = src->rt_mask;
       memcpy(data->component_bits, src->component_bits, sizeof(data->component_bits));
+      break;
+    }
+    case SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS: {
+      const struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA *data = calloc(1, sizeof(*data));
+      if (!data)
+        return false;
+      last_arg->next = data;
+      last_arg = (void *)data;
+      data->type = src->type;
+      data->view_count = src->view_count;
+      memcpy(data->viewport_offsets, src->viewport_offsets, sizeof(data->viewport_offsets));
+      memcpy(data->render_target_offsets, src->render_target_offsets, sizeof(data->render_target_offsets));
       break;
     }
     case SM50_SHADER_D3D12_INDEX_PULL:
@@ -5537,6 +5575,7 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTUnimplemented, /* 311: reserved (VIEWINST) */
     &thunk_SM50WGReflectLibrary, /* 312: work graph library reflection */
     &thunk_SM50WGCompileNode, /* 313: work graph node compilation */
+    &winemetal_metal4_call, /* 314: fixed-width typed Metal4 operation ABI */
 };
 
 #ifndef DXMT_NATIVE
@@ -5846,5 +5885,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTUnimplemented, /* 311: reserved (VIEWINST) */
     &thunk32_SM50WGReflectLibrary, /* 312: work graph library reflection */
     &thunk32_SM50WGCompileNode, /* 313: work graph node compilation */
+    &winemetal_metal4_call, /* 314: identical POD layout; nested caller pointers are zero-extended */
 };
 #endif

@@ -27,6 +27,7 @@ struct MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC {
     UINT FeatureFlags;
     BOOL OutputSubrectsEnabled;
     UINT CreationNodeMask, VisibilityNodeMask;
+    BOOL DynamicOutputEnabled;
 };
 
 struct MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC {
@@ -46,6 +47,13 @@ struct MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC {
     FLOAT MotionVectorScaleX, MotionVectorScaleY;
     FLOAT PreExposure, ExposureScale;
     BOOL ResetHistory;
+    UINT OutputWidth, OutputHeight;
+    UINT MotionContentWidth, MotionContentHeight;
+    UINT CompositionBaseX, CompositionBaseY;
+    UINT ColorTransfer;
+    BOOL CombineCompositionMask, EnableSharpening;
+    FLOAT Sharpness;
+    BOOL CapOutputToTemporalMaxScale;
 };
 
 struct IMTLD3D12TemporalUpscaleState : public IUnknown {};
@@ -67,17 +75,17 @@ struct IMTLD3D12GraphicsCommandListExt : public IUnknown {
 constexpr GUID kIID_IMTLD3D12TemporalUpscaleState = {
     0xc8a9134e, 0xf27c, 0x4e75, {0x90, 0x9f, 0xf1, 0x44, 0x39, 0xb9, 0x18, 0xe1}};
 constexpr GUID kIID_IMTLD3D12DeviceExt = {
-    0xed85c4e9, 0xe8fd, 0x491b, {0x95, 0x95, 0xd9, 0xa3, 0x69, 0xec, 0x12, 0xb2}};
+    0xed85c4e9, 0xe8fd, 0x491b, {0x95, 0x95, 0xd9, 0xa3, 0x69, 0xec, 0x12, 0xb3}};
 constexpr GUID kIID_IMTLD3D12GraphicsCommandListExt = {
-    0xd7bc6ed0, 0x6a8a, 0x4a0e, {0x84, 0x08, 0x5a, 0x26, 0xc0, 0xb0, 0x6d, 0x0e}};
+    0xd7bc6ed0, 0x6a8a, 0x4a0e, {0x84, 0x08, 0x5a, 0x26, 0xc0, 0xb0, 0x6d, 0x0f}};
 
-static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC) == 36);
+static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC) == 40);
 #ifdef _WIN64
 static_assert(offsetof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC, Color) == 8);
-static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 144);
+static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 184);
 #else
 static_assert(offsetof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC, Color) == 4);
-static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 108);
+static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 152);
 #endif
 
 namespace {
@@ -540,9 +548,10 @@ struct OutputStats {
 
 OutputStats validateOutput(const OutputResource& output, std::uint8_t inputTag,
                            const char* caseName, UINT frame,
-                           UINT outputBaseX = 0, UINT outputBaseY = 0) {
-    if (outputBaseX + kOutputWidth > kOutputBacking ||
-        outputBaseY + kOutputHeight > kOutputBacking)
+                           UINT outputBaseX = 0, UINT outputBaseY = 0,
+                           UINT outputWidth = kOutputWidth, UINT outputHeight = kOutputHeight) {
+    if (!outputWidth || !outputHeight || outputBaseX + outputWidth > kOutputBacking ||
+        outputBaseY + outputHeight > kOutputBacking)
         fail("output validation rectangle exceeds backing");
     D3D12_RANGE range{0, static_cast<SIZE_T>(output.readback.totalBytes)};
     std::uint8_t* data = nullptr;
@@ -559,8 +568,8 @@ OutputStats validateOutput(const OutputResource& output, std::uint8_t inputTag,
         for (UINT x = 0; x < kOutputBacking; ++x) {
             const std::uint8_t* pixel = row + static_cast<std::size_t>(x) * 4;
             const bool inside =
-                x >= outputBaseX && x < outputBaseX + kOutputWidth &&
-                y >= outputBaseY && y < outputBaseY + kOutputHeight;
+                x >= outputBaseX && x < outputBaseX + outputWidth &&
+                y >= outputBaseY && y < outputBaseY + outputHeight;
             if (!inside) {
                 if (!std::equal(output.sentinel.begin(), output.sentinel.end(), pixel)) {
                     output.readback.buffer->Unmap(0, nullptr);
@@ -591,7 +600,7 @@ OutputStats validateOutput(const OutputResource& output, std::uint8_t inputTag,
     const double expectedMean = static_cast<double>(inputTag) / 255.0;
     const double delta = std::fabs(stats.mean - expectedMean);
     const std::size_t logicalPixels =
-        static_cast<std::size_t>(kOutputWidth) * kOutputHeight;
+        static_cast<std::size_t>(outputWidth) * outputHeight;
     if (changedInside < logicalPixels * 3 / 4)
         fail("logical output remained sentinel/stale");
     if (!(stats.mean > 0.05 && stats.mean < 0.95))
@@ -733,6 +742,150 @@ void runCreateFlagNegative(IMTLD3D12DeviceExt* extension) {
     if (state)
         state.Reset();
     expectHRESULT(hr, E_NOTIMPL, "unrecognized_feature_flags");
+    desc = makeCreateDesc();
+    desc.FeatureFlags |= 128;
+    expectHRESULT(extension->CreateTemporalUpscaleState(&desc, &state),
+                  E_NOTIMPL, "unsupported_alpha_upscaling");
+    if (state)
+        fail("unsupported alpha returned state");
+}
+
+void runR32ExposureReplay(Gpu& gpu, IMTLD3D12DeviceExt* extension,
+                          ID3D12Resource* depth, ID3D12Resource* motion) {
+    auto create = makeCreateDesc();
+    create.FeatureFlags = kFlagMvLowRes | kFlagDepthInverted | 1; // HDR, manual exposure.
+    ComPtr<IMTLD3D12TemporalUpscaleState> state32, state16;
+    check(extension->CreateTemporalUpscaleState(&create, &state32), "manual exposure state32");
+    check(extension->CreateTemporalUpscaleState(&create, &state16), "manual exposure state16");
+    auto color = createTexture(gpu.device.Get(), kInputWidth, kInputHeight,
+                               DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+    std::vector<std::uint16_t> pixels(kInputWidth * kInputHeight * 4);
+    for (UINT y = 0; y < kInputHeight; ++y)
+        for (UINT x = 0; x < kInputWidth; ++x) {
+            const UINT i = (y * kInputWidth + x) * 4;
+            // Structured HDR contrasts exercise exposure-dependent reconstruction.
+            pixels[i] = ((x ^ y) & 1) ? 0x4400 : 0x3400; // 4 / 0.25
+            pixels[i + 1] = (x % 7) ? 0x3c00 : 0x4800; // 1 / 8
+            pixels[i + 2] = (y % 5) ? 0x3800 : 0x4000; // 0.5 / 2
+            pixels[i + 3] = 0x3c00;
+        }
+    uploadTexture(gpu, color.Get(), pixels.data(), kInputWidth * 8,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    auto exposure32 = createTexture(gpu.device.Get(), 1, 1, DXGI_FORMAT_R32_FLOAT,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto exposure16 = createTexture(gpu.device.Get(), 1, 1, DXGI_FORMAT_R16_FLOAT,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heapDesc.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(gpu.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)), "exposure RTV heap");
+    const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    gpu.device->CreateRenderTargetView(exposure32.Get(), nullptr, rtv);
+    OutputResource output32, output16;
+    for (auto* output : {&output32, &output16}) {
+        output->resource = createTexture(gpu.device.Get(), kOutputWidth, kOutputHeight,
+            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        output->readback = createTextureReadback(gpu, output->resource.Get());
+    }
+    auto desc32 = makeFrameDesc(color.Get(), output32.resource.Get(), depth, motion, TRUE);
+    desc32.ExposureTexture = exposure32.Get();
+    auto desc16 = makeFrameDesc(color.Get(), output16.resource.Get(), depth, motion, TRUE);
+    desc16.ExposureTexture = exposure16.Get();
+    // Record before the R32 texel has ever been GPU-produced. This must not
+    // snapshot exposure on the CPU or convert only at recording time.
+    auto recording32 = recordTemporal(gpu, state32.Get(), desc32, output32);
+    auto recording16 = recordTemporal(gpu, state16.Get(), desc16, output16);
+    state32.Reset();
+    state16.Reset();
+    constexpr float values[] = {0.3333f, 1.234567f, 3.14159f};
+    // Independent IEEE round-to-nearest-even oracle, uploaded as half bits.
+    constexpr std::uint16_t rounded[] = {0x3555, 0x3cf0, 0x4248};
+    std::vector<std::uint16_t> previous;
+    UINT changedWithExposure = 0;
+    for (UINT replay = 0; replay < 3; ++replay) {
+        if (replay) {
+            auto barrier = gpu.makeRecording();
+            transition(barrier.list.Get(), exposure16.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_COPY_DEST);
+            check(barrier.list->Close(), "exposure16 reupload transition");
+            gpu.executeAndWait(barrier.list.Get());
+        }
+        uploadTexture(gpu, exposure16.Get(), &rounded[replay], sizeof(rounded[replay]),
+                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        auto producer = gpu.makeRecording();
+        if (replay)
+            transition(producer.list.Get(), exposure32.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const float clear[] = {values[replay], 0, 0, 1};
+        producer.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        transition(producer.list.Get(), exposure32.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        check(producer.list->Close(), "GPU exposure producer Close");
+        ComPtr<ID3D12Fence> gate;
+        if (replay == 2) {
+            check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)),
+                  "exposure release gate");
+            check(gpu.queue->Wait(gate.Get(), 1), "exposure release gate wait");
+        }
+        ID3D12CommandList* lists[] = {producer.list.Get(), recording32.list.Get(), recording16.list.Get()};
+        gpu.queue->ExecuteCommandLists(3, lists);
+        ComPtr<ID3D12Fence> completion;
+        check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion)),
+              "exposure completion fence");
+        check(gpu.queue->Signal(completion.Get(), 1), "exposure completion signal");
+        if (replay == 2) {
+            exposure32.Reset();
+            exposure16.Reset();
+            color.Reset();
+            heap.Reset();
+            recording32.extension.Reset();
+            recording16.extension.Reset();
+            check(recording32.list->Reset(recording32.allocator.Get(), nullptr), "exposure release recording32");
+            check(recording16.list->Reset(recording16.allocator.Get(), nullptr), "exposure release recording16");
+            check(recording32.list->Close(), "exposure release32 Close");
+            check(recording16.list->Close(), "exposure release16 Close");
+            producer.extension.Reset();
+            check(producer.list->Reset(producer.allocator.Get(), nullptr), "exposure release producer");
+            check(producer.list->Close(), "exposure release producer Close");
+            check(gate->Signal(1), "exposure release gate signal");
+        }
+        waitForFenceValue(completion.Get(), 1, "exposure GPU completion timeout");
+        std::uint8_t* mapped32 = nullptr;
+        std::uint8_t* mapped16 = nullptr;
+        check(output32.readback.buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped32)),
+              "exposure output32 Map");
+        check(output16.readback.buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped16)),
+              "exposure output16 Map");
+        std::vector<std::uint16_t> current;
+        UINT maxUlp = 0;
+        for (UINT y = 0; y < kOutputHeight; ++y) {
+            const auto* row32 = reinterpret_cast<const std::uint16_t*>(mapped32 + output32.readback.footprint.Offset +
+                y * output32.readback.footprint.Footprint.RowPitch);
+            const auto* row16 = reinterpret_cast<const std::uint16_t*>(mapped16 + output16.readback.footprint.Offset +
+                y * output16.readback.footprint.Footprint.RowPitch);
+            for (UINT x = 0; x < kOutputWidth * 4; ++x) {
+                if ((row32[x] & 0x7c00) == 0x7c00 || (row16[x] & 0x7c00) == 0x7c00)
+                    fail("nonfinite manual exposure output");
+                maxUlp = std::max(maxUlp, static_cast<UINT>(std::abs(int(row32[x]) - int(row16[x]))));
+                current.push_back(row32[x]);
+            }
+        }
+        output32.readback.buffer->Unmap(0, nullptr);
+        output16.readback.buffer->Unmap(0, nullptr);
+        if (maxUlp > 1)
+            fail("R32 exposure differs from correctly rounded R16 oracle");
+        if (!previous.empty() && current != previous)
+            ++changedWithExposure;
+        previous = std::move(current);
+        std::printf("OWNED_D3D12_TEMPORAL_CASE_PASS case=r32_exposure_numeric replay=%u exposure=%.9g "
+                    "r16_bits=0x%04x max_output_ulp=%u gpu_producer=rtv_clear release_before_completion=%u\n",
+                    replay, values[replay], rounded[replay], maxUlp, replay == 2);
+    }
+    if (!changedWithExposure)
+        fail("manual exposure oracle insensitive to changed replay source");
 }
 
 void runCommandListCreationNegatives(Gpu& gpu) {
@@ -796,6 +949,11 @@ void runOutputSubrectPositive(Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
     desc.OutputBaseY = kSubrectBaseY;
 
     Recording recording = gpu.makeRecording();
+    auto invalid = desc;
+    invalid.OutputBaseX = kOutputBacking - kOutputWidth + 1;
+    invalid.CapOutputToTemporalMaxScale = TRUE;
+    expectHRESULT(recording.extension->TemporalUpscale(state.Get(), &invalid),
+                  E_INVALIDARG, "capped_output_full_rect_bounds");
     transition(recording.list.Get(), output.resource.Get(),
                D3D12_RESOURCE_STATE_COPY_SOURCE,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -855,10 +1013,10 @@ void runFrameNegatives(Gpu& gpu, IMTLD3D12TemporalUpscaleState* state,
     {
         Recording recording = gpu.makeRecording();
         auto desc = base;
-        desc.BiasBaseX = 1;
+        desc.DepthBaseY = 1;
         expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
-                      E_NOTIMPL, "invalid_optional_bias_offset");
-        check(recording.list->Close(), "negative bias offset Close");
+                      E_INVALIDARG, "depth_input_bounds");
+        check(recording.list->Close(), "negative depth bounds Close");
     }
 
     {
@@ -866,8 +1024,43 @@ void runFrameNegatives(Gpu& gpu, IMTLD3D12TemporalUpscaleState* state,
         auto desc = base;
         desc.ColorBaseX = 1;
         expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
-                      E_NOTIMPL, "nonzero_color_input_offset");
-        check(recording.list->Close(), "negative color input offset Close");
+                      E_INVALIDARG, "color_input_bounds");
+        check(recording.list->Close(), "negative color bounds Close");
+    }
+
+    {
+        Recording recording = gpu.makeRecording();
+        auto desc = base;
+        desc.MotionBaseX = std::numeric_limits<UINT>::max();
+        expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
+                      E_INVALIDARG, "motion_input_bounds_overflow");
+        desc = base;
+        desc.Output = nullptr;
+        expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
+                      E_INVALIDARG, "missing_output");
+        desc = base;
+        desc.OutputBaseX = 1;
+        expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
+                      E_INVALIDARG, "output_subrect_without_opt_in");
+        check(recording.list->Close(), "negative output guards Close");
+    }
+
+    {
+        Gpu foreign;
+        auto foreignColor = makeColor(foreign, 112);
+        Recording recording = gpu.makeRecording();
+        auto desc = base;
+        desc.Color = foreignColor.Get();
+        expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
+                      E_INVALIDARG, "foreign_device_color");
+        ComPtr<IMTLD3D12DeviceExt> foreignExtension;
+        check(foreign.device->QueryInterface(kIID_IMTLD3D12DeviceExt,
+                  reinterpret_cast<void**>(foreignExtension.GetAddressOf())),
+              "foreign device extension");
+        auto foreignState = createState(foreignExtension.Get());
+        expectHRESULT(recording.extension->TemporalUpscale(foreignState.Get(), &base),
+                      E_INVALIDARG, "foreign_device_state");
+        check(recording.list->Close(), "negative foreign device Close");
     }
 }
 
@@ -987,6 +1180,73 @@ void runGenerationTransitionReplay(
     std::puts(
         "OWNED_D3D12_TEMPORAL_CASE_PASS case=generation_transition_replay "
         "expected_reset_sequence=1,1,1,0");
+}
+
+void runDynamicOutputOldRecordReplay(
+    Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
+    ID3D12Resource* depth, ID3D12Resource* motion) {
+    constexpr UINT widthA = 96, heightA = 112;
+    constexpr std::uint8_t tagA = 72, tagB = 184;
+    auto create = makeCreateDesc();
+    create.DynamicOutputEnabled = TRUE;
+    ComPtr<IMTLD3D12TemporalUpscaleState> state;
+    check(deviceExtension->CreateTemporalUpscaleState(&create, &state),
+          "dynamic output CreateTemporalUpscaleState");
+    auto colorA = makeColor(gpu, tagA);
+    auto colorB = makeColor(gpu, tagB);
+    auto outputA = makeOutput(gpu, 850);
+    auto outputB = makeOutput(gpu, 851);
+    auto descA = makeFrameDesc(colorA.Get(), outputA.resource.Get(), depth, motion);
+    descA.OutputWidth = widthA;
+    descA.OutputHeight = heightA;
+    auto recordingA = recordTemporal(gpu, state.Get(), descA, outputA);
+    auto descB = makeFrameDesc(colorB.Get(), outputB.resource.Get(), depth, motion);
+    auto recordingB = recordTemporal(gpu, state.Get(), descB, outputB);
+    state.Reset();
+    colorA.Reset();
+    colorB.Reset();
+
+    gpu.executeAndWait(recordingA.list.Get());
+    validateOutput(outputA, tagA, "dynamic_output_A1", 0, 0, 0, widthA, heightA);
+    gpu.executeAndWait(recordingB.list.Get());
+    validateOutput(outputB, tagB, "dynamic_output_B1", 1);
+    recordingB = {};
+    outputB = {};
+    auto clear = gpu.makeRecording();
+    transition(clear.list.Get(), outputA.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+    check(clear.list->Close(), "dynamic replay sentinel Close");
+    gpu.executeAndWait(clear.list.Get());
+    std::vector<std::array<std::uint8_t, 4>> sentinel(
+        kOutputBacking * kOutputBacking, outputA.sentinel);
+    uploadTexture(gpu, outputA.resource.Get(), sentinel.data(), kOutputBacking * 4,
+                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+    auto poisonReadback = gpu.makeRecording();
+    copyTextureToReadback(poisonReadback.list.Get(), outputA.resource.Get(), outputA.readback);
+    check(poisonReadback.list->Close(), "dynamic replay sentinel readback Close");
+    gpu.executeAndWait(poisonReadback.list.Get());
+    gpu.executeAndWait(recordingA.list.Get());
+    const auto stats = validateOutput(
+        outputA, tagA, "dynamic_output_A2", 2, 0, 0, widthA, heightA);
+    // Compare the restored A generation with an independent first/reset frame.
+    ComPtr<IMTLD3D12TemporalUpscaleState> freshState;
+    create.OutputWidth = widthA;
+    create.OutputHeight = heightA;
+    check(deviceExtension->CreateTemporalUpscaleState(&create, &freshState),
+          "dynamic replay reference CreateTemporalUpscaleState");
+    auto freshColor = makeColor(gpu, tagA);
+    auto freshOutput = makeOutput(gpu, 852);
+    auto freshDesc = makeFrameDesc(freshColor.Get(), freshOutput.resource.Get(), depth, motion, TRUE);
+    auto freshRecording = recordTemporal(gpu, freshState.Get(), freshDesc, freshOutput);
+    gpu.executeAndWait(freshRecording.list.Get());
+    const auto freshStats = validateOutput(
+        freshOutput, tagA, "dynamic_output_fresh", 3, 0, 0, widthA, heightA);
+    if (std::fabs(stats.mean - freshStats.mean) > 1.0 / 255.0)
+        fail("old dynamic output generation replay differs from fresh reset");
+    std::printf("OWNED_D3D12_TEMPORAL_CASE_PASS case=dynamic_output_old_record_replay "
+                "sequence=A,B,A A=%ux%u B=128x128 caller_released=1 B_retired=1 "
+                "replay_mean=%.9g fresh_mean=%.9g outside_sentinel=1\n",
+                widthA, heightA, stats.mean, freshStats.mean);
 }
 
 struct FutureSignalCallerContext {
@@ -1252,6 +1512,8 @@ void runContinuousFrames(Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
         OutputResource output =
             makeOutput(gpu, frame, outputParentFormat);
         auto desc = makeFrameDesc(color.Get(), output.resource.Get(), depth, motion, FALSE);
+        // Auto exposure must ignore even an incompatible caller-supplied texture.
+        desc.ExposureTexture = color.Get();
         Recording recording = recordTemporal(gpu, state.Get(), desc, output);
         gpu.executeAndWait(recording.list.Get());
         OutputStats stats = validateOutput(output, inputTag, variant, frame);
@@ -1288,6 +1550,7 @@ int run() {
 
     ComPtr<ID3D12Resource> depth = makeDepth(gpu);
     ComPtr<ID3D12Resource> motion = makeMotion(gpu);
+    runR32ExposureReplay(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     std::puts("OWNED_D3D12_TEMPORAL_FORMAT role=color dxgi=28");
     std::puts("OWNED_D3D12_TEMPORAL_FORMAT role=output dxgi=28 backing=136 logical=128");
     std::puts("OWNED_D3D12_TEMPORAL_FORMAT role=motion dxgi=34 zeros=1");
@@ -1306,6 +1569,8 @@ int run() {
     runReleaseBeforeExecuteReplay(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runCallerResetReplay(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runGenerationTransitionReplay(gpu, deviceExtension.Get());
+    runDynamicOutputOldRecordReplay(
+        gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runCrossQueueFutureSignal(
         gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runOppositeFeatureOrder(gpu, deviceExtension.Get());
@@ -1332,7 +1597,8 @@ int run() {
               "positive_control=1 typeless_zzz=1 generation_transition=1 "
               "command_list_validation=1 output_subrect=1 crossqueue_future_signal=1 "
               "submitted_list_reset=1 record_head_growth=1 allocator_retention=1 "
-              "opposite_feature_order=1");
+              "opposite_feature_order=1 r32_exposure_numeric=1 gpu_exposure_replay=1 "
+              "dynamic_output_old_record_replay=1");
     return 0;
 }
 

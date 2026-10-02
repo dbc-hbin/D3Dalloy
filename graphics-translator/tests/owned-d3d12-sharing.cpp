@@ -640,7 +640,46 @@ void fenceRewindCase(Device &a, Device &b) {
   pass("fence-rewind");
 }
 
-// 3000 back-to-back GPU Signals (3x the token ring) on device A while device B polls:
+// Two enqueued producers and a CPU producer complete out of enqueue order. A
+// queue wait is a deterministic gate; it must not block either API thread.
+void fenceProducerCompletionCase(Device &a, Device &b) {
+  auto fence = sharedFence(a, 0);
+  HANDLE h = share(a, fence.Get());
+  auto remote = open<ID3D12Fence>(b, h, "open completion-order fence");
+  CloseHandle(h);
+  ComPtr<ID3D12Fence> gate;
+  check(a.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "create producer gate");
+  HANDLE crossing = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  check(remote->SetEventOnCompletion(10, crossing), "completion-order crossing event");
+  check(a.queue->Wait(gate.Get(), 1), "gate older producer");
+  check(a.queue->Signal(fence.Get(), 10), "enqueue older producer 10");
+  check(fence->Signal(3), "complete CPU producer 3");
+  if (remote->GetCompletedValue() != 3 || WaitForSingleObject(crossing, 0) != WAIT_TIMEOUT)
+    fail("incomplete older producer changed completion");
+  check(b.queue->Signal(remote.Get(), 2), "enqueue later producer 2");
+  const UINT64 second = ++b.value;
+  check(b.queue->Signal(b.fence.Get(), second), "marker later producer 2");
+  Device::waitFor(b.fence.Get(), second);
+  if (fence->GetCompletedValue() != 2 || remote->GetCompletedValue() != 2)
+    fail("later producer must complete before gated older");
+  // Register a queue wait only after B is free to consume the older completion.
+  check(b.queue->Wait(remote.Get(), 10), "older completion queue wait");
+  const UINT64 crossed = ++b.value;
+  check(b.queue->Signal(b.fence.Get(), crossed), "older completion queue marker");
+  check(gate->Signal(1), "release older producer");
+  if (WaitForSingleObject(crossing, kTimeoutMs) != WAIT_OBJECT_0)
+    fail("older completion crossing event");
+  Device::waitFor(b.fence.Get(), crossed);
+  if (fence->GetCompletedValue() != 10 || remote->GetCompletedValue() != 10)
+    fail("older enqueued producer completed last but was discarded");
+  check(remote->Signal(0), "rewind after older completion");
+  if (fence->GetCompletedValue() != 0)
+    fail("CPU rewind after older completion");
+  CloseHandle(crossing);
+  pass("fence-producer-completion-order");
+}
+
+// 3000 back-to-back GPU Signals on device A while device B polls:
 // B must reach the final value, and never observe a value outside the signaled range.
 void fenceStressCase(Device &a, Device &b) {
   constexpr UINT64 kSignals = 3000;
@@ -744,6 +783,7 @@ void namedProcessCase(Device &a) {
 // back out of the child process.
 struct Mailbox {
   uint64_t buffer, texture, fence, ready, done; // parent -> child (values valid in the child)
+  uint64_t latchReady;
   uint64_t childBuffer, childTexture, childFence; // child -> parent (values valid in the child)
   uint32_t seed;
 };
@@ -809,6 +849,31 @@ int childMain() {
   if (fence->GetCompletedValue() != 15)
     fail("child rewound value");
   std::printf("OWNED_D3D12_SHARING_CHILD_REWIND value=15\n");
+
+  // The parent suspends *all* observer threads after these registrations,
+  // publishes a qualifying completion followed by thousands of rewinds, then
+  // resumes us. Neither event nor queue wait may depend on sampling the peak.
+  HANDLE latch = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  check(fence->SetEventOnCompletion(100, latch), "child crossing event registration");
+  check(c.queue->Wait(fence.Get(), 100), "child crossing queue registration");
+  const UINT64 crossed = ++c.value;
+  check(c.queue->Signal(c.fence.Get(), crossed), "child crossing queue marker");
+  SetEvent(fromValue(box->latchReady));
+  if (WaitForSingleObject(latch, kTimeoutMs) != WAIT_OBJECT_0)
+    fail("child unobserved crossing event");
+  Device::waitFor(c.fence.Get(), crossed);
+  if (fence->GetCompletedValue() != 0)
+    fail("child crossing current value must be rewind");
+  HANDLE late = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  check(fence->SetEventOnCompletion(100, late), "child late crossing registration");
+  if (WaitForSingleObject(late, 0) != WAIT_TIMEOUT)
+    fail("child late wait inherited pre-registration crossing");
+  check(fence->Signal(100), "child release late crossing wait");
+  if (WaitForSingleObject(late, kTimeoutMs) != WAIT_OBJECT_0)
+    fail("child late crossing event");
+  CloseHandle(latch);
+  CloseHandle(late);
+  std::printf("OWNED_D3D12_SHARING_CHILD_LATCH event=1 queue=1 late=1 current=0\n");
   UnmapViewOfFile(box);
   CloseHandle(section);
   std::printf("OWNED_D3D12_SHARING_CHILD ok\n");
@@ -822,6 +887,7 @@ void crossProcess(Device &a, Device &b) {
   auto fence = sharedFence(a, 1);
   HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE latchReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
   wchar_t exe[MAX_PATH];
   GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -851,6 +917,7 @@ void crossProcess(Device &a, Device &b) {
   box->fence = dupTo(share(a, fence.Get()), true);
   box->ready = dupTo(ready, false);
   box->done = dupTo(done, false);
+  box->latchReady = dupTo(latchReady, false);
   box->seed = seed;
   ResumeThread(pi.hThread);
 
@@ -892,6 +959,40 @@ void crossProcess(Device &a, Device &b) {
 
   check(fence->Signal(15), "parent rewind 20 -> 15");
   SetEvent(done);
+  if (WaitForSingleObject(latchReady, kTimeoutMs) != WAIT_OBJECT_0)
+    fail("child crossing registrations ready");
+
+  // Owned-backend deterministic scheduling probe: acquire the section mutex
+  // before suspension so the child cannot be frozen inside publication. The
+  // old backend has no such mutex; creating it leaves its behavior unchanged.
+  HANDLE rawShare = share(a, fence.Get());
+  auto *header = static_cast<const uint8_t *>(MapViewOfFile(rawShare, FILE_MAP_READ, 0, 0, 32));
+  if (!header)
+    fail("map shared fence scheduling identity");
+  const auto *token = header + 16;
+  WCHAR mutexName[80];
+  std::swprintf(mutexName, 80, L"Local\\dxmt.fence.%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                token[0], token[1], token[2], token[3], token[4], token[5], token[6], token[7],
+                token[8], token[9], token[10], token[11], token[12], token[13], token[14], token[15]);
+  HANDLE mutex = CreateMutexW(nullptr, FALSE, mutexName);
+  UnmapViewOfFile(header);
+  CloseHandle(rawShare);
+  if (!mutex || WaitForSingleObject(mutex, kTimeoutMs) != WAIT_OBJECT_0)
+    fail("lock observer scheduling mutex");
+  using ProcessControl = LONG(WINAPI *)(HANDLE);
+  auto suspend = reinterpret_cast<ProcessControl>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSuspendProcess"));
+  auto resume = reinterpret_cast<ProcessControl>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtResumeProcess"));
+  if (!suspend || !resume || suspend(pi.hProcess) < 0)
+    fail("suspend child observers");
+  ReleaseMutex(mutex);
+  check(fence->Signal(100), "unobserved qualifying publication");
+  for (unsigned i = 0; i < 3000; ++i)
+    check(fence->Signal(0), "unobserved rewind publication");
+  if (fence->GetCompletedValue() != 0)
+    fail("parent crossing final rewind");
+  if (resume(pi.hProcess) < 0)
+    fail("resume child observers");
+  CloseHandle(mutex);
   if (WaitForSingleObject(pi.hProcess, kTimeoutMs) != WAIT_OBJECT_0)
     fail("child exit");
   DWORD code = 1;
@@ -907,8 +1008,10 @@ void crossProcess(Device &a, Device &b) {
   CloseHandle(pi.hProcess);
   CloseHandle(ready);
   CloseHandle(done);
+  CloseHandle(latchReady);
   pass("cross-process-parent-to-child");
   pass("cross-process-child-to-parent");
+  pass("cross-process-unobserved-rewind-latches");
 }
 
 } // namespace
@@ -934,6 +1037,7 @@ int wmain(int argc, wchar_t **argv) {
   namedCase(a, b);
   errorCases(a, b);
   fenceRewindCase(a, b);
+  fenceProducerCompletionCase(a, b);
   fenceStressCase(a, b);
   namedProcessCase(a);
   hostMemoryCase(a);

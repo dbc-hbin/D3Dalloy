@@ -33,6 +33,37 @@ def analyze(path: Path) -> dict:
     by_kind = defaultdict(list)
     for event in events:
         by_kind[event["event"]].append(event)
+    # Metal4 temporal waits/encoding split physical submissions. The logical
+    # ExecuteCommandLists parent survives those splits, including list replay.
+    active_executions = {}
+    encoded_in_execution = defaultdict(set)
+    latest_encodes = {}
+    temporal_parents = {}
+    consumed_encodes = set()
+    for event in events:
+        if event["event"] == "execute_list":
+            active_executions[event["queue"]] = event
+            encoded_in_execution[event["queue"]].clear()
+        elif event["event"] == "encode":
+            queue, encoder = event["queue"], event["encoder"]
+            repeated = encoder in encoded_in_execution[queue]
+            latest_encodes[(queue, encoder)] = (event, active_executions.get(queue), repeated)
+            encoded_in_execution[queue].add(encoder)
+        elif event["event"] == "temporal_encode":
+            queue = event["queue"]
+            preceding = latest_encodes.get((queue, event["encoder"]))
+            require(preceding is not None, f"missing logical encoder for temporal event {event['event_id']}")
+            if preceding is None:
+                continue
+            encode, parent, repeated = preceding
+            valid_parent = (parent is not None and parent is active_executions.get(queue)
+                            and parent["list"] == encode["list"]
+                            and parent["recording"] == encode["recording"]
+                            and not repeated and encode["event_id"] not in consumed_encodes)
+            require(valid_parent, f"missing current logical execute parent for temporal event {event['event_id']}")
+            if valid_parent:
+                temporal_parents[event["event_id"]] = parent
+            consumed_encodes.add(encode["event_id"])
     submissions = {(e["queue"], e["submission"]): e for e in by_kind["submit"]}
     completions = {(e["queue"], e["submission"]): e for e in by_kind["complete"]}
     records = {e["evaluation"]: e for e in by_kind["temporal_record"]}
@@ -111,9 +142,9 @@ def analyze(path: Path) -> dict:
             if not signals or not defers:
                 continue
             signal, defer = signals[-1], defers[-1]
-            execution = next(e for e in by_kind["execute_list"]
-                             if e["queue"] == consumer["queue"]
-                             and e["submission"] == consumer["submission"])
+            execution = temporal_parents.get(consumer["event_id"])
+            if execution is None:
+                continue
             resets = [e for e in by_kind["record_begin"] if e["list"] == execution["list"]
                       and e["recording"] > execution["recording"]
                       and e["event_id"] < consumer["event_id"]]

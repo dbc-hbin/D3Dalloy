@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -13,6 +15,7 @@ import struct
 import subprocess
 import sys
 from typing import NamedTuple
+from owned_graphics_arch import execution_architecture, macho_architectures
 
 
 SUITE_PREFIXES = {
@@ -22,6 +25,8 @@ SUITE_PREFIXES = {
     "temporal": "OWNED_D3D12_TEMPORAL",
     "ngx": "OWNED_D3D12_NGX",
     "ngx-contracts": "OWNED_D3D12_NGX_CONTRACTS",
+    "fsr": "OWNED_D3D12_FSR",
+    "fsr-fg": "OWNED_D3D12_FSR_FG",
     "core-contracts": "OWNED_D3D12_CORE_CONTRACTS",
     "execution-safety": "OWNED_D3D12_EXECUTION_SAFETY",
     "fence-events": "OWNED_D3D12_FENCE_EVENTS",
@@ -94,15 +99,19 @@ SHARING_CASES = (
     "buffer-a_to_b", "texture-a_to_b", "fence-a_to_b",
     "buffer-b_to_a", "texture-b_to_a", "fence-b_to_a",
     "cpu-signal-gpu-wait", "heap-placed", "heap-row-major-texture", "named-open", "errors",
-    "fence-rewind", "fence-stress", "named-unrelated-process", "host-memory-address", "host-memory-file-mapping",
+    "fence-rewind", "fence-producer-completion-order", "fence-stress", "named-unrelated-process",
+    "host-memory-address", "host-memory-file-mapping",
     "cross-process-parent-to-child", "cross-process-child-to-parent",
+    "cross-process-unobserved-rewind-latches",
 )
 DEFAULT_LOCK = REPOSITORY_ROOT / "graphics-translator/upstream.lock.json"
 DEFAULT_DXIL_DIR = REPOSITORY_ROOT / "graphics-translator/tests/dxil"
-# NGX fixtures run on the temporal backend and publish its identity line.
+FG_CAPTURE_CHECKER = REPOSITORY_ROOT / "graphics-translator/tests/check-owned-fg-capture.py"
+# NGX and FSR fixtures run on the temporal backend and publish its identity line.
 BACKEND_PREFIXES = {
     "ngx": "OWNED_D3D12_TEMPORAL",
     "ngx-contracts": "OWNED_D3D12_TEMPORAL",
+    "fsr": "OWNED_D3D12_TEMPORAL",
     "fullscreen": "OWNED_DXGI_FULLSCREEN",
 }
 # Extra inputs a suite consumes beside the fixture binary. Smoke reads its HLSL
@@ -940,15 +949,55 @@ def run(args: argparse.Namespace) -> int:
     frozen = out / "fixture"
     frozen.mkdir()
     sources = [fixture, *suite_inputs(args.suite, fixture, args.dxil_dir)]
+    fg_observer = getattr(args, "fg_observer", None)
+    if args.suite == "fsr-fg" and args.mode == "present" and fg_observer is None:
+        raise ValueError("--suite fsr-fg --mode present requires --fg-observer for native presentation evidence")
+    fg_observer_dependencies = []
+    fg_observer_architectures = []
+    fg_observer_dependencies_by_architecture = {}
+    if fg_observer is not None:
+        if args.suite != "fsr-fg":
+            raise ValueError("--fg-observer is only supported with --suite fsr-fg")
+        if fg_observer.is_symlink() or not fg_observer.is_file():
+            raise ValueError("--fg-observer must be a regular non-symlink file")
+        fg_observer_architectures = macho_architectures(fg_observer)
+        if set(fg_observer_architectures) not in ({"x86_64"}, {"x86_64", "arm64"}):
+            raise ValueError("--fg-observer must be x86_64 or universal x86_64/arm64 Mach-O")
+        for observer_arch in fg_observer_architectures:
+            libraries = subprocess.run(["/usr/bin/otool", "-arch", observer_arch, "-l", str(fg_observer)],
+                                       check=True, capture_output=True, text=True, timeout=30)
+            dependencies = []
+            # LC_ID_DYLIB and multiarch headers are not load dependencies.
+            for command in libraries.stdout.split("Load command"):
+                if re.search(r"\bcmd LC_(?:LOAD|LOAD_WEAK|REEXPORT|LAZY_LOAD|LOAD_UPWARD)_DYLIB\b", command):
+                    dependency = re.search(r"\n\s*name (.+) \(offset \d+\)", command)
+                    if dependency is None:
+                        raise ValueError(f"cannot read --fg-observer {observer_arch} native dependency")
+                    dependencies.append(dependency.group(1))
+            if not dependencies or any(not dependency.startswith(("/System/Library/", "/usr/lib/"))
+                                       for dependency in dependencies):
+                raise ValueError(f"--fg-observer {observer_arch} dependencies must be native macOS system libraries/frameworks only")
+            fg_observer_dependencies_by_architecture[observer_arch] = dependencies
+            fg_observer_dependencies.extend(dependencies)
+        sources.append(fg_observer)
+        sources.append(FG_CAPTURE_CHECKER)
     for source in sources:
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"fixture input must be a regular file: {source}")
         shutil.copy2(source, frozen / source.name)
     executable = frozen / fixture.name
+    manifest = json.loads((runtime / "owned-graphics-runtime.json").read_text())
+    if args.suite in ("fsr", "fsr-fg"):
+        selection = "fsr" if args.suite == "fsr" else "fsr_framegeneration"
+        if manifest.get("optional_modules", {}).get(selection) is not True:
+            raise ValueError(f"--suite {args.suite} requires a runtime staged with --with-fsr ({selection}=true)")
+    arch = execution_architecture(manifest,
+                                  executable, getattr(args, "guest_arch", None))
     env = dict(os.environ)
     for key in tuple(env):
         if (key.startswith(("D3DM", "GPTK_", "DXVK_", "DXMT_", "OWNED_GRAPHICS_", "DYLD_"))
                 or key in {"WINEDLLPATH", "WINEDLLPATH_PREPEND", "WINEDLLOVERRIDES",
+                           "OWNED_FG_OBSERVER", "FG_CAPTURE_DIR",
                            "CX_ACTIVE_GRAPHICS_BACKEND", "CX_APPLEGPTK_LIBD3DSHARED_PATH"}):
             env.pop(key)
     env.update({
@@ -965,6 +1014,11 @@ def run(args: argparse.Namespace) -> int:
         # this diagnostic variable itself on the final hop into real Wine.
         "OWNED_GRAPHICS_DYLD_AUDIT": "1",
     })
+    if fg_observer is not None:
+        capture_dir = out / "fg-capture"
+        capture_dir.mkdir()
+        env["OWNED_FG_OBSERVER"] = str(frozen / fg_observer.name)
+        env["FG_CAPTURE_DIR"] = str(capture_dir)
     validation_mode = ("api-and-shader" if args.validation else
                        "api-only" if args.api_validation else "none")
     if args.validation:
@@ -1028,11 +1082,17 @@ def run(args: argparse.Namespace) -> int:
     evidence = {
         "schema": 1, "suite": args.suite, "mode": args.mode, "validation": args.validation,
         "validation_mode": validation_mode,
+        "architecture": arch,
         "command": command, "prefix": env["WINEPREFIX"],
         "runtime_manifest_sha256": digest(runtime / "owned-graphics-runtime.json"),
         "lock": str(lock), "lock_sha256": digest(lock),
         "fixture_sha256": {source.name: digest(frozen / source.name) for source in sources},
         "timeout_seconds": args.timeout,
+        "fg_observer_dependencies": fg_observer_dependencies,
+        "fg_observer_architectures": fg_observer_architectures,
+        "fg_observer_dependencies_by_architecture": fg_observer_dependencies_by_architecture,
+        "oracle_environment": ({"OWNED_FSR_NATIVE_MAX_SCALE": env.get("OWNED_FSR_NATIVE_MAX_SCALE")}
+                               if args.suite == "fsr" else {}),
     }
     (out / "invocation.json").write_text(json.dumps(evidence, indent=2) + "\n")
     timed_out = False
@@ -1057,12 +1117,12 @@ def run(args: argparse.Namespace) -> int:
     dyld = [line for line in stderr.splitlines() if line.startswith("dyld[")]
     foreign = [line for line in dyld if "d3dmetal.framework" in line.lower()
                or "libd3dshared" in line.lower()]
-    native_path = str(runtime / "lib/wine/x86_64-unix" / WINEMETAL_NATIVE_LIBRARY)
+    native_path = str(runtime / arch["unix_directory"] / WINEMETAL_NATIVE_LIBRARY)
     native_paths = [native_path]
     native_loads = [line for line in dyld if any(path in line for path in native_paths)]
     # The owned DXIL compiler is inside this module, so a DXIL run only proves
     # the native compiler path when dyld loaded the staged module itself.
-    native_module = runtime / "lib/wine/x86_64-unix" / WINEMETAL_NATIVE_LIBRARY
+    native_module = runtime / arch["unix_directory"] / WINEMETAL_NATIVE_LIBRARY
     native_compiler_proof = native_module.is_file() and any(native_path in line for line in dyld)
     prefix = SUITE_PREFIXES[args.suite]
     backend_prefix = BACKEND_PREFIXES.get(args.suite, prefix)
@@ -1072,6 +1132,15 @@ def run(args: argparse.Namespace) -> int:
     barrier_ok = "OWNED_D3D12_SMOKE_BARRIER_STRESS readback=ok" in stdout
     success = (code == 0 and not timed_out and marker_ok and f"{prefix}_PASS" in stdout
                and native_loads and not foreign)
+    fsr_module_loads = []
+    if args.suite in ("fsr", "fsr-fg"):
+        module_name = ("amd_fidelityfx_upscaler_dx12.dll" if args.suite == "fsr"
+                       else "amd_fidelityfx_framegeneration_dx12.dll")
+        module = rf'Loaded L"C:\\windows\\system32\\{module_name}"'
+        fsr_module_loads = [line for line in stderr.splitlines()
+                            if module.lower() in line.lower() and "builtin" in line.lower()]
+        success = (success and native_compiler_proof and fsr_module_loads
+                   and (runtime / arch["windows_directory"] / module_name).is_file())
     dxil_compiler_loaded = False
     raytracing_evidence = None
     fence_rewind_cases: list[str] = []
@@ -1315,6 +1384,7 @@ def run(args: argparse.Namespace) -> int:
         success = (success and tuple(cases) == SHARING_CASES
                    and stdout.count("OWNED_D3D12_SHARING_CHILD ok") == 1
                    and stdout.count("OWNED_D3D12_SHARING_CHILD_REWIND value=15") == 1
+                   and stdout.count("OWNED_D3D12_SHARING_CHILD_LATCH event=1 queue=1 late=1 current=0") == 1
                    and stdout.count("OWNED_D3D12_SHARING_STRESS signals=3000 final=3000") == 1
                    and stdout.count("OWNED_D3D12_SHARING_NAMED_CHILD ok rewind=40") == 1
                    and "OWNED_D3D12_SHARING_CAPS cross_node=0 row_major=1" in stdout
@@ -1668,10 +1738,108 @@ def run(args: argparse.Namespace) -> int:
     if args.suite == "ngx":
         frames = re.findall(r"OWNED_D3D12_NGX_FRAME_PASS frame=(\d+)\b", stdout)
         success = success and frames == [str(n) for n in range(8)]
+    if args.suite == "fsr":
+        frames = re.findall(r"OWNED_D3D12_FSR_FRAME_PASS frame=(\d+)\b", stdout)
+        replays = re.findall(r"OWNED_D3D12_FSR_REPLAY_PASS replay=(\d+) .*"
+                             r"destroyed_before_submit=1 sentinel=1 changed_gpu_input=(\d+)", stdout)
+        exposures = re.findall(r"OWNED_D3D12_FSR_EXPOSURE_PASS format=(\d+) value=1 .* sentinel=1", stdout)
+        cases = Counter(re.findall(r"OWNED_D3D12_FSR_BEHAVIOR_PASS case=(\w+)\b", stdout))
+        required_cases = {
+            "zero_motion_resolution_jitter_equivalence": 2, "auto_exposure_ignores_poison_texture": 3,
+            "nonzero_motion_scale_equivalence": 3, "nonzero_motion_effect": 3,
+            "sharpen_constant_invariance": 1, "sharpen_edge_alpha": 1,
+            "constant_transfer_roundtrip": 2, "transfer_independent_scene": 2,
+            "reactive_composition_equivalence": 1, "mask_idempotence": 1,
+            "history_mask_channel_equivalence": 2, "reactive_history_effect": 1,
+            "composition_below_reactive_no_change": 1,
+            "output_generation_switch_resets_history": 1, "history_reset_matches_fresh": 1,
+            "cap_center_matches_native_scale_control": 1, "cap_scale_geometry": 1,
+            "inflight_release": 1, "command_list_reset_discards_work": 1, "exposure_gpu_replay": 3,
+        }
+        motion_effects = re.findall(r"case=nonzero_motion_effect option=(\d+) rgb_byte_delta_sum=(\d+) jitter_nonzero=(\d+)", stdout)
+        transfers = re.findall(r"case=transfer_independent_scene transfer=(\d+) linear_mean_abs_error=(\S+) "
+                               r"wrong_flag_byte_delta_sum=(\d+) alpha_unchanged=1", stdout)
+        constant_transfers = re.findall(r"case=constant_transfer_roundtrip transfer=(\d+) linear_max_error=(\S+) "
+                                        r"alpha_unchanged=1 sentinel=1", stdout)
+        gpu_exposures = re.findall(r"case=exposure_gpu_replay replay=(\d+) value=(\S+) half_bits=([0-9a-f]{4}) "
+                                  r"max_ulp=(\d+) contexts_destroyed=1 gpu_produced_r32=1", stdout)
+        caps = re.findall(r"case=cap_scale_geometry native_max=(\S+) content=(\d+)x(\d+) caller=256x224 "
+                          r"center=(\d+),(\d+) black_opaque=1 sentinel=1", stdout)
+        cap_ok = False
+        try:
+            if len(caps) == 1:
+                scale, width, height, x, y = caps[0]
+                scale = float(scale)
+                extent = math.floor(64 * scale)
+                cap_ok = (1 <= scale < 3.5 and (int(width), int(height), int(x), int(y))
+                          == (extent, extent, (256 - extent) // 2, (224 - extent) // 2))
+            numeric_ok = (sorted((int(option), int(jitter)) for option, _, jitter in motion_effects) == [(0, 0), (2, 0), (4, 1)]
+                          and all(int(delta) > 0 for _, delta, _ in motion_effects)
+                          and sorted(transfer for transfer, _, _ in transfers) == ["2", "4"]
+                          and all(0 <= float(error) <= 0.02 and int(delta) > 0 for _, error, delta in transfers)
+                          and sorted(transfer for transfer, _ in constant_transfers) == ["2", "4"]
+                          and all(0 <= float(error) <= 1.5 / 255 for _, error in constant_transfers)
+                          and [(replay, bits) for replay, _, bits, _ in gpu_exposures]
+                              == [("0", "3555"), ("1", "3cf0"), ("2", "4248")]
+                          and all(int(ulp) <= 1 and abs(float(value) - expected) < 0.00001
+                                  for (_, value, _, ulp), expected in zip(gpu_exposures, (0.3333, 1.234567, 3.14159))))
+        except (ValueError, OverflowError):
+            numeric_ok = False
+        success = (success and frames == ["0", "1", "2", "3"]
+                   and replays == [("0", "0"), ("1", "0"), ("2", "1")]
+                   and exposures == ["0", "54", "41"]
+                   and "OWNED_D3D12_FSR_CASE_PASS case=rejected_dispatch_output_unchanged result=0" in stdout
+                   and all(cases[name] == count for name, count in required_cases.items())
+                   and cap_ok and numeric_ok
+                   and "OWNED_D3D12_FSR_FULL_SR_PASS motion=1 masks=1 transfer=1 sharpening_constant=1 output_generation=1" in stdout
+                   and "case=inflight_release fence_gate=1 context_destroyed=1 caller_resources_released=1 sentinel=1" in stdout
+                   and "case=command_list_reset_discards_work output_unchanged=1 sentinel=1" in stdout
+                   and "OWNED_D3D12_FSR_FAIL" not in stdout + stderr)
+    if args.suite == "fsr-fg":
+        present_calls = re.findall(r"OWNED_D3D12_FSR_FG_PRESENT_CALL frame=(\d+) enabled=(\d+) only_generated=(\d+) "
+                                   r"generation_error=(\d+) present_error=(\d+) qpc_start=(\d+) qpc_end=(\d+) frequency=(\d+)", stdout)
+        callbacks = re.findall(r"OWNED_D3D12_FSR_FG_CALLBACK_PIXELS frame=(\d+) generated=(\d+) width=128 height=128 "
+                               r"hash=[0-9a-f]{16} marker=(\d+),(\d+),220", stdout)
+        expected_callbacks = [(frame, generated) for frame in range(1, 10)
+                              for generated in ((1, 0) if frame in (1, 2, 3, 4, 7) else (1,) if frame == 8 else (0,))]
+        ui_frames = re.findall(r"OWNED_D3D12_FSR_FG_UI_FRAME frame=(\d+) width=(\d+) height=(\d+) source=(\d+),60,100 "
+                               r"ui=64,0,0,128 premul=1 doublebuffer=1 overwritten_after_present=1", stdout)
+        statistics = re.findall(r"OWNED_D3D12_FSR_FG_STATISTICS frame=(\d+) native_present=(\d+) "
+                                r"present_refresh=(\d+) sync_refresh=(\d+) sync_qpc=(\d+) frequency=(\d+) "
+                                r"source=public_dxgi_actual_presentation", stdout)
+        success = (success
+                   and "OWNED_D3D12_FSR_FG_DIRECT_PASS snapshot=exact rect_guard=exact frames=4" in stdout
+                   and "OWNED_D3D12_FSR_FG_HISTORY_PASS reset=fresh gap=reset off_on=fresh stale_record=no_history_publication negative_output=unchanged" in stdout
+                   and "OWNED_D3D12_FSR_FG_LIFETIME_PASS context_destroy_before_execute=1 input_release=1 allocation_balance=1" in stdout
+                   and "OWNED_D3D12_FSR_FG_CONFIG_PASS repeated_id=replace retained_distinct_limit=64 overflow=runtime_error off_clears=1" in stdout
+                   and "OWNED_D3D12_FSR_FG_PROXY_PASS create=hwnd callbacks=gpu-readback generated_before_real=1 only_generated=1 disabled=1 callback_error=1 drain=1 destroy=1" in stdout
+                   and "OWNED_D3D12_FSR_FG_PACING_PASS ordered=1 bounded_progress=1 qpc=observed native_timestamps=external_observer_required" in stdout
+                   and "OWNED_D3D12_FSR_FG_UI_PASS wrap=real_hwnd ui=builtin_shader premultiplied=1 doublebuffer=gpu_snapshot resize=96x80 lifetime=drained" in stdout
+                   and [tuple(map(int, row)) for row in ui_frames]
+                       == [(11, 128, 128, 88), (12, 128, 128, 96), (13, 96, 80, 104), (14, 96, 80, 112)]
+                   and [int(frame) for frame, *_ in statistics] == [*range(1, 10), *range(11, 15)]
+                   and all(int(native_present) > 0 and int(qpc) > 0 and int(frequency) > 0
+                           for _, native_present, _, _, qpc, frequency in statistics)
+                   and [int(frame) for frame, *_ in present_calls] == list(range(1, 11))
+                   and [(int(frame), int(generated)) for frame, generated, _, _ in callbacks] == expected_callbacks
+                   and all(int(red) == int(frame) + 32 and int(green) == (190 if generated == "1" else 70)
+                           for frame, generated, red, green in callbacks)
+                   and all((int(enabled), int(only), int(generation_error), int(present_error))
+                           == (int(int(frame) not in (5, 6)), int(frame == "8"), int(frame == "9"), int(frame == "10"))
+                           and int(frequency) > 0 and 0 <= int(end) - int(start) < 60 * int(frequency)
+                           for frame, enabled, only, generation_error, present_error, start, end, frequency in present_calls)
+                   and "OWNED_D3D12_FSR_FG_FAIL" not in stdout + stderr
+                   and "OWNED_D3D12_FSR_FG_OBSERVER_FAIL" not in stdout + stderr)
     if args.suite == "temporal":
         frames = re.findall(r"OWNED_D3D12_TEMPORAL_FRAME_PASS variant=(\w+) frame=(\d+)\b", stdout)
-        success = success and frames == [(variant, str(n)) for variant in ("typed", "typeless_zzz")
+        exposures = re.findall(r"case=r32_exposure_numeric replay=(\d+) exposure=\S+ "
+                               r"r16_bits=0x([0-9a-f]{4}) max_output_ulp=(\d+) "
+                               r"gpu_producer=rtv_clear release_before_completion=(\d+)", stdout)
+        success = (success and frames == [(variant, str(n)) for variant in ("typed", "typeless_zzz")
                                          for n in range(8)]
+                   and [(replay, bits, released) for replay, bits, ulp, released in exposures]
+                   == [("0", "3555", "0"), ("1", "3cf0", "0"), ("2", "4248", "1")]
+                   and all(int(ulp) <= 1 for _, _, ulp, _ in exposures))
     if args.suite in ("dxil", "dxil-ia"):
         # A DXIL run is only meaningful when the staged native module carrying the
         # owned compiler is present and dyld actually loaded that exact file.
@@ -1851,6 +2019,34 @@ def run(args: argparse.Namespace) -> int:
             validation_errors.append(f"child process restores={child_restores} cold_compiles={child_colds}")
     if validation_errors:
         success = False
+    fg_capture_analysis = None
+    fg_output_artifacts = {}
+    if args.suite == "fsr-fg":
+        for image in (*sorted(frozen.glob("fg-*.bin")),
+                      *sorted((out / "fg-capture").glob("drawable-*.bin"))):
+            if image.is_symlink() or not image.is_file():
+                validation_errors.append(f"FG output is not a regular file: {image.name}")
+                success = False
+            else:
+                fg_output_artifacts[str(image.relative_to(out))] = {"sha256": digest(image), "size": image.stat().st_size}
+        if fg_observer is not None:
+            analysis_path = out / "fg-capture-analysis.json"
+            analysis = subprocess.run(
+                [sys.executable, str(frozen / FG_CAPTURE_CHECKER.name),
+                 "--stdout", str(out / "stdout.log"), "--stderr", str(out / "stderr.log"),
+                 "--captures", str(out / "fg-capture"), "--out", str(analysis_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            (out / "fg-capture-analysis.log").write_text(analysis.stdout + analysis.stderr)
+            capture_ok = False
+            if analysis_path.is_file():
+                capture_report = json.loads(analysis_path.read_text())
+                capture_ok = capture_report.get("pass") is True
+                fg_capture_analysis = {"file": analysis_path.name, "sha256": digest(analysis_path),
+                                       "pass": capture_ok}
+            if analysis.returncode or not capture_ok:
+                validation_errors.append("native FG drawable content, order or presentation timestamps check failed")
+                success = False
     temporal_analysis = None
     if args.suite == "temporal" and success:
         if len(backend_logs) != 1:
@@ -1873,6 +2069,8 @@ def run(args: argparse.Namespace) -> int:
               "backend_marker_verified": marker_ok, "frames_verified": frames,
               "uav_barrier_verified": barrier_ok, "dyld_lines": len(dyld),
               "owned_native_loads": native_loads,
+              "owned_fsr_module_loads": fsr_module_loads,
+              "fg_output_artifacts": fg_output_artifacts, "fg_capture_analysis": fg_capture_analysis,
               "dxil_native_compiler_verified": dxil_compiler_loaded,
               "raytracing": raytracing_evidence,
               "fence_rewind_cases": fence_rewind_cases,
@@ -1893,9 +2091,13 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--guest-arch", choices=("x86", "x64", "arm64"),
+                        help="assert the application architecture (otherwise inspect the fixture); not a translation switch")
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK,
                         help="authoritative owned-build lock recorded as evidence for this run")
     parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--fg-observer", type=Path,
+                        help="x86_64 or universal x86_64/arm64 native drawable observer dylib, required for fsr-fg --mode present; frozen as evidence")
     parser.add_argument("--dxil-dir", type=Path, default=DEFAULT_DXIL_DIR,
                         help="directory holding the frozen .dxil inputs a suite reads by name "
                              "(compute/vertex/pixel/register-space for the DXIL suites, "

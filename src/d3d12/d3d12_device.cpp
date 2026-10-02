@@ -26,7 +26,9 @@
 #include "d3d12_resource_contract.hpp"
 #include "d3d12_state_object.hpp"
 #include "d3d12_temporal.hpp"
+#include "d3d12_frame_generation.hpp"
 #include "Metal.hpp"
+#include "Metal4FX.hpp"
 #include "DXBCParser/BlobContainer.h"
 #include "com/com_pointer.hpp"
 #include "com/com_object.hpp"
@@ -115,9 +117,10 @@ bool ResolveRTASGPUVA(void *context, D3D12_GPU_VIRTUAL_ADDRESS address, uint64_t
   return true;
 }
 
-class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt>> {
+class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt, IMTLD3D12FrameGenerationDevice>> {
 
   Com<IMTLDXGIAdapter> adapter_;
+  WMT::Reference<WMT4::Compiler> metal4_compiler_;
   bool center_sample_positions_supported_ = false;
   /* IOKit gpu-core-count of this adapter; 0 when the registry lookup fails. */
   uint32_t gpu_core_count_ = 0;
@@ -292,6 +295,11 @@ public:
   HRESULT
   Initialize() {
     WMT::Reference<WMT::Error> err;
+    metal4_compiler_ = WMT4::Compiler::Create(adapter_->GetMTLDevice(), err);
+    if (!metal4_compiler_) {
+      ERR("Failed to create Metal 4 compiler: ", err.description().getUTF8String());
+      return DXGI_ERROR_UNSUPPORTED;
+    }
     residency_set_ = adapter_->GetMTLDevice().newResidencySet(0, err);
     if (!residency_set_) {
       ERR("Failed to create MTLResidencySet: ", err.description().getUTF8String());
@@ -330,6 +338,11 @@ public:
     return adapter_->GetMTLDevice();
   };
 
+  WMT4::Compiler
+  GetMetal4Compiler() override {
+    return metal4_compiler_;
+  }
+
   bool
   SupportsCenterSamplePattern() const override {
     return center_sample_positions_supported_;
@@ -358,6 +371,11 @@ public:
 
     *ppvObject = nullptr;
 
+    if (riid == __uuidof(IMTLD3D12FrameGenerationDevice)) {
+      *ppvObject = static_cast<IMTLD3D12FrameGenerationDevice *>(this);
+      AddRef();
+      return S_OK;
+    }
     if (riid == __uuidof(IMTLD3D12DeviceExt)) {
       *ppvObject = static_cast<IMTLD3D12DeviceExt *>(this);
       AddRef();
@@ -471,6 +489,76 @@ public:
       *out = {D3D12_WORK_GRAPHS_TIER_1_0, D3D12_EXECUTE_INDIRECT_TIER_1_0, FALSE, FALSE};
       return S_OK;
     }
+    case D3D12_FEATURE_D3D12_OPTIONS10: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS10))
+        return E_INVALIDARG;
+      *static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS10 *>(pFeatureData) = {TRUE, TRUE};
+      return S_OK;
+    }
+    case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY))
+        return E_INVALIDARG;
+      auto *out = static_cast<D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY *>(pFeatureData);
+      if (out->CommandListType < D3D12_COMMAND_LIST_TYPE_DIRECT ||
+          out->CommandListType > D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)
+        return E_INVALIDARG;
+      out->PriorityForTypeIsSupported =
+          (out->CommandListType == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+           out->CommandListType == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
+           out->CommandListType == D3D12_COMMAND_LIST_TYPE_COPY) &&
+          out->Priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+      return S_OK;
+    }
+    case D3D12_FEATURE_EXISTING_HEAPS: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_EXISTING_HEAPS))
+        return E_INVALIDARG;
+      static_cast<D3D12_FEATURE_DATA_EXISTING_HEAPS *>(pFeatureData)->Supported = TRUE;
+      return S_OK;
+    }
+    case D3D12_FEATURE_CROSS_NODE: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_CROSS_NODE))
+        return E_INVALIDARG;
+      *static_cast<D3D12_FEATURE_DATA_CROSS_NODE *>(pFeatureData) = {D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED, FALSE};
+      return S_OK;
+    }
+    case D3D12_FEATURE_DISPLAYABLE: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_DISPLAYABLE))
+        return E_INVALIDARG;
+      *static_cast<D3D12_FEATURE_DATA_DISPLAYABLE *>(pFeatureData) = {FALSE, D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0};
+      return S_OK;
+    }
+    case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT))
+        return E_INVALIDARG;
+      auto *out = static_cast<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT *>(pFeatureData);
+      if (out->NodeIndex)
+        return E_INVALIDARG;
+      out->Support = D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_NONE;
+      return S_OK;
+    }
+    case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPE_COUNT: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT))
+        return E_INVALIDARG;
+      auto *out = static_cast<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT *>(pFeatureData);
+      if (out->NodeIndex)
+        return E_INVALIDARG;
+      out->Count = 0;
+      return S_OK;
+    }
+    case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPES: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES))
+        return E_INVALIDARG;
+      auto *out = static_cast<D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPES *>(pFeatureData);
+      if (out->NodeIndex || out->Count)
+        return E_INVALIDARG;
+      return S_OK;
+    }
+    case D3D12_FEATURE_QUERY_META_COMMAND: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_QUERY_META_COMMAND))
+        return E_INVALIDARG;
+      // No vendor commands are advertised: no CommandId is valid. Leave opaque outputs untouched.
+      return E_INVALIDARG;
+    }
     case D3D12_FEATURE_ARCHITECTURE: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_ARCHITECTURE))
         return E_INVALIDARG;
@@ -583,7 +671,8 @@ public:
       /* D3D contract: the caller passes the highest model it knows; the device answers
        * min(requested, supported), and rejects a request above anything it can name. */
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
-      if (out->HighestShaderModel < D3D_SHADER_MODEL_5_1)
+      if (out->HighestShaderModel != D3D_SHADER_MODEL_5_1 &&
+          (out->HighestShaderModel < D3D_SHADER_MODEL_6_0 || out->HighestShaderModel > D3D_HIGHEST_SHADER_MODEL))
         return E_INVALIDARG;
       out->HighestShaderModel = std::min(out->HighestShaderModel, kOwnedReportedShaderModel);
       return S_OK;
@@ -692,7 +781,7 @@ public:
       // SV_Barycentrics / GetAttributeAtVertex lower to air.barycentric_coord and
       // vertex_value<T> (sm6 suite: barycentrics, barycentrics_indexed).
       out->BarycentricsSupported = TRUE;
-      out->CopyQueueTimestampQueriesSupported = FALSE;
+      out->CopyQueueTimestampQueriesSupported = TRUE;
       // Draw-level looping with exact view locations (view-instancing suite); Tier 2/3 need instancing below
       // draw level.
       out->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_1;
@@ -788,6 +877,13 @@ public:
       out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_1_0;
       return S_OK;
     }
+    case D3D12_FEATURE_D3D12_OPTIONS8: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS8))
+        return E_INVALIDARG;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS8 *>(pFeatureData);
+      out->UnalignedBlockTexturesSupported = metal.supportsBCTextureCompression();
+      return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS6: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6))
         return E_INVALIDARG;
@@ -814,7 +910,7 @@ public:
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SERIALIZATION *>(pFeatureData);
       if (out->NodeIndex)
         return E_INVALIDARG;
-      // OpenExistingHeapFromAddress/FileMapping heap serialization is not implemented.
+      // Serialized heaps are not supported.
       out->HeapSerializationTier = D3D12_HEAP_SERIALIZATION_TIER_0;
       return S_OK;
     }
@@ -925,7 +1021,7 @@ public:
       break;
     }
     ERR("CheckFeatureSupport: unhandled feature ", Feature);
-    return E_NOTIMPL;
+    return E_INVALIDARG;
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -2054,7 +2150,8 @@ public:
         return hr;
       if (HeapFlags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER))
         return E_INVALIDARG;
-      return CreateSamplerFeedbackMap(this, *pHeapProperties, HeapFlags, desc, layout, nullptr, 0,
+      return CreateSamplerFeedbackMap(this, *pHeapProperties, HeapFlags, desc, pDesc->SamplerFeedbackMipRegion,
+                                      layout, nullptr, 0,
                                       InitialResourceState, riidResource, ppvResource);
     }
     D3D12_RESOURCE_DESC desc;
@@ -2091,7 +2188,8 @@ public:
       if (FAILED(SamplerFeedbackAllocationInfo(this, layout, info)) ||
           !resource_contract::PlacementFits(HeapOffset, info.SizeInBytes, heap_desc.SizeInBytes, info.Alignment, 0))
         return E_INVALIDARG;
-      return CreateSamplerFeedbackMap(this, heap_desc.Properties, heap_desc.Flags, desc, layout, heap, HeapOffset,
+      return CreateSamplerFeedbackMap(this, heap_desc.Properties, heap_desc.Flags, desc, pDesc->SamplerFeedbackMipRegion,
+                                      layout, heap, HeapOffset,
                                       InitialState, riid, ppvResource);
     }
     D3D12_RESOURCE_DESC desc;
@@ -2605,13 +2703,18 @@ public:
   HRESULT STDMETHODCALLTYPE SupportsTemporalUpscale(BOOL *supported) final {
     if (!supported)
       return E_POINTER;
-    *supported = GetMTLDevice().supportsFXTemporalScaler();
+    *supported = WMT4::TemporalFeature::Supports(GetMTLDevice());
     return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE CreateTemporalUpscaleState(
       const MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC *desc, IMTLD3D12TemporalUpscaleState **state) final {
     return CreateOwnedTemporalState(this, desc, state);
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateFrameGenerationState(const MTL_FRAME_GENERATION_CREATE_DESC *desc,
+      IMTLD3D12FrameGenerationState **state) final {
+    return CreateOwnedFrameGenerationState(this, desc, state);
   }
 
   HRESULT
@@ -2987,8 +3090,8 @@ public:
     if (!rtas_pipelines_.prepass) {
       auto library = command_library.getLibrary();
       WMT::Reference<WMT::Error> error;
-      auto prepass_function = library.newFunction("dxmt_as_prepass");
-      auto prepass = GetMTLDevice().newComputePipelineState(prepass_function, error);
+      auto prepass_function = WMT4::Library(library).newFunction("dxmt_as_prepass");
+      auto prepass = GetMetal4Compiler().newComputePipelineState(prepass_function, error);
       if (error || !prepass)
         return E_FAIL;
       rtas_pipelines_.prepass = std::move(prepass);
@@ -2999,7 +3102,7 @@ public:
           &rtas_pipelines_.visualizeDescriptors};
       for (uint32_t i = 0; i < 6; ++i) {
         error = {};
-        *states[i] = GetMTLDevice().newComputePipelineState(library.newFunction(names[i]), error);
+        *states[i] = GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction(names[i]), error);
         if (error || !*states[i]) {
           rtas_pipelines_ = {};
           return E_FAIL;
