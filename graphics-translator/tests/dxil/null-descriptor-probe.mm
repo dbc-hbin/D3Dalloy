@@ -18,8 +18,19 @@
 #import <Metal/Metal.h>
 
 #include <dispatch/dispatch.h>
+#include <sys/sysctl.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mach/machine.h>
 
 #include "airconv_public.h"
+#if defined(DXMT_NATIVE_BRIDGE_PROBE) || defined(DXMT_UNIX_PLUGIN_PROBE)
+#include "winemetal_metal4.h"
+#endif
+#ifdef DXMT_UNIX_PLUGIN_PROBE
+#include "winemetal_thunks.h"
+extern "C" const void *__wine_unix_call_funcs[];
+#endif
 
 #include "null-descriptor-root_signature.hpp"
 
@@ -224,7 +235,8 @@ int RunProbe(id<MTLDevice> device, id<MTLCommandQueue> queue, const std::vector<
   for (uint64_t i = 0; i < kOobBufferBytes / sizeof(uint32_t); i++)
     static_cast<uint32_t *>([oob contents])[i] = kSentinel;
 
-  uint64_t root_arguments[2] = {heap.gpuAddress, root_uav.gpuAddress};
+  // Global root arguments include the root UAV residency status and view ID qwords.
+  uint64_t root_arguments[4] = {heap.gpuAddress, root_uav.gpuAddress, 0, 0};
   id<MTLBuffer> arguments = [device newBufferWithBytes:root_arguments
                                                length:sizeof(root_arguments)
                                               options:MTLResourceStorageModeShared];
@@ -280,6 +292,31 @@ int RunProbe(id<MTLDevice> device, id<MTLCommandQueue> queue, const std::vector<
 } // namespace
 
 int main(int argc, char **argv) {
+  int translated = -1;
+  size_t translated_size = sizeof(translated);
+  if (sysctlbyname("sysctl.proc_translated", &translated, &translated_size, nullptr, 0) != 0) {
+    fail("cannot establish process translation state");
+    return 1;
+  }
+#if defined(__arm64__)
+  const char *native_arch = "arm64";
+  if (translated != 0) {
+    fail("ARM64 process is translated");
+    return 1;
+  }
+#else
+  const char *native_arch = "x86_64";
+#endif
+  Dl_info compiler_image{};
+  if (!dladdr(reinterpret_cast<const void *>(&SM50Compile), &compiler_image)) {
+    fail("cannot identify loaded public compiler image");
+    return 1;
+  }
+  const char *api_validation = getenv("MTL_DEBUG_LAYER");
+  const char *shader_validation = getenv("MTL_SHADER_VALIDATION");
+  std::printf("NATIVE_PROCESS native_arch=%s proc_translated=%d compiler_image=%s api_validation=%s shader_validation=%s\n",
+              native_arch, translated, compiler_image.dli_fname,
+              api_validation ? api_validation : "unset", shader_validation ? shader_validation : "unset");
   if (argc != 2) {
     std::fprintf(stderr, "usage: null-descriptor-probe <null-descriptor.dxil>\n");
     return 2;
@@ -297,8 +334,78 @@ int main(int argc, char **argv) {
       return 2;
     }
     std::printf("NULL_DESCRIPTOR_PROBE_DEVICE name=%s\n", device.name.UTF8String);
+#if defined(DXMT_NATIVE_BRIDGE_PROBE) || defined(DXMT_UNIX_PLUGIN_PROBE)
+    const obj_handle_t device_handle = reinterpret_cast<uintptr_t>((__bridge void *)device);
+    struct WMTMetal4Call supports{};
+    supports.operation = WMTMetal4Supports;
+    supports.args[0] = device_handle;
+#ifdef DXMT_UNIX_PLUGIN_PROBE
+    // Invoke the actual exported native dispatch table, not Windows thunks or a stand-in.
+    using UnixCall = int32_t (*)(void *);
+    const auto *calls = __wine_unix_call_funcs;
+    struct unixcall_get_os_version version{};
+    const NSOperatingSystemVersion host_version = [NSProcessInfo processInfo].operatingSystemVersion;
+    if (reinterpret_cast<UnixCall>(const_cast<void *>(calls[111]))(&version) != 0 ||
+        version.ret_major != static_cast<uint64_t>(host_version.majorVersion) ||
+        version.ret_minor != static_cast<uint64_t>(host_version.minorVersion) ||
+        version.ret_patch != static_cast<uint64_t>(host_version.patchVersion)) {
+      fail("real Unix-plugin OS-version dispatch differs from the host");
+      return 1;
+    }
+    const int32_t support_status = reinterpret_cast<UnixCall>(const_cast<void *>(calls[314]))(&supports);
+#else
+    const int32_t support_status = WMTMetal4Call(&supports);
+#endif
+    if (support_status != 0 || supports.ret[0] != [device supportsFamily:MTLGPUFamilyMetal4]) {
+      fail("native typed Metal4 bridge capability differs from the real device");
+      return 1;
+    }
+#ifdef DXMT_UNIX_PLUGIN_PROBE
+    struct unixcall_generic_obj_uint64_obj_ret queue_call{device_handle, 64, 0};
+    if (reinterpret_cast<UnixCall>(const_cast<void *>(calls[9]))(&queue_call) != 0) {
+      fail("real Unix-plugin command-queue dispatch failed");
+      return 1;
+    }
+    const obj_handle_t queue_handle = queue_call.ret;
+    std::printf("NATIVE_UNIX_PLUGIN os_version=%llu.%llu.%llu dispatch=111,314,9 guest_execution=0\n",
+                static_cast<unsigned long long>(version.ret_major),
+                static_cast<unsigned long long>(version.ret_minor),
+                static_cast<unsigned long long>(version.ret_patch));
+#else
+    const obj_handle_t queue_handle = MTLDevice_newCommandQueue(device_handle, 64);
+#endif
+    if (!queue_handle) {
+      fail("native Metal bridge did not create a command queue");
+      return 1;
+    }
+    id<MTLCommandQueue> queue = (__bridge_transfer id<MTLCommandQueue>)(reinterpret_cast<void *>(queue_handle));
+    std::printf("NATIVE_BRIDGE Metal4_supported=%llu queue_created=1\n", static_cast<unsigned long long>(supports.ret[0]));
+    RunProbe(device, queue, bytecode);
+#else
     RunProbe(device, [device newCommandQueue], bytecode);
+#endif
   }
+
+#ifdef DXMT_UNIX_PLUGIN_PROBE
+  const uint32_t image_count = _dyld_image_count();
+  for (uint32_t index = 0; index < image_count; ++index) {
+    const auto *header = _dyld_get_image_header(index);
+    const char *path = _dyld_get_image_name(index);
+#if defined(__arm64__)
+    if (!header || header->cputype != CPU_TYPE_ARM64)
+      fail("loaded image is not ARM64 in the native Unix-plugin process");
+#endif
+    if (!path) {
+      fail("loaded image has no auditable path");
+      continue;
+    }
+    if (std::strstr(path, "D3DMetal") || std::strstr(path, "GPTK"))
+      fail("foreign graphics backend loaded in the owned Unix-plugin probe");
+    if (std::strncmp(path, "/System/Library/", 16) && std::strncmp(path, "/usr/lib/", 9))
+      std::printf("NATIVE_LOADED_IMAGE cpu=%d path=%s\n", header ? header->cputype : 0, path);
+  }
+  std::printf("NATIVE_UNIX_PLUGIN_IMAGES checked=%u guest_execution=0\n", image_count);
+#endif
 
   std::printf("NULL_DESCRIPTOR_PROBE_RESULT pass=%d\n", fails == 0 ? 1 : 0);
   if (fails == 0)

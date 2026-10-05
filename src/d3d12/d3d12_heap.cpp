@@ -19,6 +19,7 @@
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
 #include "d3d12_resource_contract.hpp"
+#include <memory>
 #include <new>
 #include "com/com_pointer.hpp"
 #include "wsi_platform.hpp"
@@ -249,6 +250,8 @@ ValidateHostMemory(void *pAddress, UINT64 Size, uint64_t &size) {
 HRESULT
 CreateHostMemoryHeap(MTLD3D12Device *pDevice, void *pAddress, UINT64 Size, void *owned_view, REFIID riid,
                      void **ppHeap) {
+  // Own the mapped view before either validation or heap allocation can fail.
+  std::unique_ptr<void, decltype(&UnmapViewOfFile)> view(owned_view, &UnmapViewOfFile);
   uint64_t size = 0;
   HRESULT hr = ValidateHostMemory(pAddress, Size, size);
   if (FAILED(hr))
@@ -267,7 +270,7 @@ CreateHostMemoryHeap(MTLD3D12Device *pDevice, void *pAddress, UINT64 Size, void 
   if (!impl)
     return E_OUTOFMEMORY;
   auto heap = Com(impl);
-  heap->owned_view_ = owned_view; // released with the heap, also on failure below
+  heap->owned_view_ = view.release(); // the heap releases the view after its no-copy Metal buffer
   hr = heap->InitializeExternal(static_cast<uint8_t *>(pAddress), desc);
   if (FAILED(hr))
     return hr;

@@ -2,12 +2,14 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 using Microsoft::WRL::ComPtr;
 
@@ -15,6 +17,8 @@ namespace {
 
 constexpr UINT64 kBytes = 256;
 constexpr DWORD kTimeoutMs = 15000;
+// NT event query access is omitted by the public llvm-mingw winnt.h.
+constexpr DWORD kEventQueryStateAccess = 0x0001;
 
 [[noreturn]] void fail(const char *step, HRESULT hr = E_FAIL) {
   std::fprintf(stderr, "OWNED_D3D12_RESIDENCY_FAIL step=%s hr=0x%08lx\n", step,
@@ -48,6 +52,257 @@ void requireOwnedBackend() {
   if (!id || std::strcmp(id, "owned-graphics-d3d12") != 0)
     fail("OwnedGraphicsBackendId mismatch");
   std::printf("OWNED_D3D12_RESIDENCY_BACKEND id=%s\n", id);
+}
+
+struct AdapterRelease {
+  IDXGIAdapter3 *adapter;
+  ULONG remainingReferences;
+};
+
+DWORD WINAPI releaseAdapter(void *context) {
+  auto *release = static_cast<AdapterRelease *>(context);
+  release->remainingReferences = release->adapter->Release();
+  return 0;
+}
+
+std::array<DXGI_QUERY_VIDEO_MEMORY_INFO, 2> queryBudget(IDXGIAdapter3 *adapter) {
+  std::array<DXGI_QUERY_VIDEO_MEMORY_INFO, 2> info{};
+  for (UINT segment = 0; segment < info.size(); ++segment)
+    check(adapter->QueryVideoMemoryInfo(0, static_cast<DXGI_MEMORY_SEGMENT_GROUP>(segment),
+                                       &info[segment]),
+          "QueryVideoMemoryInfo node0");
+  return info;
+}
+
+void printBudget(const char *phase, const std::array<DXGI_QUERY_VIDEO_MEMORY_INFO, 2> &info) {
+  for (UINT segment = 0; segment < info.size(); ++segment)
+    std::printf("OWNED_D3D12_RESIDENCY_BUDGET_INFO phase=%s node=0 segment=%u "
+                "budget_bytes=%llu usage_bytes=%llu available_reservation_bytes=%llu "
+                "reservation_bytes=%llu\n",
+                phase, segment, static_cast<unsigned long long>(info[segment].Budget),
+                static_cast<unsigned long long>(info[segment].CurrentUsage),
+                static_cast<unsigned long long>(info[segment].AvailableForReservation),
+                static_cast<unsigned long long>(info[segment].CurrentReservation));
+}
+
+void testAdapterBudget() {
+  ComPtr<IDXGIFactory4> factory;
+  check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "budget factory");
+  ComPtr<IDXGIAdapter1> adapter1;
+  check(factory->EnumAdapters1(0, &adapter1), "budget adapter");
+  ComPtr<IDXGIAdapter3> adapter;
+  check(adapter1.As(&adapter), "QueryInterface(IDXGIAdapter3)");
+
+  // This gate deliberately precedes null-cookie validation: the old no-op stub
+  // returns the same cookie twice and would dereference a null cookie afterward.
+  std::array<HANDLE, 2> events{};
+  std::array<DWORD, 2> cookies{};
+  for (UINT i = 0; i < events.size(); ++i) {
+    events[i] = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!events[i])
+      fail("budget CreateEvent", HRESULT_FROM_WIN32(GetLastError()));
+    check(adapter->RegisterVideoMemoryBudgetChangeNotificationEvent(events[i], &cookies[i]),
+          "budget register distinct events");
+  }
+  // Cookies are opaque: zero is allowed; only active uniqueness is required.
+  if (cookies[0] == cookies[1])
+    fail("budget distinct active cookies");
+
+  auto rejectRegistration = [&](HANDLE event, DWORD *cookie, const char *step) {
+    const HRESULT hr = adapter->RegisterVideoMemoryBudgetChangeNotificationEvent(event, cookie);
+    if (SUCCEEDED(hr))
+      fail(step, hr);
+  };
+  DWORD rejectedCookie = 0;
+  rejectRegistration(events[0], nullptr, "budget null cookie rejected");
+  rejectRegistration(nullptr, &rejectedCookie, "budget null handle rejected");
+  rejectRegistration(INVALID_HANDLE_VALUE, &rejectedCookie, "budget invalid handle rejected");
+  HANDLE semaphore = CreateSemaphoreW(nullptr, 0, 1, nullptr);
+  if (!semaphore)
+    fail("budget CreateSemaphore", HRESULT_FROM_WIN32(GetLastError()));
+  // Semaphore modify access overlaps EVENT_MODIFY_STATE: rights alone are not type validation.
+  rejectRegistration(semaphore, &rejectedCookie, "budget non-event rejected");
+  if (WaitForSingleObject(semaphore, 0) != WAIT_TIMEOUT ||
+      !ReleaseSemaphore(semaphore, 1, nullptr) ||
+      WaitForSingleObject(semaphore, 0) != WAIT_OBJECT_0)
+    fail("budget rejected semaphore state preserved");
+  CloseHandle(semaphore);
+
+  HANDLE witness = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!witness)
+    fail("budget witness CreateEvent", HRESULT_FROM_WIN32(GetLastError()));
+  for (DWORD access : {static_cast<DWORD>(SYNCHRONIZE), kEventQueryStateAccess}) {
+    HANDLE restricted = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), witness, GetCurrentProcess(), &restricted,
+                         access, FALSE, 0))
+      fail("budget restricted DuplicateHandle", HRESULT_FROM_WIN32(GetLastError()));
+    rejectRegistration(restricted, &rejectedCookie, "budget nonsignaling rights rejected");
+    CloseHandle(restricted);
+  }
+  if (WaitForSingleObject(witness, 0) != WAIT_TIMEOUT)
+    fail("budget rejected registration changed witness");
+  HANDLE modifyOnly = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), witness, GetCurrentProcess(), &modifyOnly,
+                       EVENT_MODIFY_STATE, FALSE, 0))
+    fail("budget modify-only DuplicateHandle", HRESULT_FROM_WIN32(GetLastError()));
+  DWORD witnessCookie = 0;
+  check(adapter->RegisterVideoMemoryBudgetChangeNotificationEvent(modifyOnly, &witnessCookie),
+        "budget modify-only registration");
+  CloseHandle(modifyOnly); // The registration must own a duplicate, not borrow this handle.
+
+  DWORD repeatedCookie = 0;
+  check(adapter->RegisterVideoMemoryBudgetChangeNotificationEvent(events[0], &repeatedCookie),
+        "budget repeated event registration");
+  HANDLE initialEvent = CreateEventW(nullptr, FALSE, TRUE, nullptr);
+  if (!initialEvent)
+    fail("budget initial CreateEvent", HRESULT_FROM_WIN32(GetLastError()));
+  DWORD initialCookie = 0;
+  check(adapter->RegisterVideoMemoryBudgetChangeNotificationEvent(initialEvent, &initialCookie),
+        "budget initially signaled auto event registration");
+  if (WaitForSingleObject(initialEvent, 0) != WAIT_OBJECT_0)
+    fail("budget registration consumed initial auto signal");
+  // A second wake may be a real native transition. Never infer stability from equal endpoints.
+  const DWORD initialSecondWait = WaitForSingleObject(initialEvent, 0);
+  if (initialSecondWait != WAIT_OBJECT_0 && initialSecondWait != WAIT_TIMEOUT)
+    fail("budget initial second wait", HRESULT_FROM_WIN32(GetLastError()));
+  const std::array<DWORD, 5> activeCookies{cookies[0], cookies[1], witnessCookie,
+                                          repeatedCookie, initialCookie};
+  for (size_t i = 0; i < activeCookies.size(); ++i)
+    for (size_t j = i + 1; j < activeCookies.size(); ++j)
+      if (activeCookies[i] == activeCookies[j])
+        fail("budget repeated/restricted distinct active cookies");
+
+  const auto original = queryBudget(adapter.Get());
+  printBudget("original", original);
+  DXGI_QUERY_VIDEO_MEMORY_INFO invalidInfo{};
+  expect(adapter->QueryVideoMemoryInfo(1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &invalidInfo),
+         E_INVALIDARG, "budget invalid node query");
+  expect(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, nullptr),
+         E_INVALIDARG, "budget null query output");
+  const auto invalidSegment = static_cast<DXGI_MEMORY_SEGMENT_GROUP>(2);
+  expect(adapter->QueryVideoMemoryInfo(0, invalidSegment, &invalidInfo),
+         E_INVALIDARG, "budget invalid segment query");
+  expect(adapter->SetVideoMemoryReservation(1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, 1),
+         E_INVALIDARG, "budget invalid node reservation");
+  expect(adapter->SetVideoMemoryReservation(0, invalidSegment, 1),
+         E_INVALIDARG, "budget invalid segment reservation");
+  for (UINT segment = 0; segment < original.size(); ++segment)
+    if (!original[segment].Budget || original[segment].AvailableForReservation != 0 ||
+        original[segment].CurrentReservation > original[segment].AvailableForReservation)
+      fail("budget native query policy");
+  // Stay within AvailableForReservation (currently zero). This exercises the
+  // public setter/reporting contract, not a budget-change stimulus or negative control.
+  for (UINT segment = 0; segment < original.size(); ++segment) {
+    check(adapter->SetVideoMemoryReservation(0, static_cast<DXGI_MEMORY_SEGMENT_GROUP>(segment),
+                                             0),
+          "budget available reservation");
+    const auto reserved = queryBudget(adapter.Get());
+    for (UINT other = 0; other < reserved.size(); ++other)
+      if (reserved[other].CurrentReservation !=
+          (other <= segment ? 0 : original[other].CurrentReservation))
+        fail("budget independent reservation report");
+  }
+  printBudget("reserved", queryBudget(adapter.Get()));
+  for (UINT segment = 0; segment < original.size(); ++segment)
+    check(adapter->SetVideoMemoryReservation(0, static_cast<DXGI_MEMORY_SEGMENT_GROUP>(segment),
+                                             original[segment].CurrentReservation),
+          "budget restore reservation");
+  const auto restored = queryBudget(adapter.Get());
+  for (UINT segment = 0; segment < restored.size(); ++segment)
+    if (restored[segment].CurrentReservation != original[segment].CurrentReservation)
+      fail("budget restored reservation mismatch");
+  printBudget("restored", restored);
+
+  // Observe real hardware without pressure, source overrides, or requiring a
+  // physical transition. Notifications are coalesced hints, not a wake-per-cookie ledger.
+  const HANDLE observedEvents[]{events[0], events[1], witness};
+  const auto before = queryBudget(adapter.Get());
+  auto previous = before;
+  unsigned observedChanges = 0;
+  std::array<unsigned, 3> wakes{};
+  DWORD lastWait = WAIT_TIMEOUT;
+  const ULONGLONG started = GetTickCount64();
+  for (;;) {
+    const ULONGLONG elapsed = GetTickCount64() - started;
+    if (elapsed >= 1500)
+      break;
+    const DWORD remaining = static_cast<DWORD>(1500 - elapsed);
+    lastWait = WaitForMultipleObjects(3, observedEvents, FALSE, remaining < 100 ? remaining : 100);
+    if (lastWait >= WAIT_OBJECT_0 && lastWait < WAIT_OBJECT_0 + 3)
+      ++wakes[lastWait - WAIT_OBJECT_0];
+    else if (lastWait != WAIT_TIMEOUT)
+      fail("budget native observation wait", HRESULT_FROM_WIN32(GetLastError()));
+    const auto current = queryBudget(adapter.Get());
+    for (UINT segment = 0; segment < current.size(); ++segment) {
+      if (current[segment].Budget != previous[segment].Budget) {
+        ++observedChanges;
+        std::printf("OWNED_D3D12_RESIDENCY_BUDGET_CHANGE segment=%u previous_bytes=%llu "
+                    "current_bytes=%llu elapsed_ms=%llu\n", segment,
+                    static_cast<unsigned long long>(previous[segment].Budget),
+                    static_cast<unsigned long long>(current[segment].Budget),
+                    static_cast<unsigned long long>(GetTickCount64() - started));
+      }
+    }
+    previous = current;
+  }
+  printBudget("observed", previous);
+  std::printf("OWNED_D3D12_RESIDENCY_BUDGET_MEASUREMENT elapsed_ms=%llu "
+              "local_before_bytes=%llu local_after_bytes=%llu nonlocal_before_bytes=%llu "
+              "nonlocal_after_bytes=%llu observed_segment_changes=%u event_wakes=%u,%u,%u "
+              "last_wait=%lu initial_second_wait=%lu physical_change_required=0\n",
+              static_cast<unsigned long long>(GetTickCount64() - started),
+              static_cast<unsigned long long>(before[0].Budget),
+              static_cast<unsigned long long>(previous[0].Budget),
+              static_cast<unsigned long long>(before[1].Budget),
+              static_cast<unsigned long long>(previous[1].Budget), observedChanges,
+              wakes[0], wakes[1], wakes[2], static_cast<unsigned long>(lastWait),
+              static_cast<unsigned long>(initialSecondWait));
+
+  DWORD unknownCookie = 0;
+  for (;;) {
+    bool active = false;
+    for (DWORD cookie : activeCookies)
+      active = active || cookie == unknownCookie;
+    if (!active)
+      break;
+    ++unknownCookie;
+  }
+  adapter->UnregisterVideoMemoryBudgetChangeNotification(unknownCookie); // Chosen policy: ignored.
+  adapter->UnregisterVideoMemoryBudgetChangeNotification(cookies[0]);
+  adapter->UnregisterVideoMemoryBudgetChangeNotification(cookies[0]); // Idempotent unknown cookie.
+  adapter->UnregisterVideoMemoryBudgetChangeNotification(repeatedCookie);
+  adapter->UnregisterVideoMemoryBudgetChangeNotification(cookies[1]);
+  for (HANDLE event : events) {
+    if (!ResetEvent(event) || !SetEvent(event) || WaitForSingleObject(event, 0) != WAIT_OBJECT_0 ||
+        WaitForSingleObject(event, 0) != WAIT_TIMEOUT)
+      fail("budget caller handle usable after unregister");
+  }
+  // Leave witness/initial registrations live; drop every COM alias before the
+  // final Release and check that joining the observer is bounded, with no self-reference.
+  adapter1.Reset();
+  factory.Reset();
+  AdapterRelease release{adapter.Detach(), ~0u};
+  const ULONGLONG releaseStarted = GetTickCount64();
+  HANDLE thread = CreateThread(nullptr, 0, releaseAdapter, &release, 0, nullptr);
+  if (!thread)
+    fail("budget release CreateThread", HRESULT_FROM_WIN32(GetLastError()));
+  if (WaitForSingleObject(thread, 2000) != WAIT_OBJECT_0)
+    fail("budget release with live registrations bounded");
+  CloseHandle(thread);
+  if (release.remainingReferences != 0)
+    fail("budget release with live registrations refcycle");
+  for (HANDLE event : {witness, initialEvent}) {
+    if (!ResetEvent(event) || !SetEvent(event) || WaitForSingleObject(event, 0) != WAIT_OBJECT_0 ||
+        WaitForSingleObject(event, 0) != WAIT_TIMEOUT)
+      fail("budget caller handle usable after adapter release");
+    CloseHandle(event);
+  }
+  for (HANDLE event : events)
+    CloseHandle(event);
+  std::printf("OWNED_D3D12_RESIDENCY_BUDGET_TEARDOWN elapsed_ms=%llu remaining_refs=%lu\n",
+              static_cast<unsigned long long>(GetTickCount64() - releaseStarted),
+              static_cast<unsigned long>(release.remainingReferences));
+  std::puts("OWNED_D3D12_RESIDENCY_BUDGET_PASS");
 }
 
 D3D12_HEAP_PROPERTIES heapProperties(D3D12_HEAP_TYPE type) {
@@ -99,6 +354,7 @@ void waitFence(ID3D12Fence *fence, UINT64 value) {
 
 int main() {
   requireOwnedBackend();
+  testAdapterBudget();
 
   ComPtr<ID3D12Device> device;
   check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice");

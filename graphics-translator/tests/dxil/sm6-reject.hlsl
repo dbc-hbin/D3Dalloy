@@ -4,21 +4,23 @@
 RWByteAddressBuffer Out : register(u0);
 RWByteAddressBuffer Raw : register(u1);
 
-// Wave size attribute: 32 is accepted, others must be rejected.
+// Virtual waves 4/8/16 and native32 are supported; cross-SIMD64/128 must reject.
 [WaveSize(32)] [numthreads(32, 1, 1)]
 void cs_wavesize32(uint gi : SV_GroupIndex) { Out.Store(gi * 4, WaveGetLaneCount()); }
 [WaveSize(64)] [numthreads(64, 1, 1)]
 void cs_wavesize64(uint gi : SV_GroupIndex) { Out.Store(gi * 4, WaveGetLaneCount()); }
+[WaveSize(128)] [numthreads(128, 1, 1)]
+void cs_wavesize128(uint gi : SV_GroupIndex) { Out.Store(gi * 4, WaveGetLaneCount()); }
+[WaveSize(64, 128)] [numthreads(128, 1, 1)]
+void cs_wavesize_range64only(uint gi : SV_GroupIndex) { Out.Store(gi * 4, WaveGetLaneCount()); }
 
-// FP64 must be rejected (DoublePrecisionFloatShaderOps = FALSE).
-[numthreads(1, 1, 1)]
-void cs_fp64() { double d = asfloat(Raw.Load(0)); Out.Store(0, (uint)(d * d)); }
-// 64 bit groupshared atomics must be rejected (AtomicInt64OnGroupSharedSupported = FALSE).
+
+// Positive groupshared64 input: maintained here alongside other historical rejection fixtures.
 groupshared uint64_t Shared64;
 [numthreads(1, 1, 1)]
-void cs_gs64() { InterlockedAdd(Shared64, 1); Out.Store<uint64_t>(0, Shared64); }
+void cs_gs64() { Shared64=0; InterlockedAdd(Shared64, 1); Out.Store<uint64_t>(0, Shared64); }
 
-// Compiled as cs_6_9: above the highest supported shader model (6.8).
+// SM6.9 input is accepted independently of the device's conservative SM6.5 advertisement.
 [numthreads(1, 1, 1)]
 void cs_sm69() { Out.Store(0, 1); }
 

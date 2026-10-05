@@ -19,8 +19,8 @@ if build_native_components
   )
 endif
 
-if get_option('enable_fsr') and (native_bridge_only or not dxmt_crossbuild or cpu_family != 'x86_64' or not get_option('enable_d3d12'))
-  error('enable_fsr requires a Windows x64 cross build with enable_d3d12=true')
+if get_option('enable_fsr') and (native_bridge_only or not dxmt_crossbuild or not get_option('enable_d3d12'))
+  error('enable_fsr requires a Windows cross build with enable_d3d12=true')
 endif
 
 if not native_bridge_only
@@ -41,6 +41,7 @@ subdir('d3d11')
 subdir('d3d10')
 
 if get_option('enable_d3d12')
+subdir('fsrfg/backend')
 subdir('d3d12')
 endif
 

@@ -1,0 +1,7 @@
+LIBRARY D3D12Core.dll
+EXPORTS
+    D3D12SDKVersion DATA
+    D3D12GetInterface=OwnedCoreD3D12GetInterface
+    OwnedD3D12CoreGetBridge1
+    OwnedD3D12CoreGeneration DATA
+    OwnedGraphicsBackendId=OwnedCoreGraphicsBackendId

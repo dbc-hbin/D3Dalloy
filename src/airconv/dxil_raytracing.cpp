@@ -61,6 +61,7 @@
 #include "dxil_workgraph.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -473,6 +474,28 @@ SM50_RT_FUNCTION_KIND functionKindOfStage(uint32_t stage) {
  */
 constexpr uint32_t kRtBlockAlignment = 16;
 
+// Invocation storage, SBT/VFT and traversal metadata are physical transport,
+// not application UAV cells. Mark them before resource operations are emitted.
+void MarkRaytracingTransport(Function &function) {
+  for (auto &block : function)
+    for (auto &instruction : block) {
+      bool transport = false;
+      if (auto *load = dyn_cast<LoadInst>(&instruction))
+        transport = load->getPointerAddressSpace() == 1;
+      else if (auto *store = dyn_cast<StoreInst>(&instruction))
+        transport = store->getPointerAddressSpace() == 1;
+      else if (auto *atomic = dyn_cast<AtomicRMWInst>(&instruction))
+        transport = atomic->getPointerAddressSpace() == 1;
+      else if (auto *atomic = dyn_cast<AtomicCmpXchgInst>(&instruction))
+        transport = atomic->getPointerAddressSpace() == 1;
+      else if (auto *call = dyn_cast<CallInst>(&instruction))
+        if (auto *callee = call->getCalledFunction())
+          transport = callee->getName().startswith("air.atomic.");
+      if (transport)
+        instruction.setMetadata(kAtomic64Metadata, MDNode::get(function.getContext(), {}));
+    }
+}
+
 /** Alloca an aligned byte block and return it as an i8*. */
 Value *createByteBlock(IRBuilder<> &builder, uint32_t size, StringRef name) {
   LLVMContext &context = builder.getContext();
@@ -548,15 +571,101 @@ void storeBlockField(
   builder.CreateAlignedStore(value, builder.CreateBitCast(field, type->getPointerTo(space)), Align(1));
 }
 
+llvm::Error LowerRaytracingImmutableConstants(Module &module, SM50CompiledBitcodeInternal &compiled) {
+  struct FixedEntry {
+    Function *wrapper;
+    std::string body_name;
+    unsigned dispatch_index;
+    unsigned payload_index;
+    bool visible;
+  };
+  SmallVector<FixedEntry, 8> entries;
+  // Keep Metal's callable/intersection ABI and its metadata on a declaration
+  // while the ordinary pass threads the pool through genuine application bodies.
+  for (const char *kind : {"air.visible", "air.intersection"}) {
+    auto *metadata = module.getNamedMetadata(kind);
+    if (!metadata)
+      continue;
+    for (unsigned i = 0; i < metadata->getNumOperands(); ++i) {
+      auto *entry = metadata->getOperand(i);
+      auto *body = cast<Function>(cast<ValueAsMetadata>(entry->getOperand(0))->getValue());
+      unsigned dispatch_index = ~0u, payload_index = ~0u;
+      for (auto &argument : cast<MDNode>(entry->getOperand(2))->operands()) {
+        auto *fields = cast<MDNode>(argument.get());
+        for (unsigned field = 1; field + 1 < fields->getNumOperands(); ++field) {
+          auto *key = dyn_cast<MDString>(fields->getOperand(field));
+          if (!key || key->getString() != "air.arg_name")
+            continue;
+          auto name = cast<MDString>(fields->getOperand(field + 1))->getString();
+          unsigned index = mdconst::extract<ConstantInt>(fields->getOperand(0))->getZExtValue();
+          if (name == "dispatch") dispatch_index = index;
+          if (name == "payload") payload_index = index;
+        }
+      }
+      if (dispatch_index == ~0u && payload_index == ~0u)
+        return createError("atomic64 raytracing entry has no dispatch or payload binding");
+      auto *wrapper = Function::Create(body->getFunctionType(), body->getLinkage(),
+        body->getAddressSpace(), "", &module);
+      wrapper->copyAttributesFrom(body);
+      wrapper->removeFnAttr(Attribute::ReadNone);
+      wrapper->removeFnAttr(Attribute::WriteOnly);
+      wrapper->removeFnAttr(Attribute::InaccessibleMemOnly);
+      wrapper->removeFnAttr(Attribute::Speculatable);
+      wrapper->takeName(body);
+      body->setName(wrapper->getName() + ".atomic64_body");
+      body->setLinkage(GlobalValue::InternalLinkage);
+      body->addFnAttr(Attribute::AlwaysInline);
+      SmallVector<Metadata *, 4> fields(entry->op_begin(), entry->op_end());
+      fields[0] = ValueAsMetadata::get(wrapper);
+      metadata->setOperand(i, MDNode::get(module.getContext(), fields));
+      entries.push_back({wrapper, body->getName().str(), dispatch_index, payload_index,
+        StringRef(kind) == "air.visible"});
+    }
+  }
+  if (auto failure = LowerImmutableConstants(module, compiled))
+    return failure;
+  for (auto &entry : entries) {
+    auto *body = module.getFunction(entry.body_name);
+    auto *wrapper = entry.wrapper;
+    if (!body || (body->arg_size() != wrapper->arg_size() && body->arg_size() != wrapper->arg_size() + 1))
+      return createError("atomic64 raytracing immutable body has an inconsistent signature");
+    IRBuilder<> builder(BasicBlock::Create(module.getContext(), "entry", wrapper));
+    SmallVector<Value *, 16> arguments;
+    for (auto &argument : wrapper->args())
+      arguments.push_back(&argument);
+    if (body->arg_size() != wrapper->arg_size()) {
+      Value *dispatch;
+      if (entry.dispatch_index != ~0u) {
+        auto *argument = wrapper->getArg(entry.dispatch_index);
+        unsigned space = cast<PointerType>(argument->getType())->getAddressSpace();
+        dispatch = builder.CreateBitCast(argument, builder.getInt8PtrTy(space));
+      } else {
+        Value *payload = wrapper->getArg(entry.payload_index);
+        unsigned space = cast<PointerType>(payload->getType())->getAddressSpace();
+        Value *frame = builder.CreateBitCast(payload, builder.getInt8PtrTy(space));
+        // Visible shaders receive user payload; hardware intersections receive
+        // the whole invocation block. The shared frame remains exactly80bytes.
+        if (entry.visible)
+          frame = builder.CreateGEP(builder.getInt8Ty(), frame, builder.getInt32(-int32_t(sizeof(SM50_RT_FRAME))));
+        dispatch = builder.CreateIntToPtr(
+          loadBlockQword(builder, frame, offsetof(SM50_RT_FRAME, DispatchArguments)), builder.getInt8PtrTy(1));
+      }
+      arguments.push_back(builder.CreateIntToPtr(
+        loadBlockQword(builder, dispatch, offsetof(SM50_RT_DISPATCH_ARGUMENTS, ImmutableConstants)),
+        builder.getInt32Ty()->getPointerTo(2)));
+    }
+    auto *call = builder.CreateCall(body, arguments);
+    call->setCallingConv(body->getCallingConv());
+    if (wrapper->getReturnType()->isVoidTy()) builder.CreateRetVoid();
+    else builder.CreateRet(call);
+    MarkRaytracingTransport(*wrapper);
+  }
+  return Error::success();
+}
+
 /**
- * Run `body` in a block entered only when `condition` holds, and return its value as
- * a phi in the continuation block.
- *
- * The guard is what makes a load safe when the address it would read may be zero: a
- * load cannot be speculated on a null pointer (address space 1 has no address zero),
- * so the fallback has to be a value the continuation picks with a phi rather than one
- * the guarded block merely happens to produce. A condition that folds to false emits
- * nothing at all and the fallback is returned as is.
+ * Run body only when condition holds, returning its value through a phi.
+ * A null device pointer must not be speculatively loaded on the fallback path.
  */
 Value *emitGuardedValue(
   IRBuilder<> &builder, Value *condition, Value *fallback, StringRef name,
@@ -737,6 +846,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
    * and the air.* module flags. */
   if (module_ir.getDataLayout().getPointerSizeInBits() != 64)
     dxmt::initializeModule(module_ir);
+  InitializeAtomic64Phase(module_ir, args);
 
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
   SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
@@ -817,7 +927,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
   if (stage == SM50_RT_STAGE_RAYGEN) {
     dispatch_arguments_index = func_signature.DefineInput(air::InputRaytracingDispatchArguments{
       .location_index = context.dispatch_arguments_slot,
-      .size = (uint32_t)sizeof(SM50_RT_DISPATCH_ARGUMENTS),
+      .size = uint32_t(module_ir.getModuleFlag(kAtomic64PhaseFlag)
+        ? sizeof(SM50_RT_DISPATCH_ARGUMENTS) : offsetof(SM50_RT_DISPATCH_ARGUMENTS, ImmutableConstants)),
       .arg_name = "dispatch",
     });
     func_signature.DefineInput(air::InputIntersectionFunctionTable{
@@ -1428,7 +1539,8 @@ static llvm::Error EmitDispatchCallback(
    */
   const uint32_t dispatch_index = signature.DefineInput(air::InputRaytracingDispatchArguments{
     .location_index = context.dispatch_arguments_slot,
-    .size = (uint32_t)sizeof(SM50_RT_DISPATCH_ARGUMENTS),
+    .size = uint32_t(module.getModuleFlag(kAtomic64PhaseFlag)
+      ? sizeof(SM50_RT_DISPATCH_ARGUMENTS) : offsetof(SM50_RT_DISPATCH_ARGUMENTS, ImmutableConstants)),
     .arg_name = "dispatch",
   });
   const uint32_t table_index = signature.DefineInput(air::InputVisibleFunctionTable{
@@ -2173,7 +2285,9 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
   std::vector<uint32_t> continuations(pDesc->ExportCount, SM50_RT_INDEX_NONE);
   std::vector<uint32_t> any_hits;
   std::vector<uint32_t> intersections;
-  std::vector<std::unique_ptr<dxil::ModuleInfo>> callback_modules(pDesc->ExportCount);
+  // Prepare every live closure once: phase admission cannot be decided from the
+  // first export, or from unrelated device64 code elsewhere in its container.
+  std::vector<std::array<std::unique_ptr<dxil::ModuleInfo>, 2>> export_modules(pDesc->ExportCount);
   std::vector<SM50_WG_LIBRARY> link_libraries;
   link_libraries.reserve(pDesc->LibraryCount);
   for (uint32_t i = 0; i < pDesc->LibraryCount; ++i)
@@ -2183,47 +2297,65 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
   linkage.LibraryCount = pDesc->LibraryCount;
   linkage.Exports = pDesc->LinkExports;
   linkage.ExportCount = pDesc->LinkExportCount;
-  bool query_callbacks = false;
+  bool query_callbacks = (pDesc->Flags & 0x400) != 0;
+  bool uses_atomic64 = false;
   for (uint32_t i = 0; i < pDesc->ExportCount; ++i) {
     if (pDesc->Exports[i].ClosestHitIndex != SM50_RT_INDEX_NONE)
       continuations[i] = i;
     const auto &entry = pDesc->Exports[i];
-    if (entry.Stage != SM50_RT_STAGE_ANY_HIT && entry.Stage != SM50_RT_STAGE_INTERSECTION)
+    if (entry.Stage == SM50_RT_STAGE_LIBRARY)
       continue;
-    const auto &library = pDesc->Libraries[entry.LibraryIndex];
-    auto parsed = dxil::ModuleInfo::Parse(library.Bytecode, size_t(library.Size), entry.ContainerEntryPoint);
-    if (!parsed) {
-      reportError(parsed.takeError(), ppError);
-      return 0;
-    }
-    callback_modules[i] = std::move(*parsed);
-    auto &info = *callback_modules[i];
-    linkage.EntryLibraryIndex = entry.LibraryIndex;
-    linkage.EntryExportIndex = SM50_RT_INDEX_NONE;
-    for (uint32_t function = 0; function < linkage.ExportCount; ++function) {
-      const auto &candidate = linkage.Exports[function];
-      if (candidate.LibraryIndex != entry.LibraryIndex ||
-          std::strcmp(candidate.EntryPoint, entry.ContainerEntryPoint) != 0)
+    const uint32_t variants = entry.Stage == SM50_RT_STAGE_INTERSECTION &&
+      entry.ClosestHitIndex != SM50_RT_INDEX_NONE ? 2 : 1;
+    for (uint32_t variant = 0; variant < variants; ++variant) {
+      const auto &source = variant ? pDesc->Exports[entry.ClosestHitIndex] : entry;
+      const auto &library = pDesc->Libraries[source.LibraryIndex];
+      auto parsed = dxil::ModuleInfo::Parse(library.Bytecode, size_t(library.Size), source.ContainerEntryPoint);
+      if (!parsed) {
+        reportError(parsed.takeError(), ppError);
+        return 0;
+      }
+      export_modules[i][variant] = std::move(*parsed);
+      auto &info = *export_modules[i][variant];
+      linkage.EntryLibraryIndex = source.LibraryIndex;
+      linkage.EntryExportIndex = SM50_RT_INDEX_NONE;
+      for (uint32_t function = 0; function < linkage.ExportCount; ++function) {
+        const auto &candidate = linkage.Exports[function];
+        if (candidate.LibraryIndex != source.LibraryIndex ||
+            std::strcmp(candidate.EntryPoint, source.ContainerEntryPoint) != 0)
+          continue;
+        linkage.EntryExportIndex = function;
+        if (std::strcmp(candidate.Name, entry.EntryPoint) == 0)
+          break;
+      }
+      if (auto failure = dxil::LinkLibraryDependencies(info, linkage)) {
+        reportError(std::move(failure), ppError);
+        return 0;
+      }
+      dxmt::dxil::IsolateSelectedExport(*info.module, *info.entry);
+      const auto stage = dxil::stageFromShaderKind(variant ? SM50_RT_STAGE_CLOSEST_HIT : entry.Stage);
+      if (info.stage != dxil::Stage::Library && info.stage != stage) {
+        reportMessage("a raytracing export's entry point stage does not match its state object stage", ppError);
+        return 0;
+      }
+      info.stage = stage;
+      if (!uses_atomic64)
+        uses_atomic64 = dxil::HasDeviceAtomic64(*info.module);
+      if (variant || query_callbacks ||
+          (entry.Stage != SM50_RT_STAGE_ANY_HIT && entry.Stage != SM50_RT_STAGE_INTERSECTION))
         continue;
-      linkage.EntryExportIndex = function;
-      if (std::strcmp(candidate.Name, entry.EntryPoint) == 0)
-        break;
+      for (const auto &function : *info.module)
+        if (!function.isDeclaration())
+          for (const auto &block : function)
+            for (const auto &instruction : block)
+              if (const auto *call = dyn_cast<CallInst>(&instruction))
+                if (const auto *callee = call->getCalledFunction())
+                  query_callbacks |= callee->getName().startswith("dx.op.allocateRayQuery");
     }
-    if (auto failure = dxil::LinkLibraryDependencies(info, linkage)) {
-      reportError(std::move(failure), ppError);
-      return 0;
-    }
-    dxmt::dxil::IsolateSelectedExport(*info.module, *info.entry);
-    if (query_callbacks)
-      continue;
-    for (const auto &function : *info.module)
-      if (!function.isDeclaration())
-        for (const auto &block : function)
-          for (const auto &instruction : block)
-            if (const auto *call = dyn_cast<CallInst>(&instruction))
-              if (const auto *callee = call->getCalledFunction())
-                query_callbacks |= callee->getName().startswith("dx.op.allocateRayQuery");
   }
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA phase_args{nullptr, SM50_SHADER_D3D12_ATOMIC64_PHASE};
+  if (uses_atomic64)
+    dxil::InitializeAtomic64Phase(air_module, &phase_args);
   if (query_callbacks) {
     any_hits.resize(pDesc->ExportCount, SM50_RT_INDEX_NONE);
     intersections.resize(pDesc->ExportCount, SM50_RT_INDEX_NONE);
@@ -2248,8 +2380,6 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
         export_desc.LibraryIndex = closest_hit.LibraryIndex;
         export_desc.ContainerEntryPoint = closest_hit.ContainerEntryPoint;
       }
-      const SM50_RT_LIBRARY &library = pDesc->Libraries[export_desc.LibraryIndex];
-
       dxil::RaytracingExportContext export_context;
       export_context.stage = export_desc.Stage;
       export_context.export_index = i;
@@ -2310,66 +2440,14 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
         return 0;
       }
 
-      const bool linked_callback = !variant && callback_modules[i];
-      auto info = linked_callback
-        ? llvm::Expected<std::unique_ptr<dxil::ModuleInfo>>(std::move(callback_modules[i]))
-        : dxil::ModuleInfo::Parse(library.Bytecode, static_cast<size_t>(library.Size), export_desc.ContainerEntryPoint);
-      if (!info) {
-        reportError(info.takeError(), ppError);
-        return 0;
-      }
-      linkage.EntryLibraryIndex = export_desc.LibraryIndex;
-      linkage.EntryExportIndex = SM50_RT_INDEX_NONE;
-      for (uint32_t function = 0; function < linkage.ExportCount; ++function) {
-        const auto &candidate = linkage.Exports[function];
-        if (candidate.LibraryIndex != export_desc.LibraryIndex ||
-            std::strcmp(candidate.EntryPoint, export_desc.ContainerEntryPoint) != 0)
-          continue;
-        linkage.EntryExportIndex = function;
-        if (std::strcmp(candidate.Name, export_desc.EntryPoint) == 0)
-          break;
-      }
-      if (!linked_callback) {
-        if (auto failure = dxil::LinkLibraryDependencies(**info, linkage)) {
-          reportError(std::move(failure), ppError);
-          return 0;
-        }
-      }
-
-      /*
-       * The container's `!dx.shaderModel` says "lib" for every entry, so the stage
-       * comes from the export description; D3D12 derived it from the same per-entry
-       * metadata the enumeration reads. A single-stage container keeps its own stage
-       * when it agrees with the description.
-       */
-      dxil::Stage stage = dxil::stageFromShaderKind(export_desc.Stage);
-      if (stage == dxil::Stage::Invalid) {
-        reportMessage("a raytracing export has an unknown stage", ppError);
-        return 0;
-      }
-      if ((*info)->stage != dxil::Stage::Library && (*info)->stage != stage) {
-        reportMessage(
-          "a raytracing export's entry point stage does not match the stage the state "
-          "object assigned it",
-          ppError
-        );
-        return 0;
-      }
-      (*info)->stage = stage;
-
-      /*
-       * Everything below lowers *this* export, and every lowering pass scans every
-       * function definition of the module it is given: the container's other exports
-       * have to be gone first, or an operation that is invalid outside their stage is
-       * reported while this one is compiled (see IsolateSelectedExport).
-       */
-      dxmt::dxil::IsolateSelectedExport(*(*info)->module, *(*info)->entry);
+      auto info = std::move(export_modules[i][variant]);
 
       SM50_SHADER_ROOT_SIGNATURE_DATA rootsig_data{};
       SM50_SHADER_COMMON_DATA common_data{};
       rootsig_data.type = SM50_SHADER_ROOT_SIGNATURE;
       rootsig_data.bytecode = rootsig.data;
       rootsig_data.bytecode_length = rootsig.size;
+      rootsig_data.next = uses_atomic64 ? &phase_args : nullptr;
       common_data.type = SM50_SHADER_COMMON;
       common_data.metal_version = (SM50_SHADER_METAL_VERSION)pDesc->MetalVersion;
       common_data.flags = (SM50_SHADER_FLAG)0;
@@ -2378,7 +2456,7 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
       dxbc::SM50ShaderInternal shader;
 
       auto binding = dxil::LowerRaytracingStage(
-        **info, export_context, shader, function_name.c_str(),
+        *info, export_context, shader, function_name.c_str(),
         (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common_data
       );
       if (!binding) {
@@ -2395,28 +2473,31 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
        */
       export_context.binding = binding->get();
 
-      if (auto failure = dxil::LowerRaytracingOperations(**info, export_context, function_name)) {
+      if (auto failure = dxil::LowerRaytracingOperations(*info, export_context, function_name)) {
         reportError(std::move(failure), ppError);
         return 0;
       }
 
-      if (auto failure = dxil::LowerResources(**info, **binding)) {
+      if (uses_atomic64)
+        for (auto &function : *info->module)
+          dxil::MarkRaytracingTransport(function);
+      if (auto failure = dxil::LowerResources(*info, **binding)) {
         reportError(std::move(failure), ppError);
         return 0;
       }
 
-      if (auto failure = dxil::LowerOperations(*(*info)->module)) {
+      if (auto failure = dxil::LowerOperations(*info->module)) {
         reportError(std::move(failure), ppError);
         return 0;
       }
 
-      if (auto failure = dxil::VerifyLoweredModule(*(*info)->module)) {
+      if (auto failure = dxil::VerifyLoweredModule(*info->module)) {
         reportError(std::move(failure), ppError);
         return 0;
       }
-      dxil::StripDXILArtifacts(*(*info)->module);
+      dxil::StripDXILArtifacts(*info->module);
 
-      if (auto failure = dxil::MergeRaytracingExport(air_module, *(*info)->module, function_name)) {
+      if (auto failure = dxil::MergeRaytracingExport(air_module, *info->module, function_name)) {
         reportError(std::move(failure), ppError);
         return 0;
       }
@@ -2432,7 +2513,8 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
       /* Export bodies have no hardware IFT slot: shared callbacks select them on GPU. */
       function.TableIndex = query_callbacks && export_desc.Stage == SM50_RT_STAGE_INTERSECTION
         ? pDesc->ExportCount + i + 1 : SM50_RT_INDEX_NONE;
-      function.IsDispatchEntry = export_context.is_dispatch_entry ? 1u : 0u;
+      function.Flags = (export_context.is_dispatch_entry ? SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY : 0u) |
+        (uses_atomic64 ? SM50_RT_FUNCTION_FLAG_DEVICE_ATOMIC64_PHASE : 0u);
       functions.push_back(function);
     }
   }
@@ -2477,7 +2559,7 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
     function.Kind = SM50_RT_FUNCTION_DISPATCH;
     function.ExportIndex = SM50_RT_INDEX_NONE;
     function.TableIndex = 0;
-    function.IsDispatchEntry = 0;
+    function.Flags = uses_atomic64 ? SM50_RT_FUNCTION_FLAG_DEVICE_ATOMIC64_PHASE : 0u;
     functions.push_back(function);
     if (has_intersection && !query_callbacks) {
       if (auto failure = dxmt::dxil::EmitBoundingBoxDispatch(
@@ -2509,11 +2591,30 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
     function.Kind = SM50_RT_FUNCTION_RAYGEN;
     function.ExportIndex = SM50_RT_INDEX_NONE;
     function.TableIndex = SM50_RT_INDEX_NONE;
-    function.IsDispatchEntry = 1;
+    function.Flags = SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY |
+      (uses_atomic64 ? SM50_RT_FUNCTION_FLAG_DEVICE_ATOMIC64_PHASE : 0u);
     functions.push_back(function);
   }
 
 
+  if (uses_atomic64) {
+    // These functions are emitted after application resource lowering. Mark only
+    // their physical transport, never the already-lowered user UAV operations.
+    for (const char *name : {"dxmt.rt.candidate", "dxmt.rt.bounding_box", "dxmt.rt.raygen_dispatcher"})
+      if (auto *function = air_module.getFunction(name))
+        dxil::MarkRaytracingTransport(*function);
+    if (auto failure = dxil::LowerAtomic64Phase(air_module)) {
+      reportError(std::move(failure), ppError);
+      return 0;
+    }
+  }
+  auto compiled = std::make_unique<dxil::SM50CompiledBitcodeInternal>();
+  if (uses_atomic64) {
+    if (auto failure = dxil::LowerRaytracingImmutableConstants(air_module, *compiled)) {
+      reportError(std::move(failure), ppError);
+      return 0;
+    }
+  }
   if (llvm::verifyModule(air_module, &llvm::errs())) {
     llvm::errs() << "OWNED_RT_INVALID_IR_BEGIN\n";
     air_module.print(llvm::errs(), nullptr);
@@ -2536,8 +2637,6 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
     functions[i].Name = next_name;
     next_name += name.size() + 1;
   }
-  auto compiled = new dxil::SM50CompiledBitcodeInternal();
-
   /*
    * The merged module is optimized as a whole, exactly as a raster shader is after its
    * lowering: `runOptimizationPasses`'s first pass is InferAddressSpacesPass(0), which
@@ -2554,7 +2653,7 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
   metallib::MetallibWriter writer;
   writer.Write(air_module, stream);
 
-  *ppBitcode = (sm50_bitcode_t)compiled;
+  *ppBitcode = (sm50_bitcode_t)compiled.release();
   SM50GetCompiledBitcode(*ppBitcode, pMetallib);
   for (size_t i = 0; i < functions.size(); ++i)
     pFunctions[i] = functions[i];

@@ -1647,12 +1647,12 @@ SimpleCommandContext<ArgumentEncodingContext>::dispatchIndirect(WMT::Buffer argu
 template <>
 void
 SimpleCommandContext<ArgumentEncodingContext>::setComputeTexture(
-    uint32_t index, const Rc<Texture> &texture, uint64_t viewId, int flags
+    uint32_t index, const Rc<Texture> &texture, uint64_t viewId, int flags, uint32_t sample
 ) {
   auto &dst_ = ctx.access(texture, viewId, flags);
   auto &settex = ctx.encodeComputeCommand<wmtcmd_compute_settexture>();
   settex.type = WMTComputeCommandSetTexture;
-  settex.texture = dst_.texture;
+  settex.texture = dst_.msaaSampleAddress ? WMT::Texture(dst_.msaaViews[sample]) : WMT::Texture(dst_.texture);
   settex.index = index;
 }
 

@@ -4,6 +4,7 @@
 #include <windows.h>
 #include "dxmt_presenter.hpp"
 #include "Metal.hpp"
+#include "Metal4FX.hpp"
 #include "log/log.hpp"
 #include <algorithm>
 #include <cmath>
@@ -82,7 +83,9 @@ struct Window {
 struct Probe {
   WMT::Reference<WMT::Array<WMT::Device>> devices;
   WMT::Device device;
-  WMT::Reference<WMT::CommandQueue> queue;
+  WMT::Reference<WMT::Error> compiler_error;
+  WMT::Reference<WMT4::Compiler> compiler;
+  WMT::Reference<WMT::MTL4CommandQueue> queue;
   obj_handle_t native_view = 0;
   WMT::MetalLayer layer;
   dxmt::InternalCommandLibrary library;
@@ -100,8 +103,10 @@ struct Probe {
     return WMT::MetalLayer{layer};
   }
   Probe(HWND hwnd) : devices(WMT::CopyAllDevices()), device(firstDevice(devices)),
-      queue(device.newCommandQueue(8)), native_view(), layer(makeLayer(hwnd, device, native_view)),
-      library(device), presenter(device, layer, library, 1.f, 1) {
+      compiler(WMT4::Compiler::Create(device, compiler_error)),
+      queue(device.newMTL4CommandQueue()), native_view(), layer(makeLayer(hwnd, device, native_view)),
+      library(device), presenter(device, layer, library, 1.f, 1, compiler) {
+    require(compiler, "Metal4 compiler");
     require(queue, "command queue");
     presenter.changeLayerProperties(WMTPixelFormatRGBA16Float, WMTColorSpaceHDR_PQ, kSize, kSize, 1);
     WMTTextureInfo info{};
@@ -140,9 +145,12 @@ struct Probe {
     readback.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE;
     auto buffer = device.newBuffer(readback);
     require(buffer && readback.memory.get(), "shared readback buffer");
-    auto cmd = queue.commandBuffer();
+    auto allocator = device.newMTL4CommandAllocator();
+    auto cmd = device.newMTL4CommandBuffer();
     require(cmd, "command buffer");
-    auto drawable = presenter.encodeCommands(cmd, input, state.metadata,
+    require(allocator, "Metal4 command allocator");
+    cmd.begin(allocator);
+    auto drawable = presenter.encodeCommandsMetal4(cmd, input, state.metadata,
                                              [](auto) {}, [](auto) {});
     require(drawable && drawable.texture(), "drawable");
     wmtcmd_blit_copy_from_texture_to_buffer copy{};
@@ -153,12 +161,19 @@ struct Probe {
     copy.bytes_per_row = kRow;
     copy.bytes_per_image = kBytes;
     auto blit = cmd.blitCommandEncoder();
+    blit.barrierAfterQueueStages(WMTMetal4StageFragment, WMTMetal4StageBlit, WMTMetal4VisibilityDevice);
     blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
     blit.endEncoding();
-    cmd.presentDrawable(drawable);
-    cmd.commit();
-    cmd.waitUntilCompleted();
-    require(cmd.status() == WMTCommandBufferStatusCompleted, "GPU completed");
+    cmd.end();
+    queue.waitForDrawable(drawable);
+    auto submission = queue.commit(&cmd, 1);
+    require(submission, "Metal4 submission");
+    queue.signalDrawable(drawable);
+    WMT4::PresentMetal4Drawable(drawable, 0, nullptr, 0, false);
+    submission.waitUntilCompleted();
+    WMTMetal4SubmissionInfo completion{};
+    submission.getInfo(completion);
+    require(completion.completed && !completion.error_handle, "GPU completed");
     auto *bytes = static_cast<const unsigned short *>(readback.memory.get());
     auto pixel = [&](unsigned x) { return half(bytes[((kSize / 2) * kSize + x) * 4]); };
     Sample result{pixel(8), pixel(31), pixel(56), state.metadata.max_content_luminance,

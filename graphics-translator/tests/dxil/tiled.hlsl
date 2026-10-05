@@ -135,3 +135,22 @@ RWByteAddressBuffer rgb32Output : register(u0, space2);
   const uint3 v = rgb32.Load(group.x * 65536 / 12 + 2, s0);
   rgb32Output.Store4(group.x * 16, uint4(v, Mapped(s0)));
 }
+
+// dxc -nologo -HV 2021 -T cs_6_0 -E cs_array_status -Fo tiled-array-status.dxil tiled.hlsl
+Texture2DArray<float4> arrayTexture : register(t0, space4);
+SamplerState arrayPoint : register(s0, space4);
+SamplerState arrayLinear : register(s3, space4);
+cbuffer ArrayParams : register(b0, space4) { uint arrayMips; };
+RWByteAddressBuffer arrayOutput : register(u0, space4);
+[numthreads(1, 1, 1)] void cs_array_status(uint3 group : SV_GroupID) {
+  uint loadStatus, pointStatus, linearStatus;
+  uint width, height, slices, levels;
+  arrayTexture.GetDimensions(group.x, width, height, slices, levels);
+  float4 loaded = arrayTexture.Load(int4(width - 1, height - 1, group.y, group.x), int2(0, 0), loadStatus);
+  float3 uv = float3(0.5, 0.5, group.y);
+  float4 pointSample = arrayTexture.SampleLevel(arrayPoint, uv, group.x, int2(0, 0), pointStatus);
+  float4 linearSample = arrayTexture.SampleLevel(arrayLinear, uv, group.x, int2(0, 0), linearStatus);
+  uint offset = (group.y * arrayMips + group.x) * 32;
+  arrayOutput.Store4(offset, uint4(Pack(loaded), Mapped(loadStatus), Pack(pointSample), Mapped(pointStatus)));
+  arrayOutput.Store4(offset + 16, uint4(Pack(linearSample), Mapped(linearStatus), width, height));
+}

@@ -24,16 +24,20 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dxmt {
 
+class MTLD3D12Device;
+
 /*
  * Reserved (tiled) resources over Metal placement sparse resources.
  *
- * Every D3D12 tile is one 64KB Metal sparse page (MTLSparsePageSize64). The standard 2D tile shapes
- * Metal reports for that page size equal the D3D12 standard shapes, which creation verifies per
- * format; 3D (Metal tiles are 1 texel deep) and MSAA resources are not offered.
+ * Every D3D12 tile is one 64KB Metal sparse page (MTLSparsePageSize64). Native 2D tile shapes are
+ * checked per format. A 3D tile's row-major format units are flattened into one sparse 2D-array
+ * atlas page, retaining exact independent mapping, NULL writes and shared-heap aliases even when
+ * native 3D sparse pages have a different shape. MSAA reserved resources are not offered.
  *
  * Tile mappings are queue operations. A queue applies an update on its submission thread after the
  * GPU work it submitted earlier has completed (unless the caller passed NO_HAZARD), so every command
@@ -51,6 +55,24 @@ struct ReservedSubresourceTiling {
   bool packed = false;
 };
 
+/* Shader ABI: fourteen uint32 header words followed by four words per mip, then
+ * an aligned uint64 residency-table address (zero means immutable fully backed).
+ * One logical 64KB volume tile is one native sparse 2D page; its format units
+ * are flattened x, y, z inside that page. Shared by shader addressing and copies. */
+struct ReservedVolumeLayout {
+  uint32_t width, height, depth, mips;
+  uint32_t shape_w, shape_h, shape_d, block_w, block_h;
+  uint32_t page_w, page_h, atlas_columns, atlas_rows, total_tiles;
+};
+static_assert(sizeof(ReservedVolumeLayout) == 14 * sizeof(uint32_t));
+constexpr uint64_t kReservedVolumeDescriptorTag = 1ull << 62;
+
+struct ReservedVolumeAddress {
+  uint32_t x, y, slice;
+  /* Contiguous format units before a logical tile or native page row boundary. */
+  uint32_t units;
+};
+
 /* One Metal page of one heap, or the null mapping. */
 struct ReservedTileTarget {
   WMT::Heap heap{};
@@ -64,6 +86,7 @@ struct ReservedTileTarget {
 
 class ReservedResource {
 public:
+  static inline std::mutex MappingQueueMutex;
   ReservedResource() { live_.fetch_add(1, std::memory_order_relaxed); }
   ~ReservedResource() { live_.fetch_sub(1, std::memory_order_relaxed); }
   ReservedResource(const ReservedResource &) = delete;
@@ -101,6 +124,25 @@ public:
       uint32_t block_height, uint32_t bytes_per_unit, std::unique_ptr<ReservedResource> &out
   );
 
+  static HRESULT CreateVolumeTiling(
+      const D3D12_RESOURCE_DESC &desc, WMTSparseTileShape native_page, uint32_t block_width,
+      uint32_t block_height, uint32_t bytes_per_unit, std::unique_ptr<ReservedResource> &out
+  );
+  static uint64_t VolumeTileCount(const D3D12_RESOURCE_DESC &desc, uint32_t block_width,
+                                  uint32_t block_height, uint32_t bytes_per_unit);
+  std::optional<ReservedVolumeAddress> VolumeAddress(uint32_t mip, uint32_t x, uint32_t y, uint32_t z) const;
+  const ReservedVolumeLayout *volumeLayout() const { return volume_ ? &volume_layout_ : nullptr; }
+  WMT::Reference<WMT::Buffer> volume_layout_buffer;
+  uint64_t volume_layout_address = 0;
+  WMT::MTL4CommandQueue volume_mapping_queue{};
+  MTLD3D12Device *volume_device = nullptr;
+  // Appended after the immutable 14 + 4*mips layout words; zero for ordinary volumes.
+  uint64_t volume_status_address = 0;
+
+  struct VolumeCastLayout { WMT::Reference<WMT::Buffer> buffer; uint64_t address; };
+  std::unordered_map<uint32_t, VolumeCastLayout> volume_cast_layouts;
+  WMT::Reference<WMT::Texture> GetVolumeCastAtlas(MTLD3D12Device *owner, WMTPixelFormat format, bool compressed);
+
   bool
   isBuffer() const {
     return is_buffer_;
@@ -134,7 +176,8 @@ public:
 
   bool
   isPackedTile(uint32_t tile) const {
-    return packed_tiles_ && tile >= packed_first_tile_ && tile < packed_first_tile_ + packed_tiles_;
+    return packed_tiles_ && tile < total_tiles_ &&
+           tile % (total_tiles_ / array_size_) >= packed_first_tile_;
   }
 
   const std::vector<ReservedSubresourceTiling> &
@@ -178,10 +221,14 @@ public:
 
   /* The current target of each tile, read in queue order by CopyTileMappings. */
   ReservedTileTarget CurrentTarget(uint32_t tile);
+  uint64_t CollectMappedTiles(uint64_t seen_generation, std::vector<uint32_t> &tiles,
+                              uint32_t subresource = UINT32_MAX);
+  void MapCastTiles(WMT::MTL4CommandQueue queue, WMT::Texture texture, WMT::Heap heap,
+                    const std::unordered_set<uint32_t> &tiles);
 
   /*
-   * Buffers only: CPU-visible residency bytes (one per tile) and their GPU address, which descriptors
-   * carry biased by the buffer address (see BufferAllocation::residencyStatusBase).
+   * Buffers: CPU-visible residency bytes, biased in BufferAllocation::residencyStatusBase.
+   * Reserved volumes: GPU-published uint32 words per logical tile; status_bytes stays null.
    */
   WMT::Reference<WMT::Buffer> status_buffer;
   uint8_t *status_bytes = nullptr;
@@ -203,6 +250,8 @@ private:
   static inline std::atomic<uint32_t> live_{0};
 
   bool is_buffer_ = false;
+  bool volume_ = false;
+  ReservedVolumeLayout volume_layout_{};
   uint32_t total_tiles_ = 0;
   D3D12_TILE_SHAPE shape_{};
   uint32_t mip_levels_ = 1;
@@ -218,6 +267,9 @@ private:
 
   /* Guarded by `mutex`. Heaps stay alive while any tile maps into them. */
   std::vector<ReservedTileTarget> targets_;
+  std::unordered_set<uint32_t> mapped_tiles_;
+  uint64_t mapping_generation_ = 0;
+  std::unordered_map<WMTPixelFormat, WMT::Reference<WMT::Texture>> volume_cast_atlases_;
   std::unordered_map<obj_handle_t, std::pair<WMT::Reference<WMT::Heap>, uint32_t>> heaps_;
 };
 

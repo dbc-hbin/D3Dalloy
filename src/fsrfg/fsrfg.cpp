@@ -13,11 +13,10 @@ namespace {
 constexpr uint64_t kProvider = 0x4d46584647000001ull;
 constexpr char kName[] = "MetalFX frame generation (dxmt-owned-fsr-framegeneration-metalfx-v1)";
 constexpr wchar_t kMarker[] = L"dxmt-owned-fsr-framegeneration-metalfx-v1: unsupported or invalid frame generation operation";
-constexpr UINT kUnsupportedFlags = FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES |
-    FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW |
-    FFX_FRAMEGENERATION_FLAG_RESERVED_1 | FFX_FRAMEGENERATION_FLAG_RESERVED_2;
+constexpr UINT kUnsupportedFlags = FFX_FRAMEGENERATION_FLAG_RESERVED_1 | FFX_FRAMEGENERATION_FLAG_RESERVED_2;
 constexpr UINT kKnownFlags = kUnsupportedFlags | FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY |
-    FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES;
+    FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES |
+    FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW;
 struct Context;
 struct Binding {
   Context* context;
@@ -30,6 +29,7 @@ struct Snapshot {
   Snapshot* next;
   UINT64 frame;
   FfxApiResource hudless;
+  UINT flags;
 };
 struct Context {
   Context* next = nullptr;
@@ -177,11 +177,11 @@ Snapshot* snapshotFor(Context& c, UINT64 frame) {
   for (auto s = c.snapshots; s; s = s->next) if (s->frame <= frame && (!best || best->frame < s->frame)) best = s;
   return best;
 }
-void retire(Context& c, UINT64 frame) {
+void retire(Context& c, UINT64 frame, BOOL retainResults) {
   DispatchLock lock(c);
   UINT64 oldest = 0;
   BOOL pending = FALSE;
-  if (FAILED(c.backend->RetireFrame(frame, &oldest, &pending))) return;
+  if (FAILED(c.backend->RetireFrame(frame, retainResults, &oldest, &pending))) return;
   const auto boundary = pending ? std::min(frame, oldest) : frame;
   auto floor = snapshotFor(c, boundary);
   for (auto link = &c.snapshots; *link;) {
@@ -229,6 +229,8 @@ ffxReturnCode_t prepare(Context& c, const T& desc, bool v2) {
       !std::isfinite(p.view_space_to_meters) || desc.depth.resource == desc.motionVectors.resource || (p.flags & ~kKnownFlags))
     return FFX_API_RETURN_ERROR_PARAMETER;
   if (p.flags & kUnsupportedFlags) return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+  // Only immutable algorithm/debug bits cross the renderer Prepare contract.
+  p.flags &= 7u;
   if (v2 && c.version < FFX_FRAMEGENERATION_VERSION) return FFX_API_RETURN_ERROR_PARAMETER;
   if (p.camera_info_present) for (UINT i = 0; i < 3; ++i)
     if (!std::isfinite(p.camera_position[i]) || !std::isfinite(p.camera_up[i]) || !std::isfinite(p.camera_right[i]) || !std::isfinite(p.camera_forward[i]))
@@ -246,7 +248,7 @@ ffxReturnCode_t prepare(Context& c, const T& desc, bool v2) {
 }
 ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& desc, bool* submitted) {
   if (desc.header.pNext) return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
-  if (!desc.commandList || desc.numGeneratedFrames != 1 || desc.presentColor.resource == desc.outputs[0].resource ||
+  if (!desc.commandList || desc.numGeneratedFrames < 1 || desc.numGeneratedFrames > 4 ||
       desc.backbufferTransferFunction > FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SCRGB || !validRect(c, desc.generationRect) ||
       !std::isfinite(desc.minMaxLuminance[0]) || !std::isfinite(desc.minMaxLuminance[1]) || desc.minMaxLuminance[0] > desc.minMaxLuminance[1] ||
       (desc.backbufferTransferFunction == FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ && desc.minMaxLuminance[1] <= 0) ||
@@ -254,44 +256,72 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& desc,
     return FFX_API_RETURN_ERROR_PARAMETER;
   MTL_FRAME_GENERATION_GENERATE_DESC p{};
   p.StructSize = sizeof(p); p.frame_id = desc.frameID; p.num_generated_frames = desc.numGeneratedFrames;
-  p.reset = desc.reset || (c.havePrepare && desc.frameID != c.lastPrepare);
+  // Core selects this frame's immutable Prepare, not the newest recorded one.
+  p.reset = desc.reset;
   p.backbuffer_transfer_function = desc.backbufferTransferFunction;
   p.generation_rect_left = desc.generationRect.left; p.generation_rect_top = desc.generationRect.top;
   p.generation_rect_width = desc.generationRect.width; p.generation_rect_height = desc.generationRect.height;
   p.min_luminance = desc.minMaxLuminance[0]; p.max_luminance = desc.minMaxLuminance[1];
   auto code = resource(c, desc.presentColor, &p.present_color, &p.present_color_state);
-  if (!code) code = resource(c, desc.outputs[0], &p.output, &p.output_state);
   auto config = snapshotFor(c, desc.frameID);
+  if (config) p.flags = config->flags & 7u;
   if (!code && config && config->hudless.resource) code = resource(c, config->hudless, &p.hudless_color, &p.hudless_color_state);
   if (code) return code;
-  if (p.hudless_color == p.output) return FFX_API_RETURN_ERROR_PARAMETER;
+  const auto color = p.present_color->GetDesc();
+  if (color.Width != c.width || color.Height != c.height) return FFX_API_RETURN_ERROR_PARAMETER;
+  for (UINT i = 0; i < desc.numGeneratedFrames; ++i) {
+    code = resource(c, desc.outputs[i], &p.outputs[i], &p.output_states[i]);
+    if (code) return code;
+    const auto output = p.outputs[i]->GetDesc();
+    if (p.outputs[i] == p.present_color || p.outputs[i] == p.hudless_color ||
+        output.Width != color.Width || output.Height != color.Height || output.Format != color.Format ||
+        output.MipLevels != 1 || !(output.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+      return FFX_API_RETURN_ERROR_PARAMETER;
+    for (UINT j = 0; j < i; ++j)
+      if (p.outputs[i] == p.outputs[j]) return FFX_API_RETURN_ERROR_PARAMETER;
+  }
   Com<IMTLD3D12FrameGenerationCommandList> list;
   auto hr = static_cast<IUnknown*>(desc.commandList)->QueryInterface(IID_PPV_ARGS(&list));
   if (FAILED(hr)) return result(hr);
-  if (submitted) *submitted = true;
-  return result(list->GenerateFrame(c.backend.ptr(), &p));
+  hr = list->GenerateFrames(c.backend.ptr(), &p);
+  if (submitted) *submitted = SUCCEEDED(hr);
+  return result(hr);
 }
-ffxReturnCode_t dispatch(Context& c, const ffxDispatchDescHeader* desc, bool* submitted = nullptr) {
+ffxReturnCode_t dispatch(Context& c, const ffxDispatchDescHeader* desc, bool* submitted = nullptr, bool* resultConsumer = nullptr) {
   if (!validChain(desc)) return FFX_API_RETURN_ERROR_PARAMETER;
-  DispatchLock lock(c);
-  switch (desc->type) {
-  case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE:
-    return prepare(c, *reinterpret_cast<const ffxDispatchDescFrameGenerationPrepare*>(desc), false);
-  case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2:
-    return prepare(c, *reinterpret_cast<const ffxDispatchDescFrameGenerationPrepareV2*>(desc), true);
-  case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION:
-    return generate(c, *reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc), submitted);
-  default: return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+  ffxReturnCode_t code;
+  {
+    DispatchLock lock(c);
+    switch (desc->type) {
+    case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE:
+      return prepare(c, *reinterpret_cast<const ffxDispatchDescFrameGenerationPrepare*>(desc), false);
+    case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2:
+      return prepare(c, *reinterpret_cast<const ffxDispatchDescFrameGenerationPrepareV2*>(desc), true);
+    case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION:
+      code = generate(c, *reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc), submitted); break;
+    default: return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+    }
   }
+  // Never acquire the proxy lock while holding the backend dispatch lock.
+  if (!code && c.attached) {
+    const bool captured = c.attached->recordFrameGeneration(*reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc));
+    if (resultConsumer) *resultConsumer = captured;
+  }
+  return code;
 }
 ffxReturnCode_t generationCallback(ffxDispatchDescFrameGeneration* desc, void* user) {
   auto b = static_cast<Binding*>(user);
   if (!desc || !b) return FFX_API_RETURN_ERROR_PARAMETER;
   Scope scope(b->context);
   const auto originalFrame = desc->frameID;
+  if (!b->generate) desc->numGeneratedFrames = 1;
   auto code = b->generate ? b->generate(desc, b->generateUser) : dispatch(*b->context, &desc->header);
   if (code) desc->numGeneratedFrames = 0;
-  retire(*b->context, originalFrame);
+  // RetireFrame preserves pending batches; it does not imply completed output.
+  if (desc->frameID != originalFrame || desc->numGeneratedFrames > 4) {
+    desc->numGeneratedFrames = 0; return FFX_API_RETURN_ERROR_PARAMETER;
+  }
+  retire(*b->context, originalFrame, TRUE);
   return code;
 }
 ffxReturnCode_t presentCallback(ffxCallbackDescFrameGenerationPresent* desc, void* user) {
@@ -306,6 +336,7 @@ ffxReturnCode_t detach(Context& c) {
   off.swapChain = c.attached.ptr();
   c.attached->setFrameGenerationConfig(&off);
   if (!c.attached->waitForPresents()) return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+  c.attached->setFrameGenerationState(nullptr);
   AcquireSRWLockExclusive(&g_lock);
   c.attached = nullptr;
   ReleaseSRWLockExclusive(&g_lock);
@@ -350,7 +381,7 @@ ffxReturnCode_t configureGeneration(Context& c, const ffxConfigureDescFrameGener
     }
     snapshot = static_cast<Snapshot*>(allocate(c, sizeof(Snapshot)));
     if (!snapshot) { if (changed) deallocate(c, binding); return FFX_API_RETURN_ERROR_MEMORY; }
-    *snapshot = {nullptr, desc.frameID, desc.HUDLessColor};
+    *snapshot = {nullptr, desc.frameID, desc.HUDLessColor, desc.flags};
     if (snapshot->hudless.resource) static_cast<IUnknown*>(snapshot->hudless.resource)->AddRef();
   }
   bool claimed = false;
@@ -389,10 +420,12 @@ ffxReturnCode_t configureGeneration(Context& c, const ffxConfigureDescFrameGener
     config.presentCallbackContext = binding->present ? binding : nullptr;
     config.frameGenerationCallback = generationCallback; config.frameGenerationCallbackContext = binding;
     config.frameGenerationEnabled = desc.frameGenerationEnabled; config.allowAsyncWorkloads = desc.allowAsyncWorkloads;
-    config.HUDLessColor = desc.HUDLessColor; config.flags = desc.flags; config.onlyPresentInterpolated = desc.onlyPresentGenerated;
+    config.HUDLessColor = desc.HUDLessColor; config.flags = desc.flags;
+    config.onlyPresentInterpolated = desc.onlyPresentGenerated || (desc.flags & FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW);
     config.interpolationRect = desc.generationRect; config.frameID = desc.frameID;
     config.drawDebugPacingLines = (desc.flags & FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES) != 0;
     // No registry or dispatch lock may be held while the proxy drains callbacks.
+    sc->setFrameGenerationState(c.backend.ptr());
     sc->setFrameGenerationConfig(&config);
     if (changed) deallocate(c, c.binding);
     c.binding = binding;
@@ -595,10 +628,10 @@ extern "C" ffxReturnCode_t ffxDispatch(ffxContext* handle, const ffxDispatchDesc
     if (header->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12 || header->pNext) return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     code = sdkResult(ffxWaitForPresents(c->proxy.ptr()));
   } else {
-    bool submitted = false;
-    code = dispatch(*c, header, &submitted);
+    bool submitted = false, resultConsumer = false;
+    code = dispatch(*c, header, &submitted, &resultConsumer);
     if (submitted && !Scope::current)
-      retire(*c, reinterpret_cast<const ffxDispatchDescFrameGeneration*>(header)->frameID);
+      retire(*c, reinterpret_cast<const ffxDispatchDescFrameGeneration*>(header)->frameID, resultConsumer ? TRUE : FALSE);
   }
   report(c, code); return code;
 }

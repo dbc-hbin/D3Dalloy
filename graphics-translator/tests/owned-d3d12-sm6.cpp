@@ -1,6 +1,6 @@
 // Shader Model 6.x GPU fixture: every DXIL entry of tests/dxil/sm6*.hlsl runs on the
 // owned D3D12 device and is checked against an independent CPU oracle.
-// usage: owned-d3d12-sm6.exe [--stress-reps N]   (frozen .dxil files beside the exe)
+// usage: owned-d3d12-sm6.exe [--stress-reps N]   (frozen DXIL/DXBC files beside the exe)
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -57,7 +57,7 @@ std::vector<uint8_t> shader(const char *entry) {
   std::wstring name = L"sm6-";
   for (const char *c = entry; *c; ++c)
     name += static_cast<wchar_t>(*c);
-  name += L".dxil";
+  if (!std::strchr(entry, '.')) name += L".dxil";
   return readFile(name.c_str());
 }
 
@@ -150,6 +150,7 @@ struct Gpu {
   UINT descriptorSize = 0;
   HANDLE event = nullptr;
   UINT64 fenceValue = 0;
+  bool submissionDiagnostics = false;
   std::vector<ComPtr<ID3D12Resource>> keepAlive;
 
   explicit Gpu(ID3D12Device *d) : device(d) {
@@ -178,12 +179,20 @@ struct Gpu {
   ~Gpu() { CloseHandle(event); }
 
   D3D12_CPU_DESCRIPTOR_HANDLE cpu(UINT slot) {
+#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+    D3D12_CPU_DESCRIPTOR_HANDLE handle{};heap->GetCPUDescriptorHandleForHeapStart(&handle);
+#else
     auto handle = heap->GetCPUDescriptorHandleForHeapStart();
+#endif
     handle.ptr += static_cast<SIZE_T>(slot) * descriptorSize;
     return handle;
   }
   D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT slot) {
+#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+    D3D12_GPU_DESCRIPTOR_HANDLE handle{};heap->GetGPUDescriptorHandleForHeapStart(&handle);
+#else
     auto handle = heap->GetGPUDescriptorHandleForHeapStart();
+#endif
     handle.ptr += static_cast<UINT64>(slot) * descriptorSize;
     return handle;
   }
@@ -247,31 +256,54 @@ struct Gpu {
   std::vector<std::vector<uint8_t>> finish(std::initializer_list<ID3D12Resource *> resources, double *elapsed_ms) {
     std::vector<ComPtr<ID3D12Resource>> readbacks;
     for (auto *resource : resources) {
+#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+      D3D12_RESOURCE_DESC resourceDesc{};resource->GetDesc(&resourceDesc);
+      const UINT64 size = resourceDesc.Width;
+#else
       const UINT64 size = resource->GetDesc().Width;
+#endif
       transition(resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
       auto readback = buffer(size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
       list->CopyBufferRegion(readback.Get(), 0, resource, 0, size);
       readbacks.push_back(readback);
     }
-    check(list->Close(), "CommandList::Close");
+    if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY close=begin\n");
+    const HRESULT closeResult = list->Close();
+    if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY close=returned hr=%08lx\n", static_cast<unsigned long>(closeResult));
+    check(closeResult, "CommandList::Close");
     LARGE_INTEGER start{}, end{}, frequency{};
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&start);
     ID3D12CommandList *lists[] = {list.Get()};
+    if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY execute=begin\n");
     queue->ExecuteCommandLists(1, lists);
+    if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY execute=queued\n");
     const UINT64 value = ++fenceValue;
-    check(queue->Signal(fence.Get(), value), "Queue::Signal");
+    if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY signal=begin value=%llu\n", static_cast<unsigned long long>(value));
+    const HRESULT signalResult = queue->Signal(fence.Get(), value);
+    if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY signal=returned hr=%08lx value=%llu\n", static_cast<unsigned long>(signalResult), static_cast<unsigned long long>(value));
+    check(signalResult, "Queue::Signal");
     if (fence->GetCompletedValue() < value) {
+      if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY event=begin\n");
       check(fence->SetEventOnCompletion(value, event), "Fence::SetEventOnCompletion");
-      if (WaitForSingleObject(event, kFenceTimeoutMs) != WAIT_OBJECT_0)
+      if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY wait=begin timeout_ms=%lu\n", static_cast<unsigned long>(kFenceTimeoutMs));
+      const DWORD waitResult = WaitForSingleObject(event, kFenceTimeoutMs);
+      if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY wait=returned status=%lu observed=%llu target=%llu\n", static_cast<unsigned long>(waitResult), static_cast<unsigned long long>(fence->GetCompletedValue()), static_cast<unsigned long long>(value));
+      if (waitResult != WAIT_OBJECT_0)
         die("GPU fence timeout", HRESULT_FROM_WIN32(ERROR_TIMEOUT));
     }
+    if (submissionDiagnostics) std::printf("OWNED_D3D12_SUBMISSION_BOUNDARY fence=observed value=%llu\n", static_cast<unsigned long long>(fence->GetCompletedValue()));
     QueryPerformanceCounter(&end);
     if (elapsed_ms)
       *elapsed_ms = 1000.0 * static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
     std::vector<std::vector<uint8_t>> result;
     for (auto &readback : readbacks) {
+#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+      D3D12_RESOURCE_DESC resourceDesc{};readback->GetDesc(&resourceDesc);
+      const UINT64 size = resourceDesc.Width;
+#else
       const UINT64 size = readback->GetDesc().Width;
+#endif
       D3D12_RANGE range{0, static_cast<SIZE_T>(size)};
       void *mapped = nullptr;
       check(readback->Map(0, &range, &mapped), "Map(readback)");
@@ -288,7 +320,12 @@ struct Gpu {
     D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
     desc.Format = DXGI_FORMAT_R32_TYPELESS;
     desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+    D3D12_RESOURCE_DESC resourceDesc{};resource->GetDesc(&resourceDesc);
+    desc.Buffer.NumElements = static_cast<UINT>(resourceDesc.Width / 4);
+#else
     desc.Buffer.NumElements = static_cast<UINT>(resource->GetDesc().Width / 4);
+#endif
     desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     device->CreateUnorderedAccessView(resource, nullptr, &desc, cpu(slot));
   }
@@ -296,7 +333,12 @@ struct Gpu {
     D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
     desc.Format = DXGI_FORMAT_UNKNOWN;
     desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+    D3D12_RESOURCE_DESC resourceDesc{};resource->GetDesc(&resourceDesc);
+    desc.Buffer.NumElements = static_cast<UINT>(resourceDesc.Width / stride);
+#else
     desc.Buffer.NumElements = static_cast<UINT>(resource->GetDesc().Width / stride);
+#endif
     desc.Buffer.StructureByteStride = stride;
     device->CreateUnorderedAccessView(resource, nullptr, &desc, cpu(slot));
   }
@@ -316,13 +358,16 @@ ComPtr<ID3D12RootSignature> rootSignature(ID3D12Device *device, const D3D12_VERS
   return root;
 }
 
-/* Compute layout: b0 root constants (4), b1 root CBV, table u0..u2, table t0, static point sampler s0. */
-ComPtr<ID3D12RootSignature> computeRoot(ID3D12Device *device) {
+/* Compute layout: b0 constants, b1 CBV, u0..u2, t0..t6, point s0 and mip-linear s1. */
+ComPtr<ID3D12RootSignature> computeRoot(ID3D12Device *device,
+                                       D3D12_FILTER filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                                       float bias = 0, float minLod = 0,
+                                       float maxLod = D3D12_FLOAT32_MAX, UINT anisotropy = 1) {
   static D3D12_DESCRIPTOR_RANGE1 uavs{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0,
                                       D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE |
                                           D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE,
                                       0};
-  static D3D12_DESCRIPTOR_RANGE1 srvs{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
+  static D3D12_DESCRIPTOR_RANGE1 srvs{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7, 0, 0,
                                       D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0};
   D3D12_ROOT_PARAMETER1 params[4]{};
   params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -343,12 +388,19 @@ ComPtr<ID3D12RootSignature> computeRoot(ID3D12Device *device) {
   sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
   sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
   sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_STATIC_SAMPLER_DESC samplers[2] = {sampler, sampler};
+  samplers[1].ShaderRegister = 1;
+  samplers[1].Filter = filter;
+  samplers[1].MipLODBias = bias;
+  samplers[1].MinLOD = minLod;
+  samplers[1].MaxLOD = maxLod;
+  samplers[1].MaxAnisotropy = anisotropy;
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
   desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
   desc.Desc_1_1.NumParameters = 4;
   desc.Desc_1_1.pParameters = params;
-  desc.Desc_1_1.NumStaticSamplers = 1;
-  desc.Desc_1_1.pStaticSamplers = &sampler;
+  desc.Desc_1_1.NumStaticSamplers = 2;
+  desc.Desc_1_1.pStaticSamplers = samplers;
   return rootSignature(device, desc);
 }
 
@@ -417,7 +469,8 @@ struct Compute {
   /* Dispatches `entry` with u0 = out, u1 = raw, u2 = s64 (8 byte structured) and returns their bytes. */
   std::vector<std::vector<uint8_t>> run(const char *entry, std::vector<uint8_t> out, std::vector<uint8_t> raw,
                                         std::vector<uint8_t> s64, std::array<uint32_t, 4> p0, UINT groups,
-                                        const void *cb1 = nullptr, size_t cb1_size = 0, double *elapsed = nullptr) {
+                                        const void *cb1 = nullptr, size_t cb1_size = 0, double *elapsed = nullptr,
+                                        UINT structure_stride = 8) {
     ComPtr<ID3D12PipelineState> pso;
     if (FAILED(computePso(gpu.device.Get(), root.Get(), shader(entry), pso))) {
       std::printf("OWNED_D3D12_SM6_MISMATCH case=%s field=CreateComputePipelineState\n", entry);
@@ -427,7 +480,7 @@ struct Compute {
     auto u0 = gpu.uavBuffer(out), u1 = gpu.uavBuffer(raw), u2 = gpu.uavBuffer(s64);
     gpu.rawUav(0, u0.Get());
     gpu.rawUav(1, u1.Get());
-    gpu.structuredUav(2, u2.Get(), 8);
+    gpu.structuredUav(2, u2.Get(), structure_stride);
     auto cb = gpu.constants(cb1 ? cb1 : p0.data(), cb1 ? cb1_size : 16);
     ID3D12DescriptorHeap *heaps[] = {gpu.heap.Get()};
     gpu.list->SetDescriptorHeaps(1, heaps);
@@ -451,21 +504,21 @@ std::vector<uint8_t> filled(size_t size, uint32_t word = kSentinel) {
 }
 
 /* ---- cs_wave: every reduction kind, signed vs unsigned min/max with negative values ---- */
-void testWave(Compute &c) {
+void testWave(Compute &c, const char *entry = "cs_wave", uint32_t width = 32, const char *name = "wave") {
   begin();
-  auto r = c.run("cs_wave", filled(64 * 128), filled(64), filled(64), {0, 0, 0, 0}, 1);
+  auto r = c.run(entry, filled(64 * 128), filled(64), filled(64), {0, 0, 0, 0}, 1);
   if (!r.empty()) {
     const auto &o = r[0];
     auto s = [](uint32_t gi) { return static_cast<int32_t>(gi * 2654435761u) >> 8; };
     auto u = [](uint32_t gi) { return gi * 2246822519u; };
     auto f = [](uint32_t gi) { return static_cast<float>(static_cast<int>(gi % 7) - 3) * 0.5f; };
     for (uint32_t gi = 0; gi < 64; ++gi) {
-      const uint32_t w = gi / 32, lane = gi % 32, first = w * 32;
+      const uint32_t lane = gi % width, first = gi - lane;
       uint32_t ballot = 0, sum = 0, product = 1, band = ~0u, bor = 0, bxor = 0, count4 = 0;
       int32_t smin = INT32_MAX, smax = INT32_MIN;
       uint32_t umin = ~0u, umax = 0, psum = 0, pproduct = 1, pcount = 0;
       float fsum = 0.0f, fmin = INFINITY;
-      for (uint32_t l = 0; l < 32; ++l) {
+      for (uint32_t l = 0; l < width; ++l) {
         const uint32_t g = first + l;
         ballot |= ((g % 3) == 0) << l;
         sum += u(g);
@@ -487,7 +540,8 @@ void testWave(Compute &c) {
         }
       }
       const size_t b = gi * 128;
-      const uint32_t expected[32] = {32, lane, lane == 0, 1, w == 1, ballot, 0, 0, 0, u(first + 5), u(first), sum,
+      const uint32_t expected[32] = {width, lane, lane == 0, 1, first <= 37 && first + width > 37,
+                                     ballot, 0, 0, 0, u(first + 5 % width), u(first), sum,
                                      product, static_cast<uint32_t>(smin), static_cast<uint32_t>(smax), umin, umax,
                                      band, bor, bxor, count4, psum, pproduct, pcount, floatBits(fsum),
                                      floatBits(fmin), gi ^ 1, gi ^ 2, gi ^ 3, (gi & ~3u) | 2, 1, 0};
@@ -497,16 +551,17 @@ void testWave(Compute &c) {
                                       "countbits", "prefixsum", "prefixproduct", "prefixcount", "sum.f", "min.f",
                                       "quadx", "quady", "quaddiag", "quadlane2", "allequal", "allequal.differ"};
       for (uint32_t k = 0; k < 32; ++k)
-        EXPECT_EQ("wave", names[k], gi, load<uint32_t>(o, b + k * 4), expected[k]);
+        EXPECT_EQ(name, names[k], gi, load<uint32_t>(o, b + k * 4), expected[k]);
     }
   }
-  end("wave");
+  end(name);
 }
 
 /* ---- cs_divergent: wave ops, WaveMatch and WaveMultiPrefix* under divergence ---- */
-void testDivergent(Compute &c) {
+void testDivergent(Compute &c, const char *entry = "cs_divergent", uint32_t width = 32,
+                   const char *name = "divergent") {
   begin();
-  auto r = c.run("cs_divergent", filled(64 * 64), filled(64), filled(64), {3, 0, 0, 0}, 1);
+  auto r = c.run(entry, filled(64 * 64), filled(64), filled(64), {3, 0, 0, 0}, 1);
   if (!r.empty()) {
     const auto &o = r[0];
     auto s = [](uint32_t gi) { return static_cast<int32_t>(gi * 2654435761u) >> 8; };
@@ -516,14 +571,14 @@ void testDivergent(Compute &c) {
       const size_t b = gi * 64;
       if (!active(gi)) {
         for (uint32_t k = 0; k < 16; ++k)
-          EXPECT_EQ("divergent", "inactive", gi, load<uint32_t>(o, b + k * 4), 0xdeadbeefu);
+          EXPECT_EQ(name, "inactive", gi, load<uint32_t>(o, b + k * 4), 0xdeadbeefu);
         continue;
       }
-      const uint32_t w = gi / 32, lane = gi % 32, first = w * 32;
-      uint32_t count = 0, lowest = 32, sum = 0, umax = 0, psum = 0, pcount = 0, ballot = 0, match = 0;
+      const uint32_t lane = gi % width, first = gi - lane;
+      uint32_t count = 0, lowest = width, sum = 0, umax = 0, psum = 0, pcount = 0, ballot = 0, match = 0;
       int32_t smin = INT32_MAX;
       uint32_t mpsum = 0, mpcount = 0, mpproduct = 1, mpor = 0, mpxor = 0, mpand = ~0u;
-      for (uint32_t l = 0; l < 32; ++l) {
+      for (uint32_t l = 0; l < width; ++l) {
         const uint32_t g = first + l;
         if (!active(g))
           continue;
@@ -555,10 +610,10 @@ void testDivergent(Compute &c) {
                                       "prefixcount", "ballot", "match", "multiprefix.sum", "multiprefix.count",
                                       "multiprefix.product", "multiprefix.or", "multiprefix.xor", "multiprefix.and"};
       for (uint32_t k = 0; k < 16; ++k)
-        EXPECT_EQ("divergent", names[k], gi, load<uint32_t>(o, b + k * 4), expected[k]);
+        EXPECT_EQ(name, names[k], gi, load<uint32_t>(o, b + k * 4), expected[k]);
     }
   }
-  end("divergent");
+  end(name);
 }
 
 /* ---- cs_int64 ---- */
@@ -569,7 +624,7 @@ uint64_t reverse64(uint64_t v) {
   return r;
 }
 
-void testInt64(Compute &c) {
+void testInt64(Compute &c, const char *entry = "cs_int64", uint32_t width = 32, const char *name = "int64") {
   begin();
   std::vector<uint8_t> raw(64 * 8);
   std::vector<int64_t> in(64);
@@ -581,7 +636,7 @@ void testInt64(Compute &c) {
     in[i] = i < 8 ? edges[i] : static_cast<int64_t>(seed ^ (seed >> 29));
     put(raw, i * 8, in[i]);
   }
-  auto r = c.run("cs_int64", filled(64 * 128), raw, filled(64), {0, 0, 0, 0}, 1);
+  auto r = c.run(entry, filled(64 * 128), raw, filled(64), {0, 0, 0, 0}, 1);
   if (!r.empty()) {
     const auto &o = r[0];
     for (uint32_t gi = 0; gi < 64; ++gi) {
@@ -592,11 +647,11 @@ void testInt64(Compute &c) {
       const uint64_t ubd = ub == 0 ? 5 : ub;
       const uint64_t hi = ua ? static_cast<uint64_t>(63 - __builtin_clzll(ua)) : 0xffffffffull;
       const uint64_t lo = ua ? static_cast<uint64_t>(__builtin_ctzll(ua)) : 0xffffffffull;
-      const uint32_t w = gi / 32, lane = gi % 32;
+      const uint32_t lane = gi % width, first = gi - lane;
       uint64_t wsum = 0, wmax = 0, wxor = 0, prefix = 0;
       int64_t wmin = INT64_MAX;
-      for (uint32_t l = 0; l < 32; ++l) {
-        const uint32_t g = w * 32 + l;
+      for (uint32_t l = 0; l < width; ++l) {
+        const uint32_t g = first + l;
         const uint64_t x = static_cast<uint64_t>(in[g]);
         wsum += x;
         wmax = std::max(wmax, x);
@@ -621,16 +676,16 @@ void testInt64(Compute &c) {
           static_cast<uint64_t>(a >> 32) + (ua & 0xffffffffull) + (ua & 0xffffull),
           wsum ^ wmax,
           static_cast<uint64_t>(wmin) + prefix,
-          static_cast<uint64_t>(in[w * 32 + 7]) + wxor,
+          static_cast<uint64_t>(in[first + 7 % width]) + wxor,
       };
       static const char *names[16] = {"add", "sub", "mul", "sdiv", "srem", "udiv", "urem", "ashr", "lshr", "shl",
                                       "minmax.s", "bits", "convert", "wave.sum^max", "wave.min+prefix",
                                       "readlane+xor"};
       for (uint32_t k = 0; k < 16; ++k)
-        EXPECT_EQ("int64", names[k], gi, load<uint64_t>(o, gi * 128 + k * 8), expected[k]);
+        EXPECT_EQ(name, names[k], gi, load<uint64_t>(o, gi * 128 + k * 8), expected[k]);
     }
   }
-  end("int64");
+  end(name);
 }
 
 /* ---- cs_atomic64_ops: single-thread semantics and edge values of every 64 bit atomic ---- */
@@ -668,7 +723,7 @@ void testAtomic64Ops(Compute &c) {
   end("atomic64_ops");
 }
 
-/* ---- contended 64 bit atomics (cs_atomic64 / ps_atomic64 share atomic64Body) ---- */
+/* ---- contended compute 64 bit atomics (cs_atomic64 / atomic64Body) ---- */
 constexpr uint32_t kStressThreads = 64 * 1024;
 
 uint32_t stressTarget(uint32_t id, uint32_t targets) { return ((id * 2654435761u) >> 7) % targets; }
@@ -807,7 +862,11 @@ struct Graphics {
     check(gpu.device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &rt, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                               nullptr, IID_PPV_ARGS(&target)),
           "CreateCommittedResource(RT)");
+#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv{};gpu.rtvHeap->GetCPUDescriptorHandleForHeapStart(&rtv);
+#else
     const auto rtv = gpu.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+#endif
     gpu.device->CreateRenderTargetView(target.Get(), nullptr, rtv);
     auto u0 = gpu.uavBuffer(out), u1 = gpu.uavBuffer(raw);
     gpu.rawUav(0, u0.Get());
@@ -1053,13 +1112,15 @@ void testPacked(Compute &c) {
 }
 
 /* ---- cs_quad_deriv: compute quads, derivatives, implicit LOD, barriers ---- */
-ComPtr<ID3D12Resource> mipTexture(Gpu &gpu) {
+ComPtr<ID3D12Resource> mipTexture(Gpu &gpu, UINT width = 64, UINT height = 64,
+                                  D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                                  UINT16 depthOrArraySize = 1, UINT slot = 3) {
   const auto props = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
   D3D12_RESOURCE_DESC desc{};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = 64;
-  desc.Height = 64;
-  desc.DepthOrArraySize = 1;
+  desc.Dimension = dimension;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = depthOrArraySize;
   desc.MipLevels = 7;
   desc.Format = DXGI_FORMAT_R32_FLOAT;
   desc.SampleDesc.Count = 1;
@@ -1067,21 +1128,25 @@ ComPtr<ID3D12Resource> mipTexture(Gpu &gpu) {
   check(gpu.device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
                                             nullptr, IID_PPV_ARGS(&texture)),
         "CreateCommittedResource(texture)");
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[7];
-  UINT rows[7];
-  UINT64 row_bytes[7], total = 0;
-  gpu.device->GetCopyableFootprints(&desc, 0, 7, 0, footprints, rows, row_bytes, &total);
+  const UINT subresources = 7 * (dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : depthOrArraySize);
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(subresources);
+  std::vector<UINT> rows(subresources);
+  std::vector<UINT64> row_bytes(subresources);
+  UINT64 total = 0;
+  gpu.device->GetCopyableFootprints(&desc, 0, subresources, 0, footprints.data(), rows.data(), row_bytes.data(), &total);
   auto upload = gpu.buffer(total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
   uint8_t *mapped = nullptr;
   check(upload->Map(0, nullptr, reinterpret_cast<void **>(&mapped)), "Map(texture upload)");
-  for (UINT mip = 0; mip < 7; ++mip)
-    for (UINT y = 0; y < rows[mip]; ++y)
-      for (UINT x = 0; x < footprints[mip].Footprint.Width; ++x) {
-        const float value = static_cast<float>(mip + 1);
-        std::memcpy(mapped + footprints[mip].Offset + y * footprints[mip].Footprint.RowPitch + x * 4, &value, 4);
-      }
+  for (UINT sub = 0; sub < subresources; ++sub)
+    for (UINT z = 0; z < footprints[sub].Footprint.Depth; ++z)
+      for (UINT y = 0; y < rows[sub]; ++y)
+        for (UINT x = 0; x < footprints[sub].Footprint.Width; ++x) {
+          const float value = static_cast<float>(sub % 7 + 1);
+          std::memcpy(mapped + footprints[sub].Offset +
+                          (z * rows[sub] + y) * footprints[sub].Footprint.RowPitch + x * 4, &value, 4);
+        }
   upload->Unmap(0, nullptr);
-  for (UINT mip = 0; mip < 7; ++mip) {
+  for (UINT mip = 0; mip < subresources; ++mip) {
     D3D12_TEXTURE_COPY_LOCATION dst{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
     dst.SubresourceIndex = mip;
     D3D12_TEXTURE_COPY_LOCATION src{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
@@ -1090,7 +1155,7 @@ ComPtr<ID3D12Resource> mipTexture(Gpu &gpu) {
   }
   gpu.transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   gpu.keepAlive.push_back(upload);
-  gpu.device->CreateShaderResourceView(texture.Get(), nullptr, gpu.cpu(3));
+  gpu.device->CreateShaderResourceView(texture.Get(), nullptr, gpu.cpu(slot));
   return texture;
 }
 
@@ -1132,10 +1197,196 @@ void testQuadDerivatives(Compute &c) {
   end("quad_deriv");
 }
 
+/* ---- CalculateLOD: analytical values plus independent native mip sampling ---- */
+struct LodInput {
+  float base[4];
+  float dx[4];
+  float dy[4];
+};
+
+void clearLodShapeSrvs(Gpu &gpu) {
+  D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+  view.Format = DXGI_FORMAT_R32_FLOAT;
+  view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.Texture2D.MipLevels = 1;
+  for (UINT slot = 4; slot <= 9; ++slot)
+    gpu.device->CreateShaderResourceView(nullptr, &view, gpu.cpu(slot));
+}
+
+void expectLod(const char *name, const char *field, size_t index,
+               const std::vector<uint8_t> &out, size_t offset, float expected) {
+  const uint32_t bits = load<uint32_t>(out, offset);
+  const float actual = bitsFloat(bits);
+  if (!std::isfinite(actual) || !std::isfinite(expected) || std::fabs(actual - expected) > 1.0f / 64.0f)
+    mismatch(name, field, index, bits, floatBits(expected));
+}
+
+void testCalculateLod(Compute &c) {
+  begin();
+  auto square = c.texture;
+  auto nonsquare = mipTexture(c.gpu, 64, 32);
+  auto large = mipTexture(c.gpu, 256, 256);
+  c.gpu.finish({}, nullptr);
+  const auto savedRoot = c.root;
+  const D3D12_FILTER linear = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  const D3D12_FILTER aniso = D3D12_FILTER_ANISOTROPIC;
+  struct Case {
+    const char *name;
+    UINT resource, baseMip, mips;
+    float resourceMin;
+    D3D12_FILTER filter;
+    UINT anisotropy;
+    float bias, minLod, maxLod, dxU, dxV, dyU, dyV, clamped, unclamped;
+    bool sample;
+  };
+  // All targets are specified analytically, not by a copy of the lowering.
+  // Orthogonal anisotropic targets below are chosen-modern-policy evidence,
+  // not universal hardware conformance; native Sample is a separate GPU oracle.
+  const Case cases[] = {
+      {"linear", 0, 0, 7, 0, linear, 1, 0, 0, 16, .125f, 0, 0, .03125f, 3, 3, true},
+      {"positive_bias", 0, 0, 7, 0, linear, 1, .75f, 0, 16, .125f, 0, 0, .03125f, 3.75f, 3.75f, true},
+      {"negative_bias", 0, 0, 7, 0, linear, 1, -.75f, 0, 16, .125f, 0, 0, .03125f, 2.25f, 2.25f, true},
+      {"bias_before_lower_bound", 0, 0, 7, 0, linear, 1, .75f, 0, 16, 1.f/256, 0, 0, 1.f/512, 0, -1.25f, true},
+      {"sampler_min", 0, 0, 7, 0, linear, 1, 0, 4.25f, 16, .125f, 0, 0, .03125f, 4.25f, 3, true},
+      {"bias_before_sampler_max", 0, 0, 7, 0, linear, 1, 2, 0, 2.25f, .125f, 0, 0, .03125f, 2.25f, 5, true},
+      {"view_upper", 0, 0, 3, 0, linear, 1, 0, 0, 16, .125f, 0, 0, .03125f, 2, 3, true},
+      {"view_upper_wins_sampler_min", 0, 0, 3, 0, linear, 1, 0, 5, 16, .125f, 0, 0, .03125f, 2, 3, true},
+      {"resource_wins_sampler_max", 0, 0, 7, 4.5f, linear, 1, 0, 0, 2, .125f, 0, 0, .03125f, 4.5f, 3, false},
+      {"resource_exact_last", 0, 0, 7, 6, linear, 1, 0, 0, 16, .125f, 0, 0, .03125f, 6, 3, false},
+      {"resource_fractional_empty", 0, 0, 7, 6.125f, linear, 1, 0, 0, 16, .125f, 0, 0, .03125f, 0, 3, false},
+      {"view_base_dimensions", 2, 2, 3, 0, linear, 1, 0, 0, 16, .0625f, 0, 0, .03125f, 2, 2, true},
+      {"full_resource_dimensions", 2, 0, 7, 0, linear, 1, 0, 0, 16, .0625f, 0, 0, .03125f, 4, 4, true},
+      {"nonsquare_height", 1, 0, 7, 0, linear, 1, 0, 0, 16, 0, .125f, .015625f, 0, 2, 2, true},
+      {"chosen_policy_aniso1", 0, 0, 7, 0, aniso, 1, 0, 0, 16, .125f, 0, 0, .03125f, 3, 3, true},
+      {"chosen_policy_aniso2", 0, 0, 7, 0, aniso, 2, 0, 0, 16, .125f, 0, 0, .03125f, 2, 2, true},
+      {"chosen_policy_aniso4", 0, 0, 7, 0, aniso, 4, 0, 0, 16, .125f, 0, 0, .03125f, 1, 1, true},
+      {"chosen_policy_aniso_limited", 0, 0, 7, 0, aniso, 4, 0, 0, 16, .125f, 0, 0, 1.f/256, 1, 1, true},
+      {"chosen_policy_aniso_bias", 0, 0, 7, 0, aniso, 4, 1.25f, 0, 16, .125f, 0, 0, .03125f, 2.25f, 2.25f, true},
+      {"portable_aniso_equal_range", 0, 0, 7, 0, aniso, 4, 0, 2.25f, 2.25f, .125f, 0, 0, .03125f, 2.25f, 1, true},
+  };
+  ID3D12Resource *resources[] = {square.Get(), nonsquare.Get(), large.Get()};
+  for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+    const auto &test = cases[index];
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_R32_FLOAT;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MostDetailedMip = test.baseMip;
+    view.Texture2D.MipLevels = test.mips;
+    view.Texture2D.ResourceMinLODClamp = test.resourceMin;
+    c.gpu.device->CreateShaderResourceView(resources[test.resource], &view, c.gpu.cpu(3));
+    c.root = computeRoot(c.gpu.device.Get(), test.filter, test.bias, test.minLod, test.maxLod, test.anisotropy);
+    const LodInput input{{.25f, .25f, 0, 0}, {test.dxU, test.dxV, 0, 0}, {test.dyU, test.dyV, 0, 0}};
+    const auto result = c.run("cs_lod", filled(4 * 12), filled(64), filled(64),
+                              {test.baseMip, test.sample ? 1u : 0u, 0, 0}, 1, &input, sizeof(input));
+    if (result.empty())
+      continue;
+    for (UINT lane = 0; lane < 4; ++lane) {
+      const size_t offset = lane * 12;
+      expectLod("calculate_lod", test.name, index * 4 + lane, result[0], offset, test.clamped);
+      expectLod("calculate_lod", "unclamped", index * 4 + lane, result[0], offset + 4, test.unclamped);
+      if (test.sample)
+        expectLod("calculate_lod", "native_sample_minus_one", index * 4 + lane, result[0], offset + 8,
+                   bitsFloat(load<uint32_t>(result[0], offset)));
+    }
+  }
+  c.root = savedRoot;
+  c.gpu.device->CreateShaderResourceView(square.Get(), nullptr, c.gpu.cpu(3));
+  end("calculate_lod");
+}
+
+void testCalculateLodShapes(Compute &c) {
+  begin();
+  auto t1 = mipTexture(c.gpu, 64, 1, D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1, 4);
+  auto t1Array = mipTexture(c.gpu, 64, 1, D3D12_RESOURCE_DIMENSION_TEXTURE1D, 4, 5);
+  auto t2Array = mipTexture(c.gpu, 64, 32, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 6);
+  auto t3 = mipTexture(c.gpu, 64, 16, D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8, 7);
+  auto cube = mipTexture(c.gpu, 64, 64, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6, 8);
+  auto cubeArray = mipTexture(c.gpu, 64, 64, D3D12_RESOURCE_DIMENSION_TEXTURE2D, 18, 9);
+  D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+  view.Format = DXGI_FORMAT_R32_FLOAT;
+  view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+  view.TextureCube.MipLevels = 7;
+  c.gpu.device->CreateShaderResourceView(cube.Get(), &view, c.gpu.cpu(8));
+  view = {};
+  view.Format = DXGI_FORMAT_R32_FLOAT;
+  view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+  view.TextureCubeArray.MipLevels = 7;
+  view.TextureCubeArray.NumCubes = 3;
+  c.gpu.device->CreateShaderResourceView(cubeArray.Get(), &view, c.gpu.cpu(9));
+  c.gpu.finish({}, nullptr);
+  const LodInput faces[] = {
+      {{1, .125f, -.25f, 0}, {0, 0, -.125f, 0}, {0, -.125f, 0, 0}},
+      {{-1, .125f, .25f, 0}, {0, 0, .125f, 0}, {0, -.125f, 0, 0}},
+      {{.25f, 1, -.125f, 0}, {.125f, 0, 0, 0}, {0, 0, .125f, 0}},
+      {{.25f, -1, .125f, 0}, {.125f, 0, 0, 0}, {0, 0, -.125f, 0}},
+      {{.25f, .125f, 1, 0}, {.125f, 0, 0, 0}, {0, -.125f, 0, 0}},
+      {{-.25f, .125f, -1, 0}, {-.125f, 0, 0, 0}, {0, -.125f, 0, 0}},
+  };
+  const char *fields[] = {"1d.clamped", "1d.unclamped", "1darray.clamped", "1darray.unclamped",
+                           "2darray.clamped", "2darray.unclamped", "3d.clamped", "3d.unclamped",
+                           "cube.clamped", "cube.unclamped", "cubearray.clamped", "cubearray.unclamped"};
+  for (UINT face = 0; face < 6; ++face)
+    for (UINT scale = 1; scale <= 4; scale += 3) {
+      LodInput input = faces[face];
+      for (UINT axis = 0; axis < 3; ++axis) {
+        input.base[axis] *= scale;
+        input.dx[axis] *= scale;
+        input.dy[axis] *= scale;
+      }
+      const auto result = c.run("cs_lod_shapes", filled(4 * 64), filled(64), filled(64),
+                                {0, 1, 0, 0}, 1, &input, sizeof(input));
+      if (result.empty())
+        continue;
+      for (UINT lane = 0; lane < 4; ++lane) {
+        for (UINT field = 0; field < 12; ++field)
+          expectLod("calculate_lod_shapes", fields[field], (face * 2 + (scale == 4)) * 4 + lane,
+                     result[0], lane * 64 + field * 4, field == 4 || field == 5 ? 3.f : 2.f);
+        expectLod("calculate_lod_shapes", "2darray.native_sample_minus_one", face * 4 + lane,
+                   result[0], lane * 64 + 48, bitsFloat(load<uint32_t>(result[0], lane * 64 + 16)));
+      }
+    }
+  // Quotient-rule derivative at each CURRENT lane. Neighbor projected differences
+  // would incorrectly yield log2(8/3) in both columns. Negative faces need signed dm.
+  for (float sign : {1.f, -1.f}) {
+    const LodInput input{{.25f, 0, sign, 0}, {.25f, 0, sign * .5f, 0}, {0, 0, 0, 0}};
+    const auto result = c.run("cs_lod_shapes", filled(4 * 64), filled(64), filled(64),
+                              {0, 0, 0, 0}, 1, &input, sizeof(input));
+    if (!result.empty())
+      for (UINT lane = 0; lane < 4; ++lane)
+        for (UINT field = 8; field < 12; ++field)
+          expectLod("calculate_lod_shapes", sign > 0 ? "cube.quotient_positive" : "cube.quotient_negative",
+                     lane, result[0], lane * 64 + field * 4, (lane & 1) ? std::log2(16.f / 9.f) : 2.f);
+  }
+  const auto savedRoot = c.root;
+  for (UINT anisotropy : {1u, 2u, 4u}) {
+    c.root = computeRoot(c.gpu.device.Get(), D3D12_FILTER_ANISOTROPIC, 0, 0, 16, anisotropy);
+    const auto result = c.run("cs_lod_shapes", filled(4 * 64), filled(64), filled(64),
+                              {0, 1, 0, 0}, 1, &faces[4], sizeof(LodInput));
+    if (!result.empty())
+      for (UINT lane = 0; lane < 4; ++lane) {
+        const float expected = anisotropy == 1 ? 3.f : anisotropy == 2 ? 2.f : 1.f;
+        expectLod("calculate_lod_shapes", "2darray.chosen_policy_aniso.clamped", lane,
+                   result[0], lane * 64 + 16, expected);
+        expectLod("calculate_lod_shapes", "2darray.chosen_policy_aniso.unclamped", lane,
+                   result[0], lane * 64 + 20, expected);
+        expectLod("calculate_lod_shapes", "2darray.chosen_policy_native_sample", lane,
+                   result[0], lane * 64 + 48, bitsFloat(load<uint32_t>(result[0], lane * 64 + 16)));
+      }
+    // Cube anisotropy may provide only trilinear quality: intentionally no minor-axis assertion.
+  }
+  c.root = savedRoot;
+  clearLodShapeSrvs(c.gpu);
+  end("calculate_lod_shapes");
+}
+
 /* ---- negative compile tests and WaveSize(32) ---- */
 void testRejections(Compute &c) {
   begin();
-  for (const char *entry : {"cs_wavesize64", "cs_fp64", "cs_gs64", "cs_sm69"}) {
+  for (const char *entry : {"cs_wavesize64", "cs_wavesize128", "cs_wavesize_range64only"}) {
     ComPtr<ID3D12PipelineState> pso;
     const HRESULT hr = computePso(c.gpu.device.Get(), c.root.Get(), shader(entry), pso);
     std::printf("OWNED_D3D12_SM6_REJECT entry=%s hr=0x%08lx\n", entry, static_cast<unsigned long>(hr));
@@ -1143,6 +1394,16 @@ void testRejections(Compute &c) {
       mismatch("rejections", entry, 0, static_cast<uint32_t>(hr), 0x80070057u);
   }
   end("rejections");
+  begin();
+  auto gs64=c.run("cs_gs64",filled(8),filled(64),filled(64),{0,0,0,0},1);
+  if(!gs64.empty())
+    EXPECT_EQ("groupshared64","add",0,load<uint64_t>(gs64[0],0),1);
+  end("groupshared64");
+  begin();
+  auto sm69 = c.run("cs_sm69", filled(4), filled(64), filled(64), {0, 0, 0, 0}, 1);
+  if (!sm69.empty())
+    EXPECT_EQ("sm69_input", "store", 0, load<uint32_t>(sm69[0], 0), 1);
+  end("sm69_input");
   begin();
   auto r = c.run("cs_wavesize32", filled(128), filled(64), filled(64), {0, 0, 0, 0}, 1);
   if (!r.empty())
@@ -1343,32 +1604,6 @@ void testGraphicsInt64(Graphics &g) {
   end("graphics_int64");
 }
 
-/* 64 bit atomics in a graphics stage fail pipeline creation (compute-only emulation). */
-void testGraphicsAtomic64Rejected(Graphics &g) {
-  begin();
-  for (const char *ps : {"ps_atomic64", "ps_umax64"}) {
-    const auto vs_code = shader("vs_main"), ps_code = shader(ps);
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-    desc.pRootSignature = g.root.Get();
-    desc.VS = {vs_code.data(), vs_code.size()};
-    desc.PS = {ps_code.data(), ps_code.size()};
-    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    desc.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
-    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    desc.NumRenderTargets = 1;
-    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    ComPtr<ID3D12PipelineState> pso;
-    const HRESULT hr = g.gpu.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
-    std::printf("OWNED_D3D12_SM6_REJECT entry=%s hr=0x%08lx\n", ps, static_cast<unsigned long>(hr));
-    if (SUCCEEDED(hr) || pso)
-      mismatch("graphics_atomic64_rejected", ps, 0, static_cast<uint32_t>(hr), 0x80004005u);
-  }
-  end("graphics_atomic64_rejected");
-}
-
 /* SV_ViewID with view instancing off (no VIEW_INSTANCING subobject) is 0 in the VS and the PS. */
 void testViewId(Graphics &g) {
   begin();
@@ -1463,6 +1698,192 @@ DenormInputs denormInputs() {
     in.c.push_back(pick());
   }
   return in;
+}
+
+/* ---- binary64 emulation: exact edge-case bits, shared storage and both binary32 denorm modes ---- */
+std::vector<uint8_t> fp64Inputs(uint32_t count) {
+  const uint64_t edges[] = {0, 0x8000000000000000ULL, 1, 0x8000000000000001ULL,
+      0x000fffffffffffffULL, 0x0010000000000000ULL, 0x3ff0000000000000ULL, 0x3ff0000000000001ULL,
+      0x3fefffffffffffffULL, 0x4000000000000000ULL, 0x4008000000000000ULL, 0xbff8000000000000ULL,
+      0x7fefffffffffffffULL, 0x7ff0000000000000ULL, 0xfff0000000000000ULL, 0x7ff8000000000123ULL,
+      0x7ff0000000000001ULL, 0x41e0000000000000ULL, 0xc1e0000000000000ULL, 0x43e0000000000000ULL,
+      0xc3e0000000000000ULL, 0x43f0000000000000ULL, 0x36a0000000000000ULL, 0xb6a0000000000000ULL};
+  constexpr uint32_t edgeCount = sizeof(edges) / sizeof(edges[0]);
+  std::vector<uint8_t> raw(count * 24);
+  uint64_t random = 0xF064;
+  for (uint32_t i = 0; i < count; ++i) {
+    random = random * 6364136223846793005ULL + 1442695040888963407ULL;
+    put(raw, i * 24, i < edgeCount * edgeCount ? edges[i / edgeCount] : random);
+    random = random * 6364136223846793005ULL + 1442695040888963407ULL;
+    put(raw, i * 24 + 8, i < edgeCount * edgeCount ? edges[i % edgeCount] : random);
+    random = random * 6364136223846793005ULL + 1442695040888963407ULL;
+    put(raw, i * 24 + 16, random);
+  }
+  return raw;
+}
+
+void testFp64(Compute &c, bool legacy) {
+  const unsigned saved = _mm_getcsr();
+  _mm_setcsr(saved & ~0x8040u);
+  constexpr uint32_t count = 1024, stride = 160;
+  auto bits = [](double x) { uint64_t u; std::memcpy(&u, &x, 8); return u; };
+  auto value = [](uint64_t u) { double x; std::memcpy(&x, &u, 8); return x; };
+  auto integer = [](double x, bool sign, unsigned width) -> uint64_t {
+    if (std::isnan(x)) return 0;
+    if (sign) {
+      if (width == 32) {
+        if (x >= 0x1p31) return INT32_MAX;
+        if (x <= -0x1p31) return static_cast<uint64_t>(INT32_MIN);
+        return static_cast<uint64_t>(static_cast<int32_t>(x));
+      }
+      if (x >= 0x1p63) return INT64_MAX;
+      if (x <= -0x1p63) return static_cast<uint64_t>(INT64_MIN);
+      return static_cast<uint64_t>(static_cast<int64_t>(x));
+    }
+    if (x <= 0) return 0;
+    if (width == 32) return x >= 0x1p32 ? UINT32_MAX : static_cast<uint32_t>(x);
+    return x >= 0x1p64 ? UINT64_MAX : static_cast<uint64_t>(x);
+  };
+  const auto raw = fp64Inputs(count);
+  for (bool second : {false, true}) {
+    const bool flush = !legacy && second;
+    const char *name = legacy ? (second ? "fp64_legacy51" : "fp64_legacy50") : (flush ? "fp64_ftz" : "fp64");
+    const char *entry = legacy ? (second ? "cs_fp64_legacy51.dxbc" : "cs_fp64_legacy50.dxbc") :
+                                (flush ? "cs_fp64_ftz" : "cs_fp64");
+    begin();
+    auto r = c.run(entry, filled(count * stride), raw, filled(64), {0, 0, 0, 0}, count / 4);
+    if (!r.empty()) for (uint32_t i = 0; i < count; ++i) {
+      uint64_t au = load<uint64_t>(raw, i * 24), bu = load<uint64_t>(raw, i * 24 + 8);
+      volatile double a = value(au), b = value(bu), z = value(load<uint64_t>(raw, i * 24 + 16));
+      double minimum = std::isnan(a) ? b : std::isnan(b) ? a : std::fmin(a, b);
+      double maximum = std::isnan(a) ? b : std::isnan(b) ? a : std::fmax(a, b);
+      if (a == 0 && b == 0) { minimum = value(au | bu); maximum = value(au & bu); }
+      uint32_t from = static_cast<uint32_t>(au), to = floatBits(static_cast<float>(a));
+      if (flush) {
+        if ((from & 0x7fffffff) < 0x00800000) from &= 0x80000000;
+        if ((to & 0x7fffffff) < 0x00800000) to &= 0x80000000;
+      }
+      const uint32_t neighbor = (i & ~3u) | ((i + 1) & 3u);
+      const double expected[] = {a + b, a - b, a * b, a / b, std::fma(a, b, z), -a,
+          legacy ? static_cast<double>(static_cast<int32_t>(au)) : static_cast<double>(static_cast<int64_t>(au)),
+          legacy ? static_cast<double>(static_cast<uint32_t>(au)) : static_cast<double>(au),
+          static_cast<double>(bitsFloat(from)), value(load<uint64_t>(raw, neighbor * 24)),
+          i & 1 ? a : b, minimum, maximum, std::fabs(a)};
+      const uint32_t offsets[] = {0, 8, 16, 24, 32, 40, 88, 96, 104, 112, 120, 128, 136, 144};
+      for (uint32_t op = 0; op < 14; ++op) {
+        const uint64_t actual = load<uint64_t>(r[0], i * stride + offsets[op]);
+        if (actual != bits(expected[op]) && !(std::isnan(value(actual)) && std::isnan(expected[op])))
+          mismatch(name, "binary64.bits", i * 14 + op, actual, bits(expected[op]));
+      }
+      const uint32_t actualFloat = load<uint32_t>(r[0], i * stride + 48);
+      if (actualFloat != to && !(std::isnan(bitsFloat(actualFloat)) && std::isnan(bitsFloat(to))))
+        mismatch(name, "double.to.float", i, actualFloat, to);
+      EXPECT_EQ(name, "double.to.int32", i, load<uint32_t>(r[0], i * stride + 52), static_cast<uint32_t>(integer(a, true, 32)));
+      EXPECT_EQ(name, "double.to.uint32", i, load<uint32_t>(r[0], i * stride + 56), integer(a, false, 32));
+      if (!legacy) {
+        EXPECT_EQ(name, "double.to.int64", i, load<uint64_t>(r[0], i * stride + 64), integer(a, true, 64));
+        EXPECT_EQ(name, "double.to.uint64", i, load<uint64_t>(r[0], i * stride + 72), integer(a, false, 64));
+      } else for (uint32_t pad : {64u, 68u, 72u, 76u})
+        EXPECT_EQ(name, "untouched.legacy.padding", i * stride + pad, load<uint32_t>(r[0], i * stride + pad), kSentinel);
+      const uint32_t cmp = (a < b ? 1 : 0) | (a == b ? 2 : 0) | (a != b ? 4 : 0) |
+          (a <= b ? 8 : 0) | (a > b ? 16 : 0) | (a >= b ? 32 : 0);
+      EXPECT_EQ(name, "binary64.compare", i, load<uint32_t>(r[0], i * stride + 80), cmp);
+      for (uint32_t pad : {60u, 84u, 152u, 156u})
+        EXPECT_EQ(name, "untouched.padding", i * stride + pad, load<uint32_t>(r[0], i * stride + pad), kSentinel);
+    }
+    end(name);
+  }
+  _mm_setcsr(saved);
+}
+
+void testFp64Wave(Compute &c) {
+  begin();
+  const unsigned saved = _mm_getcsr();
+  _mm_setcsr(saved & ~0x8040u);
+  const uint64_t patterns[][4] = {
+      {0, 0x8000000000000000ULL, 0, 0x8000000000000000ULL},
+      {0x7ff8000000000123ULL, 0x3ff0000000000000ULL, 0x4000000000000000ULL, 0x4008000000000000ULL},
+      {0xbff0000000000000ULL, 0xc000000000000000ULL, 0xc010000000000000ULL, 0x4020000000000000ULL},
+      {1, 2, 4, 8},
+      {0x7ff0000000000000ULL, 0xfff0000000000000ULL, 0, 0x8000000000000000ULL},
+      {0x3ff0000000000000ULL, 0x3ff0000000000000ULL, 0x3ff0000000000000ULL, 0x3ff0000000000000ULL},
+      {0, 0, 0, 0x8000000000000000ULL},
+      {0x7ff0000000000001ULL, 0xbff0000000000000ULL, 0xc000000000000000ULL, 0xc008000000000000ULL},
+  };
+  std::vector<uint8_t> raw(sizeof(patterns));
+  std::memcpy(raw.data(), patterns, sizeof(patterns));
+  constexpr uint32_t groups = sizeof(patterns) / sizeof(patterns[0]);
+  auto r = c.run("cs_fp64_wave", filled(groups * 4 * 64), raw, filled(64), {0, 0, 0, 0}, groups);
+  if (!r.empty()) for (uint32_t group = 0; group < groups; ++group) {
+    bool equal = true;
+    double minimum = INFINITY, maximum = -INFINITY;
+    uint64_t minBits = 0x7ff0000000000000ULL, maxBits = 0xfff0000000000000ULL;
+    volatile double sum = 0, product = 1;
+    const double first = load<double>(raw, group * 32);
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      const double x = load<double>(raw, group * 32 + lane * 8);
+      equal &= x == first;
+      sum = sum + x;
+      product = product * x;
+      if (x < minimum) { minimum = x; minBits = patterns[group][lane]; }
+      if (x > maximum) { maximum = x; maxBits = patterns[group][lane]; }
+      if (x == 0 && minimum == 0) minBits |= patterns[group][lane];
+      if (x == 0 && maximum == 0) maxBits &= patterns[group][lane];
+    }
+    uint64_t sumBits, productBits;
+    const double sumValue = sum, productValue = product;
+    std::memcpy(&sumBits, &sumValue, 8); std::memcpy(&productBits, &productValue, 8);
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      const uint32_t base = (group * 4 + lane) * 64;
+      EXPECT_EQ("fp64_wave", "numeric.AllEqual", base, load<uint32_t>(r[0], base), equal);
+      EXPECT_EQ("fp64_wave", "subwave.lane", base, load<uint32_t>(r[0], base + 4), lane);
+      EXPECT_EQ("fp64_wave", "bitcopy.first", base, load<uint64_t>(r[0], base + 8), patterns[group][0]);
+      EXPECT_EQ("fp64_wave", "bitcopy.shuffle", base, load<uint64_t>(r[0], base + 16), patterns[group][(lane + 1) & 3]);
+      for (const auto pair : {std::pair{24u, sumBits}, std::pair{32u, productBits},
+                              std::pair{40u, minBits}, std::pair{48u, maxBits}}) {
+        const uint64_t actual = load<uint64_t>(r[0], base + pair.first);
+        const bool nan = (actual & 0x7fffffffffffffffULL) > 0x7ff0000000000000ULL &&
+                         (pair.second & 0x7fffffffffffffffULL) > 0x7ff0000000000000ULL;
+        if (actual != pair.second && !nan) mismatch("fp64_wave", "reduce.bits", base + pair.first, actual, pair.second);
+      }
+      for (uint32_t pad : {56u, 60u})
+        EXPECT_EQ("fp64_wave", "untouched.padding", base + pad, load<uint32_t>(r[0], base + pad), kSentinel);
+    }
+  }
+  _mm_setcsr(saved);
+  end("fp64_wave");
+}
+void testFp64Graphics(Graphics &g) {
+  const unsigned saved = _mm_getcsr();
+  _mm_setcsr(saved & ~0x8040u);
+  auto raw = fp64Inputs(64);
+  // Exact cancellation below binary32 precision, produced in the vertex shader.
+  put(raw, 0, uint64_t{0x3ff0000000000001ULL});
+  put(raw, 8, uint64_t{0x3feffffffffffffeULL});
+  put(raw, 16, uint64_t{0xbff0000000000000ULL});
+  auto value = [](uint64_t u) { double x; std::memcpy(&x, &u, 8); return x; };
+  auto bits = [](double x) { uint64_t u; std::memcpy(&u, &x, 8); return u; };
+  const double vertex = std::fma(value(load<uint64_t>(raw, 0)), value(load<uint64_t>(raw, 8)), value(load<uint64_t>(raw, 16)));
+  struct Mode { const char *name, *vertex, *pixel; };
+  for (const Mode mode : {Mode{"fp64_graphics", "vs_fp64", "ps_fp64"},
+                         Mode{"fp64_graphics_legacy50", "vs_fp64_legacy50.dxbc", "ps_fp64_legacy50.dxbc"},
+                         Mode{"fp64_graphics_legacy51", "vs_fp64_legacy51.dxbc", "ps_fp64_legacy51.dxbc"}}) {
+    begin();
+    auto r = g.draw(mode.vertex, mode.pixel, 8, 8, filled(64 * 32), raw, {0, 0, 0, 0}, false, 0, 0);
+    if (!r.empty()) for (uint32_t i = 0; i < 64; ++i) {
+      volatile double a = value(load<uint64_t>(raw, i * 24)), b = value(load<uint64_t>(raw, i * 24 + 8));
+      volatile double z = value(load<uint64_t>(raw, i * 24 + 16));
+      const double fused = std::fma(a, b, z);
+      const double expected[] = {vertex, a + b, fused, fused + vertex};
+      for (uint32_t op = 0; op < 4; ++op) {
+        const uint64_t actual = load<uint64_t>(r[0], i * 32 + op * 8);
+        if (actual != bits(expected[op]) && !(std::isnan(value(actual)) && std::isnan(expected[op])))
+          mismatch(mode.name, "vertex.fragment.bits", i * 4 + op, actual, bits(expected[op]));
+      }
+    }
+    end(mode.name);
+  }
+  _mm_setcsr(saved);
 }
 
 void testDenorm(Compute &c) {
@@ -1594,11 +2015,17 @@ void printCaps(ID3D12Device *device) {
 
 int run(int argc, wchar_t **argv) {
   int reps = 20;
+  bool waves_only = false;
+  bool fp64_only = false;
   for (int i = 1; i < argc; ++i) {
     if (!std::wcscmp(argv[i], L"--stress-reps") && i + 1 < argc) {
       reps = _wtoi(argv[++i]);
+    } else if (!std::wcscmp(argv[i], L"--waves-only")) {
+      waves_only = true;
+    } else if (!std::wcscmp(argv[i], L"--fp64-only")) {
+      fp64_only = true;
     } else {
-      std::printf("usage: owned-d3d12-sm6.exe [--stress-reps N]\n");
+      std::printf("usage: owned-d3d12-sm6.exe [--stress-reps N] [--waves-only] [--fp64-only]\n");
       return 2;
     }
   }
@@ -1619,19 +2046,72 @@ int run(int argc, wchar_t **argv) {
 
   Gpu gpu(device.Get());
   Compute compute{gpu, computeRoot(device.Get()), nullptr};
+  if (fp64_only) {
+    testFp64(compute, false);
+    testFp64(compute, true);
+    testFp64Wave(compute);
+    Graphics graphics{gpu, graphicsRoot(device.Get())};
+    testFp64Graphics(graphics);
+    if (!g_failures) std::puts("OWNED_D3D12_FP64_PASS cases=8");
+    std::fflush(stdout);
+    return g_failures ? 1 : 0;
+  }
   compute.texture = mipTexture(gpu);
+  clearLodShapeSrvs(gpu);
   gpu.finish({}, nullptr);
   Graphics graphics{gpu, graphicsRoot(device.Get())};
 
   testWave(compute);
+  testWave(compute, "cs_wave4", 4, "wave4");
+  testWave(compute, "cs_wave8", 8, "wave8");
+  testWave(compute, "cs_wave16", 16, "wave16");
+  testWave(compute, "cs_wave_range4", 4, "wave_range4");
+  testWave(compute, "cs_wave_range8", 8, "wave_range8");
+  testWave(compute, "cs_wave_range16", 16, "wave_range16");
+  testWave(compute, "cs_wave_range32", 32, "wave_range32");
+  testWave(compute, "cs_wave_range64", 32, "wave_range64_unavailable");
+  testWave(compute, "cs_wave_range16max", 16, "wave_range16max");
+  testWave(compute, "cs_wave_sm68fixed4", 4, "wave_sm68fixed4");
   testDivergent(compute);
+  testDivergent(compute, "cs_divergent4", 4, "divergent4");
+  testDivergent(compute, "cs_divergent8", 8, "divergent8");
+  testDivergent(compute, "cs_divergent16", 16, "divergent16");
   testInt64(compute);
+  testInt64(compute, "cs_int64wave4", 4, "int64wave4");
+  testInt64(compute, "cs_int64wave8", 8, "int64wave8");
+  testInt64(compute, "cs_int64wave16", 16, "int64wave16");
+  if (waves_only) {
+    begin();
+    for (const char *entry : {"cs_wavesize64", "cs_wavesize128", "cs_wavesize_range64only"}) {
+      ComPtr<ID3D12PipelineState> pso;
+      const HRESULT hr = computePso(gpu.device.Get(), compute.root.Get(), shader(entry), pso);
+      std::printf("OWNED_D3D12_WAVES_REJECT entry=%s hr=0x%08lx\n", entry, static_cast<unsigned long>(hr));
+      // Shader initialization reports unsatisfied execution contracts as E_FAIL.
+      if (hr != E_FAIL || pso)
+        mismatch("wave_requirements", entry, 0, static_cast<uint32_t>(hr), static_cast<uint32_t>(E_FAIL));
+    }
+    auto widths = compute.run("cs_wavesize32", filled(128), filled(64), filled(64), {0, 0, 0, 0}, 1);
+    if (!widths.empty())
+      for (uint32_t i = 0; i < 32; ++i)
+        EXPECT_EQ("wave_requirements", "fixed32", i, load<uint32_t>(widths[0], i * 4), 32);
+    end("wave_requirements");
+    testQuadDerivatives(compute);
+    testHelperLanes(graphics, false);
+    testHelperLanes(graphics, true);
+    testVertexWave(graphics);
+    if (!g_failures)
+      std::printf("OWNED_D3D12_WAVES_PASS\n");
+    std::fflush(stdout);
+    return g_failures ? 1 : 0;
+  }
   testAtomic64Ops(compute);
   testAtomic64Heap(gpu);
   test16Bit(compute);
   testMinPrecision(compute);
   testPacked(compute);
   testQuadDerivatives(compute);
+  testCalculateLod(compute);
+  testCalculateLodShapes(compute);
   testRejections(compute);
   testBarycentrics(graphics, false);
   testBarycentrics(graphics, true);
@@ -1640,10 +2120,13 @@ int run(int argc, wchar_t **argv) {
   test16BitIo(graphics);
   testGraphicsInt64(graphics);
   testVertexWave(graphics);
-  testGraphicsAtomic64Rejected(graphics);
   testViewId(graphics);
   testViewIdInstanced(graphics);
   testDenorm(compute);
+  testFp64(compute, false);
+  testFp64(compute, true);
+  testFp64Wave(compute);
+  testFp64Graphics(graphics);
   testStress(compute, reps);
 
   if (!g_failures)

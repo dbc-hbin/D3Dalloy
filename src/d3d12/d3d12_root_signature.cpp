@@ -141,17 +141,7 @@ bool ValidStaticSampler(const STATIC_SAMPLER &sampler) {
   if ((flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR) && border <= D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE)
     return false;
   if (flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) {
-    const UINT filter = static_cast<UINT>(sampler.Filter);
-    const UINT reduction = (filter >> D3D12_FILTER_REDUCTION_TYPE_SHIFT) & D3D12_FILTER_REDUCTION_TYPE_MASK;
-    const UINT min = (filter >> D3D12_MIN_FILTER_SHIFT) & D3D12_FILTER_TYPE_MASK;
-    const UINT mag = (filter >> D3D12_MAG_FILTER_SHIFT) & D3D12_FILTER_TYPE_MASK;
-    const UINT mip = (filter >> D3D12_MIP_FILTER_SHIFT) & D3D12_FILTER_TYPE_MASK;
-    const auto clamp_or_border = [](D3D12_TEXTURE_ADDRESS_MODE mode) {
-      return mode == D3D12_TEXTURE_ADDRESS_MODE_CLAMP || mode == D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-    };
-    if ((filter & D3D12_ANISOTROPIC_FILTERING_BIT) || reduction == D3D12_FILTER_REDUCTION_TYPE_COMPARISON ||
-        min != mag || mip != 0 || sampler.MinLOD != 0.0f || sampler.MaxLOD != 0.0f ||
-        !clamp_or_border(sampler.AddressU) || !clamp_or_border(sampler.AddressV))
+    if (!sampler_feedback::ValidNonNormalizedSampler(sampler))
       return false;
   }
   return true;
@@ -750,7 +740,7 @@ public:
         return E_OUTOFMEMORY;
       }
       try {
-        static_samplers_encoded_.reserve(size_t(desc.NumStaticSamplers) * 4);
+        static_samplers_encoded_.reserve(size_t(desc.NumStaticSamplers) * 8);
         static_samplers_.reserve(desc.NumStaticSamplers);
         for (unsigned i = 0; i < desc.NumStaticSamplers; i++) {
           WMTSamplerInfo info;
@@ -765,8 +755,17 @@ public:
           static_samplers_encoded_.push_back(sampler->sampler_state_cube_handle);
           static_samplers_encoded_.push_back(sampler_feedback::SamplerMetadata(
               sampler->lod_bias, sampler_feedback::SamplerFlags(static_desc.Filter, static_desc.AddressU,
-                                                                static_desc.AddressV, static_desc.MaxAnisotropy)));
+                  static_desc.AddressV, static_desc.MaxAnisotropy,
+                  static_desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES, static_desc.AddressW,
+                  static_cast<UINT>(static_desc.BorderColor) >= kStaticBorderColorOpaqueBlackUint, static_desc.ComparisonFunc)));
           static_samplers_encoded_.push_back(sampler_feedback::SamplerLodRange(static_desc.MinLOD, static_desc.MaxLOD));
+          const bool white = static_cast<UINT>(static_desc.BorderColor) == kStaticBorderColorOpaqueWhiteUint;
+          static_samplers_encoded_.push_back(white ? uint64_t(1) | uint64_t(1) << 32 : 0);
+          static_samplers_encoded_.push_back(uint64_t(white ? 1 : 0) | uint64_t(1) << 32);
+          const uint32_t float_rgb = static_desc.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE ? 0x3f800000u : 0;
+          const uint32_t float_alpha = static_desc.BorderColor == D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK ? 0 : 0x3f800000u;
+          static_samplers_encoded_.push_back(uint64_t(float_rgb) | uint64_t(float_rgb) << 32);
+          static_samplers_encoded_.push_back(uint64_t(float_rgb) | uint64_t(float_alpha) << 32);
 
           static_samplers_.emplace_back(std::move(sampler));
         }
@@ -793,11 +792,19 @@ public:
           const auto &range = parameter.DescriptorTable.pDescriptorRanges[j];
           const uint64_t offset = range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
                                       ? previous_end : range.OffsetInDescriptorsFromTableStart;
-          table_ranges_.push_back({offset, range.NumDescriptors, range.RangeType});
+          table_ranges_.push_back({offset, range.NumDescriptors, range.RangeType,
+              range.RegisterSpace, range.BaseShaderRegister, parameter.ShaderVisibility});
           HasTextureDescriptorTables |= range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
                                         range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
           previous_end = offset + range.NumDescriptors;
         }
+      } else if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ||
+                 parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
+                 parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+        const auto type = parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV :
+            parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        table_ranges_.push_back({0, 1, type, parameter.Descriptor.RegisterSpace,
+            parameter.Descriptor.ShaderRegister, parameter.ShaderVisibility});
       }
       table_range_spans_.emplace_back(begin, table_ranges_.size() - begin);
     }
@@ -854,9 +861,17 @@ public:
 
   std::span<const TableRange> GetTableRanges(UINT root_parameter) const override {
     if (root_parameter >= table_range_spans_.size()) return {};
+    if (parameter_types_[root_parameter] != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) return {};
     const auto [begin, count] = table_range_spans_[root_parameter];
     if (!count) return {};
     return {table_ranges_.data() + begin, count};
+  }
+
+  const TableRange *GetRootDescriptorRange(UINT root_parameter) const override {
+    if (root_parameter >= table_range_spans_.size() ||
+        parameter_types_[root_parameter] == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) return nullptr;
+    const auto [begin, count] = table_range_spans_[root_parameter];
+    return count ? &table_ranges_[begin] : nullptr;
   }
 };
 

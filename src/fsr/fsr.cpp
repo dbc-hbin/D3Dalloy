@@ -21,7 +21,7 @@ constexpr uint32_t kCreateFlags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
     FFX_UPSCALE_ENABLE_DEBUG_CHECKING | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE |
     FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION;
 // Color-space/visualization create flags permit per-frame requests; dispatch
-// selects the actual transfer function and rejects the reference-unsupported debug draw.
+// selects the actual transfer function and diagnostic output.
 // A binary marker, not another public export or an AMD model/version claim.
 constexpr wchar_t kMarker[] = L"dxmt-owned-fsr-metalfx-v1: unsupported MetalFX operation";
 struct Context {
@@ -159,7 +159,8 @@ ffxReturnCode_t dispatch(Context &context, const ffxDispatchDescUpscale &desc) {
                      FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ)) return FFX_API_RETURN_ERROR_PARAMETER;
   if ((desc.flags & FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB) &&
       (desc.flags & FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ)) return FFX_API_RETURN_ERROR_PARAMETER;
-  if (desc.flags & FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW) return FFX_API_RETURN_NO_PROVIDER;
+  if ((desc.flags & FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW) &&
+      !(context.flags & FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION)) return FFX_API_RETURN_ERROR_PARAMETER;
   if ((!desc.upscaleSize.width != !desc.upscaleSize.height) ||
       desc.upscaleSize.width > context.output.width || desc.upscaleSize.height > context.output.height)
     return FFX_API_RETURN_ERROR_PARAMETER;
@@ -201,12 +202,12 @@ ffxReturnCode_t dispatch(Context &context, const ffxDispatchDescUpscale &desc) {
   frame.Sharpness = desc.sharpness;
   // Reference FSR deliberately centers/caps output above the device temporal scale limit.
   frame.CapOutputToTemporalMaxScale = TRUE;
+  frame.DrawDebugView = (desc.flags & FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW) != 0;
   frame.JitterOffsetX = desc.jitterOffset.x;
   frame.JitterOffsetY = desc.jitterOffset.y;
   frame.MotionVectorScaleX = desc.motionVectorScale.x;
   frame.MotionVectorScaleY = desc.motionVectorScale.y;
   frame.PreExposure = desc.preExposure;
-  frame.ExposureScale = 1;
   frame.ResetHistory = desc.reset;
   return backendResult(extension->TemporalUpscale(context.backend.ptr(), &frame));
 }

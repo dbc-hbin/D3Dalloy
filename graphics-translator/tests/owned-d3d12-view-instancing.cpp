@@ -80,7 +80,8 @@ private:
 };
 
 struct Shaders {
-  std::vector<uint8_t> vs = shader("vs_main"), ps = shader("ps_uint"), ps_unorm = shader("ps_unorm"),
+  std::vector<uint8_t> vs = shader("vs_main"), vs_indices = shader("vs_indices"),
+                       ps = shader("ps_uint"), ps_unorm = shader("ps_unorm"),
                        gs = shader("gs_view"), vs_tess = shader("vs_tess"), hs = shader("hs_view"),
                        ds = shader("ds_view");
 };
@@ -94,6 +95,7 @@ struct PsoDesc {
   bool view_instancing = true;  // false: no VIEW_INSTANCING subobject
   std::vector<D3D12_VIEW_INSTANCE_LOCATION> locations;
   bool masking = false;
+  bool authored_indices = false;
 };
 
 struct Context {
@@ -113,7 +115,7 @@ struct Context {
       s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, bytecode(shaders.hs));
       s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, bytecode(shaders.ds));
     } else {
-      s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, bytecode(shaders.vs));
+      s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, bytecode(d.authored_indices ? shaders.vs_indices : shaders.vs));
     }
     if (d.stages == Stages::VsGsPs) s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, bytecode(shaders.gs));
     s.add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
@@ -550,6 +552,145 @@ void testExecuteIndirect(Context &c) {
   compare("execute_indirect_2_views_2_commands", t, [&](UINT slice, UINT, UINT) {
     return slice == 2 ? viewTexel(0x82, 1, 0, 0) : slice == 0 ? viewTexel(0x82, 1, 1, 1) : kUntouched;
   });
+
+  {
+    PsoDesc masked;
+    masked.locations = {{0, 2}, {0, 1}, {0, 0}};
+    masked.masking = true;
+    auto masked_pso = c.pso(masked);
+    Target target(c, 8, 8, 3);
+    auto commands_list = c.begin();
+    target.bind(commands_list.list.Get(), {target.full()});
+    commands_list.list->SetPipelineState(masked_pso.Get());
+    commands_list.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commands_list.list->SetViewInstanceMask(0b101);
+    commands_list.list->ExecuteIndirect(signature.Get(), 2, upload.Get(), 0, nullptr, 0);
+    // A direct draw in the same pass must restore native mapping offset 1, not keep the ICB neutral offsets.
+    commands_list.list->SetViewInstanceMask(0b010);
+    draw(commands_list, masked_pso.Get(), 0x83);
+    c.execute(commands_list);
+    compare("execute_indirect_masked_rtai_then_direct", target, [&](UINT slice, UINT, UINT) {
+      return slice == 2 ? viewTexel(0x82, 1, 0, 0) : slice == 0 ? viewTexel(0x82, 1, 2, 2)
+                                                             : viewTexel(0x83, 1, 1, 1);
+    });
+  }
+  {
+    PsoDesc masked;
+    masked.locations = {{3, 0}, {1, 0}, {5, 0}};
+    masked.masking = true;
+    auto masked_pso = c.pso(masked);
+    D3D12_INDIRECT_ARGUMENT_DESC plain_argument{};
+    plain_argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC plain_desc{sizeof(D3D12_DRAW_ARGUMENTS), 1, &plain_argument, 0};
+    ComPtr<ID3D12CommandSignature> plain_signature;
+    check(c.device->CreateCommandSignature(&plain_desc, nullptr, IID_PPV_ARGS(&plain_signature)),
+          "plain draw signature");
+    const D3D12_DRAW_ARGUMENTS plain_draws[2] = {{3, 1, 0, 0}, {3, 1, 0, 0}};
+    auto plain_upload = c.buffer(sizeof(plain_draws), D3D12_HEAP_TYPE_UPLOAD,
+                                 D3D12_RESOURCE_STATE_GENERIC_READ);
+    check(plain_upload->Map(0, nullptr, &mapped), "Map(plain upload)");
+    std::memcpy(mapped, plain_draws, sizeof(plain_draws));
+    plain_upload->Unmap(0, nullptr);
+    Target target(c, 16, 4, 1);
+    auto commands_list = c.begin();
+    target.bind(commands_list.list.Get(), {{0, 0, 4, 4, 0, 1}, {4, 0, 4, 4, 0, 1},
+                                          {8, 0, 4, 4, 0, 1}, {12, 0, 4, 4, 0, 1}});
+    commands_list.list->SetPipelineState(masked_pso.Get());
+    commands_list.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commands_list.list->SetViewInstanceMask(0b101);
+    commands_list.list->SetGraphicsRoot32BitConstant(0, 0x82, 0);
+    commands_list.list->ExecuteIndirect(plain_signature.Get(), 2, plain_upload.Get(), 0, nullptr, 0);
+    c.execute(commands_list);
+    compare("execute_indirect_masked_vpai_out_of_range", target, [&](UINT, UINT x, UINT) {
+      return x / 4 == 3 ? viewTexel(0x82, 1, 0, 0) : x / 4 == 0 ? viewTexel(0x82, 1, 2, 2) : kUntouched;
+    });
+  }
+  {
+    PsoDesc authored;
+    authored.locations = {{1, 1}, {2, 2}};
+    authored.authored_indices = true;
+    auto authored_pso = c.pso(authored);
+    struct IndexedCommand {
+      uint32_t tag, viewport, layer;
+      D3D12_DRAW_ARGUMENTS draw;
+    };
+    args[0].Constant.Num32BitValuesToSet = 3;
+    D3D12_COMMAND_SIGNATURE_DESC indexed_desc{sizeof(IndexedCommand), 2, args, 0};
+    ComPtr<ID3D12CommandSignature> indexed_signature;
+    check(c.device->CreateCommandSignature(&indexed_desc, c.root.Get(), IID_PPV_ARGS(&indexed_signature)),
+          "indexed draw signature");
+    const IndexedCommand indexed_commands[2] = {{0x1181, 1, 1, {3, 1, 0, 0}},
+                                                 {0x1182, 1, 1, {3, 1, 0, 0}}};
+    auto indexed_upload = c.buffer(sizeof(indexed_commands), D3D12_HEAP_TYPE_UPLOAD,
+                                    D3D12_RESOURCE_STATE_GENERIC_READ);
+    check(indexed_upload->Map(0, nullptr, &mapped), "Map(indexed upload)");
+    std::memcpy(mapped, indexed_commands, sizeof(indexed_commands));
+    indexed_upload->Unmap(0, nullptr);
+    Target target(c, 12, 4, 3);
+    auto commands_list = c.begin();
+    target.bind(commands_list.list.Get(), {{0, 0, 4, 4, 0, 1}, {4, 0, 4, 4, 0, 1}, {8, 0, 4, 4, 0, 1}});
+    commands_list.list->SetPipelineState(authored_pso.Get());
+    commands_list.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commands_list.list->ExecuteIndirect(indexed_signature.Get(), 2, indexed_upload.Get(), 0, nullptr, 0);
+    c.execute(commands_list);
+    compare("execute_indirect_adds_authored_indices_and_clamps", target, [&](UINT slice, UINT x, UINT) {
+      return slice == 2 && x / 4 == 2 ? viewTexel(0x1182, 1, 0, 0)
+             : slice == 0 && x / 4 == 0 ? viewTexel(0x1182, 1, 1, 1) : kUntouched;
+    });
+  }
+}
+
+// Full-width shader indices isolate UINT32 addition on each axis. No GS, tessellation, or MSAA:
+// these draws take the native ICB VS epilogue, rather than a replay lowering.
+void testIndirectFullWidthIndices(Context &c) {
+  D3D12_INDIRECT_ARGUMENT_DESC plain_argument{};
+  plain_argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+  D3D12_COMMAND_SIGNATURE_DESC plain_desc{sizeof(D3D12_DRAW_ARGUMENTS), 1, &plain_argument, 0};
+  ComPtr<ID3D12CommandSignature> plain_signature;
+  check(c.device->CreateCommandSignature(&plain_desc, nullptr, IID_PPV_ARGS(&plain_signature)),
+        "full-width draw signature");
+  const D3D12_DRAW_ARGUMENTS plain_draw{3, 1, 0, 0};
+  auto plain_upload = c.buffer(sizeof(plain_draw), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+  void *mapped = nullptr;
+  check(plain_upload->Map(0, nullptr, &mapped), "Map(full-width draw)");
+  std::memcpy(mapped, &plain_draw, sizeof(plain_draw));
+  plain_upload->Unmap(0, nullptr);
+  struct IndexCase {
+    const char *name;
+    uint32_t authored;
+    UINT expected;
+  };
+  const IndexCase index_cases[2][3] = {
+    {{"execute_indirect_viewport_uint32_wrap", 0xffffffffu, 1},
+     {"execute_indirect_viewport_uint32_valid", 1, 3},
+     {"execute_indirect_viewport_uint32_oob", 2, 0}},
+    {{"execute_indirect_layer_uint32_wrap", 0xffffffffu, 1},
+     {"execute_indirect_layer_uint32_valid", 1, 3},
+     {"execute_indirect_layer_uint32_oob", 2, 0}},
+  };
+  for (unsigned axis = 0; axis < 2; ++axis) {
+    PsoDesc authored;
+    authored.locations = {{axis == 0 ? 2u : 0u, axis == 1 ? 2u : 0u}};
+    authored.authored_indices = true;
+    auto authored_pso = c.pso(authored);
+    for (const auto &test : index_cases[axis]) {
+      Target target(c, 16, 4, 4);
+      auto commands_list = c.begin();
+      target.bind(commands_list.list.Get(), {{0, 0, 4, 4, 0, 1}, {4, 0, 4, 4, 0, 1},
+                                            {8, 0, 4, 4, 0, 1}, {12, 0, 4, 4, 0, 1}});
+      commands_list.list->SetPipelineState(authored_pso.Get());
+      commands_list.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      const uint32_t constants[] = {0xa1, axis == 0 ? test.authored : 0, axis == 1 ? test.authored : 0};
+      commands_list.list->SetGraphicsRoot32BitConstants(0, 3, constants, 0);
+      commands_list.list->ExecuteIndirect(plain_signature.Get(), 1, plain_upload.Get(), 0, nullptr, 0);
+      c.execute(commands_list);
+      compare(test.name, target, [&](UINT slice, UINT x, UINT) {
+        const UINT viewport = axis == 0 ? test.expected : 0;
+        const UINT layer = axis == 1 ? test.expected : 0;
+        return slice == layer && x / 4 == viewport ? viewTexel(0xa1, 1, 0, 0) : kUntouched;
+      });
+    }
+  }
 }
 
 /* Bundles do not inherit the caller's view instance mask (it starts at 0), and a mask set in a bundle leaks back
@@ -687,7 +828,7 @@ int run() {
   check(c.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.fence)), "fence");
   D3D12_ROOT_PARAMETER parameter{};
   parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  parameter.Constants = {0, 0, 1};
+  parameter.Constants = {0, 0, 3};
   parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC rd{1, &parameter, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
   ComPtr<ID3DBlob> bytes, errors;
@@ -707,6 +848,7 @@ int run() {
   testNoViewInstancing(c);
   testMultisample(c);
   testExecuteIndirect(c);
+  testIndirectFullWidthIndices(c);
   testBundles(c);
   testPipelineStatistics(c);
   testInvalid(c);

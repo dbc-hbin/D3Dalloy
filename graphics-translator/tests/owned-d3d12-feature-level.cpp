@@ -8,6 +8,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -206,6 +207,190 @@ uint32_t packTexel(const UintFormat &f, const uint32_t value[4]) {
   return texel;
 }
 
+// Framebuffer fetch is sample-rate, but a pixel-frequency application's UAV effects/statistics must not be.
+// Mixed non-UINT MRTs bypass the op, and late depth failure/discard must leave the stored destination intact.
+void testLogicRasterEdges(Context &c) {
+  const char *source = R"(
+    RWStructuredBuffer<uint> records : register(u2);
+    float4 vs(uint id : SV_VertexID) : SV_Position {
+      float2 p = float2((id << 1) & 2, id & 2);
+      return float4(p * float2(2,-2) + float2(-1,1), 0, 1);
+    }
+    struct Output { uint4 a : SV_Target0; float4 b : SV_Target1; float z : SV_Depth; };
+    Output body(float4 p) {
+      InterlockedAdd(records[uint(p.y)*4 + uint(p.x)], 1);
+      if (uint(p.x) == 3) discard;
+      Output o; o.a = uint4(202,60,15,1); o.b = float4(0.25,0.5,0.75,1); o.z = 0.25; return o;
+    }
+    Output ps(float4 p : SV_Position) { return body(p); }
+    Output psSample(float4 p : SV_Position, uint sample : SV_SampleIndex) {
+      Output o = body(p); o.a.x += sample; return o;
+    }
+  )";
+  auto vs = shader(source, "vs", "vs_5_0");
+  auto ps = shader(source, "ps", "ps_5_0");
+  auto ps_sample = shader(source, "psSample", "ps_5_0");
+  D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0};
+  D3D12_ROOT_PARAMETER parameters[2]{};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameters[0].Descriptor.ShaderRegister = 2;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[1].DescriptorTable = {1, &range};
+  auto root = c.root({2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE});
+  struct Case { UINT samples; bool sample_frequency; };
+  const Case cases[] = {{1, false}, {4, false}, {4, true}};
+  const UINT write_masks[] = {D3D12_COLOR_WRITE_ENABLE_ALL,
+                              D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_BLUE, 0};
+  UINT checked_cases = 0;
+  for (const auto &current : cases) {
+    const std::string compute_source = std::string(current.samples == 1 ? "#define SINGLE 1\n" : "") + R"(
+      RWStructuredBuffer<uint> records : register(u2);
+      #ifdef SINGLE
+      Texture2D<uint4> color : register(t0); Texture2D<float4> mixed : register(t1);
+      Texture2D<float> depth : register(t2);
+      #else
+      Texture2DMS<uint4,4> color : register(t0); Texture2DMS<float4,4> mixed : register(t1);
+      Texture2DMS<float,4> depth : register(t2);
+      #endif
+      [numthreads(16,1,1)] void cs(uint id : SV_DispatchThreadID) {
+        uint2 p = uint2(id%4,id/4);
+        #ifdef SINGLE
+        uint4 a = color.Load(int3(p,0)); float4 b = mixed.Load(int3(p,0)); float z = depth.Load(int3(p,0));
+        uint o = 16 + id*9;
+        [unroll] for(uint i=0;i<4;i++) { records[o+i]=a[i]; records[o+4+i]=asuint(b[i]); }
+        records[o+8]=asuint(z);
+        #else
+        [unroll] for(uint s=0;s<4;s++) {
+          uint4 a=color.Load(p,s); float4 b=mixed.Load(p,s); float z=depth.Load(p,s);
+          uint o=16+(id*4+s)*9;
+          [unroll] for(uint i=0;i<4;i++) { records[o+i]=a[i]; records[o+4+i]=asuint(b[i]); }
+          records[o+8]=asuint(z);
+        }
+        #endif
+      }
+    )";
+    auto cs = shader(compute_source.c_str(), "cs", "cs_5_0");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC compute_desc{};
+    compute_desc.pRootSignature = root.Get(); compute_desc.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+    ComPtr<ID3D12PipelineState> compute;
+    check(c.device->CreateComputePipelineState(&compute_desc, IID_PPV_ARGS(&compute)), "logic dump PSO");
+    for (auto mask : write_masks) {
+      auto color = texture(c.device.Get(), DXGI_FORMAT_R10G10B10A2_UINT, 4, 4, current.samples,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      auto mixed = texture(c.device.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, current.samples,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      auto depth = texture(c.device.Get(), DXGI_FORMAT_R32_TYPELESS, 4, 4, current.samples,
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+      ComPtr<ID3D12DescriptorHeap> rtvs, dsvs, srvs;
+      D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+      check(c.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtvs)), "logic MRT heap");
+      auto rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
+      auto rtv1 = rtv; rtv1.ptr += c.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+      c.device->CreateRenderTargetView(color.Get(), nullptr, rtv);
+      c.device->CreateRenderTargetView(mixed.Get(), nullptr, rtv1);
+      heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV; heap.NumDescriptors = 1;
+      check(c.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&dsvs)), "logic depth heap");
+      auto dsv = dsvs->GetCPUDescriptorHandleForHeapStart();
+      D3D12_DEPTH_STENCIL_VIEW_DESC depth_view{}; depth_view.Format = DXGI_FORMAT_D32_FLOAT;
+      depth_view.ViewDimension = current.samples == 1 ? D3D12_DSV_DIMENSION_TEXTURE2D : D3D12_DSV_DIMENSION_TEXTURE2DMS;
+      c.device->CreateDepthStencilView(depth.Get(), &depth_view, dsv);
+      heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap.NumDescriptors = 3;
+      heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+      check(c.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&srvs)), "logic sample dump heap");
+      const UINT srv_stride = c.device->GetDescriptorHandleIncrementSize(heap.Type);
+      ID3D12Resource *resources[] = {color.Get(), mixed.Get(), depth.Get()};
+      const DXGI_FORMAT formats[] = {DXGI_FORMAT_R10G10B10A2_UINT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT};
+      auto srv = srvs->GetCPUDescriptorHandleForHeapStart();
+      for (UINT i = 0; i < 3; ++i, srv.ptr += srv_stride) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{}; view.Format = formats[i];
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.ViewDimension = current.samples == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D : D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        if (current.samples == 1) view.Texture2D.MipLevels = 1;
+        c.device->CreateShaderResourceView(resources[i], &view, srv);
+      }
+      const UINT bytes = (16 + 16*current.samples*9)*4;
+      auto records = buffer(c.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+      auto zero = buffer(c.device.Get(), bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+      void *mapped = nullptr; check(zero->Map(0, nullptr, &mapped), "logic zero map");
+      std::memset(mapped, 0, bytes); zero->Unmap(0, nullptr);
+      auto results = buffer(c.device.Get(), bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+      D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 1, 0};
+      ComPtr<ID3D12QueryHeap> statistics;
+      check(c.device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&statistics)), "logic stats heap");
+      auto stats_result = buffer(c.device.Get(), sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS),
+        D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+      auto desc = basePso(root.Get(), vs.Get(), current.sample_frequency ? ps_sample.Get() : ps.Get());
+      desc.NumRenderTargets = 2; desc.RTVFormats[0] = formats[0]; desc.RTVFormats[1] = formats[1];
+      desc.DSVFormat = DXGI_FORMAT_D32_FLOAT; desc.SampleDesc.Count = current.samples; desc.SampleMask = 0x5;
+      desc.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
+      desc.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+      desc.BlendState.RenderTarget[0].RenderTargetWriteMask = mask;
+      desc.DepthStencilState.DepthEnable = TRUE; desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+      desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+      ComPtr<ID3D12PipelineState> pipeline;
+      check(c.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "logic sideeffect PSO");
+      auto list = c.begin(pipeline.Get());
+      list.list->CopyBufferRegion(records.Get(), 0, zero.Get(), 0, bytes);
+      transition(list.list.Get(), records.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      list.list->SetGraphicsRootSignature(root.Get());
+      list.list->SetGraphicsRootUnorderedAccessView(0, records->GetGPUVirtualAddress());
+      list.list->OMSetRenderTargets(2, &rtv, TRUE, &dsv);
+      const float destination[] = {166,90,63,1}, clear[] = {0,0,0,0};
+      list.list->ClearRenderTargetView(rtv, destination, 0, nullptr);
+      list.list->ClearRenderTargetView(rtv1, clear, 0, nullptr);
+      list.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1, 0, 0, nullptr);
+      D3D12_VIEWPORT viewport{0,0,4,4,0,1}; D3D12_RECT scissor{0,0,4,4};
+      list.list->RSSetViewports(1, &viewport); list.list->RSSetScissorRects(1, &scissor);
+      list.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      list.list->BeginQuery(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+      // Shader-depth forces late testing: both draws execute UAV writes, only the first passes LESS.
+      list.list->DrawInstanced(3,1,0,0); list.list->DrawInstanced(3,1,0,0);
+      list.list->EndQuery(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+      list.list->ResolveQueryData(statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1, stats_result.Get(), 0);
+      for (UINT i = 0; i < 3; ++i)
+        transition(list.list.Get(), resources[i], i == 2 ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET,
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      D3D12_RESOURCE_BARRIER uav{}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; uav.UAV.pResource = records.Get();
+      list.list->ResourceBarrier(1, &uav);
+      list.list->SetPipelineState(compute.Get()); list.list->SetComputeRootSignature(root.Get());
+      ID3D12DescriptorHeap *heaps[] = {srvs.Get()}; list.list->SetDescriptorHeaps(1, heaps);
+      list.list->SetComputeRootUnorderedAccessView(0, records->GetGPUVirtualAddress());
+      list.list->SetComputeRootDescriptorTable(1, srvs->GetGPUDescriptorHandleForHeapStart());
+      list.list->Dispatch(1,1,1);
+      transition(list.list.Get(), records.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list.list->CopyBufferRegion(results.Get(), 0, records.Get(), 0, bytes); c.execute(list);
+      auto image = readback(results.Get(), bytes);
+      std::vector<uint32_t> words(bytes/4); std::memcpy(words.data(), image.data(), bytes);
+      const UINT invocations = current.sample_frequency ? 4 : 2;
+      const uint32_t s[] = {202,60,15,1}, d[] = {166,90,63,1};
+      const float normalized[] = {64/255.0f,128/255.0f,191/255.0f,1};
+      for (UINT p = 0; p < 16; ++p) {
+        if (words[p] != invocations) fail("logic UAV invocation multiplicity");
+        for (UINT sample = 0; sample < current.samples; ++sample) {
+          const bool covered = p%4 != 3 && (0x5 & (1u << sample));
+          const UINT offset = 16 + (p*current.samples + sample)*9;
+          for (UINT ch = 0; ch < 4; ++ch) {
+            const bool written = covered && (mask & (1u << ch));
+            const uint32_t value = s[ch] + (current.sample_frequency && ch == 0 ? sample : 0);
+            if (words[offset+ch] != (written ? value^d[ch] : d[ch])) fail("logic per-sample UINT result");
+            float got; std::memcpy(&got, &words[offset+4+ch], 4);
+            const float want = written ? normalized[ch] : 0;
+            if (std::abs(got-want) > 0.000001f) fail("logic mixed MRT quantization/write mask");
+          }
+          float got_depth; std::memcpy(&got_depth, &words[offset+8], 4);
+          if (got_depth != (covered ? 0.25f : 1.0f)) fail("logic discard/late depth/sample mask");
+        }
+      }
+      auto stats_bytes = readback(stats_result.Get(), sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
+      D3D12_QUERY_DATA_PIPELINE_STATISTICS stats{}; std::memcpy(&stats, stats_bytes.data(), sizeof(stats));
+      if (stats.PSInvocations != 16*invocations) fail("logic application PS statistics");
+      ++checked_cases;
+    }
+  }
+  std::printf("OWNED_D3D12_FEATURE_LEVEL_LOGIC_RASTER_EDGES cases=%u late_depth=1 discard=1 mixed_mrt=1 uav_stats=exact\n", checked_cases);
+}
+
 void testLogicOps(Context &c) {
   const char *source = R"(
     cbuffer Values : register(b0) { uint4 source_value; uint4 dest_value; };
@@ -370,6 +555,7 @@ void testLogicOps(Context &c) {
   desc.BlendState.IndependentBlendEnable = FALSE;
   desc.BlendState.RenderTarget[0].LogicOp = static_cast<D3D12_LOGIC_OP>(16);
   expect(c.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&rejected)), E_INVALIDARG, "logic op range");
+  testLogicRasterEdges(c);
   passed("logic_ops_16_uint_formats_7_mrt_and_rejections");
 }
 

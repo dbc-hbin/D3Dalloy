@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
@@ -368,6 +370,7 @@ struct ShaderMetadata {
   uint32_t max_output_register = 0;
   bool has_coverage_output = false;
   bool force_early_depth_stencil = false;
+  bool has_atomic64 = false;
   std::vector<SigElement> input_sig;
   std::vector<SigElement> output_sig;
   std::vector<SigElement> patch_constant_sig;
@@ -593,6 +596,28 @@ inline constexpr uint32_t kDxilRangedWaveSizeTag = 23;
  * creates it on first use; LowerImmutableConstants turns it into a runtime relocation.
  */
 inline constexpr const char *kAtomicLockTableGlobal = "dxmt.atomic64_lock_table";
+inline constexpr const char *kAtomic64ContextGlobal = "dxmt.atomic64.context";
+inline constexpr const char *kAtomic64PhaseFlag = "dxmt.atomic64.phase";
+inline constexpr const char *kAtomic64Metadata = "dxmt.atomic64.metadata";
+
+/** Only instantiated in the D3D12 atomic-phase compiler variant. Metadata
+ * operations protect helper reads; application writes remain logically guarded. */
+llvm::Value *EmitAtomic64Context(llvm::IRBuilderBase &builder);
+llvm::Value *EmitAtomic64CellRead(llvm::IRBuilderBase &builder, llvm::Value *root);
+llvm::Value *EmitAtomic64CellUpdate(
+  llvm::IRBuilderBase &builder, llvm::Value *root,
+  llvm::function_ref<llvm::Value *(llvm::Value *old)> update
+);
+llvm::Error LowerAtomic64Phase(llvm::Module &module);
+void InitializeAtomic64Phase(llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *arguments);
+bool HasDeviceAtomic64(const llvm::Module &module);
+
+/** Cooperative returning i64 RMW for device or threadgroup storage. Graphics
+ * device atomics still require a separate progress-safe resource protocol. */
+llvm::Value *EmitLockedAtomic64(
+  llvm::IRBuilder<> &builder, llvm::Value *pointer,
+  llvm::function_ref<llvm::Value *(llvm::Value *old)> update
+);
 
 /**
  * Drop the DXIL scaffolding (debug info, `dx.*` metadata, the original entry point
@@ -603,6 +628,10 @@ void StripDXILArtifacts(llvm::Module &module);
 
 /** Lower the remaining `dx.op` operations on the (already staged) module. */
 llvm::Error LowerOperations(llvm::Module &module);
+/** Replace all binary64 LLVM values and operations by exact integer software semantics. */
+llvm::Error LowerFP64(llvm::Module &module);
+/** Scalarize SM6.9 vectors and legalize long-vector storage for AIR. */
+llvm::Error LowerVectors(llvm::Module &module, bool final);
 
 /** Reject a module that still contains `dx.op` calls or non-lowerable instructions. */
 llvm::Error VerifyLoweredModule(llvm::Module &module);

@@ -21,6 +21,8 @@
 #include "Metal4.hpp"
 #include "Metal4Pipeline.hpp"
 #include "d3d12_interfaces_ext.hpp"
+#include "d3d12_reflex.hpp"
+#include "d3d12_diagnostics.hpp"
 #include "d3d12_acceleration_structure.hpp"
 #include "d3d12_command_encoder.hpp"
 #include "d3d12_descriptor_heap.hpp"
@@ -29,6 +31,7 @@
 #include "d3d12_sampler_feedback.hpp"
 #include "d3d12_standard_swizzle.hpp"
 #include "d3d12_sharing.hpp"
+#include "d3d12_shader_cache.hpp"
 #include "dxgi1_2.h"
 #include "dxgi_interfaces.h"
 #include "airconv_public.h"
@@ -150,14 +153,12 @@ struct BarrierTracker {
 inline constexpr D3D_FEATURE_LEVEL kOwnedMaxFeatureLevel = D3D_FEATURE_LEVEL_12_1;
 /* Highest DXIL shader model the owned compiler accepts (SM50_MAX_DXIL_SHADER_MODEL). */
 inline constexpr D3D_SHADER_MODEL kOwnedMaxShaderModel = static_cast<D3D_SHADER_MODEL>(SM50_MAX_DXIL_SHADER_MODEL);
-/* Intentionally lower than kOwnedMaxShaderModel: SM 6.6 requires 64 bit atomics in every
- * stage and Apple GPUs give a graphics-stage lock no forward-progress guarantee (the
- * emulation is compute-only). Every non-cap-gated SM 6.1-6.5 requirement (SV_ViewID,
- * fp32 denorm modes, dot4add, WaveMatch/MultiPrefix, DXIL GS/HS/DS) is GPU verified by
- * the sm6/view-instancing/geometry/tessellation suites; unreported cap-gated features fail PSO creation. */
+/* The advertised baseline remains SM 6.5. Newer optional features have independent
+ * capability reports and compile up to kOwnedMaxShaderModel; their focused GPU evidence
+ * does not establish every mandatory contract of a newer shader model. */
 inline constexpr D3D_SHADER_MODEL kOwnedReportedShaderModel = D3D_SHADER_MODEL_6_5;
 
-class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList10 {
+class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandListPreview {
 public:
   const uint64_t owned_id = owned_graphics::NewObjectId();
   uint64_t owned_recording = 0;
@@ -167,6 +168,7 @@ public:
   EncoderData *entry;
   size_t encoder_count;
   bool owned_closed_valid = true;
+
   std::vector<owned_graphics::BundleReference> owned_bundle_references;
 };
 
@@ -178,7 +180,7 @@ public:
   ) = 0;
 };
 
-class MTLD3D12CommandQueue : public ID3D12CommandQueue {
+class MTLD3D12CommandQueue : public ID3D12CommandQueue1 {
 public:
   virtual HRESULT Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable,
                           double after, const DXMTPresentGeometry &geometry,
@@ -210,10 +212,13 @@ public:
 
   const uint64_t owned_id = owned_graphics::NewObjectId();
   D3D12_RESOURCE_STATES owned_initial_state = D3D12_RESOURCE_STATE_COMMON;
+  bool owned_is_reserved = false;
   // Set by the ID3D12Device10 creation methods: the resource was created with an initial layout.
   std::optional<D3D12_BARRIER_LAYOUT> owned_initial_layout;
   // Formats a view may reinterpret this texture as (ID3D12Device10 castable format list).
   std::vector<DXGI_FORMAT> owned_castable_formats;
+  HRESULT PublishOwnedFormatCasting();
+  HRESULT ImportOwnedFormatCasting(MTLD3D12Device *device,const D3D12_RESOURCE_DESC &desc);
   std::shared_ptr<BarrierTracker> owned_barrier_state;
   Rc<Texture> texture;
   Rc<Buffer> buffer;
@@ -292,10 +297,38 @@ public:
     uint64_t offset;
     uint32_t count;
     D3D12_DESCRIPTOR_RANGE_TYPE type;
+    uint32_t register_space;
+    uint32_t register_lower_bound;
+    D3D12_SHADER_VISIBILITY visibility;
   };
 
   virtual UINT GetBlob(const void **ppBlob) = 0;
   virtual std::span<const TableRange> GetTableRanges(UINT root_parameter) const = 0;
+  virtual const TableRange *GetRootDescriptorRange(UINT root_parameter) const = 0;
+
+  // Enumerate only shader-used register/space intervals, never unrelated root
+  // ranges. The caller clips the intervals to the actual descriptor heap.
+  template <typename Emit>
+  static void ForEachUsedDescriptorRange(std::span<const TableRange> ranges,
+      std::span<const MTL_SM50_SHADER_ARGUMENT> bindings, Emit &&emit) {
+    for (const auto &range : ranges) {
+      for (const auto &binding : bindings) {
+        const bool kind_matches =
+            (range.type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV && binding.Type == SM50BindingType::ConstantBuffer) ||
+            (range.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && binding.Type == SM50BindingType::SRV) ||
+            (range.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV && binding.Type == SM50BindingType::UAV);
+        if (!kind_matches || binding.RegisterSpace != range.register_space || !binding.RegisterCount ||
+            !(binding.Flags & (MTL_SM50_SHADER_ARGUMENT_READ_ACCESS | MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS)) ||
+            (range.visibility != D3D12_SHADER_VISIBILITY_ALL &&
+             !(binding.ShaderVisibilityMask & (1u << range.visibility)))) continue;
+        const uint64_t first = std::max<uint64_t>(range.register_lower_bound, binding.RegisterLowerBound);
+        const uint64_t end = std::min(
+            range.count == UINT32_MAX ? uint64_t(1) << 32 : uint64_t(range.register_lower_bound) + range.count,
+            binding.RegisterCount == UINT32_MAX ? uint64_t(1) << 32 : uint64_t(binding.RegisterLowerBound) + binding.RegisterCount);
+        if (first < end) emit(range.offset + first - range.register_lower_bound, end - first, range.type);
+      }
+    }
+  }
 
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
@@ -352,6 +385,7 @@ public:
   UINT ByteStride;
   UINT DrawArgumentOffset = ~0u;
   UINT IndexBufferArgumentOffset = ~0u;
+  std::vector<Atomic64IndirectRootField> atomic64_root_fields;
   uint64_t RootParameterMask;
   uint32_t VertexBufferMask;
   UINT UpdateRootArguments : 1;
@@ -408,11 +442,13 @@ struct ShaderImmutableConstants {
 class MTLD3D12PipelineState : public ID3D12PipelineState {
 public:
   UINT IsComputePipelineState;
+  bool uses_atomic64 = false;
+  std::vector<MTL_SM50_SHADER_ARGUMENT> resource_bindings;
 
   static HRESULT
   InitializeShader(
       const char *Stage, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader,
-      struct MTL_SHADER_REFLECTION *pRefl
+      struct MTL_SHADER_REFLECTION *pRefl, std::vector<MTL_SM50_SHADER_ARGUMENT> *resource_bindings = nullptr
   );
 };
 
@@ -473,6 +509,7 @@ struct MSAAPipelineVariants {
   WMT::Reference<WMT::RenderPipelineState> coverage_with_depth;
   WMT::Reference<WMT::RenderPipelineState> clear_coverage;
   WMT::Reference<WMT::RenderPipelineState> gather_depth;
+  WMT::Reference<WMT::ComputePipelineState> depth_bounds_probe;
   WMT::Reference<WMT::RenderPipelineState> early_depth;
   WMT::Reference<WMT::RenderPipelineState> late_depth;
   WMT::Reference<WMT::RenderPipelineState> sample_pixel;
@@ -601,6 +638,9 @@ public:
   /* D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON: every draw runs the exact captured-pixel path with conservative
    * replay geometry and per-pixel coverage (SM50_SHADER_D3D12_CONSERVATIVE_RASTER). */
   bool owned_conservative = false;
+  bool owned_depth_bounds = false;
+  bool emulated_depth_bounds = false;
+  WMT::Reference<WMT::DepthStencilState> depth_bounds_reject_state;
   bool needs_rov_buffer_marker = false;
   // D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS / _DYNAMIC_INDEX_BUFFER_STRIP_CUT: the command list
   // may override depth bias / strip cut after SetPipelineState (ID3D12GraphicsCommandList9).
@@ -639,7 +679,7 @@ public:
     // Metal cannot carry natively, even on a single-sample target, and is
     // the only conservative rasterizer (native MSAA would shade per sample).
     return EffectiveRasterSampleCount() > 1 || owned_distance_interpolation || ForcedSampleReplay() ||
-           owned_conservative || owned_mesh_output_replay;
+           owned_conservative || owned_mesh_output_replay || uses_atomic64 || emulated_depth_bounds;
   }
   /* Target-independent rasterization with RTVs: the forced raster pattern differs from the RTV sample count
    * (ForcedSampleCount > 1 on 1x RTVs, or ForcedSampleCount 1 on multisampled RTVs). The PS output is replayed
@@ -699,9 +739,95 @@ struct RTASState {
  */
 using RTASLifetime = owned_graphics::RTASLifetime<raytracing::ArenaKey, RTASState, RTASKeyHash>;
 
+// Tickets are released by GPU retirement, potentially on a different CPU thread.
+// A shared_mutex lock is therefore not a suitable submission lifetime token.
+class GPUExecutionGate {
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  uint64_t readers_ = 0, writers_waiting_ = 0;
+  bool exclusive_ = false, cancelled_ = false;
 
+public:
+  class EncodingAdmission {
+    GPUExecutionGate *gate_;
+    EncodingAdmission *previous_;
+    inline static thread_local EncodingAdmission *current_ = nullptr;
+    friend class GPUExecutionGate;
+  public:
+    explicit EncodingAdmission(GPUExecutionGate &gate) : gate_(&gate), previous_(current_) { current_ = this; }
+    EncodingAdmission(const EncodingAdmission &) = delete;
+    EncodingAdmission &operator=(const EncodingAdmission &) = delete;
+    ~EncodingAdmission() { current_ = previous_; }
+  };
+  bool CurrentThreadAdmitted() const {
+    for (auto *scope = EncodingAdmission::current_; scope; scope = scope->previous_)
+      if (scope->gate_ == this) return true;
+    return false;
+  }
+  class Ticket {
+    GPUExecutionGate *gate_ = nullptr;
+    bool exclusive_ = false;
+    friend class GPUExecutionGate;
+    Ticket(GPUExecutionGate *gate, bool exclusive) : gate_(gate), exclusive_(exclusive) {}
+
+  public:
+    Ticket() = default;
+    Ticket(const Ticket &) = delete;
+    Ticket &operator=(const Ticket &) = delete;
+    Ticket(Ticket &&other) noexcept : gate_(std::exchange(other.gate_, nullptr)), exclusive_(other.exclusive_) {}
+    Ticket &operator=(Ticket &&other) noexcept {
+      if (this != &other) {
+        Reset();
+        gate_ = std::exchange(other.gate_, nullptr);
+        exclusive_ = other.exclusive_;
+      }
+      return *this;
+    }
+    ~Ticket() { Reset(); }
+    explicit operator bool() const { return gate_ != nullptr; }
+    void Reset() {
+      auto *gate = std::exchange(gate_, nullptr);
+      if (!gate) return;
+      {
+        std::lock_guard lock(gate->mutex_);
+        if (exclusive_) gate->exclusive_ = false;
+        else --gate->readers_;
+      }
+      gate->changed_.notify_all();
+    }
+  };
+
+  Ticket AcquireShared() {
+    std::unique_lock lock(mutex_);
+    changed_.wait(lock, [&] { return cancelled_ || (!exclusive_ && !writers_waiting_); });
+    if (cancelled_) return {};
+    ++readers_;
+    return Ticket(this, false);
+  }
+  Ticket AcquireExclusive() {
+    std::unique_lock lock(mutex_);
+    ++writers_waiting_;
+    changed_.wait(lock, [&] { return cancelled_ || (!exclusive_ && !readers_); });
+    --writers_waiting_;
+    if (cancelled_) return {};
+    exclusive_ = true;
+    return Ticket(this, true);
+  }
+  void Cancel() {
+    { std::lock_guard lock(mutex_); cancelled_ = true; }
+    changed_.notify_all();
+  }
+};
+
+struct Atomic64PhasePipelines;
 class MTLD3D12Device : public ID3D12Device14 {
 public:
+  RuntimeConfiguration runtime_configuration;
+  bool independent_device = false;
+  DeviceDiagnostics diagnostics{this};
+  ReflexState reflex;
+  GPUExecutionGate gpu_execution_gate;
+  std::shared_ptr<Atomic64PhasePipelines> atomic64_phase_pipelines;
   virtual HRESULT RemovedReason() const = 0;
   virtual void ReportRemoval(HRESULT reason) = 0;
   virtual bool RegisterFenceOrder(const std::shared_ptr<owned_graphics::FenceOrderEpoch> &order) = 0;
@@ -715,9 +841,17 @@ public:
   virtual HRESULT GetAdapter(REFIID riid, void **ppAdapter) = 0;
 
   virtual WMT::ResidencySet GetGlobalResidencySet() = 0;
+  // Serialize the native borrowed residency snapshot with allocation removal.
+  // This returns before GPU retirement; callers must wait outside the lock.
+  virtual WMT::Reference<WMT::MTL4Submission> CommitMetal4CommandBuffers(
+      WMT::MTL4CommandQueue queue, const WMT::MTL4CommandBuffer *buffers, uint64_t count) = 0;
 
   /* Placement sparse tile mappings are applied through this Metal 4 queue (created on first use). */
   virtual WMT::MTL4CommandQueue GetSparseMappingQueue() = 0;
+  // Called under ReservedResource::MappingQueueMutex, after the corresponding native mappings.
+  virtual HRESULT PublishSparseVolumeResidency(WMT::Buffer status,
+      std::span<const std::pair<uint32_t, ReservedTileTarget>> assignments) = 0;
+  virtual HRESULT CompleteSparseVolumeResidency() = 0;
 
   /**
    * GPU address of the device-global 64 bit atomic lock table
@@ -725,6 +859,8 @@ public:
    * residency set for the device lifetime), or 0 when it could not be allocated.
    */
   virtual uint64_t GetAtomicLockTableAddress() = 0;
+  virtual uint64_t GetAtomic64ContextAddress() = 0;
+  virtual WMT::Buffer GetAtomic64ContextBuffer() = 0;
 
   virtual HRESULT RegisterResidency(
       WMT::Allocation allocation, MTLD3D12PageableResidency *owner = nullptr, bool initially_resident = true
@@ -736,8 +872,9 @@ public:
   virtual HRESULT UnregisterSwizzleShadowResidency(
       WMT::Allocation allocation, MTLD3D12PageableResidency *owner
   ) = 0;
-  virtual HRESULT RegisterStandardSwizzleTexture(Texture *texture, MTLD3D12Resource *resource) = 0;
-  virtual void UnregisterStandardSwizzleTexture(Texture *texture) = 0;
+  virtual HRESULT RegisterDescriptorResource(MTLD3D12Resource *resource) = 0;
+  virtual void UnregisterDescriptorResource(MTLD3D12Resource *resource) = 0;
+  virtual Com<MTLD3D12Resource, false> LookupDescriptorResource(const void *backing, uint64_t owner_id = 0) = 0;
   virtual Com<MTLD3D12Resource, false> LookupStandardSwizzleTexture(Texture *texture) = 0;
   virtual bool HasStandardSwizzleTextures() const = 0;
 
@@ -838,6 +975,11 @@ struct DXMTPresentHistory {
 };
 
 struct DXMTPresentComposition {
+  // CPU-only native presentation snapshot; never part of GPU shader constants.
+  WMT::Reference<WMT::Object> surface;
+  WMTCompositionFrame frame{};
+  uint32_t sync_interval = 0;
+  bool allow_tearing = false;
   std::shared_ptr<DXMTPresentHistory> history;
   UINT write_index = 0;
   bool has_previous = false;
@@ -849,7 +991,8 @@ struct DXMTPresentComposition {
   bool full = true;
 };
 
-HRESULT CreateD3D12Device(IMTLDXGIAdapter *adapter, REFIID riid, void **ppDevice);
+HRESULT CreateD3D12Device(IMTLDXGIAdapter *adapter, REFIID riid, void **ppDevice,
+                         const RuntimeConfiguration &configuration, bool independent);
 
 HRESULT
 CreateCommandQueue(MTLD3D12Device *pDevice, const D3D12_COMMAND_QUEUE_DESC *pDesc, REFIID riid, void **ppCommandQueue);
@@ -951,12 +1094,13 @@ CreateCommandSignature(
 );
 
 /*
- * Pipeline state stream fields the classic D3D12_GRAPHICS_PIPELINE_STATE_DESC cannot carry: a
- * fractional DepthBias (D3D12_RASTERIZER_DESC1/2) and distinct back-face stencil masks
+ * Pipeline state stream fields the classic D3D12_GRAPHICS_PIPELINE_STATE_DESC cannot carry:
+ * depth bounds, fractional DepthBias (D3D12_RASTERIZER_DESC1/2) and distinct back-face stencil masks
  * (D3D12_DEPTH_STENCIL_DESC2). Only set when they differ from what the classic desc holds, so
  * equivalent descriptions share a pipeline cache key.
  */
 struct GraphicsPipelineExtras {
+  bool depth_bounds = false;
   std::optional<float> depth_bias;
   std::optional<std::pair<UINT8, UINT8>> back_stencil_read_write_mask;
   std::optional<ViewInstancingState> view_instancing;
@@ -966,7 +1110,7 @@ struct GraphicsPipelineExtras {
   D3D12_SHADER_BYTECODE ms{};
   bool
   empty() const {
-    return !depth_bias && !back_stencil_read_write_mask && !view_instancing && !ms.pShaderBytecode;
+    return !depth_bounds && !depth_bias && !back_stencil_read_write_mask && !view_instancing && !ms.pShaderBytecode;
   }
 };
 
@@ -985,7 +1129,7 @@ HRESULT
 CreateSwapChain(
     IDXGIFactory1 *pFactory, MTLD3D12Device *pDevice, MTLD3D12CommandQueue *pQueue, HWND hWnd,
     const DXGI_SWAP_CHAIN_DESC1 *pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
-    IDXGISwapChain1 **ppSwapChain, IDXGIOutput *pRestrictToOutput
+    IDXGISwapChain1 **ppSwapChain, IDXGIOutput *pRestrictToOutput, IUnknown *core_window, DXMTSwapChainKind kind
 );
 
 HRESULT
@@ -1052,8 +1196,8 @@ GetShaderVisibleDescriptor(MTLD3D12DescriptorHeap *pHeap, UINT Index) {
 inline std::tuple<MTLD3D12SamplerDescriptorHeap *, UINT>
 GetSamplerDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle) {
 #ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
-  EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
-  return {impl.extract<MTLD3D12SamplerDescriptorHeap>(), (UINT)impl.Descriptor};
+  const SIZE_T heap = ((Handle.ptr >> 26) << 9) | ((Handle.ptr & 63) << 3);
+  return {reinterpret_cast<MTLD3D12SamplerDescriptorHeap *>(heap), UINT((Handle.ptr >> 6) & 0xfffff)};
 #else
   auto [heap, index] = ResolveDescriptorHandle(Handle.ptr, DescriptorHandleKind::Sampler);
   return {static_cast<MTLD3D12SamplerDescriptorHeap *>(heap), index};
@@ -1063,7 +1207,9 @@ GetSamplerDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Ha
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetSamplerDescriptor(MTLD3D12SamplerDescriptorHeap *pHeap, UINT Index) {
 #ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
-  return EMBEDDED_DESCRIPTOR_HANDLE(pHeap, Index);
+  // Six stride bits, twenty index bits, thirty-eight heap bits; retain the full CPU heap capacity.
+  const SIZE_T heap = reinterpret_cast<SIZE_T>(pHeap);
+  return {((heap >> 9) << 26) | ((heap >> 3) & 63) | (SIZE_T(Index) << 6)};
 #else
   return {DescriptorHandleOf(pHeap, Index)};
 #endif
@@ -1080,6 +1226,8 @@ bool IsShadingRateImageDesc(const D3D12_RESOURCE_DESC &desc);
 
 HRESULT ValidateResourceDescs(MTLD3D12Device *device, const D3D12_RESOURCE_DESC *pDesc,
                               const D3D12_HEAP_PROPERTIES *pHeapProps);
+HRESULT ValidateCastableFormats(MTLD3D12Device *device,const D3D12_RESOURCE_DESC &desc,UINT32 count,
+                               const DXGI_FORMAT *formats);
 std::optional<standard_swizzle::Layout> MakeStandardSwizzleLayout(
     MTLD3D12Device *device, const D3D12_RESOURCE_DESC &desc
 );
@@ -1113,5 +1261,11 @@ UINT DecomposeSubresource(
 bool IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps);
 
 bool IsD3D12BoxInBounds(D3D12_BOX &box, D3D12_BOX &bounds);
+
+struct ExperimentalDeviceRegistration;
+HRESULT RegisterExperimentalDevice(
+    MTLD3D12Device *device, std::shared_ptr<ExperimentalDeviceRegistration> &registration
+);
+void UnregisterExperimentalDevice(const std::shared_ptr<ExperimentalDeviceRegistration> &registration);
 
 } // namespace dxmt

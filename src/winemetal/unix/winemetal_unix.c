@@ -1,4 +1,7 @@
 #include <stdatomic.h>
+#include <stdbool.h>
+#include <assert.h>
+#include <math.h>
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
@@ -32,6 +35,22 @@ typedef int NTSTATUS;
 #define STATUS_UNSUCCESSFUL 0xC0000001
 #define STATUS_NOT_IMPLEMENTED 0xC0000002
 
+static BOOL composition_release(NSObject *object);
+
+static NTSTATUS _WMTGetGuestWindowBase(void *result) {
+  *(uint64_t *)result = 0;
+#if defined(__aarch64__) && !defined(DXMT_NATIVE)
+  extern NTSTATUS NtQueryInformationProcess(void *, uint32_t, void *, uint32_t, uint32_t *);
+  /* Owned Wine ProcessWineWow64GuestBase returns a native ULONG_PTR. */
+  return NtQueryInformationProcess((void *)~(uintptr_t)0, 1010, result, sizeof(uint64_t), NULL);
+#else
+  return STATUS_SUCCESS;
+#endif
+}
+static void composition_layer_resize(CAMetalLayer *layer);
+static NSView *composition_view_for_layer(CAMetalLayer *layer);
+static id composition_next_drawable(CAMetalLayer *layer);
+
 void
 execute_on_main(dispatch_block_t block) {
   if ([NSThread isMainThread]) {
@@ -49,7 +68,8 @@ _NSObject_retain(NSObject **obj) {
 
 static NTSTATUS
 _NSObject_release(NSObject **obj) {
-  [*obj release];
+  if (!composition_release(*obj))
+    [*obj release];
   return STATUS_SUCCESS;
 }
 
@@ -71,6 +91,86 @@ static NTSTATUS
 _MTLCopyAllDevices(void *obj) {
   struct unixcall_generic_obj_ret *params = obj;
   params->ret = (obj_handle_t)MTLCopyAllDevices();
+  return STATUS_SUCCESS;
+}
+
+@interface WMTDeviceCatalogState : NSObject {
+@public
+  atomic_uint_fast64_t generation;
+}
+@end
+@implementation WMTDeviceCatalogState
+- (instancetype)init {
+  if ((self = [super init]))
+    atomic_init(&generation, 1);
+  return self;
+}
+@end
+
+@interface WMTDeviceCatalogObserver : NSObject {
+@public
+  WMTDeviceCatalogState *state;
+  id token;
+}
+@end
+@implementation WMTDeviceCatalogObserver
+- (instancetype)init {
+  if ((self = [super init])) {
+    state = [[WMTDeviceCatalogState alloc] init];
+    if (!state) {
+      [self release];
+      return nil;
+    }
+    WMTDeviceCatalogState *callback_state = state;
+    NSArray *devices = MTLCopyAllDevicesWithObserver(&token,
+        ^(id<MTLDevice> device, MTLDeviceNotificationName name) {
+          /* A removal request is not an enumeration change yet. */
+          if ([name isEqualToString:MTLDeviceWasAddedNotification] ||
+              [name isEqualToString:MTLDeviceWasRemovedNotification])
+            atomic_fetch_add_explicit(&callback_state->generation, 1, memory_order_release);
+        });
+    [devices release];
+    /* SDK: observer out parameter already carries +1 in addition to
+     * Metal's retain. Release exactly that +1 after removing it. */
+    if (!token) {
+      [self release];
+      return nil;
+    }
+  }
+  return self;
+}
+- (void)dealloc {
+  if (token)
+    MTLRemoveDeviceObserver(token);
+  [token release];
+  /* The copied callback retains state independently, including in-flight
+   * callbacks after removal. It does not capture this observer. */
+  [state release];
+  [super dealloc];
+}
+@end
+
+static NTSTATUS
+_WMTDeviceCatalog_call(void *obj) {
+  struct WMTDeviceCatalogCall *params = obj;
+  params->result = 0;
+  switch (params->operation) {
+  case WMTDeviceCatalogCreate:
+    params->result = (obj_handle_t)[[WMTDeviceCatalogObserver alloc] init];
+    break;
+  case WMTDeviceCatalogGeneration: {
+    WMTDeviceCatalogObserver *observer = (id)params->object;
+    params->result = atomic_load_explicit(&observer->state->generation, memory_order_acquire);
+    break;
+  }
+  case WMTDeviceCatalogHints: {
+    id<MTLDevice> device = (id)params->object;
+    params->result = ([device isLowPower] ? WMTDeviceLowPower : 0) |
+                     ([device isRemovable] ? WMTDeviceRemovable : 0) |
+                     ([device hasUnifiedMemory] ? WMTDeviceUnifiedMemory : 0);
+    break;
+  }
+  }
   return STATUS_SUCCESS;
 }
 
@@ -550,7 +650,7 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetHeight = info->render_target_height;
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
-  if (info->center_sample_pattern) {
+  if (info->center_sample_pattern || info->sample_positions.count) {
     NSUInteger sample_count = info->default_raster_sample_count;
     if (!sample_count) {
       for (unsigned i = 0; i < 8 && !sample_count; i++)
@@ -567,16 +667,29 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
       return STATUS_UNSUCCESSFUL;
     }
     MTLSamplePosition positions[8];
+    if (info->sample_positions.count && info->sample_positions.count != sample_count) {
+      [descriptor release];
+      return STATUS_UNSUCCESSFUL;
+    }
     for (NSUInteger i = 0; i < sample_count; i++)
-      positions[i] = MTLSamplePositionMake(0.5f, 0.5f);
+      positions[i] = info->sample_positions.count
+          ? MTLSamplePositionMake(0.5f + info->sample_positions.positions[i][0] / 16.f,
+                                  0.5f + info->sample_positions.positions[i][1] / 16.f)
+          : MTLSamplePositionMake(0.5f, 0.5f);
     [descriptor setSamplePositions:positions count:sample_count];
+    for (unsigned i = 0; i < 8; ++i)
+      if (descriptor.colorAttachments[i].texture)
+        descriptor.colorAttachments[i].storeActionOptions = MTLStoreActionOptionCustomSamplePositions;
+    if (descriptor.depthAttachment.texture)
+      descriptor.depthAttachment.storeActionOptions = MTLStoreActionOptionCustomSamplePositions;
   }
   if (info->forced16_half) {
     // D3D 16x standard pattern (1/16 pixel from center); probe pos16.m proves the two programmed 8x halves give
     // bit-exact D3D 16x coverage.
     static const int x16[16] = {1, -1, -3, 4, -5, 2, 5, 3, -2, 0, -4, -6, -8, 7, 6, -7};
     static const int y16[16] = {1, -3, 2, -1, -2, 5, 3, -5, 6, -7, -6, 4, 0, -4, 7, -8};
-    if (info->forced16_half > 2 || info->default_raster_sample_count != 8 || info->center_sample_pattern) {
+    if (info->forced16_half > 2 || info->default_raster_sample_count != 8 || info->center_sample_pattern ||
+        info->sample_positions.count) {
       [descriptor release];
       return STATUS_UNSUCCESSFUL;
     }
@@ -1108,6 +1221,11 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder setDepthClipMode:(MTLDepthClipMode)body->depth_clip_mode];
       [encoder setDepthBias:body->depth_bias slopeScale:body->scole_scale clamp:body->depth_bias_clamp];
       [encoder setFrontFacingWinding:(MTLWinding)body->winding];
+      break;
+    }
+    case WMTRenderCommandSetDepthBounds: {
+      const struct wmtcmd_render_setdepthbounds *body = (const struct wmtcmd_render_setdepthbounds *)next;
+      [encoder setDepthTestMinBound:body->min_depth maxBound:body->max_depth];
       break;
     }
     case WMTRenderCommandSetViewports: {
@@ -1790,7 +1908,7 @@ _MetalDrawable_texture(void *obj) {
 static NTSTATUS
 _MetalLayer_nextDrawable(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
-  params->ret = (obj_handle_t)[(CAMetalLayer *)params->handle nextDrawable];
+  params->ret = (obj_handle_t)composition_next_drawable((CAMetalLayer *)params->handle);
   return STATUS_SUCCESS;
 }
 
@@ -1818,9 +1936,13 @@ _MetalLayer_setProps(void *obj) {
     layer.opaque = props->opaque;
     layer.framebufferOnly = props->framebuffer_only;
     layer.contentsScale = props->contents_scale;
-    layer.displaySyncEnabled = props->display_sync_enabled;
+    // Composition sources own their display synchronization: it must stay
+    // enabled from creation so every published drawable reports a real time.
+    if (![layer isKindOfClass:objc_lookUpClass("WMTCompositionMetalLayer")])
+      layer.displaySyncEnabled = props->display_sync_enabled;
     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
     layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
+    composition_layer_resize(layer);
   });
   return STATUS_SUCCESS;
 }
@@ -1868,6 +1990,826 @@ struct macdrv_functions_t {
   void (*macdrv_view_release_metal_view)(macdrv_metal_view v);
   void (*on_main_thread)(dispatch_block_t b);
 };
+_Static_assert(sizeof(struct macdrv_win_data) == 32, "macdrv window-data prefix");
+_Static_assert(offsetof(struct macdrv_win_data, client_cocoa_view) == 24, "macdrv client-view prefix");
+_Static_assert(sizeof(struct macdrv_functions_t) == 80, "macdrv first ten function slots");
+
+
+/* Composition state is AppKit-main-thread owned. The source owns its exported
+ * context/layers; targets own a distinct host and source; the reverse set is weak. */
+@class WMTCompositionTarget;
+@interface WMTCompositionMetalLayer : CAMetalLayer {
+@public
+  CAMetalLayer *paired_layer; /* Borrowed; protected by the owning surface. */
+}
+@end
+@implementation WMTCompositionMetalLayer
+@end
+/* The opaque WMT handle owns an immutable pair. Never pass this envelope to
+ * Metal: queue operations unwrap both real native CAMetalDrawables. */
+@interface WMTCompositionDrawablePair : NSObject {
+@public
+  id<CAMetalDrawable> primary;
+  id<CAMetalDrawable> residual;
+}
+@end
+@implementation WMTCompositionDrawablePair
+- (id<MTLTexture>)texture { return [primary texture]; }
+- (void)dealloc {
+  [primary release];
+  [residual release];
+  [super dealloc];
+}
+@end
+
+void winemetal_composition_drawables(id drawable, id<CAMetalDrawable> *primary, id<CAMetalDrawable> *residual) {
+  if ([drawable isKindOfClass:WMTCompositionDrawablePair.class]) {
+    WMTCompositionDrawablePair *pair = drawable;
+    *primary = pair->primary;
+    *residual = pair->residual;
+  } else { *primary = drawable; *residual = nil; }
+}
+static id composition_next_drawable(CAMetalLayer *layer) {
+  if (![layer isKindOfClass:WMTCompositionMetalLayer.class] ||
+      !((WMTCompositionMetalLayer *)layer)->paired_layer)
+    return [layer nextDrawable];
+  id<CAMetalDrawable> primary = [layer nextDrawable];
+  if (!primary) return nil;
+  id<CAMetalDrawable> residual = [((WMTCompositionMetalLayer *)layer)->paired_layer nextDrawable];
+  if (!residual) return nil;
+  WMTCompositionDrawablePair *pair = [[WMTCompositionDrawablePair alloc] init];
+  if (!pair) return nil;
+  pair->primary = [primary retain];
+  pair->residual = [residual retain];
+  return [pair autorelease];
+}
+@interface WMTCompositionSource : NSObject {
+@public
+  CAMetalLayer *layer;
+  CALayer *root;
+  id context;
+  uint32_t context_id;
+  NSHashTable *targets;
+  id observer;
+  float transform[6];
+  uint32_t restrict_output;
+  uint32_t restricted_display_id;
+  BOOL premultiplied;
+  CAMetalLayer *residual_layer;
+  CALayer *residual_root;
+  id residual_context;
+  uint32_t residual_context_id;
+  id residual_filter;
+  id latest_drawable;
+  BOOL deferred_present;
+  double deferred_duration;
+  uint32_t deferred_sync_interval;
+  bool deferred_allow_tearing;
+  uint64_t deferred_present_id;
+}
+- (void)updateGeometry;
+- (void)updateObserver;
+- (void)publishDeferredWithPeriod:(double)period;
+- (void)cancelDeferred;
+@end
+@interface WMTCompositionTarget : NSObject {
+@public
+  uint64_t hwnd;
+  BOOL topmost;
+  BOOL dead;
+  BOOL observing_view;
+  NSWindow *lifetime_window;
+  NSView *view;
+  CALayer *host;
+  CALayer *container;
+  CALayer *residual_host;
+  CALayer *residual_container;
+  float offset_x;
+  float offset_y;
+  WMTCompositionSource *source;
+}
+- (void)layout;
+- (void)detach;
+- (void)bindView:(NSView *)new_view;
+- (void)stopObservingView;
+- (void)changed:(NSNotification *)notification;
+@end
+
+static NSMapTable *composition_layers;
+static NSMapTable *composition_views;
+static void composition_bind_observer(id observer, NSView *view);
+static double composition_refresh_period(id observer);
+static void composition_fail_observer(id observer);
+static uint64_t composition_observed_present_id(id observer, id drawable);
+static void composition_skip_deferred(id observer, id drawable, uint64_t present_id);
+NSScreen *GetNSScreenForDisplayID(CGDirectDisplayID display_id);
+
+static void composition_on_main(dispatch_block_t block) {
+  struct macdrv_functions_t *functions = dlsym(RTLD_DEFAULT, "macdrv_functions");
+  if ([NSThread isMainThread]) block();
+  else if (functions && functions->on_main_thread) functions->on_main_thread(block);
+  else execute_on_main(block);
+}
+
+static BOOL composition_is_residual_filter(id filter) {
+  Class cls = objc_lookUpClass("CAFilter");
+  if (![filter isKindOfClass:cls] || ![filter respondsToSelector:@selector(type)] ||
+      ![filter respondsToSelector:@selector(isEnabled)]) return NO;
+  id type = ((id (*)(id, SEL))objc_msgSend)(filter, @selector(type));
+  return [type isKindOfClass:NSString.class] && [(NSString *)type isEqualToString:@"plusL"] &&
+      ((BOOL (*)(id, SEL))objc_msgSend)(filter, @selector(isEnabled));
+}
+
+static id composition_create_residual_filter(void) {
+  Class cls = objc_lookUpClass("CAFilter");
+  if (![cls respondsToSelector:@selector(filterWithType:)]) return nil;
+  id filter = nil;
+  @try {
+    filter = [((id (*)(id, SEL, id))objc_msgSend)((id)cls, @selector(filterWithType:), @"plusL") retain];
+  } @catch (...) { return nil; }
+  if (!composition_is_residual_filter(filter)) { [filter release]; return nil; }
+  return filter;
+}
+
+@implementation WMTCompositionSource
+- (id)init {
+  if ((self = [super init])) {
+    targets = [[NSHashTable weakObjectsHashTable] retain];
+    transform[0] = transform[3] = 1;
+  }
+  return self;
+}
+- (void)updateGeometry {
+  const CGSize size = layer.drawableSize;
+  layer.bounds = CGRectMake(0, 0, size.width, size.height);
+  layer.position = CGPointZero;
+  const CGAffineTransform matrix = CGAffineTransformMake(
+      transform[0], transform[1], transform[2], transform[3], transform[4], transform[5]);
+  layer.affineTransform = matrix;
+  // Export every transformed pixel, including negative scales/translations.
+  root.bounds = CGRectUnion(layer.bounds, CGRectApplyAffineTransform(layer.bounds, matrix));
+  if (residual_layer) {
+    residual_layer.bounds = layer.bounds;
+    residual_layer.position = layer.position;
+    residual_layer.affineTransform = matrix;
+    residual_root.bounds = root.bounds;
+  }
+  for (WMTCompositionTarget *target in targets) [target layout];
+}
+- (void)updateObserver {
+  NSView *selected = nil;
+  for (WMTCompositionTarget *target in targets) {
+    if (!target->dead && target->view.window == target->lifetime_window && !target->view.hidden) {
+      selected = target->view; break;
+    }
+  }
+  composition_bind_observer(observer, selected);
+}
+- (void)publishDeferredWithPeriod:(double)period {
+  if (!deferred_present || !targets.count) return;
+  double duration = deferred_duration;
+  if (deferred_sync_interval) {
+    if (period > 0) duration = fmax(duration, deferred_sync_interval * period);
+    else if (deferred_sync_interval > 1) {
+      // Never turn an unavailable multiple-refresh deadline into Present(0).
+      composition_fail_observer(observer);
+      return;
+    }
+  }
+  // SyncInterval 0 cancels duration, not synchronization permission. The
+  // layers stay display-synced so every published drawable reports a time.
+  deferred_duration = duration;
+  deferred_present = NO;
+  // Observation retirement is not scene retirement. Explicit source teardown
+  // and replacement cancel deferred publication through cancelDeferred.
+  id<CAMetalDrawable> primary, residual;
+  winemetal_composition_drawables(latest_drawable, &primary, &residual);
+  const double present_time = deferred_duration > 0 ? 0 : CACurrentMediaTime();
+  if (deferred_duration > 0) [primary presentAfterMinimumDuration:deferred_duration]; else [primary presentAtTime:present_time];
+  if (deferred_duration > 0) [residual presentAfterMinimumDuration:deferred_duration]; else [residual presentAtTime:present_time];
+  deferred_present_id = 0;
+}
+- (void)cancelDeferred {
+  if (!deferred_present) return;
+  deferred_present = NO;
+  // Source owns observer; replacement cancels this frame before releasing it.
+  composition_skip_deferred(observer, latest_drawable, deferred_present_id);
+  deferred_present_id = 0;
+  deferred_allow_tearing = false;
+  [latest_drawable release]; latest_drawable = nil;
+}
+- (void)dealloc {
+  assert([NSThread isMainThread]);
+  if (layer) [composition_layers removeObjectForKey:layer];
+  [self cancelDeferred];
+  composition_bind_observer(observer, nil);
+  [observer release];
+  [latest_drawable release];
+  ((void (*)(id, SEL, id))objc_msgSend)(context, @selector(setLayer:), nil);
+  [context release];
+  if (residual_context)
+    ((void (*)(id, SEL, id))objc_msgSend)(residual_context, @selector(setLayer:), nil);
+  [residual_context release];
+  [residual_filter release];
+  [residual_layer removeFromSuperlayer];
+  [residual_layer release];
+  [residual_root release];
+  [layer removeFromSuperlayer];
+  [layer release];
+  [root release];
+  [targets release];
+  [super dealloc];
+}
+@end
+
+@implementation WMTCompositionTarget
+- (void)stopObservingView {
+  if (!observing_view) return;
+  observing_view = NO;
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
+  [view removeObserver:self forKeyPath:@"layer"];
+  [view removeObserver:self forKeyPath:@"layer.contentsScale"];
+  [view removeObserver:self forKeyPath:@"layer.geometryFlipped"];
+  [view removeObserver:self forKeyPath:@"layer.superlayer"];
+}
+- (void)bindView:(NSView *)new_view {
+  assert([NSThread isMainThread]);
+  if (view == new_view && observing_view) return;
+  [self stopObservingView];
+  if (view != new_view) {
+    [new_view retain];
+    [view release];
+    view = new_view;
+  }
+  if (!view.wantsLayer) view.wantsLayer = YES;
+  [view addObserver:self forKeyPath:@"layer" options:0 context:NULL];
+  [view addObserver:self forKeyPath:@"layer.contentsScale" options:0 context:NULL];
+  [view addObserver:self forKeyPath:@"layer.geometryFlipped" options:0 context:NULL];
+  [view addObserver:self forKeyPath:@"layer.superlayer" options:0 context:NULL];
+  view.postsFrameChangedNotifications = YES;
+  view.postsBoundsChangedNotifications = YES;
+  NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+  [center addObserver:self selector:@selector(changed:) name:NSViewFrameDidChangeNotification object:view];
+  [center addObserver:self selector:@selector(changed:) name:NSViewBoundsDidChangeNotification object:view];
+  [center addObserver:self selector:@selector(changed:) name:NSViewGlobalFrameDidChangeNotification object:view];
+  [center addObserver:self selector:@selector(changed:) name:NSWindowDidChangeScreenNotification object:view.window];
+  [center addObserver:self selector:@selector(changed:) name:NSWindowDidChangeBackingPropertiesNotification object:view.window];
+  [center addObserver:self selector:@selector(changed:) name:NSWindowDidMoveNotification object:view.window];
+  [center addObserver:self selector:@selector(changed:) name:NSApplicationDidChangeScreenParametersNotification object:nil];
+  [center addObserver:self selector:@selector(changed:) name:NSWindowWillCloseNotification object:lifetime_window];
+  observing_view = YES;
+}
+- (void)layout {
+  if (!host || !source || dead) return;
+  if (container.superlayer != view.layer || (residual_container && residual_container.superlayer != view.layer)) {
+    [container removeFromSuperlayer];
+    [residual_container removeFromSuperlayer];
+    // Both bands composite above the window's ordinary swapchain content; the
+    // zPosition band keeps FALSE below TRUE.
+    [view.layer addSublayer:container];
+    // Nested filtered groups cannot see the backing-layer backdrop. These
+    // adjacent siblings blend base source-over, then only the opaque residual.
+    if (residual_container) [view.layer insertSublayer:residual_container above:container];
+  }
+  const CGRect client_bounds = view.layer.bounds;
+  CGRect clip = client_bounds;
+  if (source->restrict_output) {
+    NSScreen *screen = CGDisplayIsActive(source->restricted_display_id)
+        ? GetNSScreenForDisplayID(source->restricted_display_id) : nil;
+    if (!screen || !view.window) {
+      container.hidden = YES; residual_container.hidden = YES; return;
+    }
+    const NSRect window_rect = [view.window convertRectFromScreen:screen.frame];
+    const NSRect view_rect = [view convertRect:window_rect fromView:nil];
+    CGRect display_rect = NSRectToCGRect(view_rect);
+    if (!view.isFlipped)
+      display_rect.origin.y = NSMinY(view.bounds) + NSMaxY(view.bounds) - CGRectGetMaxY(display_rect);
+    clip = CGRectIntersection(clip, display_rect);
+    if (CGRectIsNull(clip) || CGRectIsEmpty(clip)) {
+      container.hidden = YES; residual_container.hidden = YES; return;
+    }
+  }
+  container.hidden = NO;
+  residual_container.hidden = NO;
+  container.anchorPoint = CGPointZero;
+  container.bounds = clip;
+  container.position = clip.origin;
+  container.geometryFlipped = YES;
+  container.masksToBounds = YES;
+  container.zPosition = topmost ? 1 : 0;
+  const CGFloat pixels_per_point = view.layer.contentsScale > 0 ? view.layer.contentsScale : 1;
+  // CALayerHost conversion includes inherited flips that frame/flip getters do
+  // not describe. Convert the DXGI client center through the actual hierarchy.
+  host.anchorPoint = CGPointMake(0.5, 0.5);
+  host.bounds = source->root.bounds;
+  const CGFloat center_x = CGRectGetMidX(host.bounds) / pixels_per_point;
+  const CGFloat center_y = CGRectGetMidY(host.bounds) / pixels_per_point;
+  host.affineTransform = CGAffineTransformMakeScale(1 / pixels_per_point, 1 / pixels_per_point);
+  host.contentsScale = pixels_per_point;
+  host.geometryFlipped = source->root.geometryFlipped;
+  host.position = [view.layer convertPoint:CGPointMake(CGRectGetMinX(client_bounds) + center_x + offset_x,
+                                                      CGRectGetMinY(client_bounds) + center_y + offset_y)
+                                  toLayer:container];
+  if (residual_host) {
+    residual_container.anchorPoint = CGPointZero;
+    residual_container.bounds = container.bounds;
+    residual_container.position = container.position;
+    residual_container.geometryFlipped = container.geometryFlipped;
+    residual_container.masksToBounds = container.masksToBounds;
+    residual_container.zPosition = container.zPosition;
+    residual_host.anchorPoint = host.anchorPoint;
+    residual_host.bounds = source->residual_root.bounds;
+    residual_host.affineTransform = host.affineTransform;
+    residual_host.contentsScale = host.contentsScale;
+    residual_host.geometryFlipped = source->residual_root.geometryFlipped;
+    residual_host.position = [container convertPoint:host.position toLayer:residual_container];
+  }
+}
+- (void)detach {
+  [self stopObservingView];
+  [container removeFromSuperlayer];
+  [residual_host removeFromSuperlayer];
+  [residual_container removeFromSuperlayer];
+  [residual_host release]; residual_host = nil;
+  [residual_container release]; residual_container = nil;
+  [host removeFromSuperlayer];
+  [host release]; host = nil;
+  [container release]; container = nil;
+  WMTCompositionSource *old = source;
+  source = nil;
+  if (old) {
+    [old->targets removeObject:self];
+    [old updateObserver];
+    [old release];
+  }
+}
+- (void)changed:(NSNotification *)notification {
+  assert([NSThread isMainThread]);
+  [CATransaction begin]; [CATransaction setDisableActions:YES];
+  if ([notification.name isEqualToString:NSWindowWillCloseNotification]) {
+    dead = YES;
+    [self detach];
+  } else {
+    [self layout];
+    [source updateObserver];
+    if (source && source->deferred_present)
+      [source publishDeferredWithPeriod:source->deferred_sync_interval ? composition_refresh_period(source->observer) : 0];
+  }
+  [CATransaction commit];
+}
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                       change:(NSDictionary *)change context:(void *)context {
+  [self changed:nil];
+}
+- (void)dealloc {
+  assert([NSThread isMainThread]);
+  if (source) {
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    [self detach];
+    [CATransaction commit];
+  }
+  [view release];
+  [lifetime_window release];
+  [super dealloc];
+}
+@end
+
+static BOOL composition_release(NSObject *object) {
+  if (![object isKindOfClass:WMTCompositionSource.class] &&
+      ![object isKindOfClass:WMTCompositionTarget.class]) return NO;
+  // Capture an address, not self: block ownership must not resurrect a final release.
+  const uint64_t handle = (uint64_t)object;
+  composition_on_main(^{ [(id)handle release]; });
+  return YES;
+}
+
+static NSView *composition_view_for_layer(CAMetalLayer *layer) {
+  if (![layer isKindOfClass:WMTCompositionMetalLayer.class])
+    return [layer.delegate isKindOfClass:NSView.class] ? (NSView *)layer.delegate : nil;
+  assert([NSThread isMainThread]);
+  WMTCompositionSource *source = [composition_layers objectForKey:layer];
+  if (source) {
+    [source updateObserver];
+    for (WMTCompositionTarget *target in source->targets)
+      if (!target->dead && target->view.window == target->lifetime_window && !target->view.hidden)
+        return target->view;
+    return nil;
+  }
+  return [layer.delegate isKindOfClass:NSView.class] ? (NSView *)layer.delegate : nil;
+}
+
+static void composition_query(CAMetalLayer *layer, dispatch_block_t block) {
+  if ([layer isKindOfClass:WMTCompositionMetalLayer.class]) composition_on_main(block);
+  else block(); // Ordinary WineMetalView presentation keeps its existing path.
+}
+
+static void composition_layer_resize(CAMetalLayer *layer) {
+  if (![layer isKindOfClass:WMTCompositionMetalLayer.class]) return;
+  WMTCompositionSource *source = [composition_layers objectForKey:layer];
+  if (!source) return;
+  if (source->residual_layer) {
+    CAMetalLayer *residual = source->residual_layer;
+    residual.device = layer.device;
+    residual.framebufferOnly = layer.framebufferOnly;
+    residual.contentsScale = layer.contentsScale;
+    residual.displaySyncEnabled = layer.displaySyncEnabled;
+    residual.drawableSize = layer.drawableSize;
+    residual.pixelFormat = layer.pixelFormat;
+  }
+  [CATransaction begin]; [CATransaction setDisableActions:YES];
+  [source updateGeometry];
+  [CATransaction commit];
+}
+
+static NTSTATUS _WMTComposition_call(void *obj) {
+  struct WMTCompositionCall *call = obj;
+  call->result = 0;
+  call->status = (int32_t)0x80070057;
+  if (call->operation == 0) {
+    call->argument = 0;
+    if (!call->object || call->count > 1) return STATUS_SUCCESS;
+    composition_on_main(^{
+      Class context_class = objc_lookUpClass("CAContext");
+      int (*main_connection)(void) = dlsym(RTLD_DEFAULT, "CGSMainConnectionID");
+      if (!context_class || !main_connection ||
+          ![context_class respondsToSelector:@selector(contextWithCGSConnection:options:)]) return;
+      WMTCompositionSource *source = [[WMTCompositionSource alloc] init];
+      if (!source || !source->targets) { [source release]; return; }
+      source->premultiplied = call->count != 0;
+      source->layer = [[WMTCompositionMetalLayer alloc] init];
+      source->root = [[CALayer alloc] init];
+      if (source->premultiplied) {
+        source->residual_filter = composition_create_residual_filter();
+        if (!source->residual_filter) {
+          [source release]; call->status = (int32_t)0x80004001; return;
+        }
+        source->residual_layer = [[CAMetalLayer alloc] init];
+        source->residual_root = [[CALayer alloc] init];
+      }
+      if (!source->layer || !source->root ||
+          (source->premultiplied && (!source->residual_layer || !source->residual_root))) {
+        [source release]; call->status = (int32_t)0x8007000e; return;
+      }
+      const unsigned plane_count = source->premultiplied ? 2 : 1;
+      for (unsigned plane = 0; plane < plane_count; ++plane) {
+        CAMetalLayer *metal = plane ? source->residual_layer : source->layer;
+        CALayer *root = plane ? source->residual_root : source->root;
+        metal.device = (id<MTLDevice>)call->object;
+        metal.framebufferOnly = NO;
+        metal.presentsWithTransaction = YES;
+        // Composition presentation timing requires a real display time for every
+        // published drawable. Keep both planes display-synced from creation and
+        // never toggle per present: SyncInterval 0 only cancels the minimum
+        // duration, and a torn/unsynced present reports no presented time.
+        metal.displaySyncEnabled = YES;
+        metal.opaque = plane != 0;
+        metal.contentsScale = 1;
+        metal.anchorPoint = CGPointZero;
+        root.anchorPoint = CGPointZero;
+        root.geometryFlipped = YES;
+        root.masksToBounds = NO;
+        [root addSublayer:metal];
+        id context = [((id (*)(id, SEL, int, id))objc_msgSend)(
+            (id)context_class, @selector(contextWithCGSConnection:options:),
+            main_connection(), @{}) retain];
+        uint32_t context_id = 0;
+        if (context) {
+          ((void (*)(id, SEL, id))objc_msgSend)(context, @selector(setLayer:), root);
+          context_id = ((uint32_t (*)(id, SEL))objc_msgSend)(context, @selector(contextId));
+        }
+        if (plane) { source->residual_context = context; source->residual_context_id = context_id; }
+        else { source->context = context; source->context_id = context_id; }
+        if (!context_id) { [source release]; call->status = (int32_t)0x80004001; return; }
+      }
+      ((WMTCompositionMetalLayer *)source->layer)->paired_layer = source->residual_layer;
+      if (!composition_layers) composition_layers = [[NSMapTable weakToWeakObjectsMapTable] retain];
+      [composition_layers setObject:source forKey:source->layer];
+      call->result = (uint64_t)source;
+      call->argument = (uint64_t)source->layer;
+      call->status = 0;
+    });
+  } else if (call->operation == 1) {
+    struct macdrv_functions_t *functions = dlsym(RTLD_DEFAULT, "macdrv_functions");
+    if (!functions || !functions->macdrv_get_cocoa_window) return STATUS_SUCCESS;
+    // The exported get_win_data creates a D3DMetal client surface and binds
+    // its view. Creating an empty target must not replace another target's
+    // committed client view. Pin only the existing native window here; acquire
+    // the actual client view when a nonnull source is committed.
+    NSWindow *lifetime_window = [(NSWindow *)functions->macdrv_get_cocoa_window(
+        (HWND)(uintptr_t)call->object, FALSE) retain];
+    composition_on_main(^{
+      if (!lifetime_window || !objc_lookUpClass("CALayerHost")) {
+        [lifetime_window release]; return;
+      }
+      WMTCompositionTarget *target = [[WMTCompositionTarget alloc] init];
+      if (!target) { [lifetime_window release]; return; }
+      target->hwnd = call->object; target->topmost = call->count != 0;
+      target->lifetime_window = lifetime_window; // Transfer the retained identity token.
+      call->result = (uint64_t)target; call->status = 0;
+    });
+  } else if (call->operation == 2) {
+    const struct WMTCompositionTargetState *states = (const void *)(uintptr_t)call->argument;
+    if (call->count && !states) return STATUS_SUCCESS;
+    struct macdrv_functions_t *functions = dlsym(RTLD_DEFAULT, "macdrv_functions");
+    // Validate every attachment HWND before touching any target. Detach needs
+    // only its retained graph, including after the real window is destroyed.
+    // No Wine window-data lock crosses the main-thread hop. A live HWND may
+    // recreate its client view; the exported getter materializes a client surface
+    // and allocates a snapshot per call. The retained native window, not snapshot
+    // or client-view addresses, guards HWND reuse.
+    NSMutableArray *views = nil;
+    for (uint32_t i = 0; i < call->count; ++i) {
+      WMTCompositionTarget *target = (id)states[i].target;
+      if (![target isKindOfClass:WMTCompositionTarget.class] ||
+          (states[i].surface && ![(id)states[i].surface isKindOfClass:WMTCompositionSource.class])) {
+        composition_on_main(^{ [views release]; });
+        return STATUS_SUCCESS;
+      }
+      if (!states[i].surface) {
+        if (views) [views addObject:target->view ?: (id)[NSNull null]];
+        continue;
+      }
+      if (!functions || !functions->macdrv_get_cocoa_window) {
+        composition_on_main(^{ [views release]; });
+        return STATUS_SUCCESS;
+      }
+      if ((NSWindow *)functions->macdrv_get_cocoa_window((HWND)(uintptr_t)target->hwnd, FALSE) !=
+          target->lifetime_window) {
+        composition_on_main(^{ [views release]; });
+        call->status = (int32_t)0x80070578; return STATUS_SUCCESS;
+      }
+      __block NSView *current = nil;
+      __block BOOL dead = NO;
+      composition_on_main(^{
+        dead = target->dead;
+        if (dead) return;
+        NSView *candidate = target->view;
+        if (!candidate || candidate.window != target->lifetime_window || candidate.hidden) {
+          candidate = [composition_views objectForKey:target->lifetime_window];
+          if (candidate && (candidate.window != target->lifetime_window || candidate.hidden)) {
+            [composition_views removeObjectForKey:target->lifetime_window];
+            candidate = nil;
+          }
+        }
+        if (candidate.window == target->lifetime_window && !candidate.hidden) {
+          current = candidate;
+          if (current != target->view) [current retain];
+        }
+      });
+      if (dead) {
+        composition_on_main(^{ [views release]; });
+        call->status = (int32_t)0x80070578; return STATUS_SUCCESS;
+      }
+      if (!current) {
+        if (!functions->get_win_data || !functions->release_win_data) {
+          composition_on_main(^{ [views release]; });
+          return STATUS_SUCCESS;
+        }
+        // This is real first attachment, or Wine replaced the committed view.
+        // Never invoke this materializing getter just to validate a live host.
+        struct macdrv_win_data *data = functions->get_win_data((HWND)(uintptr_t)target->hwnd);
+        BOOL valid = data && data->hwnd == (HWND)(uintptr_t)target->hwnd &&
+            (NSWindow *)data->cocoa_window == target->lifetime_window && data->client_cocoa_view;
+        current = valid ? (NSView *)data->client_cocoa_view : nil;
+        if (current && current != target->view) [current retain];
+        if (data) functions->release_win_data(data);
+        if (!valid) {
+          composition_on_main(^{ [views release]; });
+          call->status = (int32_t)0x80070578; return STATUS_SUCCESS;
+        }
+        composition_on_main(^{
+          // TRUE/FALSE targets, including different devices, share the actual
+          // Wine consumer view. Weak entries own no window/view or scene state.
+          if (!composition_views) composition_views = [[NSMapTable weakToWeakObjectsMapTable] retain];
+          [composition_views setObject:current forKey:target->lifetime_window];
+        });
+      }
+      BOOL replaced = current && current != target->view;
+      if (replaced && !views) {
+        views = [[NSMutableArray alloc] initWithCapacity:call->count];
+        for (uint32_t previous = 0; previous < i; ++previous)
+          [views addObject:((WMTCompositionTarget *)states[previous].target)->view ?: (id)[NSNull null]];
+      }
+      if (views) [views addObject:current];
+      if (replaced) composition_on_main(^{ [current release]; });
+    }
+    composition_on_main(^{
+      for (uint32_t i = 0; i < call->count; ++i) {
+        if (!states[i].surface) continue;
+        WMTCompositionTarget *target = (id)states[i].target;
+        NSView *current = views ? [views objectAtIndex:i] : target->view;
+        if (target->dead || current.window != target->lifetime_window || current.hidden) {
+          call->status = (int32_t)0x80070578; return;
+        }
+        if (!current.window.opaque) { call->status = (int32_t)0x80004001; return; }
+      }
+      BOOL changed = NO;
+      for (uint32_t i = 0; i < call->count; ++i) {
+        WMTCompositionTarget *probe = (WMTCompositionTarget *)states[i].target;
+        changed |= probe->source != (id)states[i].surface || views != nil ||
+            probe->offset_x != states[i].offset_x || probe->offset_y != states[i].offset_y;
+      }
+      if (!changed) {
+        call->status = 0; return;
+      }
+      // Prepare every host before mutating the committed graph. Each target owns
+      // its host, not Wine's context-ID dictionary (the same source may be reused).
+      NSMutableArray *hosts = [NSMutableArray arrayWithCapacity:call->count];
+      NSMutableArray *containers = [NSMutableArray arrayWithCapacity:call->count];
+      BOOL needs_residual = NO;
+      for (uint32_t i = 0; i < call->count; ++i) {
+        WMTCompositionSource *source = (id)states[i].surface;
+        needs_residual |= source && source->premultiplied &&
+            ((WMTCompositionTarget *)states[i].target)->source != source;
+      }
+      NSMutableArray *residual_hosts = needs_residual ? [NSMutableArray arrayWithCapacity:call->count] : nil;
+      NSMutableArray *residual_containers = needs_residual ? [NSMutableArray arrayWithCapacity:call->count] : nil;
+      for (uint32_t i = 0; i < call->count; ++i) {
+        WMTCompositionSource *source = (id)states[i].surface;
+        WMTCompositionTarget *target = (id)states[i].target;
+        if (target->source == source) {
+          [hosts addObject:[NSNull null]]; [containers addObject:[NSNull null]];
+          [residual_hosts addObject:[NSNull null]]; [residual_containers addObject:[NSNull null]];
+          continue;
+        }
+        CALayer *host = source ? [(CALayer *)[objc_lookUpClass("CALayerHost") alloc] init] : nil;
+        CALayer *container = source ? [[CALayer alloc] init] : nil;
+        CALayer *residual_host = source && source->premultiplied
+            ? [(CALayer *)[objc_lookUpClass("CALayerHost") alloc] init] : nil;
+        CALayer *residual_container = source && source->premultiplied ? [[CALayer alloc] init] : nil;
+        if (source && (!host || !container || (source->premultiplied && (!residual_host || !residual_container)))) {
+          [host release]; [container release]; [residual_host release]; [residual_container release];
+          call->status = (int32_t)0x8007000e; return;
+        }
+        if (residual_container) {
+          // Blend only the opaque residual plane. The base retains ordinary
+          // source-over; putting plusL on the entire image would be incorrect.
+          @try { residual_container.compositingFilter = source->residual_filter; }
+          @catch (...) {
+            [host release]; [container release]; [residual_host release]; [residual_container release];
+            call->status = (int32_t)0x80004001; return;
+          }
+          if (!composition_is_residual_filter(residual_container.compositingFilter)) {
+            [host release]; [container release]; [residual_host release]; [residual_container release];
+            call->status = (int32_t)0x80004001; return;
+          }
+          ((void (*)(id, SEL, uint32_t))objc_msgSend)(residual_host, @selector(setContextId:), source->residual_context_id);
+          [residual_container addSublayer:residual_host];
+        }
+        if (source) ((void (*)(id, SEL, uint32_t))objc_msgSend)(host, @selector(setContextId:), source->context_id);
+        [hosts addObject:host ?: (id)[NSNull null]];
+        [containers addObject:container ?: (id)[NSNull null]];
+        [residual_hosts addObject:residual_host ?: (id)[NSNull null]];
+        [residual_containers addObject:residual_container ?: (id)[NSNull null]];
+        [host release]; [container release]; [residual_host release]; [residual_container release];
+      }
+      // Reject unsupported clock-dependent publication before changing any
+      // committed target graph. Binding uses the real prepared HWND screen.
+      for (uint32_t i = 0; i < call->count; ++i) {
+        WMTCompositionSource *source = (id)states[i].surface;
+        if (!source || !source->deferred_present || source->deferred_sync_interval <= 1) continue;
+        WMTCompositionTarget *target = (id)states[i].target;
+        composition_bind_observer(source->observer, views ? [views objectAtIndex:i] : target->view);
+        if (composition_refresh_period(source->observer) <= 0) {
+          for (uint32_t j = 0; j <= i; ++j) {
+            WMTCompositionSource *bound = (id)states[j].surface;
+            if (bound && bound->deferred_present && bound->deferred_sync_interval > 1)
+              [bound updateObserver]; // Restore the unchanged committed graph's display.
+          }
+          call->status = (int32_t)0x887a0004; return;
+        }
+      }
+      [CATransaction begin]; [CATransaction setDisableActions:YES];
+      for (uint32_t i = 0; i < call->count; ++i) {
+        WMTCompositionTarget *target = (id)states[i].target;
+        if (target->source == (id)states[i].surface) {
+          target->offset_x = states[i].offset_x;
+          target->offset_y = states[i].offset_y;
+          if (states[i].surface) [target bindView:views ? [views objectAtIndex:i] : target->view];
+          [target layout];
+          [target->source updateObserver];
+          continue;
+        }
+        WMTCompositionSource *source = [(id)states[i].surface retain];
+        [target detach];
+        target->source = source;
+        target->offset_x = states[i].offset_x;
+        target->offset_y = states[i].offset_y;
+        if (source) {
+          target->host = [[hosts objectAtIndex:i] retain];
+          target->container = [[containers objectAtIndex:i] retain];
+          [target->container addSublayer:target->host];
+          if (source->premultiplied) {
+            target->residual_host = [[residual_hosts objectAtIndex:i] retain];
+            target->residual_container = [[residual_containers objectAtIndex:i] retain];
+          }
+          [source->targets addObject:target];
+          [target bindView:views ? [views objectAtIndex:i] : target->view];
+          [target layout];
+          [source updateObserver];
+        }
+      }
+      for (uint32_t i = 0; i < call->count; ++i)
+        if (states[i].surface) {
+          // Every target snapshot is installed before the first publication.
+          WMTCompositionSource *source = (id)states[i].surface;
+          if (source->deferred_present)
+            [source publishDeferredWithPeriod:source->deferred_sync_interval ? composition_refresh_period(source->observer) : 0];
+        }
+      [CATransaction commit];
+      for (uint32_t i = 0; i < call->count; ++i)
+        if (states[i].surface) {
+          // Match WineContentView's native host-installation readiness hook.
+          // Empty targets and pending frontend changes must remain inert.
+          WMTCompositionTarget *target = (id)states[i].target;
+          NSWindow *window = target->view.window;
+          if ([window respondsToSelector:@selector(windowDidDrawContent)])
+            ((void (*)(id, SEL))objc_msgSend)(window, @selector(windowDidDrawContent));
+        }
+      call->status = 0;
+    });
+    composition_on_main(^{ [views release]; });
+  } else if (call->operation == 3) {
+    WMTCompositionSource *source = (id)call->object;
+    if (![source isKindOfClass:WMTCompositionSource.class]) return STATUS_SUCCESS;
+    composition_on_main(^{
+      id observer = [(id)call->argument retain];
+      if (source->observer != observer) {
+        [source cancelDeferred];
+        source->deferred_allow_tearing = false;
+        composition_bind_observer(source->observer, nil);
+      }
+      [source->observer release]; source->observer = observer;
+      [source updateObserver];
+      call->status = 0;
+    });
+  } else if (call->operation == 4) {
+    WMTCompositionDrawablePair *pair = (id)call->object;
+    if ([pair isKindOfClass:WMTCompositionDrawablePair.class]) {
+      call->result = (uint64_t)pair->residual.texture; call->status = 0;
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
+void winemetal_composition_present(id<MTLDrawable> drawable, double duration,
+                                  const struct WMTCompositionFrame *frame, uint32_t sync_interval, bool allow_tearing) {
+  id<CAMetalDrawable> primary, residual;
+  winemetal_composition_drawables(drawable, &primary, &residual);
+  WMTCompositionSource *source = frame ? (id)frame->surface : nil;
+  if (!source && !residual) {
+    if (duration > 0) [primary presentAfterMinimumDuration:duration]; else [primary present];
+    return;
+  }
+  if (source) for (unsigned i = 0; i < 6; ++i) if (!isfinite(frame->transform[i])) return;
+  const struct WMTCompositionFrame captured = frame ? *frame : (struct WMTCompositionFrame){0};
+  composition_on_main(^{
+    const double period = source && source->targets.count && sync_interval ? composition_refresh_period(source->observer) : 0;
+    if (source && source->targets.count && sync_interval > 1 && period <= 0) {
+      // A lost display must not change the old scene or submit a zero deadline.
+      composition_fail_observer(source->observer);
+      return;
+    }
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    if (source && (memcmp(source->transform, captured.transform, sizeof(source->transform)) ||
+        source->restrict_output != captured.restrict_output ||
+        source->restricted_display_id != captured.restricted_display_id)) {
+      memcpy(source->transform, captured.transform, sizeof(source->transform));
+      source->restrict_output = captured.restrict_output;
+      source->restricted_display_id = captured.restricted_display_id;
+      [source updateGeometry];
+    }
+    if (source && source->deferred_present) [source cancelDeferred];
+    if (source && source->latest_drawable != (id)drawable) {
+      // Keep the latest real buffers alive across GPU retirement and the
+      // first target attachment. Commit must not require another Present.
+      id latest = [(id)drawable retain];
+      [source->latest_drawable release];
+      source->latest_drawable = latest;
+    }
+    if (source) {
+      // Capture the interval and validated tearing permission even without a target/cadence.
+      // A bound source publishes below; an unbound source waits for Commit.
+      if (source->observer) {
+        source->deferred_present = YES;
+        source->deferred_duration = duration;
+        source->deferred_sync_interval = sync_interval;
+        source->deferred_allow_tearing = allow_tearing;
+        source->deferred_present_id = composition_observed_present_id(source->observer, drawable);
+        [source publishDeferredWithPeriod:period];
+      } else {
+        // Swapchain teardown cleared/closed the observer before this accepted
+        // task reached AppKit. Do not recache an already-cancelled publication.
+        [source->latest_drawable release]; source->latest_drawable = nil;
+      }
+    } else if (duration > 0) {
+      [primary presentAfterMinimumDuration:duration];
+      [residual presentAfterMinimumDuration:duration];
+    } else { [primary present]; [residual present]; }
+    [CATransaction commit];
+  });
+}
+
 
 static NTSTATUS
 _CreateMetalViewFromHWND(void *obj) {
@@ -1894,13 +2836,30 @@ _CreateMetalViewFromHWND(void *obj) {
   if (pfn_get_win_data && pfn_release_win_data && pfn_macdrv_view_create_metal_view &&
       pfn_macdrv_view_get_metal_layer) {
     struct macdrv_win_data *win_data = pfn_get_win_data((HWND)params->hwnd);
+    if (!win_data)
+      return STATUS_SUCCESS;
     macdrv_metal_view view =
         pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
     params->ret_view = (obj_handle_t)view;
+    NSWindow *window = nil;
+    NSView *client_view = nil;
     if (view) {
       params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
+      window = [(NSWindow *)win_data->cocoa_window retain];
+      client_view = [(NSView *)win_data->client_cocoa_view retain];
     }
     pfn_release_win_data(win_data);
+    if (view) composition_on_main(^{
+      // Record the actual ordinary consumer, not another materializing lookup.
+      // Composition overlays must reuse it rather than hide the game's view.
+      if (window && client_view.window == window && !client_view.hidden) {
+        if (!composition_views) composition_views = [[NSMapTable weakToWeakObjectsMapTable] retain];
+        [composition_views setObject:client_view forKey:window];
+      } else if (window) {
+        [composition_views removeObjectForKey:window];
+      }
+      [client_view release]; [window release];
+    });
   }
 
   return STATUS_SUCCESS;
@@ -2129,7 +3088,11 @@ thunk_SM50WGCompileNode(void *args) {
 
 static inline void *
 UInt32ToPtr(uint32_t v) {
-  return (void *)(uint64_t)v;
+  uint64_t base = 0;
+  if (!v) return NULL;
+  NTSTATUS status = _WMTGetGuestWindowBase(&base);
+  assert(!status);
+  return (void *)(base + v);
 }
 
 #ifndef DXMT_NATIVE
@@ -2262,13 +3225,22 @@ struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32 {
   uint32_t distance_vertex_layout;
   uint32_t distance_vertex_count;
   uint32_t coarse_vertex_layout;
+  uint8_t depth_clip_enable;
+  uint8_t depth_bounds_emulated;
 };
 _Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32, distance_vertex_layout) == 40,
                "Wine32 MSAA distance layout pointer offset");
 _Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32, distance_vertex_count) == 44,
                "Wine32 MSAA distance vertex count offset");
-_Static_assert(sizeof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32) == 52,
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32, depth_clip_enable) == 52,
+               "Wine32 MSAA pixel depth clip flag offset");
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32, depth_bounds_emulated) == 53,
+               "Wine32 MSAA pixel depth bounds flag offset");
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA32) == 56,
                "Wine32 MSAA pixel argument size");
+_Static_assert(sizeof(struct SM50_MSAA_PIXEL_LAYOUT) == 76 &&
+               offsetof(struct SM50_MSAA_PIXEL_LAYOUT, depth_bounds_mask_dword) == 72,
+               "Pointer-free MSAA pixel output layout shared with PE32");
 
 struct SM50_SHADER_D3D12_LOGIC_OP_DATA32 {
   uint32_t next;
@@ -2316,7 +3288,11 @@ struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA32 {
   uint32_t line_mode;
   uint32_t interpolation;
   uint8_t depth_clip_enable;
+  uint8_t front_counter_clockwise;
 };
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA32, front_counter_clockwise) == 29,
+               "Wine32 MSAA vertex winding flag offset");
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA32) == 32, "Wine32 MSAA vertex argument size");
 
 struct SM50_SHADER_D3D12_MSAA_MESH_DATA32 {
   uint32_t next;
@@ -2328,8 +3304,11 @@ struct SM50_SHADER_D3D12_MSAA_MESH_DATA32 {
   uint32_t interpolation;
   uint8_t depth_clip_enable;
   uint32_t object_layout_out;
+  uint8_t front_counter_clockwise;
 };
-_Static_assert(sizeof(struct SM50_SHADER_D3D12_MSAA_MESH_DATA32) == 36, "Wine32 MSAA mesh argument size");
+_Static_assert(offsetof(struct SM50_SHADER_D3D12_MSAA_MESH_DATA32, front_counter_clockwise) == 36,
+               "Wine32 MSAA mesh winding flag offset");
+_Static_assert(sizeof(struct SM50_SHADER_D3D12_MSAA_MESH_DATA32) == 40, "Wine32 MSAA mesh argument size");
 _Static_assert(sizeof(struct SM50_MSAA_MESH_CONTROL) == 16, "MSAA mesh capture control size");
 
 struct SM50_SHADER_D3D12_TESS_CAPTURE_DATA32 {
@@ -2560,6 +3539,7 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL:
     case SM50_SHADER_D3D12_COARSE_SHADING:
     case SM50_SHADER_D3D12_CONSERVATIVE_RASTER:
+    case SM50_SHADER_D3D12_ATOMIC64_PHASE:
     case SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM: {
       struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data = malloc(sizeof(*data));
       if (!data)
@@ -2590,6 +3570,8 @@ sm50_compilation_argument32_convert(
       data->distance_vertex_layout = UInt32ToPtr(src->distance_vertex_layout);
       data->distance_vertex_count = src->distance_vertex_count;
       data->coarse_vertex_layout = UInt32ToPtr(src->coarse_vertex_layout);
+      data->depth_clip_enable = src->depth_clip_enable;
+      data->depth_bounds_emulated = src->depth_bounds_emulated;
       break;
     }
     case SM50_SHADER_D3D12_MSAA_VERTEX: {
@@ -2606,6 +3588,7 @@ sm50_compilation_argument32_convert(
       data->line_mode = src->line_mode;
       data->interpolation = UInt32ToPtr(src->interpolation);
       data->depth_clip_enable = src->depth_clip_enable;
+      data->front_counter_clockwise = src->front_counter_clockwise;
       break;
     }
     case SM50_SHADER_D3D12_TESS_CAPTURE: {
@@ -2634,6 +3617,7 @@ sm50_compilation_argument32_convert(
       data->interpolation = UInt32ToPtr(src->interpolation);
       data->depth_clip_enable = src->depth_clip_enable;
       data->object_layout_out = UInt32ToPtr(src->object_layout_out);
+      data->front_counter_clockwise = src->front_counter_clockwise;
       break;
     }
 
@@ -2899,7 +3883,7 @@ thunk32_SM50RTCompileRaytracingPipeline(void *args) {
     struct sm50_rt_function_info32 *out = UInt32ToPtr(params->functions);
     for (uint32_t i = 0; i < count; ++i)
       out[i] = (struct sm50_rt_function_info32){(uint32_t)(uintptr_t)functions[i].Name, (uint32_t)(uintptr_t)functions[i].ExportName,
-          functions[i].Kind, functions[i].ExportIndex, functions[i].TableIndex, functions[i].IsDispatchEntry};
+          functions[i].Kind, functions[i].ExportIndex, functions[i].TableIndex, functions[i].Flags};
     *(uint32_t *)UInt32ToPtr(params->function_count) = count;
   }
 done:
@@ -3038,11 +4022,22 @@ _MetalLayer_setColorSpace(void *obj) {
   if (!ref)
     return STATUS_SUCCESS;
   execute_on_main(^{
+    WMTCompositionSource *source = [layer isKindOfClass:WMTCompositionMetalLayer.class]
+        ? [composition_layers objectForKey:layer] : nil;
+    if (source && source->premultiplied && colorspace != WMTColorSpaceSRGB &&
+        colorspace != WMTColorSpaceSRGBLinear) {
+      CGColorSpaceRelease(ref);
+      return;
+    }
     layer.colorspace = ref;
     layer.wantsExtendedDynamicRangeContent = WMT_COLORSPACE_IS_HDR(colorspace);
+    if (source && source->residual_layer) {
+      source->residual_layer.colorspace = ref;
+      source->residual_layer.wantsExtendedDynamicRangeContent = NO;
+    }
     CGColorSpaceRelease(ref);
+    params->ret = true;
   });
-  params->ret = true;
   return STATUS_SUCCESS;
 }
 
@@ -3173,21 +4168,14 @@ _MetalLayer_getEDRValue(void *obj) {
   value->maximum_edr_color_component_value = 1.0;
   value->maximum_potential_edr_color_component_value = 1.0;
 
-  if (![layer.delegate isKindOfClass:NSView.class])
-    return STATUS_SUCCESS;
-
-  NSView *view = (NSView *)layer.delegate;
-  if (!view.window)
-    return STATUS_SUCCESS;
-
-  if (!view.window.screen)
-    return STATUS_SUCCESS;
-
-  NSScreen *screen = view.window.screen;
-
-  value->maximum_edr_color_component_value =
-      layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
-  value->maximum_potential_edr_color_component_value = screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  composition_query(layer, ^{
+    NSView *view = composition_view_for_layer(layer);
+    NSScreen *screen = view.window.screen;
+    if (!screen) return;
+    value->maximum_edr_color_component_value =
+        layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
+    value->maximum_potential_edr_color_component_value = screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  });
 
   return STATUS_SUCCESS;
 }
@@ -3252,27 +4240,20 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
   *hdr_metadata_out = (struct WMTHDRMetadata){};
   params->edr_value.maximum_edr_color_component_value = 1.0;
   params->edr_value.maximum_potential_edr_color_component_value = 1.0;
-  if (![layer.delegate isKindOfClass:NSView.class])
-    return STATUS_SUCCESS;
-
-  NSView *view = (NSView *)layer.delegate;
-  if (!view.window)
-    return STATUS_SUCCESS;
-
-  if (!view.window.screen)
-    return STATUS_SUCCESS;
-
-  NSScreen *screen = view.window.screen;
-  CGDirectDisplayID id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
-
-  struct DisplaySetting *setting = &g_display_settings[id == CGMainDisplayID()];
-  *hdr_metadata_out = setting->hdr_metadata;
-  params->version = setting->version;
-  params->colorspace = setting->colorspace;
-  params->edr_value.maximum_edr_color_component_value =
-      layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
-  params->edr_value.maximum_potential_edr_color_component_value =
-      screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  composition_query(layer, ^{
+    NSView *view = composition_view_for_layer(layer);
+    NSScreen *screen = view.window.screen;
+    if (!screen) return;
+    CGDirectDisplayID id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
+    struct DisplaySetting *setting = &g_display_settings[id == CGMainDisplayID()];
+    *hdr_metadata_out = setting->hdr_metadata;
+    params->version = setting->version;
+    params->colorspace = setting->colorspace;
+    params->edr_value.maximum_edr_color_component_value =
+        layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
+    params->edr_value.maximum_potential_edr_color_component_value =
+        screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  });
 
   return STATUS_SUCCESS;
 }
@@ -4270,12 +5251,17 @@ _MTLDevice_sampleTimestamps(void *obj) {
 
 /* Callback blocks own their observer even if a drawable outlives the swapchain.
  * The Wine worker blocks in wait(); no callback invokes PE code. */
+struct WMTPresentationActive {
+  uint64_t present_id;
+  uint64_t drawable; // Borrowed identity only; no observer-to-drawable ownership.
+};
+
 @interface OwnedPresentationObserver : NSObject {
 @public
   NSCondition *condition;
   BOOL closing;
   BOOL failed;
-  uint64_t *active_ids;
+  struct WMTPresentationActive *active;
   size_t active_count;
   size_t active_capacity;
   struct WMTPresentationEvent *events;
@@ -4303,9 +5289,9 @@ _MTLDevice_sampleTimestamps(void *obj) {
     condition = [[NSCondition alloc] init];
     active_capacity = 16;
     event_capacity = 16;
-    active_ids = malloc(active_capacity * sizeof(*active_ids));
+    active = malloc(active_capacity * sizeof(*active));
     events = malloc(event_capacity * sizeof(*events));
-    if (!condition || !active_ids || !events) {
+    if (!condition || !active || !events) {
       [self release];
       return nil;
     }
@@ -4314,7 +5300,7 @@ _MTLDevice_sampleTimestamps(void *obj) {
 }
 - (void)dealloc {
   [condition release];
-  free(active_ids);
+  free(active);
   free(events);
   [super dealloc];
 }
@@ -4360,6 +5346,7 @@ presentation_refresh_callback(CVDisplayLinkRef link, const CVTimeStamp *now,
       owner->has_video_anchor = NO;
     }
     owner->cv_flags = output->flags;
+    [owner->condition broadcast];
   }
   [owner->condition unlock];
   return kCVReturnSuccess;
@@ -4372,27 +5359,107 @@ _WMTPresentationObserver_create(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static void presentation_record_event_locked(OwnedPresentationObserver *owner, uint64_t present_id,
+                                             uint64_t drawable_id, double time) {
+  size_t i = 0;
+  while (i < owner->active_count && owner->active[i].present_id != present_id)
+    ++i;
+  if (i < owner->active_count) {
+    owner->active[i] = owner->active[--owner->active_count];
+    if (!owner->closing && !owner->failed) {
+      if (owner->event_count == owner->event_capacity) {
+        const size_t capacity = owner->event_capacity * 2;
+        struct WMTPresentationEvent *expanded = malloc(capacity * sizeof(*expanded));
+        if (expanded) {
+          for (size_t n = 0; n < owner->event_count; ++n)
+            expanded[n] = owner->events[(owner->event_head + n) % owner->event_capacity];
+          free(owner->events);
+          owner->events = expanded;
+          owner->event_capacity = capacity;
+          owner->event_head = 0;
+        } else {
+          owner->failed = YES;
+        }
+      }
+      if (!owner->failed) {
+        owner->events[(owner->event_head + owner->event_count++) % owner->event_capacity] =
+            (struct WMTPresentationEvent){present_id, drawable_id, time,
+                                          owner->refresh_sequence, owner->refresh_generation,
+                                          time > 0 ? WMTPresentationPresented : WMTPresentationSkipped, 0,
+                                          owner->has_video_anchor ? owner->output_host_ticks : 0,
+                                          owner->has_video_anchor ? owner->previous_video_time : 0};
+      }
+      [owner->condition signal];
+    }
+  }
+}
+
+struct WMTCompositionPresentationProof {
+  unsigned mask;
+  double times[2];
+  uint64_t drawable_id;
+};
+
+static uint64_t composition_observed_present_id(id observer, id drawable) {
+  OwnedPresentationObserver *owner = observer;
+  if (!owner) return 0;
+  uint64_t present_id = 0;
+  [owner->condition lock];
+  for (size_t i = 0; i < owner->active_count; ++i) {
+    if (owner->active[i].drawable == (uint64_t)drawable) {
+      present_id = owner->active[i].present_id; break;
+    }
+  }
+  [owner->condition unlock];
+  return present_id;
+}
+
+static void composition_skip_deferred(id observer, id drawable, uint64_t present_id) {
+  OwnedPresentationObserver *owner = observer;
+  if (!owner || !present_id) return;
+  id<CAMetalDrawable> primary, residual;
+  winemetal_composition_drawables(drawable, &primary, &residual);
+  [owner->condition lock];
+  // This request was never published, so zero denotes a real skipped outcome.
+  presentation_record_event_locked(owner, present_id, primary.drawableID, 0);
+  [owner->condition unlock];
+}
+
+static void composition_record_presentation_locked(OwnedPresentationObserver *owner, uint64_t present_id,
+    struct WMTCompositionPresentationProof *proof, id<MTLDrawable> presented, unsigned plane) {
+  proof->mask |= 1u << plane;
+  proof->times[plane] = presented.presentedTime;
+  if (!plane) proof->drawable_id = presented.drawableID;
+  if (proof->mask == 3) {
+    const double time = proof->times[0] > 0 && proof->times[1] > 0
+        ? fmax(proof->times[0], proof->times[1]) : 0;
+    presentation_record_event_locked(owner, present_id, proof->drawable_id, time);
+  }
+}
+
 static NTSTATUS
 _MetalDrawable_observePresentation(void *obj) {
   struct unixcall_wmt_presentation_observe *params = obj;
   OwnedPresentationObserver *owner = (OwnedPresentationObserver *)params->observer;
-  id<MTLDrawable> drawable = (id<MTLDrawable>)params->drawable;
+  id<CAMetalDrawable> drawable, residual;
+  winemetal_composition_drawables((id)params->drawable, &drawable, &residual);
   params->ret = 0;
   if (!owner || !drawable || !params->present_id ||
-      ![drawable respondsToSelector:@selector(addPresentedHandler:)])
+      ![drawable respondsToSelector:@selector(addPresentedHandler:)] ||
+      (residual && ![residual respondsToSelector:@selector(addPresentedHandler:)]))
     return STATUS_SUCCESS;
 
   [owner->condition lock];
   if (!owner->closing && !owner->failed) {
     size_t i = 0;
-    while (i < owner->active_count && owner->active_ids[i] != params->present_id)
+    while (i < owner->active_count && owner->active[i].present_id != params->present_id)
       ++i;
     if (i == owner->active_count) {
       if (owner->active_count == owner->active_capacity) {
         const size_t capacity = owner->active_capacity * 2;
-        void *expanded = realloc(owner->active_ids, capacity * sizeof(*owner->active_ids));
+        void *expanded = realloc(owner->active, capacity * sizeof(*owner->active));
         if (expanded) {
-          owner->active_ids = expanded;
+          owner->active = expanded;
           owner->active_capacity = capacity;
         } else {
           owner->failed = YES;
@@ -4400,7 +5467,7 @@ _MetalDrawable_observePresentation(void *obj) {
         }
       }
       if (!owner->failed) {
-        owner->active_ids[owner->active_count++] = params->present_id;
+        owner->active[owner->active_count++] = (struct WMTPresentationActive){params->present_id, params->drawable};
         params->ret = 1;
       }
     }
@@ -4410,42 +5477,27 @@ _MetalDrawable_observePresentation(void *obj) {
     return STATUS_SUCCESS;
 
   const uint64_t present_id = params->present_id;
-  [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
-    [owner->condition lock];
-    size_t i = 0;
-    while (i < owner->active_count && owner->active_ids[i] != present_id)
-      ++i;
-    if (i < owner->active_count) {
-      owner->active_ids[i] = owner->active_ids[--owner->active_count];
-      if (!owner->closing && !owner->failed) {
-        if (owner->event_count == owner->event_capacity) {
-          const size_t capacity = owner->event_capacity * 2;
-          struct WMTPresentationEvent *expanded = malloc(capacity * sizeof(*expanded));
-          if (expanded) {
-            for (size_t n = 0; n < owner->event_count; ++n)
-              expanded[n] = owner->events[(owner->event_head + n) % owner->event_capacity];
-            free(owner->events);
-            owner->events = expanded;
-            owner->event_capacity = capacity;
-            owner->event_head = 0;
-          } else {
-            owner->failed = YES;
-          }
-        }
-        if (!owner->failed) {
-          const double time = presented.presentedTime;
-          owner->events[(owner->event_head + owner->event_count++) % owner->event_capacity] =
-              (struct WMTPresentationEvent){present_id, presented.drawableID, time,
-                                            owner->refresh_sequence, owner->refresh_generation,
-                                            time > 0 ? WMTPresentationPresented : WMTPresentationSkipped, 0,
-                                            owner->has_video_anchor ? owner->output_host_ticks : 0,
-                                            owner->has_video_anchor ? owner->previous_video_time : 0};
-        }
-        [owner->condition signal];
-      }
-    }
-    [owner->condition unlock];
-  }];
+  if (!residual) {
+    [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+      [owner->condition lock];
+      presentation_record_event_locked(owner, present_id, presented.drawableID, presented.presentedTime);
+      [owner->condition unlock];
+    }];
+  } else {
+    // Callbacks retain only this scalar proof and observer, never the envelope
+    // or either drawable. Cancellation cannot create a drawable/block cycle.
+    __block struct WMTCompositionPresentationProof proof = {0};
+    [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+      [owner->condition lock];
+      composition_record_presentation_locked(owner, present_id, &proof, presented, 0);
+      [owner->condition unlock];
+    }];
+    [residual addPresentedHandler:^(id<MTLDrawable> presented) {
+      [owner->condition lock];
+      composition_record_presentation_locked(owner, present_id, &proof, presented, 1);
+      [owner->condition unlock];
+    }];
+  }
   return STATUS_SUCCESS;
 }
 
@@ -4487,8 +5539,8 @@ _WMTPresentationObserver_cancel(void *obj) {
     return STATUS_SUCCESS;
   [owner->condition lock];
   for (size_t i = 0; i < owner->active_count; ++i)
-    if (owner->active_ids[i] == params->present_id) {
-      owner->active_ids[i] = owner->active_ids[--owner->active_count];
+    if (owner->active[i].present_id == params->present_id) {
+      owner->active[i] = owner->active[--owner->active_count];
       break;
     }
   for (size_t i = 0; i < owner->event_count; ++i) {
@@ -4564,35 +5616,19 @@ _WMTPresentationObserver_close(void *obj) {
   return STATUS_SUCCESS;
 }
 
-static NTSTATUS
-_WMTPresentationObserver_setView(void *obj) {
-  struct unixcall_wmt_observer_view *params = obj;
-  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)params->observer;
-  NSView *view = (NSView *)params->view;
-  params->ret = 0;
-  if (!owner || !view)
-    return STATUS_SUCCESS;
-
-  __block CGDirectDisplayID display_id = kCGNullDirectDisplay;
-  execute_on_main(^{
-    if ([view isKindOfClass:NSView.class]) {
-      NSScreen *screen = view.window.screen;
-      display_id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
-    }
-  });
-  if (display_id == kCGNullDirectDisplay)
-    return STATUS_SUCCESS;
+static BOOL
+presentation_observer_set_display(OwnedPresentationObserver *owner, CGDirectDisplayID display_id) {
+  if (!owner || !CGDisplayIsActive(display_id))
+    return NO;
   [owner->condition lock];
   BOOL same_display = !owner->closing && owner->display_link && owner->display_id == display_id;
   [owner->condition unlock];
-  if (same_display) {
-    params->ret = 1;
-    return STATUS_SUCCESS;
-  }
+  if (same_display)
+    return YES;
 
   CVDisplayLinkRef new_link = NULL;
   if (CVDisplayLinkCreateWithCGDisplay(display_id, &new_link) != kCVReturnSuccess || !new_link)
-    return STATUS_SUCCESS;
+    return NO;
   [owner retain]; // Keep the callback context alive until Stop returns.
   CVReturn status = CVDisplayLinkSetOutputCallback(new_link, presentation_refresh_callback, owner);
   if (status == kCVReturnSuccess)
@@ -4600,7 +5636,7 @@ _WMTPresentationObserver_setView(void *obj) {
   if (status != kCVReturnSuccess) {
     CVDisplayLinkRelease(new_link);
     [owner release];
-    return STATUS_SUCCESS;
+    return NO;
   }
 
   [owner->condition lock];
@@ -4609,7 +5645,7 @@ _WMTPresentationObserver_setView(void *obj) {
     CVDisplayLinkStop(new_link);
     CVDisplayLinkRelease(new_link);
     [owner release];
-    return STATUS_SUCCESS;
+    return NO;
   }
   CVDisplayLinkRef old_link = owner->display_link;
   owner->display_link = new_link;
@@ -4630,7 +5666,177 @@ _WMTPresentationObserver_setView(void *obj) {
     CVDisplayLinkRelease(old_link);
     [owner release];
   }
-  params->ret = 1;
+  return YES;
+}
+
+static void composition_bind_observer(id observer, NSView *view) {
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)observer;
+  if (!owner) return;
+  assert([NSThread isMainThread]);
+  [owner->condition lock];
+  BOOL closing = owner->closing;
+  [owner->condition unlock];
+  if (closing) return;
+  NSScreen *screen = view.window.screen;
+  CGDirectDisplayID display_id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
+  if (screen && display_id != kCGNullDirectDisplay && CGDisplayIsActive(display_id)) {
+    presentation_observer_set_display(owner, display_id);
+    return;
+  }
+  [owner->condition lock];
+  CVDisplayLinkRef link = owner->display_link;
+  owner->display_link = NULL;
+  owner->display_id = kCGNullDirectDisplay;
+  owner->has_video_anchor = NO;
+  if (link) ++owner->refresh_generation;
+  [owner->condition unlock];
+  if (link) {
+    CVDisplayLinkStop(link);
+    CVDisplayLinkRelease(link);
+    [owner release];
+  }
+}
+
+static double composition_refresh_period(id observer) {
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)observer;
+  if (!owner) return 0;
+  double period = 0;
+  [owner->condition lock];
+  if (!owner->closing && !owner->failed && owner->display_link && CGDisplayIsActive(owner->display_id)) {
+    if (owner->has_video_anchor && owner->video_refresh_period > 0 && owner->video_time_scale > 0 &&
+        isfinite(owner->rate_scalar) && owner->rate_scalar > 0)
+      period = (double)owner->video_refresh_period / owner->video_time_scale / owner->rate_scalar;
+    else {
+      // This is the actual bound device's nominal period, not a fabricated
+      // timestamp, VBlank sequence, or observer refresh anchor.
+      const CVTime nominal = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(owner->display_link);
+      if (!(nominal.flags & kCVTimeIsIndefinite) && nominal.timeValue > 0 && nominal.timeScale > 0)
+        period = (double)nominal.timeValue / nominal.timeScale;
+    }
+  }
+  [owner->condition unlock];
+  return isfinite(period) && period > 0 ? period : 0;
+}
+
+static void composition_fail_observer(id observer) {
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)observer;
+  if (!owner) return;
+  [owner->condition lock];
+  owner->failed = YES;
+  [owner->condition broadcast];
+  [owner->condition unlock];
+}
+
+static NTSTATUS
+_WMTPresentationObserver_setView(void *obj) {
+  struct unixcall_wmt_observer_view *params = obj;
+  OwnedPresentationObserver *owner = (OwnedPresentationObserver *)params->observer;
+  NSView *view = (NSView *)params->view;
+  params->ret = 0;
+  if (!owner || !view)
+    return STATUS_SUCCESS;
+  __block CGDirectDisplayID display_id = kCGNullDirectDisplay;
+  execute_on_main(^{
+    if ([view isKindOfClass:NSView.class]) {
+      NSScreen *screen = view.window.screen;
+      display_id = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
+    }
+  });
+  if (display_id != kCGNullDirectDisplay)
+    params->ret = presentation_observer_set_display(owner, display_id);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_WMTMonitorTiming_call(void *obj) {
+  struct WMTMonitorTimingCall *params = obj;
+  params->result = 0;
+  if (params->operation == WMTMonitorTimingCreate || params->operation == WMTMonitorTimingResolveDisplay) {
+    params->object = 0;
+    params->display_id = 0;
+    CGDirectDisplayID selected = kCGNullDirectDisplay;
+    const BOOL resolving = params->operation == WMTMonitorTimingResolveDisplay;
+    uint32_t count = 0, matches = 0;
+    if (!resolving && params->primary) {
+      selected = CGMainDisplayID(); // Preserve the existing timing-Create contract.
+    } else {
+      if (CGGetActiveDisplayList(0, NULL, &count) != kCGErrorSuccess || !count)
+        return STATUS_SUCCESS;
+      CGDirectDisplayID displays[count];
+      if (CGGetActiveDisplayList(count, displays, &count) != kCGErrorSuccess)
+        return STATUS_SUCCESS;
+      for (uint32_t i = 0; i < count; ++i) {
+        CGRect bounds = CGDisplayBounds(displays[i]);
+        if (!resolving) {
+          if (bounds.origin.x == params->left && bounds.origin.y == params->top &&
+              CGRectGetMaxX(bounds) == params->right && CGRectGetMaxY(bounds) == params->bottom) {
+            selected = displays[i];
+            break;
+          }
+          continue;
+        }
+        if ((CGDisplayIsMain(displays[i]) != 0) != (params->primary != 0)) continue;
+        // Wine's cgrect_win_from_mac has exactly two modes: native points or
+        // every coordinate doubled. Match the entire rectangle and require a
+        // unique (display, mode), never select a primary/secondary approximation.
+        // ponytail: ambiguous multi-display layouts fail closed; explicit Wine
+        // coordinate-mode identity is the upgrade if those layouts need support.
+        for (unsigned scale = 1; scale <= 2; ++scale) {
+          if (bounds.origin.x * scale == params->left && bounds.origin.y * scale == params->top &&
+              CGRectGetMaxX(bounds) * scale == params->right &&
+              CGRectGetMaxY(bounds) * scale == params->bottom) {
+            selected = displays[i];
+            ++matches;
+          }
+        }
+      }
+    }
+    if ((resolving && matches != 1) || selected == kCGNullDirectDisplay)
+      return STATUS_SUCCESS;
+    if (params->operation == WMTMonitorTimingResolveDisplay) {
+      if (!CGDisplayIsActive(selected)) return STATUS_SUCCESS;
+      params->display_id = selected;
+      params->result = 1;
+      return STATUS_SUCCESS;
+    }
+    OwnedPresentationObserver *owner = [[OwnedPresentationObserver alloc] init];
+    if (presentation_observer_set_display(owner, selected)) {
+      params->object = (obj_handle_t)owner;
+      params->result = 1;
+    } else {
+      [owner release];
+    }
+  } else if (params->operation == WMTMonitorTimingWait) {
+    OwnedPresentationObserver *owner = (id)params->object;
+    if (!owner)
+      return STATUS_SUCCESS;
+    [owner->condition lock];
+    const uint64_t sequence = owner->refresh_sequence;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+    while (!owner->closing && CGDisplayIsActive(owner->display_id) &&
+           (!owner->has_video_anchor || owner->refresh_sequence == sequence)) {
+      if (![owner->condition waitUntilDate:deadline])
+        break;
+    }
+    if (!owner->closing && CGDisplayIsActive(owner->display_id) && owner->has_video_anchor &&
+        owner->refresh_sequence != sequence) {
+      /* CoreVideo calls ahead of scan-out: do not return at callback delivery. */
+      const uint64_t target = owner->output_host_ticks;
+      while (!owner->closing && CVGetCurrentHostTime() < target) {
+        const uint64_t now = CVGetCurrentHostTime();
+        if (now >= target)
+          break;
+        double remaining = (double)(target - now) / owner->host_frequency;
+        if (remaining > 0 && remaining < 1.0)
+          [owner->condition waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:remaining]];
+        else
+          break;
+      }
+      params->result = !owner->closing && CGDisplayIsActive(owner->display_id) &&
+          CVGetCurrentHostTime() >= target;
+    }
+    [owner->condition unlock];
+  }
   return STATUS_SUCCESS;
 }
 
@@ -4642,7 +5848,7 @@ _WMTPresentationObserver_getRefreshSample(void *obj) {
   if (!owner)
     return STATUS_SUCCESS;
   [owner->condition lock];
-  if (!owner->closing && owner->has_video_anchor) {
+  if (!owner->closing && owner->has_video_anchor && CGDisplayIsActive(owner->display_id)) {
     params->sample = (struct WMTDisplayRefreshSample){owner->refresh_sequence, owner->refresh_generation,
         owner->output_host_ticks, owner->host_frequency, owner->previous_video_time,
         owner->video_refresh_period, owner->rate_scalar, owner->cv_flags,
@@ -5576,7 +6782,13 @@ const void *__wine_unix_call_funcs[] = {
     &thunk_SM50WGReflectLibrary, /* 312: work graph library reflection */
     &thunk_SM50WGCompileNode, /* 313: work graph node compilation */
     &winemetal_metal4_call, /* 314: fixed-width typed Metal4 operation ABI */
+    &_WMTDeviceCatalog_call, /* 315: fixed-width device hints and observer */
+    &_WMTMonitorTiming_call, /* 316: fixed-width monitor timing */
+    &_WMTComposition_call, /* 317: fixed-width composition, including nested PE32 pointers */
+    &_WMTGetGuestWindowBase, /* 318: native typed guest-window query */
 };
+_Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == 319,
+               "PE64/native composition dispatch index");
 
 #ifndef DXMT_NATIVE
 const void *__wine_unix_call_wow64_funcs[] = {
@@ -5886,5 +7098,11 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &thunk32_SM50WGReflectLibrary, /* 312: work graph library reflection */
     &thunk32_SM50WGCompileNode, /* 313: work graph node compilation */
     &winemetal_metal4_call, /* 314: identical POD layout; nested caller pointers are zero-extended */
+    &_WMTDeviceCatalog_call, /* 315: identical fixed-width POD layout */
+    &_WMTMonitorTiming_call, /* 316: identical fixed-width POD layout */
+    &_WMTComposition_call, /* 317: identical 40-byte native/PE32 layout */
+    &_WMTGetGuestWindowBase, /* 318: native typed guest-window query */
 };
+_Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == 319,
+               "PE32/native composition dispatch index");
 #endif

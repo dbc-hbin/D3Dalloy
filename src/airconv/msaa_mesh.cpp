@@ -1,6 +1,7 @@
 #include "msaa_mesh.hpp"
 #include "msaa_vertex.hpp"
 #include "air_signature.hpp"
+#include "dxil_converter.hpp"
 #include "nt/air_builder.hpp"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -313,6 +314,7 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
     replay.line_mode = options.line_mode;
     replay.interpolation = options.interpolation;
     replay.depth_clip_enable = options.depth_clip_enable;
+    replay.front_counter_clockwise = options.front_counter_clockwise;
     return transformVertex(module, replay, conservative);
   };
   if (auto error = buildReplay()) return error;
@@ -462,6 +464,8 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
         if ((!load || use.getOperandNo() != 0) && (!store || use.getOperandNo() != 1))
           return invalid("generated mesh staging pointer escapes scalar load/store");
         use.set(address);
+        if (module.getModuleFlag(dxil::kAtomic64PhaseFlag))
+          cast<Instruction>(use.getUser())->setMetadata(dxil::kAtomic64Metadata, MDNode::get(module.getContext(), {}));
       }
       old->eraseFromParent();
     }
@@ -517,7 +521,9 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
     auto *write = SplitBlockAndInsertIfThen(active, call, false);
     b.SetInsertPoint(write);
     auto *pointer = b.CreateBitCast(wordPointer(offset), value->getType()->getPointerTo(1));
-    b.CreateAlignedStore(value, pointer, Align(4));
+    auto *store = b.CreateAlignedStore(value, pointer, Align(4));
+    if (module.getModuleFlag(dxil::kAtomic64PhaseFlag))
+      store->setMetadata(dxil::kAtomic64Metadata, MDNode::get(module.getContext(), {}));
     call->eraseFromParent();
   }
   for (auto *ret : returns) {
@@ -550,6 +556,8 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
         auto *word = b.CreateAdd(scratchBase, b.CreateAdd(b.getInt32((field.primitive ? vertexWords : 0) + field.offset),
           b.CreateMul(field.primitive ? static_cast<Value *>(primitive) : vertex, b.getInt32(stride))));
         auto *value = b.CreateAlignedLoad(field.type, b.CreateBitCast(wordPointer(word), field.type->getPointerTo(1)), Align(4));
+        if (module.getModuleFlag(dxil::kAtomic64PhaseFlag))
+          value->setMetadata(dxil::kAtomic64Metadata, MDNode::get(module.getContext(), {}));
         result = b.CreateInsertValue(result, value, f);
       }
       results.push_back(result);
@@ -579,7 +587,9 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
       auto *positionValue = b.CreateExtractValue(result, position);
       result = b.CreateInsertValue(result, b.CreateSelect(live, positionValue, Constant::getNullValue(positionValue->getType())), position);
       auto *out = b.CreateAdd(outputBase, b.CreateMul(ordinal, b.getInt32(stride)));
-      b.CreateAlignedStore(result, b.CreateBitCast(wordPointer(out), native->getPointerTo(1)), Align(4));
+      auto *store = b.CreateAlignedStore(result, b.CreateBitCast(wordPointer(out), native->getPointerTo(1)), Align(4));
+      if (module.getModuleFlag(dxil::kAtomic64PhaseFlag))
+        store->setMetadata(dxil::kAtomic64Metadata, MDNode::get(module.getContext(), {}));
     }
     auto *next = b.CreateAdd(primitive, b.getInt32(meshLayout.threads_per_group));
     b.CreateBr(loop);

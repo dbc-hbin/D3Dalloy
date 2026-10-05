@@ -7,6 +7,7 @@
 #include "Metal4FX.hpp"
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -14,7 +15,7 @@
 namespace dxmt {
 namespace {
 constexpr UINT kLowResMV = 2, kAutoExposure = 64;
-constexpr UINT kSupportedFlags = 1 | 2 | 4 | 8 | 64;
+constexpr UINT kSupportedFlags = 1 | 2 | 4 | 8 | 64 | 128 | 256;
 struct Core {
   Com<MTLD3D12Device> device;
   const uint64_t id = owned_graphics::NewObjectId();
@@ -63,8 +64,8 @@ struct OwnedTemporalFrame {
   std::shared_ptr<Core> core;
   const uint64_t id = owned_graphics::NewObjectId();
   uint64_t generation = 0;
-  std::array<Com<MTLD3D12Resource, false>, 7> resources;
-  std::array<TextureViewRef, 7> views;
+  std::array<Com<MTLD3D12Resource, false>, 12> resources;
+  std::array<TextureViewRef, 12> views;
   WMT::Reference<WMT4::TemporalFrame> native;
   WMTMetal4FXTemporalFrame props{};
   ~OwnedTemporalFrame() {
@@ -91,18 +92,26 @@ public:
                   std::shared_ptr<OwnedTemporalFrame> &result) final {
     if (device != core_->device.ptr() || !desc.InputContentWidth || !desc.InputContentHeight) return E_INVALIDARG;
     for (float scalar : {desc.JitterOffsetX, desc.JitterOffsetY, desc.MotionVectorScaleX,
-                         desc.MotionVectorScaleY, desc.PreExposure, desc.ExposureScale, desc.Sharpness})
+                         desc.MotionVectorScaleY, desc.PreExposure, desc.Sharpness})
       if (!std::isfinite(scalar)) return E_INVALIDARG;
-    if (!desc.MotionVectorScaleX || !desc.MotionVectorScaleY || desc.PreExposure <= 0 || desc.ExposureScale <= 0)
+    if (!desc.MotionVectorScaleX || !desc.MotionVectorScaleY || desc.PreExposure <= 0)
       return E_INVALIDARG;
-    if (desc.ExposureScale != 1.0f) return E_NOTIMPL; // Not a reference-native exposure contract.
     if ((!desc.BiasCurrentColorMask && (desc.BiasBaseX || desc.BiasBaseY)) ||
         (!desc.TransparencyMask && (desc.CompositionBaseX || desc.CompositionBaseY))) return E_INVALIDARG;
     auto frame = std::make_shared<OwnedTemporalFrame>(); frame->core = core_;
     const auto &create = core_->create;
-    std::array<ID3D12Resource *, 7> inputs{desc.Color, desc.Depth, desc.MotionVector, desc.Output,
+    std::array<ID3D12Resource *, 12> inputs{desc.Color, desc.Depth, desc.MotionVector, desc.Output,
         (create.FeatureFlags & kAutoExposure) ? nullptr : desc.ExposureTexture,
-        desc.BiasCurrentColorMask, desc.TransparencyMask};
+        desc.BiasCurrentColorMask, desc.TransparencyMask, desc.DiffuseAlbedo, desc.SpecularAlbedo,
+        desc.Normals, desc.Roughness, desc.SpecularHitDistance};
+    const bool rr = (create.FeatureFlags & 256u) != 0;
+    if (rr) {
+      if (!desc.DiffuseAlbedo || !desc.SpecularAlbedo || !desc.Normals ||
+          (!desc.RoughnessPacked && !desc.Roughness) || desc.RoughnessPacked > 1 || desc.DepthLinear > 1) return E_INVALIDARG;
+      for (float value : desc.WorldToViewMatrix) if (!std::isfinite(value)) return E_INVALIDARG;
+      for (float value : desc.ViewToClipMatrix) if (!std::isfinite(value)) return E_INVALIDARG;
+    } else if (desc.DiffuseAlbedo || desc.SpecularAlbedo || desc.Normals || desc.Roughness ||
+               desc.SpecularHitDistance || desc.RoughnessPacked || desc.DepthLinear) return E_INVALIDARG;
     HRESULT hr;
     for (size_t i = 0; i < inputs.size(); ++i) {
       if (!inputs[i] && i >= 4) continue;
@@ -118,6 +127,19 @@ public:
     if (inputs[4]) p.exposure = frame->views[4].texture().handle;
     if (inputs[5]) p.reactive = frame->views[5].texture().handle;
     if (inputs[6]) p.composition = frame->views[6].texture().handle;
+    if (inputs[7]) p.diffuse_albedo = frame->views[7].texture().handle;
+    if (inputs[8]) p.specular_albedo = frame->views[8].texture().handle;
+    if (inputs[9]) p.normals = frame->views[9].texture().handle;
+    if (inputs[10]) p.roughness = frame->views[10].texture().handle;
+    if (inputs[11]) p.specular_hit_distance = frame->views[11].texture().handle;
+    std::memcpy(p.world_to_view, desc.WorldToViewMatrix, sizeof(p.world_to_view));
+    std::memcpy(p.view_to_clip, desc.ViewToClipMatrix, sizeof(p.view_to_clip));
+    p.roughness_packed = desc.RoughnessPacked; p.depth_linear = desc.DepthLinear;
+    p.diffuse_albedo_rect = {desc.DiffuseAlbedoBaseX, desc.DiffuseAlbedoBaseY, desc.InputContentWidth, desc.InputContentHeight};
+    p.specular_albedo_rect = {desc.SpecularAlbedoBaseX, desc.SpecularAlbedoBaseY, desc.InputContentWidth, desc.InputContentHeight};
+    p.normals_rect = {desc.NormalsBaseX, desc.NormalsBaseY, desc.InputContentWidth, desc.InputContentHeight};
+    p.roughness_rect = {desc.RoughnessBaseX, desc.RoughnessBaseY, desc.InputContentWidth, desc.InputContentHeight};
+    p.specular_hit_distance_rect = {desc.SpecularHitDistanceBaseX, desc.SpecularHitDistanceBaseY, desc.InputContentWidth, desc.InputContentHeight};
     p.input_width = desc.InputContentWidth; p.input_height = desc.InputContentHeight;
     const UINT ow = desc.OutputWidth ? desc.OutputWidth : create.OutputWidth;
     const UINT oh = desc.OutputHeight ? desc.OutputHeight : create.OutputHeight;
@@ -135,6 +157,7 @@ public:
     p.exposure_mode = (create.FeatureFlags & kAutoExposure) ? 2 : (p.exposure ? 1 : 0);
     p.color_transfer = desc.ColorTransfer; p.combine_composition = desc.CombineCompositionMask;
     p.sharpening = desc.EnableSharpening; p.sharpness = desc.Sharpness; p.cap_output = desc.CapOutputToTemporalMaxScale;
+    p.debug_view = desc.DrawDebugView;
     int32_t native_hr;
     std::lock_guard lock(core_->mutex);
     WMT::Reference<WMT4::TemporalFeature> replacement;
@@ -170,7 +193,7 @@ HRESULT CreateOwnedTemporalState(MTLD3D12Device *device,
       !desc->OutputWidth || !desc->OutputHeight || desc->InputWidth > 16384 || desc->InputHeight > 16384 ||
       desc->OutputWidth > 16384 || desc->OutputHeight > 16384) return E_INVALIDARG;
   if (desc->CreationNodeMask > 1 || desc->VisibilityNodeMask > 1 || (desc->FeatureFlags & ~kSupportedFlags)) return E_NOTIMPL;
-  if (!WMT4::TemporalFeature::Supports(device->GetMTLDevice())) return DXGI_ERROR_UNSUPPORTED;
+  if (!WMT4::TemporalFeature::Supports(device->GetMTLDevice(), desc->FeatureFlags & 256u)) return DXGI_ERROR_UNSUPPORTED;
   try {
     auto core = std::make_shared<Core>(); core->device = device; core->create = *desc;
     core->feature_output_width = desc->OutputWidth; core->feature_output_height = desc->OutputHeight;
@@ -194,9 +217,11 @@ HRESULT PrepareOwnedTemporalFrame(MTLD3D12Device *device, IMTLD3D12TemporalUpsca
   if (FAILED(state->QueryInterface(kInternalStateId, reinterpret_cast<void **>(&internal)))) return E_INVALIDARG;
   try { return internal->Prepare(device, *desc, frame); } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
 }
-std::array<MTLD3D12Resource *, 7> GetOwnedTemporalFrameResources(const std::shared_ptr<OwnedTemporalFrame> &frame) {
+std::array<MTLD3D12Resource *, 12> GetOwnedTemporalFrameResources(const std::shared_ptr<OwnedTemporalFrame> &frame) {
   return {frame->resources[0].ptr(), frame->resources[1].ptr(), frame->resources[2].ptr(), frame->resources[3].ptr(),
-          frame->resources[4].ptr(), frame->resources[5].ptr(), frame->resources[6].ptr()};
+          frame->resources[4].ptr(), frame->resources[5].ptr(), frame->resources[6].ptr(),
+          frame->resources[7].ptr(), frame->resources[8].ptr(), frame->resources[9].ptr(),
+          frame->resources[10].ptr(), frame->resources[11].ptr()};
 }
 void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
     WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence, uint64_t queue, uint64_t submission, uint64_t encoder,

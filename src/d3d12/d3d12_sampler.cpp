@@ -134,12 +134,10 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC
     break;
   }
   InfoOut.support_argument_buffers = true;
-  // Root signature validation restricts NON_NORMALIZED_COORDINATES to the subset Metal
-  // defines for normalizedCoordinates = NO (1D/2D, min=mag, point mips, LOD 0).
-  InfoOut.normalized_coords = !(Desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES);
-  if (!InfoOut.normalized_coords) {
-    // Metal requires a non-mipmapped sampler for unnormalized coordinates.
-    InfoOut.mip_filter = WMTSamplerMipFilterNotMipmapped;
+  // Shader lowering normalizes pixel coordinates; native normalized samplers also support white BORDER.
+  InfoOut.normalized_coords = true;
+  if (Desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) {
+    InfoOut.mip_filter = WMTSamplerMipFilterNearest;
     InfoOut.max_anisotroy = 1;
   }
 }

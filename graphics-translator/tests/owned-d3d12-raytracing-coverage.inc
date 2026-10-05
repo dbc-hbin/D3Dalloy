@@ -241,6 +241,73 @@ public:
     return words;
   }
 
+  std::vector<uint32_t> runRetainedGrid() {
+    // Shader tables remain application resources. Retain the dispatch arena bindings across
+    // one >4MiB compute root batch, not thousands of costly ray traversal encoders.
+    constexpr UINT slots = 16385;
+    // Reuse the arena fixture's Wine-supported DXBC source and compiler flags.
+    const char source[] = "cbuffer Constants : register(b0) { uint4 packed[15]; uint2 tail; };"
+      "RWStructuredBuffer<uint> output : register(u0);"
+      "[numthreads(1,1,1)] void main() { output[packed[0].x] = packed[0].y ^ tail.y; }";
+    ComPtr<ID3DBlob> shader; check(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0",
+      0, 0, &shader, nullptr), "coverage: arena compute shader");
+    D3D12_ROOT_PARAMETER1 parameters[2]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].Constants.Num32BitValues = 62;
+    D3D12_ROOT_SIGNATURE_DESC1 rootDesc{}; rootDesc.NumParameters = 2; rootDesc.pParameters = parameters;
+    auto root = createRootSignature(device_.Get(), rootDesc, "coverage: arena compute root");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{}; psoDesc.pRootSignature = root.Get();
+    psoDesc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+    ComPtr<ID3D12PipelineState> pso; check(device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso)), "coverage: arena compute pipeline");
+    D3D12_INDIRECT_ARGUMENT_DESC arguments[2]{};
+    arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT; arguments[0].Constant = {1, 0, 2};
+    arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_COMMAND_SIGNATURE_DESC signatureDesc{20, 2, arguments, 0};
+    ComPtr<ID3D12CommandSignature> signature; check(device_->CreateCommandSignature(&signatureDesc, root.Get(),
+      IID_PPV_ARGS(&signature)), "coverage: arena compute signature");
+    struct Command { UINT index, amount; D3D12_DISPATCH_ARGUMENTS dispatch; };
+    static_assert(sizeof(Command) == 20);
+    std::vector<Command> commands(slots, {0, 999, {1, 1, 1}});
+    commands[0].amount = 137; commands[1].index = 1; commands[1].amount = 251;
+    const UINT count = 2; const UINT64 countOffset = UINT64(slots) * sizeof(Command);
+    auto input = createBuffer(device_.Get(), countOffset + 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto *mapped = static_cast<uint8_t *>(mapUpload(input.Get()));
+    std::memcpy(mapped, commands.data(), size_t(countOffset)); std::memcpy(mapped + countOffset, &count, sizeof(count));
+    input->Unmap(0, nullptr);
+    auto zero = createBuffer(device_.Get(), 8, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    std::memset(mapUpload(zero.Get()), 0, 8); zero->Unmap(0, nullptr);
+    auto result = createBuffer(device_.Get(), 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto firstReadback = createBuffer(device_.Get(), kOutputBytes + 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto words = run("coverage grid-direct", [&](ID3D12GraphicsCommandList4 *list) {
+      list->SetPipelineState1(stateObject_.Get());
+      const auto desc = dispatchDesc(kWidth, kHeight, kDepth); list->DispatchRays(&desc);
+      transition(list, output_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->CopyBufferRegion(firstReadback.Get(), 0, output_.Get(), 0, kOutputBytes);
+      transition(list, output_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+      list->CopyBufferRegion(output_.Get(), 0, fill_.Get(), 0, kOutputBytes);
+      transition(list, output_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      list->CopyBufferRegion(result.Get(), 0, zero.Get(), 0, 8);
+      transition(list, result.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      list->SetComputeRootSignature(root.Get()); list->SetPipelineState(pso.Get());
+      list->SetComputeRootUnorderedAccessView(0, result->GetGPUVirtualAddress());
+      const std::array<UINT, 62> constants{}; list->SetComputeRoot32BitConstants(1, 62, constants.data(), 0);
+      list->ExecuteIndirect(signature.Get(), slots, input.Get(), 0, input.Get(), countOffset);
+      transition(list, result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->CopyBufferRegion(firstReadback.Get(), kOutputBytes, result.Get(), 0, 8);
+      list->SetComputeRootSignature(globalRoot_.Get());
+      list->SetComputeRootDescriptorTable(0, heap_->GetGPUDescriptorHandleForHeapStart());
+      list->SetPipelineState1(stateObject_.Get()); list->DispatchRays(&desc);
+    });
+    void *data = nullptr; check(firstReadback->Map(0, nullptr, &data), "coverage: retained first readback");
+    std::vector<uint32_t> first(kOutputWords); std::memcpy(first.data(), data, kOutputBytes);
+    std::array<uint32_t, 2> computeResult{}; std::memcpy(computeResult.data(), static_cast<uint8_t *>(data) + kOutputBytes, sizeof(computeResult));
+    firstReadback->Unmap(0, nullptr);
+    const int bad = verify("arena-first", first, kWidth, kHeight, kDepth);
+    require(!bad && computeResult == std::array<uint32_t, 2>{{137, 251}}, "coverage: retained global/local records and count-clamped compute exact oracle");
+    return words;
+  }
+
   // Compare every lane: lanes of a w x h x d grid hold their expected slot, the rest stay at the
   // fill pattern (w = 0: the dispatch was culled). `laneBad`, when given, receives per-lane counts.
   int verify(const char *name, const std::vector<uint32_t> &words, UINT w, UINT h, UINT d,
@@ -538,13 +605,10 @@ constexpr Feature kFeatures[] = {
 };
 
 int caseGridDirect(Suite &suite) {
-  auto words = suite.run("coverage grid-direct", [&](ID3D12GraphicsCommandList4 *list) {
-    list->SetPipelineState1(suite.stateObject());
-    const auto desc = suite.dispatchDesc(kWidth, kHeight, kDepth);
-    list->DispatchRays(&desc);
-  });
+  auto words = suite.runRetainedGrid();
   std::vector<int> laneBad;
   const int bad = suite.verify("grid-direct", words, kWidth, kHeight, kDepth, &laneBad);
+  std::printf("OWNED_D3D12_RAYTRACING_ARENA_GROWTH root_payload_min_bytes=4194560 compute_count=2 first_lanes=64 last_lanes=64 global_local_exact=1 status=%s\n", bad ? "FAIL" : "PASS");
   for (const auto &feature : kFeatures) {
     UINT lanes = 0;
     int featureBad = 0;

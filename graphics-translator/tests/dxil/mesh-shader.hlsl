@@ -342,3 +342,136 @@ float4 ps_early(VOut v) : SV_Target {
 }
 
 #include "mesh-shader-contract.hlsl"
+
+// SM6.6 optional MS/AS derivatives. Every invocation writes its identities and numerical
+// results, including a nonlinear field whose fine derivatives differ from the coarse ones.
+Texture2D<float> derivative_texture : register(t1);
+SamplerState derivative_sampler : register(s0);
+SamplerComparisonState derivative_compare : register(s1);
+
+void derivative_results(uint3 tid, uint3 dtid, uint3 gid, uint gi, uint threads, bool linear_quad) {
+  uint2 q = linear_quad ? uint2(gi & 1, (gi >> 1) & 1) : (tid.xy & 1);
+  float value = 100.0 * tid.z + 10.0 * tid.x + tid.y + tid.x * tid.y;
+  float2 uv = 0.25 + float2(q) * 0.125;
+  uint offset = (4 + (gid.x * threads + gi) * 24) * 4;
+  counters.Store4(offset, uint4(tid, gi));
+  counters.Store4(offset + 16, uint4(dtid, WaveGetLaneIndex() & 3));
+  counters.Store4(offset + 32, asuint(float4(value, ddx_fine(value), ddy_fine(value), ddx_coarse(value))));
+  counters.Store4(offset + 48, asuint(float4(ddy_coarse(value), QuadReadAcrossX(value),
+      QuadReadAcrossY(value), QuadReadAcrossDiagonal(value))));
+  counters.Store4(offset + 64, asuint(float4(QuadReadLaneAt(value, 3),
+      derivative_texture.CalculateLevelOfDetail(derivative_sampler, uv),
+      derivative_texture.CalculateLevelOfDetailUnclamped(derivative_sampler, uv),
+      derivative_texture.Sample(derivative_sampler, uv))));
+  half small = half(value);
+  counters.Store4(offset + 80, asuint(float4(derivative_texture.SampleBias(derivative_sampler, uv, 1.0),
+      derivative_texture.SampleCmp(derivative_compare, uv, q.x ? 0.3 : 0.2),
+      float(ddx_fine(small)), float(ddy_fine(small)))));
+}
+
+struct DerivativePayload { uint tag; };
+groupshared DerivativePayload derivative_payload;
+
+#define MS_DERIVATIVE_ENTRY(NAME, X, Y, Z, LINEAR) \
+[outputtopology("triangle")] [numthreads(X, Y, Z)] \
+void NAME(uint3 tid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID, \
+          uint3 gid : SV_GroupID, uint gi : SV_GroupIndex, \
+          out vertices VOut verts[1], out indices uint3 tris[1]) { \
+  SetMeshOutputCounts(1, 0); \
+  if (gi == 0) { verts[0].pos = float4(0, 0, 0, 1); verts[0].color = 0; } \
+  derivative_results(tid, dtid, gid, gi, X * Y * Z, LINEAR); \
+}
+
+#define AS_DERIVATIVE_ENTRY(NAME, X, Y, Z, LINEAR) \
+[numthreads(X, Y, Z)] \
+void NAME(uint3 tid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID, \
+          uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) { \
+  derivative_results(tid, dtid, gid, gi, X * Y * Z, LINEAR); \
+  if (gi == 0) derivative_payload.tag = 0x12345678; \
+  DispatchMesh(1, 1, 1, derivative_payload); \
+}
+
+MS_DERIVATIVE_ENTRY(ms_derivatives_1d, 32, 1, 1, true)
+MS_DERIVATIVE_ENTRY(ms_derivatives_2d, 8, 4, 1, false)
+MS_DERIVATIVE_ENTRY(ms_derivatives_3d, 4, 2, 2, false)
+AS_DERIVATIVE_ENTRY(as_derivatives_1d, 32, 1, 1, true)
+AS_DERIVATIVE_ENTRY(as_derivatives_2d, 8, 4, 1, false)
+AS_DERIVATIVE_ENTRY(as_derivatives_3d, 4, 2, 2, false)
+#ifdef DERIVATIVE_INVALID_SHAPE
+// Deliberately validator-disabled negative inputs; never counted as genuine valid shaders.
+MS_DERIVATIVE_ENTRY(ms_derivatives_invalid, 3, 1, 1, true)
+AS_DERIVATIVE_ENTRY(as_derivatives_invalid, 3, 1, 1, true)
+#endif
+
+[outputtopology("triangle")]
+[numthreads(4, 1, 1)]
+void ms_derivative_payload(uint gi : SV_GroupIndex, in payload DerivativePayload p,
+                           out vertices VOut verts[4], out indices uint3 tris[2]) {
+  SetMeshOutputCounts(4, 2);
+  verts[gi].pos = float4(float(gi & 1) * 2 - 1, 1 - float(gi >> 1) * 2, 0, 1);
+  verts[gi].color = p.tag == 0x12345678 ? float4(0, 1, 0, 1) : float4(1, 0, 1, 1);
+  if (gi < 2) tris[gi] = gi == 0 ? uint3(0, 1, 2) : uint3(1, 3, 2);
+}
+
+// Returning groupshared64 atomics across four physical SIMD groups, in both TG stages.
+groupshared uint64_t atomic64_shared;
+groupshared int64_t atomic64_signed;
+void group_atomic64(uint gi, uint group) {
+  if (gi == 0) {
+    for (uint op = 0; op < 9; ++op) {
+      const uint64_t initial = op == 4 || op == 5 ? 0xfffffff000000002ull : 0x200000002ull;
+      const uint64_t value = op == 4 || op == 5 ? 0xfffffff100000003ull : 0x100000001ull;
+      atomic64_shared = initial;
+      atomic64_signed = int64_t(initial);
+      uint64_t old;
+      int64_t signed_old;
+      switch (op) {
+      case 0: InterlockedAdd(atomic64_shared, value, old); break;
+      case 1: InterlockedAnd(atomic64_shared, value, old); break;
+      case 2: InterlockedOr(atomic64_shared, value, old); break;
+      case 3: InterlockedXor(atomic64_shared, value, old); break;
+      case 4: InterlockedMin(atomic64_signed, int64_t(value), signed_old); old = uint64_t(signed_old); break;
+      case 5: InterlockedMax(atomic64_signed, int64_t(value), signed_old); old = uint64_t(signed_old); break;
+      case 6: InterlockedMin(atomic64_shared, value, old); break;
+      case 7: InterlockedMax(atomic64_shared, value, old); break;
+      default: InterlockedExchange(atomic64_shared, value, old); break;
+      }
+      counters.Store<uint64_t>(16 + (group * 153 + op * 2) * 8, old);
+      counters.Store<uint64_t>(16 + (group * 153 + op * 2 + 1) * 8,
+          op == 4 || op == 5 ? uint64_t(atomic64_signed) : atomic64_shared);
+    }
+    uint64_t old;
+    atomic64_shared = 0x200000002ull;
+    InterlockedCompareExchange(atomic64_shared, 0x200000002ull, 0x300000003ull, old);
+    counters.Store<uint64_t>(16 + (group * 153 + 18) * 8, old);
+    counters.Store<uint64_t>(16 + (group * 153 + 19) * 8, atomic64_shared);
+    InterlockedCompareExchange(atomic64_shared, 0x200000002ull, 0, old);
+    counters.Store<uint64_t>(16 + (group * 153 + 20) * 8, old);
+    atomic64_shared = 0xffffffffffffffffull;
+    InterlockedAdd(atomic64_shared, 1, old);
+    counters.Store<uint64_t>(16 + (group * 153 + 21) * 8, old);
+    counters.Store<uint64_t>(16 + (group * 153 + 22) * 8, atomic64_shared);
+    InterlockedCompareStore(atomic64_shared, 0, 0x8000000000000000ull);
+    counters.Store<uint64_t>(16 + (group * 153 + 23) * 8, atomic64_shared);
+  }
+  if (gi == 0) atomic64_shared = 0;
+  GroupMemoryBarrierWithGroupSync();
+  uint64_t old;
+  InterlockedAdd(atomic64_shared, 0x100000001ull, old);
+  counters.Store<uint64_t>(16 + (group * 153 + 24 + gi) * 8, old);
+  GroupMemoryBarrierWithGroupSync();
+  if (gi == 0) counters.Store<uint64_t>(16 + (group * 153 + 152) * 8, atomic64_shared);
+}
+[outputtopology("triangle")] [numthreads(128, 1, 1)]
+void ms_groupshared64(uint gi : SV_GroupIndex, uint3 group : SV_GroupID,
+                      out vertices VOut verts[1], out indices uint3 tris[1]) {
+  SetMeshOutputCounts(1, 0);
+  if (gi == 0) { verts[0].pos = float4(0, 0, 0, 1); verts[0].color = 0; }
+  group_atomic64(gi, group.x);
+}
+[numthreads(128, 1, 1)]
+void as_groupshared64(uint gi : SV_GroupIndex, uint3 group : SV_GroupID) {
+  group_atomic64(gi, group.x);
+  if (gi == 0) derivative_payload.tag = 0x12345678;
+  DispatchMesh(1, 1, 1, derivative_payload);
+}

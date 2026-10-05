@@ -1,109 +1,70 @@
-# D3D12 core contracts audit
+# D3D12 core API 계약
 
-> **현재 상태 주의:** 이 문서는 2026-09-19 import 당시의 audit 기록이다. 이후 루트 `src/`에서 기본 DXIL·query·bundle·predication·fence/residency 및 선정 P1-A–D가 구현·검증됐다. 2026-09-29에는 fullscreen 오류·전환, D3D12 HDR10 metadata와 color-space 지원·적용 순서를 구현·검증했다. 기존 D3D11 변경은 유지하되 D3D12에 필수인 경우 외에는 추가 수정하지 않는다. **선정 항목 완료와 P1 전체 완료는 다르다.** Format 지원 보고와 HDR/color-space의 검증 경계 등 현재 판정은 [구현 상태 문서](CORE-IMPLEMENTATION-STATUS.ko.md#p1-완료-판정과-남은-계약)를 기준으로 하며 아래의 당시 blocker 설명은 provenance로 보존한다.
+2026-10-02 루트 `src/` 기준의 API 진입점·실패·수명 계약 참조다. 빌드는 [README](../README.md), 전체 지원 보고와 남은 구현 후보는 [현재 상태](CORE-IMPLEMENTATION-STATUS.ko.md#현재-지원-상태), 실행 증거의 가용성은 [검증 범위](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)를 따른다. 이 문서의 소스 대조는 새 Wine/GPU 실행이 아니다.
 
-이 문서는 `graphics-translator/patches/0009-d3d12-core-contracts.patch`가 고친 D3D12 기본 계약과 아직 남아 있는 ZZZ/Unity 시작·렌더 경로 blocker를 기록한다. 기준은 `build/owned-graphics-20260919/dxmt`를 복제한 뒤 `0007-queue-order.patch`까지 적용한 private snapshot이다. GPU, Wine, 게임 실행은 이 작업 범위에서 하지 않았다.
+## Command list 생성·기록·제출
 
-## 이번 수정
+- `ID3D12Device4::CreateCommandList1`은 **closed** list를 만든다. `GetType()`은 allocator 존재 여부와 무관하게 생성 시 지정한 type을 반환한다. `NodeMask > 1` 또는 `Flags != NONE`은 `E_INVALIDARG`다. 실패 출력은 먼저 null로 정리한다.
+- `Reset`은 같은 device·같은 type의 allocator와 같은 device의 initial PSO를 요구한다. recording 상태, allocator 사용 중 여부, 이전 `Close` 실패를 검증한다. 지원하지 않는 명령이나 잘못된 recording 인수는 first error를 보존하고 `Close`에서 드러낸다.
+- Queue는 닫힌 list, queue/list type, device 소유권, allocator recording generation과 제출 수명을 확인한다. 번들은 queue에 직접 제출하지 않고 DIRECT list의 `ExecuteBundle`로 확장한다. 상세는 [bundle 계약](D3D12-BUNDLES.ko.md), 제출·retirement는 [queue 계약](QUEUE-ORDER.ko.md)을 따른다.
+- allocator의 root/indirect/immediate payload GPU arena는 **초기 4 MiB retained chunk**에서 시작하고, 부족하면 `max(요청 크기, 4 MiB)` chunk를 추가한다. 기존 CPU pointer·Metal buffer·GPU VA를 이동하지 않고 virtual offset을 실제 chunk의 buffer/local offset/address로 resolve한다. Shared allocator의 여러 list와 제출 lease는 같은 chunk 소유권을 GPU retirement까지 유지한다. Reset은 사용 중이면 거부하고 retirement 후 추가 chunk를 해제하며 첫 chunk를 재사용한다. Native buffer 길이·SIZE_T·allocation 실패는 first recording error와 `Close`의 `E_OUTOFMEMORY`로 전달한다. **무제한 recording 지원이나 물리 메모리 고갈 검증을 뜻하지 않는다.** [성장·replay·실패 주입 focused proof와 남은 경계](CORE-IMPLEMENTATION-STATUS.ko.md#rootindirect-arena-성장과-focused-proof)를 따른다.
 
-### ID3D12Device4::CreateCommandList1
+소스: [`d3d12_device.cpp`](../src/d3d12/d3d12_device.cpp)의 `CreateCommandList1`, [`d3d12_command_list.cpp`](../src/d3d12/d3d12_command_list.cpp)의 `Reset`/`Close`/`RecordError`, [`d3d12_command_allocator.cpp`](../src/d3d12/d3d12_command_allocator.cpp)의 `ReserveGPUHeap`/`ResolveGPUHeap`, [`d3d12_command_allocator.hpp`](../src/d3d12/d3d12_command_allocator.hpp)의 `AllocateGPUHeap`.
 
-기존 구현은 `E_NOTIMPL`만 반환했다. Device4를 노출하는 이상 Unity 또는 middleware가 이 진입점을 합법적으로 사용할 수 있다.
+## Resource와 protected session
 
-이번 구현은 다음 계약을 보장한다.
+`CreateCommittedResource1`/`CreateHeap1`의 protected-session 인수는 optional이다. null이면 일반 생성 경로로 위임하고, 유효한 null-output capability probe는 기존 `S_FALSE` 계약을 사용한다. 실제 protected session은 `E_NOTIMPL`이며 output을 null로 정리한다. Resource 생성·view·copy·residency·공유 조건은 [resource 계약](D3D12-RESOURCES.ko.md), format/quality 판정은 [capability 정책](CAPABILITIES.ko.md)을 따른다.
 
-- `CreateCommandList1`이 만든 command list는 recording 상태가 아니라 closed 상태로 시작한다.
-- list type은 allocator가 없더라도 `GetType()`에서 안정적으로 반환된다.
-- `NodeMask > 1`, 정의되지 않은 command-list flags, 지원하지 않는 list type은 `E_INVALIDARG`로 거절한다.
-- output pointer는 실패 전에 null로 초기화한다.
-- 이후 `Reset()`은 같은 device와 같은 list type의 allocator만 허용한다.
-- initial PSO가 전달되면 PSO도 같은 device 소유인지 검증한다.
+## Shader·PSO·pipeline library
 
-참고 계약: Microsoft `ID3D12Device4::CreateCommandList1`, `ID3D12GraphicsCommandList::Reset` 문서.
+현재 DXBC와 DXIL은 project-owned AIR lowering으로 연결된다. import 당시의 “DXIL chunk를 만나면 즉시 `E_NOTIMPL`”은 현재 동작이 아니다. shader stage/opcode별 지원과 검증 경계는 canonical 상태 문서에만 유지한다.
 
-### CreateCommittedResource1 / CreateHeap1
+Graphics/compute PSO 생성은 null descriptor를 거절하고 실패 출력을 null로 정리한다. `GetCachedBlob`/`CachedPSO`와 `CreatePipelineLibrary`는 구현돼 있으며 다음을 구분한다.
 
-protected-resource session 포인터는 optional이다. 기존 코드는 session이 null이어도 무조건 `E_NOTIMPL`이었다.
-
-이번 구현은 session이 null이면 기존 `CreateCommittedResource` / `CreateHeap` 경로로 위임한다. 따라서 일반 리소스/heap 생성과 `ppResource == nullptr` 또는 `ppHeap == nullptr` capability probe의 기존 `S_FALSE` 동작도 그대로 사용한다. 실제 protected-resource session이 전달된 경우에는 지원하지 않는 기능을 성공으로 위장하지 않고 `E_NOTIMPL`을 유지하며 output을 null로 정리한다.
-
-참고 계약: Microsoft `ID3D12Device4::CreateCommittedResource1`, `ID3D12Device4::CreateHeap1` 문서.
-
-### pipeline-state 입력/출력 계약
-
-graphics/compute PSO helper는 null descriptor를 `E_INVALIDARG`로 거절하고 output pointer를 먼저 null로 초기화한다. compute helper는 기존에 실패 시 caller가 넘긴 output 값을 보존할 수 있었다.
-
-### 첫 shader 종류 진단
-
-실제 ZZZ가 첫 PSO에서 DXBC/SM5 계열을 넘기는지 DXIL을 넘기는지는 실제 게임 실행 전에는 확정할 수 없다. 그래서 shader 초기화 진입점에 bounded diagnostic을 추가했다.
-
-프로세스당 처음 16개 shader 초기화만 다음 메타데이터를 `d3d12.log`의 info level로 남긴다.
-
-- stage: `VS`, `PS`, `CS`
-- bytecode byte count
-- SHA-1
-- container chunk: `DXIL`, `SHEX`, `SHDR`, `invalid-container`, 또는 `unknown`
-- 최종 초기화 HRESULT
-
-raw shader bytecode는 기록하지 않는다. DXIL을 발견했을 때도 현재와 동일하게 `E_NOTIMPL`을 반환하므로 이 진단은 지원 범위를 바꾸지 않는다.
-
-## ResourceBarrier audit
-
-현재 `ResourceBarrier`는 transition/UAV/aliasing barrier를 받을 때 command allocator의 현재 Metal encoder를 끝내는 경계를 만든다. 이 D3D12 경로의 texture/buffer는 hazard tracking이 필요한 곳에서 Metal `untracked` 모드를 사용하므로, encoder 경계 뒤 queue encoder가 fence update/wait를 넣는 현재 방식은 valid legacy barrier에 대해 보수적인 실행 순서를 만든다.
-
-Apple의 Metal 문서도 `MTLHazardTrackingMode.untracked` 리소스에서는 애플리케이션이 barrier/fence/event로 안전한 접근 순서를 직접 보장해야 한다고 명시하고, `MTLFence`를 producer pass에서 update한 뒤 consumer pass에서 wait하는 방식으로 pass 사이 메모리 연산을 순서화한다고 설명한다. 현재 DXMT-derived queue encoder의 fence update/wait 구조는 이 계약과 방향이 일치한다.
-
-이 방식은 resource state를 세밀하게 추적하지 않고 필요한 경우보다 더 자주 encoder를 나누지만, 이번 감사에서 barrier를 생략해 write/read ordering을 깨뜨리는 근거는 찾지 못했다. 따라서 `0009`에서 barrier 본문을 바꾸지 않았다.
-
-split transition barrier는 command list 하나에 국한되지 않는다. `BEGIN_ONLY` 이후 다른 command list에서 `END_ONLY`가 올 수 있으므로 list-local pending-state map을 추가하면 잘못된 검증기가 된다. 현재 구현은 BEGIN과 END 모두 encoder boundary로 처리해 transition을 일찍 완료할 수 있으나 순서 안정성은 보존한다. 정확한 split-barrier state machine을 추가하려면 queue submission 범위의 resource-state tracking이 필요하다.
-
-참고 계약: Microsoft `Using Resource Barriers to Synchronize Resource States in Direct3D 12`, DirectX-Specification resource barrier 문서, Apple `MTLHazardTrackingMode.untracked`, `MTLFence`, `Synchronizing passes with a fence` 문서.
-
-## DXIL blocker와 가능한 project-owned 경로
-
-현재 PSO frontend는 DXBC container를 읽은 뒤 `DXIL` chunk를 발견하면 즉시 `E_NOTIMPL`을 반환한다. `SHEX`/`SHDR` 경로만 `SM50Initialize`와 기존 `airconv`를 통해 AIR/Metal library로 변환된다. 따라서 실제 ZZZ PSO가 DXIL을 사용하면 이것은 즉시 렌더 시작 blocker다.
-
-로컬 `build/owned-graphics-20260919/llvm-project`는 LLVM `llvmorg-15.0.7` 기반이며 DirectX target, DXIL writer/op-lowering, DXContainer parser, generic LLVM bitcode reader를 포함한다. 그러나 현재 project source에는 기존 DXIL container를 읽어 resource/signature metadata와 `dx.op.*` 의미를 project의 AIR resource/root-signature ABI로 낮추는 frontend가 없다. LLVM 15의 DirectX backend 파일을 링크하는 것만으로 DXIL→Metal 지원이 생기지 않는다.
-
-project-owned 구현 경로는 다음 순서가 현실적이다.
-
-1. 현재 upstream LLVM의 DXIL read/upgrade 구성요소를 project-owned LLVM에 port하거나 project LLVM을 해당 reader가 있는 버전으로 올려, DXIL chunk 안의 LLVM 3.7 계열 bitcode와 DXIL metadata/ops를 현대 LLVM IR로 복원한다.
-2. shader model, entry point/signature, SRV/UAV/CBV/sampler metadata와 resource handle 연산을 현재 D3D12 root-signature/descriptor ABI로 매핑하는 DXIL frontend를 `airconv`에 추가한다.
-3. `dx.op.*`별 semantic lowering을 AIR intrinsics와 Metal resource access로 구현하고 VS/PS/CS부터 단계적으로 검증한다.
-4. 현재 SM5 path와 동일하게 Metal library 생성, reflection, cache key, root-signature specialization에 연결한다.
-5. 실제 ZZZ first-PSO probe가 DXIL을 확인한 뒤 그 shader hash부터 fixture로 고정해 compiler coverage를 확장한다.
-
-대안으로 오픈소스 DXIL→SPIR-V frontend와 SPIR-V→MSL backend를 vendoring할 수 있지만, 현재 root-signature/descriptor/AIR ABI와 별도 backend를 접합해야 하므로 현 소스 구조에서는 작은 integration이 아니다. 어떤 경로도 현재 `E_NOTIMPL`을 성공으로 바꾸는 방식으로 대체해서는 안 된다.
-
-관련 upstream 참고: LLVM DirectX/DXIL Architecture, LLVM DXContainer, Microsoft DirectXShaderCompiler DXIL specification.
-
-## 당시 blocker와 현재 루트의 대응
-
-이 절의 원래 blocker 목록은 이후 구현으로 상당 부분 해소됐다. 현재 루트 기준으로는 다음처럼 읽어야 한다.
-
-| 2026-09-19 당시 항목 | 현재 루트 상태 |
+| 계약 | 현재 경로 |
 |---|---|
-| DXIL PSO hard failure | 기본 VS/PS/CS DXIL frontend/lowering과 실제 frozen-DXIL GPU fixture가 추가됐다. 모든 DXIL/SM 지원은 아니다. |
-| query heap / BeginQuery / EndQuery / ResolveQueryData 없음 | timestamp·occlusion/binary-occlusion, SO statistics와 88-byte `PIPELINE_STATISTICS`를 구현·검증했다. MSAA 실제 실행을 수정한 DXBC/DXIL 346개 GPU case·26개 validation case의 범위와 증거는 상태 문서 P1-C 참조. |
-| `ExecuteBundle` 미구현 | bundle recording/replay와 GPU fixture가 구현·검증됐다. |
-| `SetPredication` 미구현 | GPU snapshot 기반 predication과 direct/indirect/copy/resolve/clear 경로가 구현·검증됐다. |
-| `SetEventOnMultipleFenceCompletion` 미구현 | logical fence latch 기반 single/ANY/ALL/null event와 CPU/GPU rewind가 구현·검증됐다. |
-| `CreatePipelineLibrary / GetCachedBlob` 미구현 | Graphics/compute `GetCachedBlob`과 `CachedPSO`는 구현됐다. `CreatePipelineLibrary`는 여전히 `E_NOTIMPL`이다. |
-| residency extensions 미구현 | `MakeResident`, `Evict`, `SetResidencyPriority`, `EnqueueMakeResident`와 residency-set accounting이 구현됐다. |
+| Single-PSO cache | descriptor·root signature·shader identity를 포함하는 key와 backend identity를 검증한다. |
+| Pipeline library | `ID3D12PipelineLibrary1`의 `StorePipeline`, graphics/compute load, stream `LoadPipeline`, size/serialize를 구현한다. 같은 device의 PSO만 저장하며 같은 이름·다른 descriptor 또는 kind로 load하면 `E_INVALIDARG`다. |
+| Serialized library | adapter identity 불일치는 `D3D12_ERROR_ADAPTER_NOT_FOUND`, driver/backend identity 또는 version 불일치는 `D3D12_ERROR_DRIVER_VERSION_MISMATCH`, 손상된 blob은 `E_INVALIDARG`로 구분한다. 타 GPU/빌드 간 영구 호환 캐시로 취급하지 않는다. |
+| Shader-cache session/control | Application-managed MEMORY/DISK sessions, exact binary key/value·cross-device backing·persistence/isolation/version/final deletion을 구현한다. null-output creation은 S_FALSE/no mutation, developer-mode APPLICATION_MANAGED disable/enable/clear를 지원한다. [오류 선택·CPU 양 ABI proof](CORE-IMPLEMENTATION-STATUS.ko.md#shadercachesessioncontrol-완료와-focused-proof)를 따른다. Automatic/driver-managed cache·native Metal archive 지원으로 확대하지 않는다. |
 
-선정한 P1-A–D(`AtomicCopyBufferUINT/UINT64`, `ResizeBuffers1` present-queue 계약, pipeline statistics, VS→Stream Output/SO statistics)는 명시된 지원 범위에서 구현·검증을 마쳤다. 이후 SO format 보고, mip·typed cast·depth/stencil view, D24 plane copy와 지원 보고의 후속 결과는 [현재 capability 정책](CAPABILITIES.ko.md)에 기록한다. **P1 전체는 아직 완료가 아니다.** 남은 기본 format/지원 보고·DXGI presentation 계약과 검증 범위는 [완료 판정](CORE-IMPLEMENTATION-STATUS.ko.md#p1-완료-판정과-남은-계약)에 구분했다. D3D10/11 전용 작업은 별도 완료 조건으로 확장하지 않는다. GS/HS/DS 및 이에 의존하는 SO 확장, reserved/tiled/shared-handle/enhanced barrier와 pipeline library는 기존 계획대로 P2에서 추적하며, P1을 미완료로 유지하기 위해 P2 항목을 끌어오지 않는다.
+소스: [`d3d12_pipeline_library.cpp`](../src/d3d12/d3d12_pipeline_library.cpp), [`d3d12_pipeline_cache.cpp`](../src/d3d12/d3d12_pipeline_cache.cpp), [`d3d12_shader_cache.cpp`](../src/d3d12/d3d12_shader_cache.cpp), device의 `D3D12_FEATURE_SHADER_CACHE`/`CreateShaderCacheSession`/`ShaderCacheControl`.
 
-기존 actual-game static 조사(`ZZZ-COMPATIBILITY.ko.md`)에서 Unity 초기화가 확인한 feature query는 `D3D12_OPTIONS`, `FEATURE_LEVELS`, `D3D12_OPTIONS5`, `D3D12_OPTIONS7` 네 종류다. 앞의 둘과 OPTIONS7은 구현되어 있고, OPTIONS5 실패는 해당 Unity 경로에서 RT 기능을 비활성화한 뒤 계속 진행한다. 따라서 OPTIONS5의 `E_NOTIMPL`을 이번 core startup blocker로 취급하지 않았다.
+## Barrier·query·predication
 
-## 검증
+Legacy transition/UAV/aliasing barrier는 pass 경계를 만들고 queue encoder의 fence ordering과 연결된다. Enhanced barrier·render pass도 구현 경로가 있으므로 “legacy barrier만 있음”이나 “enhanced barrier가 모두 미구현”으로 설명하지 않는다. Enhanced barrier의 access/layout validation은 [`d3d12_enhanced_barrier.hpp`](../src/d3d12/d3d12_enhanced_barrier.hpp)와 command-list `Barrier`가 기준이다. 정확한 지원 범위는 [현재 상태](CORE-IMPLEMENTATION-STATUS.ko.md#현재-지원-상태)를 따른다.
 
-CPU-only x86-64 Windows cross build에서 `src/d3d12/d3d12.dll` 링크가 통과했다. 별도 `graphics-translator/tests/owned-d3d12-core-contracts.cpp` PE fixture도 `-Wall -Wextra`로 빌드했다. fixture는 다음을 검증하도록 작성했다.
+Timestamp·occlusion·pipeline/SO statistics와 GPU snapshot predication도 현재 구현 경로다. COPY queue timestamp는 아래 계약으로 구현됐으며 [x64/WoW64 focused proof](CORE-IMPLEMENTATION-STATUS.ko.md#copy-queue-timestamp-완료와-focused-proof)를 따른다. 통계 query 하나의 PASS를 모든 shader stage와 모든 workload의 정확성 증명으로 확대하지 않는다.
 
-- `CreateCommandList1` closed-state와 `GetType()`
-- matching / wrong-type / foreign-device allocator `Reset`
-- invalid node mask / flags / list type와 output clearing
-- null PSO descriptor와 output clearing
-- null protected session의 `CreateCommittedResource1` / `CreateHeap1`
-- null output capability probe의 `S_FALSE`
+### Timestamp heap/list/clock 계약
 
-이 worker의 범위에서는 Wine/GPU/game을 실행하지 않았으므로 fixture runtime result와 first-PSO shader kind는 prime의 실제 runtime gate에서 확인해야 한다.
+- OPTIONS3의 `CopyQueueTimestampQueriesSupported=TRUE`. COPY timestamp heap은 기존 native GPU counter storage와 GPU resolve를 재사용한다. Native ABI·D3D11·공개 SM/FL 상한은 변경하지 않는다.
+- `EndQuery`와 `ResolveQueryData`의 query type은 `D3D12_QUERY_TYPE_TIMESTAMP`다. **COPY list는 COPY_QUEUE_TIMESTAMP heap만**, **DIRECT/COMPUTE list는 일반 TIMESTAMP heap만** 허용한다. 반대 heap/list 조합 및 timestamp `BeginQuery`는 `E_INVALIDARG` recording 오류를 남기며 `Close`에서 실패한다. COPY 지원을 일반 TIMESTAMP heap 사용 허용으로 해석하지 않는다.
+- Heap/device ownership, index·count의 overflow-safe 범위, buffer destination/device ownership, 8-byte resolve offset alignment와 destination 범위를 검사한다. Invalid recording 뒤 `Close` 오류 우선순위와 allocator slot 해제는 기존 계약을 따른다.
+- `GetTimestampFrequency`는 DIRECT/COMPUTE/COPY에 기존 native GPU ticks/second를 반환한다. `GetClockCalibration`의 GPU 값은 기존 native paired timestamp sample이고, CPU 값은 native 호출을 감싼 **Wine QueryPerformanceCounter 전후 midpoint**다. Native host CPU tick의 epoch/frequency를 Wine QPC와 동일하다고 가정하지 않는다. Null output은 `E_INVALIDARG`이며 native 정보원 실패는 성공으로 위장하지 않는다.
+- Timestamp sample은 기록 지점까지의 queue ordering과 연결하고 resolve는 completion 전에 CPU timestamp로 채우지 않는다. [COPY proof](CORE-IMPLEMENTATION-STATUS.ko.md#copy-queue-timestamp-완료와-focused-proof)는 동일 COPY queue의 sample ordering·duplicate resolve·same-slot reuse·guard·exact copy payload를 확인한다. **COPY GPU workload duration 정확성이나 동기화 없는 queue 간 sample 비교**를 증명한 것은 아니다. 기존 fence-dependent cross-queue proof와 구분한다.
+
+## Device removal과 DXGI memory budget 계약
+
+- `ReportRemoval`은 실제 backend 오류의 reason을 게시하고 등록 fence epoch를 terminal removal로 전환한다. Fence의 `GetCompletedValue`는 `UINT64_MAX`, 오류 후 새 `SetEventOnCompletion`은 `DXGI_ERROR_DEVICE_REMOVED`다. [Fence 계약](FENCE-EVENTS.ko.md)을 참고한다.
+- **`ID3D12Device5::RemoveDevice()`는 `ReportRemoval(DXGI_ERROR_DEVICE_REMOVED)`를 호출한다.** 기존 first-error 경로를 재사용해 먼저 기록된 removal reason을 보존하고 등록 fence epoch를 terminal로 전환한다. Pending fence event와 queue wait는 해제되며 fence는 `UINT64_MAX`를 보고한다. Blocked DIRECT/COPY queue의 never-submitted 작업은 discard하되 이미 제출된 GPU 소유권은 기존 retirement 경로를 유지한다. 반복 제거는 멱등이다. 새 event 등록·fence 생성 등 관찰한 오류 경로와 기존 removal guard를 모든 API의 일괄 차단으로 확대하지 않는다. [수정 전 실패 → x64/WoW64 focused 완료 증거와 범위](CORE-IMPLEMENTATION-STATUS.ko.md#removedevice-완료와-focused-proof)를 따른다.
+- DXGI budget notification은 [`DxgiBudgetNotifications`](../src/dxgi/owned_budget_notification.hpp)가 실제 retained WMT device의 `recommendedMaxWorkingSetSize`를 관찰한다. 이는 `QueryVideoMemoryInfo.Budget`와 같은 64-bit 정보원이며, 등록이 있는 동안 nominal **500 ms polling**으로 변화를 비교해 event를 signal한다. Native Metal budget-change callback/KVO 보장을 전제하지 않는다. `QueryBudget`·등록·worker의 read/compare/`SetEvent`는 직렬화돼 첫 worker 관찰 전에 일어난 변화를 baseline 갱신으로 삼키지 않는다.
+- 등록은 `EVENT_MODIFY_STATE`만 필요한 Event handle을 복제해 소유하고, 같은 event의 중복 등록에도 서로 다른 active opaque cookie를 발급한다. 권한·type 검증은 비변경 `NtQueryObject` 조회이며 강제 initial signal/reset이 없다. Caller가 원본 handle을 닫아도 등록은 유지된다. Unregister는 signal과 직렬화해 해당 duplicate만 닫고, `Stop`은 adapter/device teardown 전에 worker를 join한다.
+- 알림은 budget을 다시 조회하라는 hint이며 coalescing과 sample 사이 A→B→A 누락이 가능하다. Windows scheduler budget 전체 구현이나 실제 물리 budget 변화의 positive 관측을 주장하지 않는다. UMA VRAM·usage/reservation 정책은 바꾸지 않았다. [완료와 x64/WoW64 focused proof](CORE-IMPLEMENTATION-STATUS.ko.md#dxgi-budget-notification-완료와-focused-proof), 상세 [resource 계약](D3D12-RESOURCES.ko.md#residency와-dxgi-memory-budget)을 따른다.
+
+## 역사적 audit: 2026-09-19 import
+
+[0009 frozen patch](patches/0009-d3d12-core-contracts.patch)는 private import snapshot의 `CreateCommandList1`, null protected-session 위임, PSO 입력/출력 정리를 보정했다. 당시 source는 `build/owned-graphics-20260919/dxmt` 복제본에 0007까지 적용한 상태였으며 **루트 소스의 최신 patch series가 아니다**.
+
+당시 x86-64 PE cross-build와 [core fixture](tests/owned-d3d12-core-contracts.cpp) compile은 통과했지만 그 audit worker는 Wine/GPU/game을 실행하지 않았다. Fixture는 closed-state/type, wrong-type/foreign allocator, node/flag/type 오류와 output clearing, null PSO, protected-session null과 `S_FALSE` probe를 확인하도록 작성됐다. 이후 실행 기록은 [구현 이력](IMPLEMENTATION-HISTORY.ko.md)에서 구분한다.
+
+당시 발견한 DXIL·bundle·predication·query·multiple-event·pipeline-library blocker는 후속 구현으로 대체됐다. LLVM backend 파일을 링크하는 것만으로 DXIL resource/signature/op lowering이 생기지 않는다는 설계 근거는 여전히 유효하지만, 당시 제안은 현재 남은 구현 목록이 아니다. Shader 첫 16개 diagnostic의 stage/bytecount/SHA-1/container/HRESULT 기록도 당시 bounded 진단 설명이며 실제 게임의 첫 PSO 관측 증거를 대신하지 않는다.
+
+`build/`의 이전 snapshot·binary·로그는 2026-10-02 삭제로 현재 보유하지 않는다. 당시 compile 관찰을 새 실행이나 현재 artifact로 표현하지 않는다. Frozen patch와 provenance는 그대로 보존한다.
+
+## 참고 계약
+
+- [CreateCommandList1](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device4-createcommandlist1)
+- [Reset](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-reset)
+- [CreatePipelineLibrary](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device1-createpipelinelibrary)
+- [RemoveDevice](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device5-removedevice)

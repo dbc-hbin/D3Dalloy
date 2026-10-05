@@ -1,83 +1,68 @@
-# Owned D3D12 NGX frontend 구현
+# D3D12 NGX frontend API
 
-2026-09-19 기준 `build/owned-graphics-20260919/ngx-work`의 pinned DXMT
-`7c8dee1c2d73415301ceb7d1fa810861cef4cd67`에 D3D12 NGX frontend를 독립 구현했다.
-Prime candidate와 runtime snapshot은 이 작업에서 수정하지 않았다.
+현재 루트 `src/nvngx`를 기준으로 한 API 안내다(2026-10-02). D3D12 NGX는 **구현되어 있다**. 전체 지원 선언·완료 범위는 [현재 상태](CORE-IMPLEMENTATION-STATUS.ko.md#현재-지원-상태), 실행 증거는 [검증 범위](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)가 기준이다. 기존 D3D11 frontend의 기능 확대는 이 문서의 범위가 아니다.
 
-공유 ABI는 Prime이 게시한 `src/d3d12/d3d12_interfaces.hpp`를 byte-for-byte 복사해 read-only로 사용한다.
-현재 checksum은 `b103d89b67800b4588c935e1332ce378cf280582c39fb6aa3e9291b25dbde758`이다.
-Create/Frame descriptor 모두 첫 `UINT StructSize`에 `sizeof(desc)`를 넣고 backend가 크기를 검증한다.
-Command-list extension의 `ValidateRecording()`을 Create/Evaluate 양쪽 진입에서 호출하므로 closed/copy/bundle list를
-frontend에서 명시적으로 실패시킬 수 있다.
+## 구현과 export
 
-구현 export는 기존 D3D11 frontend를 그대로 둔 채 다음 D3D12 surface를 추가한다.
+| 현재 파일 | 역할 |
+|---|---|
+| `src/nvngx/nvngx.cpp` | 기존 D3D11 exports·DLL 초기화·NV extension gate |
+| `src/nvngx/nvngx_d3d12.cpp` | D3D12 device/parameter/feature registry, public result mapping, create/frame parsing |
+| `src/nvngx/nvngx_d3d12_msvc.cpp` | Microsoft C++ ABI parameter facade와 C linkage storage bridge |
+| `src/nvngx/meson.build` | x64 MSVC facade object와 MinGW frontend를 같은 builtin `nvngx.dll`에 링크 |
+| `src/d3d12/d3d12_interfaces.hpp` | DLL 간 project-owned COM 계약 |
 
-- `NVSDK_NGX_D3D12_Init`, `Init_Ext`, `Init_ProjectID`, `Init_with_ProjectID`
+구현된 `NVSDK_NGX_D3D12_` export는 다음 **16개**다.
+
+- `Init`, `Init_Ext`, `Init_ProjectID`, `Init_with_ProjectID`
 - `Shutdown`, `Shutdown1`
 - `GetParameters`, `AllocateParameters`, `GetCapabilityParameters`, `DestroyParameters`
 - `GetScratchBufferSize`, `GetFeatureRequirements`
 - `CreateFeature`, `EvaluateFeature`, `EvaluateFeature_C`, `ReleaseFeature`
 
-기존 DXMT D3D11 shim은 historical `0x0BAD000x` failure 값을 사용한다. 이를 수정하면 기존 D3D11 behavior를
-바꾸게 되므로 그대로 보존했다. 새 D3D12 exports는 NVIDIA public `NVSDK_NGX_Result` ABI의 실제
-`0xBAD00000` prefix를 별도 상수로 사용한다. 예를 들어 InvalidParameter는 `0xBAD00005`,
-UnsupportedParameter는 `0xBAD00010`이다.
+지원 feature는 `SuperSampling`(id1), `FrameGeneration`(id11), `RayReconstruction`(id13)이다. 실제 backend는 각각 Metal4FX TemporalScaler, owned MetalFX FrameInterpolator, Metal4FX TemporalDenoisedScaler다. `GetScratchBufferSize`는 셋에0을 반환하며 owned backend scratch가 없다는 뜻이 아니다. 나머지 enum의 unsupported inventory와 정확한 입력 경계는 [integration](NGX-INTEGRATION.ko.md#public-non-sr-feature-inventory)을 따른다. Init metadata는 별도 모델/서비스 선택에 쓰이지 않는다. NVIDIA neural model·NGX 전체·게임 loader 지원 선언이 아니다.
 
-또한 upstream `NVNGXParameter` class의 virtual order는 현재 NVIDIA `NVSDK_NGX_Parameter` declaration과 다르다.
-D3D12에서 이 MinGW vtable을 그대로 반환하지 않는다. `nvngx_d3d12_msvc.cpp`를
-`--target=x86_64-pc-windows-msvc -fno-rtti -fno-exceptions`로 별도 compile해 공식 순서의 facade vftable을 만들고,
-모든 Set/Get/Reset을 C linkage callback으로 MinGW `ParametersImpl` storage에 전달한다. 따라서 기존 D3D11 object는
-변경하지 않으면서 D3D12 Get/Allocate/CapabilityParameters는 Microsoft C++ ABI object를 반환한다.
+D3D12의 success는 `0x00000001`, failure는 NVIDIA public `0xBAD00000` 계열이다. 기존 D3D11 shim의 historical `0x0BAD000x` 값은 변경하지 않는다. 두 결과 공간을 혼용하지 않는다.
 
-`Init` 계열은 `ID3D12Device`에서 project-owned `IMTLD3D12DeviceExt`만 QI하고
-`SupportsTemporalUpscale`을 확인한다. Metal/WMT/D3DMetal native pointer는 `nvngx.dll`에 노출되지 않는다.
-CreateFeature는 command list의 device가 초기화된 동일 COM identity인지 확인하고, node mask를
-`ID3D12Device::GetNodeCount()` 범위 안에서 검증한 뒤 `CreateTemporalUpscaleState`에 logical create contract를 넘긴다.
+## Microsoft parameter ABI
 
-feature handle은 raw backend pointer가 아니다. process-lifetime unique token을 key로 한 mutex-protected registry에서
-`shared_ptr<FeatureState>`를 찾는다. Evaluate는 lock 안에서 strong reference를 복사한 뒤 backend를 호출하므로
-동시 ReleaseFeature와 겹쳐도 frontend feature/backend COM state가 호출 도중 사라지지 않는다. Release는 registry에서
-active entry만 제거한다. token address는 session 중 재사용하지 않아 stale handle이 새 feature로 우연히 재해석되지 않는다.
+`NVSDK_NGX_Parameter`는 COM이 아닌 C++ virtual interface다. D3D12 호출자에게 MinGW `NVNGXParameter` vtable을 직접 반환하지 않는다. MSVC-target facade가 다음 공식 순서로 storage에 전달한다.
 
-현재 backend/WMT가 정확히 표현할 수 있는 첫 기능 범위는 captured flags74 경로다.
+1. Set 8개: `unsigned long long`, `float`, `double`, `unsigned int`, `int`, `ID3D11Resource*`, `ID3D12Resource*`, `void*`
+2. Get 8개: 같은 typed 순서
+3. Reset
 
-- backend가 명시적으로 인식하는 `IsHDR`, `MVLowRes`, `DepthInverted`, `DoSharpening`(deprecated),
-  `AutoExposure` bit를 create-time 지원 bit로 허용한다. flags74는 이 집합의 LDR subset이다.
-- high-resolution MV mode와 `MVJittered`/Alpha/reserved/unknown bit는 명시적
-  `NVNGX_RESULT_FAIL_UnsupportedParameter`로 반환한다. `DoSharpening` bit 자체와 별개로 nonzero `Sharpness` scalar는
-  현재 WMT/backend가 sharpening operation을 표현하지 않으므로 unsupported다.
-- color/output/depth/motion resource는 필수다.
-- render width/height가 없으면 create input extent를 사용하며 한쪽만 존재하면 실패한다.
-- color/depth/MV/bias/output 및 translucency subrect offset은 현재 0만 지원한다.
-- bias-current mask와 transparency mask가 실제 non-null이면 실패한다.
-- jitter는 finite 값을 그대로 보존한다.
-- MV scale은 missing 시 1이며 명시적 0/nonfinite는 invalid parameter다.
-- raw `DLSS.Pre.Exposure=0`은 semantic `1.0`, raw `DLSS.Exposure.Scale=0`도 semantic `1.0`으로 정규화한다.
-- non-identity Exposure.Scale와 nonzero Sharpness는 현재 WMT가 표현하지 못하므로 unsupported를 반환한다.
-- Reset missing은 false이며 caller 값만 frame descriptor에 기록한다. 새 scaler generation의 첫-execution reset은 backend/queue가 담당한다.
+D3D12만 사용해도 D3D11 resource slot은 **공식 ABI의 일부**이므로 보존한다. 공식 SDK snapshot은 `external/nvngx/include/`이고 라이선스는 `external/nvngx/LICENSE.txt`다. Slot 검사에는 공식 header로 컴파일한 consumer object를 사용한다([검증 레시피](NGX-TEST.ko.md#cpupe-abi-검사)).
 
-이 strict 범위는 기능을 조용히 무시하지 않는다. flags74 밖의 public MetalFX 확장이 backend/WMT에 추가되면 frontend
-거부 조건을 개별적으로 해제해야 한다.
+현재 Meson facade target은 `x86_64-pc-windows-msvc`다. **x64 frontend/NGX proof를 x86 WoW64·ARM64·ARM64EC NGX 지원으로 확대하지 않는다.** D3D12 temporal COM backend의 WoW64 proof와 NGX frontend의 architecture 범위는 별개다. ARM64 Wine/FEX 최종 목표는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#개발-목표와-우선순위)를 따른다.
 
-CPU/PE 검증은 `scripts/test-owned-ngx-frontend.py`가 담당한다. 현재 루트 소스의 `src/nvngx/nvngx.cpp`와
-`src/nvngx/nvngx_d3d12.cpp`를 pinned llvm-mingw로 `-Werror` compile하고, parameter facade는 MSVC target으로 별도
-compile한 뒤 현재 Meson cross build(`build/local/build`)의 DXGI/util/winemetal import/static library에 함께 링크한다.
-GPU나 D3D12 device를 만들지 않는다. 생성 PE에서 기존 D3D11 export 15개, 새 D3D12 export 16개와 `own-ngxd3d12`
-literal marker를 검사한다. MSVC object에서는 `??_7OwnedNgxParameterFacade@@6B@` vftable이 실제로 생성되고 공식
-8 Set + 8 Get + Reset slot을 모두 채우는지 확인한다. 이어서 `external/nvngx/include`의 official NVIDIA header로
-`graphics-translator/tests/owned-ngx-parameter-consumer-msvc.cpp`를 MSVC target compile하고, 그 object가 내는
-virtual call offset을 facade `.rdata` relocation과 대조한다. 즉 slot offset의 출처는 공식 header 하나뿐이며,
-양쪽이 같은 slot에서 같은 parameter type을 요구해야 PASS다.
+## Device와 feature 수명
 
-official header는 저장소에 `external/nvngx/include/{nvsdk_ngx.h,nvsdk_ngx_params.h,nvsdk_ngx_defs.h}`로 고정
-snapshot을 두고 `external/nvngx/LICENSE.txt`를 함께 보존한다. 다른 SDK 설치본을 쓰려면 `--nvidia-include` 또는
-`NGX_SDK_INCLUDE`로 지정한다.
+Init은 `ID3D12Device`의 canonical `IUnknown` identity를 등록하고 `IMTLD3D12DeviceExt::SupportsTemporalUpscale`을 확인한다. Create/Evaluate는 열린 non-copy/non-bundle list와 initialized device를 요구한다. Evaluate는 feature의 device identity와 list device identity도 비교한다.
 
-이 CPU/PE PASS는 실제 ZZZ/Streamline loader가 owned `nvngx.dll`을 선택한다는 증명이 아니다. Runtime에서는 Prime이
-loader identity, D3D12 NGX calls, queue execution과 MetalFX encode를 별도로 관측해야 한다.
+Feature handle은 backend pointer나 dereference 가능한 payload가 아니다. 재사용하지 않는 monotonic opaque token을 registry key로 사용한다. Release는 live registry entry를 지우고 stale handle은 `FeatureNotFound`가 된다. token counter는 shutdown 때도 reset하지 않으며 공간 고갈 시 재사용 대신 실패한다. Evaluate가 잡은 strong reference와 이미 기록된 backend frame은 Release와 별개로 살아 있다.
 
-`nvngx.dll`과 `nvapi64.dll`은 DXMT NV extension gate를 공유한다. candidate `dxgi.cpp`는
-`DXMT_ENABLE_NVEXT=1`일 때만 NVIDIA extension registry와 `NGXCore\\FullPath`를 설치하고,
-`nvngx.dll`의 DllMain과 `NvAPI_Initialize`는 `DXMT_NVEXT_GUID` query가 실패하면 정상 초기화되지 않는다.
-따라서 stager의 `--with-nvngx` 또는 `--with-nvapi`가 켜진 runtime wrapper는 이 환경을 내부에서 명시적으로
-`1`로 설정한다. 두 옵션이 꺼진 기본 runtime은 외부에서 상속된 `DXMT_ENABLE_NVEXT`를 제거한다.
+Create는 backend state 생성 후 **같은 Init registration이 아직 유효한지** 다시 확인하고 feature를 게시한다. 중간 shutdown/re-init은 같은 device COM identity라도 옛 registration에 늦게 feature를 게시하지 못한다. Parameter publication도 init gate와 insertion을 같은 registry lock에서 수행한다. 이것이 NVIDIA API의 caller 동기화 책임을 일반 thread-safe API 보장으로 바꾸지는 않는다.
+
+`Shutdown()`과 `Shutdown1(nullptr)`는 전체 device/feature/parameter registry를 비운다. non-null `Shutdown1(device)`는 그 device의 feature와 registration을 지우고 마지막 device가 사라지면 parameter registry도 비운다. Ownership·출력 포인터·subrect의 정확한 계약은 [NGX-CONTRACTS](NGX-CONTRACTS.ko.md)에 있다.
+
+## 현재 SR 입력 범위
+
+- Create extent 네 값은 필수이며 0이 아니어야 한다. creation/visibility node mask는 device node 범위 내의 nonzero 값이어야 한다.
+- 허용 create bit: `IsHDR`, `MVLowRes`, `DepthInverted`, `MVJittered`, deprecated `DoSharpening`, `AutoExposure`. MVLowRes off의 high-resolution MV와 jittered MV도 full SR port에서 지원한다. flags74는 `2 | 8 | 64`이며 fixture의 LDR baseline이다.
+- SR `AlphaUpscaling` flag128은 independent native alpha history·neutral exposure로 지원한다. Reserved/unknown bit는 `UnsupportedParameter`다. DoSharpening은 별도 RCAS post-operation이며 native descriptor flag가 아니다. HDR bit를 허용한다는 사실만으로 DLSS↔MetalFX transfer-function 동등성을 주장하지 않는다.
+- Color/Output/Depth/MotionVector는 필수다. missing과 명시적 null은 구분한다. Optional bias/transparency mask는 full SR port의 reactive/composition 경로에 연결한다.
+- render width/height가 둘 다 없으면 create input extent를 사용한다. 한쪽만 있으면 `MissingInput`, 0이면 `InvalidParameter`다.
+- 공식 color/depth/MV/bias/translucency subrect base를 전달하고 backend가 각 view의 active rectangle/bounds를 검사한다. **output base는 create-time subrect opt-in을 켠 경우 지원**한다. MV texture subrect base는 accept+ignore하는 MV.Offset 값 bias와 다르다.
+- jitter는 finite 값 그대로다. MV scale은 missing 시 1, 명시적 0/nonfinite는 invalid다.
+- raw `DLSS.Pre.Exposure=0`/missing은 semantic1로 정규화한다. `DLSS.Exposure.Scale`은 missing·raw0·finite nonnegative를 허용하되 수치 효과는 무시한다. 성공한 float getter의 음수/nonfinite는 InvalidParameter다. Optional float getter 실패(missing/지원하지 않는 variant)는 기존 fallback 정책을 유지한다. `MV.Offset.X/Y`도 missing 또는 모든 finite 값을 허용·무시하며 성공한 float getter의 nonfinite는 InvalidParameter다. Nonzero Sharpness는 sharpening flag가 꺼져 있으면 unsupported다. P1의 accept+ignore 계약이며 Exposure 곱셈·MV 값 bias 지원이 아니다([완료 scope·GPU/replay 증거](CORE-IMPLEMENTATION-STATUS.ko.md#p1-계약-범위와-reference)).
+- missing Reset은 false다. first execution·generation transition reset은 backend가 실행 시점에 결정한다.
+- AutoExposure off의 optional exposure는 null 또는1×1 R16/R32를 지원한다. R32는 실행/replay마다 GPU numeric R16 conversion을 수행하고 auto는 supplied exposure를 무시한다([구현·proof](NGX-INTEGRATION.ko.md#record-time-resourcegeneration-준비)). Exposure.Scale accept+ignore와 이 live resource format/conversion 지원은 별개다.
+
+Backend resource/scale/manual-exposure 제한과 Metal 4 encoding은 [NGX-INTEGRATION](NGX-INTEGRATION.ko.md), source-backed 남은 의미·portability 경계는 [API-REVIEW](API-REVIEW.ko.md)에 정리한다.
+
+## 증거와 역사
+
+2026-09-19 독립 `ngx-work` 구현과 frozen frontend/contract patch는 provenance다. 당시 작업 트리 복사·ABI checksum을 **현재 루트 빌드 절차로 사용하지 않는다**. `build/` 삭제 전 CPU/PE·GPU 관찰은 역사적 증거이며 현재 artifact 보유와 다르다. 현재 코드는 루트에서 빌드하고 [NGX-TEST](NGX-TEST.ko.md)의 fresh staging/runner를 사용한다.
+
+Synthetic fixture는 system32 owned DLL을 직접 요청한다. **실제 게임/Streamline loader가 같은 DLL을 선택한다는 관찰은 아직 없다.** 게임 DLL 교체, live prefix 변경 또는 vendor identity만으로 loader 성공을 가정하지 않는다.

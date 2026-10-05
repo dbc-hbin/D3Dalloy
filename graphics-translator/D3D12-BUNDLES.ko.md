@@ -1,12 +1,14 @@
 # D3D12 bundle 실행과 WriteBufferImmediate
 
-`0014-d3d12-bundles.patch`는 `integration/source`와 `0012-d3d12-resources.patch`를 합친 기준본에 적용한다. 기준 파일 해시와 최종 패치 해시는 `build/owned-completion-20260919/bundle-evidence/baseline.json`, `patch-manifest.json`에 기록했다. 패치에는 9개 translator 파일이 포함되며 기존 prime source는 직접 수정하지 않았다.
+2026-10-02 루트 소스의 bundle state·recording·즉시 쓰기 계약 참조다. Source authority는 [`d3d12_command_list.cpp`](../src/d3d12/d3d12_command_list.cpp)의 `ExecuteBundle`/`RecordBundle`/`WriteBufferImmediate`와 [`owned_bundle_recording.hpp`](../src/d3d12/owned_bundle_recording.hpp)다. 전역 tier/지원표는 [현재 상태](CORE-IMPLEMENTATION-STATUS.ko.md#현재-지원-상태), 실제 proof의 가용성은 [검증 범위](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)를 따른다. 이 갱신은 소스 대조이며 새 GPU 실행이 아니다.
 
 ## 실행 계약
 
-번들의 명령을 값으로 보관하고, `ExecuteBundle`에서 부모의 일반 명령 기록 경로로 재생한다. 이때 부모의 root arguments, render target, viewport, scissor를 현재 값으로 상속한다. PSO는 번들 초기 PSO로 바뀌고 topology는 undefined로 시작한다. 번들이 변경한 상태는 부모에 남는다. 따라서 같은 번들을 서로 다른 부모 상태로 반복 실행할 수 있고, 부모 allocator가 만들어진 Metal 명령을 보유하므로 제출 후 번들 Reset에도 이미 기록한 출력은 보존된다.
+번들의 명령을 값으로 보관하고, **같은 device의 recording DIRECT 부모**가 `ExecuteBundle`에서 일반 명령 기록 경로로 재생한다. 이때 부모의 root arguments, render target, viewport, scissor를 현재 값으로 상속한다. PSO는 번들 초기 PSO로 바뀌고 topology는 undefined, view-instance mask는 0으로 시작한다. 번들이 변경한 상태는 부모에 남는다. 따라서 같은 번들을 서로 다른 부모 상태로 반복 실행할 수 있고, 부모 allocator가 만들어진 Metal 명령을 보유하므로 제출 후 번들 Reset에도 이미 기록한 출력은 보존된다.
 
-root constant 배열, VB/IB view, blend factor, immediate-write 배열은 호출 때 복사한다. 사용자 COM 객체 수명은 기존 D3D12 규칙을 따른다. 지원되는 간접 번들 명령은 count buffer가 없고 root/VB/IB 변경을 포함하지 않는 단일 draw/dispatch signature다. 번들 내부에서 금지된 명령은 `Close`에 오류를 돌려준다. optional sample-position/view-instance 기능은 구현되지 않았으므로 bundle에서도 성공으로 위장하지 않는다.
+root constant 배열, VB/IB view, blend factor, immediate-write 배열은 호출 때 복사한다. 사용자 COM 객체 수명은 기존 D3D12 규칙을 따른다. 간접 번들 명령은 count buffer가 없고 root/VB/IB 변경을 포함하지 않아야 한다. 번들 내부에서 금지된 명령은 기록 오류를 보존하고 `Close`에 돌려준다.
+
+`SetSamplePositions`의 bundle 기록·부모 상태 상속·reset/replay는 [현행 Tier1 계약](CORE-IMPLEMENTATION-STATUS.ko.md#p1-계약-범위와-reference)을 따른다. 반면 **view instancing은 구현돼** `SetViewInstanceMask`를 bundle에서 복사·재생하며 mask 변경은 부모에 남는다. `RSSetShadingRate`의 값/combiner도 bundle payload로 보관한다. DXR의 `SetPipelineState1`은 state object 참조를 보유하고 `DispatchRays`는 descriptor를 값으로 복사해 부모에서 재생한다. 0014 당시의 “optional view-instance 미구현”과 draw/dispatch-only 설명을 현재 범위로 사용하지 않는다. 고급 stage/feature acceptance 범위는 canonical 상태 문서를 따른다.
 
 부모가 아직 제출하지 않은 bundle 참조를 추적한다. 해당 참조가 하나라도 있으면 bundle Reset은 실패하며, 모든 부모가 제출되거나 Reset/해제되면 풀린다. allocator generation을 보존해 bundle allocator Reset 후의 실행도 거부한다. 실패한 Close는 Reset에서도 같은 오류를 반환한다. 사용 중인 allocator에 대한 Reset 실패는 기존 명령과 bundle 참조를 보존한다. 미완성 command list 해제 시 allocator 기록 슬롯도 해제한다.
 
@@ -14,9 +16,13 @@ root constant 배열, VB/IB view, blend factor, immediate-write 배열은 호출
 
 ## 즉시 쓰기
 
-`WriteBufferImmediate`를 DIRECT, COMPUTE, COPY, BUNDLE에서 지원한다. 32-bit 값을 allocator의 불변 GPU 메모리에 복사하고 Metal blit 명령으로 목적지에 쓴다. 목적지를 CPU에서 먼저 수정하지 않는다. 두 pass 경계로 순서를 보장하며 marker mode의 최소 보장보다 보수적으로 직렬화한다. GPU 주소는 4-byte alignment와 실제 allocation 범위로 검증한다. `LookupBufferByVA`가 VA 빈 구간을 앞선 buffer로 잘못 반환하던 범위 검사도 보정했다.
+`WriteBufferImmediate`를 DIRECT, COMPUTE, COPY, BUNDLE에서 지원한다. 32-bit 값을 allocator의 불변 GPU 메모리에 복사하고 Metal blit 명령으로 목적지에 쓴다. 목적지를 CPU에서 먼저 수정하지 않는다. 두 pass 경계로 순서를 보장하며 marker mode의 최소 보장보다 보수적으로 직렬화한다. GPU 주소는 4-byte alignment와 실제 allocation 범위로 검증한다. 목적지 VA의 빈 구간을 앞선 allocation으로 오인하지 않는다.
 
-## 검증 결과
+Payload는 부모 allocator GPU retirement까지 유지한다. Arena는 초기4 MiB 이후 retained chunk를 추가하며 기존 payload 주소를 이동하지 않는다. 성장·reset·allocation failure는 [core 계약](D3D12-CORE-CONTRACTS.ko.md#command-list-생성기록제출)을 따른다. 제출 후 bundle Reset 허용은 부모 allocator/resource의 early Reset·해제를 허용하는 의미가 아니다.
+
+## 역사적 실행 기록: 2026-09-19 import
+
+[0014 frozen patch](patches/0014-d3d12-bundles.patch)는 당시 `integration/source`+0012 기준본의 9개 translator 파일에 적용했다. Baseline/patch 해시는 `build/owned-completion-20260919/bundle-evidence/{baseline.json,patch-manifest.json}`에 기록했지만 이전 `build/`는 2026-10-02 삭제로 현재 유실됐다. 아래는 당시 관찰 기록이며 현재 artifact 보유나 이 문서 갱신의 새 실행을 뜻하지 않는다.
 
 `graphics-translator/tests/owned-d3d12-bundles.cpp`를 llvm-mingw로 `-Wall -Wextra -Werror` 빌드했다. translator 전체 191단계 cross-build와 후속 변경 rebuild가 성공했다.
 
@@ -30,7 +36,7 @@ root constant 배열, VB/IB view, blend factor, immediate-write 배열은 호출
 
 수정 전 `wine-events-01`에 동일 v1 fixture를 실행한 `run-bundles-baseline-01`은 PSO attachment mismatch가 잘못 성공하는 지점을 검출해 예상대로 실패했다. 최종 fixture SHA-256은 `dd28a12da9811fce3a9b4624a18fdb2d1d5f9e8a8b5c84ef6418b6704431464f`다.
 
-이 결과는 해당 synthetic GPU/API 계약의 검증이다. ZZZ 전체 실행, 전체 DX12 API, frame-generation 지원을 입증하지 않는다. Queue의 잘못된 제출을 device-removed 상태로 연결하는 처리는 아직 별도 검토 대상이다.
+이 결과는 해당 synthetic GPU/API 계약의 검증이다. 실제 게임, 전체 DX12 API, frame-generation 지원을 입증하지 않는다. 현재 queue validation·backend 오류 전파는 [queue 계약](QUEUE-ORDER.ko.md), `ReportRemoval(DXGI_ERROR_DEVICE_REMOVED)`에 연결된 명시적 `RemoveDevice()`는 [core 계약](D3D12-CORE-CONTRACTS.ko.md#device-removal과-dxgi-memory-budget-계약)을 따른다. 명시적 제거의 새 fence-events/execution-safety focused proof는 [canonical RemoveDevice 증거](CORE-IMPLEMENTATION-STATUS.ko.md#removedevice-완료와-focused-proof)에 기록하며, 위 bundle fixture가 그 경로를 실행했다는 뜻은 아니다. 후속 advanced bundle/runtime proof와 retained recovery evidence는 [구현 이력](IMPLEMENTATION-HISTORY.ko.md) 및 canonical 검증 범위를 따른다.
 
 ## 참고 명세
 

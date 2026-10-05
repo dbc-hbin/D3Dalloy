@@ -2,6 +2,7 @@
 #pragma once
 
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
@@ -84,6 +85,16 @@ public:
   enum ResourceKind kind;
   enum SampleType sample_type;
   enum MemoryAccess memory_access;
+  // D3D12 logical volume descriptors: q2 bit 62 tags the sparse 2D-array atlas.
+  Value *volume_layout = nullptr;
+  Value *volume_view = nullptr;
+  Value *volume_metadata = nullptr;
+  Value *sampler_metadata = nullptr;
+  Value *sampler_lod_range = nullptr;
+  Value *sampler_uint_border = nullptr;
+  Value *sampler_float_border = nullptr;
+  // Only the native arm of the optional D3D12 atomic-phase conversion bypasses side cells.
+  bool atomic_phase_native = false;
 };
 
 enum class Signedness { DontCare, Signed, Unsigned };
@@ -111,6 +122,19 @@ public:
 
 class AIRBuilder {
 public:
+  /* D3D pixel-coordinate BORDER samplers exceed Metal's unnormalized subset. */
+  Value *PixelSampleCoordinates(const Texture &texture, Value *handle, Value *coord) {
+    Value *size = ConstantFP::get(coord->getType(), 1.0);
+    size = builder.CreateInsertElement(size, builder.CreateUIToFP(
+        CreateTextureQuery(texture, handle, Texture::width, getInt(0)), getFloatTy()), uint64_t(0));
+    size = builder.CreateInsertElement(size, builder.CreateUIToFP(
+        CreateTextureQuery(texture, handle, Texture::height, getInt(0)), getFloatTy()), uint64_t(1));
+    return builder.CreateFDiv(coord, size);
+  }
+  std::pair<Value *, Value *> CreateCoordinateSample(
+      Value *Metadata, Value *TextureHandle, Value *ResourceMinLOD, Value *FormatDefaults, Value *GatherComponent,
+      function_ref<std::pair<Value *, Value *>()> Pixel,
+      function_ref<std::pair<Value *, Value *>()> Normalized);
   AIRBuilder(IRBuilderBase &ir_builder, raw_ostream &debug) : builder(ir_builder), debug(debug), options() {}
 
   AIRBuilder(const AIRBuilderOptions &options, IRBuilderBase &ir_builder, raw_ostream &debug) :
@@ -119,6 +143,11 @@ public:
       options(options) {}
 
   /* Texture Operations */
+  Value *CreateSampleFootprintLOD(const Texture &texture, Texture::ResourceKind logical, Value *handle,
+                                Value *dx, Value *dy);
+  Value *CreateIntegerBorder(const Texture &texture, Texture::ResourceKind logical, Value *handle,
+      Value *metadata, Value *border, Value *lod_range, Value *resource_min_lod, Value *texel,
+      Value *coord, Value *offset, Value *lod, Value *format_metadata, Value *gather_component = nullptr);
 
   std::pair<Value *, Value *>
   CreateSample(
@@ -180,6 +209,42 @@ public:
   }
 
   std::pair<Value *, Value *>
+  CreateSample(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Offset,
+      sample_level Level
+  ) {
+    return CreateSampleCommon(Texture, Handle, Sampler, Coord, ArrayIndex, Offset, true, Level.lod, getFloat(0));
+  }
+
+  std::pair<Value *, Value *>
+  CreateSample(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Offset,
+      sample_bias Bias, sample_min_lod_clamp MinLOD
+  ) {
+    return CreateSampleCommon(Texture, Handle, Sampler, Coord, ArrayIndex, Offset, false, Bias.bias, MinLOD.lod);
+  }
+
+  std::pair<Value *, Value *>
+  CreateSampleCmp(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Reference,
+      Value *Offset, sample_bias Bias, sample_min_lod_clamp MinLOD
+  ) {
+    return CreateSampleCmpCommon(
+        Texture, Handle, Sampler, Coord, ArrayIndex, Reference, Offset, false, Bias.bias, MinLOD.lod
+    );
+  }
+
+  std::pair<Value *, Value *>
+  CreateSampleCmp(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Reference,
+      Value *Offset, sample_level Level
+  ) {
+    return CreateSampleCmpCommon(
+        Texture, Handle, Sampler, Coord, ArrayIndex, Reference, Offset, true, Level.lod, getFloat(0)
+    );
+  }
+
+  std::pair<Value *, Value *>
   CreateSampleGrad(
       const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
       Value *DerivY, const int32_t Offset[3]
@@ -187,10 +252,19 @@ public:
     return CreateSampleGrad(Texture, Handle, Sampler, Coord, ArrayIndex, DerivX, DerivY, getFloat(0), Offset);
   }
 
-  /** `Reference` non-null: the depth compare form (`air.sample_compare_<depth>_grad`). */
   std::pair<Value *, Value *> CreateSampleGrad(
       const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
       Value *DerivY, Value *MinLOD, const int32_t Offset[3], Value *Reference = nullptr
+  ) {
+    return CreateSampleGrad(
+        Texture, Handle, Sampler, Coord, ArrayIndex, DerivX, DerivY, MinLOD, GetOffset(Texture, Offset), Reference
+    );
+  }
+
+  /** `Reference` non-null: the depth compare form (`air.sample_compare_<depth>_grad`). */
+  std::pair<Value *, Value *> CreateSampleGrad(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
+      Value *DerivY, Value *MinLOD, Value *Offset, Value *Reference = nullptr
   );
 
   Value *CreateAtomicRMW(
@@ -200,12 +274,12 @@ public:
 
   std::pair<Value *, Value *> CreateRead(
       const Texture &Texture, Value *Handle, Value *Pos, Value *ArrayIndex, Value *SampleIndexOrCubeFace, Value *Level,
-      bool DeviceCoherent = false
+      bool DeviceCoherent = false, Value *MSAAMetadata = nullptr, Value *MSAASampleIds = nullptr
   );
 
   CallInst *CreateWrite(
       const Texture &Texture, Value *Handle, Value *Pos, Value *ArrayIndex, Value *CubeFace, Value *Level,
-      Value *ValVec4, bool DeviceCoherent = false
+      Value *ValVec4, bool DeviceCoherent = false, uint32_t WriteMask = 15
   );
 
   std::pair<Value *, Value *> CreateAtomicCmpXchg(
@@ -244,6 +318,7 @@ public:
   \returns (float clamped_lod, float unclamped_lod)
   */
   std::pair<Value *, Value *> CreateCalculateLOD(const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord);
+  std::pair<Value *, Value *> CreateCalculateLODGrad(const Texture &texture, Value *handle, Value *dx, Value *dy);
 
   CallInst *CreateTextureFence(const Texture &Texture, Value *Handle);
 
@@ -367,6 +442,11 @@ public:
   Value *CreateIntBinOp(IntBinOp Op, Value *LHS, Value *RHS, bool Signed = false);
 
   Value *CreateAtomicRMW(AtomicRMWInst::BinOp Op, Value *Ptr, Value *Val);
+
+  Value *CreateTypedAtomic64(const Texture &texture, Value *handle, Value *position, Value *arrayIndex,
+                            AtomicRMWInst::BinOp operation, Value *value, Value *comparison = nullptr);
+  void CreateTypedPhaseStore(const Texture &texture, Value *handle, Value *position, Value *arrayIndex,
+                            Value *sample, Value *value, uint32_t mask);
 
   llvm::Value *SanitizePosition(llvm::Value *Pos);
 
@@ -553,6 +633,29 @@ public:
 protected:
   raw_ostream &debug;
   AIRBuilderOptions options;
+
+  std::pair<Value *, Value *> CreateAtomicPhaseTypedAccess(
+      const Texture &texture, Value *handle, Value *position, Value *arrayIndex, Value *sample, Value *level,
+      Value *value, Value *comparison, AtomicRMWInst::BinOp operation, unsigned access, uint32_t writeMask,
+      function_ref<std::pair<Value *, Value *>()> native);
+  Value *CreateAtomicPhaseMetadataLoad(Value *base, uint64_t offset, Type *type);
+  Value *CreateAtomicPhaseTypedView(Value *context, Value *handle);
+
+  std::pair<Value *, Value *> CreateVolumeDispatch(
+      const Texture &texture, function_ref<std::pair<Value *, Value *>()> atlas,
+      function_ref<std::pair<Value *, Value *>()> native, Value *condition = nullptr);
+  Value *LoadVolumeWord(const Texture &texture, Value *index);
+  Value *VolumeMip(const Texture &texture, Value *level);
+  Value *VolumeDimension(const Texture &texture, unsigned axis, Value *level);
+  struct VolumeAtlasPosition { Value *xy, *slice, *tile; };
+  VolumeAtlasPosition VolumePosition(const Texture &texture, Value *position, Value *level);
+  Value *VolumeMapped(const Texture &texture, Value *tile);
+  Value *VolumeInBounds(const Texture &texture, Value *position, Value *level);
+  Value *VolumeDefaults(const Texture &texture, Value *handle);
+  std::pair<Value *, Value *> CreateVolumeRead(const Texture &texture, Value *handle, Value *position,
+                                              Value *level, bool coherent);
+  std::pair<Value *, Value *> CreateVolumeSample(const Texture &texture, Value *handle, Value *coord,
+      Value *offset, Value *lod, Value *minimum, Value *dx, Value *dy);
 
   Value *
   GetOffset(const Texture &Texture, const int32_t ImmOffset[3]) {

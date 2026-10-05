@@ -82,7 +82,8 @@ int reportCase(const char *name, int bad) {
 
 class Runner {
 public:
-  Runner(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8_t> &dxil, contract::Runner &geometry)
+  Runner(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8_t> &dxil, contract::Runner &geometry,
+         UINT outputStride = sizeof(uint32_t))
       : device5_(device5), ctx_(ctx), dxil_(dxil), geometry_(geometry) {
     check(device5->QueryInterface(IID_PPV_ARGS(&device_)), "stateobj: QueryInterface(ID3D12Device)");
     check(device5->QueryInterface(IID_PPV_ARGS(&device7_)), "stateobj: QueryInterface(ID3D12Device7)");
@@ -104,7 +105,7 @@ public:
     rootDesc.NumParameters = 1;
     rootDesc.pParameters = &table;
     globalRoot_ = createRootSignature(device_.Get(), rootDesc, "stateobj: global root signature");
-    createResources();
+    createResources(outputStride);
   }
 
   ID3D12Device *device() const { return device_.Get(); }
@@ -222,7 +223,7 @@ private:
     return h;
   }
 
-  void createResources() {
+  void createResources(UINT outputStride) {
     tableResource_ = createBuffer(device_.Get(), kTableBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                                   D3D12_RESOURCE_STATE_GENERIC_READ);
     table_ = static_cast<uint8_t *>(mapUpload(tableResource_.Get()));
@@ -254,8 +255,8 @@ private:
     device_->CreateShaderResourceView(rays_.Get(), &srv, handle(1));
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    uav.Buffer.NumElements = kOutputWords;
-    uav.Buffer.StructureByteStride = sizeof(uint32_t);
+    uav.Buffer.NumElements = kOutputBytes / outputStride;
+    uav.Buffer.StructureByteStride = outputStride;
     device_->CreateUnorderedAccessView(output_.Get(), nullptr, &uav, handle(2));
   }
 

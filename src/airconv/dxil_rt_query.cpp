@@ -50,6 +50,8 @@
  */
 
 #include "dxil_converter.hpp"
+#include "dxil_rt_omm.hpp"
+#include "dxil_raytracing.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
@@ -128,6 +130,10 @@ bool dxilOpcode(const CallInst &call, uint32_t &opcode) {
   const Function *callee = call.getCalledFunction();
   if (!callee || !callee->isDeclaration() || call.arg_size() < 1)
     return false;
+  if (callee->getName() == "dxmt.rayquery.hitobject_snapshot") {
+    opcode = 263;
+    return true;
+  }
   if (callee->getName() == kTraceInlineFunction) {
     opcode = kTraceRayInline;
     return true;
@@ -143,7 +149,7 @@ bool dxilOpcode(const CallInst &call, uint32_t &opcode) {
 
 bool isRayQueryOpcode(uint32_t opcode) {
   return (opcode >= kAllocate && opcode <= kCommittedInstanceContribution && opcode != 213) ||
-         opcode == kAllocate2;
+         opcode == kAllocate2 || opcode == 263 || opcode == 264;
 }
 
 /** Per-query state: the AIR query and what the shader traced it with. */
@@ -155,6 +161,8 @@ struct Query {
   /** i64 D3D12 GPU VA of the traced structure; 0 = the null structure (or not traced). */
   AllocaInst *address = nullptr;
   uint32_t template_flags = 0;
+  bool allow_omm = false;
+  AllocaInst *candidate_opaque = nullptr;
 };
 
 class RayQueryLowerer {
@@ -204,6 +212,7 @@ private:
   Error lowerFunction(Function &function);
   Error lowerCall(CallInst &call, uint32_t opcode);
   Error lowerTrace(CallInst &call, Query &q);
+  Error snapshot(CallInst &call, Query &q);
   Value *guarded(Instruction *at, Value *condition, Value *otherwise, function_ref<Value *(IRBuilder<> &)> body);
   Value *contribution(IRBuilder<> &b, Instruction *at, Query &q, Value *instance_index);
 };
@@ -267,6 +276,68 @@ Value *RayQueryLowerer::contribution(IRBuilder<> &b, Instruction *at, Query &q, 
   });
 }
 
+Error RayQueryLowerer::snapshot(CallInst &call, Query &q) {
+  if (call.arg_size() != 10 || !call.getArgOperand(2)->getType()->isPointerTy())
+    return createError("dxil: malformed internal HitObject query snapshot");
+  IRBuilder<> b(&call);
+  Value *block = call.getArgOperand(2);
+  const uint32_t state = cast<ConstantInt>(call.getArgOperand(3))->getZExtValue();
+  const uint32_t attributes = cast<ConstantInt>(call.getArgOperand(4))->getZExtValue();
+  const uint32_t kind = cast<ConstantInt>(call.getArgOperand(5))->getZExtValue();
+  const uint32_t attribute_size = cast<ConstantInt>(call.getArgOperand(6))->getZExtValue();
+  auto store = [&](IRBuilder<> &g, uint32_t offset, Value *value) {
+    Value *ptr = g.CreateGEP(g.getInt8Ty(), block, g.getInt32(offset));
+    g.CreateAlignedStore(value, g.CreateBitCast(ptr, value->getType()->getPointerTo()), Align(1));
+  };
+  store(b, state + offsetof(SM50_RT_HIT_STATE, WorldRayOrigin), b.CreateLoad(f32x3, q.origin));
+  store(b, state + offsetof(SM50_RT_HIT_STATE, WorldRayDirection), b.CreateLoad(f32x3, q.direction));
+  store(b, state + offsetof(SM50_RT_HIT_STATE, RayTMin), b.CreateLoad(f32, q.tmin));
+  store(b, state + offsetof(SM50_RT_HIT_STATE, RayTCurrent), b.CreateLoad(f32, q.tmax));
+  store(b, state + offsetof(SM50_RT_HIT_STATE, RayFlags), b.CreateLoad(i32, q.flags));
+  Value *address = b.CreateLoad(i64, q.address);
+  guarded(&call, b.CreateICmpNE(address, b.getInt64(0)), nullptr, [&](IRBuilder<> &g) -> Value * {
+    Value *status = getter(g, "get_committed_intersection_type", i32, q);
+    Instruction *committed_end = SplitBlockAndInsertIfThen(g.CreateICmpNE(status, g.getInt32(0)),
+      &*g.GetInsertPoint(), false);
+    IRBuilder<> h(committed_end);
+      store(h, kind, h.getInt32(1)); // A query miss produces NOP, never MISS.
+      store(h, state + offsetof(SM50_RT_HIT_STATE, RayTCurrent), getter(h, "get_committed_distance", f32, q));
+      store(h, state + offsetof(SM50_RT_HIT_STATE, PrimitiveIndex), getter(h, "get_committed_primitive_id", i32, q));
+      store(h, state + offsetof(SM50_RT_HIT_STATE, GeometryIndex), getter(h, "get_committed_geometry_id", i32, q));
+      store(h, state + offsetof(SM50_RT_HIT_STATE, InstanceIndex), getter(h, "get_committed_instance_id", i32, q));
+      store(h, state + offsetof(SM50_RT_HIT_STATE, InstanceID), getter(h, "get_committed_user_instance_id", i32, q));
+      store(h, state + offsetof(SM50_RT_HIT_STATE, ObjectRayOrigin), getter(h, "get_committed_ray_origin", f32x3, q));
+      store(h, state + offsetof(SM50_RT_HIT_STATE, ObjectRayDirection), getter(h, "get_committed_ray_direction", f32x3, q));
+      Value *o2w = getter(h, "get_committed_object_to_world_transform", transform, q);
+      Value *w2o = getter(h, "get_committed_world_to_object_transform", transform, q);
+      for (unsigned column = 0; column < 4; ++column) {
+        store(h, state + offsetof(SM50_RT_HIT_STATE, ObjectToWorld) + column * 12, h.CreateExtractValue(o2w, column));
+        store(h, state + offsetof(SM50_RT_HIT_STATE, WorldToObject) + column * 12, h.CreateExtractValue(w2o, column));
+      }
+      Instruction *triangle_end = SplitBlockAndInsertIfThen(h.CreateICmpEQ(status, h.getInt32(1)), committed_end, false);
+      IRBuilder<> triangle(triangle_end);
+        Value *front = getter(triangle, "is_committed_triangle_front_facing", i1, q);
+        Value *bary = getter(triangle, "get_committed_triangle_barycentric_coord", f32x2, q);
+        store(triangle, state + offsetof(SM50_RT_HIT_STATE, HitKind), triangle.CreateSelect(front, triangle.getInt32(0xfe), triangle.getInt32(0xff)));
+        store(triangle, state + offsetof(SM50_RT_HIT_STATE, FrontFace), triangle.CreateZExt(front, i32));
+        store(triangle, state + offsetof(SM50_RT_HIT_STATE, Barycentrics), bary);
+        if (attribute_size >= 8)
+          store(triangle, attributes, bary);
+      IRBuilder<> after(committed_end);
+      if (cast<ConstantInt>(call.getArgOperand(0))->getZExtValue() == 264) {
+        Instruction *procedural_end = SplitBlockAndInsertIfThen(after.CreateICmpEQ(status, after.getInt32(2)), committed_end, false);
+        IRBuilder<> procedural(procedural_end);
+          store(procedural, state + offsetof(SM50_RT_HIT_STATE, HitKind), call.getArgOperand(7));
+          procedural.CreateMemCpy(procedural.CreateGEP(procedural.getInt8Ty(), block, procedural.getInt32(attributes)), Align(1),
+            call.getArgOperand(8), Align(1), cast<ConstantInt>(call.getArgOperand(9))->getZExtValue());
+      }
+    return nullptr;
+  });
+  call.eraseFromParent();
+  return Error::success();
+}
+
+
 Error RayQueryLowerer::lowerTrace(CallInst &call, Query &q) {
   /* dxmt.rayquery.trace_inline(i32 op, i32 query, i64 address, i32 flags, i32 mask,
    *   float ox, oy, oz, tmin, dx, dy, dz, tmax) */
@@ -294,6 +365,7 @@ Error RayQueryLowerer::lowerTrace(CallInst &call, Query &q) {
   auto field = [&](unsigned shift) { return b.CreateAnd(b.CreateLShr(flags, b.getInt32(shift)), b.getInt32(3)); };
   Value *forced_opacity = field(0);
   Value *opacity_cull = field(6);
+  if (q.allow_omm) { forced_opacity = b.getInt32(2); opacity_cull = b.getInt32(0); }
   Value *geometry_cull = field(8);
   /* D3D12 CULL_BACK is bit 4 and CULL_FRONT bit 5; AIR's triangle_cull_mode is 1 = front, 2 = back. */
   Value *back = b.CreateAnd(b.CreateLShr(flags, b.getInt32(4)), b.getInt32(1));
@@ -326,6 +398,8 @@ Error RayQueryLowerer::lowerCall(CallInst &call, uint32_t opcode) {
   if (!query)
     return unsupported("DXIL RayQuery handle that does not name a single allocateRayQuery");
   Query &q = *query;
+  if (opcode == 263 || opcode == 264)
+    return snapshot(call, q);
   if (opcode == kTraceRayInline)
     return lowerTrace(call, q);
 
@@ -362,7 +436,48 @@ Error RayQueryLowerer::lowerCall(CallInst &call, uint32_t opcode) {
   switch (opcode) {
   case kProceed:
     value = guarded(&call, traced, b.getFalse(), [&](IRBuilder<> &g) -> Value * {
-      return g.CreateCall(intrinsic("next", i1, {query_ptr}, false), {q.object});
+      if (!q.allow_omm) return g.CreateCall(intrinsic("next", i1, {query_ptr}, false), {q.object});
+      Function *f = g.GetInsertBlock()->getParent();
+      Instruction *continuation = &*g.GetInsertPoint();
+      BasicBlock *start = g.GetInsertBlock();
+      continuation->removeFromParent();
+      g.SetInsertPoint(start);
+      BasicBlock *next = BasicBlock::Create(context, "omm.query.next", f);
+      BasicBlock *candidate = BasicBlock::Create(context, "omm.query.candidate", f);
+      BasicBlock *triangle = BasicBlock::Create(context, "omm.query.triangle", f);
+      BasicBlock *classify = BasicBlock::Create(context, "omm.query.classify", f);
+      BasicBlock *accept = BasicBlock::Create(context, "omm.query.accept", f);
+      BasicBlock *commit = BasicBlock::Create(context, "omm.query.commit", f);
+      BasicBlock *done = BasicBlock::Create(context, "omm.query.done", f);
+      g.CreateBr(next);
+      g.SetInsertPoint(next);
+      g.CreateCondBr(g.CreateCall(intrinsic("next", i1, {query_ptr}, false), {q.object}), candidate, done);
+      g.SetInsertPoint(candidate);
+      Value *isTriangle = g.CreateICmpEQ(getter(g, "get_candidate_intersection_type", i32, q), g.getInt32(1));
+      g.CreateCondBr(isTriangle, triangle, classify);
+      g.SetInsertPoint(triangle);
+      Value *bary = getter(g, "get_candidate_triangle_barycentric_coord", f32x2, q);
+      g.CreateBr(classify);
+      g.SetInsertPoint(classify);
+      PHINode *coordinates = g.CreatePHI(f32x2, 2);
+      coordinates->addIncoming(ConstantAggregateZero::get(f32x2), candidate);
+      coordinates->addIncoming(bary, triangle);
+      Value *kind = emitOmmClassification(g, module, g.CreateLoad(i64, q.address),
+        getter(g, "get_candidate_instance_id", i32, q), getter(g, "get_candidate_geometry_id", i32, q),
+        getter(g, "get_candidate_primitive_id", i32, q), coordinates, g.CreateLoad(i32, q.flags));
+      g.CreateStore(g.CreateICmpEQ(kind, g.getInt32(2)), q.candidate_opaque);
+      g.CreateCondBr(g.CreateICmpNE(kind, g.getInt32(0)), accept, next);
+      g.SetInsertPoint(accept);
+      g.CreateCondBr(g.CreateAnd(isTriangle, g.CreateICmpEQ(kind, g.getInt32(2))), commit, done);
+      g.SetInsertPoint(commit);
+      g.CreateCall(intrinsic("commit_triangle_intersection", g.getVoidTy(), {query_ptr}, false), {q.object});
+      g.CreateBr(next);
+      g.SetInsertPoint(done);
+      PHINode *result = g.CreatePHI(i1, 2);
+      result->addIncoming(g.getFalse(), next);
+      result->addIncoming(g.getTrue(), accept);
+      done->getInstList().push_back(continuation);
+      return result;
     });
     break;
   case kAbort:
@@ -404,7 +519,8 @@ Error RayQueryLowerer::lowerCall(CallInst &call, uint32_t opcode) {
     value = matrixGetter("get_committed_world_to_object_transform");
     break;
   case kCandidateProceduralPrimitiveNonOpaque:
-    value = getter(b, "is_candidate_non_opaque_bounding_box", i1, q);
+    value = q.allow_omm ? b.CreateNot(b.CreateLoad(i1, q.candidate_opaque))
+      : getter(b, "is_candidate_non_opaque_bounding_box", i1, q);
     break;
   case kCandidateTriangleFrontFace:
     value = getter(b, "is_candidate_triangle_front_facing", i1, q);
@@ -524,6 +640,15 @@ Error RayQueryLowerer::lowerFunction(Function &function) {
       return createError("dxil: allocateRayQuery's template ray flags are not a constant");
     auto q = std::make_unique<Query>();
     q->template_flags = uint32_t(flags->getZExtValue());
+    if (call->arg_size() == 3) {
+      auto *queryFlags = dyn_cast<ConstantInt>(call->getArgOperand(2));
+      if (!queryFlags || (queryFlags->getZExtValue() & ~1ull)) return createError("dxil: invalid RayQuery feature flags");
+      q->allow_omm = queryFlags->getZExtValue() & 1;
+    } else if (auto *flag = module.getModuleFlag("dxmt.rayquery.allowOMM")) {
+      if (auto *constant = mdconst::dyn_extract<ConstantInt>(flag)) q->allow_omm = constant->getZExtValue() != 0;
+    }
+    q->candidate_opaque = b.CreateAlloca(i1);
+    b.CreateStore(b.getFalse(), q->candidate_opaque);
     q->origin = b.CreateAlloca(f32x3);
     q->direction = b.CreateAlloca(f32x3);
     q->tmin = b.CreateAlloca(f32);
@@ -567,7 +692,7 @@ Error RayQueryLowerer::run() {
   SmallVector<Function *, 8> dead;
   for (Function &function : module)
     if (function.isDeclaration() && function.use_empty() &&
-        (function.getName() == kTraceInlineFunction || function.getName().startswith("dx.op.rayQuery_") ||
+        (function.getName() == kTraceInlineFunction || function.getName() == "dxmt.rayquery.hitobject_snapshot" || function.getName().startswith("dx.op.rayQuery_") ||
          function.getName().startswith("dx.op.allocateRayQuery")))
       dead.push_back(&function);
   for (Function *function : dead)

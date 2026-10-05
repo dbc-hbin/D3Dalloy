@@ -38,6 +38,8 @@ struct ASHeader {
 struct ShadowGeometry {
   uint type, flags, vertexFormat, indexFormat, vertexCount, indexCount, primitiveCount, strideAndTransform;
   ulong dataOffset, indexOffset, transformOffset, reserved;
+  ulong ommArrayAddress, ommIndexOffset;
+  uint ommIndexStride, ommIndexBytes, ommBase, ommReserved;
 };
 struct ShadowJob {
   ulong source, destinationOffset, sourceStride;
@@ -67,7 +69,7 @@ kernel void dxmt_as_shadow(constant ShadowParams &p [[buffer(0)]],
   } else {
     if (tid == 0)
       *((device ShadowMetadata *)((device uchar *)dst + 16)) = p.metadata;
-    for (uint i = tid; i < p.metadata.descCount && p.metadata.type == 1; i += 4096)
+    for (uint i = tid; i < p.metadata.descCount && p.metadata.type != 0; i += 4096)
       ((device ShadowGeometry *)((device uchar *)dst + 64))[i] = geometries[i];
     for (uint j = 0; j < p.jobCount; ++j) {
       const ShadowJob job = jobs[j];
@@ -89,25 +91,42 @@ kernel void dxmt_as_postbuild(constant PostbuildParams &p [[buffer(0)]], uint ti
   device ASHeader *h = (device ASHeader *)p.asAddress;
   device ulong *out = (device ulong *)p.destination;
   const ulong compacted = (ulong(h->nativeCompactedSize) + 64 + h->shadowSize + 255) & ~255ul;
-  if (p.operation == 0) out[0] = compacted;
-  else if (p.operation == 1) out[0] = 8 + h->shadowSize;
+  if (p.operation == 0) out[0] = h->type == 2 ? h->currentSize : compacted;
+  else if (p.operation == 1) out[0] = 8 + h->shadowSize + (h->type == 2 ? 352 + ulong(h->descCount) * 8
+    : h->type == 1 && h->reserved0 ? ulong(h->descCount) * 80 : 0);
   else if (p.operation == 2) {
-    out[0] = 56 + (h->type == 0 ? ulong(h->descCount) * 8 : 0) + 64 + h->shadowSize;
-    out[1] = h->type == 0 ? h->descCount : 0;
+    const ulong ommPointers = h->type == 1 && h->reserved0 ? h->reserved0 - 1 : 0;
+    out[0] = 56 + (h->type == 0 ? ulong(h->descCount) * 8 : ommPointers ? 16 + ommPointers * 8 : 0) + 64 + h->shadowSize;
+    out[1] = h->type == 0 ? h->descCount : ommPointers ? 1 : 0;
   } else if (p.operation == 3) out[0] = h->currentSize;
   else if (p.operation == 0x100) h->currentSize = compacted;
+  else if (p.operation == 0x101) {
+    device const ShadowGeometry *g = (device const ShadowGeometry *)((device const uchar *)h + 64);
+    uint pointers = 0;
+    for (uint i = 0; i < h->descCount; ++i) pointers += g[i].ommArrayAddress != 0;
+    h->reserved0 = pointers + 1;
+  }
 }
 struct SerializeParams { ulong source, destination; uint identifier[8]; };
 kernel void dxmt_as_serialize(constant SerializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   device const ASHeader *h = (device const ASHeader *)p.source;
   const ulong pointers = h->type == 0 ? h->descCount : 0;
-  const ulong offset = 56 + pointers * 8;
+  const ulong ommPointers = h->type == 1 && h->reserved0 ? h->reserved0 - 1 : 0;
+  const bool blocks = ommPointers != 0;
+  const ulong offset = 56 + (blocks ? 16 + ommPointers * 8 : pointers * 8);
   device uchar *dst = (device uchar *)p.destination;
   if (tid == 0) {
     for (uint i = 0; i < 8; ++i) ((device uint *)dst)[i] = p.identifier[i];
     ((device ulong *)dst)[4] = offset + 64 + h->shadowSize;
     ((device ulong *)dst)[5] = h->deserializedSize;
-    ((device ulong *)dst)[6] = pointers;
+    ((device ulong *)dst)[6] = blocks ? 0xffffffff00000001ul : pointers;
+    if (blocks) { ((device ulong *)dst)[7] = 0; ((device ulong *)dst)[8] = ommPointers; }
+  }
+  if (blocks && tid == 0) {
+    device const ShadowGeometry *g = (device const ShadowGeometry *)(p.source + 64);
+    ulong pointer = 0;
+    for (uint i = 0; i < h->descCount; ++i)
+      if (g[i].ommArrayAddress) ((device ulong *)(dst + 72))[pointer++] = g[i].ommArrayAddress;
   }
   for (ulong i = tid; i < pointers; i += 4096)
     ((device ulong *)(dst + 56))[i] = ((device const ulong *)(p.source + 64 + i * 64))[7];
@@ -117,15 +136,24 @@ kernel void dxmt_as_serialize(constant SerializeParams &p [[buffer(0)]], uint ti
 struct DeserializeParams { ulong source, destination, currentSize; };
 kernel void dxmt_as_deserialize(constant DeserializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   device const ulong *src = (device const ulong *)p.source;
-  const ulong pointers = src[6];
-  device const ASHeader *h = (device const ASHeader *)(p.source + 56 + pointers * 8);
+  const bool blocks = uint(src[6] >> 32) == 0xffffffffu;
+  const ulong pointers = blocks ? src[8] : src[6];
+  device const ASHeader *h = (device const ASHeader *)(p.source + 56 + (blocks ? 16 : 0) + pointers * 8);
   device ASHeader *dst = (device ASHeader *)p.destination;
   for (ulong i = 16 + tid; i < 64 + h->shadowSize; i += 4096) {
-    if ((i >= 40 && i < 48) || (pointers && i >= 64 && (i - 64) % 64 >= 56)) continue;
+    if ((i >= 40 && i < 48) || (!blocks && pointers && i >= 64 && (i - 64) % 64 >= 56) ||
+        (blocks && i >= 64 && i < 64 + ulong(h->descCount) * sizeof(ShadowGeometry) &&
+         (i - 64) % sizeof(ShadowGeometry) >= 64 && (i - 64) % sizeof(ShadowGeometry) < 72)) continue;
     ((device uchar *)dst)[i] = ((device const uchar *)h)[i];
   }
   // TLAS pointers are the public relocation table, not the stale copies in the shadow.
-  for (ulong i = tid; i < pointers; i += 4096)
+  if (blocks && tid == 0) {
+    device const ShadowGeometry *g = (device const ShadowGeometry *)((device const uchar *)h + 64);
+    ulong pointer = 0;
+    for (uint i = 0; i < h->descCount; ++i)
+      ((device ShadowGeometry *)(p.destination + 64))[i].ommArrayAddress = g[i].ommArrayAddress ? src[9 + pointer++] : 0;
+  }
+  if (!blocks) for (ulong i = tid; i < pointers; i += 4096)
     ((device ulong *)(p.destination + 64 + i * 64))[7] = src[7 + i];
   if (tid == 0) dst->currentSize = p.currentSize;
 }
@@ -140,19 +168,55 @@ kernel void dxmt_as_visualize(constant VisualizeParams &p [[buffer(0)]], uint ti
 }
 kernel void dxmt_as_visualize_descriptors(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   device const ASHeader *h = (device const ASHeader *)p.source;
+  if (h->type == 2) {
+    device const ShadowGeometry *g = (device const ShadowGeometry *)(p.source + 64);
+    const ulong histogram = p.destination + 8 + h->shadowSize + 40;
+    const ulong descriptors = histogram + 312;
+    if (tid == 0) {
+      device uint *array = (device uint *)(p.destination + 8);
+      array[0] = 26; array[1] = 0;
+      ((device ulong *)array)[1] = histogram;
+      ((device ulong *)array)[2] = p.destination + 8;
+      ((device ulong *)array)[3] = descriptors;
+      ((device ulong *)array)[4] = 8;
+      ((device uint *)p.destination)[1] = 1;
+    }
+    for (uint bin = tid; bin < 26; bin += 4096) {
+      uint count = 0;
+      for (uint i = 0; i < h->descCount; ++i) count += g[i].indexFormat == bin / 2 && g[i].vertexFormat == bin % 2 + 1;
+      device uint *entry = (device uint *)(histogram + bin * 12);
+      entry[0] = count; entry[1] = bin / 2; entry[2] = bin % 2 + 1;
+    }
+    for (uint i = tid; i < h->descCount; i += 4096) {
+      device uint *entry = (device uint *)(descriptors + ulong(i) * 8);
+      entry[0] = uint(g[i].dataOffset - 64); entry[1] = g[i].indexFormat | (g[i].vertexFormat << 16);
+    }
+    return;
+  }
   if (h->type != 1) return;
   device const ShadowGeometry *g = (device const ShadowGeometry *)(p.source + 64);
   for (uint i = tid; i < h->descCount; i += 4096) {
     device uint *d = (device uint *)(p.destination + 8 + ulong(i) * 56);
     d[0] = g[i].type; d[1] = g[i].flags;
     for (uint k = 2; k < 14; ++k) d[k] = 0;
-    if (g[i].type == 0) {
-      ((device ulong *)d)[1] = g[i].strideAndTransform & 0x80000000u ? p.destination + g[i].transformOffset - 56 : 0;
-      d[4] = g[i].indexFormat == 57 ? 42 : g[i].indexFormat; // R16_UINT -> padded R32_UINT
-      d[5] = g[i].vertexFormat; d[6] = g[i].indexCount; d[7] = g[i].vertexCount;
-      ((device ulong *)d)[4] = g[i].indexFormat != 0 ? p.destination + g[i].indexOffset - 56 : 0;
-      ((device ulong *)d)[5] = p.destination + g[i].dataOffset - 56;
-      ((device ulong *)d)[6] = g[i].strideAndTransform & 0x7fffffffu;
+    if (g[i].type != 1) {
+      device uint *triangles = d + 2;
+      if (g[i].type == 2) {
+        const ulong extra = p.destination + 8 + h->shadowSize + ulong(i) * 80;
+        ((device ulong *)d)[1] = extra; ((device ulong *)d)[2] = extra + 48;
+        triangles = (device uint *)extra;
+        device ulong *link = (device ulong *)(extra + 48);
+        link[0] = g[i].ommIndexBytes ? p.destination + g[i].ommIndexOffset - 56 : 0;
+        link[1] = g[i].ommIndexStride;
+        link[2] = (ulong(g[i].ommBase) << 32) | (g[i].ommIndexBytes == 1 ? 62 : g[i].ommIndexBytes == 2 ? 57 : g[i].ommIndexBytes == 4 ? 42 : 0);
+        link[3] = g[i].ommArrayAddress;
+      }
+      ((device ulong *)triangles)[0] = g[i].strideAndTransform & 0x80000000u ? p.destination + g[i].transformOffset - 56 : 0;
+      triangles[2] = g[i].indexFormat == 57 ? 42 : g[i].indexFormat;
+      triangles[3] = g[i].vertexFormat; triangles[4] = g[i].indexCount; triangles[5] = g[i].vertexCount;
+      ((device ulong *)triangles)[3] = g[i].indexFormat != 0 ? p.destination + g[i].indexOffset - 56 : 0;
+      ((device ulong *)triangles)[4] = p.destination + g[i].dataOffset - 56;
+      ((device ulong *)triangles)[5] = g[i].strideAndTransform & 0x7fffffffu;
     } else {
       ((device ulong *)d)[1] = g[i].primitiveCount;
       ((device ulong *)d)[2] = p.destination + g[i].dataOffset - 56;
@@ -245,7 +309,7 @@ dxmt_as_prepass(
   device uint *tail = (device uint *)(dstInstances + dst + 48);
   /* MTLAccelerationStructureInstanceOptions is a straight bit copy of the D3D flags
    * (0x1 cull-disable, 0x2 front-CCW, 0x4 opaque, 0x8 non-opaque). */
-  tail[0] = flags;
+  tail[0] = flags & 15u; // OMM controls are software flags, not Metal instance options.
   tail[1] = instance_mask;
   /* Geometry selects the shared triangle/bounding-box callback. D3D12 instance
    * contributions remain in the separate GPU array, never in hardware IFT slots. */

@@ -3,8 +3,47 @@
 #define __WINEMETAL_THUNKS_H
 
 #include "winemetal.h"
+#include <stddef.h>
 
 #pragma pack(push, 8)
+
+/* No native pointers: the identical structure is consumed by PE32, PE64,
+ * and the native/WoW64 tables. argument is a zero-extended caller address. */
+struct WMTCompositionCall {
+  uint32_t operation;
+  uint32_t count;
+  uint64_t object;
+  uint64_t argument;
+  uint64_t result;
+  int32_t status;
+  uint32_t reserved;
+};
+struct WMTCompositionCall_DATA32 {
+  uint32_t operation;
+  uint32_t count;
+  uint64_t object;
+  uint64_t argument;
+  uint64_t result;
+  int32_t status;
+  uint32_t reserved;
+};
+#ifdef __cplusplus
+static_assert(sizeof(WMTCompositionCall) == 40);
+static_assert(sizeof(WMTCompositionCall_DATA32) == 40);
+static_assert(offsetof(WMTCompositionCall, argument) == 16);
+static_assert(offsetof(WMTCompositionCall_DATA32, argument) == 16);
+static_assert(offsetof(WMTCompositionFrame, restrict_output) == 32);
+static_assert(offsetof(WMTCompositionFrame, restricted_display_id) == 36);
+#else
+_Static_assert(sizeof(struct WMTCompositionCall) == 40, "composition native/PE ABI");
+_Static_assert(sizeof(struct WMTCompositionCall_DATA32) == 40, "composition WoW64 ABI");
+_Static_assert(sizeof(struct WMTCompositionTargetState) == 24, "composition target ABI");
+_Static_assert(sizeof(struct WMTCompositionFrame) == 40, "composition frame ABI");
+_Static_assert(offsetof(struct WMTCompositionCall, argument) == 16, "composition caller pointer ABI");
+_Static_assert(offsetof(struct WMTCompositionCall_DATA32, argument) == 16, "composition PE32 caller pointer ABI");
+_Static_assert(offsetof(struct WMTCompositionFrame, restrict_output) == 32, "composition restrict flag ABI");
+_Static_assert(offsetof(struct WMTCompositionFrame, restricted_display_id) == 36, "composition display ID ABI");
+#endif
 
 struct unixcall_get_pipeline_cache_identity {
   struct WMTPipelineCacheIdentity identity;

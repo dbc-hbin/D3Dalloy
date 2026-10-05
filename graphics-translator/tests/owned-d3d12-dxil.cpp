@@ -90,6 +90,45 @@ ComPtr<ID3D12Resource> createBuffer(ID3D12Device *device, UINT64 size, D3D12_HEA
   return resource;
 }
 
+// Public 1.2 ABI, matching owned-d3d12-bindless.cpp; MinGW predates these declarations.
+struct StaticSamplerDesc1 {
+  D3D12_STATIC_SAMPLER_DESC base;
+  UINT Flags;
+};
+struct RootSignatureDesc2 {
+  UINT NumParameters;
+  const D3D12_ROOT_PARAMETER1 *pParameters;
+  UINT NumStaticSamplers;
+  const StaticSamplerDesc1 *pStaticSamplers;
+  D3D12_ROOT_SIGNATURE_FLAGS Flags;
+};
+struct VersionedRootSignatureDesc12 {
+  D3D_ROOT_SIGNATURE_VERSION Version;
+  union {
+    D3D12_ROOT_SIGNATURE_DESC Desc_1_0;
+    D3D12_ROOT_SIGNATURE_DESC1 Desc_1_1;
+    RootSignatureDesc2 Desc_1_2;
+  };
+};
+static_assert(sizeof(StaticSamplerDesc1) == 56);
+
+ComPtr<ID3D12RootSignature> createRootSignature(ID3D12Device *device, const RootSignatureDesc2 &desc) {
+  VersionedRootSignatureDesc12 versioned{};
+  versioned.Version = static_cast<D3D_ROOT_SIGNATURE_VERSION>(3);
+  versioned.Desc_1_2 = desc;
+  ComPtr<ID3DBlob> blob, error;
+  HRESULT hr = D3D12SerializeVersionedRootSignature(
+      reinterpret_cast<const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *>(&versioned), &blob, &error);
+  if (FAILED(hr)) {
+    if (error) std::fwrite(error->GetBufferPointer(), 1, error->GetBufferSize(), stderr);
+    check(hr, "D3D12SerializeVersionedRootSignature(1.2)");
+  }
+  ComPtr<ID3D12RootSignature> root;
+  check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)),
+        "CreateRootSignature(1.2)");
+  return root;
+}
+
 ComPtr<ID3D12RootSignature> createRootSignature(ID3D12Device *device, const D3D12_ROOT_SIGNATURE_DESC &desc) {
   ComPtr<ID3DBlob> blob;
   ComPtr<ID3DBlob> error;

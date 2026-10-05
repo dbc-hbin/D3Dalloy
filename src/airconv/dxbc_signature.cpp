@@ -326,6 +326,11 @@ void handle_signature_ps(
 
     switch (RegType) {
     case D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK: {
+      if (sm50_shader->ps_has_inner_coverage_input) {
+        sm50_shader->initialization_error = "SV_Coverage and SV_InnerCoverage inputs are mutually exclusive";
+        return;
+      }
+      sm50_shader->ps_has_coverage_input = true;
       auto assigned_index = func_signature.DefineInput(InputInputCoverage{});
       signature_handlers.push_back([=](SignatureContext &ctx) {
         ctx.prologue << make_effect([=](struct context ctx) {
@@ -336,7 +341,27 @@ void handle_signature_ps(
       });
       break;
     }
-    case D3D11_SB_OPERAND_TYPE_INNER_COVERAGE:
+    case D3D11_SB_OPERAND_TYPE_INNER_COVERAGE: {
+      if (sm50_shader->ps_has_coverage_input || sm50_shader->ps_has_inner_coverage_input) {
+        sm50_shader->initialization_error = "Invalid or mutually exclusive SV_InnerCoverage declaration";
+        return;
+      }
+      sm50_shader->ps_has_inner_coverage_input = true;
+      signature_handlers.push_back([](SignatureContext &ctx) {
+        // Ordinary user metadata is only a compiler placeholder. transformPixel removes it
+        // from all native entries and supplies the gathered geometric value to the body.
+        auto index = ctx.captured_pixel ? ctx.func_signature.DefineInput(InputFragmentStageIn{
+          .user = "dxmt_inner_coverage", .type = msl_uint, .interpolation = Interpolation::flat,
+          .pull_mode = false,
+        }) : ~0u;
+        ctx.prologue << make_effect([=](struct context ctx) {
+          ctx.resource.inner_coverage_arg = index == ~0u ? static_cast<llvm::Value *>(ctx.builder.getInt32(0))
+                                                        : ctx.function->getArg(index);
+          return std::monostate{};
+        });
+      });
+      break;
+    }
     default:
       sm50_shader->initialization_error = "Unsupported DXBC pixel shader input declaration";
       return;

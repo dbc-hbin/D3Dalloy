@@ -24,6 +24,7 @@ enum FeatureFlag : std::uint32_t {
     FeatureFlagMVJittered = 1u << 2,
     FeatureFlagDepthInverted = 1u << 3,
     FeatureFlagAutoExposure = 1u << 6,
+    FeatureFlagAlphaUpscaling = 1u << 7,
 };
 
 struct CreateInfo {

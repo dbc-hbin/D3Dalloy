@@ -63,13 +63,14 @@
 // constant as what the closest hit observes. That lane is a single invocation on a single
 // primitive, so it depends on no enumeration order either.
 //
-// Shader input is produced only by upstream Microsoft DXC (lib_6_5), never by
-// Apple's Metal Shader Converter or the D3DMetal/GPTK compiler.
+// Raytracing library input is produced only by upstream Microsoft DXC (lib_6_5), never by
+// Apple's Metal Shader Converter or the D3DMetal/GPTK compiler. Arena growth uses auxiliary DXBC compute.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
@@ -1470,6 +1471,7 @@ int testRaytracing(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8
 #include "owned-d3d12-raytracing-coverage.inc"
 #include "owned-d3d12-raytracing-rayquery-stages.inc"
 #include "owned-d3d12-raytracing-linkage.inc"
+#include "owned-d3d12-raytracing-hitobject.inc"
 
 namespace {
 
@@ -1510,12 +1512,21 @@ int run(int argc, wchar_t **argv) {
   ComPtr<ID3D12Device5> device5;
   check(device.As(&device5), "QueryInterface(ID3D12Device5)");
 
+  Context context(device.Get());
+  if (argc == 4 && std::wcscmp(argv[1], L"--hitobject") == 0) {
+    contract::Runner geometry(device5.Get(), context, readFile(argv[2]));
+    return hitobject::run(device5.Get(), context, readFile(argv[3]), geometry);
+  }
+  if (argc == 4 && std::wcscmp(argv[1], L"--atomic64") == 0) {
+    contract::Runner geometry(device5.Get(), context, readFile(argv[2]));
+    return hitobject::runAtomic(device5.Get(), context, readFile(argv[3]), geometry);
+  }
+
   const auto dxil = readFile(argv[1]);
 
   const auto contractDxil = readFile(argv[2]);
   const auto stateobjDxil = readFile(argv[3]);
 
-  Context context(device.Get());
   int failures = testRaytracing(device5.Get(), context, dxil);
   // The base workload leaves its list closed; the contract cases record on a fresh one.
   check(context.allocator->Reset(), "CommandAllocator::Reset(contract)");
@@ -1561,6 +1572,13 @@ int run(int argc, wchar_t **argv) {
     contract::Runner geometry(device5.Get(), context, contractDxil);
     failures += linkage::run(device5.Get(), context, stateobjDxil, geometry, readFile(argv[22]),
                              readFile(argv[23]), readFile(argv[24]));
+  }
+  if (argc < 26) {
+    std::fprintf(stderr, "OWNED_D3D12_RAYTRACING_FAIL step=hitobject: missing raytracing-hitobject.dxil\n");
+    ++failures;
+  } else {
+    contract::Runner geometry(device5.Get(), context, contractDxil);
+    failures += hitobject::run(device5.Get(), context, readFile(argv[25]), geometry);
   }
   if (!failures)
     std::puts("OWNED_D3D12_RAYTRACING_PASS");

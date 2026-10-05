@@ -255,6 +255,12 @@ public:
 
     ~Dx12CommandPool()
     {
+        drain();
+        DeleteCriticalSection(&criticalSection);
+    }
+
+    void drain()
+    {
         EnterCriticalSection(&criticalSection);
 
         for (size_t type = 0; type < 4; type++)
@@ -272,7 +278,6 @@ public:
 
         LeaveCriticalSection(&criticalSection);
 
-        DeleteCriticalSection(&criticalSection);
     }
 
     Dx12Commands* get(ID3D12CommandQueue* pQueue, const wchar_t* name)

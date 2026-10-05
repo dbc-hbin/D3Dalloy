@@ -9,6 +9,8 @@
 #include "metalfx-backend.hpp"
 namespace fx = yaagl::pso::metalfx;
 extern "C" int32_t winemetal_metal4_fg_call(struct WMTMetal4Call *call);
+extern "C" void winemetal_composition_present(id<MTLDrawable> drawable, double duration,
+                                             const WMTCompositionFrame *frame, uint32_t sync_interval, bool allow_tearing);
 
 @interface DXMTTemporalFeature : NSObject {
 @public std::shared_ptr<fx::Feature> feature;
@@ -43,14 +45,20 @@ static uint32_t resultFor(const fx::Error &error) {
   }
 }
 static fx::Rect rect(const WMTMetal4FXRect &r) { return {r.x, r.y, r.width, r.height}; }
+#include "metalfx_rr.inc"
 extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
   if (call->operation >= 240 && call->operation < 256) return winemetal_metal4_fg_call(call);
   @autoreleasepool {
     @try {
       if (@available(macOS 26.0, *)) {
+        if (dxmtRRCall(call)) return 0;
         switch (call->operation) {
         case WMTMetal4FXSupportsTemporal:
-          call->ret[0] = [MTLFXTemporalScalerDescriptor supportsMetal4FX:(id<MTLDevice>)call->args[0]];
+          if (call->args[1] & 256u)
+            call->ret[0] = [MTLFXTemporalDenoisedScalerDescriptor supportsMetal4FX:(id<MTLDevice>)call->args[0]];
+          else if (call->args[1] & 512u)
+            call->ret[0] = [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:(id<MTLDevice>)call->args[0]];
+          else call->ret[0] = [MTLFXTemporalScalerDescriptor supportsMetal4FX:(id<MTLDevice>)call->args[0]];
           return 0;
         case WMTMetal4FXCreateTemporal: {
           const auto &p = *reinterpret_cast<const WMTMetal4FXTemporalInfo *>(call->args[2]);
@@ -84,7 +92,7 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
           info.motionVectorScaleX = p.motion_scale_x; info.motionVectorScaleY = p.motion_scale_y;
           info.preExposure = p.pre_exposure; info.resetHistory = p.reset; info.exposureMode = fx::ExposureMode(p.exposure_mode);
           fx::FrameOperations operations{fx::ColorTransfer(p.color_transfer), bool(p.combine_composition),
-              bool(p.sharpening), p.sharpness, bool(p.cap_output)};
+              bool(p.sharpening), p.sharpness, bool(p.cap_output), bool(p.debug_view)};
           fx::TextureSet textures{info.color, info.depth, info.motionVectors, info.output,
               info.exposureTexture, info.reactiveMask, info.compositionMask};
           fx::Error error;
@@ -114,7 +122,9 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
         case WMTMetal4FXPresentDrawable: {
           double duration; std::memcpy(&duration, &call->args[1], sizeof(duration));
           id<MTLDrawable> drawable = (id<MTLDrawable>)call->args[0];
-          if (duration > 0) [drawable presentAfterMinimumDuration:duration]; else [drawable present];
+          winemetal_composition_present(drawable, duration,
+              reinterpret_cast<const WMTCompositionFrame *>(call->args[2]), uint32_t(call->args[3]),
+              call->args[4] != 0);
           return 0;
         }
         default: return int32_t(0xc0000002);

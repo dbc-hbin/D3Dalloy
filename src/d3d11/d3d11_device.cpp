@@ -1,4 +1,5 @@
 #include "com/com_guid.hpp"
+#include "DXBCParser/BlobContainer.h"
 #include "d3d11_fence.hpp"
 #include "d3d11_input_layout.hpp"
 #include "d3d11_interfaces.hpp"
@@ -23,6 +24,7 @@
 #include "d3d11_resource.hpp"
 #include "dxgi_object.hpp"
 #include <memory>
+#include <cstring>
 #include "d3d11_4.h"
 #include "util_win32_compat.h"
 
@@ -298,6 +300,17 @@ public:
     InitReturnPtr(ppPixelShader);
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
+    // The shared compiler understands D3D12 Tier3 inputs. D3D11 remains Tier1:
+    // reject InnerCoverage at creation using the container's existing feature info.
+    microsoft::CDXBCParser bytecode;
+    if (bytecode.ReadDXBC(pShaderBytecode, BytecodeLength) != S_OK) return E_FAIL;
+    const auto features = bytecode.FindNextMatchingBlob(microsoft::DXBC_ShaderFeatureInfo);
+    if (features != DXBC_BLOB_NOT_FOUND) {
+      if (bytecode.GetBlobSize(features) < sizeof(uint64_t)) return E_FAIL;
+      uint64_t feature_mask;
+      memcpy(&feature_mask, bytecode.GetBlob(features), sizeof(feature_mask));
+      if (feature_mask & 0x00000400u) return E_FAIL; // D3D_SHADER_REQUIRES_INNER_COVERAGE
+    }
 
     return pipeline_cache_->AddPixelShader(pShaderBytecode, BytecodeLength,
                                            ppPixelShader);

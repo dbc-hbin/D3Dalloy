@@ -5,6 +5,8 @@
 #include <array>
 
 #include "air_signature.hpp"
+#include "airconv_context.hpp"
+#include "dxil_converter.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/BasicBlock.h"
@@ -18,6 +20,16 @@
 using namespace llvm;
 
 namespace dxmt::msaa {
+LoadInst *capturedLoad(IRBuilder<> &builder, Type *type, Value *pointer, MaybeAlign alignment) {
+  auto *transport = builder.CreateAlignedLoad(type, pointer, alignment);
+  // Only loads created from private captured records use this origin helper.
+  // Cloned application SRV/UAV instructions must retain their phase protocol.
+  if (transport->getPointerAddressSpace() == unsigned(air::AddressSpace::device) &&
+      transport->getModule()->getModuleFlag(dxil::kAtomic64PhaseFlag))
+    transport->setMetadata(dxil::kAtomic64Metadata, MDNode::get(builder.getContext(), {}));
+  return transport;
+}
+
 namespace {
 
 Error invalid(const char *message) {
@@ -25,10 +37,13 @@ Error invalid(const char *message) {
 }
 
 bool sampleExternalEffect(Instruction &instruction) {
+  // Phase metadata protects ordinary reads in logically inactive derivative
+  // lanes. It is not an application UAV effect; application writes remain guarded.
+  if (instruction.getMetadata("dxmt.atomic64.metadata")) return false;
   if (auto *store = dyn_cast<StoreInst>(&instruction))
     return store->getPointerAddressSpace() != 0 || store->isVolatile();
-  if (auto *load = dyn_cast<LoadInst>(&instruction))
-    return load->isVolatile();
+  if (isa<LoadInst>(instruction))
+    return false; // Reads, including volatile SRV reads, remain defined in logical helpers.
   if (isa<AtomicRMWInst>(instruction) || isa<AtomicCmpXchgInst>(instruction) ||
       isa<FenceInst>(instruction))
     return true;
@@ -40,9 +55,11 @@ bool sampleExternalEffect(Instruction &instruction) {
   if (name.startswith("air.atomic") || name.startswith("air.write_") ||
       name.startswith("air.store.") || name.startswith("air.fence_")) return true;
   if (!call->mayWriteToMemory()) return false;
-  // AIR's derivative/interpolation declarations often omit LLVM's readonly
-  // attributes, although these instructions only query fragment state.
+  // AIR's derivative/interpolation and wave declarations often omit LLVM's
+  // readonly attributes. Quad/wave exchanges are not device writes: logical
+  // helpers must execute them too, including after discard and in inclusive waves.
   return !(name.startswith("air.dfdx.") || name.startswith("air.dfdy.") ||
+           name.startswith("air.quad_") || name.startswith("air.simd_") ||
            name.startswith("air.interpolate_") || name.startswith("dxmt.sample_pos.") ||
            name.startswith("air.sample_") || name.startswith("air.read_") ||
            name.startswith("air.gather_") || name.startswith("air.load.") ||
@@ -65,7 +82,9 @@ void guardSampleEffects(Function &body, Value *active) {
     IRBuilder<> writeBuilder(write);
     auto *end = writeBuilder.CreateBr(continuation);
     instruction->moveBefore(end);
-    IRBuilder<>(block).CreateCondBr(active, write, continuation);
+    IRBuilder<> guard(block);
+    Value *enabled = active->getType()->isPointerTy() ? capturedLoad(guard, guard.getInt1Ty(), active) : active;
+    guard.CreateCondBr(enabled, write, continuation);
     if (!instruction->getType()->isVoidTy() && !instruction->use_empty()) {
       auto *result = PHINode::Create(instruction->getType(), 2, "sample.effect.value",
                                      &continuation->front());
@@ -77,6 +96,74 @@ void guardSampleEffects(Function &body, Value *active) {
       result->addIncoming(Constant::getNullValue(instruction->getType()), block);
     }
   }
+}
+
+// Demotion here is logical, not native: protected ordinary reads need real
+// hardware lanes even after application discard and outside primitive coverage.
+Error promoteApplication(Module &module, Function *&body, SmallVectorImpl<Value *> &arguments,
+                         IRBuilder<> &builder, Value *active, Value *&alive, Value *position,
+                         Value *control, unsigned sampleCount, bool centerPattern) {
+  auto *old = body;
+  SmallVector<Type *, 32> types(old->getFunctionType()->param_begin(), old->getFunctionType()->param_end());
+  types.push_back(position->getType());
+  types.push_back(control->getType());
+  types.push_back(builder.getInt1Ty());
+  types.push_back(builder.getInt1Ty()->getPointerTo());
+  body = Function::Create(FunctionType::get(old->getReturnType(), types, false),
+                          Function::InternalLinkage, old->getName() + ".promoted", module);
+  body->copyAttributesFrom(old);
+  for (unsigned i = 0; i < old->arg_size(); ++i) old->getArg(i)->replaceAllUsesWith(body->getArg(i));
+  body->getBasicBlockList().splice(body->begin(), old->getBasicBlockList());
+  while (true) {
+    CallInst *nested = nullptr;
+    for (auto &instruction : instructions(*body))
+      if (auto *call = dyn_cast<CallInst>(&instruction); call && call->getCalledFunction() &&
+          !call->getCalledFunction()->isDeclaration() &&
+          !call->getCalledFunction()->hasFnAttribute("dxmt.atomic64.helper") &&
+          !call->getMetadata("dxmt.rt_sample_pos")) { nested = call; break; }
+    if (!nested) break;
+    if (nested->getCalledFunction() == body) return invalid("recursive promoted fragment helper");
+    InlineFunctionInfo info;
+    if (!InlineFunction(*nested, info).isSuccess()) return invalid("cannot inline promoted fragment helper");
+  }
+  alive = builder.CreateAlloca(builder.getInt1Ty(), nullptr, "logical.fragment.alive");
+  builder.CreateStore(active, alive);
+  arguments.push_back(position);
+  arguments.push_back(control);
+  arguments.push_back(active);
+  arguments.push_back(alive);
+  auto *state = body->getArg(body->arg_size() - 1);
+  auto *tileControl = body->getArg(body->arg_size() - 3);
+  for (auto &instruction : make_early_inc_range(instructions(*body))) {
+    auto *call = dyn_cast<CallInst>(&instruction);
+    if (!call || !call->getCalledFunction()) continue;
+    auto name = call->getCalledFunction()->getName();
+    if (name == "air.get_num_samples.i32") {
+      call->replaceAllUsesWith(ConstantInt::get(call->getType(), sampleCount));
+      call->eraseFromParent();
+    } else if (name == "dxmt.sample_pos.i32" && call->getMetadata("dxmt.rt_sample_pos")) {
+      IRBuilder<> b(call);
+      auto *sample = call->getArgOperand(1);
+      Value *fallback = centerPattern ? static_cast<Value *>(Constant::getNullValue(call->getType())) :
+        b.CreateCall(call->getCalledFunction(), {b.getInt32(sampleCount), sample});
+      Value *result = PoisonValue::get(call->getType());
+      for (unsigned axis = 0; axis < 2; ++axis)
+        result = b.CreateInsertElement(result, coarse::programmableSampleOffset(b, tileControl,
+          sample, sampleCount, axis, b.CreateExtractElement(fallback, b.getInt32(axis))), b.getInt32(axis));
+      call->replaceAllUsesWith(result);
+      call->eraseFromParent();
+    } else if (name == "air.discard_fragment") {
+      IRBuilder<>(call).CreateStore(ConstantInt::getFalse(module.getContext()), state);
+      call->eraseFromParent();
+    } else if (name == "air.simd_is_helper_thread") {
+      IRBuilder<> b(call);
+      auto *logical = b.CreateNot(capturedLoad(b, b.getInt1Ty(), state));
+      call->replaceAllUsesWith(logical);
+      call->eraseFromParent();
+    }
+  }
+  guardSampleEffects(*body, state);
+  return Error::success();
 }
 
 StringRef kind(const MDNode &node) {
@@ -345,11 +432,27 @@ Value *lineValue(IRBuilder<> &b, Value *a, Value *z, Value *start, Value *end,
 // from these remain defined when an original vertex has clip W == 0.
 std::array<Value *, 3> distanceScreenVertex(IRBuilder<> &b, Value *clip,
                                              Value *originX, Value *originY,
-                                             Value *width, Value *height) {
+                                             Value *width, Value *height, bool snap) {
   auto *x = b.CreateExtractElement(clip, b.getInt32(0));
   auto *y = b.CreateExtractElement(clip, b.getInt32(1));
   auto *w = b.CreateExtractElement(clip, b.getInt32(3));
   auto *half = ConstantFP::get(b.getFloatTy(), .5);
+  if (snap) {
+    auto *hasW = b.CreateFCmpONE(w, ConstantFP::get(b.getFloatTy(), 0));
+    auto *divisor = b.CreateSelect(hasW, w, ConstantFP::get(b.getFloatTy(), 1));
+    auto *one = ConstantFP::get(b.getFloatTy(), 1);
+    auto *grid = ConstantFP::get(b.getFloatTy(), 256);
+    auto *screenX = b.CreateFAdd(originX, b.CreateFMul(b.CreateFMul(
+      b.CreateFAdd(b.CreateFDiv(x, divisor), one), width), half));
+    auto *screenY = b.CreateFAdd(originY, b.CreateFMul(b.CreateFMul(
+      b.CreateFSub(one, b.CreateFDiv(y, divisor)), height), half));
+    screenX = b.CreateFDiv(b.CreateUnaryIntrinsic(Intrinsic::rint, b.CreateFMul(screenX, grid)), grid);
+    screenY = b.CreateFDiv(b.CreateUnaryIntrinsic(Intrinsic::rint, b.CreateFMul(screenY, grid)), grid);
+    return {b.CreateSelect(hasW, b.CreateFMul(screenX, w), b.CreateFAdd(b.CreateFMul(originX, w),
+              b.CreateFMul(b.CreateFMul(width, half), b.CreateFAdd(x, w)))),
+            b.CreateSelect(hasW, b.CreateFMul(screenY, w), b.CreateFAdd(b.CreateFMul(originY, w),
+              b.CreateFMul(b.CreateFMul(height, half), b.CreateFSub(w, y)))), w};
+  }
   return {b.CreateFAdd(b.CreateFMul(originX, w),
             b.CreateFMul(b.CreateFMul(width, half), b.CreateFAdd(x, w))),
           b.CreateFAdd(b.CreateFMul(originY, w),
@@ -391,16 +494,18 @@ Value *distanceInterpolate(IRBuilder<> &b, ArrayRef<Value *> values,
     if (noPerspective) weights[i] = b.CreateFMul(weights[i], vertices[i][2]);
   }
   auto *denominator = b.CreateFAdd(b.CreateFAdd(weights[0], weights[1]), weights[2]);
+  auto *nondegenerate = b.CreateFCmpONE(denominator, ConstantFP::get(b.getFloatTy(), 0));
+  auto *divisor = b.CreateSelect(nondegenerate, denominator, ConstantFP::get(b.getFloatTy(), 1));
   Value *result = nullptr;
   for (unsigned i = 0; i < 3; ++i) {
-    auto *weight = b.CreateFDiv(weights[i], denominator);
+    auto *weight = b.CreateFDiv(weights[i], divisor);
     Value *factor = weight;
     if (auto *vector = dyn_cast<FixedVectorType>(values[i]->getType()))
       factor = b.CreateVectorSplat(vector->getNumElements(), weight);
     auto *v = b.CreateFMul(values[i], factor);
     result = result ? b.CreateFAdd(result, v) : v;
   }
-  return result;
+  return b.CreateSelect(nondegenerate, result, values[0]);
 }
 
 Value *lineCenterXY(IRBuilder<> &b, Value *position) {
@@ -445,7 +550,7 @@ Value *interpolateSample(IRBuilder<> &b, Module &module, StringRef perspective, 
     FunctionType::get(type, {interpolant->getType(), offset->getType()}, false)), {interpolant, offset});
 }
 
-Value *lineSampleXY(IRBuilder<> &b, Value *position, Value *sample, unsigned count, bool centerPattern) {
+Value *lineSampleXY(IRBuilder<> &b, Value *control, Value *position, Value *sample, unsigned count, bool centerPattern) {
   constexpr int8_t x1[] = {0}, y1[] = {0};
   constexpr int8_t x2[] = {4, -4}, y2[] = {4, -4};
   constexpr int8_t x4[] = {-2, 6, -6, 2}, y4[] = {-6, -2, 2, 6};
@@ -462,6 +567,7 @@ Value *lineSampleXY(IRBuilder<> &b, Value *position, Value *sample, unsigned cou
       delta = b.CreateSelect(b.CreateICmpEQ(sample, b.getInt32(i)),
         ConstantFP::get(b.getFloatTy(), centerPattern ? 0.0 :
           double(axis ? sy[i] : sx[i]) / 16.0), delta);
+    delta = coarse::programmableSampleOffset(b, control, sample, count, axis, delta);
     xy = b.CreateInsertElement(xy, b.CreateFAdd(b.CreateFAdd(pixel,
       ConstantFP::get(b.getFloatTy(), .5)), delta), b.getInt32(axis));
   }
@@ -501,9 +607,9 @@ Value *pullIndex(IRBuilder<> &builder, CallInst &call, unsigned location, unsign
   switch (location) {
   case PullCenter: return builder.getInt32(0);
   case PullCentroid: {
-    auto *primitiveCoverage = builder.CreateLoad(builder.getInt32Ty(),
+    auto *primitiveCoverage = capturedLoad(builder, builder.getInt32Ty(),
       recordPointer(builder, scratch, pixel, inputWords, 1));
-    auto *psoMask = builder.CreateLoad(builder.getInt32Ty(),
+    auto *psoMask = capturedLoad(builder, builder.getInt32Ty(),
       builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3));
     return centroidSlot(builder, primitiveCoverage, psoMask, sampleCount);
   }
@@ -533,8 +639,8 @@ Value *recordPointer(IRBuilder<> &builder, Value *scratch, Value *pixel, unsigne
 Value *pixelIndex(IRBuilder<> &builder, Value *position, Value *control) {
   auto *x = builder.CreateFPToUI(builder.CreateExtractElement(position, builder.getInt32(0)), builder.getInt32Ty());
   auto *y = builder.CreateFPToUI(builder.CreateExtractElement(position, builder.getInt32(1)), builder.getInt32Ty());
-  auto *originX = builder.CreateLoad(builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 0));
-  auto *originY = builder.CreateLoad(builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 1));
+  auto *originX = capturedLoad(builder, builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 0));
+  auto *originY = capturedLoad(builder, builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 1));
   auto *tileX = builder.CreateSub(x, originX);
   auto *tileY = builder.CreateSub(y, originY);
   return builder.CreateAdd(tileX, builder.CreateMul(tileY, builder.getInt32(8)));
@@ -543,8 +649,8 @@ Value *pixelIndex(IRBuilder<> &builder, Value *position, Value *control) {
 Value *inTile(IRBuilder<> &builder, Value *position, Value *control) {
   auto *x = builder.CreateFPToUI(builder.CreateExtractElement(position, builder.getInt32(0)), builder.getInt32Ty());
   auto *y = builder.CreateFPToUI(builder.CreateExtractElement(position, builder.getInt32(1)), builder.getInt32Ty());
-  auto *originX = builder.CreateLoad(builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 0));
-  auto *originY = builder.CreateLoad(builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 1));
+  auto *originX = capturedLoad(builder, builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 0));
+  auto *originY = capturedLoad(builder, builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 1));
   return builder.CreateAnd(builder.CreateICmpULT(builder.CreateSub(x, originX), builder.getInt32(8)),
                            builder.CreateICmpULT(builder.CreateSub(y, originY), builder.getInt32(8)));
 }
@@ -607,7 +713,11 @@ void conditionalStore(IRBuilder<> &builder, Function &entry, Value *predicate, V
   auto *join = BasicBlock::Create(entry.getContext(), "next_capture", &entry);
   builder.CreateCondBr(predicate, store, join);
   builder.SetInsertPoint(store);
-  builder.CreateAlignedStore(value, pointer, Align(4));
+  auto *transport = builder.CreateAlignedStore(value, pointer, Align(4));
+  // These are private capture/replay records, not application UAV accesses.
+  // The transformer creates them after the initial phase transport tagging.
+  if (entry.getParent()->getModuleFlag(dxil::kAtomic64PhaseFlag))
+    transport->setMetadata(dxil::kAtomic64Metadata, MDNode::get(entry.getContext(), {}));
   builder.CreateBr(join);
   builder.SetInsertPoint(join);
 }
@@ -639,30 +749,62 @@ Value *readUintTexture(IRBuilder<> &b, Module &module, Value *texture, Value *xy
   return b.CreateExtractValue(b.CreateCall(read, args), 0);
 }
 
-Value *postMask(IRBuilder<> &builder, Module &module, Value *texture, Value *position, unsigned sampleCount) {
+Value *postMask(IRBuilder<> &builder, Module &module, Value *texture, Value *position,
+                unsigned sampleCount, bool boundHelpers) {
   Value *xy = UndefValue::get(FixedVectorType::get(builder.getInt32Ty(), 2));
   for (unsigned i = 0; i < 2; ++i)
     xy = builder.CreateInsertElement(xy, builder.CreateFPToUI(
       builder.CreateExtractElement(position, builder.getInt32(i)), builder.getInt32Ty()), builder.getInt32(i));
+  auto *outside = builder.GetInsertBlock();
+  BasicBlock *joined = nullptr;
+  if (boundHelpers) {
+    // Logical helpers at a partial last tile still execute the complete app
+    // quad. They have zero raster coverage, not an out-of-bounds scratch read.
+    Value *inside = builder.getTrue();
+    for (unsigned axis = 0; axis < 2; ++axis) {
+      SmallVector<Type *, 2> types{texture->getType()};
+      SmallVector<Value *, 2> arguments{texture};
+      if (sampleCount == 1) { types.push_back(builder.getInt32Ty()); arguments.push_back(builder.getInt32(0)); }
+      auto query = module.getOrInsertFunction(sampleCount == 1
+        ? axis ? "air.get_height_texture_2d" : "air.get_width_texture_2d"
+        : axis ? "air.get_height_texture_2d_ms" : "air.get_width_texture_2d_ms",
+        FunctionType::get(builder.getInt32Ty(), types, false));
+      auto *extent = builder.CreateCall(query, arguments);
+      inside = builder.CreateAnd(inside, builder.CreateICmpULT(
+        builder.CreateExtractElement(xy, builder.getInt32(axis)), extent));
+    }
+    auto *read = BasicBlock::Create(module.getContext(), "coverage_in_bounds", outside->getParent());
+    joined = BasicBlock::Create(module.getContext(), "coverage_checked", outside->getParent());
+    builder.CreateCondBr(inside, read, joined);
+    builder.SetInsertPoint(read);
+  }
   Value *mask = builder.getInt32(0);
   if (sampleCount == 1) {
     auto *value = readUintTexture(builder, module, texture, xy);
-    return builder.CreateSelect(builder.CreateICmpNE(builder.CreateExtractElement(
+    mask = builder.CreateSelect(builder.CreateICmpNE(builder.CreateExtractElement(
       value, builder.getInt32(0)), builder.getInt32(0)),
       builder.getInt32(1), builder.getInt32(0));
-  }
-  for (unsigned sample = 0; sample < sampleCount; ++sample) {
+  } else for (unsigned sample = 0; sample < sampleCount; ++sample) {
     auto *value = readUintTexture(builder, module, texture, xy, builder.getInt32(sample));
     auto *covered = builder.CreateICmpNE(builder.CreateExtractElement(value,
                                              builder.getInt32(0)), builder.getInt32(0));
     mask = builder.CreateOr(mask, builder.CreateSelect(covered, builder.getInt32(1u << sample), builder.getInt32(0)));
+  }
+  if (joined) {
+    auto *read = builder.GetInsertBlock();
+    builder.CreateBr(joined);
+    builder.SetInsertPoint(joined);
+    auto *coverage = builder.CreatePHI(builder.getInt32Ty(), 2);
+    coverage->addIncoming(mask, read);
+    coverage->addIncoming(builder.getInt32(0), outside);
+    return coverage;
   }
   return mask;
 }
 
 Value *rateImage(IRBuilder<> &b, Module &module, Function &entry, Value *texture, Value *control) {
   auto load = [&](unsigned word) {
-    return b.CreateLoad(b.getInt32Ty(), b.CreateConstGEP1_32(b.getInt32Ty(), control, word));
+    return capturedLoad(b, b.getInt32Ty(), b.CreateConstGEP1_32(b.getInt32Ty(), control, word));
   };
   Value *x = b.CreateLShr(load(0), 3), *y = b.CreateLShr(load(1), 3);
   Value *enabled = b.CreateICmpNE(b.CreateAnd(load(14), b.getInt32(1u << 13)), b.getInt32(0));
@@ -685,9 +827,9 @@ Value *rateImage(IRBuilder<> &b, Module &module, Function &entry, Value *texture
 Value *clampDepth(IRBuilder<> &builder, Module &module, Value *control, Value *depth) {
   auto *floatControl = builder.CreateBitCast(control,
     PointerType::get(builder.getFloatTy(), unsigned(air::AddressSpace::constant)));
-  auto *minDepth = builder.CreateLoad(builder.getFloatTy(),
+  auto *minDepth = capturedLoad(builder, builder.getFloatTy(),
     builder.CreateConstGEP1_32(builder.getFloatTy(), floatControl, 4));
-  auto *maxDepth = builder.CreateLoad(builder.getFloatTy(),
+  auto *maxDepth = capturedLoad(builder, builder.getFloatTy(),
     builder.CreateConstGEP1_32(builder.getFloatTy(), floatControl, 5));
   auto binary = FunctionType::get(builder.getFloatTy(), {builder.getFloatTy(), builder.getFloatTy()}, false);
   auto max = module.getOrInsertFunction("air.fmax.f32", binary);
@@ -767,16 +909,19 @@ Error maskSampleFrequency(Module &module, uint32_t sampleMask) {
 
 Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options, bool coarseRequested,
                      bool conservative) {
+  const bool promoted = options.variant & SM50_MSAA_ATOMIC_HELPERS;
+  const unsigned variant = options.variant & ~SM50_MSAA_ATOMIC_HELPERS;
+  const bool promotedApp = promoted && (variant == SM50_MSAA_PIXEL || variant == SM50_MSAA_SAMPLE_APP);
   if (options.sample_count != 1 && options.sample_count != 2 &&
       options.sample_count != 4 && options.sample_count != 8 && options.sample_count != 16)
     return invalid("sample count must be 1, 2, 4, 8 or 16");
   // ForcedSampleCount 16 runs as two native 8x halves with the D3D 16x pattern halves programmed; the native
   // passes see 8 samples and tile.sample_base (0 or 8) maps them to logical samples. Records use 16 slots.
   const bool split = options.sample_count == 16;
-  if (split && (options.variant == SM50_MSAA_SAMPLE_APP || options.depth_attachment))
+  if (split && (variant == SM50_MSAA_SAMPLE_APP || options.depth_attachment))
     return invalid("16 logical samples support pixel-frequency shading without depth only");
-  if (options.variant < SM50_MSAA_COVERAGE ||
-      (options.variant > SM50_MSAA_REPLAY && options.variant != SM50_MSAA_SAMPLE_APP))
+  if (variant < SM50_MSAA_COVERAGE ||
+      (variant > SM50_MSAA_REPLAY && variant != SM50_MSAA_SAMPLE_APP))
     return invalid("invalid fragment variant");
   auto *fragments = module.getNamedMetadata("air.fragment");
   if (!fragments || fragments->getNumOperands() != 1)
@@ -787,7 +932,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   auto *oldOutputs = dyn_cast<MDTuple>(oldEntry->getOperand(1));
   if (!original || !oldInputs || !oldOutputs || oldInputs->getNumOperands() != original->arg_size())
     return invalid("inconsistent AIR fragment signature");
-  if (options.center_pattern)
+  if (options.center_pattern && !promotedApp)
     for (auto &instruction : make_early_inc_range(instructions(*original))) {
       auto *call = dyn_cast<CallInst>(&instruction);
       if (!call || !call->getMetadata("dxmt.rt_sample_pos") ||
@@ -796,7 +941,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       call->replaceAllUsesWith(Constant::getNullValue(call->getType()));
       call->eraseFromParent();
     }
-  if (options.interpolation_out && options.variant == SM50_MSAA_COVERAGE) {
+  if (options.interpolation_out && variant == SM50_MSAA_COVERAGE) {
     auto &interpolation = *options.interpolation_out;
     interpolation = {};
     for (auto &operand : oldInputs->operands()) {
@@ -835,18 +980,25 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   const auto &layout = module.getDataLayout();
   unsigned positionOld = ~0u, sampleOld = ~0u, coverageOld = ~0u, primitiveOld = ~0u;
   unsigned shadingRateOld = ~0u;
+  unsigned innerOld = ~0u;
   bool centroidPosition = false;
   bool samplePosition = false;
   SmallVector<bool, 24> centroidInput(original->arg_size(), false);
   SmallVector<unsigned, 24> offsets(original->arg_size(), ~0u);
   unsigned inputWords = 2;
-  unsigned flags = 0;
+  unsigned flags = promoted ? SM50_MSAA_PIXEL_ATOMIC_HELPERS : 0;
   for (unsigned i = 0; i < original->arg_size(); ++i) {
     auto *md = cast<MDNode>(oldInputs->getOperand(i));
     auto type = kind(*md);
     if (type == "air.fragment_input" && md->getNumOperands() > 2)
       if (auto *name = dyn_cast<MDString>(md->getOperand(2));
           name && name->getString() == "user(dxmt_resolved_shading_rate)") shadingRateOld = i;
+    if (type == "air.fragment_input" && md->getNumOperands() > 2)
+      if (auto *name = dyn_cast<MDString>(md->getOperand(2));
+          name && name->getString() == "user(dxmt_inner_coverage)") {
+        innerOld = i;
+        continue;
+      }
     if (type == "air.position") {
       positionOld = i;
       for (unsigned j = 2; j < md->getNumOperands(); ++j)
@@ -1016,6 +1168,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     for (unsigned i = 0; i < original->arg_size(); ++i) {
       if (std::any_of(distanceInputs.begin(), distanceInputs.end(),
           [i](const DistanceInput &input) { return input.argument == i; })) continue;
+      if (i == innerOld) continue;
       auto *md = cast<MDNode>(oldInputs->getOperand(i));
       if (kind(*md) != "air.fragment_input" || md->getNumOperands() < 3) continue;
       auto *semantic = dyn_cast<MDString>(md->getOperand(2));
@@ -1067,6 +1220,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   const unsigned lineMaskOffset = conservative || options.line_mode == SM50_MSAA_LINE_ALIASED ||
       options.line_mode == SM50_MSAA_LINE_ALPHA_AA ? inputWords++ : ~0u;
   const unsigned lineAlphaOffset = options.line_mode == SM50_MSAA_LINE_ALPHA_AA ? inputWords++ : ~0u;
+  const unsigned innerMaskOffset = conservative ? inputWords++ : ~0u;
+  const unsigned boundsMaskOffset = options.depth_bounds_emulated ? inputWords++ : ~0u;
   unsigned outputWords = 2;
   if (!original->getReturnType()->isVoidTy())
     outputWords += dwords(original->getReturnType(), layout);
@@ -1076,13 +1231,16 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     *options.layout_out = {inputWords, outputWords, 0, 1, 0, 1, flags, 8,
                            coarseShading ? coarse::kRecordCount : 128, 64,
                            centerZOffset, sampleZOffset, zClaimOffset, zAnchorOffset,
-                           options.line_mode, lineMaskOffset, lineAlphaOffset};
+                           options.line_mode, lineMaskOffset, lineAlphaOffset, innerMaskOffset, boundsMaskOffset};
+  static_assert(sizeof(SM50_MSAA_PIXEL_LAYOUT) == 19 * sizeof(uint32_t));
 
-  const unsigned variant = options.variant;
   // Finalize the AIR target before emitting any version-dependent texture intrinsics.
-  // Non-coverage MSAA passes require AIR 2.8 on macOS 27 AGX and interoperate with
-  // replay vertex AIR 2.6; coverage stays at its original target.
-  if (variant != SM50_MSAA_COVERAGE) {
+  // Non-coverage MSAA passes require at least AIR 2.8 on macOS 27 AGX.
+  // Retain the selected Metal 4.1/AIR 2.9 atomic phase target: its SC intrinsics
+  // cannot be compiled under the older replay target. Coverage is unchanged.
+  auto *airVersion = module.getNamedMetadata("air.version");
+  const auto airMinor = mdconst::extract<ConstantInt>(airVersion->getOperand(0)->getOperand(1))->getZExtValue();
+  if (variant != SM50_MSAA_COVERAGE && airMinor < 8) {
     module.setTargetTriple("air64_v28-apple-macosx26.0");
     auto *version = module.getOrInsertNamedMetadata("air.version");
     version->clearOperands();
@@ -1097,13 +1255,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   SmallVector<unsigned, 32> originalArgs;
   for (unsigned i = 0; i < original->arg_size(); ++i) {
     auto type = kind(*cast<MDNode>(oldInputs->getOperand(i)));
-    if (i == shadingRateOld) continue;
+    if (i == shadingRateOld || i == innerOld) continue;
     if (std::any_of(distanceInputs.begin(), distanceInputs.end(),
         [i](const DistanceInput &input) { return input.argument == i; })) continue;
     if (std::any_of(pulled.begin(), pulled.end(),
         [i](const PulledInput &input) { return input.argument == i && input.vertex_offset != ~0u; })) continue;
     if (variant != SM50_MSAA_COVERAGE &&
-        !(variant == SM50_MSAA_SAMPLE_APP && type == "air.fragment_input" && !centroidInput[i]) &&
+        !(variant == SM50_MSAA_SAMPLE_APP && !promoted && type == "air.fragment_input" && !centroidInput[i]) &&
         !((variant == SM50_MSAA_SAMPLE_APP || variant == SM50_MSAA_PIXEL) && resourceInput(type)))
       continue;
 
@@ -1121,8 +1279,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   unsigned inputArg = ~0u, outputArg = ~0u;
   inputArg = addBuffer(SM50_BINDING_INDEX_MSAA_PIXEL_INPUTS, variant == SM50_MSAA_COVERAGE,
                        "msaa_input_records", unsigned(air::AddressSpace::device));
-  if (variant == SM50_MSAA_PIXEL || variant == SM50_MSAA_REPLAY)
-    outputArg = addBuffer(SM50_BINDING_INDEX_MSAA_PIXEL_OUTPUTS, variant == SM50_MSAA_PIXEL,
+  if (variant == SM50_MSAA_PIXEL || variant == SM50_MSAA_REPLAY || promotedApp)
+    outputArg = addBuffer(SM50_BINDING_INDEX_MSAA_PIXEL_OUTPUTS, promotedApp || variant == SM50_MSAA_PIXEL,
                           "msaa_output_records", unsigned(air::AddressSpace::device));
   unsigned lineRecordsArg = ~0u, lineIndicesArg = ~0u;
   if ((line || options.distance_vertex_count || coarseShading) && variant == SM50_MSAA_COVERAGE) {
@@ -1207,12 +1365,12 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     lineEndArg = addLineInput("msaa_line_end");
     lineIntervalArg = addLineInput("msaa_line_clip_interval");
   }
-  const bool defaultDepth = options.depth_attachment &&
+  const bool defaultDepth = options.depth_attachment && !promotedApp &&
                             (variant == SM50_MSAA_REPLAY || variant == SM50_MSAA_SAMPLE_APP) &&
                             !(flags & SM50_MSAA_PIXEL_DEPTH);
   auto *returnType = variant == SM50_MSAA_COVERAGE
     ? static_cast<Type *>(StructType::get(context, {Type::getInt32Ty(context), Type::getInt32Ty(context)}, true))
-    : variant == SM50_MSAA_PIXEL ? Type::getVoidTy(context) : original->getReturnType();
+    : variant == SM50_MSAA_PIXEL || promotedApp ? Type::getVoidTy(context) : original->getReturnType();
   if (defaultDepth) {
     SmallVector<Type *, 16> fields;
     if (!returnType->isVoidTy())
@@ -1228,14 +1386,40 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   entry->setCallingConv(original->getCallingConv());
   auto *start = BasicBlock::Create(context, "entry", entry);
   IRBuilder<> builder(start);
-  auto *position = entry->getArg(positionArg);
+  Value *position = entry->getArg(positionArg);
   auto *control = entry->getArg(controlArg);
-  auto *tile = inTile(builder, position, control);
+  if (promotedApp)
+    for (unsigned axis = 0; axis < 2; ++axis) {
+      auto *origin = capturedLoad(builder, builder.getInt32Ty(),
+        builder.CreateConstGEP1_32(builder.getInt32Ty(), control, axis));
+      position = builder.CreateInsertElement(position, builder.CreateFAdd(
+        builder.CreateFSub(builder.CreateExtractElement(position, builder.getInt32(axis)),
+          ConstantFP::get(builder.getFloatTy(), 4.0)),
+        builder.CreateUIToFP(origin, builder.getFloatTy())), builder.getInt32(axis));
+    }
+  Value *tile = promotedApp ? static_cast<Value *>(builder.getTrue()) : inTile(builder, position, control);
+  if (promotedApp) {
+    // Test native floating coordinates before any float-to-uint conversion:
+    // the guard-band maps to negative virtual positions for the first tile.
+    for (unsigned axis = 0; axis < 2; ++axis) {
+      auto *coordinate = builder.CreateExtractElement(entry->getArg(positionArg), builder.getInt32(axis));
+      tile = builder.CreateAnd(tile, builder.CreateAnd(
+        builder.CreateFCmpOGE(coordinate, ConstantFP::get(builder.getFloatTy(), 4.0)),
+        builder.CreateFCmpOLT(coordinate, ConstantFP::get(builder.getFloatTy(), 12.0))));
+    }
+    // Native all-helper quads can share a SIMD wave with this 8x8 surface.
+    // Exclude those lanes before the app and protected reads: hardware suppresses
+    // their CAS. Contributing application quads must retain all four real lanes.
+    auto *nativeHelper = builder.CreateCall(module.getOrInsertFunction("air.simd_is_helper_thread",
+      FunctionType::get(builder.getInt1Ty(), {}, false)));
+    nativeHelper->setConvergent();
+    tile = builder.CreateAnd(tile, builder.CreateNot(nativeHelper));
+  }
   auto *valid = BasicBlock::Create(context, "valid_tile_pixel", entry);
   auto *done = BasicBlock::Create(context, "outside_tile", entry);
   builder.CreateCondBr(tile, valid, done);
   builder.SetInsertPoint(done);
-  if (variant == SM50_MSAA_PIXEL) {
+  if (variant == SM50_MSAA_PIXEL || promotedApp) {
     auto discard = module.getOrInsertFunction("air.discard_fragment", FunctionType::get(builder.getVoidTy(), {}, false));
     builder.CreateCall(discard);
     builder.CreateRetVoid();
@@ -1250,14 +1434,14 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   // Split 16x has no single native coverage texture: both 8x halves OR their logical coverage into record
   // dword 1 (no depth/stencil is allowed with forced samples), so the post-raster mask is that union & SampleMask.
   auto logicalMask = [&](Value *record) -> Value * {
-    return builder.CreateAnd(builder.CreateLoad(builder.getInt32Ty(),
+    return builder.CreateAnd(capturedLoad(builder, builder.getInt32Ty(),
       recordPointer(builder, entry->getArg(inputArg), record, inputWords, 1)),
-      builder.CreateLoad(builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3)));
+      capturedLoad(builder, builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3)));
   };
   auto lineAlpha = [&](Value *value) -> Value * {
     if (lineAlphaOffset == ~0u || !value || value->getType()->isVoidTy()) return value;
     auto *word = recordPointer(builder, entry->getArg(inputArg), pixel, inputWords, lineAlphaOffset);
-    auto *alpha = builder.CreateLoad(builder.getFloatTy(), builder.CreateBitCast(word,
+    auto *alpha = capturedLoad(builder, builder.getFloatTy(), builder.CreateBitCast(word,
       PointerType::get(builder.getFloatTy(), unsigned(air::AddressSpace::device))));
     for (unsigned i = 0; i < oldOutputs->getNumOperands(); ++i) {
       auto *output = cast<MDNode>(oldOutputs->getOperand(i));
@@ -1281,11 +1465,11 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     auto *scratch = entry->getArg(inputArg);
     Value *geometricCoverage = entry->getArg(coverageArg);
     if (lineMaskOffset != ~0u)
-      geometricCoverage = builder.CreateLoad(builder.getInt32Ty(),
+      geometricCoverage = capturedLoad(builder, builder.getInt32Ty(),
         recordPointer(builder, scratch, pixel, inputWords, lineMaskOffset));
     // Native coverage of this pass's 8 samples; split 16x maps it to logical samples [sample_base, +8).
     // Line masks are written by the gather pass in logical bits already.
-    Value *sampleBase = split ? static_cast<Value *>(builder.CreateLoad(builder.getInt32Ty(),
+    Value *sampleBase = split ? static_cast<Value *>(capturedLoad(builder, builder.getInt32Ty(),
       builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 13))) : nullptr;
     Value *nativeCoverage = geometricCoverage;
     if (split && lineMaskOffset != ~0u)
@@ -1321,13 +1505,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         MaybeAlign(), AtomicOrdering::Monotonic);
     Value *lineA = nullptr, *lineZ = nullptr, *lineW0 = nullptr, *lineW1 = nullptr;
     if (line) {
-      auto *slot = builder.CreateLoad(builder.getInt32Ty(),
+      auto *slot = capturedLoad(builder, builder.getInt32Ty(),
         builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 7));
       auto *base = builder.CreateMul(builder.CreateZExt(slot, builder.getInt64Ty()), builder.getInt64(20));
       auto *indices = entry->getArg(lineIndicesArg);
       auto *records = entry->getArg(lineRecordsArg);
       auto record = [&](unsigned ordinalOffset) {
-        Value *ordinal = builder.CreateLoad(builder.getInt32Ty(), builder.CreateGEP(
+        Value *ordinal = capturedLoad(builder, builder.getInt32Ty(), builder.CreateGEP(
           builder.getInt32Ty(), indices, builder.CreateAdd(base, builder.getInt64(ordinalOffset))));
         return builder.CreateGEP(builder.getInt32Ty(), records, builder.CreateMul(
           builder.CreateZExt(ordinal, builder.getInt64Ty()),
@@ -1337,7 +1521,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       auto capturedW = [&](Value *record) {
         auto *word = builder.CreateConstGEP1_32(builder.getInt32Ty(), record,
           options.line_vertex_layout->position_offset_dwords + 3);
-        return builder.CreateLoad(builder.getFloatTy(), builder.CreateBitCast(word,
+        return capturedLoad(builder, builder.getFloatTy(), builder.CreateBitCast(word,
           PointerType::get(builder.getFloatTy(), unsigned(air::AddressSpace::device))));
       };
       lineW0 = capturedW(lineA); lineW1 = capturedW(lineZ);
@@ -1345,7 +1529,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     auto lineInputValue = [&](const LineInput &input, Type *type, Value *xy) {
       auto captured = [&](Value *record) {
         auto *word = builder.CreateConstGEP1_32(builder.getInt32Ty(), record, input.vertex_offset);
-        return builder.CreateAlignedLoad(type, builder.CreateBitCast(word,
+        return capturedLoad(builder, type, builder.CreateBitCast(word,
           PointerType::get(type, unsigned(air::AddressSpace::device))), Align(4));
       };
       return lineValue(builder, captured(lineA), captured(lineZ),
@@ -1355,6 +1539,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     };
     SmallVector<Value *, 3> distanceRecords;
     SmallVector<std::array<Value *, 3>, 3> distanceVertices;
+    Value *distanceDegenerate = builder.getFalse();
     if (options.distance_vertex_count) {
       auto *vertices = options.distance_vertex_layout;
       if (line) {
@@ -1363,13 +1548,14 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           return invalid("line distance capture layout differs from replay layout");
         distanceRecords.append({lineA, lineZ});
       } else {
-        auto *slot = builder.CreateLoad(builder.getInt32Ty(),
+        auto *slot = capturedLoad(builder, builder.getInt32Ty(),
           builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 7));
-        auto *base = builder.CreateMul(builder.CreateZExt(slot, builder.getInt64Ty()), builder.getInt64(3));
+        auto *base = builder.CreateAdd(builder.CreateMul(builder.CreateZExt(slot, builder.getInt64Ty()),
+          builder.getInt64(conservative ? 24 : 3)), builder.getInt64(conservative ? 18 : 0));
         auto *indices = entry->getArg(lineIndicesArg);
         auto *records = entry->getArg(lineRecordsArg);
         for (unsigned i = 0; i < options.distance_vertex_count; ++i) {
-          Value *ordinal = builder.CreateLoad(builder.getInt32Ty(), builder.CreateGEP(
+          Value *ordinal = capturedLoad(builder, builder.getInt32Ty(), builder.CreateGEP(
             builder.getInt32Ty(), indices, builder.CreateAdd(base, builder.getInt64(i))));
           distanceRecords.push_back(builder.CreateGEP(builder.getInt32Ty(), records, builder.CreateMul(
             builder.CreateZExt(ordinal, builder.getInt64Ty()), builder.getInt64(vertices->record_dwords))));
@@ -1378,21 +1564,34 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       if (!line && options.distance_vertex_count > 1) {
         auto *viewport = builder.CreateBitCast(control,
           PointerType::get(builder.getFloatTy(), unsigned(air::AddressSpace::constant)));
-        auto *originX = builder.CreateLoad(builder.getFloatTy(), builder.CreateConstGEP1_32(
+        auto *originX = capturedLoad(builder, builder.getFloatTy(), builder.CreateConstGEP1_32(
           builder.getFloatTy(), viewport, 8));
-        auto *originY = builder.CreateLoad(builder.getFloatTy(), builder.CreateConstGEP1_32(
+        auto *originY = capturedLoad(builder, builder.getFloatTy(), builder.CreateConstGEP1_32(
           builder.getFloatTy(), viewport, 9));
-        auto *width = builder.CreateLoad(builder.getFloatTy(), builder.CreateConstGEP1_32(
+        auto *width = capturedLoad(builder, builder.getFloatTy(), builder.CreateConstGEP1_32(
           builder.getFloatTy(), viewport, 10));
-        auto *height = builder.CreateLoad(builder.getFloatTy(), builder.CreateConstGEP1_32(
+        auto *height = capturedLoad(builder, builder.getFloatTy(), builder.CreateConstGEP1_32(
           builder.getFloatTy(), viewport, 11));
+        SmallVector<Value *, 3> clipPositions;
         for (auto *record : distanceRecords) {
           auto *positionWord = builder.CreateConstGEP1_32(builder.getInt32Ty(), record,
             vertices->position_offset_dwords);
-          auto *clip = builder.CreateAlignedLoad(FixedVectorType::get(builder.getFloatTy(), 4),
+          auto *clip = capturedLoad(builder, FixedVectorType::get(builder.getFloatTy(), 4),
             builder.CreateBitCast(positionWord, PointerType::get(FixedVectorType::get(builder.getFloatTy(), 4),
               unsigned(air::AddressSpace::device))), Align(4));
-          distanceVertices.push_back(distanceScreenVertex(builder, clip, originX, originY, width, height));
+          distanceVertices.push_back(distanceScreenVertex(builder, clip, originX, originY, width, height, conservative));
+          clipPositions.push_back(clip);
+        }
+        if (conservative && clipPositions.size() == 3) {
+          auto *float4 = FixedVectorType::get(builder.getFloatTy(), 4);
+          Value *rect = PoisonValue::get(float4);
+          Value *components[] = {originX, originY, width, height};
+          for (unsigned i = 0; i < 4; ++i) rect = builder.CreateInsertElement(rect, components[i], i);
+          auto helper = module.getOrInsertFunction("dxmt.conservative.degenerate",
+            FunctionType::get(builder.getInt32Ty(), {float4, float4, float4, float4, builder.getInt32Ty()}, false));
+          auto *value = builder.CreateCall(helper, {clipPositions[0], clipPositions[1], clipPositions[2], rect,
+            builder.getInt32(options.depth_clip_enable ? 1 : 0)});
+          distanceDegenerate = builder.CreateICmpNE(value, builder.getInt32(0));
         }
       }
     }
@@ -1402,13 +1601,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       for (auto *record : distanceRecords) {
         auto *word = builder.CreateConstGEP1_32(builder.getInt32Ty(), record, vertexOffset);
         if (bytes >= dwords(type, layout) * 4) {
-          values.push_back(builder.CreateAlignedLoad(type, builder.CreateBitCast(word,
+          values.push_back(capturedLoad(builder, type, builder.CreateBitCast(word,
             PointerType::get(type, unsigned(air::AddressSpace::device))), Align(4)));
         } else {
           auto *vector = cast<FixedVectorType>(type);
           Value *value = Constant::getNullValue(type);
           for (unsigned c = 0; c < bytes / 4; ++c)
-            value = builder.CreateInsertElement(value, builder.CreateAlignedLoad(vector->getElementType(),
+            value = builder.CreateInsertElement(value, capturedLoad(builder, vector->getElementType(),
               builder.CreateBitCast(builder.CreateConstGEP1_32(builder.getInt32Ty(), word, c),
                 PointerType::get(vector->getElementType(), unsigned(air::AddressSpace::device))), Align(4)), c);
           values.push_back(value);
@@ -1418,8 +1617,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         return lineValue(builder, values[0], values[1], entry->getArg(lineStartArg),
           entry->getArg(lineEndArg), entry->getArg(lineIntervalArg), xy, lineW0, lineW1,
           noPerspective, flat);
-      return distanceInterpolate(builder, values, distanceVertices, xy,
-        noPerspective, flat);
+      auto *interpolated = distanceInterpolate(builder, values, distanceVertices, xy, noPerspective, flat);
+      return conservative ? builder.CreateSelect(distanceDegenerate, values[0], interpolated) : interpolated;
     };
     if (positionPull && !line) {
       auto *clip = entry->getArg(clipArg);
@@ -1493,8 +1692,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       Value *toW = builder.CreateFAdd(lineW0, builder.CreateFMul(
         builder.CreateFSub(lineW1, lineW0), hi));
       for (unsigned location = 0; location <= options.sample_count; ++location) {
-        Value *xy = location ? lineSampleXY(builder, position, builder.getInt32(location - 1),
-          options.sample_count, options.center_pattern) : lineCenterXY(builder, position);
+        Value *xy = location ? lineSampleXY(builder, control, position, builder.getInt32(location - 1), options.sample_count, options.center_pattern) : lineCenterXY(builder, position);
         Value *q = lineFraction(builder, entry->getArg(lineStartArg),
           entry->getArg(lineEndArg), xy);
         Value *reciprocal = builder.CreateFAdd(builder.CreateFDiv(
@@ -1530,8 +1728,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       conditionalStore(builder, *entry, realWon, pointer, center);
       if (lineInput != lineInputs.end())
         for (unsigned sample = 0; sample < options.sample_count; ++sample) {
-          Value *value = lineInputValue(*lineInput, type, lineSampleXY(builder, position,
-            builder.getInt32(sample), options.sample_count, options.center_pattern));
+          Value *value = lineInputValue(*lineInput, type, lineSampleXY(builder, control, position, builder.getInt32(sample), options.sample_count, options.center_pattern));
           unsigned offset = lineInput->sample_offset + sample * dwords(type, layout);
           for (unsigned lane = 0; lane < 4; ++lane) {
             auto *helper = builder.CreateBitCast(recordPointer(builder, scratch,
@@ -1549,8 +1746,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
 
     for (const auto &input : distanceInputs) {
       for (unsigned location = 0; location <= options.sample_count; ++location) {
-        Value *xy = location ? lineSampleXY(builder, position, builder.getInt32(location - 1),
-          options.sample_count, options.center_pattern) : lineCenterXY(builder, position);
+        Value *xy = location ? lineSampleXY(builder, control, position, builder.getInt32(location - 1), options.sample_count, options.center_pattern) : lineCenterXY(builder, position);
         Type *type = original->getArg(input.argument)->getType();
         auto *value = capturedInputValue(input.vertex_offset, type, dwords(type, layout) * 4,
           input.no_perspective, input.flat, xy);
@@ -1614,8 +1810,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           if (location == PullSample || location == PullCentroid) {
             Value *sample = location == PullSample ? static_cast<Value *>(index) :
               builder.CreateSub(index, builder.getInt32(1));
-            Value *sampleXY = lineSampleXY(builder, position, sample,
-              options.sample_count, options.center_pattern);
+            Value *sampleXY = lineSampleXY(builder, control, position, sample, options.sample_count, options.center_pattern);
             xy = location == PullCentroid ? builder.CreateSelect(
               builder.CreateICmpEQ(index, builder.getInt32(0)), xy, sampleXY) : sampleXY;
           } else if (location == PullOffset) {
@@ -1691,7 +1886,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         builder.SetInsertPoint(after);
       }
     }
-    auto *sampleMask = builder.CreateLoad(builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3));
+    auto *sampleMask = capturedLoad(builder, builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3));
     if (coarseShading) {
       SmallVector<Value *, 8> interpolants;
       for (unsigned index = 0; index < planes.inputs.size(); ++index) {
@@ -1706,15 +1901,15 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       Value *primitiveRate = builder.getInt32(0);
       const auto *vertices = options.coarse_vertex_layout;
       if (vertices && vertices->shading_rate_offset_dwords != ~0u) {
-        Value *slot = builder.CreateLoad(builder.getInt32Ty(),
+        Value *slot = capturedLoad(builder, builder.getInt32Ty(),
           builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 7));
         Value *index = builder.CreateAdd(builder.CreateMul(slot, builder.getInt32(conservative ? 24 : 3)),
                                         builder.getInt32(conservative ? 18 : 0));
-        Value *ordinal = builder.CreateLoad(builder.getInt32Ty(),
+        Value *ordinal = capturedLoad(builder, builder.getInt32Ty(),
           builder.CreateGEP(builder.getInt32Ty(), entry->getArg(lineIndicesArg), index));
         Value *word = builder.CreateAdd(builder.CreateMul(builder.CreateZExt(ordinal, builder.getInt64Ty()),
           builder.getInt64(vertices->record_dwords)), builder.getInt64(vertices->shading_rate_offset_dwords));
-        primitiveRate = builder.CreateLoad(builder.getInt32Ty(),
+        primitiveRate = capturedLoad(builder, builder.getInt32Ty(),
           builder.CreateGEP(builder.getInt32Ty(), entry->getArg(lineRecordsArg), word));
       }
       Value *imageRate = rateImage(builder, module, *entry, entry->getArg(rateImageArg), control);
@@ -1730,7 +1925,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         if (input.flat && offsets[input.argument] != ~0u) {
           Type *type = original->getArg(input.argument)->getType();
           auto *word = recordPointer(builder, scratch, pixel, inputWords, offsets[input.argument]);
-          auto *value = builder.CreateAlignedLoad(type, builder.CreateBitCast(word,
+          auto *value = capturedLoad(builder, type, builder.CreateBitCast(word,
             PointerType::get(type, unsigned(air::AddressSpace::device))), Align(4));
           constants.push_back({offsets[input.argument], value});
         }
@@ -1756,14 +1951,41 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     auto *rate = coarse::load(builder, scratch, inputWords, coarse::kRateRecordDword, builder.getInt32Ty());
     auto grid = coarse::grid(builder, position, control, rate);
     auto coverage = coarse::coverage(builder, grid, control, scratch, inputWords, options.sample_count,
-      [&](Value *at) { return postMask(builder, module, entry->getArg(textureArg), at, options.sample_count); });
+      [&](Value *at) { return postMask(builder, module, entry->getArg(textureArg), at, options.sample_count, promotedApp); });
+    Value *innerMask = builder.getInt32(0);
+    if (conservative && innerOld != ~0u) {
+      // VRS specifies the same fine-pixel/sample bit order as SV_Coverage, but
+      // the geometric inner predicate is never ANDed with SampleMask or depth.
+      auto *width = builder.CreateShl(builder.getInt32(1), grid.log2x);
+      auto *height = builder.CreateShl(builder.getInt32(1), grid.log2y);
+      for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x) {
+          auto *fineX = builder.CreateAdd(grid.fineX, builder.getInt32(x));
+          auto *fineY = builder.CreateAdd(grid.fineY, builder.getInt32(y));
+          auto *inside = builder.CreateAnd(builder.CreateICmpULT(builder.getInt32(x), width),
+            builder.CreateICmpULT(builder.getInt32(y), height));
+          inside = builder.CreateAnd(inside, builder.CreateAnd(builder.CreateICmpULT(fineX, builder.getInt32(8)),
+            builder.CreateICmpULT(fineY, builder.getInt32(8))));
+          auto *finePixel = builder.CreateAdd(builder.CreateMul(fineY, builder.getInt32(8)), fineX);
+          finePixel = builder.CreateSelect(inside, finePixel, builder.getInt32(0));
+          auto *inner = capturedLoad(builder, builder.getInt32Ty(),
+            recordPointer(builder, scratch, finePixel, inputWords, innerMaskOffset));
+          auto *shift = builder.CreateMul(builder.CreateAdd(builder.CreateMul(builder.getInt32(y), width),
+            builder.getInt32(x)), builder.getInt32(options.sample_count));
+          auto *bits = builder.CreateShl(builder.getInt32((1u << options.sample_count) - 1),
+            builder.CreateAnd(shift, builder.getInt32(31)));
+          auto *full = builder.CreateAnd(inside, builder.CreateICmpNE(inner, builder.getInt32(0)));
+          full = builder.CreateAnd(full, builder.CreateICmpULT(shift, builder.getInt32(32)));
+          innerMask = builder.CreateOr(innerMask, builder.CreateSelect(full, bits, builder.getInt32(0)));
+        }
+    }
     auto *mask = coverage.post;
-    auto *covered = builder.CreateICmpNE(mask, builder.getInt32(0));
+    Value *covered = builder.CreateICmpNE(mask, builder.getInt32(0));
     auto *shade = BasicBlock::Create(context, "shade_coarse", entry);
     auto *discard = BasicBlock::Create(context, "no_covered_coarse_samples", entry);
     builder.CreateCondBr(covered, shade, discard);
     builder.SetInsertPoint(discard);
-    builder.CreateCall(module.getOrInsertFunction("air.discard_fragment", FunctionType::get(builder.getVoidTy(), {}, false)));
+    if (!promotedApp) builder.CreateCall(module.getOrInsertFunction("air.discard_fragment", FunctionType::get(builder.getVoidTy(), {}, false)));
     builder.CreateBr(shade);
     builder.SetInsertPoint(shade);
     SmallVector<Value *, 32> callArgs(original->arg_size());
@@ -1772,9 +1994,10 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     for (unsigned i = 0; i < original->arg_size(); ++i) {
       if (callArgs[i]) continue;
       if (i == shadingRateOld) callArgs[i] = rate;
+      else if (i == innerOld) callArgs[i] = innerMask;
       else if (i == coverageOld) callArgs[i] = mask;
       else if (i == primitiveOld)
-        callArgs[i] = builder.CreateLoad(builder.getInt32Ty(),
+        callArgs[i] = capturedLoad(builder, builder.getInt32Ty(),
           builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 6));
       else if (i == positionOld)
         callArgs[i] = coarse::position(builder, scratch, inputWords, planes, control, grid.center);
@@ -1810,7 +2033,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       call->replaceAllUsesWith(builder.getInt32(options.sample_count));
       call->eraseFromParent();
     }
+    Value *alive = nullptr;
+    if (promotedApp)
+      if (auto error = promoteApplication(module, body, callArgs, builder, covered, alive, position, control, options.sample_count, options.center_pattern)) return error;
     auto *result = builder.CreateCall(body, callArgs);
+    if (alive) covered = capturedLoad(builder, builder.getInt1Ty(), alive);
+    if (promotedApp) result->setMetadata("dxmt.rov.logical_active", MDNode::get(context,
+      {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 2))})); if (promotedApp) result->setMetadata("dxmt.rov.logical_position", MDNode::get(context, {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 4))}));
     auto *out = entry->getArg(outputArg);
     if (!original->getReturnType()->isVoidTy()) {
       auto *ptr = builder.CreateBitCast(recordPointer(builder, out, pixel, outputWords, 2),
@@ -1829,13 +2058,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   } else if (variant == SM50_MSAA_PIXEL) {
     auto *scratch = entry->getArg(inputArg);
     auto *mask = split ? logicalMask(pixel)
-                       : postMask(builder, module, entry->getArg(textureArg), position, options.sample_count);
-    auto *covered = builder.CreateICmpNE(mask, builder.getInt32(0));
+                       : postMask(builder, module, entry->getArg(textureArg), position, options.sample_count, promotedApp);
+    Value *covered = builder.CreateICmpNE(mask, builder.getInt32(0));
     auto *shade = BasicBlock::Create(context, "shade_once", entry);
     auto *discard = BasicBlock::Create(context, "no_covered_samples", entry);
     builder.CreateCondBr(covered, shade, discard);
     builder.SetInsertPoint(discard);
-    builder.CreateCall(module.getOrInsertFunction("air.discard_fragment", FunctionType::get(builder.getVoidTy(), {}, false)));
+    if (!promotedApp) builder.CreateCall(module.getOrInsertFunction("air.discard_fragment", FunctionType::get(builder.getVoidTy(), {}, false)));
     builder.CreateBr(shade);
     builder.SetInsertPoint(shade);
     auto *inputRecord = builder.CreateSelect(covered, pixel, builder.CreateAdd(pixel, builder.getInt32(64)));
@@ -1845,9 +2074,14 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     for (unsigned i = 0; i < original->arg_size(); ++i) {
       if (callArgs[i]) continue;
       if (i == coverageOld) {callArgs[i] = mask; continue;}
+      if (i == innerOld) {
+        callArgs[i] = conservative ? static_cast<Value *>(capturedLoad(builder, builder.getInt32Ty(),
+          recordPointer(builder, scratch, pixel, inputWords, innerMaskOffset))) : builder.getInt32(0);
+        continue;
+      }
       if (i == sampleOld) {callArgs[i] = builder.getInt32(0); continue;}
       if (i == primitiveOld) {
-        callArgs[i] = builder.CreateLoad(builder.getInt32Ty(),
+        callArgs[i] = capturedLoad(builder, builder.getInt32Ty(),
           builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 6));
         continue;
       }
@@ -1861,20 +2095,20 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       }
       auto *ptr = builder.CreateBitCast(recordPointer(builder, scratch, inputRecord, inputWords, offsets[i]),
                              PointerType::get(original->getArg(i)->getType(), unsigned(air::AddressSpace::device)));
-      callArgs[i] = builder.CreateAlignedLoad(original->getArg(i)->getType(), ptr, Align(4));
+      callArgs[i] = capturedLoad(builder, original->getArg(i)->getType(), ptr, Align(4));
       auto distance = std::find_if(distanceInputs.begin(), distanceInputs.end(),
         [i](const DistanceInput &input) { return input.argument == i; });
       if (distance != distanceInputs.end() && distance->centroid) {
-        auto *coverage = builder.CreateLoad(builder.getInt32Ty(),
+        auto *coverage = capturedLoad(builder, builder.getInt32Ty(),
           recordPointer(builder, scratch, inputRecord, inputWords, 1));
-        auto *mask = builder.CreateLoad(builder.getInt32Ty(),
+        auto *mask = capturedLoad(builder, builder.getInt32Ty(),
           builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3));
         auto *slot = centroidSlot(builder, coverage, mask, options.sample_count);
         auto *sampleIndex = builder.CreateSelect(builder.CreateICmpEQ(slot, builder.getInt32(0)),
           builder.getInt32(0), builder.CreateSub(slot, builder.getInt32(1)));
         auto *word = recordPointer(builder, scratch, inputRecord, inputWords,
           distance->sample_offset);
-        auto *sample = builder.CreateAlignedLoad(original->getArg(i)->getType(),
+        auto *sample = capturedLoad(builder, original->getArg(i)->getType(),
           builder.CreateBitCast(builder.CreateGEP(builder.getInt32Ty(), word,
             builder.CreateMul(sampleIndex, builder.getInt32(dwords(original->getArg(i)->getType(), layout)))),
             PointerType::get(original->getArg(i)->getType(), unsigned(air::AddressSpace::device))), Align(4));
@@ -1882,20 +2116,20 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       }
       if (i == positionOld && !centroidPosition) {
         auto *raw = recordPointer(builder, scratch, inputRecord, inputWords, centerZOffset);
-        auto *centerZ = builder.CreateLoad(builder.getFloatTy(), builder.CreateBitCast(raw,
+        auto *centerZ = capturedLoad(builder, builder.getFloatTy(), builder.CreateBitCast(raw,
           PointerType::get(builder.getFloatTy(), unsigned(air::AddressSpace::device))));
         callArgs[i] = builder.CreateInsertElement(callArgs[i], centerZ, builder.getInt32(2));
         if (line) {
-          auto *q = builder.CreateLoad(builder.getFloatTy(), builder.CreateBitCast(
+          auto *q = capturedLoad(builder, builder.getFloatTy(), builder.CreateBitCast(
             recordPointer(builder, scratch, inputRecord, inputWords, reciprocalWOffset),
             PointerType::get(builder.getFloatTy(), unsigned(air::AddressSpace::device))));
           callArgs[i] = builder.CreateInsertElement(callArgs[i], q, builder.getInt32(3));
         }
       }
       if (i == positionOld && centroidPosition) {
-        auto *preCoverage = builder.CreateLoad(builder.getInt32Ty(),
+        auto *preCoverage = capturedLoad(builder, builder.getInt32Ty(),
           recordPointer(builder, scratch, inputRecord, inputWords, 1));
-        auto *psoMask = builder.CreateLoad(builder.getInt32Ty(),
+        auto *psoMask = capturedLoad(builder, builder.getInt32Ty(),
           builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3));
         auto *clipIndex = centroidSlot(builder, preCoverage, psoMask, options.sample_count);
         auto *center = builder.CreateICmpEQ(clipIndex, builder.getInt32(0));
@@ -1918,6 +2152,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
             delta = builder.CreateSelect(builder.CreateICmpEQ(firstSample, builder.getInt32(sample)),
               ConstantFP::get(builder.getFloatTy(), options.center_pattern ? 0.0 :
                 double(axis ? sampleY[sample] : sampleX[sample]) / 16.0), delta);
+          delta = coarse::programmableSampleOffset(builder, control, firstSample, options.sample_count, axis, delta);
           delta = builder.CreateSelect(center, ConstantFP::get(builder.getFloatTy(), 0), delta);
           auto *coordinate = builder.CreateExtractElement(originalPos, builder.getInt32(axis));
           auto *pixelBase = builder.CreateUIToFP(builder.CreateFPToUI(coordinate, builder.getInt32Ty()),
@@ -1927,7 +2162,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
             builder.getInt32(axis));
         }
         auto *depthBase = recordPointer(builder, scratch, inputRecord, inputWords, centerZOffset);
-        auto *depth = builder.CreateLoad(builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
+        auto *depth = capturedLoad(builder, builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
           builder.CreateBitCast(depthBase, PointerType::get(builder.getFloatTy(),
             unsigned(air::AddressSpace::device))), clipIndex));
         fixedPos = builder.CreateInsertElement(fixedPos, depth, builder.getInt32(2));
@@ -1936,7 +2171,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         // reciprocal of the exact native interpolation at the chosen sample.
         auto *qPointer = recordPointer(builder, scratch, inputRecord, inputWords,
           reciprocalWOffset);
-        auto *q = builder.CreateLoad(builder.getFloatTy(),
+        auto *q = capturedLoad(builder, builder.getFloatTy(),
           builder.CreateGEP(builder.getFloatTy(),
             builder.CreateBitCast(qPointer, PointerType::get(builder.getFloatTy(),
               unsigned(air::AddressSpace::device))), clipIndex));
@@ -1981,7 +2216,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
                                     body->getArg(original->arg_size() + 1), inputWords, found->offset[location]);
         auto *array = load.CreateBitCast(base, PointerType::get(call->getType(), unsigned(air::AddressSpace::device)));
         auto *slot = load.CreateGEP(call->getType(), array, index);
-        call->replaceAllUsesWith(load.CreateAlignedLoad(call->getType(), slot, Align(4)));
+        call->replaceAllUsesWith(capturedLoad(load, call->getType(), slot, Align(4)));
         call->eraseFromParent();
       }
       callArgs.push_back(scratch);
@@ -1995,7 +2230,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       call->replaceAllUsesWith(builder.getInt32(options.sample_count));
       call->eraseFromParent();
     }
+    Value *alive = nullptr;
+    if (promotedApp)
+      if (auto error = promoteApplication(module, body, callArgs, builder, covered, alive, position, control, options.sample_count, options.center_pattern)) return error;
     auto *result = builder.CreateCall(body, callArgs);
+    if (alive) covered = capturedLoad(builder, builder.getInt1Ty(), alive);
+    if (promotedApp) result->setMetadata("dxmt.rov.logical_active", MDNode::get(context,
+      {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 2))})); if (promotedApp) result->setMetadata("dxmt.rov.logical_position", MDNode::get(context, {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 4))}));
     auto *out = entry->getArg(outputArg);
     if (!original->getReturnType()->isVoidTy()) {
       auto *ptr = builder.CreateBitCast(recordPointer(builder, out, pixel, outputWords, 2),
@@ -2015,7 +2256,19 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     builder.CreateRetVoid();
   } else {
     auto *mask = split ? logicalMask(pixel)
-                       : postMask(builder, module, entry->getArg(textureArg), position, options.sample_count);
+                       : postMask(builder, module, entry->getArg(textureArg), position, options.sample_count, promotedApp);
+    Value *boundsMask = builder.getInt32(~0u);
+    if (boundsMaskOffset != ~0u) {
+      auto *enabled = capturedLoad(builder, builder.getInt32Ty(),
+        builder.CreateConstGEP1_32(builder.getInt32Ty(), control,
+          offsetof(SM50_MSAA_TILE_CONTROL, depth_bounds_enabled) / sizeof(uint32_t)));
+      boundsMask = builder.CreateSelect(builder.CreateICmpNE(enabled, builder.getInt32(0)),
+        capturedLoad(builder, builder.getInt32Ty(), recordPointer(builder, entry->getArg(inputArg),
+          pixel, inputWords, boundsMaskOffset)), builder.getInt32(~0u));
+      // A late sample-frequency application must keep its UAV effects; only replay and its final outputs
+      // consume this mask. Force-early applications already read bounds-filtered post-depth coverage.
+      if (variant == SM50_MSAA_REPLAY) mask = builder.CreateAnd(mask, boundsMask);
+    }
     // Coarse replay reads the output record of the fine pixel's coarse pixel.
     Value *outputRecord = pixel, *coarseShift = nullptr;
     if (coarseShading && variant == SM50_MSAA_REPLAY) {
@@ -2026,17 +2279,22 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       coarseShift = replay.shift;
     }
     // Split 16x replays each 8x half natively: logical sample = native sample id + tile.sample_base.
-    Value *halfBase = split ? static_cast<Value *>(builder.CreateLoad(builder.getInt32Ty(),
+    Value *halfBase = split ? static_cast<Value *>(capturedLoad(builder, builder.getInt32Ty(),
       builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 13))) : nullptr;
     Value *logicalSample = sampleArg == ~0u ? nullptr : split
       ? builder.CreateAdd(entry->getArg(sampleArg), halfBase) : static_cast<Value *>(entry->getArg(sampleArg));
+    if (promotedApp && variant == SM50_MSAA_SAMPLE_APP)
+      logicalSample = capturedLoad(builder, builder.getInt32Ty(),
+        builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 13));
+    if (promoted && variant == SM50_MSAA_REPLAY && (flags & SM50_MSAA_PIXEL_SAMPLE_FREQUENCY))
+      outputRecord = builder.CreateAdd(builder.CreateMul(pixel, builder.getInt32(options.sample_count)), logicalSample);
     auto *validPixel = variant == SM50_MSAA_REPLAY && options.single_sample_target
       ? builder.CreateICmpNE(mask, builder.getInt32(0))
       : builder.CreateICmpNE(builder.CreateAnd(mask,
           builder.CreateShl(builder.getInt32(1), logicalSample)), builder.getInt32(0));
     auto *out = variant == SM50_MSAA_REPLAY ? entry->getArg(outputArg) : nullptr;
     auto *published = variant == SM50_MSAA_REPLAY
-      ? builder.CreateICmpNE(builder.CreateLoad(builder.getInt32Ty(),
+      ? builder.CreateICmpNE(capturedLoad(builder, builder.getInt32Ty(),
           recordPointer(builder, out, outputRecord, outputWords, 0)), builder.getInt32(0))
       : builder.getTrue();
     auto *present = BasicBlock::Create(context, "replay_sample", entry);
@@ -2044,7 +2302,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     auto *logicalActive = builder.CreateAnd(validPixel, published);
     builder.CreateCondBr(logicalActive, present, masked);
     builder.SetInsertPoint(masked);
-    builder.CreateCall(module.getOrInsertFunction("air.discard_fragment", FunctionType::get(builder.getVoidTy(), {}, false)));
+    if (!promotedApp) builder.CreateCall(module.getOrInsertFunction("air.discard_fragment", FunctionType::get(builder.getVoidTy(), {}, false)));
     if (variant == SM50_MSAA_SAMPLE_APP) builder.CreateBr(present);
     else if (returnType->isVoidTy()) builder.CreateRetVoid();
     else builder.CreateRet(Constant::getNullValue(returnType));
@@ -2062,15 +2320,15 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           auto *pointer = builder.CreateBitCast(recordPointer(builder,
             entry->getArg(inputArg), sampleRecord, inputWords, input.sample_offset),
             PointerType::get(type, unsigned(air::AddressSpace::device)));
-          pointer = builder.CreateGEP(type, pointer, entry->getArg(sampleArg));
-          callArgs[input.argument] = builder.CreateAlignedLoad(type, pointer, Align(4));
+          pointer = builder.CreateGEP(type, pointer, logicalSample);
+          callArgs[input.argument] = capturedLoad(builder, type, pointer, Align(4));
         }
       for (const auto &input : distanceInputs) {
-        Value *slot = entry->getArg(sampleArg);
+        Value *slot = logicalSample;
         if (input.centroid) {
-          auto *coverage = builder.CreateLoad(builder.getInt32Ty(),
+          auto *coverage = capturedLoad(builder, builder.getInt32Ty(),
             recordPointer(builder, entry->getArg(inputArg), sampleRecord, inputWords, 1));
-          auto *mask = builder.CreateLoad(builder.getInt32Ty(),
+          auto *mask = capturedLoad(builder, builder.getInt32Ty(),
             builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3));
           slot = centroidSlot(builder, coverage, mask, options.sample_count);
         }
@@ -2083,23 +2341,28 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           builder.CreateMul(sampleIndex, builder.getInt32(dwords(original->getArg(input.argument)->getType(), layout)))),
           PointerType::get(original->getArg(input.argument)->getType(),
             unsigned(air::AddressSpace::device)));
-        Value *sampleValue = builder.CreateAlignedLoad(original->getArg(input.argument)->getType(), pointer, Align(4));
+        Value *sampleValue = capturedLoad(builder, original->getArg(input.argument)->getType(), pointer, Align(4));
         if (input.centroid) {
           auto *center = builder.CreateBitCast(recordPointer(builder, entry->getArg(inputArg),
             sampleRecord, inputWords, offsets[input.argument]),
             PointerType::get(original->getArg(input.argument)->getType(),
               unsigned(air::AddressSpace::device)));
           sampleValue = builder.CreateSelect(builder.CreateICmpEQ(slot, builder.getInt32(0)),
-            builder.CreateAlignedLoad(original->getArg(input.argument)->getType(), center, Align(4)), sampleValue);
+            capturedLoad(builder, original->getArg(input.argument)->getType(), center, Align(4)), sampleValue);
         }
         callArgs[input.argument] = sampleValue;
       }
       for (unsigned i = 0; i < original->arg_size(); ++i) {
         if (callArgs[i]) continue;
-        if (i == sampleOld) { callArgs[i] = entry->getArg(sampleArg); continue; }
+        if (i == sampleOld) { callArgs[i] = logicalSample; continue; }
         if (i == coverageOld) { callArgs[i] = mask; continue; }
+        if (i == innerOld) {
+          callArgs[i] = conservative ? static_cast<Value *>(capturedLoad(builder, builder.getInt32Ty(),
+            recordPointer(builder, entry->getArg(inputArg), pixel, inputWords, innerMaskOffset))) : builder.getInt32(0);
+          continue;
+        }
         if (i == primitiveOld) {
-          callArgs[i] = builder.CreateLoad(builder.getInt32Ty(),
+          callArgs[i] = capturedLoad(builder, builder.getInt32Ty(),
             builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 6));
           continue;
         }
@@ -2108,9 +2371,9 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           Value *firstSample = builder.getInt32(0);
           Value *center = builder.getTrue();
           if (centroidPosition || samplePosition) {
-            auto *preCoverage = builder.CreateLoad(builder.getInt32Ty(),
+            auto *preCoverage = capturedLoad(builder, builder.getInt32Ty(),
               recordPointer(builder, entry->getArg(inputArg), sampleRecord, inputWords, 1));
-            auto *psoMask = builder.CreateLoad(builder.getInt32Ty(),
+            auto *psoMask = capturedLoad(builder, builder.getInt32Ty(),
               builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 3));
             slot = centroidSlot(builder, preCoverage, psoMask, options.sample_count);
             center = builder.CreateICmpEQ(slot, builder.getInt32(0));
@@ -2118,17 +2381,24 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
               builder.CreateSub(slot, builder.getInt32(1)));
             if (samplePosition) {
               center = builder.getFalse();
-              firstSample = entry->getArg(sampleArg);
+              firstSample = logicalSample;
               slot = builder.CreateAdd(firstSample, builder.getInt32(1));
             }
           }
           auto *raw = recordPointer(builder, entry->getArg(inputArg), sampleRecord, inputWords, centerZOffset);
-          auto *rawZ = builder.CreateLoad(builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
+          auto *rawZ = capturedLoad(builder, builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
             builder.CreateBitCast(raw, PointerType::get(builder.getFloatTy(),
               unsigned(air::AddressSpace::device))), slot));
           Value *fixedPos = builder.CreateInsertElement(position, rawZ, builder.getInt32(2));
+          if (promotedApp && offsets[i] != ~0u) {
+            auto *saved = builder.CreateBitCast(recordPointer(builder, entry->getArg(inputArg),
+              sampleRecord, inputWords, offsets[i]),
+              PointerType::get(original->getArg(i)->getType(), unsigned(air::AddressSpace::device)));
+            auto *captured = capturedLoad(builder, original->getArg(i)->getType(), saved, Align(4));
+            fixedPos = builder.CreateInsertElement(fixedPos, builder.CreateExtractElement(captured, builder.getInt32(3)), builder.getInt32(3));
+          }
           if (line) {
-            auto *q = builder.CreateLoad(builder.getFloatTy(), builder.CreateBitCast(
+            auto *q = capturedLoad(builder, builder.getFloatTy(), builder.CreateBitCast(
               recordPointer(builder, entry->getArg(inputArg), sampleRecord, inputWords, reciprocalWOffset),
               PointerType::get(builder.getFloatTy(), unsigned(air::AddressSpace::device))));
             fixedPos = builder.CreateInsertElement(fixedPos, q, builder.getInt32(3));
@@ -2147,6 +2417,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
                 delta = builder.CreateSelect(builder.CreateICmpEQ(firstSample, builder.getInt32(sample)),
                   ConstantFP::get(builder.getFloatTy(), options.center_pattern ? 0.0 :
                     double(axis ? sy[sample] : sx[sample]) / 16.0), delta);
+              delta = coarse::programmableSampleOffset(builder, control, firstSample, options.sample_count, axis, delta);
               delta = builder.CreateSelect(center, ConstantFP::get(builder.getFloatTy(), 0), delta);
               auto *coordinate = builder.CreateExtractElement(position, builder.getInt32(axis));
               auto *base = builder.CreateUIToFP(builder.CreateFPToUI(coordinate, builder.getInt32Ty()), builder.getFloatTy());
@@ -2154,13 +2425,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
                 base, ConstantFP::get(builder.getFloatTy(), .5)), delta), builder.getInt32(axis));
             }
             auto *qBase = recordPointer(builder, entry->getArg(inputArg), sampleRecord, inputWords, reciprocalWOffset);
-            auto *q = builder.CreateLoad(builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
+            auto *q = capturedLoad(builder, builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
               builder.CreateBitCast(qBase, PointerType::get(builder.getFloatTy(),
                 unsigned(air::AddressSpace::device))), slot));
             fixedPos = builder.CreateInsertElement(fixedPos, q, builder.getInt32(3));
             Value *centerPos = builder.CreateInsertElement(position, rawZ, builder.getInt32(2));
             if (line) {
-              auto *centerQ = builder.CreateLoad(builder.getFloatTy(), builder.CreateBitCast(
+              auto *centerQ = capturedLoad(builder, builder.getFloatTy(), builder.CreateBitCast(
                 recordPointer(builder, entry->getArg(inputArg), sampleRecord, inputWords, reciprocalWOffset),
                 PointerType::get(builder.getFloatTy(), unsigned(air::AddressSpace::device))));
               centerPos = builder.CreateInsertElement(centerPos, centerQ, builder.getInt32(3));
@@ -2168,6 +2439,13 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
             fixedPos = builder.CreateSelect(center, centerPos, fixedPos);
           }
           callArgs[i] = fixedPos;
+          continue;
+        }
+        if (promotedApp && offsets[i] != ~0u) {
+          auto *pointer = builder.CreateBitCast(recordPointer(builder, entry->getArg(inputArg),
+            sampleRecord, inputWords, offsets[i]),
+            PointerType::get(original->getArg(i)->getType(), unsigned(air::AddressSpace::device)));
+          callArgs[i] = capturedLoad(builder, original->getArg(i)->getType(), pointer, Align(4));
           continue;
         }
         if (original->getArg(i)->getType()->isPointerTy() &&
@@ -2188,7 +2466,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           bodyTypes.push_back(builder.getInt32Ty());
           bodyTypes.push_back(control->getType());
         }
-        bodyTypes.push_back(builder.getInt1Ty());
+        if (!promotedApp) bodyTypes.push_back(builder.getInt1Ty());
         body = Function::Create(FunctionType::get(original->getReturnType(), bodyTypes, false),
                                 Function::InternalLinkage, originalName + ".sample_body", module);
         body->copyAttributesFrom(original);
@@ -2202,7 +2480,9 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           CallInst *nested = nullptr;
           for (auto &instruction : instructions(*body))
             if (auto *call = dyn_cast<CallInst>(&instruction); call &&
-                call->getCalledFunction() && !call->getCalledFunction()->isDeclaration()) {
+                call->getCalledFunction() && !call->getCalledFunction()->isDeclaration() &&
+                !call->getCalledFunction()->hasFnAttribute("dxmt.atomic64.helper") &&
+                !(promotedApp && call->getMetadata("dxmt.rt_sample_pos"))) {
               nested = call;
               break;
             }
@@ -2232,7 +2512,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
                                       body->getArg(original->arg_size() + 1), inputWords, found->offset[location]);
           auto *array = load.CreateBitCast(base, PointerType::get(call->getType(), unsigned(air::AddressSpace::device)));
           auto *slot = load.CreateGEP(call->getType(), array, index);
-          call->replaceAllUsesWith(load.CreateAlignedLoad(call->getType(), slot, Align(4)));
+          call->replaceAllUsesWith(capturedLoad(load, call->getType(), slot, Align(4)));
           call->eraseFromParent();
         }
         if (!pulled.empty()) {
@@ -2242,15 +2522,44 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         }
         // Helpers still execute the original shader once for quad derivatives;
         // only lanes covered by the original primitive can commit device writes.
-        callArgs.push_back(logicalActive);
-        guardSampleEffects(*body, body->getArg(body->arg_size() - 1));
+        if (!promotedApp) {
+          callArgs.push_back(logicalActive);
+          guardSampleEffects(*body, body->getArg(body->arg_size() - 1));
+        }
       }
+      Value *alive = nullptr;
+      if (promotedApp)
+        if (auto error = promoteApplication(module, body, callArgs, builder, logicalActive, alive, position, control, options.sample_count, options.center_pattern)) return error;
       auto *result = builder.CreateCall(body, callArgs);
       // Non-marker shaders serialize this annotation: refer to a call operand,
       // never a function-local SSA value in module metadata.
       result->setMetadata("dxmt.rov.logical_active", MDNode::get(context,
-        {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 1))}));
-      if (returnType->isVoidTy()) builder.CreateRetVoid();
+        {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - (promotedApp ? 2 : 1)))})); if (promotedApp) result->setMetadata("dxmt.rov.logical_position", MDNode::get(context, {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 4))}));
+      if (boundsMaskOffset != ~0u && !promotedApp) {
+        // The application may have no SV_Coverage output at all. Late rejection must happen AFTER its
+        // UAV writes, but before any color/depth/stencil commit, regardless of its return signature.
+        auto *commit = BasicBlock::Create(context, "bounds_sample_commit", entry);
+        auto *reject = BasicBlock::Create(context, "bounds_sample_reject", entry);
+        builder.CreateCondBr(builder.CreateICmpNE(builder.CreateAnd(boundsMask,
+          builder.CreateShl(builder.getInt32(1), logicalSample)), builder.getInt32(0)), commit, reject);
+        builder.SetInsertPoint(reject);
+        builder.CreateCall(module.getOrInsertFunction("air.discard_fragment",
+          FunctionType::get(builder.getVoidTy(), {}, false)));
+        builder.CreateBr(commit);
+        builder.SetInsertPoint(commit);
+      }
+      if (promotedApp) {
+        auto *commits = capturedLoad(builder, builder.getInt1Ty(), alive);
+        auto *record = builder.CreateAdd(builder.CreateMul(pixel, builder.getInt32(options.sample_count)), logicalSample);
+        auto *out = entry->getArg(outputArg);
+        if (!body->getReturnType()->isVoidTy()) {
+          auto *ptr = builder.CreateBitCast(recordPointer(builder, out, record, outputWords, 2),
+            PointerType::get(body->getReturnType(), unsigned(air::AddressSpace::device)));
+          conditionalStore(builder, *entry, commits, ptr, result);
+        }
+        conditionalStore(builder, *entry, commits, recordPointer(builder, out, record, outputWords, 0), builder.getInt32(1));
+        builder.CreateRetVoid();
+      } else if (returnType->isVoidTy()) builder.CreateRetVoid();
       else {
         Value *value = PoisonValue::get(returnType);
         for (unsigned i = 0; i < oldOutputs->getNumOperands(); ++i)
@@ -2263,11 +2572,11 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           if (outputKind(*cast<MDNode>(oldOutputs->getOperand(i))) == "air.sample_mask")
             value = builder.CreateInsertValue(value, builder.CreateAnd(
               builder.CreateExtractValue(value, {i}),
-              builder.CreateAnd(mask, builder.CreateShl(builder.getInt32(1),
+              builder.CreateAnd(builder.CreateAnd(mask, boundsMask), builder.CreateShl(builder.getInt32(1),
                 entry->getArg(sampleArg)))), {i});
         if (defaultDepth) {
           auto *raw = recordPointer(builder, entry->getArg(inputArg), sampleRecord, inputWords, sampleZOffset);
-          auto *rawZ = builder.CreateLoad(builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
+          auto *rawZ = capturedLoad(builder, builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
             builder.CreateBitCast(raw, PointerType::get(builder.getFloatTy(),
               unsigned(air::AddressSpace::device))), entry->getArg(sampleArg)));
           value = builder.CreateInsertValue(value, clampDepth(builder, module, control, rawZ),
@@ -2281,7 +2590,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       if (!original->getReturnType()->isVoidTy()) {
         auto *ptr = builder.CreateBitCast(recordPointer(builder, out, outputRecord, outputWords, 2),
                            PointerType::get(original->getReturnType(), unsigned(air::AddressSpace::device)));
-        auto *saved = builder.CreateAlignedLoad(original->getReturnType(), ptr, Align(4));
+        auto *saved = capturedLoad(builder, original->getReturnType(), ptr, Align(4));
         for (unsigned i = 0; i < oldOutputs->getNumOperands(); ++i)
           value = builder.CreateInsertValue(value, builder.CreateExtractValue(saved, {i}), {i});
       }
@@ -2310,7 +2619,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
             builder.CreateExtractValue(value, {i})), {i});
       if (defaultDepth) {
         auto *raw = recordPointer(builder, entry->getArg(inputArg), pixel, inputWords, sampleZOffset);
-        auto *rawZ = builder.CreateLoad(builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
+        auto *rawZ = capturedLoad(builder, builder.getFloatTy(), builder.CreateGEP(builder.getFloatTy(),
           builder.CreateBitCast(raw, PointerType::get(builder.getFloatTy(),
             unsigned(air::AddressSpace::device))), entry->getArg(sampleArg)));
         value = builder.CreateInsertValue(value, clampDepth(builder, module, control, rawZ),
@@ -2320,7 +2629,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     }
   }
   original->setLinkage(Function::InternalLinkage);
-  fragments->setOperand(0, entryMetadata(*entry, *oldEntry, metadata, variant, defaultDepth));
+  fragments->setOperand(0, entryMetadata(*entry, *oldEntry, metadata, promotedApp ? SM50_MSAA_PIXEL : variant, defaultDepth));
+  if (conservative && module.getFunction("dxmt.conservative.degenerate")) linkConservative(module);
   return Error::success();
 }
 

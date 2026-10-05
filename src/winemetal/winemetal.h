@@ -27,6 +27,27 @@
 
 typedef uint64_t obj_handle_t;
 
+struct WMTCompositionTargetState {
+  uint64_t target;
+  uint64_t surface;
+  float offset_x;
+  float offset_y;
+};
+struct WMTCompositionFrame {
+  uint64_t surface;
+  float transform[6]; /* m11, m12, m21, m22, m31, m32 */
+  uint32_t restrict_output;
+  uint32_t restricted_display_id;
+};
+STATIC_ASSERT(sizeof(WMTCompositionTargetState) == 24);
+STATIC_ASSERT(sizeof(WMTCompositionFrame) == 40);
+WINEMETAL_API obj_handle_t WMTCompositionCreateSurface(obj_handle_t device, uint32_t premultiplied, obj_handle_t *borrowedLayer);
+WINEMETAL_API obj_handle_t WMTCompositionCreateTarget(uint64_t hwnd, uint32_t topmost);
+WINEMETAL_API int32_t WMTCompositionCommit(uint32_t target_count, const struct WMTCompositionTargetState *states);
+WINEMETAL_API void WMTCompositionSetObserver(obj_handle_t surface, obj_handle_t observer);
+/* Borrowed texture; the paired drawable handle protects its lifetime. */
+WINEMETAL_API obj_handle_t WMTCompositionDrawableResidualTexture(obj_handle_t drawable);
+
 #define NULL_OBJECT_HANDLE 0
 
 #ifndef _MACH_PORT_T
@@ -42,6 +63,27 @@ WINEMETAL_API obj_handle_t NSArray_object(obj_handle_t array, uint64_t index);
 WINEMETAL_API uint64_t NSArray_count(obj_handle_t array);
 
 WINEMETAL_API obj_handle_t WMTCopyAllDevices();
+
+/* Fixed-width ABI shared by PE32/PE64. Catalog observer ownership uses
+ * NSObject_release; the native callback never enters PE code. */
+enum WMTDeviceCatalogOperation : uint32_t {
+  WMTDeviceCatalogCreate = 0,
+  WMTDeviceCatalogGeneration = 1,
+  WMTDeviceCatalogHints = 2,
+};
+enum WMTDeviceHint : uint64_t {
+  WMTDeviceLowPower = 1,
+  WMTDeviceRemovable = 2,
+  WMTDeviceUnifiedMemory = 4,
+};
+struct WMTDeviceCatalogCall {
+  uint32_t operation;
+  uint32_t reserved;
+  obj_handle_t object;
+  uint64_t result;
+};
+STATIC_ASSERT(sizeof(WMTDeviceCatalogCall) == 24);
+WINEMETAL_API void WMTDeviceCatalog_call(struct WMTDeviceCatalogCall *call);
 
 enum WMTStringEncoding : uint64_t {
   WMTASCIIStringEncoding = 1,
@@ -140,6 +182,9 @@ enum WMTResourceOptions : uint64_t {
 #endif
 #define WMT_RESOURCE_CPU_ADDRESSABLE_BIT (1ull << 62)
 
+/* Memory pointers alone use the aligned 4 GiB native guest-window codec. */
+WINEMETAL_API uint64_t WMTGetGuestWindowBase(void);
+
 struct WMTMemoryPointer {
   void *ptr;
 #if defined(__i386__)
@@ -150,23 +195,23 @@ struct WMTMemoryPointer {
   void
   set(void *p) {
 #if defined(__i386__)
-    high_part = 0;
+    high_part = p ? (uint32_t)(WMTGetGuestWindowBase() >> 32) : 0;
 #endif
     ptr = p;
   }
 
   void *
-  get() {
+  get() const {
 #if defined(__i386__)
-    assert(!high_part && "inaccessible 64-bit pointer");
+    assert((!high_part || high_part == (uint32_t)(WMTGetGuestWindowBase() >> 32)) && "inaccessible native pointer");
 #endif
     return ptr;
   }
 
   void *
-  get_accessible_or_null() {
+  get_accessible_or_null() const {
 #if defined(__i386__)
-    if (high_part)
+    if (high_part && high_part != (uint32_t)(WMTGetGuestWindowBase() >> 32))
       return nullptr;
 #endif
     return ptr;
@@ -184,7 +229,7 @@ struct WMTConstMemoryPointer {
   void
   set(const void *p) {
 #if defined(__i386__)
-    high_part = 0;
+    high_part = p ? (uint32_t)(WMTGetGuestWindowBase() >> 32) : 0;
 #endif
     ptr = p;
   }
@@ -192,7 +237,7 @@ struct WMTConstMemoryPointer {
   const void *
   get() {
 #if defined(__i386__)
-    assert(!high_part && "inaccessible 64-bit pointer");
+    assert((!high_part || high_part == (uint32_t)(WMTGetGuestWindowBase() >> 32)) && "inaccessible native pointer");
 #endif
     return ptr;
   }
@@ -201,7 +246,7 @@ struct WMTConstMemoryPointer {
 
 #if defined(__i386__)
 #define WMT_MEMPTR_SET(obj, value)                                                                                     \
-  obj.high_part = 0;                                                                                                   \
+  obj.high_part = (value) ? (uint32_t)(WMTGetGuestWindowBase() >> 32) : 0;                                                 \
   obj.ptr = value
 #else
 #define WMT_MEMPTR_SET(obj, value) obj.ptr = value
@@ -815,6 +860,12 @@ struct WMTStencilAttachmentInfo {
   uint8_t clear_stencil;
 };
 
+/* One-pixel D3D12 Tier 1 pattern, in signed 1/16-pixel offsets from the center. */
+struct WMTProgrammableSamplePositions {
+  uint8_t count;
+  int8_t positions[8][2];
+};
+
 struct WMTRenderPassInfo {
   struct WMTColorAttachmentInfo colors[8];
   struct WMTDepthAttachmentInfo depth;
@@ -835,6 +886,7 @@ struct WMTRenderPassInfo {
   // High byte of render_target_array_length (D3D12 arrays reach 2048 slices). Carved from trailing padding: the
   // struct keeps its size and 32/64-bit layout. Write both through WMT::SetRenderTargetArrayLength.
   uint8_t render_target_array_length_high;
+  struct WMTProgrammableSamplePositions sample_positions;
 };
 
 WINEMETAL_API obj_handle_t MTLCommandBuffer_renderCommandEncoder(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info);
@@ -1398,6 +1450,7 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetDepthStencilState,
   WMTRenderCommandSetStencilRefFrontBack,
   WMTRenderCommandSetVertexAmplification,
+  WMTRenderCommandSetDepthBounds,
 };
 
 struct wmtcmd_render_nop {
@@ -1485,6 +1538,14 @@ struct wmtcmd_render_setrasterizerstate {
   float depth_bias;
   float scole_scale;
   float depth_bias_clamp;
+};
+
+struct wmtcmd_render_setdepthbounds {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  float min_depth;
+  float max_depth;
 };
 
 struct wmtcmd_render_setpso {
@@ -1859,6 +1920,7 @@ enum WMTGPUFamily {
   WMTGPUFamilyApple7 = 1007,
   WMTGPUFamilyApple8 = 1008,
   WMTGPUFamilyApple9 = 1009,
+  WMTGPUFamilyApple10 = 1010,
   WMTGPUFamilyMac1 = 2001,
   WMTGPUFamilyMac2 = 2002,
   WMTGPUFamilyCommon1 = 3001,
@@ -2229,6 +2291,23 @@ WINEMETAL_API double WMTClockSampleHostSeconds(void);
 WINEMETAL_API bool WMTPresentationObserver_setView(obj_handle_t observer, obj_handle_t view);
 WINEMETAL_API bool WMTPresentationObserver_getRefreshSample(obj_handle_t observer,
                                                             struct WMTDisplayRefreshSample *sample);
+
+enum WMTMonitorTimingOperation {
+  WMTMonitorTimingCreate = 1,
+  WMTMonitorTimingWait = 2,
+  WMTMonitorTimingResolveDisplay = 3, /* result=1 and display_id=native ID on unique match */
+};
+/* Fixed-width POD: identical PE32/PE64/native layout, no caller pointers. */
+struct WMTMonitorTimingCall {
+  uint64_t object;
+  uint32_t operation;
+  uint32_t result;
+  int32_t left, top, right, bottom;
+  uint32_t primary;
+  uint32_t display_id;
+};
+STATIC_ASSERT(sizeof(WMTMonitorTimingCall) == 40);
+WINEMETAL_API void WMTMonitorTiming_call(struct WMTMonitorTimingCall *params);
 
 WINEMETAL_API void WMTGetOSVersion(uint64_t *major, uint64_t *minor, uint64_t *patch);
 

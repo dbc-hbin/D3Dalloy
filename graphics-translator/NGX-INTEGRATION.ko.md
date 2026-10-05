@@ -1,311 +1,143 @@
-# Owned D3D12 NGX → MetalFX integration
+# D3D12 NGX → Metal 4 temporal integration
 
-이 문서는 owned graphics translator에서 빠져 있는 D3D12 NGX 경로를 현재 소스에 맞춰 정의한다. 범위는 NGX frontend, D3D12 command-list 기록 경계, MetalFX temporal scaler command encoding과 lifetime이다. 실제 게임/GPU 실행 결과를 이 문서의 정적 결론으로 간주하지 않는다.
+2026-10-04 현재 루트 소스의 **구현된 경로**를 설명한다. 2026-09-19의 “D3D12 NGX 없음/COM 경계 제안”은 이후 구현으로 대체됐다. 현재 API는 [frontend](D3D12-NGX-FRONTEND.ko.md), lifetime/subrect는 [contracts](NGX-CONTRACTS.ko.md), 실행은 [NGX](NGX-TEST.ko.md)·[temporal](TEMPORAL-TEST.ko.md) 문서를 따른다. 전체 상태는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md) 한 곳에서 관리한다.
 
-## 확인한 기준
-
-- DXMT reference/candidate base commit: `7c8dee1c2d73415301ceb7d1fa810861cef4cd67`.
-- candidate `src/nvngx/nvngx.cpp`는 reference와 SHA-256까지 동일하다: `b7a09375699c8d6de89a2940e75fb9dd8505359bef856dad9036a9f025531d8d`.
-- candidate D3D12 queue/list에는 owned submission/tracing 작업이 별도로 진행 중이므로 이 분석에서는 수정하지 않았다.
-- local NVIDIA public headers, `d3dmetal-pso-cache/dlss-contract.*`, `dlss-metalfx.*`, ZZZ static analysis와 flags74 fixture는 모두 read-only reference로 사용했다.
-
-## 현재 upstream DXMT에 D3D12 NGX는 없다
-
-`src/nvngx/nvngx.cpp`의 exported frontend는 전부 D3D11이다. 현재 candidate install의 `x86_64-windows/nvngx.dll`도 `NVSDK_NGX_D3D11_*`만 export하고 `NVSDK_NGX_D3D12_*`는 하나도 export하지 않는다. 반면 `nvngx.hpp`와 `ParametersImpl`은 이미 `ID3D12Resource*` parameter slot을 갖고 있어 parameter container 자체는 D3D12 resource를 저장할 수 있다.
-
-현재 D3D11 path는 다음 DXMT 내부 ABI에 직접 의존한다.
-
-1. `NVSDK_NGX_D3D11_CreateFeature`가 `ID3D11DeviceContext`를 `IMTLD3D11ContextExt1`로 QI한다.
-2. `CheckFeatureSupport(MTL_FEATURE_METALFX_TEMPORAL_SCALER)`로 MetalFX availability를 확인한다.
-3. `EvaluateFeature`가 Color/Output/Depth/Motion/Exposure를 `ID3D11Resource*`로 꺼낸다.
-4. `MTL_TEMPORAL_UPSCALE_D3D11_DESC`를 채우고 `IMTLD3D11ContextExt::TemporalUpscale`을 호출한다.
-5. D3D11 context 내부가 `TemporalScaler`를 생성/캐시하고 generic DXMT command stream의 `EncoderType::TemporalUpscale`을 기록한다.
-
-따라서 D3D12는 D3D11 함수명을 복사하는 것으로 완성되지 않는다. D3D12는 별도 command allocator/command list/queue encoder stream을 쓰며 현재 `EncoderType`은 `Null`, `Clear`, `Render`, `Blit`, `Compute`, `Resolve`뿐이다.
-
-## public D3D12 NGX ABI
-
-local NVIDIA header `nvsdk_ngx.h`가 요구하는 핵심 D3D12 ABI는 다음과 같다.
-
-| 함수 | 핵심 입력/의미 |
-| --- | --- |
-| `NVSDK_NGX_D3D12_Init` / `Init_Ext` | `ID3D12Device*`와 application/feature info |
-| `GetParameters` / `AllocateParameters` / `GetCapabilityParameters` | `NVSDK_NGX_Parameter**` |
-| `DestroyParameters` | allocated parameter map lifetime 종료 |
-| `GetScratchBufferSize` | feature별 scratch 요구량, DLSS는 0 가능 |
-| `CreateFeature` | **열려 있는 `ID3D12GraphicsCommandList*`**, feature id, create parameters |
-| `EvaluateFeature` | **열려 있고 recording 중인 command list**, handle, frame parameters |
-| `ReleaseFeature` | feature handle lifetime 종료 |
-| `Shutdown` / `Shutdown1` | global/device lifetime 종료 |
-| `GetFeatureRequirements` | adapter 기준 feature support |
-
-public header는 D3D12 Evaluate command list가 recording 중이어야 하고, init device를 포함하는 node mask를 가져야 하며, non-copy queue에서 실행돼야 한다고 명시한다. 따라서 owned implementation은 Evaluate 안에서 별도 Metal command buffer를 즉시 commit하면 안 된다. Evaluate는 caller command list의 ordered stream에 temporal work를 **기록**해야 한다.
-
-ZZZ에 동봉된 `nvngx_dlss.dll`의 static export set은 `D3D12_CreateFeature`, `EvaluateFeature`, `GetFeatureRequirements`, `GetScratchBufferSize`, `Init`, `Init_Ext`, `PopulateParameters_Impl`, `ReleaseFeature`, `Shutdown`, `Shutdown1`이다. 이는 feature plugin export이고, 우리가 만드는 `nvngx.dll` core-style shim의 parameter allocation API와 동일한 export surface라고 가정하면 안 된다. 실제 ZZZ에서 어떤 DLL lookup이 owned `nvngx.dll`로 연결되는지는 runtime loader observation이 필요하다.
-
-## 제안하는 owned COM 경계
-
-D3D12 resource 내부 포인터나 WMT object를 `nvngx.dll`에 노출하지 않는다. `nvngx.dll`과 `d3d12.dll` 사이에는 project-owned COM ABI만 둔다.
-
-새 `src/d3d12/d3d12_interfaces.hpp`에 다음 개념을 두는 것이 가장 작은 안정 경계다.
-
-### `IMTLD3D12DeviceExt`
-
-역할:
-
-- MetalFX temporal support query.
-- NGX create-time logical contract를 보관하는 opaque feature state 생성.
-
-개념적 API:
-
-```cpp
-struct MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC {
-  UINT InputWidth;
-  UINT InputHeight;
-  UINT OutputWidth;
-  UINT OutputHeight;
-  UINT FeatureFlags;
-  BOOL OutputSubrectsEnabled;
-  UINT CreationNodeMask;
-  UINT VisibilityNodeMask;
-};
-
-IMTLD3D12DeviceExt::CheckFeatureSupport(...);
-IMTLD3D12DeviceExt::CreateTemporalUpscaleState(
-    const MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC*,
-    IMTLD3D12TemporalUpscaleState**);
-```
-
-`IMTLD3D12TemporalUpscaleState`는 `IUnknown` 기반 opaque marker/state object로 둔다. concrete implementation은 `d3d12.dll` 안에만 있고 MetalFX scaler generation, first-execution state와 향후 private output/motion conversion resource를 소유한다. `nvngx.dll`은 이 concrete type이나 WMT type을 알 필요가 없다.
-
-Scaler는 CreateFeature 시점에 즉시 만들지 않는다. NGX create parameter에는 실제 frame resource format/backing capacity가 없기 때문이다. 첫 `TemporalUpscale` 기록에서 resource를 resolve한 뒤 lazy-create한다. 현재 WMT ABI에 넣을 값은 정확히 다음과 같다.
+## 현재 호출 경로
 
 ```text
-WMTFXTemporalScalerInfo.color_format = color texture pixelFormat
-WMTFXTemporalScalerInfo.output_format = output texture pixelFormat
-WMTFXTemporalScalerInfo.depth_format = depth texture pixelFormat
-WMTFXTemporalScalerInfo.motion_format = validated motion texture/view pixelFormat
-WMTFXTemporalScalerInfo.input_width = color backing width
-WMTFXTemporalScalerInfo.input_height = color backing height
-WMTFXTemporalScalerInfo.output_width = create-time NGX OutWidth
-WMTFXTemporalScalerInfo.output_height = create-time NGX OutHeight
-WMTFXTemporalScalerInfo.input_content_min_scale = 1.0f   // current DXMT policy
-WMTFXTemporalScalerInfo.input_content_max_scale = 3.0f   // current DXMT policy
-WMTFXTemporalScalerInfo.auto_exposure = create flag AutoExposure
-WMTFXTemporalScalerInfo.input_content_properties_enabled = true
-WMTFXTemporalScalerInfo.requires_synchronous_initialization = true
+NVSDK_NGX_D3D12_Init
+  → ID3D12Device QI(IMTLD3D12DeviceExt) → SupportsTemporalUpscale
+CreateFeature(open list, logical create parameters)
+  → ValidateRecording → CreateTemporalUpscaleState
+EvaluateFeature(open list, handle, frame parameters)
+  → immutable frame descriptor → IMTLD3D12GraphicsCommandListExt::TemporalUpscale
+  → PrepareOwnedTemporalFrame → retained TemporalUpscale encoder
+Close / ExecuteCommandLists
+  → FIFO submission task + recording/allocator lifetime protection
+  → Metal 4 command-buffer encode → Metal4FX scaler → output rectangle copy
+  → commit → GPU completion → in-flight frame/resource retirement
 ```
 
-Local public MetalFX translator도 descriptor `inputWidth/inputHeight`를 resolved color view의 backing capacity에서 얻고 `outputWidth/outputHeight`는 NGX create logical output에서 얻는다. 이 분리는 flags74 fixture의 128 logical output / 136 backing contract와 일치한다.
+Evaluate는 caller list에 기록한다. 별도 native command buffer를 즉시 commit하거나 GPU completion을 기다리는 API가 아니다. `nvngx.dll`은 Metal/WMT/D3DMetal native pointer나 backend implementation layout을 소비하지 않는다.
 
-### `IMTLD3D12GraphicsCommandListExt`
+## Project-owned COM ABI
 
-역할은 한 가지다: 이미 생성된 feature state와 이번 Evaluate의 immutable frame descriptor를 현재 command list에 기록한다.
+권위 소스는 `src/d3d12/d3d12_interfaces.hpp`다. 이것은 NVIDIA public SDK 자체가 아니라 두 owned DLL 사이의 private 프로젝트 계약이다.
 
-개념적 API:
+| Interface | UUID | IUnknown 뒤 slot 순서 |
+|---|---|---|
+| `IMTLD3D12TemporalUpscaleState` | `c8a9134e-f27c-4e75-909f-f14439b918e1` | opaque marker; 추가 public method 없음 |
+| `IMTLD3D12DeviceExt` | `ed85c4e9-e8fd-491b-9595-d9a369ec12b2` | `SupportsTemporalUpscale`, `CreateTemporalUpscaleState`, `SupportsTemporalFeature` |
+| `IMTLD3D12GraphicsCommandListExt` | `d7bc6ed0-6a8a-4a0e-8408-5a26c0b06d0e` | `TemporalUpscale`, `ValidateRecording` |
 
-```cpp
-struct MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC {
-  ID3D12Resource* Color;
-  ID3D12Resource* Output;
-  ID3D12Resource* Depth;
-  ID3D12Resource* MotionVector;
-  ID3D12Resource* ExposureTexture;
-  ID3D12Resource* BiasCurrentColorMask;
-  ID3D12Resource* TransparencyMask;
+Create/frame descriptor의 첫 필드는 `UINT StructSize`이며 backend는 정확한 현재 크기를 확인한다. Create는 input/output logical extent, unmodified NGX flag bits, subrect opt-in, creation/visibility node mask를 전달한다. Frame은 D3D12 resource pointers, active input extent, base offsets, jitter, MV scale, semantic exposure와 caller reset을 전달한다.
 
-  UINT InputContentWidth;
-  UINT InputContentHeight;
-  UINT ColorBaseX, ColorBaseY;
-  UINT DepthBaseX, DepthBaseY;
-  UINT MotionBaseX, MotionBaseY;
-  UINT BiasBaseX, BiasBaseY;
-  UINT OutputBaseX, OutputBaseY;
+현재 fixture의 layout assertion은 create40 bytes, frame x64 400/x86 348 bytes, Color offset x64 8/x86 4다. Pointer-bearing COM descriptor의 이 수치를 다른 guest ABI에 무조건 적용하지 않는다. Metal 4 guest/native fixed-width bridge POD와도 별개의 ABI다. Backend는 추가 DLL-private internal QI로 state를 검증하며 arbitrary IUnknown을 concrete state layout으로 재해석하지 않는다.
 
-  FLOAT JitterOffsetX, JitterOffsetY;
-  FLOAT MotionVectorScaleX, MotionVectorScaleY;
-  FLOAT PreExposure;
-  FLOAT ExposureScale;
-  BOOL ResetHistory;
-};
+## Record-time resource·generation 준비
 
-IMTLD3D12GraphicsCommandListExt::TemporalUpscale(
-    IMTLD3D12TemporalUpscaleState*,
-    const MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC*);
-```
+`src/d3d12/d3d12_temporal.cpp`의 Prepare는 resource를 resolve/retain하고 scalar·format·bounds를 검사한다.
 
-Create flags처럼 feature lifetime 동안 고정인 값은 state에 둔다. 매 frame 변하는 scalar와 resource만 frame desc에 둔다. 이 인터페이스는 `ID3D12Resource*`까지만 받으며 native `MTLTexture`, `D3DMetal` pointer, private GPTK ABI는 전혀 건너지 않는다.
+- owned same-device 2D, single slice, single sample texture를 요구한다. Color/depth/MV/mask backing extent는 서로 같을 필요가 없으며 각각의 active subrect가 해당 view bounds 안에 들어가야 한다.
+- output은 logical output + 선택 base를 수용해야 한다. Color/depth/MV와 output의 같은 resource alias는 거부한다.
+- Color/depth/MV는 ShaderRead usage가 필요하다. Motion parent의 RG16 계열은 RG16Float, RG32 계열은 RG32Float typed view로 정규화한다. 다른 motion format은 E_NOTIMPL이다.
+- manual exposure는 AutoExposure off일 때 optional null 또는1×1 R16Float/R32Float texture를 지원한다. R32는 매 execution/replay에서 선행 GPU writes 뒤 수치적으로 R16으로 변환한다. AutoExposure는 supplied exposure를 무시한다.
+- native MetalFX descriptor에서 장치별 min/max scale과 usage를 조회한다. FSR의 max 초과 output은 centered uniform cap·opaque-black margin으로 처리한다. 고정[1,3] portable 계약이나 arbitrary device 지원이 아니다([현행 SR/FG 계약](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료)).
 
-## D3D12 command recording
+Scaler generation은 첫 유효한 record에서 준비하고 format·backing·output/layout 변경 시 교체한다. Old recording/replay는 자신이 retain한 generation·scratch·residency와 GPU-retirement lease를 사용한다. Active content·generation/activation·caller reset의 history 계약과 native scale 제한은 [현행 CORE 계약](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료)에만 유지한다.
 
-`MTLD3D12GraphicsCommandListImpl::QueryInterface`가 새 command-list extension을 제공해야 한다. `TemporalUpscale` 진입 시 다음 순서를 사용한다.
+Frame은 Core/Generation, retained app resources, logical-size private scratch output, residency와 immutable props를 소유한다. Scratch는 ShaderRead|ShaderWrite|RenderTarget usage다. Scaler는 scratch origin에 출력하고, blit은 logical rectangle만 caller output base로 복사한다. Larger backing의 바깥 pixel은 보존한다.
 
-1. command list를 `IMTLD3D12GraphicsCommandListExt`로 QI하고 `ValidateRecording()`을 호출한다. 이 shared ABI가 owned backend의 현재 recording 상태와 DIRECT/COMPUTE 조건을 비파괴적으로 검증한다.
-2. list type이 `DIRECT` 또는 `COMPUTE`인지 확인한다. `COPY`는 NGX public contract와 맞지 않으므로 실패한다.
-3. 전달된 resources가 null이 아니고 texture resource인지, 같은 owned D3D12 device에 속하는지 확인한다.
-4. resource의 `MTLD3D12Resource::texture`를 **d3d12.dll 내부에서만** 사용한다.
-5. 각 texture의 현재 allocation/view를 `TextureViewRef`로 capture한다. raw `ID3D12Resource*` 또는 parameter map pointer를 encoder data에 남기지 않는다.
-6. `allocator_->InvalidateCurrentPass()`로 앞 encoder를 끝낸다.
-7. 새 `EncoderType::TemporalUpscale` payload를 allocator CPU heap에 placement-new한다.
-8. feature generation/state, retained texture views, normalized scalar snapshot을 payload에 저장한다.
-9. 다시 `InvalidateCurrentPass()`해 다음 draw/compute가 temporal pass와 같은 encoder로 합쳐지지 않게 한다.
+R32 conversion은 `d3d12_temporal.cpp`의 lazy Metal4 compute pipeline과 private retained R16 scratch를 사용한다. 기존 bridge/ABI를 그대로 쓰며 clamp·tone correction·CPU readback·record-time cache가 없다. Scratch/pipeline은 GPU completion까지 보호된다. [양 ABI numeric/replay·public NGX proof](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료)는 게임/image-quality equivalence와 별개다.
 
-`ResourceBarrier`는 현재 candidate에서 이미 pass boundary를 만든다. 따라서 app이 NGX 전후에 기록한 transition/UAV barrier의 순서는 preserved 된다. 이 path가 D3D12 state validator를 새로 만들 필요는 없다.
+## Owned FSR public API와 provenance
 
-## 새 D3D12 encoder payload의 lifetime
+`src/fsr`의 x64 `amd_fidelityfx_upscaler_dx12.dll`은 AMD public **upscaler API4.0.3** header 기반 C facade다. [`fsr.def`](../src/fsr/fsr.def)의5 exports는 `ffxConfigure@1`, `ffxCreateContext@2`, `ffxDestroyContext@3`, `ffxDispatch@4`, `ffxQuery@5`이며 provider **`4d46580000000001`**/MetalFX를 보고한다. Backend는 위 owned temporal COM 경로를 재사용한다. Public AMD API를 소비한다는 사실은 AMD FSR 모델 실행·image-quality equivalence가 아니다.
 
-generic DXMT D3D11 encoder의 `TemporalUpscaleData`를 그대로 복사하면 안 되는 가장 큰 이유가 lifetime이다. generic context는 encode 후 data를 파괴하지만 D3D12 closed command list는 다시 실행할 수 있다.
+SR의 dynamic render/output·masks·high-res/jittered MV·RCAS·linear/sRGB/PQ·manual exposure와 source-owned FG의 Prepare/Generate·history·SDK swapchain/UI/pacing proxy는 full port에 연결됐다. 지원 범위·제한·public x64와 backend 양 ABI proof는 [CORE SR/FG 계약](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료)에만 유지한다. API query나 native 기능 존재를 실제 dispatch·presentation·품질 증거로 대신하지 않는다.
 
-D3D12 `TemporalUpscaleEncoderData`는 최소 다음을 retain해야 한다.
+Headers의 read-only reference는 `/Users/hanbinnoh/Documents/zzz-wine-yaagl-pr-runtime/d3dmetal-pso-cache/third-party/fidelityfx/Kits/FidelityFX`다. 아래4 files는 reference와 byte-identical로 확인했으며 원문 notices/bytes를 유지한다. [AMD MIT license](../src/fsr/LICENSE)는 header에 적용되고 owned implementation의 SPDX는 LGPL-2.1-or-later다. Reference backend/D3DMetal/proprietary 구현 소스를 복사하지 않았다. Retained original NGX DLL은 **proprietary prebuilt binary**이며 source-copied 구현이 아니다. Frozen import lock/patches/provenance는 변경하지 않는다.
 
-- `TextureViewRef` color/output/depth/motion, optional exposure.
-- feature/scaler generation의 strong reference.
-- frame scalar snapshot.
-- 향후 필요한 per-record immutable conversion/shadow description.
+| `src/fsr/include/` 아래 public header | SHA256 |
+|---|---|
+| `api/include/ffx_api.h` | `6b23d642141cbbad01f22a9f2e44e0f9df51fbe00a7fd490b06d06ca7bd42967` |
+| `api/include/ffx_api_types.h` | `68534c808a0b981b92b1381bc39d58e85ff3d47159c27afd6d0da3caefd0f5cb` |
+| `api/include/dx12/ffx_api_dx12.h` | `6b0b377c43ebcb3c3b820008b3f05e5cf5e16f08ad41935eabcbe764970c6c88` |
+| `upscalers/include/ffx_upscale.h` | `5d0fed5deaf7e243136c70dac117d6b74c632a6f2d144fa6c3ea30c08b6c7523` |
 
-이 object의 destructor는 **queue execute에서 호출하지 않는다**. `MTLD3D12CommandAllocatorImpl::Reset()`의 type switch에 `TemporalUpscale` destructor case를 추가한다. D3D12 contract상 allocator는 그 allocator로 기록한 GPU work가 끝나기 전에 reset할 수 없으므로 이 lifetime이 GPU use까지 resource/state를 보존한다.
+빌드는 `-Denable_fsr=true -Denable_nvngx=true`, 새 x64 staging은 `--with-fsr --with-nvngx`로 선택한다. Stage는 builtin marker·5 names/ordinals를 검사한다. [전용 smoke recipe](SMOKE-TEST.ko.md#전체-srpublic-fg와-shader-cache-전용-recipe)의 `--suite fsr`는 public AMD headers로 컴파일한 consumer를 사용한다. FSR 선택만으로 NVEXT/NGX를 요구하는 backend는 아니며 동시 stage는 두 public frontends의 회귀 입력을 갖추기 위한 선택이다.
 
-이 방식은 다음 실제 fixture 요구도 만족한다.
+## Submission·history·completion
 
-- `EvaluateFeature` 직후 parameter map을 reset/destroy해도 replay payload가 영향을 받지 않는다.
-- `ReleaseFeature`가 호출돼도 이미 기록된 command list는 retained generation으로 실행될 수 있다.
-- 같은 closed command list를 여러 번 Execute해도 encoder payload가 첫 실행 후 사라지지 않는다.
+`d3d12_command_queue.cpp`는 Execute 때 immutable recording entry/identity/allocator·recording lease를 task에 담고 GPU completion까지 protection을 유지한다. Caller list의 후속 Reset을 deferred worker가 다시 읽지 않는다.
 
-## queue-side MetalFX encoding
+Future queue wait는 FIFO worker의 submission을 qualifying logical completion publication까지 defer한다([queue 계약](QUEUE-ORDER.ko.md#queue-local-fifo와-public-api)). Public Wait/Execute 호출 thread를 producer GPU completion까지 막는 방식이 아니다. Temporal submission은 ring reservation 뒤 device temporal mutex를 얻고 CPU encoding부터 commit까지 유지한다. Ring capacity/GPU completion wait를 그 mutex 안에 두지 않는다. Feature history timeline을 D3D12 queue dependency와 양립하는 실제 submit 순서로 encode한다.
 
-prime이 소유한 D3D12 queue switch에는 `EncoderType::TemporalUpscale` case가 필요하다. 기존 queue-wide `fence_`와 scaler의 fence를 다음처럼 bridge한다.
+Metal 4 경로는 필요한 wait/signal 경계에서 physical submission을 나눌 수 있다. Trace 분석은 logical Execute parent와 physical submission을 구분한다. Temporal frame은 `InflightCommandBuffer`가 completion까지 retain한다. Frontend parameter Reset/Destroy, feature Release 또는 caller state release가 이미 기록된 frame의 resource/scratch를 해제하지 않는다.
 
-1. begin blit encoder: `waitForFence(queue fence)` → `updateFence(scaler fence)` → end.
-2. 같은 Metal command buffer에서 `encodeTemporalScale(...)`.
-3. end blit encoder: `waitForFence(scaler fence)` → `updateFence(queue fence)` → end.
-
-이 순서는 기존 generic DXMT temporal encode가 쓰는 scaler-fence pattern을 D3D12 queue의 현재 pass-order fence chain에 연결한 것이다. 별도 command buffer commit이나 CPU wait는 필요하지 않다.
-
-현재 WMT per-execution property와 encode ABI는 다음 필드만 제공한다.
+Effective reset은 encode 시점에 다음과 같이 결정한다.
 
 ```text
-WMTFXTemporalScalerProps.input_content_width
-WMTFXTemporalScalerProps.input_content_height
-WMTFXTemporalScalerProps.reset
-WMTFXTemporalScalerProps.depth_reversed
-WMTFXTemporalScalerProps.motion_vector_scale_x
-WMTFXTemporalScalerProps.motion_vector_scale_y
-WMTFXTemporalScalerProps.jitter_offset_x
-WMTFXTemporalScalerProps.jitter_offset_y
-WMTFXTemporalScalerProps.pre_exposure
-
-MTLCommandBuffer_encodeTemporalScale(
-  cmdbuf, scaler, color, output, depth, motion, exposure, scaler_fence, props)
+effectiveReset = recordedCallerReset || lastExecutedGeneration != thisGeneration
 ```
 
-따라서 `Exposure.Scale`, offsets, reactive mask 같은 필드는 frame desc에는 보존하되 현재 WMT가 표현할 수 없는 non-identity 값이면 frontend/backend 경계에서 명시적으로 실패시켜야 한다.
+새 generation 첫 execution은 reset, 같은 generation의 연속 replay는 caller false이면 no reset이다. G1→G2→G1→G1은 `1,1,1,0`, caller true replay는 매번 1이다. Record 횟수나 이미지 accumulation 추정이 아니라 `temporal_encode` trace의 caller_reset/reset을 비교한다([completion 검증](TEMPORAL-COMPLETION-TEST.ko.md)).
 
-단, 동일 feature/scaler를 서로 다른 D3D12 command queue에서 동시에 사용할 때의 cross-queue history synchronization은 현재 WMT `Fence` contract만으로 증명되지 않는다. 첫 구현은 same graphics queue 사용을 runtime observation으로 확인하고, 그렇지 않다면 shared-event 기반 설계가 추가로 필요하다. static ZZZ 분석만으로 single-queue 사용을 확정하지 않는다.
+## Runtime publication
 
-## scaler state와 replay 시 reset
+`stage-owned-graphics.py stage --with-nvngx`는 owned marker `own-ngxd3d12`와 required D3D12 exports를 검증한 뒤 DLL을 stage/hash한다. x64 wrapper는 `nvngx=b`를 사용하고 vendor extension 선택 시 `DXMT_ENABLE_NVEXT=1`을 내부에서 설정한다. NVNGX/NVAPI를 둘 다 선택하지 않으면 inherited NVEXT를 제거하고 vendor DLL fallback을 막는다. DXGI NVEXT setup의 `NGXCore\\FullPath` 등록만으로 실제 Streamline lookup이 증명되지는 않는다.
 
-NGX caller의 `Reset=0`을 record 시점에서 그대로 `WMTFXTemporalScalerProps.reset`에 박아두는 것만으로는 D3D12 replay를 정확히 처리할 수 없다. local flags74 fixture는 첫 call에서도 caller reset을 false로 유지하고 translator가 새 temporal generation의 첫 실행을 초기화하도록 요구한다.
+`nvngx_dlss.dll`의 feature-plugin exports와 core-style `nvngx.dll` API는 동일 surface가 아니다. Synthetic PE는 system32 core DLL을 직접 요청한다. 실제 앱의 loader 선택, Streamline adapter 판단, public NGX 호출, queue encode, 출력까지의 관찰을 별도로 요구한다. 게임 plugin을 static 추측만으로 교체하지 않는다.
 
-따라서 feature state는 scaler **generation**을 갖고 queue 실행 시점에 effective reset을 계산해야 한다.
+## 증거와 남은 경계
 
-```text
-effectiveReset = recordedCallerReset || generationHasNeverExecuted
-```
+Metal 4 temporal readback·replay·completion은 이미 관찰된 fixture 증거다. [CORE 검증 범위](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)의 recovery proof를 따른다. 이 문서 개편에서 GPU·게임을 새로 실행한 것은 아니다.
 
-`generationHasNeverExecuted`는 record count가 아니라 실제 queue execution count에 기반해야 한다. 같은 recorded list를 재실행하면 첫 GPU execution만 implicit reset이고 다음 execution은 caller reset이 false인 한 history를 이어가야 한다. scaler가 format/extent/API requirement 변화 때문에 교체되면 새 generation으로 돌아가 첫 execution reset을 다시 적용한다.
+- `temporal` COM fixture는 x64/WoW64 범위와 NGX frontend proof를 구분한다.
+- `ngx`/`ngx-contracts`는 현재 x64 frontend 범위다. ARM64 Wine/FEX guest↔native NGX end-to-end proof가 아니다.
+- flags74 synthetic 결과는 DLSS image quality·HDR transfer 동등성·physical compositor/HDR scanout·실제 게임 loader 선택을 증명하지 않는다.
+- Full SR port는 input/output subrect offsets, masks, jittered/high-res MV와 RCAS sharpening을 지원한다. Alpha upscaling flag128은 alpha를 RGB로 복제한 독립 native temporal scaler에서 neutral exposure·동일 depth/MV/jitter/reset으로 재구성한 뒤 alpha만 병합한다. P1 Exposure.Scale·MV.Offset은 유효한 nondefault를 받아 수치 효과 없이 계속 실행하는 호환 계약이며 수식 구현이 아니다. 완료한 public x64 5쌍×3 replay와 backend x64/WoW64 회귀, pristine GPTK binary reference는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#p1-계약-범위와-reference)에서 구분한다. Runtime usage/range는 장치에서 조회하고 HDR 의미/모델 품질·다른 장치 검증 경계는 [API-REVIEW](API-REVIEW.ko.md)를 따른다.
 
-## resource → MetalFX mapping
+## Public non-SR feature inventory
 
-`ID3D12Resource*`의 native mapping은 `d3d12.dll` 내부에서 `MTLD3D12Resource::texture`와 `TextureViewRef`로 끝낸다.
+NVIDIA public SDK defs와 June2026 FG/August2026 RR integration guide의 실제 enum·key를 따른다. SR 성공을 임의 feature 지원으로 일반화하지 않는다.
 
-| NGX | owned D3D12/MetalFX |
-| --- | --- |
-| Color | retained current full/content view → MetalFX color texture |
-| Output | retained output texture; logical output extent는 NGX `OutWidth/OutHeight`, resource backing size와 분리 |
-| Depth | retained depth texture; create flag의 reverse-depth 의미를 scaler props에 전달 |
-| MotionVectors | retained motion texture; flags74는 low-resolution MV이므로 별도 high-res downsample 불필요 |
-| ExposureTexture | auto exposure에서는 null 허용; manual path는 format conversion contract가 별도 필요 |
+| ID | Public feature | 필요한 backend / 현재 계약 |
+|---|---|---|
+| 2 | InPainting | image-inpainting 합성 backend 없음; Available0, FeatureNotSupported |
+| 3 | ImageSuperResolution | NGX still-image SR backend 없음; temporal SR alias 없음 |
+| 4 | SlowMotion | NGX video sequence/time-domain slow-motion backend 없음; realtime FG alias 없음 |
+| 5 | VideoSuperResolution | NGX video SR backend 없음; temporal SR alias 없음 |
+| 9 | ImageSignalProcessing | NGX image signal-processing backend 없음 |
+| 10 | DeepResolve | NGX DeepResolve backend 없음; ordinary SR alias 없음 |
+| 11 | FrameGeneration | count1..4 owned PE D3D12 phase backend → retained batch/actual GPU outcome → public per-index output; count1 추가 출력 texture 없음 |
+| 12 | DeepDVC | NGX 색/채도 enhancement backend 없음 |
+| 13 | RayReconstruction | 실제 Metal4FX TemporalDenoisedScaler; noisy color+diffuse/specular albedo+world normals+roughness+depth/MV+copied matrices; optional specular hit distance |
 
-특히 `OutputWidth/Height`를 `output resource->width()/height()`로 다시 계산하면 안 된다. flags74 game-contract fixture는 logical output `128x128`에 backing resource `136x136`을 사용하고 outside sentinel이 보존되는지 확인한다. scaler descriptor는 create-time logical output extent를 사용해야 한다.
+Reserved0/6–8/14–18, Count, SDK/Core/Unknown sentinel은 feature가 아니다. 미지원 enum의 Create/GetScratch/GetFeatureRequirements는 FeatureNotSupported다. RR availability의 공식 이름은 `SuperSamplingDenoising.Available`이다. RR/FG는 실제 native device capability를 조회하며 기존 MSVC parameter ABI·opaque handles를 유지한다.
 
-## flags74가 요구하는 최소 functional milestone
+FG multi-frame 계약은 [NVIDIA/DLSS `3749594` public params](https://github.com/NVIDIA/DLSS/blob/374959484e79a640feaba44c93ac8cfb0a03f5b5/include/nvsdk_ngx_params_dlssg.h)의 `MultiFrameCount=N`·`MultiFrameIndex=1..N`이다. `DLSSG.OutputInterpolated`는 배열이 아니라 **해당 Evaluate의 단일 출력**이다. 첫 index가 같은 real-frame pair의 N개 phase `(i+1)/(N+1)`를 한 번 생성하고, 후속 index는 retained batch의 선택된 phase만 public output으로 발행한다. 동일 pair의 frame ID·입력 resource·guide scalar 변경이나 순서가 어긋난 index를 거부한다. Recordings는 context/resources/outcome을 소유하며 Evaluate에서 GPU를 기다리거나 결과를 polling하지 않는다.
 
-flags74는 `MVLowRes | DepthInverted | AutoExposure`, HDR bit off이다. local fixture가 요구하는 concrete mapping은 다음과 같다.
+공식 optional `DLSSG.OutputDisableInterpolation`은 최소4-byte GPU buffer이며 첫 byte의 true가 generated presents 억제를 뜻한다. 발행은 실제 GPU-retired 결과가0이면 출력 texture를 건드리지 않고 flag1, 유효한 선택 phase이면 flag0을 기록한다. First/reset/stale/disabled/scene-change의 실제0은 real history bootstrap을 제출하되 CopyCurrent 대체를 만들지 않는다. NGX caller가 단일 public output과 flag를 소비·pacing하며 ordinary DXGI Present에 별도 generated frame을 주입하지 않는다. SDK에 없는 output-array/presentation callback parameter를 만들지 않는다. 구현 계약과 GPU·품질 검증 결과는 분리한다.
 
-| 항목 | fixture/contract | 첫 owned D3D12 path 처리 |
-| --- | --- | --- |
-| create input | 64x64 | logical input extent로 보존 |
-| create output | 128x128 | logical output extent로 보존; 136x136 backing과 분리 |
-| Color/Output | DXGI 28 / Metal 70 | retained texture views |
-| Motion | DXGI 34 / Metal 65 | low-res MV 직접 전달 |
-| Depth | DXGI 20 / Metal 260 | depth-stencil texture 그대로, `depth_reversed=true` |
-| Auto exposure | true | MetalFX `autoExposureEnabled=true`; exposure texture null |
-| caller reset | 첫 frame 포함 false | generation 첫 **execution**에서 implicit reset |
-| raw PreExposure | 0 | semantic 1.0으로 normalize 후 MetalFX 전달 |
-| raw Exposure.Scale | 0 | semantic 1.0; 현재 WMT에 별도 property가 없으므로 identity는 no-op |
-| offsets | 0 | supported |
-| bias/reactive mask | null | supported as absent |
-| alpha upscaling | false | supported; alpha flag가 오면 현재 backend는 명시적 unsupported |
+NGX는 CPU `GetFrameGenerationResult` consumer가 아니다. 마지막 indexed publication을 기록한 뒤 `RetireFrame(frame, FALSE, ...)`로 결과 조회용 metadata 소유권을 명시적으로 반납한다. 새 monotonically newer real pair가 남은 index를 요청하지 않은 이전 pair를 대체하면 그 이전 lookup도 반납한다. 이미 기록한 publication은 immutable producer/batch를 계속 소유하며, pending 결과는 검증된 GPU completion에서 수거하므로 retirement가 queue 작업·real history bootstrap·closed-list replay를 취소하지 않는다. timer나 임의 frame-count window로 결과를 만료시키지 않는다.
 
-이 subset은 upstream WMT temporal scaler ABI로 표현할 수 있다. 따라서 **build 가능성**과 **flags74 synthetic compatibility 구현 가능성**에는 구조적 blocker가 없다.
+Shared/public count1도 실제 GPU scene-change 결과가 필요한 SDK phase 경로를 사용한다. Native MetalFX encode의 BOOL 성공을 generated-count 증거로 간주하지 않는다. 따라서 과거 count1 MetalFX와 알고리즘·성능이 같다는 주장은 없으며 기본 count1의 실게임 FPS/품질 회귀 비교가 별도로 필요하다.
 
-그러나 이 결론은 실제 ZZZ session이 raw flags74를 생성한다는 뜻이 아니다. static 원본 분석은 UnityPlayer가 Streamline에 HDR, auto exposure, preExposure, exposureScale, mode/output dimensions, common camera constants를 동적으로 전달하고 `sl.dlss`가 raw NGX contract를 만든다는 것까지만 증명한다. raw flags74는 이전 runtime capture/fixture contract다.
+RR은 unpacked roughness.R 또는 packed normals.w, view-space/HW depth, guide subrect를 기록한다. Row-major left-multiplication matrices는 Evaluate에서 복사해 caller mutation과 분리한다. RR guide §3.7에 따라 SR exposure/auto-exposure는 neutral이며 ordinary SR를 실행하지 않는다. 별도 native 입력이 없는 RR2 guide/reflection-MV, alpha와 sharpening은 UnsupportedParameter로 거부한다.
+RR converter → native denoiser → output copy는 독립 native recording segments 사이의 queue producer barrier와 device visibility로 순서를 보장한다. Queue barrier의 `MTLStageAll`과 encoder-local fence scope는 구분하며, compute encoder의 fence update는 Dispatch/Blit/AccelerationStructure 범위만 사용한다. Fence·frame·scratch는 recording retirement까지 유지한다.
+Feature release는 idle ownership만 내려놓으며 이미 기록된 generation의 history를 reset하지 않는다. Caller reset=false인 동일 frame의 재실행은 immutable 입력을 유지하면서 history를 한 단계 진행한다. 독립 control의 `replay` 모드는 native1..8 뒤 동일8을 reset=false로 다시 실행하며, frame8과 replay를 각각 비교한다. `.inputs`는 baseline/mirror의 uploaded guide bytes와 독립 literal SIMD matrix·jitter·reset이 public 입력과 byte-identical인지 검사한다. Wine x64와 비교할 native control은 `-arch x86_64`로 빌드하고 동일한 API+Shader validation 환경에서 실행해야 하며, ARM64 control은 별도 비교 자료다. `rotate`/`rotate-replay`는 이전 texture versions를 유지한 채 매 frame texture identity만 교체하는 독립 원인분리 control이다.
 
-## flags74 밖에서 upstream WMT ABI에 빠진 것
+Native control의 frame 로그는 encode 전 제출한 `reset`과 encode 후 getter의 `reset_after_encode`를 구분한다. Scene1·5는 reset=true를 제출하며, MetalFX가 request를 소비한 뒤의 getter=false를 제출값으로 해석하지 않는다.
 
-현재 `winemetal.h`의 `WMTFXTemporalScalerInfo/Props`와 `MTLCommandBuffer_encodeTemporalScale`은 다음 public DLSS/modern MetalFX 의미를 표현하지 못한다.
+2026-10-04 RR reference 대조는 `build/local/p4-20261004-N7DnYe/reference/D3DMetal.framework/Versions/A/D3DMetal`의 pristine GPTK4.0b2 x86_64 binary(SHA-256 `f5b56df1b8fe8b364dd9530651a3769c8aed948bd343be3b4510604d503e2bad`)를 대상으로 했다. `rr-evaluate-macho.disasm.txt`의 Metal4 MPL factory `0x3a291–0x3a46a`는 같은 public denoised descriptor·compiler factory를 사용하고 input/output dimensions를 직접 전달한다. `supportsMetal4FX:` query는 `0x31d63`, `ngx::convertMatrix`는 `0x16405b–0x1640a1`에서 64 bytes를 transpose 없이 복사하며 `rr-encode-selected.txt`의 matrix setters `0x12d596–0x12d610`도 그대로 전달한다. Pristine factory는 synchronous initialization=false, 독립 control은 true를 사용한다. 이 bounded static 대조는 reference binary의 해당 경로를 실제 실행했다는 증거가 아니다.
 
-- color/depth/MV/output content base offsets와 output subrect origin.
-- output-resolution motion-vector enable flag를 직접 전달하는 modern API.
-- jittered-motion-vector enable flag.
-- bias-current/reactive mask.
-- non-identity `DLSS.Exposure.Scale`.
-- manual exposure resource의 documented MetalFX format으로의 numeric conversion.
-- alpha upscaling.
-- scaler가 요구하는 output texture usage/private shadow negotiation.
+Main의 `build/local/p4-resume-20261004-WoVvSo/rr-native-arm64-validated` 실행에서 Apple M5 Pro의 128×128 1× texture preconditions와 queried scale range1..3이 확인됐지만, 32 frames 모두 native 내부 `Conv3x3Stride1U8` shader의 offset12672/length12672 invalid load를 보고했다. 별도 `rr-native-x86-validated`의 32-frame baseline과 18-frame history replay에서도 같은 fault가 관찰됐다. 따라서 이 환경의 fault는 Wine bridge나 Rosetta에만 국한되지 않는다. Native API 조건 충족·finite output·control completion은 shader validation PASS를 대신하지 않으며, 해당 결과로 RR acceptance 완료를 주장하지 않는다.
 
-첫 flags74 implementation에서는 이 항목을 조용히 무시하면 안 된다. identity/absent/zero 조건만 허용하고 그렇지 않으면 explicit unsupported/invalid result를 반환한다. 이후 public MetalFX API를 WMT에 확장할 때 하나씩 해제한다.
+RR runner는 native baseline/replay의 stdout·stderr를 함께 freeze한다. Native shader validation fault가 있더라도 public 입력 hash·RGB 비교를 진단용으로 실행하지만, fault는 `rr_native_validation_errors`와 전체 `validation_errors`에 기록되며 결과는 반드시 FAIL이다. Missing/malformed/nonfinite oracle, 실행 증거와 exact RGB의 acceptance gate는 그대로 유지한다. 독립 control은 queried scale range와 128×128 1× private texture의 descriptor format·usage·device 조건을 확인한다.
 
-## actual ZZZ static contract와의 경계
+FG는 normalized MV scale을 pixels로 변환하고 HDR을 display-ready PQ로 전달한다(FG guide는 scRGB/scene-linear 제외). 공개 SDK에 delta-time key가 없어 real QPC evaluate cadence를 snapshot한다. 추가 generated frames, UIR/distortion, nonzero input/output base, optional real/disable-interpolation output은 현재 명시적 UnsupportedParameter다. Record는 parameters/feature release 뒤에도 retained resource·native history 수명을 유지한다.
 
-ZZZ UnityPlayer static 분석은 다음을 증명한다.
+`owned-d3d12-ngx-features.cpp`는 public11/13/alpha128, exact capabilities, matrix/parameter snapshot, release-before-execute/replay를 검사한다. RR의 `public-rr-frame-N.bin`을 `owned-rr-native-control.mm`의 independent native output과 비교해야 한다. 구현 설명만으로 실행 전 fixture pass, NVIDIA neural-model 동등성, 게임 loader나 scanout을 주장하지 않는다.
 
-- UnityPlayer는 `sl.interposer.dll`의 Streamline API를 동적으로 resolve한다.
-- ExecuteDLSS는 `slSetConstants`, `slDLSSSetOptions`, four resource tags, `slEvaluateFeature`를 호출한다.
-- SR resource tag는 ScalingInputColor, ScalingOutputColor, Depth, MotionVectors 네 개이며 모두 eOnlyValidNow다.
-- `sl.dlss.dll`에는 raw NGX Width/Height/Out*, flags, Color/Output/Depth/MV, jitter/reset/MV scale, PreExposure/Exposure.Scale, optional masks/exposure, subrect parameter 문자열이 존재한다.
-- Unity option의 HDR, auto exposure, preExposure, exposureScale, mode/output size는 동적이며 alpha upscaling은 false다.
-
-static 분석만으로는 다음을 증명하지 않는다.
-
-- 현재 session에서 DLSS가 실제 실행됐는지.
-- Streamline가 최종 생성한 raw flags와 per-frame 값.
-- Streamline/NGX loader가 owned `nvngx.dll`을 선택했는지.
-- feature가 어느 command queue에서 몇 번 실행됐는지.
-
-따라서 첫 real integration validation에는 loader identity와 NGX D3D12 call trace가 필요하지만, 그것은 prime이 소유한 runtime/GPU 단계다.
-
-## runtime publish 변경점
-
-D3D12 NGX frontend가 완성되기 전에는 현재 `nvngx.dll`을 owned runtime의 D3D12 NGX implementation으로 광고하면 안 된다. 현재 install의 파일은 D3D11 export만 갖는다.
-
-frontend가 구현된 뒤 runtime staging에는 최소 다음이 추가돼야 한다.
-
-- `x86_64-windows/nvngx.dll`을 `lib/wine/x86_64-windows/nvngx.dll`로 stage/hash/verify.
-- `WINEDLLOVERRIDES`에 `nvngx=b` 추가하여 game/native fallback을 막음.
-- DXMT vendor extension registry setup이 필요한 실제 loader path라면 `DXMT_ENABLE_NVEXT=1`을 owned wrapper policy로 명시.
-- staged `nvngx.dll` export verification으로 required D3D12 entry points 존재 확인.
-
-`DXMT_ENABLE_NVEXT=1`일 때 candidate `dxgi.cpp`는 NVIDIA extension registry와 `NGXCore\\FullPath=C:\\Windows\\System32`를 설정한다. ZZZ Streamline가 이 경로를 실제로 사용하는지 여부는 runtime trace로 확인해야 하며 static 추측으로 `nvngx_dlss.dll`을 교체하지 않는다.
-
-## 최소 구현 순서
-
-1. **D3D12 COM interface**: `IMTLD3D12DeviceExt`, opaque temporal state, `IMTLD3D12GraphicsCommandListExt`를 정의하고 device/list QI를 구현한다.
-2. **D3D12 encoder type**: `TemporalUpscaleEncoderData`와 allocator Reset destructor를 추가한다. queue case는 prime queue owner가 현재 global fence chain에 scaler fence bridge를 추가한다.
-3. **D3D12 NGX frontend**: existing `ParametersImpl` D3D12 slots를 사용해 Init/Create/Evaluate/Release/parameter/capability entry points를 구현한다. Create는 logical create contract를 state에 저장하고 Evaluate는 immutable frame snapshot만 command list extension으로 넘긴다.
-4. **flags74 strict subset**: low-res MV, reverse depth, auto exposure, zero offsets, no optional masks/exposure, alpha off, semantic exposure identity만 허용한다. output logical extent와 backing extent를 분리한다.
-5. **CPU/PE validation**: D3D12 exports, parameter ABI, Create/Release lifetime, command-list-open rejection, unsupported-field rejection, parameter reset-after-Evaluate, command-list replay lifetime을 fixture로 검증한다.
-6. **runtime publish**: 위 CPU 계약이 통과한 뒤에만 stager에 `nvngx.dll`과 `nvngx=b`를 추가한다.
-7. **real runtime validation**: prime이 loader identity → D3D12 NGX calls → queue execution → MetalFX encode 순서로 확인한다. synthetic flags74 PASS와 실제 ZZZ compatibility는 별개의 verdict로 유지한다.
-
-현재 구조에서 가장 먼저 합의할 interface boundary는 `nvngx.dll`이 WMT/native resource를 직접 보지 않고 `ID3D12Device`/`ID3D12GraphicsCommandList`의 owned COM extension만 호출하는 것이다. 이 경계를 지키면 GPTK/D3DMetal private ABI 없이 D3D12 NGX frontend와 backend를 독립적으로 구현/검증할 수 있다.
+2026-09-19 설계는 COM boundary, retained encoder, strict flags74 parsing, MSVC facade, staging, lifecycle/subrect 보정으로 구현됐다. Frozen patches/upstream lock은 역사적 provenance로 유지하며 현재 루트에 다시 적용하는 설치 지침으로 쓰지 않는다. ZZZ의 과거 static/실행 관찰은 [ZZZ-COMPATIBILITY](ZZZ-COMPATIBILITY.ko.md)에 날짜와 당시 runtime 경계를 유지한다.

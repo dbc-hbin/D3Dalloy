@@ -19,6 +19,10 @@ from owned_graphics_arch import architecture, inspect_pe, macho_architectures, r
 
 SCHEMA = 2
 MANIFEST = "owned-graphics-runtime.json"
+WINE_DISPLAY_SOURCE = Path(__file__).resolve().parents[1] / "toolchains/wine-game-display"
+WINE_DISPLAY_SOURCE_PIN = "913e31f201d344223bdf3d13a50a41af35893d12"
+WINE_DISPLAY_ABI_HEADERS = ("src/dxgi/dxgi_composition.h", "src/winemetal/winemetal.h")
+REQUIRED_DCOMP_EXPORTS = {"DCompositionCreateDevice", "DCompositionCreateDevice2", "DCompositionCreateDevice3"}
 WINDOWS_DIR = Path("lib/wine/x86_64-windows")
 UNIX_DIR = Path("lib/wine/x86_64-unix")
 DXMT_WINDOWS_DIR = Path("x86_64-windows")
@@ -51,6 +55,7 @@ FORBIDDEN_STAGED_ARTIFACTS = (
 )
 WINDOWS_MODULES = (
     "d3d12.dll",
+    "d3d12core.dll",
     "dxgi.dll",
     "d3d11.dll",
     "d3d10core.dll",
@@ -60,9 +65,12 @@ TRANSLATOR_ARTIFACTS = tuple(WINDOWS_DIR / name for name in WINDOWS_MODULES) + (
     UNIX_DIR / "winemetal.so",
 )
 OWNED_D3D12_MARKER = b"owned-graphics-d3d12"
-# Wine's loader only accepts a builtin module whose image carries this marker;
-# `winebuild --builtin` writes it, so a target-only build is not installable.
+OWNED_D3D12_CORE_MARKER = b"owned-graphics-d3d12core"
+AGILITY_SDK_VERSION = 618
+# Wine builtin frontends require this marker from `winebuild --builtin`.
+# The pure PE Core is deliberately native-only and must not carry the signature.
 WINE_BUILTIN_MARKER = b"Wine builtin DLL"
+WINE_FAKE_MARKER = b"Wine placeholder DLL"
 OWNED_NGX_D3D12_MARKER = b"own-ngxd3d12"
 FSR_MODULE = "amd_fidelityfx_upscaler_dx12.dll"
 OWNED_FSR_MARKER = b"dxmt-owned-fsr-metalfx-v1"
@@ -191,11 +199,13 @@ def regular_file(path: Path, label: str) -> None:
         raise ValueError(f"expected regular non-symlink {label}: {path}")
 
 
-def wow64_artifacts(with_wow64: bool) -> tuple[Path, ...]:
-    return tuple(WOW64_WINDOWS_DIR / name for name in WINDOWS_MODULES) if with_wow64 else ()
+def wow64_artifacts(with_wow64: bool, with_nvngx: bool = False, with_nvapi: bool = False,
+                    with_fsr: bool = False) -> tuple[Path, ...]:
+    names = (*WINDOWS_MODULES, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr, windows_abi="x86"))
+    return tuple(WOW64_WINDOWS_DIR / name for name in names) if with_wow64 else ()
 
 
-def pe_exports(path: Path) -> dict[str, int]:
+def pe_exports(path: Path, *, uint32_data: tuple[str, ...] = (), string_data: tuple[str, ...] = ()) -> dict[str, int | str]:
     """Read named, concrete PE exports and ordinals without external tooling."""
     data = path.read_bytes()
     if len(data) < 0x40 or data[:2] != b"MZ":
@@ -270,17 +280,25 @@ def pe_exports(path: Path) -> dict[str, int]:
         rva_offset(function_rva)
         if name in exports:
             raise ValueError(f"duplicate PE export {name}: {path}")
-        exports[name] = ordinal_base + index_in_functions
+        exports[name] = (struct.unpack_from("<I", data, rva_offset(function_rva, 4))[0]
+                         if name in uint32_data else ordinal_base + index_in_functions)
+        if name in string_data:
+            offset = rva_offset(function_rva)
+            end = data.find(b"\0", offset, offset + 129)
+            if end < 0:
+                raise ValueError(f"unterminated PE DATA export {name}: {path}")
+            rva_offset(function_rva, end - offset + 1)
+            exports[name] = data[offset:end].decode("ascii")
     return exports
 
 
 def optional_modules(with_nvngx: bool, with_nvapi: bool, with_fsr: bool = False,
-                     with_fsr_framegeneration: bool = False) -> tuple[str, ...]:
+                     with_fsr_framegeneration: bool = False, *, windows_abi: str = "x64") -> tuple[str, ...]:
     modules = []
     if with_nvngx:
         modules.append("nvngx.dll")
     if with_nvapi:
-        modules.append("nvapi64.dll")
+        modules.append("nvapi.dll" if windows_abi == "x86" else "nvapi64.dll")
     if with_fsr:
         modules.append(FSR_MODULE)
     if with_fsr_framegeneration:
@@ -298,11 +316,18 @@ def runtime_artifacts(with_nvngx: bool = False, with_nvapi: bool = False,
 
 
 def owned_overrides(with_nvngx: bool = False, with_nvapi: bool = False, *, with_fsr: bool | None = False,
-                    with_fsr_framegeneration: bool | None = False) -> str:
+                    with_fsr_framegeneration: bool | None = False, wow64_frontends: bool | None = None, with_core: bool = True,
+                    with_dcomp: bool = False) -> str:
     # Unselected vendor modules must not fall through to the source Wine
     # package: its NVAPI implementation can load D3DMetal on first use.
     parts = [OWNED_OVERRIDES, "nvngx=b" if with_nvngx else "nvngx=",
              "nvapi64=b" if with_nvapi else "nvapi64="]
+    if with_core:
+        # Core has no Unix-call boundary. Native-only exact-path loading permits
+        # distinct owned Core images; builtin routing coalesces their basename.
+        parts.insert(1, "d3d12core=n")
+    if wow64_frontends is not None:
+        parts.append("nvapi=b" if wow64_frontends and with_nvapi else "nvapi=")
     # Absent fsr in retained schema 1/2 manifests denotes the immutable old
     # loader policy. Every new stage records a bool and blocks Wine's foreign FSR.
     if with_fsr is not None:
@@ -310,13 +335,130 @@ def owned_overrides(with_nvngx: bool = False, with_nvapi: bool = False, *, with_
     # No FG field means a retained SR-only policy: preserve its wrapper bytes.
     if with_fsr_framegeneration is not None:
         parts.append("amd_fidelityfx_framegeneration_dx12=b" if with_fsr_framegeneration else "amd_fidelityfx_framegeneration_dx12=")
+    if with_dcomp:
+        parts.append("dcomp=b")
     return ";".join(parts)
 
 
-def validate_fsr_module(path: Path) -> None:
+def display_artifacts(with_dcomp: bool, arch: dict, with_wow64: bool) -> tuple[Path, ...]:
+    if not with_dcomp:
+        return ()
+    return (Path(arch["windows_directory"]) / "dcomp.dll",
+            *((WOW64_WINDOWS_DIR / "dcomp.dll",) if with_wow64 else ()))
+
+
+def validate_dcomp_module(path: Path, windows_abi: str) -> None:
+    regular_file(path, "Wine display frontend")
+    if inspect_pe(path)["windows_abi"] != windows_abi:
+        raise ValueError(f"dcomp Windows ABI mismatch: {path}; expected {windows_abi}")
+    if path.read_bytes()[64:96] != WINE_BUILTIN_MARKER.ljust(32, b"\0"):
+        raise ValueError(f"dcomp lacks the Wine builtin image signature: {path}")
+    missing = REQUIRED_DCOMP_EXPORTS - pe_exports(path).keys()
+    if missing:
+        raise ValueError(f"dcomp is missing required public exports: {sorted(missing)}")
+
+
+def resolve_display_artifacts(build: Path, arch: dict, with_wow64: bool) -> tuple[dict[Path, Path], dict]:
+    """Select PE dcomp only; this source clone does not own the runtime's native overlays."""
+    if arch["native_arch"] != "x86_64" or arch["windows_abi"] != "x64":
+        raise ValueError("Wine display staging requires the established x86_64/x64 layout")
+    if build.is_symlink() or not build.is_dir():
+        raise ValueError(f"wine-display-build must be a real non-symlink directory: {build}")
+    makefile = build / "Makefile"
+    regular_file(makefile, "Wine display build Makefile")
+    with makefile.open() as stream:
+        srcdir = next((line.removeprefix("srcdir = ").strip() for line in stream if line.startswith("srcdir = ")), None)
+    if srcdir is None or (build / srcdir).resolve() != WINE_DISPLAY_SOURCE.resolve():
+        raise ValueError("Wine display build must use the authorized toolchains/wine-game-display source")
+    source = WINE_DISPLAY_SOURCE
+    pin = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    if pin != WINE_DISPLAY_SOURCE_PIN:
+        raise ValueError(f"Wine display source pin mismatch: {pin}")
+    changes = subprocess.check_output(["git", "-C", str(source), "diff", "--binary", "HEAD", "--", "dlls/dcomp"])
+    changed_names = subprocess.check_output(["git", "-C", str(source), "diff", "--name-only", "-z", "HEAD", "--", "dlls/dcomp"])
+    untracked = subprocess.check_output(["git", "-C", str(source), "ls-files", "--others", "--exclude-standard", "-z", "--", "dlls/dcomp"])
+    changed_paths = [source / os.fsdecode(name) for name in (changed_names + untracked).split(b"\0") if name]
+    digest = hashlib.sha256(changes)
+    for path in changed_paths:
+        if path.exists():
+            regular_file(path, "Wine display changed source")
+    for name in untracked.split(b"\0"):
+        if name:
+            digest.update(name + b"\0" + bytes.fromhex(sha256(source / os.fsdecode(name))))
+    if not changes and not untracked:
+        raise ValueError("Wine display source is still pristine; no updated dcomp frontend to stage")
+    newest_source = max((path.stat().st_mtime_ns for path in changed_paths if path.exists()), default=0)
+    source_files = subprocess.check_output(["git", "-C", str(source), "ls-files", "--cached", "--others",
+                                           "--exclude-standard", "-z", "--", "dlls/dcomp"])
+    snapshot = {}
+    for name in source_files.split(b"\0"):
+        if name:
+            relative = os.fsdecode(name)
+            path = source / relative
+            regular_file(path, "Wine display source snapshot")
+            snapshot[f"wine/{relative}"] = sha256(path)
+    for relative in WINE_DISPLAY_ABI_HEADERS:
+        path = Path(__file__).resolve().parents[1] / relative
+        regular_file(path, "canonical composition ABI header")
+        snapshot[relative] = sha256(path)
+    artifacts = {}
+    for relative in display_artifacts(True, arch, with_wow64):
+        module = build / "dlls/dcomp" / relative.parent.name / "dcomp.dll"
+        if existing_symlink_component(module, build) is not None:
+            raise ValueError(f"Wine display module path traverses a symlink: {module}")
+        validate_dcomp_module(module, "x86" if relative.parent == WOW64_WINDOWS_DIR else "x64")
+        if module.stat().st_mtime_ns < newest_source:
+            raise ValueError(f"Wine display module predates changed dcomp source; rebuild required: {module}")
+        artifacts[relative] = module
+    provenance = {
+        "scope": "dcomp-pe-only; source runtime native overlays preserved",
+        "source_pin": pin,
+        "source_directory": str(source.resolve()),
+        "build_directory": str(build.resolve()),
+        "source_changes_sha256": digest.hexdigest(),
+        "staging_source_snapshot": {
+            "meaning": "source contents observed at staging; not a compiled-input receipt",
+            "files": snapshot,
+        },
+        "modules": {str(relative): {"sha256": sha256(module), "pe": inspect_pe(module)}
+                    for relative, module in artifacts.items()},
+    }
+    return artifacts, provenance
+
+
+def validate_core_module(path: Path, windows_abi: str, *, legacy_builtin: bool = False) -> str:
+    regular_file(path, "owned D3D12Core module")
+    if inspect_pe(path)["windows_abi"] != windows_abi:
+        raise ValueError(f"D3D12Core Windows ABI mismatch: {path}; expected {windows_abi}")
+    payload = path.read_bytes()
+    if OWNED_D3D12_CORE_MARKER not in payload:
+        raise ValueError(f"D3D12Core lacks the owned marker: {path}")
+    # Match Wine server/mapping.c's image classifier, not arbitrary strings in
+    # code/data/debug information, including for retained builtin images.
+    signature = payload[64:96]
+    if legacy_builtin and signature != WINE_BUILTIN_MARKER.ljust(32, b"\0"):
+        raise ValueError(f"retained D3D12Core lacks its recorded Wine builtin image mode: {path}")
+    if (not legacy_builtin and signature == WINE_BUILTIN_MARKER.ljust(32, b"\0")) or signature == WINE_FAKE_MARKER.ljust(32, b"\0"):
+        raise ValueError(f"D3D12Core must be an ordinary owned PE, not Wine builtin/fake: {path}")
+    exports = pe_exports(path, uint32_data=("D3D12SDKVersion",), string_data=("OwnedD3D12CoreGeneration",))
+    if exports.get("D3D12SDKVersion") != AGILITY_SDK_VERSION:
+        raise ValueError(f"D3D12Core actual exported SDK version must be {AGILITY_SDK_VERSION}: {path}")
+    if {"D3D12GetInterface", "OwnedD3D12CoreGetBridge1"} - exports.keys():
+        raise ValueError(f"D3D12Core is missing required owned module exports: {path}")
+    generation = exports.get("OwnedD3D12CoreGeneration")
+    main_exports = pe_exports(path.with_name("d3d12.dll"), string_data=("OwnedD3D12CoreGeneration",))
+    main_generation = main_exports.get("OwnedD3D12CoreGeneration")
+    if "OwnedD3D12MainGetBridge1" not in main_exports:
+        raise ValueError(f"owned d3d12.dll is missing the matching Core bridge: {path}")
+    if not isinstance(generation, str) or len(generation) != 32 or any(char not in "0123456789abcdef" for char in generation) or generation != main_generation:
+        raise ValueError(f"D3D12Core generation does not match owned d3d12.dll: {path}")
+    return generation
+
+
+def validate_fsr_module(path: Path, windows_abi: str = "x64") -> None:
     regular_file(path, "owned DXMT FSR module")
-    if inspect_pe(path)["windows_abi"] != "x64":
-        raise ValueError(f"FSR Windows ABI mismatch: {path}; expected x64")
+    if inspect_pe(path)["windows_abi"] != windows_abi:
+        raise ValueError(f"FSR Windows ABI mismatch: {path}; expected {windows_abi}")
     payload = path.read_bytes()
     if FSR_MODULE_MARKERS[path.name] not in payload:
         raise ValueError(f"{path.name} is missing the owned MetalFX FSR marker")
@@ -366,22 +508,33 @@ def reject_removed_sdk_artifacts(dxmt_install: Path) -> None:
         )
 
 
-def resolve_wow64_artifacts(dxmt_install32: Path) -> dict[Path, Path]:
+def resolve_wow64_artifacts(dxmt_install32: Path, with_nvngx: bool = False, with_nvapi: bool = False,
+                            with_fsr: bool = False) -> dict[Path, Path]:
     """Resolve a 32-bit Meson install prefix (i386-windows) into the runtime's WoW64 module directory."""
     if dxmt_install32.is_symlink() or not dxmt_install32.is_dir():
         raise ValueError(f"dxmt-install32 must be a real Meson install directory: {dxmt_install32}")
     reject_removed_sdk_artifacts(dxmt_install32)
     result: dict[Path, Path] = {}
-    for name in WINDOWS_MODULES:
+    for name in (*WINDOWS_MODULES, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr, windows_abi="x86")):
         source = dxmt_install32 / DXMT_WOW64_DIR / name
         regular_file(source, f"32-bit DXMT {name}")
         if inspect_pe(source)["windows_abi"] != "x86":
             raise ValueError(f"32-bit DXMT {name} is not an i386 PE image: {source}")
-        if WINE_BUILTIN_MARKER not in source.read_bytes():
+        if name != "d3d12core.dll" and WINE_BUILTIN_MARKER not in source.read_bytes():
             raise ValueError(f"32-bit DXMT {name} lacks the Wine builtin marker; winebuild --builtin did not run")
         result[WOW64_WINDOWS_DIR / name] = source
+        if name in FSR_MODULE_MARKERS:
+            validate_fsr_module(source, "x86")
+        elif name == "nvngx.dll":
+            if OWNED_NGX_D3D12_MARKER not in source.read_bytes():
+                raise ValueError("32-bit nvngx.dll is missing the owned D3D12 NGX marker")
+            if REQUIRED_NGX_D3D12_EXPORTS - pe_exports(source).keys():
+                raise ValueError("32-bit nvngx.dll is missing required D3D12 exports")
+        elif name == "nvapi.dll" and pe_exports(source).get("nvapi_QueryInterface") != 2:
+            raise ValueError("32-bit nvapi.dll is missing required exports")
     if OWNED_D3D12_MARKER not in (dxmt_install32 / DXMT_WOW64_DIR / "d3d12.dll").read_bytes():
         raise ValueError("32-bit d3d12.dll is missing the owned backend marker; refusing an unowned/stale DXMT build")
+    validate_core_module(dxmt_install32 / DXMT_WOW64_DIR / "d3d12core.dll", "x86")
     return result
 
 
@@ -389,8 +542,6 @@ def resolve_dxmt_artifacts(
     dxmt_install: Path, with_nvngx: bool = False, with_nvapi: bool = False, arch: dict | None = None, *, with_fsr: bool = False
 ) -> dict[Path, Path]:
     arch = arch or architecture("x86_64", "x64")
-    if with_fsr and (arch["native_arch"] != "x86_64" or arch["windows_abi"] != "x64"):
-        raise ValueError("owned FSR frontend is only supported by the x86_64/x64 runtime")
     WINDOWS_DIR, UNIX_DIR = Path(arch["windows_directory"]), Path(arch["unix_directory"])
     DXMT_WINDOWS_DIR, DXMT_UNIX_DIR = Path(WINDOWS_DIR.name), Path(UNIX_DIR.name)
     if dxmt_install.is_symlink() or not dxmt_install.is_dir():
@@ -421,15 +572,18 @@ def resolve_dxmt_artifacts(
         missing = REQUIRED_NVAPI_EXPORTS - pe_exports(source).keys()
         if missing:
             raise ValueError(f"nvapi64.dll is missing required exports: {sorted(missing)}")
+        if pe_exports(source).get("nvapi_QueryInterface") != 2:
+            raise ValueError("nvapi64.dll QueryInterface ordinal must be 2")
         result[WINDOWS_DIR / "nvapi64.dll"] = source
     if with_fsr:
         for name in FSR_MODULE_MARKERS:
             source = dxmt_install / DXMT_WINDOWS_DIR / name
-            validate_fsr_module(source)
+            validate_fsr_module(source, arch["windows_abi"])
             result[WINDOWS_DIR / name] = source
     for relative, source in result.items():
         if relative.suffix == ".dll" and inspect_pe(source)["windows_abi"] != arch["windows_abi"]:
             raise ValueError(f"DXMT Windows ABI mismatch: {source}; expected {arch["windows_abi"]}")
+    validate_core_module(dxmt_install / DXMT_WINDOWS_DIR / "d3d12core.dll", arch["windows_abi"])
     return result
 
 
@@ -524,8 +678,14 @@ def macho_audit_problems(path: Path, label: str, native_arch: str = "x86_64") ->
 
 
 def render_wrapper(with_nvngx: bool = False, with_nvapi: bool = False, arch: dict | None = None, *, with_fsr: bool | None = False,
-                   with_fsr_framegeneration: bool | None = False) -> str:
+                   with_fsr_framegeneration: bool | None = False, wow64_frontends: bool | None = None, with_core: bool = True,
+                   with_wow64: bool = False, with_dcomp: bool = False) -> str:
     arch = arch or architecture("x86_64", "x64")
+    dll_paths = [arch["windows_directory"]]
+    if with_wow64:
+        dll_paths.append(str(WOW64_WINDOWS_DIR))
+    dll_paths.append(arch["unix_directory"])
+    dll_path = ":".join(f"$wine_root/{path}" for path in dll_paths)
     unsets = " ".join((*GPTK_ENV, *FOREIGN_GRAPHICS_ENV))
     fg_observer = '''# Explicit test-only drawable observation at the final native launch hop.
 if [ -n "${OWNED_FG_OBSERVER:-}" ]; then
@@ -558,7 +718,7 @@ unset {unsets}
 # Wine derives the same installed DLL root from ntdll.so. Pin the environment
 # copy to this staged runtime too, so an inherited WINEDLLPATH cannot redirect
 # builtin modules to another Wine/GPTK tree before our owned modules are found.
-export WINEDLLPATH="$wine_root/{arch["windows_directory"]}:$wine_root/{arch["unix_directory"]}"
+export WINEDLLPATH="{dll_path}"
 
 # Keep the packaged Wine runtime's non-graphics dependency lookup contract. These
 # paths provide bundled libraries and GStreamer plugins, not a graphics backend.
@@ -580,7 +740,7 @@ fi
 
 # Environment load order wins over prefix registry overrides. Builtin-only means
 # a missing owned module is a hard load failure rather than a native/GPTK fallback.
-export WINEDLLOVERRIDES="{owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration)}"
+export WINEDLLOVERRIDES="{owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration, wow64_frontends=wow64_frontends, with_core=with_core, with_dcomp=with_dcomp)}"
 
 {"export DXMT_ENABLE_NVEXT=1" if (with_nvngx or with_nvapi) else "unset DXMT_ENABLE_NVEXT"}
 
@@ -597,7 +757,7 @@ fi
 '''
 
 
-def prepare_real_wine(runtime: Path, with_nvngx: bool = False, with_nvapi: bool = False, arch: dict | None = None, *, with_fsr: bool = False) -> None:
+def prepare_real_wine(runtime: Path, with_nvngx: bool = False, with_nvapi: bool = False, arch: dict | None = None, *, with_fsr: bool = False, wow64_frontends: bool | None = None, with_wow64: bool = False, with_dcomp: bool = False) -> None:
     launcher = runtime / "bin/wine"
     real = runtime / "bin/wine.real"
     if launcher.read_bytes()[:2] == b"#!":
@@ -606,7 +766,7 @@ def prepare_real_wine(runtime: Path, with_nvngx: bool = False, with_nvapi: bool 
         if real.exists() or real.is_symlink():
             raise ValueError("staged runtime has ambiguous bin/wine.real")
         launcher.replace(real)
-    launcher.write_text(render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr))
+    launcher.write_text(render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=wow64_frontends, with_wow64=with_wow64, with_dcomp=with_dcomp))
     launcher.chmod(0o755)
 
 
@@ -647,9 +807,40 @@ def verify_runtime(runtime: Path) -> list[str]:
         return [str(error)]
     WINDOWS_DIR, UNIX_DIR = Path(arch["windows_directory"]), Path(arch["unix_directory"])
     optional = data.get("optional_modules", {})
+    # Retained immutable schema 1/2 runtimes predate Core. New stages always
+    # record agility_sdk; this is legacy read compatibility, not a feature gate.
+    with_core = "agility_sdk" in data
+    core_record = data.get("agility_sdk")
+    # Only immutable Core manifests from before native-only delivery used b.
+    # Verify that historical image mode too; new staging never accepts it.
+    legacy_core_builtin = isinstance(core_record, dict) and "delivery" not in core_record
+    windows_modules = tuple(name for name in WINDOWS_MODULES if with_core or name != "d3d12core.dll")
     with_nvngx = optional.get("nvngx") is True
     with_nvapi = optional.get("nvapi64") is True
     with_wow64 = optional.get("wow64") is True
+    with_dcomp = optional.get("dcomp") is True
+    with_fex = optional.get("fex_x64") is True
+    with_fex_x86 = optional.get("fex_x86") is True
+    fex_extra = (WINDOWS_DIR / "xtajit64.dll",) if with_fex else ()
+    if with_fex_x86:
+        fex_extra += (WINDOWS_DIR / "xtajit.dll", WINDOWS_DIR / "wow64.dll", WOW64_WINDOWS_DIR / "ntdll.dll")
+        if arch["native_arch"] != "arm64" or not with_wow64:
+            problems.append("FEX x86 requires native ARM64 Wine with owned WoW64 frontends")
+    if with_fex and (arch["native_arch"] != "arm64" or arch["windows_abi"] != "arm64x"):
+        problems.append("FEX x64 requires the native ARM64/paired ARM64X runtime")
+    if "dcomp" in optional and not isinstance(optional["dcomp"], bool):
+        problems.append("manifest optional dcomp selection must be a boolean")
+    display_extra = display_artifacts(with_dcomp, arch, with_wow64)
+    with_wow64_frontends = optional.get("wow64_frontends") is True
+    if "wow64_frontends" in optional and not isinstance(optional["wow64_frontends"], bool):
+        problems.append("manifest WoW64 frontend selection must be a boolean")
+    if with_wow64_frontends and not with_wow64:
+        problems.append("WoW64 frontends require WoW64 modules")
+    wow64_extra = wow64_artifacts(with_wow64, with_wow64_frontends and with_nvngx,
+                                 with_wow64_frontends and with_nvapi,
+                                 with_wow64_frontends and optional.get("fsr") is True)
+    if not with_core:
+        wow64_extra = tuple(path for path in wow64_extra if path.name != "d3d12core.dll")
     fsr_policy = optional.get("fsr")
     if "fsr" in optional and not isinstance(fsr_policy, bool):
         problems.append("manifest optional FSR selection must be a boolean")
@@ -660,8 +851,6 @@ def verify_runtime(runtime: Path) -> list[str]:
     with_fsr_framegeneration = fg_policy is True
     if with_fsr_framegeneration and not with_fsr:
         problems.append("owned FSR frame generation requires the owned FSR module group")
-    if (with_fsr or with_fsr_framegeneration) and (arch["native_arch"] != "x86_64" or arch["windows_abi"] != "x64"):
-        problems.append("owned FSR frontend is only supported by the x86_64/x64 runtime")
     native_record = data.get("native_compiler")
     if "dxil_compiler" in data:
         problems.append("manifest still records the removed external DXIL compiler")
@@ -676,7 +865,10 @@ def verify_runtime(runtime: Path) -> list[str]:
         leftover = runtime / relative
         if leftover.exists() or leftover.is_symlink():
             problems.append(f"staged runtime still contains a removed external DXIL compiler artifact: {relative}")
-    if data.get("loader", {}).get("winedlloverrides") != owned_overrides(with_nvngx, with_nvapi, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy):
+    expected_overrides = owned_overrides(with_nvngx, with_nvapi, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_dcomp=with_dcomp)
+    if legacy_core_builtin:
+        expected_overrides = expected_overrides.replace("d3d12core=n", "d3d12core=b")
+    if data.get("loader", {}).get("winedlloverrides") != expected_overrides:
         problems.append("manifest loader override does not select the owned builtin modules exactly")
     if data.get("gptk_backend", {}).get("selected") is not False:
         problems.append("manifest does not record the GPTK backend as unselected")
@@ -684,14 +876,48 @@ def verify_runtime(runtime: Path) -> list[str]:
     if not isinstance(recorded, dict):
         problems.append("manifest artifact inventory is missing")
         return problems
-    if with_wow64 and arch["native_arch"] != "x86_64":
+    if with_wow64 and arch["native_arch"] != "x86_64" and not with_fex_x86:
         problems.append("WoW64 staging is only established for the x86_64 Wine layout")
-    expected = {str(path) for path in (*runtime_artifacts(with_nvngx, with_nvapi, wow64_artifacts(with_wow64), arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration),
+    expected = {str(path) for path in (*runtime_artifacts(with_nvngx, with_nvapi, wow64_extra + display_extra + fex_extra, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration),
                                        Path("bin/wine"), Path("bin/wine.real"))}
+    if not with_core:
+        expected.discard(str(WINDOWS_DIR / "d3d12core.dll"))
     if data["schema"] == 2:
         expected.update(("bin/wineserver", str(UNIX_DIR / "ntdll.so"), str(WINDOWS_DIR / "ntdll.dll")))
     if set(recorded) != expected:
         problems.append("manifest artifact inventory is incomplete or contains unknown entries")
+    if with_fex:
+        fex = data.get("fex")
+        module = str(fex_extra[0])
+        if (not isinstance(fex, dict) or
+                fex.get("source_commit") != "9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf" or
+                fex.get("repository") != "https://github.com/FEX-Emu/FEX.git" or
+                fex.get("module") != module or not fex.get("source_patches") or
+                fex.get("sha256") != recorded.get(module, {}).get("sha256")):
+            problems.append("manifest FEX source or module provenance is incomplete")
+        try:
+            if (inspect_pe(runtime / module)["windows_abi"] != "arm64ec" or
+                    (runtime / module).read_bytes()[64:80] != WINE_BUILTIN_MARKER):
+                problems.append("staged FEX emulator is not the ARM64EC builtin module")
+        except (OSError, ValueError) as error:
+            problems.append(str(error))
+    if with_fex_x86:
+        fex = data.get("fex_x86")
+        module = str(WINDOWS_DIR / "xtajit.dll")
+        if (not isinstance(fex, dict) or
+                fex.get("source_commit") != "9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf" or
+                fex.get("repository") != "https://github.com/FEX-Emu/FEX.git" or
+                fex.get("module") != module or not fex.get("source_patches") or
+                fex.get("sha256") != recorded.get(module, {}).get("sha256") or
+                not fex.get("wine_build_result_sha256") or not fex.get("wine_source_patches")):
+            problems.append("manifest FEX x86 or guest-window Wine provenance is incomplete")
+        for relative, abi in ((WINDOWS_DIR / "xtajit.dll", "arm64"),
+                              (WINDOWS_DIR / "wow64.dll", "arm64"), (WOW64_WINDOWS_DIR / "ntdll.dll", "x86")):
+            try:
+                if inspect_pe(runtime / relative)["windows_abi"] != abi:
+                    problems.append(f"native guest-window module ABI mismatch: {relative}")
+            except (OSError, ValueError) as error:
+                problems.append(str(error))
     for relative in sorted(expected & set(recorded)):
         path = runtime / relative
         record = recorded[relative]
@@ -715,16 +941,25 @@ def verify_runtime(runtime: Path) -> list[str]:
             except (OSError, ValueError) as error:
                 problems.append(str(error))
     wrapper = runtime / "bin/wine"
-    if wrapper.is_file() and not wrapper.is_symlink() and wrapper.read_text() != render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy):
+    expected_dll_paths = [arch["windows_directory"], *([str(WOW64_WINDOWS_DIR)] if with_wow64 else []), arch["unix_directory"]]
+    dll_paths = data.get("loader", {}).get("winedllpath")
+    if dll_paths is not None and dll_paths != expected_dll_paths:
+        problems.append("manifest owned DLL discovery paths do not match staged ABIs")
+    # Retained manifests predate the pinned paired path. Verify their original
+    # wrapper without changing its bytes or broadening its loader policy.
+    expected_wrapper = render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_wow64=with_wow64 and dll_paths is not None, with_dcomp=with_dcomp)
+    if legacy_core_builtin:
+        expected_wrapper = expected_wrapper.replace("d3d12core=n", "d3d12core=b")
+    if wrapper.is_file() and not wrapper.is_symlink() and wrapper.read_text() != expected_wrapper:
         problems.append("bin/wine no longer matches the owned launch policy")
     d3d12 = runtime / WINDOWS_DIR / "d3d12.dll"
     if d3d12.is_file() and OWNED_D3D12_MARKER not in d3d12.read_bytes():
         problems.append("staged d3d12.dll no longer carries the owned backend marker")
-    for name in WINDOWS_MODULES:
+    for name in windows_modules:
         module = runtime / WINDOWS_DIR / name
-        if module.is_file() and not module.is_symlink() and WINE_BUILTIN_MARKER not in module.read_bytes():
+        if name != "d3d12core.dll" and module.is_file() and not module.is_symlink() and WINE_BUILTIN_MARKER not in module.read_bytes():
             problems.append(f"staged {name} lacks the Wine builtin marker; winebuild --builtin postprocess did not run")
-    for name in (*WINDOWS_MODULES, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr_framegeneration), "ntdll.dll"):
+    for name in (*windows_modules, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr_framegeneration), "ntdll.dll"):
         module = runtime / WINDOWS_DIR / name
         try:
             if inspect_pe(module)["windows_abi"] != arch["windows_abi"]:
@@ -739,7 +974,7 @@ def verify_runtime(runtime: Path) -> list[str]:
                 problems.append(f"Wine native image lacks {arch['native_arch']}: {image}")
         except (OSError, ValueError) as error:
             problems.append(str(error))
-    for relative in wow64_artifacts(with_wow64):
+    for relative in wow64_extra:
         module = runtime / relative
         if not module.is_file() or module.is_symlink():
             continue
@@ -748,8 +983,18 @@ def verify_runtime(runtime: Path) -> list[str]:
                 problems.append(f"staged {relative} is not an i386 PE image")
         except (OSError, ValueError) as error:
             problems.append(str(error))
-        if WINE_BUILTIN_MARKER not in module.read_bytes():
+        if module.name != "d3d12core.dll" and WINE_BUILTIN_MARKER not in module.read_bytes():
             problems.append(f"staged {relative} lacks the Wine builtin marker; winebuild --builtin postprocess did not run")
+        try:
+            if module.name in FSR_MODULE_MARKERS:
+                validate_fsr_module(module, "x86")
+            elif module.name == "nvngx.dll":
+                if OWNED_NGX_D3D12_MARKER not in module.read_bytes() or REQUIRED_NGX_D3D12_EXPORTS - pe_exports(module).keys():
+                    problems.append("staged 32-bit nvngx.dll lacks the owned D3D12 ABI")
+            elif module.name == "nvapi.dll" and pe_exports(module).get("nvapi_QueryInterface") != 2:
+                problems.append("staged 32-bit nvapi.dll lacks QueryInterface")
+        except (OSError, ValueError) as error:
+            problems.append(str(error))
     if with_wow64:
         d3d12_32 = runtime / WOW64_WINDOWS_DIR / "d3d12.dll"
         if d3d12_32.is_file() and OWNED_D3D12_MARKER not in d3d12_32.read_bytes():
@@ -771,6 +1016,8 @@ def verify_runtime(runtime: Path) -> list[str]:
         if nvapi.is_file() and not nvapi.is_symlink():
             try:
                 missing = REQUIRED_NVAPI_EXPORTS - pe_exports(nvapi).keys()
+                if pe_exports(nvapi).get("nvapi_QueryInterface") != 2:
+                    problems.append("staged nvapi64.dll QueryInterface ordinal must be 2")
             except (OSError, ValueError) as error:
                 problems.append(f"cannot inspect staged nvapi64.dll exports: {error}")
             else:
@@ -778,9 +1025,59 @@ def verify_runtime(runtime: Path) -> list[str]:
                     problems.append(f"staged nvapi64.dll is missing exports: {sorted(missing)}")
     for name in optional_modules(False, False, with_fsr, with_fsr_framegeneration):
         try:
-            validate_fsr_module(runtime / WINDOWS_DIR / name)
+            validate_fsr_module(runtime / WINDOWS_DIR / name, arch["windows_abi"])
         except (OSError, ValueError) as error:
             problems.append(str(error))
+    if with_core:
+        expected_cores = [str(WINDOWS_DIR / "d3d12core.dll")]
+        if with_wow64:
+            expected_cores.append(str(WOW64_WINDOWS_DIR / "d3d12core.dll"))
+        if not isinstance(core_record, dict) or core_record.get("version") != AGILITY_SDK_VERSION or core_record.get("ownership") != "self-owned" or (not legacy_core_builtin and core_record.get("delivery") != "native-only") or not isinstance(core_record.get("modules"), dict) or set(core_record["modules"]) != set(expected_cores):
+            problems.append("manifest owned Agility Core contract is incomplete")
+        else:
+            for relative in expected_cores:
+                try:
+                    module = runtime / relative
+                    generation = validate_core_module(module, "x86" if module.parent.name == "i386-windows" else arch["windows_abi"], legacy_builtin=legacy_core_builtin)
+                    if core_record["modules"][relative] != {"sha256": sha256(module), "generation": generation}:
+                        problems.append(f"manifest Agility Core identity changed: {relative}")
+                except (OSError, ValueError) as error:
+                    problems.append(str(error))
+    display_record = data.get("wine_display_frontend")
+    if with_dcomp:
+        snapshot = display_record.get("staging_source_snapshot") if isinstance(display_record, dict) else None
+        snapshot_files = snapshot.get("files") if isinstance(snapshot, dict) else None
+        if (not isinstance(snapshot, dict)
+                or snapshot.get("meaning") != "source contents observed at staging; not a compiled-input receipt"
+                or not isinstance(snapshot_files, dict)
+                or not {*WINE_DISPLAY_ABI_HEADERS, "wine/dlls/dcomp/device.c"} <= snapshot_files.keys()
+                or any(not isinstance(digest, str) or len(digest) != 64 or set(digest) - set("0123456789abcdef")
+                       for digest in snapshot_files.values())):
+            problems.append("manifest Wine display staging source snapshot is incomplete")
+        if arch["native_arch"] != "x86_64" or arch["windows_abi"] != "x64":
+            problems.append("Wine display frontend requires the established x86_64/x64 layout")
+        if (not isinstance(display_record, dict)
+                or display_record.get("source_pin") != WINE_DISPLAY_SOURCE_PIN
+                or display_record.get("scope") != "dcomp-pe-only; source runtime native overlays preserved"
+                or not all(isinstance(display_record.get(key), str) and display_record[key]
+                           for key in ("source_directory", "build_directory"))
+                or not isinstance(display_record.get("source_changes_sha256"), str)
+                or len(display_record["source_changes_sha256"]) != 64
+                or set(display_record["source_changes_sha256"]) - set("0123456789abcdef")
+                or not isinstance(display_record.get("modules"), dict)
+                or set(display_record["modules"]) != {str(path) for path in display_extra}):
+            problems.append("manifest Wine display frontend provenance is incomplete")
+        else:
+            for relative in display_extra:
+                try:
+                    module = runtime / relative
+                    validate_dcomp_module(module, "x86" if relative.parent == WOW64_WINDOWS_DIR else arch["windows_abi"])
+                    if display_record["modules"][str(relative)] != {"sha256": sha256(module), "pe": inspect_pe(module)}:
+                        problems.append(f"manifest Wine display frontend identity changed: {relative}")
+                except (OSError, ValueError) as error:
+                    problems.append(str(error))
+    elif display_record is not None:
+        problems.append("manifest Wine display provenance requires selected dcomp modules")
     winemetal = runtime / UNIX_DIR / NATIVE_MODULE
     if winemetal.is_file() and not winemetal.is_symlink():
         try:
@@ -800,17 +1097,18 @@ def stage(
     dxmt_install: Path, wine_source: Path, dest: Path, with_nvngx: bool = False, with_nvapi: bool = False,
     dxmt_install32: Path | None = None,
     native_arch: str = "x86_64", windows_abi: str = "x64",
-    *, with_fsr: bool = False,
+    *, with_fsr: bool = False, wine_display_build: Path | None = None, fex_build: Path | None = None,
 ) -> None:
     arch = architecture(native_arch, windows_abi)
-    if with_fsr and (native_arch != "x86_64" or windows_abi != "x64"):
-        raise ValueError("owned FSR frontend is only supported by the x86_64/x64 runtime")
     UNIX_DIR = Path(arch["unix_directory"])
-    if dxmt_install32 is not None and native_arch != "x86_64":
+    if dxmt_install32 is not None and native_arch != "x86_64" and not (native_arch == "arm64" and fex_build):
         raise ValueError("WoW64 staging is only established for the x86_64 Wine layout")
     validate_destination(dest, wine_source, dxmt_install)
     if dxmt_install32 is not None:
         validate_destination(dest, wine_source, dxmt_install32)
+    if wine_display_build is not None:
+        validate_destination(dest, wine_source, wine_display_build)
+        validate_destination(dest, wine_source, WINE_DISPLAY_SOURCE)
     validate_source_runtime(wine_source, arch)
     with_wow64 = dxmt_install32 is not None
     if with_wow64:
@@ -818,8 +1116,67 @@ def stage(
         if wow64_dir.is_symlink() or not wow64_dir.is_dir():
             raise ValueError(f"missing Wine WoW64 runtime directory: {wow64_dir}")
     dxmt_artifacts = resolve_dxmt_artifacts(dxmt_install, with_nvngx, with_nvapi, arch, with_fsr=with_fsr)
+    fex_provenance = None
+    fex_x86_provenance = None
+    fex_extra = ()
+    if fex_build is not None:
+        validate_destination(dest, wine_source, fex_build)
+        if native_arch != "arm64" or (windows_abi != "arm64x" and not with_wow64):
+            raise ValueError("FEX x64 requires the native ARM64/paired ARM64X runtime")
+        result_path = fex_build / "fex-result.json"
+        fex_result = json.loads(result_path.read_text())
+        if (fex_result.get("status") != "pass" or
+                fex_result.get("source_commit") != "9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf" or
+                fex_result.get("repository") != "https://github.com/FEX-Emu/FEX.git" or
+                not fex_result.get("source_patches")):
+            raise ValueError("FEX build must retain the pinned official source and owned Darwin patch")
+        emulators = (("xtajit64.dll", "arm64ec"),) if windows_abi == "arm64x" else ()
+        if with_wow64:
+            emulators += (("xtajit.dll", "arm64"),)
+        for name, abi in emulators:
+            module = fex_build / "dlls" / name
+            regular_file(module, "FEX emulator")
+            record = fex_result["artifacts"][name]
+            if (sha256(module) != record["sha256"] or inspect_pe(module)["windows_abi"] != abi or
+                    module.read_bytes()[64:80] != WINE_BUILTIN_MARKER or
+                    set(pe_exports(module)) != set(record["exports"])):
+                raise ValueError("FEX DLL differs from the accepted source build")
+            relative = Path(arch["windows_directory"]) / name
+            dxmt_artifacts[relative] = module
+            fex_extra += (relative,)
+            provenance = {"build_result_sha256": sha256(result_path),
+                          "source_commit": fex_result["source_commit"], "repository": fex_result["repository"],
+                          "source_patches": fex_result["source_patches"],
+                          "module": str(relative), "sha256": sha256(module)}
+            if name == "xtajit64.dll":
+                fex_provenance = provenance
+            else:
+                fex_x86_provenance = provenance
+        if with_wow64:
+            wine_receipt = wine_source.parent / "runtime-result.json"
+            wine_build = json.loads(wine_receipt.read_text())
+            if (wine_build.get("status") != "pass" or wine_build.get("native_arch") != "arm64" or
+                    not any(Path(patch["path"]).name == "wine-arm64-guest-window.patch" for patch in wine_build["patches"])):
+                raise ValueError("native ARM64 WoW64 requires the accepted guest-window Wine build")
+            for identity in wine_build["identities"]:
+                if sha256(Path(identity["path"])) != identity["sha256"]:
+                    raise ValueError("Wine runtime differs from its accepted guest-window build")
+            fex_x86_provenance["wine_build_result_sha256"] = sha256(wine_receipt)
+            fex_x86_provenance["wine_source_commit"] = wine_build["source_commit"]
+            fex_x86_provenance["wine_source_patches"] = wine_build["patches"]
+            for relative in (Path(arch["windows_directory"]) / "wow64.dll", WOW64_WINDOWS_DIR / "ntdll.dll"):
+                regular_file(wine_source / relative, "Wine guest-window module")
+                fex_extra += (relative,)
     if with_wow64:
-        dxmt_artifacts.update(resolve_wow64_artifacts(dxmt_install32))
+        dxmt_artifacts.update(resolve_wow64_artifacts(dxmt_install32, with_nvngx, with_nvapi, with_fsr))
+    display_sources, display_provenance = ({}, None)
+    if wine_display_build is not None:
+        display_sources, display_provenance = resolve_display_artifacts(wine_display_build, arch, with_wow64)
+        for relative, module in display_sources.items():
+            baseline = wine_source / relative
+            if baseline.is_file() and sha256(baseline) == sha256(module):
+                raise ValueError(f"Wine display frontend is unchanged from the source runtime: {module}")
+        dxmt_artifacts.update(display_sources)
     winemetal_source = dxmt_artifacts[UNIX_DIR / NATIVE_MODULE]
     dependencies = macho_dependencies(winemetal_source)
     problems = dependency_problems(dependencies)
@@ -831,7 +1188,7 @@ def stage(
     temporary = dest.parent / f"{dest.name}.staging-{uuid.uuid4().hex}"
     try:
         shutil.copytree(wine_source, temporary, symlinks=True)
-        prepare_real_wine(temporary, with_nvngx, with_nvapi, arch, with_fsr=with_fsr)
+        prepare_real_wine(temporary, with_nvngx, with_nvapi, arch, with_fsr=with_fsr, wow64_frontends=with_wow64, with_wow64=with_wow64, with_dcomp=wine_display_build is not None)
         for relative, source in dxmt_artifacts.items():
             target = temporary / relative
             ensure_replaceable_target(target, temporary)
@@ -839,7 +1196,7 @@ def stage(
             if target.exists():
                 target.unlink()
             shutil.copy2(source, target)
-        records = artifact_records(temporary, with_nvngx, with_nvapi, wow64_artifacts(with_wow64), arch, with_fsr=with_fsr)
+        records = artifact_records(temporary, with_nvngx, with_nvapi, wow64_artifacts(with_wow64, with_nvngx, with_nvapi, with_fsr) + tuple(display_sources) + fex_extra, arch, with_fsr=with_fsr)
         manifest = {
             "schema": SCHEMA,
             "architecture": arch,
@@ -850,7 +1207,8 @@ def stage(
                 "wine_source": str(wine_source),
             },
             "loader": {
-                "winedlloverrides": owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr),
+                "winedlloverrides": owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=with_wow64, with_dcomp=wine_display_build is not None),
+                "winedllpath": [arch["windows_directory"], *([str(WOW64_WINDOWS_DIR)] if with_wow64 else []), arch["unix_directory"]],
                 "explicit_wineprefix_required": True,
             },
             "optional_modules": {
@@ -859,8 +1217,17 @@ def stage(
                 "fsr": with_fsr,
                 "fsr_framegeneration": with_fsr,
                 "wow64": with_wow64,
+                "wow64_frontends": with_wow64,
             },
             "artifacts": records,
+            "agility_sdk": {
+                "ownership": "self-owned",
+                "delivery": "native-only",
+                "version": AGILITY_SDK_VERSION,
+                "modules": {str(relative): {"sha256": sha256(source),
+                    "generation": validate_core_module(source, "x86" if relative.parent == WOW64_WINDOWS_DIR else arch["windows_abi"])}
+                    for relative, source in dxmt_artifacts.items() if relative.name == "d3d12core.dll"},
+            },
             "winemetal_dependencies": dependencies,
             "native_compiler": {
                 "ownership": "self-owned",
@@ -876,6 +1243,15 @@ def stage(
                 "preservation_reason": "the Wine runtime may contain unrelated consumers; selection is blocked by the owned wrapper",
             },
         }
+        if display_provenance is not None:
+            manifest["optional_modules"]["dcomp"] = True
+            manifest["wine_display_frontend"] = display_provenance
+        if fex_provenance is not None:
+            manifest["optional_modules"]["fex_x64"] = True
+            manifest["fex"] = fex_provenance
+        if fex_x86_provenance is not None:
+            manifest["optional_modules"]["fex_x86"] = True
+            manifest["fex_x86"] = fex_x86_provenance
         (temporary / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
         verify_problems = verify_runtime(temporary)
         if verify_problems:
@@ -897,9 +1273,11 @@ def main() -> int:
     stage_parser.add_argument("--dxmt-install32", type=Path, help="optional 32-bit Meson install prefix containing i386-windows; stages WoW64 modules into lib/wine/i386-windows")
     stage_parser.add_argument("--wine-source", required=True, type=Path, help="untouched Wine runtime to copy")
     stage_parser.add_argument("--wine-dest", required=True, type=Path, help="new destination; must not already exist")
+    stage_parser.add_argument("--fex-build", type=Path, help="accepted build-owned-fex-windows.py output; stage the pinned Darwin FEX x64 emulator")
+    stage_parser.add_argument("--wine-display-build", type=Path, help="selected Wine build of the pinned toolchains/wine-game-display clone; stage updated builtin dcomp.dll only, paired with WoW64 when selected")
     stage_parser.add_argument("--with-nvngx", action="store_true", help="require and stage owned nvngx.dll only if D3D12 exports/marker validate")
-    stage_parser.add_argument("--with-nvapi", action="store_true", help="require and stage owned nvapi64.dll only if its QueryInterface export validates")
-    stage_parser.add_argument("--with-fsr", action="store_true", help="require and stage owned x64 MetalFX FSR upscaling and frame-generation DLLs, each with builtin marker and five C ABI exports/ordinals")
+    stage_parser.add_argument("--with-nvapi", action="store_true", help="require owned nvapi64.dll for the selected Windows ABI and nvapi.dll when staging WoW64, each with QueryInterface ordinal 2")
+    stage_parser.add_argument("--with-fsr", action="store_true", help="require owned MetalFX FSR upscaling and frame-generation DLLs matching the selected Windows ABI and WoW64 when selected, each with builtin marker and five C ABI exports/ordinals")
     verify_parser = subparsers.add_parser("verify", help="verify hashes, launcher policy and Mach-O dependencies")
     verify_parser.add_argument("--runtime", required=True, type=Path)
     args = parser.parse_args()
@@ -911,14 +1289,15 @@ def main() -> int:
             for problem in problems:
                 print(f"FAIL: {problem}")
             return 1
-        print(f"PASS: {runtime} matches {MANIFEST}; owned builtin load policy and winemetal dependencies are intact")
+        print(f"PASS: {runtime} matches {MANIFEST}; owned module load policy and winemetal dependencies are intact")
         return 0
 
     dxmt_install = args.dxmt_install.expanduser().resolve()
     wine_source = args.wine_source.expanduser().resolve()
     dest = args.wine_dest.expanduser().absolute()
     dxmt_install32 = args.dxmt_install32.expanduser().resolve() if args.dxmt_install32 else None
-    stage(dxmt_install, wine_source, dest, args.with_nvngx, args.with_nvapi, dxmt_install32, args.native_arch, args.windows_abi, with_fsr=args.with_fsr)
+    wine_display_build = args.wine_display_build.expanduser().absolute() if args.wine_display_build else None
+    stage(dxmt_install, wine_source, dest, args.with_nvngx, args.with_nvapi, dxmt_install32, args.native_arch, args.windows_abi, with_fsr=args.with_fsr, wine_display_build=wine_display_build, fex_build=args.fex_build.resolve() if args.fex_build else None)
     print(f"PRIVATE owned-graphics runtime staged: {dest}")
     print("Use it only with an explicit isolated WINEPREFIX; the wrapper forces owned builtin graphics modules.")
     print(f"Verify later with: {Path(__file__).name} verify --runtime {dest}")

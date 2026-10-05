@@ -1,18 +1,76 @@
 #include "d3d12_device.hpp"
 #include "d3d12_pipeline_cache.hpp"
+#include "d3d12_shader_cache.hpp"
 #include "../d3d10/d3d10_blob.hpp"
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <condition_variable>
+#include <mutex>
+#include <unordered_map>
 
 namespace dxmt {
+
+// Bytes are never exposed to the application: GetBlob returns a separate writable copy.
+struct PipelineCacheStorage {
+  Com<ID3DBlob> bytes;
+  std::array<SM50_COMPILED_BITCODE, PipelineCache::StageCount> views{};
+};
+
+struct AutomaticPipelineCacheFlight {
+  Sha1Digest key;
+  uint64_t generation;
+  std::condition_variable ready;
+  bool done = false;
+  bool disk_hit = false;
+  HRESULT result = E_ABORT;
+  std::shared_ptr<const PipelineCacheStorage> blob;
+};
+
 namespace {
 
 constexpr uint64_t kMagic = 0x004f5350544d5844; // "DXMTPSO\0", little endian.
 // 2: graphics key covers the stream-output declaration. 3: it covers GS/HS/DS bytecode.
 // 4: P3 hidden-resource/signature AIR ABI changed even for unchanged shader/PSO inputs.
 // Serialized pipeline libraries validate this revision for every embedded PSO blob.
-constexpr uint32_t kVersion = 4;
+// 5: atomic phase context relocations and bounded captured application variants.
+constexpr uint32_t kVersion = 5;
+constexpr size_t kAutomaticBytes = 64u * 1024u * 1024u;
+constexpr size_t kAutomaticEntries = 512;
+
+struct AutomaticCache {
+  struct Entry {
+    std::shared_ptr<const PipelineCacheStorage> blob;
+    uint64_t last_use;
+  };
+  std::mutex mutex;
+  bool enabled = true;
+  uint64_t generation = 0, clock = 0;
+  size_t bytes = 0;
+  std::unordered_map<Sha1Digest, Entry> entries;
+  std::unordered_map<Sha1Digest, std::shared_ptr<AutomaticPipelineCacheFlight>> flights;
+
+  void Retain(const Sha1Digest &key, const std::shared_ptr<const PipelineCacheStorage> &blob) {
+    const size_t size = blob->bytes->GetBufferSize();
+    if (size > kAutomaticBytes)
+      return;
+    // ponytail: bounded 512-entry LRU scan; use a list only if eviction CPU becomes material.
+    while (!entries.empty() && (bytes > kAutomaticBytes - size || entries.size() >= kAutomaticEntries)) {
+      auto oldest = std::min_element(entries.begin(), entries.end(), [](const auto &a, const auto &b) {
+        return a.second.last_use < b.second.last_use;
+      });
+      bytes -= oldest->second.blob->bytes->GetBufferSize();
+      entries.erase(oldest);
+    }
+    entries.emplace(key, Entry{blob, ++clock});
+    bytes += size;
+  }
+};
+
+AutomaticCache &Automatic() {
+  static AutomaticCache cache; // Module-local, no device or native PSO ownership.
+  return cache;
+}
 
 struct StageRecord {
   uint64_t library_size;
@@ -96,6 +154,32 @@ bool Layout(const CacheHeader &header, size_t limit,
   return true;
 }
 
+std::shared_ptr<const PipelineCacheStorage> ShareBlob(ID3DBlob *blob) {
+  CacheHeader header;
+  memcpy(&header, blob->GetBufferPointer(), sizeof(header));
+  std::array<StageOffsets, PipelineCache::StageCount> offsets{};
+  size_t size = 0;
+  if (!Layout(header, blob->GetBufferSize(), offsets, size))
+    return {};
+  auto storage = std::make_shared<PipelineCacheStorage>();
+  storage->bytes = blob;
+  auto *bytes = static_cast<uint8_t *>(blob->GetBufferPointer());
+  for (uint32_t i = 0; i < PipelineCache::StageCount; ++i) {
+    if (!(header.stages & (1u << i)))
+      continue;
+    const auto &record = header.records[i];
+    auto &view = storage->views[i];
+    view.Data = bytes + offsets[i].library;
+    view.Size = record.library_size;
+    view.ConstantData = record.constant_size ? bytes + offsets[i].constants : nullptr;
+    view.ConstantDataSize = record.constant_size;
+    view.ConstantDataAlignment = record.constant_alignment;
+    view.ConstantRelocations = record.relocation_count ? bytes + offsets[i].relocations : nullptr;
+    view.ConstantRelocationCount = record.relocation_count;
+  }
+  return storage;
+}
+
 class KeyBuilder {
   Sha1HashState hash_;
   bool valid_ = true;
@@ -129,7 +213,7 @@ public:
 
 HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Digest &key) {
   KeyBuilder hash;
-  hash.add(uint32_t(2), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  hash.add(uint32_t(3), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.CS);
   return hash.finish(key);
@@ -141,8 +225,8 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
     return E_INVALIDARG;
   KeyBuilder hash;
   // 6: Metal 4 compiles UINT logic operations into every owned framebuffer-fetch
-  // epilogue. Serialized AIR/constant-relocation blob layout is unchanged.
-  hash.add(uint32_t(6), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  // 7: device atomic64 phase selection changes every participating application stage.
+  hash.add(uint32_t(7), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.VS);
   hash.shader(desc.PS);
@@ -173,6 +257,7 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
     hash.add(face->StencilFailOp, face->StencilDepthFailOp, face->StencilPassOp, face->StencilFunc);
   // Stream-only state (fractional depth bias, back-face stencil masks); absent for classic descs.
   if (extras && !extras->empty()) {
+    if (extras->depth_bounds) hash.add(uint32_t(0x44424e44));
     hash.add(uint32_t(0x45585452), bool(extras->depth_bias), extras->depth_bias.value_or(0.0f),
              bool(extras->back_stencil_read_write_mask));
     if (extras->back_stencil_read_write_mask)
@@ -237,16 +322,221 @@ HRESULT PipelineCacheBlobKey(const void *data, size_t size, Sha1Digest &key) {
   return S_OK;
 }
 
+PipelineCache::~PipelineCache() {
+  Complete(E_ABORT);
+}
+
+void PipelineCache::Complete(HRESULT result) noexcept {
+  auto flight = std::move(flight_);
+  if (!flight)
+    return;
+  auto &cache = Automatic();
+  {
+    std::lock_guard lock(cache.mutex);
+    if (flight->done)
+      return;
+  }
+  // Optional serialization is outside the map lock; it cannot fail PSO creation.
+  if (SUCCEEDED(result) && !blob_) {
+    try {
+      Com<ID3DBlob> serialized;
+      // Oversized results may be shared by live flight/PSO owners, but are never
+      // retained as completed cache entries or written to disk.
+      if (SUCCEEDED(GetBlob(&serialized))) {
+        blob_ = ShareBlob(serialized.ptr());
+        if (blob_) {
+          // Native functions and immutable GPU constants already consumed these bytes.
+          // DispatchData_alloc_init copies input via dispatch_data_create(..., NULL, NULL).
+          for (auto &compiled : compiled_) {
+            if (sm50_bitcode_t handle = compiled) {
+              SM50DestroyBitcode(handle);
+              *&compiled = nullptr;
+            }
+          }
+        }
+      }
+    } catch (...) {
+      // Cache allocation is optional; joined requests must still terminate.
+    }
+  }
+  std::lock_guard lock(cache.mutex);
+  if (flight->done)
+    return;
+  // Controls invalidate cache membership, not valid in-progress PSO creations.
+  // Old-generation waiters still consume their producer's actual result/bytes.
+  if (SUCCEEDED(result))
+    flight->blob = blob_;
+  const bool current = cache.enabled && cache.generation == flight->generation;
+  if (current) {
+    if (SUCCEEDED(result) && blob_) {
+      try {
+        cache.Retain(flight->key, blob_);
+        if (!flight->disk_hit && blob_->bytes->GetBufferSize() <= kAutomaticBytes)
+          WriteAutomaticPipelineCache(flight->key, blob_->bytes.ptr());
+      } catch (...) {
+        // Retention/disk failure does not change the native PSO result.
+      }
+    }
+    cache.flights.erase(flight->key);
+  }
+  flight->result = result;
+  flight->done = true;
+  flight->ready.notify_all();
+  try {
+    if (owned_graphics::TraceEnabled())
+      owned_graphics::Trace(FAILED(result) ? "pipeline_cache_auto_failure" :
+                            !current ? "pipeline_cache_auto_retired_complete" :
+                            flight->disk_hit ? "pipeline_cache_auto_restore_complete" : "pipeline_cache_auto_publish",
+                            ",\"key\":\"", flight->key.string(), "\",\"hr\":", uint32_t(result),
+                            ",\"bytes\":", uint64_t(flight->blob ? flight->blob->bytes->GetBufferSize() : 0));
+  } catch (...) {
+    // Tracing must not escape completion/destruction.
+  }
+}
+
+void PipelineCache::RetryAutomatic(PipelineCache &fresh) {
+  auto &cache = Automatic();
+  std::lock_guard lock(cache.mutex);
+  fresh.retry_ = true;
+  if (flight_) {
+    fresh.flight_ = std::move(flight_);
+    fresh.flight_->disk_hit = false;
+    fresh.bypass_automatic_ = true; // Keep old-generation waiters through cold retry too.
+  }
+  if (cache.generation != automatic_generation_ || !cache.enabled) {
+    fresh.bypass_automatic_ = true;
+    return;
+  }
+  // A racing retry may already have installed a different, good result. Never
+  // delete its disk entry or flight on behalf of this old restored owner.
+  auto it = cache.entries.find(automatic_key_);
+  if (it == cache.entries.end() || it->second.blob == blob_) {
+    if (it != cache.entries.end()) {
+      cache.bytes -= it->second.blob->bytes->GetBufferSize();
+      cache.entries.erase(it);
+    }
+    RemoveAutomaticPipelineCache(automatic_key_);
+  }
+  if (owned_graphics::TraceEnabled())
+    owned_graphics::Trace("pipeline_cache_auto_retry", ",\"key\":\"", automatic_key_.string(), "\"");
+}
+
+HRESULT AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAGS control) {
+  const auto flags = static_cast<UINT>(control);
+  constexpr UINT disable = D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE;
+  constexpr UINT enable = D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE;
+  constexpr UINT clear = D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR;
+  if (!flags || (flags & ~(disable | enable | clear)) || ((flags & disable) && (flags & enable)))
+    return E_INVALIDARG;
+  auto &cache = Automatic();
+  std::lock_guard lock(cache.mutex);
+  if (flags & (disable | clear)) {
+    ++cache.generation;
+    // Owners/waiters retain old flights until actual completion. New requests
+    // cannot join them, and generation prevents their memory/disk publication.
+    cache.flights.clear();
+  }
+  if (flags & clear) {
+    cache.entries.clear();
+    cache.bytes = 0;
+  }
+  if (flags & disable)
+    cache.enabled = false;
+  if (flags & enable)
+    cache.enabled = true;
+  const HRESULT hr = (flags & clear) ? ClearAutomaticPipelineCacheDisk() : S_OK;
+  owned_graphics::Trace("pipeline_cache_auto_control", ",\"flags\":", flags,
+                        ",\"generation\":", cache.generation, ",\"hr\":", uint32_t(hr));
+  return hr;
+}
+
 HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, const Sha1Digest &key,
                                   uint32_t stages, uint64_t adapter) {
   key_ = key;
   stages_ = stages;
   adapter_ = adapter;
-  if (!cached.CachedBlobSizeInBytes) {
-    // A cold PSO compiles every stage; a restored one (below) compiles none.
+  if (cached.CachedBlobSizeInBytes)
+    return LoadBlob(cached); // Explicit CachedPSO is strict and always takes precedence.
+  if (bypass_automatic_) {
     owned_graphics::Trace("pipeline_cache_cold", ",\"stages\":", stages);
     return S_OK;
   }
+  const auto &identity = Identity();
+  if (stages && identity.valid) {
+    Sha1HashState hash;
+    hash.update(key).update(stages).update(adapter).update(identity.value).update(kVersion);
+    const auto automatic_key = hash.final();
+    auto &cache = Automatic();
+    try {
+      std::unique_lock lock(cache.mutex);
+      automatic_key_ = automatic_key;
+      automatic_generation_ = cache.generation;
+      if (cache.enabled) {
+        if (auto it = cache.entries.find(automatic_key); it != cache.entries.end()) {
+          it->second.last_use = ++cache.clock;
+          blob_ = it->second.blob;
+          automatic_loaded_ = true;
+          if (owned_graphics::TraceEnabled())
+            owned_graphics::Trace("pipeline_cache_auto_hit", ",\"key\":\"", automatic_key.string(),
+                                  "\",\"source\":\"memory\",\"stages\":", stages);
+          return S_OK;
+        }
+        if (auto it = cache.flights.find(automatic_key); it != cache.flights.end()) {
+          auto flight = it->second;
+          if (owned_graphics::TraceEnabled())
+            owned_graphics::Trace("pipeline_cache_auto_wait", ",\"key\":\"", automatic_key.string(),
+                                  "\",\"stages\":", stages);
+          flight->ready.wait(lock, [&] { return flight->done; });
+          if (FAILED(flight->result))
+            return flight->result;
+          blob_ = flight->blob;
+          automatic_loaded_ = bool(blob_);
+          return S_OK;
+        }
+        auto flight = std::make_shared<AutomaticPipelineCacheFlight>();
+        flight->key = automatic_key;
+        flight->generation = cache.generation;
+        cache.flights.emplace(automatic_key, flight);
+        flight_ = std::move(flight);
+        // ponytail: serialize disk I/O with metadata/clear for epochs; split disk locks if I/O contention matters.
+        // Native compilation and PSO creation are always outside this lock.
+        Com<ID3DBlob> disk;
+        const HRESULT disk_hr = ReadAutomaticPipelineCache(automatic_key, &disk);
+        if (disk_hr == E_FAIL) {
+          // Read rejected a malformed zero/oversized file before blob validation.
+          RemoveAutomaticPipelineCache(automatic_key);
+          owned_graphics::Trace("pipeline_cache_auto_invalid", ",\"hr\":", uint32_t(disk_hr));
+        }
+        if (SUCCEEDED(disk_hr) && disk) {
+          D3D12_CACHED_PIPELINE_STATE input{disk->GetBufferPointer(), disk->GetBufferSize()};
+          const HRESULT hr = LoadBlob(input, disk.ptr());
+          if (SUCCEEDED(hr)) {
+            automatic_loaded_ = true;
+            flight_->disk_hit = true;
+            if (owned_graphics::TraceEnabled())
+              owned_graphics::Trace("pipeline_cache_auto_hit", ",\"key\":\"", automatic_key.string(),
+                                    "\",\"source\":\"disk\",\"stages\":", stages);
+            return S_OK;
+          }
+          RemoveAutomaticPipelineCache(automatic_key);
+          owned_graphics::Trace("pipeline_cache_auto_invalid", ",\"hr\":", uint32_t(hr));
+        }
+        if (owned_graphics::TraceEnabled())
+          owned_graphics::Trace("pipeline_cache_auto_begin", ",\"key\":\"", automatic_key.string(),
+                                "\",\"stages\":", stages);
+      } else if (owned_graphics::TraceEnabled()) {
+        owned_graphics::Trace("pipeline_cache_auto_bypass", ",\"key\":\"", automatic_key.string(),
+                              "\",\"reason\":\"disabled\"");
+      }
+    } catch (const std::bad_alloc &) {
+      // Cache allocation is optional; the owner still completes any registered flight.
+    }
+  }
+  owned_graphics::Trace("pipeline_cache_cold", ",\"stages\":", stages);
+  return S_OK;
+}
+
+HRESULT PipelineCache::LoadBlob(const D3D12_CACHED_PIPELINE_STATE &cached, ID3DBlob *owned) {
   if (!cached.pCachedBlob || cached.CachedBlobSizeInBytes < sizeof(CacheHeader))
     return E_INVALIDARG;
   CacheHeader header;
@@ -255,14 +545,14 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
     return E_INVALIDARG;
   if (header.version != kVersion)
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
-  if (header.size != cached.CachedBlobSizeInBytes || header.stages != stages || header.key != key)
+  if (header.size != cached.CachedBlobSizeInBytes || header.stages != stages_ || header.key != key_)
     return E_INVALIDARG;
   std::array<StageOffsets, StageCount> offsets{};
   size_t size = 0;
   if (!Layout(header, cached.CachedBlobSizeInBytes, offsets, size) || size != header.size ||
       BlobDigest(cached.pCachedBlob, size) != header.digest)
     return E_INVALIDARG;
-  if (header.adapter != adapter)
+  if (header.adapter != adapter_)
     return D3D12_ERROR_ADAPTER_NOT_FOUND;
   const auto &identity = Identity();
   if (!identity.valid)
@@ -271,7 +561,7 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
   const auto *input = static_cast<const uint8_t *>(cached.pCachedBlob);
   for (uint32_t i = 0; i < StageCount; ++i) {
-    if (!(stages & (1u << i)))
+    if (!(stages_ & (1u << i)))
       continue;
     const auto &record = header.records[i];
     if (memcmp(input + offsets[i].library, "MTLB", 4))
@@ -281,29 +571,24 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
       memcpy(&relocation, input + offsets[i].relocations + j * sizeof(relocation), sizeof(relocation));
       if (relocation.Offset > record.constant_size - sizeof(uint64_t) ||
           (relocation.TargetOffset > record.constant_size &&
-           relocation.TargetOffset != SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE))
+           relocation.TargetOffset != SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE &&
+           relocation.TargetOffset != SM50_CONSTANT_RELOCATION_TARGET_ATOMIC64_CONTEXT))
         return E_INVALIDARG;
     }
   }
   try {
-    blob_.assign(input, input + size);
+    Com<ID3DBlob> copy;
+    if (!owned) {
+      if (HRESULT hr = CreateBlobFromMalloc(size, &copy); FAILED(hr))
+        return hr;
+      memcpy(copy->GetBufferPointer(), input, size);
+      owned = copy.ptr();
+    }
+    blob_ = ShareBlob(owned);
   } catch (const std::bad_alloc &) {
     return E_OUTOFMEMORY;
   }
-  for (uint32_t i = 0; i < StageCount; ++i) {
-    if (!(stages & (1u << i)))
-      continue;
-    const auto &record = header.records[i];
-    auto &view = views_[i];
-    view.Data = blob_.data() + offsets[i].library;
-    view.Size = record.library_size;
-    view.ConstantData = record.constant_size ? blob_.data() + offsets[i].constants : nullptr;
-    view.ConstantDataSize = record.constant_size;
-    view.ConstantDataAlignment = record.constant_alignment;
-    view.ConstantRelocations = record.relocation_count ? blob_.data() + offsets[i].relocations : nullptr;
-    view.ConstantRelocationCount = record.relocation_count;
-  }
-  owned_graphics::Trace("pipeline_cache_restore", ",\"stages\":", stages, ",\"bytes\":", uint64_t(size));
+  owned_graphics::Trace("pipeline_cache_restore", ",\"stages\":", stages_, ",\"bytes\":", uint64_t(size));
   return S_OK;
 }
 
@@ -313,7 +598,7 @@ sm50_bitcode_t PipelineCache::bitcode(Stage stage) {
 
 SM50_COMPILED_BITCODE PipelineCache::view(Stage stage) {
   if (loaded())
-    return views_[stage];
+    return blob_->views[stage];
   SM50_COMPILED_BITCODE result{};
   if (sm50_bitcode_t bitcode = compiled_[stage])
     SM50GetCompiledBitcode(bitcode, &result);
@@ -326,10 +611,11 @@ HRESULT PipelineCache::GetBlob(ID3DBlob **blob) {
   *blob = nullptr;
   try {
     if (loaded()) {
-      const HRESULT hr = CreateBlobFromMalloc(blob_.size(), blob);
+      const auto size = blob_->bytes->GetBufferSize();
+      const HRESULT hr = CreateBlobFromMalloc(size, blob);
       if (FAILED(hr))
         return hr;
-      memcpy((*blob)->GetBufferPointer(), blob_.data(), blob_.size());
+      memcpy((*blob)->GetBufferPointer(), blob_->bytes->GetBufferPointer(), size);
       return S_OK;
     }
     const auto &identity = Identity();

@@ -742,6 +742,8 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
     initializeModule(*fresh_module);
     module = fresh_module.get();
   }
+  // Resource lowering in every linked body uses this per-compilation target module.
+  InitializeAtomic64Phase(*module, args);
   // Reserve the wrapper name before creating it, but retain stage-local modules
   // until their bodies lower: resources from another stage must not be visited
   // with this stage's binding map.
@@ -813,6 +815,8 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
     if (auto error = msaa::transformMesh(*module, *msaa_mesh, conservative != nullptr))
       return std::move(error);
 
+  if (auto error = LowerAtomic64Phase(*module))
+    return std::move(error);
   runOptimizationPasses(*module);
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (auto error = LowerImmutableConstants(*module, *compiled))

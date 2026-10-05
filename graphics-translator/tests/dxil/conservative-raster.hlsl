@@ -1,9 +1,9 @@
-// Conservative rasterization suite (owned-d3d12-conservative-raster.cpp). The fixture compiles this file to DXBC
-// with D3DCompile (every stage but ps_main: vkd3d has no SV_Coverage input, so the DXBC paths use the DXIL PS) and
-// loads the DXC 1.9 DXIL frozen by build-conservative-raster.sh as
-// conservative-raster-<entry>.dxil.
+// Public Tier3 proof: DXC 1.9.2609.5 ps_6_0 and native Microsoft FXC ps_5_1,
+// frozen by build-conservative-raster.sh. Exact producer commands/hashes and retained
+// shader provenance: conservative-raster-provenance.json. The legacy DXBC geometry
+// is compiled by D3DCompile with CONSERVATIVE_LEGACY; Tier3 PS DXBC is always genuine FXC.
 StructuredBuffer<float4> vertices : register(t0);
-// One record per pixel of the 32x32 target: invocations, SV_Coverage (OR), SV_Position.z, 0.
+// Four dwords: invocations, coverage (or interpolated attribute), depth, InnerCoverage.
 RWStructuredBuffer<uint4> pixels : register(u0);
 
 struct V {
@@ -26,6 +26,43 @@ float4 ps_main(V v, uint coverage : SV_Coverage) : SV_Target {
   pixels[index].z = asuint(v.position.z);
   return float4(1, v.value, 0, 1);
 }
+
+// Separate entry points: SV_Coverage and SV_InnerCoverage are mutually exclusive.
+#ifndef CONSERVATIVE_LEGACY
+float4 ps_inner(V v, uint inner : SV_InnerCoverage, bool front : SV_IsFrontFace) : SV_Target {
+  uint index = uint(v.position.y) * 32 + uint(v.position.x);
+  InterlockedAdd(pixels[index].x, 1);
+  pixels[index].y = asuint(v.value + (front ? 16 : 0));
+  pixels[index].z = asuint(v.position.z);
+  pixels[index].w = inner;
+  return float4(1, v.value, 0, 1);
+}
+
+[earlydepthstencil]
+float4 ps_inner_early(V v, uint inner : SV_InnerCoverage, bool front : SV_IsFrontFace) : SV_Target {
+  return ps_inner(v, inner, front);
+}
+
+float4 ps_inner_late(V v, uint inner : SV_InnerCoverage, bool front : SV_IsFrontFace, out float depth_out : SV_Depth) : SV_Target {
+  depth_out = 0.25; // No depth extrapolation ambiguity; depth tests must run after UAV writes.
+  return ps_inner(v, inner, front);
+}
+
+float4 ps_helper(V v, uint inner : SV_InnerCoverage) : SV_Target {
+  uint index = uint(v.position.y) * 32 + uint(v.position.x);
+  float covered = float(inner & 1);
+  InterlockedAdd(pixels[index].x, 1);
+  pixels[index].z = asuint(v.position.z);
+  pixels[index].w = asuint(abs(ddx_fine(covered)) + abs(ddy_fine(covered)));
+  return 1;
+}
+
+#ifdef CONSERVATIVE_INVALID_INPUT
+float4 ps_invalid(V v, uint coverage : SV_Coverage, uint inner : SV_InnerCoverage) : SV_Target {
+  return float4(coverage, inner, v.value, 1);
+}
+#endif
+#endif
 
 [maxvertexcount(3)]
 void gs_main(triangle V input[3], inout TriangleStream<V> output) {
@@ -92,10 +129,19 @@ void ms_as(in payload MeshPayload payload_data, out vertices V output_vertices[3
 #endif
 
 // Reads every sample of the 4x depth target into depths[(y * 32 + x) * 4 + sample].
-Texture2DMS<float> depth : register(t1);
 RWStructuredBuffer<float> depths : register(u1);
+#ifdef CONSERVATIVE_STENCIL_READER
+Texture2DMS<uint2> stencil : register(t1);
+[numthreads(8, 8, 1)]
+void cs_stencil(uint3 id : SV_DispatchThreadID) {
+  for (uint s = 0; s < 4; s++)
+    depths[(id.y * 32 + id.x) * 4 + s] = stencil.Load(id.xy, s).y;
+}
+#else
+Texture2DMS<float> depth : register(t1);
 [numthreads(8, 8, 1)]
 void cs_depth(uint3 id : SV_DispatchThreadID) {
   for (uint s = 0; s < 4; s++)
     depths[(id.y * 32 + id.x) * 4 + s] = depth.Load(id.xy, s);
 }
+#endif

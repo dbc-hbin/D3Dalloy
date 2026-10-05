@@ -34,15 +34,75 @@
  *
  * Sampler descriptor q2 = lod bias (low 32, f32) | flags << 32, q3 = MinLOD | MaxLOD << 32 (f32):
  *   flags bits 0-2 AddressU, 3-5 AddressV (D3D12_TEXTURE_ADDRESS_MODE), 6 min linear,
- *   7 mag linear, 8 mip linear, 9 anisotropic, 10-14 MaxAnisotropy, 31 valid.
+ *   7 mag linear, 8 mip linear, 9 anisotropic, 10-14 MaxAnisotropy, 15 non-normalized,
+ *   16 UINT border, 17-19 AddressW, 20-21 reduction, 22-25 comparison function, 31 valid.
+ * q4/q5 retain the exact uint4 border; q6/q7 retain float4 border bits (64-byte sampler stride).
  */
 
 #include "d3d12.h"
+#include "d3d12_resource_contract.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstdint>
 
 namespace dxmt::sampler_feedback {
+
+/* VulkanOn12 / DDI 0100: W and bias are unrestricted; sampled views are single-mip 1D/2D. */
+template <typename DESC>
+bool ValidNonNormalizedSampler(const DESC &desc) {
+  const UINT filter = UINT(desc.Filter);
+  const UINT reduction = D3D12_DECODE_FILTER_REDUCTION(desc.Filter);
+  const auto address = [](D3D12_TEXTURE_ADDRESS_MODE mode) {
+    return mode == D3D12_TEXTURE_ADDRESS_MODE_CLAMP || mode == D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+  };
+  return !(filter & ~0x194u) && reduction != D3D12_FILTER_REDUCTION_TYPE_COMPARISON &&
+         D3D12_DECODE_MIN_FILTER(desc.Filter) == D3D12_DECODE_MAG_FILTER(desc.Filter) &&
+         desc.MinLOD == 0.0f && desc.MaxLOD == 0.0f && address(desc.AddressU) && address(desc.AddressV);
+}
+
+/* SRV q3 low4: empty-view ones; bits8..31: four 6-bit integer widths (0 means32). */
+inline uint32_t EmptyViewDefaults(DXGI_FORMAT format, UINT mapping) {
+  using resource_contract::FormatFamily;
+  uint32_t defaults = 0;
+  switch (resource_contract::GetFormatFamily(format)) {
+  case FormatFamily::R32G32B32: case FormatFamily::R32G32: case FormatFamily::R32G8X24:
+  case FormatFamily::R16G16: case FormatFamily::R32: case FormatFamily::R24G8:
+  case FormatFamily::R8G8: case FormatFamily::R16: case FormatFamily::R8:
+  case FormatFamily::B8G8R8X8: case FormatFamily::BC4: case FormatFamily::BC5: case FormatFamily::BC6H:
+    defaults = 8;
+    break;
+  default:
+    if (format == DXGI_FORMAT_R11G11B10_FLOAT || format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
+        format == DXGI_FORMAT_R1_UNORM || format == DXGI_FORMAT_B5G6R5_UNORM ||
+        format == DXGI_FORMAT_R8G8_B8G8_UNORM || format == DXGI_FORMAT_G8R8_G8B8_UNORM)
+      defaults = 8;
+    break;
+  }
+  uint32_t widths[4] = {};
+  switch (resource_contract::GetFormatFamily(format)) {
+  case FormatFamily::R8: widths[0] = 8; break;
+  case FormatFamily::R8G8: widths[0] = widths[1] = 8; break;
+  case FormatFamily::R8G8B8A8: widths[0] = widths[1] = widths[2] = widths[3] = 8; break;
+  case FormatFamily::R16: widths[0] = 16; break;
+  case FormatFamily::R16G16: widths[0] = widths[1] = 16; break;
+  case FormatFamily::R16G16B16A16: widths[0] = widths[1] = widths[2] = widths[3] = 16; break;
+  default: break;
+  }
+  if (format == DXGI_FORMAT_R10G10B10A2_UINT) {
+    widths[0] = widths[1] = widths[2] = 10;
+    widths[3] = 2;
+  }
+  if (format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT)
+    widths[0] = widths[1] = 8;
+  uint32_t result = 0;
+  for (unsigned channel = 0; channel < 4; ++channel) {
+    const unsigned selector = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(channel, mapping);
+    if (selector == 5 || (selector < 4 && (defaults & (1u << selector))))
+      result |= 1u << channel;
+    result |= widths[channel] << (8 + channel * 6);
+  }
+  return result;
+}
 
 /* DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE / _MIP_REGION_USED_OPAQUE (absent from the mingw headers). */
 inline constexpr DXGI_FORMAT kMinMipOpaque = DXGI_FORMAT(189);
@@ -120,11 +180,15 @@ MakeLayout(const D3D12_RESOURCE_DESC1 &desc, Layout &out) {
 
 /* Sampler descriptor flags (q2 high 32 bits). */
 inline uint32_t
-SamplerFlags(D3D12_FILTER filter, D3D12_TEXTURE_ADDRESS_MODE u, D3D12_TEXTURE_ADDRESS_MODE v, UINT max_anisotropy) {
+SamplerFlags(D3D12_FILTER filter, D3D12_TEXTURE_ADDRESS_MODE u, D3D12_TEXTURE_ADDRESS_MODE v, UINT max_anisotropy,
+             bool non_normalized = false, D3D12_TEXTURE_ADDRESS_MODE w = D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+             bool uint_border = false, D3D12_COMPARISON_FUNC comparison = D3D12_COMPARISON_FUNC_NEVER) {
   const bool anisotropic = D3D12_DECODE_IS_ANISOTROPIC_FILTER(filter);
   return (uint32_t(u) & 7u) | (uint32_t(v) & 7u) << 3 | uint32_t(D3D12_DECODE_MIN_FILTER(filter) != 0) << 6 |
          uint32_t(D3D12_DECODE_MAG_FILTER(filter) != 0) << 7 | uint32_t(D3D12_DECODE_MIP_FILTER(filter) != 0) << 8 |
-         uint32_t(anisotropic) << 9 | (anisotropic ? std::clamp(max_anisotropy, 1u, 16u) : 1u) << 10 | 1u << 31;
+         uint32_t(anisotropic) << 9 | (anisotropic ? std::clamp(max_anisotropy, 1u, 16u) : 1u) << 10 |
+         uint32_t(non_normalized) << 15 | uint32_t(uint_border) << 16 | (uint32_t(w) & 7u) << 17 |
+         uint32_t(D3D12_DECODE_FILTER_REDUCTION(filter)) << 20 | (uint32_t(comparison) & 15u) << 22 | 1u << 31;
 }
 
 inline uint64_t

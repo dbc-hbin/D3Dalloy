@@ -1,12 +1,427 @@
-> 현재 실행 순서와 P0 완료 기준은 [구현 우선순위](IMPLEMENTATION-PRIORITIES.ko.md)를 따른다. 아래 지원 상태·과거 증거와 작업 순서를 구분한다.
+> 현재 실행 순서·미완료 작업은 [구현 우선순위](IMPLEMENTATION-PRIORITIES.ko.md), 날짜별 관찰은 [구현 이력](IMPLEMENTATION-HISTORY.ko.md)을 따른다. 과거 완료한 P0–P3 개발 단계와 새 backlog P0–P4를 구분한다.
 
-# D3D12 렌더링 코어 소스 구현 상태
+# D3D12 번역기 현재 구현 상태
 
-> 2026-10-02 후속 P0의 현재 계약과 실행 증거는 아래 절이 기준이다. 이 커밋은 검증된 Metal4FX/SR·FG 및 budget notification 필수 선행 구현을 포함한다. 이후 본문은 앞선 개발 단계의 상태·증거를 보존한 기록이며 이번 P0/P1 작업 번호와 구분한다.
+**기준일: 2026-10-05.** 이 문서는 현재 지원 선언, 남은 구현 후보, 검증 경계를 관리하는 단일 기준이다. 상세 계약·실패→수정·실행 ledger는 [구현·검증 이력](IMPLEMENTATION-HISTORY.ko.md)으로 분리했다. 루트 `src/`의 현재 내용이 구현 판단의 기준이며, 설치본·staged runtime·과거 문서와 동일하다고 가정하지 않는다.
+
+## 최신 병렬 재개 결과 — 2026-10-05
+
+**산출물 정리·목록 통합:** 사용자 지시로 disposable prefix 148개와 obsolete runtime 37개의 bin/lib/share를 제거했다. Build 247.4→57.5 GiB, available 68.5→258.8 GiB다. 현재 build/install·ARM64 기반·frozen 입력·증거와 runtime044/비교 runtime034를 보존했다. 보호 파일50개 hash 불변·259 삭제 대상 부재·보존 runtime 두 개 stage verify PASS를 확인했다. 과거 runtime의 manifest/provenance만 남은 경로는 fresh restaging 없이 실행할 수 없다. [현재 잔여 구현·조건부·검증·기능 뒤 최적화 목록](IMPLEMENTATION-PRIORITIES.ko.md#현재-남은-구현-목록--2026-10-05-정리)이 통합 기준이며 cleanup을 기능 acceptance로 세지 않는다.
+
+**DX11 재사용 확인:** DX12의 일반 HDR은 이미 DX11과 같은 Presenter·HDR shader·native EDR 경로를 사용하며 HDR10 metadata 전달도 구현되어 있다. 새로 빌드한 HDR metadata fixture를 runtime044 x64/WoW64에서 각각7frame·API+Shader Validation 오류0으로 통과했고 diagnostics95tests도 PASS했다. DX11 Composition factory는 미지원, DX11 NGX는 SR feature1만 구현하므로 나머지 blocker를 닫을 별도 Composition/RR 구현이 없다. 일반 HDR은 Gaming SSTM/driver mode/readback 구현이 아니다. [소스 경로·증거·검증 한계](../.omo/handoffs/parallel-resume2-20261005.md)를 따르며 production 수정이나 전체 acceptance 완료로 세지 않는다.
+
+**세 번째 재개와 웹 scout 확인:** 핵심 세 기능을 병렬 재개하고 Unity·Unreal 실제 구현의 웹 scout3개를 실행했다. [최신 shader/vendor/source 증거](../.omo/handoffs/parallel-resume2-20261005.md)를 따른다. Production 변경은 없다. Composition은 Advanced Color의 linear scRGB FP16 domain과 Unity UI→HDR/OETF 순서를 확보했으나 Unity UI는 DComposition pixel oracle가 아니다. Pristine GPTK composition factory는 static/native stub 실행에서 unconditional E_NOTIMPL이다. RR은 actual K44/C16·lane31과 generic/same-constant specialized AIR에서8byte K-tail load `[12672,12680)`를 확인했고 independent arithmetic check0이다. Actual framework GPU ISA/hardware transaction proof는 별개다. HDR은 공식 Samsung UE source/guide에서 APP/GPU 소비 경로·peak calibration을 확보했다. ALLM/일반 HDR10+ builders는 Gaming SSTM/Apple driver ABI가 아니다. Mandatory sink ACK와 validation zerofill을 각각 필수 protocol/무해성 proof로 삼지 않는다. 아래 resume2 결과는 과거 cut이다.
+
+사용자의 새 병렬 구현 지시로 이전 중단을 해제했다. [최신 재개 결과와 외부 blocker](../.omo/handoffs/parallel-resume2-20261005.md)를 따른다. Runtime044 재사용으로 alpha 양 ABI13phase·104/104 backing geometry·graphics validation 오류0을 확인했고, 이미 종료된 scoped wineserver의 `-k` exit1을 실패로 세던 QA harness만 수정했다. Production 변경은 없다. Normative absolute alpha-colour는 qualified Windows/transfer oracle 부재로 미완료다. RR은 새 trace와 별도 full-validation 관측으로 MetalFX 내부 `_bufWeights`12672bytes의 argument1/offset0 및 invalid load32회를 확인했으나 native kernel/validation 원인과 public acceptance는 미해결이다. HDR은 실제 IOAV generic InfoFrame transport를 확인했지만 Gaming payload·ACK/readback·exclusive output ownership·calibrated SSTM 계약은 확보하지 못했다. Native transport 전체 부재나 feature 완료로 일반화하지 않는다. CPU diagnostics95tests PASS이며 production delta가 없어 새 build/stage는 하지 않았다. 아래 중단과 runtime043/044 기록은 과거 cut이다.
+
+## 사용자 요청에 따른 작업 중단 — 2026-10-05
+
+**후속 병렬 재개 후 최신 중단:** 사용자가 “문서 업데이트하고 그만 해라. 너무 느리다.”고 요청해 다시 중단했다. 최신 cut은 [runtime044 병렬 실행 중단 handoff](../.omo/handoffs/parallel-implementation-stop-20261005.md)다. 임시 native trace를 제거하고 양 ABI build/install/stage, frozen cadence public12/12, supplemental Sync3 public3/3, mixed scoped6phase pixels/offsets, 일반 smoke 및 composition/present-queues/colorspace 양 ABI 회귀를 확인했다. Native paired time/실제 WindowServer frame 증거와 optical panel/정규 색상 parity는 구분한다. Alpha x64 capture는6/13phase에서 중단했고 WoW64 alpha·normative parity, RR native validation32오류, HDR10+ GAMING native 협상/readback/SSTM는 여전히 미완료다. RR/HDR production 변경은 없다. 아래 runtime043 및 더 이전 기록은 과거 cut으로 보존한다.
+
+**최신 재중단/handoff:** 사용자가 다음 세션의 병렬 구현으로 넘기도록 요청했다. [최신 handoff](../.omo/handoffs/remaining-implementation-20261005.md)를 먼저 읽는다. 마지막 runtime043의 NOW absolute-time 후보는 x64 frozen consumer0·warmup3·critical public12/12·native 오류0을 확인했다. WoW64 cadence·독립 physical timing·alpha-colour·Presenter 회귀는 아직 없어 Composition 전체 완료가 아니다. 기존 아래 snapshot/실패 기록은 보존한다.
+
+아래는 사용자 요청으로 구현·조사·build/GPU/GUI 작업을 중단한 당시의 snapshot이다. 후속 사용자 지시로 작업을 재개했으며 현재 진행은 다음 절을 따른다. 마지막 중단본 `runtime-36-bound-source-tearing-permission`은 양 ABI build/install/stage0이지만 **실제 Composition acceptance FAIL인 동결 candidate**다. 당시 소스·fixture와 원본 실패는 보존한다.
+
+- **선정 FG backend 계약 완료:** genuine N1–4 독립 phase와 양 ABI140 headless checks, x64 Root31 full23 native PASS·WoW64 Root34 full23 native PASS를 mixed-cut proof로 보존한다. Root34 fixed-clock CPU0·strict public consumer 양 ABI0도 완료다. X64 Root34 자체의 N1 seq2 skipped/original runner false와22 positive external times는 그대로 남긴다. `PresentCount`19/UI4는 마지막 positive Present ID이지19개 positive event 합계가 아니다.
+- **NGX count1 facade 지정 proof 완료:** public consumer 양 ABI0·saved native capture의 bootstrap-clock offline recheck 양 ABI PASS다. Original x86 false는 수정하지 않았으며 새 GPU 재실행으로 가장하지 않는다.
+- **Composition 부분 proof/미완료:** Source-only Root33 양 ABI·양 alpha13-phase geometry/lifetime는 완료다. Root34는 warmup3 positive public events 후 critical Sync0 실패, Root35와 Root36은 더 이른 첫 warmup 실패다. Root36의 actual-bound `!allow_tearing` policy는 미검증 후보이며 Sync0 해결로 표시하지 않는다. Mixed Root36 x64는 ordinary-visible만 연속2회 GREEN20480pixels PASS(1/6 phases), 이어 `upper.SetOffsetX(18)`가 E_NOTIMPL로 실패했다. Nonempty FALSE/TRUE root pixels·WoW64 mixed·Windows normative alpha-colour parity·Sync0–4 physical cadence는 미완료다.
+- **그 밖의 경계:** Depth bounds·Conservative Tier3의 기존 지정 양 ABI proof는 유지하되 구형 물리 GPU 실행 proof는 없다. RR native Conv3x3 offset12672/length12672 validation 실패·HDR10+ 실제 EDID의 VSVDB/선행조건 부재는 미해결이다. CoreWindow·Wave64/128·상위 SM/Agility·stereo/overlay·multi-adapter는 entry criteria이며 구현 완료가 아니다. 승인 별도 Wine clone과 frontend/toolchain 경계를 유지하며 WARP/video/D3D11/ARM64FEX 확장은 하지 않았다. 전체 API·실게임 완료 선언이 아니다.
+
+## Composition 재개와 병렬 진단 — 2026-10-05
+
+**Opaque mixed 양 ABI 지정 proof 완료:** 승인 Wine clone의 visual SetOffsetX/Y, 24-byte target-state ABI와 native 위치 전달, FALSE-target z-order를 수정했다. `runtime-038-offset-cadence`의 [x64 6-phase](../build/local/composition-resume-20261005/mixed-offset38-x86_64/actual-stable-phase-evidence.json)와 [WoW64 manual 6-phase/12-capture](../build/local/composition-resume-20261005/mixed-manual38-i686/pixel-verdict.json)가 모두 통과했다. WoW64는 frozen 단계 handshake와 inspector를 직접 실행했고 consumer0·native API/Shader Validation 오류0·staged DLL hash 일치·prefix 정리를 확인했다. Nonempty FALSE/TRUE roots는 BLUE17408/RED3072, offset18x12·root32x24이며 detach 후 새 Present 없이 cached BLUE/original GREEN을 복원했다. Inspector의 2 physical-pixel edge tolerance를 포함한 opaque hue/geometry proof이지 normative Windows alpha-colour parity·scanout cadence·전체 Composition 완료가 아니다.
+
+**Cadence 미완료:** [runtime038 exposed run](../build/local/composition-resume-20261005/cadence-offset38-unoccluded-x86_64/cadence-verdict.json)은 warmup3을 측정했지만 첫 critical Sync0에서 실패했다. [zero-duration timed call039](../build/local/composition-resume-20261005/cadence-offset39-x86_64/cadence-verdict.json)과 [100µs floor040](../build/local/composition-resume-20261005/cadence-floor40-x86_64/cadence-verdict.json)도 같은 실패여서 후보를 기각했다. [별도 controlled run](../build/local/composition-resume-20261005/cadence-sync0-screen38-x86_64/cadence-verdict.json)은 테스트 창을 노출한 뒤 첫 warmup에서 실패하여 Sync0 비교 화면을 제공하지 못했다. 이 원본 FAIL을 성공으로 바꾸지 않는다. `runtime-041-composition-transaction-flush`는 observer/publication trace와 explicit transaction flush 후보의 build/install/stage/verify0까지만 확인했으며 cadence 수용은 진행 중이다. 양 ABI Sync0–4 physical acceptance·alpha-colour parity·일반 Presenter 회귀는 남아 있다.
+
+**분리된 후속 조사:** [RR absent-hit control](../build/local/rr-native-resume-20261005/optional-hit-disabled-20261005/comparison.md)도 동일 Conv3x3Stride1U8 UID·offset12672/length12672 오류32회로 실패했고 matrix sensitivity는7→0이었다. MetalFX 내부 할당이며 guide 제거는 해결책이 아니다. [HDR fresh native/EDID 조사](../build/local/hdr10plus-resume-20261005/findings.md)는 genuine 두 EDID 경로의 SHA 일치·VSVDB0·external preset0/calibration null을 확인했으며 native negotiation/readback/owner/SSTM 구현과 qualified sink proof는 여전히 없다. [조건부 일곱 항목](../build/local/conditional-resume-20261005/findings.md)은 선정 게임 근거에서 새 trigger를 확정하지 못했다는 기록이지 부재·불필요·구현 완료가 아니다. RR·HDR·조건부 증거 디렉터리의 파일 소유권을 분리해 병렬 조사했으며 shared build/GPU/GUI와 공통 문서는 단일 소유자가 관리했다.
+
+**요약:** 기존 backend의 P0–P3 선정 작업과 D3D12 Metal 4 전환의 지정 fixture acceptance는 완료했다. 공개 상한은 **SM 6.5 / FL12_1**이다. 이는 최신 규격 전체 conformance 완료가 아니다. 공개 API의 no-op·명시적 미구현, compiler 의미 누락, 상위 capability, ARM64 Wine/FEX guest 실행 및 성능·실사용 목표가 남아 있다. 2026-10-02 review의 11개 finding은 수정 또는 이미 수정된 것으로 disposition이 끝났으며 현재 열린 결함 목록이 아니다.
+
+**2026-10-04 작업 상태:** 새 P3 **#15–24를 아래 항목별 양 ABI proof로 모두 완료했다. #20은 구형 WaveMMA와 후속 pinned SM6.10 preview matrix 양쪽 모두 포함한다.** 마지막 #15는 paired runtime30의 full-SM6 stress·RT 및 영향 경로20회로 닫았다. 이 선정 계약의 완료를 전체 SM/FL 상향이나 일반 게임 호환성으로 확대하지 않는다. 초기 x64-only proof, FP64 helper 실패 및 당시 #20 보류는 [이전 중간 관찰](IMPLEMENTATION-PRIORITIES.ko.md#2026-10-03-중간-정리)이지 현재 상태가 아니다. P2 #12 depth bounds는 [native/emulation과 forced/native 각각 양 ABI146-case proof](#depth-bounds-완료와-focused-proof)로 완료했다. #13 conservative Tier3도 [cap3 양 ABI public proof·8/8 mixed-cut acceptance](#conservative-tier3-현재-계약과-provisional-proof)로 완료했다. ARM64/FEX 실행 보류는 유지한다.
+
+**새 P4 게임 경로:** OPTIONS13의 6개 선택 계약과 OPTIONS15 triangle fan은 [runtime02 양 ABI 전체 fixture](IMPLEMENTATION-HISTORY.ko.md#새-p4-게임-경로-통합--2026-10-04)로 검증하여 cap을 TRUE로 연결했다. 잘못된 input layout의 실패 출력을 먼저 읽던 PSO 오류 경로도 수정했다. Public alpha·NGX/FSR FG·Reflex·fullscreen/vblank·priority와 아래 Agility의 지정 양 ABI consumer는 통과했다. NGX RR·HDR10+ GAMING·Wine 선행 기능·장치 조건을 포함한 전체 P4 완료는 아니다.
+
+**RR 미해결:** Apple M5 Pro/macOS27.0.1(26A434)의 native 지원 query는1이다. Classic 동기 초기화 YES의 arm64·x86_64, pristine factory 초기화에 맞춘 [classic NO x86_64](../build/local/rr-classic-async-20261004.JXBn3w/validation-verdict.txt), 별도로 새로 빌드·실행한 [Metal4 NO compiler-factory x86_64](../build/local/rr-m4-async-20261004.yycbQA/validation-verdict.txt) 모두 baseline32/replay18회의 같은 framework buffer 범위 밖 읽기로 clean API/Shader Validation을 실패했다. Finite·non-copy 출력, matrix-sensitive7 및 유효한 replay history는 확인했지만 RR 완료가 아니다. 미지원 하드웨어로 분류하거나 SR/fake fallback으로 대체하지 않으며 이번 control 조사로 production 경로를 바꾸지 않았다. 정확한 오류·factory 비교·실행 증거는 [이력의 RR native 통합](IMPLEMENTATION-HISTORY.ko.md#새-p4-게임-경로-통합--2026-10-04)을 따른다.
+
+**HDR10+ GAMING 미해결:** [readonly native 계약 보고서](../build/local/hdr-gaming-20261004-native-readonly/contract-findings.json)와 원본 native/EDID 보고서에서 Samsung S32B80P(CGDisplayID3, SAM29171, serial810300994)의 실제256-byte EDID를 확보했다. 현재 연결은 PQ·정적 HDR(EOTF05)을 광고하지만 HDR10+ VSVDB(0x90848B)는 없다. 이는 모든 firmware/input mode의 하드웨어 미지원 선언이 아니다. 외부 preset0·calibration null, 내부1000-nit HDR Video/host-tone-map-off profile은 Gaming reference mode·저지연 증거가 아니다. Native Gaming 협상/readback, 규범적 transport·calibration·휘도 table·GPU tone-map/conformance, 검증 가능한 sink와 승인된 전환·실제 이전 mode 복원·광학 휘도/지연 proof가 남아 있다. APP SSTM 출력에 EETF를 중복 적용하지 않고 GPU 방식은 실제 규범적 tone map을 요구하며, DXGI72-byte sink metadata와 별도인 **관련 게임 기능의 미완료**로 유지한다.
+
+**게임용 Agility Core618:** Godot의 실제 SDK618 요청을 대상으로 owned `d3d12core.dll`과 SDKConfiguration1/version·EXE-relative path 선택, 독립 factory/configuration/device snapshot, global Set/Apply/Initialize 및 EXE export 선택을 구현했다. [Runtime08 x64](../build/local/p4-resume-20261004-WoVvSo/agility-runtime08-x64/result.json)·[WoW64](../build/local/p4-resume-20261004-WoVvSo/agility-runtime08-x86/result.json)는 각각 6개 case·6개 module rejection·8개 exact GPU readback·32회 동시 factory/configuration 생성과 FreeUnusedSDKs·실제 최종 unload를 통과했다. Direct Core public entry만 남은 경우의 정확한 SDK module 수명도 검증했다. Installed-runtime factory의 실제 native Core load와 GPU/config 격리는 runtime07 양 ABI diagnostics로 별도 확인했다.
+
+Core만 native-only 일반 PE(`d3d12core=n`)이며 나머지 Wine 경계 DLL은 builtin이다. Main의 실제 mapping/file identity, 동일 generation·ABI·전체 image와 요청한 live module path를 확인하며 foreign Core를 실행하지 않는다. SDK618은 **owned compatibility-package identity**이지 Microsoft SDK618 전체 기능, 다른 SDK version 또는 Godot 게임 전체 실행의 conformance 선언이 아니다. [실행 이력](IMPLEMENTATION-HISTORY.ko.md#게임용-owned-core618-loader-완료--2026-10-04)과 [배포/시험 절차](SMOKE-TEST.ko.md#owned-core618-versionpath수명-acceptance)를 따른다.
+
+**게임 공통 경로 후속 — global inbox 우선 정책:** 일반 EXE exports와 base SetSDKVersion은 요청 version이 검증된 설치 Core 이하이면 설치본을 사용한다. SDK1의 명시적 SxS factory 선택과 구분한다. [동일 runtime03 양 ABI acceptance](IMPLEMENTATION-HISTORY.ko.md#게임-공통-agility-inbox-우선-정책--2026-10-04)는 ABI별 6 case·10개 exact GPU readback·32회 동시 생성/FreeUnusedSDKs, SDK617/618 inbox 선택·없는619 거부와 기본 installed-factory 회귀를 통과했다. SDK617 EXE가 없는 app path 때문에 실패하던 실제 결함도 같은 입력에서 실패→성공을 확인했다. 이는 설치된 owned618을 쓰는 정책이지 다른 SDK package 구현이나 게임 전체 호환성 주장이 아니다.
+
+## 개발 목표와 우선순위
+
+### 목표와 변경 원칙
+
+현재 제품 범위는 **Metal을 통한 D3D12 게임 실행**이다. 지원하는 게임 경로는 공개 D3D12/DXGI·Shader Model/DXIL 의미를 지키되, Windows 그래픽 API 목록의 완전성만을 위해 subsystem을 확장하지 않는다. ZZZ와 다른 게임은 실제 workload이며 선택적 HDR10+ GAMING·화질·표시·성능 기능도 범위에 포함한다. Native 제약은 미해결 조건이지 게임 기능을 불필요로 분류하는 근거가 아니다.
+
+- 자체 DXIL/DXBC → AIR/metallib compiler와 native Metal bridge를 유지한다. GPTK/D3DMetal, Apple Metal Shader Converter 또는 SPIR-V fallback을 구현 의존성으로 사용하지 않는다.
+- **최종 실행 목표:** translator·compiler·Metal bridge의 ARM64-native host와 ARM64 Wine + FEX로 x64/x86 Windows guest를 실행해 Rosetta 의존을 없앤다. 현재 x64/WoW64 fixture baseline은 최종 no-Rosetta acceptance가 아니다. Plain ARM64 PE, ARM64EC/ARM64X, x86 WoW64 및 native Mach-O는 각각 다른 build/ABI/execution 계약이다.
+- **D3D11 유지 결정(2026-09-29):** 기존 변경·fixture·증거는 삭제하지 않는다. D3D12에 필수인 공유 인터페이스/ABI 변경과 그 변경으로 깨지는 업스트림 동작 보존 외에는 D3D11 기능 작업으로 범위를 확장하지 않는다. 공유 DXBC/compiler/DXGI/queue/presenter를 이름만 보고 제거하지 않는다. 당시 조사 snapshot은 [이력](IMPLEMENTATION-HISTORY.ko.md#d3d11-변경-조사와-유지-방침)에 있다.
+- Frozen import patches, upstream lock/provenance, vendored/legal 문서는 현재 root source 재생성·배포 입력과 구분한다. 이 문서 정비에서는 변경하지 않았다.
+- Native 대응 기능이 없으면 의미 보존 emulation을 검토한다. 불가능한 계약은 제약·영향을 명시한다. No-op·근사·지원 축소는 정직한 경계일 수 있으나 최종 완전 구현을 대신하지 않는다.
+
+실행 순서는 [구현 우선순위](IMPLEMENTATION-PRIORITIES.ko.md)를 따른다. **2026-10-04 최신 사용자 선택은 DX12 게임 기능 먼저, 최적화는 그다음**이다. 새 P3 #15–24와 P2 #12 native/emulated depth bounds·#14 Tiled Tier3는 지정 proof로 완료했다. #13 conservative Tier3도 아래 양 ABI cap3 proof와5개 runtime03+3개 retained runtime02 회귀로 완료했다. 다음 표시 기능은 사용자 승인된 별도 Wine clone의 Composition이며 [runtime03 x64 public consumer](../build/local/composition-20261004.vn2CH7/composition-x64-03/stdout.log)의 초기 Commit·alpha·matrix case는 통과했지만 전체 양 ABI·실제 화면 acceptance는 남아 있고 기존 Wine worktree는 수정하지 않는다. CoreWindow는 genuine CoreApplication UI thread와 실제 게임 호출이 필요한 별도 조건부 경로다. Desktop GetForCurrentThread S_OK/null은 정상이며 가짜 현재-HWND activation으로 대신하지 않는다. RR native validation·다중 FG·HDR10+ GAMING의 잔여 공통 기능 뒤 CoreWindow·필수 Wave64/128·상위 SM/SDK·stereo/overlay·multi-adapter의 게임별 조건을 적용한다. 선정 게임 근거 미확인은 불필요·제외·완료가 아니다. ARM64/FEX guest execution은 사용자 보류이며 독립 작업의 선행 조건으로 재개하지 않는다. RemoveDevice·compute CalculateLOD·DXGI budget notification·root/indirect arena·COPY timestamp 및 [programmable texture offsets](#programmable-texture-offsets-완료와-focused-proof)·[OPTIONS8 unaligned BC](#options8-unaligned-bc-완료와-focused-proof)는 각각 지정 focused proof로 완료해 남은 후보에서 제외한다.
+
+미검증 의존성을 완료로 승격하지 않는다. Device5 lifetime tracker 등의 독립 연구를 다른 준비된 작업의 선행 조건으로 자동 승격하지 않으며 새 corruption·수명·동기화 문제는 어느 단계에서든 먼저 처리한다.
+
+### 규격 기준의 관리
+
+공개 규격과 owned source를 확인해도 API 의미·native 대응·완료 기준이 애매하거나 계약을 닫을 수 없어 보이면, 미지원·해결 불가로 결론내리기 전에 **GPTK4 D3DMetal 바이너리를 참조한다**. 관련 호출 경로를 분석하고 실행 가능한 경우 격리된 behavioral probe로 확인한다. [기록된 pristine4.0b2 identity와 증거](#p1-계약-범위와-reference)를 출발점으로 버전·SHA256을 다시 확인하며 Yaagl/owned-hooked 사본과 혼동하지 않는다. 조사한 symbol/offset·입력·관찰 결과와 추론을 구분해 남긴다. GPTK 동작은 호환성 참고이지 공식 규격의 대체나 owned 구현의 완료 증거가 아니며, proprietary code 복사·제품 의존성/fallback 추가는 하지 않는다.
+
+“최신”은 영구 고정 버전이 아니다. 착수 시 Microsoft 공식 공개 규격·정식 SDK/Agility SDK·DXIL/SM revision을 확인하고 조회 시점과 차이를 기록한다. Preview/experimental은 정식 지원과 분리한다. 마지막 기록된 publication 조회는 **2026-09-21 17:48:48 UTC**이며, 당시 정식 목표는 **Agility 1.619.6 / DirectX-Headers v1.619.5 / DXC v1.9.2607 / SM6.9 / DXIL1.9**, 별도 preview는 **Agility1.721.3 / headers1.721.2 / DXC1.10.2605.37 / SM6.10 / DXIL1.10**이었다. 이것은 2026-10-02 새 publication 조회나 달성 선언이 아니다. [당시 공식 링크·환경·로컬 header 격차](IMPLEMENTATION-HISTORY.ko.md#p0에서-고정한-규격backend-기준표)를 보존했다.
+
+완료 판단에는 규격/revision·정상/오류/수치/ordering/수명 계약, API→compiler→Metal→readback/presentation 연결, 독립 oracle, native validation, 환경 범위, 회귀 근거가 함께 필요하다. Undefined behavior나 규격상 허용 오차를 무조건 bit-exact 비교하지 않는다. 구현 내부나 로그 문구만 검사하는 결과로 consumer-visible 동작·경계·오류 회귀를 대신하지 않는다. Header enum, interface 노출, 성공 HRESULT, 한 sample의 PASS는 이를 대신하지 않는다.
+
+## 현재 지원 상태
+
+아래는 **현재 소스의 공개 선언과 기록된 지정 proof**다. Apple M5 Pro/macOS 27의 fixture 범위를 다른 GPU/OS나 전체 conformance로 확대하지 않는다. Interface QueryInterface 성공은 해당 interface 모든 메서드 구현을 뜻하지 않는다.
+
+| 영역 | 현재 선언·구현 | 지원/증거 경계 |
+|---|---|---|
+| Shader / feature level | **HighestShaderModel 6.5 / FL12_1** | 일반 DXIL 입력 허용 상한 **SM6.9/DXIL1.9**; [native vector 양 ABI proof](#native-vector-완료와-focused-proof). 공개 baseline은 별개이며 새 optional feature acceptance만으로 전체 shader model을 올리지 않는다. 완료된 SM6.10 matrix는 별도 pinned preview 계약이며 전체 SM6.10 conformance가 아니다. **FL12_2 미지원** |
+| 기본 rendering/compute | resource/heap/view/footprint, copy/resolve, root/PSO, recording/indirect/predication/bundle, queue/fence/residency | P0/P1 및 후속 지정 fixture 완료. 모든 유효 입력·오류·동시성의 conformance 선언은 아님 |
+| Device5 명시적 removal | `RemoveDevice()`가 기존 `ReportRemoval(DXGI_ERROR_DEVICE_REMOVED)` 호출; 첫 reason·fence terminal epoch·GPU retirement 경로 재사용 | [fence-events·execution-safety의 x64/WoW64 focused proof 완료](#removedevice-완료와-focused-proof). 모든 API 거부·전 device/global adapter 제거·in-flight GPU race conformance 선언은 아님 |
+| Query/statistics | timestamp·occlusion·clock calibration, pipeline/SO statistics, 후속 statistics 계약 | DIRECT/COMPUTE timestamp ordering 수정 완료. **COPY timestamp cap TRUE·전용 heap/list·frequency/calibration 구현 및 [x64/WoW64 focused proof 완료](#copy-queue-timestamp-완료와-focused-proof)** |
+| Compiler stage | DXBC/DXIL VS/PS/CS·GS/HS/DS·AS/MS 및 RT/WG lowering | GS/TS+GS indirect·GS stream0–3·DS-only SO·early-Z MSAA statistics의 과거 제한은 후속 proof로 닫힘 |
+| Compute CalculateLOD | bias를 clamped/unclamped 양쪽에 반영, sampler→resource/view clamp, 2D/2Darray anisotropic footprint 및 cube 현재 face projection 수정 완료 | [sm6·dxil-texture × x64/WoW64 4/4 focused proof](#compute-calculatelod-완료와-focused-proof). Compute/kernel 한정이며 native/nonkernel 경로·공개 SM/FL cap은 변경하지 않음 |
+| Wave/numeric/atomic | **wave min4/max32·기본32**, virtual4/8/16 및 native32, int64 연산, 16-bit/min precision, all-stage returning u64 atomic·typed/groupshared/heap emulation, fp32 denorm preserve software 경로 | [Wave size 양 ABI focused proof 완료 (#23)](#wave-size-확장-완료와-focused-proof). 필수64/128은 거부하며 flexible preferred64는32가 허용될 때만32를 선택. [Atomic64 전체 선정 계약과 양 ABI stress/RT 회귀 완료](#atomic64-완료와-전체-계약-proof), 세 cap TRUE. Denorm preserve의 비-CS 범위는 미검증 |
+| Programmable texture offsets | DXIL runtime offset의 opcode별 signed truncation 및 Gather coarse/native offset 분할·view/address metadata 보존 | [full dxil-texture × x64/WoW64 focused proof](#programmable-texture-offsets-완료와-focused-proof), ABI별2816 components. 전체 SM6.7/AdvancedTextureOps cap 상향이나 texture conformance 선언이 아님 |
+| Binding/barrier/render pass | ResourceBindingTier3, root signature1.2·OPTIONS17 non-normalized samplers, enhanced barriers, GPU upload heap, dynamic depth bias/strip cut·per-face stencil | RenderPassesTier0/RenderPassesValid TRUE. RelaxedFormatCasting TRUE; owned BC/uncompressed alias transport. 양 ABI positive casting/advanced·volume/shared 및 full Tiled acceptance 완료 |
+| Tiled/sparse | Native placement-sparse 장치에서 **TiledResourcesTier4**, 64KB logical volume atlas와 packed-array tail 포함 | [Runtime28 양 ABI full Tiled acceptance](#tiled-tier34-완료와-full-proof), ABI별76 cases·DXIL/DXBC volume oracle |
+| Unaligned BC texture | OPTIONS8의 `UnalignedBlockTexturesSupported`를 native `supportsBCTextureCompression()`으로 gate; top-level 비4배수 BC 크기·physical block copy 지원 | [resources × x64/WoW64 focused proof](#options8-unaligned-bc-완료와-focused-proof). BC1–7 typed/typeless 21 variants, 논리 mip·SRV, 2D array/placed·cube/3D 지정 범위. BC1D·새 format·pitch/offset relaxation·RelaxedFormatCasting 지원 확장이 아님 |
+| Pipeline library/cache | `ID3D12PipelineLibrary/1`, `CachedPSO`, application-managed ShaderCacheSession/Control 및 일반 생성의 driver-managed 자동 컴파일 캐시 | [자동 RAM/disk·동시 생성·GPU proof](#자동-pso-컴파일-캐시와-focused-proof). 불변 owned 결과를 재사용하며 native Metal binary archive·최종 PSO 객체 캐시는 아님 |
+| Shared object | shared heap/resource/fence·named/cross-process·GetSharedResourceAdapterLuid, CrossAdapterRowMajorTextureSupported TRUE | D3D11 `OpenSharedResource1` interop 미구현, CrossNodeSharingTier 미지원, SharedResourceCompatibilityTier0. 혼합32↔64 cross-process GPU proof 없음 |
+| DXR | **RaytracingTier1.2**, AS·state object/collection·generic/named-root linkage·RayQuery·HitObject·opacity micromap | [Runtime-06 양 ABI full DXR·HitObject280+REORDER_SCOPE512 memory proof](#hitobject-완료와-focused-proof), [OMM/Tier1.2·OPTIONS22 public admission proof](#opacity-micromap-완료와-public-gpu-proof)로 전체 #19 완료. ActuallyReorders=FALSE인 conforming no-op scheduling이며 실제 SER 성능 최적화는 주장하지 않는다 |
+| Mesh / VRS | **MeshShaderTier1 / VariableShadingRateTier2**, OPTIONS9 `DerivativesInMeshAndAmplificationShadersSupported=TRUE` | 필수128-scalar/cull 및 지정 MSAA/indirect proof와 [Mesh/AS derivatives 양 ABI 수치·capability proof](#mesh-as-derivatives-완료와-focused-proof). WaveMMA/matrix는 아래 별도 완료 계약이다. VRS tile8·추가 rates·viewport indexing cap 보고 |
+| WaveMMA / preview linear algebra | **WaveMMATier1.0(10) / LinearAlgebraTier1.0(16)**; retired query38와 successor V1 query77/78, public conversion/CL11/maximum input records | **#20 두 규약 완료**. Runtime-05 양 ABI runtime behavioral, runtime-06 양 ABI11-case shader numerical/converted-weight consumer, runtime-07 양 ABI strict positive-cap query·conversion readback을 결합한 [mixed-cut 증거](#wavemmalinear-algebra-최종-positive-cap-proof). Pinned preview와 정식 전체 SM6.10·HighestSM6.5를 구분 |
+| Feedback / view / WG | **SamplerFeedbackTier1.0 / ViewInstancingTier1 / WorkGraphsTier1.0** | feedback83 case, view 후속32 case, WG9-case 등 지정 proof. 구형 OPTIONS21 E_NOTIMPL/5-case 기록은 현재 상태가 아님 |
+| Conservative raster | **ConservativeRasterizationTier3** (`src/d3d12/d3d12_device.cpp:907`) | Degenerate/full-coverage·genuine DXIL/DXBC InnerCoverage 구현. [양 ABI cap3 proof와8/8 mixed-cut acceptance](#conservative-tier3-현재-계약과-provisional-proof)로 #13 완료. SM6.5/FL12_1은 유지 |
+| Depth bounds | OPTIONS2 `DepthBoundsTestSupported`는 Apple7+에서 TRUE. Apple10은 native selector fast path, Apple7/8/9는 R8Uint coverage와 live stored-DSV per-sample compute probe로 emulation | [Forced/native 각각 양 ABI146 cases](#depth-bounds-완료와-focused-proof). M5 Pro에서 강제한 emulation 의미 proof이며 구형 물리 GPU 실행 proof는 아님 |
+| D3D12 DXGI presentation | present queue rotation·resize/fullscreen·RESTART·color space/HDR10·temporal·production drawable readback | HDR10PLUS는 native 입력 경로 부재로 명시적 거부. 물리 compositor/HDR scanout·다중 출력은 미검증 |
+| D3D12 NGX / temporal 연동 | x64/WoW64 MSVC parameter facade와16개 D3D12 export, owned SR·alpha·feature11 FG·feature13 RR | Public SR·alpha와 이전 FG acceptance는 유지한다. Root30 NGX count1 공개 native drawable·copy-list release/replay/history/reset/UI proof는 [현재 경계](#multi-frame-fg와-native-residency-현재-경계)를 따른다. WoW64 original checker 실패를 보존하고 saved-capture offline 재분석으로 PASS했다. FSR N1–4 mixed-cut backend proof·Root34 x64 별도 skipped ledger·Composition 잔여 acceptance와 구분하며 RR native shader-validation·NVIDIA 모델/Streamline 실게임/품질 동등성 완료를 주장하지 않음 |
+| D3D12 FSR SR / FG | x64/WoW64 MetalFX SR와 source-owned AMD FSR3 FG를 구분한다. FG N1–4 독립 phase·immutable batch·actual-count·SDK UI/pacing의 선정 backend proof를 direct/CPU/headless·mixed-cut native 양 ABI로 닫음 | [현재 경계](#multi-frame-fg와-native-residency-현재-경계): Root34 public consumer 양 ABI exit0·마지막 실제 표시 Present ID19/UI4, physical phase는 x64 Root31+WoW64 Root34 mixed-cut이다. Root34 x64 count/index(1,1) unexercised·runner false는 보존한다. ID를 표시 프레임 합계로 세거나 동일 Root34 양 ABI native PASS·Composition/실게임 전체 완료를 주장하지 않음 |
+| UMA memory report / DXGI budget notification | OS-visible RAM 호환 정책·Metal cap·x86 SIZE_T 포화 유지; Query와 같은 retained WMT device의64-bit Budget을 등록 중 polling하고 변경 시 event signal | [x64/WoW64 native residency와 controlled-source helper proof](#dxgi-budget-notification-완료와-focused-proof). 실제 dedicated VRAM/carveout·Windows scheduler budget·예약에 의한 실제 budget 제어를 주장하지 않음 |
+| Metal backend | D3D12 Metal4 allocator/queue/compiler/query/presenter 경로, 일반 shader AIR 타깃 Metal3.2·atomic64 특수 variant Metal4.1; D3D11 classic backend/upstream 타깃 유지 | 지정 mixed-cut fixture acceptance와 [non-execution UAV fence 양 ABI proof](#d3d12-shader-타깃과-non-execution-uav-fence). 측정하지 않은 성능 향상·단일cut 전체 suite 성공을 주장하지 않음 |
+
+### Multi-frame FG와 native residency 현재 경계
+
+**소스 구현과 acceptance를 분리한다.** 현재 FG는 MIT AMD FSR3 pin `0836aa7f24058b3f8d035a88c0774457d78fc98e`의 owned 알고리즘과 generated FP32 `cs_6_2` DXIL을 사용한다. 요청 N=1–4의 시점은 `k/(N+1)`이며 immutable real pair에서 각각 계산한다. MetalFX FG·single-output fast path·같은 출력 복제로 대체하지 않는다. History는 REAL에서 한 번만 전진하고 bootstrap/reset/scene cut은 actual0·출력 보존, supplied subrect 바깥은 REAL current를 따른다. SDK grouped/debug/history/lifetime consumer 경로도 구현돼 있다. [직접 GPU·public 부분 관찰과 소스 이력](IMPLEMENTATION-HISTORY.ko.md#multi-frame-fg와-native-borrowed-residency--2026-10-05)은 새 multi-FG 전체 완료 선언이 아니다. SR의 MetalFX 경로와 기존 SR 증거는 유지한다.
+
+**Root27 controlled lifetime:** paired `runtime-27-native-lifetime-linear`의 [x64 GC96](../build/local/multi-fg-recording-state-20261005/gpu-gc27-x86_64/stdout.log)·[WoW64 GC96](../build/local/multi-fg-recording-state-20261005/gpu-gc27-i686/stdout.log)는 max-inflight4·24 batches·24 empty-metadata probes·96 public readbacks와 caller list/output release, 마지막 batch input release·4 late-drop queries를 통과했다. Frame96 retained 재조회는 actual1·phase0.5, explicit drop 뒤 final_pending0이며 양쪽 exit0이다. `Device::CommitMetal4CommandBuffers`는 기존 `residency_lock`을 동기 native queue commit 동안 유지하고 queue/workgraph/sparse 세 caller를 이 경계로 연결한다. Lock 안 GPU wait는 없다. Root25의 native borrowed-allocation 실패와 이 bounded 수정 proof는 [이력](IMPLEMENTATION-HISTORY.ko.md#multi-frame-fg와-native-borrowed-residency--2026-10-05)을 따른다. 첫 GC 실행은 Metal debug/shader validation을 요청했지만 `MTL_SHADER_VALIDATION_REPORT_TO_STDERR`가 빠져 **전체 shader stderr clean proof로 세지 않는다.**
+
+**Root28 state admission·private96 지정 proof PASS:** Root27 resource933 COPY_DEST1024/READ64 closed-list replay 거부를 일반 one-shot private scope 수정으로 닫았다. Begin/End state-event index와 첫 Begin 이전 ALREADY_STARTED snapshot을 보존하고 replay의 private events만 queued validation·decay에서 제외한다. 첫 execution과 app outside-scope events, scope 밖 SDK initialization은 strict 검증을 유지하며 initialized SDK static closure도 보존한다. [x64](../build/local/multi-fg-recording-state-20261005/gpu-all28-x86_64/stdout.log)·[WoW64](../build/local/multi-fg-recording-state-20261005/gpu-all28-i686/stdout.log)는 graphics/compute·predication·cross-queue, closed-list replay `ff665544`/flag `8899aabb`·outcome 불변, early owner release `ff332211`/flag1·OFF-before-execute actual0/출력 불변과 GC96 전체를 통과했다. 양 ABI exit0이며 MetalDebug·ShaderValidation·enableReporting·REPORT_TO_STDERR를 켠 cut이다. 이는 지정 shared recording/admission/lifetime proof이지 FSR/NGX public native presentation 전체 완료가 아니다. Root26 headless 부분 통과와 NGX Root17의140 phase+4 scene checks도 strict native present·public copied-list-release 회귀를 대신하지 않는다.
+
+**Native drawable residency와 Root30 NGX count1 지정 proof:** [Native private op44](../src/winemetal/unix/winemetal_metal4.c)의 drawable 사용은 primary/residual layer의 auto `CAMetalLayer.residencySet` 한 개 또는 두 개를 command에서 사용하고 recording lease로 retirement까지 retain한다. Native queue의 persistent set으로 누적하거나 auto set의 allocation을 직접 변경하지 않는다. Root30 paired public NGX consumer는 양 ABI exit0·full Metal API/Shader Validation·foreign0으로 copy-list release/replay/history/reset/UI를 통과했다. Formal native drawable9개는 generated phase0.5 frames2/3/4와 REAL frames1–6이며 full RAW·positive timestamp/order proof다. [원래 x64 result PASS](../build/local/multi-fg-phase-20261004/ngx-actual-contract-30/native-x64/result.json)와 달리 WoW64 원래 result는 bootstrap seq1/2의 같은 positive clock을 strict-increase로 거부해 false였다. Bootstrap만 nondecreasing으로 고치고 formal critical의 strict/positive/RAW 검사는 유지한 [saved-capture offline 재분석 receipt](../build/local/multi-fg-phase-20261004/ngx-actual-contract-30/bootstrap-clock-offline-recheck-H.json)는 양 ABI PASS다. WoW64 원래 실패 result/raw logs는 변경하지 않았으며 새 GPU 실행 PASS가 아니다. 이 bounded NGX count1 proof를 FSR N1–4 전체 표시 완료로 합산하지 않는다.
+
+**Composition Root33의 지정 실제 geometry/lifetime proof:** [Paired classification](../build/local/composition-20261004.vn2CH7/paired-33-validation-classification.json)과 [x64](../build/local/composition-20261004.vn2CH7/paired-x64-33/actual-stable-phase-evidence.json)·[WoW64](../build/local/composition-20261004.vn2CH7/paired-x86-33/actual-stable-phase-evidence.json)는13 phases 전부 두 alpha 경로 각각 연속2회 fresh actual-window pixel/geometry matches·consumer exit0·errors[]다. WoW64 root-detached는12-round 한도 안11 rounds에서 안정화했다. Source33은 empty target의 실제 NSWindow identity, readonly slot3 query와 staged macdrv slot1 CreateClientSurface/old-source hiding, nonnull Commit의 실제 view deferred binding 및 weak NSWindow→UIView identity cache를 연결했다. 이는 **CGWindow geometry/lifetime 지정 proof**이지 Windows alpha-colour parity, mixed ordinary-first/nonempty FALSE/TRUE 또는 Sync0–4 actual presentation-gap proof가 아니다. 초기 Root27–31 실패는 이력으로 보존한다.
+
+**Root34 public clock 수정 proof와 native event 구분:** `runtime-34-stable-statistics-clock`의 [x64](../build/local/multi-fg-phase-20261004/fsr-stable-clock-34/native-x64/stdout.log)·[WoW64](../build/local/multi-fg-phase-20261004/fsr-stable-clock-34/native-x86/stdout.log)는 strict per-query clock/count·original guards 아래 public consumer exit0이다. `PresentCount`는 positive event의 마지막 실제 표시 `event.present_id`이며 합계가 아니다. Callback stream은 submitted19/마지막 실제 표시 Present ID19, UI는 submitted4/마지막 ID4로서 모든19개 개별 표시의 proof가 아니다. Fixed-epoch clock 수정은 captured-edge CPU0과 실제 public flow로 검증했다. [WoW64 result](../build/local/multi-fg-phase-20261004/fsr-stable-clock-34/native-x86/result.json)는23 exact native contents·positive ordered times PASS다. [x64 original analysis](../build/local/multi-fg-phase-20261004/fsr-stable-clock-34/native-x64/fg-capture-analysis.json)는 seq2/drawable1 zero-time/skipped로 count/index(1,1) unexercised·false이며18 positive callback+4 UI=22 timed events다. Skipped seq2의65,536-byte GPU 출력이 정확하고 REAL과 다른4,096 body channels여도 실제 표시 proof는 아니다. N1–4 genuine per-phase physical proof는 [x64 Root31](../build/local/multi-fg-phase-20261004/fsr-resize-epoch-31/native-x64/result.json)+WoW64 Root34 **mixed-cut**으로 보유하여 선정 FG backend 계약은 닫았지만 동일 Root34 양 ABI 전체 native PASS로 바꾸지 않는다. 두 ABI window는 겹친다는 증거가 없으며 occlusion 원인도 미입증이다.
+
+**Composition cadence와 전체 범위 미완료:** Root33 cadence 실패 뒤 [Root34 exposed WS_POPUP stdout](../build/local/composition-cadence-20261005.Bqiyja/run-x64-popup-34/stdout.log)은 source warmup3회를 실제 positive event/public 측정으로 통과했다. CAContext는 usable native event data를 제공한다. First unbound Sync2/4는 time0이고 첫 critical Sync0 ordinal6은8 vblanks 동안 새 eligible event가 없어 실패했다. [Native stderr](../build/local/composition-cadence-20261005.Bqiyja/run-x64-popup-34/stderr.log)의 warm sequences5–10 positive timestamps를 first deferred/Sync0 gap proof로 대체하지 않는다. 원래 실패와 후속 Root35/36 실패를 보존하며 Sync0 event·mixed ordinary/HWND native proof는 미완료 상태로 사용자 중단됐다. 플랫폼 미지원으로 분류하거나 Root34 FSR clock proof를 Composition cadence PASS로 전용하지 않는다. RR native validation 실패·선택적 HDR10+ GAMING 미해결·기존 SR/구형 forced-emulation 경계를 유지하며 WARP/video/D3D11 확장·ARM64/FEX 재개·실게임 FPS/전체 완성을 주장하지 않는다.
+
+**Composition Root36 중단 snapshot:** Root35 양 ABI build/stage 뒤의 [첫 warmup FAIL](../build/local/composition-cadence-20261005.Bqiyja/run-x64-synchronized-sync0-35/stdout.log)에 이어 마지막 Root36도 paired build/install/stage0이나 [actual stdout](../build/local/composition-cadence-20261005.Bqiyja/run-x64-bound-nontearing-sync0-36/stdout.log)은 consumer1·warmup ordinal3의9 observations 전부 DISJOINT·unmeasured로 실패했다. [Native stderr](../build/local/composition-cadence-20261005.Bqiyja/run-x64-bound-nontearing-sync0-36/stderr.log)의 first4와 warmup seq5/6 모두 time0이다. 원인은 확정하지 않았다. 현재 source는 original creation/unbound/offscreen/reset/resize mode를 복원했고 기존 `publishDeferredWithPeriod`의 `deferred_present && targets.count` guard 안 actual-bound publication만 validated allow-tearing의 반대값으로 displaySync를 정한다. Required fifth WMT4 scalar args4의0/1을 모든 Windows/native 경계로 전달하며 Frame40/Call200·GPU scheduling은 유지한다. **이 native behavior candidate는 acceptance를 실패했으며 사용자 중단 상태다.** Root34 optional first-bound visual control PNG는 scoped CGWindow surface image이고300s hold timeout FAIL이며 scanout/cadence proof가 아니다. [Mixed x64 Root36 evidence](../build/local/composition-mixed-20261005.kbTsD1/run-x64-36/actual-stable-phase-evidence.json)는 ordinary-visible GREEN20480pixels의 연속2회 PASS만 기록한다. [Public stdout](../build/local/composition-mixed-20261005.kbTsD1/run-x64-36/stdout.log)의 upper.SetOffsetX(18) E_NOTIMPL은 target-create-no-commit phase 전 발생했다. Six phases 중1개뿐이며 FALSE/TRUE root pixel acceptance·WoW64 mixed는 미실행이다. Source13-phase proof와 혼동하거나 Composition·normative alpha-colour parity 완료로 표시하지 않는다.
+
+### Conservative Tier3 현재 계약과 provisional proof
+
+현재 `D3D12_FEATURE_D3D12_OPTIONS.ConservativeRasterizationTier`는 **3**이다. Post-snap point/line 보존, degenerate winding/cull·Vertex0 값, full-coverage와 `SV_InnerCoverage`, helper·SampleMask·forced4 및 early/late depth/stencil·UAV/query 의미를 D3D12 compiler/raster 경로에 연결했다. Public **SM6.5/FL12_1**은 변경하지 않았다. OFF/nontriangle에서 undefined인 InnerCoverage를0이라는 새 계약으로 고정하지 않으며 D3D11 기능 확장도 아니다.
+
+**P2 #13 완료:** 최종 runtime-03의 [x64](../build/local/conservative-tier3-20261004.uFBr69/runtime03-conservative-x64/result.json)·[WoW64](../build/local/conservative-tier3-20261004.uFBr69/runtime03-conservative-x86/result.json)는 실제 cap3·exit0/pass=true·API+Shader Validation·owned native backend 확인·`validation_errors=[]`·`foreign_backend_loads=[]`로 PASS했다. WoW64는 `guest_arch=x86`, fixture `machine=332/windows_abi=x86`의 실제 PE32 readback이다. ABI별 retained 전체 geometry/distance matrix, 10 families×7=70 Tier3 grid rows, DXIL/DXBC18 early/late interactions,16K precision·degenerate Vertex0/cull/depth·helper·SampleMask와 새 AS/MS FrontCounterClockwise cull·near/far DepthClip ON/OFF4 rows를 통과했다.
+
+DepthClip ON의 near/far는 각각 covered28·mandatory10, ClipDistance bits `3e066666`, depth bits `00000000/3f800000`이다. OFF는 각각 covered64·mandatory64, ClipDistance `3f31999a`, depth `39000000/3f7ff800`을 exact 비교했다. ON의 post-snap degenerate는 원래 Vertex0 값을 쓰며 OFF의 nondegenerate interpolation과 구분한다. [최종 stdout](../build/local/conservative-tier3-20261004.uFBr69/runtime03-conservative-x86/stdout.log)에 실제 값과 oracle가 기록돼 있다.
+
+**Acceptance는8/8 PASS의 mixed-cut 증거다.** Runtime-03 manifest SHA256는 `59227040a45afec8a049038264e3ff4dbe39f5133bfc34336811f7406e5e0149`, runtime-02는 `05c99a341000136e37453ae6eb12b5c14ee99e6577534297850374cb77edccc9`다. 아래5회는 runtime-03 신규 실행이고3회는 runtime-02의 변경 없는 x64 risk 회귀를 유지했다. 마지막 수정은 explicit WoW64 DATA32 mirrors/copies와 PE32 sizeof/offset assertions이므로 x64 risk3회를 재실행하지 않았다. **8회 모두 같은 build에서 실행했다고 하지 않는다.**
+
+| Consumer | x64 결과·cut | WoW64 결과·cut |
+|---|---|---|
+| Conservative Tier3 | [PASS·runtime03](../build/local/conservative-tier3-20261004.uFBr69/runtime03-conservative-x64/result.json) | [PASS·runtime03](../build/local/conservative-tier3-20261004.uFBr69/runtime03-conservative-x86/result.json) |
+| Depth bounds | [PASS·retained runtime02](../build/local/conservative-tier3-20261004.uFBr69/final-depth-bounds-x64/result.json) | [PASS·runtime03](../build/local/conservative-tier3-20261004.uFBr69/runtime03-depth-bounds-x86/result.json) |
+| Pipeline statistics | [PASS·retained runtime02](../build/local/conservative-tier3-20261004.uFBr69/final-pipeline-statistics-x64/result.json) | [PASS·runtime03](../build/local/conservative-tier3-20261004.uFBr69/runtime03-pipeline-statistics-x86/result.json) |
+| Multisample capabilities | [PASS·retained runtime02](../build/local/conservative-tier3-20261004.uFBr69/final-multisample-x64/result.json) | [PASS·runtime03](../build/local/conservative-tier3-20261004.uFBr69/runtime03-multisample-capabilities-x86/result.json) |
+
+모두 exit0/pass=true·API+Shader Validation·owned backend·validation/foreign 오류0이다. Runtime02의 옛 x64 conservative PASS는 추가 consumer edges 이전 fixture의 역사 기록이며 위8회에는 세지 않는다. Provisional cap1 terminal 실패도 역사 증거로 유지한다. 실제 runtime02 WoW64 post-snap back-face cull 실패는 native raster/oracle가 아니라 Unix-call DATA32에서 VERTEX/MESH `front_counter_clockwise`와 PIXEL `depth_clip_enable`를 누락한 결함이었다. 세 mirror와 번역 copy를 고치고 PE32 layout assertions 및 위 consumer edges를 추가했다([실패→수정 이력](IMPLEMENTATION-HISTORY.ko.md#p2-13-conservative-tier3--2026-10-04)).
+
+실제 D3D11 생성 경계는 final [x64](../build/local/conservative-tier3-20261004.uFBr69/d3d11-final-x86_64.stdout.log)·[i686](../build/local/conservative-tier3-20261004.uFBr69/d3d11-final-i686.stdout.log)에서 ordinary PS `S_OK`·non-null, genuine InnerCoverage PS `E_FAIL`·null이다. Before probe는 unhandled source operand assert로 중단했고 stdout이 buffered되어 해당 shader/이전 HRESULT는 관찰되지 않았다. 이전부터 E_FAIL였다는 주장은 하지 않는다. 최종 CPU runner diagnostics는 [90 PASS](../build/local/conservative-tier3-20261004.uFBr69/diagnostics-mirrors.log)다.
+
+Genuine [DXC1.9.2609.5/FXC10.1 producer provenance](tests/dxil/conservative-raster-provenance.json), [Tier1 before의 정당한 post-snap-line 실패와 reference-only GPTK 조사](IMPLEMENTATION-HISTORY.ko.md#p2-13-conservative-tier3--2026-10-04), [재현 절차](SMOKE-TEST.ko.md#conservative-tier3-public-proof)를 함께 따른다. 전체 규격·실게임·성능·다른 GPU/OS·ARM64/FEX 완료로 확대하지 않는다.
+
+### D3D12 shader 타깃과 non-execution UAV fence
+
+macOS27 최소 환경에서 일반 D3D12 compute/graphics·RT/WG entry의 AIR 타깃은 **Metal3.2**다. `DeviceMemoryBarrier()`는 device+texture memory의 실제 non-execution fence이며, divergent 호출을 새 threadgroup rendezvous로 대체하지 않는다. Atomic64 특수 variant는 Metal4.1을 유지하고 D3D11은 변경하지 않는다. 기존 PSO cache key가 shader target을 포함하므로 이전 타깃의 캐시는 별도 호환 shim 없이 분리된다.
+
+Immutable runtime-08(manifest SHA256 `110ae822bc7399bfd2aec49588f0a5d5a9e5cbac94d6251ccf7127668620eb42`)의 [x64](../build/local/p3-20261003/runtime08-x64-02/result.json)·[WoW64](../build/local/p3-20261003/runtime08-x86-01/result.json)는 각각 **24 ordered numerical cases·closed-recording replay**, API+Shader Validation, 실제 owned native module 확인, exit0·PASS·`validation_errors=[]`·foreign backend 없음이다. BC1의 RG32UINT write→RGBA16UINT read를 같은 dispatch에서 실제 소비했다. Metal3.1 checkpoint는 이 device-only barrier를 누락해 alias가 이전 UAV-clear 값을 읽었으며 [첫 실제 bad word](../build/local/p3-20261003/runtime07-x64-worddiag03/stderr.log)를 보존한다. Runtime08-x64-01은 transport가 bootstrap 도중 중단한 비증거다.
+
+위 matrix는 committed/placed 32·64·128-bit reinterpretation, BC1/BC7 plain casts, legacy typed/typeless·signed interpretation, RTV/UAV write와 native-byte GPU copy, sparse NULL/remap을 검사한다. Runtime08 checkpoint 당시에는 `RelaxedFormatCastingSupported=FALSE`였으며 **#16 전체 완료·3D/shared acceptance 또는 상위 SM/FL conformance를 이 2D proof만으로 선언하지 않는다**.
+
+BC3D의 ordinary UNKNOWN/표준 swizzle·shared 확장은 runtime16(manifest SHA256 `70a6b1e8fa7c5bc518c9f4fe856b299197cdddc617013c9c133ba38150d3e5da`)에서 acceptance를 통과했다. Volume8 [x64](../build/local/p3-20261003/volume16-x64-logical07/result.json)·[WoW64](../build/local/p3-20261003/volume16-x86-logical01/result.json), standard8 [x64](../build/local/p3-20261003/volume16-standard-x64-logical01/result.json)·[WoW64](../build/local/p3-20261003/volume16-standard-x86-logical01/result.json), shared5 [x64](../build/local/p3-20261003/volume16-shared-x64-logical01/result.json)·[WoW64](../build/local/p3-20261003/volume16-shared-x86-logical01/result.json)는 모두 exact GPU oracle·closed-recording replay·API+Shader Validation·실제 owned backend·exit0·PASS·validation 오류/foreign backend 없음이다. 이 fixture는 실제 DXBC `cs_5_0` 입력을 사용하므로 DXIL 실행 증거로 세지 않는다. Canonical import/export 순서와 부분 destination 보존, 8/16-byte 동일 atlas 정수 view의 same-dispatch alias, native BC decode/copy, dimensions를 확인했다.
+
+Shader-write 사용의 8-byte native sparse atlas는 실제 mapped data가 정확해도 native residency가 false가 되는 별도 control을 API-only와 API+Shader Validation에서 모두 관찰했다. Reserved volume은 기존 64KB 논리 mapping 상태를 같은 native sparse queue의 GPU 작업으로 게시하며, ordinary volume은 immutable fully-backed 계약을 사용한다. Runtime16 [Tiled x64](../build/local/p3-20261003/tiled-tier4/public-runtime16-x64-logical04/result.json)는 기존 RG32→RGBA16 same-dispatch NULL/read/status 실패를 지나갔지만 후속 native BC parent decode의 수치 oracle에서 실패했다. 이 runtime16 checkpoint에서는 미완료였으며, 후속 runtime28 full Tiled 양 ABI proof가 이 경계를 대체한다.
+
+Weak descriptor registry를 전체 resource owner lookup으로 일반화한 runtime22에서도 ordinary volume8 [x64](../build/local/p3-20261003/volume22-volume-x64-liveownership01/result.json)·[WoW64](../build/local/p3-20261003/volume22-volume-x86-liveownership01/result.json), standard8 [x64](../build/local/p3-20261003/volume22-standard-x64-liveownership01/result.json)·[WoW64](../build/local/p3-20261003/volume22-standard-x86-liveownership01/result.json), shared5 [x64](../build/local/p3-20261003/volume22-shared-x64-liveownership01/result.json)·[WoW64](../build/local/p3-20261003/volume22-shared-x86-liveownership01/result.json)가 모두 API+Shader Validation·exit0·validation/foreign 오류0으로 통과했다. Manifest는 `c9ea6ccafd8982ceaba705ff7c93524dad2b0bfddf05d00386262ca1b8af2278`다.
+
+Reserved BC export는 UInt import 전의 BC baseline에서 physical-page merge를 시작한다. 별도 BC5 SNORM sparse atlas의 remap은 native AGX 내부 compute-context null 접근으로 실패했고, 순수 native map-only·metadata-blit·bootstrap-barrier3 control에서 동일하게 재현했다. 호환 BC family는 parent texture의 native view로 공유하여 중복 atlas/mapping을 없앴다. [Native parent-view control](../build/local/p3-20261003/tiled-tier4/native-sparse-parent-view-01.log)은32 remap cycles·정확한 status bytes·signed BC5 decode를 API+Shader Validation에서 통과했다. [Runtime25 strict Tiled x64](../build/local/p3-20261003/tiled-tier4/public-runtime25-x64-parentview16/result.json)는 BC5/BC6H signed/plain/full64KB/NULL-remap 경로까지 통과했으나 뒤쪽 volume copy/RTV full-page oracle의 tile1/physical3/byte61440에서 actual00/expected20으로 실패했다. 이 실패는 후속 runtime28의 mapped backing heap residency 수정과 양 ABI full Tiled proof로 해결했다.
+
+Runtime24의 positive-cap [casting x64](../build/local/p3-20261003/positive-runtime24-relaxed-casting-x64-01/result.json)·[WoW64](../build/local/p3-20261003/positive-runtime24-relaxed-casting-x86-01/result.json) 및 [advanced x64](../build/local/p3-20261003/positive-runtime24-advanced-texture-x64-01/result.json)·[WoW64](../build/local/p3-20261003/positive-runtime24-advanced-texture-x86-01/result.json)는 각24 ordered cases를 통과했다. 두 cap은 TRUE이며 과거 unsupported/probe mode는 제거했다. Runtime25의 호환 BC parent-view 변경 후에도 volume8·standard8·shared5는 양 ABI6개 실행 모두 통과했다(`positive-runtime25-relaxed-casting-{volume,volume-standard,shared}-{x64,x86}-01`). 모두 API+Shader Validation·exit0·owned backend·validation/foreign 오류0이며 runtime24 manifest는 `f63e0c689bc66106f362afd63924059dac45c5454a8eb0ea976eac5ca08e9657`, runtime25는 `5e8715b0ed7f65dbfe4faf845936f0f351e5bb525e937402d4050671924fad51`다.
+
+Runtime28의 mapped heap residency 수정 뒤에도 volume8 [x64](../build/local/p3-20261003/positive-runtime28-relaxed-casting-volume-x64-01/result.json)·[WoW64](../build/local/p3-20261003/positive-runtime28-relaxed-casting-volume-x86-01/result.json), standard8 [x64](../build/local/p3-20261003/positive-runtime28-relaxed-casting-volume-standard-x64-01/result.json)·[WoW64](../build/local/p3-20261003/positive-runtime28-relaxed-casting-volume-standard-x86-01/result.json), shared5 [x64](../build/local/p3-20261003/positive-runtime28-relaxed-casting-shared-x64-01/result.json)·[WoW64](../build/local/p3-20261003/positive-runtime28-relaxed-casting-shared-x86-01/result.json) 모두 API+Shader Validation·exit0·owned backend·validation/foreign 오류0으로 통과했다. 실제 DXBC 경로이며 DXIL proof로 세지 않는다. 아래 full Tiled76 양 ABI 결과와 함께 #16 aggregate를 완료한다.
+
+### Tiled Tier3/4 완료와 full proof
+
+Runtime28의 [x64](../build/local/p3-20261003/tiled-tier4/public-runtime28-x64-predicate-contract21/result.json)·[WoW64](../build/local/p3-20261003/tiled-tier4/public-runtime28-x86-predicate-contract21/result.json)는 실제 `tier=4`, ABI별76 ordered cases, exit0·API+Shader Validation·owned native compiler/backend 확인·validation/foreign 오류0으로 전체 Tiled fixture를 통과했다. Manifest SHA256는 `58775a050b81f9059373b258053496655a5e472453c27b341a726a6a14498c4d`다. RGBA8/BC volume의 DXIL/DXBC filtering·LOD·mapped status, full64KB physical aliases·NULL/write/remap, native BC decode, clear/RTV/copy/predicated skip-execute·cross-queue ordering과 packed-array tail을 포함한다.
+
+이 proof는 위 runtime16/25의 미완료 경계를 대체한다. Private sparse RTV·BC/UInt shadow의 mapped backing heap을 실제 consuming Metal4 recording의 기존 allocation/residency set에 포함하고 retirement까지 보유하여 clear publication 실패를 해결했다. Native control·원래 실패·fixture predicate input polarity 교정은 [이력](IMPLEMENTATION-HISTORY.ko.md#새-p3-24-compatible-bc-storage와-clear-publication-조사--2026-10-04)에 남긴다. Public upper bound는 SM6.5/FL12_1로 유지하며 다른 GPU/OS 및 실제 게임 conformance나 성능 proof는 아니다. P2의 Tier3 prerequisite도 #24에서 해결됐지만 depth bounds·conservative Tier3를 포함한 P2 전체는 미완료다.
+
+### ARM64 기반의 실제 완료 범위
+
+[ARM64/FEX 계획과 gate](../docs/ARM64-FEX-IMPLEMENTATION.md)가 architecture 세부 기준이다. 이미 완료된 기반을 미구현으로 되돌리지 않는다.
+
+- **Native compiler/Metal 및 full Unix plugin:** 11/11 exact GPU readback, `proc_translated=0`. Standalone dylib뿐 아니라 실제 owned `winemetal.so → winemac.so → win32u.so/ntdll.so` SDK closure를 로드했고 **495 ARM64 loaded image headers**를 확인했다. 기록된 compiler probe는 SM50/DXBC 범위이며 native 전체 DXIL matrix 증거가 아니다.
+- **Production PE:** 실제 plain ARM64 `d3d12/dxgi/winemetal` 3개와 pure ARM64EC 3개를 Wine builtin 후처리까지 빌드했다. ARM64EC의 raw machine/file 표시는 x86-64일 수 있으며 CHPE/code maps로 의미를 구분한다. DLL 빌드가 loader/guest 실행 성공은 아니다.
+- **ARM64X:** `scripts/build-owned-arm64x.py`의 자동 fresh paired production build가 `d3d12/dxgi/winemetal`3-DLL matrix를 완료했다. [Result](../build/local/arm64x-paired-production-20261002/result.json)는 status=pass,54 commands/0 failed 및503 stable owned input hashes다. Canonical `build-arm64.txt`/`build-arm64ec-only.txt`를 사용하며 이전 manual WineMetal link는 역사다. PE entry/import/export/CHPE/maps/relocations·builtin 검사는 guest 실행 proof가 아니다.
+- **Tooling:** schema2 architecture staging, legacy schema1/x64-WoW64 회귀, ABI fixture compile·mismatch rejection은 구현됐다. 정적 preflight의 `runtime_executed=False`를 동적 native loader 관측과 혼동하지 않는다. Native runtime packaging/runner의 최신 관측은 [ARM 계획](../docs/ARM64-FEX-IMPLEMENTATION.md)에 별도 관리하며 native Wine 실행과 PE guest 실행·strict no-Rosetta guest proof는 분리한다.
+- **Native Wine package:** [fresh runtime result](../build/local/arm64-runtime-package-final-20261002/runtime-result.json)와 [owned package result](../build/local/arm64-owned-package-cut-20261002/package-result.json)는 PASS다.33 native+751 plain ARM64 PE closure, fresh canonical owned build/install·schema2 stage verify·normal wrapper wine-11.17을 확인했다. [실행 observer](../build/local/arm64-owned-package-abi-20261002/result.json)는 real loader/server의 per-PID `proc_translated=0`, `runtime_executed=true`/`host_no_rosetta_observed=true`지만 **guest_executed=false/strict_no_rosetta_proven=false**다. KUSER_SHARED_DATA `0x7ffe0000`의 Darwin ARM64 low-VA mapping 불가로 PE 실행 전 blocked이며 guest/COM/Unix-call/GPU 성공이 아니다.
+- **2026-10-06 실제 실행:** 사용자 지시로 보류를 해제하고 official Wine MR11638/FEX-2609.1 pins와 owned shared-data/MAP_JIT patches를 빌드·실행했다. [Native ARM64 result](../build/local/arm64x-mr11638-jit03-native-gpu-20261006/result.json)와 [FEX x64 result](../build/local/arm64x-mr11638-fex-jit03-abi16k-gpu-20261006/result.json)는 guest entry·COM·integer/float/pointer/32-byte packet·reverse callback1회·Unix-call111 및 Metal64 bytes=0xa7/fence0x123456789, exit0/validation errors0이다. 두 실행 모두 실제 loaded PE/native SHA256 일치와 전체 관측 host의 ARM64/proc_translated=0을 확인해 strict_no_rosetta_proven=true다. Native callee는16KB section alignment를 사용한다.
+- **2026-10-06 native x86 실제 실행:** [PE32 COM/Unix/Metal result](../build/local/wow64-metal-run03-20261006/result.json)는 typed guest-window pointer codec, COM owner/scalar·callback·Unix-call111·two-node Metal3 blit64 bytes=0xa7/fence0x123456789, exit0·validation0·exact loaded hashes·strict no-Rosetta를 통과했다. [Unified ARM64X+WoW64 package의 x86 result](../build/local/arm64x-wow64-sdk01-x86-abi-gpu-20261006/result.json)도 같은 bounded acceptance를 통과했다. Full x86 D3D12 shader나 game acceptance는 아니다.
+- **2026-10-06 unified SDK05:** 같은 manifest `c59930623bc44b5120d6a74534c4d0be2b5704ecf910a67e252b23e4729453dc`에서 [ARM64](../build/local/arm64x-wow64-sdk05-arm64-abi-gpu-20261006/result.json), [FEX x64](../build/local/arm64x-wow64-sdk05-x64-abi-gpu-20261006/result.json), [FEX x86](../build/local/arm64x-wow64-sdk05-x86-abi-gpu-20261006/result.json)의 COM·callback·Unix-call111·Metal64-byte readback/fence가 모두 PASS다. Loaded PE/native hashes·실제 child closure·ARM64/proc_translated=0·validation0·prefix 정리를 확인했다. Native raw sections는 host page인16KB에 맞춘다.
+- **2026-10-06 D3D12 shader:** [native ARM64](../build/local/arm64x-wow64-sdk05-arm64-smoke-20261006/result.json), [FEX x64](../build/local/arm64x-wow64-sdk05-x64-smoke-20261006/result.json), [FEX x86](../build/local/arm64x-wow64-sdk05-x86-smoke-20261006/result.json)는 동일 SDK05에서 각 graphics/compute8 ordered exact-readback frames·exit0·strict no-Rosetta·API/Shader Validation0을 통과했다. Raw Core machine과 shared native/EC Core/Main generation `40ddcd07ca794d7d8d1e234d8bc54115`, installed-file identity 검사를 유지한다. `--no-present` fixture이며 game/presentation/full DXIL proof는 아니다.
+- **PE32 shader 경계 수정 완료:** Owned Wine patch는 user32 outer client-function arrays·native PEB64 NLS publication·native TEB32 dereference만 수정한다. Guest callbacks/module identities는 그대로다. Owned compiler copy destination과 Metal bytecode/pipeline/command/commit/info CPU pointers에 existing guest base를 적용하며 native object handles·GPU addresses·retirement ordering은 유지한다. 실제 실패한 SDK02/Window03–08/SDK03–04와 SDK05 복구 증거는 HISTORY에 보존한다.
+
+## 남은 구현 후보
+
+**판정 표기:** “정적 확인”은 소스와 계약의 누락/거부/no-op을 확인했다는 뜻이다. 아래 감사는 새로운 GPU failing-before 재현이 아니다. 앱 영향은 관찰하지 않았으면 `[INFERENCE]`로 구분한다. “제안 acceptance”는 앞으로 실행할 완료 기준이며 PASS가 아니다. 우선순위 묶음은 기존 P0–P4 역사 단계와 별개다.
+
+### 1. 현재 공개 경로의 의미 누락과 용량 제한
+
+| 후보·근거 | 현재 판정 | 구현 경계와 제안 acceptance |
+|---|---|---|
+| **Compute CalculateLOD sampler 의미 — 완료·남은 후보에서 제외** | `src/airconv/dxil_resources.cpp` compute/kernel 경로 수정 및 **4/4 focused PASS** | [수정 전 정적 감사·후속 실패→수정→실행·정확한 한계](#compute-calculatelod-완료와-focused-proof)를 별도 보존. 이 완료는 임의 anisotropic policy의 native 동등성이나 전체 conformance 선언이 아님 |
+| **DXGI budget notification — 완료·남은 후보에서 제외** | `src/dxgi/owned_budget_notification.hpp`의 `DxgiBudgetNotifications`: native Budget polling·owned event·독립 cookie·직렬화된 signal/unregister·Stop/join | [수정 전 finding·후속 실패→수정→실행·정확한 한계](#dxgi-budget-notification-완료와-focused-proof)를 보존. Controlled-source 변화 proof와 실제 native budget 변화 관찰은 구분 |
+| **root/indirect arena 성장 — 완료·남은 후보에서 제외** | 초기 4 MiB 뒤 retained chunk 추가; 지정 root/static sampler/VB/WG/DXR·reset/reexecute·native allocation failure **x64/WoW64 12/12 focused PASS** | [실패→수정→지정 acceptance 및 mixed-cut 증거](#rootindirect-arena-성장과-focused-proof). runtime-02의 10개와 render resolver 수정 후 runtime-03의 graphics 2개를 구분; 무제한 recording·전체 conformance 선언이 아님 |
+| **Device5 lifetime tracker** — `src/d3d12/d3d12_device.cpp:3033–3039` | **정적 확인: E_NOTIMPL**, false-success 아님 | 실제 owner/tracker COM 수명·state-change callback·재진입·중복 destruction 및 오류 output cleanup. DXR tier와 별도 API |
+
+RemoveDevice·compute CalculateLOD·DXGI budget notification·root/indirect arena·COPY timestamp 뒤 지정했던 programmable texture offsets와 독립 runtime 작업 OPTIONS8 unaligned BC도 아래 focused proof로 완료했다. 다음 항목을 Device5 lifetime tracker로 자동 지정하지 않는다. 실제 owned object와 tracker를 연결하는 association 계약은 아직 없으며 shell/tracker 객체 생성만으로 완료할 수 없다. 남은 후보는 계약·feasibility를 독립 판단하고 앞선 acceptance 범위를 확대하지 않는다.
+
+### 2. ARM64 Wine/FEX end-to-end 경로
+
+자동 paired ARM64X production build와 native runtime packaging, ARM64/FEX x64/FEX x86의 COM/Unix/Metal 및 선택한8-frame graphics/compute 실행은 SDK05에서 완료했다. 최신 disposition과 동일 runtime의6개 결과는 [ARM 계획](../docs/ARM64-FEX-IMPLEMENTATION.md)을 따른다. 선택한 shader smoke와 전체 게임/presentation/native regression matrix는 구분한다.
+
+1. **Ordinary x64 image/shared-data acceptance:** 4KB guest code/IAT의16KB host-page W^X 충돌과 FEX 비정렬 load의 native JIT backpatch 쓰기 보호를 수정했다. [JIT04 실제 guest result](../build/local/arm64x-mr11638-fex-jit04-shared-data-20261006/result.json)는 main·scalar/SSE/clock·read-only AV, exit0, loaded PE/native hash 일치, `strict_no_rosetta_proven=true`를 확인했다. Guest의 고정 주소나 PE alignment는 변경하지 않았다. Dynamic guest-JIT이나 일반 PE layout 전체 acceptance로 확대하지 않는다.
+2. **선택한 ARM64/x64/x86 D3D12 shader acceptance 완료:** SDK05는 TLS DVRT·COM owner/scalar thunk·raw Core machine·shared Core/Main generation을 유지한 동일 cut에서 세 guest의8-frame graphics/compute exact readback과 API/Shader Validation을 통과했다. General DXIL/game/presentation matrix로 확대하지 않는다.
+3. **Native x86 guest window와 unified ABI/Metal 완료:** SDK05에서 all-three-guest COM/Unix/Metal과 shader acceptance를 확인했다. Native entry는16KB raw-section alignment를 유지한다. Narrow Wine client-array/NLS/TEB fixes와 owned compiler/Metal CPU-pointer encoding으로 실제 PE32 실패를 복구했다. Unexercised Metal4/mesh/DXR slots는 별도 한계다.
+4. **Native matrix:** independent x64/x86 acceptance 뒤 asynchronous ordering/retirement/indirect와 review regressions를 명시한 native cut으로 검증한다. Global waits나 Rosetta fallback을 사용하지 않는다.
+
+### 3. 상위 규격과 capability 확장
+
+이 목록은 정직하게 cap-gated인 미지원과 backend feasibility 연구다. COPY timestamp·programmable offsets·OPTIONS8 unaligned BC는 아래 지정 focused proof로 완료해 남은 후보에서 제외했다. SM6.9/FL12_2 전체나 연구-blocked atomic64를 다른 준비된 작업의 선행 조건으로 삼지 않는다. 기존 tier proof를 폐기하거나 최근 닫힌 finding을 다시 열지 않는다.
+
+| 작업 | 현재 경계 | 필요한 구현/제안 acceptance |
+|---|---|---|
+| 최신 공식 header/SDK 통합 | P0 당시 build-selected/vendored header와 정식 목표의 revision 격차를 기록함 | 현재 선택 header·vendored provenance·SDK interface/OPTIONS/struct layout을 공식 revision에 대조하고 필요한 integration 정비. Header 갱신 자체를 runtime 지원이나 conformance 완료로 간주하지 않음 |
+| **FL12_2 묶음** | 공식 최소 SM는 **6.5**. SM6.6 미보고 자체가 blocker 아님 | Conservative3도 cap3 양 ABI proof로 완료했다. 전체 필수 cap 재대조 전 FL12_1을 유지한다. COPY timestamp·OPTIONS8 unaligned BC·Tiled Tier3/4·depth bounds는 지정 proof로 완료했다. Apple7/8/9 depth bounds emulation도 M5 강제 경로로 검증했지만 구형 물리 GPU·전체 FL12_2 proof는 아니다. [공식 요구](https://microsoft.github.io/DirectX-Specs/d3d/D3D12_FeatureLevel12_2.html) |
+| **COPY queue timestamp — 완료·남은 후보에서 제외** | OPTIONS3 cap TRUE, COPY 전용 heap/list EndQuery·ResolveQueryData 및 frequency/calibration | [x64/WoW64 full queries 2/2 focused PASS](#copy-queue-timestamp-완료와-focused-proof). Queue sample ordering·resolve·payload·오류 계약이며 COPY GPU duration 또는 unsynchronized cross-queue timestamp 비교 proof가 아님 |
+| **Depth bounds — native/emulation 지정 계약 완료 (#12)** | Apple10 native fast path; Apple7/8/9 R8Uint per-sample coverage·별도 serialized compute stored-depth probe. Apple7 미만은 cap FALSE·활성 PSO E_INVALIDARG | [Forced/native 각각 양 ABI146-case proof](#depth-bounds-완료와-focused-proof). 구형 물리 장치·HLK/실게임/FPS 검증으로 확대하지 않음 |
+| **Tiled Tier3/4 — 완료·남은 후보에서 제외 (#24)** | Native placement-sparse gate에서 Tier4; native tile을64KB logical volume atlas로 변환 | [양 ABI full76 cases](#tiled-tier34-완료와-full-proof). Filtering/LOD/status·NULL·copy/remap·alias/queue order·packed-array tail·BC/UInt/RTV full64KB 검증 |
+| **Conservative Tier3 — 완료·남은 후보에서 제외 (#13)** | 현재 cap3; degenerate·full-coverage·genuine InnerCoverage 구현 | [양 ABI cap3 public proof·8/8 mixed-cut acceptance](#conservative-tier3-현재-계약과-provisional-proof). OFF/nontriangle의 InnerCoverage 특정 상수나 D3D11 지원을 새로 선언하지 않음 |
+| **OPTIONS8 unaligned BC — 완료·남은 후보에서 제외** | Native BC compression 지원에 cap gate; odd logical sizes·physical block copy·view/footprint 경로 | [resources × x64/WoW64 focused PASS](#options8-unaligned-bc-완료와-focused-proof). Top-level4배수 제한 해제 범위이며 block-copy/pitch/offset 규칙과 format reinterpretation·SM/FL cap은 그대로 |
+| **SM6.7 programmable offsets — 완료·남은 후보에서 제외** | DXIL Load/Sample/compare signed low4 및 Gather/GatherCmp/GatherRaw low6 runtime offset lowering; bound view mip/dimension·address modes 보존 | [dxil-texture × x64/WoW64 focused PASS](#programmable-texture-offsets-완료와-focused-proof). GatherRaw low6 규격 해석의 inference와 지정 GPU 경계를 구분. AdvancedTextureOps의 RelaxedFormatCasting prerequisite·공개 SM/FL cap은 그대로 |
+| **SM6.9/DXIL1.9 vector — 완료·남은 후보에서 제외 (#18)** | Native vector IR·elementwise/wave intrinsic·raw/structured/heap vector load/store·status/bounds·reduction 및 AIR legalization | [Runtime-04 양 ABI32 case와 CPU28 contract/lowering check](#native-vector-완료와-focused-proof). SM6.9 입력 허용과 공개 SM6.5 보고는 별개다. |
+| SM6.6 all-stage returning u64 atomic | Graphics·typed·groupshared·heap·RT/WG 구현과 세 atomic cap TRUE | [#15 완료와 양 ABI proof](#atomic64-완료와-전체-계약-proof). Paired runtime30 full-SM6 및 영향 경로20/20, 기존 groupshared32KiB capacity·AS/MS 연산 proof 포함. 전체 SM6.6 이상 conformance 선언과 구분 |
+| **Mesh/AS derivatives — 완료·남은 후보에서 제외 (#17)** | OPTIONS9 cap TRUE, mesh/object용 quad derivative·implicit sampling/LOD lowering | [runtime-01의 x64/WoW64 수치·invalid-shape·기존 mesh/cache focused proof](#mesh-as-derivatives-완료와-focused-proof). 공개 SM/FL 상향이나 다른 P3 완료 선언이 아님 |
+| **WaveMMA / matrix — 두 규약 완료·남은 후보에서 제외 (#20)** | Retired WaveMMA와 pinned successor SM6.10 preview matrix compiler/runtime/public ABI 및 WaveMMATier10/LinearAlgebraTier16 | [Runtime-05 API·runtime-06 shader·runtime-07 final positive-cap의 양 ABI mixed-cut proof](#wavemmalinear-algebra-최종-positive-cap-proof). 단일 cut 전체 재실행·전체 SM6.10 conformance·공개 HighestSM 상향이 아님 |
+| **Wave size 4–32 — 완료·남은 후보에서 제외 (#23)** | Min4/max32·기본32, native SIMD32 내 virtual4/8/16 및 compute/node의 fixed/ranged·PSV 제약 | [Runtime-02의 waves24·NodeWave4 work-graphs9 case × x64/WoW64 focused proof](#wave-size-확장-완료와-focused-proof). Cross-SIMD64/128을 보고하지 않으며 공개 SM/FL 상향은 별도 |
+| **SER·SM6.9 HitObject·opacity micromap — 완료·남은 후보에서 제외 (#19)** | Deferred HitObject/Invoke·값 snapshot/query/SBT/local-root, OC1 array·linkage·software traversal·serialization, Tier1.2·final OPTIONS22 및 reorder-coherent memory 계약 | Runtime-06 양 ABI [280-word HitObject+512-word multi-wave REORDER_SCOPE와 full DXR](#hitobject-완료와-focused-proof), [OMM·cap/admission official proof](#opacity-micromap-완료와-public-gpu-proof). ActuallyReorders=FALSE인 conforming no-op scheduling이며 성능상 SER 최적화는 주장하지 않는다 |
+| **FP64 — 완료·남은 후보에서 제외 (#22)** | Binary64 정수 emulation, `DoublePrecisionFloatShaderOps=TRUE`; DXIL·DXBC5.0/5.1 lowering | [Runtime-04 양 ABI8 case의 numerical·compute·VS/PS·wave focused proof](#fp64-완료와-focused-proof). Native FP64 ALU·전체 SM/FL·성능 지원 선언이 아님 |
+| **Writable MSAA — 완료·남은 후보에서 제외 (#21)** | OPTIONS14 `WriteableMSAATexturesSupported=TRUE`; sample별 typed UAV write/read와 native resource 가시성 | [Runtime-06 양 ABI80 case focused proof](#writable-msaa-완료와-focused-proof). D3D11·reserved MSAA·전체 SM/FL 상향·다른 GPU/OS/성능을 선언하지 않음 |
+| **RelaxedFormatCasting / AdvancedTextureOps — 완료 (#16)** | 두 cap TRUE; BC/uncompressed alias transport와 advanced sample/compare/gather 구현 | 양 ABI positive casting24·advanced24·volume8·standard8·shared5 및 runtime28 full Tiled76 통과. 실제 Cap query와 numerical consumer로 검증 |
+| Protected session 등 | Native/backend 제약 또는 명시적 cap/오류 경계 | 별도 규격/feasibility audit 후 구현 범위를 결정하며 정확한 emulation 없이 완전 지원으로 표시하지 않음 |
+
+과거 compiler 감사의 retained compile-probe에서 SM6.9/groupshared u64/wave64의 명시적 rejection과1D comparison의 제한을 확인했다. 이는 **당시 binary compiler smoke**이며 최신 전체 소스 rebuild·GPU/native PSO proof가 아니다. 그 중 SM6.9 native vector·HitObject·groupshared u64·1D comparison의 과거 거부/제한은 아래 새 public GPU proof로 대체됐다. 필수 wave64는 현재도 명시적 거부다.
+
+### 4. 성능·실사용 및 검증 확장
+
+아래 portability의 FrameInterpolator 언급은 이전 single-output port의 구현 이력이다. 현재 FSR/NGX FG의 owned multi-frame 소스·남은 표시 proof는 [현재 경계](#multi-frame-fg와-native-residency-현재-경계)를 우선하며 MetalFX SR의 장치별 min/max/usage 조회와 혼동하지 않는다.
+
+- **Native Metal archive / PSO cache:** 아래 자동 owned 컴파일 캐시의 생성·재시작 비용 개선은 측정했다. Native archive는 추가 native 생성 비용이 실제 병목일 때만 검토한다. 게임 FPS·stutter·메모리·전력은 별도 같은 workload 측정이 필요하며 graphics key/current serialization revision을 역사적 값과 혼동하지 않는다.
+- **Sparse/queue/retirement 비용:** tiled mapping의 queue serialization/alias flush, submission overlap, allocation/copy, GPU→CPU capture/replay waits와 derived PSO variants, 장시간 memory pressure를 correctness 유지 조건에서 측정한다. 측정되지 않은 게임/FPS 향상을 약속하지 않는다.
+- **검증만 남은 경계:** SampleCmp 확장/GatherRaw의 미시험 조합·u64 gather, 비-CS denorm-preserve와 f32→f16 denormal 경계, 일부 queue layout/format·library GS/HS/DS·mixed-bitness sharing 등은 구현 존재와 proof 부재를 구분한다. 실패를 관찰하지 않았으므로 열린 버그로 단정하지 않는다.
+- **NGX discovery 정합:** P0-4는 `GetFeatureRequirements`와 Init의 동일 native Metal4FX temporal predicate, 유효한 미지원 adapter의 **Success + AdapterUnsupported(4)**를 구현했다. [P0 공개 계약 증거](#p0-공개-계약-정합)는 당시 x64이며 public WoW64 SR·alpha의 후속 증거는 새 P4 표를 따른다. 실제 게임 loader·다른 adapter/device의 native support 실행은 별도 검증 경계다.
+- **NGX/FSR portability와 실제 검증 경계:** full SR/FG port의 masks·high-res/jittered MV·subrect·sharpening·linear/sRGB/PQ·dynamic output·FrameInterpolator와 SDK proxy는 구현됐으므로 미구현 후보로 다시 등록하지 않는다. NGX Exposure.Scale·MV.Offset의 P1 accept+ignore는 [별도 계약](#p1-계약-범위와-reference)이다. Alpha와 public WoW64의 후속 acceptance는 상단 P4 표, 그 이전 port 증거는 [별도 절](#fsr-facade와-manual-r32-exposure-완료)을 따른다. Runtime MetalFX min/max/usage는 장치에서 조회하며 특정 M5 Pro의3× 상한이나 작은 입력의 native 동작을 이식 가능한 보장으로 고정하지 않는다. ARM64/EC guest 실행·실제 Streamline/game loader·다른 GPU/OS·모델/품질 differential은 지정 양 ABI public fixture와 별개이며 ARM64 guest 실행 gate는 user-deferred 상태다.
+- 다른 GPU/OS, Windows reference differential, 물리 compositor·HDR·다중 출력, 실제 게임·장시간·cold/warm 성능은 추가 환경/검증 track이다. ARM64 no-Rosetta guest 구현을 이 검증-only 묶음에 숨기지 않는다.
+
+## 검증 범위와 증거
+
+### Depth bounds 완료와 focused proof
+
+**P2 #12 native와 이전 Apple family emulation의 지정 계약 완료(2026-10-05).** Apple M5 Pro/macOS27에서 forced emulation과 복원된 native를 각각 **양 ABI146 cases/ABI(기본50+producer36+pixel32+coverage28)**로 검증했다. Native runtime10 manifest SHA256은 `392ec11687f2578b8a1f56ea541f68bcceb4a6c3a80bd22d83fa8879a798cf6b`다. 기본50-case runner는 pass=true·exit0·owned compiler/backend·validation/foreign 오류0이고 세 route consumer도 각 exact PASS terminal·exit0·API+Shader Validation 오류0이다. Forced proof는 runtime07/08/09의 항목별 완료 cut이며 같은 단일 build 재실행으로 합치지 않는다.
+
+- DESC1/2 enable·PSO/cache/library identity·기본0/1·Reset/ClearState·bundle 상속/persist·NaN→0·inclusive clamp를 보존한다. Inverted range는 clamp 전에 거부하고 noDSV는 항상 pass한다. Apple10은 기존 native bounds를 실제 early/replay pass에만 적용하며 emulation 때문에 capture를 강제하지 않는다. Apple7/8/9의 enabled PSO는 기존 per-primitive capture에 진입하고 이전 primitive의 depth write를 fence로 기다린 **별도 compute pass**가 live DSV의 각 실제 sample을 읽는다. Attachment feedback·draw-wide depth snapshot·공개 SRV capability 추가는 없으며 내부 depth ShaderRead와 public DENY_SHADER_RESOURCE 거부는 기존 계약을 재사용한다.
+- 50 cases는 stored depth와 incoming/oDepth 구분·inclusive endpoints·범위 안/밖 inverted·NaN·readonly/depth-disabled/noDSV/noPS, early/late UAV·discard·depth/stencil write·occlusion/binary query, direct/indexed/indirect·bundle/replay·겹치는 primitive의 live depth·mip/array·D16/D24/D32·4×MSAA early/late/per-sample을 포함한다. Pixels·UAV·depth/stencil·occlusion/binary는 exact hard assertion이며 D16 raw도 tolerance 없이 비교한다.
+- [DepthBounds v1.3](https://microsoft.github.io/DirectX-Specs/d3d/DepthBoundsTest.html)의 exact statistics test는 ForceEarly=true다. [D3D11.3 §20.4.7](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#PipelineStatistics)은 oDepth 실패를 포함한 실제 shader invocation을 센다. Early PS count는 exact 검증하되 late PSInvocations는 관찰값을 기록하고 post-bounds survivor 수와 같다고 assert하지 않는다.
+- 초기 native runtime02의 pipeline-library [x64](../build/local/p2-depth-bounds-20261004.S3Pmiu/final-pipeline-library-gated-x64/result.json)·[WoW64](../build/local/p2-depth-bounds-20261004.S3Pmiu/final-pipeline-library-gated-x86/result.json), pipeline-statistics [x64](../build/local/p2-depth-bounds-20261004.S3Pmiu/final-pipeline-statistics-x64/result.json)·[WoW64](../build/local/p2-depth-bounds-20261004.S3Pmiu/final-pipeline-statistics-x86/result.json), multisample [x64](../build/local/p2-depth-bounds-20261004.S3Pmiu/final-multisample-fixed-x64/result.json)·[WoW64](../build/local/p2-depth-bounds-20261004.S3Pmiu/final-multisample-fixed-x86/result.json)는 exit0·API+Shader Validation·validation/foreign 오류0으로 PASS다. Depth2회와 회귀6회, 총8 GPU runs이며 multisample은 기존 writable-MSAA 계약과 충돌한 stale rejection fixture만 수정했다.
+
+Public SM6.5/FL12_1은 유지한다. R8Uint가 담는 값은 sample별 정확한 uint0/1이고 primitive payload는 기존 buffer에 남으므로 Apple7/8/9에서 R32Uint MSAA에 의존하지 않는다([Apple feature tables](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf), 2026-05-21 p11). 의미 proof는 **M5 Pro에서 강제한 emulation**이며 실제 M1/M2/M3/M4·다른 GPU/OS·Windows/HLK·일반 differential conformance·실게임/FPS proof는 아니다. 후속 Shared AIR 영향 회귀도 native runtime11의 multisample·geometry·tessellation·atomic64-producers·conservative 양 ABI10회와 runtime12의 full current mesh 양 ABI2회, **총12 GPU runs**에서 pass=true·exit0·API+Shader Validation 오류0·foreign 오류0으로 통과했다. 이는 아래146-case forced/native proof와 별도의 두 native cut이다([manifest·suite별 결과](IMPLEMENTATION-HISTORY.ko.md#p2-12-이전-apple-family-depth-bounds-emulation--2026-10-05)). 초기 native50-case/회귀8회·regular probe52/56 matches와4 expected noDSV mismatch·GPTK 정적 gate는 [당시 이력](IMPLEMENTATION-HISTORY.ko.md#p2-12-depth-bounds--2026-10-04)으로 보존하고 [후속 emulation 이력](IMPLEMENTATION-HISTORY.ko.md#p2-12-이전-apple-family-depth-bounds-emulation--2026-10-05)과 구분한다.
+
+- Early bounds reject는 internal explicit-depth shader의 **zero-mask discard**로 depth/stencil commit 전에 적용하고 deferred user PS/UAV는 survivor에만 실행한다. Late PS/UAV는 원래 coverage대로 실행한 뒤 output/depth/stencil/query만 같은 bounds mask로 거부한다. Readonly·DepthEnable=false에서도 stored depth 비교를 생략하지 않는다. WoW64는 새 flag byte53을 명시적으로 copy하고 PE32/PE64와 pointer-free CPU/AIR/MSL layout assertions를 맞췄다. 내부 object/mesh producer render pass는 recorded visibility state에 필요한 retained visibility scratch를 보유하며 query를 끄지 않는다.
+- 기본50 cases에 더해 producer36은 VS/HS/DS/GS/AS/MS의1×/4×·pass/reject 및 stage UAV/atomic·color/depth/stencil/query를, pixel32는 atomic64/typed/ROV·pixel/sample-frequency·early/late를, coverage28은 VS/GS/HS+DS/HS+DS+GS/MS/AS+MS conservative coverage와 forced1/4/8/16의 noDSV/illegal-DSV 계약을 검증했다. ForcedSampleCount의 DSV 금지는 그대로다.
+
+| Depth bounds proof | Forced emulation x64 / WoW64 | 복원 native runtime10 x64 / WoW64 |
+|---|---|---|
+| 기본50 | [runtime07 x64](../build/local/depth-bounds-emulation-20261004/forced-x64-02/result.json) / [runtime08 WoW64](../build/local/depth-bounds-emulation-20261004/forced-x86-03/result.json) | [x64](../build/local/depth-bounds-emulation-20261004/native-x64-01/result.json) / [WoW64](../build/local/depth-bounds-emulation-20261004/native-x86-01/result.json) |
+| Producer36·runtime09 | [x64](../build/local/depth-bounds-emulation-20261004/route-probes/forced-producers-x64-02/stdout.log) / [WoW64](../build/local/depth-bounds-emulation-20261004/route-probes/forced-producers-x86-02/stdout.log) | [x64](../build/local/depth-bounds-emulation-20261004/route-probes/native-producers-x64-01/stdout.log) / [WoW64](../build/local/depth-bounds-emulation-20261004/route-probes/native-producers-x86-01/stdout.log) |
+| Pixel32·runtime08 | [x64](../build/local/depth-bounds-emulation-20261004/route-probes/forced-pixel-x64-01/stdout.log) / [WoW64](../build/local/depth-bounds-emulation-20261004/route-probes/forced-pixel-x86-01/stdout.log) | [x64](../build/local/depth-bounds-emulation-20261004/route-probes/native-pixel-x64-01/stdout.log) / [WoW64](../build/local/depth-bounds-emulation-20261004/route-probes/native-pixel-x86-01/stdout.log) |
+| Coverage28·runtime09 | [x64](../build/local/depth-bounds-emulation-20261004/route-probes/forced-coverage-alignment02-x64-02/stdout.log) / [WoW64](../build/local/depth-bounds-emulation-20261004/route-probes/forced-coverage-alignment02-x86-02/stdout.log) | [x64](../build/local/depth-bounds-emulation-20261004/route-probes/native-coverage-alignment02-x64-01/stdout.log) / [WoW64](../build/local/depth-bounds-emulation-20261004/route-probes/native-coverage-alignment02-x86-01/stdout.log) |
+
+### Atomic64 완료와 전체 계약 proof
+
+**#15 전체 선정 계약을 완료했으며 AtomicInt64 typed/groupshared/heap 세 capability는 TRUE다.** Paired runtime30(manifest SHA256 `a96309ccc9bedb9f1bd31fdd7d4e838ac8fe0a1c2ebf9c95773ac43d48ec51ee`)에서 아래20개 GPU 실행을 모두 통과했다. 모두 exit0·Metal API+Shader Validation·owned native compiler/backend 확인·validation/foreign 오류0이다. Full-SM6의51 numerical cases와65536 invocations·target1/16 각각20회는 원래 full64 oracle·60초 fence·600초 runner deadline 그대로다.
+
+| Suite | 검증 계약 | x64 | WoW64 |
+|---|---|---|---|
+| sm6 | 51 numerical +65536 invocations·target1/16 각각20/20 | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-sm6-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-sm6-x86-01/result.json) |
+| atomic64-typed | 6 shapes×2 signs·operation/contention·ordinary/raw/format alias | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-typed-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-typed-x86-01/result.json) |
+| atomic64-phase | GPU-produced indirect/predication·cross-queue·alias ordering | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-phase-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-phase-x86-01/result.json) |
+| atomic64-producers | 9 producer paths×sample1/4의18 cases | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-producers-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-producers-x86-01/result.json) |
+| workgraphs-atomic64 | 32 records·384 full64 words·old/final/count/guards | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-workgraphs-atomic64-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-workgraphs-atomic64-x86-01/result.json) |
+| workgraphs-atomic64-typed | 16 texels·48 full64 words·physical-copy guards | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-workgraphs-atomic64-typed-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-workgraphs-atomic64-typed-x86-01/result.json) |
+| atomic64-pixel-coupled | ROV/non-ROV·typed/structured·depth/stencil/discard의40 cases | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-pixel-coupled-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-pixel-coupled-x86-01/result.json) |
+| atomic64-pixel-contention | 4096 fragments·ADD/CAS×target1/16의4 cases | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-pixel-contention-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-pixel-contention-x86-01/result.json) |
+| atomic64-helpers | 11 cases·helper read/effect·sample/discard/inclusive preservation | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-helpers-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-atomic64-helpers-x86-01/result.json) |
+| raytracing-atomic64 | Direct/indirect·native intersection 포함 전체 full64 oracle | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-raytracing-atomic64-x64-01/result.json) | [PASS](../build/local/p3-20261003/atomic64/final-runtime30-raytracing-atomic64-x86-01/result.json) |
+
+Raw stress의 SIMD retry 경합은 initial read부터 모든 CAS retry까지 RMW 전체를 elected lane에서 실행하여 해결했다. 최종 AIR stage metadata와 direct-call graph를 기준으로 native intersection에서 도달 가능한 READ/RMW wrapper는 기존 scalar 알고리즘을 유지한다. 해당 실행 문맥은 SIMD intrinsic을 허용하지 않으며, 공유 helper도 모든 caller에서 합법적이어야 한다. Shader 이름·입력별 예외나 수치 oracle 완화는 없다. [CPU contracts·실패→수정 및 최종 실행](IMPLEMENTATION-HISTORY.ko.md#새-p3-15-raw-atomic64-stress-진행-보장--2026-10-04)을 따른다.
+
+선행 검증은 runtime09 compute phase의 GPU-produced indirect/predication·cross-queue·alias ordering, runtime13 양 ABI의 full64 work-graph record 전달·exchange, runtime15 양 ABI의 compute groupshared 연산·64×1024 contention 및32KiB capacity다. Record 정렬 변경 뒤 일반 work-graph9 case도 runtime15 양 ABI에서 통과했다. Capacity만 Metal API-only validation이고 나머지 named GPU proof는 API+Shader Validation이다. [HISTORY의 실제 결과·manifest·검증 한계](IMPLEMENTATION-HISTORY.ko.md#새-p3-15-atomic-phase-physical-helper-promotion--source-cut-2026-10-03)를 따른다.
+
+Runtime15에서 실패했던 logical helper peer·inclusive-wave는 pure quad/SIMD 연산의 잘못된 write guard와 private replay-origin 처리를 수정한 뒤 runtime17 양 ABI의 기존 helper11 case 모두 통과했다. AS/MS groupshared64는 runtime16 양 ABI의 두 focused numerical case, ROV/non-ROV·typed/structured buffer64·pixel/4×sample·depth/stencil/discard/query 조합은 runtime18 양 ABI의40 ordered coupled cases, raytracing direct/indirect 확장은 runtime19 양 ABI의 전체 atomic64 oracle를 통과했다. Runtime20에서는 AIR2.9 texture-read ABI 수정 뒤 typed2D work-graph의16texel·48 full64 words·copy guards, 별도4096-fragment ADD/CAS retry-loop ×1/16 target4case도 각각 양 ABI에서 통과했다. 모두 API+Shader Validation·실제 owned compiler/backend 확인·validation/foreign 오류0이다. Typed 전체 shape acceptance는 후속 runtime23/24로 닫혔으며, 과거 별도 native 반복-RMW hang과 최신 public contention proof를 구분한다. Native PSO 생성만 성공한 결과를 GPU 수치 검증으로 세지 않는다.
+
+Runtime21에서는 fused-stage phase 전파와 private mesh capture metadata를 수정한 뒤9 graphics producer 경로 ×sample1/4의18 case가 양 ABI에서 full64 record·primitive count·pixel oracle, API+Shader Validation을 통과했다. Public4096-fragment 경로는8×8 application 타일을 Fragment fence로 순서화한다. 같은 native shader·arena로 누적4096 updates를64개8×8 encoder에 배치한 target1/16 control도 full64 chain·final·guards·reclamation·bitmap을 통과했다. Wide native draw의 Hang은 보존하며4096 동시 참여를 주장하지 않는다. [HISTORY의 admission 비교](IMPLEMENTATION-HISTORY.ko.md#새-p3-15-atomic-phase-physical-helper-promotion--source-cut-2026-10-03)를 따른다. Typed 전체6 shapes×2 signs·40 formats·ordinary32/float32 aliases도 runtime23 양 ABI에서 통과했고 runtime24에서 cap1을 요구하는 실제 consumer로 다시 통과했다.
+
+### Writable MSAA 완료와 focused proof
+
+**공유 경로 후속 회귀:** readonly depth-MSAA cast를 위해 constructor·Append·indirect residency를 변경한 paired runtime-07에서도 [x64](../build/local/p3-20261003/writable-msaa/runtime07-x64-01/result.json)·[WoW64](../build/local/p3-20261003/writable-msaa/runtime07-x86-01/result.json)가 기존80-case consumer를 cap1·API+Shader Validation으로 각각 PASS했다. Exit0·owned native compiler·validation_errors=[]·foreign_backend_loads=[]를 확인했다. 변경된 공유 경로의 writable 회귀이며 새로운 depth-cast acceptance나 fixture 범위 확장이 아니다.
+
+새 P3 **#21 완료(2026-10-03)**. OPTIONS14의 SDK 실제 필드 `WriteableMSAATexturesSupported=TRUE`를 보고한다. 공식 SM6.7의 `RWTexture2DMS`/`RWTexture2DMSArray` 및 DXIL opcode225 sample store를 소비하며, typed single-sample array shadows와 sample-ID table을 통해 sample별 UAV 접근을 구현한다. Native MSAA resource와의 GPU import/export는 raw integer view와 변경 baseline을 사용하여 typeless half/float bit pattern을 보존하고 inactive alias의 stale export를 막는다. View별 indirect resource residency와 allocation별 synchronization을 함께 유지한다.
+
+- **실제 public GPU proof:** immutable paired `build/local/p3-20261003/runtime-06`의 [x64 result](../build/local/p3-20261003/writable-msaa/runtime06-x64-01/result.json)·[WoW64 result](../build/local/p3-20261003/writable-msaa/runtime06-x86-01/result.json), 각각 [x64 stdout](../build/local/p3-20261003/writable-msaa/runtime06-x64-01/stdout.log)·[WoW64 stdout](../build/local/p3-20261003/writable-msaa/runtime06-x86-01/stdout.log)는 **cap1·ordered80 cases·exit0·API+Shader Validation·owned native compiler 확인·validation_errors=[]·foreign_backend_loads=[]**다.
+- **Oracle:** UINT 2/4/8× single/array, same/next-dispatch alias load, GetDimensions, transition 뒤 SRV, direct heap, sample/XY/layer OOB write 보존, clear+UAV barrier, native CopyResource·raster·MIN/MAX resolve, array subview와 null store/load를 검사했다. SINT/FLOAT의 compute/alias·SRV·copy/raster/resolve·all-sample clear 및 R16G16B16A16 typeless의 half subnormal/NaN payload/negative-zero bit와 float SRV 해석까지 실제 readback으로 확인했다.
+- **실패와 수정:** [runtime-05 x64](../build/local/p3-20261003/writable-msaa/runtime05-x64-01/result.json)는 mip 없는 DXIL GetDimensions의 `undef`를 physical array mip으로 전달해 width/height0을 보고했고, fixture가 single-sample resolve destination에 source의4MiB MSAA alignment를 남겨 생성이 실패했다. Shared query lowering은 omitted mip→0으로 고쳤고 fixture는 destination alignment를0으로 되돌렸다. Runtime validation을 완화하지 않았으며 실패 artifact를 보존했다.
+- **입력과 경계:** [maintained HLSL](tests/owned-d3d12-writable-msaa.hlsl)·[official DXC producer recipe](tests/build-writable-msaa.sh)의42 modules와 public consumer를 runner가 freeze/hash한다. 실제 환경은 M5 Pro/macOS27과 x64/WoW64 Wine이다. Metal native writable-MSAA 지원을 주장하지 않으며 정확한 emulation이다. D3D11, reserved MSAA, 전체 SM/FL conformance·다른 GPU/OS·게임·성능 및 Windows differential은 별도다. [재현 recipe](SMOKE-TEST.ko.md#writable-msaa-focused-proof)를 따른다.
+
+### Matrix runtime admission과 pinned V1 focused proof
+
+**Runtime slice의 양 ABI public behavior proof 완료, #20 전체 closure는 별도다.** Paired runtime-05에서 untouched SDK v1.721.2-preview와 대응 V1 계약의 query77/78, DevicePreview conversion footprint, CommandListPreview GPU conversion/maximum input records, CL11 WaitBarrier/SignalBarrier ABI를 확인했다. Union은 x64 56/x86 48 bytes다. 후속 V2 shape와 혼용하지 않고 normal MinGW explicit `RetVal` aggregate-return ABI를 사용한다. Fake `_MSC_VER`로 실제 backend와 다른 getter ABI를 선택하지 않는다.
+
+Conversion은 같은 datatype의 layout 변환이며 optimal layout의 supplied stride는 무시한다. Raw-byte GPU kernel이10 datatype ×16 layout pairs ×2 replays의 bit pattern과 padding을 보존했다. Component alignment(S8 offset32/F16 offset64 허용, misaligned F32 거부), footprint overflow/recording error, GPU-VA allocation과 caller recording release lifetime, predication, enhanced conversion sync를 검증했다. CL11은 기존 fence generation/rewind/removal 경로를 재사용하고 consumer-first cross-queue wait, signal retirement, caller 비동기성, resource state handoff와 released caller lifetime을 확인했다. MaximumGPUInputRecords는 GPU dispatch의 실제 record/node 수를 검사하며 reset 후 default 복원 및4 records/max3 rejection을 확인했다.
+
+Public `D3D12EnableExperimentalFeatures`는 정확한 `D3D12ExperimentalShaderModels` GUID와 no-config를 검증한다. Unchanged set은 device를 보존하고 실제 changed set은 모든 live device를 기존 ReportRemoval로 제거한다. Registry는 성공적으로 초기화한 device를 non-owning으로 등록하고 파괴 전에 해제하며 removal callback을 process registry lock 밖에서 실행한다. Unknown/malformed·두 device removal·pending fence wakeup·파괴 후 set 변경의 public regression이 통과했다. Owned backend policy는 GUID 직접 opt-in이며 Windows Developer Mode registry 검사/변경이 아니다.
+
+API+Shader Validation 결과는 [matrix x64](../build/local/p3-20261003/matrix/runtime05-public-x64-02/result.json)·[WoW64](../build/local/p3-20261003/matrix/runtime05-public-x86-01/result.json), [work-graphs x64](../build/local/p3-20261003/matrix/work-graphs05-public-x64-01/result.json)·[WoW64](../build/local/p3-20261003/matrix/work-graphs05-public-x86-01/result.json)다. Work-graphs는 기존9 case와 limit reset/reject를 함께 확인했다. [SMOKE recipe](SMOKE-TEST.ko.md#matrix-runtime-admission과-pinned-v1-focused-proof)와 [실패→수정 이력](IMPLEMENTATION-HISTORY.ko.md#새-p3-20-matrix-runtimepublic-admission--2026-10-03)을 따른다.
+
+Runtime-05의 **LinearAlgebraTier0 / legacy support FALSE**는 첫 behavior proof의 정직한 capability 경계다. Shader oracle와 최종 Tier1/native shape query·readback enabled-cut proof를 이 결과로 대체하지 않는다. 전체 #20·공개 SM/FL·다른 GPU/OS·ARM64/FEX guest 완료를 선언하지 않는다.
+
+### WaveMMA·linear-algebra 최종 positive-cap proof
+
+**새 backlog P3 #20 완료: 구형 WaveMMA와 후속 pinned SM6.10 preview matrix 모두.** Runtime-05 public runtime behavioral, runtime-06 numerical shader consumer, runtime-07 final advertised-cap의 양 ABI 증거를 결합한 완료다. 최신 단일 cut에서 full suites를 전부 재실행한 결과가 아니다. Mandatory atomic 통합 acceptance가 남아 ordinary HighestShaderModel은6.5를 유지하며 preview matrix 완료를 전체 SM6.10 conformance로 읽지 않는다.
+
+**2026-10-03 immutable runtime-07에서 두 public 계약의 최종 advertised-cap query와 successor conversion readback이 양 ABI PASS였다.** Retired actual SDK query38/OPTIONS9는 [x64](../build/local/p3-20261003/matrix/caps07-retired-x64-02/result.json)·[WoW64](../build/local/p3-20261003/matrix/caps07-retired-x86-01/result.json), successor actual SDK query77/78/OPTIONS9는 [x64](../build/local/p3-20261003/matrix/caps07-preview-x64-01/result.json)·[WoW64](../build/local/p3-20261003/matrix/caps07-preview-x86-01/result.json)다. 네 결과 모두 exit0·pass=true·API+Shader Validation·owned native backend·validation_errors=[]·foreign_backend_loads=[]이며 manifest SHA256는 `1a79c00dd85e4d2528bcf5edbdafb0469081e8bd1ad4737b40da6865cee28042`다.
+
+WaveMMATier10과 LinearAlgebraTier16을 실제 public consumer로 확인했다. Retired query는 BYTE/F16/F32 ×M16/64 ×N16/64의12 combinations에서 K16·accumulator flags·wave32를 요구했다. Successor V1은10 construction types,6 operation arms, native16³ count/fill와 untouched capacity tail, F16 emulated-output flags, group32–1024, vector transpose, atomic buffer/group를 확인했다. Query union은 x64 56/x86 48 bytes이며 각 successor run은 caller resources/recording 해제 뒤 한 isolated conversion의 exact GPU readback까지 통과했다. SDK는 각각 untouched archived/preview header이고 한 translation unit에 섞지 않았다.
+
+Main의 최종 source cut은 transient capability gate를 제거하고 query38/77/78 및 OPTIONS9를 일치시켰다. 앞의 runtime-05 behavioral proof, runtime-06 shader numerical/consumer proof와 이 runtime-07 positive-cap proof는 서로 다른 named cuts의 증거다. 이미 통과한 full runtime/shader bodies를 반복하지 않았다. 전체 SM/FL·published final322–342 producer GPU·다른 GPU/OS·게임/성능·ARM64/FEX/no-Rosetta 완료로 확대하지 않는다. [작은 최종 smoke recipe](SMOKE-TEST.ko.md#wavemmalinear-algebra-최종-positive-cap-proof)를 따른다.
+
+### WaveMMA와 linear-algebra shader consumer proof
+
+**2026-10-03 immutable runtime-06에서 구형·후속 matrix shader의 양 ABI numerical/consumer proof를 완료했다.** [x64](../build/local/p3-20261003/matrix/gpu-06-x64-01/result.json)·[WoW64](../build/local/p3-20261003/matrix/gpu-06-x86-01/result.json)는 각각 strict11 ordered cases·exit0·`pass=true`·Metal API+Shader Validation·owned native compiler/load 확인·`validation_errors=[]`·`foreign_backend_loads=[]`다. Runtime manifest SHA256는 `7b7e3073cba13d88bfea91d9773a07287030f59dd619175672fcd305bc041ac7`다. Shader proof와 당시 비활성 cap은 구분하며 #20 전체 closure는 최종 enabled-cut public query proof와 함께 판단한다.
+
+- **실제 producer/입력:** archived DXC v1.8.2306-preview의 experimental `cs_6_8` WaveMMA226–237과 v1.10.2605.37의 experimental `cs_6_10` high-bit11–31/`dx.targetTypes`를 그대로 소비했다. [Producer provenance](tests/dxil/matrix-producers.json)·[HLSL와 regeneration recipe](tests/dxil/build-matrix.sh)·11 frozen DXIL이 유지된다. IR opcode/version을 바꾼 bytecode가 아니며 published final322–342 producer의 GPU 검증으로 확대하지 않는다.
+- **구형 계약:**12 operations, raw/shared load-store, accumulation·scalar/fragment op, packed S8/U8의4 signedness 조합과 nonuniform Fill/roundtrip·fragment sum, F16 subnormal 입력의 F16/F32 accumulation, M/N16·64의4 shape를 whole-buffer exact/float oracle와 padding guards로 확인했다. Wave32의 distributed storage/collective 연산으로 구현하며 native Metal matrix만 있는 경우로 제한하지 않는다.
+- **후속 계약:** wave/group의 immutable matrices, 두 SIMD를 쓰는 group multiply, signed/unsigned required-byte pairs, cast/transpose/coordinates,10 construction formats의 wave/group raw bits·padding, S32/U32/F32 raw+shared atomic add 및 outer/vector accumulate를 실제 readback으로 확인했다. Thread vector는 S8/U8, mandatory F32→S8 quantization와 F16 paths/bias를 검사했다. 실제 public `ConvertLinearAlgebraMatrix`로 ColumnMajor weights를 MulOptimal로 바꾸고, 원래 weights를 poison한 resource에서 shader가 변환된 결과를 소비했다. `MATRIX_PUBLIC_SHADER_ADMISSION_PASS`와 `MATRIX_CONVERTED_VECTOR_CONSUMER_PASS`를 runner가 필수로 요구한다.
+- **정합/경계:** metadata·opcode·shader-version 검증을 Parse 경계에서 수행하고 scalarized component ABI, wave32 shuffle/group barriers 및 byte-preserving packed memory 연산으로 AIR에 낮춘다. Untouched public SDK의 MinGW explicit `RetVal` getter ABI와 device 생성 전 experimental GUID opt-in을 사용한다. RNE는 기존 DXIL unary26→AIR rint 경로를 재사용한다. 다른 GPU/OS·전체 SM/FL·signed/final SM6.10 producer·게임/성능·D3D11·ARM64/FEX guest/no-Rosetta proof는 아니다. [재현 recipe](SMOKE-TEST.ko.md#wavemma와-linear-algebra-shader-focused-proof)를 따른다.
+
+### Native vector 완료와 focused proof
+
+**새 backlog P3 #18 완료(2026-10-03).** Genuine final DXC1.9.2609.5의 SM6.9/DXIL1.9 입력을 받아 fixed native vector2–1024와 허용된 library-interface singleton을 검증한다. Helper ABI inline·SSA/phi·dynamic extract/insert·aggregate/global/alloca byte-layout와 elementwise intrinsic을 scalar AIR로 낮춘다. RawBufferVectorLoad/Store303/304는 raw·structured·direct-heap binding, per-component bounds/zero/drop·alignment·tile status를 보존하고 vector AND/OR/FDot309–311 및 componentwise WaveActiveAllEqual·전체 component WaveMatch를 구현한다. Typed resource/cbuffer의 금지된 long-vector overload와 잘못된 length/version은 거부한다.
+
+- **최종 public GPU:** paired `p3-20261003/runtime-04`의 [x64 result](../build/local/p3-20261003/vectors/gpu-x64-04/result.json)·[WoW64 result](../build/local/p3-20261003/vectors/gpu-x86-04/result.json)는 각각32 ordered cases·exit0·pass=true, **Metal API+Shader Validation**, `dxil_native_compiler_verified=true`, `validation_errors=[]`, `foreign_backend_loads=[]`다. 같은 manifest SHA256는 **f5f5aa08617aef02a416a48867ad8fdee3ddbe659c7fefa676660a0dce0f8f93**다. 두 ABI를 exclusive GPU window에서 직렬 실행하고 전용 prefix를 stop/wait했다.
+- **독립 readback oracle:** 5개 raw/group-shared/helper/wave case, 4개1024-component dynamic-index case, f32 preserved-denormal/precise dot1, loop/branch/phi8, binary64·uint64·native-half 각1, heap3, structured3, 실제 VS+PS1, mapped/cross-tile/unmapped/overflow status4를 host integer/bit oracle와 비교했다. Partial64-bit word access와 OOB zero/drop, structured stride32 및 wrapped index를 실제 소비한다. Frozen12 DXIL·2 root signatures와 producer/source를 보존했다.
+- **CPU-only boundary 증거:** [28 contract/lowering checks](../build/local/p3-20261003/vectors/vector-contract.log)는 invalid length/scalable/version/overload·resource shape, library singleton, i8 shuffle/reduction와 i1 reduction/prefix legalization 및 실제 frozen legacy DXR contract를 검사한다. 이 CPU IR 검증을 GPU wave numerical proof로 세지 않는다. 기존 DXR의 legacy resource aggregate를 native-vector overload로 잘못 분류했던 문제는 suffix/opcode classifier로 수정했으며 [runtime-02 full DXR 양 ABI 회귀](#hitobject-완료와-focused-proof)를 따른다.
+
+일반 compiler 입력 상한은 SM6.9지만 공개 **HighestShaderModel6.5/FL12_1**은 mandatory atomic 전체 계약을 닫기 전 유지한다. Matrix preview ABI는 이 vector 완료와 별개다. Apple M5 Pro/macOS27의 지정 양 ABI acceptance이며 다른 GPU/OS·전체 SM/FL conformance·게임·성능·D3D11 cap·ARM64/FEX guest 또는 no-Rosetta 성공을 주장하지 않는다. [SMOKE recipe](SMOKE-TEST.ko.md#native-vector-focused-proof)를 따른다.
+
+### FP64 완료와 focused proof
+
+**새 backlog P3 #22 완료(2026-10-03).** 공개 `DoublePrecisionFloatShaderOps=TRUE`를 binary64 정수 emulation으로 구현했다. Metal native double ALU나 f32로 축소하는 경로가 아니다. Berkeley SoftFloat 3e의 정수 core와 owned AIR helper를 DXIL의 scalar/vector·constant·aggregate·phi/select·load/store·function ABI에 연결하고, DXBC의19개 double opcode를 xy/zw word pair와 source abs/neg·destination mask를 보존해 낮춘다. DADD/DMUL/DDIV/DFMA, 비교·min/max·move 및 float/int 변환이 같은 exact helper를 사용하며 final AIR optimizer 전에 필요한 helper만 link한다. NaN payload 선택은 D3D의 허용 범위이고, signed zero·double denormal·RNE와 정수 변환의 NaN0·saturation을 보존한다. DXIL의 binary32 `preserve`와 `ftz` 변환 모드도 구분한다.
+
+- **최종 public GPU:** paired `p3-20261003/runtime-04`의 [x64 result](../build/local/p3-20261003/fp64/public-runtime04-x64/result.json)·[WoW64 result](../build/local/p3-20261003/fp64/public-runtime04-x86/result.json)는 각각8 case·exit0·`double=1`·**Metal API+Shader Validation**, `dxil_native_compiler_verified=true`, `validation_errors=[]`, `foreign_backend_loads=[]`다. Runtime manifest SHA256는 **f5f5aa08617aef02a416a48867ad8fdee3ddbe659c7fefa676660a0dce0f8f93**이며 두 실행은 같은 owned `winemetal.so`를 사용했다.
+- **실제 consumer와 독립 oracle:** ABI별8 case 순서는 `fp64`, `fp64_ftz`, `fp64_legacy50`, `fp64_legacy51`, `fp64_wave`, `fp64_graphics`, `fp64_graphics_legacy50`, `fp64_graphics_legacy51`이다. Compute는 각1024 edge/random 입력의 bit 결과·정수 변환·groupshared·select를 host double oracle와 비교한다. Graphics는 실제 VS DFMA/fma의 -2^-104 cancellation 값을 uint2 varying으로 PS에 전달하고64 pixels의 double 결과를 비교한다. Genuine DXC DXIL과 **Windows SDK native FXC의 DXBC5.0/5.1**을 별도로 소비하며 버전 metadata를 바꾼 DXIL이 아니다.
+- **Wave numeric/bit 계약:** `[WaveSize(4)]`에서 +0/-0의 AllEqual true, NaN의 unordered false, min/max·sum/product 및 double denormal을 검사했다. ReadLaneFirst/ReadLaneAt은 NaN·signed-zero payload bits를 그대로 보존했다.
+- **독립 보조 증거:** [native-proof-constant.log](../build/local/p3-20261003/fp64/native-proof-constant.log)의 CPU720896·native Metal compute720896·graphics1024 checks PASS와6개 FXC CS/VS/PS final AIR conversion은 위 public proof를 대신하지 않는 별도 domain 증거다. 이전 helper 실패는 AIR long long의128-bit 폭과 constant table의 address-space 문제였고 실제64-bit typedef·AS2 constant로 수정했다.
+
+두 ABI는 exclusive GPU window에서 직렬 실행했고 전용 prefix를 stop/wait했다. [SMOKE recipe](SMOKE-TEST.ko.md#fp64-dxil과-dxbc-focused-proof)를 따른다. 이 완료는 Apple M5 Pro/macOS27의 지정 D3D12 numerical/consumer acceptance이며 성능 향상·다른 GPU/OS·전체 shader-model/feature-level·다른 P3·D3D11 cap 또는 ARM64/FEX guest 완료를 선언하지 않는다. 과거 FP64 rejection 기록은 당시 checkpoint로 보존한다.
+
+### HitObject 완료와 focused proof
+
+**새 backlog P3 #19의 HitObject subset 완료(2026-10-03); 당시 별도였던 OMM은 아래 runtime-04 public proof로 완료됐다.** Final upstream DXC의 genuine `lib_6_9` 입력을 기존 owned DXR traversal에 연결했다. TraceRay는 any-hit/intersection까지 실행하고 closest-hit/miss는 Invoke에 지연한다. HitObject는 frame·hit·attribute·SBT index를 값으로 보존하므로 같은 trace callsite 반복, 복사·배열·aggregate, query Reset 뒤에도 snapshot이 유지된다. Invoke는 현재 payload와 recursion frame으로 재진입한다. FromQuery의 최초 unbound 상태, NOP/miss, index mask, triangle/procedural attributes, local-root byte offset과 ray/transform getters를 구현했다. `MaybeReorderThread`의 규격상 허용된 no-op은 **성능상 reordering 지원 주장이 아니며**, 이 한 opcode만으로 완료 판정한 것도 아니다.
+
+- **Runtime-02 public GPU:** 전용 [x64](../build/local/p3-20261003/hitobject/public-runtime02-x64/consumer.log)·[WoW64](../build/local/p3-20261003/hitobject/public-runtime02-x86/consumer.log)는 각각4 raygen·280 exact output word를 검사하고 `hitobject status=PASS`, exit0를 기록했다. 동일 cut의 [full DXR x64](../build/local/p3-20261003/hitobject/full-runtime02-x64/consumer.log)·[WoW64](../build/local/p3-20261003/hitobject/full-runtime02-x86/consumer.log)도 HitObject와 기존 geometry/state-object/16 AS/RayQuery 모든 stage/root/SBT/coverage/linkage oracle을 포함해 `RAYTRACING_PASS`, exit0다. 네 실행은 exclusive window에서 직렬로 **Metal API+Shader Validation**을 켰고 Metal validation fault를 관찰하지 않았다. Expected invalid state-object rejection 진단은 negative oracle의 일부다.
+- **실제 native consumer:** [consumer-run.log](../build/local/p3-20261003/hitobject/consumer-run.log)는 AIR export/link와 `MTLLibrary`, linked compute pipeline 생성 `PIPELINE_PASS`를 기록했다. 초기 non-opaque carrier 재정의 및 local metadata remapping assertion을 고친 뒤 얻은 결과다. 이 native pipeline 생성 자체를 GPU readback으로 세지 않는다.
+- **Runtime-02 고정 입력과 당시 strict gate:** [당시 GPU 입력](../build/local/p3-20261003/hitobject/raytracing-hitobject.dxil)의 [SHA256](../build/local/p3-20261003/hitobject/frozen-input-sha256.txt)은 **1ac2ebeec95c0fdc11c7993edaa7bba5fdb256002794f5334e72e5419119e87f**다. Source·genuine producer와 당시 full fixture의 HitObject PASS 정확히1개·ordered case gate를 보존했다. [실제 양 ABI 로그의 missing/duplicate/FAIL mutation](../build/local/p3-20261003/hitobject/strict-captured-predicate.log) 및 [21 ray diagnostics tests](../build/local/p3-20261003/hitobject/strict-predicate-tests.log)가 통과했다. 이후 현행 frozen 입력에 추가된 REORDER_SCOPE memory edge를 이280-word historical proof로 소급 검증하지 않는다.
+
+**Runtime-06 최종 SER memory consumer:** [x64](../build/local/p3-20261003/hitobject/coherence/public-runtime06-long-x64/result.json)·[WoW64](../build/local/p3-20261003/hitobject/coherence/public-runtime06-long-x86/result.json) official runner는 기존 full DXR·280-word HitObject와 새64-lane×8=512-word oracle를 모두 통과했다. 각 결과는 exit0/pass=true, API+Shader Validation, staged owned native compiler verified, validation_errors=[]·foreign_backend_loads=[]다. Manifest SHA256는 **7b7e3073cba13d88bfea91d9773a07287030f59dd619175672fcd305bc041ac7**이며 두 ABI를 직렬 실행하고 prefix를 stop/wait/remove했다.
+
+실제 reordercoherent UAV에 lane별 두 message를 쓰고 Barrier(UAV_MEMORY,REORDER_SCOPE)와 세 MaybeReorderThread overload를 거친 뒤, deferred closest-hit/miss가 같은 dispatch-index의 두 UAV 값을 실제 읽어 payload를 만든다. 후속 write/fence/read와 hit/miss 상태까지8 words를 독립 host 정수 oracle로 비교한다. 64 invocations > 보고된 WaveLaneCountMax32이므로 한 wave에 제한된 시험이 아니다. 다른 dispatch-index의 global rendezvous를 가정하지 않는다. Genuine final DXC lib_6_9 -O0의 현행 frozen DXIL SHA256는 **568dad8f94656c94f20df9d9ebf1b3d1b9fbb11d9544f5523c5ca6f24226ed28**다. Strict gate는 실제64 ordered rows의512 값을 재계산하며 summary만으로 PASS를 허용하지 않는다.
+
+최초 [x64120초 deadline 결과](../build/local/p3-20261003/hitobject/coherence/public-runtime06-x64/result.json)는 legacy linkage 이후 HitObject 전에 harness timeout과 잘린 trace를 기록했다. Production validation을 완화하거나 memory oracle를 줄이지 않고 명시적600초 deadline으로 같은 전체 consumer를 실행했다. 실패 기록을 보존하며 timeout을 SER memory failure 또는 성공으로 소급 해석하지 않는다.
+
+**경계:** Runtime-02 proof는 이후 추가된 pre-SM6.9 legacy OMM opt-in 경계를 포함하지 않는다. OMM public traversal와 modern/legacy flag-matrix acceptance는 아래 runtime-04 proof를 따른다. Runtime-02의 RaytracingTier1.1 보고는 해당 historical cut의 값이다. 전체 SM6.9/FL·다른 GPU/OS·게임·성능·ARM64/FEX guest를 주장하지 않는다. [재현 recipe](SMOKE-TEST.ko.md#hitobject와-기존-dxr-focused-proof)를 따른다.
+
+### Opacity micromap 완료와 public GPU proof
+
+**P3 #19의 OMM 계약 완료(2026-10-03).** Final SDK1.619.5의 실제 layout·constant만 extension header에 추가하고 unrelated vendored SDK는 바꾸지 않았다. OMM array는 native AS가 없는 ordered GPU shadow resource이고, BLAS는 OC1 2/4-state 및 subdivision0–12, signed special index·8/16/32-bit index·BaseLocation, linkage update/disable, unknown/force-2-state 및 opacity/cull precedence를 software traversal에 연결한다. TraceRay·HitObject·RayQuery가 classifier를 공유하며 SM6.9 query는 explicit opt-in만, pre-SM6.9 query는 pipeline flag opt-in을 따른다.
+
+- **동일 immutable runtime-04 양 ABI official runner:** [x64 result](../build/local/p3-20261003/omm/public-runtime04-x64/result.json)·[WoW64 result](../build/local/p3-20261003/omm/public-runtime04-x86/result.json)는 각각 exit0, pass=true, Metal API+Shader Validation, owned backend/native compiler load verified, foreign backend 없음, validation_errors 빈 배열이다. Manifest SHA256는 **f5f5aa08617aef02a416a48867ad8fdee3ddbe659c7fefa676660a0dce0f8f93**다. 각 ABI는 modern56,206+legacy3,604 exact comparisons와 ordered27 subdivision case를 검사했다.
+- **실제 lifecycle:** Independent physical-microtriangle oracle와 opted-out modern query, GPU-produced descriptors/data의 FIFO·lifetime, index/base/special 및 ray/instance flag matrix, tools decode, array/BLAS clone·compact·serialize·deserialize, mixed ordinary+OMM BLAS nonnull array-pointer relocation과 exact postbuild-sized export, null-array uniform-state export, in-place/out-of-place linkage update를 통과했다. Levels0–5는 전 cell, levels6–12는 level별32 sample이다.
+- **실패를 고친 root cause:** [runtime-03 x64 실패](../build/local/p3-20261003/omm/runs-03-x64-b/consumer.log)는 physical oracle의 두 geometry 중 SBT group1 누락과 Metal의8-byte compacted-size write가 인접 OMM marker를 덮는 문제를 드러냈다. SBT binding과 ordered marker/count restoration으로 고쳤다. Serialized block은 ordinary/null geometry가 아닌 nonnull array references만 담는다. 실패를 그대로 보존하고 변경 없는 ABI retry를 하지 않았다.
+- **영구 입력·gate:** Genuine [modern/legacy frozen hash](../build/local/p3-20261003/omm/frozen-input-sha256.txt), producer/source, independent fixture와 strict raytracing-omm suite를 보존했다. [실제 양 ABI capture mutation](../build/local/p3-20261003/omm/strict-captured-predicate.log)의16 CPU-only checks는 missing level/legacy/relocation, duplicate PASS, short summary, explicit failure, unverified native module을 거부했다. [재현 recipe](SMOKE-TEST.ko.md#opacity-micromap-public-acceptance)를 따른다.
+
+**새 P3 #19 전체 완료(2026-10-03).** Runtime-06의 OMM·Tier1.2·final OPTIONS22·RTAS0 admission proof와 같은 cut의 실제 HitObject+multi-wave REORDER_SCOPE memory readback으로 계약을 닫았다. Runtime-02/04의 tier1.1/OPTIONS22 부재는 historical checkpoint로 유지한다. ShaderExecutionReorderingActuallyReorders=FALSE이며 MaybeReorderThread는 규격상 허용된 no-op scheduling이다. Memory visibility와 deferred invocation은 실제 구현·소비했고 실제 thread migration이나 성능상 SER 최적화를 주장하지 않는다. 전체 SM/FL 상향, 별도 #15 atomic RT, 다른 GPU/OS·게임·ARM64/FEX guest 완료로 확대하지 않는다.
+
+공개 cap source는 final SDK1.619.5의 OPTIONS5 tier12 및 OPTIONS22(feature65,16-byte layout)로 정합화했다. `ShaderExecutionReorderingActuallyReorders=FALSE`, `CreateByteOffsetViewsSupported=FALSE`, `Max1DDispatchSize/Max1DDispatchMeshSize=65535`는 기존 실행 경계의 정직한 보고다. 현행 OMM fixture는 정확한 query ABI와8개 negative query, real serialized RTAS0 driver admission을 필수 gate로 검사한다. 이 공개 query 계약은 새 runtime-06 public acceptance로 검증했고, runtime-04 기록을 소급하지 않는다. [DXR tier](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#d3d12_raytracing_tier)는1.2의 추가 계약을 OMM+SER로 정의하고, [SER Device Support](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#ser-device-support)는 실제 scheduling reordering 없이도 HitObject·deferred Invoke를 구현하는 것이 conforming임을 명시한다. [Serialized data type](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#d3d12_serialized_data_type)의 RTAS0는 OMM array를 포함한다. 별도 OMM serialized enum이나 `SERHint` capability 이름을 만들지 않는다.
+
+새 immutable runtime-06의 [x64](../build/local/p3-20261003/omm/public-runtime06-x64/result.json)·[WoW64](../build/local/p3-20261003/omm/public-runtime06-x86/result.json) official runner는 두 ABI 모두 tier12·OPTIONS22 정확한16-byte query/8개 rejection·canary, real OMM array/mixed BLAS RTAS0 driver matching 및 null/type/version rejection, modern56,206+legacy3,604/27 ordered cases를 통과했다. Exit0/pass=true, API+Shader Validation, staged owned native compiler verified, foreign backend 없음·validation_errors=[]이며 runtime manifest SHA256는 **7b7e3073cba13d88bfea91d9773a07287030f59dd619175672fcd305bc041ac7**다. 두 전용 prefix의 stop/wait를 완료했다. [최종 production predicate capture mutation24 CPU checks](../build/local/p3-20261003/omm/strict-runtime06-captured-predicate.log)는 두 실제 ABI capture에 missing/duplicate PASS·legacy/level/relocation·cap ABI/hint·driver admission·native compiler 및 explicit failure 변형을 적용했으며 GPU 제출은0개다.
+
+### Wave size 확장 완료와 focused proof
+
+**새 backlog P3 #23 완료(2026-10-03).** OPTIONS1은 **WaveLaneCountMin4 / WaveLaneCountMax32**를 보고하며 기본 선택은32다. Native SIMD32를 virtual4/8/16으로 나누어 ballot·participation·shuffle/read-first·reduction·prefix·Match·i64 교환을 실제 선택 폭에 맞춘다. Compute 및 work-graph node의 fixed/ranged WaveSize와 PSV expected-width 제약을 함께 검사한다.
+
+필수 `[WaveSize(64)]`·`[WaveSize(128)]`·64–128 전용 range는 PSO 초기화에서 **E_FAIL·null PSO**와 명시적 unsupported-width 진단으로 거부한다. 폭을 임의로32로 바꾸지 않는다. 반면32를 허용하는 flexible range의 unavailable preferred64는32를 선택할 수 있다. Cross-SIMD64/128 실행·동기화 모델은 구현·보고하지 않는다.
+
+Paired `build/local/p3-20261003/runtime-02` manifest SHA256는 **a2708cd565c32a40a6e359467e3f175b35524a50d16a0ef753f48ff87b46988e**다. 다음 네 public guest 실행은 모두 exit0·PASS·**API+Shader Validation**, `validation_errors=[]`, `foreign_backend_loads=[]`, `dxil_native_compiler_verified=true`다.
+
+| 실행 | Case·oracle | 결과 |
+|---|---|---|
+| `waves` x64 | 24: fixed4/8/16/32, SM6.8 ranges/preferred, divergence·i64, 필수64/128 거부 및 기존32 quad/helper/VS 회귀 | [result.json](../build/local/p3-20261003/waves/gpu-x64-02/result.json) |
+| `waves` WoW64 | 같은24 case | [result.json](../build/local/p3-20261003/waves/gpu-x86-02/result.json) |
+| `work-graphs` x64 | 기존9 case·정확한 record oracle; coalescing node의 WaveSize4 count4·sum6·ballot0xf·next-lane shuffle | [result.json](../build/local/p3-20261003/waves/node-gpu-x64-02/result.json) |
+| `work-graphs` WoW64 | 같은9 case 및 legal node-stage WaveSize4 | [result.json](../build/local/p3-20261003/waves/node-gpu-x86-02/result.json) |
+
+네 실행은 exclusive GPU window에서 직렬 실행했고 전용 prefix를 stop/wait/remove했다. [SMOKE recipe](SMOKE-TEST.ko.md#wave-size와-nodewave4-focused-proof)는 shared SM6 fixture의 `--waves-only`와 full WorkGraphs consumer를 사용한다. 과거 날짜의 wave32-only checkpoint는 보존한다. Apple M5 Pro/macOS27의 지정 양 ABI acceptance이며 다른 GPU/OS·전체 SM/FL conformance·FP64/vector/matrix·성능·게임·ARM64/FEX guest proof로 확대하지 않는다.
+
+### Mesh AS derivatives 완료와 focused proof
+
+**새 backlog P3 #17 완료(2026-10-03).** 기존 signature remap·MS/AS derivative와 implicit Sample/Bias/Cmp/CalculateLOD lowering을 재사용하고 genuine DXC6.6 producer·public Mesh/AS consumer·OPTIONS9 보고를 연결했다. 기존 MeshShaderTier1 필수 출력/cull 계약이나 구형 WaveMMA·후속 SM6.10 matrix와 별개다.
+
+Paired `build/local/p3-20261003/runtime-01` manifest SHA256는 **2ab82529f066ab6fc58c9cf36c3fa3c97398642026b41a1d903cf23c310cfff2**다. Full mesh [x64](../build/local/p3-20261003/mesh/final-mesh-shader-x64/result.json)·[WoW64](../build/local/p3-20261003/mesh/final-mesh-shader-x86/result.json)는 모두 exit0·PASS, **API+Shader Validation**, `validation_errors=[]`, `foreign_backend_loads=[]`, `dxil_native_compiler_verified=true`다. 양 ABI stdout은 실제 `derivatives=1`·six positive derivative cases·invalid-shape rejection 및 기존 mesh suite의 최종 PASS를 기록했다.
+
+- **수치·quad oracle:** MS/AS 각각1D32×1×1·2D8×4×1·3D4×2×2의2 groups, ABI별320 lanes에서 **2560 identity +5120 numerical words**를 검사했다. f32 fine/coarse derivatives·quad X/Y/diagonal/ReadLaneAt3, f16 fineX/Y, 독립 uploaded per-mip constant oracle에 대한 Sample·SampleBias(bias1)·SampleCmp와 clamped/unclamped LOD 결과과 실제 AS payload/mesh 출력·sentinel을 확인했다. Invalid group shape 두 입력은 의도적 DXC `-Vd` producer이며 유효 shader의 거부로 해석하지 않는다.
+- **동일 cut 회귀:** pipeline-cache [x64](../build/local/p3-20261003/mesh/final-pipeline-cache-x64/result.json)·[WoW64](../build/local/p3-20261003/mesh/final-pipeline-cache-x86/result.json)도 같은 manifest에서 exit0·API+Shader Validation PASS, validation/foreign-backend 오류0이다. 소유자가 네 전용 prefix의 stop/wait/remove를 완료했으며 결과·frozen 입력·로그는 남겼다.
+- **한계:** Apple M5 Pro/macOS27의 지정 x64/WoW64 fixture와 capability 완료다. 공개 **SM6.5/FL12_1 유지**, 전체 SM6.6/conformance·다른 P3·다른 GPU/OS·Windows differential·게임·성능·ARM64/FEX guest acceptance로 확대하지 않는다. 이전 중간 x64-only 관찰을 이 양 ABI 최종 cut으로 소급 바꿔 쓰지 않는다.
 
 ### P0 공개 계약 정합
 
-**P0-1–4 완료(2026-10-02).** 과거 backend 개발 단계와 다른 API 계약 묶음이다. 루트 소스·공개 fixture·consumer 실행을 구분하며 최신 D3D12/DXGI 전체 conformance를 선언하지 않는다. 다음 우선순위는 P1 programmable sample positions이며 ARM64/FEX guest는 사용자 보류를 유지한다.
+**P0-1–4 완료(2026-10-02).** 과거 backend 개발 단계와 다른 API 계약 묶음이다. 루트 소스·공개 fixture·consumer 실행을 구분하며 최신 D3D12/DXGI 전체 conformance를 선언하지 않는다. 후속 P1은 아래 지정 범위로 완료했으며 ARM64/FEX guest는 사용자 보류를 유지한다.
 
 | 항목 | 현행 계약과 경계 |
 |---|---|
@@ -34,1039 +449,307 @@ VRS·sharing4 runs는 **API+Shader Validation·validation_errors=[]·foreign_bac
 
 **실패 증거와 한계:** [P0-1 before assert](../build/local/p0-contracts-r5KJ0O/protection-notification/before-x64-02.stderr.log), [P0-2 wrong-LUID](../build/local/remaining-inventory-stYzia/adapter-luid.log), [P0-3 before Resource1 E_NOINTERFACE](../build/local/p0-contracts-r5KJ0O/resource-interfaces/before-x64-01/stderr.log), P0-4 before core 양 ABI62 failures·NGX1 failure는 보존했다. P0-3 `after-*-02`는 enhanced-layout texture에 필수 COMMON handoff 없이 legacy barrier를 쓰던 **잘못된 fixture oracle** 실패다. [공식 interop 계약](https://microsoft.github.io/DirectX-Specs/d3d/D3D12EnhancedBarriers.html#interop-with-legacy-resourcebarrier)에 맞춰 APIs3/6/9의 fixture가 enhanced COPY_DEST→COPY_SOURCE barrier를 쓰도록 고쳤고 같은 readback을 유지한03이 통과했다. Production barrier fix 또는 일반 interop conformance 증거가 아니다. Native-Windows differential·multi-GPU·native no-temporal device·public NGX x86·다른 GPU/OS·게임·전체 규격은 미검증이며, 미지원 adapter proof는 public wrapper의 owned-interface 부재 경계다. [재실행 recipe](SMOKE-TEST.ko.md#p0-공개-계약-fixture-수동-실행)를 따른다. 기존 recovery118·full SR/FG port 증거에 합산하지 않는다.
 
+### P1 계약 범위와 reference
 
+**P1 #5–9·#11 완료(2026-10-02), #10은 사용자 제외.** 병렬 구현을 중단한 뒤 sample positions → samplers → FG 순서로 실제 GPU acceptance를 마쳤다. 변경 전 source/runtime은 immutable `p0-contracts-r5KJ0O/runtime-01`, 새 증거 root는 `p1-contracts-tge72c`다. 같은 fixture의 before와 after, public x64-only NGX/FSR facade와 D3D12 backend x64/WoW64를 혼합하지 않는다.
 
-## 판정 기준
+최종 candidate는 `p1-contracts-tge72c/runtime-03`, manifest SHA256 **f90cd5a6f1bbbccad012004919c3ec49e1ff727c534de9548772c03e87bea625**다. Full x64/WoW64 Ninja·양 install·fresh stage 로그는 같은 root의 `11-build-x64.log`–`15-stage.log`에 있다. 아래 증거는 각 수정의 영향을 받는 경로에서 얻은 **세 runtime cut**이며 단일 cut 전체 suite PASS로 합산하지 않는다.
 
-**현재 판정: 검증한 Apple M5 Pro/macOS 27 범위에서 P0·P1·P2·P3 완료(2026-10-01).** 현재 보고 값은 Shader Model **6.5**, feature level **12_1**, RaytracingTier **1.1**, SamplerFeedbackTier **1.0**, ViewInstancingTier **1**, MeshShaderTier **1**, VariableShadingRateTier **2**, ConservativeRasterizationTier **1**, WorkGraphsTier **1.0**이다. P2의 7개 slice는 구현·GPU 검증을 마쳤으며, 그 당시 증거와 제한은 [P2 완료 결과](#p2-완료-결과-2026-10-01), 후속 수정과 최종 통합 증거·경계는 [P3 완료 결과](#p3-완료-결과-2026-10-01)에서 구분한다.
+- runtime-01: `b0f062df8119bc487c7d943fd2ee7209c9e7aad6ec5a71ea134cb0bb385773f0` — NGX/temporal/FSR·sharing.
+- runtime-02: `fcab7d4a979cd08c79c3174968c5454c405e22082547d34a00e7c6b0c9e92c44` — native sample-store options와 sampler null guard 반영, sample positions.
+- runtime-03: 위 최종 hash — 추가 GatherRaw 좌표/empty-view 수정, bindless·FG.
 
-- 제약: SM 6.6은 모든 stage의 64-bit atomic이 필요해 막혀 있다([P2-SM](#p2-sm--shader-model-6x-compiler)). TiledResourcesTier 3/4와 RelaxedFormatCasting은 Metal 제약으로 보고하지 않는다([P2-TILED](#p2-tiled--reservedtiled-resource), [P2-BARRIERS](#p2-barriers--enhanced-barriersdevice614commandlist59render-passgpu-upload-heap)). TS+GS ExecuteIndirect, GS SO stream 0–3, early-Z GS/DS/MS MSAA statistics와 DS-only SO의 과거 제한은 후속 GPU 증거로 닫았다. MeshShaderTier **1**은 필수 128-scalar 출력·cull 구현과 공개 cap strict gate를 확인한 뒤 보고한다. Native 124-scalar 한계를 필수 요건의 예외로 인정하지 않는다. D3D11 shared-resource interop은 구현하지 않았다([P2-SHARING](#p2-sharing--shared-heapresourcefence)).
-- 미검증 경계: 전체 D3D12/DXR conformance, 물리 compositor·HDR scanout, 다중 출력, 다른 GPU/OS, Windows reference differential, 실제 게임과 성능. Reachable baseline+affected-path 통합 proof를 한 snapshot의 전체 suite 통과로 확대하지 않는다. API-only atomic live reader와 source/ABI가 없어 실행하지 못한 fixture의 범위는 P3 절에 별도로 명시한다.
-- **FL12_2는 미지원**이다. FL12_1과 FL12_2는 별도 계약이며, SM 6.6 미보고 자체를 둘의 필수 선행 조건으로 혼동하지 않는다. 상세 필수 cap 경계는 P3 절에 기록한다.
+- **#7/8 사용자 선택:** 유효한 nondefault Exposure.Scale·MV.Offset.X/Y는 accept+ignore하여 실행을 계속한다. Exposure 곱셈·MV affine bias·scale/jitter 순서를 추측해 구현하지 않는다. 기본/비기본 5쌍 × replay0–2의 live GPU 출력 비교, release-before-submit 및 invalid-input output 보존을 실제 통과했다.
+- **Reference identity:** 기존 `/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/external/D3DMetal.framework/Versions/A/D3DMetal` 경로는 현재 없다. 보유 pristine/no-Yaagl 비교본은 [relocated D3DMetal](../build/local/p4-20261004-N7DnYe/reference/D3DMetal.framework/Versions/A/D3DMetal), Mach-O x86_64 **4.0b2**, SHA256 **f5b56df1b8fe8b364dd9530651a3769c8aed948bd343be3b4510604d503e2bad**다. SHA·strict codesign·Apple Software Signing/`com.apple.D3DMetal`·Info4.0b2를 확인했다. [기존 binary audit](../build/local/p1-contracts-tge72c/d3dmetal-reference/result.json)의 MPL Exposure.Scale 미read·legacy warning+continue·MV.Offset 미read 관찰은 유지한다. Ordinary worker-thread commit/present reference는 호환성 참고일 뿐 owned production/Composition alpha proof가 아니며 reference의 Composition은 E_NOTIMPL이다. Proprietary runtime 의존성·NVIDIA 모델/품질 동등성은 주장하지 않는다.
+- **#10 사용자 제외:** 기존 FFX SR v1/v2 NO_PROVIDER와 FG v1/v2 valid-input zero/unreported success를 유지한다. [Native Stats smoke](../build/local/p1-contracts-tge72c/memory-reference/result.json)는 위 pristine의 capability→DLSSGetStatsCallback→UInt64 SizeInBytes에서 각 return1과 poison→0을 실제 관찰했다. 이는 native NGX ABI이며 FFX memory API·실제 총량/aliasable 계상 증거가 아니다. Apple public MetalFX per-effect footprint API 부재를 추정 총량으로 메우지 않는다. SDK swapchain accounting·UMA/DXGI budget 보고와도 별개다.
 
-P1 기준으로는 기본 API·shader·presentation 계약의 구현 공백이 닫혔다. HDR10PLUS는 native 입력 경로가 없어 제약으로 미충족으로 분류하고 명시적으로 거부한다. 남은 항목은 이 장치에서 실행할 수 없는 하드웨어·환경 조합(다중 모니터, 물리 HDR scanout, 다른 GPU/OS, Windows reference differential)의 **미검증 경계**다. [P1 완료 판정과 남은 계약](#p1-완료-판정과-남은-계약)에서 구분한다.
-
-최초 버전은 사용자 요청에 따라 구현 뒤 검증보다 먼저 작성했다. 이후 P0 통합 빌드와 11개 suite, P1 개별 기능의 실행 검증을 마쳤다. 아래의 **소스 구현**과 **실행으로 확인한 계약**을 구분한다. 실제 GPU 증거는 Apple M5 Pro/macOS 27의 x86_64 Wine 경로에 한정하며, P1 증거는 각 결과 절, P0 증거는 10절에 기록했다.
-
-현재 개발 기준은 루트 `src/`다. `graphics-translator/patches/`와 과거 조사 문서는 frozen import 및 역사적 기록이며, 이번 변경을 재생성하거나 배포하는 입력으로 사용하지 않았다. 기존 설치본·staged runtime은 현재 소스와 구분해야 한다.
-
-### 직전 구현 단계의 범위
-
-- Resource 생성·heap·view·footprint·allocation·residency.
-- Command recording·indirect·predication·copy·resolve·legacy barrier·기본 query.
-- 기본 VS/PS/CS shader lowering·root binding·graphics/compute PSO.
-- 기존 Queue/Fence 의미와 GPU retirement 수명 유지.
-
-**직전 단계에서 사용자가 분리했던 항목:** 정확한 `PIPELINE_STATISTICS` query. Timestamp·occlusion·clock calibration은 렌더링 코어에 남겼다. 이후 P1-C에서 MSAA 실행을 포함해 구현·검증하고 공개했으며, 더 이상 보류 항목이 아니다.
-
-DXR 확장, GS/HS/DS·mesh 확장, NGX/게임별 호환성, pipeline library 및 캐시 성능 확장은 직전 단계의 완료 판정에 포함하지 않았다. 이는 프로젝트의 최종 지원 범위를 제한하는 목록이 아니다.
-
-## 개발 목표와 우선순위
-
-### 목표 변경: 특정 게임 실행 → 최신 규격의 완전한 번역기
-
-**최종 목표는 ZZZ 실행이 아니라, 최신 공개 Direct3D/DXGI 및 shader 규격의 의미를 정확하고 완전하게 구현하는 범용 Direct3D → Metal 번역기다.** ZZZ는 여러 실제 workload 중 하나이며, 실행·화면 출력·FPS 달성이 프로젝트 완료 기준이나 기능 우선순위를 대신하지 않는다.
-
-- D3D12와 자체 DXIL/DXBC → AIR/metallib compiler를 중심으로 API, shader, memory, synchronization, presentation을 end-to-end로 완성한다. 공유 DXGI/backend는 D3D12에 필요한 범위에서 수정한다. D3D11은 업스트림 구현을 사용하며 아래 예외 외에는 변경하지 않는다.
-- GPTK/D3DMetal, Apple Metal Shader Converter, SPIR-V fallback에 의존하지 않는 기존 아키텍처를 유지한다.
-- “완벽”은 목표이지 현재 달성 주장이나 성공률 수치가 아니다. 누락 기능, 부정확한 emulation, 미검증 조합을 숨기지 않고 남은 작업으로 유지한다.
-- Native Metal 대응 기능이 없으면 의미를 보존하는 emulation을 우선 설계한다. 정확한 구현이 불가능한 경우 제약·영향·미충족 계약을 명시한다. No-op, 근사 결과, capability 축소만으로 완전 지원을 달성했다고 판단하지 않는다.
-
-### D3D11 변경 조사와 유지 방침
-
-**2026-09-29 사용자 결정: 기존 변경은 삭제하지 않는다. 정말 필요한 경우가 아니면 D3D11은 건드리지 않는다.** D3D12 구현에 필수인 공유 인터페이스·ABI 변경 또는 그 변경으로 깨지는 기존 업스트림 동작 보존만 예외로 하고, 해당 의존성을 코드 근거로 설명한 뒤 최소 범위로 수정한다. 인접 코드에 같은 버그가 있거나 D3D11 테스트에서 별도 문제가 발견됐다는 이유만으로 작업을 확장하지 않는다. D3D10/11 기능 완성을 P1의 독립 완료 조건으로 삼지 않는다.
-
-고정 DXMT 업스트림 `7c8dee1c2d73415301ceb7d1fa810861cef4cd67`, frozen import patch 18개, 초기 import `9e5ffa3`, 후속 commit `6a7f923` 및 현재 작업 트리를 대조했다. `src/d3d10`은 업스트림과 동일하고, `src/d3d11`은 아래 swapchain과 buffer 두 파일만 다르다. 조사 중 시도했던 삭제는 원상복구했으며 코드·fixture·runner·과거 실행 증거를 유지한다.
-
-| 기존 변경 | 추가 이유와 판단 | 현재 처리 |
-|---|---|---|
-| `src/d3d11/d3d11_swapchain.cpp` fullscreen·`ResizeTarget` 오류/상태 보존·생성 처리 | 당시 P1 문서의 공유 D3D10/11 계약까지 적용한 범위 확장. D3D12 frontend 구현의 필수 의존성이 아님 | 기존 수정 유지, 별도 D3D11 확장 중단 |
-| 같은 파일의 공개 `GetGammaControl` 조회와 ramp cache | D3D11 output proxy Present의 내부형 캐스팅 충돌을 실제 재현해 수정. D3D11 전용 버그 | 기존 수정·증거 유지 |
-| `owned-dxgi-fullscreen.cpp`와 runner의 D3D11 분기 | 두 frontend의 fullscreen·readback·Present 회귀 검증을 위해 추가 | 기존 fixture 유지, 다음 기능은 D3D12 전용 검증 |
-| `src/d3d11/d3d11_buffer.cpp` UAV `.writable = true` (`6a7f923`) | 공유 buffer-view 확장 시 쓰기 속성을 명시. 정상 D3D11 UAV는 기존 allocation flag 분기로도 쓰기 권한을 얻으므로 필수 migration이라고 볼 근거는 없음 | 한 줄 변경 유지, 추가 D3D11 변경의 근거로 사용하지 않음 |
-| `src/nvapi/nvapi.cpp`의 D3D11 opcode-query null 검사 (`0016`) | 인접 D3D12 함수 추가 시 null 안전성을 보강한 것으로 추정 `[INFERENCE]`; 독립적인 동기 기록 없음 | 기존 검사 유지 |
-| `scripts/test-owned-ngx-frontend.py`의 D3D11 export 검사 | D3D12 NGX를 같은 DLL에 추가할 때 기존 업스트림 export 보존을 확인하려고 작성한 검사. 신규 D3D11 구현은 아님 | 기존 ABI 보존 검사 유지 |
-
-D3D12가 사용하는 DXBC/SM50 compiler, buffer range/writable, Metal bridge, queue/presenter, DXGI/WSI 변경은 D3D11이라는 이름이나 공유 여부만으로 제거하지 않는다. NGX parameter의 `ID3D11Resource` Set/Get 슬롯은 D3D12도 사용하는 공식 17-slot ABI의 일부라 유지해야 한다. 업스트림 `nvngx.cpp`의 D3D11 구현 및 frozen patch/provenance도 보존한다.
-
-### “최신 기준”의 관리
-
-최신이라는 표현을 특정 버전 번호에 영구 고정하지 않는다. 구현 착수 시점의 **Microsoft 공식 공개 규격과 정식 SDK/Agility SDK, DXIL/Shader Model 명세**를 확인해 기준 revision을 기록한다. Preview/experimental 규격은 정식 기준과 분리해 추적하며 무시하거나 정식 지원으로 섞지 않는다. 아래는 P0에서 조회한 기준이며, 지원 달성 선언이 아니다.
-
-기준표에는 다음을 함께 기록한다.
-
-| 축 | 기록할 내용 |
+| P1 지정 계약 | 구현 범위·검증 경계 |
 |---|---|
-| D3D12/DXGI | SDK·Agility SDK revision, interface, feature level, OPTIONS/tier, format 및 presentation 계약 |
-| Shader | DXIL/DXBC revision, Shader Model, stage/opcode, numeric·memory·subgroup 의미 |
-| Metal backend | macOS/SDK·Metal·GPU family, native/emulated 경로, 기능 및 수치 제약 |
-| 판정 | 미구현 / 소스 구현·미검증 / 검증 완료 / 제약으로 미충족, 근거 fixture와 실행 환경 |
+| #5 Programmable sample positions | OPTIONS2 Tier1:1 pixel의2/4/8, signed xy[-8,7]/16·pixel center 상대·Y down. Direct list 설정·bundle 상속·reset/ClearState·record/replay·PSO effective count 정합과 full ResolveSubresourceRegion을 구현·검증했다. Custom render surface의 GetSamplePosition/SamplePos는 공식 undefined이며 fixed texture의 자체 pattern·정의된 default/center pattern과 구분한다. Tier2의4-pixel pattern은 지원 선언에 포함하지 않는다. |
+| #6 Non-normalized samplers | OPTIONS17, CreateSampler2 및 RS1.2 static flags. Native normalized sampler에 실제 single-mip SRV view width/height로 나눈 좌표와 explicit LOD0를 전달하는 shader lowering이다. 유효 non-array1D/2D·one-mip·point/linear standard/min/max·U/V clamp/border·Min/MaxLOD0·offset 없음, W/bias unrestricted와 UINT_BORDER_COLOR 조합을 구분한다. DXBC/DXIL CS/PS × static/table GPU oracle·descriptor copy/null/기존 normalized 경로를 검증했다. 전체 SM/FL 상향이 아니다. |
+| #9 FG ResizeBuffers1 | 동일 device DIRECT queues·node0/1 mask를 physical buffer별 retain하여 generated/real/builtin UI에도 선택한다. Count0 유지·held backbuffer/pending recording 거부·old-frame drain·실패 시 queue/count/index 보존·일반 ResizeBuffers의 original default queue 복귀를 구현·검증했다. Public facade/observer는 x64-only이며 실제 drawable/selected queue fence·worker 진행 증거로 통과했다. |
+| #11 Shared adapter LUID | Owned shared heap/resource metadata에 실제 creator GetAdapterLuid를 보존하며 import로 creator를 바꾸거나 adapter0 fallback하지 않는다. Duplicate/named/by-name/cross-process query 수명, invalid/wrongtype/stale/forged/copied/mutated handle의 DXGI_ERROR_INVALID_CALL+zero output을 검증했다. Fixed64KiB read-only header 조회이며 named GPU import-after-last-COM-owner 한계는 기존 그대로인 query-only scope다. Mixed-bitness GPU sharing·multi-GPU Windows differential은 별도다. |
 
-Vendored header에 enum이 있다는 것, API가 성공을 반환한다는 것, fixture 하나가 통과했다는 것은 지원 증거를 대체하지 않는다. 규격이 갱신되면 차이를 backlog에 반영하며, 현재 지원 선언과 앞으로의 목표를 분리한다.
+**보존된 before:** #5 [public valid SetSamplePositions E_NOTIMPL80004001](../build/local/p1-contracts-tge72c/sample-fixtures/before-x64-01/result.json), #6 [pixel coordinate13 vs expected1](../build/local/p1-contracts-tge72c/nonnormalized/before-x64/stdout.log), #7/8 fixture의 첫 exposure_scale_auto actual0xbad00010(expected1), exit1/PASS false [NGX 실패](../build/local/p1-contracts-tge72c/ngx-inputs/before-ngx-x64-01/result.json), #9 [valid ResizeBuffers1 HRESULT887a0004](../build/local/p1-contracts-tge72c/fg-present-queues/before.stdout.log), #11 [E_NOTIMPL80004001·output sentinel 미변경](../build/local/p1-contracts-tge72c/shared-adapter-luid/before/stdout.log). 이 NGX before는 첫 exposure 실패에서 중단됐으므로 MV.Offset before 실행 증거가 아니다. 최종 after는 아래 실행표로 구분하며 before 실패를 PASS로 고쳐 쓰지 않는다. [새 실행 recipe](SMOKE-TEST.ko.md#p1-fixture-재실행과-beforeafter-분리)는 관찰 증거와 별개다.
 
-### P0에서 고정한 규격·backend 기준표
+**실행 결과:** 아래 12개 run은 exit0·API+Shader Validation PASS·validation errors0·foreign backend0이다. 증거 root는 `build/local/p1-contracts-tge72c/`다.
 
-조회 시점은 **2026-09-21 17:48:48 UTC / 로컬 2026-09-22**다. “최신”은 이 시점에 조회한 공식 publication으로 한정한다. SDK package, standalone header release, compiler release의 patch 번호가 같다고 가정하지 않는다.
-
-| 대상 | 정식 목표 | 별도 preview/experimental 추적 |
+| Runtime | Suite와 실제 결과 | 확인한 계약 |
 |---|---|---|
-| Agility SDK | Microsoft.Direct3D.D3D12 **1.619.6**, 2026-09-14 게시 | **1.721.3-preview**, 2026-07-30 게시 |
-| DirectX-Headers | **v1.619.5**, 2026-07-31 게시 | **v1.721.2-preview**, 2026-07-08 게시 |
-| DXC release | **v1.9.2607**, 2026-07-29 게시 | **v1.10.2605.37**, 2026-08-12 게시 |
-| Shader Model | **6.9**, DXC v1.9.2602부터 production support 명시 | **6.10 preview** |
-| DXIL | **1.9**, 공식 proposal Completed | **1.10**, 공식 proposal Under Review — 정식 지원 기준으로 취급하지 않음 |
+| 01 | NGX [ngx](../build/local/p1-contracts-tge72c/ngx-inputs/after-ngx-x64-01/result.json)·[contracts](../build/local/p1-contracts-tge72c/ngx-inputs/after-ngx-contracts-x64-01/result.json), x64 | Exposure3쌍·MV2쌍 ×3 replay, delta≤1·contrast·sentinel·live input·parameter/feature 수명, invalid scalars5개 |
+| 01 | Temporal [x64](../build/local/p1-contracts-tge72c/ngx-inputs/after-temporal-x64-01/result.json)·[WoW64](../build/local/p1-contracts-tge72c/ngx-inputs/after-temporal-x86-01/result.json), [FSR x64](../build/local/p1-contracts-tge72c/ngx-inputs/after-fsr-x64-01/result.json) | Private temporal field cutover와 기존 SR GPU 회귀. Public facade의 x86 지원 증거는 아님 |
+| 01 | Sharing [x64](../build/local/p1-contracts-tge72c/shared-adapter-luid/sharing-x64-01/result.json)·[WoW64](../build/local/p1-contracts-tge72c/shared-adapter-luid/sharing-x86-01/result.json) | 각21/21, creator LUID·creator release 후 named/duplicate/cross-process query·forged/stale/error와 기존 GPU sharing |
+| 02 | Multisample [x64](../build/local/p1-contracts-tge72c/sample-fixtures/after-x64-04/result.json)·[WoW64](../build/local/p1-contracts-tge72c/sample-fixtures/after-x86-02/result.json) | Programmable6·float/depth resolve18·integer/stencil resolve12·decompress12·custom depth-plane copy, pattern/reset/replay/bundle·오류13개와 기존 default/center MSAA |
+| 03 | Bindless [x64](../build/local/p1-contracts-tge72c/nonnormalized/after-x64-02/result.json)·[WoW64](../build/local/p1-contracts-tge72c/nonnormalized/after-x86-02/result.json) | 각8/8, DXBC/DXIL × table/static CS41 words·PS pixels·live replay·null/empty-view, GatherRaw 10,11,1,0 및 excluded-view0 |
+| 03 | FG [public x64](../build/local/p1-contracts-tge72c/fg-present-queues/run-02/result.json)·[native drawable 분석](../build/local/p1-contracts-tge72c/fg-present-queues/run-02/fg-capture-analysis.json) | Selected queue6 frames·idle worker 진행·3-buffer rotation·atomic rollback/drain/owner·generated/real/UI pixels·frame9 generation 실패 후 current game GPU batch ordering |
 
-공식 근거:
+**실패 iteration과 oracle 수정:** runtime-01 sample의 stencil CustomSamplePositions store-option assertion은 native attachment 설정을 수정했다. runtime-02 sample x64-02/03의 row3 실패는 bundle이 상속하지 않는 PSO를 fixture가 설정하지 않은 오류였고, 명시적 SetPipelineState 뒤 위 전체 matrix가 통과했다. Sampler runtime-01의 null dimension query validation 오류와 `nonnormalized/raw-before`의 GatherRaw13 오출력은 각각 null guard와 공통 좌표/empty-view lowering으로 수정했다. FG run-01/reject-before의 CPU callback 선행은 허용된 recording이므로 GPU ordering 실패 증거로 쓰지 않는다. 최종 run-02는 game queue를 막은 동안 GPU output sentinel이 그대로임을 확인한 후 gate를 풀어 실제 output·native drawable를 검증했다. 실패 로그는 보존했다.
 
-- [Agility 1.619.6 package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.619.6), [version/publication feed](https://api.nuget.org/v3/registration5-semver1/microsoft.direct3d.d3d12/index.json).
-- [DirectX-Headers v1.619.5](https://github.com/microsoft/DirectX-Headers/releases/tag/v1.619.5), [v1.721.2-preview](https://github.com/microsoft/DirectX-Headers/releases/tag/v1.721.2-preview). 조회 당시 대응하는 1.619.6/1.721.3 standalone header release는 확인하지 못했다.
-- [DXC v1.9.2607](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.9.2607), [6.9 production support 명시](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.9.2602), [6.10 preview compiler](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.10.2605.37).
-- [SM 6.9 명세](https://github.com/microsoft/DirectX-Specs/blob/5d736f2a61b227ad1e3cc31cd9a718f546041f4e/d3d/HLSL_ShaderModel6_9.md), [DXIL 1.9 proposal](https://github.com/microsoft/hlsl-specs/blob/fb3577a041dc2c146bd447a80b5de501eb0f4509/proposals/0033-dxil19.md), [DXIL 1.10 proposal](https://github.com/microsoft/hlsl-specs/blob/7ba76180209092d644ac74cb66c8a3836001e7b5/proposals/0046-dxil110.md).
+Runner diagnostics **67/67**, staging **31/31** PASS(`runner-diagnostics-sequential.log`, `staging-regression-sequential.log`). M5 Pro/macOS27의 지정 fixture 결과이며 Windows differential·다른 GPU/OS·실게임·물리 scanout cadence·public x86 facade·ARM64/FEX proof나 SM/FL cap 상향이 아니다.
 
-| 로컬 계층 | 실제 확인한 기준 | 지원 판정과의 구분 |
+### FSR facade와 manual R32 exposure 완료
+
+`src/fsr`는 AMD public upscaler API **4.0.3** headers를 소비하는 x64/WoW64 owned frontend다. `amd_fidelityfx_upscaler_dx12.dll`은 `ffxConfigure/CreateContext/DestroyContext/Dispatch/Query`를 ordinal **1/2/3/4/5**로 제공하고 provider **`4d46580000000001`**을 MetalFX로 식별한다. AMD FSR 모델이나 vendor backend를 가장하지 않는다. [ABI·header/license provenance](NGX-INTEGRATION.ko.md#owned-fsr-public-api와-provenance), [빌드·stage·fixture recipe](SMOKE-TEST.ko.md#전체-srpublic-fg와-shader-cache-전용-recipe)를 따른다.
+
+**2026-10-02 full SR/FG port의 당시 계약:** 아래 alpha/public ABI 제한은 새 P4에서 확장됐다. 아래 MetalFX FrameInterpolator·generated output1개·FG debug 거부는 당시 cut의 기록이며 현재 FG 소스는 [multi-frame 경계](#multi-frame-fg와-native-residency-현재-경계)로 대체됐다. 현재 소스 구현을 당시 native drawable proof로 검증했다고 하지 않는다. SR 계약과 증거는 유지한다.
+
+- **SR 입력·출력:** create-time render/output은 최대 크기이며 dispatch의 renderSize/upscaleSize가 active extent다(0 upscaleSize는 create output). Texture backing이 동일 크기일 필요는 없고 각 subrect가 해당 view 안에 들어가야 한다. Low/high-resolution·jittered MV, reactive/composition masks, 공식 NGX color/depth/MV/mask/output offsets, RCAS sharpening, linear/sRGB/PQ transfer를 GPU에서 처리한다. Manual exposure는 null 또는1×1 R16/R32이며 매 execution/replay에 GPU numeric R32→R16을 갱신한다. AutoExposure는 supplied exposure를 무시한다.
+- **FSR cap:** runtime MetalFX descriptor의 min/max scale을 조회한다. 요청 output이 max scale을 넘으면 `min(maxScale, outputWidth/renderWidth, outputHeight/renderHeight)`의 균일 배율로 floor한 영역을 중앙에 출력하고 요청 영역의 남은 margin을 opaque black으로 쓴다. Output subrect 바깥은 보존한다. 공식 quality-query의2560→floor853은 그대로이며853→2560을 무조건 거부하던 계약은 capped output으로 대체됐다. 관찰 장치 M5 Pro의 max3은 다른 GPU/OS의 고정 상수가 아니다.
+- **History·수명:** output 크기/descriptor layout 변경은 새 scaler generation을 준비하고 성공 시에만 교체한다. Explicit reset, 실행 generation/activation 전환, active input extent 변경은 history reset을 일으킨다. 오래된 recording/replay는 자신이 보유한 generation을 쓰고 caller textures·scratch·residency·execution lease는 GPU retirement까지 보유한다. Context destroy나 caller resource release가 in-flight frame을 무효화하지 않는다. 동일 recording의 replay도 record-time 픽셀 snapshot 대신 GPU 입력을 다시 소비한다.
+- **Native SR 동기화:** 한 Windows queue submission 안에서 preprocessing→Metal4FX→finish/copy를 **세 native command-buffer segment**로 분리한다. 기존 recording segment split을 사용하고 all-stage producer→all-stage queue consumer의 device-visibility barrier로 GPU 쓰기를 공개한다. MetalFX와 외부 fence consumer를 같은 native buffer에 넣지 않는다. 새 CPU wait/별도 Windows queue를 추가한 경로가 아니다. SR의 각 state와 FG의 각 context는 기존 shared-event timeline·mutex 아래 cross-queue 실행 순서를 publish하며 partial encode도 commit/signal하고 lease를 GPU retirement까지 보유한 채 device removal을 보고한다.
+- **FG 소유 경로:** `src/fsrfg`의 `amd_fidelityfx_framegeneration_dx12.dll`은 동일5 exports/ordinal1–5와 provider `4d46584647000001`을 제공한다. Pinned MIT GPUOpen SDK `0836aa7f…`의 swapchain/UI composition/pacing을 source-owned proxy로 빌드하고 interpolation은 owned D3D12 COM→WineMetal→Metal4FX FrameInterpolator로 보낸다. 원래 native vendor DLL, foreign private C++ ABI, D3DMetal/AntiLag vendor fallback은 사용하지 않는다.
+- **FG Prepare→Generate:** Prepare 실행이 depth/MV를 private GPU snapshot으로 복사하고 Generate가 같은 timeline에서 생산 완료 뒤 소비한다. Render/display MV·jitter cancellation·camera/depth 설정, active generation rect·transfer/luminance, HUDless history와 SDK UI composition을 연결한다. 첫 frame/reset·비연속 frame ID·configuration/rect/transfer/luminance 변경은 current color를 previous로 써서 warmup한다. Prepared snapshot과 history도 recording/GPU lease가 보유한다.
+- **명시적 한계:** NGX alpha-upscale bit128은 unsupported다. Exposure.Scale·MV.Offset의 P1 선택은 유효한 nondefault accept+ignore이며 완료 증거와 수치 의미의 한계는 [P1 계약](#p1-계약-범위와-reference)을 따른다. FSR SR create hints256/512(non-linear color/visualization permission)는 허용하지만 dispatch debug draw는 거부한다. FG는 single-sample2D와 generated output1개, 미retire configured frame ID64개까지이며 debug tear-lines/reset-indicators/view·reserved generation flags는 지원하지 않는다(pacing debug lines와 구분). Native FG GPU-memory query는 성공과 zero/unreported usage를 반환하며 실제 native 총량을 보고하지 않는다. Swapchain query는 SDK accounting이다. Callback/native Present 실패는 미작성 출력을 present하지 않고 fence graph를 retire하며 public wait-for-presents에서 비동기 실패를 관찰할 수 있다. Public FSR/NGX facade는 x64-only다(새 public x86 fixture의 bootstrap error126은 미빌드·미stage ABI이며 backend WoW64 regression이 아님). ARM64 Wine/FEX guest acceptance는 기존 user-deferred gate 그대로다.
+
+**새 full-port의 관찰 증거(기존 recovery118과 합산하지 않음):**
+
+- Public x64 FG [fresh after-validation06](../build/local/full-fg-port-20261002/after-validation-06/result.json)는 실제 runtime02 API+Shader Validation PASS, exit0·validation/foreign errors0이다. Direct Prepare snapshot/history/configuration64·in-flight 수명과 HWND source-owned proxy/callback/UI/resize를 확인했다. [Native drawable/control analysis](../build/local/full-fg-port-20261002/after-validation-06/fg-capture-native-control.json)는 independent public Metal4FX의 frame1–4와 byte-identical/max_abs_error0, premultiplied·double-buffered UI와 resize의 실제 pixel oracle을 통과했다. SDK double-buffer UI 등록은 frame마다 소비되므로 각 UI frame에 재등록한다. 04/05의 재등록 누락 실패는 보존하고06에서 같은 pixel·Present 후 원본 mutation oracle로 새 GPU 실행했다. Native drawable18회 중 positive presentation timestamp는17회이며 첫 generated timestamp0은 not-displayed/skipped로 남긴다. 순서·bounded progress는 확인했지만 정확한 OS2× cadence/물리 compositor·게임 성능을 보장하지 않는다.
+- Public x64 FSR의 [original runtime02 result](../build/local/full-sr-port-20261002/runtime02-fsr-api-shader/result.json)는 실제 GPU exit0·API/Shader errors0·foreign backend0이지만 stale analyzer guard로 pass=false였고 그대로 보존했다. Safe-size cap64→192/요청256×224/중앙32,16 및 history-mask 비교2행의 현행 계약으로 **동일 stdout/stderr/backend logs를 재분석**한 [derived result](../build/local/full-sr-port-20261002/runtime02-fsr-guard-reanalysis-965874de/result.json)는 PASS다(`evidence_mode=recorded-output-reanalysis`, `process_executed=false`). 새 GPU 실행이 아니다. High-res/jittered/nonzero MV·masks/history·sRGB/PQ·RCAS·manual/auto exposure·dynamic output/cap·replay·거부 시 output 보존의 fixture assertions를 확인했으며 native16 platform 오류는 별도 known boundary로 남긴다.
+- Public x64 [NGX](../build/local/full-sr-port-20261002/runtime02-ngx-api-shader/result.json)·[NGX contracts](../build/local/full-sr-port-20261002/runtime02-ngx-contracts-api-shader/result.json)는 original runtime02 API+Shader Validation strict PASS다. Context shutdown/reinit·opaque handle 수명·subrect gate와 실제 output은 해당 fixture 범위의 증거이지 public WoW64 frontend나 DLSS 모델 동등성 증거가 아니다.
+- [Production native SR transport smoke](../build/local/full-sr-port-20261002/native-transport-proof.log)는 API+Shader Validation 아래 실제 shared allocator·세 native command buffers의 단일 queue commit으로 offset inputs·독립 mask rect·R32 exposure·sRGB/RCAS·centered cap/opaque margin/outside sentinel·feature dormant/release 후 prepared replay를 통과했다. Public Windows facade acceptance와 구분한다.
+- Private temporal [x64](../build/local/full-temporal-port-20261002/runtime02-x64-validation/result.json)·[WoW64](../build/local/full-temporal-port-20261002/runtime02-x86-validation/result.json)는 API+Shader Validation PASS, exit0·validation/foreign errors0이다. Typed/typeless 각8 format, reset/replay·allocator retirement·gated final release·cross-queue/opposite-order·dynamic output96×112→128×128→96×112의 old-generation replay·outside sentinel 보존, GPU R32 exposure3값의 R16 maxULP0을 확인했다. Runtime02 manifest는 `7e52984319e4636e6443788b61b1f624f7c2a5393617994bdabe4f865eb02342`다. 이것은 public FSR/NGX/FG 전체 acceptance 판정이 아니다.
+- **Known native platform 경계:** production backend 없이 public Metal4FX16→48을 실행한 [독립 control stderr](../build/local/full-sr-port-20261002/native-sr-16-control.stderr.log)에서도 native Conv3x3 invalid stores를 재현했다. 작은 입력의 portable 지원이나 모든 size의 shader-validation 성공을 주장하지 않으며 minimum-size 제품 guard·validation suppression을 추가하지 않았다. [64→192 control](../build/local/full-sr-port-20261002/native-sr-64-cap-control.stdout.log)·[stderr](../build/local/full-sr-port-20261002/native-sr-64-cap-control.stderr.log)는 validation 오류 없이 실행됐다.
+- [독립 HDR pattern control](../build/local/full-sr-port-20261002/native-sr-64-pattern.stdout.log)·[stderr](../build/local/full-sr-port-20261002/native-sr-64-pattern.stderr.log)는 half exposure3555/3cf0/4248 변경에42550/48924 half components 차이·validation 오류0을 확인했다. Constant/reset의 byte sameness를 exposure 구현 실패로 판정하던 oracle은 사용하지 않는다.
+
+**아래는 full port 이전 SR facade/R32 slice의 proof다.** 현행 all-effects/FG public acceptance나 모델·품질 동등성으로 승격하지 않는다.
+
+- [FSR result](../build/local/fsr-metalfx-20261002/after-api-shader-01/result.json): x64 API+Shader Validation, pass=true/exit0. Changed/reset/dynamic-render4 frames, context destroy 뒤 replay0/1 input116 안정 및 replay2 GPU input140 변화, manual null/R16/R32 unit output byte-identical, caller states 보존, rejected dispatch output 불변을 확인했다. [stdout](../build/local/fsr-metalfx-20261002/after-api-shader-01/stdout.log)을 함께 보존한다.
+- 당시 `src/d3d12/d3d12_temporal.cpp`의 R32 conversion proof는 현행 shared native SR backend의 **매 execution/replay 직전 GPU numeric R32→R16** 계약으로 이어진다. CPU readback·record-time exposure cache는 사용하지 않는다.
+- [R32 x64](../build/local/r32-exposure-20261002-after-shader/result.json)·[WoW64](../build/local/r32-exposure-20261002-after-x86-shader/result.json): complete temporal/API+Shader PASS. GPU-produced0.3333/1.234567/3.14159와 half3555/3cf0/4248 비교는 모두 maxULP0, replay의 GPU write refresh와 gated completion 전 final release/reset을 확인했다.
+- [Original public NGX x64 regression](../build/local/r32-exposure-20261002-ngx-original-shader/result.json)과 같은 directory의 [manual-R32 MSVC ABI smoke](../build/local/r32-exposure-20261002-ngx-original-shader/stdout-manual-r32.log)도 PASS다. **게임·DLSS/FSR image-quality equivalence는 입증하지 않았다.**
+
+이 결과와 아래 cache proof는 `build/local/parallel-metalfx-cache-20261002/runtime-after`의 [manifest](../build/local/parallel-metalfx-cache-20261002/runtime-after/owned-graphics-runtime.json), SHA256 **`edd7ed7a0f4a8b87122df805b924c2f36fbc0a23509277c798da59399769c86c`**를 사용했다. Recovery118과 합산하지 않는다. Native runtime packaging과 ARM64/FEX guest execution은 별도 acceptance다.
+
+### ShaderCacheSession/Control 완료와 focused proof
+
+[`d3d12_shader_cache.cpp`](../src/d3d12/d3d12_shader_cache.cpp)·[`hpp`](../src/d3d12/d3d12_shader_cache.hpp)는 application-managed **MEMORY/DISK** sessions를 구현했다. SHA1 뒤 exact key 비교, process-global backing의 cross-device 공유, fixed records/checksums persistence, executable/cwd/DRIVER_VERSIONED isolation, version lifecycle, null-output **S_FALSE/no mutation**, sticky final-session delete를 제공한다. `GetDesc`는 원래 요청을 보존하고 shared backing의 첫 effective limits를 사용한다. 기본 RAM1KB/128 entries·disk128MB이며 RAM은 key+value payload, disk는 header/complete records를 계산한다. Developer mode의 APPLICATION_MANAGED disable/enable/clear는 실제 동작한다. 아래 driver-managed 자동 캐시는 이 session의 저장 형식·한도와 별개이며 native Metal archive가 아니다.
+
+[Owned fixture](../graphics-translator/tests/owned-d3d12-shader-cache.cpp)의 [x64](../build/local/shader-cache-20261002/after-x64-02/result.json)·[x86](../build/local/shader-cache-20261002/after-x86/result.json)는 canonical Wine/Device9에서 각4 case groups+5 child processes, pass=true/exit0다. SHAttered collision·restart·cross-device·8-thread race·limits·eviction·corrupt records·version-probe non-destruction·developer denial/clear/isolation을 확인했다. **CPU API proof이며 GPU/native-Windows parity가 아니다.** 수정 전 `before-x64`의 E_NOTIMPL은 역사적 실패이며 현재 상태가 아니다.
+
+Native-Windows 동등성이 미입증인 구현 선택: MORE_DATA는 required size와 no partial write, developer denial은 E_ACCESSDENIED, zero-length keys/values 허용, incompatible live mode/flags 거부, cross-process exclusive disk ownership 충돌은 NOT_CURRENTLY_AVAILABLE, corrupt data는 E_FAIL로 clear/version replacement 필요. 성능 상한은 global mutex+sequential disk scan+bounded LRU다. Fixture는 runner가 fresh isolated prefix에만 넣는 **`OWNED_SHADER_CACHE_CONTROL_ISOLATED=1`**을 요구하고 registry 값을 복원한다. Live prefix에서 수동 설정하지 않는다.
+
+### 자동 PSO 컴파일 캐시와 focused proof
+
+일반 CreateComputePipelineState/CreateGraphicsPipelineState의 명시적 CachedPSO가 없는 경로는 기존 v5 owned blob의 불변 VS/PS/CS primary 결과를 자동 재사용한다. Shader/PSO/root key·stage mask·adapter registry ID·native compiler/driver identity·blob version을 구분한다. Mutable LLVM IR·device·최종 COM/native PSO는 공유하지 않으며 각 PSO의 native 생성은 유지한다. Lazy MS/GS/HS/DS·ICB/MSAA variant나 native Metal archive까지 캐시하는 구현은 아니다.
+
+- **RAM:** module-local 완료 blob payload를 64MiB/512개까지 LRU 보유한다. 살아 있는 PSO/flight가 참조하는 결과와 cache metadata는 이 보유 한도와 별개다. 메모리 적중은 전체 blob 복사·재해시 없이 불변 storage/views를 공유한다.
+- **Disk:** %TEMP% 아래 dxmt-shader-sessions/<exe-path-SHA1>/의 전용 dxmt-pso-<key>.bin을 사용한다. Entry 최대64MiB, exe당256MiB이며 오래된 identity도 용량에 포함한다. Store 때 metadata만 조사해 oldest-write 순서로 퇴출하고, cross-process mutex 아래 temp write/flush/atomic replace·남은 temp 회수를 수행한다. Optional 저장 실패는 유효한 PSO 생성을 실패시키지 않는다.
+- **동시성·실패:** 같은 key의 동시 요청은 한 producer의 불변 결과/실제 HRESULT를 공유한다. 실패는 보유하지 않고 다음 호출에서 재시도한다. Compile/native 생성은 cache metadata lock 밖에서 한다. Disk read/store와 제어는 현재 같은 lock으로 직렬화하며 별도 background writer는 두지 않는다. Producer 종료/예외도 waiters를 해제한다.
+- **무효화·제어:** 자동 파일의 layout/checksum/key/identity 오류는 제거 후 cold compile, native library/function 거부는 새 PSO 객체로 한 번만 재시도한다. 명시적 CachedPSO 오류는 숨기지 않는다. Developer-mode IMPLICIT_DRIVER_MANAGED disable/enable/clear는 실제 연결됐고, 같은 module의 이전 generation flight는 완료하되 clear/disable 뒤 다시 보유·저장하지 못한다. 제어는 현재 process/module과 exe disk namespace 범위이며 다른 process의 메모리까지 강제로 취소하지 않는다. App sessions와 독립이다.
+- **Capability:** SINGLE_PSO|LIBRARY|DRIVER_MANAGED_CACHE = 0x13. AUTO_INPROC_CACHE/AUTO_DISK_CACHE는 [OS-managed 의미](https://microsoft.github.io/DirectX-Specs/d3d/ShaderCache.html)이므로 광고하지 않는다.
+
+[최종 x64](../build/local/auto-pso-cache-20261004.2FsF2M/cache-final02-x64/result.json)·[WoW64](../build/local/auto-pso-cache-20261004.2FsF2M/cache-final02-x86/result.json)는 API+Shader Validation, ABI별27 exact GPU outputs·7 explicit blob 거부·5 child restore/recovery·동시 생성·실패 재시도·driver control/app isolation을 통과했다. [기존 session x64](../build/local/auto-pso-cache-20261004.2FsF2M/session-final02-x64/result.json)·[WoW64](../build/local/auto-pso-cache-20261004.2FsF2M/session-final02-x86/result.json)도 CPU API 회귀 PASS다. Final runtime manifest SHA256은 61883069c1ad7dbc3d838a489e583470de7108b887f223cb3cec4a8c0b7fee03이다.
+
+[메모리 경계](../build/local/auto-pso-cache-20261004.2FsF2M/memory-entry-limit-x64/result.json)는 x64에서 서로 다른513 PSO 뒤 latest memory hit/first disk restore와 두 GPU 값을 확인했다. 64MiB aggregate RAM 경계를 실제로 채운 시험은 아니다. [Disk x64](../build/local/auto-pso-cache-20261004.2FsF2M/cache-file-verification-x64/result.json)·[WoW64](../build/local/auto-pso-cache-20261004.2FsF2M/cache-file-verification-x86/result.json)는 >4GiB sparse 손상 파일의 bounded 복구,256MiB quota의 oldest 퇴출·temp 회수,4 concurrent process 생성 뒤 온전한 disk/public blob 일치와 다음 reader restore를 통과했다. Process 간 single-flight를 뜻하지 않는다.
+
+[보관된 ZZZ compute 입력의 생성 측정](../build/local/auto-pso-cache-20261004.2FsF2M/captured-analysis.json): 같은 process의 후속5회 중앙값 x64 220.1029→2.8069ms, WoW64 217.3839→2.8762ms. 재시작 첫 호출은 각각10.7170/10.7716ms, disk hit1·memory hit5·compile0이었다. 각 process 총6회, application cache 미사용, validation off이며 before ERROR/after INFO logging 차이가 있다. Global Metal cache를 지우지 않았으므로 process-first를 cold-cache로 부르지 않는다. 단일 frozen 입력의 생성 비용이며 실제 게임 실행·GPU workload·FPS 향상 증거가 아니다. Race gates를 쓴 별도 결정적 제어/실패 proof와 원래 실패들은 [이력](IMPLEMENTATION-HISTORY.ko.md#게임-공통-자동-pso-컴파일-캐시--2026-10-04)에 구분한다.
+
+### 관찰과 보유 artifact
+
+| 증거 묶음 | 기록된 관찰 | 현재 해석 |
 |---|---|---|
-| 선택된 cross-build header | llvm-mingw toolchain의 `include/d3d12.h`; enum/interface 범위 SM6.7, OPTIONS18, ID3D12Device10 | 정식 목표보다 오래되며 이 범위를 runtime이 모두 지원한다는 뜻이 아님 |
-| 저장소 vendored header | `include/native/directx/d3d12.h`: SM6.0, OPTIONS7, ID3D12Device1; upstream revision pin 없음 | 선택된 build header와도 다름. 최신 header 기반 정비는 남은 구현 작업 |
-| Cross compiler | llvm-mingw clang **22.1.8**, LLVM commit `ca7933e47d3a3451d81e72ac174dcb5aa28b59d1`, x86_64 Windows GNU target | 현재 P0 빌드에 사용한 compiler |
-| AIR compiler dependency | LLVM **15.0.7**, `toolchains/llvm-15` | LLVM 버전과 지원 DXIL/SM 버전은 별개 |
-| Native OS/SDK | macOS **27.0 (26A428)**, Xcode **27.0 (27A5237l)**, macOS SDK **27.0** | 이 환경의 관찰값이며 다른 OS 조합은 별도 확인 필요 |
-| Native compiler | Apple clang **21.0.0**, Metal compiler **32023.921 / metalfe-32023.921.3** | Compiler 존재가 모든 Metal feature 사용을 보장하지 않음 |
-| Native GPU | Apple **M5 Pro**, 20 GPU cores, Metal 4. Native query에서 Apple family 1–10/Mac1/Mac2, raytracing, dynamic libraries 지원 응답 | Native capability를 D3D tier 지원으로 승격하지 않음 |
-| P0 당시 D3D12 공개 지원 선언 | **FL11_0 / SM5.1**, DXR tier·mesh tier 미지원(P2 완료 뒤 SM 6.5) | 일부 SM6 DXIL 입력을 소비하는 것과 SM6 전체 conformance는 다름 |
+| P0–P3 classic backend·삭제 전 Metal4/UMA/presenter | 당시 실제 PASS/FAIL·INCONCLUSIVE와 수정 관찰 | **2026-10-02 외부 build/ 삭제로 원본 artifact 유실.** 이력의 경로/hash/“보존”은 당시 기록이며 현재 보유나 이번 재실행 아님 |
+| Metal4 recovery acceptance | **118/118 = runtime-02 신규44 + runtime-01 유지74**, failed/pending0 | x64 **60=22+38**, WoW64 **58=22+36**의 mixed-cut. **116 API+Shader +2 atomic-live API-only**, **114 queue 관찰 +4 no-queue API/cap 예외**. 단일 runtime 전체 suite 아님 |
+| Review2026-10-02 targeted correction | 11 finding disposition, x64 query/view/DXIL/arena/mapping/sharing/RTAS와 제한된 WoW64 arena/mapping/sharing | [review의 manifest별 ledger](../docs/D3D12-TRANSLATION-REVIEW-2026-10-01.md#build-and-execution-evidence). 최신 retained final cut에서는 affected DXIL73-word만 재실행; 모든 review 행의 final-cut 재실행 아님 |
+| ARM64 foundation/SDK-plugin | native11/11·full plugin495 ARM64 images·6 production DLL·manual WineMetal ARM64X link | G1/G2/G3의 명시한 범위이며 PE loader→Unix-call/FEX guest 전체 proof 아님 |
+| 2026-10-02 독립 소스 감사 — 수정 전 역사 기록 | 당시 RemoveDevice/budget no-op·CalculateLOD 누락 및 cap-gated 추가 후보 | 당시 소스/공식 계약 확인이며 새로운 API/GPU 실패 재현은 아니었다. 당시 Budget/CalculateLOD는 열려 있었다. 이후 [RemoveDevice](#removedevice-완료와-focused-proof)·[compute CalculateLOD](#compute-calculatelod-완료와-focused-proof)·[DXGI budget notification](#dxgi-budget-notification-완료와-focused-proof)은 별도 후속 수정·실행으로 완료했다. Retained result 읽기와 compiler smoke는 새 GPU 실행과 별개 |
+| 2026-10-02 RemoveDevice focused correction | 수정 전 두 x64 suite removal reason `S_OK` 실패 → 수정 후 두 suite × x64/WoW64 **4/4 PASS** | API+Shader Validation, exit0, validation 오류·foreign backend load 없음. [완료 범위와 manifest](#removedevice-완료와-focused-proof); recovery118 집계에 합산하지 않음 |
+| 2026-10-02 Compute CalculateLOD focused correction | 수정 전 x64 sm6 수치112개 불일치·shape PSO17개 실패 → 수정 후 sm6·dxil-texture × x64/WoW64 **4/4 PASS** | sm6는 ABI별28 case PASS. [별도 실패→수정→증거 및 한계](#compute-calculatelod-완료와-focused-proof); recovery118 집계에 합산하지 않음 |
 
-Native family 의미는 [Apple `supportsFamily`](https://developer.apple.com/documentation/metal/mtldevice/supportsfamily(_:))와 [raytracing capability](https://developer.apple.com/documentation/metal/mtldevice/supportsraytracing)를 기준으로 구분한다. DXIL parser의 version metadata 처리나 개별 lowering 존재만으로 상위 버전 검증 완료를 주장하지 않는다.
+Recovery aggregate는 `build/local/metal4/recovery/integration/full-suite-runtime02-combined-acceptance.json`, SHA256 **7228f827e74413e38c59b2eb8fba7df5197fa682b346deb254753e3068124a92**다. 새44개는 prepared-05/runtime-02 manifest `63ef4f29…`·runner `8bef102c…`, 유지74개는 prepared-03/runtime-01·preflight runner `9e388304…`에 근거한다. RT-only runner 변경은 기록했지만 process별 실제 loaded runner hash를 모두 증명한 것은 아니다. 이전111/118와7개 false 결과는 새 결과로 덮어쓰지 않았다.
 
-### 실행 순서
+- Standalone `dxil-static-sampler` 양 ABI source 부재와 x86 `ngx`/`ngx-contracts` x64-only frontend 제약으로 **4 planned row는 미실행·118 미포함**이다. 이를 PASS에 포함하거나 conformance를 증명한 것으로 보지 않는다.
+- 별도 presenter6·UMA2·classic D3D11 1 probe는 추가 관찰이고 temporal2는 이미118에 들어 있어 중복 집계하지 않는다.
+- Atomic live의 API-only PASS는 Shader Validation PASS나64-bit atomic snapshot 보장이 아니다. Snapshot은 **unproven**이다.
+- Timestamp review10은 baseline hardware도 regression을 통과했다. 수정은 공식 ordering 계약의 정적 근거와 after 실행 proof이지 실패-before GPU reversal 증거가 아니다. Shared token finding3의 정확한 native overtaking window도 hardware reproduction으로 과장하지 않는다.
+- Drawable GPU readback은 물리 compositor/HDR scanout 증거가 아니다. Native SDK/compiler readback은 Wine/FEX guest 실행 증거가 아니다. SM6.8 입력 수용은 SM6.8 전체 지원 증거가 아니다.
+- 이번 문서 재구성은 실행 관찰을 보존/분류한 작업이다. GPU·Wine·빌드·전체 test suite·게임을 새로 실행하지 않았다.
 
-우선순위는 **정확성·공통 기반·다른 기능의 의존성**으로 정한다. 아래는 단계별 작업과 완료 기준이다. P0·P1·P2는 명시된 장치·환경 범위에서 완료했고, 현재 P3의 기능별 전체 계약과 최종 통합 회귀를 닫는 중이다. P4도 최종 범위에 포함한다.
+### RemoveDevice 완료와 focused proof
 
-| 우선순위 | 작업 | 해당 단계의 완료 기준 |
+**수정 전 소스 감사 보존:** 2026-10-02 당시 `src/d3d12/d3d12_device.cpp:3042–3043`의 `RemoveDevice`는 빈 void no-op이었고 Device5–14는 공개되어 있었다. 기존 `ReportRemoval:252–268`과 연결되지 않은 점을 정적으로 확인했다. 당시 pending wait 미해제·제거 후 device가 usable처럼 보일 영향은 `[INFERENCE]`였으며 runtime 재현 결과가 아니었다. 이 판정은 아래 후속 실패→수정→PASS와 구분하는 역사 기록이다.
+
+**완료(2026-10-02):** `src/d3d12/d3d12_device.cpp`의 `RemoveDevice()` 빈 본문을 `ReportRemoval(DXGI_ERROR_DEVICE_REMOVED)` 호출로 연결했다. 기존 first-error 게시 경로를 재사용하므로 이미 기록된 reason을 덮어쓰지 않고, 등록 fence epoch의 terminal 전환과 queue/GPU retirement를 별도 우회하지 않는다. [공식 API 계약](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device5-removedevice), [fence 계약](FENCE-EVENTS.ko.md), [queue 계약](QUEUE-ORDER.ko.md)을 따른다.
+
+증거 root는 `build/local/remove-device-20261002`다. 수정 전 runtime의 `before-fence-events-x64`·`before-execution-safety-x64`는 모두 exit1이며 명시적 removal reason이 `S_OK`인 단계에서 실패했다. 이후 x64/WoW64 전체 Ninja build·install을 반영한 runtime으로 다음 네 실행의 `result.json`을 읽어 확인했다.
+
+| 수정 후 evidence 디렉터리 | guest ABI | 관찰 |
 |---|---|---|
-| **P0 — 기준 고정과 현재 통합본 안정화** | 규격/backend 기준표 작성, 직전 UNVERIFIED 통합본의 build·ABI·실행 문제 수정. 누락 DXIL 입력 준비. Buffer RTV, depth/stencil resolve, typed/multilayer clear, 실제 placed-resource aliasing, predicate/indirect, queue/fence/residency 경계를 확인한다. | 소스와 실행 artifact가 일치하고 해당 계약의 관찰 가능한 결과·오류·수명·ordering이 재현 가능한 증거로 남는다. 알려진 corruption/deadlock/device-loss 문제를 숨기지 않는다. |
-| **P1 — 기본 API·shader·presentation 계약의 완전성** | D3D12의 resource/view/format/heap/map/copy/resolve, root/binding/PSO, recording/query/indirect/predication, queue/fence/residency의 남은 공백을 닫는다. 정확한 pipeline statistics를 다시 포함한다. D3D12가 사용하는 DXGI swapchain/present/resize/fullscreen/color-space/HDR를 기준표에 따라 다룬다. | 기본 경로의 정상·경계·오류·동시성 계약이 맞고, feature/format 지원 보고와 실제 동작이 일치한다. 부분 native counter를 전체 statistics로 가장하지 않는다. |
-| **P2 — 현대 기능의 공통 기반** | 최신 Shader Model의 stage/opcode·numeric·atomic·wave/subgroup·memory semantics와 descriptor indexing/bindless 경로를 완성한다. GS/HS/DS, 요구되는 정밀도/정수 폭도 추적한다. Enhanced barriers, tiled/reserved resource·residency, shared handle/cross-adapter의 수명·가시성·동기화 및 PSO/pipeline-library 계약을 구현한다. | 각 기능의 전체 계약과 의존 기반이 연결된다. Shader 변환 성공만이 아니라 resource binding, GPU 결과, synchronization까지 맞는다. Native 지원이 다른 GPU family는 별도 판정한다. |
-| **P3 — 최신 고급 rendering/compute 기능** | DXR의 목표 tier 전체, mesh/amplification, VRS, sampler feedback, Work Graphs 및 기준표에서 확인된 추가 최신 기능을 구현한다. 이 목록은 상한이 아니며 새로운 공개 규격을 계속 반영한다. | 기능별 API·compiler·execution·memory 경로와 tier 요건이 모두 충족된다. 한 DXR/mesh sample의 성공으로 전체 tier를 올리지 않는다. |
-| **P4 — 성능·안정성·실사용 완성도** | CPU allocation/copy·Rosetta 비용, submission overlap, shader/PSO compile/cache, native archive 활용, memory pressure, 장시간 실행과 다양한 엔진/workload를 개선한다. NVAPI/NGX 같은 연동 계층도 표준 backend 위에서 완성한다. | 동일 결과·동일 workload에서 CPU/GPU 시간·전력/발열·메모리·stutter를 분리 측정한다. Cold/warm cache와 여러 GPU/OS 조합의 회귀를 확인하며 정확성을 성능과 교환하지 않는다. |
+| `after-fence-events-x64` | x64 | PASS, exit0, API+Shader Validation |
+| `after-fence-events-x86` | WoW64 x86 | PASS, exit0, API+Shader Validation |
+| `after-execution-safety-x64` | x64 | PASS, exit0, API+Shader Validation |
+| `after-execution-safety-x86` | WoW64 x86 | PASS, exit0, API+Shader Validation |
 
-P0를 마친 뒤 공통 계약은 P1, 현대 기능의 기반은 P2, 이를 소비하는 고급 기능은 P3 순서로 진행한다. 독립된 기능은 병렬 구현할 수 있지만 의존 기반이 미검증인 상태를 완료로 승격하지 않는다. P4가 뒤에 있다고 불필요한 allocation/copy나 명백한 성능 결함을 방치한다는 뜻은 아니다. 기본적인 효율은 모든 단계의 구현 원칙이다.
+네 결과 모두 `validation_errors=[]`, `foreign_backend_loads=[]`다. 수정 후 manifest는 root 아래 `runtime-after/owned-graphics-runtime.json`, SHA256 **a5296e0e9aae44bd14a06ce499bb804090ce4563496ebf2b3ad4ac88ad86098a**다. Result의 native/windows ABI `x64`는 host 경로를 나타내며, x86 두 행은 `guest_arch=x86`·fixture PE machine **332**로 WoW64 실행을 구분한다. 이 증거는 ARM64 no-Rosetta proof가 아니다.
 
-새로운 correctness·보안·메모리 수명·data corruption 문제는 단계와 관계없이 먼저 수정한다. 게임 재현은 공통 계약의 버그를 찾는 입력으로 사용하며, 타이틀별 우회나 특정 장면의 FPS를 위해 규격을 왜곡하지 않는다.
+- **Fence proof:** pending maximum·lower-value wait와 shared-opened fence, ANY/ALL·null-event single/ANY/ALL 해제, 모든 대상 fence의 `UINT64_MAX`, late 등록/생성 거부, 반복 제거 멱등, 등록/생성과 제거를 경합시키는 case를 관찰했다. Marker는 `maximum=1 lower=1 shared_opened=1 any_all=1 null_single_any_all=1 all_fences_terminal=1 late_rejected=1 idempotent=1 registration_creation_race=1`이다.
+- **Queue proof:** 실제 GPU 제출·retirement/readback을 정상 control로 확인하고, never-submitted blocked DIRECT/COPY copy 두 개의 discard와 terminal fence 다섯 개, queue 두 개의 bounded teardown을 관찰했다. Marker는 `gpu_retired=1 pending_copies=2 terminal_fences=5 queues_destroyed=2`다. 이미 제출된 GPU 소유권의 기존 retirement 경로는 유지한다.
+- **범위 제한:** 아직 in-flight인 native GPU와 removal의 정확한 race를 강제한 proof는 아니며, 등록/생성 경합 case가 매 실행에서 scheduling overlap을 보장하지도 않는다. 거부 판정은 관찰한 API와 기존 removal guard 범위다. 모든 API가 차단됨, 전 device/global adapter 제거, 같은 adapter의 다른 device가 영향받지 않음 또는 전체 conformance를 주장하지 않는다. 실제 게임·다른 GPU/OS·성능 proof도 아니다.
 
-### 공통 완료 기준
+### Compute CalculateLOD 완료와 focused proof
 
-1. **계약:** 대상 규격/revision, 유효 입력·오류·수치 허용 오차·ordering·수명·지원 조합이 정의되어 있다.
-2. **구현:** API → compiler → Metal 실행 → readback/presentation이 연결되고 지원 선언이 실제 구현과 일치한다. Silent fallback이나 성공하는 stub은 완료가 아니다.
-3. **증거:** 독립적으로 기대값을 판단하는 contract fixture, 가능한 경우 reference D3D 실행과의 differential 결과, native validation 및 실제 workload 증거를 구분해 남긴다. Undefined behavior나 규격상 허용 오차를 무조건 bit-exact 비교하지 않는다.
-4. **범위:** 한 장치의 통과를 전체 Metal/GPU family 지원으로 일반화하지 않는다. 미검증 조합과 hardware/OS 제약은 기준표에 남긴다.
-5. **회귀:** 새로운 계약·경계·오류를 방어하는 재현을 유지한다. 구현 내부나 로그 문구만 검사하는 항목으로 정확성 증거를 대신하지 않는다.
+**수정 전 소스 감사 보존(2026-10-02):** 당시 `src/airconv/dxil_resources.cpp:3030–3062`의 compute CalculateLOD는 bias/MinLOD/MaxLOD와 anisotropic minor-axis가 빠져 있었고 기존 texture/view mip clamp만 있었다. Sampler LodRange는 당시1182–1183/1207–1208/3547–3548에서 이미 전달했으므로 “sampler 정보가 shader에 안 보인다”는 과거 설명은 오래된 것이었다. Cube의3축/depth-query 경로가 invalid AIR/compile에 미칠 영향은 당시 `[INFERENCE]`였고 runtime 재현은 없었다. 이 최초 정적 finding을 아래 후속 실패·수정·완료로 소급해서 바꾸지 않는다.
 
-**현재 단계:** P0·P1·P2·P3 완료(공통 완료 기준 4의 장치·환경 경계 명시). Shader Model **6.5**, feature level **12_1**과 위 공개 tier를 유지한다. P3 구현·기능별 cap proof에 더해 최신 WG/DXR 변경을 합친 공통 runtime-04의 x64/WoW64 affected suite를 검증했다. Reachable coverage는 baseline+targeted evidence 합산이며, 단일 snapshot 전체 suite·전체 conformance 완료를 뜻하지 않는다.
+**완료 범위:** production 변경은 `src/airconv/dxil_resources.cpp`의 **compute/kernel CalculateLOD lowering와 descriptor 설명 comment**에 한정한다. ABI·metadata producer·D3D11 기능은 변경하지 않았다.
 
-### P1 전체 구현 중 확인한 계약 안전성 보강
+- `MipLODBias`를 clamped/unclamped 양쪽 출력에 적용하고 clamped 출력만 **sampler MinLOD/MaxLOD → resource/view 범위** 순서로 제한한다. Resource clamp 후 비어 있는 view는 clamped **0**, unclamped는 resource/view clamp 전 값을 유지한다. View metadata는 이미 view-relative이므로 base mip를 중복 보정하지 않는다.
+- 2D/2Darray anisotropic footprint는 정규화한 Gram/determinant로 안정적으로 minor axis를 계산하고 MaxAnisotropy cap을 적용한다. 일반 isotropic 경로의 허용된 max-gradient 근사는 유지한다.
+- Cube/cubearray는 signed current-face quotient projection과 half-side scaling을 사용하며 **width만**으로 크기를 구한다. Cube depth query를 제거했다. Native/nonkernel 경로는 기존 resource `fmax` 처리까지 그대로 두었다.
 
-`build/local/p1-complete/runtime-01`·`runtime-02`는 아래 변경을 통합한 새 격리 runtime이다.
-모든 아래 D3D12 실행은 Metal API/Shader Validation을 사용했다. **이 결과는 P1 전체 완료 선언이 아니다.**
+**Oracle 정정:** 기존 SM6·dxil-texture LOD 비교의 POINT-mip sampler는 [공식 계약상 결과가 undefined](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/lod--sm4-1---asm-)이므로 증거로 사용하지 않는다. 두 fixture 모두 LOD oracle을 mip-linear로 정정했다. Implicit point sampling의 별도 검사는 LOD oracle과 혼동하지 않는다. DXC **1.9.2609.5**로 `cs_quad_deriv`·`cs_lod`·`cs_lod_shapes`를 다시 빌드했으며 undefined 출력이나 기대값 재고정으로 실패를 숨긴 proof가 아니다.
 
-| 변경 계약 | 관찰한 결과와 증거 |
-|---|---|
-| PSO 입력 슬롯·활성 fixed-function 상태 검증 | 유효한 IA slot 16·31은 실제 draw/readback 통과, slot 32·UINT_MAX와 잘못된 활성 enum/write mask·미지원 logic op는 출력 포인터를 비우고 거절. `shader-binding/bundles-after-01` |
-| 호환 포맷 `CopyResource` | RGBA8 linear→sRGB, 역방향, R32 UINT→FLOAT의 2 mip×2 array, case당 40 texel을 bit-exact 복사. 서로 다른 native pixel format의 직접 whole-texture blit 대신 subresource view copy 사용. `format/copy-resource-casts-after-03` |
-| Heap·CPU texture·allocation | Cross-device placed heap 거절, placed resource의 heap COM 수명 유지, caller heap release 후 GPU alias/copy, row pitch 17·3D row 9/slice 19 및 BC tail의 정확한 CPU 전송, 빈 box 무처리 성공. Small MSAA alignment는 top mip 기준이며 배열·추가 mip 크기로 잘못 거절하지 않음. AllocationInfo1 offset으로 실제 placed resource 생성·사용. `resource-memory/after-02` |
-| Recording·queue 종료 | Allocator reset 후 stale closed list가 포함된 batch 전체를 제출 전에 버리고 device removal 공개. 같은 command-list COM 객체를 다른 allocator로 reset/re-record하는 유효한 overlap은 유지. GPU fence 완료 직후 allocator reset 16회, unresolved wait의 queue-local 종료 취소와 독립 peer queue 보존 확인. `execution/shutdown-after-02` |
-| Swapchain 출력 제한·geometry | Restrict-output 소유권·COM 수명 및 `GetRestrictToOutput`, source size·rotation·background의 실제 동작과 실패 시 상태 보존을 구현. `dxgi-presentation/present-queues-proof-02`. 별도 public D3D12 fixture에서 fence 뒤에 두 Present를 기록한 뒤 setter를 변경하고 실제 CAMetalLayer drawable을 캡처하여 각 frame의 서로 다른 crop/회전/배경색 snapshot을 확인 |
-| Sampler·cache 지원 계약 | Shader-visible sampler heap 2048/2049 경계와 CPU-only 2049 허용, 장치별 살아 있는 고유 static sampler 2032개·중복 공유·해제 후 재사용 확인. Shader cache는 구현된 `SINGLE_PSO`만 보고하며 자동 OS cache를 가장하지 않음. `shader-binding/binding-only-after-02` |
+**실패-before:** 증거 root는 `build/local/calculate-lod-20261002`다. 정정한 fixture를 원래 compiler에서 실행한 `before-sm6-x64`는 exit1: `calculate_lod` **112개 수치 불일치**, `calculate_lod_shapes` **17개 PSO 생성 실패**였다. AGX의 `air.get_depth_texture_cube` unlowered call이 구체적으로 관찰되어 cube compile 영향은 더 이상 추정만이 아니다. 기존 SM6 case들은 통과했다. 이는 최초 정적 감사와 별도의 후속 GPU 재현이며 x86 before 실행을 주장하지 않는다.
 
-표의 증거 경로는 모두 `build/local/p1-complete/` 아래다.
+**수정-after:** x64·WoW64 Ninja build/install을 반영한 private runtime에서 다음 네 실행을 기록했다.
 
-### 원래 P1 추가 구현과 GPU 검증
-
-2026-09-29 추가한 아래 경로는 이전 `runtime-01`~`runtime-03`의 바이너리와 다르다.
-**소스·cross-build·native probe를 공개 D3D12 통합 검증 완료로 승격하지 않는다.**
-
-| 추가 경로 | 현재 증거 | 남은 확인 |
+| 수정 후 evidence 디렉터리 | guest ABI | 관찰 |
 |---|---|---|
-| Resource/heap/allocation | **runtime-04 공개 GPU 검증 통과:** 최신 resources v16의 dimension·mip·buffer 한계, 4KB/64KB tile 기준·MSAA RT alignment, null-output·초기 state·heap 수명·CPU 전송·GPU alias. `resource-memory/public-runtime04-v16` | 다른 GPU/OS의 allocation 및 Metal capability 차이는 별도 검증 |
-| RGB32·packed 4:2:2 | **runtime-04 공개 GPU 검증 통과:** 논리 footprint↔확장 backing, 1D/2D/3D·array·mip copy와 CPU/GPU/predicated copy, RGB32 typed-buffer remap·OOB, RGB32 texture load·MSAA load·FLOAT resolve, packed filtering와 RGB32 blend 6 case. `format-design/*-runtime04-final.log` | 물리 backing은 확장 표현이며 논리 footprint와 동일하지 않음. Format-support·multisample-capabilities도 통과 |
-| STANDARD_SWIZZLE | **runtime-04 공개 GPU 검증 통과:** canonical roundtrip, shader·clear, paired format, texture/texture·texture/buffer alias, placed heap Evict→MakeResident 뒤 GPU 읽기, custom WRITE_BACK Map·CPU transfer 뒤 GPU 읽기. `standard-swizzle/public-runtime04-v3`. 별도 native 2D/3D/BC tile oracle 유지 | 공개 fixture의 명시된 조합과 native layout 증거를 구분하며 모든 GPU family의 conformance는 아님 |
-| View/compiler | **공개 GPU 검증 통과:** partial 3D UAV DXBC와 DXIL write→load fence·atomic·bounded clear·dimensions, depth 1D/cube/cube-array의 D16/D24/D32/D32S8, fractional LOD·comparison LOD·1D border, BC volume. `format/partial-dxil-after-fence-05` | ROV nested descriptor-table과 sample-frequency 최종 검증은 아래 runtime-13 결과 참조 |
-| Compressed/packed copy | **runtime-05 공개 GPU 검증 통과:** BC1 8×8↔RGBA16UINT 2×2 bitcast의 정확한32 bytes, packed cube-array RGBA77/120/120/255, depth plane4 format. `format/{reinterpret-permanent-05,packed-cubearray-permanent-05,depth-plane-corrected-05}` | Reinterpret의 수정된 유효 fixture는 runtime-03에서 실패했다. 무효 footprint나 UAV flag 누락 fixture를 driver 결함 증거로 사용하지 않음 |
-| Recording/queue | **runtime-04 공개 GPU 검증 통과:** immutable recording, stale/duplicate·post-Close, state·split·promotion·decay·COPY handoff, 미래 queue Wait 뒤 query, 같은 COM 객체의 유효 rerecord, 제거 뒤 residency 오류. `execution/runner-common-04` | Native residency priority는 hint이며 Metal의 엄격한 eviction priority scheduling을 보장하지 않음 |
-| Presentation | **runtime-06 공개 GPU 검증 통과:** present-queues의16 drawable, latency·DO_NOT_WAIT·제거 wake·rotation·resize·restriction, 최대 latency1에서 stalled queue Wait 앞의 queued RESTART 0ms와 정확한 public credit1, fullscreen 최종 Release의 HWND/style/rect/mode 복원. Dirty/scroll exact pixels(runtime-04), crop/rotation/RTL과 실제 presented callback 뒤 statistics(runtime-05) 통과 | 이미 Metal에 commit된 drawable의 폐기는 P1 종료 결과에서 구현·검증. 물리 HDR scanout·다중 출력 전환은 별도 경계 |
+| `after-sm6-x64` | x64 | PASS, exit0, **28 case PASS** (`calculate_lod`·`calculate_lod_shapes` 신규 포함) |
+| `after-sm6-x86` | WoW64 x86 | PASS, exit0, **28 case PASS** (`calculate_lod`·`calculate_lod_shapes` 신규 포함) |
+| `after-dxil-texture-x64` | x64 | PASS, exit0, pixel LOD control clamped **0** / unclamped **−4** |
+| `after-dxil-texture-x86` | WoW64 x86 | PASS, exit0, pixel LOD control clamped **0** / unclamped **−4** |
 
-호스트의 x86_64 시작 단계가 커널 대기 상태에 빠져 full Ninja가 `winebuild --builtin`에서 멈췄다.
-Wine/LLVM을 사용하지 않는 최소 x86 프로그램도 시작하지 못했고, 승인받은 Rosetta 서비스 재시작으로도 복구되지 않았다.
-이후 사용자가 실행 권한을 허용한 뒤 같은 최소 x86 프로그램과 `winebuild --version`이 정상 종료했다.
-macOS 재시동 없이 full Ninja/install과 새 `build/local/p1-complete/runtime-04` staging을 완료했다.
-이 runtime에서 dynamic sampler2047·static sampler2031의 shader 결과와 ForcedSampleCount4의 ROV 누적27/27은 Metal API/Shader Validation을 통과했다(`shader-binding/tier2-sampler-high-after-04`, `shader-binding/rov-forced-after-04`).
-Attachmentless ordinary MSAA4 ROV의 encoder/PSO sample count 불일치는 effective raster count로 pass를 생성하고 count가 바뀌면 pass를 분리해 수정했다. **runtime-05**에서 ROV 27/27과 같은 command list의 sample1→sample4→sample1→Forced4 전환이 Metal API/Shader Validation을 통과했다(`shader-binding/{rov-msaa4-after-05,attachmentless-switch-after-05}`). 새 runtime 전체 검증은 진행 중이며 기존 설치본이나 게임 prefix는 변경하지 않았다.
-`execution/{multiqueue-04,residency-04,copy-resolve-04,predication-indirect-04}`도 API/Shader Validation을 통과했다. Multiqueue 32×1024 GPU words, residency fence7/checksum `0x59047300`, color/depth/stencil resolve와 indirect/predication 결과를 확인했다. Descriptor heap 1,000,001 거부·sampler/static sampler 수명·cache flags는 `shader-binding/binding-only-static-after-04`에서 통과했다.
-`shader-binding/pipeline-cache-after-05`는 malformed·foreign·root/shader 불일치 blob 거부와 변경 shader 결과 `0x31415813`, unaligned 입력 수명·반환 blob 격리 결과 `0x31415a5b`를 GPU에서 확인했다.
-`shader-binding/pipeline-statistics-after-06`도 DXBC·DXIL의11-field independent GPU oracle 전체를 Metal API/Shader Validation으로 통과했다. 이 결과는 이후 short-line 입력 복원·center pattern 변경 이전의 기존 MSAA depth·stencil·derivative·interpolation 경로 보존 증거다.
-DXGI의13-frame color-space·7-frame HDR metadata 공개 경로와 native presenter의 tone-map·변환 oracle도 통과했다. 공유 backend 보존 검증은 `runtime06-baseline.log`에서 D3D11 3D UINT/FLOAT48-voxel clear·DXBC compute·PS sample·Present 및 실제 drawable3072 pixels=`ff4080bf`로 확인했다. D3D11 전용 기능 범위를 추가한 것은 아니다.
-완료된 시험 prefix는 디스크 공간 회수를 위해 제거했으며 frozen fixture·stdout/stderr·native module log·result.json·drawable capture는 보존했다.
-**runtime-10 통합 GPU 통과:** `shader-binding/pipeline-statistics-after-10`의 DXBC 168+DXIL 178=346 GPU case·26 validation case와 `line-after10`, `center-final10-v1`, `center-dxil-final10-v1`이 Metal API/Shader Validation을 통과했다. Line의 W 비율 1:1000 양방향 보간, D24S8 depth/stencil·occlusion, centroid·sample·EvaluateAttribute와 derivative/UAV를 확인했다. Sample-frequency derivative는 76 covered sample과 76 UAV 증가가 일치한다. Center 2/4/8 full/masked RTV·D32 DSV·occlusion과 독립적인 resource/target quality 7조합도 보존했다.
-- **Stage linkage:** case-insensitive semantic+index와 element-local component 배치를 사용한다. `mixed-packed-after10`은 DXIL→DXIL·DXBC→DXIL·DXIL→DXBC 및 별도 clip/ordinary packed float2의 5개 pair에서 정확한 RGBA를 확인했다. Clip의 raw NaN builtin은 primitive rejection을 유지하고 user shadow만 유한 값으로 내보낸다. Masked helper의 atomic 반환값은 `poison` 대신 정의된 0을 사용한다. 이전 masked PS counter가 `15<<32`로 잘못 증가한 회귀도 전체 통계 oracle로 닫았다.
-- **Forced raster query:** `forced-query-09fixed-evidence`의 15 case가 API/Shader Validation을 통과했다. 저장한 post-PS virtual sample coverage를 numeric/binary occlusion으로 세고, 1× color replay가 Metal visibility scratch를 초기화하기 전에 query 결과를 fanout한다. Mask·discard·tiny edge·indirect predication·layered replay와 pixel-frequency UAV를 포함한다.
-- **공유 D3D11 보존:** packed VS→PS의 기존 오류(`ff800000` 대 `ff804020`)를 수정하고 기존 cache_29가 있는 같은 cache 파일에서 cache_30으로 재컴파일하여 readback을 통과했다. `d3d11-shared/runtime10-packed.log`와 실제 drawable 3,072 pixels=`ff4080bf`를 확인했다. GS→PS의 packed float2도 runtime-10에서 `(0,.625,0,.5)`였던 값을 runtime-11에서 `(.25,.625,.875,.5)`로 수정했다(`mesh-lane-before11.log`, `mesh-lane-after11.log`). 최종 mesh 경계 변경을 위해 compiler cache version은 31이다. D3D12 GS/HS/DS 지원을 추가한 것은 아니다.
-- **ROV 최종 통과:** nested buffer ROG만으로는 일반 실행의 ordering이 보장되지 않아 private per-pixel/layer/sample R8Uint ROG marker를 사용한다. Texture-array read ABI를 AIR 2.7의 5인자와 AIR 2.8의 sampler·offset을 포함한 7인자로 구분한다. Direct-root helper의 logical-active metadata는 임시 SSA 값 대신 직렬화 가능한 argument index를 저장한다. `rov-stencil/runtime13-{normal,api,validation}-full15`는 일반·API-only·API/Shader Validation에서 각각 15/15 case를 통과했다. Direct/table sample-frequency 두 경로는 각각 8개 word 모두27, layers27/27/90/90, warm cache27/27이며 validation error·foreign backend load는 없다. Exact AIR의 native ShaderValidation PSO도 통과했다. Stencil DXBC/DXIL30/35의 기존 일반·Shader Validation 증거를 유지한다.
-- **최종 linkage runner:** `mixed-packed-after13`은 최신 runtime과 exact marker gate로 mixed DXBC/DXIL·clip·packed 5개 pair를 다시 실행하여 Metal API/Shader Validation을 통과했다.
+네 `result.json` 모두 API+Shader Validation, `dxil_native_compiler_verified=true`, `validation_errors=[]`, `foreign_backend_loads=[]`다. `guest_arch`를 확인했으며 x86 행은 WoW64 guest 증거이지 ARM64 no-Rosetta 실행이 아니다. 수정 후 manifest는 root 아래 `runtime-after/owned-graphics-runtime.json`, SHA256 **9fe2523232ae4cd557b1d1351de4fae684f6bc7a04ac2a2d6a45feb125c314b2**다. 이 **4/4**는 별도 focused proof로, 이전 mixed-cut recovery **118/118**에 합산하거나 그118개를 이번 cut에서 재실행한 것으로 바꾸지 않는다.
 
-**SSD 정리에 따른 중간 중단 (2026-09-29).** 추가 계약 대조에서 native clip/cull user varying의 Inf가 0으로 전달되고, 살아남는 primitive의 cull NaN도 보존되지 않는 것을 runtime-13/14에서 재현했다. 단순 마스킹 제거는 일반 실행에서도 실패하고 ShaderValidation 오류도 발생했다. 최신 수정은 원래 VS의 raw 값을 캡처하여 point/line/triangle 거리 입력을 직접 보간하고, native replay의 user shadow는 유한 값으로 유지한다. 거리 입력을 소비하는 PS에는 1×에서도 이 경로를 사용하며, 실제 single-sample coverage texture·Metal helper와 Wine32 옵션 decoder를 함께 변경했다. Compiler cache version은 현재 **32**다.
+**검증 입력과 한계:**
 
-`runtime-15`의 전체 Ninja/install/staging과 `clip-nonfinite/after15-{normal,validation}`이 통과했다. 1×/4× clip/cull Inf, clip NaN primitive rejection, 살아남는 cull NaN의 실제 PS 입력, point/line/triangle 및 `SV_SampleIndex`, 기존 finite IA·clip·packed 결과를 확인했다. Validation 결과는 오류·foreign backend load 없이 통과했다. CPU build/staging/diagnostics 16+21+44개도 통과했다. Wine32 wire layout·native compilation은 확인했지만 실제 32-bit 실행은 당시 미검증이었다(아래 WoW64 결과로 검증).
+- `calculate_lod`는20개 analytical 2D case의 bias·sampler/view clamp·비등방 footprint를 비교한다. `calculate_lod_shapes`는1D/1Darray/2Darray/3D/cube/cubearray, cube6 face의 scale1/4 및 signed nonconstant-major quotient 진단을 포함한다. 유효하게 초기화한 mip에서만 native `Sample` 비교를 사용한다. Array LOD 메서드는 **spatial coordinates만** 받는다. Slice coordinate를 LOD에 전달해서 제외 여부를 검증했다는 주장이 아니다.
+- 절대 epsilon **1/64**는 이 fixture의 engineering acceptance이지 보편 conformance 오차가 아니다. 선택한 anisotropic policy의 case와 native Sample 비교가 임의 anisotropic policy·모든 footprint의 native 동등성을 증명하지 않는다. Cube anisotropy의 minor-axis 품질 보장도 주장하지 않는다.
+- Seams·zero/nonfinite 경계, native/nonkernel 경로의 전체 empty-view 의미, 실제 게임·다른 GPU/OS는 미검증이다. Pixel control은 유지 확인이지 native 경로 전체 proof가 아니다. **SM6.9·공개 HighestShaderModel6.5/FL12_1 cap은 그대로**이며 이번 완료로 상향하지 않는다.
 
-**재개 검증 (2026-09-30).** 전용 `clip-nonfinite-depth/probe.cpp`는 1× D32에서 early/late depth·pixel/sample-frequency PS 8개 case의 numeric/binary occlusion, UAV 호출 수, NaN cull 입력 보존과 RT readback을 `runtime-15`의 일반 실행과 Metal API/Shader Validation(`clip-nonfinite-depth/run15-{normal,validation}`)에서 모두 통과했다. 같은 runtime에서 이전 MSAA 통합 fixture 9종(346-case statistics, msaa-lines, center 2/4/8 DXBC·DXIL, forced query, ROV 15 case, attachmentless switch, ROV MSAA4, mixed/packed linkage)도 validation으로 통과했다(`msaa-regression-15/`). Linkage는 현재 runner gate가 요구하는 `DISTANCE_PASS samples=1,4`를 출력하는 현재 fixture로 실행했다.
-- **Rasterization-disabled SO:** `D3D12_SO_NO_RASTERIZED_STREAM` PSO에서 실행되지 않는 PS의 clip/cull 입력이 `owned_distance_interpolation`을 켜서 불필요한 MSAA capture/replay 경로를 선택했다. `d3d12_pipeline_graphics.cpp`에서 PS가 실제로 실행될 때(`use_fragment`)만 거리 입력을 검사하도록 수정했다. `stream-output`에 finite/non-finite `SV_ClipDistance0` no-raster case 2개를 추가했다. 두 case는 수정 전 runtime-15에서도 정확한 SO 결과로 통과하므로 출력 결함이 아니라 불필요 경로 선택의 수정이다.
-- **SO fixture barrier:** 이후 추가된 queue-time state 검증이 `stream-output`·`so-format-support` fixture의 잘못된 barrier를 device removal로 거부했다. Write state로 암시적 승격된 buffer를 barrier 없이 다른 상태로 쓰거나 `COMMON` before-state를 사용한 fixture 오류이며 translator 검증은 spec대로 유지했다. 두 fixture를 명시적 transition으로 수정하고 root UAV/GPU 인자용 default buffer에 `ALLOW_UNORDERED_ACCESS`를 지정했다.
-- **runtime-16 통합:** 위 수정을 포함한 전체 Ninja/install/staging 뒤 `regression-16/`에서 stream-output(validation 104, GPU 45, no-raster distance 2), so-format-support, pipeline-statistics, msaa-lines, dxil-ia, raster-order, execution-safety, indexed-restart, queries가 Metal API/Shader Validation을 통과했다. `runtime-15`에서 pipeline-cache·predication-indirect·stencil-reference도 통과했다. CPU build/staging/diagnostics도 통과했다.
+### DXGI budget notification 완료와 focused proof
 
-SSD 정리로 완료된 시험 prefix **421개**와 과거 복제 runtime **80개**의 `bin/lib/share` payload를 삭제했다. `build/local`은 **458.6→6.8 GiB**, 볼륨 가용 공간은 **7.4→457.7 GiB**가 됐다. 소스·toolchain·현재 build/install, 기본 runtime과 `runtime-13`/`runtime-15`, 기존 runtime manifest·fixture·로그·result.json·drawable capture는 보존했다. 보존한 runtime-13/15는 staging verifier의 manifest·builtin load policy·winemetal dependency 검사를 통과했다. 삭제된 과거 runtime/prefix를 다시 실행하려면 새 staging과 새 시험 prefix가 필요하다. 2026-09-30 P1 종료 뒤에는 최신 `runtime-20`, 비교용 `runtime-16`, WoW64 `build/local/wow64/runtime-final`의 payload를 유지하며, 나머지 runtime은 manifest·provenance만 보존한다.
+**수정 전 소스 감사 보존(2026-10-02):** 당시 `src/dxgi/dxgi_adapter.cpp:277–286`은 cookie0/S_OK만 반환하고 event 저장·signal이 없었으며 unregister는 no-op이었다. Streaming manager 영향은 당시 `[INFERENCE]`였고, 정적 감사 자체는 runtime 실패 재현이 아니었다. 후속 native residency 실행은 아래처럼 distinct active cookie 계약에서 실제 실패했다.
 
-`Present(RESTART)`는 queue에 남은 frame과 이미 Metal에 commit된 frame을 모두 폐기한다(아래 P1 종료 결과). Core Animation에 이미 넘긴 drawable은 규격상 표시 완료로 취급한다.
-HDR10PLUS는 제약으로 미충족, 물리 scanout 색 정확도·다중 출력 전환은 미검증 경계로 남긴다.
+**구현:** `src/dxgi/owned_budget_notification.hpp`의 `DxgiBudgetNotifications`는 adapter가 retain한 실제 WMT device의 `recommendedMaxWorkingSetSize`를 읽는다. 이는 `QueryVideoMemoryInfo.Budget`과 **동일한64-bit 정보원**이며 source getter/native ABI는 바꾸지 않았다. Native Metal budget-change callback 또는 KVO 통지 보장은 없으므로, 등록이 있을 때만 lazy worker가 **명목500ms 간격**으로 polling한다. QueryBudget·등록·worker의 read→compare→`SetEvent`를 직렬화해 Query가 변경을 먼저 읽거나 첫 worker sample 전에 값이 달라져도 pending change를 잃지 않는다.
 
-### P1 완료 판정과 남은 계약
+- 등록은 `EVENT_MODIFY_STATE`만 요구하는 owned duplicate Event handle을 보관한다. `NtQueryObject`로 권한/type을 비변경 조회하며, 검증이나 등록을 위해 최초 `SetEvent`/`ResetEvent`를 하지 않는다. Caller가 원래 handle을 닫아도 등록은 유지된다.
+- 같은 event를 여러 번 등록해도 **서로 다른 opaque active cookie**를 준다. Unregister는 signal과 직렬화해 해당 등록의 duplicate만 닫고 caller handle이나 다른 등록을 건드리지 않는다. `Stop`은 worker join을 마친 뒤 adapter/device teardown을 허용한다.
+- 기존 Query의 usage·reservation과 UMA 정책은 그대로다. Event는 Budget을 다시 조회하라는 **requery hint**이며 예약으로 native budget을 제어하거나 Windows scheduler budget 전체를 구현한 것이 아니다.
 
-**P1 완료(2026-09-30).** A–D 및 위에 기록한 resource·format·execution·shader/PSO 결과에 더해, 거리 보간의 1× depth/occlusion·MSAA 통합 회귀, 이미 commit된 frame까지 포함한 `Present(RESTART)` 폐기, WoW64 실행을 닫았다. HDR10PLUS는 제약으로 미충족이며 명시적으로 거부한다. 물리 HDR scanout·다중 출력 전환·다른 GPU/OS는 이 장치에서 실행할 수 없는 미검증 경계다. A는 UINT와 Apple8+ UINT64, B는 present queue rotation·transactional resize, C는 MSAA를 포함한 11-field statistics, D는 VS→SO(stream 0) direct/indirect와 SO statistics 범위다. P1-C의 346 GPU case·26 validation case는 최신 compiler(`runtime-15`, `runtime-16`, `runtime-20`)에서도 다시 통과했다.
+**실패→수정→실행 증거:** 별도 evidence root는 [`build/local/budget-notification-20261002`](../build/local/budget-notification-20261002)다. 아래 결과는 과거 mixed-cut recovery **118/118에 합산하지 않는다.**
 
-#### P1 종료 결과 (2026-09-30)
-
-- **Native `Present(RESTART)`:** 이전에는 Metal에 commit된 present가 하나라도 있으면 `DXGI_ERROR_UNSUPPORTED`를 반환했다. 이제 drawable은 present command buffer의 GPU 완료 handler에서만 Core Animation에 넘긴다. 이때 presenter의 restart epoch를 `MTLSharedEvent` token과 비교해 바뀌었으면 present하지 않고 presentation observer도 취소한다(새 WineMetal call 214 `MTLCommandBuffer_presentDrawableIfCurrent`, 64-bit·WoW64 table 모두). Order event·credit·semaphore 회수는 그대로라 뒤 frame이 막히지 않는다. D3D11 present 경로는 변경하지 않았다. 대가로 present가 GPU 완료 후 handler에서 발생하므로 최대 한 frame의 지연이 늘 수 있다.
-  - 증거: `present-queues`의 `RESTART_NATIVE` case(ResizeBuffers1 queue B/A, B 차단, frame 1 queue 대기·frame 2 native commit 뒤 RESTART). `runtime-17`/`runtime-19` 이후 S_OK·0 ms·정확한 credit·count/index와 fullscreen 복원을 통과했고, 이전 `runtime-16`은 같은 fixture에서 `0x887a0004`로 실패했다. Native 결정 trace(`OWNED_GRAPHICS_NATIVE_PRESENT_DECISION`)는 case 구간에서 `present_id=2 presented=0 reason=epoch`, `present_id=3 presented=1 reason=current`만 기록했고 runner가 이를 gate한다(`regression-17/present-queues-decision`). Core Animation `presentedTime`은 이 환경에서 모든 frame에 0을 보고해 표시 증거로 쓰지 않았다.
-- **HDR10PLUS 분류:** macOS SDK 27의 `CAEDRMetadata`는 HDR10 정적 MDCV·CLL과 HLG만 받고 ST 2094-40 동적 metadata 입력이 없다. Microsoft는 `DXGI_HDR_METADATA_HDR10PLUS`/`D3DDDI_HDR_METADATA_HDR10PLUS`를 문서화되지 않은 `BYTE Data[72]`로만 정의한다. 의미 보존 변환이 불가능하므로 `DXGI_ERROR_UNSUPPORTED`로 거부하고 상태를 바꾸지 않는다(`hdr-metadata`의 `reject-hdr10-plus`).
-- **WoW64(32-bit) D3D12:** 32-bit frontend는 이전에 실행 불가능했다(descriptor handle·shader-visible heap의 aborting `IMPLEMENT_ME`, 4 GiB 위 native 포인터로 인한 NULL `Map`, compiler 출력 역참조). 수정: 32-bit descriptor handle registry(stride 32, 외부·범위 밖 handle 거부), 하위 2 GiB에 할당한 CPU-visible buffer와 heap(WoW64 table의 `_MTLDevice_newBuffer32`), compiler 출력 복사 call 215 `sm50_copy_compiled_bitcode`(64-bit는 기존 zero-copy), 남은 `IMPLEMENT_ME`의 계약 오류 대체. `scripts/stage-owned-graphics.py --dxmt-install32`가 i386 module을 machine type·marker와 함께 staging·검증한다. 최종 tree의 `build/local/wow64/runtime-final`에서 PE32 fixture의 stream-output(validation 104·GPU 45·no-raster distance 2), indexed-restart(DXBC/DXIL 62 case), so-format-support, resources, smoke가 Metal API/Shader Validation으로 통과했다(`build/local/wow64/*-final`). 32-bit present/fullscreen·MSAA·DXR suite와 하위 2 GiB 고갈 동작은 실행하지 않았다.
-- **Fixture 수정:** `temporal`의 opposite-order case는 이전 실행이 끝나지 않은 같은 list를 반복 제출해, D3D12 규칙(\"previous execution has not yet completed\"면 drop)을 위반했다. 이번 queue 검증 이전 runtime-15에서도 같은 device removal로 실패했다. iteration마다 별도 recording을 사용하도록 고쳤다. Runner의 stale gate(`present-queues` rejected=12, format-support의 제거된 packed422 marker)도 현재 fixture에 맞췄다. `owned-d3d12-hdr-presenter.cpp`는 frame 사이에 live EDR scale이 바뀌면(관찰값 0.0625→0.075/0.32/0.40) 서로 다른 scale의 highlight 순서를 비교해 실패했다. 순서 비교는 같은 scale일 때만 하고, 모든 frame은 기존의 scale-aware 독립 PQ/EETF oracle로 계속 검사한다. `runtime-20`에서 2회 통과했다. `colorspace-presenter`(11 frame)와 `present-geometry`도 같은 runtime에서 통과했다.
-- **최종 64-bit 회귀(`runtime-20`, Metal API/Shader Validation):** smoke(present/no-present), multiqueue, temporal, core-contracts, execution-safety, fence-events, bundles, buffer-rtv, resources, residency, copy-resolve, copy-resource-casts, depth-plane-copy, reinterpret-copy, packed-cubearray, partial-3d-uav-dxil, standard-swizzle, format-support, expanded-formats, capabilities, predication-indirect, pipeline-cache, stencil-reference, indexed-restart, queries, atomic-copy, pipeline-statistics, msaa-lines, multisample-capabilities, dxil, dxil-texture, dxil-ia, raster-order, stream-output, so-format-support, raytracing, ngx, ngx-contracts, hdr-metadata, colorspace, fullscreen이 통과했다(`build/local/p1-complete/regression-20/`). present-queues(native RESTART decision gate 포함)도 최종 `runtime-20`에서 통과했다. 공유 D3D11 baseline(3D clear·DXBC compute·sample·windowed Present `4080bfff`)도 validation 오류 없이 통과했다. CPU build/staging/diagnostics와 NGX frontend 검사도 통과했다.
-
-아래는 기존 P1 정의에 속하는 잔여 항목과 후속 구현 결과다. 2026-09-28의 소스 감사 뒤, 2026-09-29에 fullscreen 오류·전환, D3D12 HDR10 metadata와 color-space 지원·적용 순서를 실제 런타임에서 수정·검증했다. Color-space의 미지원 설정 성공 반환도 이전 runtime에서 재현했다. 이후 작업은 위 D3D11 유지 방침을 따른다.
-
-| 잔여 항목 | 현재 근거와 상태 | 닫아야 할 계약 |
+| Evidence | 실행·관찰 | 판정 범위 |
 |---|---|---|
-| HDR metadata | **D3D12 HDR10 적용·교체·해제 및 기존 tone-map 경로 구현·검증:** 아래 HDR10 결과 참조. D3D11 setter는 변경하지 않음. **HDR10PLUS는 제약으로 미충족:** macOS SDK 27의 `CAMetalLayer.EDRMetadata`/`CAEDRMetadata`는 HDR10 정적 MDCV·CLL과 HLG만 입력으로 받으며 ST 2094-40 동적 metadata 입력이 없다. Microsoft는 `DXGI_HDR_METADATA_HDR10PLUS`/`D3DDDI_HDR_METADATA_HDR10PLUS`를 불투명한 `BYTE Data[72]`로만 정의하고 내부 layout을 문서화하지 않았다. 따라서 의미를 보존하는 변환이 불가능하고, 성공 반환 없이 `DXGI_ERROR_UNSUPPORTED`로 거부하며 상태를 바꾸지 않는다(`hdr-metadata`의 `reject-hdr10-plus`) | native HDR10 metadata 전달·다른 display/GPU 조합은 미검증 |
-| Color-space 설정 | **D3D12 지원·설정 일치, 실패 보존·resize·GPU 완료 순서 구현·검증:** 아래 color-space 결과 참조. D3D11 전용 코드는 변경하지 않음 | Core Animation 합성/물리적 scanout의 색 정확도, 다중 출력·EDR 전환, Windows reference differential은 미검증 |
-| Fullscreen 오류·전환 | **선정 실패·단일 출력 전환 계약 구현·검증 완료:** 양쪽 frontend의 출력 조회·native 전환·`ResizeTarget` 오류와 상태 보존, fullscreen 생성, resize/readback/present 및 반복 이탈을 검증했다. 아래 fullscreen 결과 참조 | 다중 모니터 target 변경·hot-unplug·OS display-mode 복구 실패의 실제 검증은 남음 |
-| Format·지원 보고 | **선정 정합성 수정 구현·검증 완료:** SO 12종, format/view·mip·cast, D24 copy, quality query·resource/PSO preflight와 2×/4×/8× 실행을 순서대로 검증했다. 아래 후속 결과 참조 | 98종 query와 명시한 GPU oracle의 범위이며 모든 format·dimension·연산 조합의 conformance는 아님. 다른 GPU/OS와 Windows reference differential은 미검증 |
-| 공유 backend 회귀 | **기존 증거 유지:** D3D11 fullscreen·resize·GPU readback·Present와 출력 proxy 수명을 실제 실행했다. D3D10/11 전용 기능 검증은 별도 P1 목표가 아니다. | D3D12 필수 공유 변경이 기존 동작을 깨뜨리지 않는지 영향 범위만 검증 |
+| [`before-residency-x64/stdout.log`](../build/local/budget-notification-20261002/before-residency-x64/stdout.log), [`stderr.log`](../build/local/budget-notification-20261002/before-residency-x64/stderr.log) | `step=budget distinct active cookies hr=0x80004005`에서 실패 | 기존 no-op/cookie 계약의 failing-before |
+| [`after-residency-x64/result.json`](../build/local/budget-notification-20261002/after-residency-x64/result.json) | x64 PASS, exit0,1502ms 관찰, teardown2ms·remaining_refs0 | 실제 native Budget 조회·등록/해제·GPU residency/readback |
+| [`after-residency-x86/result.json`](../build/local/budget-notification-20261002/after-residency-x86/result.json) | WoW64 x86 PASS, exit0,1501ms 관찰, teardown2ms·remaining_refs0 | 같은 계약의 PE32 guest proof; ARM64 no-Rosetta proof 아님 |
+| [`observer-x64-ordered/stdout.log`](../build/local/budget-notification-20261002/observer-x64-ordered/stdout.log) | exit0, `DXGI_BUDGET_NOTIFICATION_PASS`와6 subcase marker | Production helper를 실제 PE에 compile한 controlled-source CPU proof |
+| [`observer-x86-ordered/stdout.log`](../build/local/budget-notification-20261002/observer-x86-ordered/stdout.log) | exit0, 같은 PASS와6 subcase marker | 같은 controlled-source 계약의 PE32 proof |
 
-GS/HS/DS 및 이에 의존하는 adjacency/patch·SO 확장, reserved/tiled/shared/cross-adapter·enhanced barrier·pipeline library는 **기존 계획대로 P2**다. 이 항목들을 P1로 옮겨 완료 조건을 늘리지 않는다. UINT64의 Apple8+ 조건, MSAA의 AIR 2.8/macOS 26 target, 실제 GPU 검증이 M5 Pro/macOS 27에 한정된 점은 지원·증거 경계로 별도 유지한다. WoW64(32-bit process) 실행은 아래 P1 종료 결과에서 검증했다. 32-bit component format 12종의 x64 SO 실행은 아래 별도 결과대로 검증했다.
+두 native residency 결과는 API+Shader Validation, `validation_errors=[]`, `foreign_backend_loads=[]`이며 runtime manifest SHA256은 모두 **1f3aa16076d67807692c3a5b1a12176609396093665863734cec2226336d5925**다. Local/nonlocal Budget은 모두 **55662788608 bytes**, usage **196608**, available reservation·reservation **0**이었다. 두 실행 모두 observed changes **0**, event wakes **0,0,0**이며 **실제 native/물리 budget 변화는 관찰하거나 강제로 만들지 않았다.** Zero reservation restore는 nonzero reservation test가 아니다. 기존 GPU gate의 **256-byte readback, checksum0x59047300**도 양 ABI에서 유지됐다.
 
-### P1 구현 완료 항목
+Controlled-source probe는 mock forwarding이 아니라 **실제 production helper와 Win32 Event**를 사용한다. Low32 bits가 같은 **8GiB→4GiB→8GiB** 변화, unchanged sample, 같은/다른 event 구독, modify-only 권한과 caller-close 수명, source callback의 deterministic race barrier를 검증했다. 최종 `*-ordered` 로그의6 subcase는 **transitions/cookies, rights/lifetime, registration-pending-change, independent worker/unregister order, stop order, destruction order**다. 이는 native source의 물리 변화 proof와 별개다. 재실행 방법은 [residency 및 standalone CPU PE recipe](SMOKE-TEST.ko.md#residency-budget-notification-검증)를 따른다.
 
-2026-09-22에 선정한 P1-A/B/C/D와 이후 추가한 indexed restart·SO indirect/오류 전파·buffer UAV clear·RS 1.1 계약을 구현·검증했다. Timestamp/occlusion query, `SetPredication`, `ExecuteBundle`, `SetEventOnMultipleFenceCompletion`, `ResolveSubresourceRegion`, residency 확장과 기본 DXIL 경로도 구현되어 있다. 각 결과의 지원 범위·실행 증거·남은 제약은 아래에 유지한다.
+Production x64/WoW64 build·install은 [`build-x64-nt-layout.log`](../build/local/budget-notification-20261002/build-x64-nt-layout.log)·[`build-wow64-nt-layout.log`](../build/local/budget-notification-20261002/build-wow64-nt-layout.log)에서 성공했고, public fixture/helper PE는 양 ABI `-Wall -Wextra` clean이었다. Python 검증은 [`test-build.log`](../build/local/budget-notification-20261002/test-build.log)26 + [`test-staging.log`](../build/local/budget-notification-20261002/test-staging.log)16 + [`test-diagnostics.log`](../build/local/budget-notification-20261002/test-diagnostics.log)59 = **101 PASS**다.
 
-| 항목 | 기능 | 현재 소스 상태 | 구현 계약 |
+**한계와 후속 작업:** Polling은 명목 간격이지 hard latency 보장이 아니고, event coalescing 및 sample 사이의 **A→B→A** 변화는 놓칠 수 있다. Budget notification의 positive native transition·exhaustion fault injection·다른 GPU/OS·전체 Windows conformance·실게임 proof는 없다. 이후 착수한 **root/indirect arena 성장**의 [후속 proof](#rootindirect-arena-성장과-focused-proof)를 별도 관리하며 budget notification을 다시 미구현 선행 작업으로 취급하지 않는다.
+
+### Root/indirect arena 성장과 focused proof
+
+**수정 전 경계 보존(2026-10-02):** Review finding 1의 최초 수정은 고정 4 MiB arena overflow를 안전한 `E_OUTOFMEMORY`로 바꾼 memory-safety proof였다. 그때의 exact-end/잘못된 alignment·길이 거부와 2,000개 retained root readback은 당시 증거이며, 아래 용량 확장 proof로 소급 교체하지 않는다. 새 [x64](../build/local/arena-growth-20261002/before-x64/result.json)·[WoW64](../build/local/arena-growth-20261002/before-x86/result.json) fixture는 known-good `budget-notification-20261002/runtime-after`에서 `single-list-growth-close`, `8007000e`로 실패했다.
+
+**구현:** allocator는 초기 4 MiB와 `max(요청 크기, 4 MiB)` retained chunk를 사용한다. `ReserveGPUHeap`은 native `maxBufferLength`·SIZE_T·alignment·실제 allocation 실패를 검사하고 기존 chunk를 이동하지 않는다. `ResolveGPUHeap`은 current chunk fast path와 이전 virtual offset의 chunk 검색으로 CPU pointer·Metal buffer/local offset·GPU VA를 복원한다. root/static sampler/VB 및 immediate/indirect/WG/DXR payload caller를 이 계약으로 연결했다. Shared list의 arena는 제출 lease와 GPU retirement에 묶이고 Reset은 in-flight 사용을 거부한 뒤 추가 chunk를 해제한다. D3D11·공개 SM/FL/tier는 변경하지 않았다.
+
+현재 관찰한 수정 후 evidence root는 `build/local/arena-growth-20261002`, runtime은 [runtime-after-02 manifest](../build/local/arena-growth-20261002/runtime-after-02/owned-graphics-runtime.json), SHA256 **91a4e1c2c9c745c7f4f557fa922cbf18ea98cce716241e567b174f7e9c04f4d2**다. 다음 10개 실행은 exit0·API+Shader Validation·`validation_errors=[]`·`foreign_backend_loads=[]`다.
+
+| focused proof | x64 result | WoW64 x86 result | 실제 관찰 |
 |---|---|---|---|
-| **P1-A** | `AtomicCopyBufferUINT` / `AtomicCopyBufferUINT64` | **UINT와 macOS Apple8+ UINT64 publish 구현.** 실제 GPU 증거와 reader 관찰 한계는 아래 참조 | DIRECT/COMPUTE/COPY에서 primary element의 32/64-bit atomic publish와 dependent resource range ordering을 정확히 구현한다. Bundle에서는 허용하지 않는다. |
-| **P1-B** | `IDXGISwapChain3::ResizeBuffers1` / present queue rotation | **구현·검증 완료**(아래 결과 참조) | backbuffer별 queue를 보존하고 `Present`의 buffer 회전과 같은 index로 present queue를 회전한다. Resize를 transactional하게 만들고 실패 시 기존 swapchain 상태를 보존한다. |
-| **P1-C** | 정확한 `PIPELINE_STATISTICS` | **공개 구현·GPU 검증 완료.** DXBC 168개·DXIL 178개, 총 346 GPU case와 26개 validation case PASS | 11개 필드와 독립 UAV·RTV oracle을 검증한다. MSAA에서 실제 pixel-frequency 실행을 구현했으며 counter 나누기나 MSAA 제외로 대체하지 않는다. |
-| **P1-D** | Stream Output + SO statistics | **VS→SO(stream 0) direct/ExecuteIndirect 구현·검증 완료.** P1 당시 adjacency/patch, GS/HS/DS 조합은 `E_NOTIMPL`이었다. GS/DS SO 후속 검증은 [P3 완료 결과](#p3-완료-결과-2026-10-01) 참조 | SO declaration/binding/write offset/filled-size counter와 `SO_STATISTICS_STREAM0..3`를 compiler/runtime/query까지 end-to-end로 구현한다. |
-| **P1 추가 수정** | 일반 non-SO indexed primitive restart | **구현·GPU 검증 완료**(아래 결과 참조). SO 오류 전파/WoW64 및 SO ExecuteIndirect도 구현·검증 | Strip에서 cut disabled 또는 index format과 cut 값 불일치인 경우만 application index pulling; list와 일치 strip은 native 유지 |
-| **P1 추가 계약** | 부분 buffer UAV clear / RS 1.1 static descriptor bounds | **구현·검증 완료**(아래 결과 참조) | Clear는 view-relative rect와 predicate를 보존한다. KEEP_BOUNDS flag의 유효 조합과 descriptor-table 경계 밖 접근 규칙을 맞춘다. |
+| arena root 성장 | [after-arena-x64](../build/local/arena-growth-20261002/after-arena-x64/result.json) | [after-arena-x86](../build/local/arena-growth-20261002/after-arena-x86/result.json) | single 20,000·shared 3 list/24,000·indirect 20,000 exact word, direct/indirect replay 전 output 지움, gated queued Reset 거부·retirement 후 Reset/new recording, 첫 `E_INVALIDARG` |
+| execution safety | [after-execution-x64](../build/local/arena-growth-20261002/after-execution-x64/result.json) | [after-execution-x86](../build/local/arena-growth-20261002/after-execution-x86/result.json) | 기존 allocator/list snapshot·gate·retirement·재기록 fixture 정상 |
+| native allocation failure 주입 | [after-native-failure-x64](../build/local/arena-growth-20261002/after-native-failure-x64/result.json) | [after-native-failure-x86](../build/local/arena-growth-20261002/after-native-failure-x86/result.json) | 격리 process에서 `MTLDevice_newBuffer` IAT를 한 번 0 반환으로 주입·원복. `Close=E_OUTOFMEMORY`, 이전 retained 32 word와 recovery 32 word exact, first `E_INVALIDARG` 보존 |
+| WG 경계 | [after-wg-x64](../build/local/arena-growth-20261002/after-wg-x64/result.json) | [after-wg-x86](../build/local/arena-growth-20261002/after-wg-x86/result.json) | 보조 compute root payload 최소 4,194,560 byte로 chunk 성장 강제 후 WG 두 실행: first/last sum34·static sampler17, CPU input first70/last126 exact. CPU input 자체는 >4 MiB arena allocation이 아님 |
+| DXR 경계 | [after-dxr-x64](../build/local/arena-growth-20261002/after-dxr-x64/result.json) | [after-dxr-x86](../build/local/arena-growth-20261002/after-dxr-x86/result.json) | 같은 보조 compute 성장 전후 DXR first/last 64 lane의 global/local root 결과 exact. SBT 자체는 arena가 아닌 application resource |
 
-A–D는 기존 P1 정의 안에서 먼저 닫은 개별 묶음이다. 이 목록의 완료가 D3D12 resource/format·DXGI를 포함한 P1 전체 완료를 뜻하지 않는다. 새 correctness·수명·data-corruption 문제는 D3D12 및 그 필수 공유 경로 범위에서 단계와 관계없이 먼저 수정한다.
+WG와 DXR의 x64 수정 전 [before-wg-x64-02](../build/local/arena-growth-20261002/before-wg-x64-02/result.json)·[before-dxr-x64-03](../build/local/arena-growth-20261002/before-dxr-x64-03/result.json)는 각각 `sample Close`·`coverage grid-direct Close`의 `E_OUTOFMEMORY`로 실패했다.
 
-#### P1-A — AtomicCopyBufferUINT / UINT64 구현
+**지정 acceptance 완료:** 최초 `after-predication-x64`·`after-predication-x86`의 큰 graphics ICB hang/device removal은 실패 증거로 보존한다. Single vertex에서 전체 count를 처리하던 render resolver를 **slot당 vertex 하나**로 바꾸고 ordinary indirect/SO resolver launch count를 연결했다. Compute resolver는 변경하지 않았다. 원래 **16,385-command oracle을 축소하지 않은** [after-predication-x64-03](../build/local/arena-growth-20261002/after-predication-x64-03/result.json)·[after-predication-x86-03](../build/local/arena-growth-20261002/after-predication-x86-03/result.json)는 exit0·API+Shader Validation·validation/foreign load 오류 없음으로 통과했다. Root payload **4,325,640 byte**, slot31 VB table **8,389,120 byte**와 static sampler, first/last exact 결과, 성장 전 cached statistics의 성장 후 재사용·predicate skip을 확인했다. 작은 count 성공으로 이 proof를 대신하지 않았다.
 
-Microsoft 계약상 primary element는 source에서 destination으로 원자적으로 복사되며, 지정한 dependent subresource range는 primary publish 전에 완전히 갱신되어 있어야 한다. `UINT`/`UINT64` source·destination 주소는 각각 자연 정렬을 만족해야 한다. DIRECT/COMPUTE/COPY command list에는 허용되지만 BUNDLE에는 허용되지 않는다.
+Graphics proof의 [runtime-after-03 manifest](../build/local/arena-growth-20261002/runtime-after-03/owned-graphics-runtime.json) SHA256은 **fe7ae649653fe1ed4e74facaa709e087dc5dbe9f9ab01f5a83b6e5e5cdf60c33**다. **합계 12/12는 earlier runtime-02의 10개 + render resolver 수정 후 runtime-03의 2개인 mixed-cut focused proof**이며 최종 snapshot에서 12개를 전부 새로 실행했다는 주장이 아니다. 물리 exhaustion 대신 격리 실패 주입으로 OOM 경로를 검사했다. 지정 acceptance 내 구현 완료 당시 다음 우선 작업은 COPY queue timestamp였다. 이후 [COPY focused proof](#copy-queue-timestamp-완료와-focused-proof)로 완료했으며 이 arena mixed-cut 증거는 그대로 보존한다.
 
-- record 단계에서 source/destination이 같은 owned device의 buffer인지, 4/8-byte alignment와 bounds, dependency array/count/null 조합, 각 dependent subresource range를 검증한다. Void API이므로 첫 recording error를 기존 방식대로 `Close`까지 보존한다.
-- 기존 `ComputeEncoderData` pass에 native buffer binding과 내부 pipeline을 기록한다. queue worker는 command-list 객체를 다시 읽지 않는다. Dependent range는 검증하며, 전체 선행 pass의 write를 완료시키는 encoder fence를 사용하므로 별도 range snapshot은 필요 없다. Application resource는 D3D 계약대로 GPU 완료까지 유효해야 한다.
-- dependent payload의 선행 write가 Metal memory model에서 visibility-complete된 뒤 primary를 publish해야 한다. 단순 4/8-byte blit을 D3D12 atomic copy와 같다고 가정하지 않는다. 지원하는 Metal atomic primitive 또는 검증된 equivalent sequence만 사용한다.
-- 64-bit atomic 지원은 현재 M5 Pro 한 장치의 성공을 전체 Metal family로 일반화하지 않는다. 필요한 native capability를 명시적으로 확인하고, exact 구현이 불가능한 조합은 silent fallback 없이 unsupported로 남긴다.
-- fixture는 direct/compute/copy list, 32/64-bit, dependency 0/N, natural-alignment/OOB/foreign-device 오류, late-latch 형태의 payload-before-primary 관찰을 포함한다.
+**추가 영향 경로 회귀:** Mesh는 runtime-02의 [x64](../build/local/arena-growth-20261002/after-mesh-x64/result.json)·[WoW64](../build/local/arena-growth-20261002/after-mesh-x86/result.json), SO는 render resolver 수정 후 runtime-03의 [x64](../build/local/arena-growth-20261002/after-so-x64-03/result.json)·[WoW64](../build/local/arena-growth-20261002/after-so-x86-03/result.json)가 API+Shader Validation으로 통과했다. SO의 두 active indirect command, count clamp, mixed IB/direct rebind, zero count·zero instances·predication skip의 exact capture/statistics를 확인했다. 이는 변경된 queue/slot resolver 경로의 회귀 검사이며 이 작은 fixture 자체를 4 MiB 경계 증거로 세지 않는다.
 
-공식 계약: [AtomicCopyBufferUINT](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist1-atomiccopybufferuint), [command-list API restrictions](https://learn.microsoft.com/en-us/windows/win32/direct3d12/recording-command-lists-and-bundles).
+**증거 한계:** Native allocation 실패 주입은 실제 반환 실패 경로를 실행한 것이지만 **물리 메모리 고갈이 아니다**. 무제한 recording·다른 GPU/OS·게임/성능·ARM64 no-Rosetta·최신 규격 전체 conformance를 주장하지 않는다. 이 focused proof를 과거 recovery 118 집계에 합산하지 않는다.
 
-**P1-A 결과 (2026-09-28).**
+### COPY queue timestamp 완료와 focused proof
 
-- 공통 검증 `ValidateAtomicCopy`: 같은 device의 buffer, 자연 정렬, primary bounds, `Dependencies != 0`일 때 두 배열 non-null, dependent resource 소유권, `Range.Begin <= End`, buffer는 `Subresource == 0`·`End <= Width`, texture는 subresource index 범위를 검사한다. 오류는 첫 recording error로 `Close`까지 보존된다. Bundle은 `E_INVALIDARG`.
-- `UINT`: 단일 thread compute pass에서 `atomic_load_explicit`/`atomic_store_explicit`(`atomic_uint`, AIR `air.atomic.global.load/store.i32`)로 publish한다. 별도 typed pass이므로 queue의 pass 경계 `waitForFence`/`updateFence`가 앞선 payload write의 완료와 이후 소비자의 관찰 순서를 보장한다. Dependent range는 이 보수적 경계 아래서 별도 동기화가 필요 없으므로 검증만 한다. Predication 대상 연산이 아니므로 predicate를 적용하지 않는다.
-- `UINT64`: macOS의 `supportsFamily(Apple8)`를 확인한 뒤 안정된 source의 `ulong` 값을 읽고, 같은 값 `v`로 `atomic_min_explicit(dst, v)` → `atomic_max_explicit(dst, v)`를 실행한다. 단일 publisher에서 중간 `min(old, v)`는 old 또는 v이고 최종 값은 v다. 두 32-bit store나 일반 blit으로 대체하지 않는다. UINT와 같은 encoder fence가 payload-before-primary 순서를 보장하며 predication을 적용하지 않는다. Capability 검사는 내부 PSO를 처음 만들 때만 수행한다.
-- 이 조합은 일반적인 다중 writer atomic store가 아니다. [D3D multi-queue 계약](https://learn.microsoft.com/en-us/windows/win32/direct3d12/user-mode-heap-synchronization)의 resource당 단일 writer·writer 전환 시 동기화가 필요하다. [Apple feature table](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf)의 Apple8 macOS 64-bit min/max 지원을 기준으로 gate하며 다른 family는 `E_NOTIMPL`이다. 다른 shader용 64-bit atomic load/store 지원을 선언하는 변경은 아니다.
-- 기존 UINT 증거: `graphics-translator/tests/owned-d3d12-atomic-copy.cpp`, suite `atomic-copy`. DIRECT/COMPUTE/COPY × dependency 0/1에서 같은 list 안의 source 생성 → payload copy → publish → 후속 copy 관찰, guard 보존과 18개 validation case를 Metal validation 아래 통과했다(`build/local/p1a/runtime-01`, `build/local/p1a/proof-01`).
-- 리뷰 반영: command list가 소유한 내부 pipeline(atomic copy와 기존 predication kernel)을 `BeginPredicationComputePass`가 `ComputeEncoderData::internal_pipeline`으로 보유한다. 제출 뒤 list를 해제해도 queue worker가 해제된 PSO handle을 쓰지 않는다. 재검증: `proof-03`.
-- Reader 관찰 범위: `Load2`는 32-bit load 두 개이므로 64-bit atomic snapshot의 oracle로 사용하지 않는다. 동시 reader fixture는 high word를 고정하고 globally coherent low-word generation과 해당 immutable payload만 관찰한다. Device memory barrier를 사용하며 유한 반복 내 같은 shader thread의 값 변화가 있어야 관찰 성공으로 판정한다. 다른 GPU/OS와 전체 64-bit shader snapshot은 별도 검증 범위다.
-- UINT64 확장 증거: DIRECT/COMPUTE/COPY × dependency 0/2 × 6개 값 조합(36회), GPU compute가 생성한 source/payload, false predication 무시, 33개 validation case, 닫힌 list 재실행 2회와 제출 뒤 list 해제를 통과했다. Ordered reader control은 256개 thread 모두 최종 generation 128과 해당 payload가 정확했다. M5 Pro/macOS 27에서 API+Shader Validation을 켠 `build/local/atomic64-implementation/proof-core-final`, runtime `runtime-05`를 사용했다. 공용 내부 compute pass의 `predication-indirect` 회귀도 같은 validation 모드에서 통과했다(`proof-predication-final`).
-- 동시 관찰 증거: `atomic-copy-live --api-validation`에서 256개 thread 중 64개가 같은 shader thread 안의 generation 변화를 관찰했다(전체 관찰 범위 1..128). 관찰된 payload는 모두 일치했고 ordered control도 통과했다(`build/local/atomic64-implementation/proof-live-final`). Native/owned reader의 계측 on/off 대조에서 Shader Validation이 compute 실행을 직렬화하는 것을 확인했다. 따라서 기본 suite는 계측을 켠 계약·수명·ordered control을 검증하고, live suite는 API Validation을 유지한 실제 동시 관찰을 별도로 요구한다. `LIVE_INCONCLUSIVE`는 live suite의 성공이 아니다. 기존 compiler로도 동시 관찰이 통과하여 실험용 coherent lowering 변경은 제거했다.
-- Reader 입력: `graphics-translator/tests/dxil/atomic-copy-reader.hlsl`과 frozen `atomic-copy-reader.dxil`(4,124 B, SHA-256 `b075b9d8708a0b8f0fca94428762f4af7ac8b88aa7c4b7397540b6f17f375eb5`). Wine HLSL frontend가 이 reader의 `globallycoherent`/`RWByteAddressBuffer.Load`를 처리하지 못하므로 frozen DXIL을 사용한다. 아래 frozen shader 절과 같은 로컬 DXC 1.9.0.5402로 `-T cs_6_0 -E main -HV 2021 -O0`을 사용해 생성했다. Runner가 입력을 복사하고 실제 owned DXIL compiler load를 확인한다.
+**수정 전 cap/API 실패(2026-10-02):** Known-good arena `runtime-after-03`에서 full queries [x64 result](../build/local/copy-timestamp-20261002/before-queries-x64/result.json)·[WoW64 result](../build/local/copy-timestamp-20261002/before-queries-x86/result.json)는 exit1, `COPY timestamp capability not reported`로 **GPU COPY query 작업 제출 전에** 실패했다. 별도 throwaway API probe의 [x64 stdout](../build/local/copy-timestamp-20261002/before-copy-api-x64/stdout.log)·[WoW64 stdout](../build/local/copy-timestamp-20261002/before-copy-api-x86/stdout.log)는 frequency/calibration 각각 **E_FAIL(0x80004005)**, COPY heap 생성 **E_NOTIMPL(0x80004001)**을 관찰했다. 이는 cap/API 미지원 재현이지 GPU sample ordering 실패-before 증거가 아니다. Baseline-only `--copy-runtime` mode와 throwaway source는 제거했고, 아래 canonical proof는 정리된 최종 fixture를 다시 빌드·실행한 결과다.
 
-재현(README의 방법으로 새 runtime을 stage한 뒤, 매번 새 output 경로 사용):
+**구현 계약:** OPTIONS3의 `CopyQueueTimestampQueriesSupported=TRUE`. `D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP`는 기존 native GPU counter heap·dummy 작업·비동기 GPU resolve 경로를 재사용한다. Timestamp `EndQuery`/`ResolveQueryData`는 COPY list↔COPY heap, DIRECT/COMPUTE list↔일반 TIMESTAMP heap으로 상호 배타적이며 `BeginQuery(TIMESTAMP)`는 거부한다. Frequency는 기존 native GPU tick frequency, calibration GPU 값은 기존 native sample, CPU 값은 그 bridge 호출 전후 **Wine QPC midpoint**다. Native host CPU timestamp를 Wine QPC로 노출하지 않는다. Native ABI·D3D11·공개 SM6.5/FL12_1은 변경하지 않았다. 자세한 [timestamp 계약](D3D12-CORE-CONTRACTS.ko.md#timestamp-heaplistclock-계약)을 따른다.
 
-```sh
-"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static \
-  graphics-translator/tests/owned-d3d12-atomic-copy.cpp \
-  -ld3d12 -ldxgi -ld3dcompiler -ldxguid -lole32 -o build/local/atomic-copy.exe
-python3 scripts/test-owned-graphics.py --runtime build/local/runtime \
-  --suite atomic-copy --fixture build/local/atomic-copy.exe \
-  --out build/local/atomic-copy-core-proof --validation
-python3 scripts/test-owned-graphics.py --runtime build/local/runtime \
-  --suite atomic-copy-live --fixture build/local/atomic-copy.exe \
-  --out build/local/atomic-copy-live-proof --api-validation
-```
+Production full target의 [x64 build](../build/local/copy-timestamp-20261002/build-x64.log)·[WoW64 build](../build/local/copy-timestamp-20261002/build-x86.log) 및 [x64 install](../build/local/copy-timestamp-20261002/install-x64.log)·[WoW64 install](../build/local/copy-timestamp-20261002/install-x86.log) 후 fresh [runtime-after manifest](../build/local/copy-timestamp-20261002/runtime-after/owned-graphics-runtime.json)를 stage했다. 이는 incremental build 로그이며 clean-from-scratch 전체 rebuild 주장이 아니다. 양 실행은 **같은 runtime manifest SHA256 e422ddd70b840798e373119b1d7c29873013a25b52101a4dd4562cd4e70fe55e**를 사용했다. 별도 [diagnostics.log](../build/local/copy-timestamp-20261002/diagnostics.log)의 runner 판정 회귀 **61 PASS**는 GPU proof와 구분한다.
 
-#### P1-B — ResizeBuffers1 / present queue 구현
-
-`ResizeBuffers1`의 `ppPresentQueue`는 backbuffer 수만큼의 D3D12 queue 배열이며, `Present`가 다음 buffer로 회전할 때 queue도 함께 회전한다. 이전의 queue 배열 무시 경로를 제거하고 아래의 backbuffer별 queue 보존·transactional resize로 교체했다.
-
-- swapchain에 backbuffer별 `present_queues_`를 보존한다. 일반 `ResizeBuffers`는 기본 creation queue를 각 slot에 적용하고, `ResizeBuffers1`은 caller 배열을 검증·snapshot한다.
-- `Present1`은 현재 backbuffer index와 동일한 index의 present queue에 task를 enqueue한다. 기존 queue-local FIFO/Wait/Present ordering을 재사용한다.
-- `ResizeBuffers`와 `ResizeBuffers1`은 공통 internal transaction으로 합친다. 새 descriptor, queue vector, backbuffer vector와 layer property가 모두 준비된 뒤 commit해 중간 실패가 기존 swapchain을 반쯤 파괴하지 않게 한다.
-- node mask/queue ownership/type/count를 먼저 검증하고, 기존 backbuffer reference가 남은 resize의 DXGI 오류 계약을 별도 fixture로 고정한다.
-- `ApplyLayerProps`의 이전 flush TODO는 accepted present의 encode 완료 대기로 대체했고, 아래 color-space 후속 작업에서 D3D12 GPU 완료 대기로 강화했다. `SetColorSpace1`은 검증된 다음 색 공간만 저장하며 다음 Present가 같은 GPU 완료 경계에서 적용한다.
-
-공식 계약: [IDXGISwapChain3::ResizeBuffers1](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiswapchain3-resizebuffers1).
-
-**P1-B 결과 (2026-09-28).**
-
-- `d3d12_swapchain.cpp`: `present_queues_`와 `current_buffer_`를 backbuffer와 같은 index로 회전한다. `Present1`은 현재 index의 queue에 enqueue하고 성공 시에만 index를 전진한다. `GetCurrentBackBufferIndex`는 `current_buffer_`를 반환한다.
-- `ResizeBuffers`/`ResizeBuffers1`은 `ResizeBuffersImpl` 하나로 합쳤다. Buffer count(0=유지, 최대 `DXGI_MAX_SWAP_CHAIN_BUFFERS`, flip model 최소 2), format, 남은 application backbuffer reference, `ResizeBuffers1`의 node mask(0/1만 허용)·queue(같은 device의 DIRECT queue, null 금지)를 먼저 검증하고, 새 desc·queue·backbuffer를 모두 만든 뒤 한 번에 교체한다. 실패는 `DXGI_ERROR_INVALID_CALL` 또는 생성 오류를 반환하고 기존 상태를 그대로 둔다. 성공 시 index는 0이다. 일반 `ResizeBuffers`는 모든 slot을 creation queue로 되돌린다.
-- 당시 교체 전 `Presenter::waitPresentsEncoded()`로 이미 받아들인 present의 encode 완료를 기다렸다. 현재는 아래 color-space 후속 작업의 `waitPresentsCompleted()`로 GPU 완료까지 기다린 뒤 layer property를 바꾼다.
-- Outstanding reference 검사가 내부 보유를 app reference로 오인하지 않도록 queue의 `PresentTask`와 temporal frame의 resource 보유를 private ref(`Com<MTLD3D12Resource, false>`)로 바꿨다. GPU 완료까지의 수명은 그대로 유지된다.
-- 증거: `graphics-translator/tests/owned-d3d12-present-queues.cpp`, suite `present-queues --mode present`. 9개 거부 case 뒤 desc·index 보존, queue B만 fence wait로 막았을 때 buffer 0(queue A) present는 완료되고 buffer 1(queue B) present는 release 전까지 pending, 일반 resize 후 3-buffer rotation이 queue A에서만 완료됨을 Metal validation 아래 확인했다(`build/local/p1b/runtime-01`, `proof-01`). 회귀: `smoke --mode present`, `temporal` 통과(`proof-smoke`, `proof-temporal`).
-- 리뷰 반영: 여러 present queue에서 뒤 frame이 앞 frame을 추월하지 않도록 presenter별 `MTLSharedEvent`(`present_order_event_`)로 frame N이 N−1을 GPU에서 기다리고 N을 signal한다. queue worker는 CPU에서 막히지 않는다. encode 완료 watermark는 최대 frame id가 아니라 완료 개수(`frames_encoded_`)라서 `waitPresentsEncoded`가 앞 frame이 남은 채로 반환하지 않는다. `SwapChainFlags`를 반영하고 `FRAME_LATENCY_WAITABLE_OBJECT` 변경은 `DXGI_ERROR_INVALID_CALL`로 거부한다. Fixture는 queue B의 frame이 막힌 동안 queue A의 다음 frame이 완료되지 않음을 검사하며, GPU order wait를 제거한 build에서 `present-order-not-overtaken`으로 실패함을 확인했다(임시 build, 증거 경로 `build/local/p1b/proof-probe`). 재검증: `runtime-03`의 `proof-03`, `proof-smoke-03`, `proof-temporal-03`.
-- 남은 경계: multi-node adapter가 없으므로 node mask는 0/1만 허용한다. 단일 출력 fullscreen/resize/present는 아래 후속 fixture로 검증했지만 다중 present queue와 fullscreen 전환을 동시에 조합한 검증은 하지 않았다. 신호되지 않는 queue Wait 뒤에 present가 남아 있으면 resize는 그 present의 GPU 완료까지 기다린다. `PresentTask`의 backbuffer 참조는 기존 경로대로 encode 후 해제되며 GPU retirement까지의 보유는 Metal command buffer의 resource 보유에 의존한다. 500ms pending probe는 지연된 잘못된 queue 실행을 완전히 배제하지 못한다.
-
-#### P1 후속 — Fullscreen 오류·전환 (2026-09-29)
-
-- D3D12와 D3D11의 `SetFullscreenState`/`ResizeTarget` 전체 전환을 mode-set guard로 보호한다. `FALSE`와 non-null target 조합은 `DXGI_ERROR_INVALID_CALL`이며, 출력 `QueryInterface`/`GetDesc`/mode 조회 오류를 검사한다. 재진입은 `DXGI_STATUS_MODE_CHANGE_IN_PROGRESS`다. Window API와 output COM 호출 중 swapchain mutex를 보유하지 않는다.
-- Native 전환 성공 뒤에만 `Windowed`·monitor·target·fullscreen descriptor를 게시한다. 실패 시 이전 논리 상태를 유지하고 실제 이전 display mode의 복구를 시도한다. Win32 WSI는 창/monitor 조회, style 변경, 위치 변경의 실패를 반환하며 살아 있는 창의 부분 변경을 되돌린다. `ResizeTarget`은 실패한 mode 변경 뒤 창을 갱신하거나 descriptor를 먼저 바꾸지 않는다.
-- Fullscreen-at-creation도 실제 `SetFullscreenState(TRUE)`를 거치고 실패를 caller에 반환한다. 공유 DXGI factory는 파괴된 HWND를 Metal view 생성 전에 거부하고 output을 null로 유지한다. 기존 경로에서 발생한 WineMetal assertion을 숨기지 않고 잘못된 입력이 native layer까지 도달하지 않도록 수정했다.
-- D3D11 fullscreen `Present1`은 전달받은 `IDXGIOutput1`을 `MTLDXGIOutput`으로 직접 캐스팅하지 않고 공개 `GetGammaControl`을 사용한다. 유효한 forwarding output proxy로 실제 Present 시 발생한 execute-access fault를 수정했다. Gamma curve가 바뀔 때만 cached ramp를 갱신한다.
-- Permanent fixture: [`owned-dxgi-fullscreen.cpp`](tests/owned-dxgi-fullscreen.cpp), runner suite `fullscreen --mode present`. 각 API에서 8개 오류/재진입 경계, 두 번의 fullscreen 진입·이탈, 창 style/rect 복원, fullscreen 생성과 invalid HWND 생성 거부를 확인한다. Native 진입·이탈 중 `WM_STYLECHANGING`에서 HWND를 파괴하여 실패 반환과 pre-call 논리 상태 보존을 검사한다. 72×54 backbuffer의 **3,888픽셀/API**가 독립 clear 기대값과 일치하고 D3D12 fence/D3D11 query 완료 및 Present가 성공했다.
-- 수정 전: `build/local/fullscreen-runner-baseline-29`에서 `SetFullscreenState(FALSE, target)`이 `S_OK`를 반환하여 실패. 중간 `fullscreen-proof-29`는 invalid HWND 생성의 assertion, `fullscreen-proof-30`은 D3D11 output proxy Present 충돌을 보존한다. 최종 `build/local/fullscreen-runtime-31` + `build/local/fullscreen-proof-31`은 **D3D12·D3D11 모두 PASS**, Metal API/Shader Validation 오류와 foreign backend 로드 없음. 빌드·install·새 runtime stage도 통과했다.
-- 기존 `present-queues` 회귀는 `fullscreen-runtime-29` + `fullscreen-present-queues-proof-29`에서 PASS(거부 10개, queue rotation/blocked ordering, 일반 resize 3-buffer). 이후 변경은 invalid HWND factory 검사와 D3D11 gamma 조회다. Runner diagnostics 44개도 통과했다.
-- 증거 경계: M5 Pro/macOS 27, x86_64 Wine, 단일 출력. 다중 모니터 전환·hot-unplug·다른 GPU/OS·일반 D3D10 workload와 실제 게임은 미검증이다. 외부에서 파괴한 HWND 자체는 복원할 수 없으며, OS가 display-mode 복구까지 거부하는 경우 native 복구는 보장하지 않는다. HDR·color-space·전체 format/sample 지원 보고는 여전히 P1 잔여 항목이다.
-
-재실행(출력 경로는 새 경로 사용):
-
-```sh
-"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static \
-  graphics-translator/tests/owned-dxgi-fullscreen.cpp \
-  -ld3d12 -ld3d11 -ldxgi -ldxguid -lole32 -o build/local/owned-dxgi-fullscreen.exe
-python3 scripts/test-owned-graphics.py --runtime build/local/fullscreen-runtime-31 \
-  --fixture build/local/owned-dxgi-fullscreen.exe --suite fullscreen --mode present \
-  --out build/local/fullscreen-proof-new --validation --timeout 120
-```
-
-#### P1 후속 — D3D12 HDR10 metadata (2026-09-29)
-
-- `SetHDRMetaData`의 무처리 `S_OK`를 제거했다. HDR10은 정확한 `sizeof(DXGI_HDR_METADATA_HDR10)`와 non-null pointer를 요구하고 잘못된 경우 `E_INVALIDARG`를 반환한다. 구조체 전체를 값으로 복사하므로 호출자 메모리를 보유하지 않는다. HDR10PLUS 및 알 수 없는 type은 `DXGI_ERROR_UNSUPPORTED`이며 기존 metadata를 바꾸지 않는다.
-- `NONE`은 metadata를 해제한다. 추가적인 size/pointer 제한이 공식 문서에 명시되지 않아 기존 의도대로 나머지 인자를 읽지 않고 무시한다. 위 세부 오류 선택은 이 구현의 정책이며 Windows reference differential 결과를 주장하지 않는다.
-- 기존 `PresentState`가 수락한 frame의 수치 metadata를 복사한다. `changeHDRMetadata`는 metadata 유무가 바뀔 때만 PSO를 무효화하고 값 교체에는 재생성하지 않는다. Setter는 pending queue를 flush하지 않는다. 유무가 바뀐 뒤 다음 Present의 경계는 아래 color-space 작업에서 D3D12 GPU 완료까지 강화했다. 기존 display override가 있으면 swapchain metadata보다 우선한다.
-- D3D12 활성화에 필요한 공유 수정 두 곳: native layer display query의 no-screen 반환값을 version 0·SRGB·metadata 0·EDR `{1,1}`로 초기화했고, BT.2408 EETF는 `KS >= 1`일 때 shoulder만 건너뛰어 같은 content/display peak의 `0/0`을 막으면서 검정색 remap을 유지한다. D3D11 전용 파일·기존 fixture·NVAPI/NGX 코드는 변경하지 않았다.
-- **공개 API 증거:** `owned-d3d12-hdr-metadata.cpp`, suite `hdr-metadata --mode present`. 잘못된 HDR10 인자 4개·미지원 type 2개, 적용/교체/해제·호출자 메모리 변경·resize, fence로 막힌 accepted Present 뒤의 metadata 교체와 정상 release를 검사한다. 서로 다른 7개 frame의 원본 3,072픽셀 readback 및 GPU fence/Present가 성공했다. 이 readback은 tone mapping 전 백버퍼이며 metadata 출력 효과의 증거로 대신하지 않는다.
-- **실제 출력 증거:** `owned-d3d12-hdr-presenter.cpp`는 production `Presenter`·`InternalCommandLibrary`에 링크하고 실제 HWND/CAMetalLayer drawable을 같은 Metal command buffer에서 blit/readback한다. A(peak 3000) 수락 뒤 B(10000)로 교체해도 A의 snapshot을 보존하고, B 적용·NONE 해제·B 재적용·content=display 경계의 픽셀을 독립 double-precision PQ/EETF 계산과 비교했다. 관찰된 highlight는 A `0.491211`, B `0.474121`, NONE 및 equal-peak `0.494141`; black은 약 `0.000001`, display peak는 1600, EDR scale은 0.0625였다. 분리된 두 fixture는 public API와 production presenter를 각각 증명하며 compositor 이후 화면/모니터 광출력의 end-to-end 계측은 아니다.
-- **재현과 검증:** 이전 `fullscreen-runtime-31` + `hdr-metadata-baseline-02`는 zero-size HDR10에 `S_OK`를 반환하여 실패했다. 최종 `hdr-metadata-runtime-02` + `hdr-metadata-public-04`는 Metal API/Shader Validation으로 PASS(오류·foreign backend 로드 없음). Drawable probe도 `build/local/hdr-presenter-validation-02.stdout.log`에서 5개 frame·detached query PASS, 같은 이름의 stderr에 Metal API/GPU Validation 활성화와 validation 오류 없음이 기록됐다. 빌드·install·새 runtime stage와 runner diagnostics 44개도 통과했다. Detached native query는 이전 runtime에서 NaN/0을 반환했고 수정 후 `{1,1}`을 반환했다. 이 native baseline은 현재 shader를 링크한 probe로 이전 native module만 비교한 것이며, 이전 shader 실행 증거가 아니다.
-- **범위:** HDR10을 metadata-guided 기존 tone mapper에 연결한 것이다. 보관한 primaries/white-point/min-luminance 전부를 native HDR10 신호로 전달한 구현이 아니며 현재 tone mapper는 luminance maxima를 소비한다. HDR10PLUS는 미지원이다. Microsoft도 metadata 전달을 보장하지 않고 pixel 해석은 `SetColorSpace1`이 결정한다고 명시한다. 다른 display/GPU·Windows reference differential은 남아 있으며 color-space 후속 결과는 아래에 구분했다.
-
-공식 계약: [SetHDRMetaData](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgiswapchain4-sethdrmetadata). 공개 API fixture 재실행(출력 경로는 새 경로 사용):
-
-```sh
-"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static \
-  graphics-translator/tests/owned-d3d12-hdr-metadata.cpp \
-  -ld3d12 -ldxgi -o build/local/owned-d3d12-hdr-metadata.exe
-python3 scripts/test-owned-graphics.py --runtime build/local/hdr-metadata-runtime-02 \
-  --fixture build/local/owned-d3d12-hdr-metadata.exe --suite hdr-metadata --mode present \
-  --out build/local/hdr-metadata-public-new --validation --timeout 120
-```
-
-Production presenter probe는 위 runtime과 같은 빌드의 static library를 사용한다. 빌드 후 다음처럼 새 prefix에서 실행한다(게임 prefix 사용 금지).
-
-```sh
-"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static \
-  -Iinclude -Isrc/dxmt -Isrc/winemetal -Isrc/util -Ilibs \
-  -D_WIN32_WINNT=0xa00 -DDXMT_PAGE_SIZE=4096 \
-  graphics-translator/tests/owned-d3d12-hdr-presenter.cpp \
-  build/local/build/src/dxmt/libdxmt.a build/local/build/src/util/libutil.a \
-  build/local/build/src/winemetal/winemetal.dll.a -ldxgi -ldxguid -lole32 \
-  -o build/local/owned-d3d12-hdr-presenter.exe
-WINEPREFIX="$PWD/build/local/hdr-presenter-prefix-new" \
-  WINEDLLPATH="$PWD/build/local/hdr-metadata-runtime-02/lib/wine" \
-  WINEDLLOVERRIDES=winemenubuilder.exe=d WINEDEBUG=+loaddll \
-  MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 \
-  MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1 MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
-  build/local/hdr-metadata-runtime-02/bin/wine "$PWD/build/local/owned-d3d12-hdr-presenter.exe"
-WINEPREFIX="$PWD/build/local/hdr-presenter-prefix-new" \
-  build/local/hdr-metadata-runtime-02/bin/wineserver -k
-```
-
-#### P1 후속 — D3D12 color-space 지원·적용 순서 (2026-09-29)
-
-- `CheckColorSpaceSupport`와 `SetColorSpace1`은 동일한 DXGI→native mapping과 CGColorSpace 가용성을 사용한다. 지원 RGB는 full-range G22/P709, G10/P709, G2084/P2020, G22/P2020 네 종류다. 선택된 공간은 이후 조회에서도 PRESENT를 보고한다. EDR이 1이라는 이유만으로 HDR 공간을 거부하지 않는다. 미지원 enum의 support는 0이고 setter는 상태를 바꾸지 않고 `DXGI_ERROR_INVALID_CALL`을 반환한다. null support pointer는 `E_INVALIDARG`다.
-- Setter는 검증한 native 색 공간을 pending 값으로 보관한다. 다음 실제 Present만 이를 소비하므로 setter 자체의 GPU flush나 매 frame 추가 EDR query가 없다. 설정·HDR metadata 변경·Present capture/index·resize를 기존 swapchain mutex로 직렬화한다. 초기 FLOAT swapchain의 G10, 다른 포맷의 G22 동작은 유지하되 resize가 명시한 색 공간을 덮어쓰지 않는다.
-- D3D12의 `synchronizeLayerProperties(true)`는 PSO/layer를 바꾸기 전에 기존 frame의 encode와 실제 Metal command-buffer 완료를 기다린다. Queue는 `Rc<Presenter>`를 inflight에 넘겨 GPU retirement까지 보유한다. 완료 개수 watermark를 사용해 queue completion 스레드의 역순 실행을 처리하고, terminal 취소는 완료 대기도 해제한다. Resize도 같은 완료 경계를 사용한다. D3D11 전용 파일과 기존 D3D11 drain 동작은 변경하지 않았다.
-- **공개 API 재현/검증:** 이전 `hdr-metadata-runtime-02`의 `colorspace-baseline-public-02`는 미지원 enum 2에 S_OK를 반환해 실패했다. 최종 `colorspace-runtime-01` + `colorspace-public-02`는 지원 4종, 미지원 23종, null pointer, setter 후 support 조회, 실패한 resize 및 정상 resize, queue rotation 뒤 blocked Present 중 PQ→G10 설정을 통과했다. 8-bit/RGB10A2/RGBA16Float의 13개 frame에서 각각 원본 3,072픽셀과 fence/Present를 검사했다. 원본 readback은 색 변환 출력의 증거가 아니다.
-- **실제 native layer 관찰:** 임시 `nextDrawable` observer로 원래 API를 그대로 호출하면서 layer의 CGColorSpace/pixel format/EDR 값을 읽었다. `build/local/colorspace-native-02.stderr.log`의 14개 drawable에는 미지원 setter·실패/동일/변경 format resize 뒤 BT2020 유지, pending PQ frame 뒤 G10, FLOAT(format 115) resize 뒤 PQ 유지가 기록됐다. 공개 fixture stdout은 같은 이름의 `.stdout.log`다. Observer는 제품에 포함하지 않는다.
-- **GPU 출력/완료 경계:** `owned-d3d12-colorspace-presenter.cpp`는 production Presenter/shader의 실제 drawable 11개 frame을 독립 PQ oracle과 비교했다. 관찰된 mid 값은 SDR `0.788086`, PQ `0.491211`, scRGB `0.039398`이고, 다음 설정 후에도 이미 수락한 frame은 이전 값을 유지했다. CPU encoding이 끝나도 native shared-event로 막은 GPU 작업이 완료되기 전에는 다음 색 공간 capture가 반환하지 않았다. `retirement_gate=1`로 PASS했다. 이 probe는 새 static library와 native ABI가 같은 `hdr-metadata-runtime-02`, 전용 `colorspace-presenter-probe-prefix-01`에서 Metal API/GPU Validation으로 실행했으며 별도 stdout 파일은 저장하지 않았다.
-- **회귀:** 최종 runtime의 `colorspace-present-queues-01`과 `colorspace-hdr-metadata-01` 모두 Metal API/Shader Validation PASS. 빌드·install·새 runtime staging, runner diagnostics 44개도 통과했다. Public suite의 첫 실행은 fixture 자체는 PASS였으나 성공 marker `FAILED_RESIZE`를 `FAIL`로 오인한 runner 판정 문제였고, 오류 marker 경계를 수정한 뒤 `colorspace-public-02`가 PASS했다.
-- **경계:** 색 공간이 바뀌는 다음 Present 및 resize는 이전 GPU 작업을 기다릴 수 있다. 그것들이 반환한 뒤에만 이전 queue의 미신호 gate를 해제하는 호출 순서는 보장하지 않는다. GPU completion/native layer 태그/drawable pixels를 검증한 것이며 Core Animation 합성 이후의 색 정확도나 물리적 scanout 완료, undocumented per-drawable 색 공간 latch를 증명한 것은 아니다. 다중 출력·EDR 전환·다른 GPU·Windows reference differential은 미검증이다.
-
-공식 계약: [CheckColorSpaceSupport](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiswapchain3-checkcolorspacesupport), [SetColorSpace1](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiswapchain3-setcolorspace1), [CAMetalLayer.colorspace](https://developer.apple.com/documentation/quartzcore/cametallayer/colorspace).
-
-재실행(새 출력/prefix 경로 사용):
-
-```sh
-"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static \
-  graphics-translator/tests/owned-d3d12-colorspace.cpp \
-  -ld3d12 -ldxgi -o build/local/owned-d3d12-colorspace.exe
-python3 scripts/test-owned-graphics.py --runtime build/local/colorspace-runtime-01 \
-  --fixture build/local/owned-d3d12-colorspace.exe --suite colorspace --mode present \
-  --out build/local/colorspace-public-new --validation --timeout 120
-"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static \
-  -Iinclude -Isrc/dxmt -Isrc/winemetal -Isrc/util -Ilibs \
-  -D_WIN32_WINNT=0xa00 -DDXMT_PAGE_SIZE=4096 \
-  graphics-translator/tests/owned-d3d12-colorspace-presenter.cpp \
-  build/local/build/src/dxmt/libdxmt.a build/local/build/src/util/libutil.a \
-  build/local/build/src/winemetal/winemetal.dll.a -ldxgi -ldxguid -lole32 \
-  -o build/local/owned-d3d12-colorspace-presenter.exe
-WINEPREFIX="$PWD/build/local/colorspace-presenter-prefix-new" \
-  WINEDLLOVERRIDES=winemenubuilder.exe=d WINEDEBUG=+loaddll \
-  MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 \
-  MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1 MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
-  build/local/colorspace-runtime-01/bin/wine "$PWD/build/local/owned-d3d12-colorspace-presenter.exe"
-WINEPREFIX="$PWD/build/local/colorspace-presenter-prefix-new" \
-  build/local/colorspace-runtime-01/bin/wineserver -k
-```
-
-#### P1 후속 — SO format capability (2026-09-29)
-
-- `SO_BUFFER`를 1–4개 32-bit component의 FLOAT/SINT/UINT 12종에 보고한다. SO는 변환 없이 dword를 출력하므로 packed RGB32 texture의 native 지원 여부와 독립적이다. UNKNOWN/완전 typeless/16-bit/normalized/depth format에는 이 bit를 추가하지 않는다. VS→SO(stream 0) 범위와 공개 feature level은 유지한다.
-- `owned-d3d12-so-format-support.cpp`, suite `so-format-support`는 format별 SO 출력과 그 버퍼를 해당 format의 IA 입력으로 다시 사용한 SO 출력을 검사한다. 12종 모두 원시 bit, 출력 byte counter와 앞뒤 guard가 일치했다. Float 음수, signed 음수, high-bit unsigned 값과 3-component stride도 포함한다. 8종 비대상 format은 SO bit가 없다.
-- 이전 `colorspace-runtime-01`의 `build/local/so-format-support/baseline-06`에서 GPU 출력·IA 재입력은 모두 통과했지만 R32_FLOAT의 SO bit 누락으로 실패했다. 수정한 `so-format-runtime-01`의 `proof-02`는 12 GPU/12 capability/8 negative/12 IA 검사와 Metal API/Shader Validation을 통과했다. 기존 CPU probe의 SO 미지원 고정 assertion은 삭제했으며 실제 GPU 계약으로 대체했다. D3D11 전용 코드는 변경하지 않았다.
-
-```sh
-"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static \
-  graphics-translator/tests/owned-d3d12-so-format-support.cpp \
-  -ld3d12 -ldxgi -ld3dcompiler -o build/local/so-format-support/owned-d3d12-so-format-support.exe
-python3 scripts/test-owned-graphics.py --runtime build/local/so-format-runtime-01 \
-  --fixture build/local/so-format-support/owned-d3d12-so-format-support.exe \
-  --suite so-format-support --out build/local/so-format-support/proof-new --validation --timeout 180
-```
-
-#### P1 후속 — Format·view 보고와 D24 copy (2026-09-29)
-
-- `MIP`를 filterability와 분리하고 integer·typeless·depth mip storage를 보고한다. DXGI bit-layout family의 fully typed cast, combined DSV와 plane SRV의 역할을 구분했다. Typed buffer의 native layout/access gate를 적용하고 sRGB UAV는 지원 보고·view 생성 모두 거부한다. SO의 12종 지원 범위는 유지했다.
-- Packed 4:2:2 두 format은 이 시점에는 미지원으로 거부했다. 이후 `expanded-formats`의 RGBA8 pair backing으로 구현·검증했다(위 RGB32·packed 4:2:2 행). 독립적인 footprint query는 2×1 pixel/4-byte 계산과 짝수 resource width 조건을 따른다.
-- **실제 D24 data corruption 수정:** 이전 runtime은 `.25` depth clear의 readback을 packed `0x00400000` 대신 float bit `0x3e800000`으로 반환했고, 반대 방향 plane upload는 호환되지 않는 native view를 만들었다. D24 low24 ↔ native float의 GPU 변환과 native depth/stencil plane blit를 연결했다. 정확한 나눗셈과 nearest-even 정수 변환으로 `0x7fffff` 경계 및 `.1/.3/.9` clear를 보존한다. D32S8 float plane은 변환하지 않는다.
-- `format-runtime-02`의 `build/local/format-support/proof-05`: **98종 query**(texture2D 92, buffer 54, compressed 21)와 별도의 shader/readback 검증 통과. 실제 GPU oracle은 depth/stencil aspect, integer·typeless mip, RGBA8 linear/sRGB, R16 UINT→FLOAT, RGBA32 UINT→FLOAT, BC1 linear→sRGB 및 sRGB UAV sentinel이다. 98종의 모든 연산을 GPU로 검증했다는 뜻은 아니다. Native cast 13조합 생성도 별도 로그로 보존했다.
-- 같은 runtime의 `build/local/d24-plane-runner-03`: typed/typeless D24·D32S8 4종, 독립 clear/upload·SRV read·texture copy, 두 row/padding·placed offset·mip/array·low24 경계·guard 통과. 유효한 전체 depth subresource copy만 사용하며 금지된 depth subrectangle을 정상 계약으로 시험하지 않는다.
-- 기존 `resources`, `copy-resolve`, `capabilities`는 `build/local/format-integration/*-01`에서 Metal API/Shader Validation을 통과했다. Runner diagnostics 44개도 통과했다. 순수 bit-copy helper test는 삭제하고 공개 API/GPU 회귀로 대체했다. D3D11 전용 변경은 없으며, 공용 Metal 파일의 추가 kernel은 D3D12 D24 copy만 호출한다.
-- 세부 정책과 fixture 실행 recipe: [CAPABILITIES.ko.md](CAPABILITIES.ko.md). 다른 GPU/OS, Windows reference differential 및 실제 게임 결과는 별도 검증 대상이다. Sample-count와 single-plane depth 역할의 후속 결과는 아래에 기록한다.
-
-#### P1 후속 — Sample-count 조회·생성·실행 정합성 (2026-09-29)
-
-- Quality query, committed/placed 생성과 null-output probe, allocation-info, graphics PSO가 공통 count·quality·native layout·effective backing 판정을 사용한다. BC MSAA, MSAA UAV, RGB32 texture/RTV PSO, 3/16/32/UINT_MAX count를 native 호출 전에 거부한다. RGB32 IA/SO 지원은 유지한다.
-- 1×는 ordinary texture layout과 quality 0, MSAA는 software/native/format 모두 지원하는 2×/4×/8×와 quality 0 또는 standard pattern(`0xffffffff`)을 허용한다. Center pattern(`0xfffffffe`)은 미지원으로 거부한다. Query의 Flags를 보존하고 tiled query는 tier와 일치하게 0 level을 반환한다. Typeless depth resource는 실제 flags로 고른 Depth16/Depth32 backing을 사용한다.
-- `R32_UINT` MSAA 보고는 Apple9 이상에 한정해 D3D12-local로 보정했다. Integer/depth의 region MAX/MIN 실행을 default `ResolveSubresource` 지원으로 혼동하지 않으며 `MULTISAMPLE_RESOLVE`는 올리지 않는다.
-- Typed D16/D32/D24S8/D32S8은 shader view가 아니라 DSV 역할로 판정한다. Depth target에도 MSAA render-target bit를 적용하고, MSAA load는 shader view에만 적용한다. R16_UNORM/R32_FLOAT와 depth plane alias의 comparison 지원을 별도로 판정한다. `build/local/format-support/single-depth-after-02`에서 4종 typed DSV/4종 alias 보고와 유효한 typeless depth resource의 Load·SampleCmp 결과를 검증했다. Invalid descriptor를 shader에 bind하는 undefined/invalid 사용은 성공 fixture에서 제외했다.
-- **최종 결과:** `build/local/msaa-capability-runtime-02` + `build/local/msaa-capability-probe-01/runner-msaa-final-01`에서 **45 quality query, 15 거부 descriptor 조합, 21 GPU case PASS**. GPU case는 2×/4×/8×의 RGBA8 UNORM/typeless, R32_UINT, typed/typeless D32, D32S8 및 standard-pattern coverage다. 실제 sample별 readback과 region resolve를 확인했고 Metal API/Shader Validation 오류가 없다.
-- 이전 runtime의 BC count4 false-positive와 count1 RGB32 RTV PSO 생성 성공을 각각 baseline과 `runner-msaa-rgb32-before`에서 재현했다. 수정 후에는 GPU native assertion에 맡기지 않고 API preflight에서 실패한다.
-- Shared resource preflight 및 D24 방향별 lazy PSO의 회귀는 `build/local/format-integration/{depth,resources,copy-resolve}-final-01`에서 통과했다. 전체 Ninja/install, fresh staging과 runner diagnostics 44개도 통과했다. 최신 build/install 로그는 같은 디렉터리의 `build-msaa-02.log`, `install-msaa-02.log`다. D3D11 전용 소스와 shared inspector의 D3D11 정책은 바꾸지 않았다.
-- 지원·증거 경계: M5 Pro/macOS 27의 명시한 조합이며 center pattern, 16× 이상, 모든 format/dimension 조합과 다른 GPU/OS를 지원·검증 완료로 승격하지 않는다. 이 묶음의 완료가 P1 전체 완료는 아니다.
-
-#### P1-C — Pipeline Statistics 구현
-
-M5 Pro는 Metal statistic counter set을 제공하지 않으므로 native counter나 CPU draw 인수 추정값으로 대체하지 않는다. Translator/compiler instrumentation으로 11개 `UINT64` 필드(88 byte)를 집계하며, **공개 `PIPELINE_STATISTICS` heap 생성과 Begin/End/Resolve를 지원한다.**
-
-**MSAA 실행 수정:** 이전 native 경로는 4×4·4× MSAA에서 pixel-frequency PS의 독립 UAV가 16 대신 64를 반환했다. 새 경로는 compute VS capture → primitive 조립·bounds → 8×8 tile의 입력/coverage capture → 1× app PS → 원래 geometry의 sample별 출력 replay다. VS와 app PS를 결과 공유를 위해 중복 실행하지 않는다. Native fragment가 나눠 보고하는 geometric coverage는 atomic OR로 합치며 centroid는 capture 완료 후 규격의 full/partial/helper 순서로 선택한다.
-
-- **Query 계약:** DIRECT list의 Begin/End/Resolve. 기록별 GPU 누적값을 첫 Begin에서 초기화하고, slot별 Begin snapshot과 End 차이를 저장한다. 여러 heap/slot의 겹친 범위, slot 재사용, ClearState, command list 재실행, bundle의 부모 query, 서로 다른 queue의 격리를 지원한다. Resolve는 8-byte 정렬·88-byte stride이며 query/resource/device/range를 검사한다. 실행 task가 allocator·query·결과 자원을 GPU retirement까지 보유한다.
-- **IA·clipper:** 실제 VS epilogue가 position과 packed clip/cull distance를 primitive-vertex scratch에 한 번 capture하고, draw 뒤 compute가 list/strip/restart·instance를 조립한다. IAVertices는 cut을 제외한 소비 position, IAPrimitives는 완성 primitive를 센다. CInvocations는 rasterization이 켜진 완성 primitive 수다. CPrimitives는 w>0, depth clip이 켜졌을 때 0≤z≤w, clip/cull distance를 반영한 결과다(삼각형 n각형→n−2, line/point 0/1). x/y는 규격이 허용하는 무한 guard band를 사용하며 backface/zero-area 제거는 이 값에 적용하지 않는다. NaN, 허용된 xyz Infinity discard, w=0 경계를 safe FP로 처리한다.
-- **Shader invocation:** DXBC/DXIL VS·PS·CS entry에 전용 buffer slot 25의 counter를 삽입한다. PS discard 전에 세며 early-depth rejection은 실행되지 않은 entry이므로 제외된다. 32-bit low atomic과 overflow carry로 64-bit modulo counter를 구현한다. VS를 재실행하거나 IA position 수로 VS invocation을 대신하지 않는다. Strip에서는 GPU 재사용 여부에 따라 실제 VS invocation이 IA position 수보다 클 수 있다(FS §5.3.9/§20.4.7). DXIL의 `dx.op.sampleIndex.i32`를 AIR sample ID에 연결하고 register가 없는 intrinsic-only signature의 잘못된 초기화를 제거했다. DXIL ShaderFlags의 ForceEarlyDepthStencil도 AIR에 보존한다.
-- **실제 실행 기준:** predication으로 건너뛴 draw/dispatch와 GPU count로 제외된 indirect command는 0이다. ExecuteIndirect의 root UAV/constant 변경과 indexed draw를 포함한다. SO capture/overflow/query와 같은 draw에서 통계를 함께 구하며 SO overflow는 raster 통계를 줄이지 않는다.
-- **MSAA depth·interpolation:** pixel-frequency·sample-frequency·PS 없는 depth draw 모두 동일한 native gather에서 unclamped center/sample Z를 만든다. 원래 DSV format·bias·viewport를 보존하고 각 draw의 저장된 Z를 PS 입력과 default depth test가 공유한다. OM 출력에서만 viewport 범위로 clamp하며 early DS는 app PS 이전에 한 번, late DS는 출력 시 한 번 수행한다. D16/D32 bias, pixel/sample/no-PS 사이의 `DepthEqual`, stencil·occlusion, mask 0/부분 mask, viewport 밖 PS 입력 Z를 검증했다. Native finite pull 값을 capture해 동적 Sample/Snapped/Centroid 평가를 보존하며 helper 값은 derivative anchor와 claim 이전 quad shuffle로 전달한다.
-- **PSO/cache·비용:** query counter variant는 query 구간에서만 lazy 생성한다. MSAA 실행 variant는 query 유무와 무관하며 warm CachedPSO에서도 원 shader로 생성한다. Primitive별 capture·encoder pass·scratch와 GPU bounds readback 비용이 있고, indirect graphics는 GPU 인수 preflight로 실행 시점 count/root/VB/IB를 확정한다. Submission worker는 필요한 GPU 완료를 기다리지만 API caller를 그 완료까지 막지 않는다. MSAA shader variant는 AIR 2.8/macOS 26 target이며 실제 실행 증거는 M5 Pro/macOS 27이다. 성능 향상이나 다른 OS/GPU 지원을 이 검증으로 주장하지 않는다.
-- **지원 경계:** 현재 VS/PS/CS stage와 point/line/triangle list·strip 경로를 대상으로 한다. GS/HS/DS·adjacency/patch stage/topology 지원을 이번 query 구현이 추가하지 않는다. GSInvocations/GSPrimitives/HSInvocations/DSInvocations는 해당 stage가 없는 유효 PSO에서 0이며, stage 자체의 미지원 PSO를 허용한 뒤 가짜 0을 반환하지 않는다. PIPELINE_STATISTICS1/mesh 통계는 추가하지 않았다.
-- **증거:** permanent fixture `graphics-translator/tests/owned-d3d12-pipeline-statistics.cpp`, suite `pipeline-statistics`. 11개 field와 독립 VS/PS/CS UAV oracle, RTV readback, resolve sentinel을 비교한다. GPU carry probe는 low overflow와 전체 64-bit wraparound 및 다른 10개 counter 보존을 통과했다(`build/local/pipeline-statistics/carry-probe/gpu.log`). Windows reference differential, 다른 GPU, 실제 게임의 정확성·성능은 검증하지 않았다.
-
-최종 MSAA 통합 증거는 `build/local/msaa-implementation/runtime-integration-23`의 새 runtime·전용 prefix에서 수집했다.
-
-| 검증 | 실제 결과 | 증거 |
+| full queries proof | result | 실제 stdout |
 |---|---|---|
-| 전체 `pipeline-statistics` | **DXBC 168 + DXIL 178 = 346 GPU case**, 26 validation case PASS. Metal API/Shader Validation 오류 없음, owned native compiler 로딩 확인 | `build/local/msaa-implementation/proof-msaa-acceptance-23` |
-| 원래 8×8·4× MSAA 재현 | 35 covered pixels, 98 covered samples, **UAV atomic 35회**. Counter 보정이 아니라 실제 app shader 실행을 검증 | `build/local/msaa-implementation/proof-original8x8-23-transcript.txt` (최종 runtime 실행 출력 보존) |
-| 8× MSAA 경계 | DXBC/DXIL 각각 35 pixels, 189 samples, atomic 35회, sample별 색. DXIL sample positions/count 포함 | 전체 fixture의 `msaa_8x_boundary`와 8× intrinsic case |
-| Indexed `ExecuteIndirect` mutation | Close 이후 변경한 count 1/2·root constant/UAV·VB/IB를 사용하고 sparse slot 3, VS/PS UAV 횟수와 모든 sample 색 PASS | `build/local/msaa-indirect-fixture/proof-stage23` |
-| 기존 GPU 회귀 | `stream-output`, `indexed-restart`, `predication-indirect`, `queries` 모두 Metal API/Shader Validation PASS | `build/local/msaa-implementation/proof-{stream-output,indexed-restart,predication-indirect,queries}-23` |
+| x64 | [after-queries-x64-final/result.json](../build/local/copy-timestamp-20261002/after-queries-x64-final/result.json) | [after-queries-x64-final/stdout.log](../build/local/copy-timestamp-20261002/after-queries-x64-final/stdout.log) |
+| WoW64 x86 | [after-queries-x86-final/result.json](../build/local/copy-timestamp-20261002/after-queries-x86-final/result.json) | [after-queries-x86-final/stdout.log](../build/local/copy-timestamp-20261002/after-queries-x86-final/stdout.log) |
 
-최종 전체 Ninja/install 로그는 `build/local/msaa-implementation/full-build-23.log`와 `install-23.log`다. CPU tooling regression은 build 16개, staging 21개, diagnostics 44개를 통과했다. 이전 실패·보류 증거(`build/local/pipeline-statistics/proof-stage-only-15`, `proof-dxil-boundaries-04`, `proof-queries-gated-01`)는 수정 전 상태이며 현재 공개 gate를 나타내지 않는다.
+두 결과는 **exit0·PASS, API+Shader Validation, validation_errors=[]·foreign_backend_loads=[]**, staged owned native plugin 실제 load다. COPY뿐 아니라 기존 DIRECT timestamp·occlusion/binary·split/fence-dependent cross-queue·BOP query 경로를 포함한 **full queries suite 2/2**이며 전체 repository suite나 모든 query conformance 선언이 아니다.
 
-공식 계약: [D3D12_QUERY_DATA_PIPELINE_STATISTICS](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_query_data_pipeline_statistics), Apple [MTLCommonCounterSet.statistic](https://developer.apple.com/documentation/metal/mtlcommoncounterset/statistic).
+**COPY acceptance:** 각 ABI에서 **8 round × producer/successor/reuse 3개의 별도 ExecuteCommandLists = 24 submissions**, 중간 CPU wait 없이 마지막 **한 fence**로 drain했다. Producer는 COPY 전후 timestamp, timestamp-only successor는 다음 sample과 resolve, reuse list는 같은 slot의 새 sample/resolve를 실행한다. 각 row의 nonzero resolve offsets(**base+8/+40/+56 bytes**)·duplicate resolve equality·guard words를 확인했다. 각 round64KiB, **총524288 bytes** payload를 CPU expected와 byte-exact 비교했으며 list/allocator/heap을 completion 전에 release했다. 모든 row의 nonzero/유효 sample은 calibration bracket 안에서 **pre ≤ post ≤ successor ≤ reused**, 이전 round와 queue ordering을 만족했다. Frequency는 양 ABI **24000000 ticks/s**, 반복 조회 일치 및 Wine QPC bracket을 확인했다.
 
-#### P1-D — VS→Stream Output / SO statistics 구현
+**오류 proof:** null frequency/calibration output, COPY↔일반 timestamp heap/list 잘못된 조합의 End/Resolve, timestamp Begin, index/count/overflow, destination8-byte alignment·범위/overflow 및 cross-device heap/destination은 정확한 **E_INVALIDARG(0x80070057)**으로 거부했다. Void recording API 오류는 `Close` 결과로 확인한다.
 
-Stream Output는 `SOSetTargets` 하나만 구현해서 끝낼 수 없다. PSO의 SO declaration, shader lowering/instrumentation, target binding/offset, filled-size counter, overflow와 `SO_STATISTICS_STREAM0..3`가 하나의 계약이다. P1-C의 나머지 필드보다 먼저 compiler/runtime/query를 함께 변경하는 독립 작업으로 진행했다. 이후 2026-09-29에 12종 32-bit component format의 GPU capture·IA 재입력을 검증하고 `SO_BUFFER` capability도 보고한다(위 SO format capability 결과 참조).
+**한계와 당시 다음 작업:** 이것은 sample ordering과 query storage/resolve·copy payload proof이며 **COPY workload GPU duration의 정확성/성능 측정이나 동기화 없는 서로 다른 queue 간 timestamp 비교 증거가 아니다**. 다른 GPU/OS·실게임·ARM64 no-Rosetta·최신 전체 규격 conformance는 미검증이다. Recovery118 또는 arena12에 합산하지 않는다. COPY 완료 당시 다음 지정 bounded 작업은 programmable texture offsets였으며 이후 [별도 focused proof](#programmable-texture-offsets-완료와-focused-proof)로 완료했다. Lifetime tracker로 자동 전환하지 않는다. [재실행 recipe](SMOKE-TEST.ko.md#queries와-copy-timestamp-검증)를 따른다.
 
-**P1-D 결과 (2026-09-28).** 아래 1–3단계로 GS 없는 VS→SO(stream 0)의 `DrawInstanced`/`DrawIndexedInstanced`를 구현했다. 설계 근거는 D3D11.3 FS ch.14(SO), 8.4/8.12–8.16(IA), §5.3.9·§20.4.7(VS 실행 횟수)이다.
+### OPTIONS8 unaligned BC 완료와 focused proof
 
-- Compiler ABI: `src/airconv/airconv_public.h`의 `SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE`(인자 type 10), vertex buffer binding 26(app index)·27(`SM50_SO_CAPTURE_CONTROL`, 32 B)·28(scratch). DXIL(`dxil_signature.cpp`)과 DXBC(`dxbc_converter.cpp`) 모두 구현했고, D3D11의 `SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT` 동작은 바꾸지 않았다. DXIL VS도 `SM50_SHADER_GS_PASS_THROUGH.RasterizationDisabled`를 따라 void로 만든다(Metal은 rasterization을 끈 pipeline에서 값을 반환하는 VS를 거부한다).
-- 리뷰 반영(ReviewAll High 4·Medium 2): list topology에는 strip cut을 적용하지 않는다. indexed SO draw를 생성한 position buffer로 바꿔 Metal의 고정 restart와 assembly 규칙을 맞췄다. `StartComponent`를 PSO 검증과 compiler 모두 element 첫 성분 기준으로 해석한다. 내부 한계를 overflow로 위장하지 않고 `E_OUTOFMEMORY`로 알린다. 같은 vertex의 중복 VS 실행은 claim word로 record 하나만 남긴다. `ALLOW_STREAM_OUTPUT` 누락은 `E_INVALIDARG`다.
-- 남은 경계:
-  - **P1 당시 경계:** Adjacency/patch topology, GS/HS/DS와 SO 조합은 recording/PSO `E_NOTIMPL`이었다. GS/DS SO의 현재 후속 결과는 P3 절에 있다. SO PSO의 `ExecuteIndirect` DRAW/DRAW_INDEXED는 아래 추가 결과에서 구현했다.
-  - Claim을 못 얻은 record의 primitive는 쓰지 않으며, completion에서 아래 terminal device 오류 경로로 처리한다. 잘못된 SO 결과를 정상 완료로 공개하지 않는다.
-  - Indexed SO draw는 app index마다 VS가 한 번씩 실행돼 post-transform 재사용이 없다(규격 no-cache 상한 안). 성능은 측정하지 않았다.
-  - SO type 10의 WoW64 인자 변환과 실제 32-bit compiler 호출은 아래 추가 결과에서 검증했다. 전체 32-bit SO GPU draw와 type 11의 WoW64 GPU 실행은 2026-09-30 WoW64 결과에서 검증했다.
-  - **당시 경계, 현재 수정:** 이전 `dxil-ia` 회귀는 `build/legacy/...` 바이너리(`docs/provenance/gpu-dxil-ia.json`)에 의존했다(`build/local/p1d/reg/proof-dxil-ia-03`). 지금은 `graphics-translator/tests/owned-d3d12-dxil-ia.cpp`와 `graphics-translator/tests/dxil/dxil-ia-{vs,ps}.hlsl`·새 `.dxil`을 복원하여 소스 빌드 fixture로 검증한다.
-- 회귀: `runtime-03`에서 pipeline-cache, queries, bundles, predication-indirect, dxil, atomic-copy, `smoke --mode present`, `present-queues --mode present`가 Metal validation 오류 없이 통과했다(`build/local/p1d/reg3/proof-*`). CPU 스크립트 build/staging/diagnostics도 통과했다.
+**수정 전 관찰 구분(2026-10-02):** 기존 COPY runtime에서 [baseline-array2-x64 result](../build/local/unaligned-bc-20261002/baseline-array2-x64/result.json)·[stdout](../build/local/unaligned-bc-20261002/baseline-array2-x64/stdout.log)는21 typed/typeless BC variant의 odd resource 생성·mip/array·placed·copy·SRV/논리 dimension을 이미 통과한 뒤 **OPTIONS8 query E_NOTIMPL(0x80004001)**로 실패했다. 이것은 query 미구현 증거이며 해당 GPU 경로 실패가 아니다. 별도 explicit physical-box fixture의 [before-physical-x64 result](../build/local/unaligned-bc-20261002/before-physical-x64/result.json)·[stderr](../build/local/unaligned-bc-20261002/before-physical-x64/stderr.log)는 **format71(BC1), offset512, expected00·actual6d sentinel**의 실제 GPU readback 불일치로 실패했다. Metal validation 오류가 없어도 유효 physical block copy가 누락된 consumer-visible 실패였다.
 
-P1 당시 진행 상황(1단계, runtime plumbing): PSO는 `D3D12_STREAM_OUTPUT_DESC`를 FS ch.14 규칙으로 검증해(`E_INVALIDARG`; GS/HS/DS 조합은 `E_NOTIMPL`) owned layout과 capture record layout을 저장하고, VS 컴파일 인자에 `SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE`를 넣는다. `RasterizedStream = NO_RASTERIZED_STREAM`이면 VS를 void로 만들고 rasterization을 끄며 fragment 단계도 두지 않는다. Pipeline cache key에는 SO declaration/stride/RasterizedStream이 들어가고 blob version은 2다. `SOSetTargets`는 slot 범위, VA 해석, 크기, 4-byte 정렬된 filled-size 위치를 검증한 뒤 allocation을 보존한다. `SO_STATISTICS` heap은 16-byte 결과와 Begin snapshot을 갖고, 결과는 각 recording의 stream counter(`SOStreamCounterBuffer`) 차이로 계산한다.
+**구현·cap 계약:** `D3D12_FEATURE_D3D12_OPTIONS8`의 `UnalignedBlockTexturesSupported`는 native `supportsBCTextureCompression()`에 따라 보고한다. Null output·정확하지 않은 DataSize는 **E_INVALIDARG**다. 이 기능은 BC texture top-level width/height를4의 배수로 강제하지 않는 계약이며, BC block shape/bytes·copy origin/interior boundary·physical bound·512-byte placed footprint offset·256-byte row pitch 배수 계약을 완화하지 않는다. Copy validation은 rounded physical block extent를 사용하고 native buffer↔texture 전송은 source/destination의 논리 크기에 각각 clamp한다. Predicated staging도 같은 경계를 사용하며 direct texture↔texture는 physical region을 유지한다. Resource/SRV/`GetDimensions`는 논리 크기를 보존한다. [상세 resource 계약](D3D12-RESOURCES.ko.md#unaligned-bc-texture와-physical-block-copy)을 따른다.
 
-P1 당시 진행 상황(2단계, draw-time capture·assembly): SO PSO의 `DrawInstanced`/`DrawIndexedInstanced`는 render pass 안에서 VS epilogue capture(indices=vertex buffer 26, control=27, scratch=28)를 실행하고, render pass가 끝나면 draw마다 단일 thread `so_assemble` compute를 API 순서대로 돌린다. Record key는 0-based IA position k이고, record는 `VertexCountPerInstance × InstanceCount`개다. Scratch는 recording 시점에 크기가 정해지며(record 뒤에 record당 claim word 1개), CPU 대기는 없다. `UINT32_MAX` record나 `maxBufferLength`를 넘으면 `E_OUTOFMEMORY`를 기록한다. Indexed SO draw는 app index buffer 대신 생성한 uint32 position buffer(`positions[k] = k`, D3D12 strip cut이 적용되는 위치만 `0xFFFFFFFF`)로 Metal indexed draw를 낸다. VS가 app index를 직접 읽어 `SV_VertexID` = index 값(BaseVertexLocation 제외, FS 8.16), vertex fetch = index + BaseVertexLocation으로 쓴다. 그래서 Metal restart와 assembly cut 규칙이 같다. VS 실행 수는 IA position 수로, D3D가 허용하는 no-cache 상한 안이다. 한 vertex가 여러 번 shade되면 claim word(cmpxchg 0→1)를 얻은 invocation만 record를 쓰므로 record 성분이 섞이지 않는다. Assembly가 claim 없는 record를 만나면 그 primitive를 건너뛰고 status word로 세며, completion에서 로그와 함께 `DXGI_ERROR_DRIVER_INTERNAL_ERROR`를 device에 보존하고 대기 중인 fence를 종료한다. Assembly 규칙: strip은 list로 풀고, 홀수 strip 삼각형은 `(i, i+2, i+1)`로 leading vertex와 winding을 보존한다(MS Triangle Strips 문서, FS 8.14, VK_EXT_provoking_vertex의 D3D11 SO 순서 요구). `IBStripCutValue`에 맞는 cut은 LINESTRIP/TRIANGLESTRIP에만 적용하고(list에서는 cut 값도 일반 index), 미완성 primitive는 버린다(FS 8.12-8.13). Primitive는 참조된 모든 slot에 들어갈 때만 쓰고, overflow 뒤에는 쓰지 않으며 needed만 증가시킨다. 참조 slot이 미바인딩이면 full로, 참조하지 않는 slot이 bound돼 있으면 무시한다(FS 14.5-14.6). 끝나면 filled size를 write back하고 stream 0 counter에 누적한다. Predication은 기존 predicate snapshot을 assembly에도 적용한다. PSO 검증: root signature(명시 또는 embedded)에 `ALLOW_STREAM_OUTPUT`이 없으면 `E_INVALIDARG`이고, `StartComponent`는 packed output register의 `.x`가 아니라 element 첫 성분 기준이다(DXBC/DXIL 동일). 현재 adjacency/patch topology는 recording `E_NOTIMPL`이다. SO PSO의 `ExecuteIndirect`는 아래 추가 결과에서 구현했다. 일반 non-SO indexed restart의 과거 가정은 아래 추가 결과에서 정정했고, 불일치 strip만 application index pulling으로 수정했다. 증거: `graphics-translator/tests/owned-d3d12-stream-output.cpp`, suite `stream-output`(총 87 case, 그중 GPU capture 28개: list/strip/홀수 strip 순서, indexed 반복/restart, instancing, 다중 slot·gap·stride, 두 draw·두 list append, exact fit, overflow, 미바인딩 slot, NO_RASTERIZED vs rasterized RT, non-indexed VS invocation이 SO 없는 동일 draw와 같고 indexed는 no-cache 상한 안, list/DISABLED에서 cut 값은 일반 vertex, sparse R16/R32 index, R32 strip cut, record 단일 invocation(ticket), packed DXIL semantic, `ALLOW_STREAM_OUTPUT` 누락, predication on/off, SO_STATISTICS 0..3), `build/local/p1d/runtime-03`, `build/local/p1d/proof-11`.
+Canonical proof는 **같은 [parallel-texture/runtime-after-02 manifest](../build/local/parallel-texture-20261002/runtime-after-02/owned-graphics-runtime.json), SHA256 a06e6cf419b8d05007a40ce16942d57bd8b33bc7f9ddb1dd27d629e6fc89d81f**에서 실행했다.
 
-### P1 추가 결과 — SO ExecuteIndirect
-
-- VS-only SO PSO의 DRAW/DRAW_INDEXED indirect 명령을 지원한다. GPU argument/count buffer, MaxCommandCount clamp, predication snapshot, command별 root/VB/IB 갱신과 API 후 상태 reset을 유지한다. 이전 `Close=E_NOTIMPL`은 실제 기존 runtime에서 두 draw 형식 모두 재현했다(`build/local/so-indirect/baseline-so-e-notimpl.txt`).
-- `d3d12_command_list.cpp`는 SO indirect를 독립 render pass에 기록하고 SO target·layout과 root/VB 초기 상태를 보존한다. Signature는 packed draw/IBV byte offset을 저장한다. `dxmt_command.metal`의 준비 kernel은 GPU가 정한 실행 count와 compact draw/IB 정보를 읽는다. Count/predicate가 있으면 먼저 count만 읽고, 실행되는 명령 수만큼만 readback을 할당한다.
-- Queue worker가 producer submission의 실제 retirement를 기다린 뒤 실행별 capture scratch·claim·index positions·control·ICB·root/VB 상태를 만든다. Allocator의 녹화 상태는 수정하지 않고 새 메모리는 GPU completion까지 보유한다. VS는 기존 draw 안에서 한 번만 실행하며 SO record는 기존 epilogue로 capture한다. Indexed draw는 생성한 IA positions 위에서 실행하고 application index/BaseVertex는 VS가 읽는다. Assembly는 명령 순서대로 append·overflow·needed 통계를 반영한다.
-- 성능 경계: SO indirect에는 GPU→CPU readback과 queue-worker 대기가 있다. GPU count/predicate가 있으면 count와 draw 정보의 두 준비 단계를 사용한다(count=0이면 두 번째 생략). API caller는 비차단이다. 완전 GPU-only indirect 구현이나 성능 개선을 주장하지 않는다. 실제 record 수가 uint32/Metal buffer 한계를 넘거나 실행 메모리를 할당하지 못하면 device 오류로 전파하며 SO output을 임의로 잘라 성공 처리하지 않는다.
-- 리뷰 반영: PSO가 읽는 VB slot뿐 아니라 signature가 갱신하는 slot까지 table을 할당한다(미사용 slot 31 포함). Zero-instance indexed 명령은 큰 index count 때문에 positions 크기 제한이나 IB 접근을 수행하지 않으며 SO ICB resolver도 no-work 명령을 생략한다. Completion용 SO owner 저장 공간도 GPU setup 전에 allocation-error 처리 범위 안에서 확보한다. Zero-instance UINT_MAX case는 이 호스트의 수정 전 runtime-03에서도 통과했으므로 이 경계의 failing-before 증거로 주장하지 않는다. 강제 OOM 실행은 검증하지 않았다.
-- 최종 검증: 전체 Ninja build/install 후 새 `build/local/so-indirect/runtime-05`, Metal API/shader validation 아래 `proof-stream-output-05` PASS. **총 102 case 중 GPU capture 43개**이며, 기존 28개에 SO indirect 15개를 추가했다. GPU가 쓴 인수/count(0·clamp), 두 draw 형식, predication, append/overflow·미바인딩 needed 통계, packed DXIL, 혼합 R16/R32 및 root/VB/IB 갱신·slot 31, closed-list 인수 변경 재실행, zero-instance 큰 count를 실제 readback으로 검사한다.
-- 관련 회귀: `build/local/so-indirect/proof-indexed-restart-01`(runtime-01, DXBC/DXIL 총 62 GPU case), `proof-predication-indirect-03`(runtime-03) validation PASS. `python3 scripts/test-owned-graphics-diagnostics.py` 42 tests PASS. 두 reviewer의 지적을 수정하고 좁은 재검토에서 남은 지적이 없음을 확인했다. 전체 D3D12 conformance, 실제 게임 성능, 32-bit SO GPU 실행은 이 결과에 포함하지 않는다.
-
-### P1 추가 결과 — SO 오류 전파와 WoW64 capture 인자
-
-- SO assembly의 missing-claim status를 순차 completion 스레드에서 검사하고 최초 `DXGI_ERROR_DRIVER_INTERNAL_ERROR`를 device에 보존한다. `GetDeviceRemovedReason`은 이 원인을, 이후 queue/fence/resource 생성·Map·Present의 오류 반환 경로는 `DXGI_ERROR_DEVICE_REMOVED`를 노출한다. 이미 등록된 fence 대기는 terminal `UINT64_MAX`로 풀고 늦은 GPU/CPU signal이 이를 되돌리지 못하게 한다.
-- Fence의 native event probe는 SO 검증 전에 정상 완료를 공개할 수 있어 제거했다. Queue의 앞선 submission 검증을 마친 completion 스레드만 GPU fence 값을 공개하며, consumer worker는 latch를 기다린다. Device 오류로 폐기하는 Present는 shared presentation-order event를 `UINT64_MAX`로 signal하고 frame-latency semaphore credit도 반환한다. 이미 제출된 뒤 frame의 GPU wait와 종료 대기가 남지 않게 한다.
-- `winemetal_unix.c`는 SO type 10의 32-bit element 배열과 semantic name을 소유하는 native 저장소로 변환한다. 다섯 compile thunk가 변환 실패를 compiler 오류로 전달하고 부분 할당을 해제한다. Null compiler error에서도 오류 메시지 조회가 안전하다. 32-bit DLL 빌드에서 드러난 RT export-name 크기 포인터는 public uint64/transport size_t ABI를 유지하는 local 변환으로 수정했다. 이 RT 함수의 실제 호출은 검증하지 않았다.
-- 실제 GPU 실패 재현: `build/local/so-integrity/probe-baseline-02`는 missing record status=3인데 device reason은 S_OK였다. 수정 `runtime-02`의 `probe-fixed-02`는 같은 status에서 reason `0x887a0020`, 세 fence의 `UINT64_MAX`, 사전 등록 이벤트 해제, 이후 queue Signal/Wait·event 등록의 `0x887a0005`를 확인했다. 정상 SO는 3 vertices/48 bytes였다.
-- 다중 queue Present 실패 재현: `probe-present-before-02`는 frame N이 future fence 뒤에 있고 N+1이 GPU에서 N을 기다릴 때 독립 queue의 SO 오류 후 latency wait가 timeout(258)됐다. `probe-present-fixed-01`은 latency wait 성공, 이후 Present의 device-removed 오류, 정상 queue/swapchain 해제와 exit 0을 확인했다. 두 GPU probe는 Metal API/shader validation을 켰으며 production fault-injection 설정을 추가하지 않았다. 임시 probe는 제거하고 로그를 남겼다.
-- 실제 Wine WoW64 compiler 경로: 기존 native 모듈은 존재하지 않는 semantic을 묵인했지만 수정 후 이름을 포함한 오류로 거부했다. 유효한 capture element 두 개의 컴파일, 두 번째 element의 범위 오류, null-error 메시지 조회도 확인했다(`build/local/so-integrity/wow64-so-capture-proof.txt`). 전체 32-bit D3D12 SO GPU draw나 강제 OOM 실행을 검증한 것은 아니다.
-- 빌드·회귀: 전체 Ninja build/install 및 i686 winemetal.dll build, CPU `queue-order-scheduler.test.cpp` 통과. `runtime-01`의 `proof-stream-output-01`(총 87 case, GPU capture 28), `proof-indexed-restart-01`(DXBC/DXIL 총 62 GPU case), 최종 `runtime-02`의 `proof-fence-events-02`와 `proof-present-queues-02`가 validation PASS다. 경로는 모두 `build/local/so-integrity/` 아래다.
-
-### P1 추가 결과 — 일반 non-SO indexed primitive restart (2026-09-28)
-
-Apple M5 Pro의 native Metal direct draw와 ICB probe에서 list topology는 R16/R32 index 최댓값을 **restart하지 않았다**. 과거의 “Metal은 모든 indexed draw에서 최댓값을 restart한다, 따라서 모든 list/draw를 다시 써야 한다”는 가정은 **오류로 정정한다**. 문제는 strip의 `IBStripCutValue`가 disabled이거나 현재 R16/R32 index format과 cut 값이 불일치할 때 Metal의 고정 restart와 D3D12 계약이 달라지는 경로다. 일치하는 cut-format strip과 list는 direct/ICB 모두 native indexed draw를 유지한다.
-
-- 불일치 strip만 nonindexed Metal draw로 내리고 VS에서 application index를 읽는다. VS의 `SV_VertexID`는 app index+base vertex, input attribute fetch도 같은 값을 사용한다. Index buffer는 GPU에서 원본을 그대로 읽으며, 새 generated IB·prepass·CPU readback은 없다. Predicated direct draw, GPU argument/count `ExecuteIndirect`, command별 IB view·format/root/VB 갱신도 처리한다. 기존 SO indexed capture/assembly 경로는 그대로다.
-- Compiler: `src/airconv/airconv_public.h`의 header-only `SM50_SHADER_D3D12_INDEX_PULL`(type 11), vertex bindings 26=`VERTEX_INDICES`, 27=`VERTEX_INDEX_CONTROL`(generic 16 B). SO type 10의 control은 기존 32 B 그대로이며 두 mode는 상호 배타적이다. DXBC/DXIL의 VS index·input lowering은 공통 compiler helper를 사용한다. Type 11의 `sm50_compilation_argument32_convert`도 추가했으나 WoW64 실제 실행은 미검증이다.
-- Graphics PSO는 원본 VS source/root signature/input elements를 보존하고 normal/ICB 각각에 대해 index-pull variant를 lazy 생성한다. Variant별 immutable constants를 분리하여 normal/ICB PSO와 혼용하지 않는다. Cold/warm pipeline cache 회귀는 통과했지만 **pull variant 자체는 serialized cached blob에 들어가지 않는다**. 영향을 받는 첫 draw에서 컴파일된다.
-- 실패 재현: 기존 runtime `build/local/p1d/indexed-restart-before-01`에서 R16 line strip cut disabled의 pixel 3·5가 expected 1 / actual 0; `build/local/p1d/indexed-restart-mismatch-before-01`에서 R32와 cut FFFF의 불일치. 수정 뒤 `build/local/indexed-restart/proof-indexed-restart-02`은 `runtime-02`에서 초기 28×DXBC/DXIL=56 case PASS. 최종 `build/local/indexed-restart/proof-indexed-restart-03`은 `runtime-02`, Metal validation 아래 DXBC 31 + DXIL 31 = **62 GPU case PASS**. Direct/list/strip, cut disabled/mismatch/match, base vertex·start instance, predication, GPU count/arguments, simple strip R16/R32, command별 R16→R32→R16 ICB native→pull→native와 IB view offset 전환을 포함한다. `runtime-02`는 이전 `runtime-01` 이후 generated resolver scope만 수정한 production build이며 최종 matrix를 위한 추가 runtime 변경은 없다.
-- 같은 `runtime-02`의 `build/local/indexed-restart/proof-predication-indirect-02`, `proof-bundles-02`, `proof-pipeline-cache-02`도 validation PASS. 최초 새 runtime의 `proof-dxil-ia-01`과 `proof-stream-output-01`도 PASS. `python3 scripts/test-owned-graphics-diagnostics.py` 42 tests PASS. 기존 SO fixture는 **총 87 case(그중 GPU capture 28개)**이며, 이번 indexed 62개는 별도 suite 결과다.
-
-구현 소스는 `src/d3d12/d3d12_command_list.cpp`, `d3d12_command_signature.cpp`, `d3d12_command_allocator.cpp`, `d3d12_pipeline_graphics.cpp`, `src/airconv/airconv_public.h`, `dxbc_converter.cpp`, `dxil_signature.cpp` 및 공유 compiler helper다. 소스 fixture는 `graphics-translator/tests/owned-d3d12-indexed-restart.cpp`와 `graphics-translator/tests/dxil/indexed-restart.hlsl`·세 DXIL 입력이다. 복원한 `owned-d3d12-dxil-ia.cpp`는 기존 `compute.dxil vertex.dxil pixel.dxil` 다음에 재구성한 `dxil-ia-vs.hlsl`/`dxil-ia-ps.hlsl`에서 새로 빌드한 `dxil-ia-vs.dxil`/`dxil-ia-ps.dxil`을 받는다. 이전 runtime에 대해 소스 빌드 fixture를 `build/local/ia-restore/proof-source-built-01`에서 먼저 검증했다. Runner의 `dxil-ia` suite에는 이제 legacy binary dependency가 없다.
-
-기존 Meson install 뒤 새 runtime/prefix/evidence 경로에서 재현한다(아래 runner가 fixture 옆에 shader 입력을 복사하고 fixture의 argv 순서대로 전달한다):
-
-```sh
-"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -municode -static \
-  -Iinclude/native/directx graphics-translator/tests/owned-d3d12-dxil-ia.cpp \
-  -ld3d12 -ldxgi -ldxguid -ld3dcompiler -lole32 -o build/local/dxil-ia.exe
-"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static \
-  -Iinclude/native/directx graphics-translator/tests/owned-d3d12-indexed-restart.cpp \
-  -ld3d12 -ldxgi -ldxguid -ld3dcompiler -lole32 -o build/local/indexed-restart.exe
-python3 scripts/stage-owned-graphics.py stage \
-  --dxmt-install build/local/install --wine-source toolchains/wine-runtime \
-  --wine-dest build/local/indexed-restart/runtime-reproduce --with-nvapi --with-nvngx
-python3 scripts/test-owned-graphics.py --runtime build/local/indexed-restart/runtime-reproduce \
-  --suite dxil-ia --fixture build/local/dxil-ia.exe \
-  --out build/local/indexed-restart/proof-dxil-ia-reproduce --validation
-python3 scripts/test-owned-graphics.py --runtime build/local/indexed-restart/runtime-reproduce \
-  --suite indexed-restart --fixture build/local/indexed-restart.exe \
-  --out build/local/indexed-restart/proof-indexed-restart-reproduce --validation
-```
-
-두 fixture의 argv 계약은 각각 `compute.dxil vertex.dxil pixel.dxil dxil-ia-vs.dxil dxil-ia-ps.dxil`, `indexed-restart.hlsl indexed-restart-procedural-vs.dxil indexed-restart-attribute-vs.dxil indexed-restart-ps.dxil`이다. 위 runtime/output은 **실행 전 없는 새 경로**로 바꿔야 한다. 검증은 M5 Pro/macOS 27의 x86_64 Wine 경로이며 다른 ABI/GPU에 대한 선언은 아니다.
-
-### P1 추가 결과 — buffer UAV 사각형 clear와 RS 1.1 descriptor bounds
-
-- `ClearUnorderedAccessViewUint/Float`: rect를 `[0, view width) × [0, view height)`로 클리핑한 뒤 RAW DWORD base 또는 typed native view의 alignment prefix를 한 번만 더한다. 빈 rect는 건너뛰며 predicated dispatch도 같은 클리핑된 크기를 사용한다. 기존 clear shader/ABI는 바꾸지 않았다.
-- 수정 전 `FirstElement=8`인 RAW UAV의 rect clear가 뷰 밖 0번 DWORD를 `0x12340000`에서 `0xffffffff`로 덮는 것을 실제 GPU readback으로 재현했다(`proof-uav-before`).
-- `predication-indirect`에 **60 GPU case**를 추가했다: RAW UINT, R32/RGBA32 UINT·FLOAT, FirstElement 8/72, 전체/부분 clear, predicate 없음/실행/건너뛰기. 256-byte native view 정렬, 37-element dispatch tail, 음수·넘치는·빈 rect, 전체 backing buffer의 prefix/suffix sentinel과 32-bit UINT 값 보존을 확인한다. FLOAT clear는 typed FLOAT view만 사용한다.
-- RS 1.1의 `DESCRIPTORS_STATIC_KEEPING_BUFFER_BOUNDS_CHECKS`와 각 유효한 data flag 조합을 허용한다. `KEEP_BOUNDS | DESCRIPTORS_VOLATILE`, `DESCRIPTORS_VOLATILE | DATA_STATIC`, sampler의 data/KEEP_BOUNDS flag는 `E_INVALIDARG`다. Descriptor table을 bounds 없는 root descriptor로 승격하지 않는다.
-- 기존 runtime에서는 유효한 KEEP_BOUNDS 조합 네 개가 `E_INVALIDARG`이고 금지된 `DESCRIPTORS_VOLATILE | DATA_STATIC`은 `S_OK`인 것을 재현했다(`proof-root-before-static`). `core-contracts`의 **22개 조합**은 정상 serialize → deserialize의 범위/flags/type 보존 → CreateRootSignature와 잘못된 조합 거부를 검증한다.
-- `dxil` suite는 기존 frozen `null-descriptor.dxil`을 추가로 staging한다. KEEP_BOUNDS table을 실제 dispatch해 null CBV/SRV read와 null/OOB atomic 반환값 0, 16-byte UAV view 바깥·64-KiB allocation 안의 store/atomic 무효화, 전체 allocation sentinel 보존, 정상 table/root UAV write·read를 검증한다. 기존 RS 1.0 table, register-space, compute, graphics 경로도 유지한다.
-
-최종 전체 Ninja build/install 후 새 `build/local/p1-contracts/runtime-01`에서 Metal validation으로 다음을 통과했다. 모든 evidence는 같은 `build/local/p1-contracts/` 아래에 있다.
-
-| Suite | 증거 | 결과 |
+| full resources proof | result | stdout |
 |---|---|---|
-| `predication-indirect` | `proof-uav-final` | 새 60 GPU case와 기존 clear/indirect 회귀 PASS |
-| `core-contracts` | `proof-root-after` | 새 RS 1.1 22개 조합과 기존 기본 계약 PASS |
-| `dxil` | `proof-dxil-after` | KEEP_BOUNDS GPU readback과 기존 compiler/binding/graphics 회귀 PASS |
+| x64 | [final-resources-x64/result.json](../build/local/unaligned-bc-20261002/final-resources-x64/result.json) | [final-resources-x64/stdout.log](../build/local/unaligned-bc-20261002/final-resources-x64/stdout.log) |
+| WoW64 x86 | [final-resources-x86/result.json](../build/local/unaligned-bc-20261002/final-resources-x86/result.json) | [final-resources-x86/stdout.log](../build/local/unaligned-bc-20261002/final-resources-x86/stdout.log) |
 
-`python3 scripts/test-owned-graphics-diagnostics.py` **42 tests PASS**. 빌드 로그는 `build-01.log`다. `core-contracts`와 `dxil` fixture는 llvm-mingw의 현행 기본 D3D12 header로 `-std=c++20 -O2 -municode -static` 빌드하며, 오래된 `include/native/directx`를 include 경로로 강제하지 않는다. Runner가 필요한 shader를 복사하므로 `--suite core-contracts|dxil|predication-indirect`, 해당 `--fixture`, 새 `--out`, `--validation`으로 재현한다.
+양 결과는 **exit0·PASS·API+Shader Validation**, `validation_errors=[]`·`foreign_backend_loads=[]`, staged owned native plugin 실제 load다. OPTIONS8 **S_OK·supported1**, null/short/long-size 조회의 정확한 **E_INVALIDARG**와 기존 resource suite도 통과했다.
 
-검증 범위는 M5 Pro/macOS 27, x86_64 Wine의 격리 fixture다. Windows differential·다른 GPU/ABI·실제 게임 호환성 검증은 아니다. P1 전체 규격 완료나 지원 tier 상승을 뜻하지 않으며, 이후 공개한 `PIPELINE_STATISTICS`와 MSAA의 검증 범위는 위 P1-C에 별도로 기록했다.
+**지정 acceptance:** 각 ABI에서 **BC1–7 typed/typeless·signed/sRGB21 variants**, 논리 **7×5→3×2→1×1**, array2 slices, committed/nonzero-offset placed resource와 논리 descriptor·physical footprint를 확인했다. CPU read/write(non-block CPU pitch 포함), upload/readback의 null 및 explicit physical boxes, `CopyResource`, **8×8↔7×5 mixed-dimension direct/predicated texture copy**, true/false predication, distinct texture/buffer edge-copy payload를 검사했다. Row/offset/unused output guard와 invalid interior end/origin·physical bound·pitch/offset의 destination preservation을 확인했다. 실제 SRV sample(관측 가능한 sRGB gray 포함)·논리 `GetDimensions`, **BC1/BC3 7×5×3 volume·BC1 7×7 six-face cube**도 통과했다. Invalid void copy의 destination preservation을 HRESULT API 오류처럼 표현하지 않는다.
 
-## P3 완료 결과 (2026-10-01)
+**공유 copy 경로 회귀:** 같은 runtime의 [reinterpret-copy x64 result](../build/local/unaligned-bc-20261002/final-reinterpret-copy-x64/result.json)·[WoW64 result](../build/local/unaligned-bc-20261002/final-reinterpret-copy-x86/result.json)도 API+Shader Validation으로 PASS했다. [x64 stdout](../build/local/unaligned-bc-20261002/final-reinterpret-copy-x64/stdout.log)·[WoW64 stdout](../build/local/unaligned-bc-20261002/final-reinterpret-copy-x86/stdout.log)는 기존 **BC1 8×8→RGBA16UINT 2×2→BC1의32-byte exact round-trip**을 확인한다. 이 adjacent regression을 format reinterpretation 지원 확장으로 표현하지 않는다.
 
-**P3의 지정 구현과 최종 통합 검증을 Apple M5 Pro/macOS 27의 x64·WoW64 Wine 범위에서 완료했다.** 아래 실행은 별도 표시한 API-only를 제외하고 Metal API/Shader Validation을 사용했다. 최종 공통 runtime-04의 affected suite 통과와 baseline+targeted reachable coverage를 구분하며, 한 snapshot의 전체 suite 통과·전체 D3D12/DXR conformance를 주장하지 않는다.
+**한계:** BC1D·새 BC format·format reinterpretation·RelaxedFormatCasting·OPTIONS13 pitch/offset relaxation·공개 SM6.5/FL12_1·D3D11은 변경하지 않았다. 다른 GPU/OS·native BC 미지원 장치·모든 compressed copy conformance·실게임·ARM64 no-Rosetta는 미검증이다. COPY와 arena proof의 runtime/hash 및 역사 기록은 그대로 보존하고 recovery118에 합산하지 않는다. Programmable offsets는 같은 runtime에서 별도 [paired GPU proof](#programmable-texture-offsets-완료와-focused-proof)를 완료했으며 단순 compiler 포함으로 완료를 추론하지 않는다. [resources 재실행 recipe](SMOKE-TEST.ko.md#resources와-unaligned-bc-검증)를 따른다.
 
-| 기능 | 현재 검증 범위·보고 값 | 보존된 증거 경로 |
+### Programmable texture offsets 완료와 focused proof
+
+**실패→수정 구분(2026-10-02):** 같은 genuine frozen inputs로 [before-x64-01 result](../build/local/programmable-offsets-20261002/before-x64-01/result.json)·[WoW64 result](../build/local/programmable-offsets-20261002/before-x86-01/result.json)는 programmable-offset graphics PSO **E_FAIL(0x80004005)**로 실패했고 기존 constant texture 경로는 통과했다. Compiler owner의 진단은 constant-only offset 거부였다. 첫 lowering 수정 후 [after-x64-01 stderr](../build/local/programmable-offsets-20261002/after-x64-01/stderr.log)·[WoW64 stderr](../build/local/programmable-offsets-20261002/after-x86-01/stderr.log)도 PSO 실패를 보존한다. 후속 진단은 **zeroaggregate t0 ResBind의 compared usage 누락→AIR sampleCmp 실패**였고, `dxil_metadata.cpp`의 `ConstantAggregateZero` binding 처리와 opcode223/224/254/255 sampled/compared usage를 수정했다. Fixture를 축소하거나 원래 texture oracle을 느슨하게 바꾸지 않았다.
+
+**Lowering 계약:** DXIL Load/Sample/compare 계열 offset은 **signed low4bit[-8,7]**, Gather/GatherCmp는 **signed low6bit[-32,31]**다. Gather는 native low4 residual과16배수 coarse offset을 bound view의 mip/dimension 기준 normalized coordinate shift로 나눠 구현한다. 기존 q2 sampler-address metadata를 재사용해 WRAP/MIRROR/BORDER/CLAMP/MIRROR_ONCE 및 huge UV의 address domain을 먼저 range-reduce한다. Native descriptor ABI·D3D11·공개 SM6.5/FL12_1은 변경하지 않았다. **[INFERENCE] GatherRaw low6는 일반 gather 계약을 상속한다는 규격 해석**이며 advanced-texture 문구에 숫자 폭이 별도 재서술돼 있다는 주장이 아니다. 실제 R32_UINT GatherRaw GPU 결과는 아래 oracle로 확인했다.
+
+**입력 provenance:** [DXC version](../build/local/programmable-offsets-20261002/dxc-version.txt)은 **1.9.2609.5(01b62ad47)**, normal validator를 사용한 genuine **vs_6_0/ps_6_7/cs_6_7**다. [PS disassembly](../build/local/programmable-offsets-20261002/programmable-offsets-ps.ll)·[CS disassembly](../build/local/programmable-offsets-20261002/programmable-offsets-cs.ll)는 SRV `rawBufferLoad`에서 읽은 runtime offset과 shader-model metadata를 보존한다. [input hashes](../build/local/programmable-offsets-20261002/input-hashes.txt)·[producer hashes](../build/local/programmable-offsets-20261002/producer-hashes.txt)·[source hashes](../build/local/programmable-offsets-20261002/source-hashes.txt)를 함께 기록했다. 새로운 frozen VS/PS/CS SHA256은 각각 **e3ce7d66… / aad0ef81… / af944d24…**이며 정확한 전체 값은 해당 manifest와 result에 있다. 기존 basic-texture frozen inputs는 그대로다. Producer는 기존 `build-texture.sh`이며 `build-sm6.sh`로 대체하지 않는다.
+
+Canonical proof는 BC와 **같은 parallel-texture/runtime-after-02 manifest SHA256 a06e6cf419b8d05007a40ce16942d57bd8b33bc7f9ddb1dd27d629e6fc89d81f**다. 중단된 `after-*-02`는 완료 증거가 아니다.
+
+| full dxil-texture proof | result | stdout |
 |---|---|---|
-| 최종 공통 runtime-04 | Manifest **363308d9269fa9a29140b2f7fdff0505185e0ec143d3f3f13b7eb9582bca0230**의 x64 RT/WG/HDR **3 suite**, WoW64 RT/WG/HDR/query **4 suite** 모두 exit0·API/Shader Validation 오류 없음·foreign backend 없음. RT 25 frozen 입력/contract13/AS16/RayQuery15/formats13, WG OPTIONS21 16-byte·tier10·9 case, HDR7-frame source readback/fence/Present 검증. 전용 prefix stop/wait/cleanup 완료 | `build/local/p3/integrate/runtime-04`, `final64-04/{raytracing,work-graphs,hdr-metadata}/result.json`, `final32-04/{raytracing,work-graphs,hdr-metadata,queries}/result.json`(같은 integrate 디렉터리) |
-| x64 최종 reachable coverage | 계획 61 row 중 source가 있는 **60 reachable row 모두 PASS: 59 API/Shader+1 API-only**. Baseline과 enhanced-barrier/atomic 및 최종 common-cut proof의 합산이며 단일 snapshot 전체 suite 통과가 아니다. 기존 source-orphan standalone static-sampler 1 row는 미검증 | `build/local/p3/integrate/aggregate64-final.json` |
-| WoW64 최종 reachable coverage | **58 reachable label 모두 PASS: 57 API/Shader+1 API-only**, cleanup 완료. Baseline+affected proof+최종 common-cut 합산이며 단일 snapshot 전체 suite 통과가 아니다. RT/WG 보류 없음. NGX 2 suite는 x64-only ABI, standalone static-sampler는 retained source 부재로 실행 불가 | `build/local/p3/integrate/integration32-final-evidence.json` |
-| Feature level | **FL12_1**, 공개 max=0xc100, FL11_1/12_0/12_1 생성 성공·FL12_2 거절, strict capabilities runner PASS | `build/local/p3/integrate/runtime-03`, `build/local/p3/integrate/fl121-cap-01/result.json`·`stdout.log` |
-| Conservative raster | **ConservativeRasterizationTier 1**. VS DXBC/DXIL, GS, HS/DS, TS+GS, MS, AS/MS 전체 **10 family**, clip/cull/view·indirect/SO/statistics와 4× depth extrapolation/clamp **1180 sample** 검증. 공개 tier=1·strict runner PASS | `build/local/p3/integrate/conservative-cap-01/result.json`·`stdout.log` |
-| 선행 FL12_0 증거(역사적) | **FL12_0**. Logic op, 18 typed UAV load format, UAV-only ForcedSampleCount 1/4/8/16, TIR 16×, 4×/8× RTV의 forced 1×를 GPU 검증. Cap 조회 max=0xc000, FL11_1/12_0 생성 성공·당시 FL12_1 거절 | `build/local/p3/fl2/run-08`, `build/local/p3/fl2/cap-01` |
-| DXR | **RaytracingTier 1.1**. 새 통합 runtime에서 `raytracing_tier=11`, 정확한 RayQuery 15 case, AS 16 case, contract/state-object 12 case, vertex format 13종 및 indirect·predication·root arguments·coverage 통과. Validation 오류·foreign backend load 없음. Generic-function collection export/linkage의 후속 x64/WoW64 paired proof는 아래에 별도로 기록하며 전체 DXR conformance 완료가 아님 | `build/local/p3/integrate/runtime-01`, `build/local/p3/integrate/dxr-cap-01/result.json`·`stdout.log`; 개별 증거 `build/local/p3/rqstages/run-08`, `build/local/p3/dxras-resume/run-09` |
-| DXR ordinary-function collection(x64/WoW64) | Immutable WG/DXR namespace에서 renamed export·deferred external을 final pipeline 생성 시 연결, hidden internal closure·dependency flags·conflict·immutable root·helper resource metadata 검증. Ordinary function에는 shader identifier를 주지 않음. Upstream DXC `lib_6_6` consumer/helper/final frozen fixture에서 uint/float overload의 unmangled export group rename·mangled signature를 보존하고 float **5.25/7.25/9.25/11.25** bit pattern, reachable helper local-root incompatibility와 global-root conflict를 검증. GPU words **0x2320/0x2323/0x2326/0x2329**와 helper UAV writes, mixed RT-shader+ordinary collection의 renamed raygen만 import해 hidden closure를 유지하는 경로와 flags/hidden/missing/duplicate-global-root/incompatible-helper-local-root negative 계약, 기존 RayQuery15/AS16/formats13 유지. **같은 24 frozen DXIL 입력·typed-overload/root ABI의 x64/WoW64 paired PASS** | `build/local/p3/dxr-linkage/runtime-07`, `build/local/p3/dxr-linkage/after-09/result.json`·`stdout.log`, `build/local/p3/integrate/runtime-rt32-02`·`raytracing32-isolated-03/result.json`; 재생성 `graphics-translator/tests/dxil/build-raytracing-linkage.sh` |
-| 후속 DXR named-root/resource binding(x64/WoW64) | Source/ExistingCollection의 embedded named-root alias·filter/old-name-hidden·function/root namespace collision·NumExports0 publication, mixed collection alias와 provider association 검증. Resource가 있는 closed rootless collection 거부; AddToStateObject의 같은 embedded root 재선언 및 기존 GPU oracle 유지. **Contract13/AS16/RayQuery15/formats13**, API/Shader Validation PASS. **같은 native snapshot의 최신 x64/WoW64 paired PASS** | `build/local/p3/dxr-linkage/runtime-13`, `build/local/p3/dxr-linkage/after-16/result.json`, `build/local/p3/integrate/raytracing32-isolated-04/result.json` |
-| GS/TS+GS indirect | Command별 root constant·CBV/SRV/UAV·VB/IB 변경, GPU argument/count·predication과 직접 draw의 독립 oracle 비교. Geometry **DXBC 87/DXIL 87**, tessellation **166/166** 통과 | `build/local/p3/gsindirect-contract/geometry-10`, `build/local/p3/gsindirect-contract/tessellation-07` |
-| GS SO stream 0–3·TS+GS SO/indirect | Stream별 정확한 bytes·filled size·written/needed·overflow·rasterized stream/NONE, GS SO indirect와 SO 통계의 predication 검증 | `build/local/p3/p2sostreams/geometry-04`·`so-03`, `build/local/p3/tsgsind/geometry-05`·`tessellation-05` |
-| Early-Z MSAA statistics | GS·HS/DS·TS+GS·MS의 2×/4×/8× forced-early PSInvocations를 CPU oracle과 비교. Direct/indirect, GS indirect+SO 및 cut/adjacency strip indirect 검증. Mesh의 이 부분 통과는 MeshShaderTier 1 전체 증거가 아님 | `build/local/p3/p2last/geometry-final.log`·`tessellation-final.log`·`mesh-01.log` |
-| DS-only SO | **Tessellation DXBC 166/DXIL 166**. Fractional tri/quad·isoline point/line, direct/indirect의 정확한 SO 순서·filled size·overflow·root/VB/IB 변경·no-raster 통과. No-raster에서는 conservative/VRS 설정을 켜도 C/PS=0·clear image 유지 | `build/local/p3/ds-so/proof-10/result.json`·`stdout.log` |
-| Sampler feedback·view instancing | **SamplerFeedbackTier 1.0**, **83 case** oracle 통과. **ViewInstancingTier 1**, **23 case**: VS/GS/HS/DS/PS ViewID, view 위치·mask·4× MSAA·indirect·bundle·statistics 검증 | `build/local/p3/feedback3/run-08`, `build/local/p3/viewinst2/final-view-instancing` |
-| Mesh 출력·cull | **공개 MeshShaderTier 1**. 필수 128-scalar(SV_Position 포함) vertex/primitive split, 124 독립 semantic, 32KiB output+28KiB app threadgroup, 1×/4× direct/GPU-count indirect/cache, wide coarse SV_Coverage·pull·ddx/ddy, 8-plane CullDistance의 triangle/line·zero/NaN·primitive cull 등 **34 case** 통과. 새 통합 runtime에서 공개 `tier=10`, exit 0·strict runner PASS·API/Shader validation 오류 없음 | `build/local/p3/integrate/runtime-02`, `build/local/p3/integrate/mesh-cap-01/result.json`·`stdout.log`; 앞선 cap=0 proof는 `build/local/p3/mesh-contract/run-13` |
-| VRS | **VariableShadingRateTier 2**, AdditionalShadingRatesSupported TRUE, ShadingRateImageTileSize **8**, PerPrimitiveShadingRateSupportedWithViewportIndexing TRUE. 기존 142 case+VS/GS/MS/AS viewport 4 case, 총 **146 case**를 probe override 없이 공개 cap으로 통과. COMMON rate-image의 Close/queued capture는 S_OK지만 FIFO submission은 implicit COMMON→SRS promotion을 거부해 `DXGI_ERROR_DEVICE_REMOVED`(887a0005) | `build/local/p3/vrs2-finish/out-20-tier2/result.json`·`stdout.log` |
-| 선행 Work Graph cap(역사적) | 당시 native/WoW64 node **5 case**는 통과했지만 OPTIONS21은 `E_NOTIMPL`이었다. 현재 공개 Tier1.0·9-case 및 최종 common-cut proof와 구분 | `build/local/p3/workgraph-resume/run-14-final-native/result.json`, `run-15-final-wow64/result.json`, `cap-query-stdout.log`(같은 workgraph-resume 디렉터리) |
-| Work Graph Tier 1.0 | **실제 OPTIONS21 16-byte S_OK·tier=10**, 15/20-byte E_INVALIDARG와 adjacent guard 보존. **9 ordered case** x64/WoW64 strict PASS: 기존 exact-min25728/depth32/fanout16 및 shared budgets, per-program roots·ordinary-function/aggregate helper parameter+return·public alias/hidden dependency·same-root AddToStateObject·collision negatives, global/local static-sampler union과 local S0-only/ARG0 검증. Linked A **sum196/count4**, B **248/4**, helper **54/4**, local sampler **68/4**. 일반 Shader Model **6.5** 유지 | `build/local/p3/workgraph-resume/runtime-20`, `run-30-final-cap64/result.json`·`stdout.log`, `run-31-final-cap32/result.json`·`stdout.log`(같은 workgraph-resume 디렉터리) |
-| WoW64 production presenter GPU probe | `runtime-03-wow64`에서 HDR **5 drawable frame+detached**, color-space **11 frame+GPU retirement gate**, geometry **12 pixel oracle**(crop·3 rotation·background·RTL·restriction) 통과. 모두 rc=0·API/Shader validation 오류 없음. Public suite gate/physical compositor proof가 아닌 production presenter readback이며 color-space `compositor_proof=0`. 초기 `presenters32-01`의 rc=3은 fixture readback allocation에 기존 `WMT_RESOURCE_CPU_ADDRESSABLE` 옵션을 적용해 수정; pointer truncation·새 allocator/shim 없음 | `build/local/p3/integrate/presenters32-02/{hdr-presenter,colorspace-presenter,present-geometry}/{result.json,stdout.log,invocation.json}` |
-| x64 production presenter GPU probe | Color-space **11 drawable frame+retirement gate**와 geometry crop·3 rotation·background·RTL·restriction 통과. HDR 최종 proof는 fractional display peak **603.665771**과 content equality, **5 GPU frame+detached** 통과. 초기 HDR truncation/scale-dependent fixture 실패를 최종 proof와 구분; production drawable readback을 physical compositor proof로 확대하지 않음 | `build/local/p3/integrate/native64-01/results.json`(colorspace·geometry), `build/local/p3/integrate/native64-hdr-03/results.json`·`owned-d3d12-hdr-presenter/run.log` |
-| x64 scoped contract 회귀 | Enhanced barriers **19 case·rejected 10** API/Shader Validation PASS. Atomic64 live reader는 **API-only PASS**(observed 256·changed 64·first 1/last 128), **atomic64_snapshot=unproven**. 기존 API+shader live 실행의 INCONCLUSIVE를 통과로 바꾸거나 이 관찰을 atomic 64-bit snapshot 증거로 승격하지 않음 | `build/local/p3/integrate/enhanced64-contract-02/enhanced-barriers/result.json`, `build/local/p3/integrate/atomic64-live-api-01/result.json`·`stdout.log` |
-| WoW64 scoped query·atomic 회귀 | Clock calibration monotonic·실제 GPU timestamp 증가와 occlusion **16384,4096,0,12288,1,0** API/Shader Validation PASS. Query는 별도 `runtime-query32-01`에서 실행(초기 query abort는 역사적 실패). Atomic64 live는 **API-only PASS** observed256·changed64·first1/last128, **snapshot unproven**; 초기 API+shader INCONCLUSIVE를 통과로 승격하지 않음. 이 별도 native 재빌드 proof는 최종 combined runtime 전체 회귀가 아님 | `build/local/p3/integrate/queries32-02/result.json`·`stdout.log`, `build/local/p3/integrate/atomic-copy-live32-api-01/result.json`·`stdout.log` |
-| 초기 WoW64 실패 증거(역사적) | `all32-01`은 56 run 중 **53 API/Shader PASS**였고 query abort·obsolete barrier-interface assertion·atomic-live Shader Validation INCONCLUSIVE를 보존했다. 해당 경로의 후속 proof와 최종 reachable 58-label 결과는 위 행을 참조하며 원래 실패를 통과로 덮어쓰지 않는다 | `build/local/p3/integrate/integration32-initial-evidence.json`, `all32-01/{summary.json,coverage.json}`(같은 integrate 디렉터리) |
-| PSO cache epoch | Serialized PSO **revision 4**. Graphics compile key **revision 5**는 이 blob version과 별개다. Current PSO/library GPU round-trip, child restore 4·cold compile 0, digest가 유효한 nested revision 3도 `D3D12_ERROR_DRIVER_VERSION_MISMATCH`로 거부. 기존 캐시 폐기·재생성 필요 | `build/local/p3/cache-epoch/runtime-after`, `cache-after`·`library-after`·`nested-version-proof`(같은 cache-epoch 디렉터리) |
+| x64 | [after-x64-03/result.json](../build/local/programmable-offsets-20261002/after-x64-03/result.json) | [after-x64-03/stdout.log](../build/local/programmable-offsets-20261002/after-x64-03/stdout.log) |
+| WoW64 x86 | [after-x86-03/result.json](../build/local/programmable-offsets-20261002/after-x86-03/result.json) | [after-x86-03/stdout.log](../build/local/programmable-offsets-20261002/after-x86-03/stdout.log) |
 
-RayQuery는 CS·VS·PS·HS·DS·GS·AS·MS·raygen·closest-hit·any-hit·intersection·miss·callable과 raygen indirect에서 triangle/procedural scene의 24 lane × 64 word를 비교했다. Native intersection callback 안의 inline query가 허용되지 않는 any-hit/intersection 중첩-query pipeline만 **kernel-side candidate traversal + visible callback**을 쓰며, 다른 pipeline은 native fast path를 유지한다. Base·state-object shader의 IgnoreHit·AcceptHitAndEndSearch·ReportHit 거부/interval·opacity·local root·AddToStateObject도 새 경로를 검증한다. 잘못된 candidate InstanceID mutation은 `build/local/p3/rqstages/mutation-run`에서 추가 10 stage 모두 실패했다. AS 증거는 postbuild·clone/compact·serialize/deserialize·TLAS relocation·visualization·in-place/out-of-place update와 빈 AS/비영 offset subrange를 포함한다.
+양 결과는 **exit0·PASS·API+Shader Validation·owned native DXIL compiler verified**, `validation_errors=[]`·`foreign_backend_loads=[]`다. ABI별 **batches2·lanes16·families22·components2816**의 독립 uploaded-texel CPU oracle과 기존 gather/LOD/sample-pattern gate가 모두 통과했다.
 
-### P3 완료 범위와 cap·검증 경계
+**지정 acceptance:** signed/highbit16개(-9/-8/7/8/15/16, INT_MIN/MAX, -33/-32/31/32/63/64 및 큰 highbit 값)의 SRV-derived runtime offset이 lane 및 두 draw/dispatch batch에서 변한다. PS Sample/Bias/Cmp/CmpLevelZero, SampleLevel/Grad·SampleCmpLevel, compute implicit Sample/Bias/Cmp 경로를 확인했다. 2D/2DArray/physically padded1DArray의 slice 보존, Float Gather/GatherCmp·R32_UINT GatherRaw highbit, **127×113 NPOT**,5 address modes·huge ±UV·mirror period, **MostDetailedMip1 view127×113 over resource254×226**, dimension1 gather, 2D/array/1D/MS/uint Load low4 및 MS corner resident/zero·full32 coordinate-plus-offset control이 oracle과 일치했다.
 
-- **MeshShaderTier 1 검증:** `integrate/mesh-cap-01`은 새 `integrate/runtime-02`에서 공개 tier=10과 전체 34 case를 strict runner로 통과했다. 앞선 `mesh-contract/run-13`은 cap=0 때문에 runner가 실패했던 역사적 proof이며 현재 cap 결과와 구분한다. 필수 32 packed row/128 scalar에는 float4 SV_Position이 포함된다. Native 124-scalar 한계를 하드웨어 예외로 인정하지 않고, 초과 출력·cull/활성 query는 device-record capture/replay로 처리한다. 일반 query 없는 native 범위는 fast path를 유지한다. Tier 보고는 이 장치에서 확인한 전체 필수 출력·cull 계약과 cap proof에 근거한다.
-- **기능별 proof와 최종 통합:** WG root/ordinary collection/local-only sampler와 DXR typed-overload/mixed collection/named-root/resource-binding은 기능별 paired GPU proof에 더해 공통 runtime-04의 x64/WoW64 affected suite에서도 통과했다. Conservative Tier1·VRS Tier2·mesh Tier1의 기능별 strict proof와 합쳐 P3 완료 판정에 사용하되 전체 D3D12/DXR conformance로 확대하지 않는다.
-- **FL12_1과 FL12_2:** 현재 공개 최대는 **FL12_1**이다. FL12_1의 conservative raster Tier 1·ROV 요구를 FL12_2와 혼동하지 않는다. 공식 필수 요건 대조(P3CapAudit)에 따르면 FL12_2는 DXR 1.1·mesh 1·VRS 2·sampler feedback 0.9 이상 외에도 **ConservativeRasterizationTier 3, TiledResourcesTier 3, DepthBoundsTestSupported, CopyQueueTimestampQueriesSupported, OPTIONS8의 UnalignedBlockTexturesSupported(unaligned BC)** 등이 필요하다. 따라서 일부 P3 tier 통과만으로 FL12_2를 올릴 수 없으며 **FL12_2는 미지원**이다. SM 6.6 보고를 이 feature level/tier들의 일괄 선행 조건으로 두지 않는다; HighestShaderModel은 검증된 **6.5**를 유지한다.
-- **통합 증거의 범위:** x64 **60=59 API/Shader+1 API-only**, WoW64 **58=57+1**은 baseline+source-warranted targeted proof의 reachable 합산이다. 모든 suite를 최신 단일 snapshot에서 재실행한 것은 아니다. Atomic live의 API-only PASS는 Shader Validation PASS 또는 atomic64 snapshot 보증이 아니며 snapshot은 **unproven**으로 남긴다. 기존 retained source가 없는 standalone static-sampler와 WoW64의 x64-only NGX 2 suite는 검증 불가 경계이지 미완료 P3 기능이 아니다. Production presenter readback은 물리 compositor proof가 아니며 다른 GPU/OS·Windows reference differential·실제 게임 정상 렌더링·성능은 보증하지 않는다.
+**한계:** 전체 texture/LOD/format conformance·cube/3D offset·raw64·MS-array matrix·fixed-point ambiguity 경계의 bit-exact 정확성은 주장하지 않는다. Near-boundary case는 ambiguity를 피한 ±1/64 입력이며 결과별 허용 오차로 실패를 덮지 않았다. AdvancedTextureOps는 여전히 RelaxedFormatCasting prerequisite가 있어 이 offset 완료만으로 cap이나 전체 SM6.7을 올리지 않는다. 다른 GPU/OS·실게임·ARM64 no-Rosetta도 미검증이다. Shared [diagnostics61 PASS](../build/local/parallel-texture-20261002/diagnostics.log)는 runner regression이며 이 GPU proof나 recovery118 집계와 별개다. [재실행·producer recipe](SMOKE-TEST.ko.md#dxil-texture와-programmable-offsets-검증)를 따른다.
 
+### Advanced texture 24-case focused proof
 
-## P2 완료 결과 (2026-10-01)
+Immutable runtime-08(manifest SHA256 `110ae822bc7399bfd2aec49588f0a5d5a9e5cbac94d6251ccf7127668620eb42`)의 [x64](../build/local/p3-20261003/advanced-texture/runtime08-advanced-x64-public-validation/result.json)·[WoW64](../build/local/p3-20261003/advanced-texture/runtime08-advanced-x86-public-validation/result.json)는 각각 **24 ordered cases·exit0·API+Shader Validation PASS**, owned native DXIL compiler 확인, validation/foreign-backend 오류0이다. Genuine SM6.7 frozen62 inputs와 producer HLSL/script hash를 각 invocation에 보존했다. GPU acceptance는 comparison6 shapes(1D/array·2D/array·cube/array) × CS/VS/PS18과 raw16/32/64 GatherRaw ×2D/array6이며, 다른 producer stages의 compile-only 결과를 GPU proof로 세지 않는다.
 
-**P2 완료.** 7개 slice(SM, BINDLESS, GSTS, BARRIERS, TILED, LIBRARY, SHARING)를 모두 구현하고 Metal API/Shader Validation 아래 GPU 검증했다. GSTS가 검증된 뒤 보고 Shader Model을 6.5로 올렸다. 모든 증거 경로는 `build/local/p2/` 아래이고, 실제 GPU 증거는 M5 Pro/macOS 27에 한정한다. 각 suite fixture는 `graphics-translator/tests/owned-d3d12-<suite>.cpp`, gate는 `scripts/test-owned-graphics.py`에 있다. **이 절의 cap·거부 동작·제약·미검증 목록은 P2 종료 당시의 역사적 기록이다.** 이후 RayQuery·feedback·view instancing과 GSTS/SO 제한을 변경한 현재 판정은 P3 절을 우선한다.
+View mip/slice·compare value와 opaque status의 `CheckAccessFullyMapped`, NULL texture·empty clamp 및 raw component/order/guards가 실제 readback oracle과 일치했다. Runtime08 당시 두 cap은 FALSE였으나, 후속 runtime24에서는 두 cap TRUE를 실제 조회하는 양 ABI24-case consumer가 다시 통과했다. 후속 runtime28의 reserved-volume full-page·전체 Tiled76 및 ordinary/shared 양 ABI proof로 **#16 aggregate도 완료했다**. 별도 runtime-09의 [depth x64](../build/local/p3-20261003/advanced-texture/runtime09-depth-x64-01/result.json)·[WoW64](../build/local/p3-20261003/advanced-texture/runtime09-depth-x86-01/result.json)는 각각 d16/d32 upload·clear와 MSAA draw·clear **8 case·API+Shader Validation PASS**, native compiler 확인·오류0이다. Runtime-08의 sample-count `2 != 4` 실패는 physical array shadow에 native MSAA query를 사용한 원인이었으며 descriptor의 실제 sample count·sample-zero dimensions 조회로 수정했다. Casting-volume 전체 proof와 shared native NULL guard의 Tiled 검증은 별도로 남는다. [재현](SMOKE-TEST.ko.md#advanced-texture와-depth-casting-focused-proof)·[실패와 수정 이력](IMPLEMENTATION-HISTORY.ko.md#새-p3-16-advanced-texture24--2026-10-03)을 따른다.
 
-| Slice | 새 suite | 상태 |
-|---|---|---|
-| SM | `sm6` | 완료·검증. 보고 SM **6.5** |
-| BINDLESS | `bindless` | 완료·검증 |
-| BARRIERS | `enhanced-barriers`, `render-passes` | 완료·검증 |
-| TILED | `tiled` | 완료·검증 |
-| LIBRARY | `pipeline-library` | 완료·검증 |
-| SHARING | `sharing` | 완료·검증 |
-| GSTS | `geometry`, `tessellation` | 완료·검증 |
+### 앞으로의 검증 원칙
 
-### P2-SM — Shader Model 6.x compiler
+모든 명령은 저장소 루트를 기준으로 [README](../README.md)의 build/staging 경로를 따른다. 새 output/install·복사 runtime·전용 fresh prefix·새 evidence 경로를 사용하고 기존 게임/live installation을 변경하지 않는다. Source/fixture/shader/runtime/compiler manifest와 실제 loaded backend·validation·오류·정확한 readback을 함께 기록한다. 제출 소유권·completion·retirement, CPU/GPU ordering, 처음 오류 우선순위와 negative path도 대상 계약에 포함한다. 관찰하지 않은 기대 acceptance는 PASS 표로 옮기지 않는다.
 
-- **구현 요약:** DXIL compiler는 SM 6.8까지 입력을 받는다(`SM50_MAX_DXIL_SHADER_MODEL=0x68`, 6.9 이상 거부). Wave/quad op는 32 lane 고정이며 `[WaveSize]`가 32를 허용하지 않으면 compile 오류다. PS helper lane은 `WaveOpsIncludeHelperLanes`가 없으면 wave op에서 제외하고 quad op에는 포함한다. int64(전 stage), 16-bit 연산·buffer·stage I/O, min precision, packed op, compute quad derivative·implicit LOD·`CalculateLOD`, barycentrics·`GetAttributeAtVertex`, `SV_Start*Location`, SM6.8 barrier를 구현했다. 64-bit raw/structured UAV atomic은 device 전역 65536-entry lock table로 **compute에서만** emulation한다. Graphics stage의 64-bit atomic, groupshared/typed 64-bit atomic, FP64는 compile 단계에서 거부한다. Wave shader PSO 실패의 원인은 접미사 없는 lane intrinsic이 Metal compiler service를 중단시킨 것이었다(`.i32` 표기로 수정). `TotalLaneCount`는 IOKit GPU core 수×128이며 WineMetal call 256에서 읽는다.
-- **보고 cap:** `HighestShaderModel` **6.5**(`kOwnedReportedShaderModel = D3D_SHADER_MODEL_6_5`, `src/d3d12/d3d12_device.hpp:151`). `sm6` gate는 `OWNED_D3D12_SM6_CAPS shader_model=0x65`를 요구한다(`scripts/test-owned-graphics.py:976`). SM6.1–6.5 요구사항을 DXC wiki·DXIL.rst·DirectX-Specs 기준으로 대조했다. Cap으로 gate되지 않는 요구사항은 모두 구현·GPU 검증했다(VS wave는 `vs_wave`). 보고하지 않는 cap-gated 기능은 PSO 생성에서 깨끗하게 실패한다. GS/HS/DS DXIL은 P2-GSTS에서 검증했다. **SM 6.6은 계속 막혀 있다:** 모든 stage의 64-bit atomic을 요구하는데, fragment stage의 lock emulation은 Apple GPU를 hang시킨다(아래 증거). WaveOps TRUE(lane 32/32, TotalLaneCount 2560), Int64ShaderOps TRUE, Barycentrics TRUE, Native16Bit TRUE. DoublePrecision·AtomicInt64OnTyped/GroupShared/DescriptorHeap·OPTIONS9·OPTIONS11 FALSE, WaveMMA·ViewInstancing NOT_SUPPORTED, MinPrecision 16_BIT 유지.
-- **6.5 상향 때 추가한 구현:**
-  - `SV_ViewID`(6.1), P2 당시: ViewInstancingTier가 NOT_SUPPORTED이므로 규격대로 0을 읽는다(`dxil_signature.cpp`).
-  - fp32 denorm mode(6.2): `any`·`ftz`는 native다. M5 Pro는 모든 Metal 옵션(`-fdenorms`, `-fno-fast-math`, `-fmetal-math-mode=safe`, LLVM `denormal-fp-math=ieee`)에서 fp32 denormal 입력과 출력을 flush한다(`smaudit/evidence-denorm-native`). 그래서 `preserve`를 exact software 경로로 구현했다. 이전에는 이 속성을 무시해 flush했다. add/sub/mul/div는 `src/airconv/shaders/air_denorm.metal`의 exact helper로, fcmp는 IEEE bit 순서 비교로, FMad는 fuse하지 않은 exact mul+add로 바꾼다. dot과 float wave Sum/Product도 exact helper로 계산한다(`dxil_operations.cpp`). Groupshared·UAV·SV_Target store는 native로도 denormal bit를 보존한다. DXIL.rst가 flush를 허용하는 op(FMin/FMax, sqrt/rsqrt, round*, frc, log/exp/trig)는 `preserve`에서도 native로 flush한다. fp16 denormal은 native로 보존된다.
-  - P2 당시 보고하지 않는 cap-gated 기능을 거부했다. SV_ShadingRate(VRS Tier 2), RayQuery(RaytracingTier 1.1), sampler feedback은 `dxil_metadata.cpp:924-943`에서 명시적 오류 메시지와 함께 `E_FAIL`을 반환한다. 이전에 SV_ShadingRate는 compile에 성공했고, 나머지 둘은 무관한 내부 오류로 실패했다. View instancing(count 2)과 MS subobject는 pipeline stream 단계에서 `E_INVALIDARG`를 반환한다.
-- **GPU 증거:** `smaudit/sm6-02`(API/Shader Validation): 26 CASE_PASS, stress 20/20. 새 case는 `sv_viewid`(VS·PS·varying 0), `cap_rejected`(`ps_shadingrate`·`cs_rayquery`·`ps_feedback`·`ps_viewid_vi`·`ms_mesh`), `denorm_any/ftz/preserve`다. `denorm_preserve`는 HLK Denorm*Preserve vector 13종과 denormal·tiny·special 혼합 입력을 쓰는 64 lane case이며, DAZ/FTZ를 끈 host SSE와 bit-exact로 일치한다. Native prototype의 add/sub/mul/div 4,194,304 random pair에서도 mismatch는 0이었다. Case 추가 run은 `sm65cases/run-01`(23 case, Metal validation 오류 0)이다. 회귀: `smaudit/{dxil,dxil-texture}-01`. 이 run들은 6.5 상향 전 binary라 `shader_model=0x51`을 출력한다. `0x65` 보고는 최종 통합 run에서 확인한다(아래 P2 통합). 이전 증거: `sm/sm6-02`·`sm/sm6-03-novalidation`(20 case), `sm/sm6-04`, CS 64-bit atomic stress(65536 thread×1/16 target 20/20 exact), 회귀 `sm/{dxil,dxil-ia,dxil-texture,raster-order,pipeline-statistics,capabilities}-02`.
-- **제약 증거:** `sm/evidence-fragment-lock`. Native MSL fragment spin lock은 validation 없이 200회 중 83회만 완료되고 나머지는 GPU hang/victim이었다. `MTL_SHADER_VALIDATION=1`에서는 항상 hang된다. 같은 lock loop는 compute에서 오류가 없다. Apple native u64 min/max는 AIR 2.9에서만 compile되고 반환값이 없다. Typed/threadgroup i64 atomic은 Metal PSO 생성에서 충돌한다. FP64 ALU는 없다. `texture2d_ms`는 read-only라 `TextureStoreSample`(op 225)은 거부한다.
-- **미검증:** `SampleCmpLevel/Bias/Grad`·`GatherRaw`·64-bit gather(구현만 있음), sampler MinLOD/MaxLOD clamp를 반영한 `CalculateLOD`(shader에서 보이지 않음), compute sampling의 sampler LOD bias(0만 검증). Denorm `preserve`는 stage와 무관하게 적용되지만 GPU case는 CS뿐이다(VS/PS/GS/HS/DS 미검증). `preserve`에서 f16 denormal 범위 근처의 f32→f16 변환, `preserve` shader의 성능 비용(fp32 연산마다 helper 호출, 정규 operand는 fast path)도 미검증이다.
+## 문서 안내
 
-### P2-BINDLESS — Resource Binding Tier 3·SM 6.6 dynamic resources·RS 1.2
+- **현재 상태와 backlog:** 이 문서. 위의 stable section anchors를 다른 문서의 상태 링크로 사용한다.
+- **Build·실행 입구:** [루트 README](../README.md). Toolchain/path 예시는 여기의 현재 안내를 우선한다.
+- **상세 역사 증거·계약:** [IMPLEMENTATION-HISTORY.ko.md](IMPLEMENTATION-HISTORY.ko.md). 기존 CORE의 P0 numbered sections, P1/P2/P3·P4 상세 anchors는 같은 heading 이름으로 이 파일에 이동했다.
+- **Dated review/disposition:** [D3D12 Translation Review2026-10-01](../docs/D3D12-TRANSLATION-REVIEW-2026-10-01.md), 특히 [11 finding 처리](../docs/D3D12-TRANSLATION-REVIEW-2026-10-01.md#implementation-dispositions--2026-10-02). 최초 정적 finding과 후속 수정/실행을 구분한다.
+- **ARM64 architecture·외부 입력·acceptance:** [ARM64-FEX-IMPLEMENTATION.md](../docs/ARM64-FEX-IMPLEMENTATION.md). Plugin/DLL build의 완료와 guest gate의 미완료를 구분한다.
 
-- **구현 요약:** 기존 descriptor heap 배치(shader-visible heap당 Metal buffer 하나, 32-byte descriptor)를 유지하므로 view 수는 heap 크기(1,000,000 view·2048 sampler)로만 제한된다. `CBV_SRV_UAV/SAMPLER_HEAP_DIRECTLY_INDEXED` root signature에는 heap base·count 4개 qword를 root argument 뒤에 붙이고, `SetDescriptorHeaps`와 `Set*RootSignature` 양쪽에서 채운다. `createHandleFromHeap`(218)의 view 형태는 `annotateHandle`(216)의 ResourceProperties에서 얻는다. Lane별로 descriptor를 읽으므로 `NonUniformResourceIndex`에 waterfall이 필요 없다. Heap 범위 밖 index나 heap 미바인딩은 내부 null descriptor로 처리해 read 0, write/atomic 무효이며 GPU가 heap 밖을 읽지 않는다. Null texture/sampler handle은 모든 texture op 전에 guard한다. RS 1.2는 `D3D12_STATIC_SAMPLER_DESC1`(flags)을 serialize/deserialize·버전 변환하고 non-normalized 좌표·UINT border 규칙을 검사한다. Heap-indexed ROV는 heap argument-buffer member에 ROG 속성을 붙여 구현했다.
-- **보고 cap:** ResourceBindingTier **3**, ResourceHeapTier 2(변경 없음), ROOT_SIGNATURE HighestVersion **1.2**.
-- **GPU 증거:** `bindless/bindless-03`(7 case), heap ROV를 추가한 `bindless/bindless-10`(8 case, `OWNED_D3D12_BINDLESS_ROV triangles=512 pixels=256 expected=0xc71c711c structured_mismatches=0 typed_mismatches=0 texture_mismatches=0`). Heap index 999,999 UAV, 80개 divergent raw UAV, divergent CBV/sampler, SM5.1 unbounded DXBC(space 0–3), heap 전환, 범위 밖 read 0, non-normalized sampler·`OPAQUE_{BLACK,WHITE}_UINT`를 포함한다. ROG 속성만 제거한 음성 대조는 validation 없이 256/256/256 mismatch였다. Metal GPU validation은 fragment를 직렬화해 race를 숨기므로 validation 실행만으로는 ordering을 증명하지 못한다. 회귀: `bindless/reg-{dxil-02,raster-order-03,dxil-texture-03}`, `bindless/reg-{core-contracts,bundles,pipeline-cache,execution-safety}-01`.
-- **제약/미검증:** Heap ROV를 쓰는 PS는 모든 resource-heap 접근이 정렬되어 성능 비용이 있을 수 있다. MSAA·sample-frequency PS의 heap ROV와 Texture1D/2DArray/3D heap ROV는 GPU 미검증이다(Texture2D·typed·structured만 검증). Shader/root flag 불일치는 compile 실패로 `E_FAIL`을 반환한다(D3D12는 실패만 요구). Heap-indexed acceleration structure는 구현만 있고 GPU 미검증이다. 기록되지 않은 heap descriptor는 0으로 읽힌다(규격상 값 미정).
-
-### P2-BARRIERS — Enhanced barriers·Device6–14·CommandList5–9·render pass·GPU upload heap
-
-- **구현 요약:** `ID3D12GraphicsCommandList7::Barrier`는 subresource별 layout을 submission·queue를 넘어 추적한다. Legacy와 enhanced 모델은 COMMON으로만 전환한다. 규격 위반 barrier는 `Close`가 `E_INVALIDARG`, 실행 시 layout 불일치는 device removal이다. 순서를 요구하는 barrier는 현재 encoder를 끝내 Metal fence로 ordering·visibility를 만든다. Device10은 initial layout과 castable format 목록으로 resource를 만들고 목록의 format view를 허용한다. Front/back stencil ref·per-face mask, dynamic depth bias, dynamic strip cut을 구현했다(새 WineMetal render command, unix-call index 없음). Device13 `OpenExistingHeapFromAddress1`은 SHARING의 host-memory heap으로, Device14 `CreateRootSignatureFromSubobjectInLibrary`는 DXIL RDAT subobject에서 root signature를 만든다. `BeginRenderPass/EndRenderPass`는 render-pass 규격의 fallback(일반 bind·clear·resolve로 변환)으로 구현했다. Suspend/resume과 local-compute pass를 지원하고 pass 안의 금지 API·barrier는 기록 오류다. `D3D12_HEAP_TYPE_GPU_UPLOAD`는 heap·committed·placed resource에 허용한다. Shared storage·write-combined이며, shared/display/RT/DS flag는 거부한다. `CreateSampler2`의 UINT border는 Metal 고정 border 세 가지(0000/0001/1111)만 허용한다.
-- **보고 cap:** EnhancedBarriersSupported **TRUE**, IndependentFrontAndBackStencilRefMaskSupported·DynamicIndexBufferStripCutSupported·DynamicDepthBiasSupported TRUE, RenderPassesTier **TIER_0**, RenderPassesValid **TRUE**, GPUUploadHeapSupported **TRUE**. RelaxedFormatCastingSupported **FALSE**, TriangleFanSupported FALSE, OPTIONS13·OPTIONS17 FALSE. `ID3D12GraphicsCommandList10`(work graphs)은 노출하지 않으며 P3다.
-- **GPU 증거:** `barriers/enhanced-barriers-13`(19 case, `INVALID_BARRIERS_PASS rejected=10`, `STENCIL front=11 back=f2`, `DEPTH_BIAS … dynamic=0.251220703 reset=0.251220703 override=0.25`). UAV→UAV/SRV/COPY 4096 word, split barrier, castable RGBA8→R32_UINT의 정확한 bit, subresource 범위 layout, cross-queue COMMON handoff와 누락 시 removal, Device13 host memory GPU write→CPU read, Device14 library root signature dispatch를 포함한다. `barriers/render-passes-02`(8 case): CLEAR→PRESERVE `ff402080`, DISCARD+depth CLEAR `color=ffff0000 depth=0.125`, 4× resolve average `0x50`·min 0.125·max 0.5, suspend/resume `ff204010`, 10개 잘못된 사용 거부, GPU upload committed·placed buffer 1024 word와 `WriteToSubresource` texture, UINT border 3종. 회귀: `barriers/reg-{copy-resolve,core-contracts,msaa-lines,multisample-capabilities,resources}-03`, `barriers/reg-{execution-safety,multiqueue,so-format-support,stream-output,present-queues}-02`.
-- **제약 증거:** RelaxedFormatCasting은 BC→비압축 view를 요구하지만, M5 Pro의 `newTextureViewWithPixelFormat:`은 BC1→RG32Uint, BC1→BC4, BC3→BC7을 'not compatible', Depth32Float↔R32Float를 'not castable'로 거부한다. Castable list는 Metal이 허용하는 쌍만 받고 나머지는 생성 시 거부한다. Render pass resolve는 기존 `ResolveSubresourceRegion` draw 경로를 사용하므로 destination에 `ALLOW_RENDER_TARGET`이 필요하다.
-- **미검증:** Bundle 안의 enhanced barrier 거부(fixture 없음), queue 전용 layout(DIRECT_QUEUE_*/COMPUTE_QUEUE_*, GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE)의 개별 GPU 실행, castable list를 준 `GetResourceAllocationInfo3`. `CreateReservedResource2`의 GPU 경로는 TILED 범위다. VRS·mesh·sampler feedback·protected session·shader cache session·`AddToStateObject`는 오류를 반환하고 cap을 보고하지 않는다.
-
-### P2-TILED — Reserved/tiled resource
-
-- **구현 요약:** D3D12 64KB tile 하나를 Metal placement-sparse page(64KB) 하나에 대응한다. 모든 D3D12 heap은 placement heap이다. Reserved buffer는 실제 GPU VA를 가진다. Reserved texture는 2D/2D array, single-sample, `64KB_UNDEFINED_SWIZZLE`이며 format별로 Metal `sparseTileSize`가 D3D 표준 shape와 같을 때만 허용한다. Packed mip은 Metal sparse tail로 대응한다. `UpdateTileMappings/CopyTileMappings`는 queue FIFO에서 이전 submission 완료를 기다린 뒤(NO_HAZARD 제외) device 전역 MTL4 queue로 적용하고, shared event를 기다린다(10 s 초과 시 DEVICE_HUNG). 잘못된 호출은 mapping을 바꾸지 않고 버린다. Residency status는 texture에서 AIR residency bit, buffer에서 queue 순서로 기록하는 tile별 byte 배열을 사용한다. Root SRV/UAV는 root signature 뒤의 status qword, RGB32 emulated typed SRV는 descriptor q0로 status를 전달한다. SM5 DXBC의 모든 `*_FEEDBACK` opcode와 `check_access_fully_mapped`, DXIL `CheckAccessFullyMapped`를 lowering한다. Min/max reduction sampler를 추가했다. FXC 입력으로 발견한 `CHECK_ACCESS_FULLY_MAPPED` immediate 타입 오류도 수정했다.
-- **보고 cap:** TiledResourcesTier **2**(`supportsPlacementSparse`일 때), `FORMAT_SUPPORT2_TILED`는 reserved 경로가 허용하는 format만 보고한다. **Tier 3·Tier 4와 SRVOnlyTiledResourceTier3는 보고하지 않는다.**
-- **GPU 증거:** `tiled/final-tiled`(25 case, `OWNED_D3D12_TILED_CAPS tier=2 srv_only_tier3=0 va_bits_per_resource=48 rgba8_tiled=1`, `OWNED_D3D12_TILED_PASS cases=25 tier=2`). 두 heap mapping, NULL tile read 0·write 무효, REUSE_SINGLE_TILE, CopyTileMappings, ExecuteCommandLists 경계의 mapping 갱신, cross-queue 순서, Evict/MakeResident, `GetResourceTiling`(512²×10 RGBA8: standard 3·packed 7 mip), packed tail mapping, texture·buffer·root view·RGB32 residency status, FXC로 고정한 SM5 feedback 16 opcode(cs·ps), CopyTiles 왕복과 unmapped 0, min/max reduction을 포함한다. 회귀: `tiled/final-{bindless,raytracing}`, `tiled/reg-{bindless,bundles,capabilities,dxil-texture,predication-indirect,raytracing,resources}-02`, `tiled/reg-dxil-03`.
-- **제약:** Metal 3D sparse tile은 64KB에서 128×128×1(RGBA8)이고 D3D12 표준 3D tile은 32×32×16이다. Volume tile을 독립적으로 mapping할 수 없으므로 3D reserved texture는 `E_INVALIDARG`이고 Tier 3를 보고하지 않는다. Packed mip이 있는 array는 거부하므로 Tier 4를 보고하지 않는다. MSAA·1D reserved texture도 `E_INVALIDARG`다. Local root signature(DXR shader record)의 root view와 ExecuteIndirect 인수로 설정한 root view는 status qword가 없어 항상 mapped로 보고한다.
-- **비용:** MTL4 mapping 갱신은 enqueue 시점에 적용되고 MTL4 wait/barrier를 무시한다. 그래서 NO_HAZARD가 아닌 갱신마다 queue worker가 이전 submission 완료까지 직렬화된다. 같은 heap page를 공유하는 sparse tile은 command buffer 경계나 `MTLSharedEvent` signal+wait에서만 coherent하다. MTLFence·memoryBarrier·일반 MTLEvent로는 부족하다. 그래서 reserved resource가 하나라도 살아 있으면 모든 ordering barrier와 command-list 시작에 alias flush(shared event signal+wait)를 추가한다. Reserved resource가 없으면 비용이 없다.
-- **미검증:** 10 s DEVICE_HUNG timeout 경로. RGBA8/R16F/R32F 외 reserved texture format(`sparseTileSize` 일치로만 판정). 32-bit에서는 CPU-visible heap의 `UpdateTileMappings`를 설계상 거부한다.
-
-### P2-LIBRARY — `ID3D12PipelineLibrary/1`
-
-- **구현 요약:** 이름→entry table(`shared_mutex`, 삽입 순서 유지)에 PSO 종류, SHA1 `PipelineCacheKey`, 기존 단일 PSO cache blob(DXMTPSO v3) 사본과 생성된 PSO를 보관한다. Load는 desc에서 key를 다시 계산해 이름·종류·key가 다르면 `E_INVALIDARG`이고, 일치하면 `CachedPSO`로 PSO를 한 번만 생성해 같은 객체를 반환한다. Container `DXMTPLB\0` v1(104-byte header: adapter registryID, compiler UUID·driver build, SHA1 digest)을 검증한다. Magic·크기·digest·경계 오류는 `E_INVALIDARG`, version·identity 불일치는 `D3D12_ERROR_DRIVER_VERSION_MISMATCH`, adapter 불일치는 `D3D12_ERROR_ADAPTER_NOT_FOUND`다. Identity를 digest보다 먼저 검사한다. 생성 시 blob을 복사하므로 앱이 blob을 바로 해제해도 된다. `ID3D12Device2::CreatePipelineState`와 `LoadPipeline`이 같은 stream parser를 쓴다. 이전에 경고 후 무시하던 depth bounds·view instancing과 범위 밖 subobject type(UB)을 이제 `E_INVALIDARG`로 거부한다. Graphics key는 GS/HS/DS bytecode도 포함한다.
-- **DXMTPLB는 native Metal binary archive가 아니다.** Load는 owned shader compile을 건너뛰지만 Metal library/function/PSO 생성은 수행한다.
-- **보고 cap:** SHADER_CACHE `SINGLE_PSO | LIBRARY`(AUTOMATIC_* 없음), SERIALIZATION HeapSerializationTier **TIER_0**.
-- **GPU 증거:** `library/pipeline-library-01`: 9개 CASE_PASS, 13개 GPU line(stored·deserialized·child×4 PSO 종류와 thread entry), `THREADS threads=8 rounds=24 entries=12`, `CHILD_PASS`. 자식 process log는 restore 4·cold 0으로 compile 생략을 확인한다. 회귀: `library/{pipeline-cache,bundles,core-contracts,dxil}-01`.
-- **제약:** Depth bounds test(Metal에 없음), narrow quadrilateral line, view instancing, AS/MS bytecode(P3)는 `E_INVALIDARG`. Fractional depth bias와 per-face stencil mask의 거부는 BARRIERS가 해당 cap을 구현하며 제거했다. `OpenExistingHeapFromAddress/FileMapping` 기반 heap serialization은 tier 0이다.
-- **미검증:** 실제 다른 GPU·driver의 blob(header 변조로만 시뮬레이션), library에 저장한 GS/HS/DS PSO. Graphics key가 GS/HS/DS bytecode를 포함하므로 GSTS 완료로 경로는 열렸지만, `pipeline-library` fixture에는 GS/HS/DS를 쓰는 case가 없다.
-
-### P2-SHARING — Shared heap·resource·fence
-
-- **구현 요약:** 공유 객체마다 Wine section `Local\dxmt.share.<pid>.<128-bit token>`(64 KiB header + payload)을 만들고 `CreateSharedHandle`은 그 section의 NT handle을 `DuplicateHandle`로 반환한다. `CloseHandle`·복제·상속은 Wine 기본 동작이다. Open 시 object type·이름 prefix·magic/version/kind/payload 경계를 검사하고 이름의 token과 header token을 대조해 위조 header를 거부한다. Heap·committed buffer는 section payload 위의 no-copy buffer다. IOSurface texture와 `MTLSharedEvent`는 process별 mach receive right(`bootstrap_register2`)로 전달하고, Metal identity(IOSurface ID·`globalTraceObjectID`)를 header와 대조한다. D3D name은 per-user salt의 SHA-256 link section으로 대응하며 중복은 `DXGI_ERROR_NAME_ALREADY_EXISTS`다. `CreateHeapFromHostMemory`/`FromFileMapping`(Device3, Device13 경유)도 구현했다.
-- **Fence rewind 모델:** `MTLSharedEvent`는 되돌릴 수 없으므로(`supportsRollback=0`) event에는 단조 증가하는 native token만 싣는다. Fence section의 `SharedFenceTimeline`은 atomic `next_token`과 1024-entry `{token, logical}` ring이다. 모든 Signal은 token을 예약하고 logical 값을 기록한 뒤 event를 그 token으로 올린다. 관찰자는 token으로 ring을 읽어 기존 rewind-aware 경로에 logical 값을 공개하므로 `Signal(lower)`가 모든 process에서 일관되게 rewind된다. Ring이 가득 차면 CPU caller(CPU Signal, queue submission worker)만 backpressure로 대기하고 GPU는 기다리지 않는다. Queue Wait는 관찰한 native token을 GPU에서 기다린다.
-- **보고 cap:** CrossAdapterRowMajorTextureSupported **TRUE**, CrossNodeSharingTier NOT_SUPPORTED.
-- **GPU 증거(64-bit):** `integrate/run-02/sharing`(18 case, `OWNED_D3D12_SHARING_PASS cases=18`)와 WoW64 staging runtime의 64-bit fixture `sharing/sharing-64-w64-01`. Same-process A↔B buffer/texture/fence 4096 word readback·writeback, CPU Signal→GPU Wait, shared heap placed buffer, cross-adapter heap의 ROW_MAJOR texture, named open·중복·누락, 위조 token 등 오류, host memory·file mapping heap, `CreateProcess` 자식과 양방향 data·GPU fence 순서, 핸들 없이 이름으로만 여는 무관한 process(rewind 값 40), fence rewind, 3000 Signal stress를 포함한다. 실행 뒤 누수된 `dxmt.share.*` bootstrap 이름은 0이었다. 이전 회귀: `sharing/{execution-safety,fence-events,multiqueue,residency,resources,temporal}-02`.
-- **제약:** IOSurface 공유 texture는 Metal에서 private storage여야 하므로 ROW_MAJOR가 아닌 texture는 shared heap에 둘 수 없다(`E_INVALIDARG`). Host memory heap은 주소·크기가 16 KiB 정렬이어야 하고, Rosetta/Wine의 4 KiB 정렬 할당은 거부한다. `bootstrap_register2(name, NULL)`은 등록을 해제하지 않으므로 receive right 파괴로 해제한다. 공유 fence에서 현재 값보다 낮은 native event 값을 쓰지 않는다(rewind는 logical ring으로 처리).
-- **미구현/미검증:** **D3D11 interop(`OpenSharedResource1`)은 하지 않았다.** D3D11은 D3DKMT escape·bootstrap 이름 방식을 쓰므로 D3D11이 section 형식을 해석해야 하고, 이는 최소 공유 변경을 넘는다. 32↔64-bit 혼합 cross-process는 실행하지 않았다(fixed-width 형식이라 동작할 것으로 추정 `[INFERENCE]`). Ring 1024를 넘는 동시 publication은 backpressure로 막히며, 3000 Signal stress 이상의 경합은 미검증이다.
-- **공유 `src/dxmt` 변경(D3D11 동작 동일):** `Fence`의 shared timeline 경로(shared event가 있을 때만 활성), `Texture::allocate(flags, placed_memory)`, `Texture::import` 실패 시 assert 대신 nullptr 반환(죽은 port가 debug build를 abort하던 버그 수정).
-
-### P2-GSTS — GS/HS/DS
-
-- **구현 요약:** D3D12 PSO의 VS+GS, VS+HS+DS, VS+HS+DS+GS를 DXBC와 DXIL 모두에서 Metal mesh pipeline으로 실행한다(이전에는 `E_NOTIMPL`). VS+GS는 VS object→GS mesh, VS+HS+DS는 VS+HS object→DS mesh이며 D3D11과 같은 airconv 다단계 entry를 쓴다. DXIL은 두 번째 ABI를 만들지 않는다. `SM50ShaderInternal::body_emitter` hook이 DXBC control flow 대신 DXIL 본문을 이식하고, 네 DXBC converter는 그대로 함수를 만든다(`src/airconv/dxil_pipeline.cpp`, HS/DS는 `dxil_pipeline_ts.cpp`).
-  - **TS+GS(VS+HS+DS+GS):** 2-pass capture/compaction/GS mesh 경로다(설계: `MeshPipelineKind::TessellationGeometry`, `src/d3d12/d3d12_command_list.cpp` `RecordTessellationGeometryDraw`). Pass 1은 raster를 끈 VS+HS object와 capture mode DS mesh(`SM50_SHADER_D3D12_TESS_CAPTURE`)다. 각 workload가 DS vertex(R개 int4)와 index를 scratch slot `s = (instance*patches + patch)*W + rank`에 쓴다. Compaction compute kernel(`dxmt_tess_capture_clear`, `dxmt_tess_capture_compact`)은 slot 순서, 즉 D3D primitive 순서로 prefix scan해 flat primitive list와 object grid를 만든다. Pass 2는 capture를 읽는 object(`dsgs_main`, `SM50_SHADER_GS_TESSELLATION_INPUT`)와 DS를 첫 stage로 쓰는 GS mesh이며 `DrawMeshThreadgroupsIndirect`로 그린다. `SV_PrimitiveID`는 DS patch id다. Scratch는 CPU가 알려진 patch·instance 수와 PSO 생성 시 DS layout(W/V/P/R/K)으로 최악 크기를 계산하므로 capture write가 넘칠 수 없다. `maxBufferLength`나 UINT32 slot 범위를 넘는 draw는 `E_OUTOFMEMORY`다.
-  - **Statistics:** 각 counter를 정확히 한 번 센다. IA·VS·HS는 pass 1 object, DS는 pass 1 mesh, GSInv·GSPrim·C는 pass 2 GS mesh에서 센다.
-  - **PSG1 수정:** DXC는 patch-constant signature를 PSG1 chunk에 저장한다. HS/DS는 PCSG만 읽어 system value가 없는 metadata를 썼고, tess factor가 모두 0이 되어 모든 patch가 cull됐다(DSInvocations 0). `src/airconv/dxil_metadata.cpp:895-902`에서 PSG1을 먼저 읽고 PCSG는 fallback으로 둔다.
-  - **Signature 번호:** DXIL signature chunk는 register row마다 entry가 있지만 `dx.op` element id는 element 단위다. 그래서 GS/HS/DS lowering은 entry metadata의 element 목록으로 id를 해석한다.
-- **GPU 증거(API/Shader Validation):**
-  - `dxilgsts/geometry-04`: `OWNED_D3D12_GEOMETRY_MATRIX_PASS shader=dxbc cases=41`, `shader=dxil cases=41`. Point→quad amplification, cut이 있는 strip, line/lineadj/triadj list·strip 입력, GS instancing·`SV_GSInstanceID`, `SV_PrimitiveID`, line/point SO topology, indexed·indirect draw, pipeline statistics, stream 0 SO capture, MSAA를 포함한다.
-  - `dxilgsts/tessellation-04`: `OWNED_D3D12_TESSELLATION_MATRIX_PASS shader=dxbc cases=146`, `shader=dxil cases=146`, `OWNED_D3D12_TESSELLATION_PASS`. 각 경로의 146 case에 TS+GS 10 case가 들어 있다: tri/quad domain, integer/fractional_odd, SO stream 0, 1×/4× MSAA, 출력 불일치 `E_INVALIDARG`, indirect `E_NOTIMPL`. Oracle은 DS domain point를 tessellator oracle과, 이미지(1×와 resolve한 4×)를 GS 없는 같은 HS/DS PSO와 비교한다. Statistics와 SO 순서·내용(patch 순서, 1e-4 안에서 patch 면적 tiling)도 검사한다.
-  - DXBC 회귀: `gsts/reg-{stream-output,pipeline-statistics,msaa-lines,multisample-capabilities,indexed-restart,bundles,predication-indirect,raster-order,dxil-texture}-40`, `gsts/reg-geometry-42`. DXIL 회귀: `dxilgsts/reg-{dxil,dxil-ia,dxil-texture,sm6}-04`.
-- **공유 D3D11 변경:** `src/d3d11/d3d11_context_impl.cpp`의 `TessellationDraw`·`TessellationDrawIndexed`·`GeometryDraw`·`GeometryDrawIndexed`에 `MeshInstancesPerDraw`/`MeshDrawChunks`를 추가했다(`git diff`: 128줄 추가, 94줄 삭제). 이전에는 Apple7 미만 GPU(`maxObjectThreadgroups()` 1024, `src/dxmt/dxmt_device.cpp:45-48`)에서 object-threadgroup grid가 1024를 넘는 draw를 `WARN`만 남기고 그리지 않았다. 이제 instance 단위로 나눠 여러 mesh draw를 내보낸다. Chunk마다 draw argument block이 따로 있고 `StartInstance`가 chunk만큼 증가하므로 `SV_InstanceID`는 정확하다. Instance 하나가 한도를 넘을 때만 이전처럼 생략한다. 필요한 이유: GSTS 과제가 공유 mesh 경로의 이 silent drop 수정을 요구했다. D3D12는 자체 command list에서 mesh draw를 인코딩하고 Apple7+에서 한도가 없으므로(`d3d12_command_list.cpp`의 `max_threadgroups`) 공유 draw 경로의 사용자는 D3D11뿐이다. 그래서 D3D11 파일만 최소 범위로 바꿨다. **D3D11 baseline 통과:** `gsts/d3d11-40/baseline{,-packed}.stdout.log`에서 두 실행 모두 rc=0이다. `D3D11_BASELINE_DEVICE`, `CLEAR3D_UINT/FLOAT_PASS`, `DXBC_COMPUTE_LOAD_STORE_PASS`, `DXBC_SAMPLE_PASS`, `WINDOWED_PRESENT_PASS`를 출력했다.
-- **제약:**
-  - **P2 당시 제약(현재 후속 수정):** TS+GS PSO의 `ExecuteIndirect`는 `E_NOTIMPL`이었다. Capture scratch는 overflow가 불가능하도록 encode 전에 patch 수 상한으로 크기를 정해야 한다. Indirect vertex·instance 수는 GPU 값이고 D3D12는 임의 uint32를 허용하므로 CPU가 아는 상한이 없다. 유한한 사전 할당으로는 overflow를 막을 수 없고, 미리 기록한 Metal command stream은 mesh pass buffer를 GPU에서 할당할 수 없다.
-  - **P2 당시 제약(현재 후속 수정):** MSAA mesh draw 위의 statistics는 `E_NOTIMPL`이었다(native MSAA가 PSInvocations를 과다 호출).
-  - **P2 당시 제약(현재 후속 수정):** GS SO는 stream 0만 지원한다. Stream 1–3은 `E_NOTIMPL`이다(TS+GS와 DXIL GS도 같은 규칙). GS 없는 VS+HS+DS PSO의 SO는 `E_NOTIMPL`이다(`src/d3d12/d3d12_pipeline_graphics.cpp:1179-1181`).
-  - TS+GS에서 GS 입력 primitive는 tessellator 출력(point/line/triangle)과 같아야 하며, 다르면 `E_INVALIDARG`다.
-- **P2 당시 미검증:** isoline/point 출력을 line/point GS로 받는 TS+GS(ABI는 K=2/1을 지원하지만 fixture는 triangle만 다룬다). Indexed·instanced·predicated TS+GS(코드 경로는 있지만 fixture case가 없다). D3D11 >1024 분할의 Apple7 미만 하드웨어 실행(M5에서는 한도가 없어 시험할 수 없다). DXIL GS의 `SV_ClipDistance/CullDistance`·`SV_RenderTargetArrayIndex/ViewportArrayIndex`(compile만 확인). DXIL GS stream 1–3 거부 실행. 한 PSO에서 DXBC stage와 DXIL stage를 섞는 GS/HS/DS 조합. 이후 GS/TS+GS indirect·stream 1–3·DS SO의 검증 범위는 P3 절에 별도로 기록한다.
-
-### P2 통합·WoW64 결과
-
-- **최종 64-bit 통합:**
-  - `integrate/run-03/summary.tsv`(52 suite, `dxil-static-sampler`는 fixture 없음으로 제외): 51개 통과. `tessellation`만 실패했는데, `runtime-03`이 마지막 DXIL 수정(PSG1, TS+GS DXIL routing) 전에 staging됐기 때문이다.
-  - `integrate/run-04/summary.tsv`: `tessellation`, `geometry`, `dxil`, `sm6`을 `runtime-04`에서 다시 실행해 모두 통과했다(validation 오류 0, api-and-shader).
-  - SM 6.5 보고를 포함한 `runtime-final`의 최종 전체 실행(`integrate/run-final/summary.tsv`): **52/52 suite 통과**, 전부 validation 오류 0(api-and-shader). `sm6`·`capabilities`는 `shader_model=0x65`·`highest=0x65`를 출력한다. CPU 검증 `test-owned-graphics-{build,staging,diagnostics}.py`와 `test-owned-ngx-frontend.py`도 통과했다.
-- **이전 64-bit 통합:** `integrate/run-01/summary.tsv`는 51개 suite 중 48개 통과, 3개 실패였다(`fullscreen`, `dxil-static-sampler`는 fixture 없음으로 제외). 실패 3개 중 2개는 새로 보고한 cap에 대한 오래된 fixture 기대값이었다. `pipeline-library`는 `independent_stencil_masks`·`fractional_depth_bias`에 `E_INVALIDARG`를 기대했으므로 이제 `S_OK`를 기대한다. `enhanced-barriers`는 `capabilities` 단계에서 실패했다(run-01 fixture binary가 `GPUUploadHeapSupported=1` 기대값으로 source를 갱신하기 전에 빌드됐다. binary·source 시각 비교에 따른 추정 `[INFERENCE]`). 나머지 하나는 실제 결함이었다. `ValidateHeapProperties`가 GPU_UPLOAD case에서 DEFAULT로 fall-through해 shared DEFAULT heap을 거부했다(`CreateCommittedResource shared buffer hr=0x80070057`). `src/d3d12/d3d12_resource_helper.cpp`에서 수정했다. 세 suite는 `integrate/run-02/summary.tsv`에서 통과했다.
-- **WoW64(32-bit), 최종 tree:** `wow64/summary-02.tsv`에서 PE32 suite 17/17이 통과했다. 대상은 geometry, tessellation, stream-output, indexed-restart, so-format-support, resources, smoke, sharing, tiled, enhanced-barriers, render-passes, pipeline-library, bindless, sm6, fence-events, multiqueue, dxil이다. 증거는 `wow64/final-<suite>`이며, `final-geometry`와 `final-tessellation`은 DXBC·DXIL 각각 41·146 case의 `MATRIX_PASS`를 출력한다. 이 실행은 6.5 상향 전이라 `final-sm6`는 `shader_model=0x51`을 출력한다. 상향 뒤 32-bit `sm6`을 다시 실행한 `wow64/final-sm6-65`는 `shader_model=0x65`로 통과했다(validation 오류 0). 32-bit argument 변환은 `src/winemetal/unix/winemetal_unix.c`의 `SM50_SHADER_D3D12_TESS_CAPTURE`(layout_out pointer)·`SM50_SHADER_GS_TESSELLATION_INPUT` 경로다.
-- **WoW64 초기 실행과 수정:** `wow64/summary.tsv`의 PE32 fixture 14개 중 12개가 처음에 통과했고, 결함 두 개를 수정했다.
-  - `pipeline-library`: fixture가 i686에서 stream을 8 byte로 padding했다(fixture 결함). 재실행 `wow64/run-pipeline-library-02` 통과.
-  - `sharing`: `d3d12_buffer.cpp`의 dangling-else로 i386 build에서 fallback allocation chain이 무조건 실행되어, 모든 shared committed buffer가 새 private allocation으로 rename됐다. 할당 chain을 마지막 `else` 안으로 묶었다. `sharing/sharing-32-01`(18 case, 32↔32 cross-process 양방향, 이름으로 여는 무관한 32-bit process, 3000 Signal stress), `sharing/resources-32-01`, `sharing/fence-events-32-01` 통과.
-
-## 1. Resource·heap·view·메모리 계약
-
-주요 소스:
-
-- `src/d3d12/d3d12_resource_contract.hpp`
-- `src/d3d12/d3d12_resource_helper.cpp`
-- `src/d3d12/d3d12_device.hpp`, `d3d12_device.cpp`
-- `src/d3d12/d3d12_buffer.cpp`, `d3d12_texture.cpp`, `d3d12_heap.cpp`
-- `src/dxmt/dxmt_buffer.hpp`, `dxmt_buffer.cpp`
-
-구현 내용:
-
-- 크기·offset·alignment의 checked add/multiply/align/range 처리 및 DXGI format-family/copy 호환성 도우미.
-- Resource dimension·extent·sample·layout·alignment·heap state·node mask 검사. UPLOAD의 `GENERIC_READ`, READBACK의 `COPY_DEST` 계약 반영.
-- Optimized clear value의 flag·format 검사, 출력 객체를 요청하지 않는 validation-only 생성의 `S_FALSE` 경로.
-- Heap/placed resource의 크기·정렬·범위 검사. Native allocation 실패와 allocation 예외의 오류 전파.
-- CUSTOM heap의 CPU page property에 따른 Map 접근 정책.
-- SRV/UAV의 resource flag·format family·dimension·sample·subresource·plane·범위 검사.
-- Void view 생성 시 목적 descriptor를 먼저 비워 실패 후 이전 descriptor가 남지 않도록 처리. Typed native view를 생성 경로에서 materialize하고 실패를 내부 오류로 전달.
-- `GetCopyableFootprints`의 512-byte placement/256-byte row pitch, plane/subresource 및 표현 가능한 필드 폭 검사. 빈 범위·overflow 처리.
-- Allocation info의 빈 입력·null·overflow·native size/alignment 처리.
-
-### 64-bit buffer view
-
-Raw/structured buffer slice의 byte range를 64-bit로 유지한다. Typed view도 큰 `FirstElement`를 32-bit로 잘라 저장하지 않는다.
-
-- `BufferViewDescriptor`가 64-bit backing byte offset/length 및 writable 여부를 보유한다.
-- Native ranged texture-buffer view는 정렬된 offset에서 생성한다.
-- Shader metadata에는 정렬 때문에 생기는 작은 element bias만 남긴다.
-- View cache key에 range/writable을 포함한다.
-- Integer clear용 재해석 view도 원래 range와 alignment를 보존한다. Whole-buffer alias나 offset 이중 적용을 피한다.
-
-공유 코드 호출부도 함께 변경했다. `src/d3d11/d3d11_buffer.cpp`의 typed UAV와 `src/dxmt/dxmt_command_clear.hpp`의 alternate clear view는 writable을 명시한다. D3D10은 해당 D3D11 구현 경로를 사용한다. 이 공유 프런트엔드 변경 역시 재빌드·실행하지 않았다.
-
-## 2. Buffer render-target view
-
-기존 buffer RTV의 `E_NOTIMPL` 경로 대신 descriptor·render attachment·clear·copy coherence를 연결했다.
-
-추가 관련 소스:
-
-- `src/d3d12/d3d12_descriptor_heap.hpp`
-- `src/d3d12/d3d12_command_encoder.hpp`
-- `src/d3d12/d3d12_command_list.cpp`, `d3d12_command_queue.cpp`
-- `src/dxmt/dxmt_command_clear.hpp`
-
-동작 구조:
-
-1. `ALLOW_RENDER_TARGET`, BUFFER dimension, typed/non-typeless color format 및 full 64-bit byte range를 검사한다.
-2. Descriptor에 backing buffer, ranged view, 전체 element/byte range와 format을 보존한다.
-3. Metal `TextureBuffer`를 render attachment로 가장하지 않는다. Render pass별 private 2D single-row texture를 만들고 backing buffer 내용을 copy-in한다.
-4. 해당 attachment로 렌더링한 뒤 같은 범위를 backing buffer로 copy-out한다. 여러 buffer/texture RTV의 혼합 binding도 attachment별로 처리한다.
-5. Typed pass가 native buffer/texture 소유권을 보유해 후속 copy와 GPU retirement까지 연결한다.
-
-Raster window는 `min(NumElements, D3D12_REQ_RENDER_TO_BUFFER_WINDOW_WIDTH)`다. **16384는 일반 texture 크기에서 추정한 제한이 아니라 D3D12의 render-to-buffer window 상수**다. 전체 descriptor range는 유지하며 raster window 밖은 draw로 덮어쓰지 않는다.
-
-`ClearRenderTargetView`는 ranged typed compute clear를 사용하며 predicate를 반영한다. Rect가 없으면 전체 `UINT NumElements`를 처리하고, `LONG` 변환으로 범위를 잘라내지 않는다. Explicit rect와 dispatch group 계산은 별도로 범위/overflow를 처리한다.
-
-참조: [D3D12 constants](https://learn.microsoft.com/en-us/windows/win32/direct3d12/constants), [D3D11.3 functional specification의 buffer view 제한](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm).
-
-P0에서 `owned-d3d12-buffer-rtv.cpp`를 추가했다. 서로 다른 `FirstElement`, descriptor copy, 2개 MRT, predicated 부분 clear, 16,384-element 경계와 앞뒤 guard를 실제 GPU readback으로 확인했다. 실행 근거는 아래 P0 증거에 별도로 기록한다.
-
-## 3. Residency
-
-주요 소스:
-
-- `src/d3d12/d3d12_pageable.hpp`
-- `src/d3d12/d3d12_device.hpp`, `d3d12_device.cpp`
-- Resource/heap 생성·소멸 hook, `d3d12_descriptor_heap.cpp`, `d3d12_query_heap.cpp`
-
-구현 내용:
-
-- Committed resource, explicit heap, descriptor heap, query heap의 device-owner 기반 pageable 등록.
-- Residency reference count와 `CREATE_NOT_RESIDENT` 초기 상태. Native residency set은 0↔1 전이에서 변경한다.
-- Batch 전체의 null·타 device·unsupported object·refcount underflow/overflow 검사, 중복 항목과 atomic mutation 처리.
-- Placed resource는 heap residency를 빌려 사용한다. 독립 residency 대상으로 중복 계상하지 않으며 VA 등록 수명과 residency 등록 수명을 분리한다.
-- Priority는 허용 범위 내 값을 저장한다. Metal에 대응 priority API가 없으므로 native eviction 우선순위 보장은 아니다.
-- `EnqueueMakeResident`는 device lock 아래 add/commit을 완료한 뒤 fence를 signal한다. 호출 순서와 fence signal 순서를 직렬화하며, return 뒤 별도 residency 작업을 남기지 않는 보수적 구현이다.
-- `DENY_OVERBUDGET`는 성공으로 무시하지 않는다. Native committed residency-set bytes와 새로 resident가 될 owner bytes를 `recommendedMaxWorkingSetSize`와 비교한다. 초과하면 변경·fence signal 전에 `E_OUTOFMEMORY`를 반환한다.
-
-Metal bridge에 `MTLAllocation.allocatedSize`와 `MTLResidencySet.allocatedSize`를 추가했다. CPU-only descriptor heap은 native allocation 목록이 비어 있어도 논리 residency 상태를 가진다.
-
-**Timestamp storage 경계:** `MTLCounterSampleBuffer`는 `MTLAllocation`이 아니므로 residency set에 직접 넣지 않는다. Timestamp query heap은 dummy allocation과 논리 refcount로 표현하고 opaque counter storage는 driver가 관리한다. Occlusion heap은 실제 visibility-result allocation을 등록한다.
-
-## 4. Recording·ExecuteIndirect·GPU predication
-
-주요 소스:
-
-- `src/d3d12/d3d12_command_signature.cpp`
-- `src/d3d12/d3d12_command_list.cpp`
-- `src/d3d12/d3d12_command_allocator.cpp`, `d3d12_command_encoder.hpp`
-- `src/d3d12/d3d12_command_queue.cpp`
-- `src/dxmt/dxmt_command_context.hpp`, `dxmt_command_clear.hpp`
-
-### Recording와 indirect
-
-- Command signature의 argument graph·stride·packed size·terminal action·VB slot·IB 조합을 검사한다.
-- Root signature ownership/local 여부, parameter type 및 root constant span을 검사한다.
-- `ExecuteIndirect`의 device/list type·argument/count buffer·alignment·range·root 계약을 검사한다.
-- 실행 후 signature가 변경한 root/VB/IB state를 D3D12 계약에 맞게 reset한다.
-- Queue descriptor와 타 device의 Execute/Signal/Wait 입력을 검사한다.
-- Invalid recording은 첫 오류를 보존한다. **실패한 `Close`로 poison된 list를 `Reset`으로 복구시키는 변경은 하지 않았다.**
-- D3D의 비어 있는 viewport/scissor 상태를 Metal의 유효한 offscreen raster 상태로 내린다. 두 배열 중 하나가 바뀌면 함께 재설정해 이전 raster 상태가 남지 않도록 하며, 전체 draw를 생략하지 않아 VS UAV side effect를 보존한다. P0에서 native viewport count 0 assertion을 재현·수정했고, viewport 없는 VS atomic 실행과 일반 buffer RTV draw를 각각 확인했다.
-
-### Predicate 의미
-
-`SetPredication`은 GPU stream에서 64-bit 값을 allocator 소유 snapshot으로 복사한다. 이후 원본 predicate buffer가 바뀌어도 이미 설정한 predicate의 의미를 바꾸지 않는다.
-
-**`D3D12_PREDICATION_OP`는 실행 조건이 아니라 생략 조건이다.** `EQUAL_ZERO`는 0일 때 생략하고 nonzero일 때 실행한다. `NOT_EQUAL_ZERO`는 반대다. P0에서 direct/indirect arguments, copy, resolve, MSAA worker의 반전된 조건을 수정했다. [SetPredication 계약](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-setpredication)과 [GPU snapshot 의미](https://learn.microsoft.com/en-us/windows/win32/direct3d12/predication)를 기준으로 삼았다.
-
-원본을 `COPY_DEST`로 전환해 saved nonzero predicate 아래에서 0으로 덮어써도 기존 snapshot은 실행을 허용한다. 다시 `SetPredication`한 뒤에는 새 0을 읽어 생략해야 한다. Fixture는 덮어쓰기와 재설정 이후 destination 보존까지 확인한다.
-
-- Direct Draw/DrawIndexed/Dispatch는 GPU가 생성한 indirect arguments로 실행 또는 zero-work를 선택한다.
-- ExecuteIndirect resolver는 동일 snapshot으로 실행 count를 gate한다.
-- Bundle draw는 부모 list의 predicate 경로를 사용한다. Bundle 안의 `SetPredication`은 허용하지 않는다.
-- Predicate disable은 이후 작업을 unconditional 경로로 복원한다.
-- Query Begin/End/ResolveQueryData를 rendering predicate로 생략하지 않는다.
-
-### Clear
-
-RTV/DSV는 conditional indirect draw, UAV Uint/Float는 conditional indirect dispatch로 연결했다. Predicate가 false인 full clear를 unconditional `loadAction=Clear`로 바꾸지 않는다.
-
-Rect/array instance count, DSV의 선택한 depth/stencil component, untouched 영역의 load/store를 처리한다. Buffer RTV clear도 같은 snapshot을 사용한다.
-
-P0에서 buffer RTV clear의 compute-pass 시작 순서를 수정해 null encoder 접근을 제거했다. Indirect dispatch는 threadgroup 단위로 반올림되므로 typed/raw buffer와 2D/array/3D clear kernel 모두 metadata의 실제 rect 크기로 write를 제한한다. GPU allocation 내부라는 이유로 view/rect 바깥의 쓰기를 허용하지 않는다.
-
-## 5. Copy·resolve·legacy barrier
-
-주요 소스는 command list/encoder/queue와 `src/dxmt/dxmt_command.metal`이다.
-
-### Copy
-
-- Buffer/footprint range와 staging arithmetic에 checked helpers를 사용한다.
-- DXGI compatible-family copy에서 native pixel format이 다르면 공통 format의 per-subresource view로 맞춘다. 서로 다른 native format의 blit이 우연히 동작한다고 가정하지 않는다.
-- Predicated buffer copy는 GPU conditional byte-copy를 사용하며 큰 범위는 나누어 처리한다.
-- Non-MSAA texture↔texture, texture↔footprint, footprint↔footprint는 raw staging과 GPU conditional byte-copy로 false predicate의 destination을 보존한다.
-- Predicated `CopyResource`는 buffer/subresource 경로로 연결한다.
-
-### 정확한 predicated MSAA copy
-
-Public Metal에는 conditional blit이 없으므로 MSAA raw copy를 shader 색 변환으로 대신하지 않는다.
-
-1. Typed `PredicatedTextureCopy` pass가 source/destination/snapshot을 보유한다.
-2. **Submission worker**가 앞선 command-buffer segment를 commit하고 실제 GPU retirement를 기다린다.
-3. 완료된 snapshot을 읽고 predicate가 true일 때만 native texture blit을 기록한다.
-4. 다음 ordered segment에서 나머지 명령을 계속한다.
-
-API caller는 비동기 상태를 유지한다. 대신 이 드문 경로에서는 worker가 GPU completion을 기다리므로 overlap과 성능 비용이 있다. 각 segment의 allocator/native reference 수명도 유지한다.
-
-### Resolve
-
-- `ResolveSubresource`와 Region validation을 연결한다.
-- 부분 rect·destination offset·untouched 영역 보존을 구현한다.
-- Color float/normalized AVERAGE/MIN/MAX, signed/unsigned integer MIN/MAX 경로를 추가했다.
-- Depth/stencil MIN/MAX는 선택한 plane만 기록한다. 불법 AVERAGE는 거부한다.
-- Combined depth/stencil의 sampling view와 destination attachment/PSO format을 분리한다. Stencil sampling의 X32 view를 render attachment format으로 그대로 사용하지 않는다.
-- Resolve shader도 predicate snapshot을 반영한다.
-- Stencil resolve의 fullscreen triangle은 Metal 기본 winding에서 back face가 될 수 있으므로 front/back 모두 `Always`/`Replace` 상태를 설정한다. 한쪽 face만 설정해 stencil destination이 그대로 남던 문제를 P0에서 수정했다.
-- `DECOMPRESS`는 Metal의 uncompressed representation에서 합법적인 in-place 조건을 검사한 뒤 no-op으로 처리한다. 임의의 copy/resolve를 no-op으로 대체한 것이 아니다.
-
-### Barrier
-
-Legacy transition/UAV/aliasing barrier의 type·flag·state·subresource를 검사하고 기존 보수적 encoder 경계를 유지한다. 이 경계와 Metal synchronization이 실제 ordering을 담당한다. 완전한 resource-state debug tracker를 뜻하지 않는다. Enhanced barrier는 [P2-BARRIERS](#p2-barriers--enhanced-barriersdevice614commandlist59render-passgpu-upload-heap) 참조.
-
-## 6. Root signature·binding·PSO
-
-주요 소스:
-
-- `src/d3d12/d3d12_root_signature.cpp`, `d3d12_device.hpp`
-- `src/d3d12/d3d12_pipeline_graphics.cpp`, `d3d12_pipeline_compute.cpp`
-- Command list의 root/PSO setter
-
-RS 1.0/1.1 serializer와 deserialized root signature 생성이 같은 validator를 사용한다. Pointer/count graph, enum/flags, descriptor range/offset overlap, visibility별 register overlap, static sampler, global **64 DWORD** budget을 검사한다.
-
-Local root는 global budget과 혼동하지 않는다. Shader record 4096 bytes에서 identifier 32 bytes를 뺀 **4064-byte argument payload**와 table/descriptor alignment를 적용하고 기존 DXR local copy 경로를 보존한다.
-
-Root metadata의 type/constant count/local 여부를 setter 및 indirect validation에 연결했다. Index 경계, parameter type, constant span, null data, device ownership과 recording state를 검사한다. Graphics/compute PSO는 bytecode pointer/size, root ownership, sample/fixed-function enum/format 계약을 검사한다.
-
-P0 통합 수정에는 metadata pointer의 backing storage를 root signature 소유 배열에 유지하는 변경도 포함한다. 임시 데이터의 수명에 의존하지 않는다.
-
-## 7. 기본 shader compiler
-
-주요 소스:
-
-- `src/airconv/dxil_resources.cpp`
-- `src/airconv/nt/air_builder.hpp`, `air_builder.cpp`
-- `src/airconv/nt/dxbc_converter_base.hpp`, `dxbc_converter_base.cpp`
-- `src/airconv/dxbc_converter.hpp`, `dxbc_converter.cpp`, `dxbc_signature.cpp`
-
-추가 DXIL lowering:
-
-| Opcode | 처리 |
-|---|---|
-| 74 | `TextureGatherCmp` |
-| 75 | `Texture2DMSGetSamplePosition` |
-| 76 | `RenderTargetGetSamplePosition` |
-| 77 | `RenderTargetGetSampleCount` |
-| 81 | `CalculateLOD` |
-
-기존 AIR/DXBC helper 및 결과 shape를 재사용하고 sample-position helper를 공유한다. 기본 VS/PS/CS DXBC에서 지원하지 않는 application input은 initialize diagnostic으로 전달하도록 정리했다. 정상적인 unsupported 입력을 abort로 처리하는 경로를 줄이고 null-safe 오류 전파를 연결했다.
-
-P0에서 DXIL lowering이 생성한 `dxmt.sample_pos.i32`에 기존 AIR helper 정의를 실제로 link하도록 수정했다. DXBC PS의 SGV system declaration에는 interpolation mode 0이 합법적일 수 있으므로 `SV_SampleIndex` 등을 flat으로 처리한다. 일반 입력의 잘못된 interpolation을 일괄 허용한 변경은 아니다.
-
-이는 모든 shader model/opcode 지원 선언이 아니다. Tiled resource 관련 `CheckAccessFullyMapped`, FP64/wave, GS/HS/DS/mesh 확장 등은 이번 범위에 포함하지 않는다.
-
-### P0 frozen shader 입력과 생성 도구
-
-`graphics-translator/tests/dxil/`에 다음 입력을 추가했다. Texture fixture는 opcode 74/75/76/77/81을 실제로 포함하며, indirect fixture의 CS/VS는 opcode 78 `AtomicBinOp/Add`를 포함한다. Wine HLSL frontend가 `RWByteAddressBuffer.InterlockedAdd`를 컴파일하지 못해 indirect shader를 frozen DXIL로 바꿨다. Atomic을 일반 load/store로 바꾸거나 indirect 결과 기대값을 약화하지 않았다.
-
-| 입력 | 크기 | SHA-256 | 생성 조건 |
-|---|---:|---|---|
-| `basic-texture-vs.dxil` | 3,148 B | `3d0c8c3126d1b4608fba5f490645afd0c8529e84700d590ea047507d4d1d32a7` | `basic-texture-ops.hlsl`, `-T vs_6_0 -E vsMain -HV 2021 -O0` |
-| `basic-texture-ps.dxil` | 5,868 B | `f4fabb44ef94e4961e0e2aa7e617a9fbad0700c739492f4e6339809d6d508539` | 같은 HLSL, `-T ps_6_0 -E psMain -HV 2021 -O0` |
-| `predication-indirect-cs.dxil` | 2,984 B | `08dce50dd933af311cfea88dc0489357f3b20df5547d3b8d36824318e4444a50` | `predication-indirect-cs.hlsl`, `-T cs_6_0 -E main -HV 2021 -O0` |
-| `predication-indirect-vs.dxil` | 3,404 B | `68d328aa2906e26f7fbdc670ea07522cf6af03df9699285f703a87fe881b01a9` | `predication-indirect-vs.hlsl`, `-T vs_6_0 -E main -HV 2021 -O0` |
-
-생성에는 로컬 `build/local/dxc-probes/dxc.exe`와 같은 디렉터리의 `dxcompiler.dll`·`dxil.dll`을 사용했다. 도구 보고 버전은 **1.9.0.5402 (`0d3ee6b55-dirty`)**이며, 위 최신 정식 DXC release와 같은 배포물이라고 검증한 것은 아니다. 도구 SHA-256은 각각 `980a3a4c6e5c88f5737dde321e548860021d58fa2349790d4e572805cb298293`, `9a5100511e127c6a2fc78edf984f95074a76d35b90c90c4d342430a5ae160e9b`, `feb57253eff0a622561e29b44cedbe86b89fc9a5bc8dc00fa2f98fafd712c2d8`다.
-
-재생성 예시(동일 로컬 도구와 격리된 prefix 사용):
-
-```sh
-WINEPREFIX="$PWD/build/local/dxc-wine-prefix" WINEDEBUG=-all \
-  toolchains/wine-runtime/bin/wine build/local/dxc-probes/dxc.exe \
-  -T cs_6_0 -E main -HV 2021 -O0 \
-  graphics-translator/tests/dxil/predication-indirect-cs.hlsl \
-  -Fo graphics-translator/tests/dxil/predication-indirect-cs.dxil
-```
-
-Runner는 executable과 shader 입력을 evidence 디렉터리에 복사하고 hash·argv를 기록한다. `predication-indirect` argv 순서는 CS, VS이며 `dxil-texture`는 VS, PS다. 두 suite 모두 실행한 staged native module에 들어 있는 owned DXIL compiler의 실제 load를 요구한다.
-
-## 8. Query·clock calibration·WineMetal ABI
-
-Timestamp/occlusion 경로를 유지하고 queue `GetClockCalibration`을 구현했다.
-
-- Null output과 지원하지 않는 queue type을 구분한다.
-- Metal의 paired CPU/GPU timestamp 호출 앞뒤를 Wine `QueryPerformanceCounter`로 감싼다.
-- GPU timestamp는 기존 1 GHz frequency 계약으로 반환한다.
-- CPU timestamp는 주변 Wine QPC의 overflow-safe midpoint를 사용한다. Metal host clock 값을 Wine QPC epoch인 것처럼 직접 반환하지 않는다. 이 bracket 기반 대응의 실제 오차는 미측정이다.
-
-Bridge 관련 파일은 `src/winemetal/winemetal.h`, `winemetal_thunks.h`, `winemetal_thunks.c`, `Metal.hpp`, `unix/winemetal_unix.c`다. Append-only Unix call 번호는 다음과 같다.
-
-| 번호 | 기능 |
-|---|---|
-| 201 | Device paired timestamp sampling |
-| 202 | Allocation allocated size |
-| 203 | Residency-set allocated size |
-
-해당 wrapper/parameter/native handler/native·wow64 dispatch 연결을 함께 변경했다. P0의 x86_64 통합 빌드와 query/residency GPU 실행에서 이 경계를 확인했다. Wow64·ARM64EC 실행까지 검증한 것은 아니다. 추가한 render encoder depth/stencil state wrapper는 기존 render-command opcode/decoder를 사용하며 새 Unix call 204를 추가하지 않았다.
-
-`D3D12_QUERY_HEAP_TYPE_SO_STATISTICS`와 `SO_STATISTICS_STREAM0..3`를 추가했다(P1-D). 결과는 16 B, Begin에서 recording별 stream counter를 snapshot하고 End에서 차이를 쓴다. Resolve는 8-byte 정렬 offset을 요구한다.
-
-**`PIPELINE_STATISTICS` heap 생성과 88-byte Begin/End/Resolve를 지원한다.** MSAA 실행을 수정한 최종 격리 runtime에서 11개 필드와 독립 GPU oracle을 포함한 전체 fixture를 통과했다. 범위·비용·실행 증거는 위 P1-C를 참조한다.
-
-## 9. Queue/Fence와 기존 증거의 범위
-
-CPU/GPU rewind, API-time wait latch, ANY/ALL event registration, 실제 GPU completion 기반 consumer wait를 유지한다. SO 오류 전파 수정에서는 native event probe와 signal별 Metal event를 제거했다. Queue completion 스레드가 앞선 submission의 GPU 결과와 SO status를 검증한 뒤에만 논리 fence 값을 공개한다. CPU signal은 같은 논리 timeline mutex로 직렬화한다. Device 오류는 terminal UINT64_MAX로 대기를 종료하며 이후 signal로 rewind하지 않는다. Snapshot/staging/segment는 allocator와 native resource의 retirement 수명에 연결한다.
-
-이전 Fence 코어 단계에는 실제 실행 증거가 있었다.
-
-- `build/local/fence-core-after/result.json`
-- `build/local/fence-core-multiqueue-proof/result.json`
-- `build/local/fence-core-temporal-proof/result.json`
-- 상세: [FENCE-EVENTS.ko.md](FENCE-EVENTS.ko.md), [QUEUE-ORDER.ko.md](QUEUE-ORDER.ko.md)
-
-**이 결과는 이번 전체 코어 통합본의 검증 결과가 아니다.** 일부 fixture/객체의 과거 단독 컴파일과 query baseline 실패 기록도 현재 소스의 성공 근거로 승격하지 않는다. `build/local/fence-core-runtime` 등 기존 runtime을 최신 구현본으로 취급하면 안 된다.
-
-## 10. P0 실행 결과와 재현 근거
-
-설정된 `build/local/build`의 전체 Ninja target 빌드와 install을 통과했다. 마지막 viewport/scissor 수정 빌드는 13-step incremental build 성공으로 확인했으며 별도 log 파일은 저장하지 않았다. 앞선 통합 빌드 log는 `build/local/p0/full-build.log`, `runtime-03-build.log`, `runtime-04-build.log`, `runtime-05-build.log`다. 기존 managed-storage deprecation 및 unused lambda-capture warning은 남아 있다.
-
-아래 **11개 suite는 모두 `--validation`으로 PASS**했다. 경로 기준은 `build/local/p0/`이며 각 evidence 디렉터리에 `result.json`, `invocation.json`, frozen fixture/input, stdout/stderr와 backend trace가 있다. Source revision별 새 runtime 복사본을 만들고 각 실행마다 전용 prefix와 새 evidence를 사용했다. **모든 suite를 마지막 runtime 하나에서 재실행했다는 뜻은 아니다.** 수정 영향이 있는 경로만 다시 실행했으며 실제 사용한 revision을 구분한다.
-
-| Suite | 확인한 계약 | Runtime | PASS evidence 디렉터리 |
-|---|---|---|---|
-| `core-contracts` | Root signature validation·recording 계약 | `runtime-01` | `proof-01/core-contracts` |
-| `queries` | QPC bracket·1 GHz timestamp·occlusion·query 수명 | `runtime-01` | `proof-01/queries` |
-| `residency` | Refcount·CREATE_NOT_RESIDENT·budget flag·fence 7·256-byte readback | `runtime-01` | `proof-01/residency` |
-| `resources` | Footprint/view 계약과 같은 64 KiB heap offset 0의 placed buffer A→B→A 양방향 data inheritance | `runtime-01` | `proof-01/resources` |
-| `fence-events` | CPU/GPU rewind·ANY/ALL·registration latch·teardown | `runtime-01` | `proof-01/fence-events` |
-| `multiqueue` | 32회 × 1,024 words의 queue 간 ordering/readback | `runtime-01` | `proof-01/multiqueue` |
-| `bundles` | 기존 bundle 실행·상태 계약 | `runtime-01` | `proof-01/bundles` |
-| `dxil-texture` | Comparison gather·array·LOD 0/-4·4x sample positions/count | `runtime-03` | `proof-04/dxil-texture` |
-| `copy-resolve` | RGBA 전 성분 AVG/MIN/MAX·부분 rect·guard·MSAA predicate snapshot/rebind·depth/stencil MIN/MAX·다른 plane 보존 | `runtime-04` | `proof-04/copy-resolve` |
-| `buffer-rtv` | FirstElement·descriptor copy·2 MRT·predicated rect·16,384-element 경계와 guards | `runtime-06` | `proof-08/buffer-rtv` |
-| `predication-indirect` | Predicate 두 operation·snapshot/rebind·raw/typed clear·2-layer rect/component 보존·indirect count/root/state·CS atomic 합 9·VS atomic 합 3 | `runtime-06` | `proof-08/predication-indirect` |
-
-Fixture 소스는 `graphics-translator/tests/owned-d3d12-<suite>.cpp`다. Typed multilayer coverage는 RTV `R16G16B16A16_UINT`, DSV `D32_FLOAT_S8X24_UINT`, UAV `R32G32B32A32_UINT` 및 `R32G32B32A32_FLOAT`를 포함한다. 이것이 모든 format/layer/sample-count 조합을 검증했다는 뜻은 아니다.
-
-추가 확인:
-
-- `python3 scripts/test-owned-graphics-diagnostics.py`: 변경된 runner 기준 **42 tests PASS**.
-- `queue-order-scheduler.test.cpp`: native CPU 실행 PASS — logical fence, registration, FIFO, lifetime, storage, ring drain, cross-queue.
-- `d3d12-resource-contracts.test.cpp`: Windows cross-build 후 격리된 Wine 실행 PASS — range/placement/overflow/footprint, pitch 512.
-- `dxil/dxbc-input-error-probe.cpp`: native x86_64 실행 PASS — malformed input은 diagnostic/null shader를 반환하고, 같은 process의 다음 valid input은 성공. 일반 runner suite는 아니다.
-
-### 실제 실패에서 수정까지
-
-| 재현 | 수정 | 통과 근거 |
-|---|---|---|
-| `predication-skip-before-fix`: 0/EQUAL_ZERO에서 쓰기가 실행됨 | 모든 predicate 경로의 skip 조건 교정 | `proof-08/predication-indirect`, `proof-04/copy-resolve` |
-| `proof-02/buffer-rtv`: null compute encoder 접근 | Buffer RTV clear의 pass 시작 순서 수정 | `proof-08/buffer-rtv` |
-| `proof-03/buffer-rtv`, `proof-04/predication-indirect`: rect 뒤의 guard 손상 | 반올림된 indirect threadgroup의 typed/raw/texture clear write를 실제 rect 크기로 제한 | `proof-08/buffer-rtv`, `proof-08/predication-indirect` |
-| `resolve-stencil-diagnostic`: stencil 10 대신 초기 guard 165 | Stencil resolve front/back state 모두 설정 | `proof-04/copy-resolve` |
-| `proof-02/dxil-texture`: undefined `dxmt.sample_pos.i32` | 기존 AIR sample-position helper link | `proof-04/dxil-texture` |
-| `proof-06/predication-indirect`: Metal viewport count 0 assertion | Empty raster state의 유효한 native 표현, VS side effect 유지 | `proof-08/predication-indirect`와 일반 draw `proof-08/buffer-rtv` |
-
-Fixture 자체의 잘못된 전제도 구분해 수정했다. 존재하지 않는 environment gate를 제거하고 실제 backend identity를 검사한다. Static sampler의 `MaxAnisotropy=0`을 유효한 1로 바꿨다. Raw UINT clear는 `Values[0]`만 사용하는 oracle로, Float clear는 명확한 typed FLOAT view로 구성했다. CPU UAV descriptor는 non-shader-visible heap에 두고 clear 사이에 UAV barrier를 넣었다.
-
-Gather 기대값은 관찰값에 맞춘 것이 아니라 [GATHER4의 LL/LR/UR/UL 순서](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#inst_GATHER4), [reference와 texel의 비교 순서](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#inst_SAMPLE_C), 업로드한 texel·좌표·offset·CLAMP에서 다시 계산했다. 그 결과 scalar `(0,1,0,1)`, array `(0,1,1,0)`이며 lowering을 바꾸지 않고 잘못된 oracle만 수정했다.
-
-`proof-07`은 harness 알림에 의해 실행이 중단되어 완료 artifact가 없으며 성공/실패 판정에 사용하지 않는다. 같은 확인은 durable job으로 새 `proof-08`에서 완료했다. 실패·진단 evidence는 원인 추적을 위해 보존했다.
-
-### 재현 명령과 남은 경계
-
-예시(동일 도구와 현재 source로 새 artifact 생성):
-
-```sh
-export PATH="/opt/llvm-mingw-20260616-ucrt-macos-universal/bin:$PWD/toolchains/tools/bin:$PATH"
-mkdir -p build/local/p0-reproduce
-x86_64-w64-mingw32-clang++ -std=c++20 -O2 -Wall -Wextra -Werror -static \
-  graphics-translator/tests/owned-d3d12-predication-indirect.cpp \
-  -ld3d12 -ldxgi -luuid -o build/local/p0-reproduce/predication-indirect.exe
-ninja -C build/local/build -j8
-meson install -C build/local/build --no-rebuild
-python3 scripts/stage-owned-graphics.py stage \
-  --dxmt-install build/local/install --wine-source toolchains/wine-runtime \
-  --wine-dest build/local/p0-reproduce/runtime --with-nvapi --with-nvngx
-python3 scripts/test-owned-graphics.py --runtime build/local/p0-reproduce/runtime \
-  --suite predication-indirect --fixture build/local/p0-reproduce/predication-indirect.exe \
-  --out build/local/p0-reproduce/evidence --validation
-```
-
-`runtime`과 `evidence`는 실행 전 존재하지 않아야 한다. 재실행 때 새 경로를 선택한다. 다른 fixture도 위 evidence 표의 source로 빌드하며, buffer RTV/copy-resolve는 runtime HLSL compilation을 위해 `-ld3dcompiler`가 필요하다. 최신 header로의 교체, 전체 format/sample-count matrix, texture/reserved-resource aliasing, 다른 GPU/OS/ABI, Windows reference와의 differential 검증, 일반 D3D10/11 workload 및 presentation은 P0의 검증 범위를 넘어 남아 있다.
-
-## 최종 경계
-
-이번 문서는 **무엇을 소스에 구현했고 무엇을 아직 증명하지 않았는지**를 구분한 상태 기록이다.
-
-- 구현 경로가 있다는 이유로 build/runtime success를 선언하지 않는다.
-- P1-A·P1-B·P1-C·P1-D(VS→SO), 일반 non-SO indexed restart, SO 오류 전파·WoW64 연결·ExecuteIndirect를 구현·검증했다. P1-C는 실제 MSAA pixel-frequency 실행 수정 후 11-field query를 공개했다. `AtomicCopyBufferUINT64`는 macOS Apple8+ 대상으로 구현했으며 실제 장치·reader 관찰 범위는 P1-A 결과에 명시한다. Pipeline library·tiled·shared·enhanced barrier·GS/HS/DS 등 P2 결과와 남은 제약·미검증은 [P2 완료 결과](#p2-완료-결과-2026-10-01)에 구분한다. P3의 검증된 DXR 1.1·FL12_1·conservative raster 1·feedback 1.0·view instancing 1과 GSTS/SO 후속 결과는 [P3 완료 결과](#p3-완료-결과-2026-10-01)에 있다. P3 전체 및 최종 64-bit/WoW64 통합 회귀 완료는 아직 선언하지 않는다.
-- 실제 게임 정상 렌더링, 성능, 전체 D3D12/DXR conformance를 주장하지 않는다.
-- 이후 검증을 진행할 때는 새 build/install과 **새 runtime 복사본·전용 prefix·새 evidence 경로**를 사용해야 한다. 기존 게임 또는 live prefix에는 배포하지 않는다.
+상태·tier는 이 문서에서만 갱신하고 기술 문서는 이 문서를 링크한다. 이력은 당시 계약과 관찰을 보존하며 최신 지원표를 복제하지 않는다. 새 source audit가 기존 완료 범위 밖의 누락을 찾으면 현재 backlog에 추가하되 과거 관찰을 지우거나 이번 실행으로 가장하지 않는다.

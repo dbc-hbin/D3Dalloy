@@ -112,6 +112,33 @@ AreCopyCompatibleFormats(DXGI_FORMAT a, DXGI_FORMAT b) {
   return family != FormatFamily::Unknown && family == GetFormatFamily(b);
 }
 
+enum class TextureCastClass : uint8_t { Other, Float, Unorm, Snorm };
+
+inline TextureCastClass
+GetTextureCastClass(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32_FLOAT:
+  case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R32G32_FLOAT:
+  case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16_FLOAT:
+  case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+  case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+  case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+    return TextureCastClass::Float;
+  case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R8G8B8A8_SNORM:
+  case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R8G8_SNORM:
+  case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R8_SNORM:
+  case DXGI_FORMAT_BC4_SNORM: case DXGI_FORMAT_BC5_SNORM:
+    return TextureCastClass::Snorm;
+  case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM:
+  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R16G16_UNORM:
+  case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R8_UNORM:
+  case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC5_UNORM:
+    return TextureCastClass::Unorm;
+  default:
+    return TextureCastClass::Other;
+  }
+}
+
 inline bool
 RangeFits(uint64_t offset, uint64_t length, uint64_t total) {
   return offset <= total && length <= total - offset;

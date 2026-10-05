@@ -8,9 +8,11 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <functional>
 #include <string>
 #include <vector>
@@ -111,6 +113,7 @@ struct Target {
 struct Result {
   std::vector<uint32_t> pixels;
   std::array<uint32_t, 4> counters{};
+  std::vector<uint32_t> words;
   HRESULT close = S_OK;
   uint32_t at(const Target &t, UINT x, UINT y, UINT layer = 0) const {
     return pixels[(size_t(layer) * t.height + y) * t.width + x];
@@ -125,7 +128,7 @@ struct Gpu {
   ComPtr<ID3D12GraphicsCommandList6> list;
   ComPtr<ID3D12Fence> fence;
   ComPtr<ID3D12DescriptorHeap> rtvHeap;
-  ComPtr<ID3D12RootSignature> root, rootMeshVisibility;
+  ComPtr<ID3D12RootSignature> root, rootMeshVisibility, rootDerivatives;
   HANDLE event = nullptr;
   UINT64 fenceValue = 0;
 
@@ -149,12 +152,13 @@ struct Gpu {
       die("CreateEventW");
     root = rootSignature(D3D12_SHADER_VISIBILITY_ALL);
     rootMeshVisibility = rootSignature(D3D12_SHADER_VISIBILITY_MESH);
+    rootDerivatives = rootSignature(D3D12_SHADER_VISIBILITY_ALL, true);
   }
   ~Gpu() { CloseHandle(event); }
 
   /* b0 = 4 root constants (visible to `constants`), u0 = root UAV, t0 = root SRV (all stages). */
-  ComPtr<ID3D12RootSignature> rootSignature(D3D12_SHADER_VISIBILITY constants) {
-    D3D12_ROOT_PARAMETER1 params[3]{};
+  ComPtr<ID3D12RootSignature> rootSignature(D3D12_SHADER_VISIBILITY constants, bool derivatives = false) {
+    D3D12_ROOT_PARAMETER1 params[4]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = {0, 0, 4};
     params[0].ShaderVisibility = constants;
@@ -164,10 +168,28 @@ struct Gpu {
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[2].Descriptor = {0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0,
+                                  D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC, 0};
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[3].DescriptorTable = {1, &range};
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_STATIC_SAMPLER_DESC samplers[2]{};
+    samplers[0].Filter = D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR;
+    samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samplers[0].MaxAnisotropy = 1;
+    samplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    samplers[0].MaxLOD = 3;
+    samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    samplers[1] = samplers[0];
+    samplers[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+    samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    samplers[1].ShaderRegister = 1;
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
     desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    desc.Desc_1_1.NumParameters = 3;
+    desc.Desc_1_1.NumParameters = derivatives ? 4 : 3;
     desc.Desc_1_1.pParameters = params;
+    desc.Desc_1_1.NumStaticSamplers = derivatives ? 2 : 0;
+    desc.Desc_1_1.pStaticSamplers = samplers;
     ComPtr<ID3DBlob> blob, error;
     HRESULT hr = D3D12SerializeVersionedRootSignature(&desc, &blob, &error);
     if (FAILED(hr)) {
@@ -257,7 +279,7 @@ struct Gpu {
    */
   Result render(ID3D12PipelineState *pso, ID3D12RootSignature *rootsig, const Target &t,
                 std::array<uint32_t, 4> constants, UINT viewports,
-                const std::function<void(ID3D12GraphicsCommandList6 *)> &draw) {
+                const std::function<void(ID3D12GraphicsCommandList6 *)> &draw, UINT counter_words = 4) {
     check(allocator->Reset(), "Allocator::Reset");
     // A list whose Close failed (the reject cases) cannot be reset; such a list is replaced.
     if (FAILED(list->Reset(allocator.Get(), nullptr))) {
@@ -277,11 +299,12 @@ struct Gpu {
     }
     const auto rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(target.Get(), &rtvDesc, rtv);
-    const uint32_t zero[4] = {};
-    auto counters = buffer(16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
+    const std::vector<uint32_t> zero(counter_words);
+    const UINT64 counter_bytes = UINT64(counter_words) * 4;
+    auto counters = buffer(counter_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    auto counters_init = upload(zero, sizeof(zero));
-    list->CopyBufferRegion(counters.Get(), 0, counters_init.Get(), 0, 16);
+    auto counters_init = upload(zero.data(), size_t(counter_bytes));
+    list->CopyBufferRegion(counters.Get(), 0, counters_init.Get(), 0, counter_bytes);
     transition(counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const float clear[4] = {0, 0, 0, 0};
     list->ClearRenderTargetView(rtv, clear, 0, nullptr);
@@ -327,9 +350,9 @@ struct Gpu {
       src.SubresourceIndex = layer;
       list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
-    auto counters_readback = buffer(16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto counters_readback = buffer(counter_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     transition(counters.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->CopyBufferRegion(counters_readback.Get(), 0, counters.Get(), 0, 16);
+    list->CopyBufferRegion(counters_readback.Get(), 0, counters.Get(), 0, counter_bytes);
     Result result;
     result.close = list->Close();
     if (FAILED(result.close))
@@ -347,6 +370,10 @@ struct Gpu {
     readback->Unmap(0, nullptr);
     check(counters_readback->Map(0, nullptr, &mapped), "Map(counters)");
     std::memcpy(result.counters.data(), mapped, 16);
+    if (counter_words > 4) {
+      result.words.resize(counter_words);
+      std::memcpy(result.words.data(), mapped, size_t(counter_bytes));
+    }
     counters_readback->Unmap(0, nullptr);
     return result;
   }
@@ -643,6 +670,47 @@ void testIndirect(Gpu &gpu) {
       checkGrid(name, gpu.render(pso.Get(), gpu.root.Get(), {}, {3, 0, 0, 0}, 1, [&](auto *l) {
         l->ExecuteIndirect(signature.Get(), 3, arguments.Get(), 0, count_buffer.Get(), 0);
       }), count == 1 ? 4 : 3);
+      if (count == 3) {
+        // One query spans both nonempty command slots and the empty slot. Predication must
+        // suppress all three; otherwise visibility accumulates 2 + 1 full-target layers.
+        ComPtr<ID3D12QueryHeap> query;
+        const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1, 0};
+        check(gpu.device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query)), "CreateQueryHeap");
+        auto visibility = gpu.buffer(8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        const uint64_t predicates[] = {0, 1};
+        auto predicate_upload = gpu.upload(predicates, sizeof(predicates));
+        auto predicate_buffer = gpu.buffer(8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_PREDICATION);
+        for (uint64_t predicate : predicates) {
+          auto r = gpu.render(pso.Get(), gpu.root.Get(), {}, {3, 0, 0, 0}, 1, [&](auto *l) {
+            gpu.transition(predicate_buffer.Get(), D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COPY_DEST);
+            l->CopyBufferRegion(predicate_buffer.Get(), 0, predicate_upload.Get(), predicate * sizeof(uint64_t), 8);
+            gpu.transition(predicate_buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
+            l->BeginQuery(query.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+            l->SetPredication(predicate_buffer.Get(), 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            l->ExecuteIndirect(signature.Get(), 3, arguments.Get(), 0, count_buffer.Get(), 0);
+            l->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            l->EndQuery(query.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+            l->ResolveQueryData(query.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, visibility.Get(), 0);
+          });
+          if (!closed(name, r))
+            continue;
+          if (predicate)
+            checkGrid(name, r, 3);
+          else
+            for (size_t i = 0; i < r.pixels.size(); ++i)
+              EXPECT_EQ(name, "predicated_pixel", i, r.pixels[i], 0);
+          void *mapped = nullptr;
+          check(visibility->Map(0, nullptr, &mapped), "Map(visibility)");
+          uint64_t visible = 0;
+          std::memcpy(&visible, mapped, sizeof(visible));
+          visibility->Unmap(0, nullptr);
+          const uint64_t expected = predicate ? 3 * 64 * 64 : 0;
+          std::printf("OWNED_D3D12_MESH_SHADER_INDIRECT_OCCLUSION predicate=%llu visible=%llu expected=%llu\n",
+                      static_cast<unsigned long long>(predicate), static_cast<unsigned long long>(visible),
+                      static_cast<unsigned long long>(expected));
+          EXPECT_EQ(name, "occlusion", predicate, visible, expected);
+        }
+      }
     }
     // AS + MS through the indirect path: 4 AS groups each launch 2 x 3 MS groups.
     auto count_pso = requirePso(gpu, gpu.root.Get(), "as_count", "ms_count", "ps_color");
@@ -1357,6 +1425,167 @@ void testOutputContract(Gpu &gpu) {
   end(name);
 }
 
+void testDerivatives(Gpu &gpu) {
+  // Constant values differ by mip; a two-texel quad footprint selects mip1, bias1 selects mip2.
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = desc.Height = 16;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 4;
+  desc.Format = DXGI_FORMAT_R32_FLOAT;
+  desc.SampleDesc.Count = 1;
+  const auto props = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+  ComPtr<ID3D12Resource> texture;
+  check(gpu.device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)), "derivative texture");
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  heap_desc.NumDescriptors = 1;
+  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> heap;
+  check(gpu.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "derivative SRV heap");
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+  srv.Format = desc.Format;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2D.MipLevels = 4;
+  gpu.device->CreateShaderResourceView(texture.Get(), &srv, heap->GetCPUDescriptorHandleForHeapStart());
+  const std::array<float, 4> mip_values{0.125f, 0.25f, 0.5f, 0.75f};
+  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 4> footprints{};
+  UINT64 bytes = 0;
+  gpu.device->GetCopyableFootprints(&desc, 0, 4, 0, footprints.data(), nullptr, nullptr, &bytes);
+  auto upload = gpu.buffer(bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+  void *mapped = nullptr;
+  check(upload->Map(0, nullptr, &mapped), "derivative texture upload");
+  for (UINT mip = 0; mip < 4; ++mip)
+    for (UINT y = 0; y < footprints[mip].Footprint.Height; ++y)
+      for (UINT x = 0; x < footprints[mip].Footprint.Width; ++x)
+        std::memcpy(static_cast<uint8_t *>(mapped) + footprints[mip].Offset +
+            y * footprints[mip].Footprint.RowPitch + x * 4, &mip_values[mip], 4);
+  upload->Unmap(0, nullptr);
+  check(gpu.allocator->Reset(), "derivative upload allocator");
+  check(gpu.list->Reset(gpu.allocator.Get(), nullptr), "derivative upload list");
+  for (UINT mip = 0; mip < 4; ++mip) {
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+    src.pResource = upload.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = footprints[mip];
+    dst.pResource = texture.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = mip;
+    gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  }
+  gpu.transition(texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  check(gpu.list->Close(), "derivative upload close");
+  ID3D12CommandList *upload_lists[]{gpu.list.Get()};
+  gpu.queue->ExecuteCommandLists(1, upload_lists);
+  gpu.wait();
+  const UINT shapes[3][3]{{32,1,1}, {8,4,1}, {4,2,2}};
+  for (UINT stage = 0; stage < 2; ++stage) for (UINT shape = 0; shape < 3; ++shape) {
+    const char *suffix = shape == 0 ? "1d" : shape == 1 ? "2d" : "3d";
+    const std::string entry = std::string(stage ? "as_derivatives_" : "ms_derivatives_") + suffix;
+    const std::string name = std::string(stage ? "derivatives_as_" : "derivatives_ms_") + suffix;
+    begin();
+    auto pso = requirePso(gpu, gpu.rootDerivatives.Get(), stage ? entry.c_str() : nullptr,
+        stage ? "ms_derivative_payload" : entry.c_str(), "ps_color");
+    if (pso) {
+      const UINT X = shapes[shape][0], Y = shapes[shape][1], Z = shapes[shape][2], threads = X * Y * Z;
+      auto result = gpu.render(pso.Get(), gpu.rootDerivatives.Get(), {}, {}, 1, [&](auto *list) {
+        ID3D12DescriptorHeap *heaps[]{heap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetGraphicsRootDescriptorTable(3, heap->GetGPUDescriptorHandleForHeapStart());
+        list->DispatchMesh(2, 1, 1);
+      }, 4 + 2 * threads * 24);
+      if (closed(name.c_str(), result)) {
+        for (UINT group = 0; group < 2; ++group) for (UINT i = 0; i < threads; ++i) {
+          const UINT x = i % X, y = (i / X) % Y, z = i / (X * Y);
+          const UINT q = shape == 0 ? i % 4 : (x & 1) + 2 * (y & 1);
+          auto field = [](UINT a, UINT b, UINT c) { return float(100 * c + 10 * a + b + a * b); };
+          std::array<float,4> v{};
+          for (UINT lane = 0; lane < 4; ++lane)
+            v[lane] = shape == 0 ? field((i & ~3u) + lane, 0, 0) : field((x & ~1u) + (lane & 1),
+                (y & ~1u) + (lane >> 1), z);
+          const float dx = v[q | 1] - v[q & 2], dy = v[q | 2] - v[q & 1];
+          const std::array<float,16> expected{v[q], dx, dy, v[1]-v[0], v[2]-v[0], v[q^1],
+              v[q^2], v[q^3], v[3], 1, 1, 0.25f, 0.5f, (q & 1) ? 0.0f : 1.0f, dx, dy};
+          const size_t base = 4 + (group * threads + i) * 24;
+          const UINT identities[]{x,y,z,i,group*X+x,y,z,q};
+          for (UINT k = 0; k < 8; ++k)
+            EXPECT_EQ(name.c_str(), "thread_identity", base+k, result.words[base+k], identities[k]);
+          for (UINT k = 0; k < expected.size(); ++k) {
+            float actual; std::memcpy(&actual, &result.words[base+8+k], 4);
+            if (!std::isfinite(actual) || std::abs(actual-expected[k]) > 0.0001f) {
+              uint32_t bits; std::memcpy(&bits, &expected[k], 4);
+              mismatch(name.c_str(), "quad_sample_lod", base+8+k, result.words[base+8+k], bits);
+            }
+          }
+        }
+        for (size_t i = 0; i < result.pixels.size(); ++i)
+          EXPECT_EQ(name.c_str(), "payload_render", i, result.pixels[i], stage ? rgba(0,255,0,255) : 0);
+      }
+    }
+    end(name.c_str());
+  }
+  begin();
+  for (UINT stage = 0; stage < 2; ++stage) {
+    ComPtr<ID3D12PipelineState> invalid;
+    const HRESULT hr = meshPso(gpu, gpu.rootDerivatives.Get(), stage ? "as_derivatives_invalid" : nullptr,
+        stage ? "ms_derivative_payload" : "ms_derivatives_invalid", "ps_color", 1, invalid);
+    EXPECT_EQ("derivatives_invalid_shape", "pso_rejected", stage, uint32_t(hr), uint32_t(E_INVALIDARG));
+  }
+  end("derivatives_invalid_shape");
+}
+
+void testGroupshared64(Gpu &gpu) {
+  for (UINT stage=0;stage<2;++stage) {
+    const char *name=stage?"groupshared64_as":"groupshared64_ms";
+    begin();
+    auto pso=requirePso(gpu,gpu.root.Get(),stage?"as_groupshared64":nullptr,
+        stage?"ms_derivative_payload":"ms_groupshared64","ps_color");
+    if(pso) {
+      auto result=gpu.render(pso.Get(),gpu.root.Get(),{},{},1,[](auto *list){list->DispatchMesh(2,1,1);},4+2*2*153);
+      if(closed(name,result)) {
+        std::array<uint64_t,128> returned{};
+        for(UINT group=0;group<2;++group) {
+          const size_t group_base=4+2*group*153;
+          for(UINT op=0;op<9;++op) {
+            const uint64_t initial=op==4||op==5?0xfffffff000000002ull:0x200000002ull;
+            const uint64_t operand=op==4||op==5?0xfffffff100000003ull:0x100000001ull;
+            uint64_t expected=operand;
+            switch(op) {
+            case 0: expected=initial+operand; break;
+            case 1: expected=initial&operand; break;
+            case 2: expected=initial|operand; break;
+            case 3: expected=initial^operand; break;
+            case 4: expected=uint64_t(std::min(int64_t(initial),int64_t(operand))); break;
+            case 5: expected=uint64_t(std::max(int64_t(initial),int64_t(operand))); break;
+            case 6: expected=std::min(initial,operand); break;
+            case 7: expected=std::max(initial,operand); break;
+            }
+            const size_t base=group_base+4*op;
+            EXPECT_EQ(name,"operation_old",group*9+op,uint64_t(result.words[base])|(uint64_t(result.words[base+1])<<32),initial);
+            EXPECT_EQ(name,"operation_final",group*9+op,uint64_t(result.words[base+2])|(uint64_t(result.words[base+3])<<32),expected);
+          }
+          const uint64_t compare_wrap[]={0x200000002ull,0x300000003ull,0x300000003ull,UINT64_MAX,0,0x8000000000000000ull};
+          for(UINT op=0;op<6;++op) {
+            const size_t base=group_base+2*(18+op);
+            EXPECT_EQ(name,"compare_wrap",group*6+op,uint64_t(result.words[base])|(uint64_t(result.words[base+1])<<32),compare_wrap[op]);
+          }
+          for(UINT lane=0;lane<128;++lane) {
+            const size_t base=group_base+2*(24+lane);
+            returned[lane]=uint64_t(result.words[base])|(uint64_t(result.words[base+1])<<32);
+          }
+          std::sort(returned.begin(),returned.end());
+          for(UINT lane=0;lane<128;++lane)
+            EXPECT_EQ(name,"returned_permutation",group*128+lane,returned[lane],uint64_t(lane)*0x100000001ull);
+          const size_t base=group_base+2*152;
+          EXPECT_EQ(name,"final",group,uint64_t(result.words[base])|(uint64_t(result.words[base+1])<<32),128ull*0x100000001ull);
+        }
+        for(size_t pixel=0;pixel<result.pixels.size();++pixel)
+          EXPECT_EQ(name,"payload_render",pixel,result.pixels[pixel],stage?rgba(0,255,0,255):0);
+      }
+    }
+    end(name);
+  }
+}
+
 void printCaps(ID3D12Device *device) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7{};
   D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9{};
@@ -1373,7 +1602,7 @@ void printCaps(ID3D12Device *device) {
   std::fflush(stdout);
 }
 
-int run() {
+int run(bool groupshared64Only) {
   HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
   using BackendIdFn = const char *(WINAPI *)();
   auto backend = d3d12 ? reinterpret_cast<BackendIdFn>(GetProcAddress(d3d12, "OwnedGraphicsBackendId")) : nullptr;
@@ -1390,6 +1619,15 @@ int run() {
   printCaps(device.Get());
 
   Gpu gpu(device.Get());
+  if (groupshared64Only) {
+    testGroupshared64(gpu);
+    std::printf("OWNED_D3D12_MESH_SHADER_%s groupshared64=2 failures=%d\n",
+                g_failures ? "FAIL" : "PASS", g_failures);
+    std::fflush(stdout);
+    return g_failures ? 1 : 0;
+  }
+  testDerivatives(gpu);
+  testGroupshared64(gpu);
   testBasic(gpu, 1);
   testGrid(gpu);
   testPayload(gpu);
@@ -1421,4 +1659,8 @@ int run() {
 
 } // namespace
 
-int wmain() { return run(); }
+int wmain(int argc, wchar_t **argv) {
+  if (argc == 1) return run(false);
+  if (argc == 2 && std::wcscmp(argv[1], L"--groupshared64-only") == 0) return run(true);
+  die("usage: mesh-shader [--groupshared64-only]");
+}

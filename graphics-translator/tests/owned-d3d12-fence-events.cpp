@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -284,6 +285,151 @@ void invalidArguments(ID3D12Device1 *device) {
   std::puts("OWNED_D3D12_FENCE_EVENTS_CASE_PASS case=invalid_arguments exact_hresult=1 no_partial_registration=1");
 }
 
+void explicitDeviceRemoval(ID3D12Device1 *device) {
+  ComPtr<ID3D12Device5> device5;
+  check(device->QueryInterface(IID_PPV_ARGS(&device5)), "removal QueryInterface Device5");
+  if (device->GetDeviceRemovedReason() != S_OK) fail("removal subject is already removed");
+
+  auto first = makeFence(device), second = makeFence(device, 7);
+  auto unmonitored = makeFence(device, 19);
+  ComPtr<ID3D12Fence> shared;
+  check(device->CreateFence(11, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&shared)),
+        "removal CreateFence shared");
+  HANDLE sharedHandle = nullptr;
+  check(device->CreateSharedHandle(shared.Get(), nullptr, GENERIC_ALL, nullptr, &sharedHandle),
+        "removal CreateSharedHandle");
+  ComPtr<ID3D12Fence> openedShared;
+  const HRESULT openResult = device->OpenSharedHandle(sharedHandle, IID_PPV_ARGS(&openedShared));
+  if (!CloseHandle(sharedHandle)) fail("removal CloseHandle shared", HRESULT_FROM_WIN32(GetLastError()));
+  check(openResult, "removal OpenSharedHandle");
+  requireValue(second.Get(), 7, "removal initial nonzero fence");
+  requireValue(shared.Get(), 11, "removal initial shared fence");
+  requireValue(openedShared.Get(), 11, "removal initial opened shared fence");
+  ID3D12Fence *fences[] = {first.Get(), second.Get(), shared.Get(), openedShared.Get()};
+  const UINT64 values[] = {UINT64_MAX, 13, 17, UINT64_MAX};
+  Event maximum, lower, sharedDone, any, all;
+  check(first->SetEventOnCompletion(UINT64_MAX, maximum.handle), "removal maximum single registration");
+  check(second->SetEventOnCompletion(13, lower.handle), "removal lower single registration");
+  check(openedShared->SetEventOnCompletion(UINT64_MAX, sharedDone.handle), "removal opened shared registration");
+  check(device->SetEventOnMultipleFenceCompletion(fences, values, 4,
+      D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY, any.handle), "removal ANY registration");
+  check(device->SetEventOnMultipleFenceCompletion(fences, values, 4,
+      D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, all.handle), "removal ALL registration");
+  const std::array<Event *, 5> notifications = {&maximum, &lower, &sharedDone, &any, &all};
+  for (const auto event : notifications)
+    event->expect(WAIT_TIMEOUT, 0, "removal pending event initially ready");
+
+  std::array<Event, 3> entered, returned;
+  std::array<HRESULT, 3> results = {E_FAIL, E_FAIL, E_FAIL};
+  std::array<std::thread, 3> waiters;
+  for (std::size_t i = 0; i < waiters.size(); ++i) {
+    waiters[i] = std::thread([&, i] {
+      SetEvent(entered[i].handle);
+      if (i == 0)
+        results[i] = first->SetEventOnCompletion(UINT64_MAX, nullptr);
+      else
+        results[i] = device->SetEventOnMultipleFenceCompletion(fences, values, 4,
+            i == 1 ? D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY : D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, nullptr);
+      SetEvent(returned[i].handle);
+    });
+  }
+  for (std::size_t i = 0; i < waiters.size(); ++i) {
+    entered[i].expect(WAIT_OBJECT_0, kTimeout, "removal null-event waiter startup");
+    returned[i].expect(WAIT_TIMEOUT, 100, "removal null-event method returned before removal");
+  }
+
+  std::array<Event, 4> raceGate, raceReturned;
+  std::array<Event, 3> raceNotifications;
+  std::array<HRESULT, 4> raceResults = {E_FAIL, E_FAIL, E_FAIL, E_FAIL};
+  std::array<std::thread, 4> racers;
+  ComPtr<ID3D12Fence> raceFence;
+  for (std::size_t i = 0; i < racers.size(); ++i) {
+    racers[i] = std::thread([&, i] {
+      raceGate[i].expect(WAIT_OBJECT_0, kTimeout, "removal race start gate");
+      if (i == 3)
+        raceResults[i] = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&raceFence));
+      else if (i == 0)
+        raceResults[i] = openedShared->SetEventOnCompletion(UINT64_MAX, raceNotifications[i].handle);
+      else
+        raceResults[i] = device->SetEventOnMultipleFenceCompletion(fences, values, 4,
+            i == 1 ? D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY : D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
+            raceNotifications[i].handle);
+      SetEvent(raceReturned[i].handle);
+    });
+  }
+  // Release once around the same removal transition; either scheduling outcome
+  // is valid, but successful calls must not leave fences or events stranded.
+  for (const auto &gate : raceGate)
+    if (!SetEvent(gate.handle)) fail("removal release race gate", HRESULT_FROM_WIN32(GetLastError()));
+  device5->RemoveDevice();
+  HRESULT reason = device->GetDeviceRemovedReason();
+  if (reason != DXGI_ERROR_DEVICE_REMOVED) fail("explicit removal reason", reason);
+  const std::array<ID3D12Fence *, 5> removedFences = {first.Get(), second.Get(), shared.Get(), openedShared.Get(), unmonitored.Get()};
+  for (const auto fence : removedFences)
+    requireValue(fence, UINT64_MAX, "removal did not terminally complete every fence");
+  for (const auto event : notifications)
+    event->expect(WAIT_OBJECT_0, kTimeout, "removal pending event did not fire");
+  // A failed wait exits the process before any thread destructor or join can
+  // hang on the broken removal path. Successful completion bounds every join.
+  for (const auto &event : returned)
+    event.expect(WAIT_OBJECT_0, kTimeout, "removal null-event wait did not return");
+  for (auto &waiter : waiters) waiter.join();
+  for (const HRESULT result : results)
+    if (result != DXGI_ERROR_DEVICE_REMOVED) fail("removal null-event result", result);
+  for (const auto &event : raceReturned)
+    event.expect(WAIT_OBJECT_0, kTimeout, "removal racing call did not return");
+  for (auto &racer : racers) racer.join();
+  for (std::size_t i = 0; i < raceResults.size(); ++i) {
+    const HRESULT result = raceResults[i];
+    if (result != S_OK && result != DXGI_ERROR_DEVICE_REMOVED)
+      fail("removal racing call result", result);
+    if (i == 3) {
+      if (result == S_OK) {
+        if (!raceFence) fail("removal racing CreateFence omitted output");
+        requireValue(raceFence.Get(), UINT64_MAX, "removal racing fence stranded");
+      } else if (raceFence) {
+        fail("removal rejected racing CreateFence populated output");
+      }
+    } else {
+      raceNotifications[i].expect(result == S_OK ? WAIT_OBJECT_0 : WAIT_TIMEOUT,
+          result == S_OK ? kTimeout : 0, "removal racing registration notification");
+      raceNotifications[i].expect(WAIT_TIMEOUT, 0, "removal racing notification repeated");
+    }
+  }
+  for (const auto event : notifications)
+    event->expect(WAIT_TIMEOUT, 100, "removal event fired more than once");
+
+  HRESULT hr = first->Signal(1);
+  if (hr != DXGI_ERROR_DEVICE_REMOVED) fail("removed fence accepted CPU Signal", hr);
+  Event lateSingle, lateAny, lateAll;
+  hr = first->SetEventOnCompletion(UINT64_MAX, lateSingle.handle);
+  if (hr != DXGI_ERROR_DEVICE_REMOVED) fail("removed fence accepted single registration", hr);
+  hr = device->SetEventOnMultipleFenceCompletion(fences, values, 4,
+      D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY, lateAny.handle);
+  if (hr != DXGI_ERROR_DEVICE_REMOVED) fail("removed device accepted ANY registration", hr);
+  hr = device->SetEventOnMultipleFenceCompletion(fences, values, 4,
+      D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, lateAll.handle);
+  if (hr != DXGI_ERROR_DEVICE_REMOVED) fail("removed device accepted ALL registration", hr);
+  ComPtr<ID3D12Fence> lateFence;
+  hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&lateFence));
+  if (hr != DXGI_ERROR_DEVICE_REMOVED) fail("removed device accepted new fence", hr);
+  if (lateFence) fail("removed CreateFence populated initialized output");
+  lateSingle.expect(WAIT_TIMEOUT, 100, "rejected late single registration fired");
+  lateAny.expect(WAIT_TIMEOUT, 100, "rejected late ANY registration fired");
+  lateAll.expect(WAIT_TIMEOUT, 100, "rejected late ALL registration fired");
+
+  device5->RemoveDevice();
+  device5->RemoveDevice();
+  reason = device->GetDeviceRemovedReason();
+  if (reason != DXGI_ERROR_DEVICE_REMOVED) fail("repeated removal changed reason", reason);
+  for (const auto fence : removedFences)
+    requireValue(fence, UINT64_MAX, "repeated removal or rejected Signal changed terminal fence");
+  for (const auto event : notifications)
+    event->expect(WAIT_TIMEOUT, 100, "repeated removal duplicated notification");
+
+  std::puts("OWNED_D3D12_FENCE_EVENTS_CASE_PASS case=explicit_device_removal maximum=1 lower=1 shared_opened=1 any_all=1 null_single_any_all=1 all_fences_terminal=1 late_rejected=1 idempotent=1 registration_creation_race=1");
+}
+
 void teardown() {
   constexpr unsigned iterations = 64;
   // Keep handles alive through the entire stress case. A pending notification
@@ -317,6 +463,7 @@ int main() {
   crossDevice(device.Get());
   invalidArguments(device.Get());
   teardown();
+  explicitDeviceRemoval(device.Get());
   std::puts("OWNED_D3D12_FENCE_EVENTS_PASS any_all=1 synchronous_null=1 callback_lifetime=1 rewind=1 mixed_producers=1");
   return 0;
 }

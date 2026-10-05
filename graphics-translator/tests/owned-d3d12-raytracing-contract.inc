@@ -684,6 +684,42 @@ int caseVertexFormats(Runner &run) {
   return run.reportCase("vertex-formats", bad);
 }
 
+// An asymmetric row-major geometry transform with translation must intersect exactly like
+// independently baked vertices. The off-diagonal terms distinguish a transpose/layout error
+// from an identity, diagonal-scale, or translation-only implementation.
+int caseGeometryTransformLayout(Runner &run) {
+  // Determinant 2: both the transform and its inverse have exactly representable values.
+  const Mat transform{{{2, 0, 0, 4}, {0.5f, 1, 0, -2}, {0.25f, 0.5f, 1, 3}}};
+  const float original[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+  const float baked[] = {4, -2, 3, 6, -1.5f, 3.25f, 4, -1, 3.5f};
+  auto matrix = run.upload(&transform, sizeof(transform));
+  auto originalVertices = run.upload(original, sizeof(original));
+  auto bakedVertices = run.upload(baked, sizeof(baked));
+  const auto transformedGeometry = triangles(originalVertices->GetGPUVirtualAddress(), 12, 3,
+      DXGI_FORMAT_R32G32B32_FLOAT, D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE, matrix->GetGPUVirtualAddress());
+  const auto bakedGeometry = triangles(bakedVertices->GetGPUVirtualAddress(), 12, 3,
+      DXGI_FORMAT_R32G32B32_FLOAT, D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE);
+  auto transformedBlas = run.build(blasInputs(&transformedGeometry, 1), "contract: row-major geometry BLAS");
+  auto bakedBlas = run.build(blasInputs(&bakedGeometry, 1), "contract: baked geometry BLAS");
+  const Mat identityMatrix = translateScale(1, 0, 0, 0);
+  const D3D12_RAYTRACING_INSTANCE_DESC instances[] = {
+      instanceDesc(identityMatrix.m, 0x31, 1, 0, 0, transformedBlas->GetGPUVirtualAddress()),
+      instanceDesc(identityMatrix.m, 0x32, 2, 0, 0, bakedBlas->GetGPUVirtualAddress()),
+  };
+  auto instanceBuffer = run.upload(instances, sizeof(instances));
+  auto tlas = run.build(tlasInputs(instanceBuffer->GetGPUVirtualAddress(), 2), "contract: geometry layout TLAS");
+  const std::vector<LaneRay> rays = {
+      ray(4.5f, -1.625f, 2.1875f, 0, 0, 1, 0, 1),
+      ray(4.5f, -1.625f, 2.1875f, 0, 0, 1, 0, 2),
+  };
+  auto words = run.trace("geometry-transform-row-major", tlas->GetGPUVirtualAddress(), rays);
+  int bad = run.expect("geometry-transform-row-major", words, 0,
+      triangleHit(1, 0.25f, 0.25f, kHitGroupTagBase, 0x31, 0));
+  bad += run.expect("geometry-transform-baked", words, 1,
+      triangleHit(1, 0.25f, 0.25f, kHitGroupTagBase, 0x32, 1));
+  return run.reportCase("geometry-transform-row-major", bad);
+}
+
 // Indexed geometry (R16 and R32 indices), an inactive (NaN x) triangle that still occupies its
 // PrimitiveIndex, a geometry with zero triangles that still occupies its GeometryIndex, an
 // AABB-free BLAS with no geometry at all, and the D3D12 inactive-instance and empty / NULL
@@ -950,6 +986,7 @@ int runAll(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8_t> &dxi
   Runner run(device5, ctx, dxil);
   int failures = 0;
   failures += caseVertexFormats(run);
+  failures += caseGeometryTransformLayout(run);
   failures += caseGeometryRules(run);
   failures += caseTransforms(run);
   failures += caseInstancesAndHitGroups(run);

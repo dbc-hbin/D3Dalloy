@@ -25,6 +25,7 @@
 #include "d3d12_pipeline_library.hpp"
 #include "d3d12_resource_contract.hpp"
 #include "d3d12_state_object.hpp"
+#include "d3d12_matrix.hpp"
 #include "d3d12_temporal.hpp"
 #include "d3d12_frame_generation.hpp"
 #include "Metal.hpp"
@@ -69,7 +70,7 @@ static bool IsResourceDescriptorCompatible(MTLD3D12Device *device, const D3D12_R
          IsD3D12TextureSampleSupported(device, desc.Format, mapped, desc.Flags, desc.SampleDesc.Count);
 }
 
-HRESULT PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc);
+HRESULT PopulateWMTTextureInfo(MTLD3D12Device *device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc);
 
 /*
  * Serialized root signature of a GlobalRootSignature/LocalRootSignature subobject declared in a
@@ -117,7 +118,7 @@ bool ResolveRTASGPUVA(void *context, D3D12_GPU_VIRTUAL_ADDRESS address, uint64_t
   return true;
 }
 
-class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt, IMTLD3D12FrameGenerationDevice>> {
+class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt, IMTLD3D12FrameGenerationDevice, IMTLD3D12Reflex, ID3D12DevicePreview, ID3D12DeviceConfiguration>> {
 
   Com<IMTLDXGIAdapter> adapter_;
   WMT::Reference<WMT4::Compiler> metal4_compiler_;
@@ -128,6 +129,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   std::atomic<HRESULT> removal_reason_{S_OK};
   std::mutex removal_mutex_;
   std::vector<std::weak_ptr<owned_graphics::FenceOrderEpoch>> fence_orders_;
+  std::shared_ptr<ExperimentalDeviceRegistration> experimental_registration_;
 
   bool advertise_numa_ = false;
 
@@ -135,12 +137,17 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   WMT::Reference<WMT::ResidencySet> residency_set_;
   std::mutex sparse_mapping_queue_mutex_;
   WMT::Reference<WMT::MTL4CommandQueue> sparse_mapping_queue_;
+  WMT::Reference<WMT::MTL4CommandAllocator> sparse_mapping_allocator_;
+  WMT::Reference<WMT::MTL4CommandBuffer> sparse_mapping_command_buffer_;
+  WMT::Reference<WMT::MTL4Submission> sparse_mapping_publication_;
   /* SM 6.6 64 bit atomic emulation lock table (SM50_ATOMIC_LOCK_TABLE_ENTRIES words). */
   WMT::Reference<WMT::Buffer> atomic_lock_table_;
   uint64_t atomic_lock_table_address_ = 0;
+  WMT::Reference<WMT::Buffer> atomic64_context_;
+  uint64_t atomic64_context_address_ = 0;
   std::map<uint64_t, BufferAllocation *> interval_map_;
   dxmt::mutex swizzle_texture_lock_;
-  std::unordered_map<Texture *, MTLD3D12Resource *> swizzle_textures_;
+  std::unordered_map<const void *, MTLD3D12Resource *> descriptor_resources_;
   std::atomic<uint32_t> swizzle_texture_count_{0};
 
   InternalCommandLibrary command_library;
@@ -250,6 +257,16 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   }
 
 public:
+  HRESULT STDMETHODCALLTYPE SetReflexMode(BOOL low, UINT interval, BOOL markers) override {
+    return reflex.SetMode(low, interval, markers);
+  }
+  HRESULT STDMETHODCALLTYPE GetReflexStatus(BOOL *low, UINT *sleep, BOOL *game) override {
+    return reflex.Status(low, sleep, game);
+  }
+  HRESULT STDMETHODCALLTYPE ReflexSleep() override { return reflex.Sleep(); }
+  HRESULT STDMETHODCALLTYPE ReflexMarker(UINT64 frame, UINT marker) override { return reflex.Marker(frame, marker); }
+  HRESULT STDMETHODCALLTYPE GetReflexReports(DXMT_REFLEX_REPORT *reports) override { return reflex.Reports(reports); }
+
   HRESULT RemovedReason() const override {
     return removal_reason_.load(std::memory_order_acquire);
   }
@@ -263,9 +280,12 @@ public:
       removal_reason_.store(reason, std::memory_order_release);
       orders.swap(fence_orders_);
     }
+    gpu_execution_gate.Cancel();
+    reflex.Remove();
     for (auto &weak : orders)
       if (auto order = weak.lock())
         order->remove();
+    diagnostics.Removed(reason);
   }
 
   bool RegisterFenceOrder(const std::shared_ptr<owned_graphics::FenceOrderEpoch> &order) override {
@@ -290,7 +310,11 @@ public:
       adapter_(adapter), command_library(adapter_->GetMTLDevice()),
       rtas_mirror_([this](uint64_t slot_count) { return CreateRTASMirrorPage(slot_count); }) {}
 
-  ~MTLD3D12DeviceImpl() {}
+  ~MTLD3D12DeviceImpl() { UnregisterExperimentalDevice(experimental_registration_); }
+
+  HRESULT RegisterExperimentalFeatures() {
+    return RegisterExperimentalDevice(this, experimental_registration_);
+  }
 
   HRESULT
   Initialize() {
@@ -323,6 +347,19 @@ public:
       atomic_lock_table_address_ = lock_info.gpu_address;
       WMT::Buffer lock_buffer = atomic_lock_table_;
       residency_set_.addAllocations(&lock_buffer, 1);
+      residency_set_.commit();
+    }
+    {
+      WMTBufferInfo context_info{};
+      context_info.length = sizeof(SM50_ATOMIC64_CONTEXT);
+      context_info.options = WMTResourceHazardTrackingModeUntracked | WMT_RESOURCE_CPU_ADDRESSABLE;
+      atomic64_context_ = GetMTLDevice().newBuffer(context_info);
+      if (!atomic64_context_) return E_OUTOFMEMORY;
+      if (auto *bytes = context_info.memory.get_accessible_or_null())
+        memset(bytes, 0, context_info.length);
+      atomic64_context_address_ = context_info.gpu_address;
+      WMT::Buffer context_buffer = atomic64_context_;
+      residency_set_.addAllocations(&context_buffer, 1);
       residency_set_.commit();
     }
     
@@ -363,6 +400,44 @@ public:
     return 1; // FIXME
   };
 
+  D3D12_DEVICE_CONFIGURATION_DESC *STDMETHODCALLTYPE
+  GetDesc(D3D12_DEVICE_CONFIGURATION_DESC *result) final {
+    *result = {};
+    if (runtime_configuration.debug)
+      result->Flags |= D3D12_DEVICE_FLAG_DEBUG_LAYER_ENABLED;
+    if (runtime_configuration.breadcrumbs != D3D12_DRED_ENABLEMENT_FORCED_OFF)
+      result->Flags |= D3D12_DEVICE_FLAG_DRED_AUTO_BREADCRUMBS_ENABLED;
+    if (runtime_configuration.contexts == D3D12_DRED_ENABLEMENT_FORCED_ON)
+      result->Flags |= D3D12_DEVICE_FLAG_DRED_BREADCRUMB_CONTEXT_ENABLED;
+    result->SDKVersion = runtime_configuration.sdk_version;
+    result->NumEnabledExperimentalFeatures = runtime_configuration.experimental_shader_models ? 1 : 0;
+    return result;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  GetEnabledExperimentalFeatures(GUID *guids, UINT num_guids) final {
+    const UINT count = runtime_configuration.experimental_shader_models ? 1 : 0;
+    if (num_guids < count)
+      return E_INVALIDARG;
+    if (count && !guids)
+      return E_POINTER;
+    if (count)
+      guids[0] = D3D12ExperimentalShaderModels;
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  SerializeVersionedRootSignature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc,
+                                 ID3DBlob **result, ID3DBlob **error) final {
+    return ::D3D12SerializeVersionedRootSignature(desc, result, error);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateVersionedRootSignatureDeserializer(const void *blob, SIZE_T size, REFIID riid,
+                                          void **deserializer) final {
+    return ::D3D12CreateVersionedRootSignatureDeserializer(blob, size, riid, deserializer);
+  }
+
   HRESULT
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) {
@@ -371,8 +446,26 @@ public:
 
     *ppvObject = nullptr;
 
+    if (HRESULT hr = diagnostics.QueryInterface(riid, ppvObject); hr != E_NOINTERFACE)
+      return hr;
+
+    if (riid == __uuidof(ID3D12DeviceConfiguration)) {
+      *ppvObject = static_cast<ID3D12DeviceConfiguration *>(this);
+      AddRef();
+      return S_OK;
+    }
+    if (riid == __uuidof(ID3D12DevicePreview)) {
+      *ppvObject = static_cast<ID3D12DevicePreview *>(this);
+      AddRef();
+      return S_OK;
+    }
     if (riid == __uuidof(IMTLD3D12FrameGenerationDevice)) {
       *ppvObject = static_cast<IMTLD3D12FrameGenerationDevice *>(this);
+      AddRef();
+      return S_OK;
+    }
+    if (riid == __uuidof(IMTLD3D12Reflex)) {
+      *ppvObject = static_cast<IMTLD3D12Reflex *>(this);
       AddRef();
       return S_OK;
     }
@@ -422,10 +515,10 @@ public:
     if (!pDesc || pDesc->NodeMask > 1 ||
         (pDesc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT &&
          pDesc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
-         pDesc->Type != D3D12_COMMAND_LIST_TYPE_COPY))
+         pDesc->Type != D3D12_COMMAND_LIST_TYPE_COPY)) {
+      diagnostics.Validation(D3D12_MESSAGE_ID_CORRUPTED_PARAMETER1, "CreateCommandQueue: invalid queue descriptor or node mask");
       return E_INVALIDARG;
-    if (pDesc->Flags)
-      WARN("CreateCommandQueue: flags ignored: ", pDesc->Flags);
+    }
     return dxmt::CreateCommandQueue(this, pDesc, riid, ppCommandQueue);
   };
 
@@ -477,16 +570,123 @@ public:
     return allocator->CreateCommandList(NodeMask, Type, pInitialPipelineState, riid, ppCommandList);
   };
 
+  void STDMETHODCALLTYPE GetLinearAlgebraMatrixConversionDestinationInfo(D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_DEST_INFO *desc) override {
+    if (!desc) return;
+    uint32_t bytes = 0, stride;
+    matrix::Footprint(desc->NumRows, desc->NumColumns, desc->DestDataType, desc->DestLayout,
+                      desc->DestStride, true, bytes, stride);
+    desc->DestSize = bytes;
+  }
+  HRESULT STDMETHODCALLTYPE ConfigureDumpFile(D3D12_DUMP_FILE_DRIVER_OPTIONS) override { return DXGI_ERROR_UNSUPPORTED; }
+  void STDMETHODCALLTYPE SetDumpFileCallbacks(D3D12_DUMPFILEBEGINCALLBACK, D3D12_DUMPFILEENDCALLBACK) override {
+    // No dump facility is advertised: never retain or invoke application callbacks.
+    WARN("SetDumpFileCallbacks: dump files are unsupported");
+  }
+  HRESULT STDMETHODCALLTYPE AddBlobToDumpFile(void *blob, UINT size, UINT64) override {
+    return size && !blob ? E_INVALIDARG : DXGI_ERROR_UNSUPPORTED;
+  }
+  void STDMETHODCALLTYPE RetainDumpFile(BOOL) override { WARN("RetainDumpFile: dump files are unsupported"); }
+  D3D12_DEVICE_ERROR_CODE STDMETHODCALLTYPE GetDeviceErrorCode() override {
+    const auto reason = RemovedReason();
+    return reason == S_OK ? D3D12_DEVICE_ERROR_NONE : reason == DXGI_ERROR_DEVICE_HUNG ?
+        D3D12_DEVICE_ERROR_DEVICE_HUNG : D3D12_DEVICE_ERROR_UNKNOWN;
+  }
+
+
   HRESULT STDMETHODCALLTYPE
   CheckFeatureSupport(D3D12_FEATURE Feature, void *pFeatureData, UINT DataSize) {
     if (!pFeatureData)
       return E_INVALIDARG;
     auto metal = GetMTLDevice();
     switch (UINT(Feature)) {
+    case 38: {
+      // The retired preview query is not declared by current DirectX-Headers.
+      struct WaveMMA { UINT input, m, n; BOOL supported; UINT k, accum, wave_min, wave_max; };
+      static_assert(sizeof(WaveMMA) == 32);
+      if (DataSize != sizeof(WaveMMA)) return E_INVALIDARG;
+      auto &out = *static_cast<WaveMMA *>(pFeatureData);
+      if (out.input < 1 || out.input > 3 || out.m < 1 || out.m > 2 || out.n < 1 || out.n > 2) return E_INVALIDARG;
+      out.supported = TRUE; out.k = 16;
+      out.accum = out.input == 1 ? 1 : out.input == 2 ? 6 : 4;
+      out.wave_min = out.wave_max = 32;
+      return S_OK;
+    }
+    case 77: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT)) return E_INVALIDARG;
+      static_cast<D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT *>(pFeatureData)->LinearAlgebraTier =
+          D3D12_LINEAR_ALGEBRA_TIER_1_0;
+      return S_OK;
+    }
+    case 78: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT)) return E_INVALIDARG;
+      auto &out = *static_cast<D3D12_FEATURE_DATA_LINEAR_ALGEBRA_MATRIX_OPERATION_SUPPORT *>(pFeatureData);
+      const auto none = D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_NONE;
+      const auto supported = D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_SUPPORTED;
+      switch (out.OperationType) {
+      case D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_MATRIX_CONSTRUCTION: {
+        auto &query = out.MatrixConstruction;
+        const bool accepts = matrix::ComponentBytes(query.ComponentType) && (!query.WaveSize || query.WaveSize == 32);
+        query.MinM = query.MinK = query.MinN = accepts ? 16 : 0; break;
+      }
+      case D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_WAVE_MATRIX_MULTIPLY: {
+        auto &query = out.WaveMatrixMultiply;
+        if (query.NumShapes && !query.Shapes) return E_INVALIDARG;
+        const auto &inputs = query.Inputs;
+        const bool accepts = matrix::MultiplySupported(inputs.WaveSize, inputs.MatrixAComponentType, inputs.MatrixBComponentType, inputs.AccumulatorComponentType);
+        query.SupportFlags = accepts ? static_cast<D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAGS>(supported |
+            (inputs.AccumulatorComponentType == 7 ? D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_EMULATED_OUTPUTS : 0)) : none;
+        // V1 count/fill: one native tiling covers every multiple of 16. With
+        // one shape, every nonzero input capacity is sufficient.
+        if (accepts && query.NumShapes) query.Shapes[0] = {16,16,16};
+        query.NumShapes = accepts ? 1 : 0; break;
+      }
+      case D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREADGROUP_MATRIX_MULTIPLY: {
+        auto &query = out.ThreadGroupMatrixMultiply; const auto &inputs = query.WaveInputs; const auto &shape = query.Shape;
+        const bool accepts = shape.M && shape.K && shape.N &&
+            !(shape.M % 16 || shape.K % 16 || shape.N % 16) &&
+            matrix::MultiplySupported(inputs.WaveSize, inputs.MatrixAComponentType, inputs.MatrixBComponentType, inputs.AccumulatorComponentType);
+        query.SupportFlags = accepts ? static_cast<D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAGS>(supported |
+            (inputs.AccumulatorComponentType == 7 ? D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_EMULATED_OUTPUTS : 0)) : none;
+        query.MinThreadGroupSize = accepts ? 32 : 0; query.MaxThreadGroupSize = accepts ? 1024 : 0;
+        query.PreferredThreadGroupSize = accepts ? 32 : 0; break;
+      }
+      case D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREAD_VECTOR_MATRIX_MULTIPLY: {
+        auto &query = out.ThreadVectorMatrixMultiply;
+        const bool matrix_float = query.MatrixInputType == 7 || query.MatrixInputType == 8 || query.MatrixInputType == 20 || query.MatrixInputType == 21;
+        const bool result = matrix_float ? query.VectorResultType == 7 || query.VectorResultType == 8 : query.VectorResultType == 4 || query.VectorResultType == 5;
+        const bool accepts = matrix::ComponentBytes(query.VectorInputType) && matrix::ComponentBytes(query.MatrixInputType) && result &&
+            (!query.BiasInputType || query.BiasInputType == query.VectorResultType);
+        query.SupportFlags = accepts ? static_cast<D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAGS>(supported | D3D12_LINEAR_ALGEBRA_MULTIPLICATION_SUPPORT_FLAG_TRANSPOSE) : none; break;
+      }
+      case D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_THREAD_OUTER_PRODUCT: {
+        auto &query = out.ThreadOuterProductSupport;
+        const UINT input = query.InputComponentType;
+        query.Supported = (input == 2 || input == 3 || input == 4 || input == 5 || input == 7 || input == 8) &&
+            matrix::MultiplySupported(32, input, input, query.ResultComponentType); break;
+      }
+      case D3D12_LINEAR_ALGEBRA_OPERATION_TYPE_ATOMIC_ACCUMULATE_STORE: {
+        auto &query = out.AccumulateStore;
+        query.RWByteAddressBufferSupported = query.GroupSharedSupported =
+            (query.ComponentType == 4 || query.ComponentType == 5 || query.ComponentType == 8); break;
+      }
+      default: return E_INVALIDARG;
+      }
+      return S_OK;
+    }
+
     case kFeatureD3D12Options21: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21)) return E_INVALIDARG;
       auto *out = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS21 *>(pFeatureData);
       *out = {D3D12_WORK_GRAPHS_TIER_1_0, D3D12_EXECUTE_INDIRECT_TIER_1_0, FALSE, FALSE};
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS22: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS22)) return E_INVALIDARG;
+      auto *out = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS22 *>(pFeatureData);
+      // MaybeReorderThread is a conforming no-op; no scheduling acceleration or
+      // byte-offset views are exposed. Dispatch dimensions retain the D3D12 limit.
+      *out = {FALSE, FALSE, D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION,
+          D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION};
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS10: {
@@ -507,6 +707,13 @@ public:
            out->CommandListType == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
            out->CommandListType == D3D12_COMMAND_LIST_TYPE_COPY) &&
           out->Priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+      return S_OK;
+    }
+    case kFeatureHardwareSchedulingQueueGroupings: {
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_HARDWARE_SCHEDULING_QUEUE_GROUPINGS))
+        return E_INVALIDARG;
+      // Each frontend queue owns one native Metal queue: CreatorID cannot merge scheduler groups.
+      static_cast<D3D12_FEATURE_DATA_HARDWARE_SCHEDULING_QUEUE_GROUPINGS *>(pFeatureData)->ComputeQueuesPer3DQueue = 0;
       return S_OK;
     }
     case D3D12_FEATURE_EXISTING_HEAPS: {
@@ -681,19 +888,15 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS *>(pFeatureData);
-      out->DoublePrecisionFloatShaderOps = FALSE;
+      out->DoublePrecisionFloatShaderOps = TRUE;
       // All 16 ops on every renderable UINT format (feature-level suite): native Metal logic op, or the exact
       // framebuffer-fetch PS epilogue when an RGB10A2_UINT target is bound (Metal saturates that format).
       out->OutputMergerLogicOp = TRUE;
       out->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_16_BIT;
-      /*
-       * Tier 2 (tiled suite): reserved buffers and 2D textures over Metal 64KB placement sparse pages,
-       * NULL tiles reading zero and dropping writes, residency status for every access, and min/max
-       * filtering. Tier 3 is unreported: Metal's 3D sparse tile (e.g. 128x128x1 for RGBA8) is not the
-       * D3D12 standard 3D tile (32x32x16), so volume tiles cannot be mapped individually.
-       */
-      out->TiledResourcesTier = GetMTLDevice().supportsPlacementSparse() ? D3D12_TILED_RESOURCES_TIER_2
-                                                                         : D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+      // Volumes use a 64KB logical-tile atlas; packed mip tails retain per-array-slice mappings.
+      out->TiledResourcesTier = GetMTLDevice().supportsPlacementSparse()
+          ? static_cast<D3D12_TILED_RESOURCES_TIER>(4)
+          : D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
       // Tier 3: heap-sized unbounded CBV/SRV/UAV tables with no per-stage limits, unpopulated
       // table entries, and SM 6.6 ResourceDescriptorHeap/SamplerDescriptorHeap over
       // 1,000,000 / 2048 descriptor heaps (bindless suite).
@@ -701,7 +904,7 @@ public:
       out->PSSpecifiedStencilRefSupported = TRUE;
       out->TypedUAVLoadAdditionalFormats = TRUE;
       out->ROVsSupported = TRUE;
-      out->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_1;
+      out->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_3;
       out->MaxGPUVirtualAddressBitsPerResource = 48;
       out->StandardSwizzle64KBSupported = TRUE;
       out->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
@@ -716,17 +919,20 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS13 *>(pFeatureData);
-      // None of these relaxations is implemented (copy pitch/alignment, inverted viewports,
-      // cross-dimension copies, alpha blend factor).
-      *out = {};
+      out->UnrestrictedBufferTextureCopyPitchSupported = TRUE;
+      out->UnrestrictedVertexElementAlignmentSupported = TRUE;
+      out->InvertedViewportHeightFlipsYSupported = TRUE;
+      out->InvertedViewportDepthFlipsZSupported = TRUE;
+      out->TextureCopyBetweenDimensionsSupported = TRUE;
+      out->AlphaBlendFactorSupported = TRUE;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS14: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS14))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS14 *>(pFeatureData);
-      out->AdvancedTextureOpsSupported = FALSE;
-      out->WriteableMSAATexturesSupported = FALSE;
+      out->AdvancedTextureOpsSupported = TRUE;
+      out->WriteableMSAATexturesSupported = TRUE;
       // OMSetFrontAndBackStencilRef and D3D12_DEPTH_STENCIL_DESC2 per-face masks.
       out->IndependentFrontAndBackStencilRefMaskSupported = kReportLayoutFeatures;
       return S_OK;
@@ -735,7 +941,7 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS15))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS15 *>(pFeatureData);
-      out->TriangleFanSupported = FALSE;
+      out->TriangleFanSupported = TRUE;
       out->DynamicIndexBufferStripCutSupported = kReportLayoutFeatures;
       return S_OK;
     }
@@ -752,8 +958,7 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS17))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS17 *>(pFeatureData);
-      // Heap samplers reject D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES (CreateSampler2).
-      out->NonNormalizedCoordinateSamplersSupported = FALSE;
+      out->NonNormalizedCoordinateSamplersSupported = TRUE;
       out->ManualWriteTrackingResourceSupported = FALSE;
       return S_OK;
     }
@@ -769,8 +974,13 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2 *>(pFeatureData);
-      out->DepthBoundsTestSupported = FALSE;
-      out->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+      auto metal = GetMTLDevice();
+      // Apple7+ supports exact R8Uint per-sample boolean coverage and depth-plane reads. Apple10 stays native.
+      out->DepthBoundsTestSupported = metal.supportsFamily(WMTGPUFamilyApple7);
+      out->ProgrammableSamplePositionsTier = center_sample_positions_supported_ &&
+          metal.supportsTextureSampleCount(2) && metal.supportsTextureSampleCount(4) &&
+          metal.supportsTextureSampleCount(8) ? D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_1 :
+          D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS3: {
@@ -794,17 +1004,16 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1 *>(pFeatureData);
-      // Apple simdgroups are always 32 lanes; [WaveSize(n != 32)] fails to compile.
+      // Logical subwaves share a physical SIMD32 group; requirements above 32 remain unsupported.
       out->WaveOps = TRUE;
-      out->WaveLaneCountMin = 32;
+      out->WaveLaneCountMin = 4;
       out->WaveLaneCountMax = 32;
       // Each Apple GPU core runs 4 SIMD32 units (128 lanes); 0 when the IOKit core count is
       // unavailable, which D3D12 allows.
       out->TotalLaneCount = gpu_core_count_ * 128;
       // If CheckFeatureSupport succeeds this value will always be true.
       out->ExpandedComputeResourceStates = TRUE;
-      // 64 bit integer arithmetic in every stage (sm6 suite: int64, graphics_int64). 64 bit
-      // atomics are a separate SM 6.6 requirement and compile only in compute shaders.
+      // 64 bit integer arithmetic in every stage (sm6 suite: int64, graphics_int64).
       out->Int64ShaderOps = TRUE;
       return S_OK;
     }
@@ -816,30 +1025,27 @@ public:
       // an MS writes any SV_RenderTargetArrayIndex up to 2047. Both GPU-verified by the mesh-shader suite.
       out->MeshShaderPipelineStatsSupported = TRUE;
       out->MeshShaderSupportsFullRangeRenderTargetArrayIndex = TRUE;
-      // Apple GPUs have no returning 64 bit texture atomics or threadgroup 64 bit atomics
-      // (the Metal compiler rejects them); airconv refuses both at compile time.
-      out->AtomicInt64OnTypedResourceSupported = FALSE;
-      out->AtomicInt64OnGroupSharedSupported = FALSE;
-      out->DerivativesInMeshAndAmplificationShadersSupported = FALSE;
-      out->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
+      // Owned lowering implements returning 64 bit typed and groupshared atomics.
+      out->AtomicInt64OnTypedResourceSupported = TRUE;
+      out->AtomicInt64OnGroupSharedSupported = TRUE;
+      out->DerivativesInMeshAndAmplificationShadersSupported = TRUE;
+      out->WaveMMATier = D3D12_WAVE_MMA_TIER_1_0;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS11: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11))
         return E_INVALIDARG;
-      // Requires SM 6.6 64 bit atomics in every stage; they compile only in compute shaders.
+      // Descriptor-heap resources use the same owned atomic phase storage as static bindings.
       reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(pFeatureData)
-          ->AtomicInt64OnDescriptorHeapResourceSupported = FALSE;
+          ->AtomicInt64OnDescriptorHeapResourceSupported = TRUE;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS12: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS12 *>(pFeatureData);
-      // Metal texture views cannot reinterpret block-compressed data as another BC or an
-      // uncompressed format (MTLTexture newTextureViewWithPixelFormat: "not compatible"), which
-      // the relaxed-casting contract requires. Format lists without those casts still work.
-      out->RelaxedFormatCastingSupported = FALSE;
+      // Owned alias storage transports BC/uncompressed casts without incompatible Metal views.
+      out->RelaxedFormatCastingSupported = TRUE;
       out->EnhancedBarriersSupported = kReportLayoutFeatures;
       // MSPrimitives counts declared primitives minus those SV_CullPrimitive culls (dxil_mesh.cpp).
       out->MSPrimitivesPipelineStatisticIncludesCulledPrimitives = D3D12_TRI_STATE_FALSE;
@@ -861,9 +1067,9 @@ public:
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5 *>(pFeatureData);
       out->SRVOnlyTiledResourceTier3 = FALSE;
-      // AS build/refit/copy/serialization, state-object extension, indirect dispatch and
-      // RayQuery in every shader stage are verified by the raytracing GPU suite.
-      out->RaytracingTier = D3D12_RAYTRACING_TIER_1_1;
+      // Existing DXR1.1 and genuine SM6.9 HitObject/OMM public GPU consumers
+      // cover this tier. OPTIONS22 separately reports the no-op reorder hint.
+      out->RaytracingTier = D3D12_RAYTRACING_TIER_1_2;
       out->RenderPassesTier = D3D12_RENDER_PASS_TIER_0;
       return S_OK;
     }
@@ -899,9 +1105,9 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_SHADER_CACHE))
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_CACHE *>(pFeatureData);
-      // CachedPSO/GetCachedBlob and ID3D12PipelineLibrary are implemented. Automatic OS-managed
-      // in-process/disk caches are not.
-      out->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO | D3D12_SHADER_CACHE_SUPPORT_LIBRARY;
+      // The owned memory/disk compilation cache is driver-managed, not an OS-managed D3D cache.
+      out->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO | D3D12_SHADER_CACHE_SUPPORT_LIBRARY |
+                          D3D12_SHADER_CACHE_SUPPORT_DRIVER_MANAGED_CACHE;
       return S_OK;
     }
     case D3D12_FEATURE_SERIALIZATION: {
@@ -1036,10 +1242,11 @@ public:
   GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType) {
     switch (DescriptorHeapType) {
     case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
-    case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
     case D3D12_DESCRIPTOR_HEAP_TYPE_RTV:
     case D3D12_DESCRIPTOR_HEAP_TYPE_DSV:
       return 32;
+    case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
+      return 64;
     default:
       break;
     }
@@ -1089,6 +1296,7 @@ public:
     Heap->AddShaderResourceView(Index, static_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC *>(nullptr));
     auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
     d3d12res->CreateShaderResourceView(pDesc, Descriptor);
+    Heap->SetDescriptorOwner(Index, d3d12res->owned_id);
   };
 
   void STDMETHODCALLTYPE
@@ -1105,6 +1313,8 @@ public:
     Heap->AddUnorderedAccessView(Index, static_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC *>(nullptr));
     auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
     d3d12res->CreateUnorderedAccessView(pCounter, pDesc, Descriptor);
+    Heap->SetDescriptorOwner(Index, d3d12res->owned_id,
+        pCounter ? static_cast<MTLD3D12Resource *>(pCounter)->owned_id : 0);
   };
 
   void STDMETHODCALLTYPE
@@ -1421,8 +1631,13 @@ public:
     // Only objects created with a SHARED heap/fence flag own a share.
     if (!share)
       return E_INVALIDARG;
+    Com<ID3D12Device> creator;
+    HRESULT hr = object->GetDevice(IID_PPV_ARGS(&creator));
+    if (FAILED(hr))
+      return hr;
+    const LUID creator_luid = creator->GetAdapterLuid();
     try {
-      return share->createHandle(attributes, access, name, handle);
+      return share->createHandle(attributes, access, name, creator_luid, handle);
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
     }
@@ -1440,6 +1655,17 @@ public:
       HRESULT hr = sharing::Open(handle, share);
       if (FAILED(hr))
         return hr;
+      LUID local_luid;
+      GetAdapterLuid(&local_luid);
+      const auto &header = share->header();
+      const bool cross_adapter = share->kind() == sharing::Kind::Heap
+          ? !!(header.heap_desc.Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)
+          : share->kind() == sharing::Kind::Fence
+          ? !!(header.fence_flags & D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER)
+          : !!(header.heap_flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+      if (!cross_adapter && (header.adapter.luid.LowPart != local_luid.LowPart ||
+                             header.adapter.luid.HighPart != local_luid.HighPart))
+        return E_INVALIDARG;
       // Reject the interface before building anything, so a wrong riid never registers residency.
       const bool heap = riid == __uuidof(ID3D12Heap) || riid == __uuidof(ID3D12Heap1);
       const bool resource = riid == __uuidof(ID3D12Resource) || riid == __uuidof(ID3D12Resource1) ||
@@ -1570,7 +1796,7 @@ public:
       }
       WMTTextureInfo texture_info{};
       MTL_DXGI_FORMAT_DESC format{};
-      if (FAILED(PopulateWMTTextureInfo(GetMTLDevice(), texture_info, desc)) ||
+      if (FAILED(PopulateWMTTextureInfo(this, texture_info, desc)) ||
           FAILED(MTLQueryDXGIFormat(GetMTLDevice(), desc.Format, format))) {
         invalidate();
         return;
@@ -1718,7 +1944,8 @@ public:
       return;
     }
     auto *resource = static_cast<MTLD3D12Resource *>(pResource);
-    if (!resource->swizzle_layout && !resource->reserved) {
+    if (!resource->swizzle_layout &&
+        !(resource->reserved && (resource->reserved->isBuffer() || resource->owned_is_reserved))) {
       if (SubresourceTilingCount)
         *SubresourceTilingCount = 0;
       return;
@@ -1997,12 +2224,24 @@ public:
         info.Alignment = std::max<uint64_t>(native.align, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
       } else {
         WMTTextureInfo texture_info{};
-        if (FAILED(PopulateWMTTextureInfo(GetMTLDevice(), texture_info, desc)))
+        if (FAILED(PopulateWMTTextureInfo(this, texture_info, desc)))
           return invalid();
         const uint64_t requested = desc.Alignment ? desc.Alignment
             : desc.SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
                                         : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-        if (desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR) {
+        MTL_DXGI_FORMAT_DESC volume_format{};
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+            FAILED(MTLQueryDXGIFormat(GetMTLDevice(), desc.Format, volume_format)))
+          return invalid();
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+            (volume_format.Flag & MTL_DXGI_FORMAT_BC) &&
+            desc.Layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) {
+          const uint64_t tiles = ReservedResource::VolumeTileCount(desc, 4, 4, volume_format.BlockSize);
+          if (!tiles || tiles > UINT64_MAX / kReservedTileBytes || requested < kReservedTileBytes)
+            return invalid();
+          info.SizeInBytes = tiles * kReservedTileBytes;
+          info.Alignment = std::max<uint64_t>(requested, kReservedTileBytes);
+        } else if (desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR) {
           // Linear rows pitched to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (see InitializeRowMajor).
           MTL_DXGI_FORMAT_DESC format{};
           if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), desc.Format, format)) || !format.BytesPerTexel)
@@ -2018,6 +2257,9 @@ public:
           info.SizeInBytes = layout->size_bytes;
           info.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
         } else {
+          // Writable MSAA uses a separate sample-array backing, not native MSAA shader writes.
+          if (texture_info.sample_count > 1)
+            texture_info.usage = static_cast<WMTTextureUsage>(texture_info.usage & ~WMTTextureUsageShaderWrite);
           const auto native = GetMTLDevice().heapTextureSizeAndAlign(texture_info);
           info.SizeInBytes = native.size;
           info.Alignment = std::max<uint64_t>(native.align, requested);
@@ -2231,6 +2473,7 @@ public:
     }
     heap->AddSamplerFeedbackView(index, map->buffer.ptr(), layout.totalCells() * 4, pTargetedResource != nullptr,
                                  layout.word());
+    heap->SetDescriptorOwner(index, map->owned_id);
   }
 
   void STDMETHODCALLTYPE
@@ -2250,66 +2493,31 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateShaderCacheSession(const D3D12_SHADER_CACHE_SESSION_DESC *pDesc, REFIID riid, void **ppvSession) {
     InitReturnPtr(ppvSession);
-    // D3D12_FEATURE_SHADER_CACHE reports no AUTOMATIC_*/DRIVER_MANAGED/SHADER_CONTROL_CLEAR support.
-    return E_NOTIMPL;
+    uint8_t driver_identity[56]{};
+    if (pDesc && (pDesc->Flags & D3D12_SHADER_CACHE_FLAG_DRIVER_VERSIONED)) {
+      WMTPipelineCacheIdentity native{};
+      if (!WMTGetPipelineCacheIdentity(&native)) return E_FAIL;
+      static_assert(sizeof(native) == 48);
+      memcpy(driver_identity, &native, sizeof(native));
+      const uint64_t adapter = adapter_->GetMTLDevice().registryID();
+      memcpy(driver_identity + sizeof(native), &adapter, sizeof(adapter));
+    }
+    return dxmt::CreateShaderCacheSession(this, pDesc, driver_identity, sizeof(driver_identity), riid, ppvSession);
   }
 
   HRESULT STDMETHODCALLTYPE
   ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS Kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS Control) {
-    return E_NOTIMPL;
+    return dxmt::ShaderCacheControl(Kinds, Control);
   }
 
   HRESULT STDMETHODCALLTYPE
   CreateCommandQueue1(const D3D12_COMMAND_QUEUE_DESC *pDesc, REFIID CreatorID, REFIID riid, void **ppCommandQueue) {
-    // CreatorID only groups queues for the driver's scheduling heuristics; Metal has no equivalent.
+    // ComputeQueuesPer3DQueue is zero: every queue owns its native scheduler group, for every CreatorID.
     return CreateCommandQueue(pDesc, riid, ppCommandQueue);
   }
 
   /* ---- ID3D12Device10 ---- */
 
-  /*
-   * Format list casting (VulkanOn12 spec): same unit size, no planar formats, an uncompressed
-   * resource only lists uncompressed formats. Metal views are stricter for block formats and
-   * depth: a BC texture may only change sRGB-ness, and depth/stencil or emulated-storage formats
-   * cannot be reinterpreted at all, so those casts fail creation instead of failing later.
-   */
-  HRESULT
-  ValidateCastableFormats(const D3D12_RESOURCE_DESC &desc, UINT32 count, const DXGI_FORMAT *formats) {
-    if (!count)
-      return S_OK;
-    if (!formats)
-      return E_INVALIDARG;
-    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-      for (UINT32 i = 0; i < count; ++i)
-        if (formats[i] != DXGI_FORMAT_UNKNOWN)
-          return E_INVALIDARG;
-      return S_OK;
-    }
-    MTL_DXGI_FORMAT_DESC base;
-    if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), desc.Format, base)))
-      return E_INVALIDARG;
-    constexpr uint32_t planar_flags = MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER;
-    const bool base_exact_only = (base.Flag & (planar_flags | MTL_DXGI_FORMAT_BC)) || base.PlanarCount != 1 ||
-                                 resource_contract::GetEmulatedTextureStorage(desc.Format) !=
-                                     resource_contract::EmulatedTextureStorage::None;
-    for (UINT32 i = 0; i < count; ++i) {
-      const auto format = formats[i];
-      MTL_DXGI_FORMAT_DESC cast;
-      if (format == DXGI_FORMAT_UNKNOWN || FAILED(MTLQueryDXGIFormat(GetMTLDevice(), format, cast)))
-        return E_INVALIDARG;
-      if (resource_contract::AreCopyCompatibleFormats(desc.Format, format))
-        continue;
-      if (base_exact_only) {
-        ERR("CreateResource: Metal cannot view format ", desc.Format, " as ", format);
-        return E_INVALIDARG;
-      }
-      if ((cast.Flag & (planar_flags | MTL_DXGI_FORMAT_BC)) || cast.PlanarCount != 1 ||
-          resource_contract::GetEmulatedTextureStorage(format) != resource_contract::EmulatedTextureStorage::None ||
-          cast.BytesPerTexel != base.BytesPerTexel)
-        return E_INVALIDARG;
-    }
-    return S_OK;
-  }
 
   /*
    * InitialLayout rules: buffers have no layout (UNDEFINED); simultaneous-access textures only
@@ -2350,11 +2558,16 @@ public:
     try {
       if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         impl->owned_initial_layout = layout;
-        impl->owned_castable_formats.assign(formats, formats + count);
+        if (count)
+          impl->owned_castable_formats.assign(formats, formats + count);
+        else
+          impl->owned_castable_formats.clear();
       }
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
     }
+    if (HRESULT hr = impl->PublishOwnedFormatCasting(); FAILED(hr))
+      return hr;
     return resource->QueryInterface(riid, ppResource);
   }
 
@@ -2376,7 +2589,7 @@ public:
     if (!pHeapProperties || FAILED(hr = NarrowResourceDesc(pDesc, desc)))
       return E_INVALIDARG;
     if (FAILED(hr = ValidateInitialLayout(desc, *pHeapProperties, InitialLayout, legacy_state)) ||
-        FAILED(hr = ValidateCastableFormats(desc, NumCastableFormats, pCastableFormats)))
+        FAILED(hr = ValidateCastableFormats(this, desc, NumCastableFormats, pCastableFormats)))
       return hr;
     if (!ppvResource)
       return CreateCommittedResource(pHeapProperties, HeapFlags, &desc, legacy_state, pOptimizedClearValue,
@@ -2406,7 +2619,7 @@ public:
       return E_INVALIDARG;
     const auto heap_desc = heap->GetDesc();
     if (FAILED(hr = ValidateInitialLayout(desc, heap_desc.Properties, InitialLayout, legacy_state)) ||
-        FAILED(hr = ValidateCastableFormats(desc, NumCastableFormats, pCastableFormats)))
+        FAILED(hr = ValidateCastableFormats(this, desc, NumCastableFormats, pCastableFormats)))
       return hr;
     if (!ppvResource)
       return CreatePlacedResource(pHeap, HeapOffset, &desc, legacy_state, pOptimizedClearValue, riid, nullptr);
@@ -2435,7 +2648,7 @@ public:
     D3D12_RESOURCE_STATES legacy_state;
     HRESULT hr;
     if (FAILED(hr = ValidateInitialLayout(*pDesc, heap, InitialLayout, legacy_state)) ||
-        FAILED(hr = ValidateCastableFormats(*pDesc, NumCastableFormats, pCastableFormats)))
+        FAILED(hr = ValidateCastableFormats(this, *pDesc, NumCastableFormats, pCastableFormats)))
       return hr;
     Com<ID3D12Resource> resource;
     if (FAILED(hr = CreateReservedResource1(pDesc, legacy_state, pOptimizedClearValue, nullptr,
@@ -2456,26 +2669,27 @@ public:
     D3D12_SAMPLER_DESC desc{pDesc->Filter,        pDesc->AddressU, pDesc->AddressV, pDesc->AddressW,
                             pDesc->MipLODBias,    pDesc->MaxAnisotropy, pDesc->ComparisonFunc, {},
                             pDesc->MinLOD,        pDesc->MaxLOD};
-    if (pDesc->Flags & ~D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR) {
-      // Heap samplers with unnormalized coordinates need NonNormalizedCoordinateSamplersSupported.
+    if (pDesc->Flags & ~UINT(D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR | D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES)) {
       ERR("CreateSampler2: unsupported sampler flags ", uint32_t(pDesc->Flags));
       return;
     }
+    if ((pDesc->Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) &&
+        !sampler_feedback::ValidNonNormalizedSampler(*pDesc)) {
+      ERR("CreateSampler2: invalid non-normalized sampler");
+      return;
+    }
     if (pDesc->Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR) {
-      // Metal's three predefined border colors return integer (0,0,0,0), (0,0,0,1) and (1,1,1,1)
-      // on integer textures; only those UINT borders are representable.
+      // Keep the legacy native fallback; integer sampling consumes the exact inline UINT values.
       const auto *c = pDesc->UintBorderColor;
-      const bool rgb_zero = !c[0] && !c[1] && !c[2], rgb_one = c[0] == 1 && c[1] == 1 && c[2] == 1;
-      if (!((rgb_zero && c[3] <= 1) || (rgb_one && c[3] == 1))) {
-        ERR("CreateSampler2: uint border color (", c[0], ",", c[1], ",", c[2], ",", c[3], ") is not representable");
-        return;
-      }
       for (UINT i = 0; i < 4; ++i)
         desc.BorderColor[i] = float(c[i]);
     } else {
       std::copy_n(pDesc->FloatBorderColor, 4, desc.BorderColor);
     }
-    CreateSampler(&desc, DestDescriptor);
+    auto [heap, index] = GetSamplerDescriptorHeap(this, DestDescriptor);
+    if (heap)
+      heap->AddSampler(index, &desc, pDesc->Flags,
+                       (pDesc->Flags & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR) ? pDesc->UintBorderColor : nullptr);
   }
 
   /* ---- ID3D12Device13 ---- */
@@ -2544,7 +2758,7 @@ public:
       if (FAILED(NarrowResourceDesc(&pResourceDescs[i], descs[i])))
         return invalid();
       const UINT32 count = pNumCastableFormats ? pNumCastableFormats[i] : 0;
-      if (count && (!ppCastableFormats || FAILED(ValidateCastableFormats(descs[i], count, ppCastableFormats[i]))))
+      if (count && (!ppCastableFormats || FAILED(ValidateCastableFormats(this, descs[i], count, ppCastableFormats[i]))))
         return invalid();
     }
     // Castable formats only widen view usage; Metal texture sizes already include PixelFormatView.
@@ -2591,6 +2805,16 @@ public:
     return residency_set_;
   };
 
+  WMT::Reference<WMT::MTL4Submission> CommitMetal4CommandBuffers(
+      WMT::MTL4CommandQueue queue, const WMT::MTL4CommandBuffer *buffers, uint64_t count) override {
+    // Metal preCommit traverses borrowed allocation pointers after taking its
+    // residency snapshot. Unregister must not remove and release an allocation
+    // during that traversal. Share the mutation lock only through native commit;
+    // GPU waits and C++ retirement/destruction run after this guard is released.
+    std::lock_guard<dxmt::mutex> lock(residency_lock_);
+    return queue.commit(buffers, count);
+  }
+
   WMT::MTL4CommandQueue
   GetSparseMappingQueue() {
     std::lock_guard<std::mutex> lock(sparse_mapping_queue_mutex_);
@@ -2602,10 +2826,62 @@ public:
     return sparse_mapping_queue_;
   }
 
+  HRESULT PublishSparseVolumeResidency(WMT::Buffer status,
+      std::span<const std::pair<uint32_t, ReservedTileTarget>> assignments) override {
+    // Apply and the following completion event share this queue and MappingQueueMutex.
+    // CompleteSparseVolumeResidency retires the recording before allocator reuse.
+    if (!sparse_mapping_allocator_) {
+      sparse_mapping_allocator_ = GetMTLDevice().newMTL4CommandAllocator();
+      if (!sparse_mapping_allocator_) return E_OUTOFMEMORY;
+    }
+    if (!sparse_mapping_command_buffer_) {
+      sparse_mapping_command_buffer_ = GetMTLDevice().newMTL4CommandBuffer();
+      if (!sparse_mapping_command_buffer_) return E_OUTOFMEMORY;
+    }
+    sparse_mapping_allocator_.reset();
+    sparse_mapping_command_buffer_.begin(sparse_mapping_allocator_);
+    sparse_mapping_command_buffer_.useResidencySet(residency_set_);
+    auto encoder = sparse_mapping_command_buffer_.blitCommandEncoder();
+    encoder.barrierAfterQueueStages(WMTMetal4StageResourceState, WMTMetal4StageBlit,
+        WMTMetal4VisibilityDevice | WMTMetal4VisibilityResourceAlias);
+    for (size_t i = 0; i < assignments.size();) {
+      const uint32_t first = assignments[i].first;
+      const bool mapped = assignments[i].second.heap_tile != kReservedNullTile;
+      size_t count = 1;
+      while (i + count < assignments.size() && assignments[i + count].first == uint64_t(first) + count &&
+          (assignments[i + count].second.heap_tile != kReservedNullTile) == mapped) ++count;
+      wmtcmd_blit_fillbuffer fill{};
+      fill.type = WMTBlitCommandFillBuffer;
+      fill.buffer = status;
+      fill.offset = uint64_t(first) * sizeof(uint32_t);
+      fill.length = uint64_t(count) * sizeof(uint32_t);
+      fill.value = mapped ? 0xff : 0;
+      encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
+      i += count;
+    }
+    encoder.barrierAfterStages(WMTMetal4StageBlit, WMTMetal4StageAll, WMTMetal4VisibilityDevice);
+    encoder.endEncoding();
+    sparse_mapping_command_buffer_.end();
+    const WMT::MTL4CommandBuffer command = sparse_mapping_command_buffer_;
+    sparse_mapping_publication_ = CommitMetal4CommandBuffers(sparse_mapping_queue_, &command, 1);
+    return sparse_mapping_publication_ ? S_OK : DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+  }
+
+  HRESULT CompleteSparseVolumeResidency() override {
+    if (!sparse_mapping_publication_) return S_OK;
+    sparse_mapping_publication_.waitUntilCompleted();
+    WMTMetal4SubmissionInfo completion{};
+    sparse_mapping_publication_.getInfo(completion);
+    sparse_mapping_publication_ = {};
+    return completion.completed && !completion.error_handle ? S_OK : DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+  }
+
   uint64_t
   GetAtomicLockTableAddress() override {
     return atomic_lock_table_address_;
   }
+  uint64_t GetAtomic64ContextAddress() override { return atomic64_context_address_; }
+  WMT::Buffer GetAtomic64ContextBuffer() override { return atomic64_context_; }
 
   HRESULT
   RegisterResidency(
@@ -2663,14 +2939,24 @@ public:
   }
 
   HRESULT
-  RegisterStandardSwizzleTexture(Texture *texture, MTLD3D12Resource *resource) {
-    if (!texture || !resource)
+  RegisterDescriptorResource(MTLD3D12Resource *resource) {
+    if (!resource || (!resource->texture && !resource->buffer))
       return E_INVALIDARG;
     try {
       std::unique_lock<dxmt::mutex> lock(swizzle_texture_lock_);
-      if (!swizzle_textures_.emplace(texture, resource).second)
-        return E_INVALIDARG;
-      swizzle_texture_count_.fetch_add(1, std::memory_order_release);
+      try {
+        if (resource->texture && !descriptor_resources_.emplace(resource->texture.ptr(), resource).second)
+          return E_INVALIDARG;
+        if (resource->buffer && !descriptor_resources_.emplace(resource->buffer.ptr(), resource).second) {
+          if (resource->texture) descriptor_resources_.erase(resource->texture.ptr());
+          return E_INVALIDARG;
+        }
+      } catch (...) {
+        if (resource->texture) descriptor_resources_.erase(resource->texture.ptr());
+        throw;
+      }
+      if (resource->swizzle_layout)
+        swizzle_texture_count_.fetch_add(1, std::memory_order_release);
       return S_OK;
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
@@ -2678,21 +2964,37 @@ public:
   }
 
   void
-  UnregisterStandardSwizzleTexture(Texture *texture) {
+  UnregisterDescriptorResource(MTLD3D12Resource *resource) {
     std::unique_lock<dxmt::mutex> lock(swizzle_texture_lock_);
-    if (swizzle_textures_.erase(texture))
+    bool erased = false;
+    for (const void *backing : {static_cast<const void *>(resource->texture.ptr()),
+                               static_cast<const void *>(resource->buffer.ptr())}) {
+      auto entry = descriptor_resources_.find(backing);
+      if (entry != descriptor_resources_.end() && entry->second == resource) {
+        descriptor_resources_.erase(entry);
+        erased = true;
+      }
+    }
+    if (erased && resource->swizzle_layout)
       swizzle_texture_count_.fetch_sub(1, std::memory_order_release);
+  }
+
+  Com<MTLD3D12Resource, false>
+  LookupDescriptorResource(const void *backing, uint64_t owner_id) {
+    std::unique_lock<dxmt::mutex> lock(swizzle_texture_lock_);
+    const auto entry = descriptor_resources_.find(backing);
+    if (entry == descriptor_resources_.end() ||
+        (owner_id && entry->second->owned_id != owner_id) || !entry->second->TryAddRefPrivate())
+      return nullptr;
+    return Com<MTLD3D12Resource, false>::transfer(entry->second);
   }
 
   Com<MTLD3D12Resource, false>
   LookupStandardSwizzleTexture(Texture *texture) {
     if (!HasStandardSwizzleTextures())
       return nullptr;
-    std::unique_lock<dxmt::mutex> lock(swizzle_texture_lock_);
-    auto entry = swizzle_textures_.find(texture);
-    if (entry == swizzle_textures_.end() || !entry->second->TryAddRefPrivate())
-      return nullptr;
-    return Com<MTLD3D12Resource, false>::transfer(entry->second);
+    auto resource = LookupDescriptorResource(texture, 0);
+    return resource && resource->swizzle_layout ? std::move(resource) : nullptr;
   }
 
   bool
@@ -2710,6 +3012,14 @@ public:
   HRESULT STDMETHODCALLTYPE CreateTemporalUpscaleState(
       const MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC *desc, IMTLD3D12TemporalUpscaleState **state) final {
     return CreateOwnedTemporalState(this, desc, state);
+  }
+
+  HRESULT STDMETHODCALLTYPE SupportsTemporalFeature(UINT feature_flags, BOOL *supported) final {
+    if (!supported) return E_POINTER;
+    *supported = FALSE;
+    if (feature_flags != 0 && feature_flags != 256 && feature_flags != 512) return E_INVALIDARG;
+    *supported = WMT4::TemporalFeature::Supports(GetMTLDevice(), feature_flags);
+    return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE CreateFrameGenerationState(const MTL_FRAME_GENERATION_CREATE_DESC *desc,
@@ -2874,6 +3184,7 @@ public:
 
   HRESULT
   QueryRTASSizes(const raytracing::BuildInputs &inputs, raytracing::NativeSizes &sizes) {
+    if (uint32_t(inputs.type) == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY) { sizes = {}; return S_OK; }
     raytracing::NativeDescriptor descriptor;
     const HRESULT hr = raytracing::CreateNativeDescriptor(GetMTLDevice(), inputs, {}, descriptor);
     if (FAILED(hr))
@@ -3131,7 +3442,9 @@ public:
   }
 
   void STDMETHODCALLTYPE
-  RemoveDevice() final {}
+  RemoveDevice() final {
+    ReportRemoval(DXGI_ERROR_DEVICE_REMOVED);
+  }
 
   HRESULT STDMETHODCALLTYPE
   EnumerateMetaCommands(UINT *meta_command_count, D3D12_META_COMMAND_DESC *descs) final {
@@ -3194,10 +3507,16 @@ public:
 };
 
 HRESULT
-CreateD3D12Device(IMTLDXGIAdapter *adapter, const IID &riid, void **ppDevice) {
+CreateD3D12Device(IMTLDXGIAdapter *adapter, const IID &riid, void **ppDevice,
+                  const RuntimeConfiguration &configuration, bool independent) {
   auto device = Com(new MTLD3D12DeviceImpl(adapter));
+  device->runtime_configuration = configuration;
+  device->independent_device = independent;
+  device->diagnostics.Configure(configuration);
   HRESULT hr = device->Initialize();
   if (FAILED(hr))
+    return hr;
+  if (FAILED(hr = device->RegisterExperimentalFeatures()))
     return hr;
   return device->QueryInterface(riid, ppDevice);
 };

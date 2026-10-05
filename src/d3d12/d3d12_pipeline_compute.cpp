@@ -28,6 +28,8 @@
 namespace dxmt {
 
 class MTLD3D12ComputePipelineStateImpl : public MTLD3D12Pageable<MTLD3D12ComputePipelineState> {
+  friend HRESULT CreateComputePipelineState(MTLD3D12Device *, const D3D12_COMPUTE_PIPELINE_STATE_DESC *,
+                                             REFIID, void **);
 
   PipelineCache cache_;
   MTL_SHADER_REFLECTION ref_cs{};
@@ -83,8 +85,13 @@ public:
     common.metal_version = kD3D12ShaderMetalVersion;
     common.next = &rootsig;
 
-    if (HRESULT hr = InitializeShader("CS", pDesc->CS, &shader_cs, &ref_cs); FAILED(hr))
+    if (HRESULT hr = InitializeShader("CS", pDesc->CS, &shader_cs, &ref_cs, &resource_bindings); FAILED(hr))
       return hr;
+    uses_atomic64 = ref_cs.HasAtomic64 != 0;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
+    atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
+    atomic_phase.next = common.next;
+    if (uses_atomic64) { common.next = &atomic_phase; common.metal_version = SM50_SHADER_METAL_410; }
 
     threadgroup_size = {ref_cs.ThreadgroupSize[0], ref_cs.ThreadgroupSize[1], ref_cs.ThreadgroupSize[2]};
 
@@ -162,6 +169,9 @@ public:
       SM50_SHADER_COMMON_DATA common{};
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
+      atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
+      if (uses_atomic64) { common.next = &atomic_phase; common.metal_version = SM50_SHADER_METAL_410; }
       SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics{};
       statistics.type = SM50_SHADER_D3D12_PIPELINE_STATS;
       statistics.next = &common;
@@ -247,6 +257,13 @@ CreateComputePipelineState(
   }
   auto pso = Com(new MTLD3D12ComputePipelineStateImpl(pDevice));
   HRESULT hr = pso->Initialize(pDesc);
+  if (pso->cache_.CanRetryAutomatic(hr)) {
+    auto fresh = Com(new MTLD3D12ComputePipelineStateImpl(pDevice));
+    pso->cache_.RetryAutomatic(fresh->cache_);
+    pso = std::move(fresh); // Rebuild bindings/constants/native objects on a fresh PSO.
+    hr = pso->Initialize(pDesc);
+  }
+  pso->cache_.Complete(hr);
   if (FAILED(hr))
     return hr;
   return pso->QueryInterface(riid, ppPipelineState);

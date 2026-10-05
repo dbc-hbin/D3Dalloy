@@ -19,11 +19,14 @@
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/IPO/DeadArgumentElimination.h"
 #include "llvm/Transforms/IPO/GlobalOpt.h"
+#include "llvm/Transforms/IPO/Internalize.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/IPO/Annotation2Metadata.h"
 #include "llvm/Transforms/IPO/ForceFunctionAttrs.h"
 #include "llvm/Transforms/IPO/InferFunctionAttrs.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/IR/InstIterator.h"
 
 #include "airconv_context.hpp"
 
@@ -31,6 +34,8 @@
 #include "air_samplepos.h"
 #include "air_tessellation.h"
 #include "air_denorm.h"
+#include "air_fp64.h"
+#include "air_atomic64.h"
 #include "air_sampler_feedback.h"
 #include "air_conservative.h"
 
@@ -70,6 +75,56 @@ static std::atomic_flag llvm_overwrite = false;
 
 void
 runOptimizationPasses(llvm::Module &M) {
+  // Only D3D12 root-bound shaders define null-descriptor reads as zero. D3D11
+  // modules never enter this path. Guard native AIR accesses, not their results:
+  // selecting zero after a query/read/sample still touches a null Metal texture.
+  if (M.getModuleFlag("dxmt.d3d12.root-signature")) {
+    SmallVector<CallInst *, 16> accesses;
+    for (auto &function : M) for (auto &instruction : instructions(function)) {
+      auto *call = dyn_cast<CallInst>(&instruction);
+      auto *callee = call ? call->getCalledFunction() : nullptr;
+      if (!callee || !callee->isDeclaration() || !callee->getName().startswith("air.") ||
+          callee->getName().startswith("air.atomic_") || call->arg_empty())
+        continue;
+      auto *pointer = dyn_cast<PointerType>(call->getArgOperand(0)->getType());
+      auto *type = pointer && !pointer->isOpaque() && pointer->getAddressSpace() == 1
+          ? dyn_cast<StructType>(pointer->getNonOpaquePointerElementType()) : nullptr;
+      // AIRBuilder::getTextureHandleType names the opaque native texture/depth
+      // types this way. Raw buffers, phase metadata and workgraph pointers are not textures.
+      if (type && type->isOpaque() && type->hasName() && type->getName().endswith("_t") &&
+          (type->getName().startswith("struct._texture_") || type->getName().startswith("struct._depth_")))
+        accesses.push_back(call);
+    }
+    for (auto *call : accesses) {
+      IRBuilder<> builder(call);
+      Value *present = builder.CreateIsNotNull(call->getArgOperand(0));
+      for (auto &argument : call->args()) {
+        auto *pointer = dyn_cast<PointerType>(argument->getType());
+        auto *type = pointer && !pointer->isOpaque() && pointer->getAddressSpace() == 2
+            ? dyn_cast<StructType>(pointer->getNonOpaquePointerElementType()) : nullptr;
+        if (type && type->hasName() && type->getName() == "struct._sampler_t")
+          present = builder.CreateAnd(present, builder.CreateIsNotNull(argument));
+      }
+      auto *head = call->getParent();
+      auto *then_term = SplitBlockAndInsertIfThen(present, call, false);
+      auto *continuation = call->getParent();
+      call->moveBefore(then_term);
+      if (!call->getType()->isVoidTy()) {
+        builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
+        auto *merged = builder.CreatePHI(call->getType(), 2);
+        call->replaceUsesWithIf(merged, [&](Use &use) { return use.getUser() != merged; });
+        merged->addIncoming(call, then_term->getParent());
+        // AIR residency bit0 denotes a fault; skipped access has no fault.
+        merged->addIncoming(Constant::getNullValue(call->getType()), head);
+      }
+    }
+  }
+  for (auto &function : M) {
+    if (function.isDeclaration() && function.getName().startswith("dxmt.fp64.")) {
+      linkFP64(M);
+      break;
+    }
+  }
 
   if (!llvm_overwrite.test_and_set()) {
     auto Map = cl::getRegisteredOptions();
@@ -214,7 +269,13 @@ void linkShader(llvm::Module &M, const unsigned char (&bitcode)[N]) {
   removeNamedMetadata(*module, "llvm.ident");
   removeNamedMetadata(*module, "llvm.module.flags");
 
-  llvm::Linker::linkModules(M, std::move(module), Linker::LinkOnlyNeeded);
+  // Helpers belong to this shader module, not each separately linked AIR export.
+  llvm::Linker::linkModules(M, std::move(module), Linker::LinkOnlyNeeded,
+    [](Module &linked, const StringSet<> &imported) {
+      internalizeModule(linked, [&](const GlobalValue &value) {
+        return !imported.contains(value.getName());
+      });
+    });
 };
 
 void
@@ -235,6 +296,20 @@ linkTessellation(llvm::Module &M) {
 void
 linkDenorm(llvm::Module &M) {
   linkShader(M, air_denorm);
+}
+
+void
+linkFP64(llvm::Module &M) {
+  linkShader(M, air_fp64);
+}
+
+void
+linkAtomic64(llvm::Module &M) {
+  linkShader(M, air_atomic64);
+  // Keep the allocator/reclamation loop shared: inlining it into every user
+  // update makes AGX instruction selection grow pathologically on typed shaders.
+  if (auto *cas = M.getFunction("dxmt_atomic64_compare_exchange"))
+    cas->addFnAttr(llvm::Attribute::NoInline);
 }
 
 void

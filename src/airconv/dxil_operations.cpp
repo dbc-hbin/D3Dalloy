@@ -35,14 +35,12 @@
  *   (`Converter::operator()(const InstFloatUnaryOp &)` uses AIRBuilder with
  *   FastVariant = true) and D3D's relaxed precision contract for these ops.
  *
- * FP64: Apple GPUs have no double precision ALU and the device reports
- *   DoublePrecisionFloatShaderOps = FALSE. Any `dx.op` that produces or consumes an
- *   f64 value (makeDouble/splitDouble, the i64/f64 bitcasts, the legacy double
- *   conversions) and any plain LLVM instruction with a double operand or result
- *   fails the compile with a precise diagnostic instead of being approximated.
+ * FP64: LowerFP64 integerizes binary64 types/storage and lowers all double
+ *   arithmetic through exact software helpers before this arithmetic pass.
  *
- * Waves: an AIR simdgroup is the D3D wave; Apple simdgroups are always 32 lanes, so
- *   ballots and lane masks are 32 bit and lane loops run 32 iterations. Metal's
+ * Waves: DXIL waves of 4/8/16 partition a physical Apple SIMD32; width32 uses
+ *   native reductions where possible. Ballots, indices and lane loops use the
+ *   selected virtual width, with no cross-SIMD barriers. Metal's
  *   simdgroup reductions include pixel shader helper threads, D3D wave operations do
  *   not (unless the entry carries `waveops-include-helper-lanes`), so in pixel
  *   shaders helper lanes are replaced by the reduction identity and masked out of
@@ -139,8 +137,6 @@ enum DxilOpcode : uint32_t {
   OpDerivCoarseY = 84,
   OpDerivFineX = 85,
   OpDerivFineY = 86,
-  OpMakeDouble = 101,
-  OpSplitDouble = 102,
   OpWaveIsFirstLane = 110,
   OpWaveGetLaneIndex = 111,
   OpWaveGetLaneCount = 112,
@@ -159,13 +155,8 @@ enum DxilOpcode : uint32_t {
   OpBitcastF16toI16 = 125,
   OpBitcastI32toF32 = 126,
   OpBitcastF32toI32 = 127,
-  OpBitcastI64toF64 = 128,
-  OpBitcastF64toI64 = 129,
   OpLegacyF32ToF16 = 130,
   OpLegacyF16ToF32 = 131,
-  OpLegacyDoubleToFloat = 132,
-  OpLegacyDoubleToSInt32 = 133,
-  OpLegacyDoubleToUInt32 = 134,
   OpWaveAllBitCount = 135,
   OpWavePrefixBitCount = 136,
   OpDot2AddHalf = 162,
@@ -179,10 +170,13 @@ enum DxilOpcode : uint32_t {
   OpIsHelperLane = 221,
   OpQuadVote = 222,
   OpBarrierByMemoryType = 244,
+  OpVectorReduceAnd = 309,
+  OpVectorReduceOr = 310,
+  OpFDot = 311,
 };
 
-/** Apple simdgroups are always 32 lanes wide (the only WaveSize the device accepts). */
-constexpr unsigned kWaveLanes = 32;
+/** Physical Apple simdgroups; smaller DXIL waves partition these lanes. */
+constexpr unsigned kNativeWaveLanes = 32;
 
 /** DXIL::MemoryTypeFlag and DXIL::BarrierSemanticFlag (SM 6.8 barriers). */
 enum DxilMemoryTypeBit : uint32_t {
@@ -344,8 +338,9 @@ private:
   bool pixel_stage = false;
   /** The DXIL entry carries `waveops-include-helper-lanes` (SM 6.7). */
   bool waves_include_helpers = false;
-  /** The module's AIR entry is a kernel (SM 6.6 compute derivatives use quad shuffles). */
-  bool kernel_stage = false;
+  unsigned wave_lanes = kNativeWaveLanes;
+  /** Compute, mesh and object functions form derivatives with explicit quad shuffles. */
+  bool quad_derivative_stage = false;
   /** The AIR entry is a vertex function, where the lane-index and simdgroup-size intrinsics
    * are illegal ("vertex function uses illegal functions"). */
   bool vertex_stage = false;
@@ -462,6 +457,9 @@ OperationLowerer::owns(uint32_t opcode) const {
   case OpDot2:
   case OpDot3:
   case OpDot4:
+  case OpVectorReduceAnd:
+  case OpVectorReduceOr:
+  case OpFDot:
   /* sync / fragment */
   case OpBarrier:
   case OpDiscard:
@@ -506,15 +504,6 @@ OperationLowerer::owns(uint32_t opcode) const {
   case OpBitcastF32toI32:
   case OpLegacyF32ToF16:
   case OpLegacyF16ToF32:
-  /* FP64: owned so that it is rejected with a precise message instead of being
-   * approximated; see the file header. */
-  case OpMakeDouble:
-  case OpSplitDouble:
-  case OpBitcastI64toF64:
-  case OpBitcastF64toI64:
-  case OpLegacyDoubleToFloat:
-  case OpLegacyDoubleToSInt32:
-  case OpLegacyDoubleToUInt32:
     return true;
   default:
     return false;
@@ -543,10 +532,20 @@ OperationLowerer::laneIndex(IRBuilder<> &builder) {
 
 Error
 OperationLowerer::run() {
+  if (Metadata *flag = module.getModuleFlag("dxmt.wave-size")) {
+    auto *width = dyn_cast<ConstantAsMetadata>(flag);
+    auto *constant = width ? dyn_cast<ConstantInt>(width->getValue()) : nullptr;
+    if (!constant || !constant->getType()->isIntegerTy(32))
+      return createError("DXIL selected wave width is not an i32 constant");
+    wave_lanes = constant->getZExtValue();
+    if (wave_lanes < 4 || wave_lanes > kNativeWaveLanes || (wave_lanes & (wave_lanes - 1)))
+      return createError("DXIL selected wave width is outside the supported 4/8/16/32 set");
+  }
   if (auto *fragments = module.getNamedMetadata("air.fragment"))
     pixel_stage = fragments->getNumOperands() != 0;
-  if (auto *kernels = module.getNamedMetadata("air.kernel"))
-    kernel_stage = kernels->getNumOperands() != 0;
+  for (const char *stage : {"air.kernel", "air.mesh", "air.object"})
+    if (auto *entries = module.getNamedMetadata(stage))
+      quad_derivative_stage |= entries->getNumOperands() != 0;
   if (auto *vertices = module.getNamedMetadata("air.vertex"))
     vertex_stage = vertices->getNumOperands() != 0;
   for (Function &function : module)
@@ -578,28 +577,67 @@ OperationLowerer::run() {
   /* The mode is fully applied; it is a DXIL attribute, not an AIR one. */
   for (Function &function : module)
     function.removeFnAttr("fp32-denorm-mode");
-  /* DXC also emits plain LLVM double arithmetic (fpext, fmul double, fptoui
-   * double, ...). Metal has no f64 ALU, so any double value is rejected. */
+  SmallVector<Instruction *, 16> shared_atomics;
   for (Function &function : module) {
     for (BasicBlock &block : function) {
       for (Instruction &instruction : block) {
-        bool uses_double = instruction.getType()->getScalarType()->isDoubleTy();
-        for (const Use &operand : instruction.operands())
-          uses_double |= operand->getType()->getScalarType()->isDoubleTy();
-        if (uses_double)
-          return unsupported("FP64 arithmetic (DoublePrecisionFloatShaderOps is not supported)");
-        /* Metal's backend cannot lower 64 bit atomics on threadgroup memory (the PSO
-         * compile service crashes); AtomicInt64OnGroupSharedSupported stays FALSE. */
         Type *atomic_type = nullptr;
-        if (auto *rmw = dyn_cast<AtomicRMWInst>(&instruction))
+        Value *pointer = nullptr;
+        if (auto *rmw = dyn_cast<AtomicRMWInst>(&instruction)) {
           atomic_type = rmw->getValOperand()->getType();
-        else if (auto *exchange = dyn_cast<AtomicCmpXchgInst>(&instruction))
+          pointer = rmw->getPointerOperand();
+        } else if (auto *exchange = dyn_cast<AtomicCmpXchgInst>(&instruction)) {
           atomic_type = exchange->getNewValOperand()->getType();
-        if (atomic_type && atomic_type->isIntegerTy(64))
-          return unsupported("64 bit atomic on group shared memory (AtomicInt64OnGroupSharedSupported is not "
-                             "supported)");
+          pointer = exchange->getPointerOperand();
+        }
+        if (atomic_type && atomic_type->isIntegerTy(64)) {
+          if (pointer->getType()->getPointerAddressSpace() == 1 && module.getModuleFlag(kAtomic64PhaseFlag))
+            continue; // The whole-operation phase pass legalizes device i64 atomics after sample guards.
+          if (pointer->getType()->getPointerAddressSpace() != 3)
+            return unsupported("unlowered 64 bit atomic outside groupshared storage");
+          shared_atomics.push_back(&instruction);
+        }
       }
     }
+  }
+  for (Instruction *instruction : shared_atomics) {
+    auto *rmw = dyn_cast<AtomicRMWInst>(instruction);
+    auto *exchange = dyn_cast<AtomicCmpXchgInst>(instruction);
+    if (rmw) {
+      switch (rmw->getOperation()) {
+      case AtomicRMWInst::Add: case AtomicRMWInst::And: case AtomicRMWInst::Or:
+      case AtomicRMWInst::Xor: case AtomicRMWInst::Min: case AtomicRMWInst::Max:
+      case AtomicRMWInst::UMin: case AtomicRMWInst::UMax: case AtomicRMWInst::Xchg:
+        break;
+      default:
+        return unsupported("unknown groupshared 64 bit atomic operation");
+      }
+    }
+    IRBuilder<> builder(instruction);
+    Value *pointer = rmw ? rmw->getPointerOperand() : exchange->getPointerOperand();
+    Value *value = rmw ? rmw->getValOperand() : exchange->getNewValOperand();
+    Value *old = EmitLockedAtomic64(builder, pointer, [&](Value *previous) -> Value * {
+      if (exchange)
+        return builder.CreateSelect(builder.CreateICmpEQ(previous, exchange->getCompareOperand()), value, previous);
+      switch (rmw->getOperation()) {
+      case AtomicRMWInst::Add: return builder.CreateAdd(previous, value);
+      case AtomicRMWInst::And: return builder.CreateAnd(previous, value);
+      case AtomicRMWInst::Or: return builder.CreateOr(previous, value);
+      case AtomicRMWInst::Xor: return builder.CreateXor(previous, value);
+      case AtomicRMWInst::Min: return builder.CreateSelect(builder.CreateICmpSLT(value, previous), value, previous);
+      case AtomicRMWInst::Max: return builder.CreateSelect(builder.CreateICmpSGT(value, previous), value, previous);
+      case AtomicRMWInst::UMin: return builder.CreateSelect(builder.CreateICmpULT(value, previous), value, previous);
+      case AtomicRMWInst::UMax: return builder.CreateSelect(builder.CreateICmpUGT(value, previous), value, previous);
+      default: return value;
+      }
+    });
+    Value *result = old;
+    if (exchange) {
+      result = builder.CreateInsertValue(UndefValue::get(exchange->getType()), old, 0);
+      result = builder.CreateInsertValue(result, builder.CreateICmpEQ(old, exchange->getCompareOperand()), 1);
+    }
+    instruction->replaceAllUsesWith(result);
+    instruction->eraseFromParent();
   }
 
   /* Declarations of everything we lowered are dead now; drop them so that the
@@ -767,23 +805,90 @@ OperationLowerer::lowerCall(CallInst &call, uint32_t opcode) {
   IRBuilder<> builder(&call);
   air::AIRBuilder air_builder(builder, debug);
 
-  /* FP64 is rejected up front: Apple GPUs have no double precision and the device
-   * reports DoublePrecisionFloatShaderOps = FALSE. */
-  switch (opcode) {
-  case OpMakeDouble:
-  case OpSplitDouble:
-  case OpBitcastI64toF64:
-  case OpBitcastF64toI64:
-  case OpLegacyDoubleToFloat:
-  case OpLegacyDoubleToSInt32:
-  case OpLegacyDoubleToUInt32:
-    return unsupported("dx.op FP64 operation (DoublePrecisionFloatShaderOps is not supported)");
-  default:
-    break;
+  // The SM6.9 elementwise overloads have exactly the scalar contract per component.
+  // Reuse the scalar lowering, retaining precise metadata and IR fast-math flags.
+  FixedVectorType *vector_type = nullptr;
+  for (unsigned i = 1; i < call.arg_size(); ++i)
+    if (auto *type = dyn_cast<FixedVectorType>(call.getArgOperand(i)->getType())) {
+      vector_type = type;
+      break;
+    }
+  if (vector_type && opcode != OpVectorReduceAnd && opcode != OpVectorReduceOr && opcode != OpFDot &&
+      (opcode != OpWaveActiveAllEqual || call.getType()->isVectorTy()) && opcode != OpWaveMatch) {
+    const bool elementwise = (opcode >= OpFAbs && opcode <= OpUMin) ||
+        (opcode >= OpFMad && opcode <= OpUMad) ||
+        (opcode >= OpDerivCoarseX && opcode <= OpDerivFineY) ||
+        (opcode >= OpWaveReadLaneAt && opcode <= OpQuadOp) || opcode == OpWaveMultiPrefixOp ||
+        opcode == OpWaveActiveAllEqual;
+    auto *result_type = dyn_cast<FixedVectorType>(call.getType());
+    if (!elementwise || !result_type || result_type->getNumElements() != vector_type->getNumElements() ||
+        vector_type->getNumElements() < 2 || vector_type->getNumElements() > 1024)
+      return createError("dx.op does not have a legal SM6.9 elementwise vector overload");
+    SmallVector<Type *, 8> types;
+    for (Value *argument : call.args()) {
+      auto *type = dyn_cast<FixedVectorType>(argument->getType());
+      if (type && type->getNumElements() != vector_type->getNumElements())
+        return createError("dx.op vector operand lengths do not agree");
+      types.push_back(type ? type->getElementType() : argument->getType());
+    }
+    // Never mutate a shared vector declaration: scalar calls have their own ABI.
+    auto *function_type = FunctionType::get(result_type->getElementType(), types, false);
+    auto scalar_callee = module.getOrInsertFunction(
+        (call.getCalledFunction()->getName() + ".scalar").str(), function_type);
+    Value *result = PoisonValue::get(result_type);
+    for (unsigned component = 0; component < vector_type->getNumElements(); ++component) {
+      SmallVector<Value *, 8> arguments;
+      for (Value *argument : call.args())
+        arguments.push_back(argument->getType()->isVectorTy()
+            ? builder.CreateExtractElement(argument, component) : argument);
+      auto *scalar = builder.CreateCall(scalar_callee, arguments);
+      scalar->setAttributes(call.getAttributes());
+      scalar->copyMetadata(call);
+      scalar->copyIRFlags(&call);
+      auto *next = builder.CreateInsertElement(result, scalar, component);
+      if (Error error = lowerCall(*scalar, opcode))
+        return std::move(error);
+      result = next;
+    }
+    call.replaceAllUsesWith(result);
+    call.eraseFromParent();
+    return Error::success();
   }
 
   Expected<Value *> lowered = [&]() -> Expected<Value *> {
     switch (opcode) {
+    case OpVectorReduceAnd:
+    case OpVectorReduceOr:
+    case OpFDot: {
+      if (Error error = expectArgs(call, opcode == OpFDot ? 2 : 1, "dx.op vector reduction"))
+        return std::move(error);
+      auto *type = dyn_cast<FixedVectorType>(call.getArgOperand(1)->getType());
+      if (!type || type->getNumElements() < 2 || type->getNumElements() > 1024 ||
+          call.getType() != type->getElementType())
+        return createError("dx.op vector reduction has invalid vector or result type");
+      if (opcode == OpFDot) {
+        if ((!call.getType()->isFloatTy() && !call.getType()->isHalfTy()) ||
+            call.getArgOperand(2)->getType() != type)
+          return createError("dx.op FDot requires two matching floating point vectors");
+      } else if (!call.getType()->isIntegerTy()) {
+        return createError("dx.op bitwise vector reduction requires integer components");
+      }
+      if (isa<FPMathOperator>(call))
+        builder.setFastMathFlags(call.getFastMathFlags());
+      if (isPreciseCall(call) || preserves(*call.getFunction()))
+        builder.clearFastMathFlags();
+      auto component = [&](unsigned i) -> Value * {
+        Value *a = builder.CreateExtractElement(call.getArgOperand(1), i);
+        return opcode == OpFDot ? builder.CreateFMul(a,
+            builder.CreateExtractElement(call.getArgOperand(2), i)) : a;
+      };
+      Value *value = component(0);
+      for (unsigned i = 1; i < type->getNumElements(); ++i)
+        value = opcode == OpFDot ? builder.CreateFAdd(value, component(i))
+            : (opcode == OpVectorReduceAnd ? builder.CreateAnd(value, component(i))
+                                          : builder.CreateOr(value, component(i)));
+      return value;
+    }
     case OpFAbs:
     case OpSaturate:
     case OpCos:
@@ -1376,10 +1481,10 @@ OperationLowerer::lowerDerivative(
    * evaluates derivatives per 2x2 quad and air.dfdx/air.dfdy is the only
    * derivative intrinsic the driver accepts. */
   const bool y_axis = opcode == OpDerivCoarseY || opcode == OpDerivFineY;
-  if (kernel_stage) {
+  if (quad_derivative_stage) {
     /*
-     * SM 6.6 compute derivatives: Metal rejects air.dfdx/dfdy outside fragment
-     * functions, so the quad difference is formed explicitly. Quad lane q = 2*y + x
+     * SM 6.6 compute/mesh/amplification derivatives: air.dfdx/dfdy is fragment-only,
+     * so the quad difference is formed explicitly. Quad lane q = 2*y + x
      * in Z order (the thread IDs were laid out that way by the stage signature).
      * Fine: right - left in the lane's own row (x) or bottom - top in its own column
      * (y). Coarse: the same difference taken from the quad's top-left row/column.
@@ -1667,6 +1772,11 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
   Type *i32 = builder.getInt32Ty();
   Type *i64 = builder.getInt64Ty();
 
+  /* LowerFP64 preserves the original overload while values become i64 bits. */
+  const bool fp64_wave = call.getMetadata("dxmt.fp64") || call.getCalledFunction()->getName().contains("f64");
+  if (fp64_wave && opcode == OpWaveActiveBit)
+    return createError("DXIL FP64 wave bitwise reduction is invalid");
+
   /* D3D excludes pixel shader helper lanes from every wave operation except the
    * quad family and explicit lane reads; Metal's simdgroup functions include them. */
   const bool exclude_helpers = pixel_stage && !waves_include_helpers;
@@ -1683,10 +1793,17 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
       return builder.CreateAnd(condition, builder.CreateNot(h));
     return condition;
   };
-  auto lane_id = [&]() { return laneIndex(builder); };
+  auto lane_id = [&]() {
+    Value *lane = laneIndex(builder);
+    return wave_lanes == kNativeWaveLanes ? lane : builder.CreateAnd(lane, builder.getInt32(wave_lanes - 1));
+  };
+  auto lane_base = [&]() { return builder.CreateAnd(laneIndex(builder), builder.getInt32(~(wave_lanes - 1))); };
   auto ballot = [&](Value *condition) {
-    /* 32 lanes: the upper half of AIR's 64 bit vote is always zero. */
-    return builder.CreateTrunc(emitAIR(builder, "air.simd_ballot.i64", {condition}, i64, convergent), i32);
+    Value *mask = builder.CreateTrunc(emitAIR(builder, "air.simd_ballot.i64", {condition}, i64, convergent), i32);
+    if (wave_lanes != kNativeWaveLanes)
+      mask = builder.CreateAnd(builder.CreateLShr(mask, lane_base()),
+                               builder.getInt32((1u << wave_lanes) - 1));
+    return mask;
   };
   auto participating_mask = [&]() { return ballot(participates(builder.getTrue())); };
   auto first_lane = [&](Value *mask) {
@@ -1696,10 +1813,10 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
   auto popcount = [&](Value *mask) { return emitAIR(builder, "air.popcount.i32", {mask}, i32, false); };
 
   auto supported_type = [](Type *type) {
-    return type->isFloatTy() || type->isHalfTy() || type->isIntegerTy(1) || type->isIntegerTy(16) ||
+    return type->isFloatTy() || type->isHalfTy() || type->isIntegerTy(1) || type->isIntegerTy(8) || type->isIntegerTy(16) ||
            type->isIntegerTy(32) || type->isIntegerTy(64);
   };
-  /* Lane exchange for every supported type: i64 travels as <2 x i32>, i1 as i32. */
+  /* Lane exchange: i64 travels as <2 x i32>, i1/i8 as i32. */
   auto exchange = [&](StringRef base, Value *value, Value *lane16) -> Value * {
     Type *type = value->getType();
     if (type->isIntegerTy(64)) {
@@ -1708,14 +1825,16 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
                              convergent);
       return builder.CreateBitCast(moved, type);
     }
-    if (type->isIntegerTy(1)) {
+    if (type->isIntegerTy(1) || type->isIntegerTy(8)) {
       Value *moved = emitAIR(builder, (base + ".u.i32").str(), {builder.CreateZExt(value, i32), lane16}, i32,
                              convergent);
-      return builder.CreateTrunc(moved, i1);
+      return builder.CreateTrunc(moved, type);
     }
     return emitAIR(builder, airSymbol(air_builder, base, type, airSign(type, true)), {value, lane16}, type, convergent);
   };
   auto shuffle = [&](Value *value, Value *lane) {
+    if (wave_lanes != kNativeWaveLanes)
+      lane = builder.CreateAdd(lane_base(), lane);
     return exchange("air.simd_shuffle", value, builder.CreateTrunc(lane, i16));
   };
   auto bits_of = [&](Value *value) -> Value * {
@@ -1733,10 +1852,26 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
    */
   auto lane_loop = [&](WaveReduce kind, Value *value, bool is_signed, function_ref<Value *(unsigned)> take) {
     Value *accumulator = waveIdentity(builder, kind, value->getType(), is_signed);
-    for (unsigned lane = 0; lane < kWaveLanes; ++lane) {
+    StringRef fp64_helper;
+    if (fp64_wave) {
+      uint64_t identity = 0;
+      switch (kind) {
+      case WaveReduce::Sum: fp64_helper = "dxmt.fp64.add"; break;
+      case WaveReduce::Product: fp64_helper = "dxmt.fp64.mul"; identity = 0x3ff0000000000000ull; break;
+      case WaveReduce::Min: fp64_helper = "dxmt.fp64.min"; identity = 0x7ff0000000000000ull; break;
+      case WaveReduce::Max: fp64_helper = "dxmt.fp64.max"; identity = 0xfff0000000000000ull; break;
+      case WaveReduce::And:
+      case WaveReduce::Or:
+      case WaveReduce::Xor: llvm_unreachable("FP64 wave bitwise reduction is invalid");
+      }
+      accumulator = builder.getInt64(identity);
+    }
+    for (unsigned lane = 0; lane < wave_lanes; ++lane) {
       Value *other = shuffle(value, builder.getInt32(lane));
-      accumulator = builder.CreateSelect(take(lane), waveCombine(builder, air_builder, kind, accumulator, other,
-                                                                  is_signed), accumulator);
+      Value *combined = fp64_wave
+          ? emitAIR(builder, fp64_helper, {accumulator, other}, i64, false)
+          : waveCombine(builder, air_builder, kind, accumulator, other, is_signed);
+      accumulator = builder.CreateSelect(take(lane), combined, accumulator);
     }
     return accumulator;
   };
@@ -1751,7 +1886,7 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
      * fadd/fmul become exact helpers (preserveDenormals). */
     const bool exact_float = type->isFloatTy() && (kind == WaveReduce::Sum || kind == WaveReduce::Product) &&
                              preserves(*call.getFunction());
-    if (type->isIntegerTy(64) || native.empty() || exact_float) {
+    if (wave_lanes != kNativeWaveLanes || type->isIntegerTy(1) || type->isIntegerTy(8) || type->isIntegerTy(64) || native.empty() || exact_float) {
       Value *mask = participating_mask();
       Value *lane = prefix ? lane_id() : nullptr;
       return lane_loop(kind, value, is_signed, [&](unsigned source) -> Value * {
@@ -1781,10 +1916,10 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
       return std::move(error);
     if (!call.getType()->isIntegerTy(1))
       return createError("dx.op waveIsFirstLane result is not i1");
-    if (!exclude_helpers)
+    if (!exclude_helpers && wave_lanes == kNativeWaveLanes)
       return emitAIR(builder, "air.simd_is_first", {}, call.getType(), convergent);
-    return builder.CreateAnd(builder.CreateICmpEQ(lane_id(), first_lane(participating_mask())),
-                             builder.CreateNot(is_helper()));
+    Value *first = builder.CreateICmpEQ(lane_id(), first_lane(participating_mask()));
+    return exclude_helpers ? builder.CreateAnd(first, builder.CreateNot(is_helper())) : first;
   }
   case OpWaveGetLaneIndex: {
     if (Error error = expectArgs(call, 0, "dx.op waveGetLaneIndex"))
@@ -1798,8 +1933,8 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
       return std::move(error);
     if (!call.getType()->isIntegerTy(32))
       return createError("dx.op waveGetLaneCount result is not i32");
-    /* Always 32 (Apple simdgroups); a vertex function may not call air.get_simdgroup_size. */
-    return builder.getInt32(kWaveLanes);
+    /* The selected virtual width, not Metal's physical SIMD width. */
+    return builder.getInt32(wave_lanes);
   }
   case OpIsHelperLane: {
     if (Error error = expectArgs(call, 0, "dx.op isHelperLane"))
@@ -1818,6 +1953,10 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
     Value *condition = call.getArgOperand(1);
     if (!condition->getType()->isIntegerTy(1) || !call.getType()->isIntegerTy(1))
       return createError("dx.op wave vote operates on i1");
+    if (wave_lanes != kNativeWaveLanes)
+      return opcode == OpWaveAnyTrue
+        ? builder.CreateICmpNE(ballot(participates(condition)), builder.getInt32(0))
+        : builder.CreateICmpEQ(ballot(participates(builder.CreateNot(condition))), builder.getInt32(0));
     if (opcode == OpWaveAnyTrue)
       return emitAIR(builder, "air.simd_any", {participates(condition)}, i1, convergent);
     if (Value *h = is_helper())
@@ -1844,15 +1983,21 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
     Value *value = call.getArgOperand(1);
     if (!call.getType()->isIntegerTy(1))
       return createError("dx.op waveActiveAllEqual result is not i1");
-    if (!supported_type(value->getType()))
+    if (!supported_type(value->getType()->getScalarType()))
       return unsupported("dx.op waveActiveAllEqual on an unsupported type");
     /* All lanes equal == every participating lane matches the first one. */
-    Value *first = shuffle(value, first_lane(participating_mask()));
-    Value *equal = value->getType()->isFloatingPointTy() ? builder.CreateFCmpOEQ(value, first)
-                                                          : builder.CreateICmpEQ(value, first);
-    if (Value *h = is_helper())
-      equal = builder.CreateOr(equal, h);
-    return emitAIR(builder, "air.simd_all", {equal}, i1, convergent);
+    Value *first_index = first_lane(participating_mask());
+    Value *equal = builder.getTrue();
+    auto *vector = dyn_cast<FixedVectorType>(value->getType());
+    for (unsigned i = 0; i < (vector ? vector->getNumElements() : 1u); ++i) {
+      Value *component = vector ? builder.CreateExtractElement(value, i) : value;
+      Value *first = shuffle(component, first_index);
+      Value *matches = fp64_wave ? emitAIR(builder, "dxmt.fp64.eq", {component, first}, i1, false)
+          : component->getType()->isFloatingPointTy() ? builder.CreateFCmpOEQ(component, first)
+                                                     : builder.CreateICmpEQ(component, first);
+      equal = builder.CreateAnd(equal, matches);
+    }
+    return builder.CreateICmpEQ(ballot(participates(builder.CreateNot(equal))), builder.getInt32(0));
   }
   case OpWaveActiveBallot: {
     if (Error error = expectArgs(call, 1, "dx.op waveActiveBallot"))
@@ -1869,18 +2014,22 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
     if (Error error = expectArgs(call, 1, "dx.op waveMatch"))
       return std::move(error);
     Value *value = call.getArgOperand(1);
-    if (!supported_type(value->getType()))
+    if (!supported_type(value->getType()->getScalarType()))
       return unsupported("dx.op waveMatch on an unsupported type");
     if (Error error = expectAggregateResult(call, 4, i32, "dx.op waveMatch"))
       return std::move(error);
     /* Lanes are matched on their bit pattern, which is what DXC's reference
      * implementation compares; -0.0 and +0.0 are therefore distinct. */
     Value *mask = participating_mask();
-    Value *mine = bits_of(value);
     Value *matched = builder.getInt32(0);
-    for (unsigned lane = 0; lane < kWaveLanes; ++lane) {
-      Value *equal = builder.CreateAnd(builder.CreateICmpEQ(bits_of(shuffle(value, builder.getInt32(lane))), mine),
-                                       mask_has(mask, lane));
+    for (unsigned lane = 0; lane < wave_lanes; ++lane) {
+      Value *equal = mask_has(mask, lane);
+      auto *vector = dyn_cast<FixedVectorType>(value->getType());
+      for (unsigned i = 0; i < (vector ? vector->getNumElements() : 1u); ++i) {
+        Value *component = vector ? builder.CreateExtractElement(value, i) : value;
+        equal = builder.CreateAnd(equal, builder.CreateICmpEQ(
+            bits_of(shuffle(component, builder.getInt32(lane))), bits_of(component)));
+      }
       matched = builder.CreateOr(matched, builder.CreateShl(builder.CreateZExt(equal, i32), lane));
     }
     Value *zero = builder.getInt32(0);
@@ -1933,7 +2082,7 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
       return sign.takeError();
     if (call.getType() != value->getType())
       return createError("dx.op wave reduction result type does not match its operand");
-    if (!supported_type(value->getType()) || value->getType()->isIntegerTy(1))
+    if (!supported_type(value->getType()))
       return unsupported("dx.op wave reduction on an unsupported type");
     static constexpr WaveReduce kinds[] = {WaveReduce::Sum, WaveReduce::Product, WaveReduce::Min, WaveReduce::Max};
     if (*kind > 3 || (opcode == OpWavePrefixOp && *kind > 1))
@@ -1950,7 +2099,7 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
       return kind.takeError();
     if (call.getType() != value->getType())
       return createError("dx.op waveActiveBit result type does not match its operand");
-    if (!value->getType()->isIntegerTy(16) && !value->getType()->isIntegerTy(32) &&
+    if (!value->getType()->isIntegerTy(8) && !value->getType()->isIntegerTy(16) && !value->getType()->isIntegerTy(32) &&
         !value->getType()->isIntegerTy(64))
       return unsupported("dx.op waveActiveBit on an unsupported type");
     static constexpr WaveReduce kinds[] = {WaveReduce::And, WaveReduce::Or, WaveReduce::Xor};
@@ -1973,13 +2122,13 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
       return sign.takeError();
     if (call.getType() != value->getType() || !mask->getType()->isIntegerTy(32))
       return createError("dx.op waveMultiPrefixOp operand types are invalid");
-    if (!supported_type(value->getType()) || value->getType()->isIntegerTy(1))
+    if (!supported_type(value->getType()))
       return unsupported("dx.op waveMultiPrefixOp on an unsupported type");
     static constexpr WaveReduce kinds[] = {WaveReduce::Sum, WaveReduce::And, WaveReduce::Or, WaveReduce::Xor,
                                            WaveReduce::Product};
     if (*kind > 4)
       return createError("dx.op waveMultiPrefixOp has an unknown kind");
-    if (value->getType()->isFloatingPointTy() && *kind >= 1 && *kind <= 3)
+    if ((value->getType()->isFloatingPointTy() || fp64_wave) && *kind >= 1 && *kind <= 3)
       return createError("dx.op waveMultiPrefixOp bitwise kind on a floating point value");
     Value *members = builder.CreateAnd(mask, participating_mask());
     Value *lane = lane_id();
@@ -2132,8 +2281,20 @@ LowerOperations(llvm::Module &module) {
   /* Inline RayQuery objects (any stage); their structures were resolved by the resource pass. */
   if (Error error = LowerRayQueries(module))
     return error;
+  if (Error error = LowerVectors(module, false))
+    return error;
+  if (Error error = LowerFP64(module))
+    return error;
   OperationLowerer lowerer(module);
-  return lowerer.run();
+  if (Error error = lowerer.run())
+    return error;
+  // Wave reductions introduce FP64 helper calls after the binary64 prepass.
+  for (Function &function : module)
+    if (function.isDeclaration() && !function.use_empty() && function.getName().startswith("dxmt.fp64.")) {
+      dxmt::linkFP64(module);
+      break;
+    }
+  return LowerVectors(module, true);
 }
 
 } // namespace dxmt::dxil

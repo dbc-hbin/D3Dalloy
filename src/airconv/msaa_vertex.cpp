@@ -2,6 +2,7 @@
 
 #include "airconv_context.hpp"
 #include "air_signature.hpp"
+#include "dxil_converter.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -201,7 +202,11 @@ Value *expandedLine(IRBuilder<> &b, Value *encoded, Value *records, Value *indic
     Value *word = b.CreateMul(b.CreateZExt(which, b.getInt64Ty()), b.getInt64(stride));
     Value *pointer = b.CreateBitCast(b.CreateGEP(b.getInt32Ty(), records, word),
       PointerType::get(native, unsigned(air::AddressSpace::device)));
-    return b.CreateAlignedLoad(native, pointer, Align(4));
+    auto *value = b.CreateAlignedLoad(native, pointer, Align(4));
+    auto &module = *value->getModule();
+    if (module.getModuleFlag(dxil::kAtomic64PhaseFlag))
+      value->setMetadata(dxil::kAtomic64Metadata, MDNode::get(module.getContext(), {}));
+    return value;
   };
   Value *a = captured(ordinal(18));
   Value *z = captured(ordinal(19));
@@ -387,8 +392,11 @@ Value *expandedConservative(IRBuilder<> &b, Value *encoded, Value *records, Valu
     Value *ordinal = b.CreateLoad(b.getInt32Ty(), b.CreateGEP(b.getInt32Ty(), indices,
       b.CreateAdd(indexBase, b.getInt64(18 + v))));
     Value *word = b.CreateMul(b.CreateZExt(ordinal, b.getInt64Ty()), b.getInt64(stride));
-    captured[v] = b.CreateAlignedLoad(native, b.CreateBitCast(b.CreateGEP(b.getInt32Ty(), records, word),
+    auto *value = b.CreateAlignedLoad(native, b.CreateBitCast(b.CreateGEP(b.getInt32Ty(), records, word),
       PointerType::get(native, unsigned(air::AddressSpace::device))), Align(4));
+    if (module.getModuleFlag(dxil::kAtomic64PhaseFlag))
+      value->setMetadata(dxil::kAtomic64Metadata, MDNode::get(module.getContext(), {}));
+    captured[v] = value;
   }
   Value *p[3];
   for (unsigned v = 0; v < 3; ++v) p[v] = b.CreateExtractValue(captured[v], positionField);
@@ -453,6 +461,7 @@ Value *expandedConservative(IRBuilder<> &b, Value *encoded, Value *records, Valu
   auto *cornerType = FunctionType::get(float4Type, {float4Type, float4Type, float4Type, float4Type, b.getInt32Ty()},
                                        false);
   Value *cornerFlags = b.CreateOr(corner, b.getInt32(options.depth_clip_enable ? 16u : 0u));
+  cornerFlags = b.CreateOr(cornerFlags, b.getInt32(options.front_counter_clockwise ? 32u : 0u));
   Value *weights = b.CreateCall(module.getOrInsertFunction("dxmt.conservative.corner", cornerType),
                                 {p[0], p[1], p[2], viewportRect, cornerFlags});
   Value *cornerPosition = b.CreateCall(module.getOrInsertFunction("dxmt.conservative.corner_position", cornerType),
@@ -833,6 +842,9 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     auto *nativeOutput = builder.CreateCall(original, callArgs);
     auto *store = builder.CreateStore(nativeOutput, record);
     store->setAlignment(Align(4));
+    // The packed native return is private capture transport, not an application UAV.
+    if (module.getModuleFlag(dxil::kAtomic64PhaseFlag))
+      store->setMetadata(dxil::kAtomic64Metadata, MDNode::get(module.getContext(), {}));
     builder.CreateBr(done);
     builder.SetInsertPoint(done);
     builder.CreateRetVoid();
@@ -851,6 +863,8 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
                                     positionField, oldOutputs, stride, options);
     } else {
       auto *value = builder.CreateAlignedLoad(original->getReturnType(), record, Align(4));
+      if (module.getModuleFlag(dxil::kAtomic64PhaseFlag))
+        value->setMetadata(dxil::kAtomic64Metadata, MDNode::get(module.getContext(), {}));
       result = UndefValue::get(replayReturn);
       for (unsigned i = 0; i < nativeStruct->getNumElements(); ++i)
         result = builder.CreateInsertValue(result, builder.CreateExtractValue(value, i), i);

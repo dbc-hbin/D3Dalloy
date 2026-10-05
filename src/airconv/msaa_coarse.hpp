@@ -1,5 +1,8 @@
 #pragma once
 
+#include "airconv_public.h"
+#include <cstddef>
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -24,6 +27,19 @@
  * masks use the D3D order: fine pixels left to right then top to bottom, each fine pixel's samples packed.
  */
 namespace dxmt::msaa::coarse {
+
+/* Shared by captured position, line/distance interpolation and coarse pull-model evaluation. */
+inline llvm::Value *programmableSampleOffset(llvm::IRBuilder<> &b, llvm::Value *control, llvm::Value *sample,
+                                            unsigned count, unsigned axis, llvm::Value *fallback) {
+  if (count > 8)
+    return fallback;
+  auto *n = b.CreateLoad(b.getInt32Ty(), b.CreateConstGEP1_32(b.getInt32Ty(), control,
+      offsetof(SM50_MSAA_TILE_CONTROL, programmable_sample_count) / 4));
+  auto *index = b.CreateAdd(b.CreateMul(b.CreateAnd(sample, b.getInt32(7)), b.getInt32(2)),
+      b.getInt32(offsetof(SM50_MSAA_TILE_CONTROL, programmable_sample_positions) / 4 + axis));
+  auto *bits = b.CreateLoad(b.getInt32Ty(), b.CreateGEP(b.getInt32Ty(), control, index));
+  return b.CreateSelect(b.CreateICmpEQ(n, b.getInt32(count)), b.CreateBitCast(bits, b.getFloatTy()), fallback);
+}
 
 /* Tile-control dword (SM50_MSAA_TILE_CONTROL.shading_rate) holding the draw's rate state. */
 constexpr unsigned kRateDword = 14;

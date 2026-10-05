@@ -1099,8 +1099,8 @@ void testBindingLimits(ID3D12Device *device) {
 
   D3D12_FEATURE_DATA_SHADER_CACHE cache{};
   check(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE, &cache, sizeof(cache)), "shader cache feature");
-  if (cache.SupportFlags != (D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO | D3D12_SHADER_CACHE_SUPPORT_LIBRARY))
-    fail("shader cache advertised unsupported automatic modes");
+  if (!(cache.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO))
+    fail("shader cache missing cached PSO support");
   passed("sampler_heap_static_limits_and_cached_pso_support");
 }
 

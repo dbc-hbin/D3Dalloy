@@ -1,14 +1,19 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <wincrypt.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <barrier>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -16,7 +21,7 @@ namespace {
 
 [[noreturn]] void fail(const char *step, HRESULT hr = E_FAIL) {
   std::fprintf(stderr,"OWNED_D3D12_PIPELINE_CACHE_FAIL step=%s hr=0x%08lx\n",step,static_cast<unsigned long>(hr));
-  std::exit(1);
+  throw std::runtime_error(step);
 }
 void check(HRESULT hr,const char *step) { if(FAILED(hr))fail(step,hr); }
 
@@ -91,7 +96,229 @@ void reject(ID3D12Device *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc,const vo
   std::printf("OWNED_D3D12_PIPELINE_CACHE_REJECT case=%s hr=%08lx\n",label,static_cast<unsigned long>(hr));
 }
 
-int run(const wchar_t *firstPath,const wchar_t *secondPath) {
+struct DeveloperMode {
+  HKEY key=nullptr;DWORD previous=0;bool existed=false;
+  DeveloperMode() {
+    char isolated[2]{};
+    if(GetEnvironmentVariableA("OWNED_SHADER_CACHE_CONTROL_ISOLATED",isolated,2)!=1||isolated[0]!='1')
+      fail("automatic cache requires isolated prefix");
+    if(RegCreateKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock",0,
+       nullptr,0,KEY_QUERY_VALUE|KEY_SET_VALUE,nullptr,&key,nullptr))fail("developer registry open");
+    DWORD type=0,size=sizeof(previous);
+    existed=RegQueryValueExW(key,L"AllowDevelopmentWithoutDevLicense",nullptr,&type,
+                           reinterpret_cast<BYTE*>(&previous),&size)==ERROR_SUCCESS;
+    if(existed&&(type!=REG_DWORD||size!=sizeof(previous)))fail("developer registry type");
+    const DWORD enabled=1;
+    if(RegSetValueExW(key,L"AllowDevelopmentWithoutDevLicense",0,REG_DWORD,
+                     reinterpret_cast<const BYTE*>(&enabled),sizeof(enabled)))fail("developer registry enable");
+  }
+  ~DeveloperMode() {
+    if(existed)RegSetValueExW(key,L"AllowDevelopmentWithoutDevLicense",0,REG_DWORD,
+                            reinterpret_cast<const BYTE*>(&previous),sizeof(previous));
+    else RegDeleteValueW(key,L"AllowDevelopmentWithoutDevLicense");
+    RegCloseKey(key);
+  }
+};
+
+std::wstring cacheFile(ID3D12PipelineState *pso,const char *label) {
+  ComPtr<ID3DBlob> blob;check(pso->GetCachedBlob(&blob),"automatic export");
+  wchar_t temp[32768];if(!GetTempPathW(32768,temp))fail("cache temp path");
+  const std::wstring base=std::wstring(temp)+L"dxmt-shader-sessions\\";
+  WIN32_FIND_DATAW directory{};HANDLE dirs=FindFirstFileW((base+L"*").c_str(),&directory);
+  if(dirs==INVALID_HANDLE_VALUE)fail("automatic directory missing");
+  std::wstring result;
+  do {
+    if(!(directory.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||directory.cFileName[0]==L'.')continue;
+    const auto path=base+directory.cFileName+L"\\";
+    WIN32_FIND_DATAW entry{};HANDLE files=FindFirstFileW((path+L"dxmt-pso-*.bin").c_str(),&entry);
+    if(files==INVALID_HANDLE_VALUE)continue;
+    do {
+      if(entry.nFileSizeHigh||entry.nFileSizeLow!=blob->GetBufferSize())continue;
+      const auto bytes=readFile((path+entry.cFileName).c_str());
+      if(!memcmp(bytes.data(),blob->GetBufferPointer(),bytes.size())) {
+        if(!result.empty())fail("ambiguous automatic cache entry");
+        result=path+entry.cFileName;
+        std::printf("OWNED_D3D12_PIPELINE_CACHE_KEY case=%s key=%ls\n",label,
+                    std::wstring(entry.cFileName+9,40).c_str());
+      }
+    } while(FindNextFileW(files,&entry));
+    FindClose(files);
+  } while(FindNextFileW(dirs,&directory));
+  FindClose(dirs);if(result.empty())fail("automatic blob not persisted");return result;
+}
+
+void writeFile(const std::wstring &path,const std::vector<uint8_t> &bytes) {
+  HANDLE file=CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+  if(file==INVALID_HANDLE_VALUE)fail("cache mutation open");
+  DWORD written=0;const bool ok=WriteFile(file,bytes.data(),static_cast<DWORD>(bytes.size()),&written,nullptr);
+  CloseHandle(file);if(!ok||written!=bytes.size())fail("cache mutation write");
+}
+
+size_t v5LibrarySize(const std::vector<uint8_t> &bytes) {
+  // Only mutate this fixture's single-stage v5 export; fail closed on ABI changes.
+  if(bytes.size()<216||memcmp(bytes.data(),"DXMTPSO",8))fail("mutation cache magic/header");
+  uint32_t version=0,stages=0;uint64_t total=0;
+  memcpy(&version,bytes.data()+8,4);memcpy(&stages,bytes.data()+12,4);memcpy(&total,bytes.data()+16,8);
+  if(version!=5||total!=bytes.size()||!stages||(stages&(stages-1))||(stages&~7u))fail("mutation v5 layout");
+  size_t end=216,library=0;
+  for(unsigned i=0;i<3;++i){
+    uint64_t record[4]{};memcpy(record,bytes.data()+120+32*i,sizeof(record));
+    if(!(stages&(1u<<i))){for(auto field:record)if(field)fail("mutation inactive stage");continue;}
+    if(record[0]<88||!record[2]||(record[2]&(record[2]-1))||record[3]>record[1]/8)fail("mutation stage record");
+    library=static_cast<size_t>(record[0]);
+    for(const uint64_t length:{record[0],record[1],record[3]*16}){
+      if(length>bytes.size()-end)fail("mutation stage bounds");end+=static_cast<size_t>(length);
+      const size_t padding=(-end)&7;if(padding>bytes.size()-end)fail("mutation stage padding");end+=padding;
+    }
+  }
+  if(end!=bytes.size()||memcmp(bytes.data()+216,"MTLB",4))fail("mutation library layout");
+  return library;
+}
+
+void rehashV5(std::vector<uint8_t> &bytes) {
+  v5LibrarySize(bytes);
+  HCRYPTPROV provider=0;HCRYPTHASH hash=0;DWORD size=20;
+  const bool acquired=CryptAcquireContextW(&provider,nullptr,nullptr,PROV_RSA_FULL,CRYPT_VERIFYCONTEXT);
+  const bool ok=acquired&&CryptCreateHash(provider,CALG_SHA1,0,0,&hash)&&
+      CryptHashData(hash,bytes.data(),100,0)&&
+      CryptHashData(hash,bytes.data()+120,static_cast<DWORD>(bytes.size()-120),0)&&
+      CryptGetHashParam(hash,HP_HASHVAL,bytes.data()+100,&size,0)&&size==20;
+  if(hash)CryptDestroyHash(hash);if(provider)CryptReleaseContext(provider,0);
+  if(!ok)fail("mutation SHA1");
+}
+
+void child(const wchar_t *first,const wchar_t *second,const wchar_t *mode) {
+  wchar_t executable[32768];if(!GetModuleFileNameW(nullptr,executable,32768))fail("self path");
+  // Do not copy/rename the executable: its absolute path is part of the disk namespace.
+  std::wstring command=L"\""+std::wstring(executable)+L"\" \""+first+L"\" \""+second+L"\" "+mode;
+  STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION process{};
+  std::fflush(stdout);std::fflush(stderr);
+  char logPath[32768];const DWORD length=GetEnvironmentVariableA("DXMT_LOG_PATH",logPath,sizeof(logPath));
+  if(!length||length>=sizeof(logPath))fail("child log path");
+  const std::string childLog=std::string(logPath)+"/pipeline-cache-"+std::string(mode+2,mode+wcslen(mode));
+  // Set the inherited environment before DLL static initialization opens the log.
+  if(!SetEnvironmentVariableA("DXMT_LOG_PATH",childLog.c_str()))fail("child log environment");
+  const bool spawned=CreateProcessW(executable,command.data(),nullptr,nullptr,TRUE,0,nullptr,nullptr,&startup,&process);
+  const DWORD spawnError=GetLastError();
+  if(!SetEnvironmentVariableA("DXMT_LOG_PATH",logPath))fail("restore parent log environment");
+  if(!spawned)
+    fail("cache child create",HRESULT_FROM_WIN32(spawnError));
+  const DWORD waited=WaitForSingleObject(process.hProcess,120000);DWORD code=1;
+  if(waited==WAIT_TIMEOUT){TerminateProcess(process.hProcess,1);WaitForSingleObject(process.hProcess,INFINITE);}
+  GetExitCodeProcess(process.hProcess,&code);CloseHandle(process.hThread);CloseHandle(process.hProcess);
+  if(waited!=WAIT_OBJECT_0||code)fail("cache child result");
+}
+
+ComPtr<ID3D12PipelineState> ordinary(ID3D12Device *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc) {
+  desc.CachedPSO={};ComPtr<ID3D12PipelineState> pso;
+  check(device->CreateComputePipelineState(&desc,IID_PPV_ARGS(&pso)),"ordinary create");return pso;
+}
+
+void automatic(ID3D12Device9 *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc,
+               const std::vector<uint8_t> &shaderB,const wchar_t *first,const wchar_t *second,const wchar_t *mode) {
+  constexpr auto driver=D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED;
+  if(mode) {
+    if(!wcscmp(mode,L"--failure")) {
+      // Isolated invalid-input proof, never a normal production shader fixture.
+      auto malformed=readFile(first);malformed.resize(malformed.size()-1);desc.CS={malformed.data(),malformed.size()};
+      std::barrier start(8);std::vector<std::thread> threads;HRESULT results[8]{};void *outputs[8]{};
+      for(unsigned i=0;i<8;++i)threads.emplace_back([&,i]{
+        outputs[i]=reinterpret_cast<void*>(uintptr_t(1));start.arrive_and_wait();
+        results[i]=device->CreateComputePipelineState(&desc,__uuidof(ID3D12PipelineState),&outputs[i]);
+      });
+      for(auto &thread:threads)thread.join();
+      for(unsigned i=0;i<8;++i)if(SUCCEEDED(results[i])||outputs[i]||results[i]!=results[0])fail("failure completion");
+      void *output=reinterpret_cast<void*>(uintptr_t(1));
+      const HRESULT retry=device->CreateComputePipelineState(&desc,__uuidof(ID3D12PipelineState),&output);
+      if(retry!=results[0]||output)fail("failure later retry",retry);
+      desc.CS={nullptr,0};auto valid=readFile(first);desc.CS={valid.data(),valid.size()};
+      auto pso=ordinary(device,desc);gpuValue(device,pso.Get(),desc.pRootSignature,0x31415926u+0x135u,"failure_valid_control");
+      std::puts("OWNED_D3D12_PIPELINE_CACHE_CASE_PASS failure_completion_retry");return;
+    }
+    if(!wcscmp(mode,L"--control")) {
+      D3D12_SHADER_CACHE_SESSION_DESC sessionDesc{};
+      sessionDesc.Identifier={0xa07cca31,1,2,{3,4,5,6,7,8,9,10}};
+      sessionDesc.Mode=D3D12_SHADER_CACHE_MODE_DISK;sessionDesc.Flags=D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR;
+      ComPtr<ID3D12ShaderCacheSession> session;
+      check(device->CreateShaderCacheSession(&sessionDesc,IID_PPV_ARGS(&session)),"independent app session");
+      const UINT key=71,value=92;check(session->StoreValue(&key,sizeof(key),&value,sizeof(value)),"app session seed");
+      check(device->ShaderCacheControl(driver,D3D12_SHADER_CACHE_CONTROL_FLAGS(
+            D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE|D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR)),"driver clear");
+      auto root=rootSignature(device,6);desc.pRootSignature=root.Get();
+      auto seeded=ordinary(device,desc);const auto path=cacheFile(seeded.Get(),"control");
+      check(device->ShaderCacheControl(driver,D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE),"driver disable");
+      for(unsigned i=0;i<2;++i){auto pso=ordinary(device,desc);gpuValue(device,pso.Get(),root.Get(),
+                                    0x31415926u+0x135u,i?"disabled_second":"disabled_first");}
+      check(device->ShaderCacheControl(driver,D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE),"driver enable");
+      auto enabled=ordinary(device,desc);gpuValue(device,enabled.Get(),root.Get(),0x31415926u+0x135u,"enabled");
+      check(device->ShaderCacheControl(driver,D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR),"driver clear active");
+      if(GetFileAttributesW(path.c_str())!=INVALID_FILE_ATTRIBUTES)fail("driver clear left entry");
+      UINT actual=0,size=sizeof(actual);check(session->FindValue(&key,sizeof(key),&actual,&size),"app session independent");
+      if(actual!=value||size!=sizeof(value))fail("app session changed by driver control");
+      auto rebuilt=ordinary(device,desc);gpuValue(device,rebuilt.Get(),root.Get(),0x31415926u+0x135u,"clear_rebuild");
+      cacheFile(rebuilt.Get(),"control_rebuilt");session->SetDeleteOnDestroy();
+      std::puts("OWNED_D3D12_PIPELINE_CACHE_CASE_PASS driver_control_app_independence");return;
+    }
+    auto pso=ordinary(device,desc);cacheFile(pso.Get(),"child");
+    const std::string label=std::string("child_")+std::string(mode+2,mode+wcslen(mode));
+    gpuValue(device,pso.Get(),desc.pRootSignature,0x31415926u+0x135u,label.c_str());
+    std::printf("OWNED_D3D12_PIPELINE_CACHE_CHILD_PASS mode=%ls\n",mode+2);return;
+  }
+  DeveloperMode developer;
+  check(device->ShaderCacheControl(driver,D3D12_SHADER_CACHE_CONTROL_FLAGS(
+        D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE|D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR)),"initial driver clear");
+  D3D12_FEATURE_DATA_SHADER_CACHE support{};check(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE,&support,sizeof(support)),"cache feature");
+  constexpr UINT required=D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO|D3D12_SHADER_CACHE_SUPPORT_DRIVER_MANAGED_CACHE;
+  if((support.SupportFlags&required)!=required)fail("automatic cache required bits");
+  auto a=ordinary(device,desc);const auto path=cacheFile(a.Get(),"a");gpuValue(device,a.Get(),desc.pRootSignature,0x31415926u+0x135u,"ordinary_a");
+  auto bDesc=desc;bDesc.CS={shaderB.data(),shaderB.size()};auto b=ordinary(device,bDesc);
+  const auto bPath=cacheFile(b.Get(),"b");gpuValue(device,b.Get(),desc.pRootSignature,0x31415926u^0x135u,"ordinary_b");
+  auto otherRoot=rootSignature(device,3);auto rootDesc=desc;rootDesc.pRootSignature=otherRoot.Get();
+  auto r=ordinary(device,rootDesc);const auto rootPath=cacheFile(r.Get(),"root");
+  gpuValue(device,r.Get(),otherRoot.Get(),0x31415926u+0x135u,"ordinary_root");
+  if(path==bPath||path==rootPath||bPath==rootPath)fail("automatic key separation");
+  for(auto entry:{desc,bDesc,rootDesc}){auto pso=ordinary(device,entry);gpuValue(device,pso.Get(),entry.pRootSignature,
+                                entry.CS.pShaderBytecode==shaderB.data()?0x31415926u^0x135u:0x31415926u+0x135u,
+                                entry.pRootSignature==otherRoot.Get()?"memory_root":entry.CS.pShaderBytecode==shaderB.data()?"memory_b":"memory_a");}
+  std::puts("OWNED_D3D12_PIPELINE_CACHE_CASE_PASS ordinary_key_memory");
+  child(first,second,L"--disk");
+  auto good=readFile(path.c_str());
+  for(const auto *mutation:{L"--corrupt",L"--truncated",L"--identity",L"--native"}) {
+    auto changed=good;
+    if(!wcscmp(mutation,L"--corrupt"))changed.back()^=1;
+    else if(!wcscmp(mutation,L"--truncated"))changed.pop_back();
+    else if(!wcscmp(mutation,L"--identity")){
+      v5LibrarySize(changed);changed[32]^=1;rehashV5(changed);
+    }else{
+      const size_t library=v5LibrarySize(changed);uint64_t fileSize=0;uint16_t major=0,minor=0;
+      memcpy(&fileSize,changed.data()+216+16,8);
+      memcpy(&major,changed.data()+216+6,2);memcpy(&minor,changed.data()+216+8,2);
+      if(fileSize!=library||major!=2||minor!=7)fail("mutation metallib version layout");
+      // Native container version is consumed before AIR function HASH/cache reuse.
+      // Keep MTLB magic, offsets, byte sizes, function data and PSO relocations intact.
+      const uint16_t unsupported=0xffff;memcpy(changed.data()+216+6,&unsupported,2);
+      if(!memcmp(changed.data()+216+6,good.data()+216+6,2))fail("native fault did not change bytes");
+      rehashV5(changed);
+      std::puts("OWNED_D3D12_PIPELINE_CACHE_NATIVE_FAULT field=metallib_version_major before=2 after=65535");
+    }
+    writeFile(path,changed);child(first,second,mutation);
+    if(readFile(path.c_str())==changed)fail("ignored entry not rebuilt");
+  }
+  std::puts("OWNED_D3D12_PIPELINE_CACHE_CASE_PASS disk_restore_invalid_rebuild");
+  auto concurrentRoot=rootSignature(device,4);auto shared=desc;shared.pRootSignature=concurrentRoot.Get();
+  std::barrier start(8);std::vector<std::thread> threads;ComPtr<ID3D12PipelineState> psos[8];HRESULT results[8]{};
+  for(unsigned i=0;i<8;++i)threads.emplace_back([&,i]{start.arrive_and_wait();
+    results[i]=device->CreateComputePipelineState(&shared,IID_PPV_ARGS(&psos[i]));});
+  for(auto &thread:threads)thread.join();
+  for(unsigned i=0;i<8;++i){check(results[i],"concurrent ordinary create");if(!psos[i])fail("concurrent output");
+    char label[32];std::snprintf(label,sizeof(label),"concurrent_%u",i);
+    gpuValue(device,psos[i].Get(),concurrentRoot.Get(),0x31415926u+0x135u,label);}
+  cacheFile(psos[0].Get(),"concurrent");
+  std::puts("OWNED_D3D12_PIPELINE_CACHE_CASE_PASS concurrent_single_producer");
+  child(first,second,L"--failure");child(first,second,L"--control");
+}
+
+int run(const wchar_t *firstPath,const wchar_t *secondPath,const wchar_t *mode=nullptr) {
   using BackendId=const char*(WINAPI*)();auto identity=reinterpret_cast<BackendId>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"),"OwnedGraphicsBackendId"));
   if(!identity||strcmp(identity(),"owned-graphics-d3d12"))fail("backend identity");
   std::printf("OWNED_D3D12_PIPELINE_CACHE_BACKEND id=%s\n",identity());
@@ -100,6 +327,8 @@ int run(const wchar_t *firstPath,const wchar_t *secondPath) {
   ComPtr<ID3D12Device> device;check(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"create device");
   auto shaderA=readFile(firstPath),shaderB=readFile(secondPath);auto root=rootSignature(device.Get(),2);
   D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};desc.pRootSignature=root.Get();desc.CS={shaderA.data(),shaderA.size()};
+  ComPtr<ID3D12Device9> device9;check(device.As(&device9),"device9");
+  automatic(device9.Get(),desc,shaderB,firstPath,secondPath,mode);if(mode)return 0;
   ComPtr<ID3D12PipelineState> source;check(device->CreateComputePipelineState(&desc,IID_PPV_ARGS(&source)),"create source PSO");
   ComPtr<ID3DBlob> blob;check(source->GetCachedBlob(&blob),"export cache");
   const auto *data=static_cast<const uint8_t*>(blob->GetBufferPointer());std::vector<uint8_t> good(data,data+blob->GetBufferSize());
@@ -133,4 +362,9 @@ int run(const wchar_t *firstPath,const wchar_t *secondPath) {
   std::puts("OWNED_D3D12_PIPELINE_CACHE_PASS");return 0;
 }
 } // namespace
-int wmain(int argc,wchar_t **argv){return argc==3?run(argv[1],argv[2]):2;}
+int wmain(int argc,wchar_t **argv){
+  try {
+    if(argc!=3&&argc!=4)return 2;
+    return run(argv[1],argv[2],argc==4?argv[3]:nullptr);
+  }catch(const std::exception &){return 1;}
+}

@@ -88,6 +88,13 @@ struct FgContext {
             std::printf("OWNED_D3D12_FSR_FG_UNAVAILABLE stage=create result=%u gpu_attempted=0\n", result);
             ExitProcess(2);
         }
+        // Direct dispatch has no proxy to enable the generation context.
+        ffxConfigureDescFrameGeneration config{};
+        config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+        config.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+        config.frameGenerationEnabled = true;
+        config.generationRect = {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)};
+        fgResult(api.configure(&value, &config.header), FFX_API_RETURN_OK, "enable-direct-generation-context");
     }
     void destroy() {
         fgResult(api.destroy(&value, &callbacks), FFX_API_RETURN_OK, "destroy-context");
@@ -203,11 +210,12 @@ ffxDispatchDescFrameGeneration fgGenerate(ID3D12GraphicsCommandList* list, uint6
 std::vector<uint8_t> fgFrame(FgContext& context, Gpu& gpu, unsigned frame,
                             ID3D12Resource* depth, ID3D12Resource* motion, bool reset = false,
                             bool mutateAfterPrepare = false,
-                            FfxApiRect2D rect = {0, 0, fgWidth, fgHeight}) {
+                            FfxApiRect2D rect = {0, 0, fgWidth, fgHeight}, UINT flags = 0) {
     auto color = fgColor(gpu, frame);
     auto output = fgOutput(gpu);
     auto r = fgRecording(gpu);
     auto p = fgPrepare(r.list.Get(), frame, depth, motion, reset);
+    p.flags = flags;
     fgResult(context.api.dispatch(&context.value, &p.header), FFX_API_RETURN_OK, "prepare");
     check(r.list->Close(), "fg-prepare-close");
     gpu.executeAndWait(r.list.Get());
@@ -226,6 +234,12 @@ std::vector<uint8_t> fgFrame(FgContext& context, Gpu& gpu, unsigned frame,
     fgResult(context.api.dispatch(&context.value, &g.header), FFX_API_RETURN_OK, "generate");
     check(r.list->Close(), "fg-generate-close"); gpu.executeAndWait(r.list.Get());
     auto pixels = fgPixels(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (reset || frame == 1) {
+        for (size_t i = 0; i < pixels.size(); i += 2) {
+            uint16_t value; std::memcpy(&value, pixels.data() + i, 2);
+            fgRequire(value == 0x3200, "bootstrap-reset-zero-output-unchanged");
+        }
+    }
     std::printf("OWNED_D3D12_FSR_FG_FRAME frame=%u reset=%u hash=%016llx source=gpu-readback\n",
                 frame, reset, static_cast<unsigned long long>(fgHash(pixels)));
     return pixels;
@@ -252,8 +266,9 @@ void fgDirect(const FgApi& api, Gpu& gpu) {
     check(initializeMotion.list->Close(), "initial-pan-transition"); gpu.executeAndWait(initializeMotion.list.Get());
     fgUpload(gpu, motion.Get(), pan.data(), kInputWidth * 4, fgRead);
     FgContext clean(api, gpu), snapshot(api, gpu);
+    std::vector<uint8_t> secondFrame;
     for (unsigned frame = 1; frame <= 4; ++frame) {
-        const auto expected = fgFrame(clean, gpu, frame, depth.Get(), motion.Get());
+        auto expected = fgFrame(clean, gpu, frame, depth.Get(), motion.Get());
         char path[64]; std::snprintf(path, sizeof(path), "fg-direct-frame-%u.bin", frame);
         fgDump(expected, path);
         if (frame == 4) {
@@ -262,6 +277,7 @@ void fgDirect(const FgApi& api, Gpu& gpu) {
         }
         const auto actual = fgFrame(snapshot, gpu, frame, depth.Get(), motion.Get(), false, true);
         fgEqual(actual, expected, "prepare-gpu-snapshot-exact");
+        if (frame == 2) secondFrame = std::move(expected);
         auto r = fgRecording(gpu);
         transition(r.list.Get(), depth.Get(), fgRead, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(r.list.Get(), motion.Get(), fgRead, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -269,8 +285,23 @@ void fgDirect(const FgApi& api, Gpu& gpu) {
         fgUpload(gpu, depth.Get(), depths.data(), kInputWidth * 4, fgRead);
         fgUpload(gpu, motion.Get(), pan.data(), kInputWidth * 4, fgRead);
     }
+    FgContext ordered(api, gpu);
+    fgFrame(ordered, gpu, 1, depth.Get(), motion.Get());
+    for (UINT frame : {2u, 3u}) {
+        auto r = fgRecording(gpu);
+        auto prepare = fgPrepare(r.list.Get(), frame, depth.Get(), motion.Get(), false);
+        fgResult(api.dispatch(&ordered.value, &prepare.header), FFX_API_RETURN_OK, "prepare-ahead-of-matching-generation");
+        check(r.list->Close(), "prepare-ahead-close"); gpu.executeAndWait(r.list.Get());
+    }
+    auto orderedColor = fgColor(gpu, 2), orderedOutput = fgOutput(gpu);
+    auto orderedList = fgRecording(gpu);
+    auto orderedGeneration = fgGenerate(orderedList.list.Get(), 2, orderedColor.Get(), orderedOutput.Get(), false);
+    fgResult(api.dispatch(&ordered.value, &orderedGeneration.header), FFX_API_RETURN_OK, "generate-matching-older-prepare");
+    check(orderedList.list->Close(), "generate-older-prepare-close"); gpu.executeAndWait(orderedList.list.Get());
+    fgEqual(secondFrame, fgPixels(gpu, orderedOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS), "newer-prepare-does-not-reset-matching-real-pair");
+    std::puts("OWNED_D3D12_FSR_FG_PREPARE_ORDER_PASS matching_frame=2 newest_prepare=3 output=exact");
     const FfxApiRect2D rect{7, 11, 96, 88};
-    auto pixels = fgFrame(snapshot, gpu, 5, depth.Get(), motion.Get(), true, false, rect);
+    auto pixels = fgFrame(snapshot, gpu, 5, depth.Get(), motion.Get(), false, false, rect);
     const auto preserved = fgScene(5);
     for (UINT y = 0; y < fgHeight; ++y)
         for (UINT x = 0; x < fgWidth; ++x)
@@ -311,8 +342,18 @@ void fgDirect(const FgApi& api, Gpu& gpu) {
     auto negative = fgRecording(gpu);
     auto missing = fgGenerate(negative.list.Get(), 12, negativeColor.Get(), negativeOutput.Get(), false);
     fgResult(api.dispatch(&epoch.value, &missing.header), FFX_API_RETURN_ERROR_PARAMETER, "generate-without-prepare");
+    auto countPrepare = fgPrepare(negative.list.Get(), 12, depth.Get(), motion.Get(), true);
+    fgResult(api.dispatch(&epoch.value, &countPrepare.header), FFX_API_RETURN_OK, "count-prepare");
+    for (UINT count : {0u, 5u}) {
+        missing.numGeneratedFrames = count;
+        fgResult(api.dispatch(&epoch.value, &missing.header), FFX_API_RETURN_ERROR_PARAMETER, "count-outside-public-range");
+    }
     check(negative.list->Close(), "negative-close"); gpu.executeAndWait(negative.list.Get());
     fgEqual(fgPixels(gpu, negativeOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS), negativeBefore, "negative-output-unchanged");
+    auto retry = fgRecording(gpu); missing.commandList = retry.list.Get(); missing.numGeneratedFrames = 1;
+    fgResult(api.dispatch(&epoch.value, &missing.header), FFX_API_RETURN_OK, "count-rejection-preserves-prepare");
+    check(retry.list->Close(), "count-retry-close"); gpu.executeAndWait(retry.list.Get());
+    std::puts("OWNED_D3D12_FSR_FG_COUNT_REJECTION_PASS counts=0,5 sentinel=exact prepare=retained multi_output_supported=1");
     // The output is a real retained resource even if the public context and all
     // input COM references disappear before the recorded work executes.
     FgContext dying(api, gpu);
@@ -354,6 +395,194 @@ void fgDirect(const FgApi& api, Gpu& gpu) {
     std::puts("OWNED_D3D12_FSR_FG_CONFIG_PASS repeated_id=replace retained_distinct_limit=64 overflow=runtime_error off_clears=1");
     std::puts("OWNED_D3D12_FSR_FG_LIFETIME_PASS context_destroy_before_execute=1 input_release=1 allocation_balance=1");
 }
+void fgGrouped(const FgApi& api, Gpu& gpu) {
+    auto depth = fgDepth(gpu), motion = fgMotion(gpu);
+    for (UINT count = 1; count <= 4; ++count) {
+        FgContext context(api, gpu);
+        fgFrame(context, gpu, 1, depth.Get(), motion.Get());
+        auto color = fgColor(gpu, 2);
+        const auto current = fgPixels(gpu, color.Get(), fgRead);
+        ComPtr<ID3D12Resource> outputs[4];
+        std::vector<uint8_t> before[4];
+        for (UINT i = 0; i < count; ++i) {
+            outputs[i] = fgOutput(gpu);
+            before[i] = fgPixels(gpu, outputs[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        auto r = fgRecording(gpu);
+        auto prepare = fgPrepare(r.list.Get(), 2, depth.Get(), motion.Get(), false);
+        fgResult(api.dispatch(&context.value, &prepare.header), FFX_API_RETURN_OK, "grouped-prepare");
+        auto generation = fgGenerate(r.list.Get(), 2, color.Get(), outputs[0].Get(), false, {7, 11, 96, 88});
+        generation.numGeneratedFrames = count;
+        for (UINT i = 0; i < count; ++i)
+            generation.outputs[i] = ffxApiGetResourceDX12(outputs[i].Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (count == 4) {
+            auto invalid = generation;
+            invalid.outputs[3] = invalid.outputs[0];
+            fgResult(api.dispatch(&context.value, &invalid.header), FFX_API_RETURN_ERROR_PARAMETER, "grouped-last-output-alias");
+            invalid = generation; invalid.outputs[3] = generation.presentColor;
+            fgResult(api.dispatch(&context.value, &invalid.header), FFX_API_RETURN_ERROR_PARAMETER, "grouped-output-present-alias");
+            invalid = generation; invalid.outputs[3].resource = nullptr;
+            fgResult(api.dispatch(&context.value, &invalid.header), FFX_API_RETURN_ERROR_PARAMETER, "grouped-missing-output");
+            invalid = generation; invalid.outputs[3].state = FFX_API_RESOURCE_STATE_COPY_SRC | FFX_API_RESOURCE_STATE_COPY_DEST;
+            fgResult(api.dispatch(&context.value, &invalid.header), FFX_API_RETURN_ERROR_PARAMETER, "grouped-invalid-output-state");
+            auto wrongSize = createTexture(gpu.device.Get(), 96, 80, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            invalid = generation; invalid.outputs[3] = ffxApiGetResourceDX12(wrongSize.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            fgResult(api.dispatch(&context.value, &invalid.header), FFX_API_RETURN_ERROR_PARAMETER, "grouped-invalid-output-dimensions");
+            auto wrongFormat = createTexture(gpu.device.Get(), fgWidth, fgHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            invalid = generation; invalid.outputs[3] = ffxApiGetResourceDX12(wrongFormat.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            fgResult(api.dispatch(&context.value, &invalid.header), FFX_API_RETURN_ERROR_PARAMETER, "grouped-invalid-output-format");
+        }
+        fgResult(api.dispatch(&context.value, &generation.header), FFX_API_RETURN_OK, "grouped-generate");
+        check(r.list->Close(), "grouped-close"); gpu.executeAndWait(r.list.Get());
+        std::vector<uint8_t> phases[4];
+        for (UINT i = 0; i < count; ++i) {
+            phases[i] = fgPixels(gpu, outputs[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            fgRequire(phases[i] != before[i] && phases[i] != current, "grouped-genuine-output-not-sentinel-or-current");
+            for (UINT j = 0; j < i; ++j) fgRequire(phases[i] != phases[j], "grouped-phases-distinct-gpu-pixels");
+            for (UINT y = 0; y < fgHeight; ++y) for (UINT x = 0; x < fgWidth; ++x)
+                if (x < 7 || x >= 103 || y < 11 || y >= 99)
+                    fgRequire(!std::memcmp(phases[i].data() + (y * fgWidth + x) * 8,
+                        current.data() + (y * fgWidth + x) * 8, 8), "grouped-cropped-border-real-pixels");
+            char path[64]; std::snprintf(path, sizeof(path), "fg-grouped-%u-%u.bin", count, i + 1);
+            fgDump(phases[i], path);
+        }
+        r = fgRecording(gpu);
+        prepare = fgPrepare(r.list.Get(), 3, depth.Get(), motion.Get(), false);
+        fgResult(api.dispatch(&context.value, &prepare.header), FFX_API_RETURN_OK, "grouped-reset-prepare");
+        generation.commandList = r.list.Get(); generation.frameID = 3; generation.reset = true;
+        fgResult(api.dispatch(&context.value, &generation.header), FFX_API_RETURN_OK, "grouped-reset-generate");
+        check(r.list->Close(), "grouped-reset-close"); gpu.executeAndWait(r.list.Get());
+        for (UINT i = 0; i < count; ++i)
+            fgEqual(phases[i], fgPixels(gpu, outputs[i].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS), "grouped-reset-all-outputs-unchanged");
+        std::printf("OWNED_D3D12_FSR_FG_GROUPED_PASS count=%u distinct_gpu_outputs=%u rect_guard=exact reset_output=unchanged\n", count, count);
+    }
+}
+void fgDebug(const FgApi& api, Gpu& gpu) {
+    auto depth = fgDepth(gpu), motion = fgMotion(gpu);
+    FgContext control(api, gpu), tear(api, gpu), indicator(api, gpu), view(api, gpu);
+    std::vector<uint8_t> debugBaseline;
+    for (UINT frame = 1; frame <= 2; ++frame) {
+        const auto baseline = fgFrame(control, gpu, frame, depth.Get(), motion.Get());
+        const auto lines = fgFrame(tear, gpu, frame, depth.Get(), motion.Get(), false, false,
+            {0, 0, fgWidth, fgHeight}, FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES);
+        const auto reset = fgFrame(indicator, gpu, frame, depth.Get(), motion.Get(), false, false,
+            {0, 0, fgWidth, fgHeight}, FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS);
+        // Configure-only flags must use the same immutable per-frame snapshot as HUDLessColor.
+        ffxConfigureDescFrameGeneration config{};
+        config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+        config.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW;
+        config.frameGenerationEnabled = true; config.frameID = frame;
+        config.generationRect = {0, 0, fgWidth, fgHeight};
+        fgResult(api.configure(&view.value, &config.header), FFX_API_RETURN_OK, "debug-view-configure");
+        auto debug = fgFrame(view, gpu, frame, depth.Get(), motion.Get());
+        if (frame == 1) {
+            fgEqual(lines, baseline, "bootstrap-debug-tear-output-unchanged");
+            fgEqual(reset, baseline, "bootstrap-debug-reset-output-unchanged");
+            fgEqual(debug, baseline, "bootstrap-debug-view-output-unchanged");
+            continue;
+        }
+        // Diagnostics are full-display GPU outputs; their vendor pixel layout
+        // is not a permanent public consumer contract.
+        fgRequire(lines != baseline, "debug-tear-affects-valid-generated-pixels");
+        fgEqual(reset, baseline, "valid-pair-reset-indicator-no-overlay");
+        fgRequire(debug != baseline, "debug-view-affects-valid-generated-pixels");
+        for (const auto* pixels : std::array<const std::vector<uint8_t>*, 3>{&lines, &reset, &debug})
+            for (size_t offset = 6; offset < pixels->size(); offset += 8) {
+                uint16_t alpha; std::memcpy(&alpha, pixels->data() + offset, sizeof(alpha));
+                fgRequire(alpha == 0x3c00, "debug-generated-opaque-alpha");
+            }
+        if (frame == 2) debugBaseline = std::move(debug);
+    }
+    // Independent GPU contexts establish flag-capture baselines without
+    // pinning a vendor panel layout or reading production-private wiring.
+    FgContext preparedFlags(api, gpu), configuredFlags(api, gpu), cropControl(api, gpu);
+    fgFrame(preparedFlags, gpu, 1, depth.Get(), motion.Get());
+    fgFrame(configuredFlags, gpu, 1, depth.Get(), motion.Get());
+    fgFrame(cropControl, gpu, 1, depth.Get(), motion.Get());
+    for (UINT frame : {2u, 3u}) {
+        auto r = fgRecording(gpu);
+        auto p = fgPrepare(r.list.Get(), frame, depth.Get(), motion.Get(), false);
+        p.flags = frame == 2 ? FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW : 0;
+        fgResult(api.dispatch(&preparedFlags.value, &p.header), FFX_API_RETURN_OK, "debug-prepare-per-frame-flags");
+        p.flags = 0;
+        check(r.list->Close(), "debug-prepare-flags-close"); gpu.executeAndWait(r.list.Get());
+    }
+    auto preparedColor = fgColor(gpu, 2), preparedOutput = fgOutput(gpu);
+    auto preparedList = fgRecording(gpu);
+    auto preparedGeneration = fgGenerate(preparedList.list.Get(), 2, preparedColor.Get(), preparedOutput.Get(), false);
+    fgResult(api.dispatch(&preparedFlags.value, &preparedGeneration.header), FFX_API_RETURN_OK, "debug-generate-matching-prepare-flags");
+    check(preparedList.list->Close(), "debug-prepare-capture-close"); gpu.executeAndWait(preparedList.list.Get());
+    fgEqual(debugBaseline, fgPixels(gpu, preparedOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS), "debug-prepare-flags-independent-gpu-exact");
+    const FfxApiRect2D capturedRect{7, 11, 96, 88};
+    const auto cropBaseline = fgFrame(cropControl, gpu, 2, depth.Get(), motion.Get(), false, false,
+        capturedRect, FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW);
+    ffxConfigureDescFrameGeneration captured{};
+    captured.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    captured.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW;
+    captured.frameGenerationEnabled = true; captured.frameID = 2; captured.generationRect = capturedRect;
+    fgResult(api.configure(&configuredFlags.value, &captured.header), FFX_API_RETURN_OK, "debug-configure-recorded-flags");
+    auto capturedColor = fgColor(gpu, 2), capturedOutput = fgOutput(gpu);
+    auto capturedList = fgRecording(gpu);
+    auto capturedPrepare = fgPrepare(capturedList.list.Get(), 2, depth.Get(), motion.Get(), false);
+    fgResult(api.dispatch(&configuredFlags.value, &capturedPrepare.header), FFX_API_RETURN_OK, "debug-configure-capture-prepare");
+    auto capturedGeneration = fgGenerate(capturedList.list.Get(), 2, capturedColor.Get(), capturedOutput.Get(), false, capturedRect);
+    fgResult(api.dispatch(&configuredFlags.value, &capturedGeneration.header), FFX_API_RETURN_OK, "debug-configure-capture-generate");
+    capturedGeneration.generationRect = {0, 0, fgWidth, fgHeight};
+    captured.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    captured.generationRect = capturedGeneration.generationRect;
+    fgResult(api.configure(&configuredFlags.value, &captured.header), FFX_API_RETURN_OK, "debug-configure-flags-region-cutover-before-execute");
+    check(capturedList.list->Close(), "debug-configure-capture-close"); gpu.executeAndWait(capturedList.list.Get());
+    fgEqual(cropBaseline, fgPixels(gpu, capturedOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS), "debug-configure-flags-region-independent-gpu-exact");
+    std::puts("OWNED_D3D12_FSR_FG_DEBUG_CAPTURE_PASS prepare=per_frame configure=recorded rect=recorded output=independent_gpu_exact");
+    // Flagged outputs never contaminate real-pair history or survive a configure cutover.
+    ffxConfigureDescFrameGeneration clear{};
+    clear.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    clear.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    clear.frameGenerationEnabled = true; clear.frameID = 3; clear.generationRect = {0, 0, fgWidth, fgHeight};
+    fgResult(api.configure(&view.value, &clear.header), FFX_API_RETURN_OK, "debug-view-clear");
+    fgEqual(fgFrame(view, gpu, 3, depth.Get(), motion.Get()), fgFrame(control, gpu, 3, depth.Get(), motion.Get()), "debug-history-unmodified");
+    auto originalDepth = fgDepth(gpu), originalMotion = fgMotion(gpu);
+    const auto unchangedGuides = fgFrame(control, gpu, 4, originalDepth.Get(), originalMotion.Get(), false, false,
+        {0, 0, fgWidth, fgHeight}, FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW);
+    auto mutate = fgRecording(gpu);
+    transition(mutate.list.Get(), depth.Get(), fgRead, D3D12_RESOURCE_STATE_COPY_DEST);
+    transition(mutate.list.Get(), motion.Get(), fgRead, D3D12_RESOURCE_STATE_COPY_DEST);
+    check(mutate.list->Close(), "debug-input-change"); gpu.executeAndWait(mutate.list.Get());
+    std::vector<float> changedDepth(kInputWidth * kInputHeight, .25f);
+    std::vector<uint16_t> changedMotion(kInputWidth * kInputHeight * 2);
+    for (UINT i = 0; i < changedMotion.size(); i += 2) changedMotion[i] = 0x3d00; // 1.25 render pixels -> 2.5 display pixels.
+    fgUpload(gpu, depth.Get(), changedDepth.data(), kInputWidth * 4, fgRead);
+    fgUpload(gpu, motion.Get(), changedMotion.data(), kInputWidth * 4, fgRead);
+    const auto changed = fgFrame(view, gpu, 4, depth.Get(), motion.Get(), false, false,
+        {0, 0, fgWidth, fgHeight}, FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW);
+    fgRequire(changed != unchangedGuides, "debug-guides-actual-gpu-input-dependent");
+    FgContext replay(api, gpu);
+    fgFrame(replay, gpu, 9, depth.Get(), motion.Get());
+    clear.frameID = 10; clear.flags |= 7u;
+    fgResult(api.configure(&replay.value, &clear.header), FFX_API_RETURN_OK, "debug-replay-configure");
+    auto color = fgColor(gpu, 10), output = fgOutput(gpu);
+    auto recorded = fgRecording(gpu);
+    auto p = fgPrepare(recorded.list.Get(), 10, depth.Get(), motion.Get(), false);
+    fgResult(api.dispatch(&replay.value, &p.header), FFX_API_RETURN_OK, "debug-replay-prepare");
+    auto g = fgGenerate(recorded.list.Get(), 10, color.Get(), output.Get(), false, {7, 11, 96, 88});
+    fgResult(api.dispatch(&replay.value, &g.header), FFX_API_RETURN_OK, "debug-replay-generate");
+    check(recorded.list->Close(), "debug-replay-close");
+    clear.frameID = 11; clear.flags &= ~7u;
+    fgResult(api.configure(&replay.value, &clear.header), FFX_API_RETURN_OK, "debug-replay-cutover");
+    gpu.executeAndWait(recorded.list.Get());
+    const auto before = fgPixels(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // Destroy cancels unsubmitted generation. Complete the genuine first
+    // submission before checking retained closed-list replay after destruction.
+    replay.destroy(); color.Reset();
+    gpu.executeAndWait(recorded.list.Get());
+    fgEqual(before, fgPixels(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS), "debug-recording-replay-exact");
+    // Debug diagnostics can override the full display, including outside ROI.
+    // Normal all-count crop guards are checked separately without debug flags.
+    std::puts("OWNED_D3D12_FSR_FG_DEBUG_PASS tear=gpu_effect reset=history debug=real_inputs configure=frame_snapshot history=unmodified alpha=opaque");
+    std::puts("OWNED_D3D12_FSR_FG_DEBUG_REPLAY_PASS combined=1 debug_overlay=full_display replay=exact context_destroy_before_replay=1");
+}
 } // namespace
 
 #include "owned-d3d12-fsr-fg-proxy.inc"
@@ -365,6 +594,8 @@ int main() {
     FgApi api;
     Gpu gpu;
     fgDirect(api, gpu);
+    fgGrouped(api, gpu);
+    fgDebug(api, gpu);
     fgProxy(api, gpu);
     std::puts("OWNED_D3D12_FSR_FG_PASS");
     return 0;

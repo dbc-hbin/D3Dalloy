@@ -8,11 +8,12 @@
 
 namespace dxmt {
 
-Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count, WMT4::Compiler compiler) :
+Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count, WMT4::Compiler compiler, bool composition) :
     device_(device),
+    composition_(composition),
     compiler_(compiler),
     layer_(layer),
-    lib_(lib),
+    lib_(lib.getLibrary()),
     sample_count_(sample_count) {
   layer_.getProps(layer_props_);
   layer_props_.device = device;
@@ -39,15 +40,18 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
 
 bool
 Presenter::changeLayerProperties(
-    WMTPixelFormat format, WMTColorSpace colorspace, double width, double height, uint8_t sample_count
+    WMTPixelFormat format, WMTColorSpace colorspace, double width, double height, uint8_t sample_count,
+    DXMTPresentAlpha alpha
 ) {
   bool should_invalidated = colorspace_ != colorspace;
+  should_invalidated |= alpha_ != alpha;
+  alpha_ = alpha;
+  layer_props_.opaque = alpha == DXMTPresentAlpha::Opaque;
   should_invalidated |= source_format_ != format;
   should_invalidated |= layer_props_.drawable_width != width || layer_props_.drawable_height != height;
   source_format_ = format;
   should_invalidated |= sample_count_ != sample_count;
   sample_count_ = sample_count;
-  layer_props_.pixel_format = Forget_sRGB(format);
   layer_props_.drawable_height = height;
   layer_props_.drawable_width = width;
   colorspace_ = colorspace;
@@ -56,6 +60,42 @@ Presenter::changeLayerProperties(
   else
     layer_.setProps(layer_props_);
   return should_invalidated;
+}
+
+void
+Presenter::drainNativeRetirements() {
+  std::unique_lock lock(native_retire_mutex_);
+  for (;;) {
+    if (native_retirement_aborted_) {
+      native_retirement_draining_ = false;
+      return;
+    }
+    ++next_native_retirement_;
+    auto next = native_retirements_.find(next_native_retirement_);
+    if (next == native_retirements_.end()) {
+      native_retirement_draining_ = false;
+      return;
+    }
+    auto retirement = std::move(next->second);
+    native_retirements_.erase(next);
+    lock.unlock();
+    retirement();
+    lock.lock();
+  }
+}
+
+void
+Presenter::abortNativeRetirements() {
+  Rc<Presenter> keep_alive(this);
+  std::map<uint64_t, std::function<void()>> canceled;
+  {
+    std::lock_guard lock(native_retire_mutex_);
+    native_retirement_aborted_ = true;
+    canceled.swap(native_retirements_);
+  }
+  // The caller marked the device removed before aborting. These callbacks
+  // cancel observer records and release held drawables/surfaces, never present.
+  for (auto &[frame_id, retirement] : canceled) retirement();
 }
 
 bool
@@ -138,9 +178,15 @@ Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_
     pso_valid.clear();
   }
 
-  auto final_colorspace = display_setting_version_ > 0 ? display_colorspace_ : colorspace_;
+  const bool composition_residual = composition_ && alpha_ == DXMTPresentAlpha::Premultiplied;
+  // This owned premultiplied transport exposes G22 SDR only. A global display
+  // override must not secretly turn its two bounded UNORM planes into HDR.
+  auto final_colorspace = composition_residual ? colorspace_
+      : display_setting_version_ > 0 ? display_colorspace_ : colorspace_;
   auto is_hdr = WMT_COLORSPACE_IS_HDR(final_colorspace);
-  auto hdr_metadata = display_setting_version_ > 0 ? &display_hdr_metadata_
+  const bool linear_composition_transport = composition_ && alpha_ != DXMTPresentAlpha::Opaque &&
+      final_colorspace == WMTColorSpaceSRGB;
+  auto hdr_metadata = !composition_residual && display_setting_version_ > 0 ? &display_hdr_metadata_
                       : has_hdr_metadata_          ? &hdr_metadata_
                                                    : nullptr;
   if (unlikely(!pso_valid.test_and_set())) {
@@ -150,12 +196,17 @@ Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_
       else
         waitPresentsEncoded();
     }
-    buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1, gamma_version_ != 0);
+    // Use the native float drawable path for transparent remote exports.
+    // The source remains G22 SDR; float preserves derived additive energy.
+    layer_props_.pixel_format = linear_composition_transport ? WMTPixelFormatRGBA16Float : Forget_sRGB(source_format_);
+    buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr,
+                             sample_count_ > 1, gamma_version_ != 0, composition_residual, linear_composition_transport);
     layer_.setProps(layer_props_);
-    layer_.setColorSpace(final_colorspace);
+    layer_.setColorSpace(linear_composition_transport ? WMTColorSpaceSRGBLinear : final_colorspace);
   }
 
   DXMTPresentMetadata metadata{};
+  metadata.alpha = alpha_;
 
   metadata.edr_scale = 1.0;
   metadata.max_content_luminance = 10000;
@@ -228,11 +279,20 @@ Presenter::encodeCommandsMetal4(
 ) {
   assert(compiler_ && "Metal4 presentation requires a Metal4 compiler");
   auto drawable = layer_.nextDrawable();
+  if (!drawable) return {};
+  if (!cmdbuf.useDrawable(drawable)) return {};
   WMTRenderPassInfo info;
   WMT::InitializeRenderPassInfo(info);
   info.colors[0].load_action = WMTLoadActionDontCare;
   info.colors[0].store_action = WMTStoreActionStore;
   info.colors[0].texture = drawable.texture();
+  if (composition_ && alpha_ == DXMTPresentAlpha::Premultiplied) {
+    WMT::Texture residual{WMTCompositionDrawableResidualTexture(drawable.handle)};
+    if (!residual) return {};
+    info.colors[1].load_action = WMTLoadActionDontCare;
+    info.colors[1].store_action = WMTStoreActionStore;
+    info.colors[1].texture = residual;
+  }
   auto encoder = cmdbuf.renderCommandEncoder(info);
   wait_fences(encoder);
   encoder.setFragmentTexture(backbuffer, 0);
@@ -256,11 +316,12 @@ Presenter::encodeCommandsMetal4(
 }
 
 void
-Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable) {
+Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable,
+                                   bool composition_residual, bool linear_composition_transport) {
   auto pool = WMT::MakeAutoreleasePool();
 
   uint32_t true_data = true, false_data = false;
-  WMTFunctionConstant constants[6];
+  WMTFunctionConstant constants[8];
   constants[0].data.set(&true_data);
   constants[0].type = WMTDataTypeBool;
   constants[0].index = kPresentFCIndex_BackbufferSizeMatched;
@@ -279,6 +340,12 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
   constants[5].data.set(gamma_enable ? &true_data : &false_data);
   constants[5].type  = WMTDataTypeBool;
   constants[5].index = kPresentFCIndex_GammaEnabled;
+  constants[6].data.set(composition_residual ? &true_data : &false_data);
+  constants[6].type = WMTDataTypeBool;
+  constants[6].index = kPresentFCIndex_CompositionResidual;
+  constants[7].data.set(linear_composition_transport ? &true_data : &false_data);
+  constants[7].type = WMTDataTypeBool;
+  constants[7].index = kPresentFCIndex_LinearCompositionTransport;
 
   // Both frontends consume the same library/constants but distinct compiler
   // domains: descriptors for Metal4, MTLFunction objects for classic D3D11.
@@ -292,6 +359,7 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
     WMTRenderPipelineInfo present_pipeline;
     WMT::InitializeRenderPipelineInfo(present_pipeline);
     present_pipeline.colors[0].pixel_format = layer_props_.pixel_format;
+    if (composition_residual) present_pipeline.colors[1].pixel_format = layer_props_.pixel_format;
     present_pipeline.vertex_function = vs_present_quad;
     present_pipeline.fragment_function = fs_present_quad;
     present_blit_ = compile(present_pipeline, error);
@@ -299,11 +367,11 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
     present_scale_ = compile(present_pipeline, error);
   };
   if (compiler_)
-    build(WMT4::Library(lib_.getLibrary()), [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
+    build(WMT4::Library(lib_), [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
       return compiler_.newRenderPipelineState(info, error);
     });
   else
-    build(lib_.getLibrary(), [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
+    build(WMT::Library(lib_), [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
       return device_.newRenderPipelineState(info, error);
     });
 }

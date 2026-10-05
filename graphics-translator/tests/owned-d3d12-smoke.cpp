@@ -456,8 +456,9 @@ void printModulePath(const wchar_t* name) {
     if (!module)
         fail("GetModuleHandleW", HRESULT_FROM_WIN32(GetLastError()));
     const std::string path = utf8(modulePath(module).c_str());
+    const std::string label = name ? utf8(name) : "executable";
     std::printf("OWNED_D3D12_SMOKE_MODULE name=%s path=%s\n",
-                std::wcscmp(name, L"d3d12.dll") == 0 ? "d3d12" : "dxgi", path.c_str());
+                label.substr(0, label.find_last_of('.')).c_str(), path.c_str());
 }
 
 void requireOwnedBackend() {
@@ -567,8 +568,10 @@ void validateBarrierReadback(ID3D12Resource* readback) {
 }
 
 int run(const Options& options) {
+    printModulePath(nullptr);
     printModulePath(L"d3d12.dll");
     printModulePath(L"dxgi.dll");
+    printModulePath(L"winemetal.dll");
     requireOwnedBackend();
 
     ComPtr<IDXGIFactory4> factory;
@@ -580,6 +583,7 @@ int run(const Options& options) {
     for (UINT index = 0;; ++index) {
         ComPtr<IDXGIAdapter1> candidate;
         const HRESULT enumerated = factory->EnumAdapters1(index, &candidate);
+        std::printf("OWNED_D3D12_SMOKE_ENUM index=%u hr=0x%08lx\n", index, static_cast<unsigned long>(enumerated));
         if (enumerated == DXGI_ERROR_NOT_FOUND)
             break;
         check(enumerated, "EnumAdapters1");
@@ -588,8 +592,11 @@ int run(const Options& options) {
         if (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
             continue;
         ComPtr<ID3D12Device> candidateDevice;
-        if (SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0,
-                                        IID_PPV_ARGS(&candidateDevice)))) {
+        const HRESULT created = D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0,
+                                                 IID_PPV_ARGS(&candidateDevice));
+        std::printf("OWNED_D3D12_SMOKE_DEVICE index=%u flags=0x%x hr=0x%08lx\n", index, description.Flags,
+                    static_cast<unsigned long>(created));
+        if (SUCCEEDED(created)) {
             adapter = candidate;
             device = candidateDevice;
             adapterDescription = description;
@@ -598,6 +605,7 @@ int run(const Options& options) {
     }
     if (!device)
         fail("no D3D12 hardware adapter", DXGI_ERROR_UNSUPPORTED);
+    printModulePath(L"d3d12core.dll");
 
     const std::string adapterName = utf8(adapterDescription.Description);
     std::printf("OWNED_D3D12_SMOKE_ADAPTER description=%s vendor=0x%04x device=0x%04x\n",

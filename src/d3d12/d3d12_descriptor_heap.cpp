@@ -64,7 +64,8 @@ SIZE_T
 RegisterDescriptorHandleRange(void *heap, DescriptorHandleKind kind, uint32_t count) {
   auto &registry = descriptor_handle_registry();
   /* An empty heap still owns one slot so its start handle is distinct and resolvable to no descriptor. */
-  const uint64_t span = uint64_t(count ? count : 1) * kDescriptorHandleStride;
+  const uint64_t span = uint64_t(count ? count : 1) *
+      (kind == DescriptorHandleKind::Sampler ? kSamplerDescriptorStride : kDescriptorHandleStride);
   std::unique_lock lock(registry.lock);
   SIZE_T base = 0;
   if (auto reuse = registry.free_ranges.find(span); reuse != registry.free_ranges.end()) {
@@ -104,9 +105,10 @@ ResolveDescriptorHandle(SIZE_T handle, DescriptorHandleKind kind) {
     return {nullptr, 0};
   --range;
   const SIZE_T offset = handle - range->first;
-  if (handle >= range->second.end || range->second.kind != kind || offset % kDescriptorHandleStride)
+  const uint32_t stride = kind == DescriptorHandleKind::Sampler ? kSamplerDescriptorStride : kDescriptorHandleStride;
+  if (handle >= range->second.end || range->second.kind != kind || offset % stride)
     return {nullptr, 0};
-  return {range->second.heap, uint32_t(offset / kDescriptorHandleStride)};
+  return {range->second.heap, uint32_t(offset / stride)};
 }
 
 SIZE_T
@@ -114,7 +116,11 @@ DescriptorHandleOf(const void *heap, uint32_t index) {
   auto &registry = descriptor_handle_registry();
   std::shared_lock lock(registry.lock);
   auto base = registry.bases.find(heap);
-  return base == registry.bases.end() ? 0 : base->second + SIZE_T(index) * kDescriptorHandleStride;
+  if (base == registry.bases.end())
+    return 0;
+  const auto &range = registry.ranges.at(base->second);
+  return base->second + SIZE_T(index) *
+      (range.kind == DescriptorHandleKind::Sampler ? kSamplerDescriptorStride : kDescriptorHandleStride);
 }
 
 /** Owns one heap's handle range; registration happens only once the heap is fully initialized. */
@@ -216,6 +222,12 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
 public:
   MTLD3D12DescriptorHeapImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12DescriptorHeap>(pDevice) {}
 
+  void SetDescriptorOwner(UINT index, uint64_t owner_id, uint64_t counter_owner_id) override {
+    if (index >= descriptors_.size()) return;
+    descriptors_[index].owner_id = owner_id;
+    descriptors_[index].counter_owner_id = counter_owner_id;
+  }
+
   HRESULT
   Initialize(const D3D12_DESCRIPTOR_HEAP_DESC *pDesc) {
     if (!pDesc)
@@ -315,7 +327,7 @@ public:
 
   virtual HRESULT
   AddShaderResourceView(UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp,
-                        bool CubeView, bool CenterSamplePattern) {
+                        bool CubeView, bool CenterSamplePattern, UINT64 FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     auto &cpu_storage = descriptors_[Index];
@@ -333,10 +345,21 @@ public:
       gpu_storage.SRVTexture.metadata = TextureMetadata(
           Texture->arrayLength(View) / (CubeView ? 6 : 1),
           CenterSamplePattern ? std::bit_cast<float>(uint32_t(1)) : ResourceMinLODClamp);
-      // q2: the view's mip and slice range, read only by WriteSamplerFeedback (d3d12_sampler_feedback.hpp).
+      // q2: sampler-feedback view range, replaced below by reserved-volume or MSAA sample tables.
       gpu_storage.SRVTexture.padding[0] = (1ull << 63) | (uint64_t(View.array_start) << 16) |
                                           (uint64_t(View.mip_end) << 8) | uint64_t(View.mip_start);
-      gpu_storage.SRVTexture.padding[1] = 0;
+      // q3: empty-view defaults and integer channel widths; see EmptyViewDefaults.
+      gpu_storage.SRVTexture.padding[1] = FormatDefaults;
+      if (Texture->reservedVolumeLayoutAddress) {
+        const auto cast_address = texture_view.reservedVolumeCastLayoutAddress;
+        gpu_storage.SRVTexture.padding[0] = (1ull << 62) | (cast_address ? cast_address : Texture->reservedVolumeLayoutAddress);
+        gpu_storage.SRVTexture.padding[1] |= (cast_address ? uint64_t(1) << 8 :
+            uint64_t(View.mip_start) | uint64_t(View.mip_end - View.mip_start) << 8) << 32;
+      }
+      if (texture_view.msaaSampleAddress) {
+        gpu_storage.SRVTexture.padding[0] = texture_view.msaaSampleAddress;
+        gpu_storage.SRVTexture.metadata |= 2u | (uint64_t(Texture->sampleCount()) << 8);
+      }
     }
     return S_OK;
   }
@@ -358,7 +381,7 @@ public:
   }
 
   virtual HRESULT
-  AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize) {
+  AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize, UINT FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     auto &cpu_storage = descriptors_[Index];
@@ -375,7 +398,19 @@ public:
       // Other textures retain their existing array-length interpretation.
       const uint32_t length = WSize ? (uint32_t(WSize) << 16) | FirstWSlice : Texture->arrayLength(View);
       gpu_storage.UAVTexture.metadata = TextureMetadata(length, 0);
-      gpu_storage.UAVTexture.padding[0] = gpu_storage.UAVTexture.padding[1] = 0;
+      gpu_storage.UAVTexture.padding[0] = 0;
+      gpu_storage.UAVTexture.padding[1] = FormatDefaults;
+      if (Texture->reservedVolumeLayoutAddress) {
+        const auto cast_address = texture_view.reservedVolumeCastLayoutAddress;
+        gpu_storage.UAVTexture.padding[0] = (1ull << 62) | (cast_address ? cast_address : Texture->reservedVolumeLayoutAddress);
+        gpu_storage.UAVTexture.padding[1] |= (cast_address ? uint64_t(1) << 8 :
+            uint64_t(View.mip_start) | uint64_t(View.mip_end - View.mip_start) << 8) << 32;
+        gpu_storage.UAVTexture.padding[1] |= uint64_t(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING & 0xfff) << 48;
+      }
+      if (texture_view.msaaSampleAddress) {
+        gpu_storage.UAVTexture.padding[0] = texture_view.msaaSampleAddress;
+        gpu_storage.UAVTexture.metadata |= 2u | (uint64_t(Texture->sampleCount()) << 8);
+      }
     }
     return S_OK;
   }
@@ -412,6 +447,8 @@ public:
     cpu_storage.type = ShaderVisibleDescriptorType::UAVBuffer;
     cpu_storage.UAVBuffer.buffer = UAVBuffer;
     cpu_storage.UAVBuffer.slice = Slice;
+    cpu_storage.UAVBuffer.counter = Counter;
+    cpu_storage.UAVBuffer.counter_offset = CounterOffsetInBytes;
     if (mapped_argument_buffer_) {
       auto &gpu_storage = mapped_argument_buffer_[Index];
       if (UAVBuffer) {
@@ -686,7 +723,10 @@ struct SamplerGPUStorage {
   uint64_t cube_sampler;
   uint64_t metadata;
   uint64_t padding;
+  uint32_t uint_border[4];
+  float float_border[4];
 };
+static_assert(sizeof(SamplerGPUStorage) == kSamplerDescriptorStride);
 
 class MTLD3D12SamplerDescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12SamplerDescriptorHeap> {
 
@@ -802,7 +842,7 @@ public:
 
 
   virtual HRESULT
-  AddSampler(UINT Index, const D3D12_SAMPLER_DESC *pDesc) {
+  AddSampler(UINT Index, const D3D12_SAMPLER_DESC *pDesc, UINT Flags, const UINT *UintBorderColor) {
     if (!pDesc)
       return E_INVALIDARG;
     if (Index >= samplers_.size())
@@ -810,8 +850,19 @@ public:
   
     WMTSamplerInfo info;
     PopulateWMTSamplerInfo(device_->GetMTLDevice(), info, *pDesc);
+    const bool non_normalized = Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
+    if (non_normalized) {
+      if (!sampler_feedback::ValidNonNormalizedSampler(*pDesc))
+        return E_INVALIDARG;
+      // Shader lowering divides pixel coordinates by the view dimensions, allowing BORDER filtering.
+      info.normalized_coords = true;
+      info.mip_filter = WMTSamplerMipFilterNearest;
+      info.max_anisotroy = 1;
+    }
     auto sampler = Sampler::createSampler(device_->GetMTLDevice(), info, pDesc->MipLODBias,
                                           SamplerReductionMode(pDesc->Filter));
+    if (!sampler)
+      return E_OUTOFMEMORY;
 
     samplers_[Index] = sampler;
     if (mapped_argument_buffer_) {
@@ -820,8 +871,12 @@ public:
       gpu_storage.cube_sampler = sampler->sampler_state_cube_handle;
       gpu_storage.metadata = sampler_feedback::SamplerMetadata(
           sampler->lod_bias,
-          sampler_feedback::SamplerFlags(pDesc->Filter, pDesc->AddressU, pDesc->AddressV, pDesc->MaxAnisotropy));
+          sampler_feedback::SamplerFlags(pDesc->Filter, pDesc->AddressU, pDesc->AddressV, pDesc->MaxAnisotropy,
+                                         non_normalized, pDesc->AddressW, UintBorderColor != nullptr, pDesc->ComparisonFunc));
       gpu_storage.padding = sampler_feedback::SamplerLodRange(pDesc->MinLOD, pDesc->MaxLOD);
+      for (unsigned channel = 0; channel < 4; ++channel)
+        gpu_storage.uint_border[channel] = UintBorderColor ? UintBorderColor[channel] : 0;
+      std::copy_n(pDesc->BorderColor, 4, gpu_storage.float_border);
     }
 
     return S_OK;

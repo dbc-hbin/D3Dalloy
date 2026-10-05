@@ -241,6 +241,12 @@ SrcOperand readSrcOperand(
       };
     }
   }
+  case D3D10_SB_OPERAND_TYPE_IMMEDIATE64:
+    DXASSERT_DXBC(O.m_NumComponents == D3D10_SB_OPERAND_4_COMPONENT);
+    return SrcOperandImmediate32{
+      ._ = {swizzle_identity, false, false, read_type},
+      .uvalue = {O.m_Value[0], O.m_Value[1], O.m_Value[2], O.m_Value[3]},
+    };
 
   case D3D10_SB_OPERAND_TYPE_TEMP: {
     DXASSERT_DXBC(O.m_IndexDimension == D3D10_SB_OPERAND_INDEX_1D);
@@ -364,6 +370,12 @@ SrcOperand readSrcOperand(
     return SrcOperandAttribute{
       ._ = readSrcOperandCommon(O, read_type),
       .attribute = shader::common::InputAttribute::CoverageMask,
+    };
+  }
+  case D3D11_SB_OPERAND_TYPE_INNER_COVERAGE: {
+    return SrcOperandAttribute{
+      ._ = readSrcOperandCommon(O, read_type),
+      .attribute = shader::common::InputAttribute::InnerCoverage,
     };
   }
   case D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID: {
@@ -580,6 +592,41 @@ Instruction readInstruction(
   }
   using namespace microsoft;
   switch (Inst.m_OpCode) {
+  case D3D11_SB_OPCODE_DADD:
+  case D3D11_SB_OPCODE_DMAX:
+  case D3D11_SB_OPCODE_DMIN:
+  case D3D11_SB_OPCODE_DMUL:
+  case D3D11_SB_OPCODE_DEQ:
+  case D3D11_SB_OPCODE_DGE:
+  case D3D11_SB_OPCODE_DLT:
+  case D3D11_SB_OPCODE_DNE:
+  case D3D11_SB_OPCODE_DMOV:
+  case D3D11_SB_OPCODE_DMOVC:
+  case D3D11_SB_OPCODE_DTOF:
+  case D3D11_SB_OPCODE_FTOD:
+  case D3D11_1_SB_OPCODE_DDIV:
+  case D3D11_1_SB_OPCODE_DFMA:
+  case D3D11_1_SB_OPCODE_DRCP:
+  case D3D11_1_SB_OPCODE_DTOI:
+  case D3D11_1_SB_OPCODE_DTOU:
+  case D3D11_1_SB_OPCODE_ITOD:
+  case D3D11_1_SB_OPCODE_UTOD: {
+    InstDoubleOp result{
+      ._ = readInstructionCommon(Inst, shader_info),
+      .opcode = static_cast<uint32_t>(Inst.m_OpCode),
+      .source_count = Inst.NumOperands() - 1,
+      .dst = readDstOperand(Inst.m_Operands[0], phase, OperandDataType::Integer),
+      .src = {},
+    };
+    for (unsigned i = 0; i < result.source_count; ++i) {
+      auto type = OperandDataType::Double;
+      if (Inst.m_OpCode == D3D11_SB_OPCODE_FTOD) type = OperandDataType::Float;
+      if (Inst.m_OpCode == D3D11_1_SB_OPCODE_ITOD || Inst.m_OpCode == D3D11_1_SB_OPCODE_UTOD ||
+          (Inst.m_OpCode == D3D11_SB_OPCODE_DMOVC && i == 0)) type = OperandDataType::Integer;
+      result.src[i] = readSrcOperand(Inst.m_Operands[i + 1], phase, type);
+    }
+    return result;
+  }
   case microsoft::D3D10_SB_OPCODE_MOV: {
     return InstMov{
       ._ = readInstructionCommon(Inst, shader_info),

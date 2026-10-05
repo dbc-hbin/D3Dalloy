@@ -17,7 +17,7 @@ public:
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4PipelineLibraryFunction;
     call.args[0] = handle;
-    call.args[1] = uint64_t(reinterpret_cast<uintptr_t>(name));
+    call.args[1] = name ? WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(name)) : 0;
     WMTMetal4Call(&call);
     return WMT::Reference<Function>(call.ret[0]);
   }
@@ -27,8 +27,8 @@ public:
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4PipelineSpecializedFunction;
     call.args[0] = handle;
-    call.args[1] = uint64_t(reinterpret_cast<uintptr_t>(name));
-    call.args[2] = uint64_t(reinterpret_cast<uintptr_t>(constants));
+    call.args[1] = name ? WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(name)) : 0;
+    call.args[2] = constants ? WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(constants)) : 0;
     call.args[3] = count;
     WMTMetal4Call(&call);
     error.handle = call.ret[1];
@@ -62,7 +62,7 @@ public:
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4PipelineCompute;
     call.args[0] = handle;
-    call.args[1] = uint64_t(reinterpret_cast<uintptr_t>(&info));
+    call.args[1] = WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(&info));
     WMTMetal4Call(&call);
     error.handle = call.ret[1];
     return WMT::Reference<WMT::ComputePipelineState>(call.ret[0]);
@@ -80,7 +80,7 @@ public:
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4PipelineRender;
     call.args[0] = handle;
-    call.args[1] = uint64_t(reinterpret_cast<uintptr_t>(&info));
+    call.args[1] = WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(&info));
     WMTMetal4Call(&call);
     error.handle = call.ret[1];
     return WMT::Reference<WMT::RenderPipelineState>(call.ret[0]);
@@ -91,7 +91,7 @@ public:
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4PipelineMesh;
     call.args[0] = handle;
-    call.args[1] = uint64_t(reinterpret_cast<uintptr_t>(&info));
+    call.args[1] = WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(&info));
     WMTMetal4Call(&call);
     error.handle = call.ret[1];
     return WMT::Reference<WMT::RenderPipelineState>(call.ret[0]);
@@ -102,8 +102,8 @@ public:
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4PipelineLinkedCompute;
     call.args[0] = handle;
-    call.args[1] = uint64_t(reinterpret_cast<uintptr_t>(&info));
-    call.args[2] = uint64_t(reinterpret_cast<uintptr_t>(functions));
+    call.args[1] = WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(&info));
+    call.args[2] = functions ? WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(functions)) : 0;
     call.args[3] = count;
     WMTMetal4Call(&call);
     error.handle = call.ret[1];

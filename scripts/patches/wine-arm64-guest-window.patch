@@ -1,0 +1,177 @@
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index c1edb8f..6beb369 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -204,6 +204,7 @@ static void *host_addr_space_limit;  /* top of the host virtual address space */
+ static struct file_view *arm64ec_view;
+ 
+ ULONG_PTR user_space_wow_limit = 0;
++ULONG_PTR wow64_guest_base;
+ #if defined(__APPLE__) && defined(__aarch64__)
+ /* On Apple Silicon the kernel reserves the low 4GB (including the Windows
+  * KUSER_SHARED_DATA address 0x7ffe0000) for the executable page zero, and
+@@ -1999,7 +2000,9 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
+ 
+     /* Keep the Windows execute permission for FEX, but do not ask Darwin to
+      * execute x86 bytes. A 4KB guest IAT may share a 16KB host page with code. */
+-    if (view && (view->protect & VPROT_EMULATED_IMAGE)) unix_clear = VPROT_EXEC;
++    if ((view && (view->protect & VPROT_EMULATED_IMAGE)) ||
++        (wow64_guest_base && (ULONG_PTR)base >= wow64_guest_base &&
++         (ULONG_PTR)base - wow64_guest_base < limit_4g)) unix_clear = VPROT_EXEC;
+ #endif
+ 
+     size = ROUND_SIZE( base, size, host_page_mask );
+@@ -2421,6 +2424,17 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
+ #if defined(__APPLE__) && defined(__aarch64__)
+     if (vprot & VPROT_NATIVE_JIT)
+         return map_native_jit_view( view_ret, base, size, vprot, limit_low, limit_high, align_mask );
++    if (wow64_guest_base)
++    {
++        if ((limit_high && limit_high < limit_4g) || (base && (ULONG_PTR)base < limit_4g))
++        {
++            if (base && (ULONG_PTR)base < limit_4g) base = (void *)(wow64_guest_base + (ULONG_PTR)base);
++            if (limit_low < limit_4g) limit_low = wow64_guest_base + max( limit_low, 0x10000 );
++            if (limit_high < limit_4g) limit_high = wow64_guest_base + (limit_high ? limit_high : limit_4g - 1);
++        }
++        else if (!base && !limit_high)
++            limit_low = max( limit_low, wow64_guest_base + limit_4g + host_page_size );
++    }
+ #endif
+     if (!align_mask) align_mask = granularity_mask;
+     assert( align_mask >= host_page_mask );
+@@ -3583,6 +3597,21 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
+     BOOL top_down = (image_info->image_charact & IMAGE_FILE_DLL) &&
+                     (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated);
+ 
++    if (wow64_guest_base && image_info->machine == IMAGE_FILE_MACHINE_I386)
++    {
++        ULONG_PTR preferred = image_info->map_addr ? image_info->map_addr : image_info->base;
++        limit_low = wow64_guest_base + max( limit_low, 0x10000 );
++        limit_high = wow64_guest_base + min( limit_high ? limit_high : limit_4g - 1, limit_4g - 1 );
++        if (preferred && preferred < limit_4g)
++        {
++            status = map_view( view_ret, (void *)(wow64_guest_base + preferred), size, alloc_type,
++                               vprot, limit_low, limit_high, 0 );
++            if (!status) return status;
++        }
++        return map_view( view_ret, NULL, size, top_down ? MEM_TOP_DOWN : 0, vprot, limit_low, limit_high, 0 );
++    }
++    if (wow64_guest_base) limit_low = max( limit_low, wow64_guest_base + limit_4g + host_page_size );
++
+     limit_low = max( limit_low, (ULONG_PTR)address_space_start );  /* make sure the DOS area remains free */
+     if (!limit_high) limit_high = (ULONG_PTR)user_space_limit;
+ 
+@@ -3962,6 +3991,21 @@ void virtual_init(void)
+     size = (char *)address_space_start - (char *)0x10000;
+     if (size && mmap_is_in_reserved_area( (void*)0x10000, size ) == 1)
+         anon_mmap_fixed( (void *)0x10000, size, PROT_READ | PROT_WRITE, 0 );
++
++#if defined(__APPLE__) && defined(__aarch64__)
++    {
++        SIZE_T window_size = limit_4g + host_page_size;
++        void *window = anon_mmap_alloc( 2 * limit_4g + host_page_size, PROT_NONE );
++        if (window == MAP_FAILED)
++        {
++            ERR( "cannot reserve WoW64 guest window: %s\n", strerror(errno) );
++            exit(1);
++        }
++        window = unmap_extra_space( window, 2 * limit_4g + host_page_size, window_size, limit_4g - 1 );
++        wow64_guest_base = (ULONG_PTR)window;
++        mmap_add_reserved_area( window, window_size );
++    }
++#endif
+ }
+ 
+ 
+@@ -4300,7 +4344,7 @@ TEB *virtual_alloc_first_teb(void)
+     /* reserve space for shared user data */
+ #if defined(__APPLE__) && defined(__aarch64__)
+     /* let the OS pick an address for the shared user data */
+-    user_shared_data = NULL;
++    user_shared_data = wow64_guest_base ? (void *)(wow64_guest_base + 0x7ffe0000) : NULL;
+ #endif
+     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
+                                       MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );
+@@ -4313,7 +4357,7 @@ TEB *virtual_alloc_first_teb(void)
+ #if defined(__APPLE__) && defined(__aarch64__)
+     /* On Apple Silicon the low 2GB is kernel-reserved (page zero), so do not
+      * restrict the TEB block to the 2GB range as done on other 64-bit hosts. */
+-    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, 0, &total,
++    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, wow64_guest_base ? limit_2g - 1 : 0, &total,
+                              MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+ #else
+     NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 ? limit_2g - 1 : 0, &total,
+@@ -4440,7 +4484,7 @@ void virtual_free_thread_data( struct thread_data *data )
+         NtFreeVirtualMemory( GetCurrentProcess(), (void **)&teb->ChpeV2CpuAreaInfo, &size, MEM_RELEASE );
+     }
+ #endif
+-    if ((wow_teb = get_wow_teb( teb )) && (ptr = ULongToPtr( wow_teb->DeallocationStack )))
++    if ((wow_teb = get_wow_teb( teb )) && (ptr = wow64_guest_ptr( wow_teb->DeallocationStack )))
+     {
+         size = 0;
+         NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
+@@ -4636,7 +4680,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
+             if (wow_teb)
+             {
+                 if (wow_teb->TlsExpansionSlots)
+-                    ((ULONG *)ULongToPtr( wow_teb->TlsExpansionSlots ))[index] = 0;
++                    ((ULONG *)wow64_guest_ptr( wow_teb->TlsExpansionSlots ))[index] = 0;
+             }
+             else
+ #endif
+@@ -4822,9 +4866,9 @@ static BOOL is_inside_thread_stack( struct thread_data *data, void *ptr, struct
+     if ((char *)ptr > stack->start && (char *)ptr <= stack->end) return TRUE;
+ 
+     if (!(wow_teb = get_wow_teb( teb ))) return FALSE;
+-    stack->start = ULongToPtr( wow_teb->DeallocationStack );
+-    stack->limit = ULongToPtr( wow_teb->Tib.StackLimit );
+-    stack->end   = ULongToPtr( wow_teb->Tib.StackBase );
++    stack->start = wow64_guest_ptr( wow_teb->DeallocationStack );
++    stack->limit = wow64_guest_ptr( wow_teb->Tib.StackLimit );
++    stack->end   = wow64_guest_ptr( wow_teb->Tib.StackBase );
+     stack->guaranteed = max( wow_teb->GuaranteedStackBytes, min_guaranteed );
+     stack->is_wow = TRUE;
+     return ((char *)ptr > stack->start && (char *)ptr <= stack->end);
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 061452c..460e8a0 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -1092,6 +1092,22 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
+ 
+     switch (class)
+     {
++    case ProcessWineWow64GuestBase:
++    {
++        PROCESS_BASIC_INFORMATION pbi;
++        ULONG_PTR base = wow64_guest_base;
++        len = sizeof(base);
++        if (size != len) return STATUS_INFO_LENGTH_MISMATCH;
++        if (!info) return STATUS_ACCESS_VIOLATION;
++        if (handle != GetCurrentProcess())
++        {
++            ret = NtQueryInformationProcess( handle, ProcessBasicInformation, &pbi, sizeof(pbi), NULL );
++            if (ret) return ret;
++            base = (ULONG_PTR)pbi.PebBaseAddress & ~((ULONG_PTR)0xffffffff);
++        }
++        memcpy( info, &base, len );
++        break;
++    }
+     UNIMPLEMENTED_INFO_CLASS(ProcessBasePriority);
+     UNIMPLEMENTED_INFO_CLASS(ProcessRaisePriority);
+     UNIMPLEMENTED_INFO_CLASS(ProcessExceptionPort);
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index b8f5b0b..363be23 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -74,6 +74,11 @@ static inline TEB64 *get_teb64( TEB *teb ) { return teb ? (TEB64 *)(ULONG_PTR)te
+ 
+ extern WOW_PEB *wow_peb;
+ extern ULONG_PTR user_space_wow_limit;
++extern ULONG_PTR wow64_guest_base;
++static inline void *wow64_guest_ptr( ULONG addr )
++{
++    return addr ? (void *)(wow64_guest_base + addr) : NULL;
++}
+ extern SECTION_IMAGE_INFORMATION main_image_info;
+ 
+ static inline WOW_TEB *get_wow_teb( TEB *teb )

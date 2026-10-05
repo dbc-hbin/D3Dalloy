@@ -96,6 +96,8 @@ inline constexpr uint16_t kOwnedShaderIdentifierVersion = 1;
 
 class MTLD3D12StateObject : public ID3D12StateObject {
 public:
+  bool uses_atomic64 = false;
+  ShaderImmutableConstants immutable_constants;
   /** One application visible export, subobject or hit group. */
   struct Export {
     /** Public D3D12 name of this export, as the application refers to it. */

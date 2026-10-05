@@ -1,8 +1,9 @@
-// Reserved (tiled) resources at D3D12_TILED_RESOURCES_TIER_2 with GPU oracles: tile mappings across
+// Reserved 2D/array/volume resources with independent GPU readback oracles: tile mappings across
 // heaps, NULL/SKIP/REUSE_SINGLE_TILE ranges, CopyTileMappings, CopyTiles, packed mips, mapping
 // updates ordered at ExecuteCommandLists and cross-queue fence boundaries, residency status
 // (CheckAccessFullyMapped) for texture and buffer accesses, min/max sampler reduction, and the
-// creation/validation errors of an implementation that reports Tier 2 only.
+// creation/validation errors, per-slice full-chain array tails, standard-shape 3D addressing,
+// filtering/LOD, UAV atomics and canonical RTV/alias coherence.
 // Shaders: graphics-translator/tests/dxil/tiled.hlsl (frozen DXIL beside the executable).
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -11,6 +12,7 @@
 #include <wrl/client.h>
 
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -186,13 +188,20 @@ ComPtr<ID3D12RootSignature> rootSignature(ID3D12Device *device, const D3D12_ROOT
         "root signature");
   return root;
 }
+#include "owned-d3d12-tiled-volume.inc"
 } // namespace
 
 int
 main(int argc, char **argv) {
-  require(argc == 10, "usage: tiled.exe tiled-write.dxil tiled-buffer-status.dxil tiled-texture-status.dxil "
+  if (argc == 2 && !std::strcmp(argv[1], "--oracle-self-test")) {
+    volumeOracleSelfTest();
+    return 0;
+  }
+  require(argc == 21, "usage: tiled.exe tiled-write.dxil tiled-buffer-status.dxil tiled-texture-status.dxil "
                       "tiled-dxbc-status.dxbc tiled-fxc-cs.dxbc tiled-fxc-vs.dxbc tiled-fxc-ps.dxbc "
-                      "tiled-root-status.dxil tiled-rgb32-status.dxil");
+                      "tiled-root-status.dxil tiled-rgb32-status.dxil tiled-array-status.dxil "
+                      "volume-read.dxil volume-uint.dxil volume-vs.dxil volume-sample.dxil volume-color.dxil "
+                      "volume-read.dxbc volume-uint.dxbc volume-vs.dxbc volume-sample.dxbc volume-color.dxbc");
   const auto backend = reinterpret_cast<const char *(WINAPI *)()>(
       GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "OwnedGraphicsBackendId"));
   require(backend && !std::strcmp(backend(), "owned-graphics-d3d12"), "backend");
@@ -201,6 +210,7 @@ main(int argc, char **argv) {
   const auto dxbcCs = readFile(argv[4]);
   const auto fxcCs = readFile(argv[5]), fxcVs = readFile(argv[6]), fxcPs = readFile(argv[7]);
   const auto rootStatusCs = readFile(argv[8]), rgb32StatusCs = readFile(argv[9]);
+  const auto arrayStatusCs = readFile(argv[10]);
 
   Context c;
   ComPtr<IDXGIFactory4> factory;
@@ -1178,6 +1188,203 @@ main(int argc, char **argv) {
   pass("copy-tiles-round-trip");
   pass("copy-tiles-unmapped-reads-zero");
 
+  /* Full mip-chain arrays: per-slice packed mappings, independent blit and shader readback. */
+  {
+    constexpr UINT arrayMips = 9, arraySlices = 3, rows = arrayMips * arraySlices;
+    auto desc = textureDesc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 256, arraySlices, 0,
+                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+    ComPtr<ID3D12Resource> array;
+    check(device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&array)),
+          "full-chain reserved array");
+    desc = array->GetDesc();
+    expect("array normalized mip count", desc.MipLevels, arrayMips);
+    UINT total = 0, count = rows;
+    D3D12_PACKED_MIP_INFO tail{};
+    D3D12_TILE_SHAPE arrayShape{};
+    D3D12_SUBRESOURCE_TILING subs[rows]{};
+    device->GetResourceTiling(array.Get(), &total, &tail, &arrayShape, &count, 0, subs);
+    expect("array subresource count", count, rows);
+    expect("array standard shape", arrayShape.WidthInTexels, 128);
+    require(tail.NumPackedMips && tail.NumTilesForPackedMips, "array has packed tails");
+    expect("array mip split", tail.NumStandardMips + tail.NumPackedMips, arrayMips);
+    expect("array equal slice tiles", total % arraySlices, 0);
+    const UINT stride = total / arraySlices;
+    expect("array tail ends each slice", tail.StartTileIndexInOverallResource + tail.NumTilesForPackedMips, stride);
+    for (UINT s = 0; s < arraySlices; s++) {
+      UINT next = s * stride;
+      for (UINT mip = 0; mip < arrayMips; mip++) {
+        const auto &sub = subs[s * arrayMips + mip];
+        if (mip < tail.NumStandardMips) {
+          const UINT extent = ((256 >> mip) + 127) / 128;
+          expect("array subresource start", sub.StartTileIndexInOverallResource, next);
+          expect("array subresource width", sub.WidthInTiles, extent);
+          expect("array subresource height", sub.HeightInTiles, extent);
+          next += extent * extent;
+        } else {
+          expect("array packed sentinel", sub.StartTileIndexInOverallResource, D3D12_PACKED_TILE);
+        }
+      }
+      expect("array tail offset", next, s * stride + tail.StartTileIndexInOverallResource);
+    }
+    const auto arrayHeap = makeHeap(total, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES, "array heap");
+    const D3D12_TILED_RESOURCE_COORDINATE origin{};
+    const D3D12_TILE_REGION_SIZE entire{total, FALSE, 0, 0, 0};
+    const UINT zero = 0;
+    queue->UpdateTileMappings(array.Get(), 1, &origin, &entire, arrayHeap.Get(), 1, nullptr, &zero, &total,
+                              D3D12_TILE_MAPPING_FLAG_NONE);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[rows]{};
+    UINT64 bytes = 0;
+    device->GetCopyableFootprints(&desc, 0, rows, 0, footprints, nullptr, nullptr, &bytes);
+    const auto upload = c.buffer(D3D12_HEAP_TYPE_UPLOAD, bytes, "array upload");
+    const auto blitReadback = c.buffer(D3D12_HEAP_TYPE_READBACK, bytes, "array independent readback");
+    const UINT64 mutationOffset = (bytes + 511) & ~UINT64(511);
+    const auto mutation = c.buffer(D3D12_HEAP_TYPE_UPLOAD, mutationOffset + bytes, "array null and alias write upload");
+    BYTE *mutationData = nullptr;
+    check(mutation->Map(0, nullptr, reinterpret_cast<void **>(&mutationData)), "array mutation map");
+    constexpr UINT nullWriteColor = 0x55667788, aliasWriteColor = 0x87654321;
+    for (UINT half = 0; half < 2; half++)
+      for (const auto &fp : footprints)
+        for (UINT y = 0; y < fp.Footprint.Height; y++)
+          for (UINT x = 0; x < fp.Footprint.Width; x++)
+            reinterpret_cast<UINT *>(mutationData + half * mutationOffset + fp.Offset + y * fp.Footprint.RowPitch)[x] =
+                half ? aliasWriteColor : nullWriteColor;
+    mutation->Unmap(0, nullptr);
+    BYTE *data = nullptr;
+    check(upload->Map(0, nullptr, reinterpret_cast<void **>(&data)), "array upload map");
+    for (UINT row = 0; row < rows; row++) {
+      const auto &fp = footprints[row];
+      for (UINT y = 0; y < fp.Footprint.Height; y++)
+        for (UINT x = 0; x < fp.Footprint.Width; x++)
+          reinterpret_cast<UINT *>(data + fp.Offset + y * fp.Footprint.RowPitch)[x] =
+              0xff000000u | ((row + 1) * 0x010101u);
+    }
+    upload->Unmap(0, nullptr);
+    c.reset();
+    for (UINT row = 0; row < rows; row++) {
+      D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+      src.pResource = upload.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src.PlacedFootprint = footprints[row];
+      dst.pResource = array.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst.SubresourceIndex = row;
+      list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    transition(list, array.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 4, 0};
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable = {1, &range};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants = {0, 4, 1};
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[2].Descriptor = {0, 4};
+    D3D12_STATIC_SAMPLER_DESC arraySamplers[2] = {samplers[0], samplers[3]};
+    for (auto &sampler : arraySamplers) sampler.RegisterSpace = 4;
+    const auto root = rootSignature(device, {3, params, 2, arraySamplers, D3D12_ROOT_SIGNATURE_FLAG_NONE});
+    const auto pso = computePipeline(device, root.Get(), arrayStatusCs);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = desc.Format; srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2DArray.MipLevels = arrayMips; srv.Texture2DArray.ArraySize = arraySlices;
+    device->CreateShaderResourceView(array.Get(), &srv, cpuSlot(31));
+    auto observe = [&](UINT phase) {
+      list->SetDescriptorHeaps(1, heaps);
+      list->SetComputeRootSignature(root.Get()); list->SetPipelineState(pso.Get());
+      list->SetComputeRootDescriptorTable(0, gpuSlot(31));
+      list->SetComputeRoot32BitConstants(1, 1, &arrayMips, 0);
+      list->SetComputeRootUnorderedAccessView(2, output->GetGPUVirtualAddress() + phase * rows * 32);
+      list->Dispatch(arrayMips, arraySlices, 1); uavBarrier(list);
+    };
+    observe(0);
+    c.execute("array initial consumers");
+    const D3D12_TILED_RESOURCE_COORDINATE slice1{0, 0, 0, arrayMips + tail.NumStandardMips};
+    const D3D12_TILED_RESOURCE_COORDINATE slice2{0, 0, 0, 2 * arrayMips + tail.NumStandardMips};
+    const D3D12_TILE_REGION_SIZE tailSize{tail.NumTilesForPackedMips, FALSE, 0, 0, 0};
+    const D3D12_TILE_RANGE_FLAGS nullFlag = D3D12_TILE_RANGE_FLAG_NULL;
+    queue->UpdateTileMappings(array.Get(), 1, &slice1, &tailSize, nullptr, 1, &nullFlag, nullptr,
+                              &tail.NumTilesForPackedMips, D3D12_TILE_MAPPING_FLAG_NONE);
+    auto writeTail = [&](UINT64 offset) {
+      transition(list, array.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+      for (UINT mip = tail.NumStandardMips; mip < arrayMips; mip++) {
+        const UINT row = arrayMips + mip;
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+        src.pResource = mutation.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = footprints[row]; src.PlacedFootprint.Offset += offset;
+        dst.pResource = array.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = row;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      }
+      transition(list, array.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    };
+    c.reset(); writeTail(0); observe(1); c.execute("array null tail consumers");
+    check(queue->Signal(c.fence.Get(), ++c.value), "array cross queue producer");
+    check(c.queue2->Wait(c.fence.Get(), c.value), "array cross queue wait");
+    c.queue2->CopyTileMappings(array.Get(), &slice1, array.Get(), &slice2, &tailSize,
+                               D3D12_TILE_MAPPING_FLAG_NONE);
+    check(c.queue2->Signal(c.fence.Get(), ++c.value), "array cross queue mapped");
+    check(queue->Wait(c.fence.Get(), c.value), "array direct queue wait");
+    c.reset(); observe(2); c.execute("array copied mapping consumers");
+    const D3D12_TILED_RESOURCE_COORDINATE slice0{0, 0, 0, tail.NumStandardMips};
+    const UINT oldSlice1Heap = stride + tail.StartTileIndexInOverallResource;
+    queue->UpdateTileMappings(array.Get(), 1, &slice0, &tailSize, arrayHeap.Get(), 1, nullptr, &oldSlice1Heap,
+                              &tail.NumTilesForPackedMips, D3D12_TILE_MAPPING_FLAG_NONE);
+    c.reset(); observe(3); writeTail(mutationOffset); observe(4);
+    transition(list, array.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (UINT row = 0; row < rows; row++) {
+      D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+      src.pResource = array.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = row;
+      dst.pResource = blitReadback.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      dst.PlacedFootprint = footprints[row];
+      list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(outputReadback.Get(), 0, output.Get(), 0, 5 * rows * 32);
+    transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    c.execute("array alias consumers"); c.finish("array all consumers");
+    Words shader(outputReadback), blit(blitReadback);
+    for (UINT phase = 0; phase < 5; phase++)
+      for (UINT row = 0; row < rows; row++) {
+        const UINT slice = row / arrayMips, mip = row % arrayMips;
+        const bool packedSlice1 = slice == 1 && mip >= tail.NumStandardMips;
+        const bool mapped = !(phase == 1 && packedSlice1);
+        UINT source = phase >= 2 && packedSlice1 ? row + arrayMips : row;
+        if (phase >= 3 && slice == 0 && mip >= tail.NumStandardMips)
+          source = row + arrayMips;
+        UINT color = mapped ? 0xff000000u | ((source + 1) * 0x010101u) : 0;
+        if (phase == 4 && slice >= 1 && mip >= tail.NumStandardMips)
+          color = aliasWriteColor;
+        const UINT *result = &shader.data[(phase * rows + row) * 8];
+        for (UINT access = 0; access < 3; access++) {
+          expect("array shader color", result[access * 2], color);
+          expect("array shader residency", result[access * 2 + 1], mapped);
+        }
+        if (phase == 4) {
+          const auto &fp = footprints[row];
+          for (UINT y = 0; y < fp.Footprint.Height; y++)
+            for (UINT x = 0; x < fp.Footprint.Width; x++)
+              expect("array independent blit color", blit[(fp.Offset + y * fp.Footprint.RowPitch) / 4 + x], color);
+        }
+      }
+    pass("array-full-chain-independent-tail-readback");
+    pass("array-null-tail-point-linear-residency");
+    pass("array-tail-alias-crossqueue-order");
+    pass("array-null-tail-writes-discarded-and-remap-retains-data");
+    pass("array-tail-alias-write-visible-through-both-slices");
+    for (UINT slice = 0; slice < arraySlices; slice++) {
+      ComPtr<ID3D12CommandAllocator> allocator;
+      ComPtr<ID3D12GraphicsCommandList> invalid;
+      check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+            "array packed copy allocator");
+      check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                      IID_PPV_ARGS(&invalid)), "array packed copy list");
+      const D3D12_TILED_RESOURCE_COORDINATE packedStart{0, 0, 0, slice * arrayMips + tail.NumStandardMips};
+      const D3D12_TILE_REGION_SIZE one{1, FALSE, 0, 0, 0};
+      invalid->CopyTiles(array.Get(), &packedStart, &one, tileReadback.Get(), 0,
+                         D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+      expect("all array tails reject undefined CopyTiles", UINT(invalid->Close()), UINT(E_INVALIDARG));
+    }
+    pass("array-packed-copy-undefined-for-every-slice");
+  }
+
   /* ---- Phase 7: validation (a list whose Close failed cannot be reset, so each uses a new list) ---- */
   {
     auto invalidCopy = [&](ID3D12Resource *resource, const D3D12_TILED_RESOURCE_COORDINATE &start,
@@ -1207,9 +1414,6 @@ main(int argc, char **argv) {
                                                        IID_PPV_ARGS(&resource))),
              UINT(E_INVALIDARG));
     };
-    rejects(textureDesc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 64, 64, 16, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
-                        D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE),
-            "3D reserved texture (Tier 3 unreported)");
     rejects(textureDesc(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 16384, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                         D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE),
             "1D reserved texture");
@@ -1221,9 +1425,6 @@ main(int argc, char **argv) {
     rejects(textureDesc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 512, 512, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                         D3D12_TEXTURE_LAYOUT_UNKNOWN),
             "reserved texture without 64KB_UNDEFINED_SWIZZLE");
-    rejects(textureDesc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 512, 512, 2, 10, DXGI_FORMAT_R8G8B8A8_UNORM,
-                        D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE),
-            "reserved array with packed mips (Tier 4 unreported)");
     ComPtr<ID3D12Resource> array;
     auto arrayDesc = textureDesc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 512, 512, 2, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
                                  D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
@@ -1237,14 +1438,15 @@ main(int argc, char **argv) {
            UINT(E_INVALIDARG));
   }
   pass("reserved-creation-validation");
+  runVolumeCases(c, argc - 11, argv + 11);
   check(device->GetDeviceRemovedReason(), "device removed at end");
   /* The reported capability is checked last so a functional failure is reported first. */
-  require(options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_2, "TiledResourcesTier 2");
+  require(unsigned(options.TiledResourcesTier) == 4, "TiledResourcesTier 4");
   require(!options5.SRVOnlyTiledResourceTier3, "SRVOnlyTiledResourceTier3 unreported");
   require(va.MaxGPUVirtualAddressBitsPerResource >= 40, "per-resource VA bits");
   require(rgba8.Support2 & D3D12_FORMAT_SUPPORT2_TILED, "RGBA8 FORMAT_SUPPORT2_TILED");
   pass("caps");
   CloseHandle(c.event);
-  std::printf("OWNED_D3D12_TILED_PASS cases=%d tier=2\n", cases);
+  std::printf("OWNED_D3D12_TILED_PASS cases=%d tier=4\n", cases);
   return 0;
 }

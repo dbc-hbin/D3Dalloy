@@ -1,4 +1,4 @@
-// This file is intentionally compiled with --target=x86_64-pc-windows-msvc.
+// This file is intentionally compiled with the host Windows MSVC target ABI.
 // It contains only the NVIDIA parameter vtable ABI and forwards all storage to
 // C callbacks implemented by the normal MinGW frontend translation unit.
 
@@ -79,7 +79,7 @@ private:
   void *storage_;
 };
 
-inline void *operator new(unsigned long long, void *memory) noexcept { return memory; }
+inline void *operator new(__SIZE_TYPE__, void *memory) noexcept { return memory; }
 inline void operator delete(void *, void *) noexcept {}
 
 extern "C" {

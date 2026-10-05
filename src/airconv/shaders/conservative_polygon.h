@@ -1,118 +1,203 @@
 /*
- * D3D12 conservative rasterization: the exact screen polygon of one triangle, shared by the replay vertex helper
- * (src/airconv/shaders/air_conservative.metal) and the coverage gather fragment msaa_gather_conservative_depth
- * (src/dxmt/dxmt_command.metal, compiled with fast math: finiteness is tested on the bit patterns).
- *
- * The primitive is the original triangle clipped in homogeneous space to w >= epsilon, to 0 <= z <= w when depth
- * clipping is enabled and to every SV_ClipDistance >= 0; the clipped vertices are projected through the viewport
- * and snapped to the 16.8 fixed-point grid. A snapped polygon with zero area is culled (Tier 1 permits culling
- * post-snap degenerates). A pixel is conservatively rasterized when its square overlaps this polygon with positive
- * area: no false negatives, and no false positives beyond the fixed-point snapping of the vertices (inside the
- * 1/2 pixel uncertainty region of Tier 1). SV_CullDistance is applied to the whole primitive by the replay.
- *
- * `clip` holds the clip distances of the three original vertices (vertex v, distance k at clip[v * 8 + k]).
+ * Shared conservative raster geometry for captured replay and coverage gathering.
+ * Homogeneous clipping precedes 16.8 snapping. Outer and inner uncertainty are
+ * one fixed-point unit (1/256 pixel), strictly above the 1/512 minimum. All edge
+ * predicates use signed 64-bit fixed-point arithmetic, not rounded float products.
+ * Post-snap lines/points survive; true pre-snap zero-area triangles may be culled.
  */
 #pragma once
 
 #include <metal_stdlib>
 
 namespace dxmt_conservative {
-
 using namespace metal;
 
 constant uint kMaxClip = 8;
-/* Each clip plane (w >= epsilon, z >= 0, z <= w, then the clip distances) adds at most one vertex. */
-constant uint kMaxVertices = 3 + 3 + kMaxClip;
+// W, depth, four viewport guard planes, then user clip planes.
+constant uint kMaxVertices = 3 + 3 + 4 + kMaxClip;
 
 inline bool finite_bits(float value) { return (as_type<uint>(value) & 0x7f800000u) != 0x7f800000u; }
 
 inline float2 screen_of(float4 clip, float4 viewport) {
+  #pragma clang fp contract(off) reassociate(off)
   return float2(viewport.x + (clip.x / clip.w + 1.0f) * viewport.z * 0.5f,
                 viewport.y + (1.0f - clip.y / clip.w) * viewport.w * 0.5f);
 }
 
-/* Returns the vertex count (0 when culled); `det` is the projected orientation (positive: counter-clockwise in
- * NDC), valid for any W signs. */
+inline long polygon_area(thread const float2 *polygon, uint count) {
+  const long2 origin = long2(polygon[0] * 256.0f);
+  long area = 0;
+  for (uint i = 0; i < count; ++i) {
+    const long2 a = long2(polygon[i] * 256.0f) - origin;
+    const long2 b = long2(polygon[(i + 1) % count] * 256.0f) - origin;
+    area += a.x * b.y - a.y * b.x;
+  }
+  return area;
+}
+
+inline bool snapped_triangle_degenerate(float4 p0, float4 p1, float4 p2, float4 viewport) {
+  if (p0.w == 0.0f || p1.w == 0.0f || p2.w == 0.0f) return false;
+  const float2 a = rint(screen_of(p0, viewport) * 256.0f);
+  const float2 b = rint(screen_of(p1, viewport) * 256.0f);
+  const float2 c = rint(screen_of(p2, viewport) * 256.0f);
+  // Exact determinant for bounded projected vertices. Viewport clipping below
+  // handles far/horizon vertices without unbounded float-to-int conversion.
+  if (all(abs(a) <= 0x1p28f) && all(abs(b) <= 0x1p28f) && all(abs(c) <= 0x1p28f)) {
+    const long2 u = long2(b) - long2(a), v = long2(c) - long2(a);
+    return u.x * v.y - u.y * v.x == 0;
+  }
+  const float2 u = b - a, v = c - a;
+  return finite_bits(u.x) && finite_bits(u.y) && finite_bits(v.x) && finite_bits(v.y) &&
+         u.x * v.y - u.y * v.x == 0.0f;
+}
+
+/* det is the original homogeneous orientation. The viewport guard is two pixels
+ * outside the viewport, so it cannot change covered pixels or their inner status.
+ * It bounds the projected fixed-point coordinates (including perspective horizons)
+ * to the D3D viewport domain, keeping every integer product well below int64 limits.
+ */
 inline uint clipped_polygon(float4 p0, float4 p1, float4 p2, float4 viewport, thread const float *clip,
                             uint clip_count, bool depth_clip, thread float2 *out, thread float &det) {
-  det = determinant(float3x3(float3(p0.x, p0.y, p0.w), float3(p1.x, p1.y, p1.w), float3(p2.x, p2.y, p2.w)));
+  #pragma clang fp contract(off) reassociate(off)
+  const float3 origin(p0.x, p0.y, p0.w);
+  const float3 normal = cross(float3(p1.x, p1.y, p1.w) - origin, float3(p2.x, p2.y, p2.w) - origin);
+  det = dot(normal, origin);
+  if (!finite_bits(det)) {
+    // A finite far triangle can overflow an unscaled homogeneous determinant.
+    // Positive per-axis scaling preserves its zero/sign without rejecting it.
+    const float3 scale = max(max(abs(float3(p0.x, p0.y, p0.w)), abs(float3(p1.x, p1.y, p1.w))),
+                             max(abs(float3(p2.x, p2.y, p2.w)), float3(1.0f)));
+    const float3 a = origin / scale, b = float3(p1.x, p1.y, p1.w) / scale,
+                 c = float3(p2.x, p2.y, p2.w) / scale;
+    det = dot(cross(b - a, c - a), a);
+  }
   const float max_w = max(max(p0.w, p1.w), p2.w);
   if (!(det != 0.0f) || !finite_bits(det) || !(max_w > 0.0f) || !finite_bits(max_w) ||
       !(viewport.z > 0.0f) || !(viewport.w > 0.0f))
     return 0;
   clip_count = min(clip_count, kMaxClip);
-  // Barycentric weights carry the clip distances through homogeneous clipping.
   float3 polygon[kMaxVertices] = {float3(1, 0, 0), float3(0, 1, 0), float3(0, 0, 1)};
   float3 next[kMaxVertices];
   uint count = 3;
   const float epsilon = max_w * 0x1p-20f;
-  const float3 x = float3(p0.x, p1.x, p2.x), y = float3(p0.y, p1.y, p2.y);
-  const float3 z = float3(p0.z, p1.z, p2.z), w = float3(p0.w, p1.w, p2.w);
-  const uint fixed_planes = depth_clip ? 3u : 1u;
-  for (uint plane = 0; plane < fixed_planes + clip_count && count; plane++) {
-    // Per-vertex signed distance of the plane: w - epsilon, z, w - z, then each clip distance.
+  const float3 x(p0.x, p1.x, p2.x), y(p0.y, p1.y, p2.y);
+  const float3 z(p0.z, p1.z, p2.z), w(p0.w, p1.w, p2.w);
+  const uint fixed_planes = depth_clip ? 7u : 5u;
+  for (uint plane = 0; plane < fixed_planes + clip_count && count; ++plane) {
     float3 distance;
     if (plane == 0)
       distance = w - epsilon;
-    else if (plane == 1 && depth_clip)
+    else if (plane <= 4) {
+      // NDC guard is viewport +/- two pixels. Clip before projection/snapping.
+      if (plane == 1) distance = x + (1.0f + 4.0f / viewport.z) * w;
+      if (plane == 2) distance = (1.0f + 4.0f / viewport.z) * w - x;
+      if (plane == 3) distance = y + (1.0f + 4.0f / viewport.w) * w;
+      if (plane == 4) distance = (1.0f + 4.0f / viewport.w) * w - y;
+    } else if (plane == 5 && depth_clip)
       distance = z;
-    else if (plane == 2 && depth_clip)
+    else if (plane == 6 && depth_clip)
       distance = w - z;
     else {
       const uint k = plane - fixed_planes;
       distance = float3(clip[k], clip[kMaxClip + k], clip[2 * kMaxClip + k]);
     }
+    const float distance_scale = max(max(abs(distance.x), abs(distance.y)), abs(distance.z));
+    if (distance_scale > 1.0f) distance /= distance_scale;
     uint kept = 0;
-    for (uint i = 0; i < count; i++) {
+    for (uint i = 0; i < count; ++i) {
       const float3 a = polygon[i], b = polygon[(i + 1) % count];
       const float da = dot(distance, a), db = dot(distance, b);
       if (da >= 0.0f && kept < kMaxVertices) next[kept++] = a;
       if ((da >= 0.0f) != (db >= 0.0f) && kept < kMaxVertices) next[kept++] = mix(a, b, da / (da - db));
     }
     count = kept;
-    for (uint i = 0; i < count; i++) polygon[i] = next[i];
+    for (uint i = 0; i < count; ++i) polygon[i] = next[i];
   }
-  if (count < 3)
-    return 0;
-  for (uint i = 0; i < count; i++) {
+  if (!count) return 0;
+  for (uint i = 0; i < count; ++i) {
     const float3 b = polygon[i];
-    const float4 position = float4(dot(x, b), dot(y, b), dot(z, b), max(dot(w, b), epsilon));
+    const float4 position(dot(x, b), dot(y, b), dot(z, b), max(dot(w, b), epsilon));
     out[i] = rint(screen_of(position, viewport) * 256.0f) / 256.0f;
-    if (!finite_bits(out[i].x) || !finite_bits(out[i].y))
-      return 0;
+    if (!finite_bits(out[i].x) || !finite_bits(out[i].y)) return 0;
   }
-  float twice_area = 0.0f;
-  for (uint i = 0; i < count; i++) {
-    const float2 a = out[i] - out[0], b = out[(i + 1) % count] - out[0];
-    twice_area += a.x * b.y - a.y * b.x;
+  // Rounding a clipped convex polygon can turn nearly collinear vertices inward.
+  // SAT needs the convex hull of its snapped vertices, not those spurious edges.
+  if (count > 3) {
+    bool positive = false, negative = false;
+    for (uint i = 0; i < count; ++i) {
+      const long2 a = long2(out[i] * 256.0f), b = long2(out[(i + 1) % count] * 256.0f),
+                  c = long2(out[(i + 2) % count] * 256.0f);
+      const long cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+      positive |= cross > 0; negative |= cross < 0;
+    }
+    if (positive && negative) {
+      float2 hull[kMaxVertices];
+      uint first = 0;
+      for (uint i = 1; i < count; ++i)
+        if (out[i].x < out[first].x || (out[i].x == out[first].x && out[i].y < out[first].y)) first = i;
+      uint current = first, kept = 0;
+      do {
+        hull[kept++] = out[current];
+        uint next = (current + 1) % count;
+        const long2 a = long2(out[current] * 256.0f);
+        for (uint i = 0; i < count; ++i) {
+          const long2 u = long2(out[next] * 256.0f) - a, v = long2(out[i] * 256.0f) - a;
+          const long cross = u.x * v.y - u.y * v.x;
+          if (cross < 0 || (cross == 0 && v.x * v.x + v.y * v.y > u.x * u.x + u.y * u.y)) next = i;
+        }
+        current = next;
+      } while (current != first && kept < count);
+      count = kept;
+      for (uint i = 0; i < count; ++i) out[i] = hull[i];
+    }
   }
-  return twice_area != 0.0f ? count : 0;
+  return count;
 }
 
-/* Separating-axis test of the convex polygon against the pixel square [pixel, pixel + 1]: true when they overlap
- * with positive area. Coordinates are taken relative to the pixel so large targets keep their precision; snapped
- * coordinates are multiples of 1/256, so every product below is exact for targets up to 2^14 pixels. */
+/* SAT against a pixel square, with a one-unit Minkowski dilation. For a snapped
+ * degenerate, its collinear edges constrain both sides of the line; the axis bounds
+ * constrain its endpoints (and a point). Contact belongs to the uncertainty region.
+ */
 inline bool square_overlaps(thread const float2 *polygon, uint count, float2 pixel) {
-  float2 low = float2(INFINITY), high = float2(-INFINITY);
-  float twice_area = 0.0f;
-  for (uint i = 0; i < count; i++) {
-    const float2 a = polygon[i] - pixel, b = polygon[(i + 1) % count] - pixel;
+  const long2 origin = long2(pixel * 256.0f);
+  long2 low = long2(0x7fffffffffffffffL), high = long2(-0x7fffffffffffffffL);
+  const long area = polygon_area(polygon, count);
+  const long orientation = area >= 0 ? 1 : -1;
+  for (uint i = 0; i < count; ++i) {
+    const long2 a = long2(polygon[i] * 256.0f) - origin;
     low = min(low, a);
     high = max(high, a);
-    twice_area += a.x * b.y - a.y * b.x;
   }
-  if (!(high.x > 0.0f && low.x < 1.0f && high.y > 0.0f && low.y < 1.0f))
-    return false;
-  const float orientation = twice_area > 0.0f ? 1.0f : -1.0f;
-  for (uint i = 0; i < count; i++) {
-    const float2 a = polygon[i] - pixel, b = polygon[(i + 1) % count] - pixel;
-    // Outward normal of edge a -> b; the square is separated when its nearest corner is not inside.
-    const float2 normal = float2(b.y - a.y, a.x - b.x) * orientation;
-    if (normal.x == 0.0f && normal.y == 0.0f)
-      continue;
-    const float nearest = min(0.0f, normal.x) + min(0.0f, normal.y);
-    if (nearest >= dot(normal, a))
-      return false;
+  if (high.x < -1 || low.x > 257 || high.y < -1 || low.y > 257) return false;
+  for (uint i = 0; i < count; ++i) {
+    const long2 a = long2(polygon[i] * 256.0f) - origin;
+    const long2 b = long2(polygon[(i + 1) % count] * 256.0f) - origin;
+    const long2 normal = long2(b.y - a.y, a.x - b.x) * orientation;
+    const long nearest = min(0L, normal.x * 256) + min(0L, normal.y * 256);
+    const long uncertainty = long(abs(normal.x)) + long(abs(normal.y));
+    if (nearest > normal.x * a.x + normal.y * a.y + uncertainty) return false;
+  }
+  return true;
+}
+
+/* All four pixel corners must lie inside every edge eroded by one fixed-point
+ * unit. The erosion accounts for any nearest-grid vertex snapping (<=1/512 per
+ * axis) and finer grids, never declares a degenerate fully covered, and is positive
+ * even for vertices that happened not to move during snapping.
+ */
+inline bool square_inside(thread const float2 *polygon, uint count, float2 pixel) {
+  const long area = polygon_area(polygon, count);
+  if (!area) return false;
+  const long orientation = area > 0 ? 1 : -1;
+  const long2 origin = long2(pixel * 256.0f);
+  for (uint i = 0; i < count; ++i) {
+    const long2 a = long2(polygon[i] * 256.0f) - origin;
+    const long2 b = long2(polygon[(i + 1) % count] * 256.0f) - origin;
+    const long2 normal = long2(b.y - a.y, a.x - b.x) * orientation;
+    if (normal.x == 0 && normal.y == 0) continue;
+    const long farthest = max(0L, normal.x * 256) + max(0L, normal.y * 256);
+    const long uncertainty = long(abs(normal.x)) + long(abs(normal.y));
+    if (farthest >= normal.x * a.x + normal.y * a.y - uncertainty) return false;
   }
   return true;
 }

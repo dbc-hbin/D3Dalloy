@@ -1,4 +1,5 @@
 #include "msaa_coarse.hpp"
+#include "msaa_pixel.hpp"
 
 #include "air_signature.hpp"
 #include "llvm/IR/InstIterator.h"
@@ -13,7 +14,7 @@ namespace {
 constexpr unsigned kDevice = unsigned(air::AddressSpace::device);
 
 Value *controlWord(IRBuilder<> &b, Value *control, unsigned index) {
-  return b.CreateLoad(b.getInt32Ty(), b.CreateConstGEP1_32(b.getInt32Ty(), control, index));
+  return capturedLoad(b, b.getInt32Ty(), b.CreateConstGEP1_32(b.getInt32Ty(), control, index));
 }
 
 Value *word(IRBuilder<> &b, Value *scratch, Value *record, unsigned stride, unsigned offset) {
@@ -41,9 +42,9 @@ Value *floorXY(IRBuilder<> &b, Value *position, unsigned axis) {
 /* value(t) = origin + dx * t.x + dy * t.y for a scalar or float4 plane. */
 Value *evaluatePlane(IRBuilder<> &b, Value *scratch, unsigned stride, unsigned offset, Type *type, Value *t) {
   auto *base = planeWord(b, scratch, stride, offset, type);
-  Value *value = b.CreateAlignedLoad(type, base, Align(4));
+  Value *value = capturedLoad(b, type, base, Align(4));
   for (unsigned axis = 0; axis < 2; ++axis) {
-    auto *slope = b.CreateAlignedLoad(type, b.CreateGEP(type, base, b.getInt32(axis + 1)), Align(4));
+    auto *slope = capturedLoad(b, type, b.CreateGEP(type, base, b.getInt32(axis + 1)), Align(4));
     Value *distance = b.CreateExtractElement(t, b.getInt32(axis));
     if (type->isVectorTy()) distance = b.CreateVectorSplat(4, distance);
     value = b.CreateFAdd(value, b.CreateFMul(slope, distance));
@@ -52,17 +53,18 @@ Value *evaluatePlane(IRBuilder<> &b, Value *scratch, unsigned stride, unsigned o
 }
 
 /* Standard D3D sample offsets from the pixel center in 1/16 pixel, for the coarse sample counts. */
-Value *sampleDelta(IRBuilder<> &b, Value *sample, unsigned sampleCount, bool centerPattern) {
+Value *sampleDelta(IRBuilder<> &b, Value *control, Value *sample, unsigned sampleCount, bool centerPattern) {
   static constexpr int8_t x2[] = {4, -4}, y2[] = {4, -4};
   static constexpr int8_t x4[] = {-2, 6, -6, 2}, y4[] = {-6, -2, 2, 6};
   Value *delta = Constant::getNullValue(FixedVectorType::get(b.getFloatTy(), 2));
-  if (sampleCount == 1 || centerPattern) return delta;
   const int8_t *sx = sampleCount == 2 ? x2 : x4, *sy = sampleCount == 2 ? y2 : y4;
   for (unsigned axis = 0; axis < 2; ++axis) {
     Value *component = ConstantFP::get(b.getFloatTy(), 0);
     for (unsigned i = 0; i < sampleCount; ++i)
       component = b.CreateSelect(b.CreateICmpEQ(sample, b.getInt32(i)),
-        ConstantFP::get(b.getFloatTy(), double(axis ? sy[i] : sx[i]) / 16.0), component);
+        ConstantFP::get(b.getFloatTy(), sampleCount == 1 || centerPattern ? 0.0 :
+          double(axis ? sy[i] : sx[i]) / 16.0), component);
+    component = programmableSampleOffset(b, control, sample, sampleCount, axis, component);
     delta = b.CreateInsertElement(delta, component, b.getInt32(axis));
   }
   return delta;
@@ -232,7 +234,7 @@ void capture(IRBuilder<> &b, Module &module, Function &entry, Value *scratch, un
   auto qPlane = plane(q);
   storePlane(b, scratch, stride, planes.q, qPlane[0], qPlane[1], qPlane[2], zero);
   // The gather pass's center depth (window z at this pixel's center, with depth bias) moved to the tile origin.
-  auto *gathered = b.CreateLoad(floatTy, b.CreateBitCast(word(b, scratch, pixel, stride, centerZ),
+  auto *gathered = capturedLoad(b, floatTy, b.CreateBitCast(word(b, scratch, pixel, stride, centerZ),
                                                          PointerType::get(floatTy, kDevice)));
   auto *centerT = b.CreateFSub(b.CreateFAdd(corner, ConstantVector::getSplat(ElementCount::getFixed(2),
                                                                             ConstantFP::get(floatTy, 0.5))),
@@ -286,7 +288,7 @@ Coverage coverage(IRBuilder<> &b, const Grid &grid, Value *control, Value *scrat
       auto *x = b.CreateAdd(grid.fineX, b.getInt32(i));
       auto *y = b.CreateAdd(grid.fineY, b.getInt32(j));
       auto *record = b.CreateSelect(exists, b.CreateAdd(b.CreateMul(y, b.getInt32(8)), x), b.getInt32(0));
-      auto *primitive = b.CreateAnd(b.CreateLoad(b.getInt32Ty(), word(b, scratch, record, stride, 1)),
+      auto *primitive = b.CreateAnd(capturedLoad(b, b.getInt32Ty(), word(b, scratch, record, stride, 1)),
                                     b.getInt32(sampleBits));
       auto *covered = b.CreateAnd(exists, b.CreateICmpNE(primitive, b.getInt32(0)));
       // An uncovered fine pixel may lie outside the render target: read the tile origin instead and drop it.
@@ -309,7 +311,7 @@ Coverage coverage(IRBuilder<> &b, const Grid &grid, Value *control, Value *scrat
 }
 
 Value *load(IRBuilder<> &b, Value *scratch, unsigned stride, unsigned offset, Type *type) {
-  return b.CreateAlignedLoad(type, planeWord(b, scratch, stride, offset, type), Align(4));
+  return capturedLoad(b, type, planeWord(b, scratch, stride, offset, type), Align(4));
 }
 
 Value *position(IRBuilder<> &b, Value *scratch, unsigned stride, const Planes &planes, Value *control,
@@ -376,7 +378,7 @@ Error rewritePulls(Function &body, unsigned extra, const Planes &planes, unsigne
       for (unsigned axis = 0; axis < 2; ++axis)
         point = b.CreateInsertElement(point, b.CreateFAdd(b.CreateUIToFP(b.CreateAdd(controlWord(b, control, axis),
           offsets[axis]), b.getFloatTy()), ConstantFP::get(b.getFloatTy(), 0.5)), b.getInt32(axis));
-      return b.CreateFAdd(point, sampleDelta(b, sample, sampleCount, centerPattern));
+      return b.CreateFAdd(point, sampleDelta(b, control, sample, sampleCount, centerPattern));
     };
     Value *point = center;
     if (name.startswith("air.interpolate_sample_")) {

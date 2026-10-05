@@ -48,6 +48,7 @@ enum class InputAttribute {
   /* Fragment */
   PrimitiveId,
   CoverageMask,
+  InnerCoverage,
 
   /* Hull */
   OutputControlPointId,

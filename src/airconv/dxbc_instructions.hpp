@@ -102,6 +102,7 @@ enum class OperandDataType {
   Float,
   Integer,
   Half16X16,
+  Double,
 };
 
 #pragma region source operand
@@ -556,6 +557,14 @@ struct InstFloatBinaryOp {
   SrcOperand src1;
 };
 
+struct InstDoubleOp {
+  InstructionCommon _;
+  uint32_t opcode;
+  uint32_t source_count;
+  DstOperand dst;
+  std::array<SrcOperand, 3> src;
+};
+
 enum class FloatUnaryOp {
   Log2,
   Exp2,
@@ -781,7 +790,7 @@ using InstructionList = PackedVariantList<
   InstDotProduct, InstSinCos,                                            //
   InstConvert,                                                           //
   InstIntegerCompare, InstFloatCompare,                                  //
-  InstFloatBinaryOp, InstIntegerBinaryOp, InstIntegerBinaryOpWithTwoDst, //
+  InstFloatBinaryOp, InstDoubleOp, InstIntegerBinaryOp, InstIntegerBinaryOpWithTwoDst, //
   InstFloatUnaryOp, InstIntegerUnaryOp,                                  //
   InstFloatMAD, InstIntegerMAD, InstMaskedSumOfAbsDiff,                  //
   InstExtractBits, InstBitFiledInsert,                                   //

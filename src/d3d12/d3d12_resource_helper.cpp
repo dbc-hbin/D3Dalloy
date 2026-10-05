@@ -18,10 +18,82 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_resource_contract.hpp"
+#include "d3d12_enhanced_barrier.hpp"
 #include "util_bit.hpp"
 #include <bit>
 
 namespace dxmt {
+
+HRESULT
+ValidateCastableFormats(MTLD3D12Device *device,const D3D12_RESOURCE_DESC &desc,UINT32 count,
+                       const DXGI_FORMAT *formats) {
+  if (!count) return S_OK;
+  if (!formats) return E_INVALIDARG;
+  if (desc.Dimension==D3D12_RESOURCE_DIMENSION_BUFFER) {
+    for (UINT32 i=0;i<count;++i) if (formats[i]!=DXGI_FORMAT_UNKNOWN) return E_INVALIDARG;
+    return S_OK;
+  }
+  MTL_DXGI_FORMAT_DESC base{};
+  if (FAILED(MTLQueryDXGIFormat(device->GetMTLDevice(),desc.Format,base))) return E_INVALIDARG;
+  const bool exact_only=base.PlanarCount!=1 ||
+      resource_contract::GetEmulatedTextureStorage(desc.Format)!=resource_contract::EmulatedTextureStorage::None;
+  for (UINT32 i=0;i<count;++i) {
+    const auto format=formats[i]; MTL_DXGI_FORMAT_DESC cast{};
+    if (format==DXGI_FORMAT_UNKNOWN || FAILED(MTLQueryDXGIFormat(device->GetMTLDevice(),format,cast)))
+      return E_INVALIDARG;
+    if (resource_contract::AreCopyCompatibleFormats(desc.Format,format)) continue;
+    if (exact_only || (cast.Flag&MTL_DXGI_FORMAT_BC) || cast.PlanarCount!=1 ||
+        resource_contract::GetEmulatedTextureStorage(format)!=resource_contract::EmulatedTextureStorage::None ||
+        cast.BytesPerTexel!=((base.Flag&MTL_DXGI_FORMAT_BC) ? base.BlockSize : base.BytesPerTexel))
+      return E_INVALIDARG;
+  }
+  return S_OK;
+}
+
+HRESULT
+MTLD3D12Resource::PublishOwnedFormatCasting() {
+  if (!share) return S_OK;
+  auto &header=share->header();
+  header.format_list_explicit=owned_initial_layout.has_value();
+  header.initial_layout=owned_initial_layout.value_or(D3D12_BARRIER_LAYOUT_COMMON);
+  std::fill(std::begin(header.castable_formats),std::end(header.castable_formats),uint64_t(0));
+  for (DXGI_FORMAT format:owned_castable_formats) {
+    const auto index=uint32_t(format);
+    if (index>=sharing::kCastFormatWordCount*64 ||
+        (!index && header.resource_desc.Dimension!=D3D12_RESOURCE_DIMENSION_BUFFER)) return E_INVALIDARG;
+    header.castable_formats[index/64] |= uint64_t(1)<<(index%64);
+  }
+  return S_OK;
+}
+
+HRESULT
+MTLD3D12Resource::ImportOwnedFormatCasting(MTLD3D12Device *device,const D3D12_RESOURCE_DESC &desc) {
+  if (!share || !share->header().format_list_explicit) return S_OK;
+  const auto &header=share->header();
+  if (desc.Dimension==D3D12_RESOURCE_DIMENSION_BUFFER) {
+    if (header.initial_layout!=D3D12_BARRIER_LAYOUT_UNDEFINED) return E_INVALIDARG;
+  } else {
+    if (header.initial_layout!=D3D12_BARRIER_LAYOUT_UNDEFINED &&
+        !enhanced_barrier::LayoutAllowedOnQueue(header.initial_layout,D3D12_COMMAND_LIST_TYPE_DIRECT) &&
+        !enhanced_barrier::LayoutAllowedOnQueue(header.initial_layout,D3D12_COMMAND_LIST_TYPE_COMPUTE))
+      return E_INVALIDARG;
+    if ((desc.Flags&D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) &&
+        header.initial_layout!=D3D12_BARRIER_LAYOUT_COMMON) return E_INVALIDARG;
+    if (FAILED(ValidateResourceStates(enhanced_barrier::LegacyStateFromLayout(header.initial_layout),
+                                   &header.heap_props,&desc))) return E_INVALIDARG;
+  }
+  try {
+    uint32_t count=0; for (uint64_t word:header.castable_formats) count+=std::popcount(word);
+    owned_castable_formats.reserve(count);
+    for (uint32_t index=0;index<sharing::kCastFormatWordCount*64;++index)
+      if (header.castable_formats[index/64] & (uint64_t(1)<<(index%64)))
+        owned_castable_formats.push_back(DXGI_FORMAT(index));
+  } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
+  HRESULT hr=ValidateCastableFormats(device,desc,owned_castable_formats.size(),owned_castable_formats.data());
+  if (FAILED(hr)) return hr;
+  owned_initial_layout=header.initial_layout;
+  return S_OK;
+}
 
 WMTPixelFormat GetD3D12PhysicalPixelFormat(DXGI_FORMAT format) {
   switch (format) {
@@ -134,7 +206,7 @@ IsD3D12TextureSampleSupported(MTLD3D12Device *device, DXGI_FORMAT format, const 
   const auto backing = physical != WMTPixelFormatInvalid ? physical : GetD3D12ResourcePixelFormat(mapped, flags);
   if (count == 1)
     return true;
-  if ((mapped.Flag & MTL_DXGI_FORMAT_BC) || (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+  if (mapped.Flag & MTL_DXGI_FORMAT_BC)
     return false;
   if (IsD3D12MSAAPixelFormatSupported(device, backing))
     return true;
@@ -366,8 +438,6 @@ ExtractEntireResourceViewDescription<D3D12_UNORDERED_ACCESS_VIEW_DESC>(
     break;
   }
   case D3D12_RESOURCE_DIMENSION_TEXTURE2D: {
-    if (ResourceDesc.SampleDesc.Count > 1)
-      return E_FAIL;
     if (ResourceDesc.DepthOrArraySize > 1) {
       pViewDescOut->ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
       pViewDescOut->Texture2DArray.MipSlice = 0;
@@ -635,6 +705,12 @@ ValidateOptimizedClearValue(const D3D12_RESOURCE_DESC *pDesc, const D3D12_CLEAR_
 HRESULT
 ValidateHeapProperties(const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS Flags, bool AdapterIsNUMA) {
   if (!pHeapProps || pHeapProps->CreationNodeMask > 1 || pHeapProps->VisibleNodeMask > 1)
+    return E_INVALIDARG;
+  // The runtime reports ManualWriteTrackingResourceSupported=FALSE. Only tools
+  // may override it and implement TrackWrite (D3D12GPUUploadHeaps spec).
+  // The bundled Wine header predates this public heap flag.
+  constexpr UINT tools_manual_write_tracking = 0x2000;
+  if (UINT(Flags) & tools_manual_write_tracking)
     return E_INVALIDARG;
   switch (pHeapProps->Type) {
   case D3D12_HEAP_TYPE_DEFAULT:

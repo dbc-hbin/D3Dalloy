@@ -11,11 +11,18 @@ if dxmt_crossbuild
   # Keep its vftable in a tiny MSVC-ABI object while the storage/frontend stays
   # in the normal DXMT MinGW translation units.
   msvc_bridge_compiler = find_program('x86_64-w64-mingw32-g++')
+  if cpu_family == 'x86'
+    nvngx_msvc_target = 'i686-pc-windows-msvc'
+  elif cpu_family == 'aarch64'
+    nvngx_msvc_target = windows_abi == 'arm64' ? 'aarch64-pc-windows-msvc' : 'arm64ec-pc-windows-msvc'
+  else
+    nvngx_msvc_target = 'x86_64-pc-windows-msvc'
+  endif
   nvngx_d3d12_msvc_obj = custom_target('nvngx_d3d12_msvc_obj',
     input            : 'nvngx_d3d12_msvc.cpp',
     output           : 'nvngx_d3d12_msvc.obj',
     command          : [
-      msvc_bridge_compiler, '--target=x86_64-pc-windows-msvc', '-std=c++20',
+      msvc_bridge_compiler, '--target=' + nvngx_msvc_target, '-std=c++20',
       '-fno-exceptions', '-fno-rtti', '-Wall', '-Wextra', '-Werror',
       '-c', '@INPUT@', '-o', '@OUTPUT@',
     ],

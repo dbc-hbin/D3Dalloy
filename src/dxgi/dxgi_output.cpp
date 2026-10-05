@@ -1,18 +1,137 @@
 #include <algorithm>
+#include <cmath>
 #include <numeric>
+#include <unordered_map>
 
 #include "com/com_guid.hpp"
 #include "com/com_pointer.hpp"
 #include "dxgi_interfaces.h"
 #include "dxgi_output.hpp"
+#include "dxgi_refresh_timing.hpp"
 #include "dxgi_options.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_presenter.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include "wsi_monitor.hpp"
+#include "thread.hpp"
 
 namespace dxmt {
+
+namespace {
+struct OutputStatistics {
+  const void *owner;
+  WMT::Reference<WMT::PresentationObserver> observer;
+  std::shared_ptr<std::atomic<bool>> fault;
+  WMTPresentationEvent event{};
+  RefreshClockBasis clock{};
+  bool disjoint = true;
+};
+dxmt::mutex output_statistics_mutex;
+std::unordered_map<HMONITOR, OutputStatistics> output_statistics;
+}
+
+__declspec(dllexport) HRESULT RegisterOutputStatistics(HMONITOR monitor, const void *owner, WMT::PresentationObserver observer,
+                                 const std::shared_ptr<std::atomic<bool>> &fault) {
+  std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+  auto existing = output_statistics.find(monitor);
+  if (existing != output_statistics.end() && existing->second.owner != owner)
+    return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+  try {
+    output_statistics.insert_or_assign(monitor, OutputStatistics{owner, WMT::Reference(observer), fault});
+  } catch (const std::bad_alloc &) {
+    return E_OUTOFMEMORY;
+  }
+  return S_OK;
+}
+
+__declspec(dllexport) void UnregisterOutputStatistics(HMONITOR monitor, const void *owner) {
+  std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+  auto entry = output_statistics.find(monitor);
+  if (entry != output_statistics.end() && entry->second.owner == owner)
+    output_statistics.erase(entry);
+}
+
+__declspec(dllexport) void PublishOutputStatistics(HMONITOR monitor, const void *owner, const WMTPresentationEvent &event) {
+  std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+  auto entry = output_statistics.find(monitor);
+  if (entry != output_statistics.end() && entry->second.owner == owner)
+    entry->second.event = event;
+}
+
+__declspec(dllexport) void InvalidateOutputStatistics(HMONITOR monitor, const void *owner) {
+  std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+  auto entry = output_statistics.find(monitor);
+  if (entry != output_statistics.end() && entry->second.owner == owner) {
+    entry->second.event = {};
+    entry->second.clock = {};
+    entry->second.disjoint = true;
+  }
+}
+
+__declspec(dllexport) HRESULT ComputeFrameStatistics(const WMTPresentationEvent &event, const WMTDisplayRefreshSample &sample,
+                               bool windowed, RefreshClockBasis &clock, bool &disjoint, DXGI_FRAME_STATISTICS *stats) {
+  constexpr uint64_t kCVValidTiming = 0x1b;
+  if ((sample.cv_flags & kCVValidTiming) != kCVValidTiming || !sample.host_frequency ||
+      !sample.output_host_ticks || sample.video_time <= 0 || sample.video_refresh_period <= 0 ||
+      sample.video_time_scale <= 0 || !std::isfinite(sample.rate_scalar) || sample.rate_scalar <= 0 ||
+      event.outcome != WMTPresentationPresented || !event.refresh_sequence ||
+      !std::isfinite(event.presented_host_seconds) || event.presented_host_seconds <= 0 ||
+      !event.refresh_output_host_ticks || event.refresh_video_time <= 0 ||
+      event.refresh_generation != sample.refresh_generation || sample.refresh_sequence < event.refresh_sequence)
+    return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+  if (clock.SetEpoch(sample.refresh_generation, sample.display_id, sample.host_frequency, sample.video_time_scale))
+    disjoint = true;
+  double sampled_host_seconds;
+  if (!clock.qpc_frequency) {
+    LARGE_INTEGER before{}, after{}, frequency{};
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 || !QueryPerformanceCounter(&before))
+      return E_FAIL;
+    sampled_host_seconds = WMTClockSampleHostSeconds();
+    if (!QueryPerformanceCounter(&after) || after.QuadPart < before.QuadPart ||
+        !std::isfinite(sampled_host_seconds) || sampled_host_seconds <= 0)
+      return E_FAIL;
+    clock.calibration_host_seconds = sampled_host_seconds;
+    clock.calibration_qpc = before.QuadPart + (after.QuadPart - before.QuadPart) / 2;
+    clock.qpc_frequency = frequency.QuadPart;
+  } else {
+    sampled_host_seconds = WMTClockSampleHostSeconds();
+  }
+  if (!std::isfinite(sampled_host_seconds) || sampled_host_seconds <= 0)
+    return E_FAIL;
+  const double sync_anchor_seconds = static_cast<double>(sample.output_host_ticks) / sample.host_frequency;
+  const double present_anchor_seconds = static_cast<double>(event.refresh_output_host_ticks) / sample.host_frequency;
+  const double period_seconds = static_cast<double>(sample.video_refresh_period) /
+                                sample.video_time_scale / sample.rate_scalar;
+  if (!std::isfinite(period_seconds) || period_seconds <= 0 ||
+      std::abs(sync_anchor_seconds - sampled_host_seconds) > 0.25 ||
+      std::abs(present_anchor_seconds - event.presented_host_seconds) > 0.25 ||
+      event.presented_host_seconds > sampled_host_seconds + 0.05)
+    return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+  const int64_t present_tick_delta = RefreshTickOffset(event.presented_host_seconds, present_anchor_seconds, period_seconds);
+  const int64_t sync_tick_delta = RefreshTickOffset(sampled_host_seconds, sync_anchor_seconds, period_seconds);
+  const double sync_host_seconds = sync_anchor_seconds + sync_tick_delta * period_seconds;
+  const int64_t present_refresh = (windowed ? static_cast<int64_t>(event.refresh_sequence)
+      : event.refresh_video_time / sample.video_refresh_period) + present_tick_delta;
+  const int64_t sync_refresh = (windowed ? static_cast<int64_t>(sample.refresh_sequence)
+      : sample.video_time / sample.video_refresh_period) + sync_tick_delta;
+  if (present_refresh <= 0 || present_refresh > sync_refresh)
+    return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+  if ((sync_tick_delta > 0 && sync_tick_delta >
+       (std::numeric_limits<int64_t>::max() - sample.video_time) / sample.video_refresh_period) ||
+      (sync_tick_delta < 0 && sync_tick_delta < -(sample.video_time / sample.video_refresh_period)))
+    return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+  const int64_t reached_video_time = sample.video_time + sync_tick_delta * sample.video_refresh_period;
+  int64_t sync_qpc;
+  if (!clock.Project(reached_video_time, sync_host_seconds, sync_qpc))
+    return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+  *stats = {};
+  stats->PresentCount = static_cast<UINT>(event.present_id);
+  stats->PresentRefreshCount = static_cast<UINT>(present_refresh);
+  stats->SyncRefreshCount = static_cast<UINT>(sync_refresh);
+  stats->SyncQPCTime.QuadPart = sync_qpc;
+  return S_OK;
+}
 
 /*
  * \see
@@ -150,7 +269,10 @@ public:
     gamma_ramp_.version = 0;
   }
 
-  ~MTLDXGIOutputImpl() {}
+  ~MTLDXGIOutputImpl() {
+    if (vblank_observer_)
+      vblank_observer_.close();
+  }
 
   const DXMTGammaRamp *
   STDMETHODCALLTYPE
@@ -276,7 +398,33 @@ public:
 
   HRESULT
   STDMETHODCALLTYPE
-  WaitForVBlank() final { return S_OK; }
+  WaitForVBlank() final {
+    std::lock_guard<dxmt::mutex> lock(vblank_mutex_);
+    RECT bounds{};
+    if (!wsi::getDesktopCoordinates(monitor_, &bounds))
+      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    WMTMonitorTimingCall timing{};
+    timing.operation = WMTMonitorTimingCreate;
+    timing.left = bounds.left;
+    timing.top = bounds.top;
+    timing.right = bounds.right;
+    timing.bottom = bounds.bottom;
+    timing.primary = monitor_ == wsi::getDefaultMonitor();
+    if (!vblank_observer_) {
+      WMTMonitorTiming_call(&timing);
+      if (!timing.object)
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      vblank_observer_ = WMT::Reference<WMT::PresentationObserver>(timing.object);
+    }
+    timing.object = vblank_observer_.handle;
+    timing.operation = WMTMonitorTimingWait;
+    WMTMonitorTiming_call(&timing);
+    if (!timing.result) {
+      vblank_observer_.close();
+      vblank_observer_ = nullptr;
+    }
+    return timing.result ? S_OK : DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+  }
 
   HRESULT
   STDMETHODCALLTYPE
@@ -354,8 +502,28 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) final {
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    if (!stats)
+      return E_INVALIDARG;
+    std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+    auto entry = output_statistics.find(monitor_);
+    if (entry == output_statistics.end())
+      return DXGI_ERROR_INVALID_CALL; // Output statistics are fullscreen-only.
+    auto &state = entry->second;
+    if (state.fault && state.fault->load(std::memory_order_acquire))
+      return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+    WMTDisplayRefreshSample sample{};
+    if (!state.observer.getRefreshSample(sample))
+      return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+    DXGI_FRAME_STATISTICS measured{};
+    HRESULT hr = ComputeFrameStatistics(state.event, sample, false, state.clock, state.disjoint, &measured);
+    if (FAILED(hr))
+      return hr;
+    if (state.disjoint) {
+      state.disjoint = false;
+      return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
+    }
+    *stats = measured;
+    return S_OK;
   }
 
   HRESULT
@@ -634,6 +802,8 @@ public:
   }
 
 private:
+  dxmt::mutex vblank_mutex_;
+  WMT::Reference<WMT::PresentationObserver> vblank_observer_;
   Com<IMTLDXGIAdapter> adapter_ = nullptr;
   HMONITOR monitor_ = nullptr;
   WMTDisplayDescription native_desc_;

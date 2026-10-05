@@ -86,6 +86,12 @@ struct MTL_SM50_SHADER_ARGUMENT {
   uint32_t SM50BindingSlot;
   enum MTL_SM50_SHADER_ARGUMENT_FLAG Flags;
   uint32_t StructurePtrOffset;
+  /* D3D12 register coordinates, independent of the SM50 declaration/range ID. */
+  uint32_t RegisterSpace;
+  uint32_t RegisterLowerBound;
+  uint32_t RegisterCount;
+  /* Bit of D3D12_SHADER_VISIBILITY; compute/library/node resources use ALL. */
+  uint32_t ShaderVisibilityMask;
 };
 
 enum MTL_TESSELLATOR_OUTPUT_PRIMITIVE {
@@ -156,6 +162,8 @@ struct MTL_SHADER_REFLECTION {
   uint32_t ArgumentTableQwords;
   /* Pixel shader: D3D11 ForceEarlyDepthStencil (DXBC global flag / DXIL shader flag). */
   uint32_t PSForceEarlyDepthStencil;
+  /* Device-memory integer64 atomics; groupshared-only shaders do not require a phase. */
+  uint32_t HasAtomic64;
 };
 
 #if defined(__LP64__) || defined(_WIN64)
@@ -215,11 +223,73 @@ struct SM50_CONSTANT_RELOCATION {
 #define SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE (~(uint64_t)0)
 #define SM50_ATOMIC_LOCK_TABLE_ENTRIES 65536u
 
+/* Device-local, exclusive bounded atomic phase. Addresses are GPU virtual addresses.
+ * Cell maps share canonical root indices across every raw/typed/heap alias. */
+#define SM50_CONSTANT_RELOCATION_TARGET_ATOMIC64_CONTEXT (~(uint64_t)1)
+#define SM50_ATOMIC64_UNMAPPED_CELL 0xffffffffu
+#define SM50_ATOMIC64_NODE_RETIRED 0x80000000u
+#define SM50_ATOMIC64_NODE_RESERVED 0x40000000u
+#define SM50_ATOMIC64_NODE_REFERENCE_MASK 0x3fffffffu
+
+struct SM50_ATOMIC64_CONTEXT {
+  uint64_t rawRanges;
+  uint64_t typedViews;
+  uint64_t roots;
+  uint64_t nodes;
+  uint64_t freeBitmap;
+  uint32_t rawCount;
+  uint32_t typedCount;
+  uint32_t nodeCapacity;
+  uint32_t bitmapWordCount;
+  uint32_t cursor;
+  uint32_t hint;
+  uint32_t reserved0;
+  uint32_t reserved1;
+};
+
+struct SM50_ATOMIC64_RAW_RANGE {
+  uint64_t gpuAddressBegin;
+  uint64_t byteLength;
+  uint64_t cellMapAddr;
+};
+
+struct SM50_ATOMIC64_NODE {
+  uint32_t state;
+  uint32_t low;
+  uint32_t high;
+  uint32_t unused;
+};
+
+struct SM50_ATOMIC64_TYPED_VIEW {
+  uint64_t resourceID;
+  uint64_t subresourcesAddr;
+  uint32_t subresourceCount;
+  uint32_t mipCount;
+  uint32_t arrayCount;
+  uint32_t sampleCount;
+  uint32_t unitBytes;
+  uint32_t pixelFormat;
+  uint32_t firstWSlice;
+  uint32_t wSize;
+  uint32_t flags;
+  uint32_t firstElement;
+  uint64_t reserved1;
+};
+
+struct SM50_ATOMIC64_TYPED_SUBRESOURCE {
+  uint64_t cellMapAddr;
+  uint64_t byteBase;
+  uint32_t width;
+  uint32_t height;
+  uint32_t depth;
+  uint32_t rowPitchBytes;
+};
+
 /*
  * Highest DXIL shader model the compiler accepts (major << 4 | minor, the
  * D3D_SHADER_MODEL encoding). Containers declaring a higher model are rejected.
  */
-#define SM50_MAX_DXIL_SHADER_MODEL 0x68u
+#define SM50_MAX_DXIL_SHADER_MODEL 0x69u
 
 struct SM50_COMPILED_BITCODE {
   sm50_ptr64_t Data;
@@ -313,6 +383,9 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
   SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM = 42,
   /* Native ICB vertex variant: route view locations in shader outputs, not encoder mappings. */
   SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS = 43,
+  /* Header-only D3D12 variant: every linked application stage uses the bounded
+   * canonical-cell phase, including ordinary DXBC accesses. Never a D3D11 variant. */
+  SM50_SHADER_D3D12_ATOMIC64_PHASE = 44,
   SM50_SHADER_ARGUMENT_TYPE_MAX = 0xffffffff,
 };
 
@@ -460,6 +533,9 @@ enum SM50_MSAA_VARIANT {
   SM50_MSAA_SAMPLE_APP = 6,
   SM50_MSAA_OBJECT_CAPTURE = 7,
   SM50_MSAA_OBJECT_REPLAY = 8,
+  /* OR into pixel roles only: execute application fragments on a physical 8x8
+   * surface, retaining logical helper state and captured sample outputs. */
+  SM50_MSAA_ATOMIC_HELPERS = 0x100,
 };
 
 enum SM50_MSAA_LINE_MODE {
@@ -496,6 +572,10 @@ struct SM50_MSAA_TILE_CONTROL {
   /* Coarse shading variants: D3D12_SHADING_RATE of this tile (log2 width << 2 | log2 height); 0 = 1x1. */
   uint32_t shading_rate;
   uint32_t shading_rate_image_width, shading_rate_image_height;
+  /* Tier1 programmable raster pattern, center-relative pixels; zero count restores default/center. */
+  uint32_t programmable_sample_count;
+  float programmable_sample_positions[8][2];
+  uint32_t depth_bounds_enabled;
 };
 
 struct SM50_MSAA_PIXEL_LAYOUT {
@@ -516,6 +596,13 @@ struct SM50_MSAA_PIXEL_LAYOUT {
   uint32_t line_mode;
   uint32_t line_mask_dword;
   uint32_t line_alpha_dword;
+  uint32_t inner_mask_dword; /* Geometric SV_InnerCoverage, independent of SampleMask; ~0u when absent. */
+  uint32_t depth_bounds_mask_dword; /* Live stored-depth probe mask; ~0u on native pipelines. */
+};
+
+struct SM50_MSAA_DEPTH_BOUNDS_PROBE {
+  uint32_t origin_x, origin_y, input_record_dwords, mask_dword;
+  float min_depth, max_depth;
 };
 
 enum SM50_MSAA_PIXEL_FLAG {
@@ -529,6 +616,7 @@ enum SM50_MSAA_PIXEL_FLAG {
   SM50_MSAA_PIXEL_DISTANCE_INPUTS = 1 << 7,
   /* Compiled with SM50_SHADER_D3D12_COARSE_SHADING and eligible: tile.shading_rate is honored. */
   SM50_MSAA_PIXEL_COARSE = 1 << 8,
+  SM50_MSAA_PIXEL_ATOMIC_HELPERS = 1 << 9,
 };
 
 struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA {
@@ -546,6 +634,8 @@ struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA {
   const struct SM50_MSAA_VERTEX_LAYOUT *distance_vertex_layout;
   uint32_t distance_vertex_count;
   const struct SM50_MSAA_VERTEX_LAYOUT *coarse_vertex_layout;
+  bool depth_clip_enable;
+  bool depth_bounds_emulated;
 };
 
 struct SM50_MSAA_CAPTURED_USER {
@@ -578,6 +668,7 @@ struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA {
   uint32_t line_mode;
   const struct SM50_MSAA_INTERPOLATION_LAYOUT *interpolation;
   bool depth_clip_enable;
+  bool front_counter_clockwise;
 };
 
 struct SM50_MSAA_MESH_LAYOUT {
@@ -610,7 +701,25 @@ struct SM50_SHADER_D3D12_MSAA_MESH_DATA {
   const struct SM50_MSAA_INTERPOLATION_LAYOUT *interpolation;
   bool depth_clip_enable;
   struct SM50_MSAA_OBJECT_LAYOUT *object_layout_out;
+  bool front_counter_clockwise;
 };
+
+#ifdef __cplusplus
+/* Keep PE32 options in sync with the explicit native WoW64 argument mirrors. */
+static_assert(sizeof(void *) != 4 || (sizeof(SM50_SHADER_D3D12_MSAA_PIXEL_DATA) == 56 &&
+  offsetof(SM50_SHADER_D3D12_MSAA_PIXEL_DATA, depth_clip_enable) == 52 &&
+  offsetof(SM50_SHADER_D3D12_MSAA_PIXEL_DATA, depth_bounds_emulated) == 53));
+static_assert(sizeof(void *) != 8 || (sizeof(SM50_SHADER_D3D12_MSAA_PIXEL_DATA) == 96 &&
+  offsetof(SM50_SHADER_D3D12_MSAA_PIXEL_DATA, depth_bounds_emulated) == 89));
+static_assert(sizeof(SM50_MSAA_PIXEL_LAYOUT) == 76 &&
+  offsetof(SM50_MSAA_PIXEL_LAYOUT, depth_bounds_mask_dword) == 72);
+static_assert(sizeof(SM50_MSAA_TILE_CONTROL) == 140 &&
+  offsetof(SM50_MSAA_TILE_CONTROL, depth_bounds_enabled) == 136);
+static_assert(sizeof(void *) != 4 || (sizeof(SM50_SHADER_D3D12_MSAA_VERTEX_DATA) == 32 &&
+  offsetof(SM50_SHADER_D3D12_MSAA_VERTEX_DATA, front_counter_clockwise) == 29));
+static_assert(sizeof(void *) != 4 || (sizeof(SM50_SHADER_D3D12_MSAA_MESH_DATA) == 40 &&
+  offsetof(SM50_SHADER_D3D12_MSAA_MESH_DATA, front_counter_clockwise) == 36));
+#endif
 
 struct SM50_MSAA_OBJECT_LAYOUT {
   uint32_t payload_bytes;
@@ -676,6 +785,7 @@ typedef struct SM50_SHADER_GS_TESSELLATION_INPUT_DATA {
 enum SM50_SHADER_METAL_VERSION {
   SM50_SHADER_METAL_310 = 310,
   SM50_SHADER_METAL_320 = 320,
+  SM50_SHADER_METAL_410 = 410,
   SM50_SHADER_METAL_MAX = 0xffffffff,
 };
 

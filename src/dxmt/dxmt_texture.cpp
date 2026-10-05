@@ -17,6 +17,7 @@
  */
 
 #include "dxmt_texture.hpp"
+#include "dxmt_format.hpp"
 #include "dxmt_residency.hpp"
 #include "wsi_platform.hpp"
 #include <atomic>
@@ -48,6 +49,180 @@ TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureV
     allocation(allocation),
     key(descriptor, index, allocation->descriptor->miplevelCount()) {
   auto parent = allocation->texture();
+  if (descriptor.reservedVolumeRender) {
+    auto owner = allocation->descriptor;
+    const auto *layout = owner->reservedVolumeLayoutWords;
+    if (!layout) return;
+    const auto page = owner->device_.sparseTileSize(WMTTextureType2DArray,
+        ORIGINAL_FORMAT(descriptor.format), 1, WMTSparsePageSize64);
+    if (!page.width || !page.height || page.depth != 1) return;
+    uint32_t width = std::max(layout[0] >> descriptor.firstMiplevel, 1u);
+    uint32_t height = std::max(layout[1] >> descriptor.firstMiplevel, 1u);
+    if (descriptor.castBlockSize && !descriptor.castCompressed) {
+      width = (width + 3) / 4; height = (height + 3) / 4;
+    }
+    reservedVolumeRender = std::make_unique<ReservedVolumeRenderView>();
+    castBlockSize = descriptor.castBlockSize;
+    auto &volume = *reservedVolumeRender;
+    if (castBlockSize) {
+      auto binding=owner->reservedVolumeCastBinding(owner->reservedVolumeCastContext,descriptor.firstMiplevel,
+          MTLGetUnsignedIntegerFormat(ORIGINAL_FORMAT(descriptor.format)),false);
+      if (!binding.atlas) return;
+      castStorage=std::move(binding.atlas);
+    }
+    volume.mip = descriptor.firstMiplevel;
+    volume.first_w = descriptor.volumeFirstW;
+    volume.w_size = descriptor.arraySize;
+    volume.page_w = page.width; volume.page_h = page.height;
+    volume.pages_x = (width + page.width - 1) / page.width;
+    volume.pages_y = (height + page.height - 1) / page.height;
+    WMTTextureInfo info{};
+    info.type = WMTTextureType2DArray;
+    info.pixel_format = ORIGINAL_FORMAT(descriptor.format);
+    info.width = volume.pages_x * page.width; info.height = volume.pages_y * page.height;
+    info.depth = 1; info.array_length = descriptor.arraySize;
+    info.mipmap_level_count = info.sample_count = 1;
+    info.usage = WMTTextureUsageRenderTarget | WMTTextureUsagePixelFormatView;
+    info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
+    texture = owner->device_.newPlacementSparseTexture(info, WMTSparsePageSize64);
+    gpuResourceID = info.gpu_resource_id;
+    return;
+  }
+  if (allocation->descriptor->reservedVolumeLayoutAddress && descriptor.castBlockSize) {
+    auto owner = allocation->descriptor;
+    if (!owner->reservedVolumeCastBinding) return;
+    auto binding = owner->reservedVolumeCastBinding(owner->reservedVolumeCastContext,
+        descriptor.volumeCastMip, descriptor.castCompressed ? ORIGINAL_FORMAT(descriptor.format) :
+        MTLGetUnsignedIntegerFormat(ORIGINAL_FORMAT(descriptor.format)), descriptor.castCompressed);
+    if (!binding.atlas) return;
+    reservedVolumeCastLayoutAddress = binding.layout_address;
+    reservedVolumeAtlasCast = true;
+    castBlockSize = descriptor.castBlockSize;
+    castCompressed = descriptor.castCompressed;
+    castStorage = binding.atlas;
+    texture = binding.atlas.newTextureView(descriptor.format, WMTTextureType2DArray, 0, 1, 0,
+        owner->arrayLength(), {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha},
+        gpuResourceID);
+    return;
+  }
+  if (descriptor.msaaShadow) {
+    auto owner = allocation->descriptor;
+    WMTBufferInfo ids{};
+    ids.length = sizeof(uint64_t) * 8;
+    ids.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE;
+    msaaSampleIds = owner->device_.newBuffer(ids);
+    if (!msaaSampleIds || !ids.memory.get_accessible_or_null()) return;
+    auto entries = static_cast<uint64_t *>(ids.memory.get_accessible_or_null());
+    const bool depth_cast = descriptor.castBlockSize && descriptor.castSourceBlockWidth == 1;
+    if (depth_cast) {
+      castBlockSize = descriptor.castBlockSize;
+      castSourceBlockWidth = 1;
+      std::fill_n(entries, 8, uint64_t(0));
+    }
+    for (unsigned sample = 0; sample < owner->sampleCount(); ++sample) {
+      if (depth_cast) {
+        WMTTextureInfo info{};
+        info.pixel_format = ORIGINAL_FORMAT(descriptor.format);
+        info.type = WMTTextureType2DArray;
+        info.width = owner->width(); info.height = owner->height();
+        info.depth = info.sample_count = info.mipmap_level_count = 1;
+        info.array_length = descriptor.arraySize;
+        info.usage = WMTTextureUsageShaderRead | WMTTextureUsagePixelFormatView;
+        info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
+        auto shadow = owner->device_.newTexture(info);
+        if (!shadow) return;
+        msaaViews[sample] = shadow.newTextureView(
+            descriptor.format, WMTTextureType2DArray, 0, 1, 0, descriptor.arraySize,
+            {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha}, entries[sample]);
+      } else {
+        msaaViews[sample] = allocation->msaaShadow[sample].newTextureView(
+            descriptor.format, WMTTextureType2DArray, 0, 1, descriptor.firstArraySlice, descriptor.arraySize,
+            {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha}, entries[sample]);
+      }
+      if (!msaaViews[sample]) return;
+    }
+    if (depth_cast) castStorage = msaaViews[0];
+    msaaSampleAddress = ids.gpu_address;
+    if (descriptor.type == WMTTextureType2DArray) {
+      texture = msaaViews[0];
+      gpuResourceID = entries[0];
+      return;
+    }
+  }
+  castBlockSize = descriptor.castBlockSize;
+  castCompressed = descriptor.castCompressed;
+  if (castBlockSize) {
+    castSourceBlockWidth = descriptor.castSourceBlockWidth;
+    auto owner = allocation->descriptor;
+    WMTTextureInfo info{};
+    info.pixel_format = ORIGINAL_FORMAT(descriptor.format);
+    info.type = owner->textureType();
+    info.width = (std::max(owner->width() >> key.mip_start, 1u) + castSourceBlockWidth - 1) / castSourceBlockWidth;
+    info.height = (std::max(owner->height() >> key.mip_start, 1u) + castSourceBlockWidth - 1) / castSourceBlockWidth;
+    info.depth = owner->depth(key);
+    info.array_length = descriptor.arraySize;
+    if (info.type == WMTTextureTypeCube || info.type == WMTTextureTypeCubeArray) info.array_length /= 6;
+    info.mipmap_level_count = castSourceBlockWidth == 1 ? descriptor.miplevelCount : 1;
+    info.sample_count = 1;
+    info.usage = WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite |
+                 WMTTextureUsageRenderTarget | WMTTextureUsagePixelFormatView;
+    info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
+    if (castCompressed) {
+      info.type = owner->textureType();
+      info.width = owner->width();
+      info.height = owner->height();
+      info.depth = owner->depth();
+      info.array_length = owner->arrayLength();
+      if (info.type == WMTTextureTypeCube || info.type == WMTTextureTypeCubeArray) info.array_length /= 6;
+      info.mipmap_level_count = owner->miplevelCount();
+      info.usage = WMTTextureUsageShaderRead | WMTTextureUsagePixelFormatView;
+    }
+    if (!castCompressed) {
+      for (const auto &cached : allocation->cached_view_) {
+        if (cached->castBlockSize == castBlockSize && !cached->castCompressed &&
+            cached->castSourceBlockWidth == castSourceBlockWidth &&
+            (castSourceBlockWidth != 1 ||
+             (cached->key.mip_end == key.mip_end &&
+              ORIGINAL_FORMAT(owner->pixelFormat(cached->key)) == info.pixel_format)) &&
+            cached->key.mip_start == key.mip_start && cached->key.array_start == key.array_start &&
+            cached->key.array_end == key.array_end) {
+          castStorage = cached->castStorage;
+          reservedCast = cached->reservedCast;
+          break;
+        }
+      }
+    }
+    if (!castStorage && allocation->flags().test(TextureAllocationFlag::PlacementSparse)) {
+      const auto page = owner->device_.sparseTileSize(info.type, info.pixel_format, 1, WMTSparsePageSize64);
+      if (!page.width || !page.height || page.depth != 1) return;
+      reservedCast = std::make_shared<ReservedCastStorage>();
+      reservedCast->page_w = page.width; reservedCast->page_h = page.height;
+      reservedCast->pages_x = (info.width + page.width - 1) / page.width;
+      reservedCast->pages_y = (info.height + page.height - 1) / page.height;
+      castStorage = owner->device_.newPlacementSparseTexture(info, WMTSparsePageSize64);
+      if (!castStorage) return;
+      const auto tail = castStorage.sparseTail();
+      if (castCompressed) {
+        const auto source_tail=allocation->texture().sparseTail();
+        const auto source_page=owner->device_.sparseTileSize(info.type,owner->info_.pixel_format,1,WMTSparsePageSize64);
+        if (source_page.width != page.width || source_page.height != page.height ||
+            source_tail.first_mipmap_in_tail != tail.first_mipmap_in_tail ||
+            source_tail.tail_size_in_bytes != tail.tail_size_in_bytes) return;
+      } else if (tail.first_mipmap_in_tail == 0) {
+        if (!tail.tail_size_in_bytes || tail.tail_size_in_bytes % 65536) return;
+        reservedCast->packed = true;
+        reservedCast->pages_x = uint32_t(tail.tail_size_in_bytes / 65536);
+        reservedCast->pages_y = 1;
+      }
+    }
+    if (!castStorage) castStorage = owner->device_.newTexture(info);
+    if (!castStorage) return;
+    parent = castStorage;
+    if (!castCompressed) {
+      descriptor.firstMiplevel = 0;
+      descriptor.firstArraySlice = 0;
+    }
+  }
   texture = parent.newTextureView(
       descriptor.format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
       descriptor.firstArraySlice, descriptor.arraySize,
@@ -83,6 +258,32 @@ TextureAllocation::TextureAllocation(
   mappedMemory = nullptr;
   gpuResourceID = textureDescriptor.gpu_resource_id;
   machPort = textureDescriptor.mach_port;
+  if (obj_ && descriptor->sampleCount() > 1 && (descriptor->usage() & WMTTextureUsageShaderWrite)) {
+    auto info = textureDescriptor;
+    msaaFormat = MTLGetUnsignedIntegerFormat(info.pixel_format);
+    if (info.pixel_format == WMTPixelFormatRG11B10Float || info.pixel_format == WMTPixelFormatRGB9E5Float)
+      msaaFormat = WMTPixelFormatR32Uint;
+    if (msaaFormat == WMTPixelFormatInvalid) msaaFormat = info.pixel_format;
+    if (msaaFormat == info.pixel_format) {
+      msaaCanonical = obj_;
+    } else {
+      uint64_t id;
+      msaaCanonical = obj_.newTextureView(msaaFormat, info.type, 0, 1, 0, info.array_length,
+          {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha}, id);
+      if (!msaaCanonical) { obj_ = nullptr; return; }
+    }
+    // Synchronize raw integer views: typeless half/float aliases must retain every stored bit.
+    info.pixel_format = msaaFormat;
+    info.type = WMTTextureType2DArray;
+    info.sample_count = 1;
+    info.usage = WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsagePixelFormatView;
+    info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
+    for (unsigned sample = 0; sample < descriptor->sampleCount(); ++sample) {
+      msaaShadow[sample] = descriptor->device_.newTexture(info);
+      msaaBaseline[sample] = descriptor->device_.newTexture(info);
+      if (!msaaShadow[sample] || !msaaBaseline[sample]) { obj_ = nullptr; break; }
+    }
+  }
   fenceTrackers.resize(
       flags.test(TextureAllocationFlag::ShaderReadonly) ? 1 : descriptor->arrayLength() * descriptor->miplevelCount()
   );
@@ -99,15 +300,25 @@ TextureAllocation::free(){
 
 void
 Texture::prepareAllocationViews(TextureAllocation *allocation) {
-  if (allocation->version_ < 1) {
-    allocation->cached_view_.push_back(new TextureView(allocation));
-    allocation->version_ = 1;
+  for (;;) {
+    unsigned version;
+    TextureViewDescriptor descriptor;
+    {
+      std::shared_lock<dxmt::shared_mutex> lock(mutex_);
+      version = allocation->version_;
+      if (version == version_) break;
+      descriptor = viewDescriptors_[version];
+    }
+    // A reserved-volume view may admit native mapping work. Never wait for
+    // device execution admission while retaining the descriptor cache mutex.
+    TextureViewRef prepared(version ? new TextureView(allocation, version, descriptor) : new TextureView(allocation));
+    std::unique_lock<dxmt::shared_mutex> lock(mutex_);
+    // Another admitted encoder may have prepared this view while a CPU
+    // descriptor call waited for execution admission.
+    if (allocation->version_ != version) continue;
+    allocation->cached_view_.push_back(std::move(prepared));
+    allocation->version_ = version + 1;
   }
-  std::shared_lock<dxmt::shared_mutex> lock(mutex_);
-  for (unsigned version = allocation->version_; version < version_; version++) {
-    allocation->cached_view_.push_back(new TextureView(allocation, version, viewDescriptors_[version]));
-  }
-  allocation->version_ = version_;
 }
 
 TextureViewKey
@@ -126,6 +337,18 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
     if (viewDescriptors_[i].firstArraySlice != descriptor.firstArraySlice)
       continue;
     if (viewDescriptors_[i].arraySize != descriptor.arraySize)
+      continue;
+    if (viewDescriptors_[i].msaaShadow != descriptor.msaaShadow)
+      continue;
+    if (viewDescriptors_[i].reservedVolumeRender != descriptor.reservedVolumeRender ||
+        viewDescriptors_[i].volumeFirstW != descriptor.volumeFirstW ||
+        viewDescriptors_[i].volumeCastMip != descriptor.volumeCastMip)
+      continue;
+    if (viewDescriptors_[i].castBlockSize != descriptor.castBlockSize)
+      continue;
+    if (viewDescriptors_[i].castSourceBlockWidth != descriptor.castSourceBlockWidth)
+      continue;
+    if (viewDescriptors_[i].castCompressed != descriptor.castCompressed)
       continue;
     return TextureViewKey(descriptor, i, info_.mipmap_level_count);
   }
@@ -179,6 +402,7 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
   WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
   WMTTextureInfo info = info_; // copy
   info.mach_port = 0;
+  if (info.sample_count > 1) info.usage = static_cast<WMTTextureUsage>(info.usage & ~WMTTextureUsageShaderWrite);
   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
     options |= WMTResourceOptionCPUCacheModeWriteCombined;
   }
@@ -231,6 +455,7 @@ Texture::allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t h
   WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
   WMTTextureInfo info = info_; // copy
   info.mach_port = 0;
+  if (info.sample_count > 1) info.usage = static_cast<WMTTextureUsage>(info.usage & ~WMTTextureUsageShaderWrite);
   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
     options |= WMTResourceOptionCPUCacheModeWriteCombined;
   }
@@ -242,7 +467,10 @@ Texture::allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t h
   }
   info.options = options;
   flags.set(TextureAllocationFlag::AllocatedOnHeap);
-  return new TextureAllocation(this, heap.newTexture(info, heap_offset), info, flags);
+  Rc<TextureAllocation> allocation = new TextureAllocation(this, heap.newTexture(info, heap_offset), info, flags);
+  allocation->canonicalHeap = heap;
+  allocation->canonicalHeapOffset = heap_offset;
+  return allocation;
 }
 
 Rc<TextureAllocation>
@@ -351,7 +579,13 @@ TextureViewKey Texture::checkViewUseFormat(TextureViewKey key, WMTPixelFormat fo
   if (unlikely(view.format != format)) {
     auto new_view_desc = view;
     new_view_desc.format = format;
-    return createView(new_view_desc);
+    auto result = createView(new_view_desc);
+    if (reservedVolumeLayoutAddress) {
+      result.mip_start = key.mip_start;
+      result.mip_end = key.mip_end;
+      result.mip_count = key.mip_count;
+    }
+    return result;
   }
   return key;
 }

@@ -39,6 +39,7 @@ MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format) {
   id<MTL4CommandAllocator> allocator;
   DXMTM4Recording *recording;
   NSMutableArray<id<MTLBuffer>> *uploads;
+  NSMutableArray<NSString *> *debugGroups;
   NSUInteger uploadIndex, uploadOffset;
   _Atomic(uint32_t) inFlight;
   BOOL ended;
@@ -46,7 +47,7 @@ MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format) {
 @end
 @implementation DXMTM4CommandBuffer
 - (void)dealloc {
-  [device release]; [command release]; [allocator release]; [recording release]; [uploads release]; [super dealloc];
+  [device release]; [command release]; [allocator release]; [recording release]; [uploads release]; [debugGroups release]; [super dealloc];
 }
 @end
 
@@ -138,10 +139,13 @@ void *winemetal_metal4_split_command_buffer(void *opaque) {
   // All segments share the existing recording, allocator and retirement owner.
   if (!context->recording->segments) context->recording->segments = [NSMutableArray new];
   [context->command useResidencySet:context->recording->residency];
+  for (NSUInteger i=0;i<context->debugGroups.count;++i) [context->command popDebugGroup];
   [context->command endCommandBuffer];
   [context->recording->segments addObject:context->command];
   [context->command release]; context->command = next;
   [next beginCommandBufferWithAllocator:context->allocator];
+  next.label=context->recording->segments.lastObject.label;
+  for (NSString *group in context->debugGroups) [next pushDebugGroup:group];
   return next;
 }
 id<MTL4ComputeCommandEncoder> winemetal_metal4_compute_encoder(obj_handle_t handle) {
@@ -295,17 +299,30 @@ static MTL4RenderPassDescriptor *m4_render_pass(DXMTM4CommandBuffer *context, co
   m4_allocation(context->recording,descriptor.depthAttachment.texture); m4_allocation(context->recording,descriptor.stencilAttachment.texture);
   m4_allocation(context->recording,descriptor.visibilityResultBuffer);
   if (info->tile_width && info->tile_height) { descriptor.tileWidth=info->tile_width; descriptor.tileHeight=info->tile_height; }
-  if (info->center_sample_pattern) {
+  if (info->center_sample_pattern || info->sample_positions.count) {
     NSUInteger count=info->default_raster_sample_count;
     for (unsigned i=0;i<8 && !count;++i) count=[descriptor.colorAttachments[i].texture sampleCount];
     if (!count) count=[descriptor.depthAttachment.texture sampleCount];
     if (!count) count=[descriptor.stencilAttachment.texture sampleCount];
     if (count!=2 && count!=4 && count!=8) { [descriptor release]; m4_error(context->recording,@"Invalid center sample count"); return nil; }
-    MTLSamplePosition positions[8]; for (NSUInteger i=0;i<count;++i) positions[i]=MTLSamplePositionMake(.5f,.5f);
+    if (info->sample_positions.count && info->sample_positions.count!=count) {
+      [descriptor release]; m4_error(context->recording,@"Invalid programmable sample count"); return nil;
+    }
+    MTLSamplePosition positions[8];
+    for (NSUInteger i=0;i<count;++i)
+      positions[i]=info->sample_positions.count
+          ? MTLSamplePositionMake(.5f+info->sample_positions.positions[i][0]/16.f,
+                                  .5f+info->sample_positions.positions[i][1]/16.f)
+          : MTLSamplePositionMake(.5f,.5f);
     [descriptor setSamplePositions:positions count:count];
+    for (unsigned i=0;i<8;++i)
+      if (descriptor.colorAttachments[i].texture)
+        descriptor.colorAttachments[i].storeActionOptions=MTLStoreActionOptionCustomSamplePositions;
+    if (descriptor.depthAttachment.texture)
+      descriptor.depthAttachment.storeActionOptions=MTLStoreActionOptionCustomSamplePositions;
   }
   if (info->forced16_half) {
-    if (info->forced16_half>2 || info->default_raster_sample_count!=8 || info->center_sample_pattern) {
+    if (info->forced16_half>2 || info->default_raster_sample_count!=8 || info->center_sample_pattern || info->sample_positions.count) {
       [descriptor release]; m4_error(context->recording,@"Invalid forced-16 sample half"); return nil;
     }
     static const int x[16]={1,-1,-3,4,-5,2,5,3,-2,0,-4,-6,-8,7,6,-7};
@@ -568,12 +585,14 @@ int32_t winemetal_metal4_call(void *params) {
       context->recording->residency=[context->device newResidencySetWithDescriptor:descriptor error:nil]; [descriptor release];
       if (!context->recording->residency) { [context->recording release]; context->recording=nil; return M4_FAILED; }
       context->uploadIndex=0; context->uploadOffset=0; context->ended=NO;
+      [context->debugGroups removeAllObjects];
       [context->command beginCommandBufferWithAllocator:context->allocator]; return M4_SUCCESS;
     }
     case WMTMetal4EndCommandBuffer: {
       DXMTM4CommandBuffer *context=m4cb(a[0]); if (!context->recording || context->ended) return M4_INVALID;
       [context->recording->residency commit];
       [context->command useResidencySet:context->recording->residency];
+      for (NSUInteger i=0;i<context->debugGroups.count;++i) [context->command popDebugGroup];
       [context->command endCommandBuffer]; context->ended=YES; return M4_SUCCESS;
     }
     case WMTMetal4RenderEncoder: {
@@ -599,6 +618,29 @@ int32_t winemetal_metal4_call(void *params) {
     }
     case WMTMetal4EndEncoding: [((DXMTM4Encoder *)m4obj(a[0]))->encoder endEncoding]; return M4_SUCCESS;
     case WMTMetal4SetEncoderLabel: ((DXMTM4Encoder *)m4obj(a[0]))->encoder.label=m4obj(a[1]); return M4_SUCCESS;
+    case WMTMetal4Diagnostic: {
+      DXMTM4CommandBuffer *context=m4cb(a[0]);
+      if (!context->recording || context->ended || a[1]>3 || (a[3] && !a[2])) return M4_INVALID;
+      NSString *label=[[[NSString alloc] initWithBytes:(const void *)(uintptr_t)a[2]
+        length:a[3] encoding:NSUTF8StringEncoding] autorelease];
+      if (a[1]!=2 && !label) return M4_INVALID;
+      switch (a[1]) {
+      case 0: {
+        id<MTL4ComputeCommandEncoder> encoder=[context->command computeCommandEncoder];
+        if (!encoder) return M4_FAILED;
+        encoder.label=label; [encoder insertDebugSignpost:label]; [encoder endEncoding];
+        [context->recording->encoders addObject:encoder]; break;
+      }
+      case 1:
+        if (!context->debugGroups) context->debugGroups=[NSMutableArray new];
+        [context->command pushDebugGroup:label]; [context->debugGroups addObject:label]; break;
+      case 2:
+        if (!context->debugGroups.count) return M4_INVALID;
+        [context->command popDebugGroup]; [context->debugGroups removeLastObject]; break;
+      case 3: context->command.label=label; break;
+      }
+      return M4_SUCCESS;
+    }
     case WMTMetal4RenderCommands: return m4_render_commands((DXMTM4RenderEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
     case WMTMetal4ComputeCommands: return m4_compute_commands((DXMTM4ComputeEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
     case WMTMetal4BlitCommands: return m4_blit_commands((DXMTM4ComputeEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
@@ -614,11 +656,49 @@ int32_t winemetal_metal4_call(void *params) {
       [submission->condition unlock]; return M4_SUCCESS;
     }
     case WMTMetal4WaitEvent: [(id<MTL4CommandQueue>)m4obj(a[0]) waitForEvent:m4obj(a[1]) value:a[2]]; return M4_SUCCESS;
-    case WMTMetal4WaitDrawable: [(id<MTL4CommandQueue>)m4obj(a[0]) waitForDrawable:m4obj(a[1])]; return M4_SUCCESS;
-    case WMTMetal4SignalDrawable: [(id<MTL4CommandQueue>)m4obj(a[0]) signalDrawable:m4obj(a[1])]; return M4_SUCCESS;
+    case WMTMetal4WaitDrawable: {
+      id<MTL4CommandQueue> queue = m4obj(a[0]);
+      id drawable = m4obj(a[1]);
+      id<CAMetalDrawable> primary, residual;
+      winemetal_composition_drawables(drawable, &primary, &residual);
+      [queue waitForDrawable:primary];
+      if (residual) [queue waitForDrawable:residual];
+      return M4_SUCCESS;
+    }
+    case WMTMetal4SignalDrawable: {
+      id<MTL4CommandQueue> queue = m4obj(a[0]);
+      id drawable = m4obj(a[1]);
+      id<CAMetalDrawable> primary, residual;
+      winemetal_composition_drawables(drawable, &primary, &residual);
+      [queue signalDrawable:primary];
+      if (residual) [queue signalDrawable:residual];
+      return M4_SUCCESS;
+    }
     case WMTMetal4UseResidencySet: {
       DXMTM4CommandBuffer *context=m4cb(a[0]); if (!context->recording) return M4_INVALID;
       m4_retain(context->recording,m4obj(a[1])); [context->command useResidencySet:m4obj(a[1])]; return M4_SUCCESS;
+    }
+    case WMTMetal4UseAllocation: {
+      DXMTM4CommandBuffer *context=m4cb(a[0]); if (!context->recording || context->ended) return M4_INVALID;
+      m4_allocation(context->recording,m4obj(a[1])); return M4_SUCCESS;
+    }
+    case WMTMetal4UseDrawable: {
+      DXMTM4CommandBuffer *context=m4cb(a[0]);
+      if (!context->recording || context->ended || !a[1]) return M4_INVALID;
+      id<CAMetalDrawable> primary, residual;
+      winemetal_composition_drawables(m4obj(a[1]), &primary, &residual);
+      id<MTLResidencySet> primary_set = primary.layer.residencySet;
+      id<MTLResidencySet> residual_set = residual.layer.residencySet;
+      if (!primary_set || (residual && !residual_set)) return M4_FAILED;
+      // CAMetalLayer owns and updates these sets. Keep them through recording
+      // retirement, but never modify them or accumulate them on the queue.
+      m4_retain(context->recording, primary_set);
+      [context->command useResidencySet:primary_set];
+      if (residual_set && residual_set != primary_set) {
+        m4_retain(context->recording, residual_set);
+        [context->command useResidencySet:residual_set];
+      }
+      return M4_SUCCESS;
     }
     case WMTMetal4NewArgumentTable: {
       MTL4ArgumentTableDescriptor *descriptor=[MTL4ArgumentTableDescriptor new]; descriptor.maxBufferBindCount=a[1];
@@ -821,6 +901,11 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
       [encoder setDepthClipMode:(MTLDepthClipMode)body->depth_clip_mode];
       [encoder setDepthBias:body->depth_bias slopeScale:body->scole_scale clamp:body->depth_bias_clamp];
       [encoder setFrontFacingWinding:(MTLWinding)body->winding];
+      break;
+    }
+    case WMTRenderCommandSetDepthBounds: {
+      const struct wmtcmd_render_setdepthbounds *body = (const struct wmtcmd_render_setdepthbounds *)next;
+      [encoder setDepthTestMinBound:body->min_depth maxBound:body->max_depth];
       break;
     }
     case WMTRenderCommandSetViewports: {

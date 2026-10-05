@@ -19,6 +19,7 @@
 #include "dxbc_converter_base.hpp"
 #include "../dxbc_converter.hpp"
 #include "air_builder.hpp"
+#include "DXBCParser/ShaderBinary.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
@@ -135,6 +136,7 @@ Converter::LoadOperand(const SrcOperandImmediate32 &SrcOp, mask_t Mask) {
     }
     break;
   case OperandDataType::Integer:
+  case OperandDataType::Double:
     switch (Mask) {
     case 0b1:
       return air.getInt(SrcOp.uvalue[0]);
@@ -264,6 +266,10 @@ Converter::LoadOperand(const SrcOperandAttribute &SrcOp, mask_t Mask) {
   case InputAttribute::CoverageMask: {
     Ret = ctx.pso_sample_mask != 0xffffffff ? ir.CreateAnd(res.coverage_mask_arg, ctx.pso_sample_mask)
                                             : res.coverage_mask_arg;
+    break;
+  }
+  case InputAttribute::InnerCoverage: {
+    Ret = res.inner_coverage_arg;
     break;
   }
   case InputAttribute::Domain: {
@@ -425,6 +431,17 @@ Converter::ApplySrcModifier(SrcOperandCommon C, llvm::Value *Value, mask_t Mask)
     if (C.neg)
       Value = ir.CreateFNeg(Value);
     break;
+  case OperandDataType::Double: {
+    // DXBC stores two doubles in xy/zw. Modifiers affect each 64-bit sign, not each word.
+    DXASSERT_DXBC(Mask == kMaskAll);
+    auto bits = ir.CreateBitCast(Value, llvm::FixedVectorType::get(ir.getInt64Ty(), 2));
+    if (C.abs) bits = ir.CreateAnd(bits, llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(2),
+        ir.getInt64(0x7fffffffffffffffULL)));
+    if (C.neg) bits = ir.CreateXor(bits, llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(2),
+        ir.getInt64(0x8000000000000000ULL)));
+    Value = ir.CreateBitCast(bits, air.getIntTy(4));
+    break;
+  }
   }
   return Value;
 }
@@ -441,12 +458,15 @@ Converter::LoadTexture(const SrcOperandResource &SrcOp) {
   texture.kind = descriptor->ResourceKind;
   texture.memory_access = descriptor->MemoryAccess;
   texture.sample_type = descriptor->SampleType;
+  texture.volume_layout = descriptor->ViewRange;
+  texture.volume_view = descriptor->FormatDefaults;
+  texture.volume_metadata = descriptor->Metadata;
 
   return llvm::Optional<TextureResourceHandle>(
       {texture, descriptor->ResourceKindLogical, descriptor->ResourceHandle, descriptor->Metadata, SrcOp.read_swizzle,
        descriptor->GlobalCoherent && SupportsMemoryCoherency(), descriptor->Scoped3DUAV,
        descriptor->EmulationAddress, descriptor->EmulationTag, descriptor->StatusBase, descriptor->StatusView,
-       descriptor->RGB32StatusBase}
+       descriptor->RGB32StatusBase, descriptor->FormatDefaults, descriptor->ViewRange}
   );
 }
 
@@ -462,6 +482,9 @@ Converter::LoadTexture(const SrcOperandUAV &SrcOp) {
   texture.kind = descriptor->ResourceKind;
   texture.memory_access = descriptor->MemoryAccess;
   texture.sample_type = descriptor->SampleType;
+  texture.volume_layout = descriptor->ViewRange;
+  texture.volume_view = descriptor->FormatDefaults;
+  texture.volume_metadata = descriptor->Metadata;
 
   return llvm::Optional<TextureResourceHandle>(
       {texture, descriptor->ResourceKindLogical, descriptor->ResourceHandle, descriptor->Metadata, SrcOp.read_swizzle,
@@ -482,6 +505,9 @@ Converter::LoadTexture(const AtomicDstOperandUAV &DstOp) {
   texture.kind = descriptor->ResourceKind;
   texture.memory_access = descriptor->MemoryAccess;
   texture.sample_type = descriptor->SampleType;
+  texture.volume_layout = descriptor->ViewRange;
+  texture.volume_view = descriptor->FormatDefaults;
+  texture.volume_metadata = descriptor->Metadata;
 
   return llvm::Optional<TextureResourceHandle>(
       {texture, descriptor->ResourceKindLogical, descriptor->ResourceHandle, descriptor->Metadata, swizzle_identity,
@@ -677,7 +703,8 @@ Converter::LoadSampler(const SrcOperandSampler &SrcOp) {
 
   auto Bias = ir.CreateBitCast(ir.CreateTrunc(descriptor->Metadata, ctx.types._int), ctx.types._float);
 
-  return llvm::Optional<SamplerHandle>({descriptor->SamplerHandle, descriptor->CubeSamplerHandle, Bias});
+  return llvm::Optional<SamplerHandle>({descriptor->SamplerHandle, descriptor->CubeSamplerHandle, Bias,
+      descriptor->Metadata, descriptor->LodRange, descriptor->UintBorder, descriptor->FloatBorder});
 }
 
 void
@@ -1104,6 +1131,90 @@ Converter::operator()(const InstFloatBinaryOp &bin) {
   StoreOperand(bin.dst, Result, bin._.saturate);
 }
 
+void
+Converter::operator()(const InstDoubleOp &inst) {
+  using namespace microsoft;
+  using llvm::Value;
+  auto *i32 = ir.getInt32Ty(), *i64 = ir.getInt64Ty();
+  auto *module = ir.GetInsertBlock()->getModule();
+  auto call = [&](llvm::StringRef name, llvm::Type *result, llvm::ArrayRef<Value *> args) -> Value * {
+    llvm::SmallVector<llvm::Type *, 3> types;
+    for (auto *arg : args) types.push_back(arg->getType());
+    return ir.CreateCall(module->getOrInsertFunction(name, llvm::FunctionType::get(result, types, false)), args);
+  };
+  std::array<Value *, 3> sources{};
+  for (unsigned i = 0; i < inst.source_count; ++i)
+    sources[i] = LoadOperand(inst.src[i], kMaskAll);
+  const uint32_t op = inst.opcode, mask = GetMask(inst.dst);
+  const bool narrow = op == D3D11_SB_OPCODE_DEQ || op == D3D11_SB_OPCODE_DGE ||
+      op == D3D11_SB_OPCODE_DLT || op == D3D11_SB_OPCODE_DNE || op == D3D11_SB_OPCODE_DTOF ||
+      op == D3D11_1_SB_OPCODE_DTOI || op == D3D11_1_SB_OPCODE_DTOU;
+  const unsigned words = __builtin_popcount(mask);
+  Value *result = llvm::PoisonValue::get(air.getIntTy(words));
+  unsigned output = 0;
+  for (unsigned lane = 0; lane < 2; ++lane) {
+    if (narrow ? lane >= words : !(mask & (3u << (2 * lane)))) continue;
+    auto packed = [&](unsigned src) -> Value * {
+      return ir.CreateExtractElement(ir.CreateBitCast(sources[src], llvm::FixedVectorType::get(i64, 2)), lane);
+    };
+    auto word = [&](unsigned src) -> Value * {
+      return ir.CreateExtractElement(BitcastToInt32(sources[src]), lane);
+    };
+    Value *value = nullptr;
+    switch (op) {
+    case D3D11_SB_OPCODE_DADD: value = call("dxmt.fp64.add", i64, {packed(0), packed(1)}); break;
+    case D3D11_SB_OPCODE_DMUL: value = call("dxmt.fp64.mul", i64, {packed(0), packed(1)}); break;
+    case D3D11_1_SB_OPCODE_DDIV: value = call("dxmt.fp64.div", i64, {packed(0), packed(1)}); break;
+    case D3D11_1_SB_OPCODE_DFMA: value = call("dxmt.fp64.fma", i64, {packed(0), packed(1), packed(2)}); break;
+    case D3D11_1_SB_OPCODE_DRCP: value = call("dxmt.fp64.div", i64, {ir.getInt64(0x3ff0000000000000ULL), packed(0)}); break;
+    case D3D11_SB_OPCODE_DMIN: value = call("dxmt.fp64.min", i64, {packed(0), packed(1)}); break;
+    case D3D11_SB_OPCODE_DMAX: value = call("dxmt.fp64.max", i64, {packed(0), packed(1)}); break;
+    case D3D11_SB_OPCODE_DMOV: value = packed(0); break;
+    case D3D11_SB_OPCODE_DMOVC: value = ir.CreateSelect(ir.CreateIsNotNull(word(0)), packed(1), packed(2)); break;
+    case D3D11_SB_OPCODE_DEQ:
+    case D3D11_SB_OPCODE_DNE:
+    case D3D11_SB_OPCODE_DLT:
+    case D3D11_SB_OPCODE_DGE: {
+      auto *a = packed(0), *b = packed(1);
+      auto *equal = call("dxmt.fp64.eq", ir.getInt1Ty(), {a, b});
+      Value *test = equal;
+      if (op == D3D11_SB_OPCODE_DNE) test = ir.CreateNot(equal);
+      if (op == D3D11_SB_OPCODE_DLT || op == D3D11_SB_OPCODE_DGE) {
+        auto *aSign = ir.CreateICmpSLT(a, ir.getInt64(0));
+        auto *bSign = ir.CreateICmpSLT(b, ir.getInt64(0));
+        auto *less = ir.CreateSelect(ir.CreateICmpNE(aSign, bSign), aSign,
+            ir.CreateSelect(aSign, ir.CreateICmpUGT(a, b), ir.CreateICmpULT(a, b)));
+        auto *ordered = ir.CreateAnd(
+            ir.CreateICmpULE(ir.CreateAnd(a, 0x7fffffffffffffffULL), ir.getInt64(0x7ff0000000000000ULL)),
+            ir.CreateICmpULE(ir.CreateAnd(b, 0x7fffffffffffffffULL), ir.getInt64(0x7ff0000000000000ULL)));
+        less = ir.CreateAnd(less, ir.CreateNot(equal));
+        test = ir.CreateAnd(ordered, op == D3D11_SB_OPCODE_DLT ? less : ir.CreateNot(less));
+      }
+      value = ir.CreateSExt(test, i32);
+      break;
+    }
+    case D3D11_SB_OPCODE_DTOF: value = call("dxmt.fp64.to.f32", i32, {packed(0)}); break;
+    case D3D11_1_SB_OPCODE_DTOI: value = call("dxmt.fp64.to.i32", i32, {packed(0)}); break;
+    case D3D11_1_SB_OPCODE_DTOU: value = call("dxmt.fp64.to.u32", i32, {packed(0)}); break;
+    case D3D11_SB_OPCODE_FTOD: value = call("dxmt.fp64.from.f32", i64, {word(0)}); break;
+    case D3D11_1_SB_OPCODE_ITOD: value = call("dxmt.fp64.from.i64", i64, {ir.CreateSExt(word(0), i64)}); break;
+    case D3D11_1_SB_OPCODE_UTOD: value = call("dxmt.fp64.from.u64", i64, {ir.CreateZExt(word(0), i64)}); break;
+    default: llvm_unreachable("unhandled DXBC double instruction");
+    }
+    if (!narrow && inst._.saturate) {
+      value = call("dxmt.fp64.max", i64, {value, ir.getInt64(0)});
+      value = call("dxmt.fp64.min", i64, {value, ir.getInt64(0x3ff0000000000000ULL)});
+    }
+    if (narrow) {
+      result = words == 1 ? value : ir.CreateInsertElement(result, value, output++);
+    } else {
+      auto *pair = ir.CreateBitCast(value, llvm::FixedVectorType::get(i32, 2));
+      result = ir.CreateInsertElement(result, ir.CreateExtractElement(pair, uint64_t(0)), output++);
+      result = ir.CreateInsertElement(result, ir.CreateExtractElement(pair, uint64_t(1)), output++);
+    }
+  }
+  StoreOperand(inst.dst, result);
+}
 void
 Converter::operator()(const InstIntegerUnaryOp &unary) {
   using namespace llvm::air;
@@ -1604,7 +1715,8 @@ Converter::operator()(const InstLoad &load) {
     merged->addIncoming(native, native_block);
     Value = merged;
   } else {
-    auto Read = air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, SampleIndex, LOD, Tex->GlobalCoherent);
+    auto Read = air.CreateRead(Tex->Texture, Tex->Handle, Address, ArrayIndex, SampleIndex, LOD, Tex->GlobalCoherent,
+                               Tex->Metadata, Tex->MSAASampleIds);
     Value = Read.first;
     if (Tex->Logical != Texture::texture_buffer)
       Residency = Read.second;
@@ -1726,7 +1838,7 @@ Converter::operator()(const InstStoreUAVTyped &store) {
       auto *value = LoadOperand(store.src, kMaskAll);
       GuardScoped3DUAV(valid, nullptr, [&]() -> llvm::Value * {
         air.CreateWrite(Tex->Texture, Tex->Handle, Address, nullptr, nullptr, ir.getInt32(0), value,
-                        Tex->GlobalCoherent);
+                        Tex->GlobalCoherent, store.dst.mask);
         return nullptr;
       });
       return;
@@ -1738,7 +1850,8 @@ Converter::operator()(const InstStoreUAVTyped &store) {
 
   auto Value = LoadOperand(store.src, kMaskAll);
 
-  air.CreateWrite(Tex->Texture, Tex->Handle, Address, ArrayIndex, nullptr, ir.getInt32(0), Value, Tex->GlobalCoherent);
+  air.CreateWrite(Tex->Texture, Tex->Handle, Address, ArrayIndex, nullptr, ir.getInt32(0), Value,
+                  Tex->GlobalCoherent, store.dst.mask);
 }
 
 llvm::Value *
@@ -1763,6 +1876,10 @@ Converter::operator()(const InstSample &sample) {
   if (!Sampler)
     return;
 
+  Tex->Texture.sampler_metadata = Sampler->Metadata;
+  Tex->Texture.sampler_lod_range = Sampler->LodRange;
+  Tex->Texture.sampler_uint_border = Sampler->UintBorder;
+  Tex->Texture.sampler_float_border = Sampler->FloatBorder;
   auto SamplerHandle = Sampler->Handle;
 
   auto MinLODClamp = DecodeTextureMinLODClamp(Tex->Metadata);
@@ -1816,11 +1933,31 @@ Converter::operator()(const InstSample &sample) {
     return;
   }
 
-  auto [Value, Residency] = air.CreateSample(
-      Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, sample.offsets, sample_bias{Sampler->Bias},
-      sample_min_lod_clamp{MinLODClamp}
+  auto [Value, Residency] = air.CreateCoordinateSample(
+      Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, nullptr,
+      [&] {
+        return air.CreateSample(
+            Tex->Texture, Tex->Handle, SamplerHandle, air.PixelSampleCoordinates(Tex->Texture, Tex->Handle, Coord),
+            ArrayIndex, sample.offsets, sample_level{air.getFloat(0)}
+        );
+      },
+      [&] {
+        return air.CreateSample(
+            Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, sample.offsets, sample_bias{Sampler->Bias},
+            sample_min_lod_clamp{MinLODClamp}
+        );
+      }
   );
 
+  if (Tex->Texture.sample_type != Texture::sample_float && Sampler->UintBorder) {
+    auto BorderLOD = ir.CreateFAdd(air.CreateSampleFootprintLOD(Tex->Texture, Tex->Logical, Tex->Handle,
+        air.CreateDerivative(Coord, false), air.CreateDerivative(Coord, true)), Sampler->Bias);
+    BorderLOD = air.CreateFPBinOp(AIRBuilder::fmax, BorderLOD, MinLODClamp);
+    auto *Offset = llvm::ConstantVector::get({air.getInt(sample.offsets[0]), air.getInt(sample.offsets[1]),
+                                             air.getInt(sample.offsets[2])});
+    Value = air.CreateIntegerBorder(Tex->Texture, Tex->Logical, Tex->Handle, Sampler->Metadata,
+        Sampler->UintBorder, Sampler->LodRange, DecodeTextureMinLODClamp(Tex->Metadata), Value, Coord, Offset, BorderLOD, Tex->FormatDefaults);
+  }
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
 }
@@ -1837,6 +1974,10 @@ Converter::operator()(const InstSampleLOD &sample) {
   if (!Sampler)
     return;
 
+  Tex->Texture.sampler_metadata = Sampler->Metadata;
+  Tex->Texture.sampler_lod_range = Sampler->LodRange;
+  Tex->Texture.sampler_uint_border = Sampler->UintBorder;
+  Tex->Texture.sampler_float_border = Sampler->FloatBorder;
   auto SamplerHandle = Sampler->Handle;
 
   llvm::Value *Coord = nullptr;
@@ -1887,9 +2028,28 @@ Converter::operator()(const InstSampleLOD &sample) {
   llvm::Value *LOD = ir.CreateFAdd(LoadOperand(sample.src_lod, kMaskComponentX), Sampler->Bias);
   LOD = air.CreateFPBinOp(AIRBuilder::fmax, LOD, DecodeTextureMinLODClamp(Tex->Metadata));
 
-  auto [Value, Residency] =
-      air.CreateSample(Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, sample.offsets, sample_level{LOD});
+  auto [Value, Residency] = air.CreateCoordinateSample(
+      Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, nullptr,
+      [&] {
+        return air.CreateSample(
+            Tex->Texture, Tex->Handle, SamplerHandle, air.PixelSampleCoordinates(Tex->Texture, Tex->Handle, Coord),
+            ArrayIndex, sample.offsets, sample_level{air.getFloat(0)}
+        );
+      },
+      [&] {
+        return air.CreateSample(
+            Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, sample.offsets, sample_level{LOD}
+        );
+      }
+  );
 
+  if (Tex->Texture.sample_type != Texture::sample_float && Sampler->UintBorder) {
+    auto BorderLOD = LOD;
+    auto *Offset = llvm::ConstantVector::get({air.getInt(sample.offsets[0]), air.getInt(sample.offsets[1]),
+                                             air.getInt(sample.offsets[2])});
+    Value = air.CreateIntegerBorder(Tex->Texture, Tex->Logical, Tex->Handle, Sampler->Metadata,
+        Sampler->UintBorder, Sampler->LodRange, DecodeTextureMinLODClamp(Tex->Metadata), Value, Coord, Offset, BorderLOD, Tex->FormatDefaults);
+  }
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
 }
@@ -1906,6 +2066,10 @@ Converter::operator()(const InstSampleBias &sample) {
   if (!Sampler)
     return;
 
+  Tex->Texture.sampler_metadata = Sampler->Metadata;
+  Tex->Texture.sampler_lod_range = Sampler->LodRange;
+  Tex->Texture.sampler_uint_border = Sampler->UintBorder;
+  Tex->Texture.sampler_float_border = Sampler->FloatBorder;
   auto SamplerHandle = Sampler->Handle;
 
   auto MinLODClamp = DecodeTextureMinLODClamp(Tex->Metadata);
@@ -1961,11 +2125,31 @@ Converter::operator()(const InstSampleBias &sample) {
 
   auto Bias = ir.CreateFAdd(Sampler->Bias, LoadOperand(sample.src_bias, kMaskComponentX));
 
-  auto [Value, Residency] = air.CreateSample(
-      Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, sample.offsets, sample_bias{Bias},
-      sample_min_lod_clamp{MinLODClamp}
+  auto [Value, Residency] = air.CreateCoordinateSample(
+      Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, nullptr,
+      [&] {
+        return air.CreateSample(
+            Tex->Texture, Tex->Handle, SamplerHandle, air.PixelSampleCoordinates(Tex->Texture, Tex->Handle, Coord),
+            ArrayIndex, sample.offsets, sample_level{air.getFloat(0)}
+        );
+      },
+      [&] {
+        return air.CreateSample(
+            Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, sample.offsets, sample_bias{Bias},
+            sample_min_lod_clamp{MinLODClamp}
+        );
+      }
   );
 
+  if (Tex->Texture.sample_type != Texture::sample_float && Sampler->UintBorder) {
+    auto BorderLOD = ir.CreateFAdd(air.CreateSampleFootprintLOD(Tex->Texture, Tex->Logical, Tex->Handle,
+        air.CreateDerivative(Coord, false), air.CreateDerivative(Coord, true)), Bias);
+    BorderLOD = air.CreateFPBinOp(AIRBuilder::fmax, BorderLOD, MinLODClamp);
+    auto *Offset = llvm::ConstantVector::get({air.getInt(sample.offsets[0]), air.getInt(sample.offsets[1]),
+                                             air.getInt(sample.offsets[2])});
+    Value = air.CreateIntegerBorder(Tex->Texture, Tex->Logical, Tex->Handle, Sampler->Metadata,
+        Sampler->UintBorder, Sampler->LodRange, DecodeTextureMinLODClamp(Tex->Metadata), Value, Coord, Offset, BorderLOD, Tex->FormatDefaults);
+  }
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
 }
@@ -1982,6 +2166,10 @@ Converter::operator()(const InstSampleDerivative &sample) {
   if (!Sampler)
     return;
 
+  Tex->Texture.sampler_metadata = Sampler->Metadata;
+  Tex->Texture.sampler_lod_range = Sampler->LodRange;
+  Tex->Texture.sampler_uint_border = Sampler->UintBorder;
+  Tex->Texture.sampler_float_border = Sampler->FloatBorder;
   auto SamplerHandle = Sampler->Handle;
 
   auto MinLODClamp = DecodeTextureMinLODClamp(Tex->Metadata);
@@ -2055,10 +2243,30 @@ Converter::operator()(const InstSampleDerivative &sample) {
     return;
   }
 
-  auto [Value, Residency] = air.CreateSampleGrad(
-      Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, DDX, DDY, MinLODClamp, sample.offsets
+  auto [Value, Residency] = air.CreateCoordinateSample(
+      Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, nullptr,
+      [&] {
+        return air.CreateSample(
+            Tex->Texture, Tex->Handle, SamplerHandle, air.PixelSampleCoordinates(Tex->Texture, Tex->Handle, Coord),
+            ArrayIndex, sample.offsets, sample_level{air.getFloat(0)}
+        );
+      },
+      [&] {
+        return air.CreateSampleGrad(
+            Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, DDX, DDY, MinLODClamp, sample.offsets
+        );
+      }
   );
 
+  if (Tex->Texture.sample_type != Texture::sample_float && Sampler->UintBorder) {
+    auto BorderLOD = ir.CreateFAdd(air.CreateSampleFootprintLOD(
+        Tex->Texture, Tex->Logical, Tex->Handle, DDX, DDY), Sampler->Bias);
+    BorderLOD = air.CreateFPBinOp(AIRBuilder::fmax, BorderLOD, MinLODClamp);
+    auto *Offset = llvm::ConstantVector::get({air.getInt(sample.offsets[0]), air.getInt(sample.offsets[1]),
+                                             air.getInt(sample.offsets[2])});
+    Value = air.CreateIntegerBorder(Tex->Texture, Tex->Logical, Tex->Handle, Sampler->Metadata,
+        Sampler->UintBorder, Sampler->LodRange, DecodeTextureMinLODClamp(Tex->Metadata), Value, Coord, Offset, BorderLOD, Tex->FormatDefaults);
+  }
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
 }
@@ -2075,6 +2283,10 @@ Converter::operator()(const InstSampleCompare &sample) {
   if (!Sampler)
     return;
 
+  Tex->Texture.sampler_metadata = Sampler->Metadata;
+  Tex->Texture.sampler_lod_range = Sampler->LodRange;
+  Tex->Texture.sampler_uint_border = Sampler->UintBorder;
+  Tex->Texture.sampler_float_border = Sampler->FloatBorder;
   auto SamplerHandle = Sampler->Handle;
 
   auto MinLODClamp = DecodeTextureMinLODClamp(Tex->Metadata);
@@ -2154,6 +2366,10 @@ Converter::operator()(const InstGather &sample) {
   if (!Sampler)
     return;
 
+  Tex->Texture.sampler_metadata = Sampler->Metadata;
+  Tex->Texture.sampler_lod_range = Sampler->LodRange;
+  Tex->Texture.sampler_uint_border = Sampler->UintBorder;
+  Tex->Texture.sampler_float_border = Sampler->FloatBorder;
   auto SamplerHandle = Sampler->Handle;
 
   auto Component = ir.getInt32(sample.src_sampler.gather_channel);
@@ -2193,9 +2409,19 @@ Converter::operator()(const InstGather &sample) {
     return;
   }
 
-  auto [Value, Residency] =
-      air.CreateGather(Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, Offset, Component);
+  auto [Value, Residency] = air.CreateCoordinateSample(
+      Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, Component,
+      [&] {
+        return air.CreateGather(
+            Tex->Texture, Tex->Handle, SamplerHandle, air.PixelSampleCoordinates(Tex->Texture, Tex->Handle, Coord),
+            ArrayIndex, Offset, Component
+        );
+      },
+      [&] { return air.CreateGather(Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, Offset, Component); }
+  );
 
+  Value = air.CreateIntegerBorder(Tex->Texture, Tex->Logical, Tex->Handle, Sampler->Metadata,
+      Sampler->UintBorder, Sampler->LodRange, DecodeTextureMinLODClamp(Tex->Metadata), Value, Coord, Offset, air.getFloat(0), Tex->FormatDefaults, Component);
   StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
 }
@@ -2212,6 +2438,10 @@ Converter::operator()(const InstGatherCompare &sample) {
   if (!Sampler)
     return;
 
+  Tex->Texture.sampler_metadata = Sampler->Metadata;
+  Tex->Texture.sampler_lod_range = Sampler->LodRange;
+  Tex->Texture.sampler_uint_border = Sampler->UintBorder;
+  Tex->Texture.sampler_float_border = Sampler->FloatBorder;
   auto SamplerHandle = Sampler->Handle;
 
   auto Reference = LoadOperand(sample.src_reference, kMaskComponentX);
@@ -2266,6 +2496,10 @@ Converter::operator()(const InstCalcLOD &lod) {
   if (!Sampler)
     return;
 
+  Tex->Texture.sampler_metadata = Sampler->Metadata;
+  Tex->Texture.sampler_lod_range = Sampler->LodRange;
+  Tex->Texture.sampler_uint_border = Sampler->UintBorder;
+  Tex->Texture.sampler_float_border = Sampler->FloatBorder;
   auto SamplerHandle = Sampler->Handle;
 
   auto MinLODClamp = DecodeTextureMinLODClamp(Tex->Metadata);
@@ -2301,6 +2535,12 @@ Converter::operator()(const InstCalcLOD &lod) {
   auto [Clamped, Unclamped] = air.CreateCalculateLOD(Tex->Texture, Tex->Handle, SamplerHandle, Coord);
 
   Clamped = air.CreateFPBinOp(AIRBuilder::fmax, MinLODClamp, Clamped);
+  if (Tex->Logical == Texture::texture3d && Tex->Texture.volume_layout) {
+    auto *last = ir.CreateFSub(ir.CreateUIToFP(air.CreateTextureQuery(Tex->Texture, Tex->Handle,
+        Texture::num_mip_levels, air.getInt(0)), air.getFloatTy()), air.getFloat(1));
+    auto *atlas = ir.CreateICmpNE(ir.CreateAnd(Tex->Texture.volume_layout, ir.getInt64(uint64_t(1) << 62)), ir.getInt64(0));
+    Clamped = ir.CreateSelect(ir.CreateAnd(atlas, ir.CreateFCmpOGT(MinLODClamp, last)), air.getFloat(0), Clamped);
+  }
 
   StoreOperand(
       lod.dst,
@@ -2465,7 +2705,7 @@ Converter::operator()(const InstSamplePos &sample) {
   llvm::Value *ValueVec4 = llvm::ConstantAggregateZero::get(air.getFloatTy(2));
   llvm::Value *Pos = air.CreateGetSamplePosition(SampleCount, Index);
   if (Tex) {
-    auto *center = ir.CreateICmpEQ(ir.CreateTrunc(Tex->Metadata, ir.getInt32Ty()), ir.getInt32(1));
+    auto *center = ir.CreateICmpNE(ir.CreateAnd(Tex->Metadata, ir.getInt64(1)), ir.getInt64(0));
     Pos = ir.CreateSelect(center, llvm::ConstantAggregateZero::get(air.getFloatTy(2)), Pos);
   } else if (!sample.src) {
     if (auto *call = llvm::dyn_cast<llvm::CallInst>(Pos))

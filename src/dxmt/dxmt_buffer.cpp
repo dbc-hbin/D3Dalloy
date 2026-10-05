@@ -66,6 +66,8 @@ BufferAllocation::BufferAllocation(
     assert(0 && "heap doesn't support placed buffer");
   }
   obj_ = heap.newBuffer(info_, heap_offset);
+  canonicalHeap = heap;
+  canonicalHeapOffset = heap_offset;
   gpuAddress_ = info_.gpu_address;
   mappedMemory_ = info_.memory.get_accessible_or_null();
 }

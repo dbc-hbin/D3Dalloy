@@ -400,6 +400,21 @@ void run(bool d3d12) {
   IDXGISwapChain1 *chain = d3d12 ? static_cast<IDXGISwapChain1 *>(chain12.Get()) : chain11.Get();
   auto initial = snapshot(chain);
   require(!initial.fullscreen && initial.desc.Windowed && initial.fullscreenDesc.Windowed, "initial-windowed");
+  if (d3d12) {
+    DXGI_FRAME_STATISTICS stats{};
+    expect(b.output->GetFrameStatistics(nullptr), E_INVALIDARG, "output-stats-null");
+    expect(b.output->GetFrameStatistics(&stats), DXGI_ERROR_INVALID_CALL, "output-stats-windowed");
+    // A real monitor wait must advance the caller clock; a success-only stub cannot.
+    check(b.output->WaitForVBlank(), "vblank-prime");
+    LARGE_INTEGER start{}, finish{}, frequency{};
+    require(QueryPerformanceFrequency(&frequency) && QueryPerformanceCounter(&start), "vblank-clock-start");
+    for (UINT i = 0; i < 3; ++i)
+      check(b.output->WaitForVBlank(), "vblank-measured");
+    require(QueryPerformanceCounter(&finish) && finish.QuadPart - start.QuadPart > frequency.QuadPart / 1000,
+            "vblank-not-stub");
+    std::printf("OWNED_DXGI_OUTPUT_VBLANK waits=3 elapsed_qpc=%lld frequency=%lld\n",
+                finish.QuadPart - start.QuadPart, frequency.QuadPart);
+  }
   auto *proxy = new OutputFault(b.output1.Get());
   expect(chain->SetFullscreenState(FALSE, proxy), DXGI_ERROR_INVALID_CALL, "false-nonnull");
   same(chain, initial, "false-nonnull-preserved");
@@ -439,7 +454,38 @@ void run(bool d3d12) {
   check(chain->ResizeTarget(&mode), "ResizeTarget-fullscreen");
   check(chain->ResizeBuffers(2, 72, 54, DXGI_FORMAT_UNKNOWN, 0), "ResizeBuffers-fullscreen");
   if (d3d12) frame12(b, chain12.Get()); else frame11(b, chain);
+  if (d3d12) {
+    DXGI_FRAME_STATISTICS measured{};
+    const ULONGLONG deadline = GetTickCount64() + kWaitMs;
+    HRESULT hr;
+    do {
+      check(b.output->WaitForVBlank(), "stats-vblank");
+      hr = b.output->GetFrameStatistics(&measured);
+      require(hr == S_OK || hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT, "output-stats-result");
+      require(GetTickCount64() < deadline, "output-stats-timeout");
+    } while (hr != S_OK);
+    require(measured.PresentCount && measured.PresentRefreshCount &&
+            measured.SyncRefreshCount >= measured.PresentRefreshCount && measured.SyncQPCTime.QuadPart > 0 &&
+            measured.SyncGPUTime.QuadPart == 0, "output-stats-real-presentation");
+    const auto first = measured;
+    check(b.output->WaitForVBlank(), "stats-next-vblank");
+    check(b.output->WaitForVBlank(), "stats-next-vblank2");
+    check(b.output->GetFrameStatistics(&measured), "stats-next");
+    require(measured.PresentCount == first.PresentCount &&
+            measured.PresentRefreshCount == first.PresentRefreshCount &&
+            measured.SyncRefreshCount > first.SyncRefreshCount && measured.SyncQPCTime.QuadPart > first.SyncQPCTime.QuadPart,
+            "output-stats-monitor-progress");
+    std::printf("OWNED_DXGI_OUTPUT_STATISTICS present=%u present_refresh=%u sync_refresh=%u qpc=%lld\n",
+                measured.PresentCount, measured.PresentRefreshCount, measured.SyncRefreshCount, measured.SyncQPCTime.QuadPart);
+    check(chain->ResizeBuffers(2, 72, 54, DXGI_FORMAT_UNKNOWN, 0), "stats-resize");
+    expect(b.output->GetFrameStatistics(&measured), DXGI_ERROR_FRAME_STATISTICS_DISJOINT, "stats-resize-disjoint");
+  }
   check(chain->SetFullscreenState(FALSE, nullptr), "leave-fullscreen");
+  if (d3d12) {
+    DXGI_FRAME_STATISTICS stats{};
+    expect(b.output->GetFrameStatistics(&stats), DXGI_ERROR_INVALID_CALL, "stats-leave-unregistered");
+    std::puts("OWNED_DXGI_OUTPUT_STATISTICS_PASS native=1 resize_disjoint=1 leave_unregistered=1");
+  }
   auto left = snapshot(chain);
   require(!left.fullscreen && left.desc.Windowed && left.fullscreenDesc.Windowed && !left.target,
           "left-windowed");
@@ -553,11 +599,14 @@ void backend() {
   std::printf("OWNED_DXGI_FULLSCREEN_BACKEND id=%s\n", id());
 }
 }
-int main() {
+int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  const bool d3d12Only = argc == 2 && std::strcmp(argv[1], "--d3d12-only") == 0;
+  require(argc == 1 || d3d12Only, "arguments");
   backend();
   run(true);
-  run(false);
+  if (!d3d12Only)
+    run(false);
   std::puts("OWNED_DXGI_FULLSCREEN_PASS");
   return 0;
 }

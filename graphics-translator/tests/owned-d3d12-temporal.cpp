@@ -45,7 +45,7 @@ struct MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC {
     UINT OutputBaseX, OutputBaseY;
     FLOAT JitterOffsetX, JitterOffsetY;
     FLOAT MotionVectorScaleX, MotionVectorScaleY;
-    FLOAT PreExposure, ExposureScale;
+    FLOAT PreExposure;
     BOOL ResetHistory;
     UINT OutputWidth, OutputHeight;
     UINT MotionContentWidth, MotionContentHeight;
@@ -54,6 +54,17 @@ struct MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC {
     BOOL CombineCompositionMask, EnableSharpening;
     FLOAT Sharpness;
     BOOL CapOutputToTemporalMaxScale;
+    BOOL DrawDebugView;
+    ID3D12Resource* DiffuseAlbedo;
+    ID3D12Resource* SpecularAlbedo;
+    ID3D12Resource* Normals;
+    ID3D12Resource* Roughness;
+    ID3D12Resource* SpecularHitDistance;
+    FLOAT WorldToViewMatrix[16], ViewToClipMatrix[16];
+    UINT RoughnessPacked, DepthLinear;
+    UINT DiffuseAlbedoBaseX, DiffuseAlbedoBaseY, SpecularAlbedoBaseX, SpecularAlbedoBaseY;
+    UINT NormalsBaseX, NormalsBaseY, RoughnessBaseX, RoughnessBaseY;
+    UINT SpecularHitDistanceBaseX, SpecularHitDistanceBaseY;
 };
 
 struct IMTLD3D12TemporalUpscaleState : public IUnknown {};
@@ -63,6 +74,7 @@ struct IMTLD3D12DeviceExt : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE CreateTemporalUpscaleState(
         const MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC* desc,
         IMTLD3D12TemporalUpscaleState** state) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SupportsTemporalFeature(UINT feature_flags, BOOL* supported) = 0;
 };
 
 struct IMTLD3D12GraphicsCommandListExt : public IUnknown {
@@ -82,10 +94,12 @@ constexpr GUID kIID_IMTLD3D12GraphicsCommandListExt = {
 static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC) == 40);
 #ifdef _WIN64
 static_assert(offsetof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC, Color) == 8);
-static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 184);
+static_assert(offsetof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC, DiffuseAlbedo) == 184);
+static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 400);
 #else
 static_assert(offsetof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC, Color) == 4);
-static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 152);
+static_assert(offsetof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC, DiffuseAlbedo) == 152);
+static_assert(sizeof(MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC) == 348);
 #endif
 
 namespace {
@@ -298,6 +312,9 @@ public:
                 fail("GPU fence timeout",
                      HRESULT_FROM_WIN32(wait == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT));
         }
+        // Device removal also wakes fence events and reports UINT64_MAX,
+        // which is not successful completion of the recorded GPU work.
+        check(device->GetDeviceRemovedReason(), "GPU completion device removed");
     }
 
     ComPtr<ID3D12Device> device;
@@ -677,7 +694,6 @@ MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC makeFrameDesc(
     desc.MotionVectorScaleX = 1.0f;
     desc.MotionVectorScaleY = 1.0f;
     desc.PreExposure = 1.0f;
-    desc.ExposureScale = 1.0f;
     desc.ResetHistory = resetHistory;
     return desc;
 }
@@ -745,9 +761,8 @@ void runCreateFlagNegative(IMTLD3D12DeviceExt* extension) {
     desc = makeCreateDesc();
     desc.FeatureFlags |= 128;
     expectHRESULT(extension->CreateTemporalUpscaleState(&desc, &state),
-                  E_NOTIMPL, "unsupported_alpha_upscaling");
-    if (state)
-        fail("unsupported alpha returned state");
+                  S_OK, "alpha_upscaling_create");
+    if (!state) fail("alpha upscaling returned null state");
 }
 
 void runR32ExposureReplay(Gpu& gpu, IMTLD3D12DeviceExt* extension,
@@ -999,15 +1014,6 @@ void runFrameNegatives(Gpu& gpu, IMTLD3D12TemporalUpscaleState* state,
         expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
                       E_INVALIDARG, "nonfinite_jitter");
         check(recording.list->Close(), "negative jitter Close");
-    }
-
-    {
-        Recording recording = gpu.makeRecording();
-        auto desc = base;
-        desc.ExposureScale = 2.0f;
-        expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
-                      E_NOTIMPL, "nonidentity_exposure_scale");
-        check(recording.list->Close(), "negative exposure Close");
     }
 
     {

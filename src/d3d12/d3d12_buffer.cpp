@@ -136,10 +136,11 @@ public:
     );
     if (SUCCEEDED(hr) && pHeap)
       placed_heap_ = pHeap;
-    return hr;
+    return FAILED(hr) ? hr : device_->RegisterDescriptorResource(this);
   };
 
   ~MTLD3D12Buffer() {
+    device_->UnregisterDescriptorResource(this);
     if (buffer && buffer->current())
       device_->UnregisterResidencyAndVA(buffer->current(), owns_registration_ ? this : nullptr);
     if (reserved && reserved->status_buffer)
@@ -191,8 +192,10 @@ public:
       return E_OUTOFMEMORY;
     buffer->current()->residencyStatusBase =
         status_info.gpu_address - (buffer->current()->gpuAddress() >> 16);
+    buffer->current()->reservedResource = reserved.get();
     owns_registration_ = true;
-    return device_->RegisterResidencyAndVA(buffer->current(), this, true);
+    hr = device_->RegisterResidencyAndVA(buffer->current(), this, true);
+    return FAILED(hr) ? hr : device_->RegisterDescriptorResource(this);
   }
 
   HRESULT
@@ -552,7 +555,9 @@ OpenSharedBuffer(MTLD3D12Device *pDevice, std::shared_ptr<sharing::SharedObject>
     return E_OUTOFMEMORY;
   auto buffer = Com(impl);
   buffer->share = std::move(share);
-  HRESULT hr = buffer->Initialize(&props, flags, &desc, nullptr, nullptr, 0);
+  HRESULT hr=buffer->ImportOwnedFormatCasting(pDevice,desc);
+  if (FAILED(hr)) return hr;
+  hr = buffer->Initialize(&props, flags, &desc, nullptr, nullptr, 0);
   if (FAILED(hr))
     return hr;
   buffer->owned_initial_state = D3D12_RESOURCE_STATE_COMMON;

@@ -1,6 +1,7 @@
 #include "com/com_guid.hpp"
 #include "com/com_pointer.hpp"
 #include "dxgi_options.hpp"
+#include "dxgi_memory.hpp"
 #include "owned_budget_notification.hpp"
 #include "util_string.hpp"
 #include "log/log.hpp"
@@ -176,10 +177,17 @@ public:
 
     pDesc->SubSysId = 0;
     pDesc->Revision = 0;
-    if (device_.hasUnifiedMemory())
-      pDesc->DedicatedVideoMemory = device_.recommendedMaxWorkingSetSize() / 2; // FIXME: use a more appropriate value
-    else
-      pDesc->DedicatedVideoMemory = device_.recommendedMaxWorkingSetSize();
+    const bool unified = device_.hasUnifiedMemory();
+    uint64_t ram = 0;
+    if (unified) {
+      MEMORYSTATUSEX memory = {};
+      memory.dwLength = sizeof(memory);
+      if (!GlobalMemoryStatusEx(&memory))
+        return HRESULT_FROM_WIN32(GetLastError());
+      ram = memory.ullTotalPhys;
+    }
+    pDesc->DedicatedVideoMemory = advertisedDedicatedVideoMemory<SIZE_T>(
+        unified, device_.recommendedMaxWorkingSetSize(), ram);
     pDesc->DedicatedSystemMemory = 0;
     pDesc->SharedSystemMemory = 0;
     pDesc->AdapterLuid = GetAdapterLuid(device_);
@@ -247,6 +255,8 @@ public:
   HRESULT STDMETHODCALLTYPE QueryVideoMemoryInfo(
       UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
       DXGI_QUERY_VIDEO_MEMORY_INFO *pVideoMemoryInfo) override {
+    // Every Metal device is a distinct adapter, not a linked node. Cross-
+    // adapter shared heaps do not add nodes to this adapter.
     if (NodeIndex > 0 || !pVideoMemoryInfo)
       return E_INVALIDARG;
 

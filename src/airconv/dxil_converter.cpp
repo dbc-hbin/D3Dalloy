@@ -8,6 +8,7 @@
 
 #include "dxil_converter.hpp"
 #include "dxil_pipeline.hpp"
+#include "dxil_matrix.hpp"
 
 #include <algorithm>
 
@@ -15,11 +16,15 @@
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/Scalar/InferAddressSpaces.h"
+#include "llvm/Transforms/Scalar/Scalarizer.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
@@ -362,6 +367,7 @@ llvm::Error PrepareShader(
     llvm::raw_string_ostream stream(message);
     if (!fill_shader_reflection(&shader, masks, reflection, nullptr, nullptr, stream))
       return createError(stream.str());
+    reflection->HasAtomic64 = metadata->has_atomic64 ? 1 : 0;
   }
   return llvm::Error::success();
 }
@@ -382,6 +388,9 @@ llvm::Expected<std::unique_ptr<ModuleInfo>> LowerShader(
   );
   if (!info)
     return info.takeError();
+  if (auto error = LowerMatrices(**info))
+    return std::move(error);
+  InitializeAtomic64Phase(*(*info)->module, args);
 
   // Stage construction mutates signatures and register bookkeeping. A cached
   // shader may be compiled concurrently for different PSOs; keep those fields
@@ -522,6 +531,11 @@ llvm::Error LowerImmutableConstants(llvm::Module &module, SM50CompiledBitcodeInt
     if (global->getName() == kAtomicLockTableGlobal) {
       compiled.constant_relocations.push_back(
         {offsets.lookup(global), SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE});
+      continue;
+    }
+    if (global->getName() == kAtomic64ContextGlobal) {
+      compiled.constant_relocations.push_back(
+        {offsets.lookup(global), SM50_CONSTANT_RELOCATION_TARGET_ATOMIC64_CONTEXT});
       continue;
     }
     if (auto error = writeConstantInitializer(global->getInitializer(), offsets.lookup(global), layout, offsets, compiled))
@@ -699,5 +713,198 @@ llvm::Error LowerImmutableConstants(llvm::Module &module, SM50CompiledBitcodeInt
   return Error::success();
 }
 
+
+llvm::Error LowerVectors(llvm::Module &module, bool final) {
+  using namespace llvm;
+  auto *model = module.getNamedMetadata("dx.shaderModel");
+  if (!model || !model->getNumOperands())
+    return Error::success();
+  auto *minor = dyn_cast<ConstantAsMetadata>(model->getOperand(0)->getOperand(2));
+  if (!minor || cast<ConstantInt>(minor->getValue())->getZExtValue() < 9)
+    return Error::success();
+  auto contains_long = [&](auto &self, Type *type) -> bool {
+    if (auto *vector = dyn_cast<FixedVectorType>(type))
+      return vector->getNumElements() == 1 || vector->getNumElements() > 4;
+    if (auto *array = dyn_cast<ArrayType>(type))
+      return self(self, array->getElementType());
+    if (auto *structure = dyn_cast<StructType>(type))
+      for (auto *element : structure->elements())
+        if (self(self, element))
+          return true;
+    return false;
+  };
+  if (!final) {
+    // AIR has no long-vector function ABI. Inline just these helpers, not every
+    // shader helper; their ordinary SSA is then handled by LLVM scalarization.
+    SmallPtrSet<Function *, 8> helpers;
+    for (auto &function : module) {
+      if (function.isDeclaration())
+        continue;
+      bool wide = contains_long(contains_long, function.getReturnType());
+      for (auto *type : function.getFunctionType()->params())
+        wide |= contains_long(contains_long, type);
+      if (wide)
+        helpers.insert(&function);
+    }
+    for (auto *helper : helpers) {
+      SmallPtrSet<Function *, 16> seen;
+      SmallVector<Function *, 16> reachable{helper};
+      for (unsigned i = 0; i < reachable.size(); ++i) {
+        if (!seen.insert(reachable[i]).second)
+          continue;
+        for (auto &instruction : instructions(reachable[i]))
+          if (auto *call = dyn_cast<CallInst>(&instruction))
+            if (auto *callee = call->getCalledFunction(); callee && !callee->isDeclaration()) {
+              if (callee == helper)
+                return createError("dxil: recursive long-vector helper");
+              reachable.push_back(callee);
+            }
+      }
+    }
+    for (;;) {
+      CallInst *candidate = nullptr;
+      for (auto &function : module)
+        for (auto &instruction : instructions(function))
+          if (auto *call = dyn_cast<CallInst>(&instruction); call && helpers.contains(call->getCalledFunction())) {
+            candidate = call;
+            break;
+          }
+      if (!candidate)
+        break;
+      InlineFunctionInfo info;
+      auto result = InlineFunction(*candidate, info);
+      if (!result.isSuccess())
+        return createError(Twine("dxil: cannot inline long-vector helper: ") + result.getFailureReason());
+    }
+    for (auto *helper : helpers)
+      if (helper->use_empty())
+        helper->eraseFromParent();
+  }
+  LoopAnalysisManager loops;
+  FunctionAnalysisManager analyses;
+  CGSCCAnalysisManager calls;
+  ModuleAnalysisManager modules;
+  PassBuilder pass_builder;
+  pass_builder.registerModuleAnalyses(modules);
+  pass_builder.registerCGSCCAnalyses(calls);
+  pass_builder.registerFunctionAnalyses(analyses);
+  pass_builder.registerLoopAnalyses(loops);
+  pass_builder.crossRegisterProxies(loops, analyses, calls, modules);
+  ScalarizerPass scalarizer;
+  scalarizer.setScalarizeLoadStore(true);
+  scalarizer.setScalarizeVariableInsertExtract(true);
+  // LLVM Scalarizer deliberately skips packed i1 loads/stores. DXIL permits
+  // them: legalize their byte layout explicitly before the ordinary SSA pass.
+  for (auto &function : module)
+    for (auto &instruction : make_early_inc_range(instructions(function))) {
+      auto *load = dyn_cast<LoadInst>(&instruction);
+      auto *store = dyn_cast<StoreInst>(&instruction);
+      Value *value = load ? (Value *)load : (store ? store->getValueOperand() : nullptr);
+      auto *type = value ? dyn_cast<FixedVectorType>(value->getType()) : nullptr;
+      if (!type || !type->getElementType()->isIntegerTy(1))
+        continue;
+      IRBuilder<> builder(&instruction);
+      Value *pointer = load ? load->getPointerOperand() : store->getPointerOperand();
+      pointer = builder.CreateBitCast(pointer, builder.getInt8Ty()->getPointerTo(
+          pointer->getType()->getPointerAddressSpace()));
+      Value *result = PoisonValue::get(type);
+      for (unsigned byte = 0; byte < (type->getNumElements() + 7) / 8; ++byte) {
+        auto *address = builder.CreateGEP(builder.getInt8Ty(), pointer, builder.getInt32(byte));
+        Value *bits = builder.getInt8(0);
+        if (load) {
+          auto *word = builder.CreateLoad(builder.getInt8Ty(), address);
+          word->setAlignment(Align(1));
+          word->setVolatile(load->isVolatile());
+          bits = word;
+        }
+        for (unsigned bit = 0; bit < 8 && byte * 8 + bit < type->getNumElements(); ++bit) {
+          const unsigned lane = byte * 8 + bit;
+          if (load)
+            result = builder.CreateInsertElement(result, builder.CreateTrunc(
+                builder.CreateLShr(bits, bit), builder.getInt1Ty()), lane);
+          else
+            bits = builder.CreateOr(bits, builder.CreateShl(builder.CreateZExt(
+                builder.CreateExtractElement(value, lane), builder.getInt8Ty()), bit));
+        }
+        if (store) {
+          auto *word = builder.CreateStore(bits, address);
+          word->setAlignment(Align(1));
+          word->setVolatile(store->isVolatile());
+        }
+      }
+      if (load)
+        load->replaceAllUsesWith(result);
+      instruction.eraseFromParent();
+    }
+  for (auto &function : module)
+    if (!function.isDeclaration())
+      analyses.invalidate(function, scalarizer.run(function, analyses));
+  if (!final)
+    return Error::success();
+
+  // Preserve DXIL offsets and padding exactly. Wide vector allocas/globals are
+  // backing bytes; GEPs use the original layout, then all live loads are scalar.
+  const auto &layout = module.getDataLayout();
+  for (auto &function : module) {
+    for (auto &instruction : make_early_inc_range(instructions(function))) {
+      if (auto *gep = dyn_cast<GetElementPtrInst>(&instruction);
+          gep && contains_long(contains_long, gep->getSourceElementType())) {
+        MapVector<Value *, APInt> variables;
+        APInt constant(64, 0);
+        if (!gep->collectOffset(layout, 64, variables, constant))
+          return createError("dxil: cannot legalize long-vector GEP");
+        IRBuilder<> builder(gep);
+        Value *offset = ConstantInt::get(builder.getInt64Ty(), constant);
+        for (auto &entry : variables)
+          offset = builder.CreateAdd(offset, builder.CreateMul(
+              builder.CreateSExtOrTrunc(entry.first, builder.getInt64Ty()),
+              ConstantInt::get(builder.getInt64Ty(), entry.second)));
+        auto *pointer = builder.CreateBitCast(gep->getPointerOperand(),
+            builder.getInt8Ty()->getPointerTo(gep->getPointerAddressSpace()));
+        auto *address = builder.CreateGEP(builder.getInt8Ty(), pointer, offset);
+        auto *replacement = builder.CreateBitCast(address, gep->getType());
+        gep->replaceAllUsesWith(replacement);
+        gep->eraseFromParent();
+      } else if (auto *allocation = dyn_cast<AllocaInst>(&instruction);
+                 allocation && contains_long(contains_long, allocation->getAllocatedType())) {
+        IRBuilder<> builder(allocation);
+        auto *bytes = ArrayType::get(builder.getInt8Ty(),
+            layout.getTypeAllocSize(allocation->getAllocatedType()).getFixedValue());
+        auto *replacement = builder.CreateAlloca(bytes, allocation->getAddressSpace(), allocation->getArraySize());
+        replacement->setAlignment(allocation->getAlign());
+        allocation->replaceAllUsesWith(builder.CreateBitCast(replacement, allocation->getType()));
+        allocation->eraseFromParent();
+      }
+    }
+  }
+  for (auto &global : make_early_inc_range(module.globals())) {
+    if (!contains_long(contains_long, global.getValueType()))
+      continue;
+    const uint64_t size = layout.getTypeAllocSize(global.getValueType()).getFixedValue();
+    auto *bytes = ArrayType::get(Type::getInt8Ty(module.getContext()), size);
+    Constant *initializer = nullptr;
+    if (global.hasInitializer()) {
+      SM50CompiledBitcodeInternal packed;
+      packed.constants.resize(size, 0);
+      DenseMap<GlobalVariable *, uint64_t> offsets;
+      if (auto error = writeConstantInitializer(global.getInitializer(), 0, layout, offsets, packed))
+        return error;
+      initializer = ConstantDataArray::get(module.getContext(), packed.constants);
+    }
+    auto *replacement = new GlobalVariable(module, bytes, global.isConstant(), global.getLinkage(),
+        initializer, "", nullptr, global.getThreadLocalMode(), global.getAddressSpace());
+    replacement->copyAttributesFrom(&global);
+    replacement->setAlignment(std::max(layout.getABITypeAlign(global.getValueType()), global.getAlign().valueOrOne()));
+    replacement->takeName(&global);
+    global.replaceAllUsesWith(ConstantExpr::getBitCast(replacement, global.getType()));
+    global.eraseFromParent();
+  }
+  for (auto &function : module)
+    if (!function.isDeclaration()) {
+      analyses.invalidate(function, PreservedAnalyses::none());
+      InstCombinePass().run(function, analyses);
+    }
+  return Error::success();
+}
 
 } // namespace dxmt::dxil

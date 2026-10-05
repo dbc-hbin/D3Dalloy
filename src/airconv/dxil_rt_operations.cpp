@@ -87,10 +87,9 @@
  *   dxil_rt_callbacks.cpp), so operand 19 is pinned false and the D3D12 exception
  *   is decided where the any-hit shader actually runs.
  *
- *   FORCE_OMM_2_STATE (0x400) has no effect here and is not a gap: the pipeline
- *   never sets D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS, no
- *   geometry this runtime builds carries a micromap link, and the flag's only
- *   defined meaning is how an *encountered* micromap is interpreted.
+ *   Micromap-enabled pipelines use explicit query traversal and the shared
+ *   classifier in dxil_rt_omm.hpp; FORCE_OMM_2_STATE resolves unknown states
+ *   there before deciding opacity, culling and any-hit invocation.
  *
  * Recursion. D3D12 requires TraceRay to be rejected once the pipeline's
  * D3D12_RAYTRACING_PIPELINE_CONFIG.MaxTraceRecursionDepth would be exceeded (the
@@ -142,6 +141,7 @@
  * dxil_rt_callbacks.cpp, which needs the same traversal context this pass builds.
  */
 #include "dxil_rt_callbacks.hpp"
+#include "dxil_rt_omm.hpp"
 
 #include "nt/air_builder.hpp"
 
@@ -156,8 +156,10 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Alignment.h"
 
@@ -295,7 +297,7 @@ bool isRaytracingOpcode(uint32_t opcode) {
     return true;
   /* GeometryIndex shares the RayQuery numbering but is a hit shader system value. The
    * inline RayQuery family itself is lowered by LowerRayQueries, in every stage. */
-  return opcode == OpGeometryIndex;
+  return opcode == OpGeometryIndex || (opcode >= 262 && opcode <= 289);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -770,7 +772,13 @@ private:
   /** Copy a child block's payload area back to the object a trace named. */
   void copyPayloadBack(IRBuilder<> &builder, Value *child_block, Value *payload_operand);
 
-  Error lowerTraceRay(CallInst &call, IRBuilder<> &builder);
+  Error lowerTraceRay(CallInst &call, IRBuilder<> &builder, bool deferred = false);
+  Value *allocateHitObject(IRBuilder<> &builder);
+  Value *hitObjectBlock(IRBuilder<> &builder, Value *object);
+  Value *hitObjectValue(IRBuilder<> &builder, Value *block, Type *type);
+  Value *hitContinuation(IRBuilder<> &builder, Value *record);
+  Error bindHitObject(IRBuilder<> &builder, Value *block, Value *index);
+  Error lowerHitObject(CallInst &call, uint32_t opcode, IRBuilder<> &builder);
   Value *emitQueryTraversal(IRBuilder<> &builder, Value *child, Value *structure, Value *origin, Value *direction,
                             Value *t_min, Value *t_max, Value *flags, Value *mask, Value *triangle_cull,
                             Value *geometry_cull, Value *opacity_cull, Value *forced_opacity);
@@ -1772,6 +1780,14 @@ Value *RaytracingLowerer::emitQueryTraversal(
   Value *distance = get(b, "get_candidate_triangle_distance", f32);
   Value *front = get(b, "is_candidate_triangle_front_facing", i1);
   Value *bary = get(b, "get_candidate_triangle_barycentric_coord", v2);
+  Value *opacity = b.getInt32(1);
+  if (context.pipeline_flags & 0x400) {
+    opacity = emitOmmClassification(b, module, loadFrameField(b, child,
+      offsetof(SM50_RT_FRAME, AccelerationStructureAddress), b.getInt64Ty()), instance, geometry, primitive, bary, flags);
+    BasicBlock *visible = BasicBlock::Create(c, "rt.query.omm.visible", function);
+    b.CreateCondBr(b.CreateICmpNE(opacity, b.getInt32(0)), visible, advance);
+    b.SetInsertPoint(visible);
+  }
   storeHitState(b, child, kRtHitTCurrent, distance);
   storeHitState(b, child, kRtHitKind, b.CreateSelect(front, b.getInt32(0xfe), b.getInt32(0xff)));
   storeHitState(b, child, kRtHitFrontFace, b.CreateZExt(front, i32));
@@ -1779,7 +1795,8 @@ Value *RaytracingLowerer::emitQueryTraversal(
   Value *attributes = b.CreateGEP(b.getInt8Ty(), bytePointerOf(b, child), b.getInt32(layout.candidate_attribute));
   b.CreateAlignedStore(bary, b.CreateBitCast(attributes, v2->getPointerTo()), Align(1));
   Value *any_hit = member(b, context.hit_group_any_hits, "dxmt.rt.query.any_hits");
-  emitConditional(b, b.CreateICmpNE(any_hit, b.getInt32(kRtRecordIndexNone)), "rt.query.anyhit", [&](IRBuilder<> &g) {
+  emitConditional(b, b.CreateAnd(b.CreateICmpEQ(opacity, b.getInt32(1)),
+    b.CreateICmpNE(any_hit, b.getInt32(kRtRecordIndexNone))), "rt.query.anyhit", [&](IRBuilder<> &g) {
     callVisibleFunction(g, child, any_hit, loadFrameField(g, child, offsetof(SM50_RT_FRAME, Depth), i32));
   });
   emitConditional(b, b.CreateICmpNE(loadCandidateWord(b, child, kRtCandidateDecision), b.getInt32(kRtCandidateReject)),
@@ -1788,8 +1805,17 @@ Value *RaytracingLowerer::emitQueryTraversal(
     });
   b.CreateBr(advance);
   b.SetInsertPoint(box);
-  storeCandidateWord(b, child, kRtCandidateSkipAnyHit,
-    b.CreateZExt(b.CreateNot(get(b, "is_candidate_non_opaque_bounding_box", i1)), i32));
+  Value *boxOpaque = b.CreateNot(get(b, "is_candidate_non_opaque_bounding_box", i1));
+  if (context.pipeline_flags & 0x400) {
+    Value *classification = emitOmmClassification(b, module, loadFrameField(b, child,
+      offsetof(SM50_RT_FRAME, AccelerationStructureAddress), b.getInt64Ty()), instance, geometry, primitive,
+      ConstantAggregateZero::get(v2), flags);
+    boxOpaque = b.CreateICmpEQ(classification, b.getInt32(2));
+    BasicBlock *visible = BasicBlock::Create(c, "rt.query.box.visible", function);
+    b.CreateCondBr(b.CreateICmpNE(classification, b.getInt32(0)), visible, advance);
+    b.SetInsertPoint(visible);
+  }
+  storeCandidateWord(b, child, kRtCandidateSkipAnyHit, b.CreateZExt(boxOpaque, i32));
   Value *intersection = member(b, context.hit_group_intersections, "dxmt.rt.query.intersections");
   emitConditional(b, b.CreateICmpNE(intersection, b.getInt32(kRtRecordIndexNone)), "rt.query.intersection", [&](IRBuilder<> &g) {
     callVisibleFunction(g, child, intersection, loadFrameField(g, child, offsetof(SM50_RT_FRAME, Depth), i32));
@@ -1836,7 +1862,7 @@ Value *RaytracingLowerer::emitQueryTraversal(
   return result;
 }
 
-Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder) {
+Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, bool deferred) {
   /*
    * `dx.op.traceRay(i32 opcode, %dx.types.Handle, i32 RayFlags, i32 InstanceInclusionMask,
    *                 i32 RayContributionToHitGroupIndex,
@@ -1913,6 +1939,8 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder) {
   Value *contribution = call.getArgOperand(4);
   Value *geometry_multiplier = call.getArgOperand(5);
   Value *miss_index = call.getArgOperand(6);
+  if (deferred)
+    miss_index = builder.CreateAnd(miss_index, builder.getInt32(0xffff));
 
   Value *origin = PoisonValue::get(f32x3);
   Value *direction = PoisonValue::get(f32x3);
@@ -1937,7 +1965,7 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder) {
    * its own block, and the caller's frame / hit state / candidate control are not
    * overwritten by the shaders this trace runs.
    */
-  Value *child = allocateInvocationBlock(builder, "rt.child");
+  Value *child = deferred ? allocateHitObject(builder) : allocateInvocationBlock(builder, "rt.child");
   /*
    * The payload object is read before the call is erased: the operand is what the
    * payload is copied into the child block from and back out to, and it has to
@@ -1955,6 +1983,8 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder) {
    * traversal and reads the contribution of the instance it is offered.
    */
   publishRuntimeContext(builder, child);
+  if (Value *address = accelerationStructureGpuAddress(acceleration_structure))
+    storeFrameField(builder, child, offsetof(SM50_RT_FRAME, AccelerationStructureAddress), address);
   Value *contributions = contributionsArrayAddress(builder, acceleration_structure);
   if (contributions)
     storeFrameField(
@@ -1970,6 +2000,11 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder) {
   Value *forced_opacity = flagField(builder, ray_flags, 0);
   Value *triangle_cull = triangleCullMode(builder, ray_flags);
   Value *opacity_cull = flagField(builder, ray_flags, 6);
+  if (context.pipeline_flags & 0x400) {
+    // Force candidates visible to software before applying OMM transparency.
+    forced_opacity = builder.getInt32(2);
+    opacity_cull = builder.getInt32(0);
+  }
   Value *geometry_cull = flagField(builder, ray_flags, 8);
   /*
    * The pipeline's own SKIP_TRIANGLES / SKIP_PROCEDURAL_PRIMITIVES flags are the
@@ -2069,12 +2104,16 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder) {
   BasicBlock *head = call.getParent();
   BasicBlock *tail = head->splitBasicBlock(call.getNextNode(), "rt.tail");
   head->getTerminator()->eraseFromParent();
+  if (deferred) {
+    IRBuilder<> resume(&*tail->getFirstInsertionPt());
+    call.replaceAllUsesWith(hitObjectValue(resume, child, call.getType()));
+  }
   call.eraseFromParent();
 
   Error failure = Error::success();
   auto emitTraversal = [&](IRBuilder<> &b) {
     auto issueTraversal = [&](IRBuilder<> &tb) -> Value * {
-      if (context.query_callbacks)
+      if (context.query_callbacks || (context.pipeline_flags & 0x400))
         return emitQueryTraversal(tb, child, acceleration_structure, origin, direction, t_min, t_max,
                                   ray_flags, instance_mask, triangle_cull, geometry_cull, opacity_cull, forced_opacity);
       return tb.CreateCall(
@@ -2157,6 +2196,11 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder) {
       });
     storeHitState(b, child, kRtHitBarycentric, barycentrics);
     storeHitState(b, child, kRtHitFrontFace, b.CreateZExt(front_facing, b.getInt32Ty()));
+    if (deferred && layout.attribute_size >= 8)
+      emitConditional(b, is_triangle, "rt.hitobject.barycentrics", [&](IRBuilder<> &g) {
+        Value *attributes = g.CreateGEP(g.getInt8Ty(), bytePointerOf(g, child), g.getInt32(layout.attribute));
+        g.CreateAlignedStore(barycentrics, g.CreateBitCast(attributes, barycentrics->getType()->getPointerTo()), Align(1));
+      });
     /*
      * The committed instance's transforms, and the ray in its object space. A miss leaves
      * them unspecified in D3D12 (no shader can read them), so they are stored unconditionally.
@@ -2207,6 +2251,8 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder) {
       b.CreateAdd(contribution, b.CreateMul(geometry, geometry_multiplier)),
       instance_contribution
     );
+    if (deferred)
+      hit_group_index = b.CreateAnd(hit_group_index, b.getInt32(0x0fffffff));
     RtShaderRecord hit_lookup, miss_lookup;
     if (!shaderRecord(b, RtShaderTable::HitGroup, hit_group_index, hit_lookup) ||
         !shaderRecord(b, RtShaderTable::Miss, miss_index, miss_lookup)) {
@@ -2267,6 +2313,14 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder) {
       b, child, offsetof(SM50_RT_FRAME, LocalRootEntry),
       b.CreateSelect(hit, hit_lookup.local_entry, miss_lookup.local_entry)
     );
+    if (deferred) {
+      storeFrameField(b, child, layout.block_size, b.CreateSelect(hit, b.getInt32(1), b.getInt32(2)));
+      storeFrameField(b, child, layout.block_size + 4, b.CreateSelect(hit,
+        b.CreateAnd(hit_group_index, b.getInt32(0x0fffffff)), b.CreateAnd(miss_index, b.getInt32(0xffff))));
+      copyPayloadBack(b, child, payload_operand);
+      b.CreateBr(tail);
+      return;
+    }
 
     /*
      * Run the hit group / miss shader, exactly as D3D12 does after the traversal,
@@ -2461,9 +2515,222 @@ Error RaytracingLowerer::lowerCreateHandleForLib(CallInst &call, IRBuilder<> &bu
   return Error::success();
 }
 
+Value *RaytracingLowerer::allocateHitObject(IRBuilder<> &b) {
+  BasicBlock &function_entry = b.GetInsertBlock()->getParent()->getEntryBlock();
+  IRBuilder<> entry_builder(&function_entry, function_entry.getFirstInsertionPt());
+  auto *storage = entry_builder.CreateAlloca(ArrayType::get(b.getInt8Ty(), layout.block_size + 8), nullptr, "rt.hitobject");
+  storage->setAlignment(Align(16));
+  b.CreateMemSet(bytePointerOf(b, storage), b.getInt8(0), layout.block_size + 8, Align(16));
+  storeFrameWord(b, storage, offsetof(SM50_RT_FRAME, RecordIndex), b.getInt32(kRtRecordIndexNone));
+  return storage;
+}
+
+// The DXIL opaque carrier becomes a true value. In particular a loop can retain a
+// hit from an earlier traversal without aliasing the next traversal's workspace.
+// Payload and candidate scratch are not part of a HitObject snapshot.
+Value *RaytracingLowerer::hitObjectValue(IRBuilder<> &b, Value *block, Type *type) {
+  auto *carrier = cast<StructType>(type);
+  const uint32_t offsets[] = {0, layout.hit_state, layout.attribute, layout.block_size, layout.block_size + 4};
+  Value *value = PoisonValue::get(type);
+  for (unsigned i = 0; i < 5; ++i) {
+    Type *field = carrier->getElementType(i);
+    Value *ptr = b.CreateGEP(b.getInt8Ty(), bytePointerOf(b, block), b.getInt32(offsets[i]));
+    value = b.CreateInsertValue(value, b.CreateAlignedLoad(field, b.CreateBitCast(ptr, field->getPointerTo()), Align(1)), i);
+  }
+  return value;
+}
+
+Value *RaytracingLowerer::hitObjectBlock(IRBuilder<> &b, Value *object) {
+  Value *block = allocateHitObject(b);
+  const uint32_t offsets[] = {0, layout.hit_state, layout.attribute, layout.block_size, layout.block_size + 4};
+  for (unsigned i = 0; i < 5; ++i) {
+    Value *field = b.CreateExtractValue(object, i);
+    Value *ptr = b.CreateGEP(b.getInt8Ty(), bytePointerOf(b, block), b.getInt32(offsets[i]));
+    b.CreateAlignedStore(field, b.CreateBitCast(ptr, field->getType()->getPointerTo()), Align(1));
+  }
+  return block;
+}
+
+Value *RaytracingLowerer::hitContinuation(IRBuilder<> &b, Value *record) {
+  if (!context.hit_group_continuation_count)
+    return b.getInt32(kRtRecordIndexNone);
+  const uint32_t size = std::max(8u, context.hit_group_continuation_count);
+  auto *array = ArrayType::get(b.getInt32Ty(), size);
+  GlobalVariable *table = module.getGlobalVariable("dxmt.rt.continuations", true);
+  if (!table) {
+    std::vector<uint32_t> indices(context.hit_group_continuations,
+      context.hit_group_continuations + context.hit_group_continuation_count);
+    indices.resize(size, kRtRecordIndexNone);
+    table = new GlobalVariable(module, array, true, GlobalValue::PrivateLinkage,
+      ConstantDataArray::get(module.getContext(), indices), "dxmt.rt.continuations", nullptr,
+      GlobalValue::NotThreadLocal, 2);
+  }
+  return emitGuardedValue(b, b.CreateICmpULT(record, b.getInt32(context.hit_group_continuation_count)),
+    b.getInt32(kRtRecordIndexNone), "rt.hitobject.continuation", [&](IRBuilder<> &g) -> Value * {
+      return g.CreateLoad(g.getInt32Ty(), g.CreateGEP(array, table, {g.getInt32(0), record}));
+    });
+}
+
+Error RaytracingLowerer::bindHitObject(IRBuilder<> &b, Value *block, Value *index) {
+  Value *type = loadFrameField(b, block, layout.block_size, b.getInt32Ty());
+  Error failure = Error::success();
+  emitConditional(b, b.CreateICmpNE(type, b.getInt32(0)), "rt.hitobject.bind", [&](IRBuilder<> &g) {
+    Value *hit = g.CreateICmpEQ(type, g.getInt32(1));
+    Value *selected = g.CreateAnd(index, g.CreateSelect(hit, g.getInt32(0x0fffffff), g.getInt32(0xffff)));
+    RtShaderRecord hg, miss;
+    if (!shaderRecord(g, RtShaderTable::HitGroup, selected, hg) ||
+        !shaderRecord(g, RtShaderTable::Miss, selected, miss)) {
+      failure = createError("dxil: HitObject shader tables are not bound");
+      return;
+    }
+    Value *record = g.CreateSelect(hit, hitContinuation(g, hg.export_index), miss.export_index);
+    storeFrameField(g, block, layout.block_size + 4, selected);
+    storeFrameWord(g, block, offsetof(SM50_RT_FRAME, RecordIndex), record);
+    storeFrameField(g, block, offsetof(SM50_RT_FRAME, LocalRootEntry), g.CreateSelect(hit, hg.local_entry, miss.local_entry));
+  });
+  return failure;
+}
+
+Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuilder<> &b) {
+  if (opcode == 262)
+    return lowerTraceRay(call, b, true);
+  if (opcode == 268) {
+    // DXR explicitly permits an implementation not to reorder the calling thread.
+    call.eraseFromParent();
+    return Error::success();
+  }
+  Value *replacement = nullptr;
+  if (opcode == 265 || opcode == 266 || opcode == 263 || opcode == 264) {
+    Value *block = allocateHitObject(b);
+    publishRuntimeContext(b, block);
+    if (opcode == 265) {
+      if (call.arg_size() != 11)
+        return createError("dxil: HitObject MakeMiss expects flags, index and a ray");
+      storeFrameField(b, block, layout.block_size, b.getInt32(2));
+      storeHitState(b, block, kRtHitRayFlags, call.getArgOperand(1));
+      storeHitState(b, block, kRtHitTMin, call.getArgOperand(6));
+      storeHitState(b, block, kRtHitTCurrent, call.getArgOperand(10));
+      for (unsigned i = 0; i < 3; ++i) {
+        storeHitState(b, block, kRtHitWorldOrigin + i * 4, call.getArgOperand(3 + i));
+        storeHitState(b, block, kRtHitWorldDirection + i * 4, call.getArgOperand(7 + i));
+      }
+      if (Error error = bindHitObject(b, block, call.getArgOperand(2)))
+        return error;
+    } else if (opcode == 263 || opcode == 264) {
+      // Query lowering owns the actual query. Snapshot at this exact instruction,
+      // before a later TraceRayInline/Proceed can mutate it.
+      const uint64_t attribute_bytes = opcode == 264 ? module.getDataLayout().getTypeStoreSize(
+        call.getArgOperand(3)->getType()->getPointerElementType()) : 0;
+      if (attribute_bytes > layout.attribute_size)
+        return createError("dxil: FromRayQuery attribute type exceeds configured size");
+      SmallVector<Value *, 10> args = {b.getInt32(opcode), call.getArgOperand(1), bytePointerOf(b, block),
+        b.getInt32(layout.hit_state), b.getInt32(layout.attribute), b.getInt32(layout.block_size),
+        b.getInt32(layout.attribute_size), opcode == 264 ? call.getArgOperand(2) : b.getInt32(0),
+        opcode == 264 ? bytePointerOf(b, call.getArgOperand(3)) : ConstantPointerNull::get(b.getInt8PtrTy()),
+        b.getInt32(attribute_bytes)};
+      SmallVector<Type *, 10> types;
+      for (Value *arg : args)
+        types.push_back(arg->getType());
+      b.CreateCall(module.getOrInsertFunction("dxmt.rayquery.hitobject_snapshot",
+        FunctionType::get(b.getVoidTy(), types, false)), args);
+    }
+    replacement = hitObjectValue(b, block, call.getType());
+  } else {
+    if (call.arg_size() < 2)
+      return createError("dxil: HitObject operation has no object");
+    Value *block = hitObjectBlock(b, call.getArgOperand(1));
+    Value *type = loadFrameField(b, block, layout.block_size, b.getInt32Ty());
+    if (opcode == 267) {
+      if (call.arg_size() != 3)
+        return createError("dxil: HitObject Invoke expects object and payload");
+      Value *payload = call.getArgOperand(2);
+      copyPayloadInto(b, block, payload);
+      Value *depth = b.CreateAdd(entry.depth ? entry.depth : b.getInt32(0), b.getInt32(1));
+      Value *limit = loadDispatchField(b, kRtRecursionDepth, b.getInt32Ty());
+      if (!limit)
+        limit = b.getInt32(context.max_recursion_depth);
+      Value *record = loadFrameField(b, block, offsetof(SM50_RT_FRAME, RecordIndex), b.getInt32Ty());
+      Value *within_depth = b.CreateICmpULE(depth, limit);
+      Value *flags = readHitState(b, block, kRtHitRayFlags, b.getInt32Ty());
+      Value *skip = b.CreateAnd(b.CreateICmpEQ(type, b.getInt32(1)),
+        b.CreateICmpNE(b.CreateAnd(flags, b.getInt32(kRayFlagSkipClosestHitShader)), b.getInt32(0)));
+      Value *allowed = b.CreateAnd(within_depth,
+        b.CreateAnd(b.CreateICmpNE(record, b.getInt32(kRtRecordIndexNone)), b.CreateNot(skip)));
+      storeFrameWord(b, block, offsetof(SM50_RT_FRAME, Depth), depth);
+      storeFrameWord(b, block, offsetof(SM50_RT_FRAME, Flags), b.CreateSelect(within_depth,
+        b.getInt32(0), b.getInt32(kRtFrameFlagRecursionExceeded)));
+      emitConditional(b, allowed, "rt.hitobject.invoke", [&](IRBuilder<> &g) {
+        callVisibleFunction(g, block, record, depth);
+        copyPayloadBack(g, block, payload);
+      });
+    } else if (opcode == 287) {
+      if (Error error = bindHitObject(b, block, call.getArgOperand(2)))
+        return error;
+      replacement = hitObjectValue(b, block, call.getType());
+    } else if (opcode >= 269 && opcode <= 271) {
+      replacement = b.CreateICmpEQ(type, b.getInt32(opcode == 269 ? 2 : opcode == 270 ? 1 : 0));
+    } else if (opcode == 286) {
+      replacement = loadFrameField(b, block, layout.block_size + 4, b.getInt32Ty());
+    } else if (opcode == 288) {
+      Value *root = loadFrameField(b, block, offsetof(SM50_RT_FRAME, LocalRootEntry), b.getInt64Ty());
+      replacement = emitGuardedValue(b, b.CreateICmpNE(root, b.getInt64(0)), b.getInt32(0),
+        "rt.hitobject.rootconstant", [&](IRBuilder<> &g) -> Value * {
+          Value *address = g.CreateAdd(root, g.CreateZExt(call.getArgOperand(2), g.getInt64Ty()));
+          return g.CreateAlignedLoad(g.getInt32Ty(), g.CreateIntToPtr(address, g.getInt32Ty()->getPointerTo(1)), Align(1));
+        });
+    } else if (opcode == 289) {
+      Type *attributes = call.getArgOperand(2)->getType()->getPointerElementType();
+      uint64_t size = module.getDataLayout().getTypeStoreSize(attributes);
+      if (size > layout.attribute_size)
+        return createError("dxil: HitObject attribute type exceeds configured attribute size");
+      emitMemcpy(module, b, call.getArgOperand(2),
+        b.CreateGEP(b.getInt8Ty(), bytePointerOf(b, block), b.getInt32(layout.attribute)), size);
+    } else {
+      uint32_t offset = 0;
+      switch (opcode) {
+      case 272: offset = kRtHitRayFlags; break;
+      case 273: offset = kRtHitTMin; break;
+      case 274: offset = kRtHitTCurrent; break;
+      case 275: offset = kRtHitWorldOrigin; break;
+      case 276: offset = kRtHitWorldDirection; break;
+      case 277: offset = kRtHitObjectOrigin; break;
+      case 278: offset = kRtHitObjectDirection; break;
+      case 279: offset = kRtHitObjectToWorld; break;
+      case 280: offset = kRtHitWorldToObject; break;
+      case 281: offset = kRtHitGeometryIndex; break;
+      case 282: offset = kRtHitInstanceIndex; break;
+      case 283: offset = kRtHitInstanceID; break;
+      case 284: offset = kRtHitPrimitiveIndex; break;
+      case 285: offset = kRtHitKind; break;
+      default: return createError("dxil: invalid HitObject state opcode");
+      }
+      if (opcode >= 275 && opcode <= 280) {
+        auto *component = dyn_cast<ConstantInt>(call.getArgOperand(2));
+        if (!component || component->getZExtValue() > 2)
+          return createError("dxil: HitObject component must be constant 0..2");
+        offset += uint32_t(component->getZExtValue()) * 4;
+        if (opcode == 279 || opcode == 280) {
+          auto *column = dyn_cast<ConstantInt>(call.getArgOperand(3));
+          if (!column || column->getZExtValue() > 3)
+            return createError("dxil: HitObject matrix column must be constant 0..3");
+          offset += uint32_t(column->getZExtValue()) * 12;
+        }
+      }
+      replacement = readHitState(b, block, offset, call.getType());
+    }
+  }
+  if (replacement)
+    call.replaceAllUsesWith(replacement);
+  call.eraseFromParent();
+  return Error::success();
+}
+
+
 Error RaytracingLowerer::lowerCall(
   CallInst &call, uint32_t opcode, IRBuilder<> &builder
 ) {
+  if (opcode >= 262 && opcode <= 289)
+    return lowerHitObject(call, opcode, builder);
   switch (opcode) {
   case OpTraceRay:
     return lowerTraceRay(call, builder);
@@ -2508,6 +2775,93 @@ Error RaytracingLowerer::lowerCall(
 }
 
 Error RaytracingLowerer::run() {
+  if (auto *carrier = StructType::getTypeByName(module.getContext(), "dx.types.HitObject")) {
+    // DXC inlines resource-shaped helpers before producing validated DXIL. Its
+    // remaining lifetime hints still describe the original four-byte carrier;
+    // they must not permit reuse of a live expanded snapshot.
+    SmallVector<IntrinsicInst *, 8> lifetime_hints;
+    for (Function &function : module)
+      if (!function.isDeclaration())
+      for (BasicBlock &block : function)
+        for (Instruction &instruction : block)
+          if (auto *hint = dyn_cast<IntrinsicInst>(&instruction))
+            if (hint->getIntrinsicID() == Intrinsic::lifetime_start || hint->getIntrinsicID() == Intrinsic::lifetime_end) {
+              Value *storage = hint->getArgOperand(1)->stripPointerCasts();
+              if (storage->getType()->getPointerElementType() == carrier)
+                lifetime_hints.push_back(hint);
+            }
+    for (IntrinsicInst *hint : lifetime_hints)
+      hint->eraseFromParent();
+    auto *snapshot = StructType::get(module.getContext(), {ArrayType::get(Type::getInt8Ty(module.getContext()), layout.frame_size),
+      ArrayType::get(Type::getInt8Ty(module.getContext()), sizeof(SM50_RT_HIT_STATE)),
+      ArrayType::get(Type::getInt8Ty(module.getContext()), layout.attribute_size),
+      Type::getInt32Ty(module.getContext()), Type::getInt32Ty(module.getContext())});
+    class HitObjectTypes final : public ValueMapTypeRemapper {
+      DenseMap<Type *, Type *> mapped;
+    public:
+      HitObjectTypes(Type *old_type, Type *new_type) { mapped[old_type] = new_type; }
+      Type *remapType(Type *type) override {
+        if (auto found = mapped.find(type); found != mapped.end())
+          return found->second;
+        mapped[type] = type;
+        Type *result = type;
+        if (auto *array = dyn_cast<ArrayType>(type))
+          result = ArrayType::get(remapType(array->getElementType()), array->getNumElements());
+        else if (auto *pointer = dyn_cast<PointerType>(type); pointer && !pointer->isOpaque())
+          result = PointerType::get(remapType(pointer->getNonOpaquePointerElementType()), pointer->getAddressSpace());
+        else if (auto *function = dyn_cast<FunctionType>(type)) {
+          SmallVector<Type *, 8> args;
+          for (Type *argument : function->params())
+            args.push_back(remapType(argument));
+          result = FunctionType::get(remapType(function->getReturnType()), args, function->isVarArg());
+        } else if (auto *structure = dyn_cast<StructType>(type); structure && !structure->isOpaque()) {
+          SmallVector<Type *, 8> fields;
+          bool changed = false;
+          for (Type *field : structure->elements()) {
+            fields.push_back(remapType(field));
+            changed |= fields.back() != field;
+          }
+          if (changed)
+            result = StructType::get(type->getContext(), fields, structure->isPacked());
+        }
+        mapped[type] = result;
+        return result;
+      }
+    } types(carrier, snapshot);
+    // LLVM identified types are immutable once defined. Remap storage and DXIL
+    // declarations, keeping the already-lowered AIR entry and its local frame.
+    ValueToValueMapTy values;
+    SmallVector<Function *, 16> replaced;
+    for (Function &function : module) {
+      auto *type = cast<FunctionType>(types.remapType(function.getFunctionType()));
+      if (type == function.getFunctionType())
+        continue;
+      auto *replacement = Function::Create(type, function.getLinkage(), function.getAddressSpace(), "", &module);
+      replacement->copyAttributesFrom(&function);
+      replacement->takeName(&function);
+      values[&function] = replacement;
+      auto argument = replacement->arg_begin();
+      for (Argument &old : function.args()) {
+        argument->setName(old.getName());
+        values[&old] = &*argument++;
+      }
+      if (!function.isDeclaration()) {
+        SmallVector<ReturnInst *, 8> returns;
+        CloneFunctionInto(replacement, &function, values, CloneFunctionChangeType::GlobalChanges, returns, "", nullptr, &types);
+      }
+      replaced.push_back(&function);
+    }
+    for (Function &function : module)
+      if (!llvm::is_contained(replaced, &function))
+        for (BasicBlock &block : function)
+          for (Instruction &instruction : block)
+            RemapInstruction(&instruction, values, RF_IgnoreMissingLocals, &types);
+
+    for (Function *function : replaced)
+      function->dropAllReferences();
+    for (Function *function : replaced)
+      function->eraseFromParent();
+  }
   SmallVector<std::pair<CallInst *, uint32_t>, 32> worklist;
   SmallVector<CallInst *, 4> inline_traces;
   for (Function &function : module) {
@@ -2734,6 +3088,10 @@ llvm::Error ResolveRaytracingEntryArguments(
 llvm::Error LowerRaytracingOperations(
   ModuleInfo &info, const RaytracingExportContext &context, llvm::StringRef entry_name
 ) {
+  // SM6.9 queries opt in explicitly; only older queries inherit the pipeline flag.
+  const bool legacy_omm = (context.pipeline_flags & 0x400) &&
+    info.shader_model_major == 6 && info.shader_model_minor < 9;
+  info.module->addModuleFlag(Module::Override, "dxmt.rayquery.allowOMM", legacy_omm ? 1u : 0u);
   RaytracingEntryArguments arguments;
   if (Error error = ResolveRaytracingEntryArguments(*info.module, entry_name, arguments))
     return error;

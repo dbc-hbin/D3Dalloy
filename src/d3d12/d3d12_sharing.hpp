@@ -32,47 +32,12 @@
  * verified again after resolving.
  */
 
-#include "d3d12.h"
+#include "d3d12_shared_metadata.hpp"
 #include <cstdint>
 #include <memory>
 #include <mutex>
 
 namespace dxmt::sharing {
-
-enum class Kind : uint32_t {
-  Heap = 1,
-  Buffer = 2,
-  Texture = 3,
-  Fence = 4,
-};
-
-constexpr uint64_t kPayloadOffset = 0x10000;
-constexpr uint32_t kSlotCount = 64;
-
-struct Slot {
-  uint32_t pid;
-  uint32_t reserved;
-  char name[64];
-};
-
-struct Header {
-  uint64_t magic;
-  uint32_t version;
-  Kind kind;
-  uint8_t token[16];
-  uint64_t payload_offset;
-  uint64_t payload_size;
-  uint64_t identity;
-  D3D12_HEAP_DESC heap_desc;
-  D3D12_HEAP_PROPERTIES heap_props;
-  D3D12_HEAP_FLAGS heap_flags;
-  D3D12_FENCE_FLAGS fence_flags;
-  D3D12_RESOURCE_DESC resource_desc;
-  volatile LONG lock;
-  uint32_t reserved;
-  Slot slots[kSlotCount];
-};
-static_assert(sizeof(Header) <= kPayloadOffset);
 
 /* One mapped share per section per process; every device of the process reuses it. */
 struct SharedObjectAccess;
@@ -91,7 +56,8 @@ public:
   /* Resolves an owned object send right from any live holder; 0 on failure. */
   uint32_t lookUpPort();
 
-  HRESULT createHandle(const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle);
+  HRESULT createHandle(const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, LUID creator_luid,
+                       HANDLE *handle);
 
   SharedObject(const SharedObject &) = delete;
   SharedObject &operator=(const SharedObject &) = delete;

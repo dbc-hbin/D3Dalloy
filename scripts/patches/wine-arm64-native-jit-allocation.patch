@@ -1,0 +1,107 @@
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1768,3 +1768,4 @@
+ @ stdcall __wine_ctrl_routine(ptr)
+ @ stdcall -private -norelay -arch=arm64,arm64ec __wine_jit_write_protect(long)
++@ stdcall -private -norelay -arch=arm64 __wine_allocate_native_jit(ptr ptr)
+ @ extern -private __wine_syscall_dispatcher
+diff --git a/dlls/ntdll/unixlib.h b/dlls/ntdll/unixlib.h
+--- a/dlls/ntdll/unixlib.h
++++ b/dlls/ntdll/unixlib.h
+@@ -88,5 +88,12 @@
+     BOOL previous;
+ };
+ 
++/* Native ARM64 allocation; neither pointer-width nor ARM64EC code metadata. */
++struct allocate_native_jit_params
++{
++    ULONGLONG base;
++    ULONGLONG size;
++};
++
+ enum ntdll_unix_funcs
+ {
+@@ -104,3 +111,4 @@
+     unix_get_current_teb,
+     unix_jit_write_protect,
++    unix_allocate_native_jit,
+ };
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -3422,3 +3422,19 @@
+ /***********************************************************************
++ *           __wine_allocate_native_jit
++ */
++NTSTATUS WINAPI __wine_allocate_native_jit( void **base, SIZE_T *size )
++{
++    struct allocate_native_jit_params params = { (ULONG_PTR)*base, *size };
++    NTSTATUS status = WINE_UNIX_CALL( unix_allocate_native_jit, &params );
++
++    if (!status)
++    {
++        *base = (void *)(ULONG_PTR)params.base;
++        *size = params.size;
++    }
++    return status;
++}
++
++/***********************************************************************
+  *           __wine_jit_write_protect
+  *
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -407,3 +407,4 @@
+ extern NTSTATUS unixcall_get_current_teb( void *args );
++extern NTSTATUS unixcall_allocate_native_jit( void *args );
+ extern struct _TEB * volatile *current_teb_ptr;
+ #ifdef _WIN64
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1055,3 +1055,4 @@
+     unixcall_get_current_teb,
+     unixcall_jit_write_protect,
++    unixcall_allocate_native_jit,
+ };
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2226,5 +2226,35 @@
+ #endif
+ 
+ 
++NTSTATUS unixcall_allocate_native_jit( void *args )
++{
++#if defined(__APPLE__) && defined(__aarch64__)
++    struct allocate_native_jit_params *params = args;
++    struct file_view *view;
++    sigset_t sigset;
++    SIZE_T size;
++    NTSTATUS status;
++
++    /* This private API creates committed native JIT buffers only. It does
++     * not label them ARM64EC or permit fixed-address reservation/recommit. */
++    if (params->base || !params->size || params->size > ~(SIZE_T)0 - host_page_mask)
++        return STATUS_INVALID_PARAMETER;
++    size = ROUND_SIZE( 0, params->size, host_page_mask );
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    status = map_native_jit_view( &view, NULL, size,
++                                 VPROT_NATIVE_JIT | VPROT_COMMITTED | VPROT_READ | VPROT_WRITE | VPROT_EXEC,
++                                 0, 0, granularity_mask );
++    if (!status)
++    {
++        params->base = (ULONG_PTR)view->base;
++        params->size = size;
++    }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    return status;
++#else
++    return STATUS_NOT_SUPPORTED;
++#endif
++}
++
+ /***********************************************************************
+  *           find_reserved_free_area_outside_preloader

@@ -30,6 +30,8 @@ DEFINE_COM_INTERFACE("6c030003-460a-4b19-909b-38f97d203e45",
       IDXGISwapChain1 **ppSwapChain) = 0;
 };
 
+enum class DXMTSwapChainKind { Hwnd, CoreWindow, Composition };
+
 // D3D12-only creation path: validate the optional output before fullscreen
 // setup, without changing the shared swapchain factory ABI used by D3D11.
 DEFINE_COM_INTERFACE("ba5a922b-fee8-40ae-8c74-599855edebb7", IMTLD3D12SwapChainFactory)
@@ -37,8 +39,16 @@ DEFINE_COM_INTERFACE("ba5a922b-fee8-40ae-8c74-599855edebb7", IMTLD3D12SwapChainF
   virtual HRESULT STDMETHODCALLTYPE CreateSwapChainWithOutput(
       IDXGIFactory1 *factory, HWND window, const DXGI_SWAP_CHAIN_DESC1 *desc,
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc, IDXGIOutput *restrict_output,
-      IDXGISwapChain1 **swapchain) = 0;
+      IDXGISwapChain1 **swapchain, IUnknown *core_window, DXMTSwapChainKind kind) = 0;
 };
+
+// Public CoreWindow.idl ABI; the MinGW SDK does not ship CoreWindow.h.
+DEFINE_COM_INTERFACE("45d64a29-a63e-4cb6-b498-5781d298cb4f", DXMTCoreWindowInterop)
+    : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND *window) = 0;
+  virtual HRESULT STDMETHODCALLTYPE put_MessageHandled(boolean value) = 0;
+};
+static constexpr IID DXMT_CORE_WINDOW_IID = dxmt::guid::make_guid("79b9d5f2-879e-4b89-b798-79e47598030c");
 
 static constexpr IID DXMT_NVEXT_GUID = dxmt::guid::make_guid("ba0af616-4a43-4259-815c-db3b89829905");
 

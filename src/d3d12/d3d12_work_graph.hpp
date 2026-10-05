@@ -3,6 +3,8 @@
 #include "d3d12_device_child.hpp"
 #include "dxil_workgraph.h"
 #include <memory>
+#include <functional>
+#include <span>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -32,6 +34,7 @@ public:
     WMT::Reference<WMT::ComputePipelineState> pipeline;
     ShaderImmutableConstants constants;
     WMTSize threads{};
+    bool atomic64_phase = false;
   };
   struct Graph {
     std::wstring name;
@@ -114,19 +117,32 @@ private:
 };
 
 struct WorkGraphDispatch {
+  ~WorkGraphDispatch();
   struct Input { uint32_t entry, count; uint64_t address, stride; std::vector<uint8_t> records; };
   Com<MTLD3D12WorkGraph> object;
   uint32_t graph = 0, mode = 0;
   D3D12_SET_WORK_GRAPH_DESC program{};
   uint64_t gpu_input = 0;
+  uint32_t max_gpu_records = UINT32_MAX, max_gpu_node_inputs = UINT32_MAX;
   std::vector<Input> inputs;
   WMT::Reference<WMT::Buffer> arguments;
   uint64_t roots = 0, samplers = 0;
+  std::unique_ptr<std::vector<StandardSwizzleTableUse>> atomic64_tables;
+  std::vector<Atomic64RootBinding> atomic64_roots;
+  Com<MTLD3D12DescriptorHeap, false> atomic64_heap;
 };
 
 HRESULT CreateWorkGraphStateObject(MTLD3D12Device *device, const D3D12_STATE_OBJECT_DESC *desc,
                                  ID3D12StateObject *parent, REFIID riid, void **object);
 bool IsWorkGraphCollection(const D3D12_STATE_OBJECT_DESC *desc);
-HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, const WorkGraphDispatch &dispatch);
+// Queue-owned texture transfers and scratch survive every native graph buffer.
+// Callbacks run under the executor admission, without a nested queue commit.
+struct WorkGraphTexturePublisher {
+  std::function<HRESULT(WMT::MTL4CommandBuffer, WMT::Fence,
+      std::span<const StandardSwizzleTableUse>, std::span<const StandardSwizzleTableUse>)> begin;
+  std::function<HRESULT(WMT::MTL4CommandBuffer, WMT::Fence)> end;
+};
+HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, const WorkGraphDispatch &dispatch,
+                        const WorkGraphTexturePublisher &textures);
 
 } // namespace dxmt

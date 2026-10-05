@@ -29,6 +29,7 @@
 #include "d3d12_device_child.hpp"
 #include "d3d12_dxil_subobjects.hpp"
 #include "d3d12_pipeline.hpp"
+#include "d3d12_pipeline_cache.hpp"
 #include "dxil_raytracing.h"
 #include "log/log.hpp"
 
@@ -219,7 +220,7 @@ void ApplyAssociable(MTLD3D12StateObject::Export &entry, const Associable &value
 bool ValidPipelineConfig(const D3D12_RAYTRACING_PIPELINE_CONFIG1 &config) {
   return config.MaxTraceRecursionDepth <= D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH &&
          !(config.Flags & ~(D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_TRIANGLES |
-                            D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES));
+                            D3D12_RAYTRACING_PIPELINE_FLAG_SKIP_PROCEDURAL_PRIMITIVES | D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS));
 }
 
 
@@ -783,7 +784,7 @@ class MTLD3D12StateObjectImpl final
     desc.MaxPayloadSize = max_payload;
     desc.MaxAttributeSize = max_attribute;
     desc.Flags = static_cast<uint32_t>(pipeline_flags_);
-    desc.MetalVersion = SM50_SHADER_METAL_310;
+    desc.MetalVersion = kD3D12ShaderMetalVersion;
     /*
      * The traversal reads the payload and attribute sizes from the dispatch
      * constants, so the state object has to publish the same values it handed the
@@ -822,6 +823,8 @@ class MTLD3D12StateObjectImpl final
     }
     functions.resize(function_count);
 
+    HRESULT constants_result = immutable_constants.Initialize(device_, metallib, bitcode);
+    if (FAILED(constants_result)) return constants_result;
     WMT::Reference<WMT::Error> metal_error;
     auto library = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(metallib.Data, metallib.Size), metal_error);
     if (!library) {
@@ -836,6 +839,7 @@ class MTLD3D12StateObjectImpl final
     obj_handle_t dispatch_entry_function = NULL_OBJECT_HANDLE;
     for (size_t i = 0; i < functions.size(); ++i) {
       const auto &function = functions[i];
+      uses_atomic64 |= (function.Flags & SM50_RT_FUNCTION_FLAG_DEVICE_ATOMIC64_PHASE) != 0;
       if (!function.Name || !*function.Name) {
         ERR("RT reflection returned an unnamed function");
         return E_FAIL;
@@ -859,7 +863,7 @@ class MTLD3D12StateObjectImpl final
         exports_[function.ExportIndex].compiled = true;
         exports_[function.ExportIndex].metal_function = function.Name;
       }
-      if ((function.Kind == SM50_RT_FUNCTION_RAYGEN && !function.IsDispatchEntry) ||
+      if ((function.Kind == SM50_RT_FUNCTION_RAYGEN && !(function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY)) ||
           function.Kind == SM50_RT_FUNCTION_INTERSECTION) {
         /*
          * Raygen and intersection dispatchers inline these export bodies; they
@@ -872,7 +876,7 @@ class MTLD3D12StateObjectImpl final
         ERR("RT metallib function not found: ", function.Name);
         return E_FAIL;
       }
-      if (function.IsDispatchEntry) {
+      if (function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY) {
         if (function.Kind != SM50_RT_FUNCTION_RAYGEN) {
           ERR("RT reflection marked a non-raygen function as the dispatch entry: ", function.Name);
           return E_FAIL;
@@ -976,7 +980,7 @@ class MTLD3D12StateObjectImpl final
     }
     for (size_t i = 0; i < functions.size(); ++i) {
       const auto &function = functions[i];
-      if (function.IsDispatchEntry || function.Kind != SM50_RT_FUNCTION_VISIBLE)
+      if ((function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY) || function.Kind != SM50_RT_FUNCTION_VISIBLE)
         continue;
       if (function.ExportIndex >= exports_.size()) {
         ERR("RT reflection returned an export index outside the export table: ", function.ExportIndex);
@@ -1204,7 +1208,7 @@ private:
         if (!ValidPipelineConfig(value.pipeline_config))
           return RejectStateObject(
               "a raytracing pipeline config recursion depth outside 0..D3D12_RAYTRACING_MAX_DECLARABLE_TRACE_RECURSION_DEPTH "
-              "or a flag outside SKIP_TRIANGLES | SKIP_PROCEDURAL_PRIMITIVES"
+              "or a flag outside SKIP_TRIANGLES | SKIP_PROCEDURAL_PRIMITIVES | ALLOW_OPACITY_MICROMAPS"
           );
         api_associables.emplace(i, associables.size());
         associables.push_back(value);

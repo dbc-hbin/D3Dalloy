@@ -79,11 +79,21 @@ void PruneUnusedLibraryResources(ModuleInfo &info) {
     for (Function &function : *info.module) for (BasicBlock &block : function) for (Instruction &instruction : block) {
       auto *call = dyn_cast<CallInst>(&instruction);
       auto *callee = call ? call->getCalledFunction() : nullptr;
-      if (!callee || call->arg_size() < 3) continue;
-      if (callee->getName().startswith("dx.op.createHandle.")) {
+      if (!callee) continue;
+      if (callee->getName().startswith("dx.op.createHandleForLib.") && call->arg_size() >= 2) {
+        // DXC can strip the resource symbol to undef while retaining its name.
+        // Match the actual library handle global exactly as resource lowering
+        // does; llvm.used alone must still not keep an unreachable declaration.
+        Value *symbol = call->getArgOperand(1);
+        if (auto *load = dyn_cast<LoadInst>(symbol)) symbol = load->getPointerOperand();
+        else if (auto *gep = dyn_cast<GEPOperator>(symbol)) symbol = gep->getPointerOperand();
+        auto *global = dyn_cast<GlobalVariable>(symbol->stripPointerCasts());
+        if (global && ((resource.symbol && resource.symbol->stripPointerCasts() == global) ||
+            (!resource.name.empty() && global->getName().contains("?" + resource.name + "@@")))) return false;
+      } else if (callee->getName().startswith("dx.op.createHandle.") && call->arg_size() >= 3) {
         auto *klass = dyn_cast<ConstantInt>(call->getArgOperand(1)); auto *id = dyn_cast<ConstantInt>(call->getArgOperand(2));
         if (klass && id && klass->getZExtValue() == uint32_t(resource.klass) && id->getZExtValue() == resource.declaration_id) return false;
-      } else if (callee->getName().startswith("dx.op.createHandleFromBinding.")) {
+      } else if (callee->getName().startswith("dx.op.createHandleFromBinding.") && call->arg_size() >= 3) {
         auto *binding = dyn_cast<Constant>(call->getArgOperand(1));
         if (!binding) continue;
         auto *lower = dyn_cast_or_null<ConstantInt>(binding->getAggregateElement(0u));
@@ -753,7 +763,8 @@ Error NodeLowering::lowerCall(CallInst &call, uint32_t opcode) {
     auto handle = recordHandle(call.getArgOperand(1));
     if (!handle)
       return handle.takeError();
-    const bool coherent = handle->input && (node.info.Input.Flags & SM50_WG_IO_READ_WRITE);
+    const bool coherent = handle->input && (node.info.Input.Flags & SM50_WG_IO_READ_WRITE) &&
+                          !module.getModuleFlag(kAtomic64PhaseFlag);
     auto *index = b.CreateAdd(handle->base, call.getArgOperand(2));
     auto *address = recordAddress(b, handle->queue, index);
     auto *type = cast<PointerType>(call.getType());
@@ -800,6 +811,12 @@ Error NodeLowering::lowerCall(CallInst &call, uint32_t opcode) {
           }
           continue;
         } else if (auto *rmw = dyn_cast<AtomicRMWInst>(inst)) {
+          if (rmw->getValOperand()->getType()->isIntegerTy(64) && module.getModuleFlag(kAtomic64PhaseFlag)) {
+            // Record payloads participate in the same canonical device cells as
+            // UAVs; the runtime registers the actual queue/CPU-seed payload span.
+            rmw->setOperand(rmw->getPointerOperandIndex(), new_value);
+            continue;
+          }
           /* Device-scope AIR atomics (air.atomic.global.*), as for UAV atomics. */
           IRBuilder<> g(rmw);
           llvm::air::AIRBuilder air(g, nulls());
@@ -813,8 +830,10 @@ Error NodeLowering::lowerCall(CallInst &call, uint32_t opcode) {
           continue;
         } else if (auto *exchange = dyn_cast<AtomicCmpXchgInst>(inst)) {
           exchange->setOperand(exchange->getPointerOperandIndex(), new_value);
-          exchange->setSuccessOrdering(AtomicOrdering::Monotonic);
-          exchange->setFailureOrdering(AtomicOrdering::Monotonic);
+          if (!module.getModuleFlag(kAtomic64PhaseFlag)) {
+            exchange->setSuccessOrdering(AtomicOrdering::Monotonic);
+            exchange->setFailureOrdering(AtomicOrdering::Monotonic);
+          }
           continue;
         } else {
           std::string text;
@@ -1020,6 +1039,9 @@ Error compileNode(const SM50_WG_NODE_COMPILE_DESC &desc, SM50CompiledBitcodeInte
     Module &module = *info.module;
     isolateExport(module, *info.entry);
     PruneUnusedLibraryResources(info);
+    out.HasAtomic64 = HasDeviceAtomic64(module) ? 1 : 0;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{nullptr, SM50_SHADER_D3D12_ATOMIC64_PHASE};
+    if (out.HasAtomic64) InitializeAtomic64Phase(module, &atomic_phase);
     PrepareModuleStorage(module);
     dxbc::SM50ShaderInternal shader;
     PopulateShaderResourceBindings(shader.shader_info, info.resources);
@@ -1075,6 +1097,9 @@ Error compileNode(const SM50_WG_NODE_COMPILE_DESC &desc, SM50CompiledBitcodeInte
   isolateExport(module, *info.entry);
   if (module.getDataLayout().getPointerSizeInBits() != 64)
     dxmt::initializeModule(module);
+  out.HasAtomic64 = HasDeviceAtomic64(module) ? 1 : 0;
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{nullptr, SM50_SHADER_D3D12_ATOMIC64_PHASE};
+  if (out.HasAtomic64) InitializeAtomic64Phase(module, &atomic_phase);
   dxbc::setup_metal_version(module, (SM50_SHADER_METAL_VERSION)desc.MetalVersion);
   PrepareModuleStorage(module);
 
@@ -1238,6 +1263,7 @@ Error compileNode(const SM50_WG_NODE_COMPILE_DESC &desc, SM50CompiledBitcodeInte
   StripDXILArtifacts(module);
   if (verifyModule(module, &errs()))
     return createError("work graph node compilation produced invalid IR");
+  if (auto error = LowerAtomic64Phase(module)) return error;
   dxmt::runOptimizationPasses(module);
   if (auto error = LowerImmutableConstants(module, compiled))
     return error;

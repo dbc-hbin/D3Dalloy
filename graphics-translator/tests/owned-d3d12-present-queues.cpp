@@ -668,7 +668,7 @@ void run() {
           "occlusion-does-not-accept-frame");
   require(WaitForSingleObject(unscaledWaitable, kCompletionTimeoutMs) == WAIT_OBJECT_0,
           "occluded-frame-restores-waitable-credit");
-  ShowWindow(window.get(), SW_RESTORE);
+  ShowWindow(window.get(), SW_SHOWNOACTIVATE);
   check(swapchain->Present(0, DXGI_PRESENT_TEST), "restored-window-test-status");
   require(presentCompletes(swapchain.Get(), unscaledWaitable, kCompletionTimeoutMs),
           "restored-window-presents");

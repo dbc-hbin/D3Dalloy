@@ -5,12 +5,14 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <type_traits>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -48,6 +50,30 @@ void pass(const char *name) {
   ++g_cases;
   std::printf("OWNED_D3D12_SHARING_CASE %s status=PASS\n", name);
   std::fflush(stdout);
+}
+
+void verifySharedAdapter(HANDLE handle, LUID expected) {
+  ComPtr<IDXGIFactory4> factory;
+  check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "shared adapter factory");
+  LUID actual{0x12345678, 0x12345678};
+  check(factory->GetSharedResourceAdapterLuid(handle, &actual), "GetSharedResourceAdapterLuid");
+  if (actual.LowPart != expected.LowPart || actual.HighPart != expected.HighPart)
+    fail("shared adapter differs from creator");
+  ComPtr<IDXGIAdapter1> adapter;
+  check(factory->EnumAdapterByLuid(actual, IID_PPV_ARGS(&adapter)), "shared adapter selection");
+  DXGI_ADAPTER_DESC1 desc{};
+  check(adapter->GetDesc1(&desc), "shared adapter description");
+  if (desc.AdapterLuid.LowPart != expected.LowPart || desc.AdapterLuid.HighPart != expected.HighPart)
+    fail("shared adapter description differs from creator");
+}
+
+void rejectSharedAdapter(HANDLE handle) {
+  ComPtr<IDXGIFactory2> factory;
+  check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "invalid shared adapter factory");
+  LUID actual{0x12345678, 0x12345678};
+  expect(factory->GetSharedResourceAdapterLuid(handle, &actual), DXGI_ERROR_INVALID_CALL, "invalid shared adapter");
+  if (actual.LowPart || actual.HighPart)
+    fail("invalid shared adapter output not cleared");
 }
 
 void requireOwnedBackend() {
@@ -273,10 +299,20 @@ HANDLE share(Device &d, ID3D12DeviceChild *object, const wchar_t *name = nullptr
   check(d.device->CreateSharedHandle(object, nullptr, GENERIC_ALL, name, &h), "CreateSharedHandle");
   if (!h)
     fail("CreateSharedHandle null");
+  ComPtr<ID3D12Fence> fence;
+  if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&fence)))) {
+    rejectSharedAdapter(h);
+  } else {
+    ComPtr<ID3D12Device> creator;
+    check(object->GetDevice(IID_PPV_ARGS(&creator)), "shared object creator device");
+    verifySharedAdapter(h, creator->GetAdapterLuid());
+  }
   return h;
 }
 
 template <typename T> ComPtr<T> open(Device &d, HANDLE h, const char *step) {
+  if constexpr (!std::is_same_v<T, ID3D12Fence>)
+    verifySharedAdapter(h, d.device->GetAdapterLuid());
   ComPtr<T> out;
   check(d.device->OpenSharedHandle(h, IID_PPV_ARGS(&out)), step);
   return out;
@@ -482,9 +518,11 @@ void errorCases(Device &a, Device &b) {
   expect(b.device->OpenSharedHandle(reinterpret_cast<HANDLE>(0x7ffc), IID_PPV_ARGS(&out)), E_INVALIDARG,
          "garbage handle");
   HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  rejectSharedAdapter(event);
   expect(b.device->OpenSharedHandle(event, IID_PPV_ARGS(&out)), E_INVALIDARG, "event handle");
   CloseHandle(event);
   HANDLE anon = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 1 << 20, nullptr);
+  rejectSharedAdapter(anon);
   expect(b.device->OpenSharedHandle(anon, IID_PPV_ARGS(&out)), E_INVALIDARG, "unrelated section");
   CloseHandle(anon);
   // A section that mimics the naming scheme but carries a forged header/token.
@@ -496,11 +534,12 @@ void errorCases(Device &a, Device &b) {
   auto *bytes = static_cast<uint8_t *>(MapViewOfFile(forged, FILE_MAP_WRITE, 0, 0, 0));
   const uint64_t magic = 0x5245485354584d44ull;
   std::memcpy(bytes, &magic, 8);
-  const uint32_t version = 1, kind = 2;
+  const uint32_t version = 2, kind = 2;
   std::memcpy(bytes + 8, &version, 4);
   std::memcpy(bytes + 12, &kind, 4);
   std::memset(bytes + 16, 0xa5, 16); // token disagrees with the name
   UnmapViewOfFile(bytes);
+  rejectSharedAdapter(forged);
   expect(b.device->OpenSharedHandle(forged, IID_PPV_ARGS(&out)), E_INVALIDARG, "forged token");
   CloseHandle(forged);
   // A forged named link pointing at a real share with the wrong token.
@@ -511,6 +550,7 @@ void errorCases(Device &a, Device &b) {
   auto *lv = static_cast<uint8_t *>(MapViewOfFile(link, FILE_MAP_WRITE, 0, 0, 0));
   lv[8] ^= 0xff; // corrupt the token copy in the link
   UnmapViewOfFile(lv);
+  rejectSharedAdapter(link);
   expect(b.device->OpenSharedHandle(link, IID_PPV_ARGS(&out)), E_INVALIDARG, "stale link token");
   CloseHandle(link);
   CloseHandle(hv);
@@ -1014,9 +1054,203 @@ void crossProcess(Device &a, Device &b) {
   pass("cross-process-unobserved-rewind-latches");
 }
 
+int adapterLuidChildMain(const wchar_t *name, LUID expected) {
+  g_role = "adapter-luid-child";
+  requireOwnedBackend();
+  ComPtr<ID3D12Device> device;
+  check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "identity child device");
+  HANDLE handle = nullptr;
+  check(device->OpenSharedHandleByName(name, GENERIC_ALL, &handle), "identity child named handle");
+  verifySharedAdapter(handle, expected);
+  HANDLE duplicate = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    fail("identity child duplicate");
+  CloseHandle(handle);
+  verifySharedAdapter(duplicate, expected);
+  CloseHandle(duplicate);
+  std::printf("OWNED_D3D12_SHARING_ADAPTER_LUID_CHILD low=%08lx high=%08lx\n",
+              static_cast<unsigned long>(expected.LowPart), static_cast<unsigned long>(expected.HighPart));
+  return 0;
+}
+
+void adapterLuidLifetimeCase(Device &a, Device &b) {
+  ComPtr<IDXGIFactory4> enumerator;
+  check(CreateDXGIFactory1(IID_PPV_ARGS(&enumerator)), "identity enumerate factory");
+  UINT adapterCount = 0;
+  for (;; ++adapterCount) {
+    ComPtr<IDXGIAdapter1> adapter;
+    HRESULT hr = enumerator->EnumAdapters1(adapterCount, &adapter);
+    if (hr == DXGI_ERROR_NOT_FOUND)
+      break;
+    check(hr, "identity enumerate actual adapter");
+    DXGI_ADAPTER_DESC1 adapterDesc{};
+    check(adapter->GetDesc1(&adapterDesc), "identity actual adapter desc");
+    ComPtr<ID3D12Device> actualDevice;
+    check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&actualDevice)),
+          "identity actual adapter device");
+    auto properties = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto desc = bufferDesc(kBytes);
+    ComPtr<ID3D12Resource> actualResource;
+    check(actualDevice->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_SHARED, &desc,
+                                                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&actualResource)),
+          "identity actual adapter resource");
+    HANDLE actualHandle = nullptr;
+    check(actualDevice->CreateSharedHandle(actualResource.Get(), nullptr, GENERIC_ALL, nullptr, &actualHandle),
+          "identity actual adapter export");
+    actualResource.Reset();
+    verifySharedAdapter(actualHandle, adapterDesc.AdapterLuid);
+    CloseHandle(actualHandle);
+  }
+  if (!adapterCount)
+    fail("identity no actual adapters");
+  std::printf("OWNED_D3D12_SHARING_ADAPTER_LUID_ADAPTERS observed=%u\n", adapterCount);
+  const LUID creator = a.device->GetAdapterLuid();
+  auto buffer = sharedBuffer(a);
+  a.uploadBuffer(buffer.Get(), 0x811);
+  HANDLE original = share(a, buffer.Get());
+  HANDLE duplicate = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), original, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    fail("identity duplicate resource");
+  CloseHandle(original);
+  // Reset the completed recording too, so it cannot keep the creator resource alive.
+  a.begin();
+  a.submit();
+  buffer.Reset();
+  verifySharedAdapter(duplicate, creator);
+  auto consumer = open<ID3D12Resource>(b, duplicate, "identity handle-only buffer import");
+  b.readBuffer(consumer.Get(), 0x811, "identity handle-only GPU payload");
+  consumer.Reset();
+
+  ComPtr<IDXGIFactory2> factory;
+  check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "identity boundary factory");
+  expect(factory->GetSharedResourceAdapterLuid(duplicate, nullptr), DXGI_ERROR_INVALID_CALL, "identity null output");
+  HANDLE readOnly = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), duplicate, GetCurrentProcess(), &readOnly, FILE_MAP_READ, FALSE, 0))
+    fail("identity read-only handle");
+  verifySharedAdapter(readOnly, creator);
+  CloseHandle(readOnly);
+  // v3 preserves identity offsets and stores the explicit-format marker and list in both ABIs.
+  auto *header = static_cast<uint8_t *>(MapViewOfFile(duplicate, FILE_MAP_WRITE, 0, 0, 65536));
+  if (!header)
+    fail("identity map header");
+  for (size_t offset : {size_t(8), size_t(12), size_t(16), size_t(4808),size_t(4852),size_t(4864)}) {
+    header[offset] ^= 0xff;
+    rejectSharedAdapter(duplicate);
+    header[offset] ^= 0xff;
+  }
+  const uint32_t version=*reinterpret_cast<const uint32_t *>(header+8);
+  *reinterpret_cast<uint32_t *>(header+8)=2;
+  rejectSharedAdapter(duplicate);
+  *reinterpret_cast<uint32_t *>(header+8)=version;
+  wchar_t forgedName[96];
+  const auto *token = header + 16;
+  std::swprintf(forgedName, 96,
+                L"Local\\dxmt.share.%lu.%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                GetCurrentProcessId() + 1, token[0], token[1], token[2], token[3], token[4], token[5], token[6],
+                token[7], token[8], token[9], token[10], token[11], token[12], token[13], token[14], token[15]);
+  HANDLE clone = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 65536, forgedName);
+  auto *cloneHeader = static_cast<uint8_t *>(MapViewOfFile(clone, FILE_MAP_WRITE, 0, 0, 65536));
+  if (!clone || !cloneHeader)
+    fail("identity forged header clone");
+  std::memcpy(cloneHeader, header, 65536);
+  rejectSharedAdapter(clone);
+  UnmapViewOfFile(cloneHeader);
+  CloseHandle(clone);
+  UnmapViewOfFile(header);
+  verifySharedAdapter(duplicate, creator);
+  CloseHandle(duplicate);
+  rejectSharedAdapter(duplicate);
+  rejectSharedAdapter(nullptr);
+  rejectSharedAdapter(INVALID_HANDLE_VALUE);
+  rejectSharedAdapter(reinterpret_cast<HANDLE>(uintptr_t(0x7ffc)));
+
+  auto texture = sharedTexture(a);
+  HANDLE textureHandle = share(a, texture.Get());
+  texture.Reset();
+  verifySharedAdapter(textureHandle, creator);
+  CloseHandle(textureHandle);
+  D3D12_HEAP_DESC heapDesc{};
+  heapDesc.SizeInBytes = 65536;
+  heapDesc.Properties = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+  heapDesc.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  ComPtr<ID3D12Heap> heap;
+  check(a.device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "identity heap");
+  HANDLE heapHandle = share(a, heap.Get());
+  heap.Reset();
+  verifySharedAdapter(heapHandle, creator);
+  CloseHandle(heapHandle);
+
+  wchar_t name[64];
+  std::swprintf(name, 64, L"OwnedD3D12Sharing.%lu.identity", GetCurrentProcessId());
+  auto named = sharedBuffer(a);
+  a.uploadBuffer(named.Get(), 0x812);
+  HANDLE namedHandle = share(a, named.Get(), name);
+  auto namedConsumer = open<ID3D12Resource>(b, namedHandle, "identity named import");
+  a.begin();
+  a.submit();
+  named.Reset();
+  b.readBuffer(namedConsumer.Get(), 0x812, "identity retained named GPU payload");
+  namedConsumer.Reset();
+  b.begin();
+  b.submit();
+  verifySharedAdapter(namedHandle, creator);
+  HANDLE byName = nullptr;
+  check(b.device->OpenSharedHandleByName(name, GENERIC_ALL, &byName), "identity reopen name after creator release");
+  CloseHandle(namedHandle);
+  verifySharedAdapter(byName, creator);
+  auto *link = static_cast<uint8_t *>(MapViewOfFile(byName, FILE_MAP_WRITE, 0, 0, 256));
+  if (!link)
+    fail("identity map named metadata");
+  for (size_t offset : {size_t(8), size_t(58), size_t(184), size_t(188), size_t(192)}) {
+    link[offset] ^= 0xff;
+    rejectSharedAdapter(byName);
+    link[offset] ^= 0xff;
+  }
+  std::swprintf(forgedName, 96, L"Local\\dxmt.d3d12.identity-forged.%lu", GetCurrentProcessId());
+  clone = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 256, forgedName);
+  cloneHeader = static_cast<uint8_t *>(MapViewOfFile(clone, FILE_MAP_WRITE, 0, 0, 256));
+  if (!clone || !cloneHeader)
+    fail("identity forged named clone");
+  std::memcpy(cloneHeader, link, 256);
+  rejectSharedAdapter(clone);
+  UnmapViewOfFile(cloneHeader);
+  CloseHandle(clone);
+  UnmapViewOfFile(link);
+
+  wchar_t exe[MAX_PATH], command[MAX_PATH + 160];
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  std::swprintf(command, MAX_PATH + 160, L"\"%ls\" --adapter-luid-child %ls %lu %lu", exe, name,
+                static_cast<unsigned long>(creator.LowPart), static_cast<unsigned long>(creator.HighPart));
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(exe, command, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process))
+    fail("identity child launch", HRESULT_FROM_WIN32(GetLastError()));
+  if (WaitForSingleObject(process.hProcess, kTimeoutMs) != WAIT_OBJECT_0)
+    fail("identity child completion");
+  DWORD code = 1;
+  GetExitCodeProcess(process.hProcess, &code);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  if (code)
+    fail("identity child exit", HRESULT(code));
+  verifySharedAdapter(byName, creator);
+  CloseHandle(byName);
+  rejectSharedAdapter(byName);
+  expect(b.device->OpenSharedHandleByName(name, GENERIC_ALL, &byName), E_INVALIDARG, "identity last named close");
+  if (byName)
+    fail("identity missing name output");
+  std::printf("OWNED_D3D12_SHARING_ADAPTER_LUID_PASS low=%08lx high=%08lx\n",
+              static_cast<unsigned long>(creator.LowPart), static_cast<unsigned long>(creator.HighPart));
+  pass("adapter-luid-lifetime-errors");
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
+  if (argc == 5 && !std::wcscmp(argv[1], L"--adapter-luid-child"))
+    return adapterLuidChildMain(argv[2], LUID{static_cast<DWORD>(wcstoul(argv[3], nullptr, 10)),
+                                            static_cast<LONG>(wcstoul(argv[4], nullptr, 10))});
   if (argc > 1 && !std::wcscmp(argv[1], L"--child"))
     return childMain();
   if (argc > 2 && !std::wcscmp(argv[1], L"--named"))
@@ -1025,6 +1259,16 @@ int wmain(int argc, wchar_t **argv) {
   Device a, b;
   a.init();
   b.init();
+  if (argc == 2 && !std::wcscmp(argv[1], L"--adapter-luid")) {
+    sameProcessCases(a, b);
+    heapCase(a, b);
+    namedCase(a, b);
+    errorCases(a, b);
+    namedProcessCase(a);
+    adapterLuidLifetimeCase(a, b);
+    std::printf("OWNED_D3D12_SHARING_ADAPTER_LUID_FOCUSED_PASS cases=%d\n", g_cases);
+    return 0;
+  }
 
   D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
   check(a.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)), "OPTIONS");
@@ -1042,6 +1286,7 @@ int wmain(int argc, wchar_t **argv) {
   namedProcessCase(a);
   hostMemoryCase(a);
   crossProcess(a, b);
+  adapterLuidLifetimeCase(a, b);
   std::printf("OWNED_D3D12_SHARING_PASS cases=%d\n", g_cases);
   return 0;
 }

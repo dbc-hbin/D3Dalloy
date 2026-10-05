@@ -1,275 +1,186 @@
 #!/usr/bin/env python3
-"""CPU/PE-only validation for the DXMT D3D12 NGX frontend.
+"""Source-owned compile/COFF/PE facade ABI proof; never executes a Windows guest.
 
-Compiles the current repository source with the pinned llvm-mingw toolchain,
-links a nvngx.dll from the Meson cross-build import libraries, and validates the
-resulting PE against the public NVIDIA NGX ABI:
-
-* the D3D11 export set is preserved and the D3D12 entry points exist,
-* the owned `own-ngxd3d12` marker is embedded,
-* the MSVC-ABI parameter facade exposes the official 17-slot vtable surface in
-  the official order, and the official-header consumer resolves each vcall slot
-  to the matching facade method.
-
-No GPU, Wine runtime or D3D12 device is created.
+--abi-only --all-abis compiles NGX, FSR SR/FG and NVAPI production sources with
+existing compilers for x86/x64/ARM64/ARM64EC. The parameter vtable is compared
+with an independent official-header oracle, including x86 thiscall and all 17
+slots. Without --abi-only, link NGX against the selected Meson build libraries.
 """
-
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
+from owned_graphics_arch import inspect_pe
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_BUILD = ROOT / "build/local/build"
-DEFAULT_OUT = ROOT / "build/local/ngx-frontend"
-NVIDIA_INCLUDE = ROOT / "external/nvngx/include"
-CONSUMER = ROOT / "graphics-translator/tests/owned-ngx-parameter-consumer-msvc.cpp"
-DEFAULT_TOOLCHAIN = Path("/opt/llvm-mingw-20260616-ucrt-macos-universal/bin")
-
+TOOLCHAIN = Path("/opt/llvm-mingw-20260616-ucrt-macos-universal/bin")
+ARCHES = {
+    "x86": ("i686", "i686", 0x14C),
+    "x64": ("x86_64", "x86_64", 0x8664),
+    "arm64": ("aarch64", "aarch64", 0xAA64),
+    "arm64ec": ("arm64ec", "arm64ec", 0xA641),
+}
 COMMON = [
-    f"-I{ROOT / 'src/nvngx'}",
-    f"-I{ROOT / 'src/dxgi'}",
-    f"-I{ROOT / 'src/util'}",
-    f"-I{ROOT / 'src/winemetal'}",
-    f"-I{ROOT / 'include'}",
-    f"-I{ROOT / 'libs'}",
-    "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST",
-    "-D_FILE_OFFSET_BITS=64",
-    "-Wall", "-Wextra", "-Werror", "-std=c++20", "-O2", "-g",
-    "-DDXMT_PAGE_SIZE=4096", "-Wimplicit-fallthrough",
-    "-Wno-missing-field-initializers", "-Wno-unused-parameter",
-    "-Wno-cast-function-type", "-Wno-unused-private-field",
-    "-Wno-microsoft-exception-spec", "-Wno-extern-c-compat",
+    *(f"-I{ROOT / path}" for path in ("src/nvngx", "src/dxgi", "src/util", "src/winemetal", "include", "libs", "external/nvapi")),
+    "-std=c++20", "-O2", "-g", "-Wall", "-Wextra",
+    "-DDXMT_PAGE_SIZE=4096", "-DNOMINMAX", "-D_WIN32_WINNT=0xa00", "-fblocks",
+    "-Wno-missing-field-initializers", "-Wno-unused-parameter", "-Wno-cast-function-type",
+    "-Wno-unused-private-field", "-Wno-microsoft-exception-spec", "-Wno-extern-c-compat",
     "-Wno-unused-const-variable", "-Wno-missing-braces",
-    "-fblocks", "-DNOMINMAX", "-D_WIN32_WINNT=0xa00", "-gdwarf-4",
 ]
-
-REQUIRED_D3D11 = {
-    "NVSDK_NGX_D3D11_AllocateParameters", "NVSDK_NGX_D3D11_CreateFeature",
-    "NVSDK_NGX_D3D11_DestroyParameters", "NVSDK_NGX_D3D11_EvaluateFeature",
-    "NVSDK_NGX_D3D11_GetCapabilityParameters", "NVSDK_NGX_D3D11_GetFeatureRequirements",
-    "NVSDK_NGX_D3D11_GetParameters", "NVSDK_NGX_D3D11_GetScratchBufferSize",
-    "NVSDK_NGX_D3D11_Init", "NVSDK_NGX_D3D11_Init_Ext",
-    "NVSDK_NGX_D3D11_Init_ProjectID", "NVSDK_NGX_D3D11_Init_with_ProjectID",
-    "NVSDK_NGX_D3D11_ReleaseFeature", "NVSDK_NGX_D3D11_Shutdown",
-    "NVSDK_NGX_D3D11_Shutdown1",
-}
-
-REQUIRED_D3D12 = {
-    "NVSDK_NGX_D3D12_AllocateParameters", "NVSDK_NGX_D3D12_CreateFeature",
-    "NVSDK_NGX_D3D12_DestroyParameters", "NVSDK_NGX_D3D12_EvaluateFeature",
-    "NVSDK_NGX_D3D12_EvaluateFeature_C", "NVSDK_NGX_D3D12_GetCapabilityParameters",
-    "NVSDK_NGX_D3D12_GetFeatureRequirements", "NVSDK_NGX_D3D12_GetParameters",
-    "NVSDK_NGX_D3D12_GetScratchBufferSize", "NVSDK_NGX_D3D12_Init",
-    "NVSDK_NGX_D3D12_Init_Ext", "NVSDK_NGX_D3D12_Init_ProjectID",
-    "NVSDK_NGX_D3D12_Init_with_ProjectID", "NVSDK_NGX_D3D12_ReleaseFeature",
-    "NVSDK_NGX_D3D12_Shutdown", "NVSDK_NGX_D3D12_Shutdown1",
-}
-
-# Official NVSDK_NGX_Parameter vtable surface: 8 Set, 8 Get, Reset. Slot
-# offsets come from the official header via the consumer fixture below; this map
-# records which facade method must back each parameter type.
-FACADE_SET = [
-    "?Set@OwnedNgxParameterFacade@@UEAAXPEBD_K@Z",
-    "?Set@OwnedNgxParameterFacade@@UEAAXPEBDM@Z",
-    "?Set@OwnedNgxParameterFacade@@UEAAXPEBDN@Z",
-    "?Set@OwnedNgxParameterFacade@@UEAAXPEBDI@Z",
-    "?Set@OwnedNgxParameterFacade@@UEAAXPEBDH@Z",
-    "?Set@OwnedNgxParameterFacade@@UEAAXPEBDPEAUID3D11Resource@@@Z",
-    "?Set@OwnedNgxParameterFacade@@UEAAXPEBDPEAUID3D12Resource@@@Z",
-    "?Set@OwnedNgxParameterFacade@@UEAAXPEBDPEAX@Z",
-]
-FACADE_GET = [
-    "?Get@OwnedNgxParameterFacade@@UEBAIPEBDPEA_K@Z",
-    "?Get@OwnedNgxParameterFacade@@UEBAIPEBDPEAM@Z",
-    "?Get@OwnedNgxParameterFacade@@UEBAIPEBDPEAN@Z",
-    "?Get@OwnedNgxParameterFacade@@UEBAIPEBDPEAI@Z",
-    "?Get@OwnedNgxParameterFacade@@UEBAIPEBDPEAH@Z",
-    "?Get@OwnedNgxParameterFacade@@UEBAIPEBDPEAPEAUID3D11Resource@@@Z",
-    "?Get@OwnedNgxParameterFacade@@UEBAIPEBDPEAPEAUID3D12Resource@@@Z",
-    "?Get@OwnedNgxParameterFacade@@UEBAIPEBDPEAPEAX@Z",
-]
-FACADE_RESET = "?Reset@OwnedNgxParameterFacade@@UEAAXXZ"
-
-# Facade method that must back each official-header vcall emitted by the
-# consumer fixture. The slot offsets themselves are read from the compiled
-# consumer, so the official header stays the single source of truth.
-CONSUMER_SLOTS = {
-    "ngx_smoke_set_float": FACADE_SET[1],
-    "ngx_smoke_set_uint": FACADE_SET[3],
-    "ngx_smoke_set_int": FACADE_SET[4],
-    "ngx_smoke_set_resource": FACADE_SET[6],
-    "ngx_smoke_get_float": FACADE_GET[1],
-    "ngx_smoke_get_uint": FACADE_GET[3],
-    "ngx_smoke_get_int": FACADE_GET[4],
-    "ngx_smoke_get_resource": FACADE_GET[6],
-    "ngx_smoke_reset": FACADE_RESET,
+NGX_SUFFIXES = {
+    "AllocateParameters", "CreateFeature", "DestroyParameters", "EvaluateFeature",
+    "GetCapabilityParameters", "GetFeatureRequirements", "GetParameters", "GetScratchBufferSize",
+    "Init", "Init_Ext", "Init_ProjectID", "Init_with_ProjectID", "ReleaseFeature", "Shutdown", "Shutdown1",
 }
 
 
-def run(args: list[str]) -> str:
-    return subprocess.run(args, check=True, text=True, capture_output=True).stdout
+def run(command: list[str], log: Path) -> str:
+    result = subprocess.run(command, text=True, capture_output=True)
+    log.write_text(json.dumps(command) + "\n" + result.stdout + result.stderr)
+    if result.returncode:
+        raise RuntimeError(f"command failed ({result.returncode}); see {log}")
+    return result.stdout
 
 
-def parse_relocations(dump: str, section: str) -> list[tuple[int, str, str]]:
-    """Return (offset, type, symbol) records for one COFF section."""
-    records = []
-    current = None
-    for line in dump.splitlines():
-        header = re.match(r"RELOCATION RECORDS FOR \[(.*)\]:", line)
-        if header:
-            current = header.group(1)
-            continue
-        if current != section:
-            continue
-        fields = line.split()
-        if len(fields) == 3 and re.fullmatch(r"[0-9a-f]+", fields[0]):
-            records.append((int(fields[0], 16), fields[1], fields[2]))
-    return records
+def vtable(ir: str) -> list[str]:
+    line = next(line for line in ir.splitlines() if line.startswith('@"??_7OwnedNgxParameterFacade@@6B@" ='))
+    slots = re.findall(r'ptr @"([^"]+)"', line)
+    if len(slots) != 17:
+        raise RuntimeError(f"parameter vftable has {len(slots)} slots, expected 17")
+    return slots
 
 
-def fail(message: str) -> None:
-    raise SystemExit(f"OWNED_NGX_FRONTEND_FAIL {message}")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--build-root", type=Path, default=DEFAULT_BUILD,
-                        help="Meson cross build directory of the current source")
-    parser.add_argument("--out", type=Path,
-                        help="scratch directory for compiled objects and the PE")
-    parser.add_argument("--nvidia-include", type=Path,
-                        default=Path(os.environ.get("NGX_SDK_INCLUDE", NVIDIA_INCLUDE)),
-                        help="directory holding the official nvsdk_ngx*.h headers")
-    parser.add_argument("--toolchain", type=Path, default=DEFAULT_TOOLCHAIN,
-                        help="llvm-mingw bin directory")
-    return parser.parse_args()
+def verify_abi(abi: str, args: argparse.Namespace, out: Path) -> list[Path]:
+    prefix, msvc, machine = ARCHES[abi]
+    cxx = args.toolchain / (prefix + "-w64-mingw32-g++")
+    clang = args.toolchain / "clang++"
+    objdump = args.toolchain / "llvm-objdump"
+    readobj = args.toolchain / "llvm-readobj"
+    out.mkdir(parents=True, exist_ok=True)
+    flags = [str(clang), f"--target={msvc}-pc-windows-msvc", "-std=c++20", "-fno-exceptions", "-fno-rtti", "-Wall", "-Wextra", "-Werror", f"-I{args.nvidia_include}"]
+    bridge = ROOT / "src/nvngx/nvngx_d3d12_msvc.cpp"
+    oracle = ROOT / "graphics-translator/tests/owned-ngx-vtable-reference-msvc.cpp"
+    for name, source in (("facade", bridge), ("reference", oracle)):
+        run([*flags, "-S", "-emit-llvm", str(source), "-o", str(out / (name + ".ll"))], out / (name + "-ir.log"))
+        run([*flags, "-c", str(source), "-o", str(out / (name + ".obj"))], out / (name + "-coff.log"))
+    actual_ir = (out / "facade.ll").read_text()
+    reference_ir = (out / "reference.ll").read_text()
+    layout_source = ROOT / "graphics-translator/tests/owned-facade-pod-abi.cpp"
+    layouts = []
+    for name, compiler_flags in (("msvc", [flag for flag in flags if flag != "-Werror"]), ("mingw", [str(cxx), "-std=c++20"])):
+        layout_path = out / (name + "-pod.ll")
+        run([*compiler_flags, "-ffreestanding", "-S", "-emit-llvm", str(layout_source), "-o", str(layout_path)], out / (name + "-pod.log"))
+        layout_line = next(line for line in layout_path.read_text().splitlines() if "owned_facade_pod_layout" in line and "constant" in line)
+        layouts.append(re.findall(r"i32 (\d+)", layout_line))
+    if not layouts[0] or layouts[0] != layouts[1]:
+        raise RuntimeError(f"{abi} public FFX POD layout mismatch: {layouts}")
+    actual, expected = vtable(actual_ir), vtable(reference_ir)
+    # Enum and unsigned return values both lower to i32. Compare parameter
+    # identity/order independently of that deliberately different C++ spelling.
+    expected = [name.replace('?AW4NVSDK_NGX_Result@@', 'I') for name in expected]
+    if actual != expected:
+        raise RuntimeError(f"{abi} official-header vtable mismatch: {actual} != {expected}")
+    for symbol in actual:
+        signature = next(line for line in actual_ir.splitlines() if line.startswith("define ") and f'@"{symbol}"(' in line)
+        if abi == "x86" and "x86_thiscallcc" not in signature:
+            raise RuntimeError(f"x86 vtable method lacks thiscall: {symbol}")
+        if "?Get@" in symbol and not re.search(r'\bi32 @', signature):
+            raise RuntimeError(f"parameter Get result is not i32: {symbol}")
+    facade_dump = run([str(objdump), "-r", str(out / "facade.obj")], out / "facade-relocations.log")
+    # Every compiler-emitted slot must survive into the real COFF object.
+    coff_slots = [(symbol.replace("@@", "@@$$h", 1) if abi == "arm64ec" else symbol) for symbol in actual]
+    if any(symbol not in facade_dump for symbol in coff_slots):
+        raise RuntimeError(f"{abi} COFF parameter vtable is incomplete")
+    consumer = ROOT / "graphics-translator/tests/owned-ngx-parameter-consumer-msvc.cpp"
+    run([*flags, "-c", str(consumer), "-o", str(out / "consumer.obj")], out / "consumer.log")
+    run([str(objdump), "-d", str(out / "consumer.obj")], out / "consumer-disassembly.log")
+    objects = []
+    compiled = {}
+    sources = ["nvngx/nvngx.cpp", "nvngx/nvngx_d3d12.cpp", "fsr/fsr.cpp", "fsrfg/fsrfg.cpp", "nvapi/nvapi.cpp"]
+    sources += ["fsrfg/sdk/" + name for name in ("sdk_backend.cpp", "FrameInterpolationSwapchainDX12.cpp", "FrameInterpolationSwapchainDX12_Helpers.cpp", "FrameInterpolationSwapchainDX12_UiComposition.cpp", "FrameInterpolationSwapchainDX12_DebugPacing.cpp")]
+    for source in sources:
+        name = source.replace("/", "-")
+        obj = out / (name + ".obj")
+        run([str(cxx), *COMMON, "-c", str(ROOT / "src" / source), "-o", str(obj)], out / (name + ".log"))
+        dump = run([str(readobj), "--file-headers", str(obj)], out / (name + "-headers.log"))
+        if f"0x{machine:X}" not in dump:
+            raise RuntimeError(f"wrong COFF machine for {abi}: {obj}")
+        if source.startswith("nvngx/"):
+            objects.append(obj)
+        compiled[source] = obj
+    spec = importlib.util.spec_from_file_location("stage_owned_graphics", ROOT / "scripts/stage-owned-graphics.py")
+    assert spec and spec.loader
+    stage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(stage)
+    pe_facts = {}
+    for directory, module in (("fsr", "amd_fidelityfx_upscaler_dx12"), ("fsrfg", "amd_fidelityfx_framegeneration_dx12")):
+        dll = out / (module + ".dll")
+        inputs = [str(obj) for source, obj in compiled.items() if source.startswith(directory + "/")]
+        run([str(cxx), "-shared", "-static", *inputs, str(ROOT / "src" / directory / (directory + ".def")),
+             "-lole32", "-luuid", "-ldxguid", "-lwinmm", "-ldwmapi", "-o", str(dll)], out / (directory + "-link.log"))
+        facts = inspect_pe(dll)
+        if facts["windows_abi"] != abi or stage.pe_exports(dll) != stage.REQUIRED_FSR_EXPORTS:
+            raise RuntimeError(f"{abi} FSR PE architecture/export/ordinal mismatch: {dll}")
+        pe_facts[module] = facts
+    # x86 cdecl entries cannot acquire stdcall @N suffixes. EC native C
+    # entries must carry the compiler-generated # entry convention.
+    for source, names in (("nvapi/nvapi.cpp", {"nvapi_QueryInterface"}),
+                          ("fsr/fsr.cpp", stage.REQUIRED_FSR_EXPORTS.keys()),
+                          ("nvngx/nvngx_d3d12.cpp", {"NVSDK_NGX_D3D12_" + suffix for suffix in NGX_SUFFIXES})):
+        symbols = run([str(args.toolchain / "llvm-nm"), "--defined-only", str(compiled[source])], out / (source.replace("/", "-") + "-symbols.log"))
+        actual_names = {line.split()[-1] for line in symbols.splitlines() if line.split()}
+        prefix = "_" if abi == "x86" else "#" if abi == "arm64ec" else ""
+        if {prefix + name for name in names} - actual_names:
+            raise RuntimeError(f"{abi} public C calling convention mismatch: {source}")
+    objects.append(out / "facade.obj")
+    (out / "result.json").write_text(json.dumps({"windows_abi": abi, "source_compile": "pass", "official_parameter_slots": 17, "x86_thiscall": abi == "x86", "official_ffx_pod_layout": layouts[0], "fsr_pe": pe_facts, "public_c_calling_conventions": "pass", "guest_execution": "not_run"}, indent=2) + "\n")
+    print(f"OWNED_FACADE_ABI_PASS abi={abi} slots=17 sources={len(sources)} guest=not_run")
+    return objects
 
 
 def main() -> int:
-    args = parse_args()
-    build = (args.build_root if args.build_root.is_absolute()
-             else ROOT / args.build_root).resolve()
-    out = (args.out or DEFAULT_OUT)
-    out = (out if out.is_absolute() else ROOT / out).resolve()
-    toolchain = args.toolchain
-    nvidia_include = (args.nvidia_include if args.nvidia_include.is_absolute()
-                      else ROOT / args.nvidia_include).resolve()
-
-    cxx = toolchain / "x86_64-w64-mingw32-g++"
-    objdump = toolchain / "llvm-objdump"
-    nm = toolchain / "llvm-nm"
-    msvc_cxx = toolchain / "clang++"
-    for tool in (cxx, objdump, nm, msvc_cxx):
-        if not tool.is_file():
-            fail(f"pinned llvm-mingw toolchain is missing {tool}")
-
-    nvngx_header = nvidia_include / "nvsdk_ngx.h"
-    if not nvngx_header.is_file():
-        fail(f"official NGX header not found at {nvngx_header}; pass --nvidia-include")
-
-    dxgi_implib = build / "src/dxgi/dxgi.dll.a"
-    util_implib = build / "src/util/libutil.a"
-    winemetal_implib = build / "src/winemetal/winemetal.dll.a"
-    for implib in (dxgi_implib, util_implib, winemetal_implib):
-        if not implib.is_file():
-            fail(f"cross-build import library is missing {implib}; build first")
-
-    if out.exists():
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
-
-    objects = []
-    for name in ("nvngx.cpp", "nvngx_d3d12.cpp"):
-        obj = out / f"{name}.obj"
-        run([str(cxx), *COMMON, "-c", str(ROOT / "src/nvngx" / name), "-o", str(obj)])
-        objects.append(obj)
-
-    msvc_obj = out / "nvngx_d3d12_msvc.obj"
-    run([
-        str(msvc_cxx), "--target=x86_64-pc-windows-msvc", "-std=c++20",
-        "-fno-exceptions", "-fno-rtti", "-Wall", "-Wextra", "-Werror",
-        "-c", str(ROOT / "src/nvngx/nvngx_d3d12_msvc.cpp"), "-o", str(msvc_obj),
-    ])
-    symbols = run([str(nm), str(msvc_obj)])
-    if "??_7OwnedNgxParameterFacade@@6B@" not in symbols:
-        fail("MSVC parameter facade vftable was not emitted")
-    if symbols.count("?Set@OwnedNgxParameterFacade@@") != len(FACADE_SET):
-        fail("MSVC parameter facade does not expose the official 8 Set slots")
-    if symbols.count("?Get@OwnedNgxParameterFacade@@") != len(FACADE_GET):
-        fail("MSVC parameter facade does not expose the official 8 Get slots")
-    objects.append(msvc_obj)
-
-    # The vftable must carry exactly the official overload set, and each
-    # official-header vcall slot must resolve to the facade method whose
-    # parameter type matches. The facade's own declaration order is free; the
-    # official header, as interpreted by the same MSVC-ABI compiler, pins the
-    # slots that an MSVC-built application will call.
-    vftable = parse_relocations(run([str(objdump), "-r", str(msvc_obj)]), ".rdata")
-    facade_slots = {offset: value for offset, kind, value in vftable
-                    if kind == "IMAGE_REL_AMD64_ADDR64"
-                    and "OwnedNgxParameterFacade" in value}
-    if len(facade_slots) != len(FACADE_SET) + len(FACADE_GET) + 1:
-        fail(f"facade vftable has {len(facade_slots)} slots, expected 17")
-    expected_symbols = set(FACADE_SET + FACADE_GET + [FACADE_RESET])
-    if set(facade_slots.values()) != expected_symbols:
-        fail(f"facade vftable symbol set drift: {sorted(facade_slots.values())}")
-
-    # Compile the repository's official-header consumer bridge with the same
-    # Microsoft C++ ABI. The vcall offsets it emits come from NVIDIA's public
-    # declaration; each one must resolve in the facade vftable to the facade
-    # method with the same parameter type. This is link/run independent and
-    # catches drift between the owned facade and the pinned official header.
-    consumer_obj = out / "owned-ngx-parameter-consumer-msvc.obj"
-    run([
-        str(msvc_cxx), "--target=x86_64-pc-windows-msvc", "-std=c++20",
-        "-fno-exceptions", "-fno-rtti", "-Wall", "-Wextra", "-Werror",
-        f"-I{nvidia_include}", "-c", str(CONSUMER), "-o", str(consumer_obj),
-    ])
-    consumer_disassembly = run([str(objdump), "-d", str(consumer_obj)])
-    for function, symbol in CONSUMER_SLOTS.items():
-        block = re.search(rf"<{re.escape(function)}>:(.*?)(?=\n\n|\Z)",
-                          consumer_disassembly, re.S)
-        if not block:
-            fail(f"official-header consumer function missing from object: {function}")
-        calls = re.findall(r"callq?\s+\*0x([0-9a-f]+)\(%rax\)", block.group(1))
-        if not calls:
-            fail(f"official-header consumer does not emit a vcall: {function}")
-        for offset in {int(value, 16) for value in calls}:
-            if facade_slots.get(offset) != symbol:
-                fail(f"official-header vcall slot {offset:#x} ({function}) maps to "
-                     f"{facade_slots.get(offset)}, expected {symbol}")
-
-    dll = out / "nvngx.dll"
-    run([
-        str(cxx), "-o", str(dll), *(str(x) for x in objects), "-shared",
-        "-Wl,--start-group", f"-Wl,--out-implib={out / 'nvngx.dll.a'}", "-static",
-        "-Wl,--file-alignment=4096",
-        str(dxgi_implib), str(util_implib), str(winemetal_implib),
-        "-lkernel32", "-luser32", "-lgdi32", "-lwinspool", "-lshell32",
-        "-lole32", "-loleaut32", "-luuid", "-lcomdlg32", "-ladvapi32",
-        "-Wl,--end-group",
-    ])
-
-    dump = run([str(objdump), "-p", str(dll)])
-    exports = set(re.findall(r"\b(NVSDK_NGX_D3D(?:11|12)_[A-Za-z0-9_]+)\s*$", dump, re.MULTILINE))
-    missing11 = sorted(REQUIRED_D3D11 - exports)
-    missing12 = sorted(REQUIRED_D3D12 - exports)
-    if missing11 or missing12:
-        fail(f"missing exports: d3d11={missing11} d3d12={missing12}")
-    if b"own-ngxd3d12\x00" not in dll.read_bytes():
-        fail("owned D3D12 NGX marker missing from PE")
-
-    print(f"OWNED_NGX_FRONTEND_PASS pe={dll}")
-    print(f"D3D11_EXPORTS_PRESERVED={len(REQUIRED_D3D11)} D3D12_EXPORTS={len(REQUIRED_D3D12)}")
-    print("MSVC_PARAMETER_VFTABLE=1 MSVC_OFFICIAL_HEADER_CONSUMER=1 MSVC_VCALL_SLOTS=1")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build-root", type=Path, default=ROOT / "build/local/build")
+    parser.add_argument("--out", type=Path, default=ROOT / "build/local/ngx-frontend")
+    parser.add_argument("--nvidia-include", type=Path, default=Path(os.environ.get("NGX_SDK_INCLUDE", ROOT / "external/nvngx/include")))
+    parser.add_argument("--toolchain", type=Path, default=TOOLCHAIN)
+    parser.add_argument("--windows-abi", choices=ARCHES, default="x64")
+    parser.add_argument("--all-abis", action="store_true")
+    parser.add_argument("--abi-only", action="store_true")
+    args = parser.parse_args()
+    if args.all_abis and not args.abi_only:
+        parser.error("--all-abis requires --abi-only; link each ABI against its own --build-root")
+    for abi in ARCHES if args.all_abis else (args.windows_abi,):
+        out = args.out.resolve() / abi
+        objects = verify_abi(abi, args, out)
+        if args.abi_only:
+            continue
+        cxx = args.toolchain / (ARCHES[abi][0] + "-w64-mingw32-g++")
+        dll = out / "nvngx.dll"
+        libraries = [args.build_root / path for path in ("src/dxgi/dxgi.dll.a", "src/util/libutil.a", "src/winemetal/winemetal.dll.a")]
+        x86_flags = ["-Wl,--kill-at", "-Wl,--enable-stdcall-fixup"] if abi == "x86" else []
+        run([str(cxx), "-o", str(dll), *(str(obj) for obj in objects), "-shared", "-static", *x86_flags,
+             "-Wl,--start-group", *(str(lib) for lib in libraries), "-lkernel32", "-luser32", "-lgdi32", "-lwinspool", "-lshell32", "-lole32", "-loleaut32", "-luuid", "-lcomdlg32", "-ladvapi32", "-Wl,--end-group"], out / "link.log")
+        if inspect_pe(dll)["windows_abi"] != abi:
+            raise RuntimeError(f"NGX PE ABI mismatch: {dll}")
+        dump = run([str(args.toolchain / "llvm-objdump"), "-p", str(dll)], out / "pe.log")
+        exports = set(re.findall(r"\b(NVSDK_NGX_D3D(?:11|12)_[A-Za-z0-9_]+)\s*$", dump, re.MULTILINE))
+        required = {f"NVSDK_NGX_D3D{version}_{suffix}" for version in (11, 12) for suffix in NGX_SUFFIXES} | {"NVSDK_NGX_D3D12_EvaluateFeature_C"}
+        if required - exports or b"own-ngxd3d12\0" not in dll.read_bytes():
+            raise RuntimeError(f"NGX PE missing exports/owned marker: {sorted(required - exports)}")
+        print(f"OWNED_NGX_FRONTEND_PASS pe={dll}")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (RuntimeError, OSError, StopIteration) as error:
+        raise SystemExit(f"OWNED_NGX_FRONTEND_FAIL {error}")

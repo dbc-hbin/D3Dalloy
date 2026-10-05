@@ -481,10 +481,6 @@ void creationContracts() {
                                        nullptr, 1, toBlock, IID_PPV_ARGS(&r)),
          E_INVALIDARG, "cast-uncompressed-to-bc");
   auto bc1 = textureDesc(DXGI_FORMAT_BC1_UNORM, 8, 8, D3D12_RESOURCE_FLAG_NONE);
-  DXGI_FORMAT bcToUint[] = {DXGI_FORMAT_R32G32_UINT};
-  expect(dev->CreateCommittedResource3(&props, D3D12_HEAP_FLAG_NONE, &bc1, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
-                                       nullptr, 1, bcToUint, IID_PPV_ARGS(&r)),
-         E_INVALIDARG, "cast-bc-to-uncompressed-metal-rejects");
   DXGI_FORMAT bcSrgb[] = {DXGI_FORMAT_BC1_UNORM_SRGB};
   check(dev->CreateCommittedResource3(&props, D3D12_HEAP_FLAG_NONE, &bc1, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
                                       nullptr, 1, bcSrgb, IID_PPV_ARGS(&r)),
@@ -1153,7 +1149,7 @@ void capabilities() {
               kPrefix, o12.EnhancedBarriersSupported, o12.RelaxedFormatCastingSupported,
               o14.IndependentFrontAndBackStencilRefMaskSupported, o15.DynamicIndexBufferStripCutSupported,
               o15.TriangleFanSupported, o16.DynamicDepthBiasSupported, o16.GPUUploadHeapSupported);
-  if (!o12.EnhancedBarriersSupported || o12.RelaxedFormatCastingSupported ||
+  if (!o12.EnhancedBarriersSupported || !o12.RelaxedFormatCastingSupported ||
       !o14.IndependentFrontAndBackStencilRefMaskSupported || !o15.DynamicIndexBufferStripCutSupported ||
       o15.TriangleFanSupported || !o16.DynamicDepthBiasSupported || !o16.GPUUploadHeapSupported)
     fail("capabilities");

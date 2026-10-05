@@ -7,4 +7,7 @@ EXPORTS
     D3D12SerializeRootSignature
     D3D12SerializeVersionedRootSignature
     D3D12GetInterface
+    D3D12EnableExperimentalFeatures
     OwnedGraphicsBackendId
+    OwnedD3D12MainGetBridge1
+    OwnedD3D12CoreGeneration DATA

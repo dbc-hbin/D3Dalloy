@@ -7,6 +7,14 @@ extern "C" {
 
 int _fltused = 0;
 
+void ngx_feature_set_uint(NVSDK_NGX_Parameter *p, const char *key, unsigned int value) { p->Set(key,value); }
+void ngx_feature_set_float(NVSDK_NGX_Parameter *p, const char *key, float value) { p->Set(key,value); }
+void ngx_feature_set_resource(NVSDK_NGX_Parameter *p, const char *key, ID3D12Resource *value) { p->Set(key,value); }
+void ngx_feature_set_pointer(NVSDK_NGX_Parameter *p, const char *key, void *value) { p->Set(key,value); }
+unsigned int ngx_feature_get_uint(NVSDK_NGX_Parameter *p, const char *key, unsigned int *value) {
+    return static_cast<unsigned int>(p->Get(key,value));
+}
+
 unsigned int ngx_fixture_result_success() {
     return static_cast<unsigned int>(NVSDK_NGX_Result_Success);
 }
@@ -132,6 +140,26 @@ void ngx_fixture_set_frame_mask(NVSDK_NGX_Parameter* params, ID3D12Resource* mas
 void ngx_fixture_set_frame_scalars(NVSDK_NGX_Parameter* params, float sharpness, float exposure_scale) {
     params->Set(NVSDK_NGX_Parameter_Sharpness, sharpness);
     params->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, exposure_scale);
+}
+
+void ngx_fixture_set_compatibility_scalars(NVSDK_NGX_Parameter* params, float exposure_scale,
+                                         float motion_offset_x, float motion_offset_y) {
+    params->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, exposure_scale);
+    params->Set(NVSDK_NGX_Parameter_MV_Offset_X, motion_offset_x);
+    params->Set(NVSDK_NGX_Parameter_MV_Offset_Y, motion_offset_y);
+}
+
+void ngx_fixture_set_exposure(NVSDK_NGX_Parameter* params, ID3D12Resource* texture, float pre_exposure) {
+    params->Set(NVSDK_NGX_Parameter_ExposureTexture, texture);
+    params->Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, pre_exposure);
+}
+
+void ngx_fixture_set_motion_scalars(NVSDK_NGX_Parameter* params, float scale_x, float scale_y,
+                                   float jitter_x, float jitter_y) {
+    params->Set(NVSDK_NGX_Parameter_MV_Scale_X, scale_x);
+    params->Set(NVSDK_NGX_Parameter_MV_Scale_Y, scale_y);
+    params->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jitter_x);
+    params->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jitter_y);
 }
 
 void ngx_fixture_set_frame_nan_jitter(NVSDK_NGX_Parameter* params) {

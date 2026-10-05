@@ -5,6 +5,8 @@
 
 cbuffer Draw : register(b0) {
   uint tag;
+  uint authored_viewport;
+  uint authored_layer;
 };
 
 struct VOut {

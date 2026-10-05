@@ -5,10 +5,12 @@
 #include "winemetal_metal4_fx.h"
 
 namespace WMT4 {
-inline void PresentMetal4Drawable(WMT::MetalDrawable drawable, double duration = 0) {
+inline void PresentMetal4Drawable(WMT::MetalDrawable drawable, double duration,
+                                 const WMTCompositionFrame *composition, uint32_t sync_interval, bool allow_tearing) {
   uint64_t bits;
   std::memcpy(&bits, &duration, sizeof(bits));
-  WMT::Metal4Invoke(WMTMetal4FXPresentDrawable, drawable.handle, bits);
+  WMT::Metal4Invoke(WMTMetal4FXPresentDrawable, drawable.handle, bits, uintptr_t(composition), sync_interval,
+                    allow_tearing ? 1u : 0u);
 }
 class TemporalFrame : public WMT::Object {
 public:
@@ -22,9 +24,10 @@ public:
 };
 class TemporalFeature : public WMT::Object {
 public:
-  static bool Supports(WMT::Device device) {
+  static bool Supports(WMT::Device device, uint32_t flags = 0) {
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4FXSupportsTemporal; call.args[0] = device.handle;
+    call.args[1] = flags;
     return WMTMetal4Call(&call) == 0 && call.ret[0];
   }
   static WMT::Reference<TemporalFeature> Create(WMT::Device device, Compiler compiler,

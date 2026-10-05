@@ -27,6 +27,62 @@
 using namespace metal;
 using namespace dxmt;
 
+// Publish only bytes changed by a cast shadow; inactive descriptor-table
+// aliases must not overwrite an actively written native allocation.
+kernel void d3d12_cast_merge(device const uchar *shadow [[buffer(0)]],
+                            device const uchar *baseline [[buffer(1)]],
+                            device uchar *native [[buffer(2)]],
+                            constant uint4 &layout [[buffer(3)]],
+                            uint3 index [[thread_position_in_grid]]) {
+  if (index.x >= layout.x || index.y >= layout.z || index.z >= layout.w) return;
+  const ulong offset = (ulong(index.z) * layout.z + index.y) * layout.y + index.x;
+  if (shadow[offset] != baseline[offset]) native[offset] = shadow[offset];
+}
+
+// Buffers contain row-major blit bytes, never a private texture's physical
+// heap representation. Publish only changed format units through the actual
+// sparse texture so native swizzling stays Metal's responsibility.
+kernel void d3d12_volume_render_publish(device const uchar *shadow [[buffer(0)]],
+                                        device const uchar *baseline [[buffer(1)]],
+                                        texture2d_array<uint, access::read_write> atlas [[texture(0)]],
+                                        constant uint *p [[buffer(3)]],
+                                        uint2 position [[thread_position_in_grid]]) {
+  if (position.x >= p[3] || position.y >= p[4]) return;
+  const uint offset = (position.y * p[3] + position.x) * p[5];
+  bool changed = false;
+  uint4 words = 0;
+  uint4 changed_bytes = 0;
+  for (uint byte = 0; byte < p[5]; ++byte) {
+    bool different = shadow[offset + byte] != baseline[offset + byte];
+    changed |= different;
+    if (different) changed_bytes[byte / 4] |= 255u << ((byte % 4) * 8);
+    words[byte / 4] |= uint(shadow[offset + byte]) << ((byte % 4) * 8);
+  }
+  if (!changed) return;
+  uint4 current = atlas.read(uint2(p[0], p[1]) + position, p[2]);
+  uint4 current_words = 0;
+  uint current_bit = 0;
+  for (uint lane = 0; lane < 4; ++lane) {
+    const uint width = (p[6] >> (lane * 8)) & 255;
+    if (width) {
+      current_words[current_bit / 32] |= current[lane] << (current_bit % 32);
+      current_bit += width;
+    }
+  }
+  words = (words & changed_bytes) | (current_words & ~changed_bytes);
+  uint4 value = 0;
+  uint bit = 0;
+  for (uint lane = 0; lane < 4; ++lane) {
+    const uint width = (p[6] >> (lane * 8)) & 255;
+    if (width) {
+      value[lane] = words[bit / 32] >> (bit % 32);
+      if (width < 32) value[lane] &= (1u << width) - 1;
+      bit += width;
+    }
+  }
+  atlas.write(value, uint2(p[0], p[1]) + position, p[2]);
+}
+
 // D3D12 R24G8 placed depth plane is D24X8 (low 24 bits, high byte zero),
 // while Metal's emulated D24 texture stores its depth plane as float32.
 kernel void d3d12_d24_to_float(device const uchar *source [[buffer(0)]],
@@ -129,6 +185,14 @@ kernel void d3d12_packed422_compact(device const uchar *source [[buffer(0)]],
   return float4(corner * 2.0f - 1.0f, 0.0f, 1.0f);
 }
 
+[[vertex]] float4 msaa_atomic_tile_vertex(uint vertex_id [[vertex_id]]) {
+  const float2 corner = float2((vertex_id << 1) & 2, vertex_id & 2);
+  // An unclipped triangle over a 32x32 surface. The app's quad-aligned 8x8
+  // tile at (4,4) is interior to all three edges; clipping must not create
+  // internal fan edges with native-helper peers inside application quads.
+  return float4(corner.x - 1.0f, 1.0f - corner.y, 0.0f, 1.0f);
+}
+
 struct DXMTMSAAFullscreenLayerVertex {
   float4 position [[position]];
   uint layer [[render_target_array_index]];
@@ -167,7 +231,11 @@ struct DXMTMSAATile {
   uint output_mask, sample_base;
   uint shading_rate;
   uint shading_rate_image_width, shading_rate_image_height;
+  uint programmable_sample_count;
+  float programmable_sample_positions[8][2];
+  uint depth_bounds_enabled;
 };
+static_assert(sizeof(DXMTMSAATile) == 35 * sizeof(uint));
 
 struct DXMTMSAAPixelLayout {
   uint input_record_dwords, output_record_dwords;
@@ -176,7 +244,45 @@ struct DXMTMSAAPixelLayout {
   uint flags, tile_width, input_record_count, helper_record_base;
   uint center_z_dword, sample_z_dword, z_claim_dword, z_anchor_dword;
   uint line_mode, line_mask_dword, line_alpha_dword;
+  uint inner_mask_dword;
+  uint depth_bounds_mask_dword;
 };
+static_assert(sizeof(DXMTMSAAPixelLayout) == 19 * sizeof(uint));
+
+struct DXMTMSAADepthBoundsProbe {
+  uint x, y, input_record_dwords, mask_dword;
+  float min_depth, max_depth;
+};
+static_assert(sizeof(DXMTMSAADepthBoundsProbe) == 6 * sizeof(uint));
+
+// This is a separate, fenced compute pass. Reading the live depth attachment in the raster pass would
+// create forbidden attachment feedback, and a draw-wide snapshot would miss previous-primitive writes.
+[[kernel]] void msaa_depth_bounds_probe_single(
+    depth2d<float, access::read> depth [[texture(0)]], device uint *records [[buffer(0)]],
+    constant DXMTMSAADepthBoundsProbe &probe [[buffer(1)]], uint2 pixel [[thread_position_in_grid]]) {
+  const uint2 xy = uint2(probe.x, probe.y) + pixel;
+  uint mask = 0;
+  if (xy.x < depth.get_width() && xy.y < depth.get_height()) {
+    const float z = depth.read(xy);
+    mask = probe.min_depth <= probe.max_depth && clamp(probe.min_depth, 0.0f, 1.0f) <= z &&
+           z <= clamp(probe.max_depth, 0.0f, 1.0f) ? 1u : 0u;
+  }
+  records[(pixel.y * 8 + pixel.x) * probe.input_record_dwords + probe.mask_dword] = mask;
+}
+
+[[kernel]] void msaa_depth_bounds_probe(
+    depth2d_ms<float, access::read> depth [[texture(0)]], device uint *records [[buffer(0)]],
+    constant DXMTMSAADepthBoundsProbe &probe [[buffer(1)]], uint2 pixel [[thread_position_in_grid]]) {
+  const uint2 xy = uint2(probe.x, probe.y) + pixel;
+  uint mask = 0;
+  if (xy.x < depth.get_width() && xy.y < depth.get_height())
+    for (uint sample = 0; sample < depth.get_num_samples(); ++sample) {
+      const float z = depth.read(xy, sample);
+      if (probe.min_depth <= probe.max_depth && clamp(probe.min_depth, 0.0f, 1.0f) <= z &&
+          z <= clamp(probe.max_depth, 0.0f, 1.0f)) mask |= 1u << sample;
+    }
+  records[(pixel.y * 8 + pixel.x) * probe.input_record_dwords + probe.mask_dword] = mask;
+}
 
 struct DXMTMSAAQueryCoverage {
   uint mask [[sample_mask]];
@@ -308,7 +414,8 @@ inline DXMTMSAAMarker msaa_gather_depth_impl(
     float4 position, float center, thread const float *sample_depths,
     float2 line_start, float2 line_end, uint native_coverage,
     constant DXMTMSAATile &tile, constant DXMTMSAAPixelLayout &layout,
-    device uint *records, bool conservative = false, bool conservative_covered = false) {
+    device uint *records, bool conservative = false, bool conservative_covered = false,
+    bool inner_covered = false) {
   const uint2 xy = uint2(position.xy) - uint2(tile.x, tile.y);
   const uint pixel = xy.y * 8 + xy.x;
   // ForcedSampleCount 16 gathers in two native 8x halves: native sample s is logical sample s + base.
@@ -359,6 +466,9 @@ inline DXMTMSAAMarker msaa_gather_depth_impl(
     if (layout.line_alpha_dword != 0xffffffffu)
       atomic_store_explicit((device atomic_uint *)(record + layout.line_alpha_dword),
                             as_type<uint>(alpha), memory_order_relaxed);
+    if (layout.inner_mask_dword != 0xffffffffu)
+      atomic_store_explicit((device atomic_uint *)(record + layout.inner_mask_dword),
+                            inner_covered ? 1u : 0u, memory_order_relaxed);
     for (uint i = 0; i <= native_count; ++i) {
       if (i == 0 && base) continue;
       const uint slot = i ? i + base : 0u;
@@ -461,6 +571,7 @@ struct DXMTMSAAConservativeInput {
   const uint count = dxmt_conservative::clipped_polygon(input.p0, input.p1, input.p2, viewport, clip,
                                                         (input.flags >> 4) & 15, input.flags & 8, polygon, det);
   const bool covered = count && dxmt_conservative::square_overlaps(polygon, count, floor(input.position.xy));
+  const bool inner = count && dxmt_conservative::square_inside(polygon, count, floor(input.position.xy));
   // Native depth interpolation on the expanded fan quantizes its plane independently.
   // Derive the D3D plane from the original snapped vertices instead, using the
   // carrier only to recover the render pass's actual sample locations.
@@ -469,12 +580,21 @@ struct DXMTMSAAConservativeInput {
   for (uint i = 0; i < 3; ++i) {
     const float4 p = positions[i];
     float2 numerator = viewport.xy * p.w + float2(p.x + p.w, p.w - p.y) * viewport.zw * 0.5f;
-    if (p.w != 0.0f) numerator = rint(numerator / p.w * 256.0f) / 256.0f * p.w;
+    if (p.w != 0.0f) numerator = rint(dxmt_conservative::screen_of(p, viewport) * 256.0f) / 256.0f * p.w;
     screen[i] = float3(numerator, p.w);
   }
   const float3 c0 = cross(screen[1], screen[2]);
-  const float3 plane = (c0 * input.p0.z + cross(screen[2], screen[0]) * input.p1.z +
-                        cross(screen[0], screen[1]) * input.p2.z) / dot(screen[0], c0);
+  const float denominator = dot(screen[0], c0);
+  const bool degenerate = !count || !dxmt_conservative::polygon_area(polygon, count) ||
+      dxmt_conservative::snapped_triangle_degenerate(input.p0, input.p1, input.p2, viewport);
+  float3 plane;
+  if (degenerate)
+    plane = float3(0, 0, input.p0.z / (input.p0.w != 0.0f ? input.p0.w : 1.0f));
+  else if (denominator != 0.0f)
+    plane = (c0 * input.p0.z + cross(screen[2], screen[0]) * input.p1.z +
+             cross(screen[0], screen[1]) * input.p2.z) / denominator;
+  else
+    plane = float3(0, 0, input.p0.z / (input.p0.w != 0.0f ? input.p0.w : 1.0f));
   const float2 gradient = plane.xy;
   const float2 center_xy = floor(input.position.xy) + 0.5f;
   const float center = dot(float3(center_xy, 1.0f), plane);
@@ -485,7 +605,7 @@ struct DXMTMSAAConservativeInput {
   float4 position = input.position;
   position.z = fma(center, tile.max_depth - tile.min_depth, tile.min_depth);
   return msaa_gather_depth_impl(position, center, depths,
-                                float2(0), float2(0), native_coverage, tile, layout, records, true, covered);
+                                float2(0), float2(0), native_coverage, tile, layout, records, true, covered, inner);
 }
 
 struct DXMTMSAADepthMarker {
@@ -499,10 +619,16 @@ inline DXMTMSAADepthMarker msaa_explicit_depth_impl(
     float4 position, uint sample, constant DXMTMSAATile &tile,
     constant DXMTMSAAPixelLayout &layout, device const uint *records, Coverage coverage) {
   const uint2 xy = uint2(position.xy);
-  const uint mask = msaa_coverage_read(coverage, xy, sample).x ? 1u << sample : 0u;
+  uint mask = msaa_coverage_read(coverage, xy, sample).x ? 1u << sample : 0u;
   const uint2 local = xy - uint2(tile.x, tile.y);
   if (local.x >= 8 || local.y >= 8 || sample >= tile.sample_count) return {0, 0, 0};
   const device uint *record = records + (local.y * 8 + local.x) * layout.input_record_dwords;
+  if (tile.depth_bounds_enabled && layout.depth_bounds_mask_dword != 0xffffffffu)
+    mask &= record[layout.depth_bounds_mask_dword];
+  // Sample-mask output alone is not a kill before stencil commit. This internal pass performs the
+  // application early depth/stencil work, so bounds-failing samples must be discarded here, before
+  // returning any depth or coverage. The deferred application PS/UAV sees only the surviving marker.
+  if (!mask) discard_fragment();
   const float raw_z = as_type<float>(record[layout.sample_z_dword + sample]);
   return {1u, clamp(raw_z, tile.min_depth, tile.max_depth), mask};
 }
@@ -724,7 +850,7 @@ struct DXMTSOElement {
 };
 
 struct DXMTSOAssembly {
-  uint topology; // 0 point list, 1 line list, 2 line strip, 3 triangle list, 4 triangle strip
+  uint topology; // 0 point list, 1 line list, 2 line strip, 3 triangle list, 4 triangle strip, 5 triangle fan
   uint indexed;
   uint index_size; // 2 or 4
   uint cut_enabled; // strip topology with a matching D3D12 IBStripCutValue
@@ -841,7 +967,7 @@ struct DXMTMSAAPrimitiveDraw {
   }
   indices += params.index_skip;
   const uint vpp = params.topology == 0 ? 1 : params.topology <= 2 ? 2 : 3;
-  const bool strip = params.topology == 2 || params.topology == 4;
+  const bool strip = params.topology == 2 || params.topology == 4 || params.topology == 5;
   uint slot = 0;
   for (uint instance = 0; instance < params.instance_count; instance++) {
     uint primitive_id = 0;
@@ -878,6 +1004,13 @@ struct DXMTMSAAPrimitiveDraw {
         }
       } else if (count < 2) {
         window[count++] = ordinal;
+      } else if (params.topology == 5) {
+        primitive[0] = window[1];
+        primitive[1] = ordinal;
+        primitive[2] = window[0];
+        window[1] = ordinal;
+        strip_index++;
+        complete = true;
       } else {
         primitive[0] = window[0];
         primitive[1] = (strip_index & 1) ? ordinal : window[1];
@@ -1204,7 +1337,7 @@ inline uint dxmt_clipped_primitives(constant DXMTSOAssembly &params,
 
   const uint topology = params.topology;
   const uint vpp = topology == 0 ? 1 : topology <= 2 ? 2 : 3;
-  const bool strip = topology == 2 || topology == 4;
+  const bool strip = topology == 2 || topology == 4 || topology == 5;
   // A slot the declaration writes but no buffer is bound to counts as full (14.6).
   bool stopped = (params.referenced_mask & ~params.bound_mask) != 0;
   ulong written = 0, needed = 0, unclaimed = 0;
@@ -1246,6 +1379,13 @@ inline uint dxmt_clipped_primitives(constant DXMTSOAssembly &params,
       } else {
         if (count < 2) {
           window[count++] = record;
+        } else if (topology == 5) {
+          primitive[0] = window[1];
+          primitive[1] = record;
+          primitive[2] = window[0];
+          window[1] = record;
+          strip_index++;
+          complete = true;
         } else {
           // D3D triangle strips keep the first vertex leading: triangle i is (i, i+1, i+2) for even i
           // and (i, i+2, i+1) for odd i, so every triangle has the same winding.
@@ -1649,6 +1789,8 @@ constant bool present_with_hdr_metadata [[function_constant(kPresentFCIndex_With
 constant bool present_backbuffer_is_ms [[function_constant(kPresentFCIndex_BackbufferIsMS)]];
 constant bool present_backbuffer_is_not_ms = !present_backbuffer_is_ms;
 constant bool present_gamma_enabled [[function_constant(kPresentFCIndex_GammaEnabled)]];
+constant bool present_composition_residual [[function_constant(kPresentFCIndex_CompositionResidual)]];
+constant bool present_linear_composition_transport [[function_constant(kPresentFCIndex_LinearCompositionTransport)]];
 
 constexpr sampler s(coord::normalized);
 constexpr sampler gamma_sampler(coord::normalized, filter::linear, address::clamp_to_edge);
@@ -1665,13 +1807,39 @@ struct DXMTPresentMetadata {
     uint restrict_output;
     float output_clip[4];
   } geometry;
+  uint alpha;
 };
 
 float3 to_srgb(float3 linear) {
   return select(1.055 * pow(linear, 1.0 / 2.4) - 0.055, linear * 12.92, linear < 0.0031308); 
 }
 
-[[fragment]] float4 fs_present_quad(
+struct DXMTPresentOutput {
+  float4 base [[color(0)]];
+  float4 residual [[color(1), function_constant(present_composition_residual)]];
+};
+
+DXMTPresentOutput present_output(float4 color) {
+  if (present_linear_composition_transport) {
+    // Native float exports are tagged ExtendedLinearSRGB. Decode straight
+    // colour then restore premultiplication, without discarding RGB at A=0.
+    float3 straight = color.w > 0 ? color.xyz / color.w : color.xyz;
+    float3 linear = select(pow((straight + 0.055) / 1.055, 2.4),
+                           straight / 12.92, straight <= 0.04045);
+    color.xyz = color.w > 0 ? linear * color.w : linear;
+  }
+  DXMTPresentOutput result;
+  result.base = color;
+  if (present_composition_residual) {
+    // Export source-over RGB separately. The opaque additive plane
+    // prevents native alpha-zero transport from erasing additive colour.
+    result.base = float4(min(color.xyz, float3(color.w)), color.w);
+    result.residual = float4(max(color.xyz - float3(color.w), float3(0)), 1);
+  }
+  return result;
+}
+
+[[fragment]] DXMTPresentOutput fs_present_quad(
     present_data input [[stage_in]],
     texture2d<float, access::sample> source [[texture(0), function_constant(present_backbuffer_is_not_ms)]],
     texture2d_ms<float, access::read> source_ms [[texture(0), function_constant(present_backbuffer_is_ms)]],
@@ -1684,7 +1852,7 @@ float3 to_srgb(float3 linear) {
        input.position.y < meta.geometry.output_clip[1] ||
        input.position.x >= meta.geometry.output_clip[2] ||
        input.position.y >= meta.geometry.output_clip[3]))
-    return float4(0);
+    return present_output(float4(0));
   float2 sample_position = input.position.xy;
   if (meta.geometry.source_width > 0) {
     float2 source_size = float2(meta.geometry.source_width, meta.geometry.source_height);
@@ -1695,9 +1863,11 @@ float3 to_srgb(float3 linear) {
     float2 origin = float2(meta.geometry.scaling_none && meta.geometry.right_to_left
                                 ? target_size.x - rotated_size.x : 0.0f, 0.0f);
     float2 uv = (input.position.xy - origin) / image_size;
-    if (any(uv < 0.0f) || any(uv >= 1.0f))
-      return float4(meta.geometry.background[0], meta.geometry.background[1],
-                    meta.geometry.background[2], meta.geometry.background[3]);
+    if (any(uv < 0.0f) || any(uv >= 1.0f)) {
+      float4 background = float4(meta.geometry.background[0], meta.geometry.background[1],
+                                meta.geometry.background[2], meta.geometry.background[3]);
+      return present_output(background);
+    }
     if (meta.geometry.rotation == 2)
       uv = float2(uv.y, 1.0f - uv.x);
     else if (meta.geometry.rotation == 3)
@@ -1720,6 +1890,18 @@ float3 to_srgb(float3 linear) {
                              : input.uv);
   }
   float3 output_rgb = output.xyz;
+  if (meta.alpha == 2 && output.w <= 0)
+    return present_output(float4(0));
+  if (meta.alpha == 1 && output.w > 0) {
+    // sRGB texture reads already decoded the premultiplied encoded value.
+    // Undo that decode before unpremultiplication, then resume the color path.
+    if (present_backbuffer_is_srgb)
+      output_rgb = to_srgb(output_rgb);
+    output_rgb /= output.w;
+    if (present_backbuffer_is_srgb)
+      output_rgb = select(pow((output_rgb + 0.055) / 1.055, 2.4),
+                          output_rgb / 12.92, output_rgb <= 0.04045);
+  }
   if (present_gamma_enabled && !present_hdr_pq && !present_with_hdr_metadata) {
     output_rgb = float3(
         gamma_lut.sample(gamma_sampler, float2(output_rgb.r, 0.5)).r,
@@ -1752,7 +1934,10 @@ float3 to_srgb(float3 linear) {
     output_rgb = linear_to_pq(output_rgb);
   else if (present_with_hdr_metadata)
     output_rgb = output_rgb / 80;
-  return float4(output_rgb, output.w);
+  // Premultiplied alpha permits additive RGB even at alpha zero.
+  if (meta.alpha == 2 || (meta.alpha == 1 && output.w > 0))
+    output_rgb *= output.w;
+  return present_output(float4(output_rgb, output.w));
 }
 
 struct DXMTDispatchArguments {
@@ -1946,6 +2131,55 @@ struct DXMTClearUintMetadata {
     tex.write(meta.value, meta.offset + pos.xy, pos.z);
 }
 
+struct DXMTReservedVolumeClear {
+  device const uint *layout;
+  uint mip;
+  uint first_w_slice;
+  uint w_size;
+};
+
+bool reserved_volume_clear_address(device const uint *layout, uint mip, uint3 position, thread uint3 &address) {
+  device const uint *m = layout + 14 + 4 * mip;
+  const uint3 shape(layout[4], layout[5], layout[6]);
+  const uint3 tile_position = position / shape;
+  const uint tile = m[0] + (tile_position.z * m[2] + tile_position.y) * m[1] + tile_position.x;
+  device const uint *status = *reinterpret_cast<device const uint *device const *>(layout + 14 + 4 * layout[3]);
+  if (status && !status[tile]) return false;
+  const uint3 local = position % shape;
+  const uint flat = local.x + shape.x * (local.y + shape.y * local.z);
+  const uint page_width = layout[9], page_height = layout[10];
+  const uint columns = layout[11], rows = layout[12];
+  address = uint3((tile % columns) * page_width + flat % page_width,
+      ((tile / columns) % rows) * page_height + flat / page_width, tile / (columns * rows));
+  return true;
+}
+
+[[kernel]] void cs_clear_reserved_volume_float(
+    texture2d_array<float, access::write> tex [[texture(0)]],
+    constant DXMTClearFloatMetadata &meta [[buffer(1)]],
+    constant DXMTReservedVolumeClear &volume [[buffer(2)]],
+    uint3 position [[thread_position_in_grid]]) {
+  if (all(position.xy < meta.size) && position.z < volume.w_size) {
+    uint3 address;
+    if (reserved_volume_clear_address(volume.layout, volume.mip,
+        uint3(meta.offset + position.xy, volume.first_w_slice + position.z), address))
+      tex.write(meta.value, address.xy, address.z);
+  }
+}
+
+[[kernel]] void cs_clear_reserved_volume_uint(
+    texture2d_array<uint, access::write> tex [[texture(0)]],
+    constant DXMTClearUintMetadata &meta [[buffer(1)]],
+    constant DXMTReservedVolumeClear &volume [[buffer(2)]],
+    uint3 position [[thread_position_in_grid]]) {
+  if (all(position.xy < meta.size) && position.z < volume.w_size) {
+    uint3 address;
+    if (reserved_volume_clear_address(volume.layout, volume.mip,
+        uint3(meta.offset + position.xy, volume.first_w_slice + position.z), address))
+      tex.write(meta.value, address.xy, address.z);
+  }
+}
+
 [[kernel]] void cs_clear_texture3d_float(
     texture3d<float, access::write> tex [[texture(0)]],
     constant DXMTClearFloatMetadata& meta [[buffer(1)]],
@@ -2058,9 +2292,75 @@ struct DXMTResolveParameters {
   return {float4(positions[vertex_id], 0.0, 1.0)};
 }
 
+// Writable MSAA samples live in single-sample arrays while a shader pass runs.
+// The baseline makes exporting inactive placed UAV aliases a no-op.
+#define DXMT_WRITABLE_MSAA(T, NAME) \
+[[kernel]] void dxmt_msaa_import_##NAME( \
+    texture2d_ms<T, access::read> source [[texture(0)]], \
+    texture2d_array<T, access::write> destination [[texture(1)]], \
+    texture2d_array<T, access::write> baseline [[texture(2)]], \
+    constant uint2 &indices [[buffer(0)]], uint2 position [[thread_position_in_grid]]) { \
+  if (position.x >= source.get_width() || position.y >= source.get_height()) return; \
+  auto value = source.read(position, indices.y); \
+  destination.write(value, position, indices.x); \
+  baseline.write(value, position, indices.x); \
+} \
+[[kernel]] void dxmt_msaa_import_array_##NAME( \
+    texture2d_ms_array<T, access::read> source [[texture(0)]], \
+    texture2d_array<T, access::write> destination [[texture(1)]], \
+    texture2d_array<T, access::write> baseline [[texture(2)]], \
+    constant uint2 &indices [[buffer(0)]], uint2 position [[thread_position_in_grid]]) { \
+  if (position.x >= source.get_width() || position.y >= source.get_height()) return; \
+  auto value = source.read(position, indices.x, indices.y); \
+  destination.write(value, position, indices.x); \
+  baseline.write(value, position, indices.x); \
+} \
+[[fragment]] vec<T, 4> dxmt_msaa_export_##NAME( \
+    DXMTResolveVertexOutput input [[stage_in]], uint sample [[sample_id]], \
+    texture2d_array<T, access::read> source [[texture(0)]], \
+    texture2d_array<T, access::read> baseline [[texture(1)]], \
+    constant uint2 &indices [[buffer(0)]]) { \
+  if (sample != indices.y) discard_fragment(); \
+  auto value = source.read(uint2(input.position.xy), indices.x); \
+  auto old = baseline.read(uint2(input.position.xy), indices.x); \
+  if (all(as_type<uint4>(value) == as_type<uint4>(old))) discard_fragment(); \
+  return value; \
+}
+DXMT_WRITABLE_MSAA(float, float)
+DXMT_WRITABLE_MSAA(uint, uint)
+#undef DXMT_WRITABLE_MSAA
+
+// Depth textures cannot be reinterpreted as integer textures or blitted while
+// multisampled. Capture each sample into raw bytes before uploading color views.
+void dxmt_depth_cast_store(float depth, uint3 position, device uchar *bytes, constant uint *layout) {
+  const uint array = position.z / layout[3], sample = position.z % layout[3];
+  const ulong offset = (ulong(sample) * layout[2] + array) * layout[5] +
+                       ulong(position.y) * layout[4] + position.x * layout[6];
+  if (layout[6] == 2)
+    *reinterpret_cast<device ushort *>(bytes + offset) = ushort(rint(depth * 65535.0f));
+  else
+    *reinterpret_cast<device uint *>(bytes + offset) = as_type<uint>(depth);
+}
+
+[[kernel]] void dxmt_depth_msaa_import(
+    depth2d_ms<float, access::read> source [[texture(0)]], device uchar *bytes [[buffer(0)]],
+    constant uint *layout [[buffer(1)]], uint3 position [[thread_position_in_grid]]) {
+  if (position.x >= layout[0] || position.y >= layout[1] || position.z >= layout[2] * layout[3]) return;
+  dxmt_depth_cast_store(source.read(position.xy, position.z % layout[3]), position, bytes, layout);
+}
+
+[[kernel]] void dxmt_depth_msaa_import_array(
+    depth2d_ms_array<float, access::read> source [[texture(0)]], device uchar *bytes [[buffer(0)]],
+    constant uint *layout [[buffer(1)]], uint3 position [[thread_position_in_grid]]) {
+  if (position.x >= layout[0] || position.y >= layout[1] || position.z >= layout[2] * layout[3]) return;
+  const uint array = position.z / layout[3] + layout[7], sample = position.z % layout[3];
+  dxmt_depth_cast_store(source.read(position.xy, array, sample), position, bytes, layout);
+}
+
 template <typename T>
 vec<T, 4> dxmt_resolve_value(texture2d_ms<T, access::read> source, uint2 coordinate,
-                             constant DXMTResolveParameters &parameters) {
+                             constant DXMTResolveParameters &parameters, uint sample_index) {
+  if (parameters.mode == 3) return source.read(coordinate, sample_index);
   vec<T, 4> value = source.read(coordinate, 0);
   if (parameters.mode == 0) {
     for (uint sample = 1; sample < parameters.sample_count; ++sample)
@@ -2083,45 +2383,63 @@ bool dxmt_resolve_predicate_passes(device const ulong *predicate,
 
 [[fragment]] float4 dxmt_resolve_float(
     DXMTResolveVertexOutput input [[stage_in]], texture2d_ms<float, access::read> source [[texture(0)]],
-    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]],
+    uint sample_index [[sample_id]]) {
   if (!dxmt_resolve_predicate_passes(predicate, parameters))
     discard_fragment();
-  return dxmt_resolve_value(source, uint2(int2(input.position.xy) + parameters.source_delta), parameters);
+  return dxmt_resolve_value(source, uint2(int2(input.position.xy) + parameters.source_delta), parameters, sample_index);
 }
 
 [[fragment]] uint4 dxmt_resolve_uint(
     DXMTResolveVertexOutput input [[stage_in]], texture2d_ms<uint, access::read> source [[texture(0)]],
-    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]],
+    uint sample_index [[sample_id]]) {
   if (!dxmt_resolve_predicate_passes(predicate, parameters))
     discard_fragment();
-  return dxmt_resolve_value(source, uint2(int2(input.position.xy) + parameters.source_delta), parameters);
+  return dxmt_resolve_value(source, uint2(int2(input.position.xy) + parameters.source_delta), parameters, sample_index);
 }
 
 [[fragment]] int4 dxmt_resolve_sint(
     DXMTResolveVertexOutput input [[stage_in]], texture2d_ms<int, access::read> source [[texture(0)]],
-    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]],
+    uint sample_index [[sample_id]]) {
   if (!dxmt_resolve_predicate_passes(predicate, parameters))
     discard_fragment();
-  return dxmt_resolve_value(source, uint2(int2(input.position.xy) + parameters.source_delta), parameters);
+  return dxmt_resolve_value(source, uint2(int2(input.position.xy) + parameters.source_delta), parameters, sample_index);
 }
 
 struct DXMTDepthResolveOutput {
   float depth [[depth(any)]];
 };
 
-[[fragment]] DXMTDepthResolveOutput dxmt_resolve_depth(
-    DXMTResolveVertexOutput input [[stage_in]], depth2d_ms<float, access::read> source [[texture(0)]],
-    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
-  if (!dxmt_resolve_predicate_passes(predicate, parameters))
-    discard_fragment();
+static float dxmt_resolve_depth_value(DXMTResolveVertexOutput input, depth2d_ms<float, access::read> source,
+    constant DXMTResolveParameters &parameters, uint sample_index) {
   const uint2 coordinate = uint2(int2(input.position.xy) + parameters.source_delta);
+  if (parameters.mode == 3) return source.read(coordinate, sample_index);
   float value = source.read(coordinate, 0);
   for (uint sample = 1; sample < parameters.sample_count; ++sample) {
     const float next = source.read(coordinate, sample);
-    value = parameters.mode == 1 ? (value < next ? value : next)
-                                 : (value > next ? value : next);
+    value = parameters.mode == 0 ? value + next :
+            parameters.mode == 1 ? (value < next ? value : next) : (value > next ? value : next);
   }
-  return {value};
+  if (parameters.mode == 0) value /= parameters.sample_count;
+  return value;
+}
+
+[[fragment]] DXMTDepthResolveOutput dxmt_resolve_depth(
+    DXMTResolveVertexOutput input [[stage_in]], depth2d_ms<float, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]],
+    uint sample_index [[sample_id]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters)) discard_fragment();
+  return {dxmt_resolve_depth_value(input, source, parameters, sample_index)};
+}
+
+[[fragment]] float4 dxmt_resolve_depth_color(
+    DXMTResolveVertexOutput input [[stage_in]], depth2d_ms<float, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]],
+    uint sample_index [[sample_id]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters)) discard_fragment();
+  return float4(dxmt_resolve_depth_value(input, source, parameters, sample_index), 0, 0, 1);
 }
 
 struct DXMTStencilResolveOutput {
@@ -2130,10 +2448,12 @@ struct DXMTStencilResolveOutput {
 
 [[fragment]] DXMTStencilResolveOutput dxmt_resolve_stencil(
     DXMTResolveVertexOutput input [[stage_in]], texture2d_ms<uint, access::read> source [[texture(0)]],
-    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]],
+    uint sample_index [[sample_id]]) {
   if (!dxmt_resolve_predicate_passes(predicate, parameters))
     discard_fragment();
   const uint2 coordinate = uint2(int2(input.position.xy) + parameters.source_delta);
+  if (parameters.mode == 3) return {source.read(coordinate, sample_index).x};
   uint value = source.read(coordinate, 0).x;
   for (uint sample = 1; sample < parameters.sample_count; ++sample) {
     const uint next = source.read(coordinate, sample).x;
@@ -2143,6 +2463,44 @@ struct DXMTStencilResolveOutput {
   return {value};
 }
 
+
+// Single-sample resources can carry private color/depth compression too.
+[[fragment]] float4 dxmt_decompress_float_single(
+    DXMTResolveVertexOutput input [[stage_in]], texture2d<float, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters)) discard_fragment();
+  return source.read(uint2(int2(input.position.xy) + parameters.source_delta));
+}
+[[fragment]] uint4 dxmt_decompress_uint_single(
+    DXMTResolveVertexOutput input [[stage_in]], texture2d<uint, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters)) discard_fragment();
+  return source.read(uint2(int2(input.position.xy) + parameters.source_delta));
+}
+[[fragment]] int4 dxmt_decompress_sint_single(
+    DXMTResolveVertexOutput input [[stage_in]], texture2d<int, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters)) discard_fragment();
+  return source.read(uint2(int2(input.position.xy) + parameters.source_delta));
+}
+[[fragment]] DXMTDepthResolveOutput dxmt_decompress_depth_single(
+    DXMTResolveVertexOutput input [[stage_in]], depth2d<float, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters)) discard_fragment();
+  return {source.read(uint2(int2(input.position.xy) + parameters.source_delta))};
+}
+[[fragment]] float4 dxmt_decompress_depth_color_single(
+    DXMTResolveVertexOutput input [[stage_in]], depth2d<float, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters)) discard_fragment();
+  return float4(source.read(uint2(int2(input.position.xy) + parameters.source_delta)), 0, 0, 1);
+}
+[[fragment]] DXMTStencilResolveOutput dxmt_decompress_stencil_single(
+    DXMTResolveVertexOutput input [[stage_in]], texture2d<uint, access::read> source [[texture(0)]],
+    constant DXMTResolveParameters &parameters [[buffer(0)]], device const ulong *predicate [[buffer(1)]]) {
+  if (!dxmt_resolve_predicate_passes(predicate, parameters)) discard_fragment();
+  return {source.read(uint2(int2(input.position.xy) + parameters.source_delta)).x};
+}
 #include "../d3d12/d3d12_standard_swizzle_gpu.hpp"
 
 static uint d3d12_deposit_tile_bits(uint value, uint mask) {
@@ -2169,6 +2527,7 @@ static ulong d3d12_standard_swizzle_offset(constant D3D12StandardSwizzleParams &
 // Both kernels copy opaque format units. The native-texture blit before/after
 // these kernels supplies the linear staging representation, so BC blocks and
 // typed integer/float/sRGB texels keep their exact bits without shader sampling.
+
 kernel void d3d12_swizzle_import(device const uchar *canonical [[buffer(0)]],
                                   device uchar *linear [[buffer(1)]],
                                   constant D3D12StandardSwizzleParams &p [[buffer(2)]],
@@ -2318,6 +2677,91 @@ kernel void d3d12_swizzle_packed422_export_if_dirty(device const uchar *linear [
 // internal kernels: InternalCommandLibrary loads this one library before asking for
 // the AS prepass, shadow, postbuild, serialization and visualization kernels.
 #include "../winemetal/unix/rt_as_prepass.metal"
+
+#include "../d3d12/d3d12_atomic64_gpu.hpp"
+
+kernel void d3d12_atomic64_import(constant Atomic64TransferParams &p [[buffer(0)]],
+                                  uint cell [[thread_position_in_grid]]) {
+  if (cell >= p.cellCount) return;
+  device const Atomic64ImportCell *sources = reinterpret_cast<device const Atomic64ImportCell *>(p.sources);
+  ulong value = 0;
+  for (uint byte = 0; byte < 8; ++byte) {
+    const ulong address = sources[cell].bytes[byte];
+    if (address) value |= ulong(*reinterpret_cast<device const uchar *>(address)) << (8 * byte);
+  }
+  reinterpret_cast<device ulong *>(p.baseline)[cell] = value;
+  reinterpret_cast<device uint4 *>(p.nodes)[cell] = uint4(0, uint(value), uint(value >> 32), 0);
+}
+
+kernel void d3d12_atomic64_export_buffers(constant Atomic64TransferParams &p [[buffer(0)]],
+                                          uint cell [[thread_position_in_grid]]) {
+  if (cell >= p.cellCount) return;
+  device const Atomic64ImportCell *sources = reinterpret_cast<device const Atomic64ImportCell *>(p.sources);
+  const uint root = reinterpret_cast<device const uint *>(p.roots)[cell];
+  const uint4 node = reinterpret_cast<device const uint4 *>(p.nodes)[root];
+  const ulong value = ulong(node.y) | ulong(node.z) << 32;
+  const ulong baseline = reinterpret_cast<device const ulong *>(p.baseline)[cell];
+  for (uint byte = 0; byte < 8; ++byte) {
+    const ulong address = sources[cell].bytes[byte];
+    if (address && uchar(value >> (8 * byte)) != uchar(baseline >> (8 * byte)))
+      *reinterpret_cast<device uchar *>(address) = uchar(value >> (8 * byte));
+  }
+}
+
+static bool d3d12_atomic64_texel(constant Atomic64TransferParams &p, uint3 coord, thread uint4 &value) {
+  if (coord.x >= p.width || coord.y >= p.height || coord.z >= p.depth) return false;
+  const ulong begin = p.byteBase + ulong(coord.z) * p.rowPitch * p.height +
+                      ulong(coord.y) * p.rowPitch + ulong(coord.x) * p.texelStride;
+  device const uint *map = reinterpret_cast<device const uint *>(p.cellMap);
+  device const uint *roots = reinterpret_cast<device const uint *>(p.roots);
+  device const uint4 *nodes = reinterpret_cast<device const uint4 *>(p.nodes);
+  device const ulong *baseline = reinterpret_cast<device const ulong *>(p.baseline);
+  uchar bytes[16] = {};
+  bool changed = false;
+  for (uint byte = 0; byte < p.unitBytes; ++byte) {
+    const ulong offset = begin + byte;
+    const uint cell = map[offset >> 3];
+    if (cell == 0xffffffffu) return false;
+    const uint4 node = nodes[roots[cell]];
+    const ulong word = ulong(node.y) | ulong(node.z) << 32;
+    bytes[byte] = uchar(word >> ((offset & 7) * 8));
+    changed |= bytes[byte] != uchar(baseline[cell] >> ((offset & 7) * 8));
+  }
+  if (!changed) return false;
+  value = uint4(0);
+  uint bit = 0;
+  for (uint channel = 0; channel < p.channels; ++channel) {
+    const uint bits = (p.channelBits >> (channel * 8)) & 255u;
+    for (uint i = 0; i < bits; ++i, ++bit)
+      value[channel] |= uint((bytes[bit >> 3] >> (bit & 7)) & 1u) << i;
+  }
+  return true;
+}
+
+kernel void d3d12_atomic64_export_2d(constant Atomic64TransferParams &p [[buffer(0)]],
+                                    texture2d<uint, access::write> destination [[texture(0)]],
+                                    uint3 coord [[thread_position_in_grid]]) {
+  uint4 value;
+  if (d3d12_atomic64_texel(p, coord, value)) destination.write(value, coord.xy);
+}
+kernel void d3d12_atomic64_export_array(constant Atomic64TransferParams &p [[buffer(0)]],
+                                       texture2d_array<uint, access::write> destination [[texture(0)]],
+                                       uint3 coord [[thread_position_in_grid]]) {
+  uint4 value;
+  if (d3d12_atomic64_texel(p, coord, value)) {
+    uint3 position = coord;
+    if (p.nativePositions)
+      position = reinterpret_cast<device const uint4 *>(p.nativePositions)[
+          (ulong(coord.z) * p.height + coord.y) * p.width + coord.x].xyz;
+    destination.write(value, position.xy, position.z);
+  }
+}
+kernel void d3d12_atomic64_export_3d(constant Atomic64TransferParams &p [[buffer(0)]],
+                                    texture3d<uint, access::write> destination [[texture(0)]],
+                                    uint3 coord [[thread_position_in_grid]]) {
+  uint4 value;
+  if (d3d12_atomic64_texel(p, coord, value)) destination.write(value, coord);
+}
 
 // Sampler feedback transcoding (src/d3d12/d3d12_sampler_feedback.hpp). A map is u32 cells:
 // MIN_MIP holds 255 - mip (0 = no mip requested, decoded 0xFF); MIP_REGION_USED holds 0 or 1

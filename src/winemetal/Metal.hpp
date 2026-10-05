@@ -1177,7 +1177,7 @@ public:
 
   Reference<Library>
   newLibrary(const void *bytecode, uint64_t bytecode_length, Error &error) {
-    auto data = DispatchData_alloc_init((uint64_t)bytecode, bytecode_length);
+    auto data = DispatchData_alloc_init(bytecode ? WMTGetGuestWindowBase() + (uintptr_t)bytecode : 0, bytecode_length);
     auto ret = Reference<Library>(MTLDevice_newLibrary(handle, data, &error.handle));
     NSObject_release(data);
     return ret;
@@ -1510,7 +1510,8 @@ MakeDispatchData(uint64_t native_ptr, uint64_t length) {
 
 inline Reference<DispatchData>
 MakeDispatchData(void *native_ptr, uint64_t length) {
-  return Reference<DispatchData>(DispatchData_alloc_init((uint64_t)native_ptr, length));
+  return Reference<DispatchData>(
+    DispatchData_alloc_init(native_ptr ? WMTGetGuestWindowBase() + (uintptr_t)native_ptr : 0, length));
 }
 
 inline Object

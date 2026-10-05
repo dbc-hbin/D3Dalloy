@@ -1,15 +1,28 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <d3d12.h>
+#ifndef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#error Compile with the pinned public preview SDK in DXMT_MATRIX_PREVIEW_SDK_HEADER.
+#endif
+#include <rpc.h>
+#include <rpcndr.h>
+#if defined(__clang__) && defined(__MINGW32__)
+#undef __uuidof
+#undef DECLSPEC_UUID
+#define DECLSPEC_UUID(value) __declspec(uuid(value))
+#undef MIDL_INTERFACE
+#define MIDL_INTERFACE(value) struct __declspec(uuid(value))
+#endif
+#include DXMT_MATRIX_PREVIEW_SDK_HEADER
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
-#include "../../src/d3d12/d3d12_interfaces_ext.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 using Microsoft::WRL::ComPtr;
 
@@ -39,12 +52,13 @@ void Upload(ID3D12Resource *buffer, const void *bytes, size_t size, size_t offse
 }
 }
 
-int main() {
+int main(int argc, char **argv) {
   try {
+    const bool reject_limit=argc==2 && std::strcmp(argv[1],"--gpu-limit-reject")==0;
     ComPtr<ID3D12Device5> device; Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "device");
     struct CapabilityBuffer { D3D12_FEATURE_DATA_D3D12_OPTIONS21 options; UINT guard; } capabilities{};
     capabilities.guard = 0xa11c0ded;
-    const auto options_feature = static_cast<D3D12_FEATURE>(dxmt::kFeatureD3D12Options21);
+    const auto options_feature = static_cast<D3D12_FEATURE>(D3D12_FEATURE_D3D12_OPTIONS21);
     Require(device->CheckFeatureSupport(options_feature, &capabilities.options, sizeof(capabilities.options) - 1) == E_INVALIDARG,
             "OPTIONS21 truncated structure rejected");
     Require(device->CheckFeatureSupport(options_feature, &capabilities.options, sizeof(capabilities)) == E_INVALIDARG,
@@ -52,13 +66,15 @@ int main() {
     Check(device->CheckFeatureSupport(options_feature, &capabilities.options, sizeof(capabilities.options)), "OPTIONS21");
     Require(capabilities.options.WorkGraphsTier == D3D12_WORK_GRAPHS_TIER_1_0 && capabilities.guard == 0xa11c0ded,
             "Work Graph Tier1.0 exact typed capability");
-    std::printf("OWNED_D3D12_WORK_GRAPHS_CAPS tier=%u options21_bytes=%u\n",
+    if(!reject_limit) std::printf("OWNED_D3D12_WORK_GRAPHS_CAPS tier=%u options21_bytes=%u\n",
                 UINT(capabilities.options.WorkGraphsTier), UINT(sizeof(capabilities.options)));
     ComPtr<IDXGIFactory4> factory; Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "factory");
     ComPtr<IDXGIAdapter1> adapter; Check(factory->EnumAdapters1(0, &adapter), "adapter"); DXGI_ADAPTER_DESC1 adapter_desc{};
     Check(adapter->GetDesc1(&adapter_desc), "adapter description");
-    std::printf("OWNED_D3D12_WORK_GRAPHS_BACKEND id=owned-graphics-d3d12\n");
-    std::printf("OWNED_D3D12_WORK_GRAPHS_ADAPTER name=%ls vendor=%04x device=%04x\n", adapter_desc.Description, adapter_desc.VendorId, adapter_desc.DeviceId);
+    if(!reject_limit) {
+      std::printf("OWNED_D3D12_WORK_GRAPHS_BACKEND id=owned-graphics-d3d12\n");
+      std::printf("OWNED_D3D12_WORK_GRAPHS_ADAPTER name=%ls vendor=%04x device=%04x\n", adapter_desc.Description, adapter_desc.VendorId, adapter_desc.DeviceId);
+    }
     D3D12_ROOT_PARAMETER parameter{}; parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     parameter.Descriptor.ShaderRegister = 0; parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC root_desc{1, &parameter, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
@@ -78,34 +94,30 @@ int main() {
             collection_properties->GetEntrypointRecordSizeInBytes(0, 0) == UINT_MAX &&
             collection_properties->GetEntrypointRecordAlignmentInBytes(0, 0) == UINT_MAX, "invalid graph property sentinel");
     D3D12_EXISTING_COLLECTION_DESC existing{collection.Get(), 0, nullptr};
-    D3D12_NODE orphan_node{}; orphan_node.NodeType = dxmt::kNodeTypeShader; orphan_node.Shader.Shader = L"terminal";
+    D3D12_NODE orphan_node{}; orphan_node.NodeType = D3D12_NODE_TYPE_SHADER; orphan_node.Shader.Shader = L"terminal";
     D3D12_WORK_GRAPH_DESC orphan_graph{}; orphan_graph.ProgramName = L"orphan";
     orphan_graph.NumExplicitlyDefinedNodes = 1; orphan_graph.pExplicitlyDefinedNodes = &orphan_node;
     std::array<D3D12_STATE_SUBOBJECT, 2> orphan_subobjects{{
       {D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &existing},
-      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &orphan_graph}}};
-    D3D12_STATE_OBJECT_DESC orphan_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(dxmt::kStateObjectTypeExecutable), 2, orphan_subobjects.data()};
+      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &orphan_graph}}};
+    D3D12_STATE_OBJECT_DESC orphan_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(D3D12_STATE_OBJECT_TYPE_EXECUTABLE), 2, orphan_subobjects.data()};
     ComPtr<ID3D12StateObject> invalid_state;
     Require(device->CreateStateObject(&orphan_desc, IID_PPV_ARGS(&invalid_state)) == E_INVALIDARG, "orphan explicit node rejected");
-    D3D12_WORK_GRAPH_DESC graph{}; graph.ProgramName = L"bounded"; graph.Flags = dxmt::kWorkGraphFlagIncludeAllAvailableNodes;
+    D3D12_WORK_GRAPH_DESC graph{}; graph.ProgramName = L"bounded"; graph.Flags = D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES;
     D3D12_WORK_GRAPH_DESC empty_graph{}; empty_graph.ProgramName = L"empty";
     D3D12_STATE_OBJECT_CONFIG config{D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS};
     std::array<D3D12_STATE_SUBOBJECT, 5> subobjects{{
       {D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &existing}, {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &global},
-      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &graph},
-      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &empty_graph},
+      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &graph},
+      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &empty_graph},
       {D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &config}}};
-    D3D12_STATE_OBJECT_DESC state_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(dxmt::kStateObjectTypeExecutable), UINT(subobjects.size()), subobjects.data()};
+    D3D12_STATE_OBJECT_DESC state_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(D3D12_STATE_OBJECT_TYPE_EXECUTABLE), UINT(subobjects.size()), subobjects.data()};
     ComPtr<ID3D12StateObject> state; Check(device->CreateStateObject(&state_desc, IID_PPV_ARGS(&state)), "CreateStateObject");
     ComPtr<ID3D12WorkGraphProperties> initial_properties; Check(state.As(&initial_properties), "initial graph properties");
     ComPtr<ID3D12StateObjectProperties1> initial_state_properties; Check(state.As(&initial_state_properties), "initial state properties");
     UINT empty_index = initial_properties->GetWorkGraphIndex(L"empty");
     D3D12_PROGRAM_IDENTIFIER empty_identifier{};
-#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
     initial_state_properties->GetProgramIdentifier(&empty_identifier, L"empty");
-#else
-    empty_identifier = initial_state_properties->GetProgramIdentifier(L"empty");
-#endif
     D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS empty_memory{}; initial_properties->GetWorkGraphMemoryRequirements(empty_index, &empty_memory);
     Require(initial_properties->GetNumWorkGraphs() == 2 && initial_properties->GetNumNodes(empty_index) == 0 &&
             initial_properties->GetNumEntrypoints(empty_index) == 0 && empty_memory.MinSizeInBytes == 0 &&
@@ -114,12 +126,12 @@ int main() {
             empty_identifier.OpaqueData[2] == 0 && empty_identifier.OpaqueData[3] == 0, "empty graph remains empty with available entrypoint shaders");
     D3D12_NODE_ID added_id{L"added", 0}; BOOL added_entry = TRUE;
     D3D12_COMMON_COMPUTE_NODE_OVERRIDES overrides{}; overrides.pNewName = &added_id; overrides.pProgramEntry = &added_entry;
-    D3D12_NODE added_node{}; added_node.NodeType = dxmt::kNodeTypeShader; added_node.Shader.Shader = L"terminal";
-    added_node.Shader.OverridesType = dxmt::kNodeOverridesCommonCompute; added_node.Shader.pCommonComputeNodeOverrides = &overrides;
+    D3D12_NODE added_node{}; added_node.NodeType = D3D12_NODE_TYPE_SHADER; added_node.Shader.Shader = L"terminal";
+    added_node.Shader.OverridesType = D3D12_NODE_OVERRIDES_TYPE_COMMON_COMPUTE; added_node.Shader.pCommonComputeNodeOverrides = &overrides;
     D3D12_WORK_GRAPH_DESC extension{}; extension.ProgramName = L"bounded"; extension.NumExplicitlyDefinedNodes = 1;
     extension.pExplicitlyDefinedNodes = &added_node;
-    D3D12_STATE_SUBOBJECT extension_subobject{static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &extension};
-    D3D12_STATE_OBJECT_DESC extension_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(dxmt::kStateObjectTypeExecutable), 1, &extension_subobject};
+    D3D12_STATE_SUBOBJECT extension_subobject{static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &extension};
+    D3D12_STATE_OBJECT_DESC extension_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(D3D12_STATE_OBJECT_TYPE_EXECUTABLE), 1, &extension_subobject};
     ComPtr<ID3D12Device7> additions_device; Check(device.As(&additions_device), "Device7");
     Require(additions_device->AddToStateObject(&extension_desc, state.Get(), IID_PPV_ARGS(&invalid_state)) == E_INVALIDARG, "addition must opt in");
     std::array<D3D12_STATE_SUBOBJECT, 2> addition_subobjects{{extension_subobject, {D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &config}}};
@@ -163,11 +175,11 @@ int main() {
     expected_sum += 42; ++expected_count;
     auto sharing_shader = Shader("work-graphs-sharing.dxil");
     D3D12_DXIL_LIBRARY_DESC sharing_library{{sharing_shader.data(), sharing_shader.size()}, 0, nullptr};
-    D3D12_WORK_GRAPH_DESC sharing_graph{}; sharing_graph.ProgramName = L"sharing"; sharing_graph.Flags = dxmt::kWorkGraphFlagIncludeAllAvailableNodes;
+    D3D12_WORK_GRAPH_DESC sharing_graph{}; sharing_graph.ProgramName = L"sharing"; sharing_graph.Flags = D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES;
     std::array<D3D12_STATE_SUBOBJECT, 2> sharing_subobjects{{
       {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &sharing_library},
-      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &sharing_graph}}};
-    D3D12_STATE_OBJECT_DESC sharing_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(dxmt::kStateObjectTypeExecutable), 2, sharing_subobjects.data()};
+      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &sharing_graph}}};
+    D3D12_STATE_OBJECT_DESC sharing_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(D3D12_STATE_OBJECT_TYPE_EXECUTABLE), 2, sharing_subobjects.data()};
     ComPtr<ID3D12StateObject> sharing_state; Check(device->CreateStateObject(&sharing_desc, IID_PPV_ARGS(&sharing_state)), "sharing state");
     ComPtr<ID3D12WorkGraphProperties> sharing_properties; Check(sharing_state.As(&sharing_properties), "sharing properties");
     ComPtr<ID3D12StateObjectProperties1> sharing_identifiers; Check(sharing_state.As(&sharing_identifiers), "sharing identifiers");
@@ -177,17 +189,17 @@ int main() {
     D3D12_COMMON_COMPUTE_NODE_OVERRIDES producer_override{}; producer_override.NumOutputOverrides = 1; producer_override.pOutputOverrides = &producer_output;
     BOOL cross_array_entry = TRUE; producer_override.pProgramEntry = &cross_array_entry;
     std::array<D3D12_NODE, 2> cross_array_nodes{};
-    cross_array_nodes[0].NodeType = cross_array_nodes[1].NodeType = dxmt::kNodeTypeShader;
-    cross_array_nodes[0].Shader.Shader = L"counter"; cross_array_nodes[0].Shader.OverridesType = dxmt::kNodeOverridesCommonCompute;
+    cross_array_nodes[0].NodeType = cross_array_nodes[1].NodeType = D3D12_NODE_TYPE_SHADER;
+    cross_array_nodes[0].Shader.Shader = L"counter"; cross_array_nodes[0].Shader.OverridesType = D3D12_NODE_OVERRIDES_TYPE_COMMON_COMPUTE;
     cross_array_nodes[0].Shader.pCommonComputeNodeOverrides = &counter_override;
-    cross_array_nodes[1].Shader.Shader = L"producer"; cross_array_nodes[1].Shader.OverridesType = dxmt::kNodeOverridesCommonCompute;
+    cross_array_nodes[1].Shader.Shader = L"producer"; cross_array_nodes[1].Shader.OverridesType = D3D12_NODE_OVERRIDES_TYPE_COMMON_COMPUTE;
     cross_array_nodes[1].Shader.pCommonComputeNodeOverrides = &producer_override;
     D3D12_WORK_GRAPH_DESC cross_array_graph{}; cross_array_graph.ProgramName = L"cross-array";
     cross_array_graph.NumExplicitlyDefinedNodes = 2; cross_array_graph.pExplicitlyDefinedNodes = cross_array_nodes.data();
     std::array<D3D12_STATE_SUBOBJECT, 2> cross_array_subobjects{{
       {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &sharing_library},
-      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &cross_array_graph}}};
-    D3D12_STATE_OBJECT_DESC cross_array_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(dxmt::kStateObjectTypeExecutable), 2, cross_array_subobjects.data()};
+      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &cross_array_graph}}};
+    D3D12_STATE_OBJECT_DESC cross_array_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(D3D12_STATE_OBJECT_TYPE_EXECUTABLE), 2, cross_array_subobjects.data()};
     Require(device->CreateStateObject(&cross_array_desc, IID_PPV_ARGS(&invalid_state)) == E_INVALIDARG, "different array entries cannot connect");
     Require(sharing_properties->GetNumNodes(0) == 6 && sharing_properties->GetNumEntrypoints(0) == 2, "sharing node topology");
     UINT sharing_entry = sharing_properties->GetEntrypointIndex(0, {L"producer", 0});
@@ -226,6 +238,12 @@ int main() {
       if (mode == 4) Upload(seeds.Get(), &empty_gpu, sizeof(empty_gpu), 96);
       ComPtr<ID3D12CommandAllocator> allocator; Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "allocator");
       ComPtr<ID3D12GraphicsCommandList10> list; Check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)), "CommandList10");
+      ComPtr<ID3D12GraphicsCommandListPreview> preview; Check(list.As(&preview), "work graph Preview");
+      if(mode==1 && !reject_limit) {
+        preview->SetWorkGraphMaximumGPUInputRecords(0,0);
+        Check(list->Close(),"limit reset Close"); Check(allocator->Reset(),"limit reset allocator");
+        Check(list->Reset(allocator.Get(),nullptr),"limit reset recording");
+      } else preview->SetWorkGraphMaximumGPUInputRecords(reject_limit?3:5,reject_limit?1:3);
       D3D12_RESOURCE_BARRIER barrier{}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; barrier.Transition.pResource = result.Get();
       barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
       barrier.Transition.StateBefore = mode ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -233,35 +251,41 @@ int main() {
       list->CopyBufferRegion(result.Get(), 0, zero.Get(), 0, 8);
       barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; list->ResourceBarrier(1, &barrier);
       list->SetComputeRootSignature(root.Get()); list->SetComputeRootUnorderedAccessView(0, result->GetGPUVirtualAddress());
-      D3D12_SET_PROGRAM_DESC program{}; program.Type = dxmt::kProgramTypeWorkGraph;
-#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+      D3D12_SET_PROGRAM_DESC program{}; program.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
       (mode == 4 ? sharing_identifiers.Get() : identifiers.Get())->GetProgramIdentifier(&program.WorkGraph.ProgramIdentifier, mode == 4 ? L"sharing" : L"bounded");
-#else
-      program.WorkGraph.ProgramIdentifier = (mode == 4 ? sharing_identifiers.Get() : identifiers.Get())->GetProgramIdentifier(mode == 4 ? L"sharing" : L"bounded");
-#endif
-      program.WorkGraph.Flags = mode == 0 || mode == 4 ? dxmt::kSetWorkGraphFlagInitialize : 0;
+      program.WorkGraph.Flags = mode == 0 || mode == 4 ? D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE : D3D12_SET_WORK_GRAPH_FLAG_NONE;
       program.WorkGraph.BackingMemory = mode == 4 ? D3D12_GPU_VIRTUAL_ADDRESS_RANGE{sharing_backing->GetGPUVirtualAddress(), sharing_memory.MinSizeInBytes} : D3D12_GPU_VIRTUAL_ADDRESS_RANGE{backing->GetGPUVirtualAddress(), memory.MinSizeInBytes};
       if (mode == 4) program.WorkGraph.NodeLocalRootArgumentsTable = {seeds->GetGPUVirtualAddress() + 192, sizeof(local_values), 8};
       list->SetProgram(&program);
-      D3D12_DISPATCH_GRAPH_DESC dispatch{}; dispatch.Mode = mode == 4 ? 0 : mode;
+      D3D12_DISPATCH_GRAPH_DESC dispatch{}; dispatch.Mode = static_cast<D3D12_DISPATCH_MODE>(mode == 4 ? 0 : mode);
       std::array<D3D12_NODE_CPU_INPUT, 3> cpu_multi{{{entry, 2, input.data(), 4}, {entry, 2, input.data() + 2, 4}, {added, 1, &added_value, 4}}};
       if (mode == 0) dispatch.NodeCPUInput = {entry, UINT(input.size()), input.data(), 4};
       if (mode == 1) dispatch.NodeGPUInput = seeds->GetGPUVirtualAddress() + 32;
       if (mode == 2) dispatch.MultiNodeCPUInput = {3, cpu_multi.data(), sizeof(D3D12_NODE_CPU_INPUT)};
       if (mode == 3) dispatch.MultiNodeGPUInput = seeds->GetGPUVirtualAddress() + 144;
       if (mode == 4) dispatch.NodeCPUInput = {sharing_entry, UINT(input.size()), &sharing_seed, 0};
+      if(reject_limit) { dispatch.Mode=D3D12_DISPATCH_MODE_NODE_GPU_INPUT; dispatch.NodeGPUInput=seeds->GetGPUVirtualAddress()+32; }
       list->DispatchGraph(&dispatch);
       D3D12_DISPATCH_GRAPH_DESC added_dispatch{};
-      added_dispatch.Mode = 0; added_dispatch.NodeCPUInput = {added, 1, &added_value, 4};
+      added_dispatch.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT; added_dispatch.NodeCPUInput = {added, 1, &added_value, 4};
       if (mode < 2) list->DispatchGraph(&added_dispatch);
       if (mode == 4) {
-        D3D12_DISPATCH_GRAPH_DESC empty_dispatch{}; empty_dispatch.Mode = 0;
+        D3D12_DISPATCH_GRAPH_DESC empty_dispatch{}; empty_dispatch.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
         empty_dispatch.NodeCPUInput = {empty_entry, 4, nullptr, 0}; list->DispatchGraph(&empty_dispatch);
-        empty_dispatch.Mode = 1; empty_dispatch.NodeGPUInput = seeds->GetGPUVirtualAddress() + 96; list->DispatchGraph(&empty_dispatch);
+        empty_dispatch.Mode = D3D12_DISPATCH_MODE_NODE_GPU_INPUT; empty_dispatch.NodeGPUInput = seeds->GetGPUVirtualAddress() + 96; list->DispatchGraph(&empty_dispatch);
       }
       barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE; list->ResourceBarrier(1, &barrier);
       list->CopyBufferRegion(readback.Get(), 0, result.Get(), 0, 8); Check(list->Close(), "Close");
+      if(reject_limit) Check(fence->SetEventOnCompletion(1,event),"limit removal event");
       ID3D12CommandList *lists[]{list.Get()}; queue->ExecuteCommandLists(1, lists);
+      if(reject_limit) {
+        queue->Signal(fence.Get(),1);
+        Require(WaitForSingleObject(event,180000)==WAIT_OBJECT_0,"over-limit rejection completion");
+        Require(device->GetDeviceRemovedReason()==DXGI_ERROR_DRIVER_INTERNAL_ERROR,"over-limit rejected at execution");
+        Require(fence->GetCompletedValue()==UINT64_MAX,"rejected dispatch cannot publish successful fence");
+        CloseHandle(event);
+        std::puts("OWNED_D3D12_WORK_GRAPHS_LIMIT_REJECT_PASS records=4 max=3 nodes=1 max_nodes=1"); return 0;
+      }
       Check(queue->Signal(fence.Get(), mode + 1), "Signal"); Check(fence->SetEventOnCompletion(mode + 1, event), "SetEventOnCompletion");
       Require(WaitForSingleObject(event, 180000) == WAIT_OBJECT_0, "GPU completion"); Check(device->GetDeviceRemovedReason(), "device alive");
       void *mapping = nullptr; D3D12_RANGE range{0, 8}; Check(readback->Map(0, &range, &mapping), "Map result");
@@ -270,6 +294,7 @@ int main() {
       if (mode == 1) for (auto seed : input) oracle_sum -= (seed - input.front()) * 30 * 16 * 3;
       std::printf("OWNED_D3D12_WORK_GRAPHS_RESULT mode=%u sum=%u expected_sum=%u count=%u expected_count=%u\n", mode, actual[0], oracle_sum, actual[1], oracle_count);
       Require(actual[0] == oracle_sum && actual[1] == oracle_count, "exact CPU oracle");
+      if(mode==1) std::puts("OWNED_D3D12_WORK_GRAPHS_LIMIT_RESET_PASS default_restored=1 records=4");
       if (mode == 4) std::printf("OWNED_D3D12_WORK_GRAPHS_CASE_PASS shared_budget_sparse_array_input_sharing_local_roots_cross_group\n");
       else std::printf("OWNED_D3D12_WORK_GRAPHS_CASE_PASS mode_%u_min_backing_depth32_fanout16\n", mode);
       std::fflush(stdout);
@@ -326,7 +351,7 @@ int main() {
     std::array<D3D12_WORK_GRAPH_DESC, 2> link_graphs{};
     std::array<LPCWSTR, 2> link_programs{{L"link-A", L"link-B"}};
     for (UINT p = 0; p < link_graphs.size(); ++p) {
-      link_nodes_desc[p].NodeType = dxmt::kNodeTypeShader; link_nodes_desc[p].Shader.Shader = link_exports[p];
+      link_nodes_desc[p].NodeType = D3D12_NODE_TYPE_SHADER; link_nodes_desc[p].Shader.Shader = link_exports[p];
       link_graphs[p].ProgramName = link_programs[p]; link_graphs[p].NumExplicitlyDefinedNodes = 1;
       link_graphs[p].pExplicitlyDefinedNodes = &link_nodes_desc[p];
     }
@@ -339,9 +364,9 @@ int main() {
                        {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &link_global[1]},
                        {D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &link_associations[0]},
                        {D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &link_associations[1]},
-                       {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &link_graphs[0]},
-                       {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &link_graphs[1]}}};
-    D3D12_STATE_OBJECT_DESC link_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(dxmt::kStateObjectTypeExecutable), UINT(link_subobjects.size()), link_subobjects.data()};
+                       {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &link_graphs[0]},
+                       {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &link_graphs[1]}}};
+    D3D12_STATE_OBJECT_DESC link_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(D3D12_STATE_OBJECT_TYPE_EXECUTABLE), UINT(link_subobjects.size()), link_subobjects.data()};
     D3D12_STATE_OBJECT_CONFIG strict_config{D3D12_STATE_OBJECT_FLAG_NONE};
     link_subobjects[1] = {D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &strict_config};
     Require(device->CreateStateObject(&link_desc, IID_PPV_ARGS(&invalid_state)) == E_INVALIDARG, "missing external helper definition rejected");
@@ -400,15 +425,11 @@ int main() {
       if (p) list->SetComputeRoot32BitConstant(0, 13, 0);
       list->SetComputeRootUnorderedAccessView(p ? 1 : 0, link_result->GetGPUVirtualAddress());
       list->SetComputeRootUnorderedAccessView(p ? 2 : 1, helper_result->GetGPUVirtualAddress());
-      D3D12_SET_PROGRAM_DESC linked_program{}; linked_program.Type = dxmt::kProgramTypeWorkGraph;
-#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+      D3D12_SET_PROGRAM_DESC linked_program{}; linked_program.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
       link_identifiers->GetProgramIdentifier(&linked_program.WorkGraph.ProgramIdentifier, link_programs[p]);
-#else
-      linked_program.WorkGraph.ProgramIdentifier = link_identifiers->GetProgramIdentifier(link_programs[p]);
-#endif
-      linked_program.WorkGraph.Flags = dxmt::kSetWorkGraphFlagInitialize;
+      linked_program.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
       linked_program.WorkGraph.BackingMemory = {link_backing->GetGPUVirtualAddress(), requirements.MinSizeInBytes}; list->SetProgram(&linked_program);
-      D3D12_DISPATCH_GRAPH_DESC linked_dispatch{}; linked_dispatch.Mode = 0;
+      D3D12_DISPATCH_GRAPH_DESC linked_dispatch{}; linked_dispatch.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
       UINT entry_index = link_properties->GetEntrypointIndex(graph_index, {p ? L"linkB" : L"linkA", 0});
       Require(entry_index != UINT_MAX, "linked entrypoint");
       linked_dispatch.NodeCPUInput = {entry_index, UINT(link_input.size()), link_input.data(), sizeof(UINT)}; list->DispatchGraph(&linked_dispatch);
@@ -450,7 +471,7 @@ int main() {
     D3D12_GLOBAL_ROOT_SIGNATURE sample_global{sample_roots[0].Get()}, sample_conflict{sample_roots[2].Get()};
     D3D12_LOCAL_ROOT_SIGNATURE sample_local{sample_roots[1].Get()};
     LPCWSTR sample_export_name = L"SampleLocal";
-    D3D12_NODE sample_node{}; sample_node.NodeType = dxmt::kNodeTypeShader; sample_node.Shader.Shader = sample_export_name;
+    D3D12_NODE sample_node{}; sample_node.NodeType = D3D12_NODE_TYPE_SHADER; sample_node.Shader.Shader = sample_export_name;
     D3D12_WORK_GRAPH_DESC sample_graph{}; sample_graph.ProgramName = L"local-sampler"; sample_graph.NumExplicitlyDefinedNodes = 1; sample_graph.pExplicitlyDefinedNodes = &sample_node;
     std::array<D3D12_STATE_SUBOBJECT, 5> sample_subobjects{};
     D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION sample_association{&sample_subobjects[2], 1, &sample_export_name};
@@ -458,8 +479,8 @@ int main() {
                          {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &sample_global},
                          {D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &sample_local},
                          {D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &sample_association},
-                         {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &sample_graph}}};
-    D3D12_STATE_OBJECT_DESC sample_state_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(dxmt::kStateObjectTypeExecutable), UINT(sample_subobjects.size()), sample_subobjects.data()};
+                         {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &sample_graph}}};
+    D3D12_STATE_OBJECT_DESC sample_state_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(D3D12_STATE_OBJECT_TYPE_EXECUTABLE), UINT(sample_subobjects.size()), sample_subobjects.data()};
     sample_subobjects[1].pDesc = &sample_conflict;
     Require(device->CreateStateObject(&sample_state_desc, IID_PPV_ARGS(&invalid_state)) == E_INVALIDARG, "conflicting global and local static sampler rejected");
     sample_subobjects[1].pDesc = &sample_global;
@@ -490,7 +511,7 @@ int main() {
     D3D12_STATE_OBJECT_CONFIG sample_additions{D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS};
     std::array<D3D12_STATE_SUBOBJECT, 4> sample_import{{{D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &sample_existing},
       {D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &sample_import_association},
-      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(dxmt::kStateSubobjectTypeWorkGraph), &sample_graph},
+      {static_cast<D3D12_STATE_SUBOBJECT_TYPE>(D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH), &sample_graph},
       {D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &sample_additions}}};
     sample_state_desc.NumSubobjects = sample_import.size(); sample_state_desc.pSubobjects = sample_import.data();
     ComPtr<ID3D12StateObject> sample_state; Check(device->CreateStateObject(&sample_state_desc, IID_PPV_ARGS(&sample_state)), "local static-only sampler union state");
@@ -499,7 +520,7 @@ int main() {
     std::array<D3D12_STATE_SUBOBJECT, 2> inherited_root_subobjects{{
       {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &inherited_root_library},
       {D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, &sample_additions}}};
-    D3D12_STATE_OBJECT_DESC inherited_root_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(dxmt::kStateObjectTypeExecutable), UINT(inherited_root_subobjects.size()), inherited_root_subobjects.data()};
+    D3D12_STATE_OBJECT_DESC inherited_root_desc{static_cast<D3D12_STATE_OBJECT_TYPE>(D3D12_STATE_OBJECT_TYPE_EXECUTABLE), UINT(inherited_root_subobjects.size()), inherited_root_subobjects.data()};
     ComPtr<ID3D12StateObject> inherited_root_state;
     Check(additions_device->AddToStateObject(&inherited_root_desc, sample_state.Get(), IID_PPV_ARGS(&inherited_root_state)), "inherited named root identical redeclaration");
     sample_state = inherited_root_state;
@@ -508,8 +529,8 @@ int main() {
     UINT sample_graph_index = sample_properties->GetWorkGraphIndex(L"local-sampler");
     D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS sample_memory{}; sample_properties->GetWorkGraphMemoryRequirements(sample_graph_index, &sample_memory);
     auto sample_backing = Buffer(device.Get(), sample_memory.MinSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    auto sample_result = Buffer(device.Get(), 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    auto sample_readback = Buffer(device.Get(), 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto sample_result = Buffer(device.Get(), 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto sample_readback = Buffer(device.Get(), 24, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_RESOURCE_DESC texture_desc{}; texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; texture_desc.Width = 1; texture_desc.Height = 1;
     texture_desc.DepthOrArraySize = 1; texture_desc.MipLevels = 1; texture_desc.Format = DXGI_FORMAT_R32_FLOAT; texture_desc.SampleDesc.Count = 1;
     D3D12_HEAP_PROPERTIES texture_heap{}; texture_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -522,7 +543,11 @@ int main() {
     ComPtr<ID3D12DescriptorHeap> srv_heap; Check(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap)), "sample SRV heap");
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{}; srv.Format = DXGI_FORMAT_R32_FLOAT; srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(sample_texture.Get(), &srv, srv_heap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_CPU_DESCRIPTOR_HANDLE sample_cpu_handle{};
+    D3D12_GPU_DESCRIPTOR_HANDLE sample_gpu_handle{};
+    srv_heap->GetCPUDescriptorHandleForHeapStart(&sample_cpu_handle);
+    srv_heap->GetGPUDescriptorHandleForHeapStart(&sample_gpu_handle);
+    device->CreateShaderResourceView(sample_texture.Get(), &srv, sample_cpu_handle);
     ComPtr<ID3D12CommandAllocator> sample_allocator; Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&sample_allocator)), "sample allocator");
     ComPtr<ID3D12GraphicsCommandList10> sample_list; Check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, sample_allocator.Get(), nullptr, IID_PPV_ARGS(&sample_list)), "sample CommandList10");
     D3D12_TEXTURE_COPY_LOCATION texture_dst{}; texture_dst.pResource = sample_texture.Get(); texture_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -533,32 +558,128 @@ int main() {
     sample_list->ResourceBarrier(1, &sample_barrier);
     sample_barrier.Transition.pResource = sample_result.Get(); sample_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; sample_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     sample_list->ResourceBarrier(1, &sample_barrier); sample_list->CopyBufferRegion(sample_result.Get(), 0, zero.Get(), 0, 8);
+    sample_list->CopyBufferRegion(sample_result.Get(), 8, zero.Get(), 0, 8);
     sample_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; sample_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; sample_list->ResourceBarrier(1, &sample_barrier);
     ID3D12DescriptorHeap *sample_heaps[]{srv_heap.Get()}; sample_list->SetDescriptorHeaps(1, sample_heaps);
-    sample_list->SetComputeRootSignature(sample_roots[0].Get()); sample_list->SetComputeRootDescriptorTable(0, srv_heap->GetGPUDescriptorHandleForHeapStart());
+    sample_list->SetComputeRootSignature(sample_roots[0].Get()); sample_list->SetComputeRootDescriptorTable(0, sample_gpu_handle);
     sample_list->SetComputeRootUnorderedAccessView(1, sample_result->GetGPUVirtualAddress());
-    D3D12_SET_PROGRAM_DESC sample_program{}; sample_program.Type = dxmt::kProgramTypeWorkGraph;
-#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    D3D12_SET_PROGRAM_DESC sample_program{}; sample_program.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
     sample_identifiers->GetProgramIdentifier(&sample_program.WorkGraph.ProgramIdentifier, L"local-sampler");
-#else
-    sample_program.WorkGraph.ProgramIdentifier = sample_identifiers->GetProgramIdentifier(L"local-sampler");
-#endif
-    sample_program.WorkGraph.Flags = dxmt::kSetWorkGraphFlagInitialize; sample_program.WorkGraph.BackingMemory = {sample_backing->GetGPUVirtualAddress(), sample_memory.MinSizeInBytes};
+    sample_program.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE; sample_program.WorkGraph.BackingMemory = {sample_backing->GetGPUVirtualAddress(), sample_memory.MinSizeInBytes};
     // NodeLocalRootArgumentsTable stays {0,0,0}: the associated local root contains no parameters.
     sample_list->SetProgram(&sample_program);
-    D3D12_DISPATCH_GRAPH_DESC sample_dispatch{}; sample_dispatch.Mode = 0;
+    D3D12_DISPATCH_GRAPH_DESC sample_dispatch{}; sample_dispatch.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
     UINT sample_entry = sample_properties->GetEntrypointIndex(sample_graph_index, {L"sampleLocal", 0}); Require(sample_entry != UINT_MAX, "sample entrypoint");
-    sample_dispatch.NodeCPUInput = {sample_entry, UINT(link_input.size()), link_input.data(), sizeof(UINT)}; sample_list->DispatchGraph(&sample_dispatch);
+    sample_dispatch.NodeCPUInput = {sample_entry, 2, link_input.data(), sizeof(UINT)}; sample_list->DispatchGraph(&sample_dispatch);
+    // LinkA observes input values, unlike SampleLocal, which only observes record count.
+    const UINT retained_graph = link_properties->GetWorkGraphIndex(link_programs[0]);
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS retained_memory{}; link_properties->GetWorkGraphMemoryRequirements(retained_graph, &retained_memory);
+    auto retained_backing = Buffer(device.Get(), retained_memory.MinSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto retained_result = Buffer(device.Get(), 32, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto retained_readback = Buffer(device.Get(), 32, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    for (UINT offset = 0; offset < 32; offset += 8) sample_list->CopyBufferRegion(retained_result.Get(), offset, zero.Get(), 0, 8);
+    D3D12_RESOURCE_BARRIER retained_barrier{}; retained_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    retained_barrier.Transition = {retained_result.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    sample_list->ResourceBarrier(1, &retained_barrier);
+    D3D12_SET_PROGRAM_DESC retained_program{}; retained_program.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+    link_identifiers->GetProgramIdentifier(&retained_program.WorkGraph.ProgramIdentifier, link_programs[0]);
+    retained_program.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
+    retained_program.WorkGraph.BackingMemory = {retained_backing->GetGPUVirtualAddress(), retained_memory.MinSizeInBytes};
+    std::array<UINT, 2> retained_inputs{{1, 2}};
+    D3D12_DISPATCH_GRAPH_DESC retained_dispatch{}; retained_dispatch.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+    retained_dispatch.NodeCPUInput = {link_properties->GetEntrypointIndex(retained_graph, {L"linkA", 0}), 2, retained_inputs.data(), sizeof(UINT)};
+    sample_list->SetComputeRootSignature(link_roots[0].Get());
+    sample_list->SetComputeRootUnorderedAccessView(0, retained_result->GetGPUVirtualAddress());
+    sample_list->SetComputeRootUnorderedAccessView(1, retained_result->GetGPUVirtualAddress() + 8);
+    sample_list->SetProgram(&retained_program); sample_list->DispatchGraph(&retained_dispatch);
+    retained_inputs = {{100, 200}}; // DispatchGraph must copy CPU input before returning.
+    // CPU records live in the dispatch; only roots and static samplers live in the arena.
+    // A count-clamped compute batch grows that same allocator without increasing graph work.
+    constexpr UINT growth_slots = 16385;
+    constexpr UINT64 growth_root_bytes = UINT64(growth_slots) * 256;
+    // Reuse the arena fixture's Wine-supported DXBC source and compiler flags.
+    const char growth_source[] = "cbuffer Constants : register(b0) { uint4 packed[15]; uint2 tail; };"
+      "RWStructuredBuffer<uint> output : register(u0);"
+      "[numthreads(1,1,1)] void main() { output[packed[0].x] = packed[0].y ^ tail.y; }";
+    ComPtr<ID3DBlob> growth_shader; Check(D3DCompile(growth_source, sizeof(growth_source) - 1, nullptr, nullptr, nullptr,
+      "main", "cs_5_0", 0, 0, &growth_shader, nullptr), "arena growth compute shader");
+    std::array<D3D12_ROOT_PARAMETER, 2> growth_parameters{};
+    growth_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    growth_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    growth_parameters[1].Constants.Num32BitValues = 62;
+    D3D12_ROOT_SIGNATURE_DESC growth_root_desc{2, growth_parameters.data(), 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> growth_serialized; Check(D3D12SerializeRootSignature(&growth_root_desc, D3D_ROOT_SIGNATURE_VERSION_1,
+      &growth_serialized, nullptr), "arena growth serialize root");
+    ComPtr<ID3D12RootSignature> growth_root; Check(device->CreateRootSignature(0, growth_serialized->GetBufferPointer(),
+      growth_serialized->GetBufferSize(), IID_PPV_ARGS(&growth_root)), "arena growth root");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC growth_pso_desc{}; growth_pso_desc.pRootSignature = growth_root.Get();
+    growth_pso_desc.CS = {growth_shader->GetBufferPointer(), growth_shader->GetBufferSize()};
+    ComPtr<ID3D12PipelineState> growth_pso; Check(device->CreateComputePipelineState(&growth_pso_desc,
+      IID_PPV_ARGS(&growth_pso)), "arena growth pipeline");
+    std::array<D3D12_INDIRECT_ARGUMENT_DESC, 2> growth_arguments{};
+    growth_arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT; growth_arguments[0].Constant = {1, 0, 2};
+    growth_arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_COMMAND_SIGNATURE_DESC growth_signature_desc{20, 2, growth_arguments.data(), 0};
+    ComPtr<ID3D12CommandSignature> growth_signature; Check(device->CreateCommandSignature(&growth_signature_desc,
+      growth_root.Get(), IID_PPV_ARGS(&growth_signature)), "arena growth signature");
+    struct GrowthCommand { UINT index, amount; D3D12_DISPATCH_ARGUMENTS dispatch; };
+    static_assert(sizeof(GrowthCommand) == 20);
+    std::vector<GrowthCommand> growth_commands(growth_slots, {0, 999, {1, 1, 1}});
+    growth_commands[0].amount = 137; growth_commands[1].index = 1; growth_commands[1].amount = 251;
+    const UINT growth_count = 2;
+    const UINT64 growth_count_offset = UINT64(growth_slots) * sizeof(GrowthCommand);
+    auto growth_input = Buffer(device.Get(), growth_count_offset + 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    Upload(growth_input.Get(), growth_commands.data(), size_t(growth_count_offset));
+    Upload(growth_input.Get(), &growth_count, sizeof(growth_count), size_t(growth_count_offset));
+    auto growth_result = Buffer(device.Get(), 8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    sample_list->CopyBufferRegion(growth_result.Get(), 0, zero.Get(), 0, 8);
+    D3D12_RESOURCE_BARRIER growth_barrier{}; growth_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    growth_barrier.Transition = {growth_result.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    sample_list->ResourceBarrier(1, &growth_barrier);
+    sample_list->SetComputeRootSignature(growth_root.Get()); sample_list->SetPipelineState(growth_pso.Get());
+    sample_list->SetComputeRootUnorderedAccessView(0, growth_result->GetGPUVirtualAddress());
+    const std::array<UINT, 62> growth_constants{}; sample_list->SetComputeRoot32BitConstants(1, 62, growth_constants.data(), 0);
+    sample_list->ExecuteIndirect(growth_signature.Get(), growth_slots, growth_input.Get(), 0, growth_input.Get(), growth_count_offset);
+    growth_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; growth_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    sample_list->ResourceBarrier(1, &growth_barrier);
+    sample_list->CopyBufferRegion(sample_readback.Get(), 16, growth_result.Get(), 0, 8);
+    sample_list->SetComputeRootSignature(link_roots[0].Get());
+    sample_list->SetComputeRootUnorderedAccessView(0, retained_result->GetGPUVirtualAddress() + 16);
+    sample_list->SetComputeRootUnorderedAccessView(1, retained_result->GetGPUVirtualAddress() + 24);
+    retained_program.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_NONE; sample_list->SetProgram(&retained_program);
+    retained_inputs = {{3, 4}}; sample_list->DispatchGraph(&retained_dispatch); retained_inputs = {{300, 400}};
+    retained_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; retained_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    sample_list->ResourceBarrier(1, &retained_barrier); sample_list->CopyBufferRegion(retained_readback.Get(), 0, retained_result.Get(), 0, 32);
+    sample_list->SetComputeRootSignature(sample_roots[0].Get());
+    sample_list->SetComputeRootDescriptorTable(0, sample_gpu_handle);
+    sample_list->SetComputeRootUnorderedAccessView(1, sample_result->GetGPUVirtualAddress() + 8);
+    sample_program.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_NONE; sample_list->SetProgram(&sample_program);
+    sample_dispatch.NodeCPUInput.pRecords = link_input.data() + 2; sample_list->DispatchGraph(&sample_dispatch);
     sample_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; sample_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE; sample_list->ResourceBarrier(1, &sample_barrier);
-    sample_list->CopyBufferRegion(sample_readback.Get(), 0, sample_result.Get(), 0, 8); Check(sample_list->Close(), "sample Close");
+    sample_list->CopyBufferRegion(sample_readback.Get(), 0, sample_result.Get(), 0, 16); Check(sample_list->Close(), "sample Close");
     ID3D12CommandList *sample_lists[]{sample_list.Get()}; queue->ExecuteCommandLists(1, sample_lists);
     Check(queue->Signal(fence.Get(), 8), "sample Signal"); Check(fence->SetEventOnCompletion(8, event), "sample completion event");
     Require(WaitForSingleObject(event, 180000) == WAIT_OBJECT_0, "sample GPU completion"); Check(device->GetDeviceRemovedReason(), "sample device alive");
-    void *sample_mapping = nullptr; D3D12_RANGE sample_range{0, 8}; Check(sample_readback->Map(0, &sample_range, &sample_mapping), "sample readback map");
-    std::array<UINT, 2> sample_actual{}; std::memcpy(sample_actual.data(), sample_mapping, sizeof(sample_actual)); sample_readback->Unmap(0, nullptr);
-    std::printf("OWNED_D3D12_WORK_GRAPHS_SAMPLER_RESULT exact_min=%llu sum=%u expected_sum=68 count=%u expected_count=4 local_argument_bytes=0\n", static_cast<unsigned long long>(sample_memory.MinSizeInBytes), sample_actual[0], sample_actual[1]);
-    Require(sample_actual == std::array<UINT, 2>{{68, 4}}, "local static sampler exact CPU oracle");
+    void *sample_mapping = nullptr; D3D12_RANGE sample_range{0, 24}; Check(sample_readback->Map(0, &sample_range, &sample_mapping), "sample readback map");
+    std::array<UINT, 6> sample_actual{}; std::memcpy(sample_actual.data(), sample_mapping, sizeof(sample_actual)); sample_readback->Unmap(0, nullptr);
+    std::printf("OWNED_D3D12_WORK_GRAPHS_SAMPLER_RESULT exact_min=%llu sum=%u expected_sum=68 count=%u expected_count=4 local_argument_bytes=0\n", static_cast<unsigned long long>(sample_memory.MinSizeInBytes), sample_actual[0] + sample_actual[2], sample_actual[1] + sample_actual[3]);
+    Require(sample_actual == std::array<UINT, 6>{{34, 2, 34, 2, 137, 251}}, "retained first and last static sampler plus count-clamped compute exact oracle");
+    void *retained_mapping = nullptr; Check(retained_readback->Map(0, nullptr, &retained_mapping), "retained CPU input map");
+    std::array<UINT, 8> retained_actual{}; std::memcpy(retained_actual.data(), retained_mapping, sizeof(retained_actual)); retained_readback->Unmap(0, nullptr);
+    Require(retained_actual == std::array<UINT, 8>{{70, 2, 25, 2, 126, 2, 29, 2}}, "retained first and last CPU input and global root exact oracle");
+    std::printf("OWNED_D3D12_WORK_GRAPHS_ARENA_GROWTH root_payload_min_bytes=%llu compute_count=2 first_sum=34 last_sum=34 static_sampler=17 cpu_first_sum=70 cpu_last_sum=126 status=PASS\n", static_cast<unsigned long long>(growth_root_bytes));
     std::printf("OWNED_D3D12_WORK_GRAPHS_CASE_PASS local_static_sampler_union_exact\n");
-    CloseHandle(event); std::printf("OWNED_D3D12_WORK_GRAPHS_PASS cases=9 tier=1_0\n"); return 0;
+    CloseHandle(event);
+    wchar_t executable[MAX_PATH]; const DWORD path_length=GetModuleFileNameW(nullptr,executable,MAX_PATH);
+    Require(path_length && path_length<MAX_PATH,"boundary child executable");
+    std::wstring command=L"\""; command+=executable; command+=L"\" --gpu-limit-reject";
+    STARTUPINFOW startup{}; startup.cb=sizeof(startup); startup.dwFlags=STARTF_USESTDHANDLES;
+    startup.hStdInput=GetStdHandle(STD_INPUT_HANDLE); startup.hStdOutput=GetStdHandle(STD_OUTPUT_HANDLE); startup.hStdError=GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION child{};
+    Require(CreateProcessW(executable,command.data(),nullptr,nullptr,TRUE,0,nullptr,nullptr,&startup,&child),"limit boundary child");
+    Require(WaitForSingleObject(child.hProcess,180000)==WAIT_OBJECT_0,"limit boundary child completion");
+    DWORD exit_code=1; Require(GetExitCodeProcess(child.hProcess,&exit_code),"limit boundary child exit");
+    CloseHandle(child.hThread); CloseHandle(child.hProcess); Require(exit_code==0,"limit boundary child passed");
+    std::printf("OWNED_D3D12_WORK_GRAPHS_PASS cases=9 tier=1_0\n"); return 0;
   } catch (...) { return 1; }
 }

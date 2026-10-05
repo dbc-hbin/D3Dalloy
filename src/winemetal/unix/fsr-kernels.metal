@@ -25,6 +25,7 @@ enum : uint {
     YaaglFsrSharpen = 1u << 2,
     YaaglFsrHasExposure = 1u << 3,
     YaaglFsrCenteredOutput = 1u << 4,
+    YaaglFsrAlphaUpscaling = 1u << 5,
 };
 
 static float3 inverse_srgb(float3 value) {
@@ -143,6 +144,7 @@ kernel void yaagl_fsr_finish(
     texture2d<float, access::read> source [[texture(0)]],
     texture2d<float, access::write> destination [[texture(1)]],
     texture2d<float, access::read> exposureTexture [[texture(2)]],
+    texture2d<float, access::read> alphaTexture [[texture(3)]],
     constant YaaglFsrParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
     if (any(tid >= params.dispatchExtent)) return;
@@ -155,6 +157,8 @@ kernel void yaagl_fsr_finish(
     }
     uint2 sourcePosition = params.sourceOrigin + destinationPosition - params.destinationOrigin;
     float4 color = source.read(sourcePosition);
+    if (params.flags & YaaglFsrAlphaUpscaling)
+        color.a = clamp(alphaTexture.read(sourcePosition).r, 0.0f, 1.0f);
     float exposure = params.exposure;
     if (params.flags & YaaglFsrHasExposure)
         exposure = max(exposureTexture.read(uint2(0)).r, 1.0e-7f);
@@ -163,6 +167,79 @@ kernel void yaagl_fsr_finish(
                          params.sourceOrigin + params.extent, params.sharpness, exposure);
     color.rgb = forward_transfer(color.rgb, params.transfer);
     destination.write(color, destinationPosition);
+}
+
+// Alpha is a linear coverage signal, never scene luminance or exposure. Native
+// temporal reconstruction consumes its replicated RGB, not MetalFX output.a.
+kernel void yaagl_sr_extract_alpha(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(1)]],
+    constant YaaglFsrParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.dispatchExtent)) return;
+    float alpha = source.read(params.sourceOrigin + min(tid, params.extent - 1u)).a;
+    destination.write(float4(alpha, alpha, alpha, 1.0f), tid);
+}
+
+struct YaaglSrDebugParams {
+    uint2 outputOrigin;
+    uint2 outputExtent;
+    uint2 depthOrigin;
+    uint2 depthExtent;
+    uint2 motionOrigin;
+    uint2 motionExtent;
+    float2 motionScale;
+    uint depthInverted;
+    uint transfer;
+};
+
+// Provider diagnostic layout: thirds show reconstructed color, device
+// depth (white = far), and signed pixel motion (RG; B = magnitude / 32 pixels).
+static float sr_debug_depth(texture2d<float, access::read> depth, uint2 p) { return depth.read(p).r; }
+static float sr_debug_depth(depth2d<float, access::read> depth, uint2 p) { return depth.read(p); }
+
+template<typename Depth>
+static void sr_debug_view(texture2d<float, access::read> color, Depth depth,
+    texture2d<float, access::read> motion, texture2d<float, access::write> output,
+    constant YaaglSrDebugParams& params, uint2 tid) {
+    if (any(tid >= params.outputExtent)) return;
+    uint panel = min((tid.x * 3u) / params.outputExtent.x, 2u);
+    uint start = (panel * params.outputExtent.x + 2u) / 3u;
+    uint end = ((panel + 1u) * params.outputExtent.x + 2u) / 3u;
+    float2 uv = (float2(tid.x - start, tid.y) + 0.5f) /
+                float2(max(end - start, 1u), params.outputExtent.y);
+    float3 value;
+    if (panel == 0u) {
+        uint2 p = min(uint2(uv * float2(color.get_width(), color.get_height())),
+                      uint2(color.get_width(), color.get_height()) - 1u);
+        value = forward_transfer(color.read(p).rgb, params.transfer);
+    } else if (panel == 1u) {
+        uint2 p = params.depthOrigin + min(uint2(uv * float2(params.depthExtent)), params.depthExtent - 1u);
+        float d = sr_debug_depth(depth, p);
+        value = float3(params.depthInverted ? 1.0f - d : d);
+    } else {
+        uint2 p = params.motionOrigin + min(uint2(uv * float2(params.motionExtent)), params.motionExtent - 1u);
+        float2 m = motion.read(p).rg * params.motionScale;
+        value = float3(0.5f + m / 64.0f, length(m) / 32.0f);
+    }
+    output.write(float4(saturate(value), 1.0f), params.outputOrigin + tid);
+}
+
+kernel void yaagl_sr_debug_view(
+    texture2d<float, access::read> color [[texture(0)]],
+    texture2d<float, access::read> depth [[texture(1)]],
+    texture2d<float, access::read> motion [[texture(2)]],
+    texture2d<float, access::write> output [[texture(3)]],
+    constant YaaglSrDebugParams& params [[buffer(0)]], uint2 tid [[thread_position_in_grid]]) {
+    sr_debug_view(color, depth, motion, output, params, tid);
+}
+kernel void yaagl_sr_debug_depth_view(
+    texture2d<float, access::read> color [[texture(0)]],
+    depth2d<float, access::read> depth [[texture(1)]],
+    texture2d<float, access::read> motion [[texture(2)]],
+    texture2d<float, access::write> output [[texture(3)]],
+    constant YaaglSrDebugParams& params [[buffer(0)]], uint2 tid [[thread_position_in_grid]]) {
+    sr_debug_view(color, depth, motion, output, params, tid);
 }
 
 // Frame interpolation performs transfer conversion in an RGBA16Float scene domain.
@@ -177,6 +254,8 @@ struct YaaglFgParams {
     float minLuminance;
     float maxLuminance;
     uint transfer;
+    uint debugFlags;
+    uint reset;
 };
 
 static float3 fg_decode(float3 value, constant YaaglFgParams& params) {
@@ -226,11 +305,33 @@ kernel void yaagl_fg_normalize_motion(
 kernel void yaagl_fg_encode_scatter(
     texture2d<float, access::read> source [[texture(0)]],
     texture2d<float, access::write> destination [[texture(1)]],
+    texture2d<float, access::read> depth [[texture(2)]],
+    texture2d<float, access::read> motion [[texture(3)]],
     constant YaaglFgParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
     if (any(tid >= params.extent)) return;
     float4 color = source.read(tid);
     color.rgb = fg_encode(color.rgb, params);
+    // Provider diagnostics: generated color / normalized game motion / depth.
+    // MetalFX does not expose its internal optical-flow or disocclusion buffers.
+    if (params.debugFlags & 4u) {
+        uint panel = min(tid.x * 3u / params.extent.x, 2u);
+        uint2 position = uint2(min((tid.x * 3u) % params.extent.x, params.extent.x - 1u), tid.y);
+        if (panel == 0u) {
+            color = source.read(position);
+            color.rgb = fg_encode(color.rgb, params);
+        } else if (panel == 1u) {
+            float2 mv = motion.read(position).xy;
+            color = float4(clamp(0.5f + mv * 0.1f, 0.0f, 1.0f), 0.5f, 1.0f);
+        } else {
+            float value = clamp(depth.read(position).r, 0.0f, 1.0f);
+            color = float4(value, value, value, 1.0f);
+        }
+    }
+    if ((params.debugFlags & 1u) && (tid.x < 2u || tid.x + 2u >= params.extent.x))
+        color = float4(0.0f, 1.0f, 0.0f, 1.0f);
+    if ((params.debugFlags & 2u) && tid.x < 16u && tid.y < 16u)
+        color = params.reset ? float4(1.0f, 0.0f, 0.0f, 1.0f) : float4(0.0f, 1.0f, 0.0f, 1.0f);
     destination.write(color, uint2(params.sourceOrigin) + tid);
 }
 

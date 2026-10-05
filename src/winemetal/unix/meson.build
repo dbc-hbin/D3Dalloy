@@ -25,6 +25,7 @@ winemetal_unix_ld_args = [
   '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
   '-weak_framework', 'CoreVideo', '-weak_framework', 'IOKit',
   '-weak_framework', 'ColorSync',  '-weak_framework', 'Cocoa',
+
   '-weak_framework', 'IOSurface',
   '-lsqlite3',
 ]

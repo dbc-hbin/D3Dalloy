@@ -57,6 +57,8 @@ struct TextureResourceHandle {
   llvm::Value *StatusBase = nullptr; // reserved texel buffer residency, see TextureDescirptor
   llvm::Value *StatusView = nullptr;
   llvm::Value *RGB32StatusBase = nullptr;
+  llvm::Value *FormatDefaults = nullptr;
+  llvm::Value *MSAASampleIds = nullptr;
 };
 
 struct BufferResourceHandle {
@@ -84,6 +86,10 @@ struct SamplerHandle {
   llvm::Value *Handle;
   llvm::Value *HandleCube;
   llvm::Value *Bias;
+  llvm::Value *Metadata;
+  llvm::Value *LodRange = nullptr;
+  llvm::Value *UintBorder = nullptr;
+  llvm::Value *FloatBorder = nullptr;
 };
 
 enum class InterpolationLocation { Centroid, Sample, Offset };
@@ -279,6 +285,7 @@ public:
   void operator()(const InstDotProduct &);
   void operator()(const InstFloatUnaryOp &);
   void operator()(const InstFloatBinaryOp &);
+  void operator()(const InstDoubleOp &);
   void operator()(const InstIntegerUnaryOp &);
   void operator()(const InstIntegerBinaryOp &);
   void operator()(const InstPartialDerivative &);

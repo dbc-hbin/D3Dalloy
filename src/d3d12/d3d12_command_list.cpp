@@ -20,8 +20,10 @@
 #include "d3d12_enhanced_barrier.hpp"
 #include "d3d12_acceleration_structure.hpp"
 #include "d3d12_resource_contract.hpp"
+#include "d3d12_format_support.hpp"
 #include "d3d12_state_object.hpp"
 #include "d3d12_work_graph.hpp"
+#include "d3d12_matrix.hpp"
 #include "d3d12_temporal.hpp"
 #include "d3d12_frame_generation.hpp"
 #include "com/com_pointer.hpp"
@@ -31,6 +33,7 @@
 #include <cmath>
 #include <functional>
 #include <new>
+#include <stdexcept>
 #include <vector>
 
 namespace dxmt {
@@ -111,10 +114,16 @@ ValidatePlacedFootprint(
   info.block_height = format.Flag & MTL_DXGI_FORMAT_BC ? 4u : 1u;
   info.bytes_per_block = format.BytesPerTexel;
   resource_contract::FootprintLayout layout;
+  // OPTIONS13 permits texel/block-aligned copies without the portable 512/256
+  // alignments. Keep portable footprints valid as well (notably RGB32, whose
+  // 12-byte unit does not divide the pitch GetCopyableFootprints returns).
+  const UINT placement_alignment = placed.Offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
+      ? info.bytes_per_block : 1u;
+  const UINT pitch_alignment = footprint.RowPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+      ? info.bytes_per_block : 1u;
   if (!resource_contract::ValidateFootprintRange(
           footprint.Width, footprint.Height, footprint.Depth, info.bytes_per_block, info.block_width, info.block_height,
-          footprint.RowPitch, placed.Offset, buffer_desc.Width, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
-          D3D12_TEXTURE_DATA_PITCH_ALIGNMENT, layout
+          footprint.RowPitch, placed.Offset, buffer_desc.Width, placement_alignment, pitch_alignment, layout
       ))
     return false;
   info.row_size = layout.row_size;
@@ -200,6 +209,9 @@ enum class DrawCallStatus {
   Ordinary,
 };
 
+// Public DirectX-Headers topology value; the bundled Wine enum predates OPTIONS15.
+constexpr D3D12_PRIMITIVE_TOPOLOGY kTriangleFan = static_cast<D3D12_PRIMITIVE_TOPOLOGY>(6);
+
 inline bool
 to_metal_primitive_type(D3D12_PRIMITIVE_TOPOLOGY topo, WMTPrimitiveType &primitive, uint32_t &control_point_num) {
   control_point_num = 0;
@@ -214,6 +226,7 @@ to_metal_primitive_type(D3D12_PRIMITIVE_TOPOLOGY topo, WMTPrimitiveType &primiti
     primitive = WMTPrimitiveTypeLineStrip;
     break;
   case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+  case kTriangleFan:
     primitive = WMTPrimitiveTypeTriangle;
     break;
   case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
@@ -292,6 +305,7 @@ class MTLD3D12GraphicsCommandListImpl
       std::make_shared<owned_graphics::BundleRecordingState>();
   HRESULT recording_error_ = S_OK;
   HRESULT close_error_ = S_OK;
+  WMTProgrammableSamplePositions sample_positions_{};
 
   bool IsRecording() const {
     return allocator_ && encoder_count == std::numeric_limits<size_t>::max();
@@ -327,8 +341,11 @@ class MTLD3D12GraphicsCommandListImpl
   }
 
   void RecordError(HRESULT hr = E_INVALIDARG) {
-    if (SUCCEEDED(recording_error_))
+    if (SUCCEEDED(recording_error_)) {
       recording_error_ = hr;
+      device_->diagnostics.Validation(D3D12_MESSAGE_ID_UNKNOWN,
+          "Command list recording failed validation; Close reports the first failure");
+    }
   }
 
   template <typename F>
@@ -434,6 +451,7 @@ class MTLD3D12GraphicsCommandListImpl
   std::array<WMT::Reference<WMT::ComputePipelineState>, 4> format_conversion_pipelines_;
   WMT::Reference<WMT::ComputePipelineState> atomic_copy_u32_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> atomic_copy_u64_pipeline_;
+  WMT::Reference<WMT::ComputePipelineState> matrix_conversion_pipeline_;
   /* Sampler feedback transcoding: [0] decode, [1] encode (dxmt_command.metal). */
   std::array<WMT::Reference<WMT::ComputePipelineState>, 2> feedback_transcode_pipelines_;
   uint64_t predication_snapshot_offset_ = 0;
@@ -461,6 +479,7 @@ class MTLD3D12GraphicsCommandListImpl
   Com<MTLD3D12WorkGraph> work_graph_;
   uint32_t work_graph_index_ = 0;
   D3D12_SET_WORK_GRAPH_DESC work_graph_program_{};
+  uint32_t work_graph_max_records_ = UINT32_MAX, work_graph_max_node_inputs_ = UINT32_MAX;
   WMT::Reference<WMT::ComputePipelineState> rt_pipeline_;
   WMT::Reference<WMT::IntersectionFunctionTable> rt_intersection_function_table_;
   /* The compiled traversal reaches miss/closest-hit/any-hit/callable exports
@@ -474,11 +493,13 @@ class MTLD3D12GraphicsCommandListImpl
   UINT8 stencil_ref_;
   // OMSetFrontAndBackStencilRef; equal to stencil_ref_ after OMSetStencilRef.
   UINT8 back_stencil_ref_;
+  float depth_bounds_min_ = 0, depth_bounds_max_ = 1;
   // BeginRenderPass/EndRenderPass state (reset per recording).
   struct RenderPassResolve {
     ID3D12Resource *src, *dst;
     DXGI_FORMAT format;
     D3D12_RESOLVE_MODE mode;
+    D3D12_RESOURCE_STATES source_state;
     std::vector<D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS> regions;
   };
   bool render_pass_active_ = false;
@@ -491,6 +512,7 @@ class MTLD3D12GraphicsCommandListImpl
   std::vector<RenderPassResolve> render_pass_resolves_;
   // Begin/EndRenderPass issue their own binds, clears and resolves through the public entry points.
   bool render_pass_internal_ = false;
+  D3D12_RESOURCE_STATES render_pass_resolve_source_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
   // Textures the active pass binds for raster (non-conformant barrier detection).
   small_vector<Texture *, 9> render_pass_surfaces_;
   // RSSetDepthBias / IASetIndexBufferStripCutValue, reset from the PSO by SetPipelineState.
@@ -790,7 +812,7 @@ kernel void dxmt_mesh_strip_cut(constant DXMTMeshStripCutControl &control [[buff
   if (control.index_size == 0)
     indices = nullptr;
   const uint topology = control.topology;
-  const uint vpp = topology == 3 ? 2 : topology == 5 ? 3 : topology == 11 ? 4 : 6;
+  const uint vpp = topology == 3 ? 2 : topology == 5 || topology == 6 ? 3 : topology == 11 ? 4 : 6;
   uint emitted = 0;
   ulong strip_vertices = 0;
   uint start = 0;
@@ -802,7 +824,7 @@ kernel void dxmt_mesh_strip_cut(constant DXMTMeshStripCutControl &control [[buff
     start = k + 1;
     uint n = 0;
     if (topology == 3 && length >= 2) n = length - 1;
-    if (topology == 5 && length >= 3) n = length - 2;
+    if ((topology == 5 || topology == 6) && length >= 3) n = length - 2;
     if (topology == 11 && length >= 4) n = length - 3;
     if (topology == 13 && length >= 6) n = (length - 4) / 2;
     if (!n) continue;
@@ -813,6 +835,9 @@ kernel void dxmt_mesh_strip_cut(constant DXMTMeshStripCutControl &control [[buff
         v[0] = i; v[1] = i + 1;
       } else if (topology == 5) {
         v[0] = i; v[1] = (i & 1) ? i + 2 : i + 1; v[2] = (i & 1) ? i + 1 : i + 2;
+      } else if (topology == 6) {
+        // D3D9 fan order: moving rim is the leading/provoking vertex.
+        v[0] = i + 1; v[1] = i + 2; v[2] = 0;
       } else if (topology == 11) {
         for (uint j = 0; j < 4; j++) v[j] = i + j;
       } else {
@@ -1416,8 +1441,11 @@ public:
     blend_factor_[3] = 1.0f;
     stencil_ref_ = 0;
     back_stencil_ref_ = 0;
+    depth_bounds_min_ = 0;
+    depth_bounds_max_ = 1;
     view_instance_mask_ = 0;
     shading_rate_ = D3D12_SHADING_RATE_1X1;
+    sample_positions_ = {};
     shading_rate_image_ = nullptr;
     shading_rate_combiners_ = {D3D12_SHADING_RATE_COMBINER_PASSTHROUGH, D3D12_SHADING_RATE_COMBINER_PASSTHROUGH};
     render_pass_active_ = false;
@@ -1440,6 +1468,7 @@ public:
     rt_state_object_ = nullptr;
     work_graph_ = nullptr;
     work_graph_program_ = {};
+    work_graph_max_records_ = work_graph_max_node_inputs_ = UINT32_MAX;
     rt_pipeline_ = {};
     rt_intersection_function_table_ = {};
     rt_visible_function_table_ = {};
@@ -1547,7 +1576,8 @@ public:
         riid == __uuidof(ID3D12GraphicsCommandList3) || riid == __uuidof(ID3D12GraphicsCommandList4) ||
         riid == __uuidof(ID3D12GraphicsCommandList5) || riid == __uuidof(ID3D12GraphicsCommandList6) ||
         riid == __uuidof(ID3D12GraphicsCommandList7) || riid == __uuidof(ID3D12GraphicsCommandList8) ||
-        riid == __uuidof(ID3D12GraphicsCommandList9) || riid == __uuidof(ID3D12GraphicsCommandList10)) {
+        riid == __uuidof(ID3D12GraphicsCommandList9) || riid == __uuidof(ID3D12GraphicsCommandList10) ||
+        riid == __uuidof(ID3D12GraphicsCommandList11) || riid == __uuidof(ID3D12GraphicsCommandListPreview)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -1571,6 +1601,65 @@ public:
            allocator_->type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE ? S_OK : E_INVALIDARG;
   }
 
+  HRESULT RecordFrameGeneration(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+    // The SDK issues ordinary D3D12 compute/copy commands. Bundles cannot
+    // represent its barriers and copies, and their state changes persist.
+    // Keep these commands in our allocator with a queued validity scope.
+    allocator_->InvalidateCurrentPass();
+    auto begin = allocator_->AllocatePass<TemporalEncoderData>();
+    begin->type = EncoderType::Temporal;
+    begin->fg_frame = frame;
+    begin->fg_state_event_index = static_cast<RecordingHead *>(entry)->state_events.size();
+    allocator_->InvalidateCurrentPass();
+
+    const auto graphics_pso = pso_graphics_;
+    const auto compute_pso = pso_compute_;
+    const auto compute_rootsig = rootsig_compute_;
+    const auto heaps = descriptor_heaps_;
+    const auto dirty = dirty_state_;
+    uint64_t graphics_arguments[MTLD3D12RootSignature::kMaxRootArgumentQwords];
+    uint64_t compute_arguments[MTLD3D12RootSignature::kMaxRootArgumentQwords];
+    memcpy(graphics_arguments, rootarg_graphics_staging_, sizeof(graphics_arguments));
+    memcpy(compute_arguments, rootarg_compute_staging_, sizeof(compute_arguments));
+    const auto predicate_enabled = predication_enabled_;
+    const auto predicate_offset = predication_snapshot_offset_;
+    const auto predicate_op = predication_op_;
+    // Internal work must not consume the application's predicate or queries.
+    auto statistics = std::move(active_pipeline_statistics_);
+    predication_enabled_ = false;
+    HRESULT hr;
+    try {
+      hr = RecordOwnedFrameGenerationFrame(frame, this);
+    } catch (const std::bad_alloc &) {
+      hr = E_OUTOFMEMORY;
+    }
+    allocator_->InvalidateCurrentPass();
+    pso_graphics_ = graphics_pso;
+    pso_compute_ = compute_pso;
+    rootsig_compute_ = compute_rootsig;
+    descriptor_heaps_ = heaps;
+    memcpy(rootarg_graphics_staging_, graphics_arguments, sizeof(graphics_arguments));
+    memcpy(rootarg_compute_staging_, compute_arguments, sizeof(compute_arguments));
+    dirty_state_ = dirty;
+    predication_enabled_ = predicate_enabled;
+    predication_snapshot_offset_ = predicate_offset;
+    predication_op_ = predicate_op;
+    active_pipeline_statistics_ = std::move(statistics);
+    if (FAILED(hr)) {
+      RecordError(hr);
+      return hr;
+    }
+    if (FAILED(recording_error_)) return recording_error_;
+    auto end = allocator_->AllocatePass<TemporalEncoderData>();
+    end->type = EncoderType::Temporal;
+    end->fg_frame = frame;
+    end->fg_stage = TemporalEncoderData::FrameGenerationStage::End;
+    end->fg_state_event_index = static_cast<RecordingHead *>(entry)->state_events.size();
+    begin->fg_end = end;
+    allocator_->InvalidateCurrentPass();
+    return S_OK;
+  }
+
   HRESULT STDMETHODCALLTYPE PrepareFrameGeneration(IMTLD3D12FrameGenerationState *state,
       const MTL_FRAME_GENERATION_PREPARE_DESC *desc) final {
     auto hr = ValidateRecording();
@@ -1579,27 +1668,27 @@ public:
     hr = PrepareOwnedFrameGenerationFrame(device_, state, desc, frame);
     if (hr == S_FALSE) return S_OK;
     if (FAILED(hr)) return hr;
-    allocator_->InvalidateCurrentPass();
-    auto pass = allocator_->AllocatePass<TemporalEncoderData>();
-    pass->type = EncoderType::Temporal;
-    pass->fg_frame = std::move(frame);
-    allocator_->InvalidateCurrentPass();
-    return S_OK;
+    return RecordFrameGeneration(frame);
   }
 
-  HRESULT STDMETHODCALLTYPE GenerateFrame(IMTLD3D12FrameGenerationState *state,
+  HRESULT STDMETHODCALLTYPE GenerateFrames(IMTLD3D12FrameGenerationState *state,
       const MTL_FRAME_GENERATION_GENERATE_DESC *desc) final {
     auto hr = ValidateRecording();
     if (FAILED(hr)) return hr;
     std::shared_ptr<OwnedFrameGenerationFrame> frame;
     hr = GenerateOwnedFrameGenerationFrame(device_, state, desc, frame);
     if (FAILED(hr)) return hr;
-    allocator_->InvalidateCurrentPass();
-    auto pass = allocator_->AllocatePass<TemporalEncoderData>();
-    pass->type = EncoderType::Temporal;
-    pass->fg_frame = std::move(frame);
-    allocator_->InvalidateCurrentPass();
-    return S_OK;
+    return RecordFrameGeneration(frame);
+  }
+
+  HRESULT STDMETHODCALLTYPE PublishFrameGenerationOutput(IMTLD3D12FrameGenerationState *state,
+      const MTL_FRAME_GENERATION_OUTPUT_DESC *desc) final {
+    auto hr = ValidateRecording();
+    if (FAILED(hr)) return hr;
+    std::shared_ptr<OwnedFrameGenerationFrame> frame;
+    hr = PrepareOwnedFrameGenerationOutput(device_, state, desc, frame);
+    if (FAILED(hr)) return hr;
+    return RecordFrameGeneration(frame);
   }
 
   HRESULT STDMETHODCALLTYPE TemporalUpscale(IMTLD3D12TemporalUpscaleState *state,
@@ -1702,16 +1791,54 @@ public:
 
   bool index_pull_pipeline_bound_ = false;
 
+  void CaptureAtomic64Roots(std::vector<Atomic64RootBinding> &roots,
+                           MTLD3D12RootSignature *signature, const uint64_t *arguments,
+                           const MTLD3D12PipelineState *pipeline = nullptr) {
+    if (!signature) return;
+    for (uint32_t parameter = 0; parameter < signature->ParameterSlots; ++parameter) {
+      const auto type = signature->ParameterTypes[parameter];
+      if (type != D3D12_ROOT_PARAMETER_TYPE_UAV && type != D3D12_ROOT_PARAMETER_TYPE_SRV &&
+          type != D3D12_ROOT_PARAMETER_TYPE_CBV) continue;
+      if (pipeline) {
+        const auto *range = signature->GetRootDescriptorRange(parameter);
+        bool used = false;
+        if (range) signature->ForEachUsedDescriptorRange({range, 1}, pipeline->resource_bindings,
+            [&](uint64_t, uint64_t, D3D12_DESCRIPTOR_RANGE_TYPE) { used = true; });
+        if (!used) continue;
+      }
+      const auto address = arguments[signature->SlotQwordOffsets[parameter]];
+      if (!address) continue;
+      const bool writable = type == D3D12_ROOT_PARAMETER_TYPE_UAV;
+      if (std::none_of(roots.begin(), roots.end(), [&](const auto &root) {
+            return root.address == address && root.writable == writable;
+          })) roots.push_back({address, UINT64_MAX, writable});
+    }
+  }
+
   void CaptureStandardSwizzleTables(std::unique_ptr<std::vector<StandardSwizzleTableUse>> &uses,
-                                    MTLD3D12RootSignature *rootsig, const uint64_t *root_arguments) {
-    if (!rootsig || !rootsig->HasTextureDescriptorTables || !descriptor_heaps_[0])
+                                    MTLD3D12RootSignature *rootsig, const uint64_t *root_arguments, bool atomic_phase,
+                                    const MTLD3D12PipelineState *pipeline = nullptr) {
+    if (!rootsig || !descriptor_heaps_[0])
       return;
     auto *heap = static_cast<MTLD3D12DescriptorHeap *>(descriptor_heaps_[0]);
+    if (rootsig->Flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
+      if (!uses) uses = std::make_unique<std::vector<StandardSwizzleTableUse>>();
+      if (std::none_of(uses->begin(), uses->end(), [&](const auto &use) {
+            return use.rootsig == rootsig && use.heap == heap && use.parameter == ~0u;
+          })) {
+        D3D12_GPU_DESCRIPTOR_HANDLE start{};
+        heap->GetGPUDescriptorHandleForHeapStart(&start);
+        uses->push_back({rootsig, heap, start.ptr, ~0u});
+        rootsig->AddRefPrivate();
+        heap->AddRefPrivate();
+      }
+    }
     for (uint32_t parameter = 0; parameter < rootsig->ParameterSlots; ++parameter) {
       const auto ranges = rootsig->GetTableRanges(parameter);
-      if (std::none_of(ranges.begin(), ranges.end(), [](const auto &range) {
+      if (std::none_of(ranges.begin(), ranges.end(), [atomic_phase](const auto &range) {
             return range.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
-                   range.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+                   range.type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV ||
+                   (atomic_phase && range.type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV);
           }))
         continue;
       const uint64_t base = root_arguments[rootsig->SlotQwordOffsets[parameter]];
@@ -1724,6 +1851,10 @@ public:
           }))
         continue;
       uses->push_back({rootsig, heap, base, parameter});
+      if (atomic_phase && pipeline) {
+        uses->back().shader_bindings = pipeline->resource_bindings;
+        uses->back().restrict_to_shader = true;
+      }
       rootsig->AddRefPrivate();
       heap->AddRefPrivate();
     }
@@ -1736,7 +1867,20 @@ public:
     cmd_setdsso.type = WMTRenderCommandSetDepthStencilState;
     cmd_setdsso.depth_stencil_state =
         capture_only ? device_->default_depth_stencil_state :
+        pso_graphics_->owned_depth_bounds && !pso_graphics_->emulated_depth_bounds &&
+        render->depth.attachment && depth_bounds_min_ > depth_bounds_max_
+            ? WMT::DepthStencilState(pso_graphics_->depth_bounds_reject_state) :
         pso_graphics_->GetDepthStencilState(render->dsv_planar_flags, render->dsv_readonly_flags);
+    const bool bounds_enabled = !capture_only && pso_graphics_->owned_depth_bounds &&
+                                !pso_graphics_->emulated_depth_bounds &&
+                                render->depth.attachment && depth_bounds_min_ <= depth_bounds_max_;
+    if (bounds_enabled || render->depth_bounds_active) {
+      auto &bounds = allocator_->EncodeRenderCommand<wmtcmd_render_setdepthbounds>();
+      bounds.type = WMTRenderCommandSetDepthBounds;
+      bounds.min_depth = bounds_enabled ? std::clamp(depth_bounds_min_, 0.0f, 1.0f) : 0.0f;
+      bounds.max_depth = bounds_enabled ? std::clamp(depth_bounds_max_, 0.0f, 1.0f) : 1.0f;
+      render->depth_bounds_active = bounds_enabled;
+    }
 
     auto &cmd_setrs = allocator_->EncodeRenderCommand<wmtcmd_render_setrasterizerstate>();
     cmd_setrs.type = WMTRenderCommandSetRasterizerState;
@@ -1753,6 +1897,12 @@ public:
   PreDraw(bool SkipResourceBinding = false, bool IndexPull = false, uint32_t MeshKey = ~0u) {
     if (!pso_graphics_)
       return DrawCallStatus::Invalid;
+    if (pso_graphics_->uses_atomic64)
+      allocator_->InvalidateCurrentPass();
+    if (sample_positions_.count && sample_positions_.count != pso_graphics_->EffectiveRasterSampleCount()) {
+      RecordError();
+      return DrawCallStatus::Invalid;
+    }
     if (shading_rate_image_ &&
         !RecordImplicitUse(shading_rate_image_.ptr(), 0, D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE))
       return DrawCallStatus::Invalid;
@@ -1781,7 +1931,8 @@ public:
     }
     // ForcedSampleCount 16 runs only through the MSAA capture path; its native passes are 8x.
     const uint32_t raster_samples = std::min(pso_graphics_->EffectiveRasterSampleCount(), 8u);
-    const bool center_sample_pattern = pso_graphics_->owned_sample_desc.Quality == 0xfffffffeu;
+    const bool center_quality = pso_graphics_->owned_sample_desc.Quality == 0xfffffffeu;
+    const bool center_sample_pattern = center_quality && !sample_positions_.count;
     if (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render) {
       const auto *render = static_cast<const RenderEncoderData *>(allocator_->encoder_current);
       // An attachmentless pass takes its sample count from the PSO. Metal
@@ -1802,6 +1953,7 @@ public:
       render->dsv_readonly_flags = 0;
       render->render_target_count = num_rtvs;
       render->center_sample_pattern = center_sample_pattern;
+      render->sample_positions = sample_positions_;
       if (!active_visibility_queries_.empty()) {
         WMTBufferInfo visibility_info{};
         visibility_info.length = sizeof(uint64_t);
@@ -1830,7 +1982,7 @@ public:
         effective_rtvs++;
         auto [Heap, Index] = GetRenderTargetHeap(device_, rtvs[i]);
         auto AttachmentDesc = Heap->GetRenderTarget(Index);
-        if (AttachmentDesc.Texture && AttachmentDesc.CenterSamplePattern != center_sample_pattern) {
+        if (AttachmentDesc.Texture && AttachmentDesc.CenterSamplePattern != center_quality) {
           RecordError(E_INVALIDARG);
           return DrawCallStatus::Invalid;
         }
@@ -1883,7 +2035,7 @@ public:
         auto AttachmentDesc = Heap->GetRenderTarget(Index);
         if (!AttachmentDesc.Texture)
           continue;
-        if (AttachmentDesc.CenterSamplePattern != center_sample_pattern) {
+        if (AttachmentDesc.CenterSamplePattern != center_quality) {
           RecordError(E_INVALIDARG);
           return DrawCallStatus::Invalid;
         }
@@ -2133,7 +2285,9 @@ public:
         bool empty_region = empty_raster_state;
         if (!empty_region) {
           auto &viewport = viewports[i];
-          empty_region = viewport.Width <= 0.0f || viewport.Height <= 0.0f;
+          // A negative height is an inverted Y transform, not an empty region.
+          // Metal accepts signed heights and reversed near/far depths directly.
+          empty_region = viewport.Width <= 0.0f || viewport.Height == 0.0f;
           if (!empty_region) {
             metal_viewports[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
                                   viewport.Height,   viewport.MinDepth, viewport.MaxDepth};
@@ -2204,7 +2358,17 @@ public:
     }
 
     CaptureStandardSwizzleTables(static_cast<RenderEncoderData *>(allocator_->encoder_current)->swizzle_tables,
-                                 rootsig_graphics_.ptr(), rootarg_graphics_staging_);
+                                 rootsig_graphics_.ptr(), rootarg_graphics_staging_, pso_graphics_->uses_atomic64, pso_graphics_.ptr());
+    if (pso_graphics_->uses_atomic64) {
+      auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+      render->atomic64_phase = true;
+      render->atomic64_pipeline = pso_graphics_.ptr();
+      render->atomic64_signature = rootsig_graphics_.ptr();
+      render->atomic64_heap = descriptor_heaps_[0];
+      render->atomic64_tess_workloads = pso_graphics_->tess_capture_layout.max_workloads;
+      render->atomic64_gs_instances = pso_graphics_->gs_instance_count;
+      CaptureAtomic64Roots(render->atomic64_roots, rootsig_graphics_.ptr(), rootarg_graphics_staging_, pso_graphics_.ptr());
+    }
 
     return DrawCallStatus::Ordinary;
   }
@@ -2249,6 +2413,7 @@ public:
       // Adjacency and patch topologies: no VS-only stream-output capture yet.
       RecordError(E_NOTIMPL);
       return false;
+    case kTriangleFan: topology = 5; break;
     }
     if (Indexed && !Indirect && !index_buffer) {
       RecordError();
@@ -2315,7 +2480,7 @@ public:
     // D3D12 applies IBStripCutValue to strip topologies only, and only when it matches the index
     // format; list topologies treat 0xFFFF / 0xFFFFFFFF as ordinary indices.
     const auto cut = ib_strip_cut_value_;
-    const bool strip = topology == 2 || topology == 4;
+    const bool strip = topology == 2 || topology == 4 || topology == 5;
     params->cut_enabled =
         Indexed && strip &&
         ((cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF && params->index_size == 2) ||
@@ -2627,9 +2792,10 @@ public:
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: topology = 3; break;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: topology = 4; break;
     default: RecordError(E_INVALIDARG); return false;
+    case kTriangleFan: topology = 5; break;
     }
     const uint32_t vpp = topology == 0 ? 1 : topology <= 2 ? 2 : 3;
-    const bool strip = topology == 2 || topology == 4;
+    const bool strip = topology == 2 || topology == 4 || topology == 5;
     const uint64_t max_per_instance = strip ? vertices >= vpp ? vertices - vpp + 1 : 0 : vertices / vpp;
     const uint64_t max_primitives = max_per_instance * instances;
     const uint64_t record_count = uint64_t(vertices) * instances;
@@ -2655,12 +2821,14 @@ public:
       draw->mesh_control = *mesh_control;
     }
     draw->capture_pipeline = variants->capture;
+    draw->atomic64_phase = pso_graphics_->uses_atomic64;
     draw->assembly_pipeline = msaa_assembly_pipeline_;
     draw->bounds_pipeline = msaa_bounds_pipeline_;
     draw->coverage_pipeline = variants->coverage;
     draw->coverage_with_depth_pipeline = variants->coverage_with_depth;
     draw->clear_coverage_pipeline = variants->clear_coverage;
     draw->gather_depth_pipeline = variants->gather_depth;
+    draw->depth_bounds_probe_pipeline = variants->depth_bounds_probe;
     draw->early_depth_pipeline = variants->early_depth;
     draw->late_depth_pipeline = variants->late_depth;
     draw->sample_pixel_pipeline = variants->sample_pixel;
@@ -2679,6 +2847,9 @@ public:
     }
     draw->original_depth_stencil = pso_graphics_->GetDepthStencilState(render->dsv_planar_flags,
                                                                        render->dsv_readonly_flags);
+    if (pso_graphics_->owned_depth_bounds && !pso_graphics_->emulated_depth_bounds &&
+        render->depth.attachment && depth_bounds_min_ > depth_bounds_max_)
+      draw->original_depth_stencil = pso_graphics_->depth_bounds_reject_state;
     draw->no_depth_stencil = device_->default_depth_stencil_state;
     draw->index_buffer = indexed ? index_buffer : WMT::Buffer{};
     draw->index_offset = indexed ? index_offset + uint64_t(start_vertex) * (index_type == WMTIndexTypeUInt32 ? 4 : 2) : 0;
@@ -2686,12 +2857,17 @@ public:
       allocator_->BindGPUHeap(draw->predicate_buffer, draw->predicate_offset, predication_snapshot_offset_);
     draw->stream_output = render->so_draws.empty() ? nullptr : render->so_draws.back();
     draw->pixel_layout = variants->layout;
+    draw->depth_bounds_min = depth_bounds_min_;
+    draw->depth_bounds_max = depth_bounds_max_;
+    draw->depth_bounds_enabled = pso_graphics_->owned_depth_bounds && render->depth.attachment &&
+                                 (pso_graphics_->emulated_depth_bounds || depth_bounds_min_ <= depth_bounds_max_);
     draw->vertex_layout = variants->vertex_layout;
     draw->sample_count = pso_graphics_->EffectiveRasterSampleCount();
     if (pso_graphics_->needs_rov_buffer_marker)
       draw->rov_marker_sample_count = pso_graphics_->owned_sample_frequency_pixel_shader
           ? draw->sample_count : 1;
-    draw->center_sample_pattern = pso_graphics_->owned_sample_desc.Quality == 0xfffffffeu;
+    draw->center_sample_pattern = pso_graphics_->owned_sample_desc.Quality == 0xfffffffeu && !sample_positions_.count;
+    draw->sample_positions = sample_positions_;
     draw->shading_rate = variants->layout.flags & SM50_MSAA_PIXEL_COARSE ? shading_rate : 0;
     if (!CaptureShadingRateImage(*draw)) return false;
     draw->sample_mask = pso_graphics_->owned_sample_mask;
@@ -2843,6 +3019,7 @@ public:
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: return count / 3;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: return count > 2 ? count - 2 : 0;
     case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ: return count / 4;
+    case kTriangleFan: return count > 2 ? count - 2 : 0;
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: return count > 3 ? count - 3 : 0;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: return count / 6;
     default: return count > 5 ? (count - 4) / 2 : 0;
@@ -2967,10 +3144,16 @@ public:
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: list_topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST; vpp = 2; break;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: list_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST; vpp = 3; break;
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: list_topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ; vpp = 4; break;
+    case kTriangleFan: list_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST; vpp = 3; break;
     default: list_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ; vpp = 6; break;
     }
     // Every strip vertex completes at most one primitive (triangle-strip-adj: one per two vertices).
-    max_vertices = uint32_t(std::min<uint64_t>(uint64_t(count) * vpp, UINT32_MAX));
+    const uint64_t list_values = uint64_t(count) * vpp;
+    if (list_values > UINT32_MAX || list_values * sizeof(uint32_t) > device_->GetMTLDevice().maxBufferLength()) {
+      RecordError(E_OUTOFMEMORY);
+      return;
+    }
+    max_vertices = uint32_t(list_values);
     struct Control {
       uint64_t max_threadgroups;
       uint32_t topology, index_size, cut_value, count, instances;
@@ -3031,7 +3214,7 @@ public:
     topology_ = list_topology;
     const bool capture_pixels = (!pso_graphics_->stream_output.active ||
             pso_graphics_->stream_output.rasterized_stream != D3D12_SO_NO_RASTERIZED_STREAM) &&
-            (pso_graphics_->owned_conservative || pso_graphics_->owned_distance_interpolation || CoarseShadingRateState() != 0);
+            (pso_graphics_->owned_conservative || (pso_graphics_->owned_distance_interpolation || pso_graphics_->uses_atomic64 || pso_graphics_->emulated_depth_bounds) || CoarseShadingRateState() != 0);
     const uint32_t key = MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_UINT32, false, statistics) |
         (capture_pixels ? kMeshMSAACapture : 0);
     const auto status = PreDraw(false, false, key);
@@ -3171,7 +3354,7 @@ public:
     const uint32_t key = MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, statistics) |
                          kMeshTessellationGeometryPass |
                          ((!stream_output || pso_graphics_->stream_output.rasterized_stream != D3D12_SO_NO_RASTERIZED_STREAM) &&
-                          (pso_graphics_->owned_conservative || pso_graphics_->owned_distance_interpolation ||
+                          (pso_graphics_->owned_conservative || (pso_graphics_->owned_distance_interpolation || pso_graphics_->uses_atomic64 || pso_graphics_->emulated_depth_bounds) ||
                            CoarseShadingRateState() != 0) ? kMeshMSAACapture : 0);
     if (PreDraw(false, false, key) == DrawCallStatus::Invalid)
       return;
@@ -3233,7 +3416,7 @@ public:
     const bool strip = topology_ == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP ||
                        topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
                        topology_ == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ ||
-                       topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
+                       (topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ || topology_ == kTriangleFan);
     if (tessellation != (control_points != 0)) {
       RecordError(E_INVALIDARG);
       return;
@@ -3249,7 +3432,7 @@ public:
     const bool cut = indexed && strip && !tessellation &&
                      ((ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF && !index32) ||
                       (ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF && index32));
-    if (cut || topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ) {
+    if (cut || (topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ || topology_ == kTriangleFan)) {
       RecordMeshStripCut(indexed, count, instances, start, base_vertex, start_instance, statistics, cut);
       return;
     }
@@ -3258,7 +3441,7 @@ public:
                                                            : SM50_INDEX_BUFFER_FORMAT_UINT16;
     const bool capture_pixels = (!pso_graphics_->stream_output.active ||
             pso_graphics_->stream_output.rasterized_stream != D3D12_SO_NO_RASTERIZED_STREAM) &&
-            (pso_graphics_->owned_conservative || pso_graphics_->owned_distance_interpolation || CoarseShadingRateState() != 0);
+            (pso_graphics_->owned_conservative || (pso_graphics_->owned_distance_interpolation || pso_graphics_->uses_atomic64 || pso_graphics_->emulated_depth_bounds) || CoarseShadingRateState() != 0);
     const uint32_t key = MeshVariantKey(format, strip && !tessellation, statistics) |
         (capture_pixels ? kMeshMSAACapture : 0);
     if (capture_pixels) allocator_->InvalidateCurrentPass();
@@ -3517,7 +3700,7 @@ public:
 
   uint64_t
   EncodeStaticSamplers(MTLD3D12RootSignature *pRootSig) {
-    const uint64_t static_sampler_encode_size = uint64_t(sizeof(uint64_t)) * pRootSig->NumStaticSamplers * 4;
+    const uint64_t static_sampler_encode_size = uint64_t(sizeof(uint64_t)) * pRootSig->NumStaticSamplers * 8;
     if (!static_sampler_encode_size)
       return 0;
     auto [Ptr, Offset] = allocator_->AllocateGPUHeap(static_sampler_encode_size, 64);
@@ -3532,6 +3715,7 @@ public:
   bool
   PreDispatch(bool SkipResourceBinding = false) {
     const bool statistics = !active_pipeline_statistics_.empty();
+    if (pso_compute_ && pso_compute_->uses_atomic64) allocator_->InvalidateCurrentPass();
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute) {
       allocator_->InvalidateCurrentPass();
       auto compute = allocator_->AllocatePass<ComputeEncoderData>();
@@ -3555,6 +3739,7 @@ public:
         return false;
       }
       cmd_setpso.threadgroup_size = pso_compute_->threadgroup_size;
+      static_cast<ComputeEncoderData *>(allocator_->encoder_current)->RetainPipeline(WMT::ComputePipelineState{cmd_setpso.pso});
       const auto &constants = statistics ? pso_compute_->pipeline_statistics_compute_constants : pso_compute_->compute_constants;
       if (constants.buffer) {
         auto &binding = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
@@ -3608,7 +3793,13 @@ public:
     }
 
     CaptureStandardSwizzleTables(static_cast<ComputeEncoderData *>(allocator_->encoder_current)->swizzle_tables,
-                                 rootsig_compute_.ptr(), rootarg_compute_staging_);
+                                 rootsig_compute_.ptr(), rootarg_compute_staging_, pso_compute_->uses_atomic64, pso_compute_.ptr());
+    auto *compute = static_cast<ComputeEncoderData *>(allocator_->encoder_current);
+    compute->atomic64_phase |= pso_compute_->uses_atomic64;
+    if (pso_compute_->uses_atomic64) {
+      compute->atomic64_pipeline = pso_compute_.ptr();
+      CaptureAtomic64Roots(compute->atomic64_roots, rootsig_compute_.ptr(), rootarg_compute_staging_, pso_compute_.ptr());
+    }
 
     return true;
   }
@@ -3648,10 +3839,11 @@ public:
     owned_graphics::Trace("dispatch", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                           ",\"encoder\":", allocator_->encoder_current->id,
                           ",\"x\":", X, ",\"y\":", Y, ",\"z\":", Z);
+    if (pso_compute_->uses_atomic64) allocator_->InvalidateCurrentPass();
   };
 
-  void RecordStandardSwizzleUse(MTLD3D12Resource *resource, bool to_canonical) {
-    if (!resource || !resource->swizzle_layout)
+  void RecordStandardSwizzleUse(MTLD3D12Resource *resource, bool to_canonical, bool writable_msaa = false) {
+    if (!resource || (!resource->swizzle_layout && !writable_msaa))
       return;
     allocator_->InvalidateCurrentPass();
     auto *record = allocator_->AllocatePass<StandardSwizzleEncoderData>();
@@ -3776,8 +3968,10 @@ public:
     UINT src_block_height = 1, dst_block_height = 1;
 
     if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
-      if (!ValidatePlacedFootprint(device_->GetMTLDevice(), src_desc, pSrc->PlacedFootprint, src_footprint_info))
+      if (!ValidatePlacedFootprint(device_->GetMTLDevice(), src_desc, pSrc->PlacedFootprint, src_footprint_info)) {
+        RecordError();
         return;
+      }
       src_block_width = src_footprint_info.block_width;
       src_block_height = src_footprint_info.block_height;
       full_src_box = {
@@ -3803,8 +3997,10 @@ public:
     }
 
     if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
-      if (!ValidatePlacedFootprint(device_->GetMTLDevice(), dst_desc, pDst->PlacedFootprint, dst_footprint_info))
+      if (!ValidatePlacedFootprint(device_->GetMTLDevice(), dst_desc, pDst->PlacedFootprint, dst_footprint_info)) {
+        RecordError();
         return;
+      }
       dst_block_width = dst_footprint_info.block_width;
       dst_block_height = dst_footprint_info.block_height;
       dst_extent = {
@@ -3874,8 +4070,10 @@ public:
         src_block_width != dst_block_width || src_block_height != dst_block_height ||
         (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
          pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
-         src_footprint_info.bytes_per_block != dst_footprint_info.bytes_per_block))
+         src_footprint_info.bytes_per_block != dst_footprint_info.bytes_per_block)) {
+      RecordError();
       return;
+    }
     if (pSrc->pResource == pDst->pResource) {
       if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ||
           pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ||
@@ -3915,17 +4113,191 @@ public:
     const auto physical_copy_format = GetD3D12PhysicalPixelFormat(src_copy_format);
     if (physical_copy_format != WMTPixelFormatInvalid)
       native_copy_format.PixelFormat = physical_copy_format;
+    if (src_desc.SampleDesc.Count > 1 &&
+        DepthStencilPlanarFlags(static_cast<MTLD3D12Resource *>(pSrc->pResource)->texture->pixelFormat()) &&
+        pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+      DXGI_FORMAT copy_format = src_desc.Format;
+      if (copy_format == DXGI_FORMAT_R32_TYPELESS) copy_format = DXGI_FORMAT_D32_FLOAT;
+      else if (copy_format == DXGI_FORMAT_R16_TYPELESS) copy_format = DXGI_FORMAT_D16_UNORM;
+      else if (copy_format == DXGI_FORMAT_R24G8_TYPELESS) copy_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+      else if (copy_format == DXGI_FORMAT_R32G8X24_TYPELESS) copy_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+      D3D12_RECT rect{LONG(src_box.left), LONG(src_box.top), LONG(src_box.right), LONG(src_box.bottom)};
+      ResolveTextureRegion(pDst->pResource, pDst->SubresourceIndex, DstX, DstY, pSrc->pResource,
+                           pSrc->SubresourceIndex, &rect, copy_format, D3D12_RESOLVE_MODE_DECOMPRESS, true);
+      return;
+    }
+    auto *src_resource = static_cast<MTLD3D12Resource *>(pSrc->pResource);
+    auto *dst_resource = static_cast<MTLD3D12Resource *>(pDst->pResource);
+    const bool src_volume = src_resource->reserved && src_resource->reserved->volumeLayout();
+    const bool dst_volume = dst_resource->reserved && dst_resource->reserved->volumeLayout();
+    if (src_volume || dst_volume) {
+      if (!resource_contract::AreCopyCompatibleFormats(src_copy_format, dst_copy_format) ||
+          !RecordImplicitUse(pSrc->pResource, pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ?
+              pSrc->SubresourceIndex : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE) ||
+          !RecordImplicitUse(pDst->pResource, pDst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ?
+              pDst->SubresourceIndex : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST))
+        return;
+      if (predication_enabled_ && !EnsurePredicationPipelines()) {
+        RecordError(E_FAIL);
+        return;
+      }
+      const uint32_t unit_bytes = native_copy_format.Flag & MTL_DXGI_FORMAT_BC ?
+          native_copy_format.BlockSize : native_copy_format.BytesPerTexel;
+      if (!unit_bytes) {
+        RecordError();
+        return;
+      }
+      auto native_view = [&](MTLD3D12Resource *resource, bool volume, uint32_t level, uint32_t slice,
+                             uint32_t &native_level, uint32_t &native_slice) {
+        auto &texture = resource->texture;
+        native_level = volume ? 0 : level;
+        native_slice = volume ? 0 : slice;
+        auto result = texture->current()->texture();
+        if (texture->pixelFormat() != native_copy_format.PixelFormat) {
+          TextureViewDescriptor view{};
+          view.format = native_copy_format.PixelFormat;
+          view.type = texture->textureType();
+          view.firstMiplevel = volume ? 0 : level;
+          view.miplevelCount = 1;
+          view.firstArraySlice = volume ? 0 : slice;
+          view.arraySize = volume ? texture->arrayLength() : 1;
+          result = texture->view(texture->createView(view)).texture;
+          native_level = native_slice = 0;
+        }
+        return result;
+      };
+      uint32_t source_level = 0, source_slice = 0, destination_level = 0, destination_slice = 0;
+      WMT::Texture source{}, destination{};
+      const bool source_buffer = pSrc->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      const bool destination_buffer = pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      if (!source_buffer)
+        source = native_view(src_resource, src_volume, src_level, src_slice, source_level, source_slice);
+      if (!destination_buffer)
+        destination = native_view(dst_resource, dst_volume, dst_level, dst_slice, destination_level, destination_slice);
+      if ((!source_buffer && !source) || (!destination_buffer && !destination)) {
+        RecordError(E_OUTOFMEMORY);
+        return;
+      }
+      // A canonical volume may have been written through another placed/shared
+      // alias. Import before reading it, and preserve untouched destination tiles.
+      if (!source_buffer) RecordStandardSwizzleUse(src_resource, false);
+      if (!destination_buffer) RecordStandardSwizzleUse(dst_resource, false);
+      for (UINT z = 0; z < src_box.back - src_box.front; z++)
+        for (UINT y = 0; y < src_box.bottom - src_box.top; y += src_block_height)
+          for (UINT x = 0; x < src_box.right - src_box.left;) {
+            const UINT sx = src_box.left + x, sy = src_box.top + y, sz = src_box.front + z;
+            const UINT dx = DstX + x, dy = DstY + y, dz = DstZ + z;
+            UINT units = (src_box.right - src_box.left - x + src_block_width - 1) / src_block_width;
+            WMTOrigin source_origin{sx, sy, sz}, destination_origin{dx, dy, dz};
+            uint32_t ss = source_slice, ds = destination_slice;
+            if (src_volume) {
+              const auto address = src_resource->reserved->VolumeAddress(src_level, sx, sy, sz);
+              if (!address) { RecordError(); return; }
+              source_origin = {address->x, address->y, 0}; ss = address->slice;
+              units = std::min(units, address->units);
+            }
+            if (dst_volume) {
+              const auto address = dst_resource->reserved->VolumeAddress(dst_level, dx, dy, dz);
+              if (!address) { RecordError(); return; }
+              destination_origin = {address->x, address->y, 0}; ds = address->slice;
+              units = std::min(units, address->units);
+            }
+            const UINT width = units * src_block_width;
+            WMTSize source_chunk{width, src_block_height, 1}, destination_chunk = source_chunk;
+            if (!src_volume && !source_buffer) {
+              source_chunk.width = std::min<UINT64>(width, src_logical_extent.right - sx);
+              source_chunk.height = std::min<UINT64>(src_block_height, src_logical_extent.bottom - sy);
+            }
+            if (!dst_volume && !destination_buffer) {
+              destination_chunk.width = std::min<UINT64>(width, dst_logical_extent.right - dx);
+              destination_chunk.height = std::min<UINT64>(src_block_height, dst_logical_extent.bottom - dy);
+            }
+            const UINT64 row_bytes = UINT64(units) * unit_bytes;
+            const UINT64 pitch = (row_bytes + 255) & ~UINT64(255);
+            const UINT64 source_offset = source_buffer ? pSrc->PlacedFootprint.Offset +
+                UINT64(sz) * src_footprint_info.slice_pitch + UINT64(sy / src_block_height) *
+                pSrc->PlacedFootprint.Footprint.RowPitch + UINT64(sx / src_block_width) * unit_bytes : 0;
+            const UINT64 destination_offset = destination_buffer ? pDst->PlacedFootprint.Offset +
+                UINT64(dz) * dst_footprint_info.slice_pitch + UINT64(dy / src_block_height) *
+                pDst->PlacedFootprint.Footprint.RowPitch + UINT64(dx / src_block_width) * unit_bytes : 0;
+            if (!PreBlit()) return;
+            if (!source_buffer && !destination_buffer && !predication_enabled_ &&
+                source_chunk.width == destination_chunk.width && source_chunk.height == destination_chunk.height) {
+              auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
+              copy.type = WMTBlitCommandCopyFromTextureToTexture;
+              copy.src = source; copy.src_level = source_level; copy.src_slice = ss;
+              copy.src_origin = source_origin; copy.src_size = source_chunk;
+              copy.dst = destination; copy.dst_level = destination_level; copy.dst_slice = ds;
+              copy.dst_origin = destination_origin;
+            } else {
+              WMT::Buffer readable{};
+              UINT64 readable_offset = source_offset;
+              UINT64 readable_pitch = source_buffer ? pSrc->PlacedFootprint.Footprint.RowPitch : 0;
+              if (source_buffer) {
+                readable = src_resource->buffer->current()->buffer();
+              } else {
+                std::tie(readable, readable_offset) = allocator_->AllocateTempBuffer(pitch, 256);
+                readable_pitch = pitch;
+                if (!readable) { RecordError(E_OUTOFMEMORY); return; }
+                auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+                copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+                copy.src = source; copy.level = source_level; copy.slice = ss;
+                copy.origin = source_origin; copy.size = source_chunk;
+                copy.dst = readable; copy.offset = readable_offset;
+                copy.bytes_per_row = pitch;
+                copy.bytes_per_image = !src_volume && src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? pitch : 0;
+              }
+              if (destination_buffer) {
+                auto writable = dst_resource->buffer->current()->buffer();
+                if (predication_enabled_) {
+                  EncodePredicatedBufferCopy(readable, readable_offset, writable, destination_offset, row_bytes);
+                } else {
+                  auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+                  copy.type = WMTBlitCommandCopyFromBufferToBuffer;
+                  copy.src = readable; copy.src_offset = readable_offset;
+                  copy.dst = writable; copy.dst_offset = destination_offset; copy.copy_length = row_bytes;
+                }
+              } else {
+                if (predication_enabled_) {
+                  auto [saved, saved_offset] = allocator_->AllocateTempBuffer(pitch, 256);
+                  if (!saved) { RecordError(E_OUTOFMEMORY); return; }
+                  auto &save = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+                  save.type = WMTBlitCommandCopyFromTextureToBuffer;
+                  save.src = destination; save.level = destination_level; save.slice = ds;
+                  save.origin = destination_origin; save.size = destination_chunk;
+                  save.dst = saved; save.offset = saved_offset;
+                  save.bytes_per_row = pitch;
+                  save.bytes_per_image = !dst_volume && dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? pitch : 0;
+                  EncodePredicatedBufferCopy(readable, readable_offset, saved, saved_offset, row_bytes);
+                  readable = saved; readable_offset = saved_offset; readable_pitch = pitch;
+                  if (!PreBlit()) return;
+                }
+                auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+                copy.type = WMTBlitCommandCopyFromBufferToTexture;
+                copy.src = readable; copy.src_offset = readable_offset;
+                copy.bytes_per_row = readable_pitch;
+                copy.bytes_per_image = !dst_volume && dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? readable_pitch : 0;
+                copy.dst = destination; copy.level = destination_level; copy.slice = ds;
+                copy.origin = destination_origin; copy.size = destination_chunk;
+              }
+            }
+            x += width;
+          }
+      if (!destination_buffer) RecordStandardSwizzleUse(dst_resource, true);
+      return;
+    }
     WMT::Texture source_native_texture{};
     WMT::Texture destination_native_texture{};
+    const bool native_copy_is_depth = DepthStencilPlanarFlags(native_copy_format.PixelFormat);
     uint32_t source_native_level = src_level, source_native_slice = src_slice;
     uint32_t destination_native_level = dst_level, destination_native_slice = dst_slice;
     if (pSrc->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
       auto &texture = static_cast<MTLD3D12Resource *>(pSrc->pResource)->texture;
       source_native_texture = texture->current()->texture();
-      // R32/R8 placed formats describe buffer storage, not a depth-stencil texture view.
+      // Placed formats describe raw storage, not a castable depth texture view.
       if (texture->pixelFormat() != native_copy_format.PixelFormat &&
-          !(src_desc.Format == DXGI_FORMAT_R24G8_TYPELESS || src_desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
-            src_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || src_desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) {
+          !native_copy_is_depth && !DepthStencilPlanarFlags(texture->pixelFormat())) {
         TextureViewDescriptor view{};
         view.format = native_copy_format.PixelFormat;
         view.type = texture->textureType();
@@ -3942,8 +4314,7 @@ public:
       auto &texture = static_cast<MTLD3D12Resource *>(pDst->pResource)->texture;
       destination_native_texture = texture->current()->texture();
       if (texture->pixelFormat() != native_copy_format.PixelFormat &&
-          !(dst_desc.Format == DXGI_FORMAT_R24G8_TYPELESS || dst_desc.Format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
-            dst_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS || dst_desc.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) {
+          !native_copy_is_depth && !DepthStencilPlanarFlags(texture->pixelFormat())) {
         TextureViewDescriptor view{};
         view.format = native_copy_format.PixelFormat;
         view.type = texture->textureType();
@@ -4279,7 +4650,7 @@ public:
         WMT::Buffer copy_source = src->current()->buffer();
         UINT64 copy_offset = pSrc->PlacedFootprint.Offset + (src_box.left / block_width) * src_format.BytesPerTexel +
                              (src_box.top / src_footprint_info.block_height) * pSrc->PlacedFootprint.Footprint.RowPitch +
-                             src_box.front * src_depth_pitch;
+                             src_box.front * src_footprint_info.slice_pitch;
         UINT copy_pitch = pSrc->PlacedFootprint.Footprint.RowPitch;
         uint64_t copy_depth_pitch = src_depth_pitch;
         const auto storage = resource_contract::GetEmulatedTextureStorage(dst_desc.Format);
@@ -4367,22 +4738,29 @@ public:
         }
         auto src_planar_count = src_format.PlanarCount;
 
-        // copy between depth-stencil texture is tricky
-        if (dst_planar_count > 1 || src_planar_count > 1) {
-          // in this path, one/both of dst/src would be depth-stencil texture
+        // Depth/color reinterpretation cannot use a Metal texture view. Preserve
+        // storage bits through the existing plane-copy buffer path instead.
+        const bool different_depth_storage = dst->pixelFormat() != src->pixelFormat() &&
+            (DepthStencilPlanarFlags(dst->pixelFormat()) || DepthStencilPlanarFlags(src->pixelFormat()));
+        if (dst_planar_count > 1 || src_planar_count > 1 || different_depth_storage) {
 
           if (dst_planar_count > 1 && src_planar_count > 1 && dst_planar != src_planar) {
             WARN("CopyTextureRegion: unmatched planar"); // just in case
             return;
           }
 
-          auto texel_size = (dst_planar == 1 || src_planar == 1) ? 1 : 4;
+          auto texel_size = (dst_planar == 1 || src_planar == 1) ? 1u :
+              (dst_planar_count > 1 || src_planar_count > 1) ? 4u : src_format.BytesPerTexel;
           auto width = src_box.right - src_box.left;
           auto height = src_box.bottom - src_box.top;
           auto bytes_per_row = align(width * texel_size, 256);
           auto bytes_per_image = bytes_per_row * height;
 
           auto [temp_buffer, temp_buffer_offset] = allocator_->AllocateTempBuffer(bytes_per_image, 256);
+          if (!temp_buffer) {
+            RecordError(E_OUTOFMEMORY);
+            return;
+          }
 
           auto &cmd_to_tmp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
           cmd_to_tmp.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
@@ -4493,7 +4871,7 @@ public:
           const uint64_t dst_offset = pDst->PlacedFootprint.Offset +
               (uint64_t(DstX) / block_width) * dst_format.BytesPerTexel +
               (uint64_t(DstY) / dst_footprint_info.block_height) * pDst->PlacedFootprint.Footprint.RowPitch +
-              uint64_t(DstZ) * dst_depth_pitch;
+              uint64_t(DstZ) * dst_footprint_info.slice_pitch;
           for (UINT z = 0; z < depth; ++z) {
             if (!ConvertEmulatedTextureRows(storage, false, scratch, scratch_offset + uint64_t(z) * slice,
                     UINT(pitch), dst->current()->buffer(), dst_offset + uint64_t(z) * dst_footprint_info.slice_pitch,
@@ -4529,7 +4907,8 @@ public:
           copy.bytes_per_image = 0;
           copy.options = WMTBlitOptionDepthFromDepthStencil;
           const UINT64 offset = pDst->PlacedFootprint.Offset + UINT64(DstX) * dst_format.BytesPerTexel +
-                                UINT64(DstY) * pDst->PlacedFootprint.Footprint.RowPitch;
+                                UINT64(DstY) * pDst->PlacedFootprint.Footprint.RowPitch +
+                                UINT64(DstZ) * dst_footprint_info.slice_pitch;
           ConvertD24Plane(scratch, scratch_offset, UINT(pitch), dst->current()->buffer(), offset,
                           pDst->PlacedFootprint.Footprint.RowPitch, width, height, false);
           return;
@@ -4544,7 +4923,8 @@ public:
         cmd_cp.size = source_size;
         cmd_cp.dst = dst->current()->buffer();
         cmd_cp.offset = pDst->PlacedFootprint.Offset + (DstX / block_width) * dst_format.BytesPerTexel +
-                        (DstY / dst_footprint_info.block_height) * pDst->PlacedFootprint.Footprint.RowPitch + DstZ * dst_depth_pitch;
+                        (DstY / dst_footprint_info.block_height) * pDst->PlacedFootprint.Footprint.RowPitch +
+                        UINT64(DstZ) * dst_footprint_info.slice_pitch;
         cmd_cp.bytes_per_row = pDst->PlacedFootprint.Footprint.RowPitch;
         cmd_cp.bytes_per_image = dst_depth_pitch;
         cmd_cp.options = (src_planar_count > 1)
@@ -4743,6 +5123,39 @@ public:
             RecordError(E_OUTOFMEMORY);
             return;
           }
+          auto transfer_volume = [&](MTLD3D12Resource *resource, WMT::Buffer staging, UINT64 offset, bool upload) {
+            if (!resource->reserved || !resource->reserved->volumeLayout()) return false;
+            const bool compressed = resource->reserved->blockWidth() == 4;
+            const UINT block = compressed ? 4 : 1;
+            const UINT64 columns = source_columns, rows = source_rows;
+            auto native = resource->texture->current()->texture();
+            for (UINT64 z = 0; z < depth; ++z)
+              for (UINT64 y = 0; y < rows; ++y)
+                for (UINT64 x = 0; x < columns;) {
+                  const auto address = resource->reserved->VolumeAddress(mip, UINT(x * block), UINT(y * block), UINT(z));
+                  if (!address) { RecordError(); return true; }
+                  const UINT64 count = std::min<UINT64>(address->units, columns - x);
+                  const UINT64 row_offset = offset + z * slice_pitch + y * pitch + x * reinterpret_size;
+                  if (upload) {
+                    auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+                    copy.type = WMTBlitCommandCopyFromBufferToTexture;
+                    copy.src = staging; copy.src_offset = row_offset; copy.dst = native;
+                    copy.bytes_per_row = pitch; copy.bytes_per_image = 0;
+                    copy.slice = address->slice; copy.level = 0; copy.origin = {address->x, address->y, 0};
+                    copy.size = {count * block, block, 1};
+                  } else {
+                    auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+                    copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+                    copy.src = native; copy.dst = staging; copy.offset = row_offset;
+                    copy.bytes_per_row = pitch; copy.bytes_per_image = 0;
+                    copy.slice = address->slice; copy.level = 0; copy.origin = {address->x, address->y, 0};
+                    copy.size = {count * block, block, 1};
+                  }
+                  x += count;
+                }
+            return true;
+          };
+          if (!transfer_volume(pSrc, source_staging, source_offset, false)) {
           auto &read_source = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
           read_source.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
           read_source.src = pSrc->texture->current()->texture();
@@ -4755,6 +5168,8 @@ public:
           read_source.bytes_per_row = pitch;
           read_source.bytes_per_image = SrcDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? slice_pitch : 0;
           read_source.options = WMTBlitOptionNone;
+          }
+          if (FAILED(recording_error_)) return;
 
           WMT::Buffer destination_staging = source_staging;
           UINT64 destination_offset = source_offset;
@@ -4765,6 +5180,7 @@ public:
               RecordError(E_OUTOFMEMORY);
               return;
             }
+            if (!transfer_volume(pDst, scratch, scratch_offset, false)) {
             auto &read_destination = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
             read_destination.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
             read_destination.src = pDst->texture->current()->texture();
@@ -4777,6 +5193,8 @@ public:
             read_destination.bytes_per_row = pitch;
             read_destination.bytes_per_image = DstDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? slice_pitch : 0;
             read_destination.options = WMTBlitOptionNone;
+            }
+            if (FAILED(recording_error_)) return;
             allocator_->InvalidateCurrentPass();
             for (UINT64 copied = 0; copied < size;) {
               const UINT chunk = UINT(std::min<UINT64>(size - copied, UINT32_MAX));
@@ -4791,6 +5209,7 @@ public:
             RecordError();
             return;
           }
+          if (!transfer_volume(pDst, destination_staging, destination_offset, true)) {
           auto &write_destination = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
           write_destination.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
           write_destination.src = destination_staging;
@@ -4803,6 +5222,8 @@ public:
           write_destination.origin = {0, 0, 0};
           write_destination.size = {target_width, target_height, depth};
           write_destination.options = WMTBlitOptionNone;
+          }
+          if (FAILED(recording_error_)) return;
           allocator_->InvalidateCurrentPass();
         }
       }
@@ -4821,7 +5242,9 @@ public:
     // when D3D12 permits a bitwise copy between formats in one DXGI type group.
     // The region path creates matching-format views for each subresource (and
     // handles depth/stencil planes); keep the fast blit for identical backing.
-    if (predication_enabled_ || pSrc->texture->pixelFormat() != pDst->texture->pixelFormat()) {
+    if (predication_enabled_ || pSrc->texture->pixelFormat() != pDst->texture->pixelFormat() ||
+        (pSrc->reserved && pSrc->reserved->volumeLayout()) ||
+        (pDst->reserved && pDst->reserved->volumeLayout())) {
       MTL_DXGI_FORMAT_DESC copy_format{};
       if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), SrcDesc.Format, copy_format))) {
         RecordError();
@@ -4879,7 +5302,8 @@ public:
     auto *tiled = static_cast<MTLD3D12Resource *>(tiled_resource);
     auto *linear = static_cast<MTLD3D12Resource *>(buffer);
     const auto buffer_desc = buffer->GetDesc();
-    if (!tiled->reserved || buffer_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !linear->buffer) {
+    if (!tiled->reserved || (!tiled->reserved->isBuffer() && !tiled->owned_is_reserved) ||
+        buffer_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !linear->buffer) {
       RecordError();
       return;
     }
@@ -4939,6 +5363,32 @@ public:
      * tile. Tiles clipped by the mip's edge copy only their valid texels, keeping that pitch.
      */
     auto tiled_texture = tiled->texture->current()->texture();
+    if (const auto *volume = reserved.volumeLayout()) {
+      const uint32_t pitch = volume->page_w / volume->block_w * reserved.bytesPerUnit();
+      for (size_t i = 0; i < tiles.size(); i++) {
+        const uint32_t tile = tiles[i];
+        const uint32_t slice = tile / (volume->atlas_columns * volume->atlas_rows);
+        const WMTOrigin origin{(tile % volume->atlas_columns) * volume->page_w,
+            ((tile / volume->atlas_columns) % volume->atlas_rows) * volume->page_h, 0};
+        const WMTSize size{volume->page_w, volume->page_h, 1};
+        const uint64_t offset = buffer_offset + i * kReservedTileBytes;
+        if (to_buffer) {
+          auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+          copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+          copy.src = tiled_texture; copy.slice = slice; copy.level = 0;
+          copy.origin = origin; copy.size = size;
+          copy.dst = linear_buffer; copy.offset = offset;
+          copy.bytes_per_row = pitch; copy.bytes_per_image = 0;
+        } else {
+          auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+          copy.type = WMTBlitCommandCopyFromBufferToTexture;
+          copy.src = linear_buffer; copy.src_offset = offset;
+          copy.bytes_per_row = pitch; copy.bytes_per_image = 0; copy.size = size;
+          copy.dst = tiled_texture; copy.slice = slice; copy.level = 0; copy.origin = origin;
+        }
+      }
+      return;
+    }
     const auto shape = reserved.tileShape();
     const uint32_t block_w = reserved.blockWidth(), block_h = reserved.blockHeight();
     const uint32_t row_pitch = shape.WidthInTexels / block_w * reserved.bytesPerUnit();
@@ -5182,7 +5632,8 @@ public:
   }
 
   bool RequiresMSAAExecution() {
-    return pso_graphics_ && (pso_graphics_->RequiresMSAAExecution() || CoarseShadingRateState());
+    return pso_graphics_ && (pso_graphics_->RequiresMSAAExecution() || CoarseShadingRateState() ||
+                            topology_ == kTriangleFan);
   }
 
   /*
@@ -5211,7 +5662,7 @@ public:
     // Native mesh raster partitioning adds helper invocations to Metal's counter.
     // Active D3D queries need the captured per-(primitive,pixel) invocation accounting.
     const bool capture_pixels = statistics || CoarseShadingRateState() != 0 ||
-        pso_graphics_->owned_mesh_output_replay || pso_graphics_->owned_conservative;
+        (pso_graphics_->owned_mesh_output_replay || pso_graphics_->uses_atomic64 || pso_graphics_->emulated_depth_bounds) || pso_graphics_->owned_conservative;
     const bool capture_object = capture_pixels && pso_graphics_->as_threads[0];
     const uint32_t key = MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, statistics) |
         (capture_pixels ? kMeshMSAACapture : 0) | (capture_object ? kMeshObjectCapture : 0);
@@ -6337,6 +6788,11 @@ public:
     auto CheckedFlags = Flags & DepthStencilPlanarFlags(AttachmentDesc.Texture->pixelFormat(AttachmentDesc.View));
     if (!CheckedFlags || (RectCount && !Rects))
       return;
+    if ((CheckedFlags & D3D12_CLEAR_FLAG_DEPTH) && sample_positions_.count &&
+        sample_positions_.count != AttachmentDesc.Texture->sampleCount()) {
+      RecordError();
+      return;
+    }
 
     if (predication_enabled_ || RectCount) {
       const D3D12_RECT full_rect = {0, 0, LONG(AttachmentDesc.Width), LONG(AttachmentDesc.Height)};
@@ -6354,6 +6810,8 @@ public:
       }
 
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, 0, CheckedFlags);
+      if (CheckedFlags & D3D12_CLEAR_FLAG_DEPTH)
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->sample_positions = sample_positions_;
       for (UINT i = 0; i < clear_rect_count; i++) {
         const auto &rect = clear_rects[i];
         const uint32_t rect_offset_x = std::max(rect.left, LONG(0));
@@ -6377,6 +6835,7 @@ public:
     auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
     encoder_info->type = EncoderType::Clear;
     encoder_info->clear_dsv = CheckedFlags;
+    if (CheckedFlags & D3D12_CLEAR_FLAG_DEPTH) encoder_info->sample_positions = sample_positions_;
     encoder_info->depth_stencil = {Depth, Stencil};
     encoder_info->attachment = AttachmentDesc.Texture->view(AttachmentDesc.View);
     encoder_info->array_length = AttachmentDesc.RenderTargetArrayLength;
@@ -6578,6 +7037,8 @@ public:
       default:
         break;
       }
+      if (Descriptor.UAVTexture.texture->reservedVolumeLayoutAddress)
+        dispatch_depth = Descriptor.UAVTexture.w_size;
       break;
     case ShaderVisibleDescriptorType::UAVTexelBuffer:
       buffer_base_x = Descriptor.UAVTexelBuffer.slice.firstElement;
@@ -6606,7 +7067,7 @@ public:
     }
 
     if (Descriptor.type == ShaderVisibleDescriptorType::UAVTexture)
-      RecordStandardSwizzleUse(static_cast<MTLD3D12Resource *>(pResource), false);
+      RecordStandardSwizzleUse(static_cast<MTLD3D12Resource *>(pResource), false, Descriptor.UAVTexture.texture->isWritableMSAAView(Descriptor.UAVTexture.view));
     switch (Descriptor.type) {
     case ShaderVisibleDescriptorType::UAVBuffer:
       allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
@@ -6635,7 +7096,7 @@ public:
     }
     allocator_->clear_uav_.end();
     if (Descriptor.type == ShaderVisibleDescriptorType::UAVTexture)
-      RecordStandardSwizzleUse(static_cast<MTLD3D12Resource *>(pResource), true);
+      RecordStandardSwizzleUse(static_cast<MTLD3D12Resource *>(pResource), true, Descriptor.UAVTexture.texture->isWritableMSAAView(Descriptor.UAVTexture.view));
   };
 
   void STDMETHODCALLTYPE
@@ -6680,6 +7141,8 @@ public:
       default:
         break;
       }
+      if (Descriptor.UAVTexture.texture->reservedVolumeLayoutAddress)
+        dispatch_depth = Descriptor.UAVTexture.w_size;
       break;
     case ShaderVisibleDescriptorType::UAVTexelBuffer:
       buffer_base_x = Descriptor.UAVTexelBuffer.slice.firstElement;
@@ -6708,7 +7171,7 @@ public:
     }
 
     if (Descriptor.type == ShaderVisibleDescriptorType::UAVTexture)
-      RecordStandardSwizzleUse(static_cast<MTLD3D12Resource *>(pResource), false);
+      RecordStandardSwizzleUse(static_cast<MTLD3D12Resource *>(pResource), false, Descriptor.UAVTexture.texture->isWritableMSAAView(Descriptor.UAVTexture.view));
     switch (Descriptor.type) {
     case ShaderVisibleDescriptorType::UAVBuffer:
       allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
@@ -6737,7 +7200,7 @@ public:
     }
     allocator_->clear_uav_.end();
     if (Descriptor.type == ShaderVisibleDescriptorType::UAVTexture)
-      RecordStandardSwizzleUse(static_cast<MTLD3D12Resource *>(pResource), true);
+      RecordStandardSwizzleUse(static_cast<MTLD3D12Resource *>(pResource), true, Descriptor.UAVTexture.texture->isWritableMSAAView(Descriptor.UAVTexture.view));
   };
 
   void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *pResource, const D3D12_DISCARD_REGION *pRegion) {
@@ -7147,26 +7610,27 @@ public:
                           ",\"op\":", uint32_t(Op));
   };
 
-  void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void *data, UINT size) {
-    // The existing diagnostic records metadata and length, not marker payloads.
-    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::SetMarker, Metadata, static_cast<const void *>(nullptr), size))
+  void RecordAnnotation(DiagnosticAnnotation annotation) {
+    if (!IsRecording()) { RecordError(E_FAIL); return; }
+    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+      AppendBundleCommand([annotation = std::move(annotation)](auto &parent) { parent.RecordAnnotation(annotation); });
       return;
-    owned_graphics::Trace("marker", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
-                          ",\"metadata\":", Metadata, ",\"bytes\":", size);
-  };
-
-  void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void *data, UINT size) {
-    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::BeginEvent, Metadata, static_cast<const void *>(nullptr), size))
-      return;
-    owned_graphics::Trace("event_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
-                          ",\"metadata\":", Metadata, ",\"bytes\":", size);
-  };
-
-  void STDMETHODCALLTYPE EndEvent() {
-    if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::EndEvent))
-      return;
-    owned_graphics::Trace("event_end", ",\"list\":", owned_id, ",\"recording\":", owned_recording);
-  };
+    }
+    allocator_->InvalidateCurrentPass();
+    auto *pass = allocator_->AllocatePass<DiagnosticEncoderData>();
+    pass->type = EncoderType::Diagnostic; pass->annotation = std::move(annotation);
+    allocator_->InvalidateCurrentPass();
+  }
+  void Annotation(UINT action, UINT metadata, const void *data, UINT size) {
+    try { RecordAnnotation(CaptureAnnotation(action, metadata, data, size)); }
+    catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); }
+    catch (const std::invalid_argument &) { RecordError(); }
+    owned_graphics::Trace(action == 0 ? "marker" : action == 1 ? "event_begin" : "event_end",
+        ",\"list\":", owned_id, ",\"recording\":", owned_recording, ",\"metadata\":", metadata, ",\"bytes\":", size);
+  }
+  void STDMETHODCALLTYPE SetMarker(UINT metadata, const void *data, UINT size) { Annotation(0, metadata, data, size); }
+  void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void *data, UINT size) { Annotation(1, metadata, data, size); }
+  void STDMETHODCALLTYPE EndEvent() { Annotation(2, 0, nullptr, 0); }
 
   void RecordStreamOutputIndirect(MTLD3D12CommandSignature *sig, UINT max_count, uint64_t arguments,
                                   uint64_t count_buffer, WMTPrimitiveType primitive_type) {
@@ -7196,7 +7660,7 @@ public:
     const uint32_t slots = pso_graphics_->slot_mask | sig->VertexBufferMask;
     const uint64_t vertex_bytes = slots ? uint64_t(16) * (32 - __builtin_clz(slots)) : 0;
     const uint64_t root_bytes = rootsig_graphics_ ? uint64_t(rootsig_graphics_->UploadQwords) * 8 : 0;
-    const uint64_t sampler_bytes = rootsig_graphics_ ? uint64_t(rootsig_graphics_->NumStaticSamplers) * 32 : 0;
+    const uint64_t sampler_bytes = rootsig_graphics_ ? uint64_t(rootsig_graphics_->NumStaticSamplers) * 64 : 0;
     if (!allocator_->ReserveGPUHeap(vertex_bytes + root_bytes + sampler_bytes + 128, 64)) {
       RecordError(E_OUTOFMEMORY);
       return;
@@ -7304,7 +7768,7 @@ public:
     const bool domain_only = pso_graphics_->mesh_kind == MeshPipelineKind::Tessellation;
     const bool capture_pixels = (!pso_graphics_->stream_output.active ||
             pso_graphics_->stream_output.rasterized_stream != D3D12_SO_NO_RASTERIZED_STREAM) &&
-            (pso_graphics_->owned_conservative || pso_graphics_->owned_distance_interpolation || CoarseShadingRateState() != 0);
+            (pso_graphics_->owned_conservative || (pso_graphics_->owned_distance_interpolation || pso_graphics_->uses_atomic64 || pso_graphics_->emulated_depth_bounds) || CoarseShadingRateState() != 0);
     const bool indexed = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
     if (!indexed && sig->CommandType != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW) {
       RecordError(E_INVALIDARG);
@@ -7320,7 +7784,7 @@ public:
     const bool index32 = index_type == WMTIndexTypeUInt32;
     const bool strip = topology_ == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP || topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
                        topology_ == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ ||
-                       topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
+                       (topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ || topology_ == kTriangleFan);
     // Direct draws expand these into the equivalent list (RecordMeshStripCut); the queue does the same per command,
     // from its GPU-written arguments and the bound index buffer, before the pass.
     const bool strip_cut = geometry && indexed && strip &&
@@ -7328,7 +7792,7 @@ public:
                             (ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF && index32));
     const bool strip_expand = geometry && (strip_cut ||
         (sig->UpdateIndexBuffer && strip && ib_strip_cut_value_ != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED) ||
-        topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ);
+        (topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ || topology_ == kTriangleFan));
     const bool statistics = !active_pipeline_statistics_.empty();
     if (!MaxCommandCount)
       return;
@@ -7441,6 +7905,7 @@ public:
         case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: warp_topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST; vpp = 2; break;
         case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: warp_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST; vpp = 3; break;
         case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: warp_topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ; vpp = 4; break;
+        case kTriangleFan: warp_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST; vpp = 3; break;
         default: warp_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ; vpp = 6; break;
         }
         data->strip_expand = true;
@@ -7544,11 +8009,11 @@ public:
         ((ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF && !index32) ||
          (ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF && index32));
     // GS strips the mesh GS cannot assemble natively take the capture path, which expands them per command.
-    if (pso_graphics_->owned_conservative || pso_graphics_->owned_distance_interpolation ||
+    if (pso_graphics_->owned_conservative || (pso_graphics_->owned_distance_interpolation || pso_graphics_->uses_atomic64 || pso_graphics_->emulated_depth_bounds) ||
         CoarseShadingRateState() != 0 ||
         pso_graphics_->mesh_kind == MeshPipelineKind::TessellationGeometry || pso_graphics_->stream_output.active ||
         (pso_graphics_->mesh_kind == MeshPipelineKind::Geometry &&
-         (cut_strip || topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ))) {
+         (cut_strip || (topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ || topology_ == kTriangleFan)))) {
       RecordMeshCaptureIndirect(sig, MaxCommandCount, ArgBufferAddress, CountBufferAddress);
       return;
     }
@@ -7582,7 +8047,7 @@ public:
     }
     const bool strip = topology_ == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP || topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
                        topology_ == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ ||
-                       topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
+                       (topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ || topology_ == kTriangleFan);
     const auto [vertex_per_warp, increment] = GeometryWarpShape(topology_);
     const uint32_t threads_per_patch = pso_graphics_->tess_threads_per_patch;
     const uint32_t patch_per_group = tessellation ? 32 / threads_per_patch : 0;
@@ -7753,7 +8218,7 @@ public:
     allocator_->InvalidateCurrentPass();
 
     const bool capture_pixels = statistics || CoarseShadingRateState() != 0 ||
-        pso_graphics_->owned_mesh_output_replay || pso_graphics_->owned_conservative;
+        (pso_graphics_->owned_mesh_output_replay || pso_graphics_->uses_atomic64 || pso_graphics_->emulated_depth_bounds) || pso_graphics_->owned_conservative;
     const uint32_t capture_key = MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, statistics) |
         (capture_pixels ? kMeshMSAACapture : 0) |
         (capture_pixels && pso_graphics_->as_threads[0] ? kMeshObjectCapture : 0);
@@ -7874,7 +8339,7 @@ public:
         const uint64_t per_command = uint64_t(rootsig_compute_->UploadQwords) * sizeof(uint64_t);
         if ((per_command && MaxCommandCount > (SIZE_MAX - required_heap) / per_command) ||
             !allocator_->ReserveGPUHeap(required_heap + per_command * MaxCommandCount +
-                                                uint64_t(rootsig_compute_->NumStaticSamplers) * 4 * sizeof(uint64_t) + 128,
+                                                uint64_t(rootsig_compute_->NumStaticSamplers) * 8 * sizeof(uint64_t) + 128,
                                             16)) {
           RecordError(E_OUTOFMEMORY);
           return;
@@ -7889,6 +8354,23 @@ public:
       cmd->max_count_buffer = CountBufferAddress;
       cmd->argument_buffer = ArgBufferAddress;
       cmd->pipeline_statistics = statistics ? allocator_->GPUHeapAddress(pipeline_statistics_counters_offset_) : 0;
+      if (pso_compute_->uses_atomic64) {
+        auto *compute = static_cast<ComputeEncoderData *>(allocator_->encoder_current);
+        compute->atomic64_indirect.push_back({cmd, sig->ByteStride, sig->DrawArgumentOffset, sig->atomic64_root_fields});
+        auto *signature = static_cast<MTLD3D12RootSignature *>(rootsig_compute_.ptr());
+        std::erase_if(compute->atomic64_indirect.back().root_fields, [&](const auto &field) {
+          const auto *range = signature->GetRootDescriptorRange(field.root_parameter);
+          bool used = false;
+          if (range) signature->ForEachUsedDescriptorRange({range, 1}, pso_compute_->resource_bindings,
+              [&](uint64_t, uint64_t, D3D12_DESCRIPTOR_RANGE_TYPE) { used = true; });
+          return !used;
+        });
+        if (predication_enabled_) {
+          auto binding = allocator_->ResolveGPUHeap(predication_snapshot_offset_);
+          compute->atomic64_indirect.back().predicate_buffer = binding.buffer;
+          compute->atomic64_indirect.back().predicate_offset = binding.offset;
+        }
+      }
       cmd->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
       cmd->predicate_op = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
 
@@ -7906,6 +8388,7 @@ public:
           cmd->static_samplers = allocator_->GPUHeapAddress(cmd->static_samplers);
       }
       ResetIndirectState(sig, rootsig_compute_.ptr(), rootarg_compute_staging_, true);
+      if (pso_compute_->uses_atomic64) allocator_->InvalidateCurrentPass();
 
       return;
     }
@@ -7975,7 +8458,7 @@ public:
       if (slot_mask)
         per_command += align(uint64_t(16) * (32 - __builtin_clz(slot_mask)), uint64_t(16));
       const uint64_t sampler_bytes = rootsig_graphics_
-          ? uint64_t(rootsig_graphics_->NumStaticSamplers) * 4 * sizeof(uint64_t)
+          ? uint64_t(rootsig_graphics_->NumStaticSamplers) * 8 * sizeof(uint64_t)
           : 0;
       if ((per_command && MaxCommandCount > (SIZE_MAX - required_heap - sampler_bytes) / per_command) ||
           !allocator_->ReserveGPUHeap(required_heap + sampler_bytes + per_command * MaxCommandCount + 128, 16)) {
@@ -8133,23 +8616,64 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
   OMSetDepthBounds(FLOAT Min, FLOAT Max) {
     if (RecordBundle(&MTLD3D12GraphicsCommandListImpl::OMSetDepthBounds, Min, Max))
       return;
-    WARN("OMSetDepthBounds: ignoring (", Min, ", ", Max, ")");
+    depth_bounds_min_ = std::isnan(Min) ? 0.0f : Min;
+    depth_bounds_max_ = std::isnan(Max) ? 0.0f : Max;
+    dirty_state_.set(DirtyState::GraphicsPipelineState);
   }
 
   void STDMETHODCALLTYPE
   SetSamplePositions(UINT NumSamplesPerPixel, UINT NumPixels, D3D12_SAMPLE_POSITION *pSamplePositions) {
-    if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+    if (!IsRecording()) {
+      RecordError(E_FAIL);
+      return;
+    }
+    if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+      RecordError();
+      return;
+    }
+    if (RejectInRenderPass())
+      return;
+    if (!device_->SupportsCenterSamplePattern()) {
       RecordError(E_NOTIMPL);
       return;
     }
-    /* ProgrammableSamplePositionsTier is NOT_SUPPORTED; the call is invalid on this device. */
-    RecordError(E_NOTIMPL);
+    WMTProgrammableSamplePositions pattern{};
+    if (NumSamplesPerPixel || NumPixels || pSamplePositions) {
+      if (NumPixels != 1 || (NumSamplesPerPixel != 2 && NumSamplesPerPixel != 4 && NumSamplesPerPixel != 8) ||
+          !pSamplePositions || !device_->GetMTLDevice().supportsTextureSampleCount(NumSamplesPerPixel)) {
+        RecordError();
+        return;
+      }
+      pattern.count = NumSamplesPerPixel;
+      for (UINT i = 0; i < NumSamplesPerPixel; ++i) {
+        if (pSamplePositions[i].X < -8 || pSamplePositions[i].X > 7 ||
+            pSamplePositions[i].Y < -8 || pSamplePositions[i].Y > 7) {
+          RecordError();
+          return;
+        }
+        pattern.positions[i][0] = pSamplePositions[i].X;
+        pattern.positions[i][1] = pSamplePositions[i].Y;
+      }
+    }
+    if (std::memcmp(&sample_positions_, &pattern, sizeof(pattern)) == 0)
+      return;
+    allocator_->InvalidateCurrentPass();
+    sample_positions_ = pattern;
   }
 
   void STDMETHODCALLTYPE
   ResolveSubresourceRegion(
       ID3D12Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, ID3D12Resource *pSrcResource,
       UINT SrcSubresource, D3D12_RECT *pSrcRect, DXGI_FORMAT Format, D3D12_RESOLVE_MODE ResolveMode
+  ) {
+    ResolveTextureRegion(pDstResource, DstSubresource, DstX, DstY, pSrcResource, SrcSubresource,
+                         pSrcRect, Format, ResolveMode, false);
+  }
+
+  // Copying an MSAA depth/stencil plane needs the same sample-preserving raster operation as DECOMPRESS.
+  void ResolveTextureRegion(
+      ID3D12Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, ID3D12Resource *pSrcResource,
+      UINT SrcSubresource, D3D12_RECT *pSrcRect, DXGI_FORMAT Format, D3D12_RESOLVE_MODE ResolveMode, bool copy_states
   ) {
     if (RejectBundleOperation())
       return;
@@ -8161,7 +8685,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
                                DstSubresource, DstX, DstY, pSrcResource, SrcSubresource, pSrcRect, Format);
       return;
     }
-    if (!pDstResource || !pSrcResource ||
+    if (!QueryObjectOwnedByThisDevice(pDstResource) || !QueryObjectOwnedByThisDevice(pSrcResource) ||
         (ResolveMode != D3D12_RESOLVE_MODE_AVERAGE && ResolveMode != D3D12_RESOLVE_MODE_MIN &&
          ResolveMode != D3D12_RESOLVE_MODE_MAX && ResolveMode != D3D12_RESOLVE_MODE_DECOMPRESS)) {
       RecordError();
@@ -8173,12 +8697,25 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     const auto dst_resource_desc = dst_resource->GetDesc();
     const auto src_resource_desc = src_resource->GetDesc();
     MTL_DXGI_FORMAT_DESC format_desc;
+    MTL_DXGI_FORMAT_DESC source_format{}, destination_format{};
     if (!dst_resource->texture || !src_resource->texture ||
         dst_resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         src_resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), Format, format_desc)) ||
+        FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), src_resource_desc.Format, source_format)) ||
+        FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), dst_resource_desc.Format, destination_format)) ||
         !resource_contract::AreCopyCompatibleFormats(dst_resource_desc.Format, Format) ||
         !resource_contract::AreCopyCompatibleFormats(src_resource_desc.Format, Format)) {
+      RecordError();
+      return;
+    }
+    const bool source_typeless = (source_format.Flag & MTL_DXGI_FORMAT_TYPELESS) &&
+                                 !IsD3D12DepthStencilPlaneView(src_resource_desc.Format);
+    const bool destination_typeless = (destination_format.Flag & MTL_DXGI_FORMAT_TYPELESS) &&
+                                      !IsD3D12DepthStencilPlaneView(dst_resource_desc.Format);
+    if (!copy_states && (((format_desc.Flag & MTL_DXGI_FORMAT_TYPELESS) && !IsD3D12DepthStencilPlaneView(Format)) ||
+        (!source_typeless && src_resource_desc.Format != Format) ||
+        (!destination_typeless && dst_resource_desc.Format != Format))) {
       RecordError();
       return;
     }
@@ -8190,7 +8727,8 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     UINT src_level = 0, src_slice = 0, src_plane = 0;
     if (!GetSubresourceInfo(device_->GetMTLDevice(), dst_resource_desc, DstSubresource, dst_level, dst_slice, dst_plane) ||
         !GetSubresourceInfo(device_->GetMTLDevice(), src_resource_desc, SrcSubresource, src_level, src_slice, src_plane) ||
-        dst_plane != src_plane || src_level || src_resource_desc.SampleDesc.Count <= 1) {
+        dst_plane != src_plane || (src_level && src_resource_desc.SampleDesc.Count > 1) ||
+        (src_resource_desc.SampleDesc.Count <= 1 && ResolveMode != D3D12_RESOLVE_MODE_DECOMPRESS)) {
       RecordError();
       return;
     }
@@ -8206,36 +8744,58 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       return;
     }
 
-    if (ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS) {
-      if (dst_resource_desc.SampleDesc.Count != src_resource_desc.SampleDesc.Count ||
-          pDstResource != pSrcResource || DstSubresource != SrcSubresource || DstX != UINT(rect.left) ||
-          DstY != UINT(rect.top))
+    const bool decompress = ResolveMode == D3D12_RESOLVE_MODE_DECOMPRESS;
+    if (decompress) {
+      if (dst_resource_desc.SampleDesc.Count != src_resource_desc.SampleDesc.Count) {
         RecordError();
-      return;
+        return;
+      }
+      if (pDstResource == pSrcResource && DstSubresource == SrcSubresource) {
+        if (DstX != UINT(rect.left) || DstY != UINT(rect.top)) RecordError();
+        RecordImplicitUse(pSrcResource, SrcSubresource, render_pass_internal_ ? render_pass_resolve_source_state_ :
+                          D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        // Stored Metal samples are already accessible without decompression.
+        return;
+      }
     }
-    const uint8_t dsv_flags = uint8_t(DepthStencilPlanarFlags(format_desc.PixelFormat));
+    const uint8_t dsv_flags = uint8_t(DepthStencilPlanarFlags(src_resource->texture->pixelFormat()));
     const uint8_t dsv_plane = dsv_flags ? (src_plane ? 2 : 1) : 0;
-    if (dst_resource_desc.SampleDesc.Count != 1 || (dsv_flags && ResolveMode == D3D12_RESOLVE_MODE_AVERAGE)) {
+    if (decompress && dsv_plane == 1 && src_resource_desc.SampleDesc.Count > 1 &&
+        sample_positions_.count && sample_positions_.count != src_resource_desc.SampleDesc.Count) {
       RecordError();
       return;
     }
+    if ((!decompress && dst_resource_desc.SampleDesc.Count != 1) ||
+        ((dsv_plane == 2 || IsIntegerFormat(format_desc.PixelFormat)) && ResolveMode == D3D12_RESOLVE_MODE_AVERAGE)) {
+      RecordError();
+      return;
+    }
+    // Ending-access resolves consume the attachment in its pass state, not a public RESOLVE_SOURCE transition.
+    if (!RecordImplicitUse(pSrcResource, SrcSubresource, render_pass_internal_ ? render_pass_resolve_source_state_ :
+                           copy_states ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RESOLVE_SOURCE) ||
+        !RecordImplicitUse(pDstResource, DstSubresource, copy_states ? D3D12_RESOURCE_STATE_COPY_DEST :
+                           D3D12_RESOURCE_STATE_RESOLVE_DEST))
+      return;
 
     auto &src = src_resource->texture;
     auto &dst = dst_resource->texture;
-    const auto sampling_format = dsv_plane == 2 && DepthStencilPlanarFlags(src->pixelFormat()) == 3
-        ? WMTPixelFormatX32_Stencil8
-        : format_desc.PixelFormat;
-    const auto attachment_format = dsv_plane ? dst->pixelFormat() : format_desc.PixelFormat;
+    const auto sampling_format = dsv_plane == 2 && dsv_flags == 3 ? WMTPixelFormatX32_Stencil8 :
+                                 dsv_plane == 1 ? src->pixelFormat() : format_desc.PixelFormat;
+    const uint8_t destination_dsv_plane = DepthStencilPlanarFlags(dst->pixelFormat()) ? dsv_plane : 0;
+    const auto attachment_format = destination_dsv_plane ? dst->pixelFormat() :
+        copy_states && dsv_plane == 1 ?
+        (src_resource_desc.Format == DXGI_FORMAT_D16_UNORM || src_resource_desc.Format == DXGI_FORMAT_R16_TYPELESS
+         ? WMTPixelFormatR16Unorm : WMTPixelFormatR32Float) : format_desc.PixelFormat;
     TextureViewDescriptor src_view_desc;
     src_view_desc.format = sampling_format;
-    src_view_desc.type = WMTTextureType2DMultisample;
+    src_view_desc.type = src_resource_desc.SampleDesc.Count > 1 ? WMTTextureType2DMultisample : WMTTextureType2D;
     src_view_desc.arraySize = 1;
     src_view_desc.firstArraySlice = src_slice;
     src_view_desc.miplevelCount = 1;
-    src_view_desc.firstMiplevel = 0;
+    src_view_desc.firstMiplevel = src_level;
     TextureViewDescriptor dst_view_desc;
     dst_view_desc.format = attachment_format;
-    dst_view_desc.type = WMTTextureType2D;
+    dst_view_desc.type = decompress && dst_resource_desc.SampleDesc.Count > 1 ? WMTTextureType2DMultisample : WMTTextureType2D;
     dst_view_desc.arraySize = 1;
     dst_view_desc.firstArraySlice = dst_slice;
     dst_view_desc.miplevelCount = 1;
@@ -8254,7 +8814,8 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     resolve->type = EncoderType::Resolve;
     resolve->src = src_view;
     resolve->dst = dst_view;
-    resolve->dsv_flags = dsv_plane;
+    resolve->dsv_flags = destination_dsv_plane;
+    if (decompress && src_resource_desc.SampleDesc.Count > 1) resolve->sample_positions = sample_positions_;
 
     const bool whole_average = !dsv_plane && !predication_enabled_ && ResolveMode == D3D12_RESOLVE_MODE_AVERAGE && !pSrcRect &&
                                !DstX && !DstY && src_extent.right == dst_extent.right &&
@@ -8267,31 +8828,38 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       auto vertex = WMT4::Library(library).newFunction("dxmt_resolve_vertex");
       const bool integer = IsIntegerFormat(format_desc.PixelFormat);
       const bool unsigned_integer = integer && MTLGetUnsignedIntegerFormat(format_desc.PixelFormat) == format_desc.PixelFormat;
-      const char *fragment_name = dsv_plane == 1 ? "dxmt_resolve_depth" :
-                                  dsv_plane == 2 ? "dxmt_resolve_stencil" :
+      const char *fragment_name = dsv_plane == 1 ?
+                                  (destination_dsv_plane ? "dxmt_resolve_depth" : "dxmt_resolve_depth_color") :
+                                  dsv_plane == 2 ? (destination_dsv_plane ? "dxmt_resolve_stencil" : "dxmt_resolve_uint") :
                                   unsigned_integer ? "dxmt_resolve_uint" :
                                   integer ? "dxmt_resolve_sint" : "dxmt_resolve_float";
+      if (src_resource_desc.SampleDesc.Count == 1)
+        fragment_name = dsv_plane == 1 ?
+                        (destination_dsv_plane ? "dxmt_decompress_depth_single" : "dxmt_decompress_depth_color_single") :
+                        dsv_plane == 2 ? (destination_dsv_plane ? "dxmt_decompress_stencil_single" : "dxmt_decompress_uint_single") :
+                        unsigned_integer ? "dxmt_decompress_uint_single" :
+                        integer ? "dxmt_decompress_sint_single" : "dxmt_decompress_float_single";
       auto fragment = WMT4::Library(library).newFunction(fragment_name);
       WMTRenderPipelineInfo pipeline_info;
       WMT::InitializeRenderPipelineInfo(pipeline_info);
       pipeline_info.vertex_function = vertex.handle;
       pipeline_info.fragment_function = fragment.handle;
-      if (dsv_plane & 1)
+      if (destination_dsv_plane & 1)
         pipeline_info.depth_pixel_format = attachment_format;
-      else if (dsv_plane & 2)
+      else if (destination_dsv_plane & 2)
         pipeline_info.stencil_pixel_format = attachment_format;
       else
         pipeline_info.colors[0].pixel_format = attachment_format;
-      pipeline_info.raster_sample_count = 1;
+      pipeline_info.raster_sample_count = decompress ? src_resource_desc.SampleDesc.Count : 1;
       pipeline_info.rasterization_enabled = true;
       pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
       WMT::Reference<WMT::Error> error;
       resolve->pipeline = device_->GetMetal4Compiler().newRenderPipelineState(pipeline_info, error);
-      if (dsv_plane) {
+      if (destination_dsv_plane) {
         WMTDepthStencilInfo depth_stencil_info;
         depth_stencil_info.depth_compare_function = WMTCompareFunctionAlways;
-        depth_stencil_info.depth_write_enabled = dsv_plane & 1;
-        if (dsv_plane & 2) {
+        depth_stencil_info.depth_write_enabled = destination_dsv_plane & 1;
+        if (destination_dsv_plane & 2) {
           depth_stencil_info.front_stencil.enabled = true;
           depth_stencil_info.front_stencil.depth_stencil_pass_op = WMTStencilOperationReplace;
           depth_stencil_info.front_stencil.depth_fail_op = WMTStencilOperationReplace;
@@ -8303,7 +8871,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
         }
         resolve->depth_stencil_state = device_->GetMTLDevice().newDepthStencilState(depth_stencil_info);
       }
-      if (!vertex || !fragment || !resolve->pipeline || (dsv_plane && !resolve->depth_stencil_state)) {
+      if (!vertex || !fragment || !resolve->pipeline || (destination_dsv_plane && !resolve->depth_stencil_state)) {
         resolve->~ResolveEncoderData();
         allocator_->encoder_current = nullptr;
         RecordError(E_FAIL);
@@ -8316,7 +8884,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       resolve->parameters.source_delta_x = rect.left - LONG(DstX);
       resolve->parameters.source_delta_y = rect.top - LONG(DstY);
       resolve->parameters.sample_count = src_resource_desc.SampleDesc.Count;
-      resolve->parameters.mode = ResolveMode == D3D12_RESOLVE_MODE_AVERAGE ? 0 :
+      resolve->parameters.mode = decompress ? 3 : ResolveMode == D3D12_RESOLVE_MODE_AVERAGE ? 0 :
                                  ResolveMode == D3D12_RESOLVE_MODE_MIN ? 1 : 2;
       resolve->parameters.predicate_enabled = predication_enabled_;
       resolve->parameters.predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
@@ -8418,7 +8986,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     raytracing::BuildInputs inputs;
     raytracing::BufferLocation destination;
     if (FAILED(raytracing::ConvertBuildInputs(desc->Inputs, ResolveRaytracingGPUVA, device, inputs)) ||
-        (desc->DestAccelerationStructureData % raytracing::kAccelerationStructureAlignment) ||
+        (desc->DestAccelerationStructureData % (uint32_t(inputs.type) == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY ? 128 : raytracing::kAccelerationStructureAlignment)) ||
         !ResolveRaytracingGPUVA(device, desc->DestAccelerationStructureData, raytracing::kHeaderSize, destination) ||
         destination.available <= raytracing::kHeaderSize) {
       RecordError();
@@ -8456,11 +9024,12 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       }
     }
     raytracing::BufferLocation scratch;
-    if ((desc->ScratchAccelerationStructureData % raytracing::kAccelerationStructureAlignment) ||
+    const bool ommArray = uint32_t(inputs.type) == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY;
+    if (!ommArray && ((desc->ScratchAccelerationStructureData % raytracing::kAccelerationStructureAlignment) ||
         (!(update && !sizes.refitScratchSize && !desc->ScratchAccelerationStructureData) && !ResolveRaytracingGPUVA(
             device, desc->ScratchAccelerationStructureData,
             update ? sizes.refitScratchSize : sizes.buildScratchSize, scratch
-        ))) {
+        )))) {
       RecordError();
       return;
     }
@@ -8471,7 +9040,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
             update ? 0 : sizes.accelerationStructureSize, inputs.instanceCount);
     raytracing::NativeDescriptor native;
     if (!sidecar ||
-        (!update && FAILED(raytracing::CreateNativeDescriptor(
+        (!update && !ommArray && FAILED(raytracing::CreateNativeDescriptor(
             device->GetMTLDevice(), inputs, sidecar.instanceBuffer(), native
         )))) {
       RecordError(E_FAIL);
@@ -8497,13 +9066,20 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     uint64_t currentSize, buildScratch, updateScratch;
     raytracing::CalculatePrebuildInfo(sizes, shadow.size, &currentSize, &buildScratch, &updateScratch);
     record->metadata = {raytracing::kHeaderMagic, uint32_t(inputs.type), uint32_t(inputs.flags),
-        inputs.type == 0 ? inputs.instanceCount : uint32_t(inputs.geometries.size()), shadow.size, currentSize,
-        0, 0, currentSize};
+        inputs.type == 0 ? inputs.instanceCount : ommArray ? inputs.ommCount : uint32_t(inputs.geometries.size()), shadow.size, currentSize,
+        0, uint32_t(std::ranges::any_of(inputs.geometries, [](const raytracing::Geometry &g) {
+          return uint32_t(g.type) == D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES; })), currentSize};
     auto structureInfo = raytracing::DescribeStructure(inputs, shadow);
     record->shadowPlan = std::move(shadow);
-    if (record->deferredUpdate)
-      record->deferredInputs = std::move(inputs);
+    if (record->deferredUpdate || ommArray)
+      record->deferredInputs = inputs;
     record->descriptor = std::move(native.descriptor);
+    if (inputs.ommData.buffer) record->ommInputBuffers.emplace_back(inputs.ommData.buffer);
+    if (inputs.ommDescs.buffer) record->ommInputBuffers.emplace_back(inputs.ommDescs.buffer);
+    for (const auto &geometry : inputs.geometries) {
+      if (geometry.ommIndices.buffer) record->ommInputBuffers.emplace_back(geometry.ommIndices.buffer);
+      if (geometry.ommArray.buffer) record->ommInputBuffers.emplace_back(geometry.ommArray.buffer);
+    }
     record->source = update ? source.sidecar : WMT::AccelerationStructureSidecar{};
     record->destination = sidecar;
     record->header = destination.buffer;
@@ -8528,7 +9104,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     }
     try {
       for (UINT i = 0; i < postbuild_count; ++i) {
-        if (uint32_t(postbuild[i].InfoType) > 3) {
+        if (uint32_t(postbuild[i].InfoType) > (ommArray ? 1u : 3u)) {
           RecordError();
           return;
         }
@@ -8599,8 +9175,8 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     const bool deserialize = mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE;
     const bool export_data = mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE ||
                              mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_VISUALIZATION_DECODE_FOR_TOOLS;
-    if ((source_address % (deserialize ? 256 : raytracing::kAccelerationStructureAlignment)) ||
-        (destination_address % (export_data ? (mode == 3 ? 256 : 4) : raytracing::kAccelerationStructureAlignment)) ||
+    if ((source_address % (deserialize ? 256 : 128)) ||
+        (destination_address % (export_data ? (mode == 3 ? 256 : 4) : 128)) ||
         !ResolveRaytracingGPUVA(device, source_address, deserialize ? raytracing::kSerializedHeaderSize : raytracing::kHeaderSize, source_location) ||
         (!deserialize && !device->FindRTAS({source_location.allocationIdentity, source_location.offset}, source)) ||
         !ResolveRaytracingGPUVA(device, destination_address, export_data ? 8 : raytracing::kHeaderSize, destination)) {
@@ -8785,12 +9361,14 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       render_pass_resolves_.clear();
       for (UINT i = 0; i < NumRenderTargets; ++i)
         if (pRenderTargets[i].EndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
-          render_pass_resolves_.push_back(CopyResolve(pRenderTargets[i].EndingAccess.Resolve));
+          render_pass_resolves_.push_back(CopyResolve(pRenderTargets[i].EndingAccess.Resolve, D3D12_RESOURCE_STATE_RENDER_TARGET));
       if (pDepthStencil) {
         if (pDepthStencil->DepthEndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
-          render_pass_resolves_.push_back(CopyResolve(pDepthStencil->DepthEndingAccess.Resolve));
+          render_pass_resolves_.push_back(CopyResolve(pDepthStencil->DepthEndingAccess.Resolve,
+              UINT(Flags) & 0x8 ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE));
         if (pDepthStencil->StencilEndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
-          render_pass_resolves_.push_back(CopyResolve(pDepthStencil->StencilEndingAccess.Resolve));
+          render_pass_resolves_.push_back(CopyResolve(pDepthStencil->StencilEndingAccess.Resolve,
+              UINT(Flags) & 0x10 ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE));
       }
     } catch (const std::bad_alloc &) {
       RecordError(E_OUTOFMEMORY);
@@ -8843,8 +9421,8 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
   }
 
   static RenderPassResolve
-  CopyResolve(const D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS &params) {
-    RenderPassResolve resolve{params.pSrcResource, params.pDstResource, params.Format, params.ResolveMode, {}};
+  CopyResolve(const D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS &params, D3D12_RESOURCE_STATES source_state) {
+    RenderPassResolve resolve{params.pSrcResource, params.pDstResource, params.Format, params.ResolveMode, source_state, {}};
     resolve.regions.assign(params.pSubresourceParameters, params.pSubresourceParameters + params.SubresourceCount);
     return resolve;
   }
@@ -8862,10 +9440,12 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     const bool suspending = render_pass_flags_ & D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS;
     render_pass_internal_ = true;
     if (!suspending) {
-      for (auto &resolve : render_pass_resolves_)
+      for (auto &resolve : render_pass_resolves_) {
+        render_pass_resolve_source_state_ = resolve.source_state;
         for (auto &region : resolve.regions)
           ResolveSubresourceRegion(resolve.dst, region.DstSubresource, region.DstX, region.DstY, resolve.src,
                                    region.SrcSubresource, &region.SrcRect, resolve.format, resolve.mode);
+      }
     }
     render_pass_resolves_.clear();
     render_pass_surfaces_.clear();
@@ -8885,6 +9465,114 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
   void STDMETHODCALLTYPE ExecuteMetaCommand(ID3D12MetaCommand *, const void *, SIZE_T) {
     RecordError(E_NOTIMPL);
   }
+
+  void STDMETHODCALLTYPE ConvertLinearAlgebraMatrix(const D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_INFO *descs, UINT count) override {
+    if (!IsRecording() || (count && !descs) || RejectInRenderPass() ||
+        (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE)) { RecordError(); return; }
+    if (!count) return;
+    try {
+      if (!matrix_conversion_pipeline_) {
+        WMT::Reference<WMT::Error> error;
+        auto library = device_->GetMTLDevice().newLibraryWithSource(matrix::kConversionSource, error);
+        auto function = library ? WMT4::Library(library).newFunction("dxmt_convert_matrix") : WMT::Reference<WMT4::Function>();
+        if (function) matrix_conversion_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+        if (!matrix_conversion_pipeline_) { RecordError(E_FAIL); return; }
+      }
+      for (UINT i = 0; i < count; ++i) {
+        const auto &d = descs[i];
+        uint32_t dest_bytes, source_bytes, dest_stride, source_stride;
+        raytracing::BufferLocation source, destination;
+        if (d.DestInfo.DestDataType != d.SrcInfo.SrcDataType ||
+            !matrix::Footprint(d.DestInfo.NumRows, d.DestInfo.NumColumns, d.DestInfo.DestDataType,
+                              d.DestInfo.DestLayout, d.DestInfo.DestStride, true, dest_bytes, dest_stride) ||
+            !matrix::Footprint(d.DestInfo.NumRows, d.DestInfo.NumColumns, d.SrcInfo.SrcDataType,
+                              d.SrcInfo.SrcLayout, d.SrcInfo.SrcStride, false, source_bytes, source_stride) ||
+            d.DestInfo.DestSize < dest_bytes || d.DestInfo.DestSize % 16 || d.SrcInfo.SrcSize < source_bytes ||
+            d.DataDesc.DestVA % matrix::ComponentBytes(d.DestInfo.DestDataType) ||
+            d.DataDesc.SrcVA % matrix::ComponentBytes(d.SrcInfo.SrcDataType) ||
+            !ResolveRaytracingGPUVA(device_, d.DataDesc.SrcVA, d.SrcInfo.SrcSize, source) ||
+            !ResolveRaytracingGPUVA(device_, d.DataDesc.DestVA, d.DestInfo.DestSize, destination) ||
+            (source.buffer == destination.buffer && source.offset < destination.offset + dest_bytes &&
+             destination.offset < source.offset + source_bytes)) { RecordError(); return; }
+        const matrix::ConversionParams control{d.DestInfo.NumRows, d.DestInfo.NumColumns,
+            uint32_t(d.SrcInfo.SrcDataType), uint32_t(d.SrcInfo.SrcLayout),
+            uint32_t(d.DestInfo.DestLayout), source_stride, dest_stride};
+        if (!allocator_->ReserveGPUHeap(sizeof(control), 16)) { RecordError(E_OUTOFMEMORY); return; }
+        auto [storage, offset] = allocator_->AllocateGPUHeap(sizeof(control), 16);
+        memcpy(storage, &control, sizeof(control));
+        const uint32_t arguments[]{control.columns / 64 + (control.columns % 64 != 0), control.rows, 1};
+        uint64_t indirect = 0;
+        if (predication_enabled_) {
+          indirect = PreparePredicatedArguments(arguments, sizeof(arguments));
+          if (indirect == UINT64_MAX) { RecordError(E_OUTOFMEMORY); return; }
+        }
+        BeginPredicationComputePass(matrix_conversion_pipeline_, 64);
+        auto *compute = static_cast<ComputeEncoderData *>(allocator_->encoder_current);
+        compute->internal_buffer_owners.emplace_back(const_cast<BufferAllocation *>(static_cast<const BufferAllocation *>(source.allocationIdentity)));
+        compute->internal_buffer_owners.emplace_back(const_cast<BufferAllocation *>(static_cast<const BufferAllocation *>(destination.allocationIdentity)));
+        BindPredicationBuffer(source.buffer, source.offset, 0);
+        BindPredicationBuffer(destination.buffer, destination.offset, 1);
+        BindGPUHeapPredicationBuffer(offset, 2);
+        if (predication_enabled_) {
+          auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+          dispatch.type = WMTComputeCommandDispatchIndirect;
+          allocator_->BindGPUHeap(dispatch.indirect_args_buffer, dispatch.indirect_args_offset, indirect);
+        } else {
+          auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
+          dispatch.type = WMTComputeCommandDispatch; dispatch.size = {arguments[0], arguments[1], 1};
+        }
+        allocator_->InvalidateCurrentPass();
+        dirty_state_.set(DirtyState::ComputePipelineState);
+      }
+    } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); }
+  }
+
+  void RecordFenceBarrier(bool signal, UINT groups, const D3D12_BARRIER_GROUP *barriers,
+                          UINT count, ID3D12Fence *const *fences, const UINT64 *values) {
+    if (!IsRecording() || RejectInRenderPass() || type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE ||
+        (groups && !barriers) || (count && (!fences || !values))) { RecordError(); return; }
+    try {
+      std::vector<FenceBarrierEncoderData::Operand> operands;
+      operands.reserve(count);
+      for (UINT i = 0; i < count; ++i) {
+        Com<ID3D12Device> owner;
+        if (!fences[i] || FAILED(fences[i]->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
+            owner.ptr() != static_cast<ID3D12Device *>(device_)) { RecordError(); return; }
+        operands.push_back({Com<ID3D12Fence>(fences[i]), values[i]});
+      }
+      if (!signal && count) {
+        allocator_->InvalidateCurrentPass();
+        auto *record = allocator_->AllocatePass<FenceBarrierEncoderData>();
+        record->type = EncoderType::FenceBarrier; record->operands = std::move(operands);
+        record->state_event_index = static_cast<RecordingHead *>(entry)->state_events.size();
+        allocator_->InvalidateCurrentPass();
+      }
+      Barrier(groups, barriers);
+      if (FAILED(recording_error_)) return;
+      if (signal) {
+        allocator_->InvalidateCurrentPass();
+        auto *record = allocator_->AllocatePass<FenceBarrierEncoderData>();
+        record->type = EncoderType::FenceBarrier; record->signal = true; record->operands = std::move(operands);
+        record->state_event_index = static_cast<RecordingHead *>(entry)->state_events.size();
+        allocator_->InvalidateCurrentPass();
+      }
+    } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); }
+  }
+
+  void STDMETHODCALLTYPE WaitBarrier(UINT groups, const D3D12_BARRIER_GROUP *barriers,
+      UINT count, ID3D12Fence *const *fences, const UINT64 *values) override {
+    RecordFenceBarrier(false, groups, barriers, count, fences, values);
+  }
+  void STDMETHODCALLTYPE SignalBarrier(UINT groups, const D3D12_BARRIER_GROUP *barriers,
+      ID3D12Fence *fence, UINT64 value) override {
+    RecordFenceBarrier(true, groups, barriers, 1, &fence, &value);
+  }
+  void STDMETHODCALLTYPE SetWorkGraphMaximumGPUInputRecords(UINT records, UINT nodes) override {
+    if (!IsRecording() || RejectInRenderPass() ||
+        (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE)) { RecordError(); return; }
+    work_graph_max_records_ = records; work_graph_max_node_inputs_ = nodes;
+  }
+
 
   void STDMETHODCALLTYPE SetProgram(const D3D12_SET_PROGRAM_DESC *desc) override {
     if (!IsRecording() || !desc || RejectInRenderPass() ||
@@ -8911,6 +9599,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     try {
       auto dispatch = std::make_shared<WorkGraphDispatch>();
       dispatch->object = work_graph_; dispatch->graph = work_graph_index_; dispatch->program = work_graph_program_; dispatch->mode = desc->Mode;
+      dispatch->max_gpu_records = work_graph_max_records_; dispatch->max_gpu_node_inputs = work_graph_max_node_inputs_;
       const auto *graph = work_graph_->GetGraph(work_graph_index_);
       auto copy_input = [&](const D3D12_NODE_CPU_INPUT &input) {
         if (input.EntrypointIndex >= graph->entries.size()) return false;
@@ -8933,7 +9622,13 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
         }
       } else dispatch->gpu_input = desc->Mode == kDispatchModeNodeGPUInput ? desc->NodeGPUInput : desc->MultiNodeGPUInput;
       auto *root = work_graph_->RootSignature(work_graph_index_);
-      const uint64_t bytes = uint64_t(root->UploadQwords) * 8 + uint64_t(root->NumStaticSamplers) * 32 + 128;
+      const bool atomic_phase = std::any_of(graph->nodes.begin(), graph->nodes.end(), [](const auto &node) { return node.atomic64_phase; });
+      if (atomic_phase) {
+        CaptureStandardSwizzleTables(dispatch->atomic64_tables, root, rootarg_compute_staging_, true);
+        CaptureAtomic64Roots(dispatch->atomic64_roots, root, rootarg_compute_staging_);
+        if (descriptor_heaps_[0]) dispatch->atomic64_heap = static_cast<MTLD3D12DescriptorHeap *>(descriptor_heaps_[0]);
+      }
+      const uint64_t bytes = uint64_t(root->UploadQwords) * 8 + uint64_t(root->NumStaticSamplers) * 64 + 128;
       if (!allocator_->ReserveGPUHeap(bytes, 64)) { RecordError(E_OUTOFMEMORY); return; }
       dispatch->roots = EncodeRootArgument(root, rootarg_compute_staging_);
       if (dispatch->roots == UINT64_MAX) return;
@@ -9097,11 +9792,13 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
         return;
       }
     }
-    if (!EncodeRaytracingTraversal(arguments_offset, {desc->Width, desc->Height, desc->Depth}, predicated_grid_offset))
+    auto *traversal =
+        EncodeRaytracingTraversal(arguments_offset, {desc->Width, desc->Height, desc->Depth}, predicated_grid_offset);
+    if (!traversal)
       return;
     owned_graphics::Trace(
         "dispatch_rays", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
-        ",\"encoder\":", allocator_->encoder_current->id, ",\"width\":", desc->Width, ",\"height\":", desc->Height,
+        ",\"encoder\":", traversal->id, ",\"width\":", desc->Width, ",\"height\":", desc->Height,
         ",\"depth\":", desc->Depth, ",\"exports\":", arguments->ExportCount, ",\"miss\":", arguments->MissRecordCount,
         ",\"hitgroup\":", arguments->HitGroupRecordCount, ",\"callable\":", arguments->CallableRecordCount
     );
@@ -9176,18 +9873,23 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     auto &resolve = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
     resolve.type = WMTComputeCommandDispatch;
     resolve.size = {(uint64_t(MaxCommandCount) + 63) / 64, 1, 1};
+    uint64_t encoder_id = allocator_->encoder_current->id;
     allocator_->InvalidateCurrentPass();
 
     const uint64_t roots_stride = dispatch_rootsig ? uint64_t(dispatch_rootsig->UploadQwords) * 8 : 0;
-    for (UINT i = 0; i < MaxCommandCount; ++i)
-      if (!EncodeRaytracingTraversal(blocks_offset + i * kBlockBytes, {}, grids_offset + uint64_t(i) * 16,
-                                     roots_offset == ~0ull ? ~0ull : roots_offset + uint64_t(i) * roots_stride))
+    for (UINT i = 0; i < MaxCommandCount; ++i) {
+      auto *traversal = EncodeRaytracingTraversal(blocks_offset + i * kBlockBytes, {}, grids_offset + uint64_t(i) * 16,
+                                                 roots_offset == ~0ull ? ~0ull : roots_offset + uint64_t(i) * roots_stride);
+      if (!traversal)
         return;
+      // An atomic phase closes the current pass; the recorded traversal ID remains valid.
+      encoder_id = traversal->id;
+    }
     // The updated root parameters are zeroed afterwards, as for the other argument-changing signatures.
     ResetIndirectState(sig, rootsig_compute_.ptr(), rootarg_compute_staging_, true);
     owned_graphics::Trace(
         "dispatch_rays_indirect", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
-        ",\"encoder\":", allocator_->encoder_current->id, ",\"max_commands\":", MaxCommandCount,
+        ",\"encoder\":", encoder_id, ",\"max_commands\":", MaxCommandCount,
         ",\"count_buffer\":", CountBufferAddress ? 1 : 0, ",\"stride\":", sig->ByteStride,
         ",\"exports\":", static_cast<uint32_t>(state_object->GetExports().size())
     );
@@ -9243,7 +9945,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     uint64_t root_bytes = 0;
     if (dispatch_rootsig)
       root_bytes = uint64_t(dispatch_rootsig->UploadQwords) * sizeof(uint64_t) + 64 +
-                   uint64_t(dispatch_rootsig->NumStaticSamplers) * 4 * sizeof(uint64_t) + 64;
+                   uint64_t(dispatch_rootsig->NumStaticSamplers) * 8 * sizeof(uint64_t) + 64;
     const uint64_t per_dispatch = sizeof(SM50_RT_DISPATCH_ARGUMENTS) + 64 + 16;
     const uint64_t maximum = std::min<uint64_t>(SIZE_MAX, device_->GetMTLDevice().maxBufferLength());
     return root_bytes + 64 <= maximum && dispatches <= (maximum - root_bytes - 64) / per_dispatch &&
@@ -9266,6 +9968,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     arguments.RecursionDepth = state_object.GetPipelineConfig().MaxTraceRecursionDepth;
     arguments.PayloadSize = state_object.GetMaxPayloadSize();
     arguments.AttributeSize = state_object.GetMaxAttributeSize();
+    arguments.ImmutableConstants = state_object.immutable_constants.gpu_address;
   }
 
   /*
@@ -9274,8 +9977,8 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
    * so a direct and an indirect dispatch differ only in where the grid comes from: `grid` threads, or
    * (when `indirect_grid_offset` is not ~0) the threadgroup counts written at that heap offset.
    */
-  bool EncodeRaytracingTraversal(uint64_t arguments_offset, WMTSize grid, uint64_t indirect_grid_offset,
-                                 uint64_t root_arguments_offset = ~0ull) {
+  ComputeEncoderData *EncodeRaytracingTraversal(uint64_t arguments_offset, WMTSize grid, uint64_t indirect_grid_offset,
+                                               uint64_t root_arguments_offset = ~0ull) {
     auto *state_object = static_cast<MTLD3D12StateObject *>(rt_state_object_.ptr());
     /*
      * The intersection function table the traversal will select from is built per dispatch, not
@@ -9291,7 +9994,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     );
     if (!dispatch_intersection_table) {
       RecordError(E_FAIL);
-      return false;
+      return nullptr;
     }
 
     allocator_->InvalidateCurrentPass();
@@ -9303,6 +10006,14 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     traversal->rt_pipeline = rt_pipeline_;
     traversal->rt_intersection_function_table = dispatch_intersection_table;
     traversal->rt_visible_function_table = rt_visible_function_table_;
+    traversal->atomic64_phase = state_object->uses_atomic64;
+    if (traversal->atomic64_phase) {
+      auto &use = traversal->atomic64_ray.emplace();
+      use.state_object = rt_state_object_.ptr();
+      use.heap = descriptor_heaps_[0];
+      use.arguments = arguments_binding.buffer;
+      use.arguments_offset = arguments_binding.offset;
+    }
 
     /*
      * The root arguments and static samplers of a raytracing pipeline are bound through the
@@ -9320,16 +10031,21 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
         if (root_arguments_offset == ~0ull)
           root_arguments_offset = EncodeRootArgument(dispatch_rootsig, rootarg_compute_staging_);
         if (root_arguments_offset == UINT64_MAX)
-          return false;
+          return nullptr;
         auto &set_root_arguments = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         set_root_arguments.type = WMTComputeCommandSetBuffer;
         allocator_->BindGPUHeap(set_root_arguments.buffer, set_root_arguments.offset, root_arguments_offset);
         set_root_arguments.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
+        if (traversal->atomic64_ray) {
+          const auto binding = allocator_->ResolveGPUHeap(root_arguments_offset);
+          traversal->atomic64_ray->roots = binding.buffer;
+          traversal->atomic64_ray->roots_offset = binding.offset;
+        }
       }
       if (dispatch_rootsig->NumStaticSamplers) {
         auto static_samplers_offset = EncodeStaticSamplers(dispatch_rootsig);
         if (static_samplers_offset == UINT64_MAX)
-          return false;
+          return nullptr;
         auto &set_static_samplers = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         set_static_samplers.type = WMTComputeCommandSetBuffer;
         allocator_->BindGPUHeap(set_static_samplers.buffer, set_static_samplers.offset, static_samplers_offset);
@@ -9347,6 +10063,15 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     allocator_->BindGPUHeap(set_arguments.buffer, set_arguments.offset, arguments_offset);
     set_arguments.index = SM50_RT_BINDING_INDEX_DISPATCH;
 
+    if (state_object->immutable_constants.buffer) {
+      const auto &constants = state_object->immutable_constants;
+      auto &set_constants = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
+      set_constants.type = WMTComputeCommandSetBuffer;
+      set_constants.buffer = constants.buffer;
+      set_constants.offset = constants.offset;
+      set_constants.index = SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
+      traversal->immutable_constant_buffers.push_back(constants.buffer);
+    }
     /* The ray generation shader receives the per-dispatch table as its argument, so it is the one bound. */
     auto &set_function_table = allocator_->EncodeComputeCommand<wmtcmd_compute_setfunctiontable>();
     set_function_table.type = WMTComputeCommandSetIntersectionFunctionTable;
@@ -9369,7 +10094,9 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       dispatch_rays.type = WMTComputeCommandDispatchIndirect;
       allocator_->BindGPUHeap(dispatch_rays.indirect_args_buffer, dispatch_rays.indirect_args_offset, indirect_grid_offset);
     }
-    return true;
+    if (traversal->atomic64_phase)
+      allocator_->InvalidateCurrentPass();
+    return traversal;
   }
 };
 

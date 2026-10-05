@@ -240,6 +240,8 @@ struct SM50_RT_DISPATCH_ARGUMENTS {
    * whose identifier carries another token names no export of this dispatch.
    */
   uint32_t PipelineToken;
+  /** Immutable constant-pool GPU address, retained by the dispatched pipeline. */
+  uint64_t ImmutableConstants;
 };
 
 /**
@@ -348,11 +350,13 @@ struct SM50_RT_FRAME {
    */
   uint64_t GlobalRootArguments;
   uint64_t StaticSamplers;
+  /** Traced TLAS GPU address; software opacity classification reads its immutable shadow. */
+  uint64_t AccelerationStructureAddress;
 };
 
 #ifdef __cplusplus
 static_assert(
-  sizeof(SM50_RT_FRAME) == 72, "SM50_RT_FRAME layout is part of the shader ABI"
+  sizeof(SM50_RT_FRAME) == 80, "SM50_RT_FRAME layout is part of the shader ABI"
 );
 #endif
 
@@ -425,6 +429,11 @@ enum SM50_RT_FUNCTION_KIND : uint32_t {
   SM50_RT_FUNCTION_DISPATCH = 3,
 };
 
+enum SM50_RT_FUNCTION_FLAG {
+  SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY = 1u,
+  SM50_RT_FUNCTION_FLAG_DEVICE_ATOMIC64_PHASE = 2u,
+};
+
 struct SM50_RT_FUNCTION_INFO {
   /** Metal function name, as stored in the metallib. */
   const char *Name;
@@ -445,8 +454,8 @@ struct SM50_RT_FUNCTION_INFO {
    * Native INTERSECTION bodies remain internal to their hardware dispatcher.
    */
   uint32_t TableIndex;
-  /** Set on the single raygen; the compute function the runtime must select. */
-  uint32_t IsDispatchEntry;
+  /** SM50_RT_FUNCTION_FLAG; atomic phase is identical on every pipeline record. */
+  uint32_t Flags;
 };
 
 /* ------------------------------------------------------------------------- */

@@ -4,6 +4,7 @@
 #include <windows.h>
 #include "dxmt_presenter.hpp"
 #include "Metal.hpp"
+#include "Metal4FX.hpp"
 #include "log/log.hpp"
 #include <algorithm>
 #include <atomic>
@@ -85,7 +86,9 @@ struct Window {
 struct Probe {
   WMT::Reference<WMT::Array<WMT::Device>> devices;
   WMT::Device device;
-  WMT::Reference<WMT::CommandQueue> queue;
+  WMT::Reference<WMT::Error> compiler_error;
+  WMT::Reference<WMT4::Compiler> compiler;
+  WMT::Reference<WMT::MTL4CommandQueue> queue;
   obj_handle_t view = 0;
   WMT::MetalLayer layer;
   dxmt::InternalCommandLibrary library;
@@ -103,8 +106,10 @@ struct Probe {
     return WMT::MetalLayer{layer};
   }
   Probe(HWND hwnd) : devices(WMT::CopyAllDevices()), device(firstDevice(devices)),
-      queue(device.newCommandQueue(8)), layer(makeLayer(hwnd, device, view)),
-      library(device), presenter(device, layer, library, 1.f, 1) {
+      compiler(WMT4::Compiler::Create(device, compiler_error)),
+      queue(device.newMTL4CommandQueue()), layer(makeLayer(hwnd, device, view)),
+      library(device), presenter(device, layer, library, 1.f, 1, compiler) {
+    require(compiler, "Metal4 compiler");
     require(queue, "command queue");
     for (auto color : {WMTColorSpaceSRGB, WMTColorSpaceSRGBLinear, WMTColorSpaceHDR_scRGB,
                        WMTColorSpaceHDR_PQ, WMTColorSpaceBT2020})
@@ -151,9 +156,12 @@ struct Probe {
     readback.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE;
     auto buffer = device.newBuffer(readback);
     require(buffer && readback.memory.get(), "shared readback buffer");
-    auto cmd = queue.commandBuffer();
+    auto allocator = device.newMTL4CommandAllocator();
+    auto cmd = device.newMTL4CommandBuffer();
     require(cmd, "command buffer");
-    auto drawable = presenter.encodeCommands(cmd, input, state.metadata, [](auto) {}, [](auto) {});
+    require(allocator, "Metal4 command allocator");
+    cmd.begin(allocator);
+    auto drawable = presenter.encodeCommandsMetal4(cmd, input, state.metadata, [](auto) {}, [](auto) {});
     require(drawable && drawable.texture() && drawable.texture().width() == size &&
             drawable.texture().height() == size, "drawable dimensions");
     wmtcmd_blit_copy_from_texture_to_buffer copy{};
@@ -164,12 +172,19 @@ struct Probe {
     copy.bytes_per_row = row;
     copy.bytes_per_image = row * size;
     auto blit = cmd.blitCommandEncoder();
+    blit.barrierAfterQueueStages(WMTMetal4StageFragment, WMTMetal4StageBlit, WMTMetal4VisibilityDevice);
     blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
     blit.endEncoding();
-    cmd.presentDrawable(drawable);
-    cmd.commit();
-    cmd.waitUntilCompleted();
-    require(cmd.status() == WMTCommandBufferStatusCompleted, "GPU completed");
+    cmd.end();
+    queue.waitForDrawable(drawable);
+    auto submission = queue.commit(&cmd, 1);
+    require(submission, "Metal4 submission");
+    queue.signalDrawable(drawable);
+    WMT4::PresentMetal4Drawable(drawable, 0, nullptr, 0, false);
+    submission.waitUntilCompleted();
+    WMTMetal4SubmissionInfo completion{};
+    submission.getInfo(completion);
+    require(completion.completed && !completion.error_handle, "GPU completed");
     presenter.notifyPresentCompleted();
     const auto *bytes = static_cast<const unsigned short *>(readback.memory.get());
     auto sample = [&](unsigned x) { return half(bytes[((size / 2) * size + x) * 4]); };
@@ -251,17 +266,24 @@ int main() {
   // CPU encoding finishes while this command is held at a real Metal GPU
   // event. Color-space transition must await GPU retirement, not just encode.
   auto gate = probe.device.newSharedEvent();
-  auto command = probe.queue.commandBuffer();
-  require(gate && command, "GPU retirement gate");
-  command.encodeWaitForEvent(gate, 1);
+  auto allocator = probe.device.newMTL4CommandAllocator();
+  auto command = probe.device.newMTL4CommandBuffer();
+  require(gate && command && allocator, "GPU retirement gate");
+  command.begin(allocator);
+  probe.queue.waitForEvent(gate, 1);
   WMT::MetalDrawable gatedDrawable;
+  WMT::Reference<WMT::MTL4Submission> submission;
   {
     auto accepted = probe.presenter.synchronizeLayerProperties(true);
-    gatedDrawable = probe.presenter.encodeCommands(command, probe.input, accepted.metadata,
+    gatedDrawable = probe.presenter.encodeCommandsMetal4(command, probe.input, accepted.metadata,
                                                    [](auto) {}, [](auto) {});
     require(gatedDrawable && gatedDrawable.texture(), "gated drawable");
-    command.presentDrawable(gatedDrawable);
-    command.commit();
+    command.end();
+    probe.queue.waitForDrawable(gatedDrawable);
+    submission = probe.queue.commit(&command, 1);
+    require(submission, "gated Metal4 submission");
+    probe.queue.signalDrawable(gatedDrawable);
+    WMT4::PresentMetal4Drawable(gatedDrawable, 0, nullptr, 0, false);
   } // CPU-encoded PresentState is released, but its native command remains gated.
   require(probe.presenter.changeLayerColorSpace(WMTColorSpaceHDR_PQ), "gated BT2020 to PQ");
   probe.presenter.changeHDRMetadata(&hdr);
@@ -276,8 +298,10 @@ int main() {
   const bool heldUntilGpuRetires =
       future.wait_for(std::chrono::milliseconds(150)) == std::future_status::timeout;
   gate.signalValue(1);
-  command.waitUntilCompleted();
-  const bool completed = command.status() == WMTCommandBufferStatusCompleted;
+  submission.waitUntilCompleted();
+  WMTMetal4SubmissionInfo completion{};
+  submission.getInfo(completion);
+  const bool completed = completion.completed && !completion.error_handle;
   probe.presenter.notifyPresentCompleted();
   auto afterRetirement = future.get();
   require(completed, "gated GPU command completed");

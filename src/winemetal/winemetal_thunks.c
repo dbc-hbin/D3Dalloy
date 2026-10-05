@@ -19,7 +19,69 @@
   }
 #endif
 
+#if defined(__i386__)
+#define PtrToUInt64(v) ((v) ? WMTGetGuestWindowBase() + (uintptr_t)(v) : 0)
+#else
 #define PtrToUInt64(v) ((uint64_t)(uintptr_t)(v))
+#endif
+
+static uint64_t guest_window_base;
+NTSTATUS WMTInitializeGuestWindow(void) {
+#if defined(__i386__)
+  return WINE_UNIX_CALL(318, &guest_window_base);
+#else
+  return 0;
+#endif
+}
+WINEMETAL_API uint64_t WMTGetGuestWindowBase(void) {
+  return guest_window_base;
+}
+
+WINEMETAL_API obj_handle_t
+WMTCompositionCreateSurface(obj_handle_t device, uint32_t premultiplied, obj_handle_t *borrowedLayer) {
+  struct WMTCompositionCall call = {0};
+  call.object = device;
+  call.count = premultiplied;
+  UNIX_CALL(317, &call);
+  *borrowedLayer = call.argument;
+  return call.result;
+}
+
+WINEMETAL_API obj_handle_t
+WMTCompositionCreateTarget(uint64_t hwnd, uint32_t topmost) {
+  struct WMTCompositionCall call = {0};
+  call.operation = 1; call.object = hwnd; call.count = topmost;
+  UNIX_CALL(317, &call);
+  return call.result;
+}
+
+WINEMETAL_API int32_t
+WMTCompositionCommit(uint32_t target_count, const struct WMTCompositionTargetState *states) {
+  struct WMTCompositionCall call = {0};
+  call.operation = 2; call.count = target_count; call.argument = PtrToUInt64(states);
+  UNIX_CALL(317, &call);
+  return call.status;
+}
+
+WINEMETAL_API void
+WMTCompositionSetObserver(obj_handle_t surface, obj_handle_t observer) {
+  struct WMTCompositionCall call = {0};
+  call.operation = 3; call.object = surface; call.argument = observer;
+  UNIX_CALL(317, &call);
+}
+
+WINEMETAL_API obj_handle_t
+WMTCompositionDrawableResidualTexture(obj_handle_t drawable) {
+  struct WMTCompositionCall call = {0};
+  call.operation = 4; call.object = drawable;
+  UNIX_CALL(317, &call);
+  return call.result;
+}
+
+WINEMETAL_API void
+WMTDeviceCatalog_call(struct WMTDeviceCatalogCall *call) {
+  UNIX_CALL(315, call);
+}
 
 WINEMETAL_API uint64_t
 MTLDevice_maxBufferLength(obj_handle_t device) {
@@ -961,7 +1023,7 @@ MTLSharedEvent_setWin32EventOnValues(
 ) {
   struct unixcall_mtlsharedevent_setevent params = {0};
   params.shared_event_listener = shared_event_listener;
-  params.event_handle = (obj_handle_t)PtrToUInt64(nt_event_handle);
+  params.event_handle = (obj_handle_t)(uintptr_t)nt_event_handle;
   params.values = values;
   params.count = count;
   params.wait_all = wait_all;
@@ -1834,6 +1896,11 @@ WMTPresentationObserver_getRefreshSample(obj_handle_t observer, struct WMTDispla
   if (params.ret)
     *sample = params.sample;
   return params.ret != 0;
+}
+
+WINEMETAL_API void
+WMTMonitorTiming_call(struct WMTMonitorTimingCall *params) {
+  UNIX_CALL(316, params);
 }
 
 WINEMETAL_API void

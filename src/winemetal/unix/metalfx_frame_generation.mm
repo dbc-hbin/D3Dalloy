@@ -423,7 +423,7 @@ bool normalizeCameraPlanes(const WMTFGprepare_packet& p,
 
 bool validParameters(const WMTFGprepare_packet& p, std::uint32_t createFlags) {
     CameraPlanes planes{};
-    if (!p.render_width || !p.render_height ||
+    if ((p.flags & ~31u) || !p.render_width || !p.render_height ||
         !std::isfinite(p.jitter_x) || !std::isfinite(p.jitter_y) ||
         !std::isfinite(p.motion_scale_x) || !std::isfinite(p.motion_scale_y) ||
         !std::isfinite(p.frame_time_delta_ms) || p.frame_time_delta_ms <= 0 ||
@@ -536,6 +536,8 @@ struct alignas(16) FgParams {
     float minLuminance;
     float maxLuminance;
     std::uint32_t transfer;
+    std::uint32_t debugFlags;
+    std::uint32_t reset;
 };
 
 Object makeParameterBuffer(id<MTLDevice> device, const FgParams& params) {
@@ -550,13 +552,14 @@ Object makeParameterBuffer(id<MTLDevice> device, const FgParams& params) {
 bool computePass(id buffer, id fence, Mode mode, id<MTLDevice> device,
                  id<MTLComputePipelineState> pipeline, id<MTLTexture> source,
                  id<MTLTexture> destination, id<MTLBuffer> parameterBuffer,
-                 const FgParams& params, std::vector<Object>& retained) {
+                 const FgParams& params, std::vector<Object>& retained,
+                 id<MTLTexture> depth = nil, id<MTLTexture> motion = nil) {
     if (!pipeline || !source || !destination || !parameterBuffer) return false;
     if (@available(macOS 26.0, *)) {
         {
             MTL4ArgumentTableDescriptor* descriptor = [MTL4ArgumentTableDescriptor new];
             descriptor.maxBufferBindCount = 1;
-            descriptor.maxTextureBindCount = 2;
+            descriptor.maxTextureBindCount = depth ? 4 : 2;
             descriptor.initializeBindings = YES;
             NSError* error = nil;
             id<MTL4ArgumentTable> table =
@@ -568,6 +571,8 @@ bool computePass(id buffer, id fence, Mode mode, id<MTLDevice> device,
             [table setAddress:parameterBuffer.gpuAddress atIndex:0];
             [table setTexture:source.gpuResourceID atIndex:0];
             [table setTexture:destination.gpuResourceID atIndex:1];
+            if (depth) [table setTexture:depth.gpuResourceID atIndex:2];
+            if (motion) [table setTexture:motion.gpuResourceID atIndex:3];
             id<MTL4ComputeCommandEncoder> encoder =
                 [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
             if (!encoder) return false;
@@ -804,6 +809,8 @@ bool PreparedFrame::encode(
                 colorParams.minLuminance = d.min_luminance;
                 colorParams.maxLuminance = d.max_luminance;
                 colorParams.transfer = d.backbuffer_transfer_function;
+                colorParams.debugFlags = d.flags | (p.flags & 7u);
+                colorParams.reset = reset;
 
                 FgParams depthParams{};
                 depthParams.extent[0] = configuration.width;
@@ -979,7 +986,8 @@ bool PreparedFrame::encode(
                                  (id<MTLTexture>)output.get(),
                                  (id<MTLTexture>)outputView.get(),
                                  (id<MTLBuffer>)colorParameters.get(), colorParams,
-                                 execution->objects))
+                                 execution->objects, (id<MTLTexture>)normalizedDepth.get(),
+                                 (id<MTLTexture>)normalizedMotion.get()))
                     return fail("encode_output_scatter");
                 // A queued command may encode after OFF (or after a subsequent ON).
                 // Its output remains owned by the command, but must not seed new history.
@@ -1223,6 +1231,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 state->preparedJitterY = p->jitter_y;
                 implementation->snapshot = std::move(snapshot);
             } else {
+                if (d->flags & ~7u) return finish(Parameter);
                 if (d->num_generated_frames != 1) return finish(Unsupported);
                 std::int32_t rectLeft = 0, rectTop = 0;
                 NSUInteger rectWidth = 0, rectHeight = 0;

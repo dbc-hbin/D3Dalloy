@@ -14,4 +14,11 @@ for entry in vs_main ps_uint ps_unorm gs_view vs_tess hs_view ds_view; do
     status=1
   fi
 done
+# DXC's include handler requires a DOS path, unlike its main source argument.
+include_dir="Z:$(printf '%s' "$here" | tr / '\\')"
+if ! WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T vs_6_1 -E vs_indices -I "$include_dir" \
+    "$here/view-instancing-indices.hlsl" -Fo "$out/view-instancing-vs_indices.dxil" >/dev/null; then
+  echo "failed: vs_indices" >&2
+  status=1
+fi
 exit $status

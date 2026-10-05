@@ -2,6 +2,7 @@
 #include "wineunixlib.h"
 #include "airconv_thunks.h"
 #include "dxil_raytracing.h"
+#include "winemetal.h"
 
 AIRCONV_API int
 SM50Initialize(
@@ -73,7 +74,7 @@ SM50CopyCompiledBitcode(
   struct sm50_copy_compiled_bitcode_params params;
   params.bitcode = pBitcode;
   params.part = Part;
-  params.destination = (uint64_t)(uintptr_t)pDestination;
+  params.destination = pDestination ? WMTGetGuestWindowBase() + (uint64_t)(uintptr_t)pDestination : 0;
   params.size = Size;
   params.ret = 1;
   if (UNIX_CALL(sm50_copy_compiled_bitcode, &params))

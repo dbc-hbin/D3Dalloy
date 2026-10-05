@@ -60,6 +60,24 @@ airconv_dep_darwin = declare_dependency(
   link_args           : [ llvm_ld_flags_darwin, llvm_native_deps ]
 )
 
+fp64_lowering_test = executable('fp64-lowering-test',
+  files('../../../graphics-translator/tests/fp64-lowering.test.cpp'),
+  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  cpp_args: [airconv_args],
+  dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
+  native: dxmt_crossbuild,
+)
+test('fp64-lowering', fp64_lowering_test)
+
+atomic64_phase_test = executable('atomic64-phase-test',
+  files('../../../graphics-translator/tests/atomic64-phase.test.cpp'),
+  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  cpp_args: [airconv_args],
+  dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
+  native: dxmt_crossbuild,
+)
+test('atomic64-phase', atomic64_phase_test)
+
 executable('airconv', airconv_src + airconv_cli_src,
   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],

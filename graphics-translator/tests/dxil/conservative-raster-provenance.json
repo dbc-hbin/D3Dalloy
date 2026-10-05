@@ -1,0 +1,94 @@
+{
+  "schema": 1,
+  "suite": "conservative-raster",
+  "spec": "https://learn.microsoft.com/en-us/windows/win32/direct3d12/conservative-rasterization",
+  "producer": {
+    "dxil": {
+      "version": "DXC 1.9.2609.5",
+      "profiles": "6_0; MS/AS 6_5",
+      "flags": [
+        "-nologo",
+        "-HV",
+        "2021"
+      ],
+      "files": {
+        "toolchains/dxc-1.9.2609.5/package/build/native/bin/x64/dxc.exe": "aa7965b3763d9c710baaa5a28cedcc633449962a75d1391d161a85304a41b3e2",
+        "toolchains/dxc-1.9.2609.5/package/build/native/bin/x64/dxcompiler.dll": "0689e2fee0a1c9df8662a59680469f24e2a3ad7ce6bbbcc9284f7a83172bfc59",
+        "toolchains/dxc-1.9.2609.5/package/build/native/bin/x64/dxil.dll": "64be2368211d257a038a7d4ea6bb3e24c878eb8d588c7b8414fccf759b69c2ac"
+      }
+    },
+    "dxbc": {
+      "version": "Microsoft HLSL Shader Compiler 10.1",
+      "profile": "ps_5_1",
+      "native_override": "d3dcompiler_47=n",
+      "files": {
+        "build/local/p3-20261003/fp64-reference/fxc-native/fxc.exe": "7920b6459ac0800c71bbb9815fa33b1e2a7932f86f5a8f17cff267dc6e8ef7f5",
+        "build/local/p3-20261003/fp64-reference/fxc-native/d3dcompiler_47.dll": "c1de76af7f724c671cb393889a899268e17fd76d0d50a1244678af57567255a1"
+      }
+    }
+  },
+  "commands": [
+    "mkdir -p \"/Users/hanbinnoh/Documents/dxmt-dx12/build/local/conservative-tier3-20261004.uFBr69/producer-prefix\"",
+    "DYLD_FALLBACK_LIBRARY_PATH=\"/Users/hanbinnoh/Documents/dxmt-dx12/build/local/p2-depth-bounds-20261004.S3Pmiu/runtime-02/lib\" sh graphics-translator/tests/dxil/build-conservative-raster.sh \"/Users/hanbinnoh/Documents/dxmt-dx12/build/local/p2-depth-bounds-20261004.S3Pmiu/runtime-02/bin/wine.real\" \"/Users/hanbinnoh/Documents/dxmt-dx12/toolchains/dxc-1.9.2609.5/package/build/native/bin/x64/dxc.exe\" \"/Users/hanbinnoh/Documents/dxmt-dx12/build/local/conservative-tier3-20261004.uFBr69/producer-prefix\" \"/Users/hanbinnoh/Documents/dxmt-dx12/graphics-translator/tests/dxil\" conservative-raster \"/Users/hanbinnoh/Documents/dxmt-dx12/build/local/p3-20261003/fp64-reference/fxc-native/fxc.exe\"",
+    "for arch in x86_64 i686; do /opt/llvm-mingw-20260616-ucrt-macos-universal/bin/$arch-w64-mingw32-g++ -std=c++20 -O2 -static graphics-translator/tests/owned-d3d12-conservative-raster.cpp -o build/local/conservative-tier3-20261004.uFBr69/conservative-tier3-$arch.exe -ld3d12 -ldxgi -ld3dcompiler -ldxguid -lole32 -luuid || exit; done"
+  ],
+  "sources": {
+    "graphics-translator/tests/dxil/conservative-raster.hlsl": "f43e111ac5e40d96c4297562796a036c9361740b884053e2803c17996a47062e",
+    "graphics-translator/tests/dxil/build-conservative-raster.sh": "10ca0789b3f7be4d4cbe2d256ee7bd2896699ca2b8ee34e1a101e460005aa9ef",
+    "graphics-translator/tests/owned-d3d12-conservative-raster.cpp": "6cf4d275e3816a258f6f97023cd3366d85086f7cf999133aacd49a6184d00c85"
+  },
+  "regenerated_frozen_outputs": {
+    "graphics-translator/tests/dxil/conservative-raster-vs_main.dxil": "e8163c268f9f4bb05afed614bd9717a00f58d89a4fe0eea921c96966ce5e927b",
+    "graphics-translator/tests/dxil/conservative-raster-ps_main.dxil": "67e470922ce371dd3f93ab13f4dabeb7878b1d2d55e9785f9988d26b80a61f00",
+    "graphics-translator/tests/dxil/conservative-raster-gs_main.dxil": "f375f5216e5556ee016c69380b3919d04681fa3fbb0459ce7a3288adb7475ecd",
+    "graphics-translator/tests/dxil/conservative-raster-hs_main.dxil": "5e53d099fa1a15c59dc7b86adbb0299481b49f267ae72772390c82c9a005b722",
+    "graphics-translator/tests/dxil/conservative-raster-ds_main.dxil": "c74d142a28e5325fc220d35bc250255d6dfbc6f15f0454d563c553e9847d1800",
+    "graphics-translator/tests/dxil/conservative-raster-ms_main.dxil": "3e8f2d5530b81a16e13071bd3da3bca38f1e4ef3019e9214a29485fe8875c946",
+    "graphics-translator/tests/dxil/conservative-raster-ms_as.dxil": "e0aafba9a4060f2a5324076221b7e7198f4047fa15ad75a5973f2b33739d5cb3",
+    "graphics-translator/tests/dxil/conservative-raster-as_main.dxil": "cefd989075b4c6ace86fb79def28c0ec65677a25a4f1aebc54524cb14de27deb",
+    "graphics-translator/tests/dxil/conservative-raster-ps_inner.dxil": "fa5158a80f15080f6f53d7800300073fc69b8bdae86a6c411772a6f2d9e650a3",
+    "graphics-translator/tests/dxil/conservative-raster-ps_inner_early.dxil": "313ab20276688160768dd30834f4bd66c8d83164c9944371f3f06ca4248a13e4",
+    "graphics-translator/tests/dxil/conservative-raster-ps_inner_late.dxil": "0d0abda4766e066b646914b29a41a0288d193b6958cd066d49a80b46bcdd5220",
+    "graphics-translator/tests/dxil/conservative-raster-ps_helper.dxil": "8f0c9778c1aff866b83ebf571b9d9343e60403128a43425ef95cf7e94e344f7c",
+    "graphics-translator/tests/dxil/conservative-raster-cs_stencil.dxil": "a0553dda21e5aac43ec06d5f8f307887c377a3708ccd02baf397b350c1714c7d",
+    "graphics-translator/tests/dxil/conservative-raster-ps_main.dxbc": "905e9fd20f8337254d9614c66aa08cf1689fdc7975709604678b2f6357067b4b",
+    "graphics-translator/tests/dxil/conservative-raster-ps_inner.dxbc": "92f99a1255e85577db7608897ed59a44402cfc7eacc3fc6145330bf4b5a3f363",
+    "graphics-translator/tests/dxil/conservative-raster-ps_inner_early.dxbc": "c237dffe8e2048258a56f07bed653e3ef15b1fa877bb90a115f35810caa4c5e1",
+    "graphics-translator/tests/dxil/conservative-raster-ps_inner_late.dxbc": "c0ecdacea9ea4f0e84af3ec8c47b70d22368455c5d56eade1ff5f70f9d91af82",
+    "graphics-translator/tests/dxil/conservative-raster-ps_helper.dxbc": "c4a56a04080b26e66c078fad6779c5f0a38cd56336eab7b62091fce908c0605b"
+  },
+  "retained_frozen_inputs": {
+    "note": "Existing conservative-distance HLSL/DXIL unchanged and not regenerated in this slice.",
+    "files": {
+      "graphics-translator/tests/dxil/conservative-distance-vs_main.dxil": "990298bf5cdf73c89f07c9c534f031a8c379f90d57fa0c744f85e179000494da",
+      "graphics-translator/tests/dxil/conservative-distance-ps_main.dxil": "5add7c11e669bee91c2c6ddea63993dfa81b0d51cbe3e719f3e288a730bdf4f8",
+      "graphics-translator/tests/dxil/conservative-distance-gs_main.dxil": "733b8a55d3ea2f98e454848549909bd01030250e615a901b5d7fb58937d1efca",
+      "graphics-translator/tests/dxil/conservative-distance-hs_main.dxil": "7c48a8dd22290ed0948d6f04cb817da0483078dde699a2eaaa7bde96a2feef34",
+      "graphics-translator/tests/dxil/conservative-distance-ds_main.dxil": "918dac114ff848dcc568f47eee03a4bb73beb4da5aef2f6761615e316eb5a8d5",
+      "graphics-translator/tests/dxil/conservative-distance-ms_main.dxil": "82ff9cd9a42f2c835d7d428ff0bf61e620053e9994d2be6b1ea64ddd95005575",
+      "graphics-translator/tests/dxil/conservative-distance-ms_as.dxil": "a90f26adc2e34bfa750db819f8127848ff3baec27bbcdfe4d49231228bc65d3c",
+      "graphics-translator/tests/dxil/conservative-distance-as_main.dxil": "3f3af0ab5f4cd622933fa75d17a2e1f6e14411b5b437b5187831ba98a1a0d3da",
+      "graphics-translator/tests/dxil/conservative-distance.hlsl": "9d6fe213b7050641f785940f67cb4c762fa985ace4b800011ffb663883585679"
+    }
+  },
+  "paired_executables": {
+    "build/local/conservative-tier3-20261004.uFBr69/conservative-tier3-x86_64.exe": "ca747e0b1bb9b4f7aa06f9a1aa8beb8c82a3c317f38399c48fa0ec2d9278ab4c",
+    "build/local/conservative-tier3-20261004.uFBr69/conservative-tier3-i686.exe": "9d747234bcb5147ee48a8c23cbcc81598490220c45fa42910b91c39409340779"
+  },
+  "observed_producer_semantics": {
+    "dxil": "call i32 @dx.op.innerCoverage.i32(i32 92)",
+    "dxbc": "dcl_input vInnerCoverage; SFI: PS Inner Coverage",
+    "invalid_inputs": "Both real producers rejected mutually exclusive inputs during CPU-only generation. Raw logs retained only in build/local/conservative-tier3-20261004.uFBr69, not read by the GPU fixture or runner."
+  },
+  "oracle": {
+    "unit": "1/4096 pixel exact signed integer coordinates and rational segment/box clipping",
+    "outer": "minimum 1/512 and maximum 1/256 around snapped vertices; original nondegenerate intersection mandatory",
+    "inner": "mandatory expanded-pixel 1/256 strict containment; possible only 1/512 containment plus original full pixel containment",
+    "degenerate_boundary": "No pre-snap zero-area cases; interior snapped crossings mandatory, boundary corner any 1..4 legal neighbors.",
+    "off": "InnerCoverage undefined: ordinary center coverage tested, no assertion on OFF inner value.",
+    "mesh_cull": "AS+MS also sweeps FrontCounterClockwise and front/back culling on the nonzero pre-snap-area line triangle, checking original Vertex0 attributes.",
+    "depth_clip": "Near/far clipping leaves a strip with endpoint shift9/8193<1/512 that snaps into a diagonal line. ON captured PS ClipDistance/depth use original Vertex0; OFF exact Vertex1-center probe is within depth range and uses Vertex1. Finite clamped 4x depth samples checked; no exterior undefined attribute assertion."
+  },
+  "producer_prefix": "Dedicated CPU-only prefix stopped with wineserver -k, waited with -w, then deleted.",
+  "gpu_exercised": false
+}

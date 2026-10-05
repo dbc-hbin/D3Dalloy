@@ -4,18 +4,22 @@
 #include "Metal4Pipeline.hpp"
 #include "dxmt_command.hpp"
 #include "rc/util_rc.hpp"
+#include "rc/util_rc_ptr.hpp"
 #include "util_cpu_fence.hpp"
 #include "winemetal.h"
 #include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <mutex>
+#include <map>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
 namespace dxmt {
+
+enum class DXMTPresentAlpha : uint32_t { Opaque = 0, Premultiplied = 1, Straight = 2 };
 
 struct DXMTPresentGeometry {
   float source_width = 0, source_height = 0;
@@ -33,8 +37,9 @@ struct DXMTPresentMetadata {
   float max_content_luminance;
   float max_display_luminance;
   DXMTPresentGeometry geometry;
+  DXMTPresentAlpha alpha;
 };
-static_assert(sizeof(DXMTPresentMetadata) == 76);
+static_assert(sizeof(DXMTPresentMetadata) == 80);
 
 constexpr uint32_t DXMT_GAMMA_CP_COUNT = 1024;
 
@@ -49,11 +54,12 @@ class Presenter : public RcObject {
 public:
   Presenter(
       WMT::Device device, WMT::MetalLayer layer, InternalCommandLibrary &lib, float scale_factor, uint8_t sample_count,
-      WMT4::Compiler compiler = {}
+      WMT4::Compiler compiler = {}, bool composition = false
   );
 
   bool changeLayerProperties(
-      WMTPixelFormat format, WMTColorSpace colorspace, double width, double height, uint8_t sample_count
+      WMTPixelFormat format, WMTColorSpace colorspace, double width, double height, uint8_t sample_count,
+      DXMTPresentAlpha alpha = DXMTPresentAlpha::Opaque
   );
 
   bool changeLayerColorSpace(WMTColorSpace colorspace);
@@ -122,9 +128,35 @@ public:
     frame_completed_.signal(frames_completed_.fetch_add(1, std::memory_order_acq_rel) + 1);
   }
 
+  // Completion callbacks can arrive out of GPU order on different queues.
+  // Never block a callback executor waiting for an earlier callback.
+  // Callers must acquire/submit drawables in frame-ID order before reporting
+  // ready: filling the native pool must not prevent a missing predecessor
+  // from obtaining its drawable. D3D12 waits its predecessor GPU event first.
+  template<typename Retirement>
+  void retireNativePresent(uint64_t frame_id, Retirement &&retirement) {
+    Rc<Presenter> keep_alive(this);
+    {
+      std::lock_guard lock(native_retire_mutex_);
+      if (!native_retirement_aborted_) {
+        assert(frame_id >= next_native_retirement_);
+        if (native_retirement_draining_ || frame_id != next_native_retirement_) {
+          const bool inserted = native_retirements_.emplace(
+              frame_id, std::forward<Retirement>(retirement)).second;
+          assert(inserted);
+          return;
+        }
+        native_retirement_draining_ = true;
+      }
+    }
+    std::forward<Retirement>(retirement)();
+    drainNativeRetirements();
+  }
+  void abortNativeRetirements();
+
   // GPU timeline ordering presents in request order when they are encoded on
   // different queues: frame N waits for N-1 and signals N.
-  WMT::Event presentOrderEvent() {
+  WMT::SharedEvent presentOrderEvent() {
     return present_order_event_;
   }
 
@@ -214,16 +246,20 @@ public:
   );
 
 private:
+  void drainNativeRetirements();
   std::optional<PresentState> synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_not_wait);
-  void buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable);
+  void buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable,
+                                bool composition_residual, bool linear_composition_transport);
 
   WMT::Device device_;
+  bool composition_ = false;
   WMT::Reference<WMT4::Compiler> compiler_;
   WMT::MetalLayer layer_;
-  InternalCommandLibrary &lib_;
+  WMT::Reference<WMT::Library> lib_;
   WMTLayerProps layer_props_;
   uint32_t sample_count_;
   WMTColorSpace colorspace_ = WMTColorSpaceSRGB;
+  DXMTPresentAlpha alpha_ = DXMTPresentAlpha::Opaque;
   WMTHDRMetadata hdr_metadata_;
   bool has_hdr_metadata_ = false;
   WMTPixelFormat source_format_ = WMTPixelFormatInvalid;
@@ -243,6 +279,11 @@ private:
   std::atomic<uint64_t> frames_completed_ = 0;
   CpuFence frame_completed_ = 0;
   WMT::Reference<WMT::SharedEvent> present_order_event_;
+  std::mutex native_retire_mutex_;
+  uint64_t next_native_retirement_ = 1;
+  bool native_retirement_draining_ = false;
+  bool native_retirement_aborted_ = false;
+  std::map<uint64_t, std::function<void()>> native_retirements_;
   mutable std::mutex restart_mutex_;
   uint64_t restart_epoch_ = 0;
   WMT::Reference<WMT::SharedEvent> restart_token_;

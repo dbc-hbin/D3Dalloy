@@ -32,13 +32,15 @@ constant uchar sample_pos_8[] = {
 float2 sample_pos(uint sample_count, uint index) asm("dxmt.sample_pos.i32");
 
 float2 sample_pos(uint sample_count, uint index) {
+    if (index >= sample_count)
+        return float2(0);
     char pos_packed = 0;
     if (sample_count == 2)
-        pos_packed = sample_pos_2[index & 0b1];
+        pos_packed = sample_pos_2[index];
     else if (sample_count == 4)
-        pos_packed = sample_pos_4[index & 0b11]; 
+        pos_packed = sample_pos_4[index];
     else if (sample_count == 8)
-        pos_packed = sample_pos_8[index & 0b111];
+        pos_packed = sample_pos_8[index];
 
     int x = (char)((char)(pos_packed & 0xf) << 4 ) >> 4;
     int y = ((char)(pos_packed & 0xf0)) >> 4;

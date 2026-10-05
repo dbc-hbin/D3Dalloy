@@ -1,4 +1,6 @@
 #include "d3d12_work_graph.hpp"
+#include "d3d12_pipeline_cache.hpp"
+#include "d3d12_resource_contract.hpp"
 #include "Metal4Pipeline.hpp"
 #include "d3d12_dxil_subobjects.hpp"
 #include "../airconv/dxbc_root_signature.hpp"
@@ -18,6 +20,10 @@
 #include <unordered_set>
 
 namespace dxmt {
+WorkGraphDispatch::~WorkGraphDispatch() {
+  if (atomic64_tables)
+    for (const auto &table : *atomic64_tables) { table.rootsig->ReleasePrivate(); table.heap->ReleasePrivate(); }
+}
 namespace {
 std::mutex registry_mutex;
 std::unordered_map<uint64_t, MTLD3D12WorkGraph *> registry;
@@ -645,7 +651,10 @@ HRESULT MTLD3D12WorkGraph::BuildGraph(const D3D12_WORK_GRAPH_DESC &desc, Graph &
         if (input.RecordSize != output.info.RecordSize) return Reject("output and input record sizes differ");
         if (budget > 0x10000000u || graph.queue_capacity[target] > 0x10000000u - budget) return Reject("output budget exceeds node limits");
         graph.queue_capacity[target] += budget;
-        graph.queue_stride[target] = std::max(graph.queue_stride[target], uint32_t((input.RecordSize + 15) & ~15u));
+        uint64_t stride = 0;
+        if (!resource_contract::CheckedAlign(input.RecordSize, 16, stride) || stride > UINT32_MAX)
+          return Reject("record stride exceeds node limits");
+        graph.queue_stride[target] = std::max(graph.queue_stride[target], uint32_t(stride));
       }
     }
     if (std::find(node.targets.begin(), node.targets.end(), i) == node.targets.end()) node.info.MaxRecursionDepth = 0;
@@ -730,12 +739,30 @@ HRESULT MTLD3D12WorkGraph::BuildGraph(const D3D12_WORK_GRAPH_DESC &desc, Graph &
   if (parent) for (uint32_t i = 0; i < parent->nodes.size(); ++i)
     if (graph.node_depth[i] > parent->node_depth[i]) return Reject("addition increases an existing node depth");
   graph.queue_offset.resize(n);
+  uint64_t level_alignment = 8;
   for (uint32_t i = 0; i < n; ++i) {
     graph.queue_capacity[i] = std::bit_ceil(graph.queue_capacity[i]);
+    const uint32_t record_alignment = graph.nodes[i].info.Input.RecordAlignment;
+    const uint64_t alignment = std::max(record_alignment, 8u);
+    uint64_t stride = 0, queue_bytes = 0;
+    // A small unused queue must not misalign the next queue or recursion level.
+    // Device i64 atomics require their payload to fit one aligned canonical cell.
+    if ((record_alignment && !std::has_single_bit(record_alignment)) ||
+        !resource_contract::CheckedAlign(graph.queue_stride[i], alignment, stride) || stride > UINT32_MAX ||
+        !resource_contract::CheckedAlign(graph.level_bytes, alignment, graph.level_bytes) ||
+        !resource_contract::CheckedMul(graph.queue_capacity[i], stride, queue_bytes))
+      return Reject("invalid record queue layout");
+    graph.queue_stride[i] = uint32_t(stride);
     graph.queue_offset[i] = graph.level_bytes;
-    graph.level_bytes += uint64_t(graph.queue_capacity[i]) * graph.queue_stride[i];
+    if (!resource_contract::CheckedAdd(graph.level_bytes, queue_bytes, graph.level_bytes))
+      return Reject("record queue size overflow");
+    level_alignment = std::max(level_alignment, alignment);
   }
-  graph.memory = {graph.level_bytes * graph.depth, graph.level_bytes * graph.depth, 8};
+  uint64_t backing_bytes = 0;
+  if (!resource_contract::CheckedAlign(graph.level_bytes, level_alignment, graph.level_bytes) ||
+      !resource_contract::CheckedMul(graph.level_bytes, graph.depth, backing_bytes))
+    return Reject("record backing memory size overflow");
+  graph.memory = {backing_bytes, backing_bytes, 8};
   for (auto &node : graph.nodes) { HRESULT hr = Compile(node, graph.dispatch_root.ptr()); if (FAILED(hr)) return hr; }
   return S_OK;
 }
@@ -760,7 +787,7 @@ HRESULT MTLD3D12WorkGraph::Compile(Node &node, MTLD3D12RootSignature *root, bool
   desc.EntryPoint = node.entry.c_str(); desc.FunctionName = "dxmt_work_graph_node";
   desc.GlobalRootSignatureSize = root->GetBlob(&desc.GlobalRootSignature);
   if (node.local_root) desc.LocalRootSignatureSize = node.local_root->GetBlob(&desc.LocalRootSignature);
-  desc.MetalVersion = SM50_SHADER_METAL_310; desc.Launch = node.info.Launch;
+  desc.MetalVersion = kD3D12ShaderMetalVersion; desc.Launch = node.info.Launch;
   desc.OutputCount = node.outputs.size(); desc.OutputElementBase = node.element_base.data(); desc.OutputElementCount = node.element_count.data();
   std::vector<SM50_WG_LIBRARY> libraries; libraries.reserve(libraries_.size());
   for (const auto &bytes : libraries_) libraries.push_back({bytes.data(), bytes.size()});
@@ -802,6 +829,7 @@ HRESULT MTLD3D12WorkGraph::Compile(Node &node, MTLD3D12RootSignature *root, bool
     ERR("Work graph pipeline: ", metal_error ? metal_error.description().getUTF8String() : "no Metal error"); return E_FAIL;
   }
   node.threads = {info.ThreadgroupSize[0], info.ThreadgroupSize[1], info.ThreadgroupSize[2]};
+  node.atomic64_phase = info.HasAtomic64 != 0;
   return S_OK;
 }
 
@@ -866,12 +894,21 @@ struct GraphExecution {
   WMT::MTL4CommandQueue queue;
   const WorkGraphDispatch &dispatch;
   const MTLD3D12WorkGraph::Graph &graph;
+  const WorkGraphTexturePublisher &textures;
   WMT::Reference<WMT::Buffer> control, readback, seed_resource;
+  uint64_t seed_address = 0;
   WMT::Reference<WMT::MTL4CommandAllocator> allocator;
   WMTBufferInfo control_info{}, readback_info{};
   uint64_t control_stride = 0, context_offset = 0, batch_offset = 0, sharing_offset = 0;
+  GPUExecutionGate::Ticket execution_ticket;
+  std::optional<GPUExecutionGate::EncodingAdmission> encoding_admission;
+  WMT::Reference<WMT::Fence> atomic_fence;
+  std::shared_ptr<Atomic64Phase> atomic_phase;
 
-  WMT::Reference<WMT::MTL4CommandBuffer> Begin() {
+  WMT::Reference<WMT::MTL4CommandBuffer> Begin(bool exclusive = false) {
+    execution_ticket = exclusive ? device->gpu_execution_gate.AcquireExclusive() : device->gpu_execution_gate.AcquireShared();
+    if (!execution_ticket) return {};
+    encoding_admission.emplace(device->gpu_execution_gate);
     auto buffer = device->GetMTLDevice().newMTL4CommandBuffer();
     if (buffer) {
       buffer.begin(allocator);
@@ -881,11 +918,14 @@ struct GraphExecution {
   }
   bool Complete(WMT::MTL4CommandBuffer buffer) {
     buffer.end();
-    auto submission = queue.commit(&buffer, 1);
-    if (!submission) return false;
+    auto submission = device->CommitMetal4CommandBuffers(queue, &buffer, 1);
+    if (!submission) { encoding_admission.reset(); execution_ticket.Reset(); return false; }
     submission.waitUntilCompleted();
     const bool success = !submission.error();
     allocator.reset();
+    atomic_phase.reset();
+    encoding_admission.reset();
+    execution_ticket.Reset();
     return success;
   }
   HRESULT Read(uint64_t address, void *destination, uint64_t size) {
@@ -955,9 +995,65 @@ struct GraphExecution {
           uint64_t(node.info.LocalRootArgumentsTableIndex) * dispatch.program.NodeLocalRootArgumentsTable.StrideInBytes;
       for (uint32_t o = 0; o < node.targets.size(); ++o) context->Outputs[o] =
           node.targets[o] == index && !remaining ? SM50_WG_NONE : node.targets[o];
-      auto buffer = Begin();
+      std::vector<Atomic64RootBinding> local_roots;
+      std::vector<StandardSwizzleTableUse> local_tables;
+      if ((node.atomic64_phase || dispatch.atomic64_tables) && context->LocalRootArguments) {
+        std::vector<uint64_t> local_arguments(node.local_root->ParameterQwords);
+        HRESULT hr = Read(context->LocalRootArguments, local_arguments.data(), local_arguments.size() * sizeof(uint64_t));
+        if (FAILED(hr)) return hr;
+        for (uint32_t parameter = 0; parameter < node.local_root->ParameterSlots; ++parameter) {
+          const auto type = node.local_root->ParameterTypes[parameter];
+          const auto address = local_arguments[node.local_root->SlotQwordOffsets[parameter]];
+          if (!address) continue;
+          if (type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && dispatch.atomic64_heap)
+            local_tables.push_back({node.local_root.ptr(), dispatch.atomic64_heap.ptr(), address, parameter});
+          else if (type == D3D12_ROOT_PARAMETER_TYPE_CBV || type == D3D12_ROOT_PARAMETER_TYPE_SRV || type == D3D12_ROOT_PARAMETER_TYPE_UAV)
+            local_roots.push_back({address, UINT64_MAX, type == D3D12_ROOT_PARAMETER_TYPE_UAV});
+        }
+      }
+      auto buffer = Begin(node.atomic64_phase);
       if (!buffer) return E_OUTOFMEMORY;
+      const auto global_tables = dispatch.atomic64_tables
+          ? std::span<const StandardSwizzleTableUse>(*dispatch.atomic64_tables)
+          : std::span<const StandardSwizzleTableUse>{};
+      HRESULT texture_result = textures.begin(buffer, atomic_fence, global_tables, local_tables);
+      if (FAILED(texture_result)) return texture_result;
+      const bool texture_phase = texture_result == S_OK;
+      if (node.atomic64_phase) {
+        Atomic64PhaseBindings bindings;
+        HRESULT hr = CollectAtomic64PhaseBindings(device, dispatch.atomic64_tables
+            ? std::span<const StandardSwizzleTableUse>(*dispatch.atomic64_tables) : std::span<const StandardSwizzleTableUse>{},
+            dispatch.atomic64_roots, bindings);
+        if (SUCCEEDED(hr)) hr = CollectAtomic64PhaseBindings(device, local_tables, local_roots, bindings);
+        if (SUCCEEDED(hr)) {
+          // Record data alone participates in the immutable phase. Queue tails,
+          // batch headers and the shared-input counter remain native 32-bit state.
+          std::vector<Atomic64RootBinding> payloads;
+          if (node.info.Input.RecordSize) {
+            if (input_address == seed_address) {
+              Atomic64BufferBinding seed{};
+              seed.nativeBuffer = seed_resource;
+              seed.nativeAddress = seed_address;
+              seed.nativeLength = seed.byteLength = node.info.Input.RecordSize;
+              seed.writable = true;
+              bindings.buffers.push_back(std::move(seed));
+            } else payloads.push_back({input_address, node.info.Input.RecordSize, true});
+          }
+          for (uint32_t target = 0; target < graph.nodes.size(); ++target) {
+            if (!graph.nodes[target].info.Input.RecordSize ||
+                std::find(node.targets.begin(), node.targets.end(), target) == node.targets.end()) continue;
+            payloads.push_back({queues[target].Records, uint64_t(graph.queue_capacity[target]) * queues[target].Stride, true});
+          }
+          hr = CollectAtomic64PhaseBindings(device, {}, payloads, bindings);
+        }
+        if (SUCCEEDED(hr)) hr = PrepareAtomic64Phase(device, uint64_t(node.threads.width) * node.threads.height * node.threads.depth,
+                                                   bindings, atomic_phase);
+        if (SUCCEEDED(hr)) hr = atomic_phase->EncodeImport(buffer, atomic_fence);
+        if (SUCCEEDED(hr)) hr = atomic_phase->PublishContext(buffer, atomic_fence);
+        if (FAILED(hr)) return hr;
+      }
       auto encoder = buffer.computeCommandEncoder(false);
+      if (node.atomic64_phase || texture_phase) encoder.waitForFence(atomic_fence);
       Use(encoder, control);
       if (seed_resource) Use(encoder, seed_resource);
       wmtcmd_compute_setpso pipeline{}; pipeline.type = WMTComputeCommandSetPSO;
@@ -969,7 +1065,21 @@ struct GraphExecution {
       wmtcmd_compute_dispatch launch{}; launch.type = WMTComputeCommandDispatch; launch.size = {1, 1, 1};
       pipeline.next.set(&launch);
       encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&pipeline));
-      encoder.endEncoding(); if (!Complete(buffer)) return E_FAIL;
+      if (node.atomic64_phase || texture_phase) encoder.updateFence(atomic_fence);
+      encoder.endEncoding();
+      if (node.atomic64_phase) {
+        HRESULT hr = atomic_phase->EncodeExport(buffer, atomic_fence);
+        if (FAILED(hr)) return hr;
+      }
+      if (texture_phase) {
+        HRESULT hr = textures.end(buffer, atomic_fence);
+        if (FAILED(hr)) return hr;
+      }
+      if (node.atomic64_phase) {
+        HRESULT hr = atomic_phase->ClearContext(buffer, atomic_fence);
+        if (FAILED(hr)) return hr;
+      }
+      if (!Complete(buffer)) return E_FAIL;
       // Every suspended producer owns one level. Its siblings survive all descendant execution.
       // MaxRecords is a group-wide budget, including per-thread and node-array allocations.
       // A coalescing node may legally consume one record; no aggregation quota is required.
@@ -999,6 +1109,7 @@ struct GraphExecution {
     seed_info.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE; auto seed = device->GetMTLDevice().newBuffer(seed_info);
     if (!seed) return E_OUTOFMEMORY;
     seed_resource = seed;
+    seed_address = seed_info.gpu_address;
     for (uint32_t i = 0; i < count; ++i) {
       uint64_t input = address + uint64_t(i) * stride;
       if (cpu) { if (!record.empty()) std::memcpy(seed_info.memory.get_accessible_or_null(), cpu + uint64_t(i) * stride, record.size());
@@ -1012,11 +1123,14 @@ struct GraphExecution {
 };
 }
 
-HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, const WorkGraphDispatch &dispatch) {
+HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, const WorkGraphDispatch &dispatch,
+                        const WorkGraphTexturePublisher &textures) {
   const auto *graph = dispatch.object->GetGraph(dispatch.graph); if (!graph) return E_INVALIDARG;
-  GraphExecution execution{device, queue, dispatch, *graph};
+  GraphExecution execution{device, queue, dispatch, *graph, textures};
   execution.allocator = device->GetMTLDevice().newMTL4CommandAllocator();
   if (!execution.allocator) return E_OUTOFMEMORY;
+  execution.atomic_fence = device->GetMTLDevice().newFence();
+  if (!execution.atomic_fence) return E_OUTOFMEMORY;
   uint64_t elements = 0; for (const auto &node : graph->nodes) elements = std::max<uint64_t>(elements, node.targets.size());
   execution.context_offset = (sizeof(SM50_WG_QUEUE) * (graph->nodes.size() + 1) + 63) & ~uint64_t(63);
   execution.batch_offset = (execution.context_offset + offsetof(SM50_WG_NODE_CONTEXT, Outputs) + elements * 4 + 63) & ~uint64_t(63);
@@ -1033,13 +1147,19 @@ HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, co
     }
   } else if (dispatch.mode == kDispatchModeNodeGPUInput) {
     D3D12_NODE_GPU_INPUT input{}; HRESULT hr = execution.Read(dispatch.gpu_input, &input, sizeof(input));
-    if (FAILED(hr)) return hr; return execution.RunInput(input.EntrypointIndex, input.NumRecords, input.Records.StartAddress, input.Records.StrideInBytes, nullptr);
+    if (FAILED(hr)) return hr;
+    if (input.NumRecords > dispatch.max_gpu_records || dispatch.max_gpu_node_inputs < 1) return E_INVALIDARG;
+    return execution.RunInput(input.EntrypointIndex, input.NumRecords, input.Records.StartAddress, input.Records.StrideInBytes, nullptr);
   } else {
     D3D12_MULTI_NODE_GPU_INPUT multi{}; HRESULT hr = execution.Read(dispatch.gpu_input, &multi, sizeof(multi));
     if (FAILED(hr)) return hr;
+    if (multi.NumNodeInputs > dispatch.max_gpu_node_inputs) return E_INVALIDARG;
+    uint64_t total_records = 0;
     for (uint32_t i = 0; i < multi.NumNodeInputs; ++i) {
       D3D12_NODE_GPU_INPUT input{}; hr = execution.Read(multi.NodeInputs.StartAddress + uint64_t(i) * multi.NodeInputs.StrideInBytes, &input, sizeof(input));
       if (FAILED(hr)) return hr;
+      total_records += input.NumRecords;
+      if (total_records > dispatch.max_gpu_records) return E_INVALIDARG;
       hr = execution.RunInput(input.EntrypointIndex, input.NumRecords, input.Records.StartAddress, input.Records.StrideInBytes, nullptr);
       if (FAILED(hr)) return hr;
     }

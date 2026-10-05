@@ -304,11 +304,7 @@ HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_ST
     }
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
       GET_STREAM_DATA(D3D12_DEPTH_STENCIL_DESC1);
-      // DepthBoundsTestSupported is FALSE, so enabling the test is invalid.
-      if (subobject->data.DepthBoundsTestEnable) {
-        ERR("CreatePipelineState: DepthBoundsTestEnable without DepthBoundsTestSupported");
-        return E_INVALIDARG;
-      }
+      stream.graphics_extras.depth_bounds = bool(subobject->data.DepthBoundsTestEnable);
       auto &out = desc_graphics.DepthStencilState;
       out.StencilEnable = subobject->data.StencilEnable;
       out.DepthEnable = subobject->data.DepthEnable;
@@ -324,10 +320,7 @@ HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_ST
     case kSubobjectDepthStencil2: {
       GET_STREAM_DATA(DepthStencilDesc2);
       const auto &in = subobject->data;
-      if (in.DepthBoundsTestEnable) {
-        ERR("CreatePipelineState: DepthBoundsTestEnable without DepthBoundsTestSupported");
-        return E_INVALIDARG;
-      }
+      stream.graphics_extras.depth_bounds = bool(in.DepthBoundsTestEnable);
       // Distinct front/back masks (IndependentFrontAndBackStencilRefMaskSupported) are exact in
       // Metal's per-face stencil descriptors.
       if (in.FrontFace.StencilReadMask != in.BackFace.StencilReadMask ||
@@ -453,6 +446,10 @@ HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_ST
   // A mesh pipeline replaces the whole vertex front end: no VS/HS/DS/GS, input layout or stream
   // output, and an AS needs an MS.
   const auto &extras = stream.graphics_extras;
+  if (extras.depth_bounds && !device->GetMTLDevice().supportsFamily(WMTGPUFamilyApple7)) {
+    ERR("CreatePipelineState: depth bounds requires native bounds or Apple7 per-sample capture");
+    return E_INVALIDARG;
+  }
   if (extras.as.pShaderBytecode && !extras.ms.pShaderBytecode) {
     ERR("CreatePipelineState: amplification shader without a mesh shader");
     return E_INVALIDARG;

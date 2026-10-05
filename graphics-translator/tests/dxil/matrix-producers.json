@@ -1,0 +1,36 @@
+{
+  "retired": {
+    "release": "v1.8.2306-preview",
+    "commit": "3e105849cc64d736f7930654c1da489616b6a46c",
+    "url": "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2306-preview/dxc_preview_2023_06_21.zip",
+    "archive_sha256": "d9f57858fb2f41f0d8513dbb22049ad20123b721777a1c2355294f2b719537f9",
+    "profile": "cs_6_8",
+    "opcode_abi": "226..237",
+    "wave_size_metadata": "experimental tag 11, fixed 32",
+    "distribution": "Archived experimental bytecode; not signed/final production SM6.8 bytecode"
+  },
+  "linear_algebra": {
+    "release": "v1.10.2605.37",
+    "commit": "c4d8f4f99aa221da58cd540bf2099a2889632ab6",
+    "url": "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.10.2605.37/dxc_2026_08_11.zip",
+    "archive_sha256": "18da85ccac4d1736209bad960f0a124928a5c5a6046882e331c605d66744a889",
+    "profile": "cs_6_10",
+    "opcode_abi": "experimental high bit + 11..31, not final core opcodes 322..342",
+    "matrix_metadata": "dx.targetTypes",
+    "runtime_contract_commit": "d5e2639ef030969e5c56c92cf7f8ecd1115001a9"
+  },
+  "command": "build-matrix.sh; -HV 2021 -enable-16bit-types; real archived producers, no IR opcode rewriting",
+  "frozen_sha256": {
+    "sm6-cs_wavematrix.dxil": "7e73f2e8e7ef2ac30906bd17ae83488a89111aa7bb1c6dea5c96fc52007d2804",
+    "sm6-cs_matrix_wave.dxil": "704c74f7f230e9f16e9cc1880437640096bfb7b34cfe2fe68e8f9a29dac4d37f",
+    "sm6-cs_matrix_required.dxil": "7a5c2cbb7610ca94ad013788f2065b976bd73d474183a06516197cb1bbc2377c",
+    "sm6-cs_matrix_vector.dxil": "37ebe9e38d5ec171250ee36489688da6917f7d8deeca7b3288edd89e5b0ce96a",
+    "sm6-cs_matrix_group.dxil": "d5dea103fd73d3b18546c55c21c9bba3da0ea6d7ade16ff11303e09e476267b6",
+    "sm6-cs_matrix_atomic.dxil": "8ee08ac99f349b95638166da95ec4120a5f15fc28f84bd752c02442a1bad93a8",
+    "sm6-cs_matrix_formats.dxil": "22af994c7280b982fda6aafa17154bb51fc9beacdc84f7752dbdfed4a53945a6",
+    "sm6-cs_matrix_groupformats.dxil": "494d8f20f5c1c4730e7e4e43d145b3270350338b983ebbe0eaadb2a4fa07c975",
+    "sm6-cs_wavematrix16x64.dxil": "9f42850daa90bbddb3c7cd43c18e991052347a3dfcabe1853d57aa9b49457f79",
+    "sm6-cs_wavematrix64x16.dxil": "2d36b926cbee666fa72642a73dce6afd9b657a835592f3dfcae4e5c312f98cbb",
+    "sm6-cs_wavematrix64x64.dxil": "d37e2a7474eef5a7855bd384956c7a9f0dda95b434633412bdefdfc3bf8860f9"
+  }
+}

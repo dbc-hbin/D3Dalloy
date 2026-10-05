@@ -75,12 +75,13 @@ struct EMBEDDED_DESCRIPTOR_HANDLE {
 };
 
 static_assert(sizeof(EMBEDDED_DESCRIPTOR_HANDLE) == sizeof(D3D12_CPU_DESCRIPTOR_HANDLE));
+constexpr uint32_t kSamplerDescriptorStride = 64;
 
 #ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
 /*
  * 32-bit CPU descriptor handles. A 32-bit SIZE_T cannot embed a heap pointer and a 20-bit index,
  * so each heap reserves a disjoint range of a process-wide 32-bit handle space instead: its handle
- * for descriptor i is Base + i * kDescriptorHandleStride, the same increment
+ * for descriptor i is Base + i * its kind's descriptor stride, the same increment
  * GetDescriptorHandleIncrementSize reports on 64-bit. Handle 0 is never allocated. A lookup
  * resolves only a handle inside a live range of the requested heap kind, on a stride boundary;
  * anything else resolves to a null heap. Ranges are registered by a heap's successful
@@ -142,6 +143,8 @@ struct CBVCommonStorage {
 struct UAVBufferCPUStorage {
   Buffer *buffer = nullptr;
   BufferSlice slice{};
+  Buffer *counter = nullptr;
+  uint64_t counter_offset = 0;
 };
 
 using SRVBufferCPUStorage = UAVBufferCPUStorage;
@@ -161,6 +164,9 @@ struct AccelerationStructureCPUStorage {
 
 struct ShaderVisibleDescriptorCPUStorage {
   ShaderVisibleDescriptorType type;
+  // Borrowed pointers are dereferenced only after acquiring this live owner.
+  uint64_t owner_id = 0;
+  uint64_t counter_owner_id = 0;
   union {
     SRVTextureCPUStorage SRVTexture;
     CBVCommonStorage ConstantBuffer;
@@ -181,15 +187,16 @@ class MTLD3D12DescriptorHeap : public ID3D12DescriptorHeap {
 public:
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
+  virtual void SetDescriptorOwner(UINT index, uint64_t owner_id, uint64_t counter_owner_id = 0) = 0;
 
   virtual HRESULT
   AddShaderResourceView(UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp,
-                        bool CubeView, bool CenterSamplePattern) = 0;
+                        bool CubeView, bool CenterSamplePattern, UINT64 FormatDefaults) = 0;
 
   virtual HRESULT AddConstantBufferView(UINT Index, UINT64 VA, UINT32 SizeInBytes) = 0;
 
   virtual HRESULT AddUnorderedAccessView(
-      UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize
+      UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize, UINT FormatDefaults
   ) = 0;
 
   virtual HRESULT AddUnorderedAccessView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
@@ -234,7 +241,8 @@ public:
 
 class MTLD3D12SamplerDescriptorHeap : public ID3D12DescriptorHeap {
 public:
-  virtual HRESULT AddSampler(UINT Index, const D3D12_SAMPLER_DESC *Desc) = 0;
+  virtual HRESULT AddSampler(UINT Index, const D3D12_SAMPLER_DESC *Desc, UINT Flags = 0,
+                             const UINT *UintBorderColor = nullptr) = 0;
 
   virtual void CopyDescriptors(UINT From, MTLD3D12SamplerDescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) = 0;
 };

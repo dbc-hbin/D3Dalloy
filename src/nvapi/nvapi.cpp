@@ -1,4 +1,5 @@
 #include "../d3d11/d3d11_interfaces.hpp"
+#include "../d3d12/d3d12_reflex_interfaces.hpp"
 #include "../dxgi/dxgi_interfaces.h"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
@@ -7,18 +8,12 @@
 #include "winemetal.h"
 #include "wsi_monitor.hpp"
 #include <string>
+#include <algorithm>
 #define __NVAPI_EMPTY_SAL
 #include "nvapi.h"
 #include "nvapi_interface.h"
 #include "nvShaderExtnEnums.h"
 #undef __NVAPI_EMPTY_SAL
-
-/*
- * `nvapi.h` only declares the D3D12 entry points when the D3D12 headers were
- * included first. NVAPI clients resolve them through `nvapi_QueryInterface`
- * with a typeless device pointer, so a forward declaration is enough here.
- */
-struct ID3D12Device;
 
 namespace dxmt {
 Logger Logger::s_instance("nvapi.log");
@@ -241,7 +236,7 @@ NvAPI_DISP_GetDisplayIdByDisplayName(const char *displayName, NvU32 *displayId) 
   info.handle = nullptr;
   ::EnumDisplayMonitors(
       nullptr, nullptr,
-      [](HMONITOR hmon, HDC hdc, LPRECT rect, LPARAM lp) -> BOOL {
+      [](HMONITOR hmon, HDC hdc, LPRECT rect, LPARAM lp) __attribute__((stdcall)) -> BOOL {
         auto data = reinterpret_cast<MonitorEnumInfo *>(lp);
 
         ::MONITORINFOEXW monitor_info;
@@ -710,16 +705,24 @@ NvAPI_D3D_GetSleepStatus(IUnknown *pDev, NV_GET_SLEEP_STATUS_PARAMS *pGetSleepSt
 
   switch (pGetSleepStatusParams->version) {
   case NV_GET_SLEEP_STATUS_PARAMS_VER1:
-    pGetSleepStatusParams->bLowLatencyMode = false;
-    pGetSleepStatusParams->bFsVrr = false;
-    pGetSleepStatusParams->bCplVsyncOn = false;
-    pGetSleepStatusParams->sleepIntervalUs = 0;
-    pGetSleepStatusParams->bUseGameSleep = false;
     break;
   default:
     return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
   }
 
+  if (std::any_of(std::begin(pGetSleepStatusParams->rsvd), std::end(pGetSleepStatusParams->rsvd),
+                  [](NvU8 value) { return value != 0; }))
+    return NVAPI_INVALID_ARGUMENT;
+  Com<IMTLD3D12Reflex> reflex;
+  if (FAILED(pDev->QueryInterface(IID_PPV_ARGS(&reflex)))) return NVAPI_NOT_SUPPORTED;
+  BOOL low = FALSE, game = FALSE;
+  UINT sleep = 0;
+  if (FAILED(reflex->GetReflexStatus(&low, &sleep, &game))) return NVAPI_ERROR;
+  pGetSleepStatusParams->bLowLatencyMode = low;
+  pGetSleepStatusParams->bFsVrr = false;
+  pGetSleepStatusParams->bCplVsyncOn = false;
+  pGetSleepStatusParams->sleepIntervalUs = sleep;
+  pGetSleepStatusParams->bUseGameSleep = game;
   return NVAPI_OK;
 }
 
@@ -735,7 +738,16 @@ NvAPI_D3D_SetSleepMode(IUnknown *pDev, NV_SET_SLEEP_MODE_PARAMS *pSetSleepModePa
     return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
   }
 
-  return NVAPI_OK;
+  if (std::any_of(std::begin(pSetSleepModeParams->rsvd), std::end(pSetSleepModeParams->rsvd),
+                  [](NvU8 value) { return value != 0; }) ||
+      pSetSleepModeParams->bLowLatencyMode > 1 || pSetSleepModeParams->bLowLatencyBoost > 1 ||
+      pSetSleepModeParams->bUseMarkersToOptimize > 1) return NVAPI_INVALID_ARGUMENT;
+  Com<IMTLD3D12Reflex> reflex;
+  if (FAILED(pDev->QueryInterface(IID_PPV_ARGS(&reflex)))) return NVAPI_NOT_SUPPORTED;
+  // Metal provides no maximum-clock request; do not claim Boost was applied.
+  if (pSetSleepModeParams->bLowLatencyBoost) return NVAPI_NOT_SUPPORTED;
+  return SUCCEEDED(reflex->SetReflexMode(pSetSleepModeParams->bLowLatencyMode,
+      pSetSleepModeParams->minimumIntervalUs, pSetSleepModeParams->bUseMarkersToOptimize)) ? NVAPI_OK : NVAPI_ERROR;
 }
 
 NVAPI_INTERFACE
@@ -750,7 +762,16 @@ NvAPI_D3D_SetLatencyMarker(IUnknown *pDev, NV_LATENCY_MARKER_PARAMS *pSetLatency
     return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
   }
 
-  return NVAPI_OK;
+  if (pSetLatencyMarkerParams->rsvd0 ||
+      std::any_of(std::begin(pSetLatencyMarkerParams->rsvd), std::end(pSetLatencyMarkerParams->rsvd),
+                  [](NvU8 value) { return value != 0; }) ||
+      pSetLatencyMarkerParams->markerType < SIMULATION_START ||
+      pSetLatencyMarkerParams->markerType > OUT_OF_BAND_PRESENT_END) return NVAPI_INVALID_ARGUMENT;
+  Com<IMTLD3D12Reflex> reflex;
+  if (FAILED(pDev->QueryInterface(IID_PPV_ARGS(&reflex)))) return NVAPI_NOT_SUPPORTED;
+  const auto hr = reflex->ReflexMarker(pSetLatencyMarkerParams->frameID, pSetLatencyMarkerParams->markerType);
+  return hr == E_NOTIMPL ? NVAPI_NOT_SUPPORTED : hr == E_INVALIDARG ? NVAPI_INVALID_ARGUMENT :
+         hr == DXGI_ERROR_WAS_STILL_DRAWING ? NVAPI_DEVICE_BUSY : FAILED(hr) ? NVAPI_ERROR : NVAPI_OK;
 }
 
 NVAPI_INTERFACE
@@ -758,7 +779,9 @@ NvAPI_D3D_Sleep(IUnknown *pDev) {
   if (!pDev)
     return NVAPI_INVALID_ARGUMENT;
 
-  return NVAPI_OK;
+  Com<IMTLD3D12Reflex> reflex;
+  if (FAILED(pDev->QueryInterface(IID_PPV_ARGS(&reflex)))) return NVAPI_NOT_SUPPORTED;
+  return SUCCEEDED(reflex->ReflexSleep()) ? NVAPI_OK : NVAPI_ERROR;
 }
 
 NVAPI_INTERFACE
@@ -768,12 +791,27 @@ NvAPI_D3D_GetLatency(IUnknown *pDev, NV_LATENCY_RESULT_PARAMS *pGetLatencyParams
 
   switch (pGetLatencyParams->version) {
   case NV_LATENCY_RESULT_PARAMS_VER1:
-    memset(pGetLatencyParams->frameReport, 0, sizeof(pGetLatencyParams->frameReport));
     break;
   default:
     return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
   }
 
+  if (std::any_of(std::begin(pGetLatencyParams->rsvd), std::end(pGetLatencyParams->rsvd),
+                  [](NvU8 value) { return value != 0; })) return NVAPI_INVALID_ARGUMENT;
+  Com<IMTLD3D12Reflex> reflex;
+  if (FAILED(pDev->QueryInterface(IID_PPV_ARGS(&reflex)))) return NVAPI_NOT_SUPPORTED;
+  static_assert(sizeof(DXMT_REFLEX_REPORT) == sizeof(NV_LATENCY_RESULT_PARAMS::FrameReport));
+  static_assert(offsetof(DXMT_REFLEX_REPORT, gpuRenderStartTime) ==
+                offsetof(NV_LATENCY_RESULT_PARAMS::FrameReport, gpuRenderStartTime));
+  DXMT_REFLEX_REPORT reports[64]{};
+  const auto hr = reflex->GetReflexReports(reports);
+  // NVAPI explicitly returns all-zero reports during the 64-frame warmup.
+  if (hr == S_FALSE) {
+    memset(pGetLatencyParams->frameReport, 0, sizeof(pGetLatencyParams->frameReport));
+    return NVAPI_OK;
+  }
+  if (FAILED(hr)) return NVAPI_ERROR;
+  memcpy(pGetLatencyParams->frameReport, reports, sizeof(reports));
   return NVAPI_OK;
 }
 

@@ -373,7 +373,7 @@ struct sm50_rt_export32 {
   uint64_t LocalRootSignatureSize;
 };
 struct sm50_rt_function_info32 {
-  uint32_t Name, ExportName, Kind, ExportIndex, TableIndex, IsDispatchEntry;
+  uint32_t Name, ExportName, Kind, ExportIndex, TableIndex, Flags;
 };
 _Static_assert(sizeof(struct sm50_rt_pipeline_desc32) == 72, "raytracing pipeline description ABI");
 _Static_assert(sizeof(struct sm50_rt_export32) == 48, "raytracing export ABI");

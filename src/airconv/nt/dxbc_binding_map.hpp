@@ -17,8 +17,11 @@ struct SamplerDescriptor {
   llvm::Value *SamplerHandle;
   llvm::Value *CubeSamplerHandle;
   llvm::Value *Metadata;
-  // D3D12 sampler descriptor q3 (MinLOD | MaxLOD << 32); only sampler feedback reads it.
+  // D3D12 sampler q3 (MinLOD | MaxLOD << 32), used by feedback and compute CalculateLOD.
   llvm::Value *LodRange = nullptr;
+  // D3D12 q4/q5: exact uint4; signed formats interpret the same 32-bit lanes.
+  llvm::Value *UintBorder = nullptr;
+  llvm::Value *FloatBorder = nullptr; // D3D12 q6/q7 for software tiled-volume sampling.
 };
 
 struct TextureDescirptor {
@@ -44,6 +47,8 @@ struct TextureDescirptor {
   llvm::Value *RGB32StatusBase = nullptr;
   // D3D12 texture SRVs: q2 view range for sampler feedback (bit 63 valid; mips/slices packed).
   llvm::Value *ViewRange = nullptr;
+  // D3D12 SRV q3: post-SRV-mapping constant-one channels for an empty mip view.
+  llvm::Value *FormatDefaults = nullptr;
 
 };
 

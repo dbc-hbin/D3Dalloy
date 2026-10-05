@@ -34,6 +34,22 @@
 
 using Microsoft::WRL::ComPtr;
 
+struct SamplerDesc2 {
+  D3D12_FILTER Filter;
+  D3D12_TEXTURE_ADDRESS_MODE AddressU, AddressV, AddressW;
+  FLOAT MipLODBias;
+  UINT MaxAnisotropy;
+  D3D12_COMPARISON_FUNC ComparisonFunc;
+  union { FLOAT FloatBorderColor[4]; UINT UintBorderColor[4]; };
+  FLOAT MinLOD, MaxLOD;
+  UINT Flags;
+};
+MIDL_INTERFACE("5405c344-d457-444e-b4dd-2366e45aee39")
+SamplerDevice11 : public ID3D12Device10 {
+  virtual void STDMETHODCALLTYPE CreateSampler2(const SamplerDesc2 *, D3D12_CPU_DESCRIPTOR_HANDLE) = 0;
+};
+__CRT_UUID_DECL(SamplerDevice11,0x5405c344,0xd457,0x444e,0xb4,0xdd,0x23,0x66,0xe4,0x5a,0xee,0x39)
+
 namespace {
 
 // D3D12 root signature 1.2 declarations (DirectX-Headers v1.614.1); the llvm-mingw
@@ -214,9 +230,9 @@ struct Gpu {
       for (UINT z = 0; z < fp[s].Footprint.Depth; ++z)
         for (UINT y = 0; y < fp[s].Footprint.Height; ++y)
           for (UINT x = 0; x < fp[s].Footprint.Width; ++x) {
-            uint32_t v = texel(x, y, subresources > 1 ? s : z);
-            std::memcpy(data.data() + fp[s].Offset + (z * fp[s].Footprint.Height + y) * fp[s].Footprint.RowPitch + x * 4,
-                        &v, 4);
+            const auto v = texel(x, y, subresources > 1 ? s : z);
+            std::memcpy(data.data() + fp[s].Offset + (z * fp[s].Footprint.Height + y) * fp[s].Footprint.RowPitch + x * sizeof(v),
+                        &v, sizeof(v));
           }
     auto up = uploadData(data.data(), total);
     for (UINT s = 0; s < subresources; ++s) {
@@ -1065,6 +1081,378 @@ RWByteAddressBuffer result : register(u0);
 )";
 
 /* Root signature 1.2: serialization round trip, flag validation and GPU sampling. */
+// VulkanOn12 / DirectX-Headers v1.614.1: single-mip non-array 1D/2D views,
+// six standard/min/max filters, min=mag, LOD0, no sample offsets.
+void testNonNormalizedSamplers(Gpu &g) {
+  auto *dev=g.device.Get();
+  ComPtr<SamplerDevice11> dev11;check(g.device.As(&dev11),"sampler device11");
+  struct Options17 {BOOL NonNormalizedCoordinateSamplersSupported,ManualWriteTrackingResourceSupported;} options{};
+  check(dev->CheckFeatureSupport(D3D12_FEATURE(46),&options,sizeof(options)),"sampler options17");
+  EXPECT(options.NonNormalizedCoordinateSamplersSupported,"nonnormalized cap false");
+  const auto point=D3D12_FILTER_MIN_MAG_MIP_POINT;
+  const auto linear=D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+  auto cpu=g.heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,8,false);
+  auto heap=g.heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,8);
+  SamplerDesc2 desc{};desc.Filter=point;
+  desc.AddressU=desc.AddressV=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  desc.AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP; // W is unrestricted for 1D/2D.
+  desc.MaxAnisotropy=1;desc.ComparisonFunc=D3D12_COMPARISON_FUNC_NEVER;
+  desc.MipLODBias=3;desc.Flags=kSamplerFlagNonNormalized;
+  StaticSamplerDesc1 statics[8]{};
+  for(UINT s=0;s<6;++s){
+    const UINT reduction = s < 2 ? 0 : (s / 2 + 1) * 0x80u;
+    desc.Filter=D3D12_FILTER((s%2?UINT(linear):UINT(point))|reduction);
+    dev11->CreateSampler2(&desc,g.cpu(cpu.Get(),s,g.samplerStride));
+    statics[s]=staticSampler(desc.Filter,D3D12_TEXTURE_ADDRESS_MODE_CLAMP,0,kSamplerFlagNonNormalized,s);
+    statics[s].base.MipLODBias=3;statics[s].base.AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  }
+  desc.Flags=0;desc.MipLODBias=0;desc.Filter=point;desc.MaxLOD=D3D12_FLOAT32_MAX;
+  dev11->CreateSampler2(&desc,g.cpu(cpu.Get(),6,g.samplerStride));
+  statics[6]=staticSampler(point,D3D12_TEXTURE_ADDRESS_MODE_CLAMP,0,0,6);
+  auto border=desc;border.Filter=linear;border.Flags=kSamplerFlagNonNormalized;border.MinLOD=border.MaxLOD=0;
+  border.AddressU=border.AddressV=D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+  for(UINT channel=0;channel<4;++channel)border.FloatBorderColor[channel]=1;
+  dev11->CreateSampler2(&border,g.cpu(cpu.Get(),7,g.samplerStride));
+  statics[7]=staticSampler(linear,D3D12_TEXTURE_ADDRESS_MODE_BORDER,2,kSamplerFlagNonNormalized,7);
+  dev->CopyDescriptorsSimple(8,heap->GetCPUDescriptorHandleForHeapStart(),cpu->GetCPUDescriptorHandleForHeapStart(),D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+  // Invalid CreateSampler2 is void: it must preserve the previous descriptor.
+  SamplerDesc2 invalid=desc;invalid.Flags=kSamplerFlagNonNormalized;invalid.MinLOD=invalid.MaxLOD=0;
+  std::vector<SamplerDesc2> bad;
+  invalid.AddressU=D3D12_TEXTURE_ADDRESS_MODE_WRAP;bad.push_back(invalid);invalid.AddressU=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  invalid.AddressV=D3D12_TEXTURE_ADDRESS_MODE_MIRROR;bad.push_back(invalid);invalid.AddressV=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  invalid.Filter=D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR;bad.push_back(invalid);
+  invalid.Filter=D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT;bad.push_back(invalid);
+  invalid.Filter=D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;bad.push_back(invalid);
+  invalid.Filter=D3D12_FILTER_ANISOTROPIC;bad.push_back(invalid);invalid.Filter=point;
+  invalid.MaxLOD=1;bad.push_back(invalid);invalid.MaxLOD=0;invalid.MinLOD=-1;bad.push_back(invalid);invalid.MinLOD=0;
+  invalid.Flags=4;bad.push_back(invalid);
+  for(const auto &value:bad)dev11->CreateSampler2(&value,g.cpu(heap.Get(),6,g.samplerStride));
+  dev11->CreateSampler2(nullptr,g.cpu(heap.Get(),6,g.samplerStride));
+
+  auto views=g.heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,6);
+  std::vector<ComPtr<ID3D12Resource>> keep;
+  // A one-mip SRV can select mip1 of a multi-mip resource. Coordinates are view-relative.
+  auto props=heapProps(D3D12_HEAP_TYPE_DEFAULT);
+  D3D12_RESOURCE_DESC texture{};texture.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture.Width=8;texture.Height=4;texture.DepthOrArraySize=1;texture.MipLevels=3;
+  texture.Format=DXGI_FORMAT_R32_FLOAT;texture.SampleDesc.Count=1;
+  ComPtr<ID3D12Resource> ramp;
+  check(dev->CreateCommittedResource(&props,D3D12_HEAP_FLAG_NONE,&texture,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&ramp)),"nn mip texture");
+  g.fillTexture(ramp.Get(),3,[](UINT x,UINT y,UINT mip){return f2u(float(100*mip+10*y+x));},keep,kShaderRead);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};srv.Format=DXGI_FORMAT_R32_FLOAT;
+  srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;srv.Texture2D.MostDetailedMip=1;srv.Texture2D.MipLevels=1;
+  dev->CreateShaderResourceView(ramp.Get(),&srv,g.cpu(views.Get(),0,g.viewStride));
+  dev->CreateShaderResourceView(nullptr,&srv,g.cpu(views.Get(),2,g.viewStride));
+  srv.Texture2D.ResourceMinLODClamp=1.25f;
+  dev->CreateShaderResourceView(ramp.Get(),&srv,g.cpu(views.Get(),3,g.viewStride));
+  srv.Shader4ComponentMapping=D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3,4,5,0);
+  dev->CreateShaderResourceView(ramp.Get(),&srv,g.cpu(views.Get(),4,g.viewStride));
+  auto odd=g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D,DXGI_FORMAT_R32_FLOAT,3,2,1);
+  g.fillTexture(odd.Get(),1,[](UINT x,UINT y,UINT){return f2u(float(300+10*y+x));},keep,kShaderRead);
+  g.texSrv(views.Get(),5,odd.Get(),DXGI_FORMAT_R32_FLOAT,D3D12_SRV_DIMENSION_TEXTURE2D);
+  auto one=g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE1D,DXGI_FORMAT_R32_FLOAT,4,1,1);
+  g.fillTexture(one.Get(),1,[](UINT x,UINT,UINT){return f2u(float(200+x));},keep,kShaderRead);
+  g.texSrv(views.Get(),1,one.Get(),DXGI_FORMAT_R32_FLOAT,D3D12_SRV_DIMENSION_TEXTURE1D);
+  auto output=g.initBuffer(std::vector<uint32_t>(41,0xcccccccc),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,keep);
+  auto poison=g.initBuffer(std::vector<uint32_t>(41,0xdeadbeef),D3D12_RESOURCE_STATE_COPY_SOURCE,keep);
+  g.submit("nn upload");
+  D3D12_DESCRIPTOR_RANGE1 ranges[2]={{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,6,0,0,D3D12_DESCRIPTOR_RANGE_FLAG_NONE,0},
+    {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,8,0,0,D3D12_DESCRIPTOR_RANGE_FLAG_NONE,0}};
+  D3D12_ROOT_PARAMETER1 params[3]{};
+  params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[0].DescriptorTable={1,&ranges[0]};
+  params[1]=rootDescriptor(D3D12_ROOT_PARAMETER_TYPE_UAV,0);
+  params[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[2].DescriptorTable={1,&ranges[1]};
+  auto shaderText=readFile(L"bindless-nonnormalized.hlsl");shaderText.push_back(0);
+  auto code=compileDxbc(reinterpret_cast<const char *>(shaderText.data()),"cs","cs_5_1");
+  auto dxilCode=readFile(L"bindless-nonnormalized-cs.dxil");
+  const uint32_t expected[41]={f2u(101),f2u(101),f2u(101),f2u(102),f2u(105.5f),f2u(101),f2u(100),f2u(101),f2u(111),f2u(101),f2u(113),f2u(101),f2u(110),f2u(111),f2u(101),f2u(100),f2u(201),f2u(0),f2u(102.75f),f2u(113),f2u(75.25f),f2u(100),0,0,0,f2u(1),0,0,0,0,f2u(1),0,f2u(1),0,f2u(1),f2u(1),f2u(1),f2u(1),f2u(300),f2u(301),f2u(300.5f)};
+  for(UINT format=0;format<2;++format)for(UINT mode=0;mode<2;++mode){
+    auto root=makeRoot(dev,desc12(params,mode?2:3,mode?statics:nullptr,mode?8:0));
+    auto pso=computePso(dev,root.Get(),format?dxilCode.data():code->GetBufferPointer(),
+                        format?dxilCode.size():code->GetBufferSize());
+    ID3D12DescriptorHeap *heaps[]={views.Get(),heap.Get()};g.list->SetDescriptorHeaps(2,heaps);
+    g.list->SetComputeRootSignature(root.Get());g.list->SetPipelineState(pso.Get());
+    g.list->SetComputeRootDescriptorTable(0,views->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1,output->GetGPUVirtualAddress());
+    if(!mode)g.list->SetComputeRootDescriptorTable(2,heap->GetGPUDescriptorHandleForHeapStart());
+    g.list->Dispatch(1,1,1);g.uavBarrier();
+    check(g.list->Close(),"nn close");ID3D12CommandList *lists[]={g.list.Get()};
+    ComPtr<ID3D12CommandAllocator> clearAllocator;
+    ComPtr<ID3D12GraphicsCommandList> clearList;
+    check(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&clearAllocator)),"nn poison allocator");
+    check(dev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,clearAllocator.Get(),nullptr,IID_PPV_ARGS(&clearList)),"nn poison list");
+    D3D12_RESOURCE_BARRIER transition{};transition.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    transition.Transition={output.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_DEST};
+    clearList->ResourceBarrier(1,&transition);
+    clearList->CopyBufferRegion(output.Get(),0,poison.Get(),0,164);
+    transition.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_DEST;
+    transition.Transition.StateAfter=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    clearList->ResourceBarrier(1,&transition);check(clearList->Close(),"nn poison close");
+    ID3D12CommandList *clearLists[]={clearList.Get()};
+    for(UINT replay=0;replay<2;++replay){
+      g.queue->ExecuteCommandLists(1,lists);check(g.queue->Signal(g.fence.Get(),++g.value),"nn signal");
+      check(g.fence->SetEventOnCompletion(g.value,g.event),"nn event");
+      if(WaitForSingleObject(g.event,kFenceTimeoutMs)!=WAIT_OBJECT_0)die("nn replay wait");
+      if(replay==0)g.queue->ExecuteCommandLists(1,clearLists);
+    }
+    check(g.allocator->Reset(),"nn allocator reset");check(g.list->Reset(g.allocator.Get(),nullptr),"nn reset");
+    auto result=g.readBuffer(output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,164,"nn readback");
+    for(UINT i=0;i<41;++i)EXPECT(result[i]==expected[i],"nn mode=%u lane=%u got=%08x expected=%08x",mode,i,result[i],expected[i]);
+    std::printf("OWNED_D3D12_BINDLESS_NONNORMALIZED format=%s mode=%s words=",format?"dxil":"dxbc",mode?"static":"heap");
+    for(UINT i=0;i<41;++i)std::printf("%s%08x",i?",":"",result[i]);std::puts(" replay=2");
+  }
+  auto vs=compileDxbc(reinterpret_cast<const char *>(shaderText.data()),"vs","vs_5_1");
+  auto ps=compileDxbc(reinterpret_cast<const char *>(shaderText.data()),"ps","ps_5_1");
+  auto dxilVs=readFile(L"bindless-nonnormalized-vs.dxil");
+  auto dxilPs=readFile(L"bindless-nonnormalized-ps.dxil");
+  for(UINT format=0;format<2;++format)for(UINT mode=0;mode<2;++mode){
+    D3D12_ROOT_PARAMETER1 graphicsParams[2]={params[0],params[2]};
+    auto root=makeRoot(dev,desc12(graphicsParams,mode?1:2,mode?statics:nullptr,mode?8:0));
+    auto pso=graphicsPso(dev,root.Get(),format?dxilVs.data():vs->GetBufferPointer(),
+                        format?dxilVs.size():vs->GetBufferSize(),
+                        format?dxilPs.data():ps->GetBufferPointer(),
+                        format?dxilPs.size():ps->GetBufferSize(),DXGI_FORMAT_R32G32B32A32_FLOAT);
+    struct Binding{ID3D12DescriptorHeap *views,*samplers;bool heap;} binding{views.Get(),heap.Get(),!mode};
+    auto pixels=drawQuad(g,pso.Get(),root.Get(),DXGI_FORMAT_R32G32B32A32_FLOAT,16,
+      [](Gpu &g,void *context){
+        auto &b=*static_cast<Binding *>(context);ID3D12DescriptorHeap *heaps[]={b.views,b.samplers};
+        g.list->SetDescriptorHeaps(2,heaps);
+        g.list->SetGraphicsRootDescriptorTable(0,b.views->GetGPUDescriptorHandleForHeapStart());
+        if(b.heap)g.list->SetGraphicsRootDescriptorTable(1,b.samplers->GetGPUDescriptorHandleForHeapStart());
+      },&binding,"nn pixel readback");
+    const uint32_t expectedPixel[]={f2u(101),f2u(101),f2u(105.5f),f2u(113)};
+    for(UINT pixel=0;pixel<16;++pixel)for(UINT channel=0;channel<4;++channel)
+      EXPECT(pixels[pixel*4+channel]==expectedPixel[channel],
+             "nn pixel format=%u mode=%u pixel=%u channel=%u got=%08x expected=%08x",
+             format,mode,pixel,channel,pixels[pixel*4+channel],expectedPixel[channel]);
+    std::printf("OWNED_D3D12_BINDLESS_NONNORMALIZED_PIXEL format=%s mode=%s values=101,101,105.5,113\n",
+                format?"dxil":"dxbc",mode?"static":"heap");
+  }
+  // Copy/rebind preserves coordinate mode; BORDER and UINT_BORDER_COLOR may be combined.
+  auto root=makeRoot(dev,desc12(params,3,nullptr,0));
+  auto simple=compileDxbc("Texture2D<float> t:register(t0);SamplerState s:register(s0);RWByteAddressBuffer o:register(u0);[numthreads(1,1,1)]void main(){o.Store(0,asuint(t.SampleLevel(s,float2(1.5,.5),0)));}","main","cs_5_1");
+  auto pso=computePso(dev,root.Get(),simple->GetBufferPointer(),simple->GetBufferSize());
+  for(UINT mode=0;mode<3;++mode){
+    if(mode==2){
+      desc.Filter=point;desc.Flags=kSamplerFlagNonNormalized|kSamplerFlagUintBorder;
+      desc.MinLOD=desc.MaxLOD=0;desc.AddressU=desc.AddressV=D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+      for(UINT channel=0;channel<4;++channel)desc.UintBorderColor[channel]=1;
+      dev11->CreateSampler2(&desc,cpu->GetCPUDescriptorHandleForHeapStart());
+    }
+    dev->CopyDescriptorsSimple(1,heap->GetCPUDescriptorHandleForHeapStart(),g.cpu(cpu.Get(),mode?0:6,g.samplerStride),D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    ID3D12DescriptorHeap *heaps[]={views.Get(),heap.Get()};g.list->SetDescriptorHeaps(2,heaps);g.list->SetComputeRootSignature(root.Get());g.list->SetPipelineState(pso.Get());
+    g.list->SetComputeRootDescriptorTable(0,views->GetGPUDescriptorHandleForHeapStart());g.list->SetComputeRootUnorderedAccessView(1,output->GetGPUVirtualAddress());
+    g.list->SetComputeRootDescriptorTable(2,heap->GetGPUDescriptorHandleForHeapStart());g.list->Dispatch(1,1,1);g.uavBarrier();
+    auto result=g.readBuffer(output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,4,"nn rebind");
+    EXPECT(result[0]==f2u(mode?101:113),"nn copy/rebind=%u got=%08x",mode,result[0]);
+  }
+  statics[0]=staticSampler(point,D3D12_TEXTURE_ADDRESS_MODE_BORDER,kBorderOpaqueWhiteUint,
+                          kSamplerFlagNonNormalized|kSamplerFlagUintBorder,0);
+  auto borderRoot=makeRoot(dev,desc12(params,2,statics,8));
+  auto borderPso=computePso(dev,borderRoot.Get(),simple->GetBufferPointer(),simple->GetBufferSize());
+  ID3D12DescriptorHeap *borderHeaps[]={views.Get()};g.list->SetDescriptorHeaps(1,borderHeaps);
+  g.list->SetComputeRootSignature(borderRoot.Get());g.list->SetPipelineState(borderPso.Get());
+  g.list->SetComputeRootDescriptorTable(0,views->GetGPUDescriptorHandleForHeapStart());
+  g.list->SetComputeRootUnorderedAccessView(1,output->GetGPUVirtualAddress());g.list->Dispatch(1,1,1);g.uavBarrier();
+  auto borderResult=g.readBuffer(output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,4,"nn static border");
+  EXPECT(borderResult[0]==f2u(101),"nn static border got=%08x",borderResult[0]);
+}
+
+void testNonNormalizedRawSampler(Gpu &g) {
+  auto *dev=g.device.Get();
+  ComPtr<SamplerDevice11> dev11;check(g.device.As(&dev11),"raw sampler device11");
+  auto views=g.heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,2);
+  auto samplers=g.heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,1);
+  std::vector<ComPtr<ID3D12Resource>> keep;
+  auto texture=g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D,DXGI_FORMAT_R32_UINT,4,2,1);
+  g.fillTexture(texture.Get(),1,[](UINT x,UINT y,UINT){return 10*y+x;},keep,kShaderRead);
+  g.texSrv(views.Get(),0,texture.Get(),DXGI_FORMAT_R32_UINT,D3D12_SRV_DIMENSION_TEXTURE2D);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};srv.Format=DXGI_FORMAT_R32_UINT;
+  srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;srv.Texture2D.MipLevels=1;srv.Texture2D.ResourceMinLODClamp=.25f;
+  dev->CreateShaderResourceView(texture.Get(),&srv,g.cpu(views.Get(),1,g.viewStride));
+  SamplerDesc2 desc{};desc.Filter=D3D12_FILTER_MIN_MAG_MIP_POINT;
+  desc.AddressU=desc.AddressV=desc.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  desc.MaxAnisotropy=1;desc.ComparisonFunc=D3D12_COMPARISON_FUNC_NEVER;desc.Flags=kSamplerFlagNonNormalized;
+  dev11->CreateSampler2(&desc,samplers->GetCPUDescriptorHandleForHeapStart());
+  D3D12_DESCRIPTOR_RANGE1 ranges[2]={{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,2,0,0,D3D12_DESCRIPTOR_RANGE_FLAG_NONE,0},
+    {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,1,0,0,D3D12_DESCRIPTOR_RANGE_FLAG_NONE,0}};
+  D3D12_ROOT_PARAMETER1 params[3]{};
+  params[0].ParameterType=params[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[0].DescriptorTable={1,&ranges[0]};params[2].DescriptorTable={1,&ranges[1]};
+  params[1]=rootDescriptor(D3D12_ROOT_PARAMETER_TYPE_UAV,0);
+  auto shader=readFile(L"bindless-nonnormalized-raw.dxil");
+  auto output=g.initBuffer(std::vector<uint32_t>(8,0xcccccccc),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,keep);
+  g.submit("nn raw upload");
+  auto statics=staticSampler(desc.Filter,D3D12_TEXTURE_ADDRESS_MODE_CLAMP,0,kSamplerFlagNonNormalized,0);
+  for(UINT mode=0;mode<2;++mode){
+    auto root=makeRoot(dev,desc12(params,mode?2:3,mode?&statics:nullptr,mode?1:0));
+    auto pso=computePso(dev,root.Get(),shader.data(),shader.size());
+    ID3D12DescriptorHeap *heaps[]={views.Get(),samplers.Get()};g.list->SetDescriptorHeaps(2,heaps);
+    g.list->SetComputeRootSignature(root.Get());g.list->SetPipelineState(pso.Get());
+    g.list->SetComputeRootDescriptorTable(0,views->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1,output->GetGPUVirtualAddress());
+    if(!mode)g.list->SetComputeRootDescriptorTable(2,samplers->GetGPUDescriptorHandleForHeapStart());
+    g.list->Dispatch(1,1,1);g.uavBarrier();
+    auto result=g.readBuffer(output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,32,"nn raw readback");
+    const uint32_t expected[]={10,11,1,0,0,0,0,0};
+    for(UINT lane=0;lane<8;++lane)EXPECT(result[lane]==expected[lane],"nn raw mode=%u lane=%u got=%u expected=%u",mode,lane,result[lane],expected[lane]);
+    std::printf("OWNED_D3D12_BINDLESS_NONNORMALIZED_RAW mode=%s values=",mode?"static":"heap");
+    for(UINT lane=0;lane<8;++lane)std::printf("%s%u",lane?",":"",result[lane]);std::puts("");
+  }
+}
+
+void testUintBorderSamplers(Gpu &g) {
+  const int before = g_failures;
+  auto *dev = g.device.Get();
+  ComPtr<SamplerDevice11> dev11;
+  check(g.device.As(&dev11), "uint border device11");
+  auto views = g.heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 14);
+  auto samplers = g.heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 16);
+  std::vector<ComPtr<ID3D12Resource>> keep;
+  constexpr uint32_t interior = 0x81000013u;
+  auto u = g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_UINT, 4, 4, 1);
+  auto s = g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_SINT, 4, 4, 1);
+  auto d1 = g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE1D, DXGI_FORMAT_R32_UINT, 4, 1, 1);
+  auto d3 = g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE3D, DXGI_FORMAT_R32_UINT, 4, 4, 4);
+  for (auto *texture : {u.Get(), s.Get(), d1.Get(), d3.Get()})
+    g.fillTexture(texture, 1, [](UINT x, UINT y, UINT z) { return interior + x + 4 * y + 16 * z; }, keep, kShaderRead);
+  g.texSrv(views.Get(), 0, u.Get(), DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_TEXTURE2D);
+  g.texSrv(views.Get(), 1, s.Get(), DXGI_FORMAT_R32_SINT, D3D12_SRV_DIMENSION_TEXTURE2D);
+  g.texSrv(views.Get(), 2, u.Get(), DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_TEXTURE2D);
+  g.texSrv(views.Get(), 3, d1.Get(), DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_TEXTURE1D);
+  g.texSrv(views.Get(), 4, d3.Get(), DXGI_FORMAT_R32_UINT, D3D12_SRV_DIMENSION_TEXTURE3D);
+  const DXGI_FORMAT narrowFormats[] = {DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8G8B8A8_SINT,
+      DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16_SINT};
+  for (UINT i = 0; i < 4; ++i) {
+    auto texture = g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, narrowFormats[i], 4, 4, 1);
+    g.fillTexture(texture.Get(), 1, [](UINT, UINT, UINT) { return 0xdeadbeefu; }, keep, kShaderRead);
+    g.texSrv(views.Get(), 5 + i, texture.Get(), narrowFormats[i], D3D12_SRV_DIMENSION_TEXTURE2D);
+    keep.push_back(texture);
+  }
+  auto raw16 = g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R16_UINT, 4, 4, 1);
+  g.fillTexture(raw16.Get(), 1, [](UINT, UINT, UINT) { return uint16_t(0xfedc); }, keep, kShaderRead);
+  g.texSrv(views.Get(), 9, raw16.Get(), DXGI_FORMAT_R16_UINT, D3D12_SRV_DIMENSION_TEXTURE2D);
+  auto raw64 = g.texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32G32_UINT, 4, 4, 1);
+  g.fillTexture(raw64.Get(), 1, [](UINT, UINT, UINT) { return uint64_t(0xfedcba9781000013ull); }, keep, kShaderRead);
+  g.texSrv(views.Get(), 10, raw64.Get(), DXGI_FORMAT_R32G32_UINT, D3D12_SRV_DIMENSION_TEXTURE2D);
+  D3D12_SHADER_RESOURCE_VIEW_DESC excluded{};
+  excluded.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  excluded.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  excluded.Texture2D.MipLevels = 1;
+  excluded.Texture2D.ResourceMinLODClamp = .25f; // Past the last mip even though floor(clamp)==0.
+  excluded.Format = DXGI_FORMAT_R32_UINT;
+  dev->CreateShaderResourceView(u.Get(), &excluded, g.cpu(views.Get(), 11, g.viewStride));
+  dev->CreateShaderResourceView(u.Get(), &excluded, g.cpu(views.Get(), 13, g.viewStride));
+  excluded.Format = DXGI_FORMAT_R32_SINT;
+  dev->CreateShaderResourceView(s.Get(), &excluded, g.cpu(views.Get(), 12, g.viewStride));
+  constexpr UINT outputBytes = 28 * 16;
+  auto output = g.initBuffer(std::vector<uint32_t>(outputBytes / 4, 0xcccccccc), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, keep);
+  auto readback = g.buffer(outputBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+  g.submit("uint border upload");
+  const auto tableShader = readFile(L"bindless-uint-border-table.dxil");
+  const auto heapShader = readFile(L"bindless-uint-border-heap.dxil");
+  D3D12_DESCRIPTOR_RANGE1 ranges[2] = {
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 14, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0},
+      {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0}};
+  D3D12_ROOT_PARAMETER1 params[4]{};
+  params[0].ParameterType = params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[0].DescriptorTable = {1, &ranges[0]};
+  params[1] = rootDescriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, 0);
+  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[2].Constants = {0, 0, 1};
+  params[3].DescriptorTable = {1, &ranges[1]};
+  const D3D12_FILTER filters[] = {D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_FILTER_MINIMUM_MIN_MAG_MIP_POINT,
+                                 D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_POINT};
+  for (UINT pixel = 0; pixel < 2; ++pixel) for (UINT mode = 0; mode < 4; ++mode) for (auto filter : filters) {
+    const bool isStatic = mode >= 2;
+    std::array<UINT, 4> border = {0x01000001u, 0x81000013u, 0xfedcba97u, 0xffffffffu};
+    if (isStatic) border = mode == 2 ? std::array<UINT, 4>{0, 0, 0, 1} : std::array<UINT, 4>{1, 1, 1, 1};
+    SamplerDesc2 sd{};
+    sd.Filter = filter;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    sd.MaxAnisotropy = 1;
+    sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sd.MaxLOD = pixel ? 0 : D3D12_FLOAT32_MAX;
+    sd.Flags = kSamplerFlagUintBorder | (pixel ? kSamplerFlagNonNormalized : 0);
+    std::memcpy(sd.UintBorderColor, border.data(), 16);
+    auto cpu = g.heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, false);
+    dev11->CreateSampler2(&sd, cpu->GetCPUDescriptorHandleForHeapStart());
+    dev->CopyDescriptorsSimple(1, g.cpu(samplers.Get(), 7, g.samplerStride),
+        cpu->GetCPUDescriptorHandleForHeapStart(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    // Copy has value semantics: changing and destroying the source must not alter the destination.
+    std::memset(sd.UintBorderColor, 0x5a, 16);
+    dev11->CreateSampler2(&sd, cpu->GetCPUDescriptorHandleForHeapStart());
+    cpu.Reset();
+    auto staticDesc = staticSampler(filter, D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+        mode == 2 ? kBorderOpaqueBlackUint : kBorderOpaqueWhiteUint, sd.Flags, 0);
+    auto rootDesc = desc12(params, isStatic ? 3 : 4, isStatic ? &staticDesc : nullptr, isStatic ? 1 : 0);
+    if (mode == 1) rootDesc.Desc_1_2.Flags = D3D12_ROOT_SIGNATURE_FLAGS(kFlagResourceHeap | kFlagSamplerHeap);
+    auto root = makeRoot(dev, rootDesc);
+    auto &shader = mode == 1 ? heapShader : tableShader;
+    auto pso = computePso(dev, root.Get(), shader.data(), shader.size());
+    ID3D12DescriptorHeap *heaps[] = {views.Get(), samplers.Get()};
+    g.list->SetDescriptorHeaps(2, heaps);
+    g.list->SetComputeRootSignature(root.Get());
+    g.list->SetPipelineState(pso.Get());
+    g.list->SetComputeRootDescriptorTable(0, views->GetGPUDescriptorHandleForHeapStart());
+    g.list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
+    g.list->SetComputeRoot32BitConstant(2, pixel ? 4 : 1, 0);
+    if (!isStatic) g.list->SetComputeRootDescriptorTable(3, g.gpu(samplers.Get(), 7, g.samplerStride));
+    g.list->Dispatch(1, 1, 1);
+    g.uavBarrier();
+    g.barrier(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, outputBytes);
+    g.barrier(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    check(g.list->Close(), "uint border close");
+    root.Reset(); pso.Reset();
+    auto u8border = border, s8border = border, u16border = border, s16border = border;
+    for (UINT c = 0; c < 4; ++c) {
+      u8border[c] &= 0xff;
+      s8border[c] = (u8border[c] ^ 0x80) - 0x80;
+      if (c < 2) {
+        u16border[c] &= 0xffff;
+        s16border[c] = (u16border[c] ^ 0x8000) - 0x8000;
+      }
+    }
+    const std::array<std::array<UINT, 4>, 28> expected = {{border, {interior, 0, 0, 1}, border,
+        {interior, 0, 0, 1}, {border[0], interior + 4, interior, border[0]},
+        {border[0], interior + 4, interior, border[0]}, {border[0], interior + 4, interior, border[0]},
+        border, pixel ? std::array<UINT, 4>{interior, 0, 0, 1} : border, border, border,
+        {border[1], 0, 0, border[1]}, u8border, s8border, u16border, s16border,
+        {0xef, 0xbe, 0xad, 0xde}, {0xffffffef, 0xffffffbe, 0xffffffad, 0xffffffde},
+        {0xbeef, 0xdead, 0, 1}, {0xffffbeef, 0xffffdead, 0, 1},
+        {border[0] & 0xffff, 0xfedc, 0xfedc, border[0] & 0xffff},
+        {border[0], 0x81000013, 0x81000013, border[0]},
+        {border[1], 0xfedcba97, 0xfedcba97, border[1]},
+        {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}}};
+    for (UINT replay = 0; replay < 2; ++replay) {
+      ID3D12CommandList *batch[] = {g.list.Get()};
+      g.queue->ExecuteCommandLists(1, batch);
+      check(g.queue->Signal(g.fence.Get(), ++g.value), "uint border signal");
+      check(g.fence->SetEventOnCompletion(g.value, g.event), "uint border event");
+      if (WaitForSingleObject(g.event, kFenceTimeoutMs) != WAIT_OBJECT_0) die("uint border fence");
+      check(dev->GetDeviceRemovedReason(), "uint border device");
+      void *mapped = nullptr;
+      check(readback->Map(0, nullptr, &mapped), "uint border readback");
+      const auto *got = static_cast<const UINT *>(mapped);
+      for (UINT row = 0; row < expected.size(); ++row) for (UINT channel = 0; channel < 4; ++channel)
+        EXPECT(got[4 * row + channel] == expected[row][channel],
+            "uint border pixel=%u mode=%u filter=%u replay=%u row=%u channel=%u got=%08x expected=%08x",
+            pixel, mode, UINT(filter), replay, row, channel, got[4 * row + channel], expected[row][channel]);
+      readback->Unmap(0, nullptr);
+    }
+    check(g.allocator->Reset(), "uint border allocator reset");
+    check(g.list->Reset(g.allocator.Get(), nullptr), "uint border list reset");
+  }
+  if (g_failures == before)
+    std::puts("OWNED_D3D12_BINDLESS_UINT_BORDER variants=24 replays=2 signed=1 narrow_8_16=1 raw_gather_16_32_64=1 empty_view=1 copy_lifetime=1");
+  passCase("uint-border", before);
+}
+
+
 void testRootSignature12(Gpu &g) {
   const int before = g_failures;
   auto *dev = g.device.Get();
@@ -1191,6 +1579,8 @@ void testRootSignature12(Gpu &g) {
                                   "inside", "inside", "inside", "inside", "white-float"};
   for (UINT k = 0; k < 15; ++k)
     EXPECT(out[k] == expect[k], "rs12 %s word=%u got=0x%x expected=0x%x", names[k], k, out[k], expect[k]);
+  testNonNormalizedSamplers(g);
+  testNonNormalizedRawSampler(g);
   passCase("root-signature-1.2", before);
 }
 
@@ -1246,6 +1636,7 @@ int wmain(int argc, wchar_t **argv) {
   testCaps(g);
   testRootFlags(g, cs, rootCs);
   testRootSignature12(g);
+  testUintBorderSamplers(g);
   {
     BindlessScene scene;
     buildScene(g, scene);
@@ -1260,6 +1651,6 @@ int wmain(int argc, wchar_t **argv) {
     std::printf("OWNED_D3D12_BINDLESS_FAIL mismatches=%d\n", g_failures);
     return 1;
   }
-  std::puts("OWNED_D3D12_BINDLESS_PASS cases=8 heap=1000000 samplers=2048 max_index=999999");
+  std::puts("OWNED_D3D12_BINDLESS_PASS cases=9 heap=1000000 samplers=2048 max_index=999999");
   return 0;
 }

@@ -100,6 +100,10 @@ link_args += [
   # work properly as well as avoiding a memcpy from the Wine loader.
   '-Wl,--file-alignment=4096',
 ]
+if native_compiler_arch == 'arm64'
+  # Keep writable IAT/data away from executable code on Darwin 16KB host pages.
+  link_args += ['-Wl,--section-alignment=16384']
+endif
 
 # Wine's built-in back traces only work with dwarf4 symbols
 if get_option('debug')

@@ -255,6 +255,7 @@ void setup_temp_register(
 
 void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version) {
   using namespace llvm;
+  if (module.getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) metal_version = SM50_SHADER_METAL_410;
   auto &context = module.getContext();
   auto createUnsignedInteger = [&](uint32_t s) {
     return ConstantAsMetadata::get(ConstantInt::get(context, APInt{32, s, false}));
@@ -264,6 +265,12 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
   auto airVersion = module.getOrInsertNamedMetadata("air.version");
   auto airLangVersion = module.getOrInsertNamedMetadata("air.language_version");
   switch (metal_version) {
+  case SM50_SHADER_METAL_410: {
+    airVersion->addOperand(MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(9), createUnsignedInteger(0)}));
+    airLangVersion->addOperand(MDTuple::get(context, {createString("Metal"), createUnsignedInteger(4), createUnsignedInteger(1), createUnsignedInteger(0)}));
+    module.setTargetTriple("air64-apple-macosx27.0.0");
+    break;
+  }
   case SM50_SHADER_METAL_320: {
     airVersion->addOperand(
         MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(7), createUnsignedInteger(0)})
@@ -789,6 +796,8 @@ llvm::Error convert_dxbc_pixel_shader(
   }
   SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
   args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
+  if (pShaderInternal->ps_has_inner_coverage_input && !rootsig)
+    return llvm::make_error<UnsupportedFeature>("SV_InnerCoverage requires D3D12 ConservativeRasterization Tier3");
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *stats = nullptr;
   args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &stats);
   SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel = nullptr;
@@ -810,6 +819,7 @@ llvm::Error convert_dxbc_pixel_shader(
     SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
     sig_ctx.dual_source_blending = pso_dual_source_blending;
     sig_ctx.disable_depth_output = pso_disable_depth_output;
+    sig_ctx.captured_pixel = msaa_pixel != nullptr;
     sig_ctx.pull_mode_reg_mask = msaa_pixel ? 0xffffffffu : shader_info->pull_mode_reg_mask;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
@@ -1523,6 +1533,17 @@ dxmt::dxbc::build_argument_tables(dxmt::dxbc::SM50ShaderInternal *shader) {
   auto shader_info = &shader->shader_info;
   auto &binding_table = shader_info->binding_table;
   auto &binding_table_cbuffer = shader_info->binding_table_cbuffer;
+  uint32_t visibility = 0;
+  switch (shader->shader_type) {
+  case microsoft::D3D10_SB_VERTEX_SHADER: visibility = 1; break;
+  case microsoft::D3D11_SB_HULL_SHADER: visibility = 2; break;
+  case microsoft::D3D11_SB_DOMAIN_SHADER: visibility = 3; break;
+  case microsoft::D3D10_SB_GEOMETRY_SHADER: visibility = 4; break;
+  case microsoft::D3D10_SB_PIXEL_SHADER: visibility = 5; break;
+  case microsoft::D3D12_SB_AMPLIFICATION_SHADER: visibility = 6; break;
+  case microsoft::D3D12_SB_MESH_SHADER: visibility = 7; break;
+  default: break;
+  }
 
   uint16_t binding_cbuffer_mask = 0;
   uint16_t binding_sampler_mask = 0;
@@ -1543,6 +1564,10 @@ dxmt::dxbc::build_argument_tables(dxmt::dxbc::SM50ShaderInternal *shader) {
       .Flags =
         MTL_SM50_SHADER_ARGUMENT_BUFFER | MTL_SM50_SHADER_ARGUMENT_READ_ACCESS,
       .StructurePtrOffset = cbv.arg_index,
+      .RegisterSpace = cbv.range.space,
+      .RegisterLowerBound = cbv.range.lower_bound,
+      .RegisterCount = cbv.range.size,
+      .ShaderVisibilityMask = 1u << visibility,
     });
     binding_cbuffer_mask |= (1 << range_id);
   }
@@ -1615,6 +1640,10 @@ dxmt::dxbc::build_argument_tables(dxmt::dxbc::SM50ShaderInternal *shader) {
       .SM50BindingSlot = range_id,
       .Flags = flags,
       .StructurePtrOffset = srv.arg_index,
+      .RegisterSpace = srv.range.space,
+      .RegisterLowerBound = srv.range.lower_bound,
+      .RegisterCount = srv.range.size,
+      .ShaderVisibilityMask = 1u << visibility,
     });
     if (range_id & 64) {
       binding_srv_hi_mask |= (1ULL << (range_id - 64));
@@ -1685,6 +1714,10 @@ dxmt::dxbc::build_argument_tables(dxmt::dxbc::SM50ShaderInternal *shader) {
       .SM50BindingSlot = range_id,
       .Flags = flags,
       .StructurePtrOffset = uav.arg_index,
+      .RegisterSpace = uav.range.space,
+      .RegisterLowerBound = uav.range.lower_bound,
+      .RegisterCount = uav.range.size,
+      .ShaderVisibilityMask = 1u << visibility,
     });
     binding_uav_mask |= (1ULL << range_id);
   }
@@ -1720,6 +1753,7 @@ pRefl->ConstanttBufferTableBindIndex =
   pRefl->UAVSlotMask = masks.uav;
   pRefl->NumConstantBuffers = shader->args_reflection_cbuffer.size();
   pRefl->NumArguments = shader->args_reflection.size();
+  pRefl->HasAtomic64 = 0;
   if (shader->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER ||
       shader->shader_type == microsoft::D3D12_SB_MESH_SHADER ||
       shader->shader_type == microsoft::D3D12_SB_AMPLIFICATION_SHADER) {
@@ -1960,6 +1994,7 @@ static llvm::Error activateRasterOrderedBuffers(llvm::Module &module, unsigned s
     return createStringError(inconvertibleErrorCode(), "ROV marker: invalid fragment signature");
   CallInst *logicalCall = nullptr;
   Value *logicalActive = nullptr;
+  unsigned logicalPositionArgument = ~0u;
   for (auto &block : *original)
     for (auto &instruction : block)
       if (auto *call = dyn_cast<CallInst>(&instruction))
@@ -1976,6 +2011,17 @@ static llvm::Error activateRasterOrderedBuffers(llvm::Module &module, unsigned s
             return createStringError(inconvertibleErrorCode(), "ROV marker: invalid logical coverage");
           logicalCall = call;
           call->setMetadata("dxmt.rov.logical_active", nullptr);
+          if (auto *position = call->getMetadata("dxmt.rov.logical_position")) {
+            auto *index = position->getNumOperands() == 1
+              ? mdconst::dyn_extract<ConstantInt>(position->getOperand(0)) : nullptr;
+            if (!index || !index->getType()->isIntegerTy(32) || index->getZExtValue() >= call->arg_size())
+              return createStringError(inconvertibleErrorCode(), "ROV marker: invalid logical position");
+            auto *type = dyn_cast<FixedVectorType>(call->getArgOperand(index->getZExtValue())->getType());
+            if (!type || type->getNumElements() != 4 || !type->getElementType()->isFloatTy())
+              return createStringError(inconvertibleErrorCode(), "ROV marker: invalid logical position");
+            logicalPositionArgument = index->getZExtValue();
+            call->setMetadata("dxmt.rov.logical_position", nullptr);
+          }
         }
 
   LLVMContext &context = module.getContext();
@@ -2024,7 +2070,7 @@ static llvm::Error activateRasterOrderedBuffers(llvm::Module &module, unsigned s
     return index;
   };
   unsigned positionArg = findBuiltin("air.position");
-  if (positionArg == ~0u) {
+  if (positionArg == ~0u && logicalPositionArgument == ~0u) {
     positionArg = parameters.size();
     parameters.push_back(float4);
     attributes.push_back(MDTuple::get(context, {
@@ -2088,7 +2134,8 @@ static llvm::Error activateRasterOrderedBuffers(llvm::Module &module, unsigned s
   auto *texture = samples == 1 ? static_cast<Value *>(wrapper->getArg(textureArg)) :
     builder.CreateLoad(texturePointer, builder.CreateInBoundsGEP(arrayType,
       wrapper->getArg(textureArg), {builder.getInt32(0), wrapper->getArg(sampleArg)}));
-  auto *position = wrapper->getArg(positionArg);
+  auto *position = logicalPositionArgument == ~0u ? static_cast<Value *>(wrapper->getArg(positionArg))
+    : logicalCall->getArgOperand(logicalPositionArgument);
   Value *coordinate = PoisonValue::get(FixedVectorType::get(i32, 2));
   for (unsigned axis = 0; axis < 2; ++axis)
     coordinate = builder.CreateInsertElement(coordinate,
@@ -2353,8 +2400,8 @@ AIRCONV_API int SM50Compile(
     ((dxmt::dxbc::SM50ShaderInternal *)pShader)->ps_sample_frequency
       ? pixel_pso->sample_mask : 0xffffffffu;
   const bool mark_rov_buffers = !msaa_vertex &&
-    (!msaa_pixel || msaa_pixel->variant == SM50_MSAA_PIXEL ||
-      msaa_pixel->variant == SM50_MSAA_SAMPLE_APP) &&
+    (!msaa_pixel || (msaa_pixel->variant & ~SM50_MSAA_ATOMIC_HELPERS) == SM50_MSAA_PIXEL ||
+      (msaa_pixel->variant & ~SM50_MSAA_ATOMIC_HELPERS) == SM50_MSAA_SAMPLE_APP) &&
     root_signature && SM50NeedsRasterOrderedBufferMarker(pShader, root_signature->bytecode,
       root_signature->bytecode_length);
   const uint32_t marker_samples = pixel_pso && pixel_pso->native_sample_count
@@ -2439,6 +2486,11 @@ AIRCONV_API int SM50Compile(
     if (shader_info.use_samplepos)
       linkSamplePos(*pModule);
 
+    if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
     runOptimizationPasses(*pModule);
     auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
@@ -2461,6 +2513,7 @@ AIRCONV_API int SM50Compile(
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
+  dxmt::dxil::InitializeAtomic64Phase(*pModule, pArgs);
   if (coarse_shading) pModule->addModuleFlag(Module::Error, "dxmt.coarse.snapped", 1);
 
   if (auto err = dxmt::dxbc::convertDXBC(
@@ -2526,10 +2579,23 @@ AIRCONV_API int SM50Compile(
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
 
+  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
   auto compiled = new SM50CompiledBitcodeInternal();
+  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+      delete compiled;
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  }
 
   raw_svector_ostream OS(compiled->vec);
 
@@ -2579,6 +2645,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
+  dxmt::dxil::InitializeAtomic64Phase(*pModule, pHullShaderArgs);
 
   if (auto err = dxmt::dxbc::convert_dxbc_vertex_hull_shader(
         (dxbc::SM50ShaderInternal *)pVertexShader, (dxbc::SM50ShaderInternal *)pHullShader, 
@@ -2597,10 +2664,23 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
     linkSamplePos(*pModule);
   linkTessellation(*pModule);
 
+  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
   auto compiled = new SM50CompiledBitcodeInternal();
+  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+      delete compiled;
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  }
 
   raw_svector_ostream OS(compiled->vec);
 
@@ -2650,6 +2730,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
+  dxmt::dxil::InitializeAtomic64Phase(*pModule, pDomainShaderArgs);
 
   if (auto err = dxmt::dxbc::convert_dxbc_tesselator_domain_shader(
         (dxbc::SM50ShaderInternal *)pDomainShader, FunctionName,
@@ -2678,10 +2759,23 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
       return 1;
     }
 
+  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
   auto compiled = new SM50CompiledBitcodeInternal();
+  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+      delete compiled;
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  }
 
   raw_svector_ostream OS(compiled->vec);
 
@@ -2730,6 +2824,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
+  dxmt::dxil::InitializeAtomic64Phase(*pModule, pVertexShaderArgs);
 
   SM50_SHADER_GS_TESSELLATION_INPUT_DATA *tess_input = nullptr;
   const bool tessellation_input =
@@ -2756,10 +2851,23 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
 
+  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
   auto compiled = new SM50CompiledBitcodeInternal();
+  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+      delete compiled;
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  }
 
   raw_svector_ostream OS(compiled->vec);
 
@@ -2809,6 +2917,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
+  dxmt::dxil::InitializeAtomic64Phase(*pModule, pGeometryShaderArgs);
 
   if (auto err = dxmt::dxbc::convert_dxbc_geometry_shader(
         (dxbc::SM50ShaderInternal *)pGeometryShader, FunctionName,
@@ -2837,10 +2946,23 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
   
+  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
   auto compiled = new SM50CompiledBitcodeInternal();
+  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+      delete compiled;
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
+  }
 
   raw_svector_ostream OS(compiled->vec);
 

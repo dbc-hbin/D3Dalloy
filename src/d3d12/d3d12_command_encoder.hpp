@@ -19,6 +19,9 @@
 #pragma once
 
 #include "d3d12_acceleration_structure.hpp"
+#include "d3d12_atomic64_phase.hpp"
+#include "d3d12_diagnostics.hpp"
+#include "com/com_pointer.hpp"
 #include "airconv_public.h"
 #include "dxmt_buffer.hpp"
 #include "dxmt_texture.hpp"
@@ -26,6 +29,7 @@
 #include "Metal4Query.hpp"
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace dxmt {
@@ -43,6 +47,8 @@ enum class EncoderType {
   Raytracing,
   StandardSwizzle,
   WorkGraph,
+  FenceBarrier,
+  Diagnostic,
 };
 
 struct EncoderData {
@@ -50,10 +56,19 @@ struct EncoderData {
   EncoderData *next = nullptr;
   uint64_t id;
 };
+struct DiagnosticEncoderData : EncoderData {
+  DiagnosticAnnotation annotation;
+};
 
 struct WorkGraphDispatch;
 struct WorkGraphEncoderData : EncoderData {
   std::shared_ptr<WorkGraphDispatch> dispatch;
+};
+struct FenceBarrierEncoderData : EncoderData {
+  struct Operand { Com<ID3D12Fence> fence; uint64_t value; };
+  std::vector<Operand> operands;
+  size_t state_event_index = 0;
+  bool signal = false;
 };
 
 class MTLD3D12Resource;
@@ -64,6 +79,9 @@ struct StandardSwizzleTableUse {
   MTLD3D12DescriptorHeap *heap;
   uint64_t base;
   uint32_t parameter;
+  // Borrowed from the recording-retained PSO, not from a transient shader.
+  std::span<const MTL_SM50_SHADER_ARGUMENT> shader_bindings;
+  bool restrict_to_shader = false;
 };
 struct StandardSwizzleEncoderData : EncoderData {
   // A private COM reference survives the recording's allocator lease through
@@ -83,6 +101,7 @@ struct ClearEncoderData : EncoderData {
   unsigned width;
   unsigned height;
   unsigned depth_plane;
+  WMTProgrammableSamplePositions sample_positions{};
 
   ClearEncoderData() {}
 };
@@ -467,6 +486,9 @@ struct MeshCaptureIndirectData {
  * tile and primitive buffers for every execution; only immutable recorded state
  * and native pipeline handles live here. A bundle replays into a fresh record. */
 struct MSAADrawData {
+  float depth_bounds_min = 0, depth_bounds_max = 1;
+  bool depth_bounds_enabled = false;
+  bool atomic64_phase = false;
   WMT::Buffer statistics_claim;
   uint64_t statistics_claim_offset = 0;
   bool mesh_capture = false;
@@ -485,6 +507,7 @@ struct MSAADrawData {
   WMT::Reference<WMT::RenderPipelineState> coverage_with_depth_pipeline;
   WMT::Reference<WMT::RenderPipelineState> clear_coverage_pipeline;
   WMT::Reference<WMT::RenderPipelineState> gather_depth_pipeline;
+  WMT::Reference<WMT::ComputePipelineState> depth_bounds_probe_pipeline;
   WMT::Reference<WMT::RenderPipelineState> early_depth_pipeline;
   WMT::Reference<WMT::RenderPipelineState> late_depth_pipeline;
   WMT::Reference<WMT::RenderPipelineState> sample_pixel_pipeline;
@@ -528,6 +551,7 @@ struct MSAADrawData {
   bool needs_stream_assembly = false;
   bool single_sample_replay = false;
   bool center_sample_pattern = false;
+  WMTProgrammableSamplePositions sample_positions{};
   /* Variable-rate shading state for coarse variants (SM50_MSAA_TILE_CONTROL.shading_rate, msaa_coarse.hpp
    * kRate* encoding); 0 for fine-rate variants. */
   uint32_t shading_rate = 0;
@@ -543,11 +567,18 @@ inline uint32_t MSAAIndexStride(SM50_MSAA_LINE_MODE line_mode, bool conservative
 }
 
 struct RenderEncoderData : EncoderData {
+  bool depth_bounds_active = false;
+  bool atomic64_phase = false;
+  Com<ID3D12PipelineState> atomic64_pipeline;
+  uint32_t atomic64_tess_workloads = 0, atomic64_gs_instances = 0;
+  Com<ID3D12RootSignature> atomic64_signature;
+  Com<ID3D12DescriptorHeap> atomic64_heap;
   std::array<RenderEncoderColorAttachmentData, 8> colors;
   RenderEncoderDepthAttachmentData depth;
   RenderEncoderStencilAttachmentData stencil;
   uint8_t default_raster_sample_count;
   bool center_sample_pattern = false;
+  WMTProgrammableSamplePositions sample_positions{};
   uint16_t render_target_array_length;
   uint32_t render_target_height;
   uint32_t render_target_width;
@@ -572,6 +603,7 @@ struct RenderEncoderData : EncoderData {
   std::unique_ptr<SOIndirectEncoderData> so_indirect;
   std::unique_ptr<MSAADrawData> msaa_draw;
   std::unique_ptr<std::vector<StandardSwizzleTableUse>> swizzle_tables;
+  std::vector<Atomic64RootBinding> atomic64_roots;
   /* Capture-sized ExecuteIndirect: pass 1 or 2 of a TS+GS `capture_indirect`, or 1 (its only pass) of a GS one;
    * 0: none. The queue appends the per-command draws. */
   std::shared_ptr<const MeshCaptureIndirectData> capture_indirect;
@@ -585,11 +617,47 @@ struct BlitEncoderData : EncoderData {
   wmtcmd_base *cmd_tail;
 };
 
+struct ComputeCastUse {
+  Rc<Texture> texture;
+  Rc<TextureAllocation> allocation;
+  TextureViewKey view;
+  bool writes;
+};
+
+struct IndirectComputeCommandData;
+struct Atomic64IndirectRootField { uint32_t argument_offset; bool writable; uint32_t root_parameter; };
+struct Atomic64IndirectComputeUse {
+  const IndirectComputeCommandData *command = nullptr;
+  uint32_t stride = 0, dispatch_offset = 0;
+  std::vector<Atomic64IndirectRootField> root_fields;
+  WMT::Reference<WMT::Buffer> predicate_buffer;
+  uint64_t predicate_offset = 0;
+};
+struct Atomic64RayDispatchUse {
+  Com<ID3D12StateObject> state_object;
+  Com<ID3D12DescriptorHeap> heap;
+  WMT::Reference<WMT::Buffer> arguments, roots;
+  uint64_t arguments_offset = 0, roots_offset = 0;
+};
 struct ComputeEncoderData : EncoderData {
+  bool atomic64_phase = false;
+  Com<ID3D12PipelineState> atomic64_pipeline;
+  std::vector<Atomic64RootBinding> atomic64_roots;
+  std::vector<Atomic64IndirectComputeUse> atomic64_indirect;
+  std::optional<Atomic64RayDispatchUse> atomic64_ray;
   wmtcmd_compute_nop cmd_head;
   wmtcmd_base *cmd_tail;
+  // State commands carry raw handles; later SetPipelineState/Reset must not
+  // release a compiled pipeline before deferred encoding or recording replay.
+  small_vector<WMT::Reference<WMT::ComputePipelineState>, 4> compiled_pipelines;
+  void RetainPipeline(WMT::ComputePipelineState pipeline) {
+    for (const auto &retained : compiled_pipelines)
+      if (retained.handle == pipeline.handle) return;
+    compiled_pipelines.push_back(pipeline);
+  }
   small_vector<WMT::Reference<WMT::Buffer>, 4> immutable_constant_buffers;
   std::unique_ptr<std::vector<StandardSwizzleTableUse>> swizzle_tables;
+  small_vector<ComputeCastUse, 2> cast_textures;
   /*
    * A ray dispatch binds the compiled pipeline and the intersection function
    * table, and reads the application's shader table buffers. The encoded commands
@@ -600,6 +668,8 @@ struct ComputeEncoderData : EncoderData {
   /* Translator-internal kernel (predication, atomic copy) bound by this pass;
    * the owning list may be released before the queue worker encodes it. */
   WMT::Reference<WMT::ComputePipelineState> internal_pipeline;
+  // GPU VA operands of translator kernels survive list release and every replay.
+  small_vector<Rc<BufferAllocation>, 2> internal_buffer_owners;
   WMT::Reference<WMT::IntersectionFunctionTable> rt_intersection_function_table;
   /**
    * The visible function table is a distinct Metal object from the intersection
@@ -631,6 +701,7 @@ struct ResolveEncoderData : EncoderData {
   WMT::Reference<WMT::RenderPipelineState> pipeline;
   WMT::Reference<WMT::DepthStencilState> depth_stencil_state;
   uint8_t dsv_flags = 0;
+  WMTProgrammableSamplePositions sample_positions{};
   struct {
     int32_t source_delta_x = 0;
     int32_t source_delta_y = 0;
@@ -713,6 +784,7 @@ struct RTASEncoderData : EncoderData {
   bool deferredUpdate = false;
   uint64_t nativeCapacity = 0;
   raytracing::BuildInputs deferredInputs;
+  std::vector<WMT::Reference<WMT::Buffer>> ommInputBuffers;
   raytracing::BufferLocation sourceLocation{}, destinationLocation{};
   RTASOperation operation{};
   WMT::Reference<WMT::MTL4AccelerationStructureDescriptor> descriptor;

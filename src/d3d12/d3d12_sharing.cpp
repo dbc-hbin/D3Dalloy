@@ -10,7 +10,6 @@
 #include "d3d12_sharing.hpp"
 #include "dxgi.h"
 #include "winemetal.h"
-#include "winternl.h"
 #include <cstring>
 #include <cwchar>
 #include <string>
@@ -20,66 +19,11 @@ namespace dxmt::sharing {
 
 namespace {
 
-constexpr uint64_t kMagic = 0x5245485354584d44ull;     // "DMXTSHER"
-constexpr uint64_t kLinkMagic = 0x4b4e494c54584d44ull; // "DMXTLINK"
-constexpr uint32_t kVersion = 1;
 constexpr uint64_t kGranularity = 0x10000;
 constexpr uint64_t kMaxPayload = 1ull << 40;
 
-struct LinkHeader {
-  uint64_t magic;
-  uint8_t token[16];
-  WCHAR section_name[80];
-};
-
 std::mutex registry_mutex;
 std::unordered_map<std::string, std::weak_ptr<SharedObject>> registry;
-
-std::string
-TokenHex(const uint8_t token[16]) {
-  static const char digits[] = "0123456789abcdef";
-  std::string hex(32, '0');
-  for (unsigned i = 0; i < 16; ++i) {
-    hex[i * 2] = digits[token[i] >> 4];
-    hex[i * 2 + 1] = digits[token[i] & 15];
-  }
-  return hex;
-}
-
-/* Last path component of a named kernel object, or empty when the handle is not a named section. */
-std::wstring
-SectionLeafName(HANDLE handle) {
-  using QueryObjectFn = NTSTATUS(WINAPI *)(HANDLE, OBJECT_INFORMATION_CLASS, void *, ULONG, ULONG *);
-  static const auto NtQueryObject = reinterpret_cast<QueryObjectFn>(
-      reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject")));
-  if (!NtQueryObject)
-    return {};
-  alignas(8) uint8_t buffer[1024];
-  ULONG length = 0;
-  if (NtQueryObject(handle, ObjectTypeInformation, buffer, sizeof(buffer), &length))
-    return {};
-  auto *type = reinterpret_cast<PUBLIC_OBJECT_TYPE_INFORMATION *>(buffer);
-  if (type->TypeName.Length != 7 * sizeof(WCHAR) || wcsncmp(type->TypeName.Buffer, L"Section", 7))
-    return {};
-  if (NtQueryObject(handle, ObjectNameInformation, buffer, sizeof(buffer), &length))
-    return {};
-  auto *name = reinterpret_cast<UNICODE_STRING *>(buffer);
-  if (!name->Buffer || !name->Length)
-    return {};
-  std::wstring full(name->Buffer, name->Length / sizeof(WCHAR));
-  auto slash = full.rfind(L'\\');
-  return slash == std::wstring::npos ? full : full.substr(slash + 1);
-}
-
-bool
-EndsWithToken(const std::wstring &leaf, const std::string &hex) {
-  if (leaf.size() < hex.size() + 1 || leaf[leaf.size() - hex.size() - 1] != L'.')
-    return false;
-  for (size_t i = 0; i < hex.size(); ++i)
-    if (leaf[leaf.size() - hex.size() + i] != WCHAR(hex[i]))
-      return false;
-  return true;
-}
 
 bool
 LinkName(const WCHAR *name, WCHAR out[64]) {
@@ -115,11 +59,9 @@ OpenMain(HANDLE section, const uint8_t *expected_token, std::shared_ptr<SharedOb
   auto *header = static_cast<Header *>(MapWhole(section, size));
   if (!header)
     return E_INVALIDARG;
-  const std::string hex = TokenHex(header->token);
-  const bool valid = size >= kPayloadOffset && header->magic == kMagic && header->version == kVersion &&
-                     uint32_t(header->kind) >= uint32_t(Kind::Heap) && uint32_t(header->kind) <= uint32_t(Kind::Fence) &&
-                     header->payload_offset == kPayloadOffset && header->payload_size <= size - kPayloadOffset &&
-                     EndsWithToken(leaf, hex) && (!expected_token || !memcmp(expected_token, header->token, 16));
+  const auto hex = TokenHex(header->token);
+  const bool valid = size >= kPayloadOffset && header->payload_size <= size - kPayloadOffset &&
+                     ValidHeader(*header, leaf, expected_token);
   if (!valid) {
     UnmapViewOfFile(header);
     return E_INVALIDARG;
@@ -128,7 +70,7 @@ OpenMain(HANDLE section, const uint8_t *expected_token, std::shared_ptr<SharedOb
   std::shared_ptr<SharedObject> existing;
   {
     std::lock_guard<std::mutex> lock(registry_mutex);
-    auto it = registry.find(hex);
+    auto it = registry.find(hex.data());
     if (it != registry.end())
       existing = it->second.lock();
   }
@@ -147,7 +89,7 @@ OpenMain(HANDLE section, const uint8_t *expected_token, std::shared_ptr<SharedOb
   adopt(object.get(), own, header, leaf.c_str());
 
   std::lock_guard<std::mutex> lock(registry_mutex);
-  auto &slot = registry[hex];
+  auto &slot = registry[hex.data()];
   if (auto raced = slot.lock()) {
     out = std::move(raced);
     return S_OK;
@@ -263,7 +205,21 @@ SharedObject::lookUpPort() {
 }
 
 HRESULT
-SharedObject::createHandle(const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle) {
+SharedObject::createHandle(const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, LUID creator_luid,
+                           HANDLE *handle) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!header_->adapter.luid.LowPart && !header_->adapter.luid.HighPart) {
+    if (!creator_luid.LowPart && !creator_luid.HighPart)
+      return E_INVALIDARG;
+    AdapterMetadata adapter{};
+    adapter.luid = creator_luid;
+    if (!AdapterTag(header_->token, header_->kind, creator_luid, section_name_ + 6, {}, adapter.tag))
+      return E_FAIL;
+    header_->adapter = adapter;
+    MemoryBarrier();
+  } else if (!ValidAdapter(header_->token, header_->kind, header_->adapter, section_name_ + 6)) {
+    return E_INVALIDARG;
+  }
   (void)access; // Section rights; D3D12 callers pass GENERIC_ALL.
   if (!name) {
     const BOOL inherit = attributes && attributes->bInheritHandle;
@@ -289,6 +245,14 @@ SharedObject::createHandle(const SECURITY_ATTRIBUTES *attributes, DWORD access, 
   }
   memcpy(view->token, header_->token, sizeof(view->token));
   memcpy(view->section_name, section_name_, sizeof(view->section_name));
+  view->version = kVersion;
+  view->kind = header_->kind;
+  view->adapter.luid = header_->adapter.luid;
+  if (!AdapterTag(view->token, view->kind, view->adapter.luid, link_name + 6, section_name_, view->adapter.tag)) {
+    UnmapViewOfFile(view);
+    CloseHandle(link);
+    return E_FAIL;
+  }
   MemoryBarrier();
   view->magic = kLinkMagic;
   UnmapViewOfFile(view);
@@ -307,9 +271,9 @@ Create(Kind kind, uint64_t payload_size, std::shared_ptr<SharedObject> &out) {
       return E_FAIL;
     memcpy(token + i * 4, &value, 4);
   }
-  const std::string hex = TokenHex(token);
+  const auto hex = TokenHex(token);
   WCHAR name[80];
-  swprintf(name, 80, L"Local\\dxmt.share.%u.%hs", unsigned(GetCurrentProcessId()), hex.c_str());
+  swprintf(name, 80, L"Local\\dxmt.share.%u.%hs", unsigned(GetCurrentProcessId()), hex.data());
   const uint64_t payload = (payload_size + kGranularity - 1) & ~(kGranularity - 1);
   const uint64_t total = kPayloadOffset + payload;
   HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, DWORD(total >> 32), DWORD(total),
@@ -341,7 +305,7 @@ Create(Kind kind, uint64_t payload_size, std::shared_ptr<SharedObject> &out) {
   std::lock_guard<std::mutex> lock(registry_mutex);
   for (auto it = registry.begin(); it != registry.end();)
     it = it->second.expired() ? registry.erase(it) : std::next(it);
-  registry[hex] = object;
+  registry[hex.data()] = object;
   out = std::move(object);
   return S_OK;
 }
@@ -364,8 +328,7 @@ Open(HANDLE handle, std::shared_ptr<SharedObject> &out) {
   if (size >= sizeof(LinkHeader))
     memcpy(&copy, link, sizeof(copy));
   UnmapViewOfFile(link);
-  copy.section_name[79] = 0;
-  if (copy.magic != kLinkMagic || wcsncmp(copy.section_name, L"Local\\dxmt.share.", 17))
+  if (!ValidLink(copy, leaf))
     return E_INVALIDARG;
   HANDLE section = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, copy.section_name);
   if (!section)

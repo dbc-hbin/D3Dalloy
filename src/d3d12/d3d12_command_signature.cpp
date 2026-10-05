@@ -278,6 +278,7 @@ public:
       switch (arg.Type) {
       case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
         side_effect = arg.Type;
+        DrawArgumentOffset = packed_size;
         packed_size += sizeof(D3D12_DISPATCH_ARGUMENTS);
         source << "packed_uint3 dispatch;\n";
         break;
@@ -341,18 +342,21 @@ public:
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW: {
         UpdateRootArguments = true;
+        atomic64_root_fields.push_back({uint32_t(packed_size), false, arg.ConstantBufferView.RootParameterIndex});
         packed_size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
         source << "ulong cb_" << i << ";\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: {
         UpdateRootArguments = true;
+        atomic64_root_fields.push_back({uint32_t(packed_size), false, arg.ShaderResourceView.RootParameterIndex});
         packed_size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
         source << "ulong srv_" << i << ";\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
         UpdateRootArguments = true;
+        atomic64_root_fields.push_back({uint32_t(packed_size), true, arg.UnorderedAccessView.RootParameterIndex});
         packed_size += sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
         source << "ulong uav_" << i << ";\n";
         break;

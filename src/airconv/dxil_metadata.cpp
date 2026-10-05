@@ -7,6 +7,7 @@
  */
 
 #include "dxil_converter.hpp"
+#include "dxil_matrix.hpp"
 
 #include <bit>
 #include <cstring>
@@ -443,6 +444,9 @@ OpUsage usageOfOpcode(uint32_t opcode) {
     break;
   case 64: /* SampleCmp */
   case 65: /* SampleCmpLevelZero */
+  case 224: /* SampleCmpLevel */
+  case 254: /* SampleCmpGrad */
+  case 255: /* SampleCmpBias */
     usage.read = true;
     usage.sampled = true;
     usage.compared = true;
@@ -456,12 +460,14 @@ OpUsage usageOfOpcode(uint32_t opcode) {
   case 77: /* RenderTargetGetSampleCount */
   case 81: /* CalculateLOD */
   case 139: /* RawBufferLoad */
+  case 303: /* RawBufferVectorLoad (DXIL 1.9) */
   case 141: /* RawBufferLoad (status) */
     usage.read = true;
     if (opcode == 81)
       usage.sampled = true;
     break;
   case 73: /* TextureGather */
+  case 223: /* TextureGatherRaw */
     usage.read = true;
     usage.sampled = true;
     break;
@@ -471,8 +477,10 @@ OpUsage usageOfOpcode(uint32_t opcode) {
     usage.compared = true;
     break;
   case 67: /* TextureStore */
+  case 225: /* TextureStoreSample */
   case 69: /* BufferStore */
   case 140: /* RawBufferStore */
+  case 304: /* RawBufferVectorStore (DXIL 1.9) */
   case 142: /* RawBufferStore (status) */
     usage.written = true;
     break;
@@ -533,13 +541,20 @@ HandleOrigin resolveHandle(const llvm::Value *handle, unsigned depth = 0) {
     break;
   case 217: /* createHandleFromBinding(opcode, ResBind, index, nonUniform) */
     if (call->arg_size() >= 2) {
-      auto *binding = llvm::dyn_cast_or_null<llvm::ConstantStruct>(call->getArgOperand(1));
-      if (binding && binding->getNumOperands() >= 4) {
-        origin.lower_bound = constantU32(binding->getOperand(0));
-        origin.space = constantU32(binding->getOperand(2));
-        origin.klass = static_cast<ResourceClass>(constantU32(binding->getOperand(3)));
-        origin.has_class = true;
-        origin.has_binding = true;
+      auto *binding = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(1));
+      auto *type = binding ? llvm::dyn_cast<llvm::StructType>(binding->getType()) : nullptr;
+      if (type && type->getNumElements() >= 4 &&
+          (llvm::isa<llvm::ConstantAggregate>(binding) || llvm::isa<llvm::ConstantAggregateZero>(binding))) {
+        auto *lower = llvm::dyn_cast_or_null<llvm::ConstantInt>(binding->getAggregateElement(0u));
+        auto *space = llvm::dyn_cast_or_null<llvm::ConstantInt>(binding->getAggregateElement(2u));
+        auto *klass = llvm::dyn_cast_or_null<llvm::ConstantInt>(binding->getAggregateElement(3u));
+        if (lower && space && klass) {
+          origin.lower_bound = constantU32(lower);
+          origin.space = constantU32(space);
+          origin.klass = static_cast<ResourceClass>(constantU32(klass));
+          origin.has_class = true;
+          origin.has_binding = true;
+        }
       }
     }
     break;
@@ -769,14 +784,93 @@ llvm::Error extractMetadata(
   }
   if (out.stage == Stage::Invalid)
     return createError("DXIL module does not declare a shader model");
+  auto matrix_contract = ValidateMatrixContract(module, out.shader_model_major, out.shader_model_minor);
+  if (!matrix_contract)
+    return matrix_contract.takeError();
   if (out.shader_model_major != 6 ||
-      ((out.shader_model_major << 4) | out.shader_model_minor) > SM50_MAX_DXIL_SHADER_MODEL)
+      (((out.shader_model_major << 4) | out.shader_model_minor) > SM50_MAX_DXIL_SHADER_MODEL &&
+       !(out.shader_model_minor == 10 && *matrix_contract)))
     return createError(llvm::Twine("DXIL shader model ") + llvm::Twine(out.shader_model_major) + "." +
                        llvm::Twine(out.shader_model_minor) + " is not supported (highest supported is " +
                        llvm::Twine(SM50_MAX_DXIL_SHADER_MODEL >> 4) + "." +
                        llvm::Twine(SM50_MAX_DXIL_SHADER_MODEL & 0xf) + ")");
   readVersion(module, "dx.version", out.dxil_major, out.dxil_minor);
   readVersion(module, "dx.valver", out.valver_major, out.valver_minor);
+
+  // Native DXIL vectors are a 1.9 ABI, not a blanket permission for every dx.op
+  // overload. Reject illegal resource/signature/payload overloads before staging.
+  auto validate_type = [&](auto &self, llvm::Type *type, bool single_allowed) -> llvm::Error {
+    if (auto *vector = llvm::dyn_cast<llvm::VectorType>(type)) {
+      auto *fixed = llvm::dyn_cast<llvm::FixedVectorType>(vector);
+      if (!fixed || fixed->getNumElements() > 1024 ||
+          (fixed->getNumElements() == 1 && !single_allowed))
+        return createError("DXIL native vector length must be 2 through 1024 (1 only in library interfaces)");
+    } else if (auto *array = llvm::dyn_cast<llvm::ArrayType>(type)) {
+      return self(self, array->getElementType(), single_allowed);
+    } else if (auto *structure = llvm::dyn_cast<llvm::StructType>(type)) {
+      for (auto *element : structure->elements())
+        if (auto error = self(self, element, single_allowed))
+          return error;
+    }
+    return llvm::Error::success();
+  };
+  for (auto &function : module) {
+    const bool exported = out.stage == Stage::Library && !function.hasLocalLinkage() &&
+                          !function.getName().startswith("dx.op.");
+    if (auto error = validate_type(validate_type, function.getReturnType(), exported))
+      return error;
+    for (auto &argument : function.args())
+      if (auto error = validate_type(validate_type, argument.getType(), exported))
+        return error;
+    for (auto &block : function)
+      for (auto &instruction : block) {
+        if (auto error = validate_type(validate_type, instruction.getType(), exported))
+          return error;
+        if (auto *allocation = llvm::dyn_cast<llvm::AllocaInst>(&instruction))
+          if (auto error = validate_type(validate_type, allocation->getAllocatedType(), false))
+            return error;
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (!call || !call->getCalledFunction() ||
+            !call->getCalledFunction()->getName().startswith("dx.op."))
+          continue;
+        // A library resource object can contain legacy float2/3/4 fields, as
+        // can DXR payload/attribute structs. Those are not native dx.op vector
+        // overloads. The overload suffix and new vector-only opcodes identify
+        // the 1.9 ABI without rejecting older library resource handles.
+        auto suffix = call->getCalledFunction()->getName().rsplit('.').second;
+        bool vectors = suffix.size() > 1 && suffix.front() == 'v' &&
+                       suffix[1] >= '0' && suffix[1] <= '9';
+        if (!call->arg_empty()) {
+          uint32_t opcode = constantU32(call->getArgOperand(0));
+          vectors |= opcode == 303 || opcode == 304 || (opcode >= 309 && opcode <= 311);
+        }
+        if (!vectors)
+          continue;
+        auto matrix_operation = IsMatrixOperation(*call);
+        if (!matrix_operation)
+          return matrix_operation.takeError();
+        if (*matrix_operation)
+          continue;
+        if (call->arg_empty())
+          return createError("native vector dx.op call is missing its opcode");
+        if (out.shader_model_minor < 9 || out.dxil_major != 1 || out.dxil_minor < 9)
+          return createError("native dx.op vectors require Shader Model 6.9 and DXIL 1.9");
+        uint32_t opcode = constantU32(call->getArgOperand(0));
+        const bool allowed = (opcode >= 6 && opcode <= 40) || (opcode >= 46 && opcode <= 49) ||
+            (opcode >= 83 && opcode <= 86) || opcode == 115 || (opcode >= 117 && opcode <= 123) ||
+            opcode == 165 || opcode == 166 || opcode == 303 || opcode == 304 ||
+            (opcode >= 309 && opcode <= 311);
+        if (!allowed)
+          return createError(llvm::Twine("dx.op opcode ") + llvm::Twine(opcode) +
+                             " does not permit native vectors");
+        if (opcode == 115 && call->arg_size() >= 2 && call->getArgOperand(1)->getType()->isVectorTy() &&
+            !call->getType()->isVectorTy())
+          return createError("vector WaveActiveAllEqual must return a componentwise i1 vector");
+      }
+  }
+  for (auto &global : module.globals())
+    if (auto error = validate_type(validate_type, global.getValueType(), false))
+      return error;
 
   llvm::MDNode *entry = selectEntryPoint(module, requested_entry);
   if (!entry && out.stage != Stage::Library)
@@ -789,31 +883,68 @@ llvm::Error extractMetadata(
     return createError("DXIL entry point does not reference a function");
   out.entry_name = entry ? getString(entry, 1) : (requested_entry ? requested_entry : "");
   readThreadGroupSize(getNode(entry, 4), out.num_threads);
-  /* [WaveSize(n)] (tag 11) and SM 6.8 [WaveSize(min, max, preferred)] (tag 23): Apple
-   * simdgroups are always 32 lanes, so only a declaration that admits 32 compiles. */
-  if (llvm::MDNode *properties = getNode(entry, 4)) {
-    uint32_t wave_size = 0;
-    for (unsigned i = 0; i + 1 < properties->getNumOperands(); i += 2) {
+  /* Smaller waves partition an Apple SIMD32. Never accept a requirement for a
+   * cross-SIMD wave: a hidden threadgroup barrier is invalid under divergence. */
+  {
+    llvm::MDNode *properties = getNode(entry, 4);
+    uint32_t wave_size = 32;
+    bool declared = false;
+    auto legal_size = [](uint32_t size) { return size >= 4 && size <= 128 && (size & (size - 1)) == 0; };
+    for (unsigned i = 0; properties && i + 1 < properties->getNumOperands(); i += 2) {
       uint32_t tag = 0;
-      if (!getU32(properties, i, tag) || tag != kDxilWaveSizeTag)
+      if (!getU32(properties, i, tag) || (tag != kDxilWaveSizeTag && tag != kDxilRangedWaveSizeTag))
         continue;
-      /* SM 6.6 encodes the value as `!{i32 n}`. */
+      uint32_t shader_kind = static_cast<uint32_t>(out.stage);
+      readEntryProperty(properties, kDxilShaderKindTag, shader_kind);
+      /* DXIL kind15 is a work-graph node; other stages cannot declare WaveSize. */
+      if (shader_kind != static_cast<uint32_t>(Stage::Compute) && shader_kind != 15)
+        return createError("DXIL WaveSize is legal only on compute and node shaders");
+      if ((tag == kDxilWaveSizeTag && (out.shader_model_minor < 6 ||
+            (out.shader_model_minor >= 8 && !(out.shader_model_minor == 8 && *matrix_contract)))) ||
+          (tag == kDxilRangedWaveSizeTag && out.shader_model_minor < 8))
+        return createError("DXIL WaveSize metadata tag does not match the shader model");
+      if (declared)
+        return createError("DXIL has multiple WaveSize declarations");
+      declared = true;
       llvm::MDNode *node = getNode(properties, i + 1);
-      if (!(node ? getU32(node, 0, wave_size) : getU32(properties, i + 1, wave_size)) || wave_size != 32)
-        return createError(llvm::Twine("DXIL [WaveSize(") + llvm::Twine(wave_size) +
-                           ")] is not supported: the wave size is always 32");
+      uint32_t minimum = 0, maximum = 0, preferred = 0;
+      if (tag == kDxilWaveSizeTag) {
+        if (!node || node->getNumOperands() != 1 || !getU32(node, 0, minimum) || !legal_size(minimum))
+          return createError("DXIL has an invalid fixed WaveSize");
+        maximum = minimum;
+      } else {
+        if (!node || node->getNumOperands() != 3 || !getU32(node, 0, minimum) ||
+            !getU32(node, 1, maximum) || !getU32(node, 2, preferred) || !legal_size(minimum) ||
+            (maximum && (!legal_size(maximum) || maximum < minimum)) ||
+            (preferred && (!maximum || !legal_size(preferred) || preferred < minimum || preferred > maximum)))
+          return createError("DXIL has an invalid ranged WaveSize tuple");
+        if (!maximum)
+          maximum = minimum;
+      }
+      if (minimum > 32)
+        return createError("DXIL WaveSize requirement is unsupported: supported widths are 4, 8, 16 and 32; "
+                           "64/128 require cross-SIMD execution");
+      wave_size = preferred && preferred <= 32 ? preferred : std::min(maximum, 32u);
     }
-    for (unsigned i = 0; i + 1 < properties->getNumOperands(); i += 2) {
-      uint32_t tag = 0;
-      if (!getU32(properties, i, tag) || tag != kDxilRangedWaveSizeTag)
-        continue;
-      llvm::MDNode *range = getNode(properties, i + 1);
-      const uint32_t minimum = getU32Or(range, 0, 0);
-      const uint32_t maximum = getU32Or(range, 1, 0);
-      if (!range || minimum > 32 || (maximum && maximum < 32) || (!maximum && minimum != 32))
-        return createError(llvm::Twine("DXIL [WaveSize(") + llvm::Twine(minimum) + ", " + llvm::Twine(maximum) +
-                           ")] does not admit the wave size 32");
+    /* PSVRuntimeInfo0: 16-byte stage union, followed by expected min/max.
+     * DXC may constrain widths even without an entry WaveSize property. */
+    auto psv = findChunk(bytecode, size, "PSV0");
+    if (psv) {
+      if (psv->size < 28 || readU32(psv->data) < 24 || readU32(psv->data) > psv->size - 4)
+        return createError("DXIL PSV0 runtime wave constraints are truncated");
+      const uint32_t minimum = readU32(psv->data + 20), maximum = readU32(psv->data + 24);
+      if (minimum > maximum)
+        return createError("DXIL PSV0 expected wave range is invalid");
+      if (!declared) {
+        for (wave_size = 32; wave_size >= 4 && wave_size > maximum; wave_size >>= 1) {}
+      }
+      if (wave_size < 4 || wave_size < minimum || wave_size > maximum)
+        return createError("DXIL selected wave width does not satisfy PSV0 expected wave range");
+    } else {
+      llvm::consumeError(psv.takeError()); /* Raw bitcode/library inputs need not have PSV0. */
     }
+    if (declared || wave_size != 32)
+      module.addModuleFlag(llvm::Module::Error, "dxmt.wave-size", wave_size);
   }
   // ForceEarlyDepthStencil is bit 3 in the low word of ShaderFlags (tag 0).
   uint32_t shader_flags = 0;
@@ -895,6 +1026,28 @@ llvm::Error extractMetadata(
           ))
         return err;
     }
+  }
+  // Library handle structs retain legacy short vectors even before SM6.9.
+  // Long vectors, unlike those placeholders, are not legal constant/typed
+  // resource element storage; raw and structured buffers are the only forms.
+  auto wide_storage = [&](auto &self, llvm::Type *type) -> bool {
+    if (auto *vector = llvm::dyn_cast<llvm::FixedVectorType>(type))
+      return vector->getNumElements() > 4;
+    if (auto *array = llvm::dyn_cast<llvm::ArrayType>(type))
+      return self(self, array->getElementType());
+    if (auto *structure = llvm::dyn_cast<llvm::StructType>(type))
+      for (auto *element : structure->elements())
+        if (self(self, element))
+          return true;
+    return false;
+  };
+  for (const auto &resource : out.resources) {
+    if (!resource.symbol || resource.kind == ResourceKind::RawBuffer ||
+        resource.kind == ResourceKind::StructuredBuffer)
+      continue;
+    if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(resource.symbol->stripPointerCasts());
+        global && wide_storage(wide_storage, global->getValueType()))
+      return createError("DXIL long vectors cannot be stored in constant buffers or typed resources");
   }
 
   /* Signature chunks are authoritative for registers, masks and component types;
@@ -1060,6 +1213,7 @@ ParseMetadata(const void *bytecode, size_t size, const char *entry_name) {
   metadata.max_output_register = (*info)->max_output_register;
   metadata.has_coverage_output = (*info)->has_coverage_output;
   metadata.force_early_depth_stencil = (*info)->force_early_depth_stencil;
+  metadata.has_atomic64 = HasDeviceAtomic64(*(*info)->module);
   metadata.input_sig = std::move((*info)->input_sig);
   metadata.output_sig = std::move((*info)->output_sig);
   metadata.patch_constant_sig = std::move((*info)->patch_constant_sig);

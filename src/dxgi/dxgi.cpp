@@ -14,9 +14,6 @@ VendorExtension g_extension_enabled = VendorExtension::None;
 std::once_flag nvext_init;
 
 static void InitializeVendorExtensionNV() {
-#ifdef __i386__
-  return;
-#endif
   HKEY key1 = nullptr, key2 = nullptr, key3 = nullptr;
   auto name1 = L"{41FCC608-8496-4DEF-B43E-7D9BD675A6FF}";
   auto name2 = L"FullPath";

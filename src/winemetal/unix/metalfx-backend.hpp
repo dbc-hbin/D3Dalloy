@@ -47,6 +47,7 @@ struct FrameOperations {
     // temporal scale limit, run MetalFX at the largest exact input multiple and
     // composite it unscaled into the centered, unchanged caller output.
     bool capOutputToTemporalMaxScale = false;
+    bool drawDebugView = false;
 };
 
 enum class ErrorCode : std::uint8_t {

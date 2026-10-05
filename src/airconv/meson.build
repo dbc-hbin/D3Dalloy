@@ -17,6 +17,9 @@ airconv_src = files([
  'dxil_signature.cpp',
  'dxil_resources.cpp',
  'dxil_operations.cpp',
+ 'dxil_atomic64.cpp',
+ 'dxil_fp64.cpp',
+ 'dxil_matrix.cpp',
  'dxil_rt_operations.cpp',
  'dxil_rt_callbacks.cpp',
  'dxil_rt_query.cpp',
@@ -99,6 +102,21 @@ airconv_denorm_ir = metalir_generator.process(
 )
 airconv_denorm_header = hexdump_generator.process(airconv_denorm_ir)
 
+# Integer-only binary64 helpers: C++ accepts SoftFloat's exact control flow; AIR has no f64 ALU.
+airconv_fp64_ir = metalir_generator.process(
+  'shaders/air_fp64.cpp',
+  extra_args: ['-std=c++14', '-O3', '--target=air64-apple-macos14.0', '-fno-fast-math'],
+)
+airconv_fp64_header = hexdump_generator.process(airconv_fp64_ir)
+
+# The immutable-cell protocol requires the formally specified SC32 total order.
+# It is linked only by SM50_SHADER_D3D12_ATOMIC64_PHASE, never normal/D3D11 shaders.
+airconv_atomic64_ir = metalir_generator.process(
+  'shaders/air_atomic64.metal',
+  extra_args: ['-std=metal4.1', '--target=air64-apple-macos27.0', '-fno-fast-math'],
+)
+airconv_atomic64_header = hexdump_generator.process(airconv_atomic64_ir)
+
 # Sampler feedback LOD selection must match the CPU-side D3D12 footprint math exactly.
 airconv_sampler_feedback_ir = metalir_generator.process(
   'shaders/air_sampler_feedback.metal',
@@ -121,8 +139,8 @@ airconv_workgraph_ir = metalir_generator.process(
 )
 airconv_workgraph_header = hexdump_generator.process(airconv_workgraph_ir)
 
-airconv_src += [airconv_shaders_header, airconv_denorm_header, airconv_sampler_feedback_header,
-                airconv_conservative_header, airconv_workgraph_header]
+airconv_src += [airconv_shaders_header, airconv_denorm_header, airconv_fp64_header, airconv_sampler_feedback_header,
+                airconv_conservative_header, airconv_workgraph_header, airconv_atomic64_header]
 
 build_airconv_for_windows = get_option('build_airconv_for_windows')
 

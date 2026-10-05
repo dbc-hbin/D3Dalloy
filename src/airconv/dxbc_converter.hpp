@@ -186,6 +186,7 @@ struct io_binding_map {
   llvm::Value *thread_id_in_group_arg = nullptr;
   llvm::Value *thread_id_in_group_flat_arg = nullptr;
   llvm::Value *coverage_mask_arg = nullptr;
+  llvm::Value *inner_coverage_arg = nullptr;
 
   llvm::Value *domain = nullptr;
   llvm::Value *patch_id = nullptr;
@@ -607,6 +608,8 @@ public:
   uint32_t gs_max_vertex_output = 0;
   uint32_t gs_instance_count = 1;
   uint32_t ps_has_coverage_output = 0;
+  bool ps_has_coverage_input = false;
+  bool ps_has_inner_coverage_input = false;
   uint32_t ps_sample_frequency = 0;
   /* Pixel shader declares ForceEarlyDepthStencil. */
   uint32_t ps_force_early_depth_stencil = 0;

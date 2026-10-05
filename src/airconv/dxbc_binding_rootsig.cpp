@@ -19,6 +19,7 @@
 #include "air_signature.hpp"
 #include "dxbc_converter.hpp"
 #include "dxbc_root_signature.hpp"
+#include "dxil_converter.hpp"
 #include "shader_common.hpp"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -77,7 +78,12 @@ public:
     auto &B = AIR.builder;
     auto TyEntry = llvm::cast<llvm::PointerType>(Entry->getType())->getNonOpaquePointerElementType();
     auto TyStruct = llvm::cast<llvm::StructType>(TyEntry);
-    return B.CreateLoad(TyStruct->getElementType(Index), B.CreateStructGEP(TyStruct, Entry, Index));
+    auto *Load = B.CreateLoad(TyStruct->getElementType(Index), B.CreateStructGEP(TyStruct, Entry, Index));
+    // An SBT local-root field is invocation transport, not the resource data it
+    // points at. Resource lowering emits it after the RT operation transport pass.
+    if (Load->getPointerAddressSpace() == 1 && Load->getModule()->getModuleFlag(dxil::kAtomic64PhaseFlag))
+      Load->setMetadata(dxil::kAtomic64Metadata, llvm::MDNode::get(Load->getContext(), {}));
+    return Load;
   };
 
   /* The root view's status qword (see setup_binding_rootsig), or null when it has none. */
@@ -259,9 +265,9 @@ public:
     auto Table = StaticSamplerTable(Builder);
     if (!Table)
       return {};
-    auto [SamplerH, CubeSampler, Metadata, LodRange] =
+    auto [SamplerH, CubeSampler, Metadata, LodRange, Border, FloatBorder] =
         GetSamplerDescriptor(Builder, Table, Index, Sampler.range.lower_bound, Sampler.arg_index);
-    return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange};
+    return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange, Border, FloatBorder};
   }
 
   llvm::Optional<SamplerDescriptor>
@@ -270,9 +276,9 @@ public:
       uint64_t DescriptorOffset, llvm::Value *Index
   ) {
     auto HeapPointer = GetEntryField(Builder, Entry, Sampler.arg_index);
-    auto [SamplerH, CubeSampler, Metadata, LodRange] =
+    auto [SamplerH, CubeSampler, Metadata, LodRange, Border, FloatBorder] =
         GetSamplerDescriptor(Builder, HeapPointer, Index, Sampler.range.lower_bound, DescriptorOffset);
-    return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange};
+    return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange, Border, FloatBorder};
   }
 
   llvm::Optional<TextureDescirptor>
@@ -323,6 +329,7 @@ public:
       result.RGB32StatusBase = GetDescriptorQword0(Builder, HeapPointer, Index, First, DescriptorOffset);
     } else {
       result.ViewRange = EmulationAddress;
+      result.FormatDefaults = EmulationTag;
     }
     return result;
   }
@@ -347,6 +354,8 @@ public:
   ) {
     auto ResourceKindLogical = air::to_air_resource_type(UAV.resource_type);
     auto ResourceKind = air::lowering_texture_1d_to_2d(ResourceKindLogical);
+    if (ResourceKindLogical == Texture::texture2d_ms || ResourceKindLogical == Texture::texture2d_ms_array)
+      ResourceKind = Texture::texture2d_array;
     auto SampleType = std::visit(
         patterns{
             [](air::MSLInt) { return Texture::sample_int; }, [](air::MSLUint) { return Texture::sample_uint; },
@@ -361,6 +370,12 @@ public:
         GetTextureDescriptor(Builder, HeapPointer, Index, ResourceKind, First, DescriptorOffset);
     auto result = TextureDescirptor{Handle,       Metadata,  UAV.global_coherent, ResourceKind, ResourceKindLogical,
                                     MemoryAccess, SampleType, ResourceKindLogical == Texture::texture3d};
+    if (ResourceKindLogical == Texture::texture2d_ms || ResourceKindLogical == Texture::texture2d_ms_array)
+      result.ViewRange = EmulationAddress;
+    if (ResourceKindLogical == Texture::texture3d) {
+      result.ViewRange = EmulationAddress;
+      result.FormatDefaults = EmulationTag;
+    }
     if (ResourceKindLogical == Texture::texture_buffer) {
       result.StatusBase = EmulationAddress;
       result.StatusView = EmulationTag;
@@ -574,11 +589,11 @@ public:
     auto TySampleHandler = AIR.getSamplerHandleType();
     return llvm::StructType::get(
         AIR.getContext(), {TySampleHandler, TySampleHandler, llvm::Type::getInt64Ty(AIR.getContext()),
-                           llvm::Type::getInt64Ty(AIR.getContext())}
+                           llvm::Type::getInt64Ty(AIR.getContext()), AIR.getIntTy(4), AIR.getIntTy(4)}
     );
   }
 
-  std::tuple<llvm::Value *, llvm::Value *, llvm::Value *, llvm::Value *>
+  std::tuple<llvm::Value *, llvm::Value *, llvm::Value *, llvm::Value *, llvm::Value *, llvm::Value *>
   GetSamplerDescriptor(
       llvm::air::AIRBuilder &AIR, llvm::Value *IntPtr, llvm::Value *Index, RangeId RangeId, uint32_t DescriptorOffset
   ) {
@@ -618,7 +633,13 @@ public:
                 TySamplerDescriptor, B.CreatePointerCast(IntPtr, TySamplerDescriptor->getPointerTo(Space)),
                 {IdxDescriptor, AIR.getInt(3) /* lod range (sampler feedback) */}
             )
-        )
+        ),
+        B.CreateLoad(AIR.getIntTy(4),
+            B.CreateGEP(TySamplerDescriptor, B.CreatePointerCast(IntPtr, TySamplerDescriptor->getPointerTo(Space)),
+                        {IdxDescriptor, AIR.getInt(4) /* exact UINT border */})),
+        B.CreateLoad(AIR.getFloatTy(4), B.CreatePointerCast(
+            B.CreateGEP(TySamplerDescriptor, B.CreatePointerCast(IntPtr, TySamplerDescriptor->getPointerTo(Space)),
+                        {IdxDescriptor, AIR.getInt(5) /* float border */}), AIR.getFloatTy(4)->getPointerTo(Space)))
     };
   }
 
@@ -891,7 +912,7 @@ public:
   bool SamplerHeapIndexed = false;
 
   /**
-   * The 32 byte all-zero descriptor a heap index outside the bound heap resolves to.
+   * The 64 byte all-zero descriptor (also covering samplers) for an out-of-heap index.
    *
    * D3D12 leaves an access through an index past the heap undefined; resolving it to
    * the null descriptor keeps it a null access (reads zero, writes and atomics dropped
@@ -902,7 +923,7 @@ public:
   NullDescriptor(llvm::air::AIRBuilder &AIR) {
     auto &module = *AIR.builder.GetInsertBlock()->getModule();
     constexpr const char *name = "dxmt.heap.null_descriptor";
-    auto *type = llvm::ArrayType::get(llvm::Type::getInt64Ty(AIR.getContext()), 4);
+    auto *type = llvm::ArrayType::get(llvm::Type::getInt64Ty(AIR.getContext()), 8);
     auto *global = module.getGlobalVariable(name, true);
     if (!global) {
       global = new llvm::GlobalVariable(
@@ -957,8 +978,8 @@ public:
     auto [Heap, Slot] = HeapSlot(Builder, true, Index);
     if (!Heap)
       return {};
-    auto [SamplerH, CubeSampler, Metadata, LodRange] = GetSamplerDescriptor(Builder, Heap, Slot, 0, 0);
-    return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange};
+    auto [SamplerH, CubeSampler, Metadata, LodRange, Border, FloatBorder] = GetSamplerDescriptor(Builder, Heap, Slot, 0, 0);
+    return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange, Border, FloatBorder};
   }
 
   virtual llvm::Optional<TextureDescirptor>
@@ -1201,6 +1222,8 @@ setup_binding_rootsig(
   using namespace dxmt::air;
   using namespace dxmt::shader::common;
 
+  if (!module.getModuleFlag("dxmt.d3d12.root-signature"))
+    module.addModuleFlag(llvm::Module::Error, "dxmt.d3d12.root-signature", 1);
   auto binding_map = std::make_unique<RootSignatureBindingMap>();
 
   /*

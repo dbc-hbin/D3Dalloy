@@ -1,7 +1,7 @@
 // Shader Model 6.x feature fixture for owned-d3d12-sm6.cpp. Compile each entry
 // with DXC 1.9: -HV 2021 -T <profile> -E <entry> [-enable-16bit-types].
 // Every result is written to u0 (RWByteAddressBuffer) at the offsets listed per
-// entry; the host fixture recomputes every value on the CPU.
+// entry; LOD cases use analytical targets and independent native mip sampling.
 
 RWByteAddressBuffer Out : register(u0);
 RWByteAddressBuffer Raw : register(u1);
@@ -13,8 +13,7 @@ cbuffer Params : register(b0) {
 // ---------------------------------------------------------------------------
 // cs_wave (cs_6_5, 64 threads = two 32 lane waves). Per lane record of 32 dwords.
 // ---------------------------------------------------------------------------
-[numthreads(64, 1, 1)]
-void cs_wave(uint gi : SV_GroupIndex) {
+void waveBody(uint gi) {
   const uint base = gi * 128;
   const uint lane = WaveGetLaneIndex();
   int s = (int)(gi * 2654435761u) >> 8;    // signed values, some negative
@@ -26,7 +25,7 @@ void cs_wave(uint gi : SV_GroupIndex) {
   Out.Store(base + 12, WaveActiveAllTrue(gi < 1000) ? 1 : 0);
   Out.Store(base + 16, WaveActiveAnyTrue(gi == 37) ? 1 : 0);
   Out.Store4(base + 20, WaveActiveBallot((gi % 3) == 0));
-  Out.Store(base + 36, WaveReadLaneAt(u, 5));
+  Out.Store(base + 36, WaveReadLaneAt(u, 5 % WaveGetLaneCount()));
   Out.Store(base + 40, WaveReadLaneFirst(u));
   Out.Store(base + 44, WaveActiveSum(u));
   Out.Store(base + 48, WaveActiveProduct(gi | 1));
@@ -51,13 +50,24 @@ void cs_wave(uint gi : SV_GroupIndex) {
   Out.Store(base + 124, WaveActiveAllEqual(gi) ? 1 : 0);
 }
 
+[numthreads(64, 1, 1)] void cs_wave(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(4)] [numthreads(64, 1, 1)] void cs_wave4(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(8)] [numthreads(64, 1, 1)] void cs_wave8(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(16)] [numthreads(64, 1, 1)] void cs_wave16(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(4, 128, 4)] [numthreads(64, 1, 1)] void cs_wave_range4(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(4, 128, 8)] [numthreads(64, 1, 1)] void cs_wave_range8(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(4, 128, 16)] [numthreads(64, 1, 1)] void cs_wave_range16(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(4, 128, 32)] [numthreads(64, 1, 1)] void cs_wave_range32(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(4, 128, 64)] [numthreads(64, 1, 1)] void cs_wave_range64(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(4, 16)] [numthreads(64, 1, 1)] void cs_wave_range16max(uint gi : SV_GroupIndex) { waveBody(gi); }
+[WaveSize(4)] [numthreads(64, 1, 1)] void cs_wave_sm68fixed4(uint gi : SV_GroupIndex) { waveBody(gi); }
+
 // ---------------------------------------------------------------------------
 // cs_divergent (cs_6_5): wave ops inside divergent control flow; only lanes with
 // (gi % p0.x) != 0 are active. Record of 16 dwords per lane; inactive lanes write
 // a sentinel.
 // ---------------------------------------------------------------------------
-[numthreads(64, 1, 1)]
-void cs_divergent(uint gi : SV_GroupIndex) {
+void divergentBody(uint gi) {
   const uint base = gi * 64;
   int s = (int)(gi * 2654435761u) >> 8;
   uint u = gi * 2246822519u;
@@ -86,11 +96,15 @@ void cs_divergent(uint gi : SV_GroupIndex) {
 }
 
 // ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)] void cs_divergent(uint gi : SV_GroupIndex) { divergentBody(gi); }
+[WaveSize(4)] [numthreads(64, 1, 1)] void cs_divergent4(uint gi : SV_GroupIndex) { divergentBody(gi); }
+[WaveSize(8)] [numthreads(64, 1, 1)] void cs_divergent8(uint gi : SV_GroupIndex) { divergentBody(gi); }
+[WaveSize(16)] [numthreads(64, 1, 1)] void cs_divergent16(uint gi : SV_GroupIndex) { divergentBody(gi); }
+
 // cs_int64 (cs_6_6): 64 bit arithmetic, shifts, conversions, wave ops and raw
 // 64 bit loads/stores. Raw holds 64 input qwords; 16 qwords of output per lane.
 // ---------------------------------------------------------------------------
-[numthreads(64, 1, 1)]
-void cs_int64(uint gi : SV_GroupIndex) {
+void int64Body(uint gi) {
   const uint base = gi * 128;
   int64_t a = Raw.Load<int64_t>(gi * 8);
   int64_t b = Raw.Load<int64_t>(((gi * 7 + 3) & 63) * 8);
@@ -113,8 +127,13 @@ void cs_int64(uint gi : SV_GroupIndex) {
   Out.Store<int64_t>(base + 96, (int64_t)(int)(a >> 32) + (int64_t)(uint)ua + (int64_t)(float)(int)(a & 0xffff));
   Out.Store<uint64_t>(base + 104, WaveActiveSum(ua) ^ WaveActiveMax(ua));
   Out.Store<int64_t>(base + 112, WaveActiveMin(a) + WavePrefixSum(a));
-  Out.Store<uint64_t>(base + 120, WaveReadLaneAt(ua, 7) + WaveActiveBitXor(ub));
+  Out.Store<uint64_t>(base + 120, WaveReadLaneAt(ua, 7 % WaveGetLaneCount()) + WaveActiveBitXor(ub));
 }
+
+[numthreads(64, 1, 1)] void cs_int64(uint gi : SV_GroupIndex) { int64Body(gi); }
+[WaveSize(4)] [numthreads(64, 1, 1)] void cs_int64wave4(uint gi : SV_GroupIndex) { int64Body(gi); }
+[WaveSize(8)] [numthreads(64, 1, 1)] void cs_int64wave8(uint gi : SV_GroupIndex) { int64Body(gi); }
+[WaveSize(16)] [numthreads(64, 1, 1)] void cs_int64wave16(uint gi : SV_GroupIndex) { int64Body(gi); }
 
 // ---------------------------------------------------------------------------
 // cs_atomic64 (cs_6_6): contended 64 bit atomics through the lock table. Out
@@ -186,21 +205,22 @@ void cs_minprec(uint gi : SV_GroupIndex) {
 // cs_quad_deriv (cs_6_8): compute-shader quad derivatives (2D quad rule), QuadAny/
 // QuadAll, IsHelperLane (false in compute), implicit LOD sampling and
 // CalculateLevelOfDetail, BarrierByMemoryType / Handle. T0 is 64x64 R32_FLOAT with
-// 7 mips, mip m filled with m + 1; S0 is point filtered.
+// 7 mips, mip m filled with m + 1; S0 is point filtered, S1 is mip-linear.
 // ---------------------------------------------------------------------------
 groupshared uint Shared[64];
 Texture2D<float> T0 : register(t0);
 SamplerState S0 : register(s0);
+SamplerState S1 : register(s1);
 [numthreads(8, 8, 1)]
 void cs_quad_deriv(uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
   const uint base = gi * 48;
   // Texel-space gradients (4, 0) and (0, 2): LOD log2(4) = 2. uv_far: (256, 0) → LOD 8.
   const float2 uv = float2(gt.x * 4.0f, gt.y * 2.0f) / 64.0f;
   const float2 uv_far = float2(gt.x * 256.0f, 0.0f) / 64.0f;
-  Out.Store(base + 24, asuint(T0.CalculateLevelOfDetail(S0, uv)));
-  Out.Store(base + 28, asuint(T0.CalculateLevelOfDetailUnclamped(S0, uv)));
-  Out.Store(base + 32, asuint(T0.CalculateLevelOfDetail(S0, uv_far)));
-  Out.Store(base + 36, asuint(T0.CalculateLevelOfDetailUnclamped(S0, uv_far)));
+  Out.Store(base + 24, asuint(T0.CalculateLevelOfDetail(S1, uv)));
+  Out.Store(base + 28, asuint(T0.CalculateLevelOfDetailUnclamped(S1, uv)));
+  Out.Store(base + 32, asuint(T0.CalculateLevelOfDetail(S1, uv_far)));
+  Out.Store(base + 36, asuint(T0.CalculateLevelOfDetailUnclamped(S1, uv_far)));
   Out.Store(base + 40, asuint(T0.Sample(S0, uv)));
   Out.Store(base + 44, asuint(T0.SampleBias(S0, uv, 1.0f)));
   float v = (float)(gt.x * gt.x) + 10.0f * (float)(gt.y * gt.y * gt.y);
@@ -216,6 +236,57 @@ void cs_quad_deriv(uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
   Barrier(Raw, DEVICE_SCOPE);
   Barrier(UAV_MEMORY, DEVICE_SCOPE | GROUP_SYNC);
   Out.Store(base + 20, Raw.Load((63 - gi) * 4));
+}
+
+// ---------------------------------------------------------------------------
+// Independent LOD regressions. Every quad is complete, with uniform control flow.
+cbuffer LodParams : register(b1) {
+  float4 lodBase;
+  float4 lodDx;
+  float4 lodDy;
+};
+[numthreads(2, 2, 1)]
+void cs_lod(uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
+  float2 uv = (lodBase + gt.x * lodDx + gt.y * lodDy).xy;
+  Out.Store(gi * 12, asuint(T0.CalculateLevelOfDetail(S1, uv)));
+  Out.Store(gi * 12 + 4, asuint(T0.CalculateLevelOfDetailUnclamped(S1, uv)));
+  // Sample uses native GPU filtering, not the CalculateLOD lowering under test.
+  // Each resource mip m contains m + 1; p0.x is the view base mip.
+  if (p0.y != 0)
+    Out.Store(gi * 12 + 8, asuint(T0.Sample(S1, uv) - 1.0f - (float)p0.x));
+}
+Texture1D<float> Lod1D : register(t1);
+Texture1DArray<float> Lod1DArray : register(t2);
+Texture2DArray<float> Lod2DArray : register(t3);
+Texture3D<float> Lod3D : register(t4);
+TextureCube<float> LodCube : register(t5);
+TextureCubeArray<float> LodCubeArray : register(t6);
+[numthreads(2, 2, 1)]
+void cs_lod_shapes(uint3 gt : SV_GroupThreadID, uint gi : SV_GroupIndex) {
+  const uint base = gi * 64;
+  float u = 0.25f + gt.x * (4.0f / 64.0f);
+  float slice = (float)(gt.x + 2 * gt.y);
+  float3 a = float3(0.25f + gt.x * (8.0f / 64.0f),
+                    0.25f + gt.y * (2.0f / 32.0f), slice);
+  float3 v = float3(0.25f + gt.x * (2.0f / 64.0f), 0.25f,
+                    0.25f + gt.y * (4.0f / 8.0f));
+  float3 direction = (lodBase + gt.x * lodDx + gt.y * lodDy).xyz;
+  // Array LOD APIs take spatial coordinates only: these query array-view shape
+  // semantics. Only the independent native Sample below receives a slice index.
+  Out.Store(base, asuint(Lod1D.CalculateLevelOfDetail(S1, u)));
+  Out.Store(base + 4, asuint(Lod1D.CalculateLevelOfDetailUnclamped(S1, u)));
+  Out.Store(base + 8, asuint(Lod1DArray.CalculateLevelOfDetail(S1, u)));
+  Out.Store(base + 12, asuint(Lod1DArray.CalculateLevelOfDetailUnclamped(S1, u)));
+  Out.Store(base + 16, asuint(Lod2DArray.CalculateLevelOfDetail(S1, a.xy)));
+  Out.Store(base + 20, asuint(Lod2DArray.CalculateLevelOfDetailUnclamped(S1, a.xy)));
+  Out.Store(base + 24, asuint(Lod3D.CalculateLevelOfDetail(S1, v)));
+  Out.Store(base + 28, asuint(Lod3D.CalculateLevelOfDetailUnclamped(S1, v)));
+  Out.Store(base + 32, asuint(LodCube.CalculateLevelOfDetail(S1, direction)));
+  Out.Store(base + 36, asuint(LodCube.CalculateLevelOfDetailUnclamped(S1, direction)));
+  Out.Store(base + 40, asuint(LodCubeArray.CalculateLevelOfDetail(S1, direction)));
+  Out.Store(base + 44, asuint(LodCubeArray.CalculateLevelOfDetailUnclamped(S1, direction)));
+  if (p0.y != 0)
+    Out.Store(base + 48, asuint(Lod2DArray.Sample(S1, a) - 1.0f));
 }
 
 // ---------------------------------------------------------------------------
@@ -295,26 +366,6 @@ float4 ps_helper(VSOut i) : SV_Target {
 [WaveOpsIncludeHelperLanes]
 float4 ps_helper_all(VSOut i) : SV_Target {
   helperBody(i, 4096);
-  return 0.0f.xxxx;
-}
-
-// Pixel shader 64 bit atomics (the cs_atomic64 body): rejected at pipeline creation.
-float4 ps_atomic64(VSOut i) : SV_Target {
-  const uint2 px = (uint2)i.pos.xy;
-  atomic64Body(px.y * 256 + px.x);
-  return 0.0f.xxxx;
-}
-
-// ---------------------------------------------------------------------------
-// ps_umax64 (ps_6_6): non-returning unsigned 64 bit InterlockedMax/Min. 64 bit atomics
-// are compute-only (no forward-progress guarantee for a graphics-stage lock), so this
-// entry, like ps_atomic64, must fail pipeline creation.
-// ---------------------------------------------------------------------------
-float4 ps_umax64(VSOut i) : SV_Target {
-  const uint2 px = (uint2)i.pos.xy;
-  const uint64_t key = ((uint64_t)(px.y * 256 + px.x + 1) << 32) | (uint64_t)(px.x * 7 + px.y);
-  Raw.InterlockedMax64(0, key);
-  Raw.InterlockedMin64(8, key);
   return 0.0f.xxxx;
 }
 

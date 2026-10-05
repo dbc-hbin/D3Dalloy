@@ -174,6 +174,11 @@ public:
 
 private:
   T *m_ptr = nullptr;
+#if defined(__arm64ec__) || defined(_M_ARM64EC)
+  // LLVM 22 gives a single-field sret owner the same entry-thunk name as a scalar return.
+  // Keep the object layout, but identify the hidden-return-pointer ABI as an aggregate.
+  char arm64ec_thunk_identity[0];
+#endif
 
   void incRef() const {
     if (m_ptr != nullptr)

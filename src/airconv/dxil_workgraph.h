@@ -244,7 +244,8 @@ struct SM50_WG_NODE_COMPILE_DESC {
 struct SM50_WG_NODE_COMPILED_INFO {
   /** Metal threadgroup size the kernel must be dispatched with. */
   uint32_t ThreadgroupSize[3];
-  uint32_t Reserved;
+  /** Device i64 atomics select the exclusive, bounded canonical-cell phase. */
+  uint32_t HasAtomic64;
 };
 
 /**

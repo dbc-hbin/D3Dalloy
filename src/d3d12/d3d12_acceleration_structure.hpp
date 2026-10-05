@@ -1,6 +1,6 @@
 #pragma once
 
-#include "d3d12.h"
+#include "d3d12_interfaces_ext.hpp"
 #include "Metal4.hpp"
 #include <cstdint>
 #include <vector>
@@ -28,9 +28,10 @@ struct AccelerationStructureHeader {
   uint64_t shadowSize;
   /* POSTBUILD_INFO_CURRENT_SIZE: the prebuild size, or the compacted size after compaction. */
   uint64_t currentSize;
-  /* Scratch word Metal writes its (32-bit) compacted native size into before a postbuild pass
-   * turns it into a D3D12 size. */
+  /* Low32 bits of Metal's eight-byte compacted native size write. The ordered
+   * postbuild pass restores reserved0 before any OMM metadata consumer. */
   uint32_t nativeCompactedSize;
+  /* Nonzero for OMM BLAS: the ordered postbuild pass publishes array-reference count + 1. */
   uint32_t reserved0;
   /* The prebuild size of the uncompacted structure: what a deserialization rebuilds. */
   uint64_t deserializedSize;
@@ -82,8 +83,10 @@ struct ShadowGeometry {
   uint64_t indexOffset;
   uint64_t transformOffset;
   uint64_t reserved;
+  uint64_t ommArrayAddress, ommIndexOffset;
+  uint32_t ommIndexStride, ommIndexBytes, ommBase, ommReserved;
 };
-static_assert(sizeof(ShadowGeometry) == 64, "shadow geometry layout");
+static_assert(sizeof(ShadowGeometry) == 96, "shadow geometry layout");
 
 inline constexpr uint32_t kShadowHasTransform = 0x80000000u;
 
@@ -144,6 +147,7 @@ static_assert(sizeof(ShadowParams) == 72, "shadow params layout");
 /* dxmt_as_postbuild operations: the D3D12 postbuild info types, plus the step that turns the
  * Metal compacted size a compaction wrote into the header into the D3D12 current size. */
 inline constexpr uint32_t kPostbuildFinalizeCompactedHeader = 0x100;
+inline constexpr uint32_t kPostbuildRestoreOmmHeader = 0x101;
 
 struct PostbuildParams {
   uint64_t asAddress;
@@ -185,7 +189,7 @@ inline constexpr uint64_t kSerializedHeaderSize = 56;
 static_assert(sizeof(D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER) == kSerializedHeaderSize);
 static_assert(sizeof(D3D12_RAYTRACING_GEOMETRY_DESC) == 56);
 /* Version of the serialized/shadow layout, part of the driver matching identifier. */
-inline constexpr uint64_t kSerializedVersion = 1;
+inline constexpr uint64_t kSerializedVersion = 2;
 
 using ResolveGPUVA = bool (*)(void *context, D3D12_GPU_VIRTUAL_ADDRESS address,
     uint64_t requiredBytes, BufferLocation &location);
@@ -208,6 +212,8 @@ struct Geometry {
   /* Bytes of one vertex position: the packed stride of the shadow copy. */
   uint32_t positionSize = 0;
   bool hasTransform = false;
+  BufferLocation ommArray{}, ommIndices{};
+  uint32_t ommIndexBytes = 0, ommBase = 0, ommIndexStride = 0;
 };
 
 /* D3D12_ELEMENTS_LAYOUT of a top-level build's instance descriptions. */
@@ -224,7 +230,12 @@ struct BuildInputs {
   InstanceLayout instanceLayout = InstanceLayout::Array;
   uint32_t instanceCount = 0;
   uint32_t metalUsage = 0;
+  BufferLocation ommData{}, ommDescs{};
+  uint64_t ommDescStride = 0, ommPackedBytes = 0;
+  uint32_t ommCount = 0;
+  std::vector<D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY> ommHistogram;
 };
+
 
 /* Identity of the acceleration structure stored at a D3D12 address: the allocation it lives in
  * plus the byte offset inside it. */
@@ -267,6 +278,7 @@ bool CalculatePrepassLayout(uint32_t instanceCount, PrepassLayout &layout);
 /* Lay out the shadow copy of `inputs`. Without resolved addresses (prebuild) only the size and the
  * geometry records are meaningful. */
 bool PlanShadow(const BuildInputs &inputs, ShadowPlan &plan);
+bool PlanOmmShadow(const BuildInputs &inputs, const uint8_t *descs, uint64_t bytes, ShadowPlan &plan);
 
 /* What the CPU knows about the structure one published version holds: enough to validate an
  * update against it, to size copies of it and to rebuild it. */
@@ -304,7 +316,7 @@ struct DeserializedStructure {
 HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER &serialized,
     const AccelerationStructureHeader &header, const uint8_t *geometryData, uint64_t geometryBytes,
     uint64_t available, uint64_t registryID,
-    const BufferLocation &destination, DeserializedStructure &result);
+    const BufferLocation &destination, DeserializedStructure &result, uint64_t headerOffset = 0);
 
 } // namespace dxmt::raytracing
 

@@ -51,6 +51,16 @@ public:
 
     setClearColor(color);
 
+    if (texture->reservedVolumeLayoutAddress) {
+      volume_mip_ = texture->view(view).reservedVolumeCastLayoutAddress ? 0 : view.mip_start;
+      first_w_slice_ = first_w_slice;
+      dispatch_depth_ = w_size ? w_size : texture->depth(view);
+      if (!cs_clear_reserved_volume_float_)
+        cs_clear_reserved_volume_float_ = ctx_.getComputePipeline("cs_clear_reserved_volume_float");
+      ctx_.setComputePSO(cs_clear_reserved_volume_float_, {32, 1, 1});
+      return;
+    }
+
     bool is_array = false, is_3d = false;
     switch (texture->textureType(view)) {
     case WMTTextureType1DArray:
@@ -98,6 +108,16 @@ public:
     }
 
     setClearColor(color, view_format);
+
+    if (texture->reservedVolumeLayoutAddress) {
+      volume_mip_ = texture->view(view).reservedVolumeCastLayoutAddress ? 0 : view.mip_start;
+      first_w_slice_ = first_w_slice;
+      dispatch_depth_ = w_size ? w_size : texture->depth(view);
+      if (!cs_clear_reserved_volume_uint_)
+        cs_clear_reserved_volume_uint_ = ctx_.getComputePipeline("cs_clear_reserved_volume_uint");
+      ctx_.setComputePSO(cs_clear_reserved_volume_uint_, {32, 1, 1});
+      return;
+    }
 
     bool is_array = false, is_3d = false;
     switch (texture->textureType(view)) {
@@ -230,7 +250,15 @@ public:
 
     if (clearing_texture_) {
       ctx_.setComputeTexture(0, clearing_texture_, clearing_view_, ResourceAccess::Write);
-      if (clearing_texture_->textureType(clearing_view_) == WMTTextureType3D) {
+      if (clearing_texture_->reservedVolumeLayoutAddress) {
+        struct VolumeClearMetadata {
+          uint64_t layout_address;
+          uint32_t mip, first_w_slice, w_size;
+        } metadata{0, volume_mip_, first_w_slice_, dispatch_depth_};
+        const auto cast_address = clearing_texture_->view(TextureViewKey(clearing_view_)).reservedVolumeCastLayoutAddress;
+        metadata.layout_address = cast_address ? cast_address : clearing_texture_->reservedVolumeLayoutAddress;
+        memcpy(ctx_.setComputeBytes(2, sizeof(metadata)), &metadata, sizeof(metadata));
+      } else if (clearing_texture_->textureType(clearing_view_) == WMTTextureType3D) {
         void *first = ctx_.setComputeBytes(2, sizeof(first_w_slice_));
         memcpy(first, &first_w_slice_, sizeof(first_w_slice_));
       }
@@ -254,10 +282,15 @@ public:
     void *temp = ctx_.setComputeBytes(1, sizeof(meta_temp_));
     memcpy(temp, &meta_temp_, sizeof(meta_temp_));
 
-    if (indirect_arguments)
-      ctx_.dispatchIndirect(indirect_arguments, indirect_offset);
-    else
-      ctx_.dispatch({width, height, dispatch_depth_});
+    const uint32_t samples = clearing_texture_ && clearing_texture_->isWritableMSAAView(clearing_view_)
+        ? clearing_texture_->sampleCount() : 1;
+    for (uint32_t sample = 0; sample < samples; ++sample) {
+      if (sample) ctx_.setComputeTexture(0, clearing_texture_, clearing_view_, ResourceAccess::Write, sample);
+      if (indirect_arguments)
+        ctx_.dispatchIndirect(indirect_arguments, indirect_offset);
+      else
+        ctx_.dispatch({width, height, dispatch_depth_});
+    }
   }
 
   void
@@ -386,11 +419,14 @@ private:
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture2d_array_float_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture3d_uint_;
   WMT::Reference<WMT::ComputePipelineState> cs_clear_texture3d_float_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_reserved_volume_float_;
+  WMT::Reference<WMT::ComputePipelineState> cs_clear_reserved_volume_uint_;
   Rc<Texture> clearing_texture_;
   Rc<Buffer> clearing_buffer_;
   uint64_t clearing_view_ = 0; // type compatible with BufferViewKey
   uint32_t dispatch_depth_ = 1;
   uint32_t first_w_slice_ = 0;
+  uint32_t volume_mip_ = 0;
 
   struct DXMTClearMetadata {
     union {

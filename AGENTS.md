@@ -4,7 +4,14 @@
 
 DXMT-based D3D12-to-Metal translator for Wine on macOS, with an owned DXIL/DXBC-to-AIR/metallib compiler. D3D10/11, DXGI, NVAPI, and NGX support share the runtime. No GPTK/D3DMetal, Apple Metal Shader Converter, or SPIR-V fallback.
 
-Do not expand scope into D3D11. Change it only when necessary for D3D12, and keep such changes minimal.
+The current product scope is running D3D12 games on macOS through Metal, not general Windows graphics/API completeness. Prioritize game rendering correctness, compatibility, performance, presentation, and game-used upscaling/frame-generation/latency paths. A backlog entry or missing API alone does not authorize implementation: establish its relevance to D3D12 games before expanding scope.
+
+Game scope includes optional graphics, display, and performance features, not only the minimum needed to launch. Keep game-used features such as HDR10+ in scope even when uncommon or unsupported by the current native backend. Distinguish game relevance from implementation feasibility: record missing native/platform support as an unresolved limitation, never as evidence that the game feature is unnecessary.
+Game-facing runtime/loader APIs such as Agility SDK configuration and device factories are not developer-only tooling. Use actual game/engine call paths to classify mixed groups such as SDK/Tools or CoreWindow/Composition; do not exclude the whole group by name.
+
+Do not add a WARP/CPU renderer, standalone video decode/process/encode backend, desktop-duplication/capture subsystem, or broad Wine/DirectComposition/tooling implementation merely to close API or P4 checklists. These are outside the current scope unless a concrete D3D12 game requirement is established and the user explicitly approves the expansion. Keep unsupported capabilities honest; do not mark excluded work as implemented.
+
+Do not expand scope into D3D11. Change shared/D3D11 or Wine code only when necessary for a concrete D3D12 game path, keep changes minimal, and obtain explicit approval before extending work into another repository.
 
 Edit root `src/` directly. `README.md` describes the current workflow; `graphics-translator/patches/`, its upstream lock, and `docs/provenance/` preserve the frozen import baseline. Do not regenerate current sources with `scripts/build-owned-graphics.py` or export changes back into historical patches.
 
@@ -15,7 +22,7 @@ Edit root `src/` directly. `README.md` describes the current workflow; `graphics
 - **Shaders:** `src/airconv` parses bytecode, lowers DXIL in place using per-compilation `ModuleInfo`, validates it, and emits AIR/metallib. Mutable LLVM IR must remain local to one compilation/context.
 - **Metal boundary:** Windows WineMetal wrappers send POD parameters through numbered `WINE_UNIX_CALL`s to native Metal handlers. Change wrappers, parameter layouts, call indexes, handlers, and call tables together.
 - **NGX/NVAPI:** translation facades use private DXMT interfaces rather than independent renderers. Preserve cross-DLL ABI contracts.
-- **D3D12 fences:** logical values can rewind; GPU signals use independent monotonic native tokens. Waits latch qualifying completion at API registration or afterward. Consumer workers wait for actual completion, not just producer commit; API callers remain asynchronous. D3D11 retains its separate native fence path.
+- **D3D12 fences:** logical values can rewind. GPU queue signals publish logical completion through validated retirement, not native-token reservation. Waits latch qualifying completion at API registration or afterward; shared fences retain per-observer threshold crossings, while native shared events only wake observers. Consumer workers wait for actual completion, not just producer commit; API callers remain asynchronous. D3D11 retains its separate native fence path.
 
 ## Key Directories
 
@@ -33,46 +40,11 @@ Edit root `src/` directly. `README.md` describes the current workflow; `graphics
 
 ## Development Commands
 
-Run from the repository root with the prerequisites below. Configure a fresh build directory once; subsequently rerun Ninja and install.
+Use [README: build](README.md#빌드) for current root-source build/install commands, [Runtime](graphics-translator/RUNTIME.ko.md) for fresh staging and architecture/module selection, and [Smoke test](graphics-translator/SMOKE-TEST.ko.md) for fixture compilation, CPU/tooling checks and isolated GPU execution. Do not keep a second recipe here.
 
-```sh
-export LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin
-export PATH="$LLVM_MINGW:$PWD/toolchains/tools/bin:$PATH"
-export CC_FOR_BUILD=/usr/bin/clang CXX_FOR_BUILD=/usr/bin/clang++
-meson setup build/local/build . --cross-file build-win64.txt \
-  --prefix "$PWD/build/local/install" --buildtype debugoptimized \
-  -Dwine_builtin_dll=true -Denable_d3d12=true \
-  -Denable_nvapi=true -Denable_nvngx=true \
-  -Dnative_llvm_path=toolchains/llvm-15 \
-  -Dwine_install_path=toolchains/wine-sdk
-ninja -C build/local/build -j8
-meson install -C build/local/build --no-rebuild
-
-python3 scripts/test-owned-graphics-build.py
-python3 scripts/test-owned-graphics-staging.py
-python3 scripts/test-owned-graphics-diagnostics.py
-# Requires a configured cross build and llvm-mingw:
-python3 scripts/test-owned-ngx-frontend.py
-```
+Current support and evidence belong in [CORE](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md); pending work and the user-selected new P3 #15–24 belong in [PRIORITIES](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md). Old completed P0–P3 phases in [HISTORY](graphics-translator/IMPLEMENTATION-HISTORY.ko.md) are different slices. P2 remains pending and ARM64/FEX execution remains on hold.
 
 There is no configured lint target or general application `run` command. Respect applicable `.clang-format` files; do not invent `ninja lint` or package-manager commands.
-
-For GPU execution, first stage a **new** runtime:
-
-```sh
-python3 scripts/stage-owned-graphics.py stage \
-  --dxmt-install build/local/install --wine-source toolchains/wine-runtime \
-  --wine-dest build/local/runtime --with-nvapi --with-nvngx
-```
-
-Compile the selected fixture using the recipe in `README.md`, then run, for example:
-
-```sh
-python3 scripts/test-owned-graphics.py --runtime build/local/runtime \
-  --suite pipeline-cache --fixture build/local/pipeline-cache.exe \
-  --out build/local/cache-proof --validation
-```
-
 Runtime destinations and evidence output directories must be fresh. Never install DLLs into an existing game or live Wine prefix; use a copied runtime and dedicated prefix.
 
 ## Code Conventions & Common Patterns
@@ -96,7 +68,7 @@ Runtime destinations and evidence output directories must be fresh. Never instal
 
 Supported local stack: macOS Xcode/Metal tools, Python 3, Meson 1.10.0, Ninja 1.13 family, llvm-mingw clang 22.1.8, x86_64 native LLVM 15.0.7 static libraries, and an installed Wine SDK. Apple Silicon needs Rosetta for this x86_64 Wine path. Meson's declared minimum is 1.3.0, not the documented toolchain version.
 
-Keep local dependencies under ignored `toolchains/` and outputs under `build/`. Use relative `-Dnative_llvm_path=toolchains/llvm-15` to avoid the documented absolute-path handling issue. No Node/Bun runtime or language package manager is required. `.clangd` points at `build/`; explicitly select `build/local/build` as the compilation-database directory when needed.
+Keep local dependencies under ignored `toolchains/` and outputs under `build/`. Current Meson supports both relative and absolute `native_llvm_path`; examples use `-Dnative_llvm_path=toolchains/llvm-15`. LLVM must be 15.0.7 and match the selected native architecture. No Node/Bun runtime or language package manager is required. `.clangd` points at `build/`; explicitly select the configured build directory (for example `build/local/build`) as the compilation-database directory when needed.
 
 ### Artifact Cleanup During Development
 
@@ -107,8 +79,10 @@ Keep local dependencies under ignored `toolchains/` and outputs under `build/`. 
 
 ## Testing & QA
 
-- The three graphics build/staging/diagnostics scripts above use Python stdlib `unittest`; NGX frontend validation separately checks PE exports and MSVC parameter-facade ABI without GPU execution.
+- When API semantics, native mappings, or completion criteria remain ambiguous or appear blocked after checking the public specification and owned code, MUST consult the GPTK 4 D3DMetal binary before declaring the contract unsupported or unclosable. Inspect the relevant call path and, where executable, use an isolated behavioral probe; distinguish observed behavior from inference.
+- Use a verified pristine reference, not a Yaagl/owned-hooked copy. The recorded GPTK 4.0b2 path, SHA256, and prior evidence are in `graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md` under "P1 계약 범위와 reference"; verify identity before a new investigation. Record the version/hash, relevant symbols or offsets, inputs, and findings. GPTK behavior is compatibility evidence, not a replacement for the public specification or proof that our implementation passes. Do not copy proprietary code or add GPTK as a production dependency/fallback.
+- The build/staging/diagnostics regression scripts listed in the smoke guide use Python stdlib `unittest`; NGX frontend validation separately checks PE exports and MSVC parameter-facade ABI without GPU execution.
 - `-Denable_tests=true` builds manual DX11 samples under `tests/dx11/`; it registers no Meson `test()` cases. `meson test` is not the project regression suite.
 - D3D12 fixtures use `scripts/test-owned-graphics.py`; select the affected suite and enable Metal validation. The runner verifies staged modules, rejects foreign backends/validation errors, and preserves evidence. Standalone `*.test.cpp` files are manual CPU probes, not automatically discovered tests.
 - `scripts/test-owned-metallib.py` and `scripts/test-owned-null-descriptor.py` are native GPU probes requiring built compiler artifacts and Metal tooling.
-- No numeric coverage threshold is configured. Verify the changed behavioral contract; fixture success is not general D3D12/DXR conformance or real-game compatibility. `CreatePipelineLibrary` remains unsupported; do not confuse implemented cached PSO blobs with native Metal pipeline archives.
+- No numeric coverage threshold is configured. Verify the changed behavioral contract; fixture success is not general D3D12/DXR conformance or real-game compatibility. `CreatePipelineLibrary` and `ID3D12PipelineLibrary1` are implemented. Their owned serialized PSO blobs are not native Metal pipeline archives; restoring them still creates native Metal libraries/functions/PSOs. Current support and remaining contracts are in `graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md`; detailed dated evidence is in `graphics-translator/IMPLEMENTATION-HISTORY.ko.md`.

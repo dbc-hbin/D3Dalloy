@@ -1,197 +1,75 @@
-# Owned NVNGX D3D12 contract 보정
+# D3D12 NGX lifecycle·parameter·subrect 계약
 
-2026-09-19 기준 D3D12 NVNGX frontend의 lifecycle, feature handle, output-subrect 계약을
-project-owned translator 쪽에서 보정했다. 이 작업은 upstream 제출용이 아니며 실제 candidate
-`build/owned-graphics-20260919/dxmt`는 수정하지 않았다.
+2026-10-02 현재 루트 `src/nvngx/nvngx_d3d12.cpp`의 계약이다. API 목록/입력 제한은 [frontend](D3D12-NGX-FRONTEND.ko.md), backend 기록·실행은 [integration](NGX-INTEGRATION.ko.md), 실행 레시피는 [NGX-TEST](NGX-TEST.ko.md)가 담당한다. 프로젝트 지원·증거 상태는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md)가 기준이다.
 
-## 정확한 baseline
+## NVIDIA public SDK 기준
 
-- candidate: `build/owned-graphics-20260919/dxmt`
-- DXMT base commit: `7c8dee1c2d73415301ceb7d1fa810861cef4cd67`
-- copy 시 candidate `src/nvngx/nvngx_d3d12.cpp` SHA-256:
-  `8fae693026f44cab7906e7a2c42c334fd60d52b4f756d2907bdb96af8f8c628d`
-- 먼저 적용한 queue-order patch:
-  `graphics-translator/patches/0007-queue-order.patch`
-- 0007 SHA-256:
-  `33ffa6c19792e7aa9b855a806486182bd19f8c11661e69a25ba4e05788fa9dad`
-- private implementation tree:
-  `build/owned-completion-20260919/ngx-contract-work`
-- incremental frontend patch:
-  `graphics-translator/patches/0008-ngx-contracts.patch`
+`external/nvngx/include/{nvsdk_ngx.h,nvsdk_ngx_params.h,nvsdk_ngx_defs.h}`를 ABI 기준으로 사용한다. Vendored snapshot·법적 문서는 변경하지 않는다.
 
-`0007`은 NVNGX source를 바꾸지 않는다. 0008은 위 candidate를 복사하고 0007을 적용한 상태를
-정확한 baseline으로 삼는 incremental patch다. 검증용 별도 copy
-`build/owned-completion-20260919/ngx-contract-verify`에서 0007 뒤 0008을 다시 적용했고,
-결과 `src/nvngx/nvngx_d3d12.cpp` SHA-256은 private implementation과 동일한
-`f2bda509d271105eee4faef5e1183092a98b8609a6bf229ce43e568da01feede`였다.
+- `Shutdown1(device)`는 해당 instance, `Shutdown1(nullptr)`와 deprecated `Shutdown()`은 모든 instance를 종료한다.
+- `NVSDK_NGX_Handle`은 incomplete opaque type이다. release 뒤 invalid이며 caller가 payload를 dereference하는 계약은 없다.
+- SDK API의 caller 동기화 책임은 그대로다. 내부 registry lock·strong reference는 구현 수명 보호이지 API 전체 thread-safety 확장이 아니다.
+- Parameter virtual order는 공식 8 Set + 8 Get + Reset을 따르는 Microsoft C++ ABI다.
 
-## NVIDIA public SDK contract 근거
+## Parameter ownership과 init gate
 
-사용한 local official SDK header는
-`build/dlss-translator-20260918/contract/nvidia/include` 아래에 있다.
+| 함수 | ownership | 종료 |
+|---|---|---|
+| `GetParameters` | NGX-managed | app의 Destroy를 거부; 마지막 device/global shutdown에서 정리 |
+| `AllocateParameters` | app-managed | `DestroyParameters` |
+| `GetCapabilityParameters` | app-managed | `DestroyParameters` |
 
-- `nvsdk_ngx.h` SHA-256:
-  `dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848`
-- `nvsdk_ngx_params.h` SHA-256:
-  `943bc8cc5cdae03b6303016fbad3183636f2335ae27a2d18776798c3b4efabbc`
+세 allocation API는 valid output storage를 먼저 null로 초기화하고, initialized device가 없는 상태에서 `NotInitialized`를 반환한다. Facade 준비 뒤 registry lock 안에서 init gate와 publication을 함께 처리하므로 shutdown 뒤 새 parameter를 게시하는 옛 check/insert race가 없다. Parameter의 `Reset()`은 저장한 key/value를 지우며 backend command를 취소하지 않는다.
 
-`nvsdk_ngx.h`의 Shutdown 설명은 `Shutdown1(device)`가 지정 device instance를 종료하고,
-`Shutdown1(nullptr)`가 모든 instance를 종료한다고 명시한다. deprecated `Shutdown()`의 대체 호출도
-`Shutdown1(nullptr)`다.
+`DLSS.Enable.Output.Subrects`의 capability/managed map 기본값과 create parser fallback은 **0**이다. 이것은 capability grant가 아니라 create-time opt-in이다. Nvidia helper의 `InEnableOutputSubrects` 값을 명시적으로 기록해야 한다.
 
-`nvsdk_ngx_defs.h`는 `NVSDK_NGX_Handle`을 내용이 공개되지 않은 incomplete struct로만 선언한다.
-공식 문서는 CreateFeature가 unique handle을 반환하고 ReleaseFeature 뒤 그 handle이 invalid라고 규정하며,
-handle payload를 dereference하는 public contract는 없다. 따라서 frontend는 backend pointer나 heap object를
-public handle로 노출하지 않고 process lifetime 동안 재사용하지 않는 opaque token 값을 registry key로 사용한다.
+## Device registration·feature handle
 
-SDK header 첫 설명은 NGX method가 thread-safe하지 않고 caller가 동기화를 책임진다고 명시한다. 이번 보정은
-그 계약을 thread-safe API로 확장하지 않는다. 다만 frontend 내부 lifetime race가 stale state를 registry에
-다시 게시하는 문제는 막는다.
+Device registry key는 canonical `IUnknown` identity다. Init마다 별도 bounded registration identity가 있으며 Create는 다음 두 시점을 연결한다.
 
-## frontend 변경
+1. initialized list device와 registration을 검증해 strong reference를 보관한다.
+2. backend state를 registry lock 밖에서 만든다.
+3. 게시 직전 같은 COM identity와 **같은 registration identity**가 남았는지 확인한다.
 
-`NVSDK_NGX_D3D12_Shutdown1(nullptr)`는 이제 `NVNGXD3D12ShutdownAll()`을 호출하고 success를 반환한다.
-모든 device, feature, parameter registry가 같이 비워진다. non-null device는 기존 per-device shutdown 경로를
-그대로 사용한다.
+같은 device를 shutdown/re-init해도 registration은 달라져 in-flight old Create는 `NotInitialized`로 끝난다. 단순 COM pointer 비교만으로 옛 SDK session에 feature를 게시하지 않는다.
 
-기존 feature handle은 `HandleToken`을 heap allocation한 뒤 process lifetime vector에 계속 보관했다.
-ReleaseFeature는 feature registry entry만 지웠기 때문에 create/release 횟수만큼 token heap이 계속 증가했다.
-0008은 이 storage를 제거했다. `uintptr_t` monotonic token을 opaque `NVSDK_NGX_Handle*` 값으로 사용하며
-token counter는 Shutdown 때 reset하지 않는다. address reuse 때문에 released stale handle이 새 feature로
-해석되는 일이 없고, counter 공간을 모두 소비하면 재사용 대신 CreateFeature가 실패한다.
+Handle은 monotonic `uintptr_t` opaque token이다. permanent `HandleToken` heap vector는 없다. Release/global shutdown은 live feature storage를 제거하지만 counter를 되돌리지 않는다. Stale token이 후속 feature에 alias되지 않고 counter 고갈은 실패다. Evaluate는 registry에서 strong reference를 얻은 뒤 backend를 호출한다. **기록된 frame/state/resource의 실행 수명은 public handle의 수명보다 길 수 있다.**
 
-CreateFeature는 backend state를 만드는 동안 device가 shutdown/re-init될 수 있다. Init 때 device registry entry에
-bounded `shared_ptr` registration identity를 부여하고, CreateFeature가 state를 public registry에 넣기 직전에
-같은 COM identity와 같은 registration identity가 아직 존재하는지 다시 확인한다. shutdown된 registration은
-active registry에서 사라지고, in-flight Create가 잡은 reference가 끝나면 해제된다. 같은 device COM identity가
-re-init되더라도 새 registration identity를 받으므로 중간 shutdown/re-init은 `FAIL_NotInitialized`로 끝나며
-late feature publication을 하지 않는다.
+non-null Shutdown1은 해당 device의 feature를 제거한다. 다른 device가 남아 있으면 공통 parameter map은 유지하고, 마지막 device 종료 시 정리한다. Global shutdown은 모든 device·feature·parameter를 정리한다. 이미 기록되어 queue가 retain한 명령을 무효화한다는 뜻은 아니다.
 
-AllocateParameters/GetCapabilityParameters/GetParameters도 기존의 별도 `hasInitializedDevices()` check와
-registry insertion 사이 race를 없앴다. parameter facade를 만든 뒤 registry lock 안에서 device 존재 여부를
-검증하고 삽입한다. 세 함수는 실패 전에 caller output pointer를 null로 초기화한다.
+## Output subrect 계약
 
-D3D12 capability map의 `DLSS.Enable.Output.Subrects` 기본값은 1에서 0으로 바꿨다. NVIDIA D3D12 helper는
-Create 시 caller의 `InEnableOutputSubrects` bool을 이 key에 명시적으로 기록하고, frontend 자체 parse fallback도
-0이다. 따라서 capability map만 가져온 상태가 임의로 output-subrect opt-in이 되는 동작을 제거했다.
-D3D11 parameter map과 ABI는 변경하지 않았다.
+- `OutputSubrectsEnabled=0`: nonzero OutputBaseX/Y는 frontend `UnsupportedParameter`다.
+- `OutputSubrectsEnabled=1`: output base를 backend frame descriptor에 그대로 전달한다. frontend는 추측해 clamp하지 않는다.
+- backend는 `base + logical output`이 backing extent 안에 들어가는지 overflow-safe subtraction으로 검사하고 범위를 벗어나면 `E_INVALIDARG`를 반환한다. Frontend mapping은 `InvalidParameter`다.
+- 실제 scaler 출력은 logical-size private scratch에 쓰고, 요청 rectangle만 app output의 base로 복사한다. rectangle 밖은 변경하지 않는다.
+- 공식 **input** color/depth/motion/bias/translucency offsets도 지원하며 각 resource view 안의 active rectangle을 독립 검사한다. Output의 create-time opt-in과 input bounds는 다른 계약이다([입력 범위](D3D12-NGX-FRONTEND.ko.md#현재-입력-범위)).
 
-OutputBaseX/Y는 더 이상 무조건 UnsupportedParameter가 아니다. create-time
-`DLSS.Enable.Output.Subrects=0`이면 nonzero output base는 계속 `FAIL_UnsupportedParameter`다.
-`DLSS.Enable.Output.Subrects=1`이면 값을 backend frame descriptor에 그대로 전달한다. frontend가 output resource
-boundary를 추측해서 clamp/reject하지 않으며, backend가 logical output extent와 backing resource extent를 보고
-invalid boundary를 `E_INVALIDARG`로 거절하도록 한다. color/depth/motion/bias/translucency input offset의 기존
-unsupported 정책은 그대로다.
+136×136 backing / 128×128 logical의 X=8은 유효, X=9는 범위 초과다. 이 경계는 **record-time contract fixture**가 검사한다. 실제 nonzero output rectangle의 GPU readback/sentinel은 temporal fixture의 `(3,5)` case가 담당한다.
 
-## 새 regression fixture
+## Contract fixture의 판정
 
-기존 `owned-d3d12-ngx.cpp`와 temporal fixture는 수정하지 않았다. 새 fixture는 다음 두 파일이다.
+소스는 `graphics-translator/tests/owned-d3d12-ngx-contracts.cpp`와 `owned-d3d12-ngx-contracts-msvc.cpp`다. 후자는 공식 header를 직접 include하며 main PE는 C helper를 통해 virtual ABI를 소비한다. `nvngx.dll`을 static import하지 않고 system32에서 동적 load하며 owned marker와 backend identity를 확인한다.
 
-- `graphics-translator/tests/owned-d3d12-ngx-contracts-msvc.cpp`
-- `graphics-translator/tests/owned-d3d12-ngx-contracts.cpp`
+Exact result를 요구하는 case:
 
-MSVC ABI translation unit은 official `nvsdk_ngx.h`를 직접 include하고 `NVSDK_NGX_Parameter::Set/Get/Reset`을
-호출한다. 따라서 parameter vtable 순서와 key 이름을 자체 복제하지 않는다. MinGW PE 쪽은 parameter virtual을
-직접 호출하지 않고 C helper를 통해서만 접근한다.
+1. Init 전 Allocate/GetCapability/GetParameters: NotInitialized + null output.
+2. 두 distinct D3D12 device Init: capability/managed map의 subrect default 0.
+3. disabled feature의 nonzero output base: UnsupportedParameter.
+4. enabled feature의 X=8: Success, X=9: InvalidParameter.
+5. 64회 create/release: token 재사용 없음, stale Release는 FeatureNotFound.
+6. 양 device에 feature를 남긴 뒤 Shutdown1(nullptr): 모든 allocation은 NotInitialized + null, 양 handle 모두 FeatureNotFound.
+7. 첫 device만 re-init: Allocate/Destroy 성공, 두 번째 device list의 Create는 NotInitialized, 첫 device per-device Shutdown은 성공.
 
-fixture runtime case는 다음을 exact result로 확인하도록 작성했다.
+최종 marker는 `OWNED_D3D12_NGX_CONTRACTS_PASS`다. **이 fixture 자체는 Evaluate GPU output을 검증하지 않는다.** Lifecycle/subrect record 계약 PASS와 [NGX 8-frame GPU fixture](NGX-TEST.ko.md)는 서로 다른 증거다.
 
-1. Init 전 AllocateParameters/GetCapabilityParameters/GetParameters는 `FAIL_NotInitialized`이고 output pointer는 null이다.
-2. 두 개의 D3D12 device를 Init한 뒤 capability map과 NGX-managed GetParameters map 모두
-   `DLSS.Enable.Output.Subrects` 기본값은 0이다.
-3. create flag가 disabled인 feature의 nonzero OutputBaseX는 `FAIL_UnsupportedParameter`다.
-4. create flag가 enabled인 feature에서 136x136 backing / 128x128 logical output의 X=8 offset은 success다.
-5. 같은 enabled feature에서 X=9는 backend boundary validation을 거쳐 `FAIL_InvalidParameter`다.
-6. 64회 create/release 동안 opaque handle token은 released handle 값을 재사용하지 않고 stale Release는
-   `FAIL_FeatureNotFound`다.
-7. 서로 다른 COM identity의 두 device에 live feature를 하나씩 남긴 상태에서 `Shutdown1(nullptr)`를 호출한다.
-   그 뒤 Allocate/GetCapabilityParameters/GetParameters는 `FAIL_NotInitialized`이고 양쪽 live handle 모두
-   `FAIL_FeatureNotFound`다.
-8. 그 뒤 첫 device만 다시 Init하면 Allocate/Destroy는 다시 성공하지만 두 번째 device command list의
-   CreateFeature는 `FAIL_NotInitialized`다. 마지막 per-device Shutdown1도 success를 요구한다.
+## 2026-09-19 보정 이력
 
-fixture는 nvngx를 import table에 넣지 않고 runtime에 `C:\\windows\\system32\\nvngx.dll`을 직접 load한다.
-loaded DLL에 `own-ngxd3d12` marker가 있는지도 확인한다.
-`requireOwnedBackend()`는 D3D12 backend id `owned-graphics-d3d12`를 요구하며 최종 성공 marker는
-`OWNED_D3D12_NGX_CONTRACTS_PASS`다.
+Frozen `graphics-translator/patches/0008-ngx-contracts.patch`는 `0007-queue-order.patch` 뒤의 당시 candidate에 적용하는 incremental provenance다. 현재 루트에 다시 적용하는 절차가 아니다.
 
-## build validation
+- 당시 DXMT base: `7c8dee1c2d73415301ceb7d1fa810861cef4cd67`
+- 보정 전 frontend SHA-256: `8fae693026f44cab7906e7a2c42c334fd60d52b4f756d2907bdb96af8f8c628d`
+- 당시 0007 SHA-256: `33ffa6c19792e7aa9b855a806486182bd19f8c11661e69a25ba4e05788fa9dad`
+- 당시 보정 후 frontend SHA-256: `f2bda509d271105eee4faef5e1183092a98b8609a6bf229ce43e568da01feede`
 
-fresh Meson configure는 cross compiler path를 명시해서 수행했다.
-
-```sh
-env PATH=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin:/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-graphics-20260919/tools/bin:$PATH \
-  build/owned-graphics-20260919/tools/bin/meson setup --wipe \
-  build/owned-completion-20260919/ngx-contract-meson \
-  build/owned-completion-20260919/ngx-contract-work \
-  --cross-file build/owned-completion-20260919/ngx-contract-work/build-win64.txt \
-  -Dnative_llvm_path=/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-graphics-20260919/llvm \
-  -Dwine_install_path=/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/wine-crossover/host \
-  -Denable_d3d12=true -Denable_nvapi=true -Denable_nvngx=true \
-  --prefix=/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-completion-20260919/install \
-  --buildtype=debugoptimized
-```
-
-frontend DLL build:
-
-```sh
-cd build/owned-completion-20260919/ngx-contract-meson
-env PATH=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin:/Users/hanbinnoh/Documents/zzz-wine-d3dmetal-dx12/build/owned-graphics-20260919/tools/bin:$PATH \
-  ninja src/nvngx/nvngx.dll.postproc
-```
-
-MSVC ABI helper build:
-
-```sh
-/opt/llvm-mingw-20260616-ucrt-macos-universal/bin/x86_64-w64-mingw32-g++ \
-  --target=x86_64-pc-windows-msvc -std=c++20 -fno-exceptions -fno-rtti \
-  -Wall -Wextra -Werror \
-  -Ibuild/dlss-translator-20260918/contract/nvidia/include \
-  -c graphics-translator/tests/owned-d3d12-ngx-contracts-msvc.cpp \
-  -o build/owned-completion-20260919/ngx-contract-fixture/owned-d3d12-ngx-contracts-msvc.obj
-```
-
-PE fixture build:
-
-```sh
-/opt/llvm-mingw-20260616-ucrt-macos-universal/bin/clang++ \
-  --target=x86_64-w64-mingw32 -std=c++17 -O2 -Wall -Wextra -Werror -static \
-  graphics-translator/tests/owned-d3d12-ngx-contracts.cpp \
-  build/owned-completion-20260919/ngx-contract-fixture/owned-d3d12-ngx-contracts-msvc.obj \
-  -o build/owned-completion-20260919/ngx-contract-fixture/owned-d3d12-ngx-contracts.exe \
-  -ld3d12 -luuid
-```
-
-검증 결과:
-
-- nvngx Meson target compile/link/postprocess: PASS
-- contract MSVC helper: AMD64 COFF object, `-Wall -Wextra -Werror`: PASS
-- contract fixture: PE32+ x86-64 console executable, `-Wall -Wextra -Werror`: PASS
-- fixture import table에는 `d3d12.dll!D3D12CreateDevice`와 Windows runtime만 있고 `nvngx.dll` static import는 없음
-- built `nvngx.dll` export table에 Shutdown1/AllocateParameters/GetCapabilityParameters/CreateFeature/
-  EvaluateFeature/ReleaseFeature 존재
-- built nvngx SHA-256:
-  `20aa227073264acf54f579516288663aa4600ca691b1bfabaeca0a22ecbd57dd`
-- MSVC helper SHA-256:
-  `f90c0ba950e507cca3a148d90c8f1d01e944869858f0cfe7eb9d74704ca1bfcc`
-- PE fixture SHA-256:
-  `9e55a545ad3f8ce5e9cdfd1b9fafdec2d52cce7af56e49716ac94345fd7931cd`
-- 0008 patch SHA-256:
-  `446de97c2c0e510b78cfea17e7c2483cef0d1fc29dfc8a0e7faa878f7624bc63`
-
-0008 stack 재현 검증:
-
-```sh
-cp -a build/owned-graphics-20260919/dxmt \
-  build/owned-completion-20260919/ngx-contract-verify-v2
-git -C build/owned-completion-20260919/ngx-contract-verify-v2 apply \
-  ../../../graphics-translator/patches/0007-queue-order.patch
-git -C build/owned-completion-20260919/ngx-contract-verify-v2 apply --check \
-  ../../../graphics-translator/patches/0008-ngx-contracts.patch
-git -C build/owned-completion-20260919/ngx-contract-verify-v2 apply \
-  ../../../graphics-translator/patches/0008-ngx-contracts.patch
-```
-
-runtime fixture는 이 worker에서 실행하지 않았다. GPU/Wine/game 실행은 prime 소유다. 특히 enabled X=8 success와
-X=9 InvalidParameter case는 prime의 backend output-subrect 구현이 합쳐진 뒤 실행해야 한다. 현재 0008의 frontend는
-두 값을 backend까지 정확히 전달하고 create-time opt-in만 검사한다.
+그 작업의 Meson/COFF/PE compile·export 검사는 build-only 관찰이었다. 옛 `build/owned-completion-20260919/ngx-contract-*` 경로는 현재 retained artifact를 보장하지 않는다. Shutdown-null/token leak/subrect 미구현을 **현재 defect로 다시 나열하지 않는다**. 현재 proof 경계와 유실/retained 구분은 [CORE 검증 범위](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)를 따른다.

@@ -1,5 +1,6 @@
 #pragma once
 #include "winemetal.h"
+#include <stddef.h>
 
 /* Append-only Unix ABI 314. All addresses are zero-extended caller addresses;
  * object handles are native 64-bit identities, never truncated by WoW64. */
@@ -10,6 +11,15 @@ struct WMTMetal4Call {
   uint64_t args[16];
   uint64_t ret[8];
 };
+#ifdef __cplusplus
+static_assert(sizeof(WMTMetal4Call) == 200);
+static_assert(offsetof(WMTMetal4Call, args) == 8);
+static_assert(sizeof(WMTCompositionFrame) == 40);
+#else
+_Static_assert(sizeof(struct WMTMetal4Call) == 200, "PE32/PE64/native Metal4 call ABI");
+_Static_assert(offsetof(struct WMTMetal4Call, args) == 8, "Metal4 caller pointer slots ABI");
+_Static_assert(sizeof(struct WMTCompositionFrame) == 40, "PE32 queued composition frame ABI");
+#endif
 struct WMTMetal4SubmissionInfo {
   uint64_t completed;
   obj_handle_t error_handle;
@@ -59,6 +69,10 @@ enum WMTMetal4Operation : uint32_t {
   WMTMetal4ASCopy,
   WMTMetal4ASCompactedSize,
   WMTMetal4ASPrepass,
+  WMTMetal4UseAllocation,
+  WMTMetal4Diagnostic,
+  // args[0]: recording command buffer; args[1]: acquired ordinary/paired drawable.
+  WMTMetal4UseDrawable = 44,
 };
 enum WMTMetal4Stages : uint64_t {
   WMTMetal4StageVertex = 1ull << 0,
@@ -84,6 +98,7 @@ WINEMETAL_API int32_t WMTMetal4Call(struct WMTMetal4Call *params);
 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -92,6 +107,7 @@ int32_t winemetal_metal4_pipeline_call(struct WMTMetal4Call *params);
 int32_t winemetal_metal4_query_call(struct WMTMetal4Call *params);
 int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *params);
 id<MTL4CommandBuffer> winemetal_metal4_command_buffer(obj_handle_t handle);
+void winemetal_composition_drawables(id drawable, id<CAMetalDrawable> *primary, id<CAMetalDrawable> *residual);
 void *winemetal_metal4_split_command_buffer(void *context);
 id<MTL4ComputeCommandEncoder> winemetal_metal4_compute_encoder(obj_handle_t handle);
 id<MTL4RenderCommandEncoder> winemetal_metal4_render_encoder(obj_handle_t handle);

@@ -438,7 +438,8 @@ void rejectLibrary(Fixture &f, const void *data, size_t size, HRESULT expected, 
 void testFeatures(Fixture &f) {
   D3D12_FEATURE_DATA_SHADER_CACHE cache{};
   check(f.device->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE, &cache, sizeof(cache)), "shader cache");
-  if (cache.SupportFlags != (D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO | D3D12_SHADER_CACHE_SUPPORT_LIBRARY))
+  constexpr UINT required = D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO | D3D12_SHADER_CACHE_SUPPORT_LIBRARY;
+  if ((cache.SupportFlags & required) != required)
     fail("shader cache flags", cache.SupportFlags);
   D3D12_FEATURE_DATA_SERIALIZATION serialization{};
   check(f.device->CheckFeatureSupport(D3D12_FEATURE_SERIALIZATION, &serialization, sizeof(serialization)),
@@ -452,6 +453,9 @@ void testFeatures(Fixture &f) {
 }
 
 void testStreamCoverage(Fixture &f) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS2 options{};
+  check(f.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &options, sizeof(options)), "options2");
+  const HRESULT depth_bounds_result = options.DepthBoundsTestSupported ? S_OK : E_INVALIDARG;
   auto create = [&](const Stream &stream, HRESULT expected, const char *label) {
     auto desc = stream.desc();
     void *out = reinterpret_cast<void *>(uintptr_t(1));
@@ -466,6 +470,9 @@ void testStreamCoverage(Fixture &f) {
   DepthStencilOp1 face{D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
                        D3D12_COMPARISON_FUNC_ALWAYS, 0xff, 0xff};
   D3D12_DEPTH_STENCIL_DESC1 bounds{};
+  bounds.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+  bounds.FrontFace = bounds.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                      D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
   bounds.DepthBoundsTestEnable = TRUE;
   create(f.graphicsStream().add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, bounds), E_INVALIDARG,
          "duplicate_depth_stencil_revisions");
@@ -481,7 +488,13 @@ void testStreamCoverage(Fixture &f) {
         .add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
     return s;
   };
-  create(base().add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, bounds), E_INVALIDARG, "depth_bounds_test");
+  create(base().add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, bounds), depth_bounds_result, "depth_bounds_enabled");
+  bounds.DepthBoundsTestEnable = FALSE;
+  create(base().add(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, bounds), S_OK, "depth_bounds_disabled");
+  DepthStencil2 bounds2{FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS, FALSE, face, face, TRUE};
+  create(base().add(kDepthStencil2, bounds2), depth_bounds_result, "depth_bounds2_enabled");
+  bounds2.depthBoundsTestEnable = FALSE;
+  create(base().add(kDepthStencil2, bounds2), S_OK, "depth_bounds2_disabled");
   DepthStencil2 split{FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS, TRUE, face, face, FALSE};
   split.back.readMask = 0x0f;
   // IndependentFrontAndBackStencilRefMaskSupported is TRUE: split masks are a valid PSO.

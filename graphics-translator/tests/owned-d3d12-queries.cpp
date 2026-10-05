@@ -18,7 +18,6 @@ constexpr UINT kWidth = 64;
 constexpr UINT kHeight = 64;
 constexpr UINT64 kFullScreenSamples = UINT64(kWidth) * kHeight;
 constexpr DWORD kFenceTimeoutMs = 15000;
-constexpr UINT64 kTimestampFrequency = 1000000000ull;
 constexpr UINT64 kMetalCounterErrorValue = ~UINT64(0);
 constexpr char kExpectedBackendId[] = "owned-graphics-d3d12";
 
@@ -298,12 +297,215 @@ void recordEmptyDraw(ID3D12GraphicsCommandList* list,
     recordDraw(list, pipeline, rtv, 0);
 }
 
+void runCopyTimestamps(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    constexpr unsigned rounds = 8;
+    constexpr UINT64 rowWords = 9;
+    constexpr UINT64 guard = 0xa5a5a5a5a5a5a5a5ull;
+    constexpr UINT64 copyBytes = 64 * 1024;
+    UINT64 frequency = 0, repeatedFrequency = 0;
+    expectHRESULT(queue->GetTimestampFrequency(nullptr), E_INVALIDARG,
+                  "copy_timestamp_frequency_null_output");
+    check(queue->GetTimestampFrequency(&frequency), "COPY GetTimestampFrequency");
+    check(queue->GetTimestampFrequency(&repeatedFrequency), "COPY GetTimestampFrequency repeat");
+    if (!frequency || frequency != repeatedFrequency)
+        fail("COPY frequency zero or changed");
+    UINT64 gpuBefore = 0, cpuBefore = 0, gpuAfter = 0, cpuAfter = 0;
+    expectHRESULT(queue->GetClockCalibration(nullptr, &cpuBefore), E_INVALIDARG,
+                  "copy_clock_calibration_null_gpu");
+    expectHRESULT(queue->GetClockCalibration(&gpuBefore, nullptr), E_INVALIDARG,
+                  "copy_clock_calibration_null_cpu");
+    const auto calibrate = [&](UINT64& gpu, UINT64& cpu) {
+        LARGE_INTEGER before{}, after{};
+        if (!QueryPerformanceCounter(&before))
+            fail("COPY QPC before calibration");
+        check(queue->GetClockCalibration(&gpu, &cpu), "COPY GetClockCalibration");
+        if (!QueryPerformanceCounter(&after) || !gpu ||
+            cpu < static_cast<UINT64>(before.QuadPart) ||
+            cpu > static_cast<UINT64>(after.QuadPart))
+            fail("COPY calibration CPU sample outside QPC bracket");
+    };
+
+    auto heap = createQueryHeap(device, D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, 3);
+    auto normalHeap = createQueryHeap(device, D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 3);
+    auto readback = createBuffer(device, rounds * rowWords * sizeof(UINT64),
+                                 D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto upload = createBuffer(device, rounds * copyBytes, D3D12_HEAP_TYPE_UPLOAD,
+                               D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto payload = createBuffer(device, rounds * copyBytes, D3D12_HEAP_TYPE_READBACK,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+
+    // The two heap kinds are mutually exclusive across COPY versus DIRECT/COMPUTE.
+    for (auto type : {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                      D3D12_COMMAND_LIST_TYPE_COPY}) {
+        auto* wrongHeap = type == D3D12_COMMAND_LIST_TYPE_COPY ? normalHeap.Get() : heap.Get();
+        const char* resolveCase = type == D3D12_COMMAND_LIST_TYPE_DIRECT ? "direct_copy_heap_resolve_rejected"
+            : type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? "compute_copy_heap_resolve_rejected"
+            : "copy_normal_heap_resolve_rejected";
+        // Existing DIRECT Begin and COPY normal-heap End cases below cover those rows.
+        if (type != D3D12_COMMAND_LIST_TYPE_COPY) {
+            Recording end = createRecording(device, type);
+            end.list->EndQuery(wrongHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            expectHRESULT(end.list->Close(), E_INVALIDARG,
+                          type == D3D12_COMMAND_LIST_TYPE_DIRECT ? "direct_copy_heap_end_rejected"
+                          : "compute_copy_heap_end_rejected");
+        }
+        Recording resolve = createRecording(device, type);
+        resolve.list->ResolveQueryData(wrongHeap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, readback.Get(), 8);
+        expectHRESULT(resolve.list->Close(), E_INVALIDARG, resolveCase);
+        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+            Recording begin = createRecording(device, type);
+            begin.list->BeginQuery(type == D3D12_COMMAND_LIST_TYPE_COPY ? heap.Get() : normalHeap.Get(),
+                                   D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            expectHRESULT(begin.list->Close(), E_INVALIDARG,
+                          type == D3D12_COMMAND_LIST_TYPE_COPY ? "copy_timestamp_begin_rejected"
+                          : "compute_timestamp_begin_rejected");
+        }
+    }
+    {
+        Recording invalid = createRecording(device, D3D12_COMMAND_LIST_TYPE_COPY);
+        invalid.list->EndQuery(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
+        expectHRESULT(invalid.list->Close(), E_INVALIDARG, "copy_timestamp_end_index_rejected");
+    }
+    struct InvalidResolve { const char* name; UINT first; UINT count; UINT64 offset; };
+    const InvalidResolve invalidResolves[] = {
+        {"copy_resolve_index_rejected", 3, 1, 8},
+        {"copy_resolve_count_rejected", 2, 2, 8},
+        {"copy_resolve_count_overflow_rejected", 1, UINT_MAX, 8},
+        {"copy_resolve_alignment_rejected", 0, 1, 4},
+        {"copy_resolve_destination_bounds_rejected", 0, 2, rounds * rowWords * 8 - 8},
+        {"copy_resolve_destination_overflow_rejected", 0, 1, ~UINT64(0) - 7},
+    };
+    for (const auto& test : invalidResolves) {
+        Recording invalid = createRecording(device, D3D12_COMMAND_LIST_TYPE_COPY);
+        invalid.list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                       test.first, test.count, readback.Get(), test.offset);
+        expectHRESULT(invalid.list->Close(), E_INVALIDARG, test.name);
+    }
+    ComPtr<ID3D12Device> otherDevice;
+    check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&otherDevice)),
+          "COPY D3D12CreateDevice(other)");
+    if (otherDevice.Get() == device)
+        fail("COPY cross-device fixture received same device");
+    auto foreignHeap = createQueryHeap(otherDevice.Get(), D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, 1);
+    auto foreignDestination = createBuffer(otherDevice.Get(), 8, D3D12_HEAP_TYPE_READBACK,
+                                           D3D12_RESOURCE_STATE_COPY_DEST);
+    {
+        Recording invalid = createRecording(device, D3D12_COMMAND_LIST_TYPE_COPY);
+        invalid.list->EndQuery(foreignHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        expectHRESULT(invalid.list->Close(), E_INVALIDARG, "copy_cross_device_end_rejected");
+    }
+    {
+        Recording invalid = createRecording(device, D3D12_COMMAND_LIST_TYPE_COPY);
+        invalid.list->ResolveQueryData(foreignHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, readback.Get(), 8);
+        expectHRESULT(invalid.list->Close(), E_INVALIDARG, "copy_cross_device_resolve_heap_rejected");
+    }
+    {
+        Recording invalid = createRecording(device, D3D12_COMMAND_LIST_TYPE_COPY);
+        invalid.list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 1, foreignDestination.Get(), 0);
+        expectHRESULT(invalid.list->Close(), E_INVALIDARG, "copy_cross_device_resolve_destination_rejected");
+    }
+    D3D12_RANGE noRead{0, 0};
+    UINT64* initialized = nullptr;
+    check(readback->Map(0, &noRead, reinterpret_cast<void**>(&initialized)), "COPY guard Map");
+    for (unsigned word = 0; word != rounds * rowWords; ++word)
+        initialized[word] = guard;
+    readback->Unmap(0, nullptr);
+    unsigned char* source = nullptr;
+    check(upload->Map(0, &noRead, reinterpret_cast<void**>(&source)), "COPY upload Map");
+    for (unsigned round = 0; round != rounds; ++round)
+        for (UINT64 byte = 0; byte != copyBytes; ++byte)
+            source[round * copyBytes + byte] = static_cast<unsigned char>((byte * 17 + round * 29) ^ (byte >> 8));
+    upload->Unmap(0, nullptr);
+
+    std::array<Recording, rounds * 3> recordings;
+    for (unsigned round = 0; round != rounds; ++round) {
+        auto& producer = recordings[round * 3];
+        auto& successor = recordings[round * 3 + 1];
+        auto& reuse = recordings[round * 3 + 2];
+        producer = createRecording(device, D3D12_COMMAND_LIST_TYPE_COPY);
+        successor = createRecording(device, D3D12_COMMAND_LIST_TYPE_COPY);
+        reuse = createRecording(device, D3D12_COMMAND_LIST_TYPE_COPY);
+        producer.list->EndQuery(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        for (unsigned copy = 0; copy != 32; ++copy)
+            producer.list->CopyBufferRegion(payload.Get(), round * copyBytes, upload.Get(), round * copyBytes, copyBytes);
+        producer.list->EndQuery(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        successor.list->EndQuery(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+        const UINT64 base = round * rowWords * sizeof(UINT64);
+        successor.list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3, readback.Get(), base + 8);
+        successor.list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1, 1, readback.Get(), base + 40);
+        reuse.list->EndQuery(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        reuse.list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1, 1, readback.Get(), base + 56);
+        check(producer.list->Close(), "COPY producer Close");
+        check(successor.list->Close(), "COPY timestamp-only successor Close");
+        check(reuse.list->Close(), "COPY reused timestamp Close");
+    }
+    calibrate(gpuBefore, cpuBefore);
+    for (auto& recording : recordings) {
+        ID3D12CommandList* lists[] = {recording.list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        recording.list.Reset();
+        recording.allocator.Reset();
+    }
+    heap.Reset();
+    ComPtr<ID3D12Fence> fence;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "COPY CreateFence");
+    check(queue->Signal(fence.Get(), 1), "COPY final Signal");
+    waitFence(fence.Get(), 1);
+    calibrate(gpuAfter, cpuAfter);
+    if (gpuAfter < gpuBefore || cpuAfter < cpuBefore)
+        fail("COPY calibration samples not monotonic");
+    UINT64* values = nullptr;
+    D3D12_RANGE range{0, rounds * rowWords * sizeof(UINT64)};
+    check(readback->Map(0, &range, reinterpret_cast<void**>(&values)), "COPY timestamp readback Map");
+    UINT64 previous = gpuBefore;
+    for (unsigned round = 0; round != rounds; ++round) {
+        const auto* row = values + round * rowWords;
+        const UINT64 pre = row[1], post = row[2], successor = row[3], duplicate = row[5], reused = row[7];
+        if (row[0] != guard || row[4] != guard || row[6] != guard || row[8] != guard ||
+            !pre || pre < previous || post < pre ||
+            successor < post || duplicate != post || reused < successor || reused > gpuAfter ||
+            reused == kMetalCounterErrorValue)
+            fail("COPY timestamp slots, duplicate resolve, guards or queue ordering");
+        previous = reused;
+        std::printf("OWNED_D3D12_QUERY_COPY_VALUES round=%u pre=%llu post=%llu successor=%llu duplicate=%llu reused=%llu guards=1\n",
+                    round, static_cast<unsigned long long>(pre), static_cast<unsigned long long>(post),
+                    static_cast<unsigned long long>(successor), static_cast<unsigned long long>(duplicate),
+                    static_cast<unsigned long long>(reused));
+    }
+    readback->Unmap(0, nullptr);
+    unsigned char* copied = nullptr;
+    D3D12_RANGE payloadRange{0, rounds * copyBytes};
+    check(payload->Map(0, &payloadRange, reinterpret_cast<void**>(&copied)), "COPY payload readback Map");
+    for (unsigned round = 0; round != rounds; ++round)
+        for (UINT64 byte = 0; byte != copyBytes; ++byte)
+            if (copied[round * copyBytes + byte] != static_cast<unsigned char>((byte * 17 + round * 29) ^ (byte >> 8)))
+                fail("COPY timestamp workload payload mismatch");
+    payload->Unmap(0, nullptr);
+    std::printf("OWNED_D3D12_QUERY_COPY_CALIBRATION frequency=%llu gpu_before=%llu gpu_after=%llu cpu_before=%llu cpu_after=%llu qpc_bracket=1\n",
+                static_cast<unsigned long long>(frequency), static_cast<unsigned long long>(gpuBefore),
+                static_cast<unsigned long long>(gpuAfter), static_cast<unsigned long long>(cpuBefore),
+                static_cast<unsigned long long>(cpuAfter));
+    std::puts("OWNED_D3D12_QUERY_COPY_PASS rounds=8 separate_execute=1 same_slot_reuse=1 duplicate_resolve=1 guards=1 payload_bytes=524288 inter_submission_cpu_waits=0 final_fence=1 release_before_completion=1");
+}
+
 int run() {
     requireOwnedBackend();
 
     ComPtr<ID3D12Device> device;
     check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
           "D3D12CreateDevice");
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
+    check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options)),
+          "COPY D3D12_OPTIONS3");
+    if (options.CopyQueueTimestampQueriesSupported != TRUE)
+        fail("COPY timestamp capability not reported");
+    std::puts("OWNED_D3D12_QUERY_COPY_CAP supported=1");
+    D3D12_COMMAND_QUEUE_DESC copyQueueDesc{};
+    copyQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    ComPtr<ID3D12CommandQueue> copyQueue;
+    check(device->CreateCommandQueue(&copyQueueDesc, IID_PPV_ARGS(&copyQueue)),
+          "CreateCommandQueue(COPY)");
+    runCopyTimestamps(device.Get(), copyQueue.Get());
 
     D3D12_COMMAND_QUEUE_DESC queueDesc{};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -315,9 +517,9 @@ int run() {
                   "timestamp_frequency_null_output");
     UINT64 frequency = 0;
     check(queue->GetTimestampFrequency(&frequency), "GetTimestampFrequency");
-    if (frequency != kTimestampFrequency)
-        fail("timestamp frequency is not 1 GHz");
-    std::printf("OWNED_D3D12_QUERY_FREQUENCY ticks_per_second=%llu tick_ns=1\n",
+    if (!frequency)
+        fail("timestamp frequency is zero");
+    std::printf("OWNED_D3D12_QUERY_FREQUENCY ticks_per_second=%llu\n",
                 static_cast<unsigned long long>(frequency));
 
     UINT64 calibratedGpu = 0;
@@ -345,17 +547,6 @@ int run() {
     std::printf("OWNED_D3D12_QUERY_CLOCK_CALIBRATION gpu=%llu cpu_qpc=%llu monotonic=1\n",
                 static_cast<unsigned long long>(calibratedGpu),
                 static_cast<unsigned long long>(calibratedCpu));
-
-    D3D12_COMMAND_QUEUE_DESC copyQueueDesc{};
-    copyQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
-    ComPtr<ID3D12CommandQueue> copyQueue;
-    check(device->CreateCommandQueue(&copyQueueDesc, IID_PPV_ARGS(&copyQueue)),
-          "CreateCommandQueue(COPY)");
-    UINT64 copyFrequency = 0;
-    expectHRESULT(copyQueue->GetTimestampFrequency(&copyFrequency), E_FAIL,
-                  "copy_queue_timestamp_frequency_unsupported");
-    expectHRESULT(copyQueue->GetClockCalibration(&calibratedGpu, &calibratedCpu), E_FAIL,
-                  "copy_queue_clock_calibration_unsupported");
 
     runCreationNegatives(device.Get());
 
@@ -544,6 +735,9 @@ int run() {
     visibilityHeapB.Reset();
 
     ID3D12CommandList* lists[] = {recording.list.Get()};
+    UINT64 executionGpuBefore = 0, executionCpuBefore = 0;
+    check(queue->GetClockCalibration(&executionGpuBefore, &executionCpuBefore),
+          "GetClockCalibration(before query execution)");
     queue->ExecuteCommandLists(1, lists);
 
     // The deferred queue worker snapshots the allocator at Execute. Drop caller
@@ -556,6 +750,19 @@ int run() {
           "CreateFence");
     check(queue->Signal(fence.Get(), 1), "CommandQueue::Signal(query completion)");
     waitFence(fence.Get(), 1);
+    UINT64 executionGpuAfter = 0, executionCpuAfter = 0;
+    check(queue->GetClockCalibration(&executionGpuAfter, &executionCpuAfter),
+          "GetClockCalibration(after query completion)");
+    LARGE_INTEGER qpcFrequency{};
+    if (!QueryPerformanceFrequency(&qpcFrequency) || qpcFrequency.QuadPart <= 0 ||
+        executionGpuAfter <= executionGpuBefore || executionCpuAfter <= executionCpuBefore)
+        fail("execution clock calibration interval invalid");
+    const double calibratedSeconds = double(executionGpuAfter - executionGpuBefore) / double(frequency);
+    const double qpcSeconds = double(executionCpuAfter - executionCpuBefore) / double(qpcFrequency.QuadPart);
+    const double clockErrorSeconds = calibratedSeconds > qpcSeconds
+        ? calibratedSeconds - qpcSeconds : qpcSeconds - calibratedSeconds;
+    if (clockErrorSeconds > 0.005 + qpcSeconds * 0.05)
+        fail("GPU frequency/calibration and Wine QPC intervals disagree");
 
     D3D12_RANGE timestampRange{0, 2 * sizeof(UINT64)};
     UINT64* timestamps = nullptr;
@@ -582,8 +789,12 @@ int run() {
                 static_cast<unsigned long long>(results[2]), static_cast<unsigned long long>(results[3]),
                 static_cast<unsigned long long>(results[4]), static_cast<unsigned long long>(results[5]));
     if (!timestamp0 || !timestamp1 || timestamp0 == kMetalCounterErrorValue ||
-        timestamp1 == kMetalCounterErrorValue || timestamp1 < timestamp0)
+        timestamp1 == kMetalCounterErrorValue || timestamp1 <= timestamp0 ||
+        timestamp0 < executionGpuBefore || timestamp1 > executionGpuAfter)
         fail("GPU timestamp samples invalid/nonmonotonic");
+    std::printf("OWNED_D3D12_QUERY_CLOCK_INTERVAL gpu_seconds=%.9f qpc_seconds=%.9f "
+                "error_seconds=%.9f samples_in_calibration_bracket=1\n",
+                calibratedSeconds, qpcSeconds, clockErrorSeconds);
 
     if (results[0] != 4 * kFullScreenSamples)
         fail("outer overlapping occlusion did not accumulate four passes across ClearState");
@@ -597,6 +808,115 @@ int run() {
         fail("nested binary occlusion visible draw did not normalize to one");
     if (results[5] != 0)
         fail("binary occlusion empty query returned nonzero");
+
+    // A timestamp heap is an opaque GPU resource. Resolving it in a different
+    // command buffer must not require a CPU producer-completion wait. Across
+    // queues, the application explicitly supplies the D3D12 fence dependency.
+    for (unsigned crossQueue = 0; crossQueue != 2; ++crossQueue) {
+        ComPtr<ID3D12CommandQueue> consumerQueue;
+        if (crossQueue)
+            check(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&consumerQueue)),
+                  "CreateCommandQueue(timestamp consumer)");
+        else
+            consumerQueue = queue;
+        auto splitHeap = createQueryHeap(device.Get(), D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2);
+        auto splitReadback = createBuffer(device.Get(), 2 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
+                                          D3D12_RESOURCE_STATE_COPY_DEST);
+        Recording producer = createRecording(device.Get());
+        producer.list->EndQuery(splitHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        for (unsigned draw = 0; draw != 32; ++draw)
+            recordVisibleDraw(producer.list.Get(), pipeline, rtv);
+        producer.list->EndQuery(splitHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        check(producer.list->Close(), "split timestamp producer Close");
+        Recording consumer = createRecording(device.Get());
+        consumer.list->ResolveQueryData(splitHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                        0, 2, splitReadback.Get(), 0);
+        check(consumer.list->Close(), "split timestamp consumer Close");
+        splitHeap.Reset();
+        ComPtr<ID3D12Fence> orderingFence;
+        check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&orderingFence)),
+              "CreateFence(split timestamp)");
+        UINT64 splitGpuBefore = 0, splitCpuBefore = 0;
+        check(queue->GetClockCalibration(&splitGpuBefore, &splitCpuBefore),
+              "GetClockCalibration(before split timestamp)");
+        ID3D12CommandList* producerLists[] = {producer.list.Get()};
+        queue->ExecuteCommandLists(1, producerLists);
+        if (crossQueue) {
+            check(queue->Signal(orderingFence.Get(), 1), "Signal(timestamp producer)");
+            check(consumerQueue->Wait(orderingFence.Get(), 1), "Wait(timestamp consumer GPU)");
+        }
+        ID3D12CommandList* consumerLists[] = {consumer.list.Get()};
+        consumerQueue->ExecuteCommandLists(1, consumerLists);
+        producer.list.Reset(); producer.allocator.Reset();
+        consumer.list.Reset(); consumer.allocator.Reset();
+        check(consumerQueue->Signal(orderingFence.Get(), 2), "Signal(timestamp consumer)");
+        waitFence(orderingFence.Get(), 2);
+        UINT64 splitGpuAfter = 0, splitCpuAfter = 0;
+        check(consumerQueue->GetClockCalibration(&splitGpuAfter, &splitCpuAfter),
+              "GetClockCalibration(after split timestamp)");
+        UINT64* splitValues = nullptr;
+        check(splitReadback->Map(0, &timestampRange, reinterpret_cast<void**>(&splitValues)),
+              "split timestamp readback Map");
+        const UINT64 splitStart = splitValues[0], splitEnd = splitValues[1];
+        splitReadback->Unmap(0, nullptr);
+        if (!splitStart || splitEnd <= splitStart || splitStart < splitGpuBefore || splitEnd > splitGpuAfter)
+            fail("split timestamp resolve lost producer data or ordering");
+        std::printf("OWNED_D3D12_QUERY_SPLIT_PASS cross_queue=%u delta_ticks=%llu "
+                    "gpu_fence_dependency=%u release_before_completion=1\n", crossQueue,
+                    static_cast<unsigned long long>(splitEnd - splitStart), crossQueue);
+    }
+
+    // A timestamp at the start of its own submission must wait for the end
+    // sample of preceding queue work, not merely commands in its own buffer.
+    // Resolve before reusing slot zero, with no CPU waits between submissions.
+    constexpr unsigned orderingRounds = 8;
+    auto orderingHeap = createQueryHeap(device.Get(), D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2);
+    auto orderingReadback = createBuffer(device.Get(), orderingRounds * 3 * sizeof(UINT64),
+                                         D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::array<Recording, orderingRounds * 3> orderingLists;
+    for (unsigned round = 0; round != orderingRounds; ++round) {
+        auto& producer = orderingLists[round * 3];
+        auto& successor = orderingLists[round * 3 + 1];
+        auto& reuse = orderingLists[round * 3 + 2];
+        producer = createRecording(device.Get());
+        successor = createRecording(device.Get());
+        reuse = createRecording(device.Get());
+        for (unsigned draw = 0; draw != 2048; ++draw)
+            recordVisibleDraw(producer.list.Get(), pipeline, rtv);
+        producer.list->EndQuery(orderingHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        successor.list->EndQuery(orderingHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        successor.list->ResolveQueryData(orderingHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                         0, 2, orderingReadback.Get(), round * 3 * sizeof(UINT64));
+        reuse.list->EndQuery(orderingHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        reuse.list->ResolveQueryData(orderingHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     0, 1, orderingReadback.Get(), (round * 3 + 2) * sizeof(UINT64));
+        check(producer.list->Close(), "bottom-of-pipe producer Close");
+        check(successor.list->Close(), "bottom-of-pipe successor Close");
+        check(reuse.list->Close(), "bottom-of-pipe reuse Close");
+    }
+    for (auto& commands : orderingLists) {
+        ID3D12CommandList* submitted[] = {commands.list.Get()};
+        queue->ExecuteCommandLists(1, submitted);
+    }
+    check(queue->Signal(fence.Get(), 2), "Signal(bottom-of-pipe completion)");
+    waitFence(fence.Get(), 2);
+    D3D12_RANGE orderingRange{0, orderingRounds * 3 * sizeof(UINT64)};
+    UINT64* ordered = nullptr;
+    check(orderingReadback->Map(0, &orderingRange, reinterpret_cast<void**>(&ordered)),
+          "bottom-of-pipe readback Map");
+    for (unsigned round = 0; round != orderingRounds; ++round) {
+        const UINT64 end = ordered[round * 3], next = ordered[round * 3 + 1], reused = ordered[round * 3 + 2];
+        std::printf("OWNED_D3D12_QUERY_BOP_VALUES round=%u end=%llu successor=%llu reused=%llu\n", round,
+                    static_cast<unsigned long long>(end), static_cast<unsigned long long>(next),
+                    static_cast<unsigned long long>(reused));
+        if (!end || end == kMetalCounterErrorValue || next == kMetalCounterErrorValue ||
+            reused == kMetalCounterErrorValue || next < end || reused < next ||
+            (round && end < ordered[round * 3 - 1]))
+            fail("cross-submission bottom-of-pipe timestamp ordering or same-slot reuse");
+    }
+    orderingReadback->Unmap(0, nullptr);
+    std::printf("OWNED_D3D12_QUERY_BOP_PASS rounds=%u separate_execute=1 same_slot_reuse=1 "
+                "inter_submission_cpu_waits=0\n", orderingRounds);
 
     std::printf(
         "OWNED_D3D12_QUERY_TIMESTAMP_PASS frequency=%llu t0=%llu t1=%llu delta_ticks=%llu "
@@ -618,9 +938,9 @@ int run() {
         static_cast<unsigned long long>(kFullScreenSamples));
     std::puts(
         "OWNED_D3D12_QUERY_PASS timestamp=1 occlusion=1 binary_occlusion=1 "
-        "frequency_1ghz=1 gpu_resolve=1 release_before_completion=1 no_cpu_timestamp=1 "
+        "frequency_valid=1 gpu_resolve=1 release_before_completion=1 no_cpu_timestamp=1 "
         "overlap=1 crossheap=1 visible_empty_preserve=1 cross_device_validation=1 "
-        "closed_list_guard=1 copy_timestamp_rejected=1 clear_state_preserves_queries=1 "
+        "closed_list_guard=1 copy_timestamp=1 copy_normal_timestamp_rejected=1 clear_state_preserves_queries=1 "
         "failed_close_allocator_reuse=1 active_resolve_rejected=1");
     return 0;
 }

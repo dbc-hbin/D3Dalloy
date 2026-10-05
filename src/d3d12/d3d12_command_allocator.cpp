@@ -197,6 +197,9 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
       switch (next->type) {
       case EncoderType::Null:
         break;
+      case EncoderType::Diagnostic:
+        static_cast<DiagnosticEncoderData *>(next)->~DiagnosticEncoderData();
+        break;
       case EncoderType::Clear:
         reinterpret_cast<ClearEncoderData *>(next)->~ClearEncoderData();
         break;
@@ -233,6 +236,9 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
         break;
       case EncoderType::WorkGraph:
         reinterpret_cast<WorkGraphEncoderData *>(next)->~WorkGraphEncoderData();
+        break;
+      case EncoderType::FenceBarrier:
+        reinterpret_cast<FenceBarrierEncoderData *>(next)->~FenceBarrierEncoderData();
         break;
       case EncoderType::StandardSwizzle: {
         auto *record = reinterpret_cast<StandardSwizzleEncoderData *>(next);
@@ -340,6 +346,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
     cmd_setpso_res.type = WMTComputeCommandSetPSO;
     cmd_setpso_res.pso = pCmdSig->compute_resolver;
     cmd_setpso_res.threadgroup_size = {1, 1, 1};
+    static_cast<ComputeEncoderData *>(encoder_current)->RetainPipeline(WMT::ComputePipelineState{cmd_setpso_res.pso});
 
     auto &cmd_argbuf_res = EncodeComputeCommand<wmtcmd_compute_setbuffer>();
     cmd_argbuf_res.type = WMTComputeCommandSetBuffer;
@@ -354,6 +361,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
     cmd_setpso.type = WMTComputeCommandSetPSO;
     cmd_setpso.pso = indirect_pso;
     cmd_setpso.threadgroup_size = pPSO->threadgroup_size; // not really used
+    static_cast<ComputeEncoderData *>(encoder_current)->RetainPipeline(indirect_pso);
   }
 
   auto &cmd = EncodeComputeCommand<wmtcmd_compute_executecommands>();
@@ -365,6 +373,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
   restore.type = WMTComputeCommandSetPSO;
   restore.pso = statistics ? pPSO->GetPipelineStatisticsPipelineState(false) : pPSO->pso;
   restore.threadgroup_size = pPSO->threadgroup_size;
+  static_cast<ComputeEncoderData *>(encoder_current)->RetainPipeline(WMT::ComputePipelineState{restore.pso});
 
   icb_.push_back(std::move(icb));
 
@@ -564,6 +573,7 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputePSO(WMT::ComputePi
   setpso.type = WMTComputeCommandSetPSO;
   setpso.pso = pso;
   setpso.threadgroup_size = tgsize;
+  static_cast<ComputeEncoderData *>(ctx.encoder_current)->RetainPipeline(pso);
 }
 
 template <>
@@ -586,13 +596,24 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::dispatchIndirect(WMT::Buffer
 template <>
 void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::setComputeTexture(
-    uint32_t index, const Rc<Texture> &texture, uint64_t viewId, int flags
+    uint32_t index, const Rc<Texture> &texture, uint64_t viewId, int flags, uint32_t sample
 ) {
   auto &dst_ = texture->view(viewId);
   auto &settex = ctx.EncodeComputeCommand<wmtcmd_compute_settexture>();
   settex.type = WMTComputeCommandSetTexture;
-  settex.texture = dst_.texture;
+  settex.texture = dst_.msaaSampleAddress ? WMT::Texture(dst_.msaaViews[sample]) : WMT::Texture(dst_.texture);
   settex.index = index;
+  if (dst_.castBlockSize) {
+    auto &uses = static_cast<ComputeEncoderData *>(ctx.encoder_current)->cast_textures;
+    const bool writes = (flags & ResourceAccess::Write) != 0;
+    for (auto &use : uses) {
+      if (use.allocation.ptr() == dst_.allocation && use.view.impl_ == viewId) {
+        use.writes |= writes;
+        return;
+      }
+    }
+    uses.push_back({texture, dst_.allocation, TextureViewKey(viewId), writes});
+  }
 }
 
 template <>

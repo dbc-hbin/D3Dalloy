@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Reproduce the owned DXMT derivative from a pinned upstream and patch series."""
+"""Reproduce the frozen import baseline from pinned upstream and patches.
+
+This is provenance reproduction, not a build of current root src/. Use the root
+README for current builds and graphics-translator/BUILD.ko.md for frozen inputs.
+"""
 from __future__ import annotations
 
 import argparse

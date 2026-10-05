@@ -880,6 +880,111 @@ void shutdownWait() {
   expect(dev->GetDeviceRemovedReason(), S_OK, "shutdown-peer-healthy");
   std::puts("OWNED_D3D12_EXECUTION_SAFETY_SHUTDOWN_PASS local_cancel=1 peer_preserved=1");
 }
+DWORD WINAPI explicitRemovalQueues(void *) {
+  auto dev = device();
+  ComPtr<ID3D12Device5> dev5;
+  check(dev.As(&dev5), "explicit-removal-device5");
+  auto direct = queue(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+  auto copy = queue(dev.Get(), D3D12_COMMAND_LIST_TYPE_COPY);
+  auto retiredAllocator = allocator(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+  auto directAllocator = allocator(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+  auto copyAllocator = allocator(dev.Get(), D3D12_COMMAND_LIST_TYPE_COPY);
+  auto directCommand = list(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT, retiredAllocator.Get());
+  auto copyCommand = list(dev.Get(), D3D12_COMMAND_LIST_TYPE_COPY, copyAllocator.Get());
+  auto input = buffer(dev.Get(), D3D12_HEAP_TYPE_UPLOAD, 256);
+  auto output = buffer(dev.Get(), D3D12_HEAP_TYPE_READBACK, 256);
+  void *mapped = nullptr;
+  check(input->Map(0, nullptr, &mapped), "explicit-removal-map-input");
+  auto *words = static_cast<std::uint32_t *>(mapped);
+  words[0] = 0x1234abcd;
+  words[1] = 0x5678abcd;
+  words[2] = 0x9abc1234;
+  input->Unmap(0, nullptr);
+  check(output->Map(0, nullptr, &mapped), "explicit-removal-map-output");
+  auto *result = static_cast<std::uint32_t *>(mapped);
+  result[0] = 0;
+  result[1] = 0xfeedbeef;
+  result[2] = 0xdeadbeef;
+  ComPtr<ID3D12Fence> retired, directGate, copyGate, directDone, copyDone;
+  check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&retired)), "explicit-removal-retired");
+  check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&directGate)), "explicit-removal-direct-gate");
+  check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copyGate)), "explicit-removal-copy-gate");
+  check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&directDone)), "explicit-removal-direct-done");
+  check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copyDone)), "explicit-removal-copy-done");
+
+  // Establish actual GPU retirement and exact readback before testing removal.
+  directCommand->CopyBufferRegion(output.Get(), 0, input.Get(), 0, 4);
+  check(directCommand->Close(), "explicit-removal-control-close");
+  ID3D12CommandList *directSubmitted[] = {directCommand.Get()};
+  direct->ExecuteCommandLists(1, directSubmitted);
+  check(direct->Signal(retired.Get(), 1), "explicit-removal-control-signal");
+  wait(retired.Get(), 1);
+  if (retired->GetCompletedValue() != 1 || result[0] != 0x1234abcd ||
+      result[1] != 0xfeedbeef || result[2] != 0xdeadbeef)
+    fail("explicit-removal-control-readback");
+  check(retiredAllocator->Reset(), "explicit-removal-control-retired");
+  check(directCommand->Reset(directAllocator.Get(), nullptr), "explicit-removal-direct-reset");
+  directCommand->CopyBufferRegion(output.Get(), 4, input.Get(), 4, 4);
+  copyCommand->CopyBufferRegion(output.Get(), 8, input.Get(), 8, 4);
+  check(directCommand->Close(), "explicit-removal-direct-close");
+  check(copyCommand->Close(), "explicit-removal-copy-close");
+
+  // These gates are never signaled. Successful returns must precede removal:
+  // both Execute/Signal pairs are registered, ordered, and still CPU-pending.
+  check(direct->Wait(directGate.Get(), 1), "explicit-removal-direct-wait");
+  check(copy->Wait(copyGate.Get(), 1), "explicit-removal-copy-wait");
+  direct->ExecuteCommandLists(1, directSubmitted);
+  ID3D12CommandList *copySubmitted[] = {copyCommand.Get()};
+  copy->ExecuteCommandLists(1, copySubmitted);
+  check(direct->Signal(directDone.Get(), 1), "explicit-removal-direct-signal");
+  check(copy->Signal(copyDone.Get(), 1), "explicit-removal-copy-signal");
+  expect(directAllocator->Reset(), E_FAIL, "explicit-removal-direct-pending");
+  expect(copyAllocator->Reset(), E_FAIL, "explicit-removal-copy-pending");
+  if (directGate->GetCompletedValue() != 0 || copyGate->GetCompletedValue() != 0 ||
+      directDone->GetCompletedValue() != 0 || copyDone->GetCompletedValue() != 0)
+    fail("explicit-removal-pending-unpublished");
+  expect(dev->GetDeviceRemovedReason(), S_OK, "explicit-removal-before");
+
+  // Drop the caller's recording and allocator references to exercise owned
+  // snapshots. D3D12 callers must retain resources referenced by pending work;
+  // keep input and output alive until both queues have shut down.
+  directCommand.Reset();
+  copyCommand.Reset();
+  retiredAllocator.Reset();
+  directAllocator.Reset();
+  copyAllocator.Reset();
+  dev5->RemoveDevice();
+  expect(dev->GetDeviceRemovedReason(), DXGI_ERROR_DEVICE_REMOVED, "explicit-removal-reason");
+  for (auto *fence : {retired.Get(), directGate.Get(), copyGate.Get(), directDone.Get(), copyDone.Get()})
+    if (fence->GetCompletedValue() != UINT64_MAX) fail("explicit-removal-terminal-fence");
+  expect(direct->Signal(directDone.Get(), 2), DXGI_ERROR_DEVICE_REMOVED, "explicit-removal-direct-signal-rejected");
+  expect(copy->Signal(copyDone.Get(), 2), DXGI_ERROR_DEVICE_REMOVED, "explicit-removal-copy-signal-rejected");
+  expect(direct->Wait(directGate.Get(), 2), DXGI_ERROR_DEVICE_REMOVED, "explicit-removal-direct-wait-rejected");
+  expect(copy->Wait(copyGate.Get(), 2), DXGI_ERROR_DEVICE_REMOVED, "explicit-removal-copy-wait-rejected");
+  direct.Reset();
+  copy.Reset();
+  // Only the control copy retired. Terminal fences are not proof of GPU work:
+  // neither gated recording may execute, even during worker/queue teardown.
+  if (result[0] != 0x1234abcd || result[1] != 0xfeedbeef || result[2] != 0xdeadbeef)
+    fail("explicit-removal-pending-copy-not-executed");
+  output->Unmap(0, nullptr);
+  input.Reset();
+  output.Reset();
+  expect(dev->GetDeviceRemovedReason(), DXGI_ERROR_DEVICE_REMOVED, "explicit-removal-reason-preserved");
+  // These public APIs do not expose a deterministic still-in-flight native
+  // commit boundary. This covers retired native work plus never-submitted
+  // pending work, not an artificially forced in-flight GPU race.
+  return 0;
+}
+void explicitRemoval() {
+  // Bound every API call and destruction without signaling either wait gate.
+  HANDLE thread = CreateThread(nullptr, 0, explicitRemovalQueues, nullptr, 0, nullptr);
+  if (!thread) fail("explicit-removal-thread");
+  if (WaitForSingleObject(thread, 30000) != WAIT_OBJECT_0)
+    fail("explicit-removal-api-or-teardown-deadlock");
+  CloseHandle(thread);
+  std::puts("OWNED_D3D12_EXECUTION_SAFETY_EXPLICIT_REMOVAL_PASS gpu_retired=1 pending_copies=2 terminal_fences=5 queues_destroyed=2");
+}
 void completedRecordingReplay() {
   auto dev = device();
   auto q = queue(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
@@ -1057,6 +1162,7 @@ int main() {
   staleBatch();
   staleBundleAllocator();
   shutdownWait();
+  explicitRemoval();
   completedRecordingReplay();
   invalidRecordingReplay(false, false);
   invalidRecordingReplay(true, false);

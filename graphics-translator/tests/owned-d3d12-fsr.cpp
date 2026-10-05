@@ -305,8 +305,7 @@ void fsrErrorCases(const FsrApi& api, Gpu& gpu, FsrCreation& creation, ffxContex
     reject(bad, FFX_API_RETURN_ERROR_PARAMETER, "unknown_ffx_state");
     bad = valid; bad.enableSharpening = true; bad.sharpness = std::numeric_limits<float>::quiet_NaN();
     reject(bad, FFX_API_RETURN_ERROR_PARAMETER, "nan_sharpness");
-    bad = valid; bad.flags = FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
-    reject(bad, FFX_API_RETURN_NO_PROVIDER, "debug_view_unsupported");
+
     bad = valid; bad.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB | FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ;
     reject(bad, FFX_API_RETURN_ERROR_PARAMETER, "conflicting_transfer_functions");
     Gpu other;
@@ -932,7 +931,10 @@ void fsrFullBehavior(const FsrApi& api, Gpu& gpu, ID3D12Resource* depth, ID3D12R
 }
 } // namespace
 
-int main() {
+#ifndef OWNED_FSR_FIXTURE_ENTRY
+#define OWNED_FSR_FIXTURE_ENTRY main
+#endif
+int OWNED_FSR_FIXTURE_ENTRY() {
     FsrApi api; // Missing DLL is an availability failure, not a GPU failure.
     ffxConfigureDescGlobalDebug1 debug{};
     debug.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;

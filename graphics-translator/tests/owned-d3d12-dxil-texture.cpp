@@ -1,6 +1,7 @@
 #define wmain owned_d3d12_dxil_base_wmain
 #include "owned-d3d12-dxil.cpp"
 #undef wmain
+#include <bit>
 
 namespace {
 
@@ -68,9 +69,335 @@ bool closeFloat(float actual, float expected, float tolerance = 0.001f) {
   return std::fabs(actual - expected) <= tolerance;
 }
 
+int runProgrammableOffsets(ID3D12Device *device, wchar_t **argv) {
+  constexpr UINT lanes = 16, batches = 2, rowsPerLane = 22;
+  constexpr UINT bytes = lanes * batches * rowsPerLane * 16;
+  const std::array<int32_t, lanes> values = {
+      -9, -8, 7, 8, 15, 16, INT32_MIN, INT32_MAX,
+      -33, -32, 31, 32, 63, 64, 0x12345678, -0x12345679};
+  std::array<std::array<int32_t, 4>, lanes * batches> offsets{};
+  for (UINT batch = 0; batch < batches; ++batch)
+    for (UINT lane = 0; lane < lanes; ++lane) {
+      const UINT i = (lane + batch * 5) % lanes;
+      offsets[batch * lanes + lane] = {values[i], values[(i + 7) % lanes],
+                                      values[(i + 3) % lanes], values[(i + 11) % lanes]};
+    }
+  Context context(device);
+  D3D12_DESCRIPTOR_RANGE ranges[2]{};
+  ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 8, 0, 0, 0};
+  ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 8};
+  D3D12_ROOT_PARAMETER parameters[2]{};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {2, ranges};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants = {0, 0, 1};
+  D3D12_STATIC_SAMPLER_DESC samplers[6]{};
+  samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  samplers[0].MaxAnisotropy = 1;
+  samplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+  samplers[1] = samplers[0];
+  samplers[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+  samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  samplers[1].ShaderRegister = 1;
+  for (UINT i = 2; i < 6; ++i) {
+    samplers[i] = samplers[0];
+    samplers[i].ShaderRegister = i;
+    samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW =
+        i == 2 ? D3D12_TEXTURE_ADDRESS_MODE_WRAP :
+        i == 3 ? D3D12_TEXTURE_ADDRESS_MODE_MIRROR :
+        i == 4 ? D3D12_TEXTURE_ADDRESS_MODE_BORDER : D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+  }
+  D3D12_ROOT_SIGNATURE_DESC rootDesc{2, parameters, 6, samplers,
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  auto root = createRootSignature(device, rootDesc);
+  D3D12_DESCRIPTOR_HEAP_DESC heapDesc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 9,
+                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  ComPtr<ID3D12DescriptorHeap> heap;
+  check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)), "programmable offset heap");
+  const UINT stride = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
+  auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+  std::array<ComPtr<ID3D12Resource>, 6> textures;
+  std::array<ComPtr<ID3D12Resource>, 6> uploads;
+  auto floatTexel = [](int x, int y, int layer) {
+    return float(1 + x + 128 * y + 16384 * layer) / 65536.0f;
+  };
+  for (UINT textureIndex = 0; textureIndex < textures.size(); ++textureIndex) {
+    auto desc = texture2DDesc(127, 113, textureIndex == 1 || textureIndex == 2 ? 2 : 1, 1,
+        textureIndex == 3 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE);
+    if (textureIndex == 2) {
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+      desc.Height = 1;
+    }
+    const UINT firstSubresource = textureIndex == 4 ? 1 : 0;
+    if (textureIndex == 4) {
+      desc.Width = 254;
+      desc.Height = 226;
+      desc.MipLevels = 2;
+    } else if (textureIndex == 5) {
+      desc.Width = desc.Height = 1;
+    }
+    textures[textureIndex] = createTexture(device, desc, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> footprints{};
+    std::array<UINT, 2> rowCounts{};
+    std::array<UINT64, 2> rowBytes{};
+    UINT64 uploadBytes = 0;
+    device->GetCopyableFootprints(&desc, firstSubresource, desc.DepthOrArraySize, 0, footprints.data(),
+                                  rowCounts.data(), rowBytes.data(), &uploadBytes);
+    uploads[textureIndex] = createBuffer(device, uploadBytes, D3D12_HEAP_TYPE_UPLOAD,
+                                         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    void *mapped = nullptr;
+    check(uploads[textureIndex]->Map(0, nullptr, &mapped), "programmable texture upload");
+    for (UINT layer = 0; layer < desc.DepthOrArraySize; ++layer) {
+      for (UINT y = 0; y < footprints[layer].Footprint.Height; ++y) {
+        auto *row = reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(mapped) +
+            footprints[layer].Offset + y * footprints[layer].Footprint.RowPitch);
+        for (UINT x = 0; x < footprints[layer].Footprint.Width; ++x)
+          row[x] = textureIndex == 3 ? 0x80000000u + x + 128 * y :
+                   std::bit_cast<uint32_t>(floatTexel(x, y, textureIndex >= 4 ? textureIndex - 2 : layer));
+      }
+    }
+    uploads[textureIndex]->Unmap(0, nullptr);
+    for (UINT layer = 0; layer < desc.DepthOrArraySize; ++layer) {
+      D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+      source.pResource = uploads[textureIndex].Get();
+      source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      source.PlacedFootprint = footprints[layer];
+      destination.pResource = textures[textureIndex].Get();
+      destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      destination.SubresourceIndex = firstSubresource + layer;
+      context.list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
+    transition(context.list.Get(), textures[textureIndex].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = desc.Format;
+    if (textureIndex == 1) {
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+      srv.Texture2DArray.MipLevels = 1;
+      srv.Texture2DArray.ArraySize = 2;
+    } else if (textureIndex == 2) {
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+      srv.Texture1DArray.MipLevels = 1;
+      srv.Texture1DArray.ArraySize = 2;
+    } else {
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Texture2D.MipLevels = 1;
+      srv.Texture2D.MostDetailedMip = firstSubresource;
+    }
+    device->CreateShaderResourceView(textures[textureIndex].Get(), &srv, cpu);
+    cpu.ptr += stride;
+  }
+  auto msTexture = createTexture(device, texture2DDesc(127, 113, 1, 4, DXGI_FORMAT_R32_FLOAT,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
+  D3D12_SHADER_RESOURCE_VIEW_DESC msSRV{};
+  msSRV.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  msSRV.Format = DXGI_FORMAT_R32_FLOAT;
+  msSRV.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+  device->CreateShaderResourceView(msTexture.Get(), &msSRV, cpu);
+  cpu.ptr += stride;
+  auto inputs = createBuffer(device, sizeof(offsets), D3D12_HEAP_TYPE_UPLOAD,
+                             D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  void *mapped = nullptr;
+  check(inputs->Map(0, nullptr, &mapped), "programmable offset input map");
+  std::memcpy(mapped, offsets.data(), sizeof(offsets));
+  inputs->Unmap(0, nullptr);
+  D3D12_SHADER_RESOURCE_VIEW_DESC inputSRV{};
+  inputSRV.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  inputSRV.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+  inputSRV.Buffer.NumElements = lanes * batches;
+  inputSRV.Buffer.StructureByteStride = 16;
+  device->CreateShaderResourceView(inputs.Get(), &inputSRV, cpu);
+  cpu.ptr += stride;
+  auto output = createBuffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto zero = createBuffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                           D3D12_RESOURCE_STATE_GENERIC_READ);
+  check(zero->Map(0, nullptr, &mapped), "programmable output initialize");
+  std::memset(mapped, 0xcd, bytes);
+  zero->Unmap(0, nullptr);
+  context.list->CopyBufferRegion(output.Get(), 0, zero.Get(), 0, bytes);
+  transition(context.list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto readback = createBuffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Buffer.NumElements = lanes * batches * rowsPerLane;
+  uav.Buffer.StructureByteStride = 16;
+  device->CreateUnorderedAccessView(output.Get(), nullptr, &uav, cpu);
+  auto target = createTexture(device, texture2DDesc(lanes, 1, 1, 1, DXGI_FORMAT_R32_FLOAT,
+                              D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
+  D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  ComPtr<ID3D12DescriptorHeap> rtvHeap;
+  check(device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&rtvHeap)), "programmable offset RTV heap");
+  const auto rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+  device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+  auto msRTV = rtv;
+  msRTV.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  device->CreateRenderTargetView(msTexture.Get(), nullptr, msRTV);
+  const float clear[4] = {.75f, 0, 0, 0};
+  context.list->ClearRenderTargetView(msRTV, clear, 0, nullptr);
+  transition(context.list.Get(), msTexture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  const auto vs = readFile(argv[3]), ps = readFile(argv[4]), cs = readFile(argv[5]);
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
+  graphics.pRootSignature = root.Get();
+  graphics.VS = {vs.data(), vs.size()};
+  graphics.PS = {ps.data(), ps.size()};
+  graphics.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  graphics.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
+  graphics.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  graphics.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  graphics.RasterizerState.DepthClipEnable = TRUE;
+  graphics.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  graphics.NumRenderTargets = 1;
+  graphics.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+  graphics.SampleDesc.Count = 1;
+  ComPtr<ID3D12PipelineState> pixelPSO, computePSO;
+  check(device->CreateGraphicsPipelineState(&graphics, IID_PPV_ARGS(&pixelPSO)),
+        "programmable offset graphics PSO");
+  D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
+  compute.pRootSignature = root.Get();
+  compute.CS = {cs.data(), cs.size()};
+  check(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&computePSO)),
+        "programmable offset compute PSO");
+  ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+  context.list->SetDescriptorHeaps(1, heaps);
+  context.list->SetGraphicsRootSignature(root.Get());
+  context.list->SetComputeRootSignature(root.Get());
+  context.list->SetGraphicsRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+  context.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+  context.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  const D3D12_VIEWPORT viewport{0, 0, float(lanes), 1, 0, 1};
+  const D3D12_RECT scissor{0, 0, lanes, 1};
+  context.list->RSSetViewports(1, &viewport);
+  context.list->RSSetScissorRects(1, &scissor);
+  context.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  for (UINT batch = 0; batch < batches; ++batch) {
+    context.list->SetGraphicsRoot32BitConstant(1, batch, 0);
+    context.list->SetPipelineState(pixelPSO.Get());
+    context.list->DrawInstanced(3, 1, 0, 0);
+    context.list->SetComputeRoot32BitConstant(1, batch, 0);
+    context.list->SetPipelineState(computePSO.Get());
+    context.list->Dispatch(1, 1, 1);
+  }
+  transition(context.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+             D3D12_RESOURCE_STATE_COPY_SOURCE);
+  context.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+  context.submitAndWait();
+  const D3D12_RANGE readRange{0, bytes};
+  check(readback->Map(0, &readRange, &mapped), "programmable offset readback");
+  const auto *actual = static_cast<const uint32_t *>(mapped);
+  auto signedLow = [](int32_t value, UINT bits) {
+    const int low = uint32_t(value) & ((1u << bits) - 1);
+    return low >= (1 << (bits - 1)) ? low - (1 << bits) : low;
+  };
+  auto address = [](int coord, int size, UINT mode) {
+    if (mode == 4) {
+      coord = coord < 0 ? -coord - 1 : coord;
+      return coord >= size ? size - 1 : coord;
+    }
+    if (mode == 0)
+      return coord < 0 ? 0 : coord >= size ? size - 1 : coord;
+    if (mode == 3)
+      return coord < 0 || coord >= size ? -1 : coord;
+    const int period = mode == 2 ? size * 2 : size;
+    int reduced = coord % period;
+    if (reduced < 0)
+      reduced += period;
+    return mode == 2 && reduced >= size ? period - reduced - 1 : reduced;
+  };
+  for (UINT index = 0; index < lanes * batches; ++index) {
+    const auto &o = offsets[index];
+    const UINT batch = index / lanes;
+    const int x = 64 + signedLow(o[0], 4), y = 64 + signedLow(o[1], 4);
+    const float scalar = floatTexel(x, y, 0), array = floatTexel(x, y, 1);
+    const float line = floatTexel(x, 0, 1);
+    const float cmp = scalar >= 0.125f ? 1.f : 0.f;
+    std::array<std::array<uint32_t, 4>, rowsPerLane> expected{};
+    const std::array<std::array<float, 4>, 4> sampleRows = {{
+      {scalar, scalar, cmp, cmp}, {array, array, array, array >= .375f ? 1.f : 0.f},
+      {line, line, line, line >= 16448.f / 65536 ? 1.f : 0.f},
+      {scalar, scalar, floatTexel(65, 63, 0), scalar}}};
+    for (UINT row = 0; row < 4; ++row)
+      for (UINT component = 0; component < 4; ++component)
+        expected[row][component] = std::bit_cast<uint32_t>(sampleRows[row][component]);
+    const int ox = signedLow(o[2], 6), oy = signedLow(o[3], 6);
+    // D3D gather returns lower-left, lower-right, upper-right, upper-left.
+    // Quarter-texel interior/edge and +/-1/64 boundary inputs stay outside
+    // the specification's 0.6/256-texel fixed-point rounding ambiguity.
+    const std::array<std::array<int, 2>, 4> corners = {{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
+    for (UINT row : {4u, 5u, 6u, 7u, 8u, 11u, 12u, 13u, 14u, 15u, 16u, 17u, 19u, 20u}) {
+      int bx = batch == 0 ? 64 : 1, by = bx;
+      UINT mode = row == 11 || row == 14 ? 1 : row == 12 || row == 15 ? 2 : row == 13 ? 3 : 0;
+      if (row == 19) {
+        bx = -3;
+        by = 1;
+        mode = 4;
+      }
+      if (row == 14) {
+        bx = by = -1; // +/-2^24 wraps to 0 before the texel offsets.
+      } else if (row == 15) {
+        bx = batch == 0 ? -1 : 126;
+        by = batch == 0 ? -1 : 112; // Huge odd mirror periods reach endpoint 1.
+      } else if (row == 16) {
+        bx = 1000000;
+        by = -1000000; // Huge clamp coordinates are provably beyond every offset.
+      } else if (row == 17) {
+        bx = by = batch == 0 ? 63 : 64;
+      }
+      for (UINT component = 0; component < 4; ++component) {
+        const int gx = address(bx + ox + corners[component][0], 127, mode);
+        const int gy = address(by + oy + corners[component][1], 113, mode);
+        const bool border = gx < 0 || gy < 0;
+        const float value = border ? 0.f : floatTexel(gx, gy, row == 20 ? 2 : row == 7 || row == 8 ? 1 : 0);
+        if (row == 6)
+          expected[row][component] = 0x80000000u + gx + 128 * gy;
+        else if (row == 5 || row == 8)
+          expected[row][component] = std::bit_cast<uint32_t>(value >= (row == 5 ? .125f : .375f) ? 1.f : 0.f);
+        else
+          expected[row][component] = std::bit_cast<uint32_t>(value);
+      }
+    }
+    const std::array<float, 4> last = {cmp, array, line, floatTexel(65, 0, 1)};
+    for (UINT component = 0; component < 4; ++component)
+      expected[9][component] = std::bit_cast<uint32_t>(last[component]);
+    // Load(coord + offset) must keep all 32 coordinate bits, unlike Load(coord, offset).
+    const int32_t fullX = std::bit_cast<int32_t>(uint32_t(o[0]) + 64u);
+    const int32_t fullY = std::bit_cast<int32_t>(uint32_t(o[1]) + 64u);
+    const bool fullInBounds = fullX >= 0 && fullX < 127 && fullY >= 0 && fullY < 113;
+    expected[10] = {std::bit_cast<uint32_t>(scalar), std::bit_cast<uint32_t>(scalar),
+                    std::bit_cast<uint32_t>(cmp),
+                    std::bit_cast<uint32_t>(fullInBounds ? floatTexel(fullX, fullY, 0) : 0.f)};
+    expected[18] = {std::bit_cast<uint32_t>(signedLow(o[0], 4) >= 0 && signedLow(o[1], 4) >= 0 ? .75f : 0.f),
+                    std::bit_cast<uint32_t>(fullInBounds ? .75f : 0.f),
+                    0x80000000u + uint32_t(x) + 128u * uint32_t(y),
+                    fullInBounds ? 0x80000000u + uint32_t(fullX) + 128u * uint32_t(fullY) : 0u};
+    expected[21].fill(std::bit_cast<uint32_t>(floatTexel(0, 0, 3)));
+    for (UINT row = 0; row < rowsPerLane; ++row)
+      for (UINT component = 0; component < 4; ++component) {
+        const uint32_t observed = actual[(index * rowsPerLane + row) * 4 + component];
+        if (observed != expected[row][component]) {
+          std::fprintf(stderr, "OWNED_D3D12_DXIL_TEXTURE_OFFSETS_FAIL batch=%u lane=%u family=%u component=%u "
+                       "offsets=(%d,%d,%d,%d) actual=0x%08x expected=0x%08x\n",
+                       index / lanes, index % lanes, row, component, o[0], o[1], o[2], o[3],
+                       observed, expected[row][component]);
+          readback->Unmap(0, nullptr);
+          return 1;
+        }
+      }
+  }
+  readback->Unmap(0, nullptr);
+  std::printf("OWNED_D3D12_DXIL_TEXTURE_OFFSETS_PASS batches=%u lanes=%u families=%u components=%u\n",
+              batches, lanes, rowsPerLane, bytes / 4);
+  return 0;
+}
+
 int runTextureOps(int argc, wchar_t **argv) {
-  if (argc != 3) {
-    std::fprintf(stderr, "usage: owned-d3d12-dxil-texture.exe <basic-texture-vs.dxil> <basic-texture-ps.dxil>\n");
+  if (argc != 6) {
+    std::fprintf(stderr, "usage: owned-d3d12-dxil-texture.exe <basic-texture-vs.dxil> <basic-texture-ps.dxil> <programmable-offsets-vs.dxil> <programmable-offsets-ps.dxil> <programmable-offsets-cs.dxil>\n");
     return 2;
   }
 
@@ -115,7 +442,7 @@ int runTextureOps(int argc, wchar_t **argv) {
   samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
   samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
   samplers[1] = samplers[0];
-  samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
   samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
   samplers[1].ShaderRegister = 1;
 
@@ -328,6 +655,8 @@ int runTextureOps(int argc, wchar_t **argv) {
     if (count == 4 && patternCase(count, 0u, centerTexture.Get(), target.Get(), true))
       return 1;
   }
+  if (runProgrammableOffsets(device.Get(), argv))
+    return 1;
   std::puts("OWNED_D3D12_DXIL_TEXTURE_PASS");
   return 0;
 }

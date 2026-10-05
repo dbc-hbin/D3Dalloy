@@ -34,7 +34,7 @@ class MTL4Submission : public Object {
 public:
   void waitUntilCompleted() { Metal4Invoke(WMTMetal4WaitSubmission, handle); }
   void getInfo(WMTMetal4SubmissionInfo &info) const {
-    Metal4Invoke(WMTMetal4GetSubmissionInfo, handle, uintptr_t(&info));
+    Metal4Invoke(WMTMetal4GetSubmissionInfo, handle, WMTGetGuestWindowBase() + uintptr_t(&info));
   }
   Error error() const {
     WMTMetal4SubmissionInfo info{}; getInfo(info); return Error{info.error_handle};
@@ -82,10 +82,10 @@ public:
 class MTL4ComputeCommandEncoder : public MTL4CommandEncoder {
 public:
   void encodeCommands(const wmtcmd_compute_nop *commands) {
-    Metal4Invoke(WMTMetal4ComputeCommands, handle, uintptr_t(commands));
+    Metal4Invoke(WMTMetal4ComputeCommands, handle, commands ? WMTGetGuestWindowBase() + uintptr_t(commands) : 0);
   }
   void encodeCommands(const wmtcmd_blit_nop *commands) {
-    Metal4Invoke(WMTMetal4BlitCommands, handle, uintptr_t(commands));
+    Metal4Invoke(WMTMetal4BlitCommands, handle, commands ? WMTGetGuestWindowBase() + uintptr_t(commands) : 0);
   }
   void setArgumentTable(MTL4ArgumentTable table) { Metal4Invoke(WMTMetal4ComputeArgumentTable, handle, table.handle); }
   void waitForFence(Fence fence) { Metal4Invoke(WMTMetal4Fence, handle, fence.handle, 0, WMTMetal4StageDispatch | WMTMetal4StageBlit | WMTMetal4StageAccelerationStructure); }
@@ -109,7 +109,7 @@ public:
     return Metal4Invoke(WMTMetal4ASPrepass, handle, pipeline.handle, source_instances.handle, source_offset,
                        destination_instances.handle, destination_offset, header.handle, header_offset,
                        contributions.handle, contribution_offset, live_mirror.handle, live_mirror_offset,
-                       uintptr_t(&info)).ret[0] != 0;
+                       WMTGetGuestWindowBase() + uintptr_t(&info)).ret[0] != 0;
   }
   bool build(MTL4AccelerationStructureDescriptor descriptor, AccelerationStructureSidecar destination, Buffer scratch, uint64_t offset) {
     return Metal4Invoke(WMTMetal4ASBuild, handle, descriptor.handle, destination.handle, scratch.handle, offset).ret[0] != 0;
@@ -128,7 +128,9 @@ public:
 
 class MTL4RenderCommandEncoder : public MTL4CommandEncoder {
 public:
-  void encodeCommands(const wmtcmd_render_nop *commands) { Metal4Invoke(WMTMetal4RenderCommands, handle, uintptr_t(commands)); }
+  void encodeCommands(const wmtcmd_render_nop *commands) {
+    Metal4Invoke(WMTMetal4RenderCommands, handle, commands ? WMTGetGuestWindowBase() + uintptr_t(commands) : 0);
+  }
   void setArgumentTable(MTL4ArgumentTable table, WMTRenderStages stages) { Metal4Invoke(WMTMetal4RenderArgumentTable, handle, table.handle, uint64_t(stages)); }
   void setVertexBuffer(Buffer buffer, uint64_t offset, uint8_t index) {
     wmtcmd_render_setbuffer cmd{}; cmd.type=WMTRenderCommandSetVertexBuffer;
@@ -193,9 +195,23 @@ class MTL4CommandBuffer : public Object {
 public:
   void begin(MTL4CommandAllocator allocator) { Metal4Invoke(WMTMetal4BeginCommandBuffer, handle, allocator.handle); }
   void end() { Metal4Invoke(WMTMetal4EndCommandBuffer, handle); }
+  int32_t diagnostic(uint32_t action, const char *label, uint64_t length) {
+    struct WMTMetal4Call call{}; call.operation = WMTMetal4Diagnostic;
+    call.args[0] = handle; call.args[1] = action;
+    call.args[2] = label ? WMTGetGuestWindowBase() + uintptr_t(label) : 0; call.args[3] = length;
+    return WMTMetal4Call(&call);
+  }
   void useResidencySet(ResidencySet set) { Metal4Invoke(WMTMetal4UseResidencySet, handle, set.handle); }
+  // Sparse resources do not imply residency of the heaps backing their mapped pages.
+  void useAllocation(Allocation allocation) { Metal4Invoke(WMTMetal4UseAllocation, handle, allocation.handle); }
+  bool useDrawable(MetalDrawable drawable) {
+    struct WMTMetal4Call call{}; call.operation = WMTMetal4UseDrawable;
+    call.args[0] = handle; call.args[1] = drawable.handle;
+    return ::WMTMetal4Call(&call) == 0;
+  }
   MTL4RenderCommandEncoder renderCommandEncoder(WMTRenderPassInfo &info) {
-    return MTL4RenderCommandEncoder{Metal4Invoke(WMTMetal4RenderEncoder, handle, uintptr_t(&info)).ret[0]};
+    return MTL4RenderCommandEncoder{
+      Metal4Invoke(WMTMetal4RenderEncoder, handle, WMTGetGuestWindowBase() + uintptr_t(&info)).ret[0]};
   }
   MTL4ComputeCommandEncoder computeCommandEncoder(bool concurrent = false) {
     return MTL4ComputeCommandEncoder{Metal4Invoke(WMTMetal4ComputeEncoder, handle, uint64_t(concurrent)).ret[0]};
@@ -205,7 +221,8 @@ public:
 };
 
 inline Reference<MTL4Submission> MTL4CommandQueue::commit(const MTL4CommandBuffer *buffers, uint64_t count) {
-  return Reference<MTL4Submission>(Metal4Invoke(WMTMetal4Commit, handle, uintptr_t(buffers), count).ret[0]);
+  return Reference<MTL4Submission>(
+    Metal4Invoke(WMTMetal4Commit, handle, buffers ? WMTGetGuestWindowBase() + uintptr_t(buffers) : 0, count).ret[0]);
 }
 inline void MTL4CommandQueue::waitForEvent(Event event, uint64_t value) { Metal4Invoke(WMTMetal4WaitEvent, handle, event.handle, value); }
 inline void MTL4CommandQueue::waitForDrawable(MetalDrawable drawable) { Metal4Invoke(WMTMetal4WaitDrawable, handle, drawable.handle); }

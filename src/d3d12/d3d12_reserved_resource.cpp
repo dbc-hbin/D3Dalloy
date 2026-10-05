@@ -15,8 +15,10 @@
  */
 
 #include "d3d12_reserved_resource.hpp"
+#include "d3d12_device.hpp"
 #include "log/log.hpp"
 #include <algorithm>
+#include <bit>
 
 namespace dxmt {
 
@@ -38,6 +40,18 @@ StandardShape2D(uint32_t bytes_per_unit) {
 uint32_t
 CeilDiv(uint64_t value, uint64_t divisor) {
   return uint32_t((value + divisor - 1) / divisor);
+}
+
+D3D12_TILE_SHAPE
+StandardShape3D(uint32_t bytes_per_unit) {
+  switch (bytes_per_unit) {
+  case 1: return {64, 32, 32};
+  case 2: return {32, 32, 32};
+  case 4: return {32, 32, 16};
+  case 8: return {32, 16, 16};
+  case 16: return {16, 16, 16};
+  default: return {};
+  }
 }
 
 } // namespace
@@ -91,9 +105,6 @@ ReservedResource::CreateTextureTiling(
   tiling->packed_mips_ = desc.MipLevels - first_in_tail;
   tiling->metal_tail_level_ = first_in_tail;
   if (tiling->packed_mips_) {
-    /* Tier 2: packed mips and array slices cannot be combined (Tier 4 lifts this). */
-    if (desc.DepthOrArraySize > 1)
-      return E_INVALIDARG;
     if (!tail.tail_size_in_bytes || tail.tail_size_in_bytes % kReservedTileBytes)
       return E_INVALIDARG;
     tiling->packed_tiles_ = uint32_t(tail.tail_size_in_bytes / kReservedTileBytes);
@@ -125,7 +136,10 @@ ReservedResource::CreateTextureTiling(
       tiling->subresources_.push_back(sub);
     }
     if (tiling->packed_mips_) {
-      tiling->packed_first_tile_ = uint32_t(next);
+      if (!slice)
+        tiling->packed_first_tile_ = uint32_t(next);
+      for (uint32_t mip = first_in_tail; mip < desc.MipLevels; mip++)
+        tiling->subresources_[slice * desc.MipLevels + mip].first_tile = uint32_t(next);
       next += tiling->packed_tiles_;
     }
     if (next > UINT32_MAX)
@@ -135,6 +149,95 @@ ReservedResource::CreateTextureTiling(
   tiling->targets_.resize(tiling->total_tiles_);
   out = std::move(tiling);
   return S_OK;
+}
+
+uint64_t
+ReservedResource::VolumeTileCount(const D3D12_RESOURCE_DESC &desc, uint32_t block_width,
+                                   uint32_t block_height, uint32_t bytes_per_unit) {
+  const auto shape=StandardShape3D(bytes_per_unit);
+  if (!shape.WidthInTexels || !block_width || !block_height ||
+      desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE3D) return 0;
+  uint64_t total=0, width=desc.Width, height=desc.Height, depth=desc.DepthOrArraySize;
+  const uint32_t count=desc.MipLevels ? desc.MipLevels : std::bit_width(std::max({width,height,depth}));
+  if (count>64) return 0;
+  for (uint32_t mip=0;mip<count;++mip) {
+    total+=uint64_t(CeilDiv(std::max(width>>mip,1ull),uint64_t(shape.WidthInTexels)*block_width))*
+        CeilDiv(std::max(height>>mip,1ull),uint64_t(shape.HeightInTexels)*block_height)*
+        CeilDiv(std::max(depth>>mip,1ull),shape.DepthInTexels);
+  }
+  return total<=UINT32_MAX ? total : 0;
+}
+
+HRESULT
+ReservedResource::CreateVolumeTiling(
+    const D3D12_RESOURCE_DESC &desc, WMTSparseTileShape native_page, uint32_t block_width,
+    uint32_t block_height, uint32_t bytes_per_unit, std::unique_ptr<ReservedResource> &out
+) {
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || !desc.Width || !desc.Height ||
+      !desc.DepthOrArraySize || !desc.MipLevels ||
+      !MatchesStandardShape2D(native_page, block_width, block_height, bytes_per_unit))
+    return E_INVALIDARG;
+  auto tiling = std::make_unique<ReservedResource>();
+  tiling->volume_ = true;
+  tiling->shape_ = StandardShape3D(bytes_per_unit);
+  if (!tiling->shape_.WidthInTexels)
+    return E_INVALIDARG;
+  tiling->shape_.WidthInTexels *= block_width;
+  tiling->shape_.HeightInTexels *= block_height;
+  tiling->mip_levels_ = tiling->standard_mips_ = desc.MipLevels;
+  tiling->bytes_per_unit_ = bytes_per_unit;
+  tiling->block_width_ = block_width;
+  tiling->block_height_ = block_height;
+  uint64_t next = 0;
+  for (uint32_t mip = 0; mip < desc.MipLevels; mip++) {
+    ReservedSubresourceTiling sub{};
+    sub.mip = mip;
+    sub.tiles_x = CeilDiv(std::max<uint64_t>(desc.Width >> mip, 1), tiling->shape_.WidthInTexels);
+    sub.tiles_y = CeilDiv(std::max<uint64_t>(desc.Height >> mip, 1), tiling->shape_.HeightInTexels);
+    sub.tiles_z = CeilDiv(std::max<uint64_t>(desc.DepthOrArraySize >> mip, 1), tiling->shape_.DepthInTexels);
+    sub.first_tile = uint32_t(next);
+    next += uint64_t(sub.tiles_x) * sub.tiles_y * sub.tiles_z;
+    if (next > UINT32_MAX)
+      return E_INVALIDARG;
+    tiling->subresources_.push_back(sub);
+  }
+  tiling->total_tiles_ = uint32_t(next);
+  const uint32_t columns = std::min(uint32_t(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) / native_page.width,
+                                    tiling->total_tiles_);
+  const uint32_t rows = std::min(uint32_t(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) / native_page.height,
+                                CeilDiv(tiling->total_tiles_, columns));
+  if (CeilDiv(tiling->total_tiles_, uint64_t(columns) * rows) > D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION)
+    return E_INVALIDARG;
+  const auto shape = tiling->shape_;
+  tiling->volume_layout_ = {uint32_t(desc.Width), desc.Height, desc.DepthOrArraySize, desc.MipLevels,
+      shape.WidthInTexels, shape.HeightInTexels, shape.DepthInTexels, block_width, block_height,
+      native_page.width, native_page.height, columns, rows, tiling->total_tiles_};
+  tiling->targets_.resize(tiling->total_tiles_);
+  out = std::move(tiling);
+  return S_OK;
+}
+
+std::optional<ReservedVolumeAddress>
+ReservedResource::VolumeAddress(uint32_t mip, uint32_t x, uint32_t y, uint32_t z) const {
+  if (!volume_ || mip >= subresources_.size())
+    return std::nullopt;
+  const auto &layout = volume_layout_;
+  const auto &sub = subresources_[mip];
+  const uint32_t sx = x / layout.shape_w, sy = y / layout.shape_h, sz = z / layout.shape_d;
+  if (sx >= sub.tiles_x || sy >= sub.tiles_y || sz >= sub.tiles_z)
+    return std::nullopt;
+  const uint32_t tile = sub.first_tile + (sz * sub.tiles_y + sy) * sub.tiles_x + sx;
+  const uint32_t local_x = (x % layout.shape_w) / layout.block_w;
+  const uint32_t units_x = layout.shape_w / layout.block_w;
+  const uint32_t flat = local_x + units_x * ((y % layout.shape_h) / layout.block_h +
+      (layout.shape_h / layout.block_h) * (z % layout.shape_d));
+  const uint32_t page_units_x = layout.page_w / layout.block_w;
+  return ReservedVolumeAddress{
+      (tile % layout.atlas_columns) * layout.page_w + (flat % page_units_x) * layout.block_w + x % layout.block_w,
+      ((tile / layout.atlas_columns) % layout.atlas_rows) * layout.page_h + (flat / page_units_x) * layout.block_h +
+          y % layout.block_h,
+      tile / (layout.atlas_columns * layout.atlas_rows),
+      std::min(units_x - local_x, page_units_x - flat % page_units_x)};
 }
 
 void
@@ -182,7 +285,7 @@ ReservedResource::TileIndex(const D3D12_TILED_RESOURCE_COORDINATE &coordinate) c
     /* Packed mips are addressed as a linear run of tiles from the first packed subresource. */
     if (coordinate.Y || coordinate.Z || coordinate.X >= packed_tiles_)
       return std::nullopt;
-    return packed_first_tile_ + coordinate.X;
+    return sub.first_tile + coordinate.X;
   }
   if (coordinate.X >= sub.tiles_x || coordinate.Y >= sub.tiles_y || coordinate.Z >= sub.tiles_z)
     return std::nullopt;
@@ -283,17 +386,96 @@ ReservedResource::Apply(
     Retain(target);
     Release(targets_[tile]);
     targets_[tile] = target;
+    if (target.heap_tile == kReservedNullTile) mapped_tiles_.erase(tile);
+    else mapped_tiles_.insert(tile);
     effective.emplace_back(tile, target);
   }
   if (effective.empty())
     return;
+  mapping_generation_++;
   if (is_buffer_)
     EncodeBuffer(queue, buffer, effective);
   else
     EncodeTexture(queue, texture, effective);
+  for (const auto &[format, atlas] : volume_cast_atlases_)
+    EncodeTexture(queue, atlas, effective);
+  if (volume_device && status_buffer) {
+    const HRESULT hr = volume_device->PublishSparseVolumeResidency(status_buffer, effective);
+    if (FAILED(hr)) volume_device->ReportRemoval(hr);
+  }
   if (status_bytes)
     for (const auto &[tile, target] : effective)
       status_bytes[tile] = target.heap_tile != kReservedNullTile;
+}
+
+uint64_t
+ReservedResource::CollectMappedTiles(uint64_t seen_generation, std::vector<uint32_t> &tiles, uint32_t subresource) {
+  std::lock_guard<dxmt::mutex> lock(mutex);
+  if (seen_generation == mapping_generation_)
+    return mapping_generation_;
+  tiles.clear();
+  if (subresource != UINT32_MAX && subresource >= subresources_.size())
+    return mapping_generation_;
+  const uint32_t first = subresource == UINT32_MAX ? 0 : subresources_[subresource].first_tile;
+  const uint64_t end = subresource == UINT32_MAX ? total_tiles_ : uint64_t(first) +
+      uint64_t(subresources_[subresource].tiles_x) * subresources_[subresource].tiles_y * subresources_[subresource].tiles_z;
+  for (uint32_t tile : mapped_tiles_)
+    if (tile >= first && tile < end)
+      tiles.push_back(tile);
+  return mapping_generation_;
+}
+
+void
+ReservedResource::MapCastTiles(WMT::MTL4CommandQueue queue, WMT::Texture texture, WMT::Heap heap,
+                               const std::unordered_set<uint32_t> &tiles) {
+  std::vector<std::pair<uint32_t,ReservedTileTarget>> assignments;
+  assignments.reserve(tiles.size());
+  uint32_t offset=0;
+  for (uint32_t tile : tiles)
+    assignments.push_back({tile,heap ? ReservedTileTarget{heap,offset++} : ReservedTileTarget{}});
+  EncodeTexture(queue,texture,assignments);
+}
+
+WMT::Reference<WMT::Texture>
+ReservedResource::GetVolumeCastAtlas(MTLD3D12Device *owner, WMTPixelFormat format, bool compressed) {
+  if (block_width_==4 && !compressed)
+    format=bytes_per_unit_==8 ? WMTPixelFormatRG32Uint : WMTPixelFormatRGBA32Uint;
+  GPUExecutionGate::Ticket execution;
+  // Encoding already owns shared or exclusive admission. Re-entering the
+  // reader gate here can deadlock a writer waiting for that very submission.
+  if (!owner->gpu_execution_gate.CurrentThreadAdmitted()) {
+    execution = owner->gpu_execution_gate.AcquireShared();
+    if (!execution) return {};
+  }
+  auto device = owner->GetMTLDevice();
+  std::lock_guard<std::mutex> queue_lock(MappingQueueMutex);
+  std::lock_guard<dxmt::mutex> lock(mutex);
+  if (auto existing = volume_cast_atlases_.find(format); existing != volume_cast_atlases_.end()) return existing->second;
+  if (!volume_ || !volume_mapping_queue) return {};
+  WMTTextureInfo info{};
+  info.type = WMTTextureType2DArray;
+  info.pixel_format = format;
+  info.width = volume_layout_.atlas_columns * volume_layout_.page_w / (compressed ? 1 : block_width_);
+  info.height = volume_layout_.atlas_rows * volume_layout_.page_h / (compressed ? 1 : block_height_);
+  info.depth = 1;
+  info.array_length = (total_tiles_ + volume_layout_.atlas_columns * volume_layout_.atlas_rows - 1) /
+      (volume_layout_.atlas_columns * volume_layout_.atlas_rows);
+  info.mipmap_level_count = info.sample_count = 1;
+  info.usage = WMTTextureUsage(WMTTextureUsageShaderRead | WMTTextureUsagePixelFormatView |
+      (compressed ? 0 : WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget));
+  info.options = WMTResourceOptions(WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate);
+  auto atlas = device.newPlacementSparseTexture(info, WMTSparsePageSize64);
+  auto completed = device.newSharedEvent();
+  if (!atlas || !completed) return {};
+  std::vector<std::pair<uint32_t, ReservedTileTarget>> assignments;
+  assignments.reserve(mapped_tiles_.size());
+  for (uint32_t tile : mapped_tiles_)
+    assignments.emplace_back(tile, targets_[tile]);
+  EncodeTexture(volume_mapping_queue, atlas, assignments);
+  volume_mapping_queue.signalEvent(completed, 1);
+  if (!completed.waitUntilSignaledValue(1, 10000)) return {};
+  volume_cast_atlases_.emplace(format, atlas);
+  return atlas;
 }
 
 void
@@ -358,11 +540,17 @@ ReservedResource::EncodeTexture(
     op.mode = unmap ? WMTSparseMappingModeUnmap : WMTSparseMappingModeMap;
     op.heap_offset = unmap ? 0 : target.heap_tile;
     op.size = {1, 1, 1};
-    if (isPackedTile(tile)) {
-      /* The tail of one slice (arrays never have packed mips here): x indexes its tiles. */
+    if (volume_) {
+      op.level = 0;
+      op.slice = tile / (volume_layout_.atlas_columns * volume_layout_.atlas_rows);
+      op.origin = {tile % volume_layout_.atlas_columns,
+          (tile / volume_layout_.atlas_columns) % volume_layout_.atlas_rows, 0};
+    } else if (isPackedTile(tile)) {
+      /* Each slice has its own tail, with the same offset within its linear tile range. */
+      const uint32_t tiles_per_slice = total_tiles_ / array_size_;
       op.level = metal_tail_level_;
-      op.slice = 0;
-      op.origin = {tile - packed_first_tile_, 0, 0};
+      op.slice = tile / tiles_per_slice;
+      op.origin = {tile % tiles_per_slice - packed_first_tile_, 0, 0};
     } else {
       uint32_t x = 0, y = 0, z = 0;
       const auto *sub = subresourceOfTile(tile, x, y, z);

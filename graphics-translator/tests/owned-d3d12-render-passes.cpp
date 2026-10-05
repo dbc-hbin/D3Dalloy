@@ -706,8 +706,9 @@ void uintBorderColors() {
   c.dev->CreateShaderResourceView(tex.Get(), nullptr,
                                   descriptor(c.dev.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, srvHeap, true));
   auto samplerHandle = descriptor(c.dev.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, samplerHeap, true);
-  const std::array<std::array<UINT, 4>, 3> borders = {{{0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1}}};
-  std::array<std::array<UINT, 4>, 3> got{};
+  const std::array<std::array<UINT, 4>, 4> borders = {{{0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1},
+      {0x01000001u, 0x81000013u, 0xfedcba97u, 0xffffffffu}}};
+  std::array<std::array<UINT, 4>, 4> got{};
   for (size_t b = 0; b < borders.size(); ++b) {
     SamplerDesc2 sd{};
     sd.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -749,6 +750,8 @@ void uintBorderColors() {
               got[0][2], got[0][3], got[1][0], got[1][1], got[1][2], got[1][3], got[2][0], got[2][1], got[2][2],
               got[2][3]);
   pass("create-sampler2-uint-border-colors");
+  std::printf("%s_UINT_BORDER_ARBITRARY rgba=%08x,%08x,%08x,%08x exact=1\n", kPrefix,
+      got[3][0], got[3][1], got[3][2], got[3][3]);
 }
 
 void capabilities() {
@@ -774,13 +777,13 @@ int main() {
   if (!backend || std::strcmp(backend(), "owned-graphics-d3d12"))
     return 3;
   std::printf("%s_BACKEND id=%s\n", kPrefix, backend());
+  uintBorderColors();
   clearPreserve();
   discardAndDepthClear();
   resolveModes();
   suspendResume();
   validation();
   gpuUploadHeap();
-  uintBorderColors();
   capabilities();
   std::printf("%s_PASS cases=%u\n", kPrefix, gCases);
   return 0;

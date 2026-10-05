@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "winemetal_metal4.h"
 
-#define WMTFG_BRIDGE_VERSION 4u
+#define WMTFG_BRIDGE_VERSION 5u
 
 #pragma pack(push, 8)
 enum WMTFG_create_flags
@@ -96,6 +96,7 @@ struct WMTFGdispatch_packet
     int32_t generation_rect_height;
     float min_luminance;
     float max_luminance;
+    uint32_t flags;
 };
 
 /* Configure changes metadata ownership; recorded commands retain their own snapshots. */
@@ -125,7 +126,7 @@ struct WMTFGNativeCommand { uint64_t device, compiler; };
 static_assert(sizeof(WMTFGpacket_header) == 24);
 static_assert(sizeof(WMTFGcreate_packet) == 56);
 static_assert(sizeof(WMTFGprepare_packet) == 168);
-static_assert(sizeof(WMTFGdispatch_packet) == 112);
+static_assert(sizeof(WMTFGdispatch_packet) == 120);
 static_assert(sizeof(WMTFGconfigure_packet) == 32);
 static_assert(sizeof(WMTFGretire_frame_packet) == 48);
 #endif

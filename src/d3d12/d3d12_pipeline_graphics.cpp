@@ -202,6 +202,21 @@ constexpr WMTColorWriteMask kColorWriteMaskMap[] = {
     WMTColorWriteMaskAlpha | WMTColorWriteMaskBlue | WMTColorWriteMaskRed | WMTColorWriteMaskGreen,
 };
 
+// OPTIONS13 validates the final address, not AlignedByteOffset in isolation.
+// Packed formats require four-byte alignment; byte/half formats use their
+// component alignment even when the vertex element has four components.
+constexpr UINT
+VertexComponentAlignment(WMTAttributeFormat format) {
+  if ((format >= WMTAttributeFormatUChar2 && format <= WMTAttributeFormatChar4Normalized) ||
+      format == WMTAttributeFormatUChar4Normalized_BGRA ||
+      (format >= WMTAttributeFormatUChar && format <= WMTAttributeFormatCharNormalized))
+    return 1;
+  if ((format >= WMTAttributeFormatUShort2 && format <= WMTAttributeFormatHalf4) ||
+      (format >= WMTAttributeFormatUShort && format <= WMTAttributeFormatHalf))
+    return 2;
+  return 4;
+}
+
 HRESULT
 ExtractMTLInputLayoutElements(
     MTLD3D12Device *device, const void *pShaderBytecodeWithInputSignature,
@@ -211,6 +226,8 @@ ExtractMTLInputLayoutElements(
 
   using namespace microsoft;
   uint64_t append_offset[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {0};
+  UINT slot_alignment[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+  UINT slot_residue[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
   uint32_t register_mask = 0;
 
   CSignatureParser parser;
@@ -251,6 +268,15 @@ ExtractMTLInputLayoutElements(
     if (aligned_byte_offset > UINT32_MAX - metal_format.BytesPerTexel)
       return E_INVALIDARG;
     append_offset[desc.InputSlot] = aligned_byte_offset + metal_format.BytesPerTexel;
+
+    const UINT component_alignment = VertexComponentAlignment(metal_format.AttributeFormat);
+    const UINT common_alignment = std::min(slot_alignment[desc.InputSlot], component_alignment);
+    if (common_alignment && ((slot_residue[desc.InputSlot] ^ UINT(aligned_byte_offset)) & (common_alignment - 1)))
+      return E_INVALIDARG; // No vertex-buffer base can align every element in this slot.
+    if (component_alignment > slot_alignment[desc.InputSlot]) {
+      slot_alignment[desc.InputSlot] = component_alignment;
+      slot_residue[desc.InputSlot] = UINT(aligned_byte_offset);
+    }
 
     auto pSig = std::find_if(pParameters, pParameters + num_parameters, [&](const D3D11_SIGNATURE_PARAMETER &inputSig) {
       return desc.SemanticIndex == inputSig.SemanticIndex && strcasecmp(desc.SemanticName, inputSig.SemanticName) == 0;
@@ -483,6 +509,10 @@ ShaderImmutableConstants::Initialize(
       address = device->GetAtomicLockTableAddress();
       if (!address)
         return E_OUTOFMEMORY;
+    } else if (relocations[i].TargetOffset == SM50_CONSTANT_RELOCATION_TARGET_ATOMIC64_CONTEXT) {
+      address = device->GetAtomic64ContextAddress();
+      if (!address)
+        return E_OUTOFMEMORY;
     }
     memcpy(memory + offset + relocations[i].Offset, &address, sizeof(address));
   }
@@ -491,7 +521,8 @@ ShaderImmutableConstants::Initialize(
 
 HRESULT
 MTLD3D12PipelineState::InitializeShader(
-    const char *Stage, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl
+    const char *Stage, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl,
+    std::vector<MTL_SM50_SHADER_ARGUMENT> *resource_bindings
 ) {
   using namespace microsoft;
   HRESULT hr;
@@ -521,10 +552,18 @@ MTLD3D12PipelineState::InitializeShader(
   }
 
   TraceShaderProbe(Stage, Bytecode, chunk, S_OK);
+  if (resource_bindings && pRefl && (pRefl->NumConstantBuffers || pRefl->NumArguments)) {
+    const size_t first = resource_bindings->size();
+    resource_bindings->resize(first + pRefl->NumConstantBuffers + pRefl->NumArguments);
+    auto *rows = resource_bindings->data() + first;
+    SM50GetArgumentsInfo(*ppShader, rows, rows + pRefl->NumConstantBuffers);
+  }
   return S_OK;
 }
 
 class MTLD3D12GraphicsPipelineStateImpl : public MTLD3D12Pageable<MTLD3D12GraphicsPipelineState> {
+  friend HRESULT CreateGraphicsPipelineState(MTLD3D12Device *, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *,
+                                              REFIID, void **, const GraphicsPipelineExtras *);
 protected:
   PipelineCache cache_;
   MTL_SHADER_REFLECTION ref_vs{};
@@ -605,9 +644,8 @@ protected:
       return hr;
     WMT::Reference<WMT::Error> err;
     auto lib = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), err);
-    if (!lib) {
+    if (!lib)
       return E_FAIL;
-    }
     function = lib.newFunction(name);
     return function ? S_OK : E_FAIL;
   }
@@ -618,9 +656,10 @@ protected:
                      std::array<uint32_t, 3> &threads) -> HRESULT {
       MTL_SHADER_REFLECTION reflection{};
       SM50Shader shader;
-      if (HRESULT hr = InitializeShader(name, bytecode, &shader, &reflection); FAILED(hr))
+      if (HRESULT hr = InitializeShader(name, bytecode, &shader, &reflection, &resource_bindings); FAILED(hr))
         return hr;
       threads = {reflection.ThreadgroupSize[0], reflection.ThreadgroupSize[1], reflection.ThreadgroupSize[2]};
+      uses_atomic64 |= reflection.HasAtomic64 != 0;
       const auto *source = static_cast<const uint8_t *>(bytecode.pShaderBytecode);
       out.assign(source, source + bytecode.BytecodeLength);
       return S_OK;
@@ -675,9 +714,10 @@ protected:
     SM50Shader shader;
     HRESULT hr;
     if (mesh_kind == MeshPipelineKind::Geometry) {
-      if (FAILED(hr = InitializeShader("GS", pDesc->GS, &shader, &reflection)))
+      if (FAILED(hr = InitializeShader("GS", pDesc->GS, &shader, &reflection, &resource_bindings)))
         return hr;
       mesh_input_primitive = reflection.GeometryShader.Primitive;
+      uses_atomic64 |= reflection.HasAtomic64 != 0;
       gs_max_output_vertices = reflection.GeometryShader.MaxOutputVertexCount;
       gs_output_topology = reflection.GeometryShader.OutputTopology;
       gs_instance_count = std::max<uint32_t>(1, reflection.GeometryShader.InstanceCount);
@@ -703,17 +743,19 @@ protected:
       copy(pDesc->GS, mesh_gs_bytecode);
       return S_OK;
     }
-    if (FAILED(hr = InitializeShader("HS", pDesc->HS, &shader, &reflection)))
+    if (FAILED(hr = InitializeShader("HS", pDesc->HS, &shader, &reflection, &resource_bindings)))
       return hr;
     tess_threads_per_patch = reflection.ThreadsPerPatch;
+    uses_atomic64 |= reflection.HasAtomic64 != 0;
     if (mesh_kind == MeshPipelineKind::TessellationGeometry) {
       // The GS reads the tessellator output primitives: point, line (isoline) or triangle (either winding).
       const auto output = reflection.Tessellator.OutputPrimitive;
       MTL_SHADER_REFLECTION gs_reflection{};
       SM50Shader geometry;
-      if (FAILED(hr = InitializeShader("GS", pDesc->GS, &geometry, &gs_reflection)))
+      if (FAILED(hr = InitializeShader("GS", pDesc->GS, &geometry, &gs_reflection, &resource_bindings)))
         return hr;
       mesh_input_primitive = gs_reflection.GeometryShader.Primitive;
+      uses_atomic64 |= gs_reflection.HasAtomic64 != 0;
       gs_max_output_vertices = gs_reflection.GeometryShader.MaxOutputVertexCount;
       gs_output_topology = gs_reflection.GeometryShader.OutputTopology;
       gs_instance_count = std::max<uint32_t>(1, gs_reflection.GeometryShader.InstanceCount);
@@ -726,9 +768,10 @@ protected:
     }
     SM50Shader domain;
     MTL_SHADER_REFLECTION domain_reflection{};
-    if (FAILED(hr = InitializeShader("DS", pDesc->DS, &domain, &domain_reflection)))
+    if (FAILED(hr = InitializeShader("DS", pDesc->DS, &domain, &domain_reflection, &resource_bindings)))
       return hr;
     mesh_max_potential_tess_factor = domain_reflection.PostTessellator.MaxPotentialTessFactor;
+    uses_atomic64 |= domain_reflection.HasAtomic64 != 0;
     if (!device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple9))
       mesh_max_potential_tess_factor = std::min(8u, mesh_max_potential_tess_factor);
     copy(pDesc->HS, mesh_hs_bytecode);
@@ -745,6 +788,8 @@ protected:
     const bool statistics = key & 8;
     const bool capture_pixels = key & kMeshMSAACapture;
     const bool replay_pixels = key & kMeshMSAAReplay;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
+    atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
     SM50_SHADER_COMMON_DATA common{};
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
@@ -770,6 +815,8 @@ protected:
       root.bytecode_length = pull_root_blob.empty() ? bytecode.size() : pull_root_blob.size();
       root.next = statistics && !(stage[0] == 'A' && (key & kMeshObjectReplay))
           ? static_cast<void *>(&stats) : static_cast<void *>(&common);
+      common.metal_version = uses_atomic64 ? SM50_SHADER_METAL_410 : kD3D12ShaderMetalVersion;
+      if (uses_atomic64) { atomic_phase.next = root.next; root.next = &atomic_phase; }
       SM50_SHADER_COMPILATION_ARGUMENT_DATA conservative{};
       conservative.type = SM50_SHADER_D3D12_CONSERVATIVE_RASTER;
       conservative.next = root.next;
@@ -783,6 +830,7 @@ protected:
         capture.line_mode = owned_line_mode;
         capture.interpolation = interpolation;
         capture.depth_clip_enable = depth_clip_mode == WMTDepthClipModeClip;
+        capture.front_counter_clockwise = winding == WMTWindingCounterClockwise;
         capture.next = root.next;
         root.next = &capture;
         variant.capture_layout.threads_per_group = ms_threads[0] * ms_threads[1] * ms_threads[2];
@@ -891,6 +939,11 @@ protected:
     void *tail = statistics ? static_cast<void *>(&stats) : static_cast<void *>(&common);
     const bool capture_pixels = key & kMeshMSAACapture;
     const bool replay_vertices = key & kMeshMSAAReplay;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
+    atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
+    if (uses_atomic64) {
+      atomic_phase.next = tail; tail = &atomic_phase; common.metal_version = SM50_SHADER_METAL_410;
+    }
     SM50_SHADER_D3D12_MSAA_MESH_DATA msaa_mesh{};
     msaa_mesh.type = SM50_SHADER_D3D12_MSAA_MESH;
     msaa_mesh.variant = replay_vertices ? SM50_MSAA_VERTEX_REPLAY : SM50_MSAA_VERTEX_CAPTURE;
@@ -901,6 +954,7 @@ protected:
     msaa_mesh.line_mode = owned_line_mode;
     msaa_mesh.interpolation = interpolation;
     msaa_mesh.depth_clip_enable = depth_clip_mode == WMTDepthClipModeClip;
+    msaa_mesh.front_counter_clockwise = winding == WMTWindingCounterClockwise;
     SM50_SHADER_COMPILATION_ARGUMENT_DATA conservative{};
     conservative.type = SM50_SHADER_D3D12_CONSERVATIVE_RASTER;
     conservative.next = tail;
@@ -1332,6 +1386,13 @@ public:
 
   void
   InitializeDSSO(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, const GraphicsPipelineExtras &extras) {
+    if (extras.depth_bounds && !emulated_depth_bounds) {
+      // An inverted D3D range always fails. Metal requires ordered bounds;
+      // NEVER with writes/stencil disabled preserves the early/late PS contract.
+      WMTDepthStencilInfo reject{};
+      reject.depth_compare_function = WMTCompareFunctionNever;
+      depth_bounds_reject_state = device_->GetMTLDevice().newDepthStencilState(reject);
+    }
     WMTDepthStencilInfo info;
     info.depth_compare_function = WMTCompareFunctionAlways;
     info.depth_write_enabled = false;
@@ -1449,6 +1510,8 @@ public:
     // Capture selection and initial mesh variants consume forced sampling and
     // conservative/line state, so establish them before any pipeline is built.
     InitializeRasterizerState(pDesc, extras);
+    owned_depth_bounds = extras.depth_bounds;
+    emulated_depth_bounds = owned_depth_bounds && !device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple10);
     owned_rt_count = pDesc->NumRenderTargets;
     std::copy_n(pDesc->RTVFormats, owned_rt_count, owned_rtv_formats.begin());
     owned_dsv_format = pDesc->DSVFormat;
@@ -1542,6 +1605,9 @@ public:
       return hr;
     // Without a rasterized stream the pipeline has no fragment function (Metal requires it).
     const bool use_fragment = pDesc->PS.pShaderBytecode && !rasterization_disabled;
+    if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader("PS", pDesc->PS, &shader_ps, &ref_ps, &resource_bindings)))
+      return hr;
+    uses_atomic64 |= use_fragment && ref_ps.HasAtomic64;
     // Mesh pipelines compile their object/mesh functions per draw-time variant, outside the cache.
     const uint32_t stages = (mesh ? 0u : 1u << PipelineCache::Vertex) |
                             (use_fragment ? 1u << PipelineCache::Fragment : 0);
@@ -1555,10 +1621,15 @@ public:
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
     common.next = nullptr;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
+    atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
+    if (uses_atomic64) { common.next = &atomic_phase; common.metal_version = SM50_SHADER_METAL_410; }
 
     if (pDesc->VS.pShaderBytecode) {
-      if (FAILED(hr = InitializeShader("VS", pDesc->VS, &shader_vs, &ref_vs)))
+      if (FAILED(hr = InitializeShader("VS", pDesc->VS, &shader_vs, &ref_vs, &resource_bindings)))
         return hr;
+      uses_atomic64 |= ref_vs.HasAtomic64 != 0;
+      if (uses_atomic64) { common.next = &atomic_phase; common.metal_version = SM50_SHADER_METAL_410; }
       SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
       data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
       data_ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
@@ -1567,11 +1638,11 @@ public:
           device_, pDesc->VS.pShaderBytecode, pDesc->InputLayout.pInputElementDescs, pDesc->InputLayout.NumElements,
           elements.data(), &data_ia_layout.num_elements
       );
-      elements.resize(data_ia_layout.num_elements);
-      data_ia_layout.elements = elements.data();
       if (FAILED(hr)) {
         return hr;
       }
+      elements.resize(data_ia_layout.num_elements);
+      data_ia_layout.elements = elements.data();
       slot_mask = 0;
       for (auto &element : elements) {
         slot_mask |= (1 << element.slot);
@@ -1671,8 +1742,6 @@ public:
 
     // Pipeline alpha-to-coverage state consumes reflection even when the
     // pixel function itself is restored from a cache.
-    if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader("PS", pDesc->PS, &shader_ps, &ref_ps)))
-      return hr;
     owned_sample_frequency_pixel_shader = ref_ps.PixelShader.SampleFrequency;
     owned_force_early_pixel_shader = pDesc->PS.pShaderBytecode && ref_ps.PSForceEarlyDepthStencil;
     mesh_statistics_claim =
@@ -1687,7 +1756,10 @@ public:
       // Without a rasterized stream the PS never runs, so its distance inputs must not
       // select the captured-pixel draw path.
       const auto count = use_fragment ? input_signature.GetParameters(&parameters) : 0u;
+      bool coverage_input = false, inner_coverage_input = false;
       for (uint32_t i = 0; i < count; ++i) {
+        coverage_input |= uint32_t(parameters[i].SystemValue) == 66;
+        inner_coverage_input |= uint32_t(parameters[i].SystemValue) == 70;
         if (uint32_t(parameters[i].SystemValue) == 24) owned_shading_rate_pixel_shader = true;
         if (parameters[i].Mask &&
             (parameters[i].SystemValue == microsoft::D3D10_SB_NAME_CLIP_DISTANCE ||
@@ -1697,6 +1769,7 @@ public:
         }
       }
       const void *root_blob = pDesc->PS.pShaderBytecode;
+      if (coverage_input && inner_coverage_input) return E_INVALIDARG;
       size_t root_length = pDesc->PS.BytecodeLength;
       if (pDesc->pRootSignature)
         root_length = static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&root_blob);
@@ -1848,6 +1921,8 @@ public:
 
     // DSSO
     InitializeDSSO(pDesc, extras);
+    if (owned_depth_bounds && !emulated_depth_bounds && !depth_bounds_reject_state)
+      return E_OUTOFMEMORY;
 
     // Captured pipelines never execute the original raster PSO. Validate the
     // actual capture/pixel/replay combination at creation, rather than linking
@@ -2223,7 +2298,7 @@ public:
     if (it != mesh_variants.end())
       return it->second.pso ? &it->second : nullptr;
     auto &variant = mesh_variants[key];
-    if (FAILED(BuildMeshPipeline(key, variant))) {
+    if (HRESULT hr = BuildMeshPipeline(key, variant); FAILED(hr)) {
       variant.pso = {};
       return nullptr;
     }
@@ -2240,8 +2315,7 @@ public:
       return cached.get();
     attempted = true;
     const uint32_t sample_count = EffectiveRasterSampleCount();
-    if (!RequiresMSAAExecution() && !coarse && !(statistics_enabled && mesh_kind == MeshPipelineKind::MeshShader))
-      return nullptr;
+
     auto variants = std::make_unique<MSAAPipelineVariants>();
     const bool has_pixel_shader = !statistics_ps_bytecode.empty();
     variants->sample_frequency = has_pixel_shader && owned_sample_frequency_pixel_shader;
@@ -2260,6 +2334,8 @@ public:
           owned_line_mode == SM50_MSAA_LINE_ALPHA_AA ? variants->layout.input_record_dwords++ : ~0u;
       variants->layout.line_alpha_dword = owned_line_mode == SM50_MSAA_LINE_ALPHA_AA
           ? variants->layout.input_record_dwords++ : ~0u;
+      variants->layout.inner_mask_dword = owned_conservative ? variants->layout.input_record_dwords++ : ~0u;
+      variants->layout.depth_bounds_mask_dword = emulated_depth_bounds ? variants->layout.input_record_dwords++ : ~0u;
       variants->layout.output_record_dwords = 2;
       variants->layout.input_record_count = 128;
       variants->layout.helper_record_base = 64;
@@ -2285,7 +2361,7 @@ public:
     auto captured_topology = msaa_original_info.input_primitive_topology;
     auto compile_pixel = [&]() -> bool {
       for (uint32_t i = 0; has_pixel_shader && i < (variants->sample_frequency ? 4u : 3u); i++) {
-      if (variants->sample_frequency && (i == 1 || i == 2)) continue;
+      if (variants->sample_frequency && (i == 1 || (i == 2 && !uses_atomic64))) continue;
       SM50Shader shader;
       SM50Error compile_error;
       if (FAILED(InitializeShader("PS-msaa", {statistics_ps_bytecode.data(), statistics_ps_bytecode.size()},
@@ -2294,6 +2370,7 @@ public:
       SM50_SHADER_D3D12_MSAA_PIXEL_DATA msaa{};
       msaa.type = SM50_SHADER_D3D12_MSAA_PIXEL;
       msaa.variant = i == 3 ? SM50_MSAA_SAMPLE_APP : SM50_MSAA_COVERAGE + i;
+      if (uses_atomic64) msaa.variant |= SM50_MSAA_ATOMIC_HELPERS;
       msaa.sample_count = sample_count;
       msaa.center_pattern = owned_sample_desc.Quality == 0xfffffffeu;
       msaa.layout_out = &variants->layout;
@@ -2306,6 +2383,8 @@ public:
           ? &variants->vertex_layout : nullptr;
       const bool captured_inputs = owned_distance_interpolation || variants->vertex_layout.spill_count;
       msaa.distance_vertex_layout = captured_inputs ? &variants->vertex_layout : nullptr;
+      msaa.depth_clip_enable = depth_clip_mode == WMTDepthClipModeClip;
+      msaa.depth_bounds_emulated = emulated_depth_bounds;
       msaa.distance_vertex_count = !captured_inputs ? 0
           : captured_topology == WMTPrimitiveTopologyClassPoint ? 1
           : captured_topology == WMTPrimitiveTopologyClassLine ? 2 : 3;
@@ -2315,8 +2394,14 @@ public:
       SM50_SHADER_D3D12_LOGIC_OP_DATA logic_op = fetch_logic_op;
       logic_op.next = &common;
       // Replay (2) and sample-frequency (3) variants write the application RTs; logic ops apply per sample.
-      void *tail = use_fetch_logic_op && (i == 2 || i == 3) ? static_cast<void *>(&logic_op)
+      void *tail = use_fetch_logic_op && (i == 2 || (i == 3 && !uses_atomic64)) ? static_cast<void *>(&logic_op)
                                                              : static_cast<void *>(&common);
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
+      atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
+      // DXIL lowering precedes coverage/replay extraction, so even the variants
+      // that later discard the application body must first lower its atomics safely.
+      common.metal_version = uses_atomic64 ? SM50_SHADER_METAL_410 : kD3D12ShaderMetalVersion;
+      if (uses_atomic64) { atomic_phase.next = tail; tail = &atomic_phase; }
       statistics.next = tail;
       msaa.next = statistics_enabled && (i == 1 || i == 3) ? static_cast<void *>(&statistics) : tail;
       SM50_SHADER_COMPILATION_ARGUMENT_DATA coarse_shading{};
@@ -2332,9 +2417,9 @@ public:
       pixel.dual_source_blending = (i == 2 || i == 3) && msaa_dual_source;
       pixel.disable_depth_output = msaa_original_info.depth_pixel_format == WMTPixelFormatInvalid;
       pixel.sample_mask = statistics_ps_sample_mask;
-      pixel.native_sample_count = i == 3 && owned_sample_frequency_pixel_shader ? sample_count : 1;
+      pixel.native_sample_count = i == 3 && owned_sample_frequency_pixel_shader && !uses_atomic64 ? sample_count : 1;
       if (i == 0)
-        pixel.pixel_formats[0] = WMTPixelFormatR32Uint;
+        pixel.pixel_formats[0] = emulated_depth_bounds ? WMTPixelFormatR8Uint : WMTPixelFormatR32Uint;
       else if (i == 2 || i == 3)
         std::copy(statistics_ps_formats.begin(), statistics_ps_formats.end(), pixel.pixel_formats);
       pixel.next = &msaa;
@@ -2362,6 +2447,7 @@ public:
       return true;
     };
     auto compile_vertex = [&](uint32_t i) -> bool {
+      common.metal_version = uses_atomic64 && !i ? SM50_SHADER_METAL_410 : kD3D12ShaderMetalVersion;
       if (mesh_kind != MeshPipelineKind::None) {
         const uint32_t pass = mesh_kind == MeshPipelineKind::TessellationGeometry
             ? kMeshTessellationGeometryPass : 0;
@@ -2395,11 +2481,17 @@ public:
       msaa.line_mode = owned_line_mode;
       msaa.interpolation = owned_line_mode != SM50_MSAA_LINE_NONE ? &line_interpolation : nullptr;
       msaa.depth_clip_enable = depth_clip_mode == WMTDepthClipModeClip;
+      msaa.front_counter_clockwise = winding == WMTWindingCounterClockwise;
       SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics{};
       statistics.type = SM50_SHADER_D3D12_PIPELINE_STATS;
       statistics.next = &common;
       msaa.next = statistics_enabled && !i ? static_cast<void *>(&statistics)
                                               : static_cast<void *>(&common);
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
+      atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
+      // Original DXIL is lowered before replay removes the application body.
+      common.metal_version = uses_atomic64 ? SM50_SHADER_METAL_410 : kD3D12ShaderMetalVersion;
+      if (uses_atomic64) { atomic_phase.next = msaa.next; msaa.next = &atomic_phase; }
       SM50_SHADER_COMPILATION_ARGUMENT_DATA conservative_raster{};
       conservative_raster.type = SM50_SHADER_D3D12_CONSERVATIVE_RASTER;
       conservative_raster.next = msaa.next;
@@ -2465,7 +2557,8 @@ public:
     for (auto &color : coverage_info.colors) color = {};
     // The application logic op applies to replayed RT writes only, never to internal coverage targets.
     coverage_info.logic_operation_enabled = false;
-    coverage_info.colors[0].pixel_format = WMTPixelFormatR32Uint;
+    // Every native sample carries only exact 0/1 coverage. R8Uint supports MSAA on Apple7/8 too.
+    coverage_info.colors[0].pixel_format = emulated_depth_bounds ? WMTPixelFormatR8Uint : WMTPixelFormatR32Uint;
     coverage_info.colors[0].write_mask = WMTColorWriteMaskAll;
     coverage_info.vertex_function = vertex_replay;
     // Captured-vertex replay pipelines apply the view location through the amplification mapping (see
@@ -2482,6 +2575,12 @@ public:
         ? "msaa_explicit_depth_only_single" : "msaa_explicit_depth_only");
     if (!gather_fragment || !explicit_depth_fragment || !depth_only_fragment)
       return nullptr;
+    if (emulated_depth_bounds) {
+      auto probe = internal.newFunction(sample_count == 1 ? "msaa_depth_bounds_probe_single"
+                                                          : "msaa_depth_bounds_probe");
+      variants->depth_bounds_probe = device_->GetMetal4Compiler().newComputePipelineState(probe, error);
+      if (!variants->depth_bounds_probe) return nullptr;
+    }
     coverage_info.fragment_function = has_pixel_shader ? fragments[0] : gather_fragment;
     coverage_info.alpha_to_coverage_enabled = false;
     
@@ -2552,6 +2651,12 @@ public:
     pixel_info.stencil_pixel_format = WMTPixelFormatInvalid;
     pixel_info.raster_sample_count = 1;
     pixel_info.vertex_function = fullscreen_vertex;
+    WMT::Reference<WMT4::Function> atomic_tile_vertex;
+    if (uses_atomic64) {
+      atomic_tile_vertex = WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_atomic_tile_vertex");
+      if (!atomic_tile_vertex) return nullptr;
+      pixel_info.vertex_function = atomic_tile_vertex;
+    }
     pixel_info.max_vertex_amplification_count = 0;
     pixel_info.fragment_function = fragments[1];
     pixel_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
@@ -2583,9 +2688,9 @@ public:
     
     
     
-    if (has_pixel_shader && !variants->sample_frequency)
+    if (has_pixel_shader && (!variants->sample_frequency || uses_atomic64))
       variants->replay = device_->GetMetal4Compiler().newRenderPipelineState(replay_info, error);
-    if (has_pixel_shader && !variants->sample_frequency && !variants->replay) {
+    if (has_pixel_shader && (!variants->sample_frequency || uses_atomic64) && !variants->replay) {
       ERR("MSAA replay PSO failed: ", error.description().getUTF8String());
       return nullptr;
     }
@@ -2611,10 +2716,12 @@ public:
       }
     }
     if (variants->sample_frequency) {
-      replay_info.fragment_function = fragments[3];
+      auto sample_info = uses_atomic64 ? pixel_info : replay_info;
+      sample_info.raster_sample_count = uses_atomic64 ? 1 : sample_count;
+      sample_info.fragment_function = fragments[3];
       
       
-      variants->sample_pixel = device_->GetMetal4Compiler().newRenderPipelineState(replay_info, error);
+      variants->sample_pixel = device_->GetMetal4Compiler().newRenderPipelineState(sample_info, error);
       if (!variants->sample_pixel) {
         ERR("MSAA sample-frequency PSO failed: ", error.description().getUTF8String());
         return nullptr;
@@ -2767,6 +2874,13 @@ CreateGraphicsPipelineState(
   }
   auto pso = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
   HRESULT hr = pso->Initialize(pDesc, extras ? *extras : GraphicsPipelineExtras{});
+  if (pso->cache_.CanRetryAutomatic(hr)) {
+    auto fresh = Com(new MTLD3D12GraphicsPipelineStateImpl(pDevice));
+    pso->cache_.RetryAutomatic(fresh->cache_);
+    pso = std::move(fresh); // Never reinitialize mutated bindings or native state.
+    hr = pso->Initialize(pDesc, extras ? *extras : GraphicsPipelineExtras{});
+  }
+  pso->cache_.Complete(hr);
   if (FAILED(hr))
     return hr;
   return pso->QueryInterface(riid, ppPipelineState);

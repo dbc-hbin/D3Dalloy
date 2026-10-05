@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <array>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -626,11 +628,16 @@ void gpuCase(Fixture &f, DXGI_FORMAT resourceFormat, DXGI_FORMAT viewFormat,
   std::printf("%s_GPU_CASE_PASS format=%u view=%u count=%u quality=%u depth=%u\n", marker,
               static_cast<UINT>(resourceFormat), static_cast<UINT>(viewFormat), count, quality, depth);
 }
+
+#include "owned-d3d12-multisample-programmable.inc"
 } // namespace
 
 int main() {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   Fixture f;
   f.init();
+  programmableCases(f);
+  regionResolveCases(f);
   semanticCase(f);
   D3D12_HEAP_DESC rejectionHeapDesc{};
   rejectionHeapDesc.SizeInBytes = 8 * 1024 * 1024;
@@ -670,8 +677,6 @@ int main() {
     rejectedPSO(f, DXGI_FORMAT_R8G8B8A8_UNORM, count, 0, false,
                 "unsupported count passed PSO creation");
   rejectedDescriptor(f.device.Get(), rejectionHeap.Get(), texture(DXGI_FORMAT_BC1_UNORM, 4, 0), "compressed MSAA passed null-output preflight");
-  rejectedDescriptor(f.device.Get(), rejectionHeap.Get(), texture(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 0,
-                                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), "MSAA UAV resource passed null-output preflight");
   rejectedPSO(f, DXGI_FORMAT_BC1_UNORM, 4, 0, false, "compressed MSAA PSO created");
   auto msaaBits = [&](DXGI_FORMAT format, bool render, bool load, bool resolve) {
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};

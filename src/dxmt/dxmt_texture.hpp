@@ -25,8 +25,13 @@
 #include "thread.hpp"
 #include "util_flags.hpp"
 #include "util_svector.hpp"
+#include <array>
+#include <memory>
+#include <unordered_set>
 
 namespace dxmt {
+
+class ReservedResource;
 
 enum class TextureAllocationFlag : uint32_t {
   GpuReadonly = 0,
@@ -50,6 +55,15 @@ struct TextureViewDescriptor {
   uint32_t miplevelCount   : 4 = 1;
   uint32_t firstArraySlice : 12 = 0;
   uint32_t arraySize       : 12 = 1;
+  // Metal cannot reinterpret BC blocks or depth texels as color pixels.
+  // GPU-only shadows retain the source bytes across these format families.
+  uint8_t castBlockSize = 0;
+  uint8_t castSourceBlockWidth = 4;
+  bool castCompressed = false;
+  bool msaaShadow = false;
+  bool reservedVolumeRender = false;
+  uint16_t volumeFirstW = 0;
+  uint8_t volumeCastMip = 0;
 };
 
 struct TextureViewKey {
@@ -87,6 +101,23 @@ struct TextureViewKey {
 class Texture;
 class TextureAllocation;
 
+struct ReservedVolumeRenderView {
+  uint32_t mip, first_w, w_size, page_w, page_h, pages_x, pages_y;
+  uint64_t mapping_generation = ~uint64_t(0);
+  std::vector<uint32_t> mapped_tiles;
+  std::unordered_set<uint32_t> mapped_pages;
+  std::vector<WMT::Reference<WMT::Heap>> heaps;
+};
+
+struct ReservedCastStorage {
+  uint32_t page_w, page_h, pages_x, pages_y;
+  bool packed = false;
+  uint64_t mapping_generation = ~uint64_t(0);
+  std::vector<uint32_t> mapped_tiles;
+  std::unordered_set<uint32_t> mapped_pages;
+  WMT::Reference<WMT::Heap> heap;
+};
+
 class TextureView {
 public:
   virtual ~TextureView() {};
@@ -99,6 +130,17 @@ public:
   DXMT_RESOURCE_RESIDENCY_STATE residency{};
   TextureAllocation *allocation; // `TextureAllocation` holds strong reference to `TextureView`
   TextureViewKey key;
+  uint8_t castBlockSize = 0;
+  uint8_t castSourceBlockWidth = 4;
+  bool castCompressed = false;
+  WMT::Reference<WMT::Texture> castStorage;
+  std::shared_ptr<ReservedCastStorage> reservedCast;
+  std::array<WMT::Reference<WMT::Texture>, 8> msaaViews;
+  WMT::Reference<WMT::Buffer> msaaSampleIds;
+  uint64_t msaaSampleAddress = 0;
+  uint64_t reservedVolumeCastLayoutAddress = 0;
+  bool reservedVolumeAtlasCast = false;
+  std::unique_ptr<ReservedVolumeRenderView> reservedVolumeRender;
 
   TextureView(const TextureView &) = delete;
   TextureView(TextureView &&) = delete;
@@ -130,6 +172,7 @@ public:
 
 class TextureAllocation final : public Allocation {
   friend class Texture;
+  friend class TextureView;
 
   /**
    * notes on thread-safety:
@@ -148,10 +191,16 @@ public:
   }
 
   Texture *descriptor;
+  WMT::Reference<WMT::Heap> canonicalHeap;
+  uint64_t canonicalHeapOffset = 0;
   void *mappedMemory;
   uint64_t gpuResourceID;
   mach_port_t machPort;
   small_vector<GenericAccessTracker, 1> fenceTrackers;
+  std::array<WMT::Reference<WMT::Texture>, 8> msaaShadow;
+  std::array<WMT::Reference<WMT::Texture>, 8> msaaBaseline;
+  WMT::Reference<WMT::Texture> msaaCanonical;
+  WMTPixelFormat msaaFormat = WMTPixelFormatInvalid;
 
 private:
   TextureAllocation(
@@ -177,12 +226,30 @@ private:
 };
 
 class Texture {
+  friend class TextureView;
+  friend class TextureAllocation;
 
 public:
+  /* Nonzero only for a D3D12 tiled volume's physical sparse 2D-array atlas. */
+  uint64_t reservedVolumeLayoutAddress = 0;
+
+  const uint32_t *reservedVolumeLayoutWords = nullptr;
+  ReservedResource *reservedResource = nullptr;
+  struct ReservedVolumeCastBinding { WMT::Reference<WMT::Texture> atlas; uint64_t layout_address; };
+  ReservedVolumeCastBinding (*reservedVolumeCastBinding)(void *, uint32_t, WMTPixelFormat, bool) = nullptr;
+  void *reservedVolumeCastContext = nullptr;
   void incRef();
   void decRef();
 
   TextureViewKey createView(TextureViewDescriptor const &descriptor);
+  TextureViewDescriptor viewDescriptor(TextureViewKey key) {
+    std::shared_lock<dxmt::shared_mutex> lock(mutex_);
+    return viewDescriptors_[key.index];
+  }
+  bool isWritableMSAAView(TextureViewKey key) {
+    std::shared_lock<dxmt::shared_mutex> lock(mutex_);
+    return viewDescriptors_[key.index].msaaShadow;
+  }
 
   constexpr TextureAllocation *
   current() {
@@ -238,17 +305,25 @@ public:
 
   unsigned
   width(TextureViewKey view) {
-    return std::max(info_.width >> view.mip_start, 1u);
+    std::shared_lock<dxmt::shared_mutex> lock(mutex_);
+    const auto width = std::max((reservedVolumeLayoutWords ? reservedVolumeLayoutWords[0] : info_.width) >> view.mip_start, 1u);
+    const auto &descriptor = viewDescriptors_[view.index];
+    return descriptor.castBlockSize && !descriptor.castCompressed
+        ? (width + descriptor.castSourceBlockWidth - 1) / descriptor.castSourceBlockWidth : width;
   }
 
   unsigned
   height(TextureViewKey view) {
-    return std::max(info_.height >> view.mip_start, 1u);
+    std::shared_lock<dxmt::shared_mutex> lock(mutex_);
+    const auto height = std::max((reservedVolumeLayoutWords ? reservedVolumeLayoutWords[1] : info_.height) >> view.mip_start, 1u);
+    const auto &descriptor = viewDescriptors_[view.index];
+    return descriptor.castBlockSize && !descriptor.castCompressed
+        ? (height + descriptor.castSourceBlockWidth - 1) / descriptor.castSourceBlockWidth : height;
   }
 
   unsigned
   depth(TextureViewKey view) const {
-    return std::max(info_.depth >> view.mip_start, 1u);
+    return std::max((reservedVolumeLayoutWords ? reservedVolumeLayoutWords[2] : info_.depth) >> view.mip_start, 1u);
   }
 
   /**

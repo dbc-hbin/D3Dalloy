@@ -9,6 +9,7 @@
  */
 
 #include "dxil_signature.hpp"
+#include "dxil_quad_layout.hpp"
 
 #include "air_signature.hpp"
 #include "airconv_context.hpp"
@@ -57,6 +58,7 @@ constexpr uint8_t NAME_COVERAGE = 66;
 constexpr uint8_t NAME_DEPTH_GREATER_EQUAL = 67;
 constexpr uint8_t NAME_DEPTH_LESS_EQUAL = 68;
 constexpr uint8_t NAME_STENCIL_REF = 69;
+constexpr uint8_t NAME_INNER_COVERAGE = 70;
 
 /* DXIL::SemanticKind of the compute shader values, which have no D3D_NAME. */
 constexpr uint8_t KIND_DISPATCH_THREAD_ID = 21;
@@ -422,6 +424,13 @@ void declare_pixel_signature(
       func_signature.DefineInput(air::InputSampleIndex{});
       continue;
     }
+    if (element.semantic_kind == NAME_INNER_COVERAGE && element.start_row == ~0u) {
+      if (sig_ctx.captured_pixel) func_signature.DefineInput(air::InputFragmentStageIn{
+        .user = "dxmt_inner_coverage", .type = air::msl_uint,
+        .interpolation = air::Interpolation::flat, .pull_mode = false,
+      });
+      continue;
+    }
     if (element.semantic_kind == NAME_BARYCENTRICS) {
       /* SV_Barycentrics has no packed register: loadInput reads the AIR argument. */
       const bool perspective = element.interp == INTERP_LINEAR || element.interp == INTERP_LINEAR_CENTROID ||
@@ -500,6 +509,14 @@ void declare_pixel_signature(
         ctx.resource.coverage_mask_arg = ctx.function->getArg(air_index);
         return std::monostate{};
       });
+      init_plain = false;
+      break;
+    }
+    case NAME_INNER_COVERAGE: {
+      air_index = sig_ctx.captured_pixel ? func_signature.DefineInput(air::InputFragmentStageIn{
+        .user = "dxmt_inner_coverage", .type = air::msl_uint,
+        .interpolation = air::Interpolation::flat, .pull_mode = false,
+      }) : ~0u;
       init_plain = false;
       break;
     }
@@ -660,7 +677,7 @@ void declare_pixel_signature(
   }
 }
 
-void declare_compute_signature(
+llvm::Error declare_compute_signature(
   const ModuleInfo &module, dxbc::SM50ShaderInternal &shader, dxbc::SignatureContext &sig_ctx,
   StageSignature &out_signature
 ) {
@@ -668,6 +685,7 @@ void declare_compute_signature(
   auto &prologue = sig_ctx.prologue;
   bool used[4] = {};
   bool quad_semantics = false;
+  bool requires_derivatives = false;
   for (auto &function : *module.module)
     for (auto &block : function)
       for (auto &instruction : block) {
@@ -678,18 +696,14 @@ void declare_compute_signature(
         auto *opcode = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0));
         if (opcode && opcode->getZExtValue() >= 93 && opcode->getZExtValue() <= 96)
           used[opcode->getZExtValue() - 93] = true;
-        /* Derivatives, implicit-LOD sampling and quad operations (SM 6.6 compute quads). */
-        switch (opcode ? opcode->getZExtValue() : 0) {
-        case 60: case 61: case 64: case 81: case 83: case 84: case 85: case 86: case 122: case 123: case 222:
-          quad_semantics = true;
-          break;
-        default:
-          break;
+        if (opcode) {
+          quad_semantics |= UsesQuadOperations(opcode->getZExtValue());
+          requires_derivatives |= RequiresQuadDerivatives(opcode->getZExtValue());
         }
       }
 
   /*
-   * SM 6.6 compute quads: with numthreads X and Y even (and not the 1D X%4, Y=Z=1
+   * SM 6.6 compute/mesh/amplification quads: with numthreads X and Y even (and not the 1D X%4, Y=Z=1
    * layout), a quad is (x, y), (x+1, y), (x, y+1), (x+1, y+1). Metal assigns simdgroup
    * lanes in linear thread index order, which already satisfies the 1D rule; for the
    * 2D rule the thread IDs are re-derived from the linear index so that every 4
@@ -697,8 +711,11 @@ void declare_compute_signature(
    * mapping between thread IDs and lanes, so the remap is invisible otherwise.
    */
   const uint32_t X = module.num_threads[0], Y = module.num_threads[1], Z = module.num_threads[2];
-  const bool linear_quads = X % 4 == 0 && Y == 1 && Z == 1;
-  const bool remap = quad_semantics && !linear_quads && X % 2 == 0 && Y % 2 == 0;
+  const auto layout = ClassifyQuadLayout(X, Y, Z);
+  if (requires_derivatives && layout == QuadLayout::Unavailable)
+    return createError("DXIL quad derivatives require numthreads X divisible by 4 with Y=Z=1, "
+                       "or both X and Y divisible by 2");
+  const bool remap = quad_semantics && layout == QuadLayout::Tiled2D;
   if (remap) {
     used[1] = true;
     used[3] = true;
@@ -764,6 +781,7 @@ void declare_compute_signature(
   func_signature.UseMaxWorkgroupSize(
     module.num_threads[0] * module.num_threads[1] * module.num_threads[2]
   );
+  return llvm::Error::success();
 }
 
 } // namespace
@@ -773,6 +791,15 @@ llvm::Error DeclareStageSignature(
   StageSignature &out_signature
 ) {
   for (auto &element : module.input_sig) {
+    if (element.semantic_kind == NAME_INNER_COVERAGE) {
+      if (module.stage != Stage::Pixel || element.rows != 1 || element.cols != 1 ||
+          (element.interp != INTERP_CONSTANT && element.start_row != ~0u) ||
+          (element.comp_type != 1 && element.comp_type != 2))
+        return createError("SV_InnerCoverage must be a constant scalar integer pixel input");
+      if (std::any_of(module.input_sig.begin(), module.input_sig.end(), [](const SigElement &input) {
+            return input.semantic_kind == NAME_COVERAGE;
+          })) return createError("SV_Coverage and SV_InnerCoverage inputs are mutually exclusive");
+    }
     if (element.start_row + element.rows > shader.max_input_register)
       shader.max_input_register = element.start_row + element.rows;
   }
@@ -793,7 +820,8 @@ llvm::Error DeclareStageSignature(
   case Stage::Amplification:
     if (module.num_threads[0] * module.num_threads[1] * module.num_threads[2] == 0)
       return createError("DXIL compute shader has no numthreads");
-    declare_compute_signature(module, shader, sig_ctx, out_signature);
+    if (auto error = declare_compute_signature(module, shader, sig_ctx, out_signature))
+      return error;
     break;
   default:
     return unsupported("DXIL stage");
@@ -933,6 +961,9 @@ llvm::Error lower_load_input(
 
   llvm::Value *value;
   if (element->semantic_kind == NAME_SHADINGRATE) {
+    value = element->air_index == ~0u ? static_cast<llvm::Value *>(builder.getInt32(0))
+                                    : ctx.function->getArg(element->air_index);
+  } else if (element->semantic_kind == NAME_INNER_COVERAGE) {
     value = element->air_index == ~0u ? static_cast<llvm::Value *>(builder.getInt32(0))
                                     : ctx.function->getArg(element->air_index);
   } else if (element->semantic_kind == NAME_BARYCENTRICS) {
@@ -1556,6 +1587,30 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   }
   const auto coverage_input_arg =
     coverage_inputs.empty() ? ~0u : func_signature.DefineInput(air::InputInputCoverage{});
+  llvm::SmallVector<llvm::CallInst *, 4> inner_inputs;
+  if (auto *intrinsic = module_ir.getFunction("dx.op.innerCoverage.i32")) {
+    for (auto *user : intrinsic->users()) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (module.stage != Stage::Pixel || !call || call->getFunction() != module.entry ||
+          call->arg_size() != 1 || !call->getType()->isIntegerTy(32))
+        return createError("invalid dx.op.innerCoverage use");
+      auto opcode = constant_operand(*call, 0);
+      if (!opcode) return opcode.takeError();
+      if (*opcode != 92) return createError("invalid dx.op.innerCoverage opcode");
+      inner_inputs.push_back(call);
+    }
+  }
+  const bool has_inner = !inner_inputs.empty() || std::any_of(module.input_sig.begin(), module.input_sig.end(),
+    [](const SigElement &input) { return input.semantic_kind == NAME_INNER_COVERAGE; });
+  if (has_inner && (!coverage_inputs.empty() || std::any_of(module.input_sig.begin(), module.input_sig.end(),
+      [](const SigElement &input) { return input.semantic_kind == NAME_COVERAGE; })))
+    return createError("SV_Coverage and SV_InnerCoverage inputs are mutually exclusive");
+  SM50_SHADER_D3D12_MSAA_PIXEL_DATA *inner_pixel = nullptr;
+  dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(args, &inner_pixel);
+  const auto inner_input_arg = has_inner && inner_pixel ? func_signature.DefineInput(air::InputFragmentStageIn{
+    .user = "dxmt_inner_coverage", .type = air::msl_uint,
+    .interpolation = air::Interpolation::flat, .pull_mode = false,
+  }) : ~0u;
 
   /* Vertex stages always declare the four IA values: they are what the AIR
    * stage_in metadata carries for [[vertex_id]] / [[instance_id]] and what the
@@ -1630,6 +1685,11 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
       coverage = llvm::BinaryOperator::CreateAnd(coverage, llvm::ConstantInt::get(coverage->getType(),
                                                  pso_sample_mask), "coverage", call);
     call->replaceAllUsesWith(coverage);
+    call->eraseFromParent();
+  }
+  for (auto *call : inner_inputs) {
+    call->replaceAllUsesWith(inner_input_arg == ~0u ? static_cast<llvm::Value *>(llvm::ConstantInt::get(call->getType(), 0))
+                                                   : function->getArg(inner_input_arg));
     call->eraseFromParent();
   }
 

@@ -5,7 +5,7 @@ winemetal_src = [
   'winemetal_metal4_thunks.c',
 ]
 
-winemetal_ld_args = []
+winemetal_ld_args = native_compiler_arch == 'arm64' ? ['-Wl,--section-alignment=16384'] : []
 
 winemetal_link_depends = []
 

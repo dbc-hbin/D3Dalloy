@@ -134,6 +134,7 @@ private:
   static_assert(sizeof(UnicodeString) == (sizeof(void *) == 8 ? 16 : 8));
   static_assert(sizeof(ObjectInformationClass) == 4);
 
+public:
   static HRESULT ValidateEvent(HANDLE event) {
     using QueryObjectFn = LONG (NTAPI *)(HANDLE, ObjectInformationClass,
                                              void *, ULONG, ULONG *);
@@ -170,6 +171,7 @@ private:
     return S_OK;
   }
 
+private:
   // Caller holds mutex_ through the native observation, comparison and every
   // SetEvent, so queries cannot steal changes or reorder worker observations.
   uint64_t ObserveBudget() {

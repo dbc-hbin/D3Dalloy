@@ -22,7 +22,7 @@ using namespace metal;
  *   of the cut line.
  * dxmt.conservative.corner returns the attribute weights (zero rejects the corner),
  * dxmt.conservative.corner_position the clip position. `flags`: bits 0-3 corner, bit 4 depth clipping (clip and
- * cull distances only shrink the primitive, the gather applies them).
+ * cull distances only shrink the primitive, the gather applies them); bit 5 FrontCounterClockwise.
  */
 
 namespace {
@@ -34,6 +34,11 @@ float2 ndc_of(float2 screen, float4 viewport) {
 
 /* The plane point projecting onto `ndc` spans the null space of the two projection equations; returns its 1/w. */
 float plane_point(float4 p0, float4 p1, float4 p2, float2 ndc, thread float3 &alpha) {
+  #pragma clang fp contract(off) reassociate(off)
+  const float3 scale = max(max(abs(float3(p0.x, p0.y, p0.w)), abs(float3(p1.x, p1.y, p1.w))),
+                           max(abs(float3(p2.x, p2.y, p2.w)), float3(1.0f)));
+  p0.xyw /= scale; p1.xyw /= scale; p2.xyw /= scale;
+  ndc *= float2(scale.z / scale.x, scale.z / scale.y);
   const float3 w = float3(p0.w, p1.w, p2.w);
   const float3 u = float3(p0.x, p1.x, p2.x) - ndc.x * w;
   const float3 v = float3(p0.y, p1.y, p2.y) - ndc.y * w;
@@ -46,7 +51,7 @@ float plane_point(float4 p0, float4 p1, float4 p2, float2 ndc, thread float3 &al
   const float sum = dot(normal, float3(ndc, 1.0f));
   alpha = a / sum;
   alpha.x = 1.0f - alpha.y - alpha.z;
-  return sum / dot(normal, origin);
+  return (sum / dot(normal, origin)) / scale.z;
 }
 
 } // namespace
@@ -66,6 +71,8 @@ ConservativeCorner corner_of(float4 p0, float4 p1, float4 p2, float4 viewport, u
       dxmt_conservative::clipped_polygon(p0, p1, p2, viewport, nullptr, 0, flags & 16, clipped, det);
   if (!clipped_count)
     return reject;
+  const bool degenerate = !dxmt_conservative::polygon_area(clipped, clipped_count) ||
+      dxmt_conservative::snapped_triangle_degenerate(p0, p1, p2, viewport);
   // Coverage uses the clipped polygon, but interpolation must use the viewport-scaled
   // 16.8 vertices, just as ordinary D3D rasterization does. Extrapolating the
   // unsnapped plane changes both per-sample depth and perspective attributes.
@@ -76,7 +83,7 @@ ConservativeCorner corner_of(float4 p0, float4 p1, float4 p2, float4 viewport, u
     if (positions[i].w == 0.0f)
       continue;
     const float2 screen = rint(dxmt_conservative::screen_of(positions[i], viewport) * 256.0f) / 256.0f;
-    positions[i].xy = ndc_of(screen, viewport) * positions[i].w;
+    if (all(isfinite(screen))) positions[i].xy = ndc_of(screen, viewport) * positions[i].w;
   }
   p0 = positions[0];
   p1 = positions[1];
@@ -92,8 +99,18 @@ ConservativeCorner corner_of(float4 p0, float4 p1, float4 p2, float4 viewport, u
     return reject;
   // Clockwise in NDC (screen y points down).
   const float2 rectangle[4] = {low, float2(high.x, low.y), high, float2(low.x, high.y)};
+  if (degenerate) {
+    // Post-snap degenerates must rasterize, are back-facing under either PSO winding,
+    // and use vertex zero for every interpolated attribute (including depth).
+    if ((flags & 15) >= 5) return reject;
+    const uint k = min(flags & 15, 3u);
+    const uint index = (flags & 32) == 0 && k ? 4 - k : k;
+    const float depth = p0.z / (p0.w != 0.0f ? p0.w : 1.0f);
+    const float clip_w = p0.w > 0.0f ? p0.w : 1.0f;
+    return {float4(1, 0, 0, 1), float4(ndc_of(rectangle[index], viewport) * clip_w, depth * clip_w, clip_w)};
+  }
   // Inside the clipped primitive 1/w >= 1 / max_w > kappa, so the front part always contains it.
-  const float kappa = 1.0f / (max(max(p0.w, p1.w), p2.w) * 1024.0f);
+  const float kappa = (1.0f / max(max(p0.w, p1.w), p2.w)) / 1024.0f;
   float g[4];
   for (uint k = 0; k < 4; k++) {
     float3 alpha;
@@ -161,6 +178,17 @@ float4 conservative_corner_position(float4 p0, float4 p1, float4 p2, float4 view
     asm("dxmt.conservative.corner_position");
 float4 conservative_corner_position(float4 p0, float4 p1, float4 p2, float4 viewport, uint flags) {
   return corner_of(p0, p1, p2, viewport, flags).position;
+}
+
+uint conservative_degenerate(float4 p0, float4 p1, float4 p2, float4 viewport, uint depth_clip)
+    asm("dxmt.conservative.degenerate");
+uint conservative_degenerate(float4 p0, float4 p1, float4 p2, float4 viewport, uint depth_clip) {
+  float det;
+  float2 polygon[dxmt_conservative::kMaxVertices];
+  const uint count = dxmt_conservative::clipped_polygon(p0, p1, p2, viewport, nullptr, 0, depth_clip != 0,
+                                                        polygon, det);
+  return count && (!dxmt_conservative::polygon_area(polygon, count) ||
+                  dxmt_conservative::snapped_triangle_degenerate(p0, p1, p2, viewport));
 }
 
 uint conservative_polygon(float4 p0, float4 p1, float4 p2, float4 viewport, thread const float *clip,

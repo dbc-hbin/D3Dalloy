@@ -29,6 +29,8 @@
 
 namespace dxmt {
 
+class ReservedResource;
+
 enum class BufferAllocationFlag : uint32_t {
   GpuReadonly = 0,
   NoTracking = 0,
@@ -94,6 +96,9 @@ class BufferAllocation final : public Allocation {
   friend class Buffer;
 
 public:
+  WMT::Reference<WMT::Heap> canonicalHeap;
+  uint64_t canonicalHeapOffset = 0;
+  ReservedResource *reservedResource = nullptr;
 
   WMT::Buffer
   buffer() const {

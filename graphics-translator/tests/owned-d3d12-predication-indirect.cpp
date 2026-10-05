@@ -1167,18 +1167,26 @@ void RunIndirectTests(TestContext &context, const std::vector<uint8_t> &computeS
 
 }
 
-void RunMSAAIndexedIndirectMutations(TestContext &context) {
+void RunMSAAIndexedIndirectMutations(TestContext &context, UINT sampleCount) {
+  // Only the ordinary single-sample ICB path records these large arrays.
+  // MSAA resolves live commands at execution: keep its workload at two.
+  const UINT commandCount = sampleCount == 1 ? 16385 : 2;
+  constexpr UINT constantCount = 60;
   static constexpr char source[] = R"(
     RWStructuredBuffer<uint> counts : register(u1);
-    cbuffer Tint : register(b0) { uint value; };
+    cbuffer Tint : register(b0) { uint4 payload[15]; };
+    Texture2D<float4> black : register(t0);
+    SamplerState borderWhite : register(s0);
     struct VOut { float4 position : SV_Position; nointerpolation float tint : COLOR0; };
     VOut vs(float4 position : POSITION) {
       uint old; InterlockedAdd(counts[0], 1, old);
-      VOut result; result.position = position; result.tint = value * .25; return result;
+      VOut result; result.position = position;
+      result.tint = payload[14].w == payload[0].x + 59 ? payload[0].x * .25 : 0;
+      return result;
     }
     float4 ps(VOut input) : SV_Target0 {
       uint old; InterlockedAdd(counts[1], 1, old);
-      return float4(input.tint, 0, 0, 1);
+      return float4(input.tint * black.SampleLevel(borderWhite, float2(-2,-2), 0).r, 0, 0, 1);
     }
   )";
   ComPtr<ID3DBlob> vs, ps, errors;
@@ -1195,17 +1203,34 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
     std::fprintf(stderr, "%.*s\n", static_cast<int>(errors->GetBufferSize()),
                  static_cast<const char *>(errors->GetBufferPointer()));
   check(shaderResult, "msaa-indirect-ps");
-  D3D12_ROOT_PARAMETER roots[2] = {};
+  D3D12_ROOT_PARAMETER roots[3] = {};
   roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
   roots[0].Descriptor.ShaderRegister = 1;
   roots[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   roots[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   roots[1].Constants.ShaderRegister = 0;
-  roots[1].Constants.Num32BitValues = 1;
+  roots[1].Constants.Num32BitValues = constantCount;
   roots[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+  D3D12_DESCRIPTOR_RANGE sampleRange = {};
+  sampleRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  sampleRange.NumDescriptors = 1;
+  roots[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  roots[2].DescriptorTable = {1, &sampleRange};
+  roots[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_STATIC_SAMPLER_DESC sampler = {};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+  sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+  sampler.MaxAnisotropy = 1;
+  sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+  sampler.MaxLOD = D3D12_FLOAT32_MAX;
+  sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
   D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-  rootDesc.NumParameters = 2;
+  rootDesc.NumParameters = 3;
   rootDesc.pParameters = roots;
+  rootDesc.NumStaticSamplers = 1;
+  rootDesc.pStaticSamplers = &sampler;
+  rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
   ComPtr<ID3DBlob> serialized;
   check(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors),
         "msaa-indirect-root-serialize");
@@ -1215,14 +1240,14 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
   D3D12_INDIRECT_ARGUMENT_DESC args[5] = {};
   args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
   args[0].Constant.RootParameterIndex = 1;
-  args[0].Constant.Num32BitValuesToSet = 1;
+  args[0].Constant.Num32BitValuesToSet = constantCount;
   args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW;
   args[1].UnorderedAccessView.RootParameterIndex = 0;
   args[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
-  args[2].VertexBuffer.Slot = 3;
+  args[2].VertexBuffer.Slot = 31;
   args[3].Type = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
   args[4].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
-  constexpr UINT stride = 4 + 8 + sizeof(D3D12_VERTEX_BUFFER_VIEW) +
+  constexpr UINT stride = constantCount * 4 + 8 + sizeof(D3D12_VERTEX_BUFFER_VIEW) +
                           sizeof(D3D12_INDEX_BUFFER_VIEW) + sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
   D3D12_COMMAND_SIGNATURE_DESC signatureDesc = {};
   signatureDesc.ByteStride = stride;
@@ -1231,7 +1256,7 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
   ComPtr<ID3D12CommandSignature> signature;
   check(context.device->CreateCommandSignature(&signatureDesc, root.Get(), IID_PPV_ARGS(&signature)),
         "msaa-indirect-signature");
-  D3D12_INPUT_ELEMENT_DESC input = {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 3, 0,
+  D3D12_INPUT_ELEMENT_DESC input = {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 31, 0,
                                     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
   pso.pRootSignature = root.Get();
@@ -1247,23 +1272,38 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
   pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pso.NumRenderTargets = 1;
   pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-  pso.SampleDesc.Count = 4;
+  pso.SampleDesc.Count = sampleCount;
   ComPtr<ID3D12PipelineState> pipeline;
   check(context.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&pipeline)),
         "msaa-indirect-pipeline");
+  ComPtr<ID3D12PipelineState> postGrowthPipeline;
+  if (sampleCount == 1) {
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+    check(context.device->CreateGraphicsPipelineState(&pso,IID_PPV_ARGS(&postGrowthPipeline)),
+          "arena-post-growth-pipeline");
+  }
   // Multisampled textures cannot be copied to a readback buffer directly.
   // Load every sample on the GPU, preserving the per-sample color evidence.
   static constexpr char readSource[] = R"(
+    #if SAMPLE_COUNT == 1
+    Texture2D<float4> color : register(t0);
+    #else
     Texture2DMS<float4> color : register(t0);
+    #endif
     RWStructuredBuffer<uint4> pixels : register(u0);
     [numthreads(4,2,1)] void main(uint3 id : SV_DispatchThreadID) {
-      for (uint sample = 0; sample < 4; ++sample)
+      #if SAMPLE_COUNT == 1
+        pixels[id.y*4 + id.x] = uint4(round(color.Load(int3(id.xy,0))*255));
+      #else
+      for (uint sample = 0; sample < SAMPLE_COUNT; ++sample)
         pixels[sample*8 + id.y*4 + id.x] = uint4(round(color.Load(int2(id.xy),sample)*255));
+      #endif
     }
   )";
   ComPtr<ID3DBlob> cs;
   errors.Reset();
-  check(D3DCompile(readSource,sizeof(readSource)-1,nullptr,nullptr,nullptr,"main","cs_5_0",
+  const D3D_SHADER_MACRO macros[] = {{"SAMPLE_COUNT",sampleCount == 1 ? "1" : "4"},{nullptr,nullptr}};
+  check(D3DCompile(readSource,sizeof(readSource)-1,nullptr,macros,nullptr,"main","cs_5_0",
                    D3DCOMPILE_ENABLE_STRICTNESS,0,&cs,&errors),"msaa-indirect-reader-compile");
   D3D12_DESCRIPTOR_RANGE range = {};
   range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -1291,11 +1331,22 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
         "msaa-indirect-reader-pipeline");
   D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
   srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  srvHeapDesc.NumDescriptors = 1;
+  srvHeapDesc.NumDescriptors = 2;
   srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   ComPtr<ID3D12DescriptorHeap> srvHeap;
   check(context.device->CreateDescriptorHeap(&srvHeapDesc,IID_PPV_ARGS(&srvHeap)),
         "msaa-indirect-srv-heap");
+  auto sampleCpu = srvHeap->GetCPUDescriptorHandleForHeapStart();
+  auto sampleGpu = srvHeap->GetGPUDescriptorHandleForHeapStart();
+  const UINT descriptorSize = context.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  sampleCpu.ptr += descriptorSize;
+  sampleGpu.ptr += descriptorSize;
+  auto blackUpload = createBuffer(context.device.Get(),256,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+  const std::array<uint8_t,256> blackBytes = {};
+  writeUpload(blackUpload.Get(),blackBytes.data(),blackBytes.size());
+  auto predicate = createBuffer(context.device.Get(),16,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+  const UINT64 predicates[] = {1,0};
+  writeUpload(predicate.Get(),predicates,sizeof(predicates));
   using Vertex = std::array<float,4>;
   // Both index buffers are valid. The opposite VB/IB combination selects an
   // offscreen triangle, so forwarding a stale view cannot masquerade as pass.
@@ -1319,7 +1370,7 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
   texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   texture.Width = 4; texture.Height = 2; texture.DepthOrArraySize = 1; texture.MipLevels = 1;
   texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  texture.SampleDesc.Count = 4;
+  texture.SampleDesc.Count = sampleCount;
   texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
   D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
   heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heapDesc.NumDescriptors = 1;
@@ -1334,9 +1385,30 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
     context.device->CreateRenderTargetView(color.Get(),nullptr,rtv);
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
     srv.Format = texture.Format;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    srv.ViewDimension = sampleCount == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D : D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    if (sampleCount == 1) srv.Texture2D.MipLevels = 1;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     context.device->CreateShaderResourceView(color.Get(),&srv,srvHeap->GetCPUDescriptorHandleForHeapStart());
+    auto sampleDesc = texture;
+    sampleDesc.Width = sampleDesc.Height = 1;
+    sampleDesc.SampleDesc.Count = 1;
+    sampleDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    ComPtr<ID3D12Resource> sampleTexture;
+    check(context.device->CreateCommittedResource(&properties,D3D12_HEAP_FLAG_NONE,&sampleDesc,
+          D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&sampleTexture)),"msaa-indirect-sample-texture");
+    D3D12_SHADER_RESOURCE_VIEW_DESC sampleSrv = {};
+    sampleSrv.Format = sampleDesc.Format;
+    sampleSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sampleSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sampleSrv.Texture2D.MipLevels = 1;
+    context.device->CreateShaderResourceView(sampleTexture.Get(),&sampleSrv,sampleCpu);
+    D3D12_QUERY_HEAP_DESC queryDesc = {};
+    queryDesc.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+    queryDesc.Count = 1;
+    ComPtr<ID3D12QueryHeap> query;
+    check(context.device->CreateQueryHeap(&queryDesc,IID_PPV_ARGS(&query)),"msaa-indirect-query");
+    auto statsReadback = createBuffer(context.device.Get(),sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS),
+                                     D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
     auto image = createBuffer(context.device.Get(),32*16,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
     auto imageUav = createBuffer(context.device.Get(),32*16,D3D12_HEAP_TYPE_DEFAULT,
                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -1347,29 +1419,42 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto zero = createBuffer(context.device.Get(),8,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
     const uint64_t zeros = 0; writeUpload(zero.Get(),&zeros,8);
-    auto arguments = createBuffer(context.device.Get(),stride*2,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto arguments = createBuffer(context.device.Get(),stride*commandCount,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
     auto count = createBuffer(context.device.Get(),4,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
-    std::array<uint8_t,stride*2> records = {};
+    std::vector<uint8_t> records(stride*commandCount);
     auto pack = [&](UINT n,uint32_t tint,D3D12_GPU_VIRTUAL_ADDRESS uav,
-                    const D3D12_VERTEX_BUFFER_VIEW &vb,const D3D12_INDEX_BUFFER_VIEW &ib) {
+                    const D3D12_VERTEX_BUFFER_VIEW &vb,const D3D12_INDEX_BUFFER_VIEW &ib,UINT vertices) {
       uint8_t *p = records.data()+n*stride;
-      const D3D12_DRAW_INDEXED_ARGUMENTS draw = {3,1,0,0,0};
-      std::memcpy(p,&tint,4); p+=4;
+      const D3D12_DRAW_INDEXED_ARGUMENTS draw = {vertices,1,0,0,0};
+      std::array<UINT,constantCount> constants;
+      for (UINT i = 0; i < constantCount; ++i) constants[i] = tint+i;
+      std::memcpy(p,constants.data(),sizeof(constants)); p+=sizeof(constants);
       std::memcpy(p,&uav,8); p+=8;
       std::memcpy(p,&vb,sizeof(vb)); p+=sizeof(vb);
       std::memcpy(p,&ib,sizeof(ib)); p+=sizeof(ib);
       std::memcpy(p,&draw,sizeof(draw));
     };
-    pack(0,1,first->GetGPUVirtualAddress(),viewA,indexA);
-    pack(1,1,first->GetGPUVirtualAddress(),viewA,indexA);
+    for (UINT i = 0; i < commandCount; ++i)
+      pack(i,1,first->GetGPUVirtualAddress(),viewA,indexA,i == 0 ? 3 : 0);
     writeUpload(arguments.Get(),records.data(),records.size());
-    const uint32_t one = 1; writeUpload(count.Get(),&one,4);
+    const UINT one = 1; writeUpload(count.Get(),&one,sizeof(one));
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     check(context.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),
           "msaa-indirect-allocator");
     check(context.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),pipeline.Get(),
                                             IID_PPV_ARGS(&list)),"msaa-indirect-list");
+    D3D12_TEXTURE_COPY_LOCATION sampleSource = {};
+    sampleSource.pResource = blackUpload.Get();
+    sampleSource.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    sampleSource.PlacedFootprint.Footprint = {sampleDesc.Format,1,1,1,256};
+    D3D12_TEXTURE_COPY_LOCATION sampleDestination = {};
+    sampleDestination.pResource = sampleTexture.Get();
+    sampleDestination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&sampleDestination,0,0,0,&sampleSource,nullptr);
+    auto sampleBarrier = transition(sampleTexture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(1,&sampleBarrier);
     list->CopyBufferRegion(first.Get(),0,zero.Get(),0,8);
     list->CopyBufferRegion(second.Get(),0,zero.Get(),0,8);
     D3D12_RESOURCE_BARRIER begin[] = {
@@ -1381,12 +1466,38 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
     list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
     D3D12_VIEWPORT viewport = {0,0,4,2,0,1}; D3D12_RECT scissor = {0,0,4,2};
     list->RSSetViewports(1,&viewport); list->RSSetScissorRects(1,&scissor);
+    ID3D12DescriptorHeap *heaps[] = {srvHeap.Get()};
+    list->SetDescriptorHeaps(1,heaps);
     list->SetGraphicsRootSignature(root.Get());
+    list->SetGraphicsRootDescriptorTable(2,sampleGpu);
     list->SetGraphicsRootUnorderedAccessView(0,second->GetGPUVirtualAddress());
     list->SetGraphicsRoot32BitConstant(1,3,0);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->IASetVertexBuffers(3,1,&viewA); list->IASetIndexBuffer(&indexA);
-    list->ExecuteIndirect(signature.Get(),2,arguments.Get(),0,count.Get(),0);
+    list->IASetVertexBuffers(31,1,&viewA); list->IASetIndexBuffer(&indexA);
+    // Prime the cached counter allocation, but leave no query active on
+    // the large ICB draw: active statistics select the execution-owned path.
+    list->BeginQuery(query.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
+    if (sampleCount == 1)
+      list->EndQuery(query.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
+    list->SetPredication(predicate.Get(),0,D3D12_PREDICATION_OP_EQUAL_ZERO);
+    list->ExecuteIndirect(signature.Get(),commandCount,arguments.Get(),0,count.Get(),0);
+    list->SetGraphicsRootUnorderedAccessView(0,second->GetGPUVirtualAddress());
+    std::array<UINT,constantCount> forbidden;
+    for (UINT i = 0; i < constantCount; ++i) forbidden[i] = 3+i;
+    list->SetGraphicsRoot32BitConstants(1,constantCount,forbidden.data(),0);
+    list->IASetVertexBuffers(31,1,&viewB); list->IASetIndexBuffer(&indexB);
+    if (sampleCount == 1) {
+      list->SetPipelineState(postGrowthPipeline.Get());
+      list->BeginQuery(query.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
+      // The direct draw reuses the original counter chunk after root/VB
+      // growth. Disable color writes so it cannot hide indirect root errors.
+      list->DrawIndexedInstanced(3,1,0,0,0);
+    }
+    list->SetPredication(predicate.Get(),8,D3D12_PREDICATION_OP_EQUAL_ZERO);
+    list->DrawIndexedInstanced(3,1,0,0,0);
+    list->SetPredication(nullptr,0,D3D12_PREDICATION_OP_EQUAL_ZERO);
+    list->EndQuery(query.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0);
+    list->ResolveQueryData(query.Get(),D3D12_QUERY_TYPE_PIPELINE_STATISTICS,0,1,statsReadback.Get(),0);
     D3D12_RESOURCE_BARRIER end[] = {
       transition(first.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE),
       transition(second.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -1396,7 +1507,6 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
     list->CopyBufferRegion(countReadback.Get(),8,second.Get(),0,8);
     list->SetPipelineState(readPipeline.Get());
     list->SetComputeRootSignature(readRoot.Get());
-    ID3D12DescriptorHeap *heaps[] = {srvHeap.Get()};
     list->SetDescriptorHeaps(1,heaps);
     list->SetComputeRootDescriptorTable(0,srvHeap->GetGPUDescriptorHandleForHeapStart());
     list->SetComputeRootUnorderedAccessView(1,imageUav->GetGPUVirtualAddress());
@@ -1409,20 +1519,28 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
     // The second queue submission must observe data changed after Close,
     // not the initial record/count copied by any recording-time resolver.
     if (requested == 2) {
-      pack(1,2,second->GetGPUVirtualAddress(),viewB,indexB);
+      pack(commandCount-1,2,second->GetGPUVirtualAddress(),viewB,indexB,3);
       writeUpload(arguments.Get(),records.data(),records.size());
-      writeUpload(count.Get(),&requested,4);
+      writeUpload(count.Get(),&commandCount,sizeof(commandCount));
     }
     context.submitClosed(list.Get());
+    D3D12_QUERY_DATA_PIPELINE_STATISTICS *stats = nullptr;
+    check(statsReadback->Map(0,nullptr,reinterpret_cast<void **>(&stats)),"msaa-indirect-stats-map");
+    const UINT queriedDraws = sampleCount == 1 ? 1 : requested;
+    require(stats->IAVertices == queriedDraws*3 && stats->IAPrimitives == queriedDraws &&
+            stats->VSInvocations == queriedDraws*3 && stats->PSInvocations == queriedDraws*8,
+            "msaa-indirect-cross-chunk-cached-statistics");
+    statsReadback->Unmap(0,nullptr);
     uint32_t *observed = nullptr;
     check(countReadback->Map(0,nullptr,reinterpret_cast<void **>(&observed)),"msaa-indirect-count-map");
     require(observed[0] == 3 && observed[1] == 8,"msaa-indirect-first-exactly-once");
-    require(observed[2] == (requested == 2 ? 3u : 0u) &&
-            observed[3] == (requested == 2 ? 8u : 0u),"msaa-indirect-second-exactly-once");
+    const UINT secondDraws = (requested == 2 ? 1u : 0u) + (sampleCount == 1 ? 1u : 0u);
+    require(observed[2] == secondDraws*3 && observed[3] == secondDraws*8,
+            "msaa-indirect-second-exactly-once");
     countReadback->Unmap(0,nullptr);
     uint32_t *pixels = nullptr;
     check(image->Map(0,nullptr,reinterpret_cast<void **>(&pixels)),"msaa-indirect-color-map");
-    for (UINT sample = 0; sample < 4; ++sample)
+    for (UINT sample = 0; sample < sampleCount; ++sample)
       for (UINT y = 0; y < 2; ++y)
         for (UINT x = 0; x < 4; ++x) {
           const uint32_t *pixel = pixels+4*(sample*8+y*4+x);
@@ -1432,7 +1550,11 @@ void RunMSAAIndexedIndirectMutations(TestContext &context) {
         }
     image->Unmap(0,nullptr);
   }
-  std::puts("OWNED_D3D12_PREDICATION_INDIRECT_MSAA_INDEXED_MUTATIONS_PASS counts=1,2 samples=4");
+  if (sampleCount == 4)
+    std::puts("OWNED_D3D12_PREDICATION_INDIRECT_MSAA_INDEXED_MUTATIONS_PASS counts=1,2 samples=4");
+  else
+    std::printf("OWNED_D3D12_PREDICATION_INDIRECT_ARENA_BINDINGS_PASS commands=%u "
+                "first_last=1 static_sampler=1 vertex_slot=31 cached_statistics_after_growth=1 predicate_skip=1\n",commandCount);
 }
 
 } // namespace
@@ -1451,7 +1573,8 @@ int main(int argc, char **argv) {
   RunBufferUavRectangleTests(context);
   std::puts("OWNED_D3D12_PREDICATION_INDIRECT_CLEAR_CASES_PASS");
   RunIndirectTests(context, computeShader, vertexShader);
-  RunMSAAIndexedIndirectMutations(context);
+  RunMSAAIndexedIndirectMutations(context,4);
+  RunMSAAIndexedIndirectMutations(context,1);
   std::puts("OWNED_D3D12_PREDICATION_INDIRECT_INDIRECT_CASES_PASS");
   std::puts("OWNED_D3D12_PREDICATION_INDIRECT_PASS");
   return 0;
