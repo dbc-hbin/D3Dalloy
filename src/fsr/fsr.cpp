@@ -151,8 +151,12 @@ ffxReturnCode_t dispatch(Context &context, const ffxDispatchDescUpscale &desc) {
     return FFX_API_RETURN_ERROR_PARAMETER;
   for (float scalar : {desc.jitterOffset.x, desc.jitterOffset.y, desc.motionVectorScale.x,
       desc.motionVectorScale.y, desc.preExposure, desc.sharpness, desc.frameTimeDelta,
-      desc.cameraNear, desc.cameraFar, desc.cameraFovAngleVertical, desc.viewSpaceToMetersFactor})
+      desc.cameraNear, desc.cameraFovAngleVertical, desc.viewSpaceToMetersFactor})
     if (!std::isfinite(scalar)) return FFX_API_RETURN_ERROR_PARAMETER;
+  // The pinned FSR infinite-depth transform accepts a positive-infinite far plane.
+  if (!std::isfinite(desc.cameraFar) &&
+      (!(context.flags & FFX_UPSCALE_ENABLE_DEPTH_INFINITE) ||
+       desc.cameraFar != std::numeric_limits<float>::infinity())) return FFX_API_RETURN_ERROR_PARAMETER;
   if (!desc.motionVectorScale.x || !desc.motionVectorScale.y || desc.preExposure <= 0 ||
       desc.sharpness < 0 || desc.sharpness > 1 || desc.frameTimeDelta < 0) return FFX_API_RETURN_ERROR_PARAMETER;
   if (desc.flags & ~(FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW | FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB |

@@ -297,6 +297,12 @@ void fsrErrorCases(const FsrApi& api, Gpu& gpu, FsrCreation& creation, ffxContex
     reject(bad, FFX_API_RETURN_ERROR_PARAMETER, "output_above_max");
     bad = valid; bad.jitterOffset.x = std::numeric_limits<float>::quiet_NaN();
     reject(bad, FFX_API_RETURN_ERROR_PARAMETER, "nan_jitter");
+    bad = valid; bad.cameraFar = std::numeric_limits<float>::infinity();
+    reject(bad, FFX_API_RETURN_ERROR_PARAMETER, "infinite_far_without_infinite_depth");
+    bad = valid; bad.cameraFar = std::numeric_limits<float>::quiet_NaN();
+    reject(bad, FFX_API_RETURN_ERROR_PARAMETER, "nan_far");
+    bad = valid; bad.viewSpaceToMetersFactor = std::numeric_limits<float>::quiet_NaN();
+    reject(bad, FFX_API_RETURN_ERROR_PARAMETER, "nan_world_scale");
     bad = valid; bad.preExposure = 0;
     reject(bad, FFX_API_RETURN_ERROR_PARAMETER, "zero_pre_exposure");
     bad = valid; bad.color.description.width++;
@@ -722,6 +728,7 @@ void fsrExposureReplay(const FsrApi& api, Gpu& gpu, ID3D12Resource* depth, ID3D1
 
 void fsrFullBehavior(const FsrApi& api, Gpu& gpu, ID3D12Resource* depth, ID3D12Resource* motion) {
     FsrCreation creation(gpu.device.Get());
+    float cameraFar = 1000.0f;
     auto color = makeColor(gpu, 112);
     auto highMotion = makeMotion(gpu, DXGI_FORMAT_R16G16_FLOAT, 128, 128);
     auto mask = createTexture(gpu.device.Get(), 64, 64, DXGI_FORMAT_R8_UNORM,
@@ -736,6 +743,7 @@ void fsrFullBehavior(const FsrApi& api, Gpu& gpu, ID3D12Resource* depth, ID3D12R
         auto output = makeOutput(gpu, 1400);
         auto recording = gpu.makeRecording();
         auto desc = fsrFrame(recording.list.Get(), input ? input : color.Get(), depth, mv, output.resource.Get());
+        desc.cameraFar = cameraFar;
         desc.upscaleSize = {width, height};
         desc.reset = reset;
         desc.flags = transfer;
@@ -767,6 +775,18 @@ void fsrFullBehavior(const FsrApi& api, Gpu& gpu, ID3D12Resource* depth, ID3D12R
                             highMotion.Get() : motion, 0, false, true, false, false, nullptr, 64, false, true);
         fsrEqualPixels(image, poisoned, "auto_exposure_ignores_poison_texture");
         fsrResult(api.destroy(&context, nullptr), FFX_API_RETURN_OK, "full_motion_destroy");
+    }
+    for (uint32_t reversed : {uint32_t(0), uint32_t(FFX_UPSCALE_ENABLE_DEPTH_INVERTED)}) {
+        creation.desc.flags = (kFsrFlags & ~FFX_UPSCALE_ENABLE_DEPTH_INVERTED) |
+            FFX_UPSCALE_ENABLE_DEPTH_INFINITE | reversed;
+        ffxContext infiniteContext = nullptr;
+        fsrResult(api.create(&infiniteContext, &creation.desc.header, nullptr), FFX_API_RETURN_OK, "infinite_depth_create");
+        auto finiteFar = run(&infiniteContext, 128, 128, motion, 0, false, true, false, false);
+        cameraFar = std::numeric_limits<float>::infinity();
+        auto infiniteFar = run(&infiniteContext, 128, 128, motion, 0, false, true, false, false);
+        fsrEqualPixels(finiteFar, infiniteFar, "infinite_depth_far_equivalence");
+        cameraFar = 1000.0f;
+        fsrResult(api.destroy(&infiniteContext, nullptr), FFX_API_RETURN_OK, "infinite_depth_destroy");
     }
     creation.desc.flags = (kFsrFlags & ~FFX_UPSCALE_ENABLE_AUTO_EXPOSURE) | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
     ffxContext context = nullptr;
