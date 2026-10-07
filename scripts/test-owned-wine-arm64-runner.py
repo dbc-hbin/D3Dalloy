@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that an interrupted guest retains observed execution evidence."""
+"""Check native/FEX guest execution evidence without launching a guest."""
 from __future__ import annotations
 
 import contextlib
@@ -21,6 +21,18 @@ SPEC.loader.exec_module(runner)
 
 
 class RunnerTests(unittest.TestCase):
+    def test_fex_probe_requires_one_entry_and_nonempty_success_per_execution(self) -> None:
+        for key in runner.FEX_PROBES.values():
+            entry = '{"guest_entry":true,"pointer_bits":64}\n'
+            check = json.dumps({key: "PASS", "cases": 32}) + "\n"
+            accepted = entry + check
+            self.assertTrue(runner.fex_probe_evidence(accepted, key)["passed"])
+            for rejected in (entry, check, accepted + check, accepted + entry,
+                             accepted.replace("PASS", "FAIL"), accepted.replace("32", "0"),
+                             accepted.replace("32", "true"), accepted.replace("32", '"32"')):
+                with self.subTest(key=key, output=rejected):
+                    self.assertFalse(runner.fex_probe_evidence(rejected, key)["passed"])
+
     def test_smoke_requires_all_ordered_exact_frames_and_final_success(self) -> None:
         frames = [f"OWNED_D3D12_SMOKE_FRAME frame={index} readback=ok present=skipped" for index in range(8)]
         accepted = "\n".join([*frames, "OWNED_D3D12_SMOKE_PASS"])
@@ -46,6 +58,8 @@ class RunnerTests(unittest.TestCase):
                     guest.wait.side_effect = [subprocess.TimeoutExpired(['wine'], 1), -9]
 
                     def spawn(command, **kwargs):
+                        self.assertEqual(kwargs['env'].get('WINEMSYNC'), '1' if entered else None)
+                        self.assertEqual(kwargs['env']['WINEDLLOVERRIDES'], runner.stage.owned_overrides() + ';mscoree,mshtml=')
                         if command[0].endswith('wineserver'):
                             return server
                         if entered:
@@ -57,6 +71,8 @@ class RunnerTests(unittest.TestCase):
 
                     arguments = ['runner', '--runtime', str(runtime), '--fixture', str(base),
                                  '--output', str(output), '--timeout', '1', '--suite', suite]
+                    if entered:
+                        arguments.append('--msync')
                     with mock.patch.object(sys, 'argv', arguments), \
                          mock.patch.object(runner, 'inspect_pe', return_value={'windows_abi': 'arm64'}), \
                          mock.patch.object(runner.subprocess, 'Popen', side_effect=spawn), \

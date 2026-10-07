@@ -149,7 +149,9 @@ def main() -> int:
         shutil.copytree(source, snapshot, ignore=shutil.ignore_patterns(".git"))
         for name in ("fex-darwin-user-shared-data.patch", "fex-darwin-jit-write-scope.patch",
                      "fex-darwin-native-jit-allocation.patch", "fex-darwin-guest-window.patch",
-                     "fex-darwin-guest-window-front.patch"):
+                     "fex-darwin-guest-window-front.patch", "fex-darwin-callret-guard.patch",
+                     "fex-upstream-thread-termination.patch", "fex-upstream-pcmpxstrx.patch",
+                     "fex-upstream-disk-cache.patch"):
             patch = root / "scripts/patches" / name
             result["source_patches"].append({"path": str(patch), "sha256": hashlib.sha256(patch.read_bytes()).hexdigest()})
             run(["/usr/bin/patch", "--batch", "--fuzz=0", "-p1", "-i", str(patch)], name, snapshot)
