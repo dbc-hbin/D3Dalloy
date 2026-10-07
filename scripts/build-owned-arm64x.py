@@ -31,6 +31,25 @@ MODULES = {
     "d3d12": "src/d3d12/d3d12.dll",
     "d3d12core": "src/d3d12/d3d12core.dll",
 }
+OPTIONAL_MODULES = {
+    "nvapi": {"nvapi64": "src/nvapi/nvapi64.dll"},
+    "nvngx": {"nvngx": "src/nvngx/nvngx.dll"},
+    "fsr": {
+        "amd_fidelityfx_upscaler_dx12": "src/fsr/amd_fidelityfx_upscaler_dx12.dll",
+        "amd_fidelityfx_framegeneration_dx12": "src/fsrfg/amd_fidelityfx_framegeneration_dx12.dll",
+    },
+}
+
+
+def build_selection(args: argparse.Namespace) -> tuple[dict[str, str], dict[str, bool]]:
+    modules = dict(MODULES)
+    options = {}
+    for frontend, additions in OPTIONAL_MODULES.items():
+        enabled = getattr(args, "enable_" + frontend)
+        options["enable_" + frontend] = enabled
+        if enabled:
+            modules.update(additions)
+    return modules, options
 
 
 def complete_tls_fixups(image: Path, link_map: Path) -> None:
@@ -201,7 +220,11 @@ def main() -> int:
     parser.add_argument("--wine-source", type=Path, required=True, help="existing pinned Wine source snapshot, read-only")
     parser.add_argument("--llvm-mingw", type=Path, default=Path("/opt/llvm-mingw-20260616-ucrt-macos-universal"))
     parser.add_argument("--jobs", type=int, default=8)
+    for frontend in OPTIONAL_MODULES:
+        parser.add_argument("--with-" + frontend, dest="enable_" + frontend, action="store_true",
+                            help="build and pair the owned " + frontend + " frontends")
     args = parser.parse_args()
+    modules, meson_options = build_selection(args)
     root = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
     source = args.wine_source.resolve()
@@ -221,7 +244,8 @@ def main() -> int:
     }
     result = {"schema": 1, "status": "building", "native_arch": "arm64", "windows_abi": "arm64x",
               "guest_runtime": "not_run", "scope": "fresh production PE build; not Wine/FEX execution acceptance",
-              "commands": [], "inputs": [], "artifacts": [], "wine_source": str(source)}
+              "commands": [], "inputs": [], "artifacts": [], "wine_source": str(source),
+              "meson_options": meson_options, "modules": modules}
 
     def run(command: list[str], name: str, cwd: Path = root) -> str:
         log = logs / (name + ".log")
@@ -297,13 +321,14 @@ def main() -> int:
                  "--native-file", str(root / "build-native-arm64.txt"), "-Dnative_arch=arm64",
                  "-Dbuild_native_components=false", "-Dwine_build_path=" + str(sdk),
                  "-Denable_d3d12=true", "-Dwine_builtin_dll=true", "-Dd3d12_core_generation=" + core_generation,
+                 *["-D" + name + "=" + str(enabled).lower() for name, enabled in meson_options.items()],
                  "--buildtype=debugoptimized"], abi + "-meson-setup")
             run([ninja, "-C", str(build), "-j", str(args.jobs),
                  *[relative if module == "d3d12core" else relative + ".postproc"
-                   for module, relative in MODULES.items()]], abi + "-meson-build")
+                   for module, relative in modules.items()]], abi + "-meson-build")
             commands[abi] = {}
             baselines[abi] = {}
-            for module, relative in MODULES.items():
+            for module, relative in modules.items():
                 text = run([ninja, "-C", str(build), "-t", "commands", relative], abi + "-" + module + "-graph")
                 link = shlex.split(text.splitlines()[-1])
                 if "-shared" not in link or relative not in link:
@@ -342,7 +367,7 @@ def main() -> int:
                          'BOOL WINAPI DllMain(HINSTANCE i, DWORD r, LPVOID p) { return TRUE; }\n')
         paired = output / "aarch64-windows"
         paired.mkdir()
-        for module in ("paired-dll-probe", *MODULES):
+        for module in ("paired-dll-probe", *modules):
             objects = []
             libraries = []
             specs = []

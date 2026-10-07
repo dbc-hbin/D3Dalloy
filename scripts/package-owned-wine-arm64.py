@@ -19,10 +19,15 @@ def main() -> int:
     parser.add_argument("--paired-build", type=Path, help="accepted build-owned-arm64x.py production closure for an ARM64X runtime")
     parser.add_argument("--fex-build", type=Path, help="accepted build-owned-fex-windows.py output")
     parser.add_argument("--with-wow64", action="store_true", help="compile owned PE32 frontends against this native Wine SDK")
+    parser.add_argument("--with-nvapi", action="store_true", help="build and stage the owned NVAPI frontend")
+    parser.add_argument("--with-nvngx", action="store_true", help="build and stage the owned NGX frontend")
+    parser.add_argument("--with-fsr", action="store_true", help="build and stage owned FSR upscaling and frame generation")
     parser.add_argument("--llvm-mingw", type=Path, default=Path("/opt/llvm-mingw-20260616-ucrt-macos-universal"))
     parser.add_argument("--native-llvm", type=Path, default=Path("toolchains/llvm-15-arm64/llvm@15/15.0.7"))
     parser.add_argument("--jobs", type=int, default=8)
     args = parser.parse_args()
+    optional = {"nvapi": args.with_nvapi, "nvngx": args.with_nvngx, "fsr": args.with_fsr}
+    feature_options = [f"-Denable_{name}={str(enabled).lower()}" for name, enabled in optional.items()]
     root = Path(__file__).resolve().parents[1]
     output, wine = args.output.resolve(), args.wine_build.resolve()
     if args.jobs < 1 or output.exists() or not output.is_relative_to(root / "build/local"):
@@ -76,7 +81,7 @@ def main() -> int:
              "--native-file", str(root / "build-native-arm64.txt"), "--prefix", str(install),
              "-Dnative_arch=arm64", "-Dnative_llvm_path=" + llvm_option,
              "-Dwine_build_path=" + wine_option, "-Denable_d3d12=true",
-             "-Dwine_builtin_dll=true", "--buildtype=debugoptimized"], "owned-setup")
+             "-Dwine_builtin_dll=true", *feature_options, "--buildtype=debugoptimized"], "owned-setup")
         run(["ninja", "-C", str(owned), "-j" + str(args.jobs)], "owned-build")
         run(["meson", "install", "-C", str(owned), "--no-rebuild"], "owned-install")
         if args.with_wow64:
@@ -86,7 +91,7 @@ def main() -> int:
                  "--native-file", str(root / "build-native-arm64.txt"), "--prefix", str(install32),
                  "-Dnative_arch=arm64", "-Dbuild_native_components=false",
                  "-Dwine_build_path=" + wine_option, "-Denable_d3d12=true",
-                 "-Dwine_builtin_dll=true", "--buildtype=debugoptimized"], "owned32-setup")
+                 "-Dwine_builtin_dll=true", *feature_options, "--buildtype=debugoptimized"], "owned32-setup")
             run(["ninja", "-C", str(owned32), "-j" + str(args.jobs)], "owned32-build")
             run(["meson", "install", "-C", str(owned32), "--no-rebuild"], "owned32-install")
             result["owned_install32"] = str(install32)
@@ -99,6 +104,13 @@ def main() -> int:
             if (evidence["status"] != "pass" or evidence["windows_abi"] != "arm64x" or
                     any(source_cut.get(name) != digest for name, digest in paired_cut.items())):
                 raise RuntimeError("paired DLLs must match the accepted owned source cut")
+            required_modules = {"nvapi64.dll"} if args.with_nvapi else set()
+            if args.with_nvngx:
+                required_modules.add("nvngx.dll")
+            if args.with_fsr:
+                required_modules.update(("amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll"))
+            if not required_modules.issubset(Path(artifact["path"]).name for artifact in evidence["artifacts"]):
+                raise RuntimeError("paired build is missing selected optional frontends")
             for artifact in evidence["artifacts"]:
                 image = Path(artifact["path"])
                 if hashlib.sha256(image.read_bytes()).hexdigest() != artifact["sha256"]:
@@ -108,6 +120,7 @@ def main() -> int:
         run([sys.executable, str(root / "scripts/stage-owned-graphics.py"), "stage", "--dxmt-install", str(install),
              "--wine-source", str(wine / "runtime"), "--wine-dest", str(staged),
              "--native-arch", "arm64", "--windows-abi", windows_abi,
+             *[f"--with-{name}" for name, enabled in optional.items() if enabled],
              *(["--dxmt-install32", str(install32)] if args.with_wow64 else []),
              *(["--fex-build", str(args.fex_build.resolve())] if args.fex_build else [])], "stage")
         run([sys.executable, str(root / "scripts/stage-owned-graphics.py"), "verify", "--runtime", str(staged)], "verify")
