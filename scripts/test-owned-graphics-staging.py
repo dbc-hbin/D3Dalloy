@@ -678,6 +678,7 @@ class StagingPolicyTests(unittest.TestCase):
             'printf "CX_ACTIVE_GRAPHICS_BACKEND=%s\n" "${CX_ACTIVE_GRAPHICS_BACKEND-}"\n'
             'printf "WINEDLLOVERRIDES=%s\n" "${WINEDLLOVERRIDES-}"\n'
             'printf "DXMT_ENABLE_NVEXT=%s\n" "${DXMT_ENABLE_NVEXT-}"\n'
+            'printf "FEX_HIDEHYPERVISORBIT=%s\n" "${FEX_HIDEHYPERVISORBIT-}"\n'
         )
         real.chmod(0o755)
         prefix = self.root / "isolated-prefix"
@@ -691,6 +692,7 @@ class StagingPolicyTests(unittest.TestCase):
             "CX_ACTIVE_GRAPHICS_BACKEND": "d3dmetal",
             "WINEDLLOVERRIDES": "d3d12=n",
             "DXMT_ENABLE_NVEXT": "1",
+            "FEX_HIDEHYPERVISORBIT": "0",
         })
         output = subprocess.check_output([str(wrapper)], env=environment, text=True)
         values = dict(line.split("=", 1) for line in output.splitlines())
@@ -700,6 +702,7 @@ class StagingPolicyTests(unittest.TestCase):
         self.assertEqual(values["WINEDLLOVERRIDES"], stage_owned_graphics.owned_overrides())
         self.assertIn("amd_fidelityfx_upscaler_dx12=", values["WINEDLLOVERRIDES"].split(";"))
         self.assertEqual(values["DXMT_ENABLE_NVEXT"], "")
+        self.assertEqual(values["FEX_HIDEHYPERVISORBIT"], "0")
         wrapper.write_text(stage_owned_graphics.render_wrapper(with_wow64=True))
         output = subprocess.check_output([str(wrapper)], env=environment, text=True)
         values = dict(line.split("=", 1) for line in output.splitlines())
@@ -721,6 +724,10 @@ class StagingPolicyTests(unittest.TestCase):
         values = dict(line.split("=", 1) for line in output.splitlines())
         self.assertIn("dcomp=b", values["WINEDLLOVERRIDES"].split(";"))
         self.assertEqual(values["WINEDLLPATH"], f"{runtime}/lib/wine/x86_64-windows:{runtime}/lib/wine/i386-windows:{runtime}/lib/wine/x86_64-unix")
+        wrapper.write_text(stage_owned_graphics.render_wrapper(arch=architecture("arm64", "arm64x")))
+        output = subprocess.check_output([str(wrapper)], env=environment, text=True)
+        values = dict(line.split("=", 1) for line in output.splitlines())
+        self.assertEqual(values["FEX_HIDEHYPERVISORBIT"], "1")
         wrapper.write_text(stage_owned_graphics.render_wrapper(with_fsr=True, with_fsr_framegeneration=True))
         environment["OWNED_FG_OBSERVER"] = str(self.root / "missing-observer.dylib")
         rejected = subprocess.run([str(wrapper)], env=environment, capture_output=True, text=True)

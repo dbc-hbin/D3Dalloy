@@ -744,6 +744,11 @@ export WINEDLLOVERRIDES="{owned_overrides(with_nvngx, with_nvapi, with_fsr=with_
 
 {"export DXMT_ENABLE_NVEXT=1" if (with_nvngx or with_nvapi) else "unset DXMT_ENABLE_NVEXT"}
 
+# Native ARM64 Wine runs under FEX, whose hypervisor-bit CPUID is rejected by
+# some games; the existing documented toggle hides it. The x86_64 layout never
+# launches FEX, so its environment is left untouched.
+{"export FEX_HIDEHYPERVISORBIT=1" if arch["native_arch"] == "arm64" else ""}
+
 # macOS strips DYLD_* inherited across the /bin/sh script boundary. Re-enable
 # dyld library tracing here, at the last hop, only when the owned audit is
 # explicitly requested. Normal launches also cannot inherit a tracing setting.
