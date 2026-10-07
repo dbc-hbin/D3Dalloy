@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#include <tuple>
+#include "com/com_pointer.hpp"
 #include <initguid.h>
 #include "FrameInterpolationSwapchainDX12.h"
 
@@ -36,60 +36,21 @@
 
 
 
-// This type *is* ABI stable and you are allowed to modify the internal structures without worrying that they will be exposed to callers.
-class FrameInterpolationSwapChainDX12Stable : public TFrameInterpolationSwapChainDX12<IFrameInterpolationSwapChainDX12, FrameinterpolationPresentInfoExt, FfxFrameGenerationConfig, ffxCallbackDescFrameGenerationPresent, FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT_SDK2>
-{
-public:
-    FrameInterpolationSwapChainDX12Stable() {}
-    virtual ~FrameInterpolationSwapChainDX12Stable() {}
-
-    // IUnknown
-    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject);
-
-    // New functions overrides go here - note that all functions called from the frame-generation or other modules needs to be a pure-virtuall declared in a parent interface.
-
-private:
-    // New members can go here.
-};
-
-template<typename ConfigType>
-void InitConfigType(ConfigType& config)
-{
-    config = {};
-}
-
-template<>
-void InitConfigType<FfxFrameGenerationConfig>(FfxFrameGenerationConfig& config)
+void InitConfigType(FfxFrameGenerationConfig& config)
 {
     config = {};
     config.header.pNext = nullptr;
     config.header.type = FFX_API_FRAME_GENERATION_CONFIG;
 }
 
-template<>
-void InitConfigType<ffxCallbackDescFrameGenerationPresent>(ffxCallbackDescFrameGenerationPresent& config)
+void InitConfigType(ffxCallbackDescFrameGenerationPresent& config)
 {
     config = {};
     config.header.pNext = nullptr;
     config.header.type = FFX_API_CALLBACK_DESC_TYPE_FRAMEGENERATION_PRESENT;
 }
 
-template<typename PresentCallbackType>
-void InitPresentCallback(PresentCallbackType& desc, ffxCallbackDescFrameGenerationPresentPremulAlpha& extra, FfxDevice device, FfxCommandList cmdList, bool isInterpolated, FfxApiResource swapChainBuffer, FfxApiResource backBuffer, FfxApiResource currentUI, bool usePremulAlpha, uint64_t frameID)
-{
-    InitConfigType(desc);
-    desc.commandList = cmdList;
-    desc.device = device;
-    desc.isInterpolatedFrame = isInterpolated;
-    desc.outputSwapChainBuffer = swapChainBuffer;
-    desc.currentBackBuffer = backBuffer;
-    desc.currentUI = currentUI;
-    desc.usePremulAlpha = usePremulAlpha;
-    desc.frameID = frameID;
-}
-
-template<>
-void InitPresentCallback<ffxCallbackDescFrameGenerationPresent>(ffxCallbackDescFrameGenerationPresent& desc, ffxCallbackDescFrameGenerationPresentPremulAlpha& extra, FfxDevice device, FfxCommandList cmdList, bool isInterpolated, FfxApiResource swapChainBuffer, FfxApiResource backBuffer, FfxApiResource currentUI, bool usePremulAlpha, uint64_t frameID)
+void InitPresentCallback(ffxCallbackDescFrameGenerationPresent& desc, ffxCallbackDescFrameGenerationPresentPremulAlpha& extra, FfxDevice device, FfxCommandList cmdList, bool isInterpolated, FfxApiResource swapChainBuffer, FfxApiResource backBuffer, FfxApiResource currentUI, bool usePremulAlpha, uint64_t frameID)
 {
     InitConfigType(desc);
     desc.commandList = cmdList;
@@ -107,84 +68,13 @@ void InitPresentCallback<ffxCallbackDescFrameGenerationPresent>(ffxCallbackDescF
     desc.header.pNext = &extra.header;
 }
 
-struct FfxSwapChainABICaller
+static dxmt::Com<IFrameInterpolationSwapChainDX12> getOwnedSwapchain(FfxSwapchain gameSwapChain)
 {
-    template<typename T>
-    static void Call(T* swapChain, FfxApiResource uiResource, uint32_t flags)
-    {
-        swapChain->registerUiResource(uiResource, flags);
-    }
-
-    template<typename T>
-    static void Call(T* swapChain, FfxFrameGenerationConfig const* config)
-    {
-        swapChain->setFrameGenerationConfig(config);
-    }
-
-    template<typename T>
-    static void Call(T* swapChain, FfxWaitCallbackFunc waitCallbackFunc)
-    {
-        swapChain->setWaitCallback(waitCallbackFunc);
-    }
-
-    template<typename T>
-    static void Call(T* swapChain, const FfxApiSwapchainFramePacingTuning* framePacingTuning)
-    {
-        swapChain->setFramePacingTuning(framePacingTuning);
-    }
-
-    template<typename T>
-    static void Call(T* swapChain, FfxApiEffectMemoryUsage* vramUsage)
-    {
-        swapChain->GetGpuMemoryUsage(vramUsage);
-    }
-
-    template<typename T>
-    static FfxApiResource Call(T* swapChain, int index)
-    {
-        return swapChain->interpolationOutput(index);
-    }
-
-    enum FfxGetInterpolationCommandList
-    {
-        FFX_GET_INTERPOLATION_COMMAND_LIST
-    };
-
-    template<typename T>
-    static ID3D12GraphicsCommandList* Call(T* swapChain, FfxGetInterpolationCommandList val)
-    {
-        return swapChain->getInterpolationCommandList();
-    }
-
-    enum FfxWaitForPresent
-    {
-        FFX_WAIT_FOR_PRESENT
-    };
-
-    template<typename T>
-    static bool Call(T* swapChain, FfxWaitForPresent val)
-    {
-        return swapChain->waitForPresents();
-    }
-};
-
-template<typename... Args>
-FfxErrorCode FfxAbiFrameGenSwapChainCall(IDXGISwapChain4* swapChain, Args... args) {
-    IFrameInterpolationSwapChainDX12* owned = nullptr;
-    if (!swapChain || FAILED(swapChain->QueryInterface(IID_IFrameInterpolationSwapChainDX12, reinterpret_cast<void**>(&owned))))
-        return FFX_ERROR_INVALID_ARGUMENT;
-    FfxSwapChainABICaller::Call(owned, args...);
-    owned->Release();
-    return FFX_OK;
-}
-template<typename Result, typename... Args>
-FfxErrorCode FfxAbiFrameGenSwapChainCall(Result& result, IDXGISwapChain4* swapChain, Args... args) {
-    IFrameInterpolationSwapChainDX12* owned = nullptr;
-    if (!swapChain || FAILED(swapChain->QueryInterface(IID_IFrameInterpolationSwapChainDX12, reinterpret_cast<void**>(&owned))))
-        return FFX_ERROR_INVALID_ARGUMENT;
-    result = FfxSwapChainABICaller::Call(owned, args...);
-    owned->Release();
-    return FFX_OK;
+    dxmt::Com<IFrameInterpolationSwapChainDX12> owned;
+    auto swapChain = ffxGetDX12SwapchainPtr(gameSwapChain);
+    if (swapChain && SUCCEEDED(swapChain->QueryInterface(IID_IFrameInterpolationSwapChainDX12, reinterpret_cast<void**>(&owned))))
+        return owned;
+    return nullptr;
 }
 
 FfxApiResource ffxGetNamedResourceDX12(const ID3D12Resource* dx12Resource,
@@ -204,71 +94,63 @@ FfxApiResource ffxGetNamedResourceDX12(const ID3D12Resource* dx12Resource,
 
 FfxErrorCode ffxRegisterFrameinterpolationUiResourceDX12(FfxSwapchain gameSwapChain, FfxApiResource uiResource, uint32_t flags)
 {
-    IDXGISwapChain4* swapChain = ffxGetDX12SwapchainPtr(gameSwapChain);
-    return FfxAbiFrameGenSwapChainCall(swapChain, uiResource, flags);
+    auto swapChain = getOwnedSwapchain(gameSwapChain);
+    if (!swapChain) return FFX_ERROR_INVALID_ARGUMENT;
+    swapChain->registerUiResource(uiResource, flags);
+    return FFX_OK;
 }
 
 FFX_API FfxErrorCode ffxSetFrameGenerationConfigToSwapchainDX12(FfxFrameGenerationConfig const* config)
 {
-    FfxErrorCode result = FFX_ERROR_INVALID_ARGUMENT;
-
-    if (config->swapChain)
-    {
-        IDXGISwapChain4* swapChain = ffxGetDX12SwapchainPtr(config->swapChain);
-        result = FfxAbiFrameGenSwapChainCall(swapChain, config);
-    }
-
-    return result;
+    auto swapChain = getOwnedSwapchain(config->swapChain);
+    if (!swapChain) return FFX_ERROR_INVALID_ARGUMENT;
+    swapChain->setFrameGenerationConfig(config);
+    return FFX_OK;
 }
 
 FfxErrorCode ffxConfigureFrameInterpolationSwapchainDX12(FfxSwapchain gameSwapChain, FfxFrameInterpolationSwapchainConfigureKey key, void* valuePtr)
 {
-    FfxErrorCode errorCode = FFX_ERROR_INVALID_ARGUMENT;
-    IDXGISwapChain4* swapChain = ffxGetDX12SwapchainPtr(gameSwapChain);
     switch (key)
     {
         case FFX_FI_SWAPCHAIN_CONFIGURE_KEY_WAITCALLBACK:
         {
-            errorCode = FfxAbiFrameGenSwapChainCall(swapChain, reinterpret_cast<FfxWaitCallbackFunc>(valuePtr));
-            break;
+            auto swapChain = getOwnedSwapchain(gameSwapChain);
+            if (!swapChain) return FFX_ERROR_INVALID_ARGUMENT;
+            swapChain->setWaitCallback(reinterpret_cast<FfxWaitCallbackFunc>(valuePtr));
+            return FFX_OK;
         }
         case FFX_FI_SWAPCHAIN_CONFIGURE_KEY_FRAMEPACINGTUNING:
         {
-            if (valuePtr != nullptr)
-            {
-                errorCode = FfxAbiFrameGenSwapChainCall(swapChain, static_cast<FfxApiSwapchainFramePacingTuning*>(valuePtr));
-            }
-            break;
+            if (!valuePtr) return FFX_ERROR_INVALID_ARGUMENT;
+            auto swapChain = getOwnedSwapchain(gameSwapChain);
+            if (!swapChain) return FFX_ERROR_INVALID_ARGUMENT;
+            swapChain->setFramePacingTuning(static_cast<FfxApiSwapchainFramePacingTuning*>(valuePtr));
+            return FFX_OK;
         }
     }
-
-    return errorCode;
+    return FFX_ERROR_INVALID_ARGUMENT;
 }
 
 FfxApiResource ffxGetFrameinterpolationTextureDX12(FfxSwapchain gameSwapChain)
 {
-    FfxApiResource                      res = { nullptr };
-    IDXGISwapChain4* swapChain = ffxGetDX12SwapchainPtr(gameSwapChain);
-    FfxErrorCode errorCode = FfxAbiFrameGenSwapChainCall(res, swapChain, 0);
-    if (errorCode != FFX_OK)
-    {
-        res = { nullptr };
-    }
-    return res;
+    auto swapChain = getOwnedSwapchain(gameSwapChain);
+    return swapChain ? swapChain->interpolationOutput(0) : FfxApiResource{ nullptr };
 }
 
 FfxErrorCode ffxGetFrameinterpolationCommandlistDX12(FfxSwapchain gameSwapChain, FfxCommandList& gameCommandlist)
 {
-    // 1) query FrameInterpolationSwapChainDX12 from gameSwapChain
-    // 2) call  TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::getInterpolationCommandList()
-    IDXGISwapChain4* swapChain = ffxGetDX12SwapchainPtr(gameSwapChain);
-    return FfxAbiFrameGenSwapChainCall(gameCommandlist, swapChain, FfxSwapChainABICaller::FFX_GET_INTERPOLATION_COMMAND_LIST);
+    auto swapChain = getOwnedSwapchain(gameSwapChain);
+    if (!swapChain) return FFX_ERROR_INVALID_ARGUMENT;
+    gameCommandlist = swapChain->getInterpolationCommandList();
+    return FFX_OK;
 }
 
 FfxErrorCode ffxFrameInterpolationSwapchainGetGpuMemoryUsageDX12(FfxSwapchain gameSwapChain, FfxApiEffectMemoryUsage* vramUsage)
 {
-    IDXGISwapChain4* swapChain = ffxGetDX12SwapchainPtr(gameSwapChain);
-    return FfxAbiFrameGenSwapChainCall(swapChain, vramUsage);
+    auto swapChain = getOwnedSwapchain(gameSwapChain);
+    if (!swapChain) return FFX_ERROR_INVALID_ARGUMENT;
+    swapChain->GetGpuMemoryUsage(vramUsage);
+    return FFX_OK;
 }
 
 FfxErrorCode ffxReplaceSwapchainForFrameinterpolationDX12(FfxCommandQueue gameQueue, FfxSwapchain& gameSwapChain)
@@ -362,7 +244,7 @@ FfxErrorCode ffxCreateFrameinterpolationSwapchainForHwndDX12(HWND               
     if (SUCCEEDED(dxgiFactory->QueryInterface(IID_PPV_ARGS(&dxgiFactory2))))
     {
         // Create proxy swapchain
-        FrameInterpolationSwapChainDX12Stable* fiSwapchain = new (std::nothrow) FrameInterpolationSwapChainDX12Stable();
+        FrameInterpolationSwapChainDX12* fiSwapchain = new (std::nothrow) FrameInterpolationSwapChainDX12();
         if (fiSwapchain)
         {
             HRESULT hr = fiSwapchain->init(hWnd, desc1, fullscreenDesc, queue, dxgiFactory2);
@@ -394,11 +276,9 @@ FfxErrorCode ffxCreateFrameinterpolationSwapchainForHwndDX12(HWND               
 
 FfxErrorCode ffxWaitForPresents(FfxSwapchain gameSwapChain)
 {
-    bool completed = false;
-    IDXGISwapChain4* swapChain = ffxGetDX12SwapchainPtr(gameSwapChain);
-    FfxErrorCode result = FfxAbiFrameGenSwapChainCall(completed, swapChain, FfxSwapChainABICaller::FFX_WAIT_FOR_PRESENT);
-    if (result != FFX_OK) return result;
-    return completed ? FFX_OK : FFX_ERROR_BACKEND_API_ERROR;
+    auto swapChain = getOwnedSwapchain(gameSwapChain);
+    if (!swapChain) return FFX_ERROR_INVALID_ARGUMENT;
+    return swapChain->waitForPresents() ? FFX_OK : FFX_ERROR_BACKEND_API_ERROR;
 }
 
 void setSwapChainBufferResourceInfo(IDXGISwapChain4* swapChain, bool isInterpolated)
@@ -432,11 +312,10 @@ void setSwapChainBufferResourceInfo(IDXGISwapChain4* swapChain, bool isInterpola
     }
 }
 
-template<typename PresentType, typename PacingData, typename PresentCallbackType>
-HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry, uint32_t frameID)
+HRESULT compositeSwapChainFrame(FrameinterpolationPresentInfoExt* presenter, FrameInterpolationPacingDataExt* pacingEntry, uint32_t frameID)
 {
 
-    const typename PacingData::FrameInfo& frameInfo = pacingEntry->frames[frameID];
+    const FrameInterpolationFrameInfoExt& frameInfo = pacingEntry->frames[frameID];
     auto* presentQueue = presenter->currentPresentQueue();
     presentQueue->Wait(presenter->presentFence, presenter->lastQueuedPresent);
 
@@ -470,8 +349,7 @@ HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry,
     ID3D12Resource* swapchainBackbuffer = nullptr;
     presenter->swapChain->GetBuffer(currBackbufferIndex, IID_PPV_ARGS(&swapchainBackbuffer));
 
-    // This may call into code within the game SDK which may be older so must use the template type
-    PresentCallbackType desc;
+    ffxCallbackDescFrameGenerationPresent desc;
     ffxCallbackDescFrameGenerationPresentPremulAlpha premulAlpha;
     InitPresentCallback(desc, premulAlpha, presenter->device, ffxGetCommandListDX12(gpuCommands->reset()), frameID != FrameType::Real, ffxGetNamedResourceDX12(swapchainBackbuffer, ffxGetResourceDescriptionDX12(swapchainBackbuffer), nullptr, FFX_API_RESOURCE_STATE_PRESENT), frameInfo.resource, pacingEntry->uiSurface, pacingEntry->usePremulAlphaComposite, pacingEntry->currentFrameID);
 
@@ -487,10 +365,9 @@ HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry,
     return callbackResult == FFX_API_RETURN_OK ? S_OK : E_FAIL;
 }
 
-template<typename PresentType, typename PacingData>
-void presentToSwapChain(PresentType* presenter, PacingData* pacingEntry, FrameType frameType)
+void presentToSwapChain(FrameinterpolationPresentInfoExt* presenter, FrameInterpolationPacingDataExt* pacingEntry, FrameType frameType)
 {
-    const typename PacingData::FrameInfo& frameInfo = pacingEntry->frames[frameType];
+    const FrameInterpolationFrameInfoExt& frameInfo = pacingEntry->frames[frameType];
     auto* presentQueue = presenter->currentPresentQueue();
 
     const UINT uSyncInterval            = pacingEntry->vsync ? 1 : 0;
@@ -507,10 +384,9 @@ void presentToSwapChain(PresentType* presenter, PacingData* pacingEntry, FrameTy
 
 }
 
-template<typename PresentType, typename PacingData, typename PresentCallbackType>
 DWORD WINAPI presenterThread(LPVOID param)
 {
-    PresentType* presenter = static_cast<PresentType*>(param);
+    FrameinterpolationPresentInfoExt* presenter = static_cast<FrameinterpolationPresentInfoExt*>(param);
 
     if (presenter)
     {
@@ -535,7 +411,7 @@ DWORD WINAPI presenterThread(LPVOID param)
             {
                 EnterCriticalSection(&presenter->criticalSectionScheduledFrame);
 
-                PacingData entry = presenter->scheduledPresents;
+                FrameInterpolationPacingDataExt entry = presenter->scheduledPresents;
                 presenter->scheduledPresents.invalidate();
 
                 LeaveCriticalSection(&presenter->criticalSectionScheduledFrame);
@@ -552,10 +428,10 @@ DWORD WINAPI presenterThread(LPVOID param)
 
                     for (uint32_t frameType = 0; frameType < FrameType::Count; frameType++)
                     {
-                        const typename PacingData::FrameInfo& frameInfo = entry.frames[frameType];
+                        const FrameInterpolationFrameInfoExt& frameInfo = entry.frames[frameType];
                         if (frameInfo.doPresent)
                         {
-                            const HRESULT compositionResult = compositeSwapChainFrame<PresentType, PacingData, PresentCallbackType>(presenter, &entry, frameType);
+                            const HRESULT compositionResult = compositeSwapChainFrame(presenter, &entry, frameType);
 
                             // signal replacement buffer availability
                             if (frameInfo.presentIndex == entry.replacementBufferFenceSignal)
@@ -620,14 +496,13 @@ DWORD WINAPI presenterThread(LPVOID param)
     return 0;
 }
 
-template<typename PresentType, typename PacingData, typename PresentCallbackType>
 DWORD WINAPI interpolationThread(LPVOID param)
 {
-    PresentType* presenter = static_cast<PresentType*>(param);
+    FrameinterpolationPresentInfoExt* presenter = static_cast<FrameinterpolationPresentInfoExt*>(param);
 
     if (presenter)
     {
-        HANDLE presenterThreadHandle = CreateThread(nullptr, 0, presenterThread<PresentType, PacingData, PresentCallbackType>, param, 0, nullptr);
+        HANDLE presenterThreadHandle = CreateThread(nullptr, 0, presenterThread, param, 0, nullptr);
         FFX_ASSERT(presenterThreadHandle != NULL);
 
         if (presenterThreadHandle != 0)
@@ -650,7 +525,7 @@ DWORD WINAPI interpolationThread(LPVOID param)
                 {
                     EnterCriticalSection(&presenter->criticalSectionScheduledFrame);
 
-                    PacingData entry = presenter->scheduledInterpolations;
+                    FrameInterpolationPacingDataExt entry = presenter->scheduledInterpolations;
                     presenter->scheduledInterpolations.invalidate();
 
                     LeaveCriticalSection(&presenter->criticalSectionScheduledFrame);
@@ -749,8 +624,7 @@ DWORD WINAPI interpolationThread(LPVOID param)
     return 0;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::verifyBackbufferDuplicateResources()
+bool FrameInterpolationSwapChainDX12::verifyBackbufferDuplicateResources()
 {
     HRESULT hr = S_OK;
 
@@ -826,25 +700,7 @@ bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     return SUCCEEDED(hr);
 }
 
-template<typename PresentCallbackType>
-ffxReturnCode_t ffxFrameInterpolationUiCompositionWrapper(PresentCallbackType* params, void* unusedUserCtx)
-{
-    // This always calls the *current* version of the code so must use the *current* type
-    ffxCallbackDescFrameGenerationPresent desc;
-    ffxCallbackDescFrameGenerationPresentPremulAlpha premulAlpha;
-    InitPresentCallback(desc, premulAlpha, params->device, params->commandList, params->isInterpolatedFrame, params->outputSwapChainBuffer, params->currentBackBuffer, params->currentUI, params->usePremulAlpha, params->frameID);
-
-    return ffxFrameInterpolationUiComposition(&desc, unusedUserCtx);
-}
-
-template<>
-ffxReturnCode_t ffxFrameInterpolationUiCompositionWrapper<ffxCallbackDescFrameGenerationPresent>(ffxCallbackDescFrameGenerationPresent* params, void* unusedUserCtx)
-{
-    return ffxFrameInterpolationUiComposition(params, unusedUserCtx);
-}
-
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::init(HWND                                  hWnd,
+HRESULT FrameInterpolationSwapChainDX12::init(HWND                                  hWnd,
                                               const DXGI_SWAP_CHAIN_DESC1*          desc,
                                               const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreenDesc,
                                               ID3D12CommandQueue* queue,
@@ -860,8 +716,7 @@ HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Pr
     gameSwapEffect     = desc->SwapEffect;
 
     // set default ui composition / frame interpolation present function
-    // This has to be handdled differently if compiling with a compatibility type to ensure proper offsets are provided.
-    presentCallback = ffxFrameInterpolationUiCompositionWrapper;
+    presentCallback = ffxFrameInterpolationUiComposition;
 
     HRESULT hr = E_FAIL;
 
@@ -956,20 +811,17 @@ HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Pr
     return hr;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::TFrameInterpolationSwapChainDX12()
+FrameInterpolationSwapChainDX12::FrameInterpolationSwapChainDX12()
 {
     InitConfigType(nextFrameGenerationConfig);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::~TFrameInterpolationSwapChainDX12()
+FrameInterpolationSwapChainDX12::~FrameInterpolationSwapChainDX12()
 {
     shutdown();
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-UINT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::getInterpolationEnabledSwapChainFlags(UINT nonAdjustedFlags)
+UINT FrameInterpolationSwapChainDX12::getInterpolationEnabledSwapChainFlags(UINT nonAdjustedFlags)
 {
     UINT flags = nonAdjustedFlags;
 
@@ -985,8 +837,7 @@ UINT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     return flags;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-DXGI_SWAP_CHAIN_DESC1 TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::getInterpolationEnabledSwapChainDescription(const DXGI_SWAP_CHAIN_DESC1* nonAdjustedDesc)
+DXGI_SWAP_CHAIN_DESC1 FrameInterpolationSwapChainDX12::getInterpolationEnabledSwapChainDescription(const DXGI_SWAP_CHAIN_DESC1* nonAdjustedDesc)
 {
     DXGI_SWAP_CHAIN_DESC1 fiDesc = *nonAdjustedDesc;
 
@@ -998,14 +849,12 @@ DXGI_SWAP_CHAIN_DESC1 TFrameInterpolationSwapChainDX12<ParentType, PresentType, 
     return fiDesc;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-IDXGISwapChain4* TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::real()
+IDXGISwapChain4* FrameInterpolationSwapChainDX12::real()
 {
     return presentInfo.swapChain;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::shutdown()
+HRESULT FrameInterpolationSwapChainDX12::shutdown()
 {
     //m_pDevice will be nullptr already shutdown
     if (presentInfo.device)
@@ -1067,8 +916,7 @@ HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Pr
     return S_OK;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::killPresenterThread()
+bool FrameInterpolationSwapChainDX12::killPresenterThread()
 {
     if (interpolationThreadHandle != NULL)
     {
@@ -1084,13 +932,12 @@ bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     return interpolationThreadHandle == nullptr;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::spawnPresenterThread()
+bool FrameInterpolationSwapChainDX12::spawnPresenterThread()
 {
     if (interpolationThreadHandle == NULL)
     {
         presentInfo.shutdown      = false;
-        interpolationThreadHandle = CreateThread(nullptr, 0, &interpolationThread<PresentType, typename PresentType::PacingData, PresentCallbackType>, reinterpret_cast<void*>(&presentInfo), 0, nullptr);
+        interpolationThreadHandle = CreateThread(nullptr, 0, &interpolationThread, reinterpret_cast<void*>(&presentInfo), 0, nullptr);
         
         FFX_ASSERT(interpolationThreadHandle != NULL);
 
@@ -1106,8 +953,7 @@ bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     return interpolationThreadHandle != NULL;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::discardOutstandingInterpolationCommandLists()
+void FrameInterpolationSwapChainDX12::discardOutstandingInterpolationCommandLists()
 {
     // drop any outstanding interpolaton command lists
     for (size_t i = 0; i < _countof(registeredInterpolationCommandLists); i++)
@@ -1122,8 +968,7 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     }
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::setFrameGenerationState(IMTLD3D12FrameGenerationState* state)
+void FrameInterpolationSwapChainDX12::setFrameGenerationState(IMTLD3D12FrameGenerationState* state)
 {
     EnterCriticalSection(&criticalSection);
     if (state != presentInfo.generationState) {
@@ -1135,12 +980,11 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     LeaveCriticalSection(&criticalSection);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::recordFrameGeneration(const ffxDispatchDescFrameGeneration& desc)
+bool FrameInterpolationSwapChainDX12::recordFrameGeneration(const ffxDispatchDescFrameGeneration& desc)
 {
     EnterCriticalSection(&criticalSection);
     FrameInterpolationPacingDataExt* destination = desc.commandList == activeGenerationList ? activeGeneration : nullptr;
-    for (size_t i = 0; i < NumBuffers; ++i) {
+    for (size_t i = 0; i < FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT_SDK2; ++i) {
         auto commands = registeredInterpolationCommandLists[i];
         if (!commands || commands->getList() != desc.commandList) continue;
         destination = &registeredGenerations[i];
@@ -1165,14 +1009,7 @@ bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     return destination != nullptr;
 }
 
-template<typename PresentCallbackType>
-FfxApiPresentCallbackFunc GetPresentCallbackFunc(FfxApiPresentCallbackFunc presentCallback)
-{
-    return ffxFrameInterpolationUiComposition;
-}
-
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::setFrameGenerationConfig(FfxFrameGenerationConfig const* config)
+void FrameInterpolationSwapChainDX12::setFrameGenerationConfig(FfxFrameGenerationConfig const* config)
 {
     EnterCriticalSection(&criticalSectionUpdateConfig);
 
@@ -1202,7 +1039,7 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
         config = &temp;
     }
         
-    FfxApiPresentCallbackFunc inputPresentCallback = (nullptr != config->presentCallback) ? config->presentCallback : GetPresentCallbackFunc<PresentCallbackType>(presentCallback);
+    FfxApiPresentCallbackFunc inputPresentCallback = (nullptr != config->presentCallback) ? config->presentCallback : ffxFrameInterpolationUiComposition;
     void*                  inputPresentCallbackCtx = (nullptr != config->presentCallback) ? config->presentCallbackContext : nullptr;
     ID3D12CommandQueue*    inputInterpolationQueue = config->allowAsyncWorkloads ? presentInfo.asyncComputeQueue : presentInfo.gameQueue;
 
@@ -1278,8 +1115,7 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     LeaveCriticalSection(&criticalSectionUpdateConfig);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::destroyReplacementResources()
+bool FrameInterpolationSwapChainDX12::destroyReplacementResources()
 {
     HRESULT hr = S_OK;
 
@@ -1374,8 +1210,7 @@ bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     return SUCCEEDED(hr);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::waitForPresents(bool consumeError)
+bool FrameInterpolationSwapChainDX12::waitForPresents(bool consumeError)
 {
     // wait for interpolation to finish
     waitForFenceValue(presentInfo.gameFence, gameFenceValue, INFINITE, presentInfo.waitCallback);
@@ -1385,8 +1220,7 @@ bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     return SUCCEEDED(consumeError ? InterlockedExchange(&presentInfo.presentationError, S_OK) : InterlockedCompareExchange(&presentInfo.presentationError, S_OK, S_OK));
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-FfxApiResource TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::interpolationOutput(int index)
+FfxApiResource FrameInterpolationSwapChainDX12::interpolationOutput(int index)
 {
     if (index < 0 || index >= 4) return {};
     index += interpolationBufferIndex;
@@ -1396,8 +1230,7 @@ FfxApiResource TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigT
 }
 
 //IUnknown
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::QueryInterface(REFIID riid, void** ppvObject)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::QueryInterface(REFIID riid, void** ppvObject)
 {
 
     const GUID guidReplacements[] = {
@@ -1425,16 +1258,14 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return E_NOINTERFACE;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-ULONG STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::AddRef()
+ULONG STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::AddRef()
 {
     InterlockedIncrement(&refCount);
 
     return refCount;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-ULONG STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::Release()
+ULONG STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::Release()
 {
     ULONG ref = InterlockedDecrement(&refCount);
     if (ref != 0)
@@ -1448,39 +1279,33 @@ ULONG STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType
 }
 
 // IDXGIObject
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetPrivateData(REFGUID Name, UINT DataSize, const void* pData)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetPrivateData(REFGUID Name, UINT DataSize, const void* pData)
 {
     return real()->SetPrivateData(Name, DataSize, pData);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetPrivateDataInterface(REFGUID Name, const IUnknown* pUnknown)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetPrivateDataInterface(REFGUID Name, const IUnknown* pUnknown)
 {
     return real()->SetPrivateDataInterface(Name, pUnknown);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetPrivateData(REFGUID Name, UINT* pDataSize, void* pData)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetPrivateData(REFGUID Name, UINT* pDataSize, void* pData)
 {
     return real()->GetPrivateData(Name, pDataSize, pData);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetParent(REFIID riid, void** ppParent)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetParent(REFIID riid, void** ppParent)
 {
     return real()->GetParent(riid, ppParent);
 }
 
 // IDXGIDeviceSubObject
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetDevice(REFIID riid, void** ppDevice)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetDevice(REFIID riid, void** ppDevice)
 {
     return real()->GetDevice(riid, ppDevice);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::registerUiResource(FfxApiResource uiResource, uint32_t flags)
+void FrameInterpolationSwapChainDX12::registerUiResource(FfxApiResource uiResource, uint32_t flags)
 {
     EnterCriticalSection(&criticalSection);
 
@@ -1496,14 +1321,12 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     LeaveCriticalSection(&criticalSection);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::setWaitCallback(FfxWaitCallbackFunc waitCallbackFunc)
+void FrameInterpolationSwapChainDX12::setWaitCallback(FfxWaitCallbackFunc waitCallbackFunc)
 {
     presentInfo.waitCallback = waitCallbackFunc;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::setFramePacingTuning(const FfxApiSwapchainFramePacingTuning* framePacingTuning)
+void FrameInterpolationSwapChainDX12::setFramePacingTuning(const FfxApiSwapchainFramePacingTuning* framePacingTuning)
 {
     presentInfo.safetyMarginInSec = static_cast<double> (framePacingTuning->safetyMarginInMs) / 1000.0;
     presentInfo.varianceFactor = static_cast<double> (framePacingTuning->varianceFactor);
@@ -1512,79 +1335,13 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     presentInfo.allowWaitForSingleObjectOnFence = framePacingTuning->allowWaitForSingleObjectOnFence;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetGpuMemoryUsage(FfxApiEffectMemoryUsage* vramUsage)
+void FrameInterpolationSwapChainDX12::GetGpuMemoryUsage(FfxApiEffectMemoryUsage* vramUsage)
 {
     vramUsage->totalUsageInBytes = totalUsageInBytes;
     vramUsage->aliasableUsageInBytes = aliasableUsageInBytes;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::presentPassthrough(UINT SyncInterval, UINT Flags)
-{
-    auto* presentQueue = presentInfo.currentPresentQueue();
-    presentQueue->Wait(presentInfo.presentFence, presentInfo.lastQueuedPresent);
-    ID3D12Resource* dx12SwapchainBuffer    = nullptr;
-    UINT            currentBackBufferIndex = presentInfo.swapChain->GetCurrentBackBufferIndex();
-    presentInfo.swapChain->GetBuffer(currentBackBufferIndex, IID_PPV_ARGS(&dx12SwapchainBuffer));
-
-    auto passthroughList = presentInfo.commandPool.get(presentQueue, L"passthroughList()");
-    auto list            = passthroughList->reset();
-
-    ID3D12Resource* dx12ResourceSrc = replacementSwapBuffers[replacementSwapBufferIndex].resource;
-    ID3D12Resource* dx12ResourceDst = dx12SwapchainBuffer;
-
-    D3D12_TEXTURE_COPY_LOCATION dx12SourceLocation = {};
-    dx12SourceLocation.pResource                   = dx12ResourceSrc;
-    dx12SourceLocation.Type                        = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dx12SourceLocation.SubresourceIndex            = 0;
-
-    D3D12_TEXTURE_COPY_LOCATION dx12DestinationLocation = {};
-    dx12DestinationLocation.pResource                   = dx12ResourceDst;
-    dx12DestinationLocation.Type                        = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dx12DestinationLocation.SubresourceIndex            = 0;
-
-    D3D12_RESOURCE_BARRIER barriers[2] = {};
-    barriers[0].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barriers[0].Transition.pResource   = dx12ResourceSrc;
-    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barriers[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-
-    barriers[1].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barriers[1].Transition.pResource   = dx12ResourceDst;
-    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barriers[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-    list->ResourceBarrier(_countof(barriers), barriers);
-
-    list->CopyResource(dx12ResourceDst, dx12ResourceSrc);
-
-    for (size_t i = 0; i < _countof(barriers); ++i)
-    {
-        D3D12_RESOURCE_STATES tmpStateBefore = barriers[i].Transition.StateBefore;
-        barriers[i].Transition.StateBefore   = barriers[i].Transition.StateAfter;
-        barriers[i].Transition.StateAfter    = tmpStateBefore;
-    }
-
-    list->ResourceBarrier(_countof(barriers), barriers);
-
-    passthroughList->execute(true);
-
-    presentQueue->Signal(presentInfo.replacementBufferFence, ++framesSentForPresentation);
-    presentQueue->Signal(presentInfo.compositionFenceGPU, framesSentForPresentation);
-    presentInfo.compositionFenceCPU->Signal(framesSentForPresentation);
-
-    setSwapChainBufferResourceInfo(presentInfo.swapChain, false);
-    presentInfo.swapChain->Present(SyncInterval, Flags);
-
-    presentInfo.lastQueuedPresent = framesSentForPresentation;
-    presentQueue->Signal(presentInfo.presentFence, framesSentForPresentation);
-    presentInfo.gameQueue->Wait(presentInfo.presentFence, framesSentForPresentation);
-
-    SafeRelease(dx12SwapchainBuffer);
-}
-
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::presentWithUiComposition(UINT SyncInterval, UINT Flags)
+HRESULT FrameInterpolationSwapChainDX12::presentWithUiComposition(UINT SyncInterval, UINT Flags)
 {
     auto* presentQueue = presentInfo.currentPresentQueue();
     presentQueue->Wait(presentInfo.presentFence, presentInfo.lastQueuedPresent);
@@ -1609,8 +1366,7 @@ HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Pr
         currentUI = presentInfo.currentUiSurface;
     }
 
-    // This may call into the game SDK so must use the template type
-    PresentCallbackType desc;
+    ffxCallbackDescFrameGenerationPresent desc;
     ffxCallbackDescFrameGenerationPresentPremulAlpha premulAlpha;
     InitPresentCallback(desc, premulAlpha, presentInfo.device, ffxGetCommandListDX12(list), false, ffxGetNamedResourceDX12(dx12SwapchainBuffer, outBufferDesc, nullptr, FFX_API_RESOURCE_STATE_PRESENT), ffxGetNamedResourceDX12(replacementSwapBuffers[replacementSwapBufferIndex].resource, inBufferDesc, nullptr, FFX_API_RESOURCE_STATE_PRESENT), currentUI, (presentInfo.uiCompositionFlags & FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA) != 0, currentFrameID);
 
@@ -1631,8 +1387,7 @@ HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Pr
     return presentResult;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::dispatchInterpolationCommands(FrameInterpolationPacingDataExt& entry)
+void FrameInterpolationSwapChainDX12::dispatchInterpolationCommands(FrameInterpolationPacingDataExt& entry)
 {
     const UINT             currentBackBufferIndex   = GetCurrentBackBufferIndex();
     ID3D12Resource*        pCurrentBackBuffer       = replacementSwapBuffers[currentBackBufferIndex].resource;
@@ -1705,8 +1460,7 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     }
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::presentInterpolated(UINT SyncInterval, UINT)
+void FrameInterpolationSwapChainDX12::presentInterpolated(UINT SyncInterval, UINT)
 {
     const bool bVsync = SyncInterval > 0;
 
@@ -1714,7 +1468,7 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     presentInfo.gameQueue->Signal(presentInfo.gameFence, ++gameFenceValue);
     presentInfo.interpolationQueue->Wait(presentInfo.gameFence, gameFenceValue);
 
-    typename PresentType::PacingData entry{};
+    FrameInterpolationPacingDataExt entry{};
     dispatchInterpolationCommands(entry);
 
     EnterCriticalSection(&presentInfo.criticalSectionScheduledFrame);
@@ -1777,8 +1531,7 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
 
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::verifyUiDuplicateResource()
+bool FrameInterpolationSwapChainDX12::verifyUiDuplicateResource()
 {
     HRESULT hr = S_OK;
 
@@ -1850,8 +1603,7 @@ bool TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
     return SUCCEEDED(hr);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::copyUiResource()
+void FrameInterpolationSwapChainDX12::copyUiResource()
 {
     auto copyList = presentInfo.commandPool.get(presentInfo.gameQueue, L"uiResourceCopyList");
     auto dx12List = copyList->reset();
@@ -1898,8 +1650,7 @@ void TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Prese
 }
 
     // IDXGISwapChain1
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::Present(UINT SyncInterval, UINT Flags)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::Present(UINT SyncInterval, UINT Flags)
 {
     if (Flags & DXGI_PRESENT_TEST)
     {
@@ -1975,8 +1726,7 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return InterlockedExchange(&presentInfo.presentationError, S_OK);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetBuffer(UINT Buffer, REFIID riid, void** ppSurface)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetBuffer(UINT Buffer, REFIID riid, void** ppSurface)
 {
     if (!ppSurface) return E_POINTER;
     *ppSurface = nullptr;
@@ -2007,20 +1757,17 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return hr;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetFullscreenState(BOOL Fullscreen, IDXGIOutput* pTarget)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetFullscreenState(BOOL Fullscreen, IDXGIOutput* pTarget)
 {
     return real()->SetFullscreenState(Fullscreen, pTarget);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetFullscreenState(BOOL* pFullscreen, IDXGIOutput** ppTarget)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetFullscreenState(BOOL* pFullscreen, IDXGIOutput** ppTarget)
 {
     return real()->GetFullscreenState(pFullscreen, ppTarget);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc)
 {
     EnterCriticalSection(&criticalSection);
     HRESULT hr = real()->GetDesc(pDesc);
@@ -2038,22 +1785,20 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return hr;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
     return resizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags, nullptr, nullptr);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::resizeBuffers(
+HRESULT FrameInterpolationSwapChainDX12::resizeBuffers(
     UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT Flags,
     const UINT* nodeMasks, IUnknown* const* queues)
 {
     EnterCriticalSection(&criticalSection);
     const UINT count = BufferCount ? BufferCount : gameBufferCount;
     HRESULT hr = S_OK;
-    ID3D12CommandQueue* newQueues[NumBuffers] = {};
-    if (count < 2 || count > NumBuffers ||
+    ID3D12CommandQueue* newQueues[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT_SDK2] = {};
+    if (count < 2 || count > FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT_SDK2 ||
         ((Flags ^ gameFlags) & (DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
         hr = DXGI_ERROR_INVALID_CALL;
     // An application-owned interpolation recording must be consumed by Present
@@ -2119,14 +1864,12 @@ HRESULT TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, Pr
     return hr;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters)
 {
     return real()->ResizeTarget(pNewTargetParameters);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetContainingOutput(IDXGIOutput** ppOutput)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetContainingOutput(IDXGIOutput** ppOutput)
 {
     HRESULT hr = DXGI_ERROR_INVALID_CALL;
 
@@ -2139,21 +1882,18 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return hr;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetFrameStatistics(DXGI_FRAME_STATISTICS* pStats)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetFrameStatistics(DXGI_FRAME_STATISTICS* pStats)
 {
     return real()->GetFrameStatistics(pStats);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetLastPresentCount(UINT* pLastPresentCount)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetLastPresentCount(UINT* pLastPresentCount)
 {
     return real()->GetLastPresentCount(pLastPresentCount);
 }
 
 // IDXGISwapChain1
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc)
 {
     EnterCriticalSection(&criticalSection);
     HRESULT hr = real()->GetDesc1(pDesc);
@@ -2171,81 +1911,68 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return hr;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pDesc)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pDesc)
 {
     return real()->GetFullscreenDesc(pDesc);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetHwnd(HWND* pHwnd)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetHwnd(HWND* pHwnd)
 {
     return real()->GetHwnd(pHwnd);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetCoreWindow(REFIID refiid, void** ppUnk)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetCoreWindow(REFIID refiid, void** ppUnk)
 {
     return real()->GetCoreWindow(refiid, ppUnk);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS*)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS*)
 {
     return Present(SyncInterval, PresentFlags);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-BOOL STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::IsTemporaryMonoSupported(void)
+BOOL STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::IsTemporaryMonoSupported(void)
 {
     return real()->IsTemporaryMonoSupported();
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetRestrictToOutput(IDXGIOutput** ppRestrictToOutput)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetRestrictToOutput(IDXGIOutput** ppRestrictToOutput)
 {
     return real()->GetRestrictToOutput(ppRestrictToOutput);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetBackgroundColor(const DXGI_RGBA* pColor)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetBackgroundColor(const DXGI_RGBA* pColor)
 {
     return real()->SetBackgroundColor(pColor);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetBackgroundColor(DXGI_RGBA* pColor)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetBackgroundColor(DXGI_RGBA* pColor)
 {
     return real()->GetBackgroundColor(pColor);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetRotation(DXGI_MODE_ROTATION Rotation)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetRotation(DXGI_MODE_ROTATION Rotation)
 {
     return real()->SetRotation(Rotation);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetRotation(DXGI_MODE_ROTATION* pRotation)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetRotation(DXGI_MODE_ROTATION* pRotation)
 {
     return real()->GetRotation(pRotation);
 }
 
 // IDXGISwapChain2
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetSourceSize(UINT Width, UINT Height)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetSourceSize(UINT Width, UINT Height)
 {
     return real()->SetSourceSize(Width, Height);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetSourceSize(UINT* pWidth, UINT* pHeight)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetSourceSize(UINT* pWidth, UINT* pHeight)
 {
     return real()->GetSourceSize(pWidth, pHeight);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetMaximumFrameLatency(UINT MaxLatency)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetMaximumFrameLatency(UINT MaxLatency)
 {
     // store value, so correct value is returned if game asks for it
     gameMaximumFrameLatency = MaxLatency;
@@ -2253,8 +1980,7 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return S_OK;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetMaximumFrameLatency(UINT* pMaxLatency)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetMaximumFrameLatency(UINT* pMaxLatency)
 {
     if (pMaxLatency)
     {
@@ -2264,27 +1990,23 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return pMaxLatency ? S_OK : DXGI_ERROR_INVALID_CALL;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HANDLE STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetFrameLatencyWaitableObject(void)
+HANDLE STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetFrameLatencyWaitableObject(void)
 {
     return replacementFrameLatencyWaitableObjectHandle;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetMatrixTransform(const DXGI_MATRIX_3X2_F* pMatrix)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetMatrixTransform(const DXGI_MATRIX_3X2_F* pMatrix)
 {
     return real()->SetMatrixTransform(pMatrix);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetMatrixTransform(DXGI_MATRIX_3X2_F* pMatrix)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetMatrixTransform(DXGI_MATRIX_3X2_F* pMatrix)
 {
     return real()->GetMatrixTransform(pMatrix);
 }
 
 // IDXGISwapChain3
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-UINT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::GetCurrentBackBufferIndex(void)
+UINT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::GetCurrentBackBufferIndex(void)
 {
     EnterCriticalSection(&criticalSection);
 
@@ -2295,14 +2017,12 @@ UINT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType,
     return result;
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace, UINT* pColorSpaceSupport)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace, UINT* pColorSpaceSupport)
 {
     return real()->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace)
 {
     switch (ColorSpace)
     {
@@ -2322,8 +2042,7 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return real()->SetColorSpace1(ColorSpace);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::ResizeBuffers1(
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::ResizeBuffers1(
     UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT Flags,
     const UINT* nodeMasks, IUnknown* const* queues)
 {
@@ -2332,8 +2051,7 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
 }
 
 // IDXGISwapChain4
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void* pMetaData)
+HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void* pMetaData)
 {
     if (Size > 0 && pMetaData != nullptr)
     {
@@ -2362,8 +2080,7 @@ HRESULT STDMETHODCALLTYPE TFrameInterpolationSwapChainDX12<ParentType, PresentTy
     return real()->SetHDRMetaData(Type, Size, pMetaData);
 }
 
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-ID3D12GraphicsCommandList* TFrameInterpolationSwapChainDX12<ParentType, PresentType, ConfigType, PresentCallbackType, NumBuffers>::getInterpolationCommandList()
+ID3D12GraphicsCommandList* FrameInterpolationSwapChainDX12::getInterpolationCommandList()
 {
     EnterCriticalSection(&criticalSection);
 
@@ -2400,33 +2117,4 @@ ID3D12GraphicsCommandList* TFrameInterpolationSwapChainDX12<ParentType, PresentT
     LeaveCriticalSection(&criticalSection);
 
     return dx12CommandList;
-}
-
-
-HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12Stable::QueryInterface(REFIID riid, void** ppvObject)
-{
-
-    const GUID guidReplacements[] = {
-        IID_IUnknown,
-        IID_IDXGIObject,
-        IID_IDXGIDeviceSubObject,
-        IID_IDXGISwapChain,
-        IID_IDXGISwapChain1,
-        IID_IDXGISwapChain2,
-        IID_IDXGISwapChain3,
-        IID_IDXGISwapChain4,
-        IID_IFrameInterpolationSwapChainDX12
-    };
-
-    for (auto guid : guidReplacements)
-    {
-        if (IsEqualGUID(riid, guid) == TRUE)
-        {
-            AddRef();
-            *ppvObject = this;
-            return S_OK;
-        }
-    }
-
-    return E_NOINTERFACE;
 }

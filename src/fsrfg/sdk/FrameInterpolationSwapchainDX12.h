@@ -216,7 +216,6 @@ public:
     IFrameInterpolationSwapChainDX12() {}
     
 
-    virtual void presentPassthrough(UINT SyncInterval, UINT Flags) = 0;
     virtual HRESULT presentWithUiComposition(UINT SyncInterval, UINT Flags) = 0;
 
     virtual void dispatchInterpolationCommands(FrameInterpolationPacingDataExt& entry) = 0;
@@ -261,10 +260,9 @@ protected:
     virtual DXGI_SWAP_CHAIN_DESC1 getInterpolationEnabledSwapChainDescription(const DXGI_SWAP_CHAIN_DESC1 * nonAdjustedDesc) = 0;
 };
 
-// Owned private template/vtable: all callers are compiled together. Foreign
+// Owned private class/vtable: all callers are compiled together. Foreign
 // SDK private ABI layouts are deliberately not accepted by the provider.
-template<typename ParentType, typename PresentType, typename ConfigType, typename PresentCallbackType, size_t NumBuffers>
-class TFrameInterpolationSwapChainDX12 : public ParentType
+class FrameInterpolationSwapChainDX12 : public IFrameInterpolationSwapChainDX12
 {
 #if FFX_ABI_TEST
     friend struct FrameInterpolationSwapChainDX12ABITester;
@@ -274,8 +272,8 @@ protected:
     UINT                  getInterpolationEnabledSwapChainFlags(UINT nonAdjustedFlags);
     DXGI_SWAP_CHAIN_DESC1 getInterpolationEnabledSwapChainDescription(const DXGI_SWAP_CHAIN_DESC1* nonAdjustedDesc);
 
-    PresentType         presentInfo = {};
-    ConfigType          nextFrameGenerationConfig;
+    FrameinterpolationPresentInfoExt presentInfo = {};
+    FfxFrameGenerationConfig nextFrameGenerationConfig;
 
     CRITICAL_SECTION    criticalSection{};
     CRITICAL_SECTION    criticalSectionUpdateConfig{};
@@ -293,11 +291,11 @@ protected:
     bool                frameInterpolationResetCondition     = false;
     FfxApiRect2D        interpolationRect;
 
-    Dx12Commands*       registeredInterpolationCommandLists[NumBuffers] = {};
-    FrameInterpolationPacingDataExt registeredGenerations[NumBuffers] = {};
+    Dx12Commands*       registeredInterpolationCommandLists[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT_SDK2] = {};
+    FrameInterpolationPacingDataExt registeredGenerations[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT_SDK2] = {};
     ID3D12GraphicsCommandList* activeGenerationList = nullptr;
     FrameInterpolationPacingDataExt* activeGeneration = nullptr;
-    ReplacementResource replacementSwapBuffers[NumBuffers]  = {};
+    ReplacementResource replacementSwapBuffers[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT_SDK2]  = {};
     ReplacementResource interpolationOutputs[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_INTERPOLATION_OUTPUTS_COUNT] = {};
     ReplacementResource uiReplacementBuffer                                                          = {};
     int                 replacementSwapBufferIndex                                                   = 0;
@@ -331,7 +329,6 @@ protected:
     UINT64 totalUsageInBytes = 0;
     UINT64 aliasableUsageInBytes = 0;
 
-    void presentPassthrough(UINT SyncInterval, UINT Flags);
     HRESULT presentWithUiComposition(UINT SyncInterval, UINT Flags);
 
     void dispatchInterpolationCommands(FrameInterpolationPacingDataExt& entry);
@@ -365,8 +362,8 @@ public:
 
     void GetGpuMemoryUsage(FfxApiEffectMemoryUsage * vramUsage);
 
-    TFrameInterpolationSwapChainDX12();
-    virtual ~TFrameInterpolationSwapChainDX12();
+    FrameInterpolationSwapChainDX12();
+    virtual ~FrameInterpolationSwapChainDX12();
 
     HRESULT init(
         HWND hWnd,
