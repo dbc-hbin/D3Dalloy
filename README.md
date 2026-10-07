@@ -27,8 +27,8 @@ SPIR-V compiler fallback을 사용하지 않는다.
 | 현재 빌드·LLVM 설정·디버깅 | 아래 [빌드](#빌드), [Development](docs/DEVELOPMENT.md) |
 | 격리 runtime staging·fixture 빌드/실행 | [Runtime](graphics-translator/RUNTIME.ko.md), [Smoke test](graphics-translator/SMOKE-TEST.ko.md) |
 | NGX frontend·temporal 연동·테스트 | [NGX frontend](graphics-translator/D3D12-NGX-FRONTEND.ko.md), [Integration](graphics-translator/NGX-INTEGRATION.ko.md), [Contracts](graphics-translator/NGX-CONTRACTS.ko.md), [NGX tests](graphics-translator/NGX-TEST.ko.md), [Temporal tests](graphics-translator/TEMPORAL-TEST.ko.md), [Completion tests](graphics-translator/TEMPORAL-COMPLETION-TEST.ko.md) |
-| 설정·용어·업스트림 HUD 구분 | [Customization](docs/CUSTOMIZATION.md), [Glossary](docs/GLOSSARY.md), [Compatibility flags](docs/COMPATIBILITY_FLAG.md) |
-| Import 재현·과거 조사 | [Frozen build](graphics-translator/BUILD.ko.md), [Temporal/NGX review](graphics-translator/API-REVIEW.ko.md), [ZZZ historical analysis](graphics-translator/ZZZ-COMPATIBILITY.ko.md), [Upstream origin](docs/UPSTREAM-README.md) |
+| 설정 | [Customization](docs/CUSTOMIZATION.md) |
+| Import 재현·출처 | [Frozen build](graphics-translator/BUILD.ko.md), [Source provenance](docs/provenance/source-import.json) |
 
 ## 현재 상태 — 2026-10-07
 
@@ -206,10 +206,10 @@ Fixture마다 entry point(`main`/`wmain`), header revision, link library, frozen
 Manifest·로그·`result.json`·capture는 보존한다. 현재 build/install, 최신 staged runtime,
 비교용 known-good runtime 외의 사본은 검증 목적이 끝나면 runtime payload만 정리한다.
 
-## 라이선스와 기여
+## 라이선스와 출처
 
 루트 [LICENSE](LICENSE)와 각 소스의 원저작자 copyright를 유지한다.
 `external/nvapi/License.txt`, `external/nvngx/LICENSE.txt`,
 `include/native/directx/COPYING.MinGW-w64.txt`, `src/util/dxvk.LICENSE`는 각각의 vendored 라이선스다.
-[CONTRIBUTING.md](CONTRIBUTING.md)는 semantic commit과 실명 sign-off를 요구하며
-AI/LLM 작성·공동 작성 contribution을 받지 않는다고 명시한다. 로컬 변경을 upstream PR에 제출할 수 있다고 가정하지 않는다.
+기반 구현은 [3Shain/dxmt](https://github.com/3Shain/dxmt)에서 가져왔으며,
+정확한 import commit·patch·원본 파일 기록은 [source provenance](docs/provenance/source-import.json)에 보존한다.

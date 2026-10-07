@@ -62,7 +62,6 @@ Runtime destinations and evidence output directories must be fresh. Never instal
 - `src/d3d12/d3d12_interfaces.hpp`: private cross-DLL temporal ABI. `owned_submission_ring.hpp`, `owned_queue_task_fifo.hpp`, and `owned_rtas_lifetime.hpp` in that directory document concurrency/lifetime invariants.
 - `src/airconv/airconv_public.h`, `src/airconv/dxil_converter.hpp`: compiler ABI and lowering contract.
 - `dxmt.conf`, `docs/CUSTOMIZATION.md`: configuration, including `DXMT_CONFIG_FILE`/`DXMT_CONFIG`. `docs/DEVELOPMENT.md`: debugging background; prefer root README build instructions over older recipes.
-- `CONTRIBUTING.md`: semantic commit subjects and legal-name sign-off; it prohibits AI/LLM-authored or co-authored contributions. Do not assume generated changes are eligible for an upstream PR.
 
 ## Runtime/Tooling Preferences
 

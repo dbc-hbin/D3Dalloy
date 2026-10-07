@@ -57,4 +57,4 @@ This is not the D3D12 NGX/temporal integration; see the [D3D12 integration contr
 - Metal API/Shader Validation for isolated GPU fixtures is selected through the [test runner](../graphics-translator/SMOKE-TEST.ko.md).
 - The UMA advertised-memory policy is implemented in DXGI; there is no documented configuration switch that turns it into dedicated physical VRAM or completes budget-change notifications.
 
-Do not infer D3D12 support from the [upstream D3D11 compatibility HUD](COMPATIBILITY_FLAG.md).
+Do not infer D3D12 support from the upstream D3D11 compatibility HUD.
