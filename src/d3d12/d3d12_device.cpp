@@ -3093,17 +3093,14 @@ public:
    * nothing.
    */
   void
-  UnregisterRTASResidency(RTASState &state) {
+  UnregisterRTASResidency(const raytracing::ArenaKey &key, RTASState &state) {
     if (!state.sidecar)
       return;
     // In-place refits publish a new version of the same native object. Sweeping the
-    // previous version must not make the current one nonresident.
-    bool stillReferenced = false;
-    rtas_.ForEachKey([&](const raytracing::ArenaKey &key) {
-      const auto *current = rtas_.FindRecorded(key);
-      stillReferenced |= current && current->sidecar == state.sidecar;
-    });
-    if (stillReferenced)
+    // previous version must not make the current one nonresident. Only versions
+    // at this key share a sidecar; cross-address updates and copies allocate their own.
+    const auto *current = rtas_.FindRecorded(key);
+    if (current && current->sidecar == state.sidecar)
       return;
     WMT::Allocation structure = state.sidecar.accelerationStructure();
     if (structure)
@@ -3140,7 +3137,7 @@ public:
     });
     for (const auto &key : dying) {
       for (auto &state : rtas_.ReleaseAll(key)) {
-        UnregisterRTASResidency(state);
+        UnregisterRTASResidency(key, state);
         released_sidecars = true;
       }
       FreeRTASSlot(key);
@@ -3265,7 +3262,7 @@ public:
     if (released.empty())
       return;
     for (auto &state : released)
-      UnregisterRTASResidency(state);
+      UnregisterRTASResidency(key, state);
     residency_set_.commit();
   }
 
@@ -3301,8 +3298,8 @@ public:
     auto released = rtas_.Sweep();
     if (released.empty())
       return;
-    for (auto &state : released)
-      UnregisterRTASResidency(state);
+    for (auto &[key, state] : released)
+      UnregisterRTASResidency(key, state);
     residency_set_.commit();
   }
 

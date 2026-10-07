@@ -217,21 +217,22 @@ public:
   }
 
   /**
-   * Versions whose payload must now be released (residency dropped, reference let go).
+   * Versions whose payload must now be released (residency dropped, reference let go), paired
+   * with their originating key so residency can check the remaining version at that address.
    *
    * A version is dead when nothing can read it any more: the GPU does not hold it, no recording
    * still holds a lease on it, and if it was superseded by an observation, every submission that
    * was in flight at that observation has retired.
    */
-  std::vector<Payload>
+  std::vector<std::pair<Key, Payload>>
   Sweep() {
-    std::vector<Payload> released;
+    std::vector<std::pair<Key, Payload>> released;
     const uint64_t low = ActiveLowWatermark();
     for (auto &entry : slots_) {
       auto &versions = entry.second.versions;
       for (auto version = versions.begin(); version != versions.end();) {
         if (Dead(*version, low)) {
-          released.push_back(std::move(version->payload));
+          released.emplace_back(entry.first, std::move(version->payload));
           version = versions.erase(version);
         } else {
           ++version;
