@@ -656,6 +656,8 @@ protected:
                                               Value *level, bool coherent);
   std::pair<Value *, Value *> CreateVolumeSample(const Texture &texture, Value *handle, Value *coord,
       Value *offset, Value *lod, Value *minimum, Value *dx, Value *dy);
+  std::pair<Value *, Value *> CreateVolumeSampleBody(const Texture &texture, Value *handle, Value *coord,
+      Value *offset, Value *lod, Value *minimum, Value *dx, Value *dy);
 
   Value *
   GetOffset(const Texture &Texture, const int32_t ImmOffset[3]) {

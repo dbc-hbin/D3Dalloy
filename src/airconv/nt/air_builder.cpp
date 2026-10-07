@@ -642,6 +642,50 @@ AIRBuilder::CreateVolumeSample(const Texture &texture, Value *handle, Value *coo
     result.first = builder.CreateFPTrunc(result.first, getTexelType(texture));
     return result;
   }
+  const bool gradients = dx && dy;
+  const auto name = std::format("dxmt.volume.sample.{}.{}.{}.{}", unsigned(texture.sample_type),
+      unsigned(texture.memory_access), gradients, texture.atomic_phase_native);
+  SmallVector<Value *, 16> args{handle, coord, offset ? offset : Constant::getNullValue(getIntTy(3)),
+      lod, minimum, texture.volume_layout, texture.volume_view, texture.volume_metadata,
+      texture.sampler_metadata, texture.sampler_lod_range,
+      texture.sample_type == Texture::sample_float ? texture.sampler_float_border : texture.sampler_uint_border};
+  if (gradients) {
+    args.push_back(dx);
+    args.push_back(dy);
+  }
+  auto *function = getModule()->getFunction(name);
+  if (!function) {
+    SmallVector<Type *, 16> types;
+    for (auto *arg : args) types.push_back(arg->getType());
+    auto *result_type = StructType::get(getTexelType(texture), builder.getInt8Ty());
+    function = Function::Create(FunctionType::get(result_type, types, false),
+        GlobalValue::InternalLinkage, name, getModule());
+    // Expanding the atlas filter at each 3D sample makes real pixel shaders
+    // hundreds of thousands of instructions long before Metal compilation.
+    function->addFnAttr(Attribute::NoInline);
+    function->addFnAttr(Attribute::NoUnwind);
+    IRBuilderBase::InsertPointGuard insertion(builder);
+    builder.SetInsertPoint(BasicBlock::Create(getContext(), "entry", function));
+    auto sampled = texture;
+    sampled.volume_layout = function->getArg(5);
+    sampled.volume_view = function->getArg(6);
+    sampled.volume_metadata = function->getArg(7);
+    sampled.sampler_metadata = function->getArg(8);
+    sampled.sampler_lod_range = function->getArg(9);
+    sampled.sampler_float_border = sampled.sampler_uint_border = function->getArg(10);
+    auto result = CreateVolumeSampleBody(sampled, function->getArg(0), function->getArg(1), function->getArg(2),
+        function->getArg(3), function->getArg(4), gradients ? function->getArg(11) : nullptr,
+        gradients ? function->getArg(12) : nullptr);
+    auto *packed = builder.CreateInsertValue(UndefValue::get(result_type), result.first, 0);
+    builder.CreateRet(builder.CreateInsertValue(packed, result.second, 1));
+  }
+  auto *result = builder.CreateCall(function, args);
+  return {builder.CreateExtractValue(result, 0), builder.CreateExtractValue(result, 1)};
+}
+
+std::pair<Value *, Value *>
+AIRBuilder::CreateVolumeSampleBody(const Texture &texture, Value *handle, Value *coord,
+    Value *offset, Value *lod, Value *minimum, Value *dx, Value *dy) {
   IRBuilderBase::FastMathFlagGuard math_flags(builder);
   builder.clearFastMathFlags();
   auto *flags = builder.CreateTrunc(builder.CreateLShr(texture.sampler_metadata, 32), getIntTy());
