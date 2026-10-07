@@ -9,50 +9,24 @@ constexpr int kDXMTShaderCacheVersion = AIRCONV_VERSION;
 
 class ShaderCache {
 public:
-  template <typename T> class LockProtected {
-  public:
-    [[nodiscard]] LockProtected(dxmt::mutex &mutex, T object) : object(object), mutex_(&mutex) {
-      mutex_->lock();
-    }
-    [[nodiscard]] LockProtected() : object({}), mutex_(nullptr) {}
-    ~LockProtected() {
-      if (mutex_) {
-        mutex_->unlock();
-        mutex_ = nullptr;
-      }
-      object = {};
-    }
-    T object;
-    LockProtected(const LockProtected &copy) = delete;
-    LockProtected(LockProtected &&move) = default;
-
-    operator bool() const {
-      return mutex_ != nullptr;
-    }
-
-    T *
-    operator->() {
-      return &object;
-    }
-
-  private:
-    dxmt::mutex *mutex_;
-  };
-
   static ShaderCache &getInstance(WMTMetalVersion version);
 
-  LockProtected<WMT::CacheWriter>
-  getWriter() {
+  template <typename K>
+  void
+  set(const K &key, WMT::DispatchData data) {
     if (!scache_writer_)
-      return {};
-    return {scache_writer_mutex_, scache_writer_};
+      return;
+    std::lock_guard<dxmt::mutex> lock(scache_writer_mutex_);
+    scache_writer_.set(key, data);
   }
 
-  LockProtected<WMT::CacheReader>
-  getReader() {
+  template <typename K>
+  WMT::Reference<WMT::DispatchData>
+  get(const K &key) {
     if (!scache_reader_)
       return {};
-    return {scache_reader_mutex_, scache_reader_};
+    std::lock_guard<dxmt::mutex> lock(scache_reader_mutex_);
+    return scache_reader_.get(key);
   }
 
   ShaderCache(WMTMetalVersion metal_version);
