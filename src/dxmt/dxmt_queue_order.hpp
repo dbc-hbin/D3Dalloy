@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <list>
 #include <mutex>
 #include <vector>
 
@@ -30,17 +31,16 @@ private:
   mutable std::mutex mutex_;
   uint64_t completed_value_ = 0;
   bool removed_ = false;
-  std::vector<CompletionWaiter> completion_waiters_;
+  std::list<CompletionWaiter> completion_waiters_;
   uint64_t next_waiter_id_ = 1;
   const uint64_t generation_;
 
-  void completeValueLocked(uint64_t value) {
+  void completeValueLocked(uint64_t value, std::list<CompletionWaiter> &ready) {
     completed_value_ = value;
     for (auto it = completion_waiters_.begin(); it != completion_waiters_.end();) {
       if (value >= it->value) {
-        auto callback = std::move(it->callback);
-        it = completion_waiters_.erase(it);
-        callback();
+        auto completed = it++;
+        ready.splice(ready.end(), completion_waiters_, completed);
       } else {
         ++it;
       }
@@ -62,27 +62,42 @@ public:
   }
 
   void complete(const std::shared_ptr<Producer> &producer) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (removed_ || producer->completed)
-      return;
-    producer->completed = true;
-    completeValueLocked(producer->value);
+    std::list<CompletionWaiter> ready;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (removed_ || producer->completed)
+        return;
+      producer->completed = true;
+      completeValueLocked(producer->value, ready);
+    }
+    for (auto &waiter : ready)
+      waiter.callback();
   }
 
   void signalCpu(uint64_t value) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!removed_)
-      completeValueLocked(value);
+    std::list<CompletionWaiter> ready;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!removed_)
+        completeValueLocked(value, ready);
+    }
+    for (auto &waiter : ready)
+      waiter.callback();
   }
 
   // Device removal is terminal, unlike a user signal of UINT64_MAX. Release
   // every pending/late waiter, and never let a delayed producer rewind it.
   void remove() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (removed_)
-      return;
-    removed_ = true;
-    completeValueLocked(UINT64_MAX);
+    std::list<CompletionWaiter> ready;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (removed_)
+        return;
+      removed_ = true;
+      completeValueLocked(UINT64_MAX, ready);
+    }
+    for (auto &waiter : ready)
+      waiter.callback();
   }
 
   uint64_t completedValue() const {
@@ -91,33 +106,41 @@ public:
   }
 
   bool addCompletionWaiter(uint64_t value, std::function<void()> callback, uint64_t *registration = nullptr) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    // Registration and its initial observation are atomic with completion and
-    // rewind, so a qualifying crossing cannot disappear between two calls.
-    if (completed_value_ >= value) {
-      if (registration)
-        *registration = 0;
-      callback();
-      return true;
-    }
+    // Allocate before locking: callback destruction can itself cancel a wait.
+    std::list<CompletionWaiter> pending;
     try {
-      const uint64_t id = registration ? next_waiter_id_++ : 0;
-      completion_waiters_.push_back(CompletionWaiter{value, id, std::move(callback)});
-      if (registration)
-        *registration = id;
+      pending.push_back(CompletionWaiter{value, 0, std::move(callback)});
     } catch (...) {
       return false;
     }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      // Registration and its initial observation are atomic with completion and
+      // rewind, so a qualifying crossing cannot disappear between two calls.
+      if (completed_value_ >= value) {
+        if (registration)
+          *registration = 0;
+      } else {
+        const uint64_t id = registration ? next_waiter_id_++ : 0;
+        pending.front().id = id;
+        completion_waiters_.splice(completion_waiters_.end(), pending);
+        if (registration)
+          *registration = id;
+      }
+    }
+    if (!pending.empty())
+      pending.front().callback();
     return true;
   }
 
   void removeCompletionWaiter(uint64_t registration) {
     if (!registration)
       return;
+    std::list<CompletionWaiter> cancelled;
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = completion_waiters_.begin(); it != completion_waiters_.end(); ++it)
       if (it->id == registration) {
-        completion_waiters_.erase(it);
+        cancelled.splice(cancelled.end(), completion_waiters_, it);
         return;
       }
   }

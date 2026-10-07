@@ -9,6 +9,7 @@
 #pragma once
 
 #include "dxmt_queue_order.hpp"
+#include "dxmt_fence_event.hpp"
 #include "dxmt_shared_fence.hpp"
 #include "Metal.hpp"
 #include "windef.h"
@@ -21,9 +22,7 @@
 
 namespace dxmt {
 
-struct FenceWaitValue {
-  std::shared_ptr<owned_graphics::FenceCompletionLatch> latch;
-};
+using FenceWaitValue = owned_graphics::FenceWaitValue;
 
 class Fence {
 public:
@@ -99,7 +98,7 @@ private:
 class EventListener {
 public:
   bool setEventOnValue(Fence *fence, HANDLE event, uint64_t value);
-  bool setEventOnValues(const FenceWaitValue *values, uint32_t count, bool wait_all, HANDLE event);
+  bool setEventOnValues(FenceWaitValue *values, uint32_t count, bool wait_all, HANDLE event);
 };
 
 } // namespace dxmt

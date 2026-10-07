@@ -206,10 +206,7 @@ Fence::prepareWaitValue(uint64_t value) {
   std::lock_guard<std::mutex> lock(observe_mutex_);
   if (shared_event_)
     observeSharedLocked();
-  auto latch = std::make_shared<owned_graphics::FenceCompletionLatch>();
-  if (!order->addCompletionWaiter(value, [latch] { latch->signal(); }))
-    throw std::bad_alloc();
-  return FenceWaitValue{std::move(latch)};
+  return FenceWaitValue::prepare(order, value);
 }
 
 void
@@ -233,74 +230,6 @@ Fence::cancelQueueWait(const QueueTicket &ticket) const {
   ticket.order->removeCompletionWaiter(ticket.waiter_id);
 }
 
-namespace {
-
-class EventRegistration {
-public:
-  EventRegistration(uint32_t count, bool wait_all, HANDLE event)
-      : reached_(count, false), wait_all_(wait_all), event_(event) {}
-
-  void reach(uint32_t index) {
-    bool fire = false;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (cancelled_ || fired_ || reached_[index])
-        return;
-      reached_[index] = true;
-      if (!armed_)
-        return;
-      fire = !wait_all_;
-      if (wait_all_) {
-        fire = true;
-        for (bool reached : reached_)
-          fire &= reached;
-      }
-      fired_ = fire;
-    }
-    if (fire)
-      SetEvent(event_);
-  }
-
-  void arm() {
-    bool fire = false;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (cancelled_ || fired_)
-        return;
-      armed_ = true;
-      fire = !wait_all_;
-      if (wait_all_) {
-        fire = true;
-        for (bool reached : reached_)
-          fire &= reached;
-      } else {
-        fire = false;
-        for (bool reached : reached_)
-          fire |= reached;
-      }
-      fired_ = fire;
-    }
-    if (fire)
-      SetEvent(event_);
-  }
-
-  void cancel() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    cancelled_ = true;
-  }
-
-private:
-  std::mutex mutex_;
-  std::vector<bool> reached_;
-  bool wait_all_;
-  HANDLE event_;
-  bool armed_ = false;
-  bool fired_ = false;
-  bool cancelled_ = false;
-};
-
-} // namespace
-
 bool
 EventListener::setEventOnValue(Fence *fence, HANDLE event, uint64_t value) {
   try {
@@ -312,23 +241,8 @@ EventListener::setEventOnValue(Fence *fence, HANDLE event, uint64_t value) {
 }
 
 bool
-EventListener::setEventOnValues(const FenceWaitValue *values, uint32_t count, bool wait_all, HANDLE event) {
-  std::shared_ptr<EventRegistration> registration;
-  try {
-    registration = std::make_shared<EventRegistration>(count, wait_all, event);
-    for (uint32_t i = 0; i < count; ++i) {
-      if (!values[i].latch->addWaiter([registration, i] { registration->reach(i); })) {
-        registration->cancel();
-        return false;
-      }
-    }
-    registration->arm();
-  } catch (const std::bad_alloc &) {
-    if (registration)
-      registration->cancel();
-    return false;
-  }
-  return true;
+EventListener::setEventOnValues(FenceWaitValue *values, uint32_t count, bool wait_all, HANDLE event) {
+  return owned_graphics::FenceEventRegistration::set(values, count, wait_all, [event] { SetEvent(event); });
 }
 
 } // namespace dxmt
