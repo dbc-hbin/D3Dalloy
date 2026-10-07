@@ -29,12 +29,9 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <utility>
 #include <variant>
-
-#include "ftl.hpp"
 
 using namespace llvm;
 
@@ -42,49 +39,41 @@ namespace dxmt::air {
 
 class StreamMDHelper {
 public:
+  explicit StreamMDHelper(llvm::LLVMContext &context) : context(context) {}
+
   auto string(std::string str) {
-    factories.push_back([=](llvm::LLVMContext &context) {
-      return MDString::get(context, str);
-    });
+    mds.push_back(MDString::get(context, str));
     return this;
   };
   auto string(const char *c_str) {
-    factories.push_back([=](llvm::LLVMContext &context) {
-      return MDString::get(context, c_str);
-    });
+    mds.push_back(MDString::get(context, c_str));
     return this;
   };
   auto integer(uint64_t value, bool is_signed = false) {
-    factories.push_back([=](llvm::LLVMContext &context) {
-      return ConstantAsMetadata::get(
-        ConstantInt::get(context, APInt{32, value, is_signed})
-      );
-    });
+    mds.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(context, APInt{32, value, is_signed})
+    ));
     return this;
   };
   template <typename enumeration>
   auto integer(enumeration value, bool is_signed = false) {
-    factories.push_back([=](llvm::LLVMContext &context) {
-      return ConstantAsMetadata::get(
-        ConstantInt::get(context, APInt{32, (uint32_t)value, is_signed})
-      );
-    });
+    mds.push_back(ConstantAsMetadata::get(
+      ConstantInt::get(context, APInt{32, (uint32_t)value, is_signed})
+    ));
     return this;
   };
   auto metadata(llvm::Metadata *metadata) {
-    factories.push_back([=](llvm::LLVMContext &context) { return metadata; });
+    mds.push_back(metadata);
     return this;
   };
 
-  auto BuildTuple(llvm::LLVMContext &context) {
-    auto mds = factories | [&](auto factory) -> llvm::Metadata * {
-      return factory(context);
-    };
+  auto BuildTuple() {
     return MDTuple::get(context, mds);
   };
 
 private:
-  std::vector<std::function<llvm::Metadata *(llvm::LLVMContext &)>> factories;
+  llvm::LLVMContext &context;
+  std::vector<llvm::Metadata *> mds;
 };
 
 uint32_t ArgumentBufferBuilder::DefineBuffer(
@@ -251,10 +240,10 @@ auto build_argument_binding_buffer(
 llvm::MDNode *BuildBufferArgumentMetadata(
   uint32_t index, const ArgumentBindingBuffer &buffer, llvm::LLVMContext &context, const llvm::DataLayout &layout
 ) {
-  StreamMDHelper metadata;
+  StreamMDHelper metadata(context);
   metadata.integer(index);
   build_argument_binding_buffer(metadata, buffer, context, layout);
-  return metadata.BuildTuple(context);
+  return metadata.BuildTuple();
 }
 
 auto build_argument_binding_indirect_buffer(
@@ -407,7 +396,7 @@ auto ArgumentBufferBuilder::Build(
   std::vector<llvm::Metadata *> indirect_argument;
   uint32_t offset = 0;
   for (auto argument : fieldsType) {
-    StreamMDHelper metadata_field;
+    StreamMDHelper metadata_field(context);
     metadata_field.integer(offset);
     auto field_type = std::visit(
       patterns{
@@ -446,7 +435,7 @@ auto ArgumentBufferBuilder::Build(
       argument
     );
     fields.push_back(field_type);
-    indirect_argument.push_back(metadata_field.BuildTuple(context));
+    indirect_argument.push_back(metadata_field.BuildTuple());
     offset++;
   };
 
@@ -456,7 +445,7 @@ auto ArgumentBufferBuilder::Build(
   // struct_type.
   auto struct_layout = layout.getStructLayout(struct_type);
   auto member_offsets = struct_layout->getMemberOffsets();
-  StreamMDHelper struct_metadata;
+  StreamMDHelper struct_metadata(context);
   for (auto [field_type, member_offset, indirect_argument_metadata] :
        zip(fields, member_offsets, indirect_argument)) {
     struct_metadata.integer(member_offset)
@@ -479,7 +468,7 @@ auto ArgumentBufferBuilder::Build(
       ->string("air.indirect_argument")
       ->metadata(indirect_argument_metadata);
   }
-  return std::make_pair(struct_type, struct_metadata.BuildTuple(context));
+  return std::make_pair(struct_type, struct_metadata.BuildTuple());
 };
 
 std::tuple<llvm::StructType *, llvm::MDNode *> BuildRasterOrderedDescriptorTable(
@@ -488,7 +477,7 @@ std::tuple<llvm::StructType *, llvm::MDNode *> BuildRasterOrderedDescriptorTable
 ) {
   auto *ulong_type = llvm::Type::getInt64Ty(context);
   std::vector<llvm::Type *> fields;
-  StreamMDHelper table_info;
+  StreamMDHelper table_info(context);
   uint32_t cursor = 0;
 
   auto append_array = [&](llvm::Type *element_type, uint32_t count, llvm::MDNode *element_info,
@@ -497,7 +486,7 @@ std::tuple<llvm::StructType *, llvm::MDNode *> BuildRasterOrderedDescriptorTable
     auto *array_type = llvm::StructType::create(
       context, {llvm::ArrayType::get(element_type, count)}, "metal::array"
     );
-    StreamMDHelper element_array_info;
+    StreamMDHelper element_array_info(context);
     if (element_type->isStructTy())
       element_array_info.string("air.struct_type_info")->metadata(element_info);
     element_array_info.integer(0)->integer(layout.getTypeAllocSize(element_type))
@@ -507,19 +496,19 @@ std::tuple<llvm::StructType *, llvm::MDNode *> BuildRasterOrderedDescriptorTable
       element_array_info.integer(0);
     else
       element_array_info.metadata(element_info);
-    table_info.string("air.struct_type_info")->metadata(element_array_info.BuildTuple(context))
+    table_info.string("air.struct_type_info")->metadata(element_array_info.BuildTuple())
       ->integer(cursor * 32)->integer(layout.getTypeAllocSize(array_type))
       ->integer(0)->string("metal::array")->string(field_name)
       ->string("air.indirect_argument")->integer(location);
     fields.push_back(array_type);
   };
 
-  StreamMDHelper padding_element_info;
+  StreamMDHelper padding_element_info(context);
   padding_element_info.integer(0)->string("air.indirect_constant")
     ->string("air.location_index")->integer(0)->integer(1)
     ->string("air.arg_type_name")->string("ulong")
     ->string("air.arg_name")->string("__elems");
-  auto *padding_metadata = padding_element_info.BuildTuple(context);
+  auto *padding_metadata = padding_element_info.BuildTuple();
 
   for (const auto &range : ranges) {
     assert(range.descriptor_count && range.descriptor_offset >= cursor);
@@ -556,7 +545,7 @@ std::tuple<llvm::StructType *, llvm::MDNode *> BuildRasterOrderedDescriptorTable
 
   auto *table_type = llvm::StructType::create(context, fields, "raster_ordered_table");
   assert(layout.getTypeAllocSize(table_type) == static_cast<uint64_t>(cursor) * 32);
-  return {table_type, table_info.BuildTuple(context)};
+  return {table_type, table_info.BuildTuple()};
 }
 
 uint32_t FunctionSignatureBuilder::DefineInput(const FunctionInput &input) {
@@ -692,7 +681,7 @@ auto FunctionSignatureBuilder::CreateFunction(
 
   for (auto &item : enumerate(mesh_vertex_outputs)) {
     auto output = item.value();
-    StreamMDHelper md;
+    StreamMDHelper md(context);
     std::visit(
         patterns{
             [&](const OutputMeshData &vertex_out) {
@@ -731,12 +720,12 @@ auto FunctionSignatureBuilder::CreateFunction(
         },
         output
     );
-    metadata_mesh_vertex_output.push_back(md.BuildTuple(context));
+    metadata_mesh_vertex_output.push_back(md.BuildTuple());
   }
 
   for (auto &item : enumerate(mesh_primitive_outputs)) {
     auto output = item.value();
-    StreamMDHelper md;
+    StreamMDHelper md(context);
     std::visit(
         patterns{
             [&](const OutputMeshData &primitive_out) {
@@ -779,13 +768,13 @@ auto FunctionSignatureBuilder::CreateFunction(
         },
         output
     );
-    metadata_mesh_primitive_output.push_back(md.BuildTuple(context));
+    metadata_mesh_primitive_output.push_back(md.BuildTuple());
   }
 
   for (auto &item : enumerate(inputs)) {
     auto i = item.index();
     auto input = item.value();
-    StreamMDHelper metadata_field;
+    StreamMDHelper metadata_field(context);
     metadata_field.integer(i);
     llvm::Type *field_type = std::visit(
       patterns{
@@ -1010,7 +999,7 @@ auto FunctionSignatureBuilder::CreateFunction(
           );
         },
         [&](const InputMesh &mesh) -> llvm::Type * {
-          StreamMDHelper mesh_info;
+          StreamMDHelper mesh_info(context);
           mesh_info.string("air.mesh_type_info")
             ->metadata(MDTuple::get(context, metadata_mesh_vertex_output))
             ->metadata(MDTuple::get(context, metadata_mesh_primitive_output))
@@ -1029,7 +1018,7 @@ auto FunctionSignatureBuilder::CreateFunction(
           }
 
           metadata_field.string("air.mesh")
-            ->metadata(mesh_info.BuildTuple(context))
+            ->metadata(mesh_info.BuildTuple())
             ->string("air.arg_type_name")
             ->string("mesh<>") // HARDCODED
             ->string("air.arg_name")
@@ -1118,12 +1107,12 @@ auto FunctionSignatureBuilder::CreateFunction(
           return Type::getInt8PtrTy(context, value.address_space);
         },
         [&](const InputRaytracingPayload &payload) -> llvm::Type * {
-          StreamMDHelper payload_fields;
+          StreamMDHelper payload_fields(context);
           payload_fields.integer(0)->integer(1)->integer(payload.size)
             ->string("uchar")->string("bytes");
           metadata_field.string("air.payload")
             ->string("air.struct_type_info")
-            ->metadata(payload_fields.BuildTuple(context))
+            ->metadata(payload_fields.BuildTuple())
             ->string("air.arg_type_size")
             ->integer(payload.size)
             ->string("air.arg_type_align_size")
@@ -1142,14 +1131,14 @@ auto FunctionSignatureBuilder::CreateFunction(
       input
     );
 
-    metadata_input.push_back(metadata_field.BuildTuple(context));
+    metadata_input.push_back(metadata_field.BuildTuple());
     type_input.push_back(field_type);
   };
   for (auto &item : enumerate(outputs)) {
     if (skip_output)
       continue;
     auto output = item.value();
-    StreamMDHelper md;
+    StreamMDHelper md(context);
     llvm::Type *field_type = std::visit(
       patterns{
         [&](const OutputVertex &vertex_out) {
@@ -1276,7 +1265,7 @@ auto FunctionSignatureBuilder::CreateFunction(
       },
       output
     );
-    metadata_output.push_back(md.BuildTuple(context));
+    metadata_output.push_back(md.BuildTuple());
     type_output.push_back(field_type);
   };
   auto output_struct_type = (type_output.size() > 0 && !skip_output)
