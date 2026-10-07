@@ -19,6 +19,7 @@
 #include "log/log.hpp"
 #include <algorithm>
 #include <bit>
+#include <span>
 
 namespace dxmt {
 
@@ -331,7 +332,15 @@ ReservedResource::ExpandRegion(
 
 const ReservedSubresourceTiling *
 ReservedResource::subresourceOfTile(uint32_t tile, uint32_t &x, uint32_t &y, uint32_t &z) const {
-  for (const auto &sub : subresources_) {
+  auto subresources = std::span(subresources_);
+  if (array_size_ > 1) {
+    if (tile >= total_tiles_)
+      return nullptr;
+    // Immutable tiling stores equal-sized slices, each with its own packed tail.
+    const uint32_t slice = tile / (total_tiles_ / array_size_);
+    subresources = subresources.subspan(slice * mip_levels_, mip_levels_);
+  }
+  for (const auto &sub : subresources) {
     if (sub.packed)
       continue;
     const uint32_t count = sub.tiles_x * sub.tiles_y * sub.tiles_z;
