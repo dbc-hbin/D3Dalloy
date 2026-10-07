@@ -84,7 +84,6 @@ constexpr size_t kFrameStatisticsCount = 16;
 
 class FrameStatisticsContainer {
   std::array<FrameStatistics, kFrameStatisticsCount> frames_;
-  FrameStatistics min_;
   FrameStatistics max_;
   FrameStatistics average_;
 
@@ -99,11 +98,6 @@ public:
   }
 
   const FrameStatistics &
-  min() const {
-    return min_;
-  }
-
-  const FrameStatistics &
   max() const {
     return max_;
   }
@@ -115,24 +109,12 @@ public:
 
   void
   compute(uint64_t current_frame) {
-    min_.reset();
     max_.reset();
     average_.reset();
     current_frame = current_frame % kFrameStatisticsCount;
     for(unsigned i = 0; i < kFrameStatisticsCount; i++) {
       if (i == current_frame)
         continue; // deliberately exclude current frame since it
-      min_.command_buffer_count = std::min(min_.command_buffer_count, frames_[i].command_buffer_count);
-      min_.sync_count = std::min(min_.sync_count, frames_[i].sync_count);
-      min_.event_stall = std::min(min_.sync_count, frames_[i].event_stall);
-      min_.commit_interval = std::min(min_.commit_interval, frames_[i].commit_interval);
-      min_.sync_interval = std::min(min_.sync_interval, frames_[i].sync_interval);
-      min_.encode_prepare_interval = std::min(min_.encode_prepare_interval, frames_[i].encode_prepare_interval);
-      min_.encode_flush_interval = std::min(min_.encode_flush_interval, frames_[i].encode_flush_interval);
-      min_.drawable_blocking_interval =
-          std::min(min_.drawable_blocking_interval, frames_[i].drawable_blocking_interval);
-      min_.present_latency_interval = std::min(min_.present_latency_interval, frames_[i].present_latency_interval);
-
       max_.command_buffer_count = std::max(max_.command_buffer_count, frames_[i].command_buffer_count);
       max_.sync_count = std::max(max_.sync_count, frames_[i].sync_count);
       max_.event_stall = std::max(max_.event_stall, frames_[i].event_stall);
