@@ -40,6 +40,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <optional>
@@ -360,35 +361,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   owned_graphics::SubmissionRing<kCommandQueueSize> submission_ring_;
 
-  struct OwnedHandle {
-    HANDLE handle = nullptr;
-
-    OwnedHandle() = default;
-    explicit OwnedHandle(HANDLE handle) : handle(handle) {}
-    OwnedHandle(const OwnedHandle &) = delete;
-    OwnedHandle &operator=(const OwnedHandle &) = delete;
-    OwnedHandle(OwnedHandle &&other) : handle(other.handle) {
-      other.handle = nullptr;
-    }
-    OwnedHandle &operator=(OwnedHandle &&other) {
-      if (this != &other) {
-        if (handle)
-          CloseHandle(handle);
-        handle = other.handle;
-        other.handle = nullptr;
-      }
-      return *this;
-    }
-    ~OwnedHandle() {
-      if (handle)
-        CloseHandle(handle);
-    }
-    HANDLE release() {
-      auto result = handle;
-      handle = nullptr;
-      return result;
-    }
-  };
+  using OwnedHandle = std::unique_ptr<void, decltype([](HANDLE handle) { CloseHandle(handle); })>;
 
   // An allocator cannot discard recorded payloads while a FIFO task or any
   // Metal segment that reads them remains outstanding.  The lease is moved
@@ -973,9 +946,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (task.composition.surface)
         task.presenter->abortNativeRetirements();
     }
-    if (task.completion_handle.handle && task.credit &&
+    if (task.completion_handle && task.credit &&
         task.credit->exchange(false, std::memory_order_acq_rel))
-      task.latency->complete(task.completion_handle.handle);
+      task.latency->complete(task.completion_handle.get());
   }
 
 public:
@@ -7298,8 +7271,8 @@ public:
         }
       } else
         task.presenter->skipQueuedPresent(task.state->frame_id);
-      if (task.completion_handle.handle && task.credit->exchange(false, std::memory_order_acq_rel))
-        task.latency->complete(task.completion_handle.handle);
+      if (task.completion_handle && task.credit->exchange(false, std::memory_order_acq_rel))
+        task.latency->complete(task.completion_handle.get());
       return;
     }
     try {
