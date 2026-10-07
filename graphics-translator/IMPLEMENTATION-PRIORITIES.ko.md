@@ -4,16 +4,18 @@
 
 ## 현재 사용자 선택
 
-문서를 현행화하고 인수인계를 보존 이관한 뒤 Wine/FEX/DXMT 변경을 논리적인 로컬 커밋으로 분리한다. 이어 [2026-10-07 리뷰·설계](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)의 결함과 근거가 있는 최적화를 구현·검증한다. 과거 중단 지시는 현행 보류가 아니다. Web GPT Agent의 agents 도구는 사용하지 않는다. 사용 가능한 독립 실행 도구가 없는 경우 위임했다고 주장하지 않는다.
+문서 현행화·인수인계 보존과 이전 Wine/FEX/DXMT 변경의 원자적 로컬 커밋을 마친 뒤, 이번 지시에 따라 미사용 worktree8개를 먼저 정리했다. Dirty3개는 archive ref와 build 증거를 보존했고 interactive shell이 있던1개는 남겼다. 이어 [2026-10-07 리뷰·설계의 implementation ledger](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#follow-up-implementation-and-evidence)에 따라 R1–R6을 구현·검증·커밋하고 R7은 계측 후 native cache를 보류했다. 과거 중단 지시는 현행 보류가 아니다. Web GPT Agent의 agents 도구는 사용하지 않는다. 사용 가능한 독립 실행 도구가 없는 경우 위임했다고 주장하지 않는다.
 
-## 먼저 처리할 리뷰 항목
+## 선정 리뷰 항목 처리 결과
 
-| 순서 | 항목 | 완료 기준 |
+| 순서 | 항목 | 현재 판정·실제 검증 |
 | --- | --- | --- |
-| 1 | R1 Metal4FX의 CPU pointer 인코딩 | Null/zero-base/nonzero-base actual wrapper 계약과 해당 native x86 소비 경로; GPU 주소·native handle은 변환하지 않음 |
-| 2 | R2/R3 fence event 구독 정리와 완료 비용 | ANY losing subscriptions·설정 실패 rollback, 선형 ready 처리, 잠금 밖 callback, rewind/removal/경합·재진입 회귀 |
-| 3 | R4 자동 PSO cache 잠금 분리·계측 | 디스크 지연이 무관한 memory hit를 막지 않음; clear/disable/retry generation·single-flight·explicit CachedPSO 오류 보존 |
-| 측정 후 | R5 빈 Wait submission, R6 application cache index, R7 native PSO/archive | 실제 사용/단계 비용을 측정하고 각 순서·수명·identity·용량 계약의 회귀로 정당화. 미측정 FPS 효과를 약속하지 않음 |
+| 1 | R1 Metal4FX CPU pointer 인코딩 — 완료 | Null/zero/nonzero-base real wrapper와 FEX x86/x64 create·prepare·Composition descriptor 소비 PASS. Drawable/전체 FX proof는 아님 |
+| 2 | R2/R3 fence event 구독·완료 — 완료 | ANY losing subscription·설정 실패 rollback, allocation-free 선형 ready 처리, 잠금 밖 callback, 경합·재진입 CPU/sanitizer와 양 ABI public fence/sharing PASS |
+| 3 | R4 자동 PSO cache 잠금 분리 — 완료 | Blocked I/O와 독립 memory hit, clear/disable/retry generation·single-flight·explicit 오류 회귀 및 양 ABI public cache PASS |
+| 4 | R5 빈 Wait submission 제거 — 완료 | 같은32-frame workload의 제출191→128, 정확한 cross-queue readback. 양 ABI inline CL11·rewind·수명·shutdown/device removal PASS |
+| 5 | R6 application cache index — 완료 | 실제1,024-entry lookup x64 3,914→5.8ms·x86 4,377→6.8ms. Collision·손상·append rollback·작은 budget 재개방 회귀 PASS |
+| 6 | R7 native PSO/archive — 계측 완료, cache 보류 | Owned-blob hit의 native PSO p50 x64/x86 152/111µs. 실제 게임 중복률·retained memory·graphics variant 비용이 없어 추가 객체 cache를 정당화하지 않음 |
 
 설계가 존재하거나 컴파일됐다는 것과 public/GPU acceptance를 구분한다. 각 항목의 현재 적용·실행 결과는 리뷰 문서의 implementation ledger로 갱신한다. 기존 ring/FIFO·fence threshold semantics를 전면 재작성하거나 전역 GPU waits로 대체하지 않는다.
 

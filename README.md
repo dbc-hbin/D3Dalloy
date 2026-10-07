@@ -37,7 +37,7 @@ SPIR-V compiler fallback을 사용하지 않는다.
 | 영역 | 현재 구현 및 관찰 | 아직 증명하지 않은 범위 |
 | --- | --- | --- |
 | D3D12 코어·compiler | 기본 렌더링/compute, pipeline library, query, residency, indirect, DXR 및 선정 P0–P3 계약 구현 | 모든 유효 입력·게임·GPU/OS conformance |
-| 캐시 | 자동 owned RAM/disk·same-key single-flight와 application ShaderCacheSession/Control | native Metal archive·최종 PSO 객체 재사용; [새 캐시 잠금 리뷰](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md) |
+| 캐시 | 자동 owned RAM/disk·same-key single-flight·metadata/disk 잠금 분리와 application ShaderCacheSession/Control·검증된 record index | native Metal archive·최종 PSO 객체 재사용; [검증 및 계측](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#follow-up-implementation-and-evidence) |
 | Native ARM64/FEX | SDK05의 ARM64/x64/x86 ABI·Metal 및 각8-frame graphics/compute no-present proof. 이후 optimized Wine11.17/FEX 선정 패치·login03 ABI/Mono 기록 확보 | G8 native migration matrix, 전체 DXIL·게임·presentation |
 | 선택 frontend | ARM64/EC paired build와 PE32 packaging 옵션. 10월7일 direct isolated FEX x64 NGX·NGX-contracts·FSR SR consumer PASS 기록 | 이 기록은 generic runner·x86 FX·FG/RR 전체 native acceptance가 아님 |
 | 게임 표시·효과 | 기존 지정 SR/alpha/FG/Reflex·Composition geometry/cadence·일반 HDR proof 보존 | Composition absolute colour parity, RR clean native validation, HDR10+ GAMING |
