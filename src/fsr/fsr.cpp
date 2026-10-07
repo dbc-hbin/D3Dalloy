@@ -261,8 +261,10 @@ extern "C" ffxReturnCode_t ffxCreateContext(ffxContext *output, ffxCreateContext
   if (upscale->flags & ~kCreateFlags) return FFX_API_RETURN_NO_PROVIDER;
   Com<IMTLD3D12DeviceExt> extension;
   Com<IUnknown> identity;
-  if (FAILED(backend->device->QueryInterface(IID_PPV_ARGS(&identity)))) return FFX_API_RETURN_ERROR_PARAMETER;
   if (FAILED(backend->device->QueryInterface(IID_PPV_ARGS(&extension))) || !extension) return FFX_API_RETURN_NO_PROVIDER;
+  // Device proxies can have a different IUnknown from the resources and lists
+  // owned by the implementation that supplies the temporal extension.
+  if (FAILED(extension->QueryInterface(IID_PPV_ARGS(&identity)))) return FFX_API_RETURN_ERROR_PARAMETER;
   BOOL supported = FALSE;
   const auto supportResult = extension->SupportsTemporalUpscale(&supported);
   if (FAILED(supportResult)) return backendResult(supportResult);

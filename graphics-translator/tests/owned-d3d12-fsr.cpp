@@ -95,6 +95,91 @@ struct FsrCreation {
     }
 };
 
+struct FsrProxyRefs { LONG added = 0, released = 0, destroyed = 0; };
+
+// Interception layers keep their own base-device identity, but expose the
+// underlying implementation for extensions and return its unwrapped children.
+class FsrDeviceProxy final : public ID3D12Device {
+    ComPtr<ID3D12Device> device;
+    LONG refs = 1;
+    FsrProxyRefs& counts;
+public:
+    FsrDeviceProxy(ID3D12Device* underlying, FsrProxyRefs& counts) : device(underlying), counts(counts) {}
+    ~FsrDeviceProxy() { ++counts.destroyed; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out)
+            return E_POINTER;
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(ID3D12Object) || iid == __uuidof(ID3D12Device)) {
+            *out = static_cast<ID3D12Device*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return device->QueryInterface(iid, out);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        InterlockedIncrement(&counts.added);
+        return InterlockedIncrement(&refs);
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        InterlockedIncrement(&counts.released);
+        const ULONG remaining = InterlockedDecrement(&refs);
+        if (!remaining)
+            delete this;
+        return remaining;
+    }
+
+#define FSR_FORWARD(type, name, parameters, arguments) \
+    type STDMETHODCALLTYPE name parameters override { return device->name arguments; }
+    FSR_FORWARD(HRESULT, GetPrivateData, (REFGUID guid, UINT* size, void* data), (guid, size, data))
+    FSR_FORWARD(HRESULT, SetPrivateData, (REFGUID guid, UINT size, const void* data), (guid, size, data))
+    FSR_FORWARD(HRESULT, SetPrivateDataInterface, (REFGUID guid, const IUnknown* data), (guid, data))
+    FSR_FORWARD(HRESULT, SetName, (const WCHAR* name), (name))
+    FSR_FORWARD(UINT, GetNodeCount, (), ())
+    FSR_FORWARD(HRESULT, CreateCommandQueue, (const D3D12_COMMAND_QUEUE_DESC* desc, REFIID iid, void** out), (desc, iid, out))
+    FSR_FORWARD(HRESULT, CreateCommandAllocator, (D3D12_COMMAND_LIST_TYPE type, REFIID iid, void** out), (type, iid, out))
+    FSR_FORWARD(HRESULT, CreateGraphicsPipelineState, (const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID iid, void** out), (desc, iid, out))
+    FSR_FORWARD(HRESULT, CreateComputePipelineState, (const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** out), (desc, iid, out))
+    FSR_FORWARD(HRESULT, CreateCommandList, (UINT node, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, ID3D12PipelineState* state, REFIID iid, void** out), (node, type, allocator, state, iid, out))
+    FSR_FORWARD(HRESULT, CheckFeatureSupport, (D3D12_FEATURE feature, void* data, UINT size), (feature, data, size))
+    FSR_FORWARD(HRESULT, CreateDescriptorHeap, (const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID iid, void** out), (desc, iid, out))
+    FSR_FORWARD(UINT, GetDescriptorHandleIncrementSize, (D3D12_DESCRIPTOR_HEAP_TYPE type), (type))
+    FSR_FORWARD(HRESULT, CreateRootSignature, (UINT node, const void* bytes, SIZE_T size, REFIID iid, void** out), (node, bytes, size, iid, out))
+    FSR_FORWARD(void, CreateConstantBufferView, (const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle), (desc, handle))
+    FSR_FORWARD(void, CreateShaderResourceView, (ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle), (resource, desc, handle))
+    FSR_FORWARD(void, CreateUnorderedAccessView, (ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle), (resource, counter, desc, handle))
+    FSR_FORWARD(void, CreateRenderTargetView, (ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle), (resource, desc, handle))
+    FSR_FORWARD(void, CreateDepthStencilView, (ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle), (resource, desc, handle))
+    FSR_FORWARD(void, CreateSampler, (const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle), (desc, handle))
+    FSR_FORWARD(void, CopyDescriptors, (UINT dstCount, const D3D12_CPU_DESCRIPTOR_HANDLE* dst, const UINT* dstSizes, UINT srcCount, const D3D12_CPU_DESCRIPTOR_HANDLE* src, const UINT* srcSizes, D3D12_DESCRIPTOR_HEAP_TYPE type), (dstCount, dst, dstSizes, srcCount, src, srcSizes, type))
+    FSR_FORWARD(void, CopyDescriptorsSimple, (UINT count, D3D12_CPU_DESCRIPTOR_HANDLE dst, D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type), (count, dst, src, type))
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    FSR_FORWARD(D3D12_RESOURCE_ALLOCATION_INFO*, GetResourceAllocationInfo, (D3D12_RESOURCE_ALLOCATION_INFO* out, UINT mask, UINT count, const D3D12_RESOURCE_DESC* desc), (out, mask, count, desc))
+    FSR_FORWARD(D3D12_HEAP_PROPERTIES*, GetCustomHeapProperties, (D3D12_HEAP_PROPERTIES* out, UINT node, D3D12_HEAP_TYPE type), (out, node, type))
+    FSR_FORWARD(LUID*, GetAdapterLuid, (LUID* out), (out))
+#else
+    FSR_FORWARD(D3D12_RESOURCE_ALLOCATION_INFO, GetResourceAllocationInfo, (UINT mask, UINT count, const D3D12_RESOURCE_DESC* desc), (mask, count, desc))
+    FSR_FORWARD(D3D12_HEAP_PROPERTIES, GetCustomHeapProperties, (UINT node, D3D12_HEAP_TYPE type), (node, type))
+    FSR_FORWARD(LUID, GetAdapterLuid, (), ())
+#endif
+    FSR_FORWARD(HRESULT, CreateCommittedResource, (const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS flags, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, REFIID iid, void** out), (heap, flags, desc, state, clear, iid, out))
+    FSR_FORWARD(HRESULT, CreateHeap, (const D3D12_HEAP_DESC* desc, REFIID iid, void** out), (desc, iid, out))
+    FSR_FORWARD(HRESULT, CreatePlacedResource, (ID3D12Heap* heap, UINT64 offset, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, REFIID iid, void** out), (heap, offset, desc, state, clear, iid, out))
+    FSR_FORWARD(HRESULT, CreateReservedResource, (const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, REFIID iid, void** out), (desc, state, clear, iid, out))
+    FSR_FORWARD(HRESULT, CreateSharedHandle, (ID3D12DeviceChild* object, const SECURITY_ATTRIBUTES* attributes, DWORD access, const WCHAR* name, HANDLE* handle), (object, attributes, access, name, handle))
+    FSR_FORWARD(HRESULT, OpenSharedHandle, (HANDLE handle, REFIID iid, void** out), (handle, iid, out))
+    FSR_FORWARD(HRESULT, OpenSharedHandleByName, (const WCHAR* name, DWORD access, HANDLE* handle), (name, access, handle))
+    FSR_FORWARD(HRESULT, MakeResident, (UINT count, ID3D12Pageable* const* objects), (count, objects))
+    FSR_FORWARD(HRESULT, Evict, (UINT count, ID3D12Pageable* const* objects), (count, objects))
+    FSR_FORWARD(HRESULT, CreateFence, (UINT64 value, D3D12_FENCE_FLAGS flags, REFIID iid, void** out), (value, flags, iid, out))
+    FSR_FORWARD(HRESULT, GetDeviceRemovedReason, (), ())
+    FSR_FORWARD(void, GetCopyableFootprints, (const D3D12_RESOURCE_DESC* desc, UINT first, UINT count, UINT64 base, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows, UINT64* rowSize, UINT64* size), (desc, first, count, base, layouts, rows, rowSize, size))
+    FSR_FORWARD(HRESULT, CreateQueryHeap, (const D3D12_QUERY_HEAP_DESC* desc, REFIID iid, void** out), (desc, iid, out))
+    FSR_FORWARD(HRESULT, SetStablePowerState, (WINBOOL enable), (enable))
+    FSR_FORWARD(HRESULT, CreateCommandSignature, (const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root, REFIID iid, void** out), (desc, root, iid, out))
+    FSR_FORWARD(void, GetResourceTiling, (ID3D12Resource* resource, UINT* count, D3D12_PACKED_MIP_INFO* packed, D3D12_TILE_SHAPE* shape, UINT* subCount, UINT first, D3D12_SUBRESOURCE_TILING* tilings), (resource, count, packed, shape, subCount, first, tilings))
+#undef FSR_FORWARD
+};
+
 ffxDispatchDescUpscale fsrFrame(ID3D12GraphicsCommandList* list, ID3D12Resource* color,
                                 ID3D12Resource* depth, ID3D12Resource* motion,
                                 ID3D12Resource* output) {
@@ -389,6 +474,55 @@ void fsrGpuFrames(const FsrApi& api, Gpu& gpu, ffxContext* context,
         std::printf("OWNED_D3D12_FSR_FRAME_PASS frame=%u input_tag=%u output_mean=%.9g reset=%u render=%u output=128 sentinel=1 state_restored=1\n",
                     frame, tag, stats.mean, frame != 1, frame == 3 ? 48 : 64);
     }
+}
+
+void fsrDeviceProxy(const FsrApi& api, Gpu& gpu, const ffxAllocationCallbacks& callbacks,
+                    ID3D12Resource* depth, ID3D12Resource* motion) {
+    FsrProxyRefs refs;
+    {
+        ComPtr<ID3D12Device> proxy;
+        proxy.Attach(new FsrDeviceProxy(gpu.device.Get(), refs));
+        {
+            ComPtr<IUnknown> proxyIdentity, deviceIdentity;
+            ComPtr<ID3D12Device> proxyDevice;
+            check(proxy.As(&proxyIdentity), "FSR proxy IUnknown");
+            check(proxy.As(&proxyDevice), "FSR proxy ID3D12Device");
+            check(gpu.device.As(&deviceIdentity), "FSR underlying IUnknown");
+            if (proxyIdentity.Get() == deviceIdentity.Get() || proxyDevice.Get() != proxy.Get() ||
+                proxyDevice.Get() == gpu.device.Get())
+                fail("FSR proxy identity must differ from underlying device");
+        }
+        FsrCreation creation(proxy.Get());
+        ffxContext context = nullptr;
+        fsrResult(api.create(&context, &creation.desc.header, &callbacks), FFX_API_RETURN_OK, "proxy_create");
+        if (!context)
+            fail("FSR proxy create returned no context");
+        {
+            auto color = makeColor(gpu, 100);
+            auto output = makeOutput(gpu, 777);
+            auto recording = gpu.makeRecording();
+            const auto valid = fsrFrame(recording.list.Get(), color.Get(), depth, motion, output.resource.Get());
+            Gpu other;
+            auto foreign = makeColor(other, 100);
+            auto bad = valid;
+            bad.color = ffxApiGetResourceDX12(foreign.Get());
+            fsrResult(api.dispatch(&context, &bad.header), FFX_API_RETURN_ERROR_PARAMETER, "proxy_foreign_resource_device");
+            auto foreignRecording = other.makeRecording();
+            bad = valid;
+            bad.commandList = foreignRecording.list.Get();
+            fsrResult(api.dispatch(&context, &bad.header), FFX_API_RETURN_ERROR_PARAMETER, "proxy_foreign_list_device");
+            check(foreignRecording.list->Close(), "FSR proxy foreign list Close");
+            check(recording.list->Close(), "FSR proxy negative list Close");
+        }
+        // Lists and resources deliberately come from gpu, not from the proxy.
+        fsrGpuFrames(api, gpu, &context, depth, motion);
+        fsrResult(api.destroy(&context, &callbacks), FFX_API_RETURN_OK, "proxy_destroy");
+        if (context)
+            fail("FSR proxy destroy retained context");
+    }
+    if (refs.destroyed != 1 || refs.released != refs.added + 1)
+        fail("FSR proxy COM references unbalanced");
+    std::puts("OWNED_D3D12_FSR_CASE_PASS case=device_proxy_underlying_gpu result=0");
 }
 
 void fsrDestroyReplay(const FsrApi& api, Gpu& gpu, FsrCreation& creation,
@@ -984,6 +1118,7 @@ int OWNED_FSR_FIXTURE_ENTRY() {
     fsrGpuFrames(api, gpu, &context, depth.Get(), motion.Get());
     fsrResult(api.destroy(&context, &callbacks), FFX_API_RETURN_OK, "destroy");
     fsrResult(api.destroy(&context, &callbacks), FFX_API_RETURN_ERROR_PARAMETER, "destroy_twice");
+    fsrDeviceProxy(api, gpu, callbacks, depth.Get(), motion.Get());
     fsrDestroyReplay(api, gpu, creation, callbacks, depth.Get(), motion.Get());
     fsrManualExposure(api, gpu, creation, callbacks, depth.Get(), motion.Get());
     fsrScaleCap(api, gpu);
