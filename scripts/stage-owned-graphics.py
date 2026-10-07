@@ -144,27 +144,16 @@ SYSTEM_MACHO_PREFIXES = (
 
 
 def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def under(path: Path, root: Path) -> bool:
-    try:
-        path.resolve(strict=False).relative_to(root.resolve(strict=False))
-        return True
-    except ValueError:
-        return False
+    return path.resolve(strict=False).is_relative_to(root.resolve(strict=False))
 
 
 def lexically_under(path: Path, root: Path) -> bool:
-    try:
-        path.absolute().relative_to(root.absolute())
-        return True
-    except ValueError:
-        return False
+    return path.absolute().is_relative_to(root.absolute())
 
 
 def existing_symlink_component(path: Path, stop: Path | None = None) -> Path | None:
