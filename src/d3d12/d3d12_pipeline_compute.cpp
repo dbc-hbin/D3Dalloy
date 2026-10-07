@@ -24,6 +24,7 @@
 #include "d3d12_pipeline.hpp"
 #include "d3d12_pipeline_cache.hpp"
 #include "log/log.hpp"
+#include <chrono>
 
 namespace dxmt {
 
@@ -54,6 +55,10 @@ public:
 
   HRESULT
   Initialize(const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc) {
+    const bool trace = owned_graphics::TraceEnabled();
+    using Clock = std::chrono::steady_clock;
+    std::array<Clock::time_point, 8> times{};
+    if (trace) times[0] = Clock::now();
     Sha1Digest key;
     if (HRESULT hr = PipelineCacheKey(*pDesc, key); FAILED(hr))
       return hr;
@@ -61,6 +66,7 @@ public:
                                       device_->GetMTLDevice().registryID()); FAILED(hr))
       return hr;
 
+    if (trace) times[1] = Clock::now();
     SM50Shader shader_cs;
     SM50Error sm50_err;
 
@@ -94,12 +100,14 @@ public:
     if (uses_atomic64) { common.next = &atomic_phase; common.metal_version = SM50_SHADER_METAL_410; }
 
     threadgroup_size = {ref_cs.ThreadgroupSize[0], ref_cs.ThreadgroupSize[1], ref_cs.ThreadgroupSize[2]};
+    if (trace) times[2] = Clock::now();
 
     if (!cache_.loaded() && SM50Compile(shader_cs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main",
                                        cache_.output(PipelineCache::Compute), &sm50_err)) {
       ERR("Failed to compile cs shader: ", SM50GetErrorMessageString(sm50_err));
       return E_FAIL;
     }
+    if (trace) times[3] = Clock::now();
 
     const auto cs_bitcode_compiled = cache_.view(PipelineCache::Compute);
 
@@ -107,16 +115,19 @@ public:
 
     if (HRESULT hr = compute_constants.Initialize(device_, cs_bitcode_compiled, cache_.bitcode(PipelineCache::Compute)); FAILED(hr))
       return hr;
+    if (trace) times[4] = Clock::now();
 
     WMT::Reference<WMT::Error> err;
 
     auto cs_lib = device_->GetMetal4Compiler().newLibrary(cs_data, err);
     if (!cs_lib)
       return cache_.loaded() ? E_INVALIDARG : E_FAIL;
+    if (trace) times[5] = Clock::now();
 
     auto cs_func = cs_lib.newFunction("cs_main");
     if (!cs_func)
       return cache_.loaded() ? E_INVALIDARG : E_FAIL;
+    if (trace) times[6] = Clock::now();
 
     // PSO
     {
@@ -138,6 +149,18 @@ public:
       indirect_info = info;
     }
 
+    if (trace) {
+      times[7] = Clock::now();
+      const char *phases[] = {"cache", "reflection", "compile", "constants", "library", "function", "pipeline"};
+      const auto creation = owned_graphics::NewObjectId();
+      for (size_t i = 0; i < std::size(phases); ++i)
+        owned_graphics::Trace("pipeline_compute_timing", ",\"creation\":", creation, ",\"key\":\"", key.string(),
+                              "\",\"loaded\":", unsigned(cache_.loaded()), ",\"phase\":\"", phases[i], "\",\"ns\":",
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(times[i + 1] - times[i]).count(),
+                              ",\"library_bytes\":", cs_bitcode_compiled.Size,
+                              ",\"constant_bytes\":", cs_bitcode_compiled.ConstantDataSize,
+                              ",\"reflection_copy_bytes\":", statistics_cs_bytecode.size() + statistics_root_blob.size());
+    }
     return S_OK;
   }
 
