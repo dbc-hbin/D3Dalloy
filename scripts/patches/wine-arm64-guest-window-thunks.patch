@@ -807,7 +807,7 @@ index 7981d9a0d1a2..2a2fe1cf8aa1 100644
              params[i].Pointer = req;
              break;
          case MemExtendedParameterAttributeFlags:
-@@ -115,6 +118,10 @@ static NTSTATUS mem_extended_parameters_32to64( MEM_EXTENDED_PARAMETER **ret_par
+@@ -115,7 +118,11 @@ static NTSTATUS mem_extended_parameters_32to64( MEM_EXTENDED_PARAMETER **ret_par
  
      if (req32)
      {
@@ -815,6 +815,7 @@ index 7981d9a0d1a2..2a2fe1cf8aa1 100644
 +         * CEILING pair, exactly like zero_bits.  It is validated here against
 +         * the guest highest_user_address and translated into [B, B+limit] by
 +         * the unix side. */
+         if (req32->LowestStartingAddress > highest_user_address) return STATUS_INVALID_PARAMETER;
          if (req32->HighestEndingAddress > highest_user_address) return STATUS_INVALID_PARAMETER;
          req->LowestStartingAddress = ULongToPtr( req32->LowestStartingAddress );
          req->HighestEndingAddress  = ULongToPtr( req32->HighestEndingAddress );
@@ -964,7 +965,7 @@ index 7981d9a0d1a2..2a2fe1cf8aa1 100644
          put_size( size32, size );
      }
      return status;
-@@ -469,17 +501,18 @@ NTSTATUS WINAPI wow64_NtMapViewOfSection( UINT *args )
+@@ -469,22 +501,23 @@ NTSTATUS WINAPI wow64_NtMapViewOfSection( UINT *args )
      ULONG alloc = get_ulong( &args );
      ULONG protect = get_ulong( &args );
  
@@ -974,6 +975,11 @@ index 7981d9a0d1a2..2a2fe1cf8aa1 100644
      NTSTATUS status;
      void *prev = NtCurrentTeb()->Tib.ArbitraryUserPointer;
  
+     if (addr32)
+     {
+         if (*addr32 > highest_user_address) return STATUS_INVALID_PARAMETER;
+         if (size32 && *addr32 + (SIZE_T)*size32 > highest_user_address + 1) return STATUS_CONFLICTING_ADDRESSES;
+     }
 -    NtCurrentTeb()->Tib.ArbitraryUserPointer = ULongToPtr( NtCurrentTeb32()->Tib.ArbitraryUserPointer );
 -    status = NtMapViewOfSection( handle, process, addr_32to64( &addr, addr32 ), get_zero_bits( zero_bits ),
 +    NtCurrentTeb()->Tib.ArbitraryUserPointer = guest_ptr32( NtCurrentTeb32()->Tib.ArbitraryUserPointer );
@@ -986,12 +992,17 @@ index 7981d9a0d1a2..2a2fe1cf8aa1 100644
          put_size( size32, size );
          if (RtlIsCurrentProcess( process ))
              notify_map_view_of_section( handle, addr, size, alloc, protect, &status );
-@@ -510,15 +543,16 @@ NTSTATUS WINAPI wow64_NtMapViewOfSectionEx( UINT *args )
+@@ -510,20 +543,21 @@ NTSTATUS WINAPI wow64_NtMapViewOfSectionEx( UINT *args )
      BOOL is_current = RtlIsCurrentProcess( process );
      BOOL set_limit = (!*addr32 && is_current);
      void *prev = NtCurrentTeb()->Tib.ArbitraryUserPointer;
 +    ULONG_PTR base = wow_guest_base_for_process( process );
  
+     if (addr32)
+     {
+         if (*addr32 > highest_user_address) return STATUS_INVALID_PARAMETER;
+         if (size32 && *addr32 + (SIZE_T)*size32 > highest_user_address + 1) return STATUS_CONFLICTING_ADDRESSES;
+     }
      if ((status = mem_extended_parameters_32to64( &params64, params32, &count, set_limit ))) return status;
  
 -    NtCurrentTeb()->Tib.ArbitraryUserPointer = ULongToPtr( NtCurrentTeb32()->Tib.ArbitraryUserPointer );

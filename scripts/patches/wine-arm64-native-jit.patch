@@ -240,11 +240,13 @@ diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
              }
          }
      }
-@@ -5308,3 +5424,4 @@
+@@ -5307,5 +5423,6 @@
+     else if (type & MEM_RESET)
      {
          if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
 +        else if (view->protect & VPROT_NATIVE_JIT) status = STATUS_NOT_SUPPORTED;
-         else madvise( base, size, MADV_DONTNEED );
+         else
+         {
 @@ -5316,2 +5433,6 @@
          else if (view->protect & VPROT_FREE_PLACEHOLDER) status = STATUS_CONFLICTING_ADDRESSES;
 +#if defined(__APPLE__) && defined(__aarch64__)

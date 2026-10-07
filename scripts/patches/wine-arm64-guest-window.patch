@@ -10,12 +10,15 @@ index c1edb8f..6beb369 100644
  #if defined(__APPLE__) && defined(__aarch64__)
  /* On Apple Silicon the kernel reserves the low 4GB (including the Windows
   * KUSER_SHARED_DATA address 0x7ffe0000) for the executable page zero, and
-@@ -1999,7 +2000,9 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
+@@ -1999,7 +2000,12 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  
      /* Keep the Windows execute permission for FEX, but do not ask Darwin to
       * execute x86 bytes. A 4KB guest IAT may share a 16KB host page with code. */
 -    if (view && (view->protect & VPROT_EMULATED_IMAGE)) unix_clear = VPROT_EXEC;
++    /* Anonymous ARM64EC code is x64 unless explicitly registered as native. */
 +    if ((view && (view->protect & VPROT_EMULATED_IMAGE)) ||
++        (view && arm64ec_view && is_view_valloc( view ) &&
++         !(view->protect & (VPROT_ARM64EC | VPROT_NATIVE_JIT | VPROT_SYSTEM | SEC_IMAGE))) ||
 +        (wow64_guest_base && (ULONG_PTR)base >= wow64_guest_base &&
 +         (ULONG_PTR)base - wow64_guest_base < limit_4g)) unix_clear = VPROT_EXEC;
  #endif

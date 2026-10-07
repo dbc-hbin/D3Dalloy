@@ -1,0 +1,195 @@
+Historical window-transport patch for the earlier Wine integration.
+Not selected by build-owned-wine-arm64-runtime.py for optimized Wine 11.17;
+that source uses wine-zzz-11.17-metal-layer.patch instead. Retained as provenance.
+
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -28,6 +28,7 @@
+ 	cocoa_window.m \
+ 	display.c \
+ 	dllmain.c \
++	dxmt.c \
+ 	event.c \
+ 	gdi.c \
+ 	image.c \
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -275,6 +275,7 @@
+ W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd, int format );
+ W32KAPI void client_surface_add_ref( struct client_surface *surface );
+ W32KAPI void client_surface_release( struct client_surface *surface );
++W32KAPI void use_window_client_surface( struct client_surface *surface, BOOL use );
+ W32KAPI void client_surface_present( struct client_surface *surface );
+ W32KAPI void update_client_surfaces( HWND hwnd );
+ W32KAPI void detach_client_surfaces( HWND hwnd );
+--- /dev/null
++++ b/dlls/winemac.drv/dxmt.c
+@@ -0,0 +1,168 @@
++/*
++ * Mac graphics driver surface adapter used by DXMT.
++ * Adapted from the LGPL Wine-side D3DMetal hooks.
++ * Copyright 2023 Brendan Shanks for CodeWeavers, Inc.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ * This library is distributed without any warranty; see COPYING.LIB.
++ */
++#if 0
++#pragma makedep unix
++#endif
++#include "config.h"
++#include <stdlib.h>
++#include "macdrv.h"
++
++void OnMainThread(dispatch_block_t block);
++
++struct dxmt_surface
++{
++    struct macdrv_client_surface *surface;
++    macdrv_metal_view view;
++    struct dxmt_surface *next;
++};
++
++/* The first four fields are DXMT's existing, architecture-neutral ABI. */
++struct dxmt_win_data
++{
++    HWND hwnd;
++    macdrv_window cocoa_window;
++    macdrv_view cocoa_view;
++    macdrv_view client_cocoa_view;
++    struct macdrv_win_data *locked_data;
++    struct dxmt_surface *entry;
++};
++C_ASSERT(offsetof(struct dxmt_win_data, client_cocoa_view) == 24);
++
++static pthread_mutex_t surfaces_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct dxmt_surface *surfaces;
++
++static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct dxmt_win_data *result;
++    struct dxmt_surface *entry;
++    struct client_surface *surface;
++    struct macdrv_win_data *data;
++
++    if (!(result = calloc(1, sizeof(*result)))) return NULL;
++    if (!(entry = calloc(1, sizeof(*entry)))) { free(result); return NULL; }
++    if (!(surface = macdrv_CreateClientSurface(hwnd, 0)))
++    {
++        free(entry);
++        free(result);
++        return NULL;
++    }
++    use_window_client_surface(surface, TRUE);
++    /* Materialize before taking the window lock: surface update acquires it. */
++    if (!(data = get_win_data(hwnd)))
++    {
++        use_window_client_surface(surface, FALSE);
++        client_surface_release(surface);
++        free(entry);
++        free(result);
++        return NULL;
++    }
++    entry->surface = impl_from_client_surface(surface);
++    pthread_mutex_lock(&surfaces_mutex);
++    entry->next = surfaces;
++    surfaces = entry;
++    pthread_mutex_unlock(&surfaces_mutex);
++    result->hwnd = data->hwnd;
++    result->cocoa_window = data->cocoa_window;
++    result->client_cocoa_view = entry->surface->cocoa_view;
++    result->locked_data = data;
++    result->entry = entry;
++    return result;
++}
++
++static void dxmt_release_win_data(struct dxmt_win_data *data)
++{
++    struct dxmt_surface **cursor, *unused = NULL;
++
++    if (!data) return;
++    pthread_mutex_lock(&surfaces_mutex);
++    if (!data->entry->view)
++    {
++        for (cursor = &surfaces; *cursor != data->entry; cursor = &(*cursor)->next) {}
++        unused = *cursor;
++        *cursor = unused->next;
++    }
++    pthread_mutex_unlock(&surfaces_mutex);
++    release_win_data(data->locked_data);
++    if (unused)
++    {
++        use_window_client_surface(&unused->surface->client, FALSE);
++        client_surface_release(&unused->surface->client);
++        free(unused);
++    }
++    free(data);
++}
++
++static macdrv_metal_view dxmt_create_metal_view(macdrv_view client, macdrv_metal_device device)
++{
++    struct dxmt_surface *entry;
++    macdrv_metal_view view;
++
++    if (!(view = macdrv_view_create_metal_view(client, device))) return NULL;
++    pthread_mutex_lock(&surfaces_mutex);
++    for (entry = surfaces; entry; entry = entry->next)
++        if (entry->surface->cocoa_view == client) { entry->view = view; break; }
++    pthread_mutex_unlock(&surfaces_mutex);
++    return view;
++}
++
++static void dxmt_release_metal_view(macdrv_metal_view view)
++{
++    struct dxmt_surface **cursor, *entry = NULL;
++
++    pthread_mutex_lock(&surfaces_mutex);
++    for (cursor = &surfaces; *cursor; cursor = &(*cursor)->next)
++        if ((*cursor)->view == view)
++        {
++            entry = *cursor;
++            *cursor = entry->next;
++            break;
++        }
++    pthread_mutex_unlock(&surfaces_mutex);
++    macdrv_view_release_metal_view(view);
++    if (entry)
++    {
++        use_window_client_surface(&entry->surface->client, FALSE);
++        client_surface_release(&entry->surface->client);
++        free(entry);
++    }
++}
++
++/* Only the ten slots consumed by the owned WineMetal backend are exported.
++ * No D3DMetal renderer, registry facade, or proprietary dependency is included. */
++struct dxmt_macdrv_functions
++{
++    void (*init_display_devices)(BOOL);
++    struct dxmt_win_data *(*get_win_data)(HWND);
++    void (*release_win_data)(struct dxmt_win_data *);
++    macdrv_window (*get_cocoa_window)(HWND, BOOL);
++    macdrv_metal_device (*create_metal_device)(void);
++    void (*release_metal_device)(macdrv_metal_device);
++    macdrv_metal_view (*create_metal_view)(macdrv_view, macdrv_metal_device);
++    macdrv_metal_layer (*get_metal_layer)(macdrv_metal_view);
++    void (*release_metal_view)(macdrv_metal_view);
++    void (*on_main_thread)(dispatch_block_t);
++};
++C_ASSERT(sizeof(struct dxmt_macdrv_functions) == 80);
++
++DECLSPEC_EXPORT struct dxmt_macdrv_functions macdrv_functions =
++{
++    NULL,
++    dxmt_get_win_data,
++    dxmt_release_win_data,
++    macdrv_get_cocoa_window,
++    macdrv_create_metal_device,
++    macdrv_release_metal_device,
++    dxmt_create_metal_view,
++    macdrv_view_get_metal_layer,
++    dxmt_release_metal_view,
++    OnMainThread,
++};
