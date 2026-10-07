@@ -286,8 +286,8 @@ NvAPI_D3D_SetResourceHint(
 }
 
 /*
- * GPU handles are the stable Metal device registry ID, the same value
- * `dxgi_adapter.cpp` turns into the adapter LUID. A handle is only meaningful
+ * GPU handles encode the Metal device registry ID at pointer width;
+ * `dxgi_adapter.cpp` uses the full ID for the adapter LUID. A handle is only meaningful
  * while it still names a live device, so every lookup validates it.
  *
  * `Array::object()` hands out a borrowed device handle owned by the array, so
@@ -297,7 +297,7 @@ static WMT::Device
 FindMetalDeviceByGpuHandle(const WMT::Reference<WMT::Array<WMT::Device>> &devices, uint64_t handle) {
   for (unsigned i = 0; i < devices.count(); i++) {
     auto device = devices.object(i);
-    if (handle == device.registryID())
+    if (handle && handle == uintptr_t(device.registryID()))
       return device;
   }
   return {};
@@ -882,19 +882,8 @@ NvAPI_GPU_GetAdapterIdFromPhysicalGpu(NvPhysicalGpuHandle hPhysicalGpu, void *pO
   if (!pOSAdapterId)
     return NVAPI_INVALID_ARGUMENT;
 
-  auto registry_id = uint64_t(hPhysicalGpu);
   auto devices = WMT::CopyAllDevices();
-  auto adapter_count = devices.count();
-  if (adapter_count == 0)
-    return NVAPI_INVALID_ARGUMENT;
-
-  WMT::Device target_device{};
-  for (unsigned i = 0; i < adapter_count; i++) {
-    if (registry_id == devices.object(i).registryID()) {
-      target_device = devices.object(i);
-      break;
-    }
-  }
+  auto target_device = FindMetalDeviceByGpuHandle(devices, uint64_t(hPhysicalGpu));
   if (!target_device)
     return NVAPI_INVALID_ARGUMENT;
 

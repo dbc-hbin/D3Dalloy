@@ -49,6 +49,36 @@ struct Api {
     marker = reinterpret_cast<MarkerFn>(query(0xd9984c05));
     latency = reinterpret_cast<LatencyFn>(query(0x1a587f9c));
     require(sleep && set && get && marker && latency, "entry-points");
+    auto enumerate = reinterpret_cast<decltype(&NvAPI_EnumPhysicalGPUs)>(query(0xe5ac921f));
+    using AdapterIdFn = NvAPI_Status (__cdecl *)(NvPhysicalGpuHandle, void *);
+    auto adapterId = reinterpret_cast<AdapterIdFn>(query(0x0ff07fde));
+    require(enumerate && adapterId, "adapter-entry-points");
+    NvPhysicalGpuHandle handles[NVAPI_MAX_PHYSICAL_GPUS]{};
+    NvU32 count = 0;
+    status(enumerate(handles, &count), NVAPI_OK, "enumerate-adapters");
+    require(count > 0 && count <= NVAPI_MAX_PHYSICAL_GPUS, "adapter-count");
+    LUID luid{};
+    status(adapterId(handles[0], &luid), NVAPI_OK, "physical-adapter-id");
+    require(luid.LowPart || luid.HighPart, "physical-adapter-luid");
+    auto logicalFromPhysical = reinterpret_cast<decltype(&NvAPI_GetLogicalGPUFromPhysicalGPU)>(query(0xadd604d1));
+    auto physicalFromLogical = reinterpret_cast<decltype(&NvAPI_GetPhysicalGPUsFromLogicalGPU)>(query(0xaea3fa32));
+    auto logicalInfo = reinterpret_cast<decltype(&NvAPI_GPU_GetLogicalGpuInfo)>(query(0x842b066e));
+    require(logicalFromPhysical && physicalFromLogical && logicalInfo, "logical-adapter-entry-points");
+    NvLogicalGpuHandle logical{};
+    status(logicalFromPhysical(handles[0], &logical), NVAPI_OK, "logical-from-physical");
+    NvPhysicalGpuHandle roundtrip[NVAPI_MAX_PHYSICAL_GPUS]{};
+    status(physicalFromLogical(logical, roundtrip, &count), NVAPI_OK, "physical-from-logical");
+    require(count == 1 && roundtrip[0] == handles[0], "physical-handle-roundtrip");
+    LUID logicalLuid{};
+    NV_LOGICAL_GPU_DATA data{}; data.version = NV_LOGICAL_GPU_DATA_VER1; data.pOSAdapterId = &logicalLuid;
+    status(logicalInfo(logical, &data), NVAPI_OK, "logical-adapter-info");
+    require(data.physicalGpuCount == 1 && data.physicalGpuHandles[0] == handles[0] &&
+            logicalLuid.LowPart == luid.LowPart && logicalLuid.HighPart == luid.HighPart, "logical-adapter-luid");
+    status(adapterId(handles[0], nullptr), NVAPI_INVALID_ARGUMENT, "null-adapter-output");
+    const LUID sentinel = luid;
+    status(adapterId(nullptr, &luid), NVAPI_INVALID_ARGUMENT, "invalid-physical-handle");
+    require(luid.LowPart == sentinel.LowPart && luid.HighPart == sentinel.HighPart, "invalid-handle-output-preserved");
+    std::puts("OWNED_NVAPI_ADAPTER_PASS valid=1 null_output=1 invalid_handle=1 output_preserved=1");
   }
   ~Api() { FreeLibrary(module); }
 };
