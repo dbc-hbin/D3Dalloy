@@ -64,10 +64,7 @@ ClipUAVClearRect(const D3D12_RECT &rect, const D3D12_RECT &bounds) {
   };
 }
 
-bool
-RangeFits(UINT64 offset, UINT64 length, UINT64 total) {
-  return resource_contract::RangeFits(offset, length, total);
-}
+using resource_contract::RangeFits;
 
 bool
 GetSubresourceInfo(

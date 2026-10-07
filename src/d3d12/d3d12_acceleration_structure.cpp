@@ -1,4 +1,5 @@
 #include "d3d12_acceleration_structure.hpp"
+#include "d3d12_resource_contract.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -12,27 +13,9 @@ constexpr uint32_t kMetalUsagePreferFastBuild = 2u;
 constexpr uint32_t kMetalUsagePreferFastIntersection = 16u;
 constexpr uint32_t kMetalUsageMinimizeMemory = 32u;
 
-bool Add(uint64_t a, uint64_t b, uint64_t &result) {
-  if (b > std::numeric_limits<uint64_t>::max() - a)
-    return false;
-  result = a + b;
-  return true;
-}
-
-bool Multiply(uint64_t a, uint64_t b, uint64_t &result) {
-  if (a && b > std::numeric_limits<uint64_t>::max() / a)
-    return false;
-  result = a * b;
-  return true;
-}
-
-bool Align(uint64_t value, uint64_t alignment, uint64_t &result) {
-  uint64_t sum;
-  if (!alignment || (alignment & (alignment - 1)) || !Add(value, alignment - 1, sum))
-    return false;
-  result = sum & ~(alignment - 1);
-  return true;
-}
+using resource_contract::CheckedAdd;
+using resource_contract::CheckedMul;
+using resource_contract::CheckedAlign;
 
 uint32_t Usage(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS flags) {
   uint32_t usage = 0;
@@ -120,7 +103,7 @@ HRESULT ConvertTriangles(const D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC &triangl
         triangles.IndexFormat == DXGI_FORMAT_R32_UINT ? 4 : 0;
     uint64_t indexBytes;
     if (!indexSize || (triangles.IndexBuffer % indexSize) || triangles.IndexCount % 3 ||
-        !Multiply(triangles.IndexCount, indexSize, indexBytes))
+        !CheckedMul(triangles.IndexCount, indexSize, indexBytes))
       return E_INVALIDARG;
     geometry.indexFormat = triangles.IndexFormat;
     geometry.primitiveCount = triangles.IndexCount / 3;
@@ -133,8 +116,8 @@ HRESULT ConvertTriangles(const D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC &triangl
   /* A geometry with no triangles is legal: it builds nothing but keeps its GeometryIndex. */
   if (geometry.primitiveCount) {
     uint64_t vertexBytes;
-    if (!triangles.VertexCount || !Multiply(triangles.VertexCount - 1, stride, vertexBytes) ||
-        !Add(vertexBytes, format->positionSize, vertexBytes) ||
+    if (!triangles.VertexCount || !CheckedMul(triangles.VertexCount - 1, stride, vertexBytes) ||
+        !CheckedAdd(vertexBytes, format->positionSize, vertexBytes) ||
         !Resolve(resolve, context, triangles.VertexBuffer.StartAddress, vertexBytes, geometry.verticesOrBoxes))
       return E_INVALIDARG;
   }
@@ -159,8 +142,8 @@ HRESULT ConvertAABBs(const D3D12_RAYTRACING_GEOMETRY_AABBS_DESC &aabbs, ResolveG
   if (!aabbs.AABBCount)
     return S_OK;
   uint64_t bytes;
-  if (stride < sizeof(D3D12_RAYTRACING_AABB) || !Multiply(aabbs.AABBCount - 1, stride, bytes) ||
-      !Add(bytes, sizeof(D3D12_RAYTRACING_AABB), bytes) ||
+  if (stride < sizeof(D3D12_RAYTRACING_AABB) || !CheckedMul(aabbs.AABBCount - 1, stride, bytes) ||
+      !CheckedAdd(bytes, sizeof(D3D12_RAYTRACING_AABB), bytes) ||
       !Resolve(resolve, context, aabbs.AABBs.StartAddress, bytes, geometry.verticesOrBoxes))
     return E_INVALIDARG;
   return S_OK;
@@ -206,8 +189,8 @@ HRESULT ConvertBuildInputs(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_I
       if (entry.SubdivisionLevel > 12 || (entry.Format != 1 && entry.Format != 2)) return E_INVALIDARG;
       const uint64_t bytes = (((uint64_t(1) << (2 * entry.SubdivisionLevel)) * uint32_t(entry.Format) + 7) / 8 + 3) & ~3ull;
       uint64_t range;
-      if (!Add(count, entry.Count, count) || count > UINT32_MAX ||
-          !Multiply(entry.Count, bytes, range) || !Add(size, range, size)) return E_INVALIDARG;
+      if (!CheckedAdd(count, entry.Count, count) || count > UINT32_MAX ||
+          !CheckedMul(entry.Count, bytes, range) || !CheckedAdd(size, range, size)) return E_INVALIDARG;
       result.ommHistogram.push_back(entry);
     }
     result.ommCount = count;
@@ -217,7 +200,7 @@ HRESULT ConvertBuildInputs(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_I
     uint64_t descBytes;
     if ((array->InputBuffer % 128) || (array->PerOmmDescs.StartAddress % 4) ||
         (result.ommDescStride % 4) || result.ommDescStride < 8 ||
-        !Multiply(count - 1, result.ommDescStride, descBytes) || !Add(descBytes, 8, descBytes) ||
+        !CheckedMul(count - 1, result.ommDescStride, descBytes) || !CheckedAdd(descBytes, 8, descBytes) ||
         !Resolve(resolve, context, array->InputBuffer, 1, result.ommData) ||
         !Resolve(resolve, context, array->PerOmmDescs.StartAddress, descBytes, result.ommDescs)) return E_INVALIDARG;
     return S_OK;
@@ -235,7 +218,7 @@ HRESULT ConvertBuildInputs(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_I
     const uint64_t alignment = pointers ? sizeof(D3D12_GPU_VIRTUAL_ADDRESS)
                                         : D3D12_RAYTRACING_INSTANCE_DESCS_BYTE_ALIGNMENT;
     uint64_t bytes;
-    if ((inputs.InstanceDescs % alignment) || !Multiply(inputs.NumDescs, element, bytes) ||
+    if ((inputs.InstanceDescs % alignment) || !CheckedMul(inputs.NumDescs, element, bytes) ||
         !Resolve(resolve, context, inputs.InstanceDescs, bytes, result.instances))
       return E_INVALIDARG;
     return S_OK;
@@ -288,7 +271,7 @@ HRESULT ConvertBuildInputs(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_I
           uint64_t range;
           if (!bytes || stride < bytes || stride > UINT32_MAX || (stride % bytes) ||
               (link.OpacityMicromapIndexBuffer.StartAddress % bytes) ||
-              !Multiply(geometry.primitiveCount - 1, stride, range) || !Add(range, bytes, range) ||
+              !CheckedMul(geometry.primitiveCount - 1, stride, range) || !CheckedAdd(range, bytes, range) ||
               !Resolve(resolve, context, link.OpacityMicromapIndexBuffer.StartAddress, range, geometry.ommIndices)) return E_INVALIDARG;
           geometry.ommIndexBytes = bytes;
           geometry.ommIndexStride = stride;
@@ -307,11 +290,11 @@ bool CalculatePrebuildInfo(const NativeSizes &native, uint64_t shadowSize, uint6
   uint64_t withHeader;
   uint64_t withShadow;
   if (!resultDataMaxSize || !scratchDataSize || !updateScratchDataSize ||
-      !Add(native.accelerationStructureSize, kHeaderSize, withHeader) ||
-      !Add(withHeader, shadowSize, withShadow) ||
-      !Align(withShadow, kAccelerationStructureAlignment, *resultDataMaxSize) ||
-      !Align(native.buildScratchSize, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT, *scratchDataSize) ||
-      !Align(native.refitScratchSize, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT,
+      !CheckedAdd(native.accelerationStructureSize, kHeaderSize, withHeader) ||
+      !CheckedAdd(withHeader, shadowSize, withShadow) ||
+      !CheckedAlign(withShadow, kAccelerationStructureAlignment, *resultDataMaxSize) ||
+      !CheckedAlign(native.buildScratchSize, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT, *scratchDataSize) ||
+      !CheckedAlign(native.refitScratchSize, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT,
           *updateScratchDataSize))
     return false;
   return true;
@@ -320,8 +303,8 @@ bool CalculatePrebuildInfo(const NativeSizes &native, uint64_t shadowSize, uint6
 bool CalculatePrepassLayout(uint32_t instanceCount, PrepassLayout &layout) {
   uint64_t converted;
   uint64_t contributions;
-  if (!Multiply(instanceCount, kMetalIndirectInstanceDescriptorSize, converted) ||
-      !Multiply(instanceCount, sizeof(uint32_t), contributions))
+  if (!CheckedMul(instanceCount, kMetalIndirectInstanceDescriptorSize, converted) ||
+      !CheckedMul(instanceCount, sizeof(uint32_t), contributions))
     return false;
   layout = {0, kHeaderSize, converted, contributions};
   return true;
@@ -378,14 +361,14 @@ bool PlanShadow(const BuildInputs &inputs, ShadowPlan &plan) {
   plan = {};
   uint64_t cursor = kHeaderSize;
   if (uint32_t(inputs.type) == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY) {
-    if (!Multiply(inputs.ommCount, sizeof(ShadowGeometry), cursor) ||
-        !Add(cursor, inputs.ommPackedBytes, cursor) || !Align(cursor, 16, plan.size)) return false;
+    if (!CheckedMul(inputs.ommCount, sizeof(ShadowGeometry), cursor) ||
+        !CheckedAdd(cursor, inputs.ommPackedBytes, cursor) || !CheckedAlign(cursor, 16, plan.size)) return false;
     plan.geometries.resize(inputs.ommCount);
     return true;
   }
   if (inputs.type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
     uint64_t bytes;
-    if (!Multiply(inputs.instanceCount, kD3DInstanceDescriptorSize, bytes))
+    if (!CheckedMul(inputs.instanceCount, kD3DInstanceDescriptorSize, bytes))
       return false;
     plan.size = bytes;
     if (inputs.instanceCount)
@@ -394,16 +377,16 @@ bool PlanShadow(const BuildInputs &inputs, ShadowPlan &plan) {
           inputs.instanceLayout == InstanceLayout::Array ? kShadowJobAddress : kShadowJobPointers, 0});
     return true;
   }
-  if (!Add(cursor, inputs.geometries.size() * sizeof(ShadowGeometry), cursor))
+  if (!CheckedAdd(cursor, inputs.geometries.size() * sizeof(ShadowGeometry), cursor))
     return false;
   auto append = [&](uint64_t source, uint64_t sourceStride, uint32_t bytes, uint32_t count,
                     uint64_t &offset) {
     uint64_t size;
     const uint32_t stride = (bytes + 3u) & ~3u;
-    if (!Align(cursor, kShadowAlignment, cursor) || !Multiply(count, stride, size))
+    if (!CheckedAlign(cursor, kShadowAlignment, cursor) || !CheckedMul(count, stride, size))
       return false;
     offset = cursor;
-    if (!Add(cursor, size, cursor))
+    if (!CheckedAdd(cursor, size, cursor))
       return false;
     if (count)
       plan.jobs.push_back({source, offset, sourceStride, bytes, stride, count, kShadowJobAddress, 0});
@@ -443,7 +426,7 @@ bool PlanShadow(const BuildInputs &inputs, ShadowPlan &plan) {
         geometry.ommIndexBytes, geometry.primitiveCount, record.ommIndexOffset)) return false;
     plan.geometries.push_back(record);
   }
-  if (!Align(cursor, kShadowAlignment, cursor))
+  if (!CheckedAlign(cursor, kShadowAlignment, cursor))
     return false;
   plan.size = cursor - kHeaderSize;
   return true;
@@ -476,7 +459,7 @@ bool PlanOmmShadow(const BuildInputs &inputs, const uint8_t *descs, uint64_t byt
     record.dataOffset = cursor;
     const uint32_t padded = (size + 3) & ~3u;
     plan.jobs.push_back({inputs.ommData.address + desc.ByteOffset, cursor, size, size, padded, 1, kShadowJobAddress, 0});
-    if (!Add(cursor, padded, cursor)) return false;
+    if (!CheckedAdd(cursor, padded, cursor)) return false;
   }
   return !memcmp(expected, actual, sizeof(expected)) && cursor <= kHeaderSize + plan.size;
 }
@@ -537,8 +520,8 @@ HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE
           &serialized.DriverMatchingIdentifier) != D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE)
     return E_INVALIDARG;
   const bool blocks = uint32_t(serialized.NumBottomLevelAccelerationStructurePointersAfterHeader >> 32) == UINT32_MAX;
-  if (!blocks && (!Multiply(serialized.NumBottomLevelAccelerationStructurePointersAfterHeader, 8, headerOffset) ||
-      !Add(headerOffset, kSerializedHeaderSize, headerOffset) || headerOffset > available ||
+  if (!blocks && (!CheckedMul(serialized.NumBottomLevelAccelerationStructurePointersAfterHeader, 8, headerOffset) ||
+      !CheckedAdd(headerOffset, kSerializedHeaderSize, headerOffset) || headerOffset > available ||
       available - headerOffset < kHeaderSize))
     return E_INVALIDARG;
   uint64_t ommPointers = 0;
@@ -568,7 +551,7 @@ HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE
   inputs.metalUsage = Usage(inputs.flags);
   auto location = [&](uint64_t offset, uint64_t count, uint64_t stride, BufferLocation &out) {
     uint64_t bytes;
-    if (offset < kHeaderSize || !Multiply(count, stride, bytes) || offset > kHeaderSize + header.shadowSize ||
+    if (offset < kHeaderSize || !CheckedMul(count, stride, bytes) || offset > kHeaderSize + header.shadowSize ||
         bytes > kHeaderSize + header.shadowSize - offset)
       return false;
     out = {destination.buffer, destination.offset + offset, bytes, destination.allocationIdentity,

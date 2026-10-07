@@ -31,10 +31,7 @@ namespace dxmt {
 
 namespace {
 
-bool
-ResolveViewRange(UINT first, UINT requested, UINT total, UINT &resolved) {
-  return resource_contract::ResolveRange(first, requested, total, resolved);
-}
+using resource_contract::ResolveRange;
 
 bool
 IsTypelessTextureFormat(WMT::Device device, DXGI_FORMAT format) {
@@ -1288,7 +1285,7 @@ public:
     switch (ViewDesc.ViewDimension) {
     case D3D12_SRV_DIMENSION_TEXTURE1D: {
       UINT mip_count = 0;
-      if (!ResolveViewRange(ViewDesc.Texture1D.MostDetailedMip, ViewDesc.Texture1D.MipLevels, desc_.MipLevels, mip_count))
+      if (!ResolveRange(ViewDesc.Texture1D.MostDetailedMip, ViewDesc.Texture1D.MipLevels, desc_.MipLevels, mip_count))
         return E_INVALIDARG;
       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
       view_descriptor.firstMiplevel = ViewDesc.Texture1D.MostDetailedMip;
@@ -1300,10 +1297,10 @@ public:
     }
     case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: {
       UINT mip_count = 0, array_size = 0;
-      if (!ResolveViewRange(
+      if (!ResolveRange(
               ViewDesc.Texture1DArray.MostDetailedMip, ViewDesc.Texture1DArray.MipLevels, desc_.MipLevels, mip_count
           ) ||
-          !ResolveViewRange(
+          !ResolveRange(
               ViewDesc.Texture1DArray.FirstArraySlice, ViewDesc.Texture1DArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ))
@@ -1318,7 +1315,7 @@ public:
     }
     case D3D12_SRV_DIMENSION_TEXTURE2D: {
       UINT mip_count = 0;
-      if (!ResolveViewRange(ViewDesc.Texture2D.MostDetailedMip, ViewDesc.Texture2D.MipLevels, desc_.MipLevels, mip_count) ||
+      if (!ResolveRange(ViewDesc.Texture2D.MostDetailedMip, ViewDesc.Texture2D.MipLevels, desc_.MipLevels, mip_count) ||
           FAILED(ValidateTexturePlane(device_->GetMTLDevice(), desc_.Format, ViewDesc.Format, ViewDesc.Texture2D.PlaneSlice)))
         return E_INVALIDARG;
       view_descriptor.type = WMTTextureType2D; // FIXME: lowering to 2d array
@@ -1331,10 +1328,10 @@ public:
     }
     case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: {
       UINT mip_count = 0, array_size = 0;
-      if (!ResolveViewRange(
+      if (!ResolveRange(
               ViewDesc.Texture2DArray.MostDetailedMip, ViewDesc.Texture2DArray.MipLevels, desc_.MipLevels, mip_count
           ) ||
-          !ResolveViewRange(
+          !ResolveRange(
               ViewDesc.Texture2DArray.FirstArraySlice, ViewDesc.Texture2DArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ) ||
@@ -1353,7 +1350,7 @@ public:
     case D3D12_SRV_DIMENSION_TEXTURECUBE: {
       UINT mip_count = 0;
       if (desc_.DepthOrArraySize < 6 ||
-          !ResolveViewRange(ViewDesc.TextureCube.MostDetailedMip, ViewDesc.TextureCube.MipLevels, desc_.MipLevels, mip_count))
+          !ResolveRange(ViewDesc.TextureCube.MostDetailedMip, ViewDesc.TextureCube.MipLevels, desc_.MipLevels, mip_count))
         return E_INVALIDARG;
       view_descriptor.type = WMTTextureTypeCube; // FIXME: lowering to cube array
       view_descriptor.firstMiplevel = ViewDesc.TextureCube.MostDetailedMip;
@@ -1365,7 +1362,7 @@ public:
     }
     case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: {
       UINT mip_count = 0;
-      if (!ResolveViewRange(
+      if (!ResolveRange(
               ViewDesc.TextureCubeArray.MostDetailedMip, ViewDesc.TextureCubeArray.MipLevels, desc_.MipLevels, mip_count
           ) ||
           (ViewDesc.TextureCubeArray.First2DArrayFace % 6) ||
@@ -1396,7 +1393,7 @@ public:
     }
     case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: {
       UINT array_size = 0;
-      if (!ResolveViewRange(
+      if (!ResolveRange(
               ViewDesc.Texture2DMSArray.FirstArraySlice, ViewDesc.Texture2DMSArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ))
@@ -1411,7 +1408,7 @@ public:
     }
     case D3D12_SRV_DIMENSION_TEXTURE3D: {
       UINT mip_count = 0;
-      if (!ResolveViewRange(ViewDesc.Texture3D.MostDetailedMip, ViewDesc.Texture3D.MipLevels, desc_.MipLevels, mip_count))
+      if (!ResolveRange(ViewDesc.Texture3D.MostDetailedMip, ViewDesc.Texture3D.MipLevels, desc_.MipLevels, mip_count))
         return E_INVALIDARG;
       view_descriptor.type = WMTTextureType3D;
       view_descriptor.firstMiplevel = ViewDesc.Texture3D.MostDetailedMip;
@@ -1542,7 +1539,7 @@ public:
     case D3D12_UAV_DIMENSION_TEXTURE1DARRAY: {
       UINT array_size = 0;
       if (ViewDesc.Texture1DArray.MipSlice >= desc_.MipLevels ||
-          !ResolveViewRange(
+          !ResolveRange(
               ViewDesc.Texture1DArray.FirstArraySlice, ViewDesc.Texture1DArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ))
@@ -1558,7 +1555,7 @@ public:
       view_descriptor.msaaShadow = desc_.SampleDesc.Count > 1;
       UINT array_size = 0;
       if (ViewDesc.Texture2DArray.MipSlice >= desc_.MipLevels ||
-          !ResolveViewRange(
+          !ResolveRange(
               ViewDesc.Texture2DArray.FirstArraySlice, ViewDesc.Texture2DArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ) ||
@@ -1578,7 +1575,7 @@ public:
         return E_INVALIDARG;
       const UINT mip_depth = std::max<UINT>(1u, static_cast<UINT>(desc_.DepthOrArraySize) >> ViewDesc.Texture3D.MipSlice);
       UINT resolved_w_size = 0;
-      if (!ResolveViewRange(ViewDesc.Texture3D.FirstWSlice, ViewDesc.Texture3D.WSize, mip_depth, resolved_w_size))
+      if (!ResolveRange(ViewDesc.Texture3D.FirstWSlice, ViewDesc.Texture3D.WSize, mip_depth, resolved_w_size))
         return E_INVALIDARG;
       first_w_slice = static_cast<uint16_t>(ViewDesc.Texture3D.FirstWSlice);
       w_size = static_cast<uint16_t>(resolved_w_size);
@@ -1684,7 +1681,7 @@ public:
     case D3D12_RTV_DIMENSION_TEXTURE1DARRAY: {
       UINT array_size = 0;
       if (ViewDesc.Texture1DArray.MipSlice >= desc_.MipLevels ||
-          !ResolveViewRange(
+          !ResolveRange(
               ViewDesc.Texture1DArray.FirstArraySlice, ViewDesc.Texture1DArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ))
@@ -1711,7 +1708,7 @@ public:
     case D3D12_RTV_DIMENSION_TEXTURE2DARRAY: {
       UINT array_size = 0;
       if (ViewDesc.Texture2DArray.MipSlice >= desc_.MipLevels ||
-          !ResolveViewRange(
+          !ResolveRange(
               ViewDesc.Texture2DArray.FirstArraySlice, ViewDesc.Texture2DArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ) ||
@@ -1737,7 +1734,7 @@ public:
     }
     case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY: {
       UINT array_size = 0;
-      if (!ResolveViewRange(
+      if (!ResolveRange(
               ViewDesc.Texture2DMSArray.FirstArraySlice, ViewDesc.Texture2DMSArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ))
@@ -1755,7 +1752,7 @@ public:
         return E_INVALIDARG;
       const UINT mip_depth = std::max<UINT>(1u, static_cast<UINT>(desc_.DepthOrArraySize) >> ViewDesc.Texture3D.MipSlice);
       UINT w_size = 0;
-      if (!ResolveViewRange(ViewDesc.Texture3D.FirstWSlice, ViewDesc.Texture3D.WSize, mip_depth, w_size))
+      if (!ResolveRange(ViewDesc.Texture3D.FirstWSlice, ViewDesc.Texture3D.WSize, mip_depth, w_size))
         return E_INVALIDARG;
       view_descriptor.type = WMTTextureType3D;
       view_descriptor.firstMiplevel = ViewDesc.Texture3D.MipSlice;
@@ -1855,7 +1852,7 @@ public:
     case D3D12_DSV_DIMENSION_TEXTURE1DARRAY: {
       UINT array_size = 0;
       if (ViewDesc.Texture1DArray.MipSlice >= desc_.MipLevels ||
-          !ResolveViewRange(
+          !ResolveRange(
               ViewDesc.Texture1DArray.FirstArraySlice, ViewDesc.Texture1DArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ))
@@ -1883,7 +1880,7 @@ public:
     case D3D12_DSV_DIMENSION_TEXTURE2DARRAY: {
       UINT array_size = 0;
       if (ViewDesc.Texture2DArray.MipSlice >= desc_.MipLevels ||
-          !ResolveViewRange(
+          !ResolveRange(
               ViewDesc.Texture2DArray.FirstArraySlice, ViewDesc.Texture2DArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ))
@@ -1908,7 +1905,7 @@ public:
     }
     case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY: {
       UINT array_size = 0;
-      if (!ResolveViewRange(
+      if (!ResolveRange(
               ViewDesc.Texture2DMSArray.FirstArraySlice, ViewDesc.Texture2DMSArray.ArraySize, desc_.DepthOrArraySize,
               array_size
           ))

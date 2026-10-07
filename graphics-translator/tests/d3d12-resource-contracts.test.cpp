@@ -33,6 +33,19 @@ int main() {
   assert(CheckedMul(UINT64_MAX / 4, 4, value));
   assert(!CheckedMul(UINT64_MAX, 2, value));
 
+  value = 7;
+  assert(CheckedAdd(value, 9, value) && value == 16);
+  assert(CheckedMul(value, 3, value) && value == 48);
+  assert(CheckedAlign(value, 64, value) && value == 64);
+  assert(CheckedAlign(value, 64, value) && value == 64);
+  assert(!CheckedAlign(value, 0, value) && value == 64);
+  assert(!CheckedAlign(value, 3, value) && value == 64);
+  value = UINT64_MAX;
+  assert(!CheckedAdd(value, 1, value) && value == UINT64_MAX);
+  assert(!CheckedMul(value, 2, value) && value == UINT64_MAX);
+  assert(!CheckedAlign(value, 2, value) && value == UINT64_MAX);
+  assert(CheckedMul(value, 0, value) && value == 0);
+
   FootprintLayout footprint{};
   assert(ValidateFootprintRange(64, 64, 1, 4, 1, 1, 256, 0, 16384, 512, 256, footprint));
   assert(footprint.row_size == 256 && footprint.row_count == 64 && footprint.slice_pitch == 16384);
