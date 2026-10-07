@@ -7154,17 +7154,10 @@ public:
     if (device_->RemovedReason() != S_OK)
       return;
 
-    try {
-      auto scope = StartCommitting();
-      // The latch requires actual validated completion, including remote
-      // producers. No native-token wait or API-thread blocking is needed.
-      owned_graphics::Trace("wait", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
-                            ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
-                            ",\"generation\":", task.ticket.generation);
-    } catch (const std::bad_alloc &) {
-      ERR("CommandQueue::Wait: out of memory preparing native submission");
-      device_->ReportRemoval(DXGI_ERROR_DEVICE_REMOVED);
-    }
+    // The latch requires actual validated completion, including remote producers.
+    // This FIFO worker gate has no GPU work and needs no empty native submission.
+    owned_graphics::Trace("wait", ",\"queue\":", owned_id_, ",\"fence\":", task.fence_id,
+                          ",\"value\":", task.ticket.value, ",\"generation\":", task.ticket.generation);
   }
 
   HRESULT STDMETHODCALLTYPE

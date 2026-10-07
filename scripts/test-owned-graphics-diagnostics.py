@@ -158,6 +158,16 @@ RAYTRACING_CONTRACT_TRACE += RAYTRACING_COHERENCE_CONTROL_TRACE
 
 
 class RunnerFailures(unittest.TestCase):
+    def test_multiqueue_waits_do_not_create_native_submissions(self):
+        events = [{"event": kind} for kind, count in
+                  (("execute_list", 64), ("signal_committed", 64), ("wait", 63), ("submit", 128), ("complete", 128))
+                  for _ in range(count)]
+        self.assertEqual(runner.multiqueue_submission_failures(events), [])
+        self.assertTrue(runner.multiqueue_submission_failures(events + [{"event": "submit"}]))
+        self.assertTrue(runner.multiqueue_submission_failures(events[:-1]))
+        next(event for event in events if event["event"] == "wait")["submission"] = 99
+        self.assertTrue(runner.multiqueue_submission_failures(events))
+
     def test_automatic_pipeline_cache_scopes_same_executable_logs_and_producers(self):
         # Synthetic trace protocol only: NOT compilation, GPU or disk persistence evidence.
         prefix = "OWNED_D3D12_PIPELINE_CACHE"
@@ -2335,8 +2345,13 @@ class TemporalFailures(unittest.TestCase):
             return analyzer.analyze(path)
 
     def test_valid_recording_replay_and_async_queue_order(self):
+        for event in self.events:
+            if event["event"] == "wait":
+                event.pop("submission", None)
         report = self.report()
         self.assertTrue(report["pass"], report["errors"])
+        self.assertEqual(report["crossqueue"][0]["logical_wait"],
+                         next(event["event_id"] for event in self.events if event["event"] == "wait"))
         self.assertTrue(report["crossqueue"][0]["consumer_encoded_before_producer_completion"])
 
     def test_history_reset_regression_rejected(self):

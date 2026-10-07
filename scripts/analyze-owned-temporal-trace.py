@@ -152,7 +152,7 @@ def analyze(path: Path) -> dict:
             crossqueue.append({
                 "feature": feature, "wait_defer": defer["event_id"],
                 "producer_encode": producer["event_id"], "signal_committed": signal["event_id"],
-                "native_wait": wait["event_id"], "consumer_encode": consumer["event_id"],
+                "logical_wait": wait["event_id"], "consumer_encode": consumer["event_id"],
                 "producer_complete": producer_complete["event_id"],
                 "consumer_encoded_before_producer_completion": consumer["event_id"] < producer_complete["event_id"],
                 "submitted_recording": execution["recording"], "later_recordings_before_encode": len(resets),

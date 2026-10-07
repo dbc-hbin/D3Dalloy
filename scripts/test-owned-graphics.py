@@ -2477,6 +2477,15 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
     return []
 
 
+def multiqueue_submission_failures(events: list[dict]) -> list[str]:
+    # This fixture has 32 compute/copy pairs, 64 signals and 63 CPU-gated waits.
+    expected = {"execute_list": 64, "signal_committed": 64, "wait": 63, "submit": 128, "complete": 128}
+    counts = {kind: sum(event.get("event") == kind for event in events) for kind in expected}
+    if counts != expected or any("submission" in event for event in events if event.get("event") == "wait"):
+        return [f"multiqueue logical waits must not submit GPU work: {counts}"]
+    return []
+
+
 def run(args: argparse.Namespace) -> int:
     if getattr(args, "composition_visual_proof", False) and args.suite != "composition":
         raise ValueError("--composition-visual-proof requires --suite composition")
@@ -4021,6 +4030,8 @@ def run(args: argparse.Namespace) -> int:
             trace_events.append(event)
             if event.get("event") == "complete" and event.get("status") != 4:
                 validation_errors.append("non-completed Metal command buffer: " + line)
+    if args.suite == "multiqueue":
+        validation_errors.extend(multiqueue_submission_failures(trace_events))
     if args.suite == "pipeline-cache":
         validation_errors.extend(pipeline_cache_failures(stdout, stderr, backend_logs))
     if args.suite == "pipeline-library":
