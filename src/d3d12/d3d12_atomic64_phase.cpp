@@ -145,6 +145,13 @@ HRESULT CollectAtomic64PhaseBindings(MTLD3D12Device *device, std::span<const Sta
       const uint64_t base = (table.base - start.ptr) / 32;
       if (base >= desc.NumDescriptors) continue;
       if (table.parameter == UINT32_MAX) {
+        // Only direct heaps need deduplication; ordinary table lists can be large.
+        if (std::any_of(tables.data(), &table, [&](const auto &previous) {
+              return previous.heap == table.heap && previous.parameter == UINT32_MAX &&
+                  previous.base >= start.ptr && (previous.base - start.ptr) % 32 == 0 &&
+                  (previous.base - start.ptr) / 32 < desc.NumDescriptors;
+            }))
+          continue;
         for (uint32_t index = 0; index < desc.NumDescriptors; ++index)
           append_descriptor(table.heap->GetDescriptor(index));
         continue;

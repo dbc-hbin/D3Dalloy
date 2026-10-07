@@ -3499,6 +3499,13 @@ public:
       if (base_index >= heap_desc.NumDescriptors)
         continue;
       if (table.parameter == ~0u) {
+        // Only direct heaps need deduplication; ordinary table lists can be large.
+        if (std::any_of(tables.data(), &table, [&](const auto &previous) {
+              return previous.heap == table.heap && previous.parameter == UINT32_MAX &&
+                  previous.base >= heap_start.ptr && (previous.base - heap_start.ptr) % 32 == 0 &&
+                  (previous.base - heap_start.ptr) / 32 < heap_desc.NumDescriptors;
+            }))
+          continue;
         for (uint32_t i = 0; i < heap_desc.NumDescriptors; ++i) append_descriptor(table.heap, i);
         continue;
       }
