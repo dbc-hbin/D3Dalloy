@@ -1,7 +1,7 @@
 #pragma once
 #include "llvm/IR/Module.h"
 #include <cstdint>
-#include "sha256.hpp"
+#include <array>
 
 namespace dxmt::metallib {
 
@@ -74,8 +74,10 @@ struct __attribute__((packed)) MTLB_TYPE_TAG {
 struct __attribute__((packed)) MTLB_HASH_TAG {
   MTLBFourCC TAG = MTLBFourCC::Hash;
   uint16_t TAG_SIZE = 0x20;
-  sha256_hash hash;
+  std::array<uint8_t, 32> hash;
 };
+
+static_assert(sizeof(MTLB_HASH_TAG) == 38, "invalid HASH record size");
 
 struct __attribute__((packed)) MTLB_OFFT_TAG {
   MTLBFourCC TAG = MTLBFourCC::Offset;

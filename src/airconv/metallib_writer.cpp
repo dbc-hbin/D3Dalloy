@@ -6,6 +6,7 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Support/SHA256.h"
 
 using namespace llvm;
 
@@ -53,7 +54,7 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
   struct FunctionBitcode {
     uint64_t offset;
     uint64_t size;
-    sha256_hash hash;
+    std::array<uint8_t, 32> hash;
   };
   raw_svector_ostream bitcode_stream(bitcode);
   auto appendBitcode = [&](const Function *function) -> FunctionBitcode {
@@ -88,8 +89,8 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
       WriteBitcodeToFile(*isolated, bitcode_stream, false, nullptr, true);
     }
     const auto size = bitcode_stream.tell() - offset;
-    return {offset, size, compute_sha256_hash(
-      reinterpret_cast<const uint8_t *>(bitcode.data()) + offset, size)};
+    return {offset, size, SHA256::hash(
+      ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(bitcode.data()) + offset, size))};
   };
 
   raw_svector_ostream public_metadata_stream(public_metadata);
@@ -223,54 +224,18 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
         private_metadata_stream << "ENDT";
       }
     }
-    auto fragmentFns = module.getNamedMetadata("air.fragment");
-    if (fragmentFns) {
-      for (auto fn : fragmentFns->operands()) {
-        fn_count++;
-        const auto recordOffset = function_def_stream.tell();
-        function_def_stream << value(uint32_t(0));
-        auto func = dyn_cast<Function>(
-          dyn_cast<ConstantAsMetadata>(fn->getOperand(0).get())->getValue()
-        );
-        const auto compiled = appendBitcode(func);
-        auto name = func->getName();
-        function_def_stream << "NAME";
-        function_def_stream << value((uint16_t)(name.size() + 1));
-        function_def_stream << name << '\0';
-        function_def_stream
-          << value(MTLB_TYPE_TAG{.type = FunctionType::Fragment});
-        function_def_stream << value(MTLB_HASH_TAG{.hash = compiled.hash});
-        function_def_stream
-          << value(MTLB_MDSZ_TAG{.bitcodeSize = compiled.size});
-        function_def_stream << value(MTLB_OFFT_TAG{
-          .PublicMetadataOffset = public_metadata_stream.tell(),
-          .PrivateMetadataOffset = private_metadata_stream.tell(),
-          .BitcodeOffset = compiled.offset,
-        });
-        function_def_stream << value(MTLB_VERS_TAG{
-                  .airVersionMajor = airVersionMajor,
-                  .airVersionMinor = airVersionMinor,
-                  .languageVersionMajor = 3,
-                  .languageVersionMinor = 1,
-                });
-        function_def_stream << "ENDT";
-        const auto recordSize = uint32_t(function_def_stream.tell() - recordOffset);
-        std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));
-        public_metadata_stream << value(4);
-        public_metadata_stream << "ENDT";
-        private_metadata_stream << value(4);
-        private_metadata_stream << "ENDT";
-      }
-    }
-    // Kernel, visible and intersection functions have no vertex attribute table.
+    // Non-vertex functions have no vertex attribute table.
     // These TYPE values are the public metallib export kinds, not MTLFunctionType.
     constexpr struct {
       const char *metadata;
       FunctionType type;
     } functionKinds[] = {
+      {"air.fragment", FunctionType::Fragment},
       {"air.kernel", FunctionType::Kernel},
       {"air.visible", FunctionType::Visible},
       {"air.intersection", FunctionType::Intersection},
+      {"air.object", FunctionType::Object},
+      {"air.mesh", FunctionType::Mesh},
     };
     for (const auto &kind : functionKinds) {
       auto functions = module.getNamedMetadata(kind.metadata);
@@ -307,97 +272,6 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
         std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));
         public_metadata_stream << value(uint32_t(4)) << "ENDT";
         private_metadata_stream << value(uint32_t(4)) << "ENDT";
-      }
-    }
-    auto objectFns = module.getNamedMetadata("air.object");
-    if (objectFns) {
-      for (auto fn : objectFns->operands()) {
-        fn_count++;
-        const auto recordOffset = function_def_stream.tell();
-        function_def_stream << value(uint32_t(0));
-        auto func = dyn_cast<Function>(
-          dyn_cast<ConstantAsMetadata>(fn->getOperand(0).get())->getValue()
-        );
-        const auto compiled = appendBitcode(func);
-        auto name = func->getName();
-        function_def_stream << "NAME";
-        function_def_stream << value((uint16_t)(name.size() + 1));
-        function_def_stream << name << '\0';
-        function_def_stream
-          << value(MTLB_TYPE_TAG{.type = FunctionType::Object});
-        function_def_stream << value(MTLB_HASH_TAG{.hash = compiled.hash});
-        function_def_stream
-          << value(MTLB_MDSZ_TAG{.bitcodeSize = compiled.size});
-        function_def_stream << value(MTLB_OFFT_TAG{
-          .PublicMetadataOffset = public_metadata_stream.tell(),
-          .PrivateMetadataOffset = private_metadata_stream.tell(),
-          .BitcodeOffset = compiled.offset,
-        });
-        function_def_stream << value(MTLB_VERS_TAG{
-                  .airVersionMajor = airVersionMajor,
-                  .airVersionMinor = airVersionMinor,
-                  .languageVersionMajor = 3,
-                  .languageVersionMinor = 1,
-                });
-        function_def_stream << "ENDT";
-        const auto recordSize = uint32_t(function_def_stream.tell() - recordOffset);
-        std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));
-
-        SmallVector<char, 0> fn_public_metadata;
-        raw_svector_ostream fn_public_metadata_stream(fn_public_metadata);
-        fn_public_metadata_stream << "ENDT";
-
-        public_metadata_stream << value((uint32_t)fn_public_metadata.size());
-        public_metadata_stream << fn_public_metadata;
-
-        private_metadata_stream << value(4);
-        private_metadata_stream << "ENDT";
-      }
-    }
-
-    auto meshFns = module.getNamedMetadata("air.mesh");
-    if (meshFns) {
-      for (auto fn : meshFns->operands()) {
-        fn_count++;
-        const auto recordOffset = function_def_stream.tell();
-        function_def_stream << value(uint32_t(0));
-        auto func = dyn_cast<Function>(
-          dyn_cast<ConstantAsMetadata>(fn->getOperand(0).get())->getValue()
-        );
-        const auto compiled = appendBitcode(func);
-        auto name = func->getName();
-        function_def_stream << "NAME";
-        function_def_stream << value((uint16_t)(name.size() + 1));
-        function_def_stream << name << '\0';
-        function_def_stream
-          << value(MTLB_TYPE_TAG{.type = FunctionType::Mesh});
-        function_def_stream << value(MTLB_HASH_TAG{.hash = compiled.hash});
-        function_def_stream
-          << value(MTLB_MDSZ_TAG{.bitcodeSize = compiled.size});
-        function_def_stream << value(MTLB_OFFT_TAG{
-          .PublicMetadataOffset = public_metadata_stream.tell(),
-          .PrivateMetadataOffset = private_metadata_stream.tell(),
-          .BitcodeOffset = compiled.offset,
-        });
-        function_def_stream << value(MTLB_VERS_TAG{
-                  .airVersionMajor = airVersionMajor,
-                  .airVersionMinor = airVersionMinor,
-                  .languageVersionMajor = 3,
-                  .languageVersionMinor = 1,
-                });
-        function_def_stream << "ENDT";
-        const auto recordSize = uint32_t(function_def_stream.tell() - recordOffset);
-        std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));
-
-        SmallVector<char, 0> fn_public_metadata;
-        raw_svector_ostream fn_public_metadata_stream(fn_public_metadata);
-        fn_public_metadata_stream << "ENDT";
-
-        public_metadata_stream << value((uint32_t)fn_public_metadata.size());
-        public_metadata_stream << fn_public_metadata;
-
-        private_metadata_stream << value(4);
-        private_metadata_stream << "ENDT";
       }
     }
   }
