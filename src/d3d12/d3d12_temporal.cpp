@@ -42,7 +42,7 @@ WMTPixelFormat motionFormat(WMTPixelFormat format) {
 }
 HRESULT retainTexture(MTLD3D12Device *device, ID3D12Resource *input,
                       Com<MTLD3D12Resource, false> &resource, TextureViewRef &view,
-                      WMTPixelFormat format = WMTPixelFormatInvalid) {
+                      bool motion = false) {
   if (!input) return E_INVALIDARG;
   Com<ID3D12Device> owner;
   if (FAILED(input->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
@@ -54,7 +54,9 @@ HRESULT retainTexture(MTLD3D12Device *device, ID3D12Resource *input,
   if (!owned->texture || !owned->texture->current()) return E_INVALIDARG;
   resource = owned;
   auto texture = owned->texture;
-  const auto key = texture->createView({.format = format == WMTPixelFormatInvalid ? texture->pixelFormat() : format,
+  const auto format = motion ? motionFormat(texture->pixelFormat()) : texture->pixelFormat();
+  if (motion && format == WMTPixelFormatInvalid) return DXGI_ERROR_UNSUPPORTED;
+  const auto key = texture->createView({.format = format,
                                       .type = WMTTextureType2D, .miplevelCount = 1, .arraySize = 1});
   view = texture->view(key);
   return view.texture() ? S_OK : E_FAIL;
@@ -116,11 +118,8 @@ public:
     for (size_t i = 0; i < inputs.size(); ++i) {
       if (!inputs[i] && i >= 4) continue;
       if (i != 3 && inputs[i] == desc.Output) return E_INVALIDARG;
-      if (FAILED(hr = retainTexture(device, inputs[i], frame->resources[i], frame->views[i]))) return hr;
+      if (FAILED(hr = retainTexture(device, inputs[i], frame->resources[i], frame->views[i], i == 2))) return hr;
     }
-    const auto mv_format = motionFormat(frame->resources[2]->texture->pixelFormat());
-    if (mv_format == WMTPixelFormatInvalid) return DXGI_ERROR_UNSUPPORTED;
-    if (FAILED(hr = retainTexture(device, desc.MotionVector, frame->resources[2], frame->views[2], mv_format))) return hr;
     auto &p = frame->props;
     p.color = frame->views[0].texture().handle; p.depth = frame->views[1].texture().handle;
     p.motion = frame->views[2].texture().handle; p.output = frame->views[3].texture().handle;

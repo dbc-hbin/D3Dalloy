@@ -1041,6 +1041,10 @@ void runFrameNegatives(Gpu& gpu, IMTLD3D12TemporalUpscaleState* state,
         expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
                       E_INVALIDARG, "motion_input_bounds_overflow");
         desc = base;
+        desc.MotionVector = color.Get();
+        expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
+                      DXGI_ERROR_UNSUPPORTED, "unsupported_motion_format");
+        desc = base;
         desc.Output = nullptr;
         expectHRESULT(recording.extension->TemporalUpscale(state, &desc),
                       E_INVALIDARG, "missing_output");
