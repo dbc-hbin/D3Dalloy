@@ -3035,7 +3035,9 @@ AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_
     return str_len;
   }
   auto pInternal = (SM50ErrorInternal *)pError;
-  auto str_len = std::min(pInternal->buf.size(), BufferSize - 1);
+  // LLVM diagnostics may already contain a terminator; never count it as message text.
+  auto end = std::find(pInternal->buf.begin(), pInternal->buf.end(), '\0');
+  auto str_len = std::min(static_cast<size_t>(end - pInternal->buf.begin()), BufferSize - 1);
   memcpy(pBuffer, pInternal->buf.data(), str_len);
   pBuffer[str_len] = '\0';
   return str_len;
