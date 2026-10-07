@@ -87,96 +87,58 @@ public:
 };
 
 struct ShaderVariantVertex {
-  using this_type = ShaderVariantVertex;
   ManagedInputLayout input_layout_handle;
   uint32_t gs_passthrough;
   bool rasterization_disabled;
-  bool operator==(const this_type &rhs) const {
-    return input_layout_handle == rhs.input_layout_handle &&
-           gs_passthrough == rhs.gs_passthrough &&
-           rasterization_disabled == rhs.rasterization_disabled;
-  }
+  bool operator==(const ShaderVariantVertex &) const = default;
 };
 
 struct ShaderVariantPixel {
-  using this_type = ShaderVariantPixel;
   uint32_t sample_mask;
   bool dual_source_blending;
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
-  bool operator==(const this_type &rhs) const {
-    return sample_mask == rhs.sample_mask &&
-           dual_source_blending == rhs.dual_source_blending &&
-           disable_depth_output == rhs.disable_depth_output &&
-           unorm_output_reg_mask == rhs.unorm_output_reg_mask;
-  }
+  bool operator==(const ShaderVariantPixel &) const = default;
 };
 
 struct ShaderVariantTessellationVertexHull {
-  using this_type = ShaderVariantTessellationVertexHull;
   ManagedInputLayout input_layout_handle;
   ManagedShader vertex_shader_handle;
   SM50_INDEX_BUFFER_FORMAT index_buffer_format;
   uint32_t max_potential_tess_factor;
-  bool operator==(const this_type &rhs) const {
-    return input_layout_handle == rhs.input_layout_handle &&
-           vertex_shader_handle == rhs.vertex_shader_handle &&
-           index_buffer_format == rhs.index_buffer_format &&
-           max_potential_tess_factor == rhs.max_potential_tess_factor;
-  }
+  bool operator==(const ShaderVariantTessellationVertexHull &) const = default;
 };
 
 struct ShaderVariantTessellationDomain {
-  using this_type = ShaderVariantTessellationDomain;
   ManagedShader hull_shader_handle;
   uint32_t gs_passthrough;
   uint32_t max_potential_tess_factor;
   bool rasterization_disabled;
-  bool operator==(const this_type &rhs) const {
-    return hull_shader_handle == rhs.hull_shader_handle &&
-           gs_passthrough == rhs.gs_passthrough &&
-           max_potential_tess_factor == rhs.max_potential_tess_factor &&
-           rasterization_disabled == rhs.rasterization_disabled;
-  }
+  bool operator==(const ShaderVariantTessellationDomain &) const = default;
 };
 
 struct ShaderVariantGeometryVertex {
-  using this_type = ShaderVariantGeometryVertex;
   ManagedInputLayout input_layout_handle;
   ManagedShader geometry_shader_handle;
   SM50_INDEX_BUFFER_FORMAT index_buffer_format;
   bool strip_topology;
-  bool operator==(const this_type &rhs) const {
-    return input_layout_handle == rhs.input_layout_handle &&
-           geometry_shader_handle == rhs.geometry_shader_handle &&
-           index_buffer_format == rhs.index_buffer_format &&
-           strip_topology == rhs.strip_topology;
-  }
+  bool operator==(const ShaderVariantGeometryVertex &) const = default;
 };
 
 struct ShaderVariantGeometry {
-  using this_type = ShaderVariantGeometry;
   ManagedShader vertex_shader_handle;
   bool strip_topology;
-  bool operator==(const this_type &rhs) const {
-    return vertex_shader_handle == rhs.vertex_shader_handle &&
-           strip_topology == rhs.strip_topology;
-  }
+  bool operator==(const ShaderVariantGeometry &) const = default;
 };
 
 struct ShaderVariantDefault {
-  using this_type = ShaderVariantDefault;
-  bool operator==(const this_type &rhs) const { return true; }
+  bool operator==(const ShaderVariantDefault &) const = default;
 };
 
 struct ShaderVariantVertexStreamOutput {
-  using this_type = ShaderVariantVertexStreamOutput;
   ManagedInputLayout input_layout_handle;
   uint64_t stream_output_layout_handle;
-  bool operator==(const this_type &rhs) const {
-    return input_layout_handle == rhs.input_layout_handle &&
-           stream_output_layout_handle == rhs.stream_output_layout_handle;
-  }
+  bool operator==(const ShaderVariantVertexStreamOutput &) const = default;
 };
 
 using ShaderVariant =
