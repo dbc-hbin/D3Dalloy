@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace dxmt {
@@ -60,6 +61,9 @@ struct Cache {
   std::wstring path;
   HANDLE file = INVALID_HANDLE_VALUE;
   std::list<Entry> entries;
+  struct DiskRecord { RecordHeader header; uint64_t offset; };
+  std::unordered_multimap<Sha1Digest, DiskRecord> records;
+  bool indexed = true;
   uint64_t memory_bytes = 0, file_bytes = 0;
   bool delete_on_destroy = false, corrupt = false;
 
@@ -89,6 +93,8 @@ struct Cache {
     }
     corrupt = false;
     entries.clear();
+    records.clear();
+    indexed = true;
     memory_bytes = 0;
     return S_OK;
   }
@@ -107,46 +113,83 @@ struct Cache {
     if (file_bytes < sizeof(header) || !Read(file, &header, sizeof(header)) || header.magic != kMagic)
       return E_FAIL;
     if (header.version != desc.Version) return clear();
+    // A smaller reopening budget must not invalidate an existing cache. Keep the constant-memory
+    // scan for oversized files; otherwise record count is bounded by the configured disk budget / 48.
+    indexed = file_bytes <= desc.MaximumValueFileSizeBytes;
     // Validate on open, so malformed lengths never become allocations or false cache hits.
-    RecordHeader record{};
-    uint64_t offset = 0;
-    const Sha1Digest unused{};
-    HRESULT hr = locate(nullptr, 0, unused, record, offset);
-    return hr == DXGI_ERROR_NOT_FOUND ? S_OK : hr;
+    for (uint64_t offset = sizeof(FileHeader); offset < file_bytes;) {
+      RecordHeader record{};
+      if (file_bytes - offset < sizeof(record) || !Seek(file, offset) || !Read(file, &record, sizeof(record)))
+        return E_FAIL;
+      bool same_key = false;
+      HRESULT hr = verify(record, offset, nullptr, 0, same_key);
+      if (FAILED(hr)) return hr;
+      if (indexed) records.emplace(record.key_hash, DiskRecord{record, offset});
+      offset += sizeof(record) + uint64_t(record.key_size) + record.value_size;
+    }
+    return S_OK;
+  }
+
+  HRESULT verify(const RecordHeader &record, uint64_t offset, const void *key, UINT key_size, bool &same_key) {
+    const uint64_t payload_size = uint64_t(record.key_size) + record.value_size;
+    if (offset > file_bytes || file_bytes - offset < sizeof(record) ||
+        payload_size > file_bytes - offset - sizeof(record) || !Seek(file, offset + sizeof(record))) return E_FAIL;
+    std::array<uint8_t, 4096> scratch;
+    Sha1HashState key_digest, checksum;
+    same_key = key && record.key_size == key_size;
+    for (uint64_t pos = 0; pos < payload_size;) {
+      const UINT count = UINT(std::min<uint64_t>(scratch.size(), payload_size - pos));
+      if (!Read(file, scratch.data(), count)) return E_FAIL;
+      checksum.update(scratch.data(), count);
+      const UINT key_count = pos < record.key_size ? UINT(std::min<uint64_t>(count, record.key_size - pos)) : 0;
+      if (key_count) {
+        key_digest.update(scratch.data(), key_count);
+        if (same_key && memcmp(scratch.data(), static_cast<const uint8_t *>(key) + pos, key_count)) same_key = false;
+      }
+      pos += count;
+    }
+    if (key_digest.final() != record.key_hash || checksum.final() != record.checksum) return E_FAIL;
+    return S_OK;
   }
 
   HRESULT locate(const void *key, UINT key_size, const Sha1Digest &hash, RecordHeader &found, uint64_t &value_offset) {
     if (corrupt) return E_FAIL;
     bool matched = false, collision = false;
-    std::array<uint8_t, 4096> scratch;
-    for (uint64_t offset = sizeof(FileHeader); offset < file_bytes;) {
-      RecordHeader record{};
-      if (file_bytes - offset < sizeof(record) || !Seek(file, offset) || !Read(file, &record, sizeof(record)))
-        return E_FAIL;
-      const uint64_t payload_size = uint64_t(record.key_size) + record.value_size;
-      if (payload_size > file_bytes - offset - sizeof(record)) return E_FAIL;
-      Sha1HashState key_digest, checksum;
-      bool same_key = key && record.key_hash == hash && record.key_size == key_size;
-      for (uint64_t pos = 0; pos < payload_size;) {
-        const UINT count = UINT(std::min<uint64_t>(scratch.size(), payload_size - pos));
-        if (!Read(file, scratch.data(), count)) return E_FAIL;
-        checksum.update(scratch.data(), count);
-        const UINT key_count = pos < record.key_size ? UINT(std::min<uint64_t>(count, record.key_size - pos)) : 0;
-        if (key_count) {
-          key_digest.update(scratch.data(), key_count);
-          if (same_key && memcmp(scratch.data(), static_cast<const uint8_t *>(key) + pos, key_count)) same_key = false;
-        }
-        pos += count;
-      }
-      if (key_digest.final() != record.key_hash || checksum.final() != record.checksum) return E_FAIL;
-      if (key && record.key_hash == hash) {
-        if (same_key) {
+    auto inspect = [&](const RecordHeader &record, uint64_t record_offset) {
+      bool same_key = false;
+      HRESULT hr = verify(record, record_offset, key, key_size, same_key);
+      if (FAILED(hr)) return hr;
+      if (record.key_hash != hash) return S_OK;
+      if (same_key) {
+        const uint64_t offset = record_offset + sizeof(record) + record.key_size;
+        if (!matched || offset > value_offset) {
           found = record;
-          value_offset = offset + sizeof(record) + record.key_size;
-          matched = true;
-        } else collision = true;
+          value_offset = offset;
+        }
+        matched = true;
+      } else collision = true;
+      return S_OK;
+    };
+    if (!indexed) {
+      for (uint64_t offset = sizeof(FileHeader); offset < file_bytes;) {
+        RecordHeader record{};
+        if (file_bytes - offset < sizeof(record) || !Seek(file, offset) || !Read(file, &record, sizeof(record)))
+          return E_FAIL;
+        HRESULT hr = inspect(record, offset);
+        if (FAILED(hr)) return hr;
+        offset += sizeof(record) + uint64_t(record.key_size) + record.value_size;
       }
-      offset += sizeof(record) + payload_size;
+    } else {
+      const auto [begin, end] = records.equal_range(hash);
+      for (auto it = begin; it != end; ++it) {
+        const auto &selected = it->second;
+        RecordHeader record{};
+        if (!Seek(file, selected.offset) || !Read(file, &record, sizeof(record)) ||
+            record.key_size != selected.header.key_size || record.value_size != selected.header.value_size ||
+            record.key_hash != selected.header.key_hash || record.checksum != selected.header.checksum) return E_FAIL;
+        HRESULT hr = inspect(record, selected.offset);
+        if (FAILED(hr)) return hr;
+      }
     }
     return collision ? DXGI_ERROR_CACHE_HASH_COLLISION : matched ? S_OK : DXGI_ERROR_NOT_FOUND;
   }
@@ -223,12 +266,17 @@ struct Cache {
     if (file_bytes > desc.MaximumValueFileSizeBytes || bytes > desc.MaximumValueFileSizeBytes - file_bytes)
       return DXGI_ERROR_CACHE_FULL;
     record = {key_size, value_size, hash, Sha1HashState().update(key, key_size).update(value, value_size).final()};
+    // Allocate index storage before append; publish its node only after the durable flush.
+    decltype(records) pending;
+    pending.emplace(hash, DiskRecord{record, file_bytes});
+    records.reserve(records.size() + 1);
     if (!Seek(file, file_bytes) || !Write(file, &record, sizeof(record)) || !Write(file, key, key_size) ||
         !Write(file, value, value_size) || !FlushFileBuffers(file)) {
       const HRESULT error = FileError();
       if (!Seek(file, file_bytes) || !SetEndOfFile(file) || !FlushFileBuffers(file)) corrupt = true;
       return FAILED(error) ? error : E_FAIL;
     }
+    records.insert(pending.extract(pending.begin()));
     file_bytes += bytes;
     try { remember(key, key_size, value, value_size, hash); } catch (const std::bad_alloc &) {}
     return S_OK;

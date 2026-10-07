@@ -6,6 +6,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -380,6 +381,62 @@ void corruption(ID3D12Device9 *dev) {
   cache->SetDeleteOnDestroy(); cache.Reset();
   passed("corrupt-disk-rejected-version-recovery");
 }
+void disk_cost(ID3D12Device9 *dev) {
+  LARGE_INTEGER frequency;
+  if (!QueryPerformanceFrequency(&frequency)) fail("timer frequency");
+  for (UINT count : {64u, 256u, 1024u}) {
+    auto d = desc(100 + count, true);
+    d.MaximumInMemoryCacheSizeBytes = 1; // Every 1 KiB value bypasses the lookaside.
+    d.MaximumValueFileSizeBytes = 2 * 1024 * 1024;
+    auto cache = session(dev, d);
+    std::array<unsigned char, 1024> expected{}, output{};
+    LONGLONG store_ticks = 0, find_ticks = 0;
+    LARGE_INTEGER begin, end;
+    for (UINT i = 0; i < count; ++i) {
+      for (UINT j = 0; j < expected.size(); ++j) expected[j] = static_cast<unsigned char>(i * 17 + j * 13);
+      QueryPerformanceCounter(&begin);
+      HRESULT hr = cache->StoreValue(&i, sizeof(i), expected.data(), expected.size());
+      QueryPerformanceCounter(&end);
+      store_ticks += end.QuadPart - begin.QuadPart;
+      check(hr, "bounded sequential store");
+    }
+    cache.Reset();
+    const auto *guid = reinterpret_cast<const unsigned char *>(&d.Identifier);
+    wchar_t token[33];
+    for (unsigned i = 0; i < 16; ++i) swprintf(token + i * 2, 3, L"%02x", guid[i]);
+    WIN32_FIND_DATAW info{};
+    HANDLE search = FindFirstFileW((L"dxmt-sc-*-" + std::wstring(token) + L".val").c_str(), &info);
+    if (search == INVALID_HANDLE_VALUE) fail("bounded disk file");
+    FindClose(search);
+    const unsigned long long file_bytes = (static_cast<unsigned long long>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    const unsigned long long record_bytes = 48 + sizeof(UINT) + expected.size();
+    if (file_bytes != 16 + count * record_bytes) fail("bounded disk size");
+    QueryPerformanceCounter(&begin);
+    cache = session(dev, d);
+    QueryPerformanceCounter(&end);
+    const LONGLONG open_ticks = end.QuadPart - begin.QuadPart;
+    for (UINT i = 0; i < count; ++i) {
+      UINT size = output.size();
+      QueryPerformanceCounter(&begin);
+      HRESULT hr = cache->FindValue(&i, sizeof(i), output.data(), &size);
+      QueryPerformanceCounter(&end);
+      find_ticks += end.QuadPart - begin.QuadPart;
+      check(hr, "bounded sequential lookup");
+      for (UINT j = 0; j < expected.size(); ++j) expected[j] = static_cast<unsigned char>(i * 17 + j * 13);
+      if (size != expected.size() || output != expected) fail("bounded exact bytes");
+    }
+    std::printf("OWNED_D3D12_SHADER_CACHE_COST entries=%u value_bytes=1024 verified=%u file_bytes=%llu "
+                "store_ms=%.3f reopen_ms=%.3f lookup_ms=%.3f baseline_store_scan_bytes=%llu "
+                "baseline_reopen_read_bytes=%llu baseline_lookup_read_bytes=%llu\n",
+                count, count, file_bytes, 1000.0 * store_ticks / frequency.QuadPart,
+                1000.0 * open_ticks / frequency.QuadPart, 1000.0 * find_ticks / frequency.QuadPart,
+                record_bytes * count * (count - 1) / 2, file_bytes,
+                record_bytes * count * count + expected.size() * count);
+    std::fflush(stdout);
+    cache->SetDeleteOnDestroy();
+  }
+  passed("bounded-disk-cost-exact-readback");
+}
 } // namespace
 int wmain(int argc, wchar_t **argv) {
   try {
@@ -411,6 +468,7 @@ int wmain(int argc, wchar_t **argv) {
       return 0;
     }
     memory(dev.Get()); disk(dev.Get()); control(dev.Get()); corruption(dev.Get());
+    disk_cost(dev.Get());
     std::printf("OWNED_D3D12_SHADER_CACHE_PASS\n");
     return 0;
   } catch (const std::exception &) { return 1; }
