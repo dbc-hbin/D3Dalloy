@@ -1,7 +1,7 @@
 /**
- * Draw a 10x10 grid, each box adds 80-nits (linear value of 1.0)
+ * Draw a 10x10 HDR grid using the selected transfer function.
  */
- 
+
 #include <cstdio>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -11,6 +11,16 @@
 #include <d3dcompiler.h>
 
 #include <assert.h>
+
+#ifdef HDR_PQ
+static constexpr auto windowTitle = L"HDR (PQ)";
+static constexpr auto swapChainFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
+static constexpr auto pixelShaderEntry = "ps_main_pq";
+#else
+static constexpr auto windowTitle = L"HDR (linear)";
+static constexpr auto swapChainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+static constexpr auto pixelShaderEntry = "ps_main_linear";
+#endif
 
 static bool global_windowDidResize = false;
 
@@ -68,7 +78,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
 
         hwnd = CreateWindowExW(WS_EX_OVERLAPPEDWINDOW,
                                 winClass.lpszClassName,
-                                L"HDR (linear)",
+                                windowTitle,
                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                 CW_USEDEFAULT, CW_USEDEFAULT,
                                 initialWidth, 
@@ -159,9 +169,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         DXGI_SWAP_CHAIN_DESC1 d3d11SwapChainDesc = {};
         d3d11SwapChainDesc.Width = 0; // use window width
         d3d11SwapChainDesc.Height = 0; // use window height
-        // d3d11SwapChainDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-
-        d3d11SwapChainDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        d3d11SwapChainDesc.Format = swapChainFormat;
         d3d11SwapChainDesc.SampleDesc.Count = 1;
         d3d11SwapChainDesc.SampleDesc.Quality = 0;
         d3d11SwapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -174,7 +182,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
         HRESULT hResult = dxgiFactory->CreateSwapChainForHwnd(d3d11Device, hwnd, &d3d11SwapChainDesc, 0, 0, (IDXGISwapChain1 **)&d3d11SwapChain);
         assert(SUCCEEDED(hResult));
 
-        // d3d11SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+#ifdef HDR_PQ
+        d3d11SwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+#endif
 
         dxgiFactory->Release();
     }
@@ -219,7 +229,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, LPSTR /*lpC
     {
         ID3DBlob* psBlob;
         ID3DBlob* shaderCompileErrorsBlob;
-        HRESULT hResult = D3DCompileFromFile(L"shader_hdr.hlsl", nullptr, nullptr, "ps_main_linear", "ps_5_0", 0, 0, &psBlob, &shaderCompileErrorsBlob);
+        HRESULT hResult = D3DCompileFromFile(L"shader_hdr.hlsl", nullptr, nullptr, pixelShaderEntry, "ps_5_0", 0, 0, &psBlob, &shaderCompileErrorsBlob);
         if(FAILED(hResult))
         {
             const char* errorString = NULL;
