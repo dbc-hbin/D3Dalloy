@@ -584,6 +584,7 @@ protected:
   WMT::Reference<WMT::RenderPipelineState> indirect_pso;
   std::mutex indirect_pso_mutex;
   std::vector<uint8_t> pull_vs_bytecode;
+  // The explicit root signature is shared by every lazy graphics variant.
   std::vector<uint8_t> pull_root_blob;
   std::vector<SM50_IA_INPUT_ELEMENT> pull_ia_elements;
   bool supports_index_pull = false;
@@ -593,7 +594,6 @@ protected:
   std::mutex pull_pso_mutex;
   std::vector<StreamOutputLayout::Element> statistics_capture_elements;
   std::vector<uint8_t> statistics_ps_bytecode;
-  std::vector<uint8_t> statistics_ps_root_blob;
   std::string statistics_ps_name;
   uint32_t statistics_ps_sample_mask = 0;
   bool statistics_ps_dual_source_blending = false;
@@ -1427,10 +1427,17 @@ public:
 
     auto metal = device_->GetMTLDevice();
     dsso = metal.newDepthStencilState(info);
-    {
+    if (info.depth_write_enabled) {
       auto info_depth_readonly = info;
       info_depth_readonly.depth_write_enabled = false;
       dsso_depth_readonly = metal.newDepthStencilState(info_depth_readonly);
+    } else {
+      dsso_depth_readonly = dsso;
+    }
+    if (!pDesc->DepthStencilState.StencilEnable) {
+      dsso_stencil_readonly = dsso_no_stencil = dsso;
+      dsso_readonly = dsso_readonly_no_stencil = dsso_depth_readonly;
+      return;
     }
     {
       auto info_stencil_readonly = info;
@@ -1441,30 +1448,24 @@ public:
       info_stencil_readonly.front_stencil.depth_stencil_pass_op = WMTStencilOperationKeep;
       info_stencil_readonly.front_stencil.depth_fail_op = WMTStencilOperationKeep;
       dsso_stencil_readonly = metal.newDepthStencilState(info_stencil_readonly);
-    }
-    {
-      auto info_readonly = info;
-      info_readonly.depth_write_enabled = false;
-      info_readonly.back_stencil.stencil_fail_op = WMTStencilOperationKeep;
-      info_readonly.back_stencil.depth_stencil_pass_op = WMTStencilOperationKeep;
-      info_readonly.back_stencil.depth_fail_op = WMTStencilOperationKeep;
-      info_readonly.front_stencil.stencil_fail_op = WMTStencilOperationKeep;
-      info_readonly.front_stencil.depth_stencil_pass_op = WMTStencilOperationKeep;
-      info_readonly.front_stencil.depth_fail_op = WMTStencilOperationKeep;
-      dsso_readonly = metal.newDepthStencilState(info_readonly);
+      if (info.depth_write_enabled) {
+        info_stencil_readonly.depth_write_enabled = false;
+        dsso_readonly = metal.newDepthStencilState(info_stencil_readonly);
+      } else {
+        dsso_readonly = dsso_stencil_readonly;
+      }
     }
     {
       auto info_nostencil = info;
       info_nostencil.back_stencil.enabled = false;
       info_nostencil.front_stencil.enabled = false;
       dsso_no_stencil = metal.newDepthStencilState(info_nostencil);
-    }
-    {
-      auto info_nostencil = info;
-      info_nostencil.depth_write_enabled = false;
-      info_nostencil.back_stencil.enabled = false;
-      info_nostencil.front_stencil.enabled = false;
-      dsso_readonly_no_stencil = metal.newDepthStencilState(info_nostencil);
+      if (info.depth_write_enabled) {
+        info_nostencil.depth_write_enabled = false;
+        dsso_readonly_no_stencil = metal.newDepthStencilState(info_nostencil);
+      } else {
+        dsso_readonly_no_stencil = dsso_no_stencil;
+      }
     }
   }
 
@@ -1837,9 +1838,6 @@ public:
         rootsig.bytecode_length = pDesc->PS.BytecodeLength;
       }
       rootsig.next = &data_ps;
-      const auto *root_source = static_cast<const uint8_t *>(rootsig.bytecode);
-      if (pDesc->pRootSignature)
-        statistics_ps_root_blob.assign(root_source, root_source + rootsig.bytecode_length);
 
       if (!cache_.loaded() && SM50Compile(
               shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(),
@@ -2263,10 +2261,8 @@ public:
       pixel.next = &statistics;
       SM50_SHADER_ROOT_SIGNATURE_DATA root{};
       root.type = SM50_SHADER_ROOT_SIGNATURE;
-      root.bytecode = statistics_ps_root_blob.empty() ? statistics_ps_bytecode.data()
-                                                      : statistics_ps_root_blob.data();
-      root.bytecode_length = statistics_ps_root_blob.empty() ? statistics_ps_bytecode.size()
-                                                             : statistics_ps_root_blob.size();
+      root.bytecode = pull_root_blob.empty() ? statistics_ps_bytecode.data() : pull_root_blob.data();
+      root.bytecode_length = pull_root_blob.empty() ? statistics_ps_bytecode.size() : pull_root_blob.size();
       root.next = &pixel;
       SM50ShaderBitcode compiled;
       if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
@@ -2348,10 +2344,8 @@ public:
     common.metal_version = kD3D12ShaderMetalVersion;
     const auto *vs_root_blob = pull_root_blob.empty() ? pull_vs_bytecode.data() : pull_root_blob.data();
     const size_t vs_root_size = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
-    const auto *ps_root_blob = statistics_ps_root_blob.empty() ? statistics_ps_bytecode.data()
-                                                            : statistics_ps_root_blob.data();
-    const size_t ps_root_size = statistics_ps_root_blob.empty() ? statistics_ps_bytecode.size()
-                                                              : statistics_ps_root_blob.size();
+    const auto *ps_root_blob = pull_root_blob.empty() ? statistics_ps_bytecode.data() : pull_root_blob.data();
+    const size_t ps_root_size = pull_root_blob.empty() ? statistics_ps_bytecode.size() : pull_root_blob.size();
     WMT::Reference<WMT4::Function> vertex_replay;
     WMT::Reference<WMT4::Function> fragments[4];
     SM50_MSAA_INTERPOLATION_LAYOUT line_interpolation{};
