@@ -42,7 +42,7 @@ Edit root `src/` directly. `README.md` describes the current workflow; `graphics
 
 Use [README: build](README.md#빌드) for current root-source build/install commands, [Runtime](graphics-translator/RUNTIME.ko.md) for fresh staging and architecture/module selection, and [Smoke test](graphics-translator/SMOKE-TEST.ko.md) for fixture compilation, CPU/tooling checks and isolated GPU execution. Do not keep a second recipe here.
 
-Current support and evidence belong in [CORE](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md); pending work and the user-selected new P3 #15–24 belong in [PRIORITIES](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md). Old completed P0–P3 phases in [HISTORY](graphics-translator/IMPLEMENTATION-HISTORY.ko.md) are different slices. P2 remains pending and ARM64/FEX execution remains on hold.
+Current support and evidence belong in [CORE](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md); pending work and current user-selected execution belong in [PRIORITIES](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md). Dated phases and pauses in [HISTORY](graphics-translator/IMPLEMENTATION-HISTORY.ko.md) and [historical handoffs](docs/history/README.md) are not current instructions. Do not duplicate mutable progress or pause state here. The current source review and implementation ledger is [the 2026-10-07 review](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md).
 
 There is no configured lint target or general application `run` command. Respect applicable `.clang-format` files; do not invent `ninja lint` or package-manager commands.
 Runtime destinations and evidence output directories must be fresh. Never install DLLs into an existing game or live Wine prefix; use a copied runtime and dedicated prefix.

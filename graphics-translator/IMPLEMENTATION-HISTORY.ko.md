@@ -57,11 +57,11 @@
 
 ### DX11 공용 구현 재사용 확인
 
-사용자 지시로 HDR을 직접 확인하고 Composition/RR source mapping을 scout2개로 병렬 확인했다. DX12는 공용 Presenter·HDR shader·native EDR/NVAPI display setting을 이미 소비한다. DX11 Composition factory는 DXGI_ERROR_UNSUPPORTED이며 NGX는 SR feature1만 구현해 별도 RR/Composition 경로를 이식할 수 없다. HDR metadata의 DX11 unconditional S_OK는 재사용하지 않았다. Product source 변경은 없다. 새 HDR metadata fixture 양 ABI build0·runtime044 각7frame·API+Shader Validation/foreign 오류0·exit0/pass=true, diagnostics95tests5.682s PASS다. Source-frame readback을 tone-map drawable나 Gaming transport proof로 확대하지 않았다. Scoped prefix 종료/정리와 [실제 소스·증거](../.omo/handoffs/parallel-resume2-20261005.md)를 보존했다.
+사용자 지시로 HDR을 직접 확인하고 Composition/RR source mapping을 scout2개로 병렬 확인했다. DX12는 공용 Presenter·HDR shader·native EDR/NVAPI display setting을 이미 소비한다. DX11 Composition factory는 DXGI_ERROR_UNSUPPORTED이며 NGX는 SR feature1만 구현해 별도 RR/Composition 경로를 이식할 수 없다. HDR metadata의 DX11 unconditional S_OK는 재사용하지 않았다. Product source 변경은 없다. 새 HDR metadata fixture 양 ABI build0·runtime044 각7frame·API+Shader Validation/foreign 오류0·exit0/pass=true, diagnostics95tests5.682s PASS다. Source-frame readback을 tone-map drawable나 Gaming transport proof로 확대하지 않았다. Scoped prefix 종료/정리와 [실제 소스·증거](../docs/history/parallel-resume2-20261005.md)를 보존했다.
 
 ### 세 번째 병렬 재개 — native K-tail 원인과 웹 source 대조
 
-사용자의 핵심 세 기능 병렬 구현 및 Unity·Unreal 웹 scout 지시로 production 담당3개와 scout3개를 실행했다. [실제 probe/source/원문/실패/정리](../.omo/handoffs/parallel-resume2-20261005.md)를 따른다. Production delta나 commit은 없다. Pristine GPTK composition factory의 unconditional E_NOTIMPL을 native stub 실행으로 확인했고 Advanced Color linear scRGB FP16 규격과 Unity HDR UI/OETF 원문을 확보했다. Unity gamut rotation을 transfer decoding으로 해석하거나 UI alpha0 처리로 DXGI additive oracle를 대신하지 않았다.
+사용자의 핵심 세 기능 병렬 구현 및 Unity·Unreal 웹 scout 지시로 production 담당3개와 scout3개를 실행했다. [실제 probe/source/원문/실패/정리](../docs/history/parallel-resume2-20261005.md)를 따른다. Production delta나 commit은 없다. Pristine GPTK composition factory의 unconditional E_NOTIMPL을 native stub 실행으로 확인했고 Advanced Color linear scRGB FP16 규격과 Unity HDR UI/OETF 원문을 확보했다. Unity gamut rotation을 transfer decoding으로 해석하거나 UI alpha0 처리로 DXGI additive oracle를 대신하지 않았다.
 
 RR은 기존 trace replay, default.metallib AIR, actual public specialization observer, same-constants nodispatch binary archive를 실행했다. K44/C16 lane31/tap8/channel15 load가 `[12672,12680)`이며 K guard는 output/postprocess 뒤에만 있다. Generic/specialized AIR와 independent arithmetic check0로 원인을 좁혔다. G17s decoder 실패 및 actual framework ISA 미확정은 별개이며 validation zerofill을 uninstrumented 무해성 proof로 세지 않는다.
 
@@ -69,7 +69,7 @@ HDR은 Samsung 공식 UE sample HTTP206 source/guide를 확보하고 APP shader/
 
 ### 두 번째 병렬 재개 — alpha 전체 backing 검증과 native 계약 경계
 
-사용자가 `.omo` handoff/문서 상태를 확인하고 병렬 구현을 계속하도록 지시해 A Composition/B RR/C HDR를 동시에 실행했다. 각 담당자가 자기 QA 실행을 맡고 GPU/display lease만 직렬 배정했다. [실제 변경·명령·실패·증거·다음 외부 조건](../.omo/handoffs/parallel-resume2-20261005.md)을 따른다. Production 수정·commit·새 build/stage는 없으며 runtime044를 재사용했다.
+사용자가 `.omo` handoff/문서 상태를 확인하고 병렬 구현을 계속하도록 지시해 A Composition/B RR/C HDR를 동시에 실행했다. 각 담당자가 자기 QA 실행을 맡고 GPU/display lease만 직렬 배정했다. [실제 변경·명령·실패·증거·다음 외부 조건](../docs/history/parallel-resume2-20261005.md)을 따른다. Production 수정·commit·새 build/stage는 없으며 runtime044를 재사용했다.
 
 - Alpha 양 ABI consumer cases7/gpu14·ordered13phase와52PNG씩, 총104/104 geometry를 통과했다. Graphics validation/foreign errors0이다. Normative alpha-colour oracle는 여전히 없어 임의 transfer 변경은 하지 않았다. X64 cleanup-only `-k` exit1 원본 실패를 보존하고 같은 prefix `-w` exit0/정리를 보완했다. QA harness는 이미 retired server의 `-k`1만 허용하고 `-w`/fixture/capture exit0은 유지한다. 수정된 i686 harness exit0이며 i686 actual-prefix hash는 수집하지 못했다. 기존 Wine 초기화 오류15개는 보존했다.
 - RR 진단 capture/API Validation은 exit0·one-frame trace·원래 matrix guard7/32outputs다. 별도 full-validation observer도 guard7을 유지하지만 Conv3x3Stride1U8 offset12672/length12672 오류32회가 남는다. `_bufWeights`는 MetalFX createBuffers/newBufferWithBytes 생성·argument1/offset0·512×64 dispatch다. Owned3328-byte params나 guide producer가 아니다. Capture와 Shader Validation을 합친 성공으로 세지 않았으며 native kernel 대 instrumentation 원인은 미확정이다. 오래된 capture binary의 observe 인자 실패는 보존하고 지원되는 observer로 바꿨다.
@@ -78,13 +78,13 @@ HDR은 Samsung 공식 UE sample HTTP206 source/guide를 확보하고 APP shader/
 
 ### 후속 병렬 실행과 사용자 요청 중단 — runtime044
 
-A Composition/B RR/C HDR는 배타 경로로 동시에 시작했다. 이후 공통 build/stage와 lead GPU/display 검증이 직렬 병목이 됐고 사용자는 “병렬로 하는거 맞냐. 문서 업데이트하고 그만 해라. 너무 느리다.”고 중단을 지시했다. [최신 source delta·실행 증거·실패·정리·미완료 ledger](../.omo/handoffs/parallel-implementation-stop-20261005.md)를 따른다. 프로젝트 commit이나 전체 계약 완료 선언은 없다.
+A Composition/B RR/C HDR는 배타 경로로 동시에 시작했다. 이후 공통 build/stage와 lead GPU/display 검증이 직렬 병목이 됐고 사용자는 “병렬로 하는거 맞냐. 문서 업데이트하고 그만 해라. 너무 느리다.”고 중단을 지시했다. [최신 source delta·실행 증거·실패·정리·미완료 ledger](../docs/history/parallel-implementation-stop-20261005.md)를 따른다. 프로젝트 commit이나 전체 계약 완료 선언은 없다.
 
 Runtime044는 임시 Composition trace/model만 제거했으며 shared NOW deadline/positive-duration/exception HRESULT는 유지했다. 양 ABI build/install/stage/verify0, frozen cadence warmup3/public12/12, 별도 Sync3 public3/3 및 native 약50ms 간격, independent WindowServer 실제 palette 전환을 얻었다. Mixed 양 ABI6phase×2scoped snapshot은 mismatch0이며 FALSE BLUE와 TRUE offset18,12 RED32×24, detach cached BLUE/GREEN 및 Presents1/1/1를 확인했다. x64 screen tail은 새 사용자 창 가림 때문에 미검증이다. 일반 smoke 양 ABI와 composition/present-queues/colorspace 양 ABI6suite는 owned marker/validation/foreign/exit 기준을 통과했다.
 
 Alpha x64는 identity부터 content-pending까지6phase×4PNG만 캡처한 뒤 content-detached READY에서 중단했다. Alpha13phase 전체·i686 capture·calibrated Windows transfer/gamut oracle·normative parity는 미완료다. RR native model weights12672bytes의 argument1/offset0 producer를 관측했으나 원래 guard7/32outputs에도 native invalid load32회가 남았다. HDR 현재 link VSVDB0/calibration null/preset0과 native Gaming negotiation/readback/SSTM 부재는 분리한 limitation이고 production 수정은 없다. Alpha prefix/cache, worker/watchers, screen streams, control 파일, wake assertion을 정리하고 임시 세 창의 원래 geometry를 independent readback으로 복구했다. 이전 runtime043 cut은 아래에 보존한다.
 
-**마지막 cut/handoff:** [runtime043 원본](../build/local/composition-resume-20261005/cadence-absolute43-manual-x86_64/stdout.log)은 duration0을 같은 NOW absolute-time으로 보내 x64 warmup3·critical public12/12·consumer0을 얻었다. Native validation/exception/foreign errors0이며 screen ROI는 가림 없이 이전 warmup에서 새 내용으로 바뀌었다. 빠른 Sync0 capture는 뒤 frame의 색을 잡았으므로 독립 per-frame physical cadence를 주장하지 않는다. 양 ABI cadence·alpha/Presenter 회귀는 남았고 사용자의 다음 세션 병렬 구현 요청으로 중단했다. [소유권·증거·정리·다음 작업](../.omo/handoffs/remaining-implementation-20261005.md)을 따른다.
+**마지막 cut/handoff:** [runtime043 원본](../build/local/composition-resume-20261005/cadence-absolute43-manual-x86_64/stdout.log)은 duration0을 같은 NOW absolute-time으로 보내 x64 warmup3·critical public12/12·consumer0을 얻었다. Native validation/exception/foreign errors0이며 screen ROI는 가림 없이 이전 warmup에서 새 내용으로 바뀌었다. 빠른 Sync0 capture는 뒤 frame의 색을 잡았으므로 독립 per-frame physical cadence를 주장하지 않는다. 양 ABI cadence·alpha/Presenter 회귀는 남았고 사용자의 다음 세션 병렬 구현 요청으로 중단했다. [소유권·증거·정리·다음 작업](../docs/history/remaining-implementation-20261005.md)을 따른다.
 
 후속 사용자 요청으로 중단 지점부터 재개했고, 파일 소유권이 겹치지 않는 조사 트랙을 병렬화했다. 아래는 이 재개 구간의 실제 실행이며 이후의 중단 snapshot을 덮어쓰지 않는다.
 

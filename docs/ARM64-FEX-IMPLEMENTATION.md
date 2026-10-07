@@ -2,13 +2,25 @@
 
 ## Scope and completion boundary
 
-Current gates, reproducible procedures and dated evidence ledger, updated 2026-10-06. The goal is to remove Rosetta 2 from the execution chain: ARM64-native macOS Wine and Unix libraries, native owned AIR compiler/Metal bridge, Windows graphics modules with the loader-required ARM64EC/ARM64X ABI, and verified Darwin FEX integration for x64 and x86 guest instructions.
+Current source inputs and dated evidence ledger, updated 2026-10-07. The goal is to remove Rosetta 2 from the execution chain: ARM64-native macOS Wine and Unix libraries, native owned AIR compiler/Metal bridge, Windows graphics modules with the loader-required ARM64EC/ARM64X ABI, and verified Darwin FEX integration for x64 and x86 guest instructions.
 
 The canonical translator status is [CORE-IMPLEMENTATION-STATUS.ko.md](../graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#현재-지원-상태); [README](../README.md) is the build/entry authority. This document tracks the separate ARM64/Wine/FEX integration boundary, not another graphics support matrix.
 
 **Unified native execution passes on the SDK05 cut.** Native ARM64, FEX x64 and FEX x86 all pass actual COM/Unix-call/Metal readback and the selected D3D12 graphics/compute smoke with eight exact frames on one immutable runtime. Older failures remain dated evidence, not the current disposition. Real-game, presentation, full DXIL and broader native regression acceptance are separate from this no-present smoke.
 
+## Current source and later evidence — 2026-10-07
+
+The runtime builder now pins optimized Wine11.17 `c05971f5ea628cbb8f793662a1c54ba9a2b9d82f` from the existing isolated Wine fork. It requires `--tls-prefix` and `--freetype-prefix`, each containing headers, thin ARM64 libraries and a verified `provenance.json`. It rejects a missing configure library and stages the validated dependency closure with package-relative load paths. The earlier MR11638 pin in the SDK05 table below is historical, not the current production builder input. The older SDK archive route remains a distinct, non-WoW64 build input.
+
+The FEX builder retains baseline2609.1 `9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf` and its Darwin integration, plus 16KB call/return guards and selected upstream thread-termination, PCMPXSTRX and disk-cache patches. [Retained selected validation](../build/local/fex-selected-validation-20261006.json) records nine strict native runs/13 fixture invocations; it is not a new full FEX rebase. Disk cache remains opt-in, memory lookaside defaults to zero, and the main-file default cap is1GiB (not including its index). Owned format0xA609 isolates the changed code-generation contract; exact cache hit counts and game FPS were not measured.
+
+Later retained Wine [Mono installation](../build/local/login03-mono-install-20261007/result.json) and [x64](../build/local/login03-gpu-x64-20261007/result.json)/[x86](../build/local/login03-gpu-x86-20261007/result.json) ABI runs pass on login03. Optional NVAPI/NGX/FSR selections now propagate through both paired graphs, native/PE32 packaging and staging. [Package result](../build/local/arm64x-gpu-features-runtime01-20261007/package-result.json) and [direct FEX x64 NGX/NGX-contracts/FSR SR consumers](../build/local/arm64x-gpu-features03-20261007/feature-results.json) pass; the latter are direct isolated executions because the generic GPU runner rejects FEX. They do not establish native x86 FX, full no-Rosetta child closure for these public suites, FG/RR or G8 acceptance. [Profile consumers](../build/local/arm64x-gpu-features03-20261007/profile-results.json) validate the compatibility identity exposed for ZZZ, not physical NVIDIA/AMD hardware.
+
+The original SDK05 runtime payload was subsequently retired; its results and manifests remain evidence. Build fresh runtimes for new execution. The review identified additional CPU-pointer and fence/cache issues, tracked in [the implementation ledger](D3D12-REVIEW-AND-DESIGN-2026-10-07.md). Do not relabel old results as proof of those later changes.
+
 ## Current gate disposition — 2026-10-06
+
+This anchored table preserves the SDK05 gate observation. Current source inputs and later bounded runs are above; G8 remains open.
 
 The owned native compiler/plugin, paired ARM64X production modules and official pinned Wine/FEX builds exist. Native Wine uses relocated shared-data backing without reducing its 4-GiB PAGEZERO or using Rosetta. FEX's generated ARM64 code uses public Darwin MAP_JIT and explicit nested thread write scopes. SDK05 combines the narrow Wine user32/NLS/TEB pointer fixes with owned compiler/Metal CPU-pointer encoding. All three guests pass COM, reverse callback, Unix-call, Metal blit/fence/readback and the selected graphics/compute smoke. Native object handles, GPU addresses, guest callback identities and queue retirement semantics are preserved.
 
@@ -65,7 +77,33 @@ Strict no-Rosetta acceptance requires the launched process chain and loaded nati
 
 ## Reproduction
 
-All commands run from the repository root. Use fresh output names beneath ignored `build/local/`; never reuse recorded evidence destinations, live games or installed runtimes. Prerequisites for the retained recipe are the pinned local Wine repository, llvm-mingw at the shown path, native LLVM 15 prefix, Meson/Ninja from the existing tools and the Apple SDK/Metal-capable host. The SDK helper archives the fixed commit, not the Wine working tree, and does not install a runtime. These commands are procedures for a future reproduction, not runs performed by this refresh.
+All commands run from the repository root. Use fresh output names beneath ignored `build/local/`; never reuse recorded evidence destinations, live games or installed runtimes. The current runtime recipe requires a checkout containing the pinned optimized Wine commit below `toolchains/`, verified GnuTLS/FreeType prefixes, llvm-mingw, matching native LLVM15, Meson/Ninja and the Apple SDK. The original SDK/foundation recipes below have narrower purposes and do not themselves execute native guests.
+
+### Current optimized runtime and optional frontend package
+
+Set `WINE_REPOSITORY`, `TLS_PREFIX` and `FREETYPE_PREFIX` to existing verified local inputs; the command does not discover, download or fabricate them. All four output paths below must be new. Omit optional frontend flags consistently from both paired build and packaging when those modules are not selected.
+
+```sh
+: "${WINE_REPOSITORY:?isolated pinned Wine checkout required}"
+: "${TLS_PREFIX:?verified ARM64 GnuTLS prefix required}"
+: "${FREETYPE_PREFIX:?verified ARM64 FreeType prefix required}"
+FEX=build/local/fex-review-new
+WINE=build/local/wine-review-new
+PAIRED=build/local/paired-review-new
+PACKAGE=build/local/package-review-new
+python3 scripts/build-owned-fex-windows.py --output "$FEX" --jobs 8
+python3 scripts/build-owned-wine-arm64-runtime.py \
+  --wine-repository "$WINE_REPOSITORY" --output "$WINE" \
+  --windows-abi arm64x --wow64 --fex-result "$FEX/fex-result.json" \
+  --tls-prefix "$TLS_PREFIX" --freetype-prefix "$FREETYPE_PREFIX" --jobs 8
+python3 scripts/build-owned-arm64x.py --output "$PAIRED" \
+  --wine-source "$WINE/wine-source" --with-nvapi --with-nvngx --with-fsr --jobs 8
+python3 scripts/package-owned-wine-arm64.py --wine-build "$WINE" \
+  --paired-build "$PAIRED" --fex-build "$FEX" --output "$PACKAGE" \
+  --with-wow64 --with-nvapi --with-nvngx --with-fsr --jobs 8
+```
+
+Package success is not guest success. Use the selected ABI/smoke runner and a fresh result directory; public frontend probes require their exact fixture/ABI/validation harness. The generic GPU runner must not have its native rejection removed merely to relabel an unsupported test route as accepted.
 
 ### Current native SDK and full Unix-plugin recipe
 
@@ -111,7 +149,8 @@ After the SDK recipe, use two fresh output roots:
 ```sh
 WINE=build/local/arm64-runtime-reproduce01
 PACKAGE=build/local/arm64-owned-package-reproduce01
-python3 scripts/build-owned-wine-arm64-runtime.py --sdk "$SDK" --output "$WINE" --jobs 8
+python3 scripts/build-owned-wine-arm64-runtime.py --sdk "$SDK" --output "$WINE" \
+  --tls-prefix "$TLS_PREFIX" --freetype-prefix "$FREETYPE_PREFIX" --jobs 8
 python3 scripts/package-owned-wine-arm64.py --wine-build "$WINE" --output "$PACKAGE" --jobs 8
 ```
 
@@ -125,7 +164,7 @@ python3 scripts/run-owned-wine-arm64.py --runtime "$PACKAGE/runtime" \
   --output build/local/arm64-host-observation-reproduce01
 ```
 
-Use the actual fixture output directory; this observer is expected to remain blocked before guest entry on the recorded Darwin low-address failure. `--gpu` additionally requires the ABI fixture GPU checks and cannot turn host-only observations into GPU acceptance. The normal package-wrapper smoke and direct real-loader observer are distinct routes: the SIP-protected shell strips the DYLD observer, so direct observation preserves the audited owned wrapper policy through explicit environment plus manifest hash instead of replacing or weakening the wrapper.
+Use the actual fixture output directory. The original low-address failure belongs to the older SDK package, not the current optimized guest-window runtime. `--gpu` additionally requires the ABI fixture GPU checks and cannot turn host-only observations into GPU acceptance. The package-wrapper and direct real-loader observer are distinct routes: direct observation preserves the audited wrapper policy through explicit environment and manifest hash; a parent-only architecture check is insufficient.
 
 ### Foundation diagnostic and ABI compile-only recipe
 
@@ -186,6 +225,8 @@ The Unix-call interface is not an arbitrary C++ cross-architecture ABI. Its numb
 - Report per-gate complete, failed, or blocked evidence. No public push/merge is requested.
 
 ## Initial foundation execution disposition
+
+The remainder is a historical ledger. Past blockers, pins and then-proposed implementation slices below do not override the current source/recipe or the later accepted SDK05/login03/frontend runs above.
 
 **Initial cut, 2026-10-02 (before the SDK/plugin follow-up).** This section preserves the initial foundation cut and its failures, not the current blockers. The [native SDK/Unix-plugin follow-up](#native-sdkunix-plugin-follow-up) below supersedes its G1/G2 window-driver/plugin blocker; guest gates remain open.
 

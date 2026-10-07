@@ -9,7 +9,7 @@
 | `src/nvngx/nvngx.cpp` | 기존 D3D11 exports·DLL 초기화·NV extension gate |
 | `src/nvngx/nvngx_d3d12.cpp` | D3D12 device/parameter/feature registry, public result mapping, create/frame parsing |
 | `src/nvngx/nvngx_d3d12_msvc.cpp` | Microsoft C++ ABI parameter facade와 C linkage storage bridge |
-| `src/nvngx/meson.build` | x64 MSVC facade object와 MinGW frontend를 같은 builtin `nvngx.dll`에 링크 |
+| `src/nvngx/meson.build` | x64/i686/ARM64/ARM64EC별 MSVC facade object와 MinGW frontend를 같은 builtin DLL에 링크 |
 | `src/d3d12/d3d12_interfaces.hpp` | DLL 간 project-owned COM 계약 |
 
 구현된 `NVSDK_NGX_D3D12_` export는 다음 **16개**다.
@@ -34,7 +34,7 @@ D3D12의 success는 `0x00000001`, failure는 NVIDIA public `0xBAD00000` 계열�
 
 D3D12만 사용해도 D3D11 resource slot은 **공식 ABI의 일부**이므로 보존한다. 공식 SDK snapshot은 `external/nvngx/include/`이고 라이선스는 `external/nvngx/LICENSE.txt`다. Slot 검사에는 공식 header로 컴파일한 consumer object를 사용한다([검증 레시피](NGX-TEST.ko.md#cpupe-abi-검사)).
 
-현재 Meson facade target은 `x86_64-pc-windows-msvc`다. **x64 frontend/NGX proof를 x86 WoW64·ARM64·ARM64EC NGX 지원으로 확대하지 않는다.** D3D12 temporal COM backend의 WoW64 proof와 NGX frontend의 architecture 범위는 별개다. ARM64 Wine/FEX 최종 목표는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#개발-목표와-우선순위)를 따른다.
+현재 Meson은 x64/i686/ARM64/ARM64EC에 각각 맞는 MSVC facade target을 선택한다. ARM64X paired helper와 package는 `--with-nvngx`를 양 ABI build/stage에 전달한다. 기존 x64/WoW64 public proof와 10월7일 direct isolated FEX x64 NGX/NGX-contracts proof는 별도이며, 이를 native x86 temporal/Composition 및 전체 migration matrix 성공으로 확대하지 않는다. [현재 실행·증거](../docs/ARM64-FEX-IMPLEMENTATION.md)를 따른다.
 
 ## Device와 feature 수명
 

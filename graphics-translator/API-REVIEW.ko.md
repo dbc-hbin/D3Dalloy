@@ -42,7 +42,7 @@ Color/depth/MV/mask texture backing extent는 같을 필요가 없다. 현재 �
 
 ### 3. 명시적으로 좁힌 NGX 입력 의미
 
-High-res/jittered MV, reactive/composition masks, 공식 color/depth/MV/mask/output subrect offsets와 RCAS sharpening은 full port로 구현됐다. NGX DoSharpening bit는 native descriptor 기능이 아니라 별도 GPU post-operation을 켠다(비활성 상태의 nonzero Sharpness는 거부). Alpha-upscale bit128·reserved/unknown flags는 거부한다. P1의 사용자 선택은 유효한 nonidentity Exposure.Scale과 nonzero MV.Offset.X/Y를 받아 실행을 계속하되 수치 효과를 무시하는 **호환 계약**이다. Exposure 곱셈이나 MV 값 bias 구현으로 부르지 않으며 이미 지원하는 MV texture subrect offset과 혼동하지 않는다. Public x64의 기본/비기본 5쌍×3 live GPU replay와 invalid-output 보존을 통과했다([완료 증거](CORE-IMPLEMENTATION-STATUS.ko.md#p1-계약-범위와-reference)).
+High-res/jittered MV, reactive/composition masks, 공식 color/depth/MV/mask/output subrect offsets와 RCAS sharpening은 full port로 구현됐다. NGX DoSharpening bit는 native descriptor 기능이 아니라 별도 GPU post-operation을 켠다(비활성 상태의 nonzero Sharpness는 거부). Alpha-upscale bit128은 별도 alpha history로 지원하며 reserved/unknown flags는 거부한다. P1의 사용자 선택은 유효한 nonidentity Exposure.Scale과 nonzero MV.Offset.X/Y를 받아 실행을 계속하되 수치 효과를 무시하는 **호환 계약**이다. Exposure 곱셈이나 MV 값 bias 구현으로 부르지 않으며 이미 지원하는 MV texture subrect offset과 혼동하지 않는다. Public x64의 기본/비기본 5쌍×3 live GPU replay와 invalid-output 보존을 통과했다([완료 증거](CORE-IMPLEMENTATION-STATUS.ko.md#p1-계약-범위와-reference)).
 
 Manual exposure는 AutoExposure off일 때 optional null 또는1×1 R16Float/R32Float를 지원한다. R32는 매 execution/replay에서 선행 GPU writes 뒤 private R16 scratch로 수치 변환하며 ABI 변경·clamp·tone correction·CPU readback·record-time cache가 없다. AutoExposure는 supplied exposure를 무시한다. [양 ABI numeric·수명·public NGX proof](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료)가 완료돼 R32 conversion은 남은 후보가 아니다. Output subrect도 opt-in/bounds/scratch copy를 이미 지원한다.
 
@@ -50,7 +50,7 @@ Pristine GPTK D3DMetal4.0b2의 reference는 MPL이 Exposure.Scale을 읽지 않�
 
 ### 4. Architecture와 실제 consumer
 
-MSVC parameter facade는 **x64-only**다. x86/ARM64/ARM64EC public NGX facade는 현재 지원 선언에 포함하지 않는다. ARM64/FEX guest execution은 사용자 보류 항목이며 이번 P0 작업으로 재개하지 않는다. D3D12 backend WoW64·ARM64 compiler/native proof를 public NGX ABI proof로 바꾸지 않는다.
+MSVC parameter facade의 현재 Meson target은 x64/i686/ARM64/ARM64EC를 구분하고 paired ARM64X packaging을 지원한다. 10월7일 direct isolated FEX x64 NGX/NGX-contracts/FSR SR의 지정 실행 기록이 있으며 ARM64/FEX는 과거 보류 상태가 아니다. Native x86 Metal4FX의 CPU-pointer 누락과 아직 실행되지 않은 경로는 [새 리뷰](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)에 분리한다. 다른 ABI의 build/기존 실행을 이 경로의 acceptance로 바꾸지 않는다.
 
 Synthetic loader는 system32 DLL을 직접 요청한다. 실제 게임/Streamline의 owned core DLL 선택·public NGX calls·queue encode·출력의 연결 관찰은 아직 필요하다. Vendor identity 또는 registry gate만으로 실제 loader 성공을 선언하지 않는다.
 

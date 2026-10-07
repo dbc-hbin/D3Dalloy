@@ -10,6 +10,8 @@
 
 저장소 루트에서 필요한 범위만 실행한다.
 
+2026-10-07 문서/packaging 회귀에는 `scripts/test-owned-documentation.py`, `test-owned-wine-arm64-runner.py`, `test-owned-arm64x-build.py`, `test-owned-wine-arm64-package.py`도 있다. ARM64X의 선택적 실제 SDK graph 검증은 `--sdk-root` 없이는 skip되며, mock/CPU PASS를 target build나 GPU 실행으로 합산하지 않는다. 새 correctness 회귀와 실제 적용 결과는 [리뷰 ledger](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)를 따른다.
+
 ```sh
 python3 scripts/test-owned-graphics-build.py
 python3 scripts/test-owned-graphics-staging.py
@@ -51,6 +53,8 @@ done
 최종 acceptance는 actual cap3·exit0/pass=true·API+Shader Validation·owned backend 확인·validation/foreign 오류0과 retained 전체 geometry/ClipDistance/CullDistance matrix를 요구한다. Numeric oracle는10 families×7=70 Tier3 grid rows·18 DXIL/DXBC early/late depth/stencil/UAV/occlusion interactions·16K precision·degenerate point/line·winding/cull/Vertex0/depth·helper·SampleMask·forced4·OFF/ON toggle·indirect/bundle/replay와 새 AS/MS FrontCounterClockwise cull·near/far DepthClip ON/OFF4 rows를 검사한다. ON은 각 covered28·mandatory10, ClipDistance3e066666·depth00000000/3f800000, OFF는 각 covered64·mandatory64, ClipDistance3f31999a·depth39000000/3f7ff800의 exact comparison이다. Before의 post-snap-line 실패는 Tier1이 허용하는 cull이며 과거 Tier1 proof를 무효화하지 않는다. 기존1/128 ambiguity band는 유지하고 Tier3-specific exact-grid bounds는 별도로 검사한다. OFF/nontriangle에서 undefined인 InnerCoverage 특정 상수는 요구하지 않는다. 새 재현에서는 paired cut의 `depth-bounds`, `pipeline-statistics`, `multisample-capabilities`도 ABI별 직렬 실행하고 cut/manifest를 각각 기록한다. 위 관찰된8회는5개 runtime03+3개 retained runtime02의 mixed-cut이지 이 새 recipe를 동일 cut에서 실행했다는 주장이 아니다.
 
 ## Depth bounds 50-case focused proof
+
+아래는 최초 native50-case의 보존된 recipe/관찰이다. 현행 지원은 Apple7+ emulation과 Apple10 native이며, 최종 forced/native 각각 양 ABI146-case proof는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#depth-bounds-완료와-focused-proof)를 따른다. 아래 당시 native-only/이전 family 미지원 표현을 현재 capability로 읽지 않는다.
 
 최종 실제 결과는 runtime-02 [x64](../build/local/p2-depth-bounds-20261004.S3Pmiu/final-depth-bounds-x64/result.json)·[WoW64](../build/local/p2-depth-bounds-20261004.S3Pmiu/final-depth-bounds-x86/result.json)이며 ABI별 cap1·50 CASE_PASS·replay 포함51 STATS·exit0·API+Shader Validation·validation/foreign 오류0이다. 같은 cut의 library/statistics/multisample 양 ABI 회귀까지 총8 GPU runs가 PASS했다([CORE ledger](CORE-IMPLEMENTATION-STATUS.ko.md#depth-bounds-완료와-focused-proof)). Apple M5 Pro/macOS27의 native AppleGPUFamily10 gate 범위이며 SM6.5/FL12_1·이전 Apple family 미지원은 그대로다.
 

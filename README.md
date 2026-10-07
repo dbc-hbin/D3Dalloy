@@ -21,7 +21,7 @@ SPIR-V compiler fallback을 사용하지 않는다.
 | 미완료 작업·사용자 선택에 따른 실행 순서 | [구현 우선순위](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md) |
 | 단계별 구현·실행의 상세 이력 | [구현 이력](graphics-translator/IMPLEMENTATION-HISTORY.ko.md) |
 | ARM64/ARM64EC/ARM64X·Wine/FEX 구성과 남은 실행 단계 | [ARM64/FEX](docs/ARM64-FEX-IMPLEMENTATION.md) |
-| 최신 번역기 리뷰의 원래 지적·수정 판정·후속 증거 | [2026-10-01 리뷰와 10-02 수정](docs/D3D12-TRANSLATION-REVIEW-2026-10-01.md) |
+| 최신 리뷰·설계·후속 구현과 검증 | [2026-10-07 리뷰와 설계](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md), [이전 10-01 리뷰의 완료 판정](docs/D3D12-TRANSLATION-REVIEW-2026-10-01.md) |
 | Resource·format·view·API 계약 | [Capabilities](graphics-translator/CAPABILITIES.ko.md), [Resources](graphics-translator/D3D12-RESOURCES.ko.md), [Core contracts](graphics-translator/D3D12-CORE-CONTRACTS.ko.md), [Bundles](graphics-translator/D3D12-BUNDLES.ko.md) |
 | Queue·fence·여러 queue의 순서와 수명 | [Queue order](graphics-translator/QUEUE-ORDER.ko.md), [Fence events](graphics-translator/FENCE-EVENTS.ko.md), [Multiqueue](graphics-translator/MULTIQUEUE.ko.md) |
 | 현재 빌드·LLVM 설정·디버깅 | 아래 [빌드](#빌드), [Development](docs/DEVELOPMENT.md) |
@@ -30,30 +30,21 @@ SPIR-V compiler fallback을 사용하지 않는다.
 | 설정·용어·업스트림 HUD 구분 | [Customization](docs/CUSTOMIZATION.md), [Glossary](docs/GLOSSARY.md), [Compatibility flags](docs/COMPATIBILITY_FLAG.md) |
 | Import 재현·과거 조사 | [Frozen build](graphics-translator/BUILD.ko.md), [Temporal/NGX review](graphics-translator/API-REVIEW.ko.md), [ZZZ historical analysis](graphics-translator/ZZZ-COMPATIBILITY.ko.md), [Upstream origin](docs/UPSTREAM-README.md) |
 
-## 현재 상태의 읽는 법
+## 현재 상태 — 2026-10-07
 
-**2026-10-02 기준, 과거 개발 단계의 지정 P0–P3 범위와 D3D12 Metal 4 전환의 fixture acceptance는 완료했다.**
-새 backlog의 P3는 별개다. **#17 Mesh/AS derivatives는 paired runtime-01의 x64/WoW64 수치·capability proof로 완료했으며**, 기능별 후속 완료와 남은 통합 acceptance는 아래와 PRIORITIES에서 구분한다. 2026-10-03 후속 사용자 지시로 **구형 WaveMMA와 후속 SM6.10 matrix를 모두 구현하고 남은 P3를 닫는 작업을 재개했다**. [구현 우선순위](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md)의 현재 실행 선택과 날짜별 중간 관찰을 구분한다.
-이것은 최신 규격 전체가 구현됐다는 뜻이 아니다. 현재 공개 상한은 **FL12_1 / SM6.5**이며,
-DXR 1.1·mesh 1·VRS 2·sampler feedback 1.0·view instancing 1·Work Graphs 1.0을 보고한다.
-Matrix는 별도 pinned preview 계약으로 **WaveMMATier1.0(10) / LinearAlgebraTier1.0(16)**을 보고한다.
-**ConservativeRasterizationTier3도 완료했다(2026-10-04).** Genuine DXIL/DXBC InnerCoverage·degenerate/full-coverage를 최종 runtime03의 x64/WoW64 cap3 public consumer로 검증했다. [현행 계약·named 증거](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#conservative-tier3-현재-계약과-provisional-proof)의8/8 acceptance는 **5개 runtime03+3개 retained runtime02 x64 회귀**이며 같은 build의8회 실행이 아니다. **SM6.5/FL12_1은 변경하지 않았다.**
-기능별 조건, 상위 tier 공백, 남아 있는 API no-op과 compiler 의미 누락은
-[현재 상태와 남은 구현 후보](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#남은-구현-후보)에서 구분한다.
-Pipeline library, tiled resource, GS/HS/DS, pipeline statistics는 이미 구현되어 있으므로 통째로 미구현 목록에 넣지 않는다.
+현행 소스와 검증된 runtime은 구분한다. 공개 상한은 **FL12_1 / SM6.5**, 일반 compiler 입력 상한은 SM6.9/DXIL1.9다. DXR1.2, Mesh1, VRS2, sampler feedback1.0, view instancing1, Work Graphs1.0과 장치별 Tiled Tier4를 구현한다. FP64·writable MSAA·virtual wave4–32·구형/preview matrix 및 depth bounds·conservative Tier3의 지정 계약은 [CORE](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md)의 개별 증거를 따른다. 개별 기능 성공은 상위 Shader Model 전체 conformance가 아니다.
 
-**새 P3 #20 구형 WaveMMA와 후속 pinned SM6.10 preview matrix 모두 완료했다(2026-10-03).** 서로 다른 actual public SDK/producer 계약을 유지하며 runtime-05 양 ABI public runtime behavioral, runtime-06 양 ABI11-case numerical/converted-weight shader consumer, runtime-07 양 ABI strict query38/77/78·OPTIONS9 및 successor conversion readback을 결합했다. [정확한 계약·named 증거·한계](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#wavemmalinear-algebra-최종-positive-cap-proof)를 따른다. 이는 최신 단일 cut full-suite 재실행이 아니다. Mandatory atomic 통합 acceptance가 남아 ordinary HighestShaderModel은6.5이며 pinned preview matrix를 전체 SM6.10 conformance·다른 GPU/OS·게임/성능·ARM64/FEX/no-Rosetta 완료로 확대하지 않는다.
+| 영역 | 현재 구현 및 관찰 | 아직 증명하지 않은 범위 |
+| --- | --- | --- |
+| D3D12 코어·compiler | 기본 렌더링/compute, pipeline library, query, residency, indirect, DXR 및 선정 P0–P3 계약 구현 | 모든 유효 입력·게임·GPU/OS conformance |
+| 캐시 | 자동 owned RAM/disk·same-key single-flight와 application ShaderCacheSession/Control | native Metal archive·최종 PSO 객체 재사용; [새 캐시 잠금 리뷰](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md) |
+| Native ARM64/FEX | SDK05의 ARM64/x64/x86 ABI·Metal 및 각8-frame graphics/compute no-present proof. 이후 optimized Wine11.17/FEX 선정 패치·login03 ABI/Mono 기록 확보 | G8 native migration matrix, 전체 DXIL·게임·presentation |
+| 선택 frontend | ARM64/EC paired build와 PE32 packaging 옵션. 10월7일 direct isolated FEX x64 NGX·NGX-contracts·FSR SR consumer PASS 기록 | 이 기록은 generic runner·x86 FX·FG/RR 전체 native acceptance가 아님 |
+| 게임 표시·효과 | 기존 지정 SR/alpha/FG/Reflex·Composition geometry/cadence·일반 HDR proof 보존 | Composition absolute colour parity, RR clean native validation, HDR10+ GAMING |
 
-**새 P3 #22 FP64도 완료했다(2026-10-03).** Binary64 정수 emulation으로 `DoublePrecisionFloatShaderOps=TRUE`를 보고하며, paired runtime-04에서 실제 DXIL과 native FXC DXBC5.0/5.1의 compute·VS/PS·4-lane wave8 case가 x64/WoW64 모두 API+Shader Validation으로 통과했다. [정확한 계약·증거·한계](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#fp64-완료와-focused-proof)를 따른다. 이 완료로 공개 SM/FL 상한이나 다른 P3·D3D11·게임·성능 지원을 상향 선언하지 않는다.
+현재 실행 순서는 [PRIORITIES](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md), 새 결함과 수정 설계·실제 후속 검증은 [10월7일 리뷰](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)를 따른다. 과거 ARM64/FEX 보류와 low-VA 실패를 현재 상태로 읽지 않는다. SDK05 이후 Wine builder는 optimized Wine11.17 pin과 검증된 ARM64 GnuTLS/FreeType 입력을 사용한다. [현행 runtime 입력과 기록](docs/ARM64-FEX-IMPLEMENTATION.md)을 따른다.
 
-**새 P3 #21 Writable MSAA도 완료했다(2026-10-03).** OPTIONS14 `WriteableMSAATexturesSupported=TRUE`를 보고하며 paired runtime-06의 x64/WoW64 각각80-case public consumer가 API+Shader Validation으로 통과했다. Sample별 UAV write/load·typed alias/SRV·copy/raster/MIN/MAX resolve·clear와 typeless half의 raw-bit 보존을 GPU emulation으로 연결했다. [정확한 계약·증거·한계](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#writable-msaa-완료와-focused-proof)를 따르며 native writable-MSAA·D3D11·reserved MSAA·전체 SM/FL·게임/성능 지원으로 확대하지 않는다.
-
-- Metal 4 recovery **118/118**은 x64 60 + WoW64 58, **새 runtime-02 실행 44 + 유지한 runtime-01 실행 74**의 mixed-cut 증거다. 116개는 API/Shader Validation, 2개 atomic-live는 API-only다. 최신 단일 snapshot에서 118개를 모두 재실행한 결과가 아니다.
-- 이후 리뷰 수정은 별도 focused evidence다. 전체 D3D12/DXR conformance, Windows reference differential, 실제 게임, 성능 향상, 다른 GPU/OS, 물리 compositor/HDR scanout·다중 출력은 이 숫자로 증명되지 않는다.
-- ARM64/plain ARM64EC production DLL 6개, 실제 ARM64 Wine SDK/`winemetal.so` compiler·GPU probe **11/11**, 새 paired ARM64X D3D12/DXGI/WineMetal **3개 자동 빌드**를 확인했다. ARM64X 결과는 **54 commands / 0 failure**, owned 입력 **503개**의 빌드 전후 hash가 일치한 단일 source cut이다. 이것은 G3의 DLL 빌드 증거이지 native Wine/FEX guest 실행 증거가 아니다.
-- 격리 local Wine `c2f86161…`의 native runtime과 현재 full plain ARM64 owned install을 **schema-2 package로 완료**했다. `build/local/arm64-owned-package-cut-20261002/package-result.json`은 **6 commands / 0 failure**, normal owned wrapper는 `wine-11.17`이다. 실제 loader/server의 `proc_translated=0`은 관찰했지만 shared page `0x7ffe0000` low-VA mapping 실패로 PE guest는 시작하지 못했다(`runtime_executed=true`, `guest_executed=false`, `strict_no_rosetta_proven=false`). 패키징까지만 완료하고 실행 계층은 별도 작업이며, G5–G8/FEX와 Rosetta-free guest 완료를 선언하지 않는다.
-- `ShaderCacheSession`/`ShaderCacheControl`은 application memory/disk session으로 구현됐다. 자동 driver cache나 native Metal archive는 아니다. R32 manual exposure는 GPU 변환으로 지원하며 CPU fixup·tonemapping을 추가하지 않는다. optional x64 FSR frontend와 NGX는 같은 retained MetalFX backend를 사용한다. 정확한 지원 범위·GPU/cache 증거는 [현재 상태](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md), [Core contracts](graphics-translator/D3D12-CORE-CONTRACTS.ko.md), [Temporal/NGX contracts](graphics-translator/NGX-CONTRACTS.ko.md)를 따른다.
-- 과거 `build/` 삭제로 유실된 P3 등의 실행은 관찰 기록으로만 남는다. 문서의 옛 절대 경로나 “보존” 표기를 현재 파일 존재로 해석하지 않는다. 현재 남아 있는 recovery/review/native-plugin 증거와 구분한다.
+과거 Metal4 recovery **118/118**은 새44+유지74의 mixed-cut 증거이며 최신 단일 snapshot 전체 재실행이 아니다. 10월7일 기존 실행 기록을 문서화하는 것은 이번 수정의 새 GPU 실행이 아니다. 일부 과거 runtime payload는 정리됐으므로 존재하는 manifest/log만으로 해당 경로를 실행할 수 있다고 가정하지 않는다.
 
 ## 소스 구조
 
@@ -132,11 +123,12 @@ SR facade/owned MetalFX backend와 source-owned `amd_fidelityfx_framegeneration_
 SR은 masks, high-resolution/jittered motion vectors, input/output subrect, RCAS sharpening,
 linear/sRGB/PQ transfer, manual/auto exposure와 dynamic render/output을 연결한다. FSR 출력이
 장치의 temporal scale 상한을 넘으면 종횡비를 유지한 capped 영역을 중앙에 놓고 나머지는 opaque black으로 채운다.
-FG는 MetalFX FrameInterpolator의 Prepare GPU snapshot→Generate와 MIT GPUOpen SDK 기반
-swapchain/UI/pacing proxy를 사용한다. 원래 vendor DLL·D3DMetal fallback이나 AMD FSR 모델 실행이 아니다.
+FSR FG는 source-owned N1–4 generated phase와 MIT GPUOpen SDK 기반 swapchain/UI/pacing proxy를 사용한다.
+NGX feature11의 선정 경로는 MetalFX FrameInterpolator와 caller-owned Present를 사용하며 두 backend의 증거를 혼동하지 않는다.
+원래 vendor DLL·D3DMetal fallback이나 AMD/NVIDIA 모델 실행·품질 동등성을 주장하지 않는다.
 NGX Exposure.Scale·MV.Offset은 유효한 비기본 입력을 받아 무시하는 호환 계약이며 수치 효과를 구현한 것은 아니다.
 FG ResizeBuffers1의 per-buffer queue 선택·수명·rollback은 GPU/실제 drawable로 검증했다.
-SR debug-view dispatch, FG의 여러 generated output·일부 flags는 명시적 제한이다.
+SR debug-view와 일부 flags는 명시적 제한이다. FSR N1–4의 선정 proof와 NGX count1 proof를 유지하며 다른 count/consumer로 확대하지 않는다.
 M5 Pro의 public native Metal4FX16→48에서도 Conv3x3 invalid stores가 관찰돼 작은 입력의
 portable 지원은 보장하지 않는다. 이 platform 경계를 validation suppression이나 크기 guard로 숨기지 않는다.
 구현 계약과 실제 검증 범위는 [현재 상태](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료),
@@ -168,7 +160,7 @@ python3 scripts/test-owned-arm64x.py --build-root build/local/arm64x-paired-repr
 
 위 output은 새 목적지여야 한다. 보존한 실제 실행은 `build/local/arm64x-paired-production-20261002/`의
 `result.json`, `source-cut.json`, logs/maps를 따른다. native Wine packaging과 실행 계층의 남은 gate는
-[ARM64/FEX](docs/ARM64-FEX-IMPLEMENTATION.md#current-gate-disposition--2026-10-02)에 분리한다.
+[ARM64/FEX](docs/ARM64-FEX-IMPLEMENTATION.md#current-gate-disposition--2026-10-06)에 분리한다.
 Native runtime builder는 `scripts/build-owned-wine-arm64-runtime.py`, 완전 owned install/staging은
 `scripts/package-owned-wine-arm64.py`를 사용한다. [재현 절차](docs/ARM64-FEX-IMPLEMENTATION.md#native-wine-build-and-package-recipe)와
 [package/host 증거](docs/ARM64-FEX-IMPLEMENTATION.md#native-wine-host-evidence-and-execution-boundary)를 따른다.

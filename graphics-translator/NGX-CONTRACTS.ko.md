@@ -43,7 +43,7 @@ non-null Shutdown1은 해당 device의 feature를 제거한다. 다른 device가
 - `OutputSubrectsEnabled=1`: output base를 backend frame descriptor에 그대로 전달한다. frontend는 추측해 clamp하지 않는다.
 - backend는 `base + logical output`이 backing extent 안에 들어가는지 overflow-safe subtraction으로 검사하고 범위를 벗어나면 `E_INVALIDARG`를 반환한다. Frontend mapping은 `InvalidParameter`다.
 - 실제 scaler 출력은 logical-size private scratch에 쓰고, 요청 rectangle만 app output의 base로 복사한다. rectangle 밖은 변경하지 않는다.
-- 공식 **input** color/depth/motion/bias/translucency offsets도 지원하며 각 resource view 안의 active rectangle을 독립 검사한다. Output의 create-time opt-in과 input bounds는 다른 계약이다([입력 범위](D3D12-NGX-FRONTEND.ko.md#현재-입력-범위)).
+- 공식 **input** color/depth/motion/bias/translucency offsets도 지원하며 각 resource view 안의 active rectangle을 독립 검사한다. Output의 create-time opt-in과 input bounds는 다른 계약이다([입력 범위](D3D12-NGX-FRONTEND.ko.md#현재-sr-입력-범위)).
 
 136×136 backing / 128×128 logical의 X=8은 유효, X=9는 범위 초과다. 이 경계는 **record-time contract fixture**가 검사한다. 실제 nonzero output rectangle의 GPU readback/sentinel은 temporal fixture의 `(3,5)` case가 담당한다.
 

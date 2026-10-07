@@ -56,7 +56,7 @@ XA/YA/YB/XB는 서로 다른 app-visible resources를 사용한다. 두 queue는
 - G1→G2→G1→G1: actual encode reset `1,1,1,0`.
 - typed/typeless 각각 8 continuous frame, caller reset 모두 false.
 - output subrect enabled base `(3,5)`의 logical 128×128만 갱신, 136×136 backing의 나머지 sentinel 보존.
-- exact HRESULT positive/negative control을 유지한다. Nonzero input offset 자체는 지원하며 각 view의 active rectangle bounds를 검사한다. 이 baseline의64×64 backing에서64×64 active input에 추가 offset을 주면 범위 초과다([현재 입력 계약](D3D12-NGX-FRONTEND.ko.md#현재-입력-범위)).
+- exact HRESULT positive/negative control을 유지한다. Nonzero input offset 자체는 지원하며 각 view의 active rectangle bounds를 검사한다. 이 baseline의64×64 backing에서64×64 active input에 추가 offset을 주면 범위 초과다([현재 입력 계약](D3D12-NGX-FRONTEND.ko.md#현재-sr-입력-범위)).
 
 NGX parameter Reset/Destroy-before-Execute와 public feature Release는 [NGX-TEST](NGX-TEST.ko.md)의 public API fixture가 별도로 검사한다. Completion COM fixture 자체를 NGX facade proof로 세지 않는다.
 

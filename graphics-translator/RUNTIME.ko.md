@@ -17,7 +17,7 @@ Defaults are `x86_64`/`x64`. 그 외 조합은 거부한다. 표는 **staging la
 
 - PE machine과 최종 CHPE metadata/code ranges, ARM64X dynamic relocations를 검사한다. 중간 ARM64EC/ARM64X label만 붙인 파일은 허용하지 않는다.
 - Wine의 `ntdll.dll` ABI, native launcher/`ntdll.so`/`wineserver`의 architecture를 검사한다. x64 packaged Wine의 ARM64 IPC `wineserver`는 명시적 예외다.
-- Runner의 `--guest-arch {x86,x64,arm64}`는 fixture에서 추론한 ISA와 일치함을 **assert**하는 옵션이며 translation switch가 아니다. ARM64 Wine에서 x86/x64 guest는 Darwin FEX 통합 증거가 없어 거부한다. ARM64EC/hybrid fixture 실행 및 plain ARM64 guest와 EC/X translator의 interoperation도 established가 아니다.
+- Generic GPU runner의 `--guest-arch {x86,x64,arm64}`는 ISA assertion이지 FEX 활성화 옵션이 아니다. Native FEX의 선정 ABI/smoke 실행은 `scripts/run-owned-wine-arm64.py`의 별도 경로로 검증한다. Generic runner의 FEX 거부를 native 실행 전체 미구현으로 해석하지 않으며, 10월7일 direct public frontend 실행도 generic runner acceptance와 구분한다.
 - **Schema 1은 legacy x86_64/x64 manifest를 읽는 호환 경로만 남아 있다.** 새 stage는 schema 1을 생성하지 않는다. 기존 manifest를 손으로 schema 2로 relabel하지 말고 실제 binaries에서 새 stage를 만든다.
 
 ARM64 compiler/bridge·Wine SDK/plugin의 관측과 native Wine/FEX 최종 acceptance는 [ARM64-FEX-IMPLEMENTATION.md](../docs/ARM64-FEX-IMPLEMENTATION.md)에서 분리한다. Schema 2나 ARM64 launch 명령만으로 `strict_no_rosetta_proven`을 주장하지 않는다.
@@ -71,7 +71,7 @@ python3 scripts/stage-owned-graphics.py verify \
 
 ### WoW64
 
-x86 fixture는 `build-win32.txt`로 별도 생성한 **같은 세대** i386 install을 `--dxmt-install32 build/local/install32`로 함께 stage한다. `lib/wine/i386-windows` PE들이 x86_64 plugin의 32-bit Unix-call thunk를 사용한다. 현재 WoW64 staging은 x86_64 Wine layout에서만 established다. `--guest-arch x86`만 붙여 없던 i386 modules를 만들 수 없다.
+x86 fixture는 `build-win32.txt`로 별도 생성한 **같은 세대** i386 install을 `--dxmt-install32`로 함께 stage한다. x86_64/x64와 arm64/ARM64X native WoW64 구성을 구분하며, ARM64X에는 해당 runtime의 pinned FEX modules와 nonzero guest-window CPU-pointer 계약이 추가된다. `--guest-arch x86`만 붙여 없던 i386 modules를 만들 수 없다. SDK05와 후속 native ABI proof는 [ARM64/FEX](../docs/ARM64-FEX-IMPLEMENTATION.md)를 따른다.
 
 ### 선택적 owned NVIDIA extension
 
@@ -114,5 +114,5 @@ Current PSO cached blobs와 `ID3D12PipelineLibrary1`은 구현된 별개 경로�
 Cached blobs는 owned compiler의 stage metallib와 원본 immutable pool/alignment/relocations를 보존하고 새 allocation에 GPU 주소를 다시 적용한다. Native Metal binary archive 자체를 뜻하지 않으며 cache identity는 format, adapter, compiler/runtime/OS-build에 묶인다. 손상/mismatch를 숨겨 cold compile로 바꾸는 성공 판정을 하지 않는다. 이전 native build cache와 새 runtime을 섞은 결과도 현재 same-build 검증과 구분한다. `ID3D12ShaderCacheSession`/control의 application-managed MEMORY/DISK 지원은 이 PSO 경로와 별개이며 [완료 계약·CPU proof](CORE-IMPLEMENTATION-STATUS.ko.md#shadercachesessioncontrol-완료와-focused-proof)를 따른다.
 
 - Key는 shader bytes, serialized root signature, pipeline kind/state와 target 계약에서 만들며 pointer/struct padding을 identity로 쓰지 않는다.
-- CachedBlobSizeInBytes가 0이면 cold compile이다. Nonempty/null, 손상 layout/checksum/metallib, shader/root/stage mismatch 및 invalid relocation은 `E_INVALIDARG`; adapter mismatch는 `D3D12_ERROR_ADAPTER_NOT_FOUND`; format version/native identity mismatch는 `D3D12_ERROR_DRIVER_VERSION_MISMATCH`다. Native identity 조회 자체 실패는 `E_FAIL`이며 성공 identity로 위장하지 않는다.
+- CachedBlobSizeInBytes가 0이면 explicit blob 없이 자동 RAM/disk cache를 조회하며 miss/disabled일 때 cold compile한다. Explicit nonempty/null, 손상 layout/checksum/metallib, shader/root/stage mismatch 및 invalid relocation은 `E_INVALIDARG`; adapter mismatch는 `D3D12_ERROR_ADAPTER_NOT_FOUND`; format version/native identity mismatch는 `D3D12_ERROR_DRIVER_VERSION_MISMATCH`다. Native identity 조회 실패는 성공으로 위장하지 않는다. Optional automatic-cache의 손상 거부와 한정 cold retry는 explicit CachedPSO 오류를 숨기는 정책이 아니다.
 - `GetCachedBlob(nullptr)`는 `E_POINTER`다. Returned blob은 caller-owned이고 unaligned input/lifetime·반환 blob 격리는 cache fixture의 별도 계약이다. 오류를 자동 cold fallback으로 숨기지 말고 caller가 필요한 경우 cache 없이 명시적으로 재생성한다.
