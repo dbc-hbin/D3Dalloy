@@ -170,11 +170,11 @@ def main() -> int:
              "-Wl,--start-group", *(str(lib) for lib in libraries), "-lkernel32", "-luser32", "-lgdi32", "-lwinspool", "-lshell32", "-lole32", "-loleaut32", "-luuid", "-lcomdlg32", "-ladvapi32", "-Wl,--end-group"], out / "link.log")
         if inspect_pe(dll)["windows_abi"] != abi:
             raise RuntimeError(f"NGX PE ABI mismatch: {dll}")
-        dump = run([str(args.toolchain / "llvm-objdump"), "-p", str(dll)], out / "pe.log")
-        exports = set(re.findall(r"\b(NVSDK_NGX_D3D(?:11|12)_[A-Za-z0-9_]+)\s*$", dump, re.MULTILINE))
-        required = {f"NVSDK_NGX_D3D{version}_{suffix}" for version in (11, 12) for suffix in NGX_SUFFIXES} | {"NVSDK_NGX_D3D12_EvaluateFeature_C"}
-        if required - exports or b"own-ngxd3d12\0" not in dll.read_bytes():
-            raise RuntimeError(f"NGX PE missing exports/owned marker: {sorted(required - exports)}")
+        dump = run([str(args.toolchain / "llvm-readobj"), "--coff-exports", str(dll)], out / "pe.log")
+        exports = set(re.findall(r"^\s+Name: (\S+)$", dump, re.MULTILINE))
+        required = {f"NVSDK_NGX_D3D{version}_{suffix}" for version in (11, 12) for suffix in NGX_SUFFIXES} | {"NVSDK_NGX_D3D12_EvaluateFeature_C", "NVSDK_NGX_UpdateFeature"}
+        if required != exports or b"own-ngxd3d12\0" not in dll.read_bytes():
+            raise RuntimeError(f"NGX PE export/owned marker mismatch: missing={sorted(required - exports)}, extra={sorted(exports - required)}")
         print(f"OWNED_NGX_FRONTEND_PASS pe={dll}")
     return 0
 

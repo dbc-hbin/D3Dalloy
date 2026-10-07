@@ -7,7 +7,11 @@ struct ID3D12GraphicsCommandList;
 struct IDXGIAdapter;
 struct NVNGXHandle;
 
+#ifdef _WIN32
+#define NVNGX_API extern "C" __declspec(dllexport)
+#else
 #define NVNGX_API extern "C"
+#endif
 
 enum NVNGX_RESULT : unsigned int {
   NVNGX_RESULT_OK = 1,
