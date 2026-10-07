@@ -334,32 +334,30 @@ public:
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexture;
     cpu_storage.SRVTexture.texture = Texture;
     cpu_storage.SRVTexture.view = View;
-    if (mapped_argument_buffer_) {
-      auto &texture_view = Texture->view(View);
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      gpu_storage.SRVTexture.resource_id = texture_view.gpuResourceID;
-      // The physical view's array range counts faces; a shader cube-array
-      // coordinate indexes cubes, not individual faces.
-      // Multisampled SRVs do not have an LOD clamp: their low metadata word
-      // carries the resource's fixed sample pattern for GetSamplePosition.
-      gpu_storage.SRVTexture.metadata = TextureMetadata(
-          Texture->arrayLength(View) / (CubeView ? 6 : 1),
-          CenterSamplePattern ? std::bit_cast<float>(uint32_t(1)) : ResourceMinLODClamp);
-      // q2: sampler-feedback view range, replaced below by reserved-volume or MSAA sample tables.
-      gpu_storage.SRVTexture.padding[0] = (1ull << 63) | (uint64_t(View.array_start) << 16) |
-                                          (uint64_t(View.mip_end) << 8) | uint64_t(View.mip_start);
-      // q3: empty-view defaults and integer channel widths; see EmptyViewDefaults.
-      gpu_storage.SRVTexture.padding[1] = FormatDefaults;
-      if (Texture->reservedVolumeLayoutAddress) {
-        const auto cast_address = texture_view.reservedVolumeCastLayoutAddress;
-        gpu_storage.SRVTexture.padding[0] = (1ull << 62) | (cast_address ? cast_address : Texture->reservedVolumeLayoutAddress);
-        gpu_storage.SRVTexture.padding[1] |= (cast_address ? uint64_t(1) << 8 :
-            uint64_t(View.mip_start) | uint64_t(View.mip_end - View.mip_start) << 8) << 32;
-      }
-      if (texture_view.msaaSampleAddress) {
-        gpu_storage.SRVTexture.padding[0] = texture_view.msaaSampleAddress;
-        gpu_storage.SRVTexture.metadata |= 2u | (uint64_t(Texture->sampleCount()) << 8);
-      }
+    auto &texture_view = Texture->view(View);
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    gpu_storage.SRVTexture.resource_id = texture_view.gpuResourceID;
+    // The physical view's array range counts faces; a shader cube-array
+    // coordinate indexes cubes, not individual faces.
+    // Multisampled SRVs do not have an LOD clamp: their low metadata word
+    // carries the resource's fixed sample pattern for GetSamplePosition.
+    gpu_storage.SRVTexture.metadata = TextureMetadata(
+        Texture->arrayLength(View) / (CubeView ? 6 : 1),
+        CenterSamplePattern ? std::bit_cast<float>(uint32_t(1)) : ResourceMinLODClamp);
+    // q2: sampler-feedback view range, replaced below by reserved-volume or MSAA sample tables.
+    gpu_storage.SRVTexture.padding[0] = (1ull << 63) | (uint64_t(View.array_start) << 16) |
+                                        (uint64_t(View.mip_end) << 8) | uint64_t(View.mip_start);
+    // q3: empty-view defaults and integer channel widths; see EmptyViewDefaults.
+    gpu_storage.SRVTexture.padding[1] = FormatDefaults;
+    if (Texture->reservedVolumeLayoutAddress) {
+      const auto cast_address = texture_view.reservedVolumeCastLayoutAddress;
+      gpu_storage.SRVTexture.padding[0] = (1ull << 62) | (cast_address ? cast_address : Texture->reservedVolumeLayoutAddress);
+      gpu_storage.SRVTexture.padding[1] |= (cast_address ? uint64_t(1) << 8 :
+          uint64_t(View.mip_start) | uint64_t(View.mip_end - View.mip_start) << 8) << 32;
+    }
+    if (texture_view.msaaSampleAddress) {
+      gpu_storage.SRVTexture.padding[0] = texture_view.msaaSampleAddress;
+      gpu_storage.SRVTexture.metadata |= 2u | (uint64_t(Texture->sampleCount()) << 8);
     }
     return S_OK;
   }
@@ -371,12 +369,10 @@ public:
     cpu_storage.type = ShaderVisibleDescriptorType::ConstantBuffer;
     cpu_storage.ConstantBuffer.address = VA;
     cpu_storage.ConstantBuffer.size = SizeInBytes;
-    if (mapped_argument_buffer_) {
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      gpu_storage.ConstantBuffer.address = VA;
-      gpu_storage.ConstantBuffer.size = SizeInBytes;
-      gpu_storage.ZeroFilled[2] = gpu_storage.ZeroFilled[3] = 0;
-    }
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    gpu_storage.ConstantBuffer.address = VA;
+    gpu_storage.ConstantBuffer.size = SizeInBytes;
+    gpu_storage.ZeroFilled[2] = gpu_storage.ZeroFilled[3] = 0;
     return S_OK;
   }
 
@@ -390,27 +386,25 @@ public:
     cpu_storage.UAVTexture.view = View;
     cpu_storage.UAVTexture.first_w_slice = FirstWSlice;
     cpu_storage.UAVTexture.w_size = WSize;
-    if (mapped_argument_buffer_) {
-      auto &texture_view = Texture->view(View);
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      gpu_storage.UAVTexture.resource_id = texture_view.gpuResourceID;
-      // The D3D12 texture3D UAV's high metadata word packs its logical W range.
-      // Other textures retain their existing array-length interpretation.
-      const uint32_t length = WSize ? (uint32_t(WSize) << 16) | FirstWSlice : Texture->arrayLength(View);
-      gpu_storage.UAVTexture.metadata = TextureMetadata(length, 0);
-      gpu_storage.UAVTexture.padding[0] = 0;
-      gpu_storage.UAVTexture.padding[1] = FormatDefaults;
-      if (Texture->reservedVolumeLayoutAddress) {
-        const auto cast_address = texture_view.reservedVolumeCastLayoutAddress;
-        gpu_storage.UAVTexture.padding[0] = (1ull << 62) | (cast_address ? cast_address : Texture->reservedVolumeLayoutAddress);
-        gpu_storage.UAVTexture.padding[1] |= (cast_address ? uint64_t(1) << 8 :
-            uint64_t(View.mip_start) | uint64_t(View.mip_end - View.mip_start) << 8) << 32;
-        gpu_storage.UAVTexture.padding[1] |= uint64_t(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING & 0xfff) << 48;
-      }
-      if (texture_view.msaaSampleAddress) {
-        gpu_storage.UAVTexture.padding[0] = texture_view.msaaSampleAddress;
-        gpu_storage.UAVTexture.metadata |= 2u | (uint64_t(Texture->sampleCount()) << 8);
-      }
+    auto &texture_view = Texture->view(View);
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    gpu_storage.UAVTexture.resource_id = texture_view.gpuResourceID;
+    // The D3D12 texture3D UAV's high metadata word packs its logical W range.
+    // Other textures retain their existing array-length interpretation.
+    const uint32_t length = WSize ? (uint32_t(WSize) << 16) | FirstWSlice : Texture->arrayLength(View);
+    gpu_storage.UAVTexture.metadata = TextureMetadata(length, 0);
+    gpu_storage.UAVTexture.padding[0] = 0;
+    gpu_storage.UAVTexture.padding[1] = FormatDefaults;
+    if (Texture->reservedVolumeLayoutAddress) {
+      const auto cast_address = texture_view.reservedVolumeCastLayoutAddress;
+      gpu_storage.UAVTexture.padding[0] = (1ull << 62) | (cast_address ? cast_address : Texture->reservedVolumeLayoutAddress);
+      gpu_storage.UAVTexture.padding[1] |= (cast_address ? uint64_t(1) << 8 :
+          uint64_t(View.mip_start) | uint64_t(View.mip_end - View.mip_start) << 8) << 32;
+      gpu_storage.UAVTexture.padding[1] |= uint64_t(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING & 0xfff) << 48;
+    }
+    if (texture_view.msaaSampleAddress) {
+      gpu_storage.UAVTexture.padding[0] = texture_view.msaaSampleAddress;
+      gpu_storage.UAVTexture.metadata |= 2u | (uint64_t(Texture->sampleCount()) << 8);
     }
     return S_OK;
   }
@@ -424,18 +418,16 @@ public:
     cpu_storage.UAVTexelBuffer.buffer = UAVBuffer;
     cpu_storage.UAVTexelBuffer.slice = Slice;
     cpu_storage.UAVTexelBuffer.view = View;
-    if (mapped_argument_buffer_) { 
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      if (UAVBuffer) {
-        auto &buffer_view = UAVBuffer->view_(View);
-        gpu_storage.UAVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
-        gpu_storage.UAVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | (uint64_t)(Slice.firstElement);
-      } else {
-        gpu_storage.UAVTexelBuffer.resource_id = 0;
-        gpu_storage.UAVTexelBuffer.metadata = 0;
-      }
-      TypedResidencyStatus(UAVBuffer, View, gpu_storage.UAVTexelBuffer.padding);
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    if (UAVBuffer) {
+      auto &buffer_view = UAVBuffer->view_(View);
+      gpu_storage.UAVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
+      gpu_storage.UAVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | (uint64_t)(Slice.firstElement);
+    } else {
+      gpu_storage.UAVTexelBuffer.resource_id = 0;
+      gpu_storage.UAVTexelBuffer.metadata = 0;
     }
+    TypedResidencyStatus(UAVBuffer, View, gpu_storage.UAVTexelBuffer.padding);
     return S_OK;
   }
 
@@ -449,19 +441,17 @@ public:
     cpu_storage.UAVBuffer.slice = Slice;
     cpu_storage.UAVBuffer.counter = Counter;
     cpu_storage.UAVBuffer.counter_offset = CounterOffsetInBytes;
-    if (mapped_argument_buffer_) {
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      if (UAVBuffer) {
-        gpu_storage.UAVBuffer.pointer = UAVBuffer->current()->gpuAddress() + Slice.byteOffset;
-        gpu_storage.UAVBuffer.metadata = Slice.byteLength;
-        gpu_storage.UAVBuffer.counter_pointer = Counter ? Counter->current()->gpuAddress() + CounterOffsetInBytes : 0;
-      } else {
-        gpu_storage.UAVBuffer.pointer = 0;
-        gpu_storage.UAVBuffer.metadata = 0;
-        gpu_storage.UAVBuffer.counter_pointer = 0;
-      }
-      gpu_storage.UAVBuffer.padding = UAVBuffer ? UAVBuffer->current()->residencyStatusBase : 0;
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    if (UAVBuffer) {
+      gpu_storage.UAVBuffer.pointer = UAVBuffer->current()->gpuAddress() + Slice.byteOffset;
+      gpu_storage.UAVBuffer.metadata = Slice.byteLength;
+      gpu_storage.UAVBuffer.counter_pointer = Counter ? Counter->current()->gpuAddress() + CounterOffsetInBytes : 0;
+    } else {
+      gpu_storage.UAVBuffer.pointer = 0;
+      gpu_storage.UAVBuffer.metadata = 0;
+      gpu_storage.UAVBuffer.counter_pointer = 0;
     }
+    gpu_storage.UAVBuffer.padding = UAVBuffer ? UAVBuffer->current()->residencyStatusBase : 0;
     return S_OK;
   }
 
@@ -473,18 +463,16 @@ public:
     cpu_storage.SRVTexelBuffer.buffer = Buffer;
     cpu_storage.SRVTexelBuffer.slice = Slice;
     cpu_storage.SRVTexelBuffer.view = View;
-    if (mapped_argument_buffer_) { 
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      if (Buffer) {
-        auto &buffer_view = Buffer->view_(View);
-        gpu_storage.SRVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
-        gpu_storage.SRVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | (uint64_t)(Slice.firstElement);
-      } else {
-        gpu_storage.SRVTexelBuffer.resource_id = 0;
-        gpu_storage.SRVTexelBuffer.metadata = 0;
-      }
-      TypedResidencyStatus(Buffer, View, gpu_storage.SRVTexelBuffer.padding);
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    if (Buffer) {
+      auto &buffer_view = Buffer->view_(View);
+      gpu_storage.SRVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
+      gpu_storage.SRVTexelBuffer.metadata = ((uint64_t)Slice.elementCount << 32) | (uint64_t)(Slice.firstElement);
+    } else {
+      gpu_storage.SRVTexelBuffer.resource_id = 0;
+      gpu_storage.SRVTexelBuffer.metadata = 0;
     }
+    TypedResidencyStatus(Buffer, View, gpu_storage.SRVTexelBuffer.padding);
     return S_OK;
   }
 
@@ -496,15 +484,13 @@ public:
     cpu_storage.type = ShaderVisibleDescriptorType::SRVRGB32Buffer;
     cpu_storage.SRVRGB32Buffer.buffer = Buffer;
     cpu_storage.SRVRGB32Buffer.slice = Slice;
-    if (mapped_argument_buffer_) {
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      // The RGB32 branch never uses a native texture handle; q0 carries the residency status base of a
-      // reserved buffer (BufferAllocation::residencyStatusBase, 0 otherwise) instead.
-      gpu_storage.ZeroFilled[0] = Buffer->current()->residencyStatusBase;
-      gpu_storage.ZeroFilled[1] = uint64_t(Slice.elementCount) << 32;
-      gpu_storage.ZeroFilled[2] = Buffer->current()->gpuAddress() + Slice.byteOffset;
-      gpu_storage.ZeroFilled[3] = (uint64_t(Shader4ComponentMapping) << 32) | 1u;
-    }
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    // The RGB32 branch never uses a native texture handle; q0 carries the residency status base of a
+    // reserved buffer (BufferAllocation::residencyStatusBase, 0 otherwise) instead.
+    gpu_storage.ZeroFilled[0] = Buffer->current()->residencyStatusBase;
+    gpu_storage.ZeroFilled[1] = uint64_t(Slice.elementCount) << 32;
+    gpu_storage.ZeroFilled[2] = Buffer->current()->gpuAddress() + Slice.byteOffset;
+    gpu_storage.ZeroFilled[3] = (uint64_t(Shader4ComponentMapping) << 32) | 1u;
     return S_OK;
   }
 
@@ -515,18 +501,16 @@ public:
     cpu_storage.type = ShaderVisibleDescriptorType::SRVBuffer;
     cpu_storage.SRVBuffer.buffer = Buffer;
     cpu_storage.SRVBuffer.slice = Slice;
-    if (mapped_argument_buffer_) {
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      if (Buffer) {
-        gpu_storage.SRVBuffer.pointer = Buffer->current()->gpuAddress() + Slice.byteOffset;
-        gpu_storage.SRVBuffer.metadata = Slice.byteLength;
-      } else {
-        gpu_storage.SRVBuffer.pointer = 0;
-        gpu_storage.SRVBuffer.metadata = 0;
-      }
-      gpu_storage.SRVBuffer.counter_pointer = 0;
-      gpu_storage.SRVBuffer.padding = Buffer ? Buffer->current()->residencyStatusBase : 0;
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    if (Buffer) {
+      gpu_storage.SRVBuffer.pointer = Buffer->current()->gpuAddress() + Slice.byteOffset;
+      gpu_storage.SRVBuffer.metadata = Slice.byteLength;
+    } else {
+      gpu_storage.SRVBuffer.pointer = 0;
+      gpu_storage.SRVBuffer.metadata = 0;
     }
+    gpu_storage.SRVBuffer.counter_pointer = 0;
+    gpu_storage.SRVBuffer.padding = Buffer ? Buffer->current()->residencyStatusBase : 0;
     return S_OK;
   }
 
@@ -536,10 +520,8 @@ public:
       return E_INVALIDARG;
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::Null;
-    if (mapped_argument_buffer_) {
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      gpu_storage.ZeroFilled = {{}};
-    }
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    gpu_storage.ZeroFilled = {{}};
     return pDesc ? S_OK : E_INVALIDARG;
   }
 
@@ -560,13 +542,11 @@ public:
     cpu_storage.AccelerationStructure.address = Address;
     cpu_storage.type =
         Address ? ShaderVisibleDescriptorType::AccelerationStructure : ShaderVisibleDescriptorType::Null;
-    if (mapped_argument_buffer_) {
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      gpu_storage.SRVBuffer.pointer = Address;
-      gpu_storage.SRVBuffer.metadata = 0;
-      gpu_storage.SRVBuffer.counter_pointer = 0;
-      gpu_storage.SRVBuffer.padding = 0;
-    }
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    gpu_storage.SRVBuffer.pointer = Address;
+    gpu_storage.SRVBuffer.metadata = 0;
+    gpu_storage.SRVBuffer.counter_pointer = 0;
+    gpu_storage.SRVBuffer.padding = 0;
     return S_OK;
   }
 
@@ -578,13 +558,11 @@ public:
     cpu_storage.type = ShaderVisibleDescriptorType::SamplerFeedback;
     cpu_storage.SamplerFeedback.buffer = Cells;
     cpu_storage.SamplerFeedback.slice = {0, CellBytes, 0, uint32_t(CellBytes / 4)};
-    if (mapped_argument_buffer_) {
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      gpu_storage.UAVBuffer.pointer = Paired ? Cells->current()->gpuAddress() : 0;
-      gpu_storage.UAVBuffer.metadata = LayoutWord;
-      gpu_storage.UAVBuffer.counter_pointer = 0;
-      gpu_storage.UAVBuffer.padding = 0;
-    }
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    gpu_storage.UAVBuffer.pointer = Paired ? Cells->current()->gpuAddress() : 0;
+    gpu_storage.UAVBuffer.metadata = LayoutWord;
+    gpu_storage.UAVBuffer.counter_pointer = 0;
+    gpu_storage.UAVBuffer.padding = 0;
     return S_OK;
   }
 
@@ -594,10 +572,8 @@ public:
       return E_INVALIDARG;
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::Null;
-    if (mapped_argument_buffer_) {
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      gpu_storage.ZeroFilled = {{}};
-    }
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    gpu_storage.ZeroFilled = {{}};
     return pDesc ? S_OK : E_INVALIDARG;
   }
 
@@ -865,19 +841,17 @@ public:
       return E_OUTOFMEMORY;
 
     samplers_[Index] = sampler;
-    if (mapped_argument_buffer_) {
-      auto &gpu_storage = mapped_argument_buffer_[Index];
-      gpu_storage.sampler = sampler->sampler_state_handle;
-      gpu_storage.cube_sampler = sampler->sampler_state_cube_handle;
-      gpu_storage.metadata = sampler_feedback::SamplerMetadata(
-          sampler->lod_bias,
-          sampler_feedback::SamplerFlags(pDesc->Filter, pDesc->AddressU, pDesc->AddressV, pDesc->MaxAnisotropy,
-                                         non_normalized, pDesc->AddressW, UintBorderColor != nullptr, pDesc->ComparisonFunc));
-      gpu_storage.padding = sampler_feedback::SamplerLodRange(pDesc->MinLOD, pDesc->MaxLOD);
-      for (unsigned channel = 0; channel < 4; ++channel)
-        gpu_storage.uint_border[channel] = UintBorderColor ? UintBorderColor[channel] : 0;
-      std::copy_n(pDesc->BorderColor, 4, gpu_storage.float_border);
-    }
+    auto &gpu_storage = mapped_argument_buffer_[Index];
+    gpu_storage.sampler = sampler->sampler_state_handle;
+    gpu_storage.cube_sampler = sampler->sampler_state_cube_handle;
+    gpu_storage.metadata = sampler_feedback::SamplerMetadata(
+        sampler->lod_bias,
+        sampler_feedback::SamplerFlags(pDesc->Filter, pDesc->AddressU, pDesc->AddressV, pDesc->MaxAnisotropy,
+                                       non_normalized, pDesc->AddressW, UintBorderColor != nullptr, pDesc->ComparisonFunc));
+    gpu_storage.padding = sampler_feedback::SamplerLodRange(pDesc->MinLOD, pDesc->MaxLOD);
+    for (unsigned channel = 0; channel < 4; ++channel)
+      gpu_storage.uint_border[channel] = UintBorderColor ? UintBorderColor[channel] : 0;
+    std::copy_n(pDesc->BorderColor, 4, gpu_storage.float_border);
 
     return S_OK;
   }
