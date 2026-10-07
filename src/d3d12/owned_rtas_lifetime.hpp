@@ -261,26 +261,6 @@ public:
       fn(entry.first);
   }
 
-  size_t
-  VersionCount(const Key &key) const {
-    auto found = slots_.find(key);
-    return found == slots_.end() ? 0 : found->second.versions.size();
-  }
-
-  /** Number of versions of every address that are still resident (not yet released). */
-  size_t
-  ResidentCount() const {
-    size_t count = 0;
-    for (const auto &entry : slots_)
-      count += entry.second.versions.size();
-    return count;
-  }
-
-  size_t
-  ActiveSubmissionCount() const {
-    return active_.size();
-  }
-
 private:
   /**
    * Lowest id of any submission still in flight, or the highest possible id when none is. A

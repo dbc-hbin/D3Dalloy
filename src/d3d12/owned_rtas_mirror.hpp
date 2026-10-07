@@ -85,9 +85,6 @@ public:
    */
   void Free(uint32_t slot) { free_slots_.push_back(slot); }
 
-  /** Slots currently handed out. */
-  uint64_t AllocatedCount() const { return next_slot_ - free_slots_.size(); }
-
   /**
    * Token the GPU last published for a slot; 0 until a build executes.
    *
@@ -106,8 +103,6 @@ public:
   Slot *Pointer(uint32_t slot) const {
     return &base(slot)[slot % kSlotsPerPage];
   }
-
-  uint64_t PageCount() const { return pages_.size(); }
 
 private:
   Slot *base(uint32_t slot) const { return pages_[slot / kSlotsPerPage]; }
