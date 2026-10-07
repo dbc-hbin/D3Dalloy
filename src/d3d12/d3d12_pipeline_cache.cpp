@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <unordered_map>
+#include <chrono>
 
 namespace dxmt {
 
@@ -44,6 +45,9 @@ struct AutomaticCache {
     uint64_t last_use;
   };
   std::mutex mutex;
+  // Disk transactions take disk_mutex before mutex, and release mutex before I/O.
+  // No metadata owner may wait for disk_mutex.
+  std::mutex disk_mutex;
   bool enabled = true;
   uint64_t generation = 0, clock = 0;
   size_t bytes = 0;
@@ -70,6 +74,41 @@ struct AutomaticCache {
 AutomaticCache &Automatic() {
   static AutomaticCache cache; // Module-local, no device or native PSO ownership.
   return cache;
+}
+
+struct AutomaticCachePhase {
+  const char *phase;
+  bool trace = owned_graphics::TraceEnabled();
+  std::chrono::steady_clock::time_point start = trace ? std::chrono::steady_clock::now() :
+                                                       std::chrono::steady_clock::time_point{};
+  explicit AutomaticCachePhase(const char *name) : phase(name) {
+    try {
+      if (trace)
+        owned_graphics::Trace("pipeline_cache_auto_phase", ",\"phase\":\"", phase, "\"");
+    } catch (...) {
+      // Timing is optional, including at noexcept completion.
+    }
+  }
+  ~AutomaticCachePhase() {
+    try {
+      if (trace)
+        owned_graphics::Trace("pipeline_cache_auto_timing", ",\"phase\":\"", phase, "\",\"ns\":",
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    } catch (...) {
+      // Timing cannot fail cache completion/destruction.
+    }
+  }
+};
+
+std::unique_lock<std::mutex> LockMetadata(AutomaticCache &cache) {
+  AutomaticCachePhase phase{"metadata_wait"};
+  return std::unique_lock(cache.mutex);
+}
+
+bool OwnsFlight(const AutomaticCache &cache, const std::shared_ptr<AutomaticPipelineCacheFlight> &flight) {
+  auto it = cache.flights.find(flight->key);
+  return cache.enabled && cache.generation == flight->generation &&
+         it != cache.flights.end() && it->second == flight;
 }
 
 struct StageRecord {
@@ -332,7 +371,7 @@ void PipelineCache::Complete(HRESULT result) noexcept {
     return;
   auto &cache = Automatic();
   {
-    std::lock_guard lock(cache.mutex);
+    auto lock = LockMetadata(cache);
     if (flight->done)
       return;
   }
@@ -359,20 +398,18 @@ void PipelineCache::Complete(HRESULT result) noexcept {
       // Cache allocation is optional; joined requests must still terminate.
     }
   }
-  std::lock_guard lock(cache.mutex);
+  auto lock = LockMetadata(cache);
   if (flight->done)
     return;
   // Controls invalidate cache membership, not valid in-progress PSO creations.
   // Old-generation waiters still consume their producer's actual result/bytes.
   if (SUCCEEDED(result))
     flight->blob = blob_;
-  const bool current = cache.enabled && cache.generation == flight->generation;
+  const bool current = OwnsFlight(cache, flight);
   if (current) {
     if (SUCCEEDED(result) && blob_) {
       try {
         cache.Retain(flight->key, blob_);
-        if (!flight->disk_hit && blob_->bytes->GetBufferSize() <= kAutomaticBytes)
-          WriteAutomaticPipelineCache(flight->key, blob_->bytes.ptr());
       } catch (...) {
         // Retention/disk failure does not change the native PSO result.
       }
@@ -381,6 +418,7 @@ void PipelineCache::Complete(HRESULT result) noexcept {
   }
   flight->result = result;
   flight->done = true;
+  lock.unlock();
   flight->ready.notify_all();
   try {
     if (owned_graphics::TraceEnabled())
@@ -392,11 +430,27 @@ void PipelineCache::Complete(HRESULT result) noexcept {
   } catch (...) {
     // Tracing must not escape completion/destruction.
   }
+  if (current && SUCCEEDED(result) && blob_ && !flight->disk_hit &&
+      blob_->bytes->GetBufferSize() <= kAutomaticBytes) {
+    try {
+      AutomaticCachePhase phase{"disk_write"};
+      std::lock_guard disk_lock(cache.disk_mutex);
+      auto metadata = LockMetadata(cache);
+      const auto it = cache.entries.find(flight->key);
+      const bool persist = cache.enabled && cache.generation == flight->generation &&
+                           it != cache.entries.end() && it->second.blob == blob_;
+      metadata.unlock();
+      if (persist)
+        WriteAutomaticPipelineCache(flight->key, blob_->bytes.ptr());
+    } catch (...) {
+      // Optional synchronous persistence cannot fail the published flight.
+    }
+  }
 }
 
 void PipelineCache::RetryAutomatic(PipelineCache &fresh) {
   auto &cache = Automatic();
-  std::lock_guard lock(cache.mutex);
+  auto lock = LockMetadata(cache);
   fresh.retry_ = true;
   if (flight_) {
     fresh.flight_ = std::move(flight_);
@@ -409,13 +463,24 @@ void PipelineCache::RetryAutomatic(PipelineCache &fresh) {
   }
   // A racing retry may already have installed a different, good result. Never
   // delete its disk entry or flight on behalf of this old restored owner.
+  const auto owner = fresh.flight_;
+  lock.unlock();
+  AutomaticCachePhase phase{"disk_remove"};
+  std::lock_guard disk_lock(cache.disk_mutex);
+  lock = LockMetadata(cache);
   auto it = cache.entries.find(automatic_key_);
-  if (it == cache.entries.end() || it->second.blob == blob_) {
+  const auto producer = cache.flights.find(automatic_key_);
+  if (cache.enabled && cache.generation == automatic_generation_ &&
+      (producer == cache.flights.end() || producer->second == owner) &&
+      (it == cache.entries.end() || it->second.blob == blob_)) {
     if (it != cache.entries.end()) {
       cache.bytes -= it->second.blob->bytes->GetBufferSize();
       cache.entries.erase(it);
     }
+    lock.unlock();
     RemoveAutomaticPipelineCache(automatic_key_);
+  } else {
+    lock.unlock();
   }
   if (owned_graphics::TraceEnabled())
     owned_graphics::Trace("pipeline_cache_auto_retry", ",\"key\":\"", automatic_key_.string(), "\"");
@@ -429,7 +494,9 @@ HRESULT AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAGS control) 
   if (!flags || (flags & ~(disable | enable | clear)) || ((flags & disable) && (flags & enable)))
     return E_INVALIDARG;
   auto &cache = Automatic();
-  std::lock_guard lock(cache.mutex);
+  AutomaticCachePhase phase{"disk_control"};
+  std::lock_guard disk_lock(cache.disk_mutex);
+  auto lock = LockMetadata(cache);
   if (flags & (disable | clear)) {
     ++cache.generation;
     // Owners/waiters retain old flights until actual completion. New requests
@@ -444,9 +511,11 @@ HRESULT AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAGS control) 
     cache.enabled = false;
   if (flags & enable)
     cache.enabled = true;
+  const auto generation = cache.generation;
+  lock.unlock();
   const HRESULT hr = (flags & clear) ? ClearAutomaticPipelineCacheDisk() : S_OK;
   owned_graphics::Trace("pipeline_cache_auto_control", ",\"flags\":", flags,
-                        ",\"generation\":", cache.generation, ",\"hr\":", uint32_t(hr));
+                        ",\"generation\":", generation, ",\"hr\":", uint32_t(hr));
   return hr;
 }
 
@@ -468,7 +537,7 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
     const auto automatic_key = hash.final();
     auto &cache = Automatic();
     try {
-      std::unique_lock lock(cache.mutex);
+      auto lock = LockMetadata(cache);
       automatic_key_ = automatic_key;
       automatic_generation_ = cache.generation;
       if (cache.enabled) {
@@ -498,28 +567,42 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
         flight->generation = cache.generation;
         cache.flights.emplace(automatic_key, flight);
         flight_ = std::move(flight);
-        // ponytail: serialize disk I/O with metadata/clear for epochs; split disk locks if I/O contention matters.
-        // Native compilation and PSO creation are always outside this lock.
+        lock.unlock();
         Com<ID3DBlob> disk;
-        const HRESULT disk_hr = ReadAutomaticPipelineCache(automatic_key, &disk);
-        if (disk_hr == E_FAIL) {
-          // Read rejected a malformed zero/oversized file before blob validation.
-          RemoveAutomaticPipelineCache(automatic_key);
-          owned_graphics::Trace("pipeline_cache_auto_invalid", ",\"hr\":", uint32_t(disk_hr));
+        HRESULT disk_hr = DXGI_ERROR_NOT_FOUND;
+        {
+          AutomaticCachePhase phase{"disk_read"};
+          std::lock_guard disk_lock(cache.disk_mutex);
+          lock = LockMetadata(cache);
+          const bool read = OwnsFlight(cache, flight_);
+          lock.unlock();
+          if (read)
+            disk_hr = ReadAutomaticPipelineCache(automatic_key, &disk);
         }
+        HRESULT invalid = disk_hr;
         if (SUCCEEDED(disk_hr) && disk) {
           D3D12_CACHED_PIPELINE_STATE input{disk->GetBufferPointer(), disk->GetBufferSize()};
-          const HRESULT hr = LoadBlob(input, disk.ptr());
+          const HRESULT hr = invalid = LoadBlob(input, disk.ptr());
           if (SUCCEEDED(hr)) {
             automatic_loaded_ = true;
+            lock = LockMetadata(cache);
             flight_->disk_hit = true;
+            lock.unlock();
             if (owned_graphics::TraceEnabled())
               owned_graphics::Trace("pipeline_cache_auto_hit", ",\"key\":\"", automatic_key.string(),
                                     "\",\"source\":\"disk\",\"stages\":", stages);
             return S_OK;
           }
-          RemoveAutomaticPipelineCache(automatic_key);
-          owned_graphics::Trace("pipeline_cache_auto_invalid", ",\"hr\":", uint32_t(hr));
+        }
+        if (disk_hr == E_FAIL || (SUCCEEDED(disk_hr) && disk)) {
+          AutomaticCachePhase phase{"disk_remove"};
+          std::lock_guard disk_lock(cache.disk_mutex);
+          lock = LockMetadata(cache);
+          const bool remove = OwnsFlight(cache, flight_) && !cache.entries.count(automatic_key);
+          lock.unlock();
+          if (remove)
+            RemoveAutomaticPipelineCache(automatic_key);
+          owned_graphics::Trace("pipeline_cache_auto_invalid", ",\"hr\":", uint32_t(invalid));
         }
         if (owned_graphics::TraceEnabled())
           owned_graphics::Trace("pipeline_cache_auto_begin", ",\"key\":\"", automatic_key.string(),
