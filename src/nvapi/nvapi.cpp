@@ -2,6 +2,7 @@
 #include "../d3d12/d3d12_reflex_interfaces.hpp"
 #include "../dxgi/dxgi_interfaces.h"
 #include "com/com_pointer.hpp"
+#include "config/config.hpp"
 #include "log/log.hpp"
 #include "nvapi_lite_common.h"
 #include "util_string.hpp"
@@ -9,6 +10,7 @@
 #include "wsi_monitor.hpp"
 #include <string>
 #include <algorithm>
+#include <cstdio>
 #define __NVAPI_EMPTY_SAL
 #include "nvapi.h"
 #include "nvapi_interface.h"
@@ -45,7 +47,7 @@ NvAPI_SYS_GetDriverAndBranchVersion(NvU32 *pDriverVersion,
   if (!pDriverVersion || !szBuildBranchString)
     return NVAPI_INVALID_ARGUMENT;
 
-  memcpy(szBuildBranchString, build_str.c_str(), build_str.size());
+  std::snprintf(szBuildBranchString, NVAPI_SHORT_STRING_MAX, "%s", build_str.c_str());
   *pDriverVersion = 99999;
 
   return NVAPI_OK;
@@ -54,7 +56,7 @@ NvAPI_SYS_GetDriverAndBranchVersion(NvU32 *pDriverVersion,
 NVAPI_INTERFACE
 NvAPI_GetDisplayDriverVersion(NvDisplayHandle hNvDisplay, NV_DISPLAY_DRIVER_VERSION *pVersion) {
   std::string build_str = std::format("r{}_000", NVAPI_SDK_VERSION);
-  std::string adapter_str = "NVIDIA GeForce RTX";
+  const auto adapter_str = Config::getInstance().getOption<std::string>("dxgi.customDeviceDesc", "NVIDIA GeForce RTX");
 
   if (!pVersion)
     return NVAPI_INVALID_ARGUMENT;
@@ -64,8 +66,8 @@ NvAPI_GetDisplayDriverVersion(NvDisplayHandle hNvDisplay, NV_DISPLAY_DRIVER_VERS
 
   pVersion->drvVersion = 99999;
   pVersion->bldChangeListNum = 0;
-  memcpy(pVersion->szBuildBranchString, build_str.c_str(), build_str.size());
-  memcpy(pVersion->szAdapterString, adapter_str.c_str(), adapter_str.size());
+  std::snprintf(pVersion->szBuildBranchString, NVAPI_SHORT_STRING_MAX, "%s", build_str.c_str());
+  std::snprintf(pVersion->szAdapterString, NVAPI_SHORT_STRING_MAX, "%s", adapter_str.c_str());
 
   return NVAPI_OK;
 }
@@ -77,7 +79,7 @@ NvAPI_GetInterfaceVersionString(NvAPI_ShortString szDesc) {
   if (!szDesc)
     return NVAPI_INVALID_ARGUMENT;
 
-  memcpy(szDesc, version_str.c_str(), version_str.size());
+  std::snprintf(szDesc, NVAPI_SHORT_STRING_MAX, "%s", version_str.c_str());
 
   return NVAPI_OK;
 }
@@ -617,18 +619,24 @@ NvAPI_GPU_GetArchInfo(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_ARCH_INFO *pGpuAr
   if (!hPhysicalGpu || !pGpuArchInfo)
     return NVAPI_INVALID_ARGUMENT;
 
-  // NVIDIA GeForce RTX 4090
+  const auto &config = Config::getInstance();
+  const bool rtx5060 = Config::toLower(config.getOption<std::string>("dxgi.customVendorId")) == "10de" &&
+                       Config::toLower(config.getOption<std::string>("dxgi.customDeviceId")) == "2d05";
+  const auto architecture = rtx5060 ? NV_GPU_ARCHITECTURE_GB200 : NV_GPU_ARCHITECTURE_AD100;
+  // NVIDIA open-gpu-kernel-modules nv_arch.h: GPU_IMPLEMENTATION_GB206 = 0x06.
+  const auto implementation = rtx5060 ? static_cast<NV_GPU_ARCH_IMPLEMENTATION_ID>(0x06)
+                                      : NV_GPU_ARCH_IMPLEMENTATION_AD102;
   switch (pGpuArchInfo->version) {
     case NV_GPU_ARCH_INFO_VER_1: {
       auto pGpuArchInfoV1 = (NV_GPU_ARCH_INFO_V1 *)(pGpuArchInfo);
-      pGpuArchInfoV1->architecture = NV_GPU_ARCHITECTURE_AD100;
-      pGpuArchInfoV1->implementation = NV_GPU_ARCH_IMPLEMENTATION_AD102;
+      pGpuArchInfoV1->architecture = architecture;
+      pGpuArchInfoV1->implementation = implementation;
       pGpuArchInfoV1->revision = NV_GPU_CHIP_REV_UNKNOWN;
       break;
     }
     case NV_GPU_ARCH_INFO_VER_2:
-      pGpuArchInfo->architecture_id = NV_GPU_ARCHITECTURE_AD100;
-      pGpuArchInfo->implementation_id = NV_GPU_ARCH_IMPLEMENTATION_AD102;
+      pGpuArchInfo->architecture_id = architecture;
+      pGpuArchInfo->implementation_id = implementation;
       pGpuArchInfo->revision_id = NV_GPU_CHIP_REV_UNKNOWN;
       break;
     default:
@@ -680,12 +688,11 @@ NvAPI_GPU_GetMemoryInfoEx(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_MEMORY_INFO_E
 
 NVAPI_INTERFACE
 NvAPI_GPU_GetFullName(NvPhysicalGpuHandle hPhysicalGpu, NvAPI_ShortString szName) {
-  std::string adapter_str = "NVIDIA GeForce RTX 4090";
-
-  if (!szName)
+  if (!hPhysicalGpu || !szName)
     return NVAPI_INVALID_ARGUMENT;
 
-  memcpy(szName, adapter_str.c_str(), adapter_str.size());
+  const auto adapter_str = Config::getInstance().getOption<std::string>("dxgi.customDeviceDesc", "NVIDIA GeForce RTX 4090");
+  std::snprintf(szName, NVAPI_SHORT_STRING_MAX, "%s", adapter_str.c_str());
 
   return NVAPI_OK;
 }

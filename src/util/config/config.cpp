@@ -46,22 +46,20 @@ namespace dxmt {
       { "dxgi.customVendorId",     "1002" },
       { "dxgi.customDeviceId",     "7340" },
     }} },
-    /* Zenless Zone Zero: it drives the owned D3D12/NGX translator, and an
-     * explicitly enabled NVEXT backend expects the NVIDIA compatibility
-     * identity. Without that opt-in the game keeps the historical AMD identity,
-     * and Genshin/YuanShen are unaffected. This selects the backend identity,
-     * it does not claim a specific physical GPU. */
+    /* Use the PR Wine compatibility identities: RX 9070 for ZZZ, or RTX 5060
+     * for the explicitly selected NGX/NVAPI path. Renderer capabilities and
+     * the Genshin/YuanShen profiles are independent of these PCI identities. */
     { R"(\\ZenlessZoneZero\.exe$)",
       env::getEnvVar("DXMT_ENABLE_NVEXT") == "1"
         ? Config{{
-            { "dxgi.customDeviceDesc",   "DXMT Metal NGX" },
+            { "dxgi.customDeviceDesc",   "NVIDIA GeForce RTX 5060" },
             { "dxgi.customVendorId",     "10de" },
-            { "dxgi.customDeviceId",     "2684" },
+            { "dxgi.customDeviceId",     "2d05" },
           }}
         : Config{{
-            { "dxgi.customDeviceDesc",   "AMD Radeon Pro 5300M" },
+            { "dxgi.customDeviceDesc",   "AMD Radeon RX 9070" },
             { "dxgi.customVendorId",     "1002" },
-            { "dxgi.customDeviceId",     "7340" },
+            { "dxgi.customDeviceId",     "7550" },
           }} },
     { R"(\\SONIC_X_SHADOW_GENERATIONS\.exe$)", {{
       { "d3d11.ignoreMapFlagNoWait",   "True" },
