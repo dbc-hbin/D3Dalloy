@@ -9,7 +9,7 @@ inline void PresentMetal4Drawable(WMT::MetalDrawable drawable, double duration,
                                  const WMTCompositionFrame *composition, uint32_t sync_interval, bool allow_tearing) {
   uint64_t bits;
   std::memcpy(&bits, &duration, sizeof(bits));
-  WMT::Metal4Invoke(WMTMetal4FXPresentDrawable, drawable.handle, bits, uintptr_t(composition), sync_interval,
+  WMT::Metal4Invoke(WMTMetal4FXPresentDrawable, drawable.handle, bits, WMT::Metal4CPUPointer(composition), sync_interval,
                     allow_tearing ? 1u : 0u);
 }
 class TemporalFrame : public WMT::Object {
@@ -34,7 +34,7 @@ public:
       const WMTMetal4FXTemporalInfo &info, int32_t &result) {
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4FXCreateTemporal;
-    call.args[0] = device.handle; call.args[1] = compiler.handle; call.args[2] = uintptr_t(&info);
+    call.args[0] = device.handle; call.args[1] = compiler.handle; call.args[2] = WMT::Metal4CPUPointer(&info);
     const auto status = WMTMetal4Call(&call);
     result = status ? int32_t(0x887a0020) : int32_t(call.ret[1]);
     return WMT::Reference<TemporalFeature>(call.ret[0]);
@@ -43,7 +43,7 @@ public:
                                       uint64_t &generation) const {
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4FXPrepareTemporal;
-    call.args[0] = handle; call.args[1] = uintptr_t(&info);
+    call.args[0] = handle; call.args[1] = WMT::Metal4CPUPointer(&info);
     const auto status = WMTMetal4Call(&call);
     result = status ? int32_t(0x887a0020) : int32_t(call.ret[1]);
     generation = call.ret[2];

@@ -5,6 +5,11 @@
 
 namespace WMT {
 
+/* CPU addresses alone use the guest window; object handles and GPU addresses do not. */
+inline uint64_t Metal4CPUPointer(const void *pointer) {
+  return pointer ? WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(pointer)) : 0;
+}
+
 /* Typed operations never pass a classic command buffer or encoder handle. */
 template <typename... Args>
 inline struct WMTMetal4Call Metal4Invoke(uint32_t operation, Args... args) {

@@ -18,7 +18,8 @@ STAGE_SPEC = importlib.util.spec_from_file_location("owned_runtime_stage", Path(
 assert STAGE_SPEC and STAGE_SPEC.loader
 stage = importlib.util.module_from_spec(STAGE_SPEC)
 STAGE_SPEC.loader.exec_module(stage)
-FEX_PROBES = {"thread-termination": "thread_termination", "pcmp": "pcmp_checks", "disk-cache": "cache_checks"}
+FEX_PROBES = {"thread-termination": "thread_termination", "pcmp": "pcmp_checks", "disk-cache": "cache_checks",
+              "metal4fx-pointer": "metal4fx_pointers"}
 
 
 def fex_probe_evidence(text: str, key: str) -> dict:
@@ -63,13 +64,13 @@ def main() -> int:
     if args.suite == "smoke":
         args.gpu = True
     if args.suite in FEX_PROBES and (args.guest_arch not in ("x64", "x86") or args.gpu):
-        parser.error("FEX probes require x64 or x86 without GPU work")
+        parser.error("FEX probes require x64 or x86 without the GPU-readback option")
     if args.disk_cache and args.suite not in ("pcmp", "disk-cache"):
         parser.error("disk-cache mode requires the pcmp or disk-cache suite")
     executable = {"abi": "abi-guest.exe", "shared-data": "fex_shared_data_probe.exe", "smoke": "owned-d3d12-smoke.exe",
                   "native-jit": "native_jit_probe.exe", "wow64-window": "wow64_guest_window.exe",
                   "thread-termination": "fex_thread_termination.exe", "pcmp": "fex_pcmp_probe.exe",
-                  "disk-cache": "fex_disk_cache_lookup.exe"}[args.suite]
+                  "disk-cache": "fex_disk_cache_lookup.exe", "metal4fx-pointer": "metal4fx-pointer.exe"}[args.suite]
     fixture_modules = (executable, "abi-callee.dll") if args.suite == "abi" else (executable,)
     for name in fixture_modules:
         expected_abi = args.guest_arch if name == executable else ("arm64ec" if args.guest_arch == "x64" else args.guest_arch)
@@ -260,7 +261,7 @@ def main() -> int:
                 {Path(row["path"]).parts[0] for row in result["runs"][0]["cache_files"]}.issubset(
                 {Path(row["path"]).parts[0] for row in result["runs"][1]["cache_files"]}))
             probe_passed &= (result["cache_bounds_verified"] and result["stale_cache_pruned"] and result["current_cache_preserved"])
-        required_native = {"wine", "ntdll.so"} | ({"winemetal.so"} if args.suite in ("abi", "smoke") else set())
+        required_native = {"wine", "ntdll.so"} | ({"winemetal.so"} if args.suite in ("abi", "smoke", "metal4fx-pointer") else set())
         # Wine may start a new host process for any guest ABI. Require its
         # complete observed native closure, not WineMetal in the initial loader.
         guest_hosts = {row["pid"] for row in native if Path(row["path"]).name == "winemetal.so"}
@@ -268,9 +269,9 @@ def main() -> int:
         native_guest_closure = (any(required_native.issubset({Path(row["path"]).name for row in native
                                     if row["pid"] == pid and Path(row["path"]).name in required_native and
                                     row.get("sha256") == stage.sha256(runtime / "lib/wine/aarch64-unix" / Path(row["path"]).name)})
-                                    for pid in guest_hosts) if args.suite in ("abi", "smoke")
+                                    for pid in guest_hosts) if args.suite in ("abi", "smoke", "metal4fx-pointer")
                                 else required_native.issubset(names))
-        required_pe = set(fixture_modules) | ({"winemetal.dll"} if args.suite in ("abi", "smoke") else set())
+        required_pe = set(fixture_modules) | ({"winemetal.dll"} if args.suite in ("abi", "smoke", "metal4fx-pointer") else set())
         if args.suite == "smoke":
             required_pe |= {"d3d12.dll", "d3d12core.dll", "dxgi.dll"}
         if args.guest_arch == "x64":
@@ -288,6 +289,7 @@ def main() -> int:
             if not any(Path(row["path"]).name == name and row.get("sha256") ==
                        stage.sha256(runtime / "lib/wine/aarch64-unix" / name) for row in native)]
         if (process.returncode != 0 or not probe_passed or result["validation_errors"] or
+                (args.suite == "metal4fx-pointer" and "Metal API Validation Enabled" not in text) or
                 (args.guest_arch == "x86" and args.gpu and args.suite == "abi" and
                  (not result["memory_codec"] or result["memory_codec"]["memory_codec"] != "PASS")) or
                 result["pe_identity_failures"] or result["native_identity_failures"] or
