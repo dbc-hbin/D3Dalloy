@@ -1709,6 +1709,7 @@ private:
     for (const auto &library : libraries_)
       libraries.push_back({library.bytecode.data(), library.bytecode.size()});
     std::vector<std::string> names(exports_.size()), symbols(exports_.size());
+    std::vector<Com<ID3DBlob>> validation_roots(exports_.size());
     std::vector<SM50_WG_EXPORT> functions;
     for (size_t i = 0; i < exports_.size(); ++i) {
       const auto &entry = exports_[i];
@@ -1722,6 +1723,36 @@ private:
         function.GlobalRootSignatureSize = entry.global_root_signature->GetBlob(&function.GlobalRootSignature);
       if (entry.local_root_signature)
         function.LocalRootSignatureSize = entry.local_root_signature->GetBlob(&function.LocalRootSignature);
+      // Collections can associate a different global root with each export. Validate
+      // that export against its own global parameters and global/local sampler union.
+      std::vector<D3D12_STATIC_SAMPLER_DESC> static_samplers;
+      UINT appended = 0;
+      HRESULT hr = AppendRootStaticSamplers(entry.global_root_signature, static_samplers, &appended);
+      if (FAILED(hr))
+        return hr;
+      hr = AppendRootStaticSamplers(entry.local_root_signature, static_samplers, &appended);
+      if (FAILED(hr))
+        return hr;
+      if (appended) {
+        RootSignatureDeserializer deserializer;
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+        root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        if (entry.global_root_signature) {
+          const void *raw = nullptr;
+          UINT raw_size = 0;
+          if (FAILED(microsoft::DXBCGetRootSignature(function.GlobalRootSignature, &raw, &raw_size)) ||
+              FAILED(deserializer.Deserialize(raw, raw_size)))
+            return E_INVALIDARG;
+          root_desc.Desc_1_1 = deserializer.desc_1_1_.Desc_1_1;
+        }
+        root_desc.Desc_1_1.NumStaticSamplers = static_cast<UINT>(static_samplers.size());
+        root_desc.Desc_1_1.pStaticSamplers = static_samplers.data();
+        hr = D3D12SerializeVersionedRootSignature(&root_desc, &validation_roots[i], nullptr);
+        if (FAILED(hr))
+          return hr;
+        function.GlobalRootSignature = validation_roots[i]->GetBufferPointer();
+        function.GlobalRootSignatureSize = validation_roots[i]->GetBufferSize();
+      }
       functions.push_back(function);
     }
     for (const auto &function : functions) {

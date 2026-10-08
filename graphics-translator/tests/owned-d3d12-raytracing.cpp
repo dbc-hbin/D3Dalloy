@@ -1475,10 +1475,211 @@ int testRaytracing(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8
 
 namespace {
 
+int testCollectionStaticSamplers(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8_t> &dxil) {
+  const char *name = "collection-local-static-sampler";
+  ComPtr<ID3D12Device> device;
+  check(device5->QueryInterface(IID_PPV_ARGS(&device)), "collection sampler: device");
+  D3D12_DESCRIPTOR_RANGE1 range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
+                               D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE, 0};
+  D3D12_ROOT_PARAMETER1 params[2]{};
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[0].DescriptorTable = {1, &range};
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  params[1].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
+  D3D12_ROOT_SIGNATURE_DESC1 globalDesc{};
+  globalDesc.NumParameters = 2;
+  globalDesc.pParameters = params;
+  auto globalRoot = createRootSignature(device.Get(), globalDesc, "collection sampler: global root");
+  D3D12_STATIC_SAMPLER_DESC sampler{};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.MaxAnisotropy = 1;
+  sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+  sampler.MaxLOD = D3D12_FLOAT32_MAX;
+  D3D12_ROOT_SIGNATURE_DESC1 localDesc{};
+  localDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE;
+  localDesc.NumStaticSamplers = 1;
+  localDesc.pStaticSamplers = &sampler;
+  auto localRoot = createRootSignature(device.Get(), localDesc, "collection sampler: local root");
+  localDesc.NumStaticSamplers = 0;
+  auto emptyLocal = createRootSignature(device.Get(), localDesc, "collection sampler: missing sampler root");
+  sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  globalDesc.NumStaticSamplers = 1;
+  globalDesc.pStaticSamplers = &sampler;
+  auto conflictRoot = createRootSignature(device.Get(), globalDesc, "collection sampler: conflicting root");
+  globalDesc.NumStaticSamplers = 0;
+  range.BaseShaderRegister = 1;
+  auto missingSrvRoot = createRootSignature(device.Get(), globalDesc, "collection sampler: missing SRV root");
+  range.BaseShaderRegister = 0;
+  globalDesc.NumParameters = 1;
+  auto missingUavRoot = createRootSignature(device.Get(), globalDesc, "collection sampler: missing UAV root");
+
+  D3D12_EXPORT_DESC exportDesc{L"CollectionSamplerRayGen", nullptr, D3D12_EXPORT_FLAG_NONE};
+  D3D12_DXIL_LIBRARY_DESC library{{dxil.data(), dxil.size()}, 1, &exportDesc};
+  D3D12_RAYTRACING_SHADER_CONFIG shaderConfig{4, 8};
+  D3D12_RAYTRACING_PIPELINE_CONFIG pipelineConfig{1};
+  ID3D12RootSignature *global = globalRoot.Get(), *local = localRoot.Get();
+  D3D12_STATE_SUBOBJECT subobjects[] = {
+      {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &library},
+      {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &global},
+      {D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &local},
+      {D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &shaderConfig},
+      {D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pipelineConfig},
+  };
+  D3D12_STATE_OBJECT_DESC desc{D3D12_STATE_OBJECT_TYPE_COLLECTION, UINT(std::size(subobjects)), subobjects};
+  ComPtr<ID3D12StateObject> collection;
+  const HRESULT collectionHr = device5->CreateStateObject(&desc, IID_PPV_ARGS(&collection));
+  int bad = stateobj::mismatch(name, "local_only_collection_hr", uint32_t(collectionHr), uint32_t(S_OK));
+  std::printf("OWNED_D3D12_RAYTRACING_COLLECTION_SAMPLER field=local_only_collection_hr hr=0x%08x expected=0x%08x\n",
+              uint32_t(collectionHr), uint32_t(S_OK));
+  struct Negative {
+    const char *field;
+    ID3D12RootSignature *global;
+    ID3D12RootSignature *local;
+  };
+  const Negative negatives[] = {
+      {"missing_sampler_hr", globalRoot.Get(), emptyLocal.Get()},
+      {"conflicting_sampler_hr", conflictRoot.Get(), localRoot.Get()},
+      {"missing_srv_hr", missingSrvRoot.Get(), localRoot.Get()},
+      {"missing_uav_hr", missingUavRoot.Get(), localRoot.Get()},
+  };
+  for (const auto &negative : negatives) {
+    global = negative.global;
+    local = negative.local;
+    ComPtr<ID3D12StateObject> rejected;
+    const HRESULT hr = device5->CreateStateObject(&desc, IID_PPV_ARGS(&rejected));
+    bad += stateobj::mismatch(name, negative.field, uint32_t(hr), uint32_t(E_INVALIDARG));
+    std::printf("OWNED_D3D12_RAYTRACING_COLLECTION_SAMPLER field=%s hr=0x%08x expected=0x%08x\n",
+                negative.field, uint32_t(hr), uint32_t(E_INVALIDARG));
+  }
+  // Each export keeps its own global parameter indices, even within one collection.
+  D3D12_ROOT_PARAMETER1 reversedParams[] = {params[1], params[0]};
+  globalDesc.NumParameters = 2;
+  globalDesc.pParameters = reversedParams;
+  auto reversedRoot = createRootSignature(device.Get(), globalDesc, "collection sampler: reversed global root");
+  ID3D12RootSignature *firstGlobal = globalRoot.Get(), *secondGlobal = reversedRoot.Get();
+  D3D12_EXPORT_DESC distinctExports[] = {
+      {L"CollectionSamplerRayGen", nullptr, D3D12_EXPORT_FLAG_NONE},
+      {L"CollectionSamplerRenamed", L"CollectionSamplerRayGen", D3D12_EXPORT_FLAG_NONE},
+  };
+  D3D12_DXIL_LIBRARY_DESC distinctLibrary{{dxil.data(), dxil.size()}, 2, distinctExports};
+  const WCHAR *firstName[] = {L"CollectionSamplerRayGen"}, *secondName[] = {L"CollectionSamplerRenamed"};
+  local = localRoot.Get();
+  D3D12_STATE_SUBOBJECT distinctSubobjects[] = {
+      {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &distinctLibrary},
+      {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &firstGlobal},
+      {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &secondGlobal},
+      {D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &local},
+      {D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &shaderConfig},
+      {D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pipelineConfig},
+      {D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, nullptr},
+      {D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, nullptr},
+  };
+  D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION firstAssociation{&distinctSubobjects[1], 1, firstName};
+  D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION secondAssociation{&distinctSubobjects[2], 1, secondName};
+  distinctSubobjects[6].pDesc = &firstAssociation;
+  distinctSubobjects[7].pDesc = &secondAssociation;
+  D3D12_STATE_OBJECT_DESC distinctDesc{D3D12_STATE_OBJECT_TYPE_COLLECTION,
+                                      UINT(std::size(distinctSubobjects)), distinctSubobjects};
+  ComPtr<ID3D12StateObject> distinctCollection;
+  const HRESULT distinctHr = device5->CreateStateObject(&distinctDesc, IID_PPV_ARGS(&distinctCollection));
+  bad += stateobj::mismatch(name, "distinct_global_roots_hr", uint32_t(distinctHr), uint32_t(S_OK));
+  std::printf("OWNED_D3D12_RAYTRACING_COLLECTION_SAMPLER field=distinct_global_roots_hr hr=0x%08x expected=0x%08x\n",
+              uint32_t(distinctHr), uint32_t(S_OK));
+  if (!collection) {
+    std::printf("OWNED_D3D12_RAYTRACING_COLLECTION_SAMPLER_CASE %s status=FAIL\n", name);
+    return 1;
+  }
+  D3D12_EXISTING_COLLECTION_DESC existing{collection.Get(), 0, nullptr};
+  D3D12_STATE_SUBOBJECT import{D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &existing};
+  D3D12_STATE_OBJECT_DESC pipelineDesc{D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 1, &import};
+  ComPtr<ID3D12StateObject> pipeline;
+  check(device5->CreateStateObject(&pipelineDesc, IID_PPV_ARGS(&pipeline)), "collection sampler: import pipeline");
+  ComPtr<ID3D12StateObjectProperties> properties;
+  check(pipeline.As(&properties), "collection sampler: properties");
+  const void *identifier = properties->GetShaderIdentifier(L"CollectionSamplerRayGen");
+  require(identifier != nullptr, "collection sampler: identifier");
+  auto table = createBuffer(device.Get(), 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                            D3D12_RESOURCE_STATE_GENERIC_READ);
+  std::memcpy(mapUpload(table.Get()), identifier, kShaderIdentifierSize);
+  table->Unmap(0, nullptr);
+  D3D12_RESOURCE_DESC textureDesc{};
+  textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  textureDesc.Width = 2;
+  textureDesc.Height = textureDesc.DepthOrArraySize = textureDesc.MipLevels = 1;
+  textureDesc.Format = DXGI_FORMAT_R32_FLOAT;
+  textureDesc.SampleDesc.Count = 1;
+  const auto defaultHeap = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+  ComPtr<ID3D12Resource> texture;
+  check(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &textureDesc,
+                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)),
+        "collection sampler: texture");
+  auto upload = createBuffer(device.Get(), 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_GENERIC_READ);
+  const uint32_t uploadWords[] = {0x3e800000u, 0x3f400000u, 0xffffffffu, 0xffffffffu};
+  std::memcpy(mapUpload(upload.Get()), uploadWords, sizeof(uploadWords));
+  upload->Unmap(0, nullptr);
+  D3D12_TEXTURE_COPY_LOCATION source{};
+  source.pResource = upload.Get();
+  source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  source.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, 2, 1, 1, 256};
+  D3D12_TEXTURE_COPY_LOCATION destination{};
+  destination.pResource = texture.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  ctx.list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+  transition(ctx.list.Get(), texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  D3D12_DESCRIPTOR_HEAP_DESC heapDesc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  ComPtr<ID3D12DescriptorHeap> heap;
+  check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)), "collection sampler: heap");
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+  srv.Format = DXGI_FORMAT_R32_FLOAT;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2D.MipLevels = 1;
+  device->CreateShaderResourceView(texture.Get(), &srv, heap->GetCPUDescriptorHandleForHeapStart());
+  auto output = createBuffer(device.Get(), 256, D3D12_HEAP_TYPE_DEFAULT,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+  auto readback = createBuffer(device.Get(), 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+  // Initialize to values different from either sample, so a dropped dispatch fails.
+  ctx.list->CopyBufferRegion(output.Get(), 0, upload.Get(), 8, 8);
+  transition(ctx.list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+  ctx.list->SetDescriptorHeaps(1, heaps);
+  ctx.list->SetComputeRootSignature(globalRoot.Get());
+  ctx.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+  ctx.list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
+  ctx.list->SetPipelineState1(pipeline.Get());
+  D3D12_DISPATCH_RAYS_DESC dispatch{};
+  dispatch.RayGenerationShaderRecord = {table->GetGPUVirtualAddress(), kShaderIdentifierSize};
+  dispatch.Width = 2;
+  dispatch.Height = dispatch.Depth = 1;
+  ctx.list->DispatchRays(&dispatch);
+  transition(ctx.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  ctx.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, 8);
+  ctx.submitAndWait();
+  check(ctx.allocator->Reset(), "collection sampler: allocator reset");
+  check(ctx.list->Reset(ctx.allocator.Get(), nullptr), "collection sampler: list reset");
+  void *data = nullptr;
+  check(readback->Map(0, nullptr, &data), "collection sampler: readback");
+  const auto *words = static_cast<const uint32_t *>(data);
+  bad += stateobj::mismatch(name, "sample_inside", words[0], 0x3e800000u);
+  bad += stateobj::mismatch(name, "sample_clamp", words[1], 0x3f400000u);
+  std::printf("OWNED_D3D12_RAYTRACING_COLLECTION_SAMPLER samples=0x%08x,0x%08x\n", words[0], words[1]);
+  readback->Unmap(0, nullptr);
+  std::printf("OWNED_D3D12_RAYTRACING_COLLECTION_SAMPLER_CASE %s status=%s\n", name, bad ? "FAIL" : "PASS");
+  std::fflush(stdout);
+  return bad ? 1 : 0;
+}
+
 int run(int argc, wchar_t **argv) {
-  if (argc < 4) {
+  if (argc < 4 && !(argc == 3 && std::wcscmp(argv[1], L"--collection-samplers") == 0)) {
     std::fprintf(stderr, "usage: owned-d3d12-raytracing.exe <raytracing.dxil> <raytracing-contract.dxil> "
-                         "<raytracing-stateobj.dxil> [further suite DXIL]\n");
+                         "<raytracing-stateobj.dxil> [further suite DXIL]\n"
+                         "       owned-d3d12-raytracing.exe --collection-samplers <raytracing-rootargs.dxil>\n");
     return 2;
   }
 
@@ -1513,6 +1714,8 @@ int run(int argc, wchar_t **argv) {
   check(device.As(&device5), "QueryInterface(ID3D12Device5)");
 
   Context context(device.Get());
+  if (argc == 3 && std::wcscmp(argv[1], L"--collection-samplers") == 0)
+    return testCollectionStaticSamplers(device5.Get(), context, readFile(argv[2]));
   if (argc == 4 && std::wcscmp(argv[1], L"--hitobject") == 0) {
     contract::Runner geometry(device5.Get(), context, readFile(argv[2]));
     return hitobject::run(device5.Get(), context, readFile(argv[3]), geometry);
@@ -1550,7 +1753,9 @@ int run(int argc, wchar_t **argv) {
     std::fprintf(stderr, "OWNED_D3D12_RAYTRACING_FAIL step=rootargs: missing raytracing-rootargs.dxil\n");
     ++failures;
   } else {
-    failures += rootargs::run(device5.Get(), context, readFile(argv[11]));
+    const auto rootargsDxil = readFile(argv[11]);
+    failures += rootargs::run(device5.Get(), context, rootargsDxil);
+    failures += testCollectionStaticSamplers(device5.Get(), context, rootargsDxil);
   }
   if (argc < 11) {
     std::fprintf(stderr, "OWNED_D3D12_RAYTRACING_FAIL step=coverage: missing raytracing-coverage.dxil\n");

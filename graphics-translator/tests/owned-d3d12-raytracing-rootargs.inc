@@ -22,6 +22,9 @@ int run(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8_t> &dxil) 
 
   D3D12_DXIL_LIBRARY_DESC library{};
   library.DXILLibrary = {dxil.data(), dxil.size()};
+  D3D12_EXPORT_DESC exportDesc{L"RARayGen", nullptr, D3D12_EXPORT_FLAG_NONE};
+  library.NumExports = 1;
+  library.pExports = &exportDesc;
   D3D12_RAYTRACING_SHADER_CONFIG shaderConfig{4, 8};
   D3D12_RAYTRACING_PIPELINE_CONFIG pipelineConfig{1};
   ID3D12RootSignature *global = root.Get();
