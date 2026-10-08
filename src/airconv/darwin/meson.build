@@ -87,6 +87,15 @@ volume_sample_test = executable('airconv-volume-sample-test',
 )
 test('airconv-volume-sample', volume_sample_test)
 
+root_status_test = executable('airconv-root-status-test',
+  files('../../../graphics-translator/tests/airconv-root-status.test.cpp'),
+  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  cpp_args: [airconv_args],
+  dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
+  native: dxmt_crossbuild,
+)
+test('airconv-root-status', root_status_test)
+
 executable('airconv', airconv_src + airconv_cli_src,
   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],

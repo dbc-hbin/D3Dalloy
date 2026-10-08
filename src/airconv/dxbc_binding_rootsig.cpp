@@ -1639,6 +1639,8 @@ setup_binding_rootsig(
           Parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_UAV)
         continue;
       auto status_index = builder.DefineInteger64("root_status" + std::to_string(i), inc_attribute_index++);
+      if (!check_visibility(Parameter.ShaderVisibility))
+        continue;
       const auto &descriptor = Parameter.Descriptor;
       auto matches = [&](const ResourceRange &range) {
         return range.lower_bound == descriptor.ShaderRegister && range.space == descriptor.RegisterSpace;
