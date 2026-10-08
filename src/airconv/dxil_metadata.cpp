@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
@@ -517,6 +518,7 @@ struct HandleOrigin {
   uint32_t space = 0;
   uint32_t lower_bound = 0;
   bool has_binding = false;
+  const llvm::GlobalVariable *symbol = nullptr;
 };
 
 HandleOrigin resolveHandle(const llvm::Value *handle, unsigned depth = 0) {
@@ -531,6 +533,14 @@ HandleOrigin resolveHandle(const llvm::Value *handle, unsigned depth = 0) {
     return origin;
   uint32_t opcode = call->arg_size() ? constantU32(call->getArgOperand(0)) : 0;
   switch (opcode) {
+  case 160: /* createHandleForLib(opcode, resource object) */
+    if (call->arg_size() >= 2) {
+      const llvm::Value *symbol = call->getArgOperand(1);
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(symbol))
+        symbol = load->getPointerOperand();
+      origin.symbol = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(symbol));
+    }
+    break;
   case 57: /* createHandle(opcode, i8 class, i32 range id, i32 index, i1 nonUniform) */
     if (call->arg_size() >= 3) {
       origin.klass = static_cast<ResourceClass>(constantU32(call->getArgOperand(1)));
@@ -569,6 +579,22 @@ HandleOrigin resolveHandle(const llvm::Value *handle, unsigned depth = 0) {
 }
 
 ResourceBinding *findBinding(std::vector<ResourceBinding> &resources, const HandleOrigin &origin) {
+  if (origin.symbol) {
+    for (auto &binding : resources)
+      if (binding.symbol && llvm::getUnderlyingObject(binding.symbol) == origin.symbol)
+        return &binding;
+    // Stripped library reflection retains only the resource name. Use the same
+    // mangled-name contract as resource lowering, rejecting ambiguous matches.
+    ResourceBinding *match = nullptr;
+    for (auto &binding : resources) {
+      if (binding.name.empty() || !origin.symbol->getName().contains("?" + binding.name + "@@"))
+        continue;
+      if (match)
+        return nullptr;
+      match = &binding;
+    }
+    return match;
+  }
   for (auto &binding : resources) {
     if (origin.has_class && binding.klass != origin.klass)
       continue;
@@ -623,7 +649,7 @@ void scanUsage(llvm::Module &module, std::vector<ResourceBinding> &resources) {
         if (call->arg_size() < 2)
           continue;
         HandleOrigin origin = resolveHandle(call->getArgOperand(1));
-        if (!origin.has_declaration && !origin.has_binding)
+        if (!origin.has_declaration && !origin.has_binding && !origin.symbol)
           continue;
         accumulateUsage(resources, origin, usage);
       }

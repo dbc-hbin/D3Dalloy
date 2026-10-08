@@ -96,6 +96,18 @@ root_status_test = executable('airconv-root-status-test',
 )
 test('airconv-root-status', root_status_test)
 
+library_usage_test = executable('airconv-library-usage-test',
+  files('../../../graphics-translator/tests/airconv-library-usage.test.cpp'),
+  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  cpp_args: [airconv_args],
+  dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
+  native: dxmt_crossbuild,
+)
+test('airconv-library-usage', library_usage_test, args: [
+  join_paths(meson.project_source_root(), 'graphics-translator/tests/dxil/advanced-texture-cmp2-cs.dxil'),
+  join_paths(meson.project_source_root(), 'graphics-translator/tests/dxil/advanced-texture-cmp2-lib.dxil'),
+])
+
 executable('airconv', airconv_src + airconv_cli_src,
   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],
