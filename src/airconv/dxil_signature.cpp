@@ -180,11 +180,9 @@ SignatureSlot make_slot(const SigElement &element, uint32_t air_index, bool pull
   SignatureSlot slot;
   slot.element_id = element.id;
   slot.element_row = element.element_row;
-  slot.semantic_index = element.semantic_index;
   slot.reg = element.start_row - element.element_row;
   slot.rows = element.rows;
   slot.start_col = element_start_col(element);
-  slot.mask = element_mask(element);
   slot.air_index = air_index;
   slot.pull_mode = pull_mode;
   slot.interpolation = element.interp;

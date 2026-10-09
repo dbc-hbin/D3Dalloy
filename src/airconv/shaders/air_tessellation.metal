@@ -144,15 +144,8 @@ place_in_1d_full(short index, fxp32 factor) {
 template <partitioning partition>
 fxp32
 regularize_factor(float factor) {
-  // For integer partitioning, TessFactor range is [1 ... 64] (fractions rounded up).
-  return ((uint)clamp(ceil(factor), 1.0f, 64.0f)) << 16;
-}
-
-template <>
-fxp32
-regularize_factor<partitioning::pow2>(float factor) {
-  // The D3D11 reference tessellator (CHWTessellator) processes pow2 exactly like integer partitioning;
-  // rounding to a power of two is HLSL helper code (CHLSLTessellator), not fixed-function behaviour.
+  // Integer and pow2 partitioning use [1 ... 64], rounded up. The D3D11 reference tessellator
+  // treats pow2 like integer; rounding to a power of two belongs to the HLSL helper.
   return ((uint)clamp(ceil(factor), 1.0f, 64.0f)) << 16;
 }
 

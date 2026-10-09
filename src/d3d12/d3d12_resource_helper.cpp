@@ -550,15 +550,7 @@ ValidateResourceDescs(MTLD3D12Device *device, const D3D12_RESOURCE_DESC *pDesc,
 
   auto HeapType = pHeapProps->Type;
   switch (HeapType) {
-  case D3D12_HEAP_TYPE_UPLOAD: {
-    if (pDesc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-      return E_INVALIDARG;
-    if (pDesc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
-      return E_INVALIDARG;
-    if (pDesc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
-      return E_INVALIDARG;
-    break;
-  }
+  case D3D12_HEAP_TYPE_UPLOAD:
   case D3D12_HEAP_TYPE_READBACK: {
     if (pDesc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
       return E_INVALIDARG;

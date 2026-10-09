@@ -34,11 +34,6 @@ struct Sha1Digest {
   std::string string() const;
 };
 
-struct Sha1Data {
-  const void *data; 
-  size_t size;
-};
-
 class Sha1HashState {
 public:
   Sha1HashState();
@@ -75,12 +70,4 @@ template <> struct hash<dxmt::Sha1Digest> {
   };
 };
 
-template <> struct equal_to<dxmt::Sha1Digest> {
-  bool
-  operator()(const dxmt::Sha1Digest &x, const dxmt::Sha1Digest &y) const {
-    constexpr size_t binsize = sizeof(x);
-    return std::string_view({reinterpret_cast<const char *>(x.data), binsize}) ==
-           std::string_view({reinterpret_cast<const char *>(y.data), binsize});
-  }
-};
 } // namespace std

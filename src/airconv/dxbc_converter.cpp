@@ -90,58 +90,6 @@ static int compileDXILPipelineStage(
 
 namespace dxmt::dxbc {
 
-inline dxmt::shader::common::ResourceType
-to_shader_resource_type(microsoft::D3D10_SB_RESOURCE_DIMENSION dim) {
-  switch (dim) {
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_UNKNOWN:
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_BUFFER:
-  case microsoft::D3D11_SB_RESOURCE_DIMENSION_RAW_BUFFER:
-  case microsoft::D3D11_SB_RESOURCE_DIMENSION_STRUCTURED_BUFFER:
-    return shader::common::ResourceType::TextureBuffer;
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE1D:
-    return shader::common::ResourceType::Texture1D;
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE2D:
-    return shader::common::ResourceType::Texture2D;
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DMS:
-    return shader::common::ResourceType::Texture2DMultisampled;
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE3D:
-    return shader::common::ResourceType::Texture3D;
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURECUBE:
-    return shader::common::ResourceType::TextureCube;
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE1DARRAY:
-    return shader::common::ResourceType::Texture1DArray;
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DARRAY:
-    return shader::common::ResourceType::Texture2DArray;
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DMSARRAY:
-    return shader::common::ResourceType::Texture2DMultisampledArray;
-  case microsoft::D3D10_SB_RESOURCE_DIMENSION_TEXTURECUBEARRAY:
-    return shader::common::ResourceType::TextureCubeArray;
-  }
-  assert(0 && "invalid D3D10_SB_RESOURCE_DIMENSION");
-};
-
-inline dxmt::shader::common::ScalerDataType
-to_shader_scaler_type(microsoft::D3D10_SB_RESOURCE_RETURN_TYPE type) {
-  switch (type) {
-
-  case microsoft::D3D10_SB_RETURN_TYPE_UNORM:
-  case microsoft::D3D10_SB_RETURN_TYPE_SNORM:
-  case microsoft::D3D10_SB_RETURN_TYPE_FLOAT:
-    return shader::common::ScalerDataType::Float;
-  case microsoft::D3D10_SB_RETURN_TYPE_SINT:
-    return shader::common::ScalerDataType::Int;
-  case microsoft::D3D10_SB_RETURN_TYPE_UINT:
-    return shader::common::ScalerDataType::Uint;
-  case microsoft::D3D10_SB_RETURN_TYPE_MIXED:
-    return shader::common::ScalerDataType::Uint; // kinda weird but ok
-  case microsoft::D3D11_SB_RETURN_TYPE_DOUBLE:
-  case microsoft::D3D11_SB_RETURN_TYPE_CONTINUED:
-  case microsoft::D3D11_SB_RETURN_TYPE_UNUSED:
-    break;
-  }
-  assert(0 && "invalid D3D10_SB_RESOURCE_RETURN_TYPE");
-}
-
 uint32_t next_pow2(uint32_t x) {
   return x == 1 ? 1 : 1 << (32 - __builtin_clz(x - 1));
 }
@@ -247,9 +195,6 @@ void setup_temp_register(
     resource_map.indexable_temp_map[idx] = {
       ptr_int_vec, ptr_float_vec, (uint32_t)channel_count
     };
-  }
-  if (shader_info->use_cmp_exch) {
-    resource_map.cmp_exch_temp = builder.CreateAlloca(types._int);
   }
 }
 

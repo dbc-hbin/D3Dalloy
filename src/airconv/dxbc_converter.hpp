@@ -98,7 +98,6 @@ public:
   air::ArgumentBufferBuilder binding_table;
   bool skipOptimization = false;
   bool refactoringAllowed = false;
-  bool use_cmp_exch = false;
   bool no_control_point_phase_passthrough = false;
   bool output_control_point_read = false;
   bool use_msad = false;
@@ -136,26 +135,6 @@ struct indexable_register_file {
 struct phase_temp {
   register_file temp{};
   std::unordered_map<uint32_t, indexable_register_file> indexable_temp_map{};
-};
-
-struct sampler_descriptor {
-  IndexedIRValue handle;
-  IndexedIRValue handle_cube;
-  IndexedIRValue bias;
-};
-
-struct texture_descriptor {
-  air::MSLTexture texture_info;
-  IndexedIRValue resource_id;
-  IndexedIRValue metadata;
-  bool global_coherent;
-};
-
-struct buffer_descriptor {
-  uint32_t structure_stride;
-  IndexedIRValue resource_id;
-  IndexedIRValue metadata;
-  bool global_coherent;
 };
 
 struct interpolant_descriptor {
@@ -199,8 +178,6 @@ struct io_binding_map {
   llvm::AllocaInst *depth_output_reg = nullptr;
   llvm::AllocaInst *stencil_ref_reg = nullptr;
   llvm::AllocaInst *coverage_mask_reg = nullptr;
-
-  llvm::AllocaInst *cmp_exch_temp = nullptr;
 
   // special buffers for tessellation
   llvm::Type *hull_cp_passthrough_type = nullptr;

@@ -352,6 +352,8 @@ bool distanceSemantic(StringRef semantic) {
          semantic.startswith("user(semantic_sv_culldistance_");
 }
 
+} // namespace
+
 uint64_t userHash(StringRef semantic) {
   uint64_t hash = 14695981039346656037ull;
   for (unsigned char c : semantic) {
@@ -386,6 +388,8 @@ Value *lineBlend(IRBuilder<> &b, Value *a, Value *z, Value *fraction) {
   }
   return a; // Integral components are flat.
 }
+
+namespace {
 
 Value *lineFraction(IRBuilder<> &b, Value *start, Value *end, Value *xy) {
   auto coord = [&](Value *v, unsigned i) { return b.CreateExtractElement(v, b.getInt32(i)); };

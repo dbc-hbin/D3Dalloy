@@ -861,7 +861,6 @@ class MTLD3D12StateObjectImpl final
        */
       if (function.Kind != SM50_RT_FUNCTION_DISPATCH && function.ExportIndex < exports_.size()) {
         exports_[function.ExportIndex].compiled = true;
-        exports_[function.ExportIndex].metal_function = function.Name;
       }
       if ((function.Kind == SM50_RT_FUNCTION_RAYGEN && !(function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY)) ||
           function.Kind == SM50_RT_FUNCTION_INTERSECTION) {
@@ -1082,7 +1081,6 @@ private:
     for (const auto &source : parent.exports_) {
       Export entry = source;
       entry.compiled = false;
-      entry.metal_function.clear();
       if (HRESULT hr = AddExport(std::move(entry)); FAILED(hr))
         return hr;
     }
@@ -2017,7 +2015,6 @@ private:
       entry.library_index += library_base;
       entry.identifier = {};
       entry.compiled = false;
-      entry.metal_function.clear();
       mapped[source_index] = exports_.size();
       return AddExport(std::move(entry));
     };

@@ -22,7 +22,6 @@ public:
   createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod_bias, uint32_t reduction = 0);
 
 private:
-  WMTSamplerInfo info_;
   std::atomic<uint32_t> refcount_ = {0u};
 };
 

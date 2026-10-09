@@ -254,7 +254,6 @@ struct MetadataSignatureElement {
   std::string name;
   uint32_t interp = 0;
   uint32_t rows = 1;
-  uint32_t cols = 1;
   uint32_t start_row = 0;
   uint32_t start_col = 0;
 };
@@ -279,7 +278,6 @@ std::vector<MetadataSignatureElement> parseMetadataSignature(llvm::MDNode *list)
       element.name = getString(parameter, 1);
       element.interp = getU32Or(parameter, 5, 0);
       element.rows = getU32Or(parameter, 6, 1);
-      element.cols = getU32Or(parameter, 7, 1);
       element.start_row = getU32Or(parameter, 8, 0);
       element.start_col = getU32Or(parameter, 9, 0);
     }

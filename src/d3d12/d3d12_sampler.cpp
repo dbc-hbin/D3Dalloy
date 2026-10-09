@@ -66,9 +66,9 @@ constexpr WMTSamplerAddressMode kAddressModeMap[] = {
     WMTSamplerAddressModeMirrorClampToEdge // 5 - 1
 };
 
-void
-PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC_SAMPLER_DESC1 const &Desc) {
-
+template <typename DESC>
+static void
+PopulateWMTSamplerInfoCommon(WMTSamplerInfo &InfoOut, const DESC &Desc) {
   InfoOut.lod_average = false;
   InfoOut.mip_filter = WMTSamplerMipFilterNotMipmapped;
   // filter
@@ -118,6 +118,13 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC
       InfoOut.compare_function = kCompareFunctionMap[Desc.ComparisonFunc];
     }
   }
+  InfoOut.support_argument_buffers = true;
+  InfoOut.normalized_coords = true;
+}
+
+void
+PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC_SAMPLER_DESC1 const &Desc) {
+  PopulateWMTSamplerInfoCommon(InfoOut, Desc);
   // The *_UINT static border colors are the integer {0,0,0,1} / {1,1,1,1}. Metal's
   // predefined border colors return exactly those integers when sampling an integer
   // texture, so they map onto the same enumerators as their float counterparts.
@@ -133,9 +140,7 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC
     InfoOut.border_color = WMTSamplerBorderColorOpaqueWhite;
     break;
   }
-  InfoOut.support_argument_buffers = true;
   // Shader lowering normalizes pixel coordinates; native normalized samplers also support white BORDER.
-  InfoOut.normalized_coords = true;
   if (Desc.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES) {
     InfoOut.mip_filter = WMTSamplerMipFilterNearest;
     InfoOut.max_anisotroy = 1;
@@ -144,56 +149,7 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC
 
 void
 PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_SAMPLER_DESC const &Desc) {
-
-  InfoOut.lod_average = false;
-  InfoOut.mip_filter = WMTSamplerMipFilterNotMipmapped;
-  // filter
-  if (D3D12_DECODE_MIN_FILTER(Desc.Filter)) { // LINEAR = 1
-    InfoOut.min_filter = WMTSamplerMinMagFilterLinear;
-  } else {
-    InfoOut.min_filter = WMTSamplerMinMagFilterNearest;
-  }
-  if (D3D12_DECODE_MAG_FILTER(Desc.Filter)) { // LINEAR = 1
-    InfoOut.mag_filter = WMTSamplerMinMagFilterLinear;
-  } else {
-    InfoOut.mag_filter = WMTSamplerMinMagFilterNearest;
-  }
-  if (D3D12_DECODE_MIP_FILTER(Desc.Filter)) { // LINEAR = 1
-    InfoOut.mip_filter = WMTSamplerMipFilterLinear;
-  } else {
-    InfoOut.mip_filter = WMTSamplerMipFilterNearest;
-  }
-
-  InfoOut.lod_min_clamp = Desc.MinLOD;
-  InfoOut.lod_max_clamp = Desc.MaxLOD;
-
-  // Anisotropy
-  if (D3D12_DECODE_IS_ANISOTROPIC_FILTER(Desc.Filter)) {
-    InfoOut.max_anisotroy = std::clamp(Desc.MaxAnisotropy, 1u, 16u);
-  } else {
-    InfoOut.max_anisotroy = 1;
-  }
-
-  // address modes
-  // U-S  V-T W-R
-  if (Desc.AddressU > 0 && Desc.AddressU < 6) {
-    InfoOut.s_address_mode = kAddressModeMap[Desc.AddressU - 1];
-  }
-  if (Desc.AddressV > 0 && Desc.AddressV < 6) {
-    InfoOut.t_address_mode = kAddressModeMap[Desc.AddressV - 1];
-  }
-  if (Desc.AddressW > 0 && Desc.AddressW < 6) {
-    InfoOut.r_address_mode = kAddressModeMap[Desc.AddressW - 1];
-  }
-
-  InfoOut.compare_function = WMTCompareFunctionNever;
-  if (D3D12_DECODE_IS_COMPARISON_FILTER(Desc.Filter)) {
-    if (Desc.ComparisonFunc < 1 || Desc.ComparisonFunc > 8) {
-      WARN("CreateSamplerState: invalid ComparisonFunc");
-    } else {
-      InfoOut.compare_function = kCompareFunctionMap[Desc.ComparisonFunc];
-    }
-  }
+  PopulateWMTSamplerInfoCommon(InfoOut, Desc);
 
   // border color
   InfoOut.border_color = WMTSamplerBorderColorOpaqueWhite;
@@ -215,9 +171,6 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_SAMPLE
       );
     }
   }
-
-  InfoOut.support_argument_buffers = true;
-  InfoOut.normalized_coords = true;
 }
 
 } // namespace dxmt

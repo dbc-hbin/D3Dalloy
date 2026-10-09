@@ -6,6 +6,8 @@
 #include "llvm/Support/Error.h"
 
 namespace dxmt::msaa {
+uint64_t userHash(llvm::StringRef semantic);
+llvm::Value *lineBlend(llvm::IRBuilder<> &builder, llvm::Value *a, llvm::Value *z, llvm::Value *fraction);
 /* Private capture/replay transport only; never cloned application SRV/UAV loads. */
 llvm::LoadInst *capturedLoad(llvm::IRBuilder<> &builder, llvm::Type *type, llvm::Value *pointer,
                            llvm::MaybeAlign alignment = {});

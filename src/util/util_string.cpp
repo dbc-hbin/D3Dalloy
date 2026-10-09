@@ -123,7 +123,7 @@ size_t encodeTypedChar(uint8_t *begin, uint8_t *end, uint32_t ch) {
     return 3;
   } else if (ch < 0x200000) {
     if (begin) {
-      if (unlikely(begin + 4 < end))
+      if (unlikely(end - begin < 4))
         return 0;
 
       begin[0] = uint8_t(0xF0 | ((ch >> 18)));

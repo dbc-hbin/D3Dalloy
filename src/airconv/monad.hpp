@@ -9,12 +9,6 @@ template <typename T, typename G>
 concept MoveAndInvocable =
   std::is_object_v<T> && std::move_constructible<T> && std::invocable<T, G>;
 
-template <typename Test, template <typename...> class Ref>
-struct is_specialization : std::false_type {};
-
-template <template <typename...> class Ref, typename... Args>
-struct is_specialization<Ref<Args...>, Ref> : std::true_type {};
-
 template <typename Src, typename Dst> struct environment_cast {
   Dst cast(Src &src);
 };
@@ -208,41 +202,3 @@ ReaderIO<Env, V> &operator>>(ReaderIO<Env, V> &a, Func &&fn) {
   a = std::move(a) >>= std::forward<Func>(fn);
   return a;
 };
-
-template <typename Env, typename A, typename B, std::move_constructible Func>
-auto lift(ReaderIO<Env, A> &&a, ReaderIO<Env, B> &&b, Func &&func) {
-  return std::move(a) >>= [func = std::forward<Func>(func),
-                           b = std::move(b)](auto a) mutable {
-    return std::move(b) >>=
-           [a, func = std::forward<Func>(func)](auto b) { return func(a, b); };
-  };
-};
-
-template <typename Env, typename A, typename B, typename C, typename Func>
-auto lift(
-  ReaderIO<Env, A> &&a, ReaderIO<Env, B> &&b, ReaderIO<Env, C> &&c, Func &&func
-) {
-  return std::move(a) >>= [func = std::forward<Func>(func), b = std::move(b),
-                           c = std::move(c)](auto a) mutable {
-    return std::move(b) >>= [a, func = std::forward<Func>(func),
-                             c = std::move(c)](auto b) mutable {
-      return std::move(c) >>= [a, b, func = std::forward<Func>(func)](auto c) {
-        return func(a, b, c);
-      };
-    };
-  };
-};
-
-// template <typename Env, typename A, typename B, typename C, typename
-// D,typename Func> auto lift(const ReaderIO<Env,A>& a, const ReaderIO<Env,B>&
-// b, const ReaderIO<Env,C>& c,  const ReaderIO<Env,D>& d, Func&& func) {
-//   return a >>= [=](auto a) {
-//     return b >>= [=](auto b) {
-//       return c >>= [=](auto c) {
-//         return d >>= [=](auto d) {
-//           return func(a,b,c,d);
-//         };
-//       };
-//     };
-//   };
-// };

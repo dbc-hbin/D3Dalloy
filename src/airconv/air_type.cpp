@@ -127,21 +127,6 @@ AirType::AirType(LLVMContext &context) : context(context) {
   _interpolant = get_or_create_struct(context, "struct._interpolant_t");
 
   _mesh = get_or_create_struct(context, "struct._mesh_t");
-
-  typeContext = {
-    {"bool", _bool},     {"int", _int},        {"uint", _int},
-    {"short", _short},   {"float", _float},    {"int2", _int2},
-    {"short2", _short2}, {"uint2", _int2},     {"ushort2", _short2},
-    {"float2", _float2}, {"int3", _int3},      {"short3", _short3},
-    {"uint3", _int3},    {"ushort3", _short3}, {"float3", _float3},
-    {"int4", _int4},     {"uint4", _int4},     {"float4", _float4},
-    {"short4", _short4}, {"ushort4", _short4}, {"half", _half},
-    {"half4", _half4},
-  };
 };
-
-Type *AirType::getTypeByMetalTypeName(const std::string &name) {
-  return typeContext[name];
-}
 
 } // namespace dxmt::air

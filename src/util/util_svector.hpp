@@ -14,53 +14,13 @@
 
 namespace dxmt {
 
-/** Small vector state with stateful allocator */
-template<typename Allocator, bool Stateless>
-struct SmallVectorState {
-  SmallVectorState(size_t initialCapacity, const Allocator& alloc)
-  : capacity(initialCapacity), allocator(alloc) { }
-
-  size_t capacity = 0;
-  size_t size     = 0;
-
-  Allocator allocator = { };
-
-  Allocator& getAllocator() {
-    return allocator;
-  }
-
-  void setAllocator(const Allocator& alloc) {
-    allocator = alloc;
-  }
-};
-
-
-/** Small vector state with stateless allocator. This avoids unnecessary
- *  padding that would otherwise be caused by an empty struct, and creates
- *  a new allocator instance on the fly instead. */
-template<typename Allocator>
-struct SmallVectorState<Allocator, true> {
-  SmallVectorState(size_t initialCapacity, const Allocator&)
-  : capacity(initialCapacity) { }
-
-  size_t capacity = 0;
-  size_t size     = 0;
-
-  Allocator getAllocator() {
-    return Allocator();
-  }
-
-  void setAllocator(const Allocator&) { }
-};
-
-
 /** Small vector container with embedded storage for a given number of
  *  elements. Largely functions as a drop-in replacement for std::vector. */
-template<typename T, size_t N, typename Allocator = std::allocator<T>>
+template<typename T, size_t N>
 class small_vector {
   using storage = std::aligned_storage_t<sizeof(T), alignof(T)>;
 
-  template<typename T_, size_t N_, typename Allocator_>
+  template<typename T_, size_t N_>
   friend class small_vector;
 public:
 
@@ -69,55 +29,50 @@ public:
   using iterator = T*;
   using const_iterator = const T*;
 
-  small_vector()
-  : small_vector(Allocator()) { }
-
-  /** Initialize small vector with allocator */
-  explicit small_vector(const Allocator& alloc)
-  : m_state(N, alloc) {
+  small_vector() {
     /* Somewhat nonsensical since we will first populat the,
      * internal array anyway, but hides a GCC warning */
     u.m_ptr = nullptr;
   }
 
   /** Initialize small vector with size and default element value */
-  explicit small_vector(size_t size, T value = T(), const Allocator& alloc = Allocator())
-  : small_vector(alloc) {
+  explicit small_vector(size_t size, T value = T())
+  : small_vector() {
     resize(size, std::move(value));
   }
 
   /** Initialize small vector from initializer list */
-  small_vector(const std::initializer_list<T>& list, const Allocator& alloc = Allocator())
-  : small_vector(alloc) {
+  small_vector(const std::initializer_list<T>& list)
+  : small_vector() {
     reserve(list.size());
 
     for (auto iter = list.begin(); iter != list.end(); iter++)
-      new (ptr(m_state.size++)) T(*iter);
+      new (ptr(m_size++)) T(*iter);
   }
 
   /** Move constructor. */
   small_vector(small_vector&& other)
-  : m_state(N, other.m_state.getAllocator()) {
+  : small_vector() {
     move(std::move(other));
   }
 
   /** Move constructor from different small_vector type. */
-  template<size_t N_, typename Allocator_>
-  small_vector(small_vector<T, N_, Allocator_>&& other)
-  : m_state(N, other.m_state.getAllocator()) {
+  template<size_t N_>
+  small_vector(small_vector<T, N_>&& other)
+  : small_vector() {
     move(std::move(other));
   }
 
   /** Copy constructor. */
   small_vector(const small_vector& other)
-  : m_state(N, Allocator()) {
+  : small_vector() {
     copy(other);
   }
 
   /** Copy constructor from different small_vector type. */
-  template<size_t N_, typename Allocator_>
-  small_vector(const small_vector<T, N_, Allocator_>& other)
-  : m_state(N, Allocator()) {
+  template<size_t N_>
+  small_vector(const small_vector<T, N_>& other)
+  : small_vector() {
     copy(other);
   }
 
@@ -129,8 +84,8 @@ public:
   }
 
   /** Move assignment from different small_vector type. */
-  template<size_t N_, typename Allocator_>
-  small_vector& operator = (small_vector<T, N_, Allocator_>&& other) {
+  template<size_t N_>
+  small_vector& operator = (small_vector<T, N_>&& other) {
     free();
     move(std::move(other));
     return *this;
@@ -147,8 +102,8 @@ public:
   }
 
   /** Copy assignment from different small_vector type. */
-  template<size_t N_, typename Allocator_>
-  small_vector& operator = (const small_vector<T, N_, Allocator_>& other) {
+  template<size_t N_>
+  small_vector& operator = (const small_vector<T, N_>& other) {
     clear();
     copy(other);
     return *this;
@@ -164,7 +119,7 @@ public:
 
   /** Array size */
   size_t size() const {
-    return m_state.size;
+    return m_size;
   }
 
   /** Checks whether array is empty. */
@@ -175,7 +130,7 @@ public:
   /** Current capacity. Will always be greater
    *  or equal to \c EmbeddedCapacity. */
   size_t capacity() const {
-    return m_state.capacity;
+    return m_capacity;
   }
 
   /** Checks whether array elements are embedded in the
@@ -191,7 +146,7 @@ public:
     if (n <= capacity())
       return;
 
-    T* data = m_state.getAllocator().allocate(n);
+    T* data = std::allocator<T>().allocate(n);
 
     for (size_t i = 0; i < size(); i++) {
       auto object = std::launder(ptr(i));
@@ -201,9 +156,9 @@ public:
     }
 
     if (!is_embedded())
-      m_state.getAllocator().deallocate(u.m_ptr, capacity());
+      std::allocator<T>().deallocate(u.m_ptr, capacity());
 
-    m_state.capacity = n;
+    m_capacity = n;
     u.m_ptr = data;
   }
 
@@ -217,26 +172,26 @@ public:
     for (size_t i = size(); i < n; i++)
       new (ptr(i)) T(value);
 
-    m_state.size = n;
+    m_size = n;
   }
 
   /** Appends an element. */
   void push_back(const T& object) {
-    reserve(m_state.size + 1);
-    new (ptr(m_state.size++)) T(object);
+    reserve(m_size + 1);
+    new (ptr(m_size++)) T(object);
   }
 
   /** Appends an element with move semantics. */
   void push_back(T&& object) {
-    reserve(m_state.size + 1);
-    new (ptr(m_state.size++)) T(std::move(object));
+    reserve(m_size + 1);
+    new (ptr(m_size++)) T(std::move(object));
   }
 
   /** Constructs an element in-place at the end of the array. */
   template<typename... Args>
   T& emplace_back(Args&&... args) {
-    reserve(m_state.size + 1);
-    return *(new (ptr(m_state.size++)) T(std::forward<Args>(args)...));
+    reserve(m_size + 1);
+    return *(new (ptr(m_size++)) T(std::forward<Args>(args)...));
   }
 
   /** Removes an element at a given index. */
@@ -250,7 +205,7 @@ public:
       object->~T();
     }
 
-    m_state.size--;
+    m_size--;
     return begin() + idx;
   }
 
@@ -273,7 +228,7 @@ public:
 
   /** Removes last element from array. */
   void pop_back() {
-    std::launder(ptr(--m_state.size))->~T();
+    std::launder(ptr(--m_size))->~T();
   }
 
   /** Removes all elements from array. Does
@@ -282,7 +237,7 @@ public:
     for (size_t i = 1; i <= size(); i++)
       std::launder(ptr(size() - i))->~T();
 
-    m_state.size = 0;
+    m_size = 0;
   }
 
   /** Moves array to an allocation of exactly the required
@@ -295,17 +250,17 @@ public:
     auto oldStorage = u.m_ptr;
 
     /* Capacity must be at least as large as the embedded storage */
-    m_state.capacity = std::max(size(), EmbeddedCapacity);
+    m_capacity = std::max(size(), EmbeddedCapacity);
 
     if (!is_embedded())
-      u.m_ptr = m_state.getAllocator().allocate(capacity());
+      u.m_ptr = std::allocator<T>().allocate(capacity());
 
     for (size_t i = 0u; i < size(); i++) {
       new (ptr(i)) T(std::move(oldStorage[i]));
       oldStorage[i].~T();
     }
 
-    m_state.getAllocator().deallocate(oldStorage, oldCapacity);
+    std::allocator<T>().deallocate(oldStorage, oldCapacity);
   }
 
   /** Provides safe access to elements */
@@ -342,7 +297,8 @@ public:
 
 private:
 
-  SmallVectorState<Allocator, std::allocator_traits<Allocator>::is_always_equal::value> m_state;
+  size_t m_capacity = N;
+  size_t m_size = 0;
 
   union {
     T*      m_ptr;
@@ -379,22 +335,17 @@ private:
       std::launder(ptr(i))->~T();
 
     if (!is_embedded())
-      m_state.getAllocator().deallocate(u.m_ptr, capacity());
+      std::allocator<T>().deallocate(u.m_ptr, capacity());
 
-    m_state.capacity = N;
-    m_state.size = 0;
+    m_capacity = N;
+    m_size = 0;
   }
 
   /** Convenience method to move from another vector, assumes
    *  that the destination vector is empty. */
-  template<size_t N_, typename Allocator_>
-  void move(small_vector<T, N_, Allocator_>&& other) {
-    /* We may inherit the data pointer if there is one,
-     * so we need to inherit the allocator as well. */
-    if constexpr (std::is_same_v<Allocator, Allocator_>)
-      m_state.setAllocator(other.m_state.getAllocator());
-
-    if (!std::is_same_v<Allocator, Allocator_> || other.capacity() <= std::max(N, N_)) {
+  template<size_t N_>
+  void move(small_vector<T, N_>&& other) {
+    if (other.capacity() <= std::max(N, N_)) {
       /* Move individual elements if the source capacity is not
        * greater than either vector's embedded capacity, since
        * the capacity determines which storage to use. */
@@ -407,19 +358,19 @@ private:
         object->~T();
       }
 
-      m_state.size = std::exchange(other.m_state.size, size_t(0));
+      m_size = std::exchange(other.m_size, size_t(0));
     } else {
       /* Move the storage itself without reallocating any memory. */
-      m_state.capacity = std::exchange(other.m_state.capacity, N_);
-      m_state.size = std::exchange(other.m_state.size, size_t(0));
+      m_capacity = std::exchange(other.m_capacity, N_);
+      m_size = std::exchange(other.m_size, size_t(0));
       u.m_ptr = std::exchange(other.u.m_ptr, nullptr);
     }
   }
 
   /** Convenience method to copy from another vector, assumes
    *  that the destination vector is empty. */
-  template<size_t N_, typename Allocator_>
-  void copy(const small_vector<T, N_, Allocator_>& other) {
+  template<size_t N_>
+  void copy(const small_vector<T, N_>& other) {
     reserve(other.size());
 
     for (size_t i = 0; i < other.size(); i++)
@@ -437,7 +388,7 @@ private:
       prev->~T();
     }
 
-    m_state.size++;
+    m_size++;
     return ptr(idx);
   }
 

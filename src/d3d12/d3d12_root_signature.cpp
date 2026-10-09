@@ -26,6 +26,7 @@
 #include "dxmt_sampler.hpp"
 #include "util_math.hpp"
 #include "util_md5.hpp"
+#include <algorithm>
 #include <cstring>
 #include <set>
 #include <cmath>
@@ -374,16 +375,7 @@ SerializeVersionedRootSignatureImpl(
       OutTable->DescriptorRangesOffset = add_segment(RootParameter->DescriptorTable.NumDescriptorRanges, &OutRanges);
       if (OutTable->NumDescriptorRanges && !OutRanges)
         return E_OUTOFMEMORY;
-      for (UINT j = 0; j < RootParameter->DescriptorTable.NumDescriptorRanges; j++) {
-        const DESCRIPTOR_RANGE *Range = &RootParameter->DescriptorTable.pDescriptorRanges[j];
-        DESCRIPTOR_RANGE *OutRange = &OutRanges[j];
-        OutRange->RangeType = Range->RangeType;
-        OutRange->NumDescriptors = Range->NumDescriptors;
-        OutRange->BaseShaderRegister = Range->BaseShaderRegister;
-        OutRange->RegisterSpace = Range->RegisterSpace;
-        OutRange->OffsetInDescriptorsFromTableStart = Range->OffsetInDescriptorsFromTableStart;
-        SetFlag(OutRange, Range);
-      }
+      std::copy_n(RootParameter->DescriptorTable.pDescriptorRanges, OutTable->NumDescriptorRanges, OutRanges);
       break;
     }
     case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS: {
@@ -401,9 +393,7 @@ SerializeVersionedRootSignatureImpl(
       Out->PayloadOffset = add_segment(1, &OutDescriptor);
       if (!OutDescriptor)
         return E_OUTOFMEMORY;
-      OutDescriptor->ShaderRegister = RootParameter->Descriptor.ShaderRegister;
-      OutDescriptor->RegisterSpace = RootParameter->Descriptor.RegisterSpace;
-      SetFlag(OutDescriptor, &RootParameter->Descriptor);
+      *OutDescriptor = RootParameter->Descriptor;
       break;
     }
     }

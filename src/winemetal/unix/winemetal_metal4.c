@@ -58,7 +58,6 @@ MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format) {
   id<MTL4CommandEncoder> encoder;
   id<MTL4ArgumentTable> tables[4];
   id<MTLBuffer> buffers[4][31];
-  uint64_t offsets[4][31];
   MTLStages orderedFor[3];
   MTLStages fenceWaitStages;
 }
@@ -225,7 +224,7 @@ static void m4_blit_access(DXMTM4ComputeEncoder *context, uint64_t source, uint6
 }
 static void m4_bind_buffer(DXMTM4Encoder *context, unsigned stage, id<MTLBuffer> buffer, uint64_t offset, unsigned index) {
   if (index>=31 || (buffer && offset>buffer.length)) { m4_error(context->recording,@"Metal4 buffer binding is out of range"); return; }
-  context->buffers[stage][index]=buffer; context->offsets[stage][index]=offset;
+  context->buffers[stage][index]=buffer;
   m4_allocation(context->recording,buffer);
   [m4_table(context,stage) setAddress:buffer ? buffer.gpuAddress+offset : 0 atIndex:index];
 }

@@ -363,12 +363,8 @@ _MTLDevice_newBuffer32(void *obj) {
 }
 #endif
 
-static NTSTATUS
-_MTLDevice_newSamplerState(void *obj) {
-  struct unixcall_mtldevice_newsamplerstate *params = obj;
-  id<MTLDevice> device = (id<MTLDevice>)params->device;
-  struct WMTSamplerInfo *info = params->info.ptr;
-
+static MTLSamplerDescriptor *
+new_sampler_descriptor(const struct WMTSamplerInfo *info) {
   MTLSamplerDescriptor *sampler_desc = [[MTLSamplerDescriptor alloc] init];
   sampler_desc.borderColor = (MTLSamplerBorderColor)info->border_color;
   sampler_desc.rAddressMode = (MTLSamplerAddressMode)info->r_address_mode;
@@ -384,6 +380,15 @@ _MTLDevice_newSamplerState(void *obj) {
   sampler_desc.lodAverage = info->lod_average;
   sampler_desc.normalizedCoordinates = info->normalized_coords;
   sampler_desc.supportArgumentBuffers = info->support_argument_buffers;
+  return sampler_desc;
+}
+
+static NTSTATUS
+_MTLDevice_newSamplerState(void *obj) {
+  struct unixcall_mtldevice_newsamplerstate *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  struct WMTSamplerInfo *info = params->info.ptr;
+  MTLSamplerDescriptor *sampler_desc = new_sampler_descriptor(info);
 
   id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sampler_desc];
   info->gpu_resource_id = info->support_argument_buffers ? [sampler gpuResourceID]._impl : 0;
@@ -2116,7 +2121,7 @@ static BOOL composition_is_residual_filter(id filter) {
   if (![filter isKindOfClass:cls] || ![filter respondsToSelector:@selector(type)] ||
       ![filter respondsToSelector:@selector(isEnabled)]) return NO;
   id type = ((id (*)(id, SEL))objc_msgSend)(filter, @selector(type));
-  return [type isKindOfClass:NSString.class] && [(NSString *)type isEqualToString:@"plusL"] &&
+  return [type isKindOfClass:NSString.class] && [(NSString *)type isEqualToString:@"plusLIgnoreAlpha"] &&
       ((BOOL (*)(id, SEL))objc_msgSend)(filter, @selector(isEnabled));
 }
 
@@ -2125,7 +2130,8 @@ static id composition_create_residual_filter(void) {
   if (![cls respondsToSelector:@selector(filterWithType:)]) return nil;
   id filter = nil;
   @try {
-    filter = [((id (*)(id, SEL, id))objc_msgSend)((id)cls, @selector(filterWithType:), @"plusL") retain];
+    // Add residual RGB without plusL's extended-range clamp or changing base coverage.
+    filter = [((id (*)(id, SEL, id))objc_msgSend)((id)cls, @selector(filterWithType:), @"plusLIgnoreAlpha") retain];
   } @catch (...) { return nil; }
   if (!composition_is_residual_filter(filter)) { [filter release]; return nil; }
   return filter;
@@ -2643,7 +2649,7 @@ static NTSTATUS _WMTComposition_call(void *obj) {
         }
         if (residual_container) {
           // Blend only the opaque residual plane. The base retains ordinary
-          // source-over; putting plusL on the entire image would be incorrect.
+          // source-over; putting the additive filter on the entire image would be incorrect.
           @try { residual_container.compositingFilter = source->residual_filter; }
           @catch (...) {
             [host release]; [container release]; [residual_host release]; [residual_container release];
@@ -6145,21 +6151,7 @@ _MTLDevice_newSamplerStateWithReduction(void *obj) {
   params->ret = 0;
   info->gpu_resource_id = 0;
   if (@available(macOS 26.0, *)) {
-    MTLSamplerDescriptor *sampler_desc = [[MTLSamplerDescriptor alloc] init];
-    sampler_desc.borderColor = (MTLSamplerBorderColor)info->border_color;
-    sampler_desc.rAddressMode = (MTLSamplerAddressMode)info->r_address_mode;
-    sampler_desc.sAddressMode = (MTLSamplerAddressMode)info->s_address_mode;
-    sampler_desc.tAddressMode = (MTLSamplerAddressMode)info->t_address_mode;
-    sampler_desc.magFilter = (MTLSamplerMinMagFilter)info->mag_filter;
-    sampler_desc.minFilter = (MTLSamplerMinMagFilter)info->min_filter;
-    sampler_desc.mipFilter = (MTLSamplerMipFilter)info->mip_filter;
-    sampler_desc.compareFunction = (MTLCompareFunction)info->compare_function;
-    sampler_desc.lodMaxClamp = info->lod_max_clamp;
-    sampler_desc.lodMinClamp = info->lod_min_clamp;
-    sampler_desc.maxAnisotropy = info->max_anisotroy;
-    sampler_desc.lodAverage = info->lod_average;
-    sampler_desc.normalizedCoordinates = info->normalized_coords;
-    sampler_desc.supportArgumentBuffers = info->support_argument_buffers;
+    MTLSamplerDescriptor *sampler_desc = new_sampler_descriptor(info);
     sampler_desc.reductionMode = (MTLSamplerReductionMode)params->reduction;
     id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sampler_desc];
     info->gpu_resource_id = sampler && info->support_argument_buffers ? [sampler gpuResourceID]._impl : 0;

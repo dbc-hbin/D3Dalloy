@@ -152,8 +152,6 @@ public:
     bool has_pipeline_config = false;
     D3D12_RAYTRACING_PIPELINE_CONFIG1 pipeline_config{};
 
-    /** Compiled Metal function name, empty until the pipeline is compiled. */
-    std::string metal_function;
     bool compiled = false;
 
     OwnedShaderIdentifier identifier{};

@@ -32,15 +32,12 @@ struct SignatureSlot {
   /** `!dx.entryPoints` element id, i.e. `dx.op` operand 1. */
   uint32_t element_id = 0;
   uint32_t element_row = 0;
-  uint32_t semantic_index = 0;
   /** Register of the element (signature start row). */
   uint32_t reg = 0;
   /** Number of vec4 registers the element spans (signature rows). */
   uint32_t rows = 1;
   /** First component inside `reg`. */
   uint32_t start_col = 0;
-  /** Component mask inside the element's register. */
-  uint32_t mask = 0;
   /** Index of the AIR function argument the element is bound to, ~0u if none. */
   uint32_t air_index = ~0u;
   /** AIR argument is a pull-mode interpolant rather than an eagerly interpolated value. */

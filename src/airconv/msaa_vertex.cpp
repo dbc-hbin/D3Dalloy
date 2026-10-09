@@ -1,4 +1,5 @@
 #include "msaa_vertex.hpp"
+#include "msaa_pixel.hpp"
 
 #include "airconv_context.hpp"
 #include "air_signature.hpp"
@@ -90,33 +91,6 @@ air::ArgumentBindingBuffer lineBinding(unsigned slot, bool constant, const char 
   };
 }
 
-Value *linear(IRBuilder<> &b, Value *a, Value *z, Value *t) {
-  Type *type = a->getType();
-  if (type->isFloatingPointTy() || (type->isVectorTy() && type->getScalarType()->isFloatingPointTy())) {
-    Value *fraction = t->getType() == type->getScalarType()
-      ? t : b.CreateFPCast(t, type->getScalarType());
-    if (auto *vector = dyn_cast<FixedVectorType>(type))
-      fraction = b.CreateVectorSplat(vector->getNumElements(), fraction);
-    return b.CreateFAdd(a, b.CreateFMul(b.CreateFSub(z, a), fraction));
-  }
-  if (auto *array = dyn_cast<ArrayType>(type)) {
-    Value *out = UndefValue::get(type);
-    for (unsigned i = 0; i < array->getNumElements(); ++i)
-      out = b.CreateInsertValue(out, linear(b, b.CreateExtractValue(a, i),
-                                             b.CreateExtractValue(z, i), t), i);
-    return out;
-  }
-  if (auto *structure = dyn_cast<StructType>(type)) {
-    Value *out = UndefValue::get(type);
-    for (unsigned i = 0; i < structure->getNumElements(); ++i)
-      out = b.CreateInsertValue(out, linear(b, b.CreateExtractValue(a, i),
-                                             b.CreateExtractValue(z, i), t), i);
-    return out;
-  }
-  // Integral (flat) varyings, viewport and layer use D3D's leading vertex.
-  return a;
-}
-
 Value *component(IRBuilder<> &b, Value *vector, unsigned index) {
   return b.CreateExtractElement(vector, b.getInt32(index));
 }
@@ -154,15 +128,6 @@ MDNode *lineOutput(LLVMContext &context, StringRef name) {
     MDString::get(context, "air.arg_type_name"), MDString::get(context, "float2"),
     MDString::get(context, "air.arg_name"), MDString::get(context, name)
   });
-}
-
-uint64_t userHash(StringRef name) {
-  uint64_t hash = 14695981039346656037ull;
-  for (unsigned char c : name) {
-    hash ^= c;
-    hash *= 1099511628211ull;
-  }
-  return hash;
 }
 
 bool nonPerspective(const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &options, const MDNode &output) {
@@ -237,7 +202,7 @@ Value *expandedLine(IRBuilder<> &b, Value *encoded, Value *records, Value *indic
     }
   }
   valid = b.CreateAnd(valid, b.CreateFCmpOLE(lo, hi));
-  Value *start = linear(b, p0, p1, lo), *end = linear(b, p0, p1, hi);
+  Value *start = lineBlend(b, p0, p1, lo), *end = lineBlend(b, p0, p1, hi);
   Value *startW = component(b, start, 3), *endW = component(b, end, 3);
   valid = b.CreateAnd(valid, b.CreateAnd(b.CreateFCmpOGT(startW, ConstantFP::get(b.getFloatTy(), 0)),
                                              b.CreateFCmpOGT(endW, ConstantFP::get(b.getFloatTy(), 0))));
@@ -331,7 +296,7 @@ Value *expandedLine(IRBuilder<> &b, Value *encoded, Value *records, Value *indic
   // no-perspective varying is linear in screen-edge t = t*w1 / w(t).
   auto screenT = [&](Value *t) -> Value * {
     return b.CreateFDiv(b.CreateFMul(t, component(b, p1, 3)),
-      component(b, linear(b, p0, p1, t), 3));
+      component(b, lineBlend(b, p0, p1, t), 3));
   };
   for (unsigned i = 0; i < native->getNumElements(); ++i) {
     Value *field = nullptr;
@@ -343,7 +308,7 @@ Value *expandedLine(IRBuilder<> &b, Value *encoded, Value *records, Value *indic
     else {
       Value *t = nonPerspective(options, *cast<MDNode>(outputs->getOperand(i)))
         ? b.CreateSelect(atEnd, screenT(hi), screenT(lo)) : b.CreateSelect(atEnd, hi, lo);
-      field = linear(b, b.CreateExtractValue(a, i), b.CreateExtractValue(z, i), t);
+      field = lineBlend(b, b.CreateExtractValue(a, i), b.CreateExtractValue(z, i), t);
     }
     result = b.CreateInsertValue(result, field, i);
   }

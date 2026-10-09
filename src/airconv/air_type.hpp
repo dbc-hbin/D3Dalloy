@@ -3,14 +3,12 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Type.h"
 #include <cassert>
-#include <map>
 
 namespace dxmt::air {
 
 class AirType {
 
 public:
-  llvm::Type *getTypeByMetalTypeName(const std::string &name);
   AirType(llvm::LLVMContext &context);
 
   llvm::Type *_bool;
@@ -71,8 +69,6 @@ public:
   llvm::Type *_interpolant;
 
   llvm::Type *_mesh;
-
-  std::map<std::string, llvm::Type *> typeContext;
 
   llvm::Type* to_vec4_type(llvm::Type* scalar) {
     if(scalar == _int) {

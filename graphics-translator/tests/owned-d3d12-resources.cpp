@@ -409,6 +409,35 @@ void testPlacedHeapLifetime(ID3D12Device* device) {
     heapDesc.Properties = props;
     ComPtr<ID3D12Heap> heap;
     check(device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap(lifetime)");
+    UINT size = 1, value = 0x12345678, readback = 0;
+    expect(heap->GetPrivateData(kHeapLifetimeMarker, &size, nullptr), DXGI_ERROR_NOT_FOUND, "private missing");
+    if (size != 0) fail("private missing size");
+    expect(heap->SetPrivateData(kHeapLifetimeMarker, 0, nullptr), S_FALSE, "private erase missing");
+    check(heap->SetPrivateData(kHeapLifetimeMarker, sizeof(value), &value), "private bytes");
+    expect(heap->GetPrivateData(kHeapLifetimeMarker, nullptr, &readback), E_INVALIDARG, "private null size");
+    size = 1;
+    expect(heap->GetPrivateData(kHeapLifetimeMarker, &size, &readback), DXGI_ERROR_MORE_DATA, "private short buffer");
+    if (size != sizeof(value) || readback != 0) fail("private short buffer contents");
+    check(heap->GetPrivateData(kHeapLifetimeMarker, &size, &readback), "private readback");
+    if (readback != value) fail("private bytes mismatch");
+    bool queryReleased = false;
+    auto* queryMarker = new HeapLifetimeMarker(&queryReleased);
+    check(heap->SetPrivateDataInterface(kHeapLifetimeMarker, queryMarker), "private replace bytes");
+    queryMarker->Release();
+    size = 0;
+    check(heap->GetPrivateData(kHeapLifetimeMarker, &size, nullptr), "private interface size");
+    if (size != sizeof(IUnknown*)) fail("private interface size mismatch");
+    IUnknown* queried = nullptr;
+    size = sizeof(queried) - 1;
+    expect(heap->GetPrivateData(kHeapLifetimeMarker, &size, &queried), DXGI_ERROR_MORE_DATA, "private short interface");
+    if (queried || size != sizeof(queried)) fail("private short interface contents");
+    check(heap->GetPrivateData(kHeapLifetimeMarker, &size, &queried), "private interface readback");
+    if (queried != queryMarker) fail("private interface identity");
+    check(heap->SetPrivateData(kHeapLifetimeMarker, sizeof(value), &value), "private replace interface");
+    if (queryReleased) fail("private interface missing returned reference");
+    queried->Release();
+    if (!queryReleased) fail("private interface leaked reference");
+    check(heap->SetPrivateData(kHeapLifetimeMarker, 0, nullptr), "private erase");
     bool released = false;
     auto* marker = new HeapLifetimeMarker(&released);
     const HRESULT markerHr = heap->SetPrivateDataInterface(kHeapLifetimeMarker, marker);
@@ -1385,23 +1414,33 @@ void testUnalignedBlockTextures(ID3D12Device* device) {
     commands.list->CopyTextureRegion(&textureEdge, 4, 4, 0, &uploadEdge, &edge);
     const auto uploadedEdgeBlock = bcBlock(format, 6);
     std::memcpy(expected.data() + footprints[0].Offset + 256 + format.bytes, uploadedEdgeBlock.data(), format.bytes);
-    // Invalid footprint offset/pitch and physical bounds must leave texture bytes unchanged.
+    // Invalid copies poison Close; check each rejection on a fresh, unsubmitted list.
+    auto rejectCopy = [&](const D3D12_TEXTURE_COPY_LOCATION& dst, UINT x, UINT y,
+                          const D3D12_TEXTURE_COPY_LOCATION& src, const D3D12_BOX& box) {
+      ComPtr<ID3D12CommandAllocator> invalidAllocator;
+      ComPtr<ID3D12GraphicsCommandList> invalidList;
+      check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&invalidAllocator)),
+            "BC invalid copy allocator");
+      check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, invalidAllocator.Get(), nullptr,
+                                      IID_PPV_ARGS(&invalidList)), "BC invalid copy list");
+      invalidList->CopyTextureRegion(&dst, x, y, 0, &src, &box);
+      expect(invalidList->Close(), E_INVALIDARG, "BC invalid copy Close");
+    };
     const D3D12_BOX firstBlock{0,0,0,4,4,1};
     auto invalidUpload = uploadEdge;
     invalidUpload.PlacedFootprint.Offset += 1;
-    commands.list->CopyTextureRegion(&textureEdge, 0, 0, 0, &invalidUpload, &firstBlock);
+    rejectCopy(textureEdge, 0, 0, invalidUpload, firstBlock);
     invalidUpload = uploadEdge; invalidUpload.PlacedFootprint.Footprint.RowPitch = 255;
-    commands.list->CopyTextureRegion(&textureEdge, 0, 0, 0, &invalidUpload, &firstBlock);
+    rejectCopy(textureEdge, 0, 0, invalidUpload, firstBlock);
     const D3D12_BOX outside{4,4,0,12,8,1};
-    commands.list->CopyTextureRegion(&textureEdge, 0, 0, 0, &uploadEdge, &outside);
-    // Invalid interior ends/origins must not emit partial native block copies.
-    for (const auto& box : invalidBoxes) commands.list->CopyTextureRegion(&edgeDst, 0, 0, 0, &edgeSrc, &box);
+    rejectCopy(textureEdge, 0, 0, uploadEdge, outside);
+    for (const auto& box : invalidBoxes) rejectCopy(edgeDst, 0, 0, edgeSrc, box);
     const D3D12_BOX aligned{0,0,0,4,4,1};
     commands.list->SetPredication(predicate.Get(), 8, D3D12_PREDICATION_OP_EQUAL_ZERO);
     commands.list->CopyTextureRegion(&edgeDst, 4, 0, 0, &edgeSrc, &aligned);
     commands.list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
-    commands.list->CopyTextureRegion(&edgeDst, 1, 0, 0, &edgeSrc, &aligned);
-    commands.list->CopyTextureRegion(&edgeDst, 0, 1, 0, &edgeSrc, &aligned);
+    rejectCopy(edgeDst, 1, 0, edgeSrc, aligned);
+    rejectCopy(edgeDst, 0, 1, edgeSrc, aligned);
     transition(commands.list.Get(), placed.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION edgeReadback{}; edgeReadback.pResource = readback.Get();
     edgeReadback.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;

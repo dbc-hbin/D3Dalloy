@@ -250,7 +250,6 @@ HRESULT PreflightInstalled(HANDLE file, UINT version) {
 struct OwnedCoreModule {
   std::shared_ptr<File> installed_file, requested_file;
   HMODULE module = nullptr;
-  std::wstring path;
   const OwnedD3D12CoreBridge1 *bridge = nullptr;
   ~OwnedCoreModule() { if (module) FreeLibrary(module); }
 };
@@ -281,7 +280,7 @@ HRESULT LoadCoreLocked(UINT version, const std::wstring &requested, std::shared_
     out = found->second; return S_OK;
   }
   auto core = std::make_shared<OwnedCoreModule>();
-  core->installed_file = std::move(baseline); core->requested_file = std::move(candidate); core->path = path;
+  core->installed_file = std::move(baseline); core->requested_file = std::move(candidate);
   core->module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
   if (!core->module) return HRESULT_FROM_WIN32(GetLastError());
   std::wstring live;

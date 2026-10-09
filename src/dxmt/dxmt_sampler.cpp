@@ -17,17 +17,17 @@ Sampler::decRef() {
 Rc<Sampler>
 Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod_bias, uint32_t reduction) {
   Rc<Sampler> ret = new Sampler();
-  ret->info_ = info;
+  WMTSamplerInfo normal_sampler_info = info;
   auto create = [&](WMTSamplerInfo &sampler_info) {
     return reduction ? device.newSamplerStateWithReduction(sampler_info, reduction)
                      : device.newSamplerState(sampler_info);
   };
 
-  ret->sampler_state = create(ret->info_);
+  ret->sampler_state = create(normal_sampler_info);
   if (!ret->sampler_state) {
     return nullptr;
   }
-  ret->sampler_state_handle = ret->info_.gpu_resource_id;
+  ret->sampler_state_handle = normal_sampler_info.gpu_resource_id;
 
   WMTSamplerInfo cube_sampler_info = info;
   // it's probably still wrong, but the best result we can get

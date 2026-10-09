@@ -190,20 +190,20 @@ void FilterModesByDesc(std::vector<DXGI_MODE_DESC1> &Modes,
                   TargetMode.Format == mode.Format;
   }
 
-  for (auto it = Modes.begin(); it != Modes.end();) {
-    bool skipMode = it->Stereo != TargetMode.Stereo;
+  std::erase_if(Modes, [&](const DXGI_MODE_DESC1 &mode) {
+    bool skipMode = mode.Stereo != TargetMode.Stereo;
 
     if (testScanlineOrder)
-      skipMode |= it->ScanlineOrdering != TargetMode.ScanlineOrdering;
+      skipMode |= mode.ScanlineOrdering != TargetMode.ScanlineOrdering;
 
     if (testScaling)
-      skipMode |= it->Scaling != TargetMode.Scaling;
+      skipMode |= mode.Scaling != TargetMode.Scaling;
 
     if (testFormat)
-      skipMode |= it->Format != TargetMode.Format;
+      skipMode |= mode.Format != TargetMode.Format;
 
-    it = skipMode ? Modes.erase(it) : ++it;
-  }
+    return skipMode;
+  });
 
   // Filter by closest resolution
   uint32_t minDiffResolution = 0;
@@ -217,13 +217,11 @@ void FilterModesByDesc(std::vector<DXGI_MODE_DESC1> &Modes,
           return std::min(current, diff);
         });
 
-    for (auto it = Modes.begin(); it != Modes.end();) {
-      uint32_t diff = std::abs(int32_t(TargetMode.Width - it->Width)) +
-                      std::abs(int32_t(TargetMode.Height - it->Height));
-
-      bool skipMode = diff != minDiffResolution;
-      it = skipMode ? Modes.erase(it) : ++it;
-    }
+    std::erase_if(Modes, [&](const DXGI_MODE_DESC1 &mode) {
+      uint32_t diff = std::abs(int32_t(TargetMode.Width - mode.Width)) +
+                      std::abs(int32_t(TargetMode.Height - mode.Height));
+      return diff != minDiffResolution;
+    });
   }
 
   // Filter by closest refresh rate
@@ -241,16 +239,15 @@ void FilterModesByDesc(std::vector<DXGI_MODE_DESC1> &Modes,
           return std::min(current, diff);
         });
 
-    for (auto it = Modes.begin(); it != Modes.end();) {
-      uint64_t rate = uint64_t(it->RefreshRate.Numerator) *
+    std::erase_if(Modes, [&](const DXGI_MODE_DESC1 &mode) {
+      uint64_t rate = uint64_t(mode.RefreshRate.Numerator) *
                       uint64_t(TargetMode.RefreshRate.Denominator) /
-                      uint64_t(it->RefreshRate.Denominator);
+                      uint64_t(mode.RefreshRate.Denominator);
       uint64_t diff =
           std::abs(int64_t(rate - uint64_t(TargetMode.RefreshRate.Numerator)));
 
-      bool skipMode = diff != minDiffRefreshRate;
-      it = skipMode ? Modes.erase(it) : ++it;
-    }
+      return diff != minDiffRefreshRate;
+    });
   }
 }
 
