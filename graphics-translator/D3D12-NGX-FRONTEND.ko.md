@@ -34,7 +34,7 @@ D3D12의 success는 `0x00000001`, failure는 NVIDIA public `0xBAD00000` 계열�
 
 D3D12만 사용해도 D3D11 resource slot은 **공식 ABI의 일부**이므로 보존한다. 공식 SDK snapshot은 `external/nvngx/include/`이고 라이선스는 `external/nvngx/LICENSE.txt`다. Slot 검사에는 공식 header로 컴파일한 consumer object를 사용한다([검증 레시피](NGX-TEST.ko.md#cpupe-abi-검사)).
 
-현재 Meson은 x64/i686/ARM64/ARM64EC에 각각 맞는 MSVC facade target을 선택한다. ARM64X paired helper와 package는 `--with-nvngx`를 양 ABI build/stage에 전달한다. 기존 x64/WoW64 public proof와 10월7일 direct isolated FEX x64 NGX/NGX-contracts proof는 별도이며, 이를 native x86 temporal/Composition 및 전체 migration matrix 성공으로 확대하지 않는다. [현재 실행·증거](../docs/ARM64-FEX-IMPLEMENTATION.md)를 따른다.
+현재 Meson은 x64/i686/ARM64/ARM64EC에 각각 맞는 MSVC facade target을 선택한다. ARM64X paired helper와 package는 `--with-nvngx`를 양 ABI build/stage에 전달한다. 기존 x64/WoW64 public proof와 10월7일 direct isolated FEX x64 NGX/NGX-contracts proof는 별도이며, 이를 native x86 temporal/Composition 및 전체 migration matrix 성공으로 확대하지 않는다. [현재 실행·증거](../doc/ARM64-FEX-IMPLEMENTATION.md)를 따른다.
 
 ## Device와 feature 수명
 

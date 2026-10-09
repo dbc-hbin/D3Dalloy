@@ -18,6 +18,8 @@ FEX 소스·빌드는 [FEX-darwin](../FEX-darwin/README.md)에서 관리한다.
 
 ## 문서 안내
 
+통합 안내는 [doc/README.md](doc/README.md)를 따른다. 개발·설정·ARM64·검토 문서는 `doc/`에서 관리한다.
+
 현재 상태는 README와 CORE, 미완료 작업·실행 순서는 PRIORITIES, 날짜별 관찰은 HISTORY에서 관리한다. 기술 문서의 과거 실행 기록은 현행 지원 선언이나 새 실행 recipe를 대신하지 않는다. 과거 완료한 P0–P3와 새 backlog P0–P4는 동명일 뿐 다른 작업이다.
 
 | 읽을 내용 | 문서 |
@@ -25,15 +27,15 @@ FEX 소스·빌드는 [FEX-darwin](../FEX-darwin/README.md)에서 관리한다.
 | 현재 지원 상태·구현·검증 한계 | [구현 상태](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md) |
 | 미완료 작업·사용자 선택에 따른 실행 순서 | [구현 우선순위](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md) |
 | 현재 판정에 필요한 과거 검증 근거 | [검증 이력](graphics-translator/IMPLEMENTATION-HISTORY.ko.md) |
-| ARM64/ARM64EC/ARM64X·Wine/FEX 구성과 남은 실행 단계 | [ARM64/FEX](docs/ARM64-FEX-IMPLEMENTATION.md) |
-| 최신 리뷰·설계·후속 구현과 검증 | [2026-10-07 리뷰와 설계](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md) |
+| ARM64/ARM64EC/ARM64X·Wine/FEX 구성과 남은 실행 단계 | [ARM64/FEX](doc/ARM64-FEX-IMPLEMENTATION.md) |
+| 최신 리뷰·설계·후속 구현과 검증 | [2026-10-07 리뷰와 설계](doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md) |
 | Resource·format·view·API 계약 | [Capabilities](graphics-translator/CAPABILITIES.ko.md), [Resources](graphics-translator/D3D12-RESOURCES.ko.md), [Core contracts](graphics-translator/D3D12-CORE-CONTRACTS.ko.md), [Bundles](graphics-translator/D3D12-BUNDLES.ko.md) |
 | Queue·fence·여러 queue의 순서와 수명 | [Queue order](graphics-translator/QUEUE-ORDER.ko.md), [Fence events](graphics-translator/FENCE-EVENTS.ko.md), [Multiqueue](graphics-translator/MULTIQUEUE.ko.md) |
-| 현재 빌드·LLVM 설정·디버깅 | 아래 [빌드](#빌드), [Development](docs/DEVELOPMENT.md) |
+| 현재 빌드·LLVM 설정·디버깅 | 아래 [빌드](#빌드), [Development](doc/DEVELOPMENT.md) |
 | 격리 runtime staging·fixture 빌드/실행 | [Runtime](graphics-translator/RUNTIME.ko.md), [Smoke test](graphics-translator/SMOKE-TEST.ko.md) |
 | NGX frontend·temporal 연동·테스트 | [NGX frontend](graphics-translator/D3D12-NGX-FRONTEND.ko.md), [Integration](graphics-translator/NGX-INTEGRATION.ko.md), [Contracts](graphics-translator/NGX-CONTRACTS.ko.md), [NGX tests](graphics-translator/NGX-TEST.ko.md), [Temporal tests](graphics-translator/TEMPORAL-TEST.ko.md), [Completion tests](graphics-translator/TEMPORAL-COMPLETION-TEST.ko.md) |
-| 설정 | [Customization](docs/CUSTOMIZATION.md) |
-| Import 재현·출처 | [Frozen build](graphics-translator/BUILD.ko.md), [Source provenance](docs/provenance/source-import.json) |
+| 설정 | [Customization](doc/CUSTOMIZATION.md) |
+| Import 재현·출처 | [Frozen build](graphics-translator/BUILD.ko.md), [Source provenance](doc/provenance/source-import.json) |
 
 ## 현재 상태 — 2026-10-09
 
@@ -42,12 +44,12 @@ FEX 소스·빌드는 [FEX-darwin](../FEX-darwin/README.md)에서 관리한다.
 | 영역 | 현재 구현 및 관찰 | 아직 증명하지 않은 범위 |
 | --- | --- | --- |
 | D3D12 코어·compiler | 기본 렌더링/compute, pipeline library, query, residency, indirect, DXR 및 선정 P0–P3 계약 구현 | 모든 유효 입력·게임·GPU/OS conformance |
-| 캐시 | 자동 owned RAM/disk·same-key single-flight·metadata/disk 잠금 분리와 application ShaderCacheSession/Control·검증된 record index | native Metal archive·최종 PSO 객체 재사용; [검증 및 계측](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#follow-up-implementation-and-evidence) |
+| 캐시 | 자동 owned RAM/disk·same-key single-flight·metadata/disk 잠금 분리와 application ShaderCacheSession/Control·검증된 record index | native Metal archive·최종 PSO 객체 재사용; [검증 및 계측](doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#follow-up-implementation-and-evidence) |
 | Native ARM64/FEX | 과거 SDK05의 세 guest ABI·Metal 기록과 별도로, 10월9일 격리 ZZZ의 DLSS 도시 렌더링·리소스 검사 완료 및 FEX IR-tail 최적화를 검증 | G8 전체 migration matrix, 다른 게임·장면·전체 DXIL, 동일 조건 로딩·스터터링 개선율 |
 | 선택 frontend | ARM64/EC paired build와 PE32 packaging 옵션. 10월7일 direct isolated FEX x64 NGX·NGX-contracts·FSR SR consumer PASS 기록 | 이 기록은 generic runner·x86 FX·FG/RR 전체 native acceptance가 아님 |
 | 게임 표시·효과 | 지정 SR/alpha/FG/RR/Reflex·Composition geometry/cadence·일반 HDR proof. RR 양 ABI native parity·clean validation은 아래 증거 참조 | Composition absolute colour parity, HDR10+ GAMING, 다른 OS/GPU·실게임 품질과 성능 |
 
-남은 구현·검증은 [PRIORITIES](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md), 수정 설계와 후속 검증은 [10월7일 리뷰](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md), 최신 ZZZ 관찰은 [게임 호환성 기록](graphics-translator/ZZZ-COMPATIBILITY.ko.md)을 따른다. 과거 ARM64/FEX 보류와 low-VA 실패를 현재 상태로 읽지 않는다. Wine11.17과 ARM64 GnuTLS/FreeType을 포함한 runtime 생산은 외부 Wine-darwin의 책임이며, DXMT는 [검증된 입력](docs/ARM64-FEX-IMPLEMENTATION.md)을 소비한다.
+남은 구현·검증은 [PRIORITIES](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md), 수정 설계와 후속 검증은 [10월7일 리뷰](doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md), 최신 ZZZ 관찰은 [게임 호환성 기록](graphics-translator/ZZZ-COMPATIBILITY.ko.md)을 따른다. 과거 ARM64/FEX 보류와 low-VA 실패를 현재 상태로 읽지 않는다. Wine11.17과 ARM64 GnuTLS/FreeType을 포함한 runtime 생산은 외부 Wine-darwin의 책임이며, DXMT는 [검증된 입력](doc/ARM64-FEX-IMPLEMENTATION.md)을 소비한다.
 
 과거 Metal4 recovery **118/118**은 새44+유지74의 mixed-cut 기록이며 최신 단일 snapshot 전체 재실행이 아니다. 디스크 정리로 과거 FG/RR·SDK05·review의 로컬 결과와 문서 백업도 현재 없다. 당시 판정은 역사적 기록으로 유지하고, [현재 보유 증거](graphics-translator/IMPLEMENTATION-HISTORY.ko.md#증거를-읽는-기준)와 구분한다.
 
@@ -64,7 +66,7 @@ FEX 소스·빌드는 [FEX-darwin](../FEX-darwin/README.md)에서 관리한다.
 | `graphics-translator/tests/` | 공개 D3D12 fixture·CPU probe·frozen DXIL/DXBC |
 | `scripts/` | Build/staging/diagnostics·격리 runtime·GPU evidence runner |
 | `include/native/`, `external/`, `libs/` | Vendored 의존성; Git submodule이 아님 |
-| `graphics-translator/patches/`, `graphics-translator/upstream.lock.json`, `docs/provenance/` | Frozen import baseline과 출처 기록 |
+| `graphics-translator/patches/`, `graphics-translator/upstream.lock.json`, `doc/provenance/` | Frozen import baseline과 출처 기록 |
 
 Import baseline은 DXMT `7c8dee1c2d73415301ceb7d1fa810861cef4cd67` + owned patch 18개다.
 현재 소스를 `scripts/build-owned-graphics.py`로 재생성하거나 수정 내용을 역사적 patch로 역수출하지 않는다.
@@ -95,7 +97,7 @@ D3D11의 upstream 타깃은 변경하지 않는다. [양 ABI 실제 fence·alias
 
 현재 Meson은 `native_llvm_path`의 상대·절대 경로를 모두 처리한다. 아래는 저장소 내부 상대 경로 관례다.
 LLVM과 Wine native libraries의 아키텍처는 선택한 native target과 일치해야 한다.
-LLVM 구축과 clangd 설정은 [Development](docs/DEVELOPMENT.md)에 있다.
+LLVM 구축과 clangd 설정은 [Development](doc/DEVELOPMENT.md)에 있다.
 
 ```sh
 export LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin
@@ -152,7 +154,7 @@ M5 Pro/macOS27.0.1에서 양 ABI 각각36출력 native RGB 오차0·API/Shader V
 
 Native Mach-O 아키텍처, Windows PE ABI, guest instruction set은 독립된 축이다.
 `build-arm64.txt`, `build-arm64ec-only.txt`, `build-native-arm64.txt`의 목적과
-실제 실행 가능 범위를 [ARM64/FEX 지침](docs/ARM64-FEX-IMPLEMENTATION.md)에서 확인한다.
+실제 실행 가능 범위를 [ARM64/FEX 지침](doc/ARM64-FEX-IMPLEMENTATION.md)에서 확인한다.
 ARM64EC DLL의 raw PE machine 값이나 ARM64 object 생성만으로 Rosetta-free 실행을 판정하지 않는다.
 ARM64X는 별도 single-EC cross config가 아니라 canonical ARM64/EC Meson 입력을 함께 빌드하는
 production helper를 사용한다. Foundation helper도 이 paired 경로에 위임한다.
@@ -166,10 +168,10 @@ python3 scripts/test-owned-arm64x.py --build-root build/local/arm64x-paired-repr
 
 위 output은 새 목적지여야 한다. 과거 `build/local/arm64x-paired-production-20261002/`는 현재 보유한 실행 산출물이 아니다.
 Native Wine packaging과 실행 계층의 남은 gate는
-[ARM64/FEX](docs/ARM64-FEX-IMPLEMENTATION.md#current-gate-disposition--2026-10-09)에 분리한다.
+[ARM64/FEX](doc/ARM64-FEX-IMPLEMENTATION.md#current-gate-disposition--2026-10-09)에 분리한다.
 Native runtime과 paired SDK는 [Wine-darwin](../Wine-darwin/README.md)에서 먼저 빌드하고, 완전 owned install/staging은
-이 레포의 `scripts/package-owned-arm64.py`를 사용한다. [재현 절차](docs/ARM64-FEX-IMPLEMENTATION.md#native-wine-build-and-package-recipe)와
-[package/host 증거](docs/ARM64-FEX-IMPLEMENTATION.md#native-wine-host-evidence-and-execution-boundary)를 따른다.
+이 레포의 `scripts/package-owned-arm64.py`를 사용한다. [재현 절차](doc/ARM64-FEX-IMPLEMENTATION.md#native-wine-build-and-package-recipe)와
+[package/host 증거](doc/ARM64-FEX-IMPLEMENTATION.md#native-wine-host-evidence-and-execution-boundary)를 따른다.
 
 ## 검증
 
@@ -218,4 +220,4 @@ Manifest·로그·`result.json`·capture는 보존한다. 현재 build/install, 
 `external/nvapi/License.txt`, `external/nvngx/LICENSE.txt`,
 `include/native/directx/COPYING.MinGW-w64.txt`, `src/util/dxvk.LICENSE`는 각각의 vendored 라이선스다.
 기반 구현은 [3Shain/dxmt](https://github.com/3Shain/dxmt)에서 가져왔으며,
-정확한 import commit·patch·원본 파일 기록은 [source provenance](docs/provenance/source-import.json)에 보존한다.
+정확한 import commit·patch·원본 파일 기록은 [source provenance](doc/provenance/source-import.json)에 보존한다.

@@ -1,18 +1,18 @@
 # 구현·검증 증거 색인
 
-기준일: **2026-10-09**. 현재 지원·계약은 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 남은 작업은 [PRIORITIES](IMPLEMENTATION-PRIORITIES.ko.md), 최신 수정은 [10월7일 리뷰 implementation ledger](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#follow-up-implementation-and-evidence)를 따른다. 이 문서는 재사용할 과거 증거와 한계만 남긴 색인이다. 아래 과거 결과를 새 build·GPU·게임 실행 결과로 재분류하지 않는다.
+기준일: **2026-10-09**. 현재 지원·계약은 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 남은 작업은 [PRIORITIES](IMPLEMENTATION-PRIORITIES.ko.md), 최신 수정은 [10월7일 리뷰 implementation ledger](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#follow-up-implementation-and-evidence)를 따른다. 이 문서는 재사용할 과거 증거와 한계만 남긴 색인이다. 아래 과거 결과를 새 build·GPU·게임 실행 결과로 재분류하지 않는다.
 
 ## 증거를 읽는 기준
 
 - PASS는 해당 fixture·ABI·manifest·환경의 결과다. Mixed-cut 결과를 최신 단일 cut 전체 회귀, Windows/HLK conformance, 게임 호환성·FPS로 합치지 않는다. FAIL·INCONCLUSIVE·미실행은 이후 수정이 있어도 원본 결과를 바꾸지 않는다.
-- **2026-10-02 기존 build/ 전체가 외부 작업으로 삭제됐다.** 삭제 전 P0–P3 원본 runtime/log/JSON은 현재 보유 증거가 아니다. [Retired evidence provenance](../docs/provenance/RETIRED-BUILD-EVIDENCE.md)를 따른다. 이후 recovery/review/SDK05 증거는 별도 실행이다.
+- **2026-10-02 기존 build/ 전체가 외부 작업으로 삭제됐다.** 삭제 전 P0–P3 원본 runtime/log/JSON은 현재 보유 증거가 아니다. [Retired evidence provenance](../doc/provenance/RETIRED-BUILD-EVIDENCE.md)를 따른다. 이후 recovery/review/SDK05 증거는 별도 실행이다.
 - [10월5일 cleanup manifest](../build/local/cleanup-20261005/manifest.json)는 prefix148개·obsolete runtime37개의 payload 정리를 기록한다. 남은 manifest/로그는 실행 가능한 runtime을 뜻하지 않는다. 재실행은 현재 source의 fresh build/stage와 새 output을 사용한다.
 - **2026-10-09 현재 보유 범위:** 디스크 정리 뒤 `build/local/`에는 `zzz-ngx-enrollment-20261009`, `zzz-dlss-fix-20261009`, `zzz-fex-research-20261009`, `zzz-fex-opt-20261009`만 남아 있다. 아래 다른 root의 PASS/hash는 당시 기록이며 현재 보유한 원본 결과나 새 재검증이 아니다. 로컬 문서 검사는 없는 build 증거 링크를 별도 집계한다.
 - 긴 ledger와 삭제한 handoff/review의 원본을 보관했던 `build/local/repo-cleanup-20261008/originals/`도 현재 없다. 이 문서의 요약을 그 원본 전체가 보존돼 있다는 주장으로 읽지 않는다.
 
 ## Native ARM64/FEX 실제 실행 재개 — 2026-10-06
 
-**현재 판정:** ARM64/FEX는 보류가 아니다. [현재 native migration 범위](../docs/ARM64-FEX-IMPLEMENTATION.md)는 optimized Wine11.17·GnuTLS/FreeType closure와 G8 matrix를 구분한다.
+**현재 판정:** ARM64/FEX는 보류가 아니다. [현재 native migration 범위](../doc/ARM64-FEX-IMPLEMENTATION.md)는 optimized Wine11.17·GnuTLS/FreeType closure와 G8 matrix를 구분한다.
 
 SDK05의 동일 manifest `c59930623bc44b5120d6a74534c4d0be2b5704ecf910a67e252b23e4729453dc`에서 [ARM64 ABI](../build/local/arm64x-wow64-sdk05-arm64-abi-gpu-20261006/result.json), [x64 ABI](../build/local/arm64x-wow64-sdk05-x64-abi-gpu-20261006/result.json), [x86 ABI](../build/local/arm64x-wow64-sdk05-x86-abi-gpu-20261006/result.json)와 [ARM64 smoke](../build/local/arm64x-wow64-sdk05-arm64-smoke-20261006/result.json), [x64 smoke](../build/local/arm64x-wow64-sdk05-x64-smoke-20261006/result.json), [x86 smoke](../build/local/arm64x-wow64-sdk05-x86-smoke-20261006/result.json)가 PASS였다. COM owner/scalar·callback·Unix-call111·Metal blit/fence와 각8-frame exact graphics/compute readback, loaded hashes·actual child no-Rosetta·validation0을 확인했다. **No-present/선정 SM50-DXBC smoke이며 game/presentation/full DXIL/G8 acceptance는 아니다.**
 

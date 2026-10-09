@@ -54,7 +54,7 @@ Root가 [최종 리소스 검사 dialog](../build/local/zzz-dlss-fix-20261009/pr
 
 [최종 결과](../build/local/zzz-fex-opt-20261009/result.json)는 소스/DLL identity, 검사와 한계를 묶는다. `candidate-03`의 [DLSS 설정](../build/local/zzz-fex-opt-20261009/candidate-03/dlss-settings-confirmed.png)과 [실제 출력](../build/local/zzz-fex-opt-20261009/candidate-03/city-dlss-01.png)에서 DLSS/성능 우선·FG/RT 끄기, 캐릭터·NPC·실내 텍스처와 MetalFX temporal624×360→1280×720을 확인했다. NGX resource parse는 result1, backend는 hr0이었다. 한 장면의 렌더링 회귀이며 장시간 플레이·명시적 Metal validation-layer·전체 precompile 재실행 검증은 아니다.
 
-초기 진단 런처가 공백이 있는 `dxgi.customDeviceDesc`를 따옴표 없이 덮어써 GPU 이름이 `NVIDIA`로 잘리고 DLSS 항목이 숨겨졌다. 중복 override를 제거하고 내장 ZZZ 프로필을 쓰자 같은 FEX/runtime에서 복구됐다([설정 문법](../docs/CUSTOMIZATION.md#file-environment-and-precedence)). Streamline의 `eErrorFeatureFailedToLoad` 경고는 정상 실행에도 있으므로 그 문자열만으로 DLSS SR 실패를 판정하지 않는다. 이 잘린 이름/TAA 상태에서 얻은 앞선 FEX 프로파일은 DLSS 성능 증거가 아니며, 서로 다른 로딩 window를 전후 속도 비교로 합치지 않는다.
+초기 진단 런처가 공백이 있는 `dxgi.customDeviceDesc`를 따옴표 없이 덮어써 GPU 이름이 `NVIDIA`로 잘리고 DLSS 항목이 숨겨졌다. 중복 override를 제거하고 내장 ZZZ 프로필을 쓰자 같은 FEX/runtime에서 복구됐다([설정 문법](../doc/CUSTOMIZATION.md#file-environment-and-precedence)). Streamline의 `eErrorFeatureFailedToLoad` 경고는 정상 실행에도 있으므로 그 문자열만으로 DLSS SR 실패를 판정하지 않는다. 이 잘린 이름/TAA 상태에서 얻은 앞선 FEX 프로파일은 DLSS 성능 증거가 아니며, 서로 다른 로딩 window를 전후 속도 비교로 합치지 않는다.
 
 최신 후보는 `build/local/zzz-fex-opt-20261009/runtime`이다. 임시 게임·prefix·진단 앱과 소유한 임시 JIT 맵은 종료 확인 뒤 정리했고, 증거와 비교 기준본을 보존했다. 실사용 게임·prefix는 수정하지 않았다.
 

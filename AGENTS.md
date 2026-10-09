@@ -13,7 +13,7 @@ Do not add a WARP/CPU renderer, standalone video decode/process/encode backend, 
 
 Do not expand scope into D3D11. Change shared/D3D11 or Wine code only when necessary for a concrete D3D12 game path, keep changes minimal, and obtain explicit approval before extending work into another repository.
 
-Edit root `src/` directly. `README.md` describes the current workflow; `graphics-translator/patches/`, its upstream lock, and `docs/provenance/` preserve the frozen import baseline. Do not regenerate current sources with `scripts/build-owned-graphics.py` or export changes back into historical patches.
+Edit root `src/` directly. `README.md` describes the current workflow; `graphics-translator/patches/`, its upstream lock, and `doc/provenance/` preserve the frozen import baseline. Do not regenerate current sources with `scripts/build-owned-graphics.py` or export changes back into historical patches.
 
 ## Architecture & Data Flow
 
@@ -42,7 +42,7 @@ Edit root `src/` directly. `README.md` describes the current workflow; `graphics
 
 Use [README: build](README.md#빌드) for current root-source build/install commands, [Runtime](graphics-translator/RUNTIME.ko.md) for fresh staging and architecture/module selection, and [Smoke test](graphics-translator/SMOKE-TEST.ko.md) for fixture compilation, CPU/tooling checks and isolated GPU execution. Do not keep a second recipe here.
 
-Current support and evidence belong in [CORE](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md); pending work belongs in [PRIORITIES](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md). [HISTORY](graphics-translator/IMPLEMENTATION-HISTORY.ko.md) is a compact evidence index, not a task queue. Do not recreate session handoffs or duplicate mutable progress here. The current source review and implementation ledger is [the 2026-10-07 review](docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md).
+Current support and evidence belong in [CORE](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md); pending work belongs in [PRIORITIES](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md). [HISTORY](graphics-translator/IMPLEMENTATION-HISTORY.ko.md) is a compact evidence index, not a task queue. Do not recreate session handoffs or duplicate mutable progress here. The current source review and implementation ledger is [the 2026-10-07 review](doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md).
 
 There is no configured lint target or general application `run` command. Respect applicable `.clang-format` files; do not invent `ninja lint` or package-manager commands.
 Runtime destinations and evidence output directories must be fresh. Never install DLLs into an existing game or live Wine prefix; use a copied runtime and dedicated prefix.
@@ -61,7 +61,7 @@ Runtime destinations and evidence output directories must be fresh. Never instal
 - `src/d3d12/d3d12.cpp`, `src/d3d11/d3d11.cpp`, and adjacent `.def` files: public entry points/exports.
 - `src/d3d12/d3d12_interfaces.hpp`: private cross-DLL temporal ABI. `owned_submission_ring.hpp`, `owned_queue_task_fifo.hpp`, and `owned_rtas_lifetime.hpp` in that directory document concurrency/lifetime invariants.
 - `src/airconv/airconv_public.h`, `src/airconv/dxil_converter.hpp`: compiler ABI and lowering contract.
-- `dxmt.conf`, `docs/CUSTOMIZATION.md`: configuration, including `DXMT_CONFIG_FILE`/`DXMT_CONFIG`. `docs/DEVELOPMENT.md`: debugging background; prefer root README build instructions over older recipes.
+- `dxmt.conf`, `doc/CUSTOMIZATION.md`: configuration, including `DXMT_CONFIG_FILE`/`DXMT_CONFIG`. `doc/DEVELOPMENT.md`: debugging background; prefer root README build instructions over older recipes.
 
 ## Runtime/Tooling Preferences
 

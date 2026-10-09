@@ -29,7 +29,7 @@
 | NGX Ray Reconstruction | Native validation blocker 해소. 비공개 version0x10000으로 Apple non-fused GPU 경로 선택; 독립 native50 frame·양 ABI 각각36출력 RGB 오차0·API/Shader Validation 오류0·입력 동등성 PASS | 다른 OS/GPU에서 private 선택자의 계약, 실제 게임 loader·화질/성능 검증. 자체 RR 알고리즘 추가가 아닌 native 위임을 유지한다. [현재 증거](CORE-IMPLEMENTATION-STATUS.ko.md#rr-native-validation-재검증--2026-10-07) |
 | HDR10+ GAMING | 일반 HDR10/scRGB/PQ·EDR, generic transport 조사, Samsung APP/GPU·calibration 근거 | Supported Gaming payload/SSTM·native mode/readback·owner/restore·calibrated GPU tone-map·실제 적합 출력. Mandatory sink ACK를 임의로 요구하지 않음 |
 
-이 항목은 게임 관련 기능의 미완료로 유지한다. ALLM/SBTM/HDR10+ video·DX11 SR·validation suppression·내부 상태 echo로 대체하지 않는다. 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)과 [현재 리뷰의 native 계약](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#outstanding-externalnative-contracts)을 따른다.
+이 항목은 게임 관련 기능의 미완료로 유지한다. ALLM/SBTM/HDR10+ video·DX11 SR·validation suppression·내부 상태 echo로 대체하지 않는다. 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)과 [현재 리뷰의 native 계약](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#outstanding-externalnative-contracts)을 따른다.
 
 ## 게임/장치 요구가 확인될 때 확장할 항목
 
@@ -50,7 +50,7 @@ Mask1은 node0 선택이지 multi-GPU 사용 증거가 아니다. Capability que
 
 PipelineLibrary/CachedPSO/자동 RAM·disk cache/application ShaderCacheSession, COPY timestamps, programmable offsets, unaligned BC, CalculateLOD, budget notification, retained arena 성장, 선정 SR/alpha/FG/Reflex는 구현된 기반이다. 새로운 수명·ABI·정확성 결함은 이 완료 기록과 별도로 수정한다.
 
-ARM64/FEX는 보류 상태가 아니다. 과거 SDK05·login03 fixture 기록과 별도로 10월9일 격리 ZZZ의 DLSS 도시 출력, 리소스 검사 완료 및 FEX 최적화 회귀를 확인했다([현재 증거](ZZZ-COMPATIBILITY.ko.md)). G8 전체 native migration matrix, 다른 게임·장면·전체 DXIL 및 동일 조건 로딩·스터터링 성능 검증은 남아 있다. Wine/FEX 생산과 입력 경계는 [ARM64/FEX](../docs/ARM64-FEX-IMPLEMENTATION.md)를 따른다.
+ARM64/FEX는 보류 상태가 아니다. 과거 SDK05·login03 fixture 기록과 별도로 10월9일 격리 ZZZ의 DLSS 도시 출력, 리소스 검사 완료 및 FEX 최적화 회귀를 확인했다([현재 증거](ZZZ-COMPATIBILITY.ko.md)). G8 전체 native migration matrix, 다른 게임·장면·전체 DXIL 및 동일 조건 로딩·스터터링 성능 검증은 남아 있다. Wine/FEX 생산과 입력 경계는 [ARM64/FEX](../doc/ARM64-FEX-IMPLEMENTATION.md)를 따른다.
 
 ## 검증과 성능 판정
 

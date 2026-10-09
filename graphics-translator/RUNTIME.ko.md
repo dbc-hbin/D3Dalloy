@@ -20,7 +20,7 @@ Defaults are `x86_64`/`x64`. 그 외 조합은 거부한다. 표는 **staging la
 - Generic GPU runner의 `--guest-arch {x86,x64,arm64}`는 ISA assertion이지 FEX 활성화 옵션이 아니다. Native FEX의 선정 ABI/smoke 실행은 [Wine-darwin](../../Wine-darwin/README.md)의 `scripts/run-owned-wine-arm64.py --dxmt-root <DXMT 레포>` 경로로 검증한다. Generic runner의 FEX 거부를 native 실행 전체 미구현으로 해석하지 않으며, 10월7일 direct public frontend 실행도 generic runner acceptance와 구분한다.
 - **Schema 1은 legacy x86_64/x64 manifest를 읽는 호환 경로만 남아 있다.** 새 stage는 schema 1을 생성하지 않는다. 기존 manifest를 손으로 schema 2로 relabel하지 말고 실제 binaries에서 새 stage를 만든다.
 
-ARM64 compiler/bridge·Wine SDK/plugin의 관측과 native Wine/FEX 최종 acceptance는 [ARM64-FEX-IMPLEMENTATION.md](../docs/ARM64-FEX-IMPLEMENTATION.md)에서 분리한다. Schema 2나 ARM64 launch 명령만으로 `strict_no_rosetta_proven`을 주장하지 않는다.
+ARM64 compiler/bridge·Wine SDK/plugin의 관측과 native Wine/FEX 최종 acceptance는 [ARM64-FEX-IMPLEMENTATION.md](../doc/ARM64-FEX-IMPLEMENTATION.md)에서 분리한다. Schema 2나 ARM64 launch 명령만으로 `strict_no_rosetta_proven`을 주장하지 않는다.
 
 ## 빌드 입력과 함께 교체할 모듈
 
@@ -73,7 +73,7 @@ python3 scripts/stage-owned-graphics.py verify \
 
 ### WoW64
 
-x86 fixture는 `build-win32.txt`로 별도 생성한 **같은 세대** i386 install을 `--dxmt-install32`로 함께 stage한다. x86_64/x64와 arm64/ARM64X native WoW64 구성을 구분하며, ARM64X에는 해당 runtime의 pinned FEX modules와 nonzero guest-window CPU-pointer 계약이 추가된다. `--guest-arch x86`만 붙여 없던 i386 modules를 만들 수 없다. SDK05와 후속 native ABI proof는 [ARM64/FEX](../docs/ARM64-FEX-IMPLEMENTATION.md)를 따른다.
+x86 fixture는 `build-win32.txt`로 별도 생성한 **같은 세대** i386 install을 `--dxmt-install32`로 함께 stage한다. x86_64/x64와 arm64/ARM64X native WoW64 구성을 구분하며, ARM64X에는 해당 runtime의 pinned FEX modules와 nonzero guest-window CPU-pointer 계약이 추가된다. `--guest-arch x86`만 붙여 없던 i386 modules를 만들 수 없다. SDK05와 후속 native ABI proof는 [ARM64/FEX](../doc/ARM64-FEX-IMPLEMENTATION.md)를 따른다.
 
 ### 선택적 owned NVIDIA extension
 

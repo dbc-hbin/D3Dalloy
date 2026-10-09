@@ -2,7 +2,7 @@
 
 ## 문서 범위와 판정
 
-현재 소스 빌드는 [README.md](../README.md#빌드), LLVM/Wine SDK와 debug controls는 [DEVELOPMENT.md](../docs/DEVELOPMENT.md), staging은 [RUNTIME.ko.md](RUNTIME.ko.md)가 기준이다. 여기서는 **현재 fixture를 다시 빌드해 새 private runtime·prefix에서 실행하는 방법**과 기록된 관측을 분리한다. 아래 명령은 반복 절차이며 실행한 named result만 PASS 증거다. 새 P0 공개 계약·VRS/sharing 결과는 [CORE P0 ledger](CORE-IMPLEMENTATION-STATUS.ko.md#p0-공개-계약-정합)를 따른다.
+현재 소스 빌드는 [README.md](../README.md#빌드), LLVM/Wine SDK와 debug controls는 [DEVELOPMENT.md](../doc/DEVELOPMENT.md), staging은 [RUNTIME.ko.md](RUNTIME.ko.md)가 기준이다. 여기서는 **현재 fixture를 다시 빌드해 새 private runtime·prefix에서 실행하는 방법**과 기록된 관측을 분리한다. 아래 명령은 반복 절차이며 실행한 named result만 PASS 증거다. 새 P0 공개 계약·VRS/sharing 결과는 [CORE P0 ledger](CORE-IMPLEMENTATION-STATUS.ko.md#p0-공개-계약-정합)를 따른다.
 
 지원 matrix·검증 경계는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거), 미완료 작업·실행 선택은 [PRIORITIES](IMPLEMENTATION-PRIORITIES.ko.md), 날짜별 관찰은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에서 관리한다. 과거 완료한 P0–P3 개발 단계와 새 backlog P0–P4는 다르다. Named acceptance·mixed-cut recovery를 전체 conformance나 최신 단일cut 실행으로 읽지 않는다.
 
@@ -10,7 +10,7 @@
 
 저장소 루트에서 필요한 범위만 실행한다.
 
-문서/packaging 회귀에는 `scripts/test-owned-documentation.py`, `test-owned-arm64x-build.py`, `test-owned-arm64-package.py`도 있다. ARM64X의 선택적 실제 SDK graph 검증은 외부 Wine SDK를 가리키는 `--sdk-root` 없이는 skip되며, mock/CPU PASS를 target build나 GPU 실행으로 합산하지 않는다. Wine runner 회귀는 [Wine-darwin](../../Wine-darwin/README.md)의 `scripts/test-owned-wine-arm64-runner.py`로 이동했다. 새 correctness 회귀와 실제 적용 결과는 [리뷰 ledger](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)를 따른다.
+문서/packaging 회귀에는 `scripts/test-owned-documentation.py`, `test-owned-arm64x-build.py`, `test-owned-arm64-package.py`도 있다. ARM64X의 선택적 실제 SDK graph 검증은 외부 Wine SDK를 가리키는 `--sdk-root` 없이는 skip되며, mock/CPU PASS를 target build나 GPU 실행으로 합산하지 않는다. Wine runner 회귀는 [Wine-darwin](../../Wine-darwin/README.md)의 `scripts/test-owned-wine-arm64-runner.py`로 이동했다. 새 correctness 회귀와 실제 적용 결과는 [리뷰 ledger](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)를 따른다.
 
 ```sh
 python3 scripts/test-owned-graphics-build.py
@@ -1118,15 +1118,15 @@ CPU-only parser 회귀는 `python3 scripts/test-owned-graphics-diagnostics.py Ru
 
 ## 역사적 관측과 retained evidence
 
-아래는 **2026-09-19~21 관측 요약**이며 최신 source/runtime의 재검증이 아니다. 과거 `build/owned-*`와 `/private/tmp/owned-zzz-*`는 실행 출처 식별자이고 현재 파일 존재를 뜻하지 않는다. 당시 runtime·prefix·대형 binaries를 정리했고 이후 `build/` 삭제로 많은 log도 유실됐다. 예전 “retired-evidence에 보존했다”는 당시 조치이지 현재 availability 보증이 아니다. `docs/provenance`에 실제 남아 있는 manifest/result JSON과 CORE의 [증거 가용성](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)을 구분한다.
+아래는 **2026-09-19~21 관측 요약**이며 최신 source/runtime의 재검증이 아니다. 과거 `build/owned-*`와 `/private/tmp/owned-zzz-*`는 실행 출처 식별자이고 현재 파일 존재를 뜻하지 않는다. 당시 runtime·prefix·대형 binaries를 정리했고 이후 `build/` 삭제로 많은 log도 유실됐다. 예전 “retired-evidence에 보존했다”는 당시 조치이지 현재 availability 보증이 아니다. `doc/provenance`에 실제 남아 있는 manifest/result JSON과 CORE의 [증거 가용성](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)을 구분한다.
 
 ### PSO cache 구현과 실행 검증 (2026-09-21)
 
-당시 canonical root는 `build/owned-direct-canonical-cache-20260921`, 18-patch build였다. Native plugin hash는 `ea487e843a1c7990b8bc0d9d297e9fd3e3f46666788921a6d8fda7ce6fd56e37`; 당시 `0018` hash는 `0340701953bec5d19491ec0a0c66637b6ccb8862f532e517e5cfa3e0837bec2d`였다. Retained [import build](../docs/provenance/import-build.json), [runtime manifest](../docs/provenance/import-runtime.json)은 frozen import 식별 자료다.
+당시 canonical root는 `build/owned-direct-canonical-cache-20260921`, 18-patch build였다. Native plugin hash는 `ea487e843a1c7990b8bc0d9d297e9fd3e3f46666788921a6d8fda7ce6fd56e37`; 당시 `0018` hash는 `0340701953bec5d19491ec0a0c66637b6ccb8862f532e517e5cfa3e0837bec2d`였다. Retained [import build](../doc/provenance/import-build.json), [runtime manifest](../doc/provenance/import-runtime.json)은 frozen import 식별 자료다.
 
-- 별도 process export/import PASS: original VS와 constant-array CS/PS의 direct→indirect→direct, inheritance ON/OFF, CS `13579bdf/31415926/fedcba98` 및 PS 16/24/24 pixels. Cache/원본 PSO 해제, 반환 blob 변조 뒤 재export도 검사했다. Retained [populate](../docs/provenance/cache-populate-result.json), [restore](../docs/provenance/cache-restore-result.json).
-- Permanent fixture는 null/nonempty, truncation/corruption/foreign blob, root/shader mismatch 거부와 unaligned input 수명·blob 격리를 검사했다. Retained [pipeline-cache result](../docs/provenance/gpu-pipeline-cache.json).
-- 정상 2건 + 거부 14건은 native build/version/adapter/OS identity, size/alignment/count/relocation/layout/PSO kind 경계를 검사했다. Format 변조는 rejection fixture이지 정상 shader output 증거가 아니다. Retained [rejections](../docs/provenance/cache-rejections-result.json).
+- 별도 process export/import PASS: original VS와 constant-array CS/PS의 direct→indirect→direct, inheritance ON/OFF, CS `13579bdf/31415926/fedcba98` 및 PS 16/24/24 pixels. Cache/원본 PSO 해제, 반환 blob 변조 뒤 재export도 검사했다. Retained [populate](../doc/provenance/cache-populate-result.json), [restore](../doc/provenance/cache-restore-result.json).
+- Permanent fixture는 null/nonempty, truncation/corruption/foreign blob, root/shader mismatch 거부와 unaligned input 수명·blob 격리를 검사했다. Retained [pipeline-cache result](../doc/provenance/gpu-pipeline-cache.json).
+- 정상 2건 + 거부 14건은 native build/version/adapter/OS identity, size/alignment/count/relocation/layout/PSO kind 경계를 검사했다. Format 변조는 rejection fixture이지 정상 shader output 증거가 아니다. Retained [rejections](../doc/provenance/cache-rejections-result.json).
 - 그 당시 `CreatePipelineLibrary`는 `E_NOTIMPL`이었다. **현재에는 구현돼 있으며 별도 `pipeline-library` suite로 검증한다.** CachedPSO PASS와 library PASS를 같은 결과로 취급하지 않는다.
 - 당시 build/staging/diagnostics 16/21/42 PASS는 해당 frozen cut의 역사적 count다. 현재 test count로 재인용하지 않는다.
 
@@ -1134,7 +1134,7 @@ CPU-only parser 회귀는 `python3 scripts/test-owned-graphics-diagnostics.py Ru
 
 당시 immutable-storage canonical root는 `build/owned-direct-canonical-icb-20260920`, 17-patch build였다. Native plugin hash는 `34f794cd5efb8a4fe270e15b0df1c2dbb563c551f81d4e1d32f706b2529ee075`, compiler patch hash는 `af756950f846b88cfd43809ee4c98d41ecc256e978a173d74edcaf1dd09fb472`였다.
 
-- DXIL/IA/static-sampler exact GPU results, triangle 10 + procedural 4 DXR lanes 및 raygen별 다른 local-root layout PASS. Retained [DXIL](../docs/provenance/gpu-dxil.json), [IA](../docs/provenance/gpu-dxil-ia.json), [sampler](../docs/provenance/gpu-dxil-static-sampler.json), [RT](../docs/provenance/gpu-raytracing.json), [raygen layouts](../docs/provenance/gpu-raygen-layouts.json).
+- DXIL/IA/static-sampler exact GPU results, triangle 10 + procedural 4 DXR lanes 및 raygen별 다른 local-root layout PASS. Retained [DXIL](../doc/provenance/gpu-dxil.json), [IA](../doc/provenance/gpu-dxil-ia.json), [sampler](../doc/provenance/gpu-dxil-static-sampler.json), [RT](../doc/provenance/gpu-raytracing.json), [raygen layouts](../doc/provenance/gpu-raygen-layouts.json).
 - `UpdateScratchDataSizeInBytes=0`은 `ALLOW_UPDATE`가 없는 prebuild contract에서 정상이다. 당시 fixture의 positive result/build scratch와 전체 readback은 유지하고 update scratch만 0을 허용했다. Zero result/build scratch를 성공으로 바꾼 것이 아니다.
 - Indexed direct→indirect→direct는 16/32-bit index와 inheritance ON/OFF, 16/24/24 pixels를 검사했다. Multi-indexed는 GPU count 0/3/7 → 실제 0/3/4 commands, stride/argument offset 28 bytes, count offset 4 bytes, 2,304 uint exact였다. 잘못된 최초 base-vertex probe는 implementation regression으로 세지 않았다.
 

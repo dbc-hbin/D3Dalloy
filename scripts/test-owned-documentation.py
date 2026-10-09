@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def documents() -> list[Path]:
     # Frozen import provenance and vendored upstream documentation are not rewritten.
-    return sorted(set(ROOT.glob("*.md")) | set((ROOT / "docs").glob("*.md")) |
+    return sorted(set(ROOT.glob("*.md")) | set((ROOT / "doc").rglob("*.md")) |
                   set((ROOT / "graphics-translator").glob("*.md")))
 
 

@@ -50,7 +50,7 @@ Pristine GPTK D3DMetal4.0b2의 reference는 MPL이 Exposure.Scale을 읽지 않�
 
 ### 4. Architecture와 실제 consumer
 
-MSVC parameter facade의 현재 Meson target은 x64/i686/ARM64/ARM64EC를 구분하고 paired ARM64X packaging을 지원한다. 10월7일 direct isolated FEX x64 NGX/NGX-contracts/FSR SR의 지정 실행 기록이 있으며 ARM64/FEX는 과거 보류 상태가 아니다. Native x86 Metal4FX CPU-pointer 수정의 wrapper·FEX x86/x64 검증과 아직 실행되지 않은 전체 효과 경로는 [새 리뷰](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)에 분리한다. 다른 ABI의 build/기존 실행을 이 경로의 acceptance로 바꾸지 않는다.
+MSVC parameter facade의 현재 Meson target은 x64/i686/ARM64/ARM64EC를 구분하고 paired ARM64X packaging을 지원한다. 10월7일 direct isolated FEX x64 NGX/NGX-contracts/FSR SR의 지정 실행 기록이 있으며 ARM64/FEX는 과거 보류 상태가 아니다. Native x86 Metal4FX CPU-pointer 수정의 wrapper·FEX x86/x64 검증과 아직 실행되지 않은 전체 효과 경로는 [새 리뷰](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)에 분리한다. 다른 ABI의 build/기존 실행을 이 경로의 acceptance로 바꾸지 않는다.
 
 Synthetic loader는 system32 DLL을 직접 요청한다. 실제 게임/Streamline의 owned core DLL 선택·public NGX calls·queue encode·출력의 연결 관찰은 아직 필요하다. Vendor identity 또는 registry gate만으로 실제 loader 성공을 선언하지 않는다.
 

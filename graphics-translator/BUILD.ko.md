@@ -2,9 +2,9 @@
 
 ## 현재 소스 빌드
 
-**현재 개발의 기준은 저장소 루트 소스이며, 빌드 명령의 기준은 [README.md](../README.md#빌드)다.** LLVM/Wine SDK 설정은 [DEVELOPMENT.md](../docs/DEVELOPMENT.md), 설치 결과의 격리 스테이징은 [RUNTIME.ko.md](RUNTIME.ko.md), fixture 실행은 [SMOKE-TEST.ko.md](SMOKE-TEST.ko.md)를 사용한다.
+**현재 개발의 기준은 저장소 루트 소스이며, 빌드 명령의 기준은 [README.md](../README.md#빌드)다.** LLVM/Wine SDK 설정은 [DEVELOPMENT.md](../doc/DEVELOPMENT.md), 설치 결과의 격리 스테이징은 [RUNTIME.ko.md](RUNTIME.ko.md), fixture 실행은 [SMOKE-TEST.ko.md](SMOKE-TEST.ko.md)를 사용한다.
 
-`src/` 변경을 `graphics-translator/patches/`로 역수출하지 않는다. `upstream.lock.json`, frozen patches, `docs/provenance`는 import 출처 기록이며 현재 소스에 맞춰 갱신할 대상이 아니다. `scripts/build-owned-graphics.py`는 **현재 루트 소스를 빌드하지 않는다**. 이 스크립트로 성공한 baseline을 최신 Metal 4·DXR·ARM64 Wine/FEX 구현의 빌드/검증 결과로 보고하면 안 된다.
+`src/` 변경을 `graphics-translator/patches/`로 역수출하지 않는다. `upstream.lock.json`, frozen patches, `doc/provenance`는 import 출처 기록이며 현재 소스에 맞춰 갱신할 대상이 아니다. `scripts/build-owned-graphics.py`는 **현재 루트 소스를 빌드하지 않는다**. 이 스크립트로 성공한 baseline을 최신 Metal 4·DXR·ARM64 Wine/FEX 구현의 빌드/검증 결과로 보고하면 안 된다.
 
 현재 기능·검증 경계의 기준은 [CORE-IMPLEMENTATION-STATUS.ko.md](CORE-IMPLEMENTATION-STATUS.ko.md)다. 아래는 frozen provenance를 다시 조사해야 할 때만 사용하는 별도 절차다.
 
@@ -23,7 +23,7 @@
 | Wine SDK | 당시 `build/wine-crossover/host`의 설치 내용 |
 | Cross file | frozen source의 `build-win64.txt` |
 
-**당시 prefix가 지금 존재하거나 재사용 가능하다는 뜻이 아니다.** 과거 `build/owned-*`, `build/legacy`, `build/retired-evidence` 경로는 provenance 식별자다. 이후 `build/` 삭제로 이전 runtime/log가 유실됐으며, retained import 기록은 `docs/provenance`와 [검증·증거 가용성](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)을 기준으로 구분한다. 단순히 같은 LLVM 버전을 새로 빌드한 prefix가 아래 content hash gate를 통과한다고 보장하지 않는다.
+**당시 prefix가 지금 존재하거나 재사용 가능하다는 뜻이 아니다.** 과거 `build/owned-*`, `build/legacy`, `build/retired-evidence` 경로는 provenance 식별자다. 이후 `build/` 삭제로 이전 runtime/log가 유실됐으며, retained import 기록은 `doc/provenance`와 [검증·증거 가용성](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)을 기준으로 구분한다. 단순히 같은 LLVM 버전을 새로 빌드한 prefix가 아래 content hash gate를 통과한다고 보장하지 않는다.
 
 ## frozen 재현 입력 검증
 
