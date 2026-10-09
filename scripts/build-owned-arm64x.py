@@ -3,7 +3,7 @@
 
 The two unmodified Meson graphs retain compiler/library/link checks. ARM64X is
 only the final paired DLL link, never a single-EC Meson executable probe. Wine
-SDK inputs are rebuilt read-only from the supplied snapshot; no guest is run.
+SDK inputs are validated from a completed external Wine SDK; no guest is run.
 Core is an ordinary native PE; only the boundary DLLs are Wine builtins.
 """
 from __future__ import annotations
@@ -214,10 +214,62 @@ def audit_image(image: Path, dump: str, expected_exports: dict[str, dict[str, in
             "entry_rva": entry, "builtin": builtin, "views": views}
 
 
+def validate_wine_sdk(sdk_root: Path, readobj: Path) -> dict:
+    """Reject incomplete or changed producer inputs before any translator link."""
+    result = json.loads((sdk_root / "sdk-result.json").read_text())
+    if result.get("schema") != 1 or result.get("kind") != "paired-wine-sdk" or result.get("status") != "pass":
+        raise ValueError("Wine SDK must be a completed paired-wine-sdk schema 1 result")
+    source = result.get("source", {})
+    manifest = Path(source.get("manifest", ""))
+    if (not manifest.is_file() or hashlib.sha256(manifest.read_bytes()).hexdigest() != source.get("sha256")
+            or not (Path(source.get("path", "")) / "configure").is_file()):
+        raise ValueError("Wine SDK source identity is missing or changed")
+    source_path = Path(source["path"])
+    source_cut = json.loads(manifest.read_text())
+    current = {str(path.relative_to(source_path)): hashlib.sha256(path.read_bytes()).hexdigest()
+               for path in sorted(source_path.rglob("*")) if path.is_file() and ".git" not in path.relative_to(source_path).parts}
+    if not source_cut or current != source_cut:
+        raise ValueError("Wine SDK source snapshot changed since production")
+    variants = result.get("variants", {})
+    for abi, target, windows, machine in (
+        ("arm64", "aarch64", "aarch64-windows", "IMAGE_FILE_MACHINE_ARM64"),
+        ("arm64ec", "arm64ec", "arm64ec-windows", "IMAGE_FILE_MACHINE_ARM64EC"),
+    ):
+        variant = variants.get(abi, {})
+        if (variant.get("status") != "pass" or variant.get("native_arch") != "arm64"
+                or variant.get("windows_abi") != abi or variant.get("windows_arches") != target):
+            raise ValueError(f"Wine SDK variant is incomplete or has wrong ABI: {abi}")
+        build = Path(variant.get("build_path", "")).resolve()
+        if not build.is_relative_to(sdk_root.resolve()):
+            raise ValueError(f"Wine SDK build is outside the completed SDK root: {abi}")
+        artifacts = {row["path"]: row for row in variant.get("artifacts", [])}
+        required = [build / "tools/winebuild/winebuild", build / f"libs/winecrt0/{windows}/libwinecrt0.a",
+                    build / f"dlls/ntdll/{windows}/libntdll.a", build / f"dlls/dbghelp/{windows}/libdbghelp.a"]
+        for path in required:
+            row = artifacts.get(str(path), {})
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != row.get("sha256"):
+                raise ValueError(f"Wine SDK artifact missing or hash mismatch: {path}")
+            if path == required[0]:
+                if macho_architectures(path) != ["arm64"]:
+                    raise ValueError(f"winebuild is not thin ARM64: {path}")
+            else:
+                headers = subprocess.run([str(readobj), "--file-headers", str(path)],
+                                         capture_output=True, text=True, check=True).stdout
+                machines = re.findall(r"Machine: (\w+)", headers)
+                formats = set(re.findall(r"^Format: (\S+)", headers, re.MULTILINE))
+                # EC import descriptors are ARM64 COFF; short import records carry the EC ABI.
+                expected_machine = machine if path.name == "libwinecrt0.a" else "IMAGE_FILE_MACHINE_ARM64"
+                expected_formats = {"COFF-" + abi.upper()} if path.name == "libwinecrt0.a" else {
+                    "COFF-ARM64", "COFF-import-file-" + abi.upper()}
+                if not machines or set(machines) != {expected_machine} or formats != expected_formats:
+                    raise ValueError(f"wrong {abi} COFF archive: {path}: {set(machines)}")
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="fresh directory below build/local")
-    parser.add_argument("--wine-source", type=Path, required=True, help="existing pinned Wine source snapshot, read-only")
+    parser.add_argument("--wine-sdk", type=Path, required=True, help="completed external paired Wine SDK root, read-only")
     parser.add_argument("--llvm-mingw", type=Path, default=Path("/opt/llvm-mingw-20260616-ucrt-macos-universal"))
     parser.add_argument("--jobs", type=int, default=8)
     for frontend in OPTIONAL_MODULES:
@@ -227,12 +279,10 @@ def main() -> int:
     modules, meson_options = build_selection(args)
     root = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
-    source = args.wine_source.resolve()
+    sdk_root = args.wine_sdk.resolve()
     mingw = args.llvm_mingw.resolve()
     if output.exists() or args.jobs < 1 or not output.is_relative_to(root / "build/local"):
         parser.error("output must be fresh under build/local and jobs must be positive")
-    if not (source / "configure").is_file():
-        parser.error("--wine-source must contain the configured Wine source snapshot")
     if subprocess.run(["git", "check-ignore", "--quiet", str(output)], cwd=root).returncode:
         parser.error("output must be git-ignored")
     output.mkdir(parents=True)
@@ -244,7 +294,7 @@ def main() -> int:
     }
     result = {"schema": 1, "status": "building", "native_arch": "arm64", "windows_abi": "arm64x",
               "guest_runtime": "not_run", "scope": "fresh production PE build; not Wine/FEX execution acceptance",
-              "commands": [], "inputs": [], "artifacts": [], "wine_source": str(source),
+              "commands": [], "inputs": [], "artifacts": [], "wine_sdk": str(sdk_root),
               "meson_options": meson_options, "modules": modules}
 
     def run(command: list[str], name: str, cwd: Path = root) -> str:
@@ -262,6 +312,10 @@ def main() -> int:
                                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
 
     try:
+        sdk_result = validate_wine_sdk(sdk_root, mingw / "bin/llvm-readobj")
+        result["wine_sdk_source"] = sdk_result["source"]
+        record(sdk_root / "sdk-result.json", "external paired Wine SDK result")
+        record(Path(sdk_result["source"]["manifest"]), "Wine source identity")
         record(Path(__file__).resolve(), "paired build orchestration")
         for name in ("clang", "ld.lld", "llvm-readobj"):
             executable = (mingw / "bin" / name).resolve()
@@ -282,12 +336,6 @@ def main() -> int:
                       for path in owned_sources}
         (output / "source-cut.json").write_text(json.dumps(source_cut, indent=2, sort_keys=True) + "\n")
         result["owned_source_cut"] = str(output / "source-cut.json")
-        provenance = source.parent / "wine-source-provenance.json"
-        if provenance.is_file():
-            result["wine_source_provenance"] = json.loads(provenance.read_text())
-            record(provenance, "Wine snapshot provenance (not vendor FEX provenance)")
-        for name in ("configure", "tools/winebuild/spec32.c", "libs/winecrt0/crt_dllmain.c"):
-            record(source / name, "Wine source")
         builds = {}
         wine = {}
         runtimes = {}
@@ -297,24 +345,18 @@ def main() -> int:
         result["core_generation"] = core_generation
         for abi, target, windows, cross in (("arm64", "aarch64", "aarch64-windows", "build-arm64.txt"),
                                            ("arm64ec", "arm64ec", "arm64ec-windows", "build-arm64ec-only.txt")):
-            sdk = output / ("wine-" + abi)
-            sdk.mkdir()
-            run([str(source / "configure"), "--enable-archs=" + target, "--disable-tests", "--without-freetype",
-                 "--prefix=" + str(output / ("uninstalled-" + abi)), "CC=/usr/bin/clang", "CXX=/usr/bin/clang++",
-                 "CFLAGS=-arch arm64 -O1", "CXXFLAGS=-arch arm64 -O1", "LDFLAGS=-arch arm64"], abi + "-wine-configure", sdk)
+            sdk = Path(sdk_result["variants"][abi]["build_path"])
             archives = [sdk / "libs/winecrt0" / windows / "libwinecrt0.a",
                         sdk / "dlls/ntdll" / windows / "libntdll.a",
                         sdk / "dlls/dbghelp" / windows / "libdbghelp.a"]
-            run(["make", "-j" + str(args.jobs), "tools/winebuild/winebuild",
-                 *[str(path.relative_to(sdk)) for path in archives]], abi + "-wine-build", sdk)
             wine[abi] = archives
             for archive in archives:
-                record(archive, "fresh Wine " + abi + " CRT/import archive")
+                record(archive, "external Wine " + abi + " CRT/import archive")
                 run([str(mingw / "bin/llvm-readobj"), "--file-headers", str(archive)], abi + "-" + archive.stem + "-headers")
             winebuild = sdk / "tools/winebuild/winebuild"
             if macho_architectures(winebuild) != ["arm64"]:
                 raise RuntimeError(f"winebuild is not thin ARM64: {winebuild}")
-            record(winebuild, "fresh Wine native helper")
+            record(winebuild, "external Wine native helper")
             build = output / ("pe-" + abi)
             builds[abi] = build
             run([meson, "setup", str(build), str(root), "--cross-file", str(root / cross),
@@ -361,7 +403,7 @@ def main() -> int:
             for path in runtime:
                 record(path, "toolchain " + abi + " runtime")
 
-        winebuild = output / "wine-arm64/tools/winebuild/winebuild"
+        winebuild = Path(sdk_result["variants"]["arm64"]["build_path"]) / "tools/winebuild/winebuild"
         probe = output / "paired-dll-probe.c"
         probe.write_text('#include <windows.h>\n__declspec(dllexport) DWORD owned_arm64x_probe(void) { return GetCurrentProcessId(); }\n'
                          'BOOL WINAPI DllMain(HINSTANCE i, DWORD r, LPVOID p) { return TRUE; }\n')

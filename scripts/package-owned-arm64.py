@@ -14,10 +14,10 @@ import sys
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wine-build", type=Path, required=True, help="completed build-owned-wine-arm64-runtime.py output")
+    parser.add_argument("--wine-build", type=Path, required=True, help="completed Wine-darwin runtime build output")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--paired-build", type=Path, help="accepted build-owned-arm64x.py production closure for an ARM64X runtime")
-    parser.add_argument("--fex-build", type=Path, help="accepted build-owned-fex-windows.py output")
+    parser.add_argument("--fex-build", type=Path, help="accepted FEX-darwin Darwin/build.py output")
     parser.add_argument("--with-wow64", action="store_true", help="compile owned PE32 frontends against this native Wine SDK")
     parser.add_argument("--with-nvapi", action="store_true", help="build and stage the owned NVAPI frontend")
     parser.add_argument("--with-nvngx", action="store_true", help="build and stage the owned NGX frontend")

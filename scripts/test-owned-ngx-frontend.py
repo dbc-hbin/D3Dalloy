@@ -145,6 +145,18 @@ def verify_abi(abi: str, args: argparse.Namespace, out: Path) -> list[Path]:
     return objects
 
 
+def verify_parameter_cpu(args: argparse.Namespace) -> None:
+    out = args.out.resolve() / "parameter-cpu"
+    out.mkdir(parents=True, exist_ok=True)
+    exe = out / "parameter-contract"
+    run([os.environ.get("CXX", "clang++"), "-std=c++20", "-Wall", "-Wextra",
+         "-Wno-unused-parameter", "-DOWNED_NGX_PARAMETER_CPU_TEST",
+         f"-I{ROOT / 'src/nvngx'}",
+         str(ROOT / "graphics-translator/tests/owned-ngx-parameter-consumer-msvc.cpp"),
+         "-o", str(exe)], out / "compile.log")
+    print(run([str(exe)], out / "run.log"), end="")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-root", type=Path, default=ROOT / "build/local/build")
@@ -154,7 +166,11 @@ def main() -> int:
     parser.add_argument("--windows-abi", choices=ARCHES, default="x64")
     parser.add_argument("--all-abis", action="store_true")
     parser.add_argument("--abi-only", action="store_true")
+    parser.add_argument("--parameter-cpu-only", action="store_true")
     args = parser.parse_args()
+    if args.parameter_cpu_only:
+        verify_parameter_cpu(args)
+        return 0
     if args.all_abis and not args.abi_only:
         parser.error("--all-abis requires --abi-only; link each ABI against its own --build-root")
     for abi in ARCHES if args.all_abis else (args.windows_abi,):

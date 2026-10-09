@@ -8,10 +8,12 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from owned_graphics_arch import architecture, inspect_pe, macho_architectures, runtime_architecture
@@ -19,7 +21,9 @@ from owned_graphics_arch import architecture, inspect_pe, macho_architectures, r
 
 SCHEMA = 2
 MANIFEST = "owned-graphics-runtime.json"
-WINE_DISPLAY_SOURCE = Path(__file__).resolve().parents[1] / "toolchains/wine-game-display"
+NGX_CERTIFICATE = Path("share/dxmt/ngx-runtime.cer")
+WINE_INF = Path("share/wine/wine.inf")
+WINE_DISPLAY_SOURCE = Path(__file__).resolve().parents[2] / "Wine-darwin/toolchains/wine-game-display"
 WINE_DISPLAY_SOURCE_PIN = "913e31f201d344223bdf3d13a50a41af35893d12"
 WINE_DISPLAY_ABI_HEADERS = ("src/dxgi/dxgi_composition.h", "src/winemetal/winemetal.h")
 REQUIRED_DCOMP_EXPORTS = {"DCompositionCreateDevice", "DCompositionCreateDevice2", "DCompositionCreateDevice3"}
@@ -146,6 +150,80 @@ SYSTEM_MACHO_PREFIXES = (
 def sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def ngx_enrollment(inf: bytes, der: bytes) -> bytes:
+    """Replace only our BaseInstall directive and certificate registry section."""
+    for label, prefix in ((b"BaseInstall", b""), (b"certificate", b"\n")):
+        begin = prefix + b"; BEGIN DXMT NGX " + label + b"\n"
+        end = b"; END DXMT NGX " + label + b"\n"
+        if begin in inf:
+            if inf.count(begin) != 1 or inf.count(end) != 1:
+                raise ValueError("invalid DXMT NGX wine.inf enrollment markers")
+            start = inf.index(begin)
+            finish = inf.index(end, start) + len(end)
+            inf = inf[:start] + inf[finish:]
+    base = re.search(rb"(?im)^\[BaseInstall\][ \t]*\r?\n", inf)
+    if base is None:
+        raise ValueError("wine.inf lacks BaseInstall for NGX certificate enrollment")
+    directive = (b"; BEGIN DXMT NGX BaseInstall\n"
+                 b"AddReg=DXMT.NGX.Certificate\n; END DXMT NGX BaseInstall\n")
+    thumbprint = hashlib.sha1(der).hexdigest().upper()
+    blob = struct.pack("<III", 32, 1, len(der)) + der
+    chunks = [b",".join(f"{byte:02x}".encode() for byte in blob[offset:offset + 32])
+              for offset in range(0, len(blob), 32)]
+    section = (b"\n; BEGIN DXMT NGX certificate\n[DXMT.NGX.Certificate]\n"
+               + f'HKCU,"Software\\Microsoft\\SystemCertificates\\Root\\Certificates\\{thumbprint}","Blob",0x00000001,\\\n'.encode()
+               + b",\\\n".join(chunks) + b"\n; END DXMT NGX certificate\n")
+    return inf[:base.end()] + directive + inf[base.end():] + section
+
+
+def sign_ngx(runtime: Path, modules: tuple[Path, ...]) -> dict:
+    """Sign owned staged modules; retain the public leaf, never its private key."""
+    for executable in ("openssl", "osslsigncode"):
+        if shutil.which(executable) is None:
+            raise ValueError(f"NGX Authenticode signing requires {executable} on PATH")
+    inf = runtime / WINE_INF
+    ensure_replaceable_target(inf, runtime)
+    regular_file(inf, "Wine initialization INF")
+    ensure_replaceable_target(runtime / NGX_CERTIFICATE, runtime)
+    with tempfile.TemporaryDirectory(prefix="dxmt-ngx-signing-") as directory:
+        temporary = Path(directory)
+        key, certificate = temporary / "key.pem", temporary / "certificate.pem"
+        commands = [
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256", "-days", "3650",
+             "-subj", "/CN=DXMT Owned NGX Runtime", "-addext", "basicConstraints=critical,CA:FALSE",
+             "-addext", "keyUsage=critical,digitalSignature", "-addext", "extendedKeyUsage=codeSigning",
+             "-keyout", str(key), "-out", str(certificate)],
+            ["openssl", "x509", "-in", str(certificate), "-outform", "DER", "-out", str(temporary / "certificate.der")],
+        ]
+        try:
+            for command in commands:
+                subprocess.run(command, check=True, capture_output=True)
+            der = (temporary / "certificate.der").read_bytes()
+            enrollment = ngx_enrollment(inf.read_bytes(), der)
+            for index, relative in enumerate(modules):
+                signed = temporary / f"signed-{index}.dll"
+                subprocess.run(["osslsigncode", "sign", "-certs", str(certificate), "-key", str(key),
+                                "-h", "sha256", "-n", "DXMT Owned NGX Runtime",
+                                "-in", str(runtime / relative), "-out", str(signed)],
+                               check=True, capture_output=True)
+                subprocess.run(["osslsigncode", "verify", "-CAfile", str(certificate), "-in", str(signed)],
+                               check=True, capture_output=True)
+                shutil.copyfile(signed, runtime / relative)
+        except subprocess.CalledProcessError:
+            # Do not expose signing command output or private-key material.
+            raise ValueError("NGX Authenticode certificate generation, signing or verification failed") from None
+        public = runtime / NGX_CERTIFICATE
+        public.parent.mkdir(parents=True, exist_ok=True)
+        public.write_bytes(der)
+        inf.write_bytes(enrollment)
+    return {"method": "authenticode-sha256", "subject": "DXMT Owned NGX Runtime",
+            "trust": "Wine BaseInstall HKCU Root leaf", "private_key_retained": False,
+            "certificate": str(NGX_CERTIFICATE), "certificate_sha256": sha256(public),
+            "certificate_sha1": hashlib.sha1(der).hexdigest().upper(),
+            "wine_inf": str(WINE_INF), "wine_inf_sha256": sha256(inf),
+            "modules": {str(relative): sha256(runtime / relative) for relative in modules}}
 
 
 def under(path: Path, root: Path) -> bool:
@@ -347,8 +425,10 @@ def validate_dcomp_module(path: Path, windows_abi: str) -> None:
         raise ValueError(f"dcomp is missing required public exports: {sorted(missing)}")
 
 
-def resolve_display_artifacts(build: Path, arch: dict, with_wow64: bool) -> tuple[dict[Path, Path], dict]:
+def resolve_display_artifacts(build: Path, arch: dict, with_wow64: bool,
+                              source: Path | None = None) -> tuple[dict[Path, Path], dict]:
     """Select PE dcomp only; this source clone does not own the runtime's native overlays."""
+    source = source if source is not None else WINE_DISPLAY_SOURCE
     if arch["native_arch"] != "x86_64" or arch["windows_abi"] != "x64":
         raise ValueError("Wine display staging requires the established x86_64/x64 layout")
     if build.is_symlink() or not build.is_dir():
@@ -357,9 +437,8 @@ def resolve_display_artifacts(build: Path, arch: dict, with_wow64: bool) -> tupl
     regular_file(makefile, "Wine display build Makefile")
     with makefile.open() as stream:
         srcdir = next((line.removeprefix("srcdir = ").strip() for line in stream if line.startswith("srcdir = ")), None)
-    if srcdir is None or (build / srcdir).resolve() != WINE_DISPLAY_SOURCE.resolve():
-        raise ValueError("Wine display build must use the authorized toolchains/wine-game-display source")
-    source = WINE_DISPLAY_SOURCE
+    if srcdir is None or (build / srcdir).resolve() != source.resolve():
+        raise ValueError("Wine display build must use the authorized Wine display source")
     pin = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     if pin != WINE_DISPLAY_SOURCE_PIN:
         raise ValueError(f"Wine display source pin mismatch: {pin}")
@@ -812,6 +891,33 @@ def verify_runtime(runtime: Path) -> list[str]:
     with_nvngx = optional.get("nvngx") is True
     with_nvapi = optional.get("nvapi64") is True
     with_wow64 = optional.get("wow64") is True
+    signing = data.get("ngx_signing")
+    if with_nvngx:
+        modules = (WINDOWS_DIR / "nvngx.dll",) + ((WOW64_WINDOWS_DIR / "nvngx.dll",)
+                  if with_wow64 and optional.get("wow64_frontends") is True else ())
+        try:
+            for relative in (NGX_CERTIFICATE, WINE_INF):
+                ensure_replaceable_target(runtime / relative, runtime)
+                regular_file(runtime / relative, "NGX signing artifact")
+            der = (runtime / NGX_CERTIFICATE).read_bytes()
+            inf = (runtime / WINE_INF).read_bytes()
+            if (not isinstance(signing, dict)
+                    or signing.get("method") != "authenticode-sha256"
+                    or signing.get("subject") != "DXMT Owned NGX Runtime"
+                    or signing.get("trust") != "Wine BaseInstall HKCU Root leaf"
+                    or signing.get("private_key_retained") is not False
+                    or signing.get("certificate") != str(NGX_CERTIFICATE)
+                    or signing.get("certificate_sha256") != sha256(runtime / NGX_CERTIFICATE)
+                    or signing.get("certificate_sha1") != hashlib.sha1(der).hexdigest().upper()
+                    or signing.get("wine_inf") != str(WINE_INF)
+                    or signing.get("wine_inf_sha256") != sha256(runtime / WINE_INF)
+                    or signing.get("modules") != {str(relative): sha256(runtime / relative) for relative in modules}
+                    or ngx_enrollment(inf, der) != inf):
+                problems.append("manifest NGX signing provenance or enrollment changed")
+        except (OSError, ValueError) as error:
+            problems.append(f"cannot verify NGX signing: {error}")
+    elif signing is not None:
+        problems.append("manifest NGX signing requires selected nvngx modules")
     with_dcomp = optional.get("dcomp") is True
     with_fex = optional.get("fex_x64") is True
     with_fex_x86 = optional.get("fex_x86") is True
@@ -1092,6 +1198,7 @@ def stage(
     dxmt_install32: Path | None = None,
     native_arch: str = "x86_64", windows_abi: str = "x64",
     *, with_fsr: bool = False, wine_display_build: Path | None = None, fex_build: Path | None = None,
+    wine_display_source: Path | None = None,
 ) -> None:
     arch = architecture(native_arch, windows_abi)
     UNIX_DIR = Path(arch["unix_directory"])
@@ -1102,7 +1209,7 @@ def stage(
         validate_destination(dest, wine_source, dxmt_install32)
     if wine_display_build is not None:
         validate_destination(dest, wine_source, wine_display_build)
-        validate_destination(dest, wine_source, WINE_DISPLAY_SOURCE)
+        validate_destination(dest, wine_source, wine_display_source if wine_display_source is not None else WINE_DISPLAY_SOURCE)
     validate_source_runtime(wine_source, arch)
     with_wow64 = dxmt_install32 is not None
     if with_wow64:
@@ -1165,7 +1272,7 @@ def stage(
         dxmt_artifacts.update(resolve_wow64_artifacts(dxmt_install32, with_nvngx, with_nvapi, with_fsr))
     display_sources, display_provenance = ({}, None)
     if wine_display_build is not None:
-        display_sources, display_provenance = resolve_display_artifacts(wine_display_build, arch, with_wow64)
+        display_sources, display_provenance = resolve_display_artifacts(wine_display_build, arch, with_wow64, wine_display_source)
         for relative, module in display_sources.items():
             baseline = wine_source / relative
             if baseline.is_file() and sha256(baseline) == sha256(module):
@@ -1190,6 +1297,8 @@ def stage(
             if target.exists():
                 target.unlink()
             shutil.copy2(source, target)
+        ngx_signing = sign_ngx(temporary, tuple(relative for relative in dxmt_artifacts
+                              if relative.name == "nvngx.dll")) if with_nvngx else None
         records = artifact_records(temporary, with_nvngx, with_nvapi, wow64_artifacts(with_wow64, with_nvngx, with_nvapi, with_fsr) + tuple(display_sources) + fex_extra, arch, with_fsr=with_fsr)
         manifest = {
             "schema": SCHEMA,
@@ -1237,6 +1346,8 @@ def stage(
                 "preservation_reason": "the Wine runtime may contain unrelated consumers; selection is blocked by the owned wrapper",
             },
         }
+        if ngx_signing is not None:
+            manifest["ngx_signing"] = ngx_signing
         if display_provenance is not None:
             manifest["optional_modules"]["dcomp"] = True
             manifest["wine_display_frontend"] = display_provenance
@@ -1267,8 +1378,10 @@ def main() -> int:
     stage_parser.add_argument("--dxmt-install32", type=Path, help="optional 32-bit Meson install prefix containing i386-windows; stages WoW64 modules into lib/wine/i386-windows")
     stage_parser.add_argument("--wine-source", required=True, type=Path, help="untouched Wine runtime to copy")
     stage_parser.add_argument("--wine-dest", required=True, type=Path, help="new destination; must not already exist")
-    stage_parser.add_argument("--fex-build", type=Path, help="accepted build-owned-fex-windows.py output; stage the pinned Darwin FEX x64 emulator")
-    stage_parser.add_argument("--wine-display-build", type=Path, help="selected Wine build of the pinned toolchains/wine-game-display clone; stage updated builtin dcomp.dll only, paired with WoW64 when selected")
+    stage_parser.add_argument("--fex-build", type=Path, help="accepted FEX-darwin Darwin/build.py output; stage the pinned Darwin FEX x64 emulator")
+    stage_parser.add_argument("--wine-display-build", type=Path, help="Wine-darwin display build; stage builtin dcomp.dll only, paired with WoW64 when selected")
+    stage_parser.add_argument("--wine-display-source", type=Path, default=WINE_DISPLAY_SOURCE,
+                              help="pinned Wine checkout used by the display build; defaults to sibling Wine-darwin toolchains")
     stage_parser.add_argument("--with-nvngx", action="store_true", help="require and stage owned nvngx.dll only if D3D12 exports/marker validate")
     stage_parser.add_argument("--with-nvapi", action="store_true", help="require owned nvapi64.dll for the selected Windows ABI and nvapi.dll when staging WoW64, each with QueryInterface ordinal 2")
     stage_parser.add_argument("--with-fsr", action="store_true", help="require owned MetalFX FSR upscaling and frame-generation DLLs matching the selected Windows ABI and WoW64 when selected, each with builtin marker and five C ABI exports/ordinals")
@@ -1291,7 +1404,7 @@ def main() -> int:
     dest = args.wine_dest.expanduser().absolute()
     dxmt_install32 = args.dxmt_install32.expanduser().resolve() if args.dxmt_install32 else None
     wine_display_build = args.wine_display_build.expanduser().absolute() if args.wine_display_build else None
-    stage(dxmt_install, wine_source, dest, args.with_nvngx, args.with_nvapi, dxmt_install32, args.native_arch, args.windows_abi, with_fsr=args.with_fsr, wine_display_build=wine_display_build, fex_build=args.fex_build.resolve() if args.fex_build else None)
+    stage(dxmt_install, wine_source, dest, args.with_nvngx, args.with_nvapi, dxmt_install32, args.native_arch, args.windows_abi, with_fsr=args.with_fsr, wine_display_build=wine_display_build, fex_build=args.fex_build.resolve() if args.fex_build else None, wine_display_source=args.wine_display_source.expanduser().resolve())
     print(f"PRIVATE owned-graphics runtime staged: {dest}")
     print("Use it only with an explicit isolated WINEPREFIX; the wrapper forces owned builtin graphics modules.")
     print(f"Verify later with: {Path(__file__).name} verify --runtime {dest}")

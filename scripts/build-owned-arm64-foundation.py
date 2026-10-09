@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,16 +20,18 @@ import sys
 
 from owned_graphics_arch import inspect_pe, macho_architectures
 
+SPEC = importlib.util.spec_from_file_location("owned_arm64x", Path(__file__).with_name("build-owned-arm64x.py"))
+assert SPEC and SPEC.loader
+paired_builder = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(paired_builder)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="fresh isolated evidence/build directory")
     parser.add_argument("--native-llvm", type=Path, default=Path("toolchains/llvm-15-arm64/llvm@15/15.0.7"))
     parser.add_argument("--llvm-mingw", type=Path, default=Path("/opt/llvm-mingw-20260616-ucrt-macos-universal"))
-    parser.add_argument("--wine-sdk", type=Path, default=Path("toolchains/wine-sdk"))
-    parser.add_argument("--wine-build", type=Path, help="use an isolated real Wine build instead of an installed SDK")
-    parser.add_argument("--wine-ec-build", type=Path, help="separate pure-EC Wine build for the ARM64EC configuration")
-    parser.add_argument("--wine-source", type=Path, help="pinned Wine source snapshot for fresh paired ARM64X SDK inputs")
+    parser.add_argument("--wine-sdk", type=Path, required=True, help="completed external paired Wine SDK root, read-only")
     parser.add_argument("--jobs", type=int, default=8)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -84,8 +87,7 @@ def main() -> int:
                 candidates = [path.parent / dependency.removeprefix("@loader_path/")]
             elif dependency.startswith("@rpath/"):
                 name = dependency.removeprefix("@rpath/")
-                candidates = ([*args.wine_build.resolve().glob("dlls/*/" + name)] if args.wine_build
-                              else [sdk / "lib/wine/aarch64-unix" / name])
+                candidates = list(Path(sdk_result["variants"]["arm64"]["build_path"]).glob("dlls/*/" + name))
             else:
                 candidates = [Path(dependency)]
             candidates = [candidate.resolve() for candidate in candidates if candidate.is_file()]
@@ -102,6 +104,7 @@ def main() -> int:
                                     "dependencies": dependencies, "local_dependencies": local_dependencies})
 
     try:
+        sdk_result = paired_builder.validate_wine_sdk(sdk, mingw / "bin/llvm-readobj")
         for executable in (llvm / "bin/llvm-config", mingw / "bin/clang", mingw / "bin/llvm-readobj", mingw / "bin/lld-link"):
             if "arm64" not in macho_architectures(executable.resolve()):
                 raise RuntimeError(f"tool has no native ARM64 slice: {executable}")
@@ -139,12 +142,9 @@ def main() -> int:
         # Full production graph first: never substitute the toolchain probe for this attempt.
         configurations = (("arm64", "build-arm64.txt"),
                           ("arm64ec", "build-arm64ec-only.txt"))
-        wine_option = ("-Dwine_build_path=" + str(args.wine_build.resolve()) if args.wine_build
-                       else "-Dwine_install_path=" + str(sdk))
         for abi, cross in configurations:
             build = output / ("windows-" + abi)
-            selected_wine = ("-Dwine_build_path=" + str(args.wine_ec_build.resolve())
-                             if abi == "arm64ec" and args.wine_ec_build else wine_option)
+            selected_wine = "-Dwine_build_path=" + sdk_result["variants"][abi]["build_path"]
             setup = run([meson, "setup", str(build), str(root), "--cross-file", str(root / cross),
                          "--native-file", str(root / "build-native-arm64.txt"),
                          "-Dnative_arch=arm64", "-Dnative_llvm_path=" + os.path.relpath(llvm, root), selected_wine,
@@ -213,12 +213,9 @@ def main() -> int:
 
         # Hybrid DLLs need two complete production/CRT halves; an EC-only
         # executable check or a /noentry metadata fixture cannot prove them.
-        wine_source = (args.wine_source.resolve() if args.wine_source else
-                       args.wine_build.resolve().parent / "wine-source" if args.wine_build else
-                       sdk / "wine-source")
         paired = output / "paired-arm64x"
         hybrid = run([sys.executable, str(root / "scripts/build-owned-arm64x.py"),
-                      "--output", str(paired), "--wine-source", str(wine_source),
+                      "--output", str(paired), "--wine-sdk", str(sdk),
                       "--llvm-mingw", str(mingw), "--jobs", str(args.jobs)], "paired-arm64x-build")
         result["commands"].append(hybrid)
         if hybrid["returncode"]:

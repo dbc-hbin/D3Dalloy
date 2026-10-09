@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("owned_package", ROOT / "scripts/package-owned-wine-arm64.py")
+SPEC = importlib.util.spec_from_file_location("owned_package", ROOT / "scripts/package-owned-arm64.py")
 assert SPEC and SPEC.loader
 package = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(package)
@@ -40,7 +40,7 @@ class PackageFrontendTests(unittest.TestCase):
                     commands.append(command)
                     return subprocess.CompletedProcess(command, 0)
 
-                arguments = [str(ROOT / "scripts/package-owned-wine-arm64.py"), "--wine-build", str(wine),
+                arguments = [str(ROOT / "scripts/package-owned-arm64.py"), "--wine-build", str(wine),
                              "--output", str(base / "package"), "--with-wow64"]
                 if enabled:
                     arguments += ["--with-nvapi", "--with-nvngx", "--with-fsr"]

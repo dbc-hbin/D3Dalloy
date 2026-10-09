@@ -1,3 +1,42 @@
+#ifdef OWNED_NGX_PARAMETER_CPU_TEST
+#include "nvngx_parameter.hpp"
+#include <cstdio>
+
+int main() {
+    dxmt::ParametersImpl params;
+    int failures = 0;
+    auto check = [&](bool ok, const char* name) {
+        std::printf("NGX_PARAMETER_CONTRACT_%s case=%s\n", ok ? "PASS" : "FAIL", name);
+        failures += !ok;
+    };
+    int token = 0;
+    void* pointer = &token;
+    auto* resource = reinterpret_cast<ID3D12Resource*>(pointer);
+    ID3D12Resource* out_resource = nullptr;
+    void* out_pointer = nullptr;
+    params.Set("Color", pointer);
+    check(params.Get("Color", &out_resource) == NVNGX_RESULT_OK && out_resource == resource,
+          "void_to_d3d12");
+    params.Set("typed", resource);
+    check(params.Get("typed", &out_pointer) == NVNGX_RESULT_OK && out_pointer == pointer,
+          "d3d12_to_void");
+    params.Set("other_api", reinterpret_cast<ID3D11Resource*>(pointer));
+    check(params.Get("other_api", &out_resource) == NVNGX_RESULT_FAIL, "cross_api_rejected");
+    check(params.Get("missing", &out_resource) == NVNGX_RESULT_FAIL, "missing_rejected");
+    params.Set("null", static_cast<void*>(nullptr));
+    out_resource = resource;
+    check(params.Get("null", &out_resource) == NVNGX_RESULT_OK && out_resource == nullptr,
+          "stored_null_preserved");
+    params.Set("numeric", 7u);
+    check(params.Get("numeric", &out_resource) == NVNGX_RESULT_FAIL, "numeric_resource_rejected");
+    float number = 0;
+    check(params.Get("numeric", &number) == NVNGX_RESULT_OK && number == 7.0f,
+          "numeric_conversion_preserved");
+    params.Reset();
+    check(params.Get("Color", &out_resource) == NVNGX_RESULT_FAIL, "reset_clears_resources");
+    return failures ? 1 : 0;
+}
+#else
 #include <nvsdk_ngx_params.h>
 
 // Official-header consumer bridge compiled with the Microsoft C++ ABI. It is
@@ -26,6 +65,10 @@ void ngx_smoke_set_resource(NVSDK_NGX_Parameter* params, const char* name,
     params->Set(name, value);
 }
 
+void ngx_smoke_set_pointer(NVSDK_NGX_Parameter* params, const char* name, void* value) {
+    params->Set(name, value);
+}
+
 NVSDK_NGX_Result ngx_smoke_get_float(const NVSDK_NGX_Parameter* params, const char* name,
                                      float* value) {
     return params->Get(name, value);
@@ -51,3 +94,4 @@ void ngx_smoke_reset(NVSDK_NGX_Parameter* params) {
 }
 
 }
+#endif

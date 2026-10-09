@@ -82,6 +82,22 @@ castable(unsigned long long val, void **out) {
   return true;
 }
 
+// Streamline stores D3D12 resources through the void* overload. Preserve the
+// pointer alias without accepting numeric values or D3D11 resources.
+template <>
+inline bool
+castable(void *val, ID3D12Resource **out) {
+  *out = static_cast<ID3D12Resource *>(val);
+  return true;
+}
+
+template <>
+inline bool
+castable(ID3D12Resource *val, void **out) {
+  *out = val;
+  return true;
+}
+
 template <>
 inline bool
 castable(void *val, unsigned long long *out) {

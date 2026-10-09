@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import hashlib
 import subprocess
 import struct
 import tempfile
@@ -128,6 +129,142 @@ class StagingPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing required D3D12 exports"):
                 stage_owned_graphics.resolve_dxmt_artifacts(self.dxmt, True, False)
 
+    def ngx_inputs(self, wow64: bool = False) -> Path | None:
+        inf = self.wine / stage_owned_graphics.WINE_INF
+        inf.parent.mkdir(parents=True)
+        inf.write_bytes(b"; unrelated\r\n[BaseInstall]\r\nAddReg=Existing\r\n[Existing]\r\n; keep\r\n")
+        install32 = self.root / "install32" if wow64 else None
+        directories = [("x64", self.dxmt / stage_owned_graphics.DXMT_WINDOWS_DIR)]
+        if wow64:
+            (self.wine / stage_owned_graphics.WOW64_WINDOWS_DIR).mkdir()
+            directory = install32 / stage_owned_graphics.DXMT_WOW64_DIR
+            directory.mkdir(parents=True)
+            directories.append(("x86", directory))
+            for name in stage_owned_graphics.WINDOWS_MODULES:
+                image = (self.core_image("x86", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll")
+                         else self.pe_image(0x14C, stage_owned_graphics.WINE_BUILTIN_MARKER))
+                (directory / name).write_bytes(image)
+        for abi, directory in directories:
+            image = bytearray(self.pe_image(0x14C if abi == "x86" else 0x8664, bytes(0x1000)))
+            struct.pack_into("<II", image, 0x58 + 32, 0x1000, 0x200)
+            struct.pack_into("<II", image, 0x58 + 56, 0x2000, 0x200)
+            offset = 0x58 + (96 if abi == "x86" else 112)
+            struct.pack_into("<I", image, offset - 4, 16)
+            struct.pack_into("<II", image, offset, 0x1100, 0x700)
+            exports = sorted(stage_owned_graphics.REQUIRED_NGX_D3D12_EXPORTS)
+            struct.pack_into("<IIIIII", image, 0x310, 1, len(exports), len(exports), 0x1140, 0x1180, 0x11C0)
+            cursor = 0x400
+            for index, name in enumerate(exports):
+                struct.pack_into("<I", image, 0x340 + index * 4, 0x1900 + index)
+                struct.pack_into("<I", image, 0x380 + index * 4, cursor + 0xE00)
+                struct.pack_into("<H", image, 0x3C0 + index * 2, index)
+                encoded = name.encode() + b"\0"
+                image[cursor:cursor + len(encoded)] = encoded
+                cursor += len(encoded)
+            marker = stage_owned_graphics.OWNED_NGX_D3D12_MARKER + b"\0" + stage_owned_graphics.WINE_BUILTIN_MARKER
+            image[0xA00:0xA00 + len(marker)] = marker
+            (directory / "nvngx.dll").write_bytes(image)
+        return install32
+
+    def test_ngx_real_signing_metadata_integrity_and_restaging(self) -> None:
+        install32 = self.ngx_inputs(wow64=True)
+        original_inf = (self.wine / stage_owned_graphics.WINE_INF).read_bytes()
+        sources = [self.dxmt / stage_owned_graphics.DXMT_WINDOWS_DIR / "nvngx.dll",
+                   install32 / stage_owned_graphics.DXMT_WOW64_DIR / "nvngx.dll"]
+        original_modules = [path.read_bytes() for path in sources]
+        run = subprocess.run
+        with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
+             mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]), \
+             mock.patch.object(stage_owned_graphics.subprocess, "run", wraps=run) as invoked:
+            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_nvngx=True, dxmt_install32=install32)
+            self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
+            commands = [call.args[0] for call in invoked.call_args_list]
+            for action in ("sign", "verify"):
+                self.assertEqual(sum(command[:2] == ["osslsigncode", action] for command in commands), 2)
+            self.assertTrue(all("-t" not in command and "-ts" not in command for command in commands))
+            request = next(command for command in commands if command[:2] == ["openssl", "req"])
+            self.assertEqual(request[request.index("-days") + 1], "3650")
+            for extension in ("basicConstraints=critical,CA:FALSE", "keyUsage=critical,digitalSignature", "extendedKeyUsage=codeSigning"):
+                self.assertIn(extension, request)
+            self.assertFalse(Path(request[request.index("-keyout") + 1]).parent.exists())
+            manifest_path = self.dest / stage_owned_graphics.MANIFEST
+            manifest = json.loads(manifest_path.read_text())
+            signing = manifest["ngx_signing"]
+            der = (self.dest / stage_owned_graphics.NGX_CERTIFICATE).read_bytes()
+            self.assertEqual(signing["certificate_sha1"], hashlib.sha1(der).hexdigest().upper())
+            self.assertEqual(signing["certificate_sha256"], hashlib.sha256(der).hexdigest())
+            self.assertIs(signing["private_key_retained"], False)
+            for relative, digest in signing["modules"].items():
+                self.assertEqual(digest, manifest["artifacts"][relative]["sha256"])
+                self.assertNotIn((self.dest / relative).read_bytes(), original_modules)
+            inf = (self.dest / stage_owned_graphics.WINE_INF).read_bytes()
+            registry = inf.split(b'"Blob",0x00000001,\\\n', 1)[1].split(b"\n; END", 1)[0]
+            blob = bytes.fromhex(registry.replace(b"\\\n", b"").replace(b",", b" ").decode())
+            self.assertEqual(blob, struct.pack("<III", 32, 1, len(der)) + der)
+            self.assertEqual((self.wine / stage_owned_graphics.WINE_INF).read_bytes(), original_inf)
+            self.assertEqual([path.read_bytes() for path in sources], original_modules)
+            self.assertEqual(list(self.dest.rglob("*.pem")), [])
+            for relative in (stage_owned_graphics.NGX_CERTIFICATE, stage_owned_graphics.WINE_INF):
+                path = self.dest / relative
+                payload = path.read_bytes()
+                path.write_bytes(payload + b"tampered")
+                self.assertTrue(any("NGX signing" in problem for problem in stage_owned_graphics.verify_runtime(self.dest)))
+                path.write_bytes(payload)
+            del manifest["ngx_signing"]
+            manifest_path.write_text(json.dumps(manifest))
+            self.assertTrue(any("NGX signing" in problem for problem in stage_owned_graphics.verify_runtime(self.dest)))
+            manifest["ngx_signing"] = signing
+            manifest_path.write_text(json.dumps(manifest))
+            restaged = self.root / "restaged"
+            stage_owned_graphics.stage(self.dxmt, self.dest, restaged, with_nvngx=True, dxmt_install32=install32)
+            self.assertEqual(stage_owned_graphics.verify_runtime(restaged), [])
+            fresh_der = (restaged / stage_owned_graphics.NGX_CERTIFICATE).read_bytes()
+            self.assertNotEqual(fresh_der, der)
+            fresh_inf = (restaged / stage_owned_graphics.WINE_INF).read_bytes()
+            self.assertEqual(fresh_inf, stage_owned_graphics.ngx_enrollment(original_inf, fresh_der))
+            self.assertEqual(fresh_inf.count(b"[DXMT.NGX.Certificate]"), 1)
+            self.assertNotIn(signing["certificate_sha1"].encode(), fresh_inf)
+
+    def test_ngx_missing_signing_tools_never_publish(self) -> None:
+        self.ngx_inputs()
+        for missing in ("openssl", "osslsigncode"):
+            with self.subTest(missing=missing), \
+                 mock.patch.object(stage_owned_graphics.shutil, "which", side_effect=lambda name: None if name == missing else name), \
+                 mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
+                 mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
+                with self.assertRaisesRegex(ValueError, f"requires {missing}"):
+                    stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_nvngx=True)
+                self.assertFalse(self.dest.exists())
+                self.assertEqual(list(self.root.glob("runtime-new.staging-*")), [])
+
+    def test_ngx_signing_failure_cleans_key_and_staging(self) -> None:
+        self.ngx_inputs()
+        run = subprocess.run
+        commands = []
+        def fail(command, **kwargs):
+            commands.append(command)
+            if command[:2] == ["osslsigncode", "sign"]:
+                raise subprocess.CalledProcessError(1, command, output=b"private output must not escape")
+            return run(command, **kwargs)
+        with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
+             mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]), \
+             mock.patch.object(stage_owned_graphics.subprocess, "run", side_effect=fail):
+            with self.assertRaisesRegex(ValueError, "NGX Authenticode") as failure:
+                stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_nvngx=True)
+            self.assertNotIn("private output", str(failure.exception))
+        self.assertFalse(Path(commands[0][commands[0].index("-keyout") + 1]).parent.exists())
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(list(self.root.glob("runtime-new.staging-*")), [])
+
+    def test_ngx_enrollment_preserves_bytes_and_replaces_only_owned_blocks(self) -> None:
+        original = b"; retain\r\n[BaseInstall]\r\nAddReg=Unrelated\r\n[Unrelated]\r\nHKCU,Other,Value,0,text"
+        first = stage_owned_graphics.ngx_enrollment(original, b"first")
+        self.assertEqual(stage_owned_graphics.ngx_enrollment(first, b"second"),
+                         stage_owned_graphics.ngx_enrollment(original, b"second"))
+        self.assertIn(b"AddReg=Unrelated\r\n[Unrelated]\r\nHKCU,Other,Value,0,text", first)
+        with self.assertRaisesRegex(ValueError, "lacks BaseInstall"):
+            stage_owned_graphics.ngx_enrollment(b"[Other]\n", b"certificate")
+
     def fsr_image(self, marker: bytes = stage_owned_graphics.OWNED_FSR_MARKER, abi: str = "x64",
                   exports: tuple[str, ...] = ("ffxConfigure", "ffxCreateContext", "ffxDestroyContext", "ffxDispatch", "ffxQuery")) -> bytearray:
         machine = {"x86": 0x14C, "x64": 0x8664, "arm64": 0xAA64, "arm64ec": 0x8664}[abi]
@@ -212,6 +349,15 @@ class StagingPolicyTests(unittest.TestCase):
 
     def test_display_build_rejects_wrong_source_pin_pristine_and_stale_outputs(self) -> None:
         build = self.display_build()
+        source = stage_owned_graphics.WINE_DISPLAY_SOURCE
+        with mock.patch.object(stage_owned_graphics, "WINE_DISPLAY_SOURCE", self.wine):
+            artifacts, provenance = stage_owned_graphics.resolve_display_artifacts(
+                build, architecture("x86_64", "x64"), False, source)
+            self.assertEqual(len(artifacts), 1)
+            self.assertEqual(provenance["source_directory"], str(source.resolve()))
+            with self.assertRaises(ValueError):
+                stage_owned_graphics.stage(self.dxmt, self.wine, source / "runtime",
+                    wine_display_build=build, wine_display_source=source)
         with mock.patch.object(stage_owned_graphics, "WINE_DISPLAY_SOURCE_PIN", "0" * 40):
             with self.assertRaisesRegex(ValueError, "pin mismatch"):
                 stage_owned_graphics.resolve_display_artifacts(build, architecture("x86_64", "x64"), False)
