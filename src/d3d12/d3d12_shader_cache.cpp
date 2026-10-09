@@ -5,6 +5,7 @@
 #include "sha1/sha1_util.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <list>
 #include <map>
@@ -328,11 +329,51 @@ struct FileHandle {
   ~FileHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
 };
 
+struct AutomaticDiskAccounting {
+  uint64_t bytes;
+  DWORD valid, reserved;
+};
+static_assert(sizeof(AutomaticDiskAccounting) == 16);
+
+struct AutomaticAccountingMapping {
+  HANDLE handle = nullptr;
+  AutomaticDiskAccounting *state = nullptr;
+  ~AutomaticAccountingMapping() {
+    if (state) UnmapViewOfFile(state);
+    if (handle) CloseHandle(handle);
+  }
+};
+
+// Retain handles so successive publications (and overlapping processes) share accounting.
+// This lock protects only registry ownership, never disk I/O or application-session caches.
+std::mutex automatic_accounting_mutex;
+std::map<std::wstring, std::unique_ptr<AutomaticAccountingMapping>> automatic_accounting;
+
+HRESULT AutomaticAccounting(const std::wstring &directory, AutomaticDiskAccounting *&state) {
+  std::lock_guard lock(automatic_accounting_mutex);
+  auto found = automatic_accounting.find(directory);
+  if (found == automatic_accounting.end()) {
+    auto mapping = std::make_unique<AutomaticAccountingMapping>();
+    const auto hash = Sha1HashState::compute(directory.data(), directory.size() * sizeof(WCHAR));
+    const auto name = L"Local\\dxmt-pso-accounting-v1-" + Hex(hash.data, sizeof(hash.data));
+    mapping->handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                         sizeof(AutomaticDiskAccounting), name.c_str());
+    if (!mapping->handle) return FileError();
+    mapping->state = static_cast<AutomaticDiskAccounting *>(
+        MapViewOfFile(mapping->handle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(AutomaticDiskAccounting)));
+    if (!mapping->state) return FileError();
+    found = automatic_accounting.emplace(directory, std::move(mapping)).first;
+  }
+  state = found->second->state;
+  return S_OK;
+}
+
 // Disk metadata transactions never call into the in-process pipeline cache. Reads use atomic
 // published files and FILE_SHARE_DELETE, so they need neither this mutex nor a directory scan.
 struct AutomaticDiskLock {
   HANDLE value = nullptr;
   bool acquired = false;
+  AutomaticDiskAccounting *accounting = nullptr;
   HRESULT acquire(const std::wstring &directory) {
     const auto hash = Sha1HashState::compute(directory.data(), directory.size() * sizeof(WCHAR));
     const auto name = L"Local\\dxmt-pso-" + Hex(hash.data, sizeof(hash.data));
@@ -340,7 +381,12 @@ struct AutomaticDiskLock {
     if (!value) return FileError();
     const DWORD result = WaitForSingleObject(value, 1000);
     acquired = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
-    if (acquired) return S_OK;
+    if (acquired) {
+      const HRESULT hr = AutomaticAccounting(directory, accounting);
+      if (FAILED(hr)) return hr;
+      if (result == WAIT_ABANDONED) accounting->valid = 0;
+      return S_OK;
+    }
     return result == WAIT_FAILED ? FileError() : DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
   }
   ~AutomaticDiskLock() {
@@ -478,23 +524,45 @@ void WriteAutomaticPipelineCache(const Sha1Digest &key, ID3DBlob *blob) {
     if (FAILED(Paths(false, directory, executable))) return;
     AutomaticDiskLock lock;
     if (FAILED(lock.acquire(directory))) return;
+    auto &accounting = *lock.accounting;
+    const bool rescan = !accounting.valid;
+    uint64_t total = accounting.bytes;
+    // Invalid until publication commits: temp cleanup, eviction, errors and crashes need a rescan.
+    accounting.valid = 0;
     std::vector<AutomaticDiskEntry> entries;
-    uint64_t total = 0;
-    if (FAILED(AutomaticDiskEntries(directory, entries, total, false))) return;
+    if (rescan) {
+      total = 0;
+      if (FAILED(AutomaticDiskEntries(directory, entries, total, false))) return;
+    }
     const uint64_t size = blob->GetBufferSize();
-    if (total > kAutomaticDiskBytes - size) {
-      // ponytail: scan metadata only on stores; oldest publication first, no read-side LRU writes.
+    const auto name = L"dxmt-pso-" + Hex(key.data, sizeof(key.data)) + L".bin";
+    const auto path = directory + name;
+    uint64_t replaced = 0;
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) {
+      if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return;
+      replaced = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    } else if (GetLastError() != ERROR_FILE_NOT_FOUND) return;
+    if (replaced > total) return;
+    if (total - replaced > kAutomaticDiskBytes - size) {
+      if (!rescan) {
+        total = 0;
+        if (FAILED(AutomaticDiskEntries(directory, entries, total, false))) return;
+        if (replaced > total) return;
+      }
+      const uint64_t target = kAutomaticDiskBytes - std::max<uint64_t>(size, 32ull * 1024 * 1024);
+      // Oldest publication first; reserve a batch of space, without read-side LRU writes.
       std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) { return a.age < b.age; });
       for (const auto &entry : entries) {
-        if (total <= kAutomaticDiskBytes - size) break;
+        if (total - replaced <= target) break;
+        if (entry.name == name) continue; // Keep the replacement available until atomic publication.
         if (!DeleteFileW((directory + entry.name).c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) return;
         total -= entry.bytes;
       }
     }
-    if (total > kAutomaticDiskBytes - size) return;
+    if (total - replaced > kAutomaticDiskBytes - size) return;
     const auto stem = directory + L"dxmt-pso-" + Hex(key.data, sizeof(key.data));
-    const auto path = stem + L".bin";
-    static uint32_t sequence = 0; // All writers hold the same named mutex.
+    static std::atomic<uint32_t> sequence{0};
     const uint32_t pid = GetCurrentProcessId(), serial = ++sequence;
     AutomaticTempFile temporary;
     temporary.path = stem + L"-" + Hex(&pid, sizeof(pid)) + L"-" + Hex(&serial, sizeof(serial)) + L".tmp";
@@ -506,8 +574,10 @@ void WriteAutomaticPipelineCache(const Sha1Digest &key, ID3DBlob *blob) {
         !FlushFileBuffers(temporary.file.value)) return;
     if (!CloseHandle(temporary.file.value)) return;
     temporary.file.value = INVALID_HANDLE_VALUE;
-    if (MoveFileExW(temporary.path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-      temporary.owned = false;
+    if (!MoveFileExW(temporary.path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return;
+    temporary.owned = false;
+    accounting.bytes = total - replaced + size;
+    accounting.valid = 1;
   } catch (const std::bad_alloc &) {} // Persistence must never turn successful compilation into failure.
 }
 
@@ -517,6 +587,7 @@ void RemoveAutomaticPipelineCache(const Sha1Digest &key) {
     if (FAILED(Paths(false, directory, executable))) return;
     AutomaticDiskLock lock;
     if (FAILED(lock.acquire(directory))) return;
+    lock.accounting->valid = 0;
     const auto path = directory + L"dxmt-pso-" + Hex(key.data, sizeof(key.data)) + L".bin";
     DeleteFileW(path.c_str());
   } catch (const std::bad_alloc &) {}
@@ -530,9 +601,15 @@ HRESULT ClearAutomaticPipelineCacheDisk() {
     AutomaticDiskLock lock;
     hr = lock.acquire(directory);
     if (FAILED(hr)) return hr;
+    lock.accounting->valid = 0;
     std::vector<AutomaticDiskEntry> unused;
     uint64_t total = 0;
-    return AutomaticDiskEntries(directory, unused, total, true);
+    hr = AutomaticDiskEntries(directory, unused, total, true);
+    if (SUCCEEDED(hr)) {
+      lock.accounting->bytes = 0;
+      lock.accounting->valid = 1;
+    }
+    return hr;
   } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
 }
 

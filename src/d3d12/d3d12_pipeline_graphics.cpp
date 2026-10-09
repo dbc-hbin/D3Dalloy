@@ -22,6 +22,7 @@
 #include "d3d12_pageable.hpp"
 #include "d3d12_pipeline.hpp"
 #include "d3d12_pipeline_cache.hpp"
+#include "d3d12_shader_failure.hpp"
 #include "dxmt_format.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
@@ -1707,6 +1708,9 @@ public:
               shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main",
               cache_.output(PipelineCache::Vertex), &sm50_err
           )) {
+        RecordShaderCompileFailure("VS", pDesc->VS, rootsig,
+                                   reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&rootsig),
+                                   "vs_main", SM50GetErrorMessageString(sm50_err), pDesc->pRootSignature != nullptr);
         ERR("Failed to compile vs shader: ", SM50GetErrorMessageString(sm50_err));
         return E_FAIL;
       }
@@ -1843,6 +1847,9 @@ public:
               shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(),
               cache_.output(PipelineCache::Fragment), &sm50_err
           )) {
+        RecordShaderCompileFailure("PS", pDesc->PS, rootsig,
+                                   reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&rootsig),
+                                   ps_name.c_str(), SM50GetErrorMessageString(sm50_err), pDesc->pRootSignature != nullptr);
         ERR("Failed to compile ps shader: ", SM50GetErrorMessageString(sm50_err));
         return E_FAIL;
       }

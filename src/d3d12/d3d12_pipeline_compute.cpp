@@ -23,6 +23,7 @@
 #include "d3d12_pageable.hpp"
 #include "d3d12_pipeline.hpp"
 #include "d3d12_pipeline_cache.hpp"
+#include "d3d12_shader_failure.hpp"
 #include "log/log.hpp"
 #include <chrono>
 
@@ -104,6 +105,9 @@ public:
 
     if (!cache_.loaded() && SM50Compile(shader_cs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main",
                                        cache_.output(PipelineCache::Compute), &sm50_err)) {
+      RecordShaderCompileFailure("CS", pDesc->CS, rootsig,
+                                 reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
+                                 "cs_main", SM50GetErrorMessageString(sm50_err), pDesc->pRootSignature != nullptr);
       ERR("Failed to compile cs shader: ", SM50GetErrorMessageString(sm50_err));
       return E_FAIL;
     }
