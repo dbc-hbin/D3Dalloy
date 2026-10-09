@@ -3,8 +3,6 @@
 #include <memory>
 
 namespace dxmt::framegeneration {
-enum class Mode { Metal4 };
-
 class ExecutionLease;
 
 class PreparedFrame final {

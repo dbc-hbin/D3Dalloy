@@ -13,14 +13,8 @@ struct OwnedTemporalFrame;
 struct OwnedFrameGenerationFrame;
 
 struct TemporalEncoderData : EncoderData {
-  enum class FrameGenerationStage { Begin, End };
   std::shared_ptr<OwnedTemporalFrame> frame;
   std::shared_ptr<OwnedFrameGenerationFrame> fg_frame;
-  FrameGenerationStage fg_stage = FrameGenerationStage::Begin;
-  TemporalEncoderData *fg_end = nullptr;
-  size_t fg_state_event_index = 0;
-  // Execution-only snapshot, protected by the nonoverlapping recording lease.
-  bool fg_replay = false;
 };
 
 HRESULT CreateOwnedTemporalState(MTLD3D12Device *device,

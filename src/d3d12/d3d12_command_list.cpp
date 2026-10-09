@@ -1599,60 +1599,15 @@ public:
   }
 
   HRESULT RecordFrameGeneration(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
-    // The SDK issues ordinary D3D12 compute/copy commands. Bundles cannot
-    // represent its barriers and copies, and their state changes persist.
-    // Keep these commands in our allocator with a queued validity scope.
+    const auto resources = GetOwnedFrameGenerationResources(frame);
+    const auto states = GetOwnedFrameGenerationStates(frame);
+    for (size_t i = 0; i < resources.size(); ++i)
+      if (resources[i] && !RecordImplicitUse(resources[i], 0, states[i])) return recording_error_;
+    // Native encoding leaves application roots, descriptors, predicates and queries untouched.
     allocator_->InvalidateCurrentPass();
-    auto begin = allocator_->AllocatePass<TemporalEncoderData>();
-    begin->type = EncoderType::Temporal;
-    begin->fg_frame = frame;
-    begin->fg_state_event_index = static_cast<RecordingHead *>(entry)->state_events.size();
-    allocator_->InvalidateCurrentPass();
-
-    const auto graphics_pso = pso_graphics_;
-    const auto compute_pso = pso_compute_;
-    const auto compute_rootsig = rootsig_compute_;
-    const auto heaps = descriptor_heaps_;
-    const auto dirty = dirty_state_;
-    uint64_t graphics_arguments[MTLD3D12RootSignature::kMaxRootArgumentQwords];
-    uint64_t compute_arguments[MTLD3D12RootSignature::kMaxRootArgumentQwords];
-    memcpy(graphics_arguments, rootarg_graphics_staging_, sizeof(graphics_arguments));
-    memcpy(compute_arguments, rootarg_compute_staging_, sizeof(compute_arguments));
-    const auto predicate_enabled = predication_enabled_;
-    const auto predicate_offset = predication_snapshot_offset_;
-    const auto predicate_op = predication_op_;
-    // Internal work must not consume the application's predicate or queries.
-    auto statistics = std::move(active_pipeline_statistics_);
-    predication_enabled_ = false;
-    HRESULT hr;
-    try {
-      hr = RecordOwnedFrameGenerationFrame(frame, this);
-    } catch (const std::bad_alloc &) {
-      hr = E_OUTOFMEMORY;
-    }
-    allocator_->InvalidateCurrentPass();
-    pso_graphics_ = graphics_pso;
-    pso_compute_ = compute_pso;
-    rootsig_compute_ = compute_rootsig;
-    descriptor_heaps_ = heaps;
-    memcpy(rootarg_graphics_staging_, graphics_arguments, sizeof(graphics_arguments));
-    memcpy(rootarg_compute_staging_, compute_arguments, sizeof(compute_arguments));
-    dirty_state_ = dirty;
-    predication_enabled_ = predicate_enabled;
-    predication_snapshot_offset_ = predicate_offset;
-    predication_op_ = predicate_op;
-    active_pipeline_statistics_ = std::move(statistics);
-    if (FAILED(hr)) {
-      RecordError(hr);
-      return hr;
-    }
-    if (FAILED(recording_error_)) return recording_error_;
-    auto end = allocator_->AllocatePass<TemporalEncoderData>();
-    end->type = EncoderType::Temporal;
-    end->fg_frame = frame;
-    end->fg_stage = TemporalEncoderData::FrameGenerationStage::End;
-    end->fg_state_event_index = static_cast<RecordingHead *>(entry)->state_events.size();
-    begin->fg_end = end;
+    auto pass = allocator_->AllocatePass<TemporalEncoderData>();
+    pass->type = EncoderType::Temporal;
+    pass->fg_frame = frame;
     allocator_->InvalidateCurrentPass();
     return S_OK;
   }
@@ -1678,15 +1633,6 @@ public:
     return RecordFrameGeneration(frame);
   }
 
-  HRESULT STDMETHODCALLTYPE PublishFrameGenerationOutput(IMTLD3D12FrameGenerationState *state,
-      const MTL_FRAME_GENERATION_OUTPUT_DESC *desc) final {
-    auto hr = ValidateRecording();
-    if (FAILED(hr)) return hr;
-    std::shared_ptr<OwnedFrameGenerationFrame> frame;
-    hr = PrepareOwnedFrameGenerationOutput(device_, state, desc, frame);
-    if (FAILED(hr)) return hr;
-    return RecordFrameGeneration(frame);
-  }
 
   HRESULT STDMETHODCALLTYPE TemporalUpscale(IMTLD3D12TemporalUpscaleState *state,
       const MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC *desc) final {

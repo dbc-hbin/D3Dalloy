@@ -45,10 +45,9 @@ int main(int argc, char** argv) {
         desc.depthTextureFormat = MTLPixelFormatR32Float; desc.motionTextureFormat = MTLPixelFormatRG16Float;
         desc.uiTextureFormat = MTLPixelFormatRGBA16Float;
         desc.inputWidth = desc.inputHeight = desc.outputWidth = desc.outputHeight = 128;
-        desc.requiresPrevColorTexture = YES;
+        desc.requiresPrevColorTexture = NO;
         id<MTL4FXFrameInterpolator> effect = [desc newFrameInterpolatorWithDevice:device compiler:compiler];
         require(effect != nil, "public-native-effect");
-        id<MTLTexture> previous = nil;
         unsigned interpolated = 0;
         for (unsigned frame = 1; frame <= 8; ++frame) {
             auto color = texture(device, MTLPixelFormatRGBA16Float, effect.colorTextureUsage);
@@ -62,7 +61,7 @@ int main(int argc, char** argv) {
             upload(device, queue, color, scene.data(), 128 * 8);
             upload(device, queue, depth, depths.data(), 128 * 4);
             upload(device, queue, motion, motions.data(), 128 * 4);
-            effect.colorTexture = color; effect.prevColorTexture = previous ?: color;
+            effect.colorTexture = color;
             effect.depthTexture = depth; effect.motionTexture = motion; effect.outputTexture = output;
             effect.motionVectorScaleX = effect.motionVectorScaleY = 1;
             effect.deltaTime = 1.f / 30.f; effect.nearPlane = .1f; effect.farPlane = 100.f;
@@ -72,8 +71,8 @@ int main(int argc, char** argv) {
             id<MTLBuffer> readback = [device newBufferWithLength:128 * 128 * 8 options:MTLResourceStorageModeShared];
             auto* residencyDesc = [MTLResidencySetDescriptor new];
             id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:residencyDesc error:&error];
-            id<MTLAllocation> inputs[] = {color, previous ?: color, depth, motion, output};
-            [residency addAllocations:inputs count:5]; [residency commit];
+            id<MTLAllocation> inputs[] = {color, depth, motion, output};
+            [residency addAllocations:inputs count:4]; [residency commit];
             id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
             id<MTL4CommandBuffer> command4 = [device newCommandBuffer];
             [command4 beginCommandBufferWithAllocator:allocator]; [command4 useResidencySet:residency];
@@ -93,12 +92,12 @@ int main(int argc, char** argv) {
             FILE* file = fopen(path, "wb"); require(file != nullptr, "native-output-open");
             require(fwrite(readback.contents, 128 * 128 * 8, 1, file) == 1, "native-output-write"); fclose(file);
             printf("OWNED_D3D12_FSR_FG_NATIVE_FRAME frame=%u bytes=131072 source=public-metalfx-gpu path=%s\n", frame, path);
-            [previous release]; previous = color;
+            [color release];
             [depth release]; [motion release]; [output release]; [readback release];
             [allocator release]; [command4 release]; [residency release]; [residencyDesc release];
         }
         require(interpolated != 0, "native-generated-is-not-current-copy");
-        [previous release]; [effect release]; [desc release]; [queue release]; [device release];
+        [effect release]; [desc release]; [queue release]; [device release];
         [queue4 release]; [compiler release]; [compilerDesc release]; [completed release];
         puts("OWNED_D3D12_FSR_FG_NATIVE_PASS frames=8");
     }

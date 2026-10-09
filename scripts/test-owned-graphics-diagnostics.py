@@ -598,18 +598,13 @@ OWNED_D3D12_FSR_FG_LIFETIME_PASS context_destroy_before_execute=1 input_release=
 OWNED_D3D12_FSR_FG_CONFIG_PASS repeated_id=replace retained_distinct_limit=64 overflow=runtime_error off_clears=1
 OWNED_D3D12_FSR_FG_DEBUG_PASS tear=gpu_effect reset=history debug=real_inputs configure=frame_snapshot history=unmodified alpha=opaque
 OWNED_D3D12_FSR_FG_DEBUG_CAPTURE_PASS prepare=per_frame configure=recorded rect=recorded output=independent_gpu_exact
-OWNED_D3D12_FSR_FG_DEBUG_REPLAY_PASS combined=1 debug_overlay=full_display replay=exact context_destroy_before_replay=1
-OWNED_D3D12_FSR_FG_COUNT_REJECTION_PASS counts=0,5 sentinel=exact prepare=retained multi_output_supported=1
-OWNED_D3D12_FSR_FG_NO_NOTIFY_PROXY_PASS frame=3 generated=2 result_observer=retained
+OWNED_D3D12_FSR_FG_DEBUG_REPLAY_PASS combined=1 debug_overlay=full_display replay=fresh_native context_destroy_before_replay=1
+OWNED_D3D12_FSR_FG_COUNT_REJECTION_PASS invalid=0,5 unsupported=2,3,4 sentinel=exact prepare=retained
+OWNED_D3D12_FSR_FG_NO_NOTIFY_PROXY_PASS frame=3 generated=1
 OWNED_D3D12_FSR_FG_PREPARE_ORDER_PASS matching_frame=2 newest_prepare=3 output=exact
-OWNED_D3D12_FSR_FG_GROUPED_PASS count=1 distinct_gpu_outputs=1 rect_guard=exact reset_output=unchanged
-OWNED_D3D12_FSR_FG_GROUPED_PASS count=2 distinct_gpu_outputs=2 rect_guard=exact reset_output=unchanged
-OWNED_D3D12_FSR_FG_GROUPED_PASS count=3 distinct_gpu_outputs=3 rect_guard=exact reset_output=unchanged
-OWNED_D3D12_FSR_FG_GROUPED_PASS count=4 distinct_gpu_outputs=4 rect_guard=exact reset_output=unchanged
-OWNED_D3D12_FSR_FG_MULTI_PACING_PASS counts=1,2,3,4 distinct_gpu_outputs=1 generated_before_real=1 bootstrap_reset_scenechange_disabled=zero only_generated_zero=no_present
-OWNED_D3D12_FSR_FG_QUEUES_PASS samequeue=1 nullarray=rejected count0=preserved multipqueue=3 device_type_mask=rejected rollback=atomic drain=oldframe owners=retained generated_real_ui=selected worker_idle=progress
-OWNED_D3D12_FSR_FG_RECORDING_ROLLBACK frame=2 preserved=1 consumed_by=public_present_gpu_output
-OWNED_D3D12_FSR_FG_REJECTED_GENERATION_ORDER frame=9 real_gpu_output=after_current_game_batch generated=absent
+OWNED_D3D12_FSR_FG_NATIVE_PASS count=1 distinct_gpu_outputs=1 rect_guard=exact reset_output=current
+OWNED_D3D12_FSR_FG_NATIVE_PACING_PASS count=1 generated_before_real=1 bootstrap_reset=native_output disabled=real_only callback_error=real_only
+OWNED_D3D12_FSR_FG_ORIGINAL_SDK_PASS resize1=unsupported unchanged=1 resize=implemented pacing=original
 OWNED_D3D12_FSR_FG_PROXY_PASS create=hwnd callbacks=gpu-readback generated_before_real=1 only_generated=1 disabled=1 callback_error=1 drain=1 destroy=1
 OWNED_D3D12_FSR_FG_PACING_PASS ordered=1 bounded_progress=1 qpc=observed native_timestamps=external_observer_required
 OWNED_D3D12_FSR_FG_UI_PASS wrap=real_hwnd ui=builtin_shader premultiplied=1 doublebuffer=gpu_snapshot resize=96x80 lifetime=drained
@@ -622,18 +617,19 @@ OWNED_D3D12_FSR_FG_PASS
         for frame, enabled, only, gen_error, present_error in (
                 (1, 1, 0, 0, 0), (2, 1, 0, 0, 0), (3, 1, 0, 0, 0), (4, 1, 0, 0, 0),
                 (5, 0, 0, 0, 0), (6, 0, 0, 0, 0), (7, 1, 0, 0, 0), (8, 1, 1, 0, 0),
-                (9, 1, 0, 1, 0), (10, 1, 0, 0, 1), (11, 1, 0, 0, 0), (12, 1, 1, 0, 0)):
+                (9, 1, 0, 1, 0), (10, 1, 0, 0, 0), (11, 1, 0, 0, 0), (12, 1, 1, 0, 0)):
             trace += (f"OWNED_D3D12_FSR_FG_PRESENT_CALL frame={frame} enabled={enabled} only_generated={only} "
                       f"generation_error={gen_error} present_error={present_error} "
                       f"qpc_start={frame * 100} qpc_end={frame * 100 + 10} frequency=1000\n")
-        for frame, generated, index in ((1, 0, 0), (2, 1, 1), (2, 0, 0),
-                (3, 1, 1), (3, 1, 2), (3, 0, 0), (4, 1, 1), (4, 1, 2), (4, 1, 3), (4, 0, 0),
-                (5, 0, 0), (6, 0, 0), (7, 0, 0), (8, 1, 1), (8, 1, 2), (8, 1, 3), (8, 1, 4), (9, 0, 0), (11, 0, 0)):
+        for frame, generated, index in ((1, 1, 1), (1, 0, 0), (2, 1, 1), (2, 0, 0),
+                (3, 1, 1), (3, 0, 0), (4, 1, 1), (4, 0, 0), (5, 0, 0), (6, 0, 0),
+                (7, 1, 1), (7, 0, 0), (8, 1, 1), (9, 0, 0), (10, 1, 1), (10, 0, 0),
+                (11, 1, 1), (11, 0, 0), (12, 1, 1)):
             trace += (f"OWNED_D3D12_FSR_FG_CALLBACK_PIXELS frame={frame} generated={generated} "
                       f"output_index={index} width=128 height=128 hash={frame * 16 + index:016x} marker={frame + 32},{190 if generated else 70},220\n")
-        for stream, frames in (("callback", [*range(1, 10), 11, 12]), ("builtin_ui", list(range(11, 15)))):
+        for stream, frames in (("callback", list(range(1, 13))), ("builtin_ui", list(range(11, 15)))):
             for frame in frames:
-                submitted = (sum(1 + {2: 1, 3: 2, 4: 3, 8: 4}.get(f, 0) - int(f in (8, 10, 12))
+                submitted = (sum(1 + int(f not in (5, 6, 9)) - int(f in (8, 12))
                                  for f in range(1, frame + 1)) if stream == "callback" else frame - 10)
                 unmeasured = frame == frames[0]
                 measured = 0 if unmeasured else max(1, submitted - 1)
@@ -644,20 +640,11 @@ OWNED_D3D12_FSR_FG_PASS
             trace += (f"OWNED_D3D12_FSR_FG_FINAL_STATISTICS stream={stream} output_vblanks=3 statistics=actual "
                       f"result=0x00000000 submitted_present={submitted} native_present={measured} present_refresh={refresh} "
                       f"sync_refresh={refresh} sync_qpc={measured * 100} qpc_end=20000 frequency=1000 source=public_dxgi_actual_presentation\n")
-        for frame, composition in ((1, "pending_marker"), (3, "pending_marker"), (5, "pending_marker"),
-                                   (9, "pending_marker"), (11, "builtin_ui"), (12, "builtin_ui")):
-            trace += (f"OWNED_D3D12_FSR_FG_QUEUE_PROOF frame={frame} blocked=selected idle=progress "
-                      f"composition={composition} submitted_before={frame * 2} submitted_during={frame * 2 + int(frame == 5)} "
-                      f"counter_domain=public_present_calls\n")
         self.assertTrue(self.simulate_metalfx("fsr-fg", trace)["pass"])
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("result=0x887a000b", "result=0x00000000", 1))["pass"])
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("qpc_end=20000", "qpc_end=1"))["pass"])
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("output_vblanks=3", "output_vblanks=0"))["pass"])
-        self.assertIn("submitted_before=10 submitted_during=11", trace)
-        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("submitted_before=10 submitted_during=11",
-                                                                   "submitted_before=10 submitted_during=9"))["pass"])
-        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("consumed_by=public_present_gpu_output",
-                                                                   "consumed_by=discarded"))["pass"])
+        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("resize1=unsupported", "resize1=success"))["pass"])
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace, builtin=False)["pass"])
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace, native=False)["pass"])
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("frame=8 enabled=1 only_generated=1",
@@ -676,10 +663,10 @@ OWNED_D3D12_FSR_FG_PASS
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("debug=real_inputs", "debug=ignored"))["pass"])
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("history=unmodified", "history=debug_pixels"))["pass"])
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("frame=1 generated=0 output_index=0", "frame=1 generated=1 output_index=1"))["pass"])
-        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("frame=3 generated=1 output_index=2", "frame=3 generated=1 output_index=1"))["pass"])
-        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("frame=8 generated=1 output_index=4", "frame=8 generated=0 output_index=0"))["pass"])
-        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("hash=0000000000000032", "hash=0000000000000031"))["pass"])
-        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("reset_output=unchanged", "reset_output=copy_current"))["pass"])
+        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("frame=3 generated=1 output_index=1", "frame=3 generated=1 output_index=2"))["pass"])
+        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("frame=8 generated=1 output_index=1", "frame=8 generated=0 output_index=0"))["pass"])
+        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("hash=0000000000000031", "hash=invalid"))["pass"])
+        self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("reset_output=current", "reset_output=unchanged"))["pass"])
 
     def test_fsr_real_three_channel_history_and_centered_cap_evidence(self):
         # Reduced authentic runtime02 GPU evidence; independent of runner counts.
@@ -1840,7 +1827,7 @@ class ReviewEvidenceFailures(unittest.TestCase):
 
 
 class FsrPresentationEvidence(unittest.TestCase):
-    def test_multi_phase_native_pixels_and_zero_output_suppression(self):
+    def test_native_pixels_and_original_sdk_output_sequence(self):
         # CPU-only parser protocol, deliberately NOT GPU/native display proof.
         spec = importlib.util.spec_from_file_location("fsr_capture_checker",
             ROOT / "graphics-translator/tests/check-owned-fg-capture.py")
@@ -1850,9 +1837,9 @@ class FsrPresentationEvidence(unittest.TestCase):
             fixture.mkdir(); captures.mkdir()
             stdout = "OWNED_D3D12_FSR_FG_PASS\n"
             stderr = "OWNED_D3D12_FSR_FG_OBSERVER_READY\n"
-            expected = [(1, 0, 0), (2, 1, 1), (2, 0, 0), (3, 1, 1), (3, 1, 2), (3, 0, 0),
-                        (4, 1, 1), (4, 1, 2), (4, 1, 3), (4, 0, 0), (5, 0, 0), (6, 0, 0), (7, 0, 0),
-                        (8, 1, 1), (8, 1, 2), (8, 1, 3), (8, 1, 4), (9, 0, 0), (11, 0, 0)]
+            expected = [(1, 1, 1), (1, 0, 0), (2, 1, 1), (2, 0, 0), (3, 1, 1), (3, 0, 0),
+                        (4, 1, 1), (4, 0, 0), (5, 0, 0), (6, 0, 0), (7, 1, 1), (7, 0, 0),
+                        (8, 1, 1), (9, 0, 0), (10, 1, 1), (10, 0, 0), (11, 1, 1), (11, 0, 0), (12, 1, 1)]
             for sequence, (frame, generated, index) in enumerate(expected, 1):
                 image = bytearray(bytes((32 + index * 16, 60, 100, 255)) * (128 * 128))
                 marker = bytes((frame + 32, 190 if generated else 70, 220, 255))
@@ -1871,7 +1858,7 @@ class FsrPresentationEvidence(unittest.TestCase):
                 stdout += f"OWNED_D3D12_FSR_FG_UI_FRAME frame={frame}\n"
                 stderr += (f"OWNED_D3D12_FSR_FG_DRAWABLE sequence={sequence} drawable=d{sequence} width=128 height=128 format=70 path=drawable-{sequence}.bin\n"
                            f"OWNED_D3D12_FSR_FG_PRESENTED sequence={sequence} drawable=d{sequence} time={sequence}\n")
-            for stream, frames in (("callback", [*range(1, 10), 11, 12]), ("builtin_ui", list(range(11, 15)))):
+            for stream, frames in (("callback", list(range(1, 13))), ("builtin_ui", list(range(11, 15)))):
                 for frame in frames:
                     submitted = sum(f <= frame for f, _, _ in expected) if stream == "callback" else frame - 10
                     unmeasured = frame == frames[0]
@@ -1886,28 +1873,34 @@ class FsrPresentationEvidence(unittest.TestCase):
             args = argparse.Namespace(stdout=base / "stdout.log", stderr=base / "stderr.log", captures=captures, native=None, suite="fsr-fg")
             args.stdout.write_text(stdout); args.stderr.write_text(stderr)
             self.assertEqual(checker.check(args)["attempted_drawables"], 23)
+            args.stderr.write_text(stderr.replace("OWNED_D3D12_FSR_FG_DRAWABLE sequence=2 ",
+                "dyld[123]: /System/Library/StateReporting.framework/VersiOWNED_D3D12_FSR_FG_DRAWABLE sequence=2 "))
+            self.assertEqual(checker.check(args)["attempted_drawables"], 23)
+            args.stderr.write_text(stderr)
             args.stdout.write_text(stdout.replace("frame=1 generated=0 output_index=0", "frame=1 generated=1 output_index=1"))
             with self.assertRaisesRegex(ValueError, "sequence mismatch"): checker.check(args)
             args.stdout.write_text(stdout)
-            bad = bytearray((fixture / "fg-callback-3-1-2.bin").read_bytes())
+            bad = bytearray((fixture / "fg-callback-3-1-1.bin").read_bytes())
             bad[128 * 20 * 4:128 * 21 * 4] = bytes((19, 19, 19, 255)) * 128
             (captures / "drawable-5.bin").write_bytes(bad)
             with self.assertRaisesRegex(ValueError, "content mismatch"): checker.check(args)
-            (captures / "drawable-5.bin").write_bytes((fixture / "fg-callback-3-1-2.bin").read_bytes())
+            (captures / "drawable-5.bin").write_bytes((fixture / "fg-callback-3-1-1.bin").read_bytes())
             args.stderr.write_text(stderr.replace("sequence=5 drawable=d5 time=5", "sequence=5 drawable=d5 time=0"))
-            with self.assertRaisesRegex(ValueError, "physical phase proof incomplete"): checker.check(args)
+            with self.assertRaisesRegex(ValueError, "physical output proof incomplete"): checker.check(args)
             args.stderr.write_text(stderr.replace("sequence=1 drawable=d1 time=1", "sequence=1 drawable=d1 time=0"))
-            # A baseline skip is explicit, but every N=1..4 generated index,
+            # A bootstrap skip is explicit, but every selected native generated output,
             # critical real/error output and UI proof remains exercised.
             result = checker.check(args)
             self.assertEqual(result["positively_displayed_drawables"], 22)
             self.assertEqual(result["skipped_drawables"], 1)
-            self.assertEqual(len(result["physically_verified_generated_phases"]), 10)
+            self.assertEqual(len(result["physically_verified_generated_outputs"]), 2)
             args.stderr.write_text(stderr)
-            duplicate = (fixture / "fg-callback-3-1-1.bin").read_bytes()
-            (fixture / "fg-callback-3-1-2.bin").write_bytes(duplicate)
+            duplicate = bytearray((fixture / "fg-callback-3-0-1.bin").read_bytes())
+            marker = bytes((35, 190, 220, 255))
+            for y in range(8): duplicate[y * 128 * 4:y * 128 * 4 + 32] = marker * 8
+            (fixture / "fg-callback-3-1-1.bin").write_bytes(duplicate)
             (captures / "drawable-5.bin").write_bytes(duplicate)
-            with self.assertRaisesRegex(ValueError, "repeats another phase"): checker.check(args)
+            with self.assertRaisesRegex(ValueError, "repeats current color"): checker.check(args)
 
 
 class NgxPresentationEvidence(unittest.TestCase):
@@ -1943,7 +1936,7 @@ class NgxPresentationEvidence(unittest.TestCase):
             base = Path(directory); fixture = base / "fixture"; captures = base / "fg-capture"
             fixture.mkdir(); captures.mkdir()
             prefix = "OWNED_D3D12_NGX_PRESENT"
-            summary = prefix + "_PASS frames=6 drawables=9 generated=3 suppressed=3 ngx_feature=11 hudless=1 ui=current_backbuffer history=fresh_diff reset=untouched release_before_execute=1 replay=exact caller_owned_present=1\n"
+            summary = prefix + "_PASS frames=6 drawables=9 generated=3 bootstrap_not_presented=3 ngx_feature=11 hudless=1 ui=current_backbuffer history=native reset=fresh_equivalent release_before_execute=1 replay=native_encode caller_owned_present=1\n"
             stdout, stderr = summary, prefix + "_OBSERVER_READY public_selectors=1\n"
             args = argparse.Namespace(stdout=base / "stdout.log", stderr=base / "stderr.log",
                                       captures=captures, suite="ngx-fg-present")
@@ -1975,21 +1968,21 @@ class NgxPresentationEvidence(unittest.TestCase):
                     if generated: image[-4] ^= 1  # Non-probe synthetic distinction, not GPU interpolation proof.
                     (fixture / f"fg-ngx-{frame}-{generated}.bin").write_bytes(image)
                     (captures / f"drawable-{sequence:06}.bin").write_bytes(image)
-                    stdout += f"{prefix}_FRAME frame={frame} generated={generated} phase={.5 if generated else 1.} actual=1 output_flag=0 width=128 height=128 submitted_present={sequence} statistics=actual result=0x00000000 actual_present={sequence - 1} sync_qpc={sequence * 100} present_refresh={sequence} sync_refresh={sequence} pace_qpc_start={sequence * 100 - 10} qpc_start={sequence * 100} qpc_end={sequence * 100 + 10} frequency=1000 source=ngx11_gpu_copy_to_dxgi\n"
+                    stdout += f"{prefix}_FRAME frame={frame} generated={generated} generation=native_metalfx width=128 height=128 submitted_present={sequence} statistics=actual result=0x00000000 actual_present={sequence - 1} sync_qpc={sequence * 100} present_refresh={sequence} sync_refresh={sequence} pace_qpc_start={sequence * 100 - 10} qpc_start={sequence * 100} qpc_end={sequence * 100 + 10} frequency=1000 source=ngx11_gpu_copy_to_dxgi\n"
                     stderr += f"{prefix}_DRAWABLE sequence={sequence} drawable={sequence} width=128 height=128 format=70 path=drawable-{sequence:06}.bin\n"
                     stderr += f"{prefix}_PRESENTED sequence={sequence} drawable={sequence} time={1 + sequence / 60:.9f}\n"
                 if frame in (1, 5, 6):
-                    (fixture / f"fg-ngx-{frame}-1.bin").write_bytes(sentinel)
-                    stdout += f"OWNED_D3D12_NGX_SUPPRESSED frame={frame} actual=0 flag=1 output_untouched=1\n"
-                if frame in (4, 5): (fixture / f"fg-ngx-fresh-{frame}.bin").write_bytes(sentinel)
-                if frame == 6: (fixture / "fg-ngx-replay-6.bin").write_bytes(sentinel)
+                    (fixture / f"fg-ngx-{frame}-1.bin").write_bytes(pixels)
+                    stdout += f"OWNED_D3D12_NGX_BOOTSTRAP_OUTPUT frame={frame} reset=1 output_written=1 presented=0 policy=caller_no_history\n"
+                if frame in (4, 5): (fixture / f"fg-ngx-fresh-{frame}.bin").write_bytes(pixels)
+                if frame == 6: (fixture / "fg-ngx-replay-6.bin").write_bytes(pixels)
             stdout += f"{prefix}_DRAIN submitted_present=11 statistics=actual result=0x00000000 actual_present=10 sync_qpc=1100 present_refresh=11 sync_refresh=11 qpc_end=1150 frequency=1000 output_vblanks=3\n"
             args.stdout.write_text(stdout); args.stderr.write_text(stderr)
             result = checker.check(args)
             self.assertTrue(result["pass"])
             self.assertEqual(result["attempted_drawables"], 9)
             self.assertEqual(result["positively_displayed_drawables"], 9)
-            self.assertEqual(len(result["suppressed_generated_outputs"]), 3)
+            self.assertEqual(len(result["caller_bootstrap_outputs_not_presented"]), 3)
             unmeasured = stdout.replace("statistics=actual result=0x00000000 actual_present=2 sync_qpc=300 present_refresh=3 sync_refresh=3",
                                         "statistics=disjoint result=0x887a000b actual_present=0 sync_qpc=0 present_refresh=0 sync_refresh=0", 1)
             args.stdout.write_text(unmeasured)
@@ -2014,12 +2007,12 @@ class NgxPresentationEvidence(unittest.TestCase):
                 args.stderr.write_text(broken)
                 with self.assertRaisesRegex(ValueError, reason): checker.check(args)
             args.stderr.write_text(stderr)
-            for broken, reason in ((stdout.replace("phase=0.5", "phase=0.6", 1), "source phase/status"),
-                                   (stdout.replace("actual=0 flag=1", "actual=1 flag=0", 1), "flag/suppression"),
+            for broken, reason in ((stdout.replace("generation=native_metalfx", "generation=copy_current", 1), "native source"),
+                                   (stdout.replace("presented=0 policy=caller_no_history", "presented=1 policy=caller_no_history", 1), "bootstrap presentation policy"),
                                    (stdout + summary, "consumer incomplete")):
                 args.stdout.write_text(broken)
                 with self.assertRaisesRegex(ValueError, reason): checker.check(args)
-            args.stdout.write_text(stdout.replace(summary, prefix + "_PASS caller_owned_present=1 replay=exact release_before_execute=1 hudless=1 ngx_feature=11 suppressed=3 generated=3 drawables=9 frames=6\n"))
+            args.stdout.write_text(stdout.replace(summary, prefix + "_PASS caller_owned_present=1 replay=native_encode release_before_execute=1 hudless=1 ngx_feature=11 bootstrap_not_presented=3 generated=3 drawables=9 frames=6\n"))
             self.assertTrue(checker.check(args)["pass"])
             args.stdout.write_text(stdout)
             boot = captures / "drawable-000001.bin"; original = boot.read_bytes()
@@ -2030,11 +2023,11 @@ class NgxPresentationEvidence(unittest.TestCase):
             corrupt = bytearray(original); corrupt[(4 * 128 + 4) * 4] = 0; path.write_bytes(corrupt)
             with self.assertRaisesRegex(ValueError, "drawable content mismatch"): checker.check(args)
             path.write_bytes(original)
-            public = fixture / "fg-ngx-1-1.bin"; public.write_bytes(bytes((0,)) * len(sentinel))
-            with self.assertRaisesRegex(ValueError, "suppressed actual0 output changed"): checker.check(args)
-            public.write_bytes(sentinel)
-            public = fixture / "fg-ngx-2-1.bin"; original = public.read_bytes()
-            public.write_bytes((fixture / "fg-ngx-2-0.bin").read_bytes())
+            public = fixture / "fg-ngx-1-1.bin"; original = public.read_bytes(); public.write_bytes(sentinel)
+            with self.assertRaisesRegex(ValueError, "native bootstrap output was not written"): checker.check(args)
+            public.write_bytes(original)
+            public = fixture / "fg-ngx-3-1.bin"; original = public.read_bytes()
+            public.write_bytes((fixture / "fg-ngx-3-0.bin").read_bytes())
             with self.assertRaisesRegex(ValueError, "generated phase repeats real frame"): checker.check(args)
             public.write_bytes(original)
             corrupt = bytearray(public.read_bytes()); corrupt[(4 * 128 + 4) * 4] = 0; public.write_bytes(corrupt)
@@ -2047,24 +2040,17 @@ class GameSuiteEvidence(unittest.TestCase):
         self.alpha = "".join(f"OWNED_D3D12_SR_ALPHA_CASE_PASS frame={f} replay={r} scalar_oracle_max_half_ulp=2 subrect=1 dynamic={int(f == 3)} retired={int(f == 5)}\n" for f in range(6) for r in range(2 if f == 5 else 1)) + "OWNED_D3D12_SR_ALPHA_PASS frames=6 replay_after_release=1 independent_scalar_oracle=1 history_delta=42\n"
         self.debug = "".join(f"OWNED_D3D12_FSR_DEBUG_CASE_PASS extent={e} replay={r} panel_max_byte_error=1 sentinel=1 retired={int(e == 96)}\n" for e in (128, 96) for r in (0, 1)) + "OWNED_D3D12_FSR_DEBUG_PASS public_dispatch=1 depth_gradient=1 signed_motion=1 color=1 dynamic=1 retirement_replay=1\n"
         self.ngx = ("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 non_sr_other=0\n"
-                    "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=4 per_index_output=1 grouped_recording=1 actual0_untouched=1 immutable_params=1 release_before_execute=1 replay=1\n")
+                    "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=unsupported reset=native_history release_before_execute=1 replay=native_encode\n")
+        native = "".join(f"OWNED_D3D12_NGX_NATIVE frame={frame} reset={int(frame in (0, 5))} replay={replay} output_written=1 different_current={int(frame in (3, 4) and not replay)} resources_released=1 consumer=gpu_readback frame_id={7 if frame == 8 else frame} not_rendering={int(frame == 6)}\n"
+                         for frame in range(9) for replay in range(2 if frame in (0, 7, 8) else 1))
+        rejections = "".join(f"OWNED_D3D12_NGX_REJECT case={kind} {kind}={value} result=unsupported_parameter\n"
+                             for kind in ("count", "index") for value in (2, 3, 4))
+        rejections += "OWNED_D3D12_NGX_REJECT case=disable_buffer result=unsupported_parameter output_untouched=1 before_valid_dispatch=1 zero_count_index=invalid_parameter\n"
+        scene = "OWNED_D3D12_NGX_SCENE frames=14 reset=1 output_written=1 actual_count=unavailable consumer=gpu_readback\n"
+        self.ngx_fg = self.ngx + rejections + native + scene + "OWNED_D3D12_NGX_FG_PASS capacity=1 native_output=1 unsupported_mfg=1\n"
         self.ngx += "".join(f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant={v} frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8\n" for v in range(4))
-        self.ngx += "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_alpha flag128=1 nonopaque_contrast=1 rgb_preserved=1\nOWNED_D3D12_NGX_FEATURES_PASS\n"
-        ngx_phases = ""
-        for grouped in (0, 1):
-            for count in range(1, 5):
-                for frame in range(7):
-                    for index in range(1, count + 1):
-                        disabled = frame in (0, 2, 4, 6)
-                        phase = index / (count + 1)
-                        red = 19 if disabled else round(32 + (frame - 1) * 8 + phase * 8)
-                        ngx_phases += f"OWNED_D3D12_NGX_PHASE frame={frame} count={count} index={index} phase={phase:g} actual={int(not disabled)} grouped={grouped} actual_count={0 if disabled else count} output_flag={int(disabled)} untouched={int(disabled)} probe_red={red} consumer=gpu_readback\n"
-        ngx_scenes = "".join(f"OWNED_D3D12_NGX_SCENE count={count} actual=0 output_flag=1 untouched=1 phases={count} reset=0 consumer=gpu_readback\n" for count in range(1, 5))
-        self.ngx = self.ngx.replace("OWNED_D3D12_NGX_FEATURES_PASS\n", ngx_phases + ngx_scenes + "OWNED_D3D12_NGX_FEATURES_PASS\n")
-        self.ngx_fg = "".join(line for line in self.ngx.splitlines(keepends=True) if
-            line.startswith(("OWNED_D3D12_NGX_PHASE ", "OWNED_D3D12_NGX_SCENE ",
-                "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities ", "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg ")))
-        self.ngx_fg += "OWNED_D3D12_NGX_FG_PASS capacity=4 independent=1 grouped=1\n"
+        self.ngx += "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_alpha flag128=1 nonopaque_contrast=1 rgb_preserved=1\n"
+        self.ngx += rejections + native + scene + "OWNED_D3D12_NGX_FEATURES_PASS\n"
         self.ngx_alpha = ("OWNED_D3D12_NGX_ALPHA_PIXELS replay=0 left=112,96,80,48 right=112,96,80,192 rgb_max_error=0 release_before_execute=1\n"
                           "OWNED_D3D12_NGX_ALPHA_PIXELS replay=1 left=112,96,80,48 right=112,96,80,192 rgb_max_error=0 release_before_execute=1\n"
                           "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_alpha flag128=1 nonopaque_contrast=1 rgb_preserved=1\n"
@@ -2102,12 +2088,12 @@ OWNED_DXGI_FULLSCREEN_PASS
             ("fsr-debug", self.debug, "sentinel=1", "sentinel=0"),
             ("ngx-features", self.ngx, "variant=3", "variant=2"),
             ("ngx-features", self.ngx, "matrices_snapshotted=1", "matrices_snapshotted=0"),
-            ("ngx-fg", self.ngx_fg, "phase=0.5 actual=1", "phase=0.4 actual=1"),
-            ("ngx-fg", self.ngx_fg, "actual_count=0 output_flag=1", "actual_count=1 output_flag=1"),
-            ("ngx-fg", self.ngx_fg, "actual_count=4 output_flag=0", "actual_count=1 output_flag=0"),
-            ("ngx-fg", self.ngx_fg, "untouched=1 probe_red=19", "untouched=0 probe_red=19"),
-            ("ngx-fg", self.ngx_fg, "probe_red=36", "probe_red=40"),
-            ("ngx-fg", self.ngx_fg, "phases=4 reset=0", "phases=4 reset=1"),
+            ("ngx-fg", self.ngx_fg, "different_current=1", "different_current=0"),
+            ("ngx-fg", self.ngx_fg, "frame=0 reset=1", "frame=0 reset=0"),
+            ("ngx-fg", self.ngx_fg, "resources_released=1", "resources_released=0"),
+            ("ngx-fg", self.ngx_fg, "output_untouched=1", "output_untouched=0"),
+            ("ngx-fg", self.ngx_fg, "case=count count=2 result=unsupported_parameter", "case=count count=2 result=success"),
+            ("ngx-fg", self.ngx_fg, "frames=14 reset=1", "frames=14 reset=0"),
             ("ngx-fg", self.ngx_fg, "consumer=gpu_readback", "consumer=wiring_copy"),
             ("ngx-alpha", self.ngx_alpha, "right=112,96,80,192", "right=112,96,80,255"),
             ("ngx-alpha", self.ngx_alpha, "left=112,96,80,48", "left=112,112,80,48"),
@@ -2129,7 +2115,7 @@ OWNED_DXGI_FULLSCREEN_PASS
         self.assertTrue(runner.game_suite_failures("ngx-fg", self.ngx_fg + "OWNED_D3D12_NGX_FG_PASS capacity=1 independent=1 grouped=1\n"))
         self.assertTrue(runner.game_suite_failures("ngx-fg", self.ngx_fg, "OWNED_D3D12_TEMPORAL_FAIL device removed\n"))
         lines = self.ngx_fg.splitlines()
-        indices = [index for index, line in enumerate(lines) if line.startswith("OWNED_D3D12_NGX_PHASE ")]
+        indices = [index for index, line in enumerate(lines) if line.startswith("OWNED_D3D12_NGX_NATIVE ")]
         lines[indices[0]], lines[indices[1]] = lines[indices[1]], lines[indices[0]]
         self.assertTrue(runner.game_suite_failures("ngx-fg", "\n".join(lines)))
 

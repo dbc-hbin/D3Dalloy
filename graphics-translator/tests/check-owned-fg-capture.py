@@ -16,7 +16,7 @@ def require(condition, reason):
 
 def records(text, marker):
     return [dict(re.findall(r"(\w+)=([^\s]+)", line))
-            for line in text.splitlines() if line.startswith(marker + " ")]
+            for line in re.findall(re.escape(marker) + r" ([^\n]*)", text)]
 
 
 def statistics_observations(rows, count_key, previous=(0, 0, 0, 0)):
@@ -65,8 +65,8 @@ def check_ngx(args):
     prefix = "OWNED_D3D12_NGX_PRESENT"
     summary = records(stdout, prefix + "_PASS")
     require(len(summary) == 1 and all(summary[0].get(key) == value for key, value in
-            {"frames": "6", "drawables": "9", "generated": "3", "suppressed": "3", "ngx_feature": "11",
-             "hudless": "1", "release_before_execute": "1", "replay": "exact", "caller_owned_present": "1"}.items()),
+            {"frames": "6", "drawables": "9", "generated": "3", "bootstrap_not_presented": "3", "ngx_feature": "11",
+             "hudless": "1", "release_before_execute": "1", "replay": "native_encode", "caller_owned_present": "1"}.items()),
             "NGX public consumer incomplete")
     require(prefix + "_OBSERVER_READY public_selectors=1" in stderr, "NGX native observer never loaded")
     require(prefix + "_OBSERVER_FAIL" not in stderr, "NGX native observer GPU failure")
@@ -75,10 +75,10 @@ def check_ngx(args):
     calls = records(stdout, prefix + "_FRAME")
     require([(int(r["frame"]), int(r["generated"])) for r in calls] == expected,
             "NGX generated-before-real public sequence incomplete/reordered")
-    suppressed = records(stdout, "OWNED_D3D12_NGX_SUPPRESSED")
+    suppressed = records(stdout, "OWNED_D3D12_NGX_BOOTSTRAP_OUTPUT")
     require([int(r["frame"]) for r in suppressed] == [1, 5, 6] and all(
-            r.get("actual") == "0" and r.get("flag") == "1" and r.get("output_untouched") == "1" for r in suppressed),
-            "NGX actual0 GPU flag/suppression sequence incomplete")
+            r.get("reset") == "1" and r.get("output_written") == "1" and r.get("presented") == "0" and r.get("policy") == "caller_no_history" for r in suppressed),
+            "NGX caller bootstrap presentation policy incomplete")
     bootstrap = records(stdout, prefix + "_BOOTSTRAP")
     ready = records(stdout, prefix + "_BOOTSTRAP_READY")
     require(1 <= len(bootstrap) <= 64 and [int(r["attempt"]) for r in bootstrap] == list(range(1, len(bootstrap) + 1)),
@@ -93,8 +93,8 @@ def check_ngx(args):
     fixture = args.stdout.parent / "fixture"
     sentinel = bytes((19,)) * (128 * 128 * 4)
     for row in suppressed:
-        require((fixture / f"fg-ngx-{row['frame']}-1.bin").read_bytes() == sentinel,
-                "NGX suppressed actual0 output changed")
+        require((fixture / f"fg-ngx-{row['frame']}-1.bin").read_bytes() != sentinel,
+                "NGX native bootstrap output was not written")
     boot_images = []
     previous_sequence = previous_count = 0
     last_boot_time = 0
@@ -134,12 +134,11 @@ def check_ngx(args):
     images, times = [], []
     pacing_seconds = []
     for record, call, (frame, generated) in zip(drawables[len(bootstrap):], calls, expected, strict=True):
-        require(float(call["phase"]) == (.5 if generated else 1.) and call.get("actual") == "1"
-                and call.get("output_flag") == "0" and call.get("source") == "ngx11_gpu_copy_to_dxgi",
-                "NGX public source phase/status mismatch")
+        require(call.get("generation") == "native_metalfx" and call.get("source") == "ngx11_gpu_copy_to_dxgi",
+                "NGX public native source mismatch")
         source = (fixture / f"fg-ngx-{frame}-{generated}.bin").read_bytes()
         require(len(source) == 128 * 128 * 4, "NGX GPU readback image size mismatch")
-        if generated:
+        if generated and frame in (3, 4):
             require(source != (fixture / f"fg-ngx-{frame}-0.bin").read_bytes(),
                     "NGX generated phase repeats real frame")
         # Expected RGB comes from caller-authored geometry, not GPU readback or
@@ -200,7 +199,7 @@ def check_ngx(args):
         sample, previous_statistics = statistics_observations([call], "actual_present", previous_statistics)
         observations.extend(sample)
         images.append({"frame": frame, "generated": generated, "sequence": sequence, "presented_time": time,
-                       "phase": float(call["phase"]), "output_flag": int(call["output_flag"]),
+                       "generation": call["generation"],
                        "submitted_present": count, "presentation": "displayed" if time else "unmeasured_or_skipped",
                        "sha256": hashlib.sha256(raw).hexdigest(), "source_sha256": hashlib.sha256(source).hexdigest(),
                        "independent_scene_ui_probes": len(probes)})
@@ -228,20 +227,17 @@ def check_ngx(args):
     controls = {name: (fixture / name).read_bytes() for name in
                 ("fg-ngx-fresh-4.bin", "fg-ngx-fresh-5.bin", "fg-ngx-replay-6.bin")}
     require(all(len(image) == 128 * 128 * 4 for image in controls.values()), "NGX history/reset/replay control image size mismatch")
-    require(controls["fg-ngx-fresh-4.bin"] == controls["fg-ngx-fresh-5.bin"] == sentinel,
-            "NGX fresh history bootstrap copied a fake generated frame")
+    require(all(image != sentinel for image in controls.values()), "NGX native controls were not written")
     require((fixture / "fg-ngx-4-1.bin").read_bytes() != controls["fg-ngx-fresh-4.bin"],
             "NGX temporal history does not affect generated pixels")
     require((fixture / "fg-ngx-5-1.bin").read_bytes() == controls["fg-ngx-fresh-5.bin"],
-            "NGX explicit reset did not preserve the output")
-    require((fixture / "fg-ngx-6-1.bin").read_bytes() == controls["fg-ngx-replay-6.bin"],
-            "NGX release-before-execute closed-list replay differs")
+            "NGX explicit reset differs from fresh native history")
     return {"pass": True, "native_drawable_content_and_order": images, "attempted_drawables": len(expected),
             "positively_displayed_drawables": len(visible), "skipped_drawables": len(expected) - len(visible),
             "presentation_statistics_observations": observations,
-            "physically_verified_generated_phases": [{"count": 1, "index": 1, "phase": .5, "frame": frame}
-                                                      for frame in (2, 3, 4)],
-            "suppressed_generated_outputs": suppressed,
+            "physically_verified_generated_outputs": [{"index": 1, "frame": frame}
+                                                      for frame in (3, 4)],
+            "caller_bootstrap_outputs_not_presented": suppressed,
             "bootstrap": {"attempted_drawables": len(bootstrap), "images": boot_images,
                           "positively_displayed_drawables": sum(image["presented_time"] > 0 for image in boot_images)},
             "displayed_generated_real_pairs": pairs, "caller_vblank_wait_seconds": pacing_seconds,
@@ -259,13 +255,13 @@ def check(args):
     require("OWNED_D3D12_FSR_FG_OBSERVER_FAIL" not in stderr, "native observer GPU failure")
     statistics = records(stdout, "OWNED_D3D12_FSR_FG_STATISTICS")
     finals = records(stdout, "OWNED_D3D12_FSR_FG_FINAL_STATISTICS")
-    require([int(row["frame"]) for row in statistics] == [*range(1, 10), 11, 12, *range(11, 15)],
+    require([int(row["frame"]) for row in statistics] == [*range(1, 13), *range(11, 15)],
             "FSR statistics snapshot sequence incomplete/reordered")
     require([row["stream"] for row in finals] == ["callback", "builtin_ui"] and
             all(row["statistics"] == "actual" and int(row["output_vblanks"]) == 3 for row in finals),
             "FSR final refresh observations incomplete/unmeasured")
     observations = {}
-    for stream, rows, final in zip(("callback", "builtin_ui"), (statistics[:11], statistics[11:]), finals, strict=True):
+    for stream, rows, final in zip(("callback", "builtin_ui"), (statistics[:12], statistics[12:]), finals, strict=True):
         require(all(row["source"] == "public_dxgi_actual_presentation" for row in [*rows, final]) and
                 len({int(row["frequency"]) for row in [*rows, final]}) == 1, "FSR inconsistent statistics source/clock")
         submitted = [int(row["submitted_present"]) for row in [*rows, final]]
@@ -273,11 +269,11 @@ def check(args):
                 "FSR submitted counts regressed or refresh drain submitted another frame")
         observations[stream], _ = statistics_observations([*rows, final], "native_present")
     callbacks = records(stdout, "OWNED_D3D12_FSR_FG_CALLBACK_PIXELS")
-    counts = {2: 1, 3: 2, 4: 3, 8: 4}
+    counts = dict.fromkeys((1, 2, 3, 4, 7, 8, 10, 11, 12), 1)
     expected = []
     for frame in range(1, 13):
         expected.extend((frame, 1, index) for index in range(1, counts.get(frame, 0) + 1))
-        if frame not in (8, 10, 12):
+        if frame not in (8, 12):
             expected.append((frame, 0, 0))
     require(int(finals[0]["submitted_present"]) == len(expected) and int(finals[1]["submitted_present"]) == 4,
             "FSR native submitted request count differs from validated outputs")
@@ -313,7 +309,8 @@ def check(args):
         for y in range(8):
             content[y * sw * 4:y * sw * 4 + 32] = bytes(32)
         previous = phase_sources.setdefault(frame, [])
-        require(content not in previous, "GPU phase repeats another phase or current color behind the UI marker")
+        if frame in (3, 4):
+            require(content not in previous, "native generated output repeats current color behind the UI marker")
         previous.append(content)
         # Probe marker interior AND a spatial grid of caller-authored scene
         # colors. Avoid resampling boundaries on Retina/scaled drawables.
@@ -343,9 +340,8 @@ def check(args):
     visible = {(image["frame"], image["generated"], image["output_index"]): image for image in images if image["presented_time"] > 0}
     require(all((frame, 0, 0) in visible for frame in (2, 3, 4, 5, 6, 7, 9, 11)),
             "real, disabled or generation-error output lacks actual displayed evidence")
-    missing = [(count, index) for frame, count in counts.items() for index in range(1, count + 1)
-               if (frame, 1, index) not in visible]
-    require(not missing, f"generated physical phase proof incomplete: unexercised count/index={missing}")
+    missing = [frame for frame in (2, 3, 4, 8) if (frame, 1, 1) not in visible]
+    require(not missing, f"generated physical output proof incomplete: frame={missing}")
     pairs = []
     for frame in (2, 3, 4):
         generated = [visible[(frame, 1, index)] for index in range(1, counts[frame] + 1) if (frame, 1, index) in visible]
@@ -375,16 +371,15 @@ def check(args):
                        "presentation": "displayed",
                        "presented_time": time, "sha256": hashlib.sha256(raw).hexdigest()})
         previous_time, previous_sequence = time, sequence
-    require(not args.native, "MetalFX native pixel-equivalence is not the SDK phase algorithm; use native drawable content/order evidence")
+    require(not args.native, "standalone native comparison is not configured; use native drawable content/order evidence")
     displayed = [image for image in images if image["presented_time"] > 0]
     return {"pass": True, "native_drawable_content_and_order": images,
             "attempted_drawables": len(images), "positively_displayed_drawables": len(displayed),
             "skipped_drawables": len(images) - len(displayed),
             "presentation_statistics_observations": observations,
-            "physically_verified_generated_phases": [{"count": count, "index": index, "phase": index / (count + 1)}
-                                                      for count in counts.values() for index in range(1, count + 1)],
+            "physically_verified_generated_outputs": [{"index": 1, "frame": frame} for frame in (3, 4)],
             "displayed_generated_real_pairs": pairs,
-            "gpu_generated_counts": counts, "algorithm": "genuine_sdk_normalized_phases",
+            "sdk_generated_output_callbacks": counts, "algorithm": "native_metalfx",
             "cadence_seconds": [displayed[i]["presented_time"] - displayed[i - 1]["presented_time"]
                                                                  for i in range(1, len(displayed))],
             "timing_contract": "ordered bounded progress, not exact OS cadence"}

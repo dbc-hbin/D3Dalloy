@@ -67,7 +67,7 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
           info.featureFlags = p.feature_flags; info.outputSubrects = p.output_subrects; info.dynamicOutput = p.dynamic_output;
           fx::Error error;
           auto feature = fx::Feature::create({reinterpret_cast<void *>(call->args[0]),
-              reinterpret_cast<void *>(call->args[1]), fx::CommandMode::Metal4}, info, &error);
+              reinterpret_cast<void *>(call->args[1])}, info, &error);
           call->ret[1] = resultFor(error);
           if (feature) {
             auto holder = [DXMTTemporalFeature new]; holder->feature = std::move(feature);

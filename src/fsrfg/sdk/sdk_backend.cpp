@@ -73,8 +73,7 @@ FfxErrorCode ffxFrameInterpolationSwapchainGetGpuMemoryUsageDX12V2(FfxDevice dev
   if (desc.Format == DXGI_FORMAT_UNKNOWN) return FFX_ERROR_INVALID_ARGUMENT;
   auto allocation = d->GetResourceAllocationInfo(0, 1, &desc);
   if (allocation.SizeInBytes == UINT64_MAX) return FFX_ERROR_INVALID_ARGUMENT;
-  usage->totalUsageInBytes = allocation.SizeInBytes * (count + 2);
-  usage->aliasableUsageInBytes = 0;
+  usage->totalUsageInBytes += allocation.SizeInBytes * (count + 2);
   if (uiFormat != FFX_API_SURFACE_FORMAT_UNKNOWN && (flags & FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING)) {
     desc.Width = ui->width; desc.Height = ui->height; desc.Format = ffxGetDX12FormatFromSurfaceFormat(uiFormat);
     allocation = d->GetResourceAllocationInfo(0, 1, &desc);

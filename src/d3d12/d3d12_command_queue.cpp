@@ -560,7 +560,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // scratch until Metal completion, independently of frontend ReleaseFeature.
     std::vector<std::shared_ptr<OwnedTemporalFrame>> temporal_frames;
     std::vector<std::shared_ptr<OwnedFrameGenerationFrame>> frame_generation_frames;
-    std::vector<std::shared_ptr<OwnedFrameGenerationFrame>> frame_generation_completions;
     std::optional<SignalTask> fence_completion;
     // Retain the presenter until GPU completion, not merely task encoding.
     Rc<Presenter> present_completion;
@@ -632,11 +631,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         inflight.submission.getInfo(completion);
       }
       const bool metal_error = !inflight.submission || !completion.completed || completion.error_handle;
-      if (metal_error)
-        for (const auto &frame : inflight.frame_generation_frames)
-          CompleteOwnedFrameGenerationFrame(frame, DXGI_ERROR_DEVICE_REMOVED);
-      for (const auto &frame : inflight.frame_generation_completions)
-        CompleteOwnedFrameGenerationFrame(frame, metal_error ? DXGI_ERROR_DEVICE_REMOVED : S_OK);
       const bool reflex_present_current = !inflight.native_present ||
           inflight.native_present->restart_token.signaledValue() == inflight.native_present->restart_epoch;
       device_->reflex.Complete(inflight.reflex_work, inflight.reflex_driver_start, inflight.reflex_driver_end,
@@ -794,9 +788,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         inflight.reflex_queue_start = inflight.reflex_driver_end;
       }
       inflight.submission = queue->device_->CommitMetal4CommandBuffers(queue->queue_, &buffer, 1);
-      if (inflight.submission)
-        for (const auto &frame : inflight.frame_generation_frames)
-          CommitOwnedFrameGenerationFrame(frame, queue->owned_id_, seq);
       if (signal_event)
         queue->queue_.signalEvent(signal_event, signal_value);
       if (signal_drawable)
@@ -4691,16 +4682,6 @@ public:
   void
   ProcessExecute(ExecuteTask &task) {
     std::optional<CommittingScope> scope;
-    struct FrameGenerationRecordingScope {
-      MTLD3D12Device *device;
-      std::shared_ptr<OwnedFrameGenerationFrame> active;
-      ~FrameGenerationRecordingScope() {
-        if (!active) return;
-        const auto reason = device->RemovedReason();
-        CompleteOwnedFrameGenerationFrame(active,
-            FAILED(reason) ? reason : DXGI_ERROR_DRIVER_INTERNAL_ERROR);
-      }
-    } frame_generation{device_, {}};
     struct AtomicPhasePermit {
       MTLD3D12CommandQueueImpl *queue;
       std::optional<CommittingScope> &scope;
@@ -4723,8 +4704,6 @@ public:
       scope->inflight.reflex_work = task.reflex_work;
       if (task.reflex_work) scope->inflight.reflex_driver_start = ReflexState::NowUs();
       scope->inflight.protections.reserve(task.lists.size());
-      if (frame_generation.active)
-        scope->inflight.frame_generation_frames.push_back(frame_generation.active);
       for (auto &list : task.lists)
         scope->inflight.protections.push_back({list.allocator.Retain(), list.recording_lease.Retain()});
       /*
@@ -4990,34 +4969,7 @@ public:
     if (!start_segment())
       return;
     const bool fenced = std::any_of(task.lists.begin(), task.lists.end(), [](const auto &list) { return !list.fence_operations.empty(); });
-    // Capture replay before any admission. Fenced tasks validate and decay in
-    // several segments, so a first execution must not turn into a replay when
-    // its Begin sets started. The recording lease excludes another execution
-    // of these encoder payloads until this task and its submissions retire.
-    for (const auto &list : task.lists)
-      for (auto *encoder = list.entry; encoder; encoder = encoder->next) {
-        if (encoder->type != EncoderType::Temporal) continue;
-        auto *data = static_cast<TemporalEncoderData *>(encoder);
-        if (!data->fg_frame || data->fg_stage != TemporalEncoderData::FrameGenerationStage::Begin) continue;
-        if (!data->fg_end) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
-        data->fg_replay = HasOwnedFrameGenerationFrameStarted(data->fg_frame);
-        encoder = data->fg_end;
-      }
-    auto next_state_event = [](EncoderData *&cursor, size_t index, size_t limit) {
-      while (cursor) {
-        if (cursor->type != EncoderType::Temporal) { cursor = cursor->next; continue; }
-        auto *data = static_cast<TemporalEncoderData *>(cursor);
-        if (!data->fg_frame || data->fg_stage != TemporalEncoderData::FrameGenerationStage::Begin) {
-          cursor = cursor->next; continue;
-        }
-        if (data->fg_replay) {
-          if (index < data->fg_state_event_index) return index;
-          if (index < data->fg_end->fg_state_event_index) index = std::min(limit, data->fg_end->fg_state_event_index);
-        }
-        cursor = data->fg_end->next;
-      }
-      return index;
-    };
+
     auto validate_transitions = [&](const ListSubmission *segment, size_t first, size_t last, bool decay) {
       // Queue Waits run before this FIFO task. Validate every referenced
       // resource against the state left by all preceding submissions, even
@@ -5032,9 +4984,7 @@ public:
           if (segment && &list != segment) continue;
           const auto &events = static_cast<RecordingHead *>(list.entry)->state_events;
           const size_t limit = segment ? last : events.size();
-          auto *cursor = list.entry;
-          for (size_t index = next_state_event(cursor, segment ? first : 0, limit); index < limit;
-               index = next_state_event(cursor, index + 1, limit)) {
+          for (size_t index = segment ? first : 0; index < limit; ++index) {
             const auto &transition = events[index];
             // COPY_SOURCE/DEST on a copy engine belong to a different state
             // class from those on 3D/compute. A cross-engine handoff must
@@ -5057,9 +5007,7 @@ public:
           if (decay && segment)
             for (const auto &list : task.lists) {
               const auto &events = static_cast<RecordingHead *>(list.entry)->state_events;
-              auto *cursor = list.entry;
-              for (size_t index = next_state_event(cursor, 0, events.size()); index < events.size();
-                   index = next_state_event(cursor, index + 1, events.size()))
+              for (size_t index = 0; index < events.size(); ++index)
                 pending.try_emplace(events[index].resource.get(), events[index].resource->state);
             }
           if (decay) for (auto &[tracker, state] : pending) {
@@ -6485,54 +6433,29 @@ public:
           break; // Executed at the submission segment boundary above.
         case EncoderType::Temporal: {
           auto data = static_cast<TemporalEncoderData *>(current);
-          if (data->fg_frame && data->fg_stage == TemporalEncoderData::FrameGenerationStage::Begin) {
-            // Release every submission/device lock before the backend waits
-            // for a committed producer's validated GPU completion.
-            const auto preceding_submission = scope->seq;
-            scope.reset();
-            const bool execute = BeginOwnedFrameGenerationFrame(data->fg_frame, owned_id_, preceding_submission);
-            frame_generation.active = data->fg_frame;
-            if (!execute) {
-              // Replay/stale packets must skip copies as well as kernels.
-              // A native split callback is not a D3D12 nested-list scope.
-              auto *end = data->fg_end;
-              if (!end) {
-                device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
-                return;
-              }
-              current = end;
-            }
-            if (!start_segment()) return;
-            if (!execute) {
-              scope->inflight.frame_generation_completions.push_back(data->fg_frame);
-              scope.reset();
-              frame_generation.active.reset();
-              if (!start_segment()) return;
-            }
-            break;
-          }
-          if (data->fg_frame && data->fg_stage == TemporalEncoderData::FrameGenerationStage::End) {
-            // This segment follows every SDK pass (and its GPU counter
-            // readback); only the completion worker may settle the result.
-            scope->inflight.frame_generation_completions.push_back(data->fg_frame);
-            scope.reset();
-            frame_generation.active.reset();
-            if (!start_segment()) return;
-            break;
-          }
+
           // History waits precede this feature commit, not application work
           // already encoded into the prior segment.
           scope.reset();
           if (!start_segment())
             return;
           auto temporal_cmdbuf = scope->inflight.cmdbuf;
-          scope->inflight.temporal_frames.push_back(data->frame);
+          if (data->fg_frame) scope->inflight.frame_generation_frames.push_back(data->fg_frame);
+          else scope->inflight.temporal_frames.push_back(data->frame);
           std::vector<SwizzlePassResource> swizzle_uses;
           if (device_->HasStandardSwizzleTextures()) {
-            const auto resources = GetOwnedTemporalFrameResources(data->frame);
-            for (size_t i = 0; i < resources.size(); ++i)
-              if (resources[i] && resources[i]->swizzle_layout)
-                AppendStandardResource(swizzle_uses, Com<MTLD3D12Resource, false>(resources[i]), i == 3);
+            if (data->fg_frame) {
+              const auto resources = GetOwnedFrameGenerationResources(data->fg_frame);
+              for (size_t i = 0; i < resources.size(); ++i)
+                if (resources[i] && resources[i]->swizzle_layout)
+                  AppendStandardResource(swizzle_uses, Com<MTLD3D12Resource, false>(resources[i]),
+                      IsOwnedFrameGenerationOutput(data->fg_frame, i));
+            } else {
+              const auto resources = GetOwnedTemporalFrameResources(data->frame);
+              for (size_t i = 0; i < resources.size(); ++i)
+                if (resources[i] && resources[i]->swizzle_layout)
+                  AppendStandardResource(swizzle_uses, Com<MTLD3D12Resource, false>(resources[i]), i == 3);
+            }
           }
           if (!BeginStandardSwizzlePass(temporal_cmdbuf, scope->inflight, swizzle_uses)) {
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
@@ -6544,7 +6467,8 @@ public:
             scope->signal_value = value;
             scope.reset();
           };
-          EncodeOwnedTemporalFrame(data->frame, temporal_cmdbuf, fence_, owned_id_, scope->seq, current->id, wait, signal);
+          if (data->fg_frame) EncodeOwnedFrameGenerationFrame(data->fg_frame, temporal_cmdbuf, fence_, wait, signal);
+          else EncodeOwnedTemporalFrame(data->frame, temporal_cmdbuf, fence_, owned_id_, scope->seq, current->id, wait, signal);
           // Reacquire the device submission lock only after the feature mutex
           // has been released, preserving device-lock then feature-lock order.
           if (!start_segment())

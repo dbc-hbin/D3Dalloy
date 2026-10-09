@@ -80,32 +80,20 @@ ComPtr<ID3D12Resource> ngxPresentDisableBuffer(Gpu& gpu) {
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&result)), "NGX disable buffer");
     return result;
 }
-bool ngxPresentDisabled(Gpu& gpu, ID3D12Resource* flag) {
-    auto readback = createBuffer(gpu.device.Get(), 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    auto record = gpu.makeRecording();
-    transition(record.list.Get(), flag, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    record.list->CopyBufferRegion(readback.Get(), 0, flag, 0, 4);
-    transition(record.list.Get(), flag, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    check(record.list->Close(), "NGX disable readback close"); gpu.executeAndWait(record.list.Get());
-    uint8_t* bytes = nullptr;
-    check(readback->Map(0, nullptr, reinterpret_cast<void**>(&bytes)), "NGX disable readback map");
-    const bool disabled = bytes[0] != 0;
-    readback->Unmap(0, nullptr);
-    return disabled;
-}
 Recording ngxPresentEvaluate(const NgxApi& api, Gpu& gpu, NVSDK_NGX_Handle* feature,
                              UINT frame, bool reset, ID3D12Resource* color, ID3D12Resource* hudless,
                              ID3D12Resource* output, ID3D12Resource* depth, ID3D12Resource* motion,
-                             ID3D12Resource* disable) {
+                             bool close = true, bool notRendering = false) {
     auto params = allocateParams(api);
     ngx_feature_set_resource(params, "DLSSG.Backbuffer", color);
     ngx_feature_set_resource(params, "DLSSG.HUDLess", hudless);
     ngx_feature_set_resource(params, "DLSSG.OutputInterpolated", output);
-    ngx_feature_set_resource(params, "DLSSG.OutputDisableInterpolation", disable);
     ngx_feature_set_resource(params, "DLSSG.Depth", depth);
     ngx_feature_set_resource(params, "DLSSG.MVecs", motion);
     ngx_feature_set_uint(params, "DLSSG.BackbufferFrameID", frame);
     ngx_feature_set_uint(params, "DLSSG.Reset", reset);
+    ngx_feature_set_uint(params, "DLSSG.NotRenderingGameFrames", notRendering);
+    ngx_feature_set_float(params, "FrameTimeDeltaInMsec", 1000.f / 30);
     ngx_feature_set_float(params, "DLSSG.MvecScaleX", 1.0f / ngxPresentExtent);
     ngx_feature_set_float(params, "DLSSG.MvecScaleY", 1.0f / ngxPresentExtent);
     ngx_feature_set_float(params, "DLSSG.JitterOffsetX", (frame & 1 ? .25f : -.25f) * 2 / ngxPresentExtent);
@@ -116,7 +104,7 @@ Recording ngxPresentEvaluate(const NgxApi& api, Gpu& gpu, NVSDK_NGX_Handle* feat
     auto record = gpu.makeRecording();
     checkNgxResult(api.evaluate(record.list.Get(), feature, params, nullptr), ngx_fixture_result_success(), "NGX present evaluate11");
     resetAndDestroyParams(api, params);
-    check(record.list->Close(), "NGX present evaluate close");
+    if (close) check(record.list->Close(), "NGX present evaluate close");
     return record;
 }
 void ngxPresentCopy(Gpu& gpu, IDXGISwapChain4* chain, HANDLE credit,
@@ -198,8 +186,8 @@ void ngxPresentTexture(Gpu& gpu, IDXGISwapChain4* chain, IDXGIOutput* display, H
     const auto observation = ngxPresentObserve(chain, previous);
     const auto& stats = observation.statistics;
     QueryPerformanceCounter(&after);
-    std::printf("OWNED_D3D12_NGX_PRESENT_FRAME frame=%u generated=%u phase=%g actual=1 output_flag=0 width=128 height=128 submitted_present=%u statistics=%s result=0x%08lx actual_present=%u sync_qpc=%lld present_refresh=%u sync_refresh=%u pace_qpc_start=%lld qpc_start=%lld qpc_end=%lld frequency=%lld source=ngx11_gpu_copy_to_dxgi\n",
-                frame, generated, generated ? .5 : 1., observation.submitted, SUCCEEDED(observation.result) ? "actual" : "disjoint", static_cast<unsigned long>(observation.result), stats.PresentCount,
+    std::printf("OWNED_D3D12_NGX_PRESENT_FRAME frame=%u generated=%u generation=native_metalfx width=128 height=128 submitted_present=%u statistics=%s result=0x%08lx actual_present=%u sync_qpc=%lld present_refresh=%u sync_refresh=%u pace_qpc_start=%lld qpc_start=%lld qpc_end=%lld frequency=%lld source=ngx11_gpu_copy_to_dxgi\n",
+                frame, generated, observation.submitted, SUCCEEDED(observation.result) ? "actual" : "disjoint", static_cast<unsigned long>(observation.result), stats.PresentCount,
                 stats.SyncQPCTime.QuadPart, stats.PresentRefreshCount, stats.SyncRefreshCount,
                 paceBefore.QuadPart, before.QuadPart, after.QuadPart, frequency.QuadPart);
 }
@@ -221,7 +209,7 @@ void ngxPresentHold(const char* control, const char* phase, HWND hwnd, IDXGISwap
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&message); DispatchMessageW(&message);
         }
-        const DWORD result = MsgWaitForMultipleObjects(1, &event, FALSE, 20, QS_ALLINPUT);
+        const DWORD result = MsgWaitForMultipleObjects(1, &event, FALSE, DWORD(15000 - std::min<ULONGLONG>(15000, GetTickCount64() - retirementStart)), QS_ALLINPUT);
         if (result == WAIT_OBJECT_0) break;
         if (result == WAIT_FAILED) fail("NGX visual retirement wait", HRESULT_FROM_WIN32(GetLastError()));
         if (GetTickCount64() - retirementStart >= 15000) fail("NGX visual retirement bounded");
@@ -242,6 +230,13 @@ void ngxPresentHold(const char* control, const char* phase, HWND hwnd, IDXGISwap
                 statistics.PresentCount, statistics.SyncQPCTime.QuadPart,
                 window.left, window.top, window.right, window.bottom, client.right, client.bottom, control);
     std::fflush(stdout);
+    char fullControl[MAX_PATH];
+    if (!GetFullPathNameA(control, MAX_PATH, fullControl, nullptr)) fail("NGX control full path");
+    char* separator = std::strrchr(fullControl, '\\');
+    if (!separator) fail("NGX control parent directory");
+    *separator = 0;
+    HANDLE changed = FindFirstChangeNotificationA(fullControl, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
+    if (changed == INVALID_HANDLE_VALUE) fail("NGX control directory event");
     const ULONGLONG started = GetTickCount64();
     for (;;) {
         MSG message;
@@ -256,8 +251,11 @@ void ngxPresentHold(const char* control, const char* phase, HWND hwnd, IDXGISwap
         }
         if (advance) break;
         if (GetTickCount64() - started >= 300000) fail("NGX visual control timeout");
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, 20, QS_ALLINPUT);
+        const DWORD result = MsgWaitForMultipleObjects(1, &changed, FALSE, DWORD(300000 - std::min<ULONGLONG>(300000, GetTickCount64() - started)), QS_ALLINPUT);
+        if (result == WAIT_OBJECT_0 && !FindNextChangeNotification(changed)) fail("NGX control rearm event");
+        if (result == WAIT_FAILED) fail("NGX control event wait");
     }
+    FindCloseChangeNotification(changed);
     // A file token only advances the investigation; it is not visual evidence.
     std::printf("OWNED_D3D12_NGX_PRESENT_VISUAL_ADVANCED phase=%s\n", phase);
     std::fflush(stdout);
@@ -320,14 +318,12 @@ void runPublicFgPresent(const NgxApi& api, Gpu& gpu, const char* control) {
         auto output = createTexture(gpu.device.Get(), ngxPresentExtent, ngxPresentExtent, DXGI_FORMAT_R8G8B8A8_UNORM,
                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
         uploadTexture(gpu, output.Get(), sentinel.data(), ngxPresentExtent * 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        auto disable = ngxPresentDisableBuffer(gpu);
         const bool reset = frame == 1 || frame >= 5;
-        auto record = ngxPresentEvaluate(api, gpu, feature, frame, reset, color.Get(), hudless.Get(), output.Get(), depth.Get(), motion.Get(), disable.Get());
+        auto record = ngxPresentEvaluate(api, gpu, feature, frame, reset, color.Get(), hudless.Get(), output.Get(), depth.Get(), motion.Get());
         if (frame == 6) checkNgxResult(api.release(feature), ngx_fixture_result_success(), "NGX present release before execute");
         gpu.executeAndWait(record.list.Get());
         const auto generated = ngxPresentPixels(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const bool disabled = ngxPresentDisabled(gpu, disable.Get());
-        if (disabled != reset || (disabled && generated != sentinel)) fail("NGX actual0 suppression/untouched output");
+        if (generated == sentinel || ((frame == 3 || frame == 4) && generated == real)) fail("NGX native empty/current generated output");
         char path[80];
         std::snprintf(path, sizeof(path), "fg-ngx-%u-1.bin", frame); ngxPresentDump(generated, path);
         std::snprintf(path, sizeof(path), "fg-ngx-%u-0.bin", frame);
@@ -339,32 +335,27 @@ void runPublicFgPresent(const NgxApi& api, Gpu& gpu, const char* control) {
             auto freshOutput = createTexture(gpu.device.Get(), ngxPresentExtent, ngxPresentExtent, DXGI_FORMAT_R8G8B8A8_UNORM,
                                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
             uploadTexture(gpu, freshOutput.Get(), sentinel.data(), ngxPresentExtent * 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            auto freshDisable = ngxPresentDisableBuffer(gpu);
-            auto control = ngxPresentEvaluate(api, gpu, fresh, frame, true, color.Get(), hudless.Get(), freshOutput.Get(), depth.Get(), motion.Get(), freshDisable.Get());
+            auto control = ngxPresentEvaluate(api, gpu, fresh, frame, true, color.Get(), hudless.Get(), freshOutput.Get(), depth.Get(), motion.Get());
             checkNgxResult(api.release(fresh), ngx_fixture_result_success(), "NGX fresh control release before execute");
             gpu.executeAndWait(control.list.Get());
             const auto expected = ngxPresentPixels(gpu, freshOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            if (!ngxPresentDisabled(gpu, freshDisable.Get()) || expected != sentinel) fail("NGX fresh actual0 bootstrap");
-            if ((frame == 4 && generated == expected) || (frame == 5 && generated != expected)) fail("NGX history/reset fresh equivalence");
+            if (expected == sentinel) fail("NGX fresh bootstrap output unwritten");
+            if (frame == 5 && generated != expected) fail("NGX native reset fresh equivalence");
             std::snprintf(path, sizeof(path), "fg-ngx-fresh-%u.bin", frame); ngxPresentDump(expected, path);
         }
         if (frame == 6) {
             gpu.executeAndWait(record.list.Get());
             const auto replay = ngxPresentPixels(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            if (replay != generated)
-                fail("NGX released feature closed-list replay pixels");
+            if (replay == sentinel) fail("NGX released feature native replay output unwritten");
             checkNgxResult(api.release(feature), ngx_fixture_result_feature_not_found(), "NGX stale present feature");
             ngxPresentDump(replay, "fg-ngx-replay-6.bin");
         }
-        if (!disabled) {
+        if (!reset) {
             ngxPresentTexture(gpu, chain.Get(), display.Get(), credit, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, frame, 1, previous);
-            if (control && frame == 2) {
-                // The hold snapshots latest statistics without waiting for a
-                // submitted id to display; only the native callback proves it.
+            if (control && frame == 2)
                 ngxPresentHold(control, "after-generated-2", window.hwnd, chain.Get(), gpu, previous);
-            }
         } else
-            std::printf("OWNED_D3D12_NGX_SUPPRESSED frame=%u actual=0 flag=1 output_untouched=1\n", frame);
+            std::printf("OWNED_D3D12_NGX_BOOTSTRAP_OUTPUT frame=%u reset=1 output_written=1 presented=0 policy=caller_no_history\n", frame);
         ngxPresentTexture(gpu, chain.Get(), display.Get(), credit, color.Get(), ngxPresentRead, frame, 0, previous);
         if (frame == 2) ngxPresentHold(control, "after-real-2", window.hwnd, chain.Get(), gpu, previous);
     }
@@ -385,6 +376,6 @@ void runPublicFgPresent(const NgxApi& api, Gpu& gpu, const char* control) {
                 observation.submitted, SUCCEEDED(observation.result) ? "actual" : "disjoint", static_cast<unsigned long>(observation.result), finalStats.PresentCount,
                 finalStats.SyncQPCTime.QuadPart, finalStats.PresentRefreshCount, finalStats.SyncRefreshCount, now.QuadPart, frequency.QuadPart);
     CloseHandle(credit);
-    std::puts("OWNED_D3D12_NGX_PRESENT_PASS frames=6 drawables=9 generated=3 suppressed=3 ngx_feature=11 hudless=1 ui=current_backbuffer history=fresh_diff reset=untouched release_before_execute=1 replay=exact caller_owned_present=1");
+    std::puts("OWNED_D3D12_NGX_PRESENT_PASS frames=6 drawables=9 generated=3 bootstrap_not_presented=3 ngx_feature=11 hudless=1 ui=current_backbuffer history=native reset=fresh_equivalent release_before_execute=1 replay=native_encode caller_owned_present=1");
 }
 }

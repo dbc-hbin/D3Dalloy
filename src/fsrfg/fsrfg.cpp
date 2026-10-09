@@ -177,11 +177,11 @@ Snapshot* snapshotFor(Context& c, UINT64 frame) {
   for (auto s = c.snapshots; s; s = s->next) if (s->frame <= frame && (!best || best->frame < s->frame)) best = s;
   return best;
 }
-void retire(Context& c, UINT64 frame, BOOL retainResults) {
+void retire(Context& c, UINT64 frame) {
   DispatchLock lock(c);
   UINT64 oldest = 0;
   BOOL pending = FALSE;
-  if (FAILED(c.backend->RetireFrame(frame, retainResults, &oldest, &pending))) return;
+  if (FAILED(c.backend->RetireFrame(frame, &oldest, &pending))) return;
   const auto boundary = pending ? std::min(frame, oldest) : frame;
   auto floor = snapshotFor(c, boundary);
   for (auto link = &c.snapshots; *link;) {
@@ -254,6 +254,7 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& desc,
       (desc.backbufferTransferFunction == FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ && desc.minMaxLuminance[1] <= 0) ||
       (desc.backbufferTransferFunction == FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SCRGB && desc.minMaxLuminance[1] <= desc.minMaxLuminance[0]))
     return FFX_API_RETURN_ERROR_PARAMETER;
+  if (desc.numGeneratedFrames != 1) return FFX_API_RETURN_NO_PROVIDER;
   MTL_FRAME_GENERATION_GENERATE_DESC p{};
   p.StructSize = sizeof(p); p.frame_id = desc.frameID; p.num_generated_frames = desc.numGeneratedFrames;
   // Core selects this frame's immutable Prepare, not the newest recorded one.
@@ -287,27 +288,18 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& desc,
   if (submitted) *submitted = SUCCEEDED(hr);
   return result(hr);
 }
-ffxReturnCode_t dispatch(Context& c, const ffxDispatchDescHeader* desc, bool* submitted = nullptr, bool* resultConsumer = nullptr) {
+ffxReturnCode_t dispatch(Context& c, const ffxDispatchDescHeader* desc, bool* submitted = nullptr) {
   if (!validChain(desc)) return FFX_API_RETURN_ERROR_PARAMETER;
-  ffxReturnCode_t code;
-  {
-    DispatchLock lock(c);
-    switch (desc->type) {
-    case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE:
-      return prepare(c, *reinterpret_cast<const ffxDispatchDescFrameGenerationPrepare*>(desc), false);
-    case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2:
-      return prepare(c, *reinterpret_cast<const ffxDispatchDescFrameGenerationPrepareV2*>(desc), true);
-    case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION:
-      code = generate(c, *reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc), submitted); break;
-    default: return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
-    }
+  DispatchLock lock(c);
+  switch (desc->type) {
+  case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE:
+    return prepare(c, *reinterpret_cast<const ffxDispatchDescFrameGenerationPrepare*>(desc), false);
+  case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2:
+    return prepare(c, *reinterpret_cast<const ffxDispatchDescFrameGenerationPrepareV2*>(desc), true);
+  case FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION:
+    return generate(c, *reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc), submitted);
+  default: return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
   }
-  // Never acquire the proxy lock while holding the backend dispatch lock.
-  if (!code && c.attached) {
-    const bool captured = c.attached->recordFrameGeneration(*reinterpret_cast<const ffxDispatchDescFrameGeneration*>(desc));
-    if (resultConsumer) *resultConsumer = captured;
-  }
-  return code;
 }
 ffxReturnCode_t generationCallback(ffxDispatchDescFrameGeneration* desc, void* user) {
   auto b = static_cast<Binding*>(user);
@@ -317,11 +309,10 @@ ffxReturnCode_t generationCallback(ffxDispatchDescFrameGeneration* desc, void* u
   if (!b->generate) desc->numGeneratedFrames = 1;
   auto code = b->generate ? b->generate(desc, b->generateUser) : dispatch(*b->context, &desc->header);
   if (code) desc->numGeneratedFrames = 0;
-  // RetireFrame preserves pending batches; it does not imply completed output.
-  if (desc->frameID != originalFrame || desc->numGeneratedFrames > 4) {
+  if (desc->frameID != originalFrame || desc->numGeneratedFrames > 1) {
     desc->numGeneratedFrames = 0; return FFX_API_RETURN_ERROR_PARAMETER;
   }
-  retire(*b->context, originalFrame, TRUE);
+  retire(*b->context, originalFrame);
   return code;
 }
 ffxReturnCode_t presentCallback(ffxCallbackDescFrameGenerationPresent* desc, void* user) {
@@ -336,7 +327,6 @@ ffxReturnCode_t detach(Context& c) {
   off.swapChain = c.attached.ptr();
   c.attached->setFrameGenerationConfig(&off);
   if (!c.attached->waitForPresents()) return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
-  c.attached->setFrameGenerationState(nullptr);
   AcquireSRWLockExclusive(&g_lock);
   c.attached = nullptr;
   ReleaseSRWLockExclusive(&g_lock);
@@ -425,7 +415,6 @@ ffxReturnCode_t configureGeneration(Context& c, const ffxConfigureDescFrameGener
     config.interpolationRect = desc.generationRect; config.frameID = desc.frameID;
     config.drawDebugPacingLines = (desc.flags & FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES) != 0;
     // No registry or dispatch lock may be held while the proxy drains callbacks.
-    sc->setFrameGenerationState(c.backend.ptr());
     sc->setFrameGenerationConfig(&config);
     if (changed) deallocate(c, c.binding);
     c.binding = binding;
@@ -628,10 +617,10 @@ extern "C" ffxReturnCode_t ffxDispatch(ffxContext* handle, const ffxDispatchDesc
     if (header->type != FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12 || header->pNext) return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     code = sdkResult(ffxWaitForPresents(c->proxy.ptr()));
   } else {
-    bool submitted = false, resultConsumer = false;
-    code = dispatch(*c, header, &submitted, &resultConsumer);
+    bool submitted = false;
+    code = dispatch(*c, header, &submitted);
     if (submitted && !Scope::current)
-      retire(*c, reinterpret_cast<const ffxDispatchDescFrameGeneration*>(header)->frameID, resultConsumer ? TRUE : FALSE);
+      retire(*c, reinterpret_cast<const ffxDispatchDescFrameGeneration*>(header)->frameID);
   }
   report(c, code); return code;
 }

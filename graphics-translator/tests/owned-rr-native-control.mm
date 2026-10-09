@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-// Independent public MetalFX denoiser control: no production bridge, NGX,
+// Independent native MetalFX denoiser control: no production bridge, NGX,
 // Wine, adapter shaders or proprietary implementation is linked.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -10,6 +10,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+@interface MTLFXTemporalDenoisedScalerDescriptor (OwnedRRBackend)
+- (void)setVersion:(NSUInteger)version;
+@end
 
 namespace {
 void require(bool condition, const char *reason) {
@@ -49,6 +53,10 @@ std::vector<std::vector<uint16_t>> run(id<MTLDevice> device, id<MTL4Compiler> co
   descriptor.motionTextureFormat = MTLPixelFormatRG16Float;
   descriptor.diffuseAlbedoTextureFormat = descriptor.specularAlbedoTextureFormat = descriptor.normalTextureFormat = MTLPixelFormatRGBA16Float;
   descriptor.specularHitDistanceTextureEnabled = YES; descriptor.requiresSynchronousInitialization = YES;
+  // Keep the public factory and native math; select Apple's non-fused GPU implementation.
+  require([descriptor respondsToSelector:@selector(setVersion:)],"native-non-fused-backend");
+  [descriptor setVersion:0x10000];
+  std::puts("OWNED_RR_NATIVE_BACKEND requested_private_version=65536");
   auto scaler = [descriptor newTemporalDenoisedScalerWithDevice:device compiler:compiler];
   require(scaler != nil,"native-denoised-scaler");
   const float minScale = [MTLFXTemporalDenoisedScalerDescriptor supportedInputContentMinScaleForDevice:device];

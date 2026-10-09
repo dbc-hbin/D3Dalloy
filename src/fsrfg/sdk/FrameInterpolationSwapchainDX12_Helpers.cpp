@@ -85,7 +85,7 @@ bool waitForFenceValue(ID3D12Fence* fence, UINT64 value, DWORD dwMilliseconds, F
         const DWORD waitCallbackIntervalInMs = 1;
         int64_t deltaQpcWaitCallback = qpcFrequency * waitCallbackIntervalInMs / 1000;
         int64_t deltaQpcTimeout = qpcFrequency * dwMilliseconds /1000;
-        wchar_t fenceName[64] = {};
+        wchar_t fenceName[64];
         static const GUID debugNameW = {0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
         uint32_t fenceNameLen = sizeof(fenceName);
         fence->GetPrivateData(debugNameW, &fenceNameLen, &fenceName);

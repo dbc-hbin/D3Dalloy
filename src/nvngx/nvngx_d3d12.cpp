@@ -5,6 +5,7 @@
 #include "nvngx_parameter.hpp"
 #include "../d3d12/d3d12_interfaces.hpp"
 #include "../d3d12/d3d12_frame_generation_interfaces.hpp"
+#include "../d3d12/owned_trace.hpp"
 #include "dxgi_interfaces.h"
 #include "Metal4FX.hpp"
 
@@ -18,7 +19,6 @@
 #include <mutex>
 #include <new>
 #include <string>
-#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -69,12 +69,6 @@ struct DeviceEntry {
   std::shared_ptr<DeviceRegistration> registration;
 };
 
-struct FrameGenerationBatch {
-  MTL_FRAME_GENERATION_PREPARE_DESC prepare = {};
-  MTL_FRAME_GENERATION_GENERATE_DESC generate = {};
-  Com<ID3D12Resource> inputs[4], outputs[4];
-  UINT next_index = 0;
-};
 struct FeatureState {
   uint32_t kind = kFeatureSuperSampling;
   Com<IUnknown> device_identity;
@@ -84,7 +78,6 @@ struct FeatureState {
   bool sharpening = false;
   Com<IMTLD3D12FrameGenerationState> frame_generation;
   MTL_FRAME_GENERATION_CREATE_DESC fg_create = {};
-  FrameGenerationBatch fg_batch;
   std::mutex fg_mutex;
   uint64_t next_frame_id = 0;
   LARGE_INTEGER fg_last_counter = {}, fg_counter_frequency = {};
@@ -402,7 +395,7 @@ makeCapabilityParameters() {
     out->Set((prefix + ".MinDriverVersionMajor").c_str(), 0u);
     out->Set((prefix + ".MinDriverVersionMinor").c_str(), 0u);
   }
-  out->Set("DLSSG.MultiFrameCountMax", fg ? 4u : 1u);
+  out->Set("DLSSG.MultiFrameCountMax", 1u);
   out->Set("DLSSDOptimalSettingsCallback", reinterpret_cast<void *>(&optimalSettingsCallback));
   out->Set("DLSSDGetStatsCallback", reinterpret_cast<void *>(&statsCallback));
   return out;
@@ -606,34 +599,7 @@ parseFrameGenerationCreate(const ParametersImpl *params, ID3D12Device *device, M
   return kResultSuccess;
 }
 
-bool
-sameFrameGenerationInputs(const FrameGenerationBatch &batch,
-    const MTL_FRAME_GENERATION_PREPARE_DESC &prepare, const MTL_FRAME_GENERATION_GENERATE_DESC &generate) {
-  const auto &p = batch.prepare;
-  const auto &g = batch.generate;
-  return std::tie(p.frame_id, p.depth, p.motion_vectors, p.depth_state, p.motion_vectors_state,
-      p.render_width, p.render_height, p.flags, p.reset, p.jitter_x, p.jitter_y, p.motion_scale_x,
-      p.motion_scale_y, p.camera_near, p.camera_far, p.camera_fov_vertical_radians,
-      p.view_space_to_meters, p.camera_info_present) ==
-      std::tie(prepare.frame_id, prepare.depth, prepare.motion_vectors, prepare.depth_state,
-      prepare.motion_vectors_state, prepare.render_width, prepare.render_height, prepare.flags,
-      prepare.reset, prepare.jitter_x, prepare.jitter_y, prepare.motion_scale_x, prepare.motion_scale_y,
-      prepare.camera_near, prepare.camera_far, prepare.camera_fov_vertical_radians,
-      prepare.view_space_to_meters, prepare.camera_info_present) &&
-      std::equal(std::begin(p.camera_position), std::end(p.camera_position), std::begin(prepare.camera_position)) &&
-      std::equal(std::begin(p.camera_up), std::end(p.camera_up), std::begin(prepare.camera_up)) &&
-      std::equal(std::begin(p.camera_right), std::end(p.camera_right), std::begin(prepare.camera_right)) &&
-      std::equal(std::begin(p.camera_forward), std::end(p.camera_forward), std::begin(prepare.camera_forward)) &&
-      std::tie(g.frame_id, g.present_color, g.hudless_color, g.present_color_state, g.hudless_color_state,
-      g.num_generated_frames, g.reset, g.backbuffer_transfer_function, g.generation_rect_left,
-      g.generation_rect_top, g.generation_rect_width, g.generation_rect_height,
-      g.min_luminance, g.max_luminance, g.flags) ==
-      std::tie(generate.frame_id, generate.present_color, generate.hudless_color, generate.present_color_state,
-      generate.hudless_color_state, generate.num_generated_frames, generate.reset,
-      generate.backbuffer_transfer_function, generate.generation_rect_left, generate.generation_rect_top,
-      generate.generation_rect_width, generate.generation_rect_height, generate.min_luminance,
-      generate.max_luminance, generate.flags);
-}
+
 NVNGX_RESULT
 evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *params, FeatureState &feature) {
   Com<IMTLD3D12FrameGenerationCommandList> extension = Com<IMTLD3D12FrameGenerationCommandList>::queryFrom(list);
@@ -650,8 +616,8 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
     if (getOptionalResource(params,key)) return kResultUnsupportedParameter;
   const UINT count = getOptionalUInt(params, "DLSSG.MultiFrameCount", 1);
   const UINT index = getOptionalUInt(params, "DLSSG.MultiFrameIndex", 1);
-  if (!count || count > 4) return kResultUnsupportedParameter;
-  if (!index || index > count) return kResultInvalidParameter;
+  if (!count || !index) return kResultInvalidParameter;
+  if (count > 1 || index > 1) return kResultUnsupportedParameter;
   if (output == generate.present_color || output == generate.hudless_color ||
       output == prepare.depth || output == prepare.motion_vectors) return kResultInvalidParameter;
   if (getOptionalUInt(params,"DLSSG.OrthoProjection",0) || !getOptionalUInt(params,"DLSSG.CameraMotionIncluded",1)) return kResultUnsupportedParameter;
@@ -664,15 +630,8 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
       output_desc.Width != feature.fg_create.display_width || output_desc.Height != feature.fg_create.display_height ||
       output_desc.Format != feature.fg_create.backbuffer_format ||
       !(output_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return kResultInvalidParameter;
-  auto *disable = getOptionalResource(params, "DLSSG.OutputDisableInterpolation");
-  if (disable) {
-    Com<ID3D12Device> disable_device;
-    const auto desc = disable->GetDesc();
-    if (FAILED(disable->GetDevice(IID_PPV_ARGS(&disable_device))) ||
-        identityOf(disable_device.ptr()).ptr() != feature.device_identity.ptr() ||
-        desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || desc.Width < 4 ||
-        !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return kResultInvalidParameter;
-  }
+  // MetalFX does not expose a truthful per-output validity/count result.
+  if (getOptionalResource(params, "DLSSG.OutputDisableInterpolation")) return kResultUnsupportedParameter;
   for (const char *key : {"DLSSG.InputBackbufferSubrectBaseX", "DLSSG.InputBackbufferSubrectBaseY", "DLSSG.MVecsSubrectBaseX",
        "DLSSG.MVecsSubrectBaseY", "DLSSG.DepthSubrectBaseX", "DLSSG.DepthSubrectBaseY", "DLSSG.HUDLessSubrectBaseX",
        "DLSSG.HUDLessSubrectBaseY", "DLSSG.OutputInterpolatedSubrectBaseX", "DLSSG.OutputInterpolatedSubrectBaseY",
@@ -734,90 +693,25 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   generate.backbuffer_transfer_function = getOptionalUInt(params,"DLSSG.ColorBuffersHDR",0) ? 1 : 0;
   generate.min_luminance = 0; generate.max_luminance = generate.backbuffer_transfer_function ? 10000 : 1;
   std::lock_guard lock(feature.fg_mutex);
-  unsigned long long frame_id = index == 1 ? feature.next_frame_id : feature.fg_batch.prepare.frame_id;
+  unsigned long long frame_id = feature.next_frame_id;
   params->Get("DLSSG.BackbufferFrameID", &frame_id);
   if (frame_id == UINT64_MAX) return kResultInvalidParameter;
   prepare.frame_id = generate.frame_id = frame_id;
-
-  MTL_FRAME_GENERATION_OUTPUT_DESC publish{};
-  publish.StructSize = sizeof(publish);
-  publish.frame_id = frame_id;
-  publish.output_index = index;
-  publish.output = output;
-  publish.output_disable_interpolation = disable;
-  publish.output_state = publish.output_disable_interpolation_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-
-  if (index != 1) {
-    if (feature.fg_batch.next_index != index || !sameFrameGenerationInputs(feature.fg_batch, prepare, generate))
-      return kResultInvalidParameter;
-    auto hr = extension->PublishFrameGenerationOutput(feature.frame_generation.ptr(), &publish);
-    if (FAILED(hr)) return mapBackendResult(hr, false);
-    ++feature.fg_batch.next_index;
-    if (index == count) {
-      UINT64 oldest = 0; BOOL pending = FALSE;
-      hr = feature.frame_generation->RetireFrame(frame_id, FALSE, &oldest, &pending);
-      if (FAILED(hr)) return mapBackendResult(hr, false);
-    }
-    return kResultSuccess;
-  }
-
   LARGE_INTEGER now{};
   if (!QueryPerformanceCounter(&now) || now.QuadPart <= feature.fg_last_counter.QuadPart ||
       feature.fg_counter_frequency.QuadPart <= 0) return kResultPlatformError;
-  prepare.frame_time_delta_ms = static_cast<float>(1000.0 *
-      (now.QuadPart - feature.fg_last_counter.QuadPart) / feature.fg_counter_frequency.QuadPart);
-
-  FrameGenerationBatch batch;
-  batch.prepare = prepare;
-  batch.generate = generate;
-  batch.inputs[0] = prepare.depth;
-  batch.inputs[1] = prepare.motion_vectors;
-  batch.inputs[2] = generate.present_color;
-  batch.inputs[3] = generate.hudless_color;
-  if (count == 1) {
-    // Single-output evaluation needs no additional owned texture.
-    generate.outputs[0] = output;
-  } else {
-    // NVIDIA's output parameter is ONE texture per evaluation. The remaining
-    // phases belong to this real-frame pair and are consumed by indices 1..N,
-    // never by automatic DXGI injection or by another history generation.
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    heap.CreationNodeMask = heap.VisibleNodeMask = 1;
-    auto desc = output->GetDesc();
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    for (UINT phase = 0; phase < count; ++phase) {
-      const auto hr = feature.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&batch.outputs[phase]));
-      if (FAILED(hr)) return mapBackendResult(hr, false);
-      generate.outputs[phase] = batch.outputs[phase].ptr();
-    }
-  }
-  for (UINT phase = 0; phase < count; ++phase)
-    generate.output_states[phase] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  prepare.frame_time_delta_ms = getOptionalFloat(params, "FrameTimeDeltaInMsec", static_cast<float>(1000.0 *
+      (now.QuadPart - feature.fg_last_counter.QuadPart) / feature.fg_counter_frequency.QuadPart));
+  generate.outputs[0] = output;
+  generate.output_states[0] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   auto hr = extension->PrepareFrameGeneration(feature.frame_generation.ptr(), &prepare);
   if (FAILED(hr)) return mapBackendResult(hr, false);
   hr = extension->GenerateFrames(feature.frame_generation.ptr(), &generate);
-  if (FAILED(hr)) return mapBackendResult(hr, false);
-  // A queued publication owns the captured batch and waits/gates on its actual
-  // GPU-retired result. Evaluate never queries a pending result or waits.
-  hr = extension->PublishFrameGenerationOutput(feature.frame_generation.ptr(), &publish);
-  if (FAILED(hr)) return mapBackendResult(hr, false);
+  // Retirement affects metadata only; the recorded packet owns all GPU resources.
   UINT64 oldest = 0; BOOL pending = FALSE;
-  if (feature.fg_batch.next_index &&
-      feature.fg_batch.next_index <= feature.fg_batch.generate.num_generated_frames &&
-      feature.fg_batch.prepare.frame_id < frame_id) {
-    // A newer real pair abandons any unrequested indices of the old pair. Its
-    // recorded publications already retain their immutable producer/outcome.
-    hr = feature.frame_generation->RetireFrame(feature.fg_batch.prepare.frame_id, FALSE, &oldest, &pending);
-    if (FAILED(hr)) return mapBackendResult(hr, false);
-  }
-  if (count == 1) {
-    hr = feature.frame_generation->RetireFrame(frame_id, FALSE, &oldest, &pending);
-    if (FAILED(hr)) return mapBackendResult(hr, false);
-  }
-  batch.next_index = 2;
-  feature.fg_batch = std::move(batch);
+  const auto retired = feature.frame_generation->RetireFrame(frame_id, &oldest, &pending);
+  if (FAILED(hr)) return mapBackendResult(hr, false);
+  if (FAILED(retired)) return mapBackendResult(retired, false);
   if (frame_id >= feature.next_frame_id) feature.next_frame_id = frame_id + 1;
   feature.fg_last_counter = now;
   return kResultSuccess;
@@ -881,6 +775,7 @@ void owned_ngxd3d12_param_reset(void *storage) {
 
 NVNGX_RESULT
 NVNGXD3D12InitDevice(ID3D12Device *device) {
+  owned_graphics::Trace("ngx_d3d12_init", ",\"device_present\":", device != nullptr);
   if (!device)
     return kResultInvalidParameter;
   auto identity = identityOf(device);
@@ -898,6 +793,7 @@ NVNGXD3D12InitDevice(ID3D12Device *device) {
   DeviceEntry entry{identity, Com<ID3D12Device>(device), extension, std::make_shared<DeviceRegistration>()};
   std::lock_guard lock(g_mutex);
   g_devices[identity.ptr()] = std::move(entry);
+  owned_graphics::Trace("ngx_d3d12_init_ready", ",\"result\":", static_cast<unsigned>(kResultSuccess));
   return kResultSuccess;
 }
 
@@ -1033,6 +929,7 @@ NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D12_CreateFeature(
     ID3D12GraphicsCommandList *list, unsigned int feature, NVNGXParameter *params, NVNGXHandle **out_handle
 ) {
+  owned_graphics::Trace("ngx_d3d12_create_begin", ",\"feature\":", feature);
   if (!out_handle)
     return kResultInvalidParameter;
   *out_handle = nullptr;
@@ -1044,13 +941,17 @@ NVSDK_NGX_D3D12_CreateFeature(
   Com<IMTLD3D12GraphicsCommandListExt> list_ext = nullptr;
   Com<ID3D12Device> device = nullptr;
   auto result = validateCommandList(list, nullptr, list_ext, device);
+  owned_graphics::Trace("ngx_d3d12_create_list", ",\"result\":", static_cast<unsigned>(result));
   if (result != kResultSuccess)
     return result;
   DeviceEntry device_entry;
-  if (!findInitializedDevice(device.ptr(), &device_entry))
+  const bool initialized = findInitializedDevice(device.ptr(), &device_entry);
+  owned_graphics::Trace("ngx_d3d12_create_device", ",\"initialized\":", initialized);
+  if (!initialized)
     return kResultNotInitialized;
 
   auto parameter = lookupParameter(params);
+  owned_graphics::Trace("ngx_d3d12_create_parameters", ",\"found\":", parameter != nullptr);
   if (!parameter)
     return kResultInvalidParameter;
   auto state = std::make_shared<FeatureState>();
@@ -1070,6 +971,10 @@ NVSDK_NGX_D3D12_CreateFeature(
         !QueryPerformanceCounter(&state->fg_last_counter)) return kResultPlatformError;
   } else {
     result = parseCreate(parameter->storage.get(),device.ptr(),&state->create);
+    owned_graphics::Trace("ngx_d3d12_create_parse", ",\"result\":", static_cast<unsigned>(result),
+        ",\"input_width\":", state->create.InputWidth, ",\"input_height\":", state->create.InputHeight,
+        ",\"output_width\":", state->create.OutputWidth, ",\"output_height\":", state->create.OutputHeight,
+        ",\"flags\":", state->create.FeatureFlags);
     if (result != kResultSuccess) return result;
     state->sharpening = (getOptionalInt(parameter->storage.get(),NVNGX_Parameter_DLSS_Feature_Create_Flags,0) & NVNGX_DLSS_FLAG_DO_SHARPENING) != 0;
     if (feature == kFeatureRayReconstruction) {
@@ -1084,6 +989,7 @@ NVSDK_NGX_D3D12_CreateFeature(
       state->create.FeatureFlags |= kRayReconstructionFlag;
     }
     const auto hr = device_entry.extension->CreateTemporalUpscaleState(&state->create,&state->backend);
+    owned_graphics::Trace("ngx_d3d12_create_backend", ",\"hr\":", static_cast<unsigned>(hr));
     if (FAILED(hr) || !state->backend) return mapBackendResult(FAILED(hr) ? hr : E_FAIL,true);
   }
 
@@ -1101,6 +1007,7 @@ NVSDK_NGX_D3D12_CreateFeature(
     g_features[public_handle] = std::move(state);
   }
   *out_handle = public_handle;
+  owned_graphics::Trace("ngx_d3d12_create_ready", ",\"feature\":", feature);
   return kResultSuccess;
 }
 
@@ -1108,15 +1015,19 @@ NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D12_EvaluateFeature(
     ID3D12GraphicsCommandList *list, const NVNGXHandle *handle, NVNGXParameter *params, void *
 ) {
+  owned_graphics::Trace("ngx_d3d12_evaluate_begin", ",\"list_present\":", list != nullptr,
+      ",\"handle_present\":", handle != nullptr, ",\"params_present\":", params != nullptr);
   if (!list || !handle || !params)
     return kResultInvalidParameter;
   auto feature = lookupFeature(handle);
+  owned_graphics::Trace("ngx_d3d12_evaluate_handle", ",\"found\":", feature != nullptr);
   if (!feature)
     return kResultFeatureNotFound;
 
   Com<IMTLD3D12GraphicsCommandListExt> extension = nullptr;
   Com<ID3D12Device> device = nullptr;
   auto result = validateCommandList(list, feature->device_identity, extension, device);
+  owned_graphics::Trace("ngx_d3d12_evaluate_list", ",\"result\":", static_cast<unsigned>(result));
   if (result != kResultSuccess)
     return result;
 
@@ -1129,9 +1040,14 @@ NVSDK_NGX_D3D12_EvaluateFeature(
   result = feature->kind == kFeatureRayReconstruction
       ? parseRayReconstructionFrame(parameter->storage.get(),*feature,frame)
       : parseFrame(parameter->storage.get(), *feature, &frame);
+  owned_graphics::Trace("ngx_d3d12_evaluate_parse", ",\"result\":", static_cast<unsigned>(result),
+      ",\"input_width\":", frame.InputContentWidth, ",\"input_height\":", frame.InputContentHeight,
+      ",\"pre_exposure\":", frame.PreExposure, ",\"sharpening\":", frame.EnableSharpening);
   if (result != kResultSuccess)
     return result;
-  return mapBackendResult(extension->TemporalUpscale(feature->backend.ptr(), &frame), false);
+  const auto hr = extension->TemporalUpscale(feature->backend.ptr(), &frame);
+  owned_graphics::Trace("ngx_d3d12_evaluate_backend", ",\"hr\":", static_cast<unsigned>(hr));
+  return mapBackendResult(hr, false);
 }
 
 NVNGX_API NVNGX_RESULT

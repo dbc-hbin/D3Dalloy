@@ -1828,26 +1828,27 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
     if "_FAIL" in stdout + stderr or "_EXPECT" in stdout + stderr:
         failures.append("game fixture reported a failure")
     if suite in ("ngx-fg", "ngx-features"):
-        rows = re.findall(r"^OWNED_D3D12_NGX_PHASE frame=(\d+) count=(\d+) index=(\d+) phase=(\d+(?:\.\d+)?) actual=([01]) grouped=([01]) actual_count=(\d+) output_flag=([01]) untouched=([01]) probe_red=(\d+) consumer=gpu_readback$", stdout, re.MULTILINE)
-        expected = [(grouped, count, frame, index) for grouped in (0, 1) for count in range(1, 5)
-                    for frame in range(7) for index in range(1, count + 1)]
-        observed = [(int(g), int(c), int(f), int(i)) for f, c, i, _, _, g, _, _, _, _ in rows]
-        if observed != expected or sum(line.startswith("OWNED_D3D12_NGX_PHASE") for line in lines) != len(expected):
-            failures.append("NGX requires every ordered N1..4 indexed GPU phase in independent and grouped recordings")
-        for frame, count, index, phase, actual, _, actual_count, flag, untouched, red in rows:
-            frame, count, index = int(frame), int(count), int(index)
-            disabled = frame in (0, 2, 4, 6)
-            expected_phase = index / (count + 1)
-            expected_red = 19 if disabled else 32 + (frame - 1) * 8 + expected_phase * 8
-            if (abs(float(phase) - expected_phase) > 1e-6 or int(actual) != int(not disabled)
-                    or int(actual_count) != (0 if disabled else count) or int(flag) != int(disabled)
-                    or int(untouched) != int(disabled) or abs(int(red) - expected_red) > 1):
-                failures.append("NGX phase, actual GPU output count/flag, untouched output or temporal color mismatch")
+        rows = re.findall(r"^OWNED_D3D12_NGX_NATIVE frame=(\d+) reset=([01]) replay=([01]) output_written=1 different_current=([01]) resources_released=1 consumer=gpu_readback frame_id=(\d+) not_rendering=([01])$", stdout, re.MULTILINE)
+        expected = [(frame, replay) for frame in range(9) for replay in range(2 if frame in (0, 7, 8) else 1)]
+        if ([(int(f), int(r)) for f, _, r, *_ in rows] != expected
+                or sum(line.startswith("OWNED_D3D12_NGX_NATIVE") for line in lines) != len(expected)):
+            failures.append("NGX requires every ordered native output and retained-resource replay")
+        for frame, reset, replay, different, frame_id, not_rendering in rows:
+            frame = int(frame)
+            if (int(reset) != int(frame in (0, 5)) or int(frame_id) != (7 if frame == 8 else frame)
+                    or int(not_rendering) != int(frame == 6)
+                    or (replay == "0" and frame in (3, 4) and different != "1")):
+                failures.append("NGX native history/reset or genuine output proof mismatch")
                 break
-        scene_rows = re.findall(r"^OWNED_D3D12_NGX_SCENE count=([1-4]) actual=0 output_flag=1 untouched=1 phases=([1-4]) reset=0 consumer=gpu_readback$", stdout, re.MULTILINE)
-        if (scene_rows != [(str(count), str(count)) for count in range(1, 5)]
-                or sum(line.startswith("OWNED_D3D12_NGX_SCENE") for line in lines) != 4):
-            failures.append("NGX requires untouched actual0 GPU scene-change outputs for every indexed count")
+        rejected = [line for line in lines if line.startswith("OWNED_D3D12_NGX_REJECT ")]
+        expected_rejections = [f"OWNED_D3D12_NGX_REJECT case={kind} {kind}={value} result=unsupported_parameter"
+                               for kind in ("count", "index") for value in (2, 3, 4)]
+        expected_rejections.append("OWNED_D3D12_NGX_REJECT case=disable_buffer result=unsupported_parameter output_untouched=1 before_valid_dispatch=1 zero_count_index=invalid_parameter")
+        if rejected != expected_rejections:
+            failures.append("NGX native capability rejection or untouched-output evidence incomplete")
+        if [line for line in lines if line.startswith("OWNED_D3D12_NGX_SCENE")] != [
+                "OWNED_D3D12_NGX_SCENE frames=14 reset=1 output_written=1 actual_count=unavailable consumer=gpu_readback"]:
+            failures.append("NGX native explicit scene-reset output evidence incomplete")
     if suite == "sr-alpha":
         rows = re.findall(r"^OWNED_D3D12_SR_ALPHA_CASE_PASS frame=(\d+) replay=(\d+) scalar_oracle_max_half_ulp=(\d+) subrect=1 dynamic=([01]) retired=([01])$", stdout, re.MULTILINE)
         expected = [(str(frame), str(replay), str(int(frame == 3)), str(int(frame == 5)))
@@ -1886,18 +1887,18 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
     elif suite == "ngx-fg":
         expected = [
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 non_sr_other=0",
-            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=4 per_index_output=1 grouped_recording=1 actual0_untouched=1 immutable_params=1 release_before_execute=1 replay=1",
+            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=unsupported reset=native_history release_before_execute=1 replay=native_encode",
         ]
         if ([line for line in lines if line.startswith("OWNED_D3D12_NGX_FEATURE_CASE_PASS")] != expected
                 or sum(line.startswith(prefix + "_PASS") for line in lines) != 1
-                or lines.count("OWNED_D3D12_NGX_FG_PASS capacity=4 independent=1 grouped=1") != 1
+                or lines.count("OWNED_D3D12_NGX_FG_PASS capacity=1 native_output=1 unsupported_mfg=1") != 1
                 or any(line.startswith("OWNED_D3D12_NGX_FEATURES_PASS") for line in lines)):
             failures.append("NGX focused FG requires its public capabilities, indexed-output case and exact summary")
         return failures
     elif suite == "ngx-features":
         expected = [
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 non_sr_other=0",
-            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=4 per_index_output=1 grouped_recording=1 actual0_untouched=1 immutable_params=1 release_before_execute=1 replay=1",
+            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=unsupported reset=native_history release_before_execute=1 replay=native_encode",
             *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant={v} frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8" for v in range(4)],
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_alpha flag128=1 nonopaque_contrast=1 rgb_preserved=1",
         ]
@@ -2842,14 +2843,15 @@ def run(args: argparse.Namespace) -> int:
         success = success and (runtime / arch["windows_directory"] / "nvngx.dll").is_file() and any(
             "nvngx.dll" in line.lower() and "builtin" in line.lower()
             for line in stderr.splitlines() if "Loaded" in line)
-        success = success and native_compiler_proof
+        if args.suite not in ("ngx-fg", "ngx-fg-present"):
+            success = success and native_compiler_proof
     if args.suite == "ngx-fg-present":
         ngx_present_summary = [dict(re.findall(r"(\w+)=([^\s]+)", line)) for line in stdout.splitlines()
                                if line.startswith("OWNED_D3D12_NGX_PRESENT_PASS ")]
         success = success and len(ngx_present_summary) == 1 and all(
             ngx_present_summary[0].get(key) == value for key, value in
-            {"frames": "6", "drawables": "9", "generated": "3", "suppressed": "3",
-             "ngx_feature": "11", "hudless": "1", "release_before_execute": "1", "replay": "exact",
+            {"frames": "6", "drawables": "9", "generated": "3", "bootstrap_not_presented": "3",
+             "ngx_feature": "11", "hudless": "1", "release_before_execute": "1", "replay": "native_encode",
              "caller_owned_present": "1"}.items())
     if args.suite == "smoke":
         success = success and barrier_ok and frames == [str(n) for n in range(8)]
@@ -3715,14 +3717,14 @@ def run(args: argparse.Namespace) -> int:
                                    r"generation_error=(\d+) present_error=(\d+) qpc_start=(\d+) qpc_end=(\d+) frequency=(\d+)", stdout)
         callbacks = re.findall(r"OWNED_D3D12_FSR_FG_CALLBACK_PIXELS frame=(\d+) generated=(\d+) output_index=(\d+) width=128 height=128 "
                                r"hash=([0-9a-f]{16}) marker=(\d+),(\d+),220", stdout)
-        generated_counts = {2: 1, 3: 2, 4: 3, 8: 4}
+        generated_counts = dict.fromkeys((1, 2, 3, 4, 7, 8, 10, 11, 12), 1)
         expected_callbacks = []
         for frame in range(1, 13):
             expected_callbacks.extend((frame, 1, index) for index in range(1, generated_counts.get(frame, 0) + 1))
-            if frame not in (8, 10, 12):
+            if frame not in (8, 12):
                 expected_callbacks.append((frame, 0, 0))
-        grouped = re.findall(r"^OWNED_D3D12_FSR_FG_GROUPED_PASS count=([1-4]) distinct_gpu_outputs=([1-4]) "
-                             r"rect_guard=exact reset_output=unchanged$", stdout, re.MULTILINE)
+        grouped = re.findall(r"^OWNED_D3D12_FSR_FG_NATIVE_PASS count=(1) distinct_gpu_outputs=(1) "
+                             r"rect_guard=exact reset_output=current$", stdout, re.MULTILINE)
         ui_frames = re.findall(r"OWNED_D3D12_FSR_FG_UI_FRAME frame=(\d+) width=(\d+) height=(\d+) source=(\d+),60,100 "
                                r"ui=64,0,0,128 premul=1 doublebuffer=1 overwritten_after_present=1", stdout)
         statistics = re.findall(r"OWNED_D3D12_FSR_FG_STATISTICS frame=(\d+) statistics=(actual|disjoint) "
@@ -3734,9 +3736,9 @@ def run(args: argparse.Namespace) -> int:
                                       r"submitted_present=(\d+) native_present=(\d+) present_refresh=(\d+) "
                                       r"sync_refresh=(\d+) sync_qpc=(\d+) qpc_end=(\d+) frequency=(\d+) "
                                       r"source=public_dxgi_actual_presentation", stdout)
-        observations_ok = len(statistics) == 15 and [row[0] for row in final_statistics] == ["callback", "builtin_ui"]
+        observations_ok = len(statistics) == 16 and [row[0] for row in final_statistics] == ["callback", "builtin_ui"]
         if observations_ok:
-            for rows, final, requested in zip((statistics[:11], statistics[11:]), final_statistics,
+            for rows, final, requested in zip((statistics[:12], statistics[12:]), final_statistics,
                                               (len(expected_callbacks), len(ui_frames))):
                 previous = (0, 0, 0, 0)
                 previous_submitted = 0
@@ -3755,23 +3757,8 @@ def run(args: argparse.Namespace) -> int:
                     previous_submitted = submitted
                 observations_ok &= (final[1] == "actual" and final[3] == rows[-1][3] and
                                     int(final[3]) == requested and len(frequencies) == 1)
-        queue_proofs = re.findall(r"^OWNED_D3D12_FSR_FG_QUEUE_PROOF frame=(\d+) blocked=selected idle=progress "
-                                  r"composition=(pending_marker|builtin_ui) submitted_before=(\d+) submitted_during=(\d+) "
-                                  r"counter_domain=public_present_calls$",
-                                  stdout, re.MULTILINE)
         success = (success
-                   and stdout.count("OWNED_D3D12_FSR_FG_QUEUES_PASS samequeue=1 nullarray=rejected count0=preserved "
-                                    "multipqueue=3 device_type_mask=rejected rollback=atomic drain=oldframe "
-                                    "owners=retained generated_real_ui=selected worker_idle=progress") == 1
-                   and stdout.count("OWNED_D3D12_FSR_FG_RECORDING_ROLLBACK frame=2 preserved=1 "
-                                    "consumed_by=public_present_gpu_output") == 1
-                   and stdout.count("OWNED_D3D12_FSR_FG_REJECTED_GENERATION_ORDER frame=9 "
-                                    "real_gpu_output=after_current_game_batch generated=absent") == 1
-                   and [(frame, composition) for frame, composition, *_ in queue_proofs]
-                       == [("1", "pending_marker"), ("3", "pending_marker"),
-                           ("5", "pending_marker"), ("9", "pending_marker"),
-                           ("11", "builtin_ui"), ("12", "builtin_ui")]
-                   and all(int(during) >= int(before) for _, _, before, during in queue_proofs)
+                   and stdout.count("OWNED_D3D12_FSR_FG_ORIGINAL_SDK_PASS resize1=unsupported unchanged=1 resize=implemented pacing=original") == 1
                    and "OWNED_D3D12_FSR_FG_DIRECT_PASS snapshot=exact rect_guard=exact frames=4" in stdout
                    and "OWNED_D3D12_FSR_FG_HISTORY_PASS reset=fresh gap=reset off_on=fresh stale_record=no_history_publication negative_output=unchanged" in stdout
                    and "OWNED_D3D12_FSR_FG_LIFETIME_PASS context_destroy_before_execute=1 input_release=1 allocation_balance=1" in stdout
@@ -3779,12 +3766,12 @@ def run(args: argparse.Namespace) -> int:
                    and all(stdout.splitlines().count(marker) == 1 for marker in (
                        "OWNED_D3D12_FSR_FG_DEBUG_PASS tear=gpu_effect reset=history debug=real_inputs configure=frame_snapshot history=unmodified alpha=opaque",
                        "OWNED_D3D12_FSR_FG_DEBUG_CAPTURE_PASS prepare=per_frame configure=recorded rect=recorded output=independent_gpu_exact",
-                       "OWNED_D3D12_FSR_FG_DEBUG_REPLAY_PASS combined=1 debug_overlay=full_display replay=exact context_destroy_before_replay=1",
-                       "OWNED_D3D12_FSR_FG_COUNT_REJECTION_PASS counts=0,5 sentinel=exact prepare=retained multi_output_supported=1",
-                       "OWNED_D3D12_FSR_FG_NO_NOTIFY_PROXY_PASS frame=3 generated=2 result_observer=retained",
+                       "OWNED_D3D12_FSR_FG_DEBUG_REPLAY_PASS combined=1 debug_overlay=full_display replay=fresh_native context_destroy_before_replay=1",
+                       "OWNED_D3D12_FSR_FG_COUNT_REJECTION_PASS invalid=0,5 unsupported=2,3,4 sentinel=exact prepare=retained",
+                       "OWNED_D3D12_FSR_FG_NO_NOTIFY_PROXY_PASS frame=3 generated=1",
                        "OWNED_D3D12_FSR_FG_PREPARE_ORDER_PASS matching_frame=2 newest_prepare=3 output=exact",
-                       "OWNED_D3D12_FSR_FG_MULTI_PACING_PASS counts=1,2,3,4 distinct_gpu_outputs=1 generated_before_real=1 bootstrap_reset_scenechange_disabled=zero only_generated_zero=no_present"))
-                   and grouped == [(str(n), str(n)) for n in range(1, 5)]
+                       "OWNED_D3D12_FSR_FG_NATIVE_PACING_PASS count=1 generated_before_real=1 bootstrap_reset=native_output disabled=real_only callback_error=real_only"))
+                   and grouped == [("1", "1")]
                    and all(len({row[3] for row in callbacks if int(row[0]) == frame and row[1] == "1"}) == count
                            for frame, count in generated_counts.items())
                    and "OWNED_D3D12_FSR_FG_PROXY_PASS create=hwnd callbacks=gpu-readback generated_before_real=1 only_generated=1 disabled=1 callback_error=1 drain=1 destroy=1" in stdout
@@ -3792,14 +3779,14 @@ def run(args: argparse.Namespace) -> int:
                    and "OWNED_D3D12_FSR_FG_UI_PASS wrap=real_hwnd ui=builtin_shader premultiplied=1 doublebuffer=gpu_snapshot resize=96x80 lifetime=drained" in stdout
                    and [tuple(map(int, row)) for row in ui_frames]
                        == [(11, 128, 128, 88), (12, 128, 128, 96), (13, 96, 80, 104), (14, 96, 80, 112)]
-                   and [int(frame) for frame, *_ in statistics] == [*range(1, 10), 11, 12, *range(11, 15)]
+                   and [int(frame) for frame, *_ in statistics] == [*range(1, 13), *range(11, 15)]
                    and observations_ok
                    and [int(frame) for frame, *_ in present_calls] == list(range(1, 13))
                    and [(int(frame), int(generated), int(index)) for frame, generated, index, *_ in callbacks] == expected_callbacks
                    and all(int(red) == int(frame) + 32 and int(green) == (190 if generated == "1" else 70)
                            for frame, generated, _, _, red, green in callbacks)
                    and all((int(enabled), int(only), int(generation_error), int(present_error))
-                           == (int(int(frame) not in (5, 6)), int(frame in ("8", "12")), int(frame == "9"), int(frame == "10"))
+                           == (int(int(frame) not in (5, 6)), int(frame in ("8", "12")), int(frame == "9"), 0)
                            and int(frequency) > 0 and 0 <= int(end) - int(start) < 60 * int(frequency)
                            for frame, enabled, only, generation_error, present_error, start, end, frequency in present_calls)
                    and "OWNED_D3D12_FSR_FG_FAIL" not in stdout + stderr

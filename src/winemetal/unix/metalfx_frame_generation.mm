@@ -1,4 +1,4 @@
-// Port of the reference FSR frame-generation algorithms; owned Metal4 transport.
+// FSR/NGX resource translation to native MetalFX; owned Metal4 transport.
 #include "metalfx_frame_generation.hpp"
 #include "../winemetal_metal4_fg.h"
 #include "fsr-kernels.inc"
@@ -205,7 +205,6 @@ Object makePipeline(id<MTLDevice> device, NSString* name) {
 }
 
 struct Configuration {
-    Mode mode = Mode::Metal4;
     Object device;
     Object compiler;
     Object descriptor;
@@ -266,11 +265,8 @@ struct State {
     std::uint64_t generationEpoch = 0;
     // Protected by executionMutex; set while this context holds a HudRow count.
     bool hudCounted = false;
-    bool hasMode = false;
-    Mode mode = Mode::Metal4;
-    Object metalDevice;
+    bool providerValidated = false;
     std::unordered_map<std::uint64_t, std::shared_ptr<Snapshot>> frames;
-    Object history;
     std::shared_ptr<Configuration> historyConfiguration;
     WMTFGdispatch_packet historyDispatch{};
     std::uint64_t historyFrame = 0;
@@ -288,14 +284,12 @@ std::shared_ptr<State> lookup(std::uint64_t context) {
     return found == contexts.end() ? nullptr : found->second;
 }
 
-bool supported(id<MTLDevice> device, Mode mode, std::uint64_t compiler) {
-    if (@available(macOS 26.0, *)) {
+bool supported(id<MTLDevice> device, std::uint64_t compiler) {
+    if (@available(macOS 27.0, *)) {
         return device && compiler && [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:device];
     }
     return false;
 }
-
-bool sameConfiguration(const Configuration& a, const Configuration& b);
 
 std::shared_ptr<Configuration> configure(
     State& state, const Command& command,
@@ -303,9 +297,8 @@ std::shared_ptr<Configuration> configure(
     id<MTLTexture> depth, MTLPixelFormat sourceColor, MTLPixelFormat sourceUi,
     NSUInteger outputWidth, NSUInteger outputHeight, std::uint32_t transfer) {
     if (@available(macOS 26.0, *)) {
-        const Mode mode = Mode::Metal4;
         auto device = (id<MTLDevice>)command.value.device;
-        if (!supported(device, mode, command.value.compiler)) return {};
+        if (!supported(device, command.value.compiler)) return {};
         const MTLPixelFormat color = MTLPixelFormatRGBA16Float;
         const MTLPixelFormat ui = sourceUi == MTLPixelFormatInvalid
                                 ? MTLPixelFormatInvalid : MTLPixelFormatRGBA16Float;
@@ -314,7 +307,7 @@ std::shared_ptr<Configuration> configure(
         const bool cameraPresent = packet.camera_info_present != 0;
         // MetalFX consumes color, depth, and motion in one origin-zero active domain.
         for (const auto& cached : state.configurations) {
-            if (cached->device.get() == device && cached->mode == mode &&
+            if (cached->device.get() == device &&
                 cached->color == color && cached->ui == ui &&
                 cached->sourceColor == sourceColor && cached->sourceUi == sourceUi &&
                 cached->transfer == transfer && cached->cameraPresent == cameraPresent &&
@@ -325,7 +318,6 @@ std::shared_ptr<Configuration> configure(
         }
 
         auto result = std::make_shared<Configuration>();
-        result->mode = mode;
         result->device = Object(device);
         result->compiler = Object((id)command.value.compiler);
         result->color = color;
@@ -355,7 +347,7 @@ std::shared_ptr<Configuration> configure(
         descriptor.outputWidth = result->outputWidth;
         descriptor.outputHeight = result->outputHeight;
         if (@available(macOS 27.0, *))
-            descriptor.requiresPrevColorTexture = YES;
+            descriptor.requiresPrevColorTexture = NO;
 
         result->factory = result->makeInterpolator();
         if (!result->factory) return {};
@@ -493,7 +485,7 @@ struct Copy {
     NSUInteger destinationX = 0, destinationY = 0;
 };
 
-bool copyTextures(id buffer, id fence, Mode mode, const Copy* copies,
+bool copyTextures(id buffer, id fence, const Copy* copies,
                   std::size_t count, std::vector<Object>& retained) {
     if (@available(macOS 26.0, *)) {
     id encoder = send<id>(buffer, sel_registerName("computeCommandEncoder"));
@@ -549,7 +541,7 @@ Object makeParameterBuffer(id<MTLDevice> device, const FgParams& params) {
     return result;
 }
 
-bool computePass(id buffer, id fence, Mode mode, id<MTLDevice> device,
+bool computePass(id buffer, id fence, id<MTLDevice> device,
                  id<MTLComputePipelineState> pipeline, id<MTLTexture> source,
                  id<MTLTexture> destination, id<MTLBuffer> parameterBuffer,
                  const FgParams& params, std::vector<Object>& retained,
@@ -590,16 +582,6 @@ bool computePass(id buffer, id fence, Mode mode, id<MTLDevice> device,
     return false;
 }
 
-bool sameConfiguration(const Configuration& a, const Configuration& b) {
-    return a.device.get() == b.device.get() && a.mode == b.mode &&
-           a.color == b.color && a.ui == b.ui &&
-           a.sourceColor == b.sourceColor && a.sourceUi == b.sourceUi &&
-           a.transfer == b.transfer && a.cameraPresent == b.cameraPresent &&
-           a.depth == b.depth && a.motion == b.motion &&
-           a.width == b.width && a.height == b.height &&
-           a.outputWidth == b.outputWidth && a.outputHeight == b.outputHeight;
-}
-
 bool sameHistoryValues(const WMTFGdispatch_packet& a,
                        const WMTFGdispatch_packet& b) {
     return a.generation_rect_left == b.generation_rect_left &&
@@ -607,8 +589,9 @@ bool sameHistoryValues(const WMTFGdispatch_packet& a,
            a.generation_rect_width == b.generation_rect_width &&
            a.generation_rect_height == b.generation_rect_height &&
            a.backbuffer_transfer_function == b.backbuffer_transfer_function &&
-           a.min_luminance == b.min_luminance &&
-           a.max_luminance == b.max_luminance;
+           // SDR decode/encode does not use luminance metadata.
+           (a.backbuffer_transfer_function == 0 ||
+            (a.min_luminance == b.min_luminance && a.max_luminance == b.max_luminance));
 }
 
 } // namespace
@@ -638,7 +621,7 @@ struct ExecutionLease::Impl {
         }
     }
 
-    bool makeResident(id buffer, Mode mode) {
+    bool makeResident(id buffer) {
         if (@available(macOS 26.0, *)) {
             auto device = (id<MTLDevice>)prepared->snapshot->configuration->device.get();
             MTLResidencySetDescriptor* descriptor =
@@ -713,7 +696,7 @@ bool PreparedFrame::encode(
 
                 std::lock_guard executionLock(impl_->state->executionMutex);
                 if (impl_->kind == Impl::Kind::Snapshot) {
-                    if (!execution->makeResident(buffer, configuration.mode))
+                    if (!execution->makeResident(buffer))
                         return fail("snapshot_residency");
                     const std::array<Copy, 2> copies{{
                         {(id<MTLTexture>)impl_->first.get(),
@@ -723,7 +706,7 @@ bool PreparedFrame::encode(
                          (id<MTLTexture>)impl_->snapshot->motion.get(),
                          impl_->snapshot->motionWidth, impl_->snapshot->motionHeight}
                     }};
-                    if (!copyTextures(buffer, (id)fence, configuration.mode,
+                    if (!copyTextures(buffer, (id)fence,
                                       copies.data(), copies.size(), execution->objects))
                         return fail("snapshot_copy");
                     impl_->snapshot->production->produced = true;
@@ -758,18 +741,15 @@ bool PreparedFrame::encode(
                 auto& state = *impl_->state;
                 const std::uint64_t frame = impl_->dispatch.frame_id;
                 bool reset = impl_->reset || impl_->snapshot->parameters.reset ||
-                    !state.history || !state.historyConfiguration ||
-                    !sameConfiguration(configuration, *state.historyConfiguration) ||
+                    impl_->snapshot->configuration != state.historyConfiguration ||
                     !sameHistoryValues(impl_->dispatch, state.historyDispatch) ||
                     state.historyFrame + 1 != frame;
-                Object previous = reset ? current : state.history;
                 execution->objects.push_back(interpolator);
                 execution->objects.push_back(current);
                 execution->objects.push_back(ui);
                 execution->objects.push_back(normalizedDepth);
                 execution->objects.push_back(normalizedMotion);
                 execution->objects.push_back(output);
-                execution->objects.push_back(previous);
 
                 id<MTLTexture> present = (id<MTLTexture>)impl_->first.get();
                 id<MTLTexture> scene = impl_->third
@@ -852,36 +832,36 @@ bool PreparedFrame::encode(
                 execution->objects.push_back(depthParameters);
                 execution->objects.push_back(motionParameters);
                 // Metal4 GPU addresses must be admitted before the residency set commits.
-                if (!execution->makeResident(buffer, configuration.mode))
+                if (!execution->makeResident(buffer))
                     return fail("encode_residency");
 
                 const Copy baseline{present, (id<MTLTexture>)impl_->second.get(),
                     state.creation.display_width, state.creation.display_height};
-                if (!copyTextures(buffer, (id)fence, configuration.mode, &baseline, 1,
+                if (!copyTextures(buffer, (id)fence, &baseline, 1,
                                   execution->objects))
                     return fail("encode_baseline_copy");
-                if (!computePass(buffer, (id)fence, configuration.mode, device,
+                if (!computePass(buffer, (id)fence, device,
                                  (id<MTLComputePipelineState>)configuration.decodePipeline.get(),
                                  (id<MTLTexture>)sceneView.get(),
                                  (id<MTLTexture>)current.get(),
                                  (id<MTLBuffer>)colorParameters.get(), colorParams,
                                  execution->objects))
                     return fail("encode_scene_decode");
-                if (ui && !computePass(buffer, (id)fence, configuration.mode, device,
+                if (ui && !computePass(buffer, (id)fence, device,
                                       (id<MTLComputePipelineState>)configuration.decodePipeline.get(),
                                       (id<MTLTexture>)presentView.get(),
                                       (id<MTLTexture>)ui.get(),
                                       (id<MTLBuffer>)colorParameters.get(), colorParams,
                                       execution->objects))
                     return fail("encode_ui_decode");
-                if (!computePass(buffer, (id)fence, configuration.mode, device,
+                if (!computePass(buffer, (id)fence, device,
                                  (id<MTLComputePipelineState>)configuration.depthPipeline.get(),
                                  (id<MTLTexture>)impl_->snapshot->depth.get(),
                                  (id<MTLTexture>)normalizedDepth.get(),
                                  (id<MTLBuffer>)depthParameters.get(), depthParams,
                                  execution->objects))
                     return fail("encode_depth_normalize");
-                if (!computePass(buffer, (id)fence, configuration.mode, device,
+                if (!computePass(buffer, (id)fence, device,
                                  (id<MTLComputePipelineState>)configuration.motionPipeline.get(),
                                  (id<MTLTexture>)impl_->snapshot->motion.get(),
                                  (id<MTLTexture>)normalizedMotion.get(),
@@ -891,7 +871,6 @@ bool PreparedFrame::encode(
 
                 const InterpolatorBindings bindings(effect);
                 effect.colorTexture = (id<MTLTexture>)current.get();
-                effect.prevColorTexture = (id<MTLTexture>)previous.get();
                 effect.depthTexture = (id<MTLTexture>)normalizedDepth.get();
                 effect.motionTexture = (id<MTLTexture>)normalizedMotion.get();
                 effect.uiTexture = (id<MTLTexture>)ui.get();
@@ -981,7 +960,7 @@ bool PreparedFrame::encode(
                 [(id<MTL4FXFrameInterpolator>)interpolator.get()
                     encodeToCommandBuffer:(id<MTL4CommandBuffer>)buffer];
 
-                if (!computePass(buffer, (id)fence, configuration.mode, device,
+                if (!computePass(buffer, (id)fence, device,
                                  (id<MTLComputePipelineState>)configuration.encodePipeline.get(),
                                  (id<MTLTexture>)output.get(),
                                  (id<MTLTexture>)outputView.get(),
@@ -992,7 +971,6 @@ bool PreparedFrame::encode(
                 // A queued command may encode after OFF (or after a subsequent ON).
                 // Its output remains owned by the command, but must not seed new history.
                 if (currentGeneration) {
-                    state.history = current;
                     state.historyConfiguration = impl_->snapshot->configuration;
                     state.historyDispatch = impl_->dispatch;
                     state.historyFrame = frame;
@@ -1092,7 +1070,6 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     state->frames.clear();
                     state->configurations.clear();
                     state->hasPreparedJitter = false;
-                    state->history = {};
                     state->historyConfiguration.reset();
                 }
                 return finish(Ok);
@@ -1144,19 +1121,16 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
             void* list = pointer(generate ? d->command_list : p->command_list);
             Command command;
             if (!command.open(list)) return finish(Unsupported);
-            Mode mode = Mode::Metal4;
-            if (!supported((id<MTLDevice>)command.value.device, mode,
+            if (!supported((id<MTLDevice>)command.value.device,
                            command.value.compiler))
                 return finish(Unsupported);
-            if (state->hasMode &&
-                (state->mode != mode || state->metalDevice.get() != (id)command.value.device))
+            if (state->providerValidated && state->device.get() != (id)command.value.device)
                 return finish(Parameter);
 
             Resources resources;
             auto implementation = std::make_shared<PreparedFrame::Impl>();
             implementation->state = state;
             std::array<std::uint64_t, 3> addresses{};
-            std::array<std::uint32_t, 3> states{};
             unsigned resourceCount = 2;
             std::uint64_t frame = generate ? d->frame_id : p->frame_id;
 
@@ -1174,7 +1148,6 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 if (state->generationEnabled && state->frames.size() >= 64)
                     return finish(Runtime, "prepare_backpressure");
                 addresses = {p->depth, p->motion_vectors, 0};
-                states = {p->depth_state, p->motion_vectors_state, 0};
                 const bool displayMotion = (state->creation.flags &
                     WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
                 const NSUInteger motionWidth = displayMotion
@@ -1194,7 +1167,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 // The first Prepare selects the provider even before the pending
                 // configuration is replayed. Validate its MetalFX eligibility,
                 // but do not create or record snapshots while generation is off.
-                if (!state->generationEnabled && state->hasMode) return finish(Ok);
+                if (!state->generationEnabled && state->providerValidated) return finish(Ok);
                 auto configuration = configure(*state, command, *p, depth,
                     MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid,
                     p->render_width, p->render_height,
@@ -1202,9 +1175,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 if (!configuration) return finish(Unsupported);
                 if (!state->generationEnabled) {
                     state->configurations.clear();
-                    state->hasMode = true;
-                    state->mode = mode;
-                    state->metalDevice = Object((id)command.value.device);
+                    state->providerValidated = true;
                     return finish(Ok);
                 }
                 auto snapshot = std::make_shared<Snapshot>();
@@ -1247,7 +1218,6 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 implementation->reset = d->reset != 0;
                 implementation->dispatch = *d;
                 addresses = {d->present_color, d->output, d->hudless_color};
-                states = {d->present_color_state, d->output_state, d->hudless_color_state};
                 if (!mapPair(resources, *state, command, addresses[0], addresses[1],
                              true, state->creation.display_width,
                              state->creation.display_height))
@@ -1295,9 +1265,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
             if (!recorded) { if (!generate) state->frames.erase(frame); return finish(Parameter); }
             *recorded = std::move(prepared);
             if (generate) state->frames.erase(frame);
-            state->hasMode = true;
-            state->mode = mode;
-            state->metalDevice = Object((id)command.value.device);
+            state->providerValidated = true;
             return finish(Ok);
         } @catch (NSException*) {
             return finish(Runtime);

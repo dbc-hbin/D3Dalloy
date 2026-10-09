@@ -407,7 +407,6 @@ struct ExecutionResources {
 
 struct Feature::Impl {
     CreateInfo create{};
-    CommandMode commandMode = CommandMode::Metal4;
     id<MTLDevice> device = nil;
     id compiler = nil;
     id<MTLComputePipelineState> exposurePipeline = nil;
@@ -517,7 +516,7 @@ struct Feature::Impl {
     void returnResources(ExecutionResources& resources) noexcept {
         // The lease is retained until GPU completion. Commit the empty set
         // before allowing any scratch allocation it named into the general pool.
-        if (resources.residency && commandMode == CommandMode::Metal4 &&
+        if (resources.residency &&
             !dormant.load(std::memory_order_relaxed) &&
             emptyResidencySet(resources.residency)) {
             std::lock_guard<std::mutex> lock(bundleMutex);
@@ -679,8 +678,7 @@ struct ExecutionLease::Impl : ExecutionResources {
         // The transport retains this lease through GPU completion. Only a live
         // frame may reuse its committed set and owned scratch allocations.
         if (auto owner = feature.lock()) {
-            if (auto frame = prepared.lock(); replayEligible && frame &&
-                owner->commandMode == CommandMode::Metal4)
+            if (auto frame = prepared.lock(); replayEligible && frame)
                 owner->putBundle(*this, frame.get());
             owner->returnResources(*this);
         } else {
@@ -767,22 +765,17 @@ bool validateCreate(const CreateContext& context, const CreateInfo& create,
         return false;
     }
     @try {
-        if (context.mode == CommandMode::Metal4) {
-            if (@available(macOS 26.0, *)) {
-                id<MTL4Compiler> compiler =
-                    reinterpret_cast<id<MTL4Compiler>>(asCompiler(context.compiler));
-                if (!compiler || compiler.device != device ||
-                    ![MTLFXTemporalScalerDescriptor supportsMetal4FX:device]) {
-                    setError(error, ErrorCode::InvalidContext,
-                             "Metal4 compiler/device does not support Metal4FX temporal scaling");
-                    return false;
-                }
-            } else {
-                setError(error, ErrorCode::UnsupportedFeature, "Metal4 MetalFX translation requires macOS 26 or newer");
+        if (@available(macOS 26.0, *)) {
+            id<MTL4Compiler> compiler =
+                reinterpret_cast<id<MTL4Compiler>>(asCompiler(context.compiler));
+            if (!compiler || compiler.device != device ||
+                ![MTLFXTemporalScalerDescriptor supportsMetal4FX:device]) {
+                setError(error, ErrorCode::InvalidContext,
+                         "Metal4 compiler/device does not support Metal4FX temporal scaling");
                 return false;
             }
-        } else if (![MTLFXTemporalScalerDescriptor supportsDevice:device]) {
-            setError(error, ErrorCode::UnsupportedFeature, "Metal device does not support MetalFX temporal scaling");
+        } else {
+            setError(error, ErrorCode::UnsupportedFeature, "Metal4 MetalFX translation requires macOS 26 or newer");
             return false;
         }
 
@@ -1219,13 +1212,9 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
         }
 
         id scaler = nil;
-        if (feature.commandMode == CommandMode::Metal4) {
-            if (@available(macOS 26.0, *)) {
-                id<MTL4Compiler> compiler = reinterpret_cast<id<MTL4Compiler>>(feature.compiler);
-                scaler = [descriptor newTemporalScalerWithDevice:feature.device compiler:compiler];
-            }
-        } else {
-            scaler = [descriptor newTemporalScalerWithDevice:feature.device];
+        if (@available(macOS 26.0, *)) {
+            id<MTL4Compiler> compiler = reinterpret_cast<id<MTL4Compiler>>(feature.compiler);
+            scaler = [descriptor newTemporalScalerWithDevice:feature.device compiler:compiler];
         }
         if (!scaler) {
             setError(error, ErrorCode::ScalerCreationFailed,
@@ -1256,11 +1245,9 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
             descriptor.colorTextureFormat = MTLPixelFormatRGBA16Float;
             descriptor.outputTextureFormat = MTLPixelFormatRGBA16Float;
             descriptor.autoExposureEnabled = NO;
-            if (feature.commandMode == CommandMode::Metal4) {
-                if (@available(macOS 26.0, *))
-                    generation->alphaScaler = [descriptor newTemporalScalerWithDevice:feature.device
-                        compiler:reinterpret_cast<id<MTL4Compiler>>(feature.compiler)];
-            } else generation->alphaScaler = [descriptor newTemporalScalerWithDevice:feature.device];
+            if (@available(macOS 26.0, *))
+                generation->alphaScaler = [descriptor newTemporalScalerWithDevice:feature.device
+                    compiler:reinterpret_cast<id<MTL4Compiler>>(feature.compiler)];
             if (!generation->alphaScaler) {
                 setError(error, ErrorCode::ScalerCreationFailed, "failed to create linear alpha temporal scaler");
                 return {};
@@ -1308,9 +1295,8 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
         Feature::Impl& feature = *frame.feature;
         ScalerGeneration& generation = *frame.generation;
 
-        if (feature.commandMode != CommandMode::Metal4 || !feature.takeBundle(*lease, &frame)) {
-            if (feature.commandMode == CommandMode::Metal4)
-                lease->residency = feature.takeResidency();
+        if (!feature.takeBundle(*lease, &frame)) {
+            lease->residency = feature.takeResidency();
             const bool transfer = frame.operations.colorTransfer != ColorTransfer::Linear;
             const bool alpha = generation.alphaScaler != nil;
             const bool finish = transfer || frame.operations.sharpening || frame.cappedOutput ||
@@ -1512,15 +1498,14 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     lease->stagedDepth, lease->stagedMotion, lease->stagedReactive,
                     lease->linearizeParams, lease->maskParams, lease->finishParams,
                     lease->alphaColor, lease->alphaOutput, lease->alphaParams, lease->debugParams), reusable);
-            if (feature.commandMode == CommandMode::Metal4 && !lease->residency) {
+            if (!lease->residency) {
                 setError(error, ErrorCode::ResourceCreationFailed,
                          "failed to create Metal4 residency set for MetalFX execution");
                 return {};
             }
         }
 
-        if ((lease->linearizeParams || lease->maskParams || lease->finishParams) &&
-            feature.commandMode == CommandMode::Metal4) {
+        if (lease->linearizeParams || lease->maskParams || lease->finishParams) {
             if (@available(macOS 26.0, *)) {
                 MTL4ArgumentTableDescriptor* descriptor = nil;
                 @try {
@@ -1547,7 +1532,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
             }
         }
 
-        if (frame.needsExposureConversion && feature.commandMode == CommandMode::Metal4) {
+        if (frame.needsExposureConversion) {
             if (@available(macOS 26.0, *)) {
                 MTL4ArgumentTableDescriptor* descriptor = nil;
                 @try {
@@ -1605,28 +1590,6 @@ bool encodeExposureMetal4(const PreparedFrame::Impl& frame,
     }
 }
 
-bool encodeExposureLegacy(const PreparedFrame::Impl& frame,
-                          ExecutionLease::Impl& lease,
-                          id<MTLCommandBuffer> command,
-                          id<MTLFence> fence) {
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence];
-        [encoder setComputePipelineState:frame.feature->exposurePipeline];
-        [encoder setTexture:frame.exposure atIndex:0];
-        [encoder setTexture:lease.convertedExposure atIndex:1];
-        [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        [encoder updateFence:fence];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
 bool encodeFsrPassMetal4(ExecutionLease::Impl& lease,
                          id<MTL4CommandBuffer> command, id<MTLFence> fence,
                          id<MTLComputePipelineState> pipeline, id<MTLBuffer> params,
@@ -1648,32 +1611,6 @@ bool encodeFsrPassMetal4(ExecutionLease::Impl& lease,
         [encoder dispatchThreads:MTLSizeMake(rect.width, rect.height, 1)
              threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
         [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
-bool encodeFsrPassLegacy(
-                         id<MTLCommandBuffer> command, id<MTLFence> fence,
-                         id<MTLComputePipelineState> pipeline, id<MTLBuffer> params,
-                         id<MTLTexture> first, id<MTLTexture> second,
-                         id<MTLTexture> third, const Rect& rect, id<MTLTexture> fourth = nil) {
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence];
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:params offset:0 atIndex:0];
-        [encoder setTexture:first atIndex:0];
-        [encoder setTexture:second atIndex:1];
-        if (third) [encoder setTexture:third atIndex:2];
-        [encoder setTexture:(fourth ? fourth : first) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(rect.width, rect.height, 1)
-             threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-        [encoder updateFence:fence];
         [encoder endEncoding];
         return true;
     } @catch (id) {
@@ -1766,38 +1703,6 @@ bool encodeInputCopiesMetal4(const PreparedFrame::Impl& frame, ExecutionLease::I
     }
 }
 
-bool encodeInputCopiesLegacy(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
-                             id<MTLCommandBuffer> command, id<MTLFence> fence) {
-    if (!lease.stagedColor && !lease.stagedDepth && !lease.stagedMotion &&
-        !lease.stagedReactive)
-        return true;
-    id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence];
-        const auto copy = [&](id<MTLTexture> source, id<MTLTexture> destination,
-                              const Rect& rect) {
-            if (!destination) return;
-            [encoder copyFromTexture:source sourceSlice:0 sourceLevel:0
-                        sourceOrigin:MTLOriginMake(rect.x, rect.y, 0)
-                          sourceSize:MTLSizeMake(rect.width, rect.height, 1)
-                           toTexture:destination destinationSlice:0 destinationLevel:0
-                   destinationOrigin:MTLOriginMake(0, 0, 0)];
-            extendTextureEdges(encoder, destination, rect.width, rect.height, [] {});
-        };
-        copy(frame.color, lease.stagedColor, frame.frame.colorRect);
-        copy(frame.depth, lease.stagedDepth, frame.frame.depthRect);
-        copy(frame.motion, lease.stagedMotion, frame.scalerMotionRect);
-        copy(frame.reactive, lease.stagedReactive, frame.frame.reactiveRect);
-        [encoder updateFence:fence];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
 bool encodeFsrPreMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
                         id<MTL4CommandBuffer> command, id<MTLFence> fence)
                         API_AVAILABLE(macos(26.0)) {
@@ -1811,27 +1716,6 @@ bool encodeFsrPreMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Impl& 
     if (lease.combinedMask) {
         id<MTLTexture> fallback = frame.reactive ? frame.reactive : frame.composition;
         if (!encodeFsrPassMetal4(lease, command, fence,
-                                frame.feature->combineMaskPipeline, lease.maskParams,
-                                frame.reactive ? frame.reactive : fallback,
-                                frame.composition ? frame.composition : fallback,
-                                lease.combinedMask, frame.frame.reactiveRect))
-            return false;
-    }
-    return true;
-}
-
-bool encodeFsrPreLegacy(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
-                        id<MTLCommandBuffer> command, id<MTLFence> fence) {
-    if (lease.alphaColor && !encodeFsrPassLegacy(command, fence, frame.feature->alphaPipeline,
-            lease.alphaParams, frame.color, lease.alphaColor, nil,
-            Rect{0, 0, uint32_t(lease.alphaColor.width), uint32_t(lease.alphaColor.height)})) return false;
-    if (lease.linearColor && !encodeFsrPassLegacy(
-             command, fence, frame.feature->linearizePipeline,
-            lease.linearizeParams, frame.color, lease.linearColor, nil, frame.frame.colorRect))
-        return false;
-    if (lease.combinedMask) {
-        id<MTLTexture> fallback = frame.reactive ? frame.reactive : frame.composition;
-        if (!encodeFsrPassLegacy( command, fence,
                                 frame.feature->combineMaskPipeline, lease.maskParams,
                                 frame.reactive ? frame.reactive : fallback,
                                 frame.composition ? frame.composition : fallback,
@@ -1870,34 +1754,6 @@ bool encodeFsrInputPaddingMetal4(const PreparedFrame::Impl& frame,
     }
 }
 
-bool encodeFsrInputPaddingLegacy(const PreparedFrame::Impl& frame,
-                                ExecutionLease::Impl& lease,
-                                id<MTLCommandBuffer> command,
-                                id<MTLFence> fence) {
-    const NSUInteger width = frame.frame.inputContent.width;
-    const NSUInteger height = frame.frame.inputContent.height;
-    const bool padLinearColor = lease.linearColor &&
-        (lease.linearColor.width != width || lease.linearColor.height != height);
-    const bool padCombinedMask = lease.combinedMask &&
-        (lease.combinedMask.width != width || lease.combinedMask.height != height);
-    if (!padLinearColor && !padCombinedMask) return true;
-    id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence];
-        if (padLinearColor)
-            extendTextureEdges(encoder, lease.linearColor, width, height, [] {});
-        if (padCombinedMask)
-            extendTextureEdges(encoder, lease.combinedMask, width, height, [] {});
-        [encoder updateFence:fence];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
 bool encodeFsrFinishMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
                            id<MTL4CommandBuffer> command, id<MTLFence> fence)
                            API_AVAILABLE(macos(26.0)) {
@@ -1911,24 +1767,6 @@ bool encodeFsrFinishMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Imp
                 ? frame.feature->debugDepthPipeline : frame.feature->debugPipeline,
             lease.debugParams, lease.privateOutput, frame.depth, frame.motion, frame.frame.outputRect, frame.output);
     return encodeFsrPassMetal4(lease, command, fence, frame.feature->finishPipeline,
-                               lease.finishParams, lease.privateOutput, frame.output,
-                               lease.convertedExposure ? lease.convertedExposure :
-                                   (frame.exposure ? frame.exposure : lease.privateOutput),
-                               frame.frame.outputRect, lease.alphaOutput);
-}
-
-bool encodeFsrFinishLegacy(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
-                           id<MTLCommandBuffer> command, id<MTLFence> fence) {
-    if (!lease.finishParams) return true;
-    if (lease.debugParams)
-        return encodeFsrPassLegacy(command, fence,
-            (frame.depth.pixelFormat == MTLPixelFormatDepth16Unorm ||
-             frame.depth.pixelFormat == MTLPixelFormatDepth32Float ||
-             frame.depth.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ||
-             frame.depth.pixelFormat == MTLPixelFormatDepth24Unorm_Stencil8)
-                ? frame.feature->debugDepthPipeline : frame.feature->debugPipeline,
-            lease.debugParams, lease.privateOutput, frame.depth, frame.motion, frame.frame.outputRect, frame.output);
-    return encodeFsrPassLegacy( command, fence, frame.feature->finishPipeline,
                                lease.finishParams, lease.privateOutput, frame.output,
                                lease.convertedExposure ? lease.convertedExposure :
                                    (frame.exposure ? frame.exposure : lease.privateOutput),
@@ -1957,36 +1795,6 @@ bool copyOutputMetal4(const PreparedFrame::Impl& frame,
                destinationOrigin:MTLOriginMake(rect.x + frame.placementX,
                                                 rect.y + frame.placementY, 0)];
         [encoder updateFence:fence afterEncoderStages:MTLStageBlit];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
-bool copyOutputLegacy(const PreparedFrame::Impl& frame,
-                      ExecutionLease::Impl& lease,
-                      id<MTLCommandBuffer> command,
-                      id<MTLFence> fence) {
-    if (!lease.privateOutput || lease.finishParams) return true;
-    id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
-    if (!encoder) return false;
-    const Rect& rect = frame.frame.outputRect;
-    @try {
-        [encoder waitForFence:fence];
-        [encoder copyFromTexture:lease.privateOutput
-                     sourceSlice:0
-                     sourceLevel:0
-                    sourceOrigin:MTLOriginMake(0, 0, 0)
-                      sourceSize:MTLSizeMake(frame.temporalOutputWidth,
-                                             frame.temporalOutputHeight, 1)
-                       toTexture:frame.output
-                destinationSlice:0
-                destinationLevel:0
-               destinationOrigin:MTLOriginMake(rect.x + frame.placementX,
-                                                rect.y + frame.placementY, 0)];
-        [encoder updateFence:fence];
         [encoder endEncoding];
         return true;
     } @catch (id) {
@@ -2073,7 +1881,6 @@ std::shared_ptr<Feature> Feature::create(const CreateContext& context,
     try {
         auto impl = std::make_shared<Impl>();
         impl->create = info;
-        impl->commandMode = context.mode;
         impl->device = retainObject(asDevice(context.device));
         impl->compiler = retainObject(asCompiler(context.compiler));
         @try {
@@ -2093,10 +1900,6 @@ std::shared_ptr<Feature> Feature::create(const CreateContext& context,
         setError(error, ErrorCode::ResourceCreationFailed, "failed to allocate MetalFX feature state");
         return {};
     }
-}
-
-CommandMode Feature::mode() const noexcept {
-    return impl_ ? impl_->commandMode : CommandMode::Legacy;
 }
 
 void Feature::markDormant() noexcept {
@@ -2230,10 +2033,6 @@ std::uint64_t PreparedFrame::generationId() const noexcept {
     return impl_ ? impl_->generation->serial : 0;
 }
 
-CommandMode PreparedFrame::mode() const noexcept {
-    return impl_ && impl_->feature ? impl_->feature->commandMode : CommandMode::Legacy;
-}
-
 bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
                            std::shared_ptr<const ExecutionLease>& leaseResult,
                            Error* error, bool forceReset, void* splitContext,
@@ -2275,152 +2074,100 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
                                     generation.encodedActivation != impl_->activation ||
                                     inputExtentChanged;
         @try {
-            if (feature.commandMode == CommandMode::Metal4) {
-                if (@available(macOS 26.0, *)) {
-                    id<MTL4CommandBuffer> command =
-                        reinterpret_cast<id<MTL4CommandBuffer>>(commandBuffer);
-                    id<MTLResidencySet> residency =
-                        reinterpret_cast<id<MTLResidencySet>>(lease->residency);
-                    if (command.device != feature.device) {
-                        setError(error, ErrorCode::InvalidContext,
-                                 "Metal4 command buffer belongs to a different device");
-                        return false;
-                    }
-                    if (residency) [command useResidencySet:residency];
-                    if (impl_->needsExposureConversion &&
-                        !encodeExposureMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to encode numerical exposure conversion on Metal4");
-                        return false;
-                    }
-                    if (!encodeInputCopiesMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to encode MetalFX active-input copies on Metal4");
-                        return false;
-                    }
-                    if (!encodeFsrPreMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to encode FSR preprocessing on Metal4");
-                        return false;
-                    }
-                    if (!encodeFsrInputPaddingMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to extend processed MetalFX input padding on Metal4");
-                        return false;
-                    }
-                    if (!splitCommandBuffer) {
-                        setError(error, ErrorCode::InvalidContext, "Metal4 temporal scaling requires recording segments");
-                        return false;
-                    }
-                    id<MTL4ComputeCommandEncoder> prefixBoundary = [command computeCommandEncoder];
-                    if (!prefixBoundary) {
-                        setError(error, ErrorCode::EncodeFailed, "failed to create temporal prefix barrier");
-                        return false;
-                    }
-                    [prefixBoundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll
-                                      visibilityOptions:MTL4VisibilityOptionDevice];
-                    [prefixBoundary endEncoding];
-                    // Keep MetalFX in its own native command buffer. An external
-                    // fence consumer in the same buffer can deadlock Metal4FX;
-                    // Explicit queue producer barriers supply execution ordering
-                    // and device visibility across the native recording segments.
+            if (@available(macOS 26.0, *)) {
+                id<MTL4CommandBuffer> command =
+                    reinterpret_cast<id<MTL4CommandBuffer>>(commandBuffer);
+                id<MTLResidencySet> residency =
+                    reinterpret_cast<id<MTLResidencySet>>(lease->residency);
+                if (command.device != feature.device) {
+                    setError(error, ErrorCode::InvalidContext,
+                             "Metal4 command buffer belongs to a different device");
+                    return false;
+                }
+                if (residency) [command useResidencySet:residency];
+                if (impl_->needsExposureConversion &&
+                    !encodeExposureMetal4(*impl_, *lease, command, lease->fence)) {
+                    setError(error, ErrorCode::EncodeFailed,
+                             "failed to encode numerical exposure conversion on Metal4");
+                    return false;
+                }
+                if (!encodeInputCopiesMetal4(*impl_, *lease, command, lease->fence)) {
+                    setError(error, ErrorCode::EncodeFailed,
+                             "failed to encode MetalFX active-input copies on Metal4");
+                    return false;
+                }
+                if (!encodeFsrPreMetal4(*impl_, *lease, command, lease->fence)) {
+                    setError(error, ErrorCode::EncodeFailed,
+                             "failed to encode FSR preprocessing on Metal4");
+                    return false;
+                }
+                if (!encodeFsrInputPaddingMetal4(*impl_, *lease, command, lease->fence)) {
+                    setError(error, ErrorCode::EncodeFailed,
+                             "failed to extend processed MetalFX input padding on Metal4");
+                    return false;
+                }
+                if (!splitCommandBuffer) {
+                    setError(error, ErrorCode::InvalidContext, "Metal4 temporal scaling requires recording segments");
+                    return false;
+                }
+                id<MTL4ComputeCommandEncoder> prefixBoundary = [command computeCommandEncoder];
+                if (!prefixBoundary) {
+                    setError(error, ErrorCode::EncodeFailed, "failed to create temporal prefix barrier");
+                    return false;
+                }
+                [prefixBoundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll
+                                  visibilityOptions:MTL4VisibilityOptionDevice];
+                [prefixBoundary endEncoding];
+                // Keep MetalFX in its own native command buffer. An external
+                // fence consumer in the same buffer can deadlock Metal4FX;
+                // Explicit queue producer barriers supply execution ordering
+                // and device visibility across the native recording segments.
+                command = reinterpret_cast<id<MTL4CommandBuffer>>(splitCommandBuffer(splitContext));
+                if (!command) {
+                    setError(error, ErrorCode::EncodeFailed, "failed to split temporal preprocessing segment");
+                    return false;
+                }
+                if (residency) [command useResidencySet:residency];
+                configureScalerForFrame(feature, generation, *impl_, *lease, nil, effectiveReset);
+                [generation.scaler encodeToCommandBuffer:command];
+                if (generation.alphaScaler) {
                     command = reinterpret_cast<id<MTL4CommandBuffer>>(splitCommandBuffer(splitContext));
                     if (!command) {
-                        setError(error, ErrorCode::EncodeFailed, "failed to split temporal preprocessing segment");
+                        setError(error, ErrorCode::EncodeFailed, "failed to split temporal alpha segment");
                         return false;
                     }
                     if (residency) [command useResidencySet:residency];
-                    configureScalerForFrame(feature, generation, *impl_, *lease, nil, effectiveReset);
-                    [generation.scaler encodeToCommandBuffer:command];
-                    if (generation.alphaScaler) {
-                        command = reinterpret_cast<id<MTL4CommandBuffer>>(splitCommandBuffer(splitContext));
-                        if (!command) {
-                            setError(error, ErrorCode::EncodeFailed, "failed to split temporal alpha segment");
-                            return false;
-                        }
-                        if (residency) [command useResidencySet:residency];
-                        configureScalerForFrame(feature, generation, *impl_, *lease, nil, effectiveReset, true);
-                        [generation.alphaScaler encodeToCommandBuffer:command];
-                    }
-                    command = reinterpret_cast<id<MTL4CommandBuffer>>(splitCommandBuffer(splitContext));
-                    if (!command) {
-                        setError(error, ErrorCode::EncodeFailed, "failed to split temporal output segment");
-                        return false;
-                    }
-                    if (residency) [command useResidencySet:residency];
-                    id<MTL4ComputeCommandEncoder> suffixBoundary = [command computeCommandEncoder];
-                    if (!suffixBoundary) {
-                        setError(error, ErrorCode::EncodeFailed, "failed to create temporal output barrier");
-                        return false;
-                    }
-                    [suffixBoundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll
-                                      visibilityOptions:MTL4VisibilityOptionDevice];
-                    [suffixBoundary endEncoding];
-                    if (!encodeFsrFinishMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to encode FSR transfer/RCAS output on Metal4");
-                        return false;
-                    }
-                    if (!copyOutputMetal4(*impl_, *lease, command, lease->fence)) {
-                        setError(error, ErrorCode::EncodeFailed,
-                                 "failed to encode required MetalFX output subrect copy on Metal4");
-                        return false;
-                    }
-                } else {
-                    setError(error, ErrorCode::UnsupportedFeature,
-                             "Metal4 MetalFX encode is unavailable on this OS");
+                    configureScalerForFrame(feature, generation, *impl_, *lease, nil, effectiveReset, true);
+                    [generation.alphaScaler encodeToCommandBuffer:command];
+                }
+                command = reinterpret_cast<id<MTL4CommandBuffer>>(splitCommandBuffer(splitContext));
+                if (!command) {
+                    setError(error, ErrorCode::EncodeFailed, "failed to split temporal output segment");
+                    return false;
+                }
+                if (residency) [command useResidencySet:residency];
+                id<MTL4ComputeCommandEncoder> suffixBoundary = [command computeCommandEncoder];
+                if (!suffixBoundary) {
+                    setError(error, ErrorCode::EncodeFailed, "failed to create temporal output barrier");
+                    return false;
+                }
+                [suffixBoundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll
+                                  visibilityOptions:MTL4VisibilityOptionDevice];
+                [suffixBoundary endEncoding];
+                if (!encodeFsrFinishMetal4(*impl_, *lease, command, lease->fence)) {
+                    setError(error, ErrorCode::EncodeFailed,
+                             "failed to encode FSR transfer/RCAS output on Metal4");
+                    return false;
+                }
+                if (!copyOutputMetal4(*impl_, *lease, command, lease->fence)) {
+                    setError(error, ErrorCode::EncodeFailed,
+                             "failed to encode required MetalFX output subrect copy on Metal4");
                     return false;
                 }
             } else {
-                id<MTLCommandBuffer> command = reinterpret_cast<id<MTLCommandBuffer>>(commandBuffer);
-                if (command.device != feature.device) {
-                    setError(error, ErrorCode::InvalidContext,
-                             "legacy command buffer belongs to a different device");
-                    return false;
-                }
-                if (@available(macOS 15.0, *)) {
-                    id<MTLResidencySet> residency =
-                        reinterpret_cast<id<MTLResidencySet>>(lease->residency);
-                    if (residency) [command useResidencySet:residency];
-                }
-                if (impl_->needsExposureConversion &&
-                    !encodeExposureLegacy(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode numerical exposure conversion on legacy Metal");
-                    return false;
-                }
-                if (!encodeInputCopiesLegacy(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode MetalFX active-input copies on legacy Metal");
-                    return false;
-                }
-                if (!encodeFsrPreLegacy(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode FSR preprocessing on legacy Metal");
-                    return false;
-                }
-                if (!encodeFsrInputPaddingLegacy(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to extend processed MetalFX input padding on legacy Metal");
-                    return false;
-                }
-                configureScalerForFrame(feature, generation, *impl_, *lease, lease->fence,
-                                        effectiveReset);
-                [generation.scaler encodeToCommandBuffer:command];
-                if (generation.alphaScaler) {
-                    configureScalerForFrame(feature, generation, *impl_, *lease, lease->fence, effectiveReset, true);
-                    [generation.alphaScaler encodeToCommandBuffer:command];
-                }
-                if (!encodeFsrFinishLegacy(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode FSR transfer/RCAS output on legacy Metal");
-                    return false;
-                }
-                if (!copyOutputLegacy(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode required MetalFX output subrect copy on legacy Metal");
-                    return false;
-                }
+                setError(error, ErrorCode::UnsupportedFeature,
+                         "Metal4 MetalFX encode is unavailable on this OS");
+                return false;
             }
         } @catch (id) {
             setError(error, ErrorCode::EncodeFailed,

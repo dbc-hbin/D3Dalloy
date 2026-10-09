@@ -7,6 +7,10 @@
 #include <mutex>
 #include <vector>
 
+@interface MTLFXTemporalDenoisedScalerDescriptor (DXMTRRBackend)
+- (void)setVersion:(NSUInteger)version;
+@end
+
 namespace dxmt_rr {
 constexpr uint32_t Flag = 256;
 constexpr size_t Count = 12;
@@ -145,6 +149,9 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     d.specularHitDistanceTextureEnabled = hit;
     d.autoExposureEnabled = (core.info.feature_flags & 64) != 0;
     d.requiresSynchronousInitialization = YES;
+    // Apple non-fused GPU backend avoids the macOS 27 fused UBF K44 weight overread.
+    if (![d respondsToSelector:@selector(setVersion:)]) return {};
+    [d setVersion:0x10000];
     result->scaler = [d newTemporalDenoisedScalerWithDevice:core.device compiler:core.compiler];
     if (!result->scaler) return {};
     result->width = p.input_width; result->height = p.input_height;
@@ -212,7 +219,10 @@ static bool dxmtRRResources(DXMTRRFrame *frame, dxmt_rr::Resources &resources,
     const auto &rect = frame->rects[i];
     const uint32_t width = i == 3 ? p.output_rect.width : i == 4 ? 1 : p.input_width;
     const uint32_t height = i == 3 ? p.output_rect.height : i == 4 ? 1 : p.input_height;
-    const bool convert = (i == 1 && p.depth_linear) || i == 2 || (i == 10 && p.roughness_packed);
+    // Only bypass identity MV conversion; native scaling changes FP16 rounding order.
+    const bool convert = (i == 1 && p.depth_linear) ||
+      (i == 2 && ((core.info.feature_flags & 6) != 2 || p.motion_scale_x != 1 || p.motion_scale_y != 1)) ||
+      (i == 10 && p.roughness_packed);
     MTLTextureUsage required = usages[i];
     if (i == 5) {
       if (@available(macOS 27.0, *)) required = scaler.reactiveMaskTextureUsage;

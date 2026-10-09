@@ -8,15 +8,9 @@
 
 namespace yaagl::pso::metalfx {
 
-enum class CommandMode : std::uint8_t {
-    Legacy,
-    Metal4,
-};
-
 struct CreateContext {
     void* device = nullptr;
     void* compiler = nullptr;
-    CommandMode mode = CommandMode::Metal4;
 };
 
 // Native Metal views resolved by the transport layer from the exact D3D12
@@ -91,8 +85,6 @@ public:
         const FrameInfo& info, const TextureSet& textures, Error* error = nullptr,
         const FrameOperations& operations = {}) noexcept;
 
-    CommandMode mode() const noexcept;
-
     // Called when the owner drops the feature. Recorded frames may still prepare
     // their encode and replay, but idle scratch is drained now and later
     // GPU-completion returns are released instead of pooled.
@@ -113,9 +105,9 @@ public:
     PreparedFrame(const PreparedFrame&) = delete;
     PreparedFrame& operator=(const PreparedFrame&) = delete;
 
-    // commandBuffer is the caller's already-begun MTL4CommandBuffer for
-    // Metal4, or MTLCommandBuffer for Legacy. fence is the exact dependency
-    // fence supplied by the transport. The caller must retain this object until
+    // commandBuffer is the caller's already-begun MTL4CommandBuffer.
+    // fence is the exact dependency fence supplied by the transport.
+    // The caller must retain this object until
     // GPU completion; command-buffer encode return alone is not a lifetime
     // boundary for Metal4. lease is published before the first GPU command is
     // recorded. The transport must retain any non-null lease even when encode
@@ -126,8 +118,6 @@ public:
                 Error* error = nullptr, bool forceReset = false,
                 void* splitContext = nullptr, void* (*splitCommandBuffer)(void*) = nullptr) const noexcept;
     std::uint64_t generationId() const noexcept;
-
-    CommandMode mode() const noexcept;
 
 private:
     friend class Feature;

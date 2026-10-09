@@ -32,7 +32,6 @@ d3d12_src = [
   'd3d12_texture.cpp',
   'd3d12_temporal.cpp',
   'd3d12_frame_generation.cpp',
-  'd3d12_frame_generation_backend.cpp',
   '../d3d10/d3d10_blob.cpp',
 ]
 
@@ -52,7 +51,7 @@ configure_file(output: 'd3d12_core_generation.h', configuration: core_generation
 
 d3d12_dll = shared_library('d3d12', d3d12_src,
   name_prefix         : '',
-  dependencies        : [ dxgi_dep, dxmt_dep, airconv_forward_dep, util_dep, winemetal_dep, dxbc_parser_dep, phase_backend_dep ],
+  dependencies        : [ dxgi_dep, dxmt_dep, airconv_forward_dep, util_dep, winemetal_dep, dxbc_parser_dep ],
   include_directories : [ dxmt_include_path ],
   install             : true,
   install_dir         : windows_native_install_dir,

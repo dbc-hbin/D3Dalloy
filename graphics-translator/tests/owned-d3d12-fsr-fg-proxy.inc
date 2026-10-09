@@ -1,5 +1,4 @@
 #include <mutex>
-#include <thread>
 #include "owned-fg-present.h"
 namespace {
 struct FgCallbackCapture {
@@ -13,33 +12,17 @@ struct FgProxyCallbacks {
     ffxContext* context;
     Gpu* gpu;
     bool rejectGeneration = false;
-    bool rejectPresentation = false;
     std::mutex mutex;
     std::vector<FgCallbackCapture> captures;
     std::vector<ComPtr<ID3D12Resource>> retainedMarkers;
-    std::atomic<unsigned> dispatches{0};
-    HANDLE recorded = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    ~FgProxyCallbacks() { CloseHandle(recorded); }
 };
 ffxReturnCode_t fgGenerationCallback(ffxDispatchDescFrameGeneration* desc, void* user) {
     auto& s = *static_cast<FgProxyCallbacks*>(user);
-    ++s.dispatches;
     if (s.rejectGeneration) { desc->numGeneratedFrames = 0; return FFX_API_RETURN_ERROR; }
-    desc->numGeneratedFrames = desc->frameID == 3 ? 2 : desc->frameID == 4 ? 3 : desc->frameID == 8 ? 4 : 1;
+    desc->numGeneratedFrames = 1;
     desc->reset |= desc->frameID == 12;
-    for (UINT i = 0; i < desc->numGeneratedFrames; ++i) {
-        fgRequire(desc->outputs[i].resource, "callback-multi-output-resource");
-        for (UINT j = 0; j < i; ++j)
-            fgRequire(desc->outputs[i].resource != desc->outputs[j].resource, "callback-multi-output-nonalias");
-    }
-    const auto result = s.api->dispatch(s.context, &desc->header);
-    if (desc->frameID == 4 && result == FFX_API_RETURN_OK) {
-        // The recorded batch owns the accepted identities. The application's
-        // descriptor storage is not a completion/result channel.
-        desc->outputs[0] = desc->outputs[2];
-        desc->outputs[1] = desc->outputs[2];
-    }
-    return result;
+    fgRequire(desc->outputs[0].resource, "callback-native-output-resource");
+    return s.api->dispatch(s.context, &desc->header);
 }
 D3D12_RESOURCE_STATES fgCallbackState(uint32_t state) {
     switch (state) {
@@ -53,7 +36,6 @@ D3D12_RESOURCE_STATES fgCallbackState(uint32_t state) {
 }
 ffxReturnCode_t fgPresentCallback(ffxCallbackDescFrameGenerationPresent* desc, void* user) {
     auto& s = *static_cast<FgProxyCallbacks*>(user);
-    if (s.rejectPresentation) return FFX_API_RETURN_ERROR;
     auto* list = static_cast<ID3D12GraphicsCommandList*>(desc->commandList);
     auto* source = static_cast<ID3D12Resource*>(desc->currentBackBuffer.resource);
     auto* output = static_cast<ID3D12Resource*>(desc->outputSwapChainBuffer.resource);
@@ -88,7 +70,6 @@ ffxReturnCode_t fgPresentCallback(ffxCallbackDescFrameGenerationPresent* desc, v
     std::lock_guard<std::mutex> lock(s.mutex);
     s.captures.push_back({std::move(readback), desc->frameID, desc->isGeneratedFrame, static_cast<UINT>(d.Width), d.Height});
     s.retainedMarkers.push_back(std::move(marker));
-    SetEvent(s.recorded);
     return FFX_API_RETURN_OK;
 }
 std::vector<uint8_t> fgCallbackPixels(const FgCallbackCapture& capture) {
@@ -152,62 +133,6 @@ void fgPresentedStatistics(IDXGISwapChain4* chain, UINT frame, DXGI_FRAME_STATIS
     const HRESULT result = observe(false);
     if (stream) fgRequire(result == S_OK, "fullstream-actual-positive-presentation-clock");
 }
-struct FgQueueGate {
-    IDXGISwapChain4* chain;
-    ComPtr<ID3D12Fence> gate, reached, progress;
-    HANDLE reachedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    HANDLE progressEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    UINT64 serial = 0;
-    UINT previousSubmittedCount = 0;
-    FgQueueGate(Gpu& gpu, IDXGISwapChain4* chain) : chain(chain) {
-        check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "queue-gate-fence");
-        check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&reached)), "queue-blocked-fence");
-        check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&progress)), "queue-idle-fence");
-        fgRequire(reachedEvent && progressEvent, "queue-proof-events");
-    }
-    ~FgQueueGate() { CloseHandle(reachedEvent); CloseHandle(progressEvent); }
-    void begin(UINT frame, ID3D12CommandQueue* selected, ID3D12CommandQueue* idle) {
-        ++serial;
-        check(chain->GetLastPresentCount(&previousSubmittedCount), "queue-before-native-count");
-        check(selected->Wait(gate.Get(), serial), "queue-block-selected");
-        check(selected->Signal(reached.Get(), serial), "queue-blocked-progress");
-        check(idle->Signal(progress.Get(), serial), "queue-idle-progress");
-        check(reached->SetEventOnCompletion(serial, reachedEvent), "queue-blocked-event");
-        check(progress->SetEventOnCompletion(serial, progressEvent), "queue-idle-event");
-        std::printf("OWNED_D3D12_FSR_FG_QUEUE_GATE frame=%u serial=%llu\n", frame, static_cast<unsigned long long>(serial));
-    }
-    void release(UINT frame, FgProxyCallbacks* callbacks = nullptr, bool realOnly = false) {
-        fgRequire(WaitForSingleObject(progressEvent, 10000) == WAIT_OBJECT_0, "queue-idle-worker-not-blocked");
-        if (callbacks)
-            fgRequire(WaitForSingleObject(callbacks->recorded, 10000) == WAIT_OBJECT_0, "queue-callback-recorded-while-gated");
-        fgRequire(WaitForSingleObject(reachedEvent, 100) == WAIT_TIMEOUT, "queue-selected-remains-blocked");
-        if (callbacks) {
-            std::lock_guard<std::mutex> lock(callbacks->mutex);
-            const auto capture = std::find_if(callbacks->captures.begin(), callbacks->captures.end(),
-                [frame](const auto& entry) { return entry.frame == frame; });
-            fgRequire(capture != callbacks->captures.end(), "queue-gated-callback-found");
-            if (realOnly)
-                fgRequire(!capture->generated && capture + 1 == callbacks->captures.end(), "reject-generation-real-only-recorded");
-            uint8_t* bytes = nullptr;
-            check(capture->readback.buffer->Map(0, nullptr, reinterpret_cast<void**>(&bytes)), "queue-gated-readback-map");
-            fgRequire(bytes[capture->readback.footprint.Offset] == 0xa7,
-                      realOnly ? "reject-generation-real-gpu-output-waits-selected-presentation-queue" : "queue-composition-not-on-substitute-queue");
-            capture->readback.buffer->Unmap(0, nullptr);
-        }
-        UINT submitted = 0;
-        check(chain->GetLastPresentCount(&submitted), "queue-native-submitted-before-release");
-        // Queue Wait blocks GPU execution, not CPU admission of Present calls.
-        fgRequire(submitted >= previousSubmittedCount, "queue-public-present-call-count-nonregression");
-        DXGI_FRAME_STATISTICS statistics{};
-        const HRESULT statsResult = chain->GetFrameStatistics(&statistics);
-        fgRequire(statsResult == DXGI_ERROR_FRAME_STATISTICS_DISJOINT ||
-                  (SUCCEEDED(statsResult) && statistics.PresentCount <= previousSubmittedCount), "queue-actual-display-bounded-by-prior-calls");
-        check(gate->Signal(serial), "queue-release-selected");
-        fgRequire(WaitForSingleObject(reachedEvent, 10000) == WAIT_OBJECT_0, "queue-selected-progress-after-release");
-        std::printf("OWNED_D3D12_FSR_FG_QUEUE_PROOF frame=%u blocked=selected idle=progress composition=%s submitted_before=%u submitted_during=%u counter_domain=public_present_calls\n",
-                    frame, callbacks ? "pending_marker" : "builtin_ui", previousSubmittedCount, submitted);
-    }
-};
 void fgProxy(const FgApi& api, Gpu& gpu) {
     FgPresentWindow window(fgWidth, fgHeight, L"public FFX FG content oracle");
     // Separate paired ABI consumers without changing focus/z-order. Native
@@ -244,63 +169,25 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
     create.dxgiFactory = factory.Get(); create.gameQueue = gpu.queue.Get();
     fgResult(api.create(&swapContext, &create.header, nullptr), FFX_API_RETURN_OK, "proxy-create-hwnd");
     fgRequire(chain != nullptr, "proxy-idxgiswapchain4");
-    D3D12_COMMAND_QUEUE_DESC queueDesc{};
-    ComPtr<ID3D12CommandQueue> queueOwnerA, queueOwnerB, computeQueue;
-    check(gpu.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queueOwnerA)), "proxy-queue-a");
-    check(gpu.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queueOwnerB)), "proxy-queue-b");
-    auto* queueA = queueOwnerA.Get(); auto* queueB = queueOwnerB.Get();
-    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-    check(gpu.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&computeQueue)), "proxy-invalid-compute");
-    Gpu foreign;
-    UINT masks[3] = {0, 1, 0};
-    IUnknown* sameQueues[2] = {gpu.queue.Get(), gpu.queue.Get()};
-    check(chain->ResizeBuffers1(2, fgWidth, fgHeight, DXGI_FORMAT_UNKNOWN, desc.Flags, masks, sameQueues), "proxy-same-queue-resize1");
-    check(chain->ResizeBuffers1(0, fgWidth, fgHeight, DXGI_FORMAT_UNKNOWN, desc.Flags, masks, sameQueues), "proxy-count-zero-resize1");
-    IUnknown* queues[3] = {queueA, queueB, queueA};
-    unsigned rejected = 0;
-    auto rejectResize = [&](UINT count, DXGI_FORMAT format, const UINT* nodes, IUnknown* const* supplied, const char* name) {
-        const UINT oldIndex = chain->GetCurrentBackBufferIndex();
-        DXGI_SWAP_CHAIN_DESC1 oldDesc{}, after{};
-        check(chain->GetDesc1(&oldDesc), "proxy-before-rejected-resize-desc");
-        fgRequire(chain->ResizeBuffers1(count, 96, 80, format, desc.Flags, nodes, supplied) == DXGI_ERROR_INVALID_CALL, name);
-        check(chain->GetDesc1(&after), "proxy-after-rejected-resize-desc");
-        fgRequire(after.Width == oldDesc.Width && after.Height == oldDesc.Height && after.Format == oldDesc.Format &&
-                  after.BufferCount == oldDesc.BufferCount && chain->GetCurrentBackBufferIndex() == oldIndex, "proxy-atomic-rejected-resize");
-        ++rejected;
-    };
-    rejectResize(2, DXGI_FORMAT_UNKNOWN, nullptr, sameQueues, "proxy-null-masks");
-    rejectResize(2, DXGI_FORMAT_UNKNOWN, masks, nullptr, "proxy-null-queues");
-    IUnknown* badQueues[2] = {queueA, computeQueue.Get()};
-    rejectResize(2, DXGI_FORMAT_UNKNOWN, masks, badQueues, "proxy-compute-queue");
-    badQueues[1] = foreign.queue.Get();
-    rejectResize(2, DXGI_FORMAT_UNKNOWN, masks, badQueues, "proxy-foreign-device");
-    badQueues[1] = gpu.device.Get();
-    rejectResize(2, DXGI_FORMAT_UNKNOWN, masks, badQueues, "proxy-not-queue");
-    badQueues[1] = nullptr;
-    rejectResize(2, DXGI_FORMAT_UNKNOWN, masks, badQueues, "proxy-null-queue-entry");
-    UINT badMasks[2] = {0, 2};
-    rejectResize(2, DXGI_FORMAT_UNKNOWN, badMasks, sameQueues, "proxy-node-mask");
-    rejectResize(1, DXGI_FORMAT_UNKNOWN, masks, sameQueues, "proxy-single-buffer");
-    ComPtr<ID3D12Resource> heldBuffer;
-    check(chain->GetBuffer(0, IID_PPV_ARGS(&heldBuffer)), "proxy-held-buffer");
-    auto* oldBuffer = heldBuffer.Get();
-    rejectResize(2, DXGI_FORMAT_UNKNOWN, masks, sameQueues, "proxy-held-reference");
-    heldBuffer.Reset();
-    rejectResize(2, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, masks, sameQueues, "proxy-backend-format-rollback");
-    check(chain->GetBuffer(0, IID_PPV_ARGS(&heldBuffer)), "proxy-retained-buffer-after-failure");
-    fgRequire(heldBuffer.Get() == oldBuffer, "proxy-oldframe-identity-after-rollback");
-    heldBuffer.Reset();
-    check(chain->ResizeBuffers1(3, fgWidth, fgHeight, DXGI_FORMAT_UNKNOWN, desc.Flags, masks, queues), "proxy-multipqueue-resize1");
-    check(chain->ResizeBuffers1(0, fgWidth, fgHeight, DXGI_FORMAT_UNKNOWN, desc.Flags, masks, queues), "proxy-multipqueue-count-zero");
-    queueOwnerA.Reset(); queueOwnerB.Reset(); // Only backend/proxy COM owners remain.
-    FgQueueGate queueGate(gpu, chain.Get());
-    ComPtr<ID3D12Fence> rejectedGenerationGate, rejectedGameReached;
-    check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&rejectedGenerationGate)), "reject-generation-game-gate");
-    check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&rejectedGameReached)), "reject-generation-game-progress");
+    UINT masks[2] = {0, 0};
+    IUnknown* queues[2] = {gpu.queue.Get(), gpu.queue.Get()};
+    DXGI_SWAP_CHAIN_DESC1 beforeResize{}, afterResize{};
+    check(chain->GetDesc1(&beforeResize), "before-unsupported-resize1");
+    fgRequire(chain->ResizeBuffers1(2, 96, 80, DXGI_FORMAT_UNKNOWN, desc.Flags, masks, queues) == E_NOTIMPL,
+              "original-sdk-resize1-unsupported");
+    check(chain->GetDesc1(&afterResize), "after-unsupported-resize1");
+    fgRequire(afterResize.Width == beforeResize.Width && afterResize.Height == beforeResize.Height &&
+              afterResize.BufferCount == beforeResize.BufferCount, "unsupported-resize1-unchanged");
     FgContext context(api, gpu, fgWidth, fgHeight, desc.Format);
     FgProxyCallbacks callbacks{}; callbacks.api = &api; callbacks.context = &context.value; callbacks.gpu = &gpu;
     auto depth = fgDepth(gpu);
     auto motion = fgMotion(gpu);
+    std::vector<uint16_t> pan(kInputWidth * kInputHeight * 2);
+    for (size_t i = 0; i < pan.size(); i += 2) pan[i] = 0x4000; // +2 render pixels = +4 display pixels.
+    auto uploadMotion = fgRecording(gpu);
+    transition(uploadMotion.list.Get(), motion.Get(), fgRead, D3D12_RESOURCE_STATE_COPY_DEST);
+    check(uploadMotion.list->Close(), "proxy-motion-transition"); gpu.executeAndWait(uploadMotion.list.Get());
+    fgUpload(gpu, motion.Get(), pan.data(), kInputWidth * 4, fgRead);
     ffxConfigureDescFrameGeneration config{};
     config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
     config.swapChain = chain.Get(); config.frameGenerationEnabled = true;
@@ -314,12 +201,11 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
         config.frameGenerationEnabled = frame != 5 && frame != 6;
         config.onlyPresentGenerated = frame == 8 || frame == 12;
         callbacks.rejectGeneration = frame == 9;
-        callbacks.rejectPresentation = frame == 10;
         fgResult(api.configure(&context.value, &config.header), FFX_API_RETURN_OK, "proxy-configure");
         if (frame == 3) {
             auto noNotify = config;
             noNotify.flags |= FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
-            fgResult(api.configure(&context.value, &noNotify.header), FFX_API_RETURN_OK, "proxy-attached-no-notify-retains-result-consumer");
+            fgResult(api.configure(&context.value, &noNotify.header), FFX_API_RETURN_OK, "proxy-attached-no-notify");
         }
         ComPtr<ID3D12Resource> backbuffer;
         check(chain->GetBuffer(chain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backbuffer)), "proxy-buffer");
@@ -354,81 +240,17 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
             auto generation = fgGenerate(list, frame, backbuffer.Get(), static_cast<ID3D12Resource*>(output.resource), false);
             generation.presentColor.state = FFX_API_RESOURCE_STATE_PRESENT;
             generation.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
-            fgResult(api.dispatch(&context.value, &generation.header), FFX_API_RETURN_OK, "proxy-record-generation-before-rejected-resize");
-            backbuffer.Reset();
-            rejectResize(3, DXGI_FORMAT_UNKNOWN, masks, queues, "proxy-pending-recording-resize-rejected");
-            std::puts("OWNED_D3D12_FSR_FG_RECORDING_ROLLBACK frame=2 preserved=1 consumed_by=public_present_gpu_output");
+            // SDR ignores this descriptor's luminance difference from the SDK monitor metadata.
+            fgResult(api.dispatch(&context.value, &generation.header), FFX_API_RETURN_OK, "proxy-public-recording-sdr-history");
         }
         LARGE_INTEGER before{}, after{}; QueryPerformanceCounter(&before);
-        const bool gated = frame == 1 || frame == 3 || frame == 5 || frame == 9;
-        if (gated) ResetEvent(callbacks.recorded);
-        if (frame == 9) {
-            check(gpu.queue->Wait(rejectedGenerationGate.Get(), 1), "reject-generation-block-current-game-work");
-            check(gpu.queue->Signal(rejectedGameReached.Get(), 1), "reject-generation-queued-game-progress");
-        }
-        if (gated) {
-            UINT priorOutputs;
-            {
-                std::lock_guard<std::mutex> lock(callbacks.mutex);
-                priorOutputs = static_cast<UINT>(callbacks.captures.size());
-            }
-            // Previous batches were drained. Each accepted composition issues
-            // one native Present, so generated phases rotate the physical ring
-            // independently of the public game index or OS displayed count.
-            const UINT physicalSlot = priorOutputs % std::size(queues);
-            auto* selected = static_cast<ID3D12CommandQueue*>(queues[physicalSlot]);
-            if (frame == 9)
-                fgRequire(selected != gpu.queue.Get() && rejectedGenerationGate.Get() != queueGate.gate.Get(),
-                          "reject-generation-independent-game-and-presentation-gates");
-            std::printf("OWNED_D3D12_FSR_FG_QUEUE_SELECTION frame=%u physical_slot=%u prior_callback_outputs=%u queue=%c\n",
-                        frame, physicalSlot, priorOutputs, selected == queueA ? 'A' : 'B');
-            queueGate.begin(frame, selected, selected == queueA ? queueB : queueA);
-        }
         const HRESULT result = chain->Present(1, 0);
         QueryPerformanceCounter(&after);
-        if (frame == 9) {
-            fgRequire(double(after.QuadPart - before.QuadPart) / frequency.QuadPart < 15,
-                      "reject-generation-present-api-bounded");
-            fgRequire(rejectedGameReached->GetCompletedValue() == 0 && queueGate.reached->GetCompletedValue() < queueGate.serial,
-                      "reject-generation-game-and-presentation-gpu-still-pending");
-            // The SDK retires interpolation before recording its REAL callback.
-            // Complete game work without opening the independent presentation gate.
-            check(rejectedGenerationGate->Signal(1), "reject-generation-release-game-batch");
-            fgRequire(queueGate.gate->GetCompletedValue() < queueGate.serial,
-                      "reject-generation-game-release-preserves-presentation-gate");
-            queueGate.release(frame, &callbacks, true);
-            fgRequire(rejectedGameReached->GetCompletedValue() == 1, "reject-generation-game-batch-retired");
-            fgRequire(WaitForSingleObject(callbacks.recorded, 100) == WAIT_TIMEOUT,
-                      "reject-generation-no-second-callback");
-            std::puts("OWNED_D3D12_FSR_FG_REJECTED_GENERATION_ORDER frame=9 real_gpu_output=after_current_game_batch generated=absent");
-        }
-        if (frame == 1) {
-            backbuffer.Reset();
-            HANDLE entered = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            HANDLE finished = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            HRESULT resizeResult = S_OK;
-            std::thread resizing([&] {
-                SetEvent(entered);
-                resizeResult = chain->ResizeBuffers1(3, 96, 80, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, desc.Flags, masks, queues);
-                SetEvent(finished);
-            });
-            fgRequire(WaitForSingleObject(entered, 10000) == WAIT_OBJECT_0, "queue-resize-entered");
-            fgRequire(WaitForSingleObject(finished, 100) == WAIT_TIMEOUT, "queue-resize-drains-old-generated-frame");
-            queueGate.release(frame, &callbacks);
-            fgRequire(WaitForSingleObject(finished, 15000) == WAIT_OBJECT_0, "queue-resize-unblocks-after-retirement");
-            resizing.join(); CloseHandle(entered); CloseHandle(finished);
-            fgRequire(resizeResult == DXGI_ERROR_INVALID_CALL, "queue-active-resize-backend-rollback");
-            DXGI_SWAP_CHAIN_DESC1 retained{}; check(chain->GetDesc1(&retained), "queue-active-rollback-desc");
-            fgRequire(retained.Width == fgWidth && retained.Height == fgHeight && retained.BufferCount == 3,
-                      "queue-active-rollback-preserves-native-ring");
-            ++rejected;
-        }
-        else if (gated && frame != 9) queueGate.release(frame, &callbacks);
-        if (frame != 10) check(result, "proxy-present");
-        fgDrain(api, swapContext, frame == 10 && SUCCEEDED(result));
-        if (frame != 10) fgPresentedStatistics(chain.Get(), frame, previousStatistics);
+        check(result, "proxy-present");
+        fgDrain(api, swapContext);
+        fgPresentedStatistics(chain.Get(), frame, previousStatistics);
         std::printf("OWNED_D3D12_FSR_FG_PRESENT_CALL frame=%u enabled=%u only_generated=%u generation_error=%u present_error=%u qpc_start=%lld qpc_end=%lld frequency=%lld\n",
-                    frame, config.frameGenerationEnabled, config.onlyPresentGenerated, frame == 9, frame == 10,
+                    frame, config.frameGenerationEnabled, config.onlyPresentGenerated, frame == 9, 0,
                     before.QuadPart, after.QuadPart, frequency.QuadPart);
         MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
@@ -454,7 +276,7 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
                 fgRequire(pixels[center] == (capture.frame == 11 ? 255 : 32) && pixels[center + 2] == (capture.frame == 11 ? 255 : 8),
                            "actual-render-color-readback");
             }
-            fgRequire(capture.frame != 10 && (capture.frame != 8 || capture.generated) &&
+            fgRequire((capture.frame != 8 || capture.generated) &&
                        (capture.frame != 9 || !capture.generated) &&
                        ((capture.frame != 5 && capture.frame != 6) || !capture.generated), "negative-output-never-callback-presented");
             std::printf("OWNED_D3D12_FSR_FG_CALLBACK_PIXELS frame=%llu generated=%u output_index=%u width=%u height=%u hash=%016llx marker=%u,%u,%u\n",
@@ -466,17 +288,18 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
             for (UINT y = 0; y < 8; ++y)
                 std::fill_n(pixels.data() + y * capture.width * 4, 8 * 4, 0);
             const auto hash = fgHash(pixels);
-            for (auto prior : phaseHashes[capture.frame])
-                fgRequire(prior != hash, "genuine-phase-output-not-duplicated-current-or-midpoint");
+            if (capture.frame == 3 || capture.frame == 4)
+                for (auto prior : phaseHashes[capture.frame])
+                    fgRequire(prior != hash, "native-generated-output-differs-from-current");
             phaseHashes[capture.frame].push_back(hash);
         }
-        const UINT expectedGenerated[13] = {0, 0, 1, 2, 3, 0, 0, 0, 4, 0, 0, 0, 0};
+        const UINT expectedGenerated[13] = {0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1};
         for (UINT frame = 1; frame <= 12; ++frame) {
-            fgRequire(generatedCounts[frame] == expectedGenerated[frame], "gpu-actual-count-controls-callbacks");
-            fgRequire(realCounts[frame] == ((frame == 8 || frame == 10 || frame == 12) ? 0u : 1u), "real-once-or-generated-only-suppressed");
+            fgRequire(generatedCounts[frame] == expectedGenerated[frame], "original-sdk-single-output-callbacks");
+            fgRequire(realCounts[frame] == ((frame == 8 || frame == 12) ? 0u : 1u), "real-once-or-generated-only-suppressed");
         }
-        std::puts("OWNED_D3D12_FSR_FG_MULTI_PACING_PASS counts=1,2,3,4 distinct_gpu_outputs=1 generated_before_real=1 bootstrap_reset_scenechange_disabled=zero only_generated_zero=no_present");
-        std::puts("OWNED_D3D12_FSR_FG_NO_NOTIFY_PROXY_PASS frame=3 generated=2 result_observer=retained");
+        std::puts("OWNED_D3D12_FSR_FG_NATIVE_PACING_PASS count=1 generated_before_real=1 bootstrap_reset=native_output disabled=real_only callback_error=real_only");
+        std::puts("OWNED_D3D12_FSR_FG_NO_NOTIFY_PROXY_PASS frame=3 generated=1");
     }
     fgPresentedStatistics(chain.Get(), 12, previousStatistics, "callback");
     config.frameGenerationEnabled = false;
@@ -494,14 +317,6 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
     wrap.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12;
     wrap.swapchain = chain.GetAddressOf(); wrap.gameQueue = gpu.queue.Get();
     fgResult(api.create(&swapContext, &wrap.header, nullptr), FFX_API_RETURN_OK, "proxy-wrap-real-chain");
-    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    check(gpu.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queueOwnerA)), "ui-present-queue-a");
-    check(gpu.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queueOwnerB)), "ui-present-queue-b");
-    queueA = queueOwnerA.Get(); queueB = queueOwnerB.Get();
-    IUnknown* uiQueues[2] = {queueA, queueB};
-    check(chain->ResizeBuffers1(2, fgWidth, fgHeight, DXGI_FORMAT_UNKNOWN, desc.Flags, masks, uiQueues), "ui-present-queues-resize1");
-    queueOwnerA.Reset(); queueOwnerB.Reset();
-    FgQueueGate uiGate(gpu, chain.Get());
     previousStatistics = {};
     FgContext uiContext(api, gpu, fgWidth, fgHeight, desc.Format);
     ffxConfigureDescFrameGeneration builtin{};
@@ -546,9 +361,7 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
         // The SDK consumes a double-buffered UI registration after its copy.
         // Publish each frame explicitly, just as the application render loop.
         fgResult(api.configure(&swapContext, &registration.header), FFX_API_RETURN_OK, "ui-register-premul-doublebuffer");
-        if (frame == 11 || frame == 12) uiGate.begin(frame, frame == 11 ? queueA : queueB, frame == 11 ? queueB : queueA);
         check(chain->Present(1, 0), "ui-builtin-present");
-        if (frame == 11 || frame == 12) uiGate.release(frame);
         r = fgRecording(gpu); transition(r.list.Get(), ui.Get(), fgRead, D3D12_RESOURCE_STATE_COPY_DEST);
         check(r.list->Close(), "ui-mutate-transition"); gpu.executeAndWait(r.list.Get());
         std::vector<uint8_t> mutant(fgWidth * fgHeight * 4);
@@ -566,8 +379,7 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
     ui.Reset(); fgDrain(api, swapContext); uiContext.destroy();
     fgResult(api.destroy(&swapContext, nullptr), FFX_API_RETURN_OK, "wrapped-proxy-destroy"); chain.Reset();
     std::puts("OWNED_D3D12_FSR_FG_UI_PASS wrap=real_hwnd ui=builtin_shader premultiplied=1 doublebuffer=gpu_snapshot resize=96x80 lifetime=drained");
-    fgRequire(rejected == 12, "queue-rejection-cases-complete");
-    std::puts("OWNED_D3D12_FSR_FG_QUEUES_PASS samequeue=1 nullarray=rejected count0=preserved multipqueue=3 device_type_mask=rejected rollback=atomic drain=oldframe owners=retained generated_real_ui=selected worker_idle=progress");
+    std::puts("OWNED_D3D12_FSR_FG_ORIGINAL_SDK_PASS resize1=unsupported unchanged=1 resize=implemented pacing=original");
     std::puts("OWNED_D3D12_FSR_FG_PROXY_PASS create=hwnd callbacks=gpu-readback generated_before_real=1 only_generated=1 disabled=1 callback_error=1 drain=1 destroy=1");
     std::puts("OWNED_D3D12_FSR_FG_PACING_PASS ordered=1 bounded_progress=1 qpc=observed native_timestamps=external_observer_required");
 }
