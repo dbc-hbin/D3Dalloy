@@ -2,9 +2,9 @@
 
 Review baseline: `main@4a3731fe92c08c61451cd69927c323b51d26eabd`, plus the existing Wine/FEX/frontend working-tree changes inspected on 2026-10-07. This document consolidates the preceding source review and records the follow-up implementation separately. Source-backed findings are not reproduced GPU failures; retained results are not new executions.
 
-## Scope and current disposition
+## Review scope and initial disposition
 
-The user selected documentation cleanup, preservation of historical handoffs, component-scoped atomic local commits, and implementation of the reviewed correctness fixes and justified optimizations. No upstream PR, push, live-game installation, broad D3D11 expansion or proprietary backend dependency is part of this work.
+This review records the correctness findings and measured optimizations implemented below. Current support is maintained in [CORE](../graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md); remaining work is maintained in [PRIORITIES](../graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md). The initial dispositions below describe the review baseline, not the current task queue.
 
 | ID | Finding or design | Initial disposition | Required acceptance |
 | --- | --- | --- | --- |
@@ -66,11 +66,11 @@ Report cold and warm phase times, unique and duplicate keys, p50/p95/p99 latency
 
 Composition: retain geometry, attachment and cadence results while independently establishing alpha association, transfer domain, FP16 quantization/clipping and display-profile expectations. Microsoft's documented Advanced Color linear scRGB composition domain is a qualified starting point, not a legacy-SDR or calibrated screen oracle. Do not choose gamma from the owned output being tested.
 
-Ray Reconstruction: the retained investigation identifies a K44/C16 unmasked tail load over a 12672-byte MetalFX weight buffer. Standalone specialized AIR and the arithmetic witness do not establish byte identity of the live framework pipeline or hardware transactions. Isolate pre-load masking and compiler behavior in a minimal native experiment; preserve the failing public/native validation evidence. Fixing R1 is not fixing this independent native kernel contract. No guide removal, padding hook, SR substitution or validation suppression constitutes completion.
+Ray Reconstruction: the earlier fused-kernel K44/C16 tail-load failure is superseded for the tested M5 Pro/macOS27.0.1 route by Apple's non-fused path selected through the private descriptor version. Both public ABIs pass 36 outputs against native RGB with zero error and clean API/Shader Validation. This does not establish other OS/GPU or real-game acceptance; see [current RR evidence](../graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#rr-native-validation-재검증--2026-10-07). R1's CPU-pointer fix remains a separate contract.
 
 HDR10+ GAMING: separate metadata parsing, calibrated APP/GPU tone mapping, native Gaming/low-latency/source-TM control, payload transport, output ownership and restoration. Generic InfoFrame transport, ALLM, SBTM or ordinary HDR10+ video are not Gaming SSTM. A mandatory sink ACK was not established and must not be invented as a prerequisite. No unused parser/getter echo should be presented as a working display feature.
 
-The detailed original observations are preserved in [historical records](history/README.md). These limitations do not justify rewriting the renderer or reopening already-implemented API families.
+The relevant earlier observations are indexed in [verification history](../graphics-translator/IMPLEMENTATION-HISTORY.ko.md). These limitations do not justify rewriting the renderer or reopening already-implemented API families.
 
 ## Retained evidence before follow-up implementation
 

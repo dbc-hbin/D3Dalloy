@@ -17,7 +17,7 @@ Defaults are `x86_64`/`x64`. 그 외 조합은 거부한다. 표는 **staging la
 
 - PE machine과 최종 CHPE metadata/code ranges, ARM64X dynamic relocations를 검사한다. 중간 ARM64EC/ARM64X label만 붙인 파일은 허용하지 않는다.
 - Wine의 `ntdll.dll` ABI, native launcher/`ntdll.so`/`wineserver`의 architecture를 검사한다. x64 packaged Wine의 ARM64 IPC `wineserver`는 명시적 예외다.
-- Generic GPU runner의 `--guest-arch {x86,x64,arm64}`는 ISA assertion이지 FEX 활성화 옵션이 아니다. Native FEX의 선정 ABI/smoke 실행은 `scripts/run-owned-wine-arm64.py`의 별도 경로로 검증한다. Generic runner의 FEX 거부를 native 실행 전체 미구현으로 해석하지 않으며, 10월7일 direct public frontend 실행도 generic runner acceptance와 구분한다.
+- Generic GPU runner의 `--guest-arch {x86,x64,arm64}`는 ISA assertion이지 FEX 활성화 옵션이 아니다. Native FEX의 선정 ABI/smoke 실행은 [Wine-darwin](../../Wine-darwin/README.md)의 `scripts/run-owned-wine-arm64.py --dxmt-root <DXMT 레포>` 경로로 검증한다. Generic runner의 FEX 거부를 native 실행 전체 미구현으로 해석하지 않으며, 10월7일 direct public frontend 실행도 generic runner acceptance와 구분한다.
 - **Schema 1은 legacy x86_64/x64 manifest를 읽는 호환 경로만 남아 있다.** 새 stage는 schema 1을 생성하지 않는다. 기존 manifest를 손으로 schema 2로 relabel하지 말고 실제 binaries에서 새 stage를 만든다.
 
 ARM64 compiler/bridge·Wine SDK/plugin의 관측과 native Wine/FEX 최종 acceptance는 [ARM64-FEX-IMPLEMENTATION.md](../docs/ARM64-FEX-IMPLEMENTATION.md)에서 분리한다. Schema 2나 ARM64 launch 명령만으로 `strict_no_rosetta_proven`을 주장하지 않는다.
@@ -42,6 +42,8 @@ ARM64 compiler/bridge·Wine SDK/plugin의 관측과 native Wine/FEX 최종 accep
 DXMT install 어디든 제거된 `libdxmt-dxilconv.dylib`, `libmetalirconverter.dylib`, `metal-shader-converter` artifact가 있으면 거부한다. Owned plugin이 외부 compiler/GPTK backend (`dxilconv`, `metalirconverter`, D3DMetal, `libd3dshared`)에 링크해도 거부한다. 별도 SDK dylib/license tree를 복사하는 단계는 없다.
 
 ## 스테이징
+
+Wine SDK/runtime 생산은 별도 [Wine-darwin](../../Wine-darwin/README.md)의 책임이다. DXMT는 완성된 runtime을 입력받는다. Composition frontend가 필요하면 Wine-darwin의 `scripts/build-display.py --dxmt-root <DXMT 레포>`로 만든 `wine-build`와 `wine-source`를 stage의 `--wine-display-build`·`--wine-display-source`에 각각 전달한다. Pin·소스/ABI header hash·PE builtin/exports·freshness 검사 후 `dcomp.dll`만 교체하며 native Wine overlays는 건드리지 않는다.
 
 Core는 신규 optional 기능/CLI toggle이 아니라 `enable_d3d12` 설치 세트의 필수 모듈이다. Stage는 양 ABI 각각 `D3D12SDKVersion` **실제 DATA=618**, concrete `D3D12GetInterface`/owned bridge exports, owned marker와 `OwnedD3D12CoreGeneration` DATA char[33]을 검사한다. Core는 Wine DOS-stub의 정확한 32-byte builtin/placeholder signature를 거부하는 ordinary PE여야 한다. 같은 ABI의 Main/Core generation이 일치해야 한다. 새 schema2 manifest의 필수 `agility_sdk` record는 ownership/version, `delivery=native-only`와 ABI별 Core path/hash/generation을 저장한다. Verify도 이를 재검사한다. Core 도입 전 immutable schema1/2 manifest 및 실제 retained builtin-Core manifest의 read-only 검증은 유지하지만 새 stage에서 Core를 생략하거나 builtin으로 배포할 수는 없다.
 
@@ -78,6 +80,8 @@ x86 fixture는 `build-win32.txt`로 별도 생성한 **같은 세대** i386 inst
 현재 recipe가 NVNGX/NVAPI를 빌드하더라도 stage 선택은 별도다. 필요할 때 위 stage 명령에 `--with-nvngx --with-nvapi`를 추가한다.
 
 `nvngx.dll`은 `own-ngxd3d12` marker 및 required D3D12 Init/Create/Evaluate/Release/parameter/export set을 PE export table에서 확인한다. D3D11-only stale frontend는 거부한다. `nvapi64.dll`은 실제 `nvapi_QueryInterface` export가 필요하다. 선택에 따라 manifest의 `optional_modules`, wrapper overrides 및 `DXMT_ENABLE_NVEXT=1`을 기록한다. 두 옵션 모두 없으면 inherited NVEXT를 제거하고 `nvngx`/`nvapi64` 외부 fallback을 비활성화한다. 기능 의미는 [NGX 문서](NGX-INTEGRATION.ko.md)의 범위이며 staging 통과를 NVIDIA DLSS 품질·호환 증거로 세지 않는다.
+
+`--with-nvngx`는 OpenSSL과 `osslsigncode`가 필요하다. 선택한 64-bit/32-bit owned NGX 사본을 임시 owned-publisher 인증서로 실제 Authenticode 서명한 뒤 최종 hash를 기록한다. 개인키는 staging 종료 시 제거하고 공개 DER만 `share/dxmt/ngx-runtime.cer`에 둔다. `wine.inf`의 기본 prefix 설치가 해당 공개 인증서를 **그 Wine prefix의 HKCU Root store에만** 등록한다. macOS 신뢰 저장소나 원본 Wine/게임 파일은 변경하지 않는다. `verify`는 서명된 DLL·공개 인증서·등록 정보의 manifest 정합성을 검사한다. 이는 NVIDIA publisher를 가장하거나 앱의 서명 검증을 끄는 경로가 아니다.
 
 ### 선택적 owned FSR SR/FG
 

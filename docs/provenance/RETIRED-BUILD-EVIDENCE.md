@@ -1,5 +1,9 @@
 # 은퇴한 build root와 보존된 증거
 
+## 2026-10-09 현재 보유 범위
+
+아래 위치는 과거 이관·정리 당시의 기록이다. 이후 디스크 정리로 `build/retired-evidence/`, `build/legacy/`와 과거 FG/RR·SDK05·review 결과 및 `build/local/repo-cleanup-20261008/originals/`는 현재 없다. 이 경로와 hash를 원본 파일의 현재 보유 증거로 인용하지 않는다. 현재 로컬 검증 자료는 [증거 색인](../../graphics-translator/IMPLEMENTATION-HISTORY.ko.md#증거를-읽는-기준)의 10월9일 ZZZ 네 root로 구분한다. Frozen source-import manifest·라이선스·원본 patch는 이 산출물 정리와 무관하며 유지한다.
+
 이 저장소의 `graphics-translator/*.ko.md`에는 2026-09-19 ~ 09-20 작업 당시의 `build/owned-*` 경로가 인용되어 있다.
 그 root들은 현재 canonical runtime과 이 저장소의 루트 소스로 대체되었고, 원본 작업 폴더(`zzz-wine-d3dmetal-dx12`)에서
 디스크 사용량 때문에 정리했다. 문서에 남은 `build/owned-*` 경로는 **역사적 provenance 표기**이며 현재 파일 존재를 뜻하지 않는다.

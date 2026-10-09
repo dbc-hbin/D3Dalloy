@@ -10,7 +10,7 @@
 
 저장소 루트에서 필요한 범위만 실행한다.
 
-2026-10-07 문서/packaging 회귀에는 `scripts/test-owned-documentation.py`, `test-owned-wine-arm64-runner.py`, `test-owned-arm64x-build.py`, `test-owned-wine-arm64-package.py`도 있다. ARM64X의 선택적 실제 SDK graph 검증은 `--sdk-root` 없이는 skip되며, mock/CPU PASS를 target build나 GPU 실행으로 합산하지 않는다. 새 correctness 회귀와 실제 적용 결과는 [리뷰 ledger](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)를 따른다.
+문서/packaging 회귀에는 `scripts/test-owned-documentation.py`, `test-owned-arm64x-build.py`, `test-owned-arm64-package.py`도 있다. ARM64X의 선택적 실제 SDK graph 검증은 외부 Wine SDK를 가리키는 `--sdk-root` 없이는 skip되며, mock/CPU PASS를 target build나 GPU 실행으로 합산하지 않는다. Wine runner 회귀는 [Wine-darwin](../../Wine-darwin/README.md)의 `scripts/test-owned-wine-arm64-runner.py`로 이동했다. 새 correctness 회귀와 실제 적용 결과는 [리뷰 ledger](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)를 따른다.
 
 ```sh
 python3 scripts/test-owned-graphics-build.py
@@ -25,6 +25,18 @@ python3 scripts/test-owned-ngx-frontend.py
 - `ngx-frontend`: 현재 소스에서 frontend DLL을 CPU/PE로 만들고 exports/MSVC parameter ABI를 검사한다. GPU나 NVIDIA DLSS 품질 증거가 아니다.
 
 `enable_tests=true`의 업스트림 DX11 samples 및 수동 CPU `*.test.cpp` probes와 공용 PE/GPU runner는 별개다. 일반 project-wide lint/자동 GPU suite가 있다고 가정하지 않는다.
+
+자동 PSO disk cache의 실제 WinAPI·파일·교차 프로세스 회귀는 준비된 private runtime과 **존재하지 않는 output**으로 실행한다. Production cache 코드를 그대로 컴파일한 CPU probe이며 GPU 또는 실게임 완료 증거는 아니다.
+
+```sh
+python3 graphics-translator/tests/run-automatic-cache-cpu.py \
+  --runtime build/local/runtime-smoke-001 \
+  --out build/local/automatic-cache-cpu-001
+```
+
+내용 readback, 256MiB 한도에서 같은 key 교체, 다른 프로세스의 저장·clear, rename 실패와 mutex 소유자 종료 뒤 복구, foreign file 보존을 검사한다. Runner는 전용 prefix/TEMP를 만들고 해당 Wine 종료 뒤 제거한다. `metadata_enumerations`는 256회 작은 저장의 관측값이며 시간 기반 합격 기준이 아니다.
+
+실제 셰이더 실패 입력이 필요하면 미리 만든 **Windows 경로**를 `DXMT_SHADER_FAILURE_PATH`로 지정한다. 초기 VS/PS/CS 컴파일 실패에서 stage·bytecode·root-signature 조합별 최대64개를 `.failure` 디렉터리에 저장한다(`shader.cso`, `rootsig.bin`, compilation arguments의 `metadata.txt`, `error.txt`, module-relative caller `stack.txt`). 기본값은 꺼짐이며 모든 shader variant/native PSO 실패를 포괄하지 않는다. 게임 소유 bytecode와 실행 경로가 포함되므로 private evidence로 보관하고 저장소에 추가하거나 외부에 전송하지 않는다.
 
 ## Conservative Tier3 public proof
 
@@ -315,7 +327,7 @@ P0-3의 enhanced creation APIs3/6/9는 enhanced COPY_DEST→COPY_SOURCE barrier�
 
 ## P1 fixture 재실행과 before/after 분리
 
-P1의 완료 범위·runtime별 실행 결과·reference 결정은 [CORE P1](CORE-IMPLEMENTATION-STATUS.ko.md#p1-계약-범위와-reference)를 따른다. 아래는 **반복 recipe**이며 실행 결과가 아니다. README의 current x64/WoW64 build/install과 새 paired runtime stage/verify를 먼저 완료한다. NGX/FSR frontend는 x64-only이며 stage에 `--with-nvngx`/`--with-fsr`가 필요하다. 기존 immutable P0 runtime을 candidate로 덮어쓰지 않는다.
+P1의 완료 범위·runtime별 실행 결과·reference 결정은 [CORE P1](CORE-IMPLEMENTATION-STATUS.ko.md#p1-계약-범위와-reference)를 따른다. 아래는 **반복 recipe**이며 실행 결과가 아니다. README의 current x64/WoW64 build/install과 새 paired runtime stage/verify를 먼저 완료한다. NGX/FSR frontend는 현재 x64/WoW64이며 stage에 `--with-nvngx`/`--with-fsr`가 필요하다. 기존 immutable P0 runtime을 candidate로 덮어쓰지 않는다.
 
 ```sh
 export LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin
@@ -356,7 +368,7 @@ done
 
 Public NGX는 [MSVC+MinGW fixture recipe](NGX-TEST.ko.md#현재-fixture-빌드)로 다시 빌드해 `ngx`/`ngx-contracts`를 x64 `--validation`으로 실행한다. `ngx`는 `exposure_scale_auto`, `exposure_scale_texture`, `exposure_scale_no_texture`, `mv_value_offsets_lowres`, `mv_value_offsets_highres_jittered` 각각 replay0–2의 default-vs-nondefault GPU 출력을 비교한다(max_byte_delta≤1·active contrast·outside sentinel·live inputs·parameter destroy·release-before-submit). Negative/nonfinite scalar 거부도 output sentinel을 보존해야 한다. 이것은 accept+ignore 호환 증거이며 exposure/MV 수식 또는 pristine/NVIDIA GPU differential proof가 아니다. Backend `temporal` x64/WoW64 실행은 public NGX ABI proof와 별도로 보존한다.
 
-Public FG는 [기존 fsr-fg present/observer recipe](#전체-srpublic-fg와-shader-cache-전용-recipe)를 그대로 쓰되 current fixture/observer를 다시 빌드한다. `OWNED_D3D12_FSR_FG_QUEUES_PASS`·`QUEUE_PROOF`의6 frames(1,3,5,9,11,12) selected queue pending/completed markers, `RECORDING_ROLLBACK`의 실제 output, generated/real/builtin-UI drawable와 worker-idle 진행 판정이 필요하다. Success HRESULT만으로 queue routing/rollback/drain을 증명하지 않는다. Memory query behavior는 사용자 제외로 그대로 유지한다. Frame9의 `REJECTED_GENERATION_ORDER real_gpu_output=after_current_game_batch`는 game queue를 막은 동안 GPU output이 sentinel인지를 검사한다. CPU callback의 선행 recording은 허용되므로 callback 시점으로 GPU ordering을 판정하지 않는다.
+Public FG의 옛 `OWNED_D3D12_FSR_FG_QUEUES_PASS`·`QUEUE_PROOF`·`RECORDING_ROLLBACK` per-buffer queue recipe는 제거된 custom extension의 역사적 검증이다. 현재는 [fsr-fg present/observer recipe](#전체-srpublic-fg와-shader-cache-전용-recipe)로 원본 SDK의 단일 generated-role/real/UI 순서와 native interpolation·drawable 표시를 분리 검증한다. ResizeBuffers1은 E_NOTIMPL, ordinary ResizeBuffers는 유지한다. Success HRESULT만으로 generation/presentation을 증명하지 않는다.
 
 Before는 immutable `build/local/p0-contracts-r5KJ0O/runtime-01`에 **같은 최종 fixture**를 별도 `before-*` output으로 실행해 보존하고, candidate는 새 `after-*`로 실행한다. Before의 nonzero/timeout·실패 JSON/stdout/stderr를 PASS로 고쳐 쓰거나 candidate 결과와 합산하지 않는다. 각 cut의 source/PE/input hashes·runtime manifest·build/install/stage logs·actual owned load/no foreign backend·API+Shader Validation/completion 판정을 함께 보존한다. Failed candidate iteration도 원인과 후속 새 실행을 별도 기록한다.
 
@@ -827,11 +839,11 @@ python3 scripts/test-owned-graphics.py \
   --out "$FX_WORK/run-shader-cache"
 ```
 
-SR/FG fixture는 current temporal source를 rename-main include한다. Public headers/license와 reference checksums는 [integration](NGX-INTEGRATION.ko.md#owned-fsr-public-api와-provenance)에 있다. `enable_fsr=true`는 owned SR/FG frontend를 함께 빌드하고 stage의 `--with-fsr`는 **두 DLL 모두** 선택한다. Stage는 builtin marker와 각 five names/ordinals를 검증한다. FG reference ordinals는 Configure=1/Create=2/Destroy=3/Dispatch=4/Query=5다. 선택하지 않은 새 runtime에서는 두 foreign fallback을 차단한다. 과거 manifest에 `fsr_framegeneration` 필드가 없으면 verifier는 과거 SR-only loader 정책과 runtime bytes를 그대로 보존한다. 이는 FG 선택/자동 업그레이드가 아니므로 새 경로에 다시 stage해야 `fsr-fg`를 실행할 수 있다. `--with-nvngx`는 NGX 회귀 DLL도 선택하며 public NGX fixture는 [별도 MSVC compile recipe](NGX-TEST.ko.md#현재-fixture-빌드)를 사용한다. 현재 public SR/FG staging은 x86_64-native/x64-Windows만 지원한다.
+SR/FG fixture는 current temporal source를 rename-main include한다. Public headers/license와 reference checksums는 [integration](NGX-INTEGRATION.ko.md#owned-fsr-public-api와-provenance)에 있다. `enable_fsr=true`는 owned SR/FG frontend를 함께 빌드하고 stage의 `--with-fsr`는 **두 DLL 모두** 선택한다. Stage는 builtin marker와 각 five names/ordinals를 검증한다. FG reference ordinals는 Configure=1/Create=2/Destroy=3/Dispatch=4/Query=5다. 선택하지 않은 새 runtime에서는 두 foreign fallback을 차단한다. 과거 manifest에 `fsr_framegeneration` 필드가 없으면 verifier는 과거 SR-only loader 정책과 runtime bytes를 그대로 보존한다. 이는 FG 선택/자동 업그레이드가 아니므로 새 경로에 다시 stage해야 `fsr-fg`를 실행할 수 있다. `--with-nvngx`는 NGX 회귀 DLL도 선택하며 public NGX fixture는 [별도 MSVC compile recipe](NGX-TEST.ko.md#현재-fixture-빌드)를 사용한다. 현재 public SR/FG는 x64/WoW64를 유지한다. WoW64는 matching i686 fixture/install을 paired stage하고 `--guest-arch x86`으로 실행한다.
 
 `fsr`의 full-SR 판정은 high-resolution/jittered motion·nonzero scale/effect, reactive/composition masks·history/reset, linear/sRGB/PQ, sharpening constant/edge/alpha, automatic/manual exposure·GPU-produced R32 replay, dynamic output generation, native scale cap·centered black-opaque margins, inflight release·command-list reset discard와 rejection sentinel을 함께 요구한다. `OWNED_FSR_NATIVE_MAX_SCALE`은 **같은 장치에서 독립 public MetalFX descriptor로 측정한 값**이어야 한다. M5 Pro에서 측정한 3을 portable constant로 복사하지 않는다. 현재 cap fixture는 input64×64의 native-extent control과 caller256×224의 중심 결과를 비교하고264×232 외부 sentinel을 보존한다.
 
-`fsr-fg --mode present`는 `--fg-observer`가 필수다. Observer는 explicit **test-only** input이며 product telemetry가 아니다. x64 fixture에서도 arm64 wineserver가 injection 환경을 상속하므로 위 compile recipe처럼 x86_64+arm64 universal Mach-O를 사용한다. Runner는 각 slice의 macOS system-library/framework 의존성만 허용하고 observer/checker를 freeze·hash한 뒤 실제 drawable pixels/order/native presentation timestamps를 `fg-capture/`에 수집한다. `MTLDrawable.presentedTime=0`은 미표시/skipped로 보존하며 presentation 시도 수와 실제 positive-timestamp 표시 수를 구분한다. 반복 generated-before-real 표시 쌍과 only-generated 표시를 별도로 요구하지만 모든 시도의 scanout이나 정확한2× OS cadence를 보장하지 않는다. Callback GPU readback이나 `Present` QPC 소요시간만으로 실제 presentation을 주장하지 않는다. SDK proxy의 generated-before-real·only-generated·disabled/error/drain, premultiplied UI GPU snapshot/doublebuffer/resize와 history/lifetime/config 경계도 runner의 별도 gate다.
+`fsr-fg --mode present`는 `--fg-observer`가 필수다. Observer는 explicit **test-only** input이며 product telemetry가 아니다. x64 fixture에서도 arm64 wineserver가 injection 환경을 상속하므로 위 compile recipe처럼 x86_64+arm64 universal Mach-O를 사용한다. Runner는 각 slice의 macOS system-library/framework 의존성만 허용하고 observer/checker를 freeze·hash한 뒤 실제 drawable pixels/order/native presentation timestamps를 `fg-capture/`에 수집한다. `MTLDrawable.presentedTime=0`은 미표시/skipped로 보존하며 presentation 시도 수와 실제 positive-timestamp 표시 수를 구분한다. 반복 generated-before-real 표시 쌍과 only-generated 표시를 별도로 요구하지만 모든 시도의 scanout이나 정확한2× OS cadence를 보장하지 않는다. Callback GPU readback이나 `Present` QPC 소요시간만으로 실제 presentation을 주장하지 않는다. 원본 SDK의 generated-role-before-real·only-generated·disabled/drain, premultiplied UI GPU snapshot/doublebuffer/resize와 history/lifetime/config 경계도 runner의 별도 gate다. Generated-role callback은 actual interpolation count의 증거가 아니다. Ordinary ResizeBuffers는 유지하고 ResizeBuffers1은 E_NOTIMPL이다. Custom per-buffer queue extension이나 새 async Present 오류 protocol을 요구하지 않는다. NGX Present/pacing은 caller 책임이다.
 
 보존할 FG 증거는 `fixture/fg-*.bin`, `fg-capture/drawable-*.bin`, `fg-capture-analysis.json`/`.log`, `invocation.json`의 observer hash·architectures·per-slice dependencies, `result.json`이다. 새 stage/output/prefix만 사용하고 runner가 해당 prefix의 wineserver를 종료하게 둔다. Live prefix 재사용/전역 wineserver 종료는 하지 않는다. 실제 staged owned `winemetal.so` load와 D3DMetal/`libd3dshared` 부재가 SR/FG 모두의 전제다.
 
@@ -846,7 +858,7 @@ clang++ -std=c++20 -Wall -Wextra -Werror tests/dxgi_refresh_timing.cpp -o /tmp/d
 /tmp/dxgi-refresh-timing
 ```
 
-현재 public FG의 1–4개 출력은 pinned source-owned SDK phase backend를 사용한다. 각 real pair의 normalized phase는 `i/(N+1)`이며 GPU actual count가 0이면 generated callback·Present를 만들지 않는다. 아래 독립 control은 Wine/FFX/production backend를 링크하지 않는 **과거 Metal4 MetalFX 알고리즘 관찰용**이다. 현재 SDK 출력과 pixel equality를 비교하거나 현재 FG acceptance로 합산하지 않는다. 현재 checker는 `--native` 비교를 거부하며, 위 runner의 실제 drawable pixels/order/native timestamps와 public actual-count·phase·history/UI oracle을 사용한다.
+현재 public FG는 원본 pinned AMD SDK source-built swapchain/UI/pacing + 기존 WMTMetal4FG의 native MetalFX generation이다. Generated output 최대1개이며 FSR2–4 요청은 NO_PROVIDER, NGX count/index>1과 non-null OutputDisableInterpolation은 UnsupportedParameter다. SDK generated-role bootstrap/reset output은 current-color일 수 있다. Native warm-up과 actual drawable display는 별도로 관찰하며 public MetalFX에 없는 actual-count/status를 만들어 검사하지 않는다(pristine GPTK도 disable key를 무시한다). Closed-list replay는 native work를 다시 encode한다. 아래 독립 control은 Wine/FFX/production backend를 링크하지 않는 public MetalFX oracle다. Matching native inputs/reset/history의 비교와 SDK callback 순서/UI/pacing·실제 drawable pixels/order/timestamps를 별도 gate로 기록한다. Root27/28/30/34의 AMD phase/actual-count proof와 과거 checker의 `--native` 거부는 역사적 기록이지 현행 acceptance가 아니다. 현재 최종 root는 `build/local/fsr-metalfx-20261007-43df9ae7`이며 양 ABI FSR·NGX GPU·NGX Present 6개 실행이 API+Shader Validation으로 통과했다. 실제 표시 수·warm-up 경계는 CORE의 현재 FG 검증을 따른다.
 
 ```sh
 xcrun clang++ -std=c++20 -O2 -Wall -Wextra -Werror \

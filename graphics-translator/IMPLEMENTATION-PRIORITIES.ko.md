@@ -1,12 +1,14 @@
 # 현재 구현 우선순위
 
-기준일: **2026-10-07**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
+기준일: **2026-10-09**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
 
-## 현재 사용자 선택
+## 현재 관리 범위
 
-문서 현행화·인수인계 보존과 이전 Wine/FEX/DXMT 변경의 원자적 로컬 커밋을 마친 뒤, 이번 지시에 따라 미사용 worktree8개를 먼저 정리했다. Dirty3개는 archive ref와 build 증거를 보존했고 interactive shell이 있던1개는 남겼다. 이어 [2026-10-07 리뷰·설계의 implementation ledger](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#follow-up-implementation-and-evidence)에 따라 R1–R6을 구현·검증·커밋하고 R7은 계측 후 native cache를 보류했다. 과거 중단 지시는 현행 보류가 아니다. Web GPT Agent의 agents 도구는 사용하지 않는다. 사용 가능한 독립 실행 도구가 없는 경우 위임했다고 주장하지 않는다.
+이 저장소는 DXMT D3D12 번역기와 그 검증을 관리한다. Wine SDK/runtime 빌드는 별도 Wine-darwin, FEX 소스·빌드는 FEX-darwin의 책임이다. 아래 완료 결과와 미완료 계약을 구분하며, 과거 세션의 실행 순서·중단·위임 지시는 현재 작업 지시로 유지하지 않는다.
 
 ## 선정 리뷰 항목 처리 결과
+
+현재 FG 작업은 원본 MIT AMD SDK pin `0836aa7f24058b3f8d035a88c0774457d78fc98e`의 source-built swapchain/pacing/UI와 기존 WMTMetal4FG native MetalFX generation을 연결하는 번역이다. x64/WoW64를 유지하고 AMD phase-DXIL N1–4 알고리즘은 제거했다. Generated output 최대1개: FSR2–4는 NO_PROVIDER, NGX count/index>1 및 non-null OutputDisableInterpolation은 UnsupportedParameter다. Public MetalFX에는 actual-count/status API가 없고 pristine GPTK도 disable key를 무시한다. SDK generated-role bootstrap/reset output은 current-color일 수 있으며 native warm-up·실제 표시는 별도 관찰한다. Closed-list replay는 native 작업을 다시 encode한다. Ordinary ResizeBuffers는 유지하고 ResizeBuffers1 원본 success stub은 E_NOTIMPL로 바꿨다. Custom per-buffer queue나 새 async Present 오류 protocol은 없으며 NGX Present/pacing은 caller 소유다. Root27/28/30/34의 AMD 알고리즘 proof는 역사적으로 보존하되 현재 native FG proof로 세지 않는다. Native residency·Composition 독립 증거는 유지한다. `build/local/fsr-metalfx-20261007-43df9ae7`의 x64/x86 build는 통과했고 양 ABI FSR·NGX GPU·NGX Present 6개 실행이 API+Shader Validation으로 통과했다. 실제 표시 수·warm-up 경계는 CORE의 현재 FG 검증을 따른다.
 
 | 순서 | 항목 | 현재 판정·실제 검증 |
 | --- | --- | --- |
@@ -24,10 +26,10 @@
 | 항목 | 이미 있는 구현/증거 | 남은 조건 |
 | --- | --- | --- |
 | Composition absolute alpha/colour | 공용 Presenter, geometry·matrix·attachment·resize/lifetime·cadence, 양 ABI104 backing captures | Qualified Windows/reference transfer·association·FP16 quantization/clipping·profile oracle. Backing 결과와 물리 scanout은 별도 |
-| NGX Ray Reconstruction | Feature13 native denoised scaler, 기존 양 ABI numerical parity, K44/C16 tail 접근 조사 | Native 오류 없는 API/Shader Validation와 history/reset/replay·public acceptance. R1 수정은 native K-tail 해결과 다름 |
+| NGX Ray Reconstruction | Native validation blocker 해소. 비공개 version0x10000으로 Apple non-fused GPU 경로 선택; 독립 native50 frame·양 ABI 각각36출력 RGB 오차0·API/Shader Validation 오류0·입력 동등성 PASS | 다른 OS/GPU에서 private 선택자의 계약, 실제 게임 loader·화질/성능 검증. 자체 RR 알고리즘 추가가 아닌 native 위임을 유지한다. [현재 증거](CORE-IMPLEMENTATION-STATUS.ko.md#rr-native-validation-재검증--2026-10-07) |
 | HDR10+ GAMING | 일반 HDR10/scRGB/PQ·EDR, generic transport 조사, Samsung APP/GPU·calibration 근거 | Supported Gaming payload/SSTM·native mode/readback·owner/restore·calibrated GPU tone-map·실제 적합 출력. Mandatory sink ACK를 임의로 요구하지 않음 |
 
-이 항목은 게임 관련 기능의 미완료로 유지한다. ALLM/SBTM/HDR10+ video·DX11 SR·validation suppression·내부 상태 echo로 대체하지 않는다. 현행 조사는 [이관된 원본](../docs/history/parallel-resume2-20261005.md)과 리뷰의 별도 blocker 설계를 따른다.
+이 항목은 게임 관련 기능의 미완료로 유지한다. ALLM/SBTM/HDR10+ video·DX11 SR·validation suppression·내부 상태 echo로 대체하지 않는다. 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)과 [현재 리뷰의 native 계약](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#outstanding-externalnative-contracts)을 따른다.
 
 ## 게임/장치 요구가 확인될 때 확장할 항목
 
@@ -48,7 +50,7 @@ Mask1은 node0 선택이지 multi-GPU 사용 증거가 아니다. Capability que
 
 PipelineLibrary/CachedPSO/자동 RAM·disk cache/application ShaderCacheSession, COPY timestamps, programmable offsets, unaligned BC, CalculateLOD, budget notification, retained arena 성장, 선정 SR/alpha/FG/Reflex는 구현된 기반이다. 새로운 수명·ABI·정확성 결함은 이 완료 기록과 별도로 수정한다.
 
-ARM64/FEX는 보류 상태가 아니다. SDK05의 세 guest ABI/Metal·각8-frame no-present proof가 있고, 그 runtime payload는 이후 정리된 이력과 구분한다. 현재 builder의 Wine11.17/GnuTLS/FreeType, FEX 선정 패치 및 10월7일 frontend 증거는 [ARM64/FEX](../docs/ARM64-FEX-IMPLEMENTATION.md)를 따른다. G8 native migration matrix·실제 게임/presentation·전체 DXIL 검증은 아직 남아 있다.
+ARM64/FEX는 보류 상태가 아니다. 과거 SDK05·login03 fixture 기록과 별도로 10월9일 격리 ZZZ의 DLSS 도시 출력, 리소스 검사 완료 및 FEX 최적화 회귀를 확인했다([현재 증거](ZZZ-COMPATIBILITY.ko.md)). G8 전체 native migration matrix, 다른 게임·장면·전체 DXIL 및 동일 조건 로딩·스터터링 성능 검증은 남아 있다. Wine/FEX 생산과 입력 경계는 [ARM64/FEX](../docs/ARM64-FEX-IMPLEMENTATION.md)를 따른다.
 
 ## 검증과 성능 판정
 
@@ -56,8 +58,8 @@ Cold/warm startup, metadata-lock wait·disk I/O·owned compiler·native pipeline
 
 Fresh output/runtime·전용 prefix를 쓰며 기존 게임/live prefix에 설치하지 않는다. Runtime/fixture/module hash와 실제 실행 ABI·Metal validation·원본 실패를 보존한다. 테스트 종료 후 scoped Wine 프로세스가 멈췄을 때만 disposable prefix를 정리한다. Root captures와 출처가 불명확한 기존 산출물은 소스 커밋에 넣거나 임의로 삭제하지 않는다.
 
-## 역사적 문서로 이동한 내용
+## 과거 결과의 해석
 
 <a id="현재-남은-구현-목록--2026-10-05-정리"></a>
 <a id="2026-10-03-중간-정리"></a>
-과거 P0–P4의 세부 표, #20 중간 보류, runtime033–044 실패/재개와 오래된 ARM64/FEX 보류는 [2026-10-06까지의 원본 우선순위 기록](../docs/history/implementation-priorities-20261006.md)에 보존했다. 해당 기록의 현재형 표현은 당시 상태이며 이 문서의 실행 선택을 덮어쓰지 않는다. [인수인계 원본](../docs/history/README.md)도 같은 원칙을 따른다.
+과거 P0–P4의 중복 표·중간 보류·인수인계 문서는 삭제했다. 현재 판정에 필요한 증거와 당시 cut의 한계만 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)에 남긴다. 과거 관측을 최신 소스의 재검증으로 세지 않는다.

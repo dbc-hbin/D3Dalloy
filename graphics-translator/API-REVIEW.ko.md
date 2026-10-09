@@ -50,13 +50,13 @@ Pristine GPTK D3DMetal4.0b2의 reference는 MPL이 Exposure.Scale을 읽지 않�
 
 ### 4. Architecture와 실제 consumer
 
-MSVC parameter facade의 현재 Meson target은 x64/i686/ARM64/ARM64EC를 구분하고 paired ARM64X packaging을 지원한다. 10월7일 direct isolated FEX x64 NGX/NGX-contracts/FSR SR의 지정 실행 기록이 있으며 ARM64/FEX는 과거 보류 상태가 아니다. Native x86 Metal4FX의 CPU-pointer 누락과 아직 실행되지 않은 경로는 [새 리뷰](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)에 분리한다. 다른 ABI의 build/기존 실행을 이 경로의 acceptance로 바꾸지 않는다.
+MSVC parameter facade의 현재 Meson target은 x64/i686/ARM64/ARM64EC를 구분하고 paired ARM64X packaging을 지원한다. 10월7일 direct isolated FEX x64 NGX/NGX-contracts/FSR SR의 지정 실행 기록이 있으며 ARM64/FEX는 과거 보류 상태가 아니다. Native x86 Metal4FX CPU-pointer 수정의 wrapper·FEX x86/x64 검증과 아직 실행되지 않은 전체 효과 경로는 [새 리뷰](../docs/D3D12-REVIEW-AND-DESIGN-2026-10-07.md)에 분리한다. 다른 ABI의 build/기존 실행을 이 경로의 acceptance로 바꾸지 않는다.
 
 Synthetic loader는 system32 DLL을 직접 요청한다. 실제 게임/Streamline의 owned core DLL 선택·public NGX calls·queue encode·출력의 연결 관찰은 아직 필요하다. Vendor identity 또는 registry gate만으로 실제 loader 성공을 선언하지 않는다.
 
 ## 2026-10-01 전체 번역기 review와의 관계
 
-별도 [D3D12 translation review](../docs/D3D12-TRANSLATION-REVIEW-2026-10-01.md#implementation-dispositions--2026-10-02)의 **11건은 수정 또는 이미 수정됨**으로 disposition됐다. 그 문서의 initial finding/제안과 마지막 disposition을 구분한다. 당시 fixed 4 MiB arena의 memory-safety 수정 뒤 **retained chunk 성장**을 구현했다. 초기 4 MiB와 `max(요청, 4 MiB)` 추가 chunk는 기존 pointer·Metal buffer·GPU VA를 보존하고, native 길이·allocation 실패는 checked recording error/Close failure로 처리한다. [후속 focused proof와 경계](CORE-IMPLEMENTATION-STATUS.ko.md#rootindirect-arena-성장과-focused-proof)는 unlimited recording·물리 메모리 고갈·새 temporal/game proof가 아니다.
+별도 [D3D12 translation review](IMPLEMENTATION-HISTORY.ko.md#implementation-dispositions--2026-10-02)의 **11건은 수정 또는 이미 수정됨**으로 disposition됐다. 그 문서의 initial finding/제안과 마지막 disposition을 구분한다. 당시 fixed 4 MiB arena의 memory-safety 수정 뒤 **retained chunk 성장**을 구현했다. 초기 4 MiB와 `max(요청, 4 MiB)` 추가 chunk는 기존 pointer·Metal buffer·GPU VA를 보존하고, native 길이·allocation 실패는 checked recording error/Close failure로 처리한다. [후속 focused proof와 경계](CORE-IMPLEMENTATION-STATUS.ko.md#rootindirect-arena-성장과-focused-proof)는 unlimited recording·물리 메모리 고갈·새 temporal/game proof가 아니다.
 
 Shared fence publication, structured OOB, Metal 4 RTAS, shader shape, mapped-view lifetime, queue-wide timestamp, wrapping view-location의 과거 finding을 현재 temporal blocker로 복사하지 않는다. Timestamp baseline hardware도 after regression을 통과했다는 기록은 static contract fix와 failing-before GPU proof를 구분하는 사례다.
 

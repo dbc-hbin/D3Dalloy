@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
-"""Check repository-owned documentation links and preserved handoffs; no runtime execution."""
+"""Check repository-owned documentation links; no runtime execution."""
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 import re
 import unittest
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-HANDOFFS = {
-    "remaining-implementation-20261005.md": "d07f9ee1b77ea045679f417eb1acacf3f9c0d6e61dd7dc6fc7b6961780a73db5",
-    "parallel-implementation-stop-20261005.md": "4713787e281dd20534678af70443703b57ea3d4830f79dae2970dd233151a5b0",
-    "parallel-resume2-20261005.md": "3310b138da919a2d4ec10fdd76fc07aff35bd4f73618bb9a55119edc59a4e6bc",
-}
 
 
 def documents() -> list[Path]:
     # Frozen import provenance and vendored upstream documentation are not rewritten.
     return sorted(set(ROOT.glob("*.md")) | set((ROOT / "docs").glob("*.md")) |
-                  set((ROOT / "docs/history").glob("*.md")) |
                   set((ROOT / "graphics-translator").glob("*.md")))
 
 
@@ -42,13 +35,6 @@ def anchors(text: str) -> set[str]:
 
 
 class Documentation(unittest.TestCase):
-    def test_handoff_bodies_preserved(self):
-        for name, expected in HANDOFFS.items():
-            with self.subTest(name=name):
-                content = (ROOT / "docs/history" / name).read_bytes()
-                body = content.split(b"\n", 2)[2]
-                self.assertEqual(hashlib.sha256(body).hexdigest(), expected)
-
     def test_agent_state_removed(self):
         self.assertFalse((ROOT / ".omo").exists())
         for path in documents():

@@ -1,16 +1,62 @@
-# ZZZ workload의 역사적 static·runtime 관찰
+# ZZZ workload의 실행·호환성 관찰
 
 ## 현재 문서의 역할
 
-이 문서는 **2026-09-18~19의 특정 ZZZ 설치·당시 runtime 관찰 기록**이다. 현재 프로젝트의 완료 목표나 지원 matrix가 아니다. 현재 목표는 최신 공개 D3D12/DXGI/shader 의미를 구현하는 범용 자체 번역기와 ARM64 Wine/FEX 기반 Rosetta 제거다([CORE 목표](CORE-IMPLEMENTATION-STATUS.ko.md#개발-목표와-우선순위)). ZZZ는 여러 실제 workload 중 하나다.
+이 문서는 **2026-10-09의 격리 DLSS·precompile·FEX 최적화 증거와 2026-09-18~19의 역사적 관찰 기록**을 구분한다. 현재 제품 범위는 Metal을 통한 D3D12 게임 실행이며, ZZZ 한 workload의 성공을 전체 지원 matrix나 프로젝트 완료로 일반화하지 않는다([CORE 목표](CORE-IMPLEMENTATION-STATUS.ko.md#개발-목표와-우선순위)).
 
 현재 compiler는 DXMT airconv·LLVM·자체 AIR 경로다. Apple Metal Shader Converter, SPIR-V, GPTK/D3DMetal compiler/runtime fallback을 현재 제품 경로로 남기지 않는다. 아래 Apple SDK·dxil-spirv 실험은 **당시 선택과 CPU/GPU 실험의 역사**이며 현재 지원 증거가 아니다. 공개 Metal/MetalFX 사용은 자체 compiler와 양립한다.
 
 현재 D3D12 NGX와 temporal COM 경로는 구현됐고 Metal 4 named fixture acceptance도 관찰됐다. 옛 FL11_0/OPTIONS5 미구현/DXIL E_NOTIMPL 표를 현재 support로 읽지 않는다. 현재 선언·검증 범위는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#현재-지원-상태), NGX current integration은 [NGX-INTEGRATION](NGX-INTEGRATION.ko.md)가 기준이다.
 
-**현재 루트로 실제 ZZZ 렌더링·Streamline loader 선택이 성공했다는 새로운 관찰은 없다.** Synthetic GPU readback, DLL load, 창 생성, vendor identity 변경만으로 게임 PASS를 선언하지 않는다. Physical compositor/HDR scanout도 미검증이다. 이번 문서 개편은 게임·GPU를 실행하지 않았다.
+**2026-10-09에는 owned NGX의 실제 Streamline 로딩과 DLSS 도시 출력·끄기/켜기 재생성을 확인했다.** 아래 지정 실행의 증거이며, 장시간 성능·DLSS 모델 동등성·physical HDR scanout은 이 판정에 포함하지 않는다. 같은 날 별도 실제 precompile 경로의 root-signature binding 진단·자동 PSO 캐시 재스캔·리소스 검사 완료와 그 뒤 최종 candidate 도시 출력은 [아래 별도 절](#2026-10-09-실제-precompile-경로-진단과-자동-pso-캐시-재스캔)에 구분해 기록한다.
 
 아래 `build/owned-*`/`build/dlss-*` 경로·hash는 당시 식별자다. Build 삭제로 유실된 옛 logs/JSON/PE를 현재 retained artifact처럼 표현하지 않는다. 관찰 기록은 유지하되 [CORE 증거 ledger](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)의 recovery retained proof와 분리한다. Frozen patch/upstream lock/provenance는 변경하지 않는다.
+
+## 2026-10-09 owned NGX 로딩과 DLSS 검은 화면 복구
+
+Live 설치와 prefix를 건드리지 않은 APFS 복제본에서 Wine11.17/ARM64X/FEX, owned D3D12·NGX·MetalFX 경로를 실행했다. [실게임 결과](../build/local/zzz-dlss-fix-20261009/dlss-run-02/result.json)는 source-cut·runtime manifest·서명된 NGX의 SHA-256과 실제 호출·화면·종료 증거를 묶는다.
+
+- **초기화:** 게임의 Streamline2.11.1.da40c631은 unsigned core를 `CRYPT_E_NO_MATCH`로 거부했다. Owned publisher의 실제 Authenticode 서명과 해당 Wine prefix 안의 공개 인증서 등록으로 일반 SDK 경로를 통과했다. NVIDIA 서명 가장, 검증 우회, 게임 DLL 교체는 없다. Fresh-prefix 기본 Wine 등록 증거는 [enrollment](../build/local/zzz-ngx-enrollment-20261009/EVIDENCE.txt), 배포 계약은 [Runtime](RUNTIME.ko.md#선택적-owned-nvidia-extension)을 따른다.
+- **매 프레임 실패:** feature 생성은 성공했지만 `EvaluateFeature`가 첫 required-resource 조회에서 `MissingInput(0xbad0000a)`을 반환했다. Streamline의 `Set(void*)`와 owned store의 `Get(ID3D12Resource**)` 사이 alias 변환 누락을 수정했다. 이후 실제 게임의 parse는 input624×360·pre_exposure1로 성공하고 backend는 `HRESULT 0`을 반환했다.
+- **실제 출력:** DLSS/성능 우선, FG·RT 끄기에서 캐릭터·건물·텍스처를 확인했다. 같은 process·순찰 부스 위치의 [끄기](../build/local/zzz-dlss-fix-20261009/dlss-run-02/dlss-city-off.png)와 [다시 켜기](../build/local/zzz-dlss-fix-20261009/dlss-run-02/dlss-city-reenabled.png) 모두 렌더링되며 후자는 MetalFX temporal624×360→1280×720을 표시한다. 이는 NVIDIA neural model 실행이나 품질·성능 동등성 증거가 아니다.
+
+도시 실행의 실패-input directory는 비어 있었다. 도시 성공은 사용자가 보고한 프리컴파일의 root-signature binding 오류나 완료 여부를 해결했다는 증거가 아니며, 그 입력은 아래 별도 실제 precompile 경로에서 64쌍 전부 재현·진단했다. 목적을 마친 이전 실험 payload는 삭제하고 [retirement 기록](../build/local/zzz-dlss-fix-20261009/dlss-run-02/retirement.log)과 로그·manifest·화면을 보존했다. 이 진단의 최종 `builds/cache-04/runtime`은 후속 FEX 최적화의 비교 기준본이며, 최신 통합 후보는 아래 FEX 절을 따른다.
+
+## 2026-10-09 실제 precompile 경로 진단과 자동 PSO 캐시 재스캔
+
+`precompile-run-01`~`03`은 위 도시 실행과 **별개의 실제 precompile 관찰**이다. 증거 root는 `build/local/zzz-dlss-fix-20261009`다.
+
+### root-signature binding 진단
+
+- **원인 확정:** 원본 실패64쌍은 [binding 진단](../build/local/zzz-dlss-fix-20261009/precompile-run-01/binding-diagnosis/result.txt)과 [전량 replay](../build/local/zzz-dlss-fix-20261009/precompile-run-01/replay/all/aggregate.json)에서 owned compiler와 pristine GPTK4.0b2 **양쪽 모두 64/64 거부**됐다. 대표 PS는 root가 t0..t7만 덮는데 shader가 absolute register8(t8)을 실제로 사용한다. Owned binding lookup의 off-by-one·class·rangeID/stage 오류는 없으며 root 확장이나 permissive mapping으로 고치지 않았다.
+- **게임 쪽 입력:** [warmup caller 분석](../build/local/zzz-dlss-fix-20261009/precompile-run-01/warmup-caller/result.txt)은 Unity가 direct warmup 경로에서 실제 serializer에 SRVcount8·register0·space0을 넘겨 이 root를 직접 생성함을 관찰했다. 실패한 `CreateGraphicsPipelineState` HRESULT는 그 routine에서 로그·retry·전파 없이 무시되고 job 진행 counter는 계속 감소한다. 따라서 이 실패만으로 전체 진행이 멈춘다고 단정하지 않는다.
+- **금지 유지:** compiler validation 완화·실패 은폐·fake PSO로 이 쌍을 통과시키지 않는다. 진단용 synthetic root는 배포물이 아니다.
+
+### 자동 PSO 캐시 재스캔 제거
+
+- **실제 원인:** `WriteAutomaticPipelineCache`가 매 성공 publication마다 directory mutex 아래 12k 파일 전체를 다시 스캔했다. [실게임 fs_usage window](../build/local/zzz-dlss-fix-20261009/precompile-run-02/profile-analysis/summary.json)는 5.249429초 동안 owned `lstat64`+`listxattr` **1,969,438**행(전체의94.4%)을 기록했다.
+- **수정:** 16-byte named shared `AutomaticDiskAccounting`(bytes+valid)을 유지하고 rescan은 첫 실행·invalid·abandoned·quota 압박에만 한다. 퇴출은32MiB headroom batch, entry64MiB·disk256MiB 한도와 atomic temp→replace는 그대로다. 이미 존재하는 entry를 교체할 때 이중 계상하던 회계를 고쳤다.
+- **CPU realWinAPI proof:** 수정 전 [before-final](../build/local/zzz-dlss-fix-20261009/precompile-run-02/cache-regression/before-final/run.log)은 replacement-at-cap에서 실패했고, 수정 후 [after-final-03](../build/local/zzz-dlss-fix-20261009/precompile-run-02/cache-regression/after-final-03/run.log)는 contents/quota/cross-process/clear/failed-rename/abandonment/foreign 보존 invariants PASS다. 같은 test에서 fresh1KiB publication256회의 metadata enumeration이 before **256**회 → after **0**회다(초기 clear 제외).
+- **한계:** 최종 [실게임 window](../build/local/zzz-dlss-fix-20261009/precompile-run-03/profile-analysis/summary.json)는 5.248979초·owned `lstat64`/`listxattr` **0**행이지만 두 window는 서로 다른 workload다. **Controlled speedup·CPU-time·FPS 증거가 아니다.**
+- **Native profile:** 최종 native [sample](../build/local/zzz-dlss-fix-20261009/precompile-run-03/precompile-native.sample.txt)은 cache directory 전수 enumeration 대신 SM50/LLVM compile 경로와 다수 thread의 service 대기가 지배한다.
+
+### 리소스 검사 완료 상태
+
+Root가 [최종 리소스 검사 dialog](../build/local/zzz-dlss-fix-20261009/precompile-run-03/progress-during-evidence-update.png)를 직접 확인했다. "클라이언트가 완전해 복구가 필요하지 않습니다"와 green 확인이 표시되고 별도 compile progress는 없다. 앞서 관찰한 진행률1.13→1.98→10.76에 이어 이 리소스 검사/precompile 흐름은 cache-04에서 **실제로 종료**했다([identity](../build/local/zzz-dlss-fix-20261009/precompile-run-03/identity.sha256), [retirement](../build/local/zzz-dlss-fix-20261009/precompile-run-03/retirement.log)).
+
+이것은 **모든 invalid shader/root 쌍이 컴파일됐다는 뜻이 아니다.** 위64쌍은 계속 올바르게 거부되고, 같은 실행에서도 실패 입력64개가 다시 기록됐다(run-01과62개 중복, 2개는 새 입력). 남은 compile 오류와 이 완료 판정을 구분한다.
+
+**최종 candidate 도시 출력:** 완료된 precompile 뒤 같은 실행의 [도시 출력](../build/local/zzz-dlss-fix-20261009/precompile-run-03/dlss-city-output.png)에서 캐릭터·건물·보도·나무·텍스처가 렌더링되고 MetalFX temporal624×360→1280×720이 표시된다. 같은 실행의 [그래픽 설정](../build/local/zzz-dlss-fix-20261009/precompile-run-03/graphics-settings-visible.png)은 초해상도 DLSS·품질 등급 성능 우선·프레임 생성 끄기·레이 트레이싱 끄기다. 실행 identity·QA·한계는 [result.json](../build/local/zzz-dlss-fix-20261009/precompile-run-03/result.json)이 묶는다. 이는 controlled FPS·frame-time·장시간 stutter 완료 증거가 아니며 duration을 추론하지 않는다.
+
+## 2026-10-09 FEX 최적화와 재검증
+
+별도 FEX-darwin에서 IR 블록 끝의 반복 탐색을 줄였다. 실제 emitter의 동일 입력 8,192개 블록 비교에서 head-fixed 탐색은 100,651,008회에서 8,191회로, CPU 시간 중앙값은 113.993ms에서 0.108ms로 감소했다. 출력 일치·ASan/UBSan과 Wine CPU/ABI 회귀 34개를 통과했다. 이는 해당 JIT 작업의 비용 감소이지 게임 전체 로딩·FPS·스터터링 개선율이 아니다.
+
+[최종 결과](../build/local/zzz-fex-opt-20261009/result.json)는 소스/DLL identity, 검사와 한계를 묶는다. `candidate-03`의 [DLSS 설정](../build/local/zzz-fex-opt-20261009/candidate-03/dlss-settings-confirmed.png)과 [실제 출력](../build/local/zzz-fex-opt-20261009/candidate-03/city-dlss-01.png)에서 DLSS/성능 우선·FG/RT 끄기, 캐릭터·NPC·실내 텍스처와 MetalFX temporal624×360→1280×720을 확인했다. NGX resource parse는 result1, backend는 hr0이었다. 한 장면의 렌더링 회귀이며 장시간 플레이·명시적 Metal validation-layer·전체 precompile 재실행 검증은 아니다.
+
+초기 진단 런처가 공백이 있는 `dxgi.customDeviceDesc`를 따옴표 없이 덮어써 GPU 이름이 `NVIDIA`로 잘리고 DLSS 항목이 숨겨졌다. 중복 override를 제거하고 내장 ZZZ 프로필을 쓰자 같은 FEX/runtime에서 복구됐다([설정 문법](../docs/CUSTOMIZATION.md#file-environment-and-precedence)). Streamline의 `eErrorFeatureFailedToLoad` 경고는 정상 실행에도 있으므로 그 문자열만으로 DLSS SR 실패를 판정하지 않는다. 이 잘린 이름/TAA 상태에서 얻은 앞선 FEX 프로파일은 DLSS 성능 증거가 아니며, 서로 다른 로딩 window를 전후 속도 비교로 합치지 않는다.
+
+최신 후보는 `build/local/zzz-fex-opt-20261009/runtime`이다. 임시 게임·prefix·진단 앱과 소유한 임시 JIT 맵은 종료 확인 뒤 정리했고, 증거와 비교 기준본을 보존했다. 실사용 게임·prefix는 수정하지 않았다.
 
 ## 2026-09-19 정적 preflight의 입력
 
@@ -113,13 +159,12 @@ Baseline ZZZ profile은 AMD 1002/7340이었다. 후속 `zzz-nvext-startup-03`은
 
 이 결과는 **vendor identity만으로 당시 loader를 해결하지 못했다**는 증거다. 현재 NVAPI root 구현을 확인하지 않고 그 항목을 미구현 priority로 다시 나열하지 않는다. 지원하지 않는 opcode를 지원한다고 광고해서도 안 된다. Registry/NVEXT gate가 있는 현재 staging policy와 실제 게임 loader 선택 관찰은 별개다.
 
-## 아직 필요한 실제 workload acceptance
+## 확인한 범위와 남은 실제 workload 검증
 
-다음은 **계획/미관찰 acceptance**이며 이번 작업에서 실행한 결과가 아니다.
+10월9일 지정 실행에서는 runtime/module identity, shader/root 실패 입력, owned NGX 호출과 MetalFX 도시 출력을 확인했다. 아래 항목은 이 제한된 성공과 별개로 남아 있다.
 
-1. 현재 root compiler·binding·runtime의 hash를 고정하고 원본과 분리한 runtime/game/prefix에서 PSO/resource 오류와 실제 content 출력을 함께 관찰한다.
-2. Streamline adapter 판단 → loaded owned nvngx identity → public D3D12 NGX calls → queue execution → Metal4FX encode → 같은 frame output을 연결한다.
-3. 필요한 실제 typed view·resource states·queue wait/signal·replay shape를 기록한다. Static engine DXR/ExecuteIndirect 문자열을 actual scene usage로 간주하지 않는다.
-4. Physical presentation/HDR signal·performance는 GPU texture readback과 다른 관찰을 요구한다.
+1. 다른 장면·장시간 실행의 typed view·resource state·queue wait/signal·replay와 오류 경로. Static engine DXR/ExecuteIndirect 문자열은 actual scene usage 증거가 아니다.
+2. 전체 호출·queue·native encode·실제 표시를 동일 frame identity로 연결하는 완전한 추적. 현재 NGX 로그·HUD·화면 관찰을 이 추적 전체의 증명으로 확대하지 않는다.
+3. 동일 조건의 cold/warm 로딩, frame-time 분포·스터터링·화질 및 physical presentation/HDR signal. 개별 JIT 벤치마크와 GPU texture readback은 이를 대신하지 않는다.
 
 Live 게임 설치/설정/기존 prefix를 수정하는 CLI recipe는 제공하지 않는다. 먼저 [NGX-TEST](NGX-TEST.ko.md)·[TEMPORAL-TEST](TEMPORAL-TEST.ko.md)의 fresh synthetic recipe를 사용한다. 현재 범용 번역기 우선순위는 [CORE 남은 구현 후보](CORE-IMPLEMENTATION-STATUS.ko.md#남은-구현-후보)가 관리하며, 이 역사적 게임의 startup 성공을 전체 프로젝트 완료로 삼지 않는다.

@@ -34,6 +34,8 @@ Create/frame descriptor의 첫 필드는 `UINT StructSize`이며 backend는 정�
 
 현재 fixture의 layout assertion은 create40 bytes, frame x64 400/x86 348 bytes, Color offset x64 8/x86 4다. Pointer-bearing COM descriptor의 이 수치를 다른 guest ABI에 무조건 적용하지 않는다. Metal 4 guest/native fixed-width bridge POD와도 별개의 ABI다. Backend는 추가 DLL-private internal QI로 state를 검증하며 arbitrary IUnknown을 concrete state layout으로 재해석하지 않는다.
 
+Public parameter store는 D3D12 resource의 `void*`/`ID3D12Resource*` Set/Get alias를 보존한다. Streamline이 Color/Output/Depth/MotionVectors를 `void*`로 저장해도 required-resource 조회가 이를 누락으로 취급하지 않는다. 숫자나 typed D3D11 resource를 D3D12 resource로 변환하지 않으며, missing key와 저장된 null은 구분한다. CPU 계약 회귀는 `scripts/test-owned-ngx-frontend.py --parameter-cpu-only --out <fresh-output>`으로 실행하고 공식 MSVC facade ABI 검사와 구분한다.
+
 ## Record-time resource·generation 준비
 
 `src/d3d12/d3d12_temporal.cpp`의 Prepare는 resource를 resolve/retain하고 scalar·format·bounds를 검사한다.
@@ -52,9 +54,9 @@ R32 conversion은 `d3d12_temporal.cpp`의 lazy Metal4 compute pipeline과 privat
 
 ## Owned FSR public API와 provenance
 
-`src/fsr`의 x64 `amd_fidelityfx_upscaler_dx12.dll`은 AMD public **upscaler API4.0.3** header 기반 C facade다. [`fsr.def`](../src/fsr/fsr.def)의5 exports는 `ffxConfigure@1`, `ffxCreateContext@2`, `ffxDestroyContext@3`, `ffxDispatch@4`, `ffxQuery@5`이며 provider **`4d46580000000001`**/MetalFX를 보고한다. Backend는 위 owned temporal COM 경로를 재사용한다. Public AMD API를 소비한다는 사실은 AMD FSR 모델 실행·image-quality equivalence가 아니다.
+`src/fsr`의 x64/WoW64 `amd_fidelityfx_upscaler_dx12.dll`은 AMD public **upscaler API4.0.3** header 기반 C facade다. [`fsr.def`](../src/fsr/fsr.def)의5 exports는 `ffxConfigure@1`, `ffxCreateContext@2`, `ffxDestroyContext@3`, `ffxDispatch@4`, `ffxQuery@5`이며 provider **`4d46580000000001`**/MetalFX를 보고한다. Backend는 위 owned temporal COM 경로를 재사용한다. Public AMD API를 소비한다는 사실은 AMD FSR 모델 실행·image-quality equivalence가 아니다.
 
-SR의 dynamic render/output·masks·high-res/jittered MV·RCAS·linear/sRGB/PQ·manual exposure와 source-owned FG의 Prepare/Generate·history·SDK swapchain/UI/pacing proxy는 full port에 연결됐다. 지원 범위·제한·public x64와 backend 양 ABI proof는 [CORE SR/FG 계약](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료)에만 유지한다. API query나 native 기능 존재를 실제 dispatch·presentation·품질 증거로 대신하지 않는다.
+SR의 dynamic render/output·masks·high-res/jittered MV·RCAS·linear/sRGB/PQ·manual exposure는 기존 temporal 경로다. FG는 원본 MIT AMD SDK pin `0836aa7f24058b3f8d035a88c0774457d78fc98e`의 source-built swapchain/UI/pacing과 기존 WMTMetal4FG native MetalFX generation을 사용한다. SDK 원문·local adaptations의 출처는 [`src/fsrfg/PROVENANCE`](../src/fsrfg/PROVENANCE)에 있다. 지원 범위와 역사적/public 증거는 [CORE SR/FG 계약](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료), 현행 native FG acceptance 보류는 [현재 경계](CORE-IMPLEMENTATION-STATUS.ko.md#multi-frame-fg와-native-residency-현재-경계)를 따른다. API query나 native 기능 존재를 실제 dispatch·presentation·품질 증거로 대신하지 않는다.
 
 Headers의 read-only reference는 `/Users/hanbinnoh/Documents/zzz-wine-yaagl-pr-runtime/d3dmetal-pso-cache/third-party/fidelityfx/Kits/FidelityFX`다. 아래4 files는 reference와 byte-identical로 확인했으며 원문 notices/bytes를 유지한다. [AMD MIT license](../src/fsr/LICENSE)는 header에 적용되고 owned implementation의 SPDX는 LGPL-2.1-or-later다. Reference backend/D3DMetal/proprietary 구현 소스를 복사하지 않았다. Retained original NGX DLL은 **proprietary prebuilt binary**이며 source-copied 구현이 아니다. Frozen import lock/patches/provenance는 변경하지 않는다.
 
@@ -85,13 +87,13 @@ effectiveReset = recordedCallerReset || lastExecutedGeneration != thisGeneration
 
 ## Runtime publication
 
-`stage-owned-graphics.py stage --with-nvngx`는 owned marker `own-ngxd3d12`와 required D3D12 exports를 검증한 뒤 DLL을 stage/hash한다. x64 wrapper는 `nvngx=b`를 사용하고 vendor extension 선택 시 `DXMT_ENABLE_NVEXT=1`을 내부에서 설정한다. NVNGX/NVAPI를 둘 다 선택하지 않으면 inherited NVEXT를 제거하고 vendor DLL fallback을 막는다. DXGI NVEXT setup의 `NGXCore\\FullPath` 등록만으로 실제 Streamline lookup이 증명되지는 않는다.
+`stage-owned-graphics.py stage --with-nvngx`는 owned marker `own-ngxd3d12`와 required D3D12 exports를 검증하고, [실제 Authenticode 서명·prefix 한정 공개 인증서 등록](RUNTIME.ko.md#선택적-owned-nvidia-extension)을 포함한 DLL을 stage/hash한다. Wrapper는 `nvngx=b`를 사용하고 vendor extension 선택 시 `DXMT_ENABLE_NVEXT=1`을 내부에서 설정한다. NVNGX/NVAPI를 둘 다 선택하지 않으면 inherited NVEXT를 제거하고 vendor DLL fallback을 막는다. DXGI NVEXT setup의 `NGXCore\\FullPath` 등록만으로 실제 Streamline lookup이 증명되지는 않는다.
 
 `nvngx_dlss.dll`의 feature-plugin exports와 core-style `nvngx.dll` API는 동일 surface가 아니다. Synthetic PE는 system32 core DLL을 직접 요청한다. 실제 앱의 loader 선택, Streamline adapter 판단, public NGX 호출, queue encode, 출력까지의 관찰을 별도로 요구한다. 게임 plugin을 static 추측만으로 교체하지 않는다.
 
 ## 증거와 남은 경계
 
-Metal 4 temporal readback·replay·completion은 이미 관찰된 fixture 증거다. [CORE 검증 범위](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)의 recovery proof를 따른다. 이 문서 개편에서 GPU·게임을 새로 실행한 것은 아니다.
+Metal 4 temporal readback·replay·completion은 [CORE 검증 범위](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거)의 지정 fixture 증거다. 별도로 2026-10-09 ARM64 Wine/FEX 격리 ZZZ에서 일반 Streamline 로딩·NGX 입력 파싱·DLSS 도시 출력과 끄기/켜기 재생성을 [실제 관찰](ZZZ-COMPATIBILITY.ko.md#2026-10-09-owned-ngx-로딩과-dlss-검은-화면-복구)했다. 이를 다른 게임·모델 품질·프리컴파일 완료로 일반화하지 않는다.
 
 - `temporal` COM fixture는 x64/WoW64 범위와 NGX frontend proof를 구분한다.
 - `ngx`/`ngx-contracts`는 현재 x64 frontend 범위다. ARM64 Wine/FEX guest↔native NGX end-to-end proof가 아니다.
@@ -110,23 +112,25 @@ NVIDIA public SDK defs와 June2026 FG/August2026 RR integration guide의 실제 
 | 5 | VideoSuperResolution | NGX video SR backend 없음; temporal SR alias 없음 |
 | 9 | ImageSignalProcessing | NGX image signal-processing backend 없음 |
 | 10 | DeepResolve | NGX DeepResolve backend 없음; ordinary SR alias 없음 |
-| 11 | FrameGeneration | count1..4 owned PE D3D12 phase backend → retained batch/actual GPU outcome → public per-index output; count1 추가 출력 texture 없음 |
+| 11 | FrameGeneration | 기존 WMTMetal4FG → native MetalFX FrameInterpolator; 최대 count/index1, caller-owned 단일 output·Present/pacing |
 | 12 | DeepDVC | NGX 색/채도 enhancement backend 없음 |
 | 13 | RayReconstruction | 실제 Metal4FX TemporalDenoisedScaler; noisy color+diffuse/specular albedo+world normals+roughness+depth/MV+copied matrices; optional specular hit distance |
 
 Reserved0/6–8/14–18, Count, SDK/Core/Unknown sentinel은 feature가 아니다. 미지원 enum의 Create/GetScratch/GetFeatureRequirements는 FeatureNotSupported다. RR availability의 공식 이름은 `SuperSamplingDenoising.Available`이다. RR/FG는 실제 native device capability를 조회하며 기존 MSVC parameter ABI·opaque handles를 유지한다.
 
-FG multi-frame 계약은 [NVIDIA/DLSS `3749594` public params](https://github.com/NVIDIA/DLSS/blob/374959484e79a640feaba44c93ac8cfb0a03f5b5/include/nvsdk_ngx_params_dlssg.h)의 `MultiFrameCount=N`·`MultiFrameIndex=1..N`이다. `DLSSG.OutputInterpolated`는 배열이 아니라 **해당 Evaluate의 단일 출력**이다. 첫 index가 같은 real-frame pair의 N개 phase `(i+1)/(N+1)`를 한 번 생성하고, 후속 index는 retained batch의 선택된 phase만 public output으로 발행한다. 동일 pair의 frame ID·입력 resource·guide scalar 변경이나 순서가 어긋난 index를 거부한다. Recordings는 context/resources/outcome을 소유하며 Evaluate에서 GPU를 기다리거나 결과를 polling하지 않는다.
+공식 [NVIDIA/DLSS `3749594` public params](https://github.com/NVIDIA/DLSS/blob/374959484e79a640feaba44c93ac8cfb0a03f5b5/include/nvsdk_ngx_params_dlssg.h)의 `MultiFrameCount`·`MultiFrameIndex` 중 현재 지원은 count=1/index=1뿐이다. `DLSSG.MultiFrameCountMax=1`; higher count/index는 UnsupportedParameter, zero는 InvalidParameter다. `DLSSG.OutputInterpolated`는 해당 Evaluate의 단일 출력이며 AMD phase DXIL·multi-phase output bank는 없다. Shared FSR/NGX generation은 `d3d12_frame_generation.cpp`를 통해 기존 native MetalFX로 번역한다.
 
-공식 optional `DLSSG.OutputDisableInterpolation`은 최소4-byte GPU buffer이며 첫 byte의 true가 generated presents 억제를 뜻한다. 발행은 실제 GPU-retired 결과가0이면 출력 texture를 건드리지 않고 flag1, 유효한 선택 phase이면 flag0을 기록한다. First/reset/stale/disabled/scene-change의 실제0은 real history bootstrap을 제출하되 CopyCurrent 대체를 만들지 않는다. NGX caller가 단일 public output과 flag를 소비·pacing하며 ordinary DXGI Present에 별도 generated frame을 주입하지 않는다. SDK에 없는 output-array/presentation callback parameter를 만들지 않는다. 구현 계약과 GPU·품질 검증 결과는 분리한다.
+공식 optional `DLSSG.OutputDisableInterpolation`의 non-null 요청은 UnsupportedParameter다. Public MetalFX는 output texture를 쓰지만 generated-versus-copied actual-count/status API를 제공하지 않는다. Pristine GPTK도 이 key를 무시한다. Bootstrap/reset의 current-color output이나 encode 성공에서 flag/count를 꾸미지 않는다. SDK generated-role callback, native warm-up과 실제 physical display는 독립 관찰 대상이다. NGX caller가 output을 소비하고 Present/pacing을 소유하며 ordinary DXGI Present에 generated frame을 주입하지 않는다.
 
-NGX는 CPU `GetFrameGenerationResult` consumer가 아니다. 마지막 indexed publication을 기록한 뒤 `RetireFrame(frame, FALSE, ...)`로 결과 조회용 metadata 소유권을 명시적으로 반납한다. 새 monotonically newer real pair가 남은 index를 요청하지 않은 이전 pair를 대체하면 그 이전 lookup도 반납한다. 이미 기록한 publication은 immutable producer/batch를 계속 소유하며, pending 결과는 검증된 GPU completion에서 수거하므로 retirement가 queue 작업·real history bootstrap·closed-list replay를 취소하지 않는다. timer나 임의 frame-count window로 결과를 만료시키지 않는다.
+이미 기록된 native command는 resources/context를 GPU retirement까지 보유한다. Closed-list replay는 native 작업을 다시 encode하며 immutable-result/no-op replay가 아니다. Context metadata retirement는 기록된 GPU 작업을 취소하지 않는다. Native history reset, snapshot·queue ordering과 수명 보호는 번역 책임이며 별도 AMD scene-cut/actual-count classifier를 유지하지 않는다.
 
-Shared/public count1도 실제 GPU scene-change 결과가 필요한 SDK phase 경로를 사용한다. Native MetalFX encode의 BOOL 성공을 generated-count 증거로 간주하지 않는다. 따라서 과거 count1 MetalFX와 알고리즘·성능이 같다는 주장은 없으며 기본 count1의 실게임 FPS/품질 회귀 비교가 별도로 필요하다.
+FSR의 presentation/UI/pacing은 원본 pinned MIT AMD SDK source-built 경로이며 x64/WoW64를 유지한다. Generated output 최대1개이고 FSR2–4 요청은 NO_PROVIDER다. SDK ordinary ResizeBuffers를 유지하고 ResizeBuffers1 success-only stub은 E_NOTIMPL로 바꿨다. Custom per-buffer queue 확장이나 새 async Present 오류 protocol은 없다. Root27/28/30/34의 AMD 알고리즘 proof는 역사적 기록이다. 현재 `build/local/fsr-metalfx-20261007-43df9ae7/runtime-verified`의 양 ABI FSR·NGX GPU·NGX Present 6개 실행이 API+Shader Validation으로 통과했다. FSR22/23(bootstrap1 skipped)·NGX formal9/9의 실제 표시와 한정된 genuine interpolation proof는 CORE를 따르며 실게임·native residency·Composition 증거와 구분한다.
 
 RR은 unpacked roughness.R 또는 packed normals.w, view-space/HW depth, guide subrect를 기록한다. Row-major left-multiplication matrices는 Evaluate에서 복사해 caller mutation과 분리한다. RR guide §3.7에 따라 SR exposure/auto-exposure는 neutral이며 ordinary SR를 실행하지 않는다. 별도 native 입력이 없는 RR2 guide/reflection-MV, alpha와 sharpening은 UnsupportedParameter로 거부한다.
 RR converter → native denoiser → output copy는 독립 native recording segments 사이의 queue producer barrier와 device visibility로 순서를 보장한다. Queue barrier의 `MTLStageAll`과 encoder-local fence scope는 구분하며, compute encoder의 fence update는 Dispatch/Blit/AccelerationStructure 범위만 사용한다. Fence·frame·scratch는 recording retirement까지 유지한다.
 Feature release는 idle ownership만 내려놓으며 이미 기록된 generation의 history를 reset하지 않는다. Caller reset=false인 동일 frame의 재실행은 immutable 입력을 유지하면서 history를 한 단계 진행한다. 독립 control의 `replay` 모드는 native1..8 뒤 동일8을 reset=false로 다시 실행하며, frame8과 replay를 각각 비교한다. `.inputs`는 baseline/mirror의 uploaded guide bytes와 독립 literal SIMD matrix·jitter·reset이 public 입력과 byte-identical인지 검사한다. Wine x64와 비교할 native control은 `-arch x86_64`로 빌드하고 동일한 API+Shader validation 환경에서 실행해야 하며, ARM64 control은 별도 비교 자료다. `rotate`/`rotate-replay`는 이전 texture versions를 유지한 채 매 frame texture identity만 교체하는 독립 원인분리 control이다.
+
+현재 RR 생성부와 독립 control은 private `setVersion:0x10000`으로 Apple non-fused Metal4 GPU backend를 선택한 뒤 public factory/encode를 사용한다. Control은 `requested_private_version=65536`을 별도 기록하며 기존 `source=public-metalfx-denoiser` marker만으로 public-only 설정이라고 해석하지 않는다. 선택자가 없으면 기존 Unsupported 경로로 거부한다. macOS27.0.1/M5 Pro의 native50 frame·양 ABI 각각36출력은 validation 오류0·native RGB 오차0으로 통과했다. [현재 proof](CORE-IMPLEMENTATION-STATUS.ko.md#rr-native-validation-재검증--2026-10-07)이며 아래 기본 fused 경로의 과거 실패 기록을 덮어쓰지 않는다.
 
 Native control의 frame 로그는 encode 전 제출한 `reset`과 encode 후 getter의 `reset_after_encode`를 구분한다. Scene1·5는 reset=true를 제출하며, MetalFX가 request를 소비한 뒤의 getter=false를 제출값으로 해석하지 않는다.
 

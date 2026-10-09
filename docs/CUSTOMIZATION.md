@@ -9,6 +9,7 @@ Options use `prefix.name = value` syntax. The loader is [config.cpp](../src/util
 
 - `DXMT_CONFIG_FILE=/path/to/dxmt.conf` selects the file. If unset or empty, the filename is `dxmt.conf`, relative to the process working directory.
 - `DXMT_CONFIG="d3d12.preferredMaxFrameRate=30;dxgi.forceSDR=True"` supplies inline assignments separated by `;`.
+- Values containing spaces require double quotes inside the assignment, for example `DXMT_CONFIG='dxgi.customDeviceDesc="NVIDIA GeForce RTX 5060"'`. Without those inner quotes the value stops at the first whitespace. Prefer the existing application profile over a redundant adapter override; a truncated adapter name hid ZZZ's DLSS controls in an isolated diagnostic run.
 - For the same key, precedence is **built-in application profile < config file < `DXMT_CONFIG`**. Environment assignments are parsed after the file; built-in profiles fill keys not already supplied by the user.
 - Settings before the first section apply generally. An `[App.exe]` section is active only when its name matches the executable name; a nonmatching section is inactive until another matching section is selected.
 - Configuration is initialized through a **module-local** singleton, not a process-global configuration service shared by all DLLs. Set the file/environment before starting the application; this is not a live-reload API.
