@@ -240,7 +240,18 @@ float4 nullPS(Vertex v) : SV_Target { return 0; }
 struct Patch { float edge[3] : SV_TessFactor; float inside : SV_InsideTessFactor; };
 Patch patchMain(InputPatch<Vertex,3> input) { Patch p; p.edge[0]=p.edge[1]=p.edge[2]=1; p.inside=1; return p; }
 [domain("tri")][partitioning("integer")][outputtopology("triangle_cw")][outputcontrolpoints(3)][patchconstantfunc("patchMain")]
-Vertex hsMain(InputPatch<Vertex,3> input, uint id : SV_OutputControlPointID) { Vertex v=input[id]; v.value=compareCase(id); return v; }
+Vertex hsMain(InputPatch<Vertex,3> input, uint id : SV_OutputControlPointID) {
+  Vertex v=input[id];
+#ifdef CMP_GRAD
+  if (id == 0) exercise();
+#else
+  v.value=compareCase(id);
+#endif
+  return v;
+}
+[domain("tri")] Vertex nullDS(Patch p, float3 uv : SV_DomainLocation, const OutputPatch<Vertex,3> input) {
+  Vertex v=input[0]; v.position=input[0].position*uv.x+input[1].position*uv.y+input[2].position*uv.z; return v;
+}
 [domain("tri")] Vertex dsMain(Patch p, float3 uv : SV_DomainLocation, const OutputPatch<Vertex,3> input) {
   Vertex v=input[0]; v.position=input[0].position*uv.x+input[1].position*uv.y+input[2].position*uv.z; v.value=compareCase(1); return v;
 }

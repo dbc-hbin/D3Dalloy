@@ -32,6 +32,12 @@ Native MSL factorial 대조에서 Metal 3.2는 실패하고 Metal 4.0은 loop un
 
 Subrect/real/distortion의 이전 runtime payload는 검증 종료와 open-file 부재 확인 후 정리했고 manifest·로그·capture는 보존했다. 최신 runtime-cmp와 peer 비교 runtime은 유지한다. 모든 이번 전용 GPU/producer prefix는 종료·제거했다.
 
+### 결합 HS target 리뷰 후속
+
+당일 전체 변경 리뷰에서 plain VS 뒤에 lazy-link되는 HS의 비교 명령을 target 선택이 놓치는 결함을 확인했다. [같은 새 fixture의 수정 전 실행](../build/local/gap-implementation-20261010/qa-advanced-texture-hull-before/result.json)은 `cmpgrad4_hs` row1에서 0을 반환해 기대값 1과 달랐다. 실행할 모든 DXIL stage의 요구 버전을 변환 전에 집계하고 cache version을 37로 올렸다. 실제 결합 AIR 대조는 HS-only gradient의 자동 Metal4.0 선택, ordinary3.2 유지, 명시적4.1 유지를 확인했다(`fix-hull-{auto,ordinary,410}.ll`).
+
+[수정 후 공개 실행](../build/local/gap-implementation-20261010/qa-advanced-texture-hull/result.json)은 기존54개와 HS-only6개 모두 PASS다. 같은 fresh runtime의 [tessellation120쌍](../build/local/gap-implementation-20261010/qa-tessellation-hull/result.json)은 warm expensive 작업0을 유지했고, [pipeline-library](../build/local/gap-implementation-20261010/qa-pipeline-library-hull/result.json)는 child restore4/cold0과 기존 수치·동시성 검사를 통과했다. Metal API/Shader Validation 오류·foreign backend 없이 종료했고 각 전용 prefix를 제거했다. Diagnostics110, native/paired 빌드와 x64/i686 consumer 컴파일도 PASS다. i686 GPU·실게임은 이 후속에서 실행하지 않았다. 최신 runtime은 `runtime-hull`이며 이전54개 및 SM6/FG 결과는 원래 cut의 증거로 유지한다.
+
 ## D3DMetal 최적화 첫 병렬 cut — 2026-10-10
 
 QA root는 `build/local/d3dmetal-opt-port-20261009/`다. [paired PE build](../build/local/d3dmetal-opt-port-20261009/paired-foundation/result.json)와 native build/install 후 격리 ARM64X/FEX에서 실행했다. `runtime-foundation2`는 SR 경계 수정이 추가된 native cut이며 이전 `runtime-foundation`의 비-temporal 결과와 구분한다. 모든 아래 positive GPU 실행은 Metal API/Shader Validation을 켰다.

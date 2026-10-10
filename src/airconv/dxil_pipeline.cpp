@@ -744,6 +744,17 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
   }
   // Resource lowering in every linked body uses this per-compilation target module.
   InitializeAtomic64Phase(*module, args);
+  // Bodies link lazily, after the converter selects its AIR target. Include every
+  // emitted stage now without lowering another stage with the wrong binding map.
+  SM50_SHADER_COMMON_DATA common{args, SM50_SHADER_COMMON, SM50_SHADER_METAL_310, {}};
+  SM50_SHADER_COMMON_DATA *requested_common = nullptr;
+  if (dxbc::args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(args, &requested_common))
+    common = *requested_common;
+  common.next = args;
+  for (const auto &stage : stages)
+    if (stage.info)
+      common.metal_version = dxbc::required_metal_version(*stage.info->module, common.metal_version);
+  args = reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common);
   // Reserve the wrapper name before creating it, but retain stage-local modules
   // until their bodies lower: resources from another stage must not be visited
   // with this stage's binding map.

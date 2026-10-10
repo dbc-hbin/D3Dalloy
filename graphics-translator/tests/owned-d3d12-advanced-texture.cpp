@@ -151,16 +151,23 @@ void runAdvanced(ID3D12Device *device, UINT shape, UINT bits, const wchar_t *sha
     context.list->SetComputeRootDescriptorTable(0, views->GetGPUDescriptorHandleForHeapStart());
     context.list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress()); context.list->Dispatch(1, 1, 1);
   } else {
-    const bool vertex = !std::strcmp(stage, "vs");
+    const bool vertex = !std::strcmp(stage, "vs"), hull = !std::strcmp(stage, "hs");
     // No-op companion stages are separately produced; no second stage can overwrite the tested buffer.
     other = readFile(vertex ? L"advanced-texture-null-ps.dxil" : L"advanced-texture-null-vs.dxil");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC p{}; p.pRootSignature = root.Get();
     p.VS = vertex ? D3D12_SHADER_BYTECODE{shader.data(), shader.size()} : D3D12_SHADER_BYTECODE{other.data(), other.size()};
     p.PS = vertex ? D3D12_SHADER_BYTECODE{other.data(), other.size()} : D3D12_SHADER_BYTECODE{shader.data(), shader.size()};
+    std::vector<uint8_t> domain, pixel;
+    if (hull) {
+      domain = readFile(L"advanced-texture-null-ds.dxil");
+      pixel = readFile(L"advanced-texture-null-ps.dxil");
+      p.HS = {shader.data(), shader.size()}; p.DS = {domain.data(), domain.size()};
+      p.PS = {pixel.data(), pixel.size()};
+    }
     p.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     p.SampleMask = D3D12_DEFAULT_SAMPLE_MASK; p.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     p.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; p.RasterizerState.DepthClipEnable = TRUE;
-    p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; p.NumRenderTargets = 1;
+    p.PrimitiveTopologyType = hull ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; p.NumRenderTargets = 1;
     p.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT; p.SampleDesc.Count = 1;
     check(device->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&pso)), "advanced graphics PSO");
     auto td = desc; td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; td.Width = td.Height = td.DepthOrArraySize = td.MipLevels = 1;
@@ -176,7 +183,8 @@ void runAdvanced(ID3D12Device *device, UINT shape, UINT bits, const wchar_t *sha
     context.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1}; D3D12_RECT scissor{0, 0, 1, 1};
     context.list->RSSetViewports(1, &viewport); context.list->RSSetScissorRects(1, &scissor);
-    context.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); context.list->DrawInstanced(3, 1, 0, 0);
+    context.list->IASetPrimitiveTopology(hull ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context.list->DrawInstanced(3, 1, 0, 0);
   }
   transition(context.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
   context.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, resultBytes);
@@ -254,7 +262,7 @@ int wmain() {
     runAdvanced(device.Get(), shape, bits, path, "cs");
   }
   for (UINT shape = 0; shape < 6; ++shape) {
-    for (const char *stage : {"cs", "vs", "ps"}) {
+    for (const char *stage : {"cs", "vs", "ps", "hs"}) {
       std::swprintf(path, 96, L"advanced-texture-cmpgrad%u-%hs.dxil", shape, stage);
       runAdvanced(device.Get(), shape, 0, path, stage, "cmpgrad");
     }
@@ -263,6 +271,6 @@ int wmain() {
       runAdvanced(device.Get(), shape, 0, path, stage, "cmpbias");
     }
   }
-  std::puts("OWNED_D3D12_ADVANCED_TEXTURE_PASS cases=54");
+  std::puts("OWNED_D3D12_ADVANCED_TEXTURE_PASS cases=60");
   return 0;
 }

@@ -11,6 +11,7 @@ compile() {
 }
 compile vs_6_7 nullVS null-vs
 compile ps_6_7 nullPS null-ps
+compile ds_6_7 nullDS null-ds
 for shape in 0 1 2 3 4 5; do
   for stage in cs vs ps gs hs ds as ms; do
     compile "${stage}_6_7" "${stage}Main" "cmp${shape}-${stage}" -DSHAPE=$shape

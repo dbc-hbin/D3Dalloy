@@ -223,8 +223,7 @@ void setup_temp_register(
   }
 }
 
-void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version) {
-  using namespace llvm;
+SM50_SHADER_METAL_VERSION required_metal_version(const llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version) {
   // Metal 3.2 miscomputes dynamic cube comparison gradients. Compute comparison bias
   // uses the same gradient path; both DXIL operations need the Metal 4.0 semantics.
   for (const auto &function : module) {
@@ -235,6 +234,12 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
     }
   }
   if (module.getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) metal_version = SM50_SHADER_METAL_410;
+  return metal_version;
+}
+
+void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version) {
+  using namespace llvm;
+  metal_version = required_metal_version(module, metal_version);
   auto &context = module.getContext();
   auto createUnsignedInteger = [&](uint32_t s) {
     return ConstantAsMetadata::get(ConstantInt::get(context, APInt{32, s, false}));

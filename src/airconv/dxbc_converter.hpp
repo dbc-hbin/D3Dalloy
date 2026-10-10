@@ -708,6 +708,7 @@ std::unique_ptr<BindingMap> setup_binding_rootsig(
     bool bind_signature_arguments = true
 );
 
+SM50_SHADER_METAL_VERSION required_metal_version(const llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version);
 void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version);
 
 void setup_temp_register(
