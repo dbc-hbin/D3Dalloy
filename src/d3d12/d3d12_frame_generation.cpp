@@ -79,9 +79,9 @@ HRESULT retainTexture(MTLD3D12Device *device, ID3D12Resource *input,
 }
 struct OwnedFrameGenerationFrame {
   std::shared_ptr<Core> core;
-  std::array<Com<MTLD3D12Resource, false>, 3> resources;
-  std::array<TextureViewRef, 3> views;
-  std::array<D3D12_RESOURCE_STATES, 3> states{};
+  std::array<Com<MTLD3D12Resource, false>, 5> resources;
+  std::array<TextureViewRef, 5> views;
+  std::array<D3D12_RESOURCE_STATES, 5> states{};
   WMT::Reference<WMT::Object> native;
   bool generate = false;
 };
@@ -139,6 +139,8 @@ public:
     std::memcpy(p.camera_right, desc.camera_right, sizeof(p.camera_right));
     std::memcpy(p.camera_forward, desc.camera_forward, sizeof(p.camera_forward));
     p.camera_info_present = desc.camera_info_present;
+    p.depth_subrect_x = desc.depth_subrect_x; p.depth_subrect_y = desc.depth_subrect_y;
+    p.motion_subrect_x = desc.motion_subrect_x; p.motion_subrect_y = desc.motion_subrect_y;
     std::lock_guard lock(core_->mutex);
     if (FAILED(hr = request(p.header, &frame->native))) return hr;
     if (!frame->native) return S_FALSE;
@@ -150,13 +152,21 @@ public:
     if (desc.num_generated_frames != 1) return DXGI_ERROR_UNSUPPORTED;
     if (desc.outputs[1] || desc.outputs[2] || desc.outputs[3] || desc.outputs[0] == desc.present_color ||
         (desc.hudless_color && desc.outputs[0] == desc.hudless_color)) return E_INVALIDARG;
+    if (desc.real_output && (desc.real_output == desc.outputs[0] || desc.real_output == desc.present_color ||
+        desc.real_output == desc.hudless_color)) return E_INVALIDARG;
+    if (desc.distortion && (desc.distortion == desc.outputs[0] || desc.distortion == desc.real_output)) return E_INVALIDARG;
     auto frame = std::make_shared<OwnedFrameGenerationFrame>(); frame->core = core_; frame->generate = true;
     HRESULT hr;
     if (FAILED(hr = retainTexture(device, desc.present_color, frame->resources[0], frame->views[0], false, false)) ||
         FAILED(hr = retainTexture(device, desc.outputs[0], frame->resources[1], frame->views[1], false, true))) return hr;
     if (desc.hudless_color && FAILED(hr = retainTexture(device, desc.hudless_color,
         frame->resources[2], frame->views[2], false, false))) return hr;
-    frame->states = {desc.present_color_state, desc.output_states[0], desc.hudless_color_state};
+    if (desc.real_output && FAILED(hr = retainTexture(device, desc.real_output,
+        frame->resources[3], frame->views[3], false, true))) return hr;
+    if (desc.distortion && FAILED(hr = retainTexture(device, desc.distortion,
+        frame->resources[4], frame->views[4], false, false))) return hr;
+    frame->states = {desc.present_color_state, desc.output_states[0], desc.hudless_color_state,
+        desc.real_output_state, desc.distortion_state};
     WMTFGNativeCommand command{device->GetMTLDevice().handle, device->GetMetal4Compiler().handle};
     WMTFGdispatch_packet p{};
     p.header = {sizeof(p), WMTFG_BRIDGE_VERSION, WMTFG_DISPATCH, 0, core_->context};
@@ -168,6 +178,13 @@ public:
     p.generation_rect_left = desc.generation_rect_left; p.generation_rect_top = desc.generation_rect_top;
     p.generation_rect_width = desc.generation_rect_width; p.generation_rect_height = desc.generation_rect_height;
     p.min_luminance = desc.min_luminance; p.max_luminance = desc.max_luminance; p.flags = desc.flags;
+    if (desc.real_output) p.real_output = frame->views[3].texture().handle;
+    p.real_output_state = desc.real_output_state;
+    p.output_subrect_only = desc.output_subrect_only;
+    if (desc.distortion) p.distortion = frame->views[4].texture().handle;
+    p.distortion_state = desc.distortion_state;
+    p.distortion_x = desc.distortion_x; p.distortion_y = desc.distortion_y;
+    p.distortion_width = desc.distortion_width; p.distortion_height = desc.distortion_height;
     std::lock_guard lock(core_->mutex);
     if (FAILED(hr = request(p.header, &frame->native))) return hr;
     if (!frame->native) return E_FAIL;
@@ -214,14 +231,15 @@ HRESULT GenerateOwnedFrameGenerationFrame(MTLD3D12Device *device, IMTLD3D12Frame
   if (FAILED(state->QueryInterface(kInternalStateId, reinterpret_cast<void **>(&internal)))) return E_INVALIDARG;
   try { return internal->Generate(device, *desc, frame); } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
 }
-std::array<MTLD3D12Resource *, 3> GetOwnedFrameGenerationResources(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
-  return {frame->resources[0].ptr(), frame->resources[1].ptr(), frame->resources[2].ptr()};
+std::array<MTLD3D12Resource *, 5> GetOwnedFrameGenerationResources(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+  return {frame->resources[0].ptr(), frame->resources[1].ptr(), frame->resources[2].ptr(),
+      frame->resources[3].ptr(), frame->resources[4].ptr()};
 }
-std::array<D3D12_RESOURCE_STATES, 3> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+std::array<D3D12_RESOURCE_STATES, 5> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
   return frame->states;
 }
 bool IsOwnedFrameGenerationOutput(const std::shared_ptr<OwnedFrameGenerationFrame> &frame, size_t index) {
-  return frame->generate && index == 1;
+  return frame->generate && (index == 1 || index == 3);
 }
 void EncodeOwnedFrameGenerationFrame(const std::shared_ptr<OwnedFrameGenerationFrame> &frame,
     WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence,

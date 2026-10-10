@@ -131,7 +131,7 @@ struct Command {
     WMTFGNativeCommand value{};
     bool open(void* list) { if (!list) return false; value = *static_cast<WMTFGNativeCommand*>(list); return value.device && value.compiler; }
 };
-struct Resources { struct Resource { void* texture = nullptr; }; std::array<Resource,3> values{}; };
+struct Resources { struct Resource { void* texture = nullptr; }; std::array<Resource,5> values{}; };
 MTLPixelFormat colorFormat(std::uint32_t format) noexcept { return to_metal_pixel_format(static_cast<WMTPixelFormat>(format)); }
 bool textureValid(id<MTLTexture> texture, id<MTLDevice> device,
                   NSUInteger width, NSUInteger height) {
@@ -188,6 +188,7 @@ public:
             effect_.motionTexture = nil;
             effect_.uiTexture = nil;
             effect_.outputTexture = nil;
+            if (@available(macOS 27.0, *)) effect_.distortionTexture = nil;
             effect_.fence = nil;
         } @catch (id) {
         }
@@ -223,6 +224,7 @@ struct Configuration {
     MTLPixelFormat sourceUi = MTLPixelFormatInvalid;
     std::uint32_t transfer = 0;
     bool cameraPresent = false;
+    bool distortionEnabled = false;
     MTLPixelFormat depth = MTLPixelFormatInvalid;
     MTLPixelFormat motion = MTLPixelFormatRG16Float;
     NSUInteger width = 0, height = 0, outputWidth = 0, outputHeight = 0;
@@ -303,7 +305,7 @@ std::shared_ptr<Configuration> configure(
     State& state, const Command& command,
     const WMTFGprepare_packet& packet,
     id<MTLTexture> depth, MTLPixelFormat sourceColor, MTLPixelFormat sourceUi,
-    NSUInteger outputWidth, NSUInteger outputHeight, std::uint32_t transfer) {
+    NSUInteger outputWidth, NSUInteger outputHeight, std::uint32_t transfer, bool distortionEnabled) {
     if (@available(macOS 26.0, *)) {
         auto device = (id<MTLDevice>)command.value.device;
         if (!supported(device, command.value.compiler)) return {};
@@ -319,6 +321,7 @@ std::shared_ptr<Configuration> configure(
                 cached->color == color && cached->ui == ui &&
                 cached->sourceColor == sourceColor && cached->sourceUi == sourceUi &&
                 cached->transfer == transfer && cached->cameraPresent == cameraPresent &&
+                cached->distortionEnabled == distortionEnabled &&
                 cached->depth == depthFormat && cached->motion == motion &&
                 cached->width == outputWidth && cached->height == outputHeight &&
                 cached->outputWidth == outputWidth && cached->outputHeight == outputHeight)
@@ -334,6 +337,7 @@ std::shared_ptr<Configuration> configure(
         result->sourceUi = sourceUi;
         result->transfer = transfer;
         result->cameraPresent = cameraPresent;
+        result->distortionEnabled = distortionEnabled;
         result->depth = depthFormat;
         result->motion = motion;
         result->width = outputWidth;
@@ -354,8 +358,10 @@ std::shared_ptr<Configuration> configure(
         descriptor.inputHeight = result->height;
         descriptor.outputWidth = result->outputWidth;
         descriptor.outputHeight = result->outputHeight;
-        if (@available(macOS 27.0, *))
+        if (@available(macOS 27.0, *)) {
             descriptor.requiresPrevColorTexture = NO;
+            descriptor.distortionTextureEnabled = distortionEnabled;
+        } else if (distortionEnabled) return {};
 
         result->factory = result->makeInterpolator();
         if (!result->factory) return {};
@@ -612,6 +618,8 @@ struct PreparedFrame::Impl {
     Object first;
     Object second;
     Object third;
+    Object realOutput;
+    Object distortion;
     WMTFGdispatch_packet dispatch{};
     bool reset = false;
     std::uint64_t generationEpoch = 0;
@@ -693,6 +701,8 @@ bool PreparedFrame::encode(
                 execution->objects.push_back(impl_->first);
                 execution->objects.push_back(impl_->second);
                 execution->objects.push_back(impl_->third);
+                execution->objects.push_back(impl_->realOutput);
+                execution->objects.push_back(impl_->distortion);
                 execution->objects.push_back(impl_->snapshot->depth);
                 execution->objects.push_back(impl_->snapshot->motion);
 
@@ -709,10 +719,12 @@ bool PreparedFrame::encode(
                     const std::array<Copy, 2> copies{{
                         {(id<MTLTexture>)impl_->first.get(),
                          (id<MTLTexture>)impl_->snapshot->depth.get(),
-                         impl_->snapshot->depthWidth, impl_->snapshot->depthHeight},
+                         impl_->snapshot->depthWidth, impl_->snapshot->depthHeight,
+                         impl_->snapshot->parameters.depth_subrect_x, impl_->snapshot->parameters.depth_subrect_y},
                         {(id<MTLTexture>)impl_->second.get(),
                          (id<MTLTexture>)impl_->snapshot->motion.get(),
-                         impl_->snapshot->motionWidth, impl_->snapshot->motionHeight}
+                         impl_->snapshot->motionWidth, impl_->snapshot->motionHeight,
+                         impl_->snapshot->parameters.motion_subrect_x, impl_->snapshot->parameters.motion_subrect_y}
                     }};
                     if (!copyTextures(buffer, (id)fence,
                                       copies.data(), copies.size(), execution->objects))
@@ -760,7 +772,14 @@ bool PreparedFrame::encode(
                 Object output = privateTexture(device, configuration.color,
                     configuration.outputWidth, configuration.outputHeight,
                     effect.outputTextureUsage | MTLTextureUsageShaderRead);
+                auto distortionSource = (id<MTLTexture>)impl_->distortion.get();
+                const bool cropDistortion = distortionSource && !exactDescriptorInput(distortionSource,
+                    distortionSource.pixelFormat, d.distortion_width, d.distortion_height, MTLTextureUsageShaderRead, false);
+                // Native half-resolution atlas offsets differ from a canonical cropped field.
+                Object distortion = cropDistortion ? privateTexture(device, distortionSource.pixelFormat,
+                    d.distortion_width, d.distortion_height, MTLTextureUsageShaderRead) : impl_->distortion;
                 if (!current || !normalizedDepth || !normalizedMotion || !output ||
+                    (distortionSource && !distortion) ||
                     (configuration.ui != MTLPixelFormatInvalid && !ui))
                     return fail("encode_intermediate_textures");
 
@@ -776,6 +795,7 @@ bool PreparedFrame::encode(
                 execution->objects.push_back(normalizedDepth);
                 execution->objects.push_back(normalizedMotion);
                 execution->objects.push_back(output);
+                execution->objects.push_back(distortion);
 
                 id<MTLTexture> present = (id<MTLTexture>)impl_->first.get();
                 id<MTLTexture> scene = impl_->third
@@ -804,8 +824,8 @@ bool PreparedFrame::encode(
                 colorParams.sourceOrigin[1] = d.generation_rect_top;
                 colorParams.extent[0] = configuration.outputWidth;
                 colorParams.extent[1] = configuration.outputHeight;
-                colorParams.sourceExtent[0] = state.creation.display_width;
-                colorParams.sourceExtent[1] = state.creation.display_height;
+                colorParams.sourceExtent[0] = present.width;
+                colorParams.sourceExtent[1] = present.height;
                 colorParams.motionTargetExtent[0] = state.creation.display_width;
                 colorParams.motionTargetExtent[1] = state.creation.display_height;
                 colorParams.outputExtent[0] = configuration.outputWidth;
@@ -858,9 +878,19 @@ bool PreparedFrame::encode(
                 if (!execution->makeResident(buffer))
                     return fail("encode_residency");
 
-                const Copy baseline{present, (id<MTLTexture>)impl_->second.get(),
-                    state.creation.display_width, state.creation.display_height};
-                if (!copyTextures(buffer, (id)fence, &baseline, 1,
+                const NSUInteger copyX = d.output_subrect_only ? d.generation_rect_left : 0;
+                const NSUInteger copyY = d.output_subrect_only ? d.generation_rect_top : 0;
+                const NSUInteger copyWidth = d.output_subrect_only ? configuration.outputWidth : present.width;
+                const NSUInteger copyHeight = d.output_subrect_only ? configuration.outputHeight : present.height;
+                std::array<Copy, 3> copies{};
+                unsigned copyCount = 0;
+                copies[copyCount++] = {present, (id<MTLTexture>)impl_->second.get(),
+                    copyWidth, copyHeight, copyX, copyY, copyX, copyY};
+                if (impl_->realOutput) copies[copyCount++] = {present, (id<MTLTexture>)impl_->realOutput.get(),
+                    copyWidth, copyHeight, copyX, copyY, copyX, copyY};
+                if (cropDistortion) copies[copyCount++] = {distortionSource, (id<MTLTexture>)distortion.get(),
+                    d.distortion_width, d.distortion_height, d.distortion_x, d.distortion_y};
+                if (!copyTextures(buffer, (id)fence, copies.data(), copyCount,
                                   execution->objects))
                     return fail("encode_baseline_copy");
                 if (!computePass(buffer, (id)fence, device,
@@ -898,6 +928,11 @@ bool PreparedFrame::encode(
                 effect.motionTexture = (id<MTLTexture>)normalizedMotion.get();
                 effect.uiTexture = (id<MTLTexture>)ui.get();
                 effect.uiTextureComposited = bool(ui);
+                if (@available(macOS 27.0, *)) {
+                    effect.distortionTexture = (id<MTLTexture>)distortion.get();
+                    effect.distortionOffsetX = effect.distortionOffsetY = 0;
+                    effect.distortionWidth = d.distortion_width; effect.distortionHeight = d.distortion_height;
+                }
                 effect.outputTexture = (id<MTLTexture>)output.get();
                 effect.fence = (id<MTLFence>)fence;
                 effect.shouldResetHistory = reset;
@@ -1153,8 +1188,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
             Resources resources;
             auto implementation = std::make_shared<PreparedFrame::Impl>();
             implementation->state = state;
-            std::array<std::uint64_t, 3> addresses{};
-            unsigned resourceCount = 2;
+            std::array<std::uint64_t, 5> addresses{};
             std::uint64_t frame = generate ? d->frame_id : p->frame_id;
 
             if (!generate) {
@@ -1179,9 +1213,11 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     ? state->creation.display_height : p->render_height;
                 if (!addresses[0] || !addresses[1] || addresses[0] == addresses[1] ||
                     !mapOne(resources, 0, *state, command, addresses[0], false,
-                            p->render_width, p->render_height) ||
+                            NSUInteger(p->depth_subrect_x) + p->render_width,
+                            NSUInteger(p->depth_subrect_y) + p->render_height) ||
                     !mapOne(resources, 1, *state, command, addresses[1], false,
-                            motionWidth, motionHeight) ||
+                            NSUInteger(p->motion_subrect_x) + motionWidth,
+                            NSUInteger(p->motion_subrect_y) + motionHeight) ||
                     rootTexture((id<MTLTexture>)resources.values[0].texture) ==
                     rootTexture((id<MTLTexture>)resources.values[1].texture))
                     return finish(Unsupported);
@@ -1194,7 +1230,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 auto configuration = configure(*state, command, *p, depth,
                     MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid,
                     p->render_width, p->render_height,
-                    0);
+                    0, false);
                 if (!configuration) return finish(Unsupported);
                 if (!state->generationEnabled) {
                     state->configurations.clear();
@@ -1228,57 +1264,76 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 state->preparedJitterY = p->jitter_y;
                 implementation->snapshot = std::move(snapshot);
             } else {
-                if (d->flags & ~7u) return finish(Parameter);
+                if ((d->flags & ~7u) || d->output_subrect_only > 1) return finish(Parameter);
                 if (d->num_generated_frames != 1) return finish(Unsupported);
                 std::int32_t rectLeft = 0, rectTop = 0;
                 NSUInteger rectWidth = 0, rectHeight = 0;
-                if (!validTransfer(*d) ||
-                    !resolveRect(*d, state->creation.display_width,
-                                 state->creation.display_height, rectLeft, rectTop,
-                                 rectWidth, rectHeight))
-                    return finish(Parameter);
+                if (!validTransfer(*d)) return finish(Parameter);
                 auto found = state->frames.find(frame);
                 if (found == state->frames.end()) return finish(Parameter);
                 implementation->kind = PreparedFrame::Impl::Kind::Generate;
                 implementation->generationEpoch = state->generationEpoch;
                 implementation->reset = d->reset != 0;
                 implementation->dispatch = *d;
-                addresses = {d->present_color, d->output, d->hudless_color};
+                addresses = {d->present_color, d->output, d->hudless_color, d->real_output, d->distortion};
                 if (!mapPair(resources, *state, command, addresses[0], addresses[1],
                              true, state->creation.display_width,
                              state->creation.display_height))
                     return finish(Unsupported);
                 auto present = (id<MTLTexture>)resources.values[0].texture;
                 auto output = (id<MTLTexture>)resources.values[1].texture;
-                if (present.width != state->creation.display_width ||
-                    present.height != state->creation.display_height ||
-                    output.width != state->creation.display_width ||
-                    output.height != state->creation.display_height ||
+                if (output.width != present.width || output.height != present.height ||
                     present.pixelFormat != output.pixelFormat)
                     return finish(Unsupported);
+                if (!resolveRect(*d, d->generation_rect_width ? present.width : state->creation.display_width,
+                                 d->generation_rect_height ? present.height : state->creation.display_height,
+                                 rectLeft, rectTop, rectWidth, rectHeight))
+                    return finish(Parameter);
                 id<MTLTexture> scene = present;
                 MTLPixelFormat uiFormat = MTLPixelFormatInvalid;
                 if (d->hudless_color) {
-                    resourceCount = 3;
                     if (!mapOne(resources, 2, *state, command, d->hudless_color, false,
-                                state->creation.display_width, state->creation.display_height))
+                                NSUInteger(rectLeft) + rectWidth, NSUInteger(rectTop) + rectHeight))
                         return finish(Unsupported);
                     scene = (id<MTLTexture>)resources.values[2].texture;
                     if (rootTexture(scene) == rootTexture(output)) return finish(Parameter);
                     uiFormat = present.pixelFormat;
                 }
+                if (d->real_output) {
+                    if (!mapOne(resources, 3, *state, command, d->real_output, true, present.width, present.height))
+                        return finish(Parameter);
+                    auto real = (id<MTLTexture>)resources.values[3].texture;
+                    if (real.width != present.width || real.height != present.height ||
+                        real.pixelFormat != present.pixelFormat || rootTexture(real) == rootTexture(present) ||
+                        rootTexture(real) == rootTexture(output) || rootTexture(real) == rootTexture(scene))
+                        return finish(Parameter);
+                }
+                if (d->distortion) {
+                    if (!d->distortion_width || !d->distortion_height ||
+                        !mapOne(resources, 4, *state, command, d->distortion, false,
+                            NSUInteger(d->distortion_x) + d->distortion_width,
+                            NSUInteger(d->distortion_y) + d->distortion_height))
+                        return finish(Parameter);
+                    auto distortion = (id<MTLTexture>)resources.values[4].texture;
+                    if (rootTexture(distortion) == rootTexture(output) ||
+                        (d->real_output && rootTexture(distortion) == rootTexture((id<MTLTexture>)resources.values[3].texture)))
+                        return finish(Parameter);
+                    if (distortion.pixelFormat != MTLPixelFormatRGBA16Float && distortion.pixelFormat != MTLPixelFormatRGBA32Float)
+                        return finish(Unsupported);
+                }
                 auto dispatchSnapshot = std::make_shared<Snapshot>(*found->second);
                 dispatchSnapshot->configuration = configure(*state, command,
                     dispatchSnapshot->parameters,
                     (id<MTLTexture>)dispatchSnapshot->depth.get(), scene.pixelFormat,
-                    uiFormat, rectWidth, rectHeight, d->backbuffer_transfer_function);
+                    uiFormat, rectWidth, rectHeight, d->backbuffer_transfer_function, d->distortion != 0);
                 if (!dispatchSnapshot->configuration) return finish(Unsupported);
                 implementation->snapshot = std::move(dispatchSnapshot);
             }
             implementation->first = Object((id)resources.values[0].texture);
             implementation->second = Object((id)resources.values[1].texture);
-            if (resourceCount == 3)
-                implementation->third = Object((id)resources.values[2].texture);
+            implementation->third = Object((id)resources.values[2].texture);
+            implementation->realOutput = Object((id)resources.values[3].texture);
+            implementation->distortion = Object((id)resources.values[4].texture);
             auto prepared = std::shared_ptr<const PreparedFrame>(
                 new PreparedFrame(implementation));
 

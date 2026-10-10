@@ -612,7 +612,9 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
        std::pair{"DLSSG.MVecs", &prepare.motion_vectors}})
     if (auto status = getRequiredResource(params,key,resource); status != kResultSuccess) return status;
   generate.hudless_color = getOptionalResource(params,"DLSSG.HUDLess");
-  for (const char *key : {"DLSSG.UI", "DLSSG.UIAlpha", "DLSSG.BidirectionalDistortionField", "DLSSG.OutputReal"})
+  generate.real_output = getOptionalResource(params,"DLSSG.OutputReal");
+  generate.distortion = getOptionalResource(params,"DLSSG.BidirectionalDistortionField");
+  for (const char *key : {"DLSSG.UI", "DLSSG.UIAlpha"})
     if (getOptionalResource(params,key)) return kResultUnsupportedParameter;
   const UINT count = getOptionalUInt(params, "DLSSG.MultiFrameCount", 1);
   const UINT index = getOptionalUInt(params, "DLSSG.MultiFrameIndex", 1);
@@ -620,30 +622,83 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   if (count > 1 || index > 1) return kResultUnsupportedParameter;
   if (output == generate.present_color || output == generate.hudless_color ||
       output == prepare.depth || output == prepare.motion_vectors) return kResultInvalidParameter;
+  if (generate.real_output && (generate.real_output == output || generate.real_output == generate.present_color ||
+      generate.real_output == generate.hudless_color || generate.real_output == prepare.depth ||
+      generate.real_output == prepare.motion_vectors)) return kResultInvalidParameter;
+  const UINT eval_flags = getOptionalUInt(params,"DLSSG.EvalFlags",0);
+  if (eval_flags & ~1u) return kResultUnsupportedParameter;
+  generate.output_subrect_only = eval_flags & 1u;
+  if (generate.distortion && (generate.distortion == output || generate.distortion == generate.real_output))
+    return kResultInvalidParameter;
   if (getOptionalUInt(params,"DLSSG.OrthoProjection",0) || !getOptionalUInt(params,"DLSSG.CameraMotionIncluded",1)) return kResultUnsupportedParameter;
-  Com<ID3D12Device> output_device;
-  const auto output_desc = output->GetDesc();
-  if (FAILED(output->GetDevice(IID_PPV_ARGS(&output_device))) ||
-      identityOf(output_device.ptr()).ptr() != feature.device_identity.ptr() ||
-      output_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || output_desc.DepthOrArraySize != 1 ||
-      output_desc.MipLevels != 1 || output_desc.SampleDesc.Count != 1 ||
-      output_desc.Width != feature.fg_create.display_width || output_desc.Height != feature.fg_create.display_height ||
-      output_desc.Format != feature.fg_create.backbuffer_format ||
-      !(output_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return kResultInvalidParameter;
+  const auto present_desc = generate.present_color->GetDesc();
+  for (auto resource : {output, generate.real_output}) {
+    if (!resource) continue;
+    Com<ID3D12Device> output_device;
+    const auto desc = resource->GetDesc();
+    if (FAILED(resource->GetDevice(IID_PPV_ARGS(&output_device))) ||
+        identityOf(output_device.ptr()).ptr() != feature.device_identity.ptr() ||
+        desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
+        desc.MipLevels != 1 || desc.SampleDesc.Count != 1 ||
+        desc.Width != present_desc.Width || desc.Height != present_desc.Height ||
+        desc.Format != feature.fg_create.backbuffer_format ||
+        !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return kResultInvalidParameter;
+  }
   // MetalFX does not expose a truthful per-output validity/count result.
   if (getOptionalResource(params, "DLSSG.OutputDisableInterpolation")) return kResultUnsupportedParameter;
-  for (const char *key : {"DLSSG.InputBackbufferSubrectBaseX", "DLSSG.InputBackbufferSubrectBaseY", "DLSSG.MVecsSubrectBaseX",
-       "DLSSG.MVecsSubrectBaseY", "DLSSG.DepthSubrectBaseX", "DLSSG.DepthSubrectBaseY", "DLSSG.HUDLessSubrectBaseX",
-       "DLSSG.HUDLessSubrectBaseY", "DLSSG.OutputInterpolatedSubrectBaseX", "DLSSG.OutputInterpolatedSubrectBaseY",
-       "DLSSG.BackbufferSubrectBaseX", "DLSSG.BackbufferSubrectBaseY"})
+  for (const char *key : {"DLSSG.InputBackbufferSubrectBaseX", "DLSSG.InputBackbufferSubrectBaseY",
+       "DLSSG.HUDLessSubrectBaseX", "DLSSG.HUDLessSubrectBaseY",
+       "DLSSG.OutputInterpolatedSubrectBaseX", "DLSSG.OutputInterpolatedSubrectBaseY"})
     if (getOptionalUInt(params,key,0)) return kResultUnsupportedParameter;
   prepare.render_width = getOptionalUInt(params,"DLSSG.InternalWidth",feature.fg_create.max_render_width);
   prepare.render_height = getOptionalUInt(params,"DLSSG.InternalHeight",feature.fg_create.max_render_height);
+  if (auto width = getOptionalUInt(params,"DLSSG.DepthSubrectWidth",0)) prepare.render_width = width;
+  if (auto height = getOptionalUInt(params,"DLSSG.DepthSubrectHeight",0)) prepare.render_height = height;
+  prepare.depth_subrect_x = getOptionalUInt(params,"DLSSG.DepthSubrectBaseX",0);
+  prepare.depth_subrect_y = getOptionalUInt(params,"DLSSG.DepthSubrectBaseY",0);
+  prepare.motion_subrect_x = getOptionalUInt(params,"DLSSG.MVecsSubrectBaseX",0);
+  prepare.motion_subrect_y = getOptionalUInt(params,"DLSSG.MVecsSubrectBaseY",0);
+  const UINT left = getOptionalUInt(params,"DLSSG.BackbufferSubrectBaseX",0);
+  const UINT top = getOptionalUInt(params,"DLSSG.BackbufferSubrectBaseY",0);
+  const UINT mw = (feature.fg_create.flags & 4) ? feature.fg_create.display_width : prepare.render_width;
+  const UINT mh = (feature.fg_create.flags & 4) ? feature.fg_create.display_height : prepare.render_height;
+  auto validSubrect = [&](ID3D12Resource *resource, UINT x, UINT y, UINT width, UINT height) {
+    Com<ID3D12Device> owner;
+    const auto desc = resource->GetDesc();
+    return SUCCEEDED(resource->GetDevice(IID_PPV_ARGS(&owner))) &&
+        identityOf(owner.ptr()).ptr() == feature.device_identity.ptr() &&
+        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 &&
+        desc.SampleDesc.Count == 1 && width && height && x <= desc.Width && y <= desc.Height &&
+        width <= desc.Width - x && height <= desc.Height - y;
+  };
+  if (left > INT_MAX || top > INT_MAX ||
+      !validSubrect(prepare.depth, prepare.depth_subrect_x, prepare.depth_subrect_y, prepare.render_width, prepare.render_height) ||
+      !validSubrect(prepare.motion_vectors, prepare.motion_subrect_x, prepare.motion_subrect_y, mw, mh) ||
+      !validSubrect(generate.present_color, left, top, feature.fg_create.display_width, feature.fg_create.display_height) ||
+      (generate.hudless_color && !validSubrect(generate.hudless_color, left, top,
+          feature.fg_create.display_width, feature.fg_create.display_height))) return kResultInvalidParameter;
+  generate.generation_rect_left = left; generate.generation_rect_top = top;
+  if (generate.distortion) {
+    if (getOptionalUInt(params,"DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision",0))
+      return kResultUnsupportedParameter;
+    const auto format = generate.distortion->GetDesc().Format;
+    if (format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32G32B32A32_FLOAT)
+      return kResultUnsupportedParameter;
+    generate.distortion_x = getOptionalUInt(params,"DLSSG.BidirectionalDistortionFieldSubrectBaseX",0);
+    generate.distortion_y = getOptionalUInt(params,"DLSSG.BidirectionalDistortionFieldSubrectBaseY",0);
+    generate.distortion_width = getOptionalUInt(params,"DLSSG.BidirectionalDistortionFieldSubrectWidth",0);
+    generate.distortion_height = getOptionalUInt(params,"DLSSG.BidirectionalDistortionFieldSubrectHeight",0);
+    if (!generate.distortion_width) generate.distortion_width = prepare.render_width;
+    if (!generate.distortion_height) generate.distortion_height = prepare.render_height;
+    if (!validSubrect(generate.distortion, generate.distortion_x, generate.distortion_y,
+        generate.distortion_width, generate.distortion_height)) return kResultInvalidParameter;
+    generate.distortion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  }
   if (getOptionalUInt(params,"DLSSG.DepthInverted",feature.fg_create.flags & 1) != (feature.fg_create.flags & 1) ||
       getOptionalUInt(params,"DLSSG.MvecJittered",(feature.fg_create.flags >> 3) & 1) != ((feature.fg_create.flags >> 3) & 1))
     return kResultUnsupportedParameter;
-  for (const auto &[key, expected] : {std::pair{"DLSSG.MVecsSubrectWidth",prepare.render_width},
-       std::pair{"DLSSG.MVecsSubrectHeight",prepare.render_height},
+  for (const auto &[key, expected] : {std::pair{"DLSSG.MVecsSubrectWidth",mw},
+       std::pair{"DLSSG.MVecsSubrectHeight",mh},
        std::pair{"DLSSG.DepthSubrectWidth",prepare.render_width},std::pair{"DLSSG.DepthSubrectHeight",prepare.render_height},
        std::pair{"DLSSG.InputBackbufferSubrectWidth",feature.fg_create.display_width},
        std::pair{"DLSSG.InputBackbufferSubrectHeight",feature.fg_create.display_height},
@@ -660,8 +715,6 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   prepare.jitter_x = getOptionalFloat(params,"DLSSG.JitterOffsetX",0) * prepare.render_width * .5f;
   prepare.jitter_y = getOptionalFloat(params,"DLSSG.JitterOffsetY",0) * prepare.render_height * -.5f;
   // Public NGX scales normalize to [-1,1]; private transport multiplies into pixels.
-  const UINT mw = (feature.fg_create.flags & 4) ? feature.fg_create.display_width : prepare.render_width;
-  const UINT mh = (feature.fg_create.flags & 4) ? feature.fg_create.display_height : prepare.render_height;
   prepare.motion_scale_x = getOptionalFloat(params,"DLSSG.MvecScaleX",1) * mw;
   prepare.motion_scale_y = getOptionalFloat(params,"DLSSG.MvecScaleY",1) * mh;
   if (getOptionalUInt(params,"DLSSG.InvertXAxis",0)) prepare.motion_scale_x *= -1;
@@ -704,6 +757,7 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
       (now.QuadPart - feature.fg_last_counter.QuadPart) / feature.fg_counter_frequency.QuadPart));
   generate.outputs[0] = output;
   generate.output_states[0] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  generate.real_output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   auto hr = extension->PrepareFrameGeneration(feature.frame_generation.ptr(), &prepare);
   if (FAILED(hr)) return mapBackendResult(hr, false);
   hr = extension->GenerateFrames(feature.frame_generation.ptr(), &generate);

@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "winemetal_metal4.h"
 
-#define WMTFG_BRIDGE_VERSION 5u
+#define WMTFG_BRIDGE_VERSION 8u
 
 #pragma pack(push, 8)
 enum WMTFG_create_flags
@@ -74,6 +74,10 @@ struct WMTFGprepare_packet
     float camera_right[3];
     float camera_forward[3];
     uint32_t camera_info_present;
+    uint32_t depth_subrect_x;
+    uint32_t depth_subrect_y;
+    uint32_t motion_subrect_x;
+    uint32_t motion_subrect_y;
 };
 
 struct WMTFGdispatch_packet
@@ -97,6 +101,15 @@ struct WMTFGdispatch_packet
     float min_luminance;
     float max_luminance;
     uint32_t flags;
+    uint64_t real_output;
+    uint32_t real_output_state;
+    uint32_t output_subrect_only;
+    uint64_t distortion;
+    uint32_t distortion_state;
+    uint32_t distortion_x;
+    uint32_t distortion_y;
+    uint32_t distortion_width;
+    uint32_t distortion_height;
 };
 
 /* Configure changes metadata ownership; recorded commands retain their own snapshots. */
@@ -125,8 +138,8 @@ struct WMTFGNativeCommand { uint64_t device, compiler; };
 #ifdef __cplusplus
 static_assert(sizeof(WMTFGpacket_header) == 24);
 static_assert(sizeof(WMTFGcreate_packet) == 56);
-static_assert(sizeof(WMTFGprepare_packet) == 168);
-static_assert(sizeof(WMTFGdispatch_packet) == 120);
+static_assert(sizeof(WMTFGprepare_packet) == 184);
+static_assert(sizeof(WMTFGdispatch_packet) == 168);
 static_assert(sizeof(WMTFGconfigure_packet) == 32);
 static_assert(sizeof(WMTFGretire_frame_packet) == 48);
 #endif

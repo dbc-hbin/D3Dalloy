@@ -129,6 +129,231 @@ void runPublicFg(const NgxApi &api, Gpu &gpu) {
   checkNgxResult(api.release(feature), ngx_fixture_result_feature_not_found(), "FG stale handle");
   std::puts("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=unsupported reset=native_history release_before_execute=1 replay=native_encode");
 }
+void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
+  constexpr UINT extent = ngxPresentExtent;
+  constexpr UINT render = 96;
+  constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  constexpr auto write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  NVSDK_NGX_Handle* features[] = {ngxPresentFeature(api, gpu), ngxPresentFeature(api, gpu), ngxPresentFeature(api, gpu), ngxPresentFeature(api, gpu), ngxPresentFeature(api, gpu)};
+  unsigned distortionFrames = 0;
+  for (UINT frame = 0; frame != 8; ++frame) {
+    std::vector<uint8_t> reference, floatReference, control;
+    for (UINT variant = 0; variant != 5; ++variant) {
+      const UINT atlas = variant == 4 ? 2 : variant == 2 ? 1 : 0;
+      const bool fieldEnabled = variant != 0 && frame != 6;
+      const UINT colorWidth = extent + (atlas == 2 ? 32 : 0), colorHeight = extent + (atlas == 2 ? 40 : 0);
+      const UINT left = atlas == 2 ? 11 : 0, top = atlas == 2 ? 13 : 0;
+      const std::vector<uint8_t> sentinel(colorWidth * colorHeight * 4, 19);
+      const UINT depthWidth = render + atlas * 8, depthHeight = render + atlas * 12;
+      const UINT motionWidth = render + atlas * 16, motionHeight = render + atlas * 20;
+      const UINT dx = atlas * 3, dy = atlas * 5, mx = atlas * 7, my = atlas * 9;
+      // Padding differs from every active texel, so ignoring either origin changes native inputs.
+      std::vector<float> depths(depthWidth * depthHeight, .01f);
+      std::vector<uint16_t> vectors(motionWidth * motionHeight * 2, 0x4c00);
+      for (UINT y = 0; y != render; ++y) for (UINT x = 0; x != render; ++x) {
+        depths[(y + dy) * depthWidth + x + dx] = x > 40 && x < 88 && y > 32 && y < 96 ? .9f : .75f;
+        vectors[((y + my) * motionWidth + x + mx) * 2] = 0x4200;
+        vectors[((y + my) * motionWidth + x + mx) * 2 + 1] = 0;
+      }
+      auto depth = createTexture(gpu.device.Get(), depthWidth, depthHeight, DXGI_FORMAT_R32_FLOAT,
+          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+      auto motion = createTexture(gpu.device.Get(), motionWidth, motionHeight, DXGI_FORMAT_R16G16_FLOAT,
+          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+      auto color = createTexture(gpu.device.Get(), colorWidth, colorHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
+          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+      auto output = createTexture(gpu.device.Get(), colorWidth, colorHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
+          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+      auto real = createTexture(gpu.device.Get(), colorWidth, colorHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
+          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+      auto hudless = createTexture(gpu.device.Get(), colorWidth, colorHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
+          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+      constexpr UINT fieldExtent = 64;
+      const UINT fieldWidth = fieldExtent + atlas * 8, fieldHeight = fieldExtent + atlas * 12;
+      const UINT fieldX = atlas * 3, fieldY = atlas * 5;
+      const bool float32 = variant >= 3;
+      auto field = createTexture(gpu.device.Get(), fieldWidth, fieldHeight,
+          float32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT,
+          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+      std::vector<uint16_t> fieldHalf(fieldWidth * fieldHeight * 4, 0x3600);
+      std::vector<float> fieldFloat(fieldWidth * fieldHeight * 4, .375f);
+      for (UINT y = 0; y != fieldExtent; ++y) for (UINT x = 0; x != fieldExtent; ++x) {
+        const float u = (x + .5f) / fieldExtent - .5f;
+        // Centered 1.25x horizontal map and its inverse, in normalized UV units.
+        const float offsets[] = {.25f * u, 0, -.2f * u, 0};
+        for (UINT c = 0; c != 4; ++c) {
+          const _Float16 value = static_cast<_Float16>(offsets[c]);
+          const UINT index = ((y + fieldY) * fieldWidth + x + fieldX) * 4 + c;
+          std::memcpy(&fieldHalf[index], &value, sizeof(value));
+          fieldFloat[index] = static_cast<float>(value);
+        }
+      }
+      uploadTexture(gpu, field.Get(), float32 ? static_cast<const void*>(fieldFloat.data()) : fieldHalf.data(),
+          fieldWidth * (float32 ? 16 : 8), read);
+      const auto scene = ngxPresentScene(frame, false);
+      std::vector<uint8_t> pixels(colorWidth * colorHeight * 4, 203);
+      for (UINT y = 0; y != extent; ++y)
+        std::memcpy(pixels.data() + ((y + top) * colorWidth + left) * 4, scene.data() + y * extent * 4, extent * 4);
+      uploadTexture(gpu, hudless.Get(), pixels.data(), colorWidth * 4, read);
+      const auto composited = ngxPresentScene(frame, true);
+      for (UINT y = 0; y != extent; ++y)
+        std::memcpy(pixels.data() + ((y + top) * colorWidth + left) * 4, composited.data() + y * extent * 4, extent * 4);
+      uploadTexture(gpu, depth.Get(), depths.data(), depthWidth * 4, read);
+      uploadTexture(gpu, motion.Get(), vectors.data(), motionWidth * 4, read);
+      uploadTexture(gpu, color.Get(), pixels.data(), colorWidth * 4, read);
+      uploadTexture(gpu, output.Get(), sentinel.data(), colorWidth * 4, write);
+      uploadTexture(gpu, real.Get(), sentinel.data(), colorWidth * 4, write);
+      const bool realEnabled = frame % 2 == 0 || frame == 7;
+      const bool rectOnly = atlas == 2 && frame >= 4;
+      auto params = allocateParams(api);
+      ngx_feature_set_resource(params, "DLSSG.Backbuffer", color.Get());
+      ngx_feature_set_resource(params, "DLSSG.OutputInterpolated", output.Get());
+      ngx_feature_set_resource(params, "DLSSG.OutputReal", realEnabled ? real.Get() : nullptr);
+      ngx_feature_set_resource(params, "DLSSG.HUDLess", hudless.Get());
+      ngx_feature_set_uint(params, "DLSSG.EvalFlags", rectOnly);
+      ngx_feature_set_resource(params, "DLSSG.BidirectionalDistortionField", fieldEnabled ? field.Get() : nullptr);
+      ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldSubrectBaseX", fieldX);
+      ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldSubrectBaseY", fieldY);
+      ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldSubrectWidth", fieldExtent);
+      ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldSubrectHeight", fieldExtent);
+      ngx_feature_set_resource(params, "DLSSG.Depth", depth.Get());
+      ngx_feature_set_resource(params, "DLSSG.MVecs", motion.Get());
+      ngx_feature_set_uint(params, "DLSSG.DepthSubrectBaseX", dx);
+      ngx_feature_set_uint(params, "DLSSG.DepthSubrectBaseY", dy);
+      ngx_feature_set_uint(params, "DLSSG.DepthSubrectWidth", render);
+      ngx_feature_set_uint(params, "DLSSG.DepthSubrectHeight", render);
+      ngx_feature_set_uint(params, "DLSSG.MVecsSubrectWidth", render);
+      ngx_feature_set_uint(params, "DLSSG.MVecsSubrectHeight", render);
+      ngx_feature_set_uint(params, "DLSSG.MVecsSubrectBaseX", mx);
+      ngx_feature_set_uint(params, "DLSSG.MVecsSubrectBaseY", my);
+      ngx_feature_set_uint(params, "DLSSG.BackbufferSubrectBaseX", left);
+      ngx_feature_set_uint(params, "DLSSG.BackbufferSubrectBaseY", top);
+      ngx_feature_set_uint(params, "DLSSG.BackbufferFrameID", frame);
+      ngx_feature_set_uint(params, "DLSSG.Reset", frame == 0 || frame == 5);
+      ngx_feature_set_float(params, "FrameTimeDeltaInMsec", 1000.f / 30);
+      ngx_feature_set_float(params, "DLSSG.MvecScaleX", 1.f / render);
+      ngx_feature_set_float(params, "DLSSG.MvecScaleY", 1.f / render);
+      ngx_feature_set_float(params, "DLSSG.CameraNear", .1f);
+      ngx_feature_set_float(params, "DLSSG.CameraFar", 1000);
+      ngx_feature_set_float(params, "DLSSG.CameraFOV", 1);
+      if (atlas == 1 && frame == 0) {
+        auto rejected = gpu.makeRecording();
+        for (const auto& invalid : {std::pair{"DLSSG.DepthSubrectBaseX", depthWidth - render + 1},
+             std::pair{"DLSSG.DepthSubrectBaseY", UINT_MAX},
+             std::pair{"DLSSG.MVecsSubrectBaseX", UINT_MAX},
+             std::pair{"DLSSG.MVecsSubrectBaseY", motionHeight - render + 1},
+             std::pair{"DLSSG.BackbufferSubrectBaseX", UINT_MAX},
+             std::pair{"DLSSG.BackbufferSubrectBaseY", 1u}}) {
+          ngx_feature_set_uint(params, invalid.first, invalid.second);
+          checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
+              ngx_fixture_result_invalid_parameter(), "FG subrect overflow rejected");
+          ngx_feature_set_uint(params, "DLSSG.DepthSubrectBaseX", dx);
+          ngx_feature_set_uint(params, "DLSSG.DepthSubrectBaseY", dy);
+          ngx_feature_set_uint(params, "DLSSG.MVecsSubrectBaseX", mx);
+          ngx_feature_set_uint(params, "DLSSG.MVecsSubrectBaseY", my);
+          ngx_feature_set_uint(params, "DLSSG.BackbufferSubrectBaseX", left);
+          ngx_feature_set_uint(params, "DLSSG.BackbufferSubrectBaseY", top);
+        }
+        for (auto alias : {color.Get(), output.Get(), hudless.Get(), depth.Get(), motion.Get()}) {
+          ngx_feature_set_resource(params, "DLSSG.OutputReal", alias);
+          checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
+              ngx_fixture_result_invalid_parameter(), "FG real-output alias rejected");
+        }
+        ngx_feature_set_resource(params, "DLSSG.OutputReal", real.Get());
+        ngx_feature_set_uint(params, "DLSSG.EvalFlags", 2);
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
+            ngx_fixture_result_unsupported_parameter(), "FG unknown evaluate flags rejected");
+        ngx_feature_set_uint(params, "DLSSG.EvalFlags", 0);
+        ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldSubrectBaseX", UINT_MAX);
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
+            ngx_fixture_result_invalid_parameter(), "FG distortion overflow rejected");
+        ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldSubrectBaseX", fieldX);
+        ngx_feature_set_resource(params, "DLSSG.BidirectionalDistortionField", output.Get());
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
+            ngx_fixture_result_invalid_parameter(), "FG distortion/output alias rejected");
+        ngx_feature_set_resource(params, "DLSSG.BidirectionalDistortionField", field.Get());
+        ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", 1);
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
+            ngx_fixture_result_unsupported_parameter(), "FG unsupported precision transform rejected");
+        ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", 0);
+        ngx_feature_set_resource(params, "DLSSG.BidirectionalDistortionField", motion.Get());
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
+            ngx_fixture_result_unsupported_parameter(), "FG two-channel field rejected");
+        ngx_feature_set_resource(params, "DLSSG.BidirectionalDistortionField", field.Get());
+        check(rejected.list->Close(), "FG subrect rejected close");
+        gpu.executeAndWait(rejected.list.Get());
+        if (ngxPresentPixels(gpu, output.Get(), write) != sentinel) fail("FG invalid subrect modified output");
+        if (ngxPresentPixels(gpu, real.Get(), write) != sentinel) fail("FG invalid input modified real output");
+      }
+      auto record = gpu.makeRecording();
+      checkNgxResult(api.evaluate(record.list.Get(), features[variant], params, nullptr),
+          ngx_fixture_result_success(), "FG independent depth/motion subrect");
+      resetAndDestroyParams(api, params);
+      auto readback = createTextureReadback(gpu, output.Get());
+      auto realReadback = createTextureReadback(gpu, real.Get());
+      transition(record.list.Get(), output.Get(), write, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      copyTextureToReadback(record.list.Get(), output.Get(), readback);
+      transition(record.list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, write);
+      transition(record.list.Get(), real.Get(), write, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      copyTextureToReadback(record.list.Get(), real.Get(), realReadback);
+      transition(record.list.Get(), real.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, write);
+      check(record.list->Close(), "FG subrect close");
+      color.Reset(); depth.Reset(); motion.Reset(); output.Reset(); real.Reset(); hudless.Reset(); field.Reset();
+      if (frame == 7) checkNgxResult(api.release(features[variant]), ngx_fixture_result_success(), "FG subrect release before execute");
+      gpu.executeAndWait(record.list.Get());
+      if (frame == 7) gpu.executeAndWait(record.list.Get());
+      uint8_t* mapped = nullptr;
+      check(realReadback.buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "FG real output map");
+      auto expectedReal = realEnabled ? pixels : sentinel;
+      if (realEnabled && rectOnly)
+        for (UINT y = 0; y != colorHeight; ++y) for (UINT x = 0; x != colorWidth; ++x) {
+          if (x >= left && x < left + extent && y >= top && y < top + extent) continue;
+          std::memcpy(expectedReal.data() + (y * colorWidth + x) * 4, sentinel.data(), 4);
+        }
+      for (UINT y = 0; y != colorHeight; ++y)
+        if (std::memcmp(mapped + realReadback.footprint.Offset + y * realReadback.footprint.Footprint.RowPitch,
+                        expectedReal.data() + y * colorWidth * 4, colorWidth * 4))
+          fail("FG real output did not preserve original composited backbuffer or unbound sentinel");
+      realReadback.buffer->Unmap(0, nullptr);
+      check(readback.buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "FG subrect map");
+      std::vector<uint8_t> image(extent * extent * 4);
+      for (UINT y = 0; y != extent; ++y)
+        std::memcpy(image.data() + y * extent * 4, mapped + readback.footprint.Offset +
+            (y + top) * readback.footprint.Footprint.RowPitch + left * 4, extent * 4);
+      for (UINT y = 0; y != colorHeight; ++y) for (UINT x = 0; x != colorWidth; ++x) {
+        if (x >= left && x < left + extent && y >= top && y < top + extent) continue;
+        if (std::memcmp(mapped + readback.footprint.Offset + y * readback.footprint.Footprint.RowPitch + x * 4,
+                        (rectOnly ? sentinel : pixels).data() + (y * colorWidth + x) * 4, 4))
+          fail("FG outside viewport copy/preserve flag mismatch");
+      }
+      readback.buffer->Unmap(0, nullptr);
+      if (std::all_of(image.begin(), image.end(), [](uint8_t value) { return value == 19; }))
+        fail("FG subrect output unwritten");
+      if (!variant) control = std::move(image);
+      else if (variant == 1) {
+        if (frame > 1 && frame != 5 && image != control) ++distortionFrames;
+        reference = std::move(image);
+      } else if (variant == 3) floatReference = std::move(image);
+      else if (image != (float32 ? floatReference : reference)) {
+        unsigned maximum = 0, changed = 0;
+        for (size_t i = 0; i != image.size(); ++i) {
+          maximum = std::max(maximum, unsigned(std::abs(int(image[i]) - int((float32 ? floatReference : reference)[i]))));
+          changed += image[i] != (float32 ? floatReference : reference)[i];
+        }
+        std::printf("OWNED_D3D12_NGX_FG_DISTORTION_MISMATCH frame=%u variant=%u maximum=%u changed=%u\n",
+            frame, variant, maximum, changed);
+        fail("FG atlas differs from independently cropped same-format reference");
+      }
+    }
+    std::printf("OWNED_D3D12_NGX_FG_SUBRECT frame=%u exact=1 independent_origins=1 resources_released=1\n", frame);
+    std::printf("OWNED_D3D12_NGX_FG_DISTORTION frame=%u field_effect=%u crop_exact=1 float32_exact=1 resources_released=1\n", frame, UINT(reference != control));
+    std::printf("OWNED_D3D12_NGX_FG_REAL frame=%u exact_original=1 unbound_untouched=1 hudless_distinct=1 replay=%u\n", frame, UINT(frame == 7));
+  }
+  if (!distortionFrames) fail("FG distortion field had no observable effect");
+  std::printf("OWNED_D3D12_NGX_FG_DISTORTION_PASS affected_frames=%u half_resolution=1 rejected=4 enable_disable=1\n", distortionFrames);
+  std::puts("OWNED_D3D12_NGX_FG_SUBRECT_PASS frames=8 overflow_rejected=1 output_untouched=1 outside_copied=1");
+  std::puts("OWNED_D3D12_NGX_FG_REAL_PASS frames=8 aliases_rejected=5 rect_only=1 release_replay=1");
+}
+
 void runPublicRr(const NgxApi &api, Gpu &gpu, unsigned variant=0) {
   const char *variantName=variant==1?"linear-":variant==2?"packed-":variant==3?"mirror-":"";
   auto params = allocateParams(api);
@@ -318,6 +543,7 @@ int main(int argc, char** argv) {
   checkCapabilities(api,gpu);
   runPublicFg(api,gpu);
   runPublicFgSceneChange(api,gpu);
+  runPublicFgSubrect(api,gpu);
   if (fgOnly) {
     checkNgxResult(api.shutdown1(gpu.device.Get()),ngx_fixture_result_success(),"public FG shutdown");
     std::puts("OWNED_D3D12_NGX_FG_PASS capacity=1 native_output=1 unsupported_mfg=1");

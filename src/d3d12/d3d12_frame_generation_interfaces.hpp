@@ -19,6 +19,7 @@ struct MTL_FRAME_GENERATION_PREPARE_DESC {
   FLOAT frame_time_delta_ms, camera_near, camera_far, camera_fov_vertical_radians, view_space_to_meters;
   FLOAT camera_position[3], camera_up[3], camera_right[3], camera_forward[3];
   UINT camera_info_present;
+  UINT depth_subrect_x, depth_subrect_y, motion_subrect_x, motion_subrect_y;
 };
 struct MTL_FRAME_GENERATION_GENERATE_DESC {
   UINT StructSize;
@@ -29,6 +30,12 @@ struct MTL_FRAME_GENERATION_GENERATE_DESC {
   INT generation_rect_left, generation_rect_top, generation_rect_width, generation_rect_height;
   FLOAT min_luminance, max_luminance;
   UINT flags; // FFX tear/reset/debug-view bits 0..2; captured at recording.
+  ID3D12Resource *real_output;
+  D3D12_RESOURCE_STATES real_output_state;
+  UINT output_subrect_only; // NGX EvalFlags bit0: preserve both outputs outside the viewport.
+  ID3D12Resource *distortion;
+  D3D12_RESOURCE_STATES distortion_state;
+  UINT distortion_x, distortion_y, distortion_width, distortion_height;
 };
 // Native-only ABI: old phase-result consumers must not use these vtables.
 DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a020", IMTLD3D12FrameGenerationState) : public IUnknown {
