@@ -21,6 +21,30 @@
 
 현재 판정에 필요한 runtime033–044의 실패/성공 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)에 남긴다. 과거 paused/resumed 실행 지시와 중복 인수인계는 삭제했다. 최신 상태를 과거 실패로 되돌리거나 보존된 PASS를 현재 변경의 재검증으로 바꾸지 않는다. Agility SDK617/618의 owned Core/Main identity·inbox/SxS 정책은 유지하며 다른 package나 실제 게임의 전체 호환성을 주장하지 않는다.
 
+## NGX FG subrect·OutputReal·distortion — 2026-10-10
+
+Pristine GPTK 4.0b2 D3DMetal의 NGX evaluate/replay 경로를 REA로 대조하고 공개 MetalFX API로 독립 구현했다. Reference SHA256은 `f5b56df1b8fe8b364dd9530651a3769c8aed948bd343be3b4510604d503e2bad`이며, 실제 코드 복사나 production fallback은 없다. [Reference 조사](../build/local/d3d12-gap-rea-20261010/coverage-final.json)와 [FG 파라미터 근거](../build/local/gap-implementation-20261010/rea-fg-keys.json)는 실행 proof와 구분한다.
+
+| 계약 | 구현·검증 | 유지한 경계 |
+| --- | --- | --- |
+| Depth/MVecs/Backbuffer subrect | Depth/MV의 독립 source origin을 Prepare snapshot에서 crop한다. Creation display 크기를 active viewport로 쓰고 더 큰 물리 backbuffer의 해당 위치에 생성한다. DepthSubrect extent가 active render 크기를 선택한다 | InputBackbuffer/HUDLess/OutputInterpolated의 별도 독립 origin alias는 지원하지 않는다 |
+| OutputReal | 원래 HUD-composited Backbuffer를 별도 destination에 정확히 복사한다. Null destination은 미기록, alias·device·shape·format 오류는 Prepare 전에 거부한다 | EvalFlags bit0은 active viewport만 두 output에 쓰고 바깥 sentinel을 보존한다. 기본값은 바깥 원본도 복사한다. 알 수 없는 flag는 거부한다 |
+| BidirectionalDistortionField | RGBA16_FLOAT/RGBA32_FLOAT와 독립 field subrect를 받아 descriptor enable·native binding·GPU retirement 수명을 연결했다. Half-resolution atlas는 기존 copy로 active 크기/origin0에 정규화한다 | LowPrecision scale/bias 변환은 미지원이다. Native half-resolution atlas와 canonical crop의 차이를 직접 재현했으며, field 값을 임의 rescale하지 않는다 |
+
+최종 [공개 NGX 검증](../build/local/gap-implementation-20261010/qa-distortion-final2/result.json)은 ARM64X/FEX x64에서 5개 layout × 8 frames, FP16/FP32 각각 cropped reference와 전체 active pixel exact, invalid field 4종·output alias·reset·enable/disable·release-before-execute·replay를 통과했다. 기존 9-frame/replay와 14-frame scene-change 검사도 포함한다. [독립 native 대조](../build/local/gap-implementation-20261010/native-distortion-parity.json)는 같은 포맷의 canonical field 기준 80개 출력이 byte-identical이다. FP16과 FP32의 half-resolution 결과 자체는 native에서도 다를 수 있으므로 서로 같다는 계약을 만들지 않았다. [기존 native FG 회귀](../build/local/gap-implementation-20261010/native-fg-regression.log)는 normalization·snapshot·history·diagnostic/replay를 통과했다.
+
+Metal API/Shader Validation 오류는 없고 전용 Wine prefix는 종료 후 제거했다. [Staged runtime](../build/local/gap-implementation-20261010/stage-distortion.json)의 manifest는 `5eabec6ffe03124d7b30b278c4790af3c9184f588a9bd9ae8daec98d16dd8721`, private FG bridge는 v8이다. 이 증거는 macOS27의 지정 x64 consumer이며 WoW64·다른 OS/GPU·실제 게임 렌즈 왜곡 품질·물리 표시/FPS proof가 아니다. Apple field channel/units의 절대 규격은 별도 검증 경계로 남긴다.
+
+## SampleCmpGrad/Bias 공개 capability — 2026-10-10
+
+기존 DXIL opcode 254/255 lowering의 dynamic cube comparison-gradient 오류를 수정하고 OPTIONS21의 `SampleCmpGradientAndBiasSupported`를 TRUE로 공개했다. 해당 명령을 사용하는 shader만 AIR 2.8 / Metal 4.0 이상으로 컴파일한다. 일반 Metal 3.2와 Atomic64 Metal 4.1 경로는 유지하며 `AIRCONV_VERSION=36`으로 이전 결과를 무효화한다. 공개 SM6.5/FL12_1과 `ExtendedCommandInfoSupported=FALSE`는 유지한다.
+
+[실제 공개 API/GPU 검증](../build/local/gap-implementation-20261010/qa-advanced-texture-cmp-final/result.json)은 54개 ordered case를 통과했다. 새 30개는 6개 texture shape의 Grad CS/VS/PS와 Bias CS/PS이며, mip/view/array/offset/clamp·status·sentinel을 확인한다. Public OPTIONS21 응답도 같은 실행에서 검사한다. 새 frozen DXIL 78개는 final DXC 1.9.2609.5로 생성했고 실행 입력과 동일함을 확인했다. 추가 GS/HS/DS/AS/MS/library producer 컴파일은 해당 stage의 GPU 실행 proof가 아니다.
+
+[Fresh runtime](../build/local/gap-implementation-20261010/stage-cmp.json) manifest는 `4f8ff968162b7b76bc3639054ea8d92bfbeef51afaa742303b8860ff673e445a`다. ARM64X/FEX x64에서 owned native Core·Metal API/Shader Validation 오류 없음·foreign backend 없음·prefix 종료/제거를 확인했다. [실패와 native 대조](IMPLEMENTATION-HISTORY.ko.md#comparison-gradient-native-오류와수정--2026-10-10)는 capability 숫자 변경만으로 완료하지 않았음을 기록한다. WoW64 GPU·전체 SM6.6 conformance·실게임 proof는 아니다.
+
+동일 runtime의 [SM6](../build/local/gap-implementation-20261010/qa-sm6-cmp-final/result.json)·[DXIL texture](../build/local/gap-implementation-20261010/qa-dxil-texture-cmp-final/result.json)·[feature-level](../build/local/gap-implementation-20261010/qa-feature-level-cmp-final/result.json)·[NGX FG 통합](../build/local/gap-implementation-20261010/qa-fg-integrated/result.json)도 PASS다. SM6는 현재 HLSL/generator로 준비한 입력을 사용했다. 저장소의 오래된 `sm6-cs_fp64.dxil`과 현재 consumer가 불일치하는 원본 실패는 이력에 남겼으며, 그 frozen 파일을 이번 변경에서 덮어쓰지 않았다.
+
 ## D3DMetal 비교 기반 최적화 이식 — 2026-10-10
 
 최종 phase3e 빌드에서 16개 bounded D3D12 GPU suite와 RR 검증 ON/OFF 각각51개 출력이 통과했다. 조사한19개 중18개 항목의 적합한 경로에 최적화를 적용했으며, 지원 조건 밖의 fallback은 유지한다. **commit 시점 Present 예약은 미이식이고, 실게임 FPS 개선은 아직 입증하지 않았다.** 게임 전후 비교는 사용자가 나중으로 미뤘다. Direct ARM64X/FEX 실행이며 generic runner의 architecture gate는 바꾸지 않았다. 이전 cut의 FAIL과 판정 정정은 [이력](IMPLEMENTATION-HISTORY.ko.md#d3dmetal-최적화-phase2cphase2dphase2e-실제-검증--2026-10-10)에 보존한다.
@@ -35,7 +59,7 @@
 | Resource view | 기존 descriptor equality 전체를 포함한 hash lookup. phase2e 당시 cut resources에서64texture·64buffer keys,2resource generation,320probes·2560words, alias/BC-tail/unaligned BC matrix PASS | stable vector/index, 기존 lock과 resource 세대별 수명 유지. native view-pool immediate 계약(current cut, `CREATE7/SET22/COPY74/ordinary0`, `executions=2 slots=8 words=128`) PASS. 공개 unified view-pool 전체 이식 완료는 아님 |
 | Shader/PSO | immutable shader stage와 device-local native library 공유, function constant 특수화. 최종 phase3e에서 pipeline-cache/library 및 tessellation·mesh·statistics·stream-output 전체 지정 suite PASS | full canonical key equality, single-flight·bounded retention·generation retirement 유지. 새 compiler 인스턴스에도 HS 정규화를 실행하도록 수정하고 AIRCONV_VERSION35로 기존 artifact를 무효화했다. Tessellation 120 distinct PSO pair의 warm 초기화/AIR/library/specialization 작업0, SO+statistics의 실제 lazy Draw에서는 cold AIR2/library2를 다른 warm PSO가 같은 key로 재사용한다. 이는 지정 fixture의 증거이며 전체 shader/DXR·실게임 호환성 보증이 아니다 |
 | SR/RR 생성 | descriptor별8-entry cache와 SR/RR 비동기 초기화. RR encode에 기존 public fence를 연결한다. FIFO8의9key·10insert·4hit/non-promoting eviction은 앞선 trace에서 확인했다 | RR version `0x10000`, history reset 순서, evicted generation과 fence의 GPU retirement 수명 유지. 최종 phase3e의 ON/OFF 각각36full+15cache 출력 전체가 같은 모드의 독립 native reference와 byte-identical이고16입력도 일치했다. 전역 compiler cold-cache와 과거 timeout의 인과관계는 미확정이며, 이 결과를 게임 FPS 개선으로 해석하지 않는다 |
-| Temporal 입력 | 호환 SR color offset과 identity FG depth/MV snapshot 직접 사용 | partial SR depth/motion/reactive는 edge staging 유지. FG Prepare snapshot·비동일 normalization·output scatter 유지. FG는 teardown NSLock 재진입을 고친 Wine-darwin 패치 후 eventfix 검증이9gate PASS(19paired×18probe max error0≤tol3, full-frame every-pixel 아님)다. nonzero FG source-origin ABI는 추가하지 않음 |
+| Temporal 입력 | 호환 SR color offset과 identity FG depth/MV snapshot 직접 사용 | partial SR depth/motion/reactive는 edge staging 유지. FG Prepare snapshot·비동일 normalization·output scatter 유지. FG는 teardown NSLock 재진입을 고친 Wine-darwin 패치 후 eventfix 검증이9gate PASS(19paired×18probe max error0≤tol3, full-frame every-pixel 아님)다. 이 최적화 cut에는 nonzero source-origin ABI가 없었으며, 후속 구현은 위 NGX FG 절의 별도 증거를 따른다 |
 
 **Phase3e 최종 검증:** [build report](../build/local/d3dmetal-opt-port-20261009/phase3e-build-report.json)(`4bc643b4…`)의 paired/native/install/stage/verify가 모두 통과했다. [567-file source archive](../build/local/d3dmetal-opt-port-20261009/phase3e-source-snapshot.tar)(`6f3892a7…`)는 phase3d와 RR 파일 하나만 다르고 ABI35는 유지한다. [통합 판정](../build/local/d3dmetal-opt-port-20261009/phase3e-integration-acceptance.json)은16suite와 RR ON/OFF를 같은 runtime manifest `515d2dec…`에 연결한다. 모든 실행의 exit0·validation 오류0·prefix 제거와 실제 owned module 로드를 확인했다. [최종 RR 수명 검토](../build/local/d3dmetal-opt-port-20261009/phase3e-rr-review.json)와 [폐기 runtime 정리](../build/local/d3dmetal-opt-port-20261009/runtime-payload-retirement.json)를 남겼다. 최종 runtime, 전후 비교용 baseline, fixed-Wine producer를 보존하고22개 과거 runtime의 bin/lib/share만 제거했으며 manifest·로그·소스·검증 자료는 보존했다.
 
@@ -112,7 +136,7 @@ Partial SR depth와 motion을 함께 원본 subrect로 전달하면 poisoned pad
 | D3D12 NGX / temporal 연동 | x64/WoW64 MSVC parameter facade와16개 D3D12 export, owned SR·alpha·feature11 native MetalFX FG·feature13 RR | FG는 count/index1만 지원하며 Present/pacing은 caller 소유다. Root30 AMD phase 경로의 proof와 원본 WoW64 checker 실패/offline 재분석은 역사적 기록이다. 현재 native FG 양 ABI GPU·실제 표시 proof는 [현재 경계](#multi-frame-fg와-native-residency-현재-경계)를 따르며 RR은 [non-fused native 양 ABI proof](#rr-native-validation-재검증--2026-10-07)를 따른다. NVIDIA 모델/Streamline 실게임/품질 동등성 완료는 주장하지 않음 |
 | D3D12 FSR SR / FG | x64/WoW64 MetalFX SR와 원본 pinned AMD SDK source-built swapchain/UI/pacing + native MetalFX FG. Generated output 최대1개 | FSR2–4 outputs는 NO_PROVIDER다. 기존 AMD N1–4 알고리즘 proof·Root34 skipped ledger/runner false는 역사적으로 보존하며 현재 native FG의 증거로 재사용하지 않는다. 원본 SDK 전환 검증 root는 `build/local/fsr-metalfx-20261007-43df9ae7`; 양 ABI FSR·NGX FG 6개 GPU 실행이 API+Shader Validation으로 통과했다 |
 | UMA memory report / DXGI budget notification | OS-visible RAM 호환 정책·Metal cap·x86 SIZE_T 포화 유지; Query와 같은 retained WMT device의64-bit Budget을 등록 중 polling하고 변경 시 event signal | [x64/WoW64 native residency와 controlled-source helper proof](#dxgi-budget-notification-완료와-focused-proof). 실제 dedicated VRAM/carveout·Windows scheduler budget·예약에 의한 실제 budget 제어를 주장하지 않음 |
-| Metal backend | D3D12 Metal4 allocator/queue/compiler/query/presenter 경로, 일반 shader AIR 타깃 Metal3.2·atomic64 특수 variant Metal4.1; D3D11 classic backend/upstream 타깃 유지 | 지정 mixed-cut fixture acceptance와 [non-execution UAV fence 양 ABI proof](#d3d12-shader-타깃과-non-execution-uav-fence). 측정하지 않은 성능 향상·단일cut 전체 suite 성공을 주장하지 않음 |
+| Metal backend | D3D12 Metal4 allocator/queue/compiler/query/presenter 경로, 일반 shader AIR 타깃 Metal3.2·SampleCmpGrad/Bias Metal4.0·atomic64 특수 variant Metal4.1; D3D11 classic backend/upstream 타깃 유지 | 지정 mixed-cut fixture acceptance와 [non-execution UAV fence 양 ABI proof](#d3d12-shader-타깃과-non-execution-uav-fence). 측정하지 않은 성능 향상·단일cut 전체 suite 성공을 주장하지 않음 |
 
 ### RR native validation 재검증 — 2026-10-07
 
@@ -189,7 +213,7 @@ Genuine [DXC1.9.2609.5/FXC10.1 producer provenance](tests/dxil/conservative-rast
 
 ### D3D12 shader 타깃과 non-execution UAV fence
 
-macOS27 최소 환경에서 일반 D3D12 compute/graphics·RT/WG entry의 AIR 타깃은 **Metal3.2**다. `DeviceMemoryBarrier()`는 device+texture memory의 실제 non-execution fence이며, divergent 호출을 새 threadgroup rendezvous로 대체하지 않는다. Atomic64 특수 variant는 Metal4.1을 유지하고 D3D11은 변경하지 않는다. 기존 PSO cache key가 shader target을 포함하므로 이전 타깃의 캐시는 별도 호환 shim 없이 분리된다.
+macOS27 최소 환경에서 일반 D3D12 compute/graphics·RT/WG entry의 AIR 타깃은 **Metal3.2**다. `DeviceMemoryBarrier()`는 device+texture memory의 실제 non-execution fence이며, divergent 호출을 새 threadgroup rendezvous로 대체하지 않는다. SampleCmpGrad/Bias opcode가 있는 DXIL은 Metal4.0 이상을 선택한다. Atomic64 특수 variant는 Metal4.1을 유지하고 D3D11은 변경하지 않는다. 기존 PSO cache key가 shader target을 포함하므로 이전 타깃의 캐시는 별도 호환 shim 없이 분리된다.
 
 Immutable runtime-08(manifest SHA256 `110ae822bc7399bfd2aec49588f0a5d5a9e5cbac94d6251ccf7127668620eb42`)의 [x64](../build/local/p3-20261003/runtime08-x64-02/result.json)·[WoW64](../build/local/p3-20261003/runtime08-x86-01/result.json)는 각각 **24 ordered numerical cases·closed-recording replay**, API+Shader Validation, 실제 owned native module 확인, exit0·PASS·`validation_errors=[]`·foreign backend 없음이다. BC1의 RG32UINT write→RGBA16UINT read를 같은 dispatch에서 실제 소비했다. Metal3.1 checkpoint는 이 device-only barrier를 누락해 alias가 이전 UAV-clear 값을 읽었으며 [첫 실제 bad word](../build/local/p3-20261003/runtime07-x64-worddiag03/stderr.log)를 보존한다. Runtime08-x64-01은 transport가 bootstrap 도중 중단한 비증거다.
 

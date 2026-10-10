@@ -32,7 +32,13 @@
 
 설계가 존재하거나 컴파일됐다는 것과 public/GPU acceptance를 구분한다. 각 항목의 현재 적용·실행 결과는 리뷰 문서의 implementation ledger로 갱신한다. 기존 ring/FIFO·fence threshold semantics를 전면 재작성하거나 전역 GPU waits로 대체하지 않는다.
 
+## 추가 FG 계약 구현 — 2026-10-10
+
+NGX FG의 독립 Depth/MVecs/Backbuffer subrect, OutputReal, FP16/FP32 BidirectionalDistortionField는 [구현과 공개/native 검증](CORE-IMPLEMENTATION-STATUS.ko.md#ngx-fg-subrectoutputrealdistortion--2026-10-10)을 마쳤다. 지정 ARM64X/FEX x64 proof이며, 새 계약의 WoW64·실게임 렌즈 왜곡 품질·LowPrecision 변환·독립 InputBackbuffer/HUDLess/OutputInterpolated origin은 별도 미검증/미지원 경계다. 기존 단일 generated output 제한과 truthful status 정책은 유지한다.
+
 ## 남은 공통 게임 기능
+
+SampleCmpGrad/Bias는 dynamic cube gradient 수정과 54-case 공개 검증 후 [OPTIONS21 지원을 공개](CORE-IMPLEMENTATION-STATUS.ko.md#samplecmpgradbias-공개-capability--2026-10-10)했다. 이는 상위 SM/FL 전체 admission 상향과 별개다.
 
 | 항목 | 이미 있는 구현/증거 | 남은 조건 |
 | --- | --- | --- |
@@ -41,6 +47,8 @@
 | HDR10+ GAMING | 일반 HDR10/scRGB/PQ·EDR, generic transport 조사, Samsung APP/GPU·calibration 근거 | Supported Gaming payload/SSTM·native mode/readback·owner/restore·calibrated GPU tone-map·실제 적합 출력. Mandatory sink ACK를 임의로 요구하지 않음 |
 
 이 항목은 게임 관련 기능의 미완료로 유지한다. ALLM/SBTM/HDR10+ video·DX11 SR·validation suppression·내부 상태 echo로 대체하지 않는다. 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)과 [현재 리뷰의 native 계약](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#outstanding-externalnative-contracts)을 따른다.
+
+10월10일 재확인에서 native FP16 drawable 자체는 사용 가능하지만 premultiplied FP16의 기본 G10 색공간과 SDR residual 경로의 정합 oracle는 확보하지 못했다. 형식 제한만 해제하지 않는다. 설치된 macOS27 `CAEDRMetadata` 공개 API는 HDR10/HLG이며 검증된 Gaming SSTM 출력 제어 경로는 없다. Pristine GPTK4.0b2의 Composition factory는 E_NOTIMPL, SetHDRMetaData는 무처리 S_OK여서 이를 구현으로 이식할 수 없다. 이번에 sink EDID/VSVDB·물리 출력을 새로 측정한 것은 아니며, 플랫폼 전체의 불가능성으로 확대하지 않는다.
 
 ## 게임/장치 요구가 확인될 때 확장할 항목
 

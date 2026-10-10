@@ -10,6 +10,28 @@
 - **2026-10-09 정리 직후 보유 범위:** `build/local/`에는 `zzz-ngx-enrollment-20261009`, `zzz-dlss-fix-20261009`, `zzz-fex-research-20261009`, `zzz-fex-opt-20261009`가 남았다. 이후 새 보존 증거는 아래 날짜별 항목으로 구분한다. 과거 다른 root의 PASS/hash를 현재 보유한 원본이나 새 재검증으로 읽지 않는다. 로컬 문서 검사는 없는 build 증거 링크를 별도 집계한다.
 - 긴 ledger와 삭제한 handoff/review의 원본을 보관했던 `build/local/repo-cleanup-20261008/originals/`도 현재 없다. 이 문서의 요약을 그 원본 전체가 보존돼 있다는 주장으로 읽지 않는다.
 
+## NGX FG 미지원 계약 후속 — 2026-10-10
+
+현재 계약은 [CORE의 FG 절](CORE-IMPLEMENTATION-STATUS.ko.md#ngx-fg-subrectoutputrealdistortion--2026-10-10)을 따른다. `build/local/gap-implementation-20261010/`에서 subrect → OutputReal → distortion 순으로 별도 source cut/runtime을 빌드했다. [수정 전 공개 재현](../build/local/gap-implementation-20261010/qa-before/result.json)은 세 입력 모두 `0xbad00010`으로 거부됨을 확인했고, [subrect](../build/local/gap-implementation-20261010/qa-subrect/result.json)·[OutputReal](../build/local/gap-implementation-20261010/qa-real/result.json)·[최종 distortion](../build/local/gap-implementation-20261010/qa-distortion-final2/result.json)은 해당 단계의 실제 public GPU PASS다. 이전 두 runtime의 bin/lib/share는 검증 종료 후 정리했고 manifest와 증거는 보존했다.
+
+독립 MetalFX half-resolution atlas는 canonical crop과 달랐다([원본 실패](../build/local/gap-implementation-20261010/distortion-half-results.jsonl)). Owned 경로는 기존 blit으로 field를 active 크기/origin0에 crop하며 값을 바꾸지 않는다. 첫 공개 검사의 FP16 대 FP32 비교도 [1단계/128성분 차이](../build/local/gap-implementation-20261010/qa-distortion-diagnostic/stdout.log)를 발견했다. [독립 native FP32](../build/local/gap-implementation-20261010/distortion-half32-results.jsonl)에서 포맷 차이를 재현해, 허용치를 늘리는 대신 각 포맷의 canonical control을 따로 만들었다. [최종 native 대조 80출력](../build/local/gap-implementation-20261010/native-distortion-parity.json)은 전부 byte-identical이다. 두 독립 atlas probe의 실패를 전체 PASS로 바꾸지 않는다.
+
+[기존 native FG 회귀](../build/local/gap-implementation-20261010/native-fg-regression.log)와 [공개 FSR shared-ABI 회귀](../build/local/gap-implementation-20261010/qa-fsr-abi/result.json)는 normalization/snapshot/history/lifetime/replay를 통과했다. 후자는 기존 FSR fixture의 direct/grouped/debug 경로만 실행했으며 proxy/실제 presentation은 이번에 재검증하지 않았다. 모든 해당 GPU 실행에서 Metal API/Shader Validation 오류가 없고 전용 prefix를 종료·제거했다.
+
+## Comparison gradient native 오류와수정 — 2026-10-10
+
+[첫 공개 실행](../build/local/gap-implementation-20261010/qa-advanced-texture/result.json)은 기존 24개와 새 20개 case 이후 cube Grad CS의 row1에서 0을 읽어 기대값 1과 달랐다. 원본 실패와 oracle를 보존했다. Direct SM50Compile의 AIR를 독립 native consumer에서도 실행해 동일 실패를 재현했고, 11개 scalar operand readback은 모두 올바랐다. Shader Validation을 진단 목적으로 끄더라도 실패했다.
+
+Native MSL factorial 대조에서 Metal 3.2는 실패하고 Metal 4.0은 loop unrolling을 막아도 통과했다. 같은 owned AIR의 명령을 그대로 두고 metadata만 AIR 2.8 / Metal 4.0으로 바꾼 [control](../build/local/gap-implementation-20261010/cube-grad-air400.log)은 row1=1과 radial row20=0을 포함한 수치를 올바르게 반환했다. 이 근거로 해당 opcode shader만 target을 올리고 compiler cache version을 36으로 갱신했다. Pristine [GPTK 재조사](../build/local/gap-implementation-20261010/rea-comparison-final.json)는 OPTIONS21의 두 optional bit가 FALSE임을 확인했으며, 외부 libmetalirconverter를 생산 의존성으로 가져오지 않았다.
+
+[최종 공개 실행](../build/local/gap-implementation-20261010/qa-advanced-texture-cmp-final/result.json)은 OPTIONS21 Grad/Bias TRUE와 54개 GPU case를 통과했다. [실행·cleanup receipt](../build/local/gap-implementation-20261010/qa-advanced-texture-cmp-final/execution.json)는 actual native module/hash·validation·전용 prefix 제거를 기록한다. Frozen 78개 producer 출력도 검증 입력과 byte-identical이다. 공개 계약과 검증 범위는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#samplecmpgradbias-공개-capability--2026-10-10)를 따른다.
+
+통합 SM6의 [첫 실패](../build/local/gap-implementation-20261010/qa-sm6-cmp/result.json)는 `fp64` 한 사례에 한정됐다. [기존 frozen shader disassembly](../build/local/gap-implementation-20261010/cmp-published-final/stale-fp64.ll)는 1-thread/단일 uint store인 과거 SM6.0 입력이며 현재 FP64 수치 consumer와 다르다. 기존 `build-sm6.sh`의 cs_6_6/preserve recipe로 별도 입력을 생성한 [최종 SM6](../build/local/gap-implementation-20261010/qa-sm6-cmp-final/result.json)는 전체 및 stress20 회귀를 통과했다. 원본 shader·실패와 consumer 기대값은 보존했다.
+
+최종 self-review에서 새 Bias AS/MS producer의 4개 lane이 payload/vertex를 함께 쓰는 문제를 찾아 단일 writer와 group 동기화로 수정하고 78개 입력을 재생성했다. 이 stage들은 producer 컴파일 proof이며 GPU proof로 세지 않는다. Texture consumer의 첫 실행은 exit0이었지만 기존 QA adjudicator가 순수 `abs`/`float` 호출을 허용하지 않아 판정을 중단했다. 격리 helper의 허용 목록만 보완했고 실제 runner 조건은 변경하지 않았다. 최종 [texture](../build/local/gap-implementation-20261010/qa-dxil-texture-cmp-final/result.json)·[feature-level](../build/local/gap-implementation-20261010/qa-feature-level-cmp-final/result.json)·[FG 통합](../build/local/gap-implementation-20261010/qa-fg-integrated/result.json) 모두 native/module/validation gate를 통과했다. CPU build16·staging49·diagnostics110·NGX facade ABI도 PASS다. Staging은 native clang에 SDKROOT를 명시해야 했으며 테스트 코드는 바꾸지 않았다.
+
+Subrect/real/distortion의 이전 runtime payload는 검증 종료와 open-file 부재 확인 후 정리했고 manifest·로그·capture는 보존했다. 최신 runtime-cmp와 peer 비교 runtime은 유지한다. 모든 이번 전용 GPU/producer prefix는 종료·제거했다.
+
 ## D3DMetal 최적화 첫 병렬 cut — 2026-10-10
 
 QA root는 `build/local/d3dmetal-opt-port-20261009/`다. [paired PE build](../build/local/d3dmetal-opt-port-20261009/paired-foundation/result.json)와 native build/install 후 격리 ARM64X/FEX에서 실행했다. `runtime-foundation2`는 SR 경계 수정이 추가된 native cut이며 이전 `runtime-foundation`의 비-temporal 결과와 구분한다. 모든 아래 positive GPU 실행은 Metal API/Shader Validation을 켰다.

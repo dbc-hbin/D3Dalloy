@@ -84,7 +84,8 @@ Meson의 선언상 최소 버전은 1.3.0이며 검증에 사용한 버전과 �
 D3D12 일반 shader의 AIR 타깃은 **Metal 3.2**다. macOS 27 최소 환경에서
 `DeviceMemoryBarrier()`를 실행 동기화 없는 device/texture fence로 낮춘다.
 Atomic64 특수 variant의 Metal 4.1 타깃과 Metal 4 backend API 사용은 별개이며,
-D3D11의 upstream 타깃은 변경하지 않는다. [양 ABI 실제 fence·alias proof](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#d3d12-shader-타깃과-non-execution-uav-fence)를 따른다.
+SampleCmpGrad/Bias를 사용하는 DXIL은 dynamic cube gradient 정합을 위해 Metal 4.0 이상을 선택한다.
+D3D11의 upstream 타깃은 변경하지 않는다. [양 ABI 실제 fence·alias proof](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#d3d12-shader-타깃과-non-execution-uav-fence)와 [comparison sampling 검증](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#samplecmpgradbias-공개-capability--2026-10-10)을 따른다.
 
 로컬 입력은 다음과 같이 두며 source 배포에는 포함하지 않는다.
 
