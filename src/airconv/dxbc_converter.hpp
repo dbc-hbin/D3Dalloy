@@ -709,7 +709,8 @@ std::unique_ptr<BindingMap> setup_binding_rootsig(
 );
 
 SM50_SHADER_METAL_VERSION required_metal_version(const llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version);
-void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version);
+void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version,
+                         const SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel = nullptr);
 
 void setup_temp_register(
   const ShaderInfo *shader_info, io_binding_map &resource_map,

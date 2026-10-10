@@ -11,8 +11,8 @@
 
 namespace dxmt {
 
-// macOS 27 permits device/texture fences without imposing a threadgroup rendezvous.
-inline constexpr auto kD3D12ShaderMetalVersion = SM50_SHADER_METAL_320;
+// D3D12 device admission requires a Metal 4 compiler; Atomic64 stages select 4.1.
+inline constexpr auto kD3D12ShaderMetalVersion = SM50_SHADER_METAL_400;
 
 struct GraphicsPipelineExtras;
 HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Digest &key,

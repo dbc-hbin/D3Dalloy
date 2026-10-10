@@ -102,7 +102,9 @@ runOptimizationPasses(llvm::Module &M) {
         auto *pointer = dyn_cast<PointerType>(argument->getType());
         auto *type = pointer && !pointer->isOpaque() && pointer->getAddressSpace() == 2
             ? dyn_cast<StructType>(pointer->getNonOpaquePointerElementType()) : nullptr;
-        if (type && type->hasName() && type->getName() == "struct._sampler_t")
+        // AIR 2.8 reads use an implicit sampler, not a nullable D3D12 descriptor.
+        if (type && type->hasName() && type->getName() == "struct._sampler_t" &&
+            !call->getCalledFunction()->getName().startswith("air.read_"))
           present = builder.CreateAnd(present, builder.CreateIsNotNull(argument));
       }
       auto *head = call->getParent();

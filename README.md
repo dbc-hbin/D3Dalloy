@@ -81,11 +81,11 @@ llvm-mingw clang **22.1.8**, native LLVM **15.0.7** static libraries와 설치�
 Meson의 선언상 최소 버전은 1.3.0이며 검증에 사용한 버전과 구분한다.
 아래 x86_64 native Wine 경로는 Apple Silicon에서 Rosetta가 필요하다.
 
-D3D12 일반 shader의 AIR 타깃은 **Metal 3.2**다. macOS 27 최소 환경에서
+D3D12는 Metal4 compiler를 사용할 수 있는 장치에서 일반 shader의 AIR 타깃도 **Metal 4.0**을 우선한다.
+현재 D3D12 device 생성 자체가 Metal4 compiler를 요구한다. macOS 27 최소 환경에서
 `DeviceMemoryBarrier()`를 실행 동기화 없는 device/texture fence로 낮춘다.
-Atomic64 특수 variant의 Metal 4.1 타깃과 Metal 4 backend API 사용은 별개이며,
-SampleCmpGrad/Bias를 사용하는 DXIL은 dynamic cube gradient 정합을 위해 Metal 4.0 이상을 선택한다.
-D3D11의 upstream 타깃은 변경하지 않는다. [양 ABI 실제 fence·alias proof](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#d3d12-shader-타깃과-non-execution-uav-fence)와 [comparison sampling 검증](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#samplecmpgradbias-공개-capability--2026-10-10)을 따른다.
+Atomic64 특수 variant는 Metal 4.1을 유지하며, 공용 compiler의 명시적 Metal 3.1/3.2와
+D3D11의 upstream 타깃도 보존한다. [타깃 선택·양 ABI fence 증거](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#d3d12-shader-타깃과-non-execution-uav-fence)와 [comparison sampling 검증](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md#samplecmpgradbias-공개-capability--2026-10-10)을 따른다.
 
 로컬 입력은 다음과 같이 두며 source 배포에는 포함하지 않는다.
 

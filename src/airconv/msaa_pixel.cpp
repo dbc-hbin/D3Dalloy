@@ -911,21 +911,6 @@ Error maskSampleFrequency(Module &module, uint32_t sampleMask) {
   return Error::success();
 }
 
-void preparePixelTarget(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options) {
-  const auto variant = options.variant & ~SM50_MSAA_ATOMIC_HELPERS;
-  auto *version = module.getNamedMetadata("air.version");
-  const auto minor = mdconst::extract<ConstantInt>(version->getOperand(0)->getOperand(1))->getZExtValue();
-  // Select the final target before application lowering; keep coverage and atomic AIR 2.9 unchanged.
-  if (variant == SM50_MSAA_COVERAGE || minor >= 8) return;
-  auto &context = module.getContext();
-  module.setTargetTriple("air64_v28-apple-macosx26.0");
-  version->clearOperands();
-  version->addOperand(MDTuple::get(context, {
-    ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 2)),
-    ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 8)),
-    ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 0))
-  }));
-}
 
 Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options, bool coarseRequested,
                      bool conservative) {

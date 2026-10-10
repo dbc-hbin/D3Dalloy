@@ -38,6 +38,20 @@ Subrect/real/distortion의 이전 runtime payload는 검증 종료와 open-file 
 
 [수정 후 공개 실행](../build/local/gap-implementation-20261010/qa-advanced-texture-hull/result.json)은 기존54개와 HS-only6개 모두 PASS다. 같은 fresh runtime의 [tessellation120쌍](../build/local/gap-implementation-20261010/qa-tessellation-hull/result.json)은 warm expensive 작업0을 유지했고, [pipeline-library](../build/local/gap-implementation-20261010/qa-pipeline-library-hull/result.json)는 child restore4/cold0과 기존 수치·동시성 검사를 통과했다. Metal API/Shader Validation 오류·foreign backend 없이 종료했고 각 전용 prefix를 제거했다. Diagnostics110, native/paired 빌드와 x64/i686 consumer 컴파일도 PASS다. i686 GPU·실게임은 이 후속에서 실행하지 않았다. 최신 runtime은 `runtime-hull`이며 이전54개 및 SM6/FG 결과는 원래 cut의 증거로 유지한다.
 
+## MSAA 초기 타깃 통합과 후속 리뷰 — 2026-10-10
+
+`preparePixelTarget()`을 초기 `setup_metal_version()` 선택에 통합하고 compiler cache version을39로 올렸다. [변경 전](../build/local/gap-implementation-20261010/msaa-target-before.log) 공개 compiler80개 중12개는 AIR와 language metadata가 불일치했고, [통합 후](../build/local/gap-implementation-20261010/msaa-target-after.log)는80/80이다. 후속 리뷰는 Metal3.1 triple 검사 누락과 helper/phase 플래그의 결합된 입력을 보완했다. [최종144개](../build/local/gap-implementation-20261010/review-msaa-target.log)와 [관련 native5개](../build/local/gap-implementation-20261010/review-msaa-tests.log)가 통과했다. Production source는 리뷰 전 GPU runtime과 동일하다.
+
+[Fresh runtime의 MSAA·VRS·Atomic64 pixel40개 GPU 검증](../build/local/gap-implementation-20261010/msaa-target-acceptance.json)은 Metal API/Shader Validation과 owned module 확인을 통과했고 전용 prefix를 제거했다. Atomic64의 첫 결과 저장은 임시 helper의 잘못된 suite 이름 `atomic64-pixel` 때문에 중단됐으며, 동일한 원본 capture를 정식 `atomic64-pixel-coupled` 판정으로 확인했다. GPU 재실행이나 oracle 완화는 없었다. 현재 runtime은 `runtime-msaa-target`, manifest는 `811c5f95f6e034ddcc56c04ef5836804c922f6058e1875debd176c7c9ca793e2`다. Metal3.1/3.2·Atomic64 4.1과 MSAA read/ROV ABI는 유지했다.
+
+## Metal4 우선 선택과 MSAA 회귀 수정 — 2026-10-10
+
+D3D12 device admission이 이미 Metal4 compiler를 요구하므로 공통 shader 기본값을3.2에서4.0으로 올렸다. [동일 MSAA consumer의3.2 baseline](../build/local/gap-implementation-20261010/qa-multisample-capabilities-metal4-before/result.json)은 PASS지만, [첫4.0 실행](../build/local/gap-implementation-20261010/qa-multisample-capabilities-metal4/result.json)은 첫 ordinary color/depth를0으로 읽었다. Query-only 진단은 width4/height4/samples2를 반환했고, 실제 public PSO AIR는 내장 `air.get_read_sampler`까지 user descriptor로 null 검사하는 경로를 보여줬다. Native MSL의 read ABI는 일치했다. `air.read_*`의 내장 sampler만 null 검사에서 제외하고 texture와 sample/gather의 user sampler 검사는 보존했으며 compiler cache version38로 이전4.x 결과를 무효화했다.
+
+[수정 후 같은 MSAA oracle](../build/local/gap-implementation-20261010/qa-multisample-capabilities-metal4-fixed/result.json)은 기대값/허용치 변경 없이 PASS다. 기존 bindless heap-order에 유효 texture+미결합 user sampler의4word 확인을 더했고, 원래12word와 sentinel을 유지한 [최종10case 실행](../build/local/gap-implementation-20261010/qa-bindless-metal4-null-final/result.json)도 PASS다. [통합 증거](../build/local/gap-implementation-20261010/metal4-acceptance.json)는 최종 동일 runtime의12개 GPU suite, native/paired 빌드, diagnostics110, source identity와 cleanup을 묶는다. RT 판정 helper의 순수 `raytracing_failures`/`list` 허용 누락은 격리 helper에서만 수정했고 current runner의 수치·case gate는 유지했다.
+
+[기존 일반 AIR](../build/local/gap-implementation-20261010/default-target-before.json)는3.2/2.7, [최종 공개 library의6개 일반 AIR](../build/local/gap-implementation-20261010/default-target-final.json)는4.0/2.8이다. 명시적3.2/4.1은 `metal4-explicit320.ll`·`metal4-explicit410.ll`로 재확인했다. MTLB `VERS`의 기존 language tag3.1 고정값 대신 실제 내장 LLVM AIR metadata를 읽었다. 해당 checkpoint의 실행 대상은 `runtime-metal4-fixed`이며 이전 hull/metal4 runtime의 manifest·로그·실패 증거는 보존한다. 이 결과는 해당 host의 ARM64X/FEX x64 proof이며 WoW64 GPU·실게임·성능 증거로 확대하지 않는다.
+
 ## D3DMetal 최적화 첫 병렬 cut — 2026-10-10
 
 QA root는 `build/local/d3dmetal-opt-port-20261009/`다. [paired PE build](../build/local/d3dmetal-opt-port-20261009/paired-foundation/result.json)와 native build/install 후 격리 ARM64X/FEX에서 실행했다. `runtime-foundation2`는 SR 경계 수정이 추가된 native cut이며 이전 `runtime-foundation`의 비-temporal 결과와 구분한다. 모든 아래 positive GPU 실행은 Metal API/Shader Validation을 켰다.

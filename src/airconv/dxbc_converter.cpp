@@ -237,8 +237,11 @@ SM50_SHADER_METAL_VERSION required_metal_version(const llvm::Module &module, SM5
   return metal_version;
 }
 
-void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version) {
+void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version,
+                         const SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel) {
   using namespace llvm;
+  if (msaa_pixel && (msaa_pixel->variant & ~SM50_MSAA_ATOMIC_HELPERS) != SM50_MSAA_COVERAGE)
+    metal_version = std::max(metal_version, SM50_SHADER_METAL_400);
   metal_version = required_metal_version(module, metal_version);
   auto &context = module.getContext();
   auto createUnsignedInteger = [&](uint32_t s) {
@@ -856,8 +859,7 @@ llvm::Error convert_dxbc_pixel_shader(
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
   auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue", function);
-  setup_metal_version(module, metal_version);
-  if (msaa_pixel) dxmt::msaa::preparePixelTarget(module, *msaa_pixel);
+  setup_metal_version(module, metal_version, msaa_pixel);
   llvm::IRBuilder<> builder(entry_bb);
   llvm::raw_null_ostream nulldbg{};
   llvm::air::AIRBuilder air(

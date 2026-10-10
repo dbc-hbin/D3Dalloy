@@ -1699,8 +1699,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
 
   auto *entry_bb = llvm::BasicBlock::Create(llvm_context, "entry", function);
   auto *epilogue_bb = llvm::BasicBlock::Create(llvm_context, "epilogue", function);
-  dxbc::setup_metal_version(module_ir, metal_version);
-  if (inner_pixel) dxmt::msaa::preparePixelTarget(module_ir, *inner_pixel);
+  dxbc::setup_metal_version(module_ir, metal_version, inner_pixel);
   llvm::IRBuilder<> builder(entry_bb);
   llvm::raw_null_ostream nulldbg{};
   llvm::air::AIRBuilder air(

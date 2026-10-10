@@ -1026,16 +1026,16 @@ void testHeapOrder(Gpu &g, const std::vector<uint8_t> &cs) {
     g.texSrv(heaps[h].Get(), 4, tex.Get(), DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D);
     keep.insert(keep.end(), {raw, tex});
   }
-  auto result = g.initBuffer(std::vector<uint32_t>(12, 0xcccccccc), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, keep);
+  auto result = g.initBuffer(std::vector<uint32_t>(16, 0xcccccccc), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, keep);
   g.submit("heap order upload");
 
   D3D12_ROOT_PARAMETER1 params[2] = {rootConstant(0), rootDescriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
   auto root = makeRoot(g.device.Get(), directRootDesc(params, 2, kFlagResourceHeap | kFlagSamplerHeap));
   auto pso = computePso(g.device.Get(), root.Get(), cs.data(), cs.size());
   const UINT64 va = result->GetGPUVirtualAddress();
-  auto dispatch = [&](UINT heap, UINT index, UINT slot) {
+  auto dispatch = [&](UINT heap, UINT index, UINT slot, bool bindSampler = true) {
     ID3D12DescriptorHeap *bound[] = {heaps[heap].Get(), samplers.Get()};
-    g.list->SetDescriptorHeaps(2, bound);
+    g.list->SetDescriptorHeaps(bindSampler ? 2 : 1, bound);
     g.list->SetComputeRootSignature(root.Get());
     g.list->SetPipelineState(pso.Get());
     g.list->SetComputeRoot32BitConstant(0, index, 0);
@@ -1045,12 +1045,13 @@ void testHeapOrder(Gpu &g, const std::vector<uint8_t> &cs) {
   dispatch(0, 3, 0);
   dispatch(1, 3, 1);
   dispatch(0, 15, 2); // index 16 is past the 16-descriptor heap
+  dispatch(0, 3, 3, false); // A missing user sampler stays null even with a valid texture.
   g.uavBarrier();
   g.submit("heap order dispatch");
-  auto out = g.readBuffer(result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 48, "heap order result");
-  const uint32_t expect[12] = {0xa1, f2u(1.5f), 0xabc, 0xcccccccc, 0xb2, f2u(2.5f), 0xabc, 0xcccccccc,
-                               0,    0,         0xabc, 0xcccccccc};
-  for (UINT k = 0; k < 12; ++k)
+  auto out = g.readBuffer(result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 64, "heap order result");
+  const uint32_t expect[16] = {0xa1, f2u(1.5f), 0xabc, 0xcccccccc, 0xb2, f2u(2.5f), 0xabc, 0xcccccccc,
+                               0,    0,         0xabc, 0xcccccccc, 0xa1, 0, 0xabc, 0xcccccccc};
+  for (UINT k = 0; k < 16; ++k)
     EXPECT(out[k] == expect[k], "heap-order word=%u got=0x%x expected=0x%x", k, out[k], expect[k]);
   passCase("heap-order-and-past-heap", before);
 }
