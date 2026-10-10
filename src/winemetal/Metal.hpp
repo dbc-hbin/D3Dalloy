@@ -13,6 +13,7 @@ class MTL4CommandAllocator;
 class MTL4CommandBuffer;
 class MTL4Submission;
 class MTL4ArgumentTable;
+class TextureViewPool;
 class MTL4AccelerationStructureDescriptor;
 
 class Object {
@@ -1142,6 +1143,7 @@ public:
   Reference<MTL4CommandAllocator> newMTL4CommandAllocator();
   Reference<MTL4CommandBuffer> newMTL4CommandBuffer();
   Reference<MTL4ArgumentTable> newMTL4ArgumentTable(uint32_t buffers, uint32_t textures, uint32_t samplers, bool strides = false);
+  Reference<TextureViewPool> newTextureViewPool(uint32_t count, Buffer argument_buffer);
   Reference<MTL4AccelerationStructureDescriptor> newMTL4AccelerationStructureDescriptor(bool top_level, uint32_t geometry_count);
   WMTAccelerationStructureSizes accelerationStructureSizes(MTL4AccelerationStructureDescriptor descriptor);
 

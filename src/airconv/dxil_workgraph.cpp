@@ -1269,7 +1269,8 @@ Error compileNode(const SM50_WG_NODE_COMPILE_DESC &desc, SM50CompiledBitcodeInte
     return error;
   raw_svector_ostream stream(compiled.vec);
   metallib::MetallibWriter writer;
-  writer.Write(module, stream);
+  if (auto error = writer.Write(module, stream))
+    return error;
   out.ThreadgroupSize[0] = group[0];
   out.ThreadgroupSize[1] = group[1];
   out.ThreadgroupSize[2] = group[2];

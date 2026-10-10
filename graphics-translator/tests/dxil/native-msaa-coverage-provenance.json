@@ -1,0 +1,53 @@
+{
+  "producer": "official Microsoft DXC1.9.2609.5 x64,01b62ad47",
+  "compiler": "toolchains/dxc-1.9.2609.5/package/build/native/bin/x64/dxc.exe",
+  "compiler_dependencies": {
+    "toolchains/dxc-1.9.2609.5/package/build/native/bin/x64/dxc.exe": "aa7965b3763d9c710baaa5a28cedcc633449962a75d1391d161a85304a41b3e2",
+    "toolchains/dxc-1.9.2609.5/package/build/native/bin/x64/dxcompiler.dll": "0689e2fee0a1c9df8662a59680469f24e2a3ad7ce6bbbcc9284f7a83172bfc59",
+    "toolchains/dxc-1.9.2609.5/package/build/native/bin/x64/dxil.dll": "64be2368211d257a038a7d4ea6bb3e24c878eb8d588c7b8414fccf759b69c2ac",
+    "toolchains/dxc-1.9.2609.5/package/build/native/bin/x64/dxv.exe": "74528e8e86cdafcb9ecaa26f21a9ad9de9102b0d84213b67435de798b5a807f9"
+  },
+  "invocation": [
+    "-nologo",
+    "-HV",
+    "2021",
+    "-O0",
+    "-T",
+    "ps_6_0",
+    "-E",
+    "main"
+  ],
+  "validator": {
+    "tool": "dxv.exe",
+    "result": "Validation succeeded for both outputs",
+    "compile_validation_enabled": true
+  },
+  "shaders": [
+    {
+      "source": "graphics-translator/tests/dxil/native-msaa-coverage.hlsl",
+      "source_sha256": "4655acba64e8029848b7fb4f3891ed352e3a0b063c82441ada6d836970d50c55",
+      "output": "graphics-translator/tests/dxil/native-msaa-coverage.dxil",
+      "output_sha256": "781a0f18eb60cfa5813ee7d55b7d1d8b31c5b9a338a9b062358d65ec01f422b0",
+      "entry": "main",
+      "profile": "ps_6_0",
+      "consumed_coverage": "dx.op.coverage.i32(91) branches/selects actual RGBA outputs",
+      "evidence": "build/local/d3dmetal-opt-port-20261009/phase3b-msaa/native-msaa-coverage-disassembly.ll"
+    },
+    {
+      "source": "graphics-translator/tests/dxil/pipeline-library-coverage.hlsl",
+      "source_sha256": "acabf6ad6815e4cb16c1d6954da9b3f4c94e2f4629671fa52e08285321001c51",
+      "output": "graphics-translator/tests/dxil/pipeline-library-coverage.dxil",
+      "output_sha256": "d985be584169c57d94511373518903ac8b7ca3eaa831ae5c62b5fa999a335ab6",
+      "entry": "main",
+      "profile": "ps_6_0",
+      "consumed_coverage": "dx.op.coverage.i32(91) branches/selects actual RGBA outputs",
+      "evidence": "build/local/d3dmetal-opt-port-20261009/phase3b-msaa/pipeline-library-coverage-disassembly.ll"
+    }
+  ],
+  "runtime": "build/local/d3dmetal-opt-port-20261009/runtime-phase2/bin/wine (CPU-only x64/FEX DXC)",
+  "fresh_prefix": "/Users/hanbinnoh/Documents/dxmt-d3d12/build/local/d3dmetal-opt-port-20261009/phase3b-msaa/dxc-prefix-nsLaH1",
+  "cleanup": "scoped wineserver -k/-w completed; fresh prefix removed; build/local/d3dmetal-opt-port-20261009/phase3b-msaa/dxc-cleanup.log",
+  "command_receipt": "build/local/d3dmetal-opt-port-20261009/phase3b-msaa/dxc-producer-command.sh.txt",
+  "runtime_dependency_receipt": "build/local/d3dmetal-opt-port-20261009/phase3b-msaa/runtime-compiler-dependency-sha256.txt",
+  "gpu_exercised": false
+}

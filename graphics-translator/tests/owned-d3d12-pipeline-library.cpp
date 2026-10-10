@@ -9,6 +9,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +25,7 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 bool g_child = false;
+std::vector<uint8_t> readFile(const wchar_t *path);
 
 [[noreturn]] void fail(const char *step, HRESULT actual = E_FAIL, HRESULT expected = S_OK) {
   std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_FAIL%s step=%s actual=%08lx expected=%08lx\n",
@@ -134,6 +136,7 @@ const char *kGraphicsSource = R"(
 
 struct Shaders {
   ComPtr<ID3DBlob> csA, csB, vs, ps, inverted;
+  std::vector<uint8_t> coverage = readFile(L"pipeline-library-coverage.dxil");
   Shaders()
       : csA(compile(kComputeSource, "csA", "cs_5_0")), csB(compile(kComputeSource, "csB", "cs_5_0")),
         vs(compile(kGraphicsSource, "vs", "vs_5_0")), ps(compile(kGraphicsSource, "ps", "ps_5_0")),
@@ -310,7 +313,7 @@ struct Fixture {
   }
 
   // Draw a full-target triangle into a 4x4 RGBA8 target; every texel must be exactly `expected`.
-  void draw(ID3D12PipelineState *pso, const UINT (&color)[4], UINT expected, const char *label) {
+  void draw(ID3D12PipelineState *pso, const UINT (&color)[4], UINT expected, const char *label, UINT samples = 1) {
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     heap_desc.NumDescriptors = 1;
@@ -322,6 +325,7 @@ struct Fixture {
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = desc.Height = 4;
     desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Count = samples;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     ComPtr<ID3D12Resource> target;
@@ -348,13 +352,23 @@ struct Fixture {
     list->SetGraphicsRoot32BitConstants(0, 4, color, 0);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     list->DrawInstanced(3, 1, 0, 0);
-    barrier(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ComPtr<ID3D12Resource> resolved;
+    if (samples > 1) {
+      desc.SampleDesc.Count = 1;
+      check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                            nullptr, IID_PPV_ARGS(&resolved)), "resolve target");
+      barrier(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+      list->ResolveSubresource(resolved.Get(), 0, target.Get(), 0, desc.Format);
+      barrier(list.Get(), resolved.Get(), D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    } else {
+      barrier(list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
     D3D12_TEXTURE_COPY_LOCATION dst{};
     dst.pResource = readback.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 256};
     D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = target.Get();
+    src.pResource = resolved ? resolved.Get() : target.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     check(list->Close(), "close graphics");
@@ -797,6 +811,163 @@ int child(const wchar_t *path) {
   return 0;
 }
 
+void testStageArtifacts(Fixture &f) {
+  struct DeveloperMode {
+    HKEY key = nullptr; DWORD previous = 0; bool existed = false;
+    DeveloperMode() {
+      char isolated[2]{};
+      if (GetEnvironmentVariableA("OWNED_SHADER_CACHE_CONTROL_ISOLATED", isolated, 2) != 1 || isolated[0] != '1')
+        fail("stage cache requires isolated prefix");
+      if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock",
+          0, nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, nullptr)) fail("developer registry open");
+      DWORD type = 0, size = sizeof(previous);
+      existed = RegQueryValueExW(key, L"AllowDevelopmentWithoutDevLicense", nullptr, &type,
+                                reinterpret_cast<BYTE*>(&previous), &size) == ERROR_SUCCESS;
+      if (existed && (type != REG_DWORD || size != sizeof(previous))) fail("developer registry type");
+      const DWORD enabled = 1;
+      if (RegSetValueExW(key, L"AllowDevelopmentWithoutDevLicense", 0, REG_DWORD,
+                        reinterpret_cast<const BYTE*>(&enabled), sizeof(enabled))) fail("developer registry enable");
+    }
+    ~DeveloperMode() {
+      if (existed) RegSetValueExW(key, L"AllowDevelopmentWithoutDevLicense", 0, REG_DWORD,
+                                reinterpret_cast<const BYTE*>(&previous), sizeof(previous));
+      else RegDeleteValueW(key, L"AllowDevelopmentWithoutDevLicense");
+      RegCloseKey(key);
+    }
+  } developer;
+  ComPtr<ID3D12Device9> control;check(f.device.As(&control), "stage cache device9");
+  constexpr auto driver = D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED;
+  check(control->ShaderCacheControl(driver, D3D12_SHADER_CACHE_CONTROL_FLAGS(
+      D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE | D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR)), "stage cache clear");
+  // Different raster state gives eight distinct whole-PSO keys, but exactly the same VS/PS lowering inputs.
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=concurrent_graphics\n");std::fflush(stderr);
+  std::barrier start(8);std::vector<std::thread> threads;
+  ComPtr<ID3D12PipelineState> psos[8];HRESULT results[8]{};
+  for (UINT i = 0; i < 8; ++i) threads.emplace_back([&, i] {
+    auto desc = f.graphicsDesc();desc.RasterizerState.DepthBias = i;
+    start.arrive_and_wait();results[i] = f.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&psos[i]));
+  });
+  for (auto &thread : threads) thread.join();
+  for (UINT i = 0; i < 8; ++i) check(results[i], "distinct graphics stage create");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=concurrent_graphics air=2 libraries=2\n");std::fflush(stderr);
+  const UINT color[4]{17, 34, 51, 255};
+  for (auto &pso : psos) f.draw(pso.Get(), color, 0xff332211u, "distinct_graphics_shared_stages");
+
+  // Same entry bytecode but a different root ABI must make new stage artifacts.
+  auto oldRoot = f.graphicsRoot;auto bytes = serializeRoot(8, false);
+  f.graphicsRoot = root(f.device.Get(), bytes.Get());
+  auto changed = f.graphicsDesc();ComPtr<ID3D12PipelineState> rootPso;
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=root_abi\n");std::fflush(stderr);
+  check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&rootPso)), "different root ABI create");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=root_abi air=2 libraries_max=2\n");std::fflush(stderr);
+  f.draw(rootPso.Get(), color, 0xff332211u, "different_root_abi");f.graphicsRoot = oldRoot;
+
+  // The ordinary PS epilogue consumes SampleMask. VS may share; PS must not.
+  changed = f.graphicsDesc();changed.SampleMask = 0;ComPtr<ID3D12PipelineState> masked;
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=pixel_specialization\n");std::fflush(stderr);
+  check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&masked)), "sample mask specialization");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=pixel_specialization air=1 libraries=1\n");std::fflush(stderr);
+  f.draw(masked.Get(), color, 0, "pixel_specialization_separation");
+
+  // Non-full masks retain the same coverage signature and specialize only the scalar.
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=constant_concurrent\n");std::fflush(stderr);
+  std::barrier constantStart(8);threads.clear();
+  ComPtr<ID3D12PipelineState> constantPsos[8];
+  for (UINT i = 0; i < 8; ++i) threads.emplace_back([&, i] {
+    auto desc = f.graphicsDesc();desc.SampleMask = 1;desc.RasterizerState.DepthBias = 30 + i;
+    constantStart.arrive_and_wait();
+    results[i] = f.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&constantPsos[i]));
+  });
+  for (auto &thread : threads) thread.join();
+  for (UINT i = 0; i < 8; ++i) check(results[i], "concurrent constant specialization");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=constant_concurrent air=0 libraries=0 specializations=1\n");std::fflush(stderr);
+  for (auto &pso : constantPsos) f.draw(pso.Get(), color, 0xff332211u, "constant_mask_one");
+
+  changed = f.graphicsDesc();changed.SampleMask = 2;ComPtr<ID3D12PipelineState> otherMask;
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=constant_distinct\n");std::fflush(stderr);
+  check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&otherMask)), "second native mask");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=constant_distinct air=0 libraries=0 specializations=1\n");std::fflush(stderr);
+  f.draw(otherMask.Get(), color, 0, "constant_mask_two");
+  changed.SampleMask = 1;changed.RasterizerState.DepthBias = 41;ComPtr<ID3D12PipelineState> constantHit;
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=constant_hit\n");std::fflush(stderr);
+  check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&constantHit)), "cached native mask");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=constant_hit air=0 libraries=0 specializations=0\n");std::fflush(stderr);
+  f.draw(constantHit.Get(), color, 0xff332211u, "constant_cached_mask_one");
+
+  f.graphicsRoot = root(f.device.Get(), bytes.Get());
+  changed = f.graphicsDesc();changed.SampleMask = 1;ComPtr<ID3D12PipelineState> constantRoot;
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=constant_root_abi\n");std::fflush(stderr);
+  check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&constantRoot)), "constant root separation");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=constant_root_abi air=1 libraries_max=1 specializations=1\n");std::fflush(stderr);
+  f.draw(constantRoot.Get(), color, 0xff332211u, "constant_root_separation");f.graphicsRoot = oldRoot;
+  changed = f.graphicsDesc();changed.PS = code(f.shaders.inverted.Get());changed.SampleMask = 1;
+  ComPtr<ID3D12PipelineState> constantEntry;
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=constant_entry\n");std::fflush(stderr);
+  check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&constantEntry)), "constant entry separation");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=constant_entry air=1 libraries=1 specializations=1\n");std::fflush(stderr);
+  f.draw(constantEntry.Get(), color, 0x00ccddee, "constant_entry_separation");
+
+  auto gs = compile(R"(
+    struct Vertex { float4 position : SV_Position; };
+    [maxvertexcount(3)] void gs(triangle Vertex input[3], inout TriangleStream<Vertex> output) {
+      [unroll] for (uint i = 0; i < 3; ++i) output.Append(input[i]);
+    }
+  )", "gs", "gs_5_0");
+  ComPtr<ID3D12PipelineState> geometry[2];
+  for (UINT i = 0; i < 2; ++i) {
+    changed = f.graphicsDesc();changed.GS = code(gs.Get());changed.RasterizerState.DepthBias = 50 + i;
+    const char *phase = i ? "linked_geometry_hit" : "linked_geometry_cold";
+    std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=%s\n", phase);std::fflush(stderr);
+    check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&geometry[i])), "linked geometry create");
+    f.draw(geometry[i].Get(), color, 0xff332211u, i ? "linked_geometry_reuse" : "linked_geometry_first");
+    std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=%s air=%u libraries=%u\n",
+                 phase, i ? 0 : 2, i ? 0 : 2);std::fflush(stderr);
+  }
+  auto linkedVertex = compile(R"(
+    float4 vs(uint id : SV_VertexID) : SV_Position {
+      float2 uv = float2((id << 1) & 2, id & 2);
+      return float4(uv * float2(4, -4) + float2(-2, 2), 0, 2);
+    }
+  )", "vs", "vs_5_0");
+  changed = f.graphicsDesc();changed.GS = code(gs.Get());changed.VS = code(linkedVertex.Get());
+  ComPtr<ID3D12PipelineState> changedLink;
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=linked_geometry_input\n");std::fflush(stderr);
+  check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&changedLink)), "linked VS bytecode separation");
+  f.draw(changedLink.Get(), color, 0xff332211u, "linked_geometry_input_separation");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=linked_geometry_input air=2 libraries_max=2\n");std::fflush(stderr);
+
+  ComPtr<ID3D12PipelineState> captured[2];
+  for (UINT i = 0; i < 2; ++i) {
+    changed = f.graphicsDesc();changed.SampleDesc.Count = 2;changed.RasterizerState.DepthBias = 60 + i;
+    changed.PS = {f.shaders.coverage.data(), f.shaders.coverage.size()};
+    const char *phase = i ? "captured_layout_hit" : "captured_layout_cold";
+    std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=%s\n", phase);std::fflush(stderr);
+    check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&captured[i])), "captured layout create");
+    f.draw(captured[i].Get(), color, 0xff332211u, i ? "captured_layout_reuse" : "captured_layout_first", 2);
+    std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=%s air=%u libraries_max=%u\n",
+                 phase, i ? 0 : 5, i ? 0 : 5);std::fflush(stderr);
+  }
+
+  changed = f.graphicsDesc();changed.SampleDesc.Count = 2;changed.RasterizerState.DepthBias = 62;
+  ComPtr<ID3D12PipelineState> ordinaryMSAA;
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_NATIVE_MSAA_BEGIN count=2\n");std::fflush(stderr);
+  check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&ordinaryMSAA)), "ordinary native2x create");
+  f.draw(ordinaryMSAA.Get(), color, 0xff332211u, "ordinary_native2x", 2);
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_NATIVE_MSAA_END count=2 resolved=ff332211\n");std::fflush(stderr);
+
+  check(control->ShaderCacheControl(driver, D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR), "live stage cache clear");
+  changed = f.graphicsDesc();changed.RasterizerState.DepthBias = 19;ComPtr<ID3D12PipelineState> rebuilt;
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=clear_rebuild\n");std::fflush(stderr);
+  check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&rebuilt)), "stage clear rebuild");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=clear_rebuild air=2 libraries=2\n");std::fflush(stderr);
+  // Native function/PSO ownership survives cache eviction; reuse the original object after rebuilding.
+  f.draw(psos[0].Get(), color, 0xff332211u, "stage_library_retained_after_clear");
+  f.draw(rebuilt.Get(), color, 0xff332211u, "stage_library_clear_rebuilt");
+  f.draw(constantPsos[0].Get(), color, 0xff332211u, "constant_retained_after_clear");
+  f.draw(otherMask.Get(), color, 0, "constant_zero_retained_after_clear");
+  passed("immutable_stage_native_library_reuse");
+}
+
 int run() {
   using BackendId = const char *(WINAPI *)();
   auto identity = reinterpret_cast<BackendId>(GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "OwnedGraphicsBackendId"));
@@ -807,6 +978,7 @@ int run() {
   {
     Fixture f;
     testFeatures(f);
+    testStageArtifacts(f);
     testStreamCoverage(f);
     testContracts(f, serialized);
     testThreads(f, serialized);

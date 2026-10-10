@@ -2,6 +2,7 @@
 #include "d3d12_pipeline_cache.hpp"
 #include "d3d12_shader_cache.hpp"
 #include "../d3d10/d3d10_blob.hpp"
+#include "DXBCParser/BlobContainer.h"
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -9,6 +10,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <chrono>
+#include <string>
+#include <vector>
 
 namespace dxmt {
 
@@ -35,7 +38,8 @@ constexpr uint64_t kMagic = 0x004f5350544d5844; // "DXMTPSO\0", little endian.
 // 4: P3 hidden-resource/signature AIR ABI changed even for unchanged shader/PSO inputs.
 // Serialized pipeline libraries validate this revision for every embedded PSO blob.
 // 5: atomic phase context relocations and bounded captured application variants.
-constexpr uint32_t kVersion = 5;
+// 6: immutable linked-stage layouts and native sample-mask function constants (AIR ABI 33).
+constexpr uint32_t kVersion = 6;
 constexpr size_t kAutomaticBytes = 64u * 1024u * 1024u;
 constexpr size_t kAutomaticEntries = 512;
 
@@ -248,7 +252,485 @@ public:
   }
 };
 
+// Full canonical bytes are compared, not just a digest. No pointer/padding is a key input.
+class StageKeyBuilder {
+public:
+  std::string key;
+  std::vector<std::pair<void *, size_t>> outputs;
+  template <typename... T> void add(const T &...values) {
+    (key.append(reinterpret_cast<const char *>(&values), sizeof(values)), ...);
+  }
+  void bytes(const void *data, size_t size) {
+    add(uint64_t(size));
+    if (size) key.append(static_cast<const char *>(data), size);
+  }
+  template <typename T> void output(T *data) {
+    add(bool(data));
+    if (data) outputs.emplace_back(data, sizeof(T));
+  }
+  void interpolation(const SM50_MSAA_INTERPOLATION_LAYOUT *v) {
+    add(bool(v));
+    if (!v) return;
+    add(v->no_perspective_count, v->flat_count);
+    for (uint32_t i = 0; i < v->no_perspective_count; ++i) add(v->no_perspective_user_hashes[i]);
+    for (uint32_t i = 0; i < v->flat_count; ++i) add(v->flat_user_hashes[i]);
+  }
+  void vertex(const SM50_MSAA_VERTEX_LAYOUT *v) {
+    add(bool(v));
+    if (!v) return;
+    add(v->record_dwords, v->position_offset_dwords, v->viewport_index_offset_dwords,
+        v->render_target_array_index_offset_dwords, v->clip_distance_offset_dwords,
+        v->cull_distance_offset_dwords, v->user_count, v->shading_rate_offset_dwords,
+        v->primitive_id_offset_dwords, v->spill_count);
+    for (uint32_t i = 0; i < v->user_count; ++i)
+      add(v->users[i].hash, v->users[i].offset_dwords, v->users[i].size_bytes, v->users[i].flags);
+  }
+  bool arguments(const SM50_SHADER_COMPILATION_ARGUMENT_DATA *arg) {
+    bool sample_mask_constant = false;
+    for (auto *it = arg; it; it = static_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(it->next))
+      sample_mask_constant |= it->type == SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT;
+    for (; arg; arg = static_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(arg->next)) {
+      add(arg->type);
+      switch (arg->type) {
+      case SM50_SHADER_ROOT_SIGNATURE:
+      case SM50_SHADER_ROOT_SIGNATURE2: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_ROOT_SIGNATURE_DATA *>(arg);
+        bytes(v.bytecode, v.bytecode_length);
+        break;
+      }
+      case SM50_SHADER_COMMON: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_COMMON_DATA *>(arg);
+        add(v.metal_version, v.flags);
+        break;
+      }
+      case SM50_SHADER_IA_INPUT_LAYOUT: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_IA_INPUT_LAYOUT_DATA *>(arg);
+        add(v.index_buffer_format, v.slot_mask, v.num_elements);
+        for (uint32_t i = 0; i < v.num_elements; ++i) {
+          const auto &e = v.elements[i];
+          add(e.reg, e.slot, e.aligned_byte_offset, e.format, uint32_t(e.step_function), uint32_t(e.step_rate));
+        }
+        break;
+      }
+      case SM50_SHADER_PSO_PIXEL_SHADER: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_PSO_PIXEL_SHADER_DATA *>(arg);
+        if (!sample_mask_constant) add(v.sample_mask);
+        add(v.dual_source_blending, v.disable_depth_output, v.unorm_output_reg_mask,
+            v.pixel_formats, v.native_sample_count);
+        break;
+      }
+      case SM50_SHADER_D3D12_LOGIC_OP: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_D3D12_LOGIC_OP_DATA *>(arg);
+        add(v.op, v.rt_mask, v.component_bits);
+        break;
+      }
+      case SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *>(arg);
+        add(v.record_dwords, v.num_elements);
+        for (uint32_t i = 0; i < v.num_elements; ++i) {
+          const auto &e = v.elements[i];
+          bytes(e.semantic_name, strlen(e.semantic_name));
+          add(e.semantic_index, e.start_component, e.component_count, e.dword_offset);
+        }
+        break;
+      }
+      case SM50_SHADER_GS_PASS_THROUGH: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_GS_PASS_THROUGH_DATA *>(arg);
+        add(v.DataEncoded, v.RasterizationDisabled);
+        break;
+      }
+      case SM50_SHADER_D3D12_MSAA_PIXEL: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_D3D12_MSAA_PIXEL_DATA *>(arg);
+        add(v.variant, v.sample_count, v.depth_attachment, v.single_sample_target, v.line_mode,
+            v.center_pattern, v.distance_vertex_count, v.depth_clip_enable, v.depth_bounds_emulated);
+        output(v.layout_out); output(v.interpolation_out);
+        vertex(v.line_vertex_layout); vertex(v.distance_vertex_layout); vertex(v.coarse_vertex_layout);
+        break;
+      }
+      case SM50_SHADER_D3D12_MSAA_VERTEX: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_D3D12_MSAA_VERTEX_DATA *>(arg);
+        add(v.variant, v.sample_count, v.line_mode, v.depth_clip_enable, v.front_counter_clockwise);
+        output(v.layout_out); interpolation(v.interpolation);
+        break;
+      }
+      case SM50_SHADER_D3D12_MSAA_MESH: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_D3D12_MSAA_MESH_DATA *>(arg);
+        add(v.variant, v.line_mode, v.depth_clip_enable, v.front_counter_clockwise);
+        // Mesh capture layout has caller-supplied workload/group constraints as well as outputs.
+        add(bool(v.mesh_layout_out));
+        if (v.mesh_layout_out) add(v.mesh_layout_out->threads_per_group, v.mesh_layout_out->max_workloads);
+        output(v.layout_out); output(v.mesh_layout_out); output(v.object_layout_out);
+        interpolation(v.interpolation);
+        break;
+      }
+      case SM50_SHADER_D3D12_TESS_CAPTURE: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_D3D12_TESS_CAPTURE_DATA *>(arg);
+        output(v.layout_out); break;
+      }
+      case SM50_SHADER_GS_TESSELLATION_INPUT: {
+        const auto &v = reinterpret_cast<const SM50_SHADER_GS_TESSELLATION_INPUT_DATA *>(arg)->layout;
+        add(v.max_workloads, v.max_vertices, v.max_primitives, v.vertex_registers, v.primitive_vertices);
+        break;
+      }
+      case SM50_SHADER_PSO_GEOMETRY_SHADER:
+        add(reinterpret_cast<const SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *>(arg)->strip_topology); break;
+      case SM50_SHADER_PSO_TESSELLATOR:
+        add(reinterpret_cast<const SM50_SHADER_PSO_TESSELLATOR_DATA *>(arg)->max_potential_tess_factor); break;
+      case SM50_SHADER_D3D12_GS_STREAMS: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_D3D12_GS_STREAMS_DATA *>(arg);
+        add(v.rasterized_stream);
+        for (const auto &s : v.streams) {
+          add(s.record_dwords, s.num_elements);
+          for (uint32_t i = 0; i < s.num_elements; ++i) {
+            const auto &e = s.elements[i];
+            bytes(e.semantic_name, strlen(e.semantic_name));
+            add(e.semantic_index, e.start_component, e.component_count, e.dword_offset);
+          }
+        }
+        break;
+      }
+      case SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS: {
+        const auto &v = *reinterpret_cast<const SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA *>(arg);
+        add(v.view_count, v.viewport_offsets, v.render_target_offsets); break;
+      }
+      case SM50_SHADER_D3D12_INDEX_PULL:
+      case SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT:
+      case SM50_SHADER_D3D12_PIPELINE_STATS:
+      case SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL:
+      case SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM:
+      case SM50_SHADER_D3D12_COARSE_SHADING:
+      case SM50_SHADER_D3D12_CONSERVATIVE_RASTER:
+      case SM50_SHADER_D3D12_ATOMIC64_PHASE:
+        break; // Header-only, but presence and chain order are part of the key.
+      default:
+        // Output-layout pointers and linked GS/HS/DS inputs need their own immutable contract.
+        return false;
+      }
+    }
+    add(SM50_SHADER_ARGUMENT_TYPE_MAX);
+    return true;
+  }
+};
+
+template <typename T> struct ArtifactCache {
+  struct Flight {
+    std::condition_variable ready;
+    bool done = false;
+    uint64_t last_use = 0;
+    size_t bytes = 0;
+    std::shared_ptr<const T> value;
+  };
+  std::mutex mutex;
+  std::unordered_map<std::string, std::shared_ptr<Flight>> entries;
+  uint64_t generation = UINT64_MAX, clock = 0, operations = 0;
+  const uint64_t id = owned_graphics::NewObjectId();
+  size_t bytes = 0, completed = 0;
+
+  void Operation(const char *kind, const std::string &key) {
+    uint64_t count;
+    { std::lock_guard lock(mutex); count = ++operations; }
+    try {
+      if (owned_graphics::TraceEnabled())
+        owned_graphics::Trace("pipeline_artifact_operation", ",\"kind\":\"", kind, "\",\"cache\":", id,
+                              ",\"count\":", count, ",\"key\":\"",
+                              Sha1HashState::compute(key.data(), key.size()).string(), "\"");
+    } catch (...) {
+      // Optional instrumentation cannot change a compiler/native operation result.
+    }
+  }
+
+  template <typename Create> std::shared_ptr<const T> Get(const std::string &key, const char *kind, Create create) {
+    uint64_t current;
+    bool enabled;
+    {
+      auto &automatic = Automatic();
+      std::lock_guard lock(automatic.mutex);
+      current = automatic.generation;
+      enabled = automatic.enabled;
+    }
+    std::unique_lock lock(mutex);
+    if (generation != UINT64_MAX && current < generation) {
+      enabled = false; // A control/new request overtook this request before its local lock.
+    } else if (generation != current) {
+      // Controls retire membership, not references held by PSOs or old-generation waiters.
+      entries.clear(); bytes = completed = 0; generation = current;
+    }
+    std::shared_ptr<Flight> flight;
+    if (enabled) {
+      if (auto it = entries.find(key); it != entries.end()) {
+        flight = it->second;
+        flight->last_use = ++clock;
+        flight->ready.wait(lock, [&] { return flight->done; });
+        auto value = flight->value;
+        lock.unlock();
+        if (value && owned_graphics::TraceEnabled())
+          owned_graphics::Trace("pipeline_artifact_hit", ",\"kind\":\"", kind, "\",\"cache\":", id, ",\"key\":\"",
+                                Sha1HashState::compute(key.data(), key.size()).string(), "\"");
+        return value;
+      }
+      flight = std::make_shared<Flight>();
+      flight->last_use = ++clock;
+      entries.emplace(key, flight);
+    }
+    lock.unlock();
+    std::shared_ptr<const T> value;
+    try {
+      value = create();
+    } catch (...) {
+      if (flight) {
+        lock.lock();
+        if (auto it = entries.find(key); it != entries.end() && it->second == flight) entries.erase(it);
+        flight->done = true;
+        lock.unlock();
+        flight->ready.notify_all();
+      }
+      throw;
+    }
+    if (!flight) return value;
+    lock.lock();
+    flight->value = value;
+    flight->done = true;
+    const auto it = entries.find(key);
+    if (it != entries.end() && it->second == flight) {
+      flight->bytes = key.size() + (value ? value->size() : 0);
+      constexpr size_t limit = 32u * 1024u * 1024u;
+      if (!value || flight->bytes > limit) {
+        entries.erase(it);
+      } else {
+        bytes += flight->bytes; ++completed;
+        // ponytail: bounded 256-entry LRU scan; pending flights are never evicted.
+        while (bytes > limit || completed > 256) {
+          auto oldest = entries.end();
+          for (auto entry = entries.begin(); entry != entries.end(); ++entry)
+            if (entry->second->done && (oldest == entries.end() ||
+                entry->second->last_use < oldest->second->last_use)) oldest = entry;
+          bytes -= oldest->second->bytes; --completed; entries.erase(oldest);
+        }
+      }
+    }
+    lock.unlock();
+    flight->ready.notify_all();
+    return value;
+  }
+};
+
+struct NativeLibraryArtifact {
+  WMT::Reference<WMT4::Library> library;
+  size_t size() const { return 0; } // Serialized library bytes are counted in the exact key.
+};
+struct NativeFunctionArtifact {
+  WMT::Reference<WMT4::Function> function;
+  size_t size() const { return 0; }
+};
+struct ShaderReflectionArtifact {
+  MTL_SHADER_REFLECTION reflection{};
+  std::vector<MTL_SM50_SHADER_ARGUMENT> bindings;
+  size_t size() const { return sizeof(reflection) + bindings.size() * sizeof(MTL_SM50_SHADER_ARGUMENT); }
+};
+struct RasterMarkerArtifact {
+  bool needed;
+  size_t size() const { return sizeof(needed); }
+};
+
 } // namespace
+
+struct DeviceShaderArtifactCache::Impl {
+  ArtifactCache<ShaderStageArtifact> stages;
+  ArtifactCache<NativeLibraryArtifact> libraries;
+  ArtifactCache<NativeFunctionArtifact> functions;
+  ArtifactCache<ShaderReflectionArtifact> reflections;
+  ArtifactCache<RasterMarkerArtifact> markers;
+};
+
+DeviceShaderArtifactCache::DeviceShaderArtifactCache() : impl_(std::make_unique<Impl>()) {}
+DeviceShaderArtifactCache::~DeviceShaderArtifactCache() = default;
+
+HRESULT DeviceShaderArtifactCache::Reflect(
+    D3D12_SHADER_BYTECODE source, sm50_shader_t *shader, MTL_SHADER_REFLECTION &reflection,
+    std::vector<MTL_SM50_SHADER_ARGUMENT> *bindings) {
+  if (*shader) SM50Destroy(*shader);
+  *shader = nullptr;
+  StageKeyBuilder key;
+  key.add(uint32_t(AIRCONV_VERSION)); key.bytes(source.pShaderBytecode, source.BytecodeLength);
+  SM50Error error;
+  HRESULT result = E_FAIL;
+  auto value = impl_->reflections.Get(key.key, "shader_initialize", [&]() -> std::shared_ptr<const ShaderReflectionArtifact> {
+    microsoft::CDXBCParser parser;
+    if (FAILED(result = parser.ReadDXBC(source.pShaderBytecode, source.BytecodeLength))) return {};
+    result = E_FAIL;
+    impl_->reflections.Operation("shader_initialize", key.key);
+    auto artifact = std::make_shared<ShaderReflectionArtifact>();
+    if (SM50Initialize(source.pShaderBytecode, source.BytecodeLength, shader, &artifact->reflection, &error))
+      return {};
+    artifact->bindings.resize(artifact->reflection.NumConstantBuffers + artifact->reflection.NumArguments);
+    if (!artifact->bindings.empty())
+      SM50GetArgumentsInfo(*shader, artifact->bindings.data(),
+                          artifact->bindings.data() + artifact->reflection.NumConstantBuffers);
+    return artifact;
+  });
+  if (!value) {
+    // A failed flight does not carry its producer's HRESULT to waiting callers.
+    // Revalidate only failures so malformed bytecode preserves the parser error.
+    microsoft::CDXBCParser parser;
+    HRESULT parsed = parser.ReadDXBC(source.pShaderBytecode, source.BytecodeLength);
+    return FAILED(parsed) ? parsed : result;
+  }
+  reflection = value->reflection;
+  if (bindings) bindings->insert(bindings->end(), value->bindings.begin(), value->bindings.end());
+  return S_OK;
+}
+
+bool DeviceShaderArtifactCache::RasterOrderedMarker(
+    D3D12_SHADER_BYTECODE source, D3D12_SHADER_BYTECODE root, sm50_shader_t shader) {
+  StageKeyBuilder key;
+  key.add(uint32_t(AIRCONV_VERSION)); key.bytes(source.pShaderBytecode, source.BytecodeLength);
+  key.bytes(root.pShaderBytecode, root.BytecodeLength);
+  auto value = impl_->markers.Get(key.key, "raster_ordered_marker", [&]() -> std::shared_ptr<const RasterMarkerArtifact> {
+    SM50Shader local; SM50Error error;
+    if (!shader) {
+      if (InitializeCompiler(source, &local, &error)) return {};
+      shader = local;
+    }
+    return std::make_shared<RasterMarkerArtifact>(RasterMarkerArtifact{
+        SM50NeedsRasterOrderedBufferMarker(shader, root.pShaderBytecode, root.BytecodeLength) != 0});
+  });
+  return value && value->needed;
+}
+
+int DeviceShaderArtifactCache::InitializeCompiler(
+    D3D12_SHADER_BYTECODE source, sm50_shader_t *shader, sm50_error_t *error) {
+  StageKeyBuilder key; key.add(uint32_t(AIRCONV_VERSION));
+  key.bytes(source.pShaderBytecode, source.BytecodeLength);
+  impl_->reflections.Operation("shader_initialize", key.key);
+  // HS reflection normalizes its payload; cached reflection cannot normalize fresh compiler IR.
+  MTL_SHADER_REFLECTION reflection{};
+  return SM50Initialize(source.pShaderBytecode, source.BytecodeLength, shader, &reflection, error);
+}
+
+int PipelineCache::Compile(Stage stage, DeviceShaderArtifactCache &artifacts, D3D12_SHADER_BYTECODE source,
+                           sm50_shader_t shader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
+                           const char *name, sm50_error_t *error) {
+  if (loaded()) return 0;
+  auto lower = [&](sm50_bitcode_t *out, sm50_error_t *err) {
+    SM50Shader local;
+    if (!shader) {
+      if (int result = artifacts.InitializeCompiler(source, &local, err)) return result;
+      shader = local;
+    }
+    return SM50Compile(shader, args, name, out, err);
+  };
+  return artifacts.Compile("ordinary", {source}, args, name, output(stage), error, stage_artifacts_[stage],
+                           std::ref(lower));
+}
+
+int DeviceShaderArtifactCache::Compile(
+    const char *family, std::initializer_list<D3D12_SHADER_BYTECODE> sources,
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA *args, const char *name, sm50_bitcode_t *output,
+    sm50_error_t *error, std::shared_ptr<const ShaderStageArtifact> &artifact,
+    const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &lower) {
+  int result = 0;
+  StageKeyBuilder key;
+  auto compile = [&] {
+    impl_->stages.Operation("air_compile", key.key);
+    return lower(output, error);
+  };
+  try {
+    key.add(kVersion, uint32_t(AIRCONV_VERSION), uint32_t(sources.size()));
+    key.add(Identity().value);
+    key.bytes(family, strlen(family));
+    for (const auto &source : sources) key.bytes(source.pShaderBytecode, source.BytecodeLength);
+    key.bytes(name, strlen(name));
+    if (!key.arguments(args)) return compile();
+    artifact = impl_->stages.Get(key.key, "air_compile", [&]() -> std::shared_ptr<const ShaderStageArtifact> {
+      if ((result = compile())) return {};
+      SM50_COMPILED_BITCODE code{};
+      SM50GetCompiledBitcode(*output, &code);
+      auto value = std::make_shared<ShaderStageArtifact>();
+      value->library.resize(code.Size);
+      value->constants.resize((code.ConstantDataSize + 7) / 8);
+      value->relocations.resize(code.ConstantRelocationCount);
+      if (!SM50ReadCompiledBitcode(*output, SM50_COMPILED_BITCODE_PART_LIBRARY, code.Data,
+                                  value->library.data(), code.Size) ||
+          !SM50ReadCompiledBitcode(*output, SM50_COMPILED_BITCODE_PART_CONSTANTS, code.ConstantData,
+                                  value->constants.data(), code.ConstantDataSize) ||
+          !SM50ReadCompiledBitcode(*output, SM50_COMPILED_BITCODE_PART_RELOCATIONS, code.ConstantRelocations,
+                                  value->relocations.data(), code.ConstantRelocationCount * sizeof(SM50_CONSTANT_RELOCATION)))
+        return {}; // The producer can still consume its compiler-owned output.
+      value->view = code;
+      value->view.Data = value->library.data();
+      value->view.ConstantData = code.ConstantDataSize ? value->constants.data() : nullptr;
+      value->view.ConstantRelocations = code.ConstantRelocationCount ? value->relocations.data() : nullptr;
+      for (const auto &[data, size] : key.outputs) {
+        const auto *bytes = static_cast<const uint8_t *>(data);
+        value->metadata.insert(value->metadata.end(), bytes, bytes + size);
+      }
+      return value;
+    });
+  } catch (const std::bad_alloc &) {
+    // Optional retention must not fail a successful compiler invocation.
+  }
+  if (artifact) {
+    size_t offset = 0;
+    for (const auto &[data, size] : key.outputs) {
+      memcpy(data, artifact->metadata.data() + offset, size); offset += size;
+    }
+    if (sm50_bitcode_t handle = *output) {
+      SM50DestroyBitcode(handle); *output = nullptr;
+    }
+    return 0;
+  }
+  // Failed flights are not cached. Waiters compile locally to preserve their own error handle.
+  return result || sm50_bitcode_t(*output) ? result : compile();
+}
+
+int DeviceShaderArtifactCache::CompileShader(
+    D3D12_SHADER_BYTECODE source, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
+    const char *name, sm50_bitcode_t *output, sm50_error_t *error,
+    std::shared_ptr<const ShaderStageArtifact> &artifact) {
+  auto lower = [&](sm50_bitcode_t *out, sm50_error_t *err) {
+    SM50Shader shader;
+    if (int result = InitializeCompiler(source, &shader, err))
+      return result;
+    return SM50Compile(shader, args, name, out, err);
+  };
+  return Compile("ordinary", {source}, args, name, output, error, artifact, std::ref(lower));
+}
+
+WMT::Reference<WMT4::Library> DeviceShaderArtifactCache::Library(
+    WMT4::Compiler compiler, const SM50_COMPILED_BITCODE &code, sm50_bitcode_t owner, WMT::Error &error) {
+  std::string bytes(code.Size, char(0));
+  if (!SM50ReadCompiledBitcode(owner, SM50_COMPILED_BITCODE_PART_LIBRARY, code.Data, bytes.data(), code.Size)) return {};
+  // Device ownership fixes native device/driver identity; compiler handle is an explicit key input.
+  StageKeyBuilder key;
+  key.add(compiler.handle); key.bytes(bytes.data(), bytes.size());
+  auto value = impl_->libraries.Get(key.key, "new_library", [&]() -> std::shared_ptr<const NativeLibraryArtifact> {
+    impl_->libraries.Operation("new_library", key.key);
+    auto library = compiler.newLibrary(WMT::MakeDispatchData(bytes.data(), bytes.size()), error);
+    if (!library) return {};
+    auto artifact = std::make_shared<NativeLibraryArtifact>();
+    artifact->library = std::move(library);
+    return artifact;
+  });
+  return value ? value->library : WMT::Reference<WMT4::Library>{};
+}
+
+WMT::Reference<WMT4::Function> DeviceShaderArtifactCache::SampleMaskFunction(
+    WMT4::Library library, const char *name, D3D12_SHADER_BYTECODE root, uint32_t mask, WMT::Error &error) {
+  StageKeyBuilder key;
+  key.add(library.handle, uint16_t(0), WMTDataTypeUInt, mask);
+  key.bytes(name, strlen(name)); key.bytes(root.pShaderBytecode, root.BytecodeLength);
+  auto value = impl_->functions.Get(key.key, "specialize_function", [&]() -> std::shared_ptr<const NativeFunctionArtifact> {
+    impl_->functions.Operation("specialize_function", key.key);
+    WMTFunctionConstant constant{};
+    constant.index = 0; constant.type = WMTDataTypeUInt;
+    constant.data.set(&mask);
+    auto function = library.newFunctionWithConstants(name, &constant, 1, error);
+    if (!function) return {};
+    auto artifact = std::make_shared<NativeFunctionArtifact>();
+    artifact->function = std::move(function); return artifact;
+  });
+  return value ? value->function : WMT::Reference<WMT4::Function>{};
+}
 
 HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Digest &key) {
   KeyBuilder hash;
@@ -265,7 +747,7 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
   KeyBuilder hash;
   // 6: Metal 4 compiles UINT logic operations into every owned framebuffer-fetch
   // 7: device atomic64 phase selection changes every participating application stage.
-  hash.add(uint32_t(7), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  hash.add(uint32_t(7), uint32_t(AIRCONV_VERSION), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.VS);
   hash.shader(desc.PS);
@@ -392,6 +874,7 @@ void PipelineCache::Complete(HRESULT result) noexcept {
               *&compiled = nullptr;
             }
           }
+          stage_artifacts_.fill({}); // The PSO blob now owns its complete CPU serialization.
         }
       }
     } catch (...) {
@@ -676,12 +1159,14 @@ HRESULT PipelineCache::LoadBlob(const D3D12_CACHED_PIPELINE_STATE &cached, ID3DB
 }
 
 sm50_bitcode_t PipelineCache::bitcode(Stage stage) {
-  return loaded() ? sm50_bitcode_t{} : sm50_bitcode_t(compiled_[stage]);
+  return loaded() || stage_artifacts_[stage] ? sm50_bitcode_t{} : sm50_bitcode_t(compiled_[stage]);
 }
 
 SM50_COMPILED_BITCODE PipelineCache::view(Stage stage) {
   if (loaded())
     return blob_->views[stage];
+  if (stage_artifacts_[stage])
+    return stage_artifacts_[stage]->view;
   SM50_COMPILED_BITCODE result{};
   if (sm50_bitcode_t bitcode = compiled_[stage])
     SM50GetCompiledBitcode(bitcode, &result);

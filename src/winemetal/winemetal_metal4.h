@@ -73,6 +73,13 @@ enum WMTMetal4Operation : uint32_t {
   WMTMetal4Diagnostic,
   // args[0]: recording command buffer; args[1]: acquired ordinary/paired drawable.
   WMTMetal4UseDrawable = 44,
+  // args[1]: exactly eight physical indices 0..7. Disabled outputs use a genuinely
+  // unbound physical slot chosen by the caller; the SDK rejects 0xff.
+  WMTMetal4SetColorAttachmentMap = 45,
+  WMTMetal4NewTextureViewPool = 46,
+  WMTMetal4SetTextureView = 47,
+  WMTMetal4CopyTextureViews = 48,
+  WMTMetal4ClearTextureView = 49,
 };
 enum WMTMetal4Stages : uint64_t {
   WMTMetal4StageVertex = 1ull << 0,
@@ -93,6 +100,29 @@ enum WMTMetal4Visibility : uint64_t {
   WMTMetal4VisibilityResourceAlias = 2,
 };
 #pragma pack(pop)
+
+/* Pool descriptors have no host-sized fields. */
+struct WMTTextureViewPoolInfo {
+  uint32_t format, type;
+  uint32_t first_mip, mip_count;
+  uint32_t first_slice, slice_count;
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(WMTTextureViewPoolInfo) == 24);
+static_assert(sizeof(WMTRenderPassInfo) == 688);
+static_assert(offsetof(WMTRenderPassInfo, sample_positions) == 667);
+static_assert(offsetof(WMTRenderPassInfo, support_color_attachment_mapping) == 684);
+static_assert(sizeof(WMTRenderPipelineInfo) == 168);
+static_assert(offsetof(WMTRenderPipelineInfo, inherit_color_attachment_mapping) == 164);
+#else
+_Static_assert(sizeof(struct WMTTextureViewPoolInfo) == 24, "texture pool descriptor ABI");
+_Static_assert(sizeof(struct WMTRenderPassInfo) == 688, "render pass ABI");
+_Static_assert(offsetof(struct WMTRenderPassInfo, sample_positions) == 667, "sample positions ABI");
+_Static_assert(offsetof(struct WMTRenderPassInfo, support_color_attachment_mapping) == 684, "mapping flag ABI");
+_Static_assert(sizeof(struct WMTRenderPipelineInfo) == 168, "render pipeline ABI");
+_Static_assert(offsetof(struct WMTRenderPipelineInfo, inherit_color_attachment_mapping) == 164, "pipeline mapping ABI");
+#endif
 
 WINEMETAL_API int32_t WMTMetal4Call(struct WMTMetal4Call *params);
 

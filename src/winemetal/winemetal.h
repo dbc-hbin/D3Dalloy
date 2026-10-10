@@ -887,6 +887,8 @@ struct WMTRenderPassInfo {
   // struct keeps its size and 32/64-bit layout. Write both through WMT::SetRenderTargetArrayLength.
   uint8_t render_target_array_length_high;
   struct WMTProgrammableSamplePositions sample_positions;
+  /* Metal4 only, carved from trailing padding; zero keeps the ordinary pass. */
+  uint8_t support_color_attachment_mapping;
 };
 
 WINEMETAL_API obj_handle_t MTLCommandBuffer_renderCommandEncoder(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info);
@@ -1021,7 +1023,8 @@ struct WMTRenderPipelineInfo {
   bool support_indirect_command_buffers;
   /* maxVertexAmplificationCount; 0 means Metal's default (1). */
   uint8_t max_vertex_amplification_count;
-  uint8_t padding[4];
+  uint8_t inherit_color_attachment_mapping;
+  uint8_t padding[3];
 };
 
 struct WMTMeshRenderPipelineInfo {

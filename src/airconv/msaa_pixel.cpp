@@ -911,6 +911,22 @@ Error maskSampleFrequency(Module &module, uint32_t sampleMask) {
   return Error::success();
 }
 
+void preparePixelTarget(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options) {
+  const auto variant = options.variant & ~SM50_MSAA_ATOMIC_HELPERS;
+  auto *version = module.getNamedMetadata("air.version");
+  const auto minor = mdconst::extract<ConstantInt>(version->getOperand(0)->getOperand(1))->getZExtValue();
+  // Select the final target before application lowering; keep coverage and atomic AIR 2.9 unchanged.
+  if (variant == SM50_MSAA_COVERAGE || minor >= 8) return;
+  auto &context = module.getContext();
+  module.setTargetTriple("air64_v28-apple-macosx26.0");
+  version->clearOperands();
+  version->addOperand(MDTuple::get(context, {
+    ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 2)),
+    ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 8)),
+    ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 0))
+  }));
+}
+
 Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options, bool coarseRequested,
                      bool conservative) {
   const bool promoted = options.variant & SM50_MSAA_ATOMIC_HELPERS;
@@ -1238,22 +1254,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
                            options.line_mode, lineMaskOffset, lineAlphaOffset, innerMaskOffset, boundsMaskOffset};
   static_assert(sizeof(SM50_MSAA_PIXEL_LAYOUT) == 19 * sizeof(uint32_t));
 
-  // Finalize the AIR target before emitting any version-dependent texture intrinsics.
-  // Non-coverage MSAA passes require at least AIR 2.8 on macOS 27 AGX.
-  // Retain the selected Metal 4.1/AIR 2.9 atomic phase target: its SC intrinsics
-  // cannot be compiled under the older replay target. Coverage is unchanged.
-  auto *airVersion = module.getNamedMetadata("air.version");
-  const auto airMinor = mdconst::extract<ConstantInt>(airVersion->getOperand(0)->getOperand(1))->getZExtValue();
-  if (variant != SM50_MSAA_COVERAGE && airMinor < 8) {
-    module.setTargetTriple("air64_v28-apple-macosx26.0");
-    auto *version = module.getOrInsertNamedMetadata("air.version");
-    version->clearOperands();
-    version->addOperand(MDTuple::get(context, {
-      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 2)),
-      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 8)),
-      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 0))
-    }));
-  }
+
   SmallVector<Type *, 32> parameters;
   SmallVector<Metadata *, 32> metadata;
   SmallVector<unsigned, 32> originalArgs;

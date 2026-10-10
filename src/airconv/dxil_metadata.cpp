@@ -12,6 +12,8 @@
 #include <bit>
 #include <cstring>
 
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
@@ -770,6 +772,8 @@ void readThreadGroupSize(llvm::MDNode *properties, uint32_t (&num_threads)[3]) {
  * SM 5.x reflection counts output writes the same way.
  */
 void scanOutputWrites(llvm::Module &module, ModuleInfo &out) {
+  out.has_coverage_output = out.stage == Stage::Pixel && std::any_of(out.output_sig.begin(), out.output_sig.end(),
+      [](const SigElement &output) { return output.semantic_kind == 66; }); // D3D_NAME_COVERAGE output only.
   for (llvm::Function &function : module) {
     for (llvm::BasicBlock &block : function) {
       for (llvm::Instruction &instruction : block) {
@@ -786,8 +790,6 @@ void scanOutputWrites(llvm::Module &module, ModuleInfo &out) {
             out.output_register_mask |= (1u << reg);
             out.max_output_register = std::max(out.max_output_register, reg + 1);
           }
-        } else if (opcode == 91) { /* coverage */
-          out.has_coverage_output = true;
         }
       }
     }
@@ -1236,6 +1238,39 @@ ParseMetadata(const void *bytecode, size_t size, const char *entry_name) {
   metadata.output_register_mask = (*info)->output_register_mask;
   metadata.max_output_register = (*info)->max_output_register;
   metadata.has_coverage_output = (*info)->has_coverage_output;
+  if (metadata.stage == Stage::Pixel) {
+    for (const auto &input : (*info)->input_sig) {
+      metadata.has_coverage_input |= input.semantic_kind == 66; // D3D_NAME_COVERAGE
+      metadata.has_inner_coverage_input |= input.semantic_kind == 70; // D3D_NAME_INNER_COVERAGE
+    }
+    // Dedicated DXIL inputs need not appear in the input signature. Read the IR already parsed above.
+    llvm::SmallVector<llvm::Function *, 8> pending{(*info)->entry};
+    llvm::SmallPtrSet<llvm::Function *, 8> visited;
+    while (!pending.empty()) {
+      auto *function = pending.pop_back_val();
+      if (!visited.insert(function).second) continue;
+      for (auto &block : *function) {
+        for (auto &instruction : block) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+          auto *callee = call ? call->getCalledFunction() : nullptr;
+          if (callee && !callee->isDeclaration() && !visited.contains(callee)) pending.push_back(callee);
+          if (!callee || (callee->getName() != "dx.op.coverage.i32" &&
+                          callee->getName() != "dx.op.innerCoverage.i32"))
+            continue;
+          const bool inner = callee->getName() == "dx.op.innerCoverage.i32";
+          if (call->arg_size() != 1 || !call->getType()->isIntegerTy(32))
+            return createError("invalid DXIL coverage input use");
+          auto *opcode = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0));
+          if (!opcode || !opcode->getType()->isIntegerTy(32) || opcode->getZExtValue() != (inner ? 92u : 91u))
+            return createError("invalid DXIL coverage input opcode");
+          if (inner) metadata.has_inner_coverage_input = true;
+          else metadata.has_coverage_input = true;
+        }
+      }
+    }
+    if (metadata.has_coverage_input && metadata.has_inner_coverage_input)
+      return createError("SV_Coverage and SV_InnerCoverage inputs are mutually exclusive");
+  }
   metadata.force_early_depth_stencil = (*info)->force_early_depth_stencil;
   metadata.has_atomic64 = HasDeviceAtomic64(*(*info)->module);
   metadata.input_sig = std::move((*info)->input_sig);

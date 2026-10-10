@@ -29,6 +29,18 @@ constexpr UINT centerPattern = 0xfffffffeu;
 void check(HRESULT hr, const char *step) { if (FAILED(hr)) fail(step, hr); }
 void require(bool ok, const char *step) { if (!ok) fail(step); }
 
+std::vector<uint8_t> readFile(const wchar_t *path) {
+  HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
+  if(file==INVALID_HANDLE_VALUE) fail("open shader",HRESULT_FROM_WIN32(GetLastError()));
+  LARGE_INTEGER size{};
+  if(!GetFileSizeEx(file,&size) || size.QuadPart<=0 || size.QuadPart>64*1024*1024) fail("shader size");
+  std::vector<uint8_t> bytes(size_t(size.QuadPart)); DWORD count=0;
+  const BOOL ok=ReadFile(file,bytes.data(),DWORD(bytes.size()),&count,nullptr);
+  CloseHandle(file);
+  require(ok && count==bytes.size(),"read shader");
+  return bytes;
+}
+
 D3D12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE type) {
   D3D12_HEAP_PROPERTIES p{};
   p.Type = type;
@@ -298,8 +310,11 @@ struct Fixture {
     csUintResolved = compile(shaders, "readUintResolved", "cs_5_0");
     csDepthResolved = compile(shaders, "readDepthResolved", "cs_5_0");
   }
-  void submit(ID3D12GraphicsCommandList *list) {
-    check(list->Close(), "close");
+  void submit(ID3D12GraphicsCommandList *list, const char *label = "existing", bool closed = false) {
+    if (!closed) check(list->Close(), "close");
+    std::fprintf(stderr, "%s_SUBMISSION_BEGIN id=%llu label=%s\n", marker,
+                 static_cast<unsigned long long>(fenceValue + 1), label);
+    std::fflush(stderr);
     ID3D12CommandList *lists[]{list};
     queue->ExecuteCommandLists(1, lists);
     check(queue->Signal(fence.Get(), ++fenceValue), "signal");
@@ -308,6 +323,9 @@ struct Fixture {
       require(WaitForSingleObject(event, 15000) == WAIT_OBJECT_0, "GPU timeout");
     }
     check(device->GetDeviceRemovedReason(), "GPU removed");
+    std::fprintf(stderr, "%s_SUBMISSION_END id=%llu label=%s\n", marker,
+                 static_cast<unsigned long long>(fenceValue), label);
+    std::fflush(stderr);
   }
 };
 
@@ -630,12 +648,22 @@ void gpuCase(Fixture &f, DXGI_FORMAT resourceFormat, DXGI_FORMAT viewFormat,
 }
 
 #include "owned-d3d12-multisample-programmable.inc"
+#include "owned-d3d12-multisample-native.inc"
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   Fixture f;
   f.init();
+  if(argc==2 && std::strcmp(argv[1],"--native-binding-budget")==0) {
+    nativeBindingBudgetCase(f);
+    return 0;
+  }
+  require(argc==1,"fixture arguments");
+  nativeOrdinaryCases(f);
+  nativeResourceCases(f,false);
+  nativeResourceCases(f,true);
+  nativeBindingBudgetCase(f);
   programmableCases(f);
   regionResolveCases(f);
   semanticCase(f);

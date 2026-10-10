@@ -297,6 +297,159 @@ void recordEmptyDraw(ID3D12GraphicsCommandList* list,
     recordDraw(list, pipeline, rtv, 0);
 }
 
+void runVisibilityIntervals(ID3D12Device* device, ID3D12CommandQueue* queue,
+                            const Pipeline& pipeline, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
+    constexpr UINT64 guard = 0x1234000000000000ull;
+    constexpr UINT words = 11;
+    auto heapA = createQueryHeap(device, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 2);
+    auto heapB = createQueryHeap(device, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 3);
+    auto upload = createBuffer(device, words * sizeof(UINT64), D3D12_HEAP_TYPE_UPLOAD,
+                               D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto readback = createBuffer(device, words * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
+                                 D3D12_RESOURCE_STATE_COPY_DEST);
+    UINT64* initial = nullptr;
+    D3D12_RANGE noRead{0, 0};
+    check(upload->Map(0, &noRead, reinterpret_cast<void**>(&initial)), "interval upload Map");
+    for (UINT i = 0; i < words; ++i)
+        initial[i] = guard + i;
+    upload->Unmap(0, nullptr);
+    Recording commands = createRecording(device);
+    ComPtr<ID3D12Fence> fence;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)),
+          "CreateFence(intervals)");
+    for (unsigned execution = 0; execution < 3; ++execution) {
+        // Execution 2 replays the exact closed list, without allocator/list Reset.
+        if (execution < 2) {
+            if (execution) {
+                check(commands.allocator->Reset(), "interval allocator Reset");
+                check(commands.list->Reset(commands.allocator.Get(), nullptr), "interval list Reset");
+            }
+            std::fprintf(stderr, "OWNED_D3D12_QUERY_INTERVAL_PHASE execution=%u phase=record_begin\n", execution);
+            auto* list = commands.list.Get();
+            const float clear[4]{0, 0, 0, 1};
+            list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+            const D3D12_VIEWPORT viewport{0, 0, float(kWidth), float(kHeight), 0, 1};
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->RSSetViewports(1, &viewport);
+            list->SetGraphicsRootSignature(pipeline.root.Get());
+            list->SetPipelineState(pipeline.pso.Get());
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            const auto draw = [&](LONG width, LONG row, unsigned repeats) {
+                const D3D12_RECT scissor{0, row, width, row + 1};
+                list->RSSetScissorRects(1, &scissor);
+                for (unsigned i = 0; i < repeats; ++i)
+                    list->DrawInstanced(3, 1, 0, 0);
+            };
+            // No barriers, clears, binding changes or ClearState within this
+            // ordinary render span. Query transitions alone must not split it.
+            draw(8, 0, 1); // Disabled pre-Begin: must not enter any query.
+            list->BeginQuery(heapA.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+            draw(execution ? 3 : 2, 1, 2); // A-only.
+            list->BeginQuery(heapB.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list->BeginQuery(heapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+            draw(execution ? 2 : 4, 2, 2); // A+B; binary shadows B.
+            list->EndQuery(heapA.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+            draw(execution ? 1 : 6, 3, 2); // B-only.
+            list->EndQuery(heapB.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list->EndQuery(heapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+            draw(8, 4, 1); // Disabled post-End.
+            list->BeginQuery(heapA.Get(), D3D12_QUERY_TYPE_OCCLUSION, 1);
+            list->EndQuery(heapA.Get(), D3D12_QUERY_TYPE_OCCLUSION, 1);
+            list->BeginQuery(heapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2);
+            list->EndQuery(heapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2);
+            // Initialize every destination word on GPU; resolve only initialized
+            // heap elements, preserving six interleaved guard words exactly.
+            list->CopyBufferRegion(readback.Get(), 0, upload.Get(), 0, words * sizeof(UINT64));
+            list->ResolveQueryData(heapA.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.Get(), 8);
+            list->ResolveQueryData(heapB.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.Get(), 24);
+            list->ResolveQueryData(heapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 1, readback.Get(), 40);
+            list->ResolveQueryData(heapA.Get(), D3D12_QUERY_TYPE_OCCLUSION, 1, 1, readback.Get(), 56);
+            list->ResolveQueryData(heapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2, 1, readback.Get(), 72);
+            check(list->Close(), "interval list Close");
+            std::fprintf(stderr, "OWNED_D3D12_QUERY_INTERVAL_PHASE execution=%u phase=record_end\n", execution);
+        } else {
+            // Recorded query buffers must outlive heap COM objects on replay.
+            heapA.Reset();
+            heapB.Reset();
+        }
+        std::fprintf(stderr, "OWNED_D3D12_QUERY_INTERVAL_PHASE execution=%u phase=submit_begin\n", execution);
+        ID3D12CommandList* lists[]{commands.list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        check(queue->Signal(fence.Get(), execution + 1), "Signal(interval completion)");
+        waitFence(fence.Get(), execution + 1);
+        std::fprintf(stderr, "OWNED_D3D12_QUERY_INTERVAL_PHASE execution=%u phase=submit_end\n", execution);
+        const D3D12_RANGE range{0, words * sizeof(UINT64)};
+        UINT64* mapped = nullptr;
+        check(readback->Map(0, &range, reinterpret_cast<void**>(&mapped)), "interval readback Map");
+        std::array<UINT64, words> actual{};
+        std::memcpy(actual.data(), mapped, sizeof(actual));
+        readback->Unmap(0, nullptr);
+        std::printf("OWNED_D3D12_QUERY_INTERVAL_VALUES execution=%u values=", execution);
+        for (UINT i = 0; i < words; ++i)
+            std::printf("%s%llu", i ? "," : "", static_cast<unsigned long long>(actual[i]));
+        std::puts("");
+        std::array<UINT64, words> expected{};
+        for (UINT i = 0; i < words; ++i)
+            expected[i] = guard + i;
+        expected[1] = execution ? 10 : 12;
+        expected[3] = execution ? 6 : 20;
+        expected[5] = 1;
+        expected[7] = expected[9] = 0;
+        for (UINT i = 0; i < words; ++i) {
+            if (actual[i] != expected[i]) {
+                std::fprintf(stderr, "OWNED_D3D12_QUERY_INTERVAL_MISMATCH execution=%u word=%u expected=%llu actual=%llu\n",
+                             execution, i, static_cast<unsigned long long>(expected[i]),
+                             static_cast<unsigned long long>(actual[i]));
+                fail("interval exact counts/guards/reset/replay");
+            }
+        }
+    }
+    std::puts("OWNED_D3D12_QUERY_INTERVAL_PASS executions=3 changed_values=1 closed_list_replay=1 "
+              "crossheap=1 empty_count=0 binary_visible=1 binary_empty=0 guard_words=6 "
+              "heap_release_before_replay=1");
+}
+
+void runVisibilitySlotReuse(ID3D12Device* device, ID3D12CommandQueue* queue,
+                            const Pipeline& pipeline, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
+    auto heap = createQueryHeap(device, D3D12_QUERY_HEAP_TYPE_OCCLUSION, 1);
+    auto readback = createBuffer(device, sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
+                                 D3D12_RESOURCE_STATE_COPY_DEST);
+    auto commands = createRecording(device);
+    auto* list = commands.list.Get();
+    // Start with Disabled, then reuse the same legal heap slot after End inside
+    // one pass. The first interval must be accumulated before its later reset.
+    recordVisibleDraw(list, pipeline, rtv);
+    list->BeginQuery(heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+    list->DrawInstanced(3, 1, 0, 0);
+    list->DrawInstanced(3, 1, 0, 0);
+    list->EndQuery(heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+    list->BeginQuery(heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+    list->DrawInstanced(3, 1, 0, 0);
+    list->EndQuery(heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+    list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.Get(), 0);
+    check(list->Close(), "slot reuse Close");
+    heap.Reset();
+    ComPtr<ID3D12Fence> fence;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "slot reuse fence");
+    for (UINT execution = 0; execution < 2; ++execution) {
+        std::fprintf(stderr, "OWNED_D3D12_QUERY_REUSE_PHASE execution=%u phase=submit_begin\n", execution);
+        ID3D12CommandList* lists[]{list};
+        queue->ExecuteCommandLists(1, lists);
+        check(queue->Signal(fence.Get(), execution + 1), "slot reuse Signal");
+        waitFence(fence.Get(), execution + 1);
+        UINT64* mapped = nullptr;
+        const D3D12_RANGE range{0, sizeof(UINT64)};
+        check(readback->Map(0, &range, reinterpret_cast<void**>(&mapped)), "slot reuse Map");
+        const auto actual = *mapped;
+        readback->Unmap(0, nullptr);
+        if (actual != kFullScreenSamples) fail("slot reuse reset order or released-heap replay");
+        std::printf("OWNED_D3D12_QUERY_REUSE_VALUES execution=%u count=%llu\n", execution,
+                    static_cast<unsigned long long>(actual));
+        std::fprintf(stderr, "OWNED_D3D12_QUERY_REUSE_PHASE execution=%u phase=submit_end\n", execution);
+    }
+    std::puts("OWNED_D3D12_QUERY_REUSE_PASS executions=2 same_slot=1 heap_release_before_execute=1");
+}
+
 void runCopyTimestamps(ID3D12Device* device, ID3D12CommandQueue* queue) {
     constexpr unsigned rounds = 8;
     constexpr UINT64 rowWords = 9;
@@ -561,6 +714,8 @@ int run() {
           "CreateDescriptorHeap(RTV)");
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+    runVisibilityIntervals(device.Get(), queue.Get(), pipeline, rtv);
+    runVisibilitySlotReuse(device.Get(), queue.Get(), pipeline, rtv);
 
     ComPtr<ID3D12QueryHeap> timestampHeap =
         createQueryHeap(device.Get(), D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2);

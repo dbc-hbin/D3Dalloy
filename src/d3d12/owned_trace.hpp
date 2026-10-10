@@ -30,7 +30,7 @@ inline std::uint64_t TraceLimit() {
     const auto parsed = std::strtoull(value.c_str(), &end, 10);
     if (end != value.c_str() + value.size() || !parsed || value[0] == '-')
       return 8192ULL;
-    return std::min(parsed, 1000000ULL);
+    return std::min(parsed, 10000000ULL);
   }();
   return limit;
 }

@@ -587,6 +587,7 @@ public:
 
     try {
       texture = new Texture(unsigned(bytes), unsigned(pitch), texture_info, device_->GetMTLDevice());
+      texture->descriptorIndexedViews = device_->GetMTLDevice().supportsMetal4();
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
     }
@@ -618,7 +619,10 @@ public:
     try {
       swizzle_layout = std::make_unique<standard_swizzle::Layout>(*layout);
       buffer = new Buffer(layout->size_bytes, device_->GetMTLDevice());
-      if (!volume) texture = new Texture(texture_info, device_->GetMTLDevice());
+      if (!volume) {
+        texture = new Texture(texture_info, device_->GetMTLDevice());
+        texture->descriptorIndexedViews = device_->GetMTLDevice().supportsMetal4();
+      }
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
     }
@@ -779,6 +783,7 @@ public:
 
     try {
       texture = new Texture(texture_info, device_->GetMTLDevice());
+      texture->descriptorIndexedViews = device_->GetMTLDevice().supportsMetal4();
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
     }
@@ -938,6 +943,7 @@ public:
 
     try {
       texture = new Texture(texture_info, metal);
+      texture->descriptorIndexedViews = metal.supportsMetal4();
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
     }
@@ -1445,8 +1451,6 @@ public:
       view_descriptor.arraySize = texture->arrayLength();
     }
     View = texture->createView(view_descriptor);
-    if (!texture->view(View).texture)
-      return E_OUTOFMEMORY;
     if (reserved && reserved->volumeLayout()) {
       View.mip_start = logical_first_mip;
       View.mip_end = logical_first_mip + logical_mip_count;
@@ -1607,8 +1611,6 @@ public:
       view_descriptor.arraySize = texture->arrayLength();
     }
     View = texture->createView(view_descriptor);
-    if (!texture->view(View).texture)
-      return E_OUTOFMEMORY;
     if (reserved && reserved->volumeLayout()) {
       View.mip_start = logical_uav_mip;
       View.mip_end = logical_uav_mip + 1;

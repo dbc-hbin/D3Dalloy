@@ -217,6 +217,8 @@ struct context {
   SM50_SHADER_METAL_VERSION metal_version;
   bool capture_raw_distance_output = false;
 };
+void initialize_sample_mask_constant(llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args);
+llvm::Value *pixel_sample_mask(context ctx);
 
 template <typename S> IRValue make_irvalue(S &&fs) {
   return IRValue(std::forward<S>(fs));

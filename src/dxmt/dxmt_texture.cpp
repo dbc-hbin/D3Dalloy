@@ -19,6 +19,7 @@
 #include "dxmt_texture.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_residency.hpp"
+#include "util_hash.hpp"
 #include "wsi_platform.hpp"
 #include <atomic>
 #include <cassert>
@@ -26,6 +27,35 @@
 namespace dxmt {
 
 std::atomic_uint64_t global_texture_seq = {0};
+
+bool
+TextureViewDescriptor::operator==(const TextureViewDescriptor &other) const {
+  return format == other.format && type == other.type && firstMiplevel == other.firstMiplevel &&
+         miplevelCount == other.miplevelCount && firstArraySlice == other.firstArraySlice &&
+         arraySize == other.arraySize && msaaShadow == other.msaaShadow &&
+         reservedVolumeRender == other.reservedVolumeRender && volumeFirstW == other.volumeFirstW &&
+         volumeCastMip == other.volumeCastMip && castBlockSize == other.castBlockSize &&
+         castSourceBlockWidth == other.castSourceBlockWidth && castCompressed == other.castCompressed;
+}
+
+size_t
+TextureViewDescriptor::Hash::operator()(const TextureViewDescriptor &descriptor) const {
+  HashState hash;
+  hash.add(descriptor.format);
+  hash.add(descriptor.type);
+  hash.add(descriptor.firstMiplevel);
+  hash.add(descriptor.miplevelCount);
+  hash.add(descriptor.firstArraySlice);
+  hash.add(descriptor.arraySize);
+  hash.add(descriptor.msaaShadow);
+  hash.add(descriptor.reservedVolumeRender);
+  hash.add(descriptor.volumeFirstW);
+  hash.add(descriptor.volumeCastMip);
+  hash.add(descriptor.castBlockSize);
+  hash.add(descriptor.castSourceBlockWidth);
+  hash.add(descriptor.castCompressed);
+  return hash;
+}
 
 void
 TextureView::incRef() {
@@ -324,35 +354,16 @@ Texture::prepareAllocationViews(TextureAllocation *allocation) {
 TextureViewKey
 Texture::createView(TextureViewDescriptor const &descriptor) {
   std::unique_lock<dxmt::shared_mutex> lock(mutex_);
-  unsigned i = 0;
-  for (; i < version_; i++) {
-    if (viewDescriptors_[i].format != descriptor.format)
-      continue;
-    if (viewDescriptors_[i].type != descriptor.type)
-      continue;
-    if (viewDescriptors_[i].firstMiplevel != descriptor.firstMiplevel)
-      continue;
-    if (viewDescriptors_[i].miplevelCount != descriptor.miplevelCount)
-      continue;
-    if (viewDescriptors_[i].firstArraySlice != descriptor.firstArraySlice)
-      continue;
-    if (viewDescriptors_[i].arraySize != descriptor.arraySize)
-      continue;
-    if (viewDescriptors_[i].msaaShadow != descriptor.msaaShadow)
-      continue;
-    if (viewDescriptors_[i].reservedVolumeRender != descriptor.reservedVolumeRender ||
-        viewDescriptors_[i].volumeFirstW != descriptor.volumeFirstW ||
-        viewDescriptors_[i].volumeCastMip != descriptor.volumeCastMip)
-      continue;
-    if (viewDescriptors_[i].castBlockSize != descriptor.castBlockSize)
-      continue;
-    if (viewDescriptors_[i].castSourceBlockWidth != descriptor.castSourceBlockWidth)
-      continue;
-    if (viewDescriptors_[i].castCompressed != descriptor.castCompressed)
-      continue;
-    return TextureViewKey(descriptor, i, info_.mipmap_level_count);
-  }
+  if (auto entry = viewIndices_.find(descriptor); entry != viewIndices_.end())
+    return TextureViewKey(descriptor, entry->second, info_.mipmap_level_count);
+  const unsigned i = version_;
   viewDescriptors_.push_back(descriptor);
+  try {
+    viewIndices_.emplace(descriptor, i);
+  } catch (...) {
+    viewDescriptors_.pop_back();
+    throw;
+  }
   version_ = version_ + 1;
   return TextureViewKey(descriptor, i, info_.mipmap_level_count);
 }
@@ -369,6 +380,7 @@ Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
       .firstArraySlice = 0,
       .arraySize = arrayLength(),
   });
+  viewIndices_.emplace(viewDescriptors_[0], 0);
   version_ = 1;
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
 }
@@ -393,6 +405,7 @@ Texture::Texture(
       .firstArraySlice = 0,
       .arraySize = 1,
   });
+  viewIndices_.emplace(viewDescriptors_[0], 0);
   version_ = 1;
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
 }
@@ -517,10 +530,35 @@ Texture::view(TextureViewKey key) {
 
 TextureView &
 Texture::view(TextureViewKey key, TextureAllocation* allocation) {
+  if (descriptorIndexedViews) {
+    TextureViewDescriptor descriptor;
+    {
+      std::unique_lock<dxmt::shared_mutex> lock(mutex_);
+      allocation->cached_view_.resize(version_);
+      if (allocation->cached_view_[key.index]) return *allocation->cached_view_[key.index];
+      descriptor = viewDescriptors_[key.index];
+    }
+    TextureViewRef prepared(key.index ? new TextureView(allocation, key.index, descriptor) : new TextureView(allocation));
+    std::unique_lock<dxmt::shared_mutex> lock(mutex_);
+    if (!allocation->cached_view_[key.index]) allocation->cached_view_[key.index] = std::move(prepared);
+    return *allocation->cached_view_[key.index];
+  }
   if (unlikely(allocation->version_ != version_)) {
     prepareAllocationViews(allocation);
   }
   return *allocation->cached_view_[key.index];
+}
+
+bool Texture::supportsDescriptorViewPool(TextureViewKey key) {
+  const auto descriptor = viewDescriptor(key);
+  auto allocation = current();
+  return allocation && !bytes_per_image_ && !reservedResource && !reservedVolumeLayoutAddress &&
+      !allocation->flags().test(TextureAllocationFlag::PlacementSparse) &&
+      !allocation->flags().test(TextureAllocationFlag::GpuManaged) && sampleCount() == 1 &&
+      !descriptor.castBlockSize && !descriptor.castCompressed && !descriptor.msaaShadow &&
+      !descriptor.reservedVolumeRender && descriptor.format == pixelFormat() &&
+      (descriptor.type == WMTTextureType2D || descriptor.type == WMTTextureType2DArray) &&
+      (textureType() == WMTTextureType2D || textureType() == WMTTextureType2DArray);
 }
 
 TextureViewKey Texture::checkViewUseArray(TextureViewKey key, bool isArray) {

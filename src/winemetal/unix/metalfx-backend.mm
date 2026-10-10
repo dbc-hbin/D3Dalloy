@@ -419,9 +419,9 @@ struct Feature::Impl {
     float minScale = 1.0f;
     float maxScale = 1.0f;
     std::shared_ptr<ScalerGeneration> currentGeneration;
-    // Retain only the opposite reactive-presence variant for the same descriptor layout.
-    // Prepared frames and GPU leases independently own any evicted generation.
-    std::shared_ptr<ScalerGeneration> alternateGeneration;
+    // Eviction drops cache ownership, never prepared frames or GPU leases.
+    std::array<std::shared_ptr<ScalerGeneration>, 8> generations{};
+    std::size_t nextGenerationSlot = 0;
     std::mutex mutex;
     // Scratch never includes caller textures. Fixed capacity bounds idle memory
     // across resolution changes and avoids allocations in completion callbacks.
@@ -649,7 +649,7 @@ struct Feature::Impl {
         for (auto& set : idleResidencies) releaseObject(set);
         for (auto& texture : idleTextures) releaseObject(texture);
         for (auto& buffer : idleBuffers) releaseObject(buffer);
-        alternateGeneration.reset();
+        for (auto& generation : generations) generation.reset();
         currentGeneration.reset();
         releaseObject(debugDepthPipeline);
         releaseObject(debugPipeline);
@@ -903,12 +903,9 @@ bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
         setError(error, ErrorCode::InvalidFrame, "MetalFX dynamic content/output dimensions are inconsistent with the feature");
         return false;
     }
-    if (frame.inputContent.width > feature.create.input.width ||
-        frame.inputContent.height > feature.create.input.height) {
-        setError(error, ErrorCode::InvalidFrame,
-                 "MetalFX active input content exceeds the feature render capacity");
-        return false;
-    }
+    // NGX creation dimensions are nominal; aligned/dynamic render extents may
+    // grow. Texture bounds above and device scale limits below bound each frame.
+    // ensureScaler grows the native descriptor capacity for the validated extent.
     if (frame.colorRect.width != frame.inputContent.width ||
         frame.colorRect.height != frame.inputContent.height ||
         frame.depthRect.width != frame.inputContent.width ||
@@ -1081,11 +1078,17 @@ bool ensureFsrPipelines(Feature::Impl& feature, Error* error) noexcept {
 bool exactDescriptorInput(id<MTLTexture> texture, const Rect& rect,
                            NSUInteger activeWidth, NSUInteger activeHeight,
                            NSUInteger capacityWidth, NSUInteger capacityHeight,
-                           MTLTextureUsage usage) noexcept {
-    return texture && rect.x == 0 && rect.y == 0 &&
-           rect.width == activeWidth && rect.height == activeHeight &&
-           texture.width == capacityWidth && texture.height == capacityHeight &&
-           hasUsage(texture, usage);
+                           MTLTextureUsage usage, const char** rejection = nullptr) noexcept {
+    bool offsets = false;
+    if (@available(macOS 27.0, *)) offsets = true;
+    const char* reason = nullptr;
+    if (!texture || !rectFits(rect, texture)) reason = "texture_bounds";
+    else if (!offsets && (rect.x || rect.y)) reason = "native_offset_unavailable";
+    else if (rect.width != activeWidth || rect.height != activeHeight) reason = "active_extent";
+    else if (texture.width != capacityWidth || texture.height != capacityHeight) reason = "descriptor_capacity";
+    else if (!hasUsage(texture, usage)) reason = "native_usage";
+    if (rejection) *rejection = reason;
+    return !reason;
 }
 
 bool generationMatches(const ScalerGeneration& generation, const FrameInfo& frame,
@@ -1110,14 +1113,6 @@ bool generationMatches(const ScalerGeneration& generation, const FrameInfo& fram
            generation.reactiveFormat == (combined ? MTLPixelFormatR8Unorm : reactive.pixelFormat);
 }
 
-bool sameDescriptorLayout(const ScalerGeneration& a, const ScalerGeneration& b) noexcept {
-    return a.inputCapacityWidth == b.inputCapacityWidth &&
-           a.inputCapacityHeight == b.inputCapacityHeight &&
-           a.colorFormat == b.colorFormat && a.depthFormat == b.depthFormat &&
-           a.motionFormat == b.motionFormat && a.outputFormat == b.outputFormat &&
-           a.outputWidth == b.outputWidth && a.outputHeight == b.outputHeight;
-}
-
 std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
                                                const FrameInfo& frame,
                                                const TextureSet& set,
@@ -1134,14 +1129,15 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
         generationMatches(*feature.currentGeneration, frame, color, depth, motion, output, reactive,
                           operations, temporal))
         return feature.currentGeneration;
-    if (feature.alternateGeneration &&
-        generationMatches(*feature.alternateGeneration, frame, color, depth, motion, output, reactive,
-                          operations, temporal)) {
-        std::swap(feature.currentGeneration, feature.alternateGeneration);
+    for (const auto& cached : feature.generations) {
+      if (cached && generationMatches(*cached, frame, color, depth, motion, output, reactive,
+                                     operations, temporal)) {
+        feature.currentGeneration = cached;
         // Prepared frames retain their activation so an older encode cannot
         // consume the reset owed to this nonconsecutive sequence.
         ++feature.currentGeneration->activation;
         return feature.currentGeneration;
+      }
     }
 
     NSUInteger inputCapacityWidth = frame.inputContent.width;
@@ -1193,7 +1189,7 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
         descriptor.outputWidth = temporal.width;
         descriptor.outputHeight = temporal.height;
         descriptor.autoExposureEnabled = feature.create.autoExposure();
-        descriptor.requiresSynchronousInitialization = YES;
+        descriptor.requiresSynchronousInitialization = NO;
         descriptor.inputContentPropertiesEnabled = YES;
         descriptor.inputContentMinScale = feature.minScale;
         descriptor.inputContentMaxScale = feature.maxScale;
@@ -1264,16 +1260,8 @@ std::shared_ptr<ScalerGeneration> ensureScaler(Feature::Impl& feature,
             }
         }
 
-        // A layout/capacity change evicts obsolete variants. A mask-format
-        // change may keep the mask-absent variant, but never a third scaler.
-        const auto opposite = [&](const std::shared_ptr<ScalerGeneration>& candidate) noexcept {
-            return candidate && candidate->reactiveEnabled != generation->reactiveEnabled &&
-                   sameDescriptorLayout(*candidate, *generation);
-        };
-        if (opposite(feature.currentGeneration))
-            feature.alternateGeneration = std::move(feature.currentGeneration);
-        else if (!opposite(feature.alternateGeneration))
-            feature.alternateGeneration.reset();
+        feature.generations[feature.nextGenerationSlot] = generation;
+        feature.nextGenerationSlot = (feature.nextGenerationSlot + 1) % feature.generations.size();
         feature.currentGeneration = generation;
         return generation;
     } @catch (id) {
@@ -1846,14 +1834,14 @@ void configureScalerForFrame(Feature::Impl& feature, ScalerGeneration& generatio
     [scaler setInputContentWidth:frame.frame.inputContent.width];
     [scaler setInputContentHeight:frame.frame.inputContent.height];
     if (@available(macOS 27.0, *)) {
-        [scaler setColorContentOffsetX:0];
-        [scaler setColorContentOffsetY:0];
-        [scaler setDepthContentOffsetX:0];
-        [scaler setDepthContentOffsetY:0];
-        [scaler setMotionContentOffsetX:0];
-        [scaler setMotionContentOffsetY:0];
-        [scaler setReactiveMaskContentOffsetX:0];
-        [scaler setReactiveMaskContentOffsetY:0];
+        [scaler setColorContentOffsetX:alpha || lease.linearColor || lease.stagedColor ? 0 : frame.frame.colorRect.x];
+        [scaler setColorContentOffsetY:alpha || lease.linearColor || lease.stagedColor ? 0 : frame.frame.colorRect.y];
+        [scaler setDepthContentOffsetX:lease.stagedDepth ? 0 : frame.frame.depthRect.x];
+        [scaler setDepthContentOffsetY:lease.stagedDepth ? 0 : frame.frame.depthRect.y];
+        [scaler setMotionContentOffsetX:lease.stagedMotion ? 0 : frame.scalerMotionRect.x];
+        [scaler setMotionContentOffsetY:lease.stagedMotion ? 0 : frame.scalerMotionRect.y];
+        [scaler setReactiveMaskContentOffsetX:lease.combinedMask || lease.stagedReactive ? 0 : frame.frame.reactiveRect.x];
+        [scaler setReactiveMaskContentOffsetY:lease.combinedMask || lease.stagedReactive ? 0 : frame.frame.reactiveRect.y];
         [scaler setOutputOffsetX:0];
         [scaler setOutputOffsetY:0];
     }
@@ -1978,8 +1966,12 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
         const bool smallerThanInputCapacity =
             activeInput.width != generation->inputCapacityWidth ||
             activeInput.height != generation->inputCapacityHeight;
+        // Partial depth/motion inputs still need replicated edges for history parity.
+        // Native color offsets can avoid their copy without exposing those neighbors.
+        bool colorNeedsPadding = smallerThanInputCapacity;
+        if (@available(macOS 27.0, *)) colorNeedsPadding = false;
         frame->needsColorStaging = operations.colorTransfer == ColorTransfer::Linear &&
-            (smallerThanInputCapacity ||
+            (colorNeedsPadding ||
              !exactDescriptorInput(color, info.colorRect, activeInput.width, activeInput.height,
                                    generation->inputCapacityWidth, generation->inputCapacityHeight,
                                    generation->colorUsage));

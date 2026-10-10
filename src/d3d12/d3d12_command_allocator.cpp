@@ -59,19 +59,15 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
     return E_OUTOFMEMORY;
   cpu_heap_offset_ = 0;
 
-  for (size_t i = 1; i < gpu_heap_chunks_.size(); ++i) {
-    gpu_heap_chunks_[i].buffer = {};
-    free(gpu_heap_chunks_[i].memory);
-  }
-  if (!gpu_heap_chunks_.empty()) {
-    gpu_heap_chunks_.resize(1);
-    gpu_heap_chunks_.front().used = 0;
-  }
+  for (auto &chunk : gpu_heap_chunks_)
+    chunk.used = 0;
+  gpu_heap_active_ = 0;
   if (!ReserveGPUHeap(kGPUHeapSize, 16))
     return E_OUTOFMEMORY;
 
   encoder_current = nullptr;
   encoder_last = nullptr;
+  recording_head_ = nullptr;
   encoder_count_ = 0;
 
   icb_.clear();
@@ -105,13 +101,44 @@ MTLD3D12CommandAllocatorImpl::QueryInterface(REFIID riid, void **ppvObject) {
 HRESULT STDMETHODCALLTYPE
 MTLD3D12CommandAllocatorImpl::Reset() {
   std::lock_guard<dxmt::mutex> lock(submission_mutex_);
-  if (outstanding_submissions_)
+  if (outstanding_submissions_ || encoder_last) {
+    owned_graphics::Trace("root_upload_reset", ",\"allocator\":", trace_id_, ",\"epoch\":", gpu_heap_epoch_,
+                          ",\"accepted\":0,\"reason\":\"", outstanding_submissions_ ? "in_flight" : "recording", "\"");
     return E_FAIL;
-  if (encoder_last)
-    return E_FAIL;
+  }
 
   ClearRecordedCommands();
-  return Initialize();
+  const auto hr = Initialize();
+  if (FAILED(hr))
+    return hr;
+  ++gpu_heap_epoch_;
+  // Retain a contiguous prefix: dropping an interior chunk would change virtual offsets.
+  size_t keep = 1;
+  uint64_t retained = gpu_heap_chunks_.front().capacity;
+  const char *reason = "capacity";
+  for (; keep < gpu_heap_chunks_.size(); ++keep) {
+    const auto &chunk = gpu_heap_chunks_[keep];
+    if (chunk.last_used_epoch == UINT64_MAX || gpu_heap_epoch_ - chunk.last_used_epoch > 50) {
+      reason = "age";
+      break;
+    }
+    if (chunk.capacity > 16ULL * 1024 * 1024 - std::min<uint64_t>(retained, 16ULL * 1024 * 1024))
+      break;
+    retained += chunk.capacity;
+  }
+  for (size_t i = keep; i < gpu_heap_chunks_.size(); ++i) {
+    auto &chunk = gpu_heap_chunks_[i];
+    owned_graphics::Trace("root_upload_trim", ",\"allocator\":", trace_id_, ",\"chunk\":", chunk.id,
+                          ",\"epoch\":", gpu_heap_epoch_, ",\"last_used_epoch\":", chunk.last_used_epoch,
+                          ",\"buffer\":", chunk.buffer.handle, ",\"va\":", chunk.address,
+                          ",\"begin\":", chunk.begin, ",\"capacity\":", chunk.capacity, ",\"reason\":\"", reason, "\"");
+    chunk.buffer = {};
+    free(chunk.memory);
+  }
+  gpu_heap_chunks_.resize(keep);
+  owned_graphics::Trace("root_upload_reset", ",\"allocator\":", trace_id_, ",\"epoch\":", gpu_heap_epoch_,
+                        ",\"accepted\":1,\"reason\":\"retired\",\"retained_bytes\":", retained, ",\"chunks\":", keep);
+  return S_OK;
 };
 
 MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
@@ -132,11 +159,13 @@ MTLD3D12CommandAllocatorImpl::ReserveGPUHeap(uint64_t Length, size_t Alignment) 
   const auto maximum = std::min<uint64_t>(device_->GetMTLDevice().maxBufferLength(), SIZE_MAX);
   if (!Alignment || (Alignment & (Alignment - 1)) || Length > maximum)
     return false;
-  if (!gpu_heap_chunks_.empty()) {
-    const auto &chunk = gpu_heap_chunks_.back();
+  for (size_t i = gpu_heap_active_; i < gpu_heap_chunks_.size(); ++i) {
+    const auto &chunk = gpu_heap_chunks_[i];
     const size_t adjustment = (-chunk.used) & (Alignment - 1);
-    if (adjustment <= chunk.capacity - chunk.used && Length <= chunk.capacity - chunk.used - adjustment)
+    if (adjustment <= chunk.capacity - chunk.used && Length <= chunk.capacity - chunk.used - adjustment) {
+      gpu_heap_active_ = i;
       return true;
+    }
   }
   const uint64_t capacity = std::max<uint64_t>(Length, kGPUHeapSize);
   if (capacity > maximum)
@@ -169,6 +198,13 @@ MTLD3D12CommandAllocatorImpl::ReserveGPUHeap(uint64_t Length, size_t Alignment) 
     return false;
   }
   gpu_heap_chunks_.push_back({std::move(buffer), memory, begin, info.gpu_address, size_t(capacity)});
+  gpu_heap_active_ = gpu_heap_chunks_.size() - 1;
+  auto &chunk = gpu_heap_chunks_.back();
+  chunk.created_epoch = gpu_heap_epoch_;
+  owned_graphics::Trace("root_upload_create", ",\"allocator\":", trace_id_, ",\"chunk\":", chunk.id,
+                        ",\"epoch\":", gpu_heap_epoch_, ",\"buffer\":", chunk.buffer.handle,
+                        ",\"va\":", chunk.address, ",\"begin\":", begin, ",\"capacity\":", capacity,
+                        ",\"reason\":\"", begin ? "growth" : "initial", "\"");
   return true;
 }
 
@@ -204,6 +240,11 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
         reinterpret_cast<ClearEncoderData *>(next)->~ClearEncoderData();
         break;
       case EncoderType::Render:
+        if (auto &uses = reinterpret_cast<RenderEncoderData *>(next)->submission_tables; uses)
+          for (const auto &use : *uses) {
+            use.rootsig->ReleasePrivate();
+            use.heap->ReleasePrivate();
+          }
         if (auto &uses = reinterpret_cast<RenderEncoderData *>(next)->swizzle_tables; uses)
           for (const auto &use : *uses) {
             use.rootsig->ReleasePrivate();
@@ -215,6 +256,11 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
         reinterpret_cast<BlitEncoderData *>(next)->~BlitEncoderData();
         break;
       case EncoderType::Compute:
+        if (auto &uses = reinterpret_cast<ComputeEncoderData *>(next)->submission_tables; uses)
+          for (const auto &use : *uses) {
+            use.rootsig->ReleasePrivate();
+            use.heap->ReleasePrivate();
+          }
         if (auto &uses = reinterpret_cast<ComputeEncoderData *>(next)->swizzle_tables; uses)
           for (const auto &use : *uses) {
             use.rootsig->ReleasePrivate();
@@ -345,7 +391,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
     auto &cmd_setpso_res = EncodeComputeCommand<wmtcmd_compute_setpso>();
     cmd_setpso_res.type = WMTComputeCommandSetPSO;
     cmd_setpso_res.pso = pCmdSig->compute_resolver;
-    cmd_setpso_res.threadgroup_size = {1, 1, 1};
+    cmd_setpso_res.threadgroup_size = {32, 1, 1};
     static_cast<ComputeEncoderData *>(encoder_current)->RetainPipeline(WMT::ComputePipelineState{cmd_setpso_res.pso});
 
     auto &cmd_argbuf_res = EncodeComputeCommand<wmtcmd_compute_setbuffer>();
@@ -355,7 +401,10 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
 
     auto &cmd_dispatch_res = EncodeComputeCommand<wmtcmd_compute_dispatch>();
     cmd_dispatch_res.type = WMTComputeCommandDispatch;
-    cmd_dispatch_res.size = {1, 1, 1};
+    cmd_dispatch_res.size = {MaxCount / 32 + (MaxCount % 32 != 0), 1, 1};
+    owned_graphics::Trace("indirect_compute_resolver", ",\"allocator\":", trace_id_,
+                          ",\"pso\":", pCmdSig->compute_resolver.handle, ",\"max_count\":", MaxCount,
+                          ",\"grid_x\":", cmd_dispatch_res.size.width, ",\"threads_x\":32");
 
     auto &cmd_setpso = EncodeComputeCommand<wmtcmd_compute_setpso>();
     cmd_setpso.type = WMTComputeCommandSetPSO;

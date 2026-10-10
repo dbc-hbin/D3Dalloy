@@ -27,6 +27,7 @@
 #include "util_svector.hpp"
 #include <array>
 #include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace dxmt {
@@ -64,6 +65,11 @@ struct TextureViewDescriptor {
   bool reservedVolumeRender = false;
   uint16_t volumeFirstW = 0;
   uint8_t volumeCastMip = 0;
+
+  bool operator==(const TextureViewDescriptor &other) const;
+  struct Hash {
+    size_t operator()(const TextureViewDescriptor &descriptor) const;
+  };
 };
 
 struct TextureViewKey {
@@ -363,6 +369,9 @@ public:
 
   TextureView &view(TextureViewKey key);
   TextureView &view(TextureViewKey key, TextureAllocation *allocation);
+  /* Set before D3D12 resource publication; D3D11 keeps eager view preparation. */
+  bool descriptorIndexedViews = false;
+  bool supportsDescriptorViewPool(TextureViewKey key);
 
   TextureViewKey checkViewUseArray(TextureViewKey key, bool isArray);
   TextureViewKey checkViewUseFormat(TextureViewKey key, WMTPixelFormat format);
@@ -385,6 +394,7 @@ private:
   std::atomic<uint32_t> refcount_ = {0u};
 
   small_vector<TextureViewDescriptor, 4> viewDescriptors_;
+  std::unordered_map<TextureViewDescriptor, unsigned, TextureViewDescriptor::Hash> viewIndices_;
   dxmt::shared_mutex mutex_;
   WMT::Device device_;
 };

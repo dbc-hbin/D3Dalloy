@@ -1021,6 +1021,64 @@ void completedRecordingReplay() {
   output->Unmap(0, nullptr);
   std::puts("OWNED_D3D12_EXECUTION_SAFETY_REPLAY_COMPLETED_PASS epochs=1 executions=2 late_command=ignored");
 }
+void pendingClearResetRelease() {
+  auto dev = device(); auto q = queue(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+  auto first = allocator(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT), second = allocator(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+  auto readAllocator0 = allocator(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT), readAllocator1 = allocator(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+  auto command = list(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT, first.Get());
+  auto read0 = list(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT, readAllocator0.Get());
+  auto read1 = list(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT, readAllocator1.Get());
+  auto target = texture(dev.Get(), D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 1;
+  ComPtr<ID3D12DescriptorHeap> rtvHeap; check(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)), "clear-reset-RTV-heap");
+  const auto rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart(); dev->CreateRenderTargetView(target.Get(), nullptr, rtv);
+  const auto desc = target->GetDesc(); D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{}; UINT64 bytes = 0;
+  dev->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+  auto out0 = buffer(dev.Get(), D3D12_HEAP_TYPE_READBACK, UINT(bytes)), out1 = buffer(dev.Get(), D3D12_HEAP_TYPE_READBACK, UINT(bytes));
+  auto recordRead = [&](ID3D12GraphicsCommandList *read, ID3D12Resource *output) {
+    D3D12_RESOURCE_BARRIER transition{}; transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    transition.Transition = {target.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    read->ResourceBarrier(1, &transition);
+    D3D12_TEXTURE_COPY_LOCATION src{}, dst{}; src.pResource = target.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = output; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = footprint;
+    read->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    transition.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; transition.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    read->ResourceBarrier(1, &transition); check(read->Close(), "clear-reset-read-close");
+  };
+  recordRead(read0.Get(), out0.Get()); recordRead(read1.Get(), out1.Get());
+  const float discarded[] = {16 / 255.0f, 0, 0, 1}, oldValue[] = {0, 0, 32 / 255.0f, 1}, newValue[] = {0, 64 / 255.0f, 0, 1};
+  command->ClearRenderTargetView(rtv, discarded, 0, nullptr); command->ClearRenderTargetView(rtv, oldValue, 0, nullptr);
+  check(command->Close(), "clear-reset-old-close");
+  ComPtr<ID3D12Fence> gate, done; check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "clear-reset-gate");
+  check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)), "clear-reset-done");
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr); if (!event) fail("clear-reset-event");
+  check(done->SetEventOnCompletion(1, event), "clear-reset-register-event"); check(q->Wait(gate.Get(), 1), "clear-reset-queue-wait");
+  std::fprintf(stderr, "OWNED_D3D12_EXECUTION_SAFETY_GRAPH_PHASE begin=graph-clear-reset-release replay=0\n"); std::fflush(stderr);
+  ID3D12CommandList *old[] = {command.Get(), read0.Get()}; q->ExecuteCommandLists(2, old);
+  expect(first->Reset(), E_FAIL, "clear-reset-inflight-allocator-rejected");
+  check(command->Reset(second.Get(), nullptr), "clear-reset-new-allocator");
+  command->ClearRenderTargetView(rtv, discarded, 0, nullptr); command->ClearRenderTargetView(rtv, newValue, 0, nullptr);
+  check(command->Close(), "clear-reset-new-close");
+  ID3D12CommandList *fresh[] = {command.Get(), read1.Get()}; q->ExecuteCommandLists(2, fresh);
+  // Entry heads, pending-clear values and texture views must survive public
+  // list/allocator/CPU descriptor heap release behind the unresolved gate.
+  command.Reset(); read0.Reset(); read1.Reset(); first.Reset(); second.Reset();
+  readAllocator0.Reset(); readAllocator1.Reset(); rtvHeap.Reset();
+  check(q->Signal(done.Get(), 1), "clear-reset-signal"); check(gate->Signal(1), "clear-reset-release-gate");
+  if (WaitForSingleObject(event, 15000) != WAIT_OBJECT_0) fail("clear-reset-wait"); CloseHandle(event);
+  std::fprintf(stderr, "OWNED_D3D12_EXECUTION_SAFETY_GRAPH_PHASE end=graph-clear-reset-release replay=0\n"); std::fflush(stderr);
+  for (UINT record = 0; record < 2; ++record) {
+    auto *output = record ? out1.Get() : out0.Get(); void *mapped = nullptr; check(output->Map(0, nullptr, &mapped), "clear-reset-map");
+    for (UINT y = 0; y < 8; ++y) for (UINT x = 0; x < 8; ++x) {
+      const auto *word = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(mapped) + footprint.Offset + y * footprint.Footprint.RowPitch + x * 4);
+      if (*word != (record ? 0xff004000u : 0xff200000u)) fail("clear-reset-immutable-recorded-pixels");
+    }
+    output->Unmap(0, nullptr);
+  }
+  expect(dev->GetDeviceRemovedReason(), S_OK, "clear-reset-device-healthy");
+  std::puts("OWNED_D3D12_EXECUTION_SAFETY_GRAPH_CLEAR_RESET_RELEASE_PASS old=ff200000 new=ff004000 recordings=2 clear_encoders=2 superseded=2 released_before_retirement=1");
+}
+
 void invalidRecordingReplay(bool sameArray, bool secondQueue) {
   auto dev = device();
   auto q = queue(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
@@ -1164,6 +1222,7 @@ int main() {
   shutdownWait();
   explicitRemoval();
   completedRecordingReplay();
+  pendingClearResetRelease();
   invalidRecordingReplay(false, false);
   invalidRecordingReplay(true, false);
   invalidRecordingReplay(false, true);

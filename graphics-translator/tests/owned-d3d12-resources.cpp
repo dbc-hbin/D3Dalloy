@@ -797,6 +797,183 @@ ComPtr<ID3D12Resource> createHostBuffer(ID3D12Device* device, UINT64 bytes, D3D1
 }
 
 
+void testViewHashLookup(ID3D12Device* device) {
+  constexpr UINT viewCount = 64, subresources = 45, bufferWords = 2048;
+  constexpr UINT recordWords = 8, resultWords = 2 + viewCount * recordWords;
+  const auto props = defaultHeap();
+  const auto textureDesc = texture2DDesc(DXGI_FORMAT_R32_TYPELESS, 16, 16, 9, 5,
+                                        D3D12_RESOURCE_FLAG_NONE);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[subresources]{};
+  UINT rows[subresources]{};
+  UINT64 rowBytes[subresources]{}, textureBytes = 0;
+  device->GetCopyableFootprints(&textureDesc, 0, subresources, 0, footprints, rows, rowBytes, &textureBytes);
+
+  D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
+  D3D12_ROOT_PARAMETER parameters[3]{};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  parameters[0].DescriptorTable = {1, &range};
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameters[1].Descriptor.ShaderRegister = 0;
+  parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[2].Constants = {0, 0, 1};
+  D3D12_ROOT_SIGNATURE_DESC rootDesc{3, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  ComPtr<ID3DBlob> serialized, errors, shader;
+  check(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors),
+        "view hash serialize root");
+  ComPtr<ID3D12RootSignature> root;
+  check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                    IID_PPV_ARGS(&root)), "view hash root");
+  constexpr char source[] =
+    "Texture2DArray<uint> tex : register(t0); Buffer<uint> buf : register(t1);"
+    "RWStructuredBuffer<uint> output : register(u0); cbuffer Constants : register(b0) { uint index; };"
+    "[numthreads(1,1,1)] void main() { uint w,h,a,m,n; tex.GetDimensions(0,w,h,a,m);"
+    "n=(index&1)?33:17; uint p=1+index*8; output[p]=w;output[p+1]=h;output[p+2]=a;"
+    "output[p+3]=m;output[p+4]=tex.Load(int4(0,0,a-1,m-1));output[p+5]=buf.Load(n);"
+    "output[p+6]=buf.Load(0);output[p+7]=buf.Load(n-1); }";
+  const HRESULT compileHr = D3DCompile(source, sizeof(source), nullptr, nullptr, nullptr, "main", "cs_5_0",
+                                       D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader, &errors);
+  if (FAILED(compileHr) && errors) std::fprintf(stderr, "%s\n", static_cast<const char*>(errors->GetBufferPointer()));
+  check(compileHr, "view hash shader");
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
+  pipelineDesc.pRootSignature = root.Get();
+  pipelineDesc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+  ComPtr<ID3D12PipelineState> pipeline;
+  check(device->CreateComputePipelineState(&pipelineDesc, IID_PPV_ARGS(&pipeline)), "view hash pipeline");
+
+  D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+  heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  heapDesc.NumDescriptors = viewCount * 2;
+  heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  ComPtr<ID3D12DescriptorHeap> descriptors;
+  check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&descriptors)), "view hash descriptors");
+  const UINT stride = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
+  auto outputDesc = bufferDesc(resultWords * sizeof(UINT));
+  outputDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ComPtr<ID3D12Resource> output;
+  check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &outputDesc,
+                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&output)),
+        "view hash output");
+  auto guard = createHostBuffer(device, resultWords * sizeof(UINT), D3D12_HEAP_TYPE_UPLOAD,
+                                D3D12_RESOURCE_STATE_GENERIC_READ, "view hash guards");
+  auto readback = createHostBuffer(device, resultWords * sizeof(UINT), D3D12_HEAP_TYPE_READBACK,
+                                   D3D12_RESOURCE_STATE_COPY_DEST, "view hash readback");
+  UINT* mapped = nullptr;
+  check(guard->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "view hash guard map");
+  for (UINT i = 0; i < resultWords; ++i) mapped[i] = 0x6d6d6d6d;
+  guard->Unmap(0, nullptr);
+  CopyContext commands(device);
+  for (UINT phase = 0; phase < 2; ++phase) {
+    // Replace both resources and overwrite the same descriptor slots after retirement.
+    ComPtr<ID3D12Resource> texture, buffer;
+    check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &textureDesc,
+                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture)),
+          "view hash texture");
+    const auto typedBufferDesc = bufferDesc(bufferWords * sizeof(UINT));
+    check(device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &typedBufferDesc,
+                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)),
+          "view hash buffer");
+    auto textureUpload = createHostBuffer(device, textureBytes, D3D12_HEAP_TYPE_UPLOAD,
+                                          D3D12_RESOURCE_STATE_GENERIC_READ, "view hash texture upload");
+    auto bufferUpload = createHostBuffer(device, bufferWords * sizeof(UINT), D3D12_HEAP_TYPE_UPLOAD,
+                                         D3D12_RESOURCE_STATE_GENERIC_READ, "view hash buffer upload");
+    UINT8* textureData = nullptr;
+    check(textureUpload->Map(0, nullptr, reinterpret_cast<void**>(&textureData)), "view hash texture map");
+    std::memset(textureData, 0, static_cast<size_t>(textureBytes));
+    for (UINT sub = 0; sub < subresources; ++sub) {
+      const auto& fp = footprints[sub];
+      const UINT value = phase * 100000 + sub * 101 + 7;
+      for (UINT y = 0; y < rows[sub]; ++y)
+        for (UINT x = 0; x < fp.Footprint.Width; ++x)
+          std::memcpy(textureData + fp.Offset + y * fp.Footprint.RowPitch + x * sizeof(UINT), &value, sizeof(value));
+    }
+    textureUpload->Unmap(0, nullptr);
+    check(bufferUpload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "view hash buffer map");
+    for (UINT i = 0; i < bufferWords; ++i) mapped[i] = phase * 100000 + i * 3 + 11;
+    bufferUpload->Unmap(0, nullptr);
+    for (UINT sub = 0; sub < subresources; ++sub) {
+      D3D12_TEXTURE_COPY_LOCATION src{};
+      src.pResource = textureUpload.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src.PlacedFootprint = footprints[sub];
+      D3D12_TEXTURE_COPY_LOCATION dst{};
+      dst.pResource = texture.Get(); dst.SubresourceIndex = sub;
+      commands.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    commands.list->CopyBufferRegion(buffer.Get(), 0, bufferUpload.Get(), 0, bufferWords * sizeof(UINT));
+    transition(commands.list.Get(), texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(commands.list.Get(), buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    for (UINT batch = 0; batch < 3; ++batch) {
+      const UINT count = batch == 0 ? viewCount / 2 : viewCount;
+      // Batch 1 adds keys after the first GPU use; batch 2 looks up all keys again.
+      for (UINT i = batch == 1 ? viewCount / 2 : 0; i < count; ++i) {
+        const UINT mip = i % 4, slice = (i / 4) % 8, wide = i / 32;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R32_UINT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2DArray.MostDetailedMip = mip;
+        srv.Texture2DArray.MipLevels = wide ? 5 - mip : 1;
+        srv.Texture2DArray.FirstArraySlice = slice;
+        srv.Texture2DArray.ArraySize = wide ? 9 - slice : 1;
+        auto cpu = descriptors->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += i * 2 * stride;
+        device->CreateShaderResourceView(texture.Get(), &srv, cpu);
+        srv = {};
+        srv.Format = DXGI_FORMAT_R32_UINT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.FirstElement = (i / 2) * 64 + 3;
+        srv.Buffer.NumElements = i % 2 ? 33 : 17;
+        cpu.ptr += stride;
+        device->CreateShaderResourceView(buffer.Get(), &srv, cpu);
+      }
+      commands.list->CopyBufferRegion(output.Get(), 0, guard.Get(), 0, resultWords * sizeof(UINT));
+      transition(commands.list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      ID3D12DescriptorHeap* heaps[] = {descriptors.Get()};
+      commands.list->SetDescriptorHeaps(1, heaps);
+      commands.list->SetComputeRootSignature(root.Get());
+      commands.list->SetPipelineState(pipeline.Get());
+      commands.list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
+      for (UINT i = 0; i < count; ++i) {
+        auto gpu = descriptors->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += i * 2 * stride;
+        commands.list->SetComputeRootDescriptorTable(0, gpu);
+        commands.list->SetComputeRoot32BitConstant(2, i, 0);
+        commands.list->Dispatch(1, 1, 1);
+      }
+      transition(commands.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                 D3D12_RESOURCE_STATE_COPY_SOURCE);
+      commands.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, resultWords * sizeof(UINT));
+      transition(commands.list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                 D3D12_RESOURCE_STATE_COPY_DEST);
+      commands.submit();
+      check(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "view hash readback map");
+      if (mapped[0] != 0x6d6d6d6d || mapped[resultWords - 1] != 0x6d6d6d6d)
+        fail("view hash guards");
+      for (UINT i = 0; i < count; ++i) {
+        const UINT mip = i % 4, slice = (i / 4) % 8, wide = i / 32;
+        const UINT mips = wide ? 5 - mip : 1, slices = wide ? 9 - slice : 1;
+        const UINT first = (i / 2) * 64 + 3, elements = i % 2 ? 33 : 17;
+        const UINT sub = mip + mips - 1 + (slice + slices - 1) * 5;
+        const UINT expected[recordWords] = {16u >> mip, 16u >> mip, slices, mips,
+          phase * 100000 + sub * 101 + 7, 0,
+          phase * 100000 + first * 3 + 11, phase * 100000 + (first + elements - 1) * 3 + 11};
+        for (UINT word = 0; word < recordWords; ++word) if (mapped[1 + i * recordWords + word] != expected[word]) {
+          std::fprintf(stderr, "VIEW_HASH_MISMATCH phase=%u batch=%u view=%u word=%u expected=%u actual=%u\n",
+                       phase, batch, i, word, expected[word], mapped[1 + i * recordWords + word]);
+          fail("view hash exact readback");
+        }
+      }
+      for (UINT i = 1 + count * recordWords; i < resultWords; ++i)
+        if (mapped[i] != 0x6d6d6d6d) fail("view hash unused output guard");
+      readback->Unmap(0, nullptr);
+    }
+  }
+  std::puts("OWNED_D3D12_RESOURCES_VIEW_HASH_GPU texture_keys=64 buffer_keys=64 repeats=64 generations=2 probes=320 words=2560 guards=1 incremental_keys=1 resource_replacement=1");
+}
+
 void testOverlappingPlacedResourceAliasing(ID3D12Device* device) {
   constexpr UINT64 bytes = 64 * 1024;
   const auto description = bufferDesc(bytes);
@@ -1571,6 +1748,7 @@ int main() {
   testCpuTextureTransfers(device.Get());
   testTypelessDepthViews(device.Get());
   testBufferDescriptors(device.Get());
+  testViewHashLookup(device.Get());
   testOverlappingPlacedResourceAliasing(device.Get());
   testCustomHeapGpuCoherence(device.Get());
   testBlockCompressedTailCopy(device.Get());

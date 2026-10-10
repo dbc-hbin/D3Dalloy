@@ -823,7 +823,8 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
     return std::move(error);
   llvm::raw_svector_ostream stream(compiled->vec);
   metallib::MetallibWriter writer;
-  writer.Write(*module, stream);
+  if (auto error = writer.Write(*module, stream))
+    return std::move(error);
   return std::move(compiled);
 }
 

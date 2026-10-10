@@ -516,6 +516,12 @@ _MTLTexture_newTextureView(void *obj) {
                             swizzle:to_metal_swizzle(params->swizzle, params->format)];
   params->ret = (obj_handle_t)ret;
   params->gpu_resource_id = [ret gpuResourceID]._impl;
+  const char *trace=getenv("OWNED_GRAPHICS_TRACE");
+  if (trace && !strcmp(trace,"1"))
+    fprintf(stderr,"OWNED_GRAPHICS_NATIVE_ORDINARY_VIEW texture=%llu view=%llu format=%u type=%u first_mip=%u mip_count=%u first_slice=%u slice_count=%u\n",
+        (unsigned long long)params->texture,(unsigned long long)params->ret,(unsigned)params->format,
+        (unsigned)params->texture_type,(unsigned)params->level_start,(unsigned)params->level_count,
+        (unsigned)params->slice_start,(unsigned)params->slice_count);
   return STATUS_SUCCESS;
 }
 
@@ -3546,6 +3552,7 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_D3D12_COARSE_SHADING:
     case SM50_SHADER_D3D12_CONSERVATIVE_RASTER:
     case SM50_SHADER_D3D12_ATOMIC64_PHASE:
+    case SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT:
     case SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM: {
       struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data = malloc(sizeof(*data));
       if (!data)

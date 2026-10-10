@@ -1192,6 +1192,43 @@ void runGenerationTransitionReplay(
         "expected_reset_sequence=1,1,1,0");
 }
 
+void runDescriptorABCReuse(Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
+                           ID3D12Resource* depth, ID3D12Resource* motion) {
+    auto create = makeCreateDesc();
+    create.DynamicOutputEnabled = TRUE;
+    ComPtr<IMTLD3D12TemporalUpscaleState> state;
+    check(deviceExtension->CreateTemporalUpscaleState(&create, &state),
+          "ABC descriptor reuse CreateTemporalUpscaleState");
+    const std::array<UINT, 4> widths{128, 112, 96, 128};
+    const std::array<std::uint8_t, 4> tags{112, 144, 176, 112};
+    std::array<OutputResource, 4> outputs;
+    std::array<Recording, 4> recordings;
+    for (std::size_t i = 0; i < recordings.size(); ++i) {
+        auto color = makeColor(gpu, tags[i]);
+        outputs[i] = makeOutput(gpu, 880 + static_cast<UINT>(i));
+        auto desc = makeFrameDesc(color.Get(), outputs[i].resource.Get(), depth, motion, TRUE);
+        desc.OutputWidth = desc.OutputHeight = widths[i];
+        recordings[i] = recordTemporal(gpu, state.Get(), desc, outputs[i]);
+    }
+    state.Reset(); // Each immutable recording owns the feature and input color.
+    double firstA = 0;
+    for (std::size_t i = 0; i < recordings.size(); ++i) {
+        for (UINT replay = 0; replay < 2; ++replay) {
+            gpu.executeAndWait(recordings[i].list.Get());
+            const auto stats = validateOutput(outputs[i], tags[i], "descriptor_ABC_reuse",
+                static_cast<UINT>(i * 2 + replay), 0, 0, widths[i], widths[i]);
+            if (i == 0 && replay == 0) firstA = stats.mean;
+            if (i == 3 && std::fabs(stats.mean - firstA) > 1.0 / 255.0)
+                fail("ABC restored A differs from cold explicit-reset A");
+            std::printf("OWNED_D3D12_TEMPORAL_ABC sequence=%u replay=%u width=%u "
+                "explicit_reset=1 caller_released=1 mean=%.9g outside_sentinel=1\n",
+                static_cast<unsigned>(i), replay, widths[i], stats.mean);
+        }
+    }
+    std::puts("OWNED_D3D12_TEMPORAL_CASE_PASS case=descriptor_ABC_reuse "
+              "sequence=A,B,C,A executions=8 explicit_reset=1 caller_released=1");
+}
+
 void runDynamicOutputOldRecordReplay(
     Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
     ID3D12Resource* depth, ID3D12Resource* motion) {
@@ -1502,6 +1539,124 @@ void runOppositeFeatureOrder(Gpu& gpu,
         statsXA.outputTag, statsXB.outputTag, statsYA.outputTag, statsYB.outputTag);
 }
 
+void runNominalInputGrowth(Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension) {
+    constexpr UINT backing = 80;
+    auto create = makeCreateDesc(); // Nominal 64x64 is not an active-content cap.
+    // Neutral manual exposure keeps alternating tags distinguishable.
+    create.FeatureFlags = kFlagMvLowRes | kFlagDepthInverted;
+    ComPtr<IMTLD3D12TemporalUpscaleState> state;
+    check(deviceExtension->CreateTemporalUpscaleState(&create, &state),
+          "nominal input growth CreateTemporalUpscaleState");
+    auto depth = makeDepth(gpu, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                           DXGI_FORMAT_D32_FLOAT_S8X24_UINT, backing, backing);
+    auto motion = makeMotion(gpu, DXGI_FORMAT_R16G16_FLOAT, backing, backing);
+    auto color = createTexture(gpu.device.Get(), backing, backing,
+                               DXGI_FORMAT_R8G8B8A8_UNORM,
+                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                               D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heapDesc.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(gpu.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)),
+          "GPU freshness RTV heap");
+    const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+    gpu.device->CreateRenderTargetView(color.Get(), nullptr, rtv);
+    auto output = makeOutput(gpu, 1100);
+    ComPtr<ID3D12Fence> completion;
+    check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion)),
+          "GPU freshness completion fence");
+
+    // Start above nominal create dimensions, shrink, then grow again using the
+    // same valid backing. Each pair also exercises ResetHistory=false.
+    constexpr std::array<std::uint8_t, 6> tags{{64, 192, 64, 192, 64, 192}};
+    for (UINT frame = 0; frame < tags.size(); ++frame) {
+        auto desc = makeFrameDesc(color.Get(), output.resource.Get(), depth.Get(), motion.Get(),
+                                  frame == 0 ? TRUE : FALSE);
+        const bool shrink = frame == 2 || frame == 3;
+        desc.InputContentWidth = shrink ? kInputWidth : backing;
+        desc.InputContentHeight = shrink ? kInputHeight : backing;
+        // Actual resource bounds still apply after nominal growth is accepted.
+        if (frame == 0) {
+            auto negative = gpu.makeRecording();
+            auto invalid = desc;
+            invalid.ColorBaseX = 1;
+            expectHRESULT(negative.extension->TemporalUpscale(state.Get(), &invalid),
+                          E_INVALIDARG, "nominal_growth_color_actual_oob");
+            invalid = desc;
+            invalid.DepthBaseY = 1;
+            expectHRESULT(negative.extension->TemporalUpscale(state.Get(), &invalid),
+                          E_INVALIDARG, "nominal_growth_depth_actual_oob");
+            invalid = desc;
+            invalid.MotionBaseX = 1;
+            expectHRESULT(negative.extension->TemporalUpscale(state.Get(), &invalid),
+                          E_INVALIDARG, "nominal_growth_motion_actual_oob");
+            check(negative.list->Close(), "nominal growth negative Close");
+        }
+        Recording recording = gpu.makeRecording();
+        transition(recording.list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (frame)
+            transition(recording.list.Get(), color.Get(),
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const float value = static_cast<float>(tags[frame]) / 255.0f;
+        const float clear[] = {value, value, value, 1.0f};
+        recording.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        transition(recording.list.Get(), color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        // No upload, submission, or CPU wait separates the GPU producer and SR.
+        check(recording.extension->TemporalUpscale(state.Get(), &desc),
+              "nominal input growth TemporalUpscale");
+        transition(recording.list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copyTextureToReadback(recording.list.Get(), output.resource.Get(), output.readback);
+        check(recording.list->Close(), "GPU freshness Close");
+
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event)
+            fail("GPU freshness event", HRESULT_FROM_WIN32(GetLastError()));
+        const UINT64 fenceValue = frame + 1;
+        check(completion->SetEventOnCompletion(fenceValue, event),
+              "GPU freshness register completion before submit");
+        struct Submission {
+            ID3D12CommandQueue* queue;
+            ID3D12CommandList* list;
+            ID3D12Fence* fence;
+            UINT64 value;
+        } submission{gpu.queue.Get(), recording.list.Get(), completion.Get(), fenceValue};
+        runThreadBounded([](LPVOID opaque) -> DWORD {
+            auto* submission = static_cast<Submission*>(opaque);
+            ID3D12CommandList* lists[] = {submission->list};
+            submission->queue->ExecuteCommandLists(1, lists);
+            check(submission->queue->Signal(submission->fence, submission->value),
+                  "GPU freshness Signal");
+            return 0;
+        }, &submission, "GPU freshness submission timeout");
+        const DWORD wait = WaitForSingleObject(event, kFenceTimeoutMs);
+        if (wait != WAIT_OBJECT_0)
+            fail("GPU freshness completion timeout",
+                 HRESULT_FROM_WIN32(wait == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT));
+        CloseHandle(event);
+        waitForFenceValue(completion.Get(), fenceValue, "GPU freshness fence wait");
+        check(gpu.device->GetDeviceRemovedReason(), "GPU freshness device removed");
+
+        const auto stats = validateOutput(output, tags[frame], "nominal_input_growth", frame);
+        const double mean = stats.mean * 255.0;
+        const double delta = std::fabs(mean - tags[frame]);
+        // +/-32 bands are disjoint: a previous 64/192 frame cannot pass.
+        if (delta > 32 ||
+            (frame && std::fabs(mean - tags[frame - 1]) < 96))
+            fail("GPU freshness current tag missing or previous tag retained");
+        std::printf("OWNED_D3D12_TEMPORAL_NOMINAL_GROWTH_PASS frame=%u "
+                    "create_input=64x64 backing=80x80 input=%ux%u tag=%u mean=%.9g delta=%.9g "
+                    "caller_reset=%u same_resources=1 gpu_producer=1 outside_sentinel=1\n",
+                    frame, desc.InputContentWidth,
+                    desc.InputContentHeight, static_cast<unsigned>(tags[frame]), mean, delta,
+                    static_cast<unsigned>(desc.ResetHistory));
+    }
+}
+
 void runContinuousFrames(Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
                          ID3D12Resource* depth, ID3D12Resource* motion,
                          const char* variant = "typed",
@@ -1560,6 +1715,7 @@ int run() {
 
     ComPtr<ID3D12Resource> depth = makeDepth(gpu);
     ComPtr<ID3D12Resource> motion = makeMotion(gpu);
+    runNominalInputGrowth(gpu, deviceExtension.Get());
     runR32ExposureReplay(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     std::puts("OWNED_D3D12_TEMPORAL_FORMAT role=color dxgi=28");
     std::puts("OWNED_D3D12_TEMPORAL_FORMAT role=output dxgi=28 backing=136 logical=128");
@@ -1579,6 +1735,7 @@ int run() {
     runReleaseBeforeExecuteReplay(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runCallerResetReplay(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runGenerationTransitionReplay(gpu, deviceExtension.Get());
+    runDescriptorABCReuse(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runDynamicOutputOldRecordReplay(
         gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runCrossQueueFutureSignal(
@@ -1608,7 +1765,7 @@ int run() {
               "command_list_validation=1 output_subrect=1 crossqueue_future_signal=1 "
               "submitted_list_reset=1 record_head_growth=1 allocator_retention=1 "
               "opposite_feature_order=1 r32_exposure_numeric=1 gpu_exposure_replay=1 "
-              "dynamic_output_old_record_replay=1");
+              "dynamic_output_old_record_replay=1 nominal_input_growth=1");
     return 0;
 }
 

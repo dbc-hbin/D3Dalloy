@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 32
+#define AIRCONV_VERSION 35
 
 #ifdef __cplusplus
 #include <string>
@@ -136,6 +136,11 @@ struct MTL_PIXEL_SHADER_REFLECTION {
   uint32_t SampleFrequency;
 };
 
+enum SM50_PIXEL_COVERAGE_INPUT_FLAG : uint32_t {
+  SM50_PIXEL_COVERAGE_INPUT = 1u << 0,
+  SM50_PIXEL_INNER_COVERAGE_INPUT = 1u << 1,
+};
+
 struct MTL_SHADER_REFLECTION {
   uint32_t ConstanttBufferTableBindIndex;
   uint32_t ArgumentBufferBindIndex;
@@ -164,6 +169,8 @@ struct MTL_SHADER_REFLECTION {
   uint32_t PSForceEarlyDepthStencil;
   /* Device-memory integer64 atomics; groupshared-only shaders do not require a phase. */
   uint32_t HasAtomic64;
+  /* Application coverage inputs; occupies the existing reflection tail padding. */
+  uint32_t PSCoverageInputs;
 };
 
 #if defined(__LP64__) || defined(_WIN64)
@@ -386,6 +393,9 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
   /* Header-only D3D12 variant: every linked application stage uses the bounded
    * canonical-cell phase, including ordinary DXBC accesses. Never a D3D11 variant. */
   SM50_SHADER_D3D12_ATOMIC64_PHASE = 44,
+  /* Ordinary pixel-frequency native PS, non-full SampleMask: uint function constant index0.
+   * Coverage signature is retained; captured/sample-frequency paths must not request this. */
+  SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT = 45,
   SM50_SHADER_ARGUMENT_TYPE_MAX = 0xffffffff,
 };
 

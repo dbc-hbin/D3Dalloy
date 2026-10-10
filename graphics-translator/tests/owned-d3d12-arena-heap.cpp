@@ -22,7 +22,7 @@ namespace {
 void check(HRESULT hr, const char *step) { if (FAILED(hr)) fail(step, hr); }
 void expect(HRESULT hr, HRESULT wanted, const char *step) { if (hr != wanted) fail(step, hr); }
 
-void arena(ID3D12Device *device) {
+void arena(ID3D12Device *device, bool uploadReuse = false) {
   D3D12_ROOT_PARAMETER parameters[2]{};
   parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   parameters[0].Constants.Num32BitValues = 62;
@@ -48,7 +48,9 @@ void arena(ID3D12Device *device) {
   properties.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC resource{};
   resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  resource.Width = 40000 * sizeof(uint32_t);
+  constexpr UINT reuseBurst = 60000;
+  constexpr uint32_t guard = 0xd15ea5edu;
+  resource.Width = (uploadReuse ? reuseBurst + 2 : 40000) * sizeof(uint32_t);
   resource.Height = resource.DepthOrArraySize = resource.MipLevels = 1;
   resource.SampleDesc.Count = 1;
   resource.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -58,11 +60,17 @@ void arena(ID3D12Device *device) {
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&output)), "output");
   ComPtr<ID3D12CommandAllocator> allocator;
   check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&allocator)), "allocator");
-  auto record = [&](UINT base, UINT count, bool invalidFirst = false, UINT salt = 0x12340000u) {
+  auto record = [&](UINT base, UINT count, bool invalidFirst = false, UINT salt = 0x12340000u,
+                    ID3D12GraphicsCommandList *rerecord = nullptr) {
     ComPtr<ID3D12GraphicsCommandList> list;
-    check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), pso.Get(), IID_PPV_ARGS(&list)), "list");
+    if (rerecord) {
+      list = rerecord;
+      check(list->Reset(allocator.Get(), pso.Get()), "list-rerecord-reset");
+    } else {
+      check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), pso.Get(), IID_PPV_ARGS(&list)), "list");
+    }
     list->SetComputeRootSignature(root.Get());
-    list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress() + (uploadReuse ? sizeof(uint32_t) : 0));
     if (invalidFirst) list->SetComputeRoot32BitConstant(2, 1, 0);
     uint32_t constants[62]{};
     for (UINT i = 0; i < count; ++i) {
@@ -74,10 +82,13 @@ void arena(ID3D12Device *device) {
     }
     return list;
   };
-  auto single = record(0, 20000, true);
-  expect(single->Close(), E_INVALIDARG, "first-recording-error-preserved");
-  single.Reset();
-  check(allocator->Reset(), "allocator-reset-after-first-error");
+  ComPtr<ID3D12GraphicsCommandList> single;
+  if (!uploadReuse) {
+    single = record(0, 20000, true);
+    expect(single->Close(), E_INVALIDARG, "first-recording-error-preserved");
+    single.Reset();
+    check(allocator->Reset(), "allocator-reset-after-first-error");
+  }
   D3D12_COMMAND_QUEUE_DESC queueDesc{};
   queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
   ComPtr<ID3D12CommandQueue> queue;
@@ -94,6 +105,10 @@ void arena(ID3D12Device *device) {
   void *mapped = nullptr;
   check(zeros->Map(0, nullptr, &mapped), "map-zero-upload");
   std::memset(mapped, 0, size_t(resource.Width));
+  if (uploadReuse) {
+    auto *values = static_cast<uint32_t *>(mapped);
+    for (UINT i = 0; i < resource.Width / sizeof(uint32_t); ++i) values[i] = guard;
+  }
   zeros->Unmap(0, nullptr);
   ComPtr<ID3D12CommandAllocator> copyAllocator;
   check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&copyAllocator)), "copy-allocator");
@@ -126,21 +141,62 @@ void arena(ID3D12Device *device) {
     UINT submittedCount = 0;
     for (auto *list : lists) submitted[submittedCount++] = list;
     submitted[submittedCount++] = copy.Get();
+    check(fence->SetEventOnCompletion(++completion, event), "completion");
     queue->ExecuteCommandLists(submittedCount, submitted.data());
-    check(queue->Signal(fence.Get(), ++completion), "signal");
+    check(queue->Signal(fence.Get(), completion), "signal");
     if (blocked) {
       expect(allocator->Reset(), E_FAIL, "queued-allocator-reset-rejected");
       check(gate->Signal(1), "release-queue");
     }
-    check(fence->SetEventOnCompletion(completion, event), "completion");
     const DWORD waited = WaitForSingleObject(event, 30000);
     if (waited != WAIT_OBJECT_0) fail("wait", HRESULT_FROM_WIN32(waited));
     check(readback->Map(0, nullptr, &mapped), "map-readback");
     const auto *values = static_cast<const uint32_t *>(mapped);
     for (UINT i = 0; i < count; ++i)
-      if (values[i] != ((salt + i) ^ 0x5a5a5a5au)) fail("retained-root-values");
+      if (values[i + (uploadReuse ? 1 : 0)] != ((salt + i) ^ 0x5a5a5a5au)) fail("retained-root-values");
+    if (uploadReuse) {
+      if (values[0] != guard) fail("upload-reuse-leading-guard");
+      for (UINT i = count + 1; i < resource.Width / sizeof(uint32_t); ++i)
+        if (values[i] != guard) fail("upload-reuse-tail-guard");
+    }
     readback->Unmap(0, nullptr);
   };
+  if (uploadReuse) {
+    ComPtr<ID3D12GraphicsCommandList> initialize;
+    check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, copyAllocator.Get(), nullptr,
+          IID_PPV_ARGS(&initialize)), "guard-initialize-list");
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    initialize->ResourceBarrier(1, &barrier);
+    initialize->CopyBufferRegion(output.Get(), 0, zeros.Get(), 0, resource.Width);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    initialize->ResourceBarrier(1, &barrier);
+    check(initialize->Close(), "guard-initialize-close");
+    execute({initialize.Get()}, 0, 0);
+    auto cycle = [&](const char *phase, UINT count, UINT salt, bool blocked = false) {
+      std::printf("OWNED_D3D12_UPLOAD_REUSE_BEGIN phase=%s count=%u salt=%08x\n", phase, count, salt);
+      single = record(0, count, false, salt, single.Get());
+      check(single->Close(), "upload-reuse-close");
+      execute({single.Get()}, count, salt, blocked);
+      // The snapshot/erase list makes replay prove execution, not stale output.
+      execute({single.Get()}, count, salt);
+      check(allocator->Reset(), "upload-reuse-completed-reset");
+      std::printf("OWNED_D3D12_UPLOAD_REUSE_PHASE_PASS phase=%s count=%u executions=2\n", phase, count);
+    };
+    cycle("cold", 20000, 0x12340000u, true);
+    cycle("warm", 20000, 0x23450000u);
+    // Keep chunk zero active while extra chunks age past the reference 50 resets.
+    for (UINT age = 0; age < 51; ++age)
+      cycle("age-small", 1, 0x34560000u + age);
+    cycle("after-age", 20000, 0x45670000u);
+    cycle("byte-burst", reuseBurst, 0x56780000u);
+    cycle("after-byte-trim", 20000, 0x67890000u);
+    CloseHandle(event);
+    expect(device->GetDeviceRemovedReason(), S_OK, "device-healthy");
+    std::puts("OWNED_D3D12_UPLOAD_REUSE_PASS growth=20000 burst=60000 age_resets=51 recordings=56 executions=112 guards=60002");
+    return;
+  }
   single = record(0, 20000);
   check(single->Close(), "single-list-growth-close");
   execute({single.Get()}, 20000, 0x12340000u, true);
@@ -265,9 +321,10 @@ int main(int argc, char **argv) {
   std::puts("OWNED_D3D12_ARENA_HEAP_BACKEND id=owned-graphics-d3d12");
   ComPtr<ID3D12Device> device;
   check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "device");
-  if (argc != 2) fail("usage-arena-or-mapping");
+  if (argc != 2) fail("usage-arena-or-mapping-or-upload-reuse");
   if (!std::strcmp(argv[1], "arena")) arena(device.Get());
   else if (!std::strcmp(argv[1], "mapping")) mapping(device.Get());
+  else if (!std::strcmp(argv[1], "upload-reuse")) arena(device.Get(), true);
   else fail("unknown-mode");
   return 0;
 }

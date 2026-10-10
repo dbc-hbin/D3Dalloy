@@ -300,6 +300,7 @@ public:
     uint32_t register_space;
     uint32_t register_lower_bound;
     D3D12_SHADER_VISIBILITY visibility;
+    D3D12_DESCRIPTOR_RANGE_FLAGS descriptor_flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
   };
 
   virtual UINT GetBlob(const void **ppBlob) = 0;
@@ -439,6 +440,7 @@ struct ShaderImmutableConstants {
   HRESULT Initialize(MTLD3D12Device *device, const SM50_COMPILED_BITCODE &compiled, sm50_bitcode_t bitcode);
 };
 
+class DeviceShaderArtifactCache;
 class MTLD3D12PipelineState : public ID3D12PipelineState {
 public:
   UINT IsComputePipelineState;
@@ -447,7 +449,7 @@ public:
 
   static HRESULT
   InitializeShader(
-      const char *Stage, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader,
+      DeviceShaderArtifactCache &artifacts, const char *Stage, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader,
       struct MTL_SHADER_REFLECTION *pRefl, std::vector<MTL_SM50_SHADER_ARGUMENT> *resource_bindings = nullptr
   );
 };
@@ -577,6 +579,8 @@ struct ViewInstancingState {
 class MTLD3D12GraphicsPipelineState : public MTLD3D12PipelineState {
 public:
   WMT::Reference<WMT::RenderPipelineState> pso;
+  // Ready direct native MSAA slot; captured variants and ordinary pso remain independent.
+  WMT::Reference<WMT::RenderPipelineState> native_msaa_pso;
   MeshPipelineKind mesh_kind = MeshPipelineKind::None;
   /* Geometry: GS input primitive (D3D10_SB_PRIMITIVE). */
   uint32_t mesh_input_primitive = 0;
@@ -654,8 +658,15 @@ public:
    */
   ViewInstancingState view_instancing{};
   bool view_location_offsets = false;
+  bool submission_mapping_safe = false;
+  uint8_t submission_color_output_mask = 0;
 
   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
+  /* Ordinary mapping-safe primary PSO only. Zero/no emitted disabled outputs returns pso.
+   * Nonzero variants zero logical color write masks without recompiling shaders.
+   * Borrowed native handle; recorded consumers retain it until actual GPU retirement.
+   * Null on unsupported nonzero request or native creation failure; never execute the base instead. */
+  virtual WMT::RenderPipelineState GetColorWriteMaskPipelineState(uint8_t disabled_outputs) = 0;
 
   /**
    * The Metal pipeline a recorded indirect command buffer inherits.
@@ -667,6 +678,7 @@ public:
    */
   virtual WMT::RenderPipelineState GetIndirectCommandBufferPipelineState() = 0;
   virtual WMT::RenderPipelineState GetIndexPullPipelineState(bool indirect) = 0;
+  virtual WMT::RenderPipelineState GetNativeMSAAPipelineState(bool index_pull) = 0;
   virtual WMT::RenderPipelineState GetPipelineStatisticsPipelineState(bool indirect) = 0;
   /* `coarse`: variable-rate coarse shading variants (SM50_SHADER_D3D12_COARSE_SHADING); the layout carries
    * SM50_MSAA_PIXEL_COARSE when the PS is eligible, otherwise they shade at fine rate. */
@@ -834,6 +846,7 @@ public:
 
   virtual WMT::Device GetMTLDevice() = 0;
   virtual WMT4::Compiler GetMetal4Compiler() = 0;
+  virtual DeviceShaderArtifactCache &GetShaderArtifactCache() = 0;
   virtual bool SupportsCenterSamplePattern() const = 0;
 
   virtual D3D_FEATURE_LEVEL GetFeatureLevel() = 0;

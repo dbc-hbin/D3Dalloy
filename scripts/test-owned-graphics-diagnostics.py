@@ -172,6 +172,7 @@ class RunnerFailures(unittest.TestCase):
         # Synthetic trace protocol only: NOT compilation, GPU or disk persistence evidence.
         prefix = "OWNED_D3D12_PIPELINE_CACHE"
         keys = {name: digit * 40 for name, digit in zip(("a", "b", "root", "concurrent", "control"), "12345")}
+        keys["same_stage_node_one"] = "7" * 40
         rows = [f"{prefix}_CASE_PASS {name}" for name in
                 ("ordinary_key_memory", "disk_restore_invalid_rebuild", "concurrent_single_producer",
                  "failure_completion_retry", "driver_control_app_independence")]
@@ -182,7 +183,8 @@ class RunnerFailures(unittest.TestCase):
         rows += [f"{prefix}_KEY case=child key={keys['a']}" for _ in range(5)]
         labels = ("ordinary_a", "ordinary_root", "memory_a", "memory_root", "child_disk", "child_corrupt",
                   "child_truncated", "child_identity", "child_native", "failure_valid_control", "disabled_first",
-                  "disabled_second", "enabled", "clear_rebuild", "unaligned_input_lifetime", "returned_blob_isolation")
+                  "disabled_second", "enabled", "clear_rebuild", "unaligned_input_lifetime", "returned_blob_isolation",
+                  "distinct_compute_same_stage", "retained_after_stage_library_clear")
         rows += [f"{prefix}_GPU case={label} actual=31415a5b expected=31415a5b"
                  for label in (*labels, *(f"concurrent_{i}" for i in range(8)))]
         rows += [f"{prefix}_GPU case={label} actual=31415813 expected=31415813"
@@ -245,6 +247,271 @@ class RunnerFailures(unittest.TestCase):
                     logs["pipeline-cache-control/same_d3d12.log"].replace("pipeline_cache_auto_bypass", "pipeline_cache_auto_hit")})):
             with self.subTest(label=label):
                 self.assertTrue(runner.pipeline_cache_failures(stdout, "", corrupted))
+
+    def test_pipeline_artifacts_require_real_operations_within_joined_phases(self):
+        for suite, phases in (("pipeline-cache", [("distinct_compute", 1, 1, 0),
+                              ("concurrent_distinct_compute", 1, 0, 0)]),
+                              ("pipeline-library", [("concurrent_graphics", 2, 2, 0), ("root_abi", 2, 0, 0),
+                               ("pixel_specialization", 1, 1, 1), ("constant_concurrent", 0, 0, 1),
+                               ("constant_distinct", 0, 0, 1), ("constant_hit", 0, 0, 0),
+                               ("constant_root_abi", 1, 0, 1), ("constant_entry", 1, 1, 1),
+                               ("linked_geometry_cold", 2, 2, 0), ("linked_geometry_hit", 0, 0, 0),
+                               ("linked_geometry_input", 2, 0, 0), ("captured_layout_cold", 6, 6, 0),
+                               ("captured_layout_hit", 0, 0, 0), ("clear_rebuild", 2, 2, 0)])):
+            prefix = runner.SUITE_PREFIXES[suite] + "_ARTIFACT_PHASE "
+            rows = []
+            for name, air, libraries, specializations in phases:
+                rows.append(prefix + "begin=" + name)
+                for kind, count in (("shader_initialize", air), ("air_compile", air),
+                                    ("new_library", libraries), ("specialize_function", specializations)):
+                    for index in range(count):
+                        event={"event": "pipeline_artifact_operation", "kind": kind}
+                        if name == "captured_layout_cold" and kind in ("air_compile","new_library"):
+                            event.update(cache=1 if kind == "air_compile" else 2,key=f"{index+1+(100 if kind == 'new_library' else 0):040x}")
+                        rows.append("info: OWNED_GRAPHICS_TRACE " + json.dumps(event))
+                if name in ("captured_layout_cold","captured_layout_hit"):
+                    for kind,base,cache in (("air_compile",0,1),("new_library",100,2)):
+                        for index in (range(7) if name.endswith("hit") else (0,)):
+                            rows.append("info: OWNED_GRAPHICS_TRACE "+json.dumps(dict(event="pipeline_artifact_hit",kind=kind,key=f"{base+index:040x}",cache=cache)))
+                rows.append(prefix + "end=" + name)
+            text = "\n".join(rows)
+            self.assertEqual(runner.pipeline_artifact_failures(text, suite), [])
+            for bad in ("", text.replace("pipeline_artifact_operation", "pipeline_artifact_hit"),
+                        text + "\n" + rows[0], "\n".join(rows[1:]),
+                        text.replace(prefix + "end=" + phases[0][0],
+                                     "OWNED_GRAPHICS_TRACE " + json.dumps(
+                                         {"event": "pipeline_artifact_operation", "kind": "air_compile"})
+                                     + "\n" + prefix + "end=" + phases[0][0]),
+                        text.replace(rows[0], prefix)):
+                with self.subTest(suite=suite, bad=bad):
+                    self.assertTrue(runner.pipeline_artifact_failures(bad, suite))
+            if suite == "pipeline-library":
+                for kind in ("air_compile","new_library"):
+                    cold=next(line for line in rows if '"kind": "'+kind+'"' in line and '"key"' in line and '"event": "pipeline_artifact_operation"' in line)
+                    warm=next(line for line in rows if '"kind": "'+kind+'"' in line and '"event": "pipeline_artifact_hit"' in line and '"key": "'+("0"*39+"1" if kind == "air_compile" else f"{101:040x}")+'"' in line)
+                    sixth=cold.replace(f'{1 if kind == "air_compile" else 101:040x}',f'{6 if kind == "air_compile" else 106:040x}')
+                    for changed in (text.replace(sixth,cold,1),text.replace(warm,warm.replace("pipeline_artifact_hit","ignored_work"),1),text.replace(warm,warm.replace(json.loads(warm.split("OWNED_GRAPHICS_TRACE ",1)[1])["key"],"f"*40),1),text.replace(warm,warm+"\n"+warm,1),text.replace(cold,cold.replace('"cache": '+("1" if kind == "air_compile" else "2"),'"cache": 3'),1)):
+                        self.assertTrue(runner.pipeline_artifact_failures(changed,suite),kind)
+                before,cold_and_after=text.split(prefix+"begin=captured_layout_cold",1)
+                self.assertTrue(runner.pipeline_artifact_failures(before+prefix+"begin=captured_layout_cold"+cold_and_after.replace("pipeline_artifact_operation","ignored_work",1),suite))
+                extra="OWNED_GRAPHICS_TRACE "+json.dumps(dict(event="pipeline_artifact_operation",kind="shader_initialize"))
+                self.assertTrue(runner.pipeline_artifact_failures(text.replace(prefix+"end=captured_layout_hit",extra+"\n"+prefix+"end=captured_layout_hit",1),suite))
+                for operation in ("shader_initialize", "air_compile", "new_library", "specialize_function"):
+                    unexpected = "OWNED_GRAPHICS_TRACE " + json.dumps(
+                        {"event": "pipeline_artifact_operation", "kind": operation})
+                    with self.subTest(unexpected_warm_operation=operation):
+                        self.assertTrue(runner.pipeline_artifact_failures(
+                            text.replace(prefix + "end=constant_hit",
+                                         unexpected + "\n" + prefix + "end=constant_hit"), suite))
+                self.assertTrue(runner.pipeline_artifact_failures(
+                    text.replace("specialize_function", "new_library"), suite))
+
+    def test_execution_graph_requires_gpu_values_and_retired_native_operations(self):
+        # Independent log input from the frozen ExecutionGraph fixture/oracle, not
+        # runner-owned expectations. The generator emits records, never verifies them.
+        identity = list(range(8))
+        render = [
+            ("graph-boundary-0", 2, [2], [identity, identity], 0, 0, 0, 0, [4], 0, False),
+            ("graph-boundary-1", 2, [1, 1], [], 2, 0, 0, 0, [4], 0, False),
+            ("graph-boundary-2", 2, [1, 1], [], 2, 0, 0, 0, [4], 0, False),
+            ("graph-boundary-3", 2, [1, 1], [], 2, 1, 0, 0, [4], 0, False),
+            ("graph-boundary-4", 2, [1, 1], [], 2, 0, 0, 0, [4, 4], 0, False),
+            ("graph-uav-dependency", 1, [1, 1], [], 2, 0, 0, 0, [4], 0, False),
+            ("graph-uav-war", 1, [1, 1], [], 2, 0, 0, 0, [4], 0, False),
+            ("graph-uav-waw", 1, [1, 1], [], 2, 0, 0, 0, [4], 0, False),
+            ("graph-uav-atomic", 1, [1, 1], [], 2, 0, 0, 0, [4], 0, False),
+            ("graph-uav-vertex", 1, [2], [identity, identity], 0, 0, 0, 0, [4], 0, True),
+            ("graph-access-0", 2, [2], [identity, identity], 0, 1, 0, 0, [], 0, False),
+            ("graph-access-1", 2, [2], [identity, identity], 0, 1, 0, 0, [], 0, False),
+            ("graph-access-2", 2, [2], [identity, identity], 0, 0, 1, 0, [], 0, False),
+            ("graph-access-3", 2, [1, 1], [], 0, 1, 0, 0, [], 0, False),
+            ("graph-mips", 1, [2], [identity, identity], 0, 0, 1, 0, [], 0, False),
+            ("graph-union-0", 2, [3], [identity, [1, 0, 2, 3, 4, 5, 6, 7], identity], 0, 0, 0, 0, [], 0, False),
+            ("graph-union-1", 2, [3], [[0, 2, 2, 3, 4, 5, 6, 7], [2, 1, 2, 3, 4, 5, 6, 7], identity], 0, 0, 0, 0, [], 0, False),
+            ("graph-union-lifetime", 1, [3], [[0, 2, 2, 3, 4, 5, 6, 7], [2, 1, 2, 3, 4, 5, 6, 7], identity], 0, 0, 0, 0, [], 0, False),
+            ("graph-clears-0", 2, [], [], 0, 0, 0, 1, [4, 4, 1, 2], 3, False),
+            ("graph-clears-1", 2, [], [], 0, 1, 0, 2, [4, 4, 4, 1, 2], 2, False),
+            ("graph-clear-view-0", 2, [1], [], 1, 0, 0, 1, [4], 1, False),
+            ("graph-clear-view-1", 2, [1], [], 1, 0, 0, 1, [4], 1, False)]
+        enhanced = [(f"graph-enhanced-scope-{c}", 1, [2] if c < 2 else [1, 1],
+                     [identity, identity] if c < 2 else [], 0 if c < 2 else 2,
+                     0, 0, 0, [], 0, False) for c in range(5)]
+        safety = [("graph-clear-reset-release", 1, [], [], 0, 2, 0, 2, [4, 4], 2, False)]
+        render_numeric = [f"CROSS_LIST control={c} replay={r} left={('ff102000' if c == 4 else 'ff402080')} "
+                          f"right={('ff100000' if c == 4 else 'ff400080')} exact=1 sealed=1"
+                          for c in range(5) for r in range(2)]
+        for c in range(5):
+            render_numeric += [f"CROSS_LIST_UAV rgba={('ff402080' if c == 0 else 'ff400080')} exact=1 dependency=1",
+                               f"GRAPH_UAV control={c} word={6 if c == 4 else 64 if c == 2 else 32} render_encoders={1 if c == 4 else 2} "
+                               f"members=2 inline_barriers={int(c == 4)} exact=1"]
+        render_numeric += [f"GRAPH_ACCESS control={c} replay={r} rgba=ff000050 unrelated={('13579bdf' if c == 2 else '00000010')} "
+                           f"render_encoders={2 if c == 3 else 1} members=2 exact=1" for c in range(4) for r in range(2)]
+        render_numeric += ["GRAPH_MIPS rgba=ff000050 mip0=16 mip1=64 mip1_untouched=16 render_encoders=1 members=2 exact=1"]
+        render_numeric += [f"GRAPH_UNION unused={u} replay={r} first={('ff000030' if u else 'ff004030')} "
+                           f"second={('ff005000' if u else 'ff003040')} render_encoders=1 members=3 identity_reset=1 exact=1"
+                           for u in range(2) for r in range(2)]
+        render_numeric += ["GRAPH_UNION_LIFETIME first=ff000030 second=ff005000 render_encoders=1 members=3 "
+                           "multi_pso=1 owner_released=1 reset_before_gate=1 exact=1"]
+        render_numeric += [f"GRAPH_CLEARS observation={o} replay={r} color0=ff200000 color1=ff004000 depth=3f000000 "
+                           f"stencil=22 clear_encoders={1+o} clear_loads={4+o} superseded={3-o} no_draw_final_flush=1 exact=1"
+                           for o in range(2) for r in range(2)]
+        render_numeric += [f"GRAPH_CLEAR_VIEW order={order} replay={replay} untouched=ffff0000 drawn=ff00ff00 "
+                           "expected_untouched=ffff0000 expected_drawn=ff00ff00"
+                           for order in range(2) for replay in range(2)]
+        enhanced_numeric = [f"GRAPH_SCOPES control={c} left=ff00ff00 right=ff0000ff expected_render_encoders={1 if c < 2 else 2} exact=1"
+                            for c in range(5)]
+        safety_numeric = ["GRAPH_CLEAR_RESET_RELEASE_PASS old=ff200000 new=ff004000 recordings=2 clear_encoders=2 superseded=2 released_before_retirement=1"]
+        for suite, base, phases, numeric in (
+                ("render-passes", "OWNED_D3D12_RENDER_PASSES", render, render_numeric),
+                ("enhanced-barriers", "OWNED_D3D12_ENHANCED_BARRIERS", enhanced, enhanced_numeric),
+                ("execution-safety", "OWNED_D3D12_EXECUTION_SAFETY", safety, safety_numeric)):
+            chunks = []
+            for name, replays, begins, mappings, identities, blits, computes, clears, aspects, superseded, inline in phases:
+                for replay in range(replays):
+                    events = [{"event": "submission_clear_superseded", "aspect": 4} for _ in range(superseded)]
+                    for kind, count in (("render", len(begins)), ("clear", clears), ("blit", blits), ("compute", computes)):
+                        for index in range(count):
+                            events.append({"event": f"native_{kind}_begin", "begin_count": 1,
+                                           **({"members": begins[index]} if kind == "render" else {})})
+                            if kind == "render":
+                                events += [{"event": "native_render_attachment", "slot": slot, "load": 1, "store": 1}
+                                           for slot in range(2 if name.startswith("graph-union-") else 1)]
+                            events.append({"event": f"native_{kind}_wait", "wait_count": 1,
+                                           **({"stages": 3 if inline else 1 if name == "graph-access-3" else 2} if kind == "render"
+                                              else {"stages": 2} if kind == "clear" else {})})
+                            if index == 0 and kind == ("render" if begins else "clear"):
+                                events += [{"event": "native_clear_load", "clear_count": 1, "aspect": a} for a in aspects]
+                            if kind == "render":
+                                if identities:
+                                    events.append({"event": "native_render_color_map_identity", "map_count": 1})
+                                for member in range(begins[index]):
+                                    if mappings:
+                                        if inline and member == 1:
+                                            events.append({"event": "native_render_inline_barrier", "member": 1,
+                                                           "scope": 1, "before": 1, "after": 1, "barrier_count": 1})
+                                        events.append({"event": "native_render_color_map", "map_count": 1, "member": member,
+                                                       **{f"physical{i}": value for i, value in enumerate(mappings[member])}})
+                                    if member:
+                                        events.append({"event": "native_render_member"})
+                            if kind in ("blit", "compute"):
+                                events.append({"event": f"native_{kind}_encode", "encode_count": 1})
+                            events.append({"event": f"native_{kind}_update", "update_count": 1,
+                                           **({"stages": 3 if inline and kind == "render" else 2} if kind in ("render", "clear") else {})})
+                            events.append({"event": f"native_{kind}_end", "end_count": 1})
+                    chunks.append([base + f"_GRAPH_PHASE begin={name} replay={replay}",
+                                   *["OWNED_GRAPHICS_TRACE " + json.dumps(e) for e in events],
+                                   base + f"_GRAPH_PHASE end={name} replay={replay}"])
+            rows = [line for chunk in chunks for line in chunk]
+            numeric = [base + "_" + line for line in numeric]
+            stdout, stderr = "\n".join(numeric), "\n".join(rows)
+            with self.subTest(suite=suite, valid=True):
+                self.assertEqual(runner.execution_graph_failures(stdout, stderr, suite), [])
+            mutations = [("summary-only", stdout, ""), ("no-readback", "", stderr),
+                         ("malformed-phase", stdout, stderr.replace(" replay=0", " replay=invalid", 1)),
+                         ("malformed-json", stdout, stderr.replace("OWNED_GRAPHICS_TRACE {", "OWNED_GRAPHICS_TRACE [", 1)),
+                         ("non-object", stdout, stderr.replace(rows[1], "OWNED_GRAPHICS_TRACE []", 1))]
+            for i, chunk in enumerate(chunks):
+                mutations += [(f"missing-phase-{i}", stdout, "\n".join(line for j, c in enumerate(chunks) if j != i for line in c)),
+                              (f"duplicate-phase-{i}", stdout, stderr + "\n" + "\n".join(chunk)),
+                              (f"missing-begin-{i}", stdout, stderr.replace(chunk[0] + "\n", "", 1)),
+                              (f"missing-end-{i}", stdout, stderr.replace(chunk[-1], "", 1))]
+                if i:
+                    reordered = chunks.copy()
+                    reordered[i-1], reordered[i] = reordered[i], reordered[i-1]
+                    mutations.append((f"reordered-phase-{i}", stdout, "\n".join(line for c in reordered for line in c)))
+            seen = set()
+            for row in rows:
+                if not row.startswith("OWNED_GRAPHICS_TRACE "):
+                    continue
+                event = json.loads(row.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+                kind = event["event"]
+                if kind == "native_render_attachment":
+                    continue
+                if kind in seen:
+                    continue
+                seen.add(kind)
+                mutations += [("missing-" + kind, stdout, stderr.replace(row + "\n", "", 1)),
+                              ("duplicate-" + kind, stdout, stderr.replace(row, row + "\n" + row, 1)),
+                              ("metadata-not-" + kind, stdout, stderr.replace(row,
+                               'OWNED_GRAPHICS_TRACE {"event":"native_render_attachment","slot":0,"load":1,"store":1}', 1))]
+                for key in event:
+                    if key.endswith("_count") or key in ("stages", "scope", "before", "after", "member", "members", "aspect"):
+                        for value in (None, 255, True):
+                            bad = {**event, key: value}
+                            mutations.append((f"{kind}-{key}-{value}", stdout,
+                                              stderr.replace(row, "OWNED_GRAPHICS_TRACE " + json.dumps(bad), 1)))
+                if kind == "native_render_color_map":
+                    for value in (-1, 8, 255, True, None):
+                        bad = {**event, "physical7": value}
+                        mutations.append((f"bad-native-index-{value}", stdout,
+                                          stderr.replace(row, "OWNED_GRAPHICS_TRACE " + json.dumps(bad), 1)))
+                    mutations.append(("map-is-not-identity-event", stdout,
+                                      stderr.replace('"native_render_color_map"', '"native_render_color_map_identity"', 1)))
+                if kind == "native_render_color_map_identity":
+                    mutations.append(("identity-is-not-mapped-member", stdout,
+                                      stderr.replace('"native_render_color_map_identity"', '"native_render_color_map"', 1)))
+            for i, line in enumerate(numeric):
+                mutations += [(f"missing-readback-{i}", stdout.replace(line, "", 1), stderr),
+                              (f"duplicate-readback-{i}", stdout + "\n" + line, stderr),
+                              (f"wrong-readback-{i}", stdout.replace(line, line.replace("=ff", "=fe", 1)
+                               if "=ff" in line else line.replace("word=", "word=9", 1), 1), stderr)]
+            if suite == "render-passes":
+                mutations += [("clear-view-old-red", stdout.replace("untouched=ffff0000", "untouched=ff0000ff"), stderr),
+                              ("clear-view-draw-corrupt", stdout.replace("drawn=ff00ff00", "drawn=ff0000ff"), stderr)]
+                for chunk in (c for c in chunks if "begin=graph-clear-view-" in c[0]):
+                    view_chunk = "\n".join(chunk)
+                    for row in chunk:
+                        if not row.startswith("OWNED_GRAPHICS_TRACE ") or '"native_render_attachment"' in row:
+                            continue
+                        event = json.loads(row.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+                        mutations += [("clear-view-missing-" + event["event"], stdout,
+                                       stderr.replace(view_chunk, view_chunk.replace(row + "\n", "", 1))),
+                                      ("clear-view-extra-" + event["event"], stdout,
+                                       stderr.replace(view_chunk, view_chunk.replace(row, row + "\n" + row, 1)))]
+                lifetime_chunk = "\n".join(next(c for c in chunks if "begin=graph-union-lifetime " in c[0]))
+                for field in ("multi_pso", "owner_released", "reset_before_gate"):
+                    mutations += [("lifetime-disabled-" + field, stdout.replace(field + "=1", field + "=0"), stderr),
+                                  ("lifetime-missing-" + field, stdout.replace(field + "=1 ", ""), stderr)]
+                for row in lifetime_chunk.splitlines():
+                    if not row.startswith("OWNED_GRAPHICS_TRACE ") or '"native_render_attachment"' in row:
+                        continue
+                    event = json.loads(row.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+                    mutations += [("lifetime-missing-" + event["event"], stdout,
+                                   stderr.replace(lifetime_chunk, lifetime_chunk.replace(row + "\n", "", 1))),
+                                  ("lifetime-duplicate-" + event["event"], stdout,
+                                   stderr.replace(lifetime_chunk, lifetime_chunk.replace(row, row + "\n" + row, 1)))]
+                atomic_chunk = "\n".join(next(c for c in chunks if "begin=graph-uav-atomic " in c[0]))
+                vertex_chunk = "\n".join(next(c for c in chunks if "begin=graph-uav-vertex " in c[0]))
+                barrier_row = next(row for row in vertex_chunk.splitlines() if '"native_render_inline_barrier"' in row)
+                mutations += [("wrong-final-map", stdout, stderr.replace('"physical7": 7', '"physical7": 6')),
+                              ("fragment-atomic-collapsed", stdout, stderr.replace(atomic_chunk,
+                               vertex_chunk.replace("graph-uav-vertex", "graph-uav-atomic").replace('"stages": 3', '"stages": 2'))),
+                              ("fragment-atomic-inline", stdout, stderr.replace(atomic_chunk, atomic_chunk.replace(
+                               base + "_GRAPH_PHASE end=", barrier_row + "\n" + base + "_GRAPH_PHASE end=", 1))),
+                              ("old-fragment-inline-scope", stdout, stderr.replace(barrier_row,
+                               barrier_row.replace('"scope": 1', '"scope": 3').replace('"before": 1', '"before": 2').replace('"after": 1', '"after": 2'))),
+                              ("vertex-fragment-fence", stdout, stderr.replace(vertex_chunk, vertex_chunk.replace('"stages": 3', '"stages": 2'))),
+                              ("vertex-fragment-producer", stdout, stderr.replace(barrier_row, barrier_row.replace('"before": 1', '"before": 2'))),
+                              ("vertex-fragment-consumer", stdout, stderr.replace(barrier_row, barrier_row.replace('"after": 1', '"after": 2'))),
+                              ("old-atomic-numeric", stdout.replace("control=3 word=32 render_encoders=2 members=2 inline_barriers=0",
+                               "control=3 word=32 render_encoders=1 members=2 inline_barriers=1"), stderr),
+                              ("wrong-vertex-word", stdout.replace("control=4 word=6", "control=4 word=32"), stderr),
+                              ("wrong-UAV-word", stdout.replace("word=32", "word=31"), stderr),
+                              ("wrong-mip", stdout.replace("mip1=64", "mip1=16"), stderr),
+                              ("wrong-depth", stdout.replace("depth=3f000000", "depth=3f800000"), stderr),
+                              ("old-access-generation", stdout.replace("render_encoders=2 members=2 exact=1", "render_encoders=1 members=2 exact=1"), stderr),
+                              ("old-15-phase-matrix", stdout, "\n".join(line for c in chunks[14:20] + chunks[22:] for line in c))]
+            elif suite == "execution-safety":
+                eager = [row for row in rows if '"submission_clear_superseded"' not in row]
+                eager[1:1] = [row for row in rows if '"native_clear_' in row and '"native_clear_load"' not in row]
+                mutations += [("old-reset-output", stdout.replace("old=ff200000", "old=ff004000"), stderr),
+                              ("eager-clear-four-no-superseded", stdout.replace("clear_encoders=2 superseded=2",
+                               "clear_encoders=4 superseded=0"), "\n".join(eager)),
+                              ("new-reset-output", stdout.replace("new=ff004000", "new=ff200000"), stderr),
+                              ("not-released", stdout.replace("released_before_retirement=1", "released_before_retirement=0"), stderr)]
+            for label, out, err in mutations:
+                with self.subTest(suite=suite, label=label):
+                    self.assertTrue(runner.execution_graph_failures(out, err, suite))
 
     def test_native_core_loads_require_owned_paths_bytes_and_guest_abi(self):
         # Controlled PE headers and Wine trace protocol, not real Core execution.
@@ -2398,6 +2665,466 @@ class TemporalFailures(unittest.TestCase):
     def test_failed_native_submission_rejected(self):
         next(e for e in self.events if e["event"] == "complete")["status"] = 5
         self.assertFalse(self.report()["pass"])
+
+
+class Phase3PreparedEvidence(unittest.TestCase):
+    """Independent controlled protocols; these are parser tests, not GPU acceptance."""
+
+    def indirect_control(self):
+        out, err, ordinal = [], [], 0
+        def event(name, **fields):
+            nonlocal ordinal
+            ordinal += 1
+            if name in ("submit", "complete"):
+                fields.setdefault("queue", 1)
+            err.append("OWNED_GRAPHICS_TRACE " + json.dumps(dict(event=name, event_id=ordinal, **fields)))
+        def native(name, **fields):
+            err.append("OWNED_GRAPHICS_NATIVE_" + name + " " + " ".join(f"{k}={v}" for k, v in fields.items()))
+        submission = 0
+        for mode in range(5):
+            for maximum in (0, 1, 31, 32, 33, 4097):
+                if mode in (2, 4) and maximum != 33:
+                    continue
+                if maximum and (mode or maximum > 1):
+                    event("indirect_compute_resolver", allocator=1, pso=900, max_count=maximum, grid_x=(maximum+31)//32, threads_x=32)
+                repetitions = 7 if mode in (1, 3, 4) and maximum == 33 else 1
+                for replay in range(repetitions):
+                    count = [maximum, 1, maximum, maximum, maximum, 0, maximum + 7][replay]
+                    predicate = 0 if replay == 3 else 1
+                    active = min(count, maximum) if mode in (1, 3) else maximum
+                    if mode in (3, 4) and predicate == 0:
+                        active = 0
+                    result = active * (active + 1) // 2 if mode in (2, 3) else sum(7 * (i % 3 + 1) for i in range(active) if i % 5 != 4)
+                    guards = f"d00d0000,{0xd00d0000+2*maximum:08x},{0xd00d0001+2*maximum:08x}" if mode == 3 else "a17e0011,b28f0022,c3900033"
+                    out.append(f"OWNED_D3D12_PREDICATION_INDIRECT_PREPARED_COMPUTE_VALUES mode={mode} max={maximum} replay={replay} count={count} predicate={predicate} result={result} guards={guards}")
+                    phase = f"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode={mode} max={maximum} replay={replay} phase="
+                    err.append(phase + "submit_begin")
+                    submission += 1
+                    event("submit", submission=submission)
+                    native("DISPATCH", encoder=1, pso=100, mode="threadgroups", grid_x=max(1, (maximum+31)//32), grid_y=1, grid_z=1, threads_x=32, threads_y=1, threads_z=1)
+                    if mode in (3, 4):
+                        native("DISPATCH", encoder=3, pso=110, mode="threadgroups", grid_x=1, grid_y=1, grid_z=1, threads_x=1, threads_y=1, threads_z=1)
+                    if maximum and (mode or maximum > 1):
+                        native("DISPATCH", encoder=1, pso=900, mode="threadgroups", grid_x=(maximum+31)//32, grid_y=1, grid_z=1, threads_x=32, threads_y=1, threads_z=1)
+                        native("EXECUTE_ICB", stage="compute", encoder=1, buffer=2, location=0, length=maximum)
+                    else:
+                        for slot in range(maximum):
+                            native("DISPATCH_INDIRECT", encoder=1, pso=101, argument_buffer=2, argument_offset=16+32*slot, threads_x=1, threads_y=1, threads_z=1)
+                    event("complete", submission=submission, status=4)
+                    err.append(phase + "submit_end")
+        for kind in range(3):
+            for maximum in (0, 1, 2, 4):
+                rgba = "0,0,0,0" if maximum == 0 else "2,5,0,255" if maximum == 1 else "3,7,0,255"
+                out.append(f"OWNED_D3D12_PREDICATION_INDIRECT_SIMPLE_GRAPHICS_VALUES kind={kind} max={maximum} rgba={rgba}")
+                phase = f"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format={kind} max={maximum} phase="
+                err.append(phase + "submit_begin")
+                submission += 1
+                event("submit", submission=submission)
+                for slot in range(maximum):
+                    fields = dict(encoder=1, argument_buffer=2, argument_offset=16+32*slot, primitive_type=3)
+                    if kind:
+                        fields.update(index_type=kind-1, index_buffer=3, index_offset=4)
+                    native("DRAW_INDEXED_INDIRECT" if kind else "DRAW_INDIRECT", **fields)
+                event("complete", submission=submission, status=4)
+                err.append(phase + "submit_end")
+        for marker in ("PREPARED_COMPUTE_PASS", "SIMPLE_GRAPHICS_PASS", "MSAA_INDEXED_MUTATIONS_PASS counts=1,2 samples=4", "ARENA_BINDINGS_PASS commands=16385 first_last=1 static_sampler=1 vertex_slot=31 cached_statistics_after_growth=1 predicate_skip=1"):
+            out.append("OWNED_D3D12_PREDICATION_INDIRECT_" + marker)
+        return "\n".join(out), "\n".join(err)
+
+    def test_indirect_numeric_predicate_root_and_tail_corruption(self):
+        stdout, stderr = self.indirect_control()
+        self.assertEqual(runner.prepared_indirect_failures(stdout, stderr), [])
+        for old, new in (("result=0 guards=a17e0011", "result=7 guards=a17e0011"),
+                         ("result=1 guards=d00d0000", "result=0 guards=d00d0000"),
+                         ("predicate=0 result=0", "predicate=0 result=561"),
+                         ("rgba=2,5,0,255", "rgba=1,5,0,255"),
+                         ("b28f0022", "b28f0023")):
+            with self.subTest(old=old):
+                self.assertIn(old, stdout)
+                self.assertTrue(runner.prepared_indirect_failures(stdout.replace(old, new, 1), stderr))
+        rows = stdout.splitlines()
+        for changed in (rows[1:], rows[:1] + rows, [rows[1], rows[0]] + rows[2:]):
+            self.assertTrue(runner.prepared_indirect_failures("\n".join(changed), stderr))
+
+    def test_indirect_actual_commands_and_phase_integrity(self):
+        stdout, stderr = self.indirect_control()
+        for old, new in (("pso=900 mode=threadgroups grid_x=2", "pso=901 mode=threadgroups grid_x=2"),
+                         ("threads_x=32", "threads_x=1"),
+                         ("argument_offset=48", "argument_offset=16"),
+                         ("stage=compute", "stage=render"),
+                         ("phase=submit_end", "phase=submit_begin"),
+                         ('"status": 4', '"status": 5'),
+                         ('"event_id": 2', '"event_id": 1')):
+            with self.subTest(old=old):
+                self.assertIn(old, stderr)
+                self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(old, new, 1)))
+        line = next(line for line in stderr.splitlines() if line.startswith("OWNED_GRAPHICS_NATIVE_DISPATCH_INDIRECT"))
+        self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(line + "\n", "", 1)))
+        self.assertTrue(runner.prepared_indirect_failures(stdout, stderr + "\ntrace limit reached"))
+        snapshot=next(line for line in stderr.splitlines() if "pso=110" in line)
+        self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(snapshot+"\n", "", 1)))
+        self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(snapshot, snapshot.replace("threads_x=1", "threads_x=2"), 1)))
+
+    def test_single_native_compute_only_and_multi_command_parallel_resolver(self):
+        out,err=self.indirect_control()
+        self.assertEqual(runner.prepared_indirect_failures(out,err),[])
+        begin="OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode=0 max=32 replay=0 phase=submit_begin"
+        end=begin.replace("submit_begin","submit_end")
+        part=err.split(begin,1)[1].split(end,1)[0]
+        lines=[line for line in part.splitlines() if "pso=900" not in line and not line.startswith("OWNED_GRAPHICS_NATIVE_EXECUTE_ICB")]
+        loop=[f"OWNED_GRAPHICS_NATIVE_DISPATCH_INDIRECT encoder=1 pso=101 argument_buffer=2 argument_offset={16+32*i} threads_x=1 threads_y=1 threads_z=1" for i in range(32)]
+        self.assertTrue(runner.prepared_indirect_failures(out,err.replace(part,"\n"+"\n".join(lines+loop)+"\n",1)))
+
+
+class Phase3UploadEvidence(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        phases = [("cold",20000,0x12340000),("warm",20000,0x23450000)] + [("age-small",1,0x34560000+i) for i in range(51)] + [("after-age",20000,0x45670000),("byte-burst",60000,0x56780000),("after-byte-trim",20000,0x67890000)]
+        rows, events, chunks, next_chunk, last_used, created_epoch = [], [], [], 0, {}, {}
+        def event(name, **fields):
+            if name in ("submit", "complete"):
+                fields.setdefault("queue", 1)
+            events.append(dict(event=name,event_id=len(events)+1,**fields))
+        def create(epoch):
+            nonlocal next_chunk
+            next_chunk += 1
+            chunk = dict(chunk=next_chunk,buffer=next_chunk+100,va=next_chunk*0x1000000,begin=len(chunks)*4194304,capacity=4194304)
+            event("root_upload_create",allocator=1,epoch=epoch,reason="initial" if not chunks else "growth",**chunk)
+            chunks.append(chunk)
+            created_epoch[next_chunk] = epoch
+        create(0)
+        for _ in range(3):
+            event("copy_buffer",bytes=240008)
+        event("execute_list",list=2,recording=1,submission=1)
+        event("execute_list",list=3,recording=1,submission=1)
+        event("submit",submission=1)
+        event("signal",value=1)
+        event("complete",submission=1,status=4)
+        for epoch, (name,count,salt) in enumerate(phases):
+            rows.append(f"OWNED_D3D12_UPLOAD_REUSE_BEGIN phase={name} count={count} salt={salt:08x}")
+            event("record_begin",list=10,recording=epoch+1,allocator=1)
+            for slot in range(count):
+                number, local = divmod(slot,13107)
+                if number == len(chunks):
+                    create(epoch)
+                chunk = chunks[number]
+                if local == 0 and created_epoch[chunk["chunk"]] < epoch:
+                    event("root_upload_reuse",allocator=1,epoch=epoch,**{k:chunk[k] for k in ("chunk","buffer","va","capacity")})
+                event("root_upload_allocate",allocator=1,epoch=epoch,chunk=chunk["chunk"],buffer=chunk["buffer"],va=chunk["va"]+local*320,begin=chunk["begin"],offset=local*320,size=272,alignment=64)
+                last_used[chunk["chunk"]]=epoch
+                event("dispatch",list=10,recording=epoch+1,encoder=epoch+50,x=1,y=1,z=1)
+            if epoch==0:
+                event("root_upload_reset",allocator=1,epoch=0,accepted=0,reason="in_flight")
+            for replay in range(2):
+                submission=2+epoch*2+replay
+                event("execute_list",list=10,recording=epoch+1,submission=submission)
+                event("execute_list",list=3,recording=1,submission=submission)
+                event("native_compute_encode",submission=submission,encoder=epoch+50)
+                event("submit",submission=submission)
+                event("signal",value=submission)
+                event("complete",submission=submission,status=4)
+            if epoch in (51,54):
+                removed=chunks.pop()
+                event("root_upload_trim",allocator=1,epoch=epoch+1,last_used_epoch=last_used[removed["chunk"]],reason="age" if epoch==51 else "capacity",**removed)
+            event("root_upload_reset",allocator=1,epoch=epoch+1,accepted=1,reason="retired",chunks=len(chunks),retained_bytes=4194304*len(chunks))
+            rows.append(f"OWNED_D3D12_UPLOAD_REUSE_PHASE_PASS phase={name} count={count} executions=2")
+        rows.append("OWNED_D3D12_UPLOAD_REUSE_PASS growth=20000 burst=60000 age_resets=51 recordings=56 executions=112 guards=60002")
+        cls.stdout="\n".join(rows)
+        cls.stderr="\n".join("OWNED_GRAPHICS_TRACE "+json.dumps(e) for e in events)
+
+    def test_actual_factory_identity_policy_and_replay(self):
+        self.assertEqual(runner.upload_reuse_failures(self.stdout,self.stderr),[])
+        mutations=(('"va": 16777216, "begin": 0, "offset": 0','"va": 16777280, "begin": 0, "offset": 0'),
+                   ('"alignment": 64','"alignment": 32'),
+                   ('"epoch": 0, "accepted": 0','"epoch": 1, "accepted": 0'),
+                   ('"last_used_epoch": 1','"last_used_epoch": 2'),
+                   ('"accepted": 0','"accepted": 1'))
+        for old,new in mutations:
+            with self.subTest(old=old):
+                self.assertIn(old,self.stderr)
+                self.assertTrue(runner.upload_reuse_failures(self.stdout,self.stderr.replace(old,new,1)))
+        self.assertTrue(runner.upload_reuse_failures(self.stdout.replace("salt=23450000","salt=23450001",1),self.stderr))
+        self.assertTrue(runner.upload_reuse_failures(self.stdout,self.stderr+"\ntrace limit reached"))
+
+
+class Phase3QueryIntervals(unittest.TestCase):
+    def control(self):
+        out, err, serial = [], [], 0
+        def event(name, **fields):
+            nonlocal serial
+            serial += 1
+            if name in ("submit", "complete"):
+                fields.setdefault("queue", 1)
+            err.append("OWNED_GRAPHICS_TRACE " + json.dumps(dict(event=name,event_id=serial,**fields)))
+        for execution in range(3):
+            words=[0x1234000000000000+i for i in range(11)]
+            words[1::2]=[12,20,1,0,0] if execution==0 else [10,6,1,0,0]
+            out.append(f"OWNED_D3D12_QUERY_INTERVAL_VALUES execution={execution} values="+",".join(map(str,words)))
+        out.append("OWNED_D3D12_QUERY_INTERVAL_PASS executions=3 changed_values=1 closed_list_replay=1 crossheap=1 empty_count=0 binary_visible=1 binary_empty=0 guard_words=6 heap_release_before_replay=1")
+        for kind, repeats in (("INTERVAL",3),("REUSE",2)):
+            if kind=="REUSE":
+                for _ in range(4):
+                    event("draw",encoder=200,list=2,recording=1)
+            for execution in range(repeats):
+                encoder=100+min(execution,1) if kind=="INTERVAL" else 200
+                if kind=="INTERVAL" and execution<2:
+                    err.append(f"OWNED_D3D12_QUERY_INTERVAL_PHASE execution={execution} phase=record_begin")
+                    for _ in range(8):
+                        event("draw",encoder=encoder,list=1,recording=execution+1)
+                    err.append(f"OWNED_D3D12_QUERY_INTERVAL_PHASE execution={execution} phase=record_end")
+                err.append(f"OWNED_D3D12_QUERY_{kind}_PHASE execution={execution} phase=submit_begin")
+                submission=10+execution if kind=="INTERVAL" else 20+execution
+                slots=3 if kind=="INTERVAL" else 2
+                event("query_scratch_fill",encoder=encoder,submission=submission,queue=1,slots=slots,bytes=slots*8,fill_count=1)
+                event("native_render_begin",encoder=encoder,submission=submission)
+                event("native_render_end",encoder=encoder,submission=submission)
+                ops=[("query_reset",1,0,None),("query_accumulate",1,0,0)]
+                ops += [("query_reset",2,0,None),("query_reset",2,1,None),("query_accumulate",1,0,8),("query_accumulate",2,0,8),("query_accumulate",2,1,8),("query_accumulate",2,0,16),("query_accumulate",2,1,16),("query_reset",1,1,None),("query_reset",2,2,None)] if kind=="INTERVAL" else [("query_reset",1,0,None),("query_accumulate",1,0,8)]
+                for name,heap,index,offset in ops:
+                    fields=dict(queue=1,submission=submission,heap=heap,index=index)
+                    fields.update(encoder=encoder,reset_count=1) if name=="query_reset" else fields.update(source_offset=offset)
+                    event(name,**fields)
+                event("submit",submission=submission)
+                event("complete",submission=submission,status=4)
+                err.append(f"OWNED_D3D12_QUERY_{kind}_PHASE execution={execution} phase=submit_end")
+                if kind=="REUSE":
+                    out.append(f"OWNED_D3D12_QUERY_REUSE_VALUES execution={execution} count=4096")
+        out.append("OWNED_D3D12_QUERY_REUSE_PASS executions=2 same_slot=1 heap_release_before_execute=1")
+        return "\n".join(out),"\n".join(err)
+
+    def test_exact_interval_empty_reuse_guards_and_native_fanout(self):
+        out,err=self.control()
+        self.assertEqual(runner.query_interval_failures(out,err),[])
+        for old,new in (("values=1311673391471656960,12", "values=1311673391471656960,13"),("count=4096","count=8192")):
+            self.assertIn(old,out)
+            self.assertTrue(runner.query_interval_failures(out.replace(old,new,1),err))
+        for old,new in (('"source_offset": 8','"source_offset": 0'),('"heap": 2','"heap": 1'),('"reset_count": 1','"reset_count": 0'),('"bytes": 24','"bytes": 16'),("phase=submit_end","phase=submit_begin")):
+            self.assertIn(old,err)
+            self.assertTrue(runner.query_interval_failures(out,err.replace(old,new,1)))
+        line=next(line for line in err.splitlines() if '"event": "query_reset"' in line)
+        self.assertTrue(runner.query_interval_failures(out,err.replace(line+"\n","",1)))
+        self.assertTrue(runner.query_interval_failures(out,err.replace(line,line+"\n"+line,1)))
+        self.assertTrue(runner.query_interval_failures(out,err.replace('"event": "query_reset"','"event": "suppressed_reset"',1)))
+        guard=str(0x1234000000000002)
+        self.assertTrue(runner.query_interval_failures(out.replace(guard,str(int(guard)+1),1),err))
+
+
+class Phase3NativeMSAA(unittest.TestCase):
+    def control(self):
+        out, err, serial, encoder, submission = [], [], 0, 100, 0
+        prefix="OWNED_D3D12_MULTISAMPLE_CAPABILITIES"
+        def event(name, **fields):
+            nonlocal serial
+            serial+=1
+            if name in ("submit", "complete"):
+                fields.setdefault("queue", 2 if fields["submission"] >= 10000 else 1)
+            err.append("OWNED_GRAPHICS_TRACE "+json.dumps(dict(event=name,event_id=serial,**fields)))
+        for resource in ("free", "volatile", "static"):
+            for count in (2,4,8):
+                for quality in (0,4294967295,4294967294):
+                    for variant in range(4):
+                        mixed=variant==3
+                        mask=(0xffffffff,0x55555555,0,0xffffffff)[variant]
+                        edge=({2:3,4:15,8:255} if quality==4294967294 else {2:2,4:5,8:58})[count]&mask
+                        if resource != "free":
+                            static=resource=="static"
+                            tag="static_" if static else ""
+                            uppercase="STATIC_" if static else ""
+                            label=f"native_{tag}resource_transitions_count{count}_quality{quality}_maskffffffff" if mixed else f"native_{tag}resource_inputs_count{count}_quality{quality}_mask{mask:08x}"
+                            marker=f"NATIVE_{uppercase}RESOURCE_TRANSITIONS_PASS count={count} quality={quality} draws=4 native_candidates={3 if static else 0} fallback={1 if static else 4} srv=1 cbv=1 msaa_srv=1 owners_released={int(count==8 and quality==4294967294)}" if mixed else f"NATIVE_{uppercase}RESOURCE_INPUTS_PASS count={count} quality={quality} mask={mask:08x} edge={edge} pixels=16 channels=4 depth=1 srv=1 cbv=1 route={'native_static' if static else 'captured_volatile'}"
+                        else:
+                            label=f"native_fallback_transitions_count{count}_quality{quality}" if mixed else f"native_ordinary_count{count}_quality{quality}_mask{mask:08x}"
+                            marker=f"NATIVE_FALLBACK_TRANSITIONS_PASS count={count} quality={quality} draws=4 native_candidates=2 fallback=2 indexed=1 index_pull=1" if mixed else f"NATIVE_ORDINARY_PASS count={count} quality={quality} mask={mask:08x} edge={edge} pixels=16 channels=4 depth=1"
+                        out.append(prefix+"_"+marker)
+                        if resource == "volatile":
+                            submission+=1
+                            err.append(f"{prefix}_SUBMISSION_BEGIN id={submission} label={label}")
+                            for draw in range(4 if mixed else 1):
+                                producer=10000+submission*4+draw
+                                event("submit",submission=producer)
+                                event("msaa_producer_wait",encoder=encoder+draw,producer=producer,queue=2,wait_count=1)
+                                event("complete",submission=producer,status=4)
+                            event("submit",submission=submission)
+                            event("complete",submission=submission,status=4)
+                            err.append(f"{prefix}_SUBMISSION_END id={submission} label={label}")
+                            encoder+=4
+                            continue
+                        native_ids=[encoder,encoder+2,encoder+3] if mixed and resource=="static" else [encoder,encoder+2] if mixed else [encoder]
+                        for i,id in enumerate(native_ids):
+                            event("native_msaa_record",encoder=id,sample_count=count,center=int(quality==4294967294),index_pull=int(mixed and resource=="free" and i==1),pso=id+1000)
+                            event("native_msaa_draw_record",encoder=id,indexed=int(mixed and resource=="free"),index_pull=int(mixed and resource=="free" and i==1),count=3 if mixed else 6,instances=1)
+                        submission+=1
+                        err.append(f"{prefix}_SUBMISSION_BEGIN id={submission} label={label}")
+                        for native_index,id in enumerate(native_ids):
+                            event("native_render_begin",encoder=id,native_msaa_sample_count=count,submission=submission)
+                            event("native_render_end",encoder=id,submission=submission)
+                            if mixed and (resource=="free" or native_index==0):
+                                producer=10000+submission*4+native_index
+                                event("submit",submission=producer)
+                                event("msaa_producer_wait",encoder=encoder+1,producer=producer,queue=2,wait_count=1)
+                                event("complete",submission=producer,status=4)
+                        event("submit",submission=submission)
+                        event("complete",submission=submission,status=4)
+                        err.append(f"{prefix}_SUBMISSION_END id={submission} label={label}")
+                        encoder+=4
+        return "\n".join(out),"\n".join(err)
+
+    def test_actual_native_routes_capture_waits_and_exact_sample_matrix(self):
+        out,err=self.control()
+        self.assertEqual(runner.native_msaa_failures(out,err),[])
+        for old,new in (("edge=2","edge=3"),("owners_released=1","owners_released=0"),("mask=00000000","mask=00000001")):
+            self.assertIn(old,out)
+            self.assertTrue(runner.native_msaa_failures(out.replace(old,new,1),err))
+        for old,new in (('"native_msaa_sample_count": 2','"native_msaa_sample_count": 0'),('"wait_count": 1','"wait_count": 0'),("_SUBMISSION_END","_SUBMISSION_BEGIN")):
+            self.assertIn(old,err)
+            self.assertTrue(runner.native_msaa_failures(out,err.replace(old,new,1)))
+        first_wait=next(json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]) for line in err.splitlines() if '"event": "msaa_producer_wait"' in line)
+        self.assertTrue(runner.native_msaa_failures(out,err.replace(f'"producer": {first_wait["producer"]}','"producer": 99999',1)))
+        line=next(line for line in err.splitlines() if '"event": "native_msaa_draw_record"' in line)
+        self.assertTrue(runner.native_msaa_failures(out,err.replace(line+"\n","",1)))
+        self.assertTrue(runner.native_msaa_failures(out,err.replace(line,line+"\n"+line,1)))
+        self.assertTrue(runner.native_msaa_failures(out.replace("route=captured_volatile","route=native_static",1),err))
+        self.assertTrue(runner.native_msaa_failures(out.replace("native_candidates=0 fallback=4","native_candidates=3 fallback=1",1),err))
+        self.assertTrue(runner.native_msaa_failures(out.replace("NATIVE_STATIC_RESOURCE_INPUTS_PASS","NATIVE_RESOURCE_INPUTS_PASS",1),err))
+
+
+class Phase3NativeBudget(unittest.TestCase):
+    def test_mixed_108_budget_and_legacy_interleaving_preserves_every_record(self):
+        native_out,native_err=Phase3NativeMSAA().control()
+        budget_out,budget_err=self.control()
+        offset=sum("OWNED_GRAPHICS_TRACE " in line for line in native_err.splitlines())
+        shifted=[]
+        for submission,label in enumerate(("native_resource_upload","native_static_resource_upload"),109):
+            native_err+=f"\nOWNED_D3D12_MULTISAMPLE_CAPABILITIES_SUBMISSION_BEGIN id={submission} label={label}\nOWNED_D3D12_MULTISAMPLE_CAPABILITIES_SUBMISSION_END id={submission} label={label}"
+        for line in budget_err.splitlines():
+            if "OWNED_GRAPHICS_TRACE " in line:
+                event=json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1])
+                event["event_id"]+=offset
+                for field in ("encoder","list","pso"):
+                    if field in event:
+                        event[field]+=10000
+                shifted.append("OWNED_GRAPHICS_TRACE "+json.dumps(event))
+            else:
+                shifted.append(line)
+        out=native_out+"\n"+budget_out
+        err=native_err+"\n"+"\n".join(shifted)
+        prefix="OWNED_D3D12_MULTISAMPLE_CAPABILITIES"
+        begin=prefix+"_SUBMISSION_BEGIN id=115 label=existing"
+        end=prefix+"_SUBMISSION_END id=115 label=existing"
+        event=dict(event="encode",event_id=offset+sum("OWNED_GRAPHICS_TRACE " in line for line in shifted)+1,queue=6,submission=7,list=10010,recording=2,encoder=10022,type=2)
+        trace="info:  OWNED_GRAPHICS_TRACE "+json.dumps(event)
+        separate=err+"\n"+begin+"\n"+trace+"\n"+end
+        merged=err+"\n"+begin+trace+"\n"+end
+        for helper in (runner.native_msaa_failures,runner.native_msaa_budget_failures):
+            self.assertEqual(helper(out,separate),[])
+            self.assertEqual(helper(out,merged),[])
+            for changed in (merged.replace(begin+trace,trace,1),merged.replace(begin+trace,begin+"\n"+begin+trace,1),merged.replace(end,end.replace("115","116"),1),merged.replace(begin+trace,begin+trace[:-1],1),merged.replace(begin+trace,begin+trace+"garbage",1),merged+"\n"+trace,merged.replace(begin+trace,begin+trace.replace(f'"event_id": {event["event_id"]}','"event_id": 99999'),1),merged+"\n"+prefix+"_SUBMISSION_BEGIN id=116 label=existing truncated"):
+                self.assertTrue(helper(out,changed),helper.__name__)
+        lines=separate.splitlines()
+        index=next(i for i,line in enumerate(lines) if "_SUBMISSION_BEGIN" in line and "label=native_ordinary_" in line)
+        forward="\n".join(lines[:index]+[lines[index]+"info:  "+lines[index+1]]+lines[index+2:])
+        index=next(i for i,line in enumerate(lines) if "_SUBMISSION_END" in line and "label=native_ordinary_" in line)
+        reverse="\n".join(lines[:index-1]+["info:  "+lines[index-1]+lines[index]]+lines[index+1:])
+        for changed in (forward,reverse):
+            self.assertEqual(runner.native_msaa_failures(out,changed),[])
+            self.assertEqual(runner.native_msaa_budget_failures(out,changed),[])
+        self.assertTrue(runner.native_msaa_failures(out,merged.replace("label=native_ordinary_count2","label=native_unknown_count2",1)))
+        self.assertTrue(runner.native_msaa_failures(out,merged.replace("label=native_binding_budget_first","label=native_binding_budget_unknown",1)))
+
+    def control(self):
+        prefix="OWNED_D3D12_MULTISAMPLE_CAPABILITIES"
+        err=[]
+        serial=0
+        def event(name, **fields):
+            nonlocal serial
+            serial+=1
+            err.append("OWNED_GRAPHICS_TRACE "+json.dumps(dict(event=name,event_id=serial,**fields)))
+        err.append(prefix+"_NATIVE_BINDING_BUDGET_RECORDING_BEGIN draws=66 committed_cbvs=65 repeated_bindings=1 om_binds=1")
+        event("native_msaa_record",list=10,recording=1,encoder=20,sample_count=2,center=0,index_pull=0,pso=100)
+        for draw in range(66):
+            if draw==64:
+                event("native_msaa_budget_rollover",list=10,recording=1,encoder=20,buffer_snapshots=64,table_snapshots=0,limit=64,cause="binding_budget")
+                event("native_msaa_record",list=10,recording=1,encoder=21,sample_count=2,center=0,index_pull=0,pso=100)
+            event("native_msaa_draw_record",list=10,recording=1,encoder=20 if draw<64 else 21,indexed=0,index_pull=0,count=3,instances=1)
+        err.append(prefix+"_NATIVE_BINDING_BUDGET_RECORDING_CLOSED draws=66 committed_cbvs=65 repeated_bindings=1 owners_released=1")
+        labels=("first","color_observe","depth_observe","replay","color_observe","depth_observe")
+        for index,label in enumerate(labels,1):
+            err.append(f"{prefix}_SUBMISSION_BEGIN id={index} label=native_binding_budget_{label}")
+            if label in ("first","replay"):
+                event("execute_list",queue=6,submission=index,list=10,recording=1)
+                for encoder in (20,21):
+                    event("native_render_begin",encoder=encoder,submission=index,native_msaa_sample_count=2)
+                    event("native_render_end",encoder=encoder,submission=index)
+            event("submit",queue=6,submission=index)
+            event("complete",queue=6,submission=index,status=4)
+            err.append(f"{prefix}_SUBMISSION_END id={index} label=native_binding_budget_{label}")
+        out="\n".join(f"{prefix}_NATIVE_BINDING_BUDGET_PASS replay={i} draws=66 committed_cbvs=65 repeated_bindings=1 om_binds=1 count=2 quality=0 pixels=272 channels=4 depth=1 guard_pixels=8 owners_released=1 route=native_static" for i in range(2))
+        return out,"\n".join(err)
+
+    def test_capacity_rollover_and_retained_replay_are_actual_work(self):
+        out,err=self.control()
+        self.assertEqual(runner.native_msaa_budget_failures(out,err),[])
+        for old,new in (('"buffer_snapshots": 64','"buffer_snapshots": 63'),('"table_snapshots": 0','"table_snapshots": 1'),('"limit": 64','"limit": 65'),('"cause": "binding_budget"','"cause": "om_rebind"'),('"native_msaa_sample_count": 2','"native_msaa_sample_count": 0'),('"recording": 1','"recording": 2'),('"event": "native_render_end"','"event": "msaa_producer_wait"'),("label=native_binding_budget_replay","label=native_binding_budget_first")):
+            self.assertTrue(runner.native_msaa_budget_failures(out,err.replace(old,new,1)),old)
+        for old,new in (("replay=1","replay=0"),("committed_cbvs=65","committed_cbvs=64"),("guard_pixels=8","guard_pixels=0"),("owners_released=1","owners_released=0"),("pixels=272","pixels=264")):
+            self.assertTrue(runner.native_msaa_budget_failures(out.replace(old,new,1),err),old)
+        for kind in ("native_msaa_budget_rollover","native_msaa_draw_record","native_render_begin"):
+            line=next(line for line in err.splitlines() if f'"event": "{kind}"' in line)
+            self.assertTrue(runner.native_msaa_budget_failures(out,err.replace(line+"\n","",1)))
+            self.assertTrue(runner.native_msaa_budget_failures(out,err.replace(line,line+"\n"+line,1)))
+            self.assertTrue(runner.native_msaa_budget_failures(out,err.replace(line,line.replace(f'"event": "{kind}"','"event": "ignored_work"'),1)))
+        repeat=json.loads(next(line.split("OWNED_GRAPHICS_TRACE ",1)[1] for line in err.splitlines() if '"event": "native_msaa_budget_rollover"' in line))
+        repeat["event_id"]=sum("OWNED_GRAPHICS_TRACE " in line for line in err.splitlines())+1
+        self.assertTrue(runner.native_msaa_budget_failures(out,err+"\nOWNED_GRAPHICS_TRACE "+json.dumps(repeat)))
+
+
+class Phase3ConcurrentTrace(unittest.TestCase):
+    def test_multiqueue_identity_and_independent_logger_interleave(self):
+        events=[dict(event="submit",event_id=1,queue=6,submission=12),dict(event="submit",event_id=2,queue=207,submission=12),dict(event="native_blit_begin",event_id=3,encoder=148,submission=13),dict(event="native_blit_end",event_id=5,encoder=148,submission=13),dict(event="complete",event_id=4,queue=6,submission=12,status=4),dict(event="complete",event_id=6,queue=207,submission=12,status=4)]
+        text="\n".join("OWNED_GRAPHICS_TRACE "+json.dumps(e) for e in events)
+        parsed,failures=runner.phase3_trace(text)
+        self.assertEqual(failures,[])
+        self.assertEqual([e["event_id"] for e in parsed],[1,2,3,5,4,6])
+        for altered in (events[:4]+events[5:],events+[events[0]],events[:4]+[dict(events[4],queue=207)]+events[5:],events[:2]+[dict(events[2],event_id=5),dict(events[3],event_id=3)]+events[4:], [dict(events[0],event_id=4)]+events[1:4]+[dict(events[4],event_id=1)]+events[5:]):
+            with self.subTest(altered=altered):
+                self.assertTrue(runner.phase3_trace("\n".join("OWNED_GRAPHICS_TRACE "+json.dumps(e) for e in altered))[1])
+        fifo=[dict(event="submit",event_id=1,queue=6,submission=1),dict(event="submit",event_id=2,queue=6,submission=2),dict(event="complete",event_id=4,queue=6,submission=2,status=4),dict(event="complete",event_id=3,queue=6,submission=1,status=4)]
+        self.assertTrue(runner.phase3_trace("\n".join("OWNED_GRAPHICS_TRACE "+json.dumps(e) for e in fifo))[1])
+        self.assertTrue(runner.phase3_trace(text,limit=6)[1])
+        self.assertTrue(runner.phase3_trace(text+"\ntrace limit reached",limit=100000)[1])
+
+    def test_known_native_binding_siblings_do_not_replace_commands(self):
+        out,err=Phase3PreparedEvidence().indirect_control()
+        metadata="OWNED_GRAPHICS_NATIVE_BINDING table_new=1 table_set=2 table_bind=3 residency_new=1 residency_add=2 residency_remove=0 residency_commit=1"
+        err="\n".join((metadata+"\n"+line) if line.startswith("OWNED_D3D12_INDIRECT_PREPARATION_PHASE") else line for line in err.splitlines())
+        self.assertEqual(runner.prepared_indirect_failures(out,err),[])
+        command=next(line for line in err.splitlines() if line.startswith("OWNED_GRAPHICS_NATIVE_DISPATCH_INDIRECT"))
+        self.assertTrue(runner.prepared_indirect_failures(out,err.replace(command+"\n","",1)))
+        self.assertTrue(runner.prepared_indirect_failures(out,err.replace(command,command+"\n"+command,1)))
+        self.assertTrue(runner.prepared_indirect_failures(out,err.replace(command,command.replace("argument_buffer=2","argument_buffer=-2"),1)))
+        self.assertTrue(runner.prepared_indirect_failures(out,err.replace(metadata,metadata.replace("table_set=2","table_set=no"),2)))
+
+
+class Phase3PipelineMSAA(unittest.TestCase):
+    def test_consumed_coverage_and_native_control_require_numeric_completion(self):
+        prefix="OWNED_D3D12_PIPELINE_LIBRARY"
+        out="\n".join(f"{prefix}_GPU case={case} texels=16 value=ff332211" for case in ("captured_layout_first","captured_layout_reuse","ordinary_native2x"))
+        events=[dict(event="native_msaa_draw_record",encoder=1,count=3,instances=1),dict(event="native_render_begin",encoder=1,native_msaa_sample_count=2,submission=4),dict(event="native_render_end",encoder=1),dict(event="complete",submission=4,status=4)]
+        err=f"{prefix}_NATIVE_MSAA_BEGIN count=2\n"+"\n".join("OWNED_GRAPHICS_TRACE "+json.dumps(e) for e in events)+f"\n{prefix}_NATIVE_MSAA_END count=2 resolved=ff332211"
+        for phase in ("captured_layout_cold","captured_layout_hit"):
+            capture=[dict(event="submit",queue=6,submission=10),dict(event="msaa_producer_wait",encoder=3,queue=6,producer=10,wait_count=1),dict(event="complete",queue=6,submission=10,status=4)]
+            err+=f"\n{prefix}_ARTIFACT_PHASE begin={phase}\n"+"\n".join("OWNED_GRAPHICS_TRACE "+json.dumps(e) for e in capture)+f"\n{prefix}_ARTIFACT_PHASE end={phase} air={5 if phase.endswith('cold') else 0} libraries_max={5 if phase.endswith('cold') else 0}"
+        self.assertEqual(runner.pipeline_native_msaa_failures(out,err),[])
+        self.assertTrue(runner.pipeline_native_msaa_failures(out.replace("value=ff332211","value=ff332212",1),err))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"status": 4','"status": 5')))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"native_msaa_sample_count": 2','"native_msaa_sample_count": 0')))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"event": "native_render_end"','"event": "msaa_producer_wait"')))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"wait_count": 1','"wait_count": 0',1)))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"producer": 10','"producer": 11',1)))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"event": "msaa_producer_wait"','"event": "native_render_begin"',1)))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"event": "submit"','"event": "fake_submit"',1)))
+        malformed=next(line for line in err.splitlines() if '"event": "native_msaa_draw_record"' in line)
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace(malformed,"OWNED_GRAPHICS_TRACE []",1)))
 
 
 if __name__ == "__main__":

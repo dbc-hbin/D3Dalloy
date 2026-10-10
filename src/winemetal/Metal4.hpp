@@ -35,6 +35,17 @@ public:
   void setSamplerState(uint64_t resource_id, uint64_t index) { Metal4Invoke(WMTMetal4TableSampler, handle, resource_id, index); }
 };
 
+class TextureViewPool : public Object {
+public:
+  uint64_t setTextureView(Texture texture, const WMTTextureViewPoolInfo &info, uint32_t index) {
+    return Metal4Invoke(WMTMetal4SetTextureView, handle, texture.handle, Metal4CPUPointer(&info), index).ret[0];
+  }
+  uint64_t copyTextureView(TextureViewPool source, uint32_t from, uint32_t to, Texture parent, const WMTTextureViewPoolInfo &info) {
+    return Metal4Invoke(WMTMetal4CopyTextureViews, handle, source.handle, from, to, parent.handle, Metal4CPUPointer(&info)).ret[0];
+  }
+  void clear(uint32_t index) { Metal4Invoke(WMTMetal4ClearTextureView, handle, index); }
+};
+
 class MTL4Submission : public Object {
 public:
   void waitUntilCompleted() { Metal4Invoke(WMTMetal4WaitSubmission, handle); }
@@ -133,6 +144,9 @@ public:
 
 class MTL4RenderCommandEncoder : public MTL4CommandEncoder {
 public:
+  void setColorAttachmentMap(const uint8_t *indices) {
+    Metal4Invoke(WMTMetal4SetColorAttachmentMap, handle, Metal4CPUPointer(indices));
+  }
   void encodeCommands(const wmtcmd_render_nop *commands) {
     Metal4Invoke(WMTMetal4RenderCommands, handle, commands ? WMTGetGuestWindowBase() + uintptr_t(commands) : 0);
   }
@@ -233,6 +247,9 @@ inline void MTL4CommandQueue::waitForEvent(Event event, uint64_t value) { Metal4
 inline void MTL4CommandQueue::waitForDrawable(MetalDrawable drawable) { Metal4Invoke(WMTMetal4WaitDrawable, handle, drawable.handle); }
 inline void MTL4CommandQueue::signalDrawable(MetalDrawable drawable) { Metal4Invoke(WMTMetal4SignalDrawable, handle, drawable.handle); }
 inline bool Device::supportsMetal4() { return Metal4Invoke(WMTMetal4Supports, handle).ret[0] != 0; }
+inline Reference<TextureViewPool> Device::newTextureViewPool(uint32_t count, Buffer argument_buffer) {
+  return Reference<TextureViewPool>(Metal4Invoke(WMTMetal4NewTextureViewPool, handle, count, argument_buffer.handle).ret[0]);
+}
 inline Reference<MTL4CommandAllocator> Device::newMTL4CommandAllocator() { return Reference<MTL4CommandAllocator>(Metal4Invoke(WMTMetal4NewAllocator, handle).ret[0]); }
 inline Reference<MTL4CommandBuffer> Device::newMTL4CommandBuffer() { return Reference<MTL4CommandBuffer>(Metal4Invoke(WMTMetal4NewCommandBuffer, handle).ret[0]); }
 inline Reference<MTL4ArgumentTable> Device::newMTL4ArgumentTable(uint32_t buffers, uint32_t textures, uint32_t samplers, bool strides) {

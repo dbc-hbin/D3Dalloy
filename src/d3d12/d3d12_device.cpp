@@ -23,6 +23,7 @@
 #include "d3d12_format_support.hpp"
 #include "d3d12_pageable.hpp"
 #include "d3d12_pipeline_library.hpp"
+#include "d3d12_pipeline_cache.hpp"
 #include "d3d12_resource_contract.hpp"
 #include "d3d12_state_object.hpp"
 #include "d3d12_matrix.hpp"
@@ -122,6 +123,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
 
   Com<IMTLDXGIAdapter> adapter_;
   WMT::Reference<WMT4::Compiler> metal4_compiler_;
+  DeviceShaderArtifactCache shader_artifact_cache_;
   bool center_sample_positions_supported_ = false;
   /* IOKit gpu-core-count of this adapter; 0 when the registry lookup fails. */
   uint32_t gpu_core_count_ = 0;
@@ -378,6 +380,10 @@ public:
   WMT4::Compiler
   GetMetal4Compiler() override {
     return metal4_compiler_;
+  }
+
+  DeviceShaderArtifactCache &GetShaderArtifactCache() override {
+    return shader_artifact_cache_;
   }
 
   bool

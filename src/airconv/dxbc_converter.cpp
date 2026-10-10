@@ -44,6 +44,31 @@
 using dxmt::dxil::SM50CompiledBitcodeInternal;
 using dxmt::dxil::SM50ErrorInternal;
 
+void dxmt::dxbc::initialize_sample_mask_constant(
+    llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args) {
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *constant = nullptr;
+  if (!args_get_data<SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(args, &constant))
+    return;
+  auto &context = module.getContext();
+  auto *type = llvm::Type::getInt32Ty(context);
+  auto *global = new llvm::GlobalVariable(module, type, true, llvm::GlobalValue::LinkOnceODRLinkage,
+      llvm::UndefValue::get(type), "dxmt_sample_mask.MTL_FC_INIT_0_j", nullptr,
+      llvm::GlobalValue::NotThreadLocal, 2, true);
+  global->setVisibility(llvm::GlobalValue::HiddenVisibility);
+  global->setSection("air.fc_initializer");
+  global->setAlignment(llvm::Align(4));
+  module.getOrInsertNamedMetadata("air.function_constants")->addOperand(llvm::MDNode::get(context, {
+      llvm::ValueAsMetadata::get(global), llvm::MDString::get(context, "uint"),
+      llvm::MDString::get(context, "dxmt_sample_mask"),
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(type, 0))}));
+}
+
+llvm::Value *dxmt::dxbc::pixel_sample_mask(context ctx) {
+  if (auto *constant = ctx.module.getGlobalVariable("dxmt_sample_mask.MTL_FC_INIT_0_j"))
+    return ctx.builder.CreateLoad(ctx.builder.getInt32Ty(), constant);
+  return ctx.builder.getInt32(ctx.pso_sample_mask);
+}
+
 /** Hands the error object to the caller, or releases it when none was asked for. */
 static void failCall(SM50ErrorInternal *errorObj, sm50_error_t *ppError) {
   if (ppError)
@@ -773,6 +798,7 @@ llvm::Error convert_dxbc_pixel_shader(
       p(sig_ctx);
     }
   }
+  initialize_sample_mask_constant(module, pArgs);
   if (pso_sample_mask != 0xffffffff || coarse_mask_output) {
     auto assigned_index =
       func_signature.DefineOutput(air::OutputCoverageMask{});
@@ -782,7 +808,7 @@ llvm::Error convert_dxbc_pixel_shader(
         if (ctx.resource.coverage_mask_reg)
           return value;
         return builder.CreateInsertValue(
-          value, builder.getInt32(ctx.pso_sample_mask), {assigned_index}
+          value, pixel_sample_mask(ctx), {assigned_index}
         );
       });
     };
@@ -810,6 +836,8 @@ llvm::Error convert_dxbc_pixel_shader(
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
   auto epilogue_bb = llvm::BasicBlock::Create(context, "epilogue", function);
+  setup_metal_version(module, metal_version);
+  if (msaa_pixel) dxmt::msaa::preparePixelTarget(module, *msaa_pixel);
   llvm::IRBuilder<> builder(entry_bb);
   llvm::raw_null_ostream nulldbg{};
   llvm::air::AIRBuilder air(
@@ -819,8 +847,6 @@ llvm::Error convert_dxbc_pixel_shader(
       },
       builder, nulldbg
   );
-
-  setup_metal_version(module, metal_version);
 
   resource_map.input.ptr_int4 =
     builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_input_register));
@@ -1699,6 +1725,7 @@ pRefl->ConstanttBufferTableBindIndex =
   pRefl->NumConstantBuffers = shader->args_reflection_cbuffer.size();
   pRefl->NumArguments = shader->args_reflection.size();
   pRefl->HasAtomic64 = 0;
+  pRefl->PSCoverageInputs = 0;
   if (shader->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER ||
       shader->shader_type == microsoft::D3D12_SB_MESH_SHADER ||
       shader->shader_type == microsoft::D3D12_SB_AMPLIFICATION_SHADER) {
@@ -1769,6 +1796,8 @@ pRefl->ConstanttBufferTableBindIndex =
     pRefl->PixelShader.ValidRenderTargets = shader->pso_valid_output_reg_mask;
     pRefl->PixelShader.HasCoverageOutput = shader->ps_has_coverage_output;
     pRefl->PixelShader.SampleFrequency = shader->ps_sample_frequency;
+    pRefl->PSCoverageInputs = (shader->ps_has_coverage_input ? SM50_PIXEL_COVERAGE_INPUT : 0u) |
+                             (shader->ps_has_inner_coverage_input ? SM50_PIXEL_INNER_COVERAGE_INPUT : 0u);
     pRefl->PSForceEarlyDepthStencil = shader->ps_force_early_depth_stencil;
   }
   pRefl->NumOutputElement = shader->max_output_register;
@@ -2448,7 +2477,11 @@ AIRCONV_API int SM50Compile(
 
     metallib::MetallibWriter writer;
 
-    writer.Write(*pModule, OS);
+    if (auto error = writer.Write(*pModule, OS)) {
+      reportError(std::move(error), errorOut);
+      failCall(errorObj, ppError);
+      return 1;
+    }
 
     info.reset();
 
@@ -2532,10 +2565,9 @@ AIRCONV_API int SM50Compile(
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
-  auto compiled = new SM50CompiledBitcodeInternal();
+  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      delete compiled;
       reportError(std::move(error), errorOut);
       failCall(errorObj, ppError);
       return 1;
@@ -2546,11 +2578,15 @@ AIRCONV_API int SM50Compile(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  if (auto error = writer.Write(*pModule, OS)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
 
   pModule.reset();
 
-  *ppBitcode = (sm50_bitcode_t)compiled;
+  *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
 
@@ -2617,10 +2653,9 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
-  auto compiled = new SM50CompiledBitcodeInternal();
+  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      delete compiled;
       reportError(std::move(error), errorOut);
       failCall(errorObj, ppError);
       return 1;
@@ -2631,11 +2666,15 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  if (auto error = writer.Write(*pModule, OS)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
 
   pModule.reset();
 
-  *ppBitcode = (sm50_bitcode_t)compiled;
+  *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
 
@@ -2712,10 +2751,9 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
-  auto compiled = new SM50CompiledBitcodeInternal();
+  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      delete compiled;
       reportError(std::move(error), errorOut);
       failCall(errorObj, ppError);
       return 1;
@@ -2726,11 +2764,15 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  if (auto error = writer.Write(*pModule, OS)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
 
   pModule.reset();
 
-  *ppBitcode = (sm50_bitcode_t)compiled;
+  *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
 
@@ -2804,10 +2846,9 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
-  auto compiled = new SM50CompiledBitcodeInternal();
+  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      delete compiled;
       reportError(std::move(error), errorOut);
       failCall(errorObj, ppError);
       return 1;
@@ -2818,11 +2859,15 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  if (auto error = writer.Write(*pModule, OS)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
 
   pModule.reset();
 
-  *ppBitcode = (sm50_bitcode_t)compiled;
+  *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
 
@@ -2899,10 +2944,9 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   runOptimizationPasses(*pModule);
 
   // Serialize AIR
-  auto compiled = new SM50CompiledBitcodeInternal();
+  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      delete compiled;
       reportError(std::move(error), errorOut);
       failCall(errorObj, ppError);
       return 1;
@@ -2913,11 +2957,15 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  if (auto error = writer.Write(*pModule, OS)) {
+    reportError(std::move(error), errorOut);
+    failCall(errorObj, ppError);
+    return 1;
+  }
 
   pModule.reset();
 
-  *ppBitcode = (sm50_bitcode_t)compiled;
+  *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
 

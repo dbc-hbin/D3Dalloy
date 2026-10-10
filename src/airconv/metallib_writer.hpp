@@ -1,5 +1,6 @@
 #pragma once
 #include "llvm/IR/Module.h"
+#include "llvm/Support/Error.h"
 #include <cstdint>
 #include <array>
 
@@ -121,7 +122,7 @@ static_assert(sizeof(MTLB_VATY) == 2, "");
 class MetallibWriter {
 
 public:
-  void Write(const llvm::Module &module, llvm::raw_ostream &OS);
+  llvm::Error Write(const llvm::Module &module, llvm::raw_ostream &OS);
 };
 
 } // namespace dxmt::metallib

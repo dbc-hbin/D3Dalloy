@@ -22,6 +22,8 @@
 #include "dxmt_command_clear.hpp"
 #include "dxmt_ring_bump_allocator.hpp"
 #include "owned_submission_storage.hpp"
+#include <source_location>
+#include <unordered_set>
 
 namespace dxmt {
 
@@ -57,6 +59,9 @@ struct IndirectComputeCommandData {
   uint32_t tgsize_z;
   uint64_t pipeline_statistics;
 };
+static_assert(sizeof(IndirectComputeCommandData) == 96);
+static_assert(offsetof(IndirectComputeCommandData, tgsize_x) == 76);
+static_assert(offsetof(IndirectComputeCommandData, pipeline_statistics) == 88);
 
 // One stable entry head per recording, owned by its allocator arena. The
 // frontend may Reset the same command-list object onto another allocator
@@ -82,6 +87,10 @@ struct RecordedStateEvent {
 struct RecordingHead : EncoderData {
   std::atomic<uint32_t> in_flight{0};
   std::vector<RecordedStateEvent> state_events;
+  std::vector<RecordedBoundary> boundaries;
+  std::vector<Com<ID3D12DescriptorHeap>> descriptor_heaps;
+  std::vector<Rc<BufferAllocation>> root_allocations;
+  std::unordered_set<BufferAllocation *> root_allocation_set;
 };
 
 class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllocator> {
@@ -104,11 +113,18 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
     uint64_t address;
     size_t capacity;
     size_t used = 0;
+    uint64_t id = owned_graphics::NewObjectId();
+    uint64_t created_epoch = 0;
+    uint64_t last_used_epoch = UINT64_MAX;
   };
   std::vector<GPUHeapChunk> gpu_heap_chunks_;
+  size_t gpu_heap_active_ = 0;
+  uint64_t gpu_heap_epoch_ = 0;
+  const uint64_t trace_id_ = owned_graphics::NewObjectId();
 
   EncoderData *encoder_last = nullptr;
   EncoderData *encoder_current = nullptr;
+  RecordingHead *recording_head_ = nullptr;
   size_t encoder_count_ = 0;
 
   // Closed command-list entry pointers may outlive the list object while a
@@ -125,6 +141,18 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   uint64_t copy_temp_version_;
 
 public:
+  uint64_t GetTraceId() const { return trace_id_; }
+  RecordedBoundary &RecordBoundary(RecordedBoundaryReason reason) {
+    auto *anchor = encoder_current ? encoder_current : encoder_last;
+    const auto *command = anchor && anchor->type == EncoderType::Render
+        ? static_cast<RenderEncoderData *>(anchor)->cmd_tail :
+        anchor && anchor->type == EncoderType::Compute ? static_cast<ComputeEncoderData *>(anchor)->cmd_tail :
+        anchor && anchor->type == EncoderType::Blit ? static_cast<BlitEncoderData *>(anchor)->cmd_tail : nullptr;
+    auto &boundary = recording_head_->boundaries.emplace_back();
+    boundary.encoder = anchor; boundary.command = command; boundary.reason = reason;
+    boundary.state_event_index = recording_head_->state_events.size();
+    return boundary;
+  }
   MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type);
 
   bool CaptureSubmission(uint64_t generation) {
@@ -167,9 +195,12 @@ public:
   );
 
   void
-  InvalidateCurrentPass() {
+  InvalidateCurrentPass(std::source_location source = std::source_location::current()) {
     if (!encoder_current)
       return;
+    owned_graphics::Trace("pass_end", ",\"encoder\":", encoder_current->id,
+                          ",\"type\":", uint32_t(encoder_current->type),
+                          ",\"line\":", source.line(), ",\"function\":\"", source.function_name(), "\"");
     encoder_last->next = encoder_current;
     encoder_last = encoder_current;
 
@@ -177,11 +208,17 @@ public:
     encoder_count_++;
   }
 
+  void EndSchedulingPass() {
+    if (encoder_current) encoder_current->endpoint_reason = RecordedEndpointReason::Scheduling;
+    InvalidateCurrentPass();
+  }
+
   HRESULT
   StartRecord(EncoderData **pStartEncoder) {
     if (encoder_last)
       return E_INVALIDARG;
     auto &head = encoder_lists_.emplace_back();
+    recording_head_ = &head;
     head.type = EncoderType::Null;
     head.next = nullptr;
     head.id = 0;
@@ -193,9 +230,12 @@ public:
   EndRecord(size_t *pEncoderCount) {
     if (!encoder_last)
       return E_FAIL;
-    if (encoder_current)
+    if (encoder_current) {
+      encoder_current->endpoint_reason = RecordedEndpointReason::ListEnd;
       InvalidateCurrentPass();
+    }
     encoder_last = nullptr;
+    recording_head_ = nullptr;
     *pEncoderCount = encoder_count_;
     encoder_count_ = 0;
     return S_OK;
@@ -250,6 +290,10 @@ public:
   EncodeBlitCommand() {
     assert(encoder_current->type == EncoderType::Blit);
     auto encoder = static_cast<BlitEncoderData *>(encoder_current);
+    if constexpr (std::is_same_v<cmd_struct, wmtcmd_blit_copy_from_buffer_to_buffer>)
+      ++encoder->submission_copy_count;
+    else
+      encoder->submission_access_complete = false;
     auto storage = (cmd_struct *)AllocateCPUHeap(sizeof(cmd_struct), 16);
     encoder->cmd_tail->next.set(storage);
     encoder->cmd_tail = (wmtcmd_base *)storage;
@@ -313,10 +357,19 @@ public:
       return {nullptr, 0};
     if (!ReserveGPUHeap(Length, Alignment))
       return {nullptr, SIZE_MAX};
-    auto &chunk = gpu_heap_chunks_.back();
+    auto &chunk = gpu_heap_chunks_[gpu_heap_active_];
     const size_t adjustment = (-chunk.used) & (Alignment - 1);
     const auto aligned = chunk.used + adjustment;
+    if (!chunk.used && chunk.created_epoch < gpu_heap_epoch_)
+      owned_graphics::Trace("root_upload_reuse", ",\"allocator\":", trace_id_, ",\"chunk\":", chunk.id,
+                            ",\"epoch\":", gpu_heap_epoch_, ",\"buffer\":", chunk.buffer.handle,
+                            ",\"va\":", chunk.address, ",\"capacity\":", chunk.capacity);
     chunk.used = aligned + Length;
+    chunk.last_used_epoch = gpu_heap_epoch_;
+    owned_graphics::Trace("root_upload_allocate", ",\"allocator\":", trace_id_, ",\"chunk\":", chunk.id,
+                          ",\"epoch\":", gpu_heap_epoch_, ",\"buffer\":", chunk.buffer.handle,
+                          ",\"va\":", chunk.address + aligned, ",\"begin\":", chunk.begin,
+                          ",\"offset\":", aligned, ",\"size\":", Length, ",\"alignment\":", Alignment);
     return {ptr_add(chunk.memory, aligned), chunk.begin + aligned};
   }
 

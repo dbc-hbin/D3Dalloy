@@ -40,6 +40,8 @@ struct Core {
   WMTMetal4FXTemporalInfo info{};
   std::mutex mutex;
   std::shared_ptr<Generation> generation;
+  std::array<std::shared_ptr<Generation>, 8> generations{};
+  size_t nextGenerationSlot = 0;
   std::vector<std::unique_ptr<Resources>> pool;
   uint64_t lastGeneration = 0;
   float lastJitterX = 0, lastJitterY = 0;
@@ -131,10 +133,15 @@ void matrix(simd_float4x4 &result, const float *input) {
 }
 std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFrame &p) {
   const bool hit = p.specular_hit_distance != 0, reactive = p.reactive != 0;
-  if (core.generation && core.generation->width == p.input_width &&
-      core.generation->height == p.input_height && core.generation->outputWidth == p.output_rect.width &&
-      core.generation->outputHeight == p.output_rect.height && core.generation->hit == hit &&
-      core.generation->reactive == reactive) return core.generation;
+  for (const auto &cached : core.generations) {
+    if (cached && cached->width == p.input_width && cached->height == p.input_height &&
+        cached->outputWidth == p.output_rect.width && cached->outputHeight == p.output_rect.height &&
+        cached->hit == hit && cached->reactive == reactive) {
+      // History is reset by encode order (lastGeneration), not descriptor lookup.
+      core.generation = cached;
+      return cached;
+    }
+  }
   static std::atomic<uint64_t> next{1};
   auto result = std::make_shared<Generation>(next.fetch_add(1, std::memory_order_relaxed));
   MTLFXTemporalDenoisedScalerDescriptor *d = [MTLFXTemporalDenoisedScalerDescriptor new];
@@ -148,7 +155,7 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     d.reactiveMaskTextureEnabled = reactive; d.reactiveMaskTextureFormat = MTLPixelFormatR16Float;
     d.specularHitDistanceTextureEnabled = hit;
     d.autoExposureEnabled = (core.info.feature_flags & 64) != 0;
-    d.requiresSynchronousInitialization = YES;
+    d.requiresSynchronousInitialization = NO;
     // Apple non-fused GPU backend avoids the macOS 27 fused UBF K44 weight overread.
     if (![d respondsToSelector:@selector(setVersion:)]) return {};
     [d setVersion:0x10000];
@@ -157,6 +164,8 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     result->width = p.input_width; result->height = p.input_height;
     result->outputWidth = p.output_rect.width; result->outputHeight = p.output_rect.height;
     result->hit = hit; result->reactive = reactive;
+    core.generations[core.nextGenerationSlot] = result;
+    core.nextGenerationSlot = (core.nextGenerationSlot + 1) % core.generations.size();
     core.generation = result;
     return result;
   } @finally { [d release]; }
@@ -437,7 +446,7 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
     scaler.motionVectorScaleX = scaler.motionVectorScaleY = 1;
     scaler.shouldResetHistory = reset; scaler.depthReversed = (core.info.feature_flags & 8) != 0;
     simd_float4x4 world, projection; matrix(world,p.world_to_view); matrix(projection,p.view_to_clip);
-    scaler.worldToViewMatrix = world; scaler.viewToClipMatrix = projection; scaler.fence = nil;
+    scaler.worldToViewMatrix = world; scaler.viewToClipMatrix = projection; scaler.fence = fence;
     [scaler encodeToCommandBuffer:command];
     command = (id<MTL4CommandBuffer>)winemetal_metal4_split_command_buffer((void *)call->args[0]);
     if (!command) return true;

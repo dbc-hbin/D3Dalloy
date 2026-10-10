@@ -394,22 +394,20 @@ public:
 
     if (is_compute)
       source
-          << "[[kernel]] void resolve_indirect_commands([[thread_position_in_grid]] uint x, constant dxmt_compute_command_data";
+          << "[[kernel]] void resolve_indirect_commands([[thread_position_in_grid]] uint i, constant dxmt_compute_command_data";
     else
       source << "[[vertex]] void resolve_indirect_commands(uint i [[vertex_id]], constant dxmt_render_command_data";
     source << " &command_data [[buffer(30)]]) {\n";
 
     if (is_compute)
-      source << "if (x !=0 ) return;\n";
+      source << "if (ulong(i) >= command_data.max_count) return;\n";
 
     source << "uint count = command_data.max_count_buffer ? "
               "command_data.max_count_buffer[0] : command_data.max_count;\n";
     source << "if (command_data.predicate && (command_data.predicate_op ? command_data.predicate[0] != 0 : "
               "command_data.predicate[0] == 0)) count = 0;\n";
-    if (is_compute)
-      source << "for (uint i = 0; i < command_data.max_count; i++) {\n";
     source << "device d3d12_arguments& arg = reinterpret_cast<device d3d12_arguments *>("
-              "command_data.argument_buffer + i * "
+              "command_data.argument_buffer + " << (is_compute ? "ulong(i)" : "i") << " * "
            << pDesc->ByteStride << ")[0];\n";
     if (is_compute) {
       source << "compute_command cmd(command_data.cmd_buf, i);\n";
@@ -417,12 +415,12 @@ public:
       source << "render_command cmd(command_data.cmd_buf, i);\n";
     }
     source << "cmd.reset();\n";
-    source << "if (i >= count) " << (is_compute ? "continue" : "return") << ";\n";
+    source << "if (i >= count) return;\n";
     if (!is_compute)
       source << "if (command_data.so_draws && (!command_data.so_draws[i].args.vertex_count || "
                 "!command_data.so_draws[i].args.instance_count)) return;\n";
     source << "device ulong * rootsig_qwords = command_data.rootsig_qwords ? command_data.rootsig_qwords + "
-              "(i * command_data.rootsig_qwords_stride) : nullptr;\n";
+           << "(" << (is_compute ? "ulong(i)" : "i") << " * command_data.rootsig_qwords_stride) : nullptr;\n";
     if (!is_compute)
       source << "device dxmt_vertex_buffer * vertex_buffer = "
                 "reinterpret_cast<device dxmt_vertex_buffer *>(command_data.vertex_buffer + "
@@ -626,8 +624,6 @@ public:
       }
     }
 
-    if (is_compute)
-      source << "}\n";
     source << "};\n";
     if (updates_graphics_bindings) {
       source << "void update_graphics_bindings(device d3d12_arguments &arg, device ulong *rootsig_qwords, "

@@ -14,6 +14,7 @@
 #include "air_signature.hpp"
 #include "airconv_context.hpp"
 #include "airconv_public.h"
+#include "msaa_pixel.hpp"
 #include "nt/air_builder.hpp"
 
 #include "llvm/ADT/SmallVector.h"
@@ -636,7 +637,7 @@ void declare_pixel_signature(
           return ctx.builder.CreateInsertValue(
             value,
             ctx.pso_sample_mask != 0xffffffff
-              ? ctx.builder.CreateAnd(mask, ctx.builder.getInt32(ctx.pso_sample_mask))
+              ? ctx.builder.CreateAnd(mask, dxbc::pixel_sample_mask(ctx))
               : mask,
             {air_index}
           );
@@ -1633,6 +1634,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
       vertex_index_args = dxbc::define_vertex_index_pull(func_signature);
   }
 
+  dxbc::initialize_sample_mask_constant(module_ir, args);
   if (module.stage == Stage::Pixel && (pso_sample_mask != 0xffffffff || coarse_mask_output)) {
     auto assigned_index = func_signature.DefineOutput(air::OutputCoverageMask{});
     epilogue >> [=](dxbc::pvalue value) -> dxbc::IRValue {
@@ -1640,7 +1642,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
         if (ctx.resource.coverage_mask_reg)
           return value;
         return ctx.builder.CreateInsertValue(
-          value, ctx.builder.getInt32(ctx.pso_sample_mask), {assigned_index}
+          value, dxbc::pixel_sample_mask(ctx), {assigned_index}
         );
       });
     };
@@ -1679,9 +1681,13 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   }
   for (auto *call : coverage_inputs) {
     llvm::Value *coverage = function->getArg(coverage_input_arg);
-    if (pso_sample_mask != 0xffffffff)
-      coverage = llvm::BinaryOperator::CreateAnd(coverage, llvm::ConstantInt::get(coverage->getType(),
-                                                 pso_sample_mask), "coverage", call);
+    if (pso_sample_mask != 0xffffffff) {
+      llvm::IRBuilder<> builder(call);
+      llvm::Value *mask = builder.getInt32(pso_sample_mask);
+      if (auto *constant = module_ir.getGlobalVariable("dxmt_sample_mask.MTL_FC_INIT_0_j"))
+        mask = builder.CreateLoad(builder.getInt32Ty(), constant);
+      coverage = builder.CreateAnd(coverage, mask, "coverage");
+    }
     call->replaceAllUsesWith(coverage);
     call->eraseFromParent();
   }
@@ -1693,6 +1699,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
 
   auto *entry_bb = llvm::BasicBlock::Create(llvm_context, "entry", function);
   auto *epilogue_bb = llvm::BasicBlock::Create(llvm_context, "epilogue", function);
+  dxbc::setup_metal_version(module_ir, metal_version);
+  if (inner_pixel) dxmt::msaa::preparePixelTarget(module_ir, *inner_pixel);
   llvm::IRBuilder<> builder(entry_bb);
   llvm::raw_null_ostream nulldbg{};
   llvm::air::AIRBuilder air(
@@ -1702,8 +1710,6 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     },
     builder, nulldbg
   );
-
-  dxbc::setup_metal_version(module_ir, metal_version);
 
   if (module.stage == Stage::Vertex) {
     resource_map.vertex_id_with_base = function->getArg(vertex_idx);

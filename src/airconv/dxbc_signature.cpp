@@ -656,7 +656,7 @@ void handle_signature_ps(
             return ctx.builder.CreateInsertValue(
               v,
               ctx.pso_sample_mask != 0xffffffff
-                ? ctx.builder.CreateAnd(odepth, ctx.pso_sample_mask)
+                ? ctx.builder.CreateAnd(odepth, pixel_sample_mask(ctx))
                 : odepth,
               {assigned_index}
             );

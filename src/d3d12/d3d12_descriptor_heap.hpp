@@ -188,6 +188,8 @@ public:
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
   virtual void SetDescriptorOwner(UINT index, uint64_t owner_id, uint64_t counter_owner_id = 0) = 0;
+  /* Native identity allows a recording to retain the descriptor pool and its backing residency. */
+  virtual WMT::Buffer GetArgumentBuffer() const = 0;
 
   virtual HRESULT
   AddShaderResourceView(UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp,
@@ -245,6 +247,9 @@ public:
                              const UINT *UintBorderColor = nullptr) = 0;
 
   virtual void CopyDescriptors(UINT From, MTLD3D12SamplerDescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) = 0;
+
+  // Borrowed stable shader-visible storage; retain the heap through GPU retirement.
+  virtual WMT::Buffer GetArgumentBuffer() const = 0;
 };
 
 struct MTL_RENDER_TARGET_DESC {

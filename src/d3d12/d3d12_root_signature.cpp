@@ -783,7 +783,7 @@ public:
           const uint64_t offset = range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
                                       ? previous_end : range.OffsetInDescriptorsFromTableStart;
           table_ranges_.push_back({offset, range.NumDescriptors, range.RangeType,
-              range.RegisterSpace, range.BaseShaderRegister, parameter.ShaderVisibility});
+              range.RegisterSpace, range.BaseShaderRegister, parameter.ShaderVisibility, range.Flags});
           HasTextureDescriptorTables |= range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
                                         range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
           previous_end = offset + range.NumDescriptors;

@@ -1896,12 +1896,12 @@ AIRBuilder::CreateRead(
   Tys.push_back(getTextureHandleType(Texture));
   Ops.push_back(Handle);
 
-  // AIR 2.9 reads take the built-in read sampler and explicit offsets.
-  // Advertising 2.9 with the legacy signature crashes TextureCheckPass before
+  // AIR 2.8 reads take the built-in read sampler and explicit offsets.
+  // Advertising 2.8 with the legacy signature crashes TextureCheckPass before
   // PSO creation; older AIR modules retain their original intrinsic ABI.
   auto *airVersion = getModule()->getNamedMetadata("air.version");
   bool modernRead = airVersion && airVersion->getNumOperands() &&
-      mdconst::extract<ConstantInt>(airVersion->getOperand(0)->getOperand(1))->getZExtValue() >= 9;
+      mdconst::extract<ConstantInt>(airVersion->getOperand(0)->getOperand(1))->getZExtValue() >= 8;
   if (modernRead) {
     auto *samplerType = getSamplerHandleType();
     auto sampler = getModule()->getOrInsertFunction(
@@ -1937,7 +1937,9 @@ AIRBuilder::CreateRead(
     Ops.push_back(SampleIndexOrCubeFace);
   }
 
-  if (modernRead && !TexInfo.is_ms && Texture.kind != Texture::texture_buffer) {
+  if (modernRead && (Texture.kind == Texture::texture2d || Texture.kind == Texture::texture2d_array ||
+                     Texture.kind == Texture::texture3d || Texture.kind == Texture::depth2d ||
+                     Texture.kind == Texture::depth2d_array)) {
     auto *offsetType = getTextureRWPositionType(Texture);
     Tys.push_back(offsetType);
     Ops.push_back(Constant::getNullValue(offsetType));

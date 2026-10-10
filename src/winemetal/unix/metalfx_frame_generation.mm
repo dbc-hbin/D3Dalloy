@@ -163,6 +163,17 @@ Object privateTexture(id<MTLDevice> device, MTLPixelFormat format,
     return result;
 }
 
+// FG has no public color offset selector; color/UI conversion stays staged.
+const char* inputStagingReason(id<MTLTexture> texture, MTLPixelFormat format,
+                               NSUInteger width, NSUInteger height,
+                               MTLTextureUsage usage, bool conversion) {
+    if (conversion) return "numerical_conversion";
+    if (texture.width != width || texture.height != height) return "descriptor_capacity";
+    if (texture.pixelFormat != format) return "descriptor_format";
+    if ((texture.usage & usage) != usage) return "native_usage";
+    return nullptr;
+}
+
 // MetalFX retains the per-frame resources assigned to the cached interpolator.
 // The execution lease owns them for GPU lifetime, so drop the interpolator's
 // references on every exit from encode, including failures and exceptions.
@@ -718,6 +729,24 @@ bool PreparedFrame::encode(
                 if (!interpolator) return fail("encode_interpolator");
                 auto effect = (id<MTLFXFrameInterpolatorBase>)interpolator.get();
                 auto device = (id<MTLDevice>)configuration.device.get();
+                const auto& p = impl_->snapshot->parameters;
+                const auto& d = impl_->dispatch;
+                const bool displayMotion = (impl_->state->creation.flags &
+                    WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
+                const NSUInteger motionTargetWidth = displayMotion
+                    ? impl_->state->creation.display_width : p.render_width;
+                const NSUInteger motionTargetHeight = displayMotion
+                    ? impl_->state->creation.display_height : p.render_height;
+                const bool motionConversion = p.motion_scale_x != 1 || p.motion_scale_y != 1 ||
+                    motionTargetWidth != configuration.outputWidth ||
+                    motionTargetHeight != configuration.outputHeight ||
+                    (impl_->state->creation.flags & WMTFG_MOTION_VECTORS_JITTERED);
+                const bool directDepth = !inputStagingReason(
+                    (id<MTLTexture>)impl_->snapshot->depth.get(), configuration.depth,
+                    configuration.width, configuration.height, effect.depthTextureUsage, false);
+                const bool directMotion = !inputStagingReason(
+                    (id<MTLTexture>)impl_->snapshot->motion.get(), configuration.motion,
+                    configuration.width, configuration.height, effect.motionTextureUsage, motionConversion);
                 Object current = privateTexture(device, configuration.color,
                     configuration.outputWidth, configuration.outputHeight,
                     effect.colorTextureUsage | MTLTextureUsageShaderWrite);
@@ -725,10 +754,10 @@ bool PreparedFrame::encode(
                     privateTexture(device, configuration.ui, configuration.outputWidth,
                                    configuration.outputHeight, effect.uiTextureUsage |
                                    MTLTextureUsageShaderWrite);
-                Object normalizedDepth = privateTexture(device, configuration.depth,
+                Object normalizedDepth = directDepth ? impl_->snapshot->depth : privateTexture(device, configuration.depth,
                     configuration.width, configuration.height,
                     effect.depthTextureUsage | MTLTextureUsageShaderWrite);
-                Object normalizedMotion = privateTexture(device, configuration.motion,
+                Object normalizedMotion = directMotion ? impl_->snapshot->motion : privateTexture(device, configuration.motion,
                     configuration.width, configuration.height,
                     effect.motionTextureUsage | MTLTextureUsageShaderWrite);
                 Object output = privateTexture(device, configuration.color,
@@ -773,8 +802,6 @@ bool PreparedFrame::encode(
                 execution->objects.push_back(presentView);
                 execution->objects.push_back(outputView);
 
-                const auto& p = impl_->snapshot->parameters;
-                const auto& d = impl_->dispatch;
                 FgParams colorParams{};
                 colorParams.sourceOrigin[0] = d.generation_rect_left;
                 colorParams.sourceOrigin[1] = d.generation_rect_top;
@@ -801,8 +828,6 @@ bool PreparedFrame::encode(
                 FgParams motionParams{};
                 motionParams.extent[0] = configuration.width;
                 motionParams.extent[1] = configuration.height;
-                const bool displayMotion = (state.creation.flags &
-                    WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
                 // The generation rectangle is a placement offset, not a source offset.
                 // Resample the complete origin-zero motion domain into the active rect.
                 motionParams.sourceExtent[0] = impl_->snapshot->motionWidth;
@@ -854,14 +879,14 @@ bool PreparedFrame::encode(
                                       (id<MTLBuffer>)colorParameters.get(), colorParams,
                                       execution->objects))
                     return fail("encode_ui_decode");
-                if (!computePass(buffer, (id)fence, device,
+                if (!directDepth && !computePass(buffer, (id)fence, device,
                                  (id<MTLComputePipelineState>)configuration.depthPipeline.get(),
                                  (id<MTLTexture>)impl_->snapshot->depth.get(),
                                  (id<MTLTexture>)normalizedDepth.get(),
                                  (id<MTLBuffer>)depthParameters.get(), depthParams,
                                  execution->objects))
                     return fail("encode_depth_normalize");
-                if (!computePass(buffer, (id)fence, device,
+                if (!directMotion && !computePass(buffer, (id)fence, device,
                                  (id<MTLComputePipelineState>)configuration.motionPipeline.get(),
                                  (id<MTLTexture>)impl_->snapshot->motion.get(),
                                  (id<MTLTexture>)normalizedMotion.get(),
@@ -1189,12 +1214,15 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     state->preparedFrame + 1 == frame && !p->reset;
                 snapshot->previousJitterX = state->preparedJitterX;
                 snapshot->previousJitterY = state->preparedJitterY;
+                auto nativeInputs = (id<MTLFXFrameInterpolatorBase>)configuration->factory.get();
                 snapshot->depth = privateTexture(
                     (id<MTLDevice>)configuration->device.get(), configuration->depth,
-                    p->render_width, p->render_height, MTLTextureUsageShaderRead);
+                    p->render_width, p->render_height,
+                    nativeInputs.depthTextureUsage | MTLTextureUsageShaderRead);
                 snapshot->motion = privateTexture(
                     (id<MTLDevice>)configuration->device.get(), motion.pixelFormat,
-                    motionWidth, motionHeight, MTLTextureUsageShaderRead);
+                    motionWidth, motionHeight,
+                    nativeInputs.motionTextureUsage | MTLTextureUsageShaderRead);
                 if (!snapshot->depth || !snapshot->motion) return finish(Unsupported);
                 state->hasPreparedJitter = true;
                 state->preparedFrame = frame;

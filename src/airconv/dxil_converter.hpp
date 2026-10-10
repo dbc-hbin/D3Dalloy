@@ -369,6 +369,8 @@ struct ShaderMetadata {
   uint32_t output_register_mask = 0;
   uint32_t max_output_register = 0;
   bool has_coverage_output = false;
+  bool has_coverage_input = false;
+  bool has_inner_coverage_input = false;
   bool force_early_depth_stencil = false;
   bool has_atomic64 = false;
   std::vector<SigElement> input_sig;

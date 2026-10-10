@@ -1167,6 +1167,362 @@ void RunIndirectTests(TestContext &context, const std::vector<uint8_t> &computeS
 
 }
 
+void RunPreparedComputeIndirect(TestContext &context, const std::vector<uint8_t> &computeShader) {
+  // GPU writes the argument/count/predicate storage on every closed-list replay.
+  // The existing supplied shader stays unchanged: one thread atomically adds b0.
+  static constexpr char producerSource[] = R"(
+    RWByteAddressBuffer arguments : register(u0);
+    RWByteAddressBuffer controls : register(u1);
+    ByteAddressBuffer input : register(t0);
+    cbuffer Config : register(b0) { uint maximum; uint mutate; uint addressLow; uint addressHigh; };
+    [numthreads(32,1,1)]
+    void main(uint3 tid : SV_DispatchThreadID) {
+      uint i = tid.x;
+      if (i == 0) {
+        controls.Store(0, input.Load(4)); controls.Store(4, 0);
+        controls.Store(16, input.Load(0));
+      }
+      if (i >= maximum) return;
+      uint offset = 16 + i * 32;
+      arguments.Store4(offset, uint4(0,0,0,0));
+      arguments.Store4(offset + 16, uint4(0,0,0,0));
+      if (mutate != 0) { arguments.Store(offset, i + 1); offset += 4; }
+      if (mutate == 2) {
+        uint low = addressLow + i * 8 + 4;
+        arguments.Store2(offset, uint2(low, addressHigh + (low < addressLow ? 1 : 0)));
+        offset += 8;
+      }
+      arguments.Store(offset, mutate != 0 ? 1 : i % 3 + 1);
+      arguments.Store(offset + 4, mutate != 0 || i % 5 != 4 ? 1 : 0);
+      arguments.Store(offset + 8, 1);
+    }
+  )";
+  ComPtr<ID3DBlob> producerShader, errors, serialized;
+  check(D3DCompile(producerSource, sizeof(producerSource)-1, nullptr, nullptr, nullptr,
+                   "main", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &producerShader, &errors),
+        "prepared-compute-producer-compile");
+  D3D12_ROOT_PARAMETER producerParameters[4] = {};
+  producerParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  producerParameters[0].Descriptor.ShaderRegister = 0;
+  producerParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  producerParameters[1].Descriptor.ShaderRegister = 1;
+  producerParameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  producerParameters[2].Descriptor.ShaderRegister = 0;
+  producerParameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  producerParameters[3].Constants.Num32BitValues = 4;
+  D3D12_ROOT_SIGNATURE_DESC producerRootDesc = {};
+  producerRootDesc.NumParameters = 4; producerRootDesc.pParameters = producerParameters;
+  check(D3D12SerializeRootSignature(&producerRootDesc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&errors),
+        "prepared-compute-producer-root-serialize");
+  ComPtr<ID3D12RootSignature> producerRoot;
+  check(context.device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),
+        IID_PPV_ARGS(&producerRoot)),"prepared-compute-producer-root");
+  D3D12_COMPUTE_PIPELINE_STATE_DESC producerDesc = {};
+  producerDesc.pRootSignature = producerRoot.Get();
+  producerDesc.CS = {producerShader->GetBufferPointer(),producerShader->GetBufferSize()};
+  ComPtr<ID3D12PipelineState> producer;
+  check(context.device->CreateComputePipelineState(&producerDesc,IID_PPV_ARGS(&producer)),
+        "prepared-compute-producer-pipeline");
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[1].Constants.Num32BitValues = 1;
+  D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+  rootDesc.NumParameters = 2; rootDesc.pParameters = parameters;
+  check(D3D12SerializeRootSignature(&rootDesc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&errors),
+        "prepared-compute-root-serialize");
+  ComPtr<ID3D12RootSignature> root;
+  check(context.device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),
+        IID_PPV_ARGS(&root)),"prepared-compute-root");
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc = {};
+  pipelineDesc.pRootSignature = root.Get(); pipelineDesc.CS = {computeShader.data(),computeShader.size()};
+  ComPtr<ID3D12PipelineState> pipeline;
+  check(context.device->CreateComputePipelineState(&pipelineDesc,IID_PPV_ARGS(&pipeline)),
+        "prepared-compute-pipeline");
+  const UINT maxima[] = {0,1,31,32,33,4097};
+  for (UINT mode = 0; mode < 5; ++mode) {
+    const bool mutate = mode == 2 || mode == 3;
+    const bool counted = mode == 1 || mode == 3;
+    const bool predicated = mode == 3 || mode == 4;
+    D3D12_INDIRECT_ARGUMENT_DESC descriptions[3] = {};
+    descriptions[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    descriptions[0].Constant.RootParameterIndex = 1;
+    descriptions[0].Constant.Num32BitValuesToSet = 1;
+    descriptions[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW;
+    descriptions[1].UnorderedAccessView.RootParameterIndex = 0;
+    descriptions[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    if (mode == 2) descriptions[1] = descriptions[2];
+    D3D12_COMMAND_SIGNATURE_DESC signatureDesc = {};
+    signatureDesc.ByteStride = 32; signatureDesc.NumArgumentDescs = mode == 3 ? 3 : mutate ? 2 : 1;
+    signatureDesc.pArgumentDescs = descriptions + (mutate ? 0 : 2);
+    ComPtr<ID3D12CommandSignature> signature;
+    check(context.device->CreateCommandSignature(&signatureDesc,mutate ? root.Get() : nullptr,
+          IID_PPV_ARGS(&signature)),"prepared-compute-signature");
+    for (UINT maximum : maxima) {
+      if ((mode == 2 || mode == 4) && maximum != 33)
+        continue;
+      const UINT64 argumentBytes = 16 + UINT64(maximum)*32 + 16;
+      auto arguments = createBuffer(context.device.Get(),argumentBytes,D3D12_HEAP_TYPE_DEFAULT,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+      auto controls = createBuffer(context.device.Get(),32,D3D12_HEAP_TYPE_DEFAULT,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+      auto input = createBuffer(context.device.Get(),8,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+      std::vector<uint32_t> initial(mode == 3 ? 2*maximum+2 : 4);
+      for (UINT i = 0; i < initial.size(); ++i)
+        initial[i] = mode == 3 ? (i%2 == 0 || i == initial.size()-1 ? 0xd00d0000+i : 0) :
+                     i == 0 ? 0xa17e0011 : i == 1 ? 0 : i == 2 ? 0xb28f0022 : 0xc3900033;
+      const UINT64 outputBytes = initial.size()*sizeof(uint32_t);
+      auto initializer = createBuffer(context.device.Get(),outputBytes,D3D12_HEAP_TYPE_UPLOAD,
+                                     D3D12_RESOURCE_STATE_GENERIC_READ);
+      writeUpload(initializer.Get(),initial.data(),outputBytes);
+      auto output = createBuffer(context.device.Get(),outputBytes,D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+      auto readback = createBuffer(context.device.Get(),outputBytes,D3D12_HEAP_TYPE_READBACK,
+                                  D3D12_RESOURCE_STATE_COPY_DEST);
+      ComPtr<ID3D12CommandAllocator> allocator;
+      ComPtr<ID3D12GraphicsCommandList> list;
+      check(context.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),
+            "prepared-compute-allocator");
+      check(context.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),producer.Get(),
+            IID_PPV_ARGS(&list)),"prepared-compute-list");
+      list->CopyBufferRegion(output.Get(),0,initializer.Get(),0,outputBytes);
+      auto outputBarrier = transition(output.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      list->ResourceBarrier(1,&outputBarrier);
+      list->SetComputeRootSignature(producerRoot.Get());
+      list->SetComputeRootUnorderedAccessView(0,arguments->GetGPUVirtualAddress());
+      list->SetComputeRootUnorderedAccessView(1,controls->GetGPUVirtualAddress());
+      list->SetComputeRootShaderResourceView(2,input->GetGPUVirtualAddress());
+      const UINT64 address = output->GetGPUVirtualAddress();
+      const UINT config[] = {maximum,mode == 3 ? 2u : mutate ? 1u : 0u,
+                             static_cast<UINT>(address),static_cast<UINT>(address >> 32)};
+      list->SetComputeRoot32BitConstants(3,4,config,0);
+      list->Dispatch(maximum ? maximum/32 + (maximum%32 != 0) : 1,1,1);
+      D3D12_RESOURCE_BARRIER published[] = {
+        transition(arguments.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        transition(controls.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)};
+      list->ResourceBarrier(2,published);
+      list->SetPipelineState(pipeline.Get());
+      list->SetComputeRootSignature(root.Get());
+      list->SetComputeRootUnorderedAccessView(0,output->GetGPUVirtualAddress()+4);
+      list->SetComputeRoot32BitConstant(1,7,0);
+      if (predicated)
+        list->SetPredication(controls.Get(),0,D3D12_PREDICATION_OP_EQUAL_ZERO);
+      list->ExecuteIndirect(signature.Get(),maximum,arguments.Get(),16,counted ? controls.Get() : nullptr,16);
+      list->SetPredication(nullptr,0,D3D12_PREDICATION_OP_EQUAL_ZERO);
+      // End in the same states used by the first execution, so exact replay
+      // reruns the producer and reuses the recorded resolver/ICB allocation.
+      D3D12_RESOURCE_BARRIER finished[] = {
+        transition(arguments.Get(),D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        transition(controls.Get(),D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        transition(output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE)};
+      list->ResourceBarrier(3,finished);
+      list->CopyBufferRegion(readback.Get(),0,output.Get(),0,outputBytes);
+      outputBarrier = transition(output.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+      list->ResourceBarrier(1,&outputBarrier);
+      check(list->Close(),"prepared-compute-close");
+      const UINT replayCounts[] = {maximum,1,maximum,maximum,maximum,0,maximum+7};
+      const UINT executions = (counted || predicated) && maximum == 33 ? 7 : 1;
+      for (UINT execution = 0; execution < executions; ++execution) {
+        const UINT count = execution ? replayCounts[execution] : maximum;
+        const bool predicate = execution != 3;
+        const UINT values[] = {count,predicate ? 1u : 0u};
+        writeUpload(input.Get(),values,sizeof(values));
+        std::fprintf(stderr,"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode=%u max=%u replay=%u phase=submit_begin\n",
+                     mode,maximum,execution);
+        context.submitClosed(list.Get());
+        std::fprintf(stderr,"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode=%u max=%u replay=%u phase=submit_end\n",
+                     mode,maximum,execution);
+        const UINT active = predicated && !predicate ? 0 :
+                            counted && count < maximum ? count : maximum;
+        UINT expected = 0;
+        for (UINT i = 0; i < active; ++i)
+          expected += mutate ? i+1 : (i%5 != 4 ? 7*(i%3+1) : 0);
+        UINT *observed = nullptr;
+        check(readback->Map(0,nullptr,reinterpret_cast<void **>(&observed)),"prepared-compute-map");
+        UINT sum = 0;
+        if (mode == 3) {
+          for (UINT i = 0; i < initial.size(); ++i) {
+            const bool lane = i%2 == 1 && i < 2*maximum;
+            const UINT value = lane ? (i/2 < active ? i/2+1 : 0) : initial[i];
+            require(observed[i] == value,"prepared-compute-exact-root-uav-lane-and-guard");
+            if (lane) sum += observed[i];
+          }
+          require(sum == expected,"prepared-compute-root-uav-sum");
+        } else {
+          require(observed[0] == initial[0] && observed[1] == expected &&
+                  observed[2] == initial[2] && observed[3] == initial[3],"prepared-compute-exact-value-and-guards");
+          sum = observed[1];
+        }
+        std::printf("OWNED_D3D12_PREDICATION_INDIRECT_PREPARED_COMPUTE_VALUES mode=%u max=%u replay=%u count=%u predicate=%u result=%u guards=%08x,%08x,%08x\n",
+                    mode,maximum,execution,count,predicate,sum,observed[0],observed[initial.size()-2],observed[initial.size()-1]);
+        readback->Unmap(0,nullptr);
+      }
+    }
+  }
+  std::puts("OWNED_D3D12_PREDICATION_INDIRECT_PREPARED_COMPUTE_PASS");
+}
+
+void RunSimpleGraphicsIndirect(TestContext &context) {
+  static constexpr char source[] = R"(
+    struct VOut { float4 position : SV_Position; nointerpolation float4 color : COLOR0; };
+    VOut vs(uint vertex : SV_VertexID, float4 instanceColor : COLOR0, float4 vertexColor : COLOR1) {
+      VOut result;
+      uint corner = vertex % 3;
+      result.position = float4(corner == 2 ? 3 : -1, corner == 1 ? 3 : -1, 0, 1);
+      result.color = float4(vertexColor.r, instanceColor.g, 0, 1);
+      return result;
+    }
+    float4 ps(VOut input) : SV_Target0 { return input.color; }
+  )";
+  ComPtr<ID3DBlob> vs, ps, errors, serialized;
+  check(D3DCompile(source,sizeof(source)-1,nullptr,nullptr,nullptr,"vs","vs_5_0",
+        D3DCOMPILE_ENABLE_STRICTNESS,0,&vs,&errors),"simple-indirect-vs-compile");
+  check(D3DCompile(source,sizeof(source)-1,nullptr,nullptr,nullptr,"ps","ps_5_0",
+        D3DCOMPILE_ENABLE_STRICTNESS,0,&ps,&errors),"simple-indirect-ps-compile");
+  D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+  rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  check(D3D12SerializeRootSignature(&rootDesc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&errors),
+        "simple-indirect-root-serialize");
+  ComPtr<ID3D12RootSignature> root;
+  check(context.device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),
+        IID_PPV_ARGS(&root)),"simple-indirect-root");
+  const D3D12_INPUT_ELEMENT_DESC inputs[] = {
+    {"COLOR",0,DXGI_FORMAT_R32G32B32A32_FLOAT,2,0,D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,1},
+    {"COLOR",1,DXGI_FORMAT_R32G32B32A32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root.Get(); desc.VS = {vs->GetBufferPointer(),vs->GetBufferSize()};
+  desc.PS = {ps->GetBufferPointer(),ps->GetBufferSize()}; desc.InputLayout = {inputs,2};
+  desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  desc.SampleMask = UINT_MAX; desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; desc.RasterizerState.DepthClipEnable = TRUE;
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  desc.NumRenderTargets = 1; desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+  ComPtr<ID3D12PipelineState> pipeline;
+  check(context.device->CreateGraphicsPipelineState(&desc,IID_PPV_ARGS(&pipeline)),"simple-indirect-pipeline");
+  std::array<std::array<float,4>,16> colors = {};
+  for (UINT i = 0; i < colors.size(); ++i)
+    colors[i] = {0, i/255.0f, 0, 1};
+  auto instanceBuffer = createBuffer(context.device.Get(),sizeof(colors),D3D12_HEAP_TYPE_UPLOAD,
+                                     D3D12_RESOURCE_STATE_GENERIC_READ);
+  writeUpload(instanceBuffer.Get(),colors.data(),sizeof(colors));
+  const D3D12_VERTEX_BUFFER_VIEW instanceView = {instanceBuffer->GetGPUVirtualAddress(),sizeof(colors),16};
+  // SV_VertexID excludes start/baseVertex; fetched data observes those offsets.
+  std::array<std::array<float,4>,16> vertexColors = {};
+  for (UINT i = 0; i < vertexColors.size(); ++i)
+    vertexColors[i] = {(i/3+1)/255.0f,0,0,1};
+  auto vertexBuffer = createBuffer(context.device.Get(),sizeof(vertexColors),D3D12_HEAP_TYPE_UPLOAD,
+                                   D3D12_RESOURCE_STATE_GENERIC_READ);
+  writeUpload(vertexBuffer.Get(),vertexColors.data(),sizeof(vertexColors));
+  const D3D12_VERTEX_BUFFER_VIEW vertexView = {vertexBuffer->GetGPUVirtualAddress(),sizeof(vertexColors),16};
+  D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+  heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heapDesc.NumDescriptors = 1;
+  ComPtr<ID3D12DescriptorHeap> heap;
+  check(context.device->CreateDescriptorHeap(&heapDesc,IID_PPV_ARGS(&heap)),"simple-indirect-rtv-heap");
+  D3D12_RESOURCE_DESC texture = {};
+  texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; texture.Width = 4; texture.Height = 2;
+  texture.DepthOrArraySize = 1; texture.MipLevels = 1; texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture.SampleDesc.Count = 1; texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  const UINT maxima[] = {0,1,2,4};
+  for (UINT kind = 0; kind < 3; ++kind) {
+    const bool indexed = kind != 0;
+    const bool wide = kind == 2;
+    D3D12_INDIRECT_ARGUMENT_DESC operation = {};
+    operation.Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC signatureDesc = {};
+    signatureDesc.ByteStride = 32; signatureDesc.NumArgumentDescs = 1; signatureDesc.pArgumentDescs = &operation;
+    ComPtr<ID3D12CommandSignature> signature;
+    check(context.device->CreateCommandSignature(&signatureDesc,nullptr,IID_PPV_ARGS(&signature)),
+          "simple-indirect-signature");
+    const uint16_t indices16[] = {30,30,30,6,7,8,9,10,11};
+    const uint32_t indices32[] = {30,30,30,6,7,8,9,10,11};
+    const UINT width = wide ? 4 : 2;
+    auto indices = createBuffer(context.device.Get(),9*width,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+    writeUpload(indices.Get(),wide ? static_cast<const void *>(indices32) : indices16,9*width);
+    // Bound IB offset excludes two poison elements; argument indexStart skips
+    // the third. Valid backing remainder is a whole number of indices.
+    const D3D12_INDEX_BUFFER_VIEW indexView = {indices->GetGPUVirtualAddress()+2*width,7*width,
+                                               wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
+    for (UINT maximum : maxima) {
+      std::array<uint8_t,16+4*32+16> records = {};
+      for (UINT i = 0; i < 4; ++i) {
+        const D3D12_DRAW_ARGUMENTS draw = {i == 3 ? 0u : 3u,i == 2 ? 0u : 1u,3,5};
+        const D3D12_DRAW_INDEXED_ARGUMENTS drawIndexed = {i == 3 ? 0u : 3u,i == 2 ? 0u : 1u,1,-3,5};
+        std::memcpy(records.data()+16+i*32,indexed ? static_cast<const void *>(&drawIndexed) : &draw,
+                    indexed ? sizeof(drawIndexed) : sizeof(draw));
+      }
+      auto upload = createBuffer(context.device.Get(),records.size(),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+      writeUpload(upload.Get(),records.data(),records.size());
+      auto arguments = createBuffer(context.device.Get(),records.size(),D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST);
+      auto properties = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+      ComPtr<ID3D12Resource> color;
+      check(context.device->CreateCommittedResource(&properties,D3D12_HEAP_FLAG_NONE,&texture,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(&color)),"simple-indirect-color");
+      const auto rtv = heap->GetCPUDescriptorHandleForHeapStart();
+      context.device->CreateRenderTargetView(color.Get(),nullptr,rtv);
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+      UINT64 bytes = 0; context.device->GetCopyableFootprints(&texture,0,1,512,&footprint,nullptr,nullptr,&bytes);
+      auto readback = createBuffer(context.device.Get(),bytes+512,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
+      std::vector<uint8_t> guards(static_cast<size_t>(bytes+512),0xa5);
+      auto guardUpload = createBuffer(context.device.Get(),guards.size(),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
+      writeUpload(guardUpload.Get(),guards.data(),guards.size());
+      ComPtr<ID3D12CommandAllocator> allocator;
+      ComPtr<ID3D12GraphicsCommandList> list;
+      check(context.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),
+            "simple-indirect-allocator");
+      check(context.device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),pipeline.Get(),
+            IID_PPV_ARGS(&list)),"simple-indirect-list");
+      list->CopyBufferRegion(arguments.Get(),0,upload.Get(),0,records.size());
+      auto argumentBarrier = transition(arguments.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+      list->ResourceBarrier(1,&argumentBarrier);
+      const float clear[] = {0,0,0,0}; list->ClearRenderTargetView(rtv,clear,0,nullptr);
+      list->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
+      const D3D12_VIEWPORT viewport = {0,0,4,2,0,1}; const D3D12_RECT scissor = {1,0,3,2};
+      list->RSSetViewports(1,&viewport); list->RSSetScissorRects(1,&scissor);
+      list->SetGraphicsRootSignature(root.Get()); list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      list->IASetVertexBuffers(0,1,&vertexView);
+      list->IASetVertexBuffers(2,1,&instanceView);
+      if (indexed) list->IASetIndexBuffer(&indexView);
+      list->ExecuteIndirect(signature.Get(),maximum,arguments.Get(),16,nullptr,0);
+      auto colorBarrier = transition(color.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->ResourceBarrier(1,&colorBarrier);
+      list->CopyBufferRegion(readback.Get(),0,guardUpload.Get(),0,guards.size());
+      copyTextureToReadback(list.Get(),color.Get(),0,readback.Get(),footprint);
+      check(list->Close(),"simple-indirect-close");
+      // The final live record changes after Close. The GPU copy and native
+      // indirect command must observe it; last-command order determines color.
+      const D3D12_DRAW_ARGUMENTS last = {3,1,6,7};
+      const D3D12_DRAW_INDEXED_ARGUMENTS lastIndexed = {3,1,4,-3,7};
+      std::memcpy(records.data()+16+32,indexed ? static_cast<const void *>(&lastIndexed) : &last,
+                  indexed ? sizeof(lastIndexed) : sizeof(last));
+      writeUpload(upload.Get(),records.data(),records.size());
+      std::fprintf(stderr,"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format=%u max=%u phase=submit_begin\n",kind,maximum);
+      context.submitClosed(list.Get());
+      std::fprintf(stderr,"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format=%u max=%u phase=submit_end\n",kind,maximum);
+      const uint8_t red = maximum >= 2 ? 3 : 2; const uint8_t green = maximum >= 2 ? 7 : 5;
+      uint8_t *observed = nullptr;
+      check(readback->Map(0,nullptr,reinterpret_cast<void **>(&observed)),"simple-indirect-image-map");
+      for (UINT y = 0; y < 2; ++y)
+        for (UINT x = 0; x < 4; ++x) {
+          const uint8_t *pixel = observed+footprint.Offset+y*footprint.Footprint.RowPitch+x*4;
+          const bool covered = maximum != 0 && x >= 1 && x < 3;
+          require(pixel[0] == (covered ? red : 0) && pixel[1] == (covered ? green : 0) &&
+                  pixel[2] == 0 && pixel[3] == (covered ? 255 : 0),"simple-indirect-exact-pixel");
+        }
+      // Footprint row padding has unspecified contents; only bytes outside
+      // the entire placed footprint are guards, never the copied row padding.
+      const UINT64 end = footprint.Offset+UINT64(footprint.Footprint.RowPitch)*2;
+      for (UINT64 i = 0; i < footprint.Offset; ++i)
+        require(observed[i] == 0xa5,"simple-indirect-prefix-guard");
+      for (UINT64 i = end; i < guards.size(); ++i)
+        require(observed[i] == 0xa5,"simple-indirect-suffix-guard");
+      std::printf("OWNED_D3D12_PREDICATION_INDIRECT_SIMPLE_GRAPHICS_VALUES kind=%u max=%u rgba=%u,%u,0,%u\n",
+                  kind,maximum,maximum ? red : 0,maximum ? green : 0,maximum ? 255 : 0);
+      readback->Unmap(0,nullptr);
+    }
+  }
+  std::puts("OWNED_D3D12_PREDICATION_INDIRECT_SIMPLE_GRAPHICS_PASS");
+}
+
 void RunMSAAIndexedIndirectMutations(TestContext &context, UINT sampleCount) {
   // Only the ordinary single-sample ICB path records these large arrays.
   // MSAA resolves live commands at execution: keep its workload at two.
@@ -1573,6 +1929,8 @@ int main(int argc, char **argv) {
   RunBufferUavRectangleTests(context);
   std::puts("OWNED_D3D12_PREDICATION_INDIRECT_CLEAR_CASES_PASS");
   RunIndirectTests(context, computeShader, vertexShader);
+  RunPreparedComputeIndirect(context, computeShader);
+  RunSimpleGraphicsIndirect(context);
   RunMSAAIndexedIndirectMutations(context,4);
   RunMSAAIndexedIndirectMutations(context,1);
   std::puts("OWNED_D3D12_PREDICATION_INDIRECT_INDIRECT_CASES_PASS");

@@ -97,6 +97,122 @@ static bool cpu_visible_standard(ID3D12Device *device, ID3D12CommandQueue *queue
   std::puts("OWNED_D3D12_STANDARD_SWIZZLE_CPU_GPU_PASS canonical_map=1 transfers=1");
   return true;
 }
+static bool descriptor_capture(ID3D12Device *device, ID3D12CommandQueue *queue) {
+  using Microsoft::WRL::ComPtr;
+  // Every dispatch writes a distinct word, so the unchanged-table sequence needs no UAV ordering.
+  ComPtr<ID3D12Resource> textures[6], output, readback;
+  D3D12_RESOURCE_DESC t{};t.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  t.Width=128;t.Height=128;t.DepthOrArraySize=1;t.MipLevels=1;
+  t.Format=DXGI_FORMAT_R8G8B8A8_UNORM;t.SampleDesc.Count=1;
+  t.Layout=D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE;
+  D3D12_HEAP_PROPERTIES cpu{};cpu.Type=D3D12_HEAP_TYPE_CUSTOM;
+  cpu.CPUPageProperty=D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+  cpu.MemoryPoolPreference=D3D12_MEMORY_POOL_L0;cpu.CreationNodeMask=cpu.VisibleNodeMask=1;
+  const uint32_t colors[]={0xff332211,0xff776655,0xffbbaa99,0xff135724,0xff246813,0xffabcdef};
+  uint32_t pixels[128*128];
+  for(unsigned i=0;i<6;++i){
+    if(!ok(device->CreateCommittedResource(&cpu,D3D12_HEAP_FLAG_NONE,&t,
+           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&textures[i])),
+           "capture-texture")) return false;
+    for(auto &pixel:pixels)pixel=colors[i];
+    if(!ok(textures[i]->WriteToSubresource(0,nullptr,pixels,512,0),"capture-write")) return false;
+  }
+  auto b=buffer_desc(24);b.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+  if(!ok(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&b,
+         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&output)),"capture-output"))return false;
+  b.Flags=D3D12_RESOURCE_FLAG_NONE;hp.Type=D3D12_HEAP_TYPE_READBACK;
+  if(!ok(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&b,
+         D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback)),"capture-readback"))return false;
+  ComPtr<ID3D12DescriptorHeap> heaps[2];
+  D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  hd.NumDescriptors=4;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  const UINT stride=device->GetDescriptorHandleIncrementSize(hd.Type);
+  for(unsigned heap=0;heap<2;++heap){
+    auto &h=heaps[heap];
+    if(!ok(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&h)),"capture-heap"))return false;
+    auto handle=h->GetCPUDescriptorHandleForHeapStart();
+    for(unsigned i=0;i<4;++i){
+      device->CreateShaderResourceView(textures[heap?4+i%2:i].Get(),nullptr,handle);
+      handle.ptr+=stride;
+    }
+  }
+  D3D12_DESCRIPTOR_RANGE range{};range.RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  range.NumDescriptors=2; // Preserve t1 even while the first PSOs only use t0.
+  D3D12_ROOT_PARAMETER params[2]{};
+  params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[0].DescriptorTable={1,&range};params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;
+  D3D12_ROOT_SIGNATURE_DESC rs{};rs.NumParameters=2;rs.pParameters=params;
+  ComPtr<ID3DBlob> serialized,errors;ComPtr<ID3D12RootSignature> root;
+  if(!ok(D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&errors),"capture-serialize") ||
+     !ok(device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),
+         IID_PPV_ARGS(&root)),"capture-root"))return false;
+  ComPtr<ID3D12PipelineState> psos[6];
+  for(unsigned i=0;i<6;++i){
+    char shader[512];
+    std::snprintf(shader,sizeof(shader),
+      "Texture2D<float4> source:register(t%u); RWStructuredBuffer<uint> output:register(u0);"
+      "[numthreads(1,1,1)] void main(){uint4 v=uint4(round(source.Load(int3(37,83,0))*255));"
+      "output[%u]=v.x|(v.y<<8)|(v.z<<16)|(v.w<<24);}",i==2?1:0,i);
+    ComPtr<ID3DBlob> code;
+    if(!ok(D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,"main","cs_5_0",
+           D3DCOMPILE_ENABLE_STRICTNESS,0,&code,&errors),"capture-compile"))return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();
+    pd.CS={code->GetBufferPointer(),code->GetBufferSize()};
+    if(!ok(device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&psos[i])),"capture-pso"))return false;
+  }
+  ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
+  ComPtr<ID3D12Fence> fence;
+  if(!ok(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"capture-allocator") ||
+     !ok(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,
+         IID_PPV_ARGS(&list)),"capture-list") ||
+     !ok(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"capture-fence"))return false;
+  if(!ok(list->SetName(L"standard-swizzle-descriptor-capture"),"capture-name"))return false;
+  std::printf("OWNED_D3D12_STANDARD_SWIZZLE_CASE_BEGIN case=descriptor-capture list=%p dispatches=6\n",
+              static_cast<void *>(list.Get()));std::fflush(stdout);
+  ID3D12DescriptorHeap *bound[]={heaps[0].Get()};list->SetDescriptorHeaps(1,bound);
+  list->SetComputeRootSignature(root.Get());
+  auto table=heaps[0]->GetGPUDescriptorHandleForHeapStart();
+  list->SetComputeRootDescriptorTable(0,table);
+  list->SetComputeRootUnorderedAccessView(1,output->GetGPUVirtualAddress());
+  for(unsigned i=0;i<6;++i){
+    if(i==3){table.ptr+=2*stride;list->SetComputeRootDescriptorTable(0,table);}
+    if(i==4){
+      bound[0]=heaps[1].Get();list->SetDescriptorHeaps(1,bound);
+      table=heaps[1]->GetGPUDescriptorHandleForHeapStart();
+      list->SetComputeRootDescriptorTable(0,table);
+    }
+    if(i==5){
+      D3D12_RESOURCE_BARRIER boundary{};boundary.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      boundary.UAV.pResource=output.Get();list->ResourceBarrier(1,&boundary);
+    }
+    list->SetPipelineState(psos[i].Get());list->Dispatch(1,1,1);
+  }
+  D3D12_RESOURCE_BARRIER end{};end.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  end.Transition.pResource=output.Get();end.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  end.Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  end.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;list->ResourceBarrier(1,&end);
+  list->CopyBufferRegion(readback.Get(),0,output.Get(),0,24);
+  HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!event)return false;
+  const bool ready=ok(fence->SetEventOnCompletion(1,event),"capture-event") && ok(list->Close(),"capture-close");
+  if(ready){ID3D12CommandList *lists[]={list.Get()};queue->ExecuteCommandLists(1,lists);}
+  const bool completed=ready && ok(queue->Signal(fence.Get(),1),"capture-signal") &&
+                       WaitForSingleObject(event,20000)==WAIT_OBJECT_0;
+  CloseHandle(event);if(!completed){std::puts("SWIZZLE_FAIL capture-completion");return false;}
+  uint32_t *values=nullptr;D3D12_RANGE bytes{0,24};
+  if(!ok(readback->Map(0,&bytes,reinterpret_cast<void **>(&values)),"capture-map"))return false;
+  bool equal=true;
+  const unsigned sources[]={0,0,1,2,4,4};
+  for(unsigned i=0;i<6;++i){
+    const uint32_t expected=colors[sources[i]];
+    if(values[i]!=expected){
+      std::printf("SWIZZLE_FAIL capture index=%u got=%08x expected=%08x\n",i,values[i],expected);equal=false;
+    }
+  }
+  readback->Unmap(0,nullptr);
+  if(equal)std::puts("OWNED_D3D12_STANDARD_SWIZZLE_DESCRIPTOR_CAPTURE_PASS unchanged=2 pso_other_slot=1 table_rebind=1 heap_rebind=1 new_pass=1");
+  return equal;
+}
 int main() {
   const auto module = GetModuleHandleW(L"d3d12.dll");
   using BackendId = const char *(WINAPI *)();
@@ -564,6 +680,7 @@ int main() {
                   observed[0],observed[1],observed[2],observed[3]);break;
     }
     if (!cpu_visible_standard(device,queue)) break;
+    if (!descriptor_capture(device,queue)) break;
     std::printf("OWNED_D3D12_STANDARD_SWIZZLE_PASS width=%u height=%u allocation=%llu\n",width,height,(unsigned long long)alloc.SizeInBytes);
     rc=0;
   } while(false);

@@ -329,6 +329,8 @@ llvm::Error PrepareShader(
   shader.max_output_register = metadata->max_output_register;
   shader.pso_valid_output_reg_mask = metadata->output_register_mask;
   shader.ps_has_coverage_output = metadata->has_coverage_output ? 1 : 0;
+  shader.ps_has_coverage_input = metadata->has_coverage_input;
+  shader.ps_has_inner_coverage_input = metadata->has_inner_coverage_input;
   /* The multi-stage converters size the vertex payload and look stream output elements up
    * through the DXBC-style output signature. The signature chunk rows are the registers the
    * stage writes (storeOutput addresses elements, not registers). */
@@ -506,7 +508,8 @@ llvm::Error LowerImmutableConstants(llvm::Module &module, SM50CompiledBitcodeInt
   DenseMap<GlobalVariable *, uint64_t> offsets;
   uint64_t size = 0;
   for (auto &global : module.globals()) {
-    if (!global.isConstant() || !global.hasInitializer() || global.use_empty() ||
+    if (global.getSection() == "air.fc_initializer" ||
+        !global.isConstant() || !global.hasInitializer() || global.use_empty() ||
         (global.getAddressSpace() != 0 && global.getAddressSpace() != 2) || global.getName().startswith("llvm."))
       continue;
     const uint64_t alignment = std::max(layout.getABITypeAlign(global.getValueType()).value(),

@@ -761,6 +761,152 @@ ComPtr<ID3DBlob> compileDxbc(const char *source, const char *entry, const char *
  * with Microsoft FXC: Wine's d3dcompiler cannot compile unbounded arrays.
  */
 
+void testDescriptorViewPool(Gpu &g) {
+  const int before = g_failures;
+  const auto type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  D3D12_DESCRIPTOR_RANGE1 ranges[2]{};
+  ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0};
+  ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0};
+  D3D12_ROOT_PARAMETER1 params[4]{};
+  for (UINT i = 0; i < 2; ++i) {
+    params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[i].DescriptorTable = {1, &ranges[i]};
+  }
+  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  params[2].Descriptor.ShaderRegister = 1;
+  params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[3].Constants = {0, 0, 1};
+  auto root = makeRoot(g.device.Get(), directRootDesc(params, 4, 0));
+  // Frozen DXC preserves real SRV/UAV GetDimensions; Wine's built-in compiler
+  // does not implement GetDimensions on RWTexture2DArray<uint>.
+  const auto shader = readFile(L"bindless-view-pool-cs.dxil");
+  auto pso = computePso(g.device.Get(), root.Get(), shader.data(), shader.size());
+  auto destination = g.heap(type, 12);
+  for (UINT phase = 0; phase < 2; ++phase) {
+    auto source = g.heap(type, 12, false);
+    auto working = g.heap(type, 12, false);
+    auto cpuOnly = g.heap(type, 4, false);
+    auto props = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = 4; desc.DepthOrArraySize = 2; desc.MipLevels = 3;
+    desc.Format = DXGI_FORMAT_R32_UINT; desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ComPtr<ID3D12Resource> textures[2];
+    std::vector<ComPtr<ID3D12Resource>> keep;
+    for (UINT resource = 0; resource < 2; ++resource) {
+      check(g.device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&textures[resource])), "pool texture");
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[6]{};
+      UINT rows[6]{}; UINT64 rowBytes[6]{}, total = 0;
+      g.device->GetCopyableFootprints(&desc, 0, 6, 0, footprints, rows, rowBytes, &total);
+      std::vector<uint8_t> pixels(static_cast<size_t>(total));
+      for (UINT sub = 0; sub < 6; ++sub)
+        for (UINT y = 0; y < footprints[sub].Footprint.Height; ++y)
+          for (UINT x = 0; x < footprints[sub].Footprint.Width; ++x) {
+            const UINT value = phase * 1000 + resource * 2000 + sub * 37 + 11;
+            std::memcpy(pixels.data() + footprints[sub].Offset + y * footprints[sub].Footprint.RowPitch + x * 4,
+                        &value, 4);
+          }
+      auto upload = g.uploadData(pixels.data(), total);
+      for (UINT sub = 0; sub < 6; ++sub) {
+        D3D12_TEXTURE_COPY_LOCATION target{};
+        target.pResource = textures[resource].Get();
+        target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        target.SubresourceIndex = sub;
+        D3D12_TEXTURE_COPY_LOCATION from{};
+        from.pResource = upload.Get();
+        from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        from.PlacedFootprint = footprints[sub];
+        g.list->CopyTextureRegion(&target, 0, 0, 0, &from, nullptr);
+      }
+      keep.push_back(upload);
+      g.barrier(textures[resource].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+          resource ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    auto srv = [&](ID3D12DescriptorHeap *heap, UINT slot, UINT key, bool null = false) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+      view.Format = DXGI_FORMAT_R32_UINT; view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+      view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      view.Texture2DArray.MostDetailedMip = key % 3;
+      view.Texture2DArray.MipLevels = 3 - key % 3;
+      view.Texture2DArray.FirstArraySlice = key % 2;
+      view.Texture2DArray.ArraySize = 2 - key % 2;
+      g.device->CreateShaderResourceView(null ? nullptr : textures[0].Get(), &view, g.cpu(heap, slot, g.viewStride));
+    };
+    auto uav = [&](ID3D12DescriptorHeap *heap, UINT slot, UINT key, bool null = false) {
+      D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+      view.Format = DXGI_FORMAT_R32_UINT; view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+      view.Texture2DArray.MipSlice = key; view.Texture2DArray.FirstArraySlice = key;
+      view.Texture2DArray.ArraySize = 2 - key;
+      g.device->CreateUnorderedAccessView(null ? nullptr : textures[1].Get(), nullptr, &view,
+                                         g.cpu(heap, slot, g.viewStride));
+    };
+    auto copy = [&](ID3D12DescriptorHeap *to, UINT at, ID3D12DescriptorHeap *from, UINT start, UINT count) {
+      auto target = g.cpu(to, at, g.viewStride), origin = g.cpu(from, start, g.viewStride);
+      g.device->CopyDescriptors(1, &target, &count, 1, &origin, &count, type);
+    };
+    for (UINT key = 0; key < 4; ++key) srv(source.Get(), key, key);
+    copy(working.Get(), 0, source.Get(), 0, 4);
+    for (UINT key = 0; key < 4; ++key) srv(source.Get(), key, 0, true);
+    copy(working.Get(), 1, working.Get(), 0, 4); // Overlap right: memmove, not a forward cascade.
+    copy(working.Get(), 0, working.Get(), 1, 4); // Overlap left restores the original sequence.
+    copy(working.Get(), 1, working.Get(), 0, 4);
+    copy(working.Get(), 2, working.Get(), 1, 4); // Repeat overlap after a native copy.
+    srv(working.Get(), 0, 1); srv(working.Get(), 3, 0, true);
+    copy(working.Get(), 6, working.Get(), 4, 1);
+    srv(working.Get(), 4, 0, true);
+    copy(source.Get(), 6, working.Get(), 6, 1);
+    srv(working.Get(), 6, 3);
+    copy(working.Get(), 7, source.Get(), 6, 1);
+    srv(source.Get(), 6, 0, true);
+    srv(cpuOnly.Get(), 0, 2);
+    copy(working.Get(), 4, cpuOnly.Get(), 0, 1);
+    srv(cpuOnly.Get(), 0, 0, true);
+    uav(cpuOnly.Get(), 1, 0); copy(working.Get(), 8, cpuOnly.Get(), 1, 1);
+    uav(source.Get(), 8, 1); copy(working.Get(), 9, source.Get(), 8, 1);
+    uav(source.Get(), 8, 0);
+    copy(working.Get(), 10, working.Get(), 9, 1);
+    uav(working.Get(), 9, 0); uav(working.Get(), 11, 0, true);
+    copy(destination.Get(), 0, working.Get(), 0, 12);
+    for (UINT index = 0; index < 12; ++index) srv(working.Get(), index, 0, true);
+    working.Reset();
+    source.Reset(); cpuOnly.Reset(); // Source heaps may be released after copy, before legal destination GPU use.
+    std::vector<uint32_t> guards(66, 0x6d6d6d6d);
+    auto result = g.initBuffer(guards, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, keep);
+    ID3D12DescriptorHeap *heaps[] = {destination.Get()};
+    g.list->SetDescriptorHeaps(1, heaps); g.list->SetComputeRootSignature(root.Get());
+    g.list->SetPipelineState(pso.Get());
+    g.list->SetComputeRootUnorderedAccessView(2, result->GetGPUVirtualAddress());
+    for (UINT index = 0; index < 8; ++index) {
+      g.list->SetComputeRootDescriptorTable(0, g.gpu(destination.Get(), index, g.viewStride));
+      g.list->SetComputeRootDescriptorTable(1, g.gpu(destination.Get(), 8 + index % 4, g.viewStride));
+      g.list->SetComputeRoot32BitConstant(3, index, 0); g.list->Dispatch(1, 1, 1); g.uavBarrier();
+    }
+    const auto actual = g.readBuffer(result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, guards.size() * 4, "pool retirement");
+    EXPECT(actual.front() == guards.front() && actual.back() == guards.back(), "pool phase=%u guards", phase);
+    const UINT keys[8] = {1, 0, 0, 0, 2, 3, 3, 2};
+    // Slot 7 preserves key 2 copied from slot 4 before both intervening sources were overwritten.
+    const UINT previous[8] = {phase * 1000 + 2011, 9000, phase * 1000 + 2011 + 4 * 37, 0, 9001, 9004, 9002, 0};
+    for (UINT index = 0; index < 8; ++index) {
+      const UINT key = keys[index], mip = key % 3, slice = key % 2;
+      const bool null = index == 3, nullUav = index % 4 == 3;
+      const UINT expected[8] = {null ? 0 : 4u >> mip, null ? 0 : 4u >> mip,
+          null ? 0 : 2 - slice, null ? 0 : 3 - mip,
+          null ? 0 : phase * 1000 + (mip + slice * 3) * 37 + 11,
+          nullUav ? 0 : index % 4 == 2 ? 2u : 4u, nullUav ? 0 : index % 4 == 2 ? 1u : 2u,
+          previous[index]};
+      for (UINT word = 0; word < 8; ++word)
+        EXPECT(actual[1 + index * 8 + word] == expected[word],
+               "pool phase=%u slot=%u word=%u expected=%u actual=%u", phase, index, word,
+               expected[word], actual[1 + index * 8 + word]);
+    }
+  }
+  std::puts("OWNED_D3D12_BINDLESS_VIEW_POOL_GPU executions=2 slots=8 words=128 same_heap=1 cross_heap=1 overlap=1 source_overwrite=1 destination_overwrite=1 null=1 srv=1 uav=1 mip_array=1 source_heap_release=1 resource_generations=2");
+  passCase("descriptor-view-pool", before);
+}
+
+
 void testDxbc51(Gpu &g, BindlessScene &s) {
   const int before = g_failures;
   const auto cs = readFile(L"bindless-dxbc51-cs.dxbc");
@@ -1608,7 +1754,8 @@ void testCaps(Gpu &g) {
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
-  if (argc != 5) {
+  const bool poolOnly = argc == 2 && lstrcmpW(argv[1], L"--view-pool") == 0;
+  if (argc != 5 && !poolOnly) {
     std::printf("usage: owned-d3d12-bindless.exe <bindless-cs.dxil> <bindless-vs.dxil> <bindless-ps.dxil> "
                 "<bindless-root-cs.dxil>\n");
     return 2;
@@ -1626,13 +1773,17 @@ int wmain(int argc, wchar_t **argv) {
   check(factory->EnumAdapters1(0, &adapter), "adapter");
   ComPtr<ID3D12Device> device;
   check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "device");
+  Gpu g;
+  g.init(device.Get());
+  if (poolOnly) {
+    testDescriptorViewPool(g);
+    check(device->GetDeviceRemovedReason(), "pool device removed");
+    return g_failures ? 1 : 0;
+  }
   const auto cs = readFile(argv[1]);
   const auto vs = readFile(argv[2]);
   const auto ps = readFile(argv[3]);
   const auto rootCs = readFile(argv[4]);
-
-  Gpu g;
-  g.init(device.Get());
   testCaps(g);
   testRootFlags(g, cs, rootCs);
   testRootSignature12(g);
@@ -1645,12 +1796,13 @@ int wmain(int argc, wchar_t **argv) {
     testDxbc51(g, scene);
   }
   testHeapOrder(g, rootCs);
+  testDescriptorViewPool(g);
   testHeapRov(g);
   check(device->GetDeviceRemovedReason(), "device removed");
   if (g_failures) {
     std::printf("OWNED_D3D12_BINDLESS_FAIL mismatches=%d\n", g_failures);
     return 1;
   }
-  std::puts("OWNED_D3D12_BINDLESS_PASS cases=9 heap=1000000 samplers=2048 max_index=999999");
+  std::puts("OWNED_D3D12_BINDLESS_PASS cases=10 heap=1000000 samplers=2048 max_index=999999");
   return 0;
 }

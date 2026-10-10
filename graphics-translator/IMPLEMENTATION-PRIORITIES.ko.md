@@ -1,10 +1,21 @@
 # 현재 구현 우선순위
 
-기준일: **2026-10-09**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
+기준일: **2026-10-10**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
 
 ## 현재 관리 범위
 
 이 저장소는 DXMT D3D12 번역기와 그 검증을 관리한다. Wine SDK/runtime 빌드는 별도 Wine-darwin, FEX 소스·빌드는 FEX-darwin의 책임이다. 아래 완료 결과와 미완료 계약을 구분하며, 과거 세션의 실행 순서·중단·위임 지시는 현재 작업 지시로 유지하지 않는다.
+
+## D3DMetal 최적화 이식 후 남은 검증
+
+조사한 19개 중 18개 항목의 적합한 경로를 구현했다. 최종 phase3e의 16개 D3D12 GPU suite와 RR 검증 ON/OFF 각각 51개 출력이 통과했으며, 범위와 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#d3dmetal-비교-기반-최적화-이식--2026-10-10)에 둔다. 전체 D3DMetal 알고리즘 동등성이나 게임 FPS 개선을 뜻하지 않는다.
+
+| 항목 | 현재 판정 | 남은 조건 |
+| --- | --- | --- |
+| 동일 장면 게임 FPS·frame time | 사용자 요청으로 후속 검증 보류 | Steam 래퍼와 `-use-d3d12`로 실제 D3D12를 확인하고 동일 설정·장면·drawable·계측 조건을 맞춘 비교. 이전 DX11 실행과 불연속 HUD 수치는 제외 |
+| Commit 시점 Present 예약 | 미이식, completion 기반 표시 유지 | 이미 예약한 표시의 취소 또는 epoch 조건부 표시와 GPU 오류 시 억제를 보존하는 native 계약. D3DMetal의 더 약한 RESTART 처리를 그대로 이식하지 않음 |
+| Native SR 112×112 | Framework-only Conv3x3 BBR invalid store 재현 | 같은 입력의 독립 native 검증이 먼저 통과해야 한다. 128×128·96×112 controls는 clean이며, 출력 크기를 임의로 올린 뒤 crop하거나 validation을 끄지 않음 |
+| RR 초기 cold-cache 경계 | 비동기 초기화와 기존 public fence 연결, 최종 ON/OFF 각 51개 whole-buffer exact | 전역 compiler cache와 최초 생성 readiness를 통제한 관찰, 다른 OS/GPU 및 실제 게임 검증. 과거 timeout을 동기 설정이나 fence 하나의 원인으로 단정하지 않음 |
 
 ## 선정 리뷰 항목 처리 결과
 

@@ -38,6 +38,40 @@
 
 namespace dxmt {
 
+bool NativeMSAADescriptorSafe(MTLD3D12Device *device, const ShaderVisibleDescriptorCPUStorage &descriptor) {
+  if (descriptor.type == ShaderVisibleDescriptorType::Null) return true;
+  if (descriptor.type == ShaderVisibleDescriptorType::ConstantBuffer) {
+    uint64_t offset = 0;
+    auto *a = device->LookupBufferByVA(descriptor.ConstantBuffer.address, &offset);
+    return a && !a->canonicalHeap && !a->reservedResource &&
+        !a->flags().test(BufferAllocationFlag::PlacementSparse) &&
+        resource_contract::RangeFits(offset, descriptor.ConstantBuffer.size, a->byteLength());
+  }
+  if (descriptor.type == ShaderVisibleDescriptorType::SRVTexture) {
+    auto *texture = descriptor.SRVTexture.texture;
+    auto owner = device->LookupDescriptorResource(texture, descriptor.owner_id);
+    if (!owner || !texture || !texture->current() || texture->sampleCount() != 1 ||
+        texture->reservedResource || texture->reservedVolumeLayoutAddress ||
+        device->LookupStandardSwizzleTexture(texture)) return false;
+    const auto view = texture->viewDescriptor(descriptor.SRVTexture.view);
+    const auto *a = texture->current();
+    return !view.castBlockSize && !view.castCompressed && !view.msaaShadow && !view.reservedVolumeRender &&
+        !a->canonicalHeap && !a->flags().test(TextureAllocationFlag::Shared) &&
+        !a->flags().test(TextureAllocationFlag::PlacementSparse) &&
+        !a->flags().test(TextureAllocationFlag::GpuManaged);
+  }
+  const bool texel = descriptor.type == ShaderVisibleDescriptorType::SRVTexelBuffer;
+  if (!texel && descriptor.type != ShaderVisibleDescriptorType::SRVBuffer &&
+      descriptor.type != ShaderVisibleDescriptorType::SRVRGB32Buffer) return false;
+  auto *buffer = texel ? descriptor.SRVTexelBuffer.buffer : descriptor.SRVBuffer.buffer;
+  auto owner = device->LookupDescriptorResource(buffer, descriptor.owner_id);
+  if (!owner || !buffer || !buffer->current()) return false;
+  const auto *a = buffer->current();
+  const auto slice = texel ? descriptor.SRVTexelBuffer.slice : descriptor.SRVBuffer.slice;
+  return !a->canonicalHeap && !a->reservedResource && !a->flags().test(BufferAllocationFlag::PlacementSparse) &&
+      resource_contract::RangeFits(slice.byteOffset, slice.byteLength, a->byteLength());
+}
+
 /* Resolve an application GPU address backing one of the acceleration-structure operands.
  * D3D12 GPU virtual addresses are Metal device addresses here, so the resolved offset is
  * usable directly by the prepass kernel. */
@@ -1544,7 +1578,8 @@ public:
     owned_closed_valid = false;
     owned_bundle_references.clear();
     ++owned_recording;
-    owned_graphics::Trace("record_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording);
+    owned_graphics::Trace("record_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                          ",\"allocator\":", allocator_->GetTraceId());
     return S_OK;
   }
 
@@ -1665,6 +1700,16 @@ public:
       ERR("Close: render pass not ended");
       RecordError();
     }
+    for (auto *pass = static_cast<EncoderData *>(entry)->next; pass; pass = pass->next) {
+      if (pass->type != EncoderType::Render) continue;
+      auto *render = static_cast<RenderEncoderData *>(pass);
+      if (!render->visibility_intervals || !render->visibility_interval_count) continue;
+      WMTBufferInfo info{};
+      info.length = render->visibility_interval_count * sizeof(uint64_t);
+      info.options = WMTResourceHazardTrackingModeUntracked;
+      render->visibility_scratch = device_->GetMTLDevice().newBuffer(info);
+      if (!render->visibility_scratch) RecordError(E_OUTOFMEMORY);
+    }
     auto hr = allocator_->EndRecord(&encoder_count);
     if (SUCCEEDED(hr) && FAILED(recording_error_))
       hr = recording_error_;
@@ -1733,6 +1778,7 @@ public:
   }
 
   bool index_pull_pipeline_bound_ = false;
+  obj_handle_t direct_pipeline_bound_ = 0;
 
   void CaptureAtomic64Roots(std::vector<Atomic64RootBinding> &roots,
                            MTLD3D12RootSignature *signature, const uint64_t *arguments,
@@ -1763,6 +1809,8 @@ public:
                                     const MTLD3D12PipelineState *pipeline = nullptr) {
     if (!rootsig || !descriptor_heaps_[0])
       return;
+    owned_graphics::Trace("descriptor_table_capture", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                          ",\"atomic\":", atomic_phase);
     auto *heap = static_cast<MTLD3D12DescriptorHeap *>(descriptor_heaps_[0]);
     if (rootsig->Flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
       if (!uses) uses = std::make_unique<std::vector<StandardSwizzleTableUse>>();
@@ -1804,6 +1852,92 @@ public:
   }
 
   /* Depth-stencil and rasterizer state of the bound graphics PSO (both draw paths). */
+  template <bool CheckOnly = false>
+  bool CaptureSubmissionAccess(std::vector<RecordedBufferAccess> &buffers,
+      std::unique_ptr<std::vector<StandardSwizzleTableUse>> &tables, MTLD3D12RootSignature *signature,
+      const uint64_t *arguments, const MTLD3D12PipelineState &pipeline, uint64_t allowed_stages, bool &budget_exceeded,
+      bool &root_srv_opaque) {
+    if (!signature || (signature->Flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                           D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED))) return false;
+    if (pipeline.resource_bindings.size() > kRecordedSubmissionBufferBudget) { budget_exceeded = true; return false; }
+    small_vector<RecordedBufferAccess, kRecordedSubmissionBufferBudget> pending_buffers;
+    size_t pending_tables = 0;
+    try {
+      for (uint32_t parameter = 0; parameter < signature->ParameterSlots; ++parameter) {
+        const auto type = signature->ParameterTypes[parameter];
+        if (type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) continue;
+        if (type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+          const auto *range = signature->GetRootDescriptorRange(parameter);
+          bool complete = true;
+          for (const auto &binding : pipeline.resource_bindings) {
+            uint64_t stages = allowed_stages;
+            if (!(allowed_stages & WMTMetal4StageDispatch) && !(binding.ShaderVisibilityMask & 1u)) {
+              stages = (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_VERTEX) ? WMTMetal4StageVertex : 0) |
+                  (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_PIXEL) ? WMTMetal4StageFragment : 0);
+            }
+            if (range) signature->ForEachUsedDescriptorRange({range, 1}, {&binding, 1},
+                [&](uint64_t, uint64_t, D3D12_DESCRIPTOR_RANGE_TYPE) {
+              // Root SRV reflection does not distinguish a plain buffer from
+              // inline RayQuery's TLAS/transitive BLAS accesses. Never guess.
+              if (type == D3D12_ROOT_PARAMETER_TYPE_SRV) { root_srv_opaque = true; complete = false; return; }
+              if (binding.Type != SM50BindingType::ConstantBuffer &&
+                  (!(binding.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) ||
+                   (binding.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER))) { complete = false; return; }
+              const auto bound_address = arguments[signature->SlotQwordOffsets[parameter]];
+              uint64_t offset = 0;
+              auto *allocation = bound_address ? device_->LookupBufferByVA(bound_address, &offset) : nullptr;
+              if (!allocation || !stages) { complete = false; return; }
+              const auto address = allocation->gpuAddress(); // unknown root-view length covers this whole backing
+              const bool writes = type == D3D12_ROOT_PARAMETER_TYPE_UAV &&
+                  (binding.Flags & MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS);
+              if (std::none_of(buffers.begin(), buffers.end(), [&](const auto &use) {
+                return use.address == address && use.length == UINT64_MAX && use.writes == writes && use.stages == stages;
+              }) && std::none_of(pending_buffers.begin(), pending_buffers.end(), [&](const auto &use) {
+                return use.address == address && use.length == UINT64_MAX && use.writes == writes && use.stages == stages;
+              })) {
+                if (buffers.size() + pending_buffers.size() >= kRecordedSubmissionBufferBudget) {
+                  budget_exceeded = true; complete = false; return;
+                }
+                if constexpr (CheckOnly) pending_buffers.push_back({address, UINT64_MAX, writes, stages});
+                else buffers.push_back({address, UINT64_MAX, writes, stages});
+              }
+            });
+          }
+          if (!complete) return false;
+          continue;
+        }
+        bool used = false;
+        signature->ForEachUsedDescriptorRange(signature->GetTableRanges(parameter), pipeline.resource_bindings,
+            [&](uint64_t, uint64_t, D3D12_DESCRIPTOR_RANGE_TYPE kind) {
+              used |= kind != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            });
+        if (!used) continue;
+        if (!descriptor_heaps_[0] || !arguments[signature->SlotQwordOffsets[parameter]]) return false;
+        if (tables && std::any_of(tables->begin(), tables->end(), [&](const auto &use) {
+          return use.rootsig == signature && use.heap == descriptor_heaps_[0] && use.parameter == parameter &&
+              use.base == arguments[signature->SlotQwordOffsets[parameter]] &&
+              use.submission_bindings.size() == pipeline.resource_bindings.size() &&
+              !std::memcmp(use.submission_bindings.data(), pipeline.resource_bindings.data(),
+                  pipeline.resource_bindings.size() * sizeof(MTL_SM50_SHADER_ARGUMENT));
+        })) continue;
+        if ((tables ? tables->size() : 0) + pending_tables >= kRecordedSubmissionBufferBudget) {
+          budget_exceeded = true; return false;
+        }
+        if constexpr (CheckOnly) { ++pending_tables; continue; }
+        if (!tables) tables = std::make_unique<std::vector<StandardSwizzleTableUse>>();
+        StandardSwizzleTableUse use{signature, static_cast<MTLD3D12DescriptorHeap *>(descriptor_heaps_[0]),
+            arguments[signature->SlotQwordOffsets[parameter]], parameter};
+        use.submission_bindings = pipeline.resource_bindings;
+        use.shader_bindings = use.submission_bindings;
+        use.restrict_to_shader = true;
+        tables->push_back(std::move(use));
+        signature->AddRefPrivate();
+        tables->back().heap->AddRefPrivate();
+      }
+    } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return false; }
+    return true;
+  }
+
   void EncodeGraphicsFixedState(bool capture_only) {
     auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
     auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdepthstencilstate>();
@@ -1836,12 +1970,173 @@ public:
     cmd_setrs.winding = pso_graphics_->winding;
   }
 
+  bool NativeMSAABindingsSafe(RenderEncoderData *capture = nullptr) {
+    auto *signature = rootsig_graphics_.ptr();
+    if (!signature || (signature->Flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                          D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED)) ||
+        pso_graphics_->resource_bindings.size() > kRecordedSubmissionBufferBudget) return false;
+    auto *heap = static_cast<MTLD3D12DescriptorHeap *>(descriptor_heaps_[0]);
+    uint64_t descriptor_count = 0;
+    bool safe = true;
+    try {
+      for (uint32_t parameter = 0; safe && parameter < signature->ParameterSlots; ++parameter) {
+        const auto type = signature->ParameterTypes[parameter];
+        if (type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) continue;
+        const auto *root_range = signature->GetRootDescriptorRange(parameter);
+        const auto ranges = type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ? signature->GetTableRanges(parameter)
+            : std::span<const MTLD3D12RootSignature::TableRange>{root_range, root_range ? 1u : 0u};
+        if (type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+          for (const auto &range : ranges) {
+            if (!(range.descriptor_flags & D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE)) continue;
+            signature->ForEachUsedDescriptorRange(
+                std::span<const MTLD3D12RootSignature::TableRange>{&range, 1}, pso_graphics_->resource_bindings,
+                [&](uint64_t, uint64_t, D3D12_DESCRIPTOR_RANGE_TYPE kind) {
+                  if (kind != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) safe = false;
+                });
+            if (!safe) break;
+          }
+          if (!safe) break;
+        }
+        signature->ForEachUsedDescriptorRange(ranges, pso_graphics_->resource_bindings,
+            [&](uint64_t offset, uint64_t count, D3D12_DESCRIPTOR_RANGE_TYPE kind) {
+          if (!safe || kind == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) return;
+          // Root SRV reflection cannot exclude inline RayQuery's transitive AS reads.
+          if (kind == D3D12_DESCRIPTOR_RANGE_TYPE_UAV ||
+              (type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && type != D3D12_ROOT_PARAMETER_TYPE_CBV)) {
+            safe = false; return;
+          }
+          if (type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+            ShaderVisibleDescriptorCPUStorage descriptor{};
+            descriptor.type = ShaderVisibleDescriptorType::ConstantBuffer;
+            descriptor.ConstantBuffer = {rootarg_graphics_staging_[signature->SlotQwordOffsets[parameter]], 1};
+            safe = NativeMSAADescriptorSafe(device_, descriptor);
+            return;
+          }
+          D3D12_DESCRIPTOR_HEAP_DESC desc{}; D3D12_GPU_DESCRIPTOR_HANDLE start{};
+          if (!heap) { safe = false; return; }
+          heap->GetDesc(&desc); heap->GetGPUDescriptorHandleForHeapStart(&start);
+          const auto address = rootarg_graphics_staging_[signature->SlotQwordOffsets[parameter]];
+          if (!start.ptr || address < start.ptr || (address - start.ptr) % 32) { safe = false; return; }
+          const auto base = (address - start.ptr) / 32;
+          if (base >= desc.NumDescriptors || offset >= desc.NumDescriptors - base ||
+              count > desc.NumDescriptors - base - offset || count > kRecordedSubmissionBufferBudget - descriptor_count) {
+            safe = false; return;
+          }
+          descriptor_count += count;
+          for (uint64_t i = 0; safe && i < count; ++i) {
+            const auto &descriptor = heap->GetDescriptor(base + offset + i);
+            safe = NativeMSAADescriptorSafe(device_, descriptor);
+            if (!safe || !capture || descriptor.type == ShaderVisibleDescriptorType::Null) continue;
+            const bool texture = descriptor.type == ShaderVisibleDescriptorType::SRVTexture;
+            const bool cbv = descriptor.type == ShaderVisibleDescriptorType::ConstantBuffer;
+            const bool texel = descriptor.type == ShaderVisibleDescriptorType::SRVTexelBuffer;
+            if (!cbv) {
+              const void *backing = texture ? static_cast<const void *>(descriptor.SRVTexture.texture)
+                  : texel ? static_cast<const void *>(descriptor.SRVTexelBuffer.buffer)
+                          : static_cast<const void *>(descriptor.SRVBuffer.buffer);
+              auto owner = device_->LookupDescriptorResource(backing, descriptor.owner_id);
+              if (!owner) { safe = false; break; }
+              if (std::none_of(capture->native_msaa_resources.begin(), capture->native_msaa_resources.end(),
+                              [&](const auto &resource) { return resource.ptr() == static_cast<ID3D12Resource *>(owner.ptr()); }))
+                capture->native_msaa_resources.push_back(static_cast<ID3D12Resource *>(owner.ptr()));
+            }
+            if (texture) {
+              auto *allocation = descriptor.SRVTexture.texture->current();
+              if (std::none_of(capture->native_msaa_texture_allocations.begin(), capture->native_msaa_texture_allocations.end(),
+                              [&](const auto &retained) { return retained.ptr() == allocation; }))
+                capture->native_msaa_texture_allocations.emplace_back(allocation);
+            } else {
+              uint64_t ignored = 0;
+              auto *allocation = cbv ? device_->LookupBufferByVA(descriptor.ConstantBuffer.address, &ignored)
+                  : texel ? descriptor.SRVTexelBuffer.buffer->current() : descriptor.SRVBuffer.buffer->current();
+              if (allocator_->recording_head_->root_allocation_set.insert(allocation).second)
+                allocator_->recording_head_->root_allocations.emplace_back(allocation);
+            }
+          }
+        });
+      }
+      if (capture && safe)
+        safe = CaptureSubmissionAccess(capture->submission_buffers, capture->submission_tables, signature,
+            rootarg_graphics_staging_, *pso_graphics_.ptr(), WMTMetal4StageVertex | WMTMetal4StageFragment,
+            capture->submission_snapshot_budget, capture->submission_root_srv_opaque);
+    } catch (const std::bad_alloc &) { if (capture) RecordError(E_OUTOFMEMORY); return false; }
+    return safe;
+  }
+
+  bool CanUseNativeMSAA() {
+    if (!pso_graphics_ || !pso_graphics_->native_msaa_pso || render_pass_internal_ || predication_enabled_ ||
+        !active_visibility_queries_.empty() || !active_pipeline_statistics_.empty() || !active_so_queries_.empty() ||
+        sample_positions_.count || shading_rate_image_ || CoarseShadingRateState() ||
+        pso_graphics_->view_instancing.count || pso_graphics_->view_location_offsets ||
+        (topology_ != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && topology_ != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP))
+      return false;
+    if (!NativeMSAABindingsSafe()) return false;
+    const auto count = pso_graphics_->EffectiveRasterSampleCount();
+    bool attachment = false;
+    for (unsigned i = 0; i <= num_rtvs; ++i) {
+      const auto handle = i == num_rtvs ? dsv : rtvs[i];
+      if (!handle.ptr) continue;
+      attachment = true;
+      auto [heap, index] = GetRenderTargetHeap(device_, handle);
+      const auto desc = heap->GetRenderTarget(index);
+      if (!desc.Texture || desc.BufferResource || desc.Flags || desc.DepthPlane || desc.RenderTargetArrayLength > 1)
+        return false;
+      const auto *v = &desc.Texture->view(desc.View);
+      const auto *a = v->allocation;
+      if (v->castBlockSize || v->msaaSampleAddress || v->reservedCast || v->reservedVolumeRender ||
+          v->reservedVolumeAtlasCast || a->canonicalHeap || a->flags().test(TextureAllocationFlag::Shared) ||
+          a->flags().test(TextureAllocationFlag::PlacementSparse) ||
+          a->descriptor->sampleCount() != count || a->descriptor->textureType() != WMTTextureType2DMultisample ||
+          v->key.mip_start || v->key.array_start || v->key.array_end != 1 ||
+          device_->LookupStandardSwizzleTexture(a->descriptor)) return false;
+    }
+    if (!attachment) return false;
+    std::vector<RecordedBufferAccess> buffers;
+    std::unique_ptr<std::vector<StandardSwizzleTableUse>> tables;
+    bool budget = false, opaque = false;
+    return CaptureSubmissionAccess<true>(buffers, tables, rootsig_graphics_.ptr(), rootarg_graphics_staging_,
+        *pso_graphics_.ptr(), WMTMetal4StageVertex | WMTMetal4StageFragment, budget, opaque);
+  }
+
+  bool CanRetainVisibilityIntervals() {
+    return pso_graphics_ && !render_pass_internal_ && !RequiresMSAAExecution() &&
+        pso_graphics_->mesh_kind == MeshPipelineKind::None && !pso_graphics_->uses_atomic64 &&
+        !pso_graphics_->stream_output.active && active_pipeline_statistics_.empty() && active_so_queries_.empty() &&
+        !predication_enabled_ && !pso_graphics_->view_instancing.count && !pso_graphics_->view_location_offsets &&
+        !sample_positions_.count && !shading_rate_image_ && !pso_graphics_->needs_rov_buffer_marker;
+  }
+
+  bool RecordVisibilityInterval(RenderEncoderData *render) {
+    if (!render->visibility_interval_dirty) return true;
+    try {
+      const auto offset = render->visibility_interval_count * sizeof(uint64_t);
+      if (!active_visibility_queries_.empty()) {
+        if (render->visibility_interval_count == UINT64_MAX / sizeof(uint64_t)) {
+          RecordError(E_OUTOFMEMORY); return false;
+        }
+        ++render->visibility_interval_count;
+        for (const auto &query : active_visibility_queries_)
+          render->visibility_targets.push_back({query.destination, query.accumulate_pipeline, query.heap_id,
+                                                query.index, offset, false});
+      }
+      auto &mode = allocator_->EncodeRenderCommand<wmtcmd_render_setvisibilitymode>();
+      mode.type = WMTRenderCommandSetVisibilityMode;
+      mode.mode = active_visibility_queries_.empty() ? WMTVisibilityResultModeDisabled : WMTVisibilityResultModeCounting;
+      mode.offset = active_visibility_queries_.empty() ? 0 : offset;
+      render->visibility_interval_dirty = false;
+      return true;
+    } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return false; }
+  }
+
   DrawCallStatus
-  PreDraw(bool SkipResourceBinding = false, bool IndexPull = false, uint32_t MeshKey = ~0u) {
+  PreDraw(bool SkipResourceBinding = false, bool IndexPull = false, uint32_t MeshKey = ~0u, bool NativeMSAA = false) {
     if (!pso_graphics_)
       return DrawCallStatus::Invalid;
     if (pso_graphics_->uses_atomic64)
       allocator_->InvalidateCurrentPass();
+    if (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render &&
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->visibility_intervals &&
+        !CanRetainVisibilityIntervals()) allocator_->InvalidateCurrentPass();
     if (sample_positions_.count && sample_positions_.count != pso_graphics_->EffectiveRasterSampleCount()) {
       RecordError();
       return DrawCallStatus::Invalid;
@@ -1876,19 +2171,49 @@ public:
     const uint32_t raster_samples = std::min(pso_graphics_->EffectiveRasterSampleCount(), 8u);
     const bool center_quality = pso_graphics_->owned_sample_desc.Quality == 0xfffffffeu;
     const bool center_sample_pattern = center_quality && !sample_positions_.count;
+    auto effective_positions = sample_positions_;
+    if (NativeMSAA && !center_sample_pattern) {
+      static constexpr D3D12_SAMPLE_POSITION standard2[] = {{4,4}, {-4,-4}};
+      static constexpr D3D12_SAMPLE_POSITION standard4[] = {{-2,-6}, {6,-2}, {-6,2}, {2,6}};
+      static constexpr D3D12_SAMPLE_POSITION standard8[] = {{1,-3}, {-1,3}, {5,1}, {-3,-5},
+                                                           {-5,5}, {-7,-1}, {3,7}, {7,-7}};
+      const auto *positions = raster_samples == 2 ? standard2 : raster_samples == 4 ? standard4 : standard8;
+      effective_positions.count = raster_samples;
+      for (unsigned i = 0; i < raster_samples; ++i) {
+        effective_positions.positions[i][0] = positions[i].X;
+        effective_positions.positions[i][1] = positions[i].Y;
+      }
+    }
     if (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render) {
       const auto *render = static_cast<const RenderEncoderData *>(allocator_->encoder_current);
       // An attachmentless pass takes its sample count from the PSO. Metal
       // cannot change that count while the render encoder remains open.
       if ((render->default_raster_sample_count && render->default_raster_sample_count != raster_samples) ||
-          render->center_sample_pattern != center_sample_pattern)
+          render->center_sample_pattern != center_sample_pattern ||
+          render->native_msaa_sample_count != (NativeMSAA ? raster_samples : 0) ||
+          std::memcmp(&render->sample_positions, &effective_positions, sizeof(effective_positions)))
         allocator_->InvalidateCurrentPass();
+    }
+    if (NativeMSAA && allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render) {
+      auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+      bool budget = false, opaque = false;
+      if (!CaptureSubmissionAccess<true>(render->submission_buffers, render->submission_tables,
+          rootsig_graphics_.ptr(), rootarg_graphics_staging_, *pso_graphics_.ptr(),
+          WMTMetal4StageVertex | WMTMetal4StageFragment, budget, opaque)) {
+        if (!budget) { RecordError(E_INVALIDARG); return DrawCallStatus::Invalid; }
+        owned_graphics::Trace("native_msaa_budget_rollover", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+            ",\"encoder\":", render->id, ",\"buffer_snapshots\":", render->submission_buffers.size(),
+            ",\"table_snapshots\":", render->submission_tables ? render->submission_tables->size() : 0,
+            ",\"limit\":", kRecordedSubmissionBufferBudget, ",\"cause\":\"binding_budget\"");
+        allocator_->InvalidateCurrentPass();
+      }
     }
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render) {
 
-      allocator_->InvalidateCurrentPass();
+      allocator_->EndSchedulingPass();
       auto render = allocator_->AllocatePass<RenderEncoderData>();
       render->type = EncoderType::Render;
+      render->submission_group_safe = true;
       render->cmd_head.type = WMTRenderCommandNop;
       render->cmd_head.next.set(0);
       render->cmd_tail = (wmtcmd_base *)&render->cmd_head;
@@ -1896,8 +2221,11 @@ public:
       render->dsv_readonly_flags = 0;
       render->render_target_count = num_rtvs;
       render->center_sample_pattern = center_sample_pattern;
-      render->sample_positions = sample_positions_;
-      if (!active_visibility_queries_.empty()) {
+      render->sample_positions = effective_positions;
+      render->native_msaa_sample_count = NativeMSAA ? raster_samples : 0;
+      render->visibility_intervals = CanRetainVisibilityIntervals();
+      render->visibility_interval_dirty = render->visibility_intervals;
+      if (!render->visibility_intervals && !active_visibility_queries_.empty()) {
         WMTBufferInfo visibility_info{};
         visibility_info.length = sizeof(uint64_t);
         visibility_info.options = WMTResourceHazardTrackingModeUntracked;
@@ -1998,6 +2326,7 @@ public:
           rt.store_action = WMTStoreActionStore;
         }
         render->dsv_planar_flags = dsv_planar_flags;
+        render->dsv_descriptor_flags = AttachmentDesc.Flags;
         render_target_width = std::min(render_target_width, AttachmentDesc.Width);
         render_target_height = std::min(render_target_height, AttachmentDesc.Height);
         render_target_array_length = std::max(render_target_array_length, AttachmentDesc.RenderTargetArrayLength);
@@ -2011,6 +2340,51 @@ public:
         render->default_raster_sample_count = raster_samples;
       }
 
+      // Fold while recording, never while executing a replayable command list. Keep the clear
+      // object alive so its retained attachment is released by normal allocator destruction.
+      if (!render_pass_internal_ && !mesh && !RequiresMSAAExecution() && !pso_graphics_->uses_atomic64 &&
+          !pso_graphics_->stream_output.active && active_pipeline_statistics_.empty() &&
+          !sample_positions_.count && allocator_->encoder_last->type == EncoderType::Clear) {
+        auto *clear = static_cast<ClearEncoderData *>(allocator_->encoder_last);
+        if (clear->width == render_target_width && clear->height == render_target_height &&
+            clear->array_length == render_target_array_length && !clear->sample_positions.count &&
+            !device_->LookupStandardSwizzleTexture(clear->attachment.ptr()->allocation->descriptor)) {
+          if (!clear->clear_dsv) {
+            for (unsigned i = 0; i < num_rtvs; i++) {
+              auto &rt = render->colors[i];
+              if (rt.attachment.ptr() != clear->attachment.ptr() || rt.depth_plane != clear->depth_plane ||
+                  rt.load_action != WMTLoadActionLoad)
+                continue;
+              rt.load_action = WMTLoadActionClear;
+              rt.clear_color = clear->color;
+              clear->folded_into_render = true;
+              break;
+            }
+          } else if ((!(clear->clear_dsv & 1) ||
+                      (render->depth.attachment.ptr() == clear->attachment.ptr() &&
+                       render->depth.depth_plane == clear->depth_plane &&
+                       render->depth.load_action == WMTLoadActionLoad)) &&
+                     (!(clear->clear_dsv & 2) ||
+                      (render->stencil.attachment.ptr() == clear->attachment.ptr() &&
+                       render->stencil.depth_plane == clear->depth_plane &&
+                       render->stencil.load_action == WMTLoadActionLoad))) {
+            if (clear->clear_dsv & 1) {
+              render->depth.load_action = WMTLoadActionClear;
+              render->depth.clear_depth = clear->depth_stencil.first;
+            }
+            if (clear->clear_dsv & 2) {
+              render->stencil.load_action = WMTLoadActionClear;
+              render->stencil.clear_stencil = clear->depth_stencil.second;
+            }
+            clear->folded_into_render = true;
+          }
+          if (clear->folded_into_render)
+            owned_graphics::Trace("clear_load_folded", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                                  ",\"clear\":", clear->id, ",\"encoder\":", render->id,
+                                  ",\"aspects\":", clear->clear_dsv);
+        }
+      }
+
       dirty_state_.set(DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
       dirty_state_.set(DirtyState::Viewport, DirtyState::ScissorRect);
       dirty_state_.set(DirtyState::BlendFactor, DirtyState::StencilRef);
@@ -2019,6 +2393,51 @@ public:
 
     if (!pso_graphics_)
       return DrawCallStatus::Invalid;
+
+    auto *submission_render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+    if (NativeMSAA) {
+      if (!NativeMSAABindingsSafe(submission_render)) { RecordError(E_INVALIDARG); return DrawCallStatus::Invalid; }
+      try {
+        for (unsigned slot = 0; slot < vertex_buffers_.size(); ++slot) {
+          if (!(pso_graphics_->slot_mask & (1u << slot))) continue;
+          uint64_t offset = 0;
+          auto *allocation = device_->LookupBufferByVA(vertex_buffers_[slot].BufferLocation, &offset);
+          if (!allocation) { RecordError(E_INVALIDARG); return DrawCallStatus::Invalid; }
+          if (allocator_->recording_head_->root_allocation_set.insert(allocation).second)
+            allocator_->recording_head_->root_allocations.emplace_back(allocation);
+        }
+      } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return DrawCallStatus::Invalid; }
+    }
+    if (submission_render->visibility_intervals && !RecordVisibilityInterval(submission_render))
+      return DrawCallStatus::Invalid;
+    submission_render->submission_color_output_mask |= pso_graphics_->submission_color_output_mask;
+    submission_render->submission_group_safe &= !render_pass_internal_ && !mesh && !SkipResourceBinding &&
+        !IndexPull && !predication_enabled_ && !statistics &&
+        active_visibility_queries_.empty() && active_so_queries_.empty() &&
+        !pso_graphics_->stream_output.active && !RequiresMSAAExecution() &&
+        !pso_graphics_->view_instancing.count &&
+        !pso_graphics_->uses_atomic64 && !pso_graphics_->needs_rov_buffer_marker && !shading_rate_image_ &&
+        pso_graphics_->submission_mapping_safe &&
+        CaptureSubmissionAccess(submission_render->submission_buffers, submission_render->submission_tables,
+            rootsig_graphics_.ptr(), rootarg_graphics_staging_, *pso_graphics_.ptr(), WMTMetal4StageVertex | WMTMetal4StageFragment,
+            submission_render->submission_snapshot_budget, submission_render->submission_root_srv_opaque);
+    if (submission_render->submission_group_safe) {
+      try {
+        for (unsigned slot = 0; slot < 32; ++slot)
+          if (pso_graphics_->slot_mask & (1u << slot)) {
+            const auto &input = vertex_buffers_[slot];
+            if (!input.BufferLocation || !input.SizeInBytes) submission_render->submission_group_safe = false;
+            else if (std::none_of(submission_render->submission_buffers.begin(), submission_render->submission_buffers.end(),
+                [&](const auto &use) { return use.address == input.BufferLocation && use.length == input.SizeInBytes &&
+                    !use.writes && use.stages == WMTMetal4StageVertex; })) {
+              if (submission_render->submission_buffers.size() == kRecordedSubmissionBufferBudget) {
+                submission_render->submission_snapshot_budget = true; submission_render->submission_group_safe = false; break;
+              }
+              submission_render->submission_buffers.push_back({input.BufferLocation, input.SizeInBytes, false, WMTMetal4StageVertex});
+            }
+          }
+      } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return DrawCallStatus::Invalid; }
+    }
 
     if (pso_graphics_->needs_rov_buffer_marker) {
       auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
@@ -2112,14 +2531,45 @@ public:
     if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
       // MSAA producers replay only shader bindings; their capture and pixel
       // variants are selected by RecordMSAADraw, never this direct raster PSO.
-      if (!RequiresMSAAExecution()) {
+      if (NativeMSAA || !RequiresMSAAExecution()) {
         auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
         cmd_setpso.type = WMTRenderCommandSetPSO;
-        cmd_setpso.pso = statistics ? pso_graphics_->GetPipelineStatisticsPipelineState(false)
+        cmd_setpso.pso = NativeMSAA ? pso_graphics_->GetNativeMSAAPipelineState(IndexPull)
+                                   : statistics ? pso_graphics_->GetPipelineStatisticsPipelineState(false)
                                    : IndexPull ? pso_graphics_->GetIndexPullPipelineState(false) : pso_graphics_->pso;
+        if (!NativeMSAA && !statistics && !IndexPull && pso_graphics_->submission_mapping_safe) {
+          uint8_t bound_outputs = 0;
+          for (unsigned logical = 0; logical < submission_render->render_target_count; ++logical)
+            if (submission_render->colors[logical].attachment) bound_outputs |= 1u << logical;
+          const uint8_t disabled = pso_graphics_->submission_color_output_mask & ~bound_outputs;
+          if (disabled) {
+            try {
+              cmd_setpso.pso = pso_graphics_->GetColorWriteMaskPipelineState(disabled);
+              if (cmd_setpso.pso) {
+                auto &retained_pipelines = submission_render->masked_pipeline_states;
+                if (std::none_of(retained_pipelines.begin(), retained_pipelines.end(), [&](const auto &pipeline) {
+                      return pipeline.handle == cmd_setpso.pso;
+                    })) {
+                  retained_pipelines.push_back(WMT::RenderPipelineState{cmd_setpso.pso});
+                }
+              }
+            } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return DrawCallStatus::Invalid; }
+          }
+        }
         if (!cmd_setpso.pso) {
           RecordError(E_FAIL);
           return DrawCallStatus::Invalid;
+        }
+        direct_pipeline_bound_ = cmd_setpso.pso;
+        if (NativeMSAA) {
+          try {
+            auto &retained = submission_render->masked_pipeline_states;
+            if (std::none_of(retained.begin(), retained.end(), [&](const auto &pso) { return pso.handle == cmd_setpso.pso; }))
+              retained.push_back(WMT::RenderPipelineState{cmd_setpso.pso});
+          } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return DrawCallStatus::Invalid; }
+          owned_graphics::Trace("native_msaa_record", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+              ",\"encoder\":", submission_render->id, ",\"sample_count\":", raster_samples,
+              ",\"center\":", center_sample_pattern, ",\"index_pull\":", IndexPull, ",\"pso\":", cmd_setpso.pso);
         }
       }
       auto &retained = static_cast<RenderEncoderData *>(allocator_->encoder_current)->immutable_constant_buffers;
@@ -2176,7 +2626,8 @@ public:
       dirty_state_.clr(DirtyState::VertexBuffer);
     }
 
-    if (dirty_state_.test(DirtyState::GraphicsRootArguments) && !SkipResourceBinding) {
+    const bool capture_swizzle_tables = dirty_state_.test(DirtyState::GraphicsRootArguments);
+    if (capture_swizzle_tables && !SkipResourceBinding) {
       if (rootsig_graphics_) {
         auto Offset = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
         if (Offset == UINT64_MAX)
@@ -2300,8 +2751,13 @@ public:
       cmd.render_target_array_offset = view_location_.RenderTargetArrayIndex;
     }
 
-    CaptureStandardSwizzleTables(static_cast<RenderEncoderData *>(allocator_->encoder_current)->swizzle_tables,
-                                 rootsig_graphics_.ptr(), rootarg_graphics_staging_, pso_graphics_->uses_atomic64, pso_graphics_.ptr());
+    // Ordinary captures cover the complete table, including later PSOs. A new
+    // pass or changed root arguments needs another capture; atomic phases keep
+    // their per-PSO capture because those ranges are shader-restricted.
+    if (capture_swizzle_tables || pso_graphics_->uses_atomic64)
+      CaptureStandardSwizzleTables(
+          static_cast<RenderEncoderData *>(allocator_->encoder_current)->swizzle_tables,
+          rootsig_graphics_.ptr(), rootarg_graphics_staging_, pso_graphics_->uses_atomic64, pso_graphics_.ptr());
     if (pso_graphics_->uses_atomic64) {
       auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
       render->atomic64_phase = true;
@@ -2903,7 +3359,8 @@ public:
     uint32_t cp_count;
     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
       return;
-    const bool msaa_execution = RequiresMSAAExecution();
+    const bool native_msaa = CanUseNativeMSAA();
+    const bool msaa_execution = RequiresMSAAExecution() && !native_msaa;
     if (msaa_execution)
       allocator_->InvalidateCurrentPass();
     uint64_t predicated_offset = 0;
@@ -2920,9 +3377,12 @@ public:
         (pso_graphics_->stream_output.active || !active_pipeline_statistics_.empty());
     if (stream_output && !PrepareStreamOutputDraw(VertexCountPerInstance, InstanceCount, false, 0, 0))
       return;
-    DrawCallStatus status = PreDraw();
+    DrawCallStatus status = PreDraw(false, false, ~0u, native_msaa);
     if (status == DrawCallStatus::Invalid)
       return;
+    if (native_msaa) owned_graphics::Trace("native_msaa_draw_record", ",\"list\":", owned_id,
+        ",\"recording\":", owned_recording, ",\"encoder\":", allocator_->encoder_current->id,
+        ",\"indexed\":0,\"index_pull\":0,\"count\":", VertexCountPerInstance, ",\"instances\":", InstanceCount);
     if (stream_output && !BindStreamOutputDraw())
       return;
     if (msaa_execution) {
@@ -3512,7 +3972,8 @@ public:
     uint32_t cp_count;
     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
       return;
-    const bool msaa_execution = RequiresMSAAExecution();
+    const bool native_msaa = CanUseNativeMSAA();
+    const bool msaa_execution = RequiresMSAAExecution() && !native_msaa;
     if (msaa_execution)
       allocator_->InvalidateCurrentPass();
     // A stream-output draw is issued over its generated IA positions (StreamOutputDrawData); the
@@ -3543,9 +4004,30 @@ public:
     if (stream_output &&
         !PrepareStreamOutputDraw(IndexCountPerInstance, InstanceCount, true, StartVertexLocation, BaseVertexLocation))
       return;
-    DrawCallStatus status = PreDraw(false, pull_indices);
+    DrawCallStatus status = PreDraw(false, pull_indices, ~0u, native_msaa);
     if (status == DrawCallStatus::Invalid)
       return;
+    if (native_msaa) owned_graphics::Trace("native_msaa_draw_record", ",\"list\":", owned_id,
+        ",\"recording\":", owned_recording, ",\"encoder\":", allocator_->encoder_current->id,
+        ",\"indexed\":1,\"index_pull\":", pull_indices, ",\"count\":", IndexCountPerInstance,
+        ",\"instances\":", InstanceCount);
+    try {
+      if (native_msaa) {
+        uint64_t offset = 0;
+        auto *allocation = device_->LookupBufferByVA(index_buffer_address, &offset);
+        if (!allocation) { RecordError(E_INVALIDARG); return; }
+        if (allocator_->recording_head_->root_allocation_set.insert(allocation).second)
+          allocator_->recording_head_->root_allocations.emplace_back(allocation);
+      }
+      auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+      if (render->submission_group_safe && render->submission_buffers.size() == kRecordedSubmissionBufferBudget) {
+        render->submission_snapshot_budget = true; render->submission_group_safe = false;
+      }
+      if (render->submission_group_safe)
+        render->submission_buffers.push_back({index_buffer_address +
+            uint64_t(StartVertexLocation) * (index_type == WMTIndexTypeUInt32 ? 4 : 2),
+            uint64_t(IndexCountPerInstance) * (index_type == WMTIndexTypeUInt32 ? 4 : 2), false, WMTMetal4StageVertex});
+    } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return; }
     if (stream_output && !BindStreamOutputDraw())
       return;
     if (msaa_execution) {
@@ -3660,8 +4142,9 @@ public:
     const bool statistics = !active_pipeline_statistics_.empty();
     if (pso_compute_ && pso_compute_->uses_atomic64) allocator_->InvalidateCurrentPass();
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute) {
-      allocator_->InvalidateCurrentPass();
+      allocator_->EndSchedulingPass();
       auto compute = allocator_->AllocatePass<ComputeEncoderData>();
+      compute->submission_access_complete = true;
       compute->type = EncoderType::Compute;
       compute->cmd_head.type = WMTComputeCommandNop;
       compute->cmd_head.next.set(0);
@@ -3672,6 +4155,12 @@ public:
 
     if (!pso_compute_)
         return false;
+    auto *submission_compute = static_cast<ComputeEncoderData *>(allocator_->encoder_current);
+    submission_compute->submission_access_complete &= !SkipResourceBinding && !statistics &&
+        !predication_enabled_ && !pso_compute_->uses_atomic64 &&
+        CaptureSubmissionAccess(submission_compute->submission_buffers, submission_compute->submission_tables,
+            rootsig_compute_.ptr(), rootarg_compute_staging_, *pso_compute_.ptr(), WMTMetal4StageDispatch,
+            submission_compute->submission_snapshot_budget, submission_compute->submission_root_srv_opaque);
 
     if (dirty_state_.test(DirtyState::ComputePipelineState)) {
       auto &cmd_setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
@@ -3709,7 +4198,8 @@ public:
       dirty_state_.clr(DirtyState::ComputePipelineState);
     }
 
-    if (dirty_state_.test(DirtyState::ComputeRootArguments) && !SkipResourceBinding) {
+    const bool capture_swizzle_tables = dirty_state_.test(DirtyState::ComputeRootArguments);
+    if (capture_swizzle_tables && !SkipResourceBinding) {
       if (rootsig_compute_) {
         auto Offset = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_);
         if (Offset == UINT64_MAX)
@@ -3735,8 +4225,10 @@ public:
       dirty_state_.clr(DirtyState::ComputeRootSignature);
     }
 
-    CaptureStandardSwizzleTables(static_cast<ComputeEncoderData *>(allocator_->encoder_current)->swizzle_tables,
-                                 rootsig_compute_.ptr(), rootarg_compute_staging_, pso_compute_->uses_atomic64, pso_compute_.ptr());
+    if (capture_swizzle_tables || pso_compute_->uses_atomic64)
+      CaptureStandardSwizzleTables(
+          static_cast<ComputeEncoderData *>(allocator_->encoder_current)->swizzle_tables,
+          rootsig_compute_.ptr(), rootarg_compute_staging_, pso_compute_->uses_atomic64, pso_compute_.ptr());
     auto *compute = static_cast<ComputeEncoderData *>(allocator_->encoder_current);
     compute->atomic64_phase |= pso_compute_->uses_atomic64;
     if (pso_compute_->uses_atomic64) {
@@ -3800,7 +4292,7 @@ public:
   bool
   PreBlit() {
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Blit) {
-      allocator_->InvalidateCurrentPass();
+      allocator_->EndSchedulingPass();
       auto render = allocator_->AllocatePass<BlitEncoderData>();
       render->type = EncoderType::Blit;
       render->cmd_head.type = WMTBlitCommandNop;
@@ -3862,6 +4354,11 @@ public:
     auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
     cmd_cp.type = WMTBlitCommandCopyFromBufferToBuffer;
     cmd_cp.src = src_resource->buffer->current()->buffer();
+    try {
+      auto &uses = static_cast<BlitEncoderData *>(allocator_->encoder_current)->submission_buffers;
+      uses.push_back({src_resource->buffer->current()->gpuAddress() + SrcOffset, ByteCount, false});
+      uses.push_back({dst_resource->buffer->current()->gpuAddress() + DstOffset, ByteCount, true});
+    } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return; }
     cmd_cp.dst = dst_resource->buffer->current()->buffer();
     cmd_cp.src_offset = SrcOffset;
     cmd_cp.dst_offset = DstOffset;
@@ -5763,6 +6260,26 @@ public:
     }
   }
 
+  void CaptureBoundaryResource(RecordedBoundary &boundary, MTLD3D12Resource *resource) {
+    if (!resource || resource->reserved || resource->share || resource->swizzle_layout || resource->feedback) return;
+    if (resource->buffer) {
+      boundary.buffer = Rc<BufferAllocation>(resource->buffer->current());
+      boundary.resource_scoped = bool(boundary.buffer) && !boundary.buffer->canonicalHeap &&
+          !boundary.buffer->reservedResource && !boundary.buffer->flags().test(BufferAllocationFlag::PlacementSparse);
+    } else if (resource->texture) {
+      const auto desc = resource->GetDesc();
+      boundary.mip_count = std::max<UINT16>(desc.MipLevels, 1);
+      boundary.array_count = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
+      boundary.plane_count = BarrierStateFor(resource)->subresource_count / (boundary.mip_count * boundary.array_count);
+      if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) boundary.texture_aspects = boundary.plane_count > 1 ? 3 : 1;
+      boundary.texture = Rc<TextureAllocation>(resource->texture->current());
+      boundary.resource_scoped = bool(boundary.texture) && !boundary.texture->canonicalHeap && desc.SampleDesc.Count == 1 &&
+          !boundary.texture->flags().test(TextureAllocationFlag::Shared) &&
+          !boundary.texture->flags().test(TextureAllocationFlag::PlacementSparse) &&
+          (boundary.plane_count == 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+    }
+  }
+
   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
     if (RejectBundleOperation())
       return;
@@ -5801,13 +6318,13 @@ public:
         D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_RESOLVE_SOURCE |
         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE |
         D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE | D3D12_RESOURCE_STATE_PREDICATION;
+    constexpr D3D12_RESOURCE_STATES write_states = D3D12_RESOURCE_STATE_RENDER_TARGET |
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+        D3D12_RESOURCE_STATE_STREAM_OUT | D3D12_RESOURCE_STATE_COPY_DEST |
+        D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
     auto valid_state = [](D3D12_RESOURCE_STATES state) {
       if (state & ~valid_states)
         return false;
-      constexpr D3D12_RESOURCE_STATES write_states = D3D12_RESOURCE_STATE_RENDER_TARGET |
-          D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
-          D3D12_RESOURCE_STATE_STREAM_OUT | D3D12_RESOURCE_STATE_COPY_DEST |
-          D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
       const UINT writes = std::popcount(UINT(state & write_states));
       return writes <= 1 && (!writes || !(state & ~write_states));
     };
@@ -5870,15 +6387,16 @@ public:
     // Resources use untracked Metal storage. Consecutive commands in the same
     // encoder therefore cannot ignore a UAV or aliasing dependency. A pass
     // boundary makes the queue emit updateFence/endEncoding followed by the
-    // next encoder's waitForFence. This deliberately over-synchronizes valid
-    // legacy transition/UAV/aliasing barriers without a CPU or queue-idle wait.
-    // Split barriers may complete early; END_ONLY also establishes a boundary.
+    // next encoder's waitForFence. Only unsplit read-to-read transitions need
+    // no GPU ordering. COMMON/PRESENT, writes, split barriers and sparse aliases
+    // retain the conservative boundary without a CPU or queue-idle wait.
     for (UINT i = 0; owned_graphics::TraceEnabled() && i < Count; ++i) {
       const auto &barrier = barriers[i];
       if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
         auto resource = static_cast<MTLD3D12Resource *>(barrier.Transition.pResource);
         owned_graphics::Trace("transition", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                               ",\"resource\":", resource ? resource->owned_id : 0,
+                              ",\"dimension\":", resource ? uint32_t(resource->GetDesc().Dimension) : 0,
                               ",\"before\":", uint32_t(barrier.Transition.StateBefore),
                               ",\"after\":", uint32_t(barrier.Transition.StateAfter),
                               ",\"subresource\":", barrier.Transition.Subresource,
@@ -5896,12 +6414,31 @@ public:
       }
     }
     auto &state_events = static_cast<RecordingHead *>(entry)->state_events;
+    bool needs_boundary = false;
     try {
       for (UINT i = 0; i < Count; ++i) {
         const auto &barrier = barriers[i];
-        if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+        auto &scope = allocator_->RecordBoundary(barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV ? RecordedBoundaryReason::UAV :
+            barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING ? RecordedBoundaryReason::Alias :
+            barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE ? RecordedBoundaryReason::Split :
+                                                              RecordedBoundaryReason::StateTransition);
+        if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+          CaptureBoundaryResource(scope, static_cast<MTLD3D12Resource *>(barrier.UAV.pResource));
+          scope.access_before = scope.access_after = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+        }
+        if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+          needs_boundary = true;
           continue;
+        }
+        needs_boundary |= barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE ||
+            barrier.Transition.StateBefore == D3D12_RESOURCE_STATE_COMMON ||
+            barrier.Transition.StateAfter == D3D12_RESOURCE_STATE_COMMON ||
+            ((barrier.Transition.StateBefore | barrier.Transition.StateAfter) & write_states) != 0;
         const auto resource = static_cast<MTLD3D12Resource *>(barrier.Transition.pResource);
+        CaptureBoundaryResource(scope, resource);
+        scope.subresources.IndexOrFirstMipLevel = barrier.Transition.Subresource;
+        scope.access_before = D3D12_BARRIER_ACCESS(enhanced_barrier::AccessFromLegacyState(barrier.Transition.StateBefore));
+        scope.access_after = D3D12_BARRIER_ACCESS(enhanced_barrier::AccessFromLegacyState(barrier.Transition.StateAfter));
         state_events.push_back({BarrierStateFor(resource), barrier.Transition.Subresource,
                                 barrier.Transition.StateBefore, barrier.Transition.StateAfter, barrier.Flags});
       }
@@ -5909,8 +6446,10 @@ public:
       RecordError(E_OUTOFMEMORY);
       return;
     }
-    allocator_->InvalidateCurrentPass();
-    RecordAliasFlush();
+    if (needs_boundary || ReservedResource::AnyLive()) {
+      allocator_->EndSchedulingPass();
+      RecordAliasFlush();
+    }
   };
 
   /*
@@ -6144,6 +6683,9 @@ public:
         for (UINT32 i = 0; i < group.NumBarriers; ++i) {
           if (group.Type == D3D12_BARRIER_TYPE_GLOBAL) {
             const auto &b = group.pGlobalBarriers[i];
+            auto &scope = allocator_->RecordBoundary(RecordedBoundaryReason::EnhancedGlobal);
+            scope.sync_before = b.SyncBefore; scope.sync_after = b.SyncAfter;
+            scope.access_before = b.AccessBefore; scope.access_after = b.AccessAfter;
             orders(b.SyncBefore, b.SyncAfter);
             owned_graphics::Trace("global_barrier", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                                   ",\"sync_before\":", uint32_t(b.SyncBefore),
@@ -6155,6 +6697,12 @@ public:
           event.subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
           if (group.Type == D3D12_BARRIER_TYPE_BUFFER) {
             const auto &b = group.pBufferBarriers[i];
+            auto &scope = allocator_->RecordBoundary(b.SyncBefore == D3D12_BARRIER_SYNC_SPLIT || b.SyncAfter == D3D12_BARRIER_SYNC_SPLIT
+                ? RecordedBoundaryReason::Split : RecordedBoundaryReason::EnhancedBuffer);
+            CaptureBoundaryResource(scope, static_cast<MTLD3D12Resource *>(b.pResource));
+            scope.offset = b.Offset; scope.size = b.Size;
+            scope.sync_before = b.SyncBefore; scope.sync_after = b.SyncAfter;
+            scope.access_before = b.AccessBefore; scope.access_after = b.AccessAfter;
             orders(b.SyncBefore, b.SyncAfter);
             event.resource = BarrierStateFor(static_cast<MTLD3D12Resource *>(b.pResource));
             event.split_begin = b.SyncAfter == D3D12_BARRIER_SYNC_SPLIT;
@@ -6165,6 +6713,12 @@ public:
             continue;
           }
           const auto &b = group.pTextureBarriers[i];
+          auto &scope = allocator_->RecordBoundary(b.SyncBefore == D3D12_BARRIER_SYNC_SPLIT || b.SyncAfter == D3D12_BARRIER_SYNC_SPLIT
+              ? RecordedBoundaryReason::Split : RecordedBoundaryReason::EnhancedTexture);
+          CaptureBoundaryResource(scope, static_cast<MTLD3D12Resource *>(b.pResource));
+          scope.subresources = b.Subresources;
+          scope.sync_before = b.SyncBefore; scope.sync_after = b.SyncAfter;
+          scope.access_before = b.AccessBefore; scope.access_after = b.AccessAfter;
           orders(b.SyncBefore, b.SyncAfter);
           event.resource = BarrierStateFor(static_cast<MTLD3D12Resource *>(b.pResource));
           event.split_begin = b.SyncAfter == D3D12_BARRIER_SYNC_SPLIT;
@@ -6206,7 +6760,7 @@ public:
       return;
     }
     if (boundary) {
-      allocator_->InvalidateCurrentPass();
+      allocator_->EndSchedulingPass();
       RecordAliasFlush();
     }
   }
@@ -6290,6 +6844,14 @@ public:
     }
     // Root tables contain complete GPU addresses. Keep the binding identities
     // for the ExecuteBundle contract even though Metal needs no separate bind.
+    try {
+      auto &retained = static_cast<RecordingHead *>(entry)->descriptor_heaps;
+      for (auto *heap : heaps) {
+        if (!heap) continue;
+        if (std::none_of(retained.begin(), retained.end(), [&](const auto &old) { return old.ptr() == heap; }))
+          retained.emplace_back(heap);
+      }
+    } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return; }
     descriptor_heaps_ = heaps;
     if (StageDirectlyIndexedHeaps(rootsig_compute_.ptr(), rootarg_compute_staging_))
       dirty_state_.set(DirtyState::ComputeRootArguments);
@@ -6541,11 +7103,16 @@ public:
   void
   SetRootViewStatus(MTLD3D12RootSignature *rootsig, uint64_t *staging, UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
     const uint32_t slot = rootsig->StatusQwordOffsets[Index];
-    if (slot == ~0u)
-      return;
     uint64_t offset = 0;
     auto *allocation = VA ? device_->LookupBufferByVA(VA, &offset) : nullptr;
-    staging[slot] = allocation ? allocation->residencyStatusBase : 0;
+    if (allocation) {
+      try {
+        auto &retained = allocator_->recording_head_->root_allocations;
+        if (allocator_->recording_head_->root_allocation_set.insert(allocation).second)
+          retained.emplace_back(allocation);
+      } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return; }
+    }
+    if (slot != ~0u) staging[slot] = allocation ? allocation->residencyStatusBase : 0;
   }
 
   void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
@@ -6555,6 +7122,7 @@ public:
       return;
     rootarg_compute_staging_[rootsig_compute_->SlotQwordOffsets[Index]] = VA;
     dirty_state_.set(DirtyState::ComputeRootArguments);
+    SetRootViewStatus(rootsig_compute_.ptr(), rootarg_compute_staging_, Index, VA);
   };
 
   void STDMETHODCALLTYPE
@@ -6565,6 +7133,7 @@ public:
       return;
     rootarg_graphics_staging_[rootsig_graphics_->SlotQwordOffsets[Index]] = VA;
     dirty_state_.set(DirtyState::GraphicsRootArguments);
+    SetRootViewStatus(rootsig_graphics_.ptr(), rootarg_graphics_staging_, Index, VA);
   };
 
   void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
@@ -6700,7 +7269,111 @@ public:
       RecordError();
       return;
     }
-    allocator_->InvalidateCurrentPass();
+    bool reuse_render = false;
+    const bool trace_reuse = owned_graphics::TraceEnabled();
+    const char *reuse_reason = nullptr;
+    int failed_rtv = -1;
+    if (!render_pass_internal_ && NumRTV && allocator_->encoder_current &&
+        allocator_->encoder_current->type == EncoderType::Render) {
+      const auto *render = static_cast<const RenderEncoderData *>(allocator_->encoder_current);
+      reuse_render = render->render_target_count == NumRTV && !render->dsv_readonly_flags &&
+          !render->default_raster_sample_count && !render->native_msaa_sample_count &&
+          !render->atomic64_phase && !render->msaa_draw &&
+          !render->capture_indirect && !render->so_indirect && render->so_draws.empty() &&
+          !render->use_tessellation && !render->use_geometry;
+      if (trace_reuse && !reuse_render)
+        reuse_reason = render->render_target_count != NumRTV ? "count" : "ordinary_flags";
+      unsigned width = 16384, height = 16384, array_length = 0;
+      for (unsigned i = 0; reuse_render && i < NumRTV; i++) {
+        const auto handle = SingleDescriptor
+            ? D3D12_CPU_DESCRIPTOR_HANDLE{RTVs[0].ptr + i * 32 /* kRTVDSVHeapIncrementalSize */} : RTVs[i];
+        const auto &rt = render->colors[i];
+        if (!handle.ptr || rt.buffer_attachment || rt.resolve_attachment || rt.level || rt.slice ||
+            (rt.load_action != WMTLoadActionLoad && rt.load_action != WMTLoadActionClear) ||
+            rt.store_action != WMTStoreActionStore) {
+          reuse_render = false;
+          if (trace_reuse) {
+            reuse_reason = "rtv_state";
+            failed_rtv = i;
+          }
+          break;
+        }
+        auto [heap, index] = GetRenderTargetHeap(device_, handle);
+        const auto desc = heap->GetRenderTarget(index);
+        // Resolve the descriptor now: its CPU slot may have been overwritten since the last draw.
+        // TextureView identity includes the allocation, format, mip and array range; 3D planes are separate.
+        reuse_render = desc.Texture && !desc.BufferResource &&
+            &desc.Texture->view(desc.View) == rt.attachment.ptr() &&
+            desc.DepthPlane == rt.depth_plane &&
+            desc.CenterSamplePattern == (pso_graphics_ && pso_graphics_->owned_sample_desc.Quality == 0xfffffffeu);
+        if (trace_reuse && !reuse_render) {
+          reuse_reason = !desc.Texture ? "rtv_no_texture" : desc.BufferResource ? "rtv_buffer" :
+              &desc.Texture->view(desc.View) != rt.attachment.ptr() ? "rtv_view" :
+              desc.DepthPlane != rt.depth_plane ? "rtv_plane" : "rtv_sample";
+          failed_rtv = i;
+        }
+        width = std::min(width, desc.Width);
+        height = std::min(height, desc.Height);
+        array_length = std::max(array_length, desc.RenderTargetArrayLength);
+      }
+      if (reuse_render && DSV && DSV->ptr) {
+        auto [heap, index] = GetRenderTargetHeap(device_, *DSV);
+        const auto desc = heap->GetRenderTarget(index);
+        reuse_render = desc.Texture && !desc.BufferResource && desc.Texture->sampleCount() == 1 &&
+            desc.Flags == render->dsv_descriptor_flags &&
+            desc.CenterSamplePattern == (pso_graphics_ && pso_graphics_->owned_sample_desc.Quality == 0xfffffffeu);
+        if (trace_reuse && !reuse_render)
+          reuse_reason = "dsv_descriptor_flags_samples";
+        if (reuse_render) {
+          const auto aspects = DepthStencilPlanarFlags(desc.Texture->pixelFormat(desc.View));
+          const auto *view = &desc.Texture->view(desc.View);
+          // Compare retained views and flags, never the old mutable CPU descriptor slots.
+          const auto &depth = render->depth;
+          const auto &stencil = render->stencil;
+          reuse_render = aspects == render->dsv_planar_flags &&
+              ((aspects & 1) ? depth.attachment.ptr() == view && !depth.level && !depth.slice &&
+                  depth.depth_plane == desc.DepthPlane &&
+                  (depth.load_action == WMTLoadActionLoad || depth.load_action == WMTLoadActionClear) &&
+                  depth.store_action == WMTStoreActionStore : !depth.attachment) &&
+              ((aspects & 2) ? stencil.attachment.ptr() == view && !stencil.level && !stencil.slice &&
+                  stencil.depth_plane == desc.DepthPlane &&
+                  (stencil.load_action == WMTLoadActionLoad || stencil.load_action == WMTLoadActionClear) &&
+                  stencil.store_action == WMTStoreActionStore : !stencil.attachment);
+          if (trace_reuse && !reuse_render)
+            reuse_reason = "dsv_view_aspects_actions";
+          width = std::min(width, desc.Width);
+          height = std::min(height, desc.Height);
+          array_length = std::max(array_length, desc.RenderTargetArrayLength);
+        }
+      } else if (reuse_render) {
+        reuse_render = !render->depth.attachment && !render->stencil.attachment &&
+            !render->dsv_planar_flags && !render->dsv_descriptor_flags;
+        if (trace_reuse && !reuse_render)
+          reuse_reason = "dsv_removal";
+      }
+      reuse_render = reuse_render && width == render->render_target_width &&
+          height == render->render_target_height && array_length == render->render_target_array_length;
+      if (trace_reuse && !reuse_render && !reuse_reason)
+        reuse_reason = "dimensions_array";
+    }
+    if (trace_reuse && !reuse_render && allocator_->encoder_current &&
+        allocator_->encoder_current->type == EncoderType::Render) {
+      const auto *render = static_cast<const RenderEncoderData *>(allocator_->encoder_current);
+      if (!reuse_reason)
+        reuse_reason = render_pass_internal_ ? "internal_render_pass" : "zero_rtvs";
+      owned_graphics::Trace("render_targets_rebind_rejected", ",\"list\":", owned_id,
+                            ",\"recording\":", owned_recording, ",\"encoder\":", render->id,
+                            ",\"reason\":\"", reuse_reason, "\",\"incoming_rtvs\":", NumRTV,
+                            ",\"retained_rtvs\":", uint32_t(render->render_target_count),
+                            ",\"incoming_dsv\":", bool(DSV && DSV->ptr),
+                            ",\"retained_dsv\":", bool(render->depth.attachment || render->stencil.attachment),
+                            ",\"failed_rtv\":", failed_rtv);
+    }
+    if (reuse_render)
+      owned_graphics::Trace("render_targets_rebind_elided", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                            ",\"encoder\":", allocator_->encoder_current->id, ",\"rtvs\":", NumRTV);
+    else
+      allocator_->EndSchedulingPass();
 
     num_rtvs = NumRTV;
     for (unsigned i = 0; i < NumRTV; i++) {
@@ -6737,6 +7410,16 @@ public:
       return;
     }
 
+    for (UINT i = 0; !predication_enabled_ && i < RectCount; i++) {
+      if (Rects[i].left <= 0 && Rects[i].top <= 0 &&
+          Rects[i].right >= LONG(AttachmentDesc.Width) && Rects[i].bottom >= LONG(AttachmentDesc.Height)) {
+        owned_graphics::Trace("clear_rect_normalized", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                              ",\"kind\":\"dsv\",\"width\":", AttachmentDesc.Width, ",\"height\":", AttachmentDesc.Height);
+        RectCount = 0;
+        break;
+      }
+    }
+
     if (predication_enabled_ || RectCount) {
       const D3D12_RECT full_rect = {0, 0, LONG(AttachmentDesc.Width), LONG(AttachmentDesc.Height)};
       const D3D12_RECT *clear_rects = RectCount ? Rects : &full_rect;
@@ -6757,10 +7440,10 @@ public:
         static_cast<RenderEncoderData *>(allocator_->encoder_current)->sample_positions = sample_positions_;
       for (UINT i = 0; i < clear_rect_count; i++) {
         const auto &rect = clear_rects[i];
-        const uint32_t rect_offset_x = std::max(rect.left, LONG(0));
-        const uint32_t rect_offset_y = std::max(rect.top, LONG(0));
-        const int32_t rect_width = rect.right - rect_offset_x;
-        const int32_t rect_height = rect.bottom - rect_offset_y;
+        const LONG rect_offset_x = std::clamp(rect.left, LONG(0), LONG(AttachmentDesc.Width));
+        const LONG rect_offset_y = std::clamp(rect.top, LONG(0), LONG(AttachmentDesc.Height));
+        const LONG rect_width = std::clamp(rect.right, LONG(0), LONG(AttachmentDesc.Width)) - rect_offset_x;
+        const LONG rect_height = std::clamp(rect.bottom, LONG(0), LONG(AttachmentDesc.Height)) - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
         {
@@ -6774,7 +7457,7 @@ public:
       return;
     }
 
-    allocator_->InvalidateCurrentPass();
+    allocator_->EndSchedulingPass();
     auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
     encoder_info->type = EncoderType::Clear;
     encoder_info->clear_dsv = CheckedFlags;
@@ -6786,7 +7469,7 @@ public:
     encoder_info->height = AttachmentDesc.Height;
     encoder_info->depth_plane = 0;
 
-    allocator_->InvalidateCurrentPass();
+    allocator_->EndSchedulingPass();
   };
 
   void STDMETHODCALLTYPE
@@ -6874,6 +7557,16 @@ public:
     if (!AttachmentDesc.Texture)
       return;
 
+    for (UINT i = 0; !predication_enabled_ && i < RectCount; i++) {
+      if (Rects[i].left <= 0 && Rects[i].top <= 0 &&
+          Rects[i].right >= LONG(AttachmentDesc.Width) && Rects[i].bottom >= LONG(AttachmentDesc.Height)) {
+        owned_graphics::Trace("clear_rect_normalized", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+                              ",\"kind\":\"rtv\",\"width\":", AttachmentDesc.Width, ",\"height\":", AttachmentDesc.Height);
+        RectCount = 0;
+        break;
+      }
+    }
+
     if (predication_enabled_ || RectCount) {
       const D3D12_RECT full_rect = {0, 0, LONG(AttachmentDesc.Width), LONG(AttachmentDesc.Height)};
       const D3D12_RECT *clear_rects = RectCount ? Rects : &full_rect;
@@ -6899,10 +7592,10 @@ public:
       allocator_->clear_rtv_.begin(AttachmentDesc.Texture, AttachmentDesc.View, AttachmentDesc.DepthPlane);
       for (UINT i = 0; i < clear_rect_count; i++) {
         const auto &rect = clear_rects[i];
-        const uint32_t rect_offset_x = std::max(rect.left, LONG(0));
-        const uint32_t rect_offset_y = std::max(rect.top, LONG(0));
-        const int32_t rect_width = rect.right - rect_offset_x;
-        const int32_t rect_height = rect.bottom - rect_offset_y;
+        const LONG rect_offset_x = std::clamp(rect.left, LONG(0), LONG(AttachmentDesc.Width));
+        const LONG rect_offset_y = std::clamp(rect.top, LONG(0), LONG(AttachmentDesc.Height));
+        const LONG rect_width = std::clamp(rect.right, LONG(0), LONG(AttachmentDesc.Width)) - rect_offset_x;
+        const LONG rect_height = std::clamp(rect.bottom, LONG(0), LONG(AttachmentDesc.Height)) - rect_offset_y;
         if (rect_height <= 0 || rect_width <= 0)
           continue;
         {
@@ -6918,7 +7611,7 @@ public:
       return;
     }
 
-    allocator_->InvalidateCurrentPass();
+    allocator_->EndSchedulingPass();
     auto encoder_info = allocator_->AllocatePass<ClearEncoderData>();
     encoder_info->type = EncoderType::Clear;
     encoder_info->clear_dsv = 0;
@@ -6930,7 +7623,7 @@ public:
     encoder_info->height = AttachmentDesc.Height;
     encoder_info->depth_plane = AttachmentDesc.DepthPlane;
 
-    allocator_->InvalidateCurrentPass();
+    allocator_->EndSchedulingPass();
   };
 
   void STDMETHODCALLTYPE
@@ -7338,14 +8031,25 @@ public:
       }
     }
 
-    allocator_->InvalidateCurrentPass();
-    auto reset = allocator_->AllocatePass<QueryEncoderData>();
-    reset->type = EncoderType::Query;
-    reset->op = QueryEncoderOp::ResetOcclusion;
-    reset->source = heap->visibility_results;
-    reset->start_index = Index;
-    reset->query_count = 1;
-    allocator_->InvalidateCurrentPass();
+    if (CanRetainVisibilityIntervals() && allocator_->encoder_current &&
+        allocator_->encoder_current->type == EncoderType::Render &&
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->visibility_intervals) {
+      auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+      try {
+        render->visibility_targets.push_back({heap->visibility_results, {}, heap->owned_id, Index, 0, true});
+      } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return; }
+      render->visibility_interval_dirty = true;
+      render->submission_group_safe = false;
+    } else {
+      allocator_->InvalidateCurrentPass();
+      auto reset = allocator_->AllocatePass<QueryEncoderData>();
+      reset->type = EncoderType::Query;
+      reset->op = QueryEncoderOp::ResetOcclusion;
+      reset->source = heap->visibility_results;
+      reset->start_index = Index;
+      reset->query_count = 1;
+      allocator_->InvalidateCurrentPass();
+    }
     active_visibility_queries_.push_back(ActiveVisibilityQuery{
         Type, Index, heap->owned_id, heap->visibility_results, heap->visibility_accumulate_pipeline});
     owned_graphics::Trace("query_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
@@ -7403,7 +8107,11 @@ public:
     for (auto it = active_visibility_queries_.begin(); it != active_visibility_queries_.end(); ++it) {
       if (it->heap_id != heap->owned_id || it->index != Index || it->type != Type)
         continue;
-      allocator_->InvalidateCurrentPass();
+      if (CanRetainVisibilityIntervals() && allocator_->encoder_current &&
+          allocator_->encoder_current->type == EncoderType::Render &&
+          static_cast<RenderEncoderData *>(allocator_->encoder_current)->visibility_intervals)
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->visibility_interval_dirty = true;
+      else allocator_->InvalidateCurrentPass();
       active_visibility_queries_.erase(it);
       owned_graphics::Trace("query_end", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                             ",\"heap\":", heap->owned_id, ",\"type\":", uint32_t(Type), ",\"index\":", Index,
@@ -8253,6 +8961,9 @@ public:
       return;
     }
     auto ArgBufferAddress = arg_buffer->buffer->current()->gpuAddress() + ArgBufferOffset;
+    const bool simple_indirect = !pCountBuffer && !sig->UpdateRootArguments && !sig->UpdateVertexBuffers &&
+        !sig->UpdateIndexBuffer && !sig->DrawArgumentOffset && !predication_enabled_ &&
+        active_pipeline_statistics_.empty() && active_so_queries_.empty();
     uint64_t CountBufferAddress = 0;
     if (auto count_buffer = static_cast<MTLD3D12Resource *>(pCountBuffer)) {
       if (!count_buffer->buffer) {
@@ -8266,6 +8977,28 @@ public:
       return;
     }
     if (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
+      if (simple_indirect && MaxCommandCount == 1 && pso_compute_ && !pso_compute_->uses_atomic64 && pso_compute_->pso) {
+        if (!PreDispatch(false)) return;
+        auto *allocation = arg_buffer->buffer->current();
+        try {
+          if (allocator_->recording_head_->root_allocation_set.insert(allocation).second)
+            allocator_->recording_head_->root_allocations.emplace_back(allocation);
+          auto *compute = static_cast<ComputeEncoderData *>(allocator_->encoder_current);
+          compute->submission_buffers.push_back({ArgBufferAddress, uint64_t(MaxCommandCount) * sig->ByteStride,
+                                                 false, WMTMetal4StageDispatch});
+          compute->submission_access_complete = false;
+        } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return; }
+        if (!RecordImplicitUse(arg_buffer, 0, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)) return;
+        auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+        dispatch.type = WMTComputeCommandDispatchIndirect;
+        dispatch.indirect_args_buffer = allocation->buffer();
+        dispatch.indirect_args_offset = allocation->currentSuballocationOffset() + ArgBufferOffset;
+        ResetIndirectState(sig, rootsig_compute_.ptr(), rootarg_compute_staging_, true);
+        owned_graphics::Trace("simple_indirect_record", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+            ",\"path\":\"native_dispatch\",\"commands\":", MaxCommandCount, ",\"stride\":", sig->ByteStride,
+            ",\"pso\":", pso_compute_->pso.handle);
+        return;
+      }
       if (!PreDispatch(sig->UpdateRootArguments))
         return;
       if (sig->UpdateRootArguments && !rootsig_compute_) {
@@ -8371,6 +9104,57 @@ public:
          (index_type == WMTIndexTypeUInt32 && ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF));
     const bool index_pull = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED && strip &&
                             (sig->UpdateIndexBuffer || !matching_cut);
+    uint64_t ib_offset = 0;
+    auto *ib_allocation = index_buffer_address ? device_->LookupBufferByVA(index_buffer_address, &ib_offset) : nullptr;
+    const uint32_t index_width = index_type == WMTIndexTypeUInt32 ? 4 : 2;
+    const bool indexed = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+    const bool native_index = !indexed || (index_buffer && ib_allocation && !(ib_offset % index_width) &&
+        ib_offset <= ib_allocation->byteLength() && !((ib_allocation->byteLength() - ib_offset) % index_width));
+    if (simple_indirect && pso_graphics_ && !pso_graphics_->uses_atomic64 && !index_pull && native_index &&
+        !pso_graphics_->view_instancing.count && !pso_graphics_->view_location_offsets &&
+        (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW || indexed)) {
+      if (PreDraw(false) != DrawCallStatus::Ordinary) return;
+      auto *allocation = arg_buffer->buffer->current();
+      try {
+        for (auto *retained : {allocation, indexed ? ib_allocation : nullptr})
+          if (retained && allocator_->recording_head_->root_allocation_set.insert(retained).second)
+            allocator_->recording_head_->root_allocations.emplace_back(retained);
+        auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+        render->submission_buffers.push_back({ArgBufferAddress, uint64_t(MaxCommandCount) * sig->ByteStride,
+                                              false, WMTMetal4StageVertex});
+        if (std::none_of(render->masked_pipeline_states.begin(), render->masked_pipeline_states.end(),
+                        [&](const auto &pso) { return pso.handle == direct_pipeline_bound_; }))
+          render->masked_pipeline_states.push_back(WMT::RenderPipelineState{direct_pipeline_bound_});
+        if (indexed) render->submission_buffers.push_back({index_buffer_address,
+            ib_allocation->byteLength() - ib_offset, false, WMTMetal4StageVertex});
+        render->submission_group_safe = false;
+      } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return; }
+      if (!RecordImplicitUse(arg_buffer, 0, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)) return;
+      for (UINT i = 0; i < MaxCommandCount; ++i) {
+        const uint64_t offset = allocation->currentSuballocationOffset() + ArgBufferOffset + uint64_t(i) * sig->ByteStride;
+        if (indexed) {
+          auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
+          draw.type = WMTRenderCommandDrawIndexedIndirect;
+          draw.primitive_type = primitive_type;
+          draw.index_type = index_type;
+          draw.index_buffer = index_buffer;
+          draw.index_buffer_offset = index_offset;
+          draw.indirect_args_buffer = allocation->buffer();
+          draw.indirect_args_offset = offset;
+        } else {
+          auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indirect>();
+          draw.type = WMTRenderCommandDrawIndirect;
+          draw.primitive_type = primitive_type;
+          draw.indirect_args_buffer = allocation->buffer();
+          draw.indirect_args_offset = offset;
+        }
+      }
+      ResetIndirectState(sig, rootsig_graphics_.ptr(), rootarg_graphics_staging_, false);
+      owned_graphics::Trace("simple_indirect_record", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+          ",\"path\":\"native_draw\",\"indexed\":", indexed, ",\"commands\":", MaxCommandCount,
+          ",\"stride\":", sig->ByteStride, ",\"pso\":", direct_pipeline_bound_);
+      return;
+    }
     bool encode_binding = index_pull || sig->UpdateRootArguments || sig->UpdateIndexBuffer ||
                           sig->UpdateVertexBuffers || (pso_graphics_ && pso_graphics_->view_location_offsets);
     DrawCallStatus status = PreDraw(encode_binding);

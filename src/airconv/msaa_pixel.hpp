@@ -6,6 +6,7 @@
 #include "llvm/Support/Error.h"
 
 namespace dxmt::msaa {
+void preparePixelTarget(llvm::Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options);
 uint64_t userHash(llvm::StringRef semantic);
 llvm::Value *lineBlend(llvm::IRBuilder<> &builder, llvm::Value *a, llvm::Value *z, llvm::Value *fraction);
 /* Private capture/replay transport only; never cloned application SRV/UAV loads. */

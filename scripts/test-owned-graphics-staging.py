@@ -884,6 +884,52 @@ class StagingPolicyTests(unittest.TestCase):
         rejected = subprocess.run([str(wrapper)], env=environment, text=True, capture_output=True)
         self.assertEqual(rejected.returncode, 64)
 
+    def test_wrapper_optional_dyld_settings_reach_native_target(self) -> None:
+        runtime = self.root / "runtime with spaces"
+        (runtime / "bin").mkdir(parents=True)
+        target = runtime / "bin/wine.real"
+        source = self.root / "target.c"
+        source.write_text(
+            '#include <stdio.h>\n#include <stdlib.h>\n'
+            'int main(int argc, char **argv) {\n'
+            'const char *insert = getenv("DYLD_INSERT_LIBRARIES");\n'
+            'const char *audit = getenv("DYLD_PRINT_LIBRARIES");\n'
+            'printf("insert=%s\\naudit=%s\\n", insert ? insert : "", audit ? audit : "");\n'
+            'for (int i = 1; i < argc; ++i) printf("arg=%s\\n", argv[i]);\n'
+            'return 0; }\n')
+        observer = self.root / "observer with spaces.dylib"
+        observer_source = self.root / "observer.c"
+        observer_source.write_text(
+            '#include <stdio.h>\n'
+            '__attribute__((constructor)) static void ready(void) { fputs("OBSERVER_READY\\n", stderr); }\n')
+        slices = ["-arch", "arm64", "-arch", "x86_64"]
+        subprocess.run(["clang", *slices, "-dynamiclib", str(observer_source), "-o", str(observer)], check=True, capture_output=True, timeout=60)
+        wrapper = runtime / "bin/wine"
+        environment = dict(os.environ, WINEPREFIX=str(self.root / "unused prefix"))
+        for native_arch, abi in (("arm64", "arm64x"), ("x86_64", "x64")):
+            subprocess.run(["clang", "-arch", native_arch, str(source), "-o", str(target)],
+                           check=True, capture_output=True, timeout=60)
+            for with_fg in (False, True):
+                wrapper.write_text(stage_owned_graphics.render_wrapper(
+                    arch=architecture(native_arch, abi), with_fsr=with_fg, with_fsr_framegeneration=with_fg))
+                wrapper.chmod(0o755)
+                for with_observer in (False, True):
+                    for with_audit in (False, True):
+                        with self.subTest(arch=native_arch, fg=with_fg, observer=with_observer, audit=with_audit):
+                            environment["OWNED_FG_OBSERVER"] = str(observer) if with_observer else ""
+                            environment["OWNED_GRAPHICS_DYLD_AUDIT"] = "1" if with_audit else "0"
+                            result = subprocess.run([str(wrapper), "argument with spaces", "-e", "literal=value"],
+                                                    env=environment, text=True, capture_output=True, timeout=30)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            inserted = with_fg and with_observer
+                            self.assertEqual(result.stdout.splitlines(), [
+                                f"insert={observer if inserted else ''}", f"audit={'1' if with_audit else ''}",
+                                "arg=argument with spaces", "arg=-e", "arg=literal=value"])
+                            self.assertEqual("OBSERVER_READY" in result.stderr, inserted)
+                            self.assertEqual("dyld[" in result.stderr, with_audit)
+                            if inserted and with_audit:
+                                self.assertIn(str(observer), result.stderr)
+
     def test_dependency_policy_accepts_relocatable_wine_and_system_paths(self) -> None:
         dependencies = [
             "@rpath/winemetal.so",

@@ -755,13 +755,14 @@ def render_wrapper(with_nvngx: bool = False, with_nvapi: bool = False, arch: dic
     dll_paths.append(arch["unix_directory"])
     dll_path = ":".join(f"$wine_root/{path}" for path in dll_paths)
     unsets = " ".join((*GPTK_ENV, *FOREIGN_GRAPHICS_ENV))
-    fg_observer = '''# Explicit test-only drawable observation at the final native launch hop.
-if [ -n "${OWNED_FG_OBSERVER:-}" ]; then
+    fg_observer = f'''# Explicit test-only drawable observation at the final native launch hop.
+if [ -n "${{OWNED_FG_OBSERVER:-}}" ]; then
   if [ ! -f "$OWNED_FG_OBSERVER" ]; then
     echo "owned graphics runtime: missing FG observer" >&2
     exit 126
   fi
   export DYLD_INSERT_LIBRARIES="$OWNED_FG_OBSERVER"
+  {'set -- -e "DYLD_INSERT_LIBRARIES=$OWNED_FG_OBSERVER" "$@"' if arch["native_arch"] == "arm64" else ""}
 fi
 
 ''' if with_fsr_framegeneration is True else ""
@@ -817,16 +818,17 @@ export WINEDLLOVERRIDES="{owned_overrides(with_nvngx, with_nvapi, with_fsr=with_
 # launches FEX, so its environment is left untouched.
 {"export FEX_HIDEHYPERVISORBIT=1" if arch["native_arch"] == "arm64" else ""}
 
-# macOS strips DYLD_* inherited across the /bin/sh script boundary. Re-enable
-# dyld library tracing here, at the last hop, only when the owned audit is
-# explicitly requested. Normal launches also cannot inherit a tracing setting.
+# Restricted system launchers strip inherited DYLD_*. Pass approved optional
+# settings through arch -e so they reach the final native executable.
+set -- "$real_wine" "$@"
 if [ "${{OWNED_GRAPHICS_DYLD_AUDIT:-0}}" = "1" ]; then
   export DYLD_PRINT_LIBRARIES=1
+  {'set -- -e "DYLD_PRINT_LIBRARIES=1" "$@"' if arch["native_arch"] == "arm64" else ""}
 else
   unset DYLD_PRINT_LIBRARIES
 fi
 
-{fg_observer}exec {"/usr/bin/arch -arm64 " if arch["native_arch"] == "arm64" else ""}"$real_wine" "$@"
+{fg_observer}exec {"/usr/bin/arch -arm64 " if arch["native_arch"] == "arm64" else ""}"$@"
 '''
 
 

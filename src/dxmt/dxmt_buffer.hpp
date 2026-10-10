@@ -26,6 +26,7 @@
 #include "thread.hpp"
 #include "util_flags.hpp"
 #include "util_svector.hpp"
+#include <unordered_map>
 
 namespace dxmt {
 
@@ -76,6 +77,11 @@ struct BufferViewDescriptor {
   uint64_t byteOffset = 0;
   uint64_t byteLength = 0;
   bool writable = false;
+
+  bool operator==(const BufferViewDescriptor &other) const;
+  struct Hash {
+    size_t operator()(const BufferViewDescriptor &descriptor) const;
+  };
 };
 
 class Buffer;
@@ -247,6 +253,7 @@ private:
   std::atomic<uint32_t> refcount_ = {0u};
 
   small_vector<BufferViewDescriptor, 1> viewDescriptors_;
+  std::unordered_map<BufferViewDescriptor, unsigned, BufferViewDescriptor::Hash> viewIndices_;
   dxmt::mutex mutex_;
   WMT::Device device_;
 };

@@ -54,6 +54,7 @@ thread_local std::function<void(const std::string &, const std::string &)> trace
 thread_local std::function<void()> disk_hook;
 namespace owned_graphics {
 inline bool TraceEnabled() { return true; }
+inline uint64_t NewObjectId() { static std::atomic_uint64_t next{0}; return ++next; }
 template <typename... Fields> void Trace(const char *event, Fields &&...fields) {
   if (trace_hook) {
     std::ostringstream stream;
@@ -288,7 +289,87 @@ void testStrictAndBounds() {
   std::puts("PIPELINE_CACHE_STRICT_BOUNDS_PASS explicit=1 retry=0 entries=512");
 }
 }
+void testStageArtifactKeys() {
+  using namespace dxmt;
+  SM50_SHADER_PSO_PIXEL_SHADER_DATA pixel{};
+  pixel.type = SM50_SHADER_PSO_PIXEL_SHADER; pixel.sample_mask = 1; pixel.native_sample_count = 1;
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA constant{};
+  constant.type = SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT; constant.next = &pixel;
+  auto key = [&](SM50_SHADER_COMPILATION_ARGUMENT_DATA *args) {
+    StageKeyBuilder builder; require(builder.arguments(args), "supported artifact key"); return builder.key;
+  };
+  const auto structural = key(reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&pixel));
+  const auto specialized = key(&constant);
+  pixel.sample_mask = 2;
+  require(structural != key(reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&pixel)), "structural mask key");
+  require(specialized == key(&constant), "constant value excluded from base AIR");
+  pixel.native_sample_count = 2; require(specialized != key(&constant), "native signature still keyed");
+
+  SM50_MSAA_VERTEX_LAYOUT first{}, second{};
+  SM50_MSAA_INTERPOLATION_LAYOUT interpolation{};
+  SM50_SHADER_D3D12_MSAA_VERTEX_DATA capture{};
+  capture.type = SM50_SHADER_D3D12_MSAA_VERTEX; capture.variant = SM50_MSAA_VERTEX_CAPTURE;
+  capture.sample_count = 4; capture.layout_out = &first; capture.interpolation = &interpolation;
+  const auto captureKey = key(reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&capture));
+  capture.layout_out = &second;
+  require(captureKey == key(reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&capture)), "output addresses not keyed");
+  interpolation.flat_count = 1; interpolation.flat_user_hashes[0] = 123;
+  require(captureKey != key(reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&capture)), "interpolation linkage keyed");
+
+  SM50_SHADER_GS_TESSELLATION_INPUT_DATA tess{};
+  tess.type = SM50_SHADER_GS_TESSELLATION_INPUT;
+  const auto tessKey = key(reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&tess));
+  tess.layout.vertex_registers = 4;
+  require(tessKey != key(reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&tess)), "TS GS linkage keyed");
+  std::puts("PIPELINE_STAGE_KEY_PASS constant_values=2 structural=1 capture_output_addresses=2 interpolation=1 tess_linkage=1");
+}
+
+void testStageArtifactFlights() {
+  using namespace dxmt;
+  controls(6);
+  ArtifactCache<ShaderStageArtifact> cache;
+  Gate producer;
+  std::atomic_uint operations{0};
+  auto first = std::async(std::launch::async, [&] {
+    return cache.Get("linked-stage", "air_compile", [&] {
+      ++operations; producer.block(); auto value = std::make_shared<ShaderStageArtifact>();
+      value->metadata = {1, 2, 3, 4}; return value;
+    });
+  });
+  producer.wait();
+  std::promise<void> joined; auto signal = joined.get_future();
+  auto second = std::async(std::launch::async, [&] {
+    { std::lock_guard lock(cache.mutex); require(cache.entries.size() == 1, "one pending flight"); }
+    joined.set_value();
+    return cache.Get("linked-stage", "air_compile", [&] { ++operations; return std::make_shared<ShaderStageArtifact>(); });
+  });
+  await(signal); producer.open(); auto a = await(first), b = await(second);
+  require(operations == 1 && a == b && a->metadata == std::vector<uint8_t>({1,2,3,4}), "single flight immutable metadata");
+  controls(4);
+  auto rebuilt = cache.Get("linked-stage", "air_compile", [&] { ++operations; return std::make_shared<ShaderStageArtifact>(); });
+  require(operations == 2 && rebuilt != a && a->metadata[0] == 1, "generation retires membership not ownership");
+  Gate retired;
+  auto old = std::async(std::launch::async, [&] {
+    return cache.Get("retired-stage", "air_compile", [&] {
+      ++operations; retired.block(); auto value = std::make_shared<ShaderStageArtifact>();
+      value->metadata = {9}; return value;
+    });
+  });
+  retired.wait(); controls(4);
+  auto fresh = cache.Get("retired-stage", "air_compile", [&] { ++operations; return std::make_shared<ShaderStageArtifact>(); });
+  retired.open(); auto retained = await(old);
+  require(operations == 4 && fresh != retained && retained->metadata[0] == 9,
+          "clear during conversion separates generation and retains old result");
+  cache.Get("failed", "air_compile", []() -> std::shared_ptr<ShaderStageArtifact> { return {}; });
+  auto retry = cache.Get("failed", "air_compile", [] { return std::make_shared<ShaderStageArtifact>(); });
+  require(bool(retry), "failed stage not cached");
+  for (unsigned i = 0; i < 300; ++i)
+    cache.Get(std::to_string(i), "air_compile", [] { return std::make_shared<ShaderStageArtifact>(); });
+  require(cache.completed <= 256 && cache.bytes <= 32u * 1024u * 1024u, "artifact retention bounded");
+  std::puts("PIPELINE_STAGE_FLIGHT_PASS conversions=4 same_artifact=1 retained_after_clear=1 clear_pending=1 failure_retry=1 bounded=1");
+}
 int main() {
+  testStageArtifactKeys(); testStageArtifactFlights();
   testBlockedDisk(); testDelayedWrite(); testDelayedReadAndInvalid(); testDelayedRetry(); testStrictAndBounds();
   std::puts("PIPELINE_CACHE_CPU_PASS");
 }

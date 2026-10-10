@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <barrier>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -154,35 +155,59 @@ void writeFile(const std::wstring &path,const std::vector<uint8_t> &bytes) {
   CloseHandle(file);if(!ok||written!=bytes.size())fail("cache mutation write");
 }
 
-size_t v5LibrarySize(const std::vector<uint8_t> &bytes) {
-  // Only mutate this fixture's single-stage v5 export; fail closed on ABI changes.
-  if(bytes.size()<216||memcmp(bytes.data(),"DXMTPSO",8))fail("mutation cache magic/header");
-  uint32_t version=0,stages=0;uint64_t total=0;
-  memcpy(&version,bytes.data()+8,4);memcpy(&stages,bytes.data()+12,4);memcpy(&total,bytes.data()+16,8);
-  if(version!=5||total!=bytes.size()||!stages||(stages&(stages-1))||(stages&~7u))fail("mutation v5 layout");
-  size_t end=216,library=0;
+// Wire mirror of production CacheHeader/StageRecord, not a runtime-version heuristic.
+struct CacheMutationStage {
+  uint64_t library_size, constant_size, constant_alignment, relocation_count;
+};
+struct CacheMutationHeader {
+  uint64_t magic;
+  uint32_t version, stages;
+  uint64_t size, adapter;
+  uint8_t identity[48], key[20], digest[20];
+  CacheMutationStage records[3];
+};
+static_assert(sizeof(CacheMutationHeader)==216 && sizeof(CacheMutationStage)==32);
+static_assert(offsetof(CacheMutationHeader,identity)==32 && offsetof(CacheMutationHeader,digest)==100 &&
+              offsetof(CacheMutationHeader,records)==120);
+constexpr uint32_t kMutationCacheVersion=6;
+
+size_t cacheLibrarySize(const std::vector<uint8_t> &bytes) {
+  // Mutate only a validated single-stage export; unknown wire revisions fail closed.
+  if(bytes.size()<sizeof(CacheMutationHeader)||memcmp(bytes.data(),"DXMTPSO",8))fail("mutation cache magic/header");
+  CacheMutationHeader header{};memcpy(&header,bytes.data(),sizeof(header));
+  const uint32_t stages=header.stages;
+  if(header.version!=kMutationCacheVersion||header.size!=bytes.size()||!stages||(stages&(stages-1))||(stages&~7u))
+    fail("mutation cache revision/layout");
+  size_t end=sizeof(header),library=0;
   for(unsigned i=0;i<3;++i){
-    uint64_t record[4]{};memcpy(record,bytes.data()+120+32*i,sizeof(record));
-    if(!(stages&(1u<<i))){for(auto field:record)if(field)fail("mutation inactive stage");continue;}
-    if(record[0]<88||!record[2]||(record[2]&(record[2]-1))||record[3]>record[1]/8)fail("mutation stage record");
-    library=static_cast<size_t>(record[0]);
-    for(const uint64_t length:{record[0],record[1],record[3]*16}){
+    const auto &record=header.records[i];
+    if(!(stages&(1u<<i))){
+      for(auto field:{record.library_size,record.constant_size,record.constant_alignment,record.relocation_count})
+        if(field)fail("mutation inactive stage");
+      continue;
+    }
+    if(record.library_size<88||!record.constant_alignment||(record.constant_alignment&(record.constant_alignment-1))||
+       record.relocation_count>record.constant_size/8)fail("mutation stage record");
+    library=static_cast<size_t>(record.library_size);
+    for(const uint64_t length:{record.library_size,record.constant_size,record.relocation_count*16}){
       if(length>bytes.size()-end)fail("mutation stage bounds");end+=static_cast<size_t>(length);
       const size_t padding=(-end)&7;if(padding>bytes.size()-end)fail("mutation stage padding");end+=padding;
     }
   }
-  if(end!=bytes.size()||memcmp(bytes.data()+216,"MTLB",4))fail("mutation library layout");
+  if(end!=bytes.size()||memcmp(bytes.data()+sizeof(header),"MTLB",4))fail("mutation library layout");
   return library;
 }
 
-void rehashV5(std::vector<uint8_t> &bytes) {
-  v5LibrarySize(bytes);
+void rehashCache(std::vector<uint8_t> &bytes) {
+  cacheLibrarySize(bytes);
+  constexpr size_t digest=offsetof(CacheMutationHeader,digest),
+                   afterDigest=digest+sizeof(CacheMutationHeader::digest);
   HCRYPTPROV provider=0;HCRYPTHASH hash=0;DWORD size=20;
   const bool acquired=CryptAcquireContextW(&provider,nullptr,nullptr,PROV_RSA_FULL,CRYPT_VERIFYCONTEXT);
   const bool ok=acquired&&CryptCreateHash(provider,CALG_SHA1,0,0,&hash)&&
-      CryptHashData(hash,bytes.data(),100,0)&&
-      CryptHashData(hash,bytes.data()+120,static_cast<DWORD>(bytes.size()-120),0)&&
-      CryptGetHashParam(hash,HP_HASHVAL,bytes.data()+100,&size,0)&&size==20;
+      CryptHashData(hash,bytes.data(),static_cast<DWORD>(digest),0)&&
+      CryptHashData(hash,bytes.data()+afterDigest,static_cast<DWORD>(bytes.size()-afterDigest),0)&&
+      CryptGetHashParam(hash,HP_HASHVAL,bytes.data()+digest,&size,0)&&size==20;
   if(hash)CryptDestroyHash(hash);if(provider)CryptReleaseContext(provider,0);
   if(!ok)fail("mutation SHA1");
 }
@@ -253,6 +278,7 @@ void automatic(ID3D12Device9 *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc,
       auto enabled=ordinary(device,desc);gpuValue(device,enabled.Get(),root.Get(),0x31415926u+0x135u,"enabled");
       check(device->ShaderCacheControl(driver,D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR),"driver clear active");
       if(GetFileAttributesW(path.c_str())!=INVALID_FILE_ATTRIBUTES)fail("driver clear left entry");
+      gpuValue(device,seeded.Get(),root.Get(),0x31415926u+0x135u,"retained_after_stage_library_clear");
       UINT actual=0,size=sizeof(actual);check(session->FindValue(&key,sizeof(key),&actual,&size),"app session independent");
       if(actual!=value||size!=sizeof(value))fail("app session changed by driver control");
       auto rebuilt=ordinary(device,desc);gpuValue(device,rebuilt.Get(),root.Get(),0x31415926u+0x135u,"clear_rebuild");
@@ -270,7 +296,12 @@ void automatic(ID3D12Device9 *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc,
   D3D12_FEATURE_DATA_SHADER_CACHE support{};check(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE,&support,sizeof(support)),"cache feature");
   constexpr UINT required=D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO|D3D12_SHADER_CACHE_SUPPORT_DRIVER_MANAGED_CACHE;
   if((support.SupportFlags&required)!=required)fail("automatic cache required bits");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_CACHE_ARTIFACT_PHASE begin=distinct_compute\n");std::fflush(stderr);
   auto a=ordinary(device,desc);const auto path=cacheFile(a.Get(),"a");gpuValue(device,a.Get(),desc.pRootSignature,0x31415926u+0x135u,"ordinary_a");
+  auto aliasDesc=desc;aliasDesc.NodeMask=1;auto alias=ordinary(device,aliasDesc);
+  if(cacheFile(alias.Get(),"same_stage_node_one")==path)fail("distinct PSO node key");
+  gpuValue(device,alias.Get(),desc.pRootSignature,0x31415926u+0x135u,"distinct_compute_same_stage");
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_CACHE_ARTIFACT_PHASE end=distinct_compute air=1 libraries=1\n");std::fflush(stderr);
   auto bDesc=desc;bDesc.CS={shaderB.data(),shaderB.size()};auto b=ordinary(device,bDesc);
   const auto bPath=cacheFile(b.Get(),"b");gpuValue(device,b.Get(),desc.pRootSignature,0x31415926u^0x135u,"ordinary_b");
   auto otherRoot=rootSignature(device,3);auto rootDesc=desc;rootDesc.pRootSignature=otherRoot.Get();
@@ -288,17 +319,18 @@ void automatic(ID3D12Device9 *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc,
     if(!wcscmp(mutation,L"--corrupt"))changed.back()^=1;
     else if(!wcscmp(mutation,L"--truncated"))changed.pop_back();
     else if(!wcscmp(mutation,L"--identity")){
-      v5LibrarySize(changed);changed[32]^=1;rehashV5(changed);
+      cacheLibrarySize(changed);changed[offsetof(CacheMutationHeader,identity)]^=1;rehashCache(changed);
     }else{
-      const size_t library=v5LibrarySize(changed);uint64_t fileSize=0;uint16_t major=0,minor=0;
-      memcpy(&fileSize,changed.data()+216+16,8);
-      memcpy(&major,changed.data()+216+6,2);memcpy(&minor,changed.data()+216+8,2);
+      const size_t library=cacheLibrarySize(changed), offset=sizeof(CacheMutationHeader);
+      uint64_t fileSize=0;uint16_t major=0,minor=0;
+      memcpy(&fileSize,changed.data()+offset+16,8);
+      memcpy(&major,changed.data()+offset+6,2);memcpy(&minor,changed.data()+offset+8,2);
       if(fileSize!=library||major!=2||minor!=7)fail("mutation metallib version layout");
       // Native container version is consumed before AIR function HASH/cache reuse.
       // Keep MTLB magic, offsets, byte sizes, function data and PSO relocations intact.
-      const uint16_t unsupported=0xffff;memcpy(changed.data()+216+6,&unsupported,2);
-      if(!memcmp(changed.data()+216+6,good.data()+216+6,2))fail("native fault did not change bytes");
-      rehashV5(changed);
+      const uint16_t unsupported=0xffff;memcpy(changed.data()+offset+6,&unsupported,2);
+      if(!memcmp(changed.data()+offset+6,good.data()+offset+6,2))fail("native fault did not change bytes");
+      rehashCache(changed);
       std::puts("OWNED_D3D12_PIPELINE_CACHE_NATIVE_FAULT field=metallib_version_major before=2 after=65535");
     }
     writeFile(path,changed);child(first,second,mutation);
@@ -307,9 +339,11 @@ void automatic(ID3D12Device9 *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc,
   std::puts("OWNED_D3D12_PIPELINE_CACHE_CASE_PASS disk_restore_invalid_rebuild");
   auto concurrentRoot=rootSignature(device,4);auto shared=desc;shared.pRootSignature=concurrentRoot.Get();
   std::barrier start(8);std::vector<std::thread> threads;ComPtr<ID3D12PipelineState> psos[8];HRESULT results[8]{};
-  for(unsigned i=0;i<8;++i)threads.emplace_back([&,i]{start.arrive_and_wait();
-    results[i]=device->CreateComputePipelineState(&shared,IID_PPV_ARGS(&psos[i]));});
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_CACHE_ARTIFACT_PHASE begin=concurrent_distinct_compute\n");std::fflush(stderr);
+  for(unsigned i=0;i<8;++i)threads.emplace_back([&,i]{auto entry=shared;entry.NodeMask=i&1u;start.arrive_and_wait();
+    results[i]=device->CreateComputePipelineState(&entry,IID_PPV_ARGS(&psos[i]));});
   for(auto &thread:threads)thread.join();
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_CACHE_ARTIFACT_PHASE end=concurrent_distinct_compute air=1 libraries_max=1\n");std::fflush(stderr);
   for(unsigned i=0;i<8;++i){check(results[i],"concurrent ordinary create");if(!psos[i])fail("concurrent output");
     char label[32];std::snprintf(label,sizeof(label),"concurrent_%u",i);
     gpuValue(device,psos[i].Get(),concurrentRoot.Get(),0x31415926u+0x135u,label);}

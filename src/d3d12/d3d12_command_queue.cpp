@@ -41,10 +41,12 @@
 #include <bit>
 #include <cstdio>
 #include <memory>
+#include <list>
 #include <new>
 #include <stdexcept>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include "d3d10_1.h"
@@ -53,6 +55,273 @@
 namespace dxmt {
 
 constexpr auto kCommandQueueSize = 32u;
+
+namespace {
+constexpr size_t kSubmissionDescriptorBudget = 64;
+constexpr size_t kSubmissionRangeBudget = 32;
+constexpr size_t kSubmissionCandidateBudget = 8;
+constexpr size_t kSubmissionGroupBudget = 64;
+struct SubmissionAccess {
+  const void *allocation;
+  uint64_t begin = 0, end = 0;
+  uint32_t mip_begin = 0, mip_end = 1, slice_begin = 0, slice_end = 1;
+  uint8_t aspects = 0; // zero is a buffer; color/depth/stencil are 4/1/2
+  bool writes = false, attachment = false;
+  uint64_t stages = 0;
+};
+bool AccessOverlaps(const SubmissionAccess &a, const SubmissionAccess &b) {
+  if (a.allocation != b.allocation) return false;
+  if (!a.aspects || !b.aspects) return a.begin < b.end && b.begin < a.end;
+  return (a.aspects & b.aspects) && a.mip_begin < b.mip_end && b.mip_begin < a.mip_end &&
+      a.slice_begin < b.slice_end && b.slice_begin < a.slice_end;
+}
+struct SubmissionDependency { size_t source; uint64_t before, after; bool attachment_only; uint8_t scope; };
+struct SubmissionNode {
+  const EncoderData *record;
+  size_t list_ordinal, node_ordinal;
+  size_t group = SIZE_MAX;
+  const char *rejection = nullptr;
+  bool access_complete = false, boundary_before = false, boundary_after = false, skip_clear = false;
+  std::vector<SubmissionAccess> accesses;
+  std::unordered_map<const void *, std::vector<size_t>> access_slots;
+  size_t descriptor_resolutions = 0;
+  std::vector<SubmissionAccess> scopes_before, scopes_after;
+  std::vector<SubmissionDependency> dependencies;
+  std::vector<size_t> clears_before;
+};
+struct RenderReplayGroup {
+  std::vector<size_t> members;
+  WMTRenderPassInfo descriptor{};
+  std::vector<std::array<uint8_t, 8>> color_maps;
+  std::array<TextureViewRef, 8> colors;
+  TextureViewRef depth, stencil;
+  uint32_t color_count = 0;
+  bool needs_unbound_slot = false;
+  uint64_t stages = 0;
+};
+struct SubmissionClearBatch {
+  WMTRenderPassInfo descriptor{};
+  std::vector<std::pair<size_t, uint8_t>> members;
+};
+struct SubmissionPlan {
+  std::vector<SubmissionNode> nodes;
+  std::vector<RenderReplayGroup> groups;
+  std::vector<SubmissionClearBatch> clear_batches;
+  std::vector<size_t> tail_clears;
+  std::vector<Com<MTLD3D12Resource, false>> descriptor_owners;
+  std::unordered_set<uint64_t> descriptor_owner_ids;
+  size_t history_checks = 0, candidate_checks = 0, metadata_copies = 0, scope_checks = 0, feedback_checks = 0;
+};
+bool AppendSubmissionAccess(SubmissionNode &node, SubmissionAccess access) {
+  auto &slots = node.access_slots[access.allocation];
+  for (const auto slot : slots) {
+    auto &prior = node.accesses[slot];
+    if (prior.begin == access.begin && prior.end == access.end && prior.mip_begin == access.mip_begin &&
+        prior.mip_end == access.mip_end && prior.slice_begin == access.slice_begin && prior.slice_end == access.slice_end &&
+        prior.aspects == access.aspects && prior.writes == access.writes && prior.attachment == access.attachment) {
+      prior.stages |= access.stages; return true;
+    }
+  }
+  if (slots.size() == kSubmissionRangeBudget) { node.rejection = "access_range_budget"; return false; }
+  slots.push_back(node.accesses.size()); node.accesses.push_back(access);
+  return true;
+}
+bool ResolveSubmissionDescriptorBudget(SubmissionNode &node, uint64_t count) {
+  if (count > kSubmissionDescriptorBudget - node.descriptor_resolutions) {
+    node.rejection = "descriptor_resolution_budget"; return false;
+  }
+  node.descriptor_resolutions += size_t(count);
+  return true;
+}
+
+const char *OrdinaryRenderRejection(const RenderEncoderData &render, MTLD3D12Device *device) {
+  if (render.submission_root_srv_opaque) return "unresolved_root_srv";
+  if (render.submission_snapshot_budget) return "recorded_buffer_budget";
+  if (!render.submission_group_safe) return "shader_or_state_unresolved";
+  if (render.endpoint_reason == RecordedEndpointReason::Opaque) return "opaque_endpoint";
+  if ((!render.render_target_count && !render.depth.attachment && !render.stencil.attachment) ||
+      render.dsv_readonly_flags || render.default_raster_sample_count || render.center_sample_pattern ||
+      render.sample_positions.count || render.render_target_array_length > 1 ||
+      render.atomic64_phase || render.msaa_draw || render.capture_indirect || render.so_indirect ||
+      !render.so_draws.empty() || render.use_geometry || render.use_tessellation ||
+      render.visibility_scratch || !render.visibility_targets.empty() || render.rov_marker_sample_count ||
+      render.depth_bounds_active) return "advanced_render";
+  for (unsigned i = 0; i < render.render_target_count; ++i) {
+    const auto &color = render.colors[i];
+    if (!color.attachment) continue;
+    if (color.buffer_attachment || color.resolve_attachment || color.level || color.slice ||
+        color.depth_plane || color.store_action != WMTStoreActionStore ||
+        (color.load_action != WMTLoadActionLoad && color.load_action != WMTLoadActionClear))
+      return "attachment_actions";
+    const auto *view = color.attachment.ptr();
+    const auto *allocation = view->allocation;
+    if (view->castBlockSize || view->msaaSampleAddress || view->reservedCast || view->reservedVolumeRender ||
+        view->reservedVolumeAtlasCast) return "attachment_cast_or_sparse";
+    for (unsigned previous = 0; previous < i; ++previous)
+      if (const auto &other = render.colors[previous].attachment; other && other->allocation == allocation &&
+          other->key.mip_start < view->key.mip_end && view->key.mip_start < other->key.mip_end &&
+          other->key.array_start < view->key.array_end && view->key.array_start < other->key.array_end)
+        return "attachment_overlap";
+    if (allocation->canonicalHeap || allocation->flags().test(TextureAllocationFlag::Shared) ||
+        allocation->flags().test(TextureAllocationFlag::PlacementSparse) || allocation->descriptor->sampleCount() != 1 ||
+        allocation->descriptor->textureType() != WMTTextureType2D ||
+        device->LookupStandardSwizzleTexture(allocation->descriptor)) return "attachment_alias_or_swizzle";
+  }
+  return nullptr;
+}
+// No state_events inference: these summaries describe native allocation effects.
+bool AppendSubmissionBuffer(SubmissionNode &node, MTLD3D12Device *device,
+                            uint64_t address, uint64_t bytes, bool writes, uint64_t stages) {
+  uint64_t offset = 0;
+  auto *allocation = device->LookupBufferByVA(address, &offset);
+  if (!allocation || allocation->canonicalHeap || allocation->reservedResource ||
+      allocation->flags().test(BufferAllocationFlag::PlacementSparse) || offset >= allocation->byteLength()) return false;
+  const uint64_t length = bytes == UINT64_MAX ? allocation->byteLength() - offset : bytes;
+  if (length > allocation->byteLength() - offset) return false;
+  return !length || AppendSubmissionAccess(node, {allocation, bytes == UINT64_MAX ? 0 : offset,
+      bytes == UINT64_MAX ? allocation->byteLength() : offset + length, 0, 1, 0, 1, 0, writes, false, stages});
+}
+bool AppendSubmissionTexture(SubmissionNode &node, MTLD3D12Device *device, Texture *texture,
+    TextureAllocation *allocation, TextureViewKey key, uint8_t aspects, bool writes, bool attachment, uint64_t stages) {
+  if (!texture || !allocation || allocation->canonicalHeap ||
+      allocation->flags().test(TextureAllocationFlag::Shared) ||
+      allocation->flags().test(TextureAllocationFlag::PlacementSparse) ||
+      allocation->descriptor->sampleCount() != 1 || device->LookupStandardSwizzleTexture(texture)) return false;
+  if (!key.mip_end || !key.array_end) return false;
+  return AppendSubmissionAccess(node, {allocation, 0, 0, uint32_t(key.mip_start), uint32_t(key.mip_end),
+      uint32_t(key.array_start), uint32_t(key.array_end), aspects, writes, attachment, stages});
+}
+bool ResolveSubmissionTables(SubmissionPlan &plan, SubmissionNode &node, MTLD3D12Device *device,
+    const std::unique_ptr<std::vector<StandardSwizzleTableUse>> &tables, uint64_t stages) {
+  if (!tables) return true;
+  bool complete = true;
+  for (const auto &table : *tables) {
+    D3D12_DESCRIPTOR_HEAP_DESC desc{}; D3D12_GPU_DESCRIPTOR_HANDLE start{};
+    table.heap->GetDesc(&desc); table.heap->GetGPUDescriptorHandleForHeapStart(&start);
+    if (!start.ptr || table.base < start.ptr || (table.base - start.ptr) % 32 || table.parameter == ~0u) return false;
+    const uint64_t base = (table.base - start.ptr) / 32;
+    if (base >= desc.NumDescriptors) return false;
+    for (const auto &binding : table.shader_bindings) {
+      uint64_t binding_stages = stages;
+      if (!(stages & WMTMetal4StageDispatch) && !(binding.ShaderVisibilityMask & 1u))
+        binding_stages = (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_VERTEX) ? WMTMetal4StageVertex : 0) |
+            (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_PIXEL) ? WMTMetal4StageFragment : 0);
+      table.rootsig->ForEachUsedDescriptorRange(table.rootsig->GetTableRanges(table.parameter), {&binding, 1},
+        [&](uint64_t offset, uint64_t count, D3D12_DESCRIPTOR_RANGE_TYPE kind) {
+      if (!complete) return;
+      if (kind == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) return;
+      if (!binding_stages) { complete = false; return; }
+      if (offset >= desc.NumDescriptors - base || count > desc.NumDescriptors - base - offset) { complete = false; return; }
+      if (!ResolveSubmissionDescriptorBudget(node, count)) { complete = false; return; }
+      for (uint64_t i = 0; complete && i < count; ++i) {
+        const auto &descriptor = table.heap->GetDescriptor(base + offset + i);
+        switch (descriptor.type) {
+        case ShaderVisibleDescriptorType::Null: break;
+        case ShaderVisibleDescriptorType::ConstantBuffer:
+          complete &= AppendSubmissionBuffer(node, device, descriptor.ConstantBuffer.address,
+              descriptor.ConstantBuffer.size, false, binding_stages); break;
+        case ShaderVisibleDescriptorType::SRVTexture:
+        case ShaderVisibleDescriptorType::UAVTexture: {
+          const bool uav = descriptor.type == ShaderVisibleDescriptorType::UAVTexture;
+          const bool writes = uav && (binding.Flags & MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS);
+          auto *texture = uav ? descriptor.UAVTexture.texture : descriptor.SRVTexture.texture;
+          auto owner = device->LookupDescriptorResource(texture, descriptor.owner_id);
+          if (!owner || !texture) { complete = false; break; }
+          const auto key = uav ? descriptor.UAVTexture.view : descriptor.SRVTexture.view;
+          // Plane reinterpretation, casts and shadow work are deliberately opaque.
+          if (!texture->supportsDescriptorViewPool(key)) { complete = false; break; }
+          complete &= AppendSubmissionTexture(node, device, texture, texture->current(), key, 4, writes, false, binding_stages);
+          if (plan.descriptor_owner_ids.insert(owner->owned_id).second) plan.descriptor_owners.push_back(std::move(owner)); break;
+        }
+        case ShaderVisibleDescriptorType::SRVBuffer:
+        case ShaderVisibleDescriptorType::SRVRGB32Buffer:
+        case ShaderVisibleDescriptorType::UAVBuffer:
+        case ShaderVisibleDescriptorType::SRVTexelBuffer:
+        case ShaderVisibleDescriptorType::UAVTexelBuffer: {
+          const bool texel = descriptor.type == ShaderVisibleDescriptorType::SRVTexelBuffer ||
+                             descriptor.type == ShaderVisibleDescriptorType::UAVTexelBuffer;
+          const bool uav = descriptor.type == ShaderVisibleDescriptorType::UAVBuffer ||
+                           descriptor.type == ShaderVisibleDescriptorType::UAVTexelBuffer;
+          const bool writes = uav && (binding.Flags & MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS);
+          auto *buffer = texel ? descriptor.UAVTexelBuffer.buffer : descriptor.UAVBuffer.buffer;
+          auto owner = device->LookupDescriptorResource(buffer, descriptor.owner_id);
+          if (!owner || !buffer || (!texel && uav && descriptor.UAVBuffer.counter)) { complete = false; break; }
+          const auto slice = texel ? descriptor.UAVTexelBuffer.slice : descriptor.UAVBuffer.slice;
+          complete &= AppendSubmissionBuffer(node, device, buffer->current()->gpuAddress() + slice.byteOffset,
+              slice.byteLength, writes, binding_stages);
+          if (plan.descriptor_owner_ids.insert(owner->owned_id).second) plan.descriptor_owners.push_back(std::move(owner)); break;
+        }
+        default: complete = false; break;
+        }
+      }
+      });
+      if (!complete) return false;
+    }
+  }
+  return complete;
+}
+const char *AppendRenderMember(RenderReplayGroup &group, const RenderEncoderData &render, bool first,
+                              std::array<uint8_t, 8> &map) {
+  uint8_t bound_outputs = 0;
+  for (unsigned i = 0; i < render.render_target_count; ++i)
+    if (render.colors[i].attachment) bound_outputs |= 1u << i;
+  if (__builtin_popcount(unsigned(render.submission_color_output_mask & ~bound_outputs)) > 1)
+    return "multiple_emitted_disabled_outputs_unproved";
+  if (first) {
+    WMT::InitializeRenderPassInfo(group.descriptor);
+    group.descriptor.render_target_width = render.render_target_width;
+    group.descriptor.render_target_height = render.render_target_height;
+    WMT::SetRenderTargetArrayLength(group.descriptor, render.render_target_array_length);
+  } else if (group.descriptor.render_target_width != render.render_target_width ||
+      group.descriptor.render_target_height != render.render_target_height ||
+      group.descriptor.render_target_array_length != render.render_target_array_length) return "attachment_dimensions";
+  map.fill(0xff);
+  for (unsigned logical = 0; logical < render.render_target_count; ++logical) {
+    const auto &src = render.colors[logical];
+    if (!src.attachment) continue;
+    unsigned physical = 0;
+    while (physical < group.color_count && group.colors[physical].ptr() != src.attachment.ptr()) ++physical;
+    if (physical == group.color_count) {
+      if (physical == 8) return "attachment_union_overflow";
+      for (unsigned existing = 0; existing < group.color_count; ++existing) {
+        const auto &other = group.colors[existing]; const auto &view = src.attachment;
+        if (other->allocation == view->allocation && other->key.mip_start < view->key.mip_end &&
+            view->key.mip_start < other->key.mip_end && other->key.array_start < view->key.array_end &&
+            view->key.array_start < other->key.array_end) return "attachment_union_alias";
+      }
+      if (!first && src.load_action != WMTLoadActionLoad) return "incoming_union_clear_discard";
+      group.colors[physical] = src.attachment;
+      ++group.color_count;
+      auto &dst = group.descriptor.colors[physical];
+      dst.texture = src.attachment.texture(); dst.level = src.level; dst.slice = src.slice;
+      dst.depth_plane = src.depth_plane; dst.load_action = src.load_action; dst.clear_color = src.clear_color;
+    } else if (!first && src.load_action != WMTLoadActionLoad) return "incoming_clear_discard";
+    map[logical] = uint8_t(physical);
+    group.descriptor.colors[physical].store_action = src.store_action;
+  }
+  group.needs_unbound_slot |= std::find(map.begin(), map.end(), 0xff) != map.end();
+  if (group.color_count == 8 && group.needs_unbound_slot) return "attachment_union_no_disabled_slot";
+  if (first) {
+    group.depth = render.depth.attachment; group.stencil = render.stencil.attachment;
+    if (group.depth) {
+      const auto &src = render.depth; auto &dst = group.descriptor.depth;
+      dst.texture = src.attachment.texture(); dst.level = src.level; dst.slice = src.slice;
+      dst.depth_plane = src.depth_plane; dst.load_action = src.load_action; dst.store_action = src.store_action;
+      dst.clear_depth = src.clear_depth;
+    }
+    if (group.stencil) {
+      const auto &src = render.stencil; auto &dst = group.descriptor.stencil;
+      dst.texture = src.attachment.texture(); dst.level = src.level; dst.slice = src.slice;
+      dst.depth_plane = src.depth_plane; dst.load_action = src.load_action; dst.store_action = src.store_action;
+      dst.clear_stencil = src.clear_stencil;
+    }
+  } else if (group.depth.ptr() != render.depth.attachment.ptr() || group.stencil.ptr() != render.stencil.attachment.ptr() ||
+      (group.depth && render.depth.load_action != WMTLoadActionLoad) ||
+      (group.stencil && render.stencil.load_action != WMTLoadActionLoad)) return "depth_stencil_actions";
+  group.descriptor.support_color_attachment_mapping = 1;
+  return nullptr;
+}
+} // namespace
 
 const GUID kD3D12CommandQueueDownlevelUUID = {
     0x38a8c5ef, 0x7ccb, 0x4e81, {0x91, 0x4f, 0xa6, 0xe9, 0xd0, 0x72, 0xc4, 0x94}
@@ -3382,6 +3651,7 @@ public:
     AppendStandardResource(uses, device_->LookupStandardSwizzleTexture(texture), writes);
     if (!allocation) allocation = texture->current();
     if (!allocation) return;
+    if (texture->supportsDescriptorViewPool(key)) return;
     auto &view = texture->view(key, allocation);
     const bool msaa = texture->isWritableMSAAView(key) && !view.castBlockSize;
     if (!view.castBlockSize && !msaa && !view.reservedVolumeRender && !texture->reservedVolumeLayoutAddress) return;
@@ -4706,6 +4976,24 @@ public:
       scope->inflight.protections.reserve(task.lists.size());
       for (auto &list : task.lists)
         scope->inflight.protections.push_back({list.allocator.Retain(), list.recording_lease.Retain()});
+      std::unordered_set<obj_handle_t> descriptor_buffers;
+      for (const auto &list : task.lists)
+        for (const auto &heap : static_cast<const RecordingHead *>(list.entry)->descriptor_heaps) {
+          D3D12_DESCRIPTOR_HEAP_DESC desc{}; heap->GetDesc(&desc);
+          WMT::Buffer buffer{};
+          if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            buffer = static_cast<MTLD3D12DescriptorHeap *>(heap.ptr())->GetArgumentBuffer();
+          else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+            buffer = static_cast<MTLD3D12SamplerDescriptorHeap *>(heap.ptr())->GetArgumentBuffer();
+          if (buffer && descriptor_buffers.insert(buffer.handle).second)
+            scope->inflight.cmdbuf.useAllocation(WMT::Allocation{buffer.handle});
+        }
+      for (const auto &list : task.lists)
+        for (const auto &allocation : static_cast<const RecordingHead *>(list.entry)->root_allocations) {
+          auto buffer = allocation->buffer();
+          if (buffer && descriptor_buffers.insert(buffer.handle).second)
+            scope->inflight.cmdbuf.useAllocation(WMT::Allocation{buffer.handle});
+        }
       /*
        * Mark this submission active before anything is encoded. Every acceleration-structure
        * version superseded while it is in flight is held until it retires, because this
@@ -5067,6 +5355,483 @@ public:
       return true;
     };
     if (!fenced && !validate_transitions(nullptr, 0, 0, true)) return;
+    // Value-owned scratch over const arena records. Every member remains under
+    // the existing Execute leases; neither links nor payloads are rewritten.
+    SubmissionPlan plan;
+    try {
+      for (size_t ordinal = 0; ordinal < task.lists.size(); ++ordinal) {
+        const auto *head = static_cast<const RecordingHead *>(task.lists[ordinal].entry);
+        const size_t list_begin = plan.nodes.size();
+        std::unordered_map<const EncoderData *, size_t> anchors;
+        size_t node_ordinal = 0;
+        for (const auto *record = head->next; record; record = record->next) {
+          SubmissionNode node{}; node.record = record; node.list_ordinal = ordinal; node.node_ordinal = node_ordinal++;
+          const uint64_t render_stages = WMTMetal4StageVertex | WMTMetal4StageFragment;
+          auto append_buffers = [&](const auto &buffers, uint64_t stages) {
+            for (const auto &use : buffers) {
+              if (!node.access_complete) break;
+              node.access_complete = AppendSubmissionBuffer(node, device_, use.address, use.length, use.writes, use.stages ? use.stages : stages);
+            }
+          };
+          auto append_attachment = [&](const auto &attachment, uint8_t aspect) {
+            if (!node.access_complete || !attachment.attachment) return;
+            const auto *view = attachment.attachment.ptr();
+            if (view->castBlockSize || view->msaaSampleAddress || view->reservedCast || view->reservedVolumeRender ||
+                view->reservedVolumeAtlasCast || attachment.level || attachment.slice || attachment.depth_plane ||
+                attachment.store_action != WMTStoreActionStore ||
+                (attachment.load_action != WMTLoadActionLoad && attachment.load_action != WMTLoadActionClear)) {
+              node.access_complete = false; return;
+            }
+            node.access_complete = AppendSubmissionTexture(node, device_, view->allocation->descriptor,
+                view->allocation, view->key, aspect, true, true, WMTMetal4StageFragment);
+          };
+          if (record->type == EncoderType::Render) {
+            const auto &render = *static_cast<const RenderEncoderData *>(record);
+            node.rejection = fenced ? "fence_segment" : ReservedResource::AnyLive() ? "sparse_alias" :
+                OrdinaryRenderRejection(render, device_);
+            node.access_complete = !node.rejection;
+            if (node.access_complete) append_buffers(render.submission_buffers, render_stages);
+            if (node.access_complete) node.access_complete = ResolveSubmissionTables(plan, node, device_, render.submission_tables, render_stages);
+            if (node.access_complete) node.access_complete = CollectStandardSwizzleTables(render.swizzle_tables).empty();
+            for (const auto &color : render.colors) append_attachment(color, 4);
+            append_attachment(render.depth, 1); append_attachment(render.stencil, 2);
+            // A shader-visible attachment feedback loop needs its own native
+            // side-work proof; it cannot become an ordinary load/store group.
+            for (const auto &attachment : node.accesses)
+              if (attachment.attachment)
+                for (const auto &shader : node.accesses)
+                  if (!shader.attachment && AccessOverlaps(attachment, shader)) node.access_complete = false;
+            if (!node.access_complete && !node.rejection) node.rejection = "access_or_side_work_unresolved";
+            owned_graphics::Trace("submission_render_candidate", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
+                ",\"list_ordinal\":", ordinal, ",\"node_ordinal\":", node.node_ordinal, ",\"encoder\":", record->id,
+                ",\"eligible\":", !node.rejection, ",\"reason\":\"", node.rejection ? node.rejection : "eligible", "\"");
+          } else if (record->type == EncoderType::Compute) {
+            const auto &compute = *static_cast<const ComputeEncoderData *>(record);
+            if (compute.submission_root_srv_opaque) node.rejection = "unresolved_root_srv";
+            else if (compute.submission_snapshot_budget) node.rejection = "recorded_buffer_budget";
+            node.access_complete = !node.rejection && !fenced && !ReservedResource::AnyLive() && compute.submission_access_complete && !compute.atomic64_phase &&
+                compute.atomic64_indirect.empty() && !compute.atomic64_ray && compute.cast_textures.empty();
+            if (node.access_complete) append_buffers(compute.submission_buffers, WMTMetal4StageDispatch);
+            if (node.access_complete) node.access_complete = ResolveSubmissionTables(plan, node, device_, compute.submission_tables, WMTMetal4StageDispatch);
+            if (node.access_complete) node.access_complete = CollectStandardSwizzleTables(compute.swizzle_tables).empty();
+            for (auto *cmd = reinterpret_cast<const wmtcmd_base *>(&compute.cmd_head); node.access_complete && cmd;
+                 cmd = static_cast<const wmtcmd_base *>(cmd->next.get_accessible_or_null()))
+              if (cmd->type != WMTComputeCommandNop && cmd->type != WMTComputeCommandSetPSO &&
+                  cmd->type != WMTComputeCommandSetBuffer && cmd->type != WMTComputeCommandUseResource &&
+                  cmd->type != WMTComputeCommandDispatch) node.access_complete = false;
+          } else if (record->type == EncoderType::Blit) {
+            const auto &blit = *static_cast<const BlitEncoderData *>(record);
+            node.access_complete = !fenced && !ReservedResource::AnyLive() && blit.submission_access_complete &&
+                blit.submission_buffers.size() == blit.submission_copy_count * 2;
+            append_buffers(blit.submission_buffers, WMTMetal4StageBlit);
+          } else if (record->type == EncoderType::Clear) {
+            const auto &clear = *static_cast<const ClearEncoderData *>(record);
+            // Zero is the recording/descriptor sentinel for a nonlayered view.
+            node.access_complete = !clear.sample_positions.count && clear.array_length <= 1 && !fenced && !ReservedResource::AnyLive();
+            if (node.access_complete && !clear.folded_into_render && clear.attachment) {
+              const auto *view = clear.attachment.ptr();
+              node.access_complete &= !view->castBlockSize && !view->msaaSampleAddress && !view->reservedCast &&
+                  !view->reservedVolumeRender && !view->reservedVolumeAtlasCast && !clear.depth_plane &&
+                  view->key.mip_end - view->key.mip_start == 1 && view->key.array_end - view->key.array_start == 1;
+              if (node.access_complete) node.access_complete = AppendSubmissionTexture(node, device_, view->allocation->descriptor,
+                  view->allocation, view->key, clear.clear_dsv ? uint8_t(clear.clear_dsv) : uint8_t(4),
+                  true, true, WMTMetal4StageFragment);
+            }
+          }
+          if (record->endpoint_reason == RecordedEndpointReason::Opaque) node.boundary_after = true;
+          if (fenced || ReservedResource::AnyLive()) node.access_complete = false;
+          if (!node.access_complete) { node.accesses.clear(); node.access_slots.clear(); }
+          if (!node.access_complete) owned_graphics::Trace("submission_access_opaque", ",\"submission\":", scope->seq,
+              ",\"list_ordinal\":", ordinal, ",\"node_ordinal\":", node.node_ordinal, ",\"encoder\":", record->id,
+              ",\"reason\":\"", node.rejection ? node.rejection : "unresolved_encoder_access", "\"");
+          anchors.emplace(record, plan.nodes.size());
+          plan.nodes.push_back(std::move(node));
+        }
+        for (const auto &boundary : head->boundaries) {
+          std::optional<SubmissionAccess> observation;
+          if (boundary.resource_scoped && boundary.reason != RecordedBoundaryReason::Split &&
+              boundary.reason != RecordedBoundaryReason::Alias) {
+            if (boundary.buffer && boundary.offset <= boundary.buffer->byteLength()) {
+              const auto available = boundary.buffer->byteLength() - boundary.offset;
+              const auto bytes = boundary.size == UINT64_MAX ? available : boundary.size;
+              if (bytes <= available) observation = SubmissionAccess{boundary.buffer.ptr(), boundary.offset,
+                  boundary.offset + bytes, 0, 1, 0, 1, 0, true, false, 0};
+            } else if (boundary.texture) {
+              const auto &range = boundary.subresources;
+              uint32_t mip = 0, mips = boundary.mip_count, slice = 0, slices = boundary.array_count;
+              uint8_t aspects = boundary.texture_aspects;
+              if (!range.NumMipLevels && range.IndexOrFirstMipLevel != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+                const auto subresource = range.IndexOrFirstMipLevel;
+                mip = subresource % boundary.mip_count; mips = 1;
+                slice = (subresource / boundary.mip_count) % boundary.array_count; slices = 1;
+                if (aspects != 4) aspects = uint8_t(1u << (subresource / (boundary.mip_count * boundary.array_count)));
+              } else if (range.NumMipLevels) {
+                mip = range.IndexOrFirstMipLevel; mips = range.NumMipLevels;
+                slice = range.FirstArraySlice; slices = range.NumArraySlices;
+                if (aspects != 4) aspects = uint8_t(((1u << range.NumPlanes) - 1u) << range.FirstPlane);
+              }
+              observation = SubmissionAccess{boundary.texture.ptr(), 0, 0, mip, mip + mips, slice, slice + slices,
+                  aspects, true, false, 0};
+            }
+          }
+          owned_graphics::Trace("submission_boundary", ",\"submission\":", scope->seq, ",\"list_ordinal\":", ordinal,
+              ",\"encoder\":", boundary.encoder ? boundary.encoder->id : 0,
+              ",\"reason\":", uint32_t(boundary.reason), ",\"state_event\":", boundary.state_event_index,
+              ",\"resource_scoped\":", bool(observation), ",\"offset\":", boundary.offset, ",\"size\":", boundary.size,
+              ",\"sync_before\":", uint64_t(boundary.sync_before), ",\"sync_after\":", uint64_t(boundary.sync_after),
+              ",\"access_before\":", uint64_t(boundary.access_before), ",\"access_after\":", uint64_t(boundary.access_after));
+          const auto anchor = anchors.find(boundary.encoder);
+          if (anchor == anchors.end()) {
+            if (list_begin < plan.nodes.size()) {
+              if (observation) plan.nodes[list_begin].scopes_before.push_back(*observation);
+              else plan.nodes[list_begin].boundary_before = true;
+            } else if (list_begin) {
+              if (observation) plan.nodes.back().scopes_after.push_back(*observation);
+              else plan.nodes.back().boundary_after = true;
+            }
+            if (!observation && list_begin) plan.nodes[list_begin - 1].boundary_after = true;
+            continue;
+          }
+          auto &node = plan.nodes[anchor->second];
+          const wmtcmd_base *tail = nullptr;
+          if (node.record->type == EncoderType::Render) tail = static_cast<const RenderEncoderData *>(node.record)->cmd_tail;
+          if (node.record->type == EncoderType::Compute) tail = static_cast<const ComputeEncoderData *>(node.record)->cmd_tail;
+          if (node.record->type == EncoderType::Blit) tail = static_cast<const BlitEncoderData *>(node.record)->cmd_tail;
+          if (observation) {
+            if (boundary.command == tail) node.scopes_after.push_back(*observation);
+            else node.scopes_before.push_back(*observation);
+          } else node.boundary_after = true;
+          if (boundary.command != tail && (!observation || std::any_of(node.accesses.begin(), node.accesses.end(),
+              [&](const auto &access) { return AccessOverlaps(access, *observation); }))) {
+            node.access_complete = false;
+            if (node.record->type == EncoderType::Render) node.rejection = "interior_barrier";
+          }
+          if (!observation && anchor->second + 1 < plan.nodes.size()) plan.nodes[anchor->second + 1].boundary_before = true;
+        }
+      }
+      std::list<std::pair<size_t, uint8_t>> pending_clears;
+      using PendingIterator = decltype(pending_clears)::iterator;
+      struct PendingKey {
+        const void *allocation;
+        uint32_t mip, slice;
+        bool operator==(const PendingKey &) const = default;
+      };
+      struct PendingKeyHash {
+        size_t operator()(const PendingKey &key) const {
+          return std::hash<const void *>{}(key.allocation) ^ (size_t(key.mip) << 16) ^ size_t(key.slice);
+        }
+      };
+      // Full single-subresource clears replace earlier unobserved writes across
+      // format views. Keep the latest view and typed value; never absorb an
+      // older linear load clear after a newer sRGB clear of the same aspect.
+      std::unordered_map<PendingKey, std::array<PendingIterator, 3>, PendingKeyHash> pending_slots;
+      auto erase_pending = [&](PendingIterator it) {
+        const auto &clear = *static_cast<const ClearEncoderData *>(plan.nodes[it->first].record);
+        auto slot = pending_slots.find({clear.attachment->allocation, clear.attachment->key.mip_start, clear.attachment->key.array_start});
+        slot->second[it->second == 1 ? 0 : it->second == 2 ? 1 : 2] = pending_clears.end();
+        if (std::all_of(slot->second.begin(), slot->second.end(), [&](const auto &old) { return old == pending_clears.end(); }))
+          pending_slots.erase(slot);
+        return pending_clears.erase(it);
+      };
+      auto flush_clears = [&](std::vector<size_t> &destination) {
+        while (!pending_clears.empty()) {
+          SubmissionClearBatch batch;
+          WMT::InitializeRenderPassInfo(batch.descriptor);
+          const auto &first = *static_cast<const ClearEncoderData *>(plan.nodes[pending_clears.front().first].record);
+          batch.descriptor.render_target_width = first.width; batch.descriptor.render_target_height = first.height;
+          WMT::SetRenderTargetArrayLength(batch.descriptor, first.array_length);
+          unsigned colors = 0;
+          for (auto it = pending_clears.begin(); it != pending_clears.end();) {
+            const auto &data = *static_cast<const ClearEncoderData *>(plan.nodes[it->first].record);
+            const auto aspect = it->second;
+            bool compatible = data.width == first.width && data.height == first.height && data.array_length == first.array_length;
+            if (aspect == 4) compatible &= colors < 8;
+            if (aspect == 1) compatible &= !batch.descriptor.depth.texture;
+            if (aspect == 2) compatible &= !batch.descriptor.stencil.texture;
+            // Two distinct views of one allocation remain separate native
+            // passes until attachment alias legality has an independent proof.
+            for (const auto &[previous, previous_aspect] : batch.members) {
+              const auto &other = *static_cast<const ClearEncoderData *>(plan.nodes[previous].record);
+              if (other.attachment->allocation == data.attachment->allocation &&
+                  (other.attachment.ptr() != data.attachment.ptr() || previous_aspect == aspect)) compatible = false;
+            }
+            if (!compatible) { ++it; continue; }
+            if (aspect == 4) {
+              auto &color = batch.descriptor.colors[colors++];
+              color.texture = data.attachment.texture(); color.depth_plane = data.depth_plane;
+              color.load_action = WMTLoadActionClear; color.store_action = WMTStoreActionStore; color.clear_color = data.color;
+            } else if (aspect == 1) {
+              auto &depth = batch.descriptor.depth;
+              depth.texture = data.attachment.texture(); depth.depth_plane = data.depth_plane;
+              depth.load_action = WMTLoadActionClear; depth.store_action = WMTStoreActionStore; depth.clear_depth = data.depth_stencil.first;
+            } else {
+              auto &stencil = batch.descriptor.stencil;
+              stencil.texture = data.attachment.texture(); stencil.depth_plane = data.depth_plane;
+              stencil.load_action = WMTLoadActionClear; stencil.store_action = WMTStoreActionStore;
+              stencil.clear_stencil = data.depth_stencil.second;
+            }
+            batch.members.push_back(*it); it = erase_pending(it);
+          }
+          destination.push_back(plan.clear_batches.size()); plan.clear_batches.push_back(std::move(batch));
+        }
+      };
+      for (size_t index = 0; index < plan.nodes.size(); ++index) {
+        auto &node = plan.nodes[index];
+        if (node.boundary_before || !node.scopes_before.empty() || !node.access_complete) flush_clears(node.clears_before);
+        if (node.record->type == EncoderType::Clear && node.access_complete) {
+          const auto &clear = *static_cast<const ClearEncoderData *>(node.record);
+          if (!clear.folded_into_render) {
+            node.skip_clear = true;
+            // Bound compatible-batch exploration; larger windows materialize
+            // conservatively rather than retaining an unbounded clear scan.
+            const uint8_t aspects = clear.clear_dsv ? uint8_t(clear.clear_dsv) : uint8_t(4);
+            if (pending_clears.size() + std::popcount(unsigned(aspects)) > kSubmissionGroupBudget)
+              flush_clears(node.clears_before);
+            for (uint8_t aspect : {uint8_t(1), uint8_t(2), uint8_t(4)}) {
+              if (!(aspects & aspect)) continue;
+              const unsigned aspect_slot = aspect == 1 ? 0 : aspect == 2 ? 1 : 2;
+              const PendingKey key{clear.attachment->allocation, clear.attachment->key.mip_start, clear.attachment->key.array_start};
+              auto slots = pending_slots.find(key);
+              auto prior = slots == pending_slots.end() ? pending_clears.end() : slots->second[aspect_slot];
+              if (prior != pending_clears.end()) {
+                owned_graphics::Trace("submission_clear_superseded", ",\"submission\":", scope->seq,
+                    ",\"before\":", prior->first, ",\"after\":", index, ",\"aspect\":", uint32_t(aspect));
+                erase_pending(prior);
+              }
+              pending_clears.emplace_back(index, aspect);
+              std::array<PendingIterator, 3> empty_slots; empty_slots.fill(pending_clears.end());
+              auto [stored, inserted] = pending_slots.try_emplace(key, empty_slots);
+              stored->second[aspect_slot] = std::prev(pending_clears.end());
+            }
+          }
+        } else if (!pending_clears.empty()) {
+          if (node.record->type == EncoderType::Render && !node.rejection && node.access_complete) {
+            const auto &render = *static_cast<const RenderEncoderData *>(node.record);
+            RenderReplayGroup trial;
+            std::array<uint8_t, 8> first_map;
+            if (!AppendRenderMember(trial, render, true, first_map)) {
+              trial.color_maps.push_back(first_map);
+              bool absorbed = false;
+              for (auto it = pending_clears.begin(); it != pending_clears.end();) {
+                const auto &clear = *static_cast<const ClearEncoderData *>(plan.nodes[it->first].record);
+                bool match = clear.width == render.render_target_width && clear.height == render.render_target_height &&
+                    clear.array_length == render.render_target_array_length;
+                unsigned physical = 0;
+                if (it->second == 4) {
+                  while (physical < trial.color_count && trial.colors[physical].ptr() != clear.attachment.ptr()) ++physical;
+                  match &= physical < trial.color_count && trial.descriptor.colors[physical].load_action == WMTLoadActionLoad;
+                  if (match) {
+                    trial.descriptor.colors[physical].load_action = WMTLoadActionClear;
+                    trial.descriptor.colors[physical].clear_color = clear.color;
+                  }
+                } else if (it->second == 1) {
+                  match &= trial.depth.ptr() == clear.attachment.ptr() && trial.descriptor.depth.load_action == WMTLoadActionLoad;
+                  if (match) { trial.descriptor.depth.load_action = WMTLoadActionClear; trial.descriptor.depth.clear_depth = clear.depth_stencil.first; }
+                } else {
+                  match &= trial.stencil.ptr() == clear.attachment.ptr() && trial.descriptor.stencil.load_action == WMTLoadActionLoad;
+                  if (match) { trial.descriptor.stencil.load_action = WMTLoadActionClear; trial.descriptor.stencil.clear_stencil = clear.depth_stencil.second; }
+                }
+                if (!match) { ++it; continue; }
+                owned_graphics::Trace("submission_clear_load", ",\"submission\":", scope->seq,
+                    ",\"clear_node\":", it->first, ",\"render_node\":", index, ",\"aspect\":", uint32_t(it->second));
+                absorbed = true; it = erase_pending(it);
+              }
+              if (absorbed) {
+                trial.members.push_back(index);
+                for (const auto &access : node.accesses) trial.stages |= access.stages;
+                node.group = plan.groups.size(); plan.groups.push_back(std::move(trial));
+              }
+            }
+          }
+          bool observed = false;
+          for (const auto &[pending, aspect] : pending_clears) {
+            const auto &clear_accesses = plan.nodes[pending].accesses;
+            for (auto access : clear_accesses) {
+              access.aspects = aspect;
+              for (const auto &use : node.accesses) observed |= AccessOverlaps(access, use);
+            }
+          }
+          if (observed) flush_clears(node.clears_before);
+        }
+        if ((node.boundary_after || !node.scopes_after.empty()) && !pending_clears.empty()) {
+          if (index + 1 < plan.nodes.size()) flush_clears(plan.nodes[index + 1].clears_before);
+          else flush_clears(plan.tail_clears);
+        }
+      }
+      flush_clears(plan.tail_clears);
+      // Resource frontiers retain every required reader until a covering write.
+      // Reads never inspect readers; covered older writes/readers are retired.
+      struct History { size_t node; SubmissionAccess access; };
+      struct Frontier { std::vector<History> writers, readers; };
+      std::unordered_map<const void *, Frontier> history;
+      size_t partition = 0;
+      for (size_t index = 0; index < plan.nodes.size(); ++index) {
+        auto &node = plan.nodes[index];
+        if (node.boundary_before || !node.access_complete) { history.clear(); partition = index; }
+        std::unordered_map<size_t, size_t> edge_slots;
+        for (const auto &access : node.accesses) {
+          auto &frontier = history[access.allocation];
+          auto visit = [&](const std::vector<History> &entries) {
+            for (const auto &prior : entries) {
+              ++plan.history_checks;
+              if (prior.node == index || !AccessOverlaps(access, prior.access)) continue;
+              const auto [slot, inserted] = edge_slots.try_emplace(prior.node, node.dependencies.size());
+              const bool attachment_only = access.attachment && prior.access.attachment;
+              const uint8_t scope_mask = access.aspects ? WMTBarrierScopeTextures : WMTBarrierScopeBuffers;
+              if (inserted) node.dependencies.push_back({prior.node, attachment_only ? 0 : prior.access.stages,
+                  attachment_only ? 0 : access.stages, attachment_only, uint8_t(attachment_only ? 0 : scope_mask)});
+              else {
+                auto &edge = node.dependencies[slot->second];
+                if (!attachment_only) {
+                  edge.before |= prior.access.stages; edge.after |= access.stages; edge.scope |= scope_mask;
+                }
+                edge.attachment_only &= attachment_only;
+              }
+              owned_graphics::Trace("submission_access_edge", ",\"submission\":", scope->seq,
+                  ",\"before\":", prior.node, ",\"after\":", index, ",\"raw\":", prior.access.writes && !access.writes,
+                  ",\"war\":", !prior.access.writes && access.writes, ",\"waw\":", prior.access.writes && access.writes,
+                  ",\"stages_before\":", prior.access.stages, ",\"stages_after\":", access.stages);
+            }
+          };
+          visit(frontier.writers);
+          if (access.writes) {
+            visit(frontier.readers);
+            auto covered = [&](const History &prior) {
+              if (prior.node == index || bool(access.aspects) != bool(prior.access.aspects)) return false;
+              if (!access.aspects) return access.begin <= prior.access.begin && access.end >= prior.access.end;
+              return (access.aspects & prior.access.aspects) == prior.access.aspects &&
+                  access.mip_begin <= prior.access.mip_begin && access.mip_end >= prior.access.mip_end &&
+                  access.slice_begin <= prior.access.slice_begin && access.slice_end >= prior.access.slice_end;
+            };
+            std::erase_if(frontier.writers, covered); std::erase_if(frontier.readers, covered);
+            frontier.writers.push_back({index, access});
+          } else frontier.readers.push_back({index, access});
+        }
+        if (node.record->type == EncoderType::Render && !node.rejection && node.access_complete &&
+            !node.boundary_before && node.clears_before.empty() && node.group == SIZE_MAX) {
+          size_t attempts = 0;
+          // ponytail: bounded candidates/source span and 64-member groups; a
+          // range-indexed group summary can replace this if larger groups pay.
+          const size_t lower = std::max(partition, index > kSubmissionGroupBudget ? index - kSubmissionGroupBudget : 0);
+          for (size_t candidate = index; candidate-- > lower;) {
+            auto &prior = plan.nodes[candidate];
+            if (prior.boundary_after || !prior.access_complete) break;
+            if (prior.record->type != EncoderType::Render || prior.rejection) continue;
+            if (attempts++ == kSubmissionCandidateBudget) break;
+            ++plan.candidate_checks;
+            const auto *existing = prior.group == SIZE_MAX ? nullptr : &plan.groups[prior.group];
+            const size_t leader = existing ? existing->members.front() : candidate;
+            if (index - leader > kSubmissionGroupBudget || (existing && existing->members.size() == kSubmissionGroupBudget)) continue;
+            bool commute = true;
+            for (const auto &dependency : node.dependencies) {
+              const bool internal = dependency.source == leader ||
+                  (prior.group != SIZE_MAX && plan.nodes[dependency.source].group == prior.group);
+              if (dependency.source > leader && !internal) commute = false;
+              // TBDR cannot complete Fragment inside the same render pass.
+              // The proven ordinary inline family is Vertex -> Vertex only;
+              // other nonattachment dependencies retain store/load + fences.
+              if (internal && !dependency.attachment_only &&
+                  (dependency.before != WMTMetal4StageVertex || dependency.after != WMTMetal4StageVertex)) commute = false;
+            }
+            for (size_t crossed = leader + 1; commute && crossed < index; ++crossed)
+              if (plan.nodes[crossed].boundary_before || plan.nodes[crossed].boundary_after ||
+                  !plan.nodes[crossed].access_complete || !plan.nodes[crossed].clears_before.empty() ||
+                  plan.nodes[crossed].record->type == EncoderType::Clear) commute = false;
+            bool scope_blocked = false;
+            for (size_t crossed = leader; commute && crossed <= index; ++crossed) {
+              auto conflicts = [&](const auto &observations) {
+                for (const auto &observation : observations)
+                  for (const auto &access : node.accesses) {
+                    ++plan.scope_checks;
+                    if (AccessOverlaps(observation, access)) scope_blocked = true;
+                  }
+              };
+              if (crossed != leader) conflicts(plan.nodes[crossed].scopes_before);
+              if (crossed != index) conflicts(plan.nodes[crossed].scopes_after);
+            }
+            if (scope_blocked) {
+              commute = false;
+              owned_graphics::Trace("submission_render_rejected", ",\"submission\":", scope->seq,
+                  ",\"before_list\":", prior.list_ordinal, ",\"after_list\":", node.list_ordinal,
+                  ",\"reason\":\"resource_boundary\"");
+            }
+            if (!commute) continue;
+            RenderReplayGroup trial;
+            std::array<uint8_t, 8> first_map, map;
+            if (existing) {
+              trial.descriptor = existing->descriptor; trial.colors = existing->colors;
+              trial.depth = existing->depth; trial.stencil = existing->stencil;
+              trial.color_count = existing->color_count; trial.needs_unbound_slot = existing->needs_unbound_slot;
+              trial.stages = existing->stages; ++plan.metadata_copies;
+            } else if (AppendRenderMember(trial, *static_cast<const RenderEncoderData *>(prior.record), true, first_map)) continue;
+            const char *reason = AppendRenderMember(trial, *static_cast<const RenderEncoderData *>(node.record), false, map);
+            auto feedback = [&](size_t member) {
+              for (const auto &a : plan.nodes[member].accesses)
+                for (const auto &b : node.accesses) {
+                  ++plan.feedback_checks;
+                  if (a.attachment != b.attachment && AccessOverlaps(a, b)) reason = "cross_member_attachment_feedback";
+                }
+            };
+            if (existing) for (const auto member : existing->members) feedback(member);
+            else feedback(candidate);
+            if (reason) {
+              owned_graphics::Trace("submission_render_rejected", ",\"submission\":", scope->seq,
+                  ",\"before_list\":", prior.list_ordinal, ",\"after_list\":", node.list_ordinal,
+                  ",\"reason\":\"", reason, "\""); continue;
+            }
+            for (const auto &access : node.accesses) trial.stages |= access.stages;
+            for (const auto &access : prior.accesses) trial.stages |= access.stages;
+            if (!existing) {
+              trial.members.push_back(candidate); trial.color_maps.push_back(first_map);
+              prior.group = plan.groups.size(); plan.groups.push_back(std::move(trial));
+            } else {
+              auto &group = plan.groups[prior.group];
+              group.descriptor = trial.descriptor; group.colors = std::move(trial.colors);
+              group.depth = std::move(trial.depth); group.stencil = std::move(trial.stencil);
+              group.color_count = trial.color_count; group.needs_unbound_slot = trial.needs_unbound_slot;
+              group.stages = trial.stages;
+            }
+            auto &group = plan.groups[prior.group]; group.members.push_back(index); group.color_maps.push_back(map);
+            node.group = prior.group;
+            owned_graphics::Trace("submission_render_merged", ",\"submission\":", scope->seq, ",\"group\":", node.group,
+                ",\"before_list\":", prior.list_ordinal, ",\"after_list\":", node.list_ordinal,
+                ",\"members\":", group.members.size(), ",\"nonconsecutive\":", candidate + 1 != index);
+            break;
+          }
+        }
+        if (!node.access_complete || node.boundary_after) { history.clear(); partition = index + 1; }
+      }
+      owned_graphics::Trace("submission_plan_work", ",\"submission\":", scope->seq,
+          ",\"history_checks\":", plan.history_checks, ",\"candidate_checks\":", plan.candidate_checks,
+          ",\"metadata_copies\":", plan.metadata_copies, ",\"scope_checks\":", plan.scope_checks,
+          ",\"feedback_checks\":", plan.feedback_checks);
+    } catch (const std::bad_alloc &) {
+      ERR("ExecuteCommandLists: out of memory planning immutable render groups");
+      scope.reset();
+      device_->ReportRemoval(DXGI_ERROR_DEVICE_REMOVED);
+      return;
+    }
+    auto emit_clear_batches = [&](const std::vector<size_t> &batches) {
+      for (const auto batch_index : batches) {
+        auto &batch = plan.clear_batches[batch_index];
+        auto encoder = scope->inflight.cmdbuf.renderCommandEncoder(batch.descriptor);
+        owned_graphics::Trace("native_clear_begin", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
+            ",\"members\":", batch.members.size(), ",\"begin_count\":1");
+        encoder.setLabel(WMT::String::string("SubmissionClearBatch", WMTUTF8StringEncoding));
+        encoder.waitForFence(fence_, WMTRenderStageFragment);
+        owned_graphics::Trace("native_clear_wait", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
+            ",\"stages\":", uint32_t(WMTRenderStageFragment), ",\"wait_count\":1");
+        for (const auto &[node, aspect] : batch.members)
+          owned_graphics::Trace("native_clear_load", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
+              ",\"node\":", node, ",\"aspect\":", uint32_t(aspect), ",\"clear_count\":1");
+        encoder.updateFence(fence_, WMTRenderStageFragment);
+        owned_graphics::Trace("native_clear_update", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
+            ",\"stages\":", uint32_t(WMTRenderStageFragment), ",\"update_count\":1");
+        encoder.endEncoding();
+        owned_graphics::Trace("native_clear_end", ",\"submission\":", scope->seq, ",\"batch\":", batch_index, ",\"end_count\":1");
+      }
+    };
+    size_t replay_node = 0;
     for (auto &list : task.lists) {
       if (device_->RemovedReason() != S_OK)
         return;
@@ -5100,6 +5865,23 @@ public:
       while (current) {
         if (device_->RemovedReason() != S_OK)
           return;
+        const RenderReplayGroup *replay_group = nullptr;
+        const SubmissionNode *replay_current_node = nullptr;
+        if (current->type != EncoderType::Null) {
+          const auto index = replay_node++;
+          const auto &node = plan.nodes[index];
+          assert(node.record == current);
+          replay_current_node = &node;
+          emit_clear_batches(node.clears_before);
+          if (node.skip_clear) { current = current->next; continue; }
+          if (node.group != SIZE_MAX) {
+            replay_group = &plan.groups[node.group];
+            if (replay_group->members.front() != index) {
+              current = current->next;
+              continue;
+            }
+          }
+        }
         if (reserved_volume_publish_pending_ &&
             !(current->type == EncoderType::Query &&
               static_cast<QueryEncoderData *>(current)->op == QueryEncoderOp::AliasFlush)) {
@@ -5531,6 +6313,8 @@ public:
             }
             const uint64_t producer = scope->seq;
             scope.reset();
+            owned_graphics::Trace("msaa_producer_wait", ",\"queue\":", owned_id_,
+                ",\"encoder\":", render->id, ",\"producer\":", producer, ",\"wait_count\":1");
             submission_ring_.waitUntilRetired(producer);
             if (device_->RemovedReason() != S_OK)
               return;
@@ -5717,7 +6501,8 @@ public:
           }
         }
         WMT::MTL4CommandBuffer cmdbuf = scope->inflight.cmdbuf;
-        if (current->type != EncoderType::Null)
+        if (current->type != EncoderType::Null &&
+            (current->type != EncoderType::Clear || !static_cast<ClearEncoderData *>(current)->folded_into_render))
           owned_graphics::Trace("encode", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
                                 ",\"list\":", list.list_id,
                                 ",\"recording\":", list.recording,
@@ -5732,6 +6517,8 @@ public:
         }
         case EncoderType::Clear: {
           auto data = static_cast<ClearEncoderData *>(current);
+          if (data->folded_into_render)
+            break;
           std::vector<SwizzlePassResource> swizzle_uses;
           if (data->attachment)
             AppendStandardTexture(swizzle_uses, data->attachment.ptr()->allocation->descriptor, true,
@@ -5770,10 +6557,18 @@ public:
             }
             WMT::SetRenderTargetArrayLength(info, data->array_length);
             auto encoder = cmdbuf.renderCommandEncoder(info);
+            owned_graphics::Trace("native_clear_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"members\":1,\"begin_count\":1");
             encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
             encoder.waitForFence(fence_, WMTRenderStageFragment);
+            owned_graphics::Trace("native_clear_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"wait_count\":1");
+            for (uint8_t aspect : {uint8_t(1), uint8_t(2), uint8_t(4)})
+              if ((data->clear_dsv ? data->clear_dsv : 4) & aspect)
+                owned_graphics::Trace("native_clear_load", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                    ",\"aspect\":", uint32_t(aspect), ",\"clear_count\":1");
             encoder.updateFence(fence_, WMTRenderStageFragment);
+            owned_graphics::Trace("native_clear_update", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"update_count\":1");
             encoder.endEncoding();
+            owned_graphics::Trace("native_clear_end", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"end_count\":1");
           }
           if (!EndStandardSwizzlePass(cmdbuf, scope->inflight, swizzle_uses)) {
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
@@ -5807,6 +6602,15 @@ public:
             }
           };
           append_attachments();
+          owned_graphics::Trace("render_work", ",\"encoder\":", data->id,
+                                ",\"width\":", data->render_target_width, ",\"height\":", data->render_target_height,
+                                ",\"swizzle\":", swizzle_uses.size(), ",\"msaa\":", bool(data->msaa_draw),
+                                ",\"atomic64\":", bool(data->atomic64_phase),
+                                ",\"rov_samples\":", uint32_t(data->rov_marker_sample_count),
+                                ",\"visibility\":", data->visibility_targets.size(),
+                                ",\"stream_output\":", data->so_draws.size(),
+                                ",\"capture_indirect\":", bool(data->capture_indirect),
+                                ",\"depth\":", bool(data->depth.attachment));
           if (atomic_render) {
             const uint64_t participants = producer_participants(*data, nullptr,
                 data->capture_indirect_pass ? &*capture_execution : nullptr);
@@ -5939,6 +6743,47 @@ public:
             render_pass_info.render_target_height = data->render_target_height;
             render_pass_info.visibility_buffer = data->visibility_scratch;
           }
+          if (data->native_msaa_sample_count) {
+            if (data->submission_tables) {
+              bool bindings_safe = true;
+              for (const auto &table : *data->submission_tables) {
+                D3D12_DESCRIPTOR_HEAP_DESC desc{}; D3D12_GPU_DESCRIPTOR_HANDLE start{};
+                table.heap->GetDesc(&desc); table.heap->GetGPUDescriptorHandleForHeapStart(&start);
+                if (!start.ptr || table.base < start.ptr || (table.base - start.ptr) % 32 || table.parameter == ~0u) {
+                  bindings_safe = false; break;
+                }
+                const auto base = (table.base - start.ptr) / 32;
+                if (base >= desc.NumDescriptors) { bindings_safe = false; break; }
+                table.rootsig->ForEachUsedDescriptorRange(table.rootsig->GetTableRanges(table.parameter), table.shader_bindings,
+                    [&](uint64_t offset, uint64_t count, D3D12_DESCRIPTOR_RANGE_TYPE kind) {
+                  if (!bindings_safe || kind == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) return;
+                  if (kind == D3D12_DESCRIPTOR_RANGE_TYPE_UAV || offset >= desc.NumDescriptors - base ||
+                      count > desc.NumDescriptors - base - offset) { bindings_safe = false; return; }
+                  for (uint64_t i = 0; bindings_safe && i < count; ++i)
+                    bindings_safe = NativeMSAADescriptorSafe(device_, table.heap->GetDescriptor(base + offset + i));
+                });
+              }
+              if (!bindings_safe) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
+            }
+            const auto safe_view = [&](const TextureViewRef &view) {
+              if (!view) return true;
+              const auto *v = view.ptr();
+              const auto *a = v->allocation;
+              return !v->castBlockSize && !v->msaaSampleAddress && !v->reservedCast && !v->reservedVolumeRender &&
+                  !v->reservedVolumeAtlasCast && !a->canonicalHeap &&
+                  !a->flags().test(TextureAllocationFlag::Shared) &&
+                  !a->flags().test(TextureAllocationFlag::PlacementSparse) &&
+                  a->descriptor->sampleCount() == data->native_msaa_sample_count &&
+                  a->descriptor->textureType() == WMTTextureType2DMultisample &&
+                  !v->key.mip_start && !v->key.array_start && v->key.array_end == 1 &&
+                  !device_->LookupStandardSwizzleTexture(a->descriptor);
+            };
+            bool valid = !data->msaa_draw && !data->dsv_descriptor_flags &&
+                safe_view(data->depth.attachment) && safe_view(data->stencil.attachment);
+            for (const auto &color : data->colors)
+              valid &= safe_view(color.attachment) && !color.buffer_attachment && !color.resolve_attachment;
+            if (!valid) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
+          }
           std::array<WMT::Texture, 8> rov_markers{};
           if (data->rov_marker_sample_count && !PrepareROVMarkers(
                   cmdbuf, scope->inflight,
@@ -5950,7 +6795,40 @@ public:
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
             return;
           }
+          if (replay_group) render_pass_info = replay_group->descriptor;
+          if (data->visibility_intervals && data->visibility_interval_count) {
+            // GPU-driven draws can contain zero work: initialize every interval
+            // even when native visibility Reset never encounters a fragment.
+            auto zero = cmdbuf.blitCommandEncoder();
+            zero.waitForFence(fence_);
+            wmtcmd_blit_fillbuffer fill{};
+            fill.type = WMTBlitCommandFillBuffer;
+            fill.next.set(nullptr);
+            fill.buffer = data->visibility_scratch;
+            fill.length = data->visibility_interval_count * sizeof(uint64_t);
+            zero.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
+            zero.updateFence(fence_);
+            zero.endEncoding();
+            owned_graphics::Trace("query_scratch_fill", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
+                ",\"encoder\":", data->id, ",\"slots\":", data->visibility_interval_count,
+                ",\"bytes\":", fill.length, ",\"fill_count\":1");
+          }
           auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
+          owned_graphics::Trace("native_render_begin", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
+              ",\"encoder\":", data->id, ",\"members\":", replay_group ? replay_group->members.size() : 1,
+              ",\"native_msaa_sample_count\":", uint32_t(data->native_msaa_sample_count), ",\"begin_count\":1");
+          for (unsigned i = 0; i < (replay_group ? replay_group->color_count : data->render_target_count); ++i)
+            owned_graphics::Trace("native_render_attachment", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                ",\"slot\":", i, ",\"load\":", uint32_t(render_pass_info.colors[i].load_action),
+                ",\"store\":", uint32_t(render_pass_info.colors[i].store_action));
+          for (unsigned i = 0; i < 8; ++i)
+            if (render_pass_info.colors[i].texture && render_pass_info.colors[i].load_action == WMTLoadActionClear)
+              owned_graphics::Trace("native_clear_load", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                  ",\"slot\":", i, ",\"aspect\":4,\"clear_count\":1");
+          if (render_pass_info.depth.texture && render_pass_info.depth.load_action == WMTLoadActionClear)
+            owned_graphics::Trace("native_clear_load", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"aspect\":1,\"clear_count\":1");
+          if (render_pass_info.stencil.texture && render_pass_info.stencil.load_action == WMTLoadActionClear)
+            owned_graphics::Trace("native_clear_load", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"aspect\":2,\"clear_count\":1");
           for (const auto &use : swizzle_uses) {
             if (!use.cast_view) continue;
             const auto usage = use.writes ? WMTResourceUsageRead | WMTResourceUsageWrite : WMTResourceUsageRead;
@@ -5966,13 +6844,70 @@ public:
           }
           // Object/mesh (GS/HS/DS) functions read resources earlier writers produced.
           const bool mesh_pass = data->use_geometry || data->use_tessellation;
-          encoder.waitForFence(fence_, mesh_pass ? WMTRenderStagePreRaster : WMTRenderStageVertex);
+          WMTRenderStages wait_stages = mesh_pass ? WMTRenderStagePreRaster : WMTRenderStageVertex;
+          if (replay_current_node && replay_current_node->access_complete) {
+            uint64_t stages = replay_group ? replay_group->stages : 0;
+            for (const auto &access : replay_current_node->accesses) stages |= access.stages;
+            wait_stages = WMTRenderStages(stages & (WMTMetal4StageVertex | WMTMetal4StageFragment));
+          }
+          encoder.waitForFence(fence_, wait_stages);
+          owned_graphics::Trace("native_render_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+              ",\"stages\":", uint32_t(wait_stages), ",\"wait_count\":1");
           for (uint32_t i = 0; i < data->rov_marker_sample_count; ++i) {
             encoder.setFragmentTexture(rov_markers[i], 31 + i);
             encoder.useResource(rov_markers[i], WMTResourceUsageRead | WMTResourceUsageWrite,
                                 WMTRenderStageFragment);
           }
+          auto set_member_map = [&](size_t member) {
+            auto map = replay_group->color_maps[member];
+            // 0xff never crosses the native ABI. Inactive logical outputs
+            // route into a capacity-proven, truly unbound physical slot.
+            for (unsigned logical = 0; logical < 8; ++logical)
+              if (map[logical] == 0xff) map[logical] = uint8_t(std::max<unsigned>(logical, replay_group->color_count));
+            encoder.setColorAttachmentMap(map.data());
+            owned_graphics::Trace("native_render_color_map", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                ",\"member\":", member, ",\"map_count\":1,\"physical0\":", uint32_t(map[0]),
+                ",\"physical1\":", uint32_t(map[1]), ",\"physical2\":", uint32_t(map[2]), ",\"physical3\":", uint32_t(map[3]),
+                ",\"physical4\":", uint32_t(map[4]), ",\"physical5\":", uint32_t(map[5]), ",\"physical6\":", uint32_t(map[6]),
+                ",\"physical7\":", uint32_t(map[7]));
+          };
+          if (replay_group) set_member_map(0);
+          else if (data->submission_group_safe) {
+            const uint8_t identity[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+            encoder.setColorAttachmentMap(identity);
+            owned_graphics::Trace("native_render_color_map_identity", ",\"submission\":", scope->seq,
+                ",\"encoder\":", data->id, ",\"map_count\":1");
+          }
           encoder.encodeCommands(&data->cmd_head);
+          if (replay_group) {
+            // PreDraw reinitializes PSO/fixed state, roots, input tables,
+            // viewport/scissor, blend and stencil for every independent chain.
+            for (size_t member = 1; member < replay_group->members.size(); ++member) {
+              const auto &node = plan.nodes[replay_group->members[member]];
+              const auto *render = static_cast<const RenderEncoderData *>(node.record);
+              uint64_t before = 0, after = 0; uint8_t scope_mask = 0;
+              for (const auto &dependency : node.dependencies)
+                if (!dependency.attachment_only && plan.nodes[dependency.source].group == node.group) {
+                  before |= dependency.before; after |= dependency.after; scope_mask |= dependency.scope;
+                }
+              if (scope_mask) {
+                // Native replay maps stages_after to the producer and
+                // stages_before to the consumer, unlike our edge names.
+                encoder.memoryBarrier(WMTBarrierScope(scope_mask), WMTRenderStages(after), WMTRenderStages(before));
+                owned_graphics::Trace("native_render_inline_barrier", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                    ",\"member\":", member, ",\"scope\":", uint32_t(scope_mask), ",\"before\":", before, ",\"after\":", after,
+                    ",\"barrier_count\":1");
+              }
+              set_member_map(member);
+              wmtcmd_render_set_vertex_amplification mapping{};
+              mapping.type = WMTRenderCommandSetVertexAmplification;
+              encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&mapping));
+              encoder.encodeCommands(&render->cmd_head);
+              owned_graphics::Trace("native_render_member", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                  ",\"member_encoder\":", render->id, ",\"list_ordinal\":", node.list_ordinal,
+                  ",\"node_ordinal\":", node.node_ordinal);
+            }
+          }
           if (data->capture_indirect_pass)
             EncodeMeshCaptureDraws(encoder, *capture_execution, data->capture_indirect_pass);
           if (indirect_execution && indirect_execution->count) {
@@ -6047,10 +6982,14 @@ public:
           }
           // Capture writes happen in the vertex stage; a rasterization-disabled pass has no
           // fragment work, so the assembly after it must wait for the vertex stage too.
-          encoder.updateFence(fence_, WMTRenderStages(
-                                          (so_draws.empty() ? 0 : WMTRenderStageVertex) | WMTRenderStageFragment |
-                                          (mesh_pass ? WMTRenderStageObject | WMTRenderStageMesh : 0)));
+          const WMTRenderStages update_stages = replay_current_node && replay_current_node->access_complete ? wait_stages :
+              WMTRenderStages((so_draws.empty() ? 0 : WMTRenderStageVertex) | WMTRenderStageFragment |
+                              (mesh_pass ? WMTRenderStageObject | WMTRenderStageMesh : 0));
+          encoder.updateFence(fence_, update_stages);
+          owned_graphics::Trace("native_render_update", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+              ",\"stages\":", uint32_t(update_stages), ",\"update_count\":1");
           encoder.endEncoding();
+          owned_graphics::Trace("native_render_end", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"end_count\":1");
           if (std::any_of(data->colors.begin(), data->colors.end(), [](const auto &color) {
                 return bool(color.buffer_attachment);
               })) {
@@ -6077,6 +7016,23 @@ public:
           for (const auto &draw : so_draws)
             EncodeStreamOutputAssembly(cmdbuf, *draw);
           for (const auto &target : data->visibility_targets) {
+            if (target.reset) {
+              auto reset = cmdbuf.blitCommandEncoder();
+              reset.waitForFence(fence_);
+              wmtcmd_blit_fillbuffer fill{};
+              fill.type = WMTBlitCommandFillBuffer;
+              fill.next.set(nullptr);
+              fill.buffer = target.destination;
+              fill.offset = uint64_t(target.index) * sizeof(uint64_t);
+              fill.length = sizeof(uint64_t);
+              reset.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
+              reset.updateFence(fence_);
+              reset.endEncoding();
+              owned_graphics::Trace("query_reset", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
+                  ",\"encoder\":", data->id, ",\"heap\":", target.heap_id, ",\"index\":", target.index,
+                  ",\"reset_count\":1");
+              continue;
+            }
             auto accumulate = cmdbuf.computeCommandEncoder(false);
             accumulate.waitForFence(fence_);
             wmtcmd_compute_nop head{};
@@ -6088,7 +7044,7 @@ public:
             wmtcmd_compute_setbuffer set_source{};
             set_source.type = WMTComputeCommandSetBuffer;
             set_source.buffer = data->visibility_scratch;
-            set_source.offset = 0;
+            set_source.offset = target.source_offset;
             set_source.index = 0;
             wmtcmd_compute_setbuffer set_destination{};
             set_destination.type = WMTComputeCommandSetBuffer;
@@ -6108,7 +7064,7 @@ public:
             accumulate.endEncoding();
             owned_graphics::Trace("query_accumulate", ",\"queue\":", owned_id_,
                                   ",\"submission\":", scope->seq, ",\"heap\":", target.heap_id,
-                                  ",\"index\":", target.index);
+                                  ",\"index\":", target.index, ",\"source_offset\":", target.source_offset);
           }
           if (atomic_render) {
             if (!end_atomic(&swizzle_uses)) return;
@@ -6229,10 +7185,15 @@ public:
         case EncoderType::Blit: {
           auto data = static_cast<BlitEncoderData *>(current);
           auto encoder = cmdbuf.blitCommandEncoder();
+          owned_graphics::Trace("native_blit_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"begin_count\":1");
           encoder.waitForFence(fence_);
+          owned_graphics::Trace("native_blit_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"wait_count\":1");
           encoder.encodeCommands(&data->cmd_head);
+          owned_graphics::Trace("native_blit_encode", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"encode_count\":1");
           encoder.updateFence(fence_);
+          owned_graphics::Trace("native_blit_update", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"update_count\":1");
           encoder.endEncoding();
+          owned_graphics::Trace("native_blit_end", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"end_count\":1");
           break;
         }
         case EncoderType::StandardSwizzle: {
@@ -6396,7 +7357,9 @@ public:
             return;
           }
           auto encoder = cmdbuf.computeCommandEncoder(false);
+          owned_graphics::Trace("native_compute_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"begin_count\":1");
           encoder.waitForFence(fence_);
+          owned_graphics::Trace("native_compute_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"wait_count\":1");
           for (const auto &use : swizzle_uses) {
             if (!use.cast_view) continue;
             wmtcmd_compute_useresource declaration{};
@@ -6418,8 +7381,11 @@ public:
             }
           }
           encoder.encodeCommands(&data->cmd_head);
+          owned_graphics::Trace("native_compute_encode", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"encode_count\":1");
           encoder.updateFence(fence_);
+          owned_graphics::Trace("native_compute_update", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"update_count\":1");
           encoder.endEncoding();
+          owned_graphics::Trace("native_compute_end", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"end_count\":1");
           if (data->atomic64_phase) {
             if (!end_atomic(&swizzle_uses)) return;
           } else if (!EndStandardSwizzlePass(cmdbuf, scope->inflight, swizzle_uses)) {
@@ -6779,6 +7745,7 @@ public:
       }
       scope->inflight.breadcrumbs.push_back(list.breadcrumb);
     }
+    emit_clear_batches(plan.tail_clears);
     if (fenced && !task.lists.empty()) {
       const auto &last = task.lists.back();
       const auto count = static_cast<RecordingHead *>(last.entry)->state_events.size();

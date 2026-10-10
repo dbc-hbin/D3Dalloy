@@ -395,7 +395,10 @@ int main(int argc, char **argv) {
     M.print(Out->os(), nullptr, PreserveAssemblyUseListOrder);
   } else if (EmitMetallib) {
     dxmt::metallib::MetallibWriter writer;
-    writer.Write(M, Out->os());
+    if (auto error = writer.Write(M, Out->os())) {
+      logAllUnhandledErrors(std::move(error), errs());
+      return 1;
+    }
   } else {
     WriteBitcodeToFile(
       M, Out->os(), PreserveBitcodeUseListOrder, nullptr, true

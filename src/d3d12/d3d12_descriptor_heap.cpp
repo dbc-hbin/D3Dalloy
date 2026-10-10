@@ -215,12 +215,42 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
   Rc<Buffer> buffer_;
   ShaderVisibleDescriptorGPUStorage *mapped_argument_buffer_ = nullptr;
   uint64_t argument_buffer_gpu_address_ = 0;
+  struct PoolSlot {
+    WMT::Reference<WMT::Texture> texture;
+    WMTTextureViewPoolInfo info{};
+    bool pooled = false;
+  };
+  std::vector<PoolSlot> pool_slots_;
+  WMT::Reference<WMT::TextureViewPool> view_pool_;
+  bool pool_supported_ = false;
+
+  void ResetPoolSlot(UINT index) {
+    if (pool_slots_[index].pooled) view_pool_.clear(index);
+    pool_slots_[index] = {};
+  }
+
+  bool SetPoolSlot(UINT index, Texture *texture, TextureViewKey key) {
+    if (!pool_supported_) return false;
+    if (!texture->supportsDescriptorViewPool(key)) return false;
+    const auto descriptor = texture->viewDescriptor(key);
+    auto &slot = pool_slots_[index];
+    slot.texture = texture->current()->texture();
+    slot.info = {uint32_t(descriptor.format), uint32_t(descriptor.type), descriptor.firstMiplevel,
+                 descriptor.miplevelCount, descriptor.firstArraySlice, descriptor.arraySize};
+    slot.pooled = true; // Bridge-managed, including the optional SDK-pool fallback.
+    mapped_argument_buffer_[index].SRVTexture.resource_id = view_pool_.setTextureView(slot.texture, slot.info, index);
+    return true;
+  }
 #ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
   DescriptorHandleRangeOwner handles_;
 #endif
 
 public:
   MTLD3D12DescriptorHeapImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12DescriptorHeap>(pDevice) {}
+
+  WMT::Buffer GetArgumentBuffer() const override {
+    return buffer_ ? buffer_->current()->buffer() : WMT::Buffer{};
+  }
 
   void SetDescriptorOwner(UINT index, uint64_t owner_id, uint64_t counter_owner_id) override {
     if (index >= descriptors_.size()) return;
@@ -241,6 +271,8 @@ public:
       return E_INVALIDARG;
     }
     descriptors_.resize(pDesc->NumDescriptors);
+    pool_slots_.resize(pDesc->NumDescriptors);
+    pool_supported_ = device_->GetMTLDevice().supportsMetal4();
 
     if (pDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
       buffer_ = new Buffer(descriptors_.size() * sizeof(ShaderVisibleDescriptorGPUStorage), device_->GetMTLDevice());
@@ -268,6 +300,12 @@ public:
       if (!descriptors_.empty() && !mapped_argument_buffer_)
         return E_OUTOFMEMORY;
       InitializeResidency(true);
+    }
+    // CPU heaps are legal CopyDescriptors sources: their native pool avoids recreating
+    // a view when copying into a shader-visible destination pool.
+    if (pDesc->NumDescriptors && pool_supported_) {
+      view_pool_ = device_->GetMTLDevice().newTextureViewPool(pDesc->NumDescriptors, GetArgumentBuffer());
+      if (!view_pool_) return E_OUTOFMEMORY;
     }
 
 #ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
@@ -330,13 +368,15 @@ public:
                         bool CubeView, bool CenterSamplePattern, UINT64 FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexture;
     cpu_storage.SRVTexture.texture = Texture;
     cpu_storage.SRVTexture.view = View;
-    auto &texture_view = Texture->view(View);
+    const auto *texture_view = SetPoolSlot(Index, Texture, View) ? nullptr : &Texture->view(View);
+    if (texture_view && !texture_view->texture) return E_OUTOFMEMORY;
     auto &gpu_storage = mapped_argument_buffer_[Index];
-    gpu_storage.SRVTexture.resource_id = texture_view.gpuResourceID;
+    if (texture_view) gpu_storage.SRVTexture.resource_id = texture_view->gpuResourceID;
     // The physical view's array range counts faces; a shader cube-array
     // coordinate indexes cubes, not individual faces.
     // Multisampled SRVs do not have an LOD clamp: their low metadata word
@@ -350,13 +390,13 @@ public:
     // q3: empty-view defaults and integer channel widths; see EmptyViewDefaults.
     gpu_storage.SRVTexture.padding[1] = FormatDefaults;
     if (Texture->reservedVolumeLayoutAddress) {
-      const auto cast_address = texture_view.reservedVolumeCastLayoutAddress;
+      const auto cast_address = texture_view->reservedVolumeCastLayoutAddress;
       gpu_storage.SRVTexture.padding[0] = (1ull << 62) | (cast_address ? cast_address : Texture->reservedVolumeLayoutAddress);
       gpu_storage.SRVTexture.padding[1] |= (cast_address ? uint64_t(1) << 8 :
           uint64_t(View.mip_start) | uint64_t(View.mip_end - View.mip_start) << 8) << 32;
     }
-    if (texture_view.msaaSampleAddress) {
-      gpu_storage.SRVTexture.padding[0] = texture_view.msaaSampleAddress;
+    if (texture_view && texture_view->msaaSampleAddress) {
+      gpu_storage.SRVTexture.padding[0] = texture_view->msaaSampleAddress;
       gpu_storage.SRVTexture.metadata |= 2u | (uint64_t(Texture->sampleCount()) << 8);
     }
     return S_OK;
@@ -365,6 +405,7 @@ public:
   AddConstantBufferView(UINT Index, UINT64 VA, UINT32 SizeInBytes) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::ConstantBuffer;
     cpu_storage.ConstantBuffer.address = VA;
@@ -380,15 +421,17 @@ public:
   AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize, UINT FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexture;
     cpu_storage.UAVTexture.texture = Texture;
     cpu_storage.UAVTexture.view = View;
     cpu_storage.UAVTexture.first_w_slice = FirstWSlice;
     cpu_storage.UAVTexture.w_size = WSize;
-    auto &texture_view = Texture->view(View);
+    const auto *texture_view = SetPoolSlot(Index, Texture, View) ? nullptr : &Texture->view(View);
+    if (texture_view && !texture_view->texture) return E_OUTOFMEMORY;
     auto &gpu_storage = mapped_argument_buffer_[Index];
-    gpu_storage.UAVTexture.resource_id = texture_view.gpuResourceID;
+    if (texture_view) gpu_storage.UAVTexture.resource_id = texture_view->gpuResourceID;
     // The D3D12 texture3D UAV's high metadata word packs its logical W range.
     // Other textures retain their existing array-length interpretation.
     const uint32_t length = WSize ? (uint32_t(WSize) << 16) | FirstWSlice : Texture->arrayLength(View);
@@ -396,14 +439,14 @@ public:
     gpu_storage.UAVTexture.padding[0] = 0;
     gpu_storage.UAVTexture.padding[1] = FormatDefaults;
     if (Texture->reservedVolumeLayoutAddress) {
-      const auto cast_address = texture_view.reservedVolumeCastLayoutAddress;
+      const auto cast_address = texture_view->reservedVolumeCastLayoutAddress;
       gpu_storage.UAVTexture.padding[0] = (1ull << 62) | (cast_address ? cast_address : Texture->reservedVolumeLayoutAddress);
       gpu_storage.UAVTexture.padding[1] |= (cast_address ? uint64_t(1) << 8 :
           uint64_t(View.mip_start) | uint64_t(View.mip_end - View.mip_start) << 8) << 32;
       gpu_storage.UAVTexture.padding[1] |= uint64_t(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING & 0xfff) << 48;
     }
-    if (texture_view.msaaSampleAddress) {
-      gpu_storage.UAVTexture.padding[0] = texture_view.msaaSampleAddress;
+    if (texture_view && texture_view->msaaSampleAddress) {
+      gpu_storage.UAVTexture.padding[0] = texture_view->msaaSampleAddress;
       gpu_storage.UAVTexture.metadata |= 2u | (uint64_t(Texture->sampleCount()) << 8);
     }
     return S_OK;
@@ -413,6 +456,7 @@ public:
   AddUnorderedAccessView(UINT Index, Buffer *UAVBuffer, BufferViewKey View, BufferSlice Slice) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexelBuffer;
     cpu_storage.UAVTexelBuffer.buffer = UAVBuffer;
@@ -435,6 +479,7 @@ public:
   AddUnorderedAccessView(UINT Index, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT64 CounterOffsetInBytes) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::UAVBuffer;
     cpu_storage.UAVBuffer.buffer = UAVBuffer;
@@ -458,6 +503,7 @@ public:
   virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexelBuffer;
     cpu_storage.SRVTexelBuffer.buffer = Buffer;
@@ -480,6 +526,7 @@ public:
                                              UINT Shader4ComponentMapping) {
     if (Index >= descriptors_.size() || !Buffer)
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::SRVRGB32Buffer;
     cpu_storage.SRVRGB32Buffer.buffer = Buffer;
@@ -497,6 +544,7 @@ public:
   virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferSlice Slice) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::SRVBuffer;
     cpu_storage.SRVBuffer.buffer = Buffer;
@@ -518,6 +566,7 @@ public:
   AddShaderResourceView(UINT Index, D3D12_SHADER_RESOURCE_VIEW_DESC const *pDesc) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::Null;
     auto &gpu_storage = mapped_argument_buffer_[Index];
@@ -538,6 +587,7 @@ public:
   virtual HRESULT AddAccelerationStructure(UINT Index, UINT64 Address) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.AccelerationStructure.address = Address;
     cpu_storage.type =
@@ -554,6 +604,7 @@ public:
   AddSamplerFeedbackView(UINT Index, Buffer *Cells, uint64_t CellBytes, bool Paired, uint64_t LayoutWord) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::SamplerFeedback;
     cpu_storage.SamplerFeedback.buffer = Cells;
@@ -570,6 +621,7 @@ public:
   AddUnorderedAccessView(UINT Index, D3D12_UNORDERED_ACCESS_VIEW_DESC const *pDesc) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
+    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::Null;
     auto &gpu_storage = mapped_argument_buffer_[Index];
@@ -585,9 +637,24 @@ public:
   virtual void
   CopyDescriptors(UINT From, MTLD3D12DescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) {
     auto *destination = static_cast<MTLD3D12DescriptorHeapImpl *>(pHeapTo);
-    for (unsigned i = 0; i < CopyCount; i++) {
-      destination->descriptors_[DescriptorTo + i] = descriptors_[From + i];
-      destination->mapped_argument_buffer_[DescriptorTo + i] = mapped_argument_buffer_[From + i];
+    if (destination == this && From == DescriptorTo) return;
+    const bool reverse = destination == this && DescriptorTo > From && DescriptorTo < From + CopyCount;
+    for (unsigned n = 0; n < CopyCount; ++n) {
+      const unsigned i = reverse ? CopyCount - n - 1 : n;
+      const auto slot = pool_slots_[From + i];
+      const auto cpu = descriptors_[From + i];
+      auto gpu = mapped_argument_buffer_[From + i];
+      destination->ResetPoolSlot(DescriptorTo + i);
+      destination->descriptors_[DescriptorTo + i] = cpu;
+      destination->pool_slots_[DescriptorTo + i] = slot;
+      auto &target = destination->pool_slots_[DescriptorTo + i];
+      target.pooled = false;
+      if (slot.texture) {
+        gpu.SRVTexture.resource_id = destination->view_pool_.copyTextureView(
+            view_pool_, From + i, DescriptorTo + i, slot.texture, slot.info);
+        target.pooled = true;
+      }
+      destination->mapped_argument_buffer_[DescriptorTo + i] = gpu;
     }
   }
 };
@@ -720,6 +787,10 @@ class MTLD3D12SamplerDescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12Sample
 public:
   MTLD3D12SamplerDescriptorHeapImpl(MTLD3D12Device *pDevice) :
       MTLD3D12Pageable<MTLD3D12SamplerDescriptorHeap>(pDevice) {}
+
+  WMT::Buffer GetArgumentBuffer() const override {
+    return buffer_ ? buffer_->current()->buffer() : WMT::Buffer{};
+  }
 
   HRESULT
   Initialize(const D3D12_DESCRIPTOR_HEAP_DESC *pDesc) {

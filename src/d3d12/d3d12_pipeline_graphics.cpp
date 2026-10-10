@@ -522,10 +522,16 @@ ShaderImmutableConstants::Initialize(
 
 HRESULT
 MTLD3D12PipelineState::InitializeShader(
-    const char *Stage, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl,
+    DeviceShaderArtifactCache &artifacts, const char *Stage, D3D12_SHADER_BYTECODE Bytecode,
+    sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl,
     std::vector<MTL_SM50_SHADER_ARGUMENT> *resource_bindings
 ) {
   using namespace microsoft;
+  if (pRefl) {
+    HRESULT hr = artifacts.Reflect(Bytecode, ppShader, *pRefl, resource_bindings);
+    TraceShaderProbe(Stage, Bytecode, "reflection-cache", hr);
+    return hr;
+  }
   HRESULT hr;
   CDXBCParser Parser;
   if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength))) {
@@ -584,6 +590,8 @@ protected:
   WMT::Reference<WMT4::Function> indirect_fragment_function;
   WMT::Reference<WMT::RenderPipelineState> indirect_pso;
   std::mutex indirect_pso_mutex;
+  std::mutex color_write_mask_pso_mutex;
+  std::map<uint8_t, WMT::Reference<WMT::RenderPipelineState>> color_write_mask_psos;
   std::vector<uint8_t> pull_vs_bytecode;
   // The explicit root signature is shared by every lazy graphics variant.
   std::vector<uint8_t> pull_root_blob;
@@ -597,6 +605,7 @@ protected:
   std::vector<uint8_t> statistics_ps_bytecode;
   std::string statistics_ps_name;
   uint32_t statistics_ps_sample_mask = 0;
+  bool sample_mask_constant = false;
   bool statistics_ps_dual_source_blending = false;
   std::array<uint32_t, 8> statistics_ps_formats{};
   /* Framebuffer-fetch logic op (LogicOpNeedsFetch); chained into every PS variant that writes render targets. */
@@ -632,19 +641,23 @@ protected:
 
   HRESULT CompileMeshStage(const char *name, sm50_bitcode_t *compiled, ShaderImmutableConstants &constants,
                            WMT::Reference<WMT4::Function> &function,
+                           std::initializer_list<D3D12_SHADER_BYTECODE> sources,
+                           SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
                            const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &compile) {
     SM50Error error;
-    if (compile(compiled, &error)) {
+    std::shared_ptr<const ShaderStageArtifact> artifact;
+    if (device_->GetShaderArtifactCache().Compile(name, sources, args, name, compiled, &error, artifact, compile)) {
       ERR("Failed to compile ", name, ": ", SM50GetErrorMessageString(error));
       return E_FAIL;
     }
     SM50_COMPILED_BITCODE bytecode{};
-    SM50GetCompiledBitcode(*compiled, &bytecode);
+    if (artifact) bytecode = artifact->view;
+    else SM50GetCompiledBitcode(*compiled, &bytecode);
     HRESULT hr;
     if (FAILED(hr = constants.Initialize(device_, bytecode, *compiled)))
       return hr;
     WMT::Reference<WMT::Error> err;
-    auto lib = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), err);
+    auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, *compiled, err);
     if (!lib)
       return E_FAIL;
     function = lib.newFunction(name);
@@ -657,7 +670,7 @@ protected:
                      std::array<uint32_t, 3> &threads) -> HRESULT {
       MTL_SHADER_REFLECTION reflection{};
       SM50Shader shader;
-      if (HRESULT hr = InitializeShader(name, bytecode, &shader, &reflection, &resource_bindings); FAILED(hr))
+      if (HRESULT hr = InitializeShader(device_->GetShaderArtifactCache(), name, bytecode, &shader, &reflection, &resource_bindings); FAILED(hr))
         return hr;
       threads = {reflection.ThreadgroupSize[0], reflection.ThreadgroupSize[1], reflection.ThreadgroupSize[2]};
       uses_atomic64 |= reflection.HasAtomic64 != 0;
@@ -715,7 +728,7 @@ protected:
     SM50Shader shader;
     HRESULT hr;
     if (mesh_kind == MeshPipelineKind::Geometry) {
-      if (FAILED(hr = InitializeShader("GS", pDesc->GS, &shader, &reflection, &resource_bindings)))
+      if (FAILED(hr = InitializeShader(device_->GetShaderArtifactCache(), "GS", pDesc->GS, &shader, &reflection, &resource_bindings)))
         return hr;
       mesh_input_primitive = reflection.GeometryShader.Primitive;
       uses_atomic64 |= reflection.HasAtomic64 != 0;
@@ -744,7 +757,7 @@ protected:
       copy(pDesc->GS, mesh_gs_bytecode);
       return S_OK;
     }
-    if (FAILED(hr = InitializeShader("HS", pDesc->HS, &shader, &reflection, &resource_bindings)))
+    if (FAILED(hr = InitializeShader(device_->GetShaderArtifactCache(), "HS", pDesc->HS, &shader, &reflection, &resource_bindings)))
       return hr;
     tess_threads_per_patch = reflection.ThreadsPerPatch;
     uses_atomic64 |= reflection.HasAtomic64 != 0;
@@ -753,7 +766,7 @@ protected:
       const auto output = reflection.Tessellator.OutputPrimitive;
       MTL_SHADER_REFLECTION gs_reflection{};
       SM50Shader geometry;
-      if (FAILED(hr = InitializeShader("GS", pDesc->GS, &geometry, &gs_reflection, &resource_bindings)))
+      if (FAILED(hr = InitializeShader(device_->GetShaderArtifactCache(), "GS", pDesc->GS, &geometry, &gs_reflection, &resource_bindings)))
         return hr;
       mesh_input_primitive = gs_reflection.GeometryShader.Primitive;
       uses_atomic64 |= gs_reflection.HasAtomic64 != 0;
@@ -769,7 +782,7 @@ protected:
     }
     SM50Shader domain;
     MTL_SHADER_REFLECTION domain_reflection{};
-    if (FAILED(hr = InitializeShader("DS", pDesc->DS, &domain, &domain_reflection, &resource_bindings)))
+    if (FAILED(hr = InitializeShader(device_->GetShaderArtifactCache(), "DS", pDesc->DS, &domain, &domain_reflection, &resource_bindings)))
       return hr;
     mesh_max_potential_tess_factor = domain_reflection.PostTessellator.MaxPotentialTessFactor;
     uses_atomic64 |= domain_reflection.HasAtomic64 != 0;
@@ -808,8 +821,6 @@ protected:
                        ShaderImmutableConstants &constants, SM50ShaderBitcode &bitcode,
                        WMT::Reference<WMT4::Function> &function) -> HRESULT {
       SM50Shader shader;
-      if (FAILED(InitializeShader(stage, {bytecode.data(), bytecode.size()}, &shader, nullptr)))
-        return E_FAIL;
       SM50_SHADER_ROOT_SIGNATURE_DATA root{};
       root.type = SM50_SHADER_ROOT_SIGNATURE;
       root.bytecode = pull_root_blob.empty() ? bytecode.data() : pull_root_blob.data();
@@ -843,9 +854,13 @@ protected:
         capture.next = root.next;
         root.next = &capture;
       }
-      return CompileMeshStage(name, &bitcode, constants, function, [&](sm50_bitcode_t *out, sm50_error_t *error) {
+      auto lower = [&](sm50_bitcode_t *out, sm50_error_t *error) {
+        if (int result = device_->GetShaderArtifactCache().InitializeCompiler(
+              {bytecode.data(), bytecode.size()}, &shader, error)) return result;
         return SM50Compile(shader, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&root, name, out, error);
-      });
+      };
+      return CompileMeshStage(name, &bitcode, constants, function, {{bytecode.data(), bytecode.size()}},
+                              reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root), std::ref(lower));
     };
     SM50ShaderBitcode object_bitcode, mesh_bitcode;
     WMT::Reference<WMT4::Function> object_function, mesh_function;
@@ -908,22 +923,14 @@ protected:
     const bool strip = key & 4;
     const bool statistics = key & 8;
     SM50Shader vs, gs, hs, ds;
-    if (FAILED(InitializeShader("VS-mesh", {pull_vs_bytecode.data(), pull_vs_bytecode.size()}, &vs, nullptr)))
-      return E_FAIL;
     const bool geometry = mesh_kind == MeshPipelineKind::Geometry;
     const bool tess_geometry = mesh_kind == MeshPipelineKind::TessellationGeometry;
     // TS+GS: pass 1 is VS+HS / DS capture, pass 2 (kMeshTessellationGeometryPass) capture fetch / GS.
     const bool gs_pass = geometry || (tess_geometry && (key & kMeshTessellationGeometryPass));
-    // Reflection also fits the HS payload (threads per patch, max factor) into the object payload limit.
-    MTL_SHADER_REFLECTION stage_reflection{};
-    if (gs_pass &&
-        FAILED(InitializeShader("GS", {mesh_gs_bytecode.data(), mesh_gs_bytecode.size()}, &gs, &stage_reflection)))
-      return E_FAIL;
-    if (!geometry && (FAILED(InitializeShader("HS", {mesh_hs_bytecode.data(), mesh_hs_bytecode.size()}, &hs,
-                                              &stage_reflection)) ||
-                      FAILED(InitializeShader("DS", {mesh_ds_bytecode.data(), mesh_ds_bytecode.size()}, &ds,
-                                              &stage_reflection))))
-      return E_FAIL;
+    auto initialize = [&](SM50Shader &shader, const std::vector<uint8_t> &source, sm50_error_t *error) {
+      return sm50_shader_t(shader) ? 0 : device_->GetShaderArtifactCache().InitializeCompiler(
+          {source.data(), source.size()}, &shader, error);
+    };
 
     SM50_SHADER_COMMON_DATA common{};
     common.type = SM50_SHADER_COMMON;
@@ -995,13 +1002,17 @@ protected:
       layout.next = &pso_gs;
       SM50_SHADER_ROOT_SIGNATURE_DATA vs_root{};
       root(vs_root, SM50_SHADER_ROOT_SIGNATURE, geometry ? pull_vs_bytecode : mesh_ds_bytecode, &layout);
-      if (FAILED(hr = CompileMeshStage(object_name, &object_bitcode, variant.object_constants, object_function,
-                                       [&](sm50_bitcode_t *out, sm50_error_t *error) {
-                                         return SM50CompileGeometryPipelineVertex(
-                                             first, gs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&vs_root,
-                                             object_name, out, error);
-                                       })))
-        return hr;
+      auto lower_object = [&](sm50_bitcode_t *out, sm50_error_t *error) {
+        if (int result = initialize(first, geometry ? pull_vs_bytecode : mesh_ds_bytecode, error)) return result;
+        if (int result = initialize(gs, mesh_gs_bytecode, error)) return result;
+        return SM50CompileGeometryPipelineVertex(
+            first, gs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&vs_root,
+            object_name, out, error);
+      };
+            if (FAILED(hr = CompileMeshStage(object_name, &object_bitcode, variant.object_constants, object_function, {{geometry ? pull_vs_bytecode.data() : mesh_ds_bytecode.data(),
+              geometry ? pull_vs_bytecode.size() : mesh_ds_bytecode.size()},
+             {mesh_gs_bytecode.data(), mesh_gs_bytecode.size()}}, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&vs_root), std::ref(lower_object))))
+              return hr;
       SM50_SHADER_PSO_GEOMETRY_SHADER_DATA pso_gs_mesh = pso_gs;
       // Stream output after the GS: the mesh function captures every declared stream and rasterizes the
       // selected one (see so_assemble_gs and SM50_SHADER_D3D12_GS_STREAMS_DATA).
@@ -1049,13 +1060,17 @@ protected:
         pso_gs_mesh.next = &msaa_mesh;
       }
       root(gs_root, SM50_SHADER_ROOT_SIGNATURE, mesh_gs_bytecode, &pso_gs_mesh);
-      if (FAILED(hr = CompileMeshStage("gs_main", &mesh_bitcode, variant.mesh_constants, mesh_function,
-                                       [&](sm50_bitcode_t *out, sm50_error_t *error) {
-                                         return SM50CompileGeometryPipelineGeometry(
-                                             first, gs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&gs_root,
-                                             "gs_main", out, error);
-                                       })))
-        return hr;
+      auto lower_mesh = [&](sm50_bitcode_t *out, sm50_error_t *error) {
+        if (int result = initialize(first, geometry ? pull_vs_bytecode : mesh_ds_bytecode, error)) return result;
+        if (int result = initialize(gs, mesh_gs_bytecode, error)) return result;
+        return SM50CompileGeometryPipelineGeometry(
+            first, gs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&gs_root,
+            "gs_main", out, error);
+      };
+            if (FAILED(hr = CompileMeshStage("gs_main", &mesh_bitcode, variant.mesh_constants, mesh_function, {{geometry ? pull_vs_bytecode.data() : mesh_ds_bytecode.data(),
+              geometry ? pull_vs_bytecode.size() : mesh_ds_bytecode.size()},
+             {mesh_gs_bytecode.data(), mesh_gs_bytecode.size()}}, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&gs_root), std::ref(lower_mesh))))
+              return hr;
     } else {
       SM50_SHADER_PSO_TESSELLATOR_DATA pso_tess{};
       pso_tess.type = SM50_SHADER_PSO_TESSELLATOR;
@@ -1066,13 +1081,16 @@ protected:
       SM50_SHADER_ROOT_SIGNATURE_DATA vs_root{}, hs_root{};
       root(vs_root, SM50_SHADER_ROOT_SIGNATURE2, pull_vs_bytecode, &layout);
       root(hs_root, SM50_SHADER_ROOT_SIGNATURE, mesh_hs_bytecode, &vs_root);
-      if (FAILED(hr = CompileMeshStage("vshs_main", &object_bitcode, variant.object_constants, object_function,
-                                       [&](sm50_bitcode_t *out, sm50_error_t *error) {
-                                         return SM50CompileTessellationPipelineHull(
-                                             vs, hs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&hs_root,
-                                             "vshs_main", out, error);
-                                       })))
-        return hr;
+      auto lower_hull = [&](sm50_bitcode_t *out, sm50_error_t *error) {
+        if (int result = initialize(vs, pull_vs_bytecode, error)) return result;
+        if (int result = initialize(hs, mesh_hs_bytecode, error)) return result;
+        return SM50CompileTessellationPipelineHull(
+            vs, hs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&hs_root,
+            "vshs_main", out, error);
+      };
+            if (FAILED(hr = CompileMeshStage("vshs_main", &object_bitcode, variant.object_constants, object_function, {{pull_vs_bytecode.data(), pull_vs_bytecode.size()},
+             {mesh_hs_bytecode.data(), mesh_hs_bytecode.size()}}, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&hs_root), std::ref(lower_hull))))
+              return hr;
       SM50_SHADER_PSO_TESSELLATOR_DATA pso_tess_mesh = pso_tess;
       // TS+GS pass 1: the DS writes its vertices and primitives to the capture scratch instead of rasterizing.
       SM50_TESS_CAPTURE_LAYOUT captured{};
@@ -1115,13 +1133,16 @@ protected:
       const char *mesh_name = tess_geometry ? "ds_capture" : "ds_main";
       SM50_SHADER_ROOT_SIGNATURE_DATA ds_root{};
       root(ds_root, SM50_SHADER_ROOT_SIGNATURE, mesh_ds_bytecode, &pass_through);
-      if (FAILED(hr = CompileMeshStage(mesh_name, &mesh_bitcode, variant.mesh_constants, mesh_function,
-                                       [&](sm50_bitcode_t *out, sm50_error_t *error) {
-                                         return SM50CompileTessellationPipelineDomain(
-                                             hs, ds, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&ds_root,
-                                             mesh_name, out, error);
-                                       })))
-        return hr;
+      auto lower_domain = [&](sm50_bitcode_t *out, sm50_error_t *error) {
+        if (int result = initialize(hs, mesh_hs_bytecode, error)) return result;
+        if (int result = initialize(ds, mesh_ds_bytecode, error)) return result;
+        return SM50CompileTessellationPipelineDomain(
+            hs, ds, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&ds_root,
+            mesh_name, out, error);
+      };
+            if (FAILED(hr = CompileMeshStage(mesh_name, &mesh_bitcode, variant.mesh_constants, mesh_function, {{mesh_hs_bytecode.data(), mesh_hs_bytecode.size()},
+             {mesh_ds_bytecode.data(), mesh_ds_bytecode.size()}}, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ds_root), std::ref(lower_domain))))
+              return hr;
       if (tess_geometry || (domain_so && !replay_vertices))
         tess_capture_layout = captured;
       if (domain_so && !replay_vertices) {
@@ -1607,10 +1628,10 @@ public:
       return hr;
     // Without a rasterized stream the pipeline has no fragment function (Metal requires it).
     const bool use_fragment = pDesc->PS.pShaderBytecode && !rasterization_disabled;
-    if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader("PS", pDesc->PS, &shader_ps, &ref_ps, &resource_bindings)))
+    if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader(device_->GetShaderArtifactCache(), "PS", pDesc->PS, &shader_ps, &ref_ps, &resource_bindings)))
       return hr;
     uses_atomic64 |= use_fragment && ref_ps.HasAtomic64;
-    // Mesh pipelines compile their object/mesh functions per draw-time variant, outside the cache.
+    // Mesh variants use the device artifact cache, not the serialized ordinary-stage PSO blob.
     const uint32_t stages = (mesh ? 0u : 1u << PipelineCache::Vertex) |
                             (use_fragment ? 1u << PipelineCache::Fragment : 0);
     if (FAILED(hr = cache_.Initialize(pDesc->CachedPSO, key, stages, metal.registryID())))
@@ -1628,7 +1649,7 @@ public:
     if (uses_atomic64) { common.next = &atomic_phase; common.metal_version = SM50_SHADER_METAL_410; }
 
     if (pDesc->VS.pShaderBytecode) {
-      if (FAILED(hr = InitializeShader("VS", pDesc->VS, &shader_vs, &ref_vs, &resource_bindings)))
+      if (FAILED(hr = InitializeShader(device_->GetShaderArtifactCache(), "VS", pDesc->VS, &shader_vs, &ref_vs, &resource_bindings)))
         return hr;
       uses_atomic64 |= ref_vs.HasAtomic64 != 0;
       if (uses_atomic64) { common.next = &atomic_phase; common.metal_version = SM50_SHADER_METAL_410; }
@@ -1704,9 +1725,9 @@ public:
 
       if (mesh) {
         // The VS is compiled into each mesh variant's object function (BuildMeshPipeline).
-      } else if (!cache_.loaded() && SM50Compile(
-              shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main",
-              cache_.output(PipelineCache::Vertex), &sm50_err
+      } else if (cache_.Compile(
+              PipelineCache::Vertex, device_->GetShaderArtifactCache(), pDesc->VS,
+              shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &sm50_err
           )) {
         RecordShaderCompileFailure("VS", pDesc->VS, rootsig,
                                    reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&rootsig),
@@ -1720,8 +1741,8 @@ public:
         if (FAILED(hr = vertex_constants.Initialize(device_, vs_bitcode_compiled,
                                                     cache_.bitcode(PipelineCache::Vertex))))
           return hr;
-        auto vs_data = WMT::MakeDispatchData(vs_bitcode_compiled.Data, vs_bitcode_compiled.Size);
-        auto vs_lib = device_->GetMetal4Compiler().newLibrary(vs_data, err);
+        auto vs_lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), vs_bitcode_compiled,
+                                                              cache_.bitcode(PipelineCache::Vertex), err);
         if (!vs_lib)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
         vs_func = vs_lib.newFunction("vs_main");
@@ -1753,6 +1774,8 @@ public:
         mesh_kind != MeshPipelineKind::None && EffectiveRasterSampleCount() > 1 &&
         owned_force_early_pixel_shader && !owned_sample_frequency_pixel_shader &&
         (pDesc->DepthStencilState.DepthEnable || pDesc->DepthStencilState.StencilEnable);
+    const bool coverage_input = (ref_ps.PSCoverageInputs & SM50_PIXEL_COVERAGE_INPUT) != 0;
+    const bool inner_coverage_input = (ref_ps.PSCoverageInputs & SM50_PIXEL_INNER_COVERAGE_INPUT) != 0;
     if (pDesc->PS.pShaderBytecode) {
       microsoft::CSignatureParser input_signature;
       if (FAILED(hr = microsoft::DXBCGetInputSignature(pDesc->PS.pShaderBytecode, &input_signature)))
@@ -1761,10 +1784,7 @@ public:
       // Without a rasterized stream the PS never runs, so its distance inputs must not
       // select the captured-pixel draw path.
       const auto count = use_fragment ? input_signature.GetParameters(&parameters) : 0u;
-      bool coverage_input = false, inner_coverage_input = false;
       for (uint32_t i = 0; i < count; ++i) {
-        coverage_input |= uint32_t(parameters[i].SystemValue) == 66;
-        inner_coverage_input |= uint32_t(parameters[i].SystemValue) == 70;
         if (uint32_t(parameters[i].SystemValue) == 24) owned_shading_rate_pixel_shader = true;
         if (parameters[i].Mask &&
             (parameters[i].SystemValue == microsoft::D3D10_SB_NAME_CLIP_DISTANCE ||
@@ -1775,10 +1795,12 @@ public:
       }
       const void *root_blob = pDesc->PS.pShaderBytecode;
       if (coverage_input && inner_coverage_input) return E_INVALIDARG;
+      sample_mask_constant = !coverage_input;
       size_t root_length = pDesc->PS.BytecodeLength;
       if (pDesc->pRootSignature)
         root_length = static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&root_blob);
-      needs_rov_buffer_marker = SM50NeedsRasterOrderedBufferMarker(shader_ps, root_blob, root_length) != 0;
+      needs_rov_buffer_marker = device_->GetShaderArtifactCache().RasterOrderedMarker(
+          pDesc->PS, {root_blob, root_length}, shader_ps);
     }
     // D3D12 forbids sample-frequency execution with the fixed center pattern.
     if (owned_sample_desc.Quality == 0xfffffffeu && owned_sample_frequency_pixel_shader)
@@ -1842,10 +1864,17 @@ public:
         rootsig.bytecode_length = pDesc->PS.BytecodeLength;
       }
       rootsig.next = &data_ps;
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA mask_constant{};
+      mask_constant.type = SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT;
+      mask_constant.next = rootsig.next;
+      sample_mask_constant = sample_mask_constant && !mesh && !RequiresMSAAExecution() &&
+                             !owned_sample_frequency_pixel_shader && !needs_rov_buffer_marker &&
+                             owned_sample_mask != UINT_MAX;
+      if (sample_mask_constant) rootsig.next = &mask_constant;
 
-      if (!cache_.loaded() && SM50Compile(
-              shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(),
-              cache_.output(PipelineCache::Fragment), &sm50_err
+      if (cache_.Compile(
+              PipelineCache::Fragment, device_->GetShaderArtifactCache(), pDesc->PS,
+              shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &sm50_err
           )) {
         RecordShaderCompileFailure("PS", pDesc->PS, rootsig,
                                    reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&rootsig),
@@ -1860,11 +1889,14 @@ public:
       // Retain its compiled AIR/cache data, but never ask Metal to link the
       // original over-limit fragment signature.
       if (!owned_mesh_output_replay) {
-        auto ps_data = WMT::MakeDispatchData(ps_bitcode_compiled.Data, ps_bitcode_compiled.Size);
-        auto ps_lib = device_->GetMetal4Compiler().newLibrary(ps_data, err);
+        auto ps_lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), ps_bitcode_compiled,
+                                                              cache_.bitcode(PipelineCache::Fragment), err);
         if (!ps_lib)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
-        ps_func = ps_lib.newFunction(ps_name.c_str());
+        ps_func = sample_mask_constant
+          ? device_->GetShaderArtifactCache().SampleMaskFunction(ps_lib, ps_name.c_str(),
+              {rootsig.bytecode, rootsig.bytecode_length}, owned_sample_mask, err)
+          : ps_lib.newFunction(ps_name.c_str());
         if (!ps_func)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
       }
@@ -1907,6 +1939,10 @@ public:
     } else {
       info.vertex_function = vs_func.handle;
       info.fragment_function = ps_func.handle;
+      info.inherit_color_attachment_mapping = !RequiresMSAAExecution();
+      submission_mapping_safe = info.inherit_color_attachment_mapping && !use_fetch_logic_op && !dual_source_blending;
+      submission_color_output_mask = submission_mapping_safe && use_fragment
+                                         ? static_cast<uint8_t>(ref_ps.PixelShader.ValidRenderTargets) : 0;
       
       
       info.max_vertex_amplification_count = max_vertex_amplification;
@@ -1916,6 +1952,30 @@ public:
         if (!pso) {
           ERR("Failed to create PSO: ", err.description().getUTF8String());
           return E_FAIL;
+        }
+      } else {
+        const auto count = owned_sample_desc.Count;
+        const auto quality = owned_sample_desc.Quality;
+        const bool native_msaa =
+            (count == 2 || count == 4 || count == 8) && metal.supportsTextureSampleCount(count) &&
+            (quality == 0 || quality == 0xffffffffu || quality == 0xfffffffeu) &&
+            pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
+            use_fragment && !stream_output.active && !rasterization_disabled &&
+            !forced_sample_count && !ForcedSampleReplay() && !owned_conservative &&
+            !owned_distance_interpolation && !owned_mesh_output_replay && !uses_atomic64 &&
+            !needs_rov_buffer_marker && !owned_depth_bounds && !owned_sample_frequency_pixel_shader &&
+            !coverage_input && !inner_coverage_input && !owned_shading_rate_pixel_shader &&
+            !pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput &&
+            owned_line_mode == SM50_MSAA_LINE_NONE && !use_fetch_logic_op &&
+            !dual_source_blending && !owned_force_early_pixel_shader && !pDesc->DepthStencilState.StencilEnable &&
+            !view_instancing.count;
+        if (native_msaa) {
+          // Identity mapping, original VS/PS and their constants; no capture or ICB epilogue.
+          native_msaa_pso = device_->GetMetal4Compiler().newRenderPipelineState(info, err);
+          if (!native_msaa_pso) {
+            ERR("Failed to create native MSAA PSO: ", err ? err.description().getUTF8String() : "");
+            return E_FAIL;
+          }
         }
       }
 
@@ -1974,11 +2034,7 @@ public:
       return true;
     auto &constants = statistics ? indirect_view_pipeline_statistics_vertex_constants
                                 : index_pull ? indirect_view_index_pull_vertex_constants : indirect_view_vertex_constants;
-    SM50Shader shader;
     SM50Error compile_error;
-    if (FAILED(InitializeShader(
-            "VS-indirect-view", {pull_vs_bytecode.data(), pull_vs_bytecode.size()}, &shader, nullptr)))
-      return false;
     SM50_SHADER_COMMON_DATA common{};
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
@@ -2040,22 +2096,49 @@ public:
     root.bytecode_length = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
     root.next = &layout;
     SM50ShaderBitcode compiled;
-    if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                    "vs_main", &compiled, &compile_error)) {
+    std::shared_ptr<const ShaderStageArtifact> artifact;
+    if (device_->GetShaderArtifactCache().CompileShader({pull_vs_bytecode.data(), pull_vs_bytecode.size()},
+                    reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+                    "vs_main", &compiled, &compile_error, artifact)) {
       ERR("Failed to compile indirect view VS: ", SM50GetErrorMessageString(compile_error));
       return false;
     }
     SM50_COMPILED_BITCODE bytecode{};
-    SM50GetCompiledBitcode(compiled, &bytecode);
+    if (artifact) bytecode = artifact->view;
+    else SM50GetCompiledBitcode(compiled, &bytecode);
     if (FAILED(constants.Initialize(device_, bytecode, compiled)))
       return false;
-    auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
     WMT::Reference<WMT::Error> error;
-    auto library = device_->GetMetal4Compiler().newLibrary(data, error);
+    auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
     if (!library)
       return false;
     function = library.newFunction("vs_main");
     return bool(function);
+  }
+
+  WMT::RenderPipelineState GetColorWriteMaskPipelineState(uint8_t disabled_outputs) override {
+    if (!disabled_outputs)
+      return pso;
+    if (!submission_mapping_safe || !pso)
+      return {};
+    disabled_outputs &= submission_color_output_mask;
+    if (!disabled_outputs)
+      return pso;
+    std::lock_guard<std::mutex> lock(color_write_mask_pso_mutex);
+    if (auto found = color_write_mask_psos.find(disabled_outputs); found != color_write_mask_psos.end())
+      return found->second;
+    auto info = indirect_info;
+    for (unsigned i = 0; i < 8; ++i)
+      if (disabled_outputs & (1u << i))
+        info.colors[i].write_mask = 0;
+    WMT::Reference<WMT::Error> error;
+    auto variant = device_->GetMetal4Compiler().newRenderPipelineState(info, error);
+    if (!variant) {
+      ERR("Failed to create logical color write-mask PSO: ",
+          error ? error.description().getUTF8String() : "");
+      return {};
+    }
+    return color_write_mask_psos.emplace(disabled_outputs, std::move(variant)).first->second;
   }
 
   virtual WMT::RenderPipelineState
@@ -2079,16 +2162,19 @@ public:
     return indirect_pso;
   }
 
+  WMT::RenderPipelineState GetNativeMSAAPipelineState(bool index_pull) override {
+    if (!native_msaa_pso)
+      return {};
+    return index_pull ? GetIndexPullPipelineState(false) : native_msaa_pso;
+  }
+
   WMT::RenderPipelineState GetIndexPullPipelineState(bool indirect) override {
     std::lock_guard<std::mutex> lock(pull_pso_mutex);
     if (!supports_index_pull)
       return {};
     WMT::Reference<WMT::Error> error;
     if (!pull_vertex_function && !(indirect && view_location_offsets)) {
-      SM50Shader shader;
       SM50Error compile_error;
-      if (FAILED(InitializeShader("VS-index-pull", {pull_vs_bytecode.data(), pull_vs_bytecode.size()}, &shader, nullptr)))
-        return {};
       SM50_SHADER_COMMON_DATA common{};
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
@@ -2108,17 +2194,19 @@ public:
       root.bytecode_length = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
       root.next = &layout;
       SM50ShaderBitcode compiled;
-      if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      "vs_main", &compiled, &compile_error)) {
+      std::shared_ptr<const ShaderStageArtifact> artifact;
+      if (device_->GetShaderArtifactCache().CompileShader({pull_vs_bytecode.data(), pull_vs_bytecode.size()},
+                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+                      "vs_main", &compiled, &compile_error, artifact)) {
         ERR("Failed to compile indexed pull VS: ", SM50GetErrorMessageString(compile_error));
         return {};
       }
       SM50_COMPILED_BITCODE bytecode{};
-      SM50GetCompiledBitcode(compiled, &bytecode);
+      if (artifact) bytecode = artifact->view;
+      else SM50GetCompiledBitcode(compiled, &bytecode);
       if (FAILED(index_pull_vertex_constants.Initialize(device_, bytecode, compiled)))
         return {};
-      auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
-      auto lib = device_->GetMetal4Compiler().newLibrary(data, error);
+      auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       if (!lib)
         return {};
       pull_vertex_function = lib.newFunction("vs_main");
@@ -2147,11 +2235,7 @@ public:
     std::lock_guard<std::mutex> lock(statistics_pso_mutex);
     WMT::Reference<WMT::Error> error;
     if (!statistics_vertex_function && !(indirect && view_location_offsets)) {
-      SM50Shader shader;
       SM50Error compile_error;
-      if (FAILED(InitializeShader(
-              "VS-statistics", {pull_vs_bytecode.data(), pull_vs_bytecode.size()}, &shader, nullptr)))
-        return {};
       SM50_SHADER_COMMON_DATA common{};
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
@@ -2190,17 +2274,19 @@ public:
       root.bytecode_length = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
       root.next = &layout;
       SM50ShaderBitcode compiled;
-      if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      "vs_main", &compiled, &compile_error)) {
+      std::shared_ptr<const ShaderStageArtifact> artifact;
+      if (device_->GetShaderArtifactCache().CompileShader({pull_vs_bytecode.data(), pull_vs_bytecode.size()},
+                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+                      "vs_main", &compiled, &compile_error, artifact)) {
         ERR("Failed to compile statistics VS: ", SM50GetErrorMessageString(compile_error));
         return {};
       }
       SM50_COMPILED_BITCODE bytecode{};
-      SM50GetCompiledBitcode(compiled, &bytecode);
+      if (artifact) bytecode = artifact->view;
+      else SM50GetCompiledBitcode(compiled, &bytecode);
       if (FAILED(pipeline_statistics_vertex_constants.Initialize(device_, bytecode, compiled)))
         return {};
-      auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
-      auto lib = device_->GetMetal4Compiler().newLibrary(data, error);
+      auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       if (!lib)
         return {};
       statistics_vertex_function = lib.newFunction("vs_main");
@@ -2235,11 +2321,7 @@ public:
   bool EnsureStatisticsFragmentFunction() {
     if (!statistics_ps_bytecode.empty() && !statistics_fragment_function) {
       WMT::Reference<WMT::Error> error;
-      SM50Shader shader;
       SM50Error compile_error;
-      if (FAILED(InitializeShader(
-              "PS-statistics", {statistics_ps_bytecode.data(), statistics_ps_bytecode.size()}, &shader, nullptr)))
-        return {};
       SM50_SHADER_COMMON_DATA common{};
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
@@ -2272,17 +2354,19 @@ public:
       root.bytecode_length = pull_root_blob.empty() ? statistics_ps_bytecode.size() : pull_root_blob.size();
       root.next = &pixel;
       SM50ShaderBitcode compiled;
-      if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      statistics_ps_name.c_str(), &compiled, &compile_error)) {
+      std::shared_ptr<const ShaderStageArtifact> artifact;
+      if (device_->GetShaderArtifactCache().CompileShader({statistics_ps_bytecode.data(), statistics_ps_bytecode.size()},
+                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+                      statistics_ps_name.c_str(), &compiled, &compile_error, artifact)) {
         ERR("Failed to compile statistics PS: ", SM50GetErrorMessageString(compile_error));
         return {};
       }
       SM50_COMPILED_BITCODE bytecode{};
-      SM50GetCompiledBitcode(compiled, &bytecode);
+      if (artifact) bytecode = artifact->view;
+      else SM50GetCompiledBitcode(compiled, &bytecode);
       if (FAILED(pipeline_statistics_fragment_constants.Initialize(device_, bytecode, compiled)))
         return {};
-      auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
-      auto lib = device_->GetMetal4Compiler().newLibrary(data, error);
+      auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       if (!lib)
         return {};
       statistics_fragment_function = lib.newFunction(statistics_ps_name.c_str());
@@ -2363,11 +2447,7 @@ public:
     auto compile_pixel = [&]() -> bool {
       for (uint32_t i = 0; has_pixel_shader && i < (variants->sample_frequency ? 4u : 3u); i++) {
       if (variants->sample_frequency && (i == 1 || (i == 2 && !uses_atomic64))) continue;
-      SM50Shader shader;
       SM50Error compile_error;
-      if (FAILED(InitializeShader("PS-msaa", {statistics_ps_bytecode.data(), statistics_ps_bytecode.size()},
-                                  &shader, nullptr)))
-        return false;
       SM50_SHADER_D3D12_MSAA_PIXEL_DATA msaa{};
       msaa.type = SM50_SHADER_D3D12_MSAA_PIXEL;
       msaa.variant = i == 3 ? SM50_MSAA_SAMPLE_APP : SM50_MSAA_COVERAGE + i;
@@ -2430,16 +2510,19 @@ public:
       root.bytecode_length = ps_root_size;
       root.next = &pixel;
       SM50ShaderBitcode compiled;
-      if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      statistics_ps_name.c_str(), &compiled, &compile_error)) {
+      std::shared_ptr<const ShaderStageArtifact> artifact;
+      if (device_->GetShaderArtifactCache().CompileShader({statistics_ps_bytecode.data(), statistics_ps_bytecode.size()},
+                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+                      statistics_ps_name.c_str(), &compiled, &compile_error, artifact)) {
         ERR("Failed to compile MSAA PS variant ", i, ": ", SM50GetErrorMessageString(compile_error));
         return false;
       }
       SM50_COMPILED_BITCODE bytecode{};
-      SM50GetCompiledBitcode(compiled, &bytecode);
+      if (artifact) bytecode = artifact->view;
+      else SM50GetCompiledBitcode(compiled, &bytecode);
       if (FAILED(fragment_constants[i]->Initialize(device_, bytecode, compiled)))
         return false;
-      auto library = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), error);
+      auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       if (!library || !(fragments[i] = library.newFunction(statistics_ps_name.c_str()))) {
         ERR("Failed to load MSAA PS variant ", i);
         return false;
@@ -2469,11 +2552,7 @@ public:
         vertex_replay = replay.replay_function;
         return bool(vertex_replay);
       }
-      SM50Shader shader;
       SM50Error compile_error;
-      if (FAILED(InitializeShader("VS-msaa", {pull_vs_bytecode.data(), pull_vs_bytecode.size()},
-                                  &shader, nullptr)))
-        return false;
       SM50_SHADER_D3D12_MSAA_VERTEX_DATA msaa{};
       msaa.type = SM50_SHADER_D3D12_MSAA_VERTEX;
       msaa.variant = i ? SM50_MSAA_VERTEX_REPLAY : SM50_MSAA_VERTEX_CAPTURE;
@@ -2527,17 +2606,20 @@ public:
       root.bytecode_length = vs_root_size;
       root.next = &layout;
       SM50ShaderBitcode compiled;
-      if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      "vs_main", &compiled, &compile_error)) {
+      std::shared_ptr<const ShaderStageArtifact> artifact;
+      if (device_->GetShaderArtifactCache().CompileShader({pull_vs_bytecode.data(), pull_vs_bytecode.size()},
+                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+                      "vs_main", &compiled, &compile_error, artifact)) {
         ERR("Failed to compile MSAA VS variant ", i, ": ", SM50GetErrorMessageString(compile_error));
         return false;
       }
       SM50_COMPILED_BITCODE bytecode{};
-      SM50GetCompiledBitcode(compiled, &bytecode);
+      if (artifact) bytecode = artifact->view;
+      else SM50GetCompiledBitcode(compiled, &bytecode);
       auto &constants = i ? variants->replay_vertex_constants : variants->capture_constants;
       if (FAILED(constants.Initialize(device_, bytecode, compiled)))
         return false;
-      auto library = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(bytecode.Data, bytecode.Size), error);
+      auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       auto function = library ? library.newFunction("vs_main") : WMT::Reference<WMT4::Function>();
       if (!function)
         return false;

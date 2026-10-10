@@ -343,6 +343,72 @@ void computeOrdering(bool split) {
   pass(split ? "compute-uav-srv-split" : "compute-uav-uav-srv-copy");
 }
 
+// Adjacent consumers write independent outputs; the read-only transition never orders UAV writes.
+void legacyReadOnlyPass(bool uavBoundary) {
+  auto dev = device();
+  auto q = queue(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+  ComputePipeline pipeline(dev.Get());
+  constexpr UINT kWords = 64;
+  auto upload = buffer(dev.Get(), D3D12_HEAP_TYPE_UPLOAD, kWords * 4);
+  auto input = buffer(dev.Get(), D3D12_HEAP_TYPE_DEFAULT, kWords * 4);
+  auto a = buffer(dev.Get(), D3D12_HEAP_TYPE_DEFAULT, kWords * 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto b = buffer(dev.Get(), D3D12_HEAP_TYPE_DEFAULT, kWords * 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto readback = buffer(dev.Get(), D3D12_HEAP_TYPE_READBACK, kWords * 8);
+  void *mapped = nullptr;
+  check(upload->Map(0, nullptr, &mapped), "Map(read-only input)");
+  for (UINT i = 0; i < kWords; ++i)
+    static_cast<uint32_t *>(mapped)[i] = i * 13 + 0x1234;
+  upload->Unmap(0, nullptr);
+  auto l = list(dev.Get());
+  const char *name = uavBoundary ? "legacy-read-only-uav-boundary" : "legacy-read-only-coalesce";
+  check(l.list->SetName(uavBoundary ? L"legacy-read-only-uav-boundary" : L"legacy-read-only-coalesce"), "SetName");
+  std::printf("%s_CASE_BEGIN case=%s list=%p dispatches=2\n", kPrefix, name, static_cast<void *>(l.list.Get()));
+  std::fflush(stdout);
+  l.list->CopyBufferRegion(input.Get(), 0, upload.Get(), 0, kWords * 4);
+  D3D12_RESOURCE_BARRIER transition{};
+  transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  transition.Transition.pResource = input.Get();
+  transition.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  transition.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  transition.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  l.list->ResourceBarrier(1, &transition);
+  pipeline.dispatch(l.list.Get(), a.Get(), input.Get(), 2, 0, 1);
+  transition.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  transition.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE;
+  l.list->ResourceBarrier(1, &transition);
+  if (uavBoundary) {
+    D3D12_RESOURCE_BARRIER uav{};
+    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav.UAV.pResource = a.Get();
+    l.list->ResourceBarrier(1, &uav);
+  }
+  pipeline.dispatch(l.list.Get(), b.Get(), input.Get(), 2, 0, 1);
+  for (auto *output : {a.Get(), b.Get()}) {
+    transition.Transition.pResource = output;
+    transition.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    transition.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    l.list->ResourceBarrier(1, &transition);
+    l.list->CopyBufferRegion(readback.Get(), output == a.Get() ? 0 : kWords * 4, output, 0, kWords * 4);
+  }
+  ComPtr<ID3D12Fence> fence;
+  check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence(read-only)");
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!event) fail("CreateEvent(read-only)");
+  check(fence->SetEventOnCompletion(1, event), "SetEventOnCompletion(read-only)");
+  check(l.list->Close(), "Close(read-only)");
+  ID3D12CommandList *lists[] = {l.list.Get()};
+  q->ExecuteCommandLists(1, lists);
+  check(q->Signal(fence.Get(), 1), "Signal(read-only)");
+  const DWORD result = WaitForSingleObject(event, kTimeoutMs);
+  CloseHandle(event);
+  if (result != WAIT_OBJECT_0) fail("fence-wait(read-only)", HRESULT_FROM_WIN32(result));
+  expect(dev->GetDeviceRemovedReason(), S_OK, "device-healthy(read-only)");
+  const auto values = readBuffer(readback.Get(), kWords * 2);
+  for (UINT i = 0; i < kWords * 2; ++i)
+    if (values[i] != (i % kWords) * 13 + 0x1234 + 7) fail(name);
+  pass(name);
+}
+
 // ---- textures: castable formats, layouts, DISCARD, subresource ranges ----
 
 // Readback of one subresource of a texture that is already in a COPY_SOURCE-capable layout.
@@ -816,6 +882,7 @@ float4 vsMain(uint id : SV_VertexID) : SV_Position {
   return float4(p, z, 1);
 }
 float4 psColor() : SV_Target { return float4(1, 0, 0, 1); }
+float4 psGraphColor() : SV_Target { return mode == 0 ? float4(1, 0, 0, 1) : float4(0, 1, 0, 1); }
 float4 psCopy(float4 position : SV_Position) : SV_Target {
   return Previous.Load(int3(position.xy, 0)) + float4(0, 1, 0, 0);
 }
@@ -970,6 +1037,59 @@ void renderTargetToShaderResource() {
         ExitProcess(1);
       }
   pass("draw-render-target-to-shader-resource");
+}
+
+// Whole-buffer barriers on unrelated allocations may commute; global and matching
+// attachment scopes remain boundaries, at both the tail and head anchors.
+void submissionBarrierScopes(UINT control) {
+  Graphics g(device()); auto q = queue(g.dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+  auto rt = texture(g.dev.Get(), textureDesc(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4,
+      D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_BARRIER_LAYOUT_RENDER_TARGET);
+  auto unrelated = buffer(g.dev.Get(), D3D12_HEAP_TYPE_DEFAULT, 64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  ComPtr<ID3D12DescriptorHeap> rtvHeap; const auto rtv = view(g.dev.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, rtvHeap);
+  g.dev->CreateRenderTargetView(rt.Get(), nullptr, rtv);
+  auto initialize = list(g.dev.Get()); const float black[4] = {};
+  initialize.list->ClearRenderTargetView(rtv, black, 0, nullptr); submit(g.dev.Get(), q.Get(), initialize.list.Get());
+  auto ps = compile(kGraphicsSource, "psGraphColor", "ps_5_0");
+  auto stream = g.stream(ps.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN); auto pso = g.create(stream);
+  auto a = list(g.dev.Get()), b = list(g.dev.Get()), read = list(g.dev.Get());
+  a.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); g.bind(a.list.Get(), pso.Get(), 0, 0.5f, 4, 4);
+  a.list->DrawInstanced(3, 1, 0, 0);
+  auto *anchor = control == 1 || control == 4 ? a.list.Get() : b.list.Get();
+  if (control < 2) {
+    auto scoped = bufferBarrier(unrelated.Get(), D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+        D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+    barrier(anchor, scoped);
+  } else if (control == 2) {
+    const D3D12_GLOBAL_BARRIER global{D3D12_BARRIER_SYNC_RENDER_TARGET, D3D12_BARRIER_SYNC_RENDER_TARGET,
+        D3D12_BARRIER_ACCESS_RENDER_TARGET, D3D12_BARRIER_ACCESS_RENDER_TARGET}; barrier(anchor, global);
+  } else barrier(anchor, textureBarrier(rt.Get(), D3D12_BARRIER_SYNC_RENDER_TARGET, D3D12_BARRIER_SYNC_RENDER_TARGET,
+      D3D12_BARRIER_ACCESS_RENDER_TARGET, D3D12_BARRIER_ACCESS_RENDER_TARGET,
+      D3D12_BARRIER_LAYOUT_RENDER_TARGET, D3D12_BARRIER_LAYOUT_RENDER_TARGET));
+  b.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); g.bind(b.list.Get(), pso.Get(), 1, 0.5f, 4, 4);
+  const D3D12_VIEWPORT viewport{0, 0, 2, 4, 0, 1}; const D3D12_RECT scissor{0, 0, 1, 4};
+  b.list->RSSetViewports(1, &viewport); b.list->RSSetScissorRects(1, &scissor); b.list->DrawInstanced(3, 1, 0, 0);
+  barrier(read.list.Get(), textureBarrier(rt.Get(), D3D12_BARRIER_SYNC_RENDER_TARGET, D3D12_BARRIER_SYNC_COPY,
+      D3D12_BARRIER_ACCESS_RENDER_TARGET, D3D12_BARRIER_ACCESS_COPY_SOURCE,
+      D3D12_BARRIER_LAYOUT_RENDER_TARGET, D3D12_BARRIER_LAYOUT_COPY_SOURCE));
+  auto out = copyOut(g.dev.Get(), read.list.Get(), rt.Get(), 0);
+  check(a.list->Close(), "Close(graph-enhanced-A)"); check(b.list->Close(), "Close(graph-enhanced-B)");
+  ComPtr<ID3D12Fence> done; check(g.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)), "Fence(graph-enhanced)");
+  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr); if (!event) fail("Event(graph-enhanced)");
+  check(done->SetEventOnCompletion(1, event), "Register(graph-enhanced)");
+  std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-enhanced-scope-%u replay=0\n", kPrefix, control); std::fflush(stderr);
+  ID3D12CommandList *recordings[] = {a.list.Get(), b.list.Get()}; q->ExecuteCommandLists(2, recordings);
+  check(q->Signal(done.Get(), 1), "Signal(graph-enhanced)");
+  if (WaitForSingleObject(event, kTimeoutMs) != WAIT_OBJECT_0) fail("Wait(graph-enhanced)"); CloseHandle(event);
+  std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-enhanced-scope-%u replay=0\n", kPrefix, control); std::fflush(stderr);
+  submit(g.dev.Get(), q.Get(), read.list.Get());
+  for (UINT y = 0; y < 4; ++y) for (UINT x = 0; x < 4; ++x)
+    if (texel<uint32_t>(out, x, y) != (x ? 0xff0000ffu : 0xff00ff00u)) fail("graph-enhanced-scoped-pixels");
+  std::printf("%s_GRAPH_SCOPES control=%u left=%08x right=%08x expected_render_encoders=%u exact=1\n",
+      kPrefix, control, texel<uint32_t>(out, 0, 0), texel<uint32_t>(out, 3, 0), control < 2 ? 1u : 2u);
+  const char *names[] = {"graph-enhanced-unrelated-head-buffer-scope", "graph-enhanced-unrelated-tail-buffer-scope",
+      "graph-enhanced-global-head-control", "graph-enhanced-attachment-head-control", "graph-enhanced-attachment-tail-control"};
+  pass(names[control]);
 }
 
 // OMSetFrontAndBackStencilRef plus DEPTH_STENCIL2 per-face write masks: the front triangle writes
@@ -1151,7 +1271,7 @@ void capabilities() {
               o15.TriangleFanSupported, o16.DynamicDepthBiasSupported, o16.GPUUploadHeapSupported);
   if (!o12.EnhancedBarriersSupported || !o12.RelaxedFormatCastingSupported ||
       !o14.IndependentFrontAndBackStencilRefMaskSupported || !o15.DynamicIndexBufferStripCutSupported ||
-      o15.TriangleFanSupported || !o16.DynamicDepthBiasSupported || !o16.GPUUploadHeapSupported)
+      !o16.DynamicDepthBiasSupported || !o16.GPUUploadHeapSupported)
     fail("capabilities");
   ComPtr<ID3D12Device14> device14;
   check(dev.As(&device14), "QI ID3D12Device14");
@@ -1294,6 +1414,8 @@ int main() {
   creationContracts();
   computeOrdering(false);
   computeOrdering(true);
+  legacyReadOnlyPass(false);
+  legacyReadOnlyPass(true);
   castableView();
   subresourceLayouts(false);
   subresourceLayouts(true);
@@ -1304,6 +1426,7 @@ int main() {
   legacyMixing(true);
   invalidBarriers();
   renderTargetToShaderResource();
+  for (UINT control = 0; control < 5; ++control) submissionBarrierScopes(control);
   frontBackStencil();
   dynamicDepthBias();
   stripCut();

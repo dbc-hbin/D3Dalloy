@@ -99,6 +99,9 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
   case WMTMetal4PipelineRender: {
     const struct WMTRenderPipelineInfo *info = (const void *)(uintptr_t)params->args[1];
     MTL4RenderPipelineDescriptor *descriptor = [[MTL4RenderPipelineDescriptor alloc] init];
+    descriptor.colorAttachmentMappingState = info->inherit_color_attachment_mapping
+        ? MTL4LogicalToPhysicalColorAttachmentMappingStateInherited
+        : MTL4LogicalToPhysicalColorAttachmentMappingStateIdentity;
     metal4_colors(descriptor.colorAttachments, info->colors);
     descriptor.vertexFunctionDescriptor = (MTL4FunctionDescriptor *)info->vertex_function;
     descriptor.fragmentFunctionDescriptor = (MTL4FunctionDescriptor *)info->fragment_function;

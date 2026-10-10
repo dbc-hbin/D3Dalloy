@@ -3,6 +3,7 @@
 #include "llvm/IR/Constants.h"
 #include <cstring>
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -23,7 +24,45 @@ struct InputAttribute {
   // TODO: extend patch/control point here
 };
 
-void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
+Error MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
+
+  // AIR declares the initializer; CNST exposes its index/type to native specialization.
+  SmallVector<char, 64> function_constant_metadata;
+  if (auto *constants = module.getNamedMetadata("air.function_constants"); constants && constants->getNumOperands()) {
+    if (constants->getNumOperands() > UINT16_MAX)
+      return createStringError(inconvertibleErrorCode(), "metallib function constant count exceeds CNST bounds");
+    raw_svector_ostream metadata(function_constant_metadata);
+    metadata << "CNST" << value(uint16_t(0)) << value(uint16_t(constants->getNumOperands()));
+    SmallDenseSet<uint16_t, 8> indices;
+    SmallDenseSet<StringRef, 8> names;
+    for (auto *declaration : constants->operands()) {
+      if (declaration->getNumOperands() != 4)
+        return createStringError(inconvertibleErrorCode(), "invalid AIR function constant declaration");
+      auto *reference = dyn_cast_or_null<ValueAsMetadata>(declaration->getOperand(0));
+      auto *global = reference ? dyn_cast<GlobalVariable>(reference->getValue()) : nullptr;
+      auto *type = dyn_cast_or_null<MDString>(declaration->getOperand(1));
+      auto *name = dyn_cast_or_null<MDString>(declaration->getOperand(2));
+      auto *indexValue = dyn_cast_or_null<ConstantAsMetadata>(declaration->getOperand(3));
+      auto *index = indexValue ? dyn_cast<ConstantInt>(indexValue->getValue()) : nullptr;
+      if (!global || !global->getValueType()->isIntegerTy(32) || global->getAddressSpace() != 2 ||
+          global->getSection() != "air.fc_initializer" || !global->isExternallyInitialized() ||
+          !global->hasInitializer() || !isa<UndefValue>(global->getInitializer()) ||
+          !type || type->getString() != "uint" ||
+          !name || name->getString().empty() || name->getString().contains('\0') || !index ||
+          index->getValue().getLimitedValue(UINT16_MAX + 1u) > UINT16_MAX)
+        return createStringError(inconvertibleErrorCode(), "unsupported AIR function constant type/name/index");
+      const auto nativeIndex = uint16_t(index->getZExtValue());
+      if (!indices.insert(nativeIndex).second || !names.insert(name->getString()).second)
+        return createStringError(inconvertibleErrorCode(), "duplicate AIR function constant index/name");
+      if (name->getString().size() > UINT16_MAX ||
+          function_constant_metadata.size() - 6 + name->getString().size() + 5 > UINT16_MAX)
+        return createStringError(inconvertibleErrorCode(), "metallib function constant table exceeds CNST bounds");
+      // SDK CNST scalar record: NUL name, UInt(33), uint16 index, required(1).
+      metadata << name->getString() << '\0' << value(uint8_t(33)) << value(nativeIndex) << value(uint8_t(1));
+    }
+    const uint16_t size = function_constant_metadata.size() - 6;
+    std::memcpy(function_constant_metadata.data() + 4, &size, sizeof(size));
+  }
 
   uint16_t airVersionMajor = 2, airVersionMinor = 6;
   if (auto *version = module.getNamedMetadata("air.version"); version && version->getNumOperands()) {
@@ -215,7 +254,7 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
             fn_public_metadata_stream << value(vattr.type);
           }
         }
-        fn_public_metadata_stream << "ENDT";
+        fn_public_metadata_stream << function_constant_metadata << "ENDT";
 
         public_metadata_stream << value((uint32_t)fn_public_metadata.size());
         public_metadata_stream << fn_public_metadata;
@@ -270,7 +309,8 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
         function_def_stream << "ENDT";
         const auto recordSize = uint32_t(function_def_stream.tell() - recordOffset);
         std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));
-        public_metadata_stream << value(uint32_t(4)) << "ENDT";
+        public_metadata_stream << value(uint32_t(4 + function_constant_metadata.size()))
+                               << function_constant_metadata << "ENDT";
         private_metadata_stream << value(uint32_t(4)) << "ENDT";
       }
     }
@@ -313,6 +353,7 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
   OS << public_metadata;
   OS << private_metadata;
   OS << bitcode;
+  return Error::success();
 }
 
 } // namespace dxmt::metallib

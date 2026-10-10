@@ -2651,7 +2651,10 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
 
   raw_svector_ostream stream(compiled->vec);
   metallib::MetallibWriter writer;
-  writer.Write(air_module, stream);
+  if (auto failure = writer.Write(air_module, stream)) {
+    reportError(std::move(failure), ppError);
+    return 0;
+  }
 
   *ppBitcode = (sm50_bitcode_t)compiled.release();
   SM50GetCompiledBitcode(*ppBitcode, pMetallib);

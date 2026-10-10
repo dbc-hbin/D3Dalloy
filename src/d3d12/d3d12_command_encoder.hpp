@@ -51,10 +51,29 @@ enum class EncoderType {
   Diagnostic,
 };
 
+enum class RecordedEndpointReason { Opaque, ListEnd, Scheduling };
 struct EncoderData {
   EncoderType type;
   EncoderData *next = nullptr;
   uint64_t id;
+  // Recording-only endpoint metadata; submission planning never writes it.
+  RecordedEndpointReason endpoint_reason = RecordedEndpointReason::Opaque;
+};
+enum class RecordedBoundaryReason { StateTransition, UAV, Alias, EnhancedGlobal, EnhancedBuffer, EnhancedTexture, Split };
+struct RecordedBoundary {
+  const EncoderData *encoder;
+  const wmtcmd_base *command;
+  RecordedBoundaryReason reason;
+  size_t state_event_index;
+  Rc<BufferAllocation> buffer;
+  Rc<TextureAllocation> texture;
+  uint64_t offset = 0, size = UINT64_MAX;
+  D3D12_BARRIER_SUBRESOURCE_RANGE subresources{D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, 0, 0, 0, 0, 0};
+  uint32_t mip_count = 1, array_count = 1, plane_count = 1;
+  uint8_t texture_aspects = 4;
+  D3D12_BARRIER_SYNC sync_before = D3D12_BARRIER_SYNC_ALL, sync_after = D3D12_BARRIER_SYNC_ALL;
+  D3D12_BARRIER_ACCESS access_before = D3D12_BARRIER_ACCESS_COMMON, access_after = D3D12_BARRIER_ACCESS_COMMON;
+  bool resource_scoped = false;
 };
 struct DiagnosticEncoderData : EncoderData {
   DiagnosticAnnotation annotation;
@@ -74,6 +93,9 @@ struct FenceBarrierEncoderData : EncoderData {
 class MTLD3D12Resource;
 class MTLD3D12RootSignature;
 class MTLD3D12DescriptorHeap;
+class MTLD3D12Device;
+struct ShaderVisibleDescriptorCPUStorage;
+bool NativeMSAADescriptorSafe(MTLD3D12Device *device, const ShaderVisibleDescriptorCPUStorage &descriptor);
 struct StandardSwizzleTableUse {
   MTLD3D12RootSignature *rootsig;
   MTLD3D12DescriptorHeap *heap;
@@ -82,7 +104,16 @@ struct StandardSwizzleTableUse {
   // Borrowed from the recording-retained PSO, not from a transient shader.
   std::span<const MTL_SM50_SHADER_ARGUMENT> shader_bindings;
   bool restrict_to_shader = false;
+  std::vector<MTL_SM50_SHADER_ARGUMENT> submission_bindings;
 };
+// Addresses are immutable recording inputs. Resolve backing allocations under
+// the Execute lease, just as descriptor tables are resolved at submission.
+struct RecordedBufferAccess {
+  uint64_t address, length;
+  bool writes;
+  uint64_t stages = 0;
+};
+constexpr size_t kRecordedSubmissionBufferBudget = 64;
 struct StandardSwizzleEncoderData : EncoderData {
   // A private COM reference survives the recording's allocator lease through
   // GPU retirement; the allocator releases it when it destroys this entry.
@@ -102,6 +133,7 @@ struct ClearEncoderData : EncoderData {
   unsigned height;
   unsigned depth_plane;
   WMTProgrammableSamplePositions sample_positions{};
+  bool folded_into_render = false;
 
   ClearEncoderData() {}
 };
@@ -153,6 +185,8 @@ struct QueryVisibilityTarget {
   WMT::Reference<WMT::ComputePipelineState> accumulate_pipeline;
   uint64_t heap_id = 0;
   uint32_t index = 0;
+  uint64_t source_offset = 0;
+  bool reset = false;
 };
 
 /* Mirrors DXMTSOAssembly in dxmt_command.metal (so_index_range / so_assemble). */
@@ -567,6 +601,16 @@ inline uint32_t MSAAIndexStride(SM50_MSAA_LINE_MODE line_mode, bool conservative
 }
 
 struct RenderEncoderData : EncoderData {
+  // Every ordinary draw contributes its root/input and reflected table uses.
+  // An unresolved or advanced draw permanently excludes the pass.
+  bool submission_group_safe = false;
+  uint8_t submission_color_output_mask = 0;
+  // Cached masked native PSOs must outlive public PSO/list reset or release.
+  small_vector<WMT::Reference<WMT::RenderPipelineState>, 2> masked_pipeline_states;
+  bool submission_snapshot_budget = false;
+  bool submission_root_srv_opaque = false;
+  std::vector<RecordedBufferAccess> submission_buffers;
+  std::unique_ptr<std::vector<StandardSwizzleTableUse>> submission_tables;
   bool depth_bounds_active = false;
   bool atomic64_phase = false;
   Com<ID3D12PipelineState> atomic64_pipeline;
@@ -590,12 +634,20 @@ struct RenderEncoderData : EncoderData {
   wmtcmd_base *cmd_tail;
   uint8_t dsv_planar_flags;
   uint8_t dsv_readonly_flags;
+  // Descriptor identity only; ordinary passes retain their existing native read-only behavior.
+  uint8_t dsv_descriptor_flags = 0;
   uint8_t render_target_count;
-  // Metal exposes one visibility-result stream per render pass. Snapshot all
-  // D3D12 queries active for this pass, count once into a private 8-byte
-  // scratch slot, then fan that count into each query heap slot on the queue.
+  // Ordinary passes use one aligned slot per draw-bearing active-set interval.
+  // Targets preserve query-start resets and interval fanout in source order,
+  // including legal same-slot reuse after End. Captured passes keep slot zero.
   WMT::Reference<WMT::Buffer> visibility_scratch;
   small_vector<QueryVisibilityTarget, 4> visibility_targets;
+  uint64_t visibility_interval_count = 0;
+  bool visibility_interval_dirty = false;
+  bool visibility_intervals = false;
+  uint8_t native_msaa_sample_count = 0;
+  std::vector<Com<ID3D12Resource>> native_msaa_resources;
+  small_vector<Rc<TextureAllocation>, 4> native_msaa_texture_allocations;
   // Recorded handles must survive PSO switches and deferred queue encoding.
   small_vector<WMT::Reference<WMT::Buffer>, 4> immutable_constant_buffers;
   /* Stream-output draws of this pass, assembled in order after the pass ends. */
@@ -613,6 +665,9 @@ struct RenderEncoderData : EncoderData {
 };
 
 struct BlitEncoderData : EncoderData {
+  bool submission_access_complete = true;
+  size_t submission_copy_count = 0;
+  std::vector<RecordedBufferAccess> submission_buffers;
   wmtcmd_blit_nop cmd_head;
   wmtcmd_base *cmd_tail;
 };
@@ -640,6 +695,11 @@ struct Atomic64RayDispatchUse {
   uint64_t arguments_offset = 0, roots_offset = 0;
 };
 struct ComputeEncoderData : EncoderData {
+  bool submission_access_complete = false;
+  bool submission_snapshot_budget = false;
+  bool submission_root_srv_opaque = false;
+  std::vector<RecordedBufferAccess> submission_buffers;
+  std::unique_ptr<std::vector<StandardSwizzleTableUse>> submission_tables;
   bool atomic64_phase = false;
   Com<ID3D12PipelineState> atomic64_pipeline;
   std::vector<Atomic64RootBinding> atomic64_roots;

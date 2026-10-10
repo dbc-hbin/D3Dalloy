@@ -92,7 +92,7 @@ public:
     common.metal_version = kD3D12ShaderMetalVersion;
     common.next = &rootsig;
 
-    if (HRESULT hr = InitializeShader("CS", pDesc->CS, &shader_cs, &ref_cs, &resource_bindings); FAILED(hr))
+    if (HRESULT hr = InitializeShader(device_->GetShaderArtifactCache(), "CS", pDesc->CS, &shader_cs, &ref_cs, &resource_bindings); FAILED(hr))
       return hr;
     uses_atomic64 = ref_cs.HasAtomic64 != 0;
     SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
@@ -103,8 +103,8 @@ public:
     threadgroup_size = {ref_cs.ThreadgroupSize[0], ref_cs.ThreadgroupSize[1], ref_cs.ThreadgroupSize[2]};
     if (trace) times[2] = Clock::now();
 
-    if (!cache_.loaded() && SM50Compile(shader_cs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main",
-                                       cache_.output(PipelineCache::Compute), &sm50_err)) {
+    if (cache_.Compile(PipelineCache::Compute, device_->GetShaderArtifactCache(), pDesc->CS, shader_cs,
+                       (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main", &sm50_err)) {
       RecordShaderCompileFailure("CS", pDesc->CS, rootsig,
                                  reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
                                  "cs_main", SM50GetErrorMessageString(sm50_err), pDesc->pRootSignature != nullptr);
@@ -115,15 +115,14 @@ public:
 
     const auto cs_bitcode_compiled = cache_.view(PipelineCache::Compute);
 
-    auto cs_data = WMT::MakeDispatchData(cs_bitcode_compiled.Data, cs_bitcode_compiled.Size);
-
     if (HRESULT hr = compute_constants.Initialize(device_, cs_bitcode_compiled, cache_.bitcode(PipelineCache::Compute)); FAILED(hr))
       return hr;
     if (trace) times[4] = Clock::now();
 
     WMT::Reference<WMT::Error> err;
 
-    auto cs_lib = device_->GetMetal4Compiler().newLibrary(cs_data, err);
+    auto cs_lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), cs_bitcode_compiled,
+                                                          cache_.bitcode(PipelineCache::Compute), err);
     if (!cs_lib)
       return cache_.loaded() ? E_INVALIDARG : E_FAIL;
     if (trace) times[5] = Clock::now();
@@ -188,11 +187,7 @@ public:
     std::lock_guard<std::mutex> lock(statistics_pso_mutex);
     WMT::Reference<WMT::Error> error;
     if (!statistics_function) {
-      SM50Shader shader;
       SM50Error compile_error;
-      if (FAILED(InitializeShader(
-              "CS-statistics", {statistics_cs_bytecode.data(), statistics_cs_bytecode.size()}, &shader, nullptr)))
-        return {};
       SM50_SHADER_COMMON_DATA common{};
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
@@ -209,17 +204,19 @@ public:
                                                          : statistics_root_blob.size();
       root.next = &statistics;
       SM50ShaderBitcode compiled;
-      if (SM50Compile(shader, reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      "cs_main", &compiled, &compile_error)) {
+      std::shared_ptr<const ShaderStageArtifact> artifact;
+      if (device_->GetShaderArtifactCache().CompileShader({statistics_cs_bytecode.data(), statistics_cs_bytecode.size()},
+                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+                      "cs_main", &compiled, &compile_error, artifact)) {
         ERR("Failed to compile statistics CS: ", SM50GetErrorMessageString(compile_error));
         return {};
       }
       SM50_COMPILED_BITCODE bytecode{};
-      SM50GetCompiledBitcode(compiled, &bytecode);
+      if (artifact) bytecode = artifact->view;
+      else SM50GetCompiledBitcode(compiled, &bytecode);
       if (FAILED(pipeline_statistics_compute_constants.Initialize(device_, bytecode, compiled)))
         return {};
-      auto data = WMT::MakeDispatchData(bytecode.Data, bytecode.Size);
-      auto lib = device_->GetMetal4Compiler().newLibrary(data, error);
+      auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       if (!lib)
         return {};
       statistics_function = lib.newFunction("cs_main");

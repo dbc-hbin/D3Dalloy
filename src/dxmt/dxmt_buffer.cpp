@@ -21,6 +21,7 @@
 #include "thread.hpp"
 #include "util_likely.hpp"
 #include "util_math.hpp"
+#include "util_hash.hpp"
 #include "wsi_platform.hpp"
 #include <cassert>
 #include <mutex>
@@ -28,6 +29,22 @@
 namespace dxmt {
 
 std::atomic_uint64_t global_buffer_seq = {0};
+
+bool
+BufferViewDescriptor::operator==(const BufferViewDescriptor &other) const {
+  return format == other.format && byteOffset == other.byteOffset && byteLength == other.byteLength &&
+         writable == other.writable;
+}
+
+size_t
+BufferViewDescriptor::Hash::operator()(const BufferViewDescriptor &descriptor) const {
+  HashState hash;
+  hash.add(descriptor.format);
+  hash.add(std::hash<uint64_t>{}(descriptor.byteOffset));
+  hash.add(std::hash<uint64_t>{}(descriptor.byteLength));
+  hash.add(descriptor.writable);
+  return hash;
+}
 
 BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags) :
     info_(info),
@@ -188,18 +205,18 @@ Buffer::viewDescriptor(BufferViewKey key) {
 BufferViewKey
 Buffer::createView(BufferViewDescriptor const &descriptor) {
   std::unique_lock<dxmt::mutex> lock(mutex_);
-  unsigned i = 0;
-  for (; i < version_; i++) {
-    if (viewDescriptors_[i].format == descriptor.format &&
-        viewDescriptors_[i].byteOffset == descriptor.byteOffset &&
-        viewDescriptors_[i].byteLength == descriptor.byteLength &&
-        viewDescriptors_[i].writable == descriptor.writable) {
-      return BufferViewKey(i, std::nullopt);
-    }
-  }
+  if (auto entry = viewIndices_.find(descriptor); entry != viewIndices_.end())
+    return BufferViewKey(entry->second, std::nullopt);
+  const unsigned i = version_;
   viewDescriptors_.push_back(descriptor);
+  try {
+    viewIndices_.emplace(descriptor, i);
+  } catch (...) {
+    viewDescriptors_.pop_back();
+    throw;
+  }
   version_ = version_ + 1;
-  return BufferViewKey(i, std::nullopt);;
+  return BufferViewKey(i, std::nullopt);
 }
 
 Rc<BufferAllocation>
