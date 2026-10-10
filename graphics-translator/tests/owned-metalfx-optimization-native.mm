@@ -116,11 +116,10 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     require(exactDescriptorInput(frame.color,p.colorRect,120,120,128,128,generation->colorUsage) &&
             exactDescriptorInput(frame.depth,p.depthRect,120,120,128,128,generation->depthUsage) &&
             exactDescriptorInput(frame.motion,p.motionRect,120,120,128,128,generation->motionUsage), "sr-offset-eligibility");
-    const char* rejection = nullptr;
-    require(!exactDescriptorInput(frame.color,p.colorRect,120,120,120,120,generation->colorUsage,&rejection) &&
-            std::strcmp(rejection,"descriptor_capacity")==0, "capacity-rejection");
-    require(!exactDescriptorInput(frame.color,p.colorRect,120,120,128,128,MTLTextureUsageRenderTarget,&rejection) &&
-            std::strcmp(rejection,"native_usage")==0, "usage-rejection");
+    require(!exactDescriptorInput(frame.color,p.colorRect,120,120,120,120,generation->colorUsage),
+            "capacity-rejection");
+    require(!exactDescriptorInput(frame.color,p.colorRect,120,120,128,128,MTLTextureUsageRenderTarget),
+            "usage-rejection");
     std::vector<_Float16> colors(128*128*4, _Float16(8));
     std::vector<float> depths(128*128, .05f);
     std::vector<_Float16> motions(128*128*2, _Float16(64));

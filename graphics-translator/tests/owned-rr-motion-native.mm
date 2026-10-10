@@ -14,6 +14,11 @@
 #include "../../src/winemetal/winemetal_metal4_fx.h"
 #include "../../src/winemetal/unix/metalfx_rr.inc"
 
+// This probe uses native queues; Dormant must never enter the Wine recording transport.
+extern "C" id<MTL4CommandBuffer> winemetal_metal4_command_buffer(obj_handle_t) { std::abort(); }
+extern "C" void *winemetal_metal4_split_command_buffer(void *) { std::abort(); }
+extern "C" void winemetal_metal4_retain_resource(obj_handle_t, id) { std::abort(); }
+
 static void require(bool ok, const char *reason) {
   if (!ok) { std::fprintf(stderr,"OWNED_RR_REUSE_FAIL reason=%s\n",reason); std::exit(1); }
 }
@@ -48,7 +53,7 @@ static void descriptorReuse(const std::shared_ptr<dxmt_rr::Core> &owner) {
   auto queue = [core->device newCommandQueue]; auto queue4 = [core->device newMTL4CommandQueue];
   auto event = [core->device newSharedEvent]; uint64_t value = 0;
   require(queue && queue4 && event,"native-queues");
-  const std::array<std::shared_ptr<dxmt_rr::Generation>,4> generations{a,b,c,restored};
+  std::array<std::shared_ptr<dxmt_rr::Generation>,4> generations{a,b,c,restored};
   std::vector<float> firstA;
   for (unsigned mode = 0; mode < generations.size(); ++mode) {
     auto frame = [DXMTRRFrame new]; frame->core = core; frame->generation = generations[mode];
@@ -128,6 +133,23 @@ static void descriptorReuse(const std::shared_ptr<dxmt_rr::Core> &owner) {
     [readback release]; [allocator release]; [frame release];
   }
   [event release]; [queue4 release]; [queue release];
+  auto feature = [DXMTRRFeature new]; feature->core = core;
+  auto prepared = [DXMTRRFrame new]; prepared->core = core; prepared->generation = a;
+  std::weak_ptr<dxmt_rr::Generation> retained = a, idleB = b, idleC = c;
+  a.reset(); b.reset(); c.reset(); restored.reset(); generations.fill(nullptr);
+  struct WMTMetal4Call dormant{}; dormant.operation = WMTMetal4FXDormantTemporal;
+  dormant.args[0] = uintptr_t(feature);
+  require(dxmtRRCall(&dormant),"dormant-dispatch");
+  for (const auto &cached : core->generations) require(!cached,"dormant-cache-empty");
+  require(idleB.expired() && idleC.expired() && !retained.expired() &&
+          prepared->generation->scaler != nil,"dormant-releases-only-idle-generations");
+  auto execution = [DXMTRRExecution new]; execution->core = core;
+  execution->generation = prepared->generation;
+  [prepared release]; [feature release];
+  require(!retained.expired() && execution->generation->scaler != nil,"execution-retains-generation");
+  [execution release];
+  require(retained.expired(),"retired-generation-released");
+  std::puts("OWNED_RR_DORMANT_PASS cache_empty=1 idle_released=2 prepared_retained=1 execution_retained=1 retired_released=1");
   std::puts("OWNED_RR_REUSE_PASS sequence=A,B,C,A creations=3 frames=8 version=65536");
 }
 

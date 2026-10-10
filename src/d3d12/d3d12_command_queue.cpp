@@ -5577,6 +5577,10 @@ public:
       };
       for (size_t index = 0; index < plan.nodes.size(); ++index) {
         auto &node = plan.nodes[index];
+        // ponytail: 64-source-node planning partitions bound frontier scans.
+        // Establish them before clear promotion so no replay group or delayed
+        // clear can cross discarded history; original native fences remain.
+        if (index && index % kSubmissionGroupBudget == 0) node.boundary_before = true;
         if (node.boundary_before || !node.scopes_before.empty() || !node.access_complete) flush_clears(node.clears_before);
         if (node.record->type == EncoderType::Clear && node.access_complete) {
           const auto &clear = *static_cast<const ClearEncoderData *>(node.record);
@@ -5721,6 +5725,7 @@ public:
             ++plan.candidate_checks;
             const auto *existing = prior.group == SIZE_MAX ? nullptr : &plan.groups[prior.group];
             const size_t leader = existing ? existing->members.front() : candidate;
+            if (leader < partition) continue;
             if (index - leader > kSubmissionGroupBudget || (existing && existing->members.size() == kSubmissionGroupBudget)) continue;
             bool commute = true;
             for (const auto &dependency : node.dependencies) {

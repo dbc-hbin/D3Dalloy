@@ -413,6 +413,87 @@ void submissionAccessScheduling(UINT control) {
        control == 2 ? "graph-cross-list-independent-compute" : "graph-root-srv-opaque-control");
 }
 
+// Each closed list contributes one small, disjoint writer to the same buffer.
+// Doubling the sequence must double bounded frontier work, not quadruple it.
+void submissionLongFrontier(UINT count) {
+  Context c;
+  auto input = committed(c.dev.Get(), D3D12_HEAP_TYPE_UPLOAD, bufDesc(4), D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto output = committed(c.dev.Get(), D3D12_HEAP_TYPE_READBACK, bufDesc(4 * count), D3D12_RESOURCE_STATE_COPY_DEST);
+  void *mapped = nullptr;
+  check(input->Map(0, nullptr, &mapped), "Map(frontier-input)");
+  *static_cast<UINT *>(mapped) = 0x13579bdfu; input->Unmap(0, nullptr);
+  std::vector<Context::List> lists; lists.reserve(count);
+  std::vector<ID3D12CommandList *> batch; batch.reserve(count);
+  for (UINT i = 0; i < count; ++i) {
+    lists.push_back(c.list());
+    lists.back().list->CopyBufferRegion(output.Get(), 4 * i, input.Get(), 0, 4);
+    check(lists.back().list->Close(), "Close(frontier-copy)");
+    batch.push_back(lists.back().list.Get());
+  }
+  for (UINT replay = 0; replay < 2; ++replay) {
+    std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-frontier-%u replay=%u\n", kPrefix, count, replay); std::fflush(stderr);
+    c.executeSealed(batch);
+    std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-frontier-%u replay=%u\n", kPrefix, count, replay); std::fflush(stderr);
+    check(output->Map(0, nullptr, &mapped), "Map(frontier-output)");
+    for (UINT i = 0; i < count; ++i)
+      if (static_cast<const UINT *>(mapped)[i] != 0x13579bdfu) fail("frontier-disjoint-copy-values");
+    output->Unmap(0, nullptr);
+    std::printf("%s_GRAPH_FRONTIER count=%u replay=%u word=13579bdf exact=1 sealed=1\n", kPrefix, count, replay);
+  }
+  pass(count == 256 ? "graph-frontier-256" : "graph-frontier-512");
+}
+
+// Attachment dependencies span node 64. An existing clear-promoted group at
+// 62/63 must stay separate from 64/65. The second control instead places the
+// pending clear at 63: it must materialize before history is cleared at 64.
+void submissionFrontierBoundary(bool delayedClear) {
+  Context c; constexpr auto fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+  auto rt = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
+      texDesc(fmt, 4, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
+  auto input = committed(c.dev.Get(), D3D12_HEAP_TYPE_UPLOAD, bufDesc(4), D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto output = committed(c.dev.Get(), D3D12_HEAP_TYPE_READBACK, bufDesc(256), D3D12_RESOURCE_STATE_COPY_DEST);
+  void *mapped = nullptr;
+  check(input->Map(0, nullptr, &mapped), "Map(frontier-boundary-input)");
+  *static_cast<UINT *>(mapped) = 0x13579bdfu; input->Unmap(0, nullptr);
+  ComPtr<ID3D12DescriptorHeap> rtvHeap;
+  const auto rtv = descriptor(c.dev.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, rtvHeap);
+  c.dev->CreateRenderTargetView(rt.Get(), nullptr, rtv);
+  Draw draw(c.dev.Get(), fmt, DXGI_FORMAT_UNKNOWN, 1, "psMain", true);
+  const float black[4] = {0, 0, 0, 1}, red[4] = {16 / 255.0f, 0, 0, 0};
+  std::vector<Context::List> lists; lists.reserve(66);
+  std::vector<ID3D12CommandList *> batch; batch.reserve(66);
+  for (UINT i = 0; i < 66; ++i) {
+    lists.push_back(c.list()); auto *list = lists.back().list.Get();
+    if (i == (delayedClear ? 63u : 0u)) list->ClearRenderTargetView(rtv, black, 0, nullptr);
+    else if (i >= (delayedClear ? 64u : 62u)) {
+      list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+      draw.draw(list, 4, 4, red);
+    } else list->CopyBufferRegion(output.Get(), 4 * i, input.Get(), 0, 4);
+    check(list->Close(), "Close(frontier-boundary)"); batch.push_back(list);
+  }
+  auto read = c.list();
+  transition(read.list.Get(), rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto color = copyOut(c.dev.Get(), read.list.Get(), rt.Get());
+  transition(read.list.Get(), rt.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  check(read.list->Close(), "Close(frontier-boundary-read)");
+  for (UINT replay = 0; replay < 2; ++replay) {
+    std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-frontier-boundary-%u replay=%u\n", kPrefix, unsigned(delayedClear), replay); std::fflush(stderr);
+    c.executeSealed(batch);
+    std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-frontier-boundary-%u replay=%u\n", kPrefix, unsigned(delayedClear), replay); std::fflush(stderr);
+    c.executeSealed({read.list.Get()});
+    const UINT expected = delayedClear ? 0xff000020u : 0xff000040u;
+    for (UINT y = 0; y < 4; ++y) for (UINT x = 0; x < 4; ++x)
+      if (color.at<UINT>(x, y) != expected) fail("frontier-boundary-overlap-pixels");
+    check(output->Map(0, nullptr, &mapped), "Map(frontier-boundary-output)");
+    for (UINT i = delayedClear ? 0 : 1; i < (delayedClear ? 63u : 62u); ++i)
+      if (static_cast<const UINT *>(mapped)[i] != 0x13579bdfu) fail("frontier-boundary-copy-values");
+    output->Unmap(0, nullptr);
+    std::printf("%s_GRAPH_FRONTIER_BOUNDARY delayed_clear=%u replay=%u rgba=%08x render_encoders=%u clear_encoders=%u exact=1 sealed=1\n",
+        kPrefix, unsigned(delayedClear), replay, color.at<UINT>(0), delayedClear ? 1u : 2u, delayedClear ? 1u : 0u);
+  }
+  pass(delayedClear ? "graph-frontier-delayed-clear-boundary" : "graph-frontier-overlap-group-boundary");
+}
+
 void submissionDisjointMips() {
   Context c; constexpr auto fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
   auto rt = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
@@ -1564,6 +1645,10 @@ int main() {
   for (UINT control = 0; control < 5; ++control) crossListRenderGrouping(control);
   for (UINT control = 0; control < 5; ++control) crossListUavDependency(control);
   for (UINT control = 0; control < 4; ++control) submissionAccessScheduling(control);
+  submissionLongFrontier(256);
+  submissionLongFrontier(512);
+  submissionFrontierBoundary(false);
+  submissionFrontierBoundary(true);
   submissionDisjointMips();
   submissionAttachmentUnion(false);
   submissionAttachmentUnion(true);

@@ -164,14 +164,11 @@ Object privateTexture(id<MTLDevice> device, MTLPixelFormat format,
 }
 
 // FG has no public color offset selector; color/UI conversion stays staged.
-const char* inputStagingReason(id<MTLTexture> texture, MTLPixelFormat format,
-                               NSUInteger width, NSUInteger height,
-                               MTLTextureUsage usage, bool conversion) {
-    if (conversion) return "numerical_conversion";
-    if (texture.width != width || texture.height != height) return "descriptor_capacity";
-    if (texture.pixelFormat != format) return "descriptor_format";
-    if ((texture.usage & usage) != usage) return "native_usage";
-    return nullptr;
+bool exactDescriptorInput(id<MTLTexture> texture, MTLPixelFormat format,
+                          NSUInteger width, NSUInteger height,
+                          MTLTextureUsage usage, bool conversion) {
+    return !conversion && texture.width == width && texture.height == height &&
+           texture.pixelFormat == format && (texture.usage & usage) == usage;
 }
 
 // MetalFX retains the per-frame resources assigned to the cached interpolator.
@@ -741,10 +738,10 @@ bool PreparedFrame::encode(
                     motionTargetWidth != configuration.outputWidth ||
                     motionTargetHeight != configuration.outputHeight ||
                     (impl_->state->creation.flags & WMTFG_MOTION_VECTORS_JITTERED);
-                const bool directDepth = !inputStagingReason(
+                const bool directDepth = exactDescriptorInput(
                     (id<MTLTexture>)impl_->snapshot->depth.get(), configuration.depth,
                     configuration.width, configuration.height, effect.depthTextureUsage, false);
-                const bool directMotion = !inputStagingReason(
+                const bool directMotion = exactDescriptorInput(
                     (id<MTLTexture>)impl_->snapshot->motion.get(), configuration.motion,
                     configuration.width, configuration.height, effect.motionTextureUsage, motionConversion);
                 Object current = privateTexture(device, configuration.color,
@@ -849,13 +846,14 @@ bool PreparedFrame::encode(
                 }
 
                 Object colorParameters = makeParameterBuffer(device, colorParams);
-                Object depthParameters = makeParameterBuffer(device, depthParams);
-                Object motionParameters = makeParameterBuffer(device, motionParams);
-                if (!colorParameters || !depthParameters || !motionParameters)
+                Object depthParameters = directDepth ? Object{} : makeParameterBuffer(device, depthParams);
+                Object motionParameters = directMotion ? Object{} : makeParameterBuffer(device, motionParams);
+                if (!colorParameters || (!directDepth && !depthParameters) ||
+                    (!directMotion && !motionParameters))
                     return fail("encode_parameter_buffers");
                 execution->objects.push_back(colorParameters);
-                execution->objects.push_back(depthParameters);
-                execution->objects.push_back(motionParameters);
+                if (!directDepth) execution->objects.push_back(depthParameters);
+                if (!directMotion) execution->objects.push_back(motionParameters);
                 // Metal4 GPU addresses must be admitted before the residency set commits.
                 if (!execution->makeResident(buffer))
                     return fail("encode_residency");

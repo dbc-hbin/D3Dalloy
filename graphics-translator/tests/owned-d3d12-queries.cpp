@@ -426,15 +426,19 @@ void runVisibilitySlotReuse(ID3D12Device* device, ID3D12CommandQueue* queue,
     list->BeginQuery(heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
     list->DrawInstanced(3, 1, 0, 0);
     list->EndQuery(heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
-    list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.Get(), 0);
     check(list->Close(), "slot reuse Close");
+    // EndQuery leaves the final render pass active until Close. Resolve in a
+    // second list so it cannot hide missing Close-time scratch allocation.
+    auto resolve = createRecording(device);
+    resolve.list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.Get(), 0);
+    check(resolve.list->Close(), "slot reuse resolve Close");
     heap.Reset();
     ComPtr<ID3D12Fence> fence;
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "slot reuse fence");
     for (UINT execution = 0; execution < 2; ++execution) {
         std::fprintf(stderr, "OWNED_D3D12_QUERY_REUSE_PHASE execution=%u phase=submit_begin\n", execution);
-        ID3D12CommandList* lists[]{list};
-        queue->ExecuteCommandLists(1, lists);
+        ID3D12CommandList* lists[]{list, resolve.list.Get()};
+        queue->ExecuteCommandLists(2, lists);
         check(queue->Signal(fence.Get(), execution + 1), "slot reuse Signal");
         waitFence(fence.Get(), execution + 1);
         UINT64* mapped = nullptr;

@@ -39,7 +39,6 @@ struct Core {
   id<MTLComputePipelineState> depthConversion = nil;
   WMTMetal4FXTemporalInfo info{};
   std::mutex mutex;
-  std::shared_ptr<Generation> generation;
   std::array<std::shared_ptr<Generation>, 8> generations{};
   size_t nextGenerationSlot = 0;
   std::vector<std::unique_ptr<Resources>> pool;
@@ -138,7 +137,6 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
         cached->outputWidth == p.output_rect.width && cached->outputHeight == p.output_rect.height &&
         cached->hit == hit && cached->reactive == reactive) {
       // History is reset by encode order (lastGeneration), not descriptor lookup.
-      core.generation = cached;
       return cached;
     }
   }
@@ -166,7 +164,6 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     result->hit = hit; result->reactive = reactive;
     core.generations[core.nextGenerationSlot] = result;
     core.nextGenerationSlot = (core.nextGenerationSlot + 1) % core.generations.size();
-    core.generation = result;
     return result;
   } @finally { [d release]; }
 }
@@ -292,7 +289,7 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
   if (call->operation == WMTMetal4FXDormantTemporal && [(id)call->args[0] isKindOfClass:[DXMTRRFeature class]]) {
     auto &core = *((DXMTRRFeature *)call->args[0])->core;
     // Release idle ownership, not history retained by recorded frames and replay.
-    std::lock_guard lock(core.mutex); core.generation.reset(); core.pool.clear();
+    std::lock_guard lock(core.mutex); core.generations.fill(nullptr); core.pool.clear();
     return true;
   }
   if (call->operation == WMTMetal4FXPrepareTemporal && [(id)call->args[0] isKindOfClass:[DXMTRRFeature class]]) {

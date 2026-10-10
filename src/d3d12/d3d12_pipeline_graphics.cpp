@@ -559,12 +559,6 @@ MTLD3D12PipelineState::InitializeShader(
   }
 
   TraceShaderProbe(Stage, Bytecode, chunk, S_OK);
-  if (resource_bindings && pRefl && (pRefl->NumConstantBuffers || pRefl->NumArguments)) {
-    const size_t first = resource_bindings->size();
-    resource_bindings->resize(first + pRefl->NumConstantBuffers + pRefl->NumArguments);
-    auto *rows = resource_bindings->data() + first;
-    SM50GetArgumentsInfo(*ppShader, rows, rows + pRefl->NumConstantBuffers);
-  }
   return S_OK;
 }
 

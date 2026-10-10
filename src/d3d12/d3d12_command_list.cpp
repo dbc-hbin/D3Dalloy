@@ -1700,6 +1700,7 @@ public:
       ERR("Close: render pass not ended");
       RecordError();
     }
+    auto hr = allocator_->EndRecord(&encoder_count);
     for (auto *pass = static_cast<EncoderData *>(entry)->next; pass; pass = pass->next) {
       if (pass->type != EncoderType::Render) continue;
       auto *render = static_cast<RenderEncoderData *>(pass);
@@ -1710,7 +1711,6 @@ public:
       render->visibility_scratch = device_->GetMTLDevice().newBuffer(info);
       if (!render->visibility_scratch) RecordError(E_OUTOFMEMORY);
     }
-    auto hr = allocator_->EndRecord(&encoder_count);
     if (SUCCEEDED(hr) && FAILED(recording_error_))
       hr = recording_error_;
     close_error_ = hr;
@@ -8984,8 +8984,6 @@ public:
           if (allocator_->recording_head_->root_allocation_set.insert(allocation).second)
             allocator_->recording_head_->root_allocations.emplace_back(allocation);
           auto *compute = static_cast<ComputeEncoderData *>(allocator_->encoder_current);
-          compute->submission_buffers.push_back({ArgBufferAddress, uint64_t(MaxCommandCount) * sig->ByteStride,
-                                                 false, WMTMetal4StageDispatch});
           compute->submission_access_complete = false;
         } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return; }
         if (!RecordImplicitUse(arg_buffer, 0, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)) return;
@@ -9110,7 +9108,9 @@ public:
     const bool indexed = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
     const bool native_index = !indexed || (index_buffer && ib_allocation && !(ib_offset % index_width) &&
         ib_offset <= ib_allocation->byteLength() && !((ib_allocation->byteLength() - ib_offset) % index_width));
-    if (simple_indirect && pso_graphics_ && !pso_graphics_->uses_atomic64 && !index_pull && native_index &&
+    // ponytail: cap CPU/native command expansion; larger batches use the GPU ICB resolver.
+    if (simple_indirect && MaxCommandCount <= 64 && pso_graphics_ && !pso_graphics_->uses_atomic64 &&
+        !index_pull && native_index &&
         !pso_graphics_->view_instancing.count && !pso_graphics_->view_location_offsets &&
         (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW || indexed)) {
       if (PreDraw(false) != DrawCallStatus::Ordinary) return;
@@ -9120,13 +9120,9 @@ public:
           if (retained && allocator_->recording_head_->root_allocation_set.insert(retained).second)
             allocator_->recording_head_->root_allocations.emplace_back(retained);
         auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
-        render->submission_buffers.push_back({ArgBufferAddress, uint64_t(MaxCommandCount) * sig->ByteStride,
-                                              false, WMTMetal4StageVertex});
         if (std::none_of(render->masked_pipeline_states.begin(), render->masked_pipeline_states.end(),
                         [&](const auto &pso) { return pso.handle == direct_pipeline_bound_; }))
           render->masked_pipeline_states.push_back(WMT::RenderPipelineState{direct_pipeline_bound_});
-        if (indexed) render->submission_buffers.push_back({index_buffer_address,
-            ib_allocation->byteLength() - ib_offset, false, WMTMetal4StageVertex});
         render->submission_group_safe = false;
       } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return; }
       if (!RecordImplicitUse(arg_buffer, 0, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)) return;

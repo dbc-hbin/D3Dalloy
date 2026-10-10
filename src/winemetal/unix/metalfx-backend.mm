@@ -1078,17 +1078,13 @@ bool ensureFsrPipelines(Feature::Impl& feature, Error* error) noexcept {
 bool exactDescriptorInput(id<MTLTexture> texture, const Rect& rect,
                            NSUInteger activeWidth, NSUInteger activeHeight,
                            NSUInteger capacityWidth, NSUInteger capacityHeight,
-                           MTLTextureUsage usage, const char** rejection = nullptr) noexcept {
+                           MTLTextureUsage usage) noexcept {
     bool offsets = false;
     if (@available(macOS 27.0, *)) offsets = true;
-    const char* reason = nullptr;
-    if (!texture || !rectFits(rect, texture)) reason = "texture_bounds";
-    else if (!offsets && (rect.x || rect.y)) reason = "native_offset_unavailable";
-    else if (rect.width != activeWidth || rect.height != activeHeight) reason = "active_extent";
-    else if (texture.width != capacityWidth || texture.height != capacityHeight) reason = "descriptor_capacity";
-    else if (!hasUsage(texture, usage)) reason = "native_usage";
-    if (rejection) *rejection = reason;
-    return !reason;
+    return texture && rectFits(rect, texture) && (offsets || (!rect.x && !rect.y)) &&
+           rect.width == activeWidth && rect.height == activeHeight &&
+           texture.width == capacityWidth && texture.height == capacityHeight &&
+           hasUsage(texture, usage);
 }
 
 bool generationMatches(const ScalerGeneration& generation, const FrameInfo& frame,

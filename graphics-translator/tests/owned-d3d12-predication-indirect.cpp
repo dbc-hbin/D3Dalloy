@@ -1422,7 +1422,7 @@ void RunSimpleGraphicsIndirect(TestContext &context) {
   texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; texture.Width = 4; texture.Height = 2;
   texture.DepthOrArraySize = 1; texture.MipLevels = 1; texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
   texture.SampleDesc.Count = 1; texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-  const UINT maxima[] = {0,1,2,4};
+  const UINT maxima[] = {0,1,2,4,63,64,65,4096};
   for (UINT kind = 0; kind < 3; ++kind) {
     const bool indexed = kind != 0;
     const bool wide = kind == 2;
@@ -1443,10 +1443,10 @@ void RunSimpleGraphicsIndirect(TestContext &context) {
     const D3D12_INDEX_BUFFER_VIEW indexView = {indices->GetGPUVirtualAddress()+2*width,7*width,
                                                wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
     for (UINT maximum : maxima) {
-      std::array<uint8_t,16+4*32+16> records = {};
-      for (UINT i = 0; i < 4; ++i) {
-        const D3D12_DRAW_ARGUMENTS draw = {i == 3 ? 0u : 3u,i == 2 ? 0u : 1u,3,5};
-        const D3D12_DRAW_INDEXED_ARGUMENTS drawIndexed = {i == 3 ? 0u : 3u,i == 2 ? 0u : 1u,1,-3,5};
+      std::vector<uint8_t> records(16 + (maximum < 4 ? 4 : maximum) * 32 + 16);
+      for (UINT i = 0; i < (maximum < 4 ? 4 : maximum); ++i) {
+        const D3D12_DRAW_ARGUMENTS draw = {i >= 3 ? 0u : 3u,i == 2 ? 0u : 1u,3,5};
+        const D3D12_DRAW_INDEXED_ARGUMENTS drawIndexed = {i >= 3 ? 0u : 3u,i == 2 ? 0u : 1u,1,-3,5};
         std::memcpy(records.data()+16+i*32,indexed ? static_cast<const void *>(&drawIndexed) : &draw,
                     indexed ? sizeof(drawIndexed) : sizeof(draw));
       }

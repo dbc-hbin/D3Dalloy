@@ -218,14 +218,13 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
   struct PoolSlot {
     WMT::Reference<WMT::Texture> texture;
     WMTTextureViewPoolInfo info{};
-    bool pooled = false;
   };
   std::vector<PoolSlot> pool_slots_;
   WMT::Reference<WMT::TextureViewPool> view_pool_;
   bool pool_supported_ = false;
 
   void ResetPoolSlot(UINT index) {
-    if (pool_slots_[index].pooled) view_pool_.clear(index);
+    if (pool_slots_[index].texture) view_pool_.clear(index);
     pool_slots_[index] = {};
   }
 
@@ -237,7 +236,6 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
     slot.texture = texture->current()->texture();
     slot.info = {uint32_t(descriptor.format), uint32_t(descriptor.type), descriptor.firstMiplevel,
                  descriptor.miplevelCount, descriptor.firstArraySlice, descriptor.arraySize};
-    slot.pooled = true; // Bridge-managed, including the optional SDK-pool fallback.
     mapped_argument_buffer_[index].SRVTexture.resource_id = view_pool_.setTextureView(slot.texture, slot.info, index);
     return true;
   }
@@ -647,12 +645,9 @@ public:
       destination->ResetPoolSlot(DescriptorTo + i);
       destination->descriptors_[DescriptorTo + i] = cpu;
       destination->pool_slots_[DescriptorTo + i] = slot;
-      auto &target = destination->pool_slots_[DescriptorTo + i];
-      target.pooled = false;
       if (slot.texture) {
         gpu.SRVTexture.resource_id = destination->view_pool_.copyTextureView(
             view_pool_, From + i, DescriptorTo + i, slot.texture, slot.info);
-        target.pooled = true;
       }
       destination->mapped_argument_buffer_[DescriptorTo + i] = gpu;
     }

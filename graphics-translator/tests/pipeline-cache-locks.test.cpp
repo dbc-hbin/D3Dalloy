@@ -339,8 +339,9 @@ void testStageArtifactFlights() {
   producer.wait();
   std::promise<void> joined; auto signal = joined.get_future();
   auto second = std::async(std::launch::async, [&] {
-    { std::lock_guard lock(cache.mutex); require(cache.entries.size() == 1, "one pending flight"); }
-    joined.set_value();
+    trace_hook = [&](const auto &event, const auto &) {
+      if (event == "pipeline_artifact_wait") { joined.set_value(); throw E_ABORT; }
+    };
     return cache.Get("linked-stage", "air_compile", [&] { ++operations; return std::make_shared<ShaderStageArtifact>(); });
   });
   await(signal); producer.open(); auto a = await(first), b = await(second);
@@ -360,13 +361,41 @@ void testStageArtifactFlights() {
   retired.open(); auto retained = await(old);
   require(operations == 4 && fresh != retained && retained->metadata[0] == 9,
           "clear during conversion separates generation and retains old result");
-  cache.Get("failed", "air_compile", []() -> std::shared_ptr<ShaderStageArtifact> { return {}; });
-  auto retry = cache.Get("failed", "air_compile", [] { return std::make_shared<ShaderStageArtifact>(); });
-  require(bool(retry), "failed stage not cached");
+  for (bool throws : {false, true}) {
+    Gate failing;
+    auto failed = std::async(std::launch::async, [&] {
+      try {
+        auto value = cache.Get("failed", "air_compile", [&]() -> std::shared_ptr<ShaderStageArtifact> {
+          failing.block();
+          if (throws) throw E_FAIL;
+          return {};
+        });
+        require(!throws && !value, "null producer failure preserved");
+      } catch (HRESULT hr) {
+        require(throws && hr == E_FAIL, "producer exception preserved");
+      }
+    });
+    failing.wait();
+    std::promise<void> waiting; auto waiting_signal = waiting.get_future();
+    auto waiter = std::async(std::launch::async, [&] {
+      trace_hook = [&](const auto &event, const auto &) {
+        if (event == "pipeline_artifact_wait") waiting.set_value();
+      };
+      return cache.Get("failed", "air_compile", [] {
+        require(false, "failure waiter must join pending flight");
+        return std::make_shared<ShaderStageArtifact>();
+      });
+    });
+    await(waiting_signal); failing.open(); await(failed);
+    require(!await(waiter), "producer failure wakes pending waiter with no artifact");
+    auto retry = cache.Get("failed", "air_compile", [] { return std::make_shared<ShaderStageArtifact>(); });
+    require(bool(retry), "failed stage not cached");
+    controls(4);
+  }
   for (unsigned i = 0; i < 300; ++i)
     cache.Get(std::to_string(i), "air_compile", [] { return std::make_shared<ShaderStageArtifact>(); });
   require(cache.completed <= 256 && cache.bytes <= 32u * 1024u * 1024u, "artifact retention bounded");
-  std::puts("PIPELINE_STAGE_FLIGHT_PASS conversions=4 same_artifact=1 retained_after_clear=1 clear_pending=1 failure_retry=1 bounded=1");
+  std::puts("PIPELINE_STAGE_FLIGHT_PASS conversions=4 same_artifact=1 retained_after_clear=1 clear_pending=1 failure_retry=1 failure_wakeups=2 trace_exception=1 bounded=1");
 }
 int main() {
   testStageArtifactKeys(); testStageArtifactFlights();

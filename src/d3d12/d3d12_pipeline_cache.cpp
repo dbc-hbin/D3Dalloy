@@ -460,6 +460,14 @@ template <typename T> struct ArtifactCache {
       if (auto it = entries.find(key); it != entries.end()) {
         flight = it->second;
         flight->last_use = ++clock;
+        if (!flight->done) {
+          try {
+            if (owned_graphics::TraceEnabled())
+              owned_graphics::Trace("pipeline_artifact_wait", ",\"kind\":\"", kind, "\",\"cache\":", id);
+          } catch (...) {
+            // Optional tracing cannot prevent joining a pending flight.
+          }
+        }
         flight->ready.wait(lock, [&] { return flight->done; });
         auto value = flight->value;
         lock.unlock();

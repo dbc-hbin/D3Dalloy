@@ -208,12 +208,14 @@ TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureV
       info.usage = WMTTextureUsageShaderRead | WMTTextureUsagePixelFormatView;
     }
     if (!castCompressed) {
+      // Lazy descriptor-index caches contain holes; retain shared storage before unlocking.
+      std::shared_lock<dxmt::shared_mutex> lock(owner->mutex_);
       for (const auto &cached : allocation->cached_view_) {
-        if (cached->castBlockSize == castBlockSize && !cached->castCompressed &&
+        if (cached && cached->castBlockSize == castBlockSize && !cached->castCompressed &&
             cached->castSourceBlockWidth == castSourceBlockWidth &&
             (castSourceBlockWidth != 1 ||
              (cached->key.mip_end == key.mip_end &&
-              ORIGINAL_FORMAT(owner->pixelFormat(cached->key)) == info.pixel_format)) &&
+              ORIGINAL_FORMAT(owner->viewDescriptors_[cached->key.index].format) == info.pixel_format)) &&
             cached->key.mip_start == key.mip_start && cached->key.array_start == key.array_start &&
             cached->key.array_end == key.array_end) {
           castStorage = cached->castStorage;

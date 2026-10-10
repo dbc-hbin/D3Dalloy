@@ -325,6 +325,10 @@ class RunnerFailures(unittest.TestCase):
             ("graph-access-1", 2, [2], [identity, identity], 0, 1, 0, 0, [], 0, False),
             ("graph-access-2", 2, [2], [identity, identity], 0, 0, 1, 0, [], 0, False),
             ("graph-access-3", 2, [1, 1], [], 0, 1, 0, 0, [], 0, False),
+            ("graph-frontier-256", 2, [], [], 0, 256, 0, 0, [], 0, False),
+            ("graph-frontier-512", 2, [], [], 0, 512, 0, 0, [], 0, False),
+            ("graph-frontier-boundary-0", 2, [2, 2], [identity, identity, identity, identity], 0, 61, 0, 0, [4], 0, False),
+            ("graph-frontier-boundary-1", 2, [2], [identity, identity], 0, 63, 0, 1, [4], 0, False),
             ("graph-mips", 1, [2], [identity, identity], 0, 0, 1, 0, [], 0, False),
             ("graph-union-0", 2, [3], [identity, [1, 0, 2, 3, 4, 5, 6, 7], identity], 0, 0, 0, 0, [], 0, False),
             ("graph-union-1", 2, [3], [[0, 2, 2, 3, 4, 5, 6, 7], [2, 1, 2, 3, 4, 5, 6, 7], identity], 0, 0, 0, 0, [], 0, False),
@@ -346,6 +350,11 @@ class RunnerFailures(unittest.TestCase):
                                f"members=2 inline_barriers={int(c == 4)} exact=1"]
         render_numeric += [f"GRAPH_ACCESS control={c} replay={r} rgba=ff000050 unrelated={('13579bdf' if c == 2 else '00000010')} "
                            f"render_encoders={2 if c == 3 else 1} members=2 exact=1" for c in range(4) for r in range(2)]
+        render_numeric += [f"GRAPH_FRONTIER count={count} replay={replay} word=13579bdf exact=1 sealed=1"
+                           for count in (256, 512) for replay in range(2)]
+        render_numeric += [f"GRAPH_FRONTIER_BOUNDARY delayed_clear={delayed} replay={replay} "
+                           f"rgba={'ff000020' if delayed else 'ff000040'} render_encoders={1 if delayed else 2} "
+                           f"clear_encoders={delayed} exact=1 sealed=1" for delayed in range(2) for replay in range(2)]
         render_numeric += ["GRAPH_MIPS rgba=ff000050 mip0=16 mip1=64 mip1_untouched=16 render_encoders=1 members=2 exact=1"]
         render_numeric += [f"GRAPH_UNION unused={u} replay={r} first={('ff000030' if u else 'ff004030')} "
                            f"second={('ff005000' if u else 'ff003040')} render_encoders=1 members=3 identity_reset=1 exact=1"
@@ -369,6 +378,13 @@ class RunnerFailures(unittest.TestCase):
             for name, replays, begins, mappings, identities, blits, computes, clears, aspects, superseded, inline in phases:
                 for replay in range(replays):
                     events = [{"event": "submission_clear_superseded", "aspect": 4} for _ in range(superseded)]
+                    if name.startswith("graph-frontier-"):
+                        events.append({"event": "submission_plan_work", "history_checks": 8064 if name == "graph-frontier-256" else 16128 if name == "graph-frontier-512" else 0,
+                                       "candidate_checks": 0, "metadata_copies": 0, "scope_checks": 0, "feedback_checks": 0})
+                        pairs = [(62, 63), (64, 65)] if name == "graph-frontier-boundary-0" else [(64, 65)] if name == "graph-frontier-boundary-1" else []
+                        events += [{"event": "submission_render_merged", "before_list": before, "after_list": after, "members": 2} for before, after in pairs]
+                        if name == "graph-frontier-boundary-0":
+                            events.append({"event": "submission_clear_load", "clear_node": 0, "render_node": 62, "aspect": 4})
                     for kind, count in (("render", len(begins)), ("clear", clears), ("blit", blits), ("compute", computes)):
                         for index in range(count):
                             events.append({"event": f"native_{kind}_begin", "begin_count": 1,
@@ -379,8 +395,9 @@ class RunnerFailures(unittest.TestCase):
                             events.append({"event": f"native_{kind}_wait", "wait_count": 1,
                                            **({"stages": 3 if inline else 1 if name == "graph-access-3" else 2} if kind == "render"
                                               else {"stages": 2} if kind == "clear" else {})})
-                            if index == 0 and kind == ("render" if begins else "clear"):
-                                events += [{"event": "native_clear_load", "clear_count": 1, "aspect": a} for a in aspects]
+                            if index == 0 and kind == ("clear" if name == "graph-frontier-boundary-1" else "render" if begins else "clear"):
+                                events += [{"event": "native_clear_load", "clear_count": 1, "aspect": a,
+                                            **({"node": 63} if name == "graph-frontier-boundary-1" else {})} for a in aspects]
                             if kind == "render":
                                 if identities:
                                     events.append({"event": "native_render_color_map_identity", "map_count": 1})
@@ -456,6 +473,44 @@ class RunnerFailures(unittest.TestCase):
                               (f"wrong-readback-{i}", stdout.replace(line, line.replace("=ff", "=fe", 1)
                                if "=ff" in line else line.replace("word=", "word=9", 1), 1), stderr)]
             if suite == "render-passes":
+                for chunk in (c for c in chunks if "begin=graph-frontier-" in c[0]):
+                    frontier_chunk = "\n".join(chunk)
+                    for row in chunk:
+                        if not row.startswith("OWNED_GRAPHICS_TRACE "):
+                            continue
+                        event = json.loads(row.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+                        kind = event["event"]
+                        if kind in ("submission_plan_work", "submission_render_merged", "submission_clear_load"):
+                            mutations += [("frontier-missing-" + kind, stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row + "\n", "", 1))),
+                                          ("frontier-duplicate-" + kind, stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, row + "\n" + row, 1)))]
+                        if kind == "submission_plan_work":
+                            for field in ("history_checks", "candidate_checks", "metadata_copies", "scope_checks", "feedback_checks"):
+                                for value in (None, True, -1):
+                                    bad = "OWNED_GRAPHICS_TRACE " + json.dumps({**event, field: value})
+                                    mutations.append((f"frontier-invalid-{field}-{value}", stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, bad, 1))))
+                            if "boundary" not in chunk[0]:
+                                count = 256 if "frontier-256" in chunk[0] else 512
+                                for field, value in (("history_checks", count * (count - 1) // 2), ("history_checks", event["history_checks"] + 1),
+                                                     ("candidate_checks", 1), ("metadata_copies", 1), ("scope_checks", 1), ("feedback_checks", 1)):
+                                    bad = "OWNED_GRAPHICS_TRACE " + json.dumps({**event, field: value})
+                                    mutations.append((f"frontier-work-{count}-{field}-{value}", stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, bad, 1))))
+                        elif kind == "submission_render_merged":
+                            for field, value in (("before_list", 63), ("after_list", 64), ("members", 4), ("members", True)):
+                                bad = "OWNED_GRAPHICS_TRACE " + json.dumps({**event, field: value})
+                                mutations.append((f"frontier-cross-partition-{field}-{value}", stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, bad, 1))))
+                        elif kind == "submission_clear_load":
+                            for field, value in (("clear_node", 63), ("render_node", 64), ("aspect", 1)):
+                                bad = "OWNED_GRAPHICS_TRACE " + json.dumps({**event, field: value})
+                                mutations.append(("frontier-clear-position-" + field, stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, bad, 1))))
+                        elif kind == "native_clear_load" and "boundary-1" in chunk[0]:
+                            bad = "OWNED_GRAPHICS_TRACE " + json.dumps({**event, "node": 64})
+                            promoted = 'OWNED_GRAPHICS_TRACE {"event":"submission_clear_load","clear_node":63,"render_node":64,"aspect":4}'
+                            mutations += [("frontier-delayed-clear-wrong-node", stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, bad, 1))),
+                                          ("frontier-delayed-clear-promoted", stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, promoted, 1))),
+                                          ("frontier-delayed-clear-extra-promotion", stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, row + "\n" + promoted, 1)))]
+                        elif kind == "native_render_color_map" and "boundary-0" in chunk[0] and event["member"] == 0:
+                            bad = "OWNED_GRAPHICS_TRACE " + json.dumps({**event, "member": 2})
+                            mutations.append(("frontier-group-map-no-reset", stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, bad, 1))))
                 mutations += [("clear-view-old-red", stdout.replace("untouched=ffff0000", "untouched=ff0000ff"), stderr),
                               ("clear-view-draw-corrupt", stdout.replace("drawn=ff00ff00", "drawn=ff0000ff"), stderr)]
                 for chunk in (c for c in chunks if "begin=graph-clear-view-" in c[0]):
@@ -2713,14 +2768,16 @@ class Phase3PreparedEvidence(unittest.TestCase):
                     event("complete", submission=submission, status=4)
                     err.append(phase + "submit_end")
         for kind in range(3):
-            for maximum in (0, 1, 2, 4):
+            for maximum in (0, 1, 2, 4, 63, 64, 65, 4096):
                 rgba = "0,0,0,0" if maximum == 0 else "2,5,0,255" if maximum == 1 else "3,7,0,255"
                 out.append(f"OWNED_D3D12_PREDICATION_INDIRECT_SIMPLE_GRAPHICS_VALUES kind={kind} max={maximum} rgba={rgba}")
                 phase = f"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format={kind} max={maximum} phase="
                 err.append(phase + "submit_begin")
                 submission += 1
                 event("submit", submission=submission)
-                for slot in range(maximum):
+                if maximum > 64:
+                    native("EXECUTE_ICB", stage="render", encoder=1, buffer=2, location=0, length=maximum)
+                for slot in range(maximum if maximum <= 64 else 0):
                     fields = dict(encoder=1, argument_buffer=2, argument_offset=16+32*slot, primitive_type=3)
                     if kind:
                         fields.update(index_type=kind-1, index_buffer=3, index_offset=4)
@@ -2774,6 +2831,37 @@ class Phase3PreparedEvidence(unittest.TestCase):
         lines=[line for line in part.splitlines() if "pso=900" not in line and not line.startswith("OWNED_GRAPHICS_NATIVE_EXECUTE_ICB")]
         loop=[f"OWNED_GRAPHICS_NATIVE_DISPATCH_INDIRECT encoder=1 pso=101 argument_buffer=2 argument_offset={16+32*i} threads_x=1 threads_y=1 threads_z=1" for i in range(32)]
         self.assertTrue(runner.prepared_indirect_failures(out,err.replace(part,"\n"+"\n".join(lines+loop)+"\n",1)))
+
+
+    def test_graphics_bypass_threshold_and_actual_icb_range(self):
+        out, err = self.indirect_control()
+        self.assertEqual(runner.prepared_indirect_failures(out, err), [])
+        for kind in range(3):
+            for maximum in (64, 65, 4096):
+                begin = f"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format={kind} max={maximum} phase=submit_begin"
+                end = begin.replace("submit_begin", "submit_end")
+                part = err.split(begin, 1)[1].split(end, 1)[0]
+                records = [line for line in part.splitlines() if not line.startswith("OWNED_GRAPHICS_NATIVE_")]
+                indirect = []
+                for slot in range(maximum):
+                    line = f"OWNED_GRAPHICS_NATIVE_{'DRAW_INDEXED_INDIRECT' if kind else 'DRAW_INDIRECT'} encoder=1 argument_buffer=2 argument_offset={16+32*slot} primitive_type=3"
+                    if kind:
+                        line += f" index_type={kind-1} index_buffer=3 index_offset=4"
+                    indirect.append(line)
+                icb = f"OWNED_GRAPHICS_NATIVE_EXECUTE_ICB stage=render encoder=1 buffer=2 location=0 length={maximum}"
+                flipped = [icb] if maximum == 64 else indirect
+                with self.subTest(kind=kind, maximum=maximum, mutation="threshold-or-expanded-calls"):
+                    self.assertTrue(runner.prepared_indirect_failures(out, err.replace(part, "\n" + "\n".join(records + flipped) + "\n", 1)))
+                if maximum > 64:
+                    for replacement in ("", icb + "\n" + icb):
+                        with self.subTest(kind=kind, maximum=maximum, mutation="missing-or-duplicate-icb"):
+                            self.assertTrue(runner.prepared_indirect_failures(out, err.replace(part, part.replace(icb, replacement, 1), 1)))
+                    for old, new in (("stage=render", "stage=compute"), ("location=0", "location=1"),
+                                     (f"length={maximum}", f"length={maximum-1}")):
+                        with self.subTest(kind=kind, maximum=maximum, mutation=new):
+                            self.assertTrue(runner.prepared_indirect_failures(out, err.replace(part, part.replace(icb, icb.replace(old, new), 1), 1)))
+                    resolver = "OWNED_GRAPHICS_NATIVE_DISPATCH encoder=1 pso=900 mode=threadgroups grid_x=2 grid_y=1 grid_z=1 threads_x=32 threads_y=1 threads_z=1"
+                    self.assertTrue(runner.prepared_indirect_failures(out, err.replace(part, part.replace(icb, resolver + "\n" + icb, 1), 1)))
 
 
 class Phase3UploadEvidence(unittest.TestCase):

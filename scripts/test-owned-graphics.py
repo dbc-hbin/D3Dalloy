@@ -1468,7 +1468,7 @@ def prepared_indirect_rows() -> tuple[list[str], list[str], list[str]]:
                 compute.append(f"{prefix}_PREPARED_COMPUTE_VALUES mode={mode} max={maximum} replay={replay} count={count} predicate={predicate} result={result} guards=" + ",".join(f"{v:08x}" for v in guards))
                 phases.extend(f"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode={mode} max={maximum} replay={replay} phase={phase}" for phase in ("submit_begin", "submit_end"))
     for kind in range(3):
-        for maximum in (0, 1, 2, 4):
+        for maximum in (0, 1, 2, 4, 63, 64, 65, 4096):
             rgba = (0, 0, 0, 0) if maximum == 0 else (3, 7, 0, 255) if maximum >= 2 else (2, 5, 0, 255)
             graphics.append(f"{prefix}_SIMPLE_GRAPHICS_VALUES kind={kind} max={maximum} rgba=" + ",".join(map(str, rgba)))
             phases.extend(f"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format={kind} max={maximum} phase={phase}" for phase in ("submit_begin", "submit_end"))
@@ -1488,7 +1488,7 @@ def prepared_indirect_numeric_failures(stdout: str) -> list[str]:
 
 
 def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
-    events, failures = phase3_trace(stderr)
+    events, failures = phase3_trace(stderr, 100000)
     failures.extend(prepared_indirect_numeric_failures(stdout))
     if failures:
         return failures
@@ -1568,8 +1568,11 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
                 failures.append("actual GPU argument producer dispatch differs")
         else:
             kind = "DRAW_INDIRECT" if fields["format"] == "0" else "DRAW_INDEXED_INDIRECT"
-            if counts != (Counter({kind: maximum}) if maximum else Counter()) or resolver or icbs:
+            expected = Counter({"EXECUTE_ICB": 1}) if maximum > 64 else Counter({kind: maximum}) if maximum else Counter()
+            if counts != expected or resolver:
                 failures.append("graphics native fixed-count bypass work differs: " + marker)
+            if maximum > 64 and icbs and (icbs[0]["stage"], icbs[0]["location"], icbs[0]["length"]) != ("render", 0, maximum):
+                failures.append("actual graphics ICB range differs")
             if kind == "DRAW_INDEXED_INDIRECT" and any(value.get("index_type") != int(fields["format"]) - 1 for name, value in commands if name == kind):
                 failures.append("native indexed buffer width differs")
         payloads = [value for kind, value in commands if kind.endswith("_INDIRECT")]
@@ -2274,6 +2277,10 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
             "graph-access-1": (2, (2,), 2, 0, 1, 0, 0, 0, 0, 0),
             "graph-access-2": (2, (2,), 2, 0, 0, 1, 0, 0, 0, 0),
             "graph-access-3": (2, (1, 1), 0, 0, 1, 0, 0, 0, 0, 0),
+            "graph-frontier-256": (2, (), 0, 0, 256, 0, 0, 0, 0, 0),
+            "graph-frontier-512": (2, (), 0, 0, 512, 0, 0, 0, 0, 0),
+            "graph-frontier-boundary-0": (2, (2, 2), 4, 0, 61, 0, 0, 1, 0, 0),
+            "graph-frontier-boundary-1": (2, (2,), 2, 0, 63, 0, 1, 1, 0, 0),
             "graph-mips": (1, (2,), 2, 0, 0, 1, 0, 0, 0, 0),
             "graph-union-0": (2, (3,), 3, 0, 0, 0, 0, 0, 0, 0),
             "graph-union-1": (2, (3,), 3, 0, 0, 0, 0, 0, 0, 0),
@@ -2297,6 +2304,8 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
     identity = list(range(8))
     failures, completed = [], []
     active, counts, maps, map_members, members, aspects = None, Counter(), [], [], [], Counter()
+    planning = []
+    frontier_work = {}
     for line in stderr.splitlines():
         if line.startswith(prefix.rstrip()):
             marker = re.fullmatch(re.escape(prefix) + r"(begin|end)=([\w-]+) replay=(\d+)", line)
@@ -2308,6 +2317,7 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
             if (action == "begin" and active is None and len(completed) < len(expected_phases)
                     and phase == expected_phases[len(completed)]):
                 active, counts, maps, map_members, members, aspects = phase, Counter(), [], [], [], Counter()
+                planning = []
             elif action == "end" and active == phase:
                 _, begin_members, mapped, identities, blits, computes, clears, loads, superseded, barriers = matrix[name]
                 expected = Counter({"native_render_member": sum(n - 1 for n in begin_members),
@@ -2328,12 +2338,29 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
                     expected_maps = [identity, [1, 0, 2, 3, 4, 5, 6, 7], identity]
                 elif name in ("graph-union-1", "graph-union-lifetime"):
                     expected_maps = [[0, 2, 2, 3, 4, 5, 6, 7], [2, 1, 2, 3, 4, 5, 6, 7], identity]
-                if maps != expected_maps or map_members != list(range(mapped)):
+                expected_map_members = [0, 1, 0, 1] if name == "graph-frontier-boundary-0" else list(range(mapped))
+                if maps != expected_maps or map_members != expected_map_members:
                     failures.append(f"graph {phase}: per-member mapping or final identity wrong")
                 expected_aspects = (Counter({4: loads - 2, 1: 1, 2: 1}) if name.startswith("graph-clears-")
                                     else Counter({4: loads}))
                 if aspects != expected_aspects:
                     failures.append(f"graph {phase}: color/depth/stencil clear aspects wrong")
+                if name.startswith("graph-frontier-"):
+                    work = [e for e in planning if e["event"] == "submission_plan_work"]
+                    work_fields = ("history_checks", "candidate_checks", "metadata_copies", "scope_checks", "feedback_checks")
+                    if len(work) != 1 or any(type(e.get(key)) is not int or e[key] < 0 for e in work for key in work_fields):
+                        failures.append(f"graph {phase}: missing, duplicated or invalid planning work")
+                    elif name in ("graph-frontier-256", "graph-frontier-512"):
+                        expected_work = (8064 if name.endswith("256") else 16128, 0, 0, 0, 0)
+                        if tuple(work[0][key] for key in work_fields) != expected_work:
+                            failures.append(f"graph {phase}: bounded frontier work differs")
+                        frontier_work[phase] = work[0]["history_checks"]
+                    merged = [(e.get("before_list"), e.get("after_list"), e.get("members")) for e in planning if e["event"] == "submission_render_merged"]
+                    clear_loads = [(e.get("clear_node"), e.get("render_node"), e.get("aspect")) for e in planning if e["event"] == "submission_clear_load"]
+                    expected_merged = [(62, 63, 2), (64, 65, 2)] if name == "graph-frontier-boundary-0" else [(64, 65, 2)] if name == "graph-frontier-boundary-1" else []
+                    expected_clear_loads = [(0, 62, 4)] if name == "graph-frontier-boundary-0" else []
+                    if merged != expected_merged or clear_loads != expected_clear_loads or any(type(value) is not int for row in merged + clear_loads for value in row):
+                        failures.append(f"graph {phase}: merge or clear promotion crossed planning partition")
                 completed.append(phase)
                 active = None
             else:
@@ -2350,6 +2377,9 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
             kind = event.get("event", "")
             if not isinstance(kind, str):
                 failures.append("non-string graph operation event")
+                continue
+            if active[0].startswith("graph-frontier-") and kind in ("submission_plan_work", "submission_render_merged", "submission_clear_load"):
+                planning.append(event)
                 continue
             if kind == "native_render_attachment":
                 # Descriptor metadata is not a native operation call.
@@ -2390,6 +2420,8 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
                        for key, value in (("member", 1), ("scope", 1), ("before", 1), ("after", 1))):
                     failures.append(f"graph {active}: wrong inline barrier scope/stages/member")
             elif kind in ("native_clear_load", "submission_clear_superseded"):
+                if kind == "native_clear_load" and active[0] == "graph-frontier-boundary-1" and (type(event.get("node")) is not int or event["node"] != 63):
+                    failures.append(f"graph {active}: delayed clear materialized at wrong node")
                 aspect = event.get("aspect")
                 if type(aspect) is not int or aspect not in (1, 2, 4):
                     failures.append(f"graph {active}: invalid clear aspect")
@@ -2398,6 +2430,8 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
     if active is not None or completed != expected_phases:
         failures.append("graph native operation phase matrix missing, duplicated or reordered")
     if suite == "render-passes":
+        if any(frontier_work.get(("graph-frontier-512", replay)) != 2 * frontier_work.get(("graph-frontier-256", replay), -1) for replay in range(2)):
+            failures.append("graph frontier work does not scale linearly across sealed replays")
         numeric = [base + f"_CROSS_LIST control={c} replay={r} left={('ff102000' if c == 4 else 'ff402080')} "
                    f"right={('ff100000' if c == 4 else 'ff400080')} exact=1 sealed=1"
                    for c in range(5) for r in range(2)]
@@ -2408,6 +2442,11 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
         numeric += [base + f"_GRAPH_ACCESS control={c} replay={r} rgba=ff000050 "
                     f"unrelated={('13579bdf' if c == 2 else '00000010')} render_encoders={2 if c == 3 else 1} members=2 exact=1"
                     for c in range(4) for r in range(2)]
+        numeric += [base + f"_GRAPH_FRONTIER count={count} replay={replay} word=13579bdf exact=1 sealed=1"
+                    for count in (256, 512) for replay in range(2)]
+        numeric += [base + f"_GRAPH_FRONTIER_BOUNDARY delayed_clear={delayed} replay={replay} "
+                    f"rgba={'ff000020' if delayed else 'ff000040'} render_encoders={1 if delayed else 2} "
+                    f"clear_encoders={delayed} exact=1 sealed=1" for delayed in range(2) for replay in range(2)]
         numeric += [base + "_GRAPH_MIPS rgba=ff000050 mip0=16 mip1=64 mip1_untouched=16 render_encoders=1 members=2 exact=1"]
         numeric += [base + f"_GRAPH_UNION unused={u} replay={r} first={('ff000030' if u else 'ff004030')} "
                     f"second={('ff005000' if u else 'ff003040')} render_encoders=1 members=3 identity_reset=1 exact=1"
@@ -3420,7 +3459,7 @@ def run(args: argparse.Namespace) -> int:
         "DXMT_LOG_PATH": str(out),
         "DXMT_SHADER_CACHE_PATH": str(out / "shader-cache"),
         "OWNED_GRAPHICS_TRACE": "1",
-        "OWNED_GRAPHICS_TRACE_LIMIT": "1000000" if args.suite == "arena-heap-upload-reuse" else "100000" if args.suite in ("queries", "multisample-capabilities") else "8192",
+        "OWNED_GRAPHICS_TRACE_LIMIT": "1000000" if args.suite == "arena-heap-upload-reuse" else "100000" if args.suite in ("queries", "multisample-capabilities", "render-passes", "predication-indirect") else "8192",
         # macOS strips DYLD_* while entering /bin/sh. The owned wrapper sets
         # this diagnostic variable itself on the final hop into real Wine.
         "OWNED_GRAPHICS_DYLD_AUDIT": "1",
@@ -3678,7 +3717,10 @@ def run(args: argparse.Namespace) -> int:
                    and "_FAIL" not in stdout)
     if args.suite == "render-passes":
         success = (success
-                   and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 34
+                   and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 38
+                   and all(stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_CASE_PASS case=" + case) == 1
+                           for case in ("graph-frontier-256", "graph-frontier-512",
+                                        "graph-frontier-overlap-group-boundary", "graph-frontier-delayed-clear-boundary"))
                    and "OWNED_D3D12_RENDER_PASSES_CLEAR_PRESERVE pixel=ff402080" in stdout
                    and ("OWNED_D3D12_RENDER_PASSES_RTV_REBIND first=ff102040 view=ff800000 "
                         "resource=ff002040 draws=6 redundant=2 unbind=1") in stdout
@@ -3693,7 +3735,7 @@ def run(args: argparse.Namespace) -> int:
                    and "OWNED_D3D12_RENDER_PASSES_SUSPEND_RESUME pixel=ff204010" in stdout
                    and "OWNED_D3D12_RENDER_PASSES_VALIDATION_PASS rejected=10 conformant_barrier=1" in stdout
                    and "OWNED_D3D12_RENDER_PASSES_UINT_BORDER b0000=0000 b0001=0001 b1111=1111" in stdout
-                   and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=34") == 1
+                   and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=38") == 1
                    and "_FAIL" not in stdout)
     if args.suite == "enhanced-barriers":
         success = (success
