@@ -225,6 +225,15 @@ void setup_temp_register(
 
 void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version) {
   using namespace llvm;
+  // Metal 3.2 miscomputes dynamic cube comparison gradients. Compute comparison bias
+  // uses the same gradient path; both DXIL operations need the Metal 4.0 semantics.
+  for (const auto &function : module) {
+    if (function.getName().startswith("dx.op.sampleCmpGrad.") ||
+        function.getName().startswith("dx.op.sampleCmpBias.")) {
+      metal_version = std::max(metal_version, SM50_SHADER_METAL_400);
+      break;
+    }
+  }
   if (module.getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) metal_version = SM50_SHADER_METAL_410;
   auto &context = module.getContext();
   auto createUnsignedInteger = [&](uint32_t s) {
@@ -239,6 +248,12 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
     airVersion->addOperand(MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(9), createUnsignedInteger(0)}));
     airLangVersion->addOperand(MDTuple::get(context, {createString("Metal"), createUnsignedInteger(4), createUnsignedInteger(1), createUnsignedInteger(0)}));
     module.setTargetTriple("air64-apple-macosx27.0.0");
+    break;
+  }
+  case SM50_SHADER_METAL_400: {
+    airVersion->addOperand(MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(8), createUnsignedInteger(0)}));
+    airLangVersion->addOperand(MDTuple::get(context, {createString("Metal"), createUnsignedInteger(4), createUnsignedInteger(0), createUnsignedInteger(0)}));
+    module.setTargetTriple("air64-apple-macosx26.0.0");
     break;
   }
   case SM50_SHADER_METAL_320: {

@@ -16,6 +16,14 @@ for shape in 0 1 2 3 4 5; do
     compile "${stage}_6_7" "${stage}Main" "cmp${shape}-${stage}" -DSHAPE=$shape
   done
   compile lib_6_7 rayMain "cmp${shape}-lib" -DSHAPE=$shape -DLIBRARY
+  # SM6.8: explicit gradients are legal everywhere; bias requires derivatives.
+  for stage in cs vs ps gs hs ds as ms; do
+    compile "${stage}_6_8" "${stage}Main" "cmpgrad${shape}-${stage}" -DSHAPE=$shape -DCMP_GRAD
+  done
+  compile lib_6_8 rayMain "cmpgrad${shape}-lib" -DSHAPE=$shape -DCMP_GRAD -DLIBRARY
+  for stage in cs ps as ms; do
+    compile "${stage}_6_8" "${stage}Main" "cmpbias${shape}-${stage}" -DSHAPE=$shape -DCMP_BIAS
+  done
 done
 for bits in 16 32 64; do
   for shape in 2 3; do

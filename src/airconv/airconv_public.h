@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 35
+#define AIRCONV_VERSION 36
 
 #ifdef __cplusplus
 #include <string>
@@ -795,6 +795,7 @@ typedef struct SM50_SHADER_GS_TESSELLATION_INPUT_DATA {
 enum SM50_SHADER_METAL_VERSION {
   SM50_SHADER_METAL_310 = 310,
   SM50_SHADER_METAL_320 = 320,
+  SM50_SHADER_METAL_400 = 400,
   SM50_SHADER_METAL_410 = 410,
   SM50_SHADER_METAL_MAX = 0xffffffff,
 };

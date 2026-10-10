@@ -192,11 +192,18 @@ DXIL_TEXTURE_SHADERS = ("basic-texture-vs.dxil", "basic-texture-ps.dxil",
 ADVANCED_TEXTURE_SHADERS = (
     tuple(f"advanced-texture-cmp{shape}-{stage}.dxil"
           for shape in range(6) for stage in ("cs", "vs", "ps", "gs", "hs", "ds", "as", "ms", "lib"))
+    + tuple(f"advanced-texture-cmpgrad{shape}-{stage}.dxil"
+            for shape in range(6) for stage in ("cs", "vs", "ps", "gs", "hs", "ds", "as", "ms", "lib"))
+    + tuple(f"advanced-texture-cmpbias{shape}-{stage}.dxil"
+            for shape in range(6) for stage in ("cs", "ps", "as", "ms"))
     + tuple(f"advanced-texture-raw{bits}-{shape}.dxil" for bits in (16, 32, 64) for shape in (2, 3))
     + ("advanced-texture-null-vs.dxil", "advanced-texture-null-ps.dxil"))
 ADVANCED_TEXTURE_CASES = (
     tuple(f"cmp{shape}_{stage}_shape{shape}" for shape in range(6) for stage in ("cs", "vs", "ps"))
-    + tuple(f"raw{bits}_cs_shape{shape}" for bits in (16, 32, 64) for shape in (2, 3)))
+    + tuple(f"raw{bits}_cs_shape{shape}" for bits in (16, 32, 64) for shape in (2, 3))
+    + tuple(f"{kind}{shape}_{stage}_shape{shape}" for shape in range(6)
+            for kind, stages in (("cmpgrad", ("cs", "vs", "ps")), ("cmpbias", ("cs", "ps")))
+            for stage in stages))
 DEPTH_CASTING_CASES = ("d16_upload", "d16_clear", "d32_upload", "d32_clear",
                       "d16_msaa_draw", "d16_msaa_clear", "d32_msaa_draw", "d32_msaa_clear")
 DEPTH_BOUNDS_CASES = (
@@ -4737,8 +4744,8 @@ def run(args: argparse.Namespace) -> int:
         dxil_compiler_loaded = native_compiler_proof
         cases = re.findall(r"^OWNED_D3D12_ADVANCED_TEXTURE_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
         success = (success and dxil_compiler_loaded and tuple(cases) == ADVANCED_TEXTURE_CASES
-                   and len(re.findall(r"^OWNED_D3D12_ADVANCED_TEXTURE_CAPS relaxed_format_casting=1 advanced_texture_ops=1$", stdout, re.MULTILINE)) == 1
-                   and stdout.count("OWNED_D3D12_ADVANCED_TEXTURE_PASS cases=24") == 1
+                   and len(re.findall(r"^OWNED_D3D12_ADVANCED_TEXTURE_CAPS relaxed_format_casting=1 advanced_texture_ops=1 comparison_gradient_bias=1$", stdout, re.MULTILINE)) == 1
+                   and stdout.count("OWNED_D3D12_ADVANCED_TEXTURE_PASS cases=54") == 1
                    and "OWNED_D3D12_ADVANCED_TEXTURE_FAIL" not in stdout + stderr
                    and "OWNED_D3D12_DXIL_FAIL" not in stdout + stderr
                    and "kIOGPUCommandBufferCallbackError" not in stderr)

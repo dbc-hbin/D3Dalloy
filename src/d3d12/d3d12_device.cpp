@@ -683,7 +683,7 @@ public:
     case kFeatureD3D12Options21: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21)) return E_INVALIDARG;
       auto *out = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS21 *>(pFeatureData);
-      *out = {D3D12_WORK_GRAPHS_TIER_1_0, D3D12_EXECUTE_INDIRECT_TIER_1_0, FALSE, FALSE};
+      *out = {D3D12_WORK_GRAPHS_TIER_1_0, D3D12_EXECUTE_INDIRECT_TIER_1_0, TRUE, FALSE};
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS22: {

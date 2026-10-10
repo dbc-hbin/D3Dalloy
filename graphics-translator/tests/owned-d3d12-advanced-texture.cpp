@@ -15,13 +15,16 @@ void expect(UINT actual, UINT expected, const char *name, UINT row, UINT compone
     ExitProcess(1);
   }
 }
-void runAdvanced(ID3D12Device *device, UINT shape, UINT bits, const wchar_t *shaderPath, const char *stage) {
+void runAdvanced(ID3D12Device *device, UINT shape, UINT bits, const wchar_t *shaderPath, const char *stage,
+                 const char *operation = "cmp") {
   const bool raw = bits != 0, cube = shape >= 4;
   const bool array = shape == 1 || shape == 3 || shape == 5;
   Context context(device);
   D3D12_RESOURCE_DESC desc{};
   desc.Dimension = shape < 2 ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   desc.Width = 8; desc.Height = shape < 2 ? 1 : 8;
+  // Rectangular 2D views make an X/Y gradient operand swap change the mip.
+  if ((shape == 2 || shape == 3) && std::strcmp(operation, "cmp")) desc.Height = 16;
   desc.DepthOrArraySize = cube ? (array ? 18 : 6) : (array ? 3 : 1);
   desc.MipLevels = 4; desc.SampleDesc.Count = 1;
   desc.Format = !raw ? DXGI_FORMAT_R32_TYPELESS : bits == 16 ? DXGI_FORMAT_R16_UINT :
@@ -180,8 +183,21 @@ void runAdvanced(ID3D12Device *device, UINT shape, UINT bits, const wchar_t *sha
   context.submitAndWait(); check(device->GetDeviceRemovedReason(), "advanced device status");
   check(readback->Map(0, nullptr, &mapped), "advanced readback map");
   const auto *words = static_cast<const UINT *>(mapped);
-  char name[64]; std::snprintf(name, sizeof(name), raw ? "raw%u_%s" : "cmp%u_%s", raw ? bits : shape, stage);
-  if (!raw) {
+  char name[64];
+  if (raw) std::snprintf(name, sizeof(name), "raw%u_%s", bits, stage);
+  else std::snprintf(name, sizeof(name), "%s%u_%s", operation, shape, stage);
+  if (!raw && std::strcmp(operation, "cmp")) {
+    // Exact point comparison results: mip0 depth .25, mip1 depth .75.
+    // Intrinsic/resource/sampler clamps and bias must select the right mip;
+    // reference .875 must still fail at mip1, and null/empty SRVs return zero.
+    for (UINT i = 0; i < 22; ++i) {
+      const bool pass = i == 1 || i == 2 || i == 4 || i == 6 || i == 7 || i == 13 || i == 14 || i == 21 ||
+                        (!cube && i == 16) || (array && i == 17);
+      expect(words[i * 2], std::bit_cast<UINT>(pass ? 1.f : 0.f), name, i, 0);
+      expect(words[i * 2 + 1], 1, name, i, 1);
+    }
+    for (UINT i = 44; i < resultBytes / 4; ++i) expect(words[i], 0xcdcdcdcd, name, i / 2, i % 2);
+  } else if (!raw) {
     for (UINT i = 0; i < 22; ++i) {
       const bool pass = i == 1 || i == 2 || i == 7 || i == 12 || i == 14 || i == 16 ||
                         (array && (i == 17 || i == 18)) || (!cube && (i == 9 || i == 10 || i == 15));
@@ -221,10 +237,13 @@ int wmain() {
   D3D12_FEATURE_DATA_D3D12_OPTIONS14 options14{};
   check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12, sizeof(options12)), "advanced OPTIONS12");
   check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &options14, sizeof(options14)), "advanced OPTIONS14");
-  std::printf("OWNED_D3D12_ADVANCED_TEXTURE_CAPS relaxed_format_casting=%u advanced_texture_ops=%u\n",
-              unsigned(options12.RelaxedFormatCastingSupported), unsigned(options14.AdvancedTextureOpsSupported));
+  // OPTIONS21 ABI: WorkGraphsTier, ExecuteIndirectTier, Grad/Bias, ExtendedCommandInfo.
+  UINT options21[4]{};
+  check(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(53), options21, sizeof(options21)), "advanced OPTIONS21");
+  std::printf("OWNED_D3D12_ADVANCED_TEXTURE_CAPS relaxed_format_casting=%u advanced_texture_ops=%u comparison_gradient_bias=%u\n",
+              unsigned(options12.RelaxedFormatCastingSupported), unsigned(options14.AdvancedTextureOpsSupported), options21[2]);
   std::fflush(stdout);
-  if (!options12.RelaxedFormatCastingSupported || !options14.AdvancedTextureOpsSupported) return fail("advanced capabilities");
+  if (!options12.RelaxedFormatCastingSupported || !options14.AdvancedTextureOpsSupported || options21[2] != 1) return fail("advanced capabilities");
   wchar_t path[96];
   for (UINT shape = 0; shape < 6; ++shape) for (const char *stage : {"cs", "vs", "ps"}) {
     std::swprintf(path, 96, L"advanced-texture-cmp%u-%hs.dxil", shape, stage);
@@ -234,6 +253,16 @@ int wmain() {
     std::swprintf(path, 96, L"advanced-texture-raw%u-%u.dxil", bits, shape);
     runAdvanced(device.Get(), shape, bits, path, "cs");
   }
-  std::puts("OWNED_D3D12_ADVANCED_TEXTURE_PASS cases=24");
+  for (UINT shape = 0; shape < 6; ++shape) {
+    for (const char *stage : {"cs", "vs", "ps"}) {
+      std::swprintf(path, 96, L"advanced-texture-cmpgrad%u-%hs.dxil", shape, stage);
+      runAdvanced(device.Get(), shape, 0, path, stage, "cmpgrad");
+    }
+    for (const char *stage : {"cs", "ps"}) {
+      std::swprintf(path, 96, L"advanced-texture-cmpbias%u-%hs.dxil", shape, stage);
+      runAdvanced(device.Get(), shape, 0, path, stage, "cmpbias");
+    }
+  }
+  std::puts("OWNED_D3D12_ADVANCED_TEXTURE_PASS cases=54");
   return 0;
 }
