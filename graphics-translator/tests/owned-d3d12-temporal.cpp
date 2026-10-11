@@ -1437,9 +1437,7 @@ DWORD WINAPI runOppositeOrderCallerThread(LPVOID opaque) {
     check(context->queueB->Signal(context->completionB, 1),
           "opposite-order B.Signal(done,1)");
 
-    // Give both queue workers a chance to park on the same future CPU fence so
-    // the two opposite-order temporal submissions begin from the same gate.
-    Sleep(10);
+    // All queue waits and submissions are now recorded before releasing their shared gate.
     check(context->start->Signal(1), "opposite-order CPU start Signal(1)");
     return 0;
 }

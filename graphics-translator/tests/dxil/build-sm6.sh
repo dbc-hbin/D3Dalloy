@@ -1,13 +1,14 @@
 #!/bin/sh
 # Rebuilds the frozen SM 6.x DXIL fixtures from sm6*.hlsl with DXC 1.9 under Wine.
 # usage: build-sm6.sh <wine> <dxc.exe> <WINEPREFIX> <out-dir>
-set -u
+set -eu
 wine=$1 dxc=$2 prefix=$3 out=$4
 here=$(cd "$(dirname "$0")" && pwd)
 compile() {
   file=$1 profile=$2 entry=$3; shift 3
   WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T "$profile" -E "$entry" "$@" \
     "$here/$file" -Fo "$out/sm6-$entry.dxil" >/dev/null
+  test -s "$out/sm6-$entry.dxil"
 }
 compile sm6.hlsl cs_6_5 cs_wave
 compile sm6.hlsl cs_6_5 cs_divergent
@@ -71,5 +72,7 @@ compile sm6-denorm.hlsl cs_6_2 cs_denorm_ftz -denorm ftz
 compile sm6-denorm.hlsl cs_6_2 cs_denorm_preserve -denorm preserve
 WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T lib_6_8 \
   "$here/atomic64-workgraph-records.hlsl" -Fo "$out/atomic64-workgraph-records.dxil"
+test -s "$out/atomic64-workgraph-records.dxil"
 WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T lib_6_8 \
   "$here/atomic64-workgraph-typed.hlsl" -Fo "$out/atomic64-workgraph-typed.dxil"
+test -s "$out/atomic64-workgraph-typed.dxil"
