@@ -15,11 +15,11 @@
 | 동일 장면 게임 FPS·frame time | 사용자 요청으로 후속 검증 보류 | Steam 래퍼와 `-use-d3d12`로 실제 D3D12를 확인하고 동일 설정·장면·drawable·계측 조건을 맞춘 비교. 이전 DX11 실행과 불연속 HUD 수치는 제외 |
 | Commit 시점 Present 예약 | 미이식, completion 기반 표시 유지 | 이미 예약한 표시의 취소 또는 epoch 조건부 표시와 GPU 오류 시 억제를 보존하는 native 계약. D3DMetal의 더 약한 RESTART 처리를 그대로 이식하지 않음 |
 | Native SR 112×112 | Framework-only Conv3x3 BBR invalid store 재현 | 같은 입력의 독립 native 검증이 먼저 통과해야 한다. 128×128·96×112 controls는 clean이며, 출력 크기를 임의로 올린 뒤 crop하거나 validation을 끄지 않음 |
-| RR 초기 cold-cache 경계 | 비동기 초기화와 기존 public fence 연결, 최종 ON/OFF 각 51개 whole-buffer exact | 전역 compiler cache와 최초 생성 readiness를 통제한 관찰, 다른 OS/GPU 및 실제 게임 검증. 과거 timeout을 동기 설정이나 fence 하나의 원인으로 단정하지 않음 |
+| RR 초기 cold-cache 경계 | 추가 ResponsivityMask 검사에서 비동기 초기화 timeout을 재현했고 최종 모델 동기 초기화 후32 frames 통과 | 생성 시 CPU 대기는 늘 수 있다. 전역 compiler cache·다른 OS/GPU·실게임 cold-start는 별도이며 모든 과거 timeout의 원인을 하나로 단정하지 않음 |
 
 ## 선정 리뷰 항목 처리 결과
 
-현재 FG 작업은 원본 MIT AMD SDK pin `0836aa7f24058b3f8d035a88c0774457d78fc98e`의 source-built swapchain/pacing/UI와 기존 WMTMetal4FG native MetalFX generation을 연결하는 번역이다. x64/WoW64를 유지하고 AMD phase-DXIL N1–4 알고리즘은 제거했다. Generated output 최대1개: FSR2–4는 NO_PROVIDER, NGX count/index>1 및 non-null OutputDisableInterpolation은 UnsupportedParameter다. Public MetalFX에는 actual-count/status API가 없고 pristine GPTK도 disable key를 무시한다. SDK generated-role bootstrap/reset output은 current-color일 수 있으며 native warm-up·실제 표시는 별도 관찰한다. Closed-list replay는 native 작업을 다시 encode한다. Ordinary ResizeBuffers는 유지하고 ResizeBuffers1 원본 success stub은 E_NOTIMPL로 바꿨다. Custom per-buffer queue나 새 async Present 오류 protocol은 없으며 NGX Present/pacing은 caller 소유다. Root27/28/30/34의 AMD 알고리즘 proof는 역사적으로 보존하되 현재 native FG proof로 세지 않는다. Native residency·Composition 독립 증거는 유지한다. `build/local/fsr-metalfx-20261007-43df9ae7`의 x64/x86 build는 통과했고 양 ABI FSR·NGX GPU·NGX Present 6개 실행이 API+Shader Validation으로 통과했다. 실제 표시 수·warm-up 경계는 CORE의 현재 FG 검증을 따른다.
+현재 FG 작업은 원본 MIT AMD SDK pin `0836aa7f24058b3f8d035a88c0774457d78fc98e`의 source-built swapchain/pacing/UI와 기존 WMTMetal4FG native MetalFX generation을 연결하는 번역이다. x64/WoW64를 유지하고 AMD phase-DXIL N1–4 알고리즘은 제거했다. Generated output 최대1개: FSR2–4는 NO_PROVIDER, NGX count/index>1은 UnsupportedParameter다. OutputDisableInterpolation은 GPU가 history/reset/replay provider hint를 기록한다. Public MetalFX에는 actual-count/status API가 없고 pristine GPTK도 disable key를 무시한다. SDK generated-role bootstrap/reset output은 current-color일 수 있으며 native warm-up·실제 표시는 별도 관찰한다. Closed-list replay는 native 작업을 다시 encode한다. Ordinary ResizeBuffers는 유지하고 ResizeBuffers1 원본 success stub은 E_NOTIMPL로 바꿨다. Custom per-buffer queue나 새 async Present 오류 protocol은 없으며 NGX Present/pacing은 caller 소유다. Root27/28/30/34의 AMD 알고리즘 proof는 역사적으로 보존하되 현재 native FG proof로 세지 않는다. Native residency·Composition 독립 증거는 유지한다. `build/local/fsr-metalfx-20261007-43df9ae7`의 x64/x86 build는 통과했고 양 ABI FSR·NGX GPU·NGX Present 6개 실행이 API+Shader Validation으로 통과했다. 실제 표시 수·warm-up 경계는 CORE의 현재 FG 검증을 따른다.
 
 | 순서 | 항목 | 현재 판정·실제 검증 |
 | --- | --- | --- |
@@ -34,7 +34,7 @@
 
 ## 추가 FG 계약 구현 — 2026-10-10
 
-NGX FG의 독립 Depth/MVecs/Backbuffer subrect, OutputReal, FP16/FP32 BidirectionalDistortionField는 [구현과 공개/native 검증](CORE-IMPLEMENTATION-STATUS.ko.md#ngx-fg-subrectoutputrealdistortion--2026-10-10)을 마쳤다. 지정 ARM64X/FEX x64 proof이며, 새 계약의 WoW64·실게임 렌즈 왜곡 품질·LowPrecision 변환·독립 InputBackbuffer/HUDLess/OutputInterpolated origin은 별도 미검증/미지원 경계다. 기존 단일 generated output 제한과 truthful status 정책은 유지한다.
+NGX FG의 독립 Depth/MVecs/color origin, OutputReal, FP16/FP32 및 LowPrecision BidirectionalDistortionField, UI/UIAlpha 재합성은 [구현과 집중 공개 GPU 검증](CORE-IMPLEMENTATION-STATUS.ko.md#ngx-fg-subrectoutputrealdistortion--2026-10-10)을 마쳤다. [VS-only no-raster SO adjacency 4종](CORE-IMPLEMENTATION-STATUS.ko.md#vs-only-so-adjacency--2026-10-10)도 구현했다. 지정 ARM64X/FEX x64 proof이며 WoW64·다른 OS/GPU·실게임 화질/FPS는 별도다. 후속 orthographic·camera-motion 재구성과 GPU disable hint도 [집중 검증](CORE-IMPLEMENTATION-STATUS.ko.md#sm66fl12_2와-대형-계약-확장--2026-10-10)을 통과했다. 임의 시점 MFG N>1은 미구현이다.
 
 ## 남은 공통 게임 기능
 
@@ -42,21 +42,21 @@ SampleCmpGrad/Bias는 dynamic cube gradient 수정과 54-case 공개 검증 후 
 
 | 항목 | 이미 있는 구현/증거 | 남은 조건 |
 | --- | --- | --- |
-| Composition absolute alpha/colour | 공용 Presenter, geometry·matrix·attachment·resize/lifetime·cadence, 양 ABI104 backing captures | Qualified Windows/reference transfer·association·FP16 quantization/clipping·profile oracle. Backing 결과와 물리 scanout은 별도 |
-| NGX Ray Reconstruction | Native validation blocker 해소. 비공개 version0x10000으로 Apple non-fused GPU 경로 선택; 독립 native50 frame·양 ABI 각각36출력 RGB 오차0·API/Shader Validation 오류0·입력 동등성 PASS | 다른 OS/GPU에서 private 선택자의 계약, 실제 게임 loader·화질/성능 검증. 자체 RR 알고리즘 추가가 아닌 native 위임을 유지한다. [현재 증거](CORE-IMPLEMENTATION-STATUS.ko.md#rr-native-validation-재검증--2026-10-07) |
+| Composition absolute alpha/colour | Premultiplied FP16·G10/P709·PQ/P2020·G22/P2020 구현, 공개 HDR 계약과 paired drawable32개 수치·기존 Presenter11 frames PASS | 현재 ARM64 Wine DComp stub·target attachment 실패로 최종 compositor/scanout 미검증. Qualified Windows/reference/profile 비교는 별도 |
+| NGX Ray Reconstruction | 기존 non-fused native 위임에 ResponsivityMask와 독립 origin 연결. 4 variants×8 frames·243,392 RGB 성분 반응·atlas/tight exact·release/replay PASS | 나머지 ray-direction/DoF/transparency/alpha 등의 guide는 정확한 native consumer가 없어 거부. NVIDIA 모델 동등성·다른 OS/GPU·실게임은 별도 |
 | HDR10+ GAMING | 일반 HDR10/scRGB/PQ·EDR, generic transport 조사, Samsung APP/GPU·calibration 근거 | Supported Gaming payload/SSTM·native mode/readback·owner/restore·calibrated GPU tone-map·실제 적합 출력. Mandatory sink ACK를 임의로 요구하지 않음 |
 
 이 항목은 게임 관련 기능의 미완료로 유지한다. ALLM/SBTM/HDR10+ video·DX11 SR·validation suppression·내부 상태 echo로 대체하지 않는다. 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)과 [현재 리뷰의 native 계약](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#outstanding-externalnative-contracts)을 따른다.
 
-10월10일 재확인에서 native FP16 drawable 자체는 사용 가능하지만 premultiplied FP16의 기본 G10 색공간과 SDR residual 경로의 정합 oracle는 확보하지 못했다. 형식 제한만 해제하지 않는다. 설치된 macOS27 `CAEDRMetadata` 공개 API는 HDR10/HLG이며 검증된 Gaming SSTM 출력 제어 경로는 없다. Pristine GPTK4.0b2의 Composition factory는 E_NOTIMPL, SetHDRMetaData는 무처리 S_OK여서 이를 구현으로 이식할 수 없다. 이번에 sink EDID/VSVDB·물리 출력을 새로 측정한 것은 아니며, 플랫폼 전체의 불가능성으로 확대하지 않는다.
+10월10일 후속 구현은 source transfer를 선형화하고 association·signed residual을 보존하며 paired RGBA16Float planes를 사용한다. 공개 생성과 실제 GPU 출력 oracle는 통과했지만 현재 Wine에서 최종 화면 부착은 실패했다. 설치된 macOS27 `CAEDRMetadata` 공개 API는 HDR10/HLG이며 검증된 Gaming SSTM 출력 제어 경로는 없다. Pristine GPTK4.0b2의 Composition factory는 E_NOTIMPL, SetHDRMetaData는 무처리 S_OK여서 이를 구현으로 이식할 수 없다. 이번에 sink EDID/VSVDB·물리 출력을 새로 측정한 것은 아니며, 플랫폼 전체의 불가능성으로 확대하지 않는다.
 
 ## 게임/장치 요구가 확인될 때 확장할 항목
 
 | 항목 | 착수 조건 |
 | --- | --- |
 | Genuine CoreWindow | HWND/Composition fallback으로 충족되지 않는 실제 game UI/identity 호출 |
-| 필수 Wave64/128 | 실제 shader의 fixed width 또는32를 허용하지 않는 range |
-| 상위 공개 SM/feature level | 현재 SM6.5/FL12_1 admission을 거부하는 게임과 해당 mandatory 계약 검증 |
+| 일반 Wave64/128 | 단일 block compute는 구현했다. Divergent CFG·graphics/RT/WG와 FP64/vector wide collectives는 남아 있으며 실제 shader 요구를 기준으로 확장 |
+| 상위 공개 SM/feature level | 현재 SM6.6·조건부 FL12_2를 넘어서는 게임 요구와 해당 mandatory 계약. 기존 cap을 거부하던 public admission 자체는 구현·집중 검증 완료 |
 | 상위 Agility package | 실제 EXE/configuration이 owned617/618 외 정확한 package를 요구 |
 | Stereo / hardware plane | 일반 presentation/alpha fallback이 불충분한 실제 game/display 요구 |
 | Linked node / multi-adapter | 실제 복수 GPU와 resource identity·queue/fence·node 실행 요구 |
@@ -65,7 +65,7 @@ Mask1은 node0 선택이지 multi-GPU 사용 증거가 아니다. Capability que
 
 ## 이미 완료한 기반과 증거 한계
 
-선정 P0, P1 #5–9/#11, P2 depth bounds/conservative Tier3와 P3 #15–24는 CORE의 항목별 proof로 완료됐다. P1 #10의 총 GPU memory usage query는 사용자 제외 상태이지 구현 완료가 아니다. Atomic64·FP64·matrix·writable MSAA·wave4–32·Tiled4를 API 이름만 보고 다시 TODO로 넣지 않는다. Public SM6.5/FL12_1과 개별 higher/preview bytecode 지원은 별개다.
+선정 P0, P1 #5–9/#11, P2 depth bounds/conservative Tier3와 P3 #15–24는 CORE의 항목별 proof로 완료됐다. P1 #10의 총 GPU memory usage query는 사용자 제외 상태이지 구현 완료가 아니다. Atomic64·FP64·matrix·writable MSAA·wave4–32·Tiled4를 API 이름만 보고 다시 TODO로 넣지 않는다. Public SM6.6/조건부 FL12_2과 개별 higher/preview bytecode 지원은 별개다.
 
 PipelineLibrary/CachedPSO/자동 RAM·disk cache/application ShaderCacheSession, COPY timestamps, programmable offsets, unaligned BC, CalculateLOD, budget notification, retained arena 성장, 선정 SR/alpha/FG/Reflex는 구현된 기반이다. 새로운 수명·ABI·정확성 결함은 이 완료 기록과 별도로 수정한다.
 
