@@ -264,6 +264,8 @@ SM6_ENTRIES = (
     "cs_int64wave4", "cs_int64wave8", "cs_int64wave16",
     "cs_wave_range4", "cs_wave_range8", "cs_wave_range16", "cs_wave_range32", "cs_wave_range64",
     "cs_wave_range16max", "cs_wave_sm68fixed4", "cs_wavesize128", "cs_wavesize_range64only",
+    "cs_wavesize64_partial", "cs_wavesize128_partial",
+    "cs_wavesize64_divergent", "cs_wavesize128_divergent", "cs_wavesize64_return",
     "cs_wave", "cs_divergent", "cs_int64", "cs_atomic64", "cs_atomic64_ops", "cs_atomic64_heap", "cs_minprec",
     "cs_quad_deriv", "cs_lod", "cs_lod_shapes", "vs_main", "ps_main", "ps_helper", "ps_helper_all", "vs_tiny",
     "vs_int64", "ps_int64", "vs_wave", "ps_null", "cs_16bit", "cs_packed", "vs_16bit", "ps_16bit", "cs_wavesize32", "cs_wavesize64",
@@ -277,13 +279,14 @@ SM6_CASES = (
     "int64", "int64wave4", "int64wave8", "int64wave16",
     "atomic64_ops", "atomic64_heap", "16bit", "minprec", "packed", "quad_deriv",
     "calculate_lod", "calculate_lod_shapes",
+    "cs_wavesize64", "cs_wavesize128", "cs_wavesize_range64only", "cs_wavesize64_partial", "cs_wavesize128_partial",
     "rejections", "groupshared64", "sm69_input", "wavesize32", "barycentrics", "barycentrics_indexed", "helper_lanes", "helper_lanes_included",
     "16bit_io", "graphics_int64", "vs_wave", "sv_viewid", "sv_viewid_instanced",
     "denorm_any", "denorm_ftz", "denorm_preserve",
 ) + FP64_CASES + (
     "cs_atomic64_stress_1", "cs_atomic64_stress_16",
 )
-SM6_REJECTS = ["cs_wavesize64", "cs_wavesize128", "cs_wavesize_range64only"]
+SM6_REJECTS = ["cs_wavesize64_divergent", "cs_wavesize128_divergent", "cs_wavesize64_return"]
 SM6_STRESS_REPS = 20
 WAVE_ENTRIES = tuple(entry for entry in SM6_ENTRIES
                      if entry.startswith(("cs_wave", "cs_divergent", "cs_int64"))
@@ -2694,7 +2697,7 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
             failures.append("NGX requires every ordered native output and retained-resource replay")
         for frame, reset, replay, different, frame_id, not_rendering in rows:
             frame = int(frame)
-            if (int(reset) != int(frame in (0, 5)) or int(frame_id) != (7 if frame == 8 else frame)
+            if (int(reset) != int(frame in (0, 5)) or int(frame_id) != (frame if frame < 7 else 9)
                     or int(not_rendering) != int(frame == 6)
                     or (replay == "0" and frame in (3, 4) and different != "1")):
                 failures.append("NGX native history/reset or genuine output proof mismatch")
@@ -2702,9 +2705,22 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
         rejected = [line for line in lines if line.startswith("OWNED_D3D12_NGX_REJECT ")]
         expected_rejections = [f"OWNED_D3D12_NGX_REJECT case={kind} {kind}={value} result=unsupported_parameter"
                                for kind in ("count", "index") for value in (2, 3, 4)]
-        expected_rejections.append("OWNED_D3D12_NGX_REJECT case=disable_buffer result=unsupported_parameter output_untouched=1 before_valid_dispatch=1 zero_count_index=invalid_parameter")
+        expected_rejections.append("OWNED_D3D12_NGX_REJECT case=disable_buffer result=invalid_parameter texture=1 non_uav=1 too_small=1 cross_device=1 output_untouched=1 zero_count_index=invalid_parameter")
+        expected_rejections.extend(f"OWNED_D3D12_NGX_REJECT case=camera_matrix ortho={ortho} missing=missing_input nan=invalid_parameter infinity=invalid_parameter singular=invalid_parameter output_untouched=1" for ortho in (0, 1))
+        expected_rejections.append("OWNED_D3D12_NGX_REJECT case=ortho_camera missing_matrix=missing_input missing_basis=missing_input nan=invalid_parameter infinity=invalid_parameter singular=invalid_parameter outputs_untouched=1")
         if rejected != expected_rejections:
             failures.append("NGX native capability rejection or untouched-output evidence incomplete")
+        hints = re.findall(r"^OWNED_D3D12_NGX_DISABLE_HINT frame=(\d+) replay=([01]) value=([01]) before_execute_untouched=1 after_fence=1 tail_untouched=1 history_hint=1$", stdout, re.MULTILINE)
+        if ([(int(f), int(r), int(v)) for f, r, v in hints] !=
+                [(f, r, int(f == 0 or f >= 5 or r != 0)) for f, r in expected]
+                or sum(line.startswith("OWNED_D3D12_NGX_DISABLE_HINT") for line in lines) != len(expected)):
+            failures.append("NGX GPU publication hint/reset/replay evidence incomplete")
+        cameras = re.findall(r"^OWNED_D3D12_NGX_CAMERA_MOTION ortho=([01]) frame=(\d+) max_delta=(\d+) different_zero=([01]) row_major=1 translated_last_row=1 matrix_snapshotted=1$", stdout, re.MULTILINE)
+        if ([(int(o), int(f)) for o, f, _, _ in cameras] != [(o, f) for o in (0, 1) for f in range(6)]
+                or sum(line.startswith("OWNED_D3D12_NGX_CAMERA_MOTION") for line in lines) != 12
+                or any(int(delta) > 1 for _, _, delta, _ in cameras)
+                or any(not any(int(effect) for o, _, _, effect in cameras if int(o) == ortho) for ortho in (0, 1))):
+            failures.append("NGX perspective/orthographic camera reconstruction oracle incomplete")
         if [line for line in lines if line.startswith("OWNED_D3D12_NGX_SCENE")] != [
                 "OWNED_D3D12_NGX_SCENE frames=14 reset=1 output_written=1 actual_count=unavailable consumer=gpu_readback"]:
             failures.append("NGX native explicit scene-reset output evidence incomplete")
@@ -2746,7 +2762,9 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
     elif suite == "ngx-fg":
         expected = [
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 non_sr_other=0",
-            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=unsupported reset=native_history release_before_execute=1 replay=native_encode",
+            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=gpu_history_hint reset=native_history release_before_execute=1 replay=native_encode",
+            *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_camera_motion ortho={o} frames=6 independent_features=3 equivalent_motion=1 nonzero_effect=1 release_before_execute=1" for o in (0, 1)],
+            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_ui premultiplied=1 alpha_only=1 independent_ui_origin=1 invalid_inputs=1 release_before_execute=1 replay=1",
         ]
         if ([line for line in lines if line.startswith("OWNED_D3D12_NGX_FEATURE_CASE_PASS")] != expected
                 or sum(line.startswith(prefix + "_PASS") for line in lines) != 1
@@ -2755,10 +2773,16 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
             failures.append("NGX focused FG requires its public capabilities, indexed-output case and exact summary")
         return failures
     elif suite == "ngx-features":
+        responsivity = re.findall(r"^OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr_responsivity changed_rgb=([1-9]\d*) origins=1 invalid_resource_subrect=1 release_before_execute=1 replay=1$", stdout, re.MULTILINE)
+        if len(responsivity) != 1:
+            failures.append("NGX RR history-responsivity numeric effect missing")
         expected = [
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 non_sr_other=0",
-            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=unsupported reset=native_history release_before_execute=1 replay=native_encode",
-            *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant={v} frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8" for v in range(4)],
+            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=gpu_history_hint reset=native_history release_before_execute=1 replay=native_encode",
+            *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_camera_motion ortho={o} frames=6 independent_features=3 equivalent_motion=1 nonzero_effect=1 release_before_execute=1" for o in (0, 1)],
+            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_ui premultiplied=1 alpha_only=1 independent_ui_origin=1 invalid_inputs=1 release_before_execute=1 replay=1",
+            *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant={v} frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8" for v in range(8)],
+            *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr_responsivity changed_rgb={value} origins=1 invalid_resource_subrect=1 release_before_execute=1 replay=1" for value in responsivity],
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_alpha flag128=1 nonopaque_contrast=1 rgb_preserved=1",
         ]
         if [line for line in lines if line.startswith("OWNED_D3D12_NGX_FEATURE_CASE_PASS")] != expected or lines.count("OWNED_D3D12_NGX_FEATURES_PASS") != 1:
@@ -3876,7 +3900,7 @@ def run(args: argparse.Namespace) -> int:
         cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
         rejects = re.findall(r"^OWNED_D3D12_WAVES_REJECT entry=(\w+) hr=0x80004005$", stdout, re.MULTILINE)
         success = (success and dxil_compiler_loaded and tuple(cases) == WAVE_CASES
-                   and rejects == ["cs_wavesize64", "cs_wavesize128", "cs_wavesize_range64only"]
+                   and rejects == SM6_REJECTS
                    and re.search(r"^OWNED_D3D12_SM6_CAPS .* wave=1 lanes=4-32 ", stdout, re.MULTILINE)
                    and stdout.count("OWNED_D3D12_WAVES_PASS") == 1
                    and "OWNED_D3D12_SM6_MISMATCH" not in stdout
@@ -3908,7 +3932,7 @@ def run(args: argparse.Namespace) -> int:
                    and [name for name, *_ in stress] == ["cs_atomic64_stress_1", "cs_atomic64_stress_16"]
                    and all(reps == exact == str(SM6_STRESS_REPS) for _, _, reps, exact in stress)
                    and rejects == SM6_REJECTS and not gpu_hang
-                   and re.search(r"^OWNED_D3D12_SM6_CAPS shader_model=0x65/0x0 double=1 minprec=2 wave=1 "
+                   and re.search(r"^OWNED_D3D12_SM6_CAPS shader_model=0x66/0x0 double=1 minprec=2 wave=1 "
                                  r"lanes=4-32 total_lanes=\d+ int64=1 barycentrics=1 view_instancing=1 "
                                  r"native16=1 atomic64_typed=1 atomic64_groupshared=1 atomic64_heap=1 "
                                  r"wave_mma=10$", stdout, re.MULTILINE)
@@ -4269,9 +4293,9 @@ def run(args: argparse.Namespace) -> int:
                               r"written=([\d,]+) needed=([\d,]+) filled=([\d,]+)$", stdout, re.MULTILINE)
         success = success and found_gs == [(name, shader, *rest) for shader in ("dxbc", "dxil")
                                            for name, *rest in gs_streams]
-        success = (success and stdout.count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=112") == 1
-                   and stdout.count("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=43") == 1
-                   and stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS ") == 45
+        success = (success and stdout.count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=122") == 1
+                   and stdout.count("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=53") == 1
+                   and stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS ") == 55
                    and stdout.count("OWNED_D3D12_STREAM_OUTPUT_NO_RASTER_DISTANCE_PASS cases=2") == 1
                    and "OWNED_D3D12_STREAM_OUTPUT_PASS validation=1 capture=1" in stdout
                    and "OWNED_D3D12_STREAM_OUTPUT_FAIL" not in stdout + stderr

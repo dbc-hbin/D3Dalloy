@@ -844,7 +844,6 @@ def prepare_real_wine(runtime: Path, with_nvngx: bool = False, with_nvapi: bool 
     launcher.write_text(render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=wow64_frontends, with_wow64=with_wow64, with_dcomp=with_dcomp))
     launcher.chmod(0o755)
 
-
 def artifact_records(
     runtime: Path, with_nvngx: bool = False, with_nvapi: bool = False, extra: tuple[Path, ...] = (), arch: dict | None = None, *, with_fsr: bool = False
 ) -> dict[str, dict]:

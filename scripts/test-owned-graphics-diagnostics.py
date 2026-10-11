@@ -2362,15 +2362,23 @@ class GameSuiteEvidence(unittest.TestCase):
         self.alpha = "".join(f"OWNED_D3D12_SR_ALPHA_CASE_PASS frame={f} replay={r} scalar_oracle_max_half_ulp=2 subrect=1 dynamic={int(f == 3)} retired={int(f == 5)}\n" for f in range(6) for r in range(2 if f == 5 else 1)) + "OWNED_D3D12_SR_ALPHA_PASS frames=6 replay_after_release=1 independent_scalar_oracle=1 history_delta=42\n"
         self.debug = "".join(f"OWNED_D3D12_FSR_DEBUG_CASE_PASS extent={e} replay={r} panel_max_byte_error=1 sentinel=1 retired={int(e == 96)}\n" for e in (128, 96) for r in (0, 1)) + "OWNED_D3D12_FSR_DEBUG_PASS public_dispatch=1 depth_gradient=1 signed_motion=1 color=1 dynamic=1 retirement_replay=1\n"
         self.ngx = ("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 non_sr_other=0\n"
-                    "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=unsupported reset=native_history release_before_execute=1 replay=native_encode\n")
-        native = "".join(f"OWNED_D3D12_NGX_NATIVE frame={frame} reset={int(frame in (0, 5))} replay={replay} output_written=1 different_current={int(frame in (3, 4) and not replay)} resources_released=1 consumer=gpu_readback frame_id={7 if frame == 8 else frame} not_rendering={int(frame == 6)}\n"
+                    "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=gpu_history_hint reset=native_history release_before_execute=1 replay=native_encode\n"
+                    "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_camera_motion ortho=0 frames=6 independent_features=3 equivalent_motion=1 nonzero_effect=1 release_before_execute=1\n"
+                    "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_camera_motion ortho=1 frames=6 independent_features=3 equivalent_motion=1 nonzero_effect=1 release_before_execute=1\n"
+                    "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_ui premultiplied=1 alpha_only=1 independent_ui_origin=1 invalid_inputs=1 release_before_execute=1 replay=1\n")
+        native = "".join(f"OWNED_D3D12_NGX_NATIVE frame={frame} reset={int(frame in (0, 5))} replay={replay} output_written=1 different_current={int(frame in (3, 4) and not replay)} resources_released=1 consumer=gpu_readback frame_id={frame if frame < 7 else 9} not_rendering={int(frame == 6)}\n"
                          for frame in range(9) for replay in range(2 if frame in (0, 7, 8) else 1))
         rejections = "".join(f"OWNED_D3D12_NGX_REJECT case={kind} {kind}={value} result=unsupported_parameter\n"
                              for kind in ("count", "index") for value in (2, 3, 4))
-        rejections += "OWNED_D3D12_NGX_REJECT case=disable_buffer result=unsupported_parameter output_untouched=1 before_valid_dispatch=1 zero_count_index=invalid_parameter\n"
+        rejections += "OWNED_D3D12_NGX_REJECT case=disable_buffer result=invalid_parameter texture=1 non_uav=1 too_small=1 cross_device=1 output_untouched=1 zero_count_index=invalid_parameter\n"
+        rejections += "".join(f"OWNED_D3D12_NGX_REJECT case=camera_matrix ortho={o} missing=missing_input nan=invalid_parameter infinity=invalid_parameter singular=invalid_parameter output_untouched=1\n" for o in (0, 1))
+        rejections += "OWNED_D3D12_NGX_REJECT case=ortho_camera missing_matrix=missing_input missing_basis=missing_input nan=invalid_parameter infinity=invalid_parameter singular=invalid_parameter outputs_untouched=1\n"
+        native += "".join(f"OWNED_D3D12_NGX_DISABLE_HINT frame={f} replay={r} value={int(f == 0 or f >= 5 or r != 0)} before_execute_untouched=1 after_fence=1 tail_untouched=1 history_hint=1\n" for f in range(9) for r in range(2 if f in (0, 7, 8) else 1))
+        native += "".join(f"OWNED_D3D12_NGX_CAMERA_MOTION ortho={o} frame={f} max_delta=1 different_zero={int(f > 0)} row_major=1 translated_last_row=1 matrix_snapshotted=1\n" for o in (0, 1) for f in range(6))
         scene = "OWNED_D3D12_NGX_SCENE frames=14 reset=1 output_written=1 actual_count=unavailable consumer=gpu_readback\n"
         self.ngx_fg = self.ngx + rejections + native + scene + "OWNED_D3D12_NGX_FG_PASS capacity=1 native_output=1 unsupported_mfg=1\n"
-        self.ngx += "".join(f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant={v} frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8\n" for v in range(4))
+        self.ngx += "".join(f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant={v} frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8\n" for v in range(8))
+        self.ngx += "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr_responsivity changed_rgb=42 origins=1 invalid_resource_subrect=1 release_before_execute=1 replay=1\n"
         self.ngx += "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_alpha flag128=1 nonopaque_contrast=1 rgb_preserved=1\n"
         self.ngx += rejections + native + scene + "OWNED_D3D12_NGX_FEATURES_PASS\n"
         self.ngx_alpha = ("OWNED_D3D12_NGX_ALPHA_PIXELS replay=0 left=112,96,80,48 right=112,96,80,192 rgb_max_error=0 release_before_execute=1\n"

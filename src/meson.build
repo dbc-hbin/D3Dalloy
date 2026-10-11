@@ -6,6 +6,7 @@ winemetal_unix_sources = files(
   'winemetal/unix/winemetal_metal4_fx.mm',
   'winemetal/unix/metalfx-backend.mm',
   'winemetal/unix/metalfx_frame_generation.mm',
+
   'winemetal/unix/winemetal_rt.c',
   'winemetal/unix/rt_acceleration_structure.c',
   'winemetal/unix/cache.c',
