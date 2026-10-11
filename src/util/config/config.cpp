@@ -15,6 +15,7 @@
 #include <regex>
 #include <utility>
 #include <cmath>
+#include <limits>
 
 #include "config.hpp"
 
@@ -222,27 +223,33 @@ namespace dxmt {
       return false;
 
     // Parse sign, don't allow '+'
-    int32_t sign = 1;
+    const bool negative = value[0] == '-';
     size_t start = 0;
 
-    if (value[0] == '-') {
-      sign = -1;
+    if (negative) {
       start = 1;
+      if (start == value.size())
+        return false;
     }
 
-    // Parse absolute number
-    int32_t intval = 0;
+    const uint64_t limit = negative
+      ? uint64_t(std::numeric_limits<int32_t>::max()) + 1
+      : uint64_t(std::numeric_limits<int32_t>::max());
+    uint64_t intval = 0;
 
     for (size_t i = start; i < value.size(); i++) {
       if (value[i] < '0' || value[i] > '9')
         return false;
 
-      intval *= 10;
-      intval += value[i] - '0';
+      const uint64_t digit = value[i] - '0';
+      if (intval > (limit - digit) / 10)
+        return false;
+      intval = intval * 10 + digit;
     }
 
-    // Apply sign and return
-    result = sign * intval;
+    result = negative
+      ? (intval == limit ? std::numeric_limits<int32_t>::min() : -int32_t(intval))
+      : int32_t(intval);
     return true;
   }
 

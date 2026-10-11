@@ -337,16 +337,18 @@ public:
     if (pNumModes == nullptr)
       return DXGI_ERROR_INVALID_CALL;
 
+    const UINT capacity = *pNumModes;
     std::vector<DXGI_MODE_DESC1> modes;
 
     if (pDesc)
-      modes.resize(std::max(1u, *pNumModes));
+      modes.resize(std::max(1u, capacity));
 
-    HRESULT hr = GetDisplayModeList1(EnumFormat, Flags, pNumModes,
+    UINT modeCount = capacity;
+    HRESULT hr = GetDisplayModeList1(EnumFormat, Flags, &modeCount,
                                      pDesc ? modes.data() : nullptr);
 
     if (pDesc) {
-      for (uint32_t i = 0; i < *pNumModes && i < modes.size(); i++) {
+      for (uint32_t i = 0; i < modeCount && i < capacity && i < modes.size(); i++) {
         pDesc[i].Width = modes[i].Width;
         pDesc[i].Height = modes[i].Height;
         pDesc[i].RefreshRate = modes[i].RefreshRate;
@@ -356,6 +358,7 @@ public:
       }
     }
 
+    *pNumModes = modeCount;
     return hr;
   }
 
