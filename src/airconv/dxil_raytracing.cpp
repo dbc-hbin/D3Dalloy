@@ -95,12 +95,76 @@
 #include "dxbc_converter.hpp"
 #include "dxil_converter.hpp"
 #include "dxil_rt_callbacks.hpp"
+#include "dxil_rt_payload.hpp"
 #include "dxil_signature.hpp"
 #include "metallib_writer.hpp"
 
 using namespace llvm;
 
 namespace dxmt::dxil {
+
+llvm::Error ValidateRayPayloadAnnotations(Module &module) {
+  auto *annotations = module.getNamedMetadata("dx.dxrPayloadAnnotations");
+  if (!annotations)
+    return Error::success();
+  for (MDNode *node : annotations->operands()) {
+    auto *tag = node->getNumOperands() ? mdconst::dyn_extract<ConstantInt>(node->getOperand(0)) : nullptr;
+    if (!tag || !tag->isZero() || node->getNumOperands() % 2 != 1)
+      return createError("dxil: unsupported DXR payload annotation record");
+    for (unsigned i = 1; i < node->getNumOperands(); i += 2) {
+      auto *value = dyn_cast_or_null<ValueAsMetadata>(node->getOperand(i));
+      auto *type = value ? dyn_cast<StructType>(value->getValue()->getType()) : nullptr;
+      auto *fields = dyn_cast_or_null<MDNode>(node->getOperand(i + 1));
+      if (!type || !type->isSized() || !fields || fields->getNumOperands() != type->getNumElements())
+        return createError("dxil: malformed DXR payload field annotations");
+      for (const MDOperand &operand : fields->operands()) {
+        auto *field = dyn_cast_or_null<MDNode>(operand);
+        if (!field || field->getNumOperands() != 2)
+          return createError("dxil: unsupported DXR payload field annotation");
+        auto *field_tag = mdconst::dyn_extract<ConstantInt>(field->getOperand(0));
+        auto *mask = mdconst::dyn_extract<ConstantInt>(field->getOperand(1));
+        if (!field_tag || !field_tag->isZero() || !mask || (mask->getZExtValue() & ~0x3333ull))
+          return createError("dxil: unsupported DXR payload access qualifier");
+      }
+    }
+  }
+  return Error::success();
+}
+
+MDNode *RayPayloadAnnotation(Module &module, Type *type) {
+  auto *annotations = module.getNamedMetadata("dx.dxrPayloadAnnotations");
+  if (annotations)
+    for (MDNode *node : annotations->operands())
+      for (unsigned i = 1; i < node->getNumOperands(); i += 2)
+        if (cast<ValueAsMetadata>(node->getOperand(i))->getValue()->getType() == type)
+          return cast<MDNode>(node->getOperand(i + 1));
+  return nullptr;
+}
+
+void CopyQualifiedRayPayload(
+  IRBuilder<> &builder, Value *destination, Value *source, StructType *type, MDNode *fields,
+  unsigned access_bit
+) {
+  const DataLayout &layout = builder.GetInsertBlock()->getModule()->getDataLayout();
+  const StructLayout *structure = layout.getStructLayout(type);
+  auto bytes = [&](Value *pointer) {
+    unsigned space = cast<PointerType>(pointer->getType())->getAddressSpace();
+    return builder.CreateBitCast(pointer, builder.getInt8PtrTy(space));
+  };
+  Value *dest = bytes(destination), *src = bytes(source);
+  for (unsigned i = 0; i < fields->getNumOperands(); ++i) {
+    auto *field = cast<MDNode>(fields->getOperand(i));
+    const uint64_t mask = mdconst::extract<ConstantInt>(field->getOperand(1))->getZExtValue();
+    if (!(mask & access_bit))
+      continue;
+    Value *offset = builder.getInt64(structure->getElementOffset(i));
+    builder.CreateMemCpy(
+      builder.CreateGEP(builder.getInt8Ty(), dest, offset), Align(1),
+      builder.CreateGEP(builder.getInt8Ty(), src, offset), Align(1),
+      layout.getTypeStoreSize(type->getElementType(i))
+    );
+  }
+}
 
 namespace {
 
@@ -841,6 +905,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
 
   auto &module_ir = *module.module;
   auto &llvm_context = *module.context;
+  if (auto error = ValidateRayPayloadAnnotations(module_ir))
+    return std::move(error);
 
   /* DXIL containers carry the dxil-ms-dx 32 bit pointer layout; AIR needs air64
    * and the air.* module flags. */
@@ -1324,6 +1390,12 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
    * them can be pointed at this invocation's storage; the entry function itself keeps no
    * body after the transplant, so the now-unused parameters are dropped with it. */
   SmallVector<Argument *, 2> dxil_parameters;
+  Value *working_payload = nullptr;
+  StructType *qualified_type = nullptr;
+  MDNode *qualified_fields = nullptr;
+  unsigned stage_access = stage == SM50_RT_STAGE_CLOSEST_HIT ? 4 :
+                          stage == SM50_RT_STAGE_MISS ? 8 :
+                          stage == SM50_RT_STAGE_ANY_HIT ? 12 : 0;
   for (Argument &argument : module.entry->args())
     dxil_parameters.push_back(&argument);
   for (Argument *argument : dxil_parameters) {
@@ -1363,6 +1435,20 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
     Value *field = builder.CreateGEP(
       Type::getInt8Ty(llvm_context), head, builder.getInt32(offset)
     );
+    if (!is_attribute && stage_access) {
+      Type *type = cast<PointerType>(argument->getType())->getNonOpaquePointerElementType();
+      qualified_fields = RayPayloadAnnotation(module_ir, type);
+      if (qualified_fields) {
+        qualified_type = cast<StructType>(type);
+        if (module_ir.getDataLayout().getTypeAllocSize(type) > context.payload_size)
+          return createError("dxil: qualified payload exceeds configured payload size");
+        // PAQ restricts inter-shader transfer, not accesses to this invocation's
+        // working copy. Never expose transport storage to the shader body.
+        working_payload = builder.CreateAlloca(type, nullptr, "rt.payload.working");
+        CopyQualifiedRayPayload(builder, working_payload, field, qualified_type, qualified_fields, 1u << stage_access);
+        field = working_payload;
+      }
+    }
     /* A DXIL pointer is address space 0 while the block a visible function was handed
      * is a ray-data pointer, so the cast between the two spaces is an addrspacecast. */
     const unsigned field_space = cast<PointerType>(field->getType())->getAddressSpace();
@@ -1403,6 +1489,22 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
    * handed this function.
    */
   IRBuilder<> epilogue(epilogue_bb);
+  if (working_payload) {
+    CopyQualifiedRayPayload(epilogue, payload, working_payload, qualified_type, qualified_fields, 2u << stage_access);
+    // Any-hit control intrinsics terminate before the normal epilogue. Commit
+    // permitted writes at those exits as well, including IgnoreHit.
+    if (stage == SM50_RT_STAGE_ANY_HIT)
+      for (BasicBlock &bb : *function)
+        for (Instruction &instruction : bb)
+          if (auto *call = dyn_cast<CallInst>(&instruction))
+            if (Function *callee = call->getCalledFunction(); callee && callee->getName().startswith("dx.op."))
+              if (call->arg_size())
+                if (auto *opcode = dyn_cast<ConstantInt>(call->getArgOperand(0));
+                    opcode && (opcode->getZExtValue() == 155 || opcode->getZExtValue() == 156)) {
+                  IRBuilder<> exit(call);
+                  CopyQualifiedRayPayload(exit, payload, working_payload, qualified_type, qualified_fields, 2u << stage_access);
+                }
+  }
   if (hardware_intersection) {
     /* `block` is the head the prologue already computed in the entry block, which
      * dominates this one. */

@@ -142,6 +142,7 @@
  */
 #include "dxil_rt_callbacks.hpp"
 #include "dxil_rt_omm.hpp"
+#include "dxil_rt_payload.hpp"
 
 #include "nt/air_builder.hpp"
 
@@ -768,9 +769,9 @@ private:
    * own. Returns the child's payload area as the address the shaders see, or null
    * when the operand cannot be copied from.
    */
-  Value *copyPayloadInto(IRBuilder<> &builder, Value *child_block, Value *payload_operand);
+  Value *copyPayloadInto(IRBuilder<> &builder, Value *child_block, Value *payload_operand, bool qualified = true);
   /** Copy a child block's payload area back to the object a trace named. */
-  void copyPayloadBack(IRBuilder<> &builder, Value *child_block, Value *payload_operand);
+  void copyPayloadBack(IRBuilder<> &builder, Value *child_block, Value *payload_operand, bool qualified = true);
 
   Error lowerTraceRay(CallInst &call, IRBuilder<> &builder, bool deferred = false);
   Value *allocateHitObject(IRBuilder<> &builder);
@@ -1354,24 +1355,32 @@ Value *RaytracingLowerer::candidatePointerOf(IRBuilder<> &builder, Value *block)
  * complete child block, including the frame before that area.
  */
 Value *RaytracingLowerer::copyPayloadInto(
-  IRBuilder<> &builder, Value *child_block, Value *payload_operand
+  IRBuilder<> &builder, Value *child_block, Value *payload_operand, bool qualified
 ) {
   Value *child_payload = payloadPointerOf(builder, child_block);
   if (!payload_operand || layout.payload_size == 0)
     return child_payload;
-  emitMemcpy(module, builder, child_payload, payload_operand, layout.payload_size);
+  Type *type = cast<PointerType>(payload_operand->getType())->getNonOpaquePointerElementType();
+  MDNode *fields = qualified ? RayPayloadAnnotation(module, type) : nullptr;
+  if (fields)
+    CopyQualifiedRayPayload(builder, child_payload, payload_operand, cast<StructType>(type), fields, 2);
+  else
+    emitMemcpy(module, builder, child_payload, payload_operand, layout.payload_size);
   return child_payload;
 }
 
 /** Copy a child block's payload area back to the object the trace named. */
 void RaytracingLowerer::copyPayloadBack(
-  IRBuilder<> &builder, Value *child_block, Value *payload_operand
+  IRBuilder<> &builder, Value *child_block, Value *payload_operand, bool qualified
 ) {
   if (!payload_operand || layout.payload_size == 0)
     return;
-  emitMemcpy(
-    module, builder, payload_operand, payloadPointerOf(builder, child_block), layout.payload_size
-  );
+  Type *type = cast<PointerType>(payload_operand->getType())->getNonOpaquePointerElementType();
+  MDNode *fields = qualified ? RayPayloadAnnotation(module, type) : nullptr;
+  if (fields)
+    CopyQualifiedRayPayload(builder, payload_operand, payloadPointerOf(builder, child_block), cast<StructType>(type), fields, 1);
+  else
+    emitMemcpy(module, builder, payload_operand, payloadPointerOf(builder, child_block), layout.payload_size);
 }
 
 /**
@@ -2389,7 +2398,7 @@ Error RaytracingLowerer::lowerCallShader(CallInst &call, IRBuilder<> &builder) {
    * per-call-site block a trace uses - whose payload is copied in and back out.
    */
   Value *child = allocateInvocationBlock(builder, "rt.callable");
-  copyPayloadInto(builder, child, call.getArgOperand(2));
+  copyPayloadInto(builder, child, call.getArgOperand(2), false);
   Value *callable_index = call.getArgOperand(1);
   RtShaderRecord callable;
   if (!shaderRecord(builder, RtShaderTable::Callable, callable_index, callable))
@@ -2419,7 +2428,7 @@ Error RaytracingLowerer::lowerCallShader(CallInst &call, IRBuilder<> &builder) {
       callVisibleFunction(inner, child, record, depth);
     }
   );
-  copyPayloadBack(builder, child, call.getArgOperand(2));
+  copyPayloadBack(builder, child, call.getArgOperand(2), false);
   call.eraseFromParent();
   return Error::success();
 }

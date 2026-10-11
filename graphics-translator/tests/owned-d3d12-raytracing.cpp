@@ -1472,6 +1472,7 @@ int testRaytracing(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8
 #include "owned-d3d12-raytracing-rayquery-stages.inc"
 #include "owned-d3d12-raytracing-linkage.inc"
 #include "owned-d3d12-raytracing-hitobject.inc"
+#include "owned-d3d12-raytracing-paq.inc"
 
 namespace {
 
@@ -1723,6 +1724,10 @@ int run(int argc, wchar_t **argv) {
   if (argc == 4 && std::wcscmp(argv[1], L"--atomic64") == 0) {
     contract::Runner geometry(device5.Get(), context, readFile(argv[2]));
     return hitobject::runAtomic(device5.Get(), context, readFile(argv[3]), geometry);
+  }
+  if (argc == 4 && std::wcscmp(argv[1], L"--paq") == 0) {
+    contract::Runner geometry(device5.Get(), context, readFile(argv[2]));
+    return paq::run(device5.Get(), context, readFile(argv[3]), geometry);
   }
 
   const auto dxil = readFile(argv[1]);
