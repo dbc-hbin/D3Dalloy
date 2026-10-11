@@ -909,8 +909,8 @@ llvm::Error extractMetadata(
     return createError("DXIL entry point does not reference a function");
   out.entry_name = entry ? getString(entry, 1) : (requested_entry ? requested_entry : "");
   readThreadGroupSize(getNode(entry, 4), out.num_threads);
-  /* Smaller waves partition an Apple SIMD32. Never accept a requirement for a
-   * cross-SIMD wave: a hidden threadgroup barrier is invalid under divergence. */
+  /* Small waves partition SIMD32. Wide waves require an unconditional compute
+   * entry proof before the lowering may introduce any threadgroup barrier. */
   {
     llvm::MDNode *properties = getNode(entry, 4);
     uint32_t wave_size = 32;
@@ -947,10 +947,8 @@ llvm::Error extractMetadata(
         if (!maximum)
           maximum = minimum;
       }
-      if (minimum > 32)
-        return createError("DXIL WaveSize requirement is unsupported: supported widths are 4, 8, 16 and 32; "
-                           "64/128 require cross-SIMD execution");
-      wave_size = preferred && preferred <= 32 ? preferred : std::min(maximum, 32u);
+      wave_size = minimum > 32 ? (preferred ? preferred : minimum)
+                              : preferred && preferred <= 32 ? preferred : std::min(maximum, 32u);
     }
     /* PSVRuntimeInfo0: 16-byte stage union, followed by expected min/max.
      * DXC may constrain widths even without an entry WaveSize property. */
@@ -962,12 +960,53 @@ llvm::Error extractMetadata(
       if (minimum > maximum)
         return createError("DXIL PSV0 expected wave range is invalid");
       if (!declared) {
-        for (wave_size = 32; wave_size >= 4 && wave_size > maximum; wave_size >>= 1) {}
+        if (minimum > 32)
+          wave_size = minimum <= 64 && maximum >= 64 ? 64 : 128;
+        else
+          for (wave_size = 32; wave_size >= 4 && wave_size > maximum; wave_size >>= 1) {}
       }
       if (wave_size < 4 || wave_size < minimum || wave_size > maximum)
         return createError("DXIL selected wave width does not satisfy PSV0 expected wave range");
     } else {
       llvm::consumeError(psv.takeError()); /* Raw bitcode/library inputs need not have PSV0. */
+    }
+    if (wave_size > 32) {
+      // ponytail: single-block compute only; a uniformity analysis is required to admit CFGs.
+      if (out.stage != Stage::Compute || !out.entry || out.entry->size() != 1 ||
+          !llvm::isa<llvm::ReturnInst>(out.entry->front().getTerminator()))
+        return createError("DXIL wide WaveSize requires proven unconditional compute control flow");
+      const uint64_t threads = uint64_t(out.num_threads[0]) * out.num_threads[1] * out.num_threads[2];
+      if (!threads || threads > 1024)
+        return createError("DXIL wide WaveSize requires 1..1024 threads per group");
+      for (auto &instruction : out.entry->front()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee || !callee->isDeclaration() ||
+            (!callee->getName().startswith("dx.op.") && !callee->isIntrinsic()))
+          return createError("DXIL wide WaveSize cannot prove called function uniformity");
+        if (!callee->getName().startswith("dx.op.")) {
+          if (!callee->getName().startswith("llvm.dbg.") &&
+              !callee->getName().startswith("llvm.lifetime.") && callee->getName() != "llvm.assume")
+            return createError("DXIL wide WaveSize intrinsic is outside the unconditional compute subset");
+          continue;
+        }
+        auto *op = call->arg_empty() ? nullptr : llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0));
+        const uint64_t opcode = op ? op->getZExtValue() : UINT64_MAX;
+        if (!(opcode <= 80 || (opcode >= 93 && opcode <= 96) || (opcode >= 110 && opcode <= 121) ||
+              opcode == 135 || opcode == 136 || opcode == 139 || opcode == 140 ||
+              (opcode >= 165 && opcode <= 167) ||
+              opcode == 216 || opcode == 217))
+          return createError("DXIL wide WaveSize operation is outside the unconditional compute subset");
+        if ((opcode >= 113 && opcode <= 121) || (opcode >= 165 && opcode <= 167)) {
+          auto *type = call->arg_size() > 1 ? call->getArgOperand(1)->getType() : nullptr;
+          if (!type || !(type->isIntegerTy() || type->isFloatTy() || type->isHalfTy()) ||
+              (type->isIntegerTy() && type->getIntegerBitWidth() > 64))
+            return createError("DXIL wide WaveSize requires scalar integer/half/float collectives");
+        }
+      }
+      module.addModuleFlag(llvm::Module::Error, "dxmt.wide-wave-threads", uint32_t(threads));
     }
     if (declared || wave_size != 32)
       module.addModuleFlag(llvm::Module::Error, "dxmt.wave-size", wave_size);

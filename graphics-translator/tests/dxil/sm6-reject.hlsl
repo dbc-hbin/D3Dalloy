@@ -4,15 +4,55 @@
 RWByteAddressBuffer Out : register(u0);
 RWByteAddressBuffer Raw : register(u1);
 
-// Virtual waves 4/8/16 and native32 are supported; cross-SIMD64/128 must reject.
+// Native32 remains the public maximum; unconditional compute may request wider waves.
 [WaveSize(32)] [numthreads(32, 1, 1)]
 void cs_wavesize32(uint gi : SV_GroupIndex) { Out.Store(gi * 4, WaveGetLaneCount()); }
-[WaveSize(64)] [numthreads(64, 1, 1)]
-void cs_wavesize64(uint gi : SV_GroupIndex) { Out.Store(gi * 4, WaveGetLaneCount()); }
-[WaveSize(128)] [numthreads(128, 1, 1)]
-void cs_wavesize128(uint gi : SV_GroupIndex) { Out.Store(gi * 4, WaveGetLaneCount()); }
+// Wide waves are admitted only when DXIL has one unconditional compute block.
+void wide_values(uint gi) {
+  uint lane = WaveGetLaneIndex();
+  uint width = WaveGetLaneCount();
+  uint live = WaveActiveCountBits(true);
+  uint value = gi + 1;
+  uint4 ballot = WaveActiveBallot((lane & 1) == 0);
+  uint4 match = WaveMatch(lane & 3);
+  uint b = gi * 128;
+  Out.Store4(b, uint4(width, lane, live, WaveIsFirstLane()));
+  Out.Store4(b + 16, ballot);
+  Out.Store4(b + 32, uint4(WaveReadLaneAt(value, (lane + 33) % live), WaveReadLaneFirst(value),
+                          WaveActiveSum(value), WavePrefixSum(value)));
+  Out.Store4(b + 48, uint4(WaveActiveMin(value), WaveActiveMax(value),
+                          WaveActiveCountBits((lane & 1) == 0), WavePrefixCountBits((lane & 1) == 0)));
+  Out.Store4(b + 64, match);
+  Out.Store4(b + 80, uint4(WaveMultiPrefixSum(value, match), WaveMultiPrefixCountBits(true, match),
+                          WaveActiveAnyTrue(lane == 33), WaveActiveAllTrue(lane < live)));
+  Out.Store4(b + 96, uint4(WaveActiveAllEqual(value), WaveActiveAllEqual(width),
+                          WaveActiveBitOr(1u << (lane & 31)), WaveActiveBitXor(value)));
+  Out.Store(b + 112, asuint(WaveActiveSum((float)value)));
+}
+[WaveSize(64)] [numthreads(128, 1, 1)]
+void cs_wavesize64(uint gi : SV_GroupIndex) { wide_values(gi); }
+[WaveSize(128)] [numthreads(256, 1, 1)]
+void cs_wavesize128(uint gi : SV_GroupIndex) { wide_values(gi); }
 [WaveSize(64, 128)] [numthreads(128, 1, 1)]
-void cs_wavesize_range64only(uint gi : SV_GroupIndex) { Out.Store(gi * 4, WaveGetLaneCount()); }
+void cs_wavesize_range64only(uint gi : SV_GroupIndex) { wide_values(gi); }
+[WaveSize(64)] [numthreads(160, 1, 1)]
+void cs_wavesize64_partial(uint gi : SV_GroupIndex) { wide_values(gi); }
+[WaveSize(128)] [numthreads(288, 1, 1)]
+void cs_wavesize128_partial(uint gi : SV_GroupIndex) { wide_values(gi); }
+[WaveSize(64)] [numthreads(64, 1, 1)]
+void cs_wavesize64_divergent(uint gi : SV_GroupIndex) {
+  if ((gi & 1) != 0) Out.Store(gi * 4, WaveActiveSum(gi));
+}
+[WaveSize(128)] [numthreads(128, 1, 1)]
+void cs_wavesize128_divergent(uint gi : SV_GroupIndex) {
+  if ((gi & 1) != 0) Out.Store(gi * 4, WaveActiveSum(gi));
+}
+[WaveSize(64)] [numthreads(64, 1, 1)]
+void cs_wavesize64_return(uint gi : SV_GroupIndex) {
+  if (gi == 0) return;
+  Out.Store(gi * 4, WaveActiveSum(gi));
+}
+
 
 
 // Positive groupshared64 input: maintained here alongside other historical rejection fixtures.

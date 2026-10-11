@@ -204,6 +204,9 @@ CreateConfiguredDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel
     return hr;
   }
 
+  if (MinimumFeatureLevel > OwnedFeatureLevel(dxgi_adapter_mtl->GetMTLDevice()))
+    return DXGI_ERROR_UNSUPPORTED;
+
   if (!ppDevice)
     return S_FALSE;
 

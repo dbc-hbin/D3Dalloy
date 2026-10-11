@@ -50,6 +50,11 @@ compile sm6-reject.hlsl cs_6_6 cs_wavesize32
 compile sm6-reject.hlsl cs_6_6 cs_wavesize64
 compile sm6-reject.hlsl cs_6_6 cs_wavesize128
 compile sm6-reject.hlsl cs_6_8 cs_wavesize_range64only
+compile sm6-reject.hlsl cs_6_6 cs_wavesize64_partial
+compile sm6-reject.hlsl cs_6_6 cs_wavesize128_partial
+compile sm6-reject.hlsl cs_6_6 cs_wavesize64_divergent
+compile sm6-reject.hlsl cs_6_6 cs_wavesize128_divergent
+compile sm6-reject.hlsl cs_6_6 cs_wavesize64_return
 compile fp64.hlsl cs_6_6 cs_fp64 -Gis -denorm preserve
 compile fp64.hlsl cs_6_6 cs_fp64_ftz -Gis -denorm ftz
 compile fp64.hlsl cs_6_6 cs_fp64_wave -Gis -denorm preserve

@@ -150,13 +150,22 @@ struct BarrierTracker {
 // multisampled RTVs) plus 12_0's Tiled Tier 2, Resource Binding Tier 2+ and the typed UAV load format set are
 // GPU-verified by the feature-level, tiled and bindless suites. FL 12_1 additionally has ROVs and
 // ConservativeRasterizationTier 1, verified across all shader families by the conservative-raster suite.
-inline constexpr D3D_FEATURE_LEVEL kOwnedMaxFeatureLevel = D3D_FEATURE_LEVEL_12_1;
+inline constexpr D3D_FEATURE_LEVEL kOwnedMaxFeatureLevel = D3D_FEATURE_LEVEL_12_2;
+
+// FL 12_2 requires Tiled Tier 3, depth bounds and unaligned BC textures in addition
+// to the owned DXR 1.1+, VRS 2, mesh 1, feedback 0.9+, binding 3 and conservative 3 paths.
+// Use the same adapter gate for creation (including null-output probes) and queries.
+inline D3D_FEATURE_LEVEL OwnedFeatureLevel(WMT::Device metal) {
+  if (!metal.supportsPlacementSparse())
+    return D3D_FEATURE_LEVEL_11_1;
+  return metal.supportsFamily(WMTGPUFamilyApple7) && metal.supportsBCTextureCompression()
+      ? kOwnedMaxFeatureLevel : D3D_FEATURE_LEVEL_12_1;
+}
 /* Highest DXIL shader model the owned compiler accepts (SM50_MAX_DXIL_SHADER_MODEL). */
 inline constexpr D3D_SHADER_MODEL kOwnedMaxShaderModel = static_cast<D3D_SHADER_MODEL>(SM50_MAX_DXIL_SHADER_MODEL);
-/* The advertised baseline remains SM 6.5. Newer optional features have independent
- * capability reports and compile up to kOwnedMaxShaderModel; their focused GPU evidence
- * does not establish every mandatory contract of a newer shader model. */
-inline constexpr D3D_SHADER_MODEL kOwnedReportedShaderModel = D3D_SHADER_MODEL_6_5;
+/* SM 6.6 includes stage-qualified DXR payload transfer and selectable waves 4..32.
+ * Restricted wider compute lowering does not expand the public wave-size range. */
+inline constexpr D3D_SHADER_MODEL kOwnedReportedShaderModel = D3D_SHADER_MODEL_6_6;
 
 class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandListPreview {
 public:

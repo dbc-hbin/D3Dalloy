@@ -393,6 +393,14 @@ llvm::Expected<std::unique_ptr<ModuleInfo>> LowerShader(
   if (auto error = LowerMatrices(**info))
     return std::move(error);
   InitializeAtomic64Phase(*(*info)->module, args);
+  if ((*info)->module->getModuleFlag("dxmt.wide-wave-threads")) {
+    // Force the stage pass to bind the physical linear group index, even when
+    // the source only uses WaveGetLaneIndex or dispatch coordinates.
+    llvm::IRBuilder<> builder(&*(*info)->entry->getEntryBlock().getFirstInsertionPt());
+    auto index = (*info)->module->getOrInsertFunction("dx.op.flattenedThreadIdInGroup.i32",
+      llvm::FunctionType::get(builder.getInt32Ty(), {builder.getInt32Ty()}, false));
+    builder.CreateCall(index, {builder.getInt32(96)});
+  }
 
   // Stage construction mutates signatures and register bookkeeping. A cached
   // shader may be compiled concurrently for different PSOs; keep those fields

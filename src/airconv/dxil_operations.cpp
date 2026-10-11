@@ -339,6 +339,10 @@ private:
   /** The DXIL entry carries `waveops-include-helper-lanes` (SM 6.7). */
   bool waves_include_helpers = false;
   unsigned wave_lanes = kNativeWaveLanes;
+  unsigned wide_threads = 0;
+  Value *wide_group_index = nullptr;
+  GlobalVariable *wide_scratch = nullptr;
+  Expected<Value *> lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &builder, air::AIRBuilder &air);
   /** Compute, mesh and object functions form derivatives with explicit quad shuffles. */
   bool quad_derivative_stage = false;
   /** The AIR entry is a vertex function, where the lane-index and simdgroup-size intrinsics
@@ -538,8 +542,30 @@ OperationLowerer::run() {
     if (!constant || !constant->getType()->isIntegerTy(32))
       return createError("DXIL selected wave width is not an i32 constant");
     wave_lanes = constant->getZExtValue();
-    if (wave_lanes < 4 || wave_lanes > kNativeWaveLanes || (wave_lanes & (wave_lanes - 1)))
-      return createError("DXIL selected wave width is outside the supported 4/8/16/32 set");
+    if (wave_lanes < 4 || wave_lanes > 128 || (wave_lanes & (wave_lanes - 1)))
+      return createError("DXIL selected wave width is outside the supported set");
+  }
+  if (wave_lanes > kNativeWaveLanes) {
+    auto *threads = mdconst::dyn_extract_or_null<ConstantInt>(module.getModuleFlag("dxmt.wide-wave-threads"));
+    auto *kernels = module.getNamedMetadata("air.kernel");
+    if (!threads || !kernels || kernels->getNumOperands() != 1)
+      return createError("DXIL wide wave lowering requires the unconditional compute admission proof");
+    wide_threads = threads->getZExtValue();
+    auto *entry = kernels->getOperand(0);
+    auto *function = cast<Function>(cast<ValueAsMetadata>(entry->getOperand(0))->getValue());
+    auto *inputs = cast<MDNode>(entry->getOperand(2));
+    for (unsigned i = 0; i < inputs->getNumOperands(); ++i) {
+      auto *input = cast<MDNode>(inputs->getOperand(i));
+      auto *kind = dyn_cast<MDString>(input->getOperand(1));
+      if (kind && kind->getString() == "air.thread_index_in_threadgroup")
+        wide_group_index = function->getArg(i);
+    }
+    if (!wide_group_index || !wide_threads || wide_threads > 1024)
+      return createError("DXIL wide wave lowering is missing its group index or thread count");
+    auto *array = ArrayType::get(Type::getInt64Ty(module.getContext()), wide_threads);
+    wide_scratch = new GlobalVariable(module, array, false, GlobalValue::InternalLinkage,
+      UndefValue::get(array), "dxmt.wide-wave-scratch", nullptr, GlobalValue::NotThreadLocal, 3);
+    wide_scratch->setAlignment(Align(8));
   }
   if (auto *fragments = module.getNamedMetadata("air.fragment"))
     pixel_stage = fragments->getNumOperands() != 0;
@@ -1763,7 +1789,140 @@ waveNativeName(WaveReduce kind, bool prefix) {
 } // namespace
 
 Expected<Value *>
+OperationLowerer::lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &b, air::AIRBuilder &air) {
+  Value *lane = b.CreateAnd(wide_group_index, b.getInt32(wave_lanes - 1));
+  Value *base = b.CreateAnd(wide_group_index, b.getInt32(~(wave_lanes - 1)));
+  Value *remaining = b.CreateSub(b.getInt32(wide_threads), base);
+  Value *active = b.CreateSelect(b.CreateICmpULT(remaining, b.getInt32(wave_lanes)), remaining, b.getInt32(wave_lanes));
+  if (opcode == OpWaveGetLaneCount || opcode == OpWaveGetLaneIndex || opcode == OpWaveIsFirstLane) {
+    if (auto error = expectArgs(call, 0, "dx.op wide wave lane query"))
+      return std::move(error);
+    if (opcode == OpWaveIsFirstLane) {
+      if (!call.getType()->isIntegerTy(1)) return createError("DXIL wide first-lane result must be i1");
+      return b.CreateICmpEQ(lane, b.getInt32(0));
+    }
+    if (!call.getType()->isIntegerTy(32)) return createError("DXIL wide lane query result must be i32");
+    return opcode == OpWaveGetLaneCount ? b.getInt32(wave_lanes) : lane;
+  }
+  const unsigned args = opcode == OpWaveReadLaneAt || opcode == OpWaveActiveBit ? 2
+      : opcode == OpWaveActiveOp || opcode == OpWavePrefixOp ? 3
+      : opcode == OpWaveMultiPrefixOp ? 7 : opcode == OpWaveMultiPrefixBitCount ? 5 : 1;
+  if (auto error = expectArgs(call, args, "dx.op wide collective")) return std::move(error);
+  Value *value = call.getArgOperand(1);
+  Type *type = value->getType();
+  if (!(type->isIntegerTy() || type->isFloatTy() || type->isHalfTy()) ||
+      (type->isIntegerTy() && type->getIntegerBitWidth() > 64) || call.getMetadata("dxmt.fp64"))
+    return createError("DXIL wide collective supports scalar integers, half and float only");
+  const bool vote = opcode == OpWaveAnyTrue || opcode == OpWaveAllTrue || opcode == OpWaveActiveBallot ||
+      opcode == OpWaveAllBitCount || opcode == OpWavePrefixBitCount || opcode == OpWaveMultiPrefixBitCount;
+  const bool mask_result = opcode == OpWaveActiveBallot || opcode == OpWaveMatch;
+  const bool bool_result = opcode == OpWaveAnyTrue || opcode == OpWaveAllTrue || opcode == OpWaveActiveAllEqual;
+  const bool count_result = opcode == OpWaveAllBitCount || opcode == OpWavePrefixBitCount || opcode == OpWaveMultiPrefixBitCount;
+  if (vote && !type->isIntegerTy(1)) return createError("DXIL wide vote operand must be i1");
+  if (mask_result) {
+    if (auto error = expectAggregateResult(call, 4, b.getInt32Ty(), "dx.op wide mask")) return std::move(error);
+  } else if (call.getType() != (bool_result ? b.getInt1Ty() : count_result ? b.getInt32Ty() : type)) {
+    return createError("DXIL wide collective result type is invalid");
+  }
+  auto kind_at = [&](unsigned operand) -> Expected<unsigned> {
+    auto *kind = dyn_cast<ConstantInt>(call.getArgOperand(operand));
+    if (!kind) return createError("DXIL wide reduction kind must be constant");
+    return unsigned(kind->getZExtValue());
+  };
+  WaveReduce kind = WaveReduce::Sum;
+  bool is_signed = false;
+  const bool reduction = opcode == OpWaveActiveOp || opcode == OpWavePrefixOp || opcode == OpWaveActiveBit || opcode == OpWaveMultiPrefixOp;
+  const bool prefix = opcode == OpWavePrefixOp || opcode == OpWaveMultiPrefixOp || opcode == OpWavePrefixBitCount || opcode == OpWaveMultiPrefixBitCount;
+  const bool multi = opcode == OpWaveMultiPrefixOp || opcode == OpWaveMultiPrefixBitCount;
+  if (reduction) {
+    auto operation = kind_at(opcode == OpWaveMultiPrefixOp ? 6 : 2);
+    if (!operation) return operation.takeError();
+    if (opcode == OpWaveActiveBit) {
+      if (*operation > 2 || !type->isIntegerTy()) return createError("DXIL wide bitwise reduction is invalid");
+      constexpr WaveReduce kinds[] = {WaveReduce::And, WaveReduce::Or, WaveReduce::Xor};
+      kind = kinds[*operation];
+    } else {
+      auto sign = kind_at(opcode == OpWaveMultiPrefixOp ? 7 : 3);
+      if (!sign) return sign.takeError();
+      if (*sign > 1) return createError("DXIL wide reduction signedness is invalid");
+      is_signed = *sign == 0;
+      if (opcode == OpWaveMultiPrefixOp) {
+        if (*operation > 4) return createError("DXIL wide multi-prefix kind is invalid");
+        constexpr WaveReduce kinds[] = {WaveReduce::Sum, WaveReduce::And, WaveReduce::Or, WaveReduce::Xor, WaveReduce::Product};
+        kind = kinds[*operation];
+      } else {
+        if (*operation > (opcode == OpWavePrefixOp ? 1u : 3u)) return createError("DXIL wide reduction kind is invalid");
+        constexpr WaveReduce kinds[] = {WaveReduce::Sum, WaveReduce::Product, WaveReduce::Min, WaveReduce::Max};
+        kind = kinds[*operation];
+      }
+    }
+    if ((kind == WaveReduce::And || kind == WaveReduce::Or || kind == WaveReduce::Xor) && !type->isIntegerTy())
+      return createError("DXIL wide bitwise reduction requires integers");
+  }
+  if (multi)
+    for (unsigned i = 2; i <= 5; ++i)
+      if (!call.getArgOperand(i)->getType()->isIntegerTy(32)) return createError("DXIL wide prefix mask words must be i32");
+  if (opcode == OpWaveReadLaneAt && !call.getArgOperand(2)->getType()->isIntegerTy(32))
+    return createError("DXIL wide lane read index must be i32");
+
+  // One snapshot per group, not per physical SIMD. Both barriers are unconditional:
+  // admission ran on the original DXIL before any stage/resource lowering.
+  Type *bits_type = type->isFloatingPointTy() ? b.getIntNTy(type->getPrimitiveSizeInBits()) : type;
+  Value *bits = type->isFloatingPointTy() ? b.CreateBitCast(value, bits_type) : value;
+  auto pointer = [&](Value *index) { return b.CreateInBoundsGEP(wide_scratch->getValueType(), wide_scratch, {b.getInt32(0), index}); };
+  b.CreateStore(b.CreateZExtOrTrunc(bits, b.getInt64Ty()), pointer(wide_group_index))->setVolatile(true);
+  air.CreateBarrier(air::MemFlags::Threadgroup, false);
+  auto read = [&](Value *index) -> Value * {
+    // Inactive source lanes never address outside the original numthreads array.
+    Value *safe = b.CreateSelect(b.CreateICmpULT(index, active), index, b.getInt32(0));
+    auto *load = b.CreateLoad(b.getInt64Ty(), pointer(b.CreateAdd(base, safe)));
+    load->setVolatile(true);
+    Value *other = b.CreateTruncOrBitCast(load, bits_type);
+    return type->isFloatingPointTy() ? b.CreateBitCast(other, type) : other;
+  };
+  Value *result = nullptr;
+  if (opcode == OpWaveReadLaneAt || opcode == OpWaveReadLaneFirst) {
+    result = read(opcode == OpWaveReadLaneAt ? call.getArgOperand(2) : b.getInt32(0));
+  } else {
+    Value *acc = reduction ? waveIdentity(b, kind, type, is_signed)
+        : bool_result ? (opcode == OpWaveAnyTrue ? b.getFalse() : b.getTrue()) : b.getInt32(0);
+    SmallVector<Value *, 4> words(4, b.getInt32(0));
+    Value *first = opcode == OpWaveActiveAllEqual ? read(b.getInt32(0)) : nullptr;
+    for (unsigned source = 0; source < wave_lanes; ++source) {
+      Value *other = read(b.getInt32(source));
+      Value *take = b.CreateICmpULT(b.getInt32(source), active);
+      if (prefix) take = b.CreateAnd(take, b.CreateICmpULT(b.getInt32(source), lane));
+      if (multi) take = b.CreateAnd(take, b.CreateICmpNE(b.CreateAnd(call.getArgOperand(2 + source / 32), b.getInt32(1u << (source % 32))), b.getInt32(0)));
+      if (reduction) {
+        acc = b.CreateSelect(take, waveCombine(b, air, kind, acc, other, is_signed), acc);
+      } else if (opcode == OpWaveActiveAllEqual) {
+        Value *equal = type->isFloatingPointTy() ? b.CreateFCmpOEQ(other, first) : b.CreateICmpEQ(other, first);
+        acc = b.CreateAnd(acc, b.CreateOr(b.CreateNot(take), equal));
+      } else {
+        Value *condition = other;
+        if (opcode == OpWaveMatch) {
+          Value *other_bits = type->isFloatingPointTy() ? b.CreateBitCast(other, bits_type) : other;
+          condition = b.CreateICmpEQ(other_bits, bits);
+        }
+        Value *selected = b.CreateAnd(take, condition);
+        if (mask_result) words[source / 32] = b.CreateOr(words[source / 32], b.CreateShl(b.CreateZExt(selected, b.getInt32Ty()), source % 32));
+        else if (opcode == OpWaveAnyTrue) acc = b.CreateOr(acc, selected);
+        else if (opcode == OpWaveAllTrue) acc = b.CreateAnd(acc, b.CreateOr(b.CreateNot(take), condition));
+        else if (count_result) acc = b.CreateAdd(acc, b.CreateZExt(selected, b.getInt32Ty()));
+        else return createError("DXIL wide collective opcode is unsupported");
+      }
+    }
+    result = mask_result ? buildAggregate(b, call.getType(), words) : acc;
+  }
+  // Complete every reader before the next collective reuses the same scratch.
+  air.CreateBarrier(air::MemFlags::Threadgroup, false);
+  return result;
+}
+
+Expected<Value *>
 OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builder, air::AIRBuilder &air_builder) {
+  if (wave_lanes > kNativeWaveLanes)
+    return lowerWideWave(call, opcode, builder, air_builder);
   /* Wave operations are convergent: they read lane state, so they must not be
    * moved or merged across control flow. */
   const bool convergent = true;

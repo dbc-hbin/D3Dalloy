@@ -393,7 +393,7 @@ public:
 
   D3D_FEATURE_LEVEL
   GetFeatureLevel() {
-    return kOwnedMaxFeatureLevel;
+    return OwnedFeatureLevel(GetMTLDevice());
   };
 
   HRESULT
@@ -848,7 +848,7 @@ public:
       D3D_FEATURE_LEVEL max_level = {};
       for (unsigned i = 0; i < out->NumFeatureLevels; i++) {
         const auto requested = out->pFeatureLevelsRequested[i];
-        if (requested >= D3D_FEATURE_LEVEL_11_0 && requested <= kOwnedMaxFeatureLevel)
+        if (requested >= D3D_FEATURE_LEVEL_11_0 && requested <= GetFeatureLevel())
           max_level = std::max(requested, max_level);
       }
       out->MaxSupportedFeatureLevel = max_level;

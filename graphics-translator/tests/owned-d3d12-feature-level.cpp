@@ -1140,7 +1140,170 @@ void testTypedUavLoads(Context &c) {
   passed("typed_uav_load_18_required_formats_texture2d_and_buffer_exact");
 }
 
-int run() {
+D3D_FEATURE_LEVEL testAdmission(Context &c) {
+  D3D12_FEATURE_DATA_D3D12_OPTIONS o0{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS8 o8{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9{};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS11 o11{};
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o0, sizeof(o0)), "admission options");
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1)), "admission options1");
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof(o2)), "admission options2");
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3)), "admission options3");
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5)), "admission options5");
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6)), "admission options6");
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7)), "admission options7");
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &o8, sizeof(o8)), "admission options8");
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &o9, sizeof(o9)), "admission options9");
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &o11, sizeof(o11)), "admission options11");
+  D3D12_FEATURE_DATA_ROOT_SIGNATURE root{D3D_ROOT_SIGNATURE_VERSION_1_1};
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &root, sizeof(root)), "admission root1.1");
+  D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va{};
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va, sizeof(va)), "admission VA");
+  for (auto requested : {D3D_SHADER_MODEL_5_1, D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_6, D3D_HIGHEST_SHADER_MODEL}) {
+    D3D12_FEATURE_DATA_SHADER_MODEL sm{requested};
+    check(c.device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)), "admission SM query");
+    if (sm.HighestShaderModel != (requested < D3D_SHADER_MODEL_6_6 ? requested : D3D_SHADER_MODEL_6_6))
+      fail("SM6.6 public query ceiling");
+  }
+  if (!o1.WaveOps || o1.WaveLaneCountMin != 4 || o1.WaveLaneCountMax != 32 || !o1.Int64ShaderOps)
+    fail("SM6.6 selectable wave and int64 contracts");
+  if (!o9.AtomicInt64OnTypedResourceSupported || !o9.AtomicInt64OnGroupSharedSupported ||
+      !o11.AtomicInt64OnDescriptorHeapResourceSupported || !o9.DerivativesInMeshAndAmplificationShadersSupported)
+    fail("owned optional SM6.6 capabilities");
+  const UINT immediate = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT | D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE |
+                         D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE;
+  const bool mandatory = o0.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3 &&
+      o0.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_3 &&
+      o0.ConservativeRasterizationTier >= D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 &&
+      o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 &&
+      o6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2 &&
+      o7.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1 &&
+      o7.SamplerFeedbackTier >= D3D12_SAMPLER_FEEDBACK_TIER_0_9 &&
+      root.HighestVersion >= D3D_ROOT_SIGNATURE_VERSION_1_1 && o2.DepthBoundsTestSupported &&
+      (o3.WriteBufferImmediateSupportFlags & immediate) == immediate &&
+      (sizeof(void *) == 4 || (va.MaxGPUVirtualAddressBitsPerResource >= 40 &&
+          va.MaxGPUVirtualAddressBitsPerProcess >= 40 && o0.MaxGPUVirtualAddressBitsPerResource >= 40)) &&
+      o0.OutputMergerLogicOp && o0.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation &&
+      o3.CopyQueueTimestampQueriesSupported && o3.CastingFullyTypedFormatSupported && o8.UnalignedBlockTexturesSupported;
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_11_0,
+      D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_11_1};
+  D3D12_FEATURE_DATA_FEATURE_LEVELS fl{UINT(std::size(levels)), levels, {}};
+  check(c.device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl)), "admission max FL");
+  const auto expected = mandatory ? D3D_FEATURE_LEVEL_12_2 :
+      o0.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2 ? D3D_FEATURE_LEVEL_12_1 : D3D_FEATURE_LEVEL_11_1;
+  if (fl.MaxSupportedFeatureLevel != expected) fail("maximum FL agrees with mandatory capabilities");
+  for (auto level : levels) {
+    ComPtr<ID3D12Device> admitted;
+    const bool supported = level <= expected;
+    expect(D3D12CreateDevice(nullptr, level, __uuidof(ID3D12Device), nullptr),
+        supported ? S_FALSE : DXGI_ERROR_UNSUPPORTED, "null-output FL probe");
+    expect(D3D12CreateDevice(nullptr, level, IID_PPV_ARGS(&admitted)),
+        supported ? S_OK : DXGI_ERROR_UNSUPPORTED, "actual FL device admission");
+    if (bool(admitted) != supported) fail("device output agrees with admission");
+  }
+  D3D12_FEATURE_DATA_FEATURE_LEVELS only12_2{1, levels, {}};
+  expect(c.device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &only12_2, sizeof(only12_2)),
+      mandatory ? S_OK : E_FAIL, "FL12_2-only query");
+  if (only12_2.MaxSupportedFeatureLevel != (mandatory ? D3D_FEATURE_LEVEL_12_2 : D3D_FEATURE_LEVEL{}))
+    fail("FL12_2-only maximum");
+  ComPtr<ID3D12Device> unsupported;
+  const auto above = static_cast<D3D_FEATURE_LEVEL>(0xc300);
+  expect(D3D12CreateDevice(nullptr, above, __uuidof(ID3D12Device), nullptr), DXGI_ERROR_UNSUPPORTED,
+      "above-ceiling null-output probe");
+  expect(D3D12CreateDevice(nullptr, above, IID_PPV_ARGS(&unsupported)), DXGI_ERROR_UNSUPPORTED,
+      "above-ceiling actual creation");
+  if (unsupported) fail("unsupported device output cleared");
+  std::printf("OWNED_D3D12_FEATURE_LEVEL_ADMISSION max=0x%x sm=0x66 mandatory12_2=%d waves=%u..%u\n",
+      fl.MaxSupportedFeatureLevel, mandatory, o1.WaveLaneCountMin, o1.WaveLaneCountMax);
+  passed("public_admission_mandatory_caps_creation_and_probe");
+  return fl.MaxSupportedFeatureLevel;
+}
+
+void testShaderModel66(Context &c) {
+  D3D12_ROOT_PARAMETER params[2]{};
+  for (UINT i = 0; i < 2; ++i) {
+    params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[i].Descriptor.ShaderRegister = i + 1;
+  }
+  D3D12_ROOT_SIGNATURE_DESC desc{2, params, 0, nullptr,
+      D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED};
+  auto root = c.root(desc);
+  constexpr UINT bytes = 1552;
+  auto initial = buffer(c.device.Get(), bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+  void *mapped = nullptr;
+  check(initial->Map(0, nullptr, &mapped), "SM6.6 init Map");
+  std::memset(mapped, 0, bytes);
+  const uint64_t rawInitial = 0x100000000ull, structuredInitial = 0x200000000ull;
+  std::memcpy(mapped, &rawInitial, 8);
+  std::memcpy(static_cast<uint8_t *>(mapped) + 16, &structuredInitial, 8);
+  initial->Unmap(0, nullptr);
+  auto targets = buffer(c.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto output = buffer(c.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto results = buffer(c.device.Get(), bytes + 24, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+  D3D12_DESCRIPTOR_HEAP_DESC heapDesc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  ComPtr<ID3D12DescriptorHeap> heap;
+  check(c.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap)), "SM6.6 direct heap");
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  uav.Format = DXGI_FORMAT_R32_TYPELESS;
+  uav.Buffer.NumElements = bytes / 4;
+  uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+  c.device->CreateUnorderedAccessView(output.Get(), nullptr, &uav, heap->GetCPUDescriptorHandleForHeapStart());
+  for (UINT width : {4u, 8u, 16u, 32u}) {
+    const std::string entry = "cs_admission" + std::to_string(width);
+    auto code = dxil(entry.c_str());
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = root.Get();
+    psoDesc.CS = {code.data(), code.size()};
+    ComPtr<ID3D12PipelineState> pso;
+    check(c.device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso)), "SM6.6 public PSO");
+    auto list = c.begin(pso.Get());
+    list.list->CopyBufferRegion(targets.Get(), 0, initial.Get(), 0, 24);
+    transition(list.list.Get(), targets.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list.list->SetComputeRootSignature(root.Get());
+    ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+    list.list->SetDescriptorHeaps(1, heaps);
+    list.list->SetComputeRootUnorderedAccessView(0, targets->GetGPUVirtualAddress());
+    list.list->SetComputeRootUnorderedAccessView(1, targets->GetGPUVirtualAddress() + 16);
+    list.list->Dispatch(1, 1, 1);
+    transition(list.list.Get(), targets.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(list.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list.list->CopyBufferRegion(results.Get(), 0, output.Get(), 0, bytes);
+    list.list->CopyBufferRegion(results.Get(), bytes, targets.Get(), 0, 24);
+    transition(list.list.Get(), targets.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    transition(list.list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    c.execute(list);
+    auto data = readback(results.Get(), bytes + 24);
+    std::array<uint32_t, (bytes + 24) / 4> words{};
+    std::memcpy(words.data(), data.data(), data.size());
+    std::array<bool, 32> rawSeen{}, structuredSeen{};
+    for (UINT gi = 0; gi < 32; ++gi) {
+      const auto *r = words.data() + gi * 12;
+      if (r[0] != width || r[1] != width || r[2] >= width || r[3] != 0 ||
+          r[4] != 0x3f800000 || r[5] != 0x3f800000 || r[7] != 1 || r[9] != 2 ||
+          r[10] != (gi | 0x7fff0000u) || r[11] != 0xffffff80u) fail("SM6.6 wave/quad/packed oracle");
+      if (r[6] >= 32 || r[8] >= 32 || rawSeen[r[6]] || structuredSeen[r[8]])
+        fail("SM6.6 raw/structured full64 atomic return permutation");
+      rawSeen[r[6]] = structuredSeen[r[8]] = true;
+    }
+    if (words[384] != 0 || words[385] != 0x7fc12345 || words[386] != 0x3f800000 ||
+        words[bytes / 4] != 32 || words[bytes / 4 + 1] != 1 ||
+        words[bytes / 4 + 4] != 32 || words[bytes / 4 + 5] != 2)
+      fail("SM6.6 final int64 and float-bitwise NaN/signed-zero oracle");
+    passed("sm66_wave" + std::to_string(width) + "_root_atomics_heap_derivatives_packed");
+  }
+}
+
+int run(bool admission_only) {
   auto backend = reinterpret_cast<const char *(WINAPI *)()>(
       GetProcAddress(GetModuleHandleW(L"d3d12.dll"), "OwnedGraphicsBackendId"));
   if (!backend || std::strcmp(backend(), "owned-graphics-d3d12")) {
@@ -1153,6 +1316,12 @@ int run() {
   D3D12_COMMAND_QUEUE_DESC queue_desc{};
   check(c.device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&c.queue)), "queue");
   check(c.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.fence)), "fence");
+  const auto maximum = testAdmission(c);
+  if (admission_only) {
+    testShaderModel66(c);
+    std::printf("OWNED_D3D12_FEATURE_LEVEL_PASS cases=%d max=0x%x\n", g_cases, maximum);
+    return 0;
+  }
   testLogicOps(c);
   testUavOnlyForced(c);
   testForcedOneMultisampleRtv(c);
@@ -1163,9 +1332,10 @@ int run() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
-    return run();
+    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--admission-only"))) return 2;
+    return run(argc == 2);
   } catch (const std::exception &) {
     return 1;
   }

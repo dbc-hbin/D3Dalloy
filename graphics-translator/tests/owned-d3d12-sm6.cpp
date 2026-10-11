@@ -1383,10 +1383,59 @@ void testCalculateLodShapes(Compute &c) {
   end("calculate_lod_shapes");
 }
 
+void testWideWaves(Compute &c) {
+  struct Case { const char *entry; uint32_t width, threads; };
+  for (const auto &test : {Case{"cs_wavesize64", 64, 128}, Case{"cs_wavesize128", 128, 256},
+       Case{"cs_wavesize_range64only", 64, 128}, Case{"cs_wavesize64_partial", 64, 160},
+       Case{"cs_wavesize128_partial", 128, 288}}) {
+    begin();
+    auto result = c.run(test.entry, filled(test.threads * 128), filled(64), filled(64), {0, 0, 0, 0}, 1);
+    if (!result.empty()) for (uint32_t gi = 0; gi < test.threads; ++gi) {
+      const uint32_t lane = gi % test.width, base = gi - lane;
+      const uint32_t live = std::min(test.width, test.threads - base);
+      uint32_t expected[29] = {test.width, lane, live, lane == 0};
+      uint32_t sum = 0, prefix = 0, multi_sum = 0, multi_count = 0, bit_or = 0, bit_xor = 0;
+      for (uint32_t source = 0; source < live; ++source) {
+        const uint32_t value = base + source + 1;
+        sum += value;
+        if (source < lane) prefix += value;
+        if ((source & 1) == 0) expected[4 + source / 32] |= 1u << (source % 32);
+        if ((source & 3) == (lane & 3)) {
+          expected[16 + source / 32] |= 1u << (source % 32);
+          if (source < lane) { multi_sum += value; ++multi_count; }
+        }
+        bit_or |= 1u << (source % 32);
+        bit_xor ^= value;
+      }
+      expected[8] = base + (lane + 33) % live + 1;
+      expected[9] = base + 1;
+      expected[10] = sum;
+      expected[11] = prefix;
+      expected[12] = base + 1;
+      expected[13] = base + live;
+      expected[14] = (live + 1) / 2;
+      expected[15] = (lane + 1) / 2;
+      expected[20] = multi_sum;
+      expected[21] = multi_count;
+      expected[22] = live > 33;
+      expected[23] = 1;
+      expected[24] = live == 1;
+      expected[25] = 1;
+      expected[26] = bit_or;
+      expected[27] = bit_xor;
+      const float float_sum = static_cast<float>(sum);
+      std::memcpy(&expected[28], &float_sum, sizeof(float_sum));
+      for (uint32_t word = 0; word < 29; ++word)
+        EXPECT_EQ(test.entry, "word", gi * 29 + word, load<uint32_t>(result[0], gi * 128 + word * 4), expected[word]);
+    }
+    end(test.entry);
+  }
+}
+
 /* ---- negative compile tests and WaveSize(32) ---- */
 void testRejections(Compute &c) {
   begin();
-  for (const char *entry : {"cs_wavesize64", "cs_wavesize128", "cs_wavesize_range64only"}) {
+  for (const char *entry : {"cs_wavesize64_divergent", "cs_wavesize128_divergent", "cs_wavesize64_return"}) {
     ComPtr<ID3D12PipelineState> pso;
     const HRESULT hr = computePso(c.gpu.device.Get(), c.root.Get(), shader(entry), pso);
     std::printf("OWNED_D3D12_SM6_REJECT entry=%s hr=0x%08lx\n", entry, static_cast<unsigned long>(hr));
@@ -2016,16 +2065,19 @@ void printCaps(ID3D12Device *device) {
 int run(int argc, wchar_t **argv) {
   int reps = 20;
   bool waves_only = false;
+  bool wide_waves_only = false;
   bool fp64_only = false;
   for (int i = 1; i < argc; ++i) {
     if (!std::wcscmp(argv[i], L"--stress-reps") && i + 1 < argc) {
       reps = _wtoi(argv[++i]);
     } else if (!std::wcscmp(argv[i], L"--waves-only")) {
       waves_only = true;
+    } else if (!std::wcscmp(argv[i], L"--wide-waves-only")) {
+      wide_waves_only = true;
     } else if (!std::wcscmp(argv[i], L"--fp64-only")) {
       fp64_only = true;
     } else {
-      std::printf("usage: owned-d3d12-sm6.exe [--stress-reps N] [--waves-only] [--fp64-only]\n");
+      std::printf("usage: owned-d3d12-sm6.exe [--stress-reps N] [--waves-only] [--wide-waves-only] [--fp64-only]\n");
       return 2;
     }
   }
@@ -2046,6 +2098,25 @@ int run(int argc, wchar_t **argv) {
 
   Gpu gpu(device.Get());
   Compute compute{gpu, computeRoot(device.Get()), nullptr};
+  if (wide_waves_only) {
+    testWave(compute);
+    testWideWaves(compute);
+    begin();
+    for (const char *entry : {"cs_wavesize64_divergent", "cs_wavesize128_divergent", "cs_wavesize64_return"}) {
+      ComPtr<ID3D12PipelineState> pso;
+      const HRESULT hr = computePso(gpu.device.Get(), compute.root.Get(), shader(entry), pso);
+      std::printf("OWNED_D3D12_WAVES_REJECT entry=%s hr=0x%08lx\n", entry, static_cast<unsigned long>(hr));
+      if (hr != E_FAIL || pso)
+        mismatch("wide_wave_requirements", entry, 0, static_cast<uint32_t>(hr), static_cast<uint32_t>(E_FAIL));
+    }
+    auto widths = compute.run("cs_wavesize32", filled(128), filled(64), filled(64), {0, 0, 0, 0}, 1);
+    if (!widths.empty()) for (uint32_t i = 0; i < 32; ++i)
+      EXPECT_EQ("wide_wave_requirements", "native32", i, load<uint32_t>(widths[0], i * 4), 32);
+    end("wide_wave_requirements");
+    if (!g_failures) std::puts("OWNED_D3D12_WIDE_WAVES_PASS");
+    std::fflush(stdout);
+    return g_failures ? 1 : 0;
+  }
   if (fp64_only) {
     testFp64(compute, false);
     testFp64(compute, true);
@@ -2082,7 +2153,7 @@ int run(int argc, wchar_t **argv) {
   testInt64(compute, "cs_int64wave16", 16, "int64wave16");
   if (waves_only) {
     begin();
-    for (const char *entry : {"cs_wavesize64", "cs_wavesize128", "cs_wavesize_range64only"}) {
+    for (const char *entry : {"cs_wavesize64_divergent", "cs_wavesize128_divergent", "cs_wavesize64_return"}) {
       ComPtr<ID3D12PipelineState> pso;
       const HRESULT hr = computePso(gpu.device.Get(), compute.root.Get(), shader(entry), pso);
       std::printf("OWNED_D3D12_WAVES_REJECT entry=%s hr=0x%08lx\n", entry, static_cast<unsigned long>(hr));
@@ -2112,6 +2183,7 @@ int run(int argc, wchar_t **argv) {
   testQuadDerivatives(compute);
   testCalculateLod(compute);
   testCalculateLodShapes(compute);
+  testWideWaves(compute);
   testRejections(compute);
   testBarycentrics(graphics, false);
   testBarycentrics(graphics, true);
