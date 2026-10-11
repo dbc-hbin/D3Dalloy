@@ -1,0 +1,29 @@
+## 판정
+제안한 순서는 **최적화 효과 순위가 아니라, 정상 출력 확인 이후의 조사 우선순위**로 채택할 수 있다. 최신 CPU/GPU 프레임 추적과 동일 조건의 Rosetta/D3DMetal 기준선이 없으므로, 아래 항목 모두 최신 FPS 원인이나 개선량이 확정된 것은 아니다. 특히 cold PSO 지연과 steady-state 처리량은 별도 문제로 분리해야 한다. 지정된 8개 문서를 모두 읽고 핵심 생산·소비 경로를 소스에서 대조했다. 파일 수정, 실행 검증, 게임 실행은 하지 않았다.
+
+## 수정된 우선순위와 실행 가능한 범위
+
+**0. 출력 정확성과 실제 설정부터 맞춘다.** 최신의 연속 장면 갱신, 실제 SR 입력/출력·backbuffer 크기, temporal mode, FG/RT, VSync/FPS 제한, 동일 장면·cache 상태를 확인한 뒤 비교한다. 저장 설정 3840×2160과 과거 추적의 1280×720은 비교 조건이 다르다는 증거이지, 최신 실제 렌더링 해상도나 9배 성능 차이의 증거가 아니다. 또한 “컴파일 오류를 모두 없앤 뒤 측정”보다 **실제 실행 draw에 필요한 PSO 실패와 정상적으로 거부되는 warmup 요청을 구분하고, 장면이 정상 갱신되는 조건에서 측정**한다고 써야 한다. 과거 64개 잘못된 shader/root 쌍이 reference에서도 거부되었다는 사실은 최신 9,131개 오류의 동일성·원인·실행 영향까지 증명하지 않는다. [verify-shader-corrections.md; wave-3-verification.md; wave-1-render-performance.md, 권고 0]
+
+**1. ResourceBarrier의 과도한 pass 종료를 계측하고, 의존성이 없는 경우만 줄인다.** 유효한 비어 있지 않은 legacy barrier batch도 현재 pass를 종료한다. 먼저 barrier 종류별 호출 수, 실제 닫힌 pass 수, 후속 encoder·attachment load/store·재바인딩 비용을 구분한다. 그 뒤 read-to-read 등 안전성이 입증된 경우에만 pass 유지 후보를 만든다. 이 경로는 직접 CPU queue-idle 대기를 하는 것이 아니다. B개 API 호출이 ResourceBarrier 자체의 InvalidateCurrentPass 호출로 닫는 기존 pass는 최대 B개이며, barrier 원소마다 encoder가 생기는 것도 아니다. 별도 reserved-resource AliasFlush 작업은 구분해야 한다. [src/d3d12/d3d12_command_list.cpp:5870-5927; src/d3d12/d3d12_command_allocator.hpp:170-178]
+
+**2. ordinary descriptor table의 반복 순회와 owner lookup을 계측한다.** capture는 dirty-root 검사 밖에서 반복되고, queue 소비자는 ordinary SRV/UAV table 범위를 전체 순회한다. texture owner 확인은 mutex 아래에서 identity와 수명을 검증한다. 따라서 우선 descriptor 방문 수, 중복 interval, capture CPU, lookup CPU/lock 대기를 나누어 측정한다. 후보는 per-pass capture 재사용, 겹친 interval 병합, 사용 범위 제한이며, mutex 제거·전역 raw-pointer cache는 권고하지 않는다. [src/d3d12/d3d12_command_list.cpp:1761-1805,2303-2304,3738-3739; src/d3d12/d3d12_command_queue.cpp:3441-3502; src/d3d12/d3d12_device.cpp:2983-2989]
+
+새 보정이 필요하다. **ordinary table에 restrict_to_shader만 켜는 것은 안전한 작은 변경이 아니다.** 현재 capture 중복 판단은 rootsig/heap/parameter/base만 비교하고 PSO는 포함하지 않는다. 같은 pass에서 PSO A와 B가 같은 table의 서로 다른 범위를 쓰면 최초 PSO의 범위만 보존하는 방식은 B의 conversion 대상 자원을 누락할 수 있다. 사용 범위 최적화는 pass 안의 모든 관련 PSO 사용 범위를 합치거나 그에 상응하는 capture identity를 보존하고, dynamic/unbounded indexing도 빠뜨리지 않아야 한다. [src/d3d12/d3d12_command_list.cpp:1791-1802; src/d3d12/d3d12_device.hpp:312-330; src/d3d12/d3d12_command_queue.cpp:3476-3486]
+
+또한 기존 보고서의 “S개 방문이면 owner lookup 최대 S회”는 **append_descriptor의 직접 lookup에만 한정**해야 한다. AppendStandardTexture는 LookupStandardSwizzleTexture를 추가 호출하며, standard-swizzle resource가 존재하면 이 helper도 같은 owner lookup을 수행한다. 전체 경로의 lock 횟수를 S로 상한 처리하면 비용 모델을 과소평가한다. 이 역시 비용 측정이지 mutex가 병목이라는 증명은 아니다. [src/d3d12/d3d12_command_queue.cpp:3380-3385,3443-3452; src/d3d12/d3d12_device.cpp:2992-3004]
+
+**3. SR의 별도 command buffer와 all-stage 동기화는 높은 주의가 필요한 연구 후보로 둔다.** pristine GPTK4.0b2의 확인된 Metal4 replay는 같은 외부 command-buffer 객체에서 scaler fence와 dispatch-stage update/wait를 사용한다. owned는 prefix/scaler/suffix를 분리하고 nil scaler fence, all-stage queue barrier를 사용한다. 먼저 정상 SR에서 segment 수, preprocessing/output-copy 활성화·크기, CPU encode 시간, GPU 실행·의존 대기를 측정해야 한다. 비용이 확인된 뒤에도 기존 same-buffer fence-consumer deadlock 재현과 출력·residency·수명·완료 순서 보존을 함께 다루는 변경이어야 한다. reference 구조를 그대로 이식하거나 barrier만 삭제하는 권고는 거부한다. MetalFX 내부 작업과 reference의 함수 밖 queue 비용은 이 비교로 알 수 없다. [verify-reference.md; wave-2-reference-temporal.md; src/winemetal/unix/metalfx-backend.mm:2113-2166]
+
+**4. native PSO 재사용·prewarm은 cold hitch 축에서 우선 조사한다.** historical compute creation 143의 정확한 값은 compile **150.2201 ms**, native pipeline 호출 경과 시간 **1704.065 ms**다. 이는 선택된 과거 이벤트이며 최신 steady FPS나 순수 active CPU 시간이 아니다. shader-cache hit여도 native library/function/PSO 생성 경로는 남는다. 실제로 반복 생성되는 동일 PSO와 frame-critical 생성 시점이 확인되면 기존 객체 재사용, 로딩 단계 prewarm, 가능한 비동기 scheduling을 먼저 검토하고, archive는 비용과 identity/invalidation 설계가 정당화될 때 검토한다. archive만 유일한 해법이거나 모든 native 생성 비용을 없앤다는 주장은 삭제한다. cold hitch가 주 증상이면 이 항목을 1~3보다 먼저 조사할 수 있다. [verify-identity-timings.md, Historical compute phases; verify-shader-corrections.md; src/d3d12/d3d12_pipeline_compute.cpp:107-166]
+
+**5. FEX는 이미 반영된 tail fix 이후 다시 측정하고 ExitFunctionEC/Bind를 좁힌다.** 과거 native FEX 약 14~18%는 여러 game thread에 걸친 scheduled CPU sample 비율이며, Rosetta 대비 FPS 손실률이 아니다. tail fix 이전 자료이고 Network Thread에도 native_FEX 4.899/4.791/4.728 CPU seconds가 포함되어 있어 render critical path 비율로 읽을 수 없다. 다음 조사는 transition 횟수·호출 위치와 최신 Bind 기여도를 확인하는 것이다. EC는 불필요한 boundary 왕복 축소부터 검토하고 FPCR/AFP, suspend doorbell, stack 규약은 유지한다. Bind 개선은 동일 emitted code와 branch 범위·alignment·실패 시 비변경·모든 reference 처리 계약을 유지하는 equal-work 검증이 필요하다. [wave-1-fex-comparison.md, 절 1~4; build/local/zzz-fex-research-20261009/cpu-attribution.json:432-438,2092-2098,3776-3782; /Users/hanbinnoh/Documents/FEX-darwin/Source/Windows/ARM64EC/Module.S:57-105; /Users/hanbinnoh/Documents/FEX-darwin/CodeEmitter/CodeEmitter/Emitter.h:694-742,795-806]
+
+## 최종 보고서에서 거부할 단순화
+- 이미 반영된 bindless heap dedup, automatic cache directory-rescan 개선, FEX emitter tail fix를 새 최적화로 제시하지 않는다. ordinary table 및 pass 간 반복 비용은 이들과 구분한다.
+- untimestamped 오류 블록의 앞뒤 시각을 compile duration, 균일 오류율, 85.1% warmup 점유율로 바꾸지 않는다. cache mtime·파일 수를 publication rate, hit rate, cache 압박의 증거로 바꾸지 않는다. syscall 행 빈도를 호출 지연이나 FPS로 환산하지 않는다. [verify-shader-corrections.md; verify-identity-timings.md]
+- mesh PSO 전체가 shader cache 밖이라는 주장을 삭제한다. object/mesh variant와 fragment-stage cache eligibility는 다르다. [verify-shader-corrections.md]
+- untracked resource의 UAV/alias ordering, reserved-resource coherence, SR deadlock 회피, descriptor lifetime 검증, EC ABI 상태를 성능 명목으로 생략하지 않는다.
+- 루트 검증 완화, fake PSO, 오류 숨김을 정상화 작업으로 제안하지 않는다. 정지 화면에서 FPS counter가 움직이는 것, wrapper 성공, 한 장의 정상 screenshot은 연속 장면 갱신의 증거가 아니다.
+
+이 보정을 적용하면 권고 목록은 안전하고 구체적인 **후속 측정·검증 계획**이 된다. 구현 우선순위의 최종 확정이나 정량 개선 예상치는 아직 성립하지 않는다.
