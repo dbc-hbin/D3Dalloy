@@ -2808,11 +2808,20 @@ public:
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: topology = 2; break;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: topology = 3; break;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: topology = 4; break;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ: topology = 6; break;
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: topology = 7; break;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: topology = 8; break;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ: topology = 9; break;
     default:
-      // Adjacency and patch topologies: no VS-only stream-output capture yet.
+      // Patch inputs require tessellation, not the VS-only capture path.
       RecordError(E_NOTIMPL);
       return false;
     case kTriangleFan: topology = 5; break;
+    }
+    // Metal point draws capture adjacency inputs, but cannot rasterize their interior primitives.
+    if (topology >= 6 && (!layout.active || layout.rasterized_stream != D3D12_SO_NO_RASTERIZED_STREAM)) {
+      RecordError(E_NOTIMPL);
+      return false;
     }
     if (Indexed && !Indirect && !index_buffer) {
       RecordError();
@@ -2879,7 +2888,7 @@ public:
     // D3D12 applies IBStripCutValue to strip topologies only, and only when it matches the index
     // format; list topologies treat 0xFFFF / 0xFFFFFFFF as ordinary indices.
     const auto cut = ib_strip_cut_value_;
-    const bool strip = topology == 2 || topology == 4 || topology == 5;
+    const bool strip = topology == 2 || topology == 4 || topology == 5 || topology == 7 || topology == 9;
     params->cut_enabled =
         Indexed && strip &&
         ((cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF && params->index_size == 2) ||

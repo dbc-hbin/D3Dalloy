@@ -628,6 +628,18 @@ void apply_vertex_index_pull(
   auto *index_size = load_control(offsetof(SM50_INDEX_PULL_CONTROL, index_size) / 4);
   auto *index_first = load_control(offsetof(SM50_INDEX_PULL_CONTROL, index_first) / 4);
   auto *base_vertex = load_control(offsetof(SM50_INDEX_PULL_CONTROL, base_vertex) / 4);
+  if (resource.so_capture_key) {
+    // Point capture does not discard Metal restart indices. Skip before fetching
+    // the application index or executing a cut vertex's shader side effects.
+    auto *restart = llvm::BasicBlock::Create(builder.getContext(), "so_restart", function);
+    auto *valid = llvm::BasicBlock::Create(builder.getContext(), "so_position", function);
+    builder.CreateCondBr(builder.CreateAnd(builder.CreateICmpNE(index_size, builder.getInt32(0)),
+                                          builder.CreateICmpEQ(key, builder.getInt32(~0u))), restart, valid);
+    builder.SetInsertPoint(restart);
+    if (function->getReturnType()->isVoidTy()) builder.CreateRetVoid();
+    else builder.CreateRet(llvm::Constant::getNullValue(function->getReturnType()));
+    builder.SetInsertPoint(valid);
+  }
   auto *entry = builder.GetInsertBlock();
   auto *pull_bb = llvm::BasicBlock::Create(builder.getContext(), "vertex_index_pull", function);
   auto *join_bb = llvm::BasicBlock::Create(builder.getContext(), "vertex_index_join", function);

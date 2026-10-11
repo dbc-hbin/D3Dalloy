@@ -291,7 +291,7 @@ void runTargetCases(const Fixture &f, ID3D12PipelineState *soPso) {
            list->SOSetTargets(0, 1, &valid);
          }), E_INVALIDARG, "so_set_targets_bundle_rejected");
 
-  // Draws with a stream-output PSO record; adjacency topologies are rejected explicitly.
+  // Draws with a stream-output PSO record; rasterizing VS-only adjacency remains unsupported.
   expect(recordAndClose(device, direct, [&](auto *list) {
            list->SetGraphicsRootSignature(f.root.Get());
            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
@@ -628,7 +628,8 @@ struct Model {
 UINT verticesPerPrimitive(D3D_PRIMITIVE_TOPOLOGY t) {
   if (t == D3D_PRIMITIVE_TOPOLOGY_POINTLIST)
     return 1;
-  if (t == D3D_PRIMITIVE_TOPOLOGY_LINELIST || t == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP)
+  if (t == D3D_PRIMITIVE_TOPOLOGY_LINELIST || t == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP ||
+      t == D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ || t == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ)
     return 2;
   return 3;
 }
@@ -636,7 +637,13 @@ UINT verticesPerPrimitive(D3D_PRIMITIVE_TOPOLOGY t) {
 void modelDraw(const Case &c, const Draw &d, Model &m, std::array<UINT64, 2> &counts) {
   const Layout &l = c.layout;
   const UINT vpp = verticesPerPrimitive(d.topology);
-  const bool strip = d.topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP || d.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+  const bool adjacency = d.topology >= D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ &&
+                         d.topology <= D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
+  const UINT inputVpp = adjacency ? 2 * vpp : vpp;
+  const bool strip = d.topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP ||
+                     d.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
+                     d.topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ ||
+                     d.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
   // The strip cut applies to strip topologies only; elsewhere the cut value is an ordinary index.
   const DXGI_FORMAT format = d.commandFormat == DXGI_FORMAT_UNKNOWN ? c.indexFormat : d.commandFormat;
   const std::uint32_t cutValue = format == DXGI_FORMAT_R16_UINT ? 0xffffu : 0xffffffffu;
@@ -669,7 +676,23 @@ void modelDraw(const Case &c, const Draw &d, Model &m, std::array<UINT64, 2> &co
       }
       m.maxInvocations++;
       std::vector<std::uint32_t> prim;
-      if (!strip) {
+      if (adjacency) {
+        window.push_back(key);
+        if (window.size() == inputVpp) {
+          // FS ch.14 streams only interior vertices; 8.14 keeps the leading vertex first.
+          if (vpp == 2)
+            prim = {window[1], window[2]};
+          else
+            prim = (stripIndex & 1) ? std::vector<std::uint32_t>{window[0], window[4], window[2]}
+                                    : std::vector<std::uint32_t>{window[0], window[2], window[4]};
+          if (strip) {
+            window.erase(window.begin(), window.begin() + (vpp == 2 ? 1 : 2));
+            stripIndex++;
+          } else {
+            window.clear();
+          }
+        }
+      } else if (!strip) {
         window.push_back(key);
         if (window.size() == vpp) {
           prim = window;
@@ -1578,6 +1601,46 @@ void runCaptureCases(ID3D12Device *device, std::vector<std::uint8_t> packedVs) {
   cases.push_back({"line_strip", one, {{drawOf(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP, 4)}}});
   cases.push_back({"triangle_list_incomplete_dropped", one, {{drawOf(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 7)}}});
   cases.push_back({"triangle_strip_odd_order", one, {{drawOf(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, 6)}}});
+  for (const auto &[directName, indexedName, topology, count] : {
+           std::tuple{"adj_line_list_interior", "adj_indexed_line_list", D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ, 9u},
+           std::tuple{"adj_line_strip_interior", "adj_indexed_line_strip_cut", D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ, 6u},
+           std::tuple{"adj_triangle_list_interior", "adj_indexed_triangle_list", D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ, 13u},
+           std::tuple{"adj_triangle_strip_odd_order", "adj_indexed_triangle_strip_cut", D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ, 11u}}) {
+    Case direct{directName, oneSlotLayout(D3D12_SO_NO_RASTERIZED_STREAM),
+                {{{topology, false, count, 2, 3, 0, 4}}}};
+    direct.expectRt = 0;
+    cases.push_back(direct);
+    Case indexed{indexedName, direct.layout, {{{topology, true, count, 2, 1, -2, 4}}}};
+    indexed.expectRt = 0;
+    indexed.indices = {40}; // leading junk exercises StartIndexLocation
+    for (UINT k = 0; k < count; k++)
+      indexed.indices.push_back(3 + k / 2); // repeated indices still occupy distinct IA positions
+    if (topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ ||
+        topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ) {
+      const UINT cut = topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ ? 0xffffu : 0xffffffffu;
+      indexed.indexFormat = cut == 0xffffu ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+      indexed.cut = cut == 0xffffu ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF
+                                 : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+      // An incomplete run between cuts must disappear; the final run restarts strip parity.
+      indexed.indices.insert(indexed.indices.end(), {cut, 20, 21, 22, cut, 10, 11, 12, 13, 14, 15});
+      indexed.lists[0][0].count = UINT(indexed.indices.size()) - 1;
+    }
+    cases.push_back(indexed);
+  }
+  {
+    Case c{"adj_overflow_interior_primitive", oneSlotLayout(D3D12_SO_NO_RASTERIZED_STREAM),
+           {{drawOf(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ, 12)}}};
+    c.size[0] = 80; // one 48-byte interior triangle fits; neither adjacency nor a partial triangle is written
+    c.expectRt = 0;
+    cases.push_back(c);
+  }
+  {
+    Case c{"adj_strip_draw_boundary_reset", oneSlotLayout(D3D12_SO_NO_RASTERIZED_STREAM),
+           {{drawOf(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ, 5),
+             drawOf(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ, 8)}}};
+    c.expectRt = 0;
+    cases.push_back(c);
+  }
   {
     // StartIndexLocation 1 skips the leading junk index; BaseVertexLocation does not change the key;
     // a repeated index and a 0xFFFF strip cut restart the strip.

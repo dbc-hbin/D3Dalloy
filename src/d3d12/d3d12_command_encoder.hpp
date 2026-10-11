@@ -197,7 +197,7 @@ struct StreamOutputAssemblyParams {
     uint32_t dword_offset;
     uint32_t component_count;
   };
-  uint32_t topology; // 0 point list, 1 line list, 2 line strip, 3 triangle list, 4 triangle strip
+  uint32_t topology; // 0 point, 1/2 line list/strip, 3/4 triangle list/strip, 5 fan, 6/7 line adj, 8/9 triangle adj
   uint32_t indexed;
   uint32_t index_size;
   uint32_t cut_enabled;
