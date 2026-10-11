@@ -153,7 +153,9 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     d.reactiveMaskTextureEnabled = reactive; d.reactiveMaskTextureFormat = MTLPixelFormatR16Float;
     d.specularHitDistanceTextureEnabled = hit;
     d.autoExposureEnabled = (core.info.feature_flags & 64) != 0;
-    d.requiresSynchronousInitialization = NO;
+    // Build the final model before submission instead of encoding the slower
+    // interim model while its pipelines are still compiling in the background.
+    d.requiresSynchronousInitialization = YES;
     // Apple non-fused GPU backend avoids the macOS 27 fused UBF K44 weight overread.
     if (![d respondsToSelector:@selector(setVersion:)]) return {};
     [d setVersion:0x10000];
@@ -297,6 +299,7 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
     call->ret[1] = 0x80070057;
     auto feature = (DXMTRRFeature *)call->args[0];
     const auto &p = *reinterpret_cast<const WMTMetal4FXTemporalFrame *>(call->args[1]);
+    if (!p.reactive && (p.reactive_rect.x || p.reactive_rect.y)) return true;
     if (!p.input_width || !p.input_height || p.input_width > feature->core->info.input_width ||
         p.input_height > feature->core->info.input_height || p.roughness_packed > 1 || p.depth_linear > 1 ||
         p.color_transfer || p.combine_composition || p.sharpening || p.cap_output || p.composition || p.debug_view ||
@@ -325,6 +328,10 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
       id<MTLTexture> texture = (id<MTLTexture>)handles[i];
       if (!texture && (i == 4 || i == 5 || i == 6 || i == 11)) continue;
       auto r = holder->rects[i];
+      // Responsivity is one nonnegative scalar, not an arbitrary color channel.
+      if (i == 5 && texture.pixelFormat != MTLPixelFormatR8Unorm &&
+          texture.pixelFormat != MTLPixelFormatR16Unorm && texture.pixelFormat != MTLPixelFormatR16Float &&
+          texture.pixelFormat != MTLPixelFormatR32Float) return true;
       if (i == 3) {
         if (!texture || texture.device != feature->core->device || texture.textureType != MTLTextureType2D ||
             texture.arrayLength != 1 || texture.sampleCount != 1 || texture.depth != 1 || texture.framebufferOnly ||

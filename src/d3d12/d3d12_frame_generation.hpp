@@ -16,8 +16,8 @@ HRESULT PrepareOwnedFrameGenerationFrame(MTLD3D12Device *, IMTLD3D12FrameGenerat
     const MTL_FRAME_GENERATION_PREPARE_DESC *, std::shared_ptr<OwnedFrameGenerationFrame> &);
 HRESULT GenerateOwnedFrameGenerationFrame(MTLD3D12Device *, IMTLD3D12FrameGenerationState *,
     const MTL_FRAME_GENERATION_GENERATE_DESC *, std::shared_ptr<OwnedFrameGenerationFrame> &);
-std::array<MTLD3D12Resource *, 5> GetOwnedFrameGenerationResources(const std::shared_ptr<OwnedFrameGenerationFrame> &);
-std::array<D3D12_RESOURCE_STATES, 5> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &);
+std::array<MTLD3D12Resource *, 8> GetOwnedFrameGenerationResources(const std::shared_ptr<OwnedFrameGenerationFrame> &);
+std::array<D3D12_RESOURCE_STATES, 8> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &);
 bool IsOwnedFrameGenerationOutput(const std::shared_ptr<OwnedFrameGenerationFrame> &, size_t index);
 void EncodeOwnedFrameGenerationFrame(const std::shared_ptr<OwnedFrameGenerationFrame> &,
     WMT::MTL4CommandBuffer, WMT::Fence,

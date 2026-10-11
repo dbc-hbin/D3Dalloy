@@ -18,6 +18,7 @@ struct MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC {
 struct MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC {
   UINT StructSize;
   ID3D12Resource *Color, *Output, *Depth, *MotionVector;
+  // RR responsivity uses BiasCurrentColorMask: a scalar [0,1] history-rejection mask.
   ID3D12Resource *ExposureTexture, *BiasCurrentColorMask, *TransparencyMask;
   UINT InputContentWidth, InputContentHeight;
   UINT ColorBaseX, ColorBaseY, DepthBaseX, DepthBaseY;

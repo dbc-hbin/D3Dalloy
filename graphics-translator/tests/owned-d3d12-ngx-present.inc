@@ -50,15 +50,16 @@ std::vector<uint8_t> ngxPresentPixels(Gpu& gpu, ID3D12Resource* texture, D3D12_R
     check(record.list->Close(), "NGX present readback close"); gpu.executeAndWait(record.list.Get());
     uint8_t* bytes = nullptr;
     check(readback.buffer->Map(0, nullptr, reinterpret_cast<void**>(&bytes)), "NGX present readback map");
-    std::vector<uint8_t> pixels(ngxPresentExtent * ngxPresentExtent * 4);
-    for (UINT y = 0; y < ngxPresentExtent; ++y)
-        std::memcpy(pixels.data() + y * ngxPresentExtent * 4,
+    const auto& footprint = readback.footprint.Footprint;
+    std::vector<uint8_t> pixels(size_t(footprint.Width) * footprint.Height * 4);
+    for (UINT y = 0; y < footprint.Height; ++y)
+        std::memcpy(pixels.data() + size_t(y) * footprint.Width * 4,
                     bytes + readback.footprint.Offset + y * readback.footprint.Footprint.RowPitch,
-                    ngxPresentExtent * 4);
+                    size_t(footprint.Width) * 4);
     readback.buffer->Unmap(0, nullptr);
     return pixels;
 }
-NVSDK_NGX_Handle* ngxPresentFeature(const NgxApi& api, Gpu& gpu) {
+NVSDK_NGX_Handle* ngxPresentFeature(const NgxApi& api, Gpu& gpu, bool orthographic = false) {
     auto params = allocateParams(api);
     ngx_feature_set_uint(params, "DLSSG.Width", ngxPresentExtent);
     ngx_feature_set_uint(params, "DLSSG.Height", ngxPresentExtent);
@@ -66,13 +67,14 @@ NVSDK_NGX_Handle* ngxPresentFeature(const NgxApi& api, Gpu& gpu) {
     ngx_feature_set_uint(params, "DLSSG.InternalHeight", ngxPresentExtent);
     ngx_feature_set_uint(params, "DLSSG.BackbufferFormat", DXGI_FORMAT_R8G8B8A8_UNORM);
     ngx_feature_set_uint(params, "DLSSG.DepthInverted", 1);
+    ngx_feature_set_uint(params, "DLSSG.OrthoProjection", orthographic);
     auto record = gpu.makeRecording(); NVSDK_NGX_Handle* feature = nullptr;
     checkNgxResult(api.create(record.list.Get(), 11, params, &feature), ngx_fixture_result_success(), "NGX present create11");
     check(record.list->Close(), "NGX present create close"); resetAndDestroyParams(api, params);
     return feature;
 }
-ComPtr<ID3D12Resource> ngxPresentDisableBuffer(Gpu& gpu) {
-    auto desc = bufferDescription(4);
+ComPtr<ID3D12Resource> ngxPresentDisableBuffer(Gpu& gpu, UINT64 size = 4) {
+    auto desc = bufferDescription(size);
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     const auto heap = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
     ComPtr<ID3D12Resource> result;
@@ -83,13 +85,29 @@ ComPtr<ID3D12Resource> ngxPresentDisableBuffer(Gpu& gpu) {
 Recording ngxPresentEvaluate(const NgxApi& api, Gpu& gpu, NVSDK_NGX_Handle* feature,
                              UINT frame, bool reset, ID3D12Resource* color, ID3D12Resource* hudless,
                              ID3D12Resource* output, ID3D12Resource* depth, ID3D12Resource* motion,
-                             bool close = true, bool notRendering = false) {
+                             bool close = true, bool notRendering = false, ID3D12Resource* disable = nullptr,
+                             float* clipToPrev = nullptr, bool cameraMotionIncluded = true,
+                             float* viewToClip = nullptr) {
     auto params = allocateParams(api);
     ngx_feature_set_resource(params, "DLSSG.Backbuffer", color);
     ngx_feature_set_resource(params, "DLSSG.HUDLess", hudless);
     ngx_feature_set_resource(params, "DLSSG.OutputInterpolated", output);
     ngx_feature_set_resource(params, "DLSSG.Depth", depth);
     ngx_feature_set_resource(params, "DLSSG.MVecs", motion);
+    ngx_feature_set_resource(params, "DLSSG.OutputDisableInterpolation", disable);
+    ngx_feature_set_uint(params, "DLSSG.CameraMotionIncluded", cameraMotionIncluded);
+    if (clipToPrev) ngx_feature_set_pointer(params, "DLSSG.ClipToPrevClip", clipToPrev);
+    if (viewToClip) {
+        ngx_feature_set_uint(params, "DLSSG.OrthoProjection", 1);
+        ngx_feature_set_pointer(params, "DLSSG.CameraViewToClip", viewToClip);
+        const char* keys[4][3] = {{"DLSSG.CameraPosX","DLSSG.CameraPosY","DLSSG.CameraPosZ"},
+            {"DLSSG.CameraUpX","DLSSG.CameraUpY","DLSSG.CameraUpZ"},
+            {"DLSSG.CameraRightX","DLSSG.CameraRightY","DLSSG.CameraRightZ"},
+            {"DLSSG.CameraFwdX","DLSSG.CameraFwdY","DLSSG.CameraFwdZ"}};
+        const float basis[4][3] = {{0,0,0},{0,1,0},{1,0,0},{0,0,1}};
+        for (UINT vector = 0; vector != 4; ++vector) for (UINT axis = 0; axis != 3; ++axis)
+            ngx_feature_set_float(params, keys[vector][axis], basis[vector][axis]);
+    }
     ngx_feature_set_uint(params, "DLSSG.BackbufferFrameID", frame);
     ngx_feature_set_uint(params, "DLSSG.Reset", reset);
     ngx_feature_set_uint(params, "DLSSG.NotRenderingGameFrames", notRendering);

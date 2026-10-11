@@ -926,10 +926,6 @@ public:
       return DXGI_ERROR_INVALID_CALL;
     if (Format != DXGI_FORMAT_UNKNOWN && ConvertSwapChainFormat(Format) == WMTPixelFormatInvalid)
       return DXGI_ERROR_INVALID_CALL;
-    // The two-plane premultiplied transport is bounded SDR, not floating HDR.
-    if (kind_ == DXMTSwapChainKind::Composition && desc_.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED &&
-        Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-      return DXGI_ERROR_UNSUPPORTED;
     // Every application reference to the current backbuffers must be released.
     // Internal holders (pending presents, temporal frames) use private refs.
     for (auto &backbuffer : backbuffers_) {
@@ -1111,7 +1107,7 @@ public:
     drawable_width_ = width ? width : desc_.Width;
     drawable_height_ = height ? height : desc_.Height;
     presenter->changeLayerProperties(
-        ConvertSwapChainFormat(desc_.Format), ConvertColorSpace(colorspace_, LayerSupportEDR()),
+        ConvertSwapChainFormat(desc_.Format), ConvertColorSpace(colorspace_, kind_ == DXMTSwapChainKind::Composition || LayerSupportEDR()),
         drawable_width_ * scale_factor, drawable_height_ * scale_factor, desc_.SampleDesc.Count,
         desc_.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED ? DXMTPresentAlpha::Premultiplied :
         desc_.AlphaMode == DXGI_ALPHA_MODE_STRAIGHT ? DXMTPresentAlpha::Straight : DXMTPresentAlpha::Opaque
@@ -1616,12 +1612,7 @@ public:
     if (!pColorSpaceSupport)
       return E_INVALIDARG;
     std::lock_guard<dxmt::mutex> lock(mutex_);
-    if (kind_ == DXMTSwapChainKind::Composition && desc_.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED &&
-        ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
-      *pColorSpaceSupport = 0;
-      return S_OK;
-    }
-    const auto native = ConvertColorSpace(ColorSpace, LayerSupportEDR());
+    const auto native = ConvertColorSpace(ColorSpace, kind_ == DXMTSwapChainKind::Composition || LayerSupportEDR());
     *pColorSpaceSupport = native != WMTColorSpaceInvalid &&
                                   (ColorSpace == colorspace_ || CGColorSpace_checkColorSpaceSupported(native))
                               ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT
@@ -1649,12 +1640,9 @@ public:
   HRESULT STDMETHODCALLTYPE
   SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) override {
     std::lock_guard<dxmt::mutex> lock(mutex_);
-    const auto native = ConvertColorSpace(ColorSpace, LayerSupportEDR());
+    const auto native = ConvertColorSpace(ColorSpace, kind_ == DXMTSwapChainKind::Composition || LayerSupportEDR());
     if (native == WMTColorSpaceInvalid)
       return DXGI_ERROR_INVALID_CALL;
-    if (kind_ == DXMTSwapChainKind::Composition && desc_.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED &&
-        ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
-      return DXGI_ERROR_UNSUPPORTED;
     if (ColorSpace != colorspace_ && !CGColorSpace_checkColorSpaceSupported(native))
       return DXGI_ERROR_INVALID_CALL;
     colorspace_ = ColorSpace;
@@ -1675,8 +1663,6 @@ public:
       static_assert(sizeof(DXGI_HDR_METADATA_HDR10) == sizeof(WMTHDRMetadata));
       if (Size != sizeof(DXGI_HDR_METADATA_HDR10) || !pMetaData)
         return E_INVALIDARG;
-      if (kind_ == DXMTSwapChainKind::Composition && desc_.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED)
-        return DXGI_ERROR_UNSUPPORTED;
       WMTHDRMetadata metadata;
       std::memcpy(&metadata, pMetaData, sizeof(metadata));
       presenter->changeHDRMetadata(&metadata);
@@ -1718,9 +1704,6 @@ CreateSwapChain(
       (pDesc->AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED ||
        pDesc->AlphaMode == DXGI_ALPHA_MODE_STRAIGHT))
     return DXGI_ERROR_UNSUPPORTED; // The HWND-backed Metal layer is opaque.
-  if (kind == DXMTSwapChainKind::Composition && pDesc->AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED &&
-      pDesc->Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-    return DXGI_ERROR_UNSUPPORTED;
   constexpr UINT supported_flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH |
                                     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
                                     DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;

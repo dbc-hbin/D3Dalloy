@@ -38,8 +38,10 @@ struct DXMTPresentMetadata {
   float max_display_luminance;
   DXMTPresentGeometry geometry;
   DXMTPresentAlpha alpha;
+  // Owned transparent transport: 1=sRGB, 2=scRGB, 3=PQ/2020, 4=sRGB/2020.
+  uint32_t composition_color_space = 0;
 };
-static_assert(sizeof(DXMTPresentMetadata) == 80);
+static_assert(sizeof(DXMTPresentMetadata) == 84);
 
 constexpr uint32_t DXMT_GAMMA_CP_COUNT = 1024;
 

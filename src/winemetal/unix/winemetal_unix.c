@@ -4038,7 +4038,7 @@ _MetalLayer_setColorSpace(void *obj) {
     WMTCompositionSource *source = [layer isKindOfClass:WMTCompositionMetalLayer.class]
         ? [composition_layers objectForKey:layer] : nil;
     if (source && source->premultiplied && colorspace != WMTColorSpaceSRGB &&
-        colorspace != WMTColorSpaceSRGBLinear) {
+        colorspace != WMTColorSpaceSRGBLinear && colorspace != WMTColorSpaceHDR_scRGB) {
       CGColorSpaceRelease(ref);
       return;
     }
@@ -4046,7 +4046,7 @@ _MetalLayer_setColorSpace(void *obj) {
     layer.wantsExtendedDynamicRangeContent = WMT_COLORSPACE_IS_HDR(colorspace);
     if (source && source->residual_layer) {
       source->residual_layer.colorspace = ref;
-      source->residual_layer.wantsExtendedDynamicRangeContent = NO;
+      source->residual_layer.wantsExtendedDynamicRangeContent = WMT_COLORSPACE_IS_HDR(colorspace);
     }
     CGColorSpaceRelease(ref);
     params->ret = true;

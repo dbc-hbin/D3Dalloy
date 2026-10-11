@@ -4,6 +4,7 @@
 #undef main
 #include "owned-rr-pattern.h"
 #include <cmath>
+#include <limits>
 
 extern "C" {
 void ngx_feature_set_uint(NVSDK_NGX_Parameter *, const char *, unsigned int);
@@ -95,26 +96,64 @@ void runPublicFg(const NgxApi &api, Gpu &gpu) {
         std::printf("OWNED_D3D12_NGX_REJECT case=index index=%u result=unsupported_parameter\n", index);
       }
       ngx_feature_set_uint(params, "DLSSG.MultiFrameIndex", 1);
-      auto flag = ngxPresentDisableBuffer(gpu);
-      ngx_feature_set_resource(params, "DLSSG.OutputDisableInterpolation", flag.Get());
-      checkNgxResult(api.evaluate(rejected.list.Get(), feature, params, nullptr), ngx_fixture_result_unsupported_parameter(), "FG native unsupported disable buffer");
+      auto plain = createBuffer(gpu.device.Get(), 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+      auto small = ngxPresentDisableBuffer(gpu, 3);
+      Gpu foreign; auto foreignFlag = ngxPresentDisableBuffer(foreign);
+      ID3D12Resource* invalidFlags[] = {output.Get(), plain.Get(), small.Get(), foreignFlag.Get()};
+      for (auto invalid : invalidFlags) {
+        ngx_feature_set_resource(params, "DLSSG.OutputDisableInterpolation", invalid);
+        checkNgxResult(api.evaluate(rejected.list.Get(), feature, params, nullptr), ngx_fixture_result_invalid_parameter(), "FG invalid disable buffer");
+      }
       resetAndDestroyParams(api, params);
       check(rejected.list->Close(), "FG rejected close"); gpu.executeAndWait(rejected.list.Get());
       if (ngxPresentPixels(gpu, output.Get(), write) != sentinel) fail("rejected FG modified output");
-      std::puts("OWNED_D3D12_NGX_REJECT case=disable_buffer result=unsupported_parameter output_untouched=1 before_valid_dispatch=1 zero_count_index=invalid_parameter");
+      std::puts("OWNED_D3D12_NGX_REJECT case=disable_buffer result=invalid_parameter texture=1 non_uav=1 too_small=1 cross_device=1 output_untouched=1 zero_count_index=invalid_parameter");
     }
     const bool reset = frame == 0 || frame == 5;
-    const UINT frameId = frame == 8 ? 7 : frame;
-    auto record = ngxPresentEvaluate(api, gpu, feature, frameId, reset, color.Get(), nullptr, output.Get(), depth.Get(), motion.Get(), false, frame == 6);
+    const UINT frameId = frame < 7 ? frame : 9; // Gap, followed by repeated ID.
+    const UINT flagBytes = frame & 1 ? 8 : 4;
+    auto flag = ngxPresentDisableBuffer(gpu, flagBytes);
+    auto flagUpload = createBuffer(gpu.device.Get(), 8, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto flagReadback = createBuffer(gpu.device.Get(), 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    UINT* mappedFlag = nullptr;
+    check(flagUpload->Map(0, nullptr, reinterpret_cast<void**>(&mappedFlag)), "FG flag upload map");
+    mappedFlag[0] = 0x76543210; mappedFlag[1] = 0x12345678; flagUpload->Unmap(0, nullptr);
+    auto initialize = gpu.makeRecording();
+    transition(initialize.list.Get(), flag.Get(), write, D3D12_RESOURCE_STATE_COPY_DEST);
+    initialize.list->CopyBufferRegion(flag.Get(), 0, flagUpload.Get(), 0, flagBytes);
+    transition(initialize.list.Get(), flag.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    initialize.list->CopyBufferRegion(flagReadback.Get(), 0, flagUpload.Get(), 0, 8);
+    initialize.list->CopyBufferRegion(flagReadback.Get(), 0, flag.Get(), 0, flagBytes);
+    transition(initialize.list.Get(), flag.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, write);
+    check(initialize.list->Close(), "FG flag initialize close"); gpu.executeAndWait(initialize.list.Get());
+    auto record = ngxPresentEvaluate(api, gpu, feature, frameId, reset, color.Get(), nullptr, output.Get(), depth.Get(), motion.Get(), false, frame == 6, flag.Get());
+    auto beforeExecute = gpu.makeRecording();
+    transition(beforeExecute.list.Get(), flag.Get(), write, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    beforeExecute.list->CopyBufferRegion(flagReadback.Get(), 0, flag.Get(), 0, flagBytes);
+    transition(beforeExecute.list.Get(), flag.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, write);
+    check(beforeExecute.list->Close(), "FG before execute close"); gpu.executeAndWait(beforeExecute.list.Get());
+    check(flagReadback->Map(0, nullptr, reinterpret_cast<void**>(&mappedFlag)), "FG flag before execute map");
+    if (mappedFlag[0] != 0x76543210 || mappedFlag[1] != 0x12345678) fail("FG flag changed before execute");
+    flagReadback->Unmap(0, nullptr);
+    transition(record.list.Get(), flag.Get(), write, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    record.list->CopyBufferRegion(flagReadback.Get(), 0, flag.Get(), 0, flagBytes);
+    transition(record.list.Get(), flag.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, write);
     auto readback = createTextureReadback(gpu, output.Get());
     transition(record.list.Get(), output.Get(), write, D3D12_RESOURCE_STATE_COPY_SOURCE);
     copyTextureToReadback(record.list.Get(), output.Get(), readback);
     transition(record.list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, write);
     check(record.list->Close(), "FG lifetime close");
-    color.Reset(); depth.Reset(); motion.Reset(); output.Reset();
+    color.Reset(); depth.Reset(); motion.Reset(); output.Reset(); flag.Reset();
     if (frame == 8) checkNgxResult(api.release(feature), ngx_fixture_result_success(), "FG release before execute");
     for (UINT replay = 0; replay <= UINT(frame == 0 || frame == 7 || frame == 8); ++replay) {
       gpu.executeAndWait(record.list.Get());
+      check(flagReadback->Map(0, nullptr, reinterpret_cast<void**>(&mappedFlag)), "FG flag after fence map");
+      const UINT disabled = *mappedFlag;
+      if (mappedFlag[1] != 0x12345678) fail("FG flag wrote beyond uint32 hint");
+      flagReadback->Unmap(0, nullptr);
+      const UINT expectedDisabled = frame == 0 || frame >= 5 || replay != 0;
+      if (disabled != expectedDisabled) fail("FG disable hint history contract");
+      std::printf("OWNED_D3D12_NGX_DISABLE_HINT frame=%u replay=%u value=%u before_execute_untouched=1 after_fence=1 tail_untouched=1 history_hint=1\n", frame, replay, disabled);
       uint8_t* bytes = nullptr;
       check(readback.buffer->Map(0, nullptr, reinterpret_cast<void**>(&bytes)), "FG lifetime readback");
       std::vector<uint8_t> image(extent * extent * 4);
@@ -127,22 +166,284 @@ void runPublicFg(const NgxApi &api, Gpu &gpu) {
     }
   }
   checkNgxResult(api.release(feature), ngx_fixture_result_feature_not_found(), "FG stale handle");
-  std::puts("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=unsupported reset=native_history release_before_execute=1 replay=native_encode");
+  std::puts("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=gpu_history_hint reset=native_history release_before_execute=1 replay=native_encode");
+}
+void runPublicFgCameraMotion(const NgxApi &api, Gpu &gpu, bool orthographic = false) {
+  constexpr UINT extent = ngxPresentExtent;
+  constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  constexpr auto write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  NVSDK_NGX_Handle* features[3]{};
+  for (auto& feature : features) feature = ngxPresentFeature(api, gpu, orthographic);
+  auto depth = createTexture(gpu.device.Get(), extent, extent, DXGI_FORMAT_R32_FLOAT,
+      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  std::vector<float> depths(extent * extent, .75f);
+  if (orthographic) for (UINT y = 0; y != extent; ++y) for (UINT x = 0; x != extent; ++x)
+    depths[y * extent + x] = .2f + .6f * float(x + y) / float(2 * (extent - 1));
+  uploadTexture(gpu, depth.Get(), depths.data(), extent * 4, read);
+  std::array<ComPtr<ID3D12Resource>, 2> motions;
+  for (UINT mode = 0; mode != 2; ++mode) {
+    motions[mode] = createTexture(gpu.device.Get(), extent, extent, DXGI_FORMAT_R16G16_FLOAT,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::vector<uint16_t> vectors(extent * extent * 2, 0);
+    if (!mode) for (size_t i = 0; i < vectors.size(); i += 2) {
+      vectors[i] = 0x4400; vectors[i + 1] = 0x4000; // +4,+2 pixels, both exactly representable.
+    }
+    uploadTexture(gpu, motions[mode].Get(), vectors.data(), extent * 4, read);
+  }
+  const std::vector<uint8_t> sentinel(extent * extent * 4, 19);
+  UINT effectiveFrames = 0;
+  for (UINT frame = 0; frame != 6; ++frame) {
+    auto color = createTexture(gpu.device.Get(), extent, extent, DXGI_FORMAT_R8G8B8A8_UNORM,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    const auto scene = ngxPresentScene(frame, false);
+    uploadTexture(gpu, color.Get(), scene.data(), extent * 4, read);
+    std::array<std::vector<uint8_t>, 3> images;
+    for (UINT mode = 0; mode != 3; ++mode) {
+      auto output = createTexture(gpu.device.Get(), extent, extent, DXGI_FORMAT_R8G8B8A8_UNORM,
+          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+      uploadTexture(gpu, output.Get(), sentinel.data(), extent * 4, write);
+      // Row-vector multiplication: last row supplies +4,+2 output-pixel motion.
+      float matrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 8.f/extent,-4.f/extent,0,1};
+      float viewToClip[16] = {.25f,0,0,0, 0,.25f,0,0, 0,0,-1.f/999.9f,0, 0,0,1000.f/999.9f,1};
+      if (!frame && mode == 1) {
+        auto real = createTexture(gpu.device.Get(), extent, extent, DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        uploadTexture(gpu, real.Get(), sentinel.data(), extent * 4, write);
+        auto params = allocateParams(api);
+        ngx_feature_set_resource(params, "DLSSG.Backbuffer", color.Get());
+        ngx_feature_set_resource(params, "DLSSG.OutputInterpolated", output.Get());
+        ngx_feature_set_resource(params, "DLSSG.OutputReal", real.Get());
+        ngx_feature_set_resource(params, "DLSSG.Depth", depth.Get());
+        ngx_feature_set_resource(params, "DLSSG.MVecs", motions[1].Get());
+        ngx_feature_set_float(params, "DLSSG.CameraNear", .1f);
+        ngx_feature_set_float(params, "DLSSG.CameraFar", 1000);
+        ngx_feature_set_float(params, "DLSSG.CameraFOV", 1);
+        ngx_feature_set_float(params, "FrameTimeDeltaInMsec", 1000.f / 30);
+        ngx_feature_set_float(params, "DLSSG.MvecScaleX", 1.f / extent);
+        ngx_feature_set_float(params, "DLSSG.MvecScaleY", 1.f / extent);
+        ngx_feature_set_uint(params, "DLSSG.CameraMotionIncluded", 0);
+        auto rejected = gpu.makeRecording();
+        if (orthographic) {
+          ngx_feature_set_uint(params, "DLSSG.CameraMotionIncluded", 1);
+          ngx_feature_set_uint(params, "DLSSG.OrthoProjection", 1);
+          checkNgxResult(api.evaluate(rejected.list.Get(), features[mode], params, nullptr),
+              ngx_fixture_result_missing_input(), "FG ortho missing view-to-clip");
+          ngx_feature_set_pointer(params, "DLSSG.CameraViewToClip", viewToClip);
+          checkNgxResult(api.evaluate(rejected.list.Get(), features[mode], params, nullptr),
+              ngx_fixture_result_missing_input(), "FG ortho missing basis");
+          const char* keys[4][3] = {{"DLSSG.CameraPosX","DLSSG.CameraPosY","DLSSG.CameraPosZ"},
+              {"DLSSG.CameraUpX","DLSSG.CameraUpY","DLSSG.CameraUpZ"},
+              {"DLSSG.CameraRightX","DLSSG.CameraRightY","DLSSG.CameraRightZ"},
+              {"DLSSG.CameraFwdX","DLSSG.CameraFwdY","DLSSG.CameraFwdZ"}};
+          const float basis[4][3] = {{0,0,0},{0,1,0},{1,0,0},{0,0,1}};
+          for (UINT vector = 0; vector != 4; ++vector) for (UINT axis = 0; axis != 3; ++axis)
+            ngx_feature_set_float(params, keys[vector][axis], basis[vector][axis]);
+          const float scale = viewToClip[0];
+          for (float invalid : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), 0.f}) {
+            viewToClip[0] = invalid;
+            checkNgxResult(api.evaluate(rejected.list.Get(), features[mode], params, nullptr),
+                ngx_fixture_result_invalid_parameter(), "FG invalid ortho view-to-clip");
+          }
+          viewToClip[0] = scale;
+          ngx_feature_set_uint(params, "DLSSG.CameraMotionIncluded", 0);
+        }
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[mode], params, nullptr),
+            ngx_fixture_result_missing_input(), "FG missing clip-to-prev");
+        ngx_feature_set_pointer(params, "DLSSG.ClipToPrevClip", matrix);
+        matrix[12] = std::numeric_limits<float>::quiet_NaN();
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[mode], params, nullptr),
+            ngx_fixture_result_invalid_parameter(), "FG NaN clip-to-prev");
+        matrix[12] = 8.f/extent; matrix[5] = std::numeric_limits<float>::infinity();
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[mode], params, nullptr),
+            ngx_fixture_result_invalid_parameter(), "FG infinite clip-to-prev");
+        matrix[5] = 1;
+        matrix[15] = 0;
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[mode], params, nullptr),
+            ngx_fixture_result_invalid_parameter(), "FG singular clip-to-prev");
+        matrix[15] = 1;
+        resetAndDestroyParams(api, params);
+        check(rejected.list->Close(), "FG camera rejects close"); gpu.executeAndWait(rejected.list.Get());
+        if (ngxPresentPixels(gpu, output.Get(), write) != sentinel ||
+            ngxPresentPixels(gpu, real.Get(), write) != sentinel) fail("FG rejected camera modified output");
+        std::printf("OWNED_D3D12_NGX_REJECT case=camera_matrix ortho=%u missing=missing_input nan=invalid_parameter infinity=invalid_parameter singular=invalid_parameter output_untouched=1\n", UINT(orthographic));
+        if (orthographic) std::puts("OWNED_D3D12_NGX_REJECT case=ortho_camera missing_matrix=missing_input missing_basis=missing_input nan=invalid_parameter infinity=invalid_parameter singular=invalid_parameter outputs_untouched=1");
+      }
+      auto record = ngxPresentEvaluate(api, gpu, features[mode], frame, !frame, color.Get(), nullptr,
+          output.Get(), depth.Get(), motions[mode ? 1 : 0].Get(), true, false, nullptr,
+          mode == 1 ? matrix : nullptr, mode != 1, orthographic ? viewToClip : nullptr);
+      std::fill_n(matrix, 16, std::numeric_limits<float>::quiet_NaN()); // Evaluate must snapshot caller memory.
+      std::fill_n(viewToClip, 16, std::numeric_limits<float>::quiet_NaN());
+      if (frame == 5) checkNgxResult(api.release(features[mode]), ngx_fixture_result_success(), "FG camera release before execute");
+      gpu.executeAndWait(record.list.Get());
+      images[mode] = ngxPresentPixels(gpu, output.Get(), write);
+      if (images[mode] == sentinel) fail("FG camera output unwritten");
+    }
+    int maxDelta = 0;
+    for (size_t i = 0; i != images[0].size(); ++i)
+      maxDelta = std::max(maxDelta, std::abs(int(images[0][i]) - int(images[1][i])));
+    if (maxDelta > 1) fail("FG camera reconstruction differs from equivalent supplied motion");
+    const bool effective = frame >= 2 && images[0] != images[2];
+    effectiveFrames += UINT(effective);
+    std::printf("OWNED_D3D12_NGX_CAMERA_MOTION ortho=%u frame=%u max_delta=%d different_zero=%u row_major=1 translated_last_row=1 matrix_snapshotted=1\n", UINT(orthographic), frame, maxDelta, UINT(effective));
+  }
+  if (!effectiveFrames) fail("FG camera comparison did not exercise nonzero effective motion");
+  std::printf("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_camera_motion ortho=%u frames=6 independent_features=3 equivalent_motion=1 nonzero_effect=1 release_before_execute=1\n", UINT(orthographic));
+}
+void runPublicFgUi(const NgxApi &api, Gpu &gpu) {
+  constexpr UINT extent = ngxPresentExtent, atlas = extent + 8, uiX = 3, uiY = 5;
+  constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  constexpr auto write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  NVSDK_NGX_Handle* features[3]{};
+  for (UINT mode = 0; mode != 3; ++mode) {
+    auto params = allocateParams(api);
+    ngx_feature_set_uint(params,"DLSSG.Width",extent);
+    ngx_feature_set_uint(params,"DLSSG.Height",extent);
+    ngx_feature_set_uint(params,"DLSSG.InternalWidth",extent);
+    ngx_feature_set_uint(params,"DLSSG.InternalHeight",extent);
+    ngx_feature_set_uint(params,"DLSSG.BackbufferFormat",DXGI_FORMAT_R8G8B8A8_UNORM);
+    ngx_feature_set_uint(params,"DLSSG.DepthInverted",1);
+    auto record = gpu.makeRecording();
+    if (!mode) {
+      ngx_feature_set_uint(params,"DLSSG.UserInterfaceRecompositionEnabled",2);
+      checkNgxResult(api.create(record.list.Get(),11,params,&features[mode]),ngx_fixture_result_invalid_parameter(),"FG invalid UIR boolean");
+      if (features[mode]) fail("invalid UIR created feature");
+    }
+    ngx_feature_set_uint(params,"DLSSG.UserInterfaceRecompositionEnabled",mode != 2);
+    checkNgxResult(api.create(record.list.Get(),11,params,&features[mode]),ngx_fixture_result_success(),"FG UI create");
+    check(record.list->Close(),"FG UI create close"); resetAndDestroyParams(api,params);
+  }
+  for (UINT frame = 0; frame != 5; ++frame) {
+    auto scene = ngxPresentScene(frame,false), composite = scene;
+    std::vector<float> overlay(atlas * atlas * 4,1.f), alpha(atlas * atlas,1.f);
+    for (UINT y = 0; y != extent; ++y) for (UINT x = 0; x != extent; ++x) {
+      const float a = x < 32 ? 1.f : x < 64 ? .5f : 0.f;
+      const UINT i = (y * extent + x) * 4, u = ((y + uiY) * atlas + x + uiX) * 4;
+      alpha[u / 4] = a; overlay[u + 3] = a;
+      for (UINT c = 0; c != 3; ++c) {
+        overlay[u + c] = a * (.5f / (1u << c));
+        composite[i + c] = uint8_t(std::lround(255.f * overlay[u + c] + (1.f - a) * scene[i + c]));
+      }
+    }
+    auto depth = createTexture(gpu.device.Get(),extent,extent,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto motion = createTexture(gpu.device.Get(),extent,extent,DXGI_FORMAT_R16G16_FLOAT,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto hudless = createTexture(gpu.device.Get(),extent,extent,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto color = createTexture(gpu.device.Get(),extent,extent,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto ui = createTexture(gpu.device.Get(),atlas,atlas,DXGI_FORMAT_R32G32B32A32_FLOAT,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto uiAlpha = createTexture(gpu.device.Get(),atlas,atlas,DXGI_FORMAT_R32_FLOAT,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST);
+    std::vector<float> depths(extent * extent,.75f);
+    std::vector<uint16_t> vectors(extent * extent * 2,0);
+    for (size_t i = 0; i < vectors.size(); i += 2) vectors[i] = 0x4400;
+    uploadTexture(gpu,depth.Get(),depths.data(),extent * 4,read);
+    uploadTexture(gpu,motion.Get(),vectors.data(),extent * 4,read);
+    uploadTexture(gpu,hudless.Get(),scene.data(),extent * 4,read);
+    uploadTexture(gpu,color.Get(),composite.data(),extent * 4,read);
+    uploadTexture(gpu,ui.Get(),overlay.data(),atlas * 16,read);
+    uploadTexture(gpu,uiAlpha.Get(),alpha.data(),atlas * 4,read);
+    std::array<Recording,3> records;
+    std::array<TextureReadback,3> readbacks;
+    for (UINT mode = 0; mode != 3; ++mode) {
+      auto output = createTexture(gpu.device.Get(),extent,extent,DXGI_FORMAT_R8G8B8A8_UNORM,
+          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_DEST);
+      const std::vector<uint8_t> sentinel(extent * extent * 4,19);
+      uploadTexture(gpu,output.Get(),sentinel.data(),extent * 4,write);
+      auto params = allocateParams(api);
+      ngx_feature_set_resource(params,"DLSSG.Backbuffer",mode == 2 ? hudless.Get() : color.Get());
+      ngx_feature_set_resource(params,"DLSSG.HUDLess",mode == 2 ? nullptr : hudless.Get());
+      ngx_feature_set_resource(params,"DLSSG.UI",mode == 0 ? ui.Get() : nullptr);
+      ngx_feature_set_resource(params,"DLSSG.UIAlpha",mode == 1 ? uiAlpha.Get() : nullptr);
+      ngx_feature_set_resource(params,"DLSSG.OutputInterpolated",output.Get());
+      ngx_feature_set_resource(params,"DLSSG.Depth",depth.Get());
+      ngx_feature_set_resource(params,"DLSSG.MVecs",motion.Get());
+      ngx_feature_set_uint(params,"DLSSG.UISubrectBaseX",uiX); ngx_feature_set_uint(params,"DLSSG.UISubrectBaseY",uiY);
+      ngx_feature_set_uint(params,"DLSSG.UIAlphaSubrectBaseX",uiX); ngx_feature_set_uint(params,"DLSSG.UIAlphaSubrectBaseY",uiY);
+      ngx_feature_set_uint(params,"DLSSG.BackbufferFrameID",frame);
+      ngx_feature_set_uint(params,"DLSSG.Reset",frame == 0);
+      ngx_feature_set_float(params,"FrameTimeDeltaInMsec",1000.f / 30);
+      ngx_feature_set_float(params,"DLSSG.MvecScaleX",1.f / extent);
+      ngx_feature_set_float(params,"DLSSG.MvecScaleY",1.f / extent);
+      ngx_feature_set_float(params,"DLSSG.CameraNear",.1f);
+      ngx_feature_set_float(params,"DLSSG.CameraFar",1000);
+      ngx_feature_set_float(params,"DLSSG.CameraFOV",1);
+      records[mode] = gpu.makeRecording();
+      if (!frame && !mode) {
+        auto rejected = gpu.makeRecording();
+        ngx_feature_set_resource(params,"DLSSG.HUDLess",nullptr);
+        checkNgxResult(api.evaluate(rejected.list.Get(),features[mode],params,nullptr),ngx_fixture_result_missing_input(),"FG UI missing HUDLess");
+        ngx_feature_set_resource(params,"DLSSG.HUDLess",hudless.Get());
+        ngx_feature_set_resource(params,"DLSSG.UI",nullptr);
+        checkNgxResult(api.evaluate(rejected.list.Get(),features[mode],params,nullptr),ngx_fixture_result_missing_input(),"FG UIR missing UI");
+        ngx_feature_set_resource(params,"DLSSG.UI",ui.Get());
+        ngx_feature_set_uint(params,"DLSSG.UISubrectBaseX",9);
+        checkNgxResult(api.evaluate(rejected.list.Get(),features[mode],params,nullptr),ngx_fixture_result_invalid_parameter(),"FG UI invalid origin");
+        ngx_feature_set_uint(params,"DLSSG.UISubrectBaseX",uiX);
+        ngx_feature_set_resource(params,"DLSSG.UIAlpha",uiAlpha.Get());
+        checkNgxResult(api.evaluate(rejected.list.Get(),features[mode],params,nullptr),ngx_fixture_result_unsupported_parameter(),"FG ambiguous dual alpha");
+        ngx_feature_set_resource(params,"DLSSG.UIAlpha",nullptr);
+        ngx_feature_set_resource(params,"DLSSG.UI",output.Get());
+        checkNgxResult(api.evaluate(rejected.list.Get(),features[mode],params,nullptr),ngx_fixture_result_invalid_parameter(),"FG UI output alias");
+        ngx_feature_set_resource(params,"DLSSG.UI",ui.Get());
+        check(rejected.list->Close(),"FG rejected UI close"); gpu.executeAndWait(rejected.list.Get());
+        if (ngxPresentPixels(gpu,output.Get(),write) != sentinel) fail("rejected UI modified output");
+      }
+      if (!frame && mode == 1) {
+        ngx_feature_set_uint(params,"DLSSG.UIAlphaSubrectBaseY",9);
+        checkNgxResult(api.evaluate(records[mode].list.Get(),features[mode],params,nullptr),ngx_fixture_result_invalid_parameter(),"FG UIAlpha invalid origin");
+        ngx_feature_set_uint(params,"DLSSG.UIAlphaSubrectBaseY",uiY);
+        ngx_feature_set_resource(params,"DLSSG.UIAlpha",ui.Get());
+        checkNgxResult(api.evaluate(records[mode].list.Get(),features[mode],params,nullptr),ngx_fixture_result_unsupported_parameter(),"FG UIAlpha invalid format");
+        ngx_feature_set_resource(params,"DLSSG.UIAlpha",uiAlpha.Get());
+      }
+      checkNgxResult(api.evaluate(records[mode].list.Get(),features[mode],params,nullptr),ngx_fixture_result_success(),"FG UI evaluate");
+      resetAndDestroyParams(api,params);
+      readbacks[mode] = createTextureReadback(gpu,output.Get());
+      transition(records[mode].list.Get(),output.Get(),write,D3D12_RESOURCE_STATE_COPY_SOURCE);
+      copyTextureToReadback(records[mode].list.Get(),output.Get(),readbacks[mode]);
+      transition(records[mode].list.Get(),output.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,write);
+      check(records[mode].list->Close(),"FG UI close");
+    }
+    depth.Reset(); motion.Reset(); hudless.Reset(); color.Reset(); ui.Reset(); uiAlpha.Reset();
+    if (frame == 4) for (auto feature : features) checkNgxResult(api.release(feature),ngx_fixture_result_success(),"FG UI release before execute");
+    for (UINT replay = 0; replay <= UINT(frame == 4); ++replay) {
+      std::array<std::vector<uint8_t>,3> images;
+      for (UINT mode = 0; mode != 3; ++mode) {
+        gpu.executeAndWait(records[mode].list.Get());
+        uint8_t* bytes = nullptr;
+        check(readbacks[mode].buffer->Map(0,nullptr,reinterpret_cast<void**>(&bytes)),"FG UI map");
+        images[mode].resize(extent * extent * 4);
+        for (UINT y = 0; y != extent; ++y) std::memcpy(images[mode].data() + y * extent * 4,
+            bytes + readbacks[mode].footprint.Offset + y * readbacks[mode].footprint.Footprint.RowPitch,extent * 4);
+        readbacks[mode].buffer->Unmap(0,nullptr);
+      }
+      if (frame == 3 && images[2] == scene) fail("FG UI control did not interpolate");
+      for (UINT y = 0; y != extent; ++y) for (UINT x = 0; x != extent; ++x) for (UINT c = 0; c != 3; ++c) {
+        const UINT i = (y * extent + x) * 4 + c, u = ((y + uiY) * atlas + x + uiX) * 4;
+        const float a = alpha[u / 4];
+        const int expected = int(std::lround(255.f * overlay[u + c] + (1.f - a) * images[2][i]));
+        for (UINT mode = 0; mode != 2; ++mode)
+          if (std::abs(int(images[mode][i]) - expected) > 2) fail("FG premultiplied UI/UIAlpha composition");
+      }
+    }
+  }
+  std::puts("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_ui premultiplied=1 alpha_only=1 independent_ui_origin=1 invalid_inputs=1 release_before_execute=1 replay=1");
 }
 void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
   constexpr UINT extent = ngxPresentExtent;
   constexpr UINT render = 96;
   constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   constexpr auto write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  NVSDK_NGX_Handle* features[] = {ngxPresentFeature(api, gpu), ngxPresentFeature(api, gpu), ngxPresentFeature(api, gpu), ngxPresentFeature(api, gpu), ngxPresentFeature(api, gpu)};
+  NVSDK_NGX_Handle* features[8]{};
+  for (auto& feature : features) feature = ngxPresentFeature(api, gpu);
   unsigned distortionFrames = 0;
   for (UINT frame = 0; frame != 8; ++frame) {
-    std::vector<uint8_t> reference, floatReference, control;
-    for (UINT variant = 0; variant != 5; ++variant) {
-      const UINT atlas = variant == 4 ? 2 : variant == 2 ? 1 : 0;
+    std::vector<uint8_t> reference, floatReference, precisionReference, control;
+    for (UINT variant = 0; variant != 8; ++variant) {
+      const UINT atlas = variant == 4 || variant == 5 || variant == 7 ? 2 : variant == 2 ? 1 : 0;
       const bool fieldEnabled = variant != 0 && frame != 6;
       const UINT colorWidth = extent + (atlas == 2 ? 32 : 0), colorHeight = extent + (atlas == 2 ? 40 : 0);
       const UINT left = atlas == 2 ? 11 : 0, top = atlas == 2 ? 13 : 0;
+      const UINT hx = atlas == 2 ? 3 : left, hy = atlas == 2 ? 5 : top;
+      const UINT ox = atlas == 2 ? 7 : left, oy = atlas == 2 ? 9 : top;
+      const UINT rx = atlas == 2 ? 17 : left, ry = atlas == 2 ? 19 : top;
       const std::vector<uint8_t> sentinel(colorWidth * colorHeight * 4, 19);
       const UINT depthWidth = render + atlas * 8, depthHeight = render + atlas * 12;
       const UINT motionWidth = render + atlas * 16, motionHeight = render + atlas * 20;
@@ -171,11 +472,14 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
       const UINT fieldWidth = fieldExtent + atlas * 8, fieldHeight = fieldExtent + atlas * 12;
       const UINT fieldX = atlas * 3, fieldY = atlas * 5;
       const bool float32 = variant >= 3;
+      const bool lowPrecision = variant == 5 || variant == 7;
       auto field = createTexture(gpu.device.Get(), fieldWidth, fieldHeight,
+          variant == 7 ? DXGI_FORMAT_R8G8B8A8_UNORM :
           float32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT,
           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
       std::vector<uint16_t> fieldHalf(fieldWidth * fieldHeight * 4, 0x3600);
       std::vector<float> fieldFloat(fieldWidth * fieldHeight * 4, .375f);
+      std::vector<uint8_t> fieldBytes(fieldWidth * fieldHeight * 4, 255);
       for (UINT y = 0; y != fieldExtent; ++y) for (UINT x = 0; x != fieldExtent; ++x) {
         const float u = (x + .5f) / fieldExtent - .5f;
         // Centered 1.25x horizontal map and its inverse, in normalized UV units.
@@ -185,15 +489,22 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
           const UINT index = ((y + fieldY) * fieldWidth + x + fieldX) * 4 + c;
           std::memcpy(&fieldHalf[index], &value, sizeof(value));
           fieldFloat[index] = static_cast<float>(value);
+          if (variant == 5) fieldFloat[index] = (fieldFloat[index] + 1.f) * 2.f;
+          if (variant >= 6) {
+            fieldBytes[index] = uint8_t(64 + (x * 3 + c * 37) % 127);
+            fieldFloat[index] = float(fieldBytes[index]) / 255.f * .25f - .125f;
+          }
         }
       }
-      uploadTexture(gpu, field.Get(), float32 ? static_cast<const void*>(fieldFloat.data()) : fieldHalf.data(),
-          fieldWidth * (float32 ? 16 : 8), read);
+      uploadTexture(gpu, field.Get(), variant == 7 ? static_cast<const void*>(fieldBytes.data()) :
+          float32 ? static_cast<const void*>(fieldFloat.data()) : fieldHalf.data(),
+          fieldWidth * (variant == 7 ? 4 : float32 ? 16 : 8), read);
       const auto scene = ngxPresentScene(frame, false);
       std::vector<uint8_t> pixels(colorWidth * colorHeight * 4, 203);
       for (UINT y = 0; y != extent; ++y)
-        std::memcpy(pixels.data() + ((y + top) * colorWidth + left) * 4, scene.data() + y * extent * 4, extent * 4);
+        std::memcpy(pixels.data() + ((y + hy) * colorWidth + hx) * 4, scene.data() + y * extent * 4, extent * 4);
       uploadTexture(gpu, hudless.Get(), pixels.data(), colorWidth * 4, read);
+      std::fill(pixels.begin(), pixels.end(), 203);
       const auto composited = ngxPresentScene(frame, true);
       for (UINT y = 0; y != extent; ++y)
         std::memcpy(pixels.data() + ((y + top) * colorWidth + left) * 4, composited.data() + y * extent * 4, extent * 4);
@@ -215,6 +526,9 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
       ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldSubrectBaseY", fieldY);
       ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldSubrectWidth", fieldExtent);
       ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldSubrectHeight", fieldExtent);
+      ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", lowPrecision);
+      ngx_feature_set_float(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.Scale", variant == 7 ? .25f : .5f);
+      ngx_feature_set_float(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.Bias", variant == 7 ? -.125f : -1.f);
       ngx_feature_set_resource(params, "DLSSG.Depth", depth.Get());
       ngx_feature_set_resource(params, "DLSSG.MVecs", motion.Get());
       ngx_feature_set_uint(params, "DLSSG.DepthSubrectBaseX", dx);
@@ -227,6 +541,17 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
       ngx_feature_set_uint(params, "DLSSG.MVecsSubrectBaseY", my);
       ngx_feature_set_uint(params, "DLSSG.BackbufferSubrectBaseX", left);
       ngx_feature_set_uint(params, "DLSSG.BackbufferSubrectBaseY", top);
+      if (atlas == 2) {
+        // Explicit resource origins override the deprecated shared origin.
+        ngx_feature_set_uint(params, "DLSSG.InputBackbufferSubrectBaseX", left);
+        ngx_feature_set_uint(params, "DLSSG.InputBackbufferSubrectBaseY", top);
+        ngx_feature_set_uint(params, "DLSSG.HUDLessSubrectBaseX", hx);
+        ngx_feature_set_uint(params, "DLSSG.HUDLessSubrectBaseY", hy);
+        ngx_feature_set_uint(params, "DLSSG.OutputInterpolatedSubrectBaseX", ox);
+        ngx_feature_set_uint(params, "DLSSG.OutputInterpolatedSubrectBaseY", oy);
+        ngx_feature_set_uint(params, "DLSSG.OutputRealSubrectBaseX", rx);
+        ngx_feature_set_uint(params, "DLSSG.OutputRealSubrectBaseY", ry);
+      }
       ngx_feature_set_uint(params, "DLSSG.BackbufferFrameID", frame);
       ngx_feature_set_uint(params, "DLSSG.Reset", frame == 0 || frame == 5);
       ngx_feature_set_float(params, "FrameTimeDeltaInMsec", 1000.f / 30);
@@ -271,9 +596,9 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
         checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
             ngx_fixture_result_invalid_parameter(), "FG distortion/output alias rejected");
         ngx_feature_set_resource(params, "DLSSG.BidirectionalDistortionField", field.Get());
-        ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", 1);
+        ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", 2);
         checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
-            ngx_fixture_result_unsupported_parameter(), "FG unsupported precision transform rejected");
+            ngx_fixture_result_invalid_parameter(), "FG invalid precision flag rejected");
         ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", 0);
         ngx_feature_set_resource(params, "DLSSG.BidirectionalDistortionField", motion.Get());
         checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
@@ -283,6 +608,27 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
         gpu.executeAndWait(rejected.list.Get());
         if (ngxPresentPixels(gpu, output.Get(), write) != sentinel) fail("FG invalid subrect modified output");
         if (ngxPresentPixels(gpu, real.Get(), write) != sentinel) fail("FG invalid input modified real output");
+      }
+      if (variant == 4 && frame == 0) {
+        auto rejected = gpu.makeRecording();
+        for (const auto& origin : {std::pair{"DLSSG.InputBackbufferSubrectBaseX", left},
+             std::pair{"DLSSG.HUDLessSubrectBaseY", hy},
+             std::pair{"DLSSG.OutputInterpolatedSubrectBaseX", ox},
+             std::pair{"DLSSG.OutputRealSubrectBaseY", ry}}) {
+          ngx_feature_set_uint(params, origin.first, UINT_MAX);
+          checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
+              ngx_fixture_result_invalid_parameter(), "FG independent color origin overflow");
+          ngx_feature_set_uint(params, origin.first, origin.second);
+        }
+        ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", 1);
+        ngx_feature_set_float(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.Scale", INFINITY);
+        checkNgxResult(api.evaluate(rejected.list.Get(), features[variant], params, nullptr),
+            ngx_fixture_result_invalid_parameter(), "FG nonfinite precision scale");
+        ngx_feature_set_uint(params, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision", 0);
+        check(rejected.list->Close(), "FG color origin rejection close");
+        gpu.executeAndWait(rejected.list.Get());
+        if (ngxPresentPixels(gpu, output.Get(), write) != sentinel ||
+            ngxPresentPixels(gpu, real.Get(), write) != sentinel) fail("FG rejected color origin modified output");
       }
       auto record = gpu.makeRecording();
       checkNgxResult(api.evaluate(record.list.Get(), features[variant], params, nullptr),
@@ -304,9 +650,13 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
       uint8_t* mapped = nullptr;
       check(realReadback.buffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "FG real output map");
       auto expectedReal = realEnabled ? pixels : sentinel;
+      if (realEnabled)
+        for (UINT y = 0; y != extent; ++y)
+          std::memcpy(expectedReal.data() + ((y + ry) * colorWidth + rx) * 4,
+              pixels.data() + ((y + top) * colorWidth + left) * 4, extent * 4);
       if (realEnabled && rectOnly)
         for (UINT y = 0; y != colorHeight; ++y) for (UINT x = 0; x != colorWidth; ++x) {
-          if (x >= left && x < left + extent && y >= top && y < top + extent) continue;
+          if (x >= rx && x < rx + extent && y >= ry && y < ry + extent) continue;
           std::memcpy(expectedReal.data() + (y * colorWidth + x) * 4, sentinel.data(), 4);
         }
       for (UINT y = 0; y != colorHeight; ++y)
@@ -318,9 +668,9 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
       std::vector<uint8_t> image(extent * extent * 4);
       for (UINT y = 0; y != extent; ++y)
         std::memcpy(image.data() + y * extent * 4, mapped + readback.footprint.Offset +
-            (y + top) * readback.footprint.Footprint.RowPitch + left * 4, extent * 4);
+            (y + oy) * readback.footprint.Footprint.RowPitch + ox * 4, extent * 4);
       for (UINT y = 0; y != colorHeight; ++y) for (UINT x = 0; x != colorWidth; ++x) {
-        if (x >= left && x < left + extent && y >= top && y < top + extent) continue;
+        if (x >= ox && x < ox + extent && y >= oy && y < oy + extent) continue;
         if (std::memcmp(mapped + readback.footprint.Offset + y * readback.footprint.Footprint.RowPitch + x * 4,
                         (rectOnly ? sentinel : pixels).data() + (y * colorWidth + x) * 4, 4))
           fail("FG outside viewport copy/preserve flag mismatch");
@@ -333,11 +683,13 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
         if (frame > 1 && frame != 5 && image != control) ++distortionFrames;
         reference = std::move(image);
       } else if (variant == 3) floatReference = std::move(image);
-      else if (image != (float32 ? floatReference : reference)) {
+      else if (variant == 6) precisionReference = std::move(image);
+      else if (image != (variant == 7 ? precisionReference : float32 ? floatReference : reference)) {
+        const auto& expected = variant == 7 ? precisionReference : float32 ? floatReference : reference;
         unsigned maximum = 0, changed = 0;
         for (size_t i = 0; i != image.size(); ++i) {
-          maximum = std::max(maximum, unsigned(std::abs(int(image[i]) - int((float32 ? floatReference : reference)[i]))));
-          changed += image[i] != (float32 ? floatReference : reference)[i];
+          maximum = std::max(maximum, unsigned(std::abs(int(image[i]) - int(expected[i]))));
+          changed += image[i] != expected[i];
         }
         std::printf("OWNED_D3D12_NGX_FG_DISTORTION_MISMATCH frame=%u variant=%u maximum=%u changed=%u\n",
             frame, variant, maximum, changed);
@@ -352,10 +704,14 @@ void runPublicFgSubrect(const NgxApi &api, Gpu &gpu) {
   std::printf("OWNED_D3D12_NGX_FG_DISTORTION_PASS affected_frames=%u half_resolution=1 rejected=4 enable_disable=1\n", distortionFrames);
   std::puts("OWNED_D3D12_NGX_FG_SUBRECT_PASS frames=8 overflow_rejected=1 output_untouched=1 outside_copied=1");
   std::puts("OWNED_D3D12_NGX_FG_REAL_PASS frames=8 aliases_rejected=5 rect_only=1 release_replay=1");
+  std::puts("OWNED_D3D12_NGX_FG_INPUTS_PASS color_origins=4 precision_float=1 precision_unorm=1 invalid_untouched=1");
 }
 
-void runPublicRr(const NgxApi &api, Gpu &gpu, unsigned variant=0) {
-  const char *variantName=variant==1?"linear-":variant==2?"packed-":variant==3?"mirror-":"";
+std::vector<uint16_t> runPublicRr(const NgxApi &api, Gpu &gpu, unsigned variant=0) {
+  const char *variantName=variant==1?"linear-":variant==2?"packed-":variant==3?"mirror-":
+      variant==4?"responsivity-zero-":variant==5?"responsivity-one-":
+      variant==6?"responsivity-zero-tight-":variant==7?"responsivity-one-tight-":"";
+  std::vector<uint16_t> historyPixels;
   auto params = allocateParams(api);
   ngx_fixture_set_create_flags74(params,owned_rr::Width,owned_rr::Height,owned_rr::Width,owned_rr::Height);
   ngx_fixture_set_create_options(params,2|8,0);
@@ -395,6 +751,39 @@ void runPublicRr(const NgxApi &api, Gpu &gpu, unsigned variant=0) {
     ngx_feature_set_float(params,"Jitter.Offset.X",pattern.jitterX); ngx_feature_set_float(params,"Jitter.Offset.Y",pattern.jitterY);
     ngx_feature_set_uint(params,"Reset",pattern.reset);
     auto record=gpu.makeRecording();
+    ComPtr<ID3D12Resource> responsivity;
+    if (variant>=4) {
+      const UINT left=variant>=6?0:2, top=variant>=6?0:3;
+      const UINT atlasWidth=owned_rr::Width+(variant>=6?0:3), atlasHeight=owned_rr::Height+(variant>=6?0:5);
+      // Opposite-valued margins catch accidentally ignoring the public origin.
+      const bool zero=(variant%2)==0;
+      std::vector<uint8_t> mask(size_t(atlasWidth)*atlasHeight,zero?255:0);
+      for(UINT y=0;y<owned_rr::Height;++y)
+        std::fill_n(mask.data()+size_t(y+top)*atlasWidth+left,owned_rr::Width,zero?0:255);
+      responsivity=createTexture(gpu.device.Get(),atlasWidth,atlasHeight,DXGI_FORMAT_R8_UNORM,
+          D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST);
+      uploadTexture(gpu,responsivity.Get(),mask.data(),atlasWidth,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      ngx_feature_set_resource(params,"DLSSD.ResponsivityMask",responsivity.Get());
+      ngx_feature_set_uint(params,"DLSSD.ResponsivityMask.Subrect.Base.X",left);
+      ngx_feature_set_uint(params,"DLSSD.ResponsivityMask.Subrect.Base.Y",top);
+      if(index==1 && variant==4) {
+        ngx_feature_set_uint(params,"DLSSD.ResponsivityMask.Subrect.Base.X",UINT_MAX);
+        checkNgxResult(api.evaluate(record.list.Get(),feature,params,nullptr),ngx_fixture_result_invalid_parameter(),"RR responsivity overflowing subrect rejected");
+        ngx_feature_set_uint(params,"DLSSD.ResponsivityMask.Subrect.Base.X",2);
+        ngx_feature_set_resource(params,"DLSSD.ResponsivityMask",textures[2].Get());
+        checkNgxResult(api.evaluate(record.list.Get(),feature,params,nullptr),ngx_fixture_result_invalid_parameter(),"RR responsivity vector format rejected");
+        ngx_feature_set_resource(params,"DLSSD.ResponsivityMask",output.Get());
+        checkNgxResult(api.evaluate(record.list.Get(),feature,params,nullptr),ngx_fixture_result_invalid_parameter(),"RR responsivity output alias rejected");
+        ngx_feature_set_resource(params,"DLSSD.ResponsivityMask",nullptr);
+        checkNgxResult(api.evaluate(record.list.Get(),feature,params,nullptr),ngx_fixture_result_invalid_parameter(),"RR absent responsivity origin rejected");
+        ngx_feature_set_resource(params,"DLSSD.ResponsivityMask",responsivity.Get());
+        for(const char *key:{"DLSSD.SpecularRayDirectionHitDistance","DLSSD.Alpha","DLSSD.ColorBeforeTransparency"}) {
+          ngx_feature_set_resource(params,key,textures[3].Get());
+          checkNgxResult(api.evaluate(record.list.Get(),feature,params,nullptr),ngx_fixture_result_unsupported_parameter(),"RR guide without native consumer rejected");
+          ngx_feature_set_resource(params,key,nullptr);
+        }
+      }
+    }
     if (index==1) {
       ngx_feature_set_resource(params,"DLSS.Input.DiffuseAlbedo",nullptr);
       checkNgxResult(api.evaluate(record.list.Get(),feature,params,nullptr),ngx_fixture_result_invalid_parameter(),"RR missing guide rejected");
@@ -406,6 +795,7 @@ void runPublicRr(const NgxApi &api, Gpu &gpu, unsigned variant=0) {
     std::fill_n(pattern.world,16,0.0f); std::fill_n(pattern.projection,16,0.0f);
     resetAndDestroyParams(api,params);
     for(auto &texture:textures) texture.Reset();
+    responsivity.Reset();
     if(index==owned_rr::Frames) checkNgxResult(api.release(feature),ngx_fixture_result_success(),"RR release before execute");
     transition(record.list.Get(),output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
     copyTextureToReadback(record.list.Get(),output.Get(),readback);
@@ -422,6 +812,7 @@ void runPublicRr(const NgxApi &api, Gpu &gpu, unsigned variant=0) {
       if(pixel%4!=3 && pixels[pixel]) ++nonzero;
     }
     if(nonzero<owned_rr::Width*owned_rr::Height) fail("RR empty denoising output");
+    if(variant>=4 && index>1) historyPixels.insert(historyPixels.end(),pixels.begin(),pixels.end());
     char filename[64]; std::snprintf(filename,sizeof(filename),"public-rr-%sframe-%u.bin",variantName,index);
     FILE *file=std::fopen(filename,"wb"); if(!file) fail("RR oracle artifact open");
     if(std::fwrite(pixels.data(),sizeof(uint16_t),pixels.size(),file)!=pixels.size()) fail("RR oracle artifact write");
@@ -441,6 +832,18 @@ void runPublicRr(const NgxApi &api, Gpu &gpu, unsigned variant=0) {
     }
   }
   std::printf("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant=%u frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8\n",variant);
+  return historyPixels;
+}
+void runPublicRrResponsivity(const NgxApi &api,Gpu &gpu) {
+  const auto zero=runPublicRr(api,gpu,4);
+  const auto one=runPublicRr(api,gpu,5);
+  if(zero!=runPublicRr(api,gpu,6) || one!=runPublicRr(api,gpu,7))
+    fail("RR responsivity atlas origin changed numeric output");
+  if(zero.size()!=one.size()) fail("RR responsivity image extent mismatch");
+  size_t changed=0;
+  for(size_t i=0;i<zero.size();++i) if(i%4!=3 && zero[i]!=one[i]) ++changed;
+  if(!changed) fail("RR responsivity mask did not change numeric RGB output");
+  std::printf("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr_responsivity changed_rgb=%zu origins=1 invalid_resource_subrect=1 release_before_execute=1 replay=1\n",changed);
 }
 void runPublicAlpha(const NgxApi &api,Gpu &gpu) {
   auto params=allocateParams(api); ngx_fixture_set_create_flags74(params,64,64,128,128);
@@ -525,7 +928,10 @@ int main(int argc, char** argv) {
   }
   const bool alphaOnly = argc == 2 && std::strcmp(argv[1],"--alpha-only") == 0;
   const bool fgOnly = argc == 2 && std::strcmp(argv[1],"--fg-only") == 0;
-  if (argc != 1 && !present && !alphaOnly && !fgOnly) fail("expected no arguments, --mode present [--present-control <path>], --alpha-only or --fg-only");
+  const bool rrOnly = argc == 2 && std::strcmp(argv[1],"--rr-only") == 0;
+  const bool rrGuidesOnly = argc == 2 && std::strcmp(argv[1],"--rr-guides-only") == 0;
+  if (argc != 1 && !present && !alphaOnly && !fgOnly && !rrOnly && !rrGuidesOnly)
+    fail("expected no arguments, --mode present [--present-control <path>], --alpha-only, --fg-only, --rr-only or --rr-guides-only");
   requireOwnedBackend();
   NgxApi api; Gpu gpu;
   checkNgxResult(api.init(0x4e47584645415455ull,L"C:\\",gpu.device.Get(),nullptr,ngx_fixture_sdk_version()),ngx_fixture_result_success(),"public feature init");
@@ -540,8 +946,20 @@ int main(int argc, char** argv) {
     std::puts("OWNED_D3D12_NGX_ALPHA_PASS cases=1 release_before_execute=1 replay=1 rgb_alpha=gpu_readback");
     return 0;
   }
+  if (rrOnly || rrGuidesOnly) {
+    if(rrOnly) {
+      runPublicRr(api,gpu); runPublicRr(api,gpu,1); runPublicRr(api,gpu,2); runPublicRr(api,gpu,3);
+    }
+    runPublicRrResponsivity(api,gpu);
+    checkNgxResult(api.shutdown1(gpu.device.Get()),ngx_fixture_result_success(),"public RR shutdown");
+    std::puts("OWNED_D3D12_NGX_RR_PASS numeric_responsivity=1 invalid_resource_subrect=1 release_before_execute=1 replay=1");
+    return 0;
+  }
   checkCapabilities(api,gpu);
   runPublicFg(api,gpu);
+  runPublicFgCameraMotion(api,gpu);
+  runPublicFgCameraMotion(api,gpu,true);
+  runPublicFgUi(api,gpu);
   runPublicFgSceneChange(api,gpu);
   runPublicFgSubrect(api,gpu);
   if (fgOnly) {
@@ -553,6 +971,7 @@ int main(int argc, char** argv) {
   runPublicRr(api,gpu,1);
   runPublicRr(api,gpu,2);
   runPublicRr(api,gpu,3);
+  runPublicRrResponsivity(api,gpu);
   runPublicAlpha(api,gpu);
   checkNgxResult(api.shutdown1(gpu.device.Get()),ngx_fixture_result_success(),"public feature shutdown");
   std::puts("OWNED_D3D12_NGX_FEATURES_PASS");

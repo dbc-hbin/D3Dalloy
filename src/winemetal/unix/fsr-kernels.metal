@@ -256,6 +256,11 @@ struct YaaglFgParams {
     uint transfer;
     uint debugFlags;
     uint reset;
+    uint disableHint;
+    uint2 uiOrigin, sceneOrigin, presentOrigin;
+    uint uiMode;
+    uint reconstructCameraMotion;
+    float4x4 clipToPreviousClip;
 };
 
 static float3 fg_decode(float3 value, constant YaaglFgParams& params) {
@@ -287,9 +292,20 @@ kernel void yaagl_fg_decode_crop(
     destination.write(color, tid);
 }
 
+kernel void yaagl_fg_decode_distortion(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(1)]],
+    constant YaaglFgParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.extent)) return;
+    // NGX PrecisionInfo: hi = lo * Scale + Bias, for all four field channels.
+    destination.write(source.read(uint2(params.sourceOrigin) + tid) * params.motionScale.x + params.motionScale.y, tid);
+}
+
 kernel void yaagl_fg_normalize_motion(
     texture2d<float, access::read> source [[texture(0)]],
     texture2d<float, access::write> destination [[texture(1)]],
+    texture2d<float, access::read> depth [[texture(2)]],
     constant YaaglFgParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
     if (any(tid >= params.extent)) return;
@@ -299,6 +315,14 @@ kernel void yaagl_fg_normalize_motion(
     float2 value = source.read(sourcePosition).xy;
     float2 pixels = (value * params.motionScale - params.jitterCancellation) *
                     float2(params.outputExtent) / float2(params.motionTargetExtent);
+    if (params.reconstructCameraMotion) {
+        float2 uv = (float2(tid) + 0.5f) / float2(params.extent);
+        float4 clip = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), depth.read(tid).r, 1.0f);
+        // NGX rows occupy Metal columns: this is the public row-vector transform.
+        float4 previous = params.clipToPreviousClip * clip;
+        if (all(isfinite(previous)) && abs(previous.w) > 1.0e-6f)
+            pixels += (previous.xy / previous.w - clip.xy) * float2(0.5f, -0.5f) * float2(params.outputExtent);
+    }
     destination.write(float4(pixels, 0.0f, 0.0f), tid);
 }
 
@@ -307,11 +331,25 @@ kernel void yaagl_fg_encode_scatter(
     texture2d<float, access::write> destination [[texture(1)]],
     texture2d<float, access::read> depth [[texture(2)]],
     texture2d<float, access::read> motion [[texture(3)]],
+    texture2d<float, access::read> ui [[texture(4)]],
+    texture2d<float, access::read> scene [[texture(5)]],
+    texture2d<float, access::read> present [[texture(6)]],
     constant YaaglFgParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
     if (any(tid >= params.extent)) return;
     float4 color = source.read(tid);
     color.rgb = fg_encode(color.rgb, params);
+    if (params.uiMode) {
+        float4 overlay = ui.read(params.uiOrigin + tid);
+        float alpha = clamp(params.uiMode == 1u ? overlay.a : overlay.r, 0.0f, 1.0f);
+        // NGX defines premultiplication in the supplied color domain. Recompose
+        // after encoding, not through MetalFX's undocumented UI alpha convention.
+        float3 uiColor = params.uiMode == 1u ? overlay.rgb :
+            present.read(params.presentOrigin + tid).rgb -
+            (1.0f - alpha) * scene.read(params.sceneOrigin + tid).rgb;
+        color.rgb = uiColor + (1.0f - alpha) * color.rgb;
+        color.a = alpha + (1.0f - alpha) * color.a;
+    }
     // Provider diagnostics: generated color / normalized game motion / depth.
     // MetalFX does not expose its internal optical-flow or disocclusion buffers.
     if (params.debugFlags & 4u) {

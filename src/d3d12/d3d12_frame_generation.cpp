@@ -4,6 +4,7 @@
 #include "d3d12_device.hpp"
 #include "com/com_object.hpp"
 #include "winemetal_metal4_fg.h"
+#include "dxmt_buffer.hpp"
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -79,9 +80,10 @@ HRESULT retainTexture(MTLD3D12Device *device, ID3D12Resource *input,
 }
 struct OwnedFrameGenerationFrame {
   std::shared_ptr<Core> core;
-  std::array<Com<MTLD3D12Resource, false>, 5> resources;
-  std::array<TextureViewRef, 5> views;
-  std::array<D3D12_RESOURCE_STATES, 5> states{};
+  std::array<Com<MTLD3D12Resource, false>, 8> resources;
+  std::array<TextureViewRef, 7> views;
+  std::array<D3D12_RESOURCE_STATES, 8> states{};
+  Rc<BufferAllocation> disable_allocation;
   WMT::Reference<WMT::Object> native;
   bool generate = false;
 };
@@ -141,6 +143,10 @@ public:
     p.camera_info_present = desc.camera_info_present;
     p.depth_subrect_x = desc.depth_subrect_x; p.depth_subrect_y = desc.depth_subrect_y;
     p.motion_subrect_x = desc.motion_subrect_x; p.motion_subrect_y = desc.motion_subrect_y;
+    p.reconstruct_camera_motion = desc.reconstruct_camera_motion;
+    std::memcpy(p.clip_to_previous_clip, desc.clip_to_previous_clip, sizeof(p.clip_to_previous_clip));
+    p.projection_matrix_present = desc.projection_matrix_present;
+    std::memcpy(p.view_to_clip, desc.view_to_clip, sizeof(p.view_to_clip));
     std::lock_guard lock(core_->mutex);
     if (FAILED(hr = request(p.header, &frame->native))) return hr;
     if (!frame->native) return S_FALSE;
@@ -165,8 +171,12 @@ public:
         frame->resources[3], frame->views[3], false, true))) return hr;
     if (desc.distortion && FAILED(hr = retainTexture(device, desc.distortion,
         frame->resources[4], frame->views[4], false, false))) return hr;
+    if (desc.ui && FAILED(hr = retainTexture(device, desc.ui,
+        frame->resources[5], frame->views[5], false, false))) return hr;
+    if (desc.ui_alpha && FAILED(hr = retainTexture(device, desc.ui_alpha,
+        frame->resources[6], frame->views[6], false, false))) return hr;
     frame->states = {desc.present_color_state, desc.output_states[0], desc.hudless_color_state,
-        desc.real_output_state, desc.distortion_state};
+        desc.real_output_state, desc.distortion_state, desc.ui_state, desc.ui_alpha_state};
     WMTFGNativeCommand command{device->GetMTLDevice().handle, device->GetMetal4Compiler().handle};
     WMTFGdispatch_packet p{};
     p.header = {sizeof(p), WMTFG_BRIDGE_VERSION, WMTFG_DISPATCH, 0, core_->context};
@@ -185,6 +195,32 @@ public:
     p.distortion_state = desc.distortion_state;
     p.distortion_x = desc.distortion_x; p.distortion_y = desc.distortion_y;
     p.distortion_width = desc.distortion_width; p.distortion_height = desc.distortion_height;
+    p.independent_subrects = desc.independent_subrects;
+    p.present_x = desc.present_x; p.present_y = desc.present_y;
+    p.hudless_x = desc.hudless_x; p.hudless_y = desc.hudless_y;
+    p.output_x = desc.output_x; p.output_y = desc.output_y;
+    p.real_x = desc.real_x; p.real_y = desc.real_y;
+    p.distortion_low_precision = desc.distortion_low_precision;
+    p.distortion_scale = desc.distortion_scale; p.distortion_bias = desc.distortion_bias;
+    if (desc.ui) p.ui = frame->views[5].texture().handle;
+    if (desc.ui_alpha) p.ui_alpha = frame->views[6].texture().handle;
+    p.ui_x = desc.ui_x; p.ui_y = desc.ui_y;
+    p.ui_alpha_x = desc.ui_alpha_x; p.ui_alpha_y = desc.ui_alpha_y;
+    if (desc.disable_interpolation) {
+      Com<ID3D12Device> owner;
+      const auto output = desc.disable_interpolation->GetDesc();
+      if (FAILED(desc.disable_interpolation->GetDevice(IID_PPV_ARGS(&owner))) ||
+          owner.ptr() != static_cast<ID3D12Device *>(device) ||
+          output.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || output.Width < sizeof(UINT) ||
+          !(output.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return E_INVALIDARG;
+      auto resource = static_cast<MTLD3D12Resource *>(desc.disable_interpolation);
+      if (!resource->buffer || !resource->buffer->current()) return E_INVALIDARG;
+      frame->resources[7] = resource;
+      frame->states[7] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      frame->disable_allocation = resource->buffer->current();
+      p.disable_interpolation = frame->disable_allocation->buffer().handle;
+      p.disable_interpolation_offset = frame->disable_allocation->currentSuballocationOffset();
+    }
     std::lock_guard lock(core_->mutex);
     if (FAILED(hr = request(p.header, &frame->native))) return hr;
     if (!frame->native) return E_FAIL;
@@ -231,15 +267,16 @@ HRESULT GenerateOwnedFrameGenerationFrame(MTLD3D12Device *device, IMTLD3D12Frame
   if (FAILED(state->QueryInterface(kInternalStateId, reinterpret_cast<void **>(&internal)))) return E_INVALIDARG;
   try { return internal->Generate(device, *desc, frame); } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
 }
-std::array<MTLD3D12Resource *, 5> GetOwnedFrameGenerationResources(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+std::array<MTLD3D12Resource *, 8> GetOwnedFrameGenerationResources(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
   return {frame->resources[0].ptr(), frame->resources[1].ptr(), frame->resources[2].ptr(),
-      frame->resources[3].ptr(), frame->resources[4].ptr()};
+      frame->resources[3].ptr(), frame->resources[4].ptr(), frame->resources[5].ptr(), frame->resources[6].ptr(),
+      frame->resources[7].ptr()};
 }
-std::array<D3D12_RESOURCE_STATES, 5> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+std::array<D3D12_RESOURCE_STATES, 8> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
   return frame->states;
 }
 bool IsOwnedFrameGenerationOutput(const std::shared_ptr<OwnedFrameGenerationFrame> &frame, size_t index) {
-  return frame->generate && (index == 1 || index == 3);
+  return frame->generate && (index == 1 || index == 3 || index == 7);
 }
 void EncodeOwnedFrameGenerationFrame(const std::shared_ptr<OwnedFrameGenerationFrame> &frame,
     WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence,

@@ -1,5 +1,6 @@
 // Public D3D12/DXGI/DComposition consumer. Readback proves source pixels only;
 // the held windows are the independent on-screen alpha/matrix oracle.
+#include <initializer_list>
 namespace composition_test {
 constexpr char prefix[] = "OWNED_D3D12_COMPOSITION";
 unsigned advances = 0;
@@ -135,13 +136,67 @@ void matrix_equals(IDXGISwapChain4 *chain, const DXGI_MATRIX_3X2_F &wanted) {
   DXGI_MATRIX_3X2_F actual{}; ok(chain->GetMatrixTransform(&actual), "matrix-get");
   need(std::memcmp(&actual, &wanted, sizeof(actual)) == 0, "matrix-value");
 }
+void hdr_contracts(IDXGIFactory4 *factory, ID3D12CommandQueue *queue, IDXGISwapChain4 *sdr,
+                   const DXGI_SWAP_CHAIN_DESC1 &desc) {
+  // FP16 premultiplied sources use paired extended-linear float planes.
+  auto floatDesc = desc;
+  floatDesc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+  floatDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  ComPtr<IDXGISwapChain1> floatBase;
+  ok(factory->CreateSwapChainForComposition(queue, &floatDesc, nullptr, &floatBase),
+     "premul-float-creation");
+  ComPtr<IDXGISwapChain4> floatChain; ok(floatBase.As(&floatChain), "premul-float-chain4");
+  ok(floatChain->ResizeBuffers(3, 96, 80, DXGI_FORMAT_R16G16B16A16_FLOAT, 0), "premul-float-resize");
+  DXGI_SWAP_CHAIN_DESC1 preserved{};
+  ok(floatChain->GetDesc1(&preserved), "premul-float-resized-desc");
+  need(preserved.Width == 96 && preserved.Height == 80 && preserved.BufferCount == 3 &&
+       preserved.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && preserved.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED &&
+       floatChain->GetCurrentBackBufferIndex() == 0, "premul-float-resize-chain");
+  UINT preservedWidth = 0, preservedHeight = 0;
+  ok(floatChain->GetSourceSize(&preservedWidth, &preservedHeight), "premul-float-resized-source");
+  need(preservedWidth == 96 && preservedHeight == 80, "premul-float-resize-source");
+  UINT colorSupport = 0;
+  ok(sdr->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, &colorSupport), "premul-sdr-color-support");
+  need(colorSupport == DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, "premul-sdr-present-support");
+  ok(sdr->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709), "premul-sdr-color-space");
+  const DXGI_COLOR_SPACE_TYPE supportedColors[] = {DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+      DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020};
+  for (auto space : supportedColors) {
+    colorSupport = ~0u;
+    ok(floatChain->CheckColorSpaceSupport(space, &colorSupport), "premul-hdr-color-support-query");
+    need(colorSupport == DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, "premul-hdr-color-advertised");
+    ok(floatChain->SetColorSpace1(space), "premul-hdr-color-selection");
+  }
+  for (auto space : {DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709, DXGI_COLOR_SPACE_CUSTOM}) {
+    colorSupport = ~0u;
+    ok(floatChain->CheckColorSpaceSupport(space, &colorSupport), "premul-unsupported-color-query");
+    need(colorSupport == 0, "premul-unsupported-color-unadvertised");
+    invalid(floatChain->SetColorSpace1(space), "premul-unsupported-color-selection", DXGI_ERROR_INVALID_CALL);
+  }
+  ok(floatChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709), "premul-float-scrgb");
+  floatChain.Reset(); floatBase.Reset();
+  // Same valid HDR10 data as the existing owned-d3d12-hdr-metadata consumer.
+  DXGI_HDR_METADATA_HDR10 hdr{};
+  hdr.RedPrimary[0] = 34000; hdr.RedPrimary[1] = 16000;
+  hdr.GreenPrimary[0] = 13250; hdr.GreenPrimary[1] = 34500;
+  hdr.BluePrimary[0] = 7500; hdr.BluePrimary[1] = 3000;
+  hdr.WhitePoint[0] = 15635; hdr.WhitePoint[1] = 16450;
+  hdr.MaxMasteringLuminance = 1000; hdr.MinMasteringLuminance = 1;
+  hdr.MaxContentLightLevel = 900; hdr.MaxFrameAverageLightLevel = 450;
+  invalid(sdr->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr) - 1, &hdr),
+          "premul-hdr10-malformed-size", E_INVALIDARG);
+  ok(sdr->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr), &hdr), "premul-hdr10-metadata");
+  ok(sdr->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr), "premul-hdr-none");
+}
 } // namespace composition_test
 
 int composition_main(int argc, char **argv) {
   using namespace composition_test;
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  bool hdr_only = false;
   for (int i = 2; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--visual-proof") == 0) visual = true;
+    if (std::strcmp(argv[i], "--hdr-contracts-only") == 0) hdr_only = true;
+    else if (std::strcmp(argv[i], "--visual-proof") == 0) visual = true;
     else if (std::strcmp(argv[i], "--control") == 0 && i + 1 < argc) control = argv[++i];
     else error("argument");
   }
@@ -155,6 +210,19 @@ int composition_main(int argc, char **argv) {
   std::printf("%s_BACKEND id=owned-graphics-d3d12\n", prefix);
   D3D12_COMMAND_QUEUE_DESC q{}; q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   ok(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)), "queue");
+  if (hdr_only) {
+    DXGI_SWAP_CHAIN_DESC1 desc{}; desc.Width = 80; desc.Height = 64;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; desc.BufferCount = 2;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+    ComPtr<IDXGISwapChain1> base; ComPtr<IDXGISwapChain4> chain;
+    ok(factory->CreateSwapChainForComposition(queue.Get(), &desc, nullptr, &base), "hdr-sdr-chain");
+    ok(base.As(&chain), "hdr-sdr-chain4");
+    hdr_contracts(factory.Get(), queue.Get(), chain.Get(), desc);
+    std::printf("%s_HDR_CONTRACTS_PASS creation=1 resize=1 colorspaces=4 metadata=1\n", prefix);
+    return 0;
+  }
   WNDCLASSW cls{}; cls.lpfnWndProc = window_proc; cls.hInstance = GetModuleHandleW(nullptr);
   cls.lpszClassName = L"OwnedCompositionPublicConsumer"; cls.hbrBackground = CreateSolidBrush(RGB(0, 255, 0));
   need(RegisterClassW(&cls) != 0, "register-class");
@@ -198,50 +266,7 @@ int composition_main(int argc, char **argv) {
     ok(dcomp->CreateVisual(&visuals[i]), "visual"); ok(visuals[i]->SetContent(chains[i].Get()), "content");
     ok(targets[i]->SetRoot(visuals[i].Get()), "root");
   }
-  // Premultiplied two-plane hosting is an SDR contract; reject HDR inputs
-  // honestly instead of silently losing extended RGB or alpha semantics.
-  auto floatDesc = desc;
-  floatDesc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-  floatDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-  ComPtr<IDXGISwapChain1> rejectedFloat;
-  invalid(factory->CreateSwapChainForComposition(queue.Get(), &floatDesc, nullptr, &rejectedFloat),
-          "premul-float-creation-unsupported", DXGI_ERROR_UNSUPPORTED);
-  need(!rejectedFloat, "premul-float-no-chain");
-  invalid(chains[0]->ResizeBuffers(3, 96, 80, DXGI_FORMAT_R16G16B16A16_FLOAT, 0),
-          "premul-float-resize-unsupported", DXGI_ERROR_UNSUPPORTED);
-  DXGI_SWAP_CHAIN_DESC1 preserved{};
-  ok(chains[0]->GetDesc1(&preserved), "premul-float-resize-preserved-desc");
-  need(preserved.Width == 80 && preserved.Height == 64 && preserved.BufferCount == 2 &&
-       preserved.Format == DXGI_FORMAT_B8G8R8A8_UNORM && preserved.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED &&
-       chains[0]->GetCurrentBackBufferIndex() == 0, "premul-float-resize-preserves-chain");
-  UINT preservedWidth = 0, preservedHeight = 0;
-  ok(chains[0]->GetSourceSize(&preservedWidth, &preservedHeight), "premul-float-resize-preserved-source");
-  need(preservedWidth == 80 && preservedHeight == 64, "premul-float-resize-preserves-source");
-  UINT colorSupport = 0;
-  ok(chains[0]->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, &colorSupport), "premul-sdr-color-support");
-  need(colorSupport == DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, "premul-sdr-present-support");
-  ok(chains[0]->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709), "premul-sdr-color-space");
-  const DXGI_COLOR_SPACE_TYPE unsupportedColors[] = {DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
-      DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020};
-  for (auto space : unsupportedColors) {
-    colorSupport = ~0u;
-    ok(chains[0]->CheckColorSpaceSupport(space, &colorSupport), "premul-hdr-color-support-query");
-    need(colorSupport == 0, "premul-hdr-color-unadvertised");
-    invalid(chains[0]->SetColorSpace1(space), "premul-hdr-color-unsupported", DXGI_ERROR_UNSUPPORTED);
-  }
-  // Same valid HDR10 data as the existing owned-d3d12-hdr-metadata consumer.
-  DXGI_HDR_METADATA_HDR10 hdr{};
-  hdr.RedPrimary[0] = 34000; hdr.RedPrimary[1] = 16000;
-  hdr.GreenPrimary[0] = 13250; hdr.GreenPrimary[1] = 34500;
-  hdr.BluePrimary[0] = 7500; hdr.BluePrimary[1] = 3000;
-  hdr.WhitePoint[0] = 15635; hdr.WhitePoint[1] = 16450;
-  hdr.MaxMasteringLuminance = 1000; hdr.MinMasteringLuminance = 1;
-  hdr.MaxContentLightLevel = 900; hdr.MaxFrameAverageLightLevel = 450;
-  invalid(chains[0]->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr) - 1, &hdr),
-          "premul-hdr10-malformed-size", E_INVALIDARG);
-  invalid(chains[0]->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr), &hdr),
-          "premul-hdr10-unsupported", DXGI_ERROR_UNSUPPORTED);
-  ok(chains[0]->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr), "premul-hdr-none");
+  hdr_contracts(factory.Get(), queue.Get(), chains[0].Get(), desc);
   render(device.Get(), queue.Get(), chains[0].Get(), false, "premul");
   render(device.Get(), queue.Get(), chains[1].Get(), true, "straight");
   ok(dcomp->Commit(), "initial-commit-after-unbound-present");

@@ -543,6 +543,16 @@ parseRayReconstructionFrame(const ParametersImpl *params, const FeatureState &fe
   if (result != kResultSuccess) return result;
   frame.RoughnessPacked = feature.roughness_packed; frame.DepthLinear = feature.depth_linear;
   frame.ExposureTexture = nullptr; frame.PreExposure = 1;
+  auto responsivity = getOptionalResource(params, "DLSSD.ResponsivityMask");
+  const UINT responsivity_x = getOptionalUInt(params, "DLSSD.ResponsivityMask.Subrect.Base.X", 0);
+  const UINT responsivity_y = getOptionalUInt(params, "DLSSD.ResponsivityMask.Subrect.Base.Y", 0);
+  if (!responsivity && (responsivity_x || responsivity_y)) return kResultInvalidParameter;
+  if (responsivity) {
+    // Two independently supplied history masks have no defined combination.
+    if (frame.BiasCurrentColorMask || frame.BiasBaseX || frame.BiasBaseY) return kResultUnsupportedParameter;
+    frame.BiasCurrentColorMask = responsivity;
+    frame.BiasBaseX = responsivity_x; frame.BiasBaseY = responsivity_y;
+  }
   struct Guide { const char *key; ID3D12Resource **resource; const char *x, *y; UINT *base_x, *base_y; };
   Guide guides[] = {
     {"DLSS.Input.DiffuseAlbedo", &frame.DiffuseAlbedo, "DLSS.Input.DiffuseAlbedo.Subrect.Base.X", "DLSS.Input.DiffuseAlbedo.Subrect.Base.Y", &frame.DiffuseAlbedoBaseX, &frame.DiffuseAlbedoBaseY},
@@ -568,7 +578,7 @@ parseRayReconstructionFrame(const ParametersImpl *params, const FeatureState &fe
   // These optional RR2 guides need separate native denoiser inputs; never silently ignore them.
   for (const char *key : {"DLSSD.DiffuseHitDistance", "DLSSD.DiffuseRayDirection", "DLSSD.SpecularRayDirection",
        "DLSSD.DiffuseRayDirectionHitDistance", "DLSSD.SpecularRayDirectionHitDistance",
-       "DLSSD.ReflectedAlbedo", "DLSSD.Alpha", "DLSSD.OutputAlpha", "DLSSD.ResponsivityMask",
+       "DLSSD.ReflectedAlbedo", "DLSSD.Alpha", "DLSSD.OutputAlpha",
        "DLSSD.DepthOfFieldGuide", "DLSSD.ScreenSpaceRefractionGuide", "DLSSD.ScreenSpaceSubsurfaceScatteringGuide",
        "MotionVectorsReflection", "DLSSD.ColorBeforeTransparency", "DLSSD.ColorBeforeParticles", "DLSSD.ColorAfterParticles",
        "DLSSD.ColorAfterTransparency", "DLSSD.ColorBeforeFog", "DLSSD.ColorAfterFog",
@@ -590,8 +600,10 @@ parseFrameGenerationCreate(const ParametersImpl *params, ID3D12Device *device, M
   if (!desc.display_width || !desc.display_height || !desc.max_render_width || !desc.max_render_height) return kResultMissingInput;
   if (!deviceMaskValid(device,getOptionalUInt(params,"CreationNodeMask",1)) ||
       !deviceMaskValid(device,getOptionalUInt(params,"VisibilityNodeMask",1))) return kResultInvalidParameter;
-  for (const char *key : {"DLSSG.UserInterfaceRecompositionEnabled", "DLSSG.OrthoProjection"})
-    if (getOptionalUInt(params,key,0)) return kResultUnsupportedParameter;
+  desc.user_interface_recomposition = getOptionalUInt(params,"DLSSG.UserInterfaceRecompositionEnabled",0);
+  desc.orthographic_projection = getOptionalUInt(params,"DLSSG.OrthoProjection",0);
+  if (desc.orthographic_projection > 1) return kResultInvalidParameter;
+  if (desc.user_interface_recomposition > 1) return kResultInvalidParameter;
   const UINT inverted = getOptionalUInt(params,"DLSSG.DepthInverted",0);
   const UINT jittered = getOptionalUInt(params,"DLSSG.MvecJittered",0);
   if (inverted > 1 || jittered > 1) return kResultInvalidParameter;
@@ -614,8 +626,25 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   generate.hudless_color = getOptionalResource(params,"DLSSG.HUDLess");
   generate.real_output = getOptionalResource(params,"DLSSG.OutputReal");
   generate.distortion = getOptionalResource(params,"DLSSG.BidirectionalDistortionField");
-  for (const char *key : {"DLSSG.UI", "DLSSG.UIAlpha"})
-    if (getOptionalResource(params,key)) return kResultUnsupportedParameter;
+  generate.ui = getOptionalResource(params,"DLSSG.UI");
+  generate.ui_alpha = getOptionalResource(params,"DLSSG.UIAlpha");
+  if ((feature.fg_create.user_interface_recomposition || generate.ui || generate.ui_alpha) &&
+      (!generate.hudless_color || (!generate.ui && !generate.ui_alpha))) return kResultMissingInput;
+  // Two independently supplied alpha signals have no specified precedence.
+  if (generate.ui && generate.ui_alpha) return kResultUnsupportedParameter;
+  for (auto resource : {generate.ui, generate.ui_alpha})
+    if (resource && (resource == output || resource == generate.real_output)) return kResultInvalidParameter;
+  if (generate.ui) {
+    const auto format = generate.ui->GetDesc().Format;
+    if (format != DXGI_FORMAT_R8G8B8A8_UNORM && format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+        format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32G32B32A32_FLOAT)
+      return kResultUnsupportedParameter;
+  }
+  if (generate.ui_alpha) {
+    const auto format = generate.ui_alpha->GetDesc().Format;
+    if (format != DXGI_FORMAT_R8_UNORM && format != DXGI_FORMAT_R16_UNORM &&
+        format != DXGI_FORMAT_R16_FLOAT && format != DXGI_FORMAT_R32_FLOAT) return kResultUnsupportedParameter;
+  }
   const UINT count = getOptionalUInt(params, "DLSSG.MultiFrameCount", 1);
   const UINT index = getOptionalUInt(params, "DLSSG.MultiFrameIndex", 1);
   if (!count || !index) return kResultInvalidParameter;
@@ -630,7 +659,29 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   generate.output_subrect_only = eval_flags & 1u;
   if (generate.distortion && (generate.distortion == output || generate.distortion == generate.real_output))
     return kResultInvalidParameter;
-  if (getOptionalUInt(params,"DLSSG.OrthoProjection",0) || !getOptionalUInt(params,"DLSSG.CameraMotionIncluded",1)) return kResultUnsupportedParameter;
+  prepare.reconstruct_camera_motion = !getOptionalUInt(params,"DLSSG.CameraMotionIncluded",1);
+  const auto orthographic = getOptionalUInt(params,"DLSSG.OrthoProjection",feature.fg_create.orthographic_projection);
+  if (orthographic > 1) return kResultInvalidParameter;
+  void *projection = nullptr;
+  const bool has_projection = !NVNGX_FAILED(params->Get("DLSSG.CameraViewToClip", &projection));
+  if (orthographic && !has_projection) return kResultMissingInput;
+  if (has_projection) {
+    if (!projection) return kResultInvalidParameter;
+    std::memcpy(prepare.view_to_clip, projection, sizeof(prepare.view_to_clip));
+    for (float value : prepare.view_to_clip)
+      if (!std::isfinite(value)) return kResultInvalidParameter;
+    if (orthographic && (prepare.view_to_clip[3] != 0 || prepare.view_to_clip[7] != 0 ||
+        prepare.view_to_clip[11] != 0 || prepare.view_to_clip[15] == 0)) return kResultInvalidParameter;
+    prepare.projection_matrix_present = 1;
+  }
+  if (prepare.reconstruct_camera_motion) {
+    void *matrix = nullptr;
+    if (NVNGX_FAILED(params->Get("DLSSG.ClipToPrevClip", &matrix))) return kResultMissingInput;
+    if (!matrix) return kResultInvalidParameter;
+    std::memcpy(prepare.clip_to_previous_clip, matrix, sizeof(prepare.clip_to_previous_clip));
+    for (float value : prepare.clip_to_previous_clip)
+      if (!std::isfinite(value)) return kResultInvalidParameter;
+  }
   const auto present_desc = generate.present_color->GetDesc();
   for (auto resource : {output, generate.real_output}) {
     if (!resource) continue;
@@ -644,12 +695,15 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
         desc.Format != feature.fg_create.backbuffer_format ||
         !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return kResultInvalidParameter;
   }
-  // MetalFX does not expose a truthful per-output validity/count result.
-  if (getOptionalResource(params, "DLSSG.OutputDisableInterpolation")) return kResultUnsupportedParameter;
-  for (const char *key : {"DLSSG.InputBackbufferSubrectBaseX", "DLSSG.InputBackbufferSubrectBaseY",
-       "DLSSG.HUDLessSubrectBaseX", "DLSSG.HUDLessSubrectBaseY",
-       "DLSSG.OutputInterpolatedSubrectBaseX", "DLSSG.OutputInterpolatedSubrectBaseY"})
-    if (getOptionalUInt(params,key,0)) return kResultUnsupportedParameter;
+  generate.disable_interpolation = getOptionalResource(params, "DLSSG.OutputDisableInterpolation");
+  if (generate.disable_interpolation) {
+    Com<ID3D12Device> owner;
+    const auto desc = generate.disable_interpolation->GetDesc();
+    if (FAILED(generate.disable_interpolation->GetDevice(IID_PPV_ARGS(&owner))) ||
+        identityOf(owner.ptr()).ptr() != feature.device_identity.ptr() ||
+        desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || desc.Width < sizeof(UINT) ||
+        !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return kResultInvalidParameter;
+  }
   prepare.render_width = getOptionalUInt(params,"DLSSG.InternalWidth",feature.fg_create.max_render_width);
   prepare.render_height = getOptionalUInt(params,"DLSSG.InternalHeight",feature.fg_create.max_render_height);
   if (auto width = getOptionalUInt(params,"DLSSG.DepthSubrectWidth",0)) prepare.render_width = width;
@@ -660,6 +714,19 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   prepare.motion_subrect_y = getOptionalUInt(params,"DLSSG.MVecsSubrectBaseY",0);
   const UINT left = getOptionalUInt(params,"DLSSG.BackbufferSubrectBaseX",0);
   const UINT top = getOptionalUInt(params,"DLSSG.BackbufferSubrectBaseY",0);
+  generate.independent_subrects = 1;
+  generate.present_x = getOptionalUInt(params,"DLSSG.InputBackbufferSubrectBaseX",left);
+  generate.present_y = getOptionalUInt(params,"DLSSG.InputBackbufferSubrectBaseY",top);
+  generate.hudless_x = getOptionalUInt(params,"DLSSG.HUDLessSubrectBaseX",left);
+  generate.hudless_y = getOptionalUInt(params,"DLSSG.HUDLessSubrectBaseY",top);
+  generate.ui_x = getOptionalUInt(params,"DLSSG.UISubrectBaseX",left);
+  generate.ui_y = getOptionalUInt(params,"DLSSG.UISubrectBaseY",top);
+  generate.ui_alpha_x = getOptionalUInt(params,"DLSSG.UIAlphaSubrectBaseX",left);
+  generate.ui_alpha_y = getOptionalUInt(params,"DLSSG.UIAlphaSubrectBaseY",top);
+  generate.output_x = getOptionalUInt(params,"DLSSG.OutputInterpolatedSubrectBaseX",left);
+  generate.output_y = getOptionalUInt(params,"DLSSG.OutputInterpolatedSubrectBaseY",top);
+  generate.real_x = getOptionalUInt(params,"DLSSG.OutputRealSubrectBaseX",left);
+  generate.real_y = getOptionalUInt(params,"DLSSG.OutputRealSubrectBaseY",top);
   const UINT mw = (feature.fg_create.flags & 4) ? feature.fg_create.display_width : prepare.render_width;
   const UINT mh = (feature.fg_create.flags & 4) ? feature.fg_create.display_height : prepare.render_height;
   auto validSubrect = [&](ID3D12Resource *resource, UINT x, UINT y, UINT width, UINT height) {
@@ -671,18 +738,36 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
         desc.SampleDesc.Count == 1 && width && height && x <= desc.Width && y <= desc.Height &&
         width <= desc.Width - x && height <= desc.Height - y;
   };
-  if (left > INT_MAX || top > INT_MAX ||
+  if (generate.output_x > INT_MAX || generate.output_y > INT_MAX ||
       !validSubrect(prepare.depth, prepare.depth_subrect_x, prepare.depth_subrect_y, prepare.render_width, prepare.render_height) ||
       !validSubrect(prepare.motion_vectors, prepare.motion_subrect_x, prepare.motion_subrect_y, mw, mh) ||
-      !validSubrect(generate.present_color, left, top, feature.fg_create.display_width, feature.fg_create.display_height) ||
-      (generate.hudless_color && !validSubrect(generate.hudless_color, left, top,
+      !validSubrect(generate.present_color, generate.present_x, generate.present_y,
+          feature.fg_create.display_width, feature.fg_create.display_height) ||
+      !validSubrect(output, generate.output_x, generate.output_y,
+          feature.fg_create.display_width, feature.fg_create.display_height) ||
+      (generate.hudless_color && !validSubrect(generate.hudless_color, generate.hudless_x, generate.hudless_y,
+          feature.fg_create.display_width, feature.fg_create.display_height)) ||
+      (generate.real_output && !validSubrect(generate.real_output, generate.real_x, generate.real_y,
           feature.fg_create.display_width, feature.fg_create.display_height))) return kResultInvalidParameter;
-  generate.generation_rect_left = left; generate.generation_rect_top = top;
+  if ((generate.ui && !validSubrect(generate.ui,generate.ui_x,generate.ui_y,
+          feature.fg_create.display_width,feature.fg_create.display_height)) ||
+      (generate.ui_alpha && !validSubrect(generate.ui_alpha,generate.ui_alpha_x,generate.ui_alpha_y,
+          feature.fg_create.display_width,feature.fg_create.display_height))) return kResultInvalidParameter;
+  generate.generation_rect_left = generate.output_x; generate.generation_rect_top = generate.output_y;
   if (generate.distortion) {
-    if (getOptionalUInt(params,"DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision",0))
-      return kResultUnsupportedParameter;
+    generate.distortion_low_precision = getOptionalUInt(params,"DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision",0);
+    if (generate.distortion_low_precision > 1) return kResultInvalidParameter;
+    if (generate.distortion_low_precision) {
+      if (NVNGX_FAILED(params->Get("DLSSG.BidirectionalDistortionFieldLowPrecision.Scale", &generate.distortion_scale)) ||
+          NVNGX_FAILED(params->Get("DLSSG.BidirectionalDistortionFieldLowPrecision.Bias", &generate.distortion_bias)))
+        return kResultMissingInput;
+      if (!std::isfinite(generate.distortion_scale) || !std::isfinite(generate.distortion_bias))
+        return kResultInvalidParameter;
+    }
     const auto format = generate.distortion->GetDesc().Format;
-    if (format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32G32B32A32_FLOAT)
+    if (format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32G32B32A32_FLOAT &&
+        !(generate.distortion_low_precision && (format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+          format == DXGI_FORMAT_R16G16B16A16_UNORM || format == DXGI_FORMAT_R16G16B16A16_SNORM)))
       return kResultUnsupportedParameter;
     generate.distortion_x = getOptionalUInt(params,"DLSSG.BidirectionalDistortionFieldSubrectBaseX",0);
     generate.distortion_y = getOptionalUInt(params,"DLSSG.BidirectionalDistortionFieldSubrectBaseY",0);
@@ -704,13 +789,20 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
        std::pair{"DLSSG.InputBackbufferSubrectHeight",feature.fg_create.display_height},
        std::pair{"DLSSG.OutputInterpolatedSubrectWidth",feature.fg_create.display_width},
        std::pair{"DLSSG.OutputInterpolatedSubrectHeight",feature.fg_create.display_height},
+       std::pair{"DLSSG.OutputRealSubrectWidth",feature.fg_create.display_width},
+       std::pair{"DLSSG.OutputRealSubrectHeight",feature.fg_create.display_height},
        std::pair{"DLSSG.HUDLessSubrectWidth",feature.fg_create.display_width},
-       std::pair{"DLSSG.HUDLessSubrectHeight",feature.fg_create.display_height}}) {
+       std::pair{"DLSSG.HUDLessSubrectHeight",feature.fg_create.display_height},
+       std::pair{"DLSSG.UISubrectWidth",feature.fg_create.display_width},
+       std::pair{"DLSSG.UISubrectHeight",feature.fg_create.display_height},
+       std::pair{"DLSSG.UIAlphaSubrectWidth",feature.fg_create.display_width},
+       std::pair{"DLSSG.UIAlphaSubrectHeight",feature.fg_create.display_height}}) {
     const auto extent = getOptionalUInt(params,key,0);
     if (extent && extent != expected) return kResultUnsupportedParameter;
   }
   prepare.depth_state = prepare.motion_vectors_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   generate.present_color_state = generate.hudless_color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  generate.ui_state = generate.ui_alpha_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   // NGX clip-space (+Y up) jitter becomes render pixels (+Y down).
   prepare.jitter_x = getOptionalFloat(params,"DLSSG.JitterOffsetX",0) * prepare.render_width * .5f;
   prepare.jitter_y = getOptionalFloat(params,"DLSSG.JitterOffsetY",0) * prepare.render_height * -.5f;
@@ -736,6 +828,7 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
       any_camera |= present; all_camera &= present;
     }
   if (any_camera && !all_camera) return kResultMissingInput;
+  if (prepare.projection_matrix_present && !all_camera) return kResultMissingInput;
   prepare.camera_info_present = all_camera;
   prepare.view_space_to_meters = 1;
   prepare.reset = generate.reset = getOptionalUInt(params,"DLSSG.Reset",0) ||

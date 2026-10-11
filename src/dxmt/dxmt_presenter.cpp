@@ -179,13 +179,12 @@ Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_
   }
 
   const bool composition_residual = composition_ && alpha_ == DXMTPresentAlpha::Premultiplied;
-  // This owned premultiplied transport exposes G22 SDR only. A global display
-  // override must not secretly turn its two bounded UNORM planes into HDR.
-  auto final_colorspace = composition_residual ? colorspace_
+  // Composition converts the selected source space into extended linear sRGB.
+  // Display overrides must not reinterpret the source transfer or primaries.
+  auto final_colorspace = composition_ ? colorspace_
       : display_setting_version_ > 0 ? display_colorspace_ : colorspace_;
   auto is_hdr = WMT_COLORSPACE_IS_HDR(final_colorspace);
-  const bool linear_composition_transport = composition_ && alpha_ != DXMTPresentAlpha::Opaque &&
-      final_colorspace == WMTColorSpaceSRGB;
+  const bool linear_composition_transport = composition_ && alpha_ != DXMTPresentAlpha::Opaque;
   auto hdr_metadata = !composition_residual && display_setting_version_ > 0 ? &display_hdr_metadata_
                       : has_hdr_metadata_          ? &hdr_metadata_
                                                    : nullptr;
@@ -196,17 +195,20 @@ Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_
       else
         waitPresentsEncoded();
     }
-    // Use the native float drawable path for transparent remote exports.
-    // The source remains G22 SDR; float preserves derived additive energy.
+    // Transparent remote exports retain signed/extended energy in both planes.
     layer_props_.pixel_format = linear_composition_transport ? WMTPixelFormatRGBA16Float : Forget_sRGB(source_format_);
     buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr,
                              sample_count_ > 1, gamma_version_ != 0, composition_residual, linear_composition_transport);
     layer_.setProps(layer_props_);
-    layer_.setColorSpace(linear_composition_transport ? WMTColorSpaceSRGBLinear : final_colorspace);
+    layer_.setColorSpace(linear_composition_transport
+        ? (is_hdr ? WMTColorSpaceHDR_scRGB : WMTColorSpaceSRGBLinear) : final_colorspace);
   }
 
   DXMTPresentMetadata metadata{};
   metadata.alpha = alpha_;
+  if (linear_composition_transport)
+    metadata.composition_color_space = final_colorspace == WMTColorSpaceSRGB ? 1 :
+        final_colorspace == WMTColorSpaceHDR_PQ ? 3 : final_colorspace == WMTColorSpaceBT2020 ? 4 : 2;
 
   metadata.edr_scale = 1.0;
   metadata.max_content_luminance = 10000;
@@ -227,6 +229,12 @@ Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_
 
   if (final_colorspace == WMTColorSpaceHDR_scRGB)
     metadata.edr_scale *= 0.8;
+  // scRGB white is 80 nits; Core Animation extended-linear white is 100 nits.
+  // Core Animation owns output headroom/tone mapping, not each source plane.
+  if (linear_composition_transport)
+    metadata.edr_scale = final_colorspace == WMTColorSpaceHDR_scRGB ? 0.8f : 1.0f;
+  // HDR10 metadata remains advisory for transparent composition. Per-plane
+  // tone mapping would alter additive/source-over algebra; CA maps the sum.
 
   return std::optional<PresentState>(std::in_place, metadata, ++frame_requested_, this);
 }

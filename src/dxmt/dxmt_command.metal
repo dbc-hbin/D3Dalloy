@@ -850,7 +850,7 @@ struct DXMTSOElement {
 };
 
 struct DXMTSOAssembly {
-  uint topology; // 0 point list, 1 line list, 2 line strip, 3 triangle list, 4 triangle strip, 5 triangle fan
+  uint topology; // 0 point, 1/2 line list/strip, 3/4 triangle list/strip, 5 fan, 6/7 line adj, 8/9 triangle adj
   uint indexed;
   uint index_size; // 2 or 4
   uint cut_enabled; // strip topology with a matching D3D12 IBStripCutValue
@@ -1336,15 +1336,16 @@ inline uint dxmt_clipped_primitives(constant DXMTSOAssembly &params,
         filled[s] = dxmt_so_load_dword(filled_sizes[s], 0);
 
   const uint topology = params.topology;
-  const uint vpp = topology == 0 ? 1 : topology <= 2 ? 2 : 3;
-  const bool strip = topology == 2 || topology == 4 || topology == 5;
+  const uint vpp = topology == 0 ? 1 : (topology <= 2 || topology == 6 || topology == 7) ? 2 : 3;
+  const uint input_vpp = topology >= 8 ? 6 : topology >= 6 ? 4 : vpp;
+  const bool strip = topology == 2 || topology == 4 || topology == 5 || topology == 7 || topology == 9;
   // A slot the declaration writes but no buffer is bound to counts as full (14.6).
   bool stopped = (params.referenced_mask & ~params.bound_mask) != 0;
   ulong written = 0, needed = 0, unclaimed = 0;
   ulong ia_vertices = 0, ia_primitives = 0, clip_invocations = 0, clip_primitives = 0;
 
   for (uint instance = 0; instance < params.instance_count; instance++) {
-    uint window[3];
+    uint window[6];
     uint count = 0;   // vertices collected in the current list primitive / strip
     uint strip_index = 0;
     for (uint k = 0; k < params.vertex_count; k++) {
@@ -1357,7 +1358,30 @@ inline uint dxmt_clipped_primitives(constant DXMTSOAssembly &params,
       const uint record = instance * control.positions_per_instance + k - control.first_position;
       uint primitive[3];
       bool complete = false;
-      if (!strip) {
+      if (topology >= 6) {
+        window[count++] = record;
+        if (count == input_vpp) {
+          // FS ch.14: adjacency is discarded at SO; only interior vertices are written.
+          if (vpp == 2) {
+            primitive[0] = window[1];
+            primitive[1] = window[2];
+          } else {
+            primitive[0] = window[0];
+            primitive[1] = window[(strip_index & 1) ? 4 : 2];
+            primitive[2] = window[(strip_index & 1) ? 2 : 4];
+          }
+          if (strip) {
+            const uint step = topology == 7 ? 1 : 2;
+            for (uint v = 0; v < input_vpp - step; v++)
+              window[v] = window[v + step];
+            count = input_vpp - step;
+            strip_index++;
+          } else {
+            count = 0;
+          }
+          complete = true;
+        }
+      } else if (!strip) {
         window[count++] = record;
         if (count == vpp) {
           for (uint v = 0; v < vpp; v++)
@@ -1404,7 +1428,7 @@ inline uint dxmt_clipped_primitives(constant DXMTSOAssembly &params,
         ia_primitives++;
         // Strip vertices are consumed once, not once per overlapping primitive. An incomplete
         // run does not contribute, and a restart starts a new run.
-        ia_vertices += !strip || strip_index == 1u ? vpp : 1u;
+        ia_vertices += !strip || strip_index == 1u ? input_vpp : topology == 9 ? 2u : 1u;
       }
       if (!params.stream_output_enabled && !params.statistics_enabled)
         continue;
@@ -1808,6 +1832,7 @@ struct DXMTPresentMetadata {
     float output_clip[4];
   } geometry;
   uint alpha;
+  uint composition_color_space;
 };
 
 float3 to_srgb(float3 linear) {
@@ -1819,22 +1844,39 @@ struct DXMTPresentOutput {
   float4 residual [[color(1), function_constant(present_composition_residual)]];
 };
 
-DXMTPresentOutput present_output(float4 color) {
+DXMTPresentOutput present_output(float4 color, constant DXMTPresentMetadata &meta) {
   if (present_linear_composition_transport) {
-    // Native float exports are tagged ExtendedLinearSRGB. Decode straight
-    // colour then restore premultiplication, without discarding RGB at A=0.
-    float3 straight = color.w > 0 ? color.xyz / color.w : color.xyz;
-    float3 linear = select(pow((straight + 0.055) / 1.055, 2.4),
-                           straight / 12.92, straight <= 0.04045);
-    color.xyz = color.w > 0 ? linear * color.w : linear;
+    // Platform domain: finite source RGB, alpha in [0,1]; G22/PQ straight
+    // values are bounded [0,1], while G10 scRGB retains signed extended RGB.
+    if (meta.alpha == 2 && color.w <= 0) color = float4(0);
+    // Unassociate in the source transfer domain, convert, then associate.
+    // At alpha zero premultiplied RGB is additive energy, not straight color.
+    float3 straight = color.xyz;
+    if (present_backbuffer_is_srgb) straight = to_srgb(straight);
+    if (meta.alpha == 1 && color.w > 0) straight /= color.w;
+    float3 linear = straight;
+    if (meta.composition_color_space == 1 || meta.composition_color_space == 4)
+      linear = select(pow(max((straight + 0.055) / 1.055, float3(0)), 2.4),
+                      straight / 12.92, straight <= 0.04045);
+    else if (meta.composition_color_space == 3)
+      linear = pq_to_linear(clamp(straight, float3(0), float3(1))) / 100.0f;
+    // D65 BT.2020 -> BT.709. Preserve signed and extended components.
+    if (meta.composition_color_space == 3 || meta.composition_color_space == 4)
+      linear = float3(dot(linear, float3(1.660491, -0.587641, -0.072850)),
+                      dot(linear, float3(-0.124550, 1.132900, -0.008349)),
+                      dot(linear, float3(-0.018151, -0.100579, 1.118730)));
+    linear *= meta.edr_scale;
+    color.xyz = meta.alpha == 2 || color.w > 0 ? linear * color.w : linear;
   }
   DXMTPresentOutput result;
   result.base = color;
   if (present_composition_residual) {
     // Export source-over RGB separately. The opaque additive plane
     // prevents native alpha-zero transport from erasing additive colour.
-    result.base = float4(min(color.xyz, float3(color.w)), color.w);
-    result.residual = float4(max(color.xyz - float3(color.w), float3(0)), 1);
+    // Keep signed energy on the opaque plane too: CA may discard negative
+    // or zero-coverage color on an unassociated transparent export.
+    result.base = float4(clamp(color.xyz, float3(0), float3(color.w)), color.w);
+    result.residual = float4(color.xyz - result.base.xyz, 1);
   }
   return result;
 }
@@ -1852,7 +1894,7 @@ DXMTPresentOutput present_output(float4 color) {
        input.position.y < meta.geometry.output_clip[1] ||
        input.position.x >= meta.geometry.output_clip[2] ||
        input.position.y >= meta.geometry.output_clip[3]))
-    return present_output(float4(0));
+    return present_output(float4(0), meta);
   float2 sample_position = input.position.xy;
   if (meta.geometry.source_width > 0) {
     float2 source_size = float2(meta.geometry.source_width, meta.geometry.source_height);
@@ -1866,7 +1908,7 @@ DXMTPresentOutput present_output(float4 color) {
     if (any(uv < 0.0f) || any(uv >= 1.0f)) {
       float4 background = float4(meta.geometry.background[0], meta.geometry.background[1],
                                 meta.geometry.background[2], meta.geometry.background[3]);
-      return present_output(background);
+      return present_output(background, meta);
     }
     if (meta.geometry.rotation == 2)
       uv = float2(uv.y, 1.0f - uv.x);
@@ -1889,9 +1931,11 @@ DXMTPresentOutput present_output(float4 color) {
                              ? sample_position / float2(source.get_width(), source.get_height())
                              : input.uv);
   }
+  if (present_linear_composition_transport)
+    return present_output(output, meta);
   float3 output_rgb = output.xyz;
   if (meta.alpha == 2 && output.w <= 0)
-    return present_output(float4(0));
+    return present_output(float4(0), meta);
   if (meta.alpha == 1 && output.w > 0) {
     // sRGB texture reads already decoded the premultiplied encoded value.
     // Undo that decode before unpremultiplication, then resume the color path.
@@ -1937,7 +1981,7 @@ DXMTPresentOutput present_output(float4 color) {
   // Premultiplied alpha permits additive RGB even at alpha zero.
   if (meta.alpha == 2 || (meta.alpha == 1 && output.w > 0))
     output_rgb *= output.w;
-  return present_output(float4(output_rgb, output.w));
+  return present_output(float4(output_rgb, output.w), meta);
 }
 
 struct DXMTDispatchArguments {
