@@ -1,0 +1,279 @@
+
+build/local/zzz-dlss-fix-20261009/precompile-run-01/binding-diagnosis/reference/D3DMetal.framework/Versions/A/D3DMetal:	file format mach-o 64-bit x86-64
+
+Disassembly of section __TEXT,__text:
+
+00000000000132a6 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)>:
+   132a6: 55                           	pushq	%rbp
+   132a7: 48 89 e5                     	movq	%rsp, %rbp
+   132aa: 41 57                        	pushq	%r15
+   132ac: 41 56                        	pushq	%r14
+   132ae: 41 55                        	pushq	%r13
+   132b0: 41 54                        	pushq	%r12
+   132b2: 53                           	pushq	%rbx
+   132b3: 48 83 ec 38                  	subq	$0x38, %rsp
+   132b7: 41 89 cc                     	movl	%ecx, %r12d
+   132ba: 85 f6                        	testl	%esi, %esi
+   132bc: 0f 94 c0                     	sete	%al
+   132bf: 85 d2                        	testl	%edx, %edx
+   132c1: 0f 94 c1                     	sete	%cl
+   132c4: 08 c1                        	orb	%al, %cl
+   132c6: 0f 85 45 02 00 00            	jne	0x13511 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x26b>
+   132cc: 45 89 c7                     	movl	%r8d, %r15d
+   132cf: 41 89 d5                     	movl	%edx, %r13d
+   132d2: 49 89 fe                     	movq	%rdi, %r14
+   132d5: 89 75 d0                     	movl	%esi, -0x30(%rbp)
+   132d8: 48 83 bf 60 2c 00 00 00      	cmpq	$0x0, 0x2c60(%rdi)
+   132e0: 0f 85 3a 02 00 00            	jne	0x13520 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x27a>
+   132e6: 4c 89 f7                     	movq	%r14, %rdi
+   132e9: e8 6e cf ff ff               	callq	0x1025c <MPLCommandList::EmitInternalRenderEncoders()>
+   132ee: 49 8d b6 d8 27 00 00         	leaq	0x27d8(%r14), %rsi
+   132f5: 48 8d 5d a0                  	leaq	-0x60(%rbp), %rbx
+   132f9: 48 89 df                     	movq	%rbx, %rdi
+   132fc: 48 89 75 c8                  	movq	%rsi, -0x38(%rbp)
+   13300: e8 f7 c7 00 00               	callq	0x1fafc <MPLCommandList::EncoderDependenciesStack::GetNextDependenciesSet()>
+   13305: 48 8b 03                     	movq	(%rbx), %rax
+   13308: 8b 4b 08                     	movl	0x8(%rbx), %ecx
+   1330b: 48 03 48 20                  	addq	0x20(%rax), %rcx
+   1330f: 48 8b 70 08                  	movq	0x8(%rax), %rsi
+   13313: 48 ba c1 c0 c0 c0 c0 c0 c0 c0	movabsq	$-0x3f3f3f3f3f3f3f3f, %rdx ## imm = 0xC0C0C0C0C0C0C0C1
+   1331d: 48 89 c8                     	movq	%rcx, %rax
+   13320: 48 f7 e2                     	mulq	%rdx
+   13323: 48 c1 ea 07                  	shrq	$0x7, %rdx
+   13327: 48 69 c2 aa 00 00 00         	imulq	$0xaa, %rdx, %rax
+   1332e: 48 29 c1                     	subq	%rax, %rcx
+   13331: 48 8d 1c 49                  	leaq	(%rcx,%rcx,2), %rbx
+   13335: 48 c1 e3 03                  	shlq	$0x3, %rbx
+   13339: 48 03 1c d6                  	addq	(%rsi,%rdx,8), %rbx
+   1333d: 41 8b b6 c4 27 00 00         	movl	0x27c4(%r14), %esi
+   13344: 48 89 df                     	movq	%rbx, %rdi
+   13347: e8 70 f4 00 00               	callq	0x227bc <MPLDynamicBitset<unsigned long long>::Resize(unsigned long long)>
+   1334c: 41 80 be 78 2b 00 00 01      	cmpb	$0x1, 0x2b78(%r14)
+   13354: 75 10                        	jne	0x13366 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0xc0>
+   13356: 4c 89 f7                     	movq	%r14, %rdi
+   13359: 31 f6                        	xorl	%esi, %esi
+   1335b: 31 d2                        	xorl	%edx, %edx
+   1335d: 31 c9                        	xorl	%ecx, %ecx
+   1335f: e8 a8 e2 00 00               	callq	0x2160c <MPLCommandList::SubresourceNeedsClearing(MPLEncoderType, std::__1::span<MPLCommandList::SubresourceAccess const, 18446744073709551615ul>)>
+   13364: eb 02                        	jmp	0x13368 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0xc2>
+   13366: 31 c0                        	xorl	%eax, %eax
+   13368: 84 c0                        	testb	%al, %al
+   1336a: 75 09                        	jne	0x13375 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0xcf>
+   1336c: 41 8b 46 18                  	movl	0x18(%r14), %eax
+   13370: 83 e0 01                     	andl	$0x1, %eax
+   13373: 74 0a                        	je	0x1337f <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0xd9>
+   13375: 4c 89 f7                     	movq	%r14, %rdi
+   13378: 31 f6                        	xorl	%esi, %esi
+   1337a: e8 89 b6 ff ff               	callq	0xea08 <MPLCommandList::EndEncoder(MPLEncoderType)>
+   1337f: 41 f6 86 c8 27 00 00 04      	testb	$0x4, 0x27c8(%r14)
+   13387: 74 0d                        	je	0x13396 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0xf0>
+   13389: 4c 89 f7                     	movq	%r14, %rdi
+   1338c: 31 f6                        	xorl	%esi, %esi
+   1338e: 48 89 da                     	movq	%rbx, %rdx
+   13391: e8 84 bf 00 00               	callq	0x1f31a <MPLCommandList::CheckBarrierDependencies(MPLEncoderType, MPLDynamicBitset<unsigned long long>&)>
+   13396: 4c 89 f7                     	movq	%r14, %rdi
+   13399: 31 f6                        	xorl	%esi, %esi
+   1339b: 31 d2                        	xorl	%edx, %edx
+   1339d: 31 c9                        	xorl	%ecx, %ecx
+   1339f: e8 de d9 00 00               	callq	0x20d82 <MPLCommandList::ApplyResourceBarrierDependencies(MPLEncoderType, std::__1::span<MPLCommandList::SubresourceAccess const, 18446744073709551615ul>)>
+   133a4: 84 c0                        	testb	%al, %al
+   133a6: 74 0d                        	je	0x133b5 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x10f>
+   133a8: 4c 89 f7                     	movq	%r14, %rdi
+   133ab: 31 f6                        	xorl	%esi, %esi
+   133ad: 48 89 da                     	movq	%rbx, %rdx
+   133b0: e8 65 bf 00 00               	callq	0x1f31a <MPLCommandList::CheckBarrierDependencies(MPLEncoderType, MPLDynamicBitset<unsigned long long>&)>
+   133b5: 49 8b 86 50 24 00 00         	movq	0x2450(%r14), %rax
+   133bc: 48 85 c0                     	testq	%rax, %rax
+   133bf: 44 89 7d c0                  	movl	%r15d, -0x40(%rbp)
+   133c3: 44 89 6d c4                  	movl	%r13d, -0x3c(%rbp)
+   133c7: 74 55                        	je	0x1341e <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x178>
+   133c9: 44 8b 78 04                  	movl	0x4(%rax), %r15d
+   133cd: 41 8b 86 c8 27 00 00         	movl	0x27c8(%r14), %eax
+   133d4: a8 01                        	testb	$0x1, %al
+   133d6: 74 1d                        	je	0x133f5 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x14f>
+   133d8: 4c 89 f7                     	movq	%r14, %rdi
+   133db: 44 89 fe                     	movl	%r15d, %esi
+   133de: ba 01 00 00 00               	movl	$0x1, %edx
+   133e3: 31 c9                        	xorl	%ecx, %ecx
+   133e5: e8 b8 bc 00 00               	callq	0x1f0a2 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)>
+   133ea: 84 c0                        	testb	%al, %al
+   133ec: 75 1d                        	jne	0x1340b <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x165>
+   133ee: 41 8b 86 c8 27 00 00         	movl	0x27c8(%r14), %eax
+   133f5: a8 02                        	testb	$0x2, %al
+   133f7: 74 12                        	je	0x1340b <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x165>
+   133f9: 4c 89 f7                     	movq	%r14, %rdi
+   133fc: 44 89 fe                     	movl	%r15d, %esi
+   133ff: ba 02 00 00 00               	movl	$0x2, %edx
+   13404: 31 c9                        	xorl	%ecx, %ecx
+   13406: e8 97 bc 00 00               	callq	0x1f0a2 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)>
+   1340b: 45 89 e5                     	movl	%r12d, %r13d
+   1340e: 49 83 be 50 24 00 00 00      	cmpq	$0x0, 0x2450(%r14)
+   13416: 0f 95 c0                     	setne	%al
+   13419: 89 45 d4                     	movl	%eax, -0x2c(%rbp)
+   1341c: eb 0a                        	jmp	0x13428 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x182>
+   1341e: 45 89 e5                     	movl	%r12d, %r13d
+   13421: c7 45 d4 00 00 00 00         	movl	$0x0, -0x2c(%rbp)
+   13428: 45 8b a6 c4 27 00 00         	movl	0x27c4(%r14), %r12d
+   1342f: 4c 89 f7                     	movq	%r14, %rdi
+   13432: 48 89 de                     	movq	%rbx, %rsi
+   13435: e8 a4 d6 ff ff               	callq	0x10ade <MPLCommandList::FlushDirtyRenderState(MPLDynamicBitset<unsigned long long>&)>
+   1343a: 49 89 c7                     	movq	%rax, %r15
+   1343d: f6 c2 01                     	testb	$0x1, %dl
+   13440: 0f 85 26 01 00 00            	jne	0x1356c <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x2c6>
+   13446: 45 39 67 04                  	cmpl	%r12d, 0x4(%r15)
+   1344a: 0f 85 30 01 00 00            	jne	0x13580 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x2da>
+   13450: 44 89 e6                     	movl	%r12d, %esi
+   13453: 41 8b 86 c8 27 00 00         	movl	0x27c8(%r14), %eax
+   1345a: 89 c2                        	movl	%eax, %edx
+   1345c: 80 e2 01                     	andb	$0x1, %dl
+   1345f: a8 02                        	testb	$0x2, %al
+   13461: 75 08                        	jne	0x1346b <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x1c5>
+   13463: b1 01                        	movb	$0x1, %cl
+   13465: 84 d2                        	testb	%dl, %dl
+   13467: 75 07                        	jne	0x13470 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x1ca>
+   13469: eb 17                        	jmp	0x13482 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x1dc>
+   1346b: 80 ca 02                     	orb	$0x2, %dl
+   1346e: 89 d1                        	movl	%edx, %ecx
+   13470: 0f b6 d1                     	movzbl	%cl, %edx
+   13473: 4c 89 f7                     	movq	%r14, %rdi
+   13476: e8 05 b8 00 00               	callq	0x1ec80 <MPLCommandList::RegisterPendingResources(EncoderIndex, MPLStage)>
+   1347b: 41 8b 86 c8 27 00 00         	movl	0x27c8(%r14), %eax
+   13482: a8 04                        	testb	$0x4, %al
+   13484: 74 15                        	je	0x1349b <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x1f5>
+   13486: 41 8b 4f 04                  	movl	0x4(%r15), %ecx
+   1348a: 0f b6 55 d4                  	movzbl	-0x2c(%rbp), %edx
+   1348e: 4c 89 f7                     	movq	%r14, %rdi
+   13491: 31 f6                        	xorl	%esi, %esi
+   13493: 49 89 d9                     	movq	%rbx, %r9
+   13496: e8 c1 d3 00 00               	callq	0x2085c <MPLCommandList::EmitBarrierDependencies(MPLEncoderType, bool, EncoderIndex, EncoderIndex, MPLDynamicBitset<unsigned long long> const&)>
+   1349b: 41 c7 86 c8 27 00 00 00 00 00 00     	movl	$0x0, 0x27c8(%r14)
+   134a6: 48 8b 75 a0                  	movq	-0x60(%rbp), %rsi
+   134aa: 8b 4d a8                     	movl	-0x58(%rbp), %ecx
+   134ad: 48 03 4e 20                  	addq	0x20(%rsi), %rcx
+   134b1: 48 89 c8                     	movq	%rcx, %rax
+   134b4: 48 ba c1 c0 c0 c0 c0 c0 c0 c0	movabsq	$-0x3f3f3f3f3f3f3f3f, %rdx ## imm = 0xC0C0C0C0C0C0C0C1
+   134be: 48 f7 e2                     	mulq	%rdx
+   134c1: 48 8b 46 08                  	movq	0x8(%rsi), %rax
+   134c5: 48 c1 ea 07                  	shrq	$0x7, %rdx
+   134c9: 48 8b 04 d0                  	movq	(%rax,%rdx,8), %rax
+   134cd: 48 69 d2 aa 00 00 00         	imulq	$0xaa, %rdx, %rdx
+   134d4: 48 29 d1                     	subq	%rdx, %rcx
+   134d7: 48 8d 0c 49                  	leaq	(%rcx,%rcx,2), %rcx
+   134db: 48 c7 04 c8 00 00 00 00      	movq	$0x0, (%rax,%rcx,8)
+   134e3: ff 4e 30                     	decl	0x30(%rsi)
+   134e6: 49 8b 86 d8 23 00 00         	movq	0x23d8(%r14), %rax
+   134ed: c7 00 18 00 00 08            	movl	$0x8000018, (%rax)      ## imm = 0x8000018
+   134f3: 49 83 86 d8 23 00 00 18      	addq	$0x18, 0x23d8(%r14)
+   134fb: 8b 4d d0                     	movl	-0x30(%rbp), %ecx
+   134fe: 89 48 04                     	movl	%ecx, 0x4(%rax)
+   13501: 8b 4d c4                     	movl	-0x3c(%rbp), %ecx
+   13504: 89 48 08                     	movl	%ecx, 0x8(%rax)
+   13507: 44 89 68 0c                  	movl	%r13d, 0xc(%rax)
+   1350b: 8b 4d c0                     	movl	-0x40(%rbp), %ecx
+   1350e: 89 48 10                     	movl	%ecx, 0x10(%rax)
+   13511: 48 83 c4 38                  	addq	$0x38, %rsp
+   13515: 5b                           	popq	%rbx
+   13516: 41 5c                        	popq	%r12
+   13518: 41 5d                        	popq	%r13
+   1351a: 41 5e                        	popq	%r14
+   1351c: 41 5f                        	popq	%r15
+   1351e: 5d                           	popq	%rbp
+   1351f: c3                           	retq
+   13520: 49 8b 76 10                  	movq	0x10(%r14), %rsi
+   13524: 48 8d 5d a0                  	leaq	-0x60(%rbp), %rbx
+   13528: ba 10 00 00 00               	movl	$0x10, %edx
+   1352d: 48 89 df                     	movq	%rbx, %rdi
+   13530: 31 c9                        	xorl	%ecx, %ecx
+   13532: e8 df 5c 02 00               	callq	0x39216 <MPLCommandAllocator::Allocate(unsigned long, bool)>
+   13537: 48 8b 43 08                  	movq	0x8(%rbx), %rax
+   1353b: 8b 4d d0                     	movl	-0x30(%rbp), %ecx
+   1353e: 89 08                        	movl	%ecx, (%rax)
+   13540: 44 89 68 04                  	movl	%r13d, 0x4(%rax)
+   13544: 44 89 60 08                  	movl	%r12d, 0x8(%rax)
+   13548: 44 89 78 0c                  	movl	%r15d, 0xc(%rax)
+   1354c: 49 8b 46 08                  	movq	0x8(%r14), %rax
+   13550: 48 8b b0 90 09 00 00         	movq	0x990(%rax), %rsi
+   13557: 48 8b 0b                     	movq	(%rbx), %rcx
+   1355a: 4c 89 f7                     	movq	%r14, %rdi
+   1355d: ba 01 00 00 00               	movl	$0x1, %edx
+   13562: 45 31 c0                     	xorl	%r8d, %r8d
+   13565: e8 b6 00 00 00               	callq	0x13620 <MPLCommandList::ExecuteIndirect(IMPLExecuteIndirectSignature const*, unsigned int, unsigned long long, unsigned long long)>
+   1356a: eb a5                        	jmp	0x13511 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x26b>
+   1356c: 4c 89 f7                     	movq	%r14, %rdi
+   1356f: 4c 89 fe                     	movq	%r15, %rsi
+   13572: 48 8b 55 c8                  	movq	-0x38(%rbp), %rdx
+   13576: e8 2e c3 35 00               	callq	0x36f8a9 <MPLCommandList::DrawMesh(MTLSize) (.cold.1)>
+   1357b: e9 c6 fe ff ff               	jmp	0x13446 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x1a0>
+   13580: 41 8b b6 c4 27 00 00         	movl	0x27c4(%r14), %esi
+   13587: 48 89 df                     	movq	%rbx, %rdi
+   1358a: e8 2d f2 00 00               	callq	0x227bc <MPLDynamicBitset<unsigned long long>::Resize(unsigned long long)>
+   1358f: 41 8b 77 04                  	movl	0x4(%r15), %esi
+   13593: 41 39 f4                     	cmpl	%esi, %r12d
+   13596: 0f 83 b7 fe ff ff            	jae	0x13453 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x1ad>
+   1359c: 49 69 fc e8 01 00 00         	imulq	$0x1e8, %r12, %rdi      ## imm = 0x1E8
+   135a3: 48 81 c7 b8 01 00 00         	addq	$0x1b8, %rdi            ## imm = 0x1B8
+   135aa: 49 8b 86 d0 24 00 00         	movq	0x24d0(%r14), %rax
+   135b1: 80 bc 38 58 fe ff ff 00      	cmpb	$0x0, -0x1a8(%rax,%rdi)
+   135b9: 75 4f                        	jne	0x1360a <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x364>
+   135bb: ba 01 00 00 00               	movl	$0x1, %edx
+   135c0: 44 89 e1                     	movl	%r12d, %ecx
+   135c3: 48 d3 e2                     	shlq	%cl, %rdx
+   135c6: 48 8b 4b 10                  	movq	0x10(%rbx), %rcx
+   135ca: 4c 89 e6                     	movq	%r12, %rsi
+   135cd: 48 c1 ee 06                  	shrq	$0x6, %rsi
+   135d1: 48 09 14 f1                  	orq	%rdx, (%rcx,%rsi,8)
+   135d5: 48 01 f8                     	addq	%rdi, %rax
+   135d8: 48 89 7d c8                  	movq	%rdi, -0x38(%rbp)
+   135dc: 48 89 df                     	movq	%rbx, %rdi
+   135df: 48 89 c6                     	movq	%rax, %rsi
+   135e2: e8 d9 df 00 00               	callq	0x215c0 <MPLDynamicBitset<unsigned long long>::operator|=(MPLDynamicBitset<unsigned long long> const&)>
+   135e7: 49 8b 86 d0 24 00 00         	movq	0x24d0(%r14), %rax
+   135ee: 48 8b 4d c8                  	movq	-0x38(%rbp), %rcx
+   135f2: 48 8d 34 08                  	leaq	(%rax,%rcx), %rsi
+   135f6: 48 83 c6 e8                  	addq	$-0x18, %rsi
+   135fa: 48 89 df                     	movq	%rbx, %rdi
+   135fd: e8 be df 00 00               	callq	0x215c0 <MPLDynamicBitset<unsigned long long>::operator|=(MPLDynamicBitset<unsigned long long> const&)>
+   13602: 48 8b 7d c8                  	movq	-0x38(%rbp), %rdi
+   13606: 41 8b 77 04                  	movl	0x4(%r15), %esi
+   1360a: 49 ff c4                     	incq	%r12
+   1360d: 89 f0                        	movl	%esi, %eax
+   1360f: 48 81 c7 e8 01 00 00         	addq	$0x1e8, %rdi            ## imm = 0x1E8
+   13616: 49 39 c4                     	cmpq	%rax, %r12
+   13619: 72 8f                        	jb	0x135aa <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x304>
+   1361b: e9 33 fe ff ff               	jmp	0x13453 <MPLCommandList::Draw(unsigned int, unsigned int, unsigned int, unsigned int)+0x1ad>
+
+0000000000013620 <MPLCommandList::ExecuteIndirect(IMPLExecuteIndirectSignature const*, unsigned int, unsigned long long, unsigned long long)>:
+   13620: 55                           	pushq	%rbp
+   13621: 48 89 e5                     	movq	%rsp, %rbp
+   13624: 41 57                        	pushq	%r15
+   13626: 41 56                        	pushq	%r14
+   13628: 41 55                        	pushq	%r13
+   1362a: 41 54                        	pushq	%r12
+   1362c: 53                           	pushq	%rbx
+   1362d: 48 81 ec 68 01 00 00         	subq	$0x168, %rsp            ## imm = 0x168
+   13634: 49 89 c9                     	movq	%rcx, %r9
+   13637: 41 89 d4                     	movl	%edx, %r12d
+   1363a: 49 89 f5                     	movq	%rsi, %r13
+   1363d: 49 89 ff                     	movq	%rdi, %r15
+   13640: 4d 85 c0                     	testq	%r8, %r8
+   13643: 75 5a                        	jne	0x1369f <MPLCommandList::ExecuteIndirect(IMPLExecuteIndirectSignature const*, unsigned int, unsigned long long, unsigned long long)+0x7f>
+   13645: 41 80 7d 11 00               	cmpb	$0x0, 0x11(%r13)
+   1364a: 74 53                        	je	0x1369f <MPLCommandList::ExecuteIndirect(IMPLExecuteIndirectSignature const*, unsigned int, unsigned long long, unsigned long long)+0x7f>
+   1364c: 49 83 bf 60 2c 00 00 00      	cmpq	$0x0, 0x2c60(%r15)
+   13654: 75 49                        	jne	0x1369f <MPLCommandList::ExecuteIndirect(IMPLExecuteIndirectSignature const*, unsigned int, unsigned long long, unsigned long long)+0x7f>
+   13656: 49 8b 85 b0 00 00 00         	movq	0xb0(%r13), %rax
+   1365d: 8b 00                        	movl	(%rax), %eax
+   1365f: 48 83 f8 04                  	cmpq	$0x4, %rax
+   13663: 0f 87 f6 0f 00 00            	ja	0x1465f <MPLCommandList::ExecuteIndirect(IMPLExecuteIndirectSignature const*, unsigned int, unsigned long long, unsigned long long)+0x103f>
+   13669: 48 8d 0d 08 10 00 00         	leaq	0x1008(%rip), %rcx      ## 0x14678 <MPLCommandList::ExecuteIndirect(IMPLExecuteIndirectSignature const*, unsigned int, unsigned long long, unsigned long long)+0x1058>
+   13670: 48 63 04 81                  	movslq	(%rcx,%rax,4), %rax
+   13674: 48 01 c8                     	addq	%rcx, %rax
+   13677: ff e0                        	jmpq	*%rax
+   13679: 41 8b 8d ac 00 00 00         	movl	0xac(%r13), %ecx
+   13680: 4c 89 ff                     	movq	%r15, %rdi
+   13683: 44 89 e6                     	movl	%r12d, %esi
+   13686: 4c 89 ca                     	movq	%r9, %rdx
+   13689: 48 81 c4 68 01 00 00         	addq	$0x168, %rsp            ## imm = 0x168
+
+
+Wall time: 0.06 seconds

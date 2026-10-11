@@ -1,0 +1,11 @@
+{
+  "text": "MCP failure\nserver: rea\ntool: read_function_instructions\ntransport: stdio\nstage: receive\nfailure: timeout\nretryable: no\nmessage: Request timeout after 30000ms\nnext: Check server health or increase the MCP timeout; the request outcome is unknown.",
+  "details": {
+    "serverName": "rea",
+    "mcpToolName": "read_function_instructions",
+    "isError": true,
+    "provider": "native",
+    "providerName": "OMP"
+  },
+  "hasError": true
+}

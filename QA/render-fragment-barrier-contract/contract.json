@@ -1,0 +1,64 @@
+{
+  "schema": "render-fragment-barrier-contract-v1",
+  "date": "2026-10-10",
+  "report": "local://render-fragment-barrier-contract.md",
+  "binary": {
+    "path": "build/local/zzz-dlss-fix-20261009/precompile-run-01/binding-diagnosis/reference/D3DMetal.framework/Versions/A/D3DMetal",
+    "sha256": "f5b56df1b8fe8b364dd9530651a3769c8aed948bd343be3b4510604d503e2bad",
+    "architecture": "x86_64",
+    "hash_verified_before_rea_open": true
+  },
+  "decision": {
+    "target": "Apple silicon TBDR Metal4",
+    "dependent_fragment_uav_requires_native_render_split": true,
+    "same_pass_fragment_completion_barrier": "unsupported",
+    "same_pass_fence_replacement": "invalid; fences order different passes",
+    "legal_mechanisms": [
+      "producer fence update -> endEncoding -> new render encoder -> consumer fence wait",
+      "endEncoding -> new render encoder -> consumer queue barrier with Device visibility",
+      "producer queue barrier with Device visibility -> endEncoding -> new render encoder"
+    ],
+    "new_command_buffer_required": false,
+    "fragment_only_consumer_barrier_legality": "not independently established by the observed producer-mask assertion"
+  },
+  "prior_rea": [
+    {"symbol": "MPLCommandList::Draw", "address": "0x132a6", "evidence_id": "ev_1948210b8502e59735b61fa72f0c76af5c7318e11a13c4a84f11761ff0777ccb"},
+    {"symbol": "ReplayInlineMemoryBarrier", "address": "0x36263", "evidence_id": "ev_d0a29294f0920c2fa745c89f553a627f4e7c05bace4c1c76c5746ecda471851a"},
+    {"symbol": "ReplayBackwardStageBarrier", "address": "0x3632c", "evidence_id": "ev_061e47c3b95673108a21b7449532a1d54de9b334a4f82da0e4f325eb8e093348"},
+    {"symbol": "RenderEncoder::End", "address": "0x29110", "evidence_id": "ev_d7c488271eef3b2d239231236cfef5834bf10714672052300ab211655494bbb1"}
+  ],
+  "fresh_static_evidence": {
+    "provider": "Xcode llvm-objdump; not REA decompilation",
+    "inline_render_argument_sites": ["0x36282", "0x36286", "0x3628e", "0x363c0", "0x363e3"],
+    "fragment_dependency_call": "0x13406",
+    "check_resource_dependencies": "0x1f0a2",
+    "producer_stage_index_one_checks": ["0x1f1aa", "0x1f256"],
+    "conflict_end_encoder_call": "0x1f311 -> 0xea08",
+    "authority": "static shipped artifact; no runtime D3DMetal activation inferred"
+  },
+  "observed_gpu_evidence": {
+    "authority": "retained root capture; this task launched no GPU",
+    "path": "build/local/d3dmetal-opt-port-20261009/gpu-phase2c-render-passes/stderr.log",
+    "submission": 3,
+    "encoder": 210,
+    "prior_event": 1382,
+    "assertion": "afterEncoderStages must be a valid combination of MTLStages for the current encoder type (MTLStageVertex | MTLStageObject | MTLStageMesh).",
+    "numerical_acceptance": false
+  },
+  "source_obligations": [
+    "reject grouping requiring fragment completion on a nonattachment hazard",
+    "separate attachment stage summaries from nonattachment summaries",
+    "map edge producer into record stages_after and consumer into record stages_before",
+    "preserve original descriptors/store/load/clear and complete member state replay",
+    "retain numerical UAV word32 oracle; change work-count oracle only to required split"
+  ],
+  "rea_status": {
+    "open_verified_hash": true,
+    "new_semantic_queries": "30s MCP transport timeouts",
+    "hopper": "configured launcher missing",
+    "ida": "not configured",
+    "final_close_result": null,
+    "closed": true
+  },
+  "edits": "report and evidence only; no source/fixture/runner/runtime changes"
+}

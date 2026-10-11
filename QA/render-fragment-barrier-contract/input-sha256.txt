@@ -1,0 +1,8 @@
+cb7bfe7d7b5347112823c908cff7714d9ecc20eec6594d2cfd46ea90fd1b7fe3  src/winemetal/unix/winemetal_metal4.c
+b5ac3f8c93ca205830a90dff4528849df7d63bc87a9addb81e6f58cdaba81329  src/d3d12/d3d12_command_queue.cpp
+75896b50987d44274b93e7c6bcbfa0e6f73bd65d9a5233f8804572b51988df0b  /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Metal.framework/Headers/MTL4CommandEncoder.h
+30a4ef6d30a363b6a0df94eb44873c2a1718a96b3091e7edfa9f1082824ec47f  /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Metal.framework/Headers/MTL4RenderCommandEncoder.h
+f5b56df1b8fe8b364dd9530651a3769c8aed948bd343be3b4510604d503e2bad  build/local/zzz-dlss-fix-20261009/precompile-run-01/binding-diagnosis/reference/D3DMetal.framework/Versions/A/D3DMetal
+
+
+Wall time: 0.05 seconds

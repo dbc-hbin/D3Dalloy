@@ -1,0 +1,175 @@
+
+build/local/zzz-dlss-fix-20261009/precompile-run-01/binding-diagnosis/reference/D3DMetal.framework/Versions/A/D3DMetal:	file format mach-o 64-bit x86-64
+
+Disassembly of section __TEXT,__text:
+
+000000000001f0a2 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)>:
+   1f0a2: 55                           	pushq	%rbp
+   1f0a3: 48 89 e5                     	movq	%rsp, %rbp
+   1f0a6: 41 57                        	pushq	%r15
+   1f0a8: 41 56                        	pushq	%r14
+   1f0aa: 41 55                        	pushq	%r13
+   1f0ac: 41 54                        	pushq	%r12
+   1f0ae: 53                           	pushq	%rbx
+   1f0af: 48 83 ec 38                  	subq	$0x38, %rsp
+   1f0b3: 41 89 cc                     	movl	%ecx, %r12d
+   1f0b6: 41 89 f5                     	movl	%esi, %r13d
+   1f0b9: 0f bc ca                     	bsfl	%edx, %ecx
+   1f0bc: 89 c8                        	movl	%ecx, %eax
+   1f0be: c1 e0 06                     	shll	$0x6, %eax
+   1f0c1: 48 8b b4 07 f0 24 00 00      	movq	0x24f0(%rdi,%rax), %rsi
+   1f0c9: 48 8b 84 07 f8 24 00 00      	movq	0x24f8(%rdi,%rax), %rax
+   1f0d1: 48 89 45 a0                  	movq	%rax, -0x60(%rbp)
+   1f0d5: 48 39 c6                     	cmpq	%rax, %rsi
+   1f0d8: 0f 84 09 02 00 00            	je	0x1f2e7 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x245>
+   1f0de: 48 89 fb                     	movq	%rdi, %rbx
+   1f0e1: 89 4d bc                     	movl	%ecx, -0x44(%rbp)
+   1f0e4: 48 8d 87 70 27 00 00         	leaq	0x2770(%rdi), %rax
+   1f0eb: 48 89 45 a8                  	movq	%rax, -0x58(%rbp)
+   1f0ef: 44 89 e8                     	movl	%r13d, %eax
+   1f0f2: 48 89 45 c0                  	movq	%rax, -0x40(%rbp)
+   1f0f6: 44 89 e8                     	movl	%r13d, %eax
+   1f0f9: c1 e8 06                     	shrl	$0x6, %eax
+   1f0fc: 48 89 45 c8                  	movq	%rax, -0x38(%rbp)
+   1f100: b8 01 00 00 00               	movl	$0x1, %eax
+   1f105: 44 89 e9                     	movl	%r13d, %ecx
+   1f108: 48 d3 e0                     	shlq	%cl, %rax
+   1f10b: 48 89 45 d0                  	movq	%rax, -0x30(%rbp)
+   1f10f: 44 89 6d b8                  	movl	%r13d, -0x48(%rbp)
+   1f113: 48 89 75 b0                  	movq	%rsi, -0x50(%rbp)
+   1f117: 48 8b 7d a8                  	movq	-0x58(%rbp), %rdi
+   1f11b: e8 88 04 35 00               	callq	0x36f5a8 <std::__1::__wrap_iter<std::__1::pair<MPLSubresource, MPLCommandList::SubresourceDependency>*> ankerl::unordered_dense::v4_5_0::detail::table<MPLSubresource, MPLCommandList::SubresourceDependency, MPLSubresourceHasher, std::__1::equal_to<MPLSubresource>, std::__1::allocator<std::__1::pair<MPLSubresource, MPLCommandList::SubresourceDependency>>, ankerl::unordered_dense::v4_5_0::bucket_type::standard, ankerl::unordered_dense::v4_5_0::detail::default_container_t, false>::do_find<MPLSubresource>(MPLSubresource const&)>
+   1f120: 48 8b 75 b0                  	movq	-0x50(%rbp), %rsi
+   1f124: 48 3b 83 78 27 00 00         	cmpq	0x2778(%rbx), %rax
+   1f12b: 0f 84 a8 01 00 00            	je	0x1f2d9 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x237>
+   1f131: 8a 56 11                     	movb	0x11(%rsi), %dl
+   1f134: 80 fa 01                     	cmpb	$0x1, %dl
+   1f137: 75 0d                        	jne	0x1f146 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0xa4>
+   1f139: 44 8a 70 39                  	movb	0x39(%rax), %r14b
+   1f13d: 40 8a 78 38                  	movb	0x38(%rax), %dil
+   1f141: 44 08 f7                     	orb	%r14b, %dil
+   1f144: eb 07                        	jmp	0x1f14d <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0xab>
+   1f146: 44 8a 70 39                  	movb	0x39(%rax), %r14b
+   1f14a: 44 89 f7                     	movl	%r14d, %edi
+   1f14d: 40 84 ff                     	testb	%dil, %dil
+   1f150: 0f 84 83 01 00 00            	je	0x1f2d9 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x237>
+   1f156: 45 31 c9                     	xorl	%r9d, %r9d
+   1f159: 40 0f b6 cf                  	movzbl	%dil, %ecx
+   1f15d: 0f bc c9                     	bsfl	%ecx, %ecx
+   1f160: 41 b0 01                     	movb	$0x1, %r8b
+   1f163: 41 d2 e0                     	shlb	%cl, %r8b
+   1f166: 80 fa 01                     	cmpb	$0x1, %dl
+   1f169: 0f 85 b6 00 00 00            	jne	0x1f225 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x183>
+   1f16f: 44 84 40 38                  	testb	%r8b, 0x38(%rax)
+   1f173: 0f 84 ac 00 00 00            	je	0x1f225 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x183>
+   1f179: 41 f6 c1 01                  	testb	$0x1, %r9b
+   1f17d: 41 b1 01                     	movb	$0x1, %r9b
+   1f180: 0f 85 9f 00 00 00            	jne	0x1f225 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x183>
+   1f186: 49 89 db                     	movq	%rbx, %r11
+   1f189: 44 89 e3                     	movl	%r12d, %ebx
+   1f18c: 44 0f b6 c9                  	movzbl	%cl, %r9d
+   1f190: 46 8b 54 88 10               	movl	0x10(%rax,%r9,4), %r10d
+   1f195: 4d 89 dd                     	movq	%r11, %r13
+   1f198: 4d 8b 8b d0 24 00 00         	movq	0x24d0(%r11), %r9
+   1f19f: 4d 69 e2 e8 01 00 00         	imulq	$0x1e8, %r10, %r12      ## imm = 0x1E8
+   1f1a6: 4f 8d 3c 21                  	leaq	(%r9,%r12), %r15
+   1f1aa: 80 f9 01                     	cmpb	$0x1, %cl
+   1f1ad: 41 0f 94 c3                  	sete	%r11b
+   1f1b1: 48 8b 75 c0                  	movq	-0x40(%rbp), %rsi
+   1f1b5: 4b 39 b4 21 a0 01 00 00      	cmpq	%rsi, 0x1a0(%r9,%r12)
+   1f1bd: 76 19                        	jbe	0x1f1d8 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x136>
+   1f1bf: 4d 8b 8f b0 01 00 00         	movq	0x1b0(%r15), %r9
+   1f1c6: 48 8b 75 c8                  	movq	-0x38(%rbp), %rsi
+   1f1ca: 4c 8b 65 d0                  	movq	-0x30(%rbp), %r12
+   1f1ce: 4d 85 24 f1                  	testq	%r12, (%r9,%rsi,8)
+   1f1d2: 41 0f 95 c1                  	setne	%r9b
+   1f1d6: eb 03                        	jmp	0x1f1db <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x139>
+   1f1d8: 45 31 c9                     	xorl	%r9d, %r9d
+   1f1db: 4c 8b 65 c0                  	movq	-0x40(%rbp), %r12
+   1f1df: 4d 39 a7 b8 01 00 00         	cmpq	%r12, 0x1b8(%r15)
+   1f1e6: 41 89 dc                     	movl	%ebx, %r12d
+   1f1e9: 76 19                        	jbe	0x1f204 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x162>
+   1f1eb: 4d 8b bf c8 01 00 00         	movq	0x1c8(%r15), %r15
+   1f1f2: 48 8b 75 c8                  	movq	-0x38(%rbp), %rsi
+   1f1f6: 48 8b 5d d0                  	movq	-0x30(%rbp), %rbx
+   1f1fa: 49 85 1c f7                  	testq	%rbx, (%r15,%rsi,8)
+   1f1fe: 41 0f 95 c7                  	setne	%r15b
+   1f202: eb 03                        	jmp	0x1f207 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x165>
+   1f204: 45 31 ff                     	xorl	%r15d, %r15d
+   1f207: 4c 89 eb                     	movq	%r13, %rbx
+   1f20a: 45 08 e3                     	orb	%r12b, %r11b
+   1f20d: 44 8b 6d b8                  	movl	-0x48(%rbp), %r13d
+   1f211: 45 39 ea                     	cmpl	%r13d, %r10d
+   1f214: 41 0f 94 c2                  	sete	%r10b
+   1f218: 45 20 da                     	andb	%r11b, %r10b
+   1f21b: 45 08 f9                     	orb	%r15b, %r9b
+   1f21e: 45 08 d1                     	orb	%r10b, %r9b
+   1f221: 41 80 e1 01                  	andb	$0x1, %r9b
+   1f225: 45 84 c6                     	testb	%r8b, %r14b
+   1f228: 0f 84 98 00 00 00            	je	0x1f2c6 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x224>
+   1f22e: 41 f6 c1 01                  	testb	$0x1, %r9b
+   1f232: 41 b1 01                     	movb	$0x1, %r9b
+   1f235: 0f 85 8b 00 00 00            	jne	0x1f2c6 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x224>
+   1f23b: 44 0f b6 c9                  	movzbl	%cl, %r9d
+   1f23f: 46 8b 54 88 24               	movl	0x24(%rax,%r9,4), %r10d
+   1f244: 4c 8b 8b d0 24 00 00         	movq	0x24d0(%rbx), %r9
+   1f24b: 4d 69 fa e8 01 00 00         	imulq	$0x1e8, %r10, %r15      ## imm = 0x1E8
+   1f252: 4f 8d 1c 39                  	leaq	(%r9,%r15), %r11
+   1f256: 80 f9 01                     	cmpb	$0x1, %cl
+   1f259: 0f 94 c1                     	sete	%cl
+   1f25c: 48 8b 75 c0                  	movq	-0x40(%rbp), %rsi
+   1f260: 4b 39 b4 39 a0 01 00 00      	cmpq	%rsi, 0x1a0(%r9,%r15)
+   1f268: 76 19                        	jbe	0x1f283 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x1e1>
+   1f26a: 4d 8b 8b b0 01 00 00         	movq	0x1b0(%r11), %r9
+   1f271: 48 8b 75 c8                  	movq	-0x38(%rbp), %rsi
+   1f275: 4c 8b 7d d0                  	movq	-0x30(%rbp), %r15
+   1f279: 4d 85 3c f1                  	testq	%r15, (%r9,%rsi,8)
+   1f27d: 41 0f 95 c1                  	setne	%r9b
+   1f281: eb 03                        	jmp	0x1f286 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x1e4>
+   1f283: 45 31 c9                     	xorl	%r9d, %r9d
+   1f286: 48 8b 75 c0                  	movq	-0x40(%rbp), %rsi
+   1f28a: 49 39 b3 b8 01 00 00         	cmpq	%rsi, 0x1b8(%r11)
+   1f291: 76 19                        	jbe	0x1f2ac <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x20a>
+   1f293: 4d 8b 9b c8 01 00 00         	movq	0x1c8(%r11), %r11
+   1f29a: 48 8b 75 c8                  	movq	-0x38(%rbp), %rsi
+   1f29e: 4c 8b 7d d0                  	movq	-0x30(%rbp), %r15
+   1f2a2: 4d 85 3c f3                  	testq	%r15, (%r11,%rsi,8)
+   1f2a6: 41 0f 95 c3                  	setne	%r11b
+   1f2aa: eb 03                        	jmp	0x1f2af <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x20d>
+   1f2ac: 45 31 db                     	xorl	%r11d, %r11d
+   1f2af: 44 08 e1                     	orb	%r12b, %cl
+   1f2b2: 45 39 ea                     	cmpl	%r13d, %r10d
+   1f2b5: 41 0f 94 c2                  	sete	%r10b
+   1f2b9: 41 20 ca                     	andb	%cl, %r10b
+   1f2bc: 45 08 d9                     	orb	%r11b, %r9b
+   1f2bf: 45 08 d1                     	orb	%r10b, %r9b
+   1f2c2: 41 80 e1 01                  	andb	$0x1, %r9b
+   1f2c6: 44 30 c7                     	xorb	%r8b, %dil
+   1f2c9: 0f 85 8a fe ff ff            	jne	0x1f159 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0xb7>
+   1f2cf: 41 f6 c1 01                  	testb	$0x1, %r9b
+   1f2d3: 48 8b 75 b0                  	movq	-0x50(%rbp), %rsi
+   1f2d7: 75 1f                        	jne	0x1f2f8 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x256>
+   1f2d9: 48 83 c6 18                  	addq	$0x18, %rsi
+   1f2dd: 48 3b 75 a0                  	cmpq	-0x60(%rbp), %rsi
+   1f2e1: 0f 85 2c fe ff ff            	jne	0x1f113 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x71>
+   1f2e7: 31 c0                        	xorl	%eax, %eax
+   1f2e9: 48 83 c4 38                  	addq	$0x38, %rsp
+   1f2ed: 5b                           	popq	%rbx
+   1f2ee: 41 5c                        	popq	%r12
+   1f2f0: 41 5d                        	popq	%r13
+   1f2f2: 41 5e                        	popq	%r14
+   1f2f4: 41 5f                        	popq	%r15
+   1f2f6: 5d                           	popq	%rbp
+   1f2f7: c3                           	retq
+   1f2f8: 8b 4d bc                     	movl	-0x44(%rbp), %ecx
+   1f2fb: c0 e1 03                     	shlb	$0x3, %cl
+   1f2fe: 48 b8 00 00 01 02 03 00 00 00	movabsq	$0x302010000, %rax      ## imm = 0x302010000
+   1f308: 48 d3 e8                     	shrq	%cl, %rax
+   1f30b: 0f b6 f0                     	movzbl	%al, %esi
+   1f30e: 48 89 df                     	movq	%rbx, %rdi
+   1f311: e8 f2 f6 fe ff               	callq	0xea08 <MPLCommandList::EndEncoder(MPLEncoderType)>
+   1f316: b0 01                        	movb	$0x1, %al
+   1f318: eb cf                        	jmp	0x1f2e9 <MPLCommandList::CheckResourceDependencies(EncoderIndex, MPLStage, bool)+0x247>
+
+
+Wall time: 0.06 seconds

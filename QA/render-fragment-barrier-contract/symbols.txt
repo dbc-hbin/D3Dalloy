@@ -1,0 +1,719 @@
+                 U _AnalyticsSendEventLazy
+                 U _CFEqual
+                 U _CGColorCreate
+                 U _CGColorCreateCopyByMatchingToColorSpace
+                 U _CGColorGetComponents
+                 U _CGColorRelease
+                 U _CGColorSpaceCreateWithName
+                 U _CGColorSpaceGetModel
+                 U _CGColorSpaceRelease
+                 U _IRCompilerAppendShaderIDToEntryPointName
+                 U _IRCompilerCreate
+                 U _IRCompilerDestroy
+                 U _IRCompilerEnableGeometryAndTessellationEmulation
+                 U _IRCompilerIgnoreDebugInformation
+                 U _IRCompilerIgnoreRootSignature
+                 U _IRCompilerSetCompatibilityFlags
+                 U _IRCompilerSetDebugRTArguments
+                 U _IRCompilerSetDepthFeedbackConfiguration
+                 U _IRCompilerSetDualSourceBlendingConfiguration
+                 U _IRCompilerSetGlobalRootSignature
+                 U _IRCompilerSetHasGeometryShader
+                 U _IRCompilerSetHitgroupArguments
+                 U _IRCompilerSetInputTopology
+                 U _IRCompilerSetIntRTMask
+                 U _IRCompilerSetLocalRootSignature
+                 U _IRCompilerSetMinimumGPUFamily
+                 U _IRCompilerSetNodeShaderDescriptorOverrides
+                 U _IRCompilerSetNodeShaderDescriptors
+                 U _IRCompilerSetSampleMask
+                 U _IRCompilerSetSharedRTArguments
+                 U _IRCompilerSetStageInGenerationMode
+                 U _IRCompilerSetStreamOutEnabled
+                 U _IRCompilerSetStripCutIndex
+                 U _IRCompilerSetTessellationEnabled
+                 U _IRCompilerSetTessellatorOutputPrimitive
+                 U _IRCompilerSetValidationFlags
+                 U _IRCompilerSetVertexRenderTargetIndexID
+                 U _IRCompilerSetVertexViewportIndexID
+                 U _IRErrorDestroy
+                 U _IRErrorGetCode
+                 U _IRErrorGetPayload
+                 U _IRMetalLibGetBytecodeData
+                 U _IRMetalLibSynthesizeIndirectIntersectionFunction
+                 U _IRObjectDestroy
+                 U _IRObjectGetMetalIRShaderStage
+                 U _IRObjectGetMetalLibBinary
+                 U _IRObjectGetReflection
+                 U _IRRootSignatureDestroy
+                 U _IRVersionedRootSignatureDescriptorCreateFromBlob
+                 U _IRVersionedRootSignatureDescriptorRelease
+                 U _MTLCopyAllDevices
+                 U _MTLCreateSystemDefaultDevice
+                 U _MTLMakeShaderCacheWritableByAllUsers
+                 U _MTLSetShaderCachePath
+                 U _MTLTextureSwizzleChannelsToKey
+                 U _MTLTextureSwizzleKeyToChannels
+                 U _NSClassFromString
+                 U _NSGlobalDomain
+                 U _NSLog
+                 U _NSSelectorFromString
+                 U _OBJC_CLASS_$_MTL4AccelerationStructureBoundingBoxGeometryDescriptor
+                 U _OBJC_CLASS_$_MTL4AccelerationStructureTriangleGeometryDescriptor
+                 U _OBJC_CLASS_$_MTL4ArgumentTableDescriptor
+                 U _OBJC_CLASS_$_MTL4CommitOptions
+                 U _OBJC_CLASS_$_MTL4CompilerDescriptor
+                 U _OBJC_CLASS_$_MTL4ComputePipelineDescriptor
+                 U _OBJC_CLASS_$_MTL4InstanceAccelerationStructureDescriptor
+                 U _OBJC_CLASS_$_MTL4LibraryFunctionDescriptor
+                 U _OBJC_CLASS_$_MTL4PrimitiveAccelerationStructureDescriptor
+                 U _OBJC_CLASS_$_MTL4RenderPassDescriptor
+                 U _OBJC_CLASS_$_MTL4RenderPipelineDescriptor
+                 U _OBJC_CLASS_$_MTL4SpecializedFunctionDescriptor
+                 U _OBJC_CLASS_$_MTL4StaticLinkingDescriptor
+                 U _OBJC_CLASS_$_MTLAccelerationStructureAllocationDescriptor
+                 U _OBJC_CLASS_$_MTLAccelerationStructureBoundingBoxGeometryDescriptor
+                 U _OBJC_CLASS_$_MTLAccelerationStructurePassDescriptor
+                 U _OBJC_CLASS_$_MTLAccelerationStructureTriangleGeometryDescriptor
+                 U _OBJC_CLASS_$_MTLCaptureDescriptor
+                 U _OBJC_CLASS_$_MTLCaptureManager
+                 U _OBJC_CLASS_$_MTLComputePassDescriptor
+                 U _OBJC_CLASS_$_MTLComputePipelineDescriptor
+                 U _OBJC_CLASS_$_MTLDepthStencilDescriptor
+                 U _OBJC_CLASS_$_MTLFXFrameInterpolatorDescriptor
+                 U _OBJC_CLASS_$_MTLFXSpatialScalerDescriptor
+                 U _OBJC_CLASS_$_MTLFXTemporalDenoisedScalerDescriptor
+                 U _OBJC_CLASS_$_MTLFXTemporalScalerDescriptor
+                 U _OBJC_CLASS_$_MTLFunctionConstantValues
+                 U _OBJC_CLASS_$_MTLFunctionDescriptor
+                 U _OBJC_CLASS_$_MTLHeapDescriptor
+                 U _OBJC_CLASS_$_MTLIndirectCommandBufferDescriptor
+                 U _OBJC_CLASS_$_MTLInstanceAccelerationStructureDescriptor
+                 U _OBJC_CLASS_$_MTLIntersectionFunctionDescriptor
+                 U _OBJC_CLASS_$_MTLIntersectionFunctionTableDescriptor
+                 U _OBJC_CLASS_$_MTLLinkedFunctions
+                 U _OBJC_CLASS_$_MTLLogicalToPhysicalColorAttachmentMap
+                 U _OBJC_CLASS_$_MTLMeshRenderPipelineDescriptor
+                 U _OBJC_CLASS_$_MTLPrimitiveAccelerationStructureDescriptor
+                 U _OBJC_CLASS_$_MTLRenderPassDepthAttachmentDescriptor
+                 U _OBJC_CLASS_$_MTLRenderPassDescriptor
+                 U _OBJC_CLASS_$_MTLRenderPassStencilAttachmentDescriptor
+                 U _OBJC_CLASS_$_MTLRenderPipelineDescriptor
+                 U _OBJC_CLASS_$_MTLResidencySetDescriptor
+                 U _OBJC_CLASS_$_MTLResourceViewPoolDescriptor
+                 U _OBJC_CLASS_$_MTLSamplerDescriptor
+                 U _OBJC_CLASS_$_MTLSharedEventListener
+                 U _OBJC_CLASS_$_MTLStencilDescriptor
+                 U _OBJC_CLASS_$_MTLTextureDescriptor
+                 U _OBJC_CLASS_$_MTLTextureViewDescriptor
+                 U _OBJC_CLASS_$_MTLVisibleFunctionTableDescriptor
+                 U _OBJC_CLASS_$_NSAlert
+                 U _OBJC_CLASS_$_NSArray
+                 U _OBJC_CLASS_$_NSBundle
+                 U _OBJC_CLASS_$_NSData
+                 U _OBJC_CLASS_$_NSDictionary
+                 U _OBJC_CLASS_$_NSFileManager
+                 U _OBJC_CLASS_$_NSJSONSerialization
+                 U _OBJC_CLASS_$_NSMutableArray
+                 U _OBJC_CLASS_$_NSMutableDictionary
+                 U _OBJC_CLASS_$_NSMutableSet
+                 U _OBJC_CLASS_$_NSNumber
+                 U _OBJC_CLASS_$_NSProcessInfo
+                 U _OBJC_CLASS_$_NSScreen
+                 U _OBJC_CLASS_$_NSString
+                 U _OBJC_CLASS_$_NSThread
+                 U _OBJC_CLASS_$_NSURL
+                 U _OBJC_CLASS_$_NSUserDefaults
+                 U __Block_copy
+                 U __Block_object_assign
+                 U __Block_object_dispose
+                 U __Block_release
+                 U __DefaultRuneLocale
+                 U __NSConcreteGlobalBlock
+                 U __NSConcreteStackBlock
+                 U __NSGetEnviron
+                 U __NSGetExecutablePath
+                 U __Unwind_Resume
+                 U IRCompilerEnableYield(IRCompiler*, bool, DXIL2AIRYieldMode, unsigned short, unsigned short)
+                 U IRCompilerSetShaderID(IRCompiler*, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
+                 U IRObjectCreateFromDXIL(char const*, unsigned long)
+                 U IRCreateStageInFunction(IRCompiler const*, IRMetalLibBinary*, IRShaderReflection const*, D3DMInputLayoutDesc const&)
+                 U IRCompilerEnableFeedback(IRCompiler*, bool)
+                 U IRCompilerSetTargetTriple(IRCompiler*, char const*)
+                 U IRCompilerSetUnorm8RTMask(IRCompiler*, unsigned char)
+                 U IRCreateStreamOutFunction(IRCompiler const*, IRMetalLibBinary*, IRShaderReflection const*, D3DMStreamOutDesc const&)
+                 U IRCompilerPatchFloatToUnorm(IRCompiler*, bool)
+                 U IRCompilerForce4WideVaryings(IRCompiler*, bool)
+                 U IRCompilerAllocCompileAndLink(IRCompiler*, std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>> const&, IRObject const*, IRError**)
+                 U IRCompilerEnableFP64Emulation(IRCompiler*, bool)
+                 U IRCompilerEnableShaderDetection(IRCompiler*, bool)
+                 U IRShaderReflectionGetBinarySize(IRShaderReflection*)
+                 U IRCompilerEnableGOSPayloadReadWA(IRCompiler*, bool)
+                 U IRCompilerEnableGeometryDebugging(IRCompiler*, bool)
+                 U IRCompilerSupportGloballyCoherent(IRCompiler*, bool)
+                 U IRRootSignatureCreateFromABLayout(ABLayout*)
+                 U IRCompilerSupportRGB32TypedBuffers(IRCompiler*, bool)
+                 U IRCompilerUnsafePositionInvariance(IRCompiler*, bool)
+                 U IRShaderReflectionSerializeToBinary(IRShaderReflection*, void*, unsigned long long)
+                 U IRCompilerFlushFragmentColorNanToZero(IRCompiler*, bool)
+                 U IRCompilerSupportUnAlignedTypedBuffers(IRCompiler*, bool)
+                 U IRShaderReflectionDeserializeFromBinary(IRShaderReflection*, void*, unsigned long long)
+                 U DXCompiler::DXBCToDXIL(ShaderBytecode, ShaderBytecode&)
+                 U DXCompiler::HLSLToDXIL(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, char const*, char const*, std::__1::vector<std::__1::basic_string<wchar_t, std::__1::char_traits<wchar_t>, std::__1::allocator<wchar_t>>, std::__1::allocator<std::__1::basic_string<wchar_t, std::__1::char_traits<wchar_t>, std::__1::allocator<wchar_t>>>> const&, std::__1::vector<std::__1::basic_string<wchar_t, std::__1::char_traits<wchar_t>, std::__1::allocator<wchar_t>>, std::__1::allocator<std::__1::basic_string<wchar_t, std::__1::char_traits<wchar_t>, std::__1::allocator<wchar_t>>>> const&, ShaderBytecode&)
+                 U DXCompiler::GetDxilPartByType(hlsl::DxilContainerHeader*, unsigned int)
+                 U DXILContainer::DXILContainer(char const*, unsigned long, DXILContainer::ParseFlags)
+                 U DXIL2AIR::getEntryPoints()
+                 U DXIL2AIR::gatherInfoRTShaders(ABLayout*, ABLayout*, char const*, RTInfoFromShaders*)
+                 U DXIL2AIR::serializeRootSignature(D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, unsigned char**, unsigned int*)
+                 U DXIL2AIR::deserializeRootSignature(unsigned char*, D3D12_ROOT_SIGNATURE_DESC**)
+                 U DXIL2AIR::deserializeRootSignature(unsigned char*, D3D12_VERSIONED_ROOT_SIGNATURE_DESC**, D3D12_VERSIONED_ROOT_SIGNATURE_DESC**)
+                 U DXIL2AIR::createABLayoutFromRootSignatureDesc(D3D12_VERSIONED_ROOT_SIGNATURE_DESC const*, std::__1::unique_ptr<IRError, std::__1::default_delete<IRError>>*)
+                 U DXIL2AIR::getNodeShaderDescriptorsForLibraries(std::__1::vector<DXIL2AIR, std::__1::allocator<DXIL2AIR>>&, std::__1::vector<std::__1::shared_ptr<NodeShaderDescriptor>, std::__1::allocator<std::__1::shared_ptr<NodeShaderDescriptor>>>&, std::__1::vector<std::__1::vector<std::__1::shared_ptr<NodeShaderDescriptor>, std::__1::allocator<std::__1::shared_ptr<NodeShaderDescriptor>>>, std::__1::allocator<std::__1::vector<std::__1::shared_ptr<NodeShaderDescriptor>, std::__1::allocator<std::__1::shared_ptr<NodeShaderDescriptor>>>>>&)
+                 U DXIL2AIR::extractRootSignatureFromDXILContainer(char const*, unsigned long)
+                 U DXIL2AIR::DXIL2AIR(ShaderBytecode const&, DXIL2AIRCompilerSettings const&)
+                 U DXIL2AIR::~DXIL2AIR()
+                 U DXILContainer::BytecodeType() const
+                 U DXILContainer::Digest() const
+                 U DXILContainer::IsValid() const
+                 U std::logic_error::what() const
+                 U std::runtime_error::what() const
+                 U std::bad_optional_access::what() const
+                 U std::__1::__shared_weak_count::__get_deleter(std::type_info const&) const
+                 U std::__1::__codecvt_utf8_utf16<char16_t>::do_unshift(__mbstate_t&, char*, char*, char*&) const
+                 U std::__1::__codecvt_utf8_utf16<char16_t>::do_encoding() const
+                 U std::__1::__codecvt_utf8_utf16<char16_t>::do_max_length() const
+                 U std::__1::__codecvt_utf8_utf16<char16_t>::do_always_noconv() const
+                 U std::__1::__codecvt_utf8_utf16<char16_t>::do_in(__mbstate_t&, char const*, char const*, char const*&, char16_t*, char16_t*, char16_t*&) const
+                 U std::__1::__codecvt_utf8_utf16<char16_t>::do_out(__mbstate_t&, char16_t const*, char16_t const*, char16_t const*&, char*, char*, char*&) const
+                 U std::__1::__codecvt_utf8_utf16<char16_t>::do_length(__mbstate_t&, char const*, char const*, unsigned long) const
+                 U std::__1::__fs::filesystem::directory_iterator::__dereference() const
+                 U std::__1::__fs::filesystem::path::__filename() const
+                 U std::__1::__fs::filesystem::path::__parent_path() const
+                 U std::__1::__fs::filesystem::path::__root_directory() const
+                 U std::__1::__fs::filesystem::path::__compare(std::__1::basic_string_view<char, std::__1::char_traits<char>>) const
+                 U std::__1::locale::use_facet(std::__1::locale::id&) const
+                 U std::__1::codecvt<char16_t, char, __mbstate_t>::do_unshift(__mbstate_t&, char*, char*, char*&) const
+                 U std::__1::codecvt<char16_t, char, __mbstate_t>::do_encoding() const
+                 U std::__1::codecvt<char16_t, char, __mbstate_t>::do_max_length() const
+                 U std::__1::codecvt<char16_t, char, __mbstate_t>::do_always_noconv() const
+                 U std::__1::codecvt<char16_t, char, __mbstate_t>::do_in(__mbstate_t&, char const*, char const*, char const*&, char16_t*, char16_t*, char16_t*&) const
+                 U std::__1::codecvt<char16_t, char, __mbstate_t>::do_out(__mbstate_t&, char16_t const*, char16_t const*, char16_t const*&, char*, char*, char*&) const
+                 U std::__1::codecvt<char16_t, char, __mbstate_t>::do_length(__mbstate_t&, char const*, char const*, unsigned long) const
+                 U std::__1::ios_base::getloc() const
+                 U std::exception::what() const
+                 U std::logic_error::logic_error(char const*)
+                 U std::range_error::~range_error()
+                 U std::range_error::~range_error()
+                 U std::length_error::~length_error()
+                 U std::length_error::~length_error()
+                 U std::out_of_range::~out_of_range()
+                 U std::out_of_range::~out_of_range()
+                 U std::runtime_error::runtime_error(char const*)
+                 U std::overflow_error::~overflow_error()
+                 U std::overflow_error::~overflow_error()
+                 U std::bad_optional_access::~bad_optional_access()
+                 U std::bad_optional_access::~bad_optional_access()
+                 U std::bad_array_new_length::bad_array_new_length()
+                 U std::bad_array_new_length::~bad_array_new_length()
+                 U std::__1::__next_prime(unsigned long)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::__grow_by_and_replace(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, char const*)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::__init(char const*, unsigned long)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::append(char const*)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::append(char const*, unsigned long)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::append(unsigned long, char)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::assign(char const*)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::insert(unsigned long, char const*, unsigned long)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::resize(unsigned long, char)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::__grow_by(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::push_back(char)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::basic_string(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, unsigned long, unsigned long, std::__1::allocator<char> const&)
+                 U std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>::operator=(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)
+                 U std::__1::basic_filebuf<char, std::__1::char_traits<char>>::close()
+                 U std::__1::basic_filebuf<char, std::__1::char_traits<char>>::basic_filebuf()
+                 U std::__1::basic_filebuf<char, std::__1::char_traits<char>>::~basic_filebuf()
+                 U std::__1::basic_ostream<char, std::__1::char_traits<char>>::write(char const*, long)
+                 U std::__1::basic_ostream<char, std::__1::char_traits<char>>::sentry::sentry(std::__1::basic_ostream<char, std::__1::char_traits<char>>&)
+                 U std::__1::basic_ostream<char, std::__1::char_traits<char>>::sentry::~sentry()
+                 U std::__1::basic_ostream<char, std::__1::char_traits<char>>::~basic_ostream()
+                 U std::__1::basic_ostream<char, std::__1::char_traits<char>>::operator<<(unsigned int)
+                 U std::__1::basic_ostream<char, std::__1::char_traits<char>>::operator<<(unsigned long long)
+                 U std::__1::__shared_count::~__shared_count()
+                 U std::__1::__shared_count::~__shared_count()
+                 U std::__1::basic_iostream<char, std::__1::char_traits<char>>::~basic_iostream()
+                 U std::__1::basic_ofstream<char, std::__1::char_traits<char>>::open(char const*, unsigned int)
+                 U std::__1::recursive_mutex::lock()
+                 U std::__1::recursive_mutex::unlock()
+                 U std::__1::recursive_mutex::recursive_mutex()
+                 U std::__1::recursive_mutex::~recursive_mutex()
+                 U std::__1::system_category()
+                 U std::__1::generic_category()
+                 U std::__1::condition_variable::notify_all()
+                 U std::__1::condition_variable::wait(std::__1::unique_lock<std::__1::mutex>&)
+                 U std::__1::condition_variable::~condition_variable()
+                 U std::__1::__shared_weak_count::__release_weak()
+                 U std::__1::__shared_weak_count::lock()
+                 U std::__1::__shared_weak_count::~__shared_weak_count()
+                 U std::__1::__shared_weak_count::~__shared_weak_count()
+                 U std::__1::__shared_weak_count::~__shared_weak_count()
+                 U std::__1::__libcpp_atomic_wait(void const volatile*, long long)
+                 U std::__1::__throw_system_error(int, char const*)
+                 U std::__1::__libcpp_verbose_abort(char const*, ...)
+                 U std::__1::__cxx_atomic_notify_all(void const volatile*)
+                 U std::__1::__cxx_atomic_notify_one(void const volatile*)
+                 U std::__1::__libcpp_atomic_monitor(void const volatile*)
+                 U std::__1::__fs::filesystem::__remove_all(std::__1::__fs::filesystem::path const&, std::__1::error_code*)
+                 U std::__1::__fs::filesystem::directory_iterator::__increment(std::__1::error_code*)
+                 U std::__1::__fs::filesystem::directory_iterator::directory_iterator(std::__1::__fs::filesystem::path const&, std::__1::error_code*, std::__1::__fs::filesyste
+[…13805ln elided…]
+p
+00000000005180c8 b EncodeResourceBarrier(D3D12CommandEncoder&, D3D12::ResourceBarrierCommand const&)::appWA
+00000000005180d0 b guard variable for EncodeResourceBarrier(D3D12CommandEncoder&, D3D12::ResourceBarrierCommand const&)::appWA
+00000000005180e0 b BindingTypeToStr (.9705)
+0000000000518140 b DXInterpolationToAIR (.9712)
+00000000005182f0 b DXResourceTypeToStr (.9718)
+0000000000518370 b DXGenericToStr (.9778)
+0000000000518508 b D3DMDefaultOSLog()::logObj (.9955)
+0000000000518510 b D3DMDefaultOSLog()::onceToken (.9953)
+0000000000518518 b D3DMPrintError(char const*, ...)::errorMode (.9968)
+0000000000518520 b guard variable for D3DMPrintError(char const*, ...)::errorMode (.9966)
+0000000000518528 b D3DMVirtualMemoryLookup::instance(D3DMVirtualMemoryLookup::Type)::buffers
+0000000000518550 b guard variable for D3DMVirtualMemoryLookup::instance(D3DMVirtualMemoryLookup::Type)::buffers
+0000000000518558 b D3DMVirtualMemoryLookup::instance(D3DMVirtualMemoryLookup::Type)::accelerationStructures
+0000000000518580 b guard variable for D3DMVirtualMemoryLookup::instance(D3DMVirtualMemoryLookup::Type)::accelerationStructures
+0000000000518588 b D3DMVirtualMemoryLookup::instance(D3DMVirtualMemoryLookup::Type)::cpuDescHeap
+00000000005185b0 b guard variable for D3DMVirtualMemoryLookup::instance(D3DMVirtualMemoryLookup::Type)::cpuDescHeap
+00000000005185b8 b D3DMVirtualMemoryLookup::instance(D3DMVirtualMemoryLookup::Type)::heaps
+00000000005185e0 b guard variable for D3DMVirtualMemoryLookup::instance(D3DMVirtualMemoryLookup::Type)::heaps
+00000000005185e8 b dx_tex_inst_info_compat (.10044)
+0000000000518610 b dx_tex_inst_info_nocompat (.10051)
+0000000000518640 b DXBuiltinIOKindToAIRStr (.10052)
+0000000000518ac0 b dx_op_to_builtin (.10120)
+0000000000518ae8 b mesh_shader_supported_build_ins (.10121)
+0000000000518b10 b ngx::reactiveMaskMode()::reactiveMaskMode
+0000000000518b18 b guard variable for ngx::reactiveMaskMode()::reactiveMaskMode
+0000000000518b20 b BindingTypeToStr (.10015)
+0000000000518b80 b DXInterpolationToAIR (.10022)
+0000000000518d30 b DXResourceTypeToStr (.10028)
+0000000000518db0 b DXGenericToStr (.10088)
+0000000000518f48 b dx_tex_inst_info_compat (.10561)
+0000000000518f70 b dx_tex_inst_info_nocompat (.10568)
+0000000000518fa0 b DXBuiltinIOKindToAIRStr (.10569)
+0000000000519420 b dx_op_to_builtin (.10603)
+0000000000519448 b mesh_shader_supported_build_ins (.10604)
+0000000000519470 b nvapi_Direct_GetMethod::onceToken
+0000000000519480 b BindingTypeToStr (.10548)
+00000000005194e0 b DXInterpolationToAIR (.10549)
+0000000000519690 b DXResourceTypeToStr (.10550)
+0000000000519710 b DXGenericToStr (.10576)
+00000000005198a8 b nvapi::referenceCount
+00000000005198b0 b D3DMDefaultOSLog()::logObj (.10615)
+00000000005198b8 b D3DMDefaultOSLog()::onceToken (.10613)
+00000000005198c0 b nvapi::entryPointsBackingStore()::entryPoints
+00000000005198e8 b guard variable for nvapi::entryPointsBackingStore()::entryPoints
+00000000005198f0 b dx_tex_inst_info_compat (.10666)
+0000000000519918 b dx_tex_inst_info_nocompat (.10673)
+0000000000519940 b DXBuiltinIOKindToAIRStr (.10674)
+0000000000519dc0 b dx_op_to_builtin (.10742)
+0000000000519de8 b mesh_shader_supported_build_ins (.10743)
+0000000000519e10 b BindingTypeToStr (.10637)
+0000000000519e70 b DXInterpolationToAIR (.10644)
+000000000051a020 b DXResourceTypeToStr (.10650)
+000000000051a0a0 b DXGenericToStr (.10710)
+000000000051a238 b dx_tex_inst_info_compat (.10800)
+000000000051a260 b dx_tex_inst_info_nocompat (.10807)
+000000000051a290 b DXBuiltinIOKindToAIRStr (.10808)
+000000000051a710 b dx_op_to_builtin (.10876)
+000000000051a738 b mesh_shader_supported_build_ins (.10877)
+000000000051a760 b BindingTypeToStr (.10771)
+000000000051a7c0 b DXInterpolationToAIR (.10778)
+000000000051a970 b DXResourceTypeToStr (.10784)
+000000000051a9f0 b DXGenericToStr (.10844)
+000000000051ab90 b BindingTypeToStr (.10986)
+000000000051abf0 b dx_tex_inst_info_compat (.11059)
+000000000051ac18 b dx_tex_inst_info_nocompat (.11066)
+000000000051ac40 b DXBuiltinIOKindToAIRStr (.11067)
+000000000051b0c0 b dx_op_to_builtin (.11135)
+000000000051b0e8 b mesh_shader_supported_build_ins (.11136)
+000000000051b110 b GetOSVersion()::osVersion
+000000000051b128 b guard variable for GetOSVersion()::osVersion
+000000000051b130 b MTLBlendFactorFromD3DMBlend(D3DMBlend, bool)::onceToken
+000000000051b138 b MTLPrimitiveTypeFromD3DPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY)::onceToken
+000000000051b140 b D3DMHeapTypeToMTLHeapResourceOptions(D3DMHeapType, D3DMHeapCPUCaching, unsigned long, bool)::ForcedSharedHeaps
+000000000051b148 b guard variable for D3DMHeapTypeToMTLHeapResourceOptions(D3DMHeapType, D3DMHeapCPUCaching, unsigned long, bool)::ForcedSharedHeaps
+000000000051b150 b D3DMHeapTypeToMTLHeapResourceOptions(D3DMHeapType, D3DMHeapCPUCaching, unsigned long, bool)::ShouldUseSharedHeap
+000000000051b158 b guard variable for D3DMHeapTypeToMTLHeapResourceOptions(D3DMHeapType, D3DMHeapCPUCaching, unsigned long, bool)::ShouldUseSharedHeap
+000000000051b160 b D3DMHeapTypeToMTLHeapResourceOptions(D3DMHeapType, D3DMHeapCPUCaching, unsigned long, bool)::onceToken
+000000000051b168 b D3D12ResolveModeToMTLResolveMode(D3D12_RESOLVE_MODE)::onceToken
+000000000051b170 b D3DCompile::onceToken
+000000000051b178 b guard variable for D3DCompile::generateDebugInformation
+000000000051b180 b guard variable for D3DCompile::enable16BitTypes
+000000000051b188 b D3DCompileFromFile::onceToken
+000000000051b190 b D3D12StreamToD3DMPipelineStateDesc(D3D12_PIPELINE_STATE_STREAM_DESC const*, D3DMGraphicsPipelineStateDesc&, D3DMComputePipelineStateDesc&)::onceToken
+000000000051b198 b D3D12StreamToD3DMPipelineStateDesc(D3D12_PIPELINE_STATE_STREAM_DESC const*, D3DMGraphicsPipelineStateDesc&, D3DMComputePipelineStateDesc&)::onceToken
+000000000051b1a0 b guard variable for D3DMStartCaptureWithDevice(id<MTLDevice>, bool)::captureIndividualCommandLists
+000000000051b1a8 b D3DMStartCaptureWithDevice(id<MTLDevice>, bool)::captureCount
+000000000051b1b0 b D3DMTracingEnabled()::once
+000000000051b1b8 b D3DMWaitForDebugger()::once
+000000000051b1c0 b D3DMEncodeWaitForEvent(id<MTL4CommandQueue>, id<MTLEvent>, unsigned long long)::timeout
+000000000051b1c8 b guard variable for D3DMEncodeWaitForEvent(id<MTL4CommandQueue>, id<MTLEvent>, unsigned long long)::timeout
+000000000051b1d0 b D3DMEncodeWaitForEvent(id<MTLCommandBuffer>, id<MTLEvent>, unsigned long long)::timeout
+000000000051b1d8 b guard variable for D3DMEncodeWaitForEvent(id<MTLCommandBuffer>, id<MTLEvent>, unsigned long long)::timeout
+000000000051b1e0 b IsDebuggerPresent()::IsPresent
+000000000051b1e8 b guard variable for IsDebuggerPresent()::IsPresent
+000000000051b1f0 b BindingTypeToStr (.11030)
+000000000051b250 b DXInterpolationToAIR (.11037)
+000000000051b400 b DXResourceTypeToStr (.11043)
+000000000051b480 b DXGenericToStr (.11103)
+000000000051b618 b MTLFilterFromD3DMFilter(MTLSamplerDescriptor*, D3DMFilter, D3DMComparisonFunc, unsigned int)::onceToken
+000000000051b620 b D3DMDefaultOSLog()::logObj (.11353)
+000000000051b628 b D3DMDefaultOSLog()::onceToken (.11352)
+000000000051b630 b D3DMPrintError(char const*, ...)::errorMode (.11411)
+000000000051b638 b guard variable for D3DMPrintError(char const*, ...)::errorMode (.11410)
+000000000051b640 b dx_tex_inst_info_compat (.11557)
+000000000051b668 b dx_tex_inst_info_nocompat (.11564)
+000000000051b690 b DXBuiltinIOKindToAIRStr (.11565)
+000000000051bb10 b dx_op_to_builtin (.11633)
+000000000051bb38 b mesh_shader_supported_build_ins (.11634)
+000000000051bb60 b BindingTypeToStr (.11528)
+000000000051bbc0 b DXInterpolationToAIR (.11535)
+000000000051bd70 b DXResourceTypeToStr (.11541)
+000000000051bdf0 b DXGenericToStr (.11601)
+000000000051bf90 b BindingTypeToStr (.11647)
+000000000051bff0 b BindingTypeToStr (.11658)
+000000000051c050 b dx_tex_inst_info_compat (.11915)
+000000000051c078 b dx_tex_inst_info_nocompat (.11922)
+000000000051c0a0 b DXBuiltinIOKindToAIRStr (.11923)
+000000000051c520 b dx_op_to_builtin (.11991)
+000000000051c548 b mesh_shader_supported_build_ins (.11992)
+000000000051c570 b D3DMCommandEncoder::GetCommandBuffer()::RetainReferences
+000000000051c578 b guard variable for D3DMCommandEncoder::GetCommandBuffer()::RetainReferences
+000000000051c580 b D3DMCommandEncoder::GetComputeEncoder(bool, IRShaderReflection::ResourceUsage)::NextComputeEncoderIndex
+000000000051c584 b D3DMCommandEncoder::GetBlitEncoder(std::__1::span<Subresource, 18446744073709551615ul>)::NextBlitEncoderIndex
+000000000051c588 b D3DMCommandEncoder::GetAccelerationStructureEncoder(bool)::NextAccelerationStructureEncoderIndex
+000000000051c58c b D3DMCommandEncoder::CreateRenderCommandEncoder(MTLRenderPassDescriptor*, bool)::NextRenderEncoderIndex
+000000000051c590 b BindingTypeToStr (.11886)
+000000000051c5f0 b DXInterpolationToAIR (.11893)
+000000000051c7a0 b DXResourceTypeToStr (.11899)
+000000000051c820 b DXGenericToStr (.11959)
+000000000051c9b8 b D3DMDefaultOSLog()::logObj (.11763)
+000000000051c9c0 b D3DMDefaultOSLog()::onceToken (.11761)
+000000000051c9c8 b D3DMPrintError(char const*, ...)::errorMode (.11770)
+000000000051c9d0 b guard variable for D3DMPrintError(char const*, ...)::errorMode (.11769)
+000000000051c9d8 b dx_tex_inst_info_compat (.12289)
+000000000051ca00 b dx_tex_inst_info_nocompat (.12296)
+000000000051ca30 b DXBuiltinIOKindToAIRStr (.12297)
+000000000051ceb0 b dx_op_to_builtin (.12365)
+000000000051ced8 b mesh_shader_supported_build_ins (.12366)
+000000000051cf00 b D3D11DeferredDeviceContext::PSSetShader(ID3D11PixelShader*, ID3D11ClassInstance* const*, unsigned int)::onceToken
+000000000051cf08 b D3D11DeferredDeviceContext::VSSetShader(ID3D11VertexShader*, ID3D11ClassInstance* const*, unsigned int)::onceToken
+000000000051cf10 b D3D11DeferredDeviceContext::GSSetShader(ID3D11GeometryShader*, ID3D11ClassInstance* const*, unsigned int)::onceToken
+000000000051cf18 b D3D11DeferredDeviceContext::DrawAuto()::onceToken
+000000000051cf20 b D3D11DeferredDeviceContext::SetResourceMinLOD(ID3D11Resource*, float)::onceToken
+000000000051cf28 b D3D11DeferredDeviceContext::GetResourceMinLOD(ID3D11Resource*)::onceToken
+000000000051cf30 b D3D11DeferredDeviceContext::ExecuteCommandList(ID3D11CommandList*, int)::onceToken
+000000000051cf38 b D3D11DeferredDeviceContext::HSSetShader(ID3D11HullShader*, ID3D11ClassInstance* const*, unsigned int)::onceToken
+000000000051cf40 b D3D11DeferredDeviceContext::DSSetShader(ID3D11DomainShader*, ID3D11ClassInstance* const*, unsigned int)::onceToken
+000000000051cf48 b D3D11DeferredDeviceContext::CSSetShader(ID3D11ComputeShader*, ID3D11ClassInstance* const*, unsigned int)::onceToken
+000000000051cf50 b D3D11DeferredDeviceContext::Flush()::onceToken
+000000000051cf58 b D3D11DeferredDeviceContext::SwapDeviceContextState(ID3DDeviceContextState*, ID3DDeviceContextState**)::onceToken
+000000000051cf60 b D3D11DeferredDeviceContext::ClearView(ID3D11View*, float const*, tagRECT const*, unsigned int)::onceToken
+000000000051cf68 b D3D11DeferredDeviceContext::UpdateTileMappings(ID3D11Resource*, unsigned int, D3D11_TILED_RESOURCE_COORDINATE const*, D3D11_TILE_REGION_SIZE const*, ID3D11Buffer*, unsigned int, unsigned int const*, unsigned int const*, unsigned int const*, unsigned int)::onceToken
+000000000051cf70 b D3D11DeferredDeviceContext::CopyTileMappings(ID3D11Resource*, D3D11_TILED_RESOURCE_COORDINATE const*, ID3D11Resource*, D3D11_TILED_RESOURCE_COORDINATE const*, D3D11_TILE_REGION_SIZE const*, unsigned int)::onceToken
+000000000051cf78 b D3D11DeferredDeviceContext::CopyTiles(ID3D11Resource*, D3D11_TILED_RESOURCE_COORDINATE const*, D3D11_TILE_REGION_SIZE const*, ID3D11Buffer*, unsigned long long, unsigned int)::onceToken
+000000000051cf80 b D3D11DeferredDeviceContext::UpdateTiles(ID3D11Resource*, D3D11_TILED_RESOURCE_COORDINATE const*, D3D11_TILE_REGION_SIZE const*, void const*, unsigned int)::onceToken
+000000000051cf88 b D3D11DeferredDeviceContext::ResizeTilePool(ID3D11Buffer*, unsigned long long)::onceToken
+000000000051cf90 b D3D11DeferredDeviceContext::TiledResourceBarrier(ID3D11DeviceChild*, ID3D11DeviceChild*)::onceToken
+000000000051cf98 b D3D11DeferredDeviceContext::Flush1(D3D11_CONTEXT_TYPE, void*)::onceToken
+000000000051cfa0 b BindingTypeToStr (.12260)
+000000000051d000 b DXInterpolationToAIR (.12267)
+000000000051d1b0 b DXResourceTypeToStr (.12273)
+000000000051d230 b DXGenericToStr (.12333)
+000000000051d3c8 b D3DMDefaultOSLog()::logObj (.12205)
+000000000051d3d0 b D3DMDefaultOSLog()::onceToken (.12203)
+000000000051d3d8 b dx_tex_inst_info_compat (.12402)
+000000000051d400 b dx_tex_inst_info_nocompat (.12409)
+000000000051d430 b DXBuiltinIOKindToAIRStr (.12410)
+000000000051d8b0 b dx_op_to_builtin (.12478)
+000000000051d8d8 b mesh_shader_supported_build_ins (.12479)
+000000000051d900 b BindingTypeToStr (.12373)
+000000000051d960 b DXInterpolationToAIR (.12380)
+000000000051db10 b DXResourceTypeToStr (.12386)
+000000000051db90 b DXGenericToStr (.12446)
+000000000051dd28 b dx_tex_inst_info_compat (.12540)
+000000000051dd50 b dx_tex_inst_info_nocompat (.12547)
+000000000051dd80 b DXBuiltinIOKindToAIRStr (.12548)
+000000000051e200 b dx_op_to_builtin (.12616)
+000000000051e228 b mesh_shader_supported_build_ins (.12617)
+000000000051e250 b DXGIDevice::CreateSurface(DXGI_SURFACE_DESC const*, unsigned int, unsigned int, DXGI_SHARED_RESOURCE const*, IDXGISurface**)::onceToken
+000000000051e258 b DXGIDevice::QueryResourceResidency(IUnknown* const*, DXGI_RESIDENCY*, unsigned int)::onceToken
+000000000051e260 b DXGIDevice::EnqueueSetEvent(void*)::onceToken
+000000000051e270 b BindingTypeToStr (.12511)
+000000000051e2d0 b DXInterpolationToAIR (.12518)
+000000000051e480 b DXResourceTypeToStr (.12524)
+000000000051e500 b DXGenericToStr (.12584)
+000000000051e698 b D3DMDefaultOSLog()::logObj (.12498)
+000000000051e6a0 b D3DMDefaultOSLog()::onceToken (.12496)
+000000000051e6a8 b dx_tex_inst_info_compat (.12651)
+000000000051e6d0 b dx_tex_inst_info_nocompat (.12658)
+000000000051e700 b DXBuiltinIOKindToAIRStr (.12659)
+000000000051eb80 b dx_op_to_builtin (.12727)
+000000000051eba8 b mesh_shader_supported_build_ins (.12728)
+000000000051ebd0 b ngx::taauRuntimeCheck()::present
+000000000051ebd8 b guard variable for ngx::taauRuntimeCheck()::present
+000000000051ebe0 b ngx::frameInterpolationRuntimeCheck()::present
+000000000051ebe8 b guard variable for ngx::frameInterpolationRuntimeCheck()::present
+000000000051ebf0 b ngx::denoisingRuntimeCheck()::present
+000000000051ebf8 b guard variable for ngx::denoisingRuntimeCheck()::present
+000000000051ec00 b NVSDK_NGX_D3D12_GetScratchBufferSize::onceToken
+000000000051ec08 b NVSDK_NGX_D3D12_GetScratchBufferSize::onceToken
+000000000051ec10 b NVSDK_NGX_D3D12_GetScratchBufferSize::onceToken
+000000000051ec18 b NVSDK_NGX_D3D12_GetScratchBufferSize::onceToken
+000000000051ec20 b NVSDK_NGX_D3D12_CreateFeature::onceToken
+000000000051ec28 b NVSDK_NGX_D3D12_CreateFeature::onceToken
+000000000051ec30 b NVSDK_NGX_D3D12_CreateFeature::onceToken
+000000000051ec38 b NVSDK_NGX_D3D12_CreateFeature::onceToken
+000000000051ec40 b NVSDK_NGX_D3D12_GetFeatureRequirements::onceToken
+000000000051ec48 b NVSDK_NGX_D3D12_GetFeatureRequirements::onceToken
+000000000051ec50 b NVSDK_NGX_D3D12_GetFeatureRequirements::onceToken
+000000000051ec58 b NVSDK_NGX_D3D12_GetFeatureRequirements::onceToken
+000000000051ec60 b NVSDK_NGX_D3D11_CreateFeature::onceToken
+000000000051ec68 b NVSDK_NGX_D3D11_CreateFeature::onceToken
+000000000051ec70 b NVSDK_NGX_D3D11_CreateFeature::onceToken
+000000000051ec78 b NVSDK_NGX_D3D11_CreateFeature::onceToken
+000000000051ec80 b NVSDK_NGX_D3D11_GetFeatureRequirements::onceToken
+000000000051ec88 b NVSDK_NGX_D3D11_GetFeatureRequirements::onceToken
+000000000051ec90 b NVSDK_NGX_D3D11_GetFeatureRequirements::onceToken
+000000000051ec98 b NVSDK_NGX_D3D11_GetFeatureRequirements::onceToken
+000000000051eca0 b NVSDK_NGX_D3D11_GetScratchBufferSize::onceToken
+000000000051eca8 b NVSDK_NGX_D3D11_GetScratchBufferSize::onceToken
+000000000051ecb0 b NVSDK_NGX_D3D11_GetScratchBufferSize::onceToken
+000000000051ecb8 b NVSDK_NGX_D3D11_GetScratchBufferSize::onceToken
+000000000051ecc0 b BindingTypeToStr (.12622)
+000000000051ed20 b DXInterpolationToAIR (.12629)
+000000000051eed0 b DXResourceTypeToStr (.12635)
+000000000051ef50 b DXGenericToStr (.12695)
+000000000051f0e8 b referenceCount
+000000000051f0f0 b parameter
+000000000051f168 b D3DMDefaultOSLog()::logObj (.12747)
+000000000051f170 b D3DMDefaultOSLog()::onceToken (.12745)
+000000000051f178 b dx_tex_inst_info_compat (.12817)
+000000000051f1a0 b dx_tex_inst_info_nocompat (.12824)
+000000000051f1d0 b DXBuiltinIOKindToAIRStr (.12825)
+000000000051f650 b dx_op_to_builtin (.12893)
+000000000051f678 b mesh_shader_supported_build_ins (.12894)
+000000000051f6a0 b D3D12CommandSignature::D3D12CommandSignature(D3D12Device*, D3D12_COMMAND_SIGNATURE_DESC const*, D3D12RootSignature*)::onceToken
+000000000051f6b0 b BindingTypeToStr (.12788)
+000000000051f710 b DXInterpolationToAIR (.12795)
+000000000051f8c0 b DXResourceTypeToStr (.12801)
+000000000051f940 b DXGenericToStr (.12861)
+000000000051fad8 b D3DMDefaultOSLog()::logObj (.12901)
+000000000051fae0 b D3DMDefaultOSLog()::onceToken (.12899)
+000000000051fae8 b D3DMPrintError(char const*, ...)::errorMode (.12906)
+000000000051faf0 b guard variable for D3DMPrintError(char const*, ...)::errorMode (.12904)
+000000000051fb00 b BindingTypeToStr (.12922)
+000000000051fb60 b dx_tex_inst_info_compat (.12968)
+000000000051fb88 b dx_tex_inst_info_nocompat (.12975)
+000000000051fbb0 b DXBuiltinIOKindToAIRStr (.12976)
+0000000000520030 b dx_op_to_builtin (.13044)
+0000000000520058 b mesh_shader_supported_build_ins (.13045)
+0000000000520080 b BindingTypeToStr (.12939)
+00000000005200e0 b DXInterpolationToAIR (.12946)
+0000000000520290 b DXResourceTypeToStr (.12952)
+0000000000520310 b DXGenericToStr (.13012)
+00000000005204a8 b dx_tex_inst_info_compat (.13081)
+00000000005204d0 b dx_tex_inst_info_nocompat (.13088)
+0000000000520500 b DXBuiltinIOKindToAIRStr (.13089)
+0000000000520980 b dx_op_to_builtin (.13157)
+00000000005209a8 b mesh_shader_supported_build_ins (.13158)
+00000000005209d0 b BindingTypeToStr (.13052)
+0000000000520a30 b DXInterpolationToAIR (.13059)
+0000000000520be0 b DXResourceTypeToStr (.13065)
+0000000000520c60 b DXGenericToStr (.13125)
+0000000000520df8 b dx_tex_inst_info_compat (.13333)
+0000000000520e20 b dx_tex_inst_info_nocompat (.13340)
+0000000000520e50 b DXBuiltinIOKindToAIRStr (.13341)
+00000000005212d0 b dx_op_to_builtin (.13409)
+00000000005212f8 b mesh_shader_supported_build_ins (.13410)
+0000000000521320 b D3D11Device::CreateVertexShader(void const*, unsigned long, ID3D11ClassLinkage*, ID3D11VertexShader**)::onceToken
+0000000000521328 b D3D11Device::CreateGeometryShader(void const*, unsigned long, ID3D11ClassLinkage*, ID3D11GeometryShader**)::onceToken
+0000000000521330 b D3D11Device::CreateGeometryShaderWithStreamOutput(void const*, unsigned long, D3D11_SO_DECLARATION_ENTRY const*, unsigned int, unsigned int const*, unsigned int, unsigned int, ID3D11ClassLinkage*, ID3D11GeometryShader**)::onceToken
+0000000000521338 b D3D11Device::CreateGeometryShaderWithStreamOutput(void const*, unsigned long, D3D11_SO_DECLARATION_ENTRY const*, unsigned int, unsigned int const*, unsigned int, unsigned int, ID3D11ClassLinkage*, ID3D11GeometryShader**)::onceToken
+0000000000521340 b D3D11Device::CreatePixelShader(void const*, unsigned long, ID3D11ClassLinkage*, ID3D11PixelShader**)::onceToken
+0000000000521348 b D3D11Device::CreateHullShader(void const*, unsigned long, ID3D11ClassLinkage*, ID3D11HullShader**)::onceToken
+0000000000521350 b D3D11Device::CreateDomainShader(void const*, unsigned long, ID3D11ClassLinkage*, ID3D11DomainShader**)::onceToken
+0000000000521358 b D3D11Device::CreateComputeShader(void const*, unsigned long, ID3D11ClassLinkage*, ID3D11ComputeShader**)::onceToken
+0000000000521360 b D3D11Device::CreateCounter(D3D11_COUNTER_DESC const*, ID3D11Counter**)::onceToken
+0000000000521368 b D3D11Device::OpenSharedResource(void*, _GUID const&, void**)::onceToken
+0000000000521370 b D3D11Device::CheckCounterInfo(D3D11_COUNTER_INFO*)::onceToken
+0000000000521378 b D3D11Device::CheckCounter(D3D11_COUNTER_DESC const*, D3D11_COUNTER_TYPE*, unsigned int*, char*, unsigned int*, char*, unsigned int*, char*, unsigned int*)::onceToken
+0000000000521380 b D3D11Device::CreateDeviceContextState(unsigned int, D3D_FEATURE_LEVEL const*, unsigned int, unsigned int, _GUID const&, D3D_FEATURE_LEVEL*, ID3DDeviceContextState**)::onceToken
+0000000000521388 b D3D11Device::OpenSharedResource1(void*, _GUID const&, void**)::onceToken
+0000000000521390 b D3D11Device::OpenSharedResourceByName(char16_t const*, unsigned int, _GUID const&, void**)::onceToken
+0000000000521398 b D3D11Device::GetResourceTiling(ID3D11Resource*, unsigned int*, D3D11_PACKED_MIP_DESC*, D3D11_TILE_SHAPE*, unsigned int*, unsigned int, D3D11_SUBRESOURCE_TILING*)::onceToken
+00000000005213a0 b D3D11Device::CheckMultisampleQualityLevels1(DXGI_FORMAT, unsigned int, unsigned int, unsigned int*)::onceToken
+00000000005213a8 b D3D11Device::CreateShaderResourceView1(ID3D11Resource*, D3D11_SHADER_RESOURCE_VIEW_DESC1 const*, ID3D11ShaderResourceView1**)::onceToken
+00000000005213b0 b D3D11Device::CreateUnorderedAccessView1(ID3D11Resource*, D3D11_UNORDERED_ACCESS_VIEW_DESC1 const*, ID3D11UnorderedAccessView1**)::onceToken
+00000000005213b8 b D3D11Device::CreateRenderTargetView1(ID3D11Resource*, D3D11_RENDER_TARGET_VIEW_DESC1 const*, ID3D11RenderTargetView1**)::onceToken
+00000000005213c0 b D3D11Device::CreateQuery1(D3D11_QUERY_DESC1 const*, ID3D11Query1**)::onceToken
+00000000005213c8 b D3D11Device::RegisterDeviceRemovedEvent(void*, unsigned int*)::onceToken
+00000000005213d0 b D3D11Device::UnregisterDeviceRemoved(unsigned int)::onceToken
+00000000005213d8 b D3D11Device::OpenSharedFence(void*, _GUID const&, void**)::onceToken
+00000000005213e0 b BindingTypeToStr (.13304)
+0000000000521440 b DXInterpolationToAIR (.13311)
+00000000005215f0 b DXResourceTypeToStr (.13317)
+0000000000521670 b DXGenericToStr (.13377)
+0000000000521808 b D3D11ClassLinkage::GetClassInstance(char const*, unsigned int, ID3D11ClassInstance**)::onceToken
+0000000000521810 b D3D11ClassLinkage::CreateClassInstance(char const*, unsigned int, unsigned int, unsigned int, unsigned int, ID3D11ClassInstance**)::onceToken
+0000000000521818 b D3DMDefaultOSLog()::logObj (.13189)
+0000000000521820 b D3DMDefaultOSLog()::onceToken (.13188)
+0000000000521828 b D3DMDevice::EncoderStatsEnabled()::onceToken
+0000000000521830 b D3DMDevice::EncoderStatsEnabled()::enabled
+0000000000521834 b D3DMPrintError(char const*, ...)::errorMode (.13209)
+0000000000521838 b guard variable for D3DMPrintError(char const*, ...)::errorMode (.13208)
+0000000000521840 b D3D11TimestampQuery::UmplementedTimestampQuery()::onceToken
+0000000000521848 b dx_tex_inst_info_compat (.13542)
+0000000000521870 b dx_tex_inst_info_nocompat (.13549)
+00000000005218a0 b DXBuiltinIOKindToAIRStr (.13550)
+0000000000521d20 b dx_op_to_builtin (.13618)
+0000000000521d48 b mesh_shader_supported_build_ins (.13619)
+0000000000521d70 b BindingTypeToStr (.13513)
+0000000000521dd0 b DXInterpolationToAIR (.13520)
+0000000000521f80 b DXResourceTypeToStr (.13526)
+0000000000522000 b DXGenericToStr (.13586)
+0000000000522198 b D3DMDefaultOSLog()::logObj (.13484)
+00000000005221a0 b D3DMDefaultOSLog()::onceToken (.13483)
+00000000005221a8 b ngx::Feature::Evaluate(D3D12GraphicsCommandListMPL&, NVSDK_NGX_Parameter const&, void*) const::onceToken
+00000000005221b0 b unsigned int ngx::ImageSignalProcessor::Evaluate<ID3D12Resource, D3D12Texture, D3D12Buffer, ngx::ImageSignalProcessor::Evaluate(D3D12GraphicsCommandListMTL&, NVSDK_NGX_Parameter const&, void*) const::$_0>(NVSDK_NGX_Parameter const&, void*, ngx::ImageSignalProcessor::Evaluate(D3D12GraphicsCommandListMTL&, NVSDK_NGX_Parameter const&, void*) const::$_0&&) const::onceToken
+00000000005221b8 b unsigned int ngx::ImageSignalProcessor::Evaluate<ID3D11Resource, D3D11Texture2D, D3D11Buffer, ngx::ImageSignalProcessor::Evaluate(D3D11DeviceContext&, NVSDK_NGX_Parameter const&, void*) const::$_0>(NVSDK_NGX_Parameter const&, void*, ngx::ImageSignalProcessor::Evaluate(D3D11DeviceContext&, NVSDK_NGX_Parameter const&, void*) const::$_0&&) const::onceToken
+00000000005221c0 b dx_tex_inst_info_compat (.13708)
+00000000005221e8 b dx_tex_inst_info_nocompat (.13715)
+0000000000522210 b DXBuiltinIOKindToAIRStr (.13716)
+0000000000522690 b dx_op_to_builtin (.13784)
+00000000005226b8 b mesh_shader_supported_build_ins (.13785)
+00000000005226e0 b BindingTypeToStr (.13679)
+0000000000522740 b DXInterpolationToAIR (.13686)
+00000000005228f0 b DXResourceTypeToStr (.13692)
+0000000000522970 b DXGenericToStr (.13752)
+0000000000522b08 b D3D11Query::GetDataSize()::onceToken
+0000000000522b10 b dx_tex_inst_info_compat (.13827)
+0000000000522b38 b dx_tex_inst_info_nocompat (.13834)
+0000000000522b60 b DXBuiltinIOKindToAIRStr (.13835)
+0000000000522fe0 b dx_op_to_builtin (.13903)
+0000000000523008 b mesh_shader_supported_build_ins (.13904)
+0000000000523030 b BindingTypeToStr (.13798)
+0000000000523090 b DXInterpolationToAIR (.13805)
+0000000000523240 b DXResourceTypeToStr (.13811)
+00000000005232c0 b DXGenericToStr (.13871)
+0000000000523458 b dx_tex_inst_info_compat (.13949)
+0000000000523480 b dx_tex_inst_info_nocompat (.13956)
+00000000005234b0 b DXBuiltinIOKindToAIRStr (.13957)
+0000000000523930 b dx_op_to_builtin (.14025)
+0000000000523958 b mesh_shader_supported_build_ins (.14026)
+0000000000523980 b D3D11Fence::CreateSharedHandle(_SECURITY_ATTRIBUTES const*, unsigned int, char16_t const*, void**)::onceToken
+0000000000523990 b BindingTypeToStr (.13920)
+00000000005239f0 b DXInterpolationToAIR (.13927)
+0000000000523ba0 b DXResourceTypeToStr (.13933)
+0000000000523c20 b DXGenericToStr (.13993)
+0000000000523db8 b D3DMDefaultOSLog()::logObj (.13913)
+0000000000523dc0 b D3DMDefaultOSLog()::onceToken (.13911)
+0000000000523dc8 S D3DMPerfTrace::TracingEnabled
+0000000000523dc9 S D3DMDevice::CompilerPerfTest
+0000000000523dca S D3DMDevice::MSEmulationEncoderDrawLimitEnabled
+0000000000523dcb S D3DMDevice::SupportFamily13
+0000000000523dcc S D3D12Device::FailOnNoOpPipelinestate
+0000000000523dcd S D3D12Device::WorkGraphsEnabled
+0000000000523dce S D3D12Device::IndirectInstanceTypeAvailable
+0000000000523dcf S D3D12Device::DumpSbt
+0000000000523dd0 S D3D12Device::AtomicInt64OnDescriptorHeapResourceSupported
+0000000000523dd4 S D3D12Device::tiledSupport
+0000000000523dd8 S D3D12Device::LoadAS
+0000000000523de0 S D3D12Device::EnableDSA
+0000000000523de1 S D3D12Device::FeedbackRT
+0000000000523de2 S D3D12Device::FeedinRT
+0000000000523de3 S D3D12Device::ForceOpaqueIntersections
+0000000000523de4 S D3D12Device::Enable16BitRayGenDimensions
+0000000000523de5 S D3D12Device::EnableTraceRay
+0000000000523de6 S D3D12Device::SkipIntersectionAnyHit
+0000000000523de7 S D3D12Device::SkipClosestHit
+0000000000523de8 S D3D12Device::SkipMiss
+0000000000523dec S D3DMQueryHeap::MaxVisibilityBufferSize
+0000000000523df0 S D3DMQueryHeap::VisibilityBuffers
+0000000000523e28 S D3DMQueryHeap::VisibilityBuffersLock
+0000000000523e2c S D3D12Device::SupportRayGenICB
+0000000000523e2d S D3DMDevice::D3D11RenderToRenderUAVBarriersIgnored
+0000000000523e2e S D3DMDevice::EnableWriteBufferImmediate
+0000000000523e30 S D3D12Device::SaveAS
+0000000000523e38 S D3DMDevice::MetalFXFullResolutionMotionVectorsSupport
+0000000000523e39 S D3DMDevice::MetalFXJitteredMotionVectorSupport
+0000000000523e40 S GFXTOSInterface::Registry
+0000000000523e48 S GFXTOSInterface::Allocations
+0000000000523e50 S D3D12AccelerationStructure::uuid
+0000000000523e54 S D3DMDevice::EnableMPLWithRTV
+0000000000523e58 S DXGISwapChain::BundleID
+0000000000523e60 S DXGISwapChain::ExeName
+0000000000523e68 S D3D12Device::DXREnabled
+0000000000523e70 S GFXTOSInterface::Instance
+0000000000523e78 S D3DMDevice::Metal4Supported
+0000000000523e80 S D3D12::WorkGraphCommandEncoder::serializeFence
+0000000000523e88 S D3D12StateObject::s_globalVFTCounter
+0000000000523e8c S D3D12StateObject::s_globalRayGenCounter
+0000000000523e90 S D3D12Device::AddingBinaryFunctionsToPipelinesEnabled
+0000000000523e91 S D3D12Device::AllowSingleAnyHitOptimisation
+0000000000523e92 S D3DMDevice::Support64BitAtomics
+0000000000523e93 S D3DMDevice::BufferMismatchSupported
+0000000000523e94 S D3DMDevice::SupportFamily11
+0000000000523e95 S D3DMDevice::RemapOffsets
+0000000000523e96 S D3DMDevice::MetalFXSubrectangleProcessingSupport
+0000000000523e97 S D3DMDevice::MetalFXBarrelDistortionSupport
+0000000000523e98 S D3D12ExecutableStateObject::m_mappings
+0000000000523eb0 S D3D12ExecutableStateObject::m_mappingsLock
+0000000000523ef0 S D3DMDevice::UseSharedFenceEvents
+0000000000523ef1 S D3DMDevice::AllowEventRollback
+0000000000523ef8 S GFXTOSInterface::Monitor
+0000000000523f00 S GFXTOSInterface::Adapter
+0000000000523f08 S GFXTOSInterface::Libraries
+0000000000523f10 S GFXTOSInterface::Event
+0000000000523f18 S GFXTOSInterface::Paths
+0000000000523f20 S D3DMDevice::PlacementSparseEnabled
+0000000000523f21 S D3DMDevice::UseInternalHeaps
+0000000000523f22 S D3D12Device::MapInstanceDescriptorsOnGPU
+0000000000523f23 S D3D12Device::ForceEIDispatchRays
+0000000000523f24 S D3D12Device::ForceICBDispatchRays
+0000000000523f25 S D3D12Device::EnableRefit
+0000000000523f28 S nvapi::factory
+0000000000523f30 S D3DMDevice::TextureViewPoolsSupportSparse
+0000000000523f31 S D3DMDevice::TextureViewPoolsEnabled
+0000000000523f38 S ATFMTLDynamic::openATFMTLOnceToken
+0000000000523f40 S D3DMDevice::ForceCPUInit
+0000000000523f41 S D3D12Device::UseIndirectInstanceType
+0000000000523f42 S D3D12Device::SupportRTRowMajorMatrix
+0000000000523f43 S D3D12Device::Rdar105398649Workaround
+0000000000523f44 S DXGISwapChain::totalFramesPresented
+0000000000523f48 S D3D12Device::IFConfig
+0000000000523f4c S D3DMDevice::ForceSerialCompute
+0000000000523f4d S D3DMDevice::HonorUAVBarrierForBlit
+0000000000523f50 S D3DMDevice::ForceBarriersSync
+0000000000523f54 S D3DMDevice::NeedsFenceWorkaround
+0000000000523f55 S D3DMDevice::ForceFoldedClearSync
+0000000000523f58 S D3DMDevice::m_stats
+0000000000523fb4 S D3DMDevice::ResidencySetsEnabled
+0000000000523fb5 S D3DMDevice::SupportMeshShaders
+0000000000523fb8 S D3DMAllocator::InvalidHandle
+0000000000523fc0 S GFXTOSInterface::IUnknownIface
+0000000000523fc8 S D3DMDevice::D3D11MultithreadingInterface
+0000000000523fc9 S D3DMDevice::D3D11MultithreadingForced
+0000000000523fcc S D3D11InputLayout::NextUniqueID
+0000000000523fd0 S D3D11BlendState::NextUniqueID
+0000000000523fd4 S D3D11DepthStencilState::NextUniqueID
+0000000000523fd8 S D3D11RasterizerState::NextUniqueID
+0000000000523fdc S D3D11SamplerState::NextUniqueID
+0000000000523fe0 S D3DMDevice::ReportFP64Support
+0000000000523fe1 S D3DMDevice::SupportFamily10
+0000000000523fe8 S D3DMDevice::m_metalHUD
+0000000000523ff0 S D3DMDevice::m_metalHUD2
+0000000000523ff8 S _dxgi_info
+
+
+Wall time: 0.08 seconds
+
+[Showing lines 1-357 and 14163-14519 of 14519; 13,805 middle lines (1.6MB) elided. Read artifact://3435 for full output. Some lines truncated to 768 bytes. Read artifact://3435 for full output]

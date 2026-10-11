@@ -1,0 +1,172 @@
+
+build/local/zzz-dlss-fix-20261009/precompile-run-01/binding-diagnosis/reference/D3DMetal.framework/Versions/A/D3DMetal:	file format mach-o 64-bit x86-64
+
+Disassembly of section __TEXT,__text:
+
+0000000000036263 <ReplayInlineMemoryBarrier(MPLCommandReplayer&, MPLCommand const&)>:
+   36263: 55                           	pushq	%rbp
+   36264: 48 89 e5                     	movq	%rsp, %rbp
+   36267: 0f b6 46 04                  	movzbl	0x4(%rsi), %eax
+   3626b: 48 8d 0d aa 00 00 00         	leaq	0xaa(%rip), %rcx        ## 0x3631c <ReplayInlineMemoryBarrier(MPLCommandReplayer&, MPLCommand const&)+0xb9>
+   36272: 48 63 04 81                  	movslq	(%rcx,%rax,4), %rax
+   36276: 48 01 c8                     	addq	%rcx, %rax
+   36279: ff e0                        	jmpq	*%rax
+   3627b: 48 8b 87 48 06 00 00         	movq	0x648(%rdi), %rax
+   36282: 0f b6 50 4b                  	movzbl	0x4b(%rax), %edx
+   36286: 48 8d 0c d5 01 00 00 00      	leaq	0x1(,%rdx,8), %rcx
+   3628e: c1 e2 04                     	shll	$0x4, %edx
+   36291: 48 ff c2                     	incq	%rdx
+   36294: 48 8b 87 a0 00 00 00         	movq	0xa0(%rdi), %rax
+   3629b: 4c 8b 8f 50 02 00 00         	movq	0x250(%rdi), %r9
+   362a2: 48 8b 35 97 ff 48 00         	movq	0x48ff97(%rip), %rsi    ## 0x4c6240 <_writev+0x4c6240>
+   362a9: eb 61                        	jmp	0x3630c <ReplayInlineMemoryBarrier(MPLCommandReplayer&, MPLCommand const&)+0xa9>
+   362ab: 48 8b 87 58 03 00 00         	movq	0x358(%rdi), %rax
+   362b2: 4c 8b 8f 90 03 00 00         	movq	0x390(%rdi), %r9
+   362b9: 48 8b 35 80 ff 48 00         	movq	0x48ff80(%rip), %rsi    ## 0x4c6240 <_writev+0x4c6240>
+   362c0: ba 00 00 00 10               	movl	$0x10000000, %edx       ## imm = 0x10000000
+   362c5: b9 00 00 00 10               	movl	$0x10000000, %ecx       ## imm = 0x10000000
+   362ca: eb 40                        	jmp	0x3630c <ReplayInlineMemoryBarrier(MPLCommandReplayer&, MPLCommand const&)+0xa9>
+   362cc: 48 8b 87 c0 03 00 00         	movq	0x3c0(%rdi), %rax
+   362d3: 4c 8b 8f f0 03 00 00         	movq	0x3f0(%rdi), %r9
+   362da: 48 8b 35 5f ff 48 00         	movq	0x48ff5f(%rip), %rsi    ## 0x4c6240 <_writev+0x4c6240>
+   362e1: ba 00 00 00 20               	movl	$0x20000000, %edx       ## imm = 0x20000000
+   362e6: b9 00 00 00 20               	movl	$0x20000000, %ecx       ## imm = 0x20000000
+   362eb: eb 1f                        	jmp	0x3630c <ReplayInlineMemoryBarrier(MPLCommandReplayer&, MPLCommand const&)+0xa9>
+   362ed: 48 8b 87 88 02 00 00         	movq	0x288(%rdi), %rax
+   362f4: 4c 8b 8f 20 03 00 00         	movq	0x320(%rdi), %r9
+   362fb: 48 8b 35 3e ff 48 00         	movq	0x48ff3e(%rip), %rsi    ## 0x4c6240 <_writev+0x4c6240>
+   36302: ba 00 00 00 08               	movl	$0x8000000, %edx        ## imm = 0x8000000
+   36307: b9 00 00 00 08               	movl	$0x8000000, %ecx        ## imm = 0x8000000
+   3630c: 41 b8 01 00 00 00            	movl	$0x1, %r8d
+   36312: 48 89 c7                     	movq	%rax, %rdi
+   36315: 5d                           	popq	%rbp
+   36316: 41 ff e1                     	jmpq	*%r9
+   36319: 0f 1f 00                     	nopl	(%rax)
+   3631c: 5f                           	popq	%rdi
+   3631d: ff ff                        	<unknown>
+   3631f: ff d1                        	callq	*%rcx
+   36321: ff ff                        	<unknown>
+   36323: ff 8f ff ff ff b0            	decl	-0x4f000001(%rdi)
+   36329: ff ff                        	<unknown>
+   3632b: ff 55 48                     	callq	*0x48(%rbp)
+
+000000000003632c <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)>:
+   3632c: 55                           	pushq	%rbp
+   3632d: 48 89 e5                     	movq	%rsp, %rbp
+   36330: 41 57                        	pushq	%r15
+   36332: 41 56                        	pushq	%r14
+   36334: 41 55                        	pushq	%r13
+   36336: 41 54                        	pushq	%r12
+   36338: 53                           	pushq	%rbx
+   36339: 50                           	pushq	%rax
+   3633a: 48 89 fb                     	movq	%rdi, %rbx
+   3633d: 8a 4e 04                     	movb	0x4(%rsi), %cl
+   36340: 45 31 f6                     	xorl	%r14d, %r14d
+   36343: 84 c9                        	testb	%cl, %cl
+   36345: 74 18                        	je	0x3635f <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x33>
+   36347: 48 8d 05 4a dd 33 00         	leaq	0x33dd4a(%rip), %rax    ## 0x374098 <std::__1::__itoa::__pow10_128+0x5b8>
+   3634e: 0f b6 d1                     	movzbl	%cl, %edx
+   36351: 0f bc ca                     	bsfl	%edx, %ecx
+   36354: 4c 0b 34 c8                  	orq	(%rax,%rcx,8), %r14
+   36358: 8d 4a ff                     	leal	-0x1(%rdx), %ecx
+   3635b: 20 d1                        	andb	%dl, %cl
+   3635d: 75 ef                        	jne	0x3634e <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x22>
+   3635f: 8a 4e 05                     	movb	0x5(%rsi), %cl
+   36362: 45 31 ff                     	xorl	%r15d, %r15d
+   36365: 84 c9                        	testb	%cl, %cl
+   36367: 74 18                        	je	0x36381 <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x55>
+   36369: 48 8d 05 28 dd 33 00         	leaq	0x33dd28(%rip), %rax    ## 0x374098 <std::__1::__itoa::__pow10_128+0x5b8>
+   36370: 0f b6 d1                     	movzbl	%cl, %edx
+   36373: 0f bc ca                     	bsfl	%edx, %ecx
+   36376: 4c 0b 3c c8                  	orq	(%rax,%rcx,8), %r15
+   3637a: 8d 4a ff                     	leal	-0x1(%rdx), %ecx
+   3637d: 20 d1                        	andb	%dl, %cl
+   3637f: 75 ef                        	jne	0x36370 <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x44>
+   36381: 83 7e 08 01                  	cmpl	$0x1, 0x8(%rsi)
+   36385: 41 bc 02 00 00 00            	movl	$0x2, %r12d
+   3638b: 49 83 dc 00                  	sbbq	$0x0, %r12
+   3638f: 48 8b 8b 48 06 00 00         	movq	0x648(%rbx), %rcx
+   36396: 0f b6 51 08                  	movzbl	0x8(%rcx), %edx
+   3639a: 8a 46 0c                     	movb	0xc(%rsi), %al
+   3639d: 48 8d 35 20 01 00 00         	leaq	0x120(%rip), %rsi       ## 0x364c4 <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x198>
+   363a4: 48 63 14 96                  	movslq	(%rsi,%rdx,4), %rdx
+   363a8: 48 01 f2                     	addq	%rsi, %rdx
+   363ab: ff e2                        	jmpq	*%rdx
+   363ad: ba a0 00 00 00               	movl	$0xa0, %edx
+   363b2: 41 bd 58 02 00 00            	movl	$0x258, %r13d           ## imm = 0x258
+   363b8: 84 c0                        	testb	%al, %al
+   363ba: 0f 84 da 00 00 00            	je	0x3649a <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x16e>
+   363c0: 0f b6 51 4b                  	movzbl	0x4b(%rcx), %edx
+   363c4: 48 8d 0c d5 01 00 00 00      	leaq	0x1(,%rdx,8), %rcx
+   363cc: c1 e2 04                     	shll	$0x4, %edx
+   363cf: 48 ff c2                     	incq	%rdx
+   363d2: 48 8b bb a0 00 00 00         	movq	0xa0(%rbx), %rdi
+   363d9: 48 8b 35 60 fe 48 00         	movq	0x48fe60(%rip), %rsi    ## 0x4c6240 <_writev+0x4c6240>
+   363e0: 4d 89 e0                     	movq	%r12, %r8
+   363e3: ff 93 50 02 00 00            	callq	*0x250(%rbx)
+   363e9: ba a0 00 00 00               	movl	$0xa0, %edx
+   363ee: e9 a7 00 00 00               	jmp	0x3649a <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x16e>
+   363f3: ba 58 03 00 00               	movl	$0x358, %edx            ## imm = 0x358
+   363f8: 41 bd 98 03 00 00            	movl	$0x398, %r13d           ## imm = 0x398
+   363fe: 84 c0                        	testb	%al, %al
+   36400: 0f 84 94 00 00 00            	je	0x3649a <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x16e>
+   36406: 48 8b bb 58 03 00 00         	movq	0x358(%rbx), %rdi
+   3640d: 48 8b 35 2c fe 48 00         	movq	0x48fe2c(%rip), %rsi    ## 0x4c6240 <_writev+0x4c6240>
+   36414: ba 00 00 00 10               	movl	$0x10000000, %edx       ## imm = 0x10000000
+   36419: b9 00 00 00 10               	movl	$0x10000000, %ecx       ## imm = 0x10000000
+   3641e: 4d 89 e0                     	movq	%r12, %r8
+   36421: ff 93 90 03 00 00            	callq	*0x390(%rbx)
+   36427: ba 58 03 00 00               	movl	$0x358, %edx            ## imm = 0x358
+   3642c: eb 6c                        	jmp	0x3649a <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x16e>
+   3642e: ba c0 03 00 00               	movl	$0x3c0, %edx            ## imm = 0x3C0
+   36433: 41 bd f8 03 00 00            	movl	$0x3f8, %r13d           ## imm = 0x3F8
+   36439: 84 c0                        	testb	%al, %al
+   3643b: 74 5d                        	je	0x3649a <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x16e>
+   3643d: 48 8b bb c0 03 00 00         	movq	0x3c0(%rbx), %rdi
+   36444: 48 8b 35 f5 fd 48 00         	movq	0x48fdf5(%rip), %rsi    ## 0x4c6240 <_writev+0x4c6240>
+   3644b: ba 00 00 00 20               	movl	$0x20000000, %edx       ## imm = 0x20000000
+   36450: b9 00 00 00 20               	movl	$0x20000000, %ecx       ## imm = 0x20000000
+   36455: 4d 89 e0                     	movq	%r12, %r8
+   36458: ff 93 f0 03 00 00            	callq	*0x3f0(%rbx)
+   3645e: ba c0 03 00 00               	movl	$0x3c0, %edx            ## imm = 0x3C0
+   36463: eb 35                        	jmp	0x3649a <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x16e>
+   36465: ba 88 02 00 00               	movl	$0x288, %edx            ## imm = 0x288
+   3646a: 41 bd 28 03 00 00            	movl	$0x328, %r13d           ## imm = 0x328
+   36470: 84 c0                        	testb	%al, %al
+   36472: 74 26                        	je	0x3649a <ReplayBackwardStageBarrier(MPLCommandReplayer&, MPLCommand const&)+0x16e>
+   36474: 48 8b bb 88 02 00 00         	movq	0x288(%rbx), %rdi
+   3647b: 48 8b 35 be fd 48 00         	movq	0x48fdbe(%rip), %rsi    ## 0x4c6240 <_writev+0x4c6240>
+   36482: ba 00 00 00 08               	movl	$0x8000000, %edx        ## imm = 0x8000000
+   36487: b9 00 00 00 08               	movl	$0x8000000, %ecx        ## imm = 0x8000000
+   3648c: 4d 89 e0                     	movq	%r12, %r8
+   3648f: ff 93 20 03 00 00            	callq	*0x320(%rbx)
+   36495: ba 88 02 00 00               	movl	$0x288, %edx            ## imm = 0x288
+   3649a: 4a 8b 04 2b                  	movq	(%rbx,%r13), %rax
+   3649e: 48 8b 3c 13                  	movq	(%rbx,%rdx), %rdi
+   364a2: 48 8b 35 9f fd 48 00         	movq	0x48fd9f(%rip), %rsi    ## 0x4c6248 <_writev+0x4c6248>
+   364a9: 4c 89 f2                     	movq	%r14, %rdx
+   364ac: 4c 89 f9                     	movq	%r15, %rcx
+   364af: 4d 89 e0                     	movq	%r12, %r8
+   364b2: 48 83 c4 08                  	addq	$0x8, %rsp
+   364b6: 5b                           	popq	%rbx
+   364b7: 41 5c                        	popq	%r12
+   364b9: 41 5d                        	popq	%r13
+   364bb: 41 5e                        	popq	%r14
+   364bd: 41 5f                        	popq	%r15
+   364bf: 5d                           	popq	%rbp
+   364c0: ff e0                        	jmpq	*%rax
+   364c2: 66 90                        	nop
+   364c4: e9 fe ff ff a1               	jmp	0xffffffffa20364c7 <_dxgi_info+0xffffffffa1b124cf>
+   364c9: ff ff                        	<unknown>
+   364cb: ff 2f                        	ljmpl	*(%rdi)
+   364cd: ff ff                        	<unknown>
+   364cf: ff 6a ff                     	ljmpl	*-0x1(%rdx)
+   364d2: ff ff                        	<unknown>
+
+00000000000364d4 <ReplaySetVisibilityResultMode(MPLCommandReplayer&, MPLCommand const&)>:
+   364d4: 55                           	pushq	%rbp
+   364d5: 48 89 e5                     	movq	%rsp, %rbp
+   364d8: 48 8b 56 08                  	movq	0x8(%rsi), %rdx
+
+
+Wall time: 0.06 seconds

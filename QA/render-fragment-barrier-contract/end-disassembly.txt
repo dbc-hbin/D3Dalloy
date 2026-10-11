@@ -1,0 +1,334 @@
+
+build/local/zzz-dlss-fix-20261009/precompile-run-01/binding-diagnosis/reference/D3DMetal.framework/Versions/A/D3DMetal:	file format mach-o 64-bit x86-64
+
+Disassembly of section __TEXT,__text:
+
+0000000000029110 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)>:
+   29110: 55                           	pushq	%rbp
+   29111: 48 89 e5                     	movq	%rsp, %rbp
+   29114: 41 57                        	pushq	%r15
+   29116: 41 56                        	pushq	%r14
+   29118: 41 55                        	pushq	%r13
+   2911a: 41 54                        	pushq	%r12
+   2911c: 53                           	pushq	%rbx
+   2911d: 48 83 ec 68                  	subq	$0x68, %rsp
+   29121: 48 8b 07                     	movq	(%rdi), %rax
+   29124: 48 8b 50 08                  	movq	0x8(%rax), %rdx
+   29128: 48 8d 88 90 06 00 00         	leaq	0x690(%rax), %rcx
+   2912f: 48 89 4d c8                  	movq	%rcx, -0x38(%rbp)
+   29133: 48 89 45 98                  	movq	%rax, -0x68(%rbp)
+   29137: 48 8b 80 48 06 00 00         	movq	0x648(%rax), %rax
+   2913e: 48 8b 00                     	movq	(%rax), %rax
+   29141: 89 f1                        	movl	%esi, %ecx
+   29143: 48 8b 80 d0 24 00 00         	movq	0x24d0(%rax), %rax
+   2914a: 48 69 c9 e8 01 00 00         	imulq	$0x1e8, %rcx, %rcx      ## imm = 0x1E8
+   29151: 48 01 c8                     	addq	%rcx, %rax
+   29154: 48 05 80 00 00 00            	addq	$0x80, %rax
+   2915a: 48 89 45 b8                  	movq	%rax, -0x48(%rbp)
+   2915e: 0f b6 40 90                  	movzbl	-0x70(%rax), %eax
+   29162: 48 8d 0d 9f 03 00 00         	leaq	0x39f(%rip), %rcx       ## 0x29508 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x3f8>
+   29169: 48 63 04 81                  	movslq	(%rcx,%rax,4), %rax
+   2916d: 48 01 c8                     	addq	%rcx, %rax
+   29170: 48 89 7d c0                  	movq	%rdi, -0x40(%rbp)
+   29174: ff e0                        	jmpq	*%rax
+   29176: 66 c7 45 d6 00 01            	movw	$0x100, -0x2a(%rbp)     ## imm = 0x100
+   2917c: 48 81 c2 90 00 00 00         	addq	$0x90, %rdx
+   29183: 31 c0                        	xorl	%eax, %eax
+   29185: 48 8d 1d 84 ae 34 00         	leaq	0x34ae84(%rip), %rbx    ## 0x374010 <std::__1::__itoa::__pow10_128+0x530>
+   2918c: 48 89 95 78 ff ff ff         	movq	%rdx, -0x88(%rbp)
+   29193: 48 89 45 90                  	movq	%rax, -0x70(%rbp)
+   29197: 0f b6 4c 05 d6               	movzbl	-0x2a(%rbp,%rax), %ecx
+   2919c: 31 c0                        	xorl	%eax, %eax
+   2919e: 48 89 4d 88                  	movq	%rcx, -0x78(%rbp)
+   291a2: 48 83 f9 01                  	cmpq	$0x1, %rcx
+   291a6: 0f 94 c0                     	sete	%al
+   291a9: 66 c7 45 d4 01 02            	movw	$0x201, -0x2c(%rbp)     ## imm = 0x201
+   291af: 48 8d 04 c5 a0 ff ff ff      	leaq	-0x60(,%rax,8), %rax
+   291b7: 48 01 e8                     	addq	%rbp, %rax
+   291ba: 48 89 85 70 ff ff ff         	movq	%rax, -0x90(%rbp)
+   291c1: 31 c0                        	xorl	%eax, %eax
+   291c3: 48 89 45 80                  	movq	%rax, -0x80(%rbp)
+   291c7: 44 8a 74 05 d4               	movb	-0x2c(%rbp,%rax), %r14b
+   291cc: 31 c0                        	xorl	%eax, %eax
+   291ce: 41 80 fe 02                  	cmpb	$0x2, %r14b
+   291d2: 0f 94 c0                     	sete	%al
+   291d5: 48 8b 4d 88                  	movq	-0x78(%rbp), %rcx
+   291d9: 8d 04 41                     	leal	(%rcx,%rax,2), %eax
+   291dc: c1 e0 06                     	shll	$0x6, %eax
+   291df: 48 8b 4d b8                  	movq	-0x48(%rbp), %rcx
+   291e3: 4c 8b 2c 01                  	movq	(%rcx,%rax), %r13
+   291e7: 4c 8b 64 01 08               	movq	0x8(%rcx,%rax), %r12
+   291ec: 4d 39 e5                     	cmpq	%r12, %r13
+   291ef: 74 5b                        	je	0x2924c <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x13c>
+   291f1: 41 8b 45 10                  	movl	0x10(%r13), %eax
+   291f5: 83 e0 7f                     	andl	$0x7f, %eax
+   291f8: c1 e0 04                     	shll	$0x4, %eax
+   291fb: 0f 10 04 02                  	movups	(%rdx,%rax), %xmm0
+   291ff: 0f 29 45 a0                  	movaps	%xmm0, -0x60(%rbp)
+   29203: 45 84 f6                     	testb	%r14b, %r14b
+   29206: 74 1d                        	je	0x29225 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x115>
+   29208: 44 89 f0                     	movl	%r14d, %eax
+   2920b: 45 31 ff                     	xorl	%r15d, %r15d
+   2920e: 48 8b 7d c8                  	movq	-0x38(%rbp), %rdi
+   29212: 0f b6 c8                     	movzbl	%al, %ecx
+   29215: 0f bc c1                     	bsfl	%ecx, %eax
+   29218: 4c 0b 3c c3                  	orq	(%rbx,%rax,8), %r15
+   2921c: 8d 41 ff                     	leal	-0x1(%rcx), %eax
+   2921f: 20 c8                        	andb	%cl, %al
+   29221: 75 ef                        	jne	0x29212 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x102>
+   29223: eb 07                        	jmp	0x2922c <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x11c>
+   29225: 45 31 ff                     	xorl	%r15d, %r15d
+   29228: 48 8b 7d c8                  	movq	-0x38(%rbp), %rdi
+   2922c: 48 8b b5 70 ff ff ff         	movq	-0x90(%rbp), %rsi
+   29233: e8 00 70 00 00               	callq	0x30238 <ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::allocator<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::__wrap_iter<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::pair*>, bool> ankerl::unordered_dense::v4_5_0::detail::table<id<MTLFence>, unsigned long, ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>, std::__1::equal_to<objc_object<MTLFence>>, ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::allocator<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::pair<objc_object<MTLFence>, unsigned long>>, ankerl::unordered_dense::v4_5_0::bucket_type::standard, ankerl::unordered_dense::v4_5_0::det…
+   29238: 4c 09 78 08                  	orq	%r15, 0x8(%rax)
+   2923c: 49 83 c5 20                  	addq	$0x20, %r13
+   29240: 4d 39 e5                     	cmpq	%r12, %r13
+   29243: 48 8b 95 78 ff ff ff         	movq	-0x88(%rbp), %rdx
+   2924a: 75 a5                        	jne	0x291f1 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0xe1>
+   2924c: 48 8b 45 80                  	movq	-0x80(%rbp), %rax
+   29250: 48 ff c0                     	incq	%rax
+   29253: 48 83 f8 02                  	cmpq	$0x2, %rax
+   29257: 0f 85 66 ff ff ff            	jne	0x291c3 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0xb3>
+   2925d: 48 8b 45 90                  	movq	-0x70(%rbp), %rax
+   29261: 48 ff c0                     	incq	%rax
+   29264: 48 83 f8 02                  	cmpq	$0x2, %rax
+   29268: 0f 85 25 ff ff ff            	jne	0x29193 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x83>
+   2926e: e9 6d 01 00 00               	jmp	0x293e0 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x2d0>
+   29273: 66 c7 45 d6 00 01            	movw	$0x100, -0x2a(%rbp)     ## imm = 0x100
+   29279: 48 81 c2 90 00 00 00         	addq	$0x90, %rdx
+   29280: 31 db                        	xorl	%ebx, %ebx
+   29282: 0f b6 44 1d d6               	movzbl	-0x2a(%rbp,%rbx), %eax
+   29287: 89 c1                        	movl	%eax, %ecx
+   29289: c1 e1 06                     	shll	$0x6, %ecx
+   2928c: 48 8b 75 b8                  	movq	-0x48(%rbp), %rsi
+   29290: 4c 8b 34 0e                  	movq	(%rsi,%rcx), %r14
+   29294: 4c 8b 64 0e 08               	movq	0x8(%rsi,%rcx), %r12
+   29299: 4d 39 e6                     	cmpq	%r12, %r14
+   2929c: 74 43                        	je	0x292e1 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x1d1>
+   2929e: 31 c9                        	xorl	%ecx, %ecx
+   292a0: 3c 01                        	cmpb	$0x1, %al
+   292a2: 0f 94 c1                     	sete	%cl
+   292a5: 4c 8d 3c cd a0 ff ff ff      	leaq	-0x60(,%rcx,8), %r15
+   292ad: 49 01 ef                     	addq	%rbp, %r15
+   292b0: 41 8b 46 10                  	movl	0x10(%r14), %eax
+   292b4: 83 e0 7f                     	andl	$0x7f, %eax
+   292b7: c1 e0 04                     	shll	$0x4, %eax
+   292ba: 0f 10 04 02                  	movups	(%rdx,%rax), %xmm0
+   292be: 0f 29 45 a0                  	movaps	%xmm0, -0x60(%rbp)
+   292c2: 48 8b 7d c8                  	movq	-0x38(%rbp), %rdi
+   292c6: 4c 89 fe                     	movq	%r15, %rsi
+   292c9: 49 89 d5                     	movq	%rdx, %r13
+   292cc: e8 67 6f 00 00               	callq	0x30238 <ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::allocator<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::__wrap_iter<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::pair*>, bool> ankerl::unordered_dense::v4_5_0::detail::table<id<MTLFence>, unsigned long, ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>, std::__1::equal_to<objc_object<MTLFence>>, ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::allocator<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::pair<objc_object<MTLFence>, unsigned long>>, ankerl::unordered_dense::v4_5_0::bucket_type::standard, ankerl::unordered_dense::v4_5_0::det…
+   292d1: 4c 89 ea                     	movq	%r13, %rdx
+   292d4: 80 48 0b 10                  	orb	$0x10, 0xb(%rax)
+   292d8: 49 83 c6 20                  	addq	$0x20, %r14
+   292dc: 4d 39 e6                     	cmpq	%r12, %r14
+   292df: 75 cf                        	jne	0x292b0 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x1a0>
+   292e1: 48 ff c3                     	incq	%rbx
+   292e4: 48 83 fb 02                  	cmpq	$0x2, %rbx
+   292e8: 0f 84 f2 00 00 00            	je	0x293e0 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x2d0>
+   292ee: eb 92                        	jmp	0x29282 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x172>
+   292f0: 66 c7 45 d6 00 01            	movw	$0x100, -0x2a(%rbp)     ## imm = 0x100
+   292f6: 48 81 c2 90 00 00 00         	addq	$0x90, %rdx
+   292fd: 31 db                        	xorl	%ebx, %ebx
+   292ff: 0f b6 44 1d d6               	movzbl	-0x2a(%rbp,%rbx), %eax
+   29304: 89 c1                        	movl	%eax, %ecx
+   29306: c1 e1 06                     	shll	$0x6, %ecx
+   29309: 48 8b 75 b8                  	movq	-0x48(%rbp), %rsi
+   2930d: 4c 8b 34 0e                  	movq	(%rsi,%rcx), %r14
+   29311: 4c 8b 64 0e 08               	movq	0x8(%rsi,%rcx), %r12
+   29316: 4d 39 e6                     	cmpq	%r12, %r14
+   29319: 74 43                        	je	0x2935e <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x24e>
+   2931b: 31 c9                        	xorl	%ecx, %ecx
+   2931d: 3c 01                        	cmpb	$0x1, %al
+   2931f: 0f 94 c1                     	sete	%cl
+   29322: 4c 8d 3c cd a0 ff ff ff      	leaq	-0x60(,%rcx,8), %r15
+   2932a: 49 01 ef                     	addq	%rbp, %r15
+   2932d: 41 8b 46 10                  	movl	0x10(%r14), %eax
+   29331: 83 e0 7f                     	andl	$0x7f, %eax
+   29334: c1 e0 04                     	shll	$0x4, %eax
+   29337: 0f 10 04 02                  	movups	(%rdx,%rax), %xmm0
+   2933b: 0f 29 45 a0                  	movaps	%xmm0, -0x60(%rbp)
+   2933f: 48 8b 7d c8                  	movq	-0x38(%rbp), %rdi
+   29343: 4c 89 fe                     	movq	%r15, %rsi
+   29346: 49 89 d5                     	movq	%rdx, %r13
+   29349: e8 ea 6e 00 00               	callq	0x30238 <ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::allocator<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::__wrap_iter<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::pair*>, bool> ankerl::unordered_dense::v4_5_0::detail::table<id<MTLFence>, unsigned long, ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>, std::__1::equal_to<objc_object<MTLFence>>, ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::allocator<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::pair<objc_object<MTLFence>, unsigned long>>, ankerl::unordered_dense::v4_5_0::bucket_type::standard, ankerl::unordered_dense::v4_5_0::det…
+   2934e: 4c 89 ea                     	movq	%r13, %rdx
+   29351: 80 48 0b 20                  	orb	$0x20, 0xb(%rax)
+   29355: 49 83 c6 20                  	addq	$0x20, %r14
+   29359: 4d 39 e6                     	cmpq	%r12, %r14
+   2935c: 75 cf                        	jne	0x2932d <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x21d>
+   2935e: 48 ff c3                     	incq	%rbx
+   29361: 48 83 fb 02                  	cmpq	$0x2, %rbx
+   29365: 74 79                        	je	0x293e0 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x2d0>
+   29367: eb 96                        	jmp	0x292ff <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x1ef>
+   29369: 66 c7 45 d6 00 01            	movw	$0x100, -0x2a(%rbp)     ## imm = 0x100
+   2936f: 48 81 c2 90 00 00 00         	addq	$0x90, %rdx
+   29376: 31 db                        	xorl	%ebx, %ebx
+   29378: 0f b6 44 1d d6               	movzbl	-0x2a(%rbp,%rbx), %eax
+   2937d: 89 c1                        	movl	%eax, %ecx
+   2937f: c1 e1 06                     	shll	$0x6, %ecx
+   29382: 48 8b 75 b8                  	movq	-0x48(%rbp), %rsi
+   29386: 4c 8b 34 0e                  	movq	(%rsi,%rcx), %r14
+   2938a: 4c 8b 64 0e 08               	movq	0x8(%rsi,%rcx), %r12
+   2938f: 4d 39 e6                     	cmpq	%r12, %r14
+   29392: 74 43                        	je	0x293d7 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x2c7>
+   29394: 31 c9                        	xorl	%ecx, %ecx
+   29396: 3c 01                        	cmpb	$0x1, %al
+   29398: 0f 94 c1                     	sete	%cl
+   2939b: 4c 8d 3c cd a0 ff ff ff      	leaq	-0x60(,%rcx,8), %r15
+   293a3: 49 01 ef                     	addq	%rbp, %r15
+   293a6: 41 8b 46 10                  	movl	0x10(%r14), %eax
+   293aa: 83 e0 7f                     	andl	$0x7f, %eax
+   293ad: c1 e0 04                     	shll	$0x4, %eax
+   293b0: 0f 10 04 02                  	movups	(%rdx,%rax), %xmm0
+   293b4: 0f 29 45 a0                  	movaps	%xmm0, -0x60(%rbp)
+   293b8: 48 8b 7d c8                  	movq	-0x38(%rbp), %rdi
+   293bc: 4c 89 fe                     	movq	%r15, %rsi
+   293bf: 49 89 d5                     	movq	%rdx, %r13
+   293c2: e8 71 6e 00 00               	callq	0x30238 <ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::allocator<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::__wrap_iter<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::pair*>, bool> ankerl::unordered_dense::v4_5_0::detail::table<id<MTLFence>, unsigned long, ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>, std::__1::equal_to<objc_object<MTLFence>>, ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::allocator<ankerl::unordered_dense::v4_5_0::hash<objc_object<MTLFence>, void>::pair<objc_object<MTLFence>, unsigned long>>, ankerl::unordered_dense::v4_5_0::bucket_type::standard, ankerl::unordered_dense::v4_5_0::det…
+   293c7: 4c 89 ea                     	movq	%r13, %rdx
+   293ca: 80 48 0b 08                  	orb	$0x8, 0xb(%rax)
+   293ce: 49 83 c6 20                  	addq	$0x20, %r14
+   293d2: 4d 39 e6                     	cmpq	%r12, %r14
+   293d5: 75 cf                        	jne	0x293a6 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x296>
+   293d7: 48 ff c3                     	incq	%rbx
+   293da: 48 83 fb 02                  	cmpq	$0x2, %rbx
+   293de: 75 98                        	jne	0x29378 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x268>
+   293e0: 4c 8b 6d c0                  	movq	-0x40(%rbp), %r13
+   293e4: 4c 8b 65 98                  	movq	-0x68(%rbp), %r12
+   293e8: 49 8b 9c 24 90 06 00 00      	movq	0x690(%r12), %rbx
+   293f0: 4d 8b b4 24 98 06 00 00      	movq	0x698(%r12), %r14
+   293f8: 4c 39 f3                     	cmpq	%r14, %rbx
+   293fb: 74 2c                        	je	0x29429 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x319>
+   293fd: 4c 8b 3d d4 de 49 00         	movq	0x49ded4(%rip), %r15    ## 0x4c72d8 <_writev+0x4c72d8>
+   29404: 48 8b 13                     	movq	(%rbx), %rdx
+   29407: 48 8b 4b 08                  	movq	0x8(%rbx), %rcx
+   2940b: 49 8b 7d 08                  	movq	0x8(%r13), %rdi
+   2940f: 4c 89 fe                     	movq	%r15, %rsi
+   29412: 41 ff 95 d0 01 00 00         	callq	*0x1d0(%r13)
+   29419: 48 83 c3 10                  	addq	$0x10, %rbx
+   2941d: 4c 39 f3                     	cmpq	%r14, %rbx
+   29420: 75 e2                        	jne	0x29404 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x2f4>
+   29422: 48 8b 45 c8                  	movq	-0x38(%rbp), %rax
+   29426: 48 8b 18                     	movq	(%rax), %rbx
+   29429: 49 89 9c 24 98 06 00 00      	movq	%rbx, 0x698(%r12)
+   29431: 49 8b bc 24 a8 06 00 00      	movq	0x6a8(%r12), %rdi
+   29439: 49 8b b4 24 b0 06 00 00      	movq	0x6b0(%r12), %rsi
+   29441: 48 29 fe                     	subq	%rdi, %rsi
+   29444: e8 f3 71 34 00               	callq	0x37063c <_writev+0x37063c>
+   29449: 49 8b 45 00                  	movq	(%r13), %rax
+   2944d: 4c 8b b0 48 06 00 00         	movq	0x648(%rax), %r14
+   29454: b1 1f                        	movb	$0x1f, %cl
+   29456: 31 d2                        	xorl	%edx, %edx
+   29458: 31 c0                        	xorl	%eax, %eax
+   2945a: 31 f6                        	xorl	%esi, %esi
+   2945c: 0f b6 f9                     	movzbl	%cl, %edi
+   2945f: 0f bc cf                     	bsfl	%edi, %ecx
+   29462: 41 b0 01                     	movb	$0x1, %r8b
+   29465: 41 d2 e0                     	shlb	%cl, %r8b
+   29468: 41 8a 4c 0e 4e               	movb	0x4e(%r14,%rcx), %cl
+   2946d: 40 08 ce                     	orb	%cl, %sil
+   29470: 84 c9                        	testb	%cl, %cl
+   29472: 41 0f b6 c8                  	movzbl	%r8b, %ecx
+   29476: 41 89 c8                     	movl	%ecx, %r8d
+   29479: 44 0f 44 c2                  	cmovel	%edx, %r8d
+   2947d: 44 08 c0                     	orb	%r8b, %al
+   29480: 40 30 f9                     	xorb	%dil, %cl
+   29483: 75 d7                        	jne	0x2945c <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x34c>
+   29485: 40 84 f6                     	testb	%sil, %sil
+   29488: 74 4c                        	je	0x294d6 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x3c6>
+   2948a: 31 d2                        	xorl	%edx, %edx
+   2948c: 48 8d 3d 7d ab 34 00         	leaq	0x34ab7d(%rip), %rdi    ## 0x374010 <std::__1::__itoa::__pow10_128+0x530>
+   29493: 40 0f b6 ce                  	movzbl	%sil, %ecx
+   29497: 0f bc f1                     	bsfl	%ecx, %esi
+   2949a: 48 0b 14 f7                  	orq	(%rdi,%rsi,8), %rdx
+   2949e: 8d 71 ff                     	leal	-0x1(%rcx), %esi
+   294a1: 40 20 ce                     	andb	%cl, %sil
+   294a4: 75 ed                        	jne	0x29493 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x383>
+   294a6: 31 c9                        	xorl	%ecx, %ecx
+   294a8: 84 c0                        	testb	%al, %al
+   294aa: 74 12                        	je	0x294be <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x3ae>
+   294ac: 0f b6 f0                     	movzbl	%al, %esi
+   294af: 0f bc c6                     	bsfl	%esi, %eax
+   294b2: 48 0b 0c c7                  	orq	(%rdi,%rax,8), %rcx
+   294b6: 8d 46 ff                     	leal	-0x1(%rsi), %eax
+   294b9: 40 20 f0                     	andb	%sil, %al
+   294bc: 75 ee                        	jne	0x294ac <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x39c>
+   294be: 49 8b 7d 08                  	movq	0x8(%r13), %rdi
+   294c2: 48 8b 35 87 cd 49 00         	movq	0x49cd87(%rip), %rsi    ## 0x4c6250 <_writev+0x4c6250>
+   294c9: 41 b8 01 00 00 00            	movl	$0x1, %r8d
+   294cf: 41 ff 95 c8 01 00 00         	callq	*0x1c8(%r13)
+   294d6: 41 80 7e 49 01               	cmpb	$0x1, 0x49(%r14)
+   294db: 75 19                        	jne	0x294f6 <MPLCommandReplayer::RenderEncoder::End(EncoderIndex)+0x3e6>
+   294dd: 49 8b 7d 08                  	movq	0x8(%r13), %rdi
+   294e1: 48 8b 35 30 d0 49 00         	movq	0x49d030(%rip), %rsi    ## 0x4c6518 <_writev+0x4c6518>
+   294e8: ff 15 3a 4e 48 00            	callq	*0x484e3a(%rip)         ## 0x4ae328 <_writev+0x4ae328>
+   294ee: 49 c7 45 08 00 00 00 00      	movq	$0x0, 0x8(%r13)
+   294f6: 48 83 c4 68                  	addq	$0x68, %rsp
+   294fa: 5b                           	popq	%rbx
+   294fb: 41 5c                        	popq	%r12
+   294fd: 41 5d                        	popq	%r13
+   294ff: 41 5e                        	popq	%r14
+   29501: 41 5f                        	popq	%r15
+   29503: 5d                           	popq	%rbp
+   29504: c3                           	retq
+   29505: 0f 1f 00                     	nopl	(%rax)
+   29508: 6e                           	outsb	(%rsi), %dx
+   29509: fc                           	cld
+   2950a: ff ff                        	<unknown>
+   2950c: 61                           	<unknown>
+   2950d: fe ff                        	<unknown>
+   2950f: ff 6b fd                     	ljmpl	*-0x3(%rbx)
+   29512: ff ff                        	<unknown>
+   29514: e8 fd ff ff 00               	callq	0x1029516 <_dxgi_info+0xb0551e>
+   29519: 00 55 48                     	addb	%dl, 0x48(%rbp)
+
+000000000002951a <MPLCommandReplayer::ComputeEncoder::Initialize()>:
+   2951a: 55                           	pushq	%rbp
+   2951b: 48 89 e5                     	movq	%rsp, %rbp
+   2951e: 41 57                        	pushq	%r15
+   29520: 41 56                        	pushq	%r14
+   29522: 53                           	pushq	%rbx
+   29523: 48 81 ec 08 01 00 00         	subq	$0x108, %rsp            ## imm = 0x108
+   2952a: 48 8b 05 0f 52 48 00         	movq	0x48520f(%rip), %rax    ## 0x4ae740 <_writev+0x4ae740>
+   29531: 48 8b 00                     	movq	(%rax), %rax
+   29534: 48 89 45 e0                  	movq	%rax, -0x20(%rbp)
+   29538: 48 8b 05 21 d3 49 00         	movq	0x49d321(%rip), %rax    ## 0x4c6860 <_writev+0x4c6860>
+   2953f: 48 89 85 e0 fe ff ff         	movq	%rax, -0x120(%rbp)
+   29546: 48 8d 47 50                  	leaq	0x50(%rdi), %rax
+   2954a: 48 89 85 e8 fe ff ff         	movq	%rax, -0x118(%rbp)
+   29551: 48 8b 05 b8 cf 49 00         	movq	0x49cfb8(%rip), %rax    ## 0x4c6510 <_writev+0x4c6510>
+   29558: 48 89 85 f0 fe ff ff         	movq	%rax, -0x110(%rbp)
+   2955f: 48 8d 47 58                  	leaq	0x58(%rdi), %rax
+   29563: 48 89 85 f8 fe ff ff         	movq	%rax, -0x108(%rbp)
+   2956a: 48 8b 05 f7 cc 49 00         	movq	0x49ccf7(%rip), %rax    ## 0x4c6268 <_writev+0x4c6268>
+   29571: 48 89 85 00 ff ff ff         	movq	%rax, -0x100(%rbp)
+   29578: 48 8d 47 60                  	leaq	0x60(%rdi), %rax
+   2957c: 48 89 85 08 ff ff ff         	movq	%rax, -0xf8(%rbp)
+   29583: 48 8b 05 e6 cc 49 00         	movq	0x49cce6(%rip), %rax    ## 0x4c6270 <_writev+0x4c6270>
+   2958a: 48 89 85 10 ff ff ff         	movq	%rax, -0xf0(%rbp)
+   29591: 48 8d 47 68                  	leaq	0x68(%rdi), %rax
+   29595: 48 89 85 18 ff ff ff         	movq	%rax, -0xe8(%rbp)
+   2959c: 48 8b 05 a5 dd 49 00         	movq	0x49dda5(%rip), %rax    ## 0x4c7348 <_writev+0x4c7348>
+   295a3: 48 89 85 20 ff ff ff         	movq	%rax, -0xe0(%rbp)
+   295aa: 48 8d 47 70                  	leaq	0x70(%rdi), %rax
+   295ae: 48 89 85 28 ff ff ff         	movq	%rax, -0xd8(%rbp)
+   295b5: 48 8b 05 74 cc 49 00         	movq	0x49cc74(%rip), %rax    ## 0x4c6230 <_writev+0x4c6230>
+   295bc: 48 89 85 30 ff ff ff         	movq	%rax, -0xd0(%rbp)
+   295c3: 48 8d 47 78                  	leaq	0x78(%rdi), %rax
+   295c7: 48 89 85 38 ff ff ff         	movq	%rax, -0xc8(%rbp)
+   295ce: 48 8b 05 a3 cc 49 00         	movq	0x49cca3(%rip), %rax    ## 0x4c6278 <_writev+0x4c6278>
+   295d5: 48 89 85 40 ff ff ff         	movq	%rax, -0xc0(%rbp)
+   295dc: 48 8d 87 80 00 00 00         	leaq	0x80(%rdi), %rax
+   295e3: 48 89 85 48 ff ff ff         	movq	%rax, -0xb8(%rbp)
+   295ea: 48 8b 05 8f cc 49 00         	movq	0x49cc8f(%rip), %rax    ## 0x4c6280 <_writev+0x4c6280>
+   295f1: 48 89 85 50 ff ff ff         	movq	%rax, -0xb0(%rbp)
+   295f8: 48 8d 87 88 00 00 00         	leaq	0x88(%rdi), %rax
+   295ff: 48 89 85 58 ff ff ff         	movq	%rax, -0xa8(%rbp)
+
+
+Wall time: 0.04 seconds
+
+[Some lines truncated to 768 bytes. Read artifact://3432 for full output]

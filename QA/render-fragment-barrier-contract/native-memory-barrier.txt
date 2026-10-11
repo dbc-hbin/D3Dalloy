@@ -1,0 +1,26 @@
+    case WMTRenderCommandDrawMeshThreadgroupsIndirect: {
+…
+      [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->indirect_args_buffer,body->indirect_args_offset)
+…
+                            threadsPerMeshThreadgroup:MTLSizeMake(
+…
+                                                          body->mesh_threadgroup_size.height,
+                                                          body->mesh_threadgroup_size.depth
+                                                      )];
+      break;
+    }
+    case WMTRenderCommandMemoryBarrier: {
+      struct wmtcmd_render_memory_barrier *body = (struct wmtcmd_render_memory_barrier *)next;
+      [encoder barrierAfterEncoderStages:(MTLStages)body->stages_after beforeEncoderStages:(MTLStages)body->stages_before visibilityOptions:MTL4VisibilityOptionDevice];
+      break;
+    }
+    case WMTRenderCommandDXMTGeometryDraw: {
+      struct wmtcmd_render_dxmt_geometry_draw *body = (struct wmtcmd_render_dxmt_geometry_draw *)next;
+      m4_render_offset(context,3,body->draw_arguments_offset,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
+          threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
+            threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
+…
+    }
+
+[Showing lines 1309-1323 of 1594. Use :1324 to continue]
