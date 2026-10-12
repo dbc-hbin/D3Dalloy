@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "winemetal_metal4.h"
 
-#define WMTFG_BRIDGE_VERSION 10u
+#define WMTFG_BRIDGE_VERSION 11u
 
 #pragma pack(push, 8)
 enum WMTFG_create_flags
@@ -58,6 +58,8 @@ struct WMTFGprepare_packet
     uint32_t motion_vectors_state;
     uint32_t render_width;
     uint32_t render_height;
+    uint32_t motion_width;
+    uint32_t motion_height;
     uint32_t flags;
     uint32_t reset;
     float jitter_x;
@@ -69,6 +71,9 @@ struct WMTFGprepare_packet
     float camera_far;
     float camera_fov_vertical_radians;
     float view_space_to_meters;
+    float camera_aspect_ratio;
+    float motion_vectors_invalid_value;
+    uint32_t motion_vectors_invalid_value_present;
     float camera_position[3];
     float camera_up[3];
     float camera_right[3];
@@ -149,7 +154,7 @@ struct WMTFGNativeCommand { uint64_t device, compiler; };
 #ifdef __cplusplus
 static_assert(sizeof(WMTFGpacket_header) == 24);
 static_assert(sizeof(WMTFGcreate_packet) == 56);
-static_assert(sizeof(WMTFGprepare_packet) == 320);
+static_assert(sizeof(WMTFGprepare_packet) == 344);
 static_assert(sizeof(WMTFGdispatch_packet) == 264);
 static_assert(sizeof(WMTFGconfigure_packet) == 32);
 static_assert(sizeof(WMTFGretire_frame_packet) == 48);

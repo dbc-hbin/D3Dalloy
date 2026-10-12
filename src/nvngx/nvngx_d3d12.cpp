@@ -273,6 +273,38 @@ getOptionalFloat(const ParametersImpl *params, const char *name, float fallback,
   return found ? value : fallback;
 }
 
+bool invertMatrix(const float input[16], float output[16]) {
+  double augmented[4][8]{};
+  for (unsigned row = 0; row != 4; ++row) {
+    for (unsigned column = 0; column != 4; ++column) {
+      if (!std::isfinite(input[row * 4 + column])) return false;
+      augmented[row][column] = input[row * 4 + column];
+    }
+    augmented[row][row + 4] = 1.0;
+  }
+  for (unsigned column = 0; column != 4; ++column) {
+    unsigned pivot = column;
+    for (unsigned row = column + 1; row != 4; ++row)
+      if (std::abs(augmented[row][column]) > std::abs(augmented[pivot][column])) pivot = row;
+    if (augmented[pivot][column] == 0) return false;
+    if (pivot != column)
+      for (unsigned value = 0; value != 8; ++value) std::swap(augmented[pivot][value], augmented[column][value]);
+    const double scale = augmented[column][column];
+    for (unsigned value = 0; value != 8; ++value) augmented[column][value] /= scale;
+    for (unsigned row = 0; row != 4; ++row) {
+      if (row == column) continue;
+      const double factor = augmented[row][column];
+      for (unsigned value = 0; value != 8; ++value) augmented[row][value] -= factor * augmented[column][value];
+    }
+  }
+  for (unsigned row = 0; row != 4; ++row)
+    for (unsigned column = 0; column != 4; ++column) {
+      output[row * 4 + column] = static_cast<float>(augmented[row][column + 4]);
+      if (!std::isfinite(output[row * 4 + column])) return false;
+    }
+  return true;
+}
+
 ID3D12Resource *
 getOptionalResource(const ParametersImpl *params, const char *name, bool *present = nullptr) {
   ID3D12Resource *value = nullptr;
@@ -664,21 +696,35 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   if (orthographic > 1) return kResultInvalidParameter;
   void *projection = nullptr;
   const bool has_projection = !NVNGX_FAILED(params->Get("DLSSG.CameraViewToClip", &projection));
-  if (orthographic && !has_projection) return kResultMissingInput;
   if (has_projection) {
     if (!projection) return kResultInvalidParameter;
     std::memcpy(prepare.view_to_clip, projection, sizeof(prepare.view_to_clip));
     for (float value : prepare.view_to_clip)
       if (!std::isfinite(value)) return kResultInvalidParameter;
-    if (orthographic && (prepare.view_to_clip[3] != 0 || prepare.view_to_clip[7] != 0 ||
-        prepare.view_to_clip[11] != 0 || prepare.view_to_clip[15] == 0)) return kResultInvalidParameter;
     prepare.projection_matrix_present = 1;
+  } else {
+    void *clip_to_camera = nullptr;
+    const bool has_clip_to_camera = !NVNGX_FAILED(params->Get("DLSSG.ClipToCameraView", &clip_to_camera));
+    if (has_clip_to_camera) {
+      if (!clip_to_camera || !invertMatrix(static_cast<const float *>(clip_to_camera), prepare.view_to_clip))
+        return kResultInvalidParameter;
+      prepare.projection_matrix_present = 1;
+    }
   }
+  if (orthographic && !prepare.projection_matrix_present) return kResultMissingInput;
+  if (orthographic && (prepare.view_to_clip[3] != 0 || prepare.view_to_clip[7] != 0 ||
+      prepare.view_to_clip[11] != 0 || prepare.view_to_clip[15] == 0)) return kResultInvalidParameter;
   if (prepare.reconstruct_camera_motion) {
     void *matrix = nullptr;
-    if (NVNGX_FAILED(params->Get("DLSSG.ClipToPrevClip", &matrix))) return kResultMissingInput;
-    if (!matrix) return kResultInvalidParameter;
-    std::memcpy(prepare.clip_to_previous_clip, matrix, sizeof(prepare.clip_to_previous_clip));
+    if (NVNGX_FAILED(params->Get("DLSSG.ClipToPrevClip", &matrix))) {
+      void *inverse = nullptr;
+      if (NVNGX_FAILED(params->Get("DLSSG.PrevClipToClip", &inverse))) return kResultMissingInput;
+      if (!inverse || !invertMatrix(static_cast<const float *>(inverse), prepare.clip_to_previous_clip))
+        return kResultInvalidParameter;
+    } else {
+      if (!matrix) return kResultInvalidParameter;
+      std::memcpy(prepare.clip_to_previous_clip, matrix, sizeof(prepare.clip_to_previous_clip));
+    }
     for (float value : prepare.clip_to_previous_clip)
       if (!std::isfinite(value)) return kResultInvalidParameter;
   }
@@ -691,7 +737,7 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
         identityOf(output_device.ptr()).ptr() != feature.device_identity.ptr() ||
         desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
         desc.MipLevels != 1 || desc.SampleDesc.Count != 1 ||
-        desc.Width != present_desc.Width || desc.Height != present_desc.Height ||
+        (!generate.output_subrect_only && (desc.Width != present_desc.Width || desc.Height != present_desc.Height)) ||
         desc.Format != feature.fg_create.backbuffer_format ||
         !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return kResultInvalidParameter;
   }
@@ -727,8 +773,12 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   generate.output_y = getOptionalUInt(params,"DLSSG.OutputInterpolatedSubrectBaseY",top);
   generate.real_x = getOptionalUInt(params,"DLSSG.OutputRealSubrectBaseX",left);
   generate.real_y = getOptionalUInt(params,"DLSSG.OutputRealSubrectBaseY",top);
-  const UINT mw = (feature.fg_create.flags & 4) ? feature.fg_create.display_width : prepare.render_width;
-  const UINT mh = (feature.fg_create.flags & 4) ? feature.fg_create.display_height : prepare.render_height;
+  const UINT default_mw = (feature.fg_create.flags & 4) ? feature.fg_create.display_width : prepare.render_width;
+  const UINT default_mh = (feature.fg_create.flags & 4) ? feature.fg_create.display_height : prepare.render_height;
+  const UINT mw = getOptionalUInt(params, "DLSSG.MVecsSubrectWidth", 0) ?: default_mw;
+  const UINT mh = getOptionalUInt(params, "DLSSG.MVecsSubrectHeight", 0) ?: default_mh;
+  prepare.motion_width = mw;
+  prepare.motion_height = mh;
   auto validSubrect = [&](ID3D12Resource *resource, UINT x, UINT y, UINT width, UINT height) {
     Com<ID3D12Device> owner;
     const auto desc = resource->GetDesc();
@@ -782,8 +832,7 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   if (getOptionalUInt(params,"DLSSG.DepthInverted",feature.fg_create.flags & 1) != (feature.fg_create.flags & 1) ||
       getOptionalUInt(params,"DLSSG.MvecJittered",(feature.fg_create.flags >> 3) & 1) != ((feature.fg_create.flags >> 3) & 1))
     return kResultUnsupportedParameter;
-  for (const auto &[key, expected] : {std::pair{"DLSSG.MVecsSubrectWidth",mw},
-       std::pair{"DLSSG.MVecsSubrectHeight",mh},
+  for (const auto &[key, expected] : {
        std::pair{"DLSSG.DepthSubrectWidth",prepare.render_width},std::pair{"DLSSG.DepthSubrectHeight",prepare.render_height},
        std::pair{"DLSSG.InputBackbufferSubrectWidth",feature.fg_create.display_width},
        std::pair{"DLSSG.InputBackbufferSubrectHeight",feature.fg_create.display_height},
@@ -815,6 +864,34 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   prepare.camera_far = getOptionalFloat(params,"DLSSG.CameraFar",0);
   prepare.camera_fov_vertical_radians = getOptionalFloat(params,"DLSSG.CameraFOV",0);
   if (!prepare.camera_near || !prepare.camera_far || !prepare.camera_fov_vertical_radians) return kResultMissingInput;
+  bool has_aspect = false;
+  prepare.camera_aspect_ratio = getOptionalFloat(params, "DLSSG.CameraAspectRatio", 0, &has_aspect);
+  if (has_aspect && (!std::isfinite(prepare.camera_aspect_ratio) || prepare.camera_aspect_ratio <= 0))
+    return kResultInvalidParameter;
+  bool has_invalid_motion = false;
+  prepare.motion_vectors_invalid_value = getOptionalFloat(params, "DLSSG.MvecInvalidValue", 0, &has_invalid_motion);
+  if (has_invalid_motion && prepare.reconstruct_camera_motion) {
+    if (!std::isfinite(prepare.motion_vectors_invalid_value)) return kResultUnsupportedParameter;
+    prepare.motion_vectors_invalid_value_present = 1;
+  }
+  if (getOptionalResource(params, "DLSSG.NoWarp")) return kResultUnsupportedParameter;
+  // No public convention maps an extra pinhole/lens transform onto MetalFX's projection or distortion field.
+  for (const char *key : {"DLSSG.CameraPinholeOffsetX", "DLSSG.CameraPinholeOffsetY"}) {
+    const float offset = getOptionalFloat(params, key, 0);
+    if (!std::isfinite(offset)) return kResultInvalidParameter;
+    if (offset != 0) return kResultUnsupportedParameter;
+  }
+  void *lens = nullptr;
+  if (!NVNGX_FAILED(params->Get("DLSSG.ClipToLensClip", &lens))) {
+    if (!lens) return kResultInvalidParameter;
+    const auto values = static_cast<const float *>(lens);
+    bool identity = true;
+    for (unsigned i = 0; i != 16; ++i) {
+      if (!std::isfinite(values[i])) return kResultInvalidParameter;
+      identity &= values[i] == (i % 5 == 0 ? 1.f : 0.f);
+    }
+    if (!identity) return kResultUnsupportedParameter;
+  }
   const char *camera_keys[4][3] = {{"DLSSG.CameraPosX","DLSSG.CameraPosY","DLSSG.CameraPosZ"},
       {"DLSSG.CameraUpX","DLSSG.CameraUpY","DLSSG.CameraUpZ"},
       {"DLSSG.CameraRightX","DLSSG.CameraRightY","DLSSG.CameraRightZ"},

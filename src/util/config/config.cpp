@@ -47,15 +47,15 @@ namespace dxmt {
       { "dxgi.customVendorId",     "1002" },
       { "dxgi.customDeviceId",     "7340" },
     }} },
-    /* Use the PR Wine compatibility identities: RX 9070 for ZZZ, or RTX 5060
+    /* Use the PR Wine compatibility identities: RX 9070 for ZZZ, or RTX 4060
      * for the explicitly selected NGX/NVAPI path. Renderer capabilities and
      * the Genshin/YuanShen profiles are independent of these PCI identities. */
     { R"(\\ZenlessZoneZero\.exe$)",
       env::getEnvVar("DXMT_ENABLE_NVEXT") == "1"
         ? Config{{
-            { "dxgi.customDeviceDesc",   "NVIDIA GeForce RTX 5060" },
+            { "dxgi.customDeviceDesc",   "NVIDIA GeForce RTX 4060" },
             { "dxgi.customVendorId",     "10de" },
-            { "dxgi.customDeviceId",     "2d05" },
+            { "dxgi.customDeviceId",     "2882" },
           }}
         : Config{{
             { "dxgi.customDeviceDesc",   "AMD Radeon RX 9070" },

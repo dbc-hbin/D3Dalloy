@@ -2375,6 +2375,9 @@ class GameSuiteEvidence(unittest.TestCase):
         rejections += "OWNED_D3D12_NGX_REJECT case=ortho_camera missing_matrix=missing_input missing_basis=missing_input nan=invalid_parameter infinity=invalid_parameter singular=invalid_parameter outputs_untouched=1\n"
         native += "".join(f"OWNED_D3D12_NGX_DISABLE_HINT frame={f} replay={r} value={int(f == 0 or f >= 5 or r != 0)} before_execute_untouched=1 after_fence=1 tail_untouched=1 history_hint=1\n" for f in range(9) for r in range(2 if f in (0, 7, 8) else 1))
         native += "".join(f"OWNED_D3D12_NGX_CAMERA_MOTION ortho={o} frame={f} max_delta=1 different_zero={int(f > 0)} row_major=1 translated_last_row=1 matrix_snapshotted=1\n" for o in (0, 1) for f in range(6))
+        native += "".join(f"OWNED_D3D12_NGX_INPUT_PASS case=camera infinite_far={i} frames=6 independent_features=4 inverse_projection=1 invalid_untouched=1 native_boundaries=1 explicit_projection=1 complete_basis=1 aspect=2 generated_beyond_warmup=1 release_before_execute=1 snapshot=1\n" for i in (0, 1))
+        native += "".join(f"OWNED_D3D12_NGX_INPUT_PASS case=motion invalid_sentinel={i} frames=6 independent_features=4 equivalent_motion=1 poisoned_padding=1 output_real_rects=1 jitter_or_inverse=1 generated_beyond_warmup=1 release_before_execute=1 snapshot=1\n" for i in (0, 1))
+        native += "".join(f"OWNED_D3D12_NGX_INPUT_REJECT case=camera infinite_far={i} aspect_zero_negative_nan_infinity=invalid_parameter far_negative_infinity_nan=invalid_parameter outputs_untouched=1\n" for i in (0, 1))
         scene = "OWNED_D3D12_NGX_SCENE frames=14 reset=1 output_written=1 actual_count=unavailable consumer=gpu_readback\n"
         self.ngx_fg = self.ngx + rejections + native + scene + "OWNED_D3D12_NGX_FG_PASS capacity=1 native_output=1 unsupported_mfg=1\n"
         self.ngx += "".join(f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant={v} frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8\n" for v in range(8))
@@ -2419,6 +2422,7 @@ OWNED_DXGI_FULLSCREEN_PASS
             ("ngx-features", self.ngx, "variant=3", "variant=2"),
             ("ngx-features", self.ngx, "matrices_snapshotted=1", "matrices_snapshotted=0"),
             ("ngx-fg", self.ngx_fg, "different_current=1", "different_current=0"),
+            ("ngx-fg", self.ngx_fg, "output_real_rects=1", "output_real_rects=0"),
             ("ngx-fg", self.ngx_fg, "frame=0 reset=1", "frame=0 reset=0"),
             ("ngx-fg", self.ngx_fg, "resources_released=1", "resources_released=0"),
             ("ngx-fg", self.ngx_fg, "output_untouched=1", "output_untouched=0"),

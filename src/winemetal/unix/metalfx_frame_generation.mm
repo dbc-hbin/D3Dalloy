@@ -418,7 +418,8 @@ struct CameraPlanes {
 bool normalizeCameraPlanes(const WMTFGprepare_packet& p,
                            std::uint32_t createFlags, CameraPlanes& planes) noexcept {
     if (!std::isfinite(p.camera_near) || p.camera_near <= 0) return false;
-    if (createFlags & WMTFG_DEPTH_INFINITE) {
+    if (std::isnan(p.camera_far) || (std::isinf(p.camera_far) && p.camera_far < 0)) return false;
+    if ((createFlags & WMTFG_DEPTH_INFINITE) || std::isinf(p.camera_far)) {
         planes = {p.camera_near, INFINITY};
         return true;
     }
@@ -433,6 +434,9 @@ bool normalizeCameraPlanes(const WMTFGprepare_packet& p,
 bool validParameters(const WMTFGprepare_packet& p, std::uint32_t createFlags) {
     CameraPlanes planes{};
     if (p.reconstruct_camera_motion > 1) return false;
+    if (p.camera_aspect_ratio < 0 || !std::isfinite(p.camera_aspect_ratio) ||
+        p.motion_vectors_invalid_value_present > 1 ||
+        (p.motion_vectors_invalid_value_present && !std::isfinite(p.motion_vectors_invalid_value))) return false;
     if (p.projection_matrix_present > 1 || (p.projection_matrix_present && !p.camera_info_present)) return false;
     if (p.projection_matrix_present) {
         for (float value : p.view_to_clip)
@@ -451,10 +455,10 @@ bool validParameters(const WMTFGprepare_packet& p, std::uint32_t createFlags) {
         const float determinant = simd_determinant(transform);
         if (!std::isfinite(determinant) || determinant == 0) return false;
     }
-    if ((p.flags & ~31u) || !p.render_width || !p.render_height ||
+    if ((p.flags & ~31u) || !p.render_width || !p.render_height || !p.motion_width || !p.motion_height ||
         !std::isfinite(p.jitter_x) || !std::isfinite(p.jitter_y) ||
         !std::isfinite(p.motion_scale_x) || !std::isfinite(p.motion_scale_y) ||
-        !std::isfinite(p.frame_time_delta_ms) || p.frame_time_delta_ms <= 0 ||
+        !std::isfinite(p.frame_time_delta_ms) || p.frame_time_delta_ms < 0 ||
         !std::isfinite(p.view_space_to_meters) ||
         !normalizeCameraPlanes(p, createFlags, planes) ||
         !std::isfinite(p.camera_fov_vertical_radians) ||
@@ -571,8 +575,10 @@ struct alignas(16) FgParams {
     std::uint32_t uiMode;
     std::uint32_t reconstructCameraMotion;
     float clipToPreviousClip[16];
+    float motionVectorsInvalidValue;
+    std::uint32_t motionVectorsInvalidValuePresent;
 };
-static_assert(sizeof(FgParams) == 176);
+static_assert(sizeof(FgParams) == 192);
 
 Object makeParameterBuffer(id<MTLDevice> device, const FgParams& params) {
     id<MTLBuffer> buffer =
@@ -782,13 +788,10 @@ bool PreparedFrame::encode(
                 auto device = (id<MTLDevice>)configuration.device.get();
                 const auto& p = impl_->snapshot->parameters;
                 const auto& d = impl_->dispatch;
-                const bool displayMotion = (impl_->state->creation.flags &
-                    WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
-                const NSUInteger motionTargetWidth = displayMotion
-                    ? impl_->state->creation.display_width : p.render_width;
-                const NSUInteger motionTargetHeight = displayMotion
-                    ? impl_->state->creation.display_height : p.render_height;
+                const NSUInteger motionTargetWidth = p.motion_width;
+                const NSUInteger motionTargetHeight = p.motion_height;
                 const bool motionConversion = p.reconstruct_camera_motion || p.motion_scale_x != 1 || p.motion_scale_y != 1 ||
+                    p.motion_vectors_invalid_value_present ||
                     motionTargetWidth != configuration.outputWidth ||
                     motionTargetHeight != configuration.outputHeight ||
                     (impl_->state->creation.flags & WMTFG_MOTION_VECTORS_JITTERED);
@@ -916,22 +919,22 @@ bool PreparedFrame::encode(
                 // Resample the complete origin-zero motion domain into the active rect.
                 motionParams.sourceExtent[0] = impl_->snapshot->motionWidth;
                 motionParams.sourceExtent[1] = impl_->snapshot->motionHeight;
-                motionParams.motionTargetExtent[0] = displayMotion
-                    ? state.creation.display_width : p.render_width;
-                motionParams.motionTargetExtent[1] = displayMotion
-                    ? state.creation.display_height : p.render_height;
+                motionParams.motionTargetExtent[0] = p.motion_width;
+                motionParams.motionTargetExtent[1] = p.motion_height;
                 motionParams.outputExtent[0] = configuration.outputWidth;
                 motionParams.outputExtent[1] = configuration.outputHeight;
                 motionParams.motionScale[0] = p.motion_scale_x;
                 motionParams.motionScale[1] = p.motion_scale_y;
                 motionParams.reconstructCameraMotion = p.reconstruct_camera_motion;
+                motionParams.motionVectorsInvalidValue = p.motion_vectors_invalid_value;
+                motionParams.motionVectorsInvalidValuePresent = p.motion_vectors_invalid_value_present;
                 std::memcpy(motionParams.clipToPreviousClip, p.clip_to_previous_clip, sizeof(p.clip_to_previous_clip));
                 if ((state.creation.flags & WMTFG_MOTION_VECTORS_JITTERED) &&
                     impl_->snapshot->hasPreviousJitter && !reset) {
                     motionParams.jitterCancellation[0] =
-                        impl_->snapshot->previousJitterX - p.jitter_x;
+                        (impl_->snapshot->previousJitterX - p.jitter_x) * p.motion_width / p.render_width;
                     motionParams.jitterCancellation[1] =
-                        impl_->snapshot->previousJitterY - p.jitter_y;
+                        (impl_->snapshot->previousJitterY - p.jitter_y) * p.motion_height / p.render_height;
                 }
 
                 Object colorParameters = makeParameterBuffer(device, colorParams);
@@ -1030,7 +1033,9 @@ bool PreparedFrame::encode(
                 effect.jitterOffsetX = p.jitter_x;
                 effect.jitterOffsetY = p.jitter_y;
                 effect.deltaTime = p.frame_time_delta_ms * 0.001f;
-                effect.aspectRatio = float(p.render_width) / float(p.render_height);
+                effect.aspectRatio = p.camera_aspect_ratio > 0
+                    ? p.camera_aspect_ratio
+                    : float(p.render_width) / float(p.render_height);
 
                 if (@available(macOS 27.0, *)) {
                     // All interpolator inputs are normalized to the origin-zero
@@ -1312,12 +1317,8 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 if (state->generationEnabled && state->frames.size() >= 64)
                     return finish(Runtime, "prepare_backpressure");
                 addresses = {p->depth, p->motion_vectors, 0};
-                const bool displayMotion = (state->creation.flags &
-                    WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
-                const NSUInteger motionWidth = displayMotion
-                    ? state->creation.display_width : p->render_width;
-                const NSUInteger motionHeight = displayMotion
-                    ? state->creation.display_height : p->render_height;
+                const NSUInteger motionWidth = p->motion_width;
+                const NSUInteger motionHeight = p->motion_height;
                 if (!addresses[0] || !addresses[1] || addresses[0] == addresses[1] ||
                     !mapOne(resources, 0, *state, command, addresses[0], false,
                             NSUInteger(p->depth_subrect_x) + p->render_width,
@@ -1400,7 +1401,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     return finish(Unsupported);
                 auto present = (id<MTLTexture>)resources.values[0].texture;
                 auto output = (id<MTLTexture>)resources.values[1].texture;
-                if (output.width != present.width || output.height != present.height ||
+                if ((!d->output_subrect_only && (output.width != present.width || output.height != present.height)) ||
                     present.pixelFormat != output.pixelFormat)
                     return finish(Unsupported);
                 if (!resolveRect(*d, d->generation_rect_width ? output.width : state->creation.display_width,
@@ -1427,10 +1428,12 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     if (!d->ui && !d->ui_alpha) uiFormat = present.pixelFormat;
                 }
                 if (d->real_output) {
-                    if (!mapOne(resources, 3, *state, command, d->real_output, true, present.width, present.height))
+                    if (!mapOne(resources, 3, *state, command, d->real_output, true,
+                                d->output_subrect_only ? NSUInteger(dispatch.real_x) + rectWidth : present.width,
+                                d->output_subrect_only ? NSUInteger(dispatch.real_y) + rectHeight : present.height))
                         return finish(Parameter);
                     auto real = (id<MTLTexture>)resources.values[3].texture;
-                    if (real.width != present.width || real.height != present.height ||
+                    if ((!d->output_subrect_only && (real.width != present.width || real.height != present.height)) ||
                         NSUInteger(dispatch.real_x) + rectWidth > real.width ||
                         NSUInteger(dispatch.real_y) + rectHeight > real.height ||
                         real.pixelFormat != present.pixelFormat || rootTexture(real) == rootTexture(present) ||

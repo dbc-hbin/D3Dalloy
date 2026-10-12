@@ -261,6 +261,8 @@ struct YaaglFgParams {
     uint uiMode;
     uint reconstructCameraMotion;
     float4x4 clipToPreviousClip;
+    float motionVectorsInvalidValue;
+    uint motionVectorsInvalidValuePresent;
 };
 
 static float3 fg_decode(float3 value, constant YaaglFgParams& params) {
@@ -313,6 +315,10 @@ kernel void yaagl_fg_normalize_motion(
         uint2((float2(tid) + 0.5f) * float2(params.sourceExtent) /
               float2(params.extent)), params.sourceExtent - 1u);
     float2 value = source.read(sourcePosition).xy;
+    // Either invalid component invalidates the object vector; camera reprojection is still applied below.
+    if (params.motionVectorsInvalidValuePresent &&
+        (value.x == params.motionVectorsInvalidValue || value.y == params.motionVectorsInvalidValue))
+        value = 0.0f;
     float2 pixels = (value * params.motionScale - params.jitterCancellation) *
                     float2(params.outputExtent) / float2(params.motionTargetExtent);
     if (params.reconstructCameraMotion) {

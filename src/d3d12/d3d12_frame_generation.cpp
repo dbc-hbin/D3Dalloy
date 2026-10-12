@@ -131,11 +131,16 @@ public:
     p.command_list = WMT::Metal4CPUPointer(&command); p.frame_id = desc.frame_id;
     p.depth = frame->views[0].texture().handle; p.motion_vectors = frame->views[1].texture().handle;
     p.depth_state = desc.depth_state; p.motion_vectors_state = desc.motion_vectors_state;
-    p.render_width = desc.render_width; p.render_height = desc.render_height; p.flags = desc.flags; p.reset = desc.reset;
+    p.render_width = desc.render_width; p.render_height = desc.render_height;
+    p.motion_width = desc.motion_width; p.motion_height = desc.motion_height;
+    p.flags = desc.flags; p.reset = desc.reset;
     p.jitter_x = desc.jitter_x; p.jitter_y = desc.jitter_y;
     p.motion_scale_x = desc.motion_scale_x; p.motion_scale_y = desc.motion_scale_y;
     p.frame_time_delta_ms = desc.frame_time_delta_ms; p.camera_near = desc.camera_near; p.camera_far = desc.camera_far;
     p.camera_fov_vertical_radians = desc.camera_fov_vertical_radians; p.view_space_to_meters = desc.view_space_to_meters;
+    p.camera_aspect_ratio = desc.camera_aspect_ratio;
+    p.motion_vectors_invalid_value = desc.motion_vectors_invalid_value;
+    p.motion_vectors_invalid_value_present = desc.motion_vectors_invalid_value_present;
     std::memcpy(p.camera_position, desc.camera_position, sizeof(p.camera_position));
     std::memcpy(p.camera_up, desc.camera_up, sizeof(p.camera_up));
     std::memcpy(p.camera_right, desc.camera_right, sizeof(p.camera_right));

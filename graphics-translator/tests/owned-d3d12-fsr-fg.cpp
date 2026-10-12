@@ -159,11 +159,7 @@ std::vector<uint8_t> fgPixels(Gpu& gpu, ID3D12Resource* texture, D3D12_RESOURCE_
     readback.buffer->Unmap(0, &written);
     return pixels;
 }
-uint64_t fgHash(const std::vector<uint8_t>& bytes) {
-    uint64_t hash = 14695981039346656037ull;
-    for (uint8_t value : bytes) hash = (hash ^ value) * 1099511628211ull;
-    return hash;
-}
+
 ComPtr<ID3D12Resource> fgColor(Gpu& gpu, unsigned frame) {
     auto color = createTexture(gpu.device.Get(), fgWidth, fgHeight, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -179,14 +175,15 @@ ComPtr<ID3D12Resource> fgOutput(Gpu& gpu) {
     return output;
 }
 ffxDispatchDescFrameGenerationPrepare fgPrepare(ID3D12GraphicsCommandList* list, uint64_t frame,
-                                                ID3D12Resource* depth, ID3D12Resource* motion, bool reset) {
+                                                ID3D12Resource* depth, ID3D12Resource* motion, bool reset,
+                                                float frameTimeDelta = 1000.f / 30) {
     ffxDispatchDescFrameGenerationPrepare p{};
     p.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
     p.commandList = list;
     p.frameID = frame;
     p.renderSize = {kInputWidth, kInputHeight};
     p.motionVectorScale = {1.f, 1.f};
-    p.frameTimeDelta = 1000.f / 30;
+    p.frameTimeDelta = frameTimeDelta;
     p.unused_reset = reset;
     p.cameraNear = 0.1f; p.cameraFar = 100.f; p.cameraFovAngleVertical = 1.f;
     p.viewSpaceToMetersFactor = 1.f;
@@ -210,11 +207,12 @@ ffxDispatchDescFrameGeneration fgGenerate(ID3D12GraphicsCommandList* list, uint6
 std::vector<uint8_t> fgFrame(FgContext& context, Gpu& gpu, unsigned frame,
                             ID3D12Resource* depth, ID3D12Resource* motion, bool reset = false,
                             bool mutateAfterPrepare = false,
-                            FfxApiRect2D rect = {0, 0, fgWidth, fgHeight}, UINT flags = 0) {
+                            FfxApiRect2D rect = {0, 0, fgWidth, fgHeight}, UINT flags = 0,
+                            float frameTimeDelta = 1000.f / 30) {
     auto color = fgColor(gpu, frame);
     auto output = fgOutput(gpu);
     auto r = fgRecording(gpu);
-    auto p = fgPrepare(r.list.Get(), frame, depth, motion, reset);
+    auto p = fgPrepare(r.list.Get(), frame, depth, motion, reset, frameTimeDelta);
     p.flags = flags;
     fgResult(context.api.dispatch(&context.value, &p.header), FFX_API_RETURN_OK, "prepare");
     check(r.list->Close(), "fg-prepare-close");
@@ -234,8 +232,6 @@ std::vector<uint8_t> fgFrame(FgContext& context, Gpu& gpu, unsigned frame,
     fgResult(context.api.dispatch(&context.value, &g.header), FFX_API_RETURN_OK, "generate");
     check(r.list->Close(), "fg-generate-close"); gpu.executeAndWait(r.list.Get());
     auto pixels = fgPixels(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    std::printf("OWNED_D3D12_FSR_FG_FRAME frame=%u reset=%u hash=%016llx source=gpu-readback\n",
-                frame, reset, static_cast<unsigned long long>(fgHash(pixels)));
     return pixels;
 }
 void fgEqual(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, const char* name) {
@@ -310,6 +306,10 @@ void fgDirect(const FgApi& api, Gpu& gpu) {
                     fgRequire(value == preserved[(y * fgWidth + x) * 4 + c], "generation-rect-outside-preserved");
                 }
     std::puts("OWNED_D3D12_FSR_FG_DIRECT_PASS snapshot=exact rect_guard=exact frames=4");
+    FgContext zeroDelta(api, gpu);
+    const auto zeroFrame = fgFrame(zeroDelta, gpu, 6, depth.Get(), motion.Get(), false, false,
+                                    {0, 0, fgWidth, fgHeight}, 0, 0.f);
+    fgRequire(!zeroFrame.empty(), "zero-frame-time-delta");
     FgContext reset(api, gpu), fresh(api, gpu), gap(api, gpu);
     fgFrame(reset, gpu, 1, depth.Get(), motion.Get());
     fgFrame(gap, gpu, 1, depth.Get(), motion.Get());

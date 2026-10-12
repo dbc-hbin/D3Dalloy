@@ -197,6 +197,8 @@ ffxReturnCode_t prepare(Context& c, const T& desc, bool v2) {
   p.StructSize = sizeof(p);
   p.frame_id = desc.frameID; p.flags = desc.flags;
   p.render_width = desc.renderSize.width; p.render_height = desc.renderSize.height;
+  p.motion_width = (c.flags & FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) ? c.width : p.render_width;
+  p.motion_height = (c.flags & FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) ? c.height : p.render_height;
   p.jitter_x = desc.jitterOffset.x; p.jitter_y = desc.jitterOffset.y;
   p.motion_scale_x = desc.motionVectorScale.x; p.motion_scale_y = desc.motionVectorScale.y;
   p.frame_time_delta_ms = desc.frameTimeDelta; p.camera_near = desc.cameraNear; p.camera_far = desc.cameraFar;

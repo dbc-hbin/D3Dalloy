@@ -126,6 +126,7 @@ struct Harness {
     std::vector<std::shared_ptr<const PreparedFrame>> record(uint64_t context, unsigned frame, id<MTLTexture> color,id<MTLTexture> depth,id<MTLTexture> motion,id<MTLTexture> output,unsigned flags,unsigned render=128,float scale=1,bool mutate=false) {
         WMTFGprepare_packet p{}; header(p,WMTFG_PREPARE,context); p.command_list=(uint64_t)&native; p.frame_id=frame;
         p.depth=(uint64_t)depth; p.motion_vectors=(uint64_t)motion; p.render_width=p.render_height=render;
+        p.motion_width=p.motion_height=render;
         p.motion_scale_x=p.motion_scale_y=scale; p.frame_time_delta_ms=33.3333f; p.camera_near=.1f; p.camera_far=100;
         p.camera_fov_vertical_radians=1; p.view_space_to_meters=1;
         std::shared_ptr<const PreparedFrame> prepare; require(api(WMTFG_PREPARE,&p,&prepare)==0,"prepare");

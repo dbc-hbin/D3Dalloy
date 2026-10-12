@@ -16,9 +16,11 @@ struct MTL_FRAME_GENERATION_PREPARE_DESC {
   UINT64 frame_id;
   ID3D12Resource *depth, *motion_vectors;
   D3D12_RESOURCE_STATES depth_state, motion_vectors_state;
-  UINT render_width, render_height, flags, reset;
+  UINT render_width, render_height, motion_width, motion_height, flags, reset;
   FLOAT jitter_x, jitter_y, motion_scale_x, motion_scale_y;
   FLOAT frame_time_delta_ms, camera_near, camera_far, camera_fov_vertical_radians, view_space_to_meters;
+  FLOAT camera_aspect_ratio, motion_vectors_invalid_value;
+  UINT motion_vectors_invalid_value_present;
   FLOAT camera_position[3], camera_up[3], camera_right[3], camera_forward[3];
   UINT camera_info_present;
   UINT depth_subrect_x, depth_subrect_y, motion_subrect_x, motion_subrect_y;

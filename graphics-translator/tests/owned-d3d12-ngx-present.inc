@@ -59,7 +59,7 @@ std::vector<uint8_t> ngxPresentPixels(Gpu& gpu, ID3D12Resource* texture, D3D12_R
     readback.buffer->Unmap(0, nullptr);
     return pixels;
 }
-NVSDK_NGX_Handle* ngxPresentFeature(const NgxApi& api, Gpu& gpu, bool orthographic = false) {
+NVSDK_NGX_Handle* ngxPresentFeature(const NgxApi& api, Gpu& gpu, bool orthographic = false, bool jittered = false) {
     auto params = allocateParams(api);
     ngx_feature_set_uint(params, "DLSSG.Width", ngxPresentExtent);
     ngx_feature_set_uint(params, "DLSSG.Height", ngxPresentExtent);
@@ -68,6 +68,7 @@ NVSDK_NGX_Handle* ngxPresentFeature(const NgxApi& api, Gpu& gpu, bool orthograph
     ngx_feature_set_uint(params, "DLSSG.BackbufferFormat", DXGI_FORMAT_R8G8B8A8_UNORM);
     ngx_feature_set_uint(params, "DLSSG.DepthInverted", 1);
     ngx_feature_set_uint(params, "DLSSG.OrthoProjection", orthographic);
+    ngx_feature_set_uint(params, "DLSSG.MvecJittered", jittered);
     auto record = gpu.makeRecording(); NVSDK_NGX_Handle* feature = nullptr;
     checkNgxResult(api.create(record.list.Get(), 11, params, &feature), ngx_fixture_result_success(), "NGX present create11");
     check(record.list->Close(), "NGX present create close"); resetAndDestroyParams(api, params);

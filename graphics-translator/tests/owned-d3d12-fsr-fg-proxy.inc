@@ -151,10 +151,7 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
               GetWindowRect(window.hwnd, &outer) && GetClientRect(window.hwnd, &client), "proxy-window-controlled-position");
     POINT origin{client.left, client.top};
     fgRequire(ClientToScreen(window.hwnd, &origin) && IsWindowVisible(window.hwnd) && !IsIconic(window.hwnd), "proxy-window-visible-client");
-    std::printf("OWNED_D3D12_FSR_FG_WINDOW abi=%s window=%ld,%ld,%ld,%ld client=%ld,%ld,%ld,%ld workarea=%ld,%ld,%ld,%ld visible=1 iconic=0\n",
-                sizeof(void*) == 8 ? "x64" : "x86", outer.left, outer.top, outer.right, outer.bottom,
-                origin.x, origin.y, origin.x + client.right - client.left, origin.y + client.bottom - client.top,
-                work.left, work.top, work.right, work.bottom);
+
     ComPtr<IDXGIFactory4> factory; check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "fg-factory");
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width = fgWidth; desc.Height = fgHeight; desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
