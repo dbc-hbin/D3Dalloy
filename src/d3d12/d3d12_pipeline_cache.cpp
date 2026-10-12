@@ -12,6 +12,9 @@
 #include <chrono>
 #include <string>
 #include <vector>
+#include <deque>
+#include <thread>
+#include <type_traits>
 
 namespace dxmt {
 
@@ -39,9 +42,13 @@ constexpr uint64_t kMagic = 0x004f5350544d5844; // "DXMTPSO\0", little endian.
 // Serialized pipeline libraries validate this revision for every embedded PSO blob.
 // 5: atomic phase context relocations and bounded captured application variants.
 // 6: immutable linked-stage layouts and native sample-mask function constants (AIR ABI 33).
-constexpr uint32_t kVersion = 6;
+// 7: SM50 sample-NaN-to-zero compatibility flag changes generated shader semantics.
+constexpr uint32_t kVersion = 7;
 constexpr size_t kAutomaticBytes = 64u * 1024u * 1024u;
 constexpr size_t kAutomaticEntries = 512;
+
+struct AutomaticCache;
+std::unique_lock<std::mutex> LockMetadata(AutomaticCache &cache);
 
 struct AutomaticCache {
   struct Entry {
@@ -57,6 +64,77 @@ struct AutomaticCache {
   size_t bytes = 0;
   std::unordered_map<Sha1Digest, Entry> entries;
   std::unordered_map<Sha1Digest, std::shared_ptr<AutomaticPipelineCacheFlight>> flights;
+  struct Publication { Sha1Digest key; uint64_t generation; std::shared_ptr<const PipelineCacheStorage> blob; };
+  std::mutex publication_mutex;
+  std::condition_variable publication_ready;
+  std::deque<Publication> publications;
+  bool publication_stop = false;
+  std::thread publication_worker;
+
+  std::thread StartPublicationWorker() {
+    try {
+      return std::thread([this] {
+    for (;;) {
+      Publication publication;
+      {
+        std::unique_lock lock(publication_mutex);
+        publication_ready.wait(lock, [this] { return publication_stop || !publications.empty(); });
+        if (publications.empty()) {
+          if (publication_stop) return;
+          continue;
+        }
+        publication = std::move(publications.front());
+        publications.pop_front();
+        publication_ready.notify_all();
+      }
+      try {
+        if (owned_graphics::TraceEnabled())
+          owned_graphics::Trace("pipeline_cache_auto_phase", ",\"phase\":\"disk_write\"");
+        std::lock_guard disk_lock(disk_mutex);
+        auto metadata = LockMetadata(*this);
+        const auto it = entries.find(publication.key);
+        const bool persist = enabled && generation == publication.generation &&
+                             it != entries.end() && it->second.blob == publication.blob;
+        metadata.unlock();
+        if (persist) {
+          WriteAutomaticPipelineCache(publication.key, publication.blob->bytes.ptr());
+          if (owned_graphics::TraceEnabled())
+            owned_graphics::Trace("pipeline_cache_auto_published", ",\"key\":\"", publication.key.string(), "\"");
+        }
+      } catch (...) {
+        // Optional persistence must not affect producer completion or worker lifetime.
+      }
+    }
+      });
+    } catch (...) {
+      publication_stop = true;
+      return {};
+    }
+  }
+
+  AutomaticCache() : publication_worker(StartPublicationWorker()) {}
+
+  ~AutomaticCache() {
+    {
+      std::lock_guard lock(publication_mutex);
+      publication_stop = true;
+    }
+    publication_ready.notify_one();
+    if (publication_worker.joinable()) publication_worker.join();
+  }
+
+  void Publish(const Sha1Digest &key, uint64_t generation,
+               const std::shared_ptr<const PipelineCacheStorage> &blob) noexcept {
+    try {
+      std::unique_lock lock(publication_mutex);
+      constexpr size_t kPublicationQueueLimit = 8;
+      if (publication_stop || publications.size() >= kPublicationQueueLimit)
+        return;
+      publications.push_back(Publication{key, generation, blob});
+      publication_ready.notify_one();
+    } catch (...) {
+    }
+  }
 
   void Retain(const Sha1Digest &key, const std::shared_ptr<const PipelineCacheStorage> &blob) {
     const size_t size = blob->bytes->GetBufferSize();
@@ -482,8 +560,22 @@ template <typename T> struct ArtifactCache {
     }
     lock.unlock();
     std::shared_ptr<const T> value;
+    bool disk_loaded = false;
     try {
-      value = create();
+      if constexpr (std::is_same_v<T, ShaderStageArtifact>) {
+        if (enabled) {
+          std::shared_ptr<const ShaderStageArtifact> disk;
+          if (SUCCEEDED(ReadAutomaticStageArtifact(key, disk)) && disk) {
+            value = std::move(disk);
+            disk_loaded = true;
+          }
+        }
+      }
+      if (!value) value = create();
+      if constexpr (std::is_same_v<T, ShaderStageArtifact>) {
+        if (value && !disk_loaded && enabled)
+          QueueAutomaticStageArtifact(key, value, current);
+      }
     } catch (...) {
       if (flight) {
         lock.lock();
@@ -520,6 +612,15 @@ template <typename T> struct ArtifactCache {
     flight->ready.notify_all();
     return value;
   }
+
+  void Erase(const std::string &key, const std::shared_ptr<const T> &value) {
+    std::lock_guard lock(mutex);
+    const auto it = entries.find(key);
+    if (it == entries.end() || !it->second->done || it->second->value != value) return;
+    bytes -= it->second->bytes;
+    --completed;
+    entries.erase(it);
+  }
 };
 
 struct NativeLibraryArtifact {
@@ -548,10 +649,132 @@ struct DeviceShaderArtifactCache::Impl {
   ArtifactCache<NativeFunctionArtifact> functions;
   ArtifactCache<ShaderReflectionArtifact> reflections;
   ArtifactCache<RasterMarkerArtifact> markers;
+  ArtifactCache<WorkGraphArtifact> workgraphs;
+  ArtifactCache<RaytracingArtifact> raytracing;
 };
 
 DeviceShaderArtifactCache::DeviceShaderArtifactCache() : impl_(std::make_unique<Impl>()) {}
 DeviceShaderArtifactCache::~DeviceShaderArtifactCache() = default;
+
+namespace {
+bool CopyCompiledArtifact(sm50_bitcode_t owner, const SM50_COMPILED_BITCODE &code, ShaderStageArtifact &value) {
+  if (!owner || !code.Data || !code.Size || code.ConstantDataSize > SIZE_MAX - 7 ||
+      code.ConstantRelocationCount > SIZE_MAX / sizeof(SM50_CONSTANT_RELOCATION)) return false;
+  value.library.resize(code.Size);
+  value.constants.resize((code.ConstantDataSize + 7) / 8);
+  value.relocations.resize(code.ConstantRelocationCount);
+  if (!SM50ReadCompiledBitcode(owner, SM50_COMPILED_BITCODE_PART_LIBRARY, code.Data, value.library.data(), code.Size) ||
+      !SM50ReadCompiledBitcode(owner, SM50_COMPILED_BITCODE_PART_CONSTANTS, code.ConstantData, value.constants.data(), code.ConstantDataSize) ||
+      !SM50ReadCompiledBitcode(owner, SM50_COMPILED_BITCODE_PART_RELOCATIONS, code.ConstantRelocations, value.relocations.data(), code.ConstantRelocationCount * sizeof(SM50_CONSTANT_RELOCATION))) return false;
+  value.view = code;
+  value.view.Data = value.library.data();
+  value.view.ConstantData = code.ConstantDataSize ? value.constants.data() : nullptr;
+  value.view.ConstantRelocations = code.ConstantRelocationCount ? value.relocations.data() : nullptr;
+  return true;
+}
+
+void LinkExportKey(StageKeyBuilder &key, const SM50_WG_EXPORT &entry) {
+  key.bytes(entry.Name, entry.Name ? strlen(entry.Name) : 0);
+  key.bytes(entry.EntryPoint, entry.EntryPoint ? strlen(entry.EntryPoint) : 0);
+  key.add(entry.LibraryIndex, entry.Scope, entry.Flags, entry.Reserved);
+  key.bytes(entry.GlobalRootSignature, entry.GlobalRootSignatureSize);
+  key.bytes(entry.LocalRootSignature, entry.LocalRootSignatureSize);
+}
+}
+
+int DeviceShaderArtifactCache::CompileWorkGraph(const SM50_WG_NODE_COMPILE_DESC &desc, sm50_bitcode_t *output,
+    SM50_COMPILED_BITCODE &code, SM50_WG_NODE_COMPILED_INFO &info, sm50_error_t *error,
+    std::shared_ptr<const WorkGraphArtifact> &artifact, bool bypass) {
+  artifact.reset();
+  auto compile = [&] { return SM50WGCompileNode(&desc, output, &code, &info, error); };
+  if (bypass || desc.Reserved || desc.AllowUnresolved) return compile();
+  int result = 1; bool compiled = false;
+  try {
+    StageKeyBuilder key;
+    key.add(uint32_t(AIRCONV_VERSION), desc.MetalVersion, desc.Launch, desc.OutputCount,
+            desc.LibraryCount, desc.ExportCount, desc.EntryLibraryIndex, desc.EntryExportIndex);
+    key.bytes(desc.Library, desc.LibrarySize);
+    key.bytes(desc.EntryPoint, desc.EntryPoint ? strlen(desc.EntryPoint) : 0);
+    key.bytes(desc.FunctionName, desc.FunctionName ? strlen(desc.FunctionName) : 0);
+    key.bytes(desc.GlobalRootSignature, desc.GlobalRootSignatureSize); key.bytes(desc.LocalRootSignature, desc.LocalRootSignatureSize);
+    key.bytes(desc.OutputElementBase, size_t(desc.OutputCount) * sizeof(uint32_t));
+    key.bytes(desc.OutputElementCount, size_t(desc.OutputCount) * sizeof(uint32_t));
+    for (uint32_t i = 0; i < desc.LibraryCount; ++i) key.bytes(desc.Libraries[i].Bytecode, desc.Libraries[i].Size);
+    for (uint32_t i = 0; i < desc.ExportCount; ++i) LinkExportKey(key, desc.Exports[i]);
+    artifact = impl_->workgraphs.Get(key.key, "wg_compile", [&]() -> std::shared_ptr<const WorkGraphArtifact> {
+      compiled = true;
+      if (!(result = compile())) return {};
+      auto value = std::make_shared<WorkGraphArtifact>();
+      if (!CopyCompiledArtifact(*output, code, *value)) return {};
+      value->info = info;
+      if (!info.ThreadgroupSize[0] || !info.ThreadgroupSize[1] || !info.ThreadgroupSize[2]) return {};
+      return value;
+    });
+  } catch (const std::bad_alloc &) { }
+  if (artifact) {
+    if (*output) { SM50DestroyBitcode(*output); *output = nullptr; }
+    code = artifact->view; info = artifact->info; return 1;
+  }
+  return compiled ? result : compile();
+}
+
+int DeviceShaderArtifactCache::CompileRaytracing(const SM50_RT_PIPELINE_DESC &desc, sm50_bitcode_t *output,
+    SM50_COMPILED_BITCODE &code, std::vector<SM50_RT_FUNCTION_INFO> &functions, uint32_t &count,
+    sm50_error_t *error, std::shared_ptr<const RaytracingArtifact> &artifact, bool bypass) {
+  artifact.reset();
+  auto compile = [&] { return SM50CompileRaytracingPipeline(&desc, output, &code, functions.data(), functions.size(), &count, error); };
+  if (bypass) return compile();
+  int result = 1; bool compiled = false;
+  try {
+    StageKeyBuilder key;
+    key.add(uint32_t(AIRCONV_VERSION), desc.MetalVersion, desc.MaxRecursionDepth, desc.MaxPayloadSize,
+            desc.MaxAttributeSize, desc.Flags, desc.LibraryCount, desc.ExportCount, desc.LinkExportCount);
+    key.bytes(desc.GlobalRootSignature, desc.GlobalRootSignatureSize);
+    for (uint32_t i = 0; i < desc.LibraryCount; ++i) key.bytes(desc.Libraries[i].Bytecode, desc.Libraries[i].Size);
+    for (uint32_t i = 0; i < desc.ExportCount; ++i) {
+      const auto &entry = desc.Exports[i];
+      key.add(entry.Stage, entry.LibraryIndex, entry.HitGroupType, entry.ClosestHitIndex, entry.AnyHitIndex, entry.IntersectionIndex);
+      key.bytes(entry.EntryPoint, entry.EntryPoint ? strlen(entry.EntryPoint) : 0);
+      key.bytes(entry.ContainerEntryPoint, entry.ContainerEntryPoint ? strlen(entry.ContainerEntryPoint) : 0);
+      key.bytes(entry.LocalRootSignature, entry.LocalRootSignatureSize);
+    }
+    for (uint32_t i = 0; i < desc.LinkExportCount; ++i) LinkExportKey(key, desc.LinkExports[i]);
+    artifact = impl_->raytracing.Get(key.key, "rt_compile", [&]() -> std::shared_ptr<const RaytracingArtifact> {
+      compiled = true;
+      if (!(result = compile()) || !count || count > functions.size()) return {};
+      auto value = std::make_shared<RaytracingArtifact>();
+      if (!CopyCompiledArtifact(*output, code, *value)) return {};
+      value->names.resize(count); value->export_names.resize(count);
+      value->functions.assign(functions.begin(), functions.begin() + count);
+      const uintptr_t begin = reinterpret_cast<uintptr_t>(desc.FunctionNames);
+      const auto copy_name = [&](const char *name, std::string &target, bool required) {
+        if (!name) return !required;
+        const uintptr_t address = reinterpret_cast<uintptr_t>(name);
+        if (address < begin || address - begin >= desc.FunctionNamesSize) return false;
+        const size_t remaining = desc.FunctionNamesSize - (address - begin);
+        const char *end = static_cast<const char *>(memchr(name, 0, remaining));
+        if (!end || (required && end == name)) return false;
+        target.assign(name, end); return true;
+      };
+      for (uint32_t i = 0; i < count; ++i) {
+        auto &entry = value->functions[i];
+        if (!copy_name(entry.Name, value->names[i], true) || !copy_name(entry.ExportName, value->export_names[i], false)) return {};
+        entry.Name = value->names[i].c_str();
+        entry.ExportName = entry.ExportName ? value->export_names[i].c_str() : nullptr;
+      }
+      return value;
+    });
+    if (artifact && artifact->functions.size() > functions.size()) {
+      impl_->raytracing.Erase(key.key, artifact); artifact.reset();
+    }
+  } catch (const std::bad_alloc &) { }
+  if (artifact) {
+    if (*output) { SM50DestroyBitcode(*output); *output = nullptr; }
+    code = artifact->view; count = artifact->functions.size();
+    std::copy(artifact->functions.begin(), artifact->functions.end(), functions.begin()); return 1;
+  }
+  return compiled ? result : compile();
+}
 
 HRESULT DeviceShaderArtifactCache::Reflect(
     D3D12_SHADER_BYTECODE source, sm50_shader_t *shader, MTL_SHADER_REFLECTION &reflection,
@@ -671,9 +894,33 @@ int DeviceShaderArtifactCache::Compile(
       for (const auto &[data, size] : key.outputs) {
         const auto *bytes = static_cast<const uint8_t *>(data);
         value->metadata.insert(value->metadata.end(), bytes, bytes + size);
+        value->metadata_sizes.push_back(uint32_t(size));
       }
       return value;
     });
+    if (artifact && artifact->metadata_sizes.size() != key.outputs.size()) {
+      auto invalid = artifact;
+      artifact.reset();
+      impl_->stages.Erase(key.key, invalid);
+    } else if (artifact) {
+      size_t offset = 0;
+      for (size_t i = 0; i < key.outputs.size(); ++i) {
+        if (artifact->metadata_sizes[i] != key.outputs[i].second ||
+            offset > artifact->metadata.size() ||
+            key.outputs[i].second > artifact->metadata.size() - offset) {
+          auto invalid = artifact;
+          artifact.reset();
+          impl_->stages.Erase(key.key, invalid);
+          break;
+        }
+        offset += artifact->metadata_sizes[i];
+      }
+      if (artifact && offset != artifact->metadata.size()) {
+        auto invalid = artifact;
+        artifact.reset();
+        impl_->stages.Erase(key.key, invalid);
+      }
+    }
   } catch (const std::bad_alloc &) {
     // Optional retention must not fail a successful compiler invocation.
   }
@@ -689,6 +936,18 @@ int DeviceShaderArtifactCache::Compile(
   }
   // Failed flights are not cached. Waiters compile locally to preserve their own error handle.
   return result || sm50_bitcode_t(*output) ? result : compile();
+}
+
+void PublishAutomaticStageArtifact(const std::string &key,
+                                   std::shared_ptr<const ShaderStageArtifact> artifact,
+                                   uint64_t generation) {
+  if (!artifact) return;
+  auto &cache = Automatic();
+  std::lock_guard disk_lock(cache.disk_mutex);
+  auto lock = LockMetadata(cache);
+  const bool allowed = cache.enabled && cache.generation == generation;
+  lock.unlock();
+  if (allowed) WriteAutomaticStageArtifact(key, *artifact);
 }
 
 int DeviceShaderArtifactCache::CompileShader(
@@ -707,7 +966,13 @@ int DeviceShaderArtifactCache::CompileShader(
 WMT::Reference<WMT4::Library> DeviceShaderArtifactCache::Library(
     WMT4::Compiler compiler, const SM50_COMPILED_BITCODE &code, sm50_bitcode_t owner, WMT::Error &error) {
   std::string bytes(code.Size, char(0));
-  if (!SM50ReadCompiledBitcode(owner, SM50_COMPILED_BITCODE_PART_LIBRARY, code.Data, bytes.data(), code.Size)) return {};
+  if (owner) {
+    if (!SM50ReadCompiledBitcode(owner, SM50_COMPILED_BITCODE_PART_LIBRARY, code.Data, bytes.data(), code.Size)) return {};
+  } else {
+    const void *direct = SM50AccessiblePointer(code.Data);
+    if (!direct) return {};
+    std::memcpy(bytes.data(), direct, code.Size);
+  }
   // Device ownership fixes native device/driver identity; compiler handle is an explicit key input.
   StageKeyBuilder key;
   key.add(compiler.handle); key.bytes(bytes.data(), bytes.size());
@@ -742,7 +1007,7 @@ WMT::Reference<WMT4::Function> DeviceShaderArtifactCache::SampleMaskFunction(
 
 HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Digest &key) {
   KeyBuilder hash;
-  hash.add(uint32_t(3), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  hash.add(uint32_t(4), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.CS);
   return hash.finish(key);
@@ -755,7 +1020,7 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
   KeyBuilder hash;
   // 6: Metal 4 compiles UINT logic operations into every owned framebuffer-fetch
   // 7: device atomic64 phase selection changes every participating application stage.
-  hash.add(uint32_t(7), uint32_t(AIRCONV_VERSION), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  hash.add(uint32_t(8), uint32_t(AIRCONV_VERSION), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.VS);
   hash.shader(desc.PS);
@@ -921,22 +1186,8 @@ void PipelineCache::Complete(HRESULT result) noexcept {
   } catch (...) {
     // Tracing must not escape completion/destruction.
   }
-  if (current && SUCCEEDED(result) && blob_ && !flight->disk_hit &&
-      blob_->bytes->GetBufferSize() <= kAutomaticBytes) {
-    try {
-      AutomaticCachePhase phase{"disk_write"};
-      std::lock_guard disk_lock(cache.disk_mutex);
-      auto metadata = LockMetadata(cache);
-      const auto it = cache.entries.find(flight->key);
-      const bool persist = cache.enabled && cache.generation == flight->generation &&
-                           it != cache.entries.end() && it->second.blob == blob_;
-      metadata.unlock();
-      if (persist)
-        WriteAutomaticPipelineCache(flight->key, blob_->bytes.ptr());
-    } catch (...) {
-      // Optional synchronous persistence cannot fail the published flight.
-    }
-  }
+  if (SUCCEEDED(result) && blob_ && current && !flight->disk_hit)
+    cache.Publish(flight->key, flight->generation, blob_);
 }
 
 void PipelineCache::RetryAutomatic(PipelineCache &fresh) {

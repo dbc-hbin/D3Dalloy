@@ -799,6 +799,7 @@ protected:
     SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
     atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
     SM50_SHADER_COMMON_DATA common{};
+    common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
     // The statistics variant counts AS/MS invocations, MS primitives and the clipper (dxil_mesh.cpp).
@@ -927,6 +928,7 @@ protected:
     };
 
     SM50_SHADER_COMMON_DATA common{};
+    common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
     SM50_SHADER_COMPILATION_ARGUMENT_DATA stats{};
@@ -1634,7 +1636,7 @@ public:
     WMT::Reference<WMT4::Function> vs_func, ps_func;
 
     SM50_SHADER_COMMON_DATA common;
-    common.flags = {};
+    common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
     common.next = nullptr;
@@ -2030,6 +2032,7 @@ public:
                                 : index_pull ? indirect_view_index_pull_vertex_constants : indirect_view_vertex_constants;
     SM50Error compile_error;
     SM50_SHADER_COMMON_DATA common{};
+    common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
     SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA locations{};
@@ -2170,6 +2173,7 @@ public:
     if (!pull_vertex_function && !(indirect && view_location_offsets)) {
       SM50Error compile_error;
       SM50_SHADER_COMMON_DATA common{};
+      common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
       SM50_SHADER_COMPILATION_ARGUMENT_DATA pull{};
@@ -2231,6 +2235,7 @@ public:
     if (!statistics_vertex_function && !(indirect && view_location_offsets)) {
       SM50Error compile_error;
       SM50_SHADER_COMMON_DATA common{};
+      common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
       SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics{};
@@ -2317,6 +2322,7 @@ public:
       WMT::Reference<WMT::Error> error;
       SM50Error compile_error;
       SM50_SHADER_COMMON_DATA common{};
+      common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
       SM50_SHADER_D3D12_LOGIC_OP_DATA logic_op = fetch_logic_op;
@@ -2425,6 +2431,7 @@ public:
     auto metal = device_->GetMTLDevice();
     WMT::Reference<WMT::Error> error;
     SM50_SHADER_COMMON_DATA common{};
+    common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
     const auto *vs_root_blob = pull_root_blob.empty() ? pull_vs_bytecode.data() : pull_root_blob.data();

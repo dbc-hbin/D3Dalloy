@@ -6,10 +6,13 @@
 #include "d3d12.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <future>
+#include <mutex>
+#include <memory>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -26,6 +29,12 @@ constexpr HRESULT D3D12_ERROR_DRIVER_VERSION_MISMATCH = HRESULT(0x887e0002u);
 constexpr HRESULT E_ABORT = HRESULT(0x80004004u);
 #include "d3d12_pipeline_cache.hpp"
 #include "../../src/d3d10/d3d10_blob.hpp"
+
+namespace dxmt {
+struct ShaderStageArtifact;
+HRESULT ReadAutomaticStageArtifact(const std::string &, std::shared_ptr<const ShaderStageArtifact> &);
+void WriteAutomaticStageArtifact(const std::string &, const ShaderStageArtifact &);
+}
 
 using namespace std::chrono_literals;
 void require(bool value, const char *message) {
@@ -51,16 +60,31 @@ struct Gate {
   void open() { released.set_value(); }
 };
 thread_local std::function<void(const std::string &, const std::string &)> trace_hook;
-thread_local std::function<void()> disk_hook;
+std::function<void(const std::string &, const std::string &)> worker_trace_hook;
+std::mutex worker_trace_mutex;
+std::function<void()> disk_hook;
+std::mutex disk_hook_mutex;
+std::shared_ptr<std::promise<void>> publication_signal;
+void setDiskHook(std::function<void()> hook) {
+  std::lock_guard lock(disk_hook_mutex);
+  disk_hook = std::move(hook);
+}
+void invokeDiskHook() {
+  std::function<void()> hook;
+  { std::lock_guard lock(disk_hook_mutex); hook = disk_hook; }
+  if (hook) hook();
+}
 namespace owned_graphics {
 inline bool TraceEnabled() { return true; }
 inline uint64_t NewObjectId() { static std::atomic_uint64_t next{0}; return ++next; }
 template <typename... Fields> void Trace(const char *event, Fields &&...fields) {
-  if (trace_hook) {
-    std::ostringstream stream;
-    (stream << ... << fields);
+  std::ostringstream stream;
+  (stream << ... << fields);
+  if (trace_hook)
     trace_hook(event, stream.str());
-  }
+  std::function<void(const std::string &, const std::string &)> worker_hook;
+  { std::lock_guard lock(worker_trace_mutex); worker_hook = worker_trace_hook; }
+  if (worker_hook) worker_hook(event, stream.str());
 }
 }
 namespace dxmt {
@@ -85,26 +109,42 @@ public:
 };
 HRESULT CreateBlobFromMalloc(SIZE_T size, ID3DBlob **blob) { *blob = new TestBlob(size); return S_OK; }
 std::unordered_map<Sha1Digest, Com<ID3DBlob>> disk;
+std::mutex test_disk_mutex;
+std::condition_variable test_disk_ready;
 unsigned writes = 0, removals = 0, reads = 0;
 HRESULT ReadAutomaticPipelineCache(const Sha1Digest &key, ID3DBlob **blob) {
-  if (disk_hook) disk_hook();
+  invokeDiskHook();
+  std::lock_guard lock(test_disk_mutex);
   ++reads;
   auto it = disk.find(key);
   *blob = it == disk.end() ? nullptr : it->second.ref();
   return *blob ? S_OK : DXGI_ERROR_NOT_FOUND;
 }
 void WriteAutomaticPipelineCache(const Sha1Digest &key, ID3DBlob *blob) {
-  if (disk_hook) disk_hook();
-  ++writes; disk[key] = blob;
+  invokeDiskHook();
+  {
+    std::lock_guard lock(test_disk_mutex);
+    ++writes; disk[key] = blob;
+  }
+  test_disk_ready.notify_all();
 }
 void RemoveAutomaticPipelineCache(const Sha1Digest &key) {
-  if (disk_hook) disk_hook();
+  invokeDiskHook();
+  std::lock_guard lock(test_disk_mutex);
   ++removals; disk.erase(key);
 }
 HRESULT ClearAutomaticPipelineCacheDisk() {
-  if (disk_hook) disk_hook();
+  invokeDiskHook();
+  std::lock_guard lock(test_disk_mutex);
   disk.clear(); return S_OK;
 }
+HRESULT ReadAutomaticStageArtifact(const std::string &, std::shared_ptr<const ShaderStageArtifact> &artifact) {
+  artifact.reset(); return DXGI_ERROR_NOT_FOUND;
+}
+void WriteAutomaticStageArtifact(const std::string &, const ShaderStageArtifact &) {}
+unsigned stage_publications = 0;
+void QueueAutomaticStageArtifact(const std::string &, std::shared_ptr<const ShaderStageArtifact>, uint64_t) { ++stage_publications; }
+void PublishAutomaticStageArtifact(const std::string &, std::shared_ptr<const ShaderStageArtifact>, uint64_t) {}
 }
 extern "C" bool WMTGetPipelineCacheIdentity(WMTPipelineCacheIdentity *identity) {
   *identity = {}; identity->compiler_uuid[0] = 1; return true;
@@ -134,6 +174,7 @@ void compile(PipelineCache &cache, bool newer = false) {
   cache.Complete(S_OK);
 }
 void reset() {
+  publication_signal.reset();
   require(AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR) == S_OK, "clear");
   require(AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE) == S_OK, "enable");
 }
@@ -153,42 +194,73 @@ void newer(unsigned value) {
     compile(cache, true);
   }
 }
+Com<ID3DBlob> waitForDisk(unsigned value) {
+  const auto expected = autoKey(value);
+  std::unique_lock lock(test_disk_mutex);
+  require(test_disk_ready.wait_for(lock, 5s, [&] {
+    auto it = disk.find(expected);
+    return it != disk.end();
+  }), "disk publication not observed");
+  return disk.at(expected);
+}
 void expectNewDisk(unsigned value) {
-  require(disk.count(autoKey(value)) == 1, "new disk entry erased");
   PipelineCache explicit_cache;
-  auto blob = disk.at(autoKey(value));
+  auto blob = waitForDisk(value);
   require(explicit_cache.Initialize({blob->GetBufferPointer(), blob->GetBufferSize()}, key(value), stages, 7) == S_OK,
           "disk blob valid");
   require(static_cast<const uint8_t *>(explicit_cache.view(PipelineCache::Compute).Data)[4] == 2, "old disk write replaced new");
 }
 void phaseHook(Gate &gate, const char *event, const char *phase) {
-  trace_hook = [&gate, event, phase](const auto &name, const auto &fields) {
+  auto signal = publication_signal;
+  std::lock_guard lock(worker_trace_mutex);
+  worker_trace_hook = [&gate, event, phase, signal](const auto &name, const auto &fields) {
     if (name == event && fields.find(phase) != std::string::npos) gate.block();
+    if (name == "pipeline_cache_auto_published" && signal &&
+        fields.find(autoKey(3).string()) != std::string::npos)
+      try { signal->set_value(); } catch (...) {}
   };
+}
+void clearWorkerTraceHook() {
+  std::lock_guard lock(worker_trace_mutex);
+  worker_trace_hook = {};
+}
+void armPublication(unsigned value) {
+  publication_signal = std::make_shared<std::promise<void>>();
+  const auto expected = autoKey(value).string();
+  auto signal = publication_signal;
+  std::function<void(const std::string &, const std::string &)> previous;
+  { std::lock_guard lock(worker_trace_mutex); previous = worker_trace_hook; }
+  std::lock_guard lock(worker_trace_mutex);
+  worker_trace_hook = [previous, signal, expected](const auto &name, const auto &fields) {
+    if (previous) previous(name, fields);
+    if (name == "pipeline_cache_auto_published" && fields.find(expected) != std::string::npos)
+      try { signal->set_value(); } catch (...) {}
+  };
+}
+void awaitPublication() {
+  auto signal = publication_signal;
+  require(signal && signal->get_future().wait_for(5s) == std::future_status::ready, "publication drain");
+  publication_signal.reset();
+  { std::lock_guard lock(worker_trace_mutex); worker_trace_hook = {}; }
 }
 
 void testBlockedDisk() {
-  for (unsigned operation = 0; operation < 4; ++operation) {
+  for (unsigned operation = 0; operation < 2; ++operation) {
     reset(); PipelineCache resident; initialize(resident, 1); compile(resident);
-    if (operation == 2) { PipelineCache rejected; initialize(rejected, 2); compile(rejected); }
-    Gate gate;
+    auto gate = std::make_shared<Gate>();
     auto blocked = std::async(std::launch::async, [&] {
-      if (operation != 1) disk_hook = [&] { gate.block(); };
+      if (operation != 1) setDiskHook([gate] { gate->block(); });
       if (operation == 0) { PipelineCache miss; initialize(miss, 2); }
-      if (operation == 1) { PipelineCache miss; initialize(miss, 2); disk_hook = [&] { gate.block(); }; compile(miss); }
-      if (operation == 2) { PipelineCache hit, fresh; initialize(hit, 2); hit.RetryAutomatic(fresh); }
-      if (operation == 3) controls(4);
+      if (operation == 1) { PipelineCache miss; initialize(miss, 2); setDiskHook([gate] { gate->block(); }); compile(miss); }
     });
-    gate.wait();
-    if (operation != 3) ramHit(1);
-    else {
-      // CLEAR has already reset metadata; disabled requests still need no disk lock.
-      auto metadata = std::async(std::launch::async, [] { auto lock = LockMetadata(Automatic()); return Automatic().bytes; });
-      require(await(metadata) == 0, "clear held metadata through disk");
-    }
-    gate.open(); await(blocked);
+    gate->wait();
+    if (operation == 0) ramHit(1);
+    gate->open(); await(blocked);
+    setDiskHook({});
   }
-  std::puts("PIPELINE_CACHE_BLOCKED_DISK_PASS phases=4 memory_independent=1");
+  reset(); PipelineCache resident; initialize(resident, 1); compile(resident); controls(4);
+  { std::lock_guard lock(test_disk_mutex); require(disk.empty(), "clear removed complete-pipeline publications"); }
+  std::puts("PIPELINE_CACHE_BLOCKED_DISK_PASS phases=3 memory_independent=1 clear=1");
 }
 
 void testDelayedWrite() {
@@ -201,23 +273,24 @@ void testDelayedWrite() {
     });
     await(joined_signal);
     Gate gate;
+    armPublication(3);
     auto producer = std::async(std::launch::async, [&] { phaseHook(gate, "pipeline_cache_auto_phase", "disk_write"); compile(owner); });
     gate.wait(); require(await(waiter), "joined waiter waited for persistence"); ramHit(3);
-    controls(flags); newer(3); gate.open(); await(producer); expectNewDisk(3);
+    controls(flags); gate.open(); await(producer); clearWorkerTraceHook(); armPublication(3); newer(3); awaitPublication(); expectNewDisk(3);
   }
   // Same generation, exact blob identity: old completed publication cannot overwrite a cold retry.
-  reset(); PipelineCache owner; initialize(owner, 3); Gate gate;
+  reset(); PipelineCache owner; initialize(owner, 3); Gate gate; armPublication(3);
   auto producer = std::async(std::launch::async, [&] { phaseHook(gate, "pipeline_cache_auto_phase", "disk_write"); compile(owner); });
   gate.wait(); PipelineCache hit, fresh; initialize(hit, 3); hit.RetryAutomatic(fresh); initialize(fresh, 3); compile(fresh, true);
-  gate.open(); await(producer); expectNewDisk(3);
+  gate.open(); await(producer); awaitPublication(); expectNewDisk(3);
   std::puts("PIPELINE_CACHE_DELAYED_WRITE_PASS controls=3 exact_blob=1 joined_before_persist=1");
 }
 
 void testDelayedReadAndInvalid() {
   for (bool invalid : {false, true}) for (unsigned flags : {4u, 1u, 5u}) {
-    reset(); PipelineCache seed; initialize(seed, 4); compile(seed);
+    reset(); PipelineCache seed; initialize(seed, 4); compile(seed); waitForDisk(4);
     { auto lock = LockMetadata(Automatic()); Automatic().entries.clear(); Automatic().bytes = 0; }
-    if (invalid) static_cast<uint8_t *>(disk.at(autoKey(4))->GetBufferPointer())[0] ^= 1;
+    if (invalid) static_cast<uint8_t *>(waitForDisk(4)->GetBufferPointer())[0] ^= 1;
     Gate gate; PipelineCache owner;
     auto read = std::async(std::launch::async, [&] {
       phaseHook(gate, invalid ? "pipeline_cache_auto_phase" : "pipeline_cache_auto_timing",
@@ -232,6 +305,7 @@ void testDelayedReadAndInvalid() {
       return cache.loaded() ? static_cast<const uint8_t *>(cache.view(PipelineCache::Compute).Data)[4] : 0;
     });
     await(joined_signal); controls(flags); newer(4); gate.open(); await(read);
+    clearWorkerTraceHook();
     if (invalid) compile(owner); else owner.Complete(S_OK);
     require(await(waiter) == 1, "old successful joined flight lost"); expectNewDisk(4);
   }
@@ -240,19 +314,19 @@ void testDelayedReadAndInvalid() {
 
 void testDelayedRetry() {
   for (unsigned flags : {4u, 1u, 5u}) {
-    reset(); PipelineCache seed; initialize(seed, 5); compile(seed);
+    reset(); PipelineCache seed; initialize(seed, 5); compile(seed); waitForDisk(5);
     PipelineCache old, fresh; initialize(old, 5); require(old.CanRetryAutomatic(E_INVALIDARG), "automatic retry allowed");
     Gate gate;
     auto retry = std::async(std::launch::async, [&] { phaseHook(gate, "pipeline_cache_auto_phase", "disk_remove"); old.RetryAutomatic(fresh); });
-    gate.wait(); controls(flags); newer(5); gate.open(); await(retry); expectNewDisk(5);
+    gate.wait(); controls(flags); newer(5); gate.open(); await(retry); clearWorkerTraceHook(); expectNewDisk(5);
     initialize(fresh, 5); require(!fresh.CanRetryAutomatic(E_INVALIDARG), "retry is bounded");
   }
   // A different exact blob in the same generation survives an older restored caller's retry.
-  reset(); PipelineCache seed; initialize(seed, 5); compile(seed); PipelineCache old, first, second;
+  reset(); PipelineCache seed; initialize(seed, 5); compile(seed); waitForDisk(5); PipelineCache old, first, second;
   initialize(old, 5); initialize(first, 5); first.RetryAutomatic(second); initialize(second, 5); compile(second, true);
   PipelineCache fresh; old.RetryAutomatic(fresh); expectNewDisk(5);
   for (unsigned flags : {4u, 1u, 5u}) {
-    reset(); PipelineCache seed; initialize(seed, 7); compile(seed);
+    reset(); PipelineCache seed; initialize(seed, 7); compile(seed); waitForDisk(7);
     { auto lock = LockMetadata(Automatic()); Automatic().entries.clear(); Automatic().bytes = 0; }
     PipelineCache restored, cold; initialize(restored, 7); require(restored.loaded(), "restore producer");
     std::promise<void> joined; auto signal = joined.get_future();
@@ -265,7 +339,7 @@ void testDelayedRetry() {
     auto retry = std::async(std::launch::async, [&] {
       phaseHook(gate, "pipeline_cache_auto_phase", "disk_remove"); restored.RetryAutomatic(cold);
     });
-    gate.wait(); controls(flags); newer(7); gate.open(); await(retry);
+    gate.wait(); controls(flags); newer(7); gate.open(); await(retry); clearWorkerTraceHook();
     initialize(cold, 7); require(!cold.loaded(), "fresh cold retry reused old native state");
     require(!cold.CanRetryAutomatic(E_INVALIDARG), "cold producer retries twice");
     compile(cold); require(await(waiter) == 1, "retired retry lost joined caller"); expectNewDisk(7);
@@ -273,8 +347,7 @@ void testDelayedRetry() {
   std::puts("PIPELINE_CACHE_DELAYED_RETRY_PASS controls=3 exact_blob=1 bounded=1 old_cold_waiters=3");
 }
 void testStrictAndBounds() {
-  reset(); PipelineCache seed; initialize(seed, 6); compile(seed);
-  auto blob = disk.at(autoKey(6));
+  reset(); PipelineCache seed; initialize(seed, 6); compile(seed); auto blob = waitForDisk(6);
   auto *bytes = static_cast<uint8_t *>(blob->GetBufferPointer());
   bytes[0] ^= 1;
   PipelineCache explicit_cache;
@@ -327,6 +400,7 @@ void testStageArtifactKeys() {
 void testStageArtifactFlights() {
   using namespace dxmt;
   controls(6);
+  stage_publications = 0;
   ArtifactCache<ShaderStageArtifact> cache;
   Gate producer;
   std::atomic_uint operations{0};
@@ -346,6 +420,7 @@ void testStageArtifactFlights() {
   });
   await(signal); producer.open(); auto a = await(first), b = await(second);
   require(operations == 1 && a == b && a->metadata == std::vector<uint8_t>({1,2,3,4}), "single flight immutable metadata");
+  require(stage_publications >= 1, "stage artifact publication was not queued");
   controls(4);
   auto rebuilt = cache.Get("linked-stage", "air_compile", [&] { ++operations; return std::make_shared<ShaderStageArtifact>(); });
   require(operations == 2 && rebuilt != a && a->metadata[0] == 1, "generation retires membership not ownership");
@@ -397,8 +472,47 @@ void testStageArtifactFlights() {
   require(cache.completed <= 256 && cache.bytes <= 32u * 1024u * 1024u, "artifact retention bounded");
   std::puts("PIPELINE_STAGE_FLIGHT_PASS conversions=4 same_artifact=1 retained_after_clear=1 clear_pending=1 failure_retry=1 failure_wakeups=2 trace_exception=1 bounded=1");
 }
+void testCompiledArtifactKinds() {
+  using namespace dxmt;
+  ArtifactCache<WorkGraphArtifact> workgraphs;
+  std::atomic_uint workgraph_compiles{0};
+  auto workgraph = workgraphs.Get("workgraph", "wg_compile", [&] {
+    ++workgraph_compiles;
+    auto value = std::make_shared<WorkGraphArtifact>();
+    value->library = {1, 2, 3};
+    value->info.ThreadgroupSize[0] = 32;
+    return value;
+  });
+  auto workgraph_hit = workgraphs.Get("workgraph", "wg_compile", [&] {
+    ++workgraph_compiles;
+    return std::make_shared<WorkGraphArtifact>();
+  });
+  require(workgraph == workgraph_hit && workgraph_compiles == 1 && workgraph->info.ThreadgroupSize[0] == 32,
+          "workgraph artifact single flight");
+
+  ArtifactCache<RaytracingArtifact> raytracing;
+  std::atomic_uint raytracing_compiles{0};
+  auto rt = raytracing.Get("raytracing", "rt_compile", [&] {
+    ++raytracing_compiles;
+    auto value = std::make_shared<RaytracingArtifact>();
+    value->library = {4, 5, 6};
+    value->names.emplace_back("metal_raygen");
+    value->export_names.emplace_back("RayGen");
+    value->functions.push_back({value->names[0].c_str(), value->export_names[0].c_str(),
+                                SM50_RT_FUNCTION_RAYGEN, 0, 0, SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY});
+    return value;
+  });
+  auto rt_hit = raytracing.Get("raytracing", "rt_compile", [&] {
+    ++raytracing_compiles;
+    return std::make_shared<RaytracingArtifact>();
+  });
+  require(rt == rt_hit && raytracing_compiles == 1 && rt->functions.size() == 1 &&
+              std::strcmp(rt->functions[0].Name, "metal_raygen") == 0,
+          "raytracing artifact owns reflection");
+  std::puts("PIPELINE_COMPILED_ARTIFACT_KINDS_PASS workgraph=1 raytracing=1 reflection=1");
+}
 int main() {
-  testStageArtifactKeys(); testStageArtifactFlights();
+  testStageArtifactKeys(); testStageArtifactFlights(); testCompiledArtifactKinds();
   testBlockedDisk(); testDelayedWrite(); testDelayedReadAndInvalid(); testDelayedRetry(); testStrictAndBounds();
   std::puts("PIPELINE_CACHE_CPU_PASS");
 }

@@ -1658,6 +1658,8 @@ void testRootSignature12(Gpu &g) {
   EXPECT(up->Version == kVersion_1_2 && up->Desc_1_2.NumStaticSamplers == 1 && up->Desc_1_2.pStaticSamplers[0].Flags == 0 &&
              up->Desc_1_2.pStaticSamplers[0].base.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
          "1.1 desc at 1.2 wrong");
+  EXPECT(deserializer11->GetRootSignatureDescAtVersion(kVersion_1_2, nullptr) == E_INVALIDARG,
+         "null versioned root-signature output accepted");
   EXPECT(deserializer11->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION(4), &at12) == E_INVALIDARG,
          "version 4 accepted");
 

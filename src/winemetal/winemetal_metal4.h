@@ -80,6 +80,8 @@ enum WMTMetal4Operation : uint32_t {
   WMTMetal4SetTextureView = 47,
   WMTMetal4CopyTextureViews = 48,
   WMTMetal4ClearTextureView = 49,
+  /* Append-only: args[0..4] are dst, src, src index, dst index, count. */
+  WMTMetal4CopyTextureViewsRange = 50,
 };
 enum WMTMetal4Stages : uint64_t {
   WMTMetal4StageVertex = 1ull << 0,
@@ -137,6 +139,7 @@ int32_t winemetal_metal4_pipeline_call(struct WMTMetal4Call *params);
 int32_t winemetal_metal4_query_call(struct WMTMetal4Call *params);
 int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *params);
 id<MTL4CommandBuffer> winemetal_metal4_command_buffer(obj_handle_t handle);
+int32_t winemetal_metal4_reserve_present(struct WMTMetal4Call *call);
 void winemetal_composition_drawables(id drawable, id<CAMetalDrawable> *primary, id<CAMetalDrawable> *residual);
 void *winemetal_metal4_split_command_buffer(void *context);
 id<MTL4ComputeCommandEncoder> winemetal_metal4_compute_encoder(obj_handle_t handle);

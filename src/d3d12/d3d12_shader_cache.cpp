@@ -14,6 +14,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#include <limits>
 
 namespace dxmt {
 namespace {
@@ -323,6 +327,44 @@ HRESULT Paths(bool working_directory, std::wstring &directory, std::wstring &exe
 
 constexpr uint64_t kAutomaticEntryBytes = 64ull * 1024 * 1024;
 constexpr uint64_t kAutomaticDiskBytes = 256ull * 1024 * 1024;
+constexpr uint64_t kStageMagic = 0x314754534d584444ull; // DDXMSTG1
+constexpr uint32_t kStageVersion = 2;
+constexpr uint64_t kStageEntryBytes = 8ull * 1024 * 1024;
+constexpr uint64_t kStageDiskBytes = 256ull * 1024 * 1024;
+
+struct StageFileHeader {
+  uint64_t magic;
+  uint32_t version;
+  uint32_t key_size;
+  uint64_t library_size;
+  uint64_t metadata_size;
+  uint64_t constants_size;
+  uint64_t constant_alignment;
+  uint64_t relocations_size;
+  WMTPipelineCacheIdentity identity;
+  Sha1Digest checksum;
+};
+static_assert(sizeof(StageFileHeader) % 8 == 0);
+bool StageIdentity(WMTPipelineCacheIdentity &identity) { return WMTGetPipelineCacheIdentity(&identity); }
+bool StageDiskHasRoom(const std::wstring &directory, const std::wstring &path, uint64_t incoming) {
+  WIN32_FIND_DATAW data{};
+  const auto pattern = directory + L"dxmt-stage-*";
+  HANDLE search = FindFirstFileW(pattern.c_str(), &data);
+  if (search == INVALID_HANDLE_VALUE) {
+    return GetLastError() == ERROR_FILE_NOT_FOUND && incoming <= kStageDiskBytes;
+  }
+  uint64_t total = 0;
+  do {
+    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    const auto current = directory + data.cFileName;
+    if (current != path)
+      total += (uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+  } while (FindNextFileW(search, &data));
+  const DWORD enumeration_error = GetLastError();
+  FindClose(search);
+  if (enumeration_error != ERROR_NO_MORE_FILES) return false;
+  return total <= kStageDiskBytes && incoming <= kStageDiskBytes - total;
+}
 
 struct FileHandle {
   HANDLE value = INVALID_HANDLE_VALUE;
@@ -581,6 +623,219 @@ void WriteAutomaticPipelineCache(const Sha1Digest &key, ID3DBlob *blob) {
   } catch (const std::bad_alloc &) {} // Persistence must never turn successful compilation into failure.
 }
 
+HRESULT ReadAutomaticStageArtifact(const std::string &key, std::shared_ptr<const ShaderStageArtifact> &artifact) {
+  artifact.reset();
+  if (key.empty() || key.size() > UINT32_MAX) return E_INVALIDARG;
+  try {
+    std::wstring directory, executable;
+    if (FAILED(Paths(false, directory, executable))) return E_FAIL;
+    const auto digest = Sha1HashState::compute(key.data(), key.size());
+    const auto path = directory + L"dxmt-stage-" + Hex(digest.data, sizeof(digest.data)) + L".bin";
+    const FileHandle file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
+    if (file.value == INVALID_HANDLE_VALUE) return DXGI_ERROR_NOT_FOUND;
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(file.value, &size) || size.QuadPart < static_cast<LONGLONG>(sizeof(StageFileHeader)) ||
+        uint64_t(size.QuadPart) > kStageEntryBytes) return E_FAIL;
+    StageFileHeader header{};
+    WMTPipelineCacheIdentity identity{};
+    if (!Seek(file.value, 0) || !Read(file.value, &header, sizeof(header)) || header.magic != kStageMagic ||
+        header.version != kStageVersion || header.key_size != key.size() || !StageIdentity(identity) ||
+        memcmp(&header.identity, &identity, sizeof(identity))) return E_FAIL;
+    const uint64_t payload = uint64_t(header.key_size) + header.library_size + header.metadata_size +
+                             header.constants_size + header.relocations_size;
+    if (payload > kStageEntryBytes - sizeof(header) || sizeof(header) + payload != uint64_t(size.QuadPart) ||
+        header.library_size < 4 || header.library_size > UINT32_MAX || header.metadata_size > UINT32_MAX ||
+        !header.constant_alignment || (header.constant_alignment & (header.constant_alignment - 1)) ||
+        header.constant_alignment > UINT32_MAX || (!header.constants_size && header.constant_alignment != 1) ||
+        header.constants_size > UINT32_MAX || header.relocations_size > UINT32_MAX ||
+        header.constants_size % sizeof(uint64_t) || header.relocations_size % sizeof(SM50_CONSTANT_RELOCATION) ||
+        header.relocations_size > header.constants_size / sizeof(uint64_t) * sizeof(SM50_CONSTANT_RELOCATION)) return E_FAIL;
+    std::vector<uint8_t> bytes(payload);
+    if (!Read(file.value, bytes.data(), DWORD(bytes.size()))) return E_FAIL;
+    Sha1HashState checksum;
+    const auto checksum_header = [&] { auto copy = header; copy.checksum = {}; return copy; }();
+    checksum.update(&checksum_header, offsetof(StageFileHeader, checksum)).update(bytes.data(), bytes.size());
+    if (checksum.final() != header.checksum || memcmp(bytes.data(), key.data(), key.size())) return E_FAIL;
+    auto value = std::make_shared<ShaderStageArtifact>();
+    size_t offset = key.size();
+    const size_t library_end = offset + header.library_size;
+    value->library.assign(bytes.begin() + offset, bytes.begin() + library_end);
+    offset = library_end;
+    if (memcmp(value->library.data(), "MTLB", 4)) return E_FAIL;
+    if (header.metadata_size < sizeof(uint32_t)) return E_FAIL;
+    uint32_t metadata_count = 0;
+    memcpy(&metadata_count, bytes.data() + offset, sizeof(metadata_count));
+    const uint64_t metadata_sizes_bytes = uint64_t(metadata_count) * sizeof(uint32_t);
+    if (metadata_sizes_bytes > header.metadata_size - sizeof(uint32_t)) return E_FAIL;
+    const size_t metadata_data_offset = offset + sizeof(uint32_t) + size_t(metadata_sizes_bytes);
+    const size_t metadata_data_size = header.metadata_size - sizeof(uint32_t) - size_t(metadata_sizes_bytes);
+    value->metadata_sizes.resize(metadata_count);
+    memcpy(value->metadata_sizes.data(), bytes.data() + offset + sizeof(uint32_t), size_t(metadata_sizes_bytes));
+    uint64_t metadata_sum = 0;
+    for (uint32_t metadata_size : value->metadata_sizes) {
+      metadata_sum += metadata_size;
+      if (metadata_sum > metadata_data_size) return E_FAIL;
+    }
+    if (metadata_sum != metadata_data_size) return E_FAIL;
+    value->metadata.assign(bytes.begin() + metadata_data_offset, bytes.begin() + metadata_data_offset + metadata_data_size);
+    offset += header.metadata_size;
+    value->constants.resize(header.constants_size / sizeof(uint64_t));
+    memcpy(value->constants.data(), bytes.data() + offset, header.constants_size); offset += header.constants_size;
+    value->relocations.resize(header.relocations_size / sizeof(SM50_CONSTANT_RELOCATION));
+    memcpy(value->relocations.data(), bytes.data() + offset, header.relocations_size);
+    for (const auto &relocation : value->relocations) {
+      if (header.constants_size < sizeof(uint64_t) ||
+          relocation.Offset > header.constants_size - sizeof(uint64_t) ||
+          (relocation.TargetOffset > header.constants_size &&
+           relocation.TargetOffset != SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE &&
+           relocation.TargetOffset != SM50_CONSTANT_RELOCATION_TARGET_ATOMIC64_CONTEXT)) return E_FAIL;
+    }
+    value->view.Data = value->library.data(); value->view.Size = value->library.size();
+    value->view.ConstantData = value->constants.empty() ? nullptr : value->constants.data();
+    value->view.ConstantDataSize = header.constants_size; value->view.ConstantDataAlignment = header.constant_alignment;
+    value->view.ConstantRelocations = value->relocations.empty() ? nullptr : value->relocations.data();
+    value->view.ConstantRelocationCount = value->relocations.size();
+    artifact = std::move(value);
+    return S_OK;
+  } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
+}
+
+void WriteAutomaticStageArtifact(const std::string &key, const ShaderStageArtifact &artifact) {
+  if (key.empty() || key.size() > UINT32_MAX || artifact.library.size() < 4 || artifact.library.size() > UINT32_MAX ||
+      artifact.metadata.size() > UINT32_MAX || artifact.constants.size() > UINT32_MAX / sizeof(uint64_t) ||
+      artifact.relocations.size() > UINT32_MAX / sizeof(SM50_CONSTANT_RELOCATION)) return;
+  if (artifact.metadata_sizes.size() > UINT32_MAX / sizeof(uint32_t)) return;
+  uint64_t metadata_sizes_bytes = artifact.metadata_sizes.size() * sizeof(uint32_t);
+  uint64_t metadata_sum = 0;
+  for (uint32_t metadata_size : artifact.metadata_sizes) {
+    metadata_sum += metadata_size;
+    if (metadata_sum > artifact.metadata.size()) return;
+  }
+  if (metadata_sum != artifact.metadata.size()) return;
+  const uint64_t encoded_metadata_size = sizeof(uint32_t) + metadata_sizes_bytes + artifact.metadata.size();
+  if (encoded_metadata_size > UINT32_MAX) return;
+  std::vector<uint8_t> encoded_metadata((size_t(encoded_metadata_size)));
+  const uint32_t metadata_count = uint32_t(artifact.metadata_sizes.size());
+  memcpy(encoded_metadata.data(), &metadata_count, sizeof(metadata_count));
+  if (metadata_sizes_bytes)
+    memcpy(encoded_metadata.data() + sizeof(metadata_count), artifact.metadata_sizes.data(), size_t(metadata_sizes_bytes));
+  if (!artifact.metadata.empty())
+    memcpy(encoded_metadata.data() + sizeof(metadata_count) + size_t(metadata_sizes_bytes), artifact.metadata.data(), artifact.metadata.size());
+  const uint64_t payload = key.size() + artifact.library.size() + encoded_metadata.size() +
+                           artifact.constants.size() * sizeof(uint64_t) + artifact.relocations.size() * sizeof(SM50_CONSTANT_RELOCATION);
+  WMTPipelineCacheIdentity identity{};
+  if (payload > kStageEntryBytes - sizeof(StageFileHeader) || !StageIdentity(identity) || !artifact.view.ConstantDataAlignment ||
+      (artifact.view.ConstantDataAlignment & (artifact.view.ConstantDataAlignment - 1)) ||
+      (!artifact.constants.size() && artifact.view.ConstantDataAlignment != 1)) return;
+  try {
+    std::wstring directory, executable;
+    if (FAILED(Paths(false, directory, executable))) return;
+    AutomaticDiskLock disk_lock;
+    if (FAILED(disk_lock.acquire(directory))) return;
+    const auto digest = Sha1HashState::compute(key.data(), key.size());
+    const auto path = directory + L"dxmt-stage-" + Hex(digest.data, sizeof(digest.data)) + L".bin";
+    static std::atomic<uint32_t> sequence{0};
+    const uint32_t pid = GetCurrentProcessId(), serial = ++sequence;
+    const auto temp = path + L"-" + Hex(&pid, sizeof(pid)) + L"-" + Hex(&serial, sizeof(serial)) + L".tmp";
+    if (!StageDiskHasRoom(directory, path, sizeof(StageFileHeader) + payload)) return;
+    FileHandle file{CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    if (file.value == INVALID_HANDLE_VALUE) return;
+    StageFileHeader header{kStageMagic, kStageVersion, uint32_t(key.size()), artifact.library.size(), encoded_metadata.size(),
+                           artifact.constants.size() * sizeof(uint64_t), artifact.view.ConstantDataAlignment,
+                           artifact.relocations.size() * sizeof(SM50_CONSTANT_RELOCATION),
+                           identity, {}};
+    Sha1HashState checksum;
+    checksum.update(&header, offsetof(StageFileHeader, checksum)).update(key.data(), key.size())
+      .update(artifact.library.data(), artifact.library.size()).update(encoded_metadata.data(), encoded_metadata.size())
+      .update(artifact.constants.data(), header.constants_size).update(artifact.relocations.data(), header.relocations_size);
+    header.checksum = checksum.final();
+    if (!Write(file.value, &header, sizeof(header)) || !Write(file.value, key.data(), DWORD(key.size())) ||
+        !Write(file.value, artifact.library.data(), DWORD(artifact.library.size())) ||
+        !Write(file.value, encoded_metadata.data(), DWORD(encoded_metadata.size())) ||
+        !Write(file.value, artifact.constants.data(), DWORD(header.constants_size)) ||
+        !Write(file.value, artifact.relocations.data(), DWORD(header.relocations_size)) || !FlushFileBuffers(file.value)) {
+      CloseHandle(file.value); file.value = INVALID_HANDLE_VALUE;
+      DeleteFileW(temp.c_str()); return;
+    }
+    CloseHandle(file.value); file.value = INVALID_HANDLE_VALUE;
+    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+      DeleteFileW(temp.c_str());
+  } catch (...) {}
+}
+
+class StageArtifactWriter {
+  struct Job {
+    std::string key;
+    std::shared_ptr<const ShaderStageArtifact> artifact;
+    uint64_t generation;
+  };
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<Job> jobs_;
+  bool stop_ = false;
+  std::thread thread_;
+  std::thread StartWorker() {
+    try {
+      return std::thread([this] {
+    for (;;) {
+      Job job;
+      {
+        std::unique_lock lock(mutex_);
+        ready_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
+        if (jobs_.empty()) {
+          if (stop_) return;
+          continue;
+        }
+        job = std::move(jobs_.front());
+        jobs_.pop_front();
+        ready_.notify_all();
+      }
+      try {
+        PublishAutomaticStageArtifact(job.key, std::move(job.artifact), job.generation);
+      } catch (...) {
+        // Optional persistence must not terminate the worker or the producer process.
+      }
+    }
+      });
+    } catch (...) {
+      stop_ = true;
+      return {};
+    }
+  }
+public:
+  StageArtifactWriter() : thread_(StartWorker()) {}
+  ~StageArtifactWriter() {
+    {
+      std::lock_guard lock(mutex_);
+      stop_ = true;
+    }
+    ready_.notify_all();
+    if (thread_.joinable()) thread_.join();
+  }
+  void enqueue(std::string key, std::shared_ptr<const ShaderStageArtifact> artifact, uint64_t generation) noexcept {
+    try {
+      std::unique_lock lock(mutex_);
+      constexpr size_t limit = 8;
+      if (stop_ || jobs_.size() >= limit) return;
+      jobs_.push_back({std::move(key), std::move(artifact), generation});
+    } catch (...) {
+    }
+    ready_.notify_one();
+  }
+};
+
+StageArtifactWriter &StageArtifactWriterInstance() {
+  static StageArtifactWriter writer;
+  return writer;
+}
+
+void QueueAutomaticStageArtifact(const std::string &key, std::shared_ptr<const ShaderStageArtifact> artifact,
+                                 uint64_t generation) {
+  if (artifact) StageArtifactWriterInstance().enqueue(key, std::move(artifact), generation);
+}
+
+
 void RemoveAutomaticPipelineCache(const Sha1Digest &key) {
   try {
     std::wstring directory, executable;
@@ -605,6 +860,21 @@ HRESULT ClearAutomaticPipelineCacheDisk() {
     std::vector<AutomaticDiskEntry> unused;
     uint64_t total = 0;
     hr = AutomaticDiskEntries(directory, unused, total, true);
+    if (SUCCEEDED(hr)) {
+      WIN32_FIND_DATAW info{};
+      HANDLE search = FindFirstFileW((directory + L"dxmt-stage-*").c_str(), &info);
+      if (search != INVALID_HANDLE_VALUE) {
+        const SearchHandle search_handle{search};
+        do {
+          if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+              !DeleteFileW((directory + info.cFileName).c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND)
+            return FileError();
+        } while (FindNextFileW(search, &info));
+        if (GetLastError() != ERROR_NO_MORE_FILES) return FileError();
+      } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+        return FileError();
+      }
+    }
     if (SUCCEEDED(hr)) {
       lock.accounting->bytes = 0;
       lock.accounting->valid = 1;

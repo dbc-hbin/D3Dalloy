@@ -8,6 +8,7 @@ enum WMTMetal4FXOperation {
   WMTMetal4FXCreateTemporal = 225,
   WMTMetal4FXEncodeTemporal = 226,
   WMTMetal4FXPresentDrawable = 227, /* args: drawable, double duration bits, CPU composition frame, sync interval, allow tearing (0/1) */
+  WMTMetal4FXReservePresent = 230, /* args: MTL4 command buffer, drawable, duration bits, composition frame, sync, tearing, restart token, epoch */
   WMTMetal4FXPrepareTemporal = 228,
   WMTMetal4FXDormantTemporal = 229,
 };

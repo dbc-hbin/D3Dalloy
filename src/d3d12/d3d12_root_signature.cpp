@@ -522,6 +522,8 @@ public:
   GetRootSignatureDescAtVersion(
       D3D_ROOT_SIGNATURE_VERSION Version, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC **ppDesc
   ) {
+    if (!ppDesc)
+      return E_INVALIDARG;
     switch (Version) {
     case D3D_ROOT_SIGNATURE_VERSION_1_0:
       *ppDesc = &impl_.desc_1_0_;

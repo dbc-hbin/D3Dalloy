@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d12_device_child.hpp"
+#include "d3d12_pipeline_cache.hpp"
 #include "dxil_workgraph.h"
 #include <memory>
 #include <functional>
@@ -32,6 +33,7 @@ public:
     Com<MTLD3D12RootSignature> local_root;
     Com<MTLD3D12RootSignature> global_root;
     WMT::Reference<WMT::ComputePipelineState> pipeline;
+    std::shared_ptr<const WorkGraphArtifact> compiled_artifact;
     ShaderImmutableConstants constants;
     WMTSize threads{};
     bool atomic64_phase = false;

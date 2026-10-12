@@ -127,6 +127,9 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
               call->args[4] != 0);
           return 0;
         }
+        case WMTMetal4FXReservePresent: {
+          return winemetal_metal4_reserve_present(call);
+        }
         default: return int32_t(0xc0000002);
         }
       }

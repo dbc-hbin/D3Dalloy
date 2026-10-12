@@ -3,11 +3,14 @@
 #include "d3d12_pipeline.hpp"
 #include "sha1/sha1_util.hpp"
 #include "Metal4Pipeline.hpp"
+#include "dxil_raytracing.h"
+#include "dxil_workgraph.h"
 #include <d3d12.h>
 #include <array>
 #include <memory>
 #include <functional>
 #include <initializer_list>
+#include <string>
 
 namespace dxmt {
 
@@ -31,6 +34,7 @@ struct AutomaticPipelineCacheFlight;
 struct PipelineCacheStorage;
 struct ShaderStageArtifact {
   std::vector<uint8_t> library, metadata;
+  std::vector<uint32_t> metadata_sizes;
   std::vector<uint64_t> constants;
   std::vector<SM50_CONSTANT_RELOCATION> relocations;
   SM50_COMPILED_BITCODE view{};
@@ -40,6 +44,22 @@ struct ShaderStageArtifact {
   }
 };
 class DeviceShaderArtifactCache;
+
+// CPU-only output; every consumer creates its own native objects and relocated constants.
+struct WorkGraphArtifact : ShaderStageArtifact {
+  SM50_WG_NODE_COMPILED_INFO info{};
+  size_t size() const { return ShaderStageArtifact::size() + sizeof(info); }
+};
+struct RaytracingArtifact : ShaderStageArtifact {
+  std::vector<SM50_RT_FUNCTION_INFO> functions;
+  std::vector<std::string> names, export_names;
+  size_t size() const {
+    size_t bytes = ShaderStageArtifact::size() + functions.size() * sizeof(SM50_RT_FUNCTION_INFO);
+    for (const auto &name : names) bytes += name.size();
+    for (const auto &name : export_names) bytes += name.size();
+    return bytes;
+  }
+};
 
 // Cold uncached PSOs retain compiler-owned bytes. Restored/automatic PSOs use
 // immutable serialized storage; neither representation contains GPU addresses.
@@ -94,6 +114,13 @@ public:
   ~DeviceShaderArtifactCache();
   DeviceShaderArtifactCache(const DeviceShaderArtifactCache &) = delete;
   DeviceShaderArtifactCache &operator=(const DeviceShaderArtifactCache &) = delete;
+  int CompileWorkGraph(const SM50_WG_NODE_COMPILE_DESC &desc, sm50_bitcode_t *output,
+      SM50_COMPILED_BITCODE &code, SM50_WG_NODE_COMPILED_INFO &info, sm50_error_t *error,
+      std::shared_ptr<const WorkGraphArtifact> &artifact, bool bypass = false);
+  int CompileRaytracing(const SM50_RT_PIPELINE_DESC &desc, sm50_bitcode_t *output,
+      SM50_COMPILED_BITCODE &code, std::vector<SM50_RT_FUNCTION_INFO> &functions,
+      uint32_t &count, sm50_error_t *error, std::shared_ptr<const RaytracingArtifact> &artifact,
+      bool bypass = false);
   HRESULT Reflect(D3D12_SHADER_BYTECODE source, sm50_shader_t *shader, MTL_SHADER_REFLECTION &reflection,
                   std::vector<MTL_SM50_SHADER_ARGUMENT> *bindings);
   bool RasterOrderedMarker(D3D12_SHADER_BYTECODE source, D3D12_SHADER_BYTECODE root, sm50_shader_t shader);

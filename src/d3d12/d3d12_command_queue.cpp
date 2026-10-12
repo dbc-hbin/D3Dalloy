@@ -846,6 +846,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       double after = 0;
       uint32_t sync_interval = 0;
       bool allow_tearing = false;
+      bool native_present_attempted = false;
+      bool native_present_reserved = false;
     };
     std::optional<NativePresent> native_present;
     // Stream-output and pipeline-statistics draws of this submission: their capture buffers
@@ -933,18 +935,22 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
           const bool terminal = present.surface &&
               presenter->presentOrderEvent().signaledValue() == UINT64_MAX;
           const bool current = !terminal && present.restart_token.signaledValue() == present.restart_epoch;
-          if (!metal_error && current)
+          const bool presented = (present.native_present_reserved && !metal_error && current) ||
+                                 (!present.native_present_attempted && !metal_error && current);
+          if (!present.native_present_attempted && !metal_error && current)
             WMT4::PresentMetal4Drawable(present.drawable, present.after,
                                        present.surface ? &present.frame : nullptr, present.sync_interval,
                                        present.surface ? present.allow_tearing : false);
-          else if (present.observer)
+          else if ((metal_error || !current || !present.native_present_reserved) && present.observer)
             present.observer.cancel(present.present_id);
           owned_graphics::Trace("present_native_decision", ",\"queue\":", queue_id,
                                 ",\"present_id\":", present.present_id,
-                                ",\"presented\":", unsigned(!metal_error && current));
+                                ",\"reserved\":", unsigned(present.native_present_reserved),
+                                ",\"presented\":", unsigned(presented));
           if (owned_graphics::TraceEnabled())
             Logger::info(str::format("OWNED_GRAPHICS_NATIVE_PRESENT_DECISION present_id=", present.present_id,
-                                     " presented=", unsigned(!metal_error && current),
+                                     " reserved=", unsigned(present.native_present_reserved),
+                                     ", presented=", unsigned(presented),
                                      " reason=", !current ? "epoch" : metal_error ? "status" : "current"));
           if (metal_error || terminal)
             presenter->cancelPresentOrder();
@@ -8291,6 +8297,14 @@ public:
         std::move(task.composition.surface), task.composition.frame,
         frame_id, task.restart_epoch, task.present_id, task.after, task.composition.sync_interval,
         task.composition.allow_tearing});
+    scope.inflight.native_present->native_present_attempted = true;
+    scope.inflight.native_present->native_present_reserved = WMT4::ReserveMetal4Present(
+        cmdbuf, drawable, task.after,
+        scope.inflight.native_present->surface ? &scope.inflight.native_present->frame : nullptr,
+        task.composition.sync_interval, scope.inflight.native_present->surface ? task.composition.allow_tearing : false,
+        task.presenter->restartToken(), task.restart_epoch);
+    if (!scope.inflight.native_present->native_present_reserved)
+      device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
     owned_graphics::Trace("present_encode", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
                           ",\"resource\":", g->owned_id);
     // Encoding completion releases PSO readers. Layer transitions additionally

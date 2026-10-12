@@ -30,6 +30,7 @@
 #include "dxil_raytracing.h"
 #include "dxmt_buffer.hpp"
 #include "dxmt_format.hpp"
+#include <array>
 #include <cmath>
 #include <functional>
 #include <new>
@@ -316,6 +317,32 @@ class MTLD3D12GraphicsCommandListImpl
     : public MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12GraphicsCommandListExt, IMTLD3D12FrameGenerationCommandList> {
 
   Com<MTLD3D12CommandAllocatorImpl, false> allocator_;
+
+  struct ResolvePipelineKey {
+    uint32_t attachment_format;
+    uint32_t raster_sample_count;
+    uint8_t fragment_kind;
+    uint8_t dsv_plane;
+    uint8_t depth_write_enabled;
+    uint8_t stencil_enabled;
+
+    bool operator==(const ResolvePipelineKey &other) const {
+      return attachment_format == other.attachment_format &&
+          raster_sample_count == other.raster_sample_count && fragment_kind == other.fragment_kind &&
+          dsv_plane == other.dsv_plane && depth_write_enabled == other.depth_write_enabled &&
+          stencil_enabled == other.stencil_enabled;
+    }
+  };
+
+  struct ResolvePipelineCacheEntry {
+    ResolvePipelineKey key{};
+    WMT::Reference<WMT::RenderPipelineState> pipeline;
+  };
+
+  // Resolve pipelines are device-owned and remain valid across command-list Reset.
+  std::array<ResolvePipelineCacheEntry, 8> resolve_pipeline_cache_{};
+  size_t resolve_pipeline_cache_count_ = 0;
+  size_t resolve_pipeline_cache_next_ = 0;
   const D3D12_COMMAND_LIST_TYPE type_;
 
   // Bundle calls are expanded through the parent's ordinary command recorder.
@@ -9571,6 +9598,9 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
                         dsv_plane == 2 ? (destination_dsv_plane ? "dxmt_decompress_stencil_single" : "dxmt_decompress_uint_single") :
                         unsigned_integer ? "dxmt_decompress_uint_single" :
                         integer ? "dxmt_decompress_sint_single" : "dxmt_decompress_float_single";
+      const uint8_t fragment_kind = (dsv_plane == 1 ? (destination_dsv_plane ? 1 : 2) :
+                                     dsv_plane == 2 ? (destination_dsv_plane ? 3 : 4) :
+                                     unsigned_integer ? 5 : integer ? 6 : 7) + (decompress ? 8 : 0);
       auto fragment = WMT4::Library(library).newFunction(fragment_name);
       WMTRenderPipelineInfo pipeline_info;
       WMT::InitializeRenderPipelineInfo(pipeline_info);
@@ -9585,8 +9615,25 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       pipeline_info.raster_sample_count = decompress ? src_resource_desc.SampleDesc.Count : 1;
       pipeline_info.rasterization_enabled = true;
       pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
-      WMT::Reference<WMT::Error> error;
-      resolve->pipeline = device_->GetMetal4Compiler().newRenderPipelineState(pipeline_info, error);
+      const ResolvePipelineKey pipeline_key{
+          static_cast<uint32_t>(attachment_format), pipeline_info.raster_sample_count, fragment_kind,
+          destination_dsv_plane, uint8_t(destination_dsv_plane & 1), uint8_t(destination_dsv_plane & 2)};
+      for (size_t i = 0; i < resolve_pipeline_cache_count_; ++i) {
+        if (resolve_pipeline_cache_[i].key == pipeline_key) {
+          resolve->pipeline = resolve_pipeline_cache_[i].pipeline;
+          break;
+        }
+      }
+      if (!resolve->pipeline) {
+        WMT::Reference<WMT::Error> error;
+        resolve->pipeline = device_->GetMetal4Compiler().newRenderPipelineState(pipeline_info, error);
+        if (resolve->pipeline) {
+          auto &entry = resolve_pipeline_cache_[resolve_pipeline_cache_count_ < resolve_pipeline_cache_.size()
+              ? resolve_pipeline_cache_count_++ : resolve_pipeline_cache_next_++ % resolve_pipeline_cache_.size()];
+          entry.key = pipeline_key;
+          entry.pipeline = resolve->pipeline;
+        }
+      }
       if (destination_dsv_plane) {
         WMTDepthStencilInfo depth_stencil_info;
         depth_stencil_info.depth_compare_function = WMTCompareFunctionAlways;

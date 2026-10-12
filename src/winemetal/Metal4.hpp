@@ -43,6 +43,11 @@ public:
   uint64_t copyTextureView(TextureViewPool source, uint32_t from, uint32_t to, Texture parent, const WMTTextureViewPoolInfo &info) {
     return Metal4Invoke(WMTMetal4CopyTextureViews, handle, source.handle, from, to, parent.handle, Metal4CPUPointer(&info)).ret[0];
   }
+  uint64_t copyTextureViews(TextureViewPool source, uint32_t from, uint32_t to, uint32_t count) {
+    struct WMTMetal4Call call{WMTMetal4CopyTextureViewsRange, 0,
+                              {handle, source.handle, from, to, count}, {}};
+    return ::WMTMetal4Call(&call) == 0 ? call.ret[0] : 0;
+  }
   void clear(uint32_t index) { Metal4Invoke(WMTMetal4ClearTextureView, handle, index); }
 };
 

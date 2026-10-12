@@ -87,7 +87,7 @@ public:
       statistics_root_blob.assign(root_source, root_source + rootsig.bytecode_length);
 
     SM50_SHADER_COMMON_DATA common;
-    common.flags = {};
+    common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
     common.next = &rootsig;
@@ -189,6 +189,7 @@ public:
     if (!statistics_function) {
       SM50Error compile_error;
       SM50_SHADER_COMMON_DATA common{};
+      common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
       common.type = SM50_SHADER_COMMON;
       common.metal_version = kD3D12ShaderMetalVersion;
       SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};

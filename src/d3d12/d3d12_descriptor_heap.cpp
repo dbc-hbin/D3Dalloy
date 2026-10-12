@@ -636,8 +636,35 @@ public:
   CopyDescriptors(UINT From, MTLD3D12DescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) {
     auto *destination = static_cast<MTLD3D12DescriptorHeapImpl *>(pHeapTo);
     if (destination == this && From == DescriptorTo) return;
-    const bool reverse = destination == this && DescriptorTo > From && DescriptorTo < From + CopyCount;
-    for (unsigned n = 0; n < CopyCount; ++n) {
+    const bool overlap = destination == this && DescriptorTo < From + CopyCount && From < DescriptorTo + CopyCount;
+    const bool reverse = overlap && DescriptorTo > From;
+    for (unsigned n = 0; n < CopyCount;) {
+      if (!overlap && view_pool_ && destination->view_pool_) {
+        unsigned range = 0;
+        while (n + range < CopyCount && pool_slots_[From + n + range].texture)
+          ++range;
+        if (range > 1) {
+          const uint64_t source_id = mapped_argument_buffer_[From + n].SRVTexture.resource_id;
+          for (unsigned i = 0; i < range; ++i)
+            destination->ResetPoolSlot(DescriptorTo + n + i);
+          const uint64_t destination_id = destination->view_pool_.copyTextureViews(
+              view_pool_, From + n, DescriptorTo + n, range);
+          if (destination_id) {
+            for (unsigned i = 0; i < range; ++i) {
+              const auto slot = pool_slots_[From + n + i];
+              const auto cpu = descriptors_[From + n + i];
+              auto gpu = mapped_argument_buffer_[From + n + i];
+              destination->descriptors_[DescriptorTo + n + i] = cpu;
+              destination->pool_slots_[DescriptorTo + n + i] = slot;
+              gpu.SRVTexture.resource_id = destination_id +
+                  (gpu.SRVTexture.resource_id - source_id);
+              destination->mapped_argument_buffer_[DescriptorTo + n + i] = gpu;
+            }
+            n += range;
+            continue;
+          }
+        }
+      }
       const unsigned i = reverse ? CopyCount - n - 1 : n;
       const auto slot = pool_slots_[From + i];
       const auto cpu = descriptors_[From + i];
@@ -650,6 +677,7 @@ public:
             view_pool_, From + i, DescriptorTo + i, slot.texture, slot.info);
       }
       destination->mapped_argument_buffer_[DescriptorTo + i] = gpu;
+      ++n;
     }
   }
 };

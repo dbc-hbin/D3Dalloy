@@ -441,6 +441,7 @@ class MTLD3D12StateObjectImpl final
 
   std::vector<WMT::Reference<WMT4::Library>> metal_libraries_;
   std::vector<WMT::Reference<WMT4::Function>> metal_functions_;
+  std::shared_ptr<const RaytracingArtifact> compiled_artifact_;
   WMT::Reference<WMT::ComputePipelineState> pipeline_state_;
   WMT::Reference<WMT::IntersectionFunctionTable> intersection_table_;
   WMT::Reference<WMT::VisibleFunctionTable> visible_function_table_;
@@ -807,9 +808,9 @@ class MTLD3D12StateObjectImpl final
     uint32_t function_count = 0;
     sm50_error_t error = nullptr;
     SM50ShaderBitcode bitcode;
-    if (!SM50CompileRaytracingPipeline(
-            &desc, &bitcode, &metallib, functions.data(), static_cast<uint32_t>(functions.size()), &function_count,
-            &error
+    std::shared_ptr<const RaytracingArtifact> artifact;
+    if (!device_->GetShaderArtifactCache().CompileRaytracing(
+            desc, &bitcode, metallib, functions, function_count, &error, artifact
         )) {
       const std::string message = DescribeCompilerError(error);
       ERR("RT pipeline compilation failed: ", message.empty() ? "no compiler diagnostic" : message);
@@ -822,6 +823,7 @@ class MTLD3D12StateObjectImpl final
       return E_FAIL;
     }
     functions.resize(function_count);
+    compiled_artifact_ = artifact;
 
     HRESULT constants_result = immutable_constants.Initialize(device_, metallib, bitcode);
     if (FAILED(constants_result)) return constants_result;

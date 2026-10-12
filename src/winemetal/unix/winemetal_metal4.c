@@ -10,6 +10,9 @@
 #include "rt_acceleration_structure.h"
 #include "airconv_public.h"
 
+extern void winemetal_composition_present(id drawable, double duration,
+    const struct WMTCompositionFrame *frame, uint32_t sync_interval, bool allow_tearing);
+
 #define M4_SUCCESS 0
 #define M4_INVALID ((int32_t)0xc000000d)
 #define M4_FAILED ((int32_t)0xc0000001)
@@ -110,12 +113,57 @@ typedef struct {
   M4BindingCounters counters;
   NSMutableArray *encoders;
   NSMutableArray<id<MTL4CommandBuffer>> *segments;
+  NSMutableArray *presentTickets;
   NSError *error;
 }
 @end
 @implementation DXMTM4Recording
 - (void)dealloc {
-  [residency release]; [objects release]; [allocations release]; [encoders release]; [segments release]; [error release]; [super dealloc];
+  [residency release]; [objects release]; [allocations release]; [encoders release]; [segments release];
+  [presentTickets release]; [error release]; [super dealloc];
+}
+@end
+
+@interface DXMTM4PresentTicket : NSObject {
+@public
+  id drawable, restart_token, surface;
+  struct WMTCompositionFrame frame;
+  uint64_t epoch;
+  double duration;
+  uint32_t sync_interval;
+  BOOL allow_tearing, completed;
+}
+- (id)initWithCall:(struct WMTMetal4Call *)call;
+- (void)complete:(BOOL)success;
+@end
+
+@implementation DXMTM4PresentTicket
+- (id)initWithCall:(struct WMTMetal4Call *)call {
+  self = [super init];
+  if (!self) return nil;
+  drawable = [(id)(uintptr_t)call->args[1] retain];
+  restart_token = [(id)(uintptr_t)call->args[6] retain];
+  if (!drawable || !restart_token) { [self release]; return nil; }
+  memcpy(&duration, &call->args[2], sizeof(duration));
+  if (call->args[3]) {
+    frame = *(const struct WMTCompositionFrame *)(uintptr_t)call->args[3];
+    surface = [(id)(uintptr_t)frame.surface retain];
+  }
+  epoch = call->args[7];
+  sync_interval = (uint32_t)call->args[4];
+  allow_tearing = call->args[5] != 0;
+  return self;
+}
+- (void)complete:(BOOL)success {
+  @synchronized(self) {
+    if (completed) return;
+    completed = YES;
+    if (!success || [restart_token signaledValue] != epoch) return;
+    winemetal_composition_present(drawable, duration, surface ? &frame : NULL, sync_interval, allow_tearing);
+  }
+}
+- (void)dealloc {
+  [drawable release]; [restart_token release]; [surface release]; [super dealloc];
 }
 @end
 
@@ -180,6 +228,7 @@ typedef struct {
   NSCondition *condition;
   NSMutableArray *leases;
   NSMutableArray<DXMTM4CommandBuffer *> *buffers;
+  NSMutableArray *presentTickets;
   NSError *error;
   uint64_t gpuStart, gpuEnd;
   BOOL completed, commitReturned, feedbackReceived;
@@ -187,7 +236,7 @@ typedef struct {
 @end
 @implementation DXMTM4Submission
 - (void)dealloc {
-  [condition release]; [leases release]; [buffers release]; [error release]; [super dealloc];
+  [condition release]; [leases release]; [buffers release]; [presentTickets release]; [error release]; [super dealloc];
 }
 @end
 
@@ -246,6 +295,17 @@ static void m4_commit_residency(DXMTM4Recording *recording) {
 }
 
 id<MTL4CommandBuffer> winemetal_metal4_command_buffer(obj_handle_t handle) { return handle ? m4cb(handle)->command : nil; }
+int32_t winemetal_metal4_reserve_present(struct WMTMetal4Call *call) {
+  if (!call || !call->args[0]) return M4_INVALID;
+  DXMTM4CommandBuffer *context = m4cb(call->args[0]);
+  if (!context || !context->recording || context->ended) return M4_INVALID;
+  DXMTM4PresentTicket *ticket = [[DXMTM4PresentTicket alloc] initWithCall:call];
+  if (!ticket) return M4_FAILED;
+  [context->recording->presentTickets addObject:ticket];
+  [ticket release];
+  call->ret[0] = 1;
+  return M4_SUCCESS;
+}
 void *winemetal_metal4_split_command_buffer(void *opaque) {
   DXMTM4CommandBuffer *context = opaque;
   if (!context || !context->recording || context->ended) return NULL;
@@ -706,12 +766,14 @@ static int32_t m4_commit(struct WMTMetal4Call *call) {
   if (!commands) return M4_FAILED;
   DXMTM4Submission *submission=[DXMTM4Submission new]; submission->condition=[NSCondition new];
   submission->leases=[[NSMutableArray alloc] initWithCapacity:count*3]; submission->buffers=[[NSMutableArray alloc] initWithCapacity:count];
+  submission->presentTickets=[NSMutableArray new];
   NSUInteger command_index = 0;
   for (uint64_t i=0;i<count;++i) {
     DXMTM4CommandBuffer *context=m4cb(handles[i]);
     for (id<MTL4CommandBuffer> segment in context->recording->segments) commands[command_index++]=segment;
     commands[command_index++]=context->command; [submission->buffers addObject:context];
     [submission->leases addObject:context->recording]; [submission->leases addObject:context->command]; [submission->leases addObject:context->allocator];
+    [submission->presentTickets addObjectsFromArray:context->recording->presentTickets];
     if (context->recording->error && !submission->error) submission->error=[context->recording->error retain];
   }
   for (DXMTM4CommandBuffer *context in submission->buffers) {
@@ -719,6 +781,7 @@ static int32_t m4_commit(struct WMTMetal4Call *call) {
     [context->recording release]; context->recording=nil;
   }
   if (submission->error) {
+    for (DXMTM4PresentTicket *ticket in submission->presentTickets) [ticket complete:NO];
     [submission->condition lock]; submission->commitReturned=YES; submission->feedbackReceived=YES;
     m4_finish_submission(submission); [submission->condition unlock];
   } else {
@@ -727,6 +790,7 @@ static int32_t m4_commit(struct WMTMetal4Call *call) {
       [submission->condition lock]; submission->error=[feedback.error retain];
       submission->gpuStart=(uint64_t)(feedback.GPUStartTime*1000000000.0);
       submission->gpuEnd=(uint64_t)(feedback.GPUEndTime*1000000000.0);
+      for (DXMTM4PresentTicket *ticket in submission->presentTickets) [ticket complete:feedback.error == nil];
       submission->feedbackReceived=YES; m4_finish_submission(submission); [submission->condition unlock];
     }];
     [queue commit:commands count:command_count options:options]; [options release];
@@ -804,6 +868,28 @@ int32_t winemetal_metal4_call(void *params) {
       } }
       return call->ret[0] ? M4_SUCCESS : M4_FAILED;
     }
+    case WMTMetal4CopyTextureViewsRange: {
+      DXMTM4ViewPool *views=m4obj(a[0]), *source=m4obj(a[1]);
+      NSUInteger from=a[2], to=a[3], count=a[4];
+      if (!views || !source || !views->pool || !source->pool || !count ||
+          from > source->textures.count || count > source->textures.count-from ||
+          to > views->textures.count || count > views->textures.count-to)
+        return M4_INVALID;
+      if (views==source && ((to < from + count && from < to + count))) return M4_INVALID;
+      id first=(uintptr_t)views<(uintptr_t)source ? views : source;
+      id second=first==views ? source : views;
+      @synchronized(first) { @synchronized(second) {
+        MTLResourceID resource=[views->pool copyResourceViewsFromPool:source->pool
+            sourceRange:NSMakeRange(from,count) destinationIndex:to];
+        if (!resource._impl) return M4_FAILED;
+        for (NSUInteger i=0; i<count; ++i) {
+          [views replaceTexture:source->textures[from+i] atIndex:to+i];
+          if (views->trace) ++views->copyCount;
+        }
+        call->ret[0]=resource._impl;
+      } }
+      return M4_SUCCESS;
+    }
     case WMTMetal4ClearTextureView: {
       DXMTM4ViewPool *views=m4obj(a[0]); if (a[1]>=views->textures.count) return M4_INVALID;
       @synchronized(views) {
@@ -848,6 +934,7 @@ int32_t winemetal_metal4_call(void *params) {
       }
       [context->allocator release]; context->allocator=[m4obj(a[1]) retain];
       context->recording=[DXMTM4Recording new]; context->recording->objects=[NSMutableSet new]; context->recording->encoders=[NSMutableArray new];
+      context->recording->presentTickets=[NSMutableArray new];
       context->recording->allocations=[NSMutableSet new];
       const char *trace=getenv("OWNED_GRAPHICS_TRACE"); context->recording->trace=trace && trace[0]=='1' && !trace[1];
       if (!context->residency) {

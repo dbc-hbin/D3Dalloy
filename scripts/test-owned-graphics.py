@@ -4221,10 +4221,10 @@ def run(args: argparse.Namespace) -> int:
                                     "presented=restart_only") == 1)
         # Native decision per drawable: only the restart frame may be handed to Core Animation.
         native_window = stderr.partition("RESTART_NATIVE_BEGIN")[2].partition("RESTART_NATIVE_END")
-        native_decisions = re.findall(r"OWNED_GRAPHICS_NATIVE_PRESENT_DECISION present_id=(\d+) presented=([01]) "
+        native_decisions = re.findall(r"OWNED_GRAPHICS_NATIVE_PRESENT_DECISION present_id=(\d+) reserved=([01]), presented=([01]) "
                                       r"reason=(\w+)", native_window[0])
         success = (success and bool(native_window[1])
-                   and sorted(native_decisions) == [("2", "0", "epoch"), ("3", "1", "current")])
+                   and sorted(native_decisions) == [("2", "1", "0", "epoch"), ("3", "1", "1", "current")])
     if args.suite == "hdr-metadata":
         frames = re.findall(r"OWNED_D3D12_HDR_METADATA_FRAME frame=(\d+) source_pixels=3072 "
                             r"exact=1 fence=complete present=ok", stdout)

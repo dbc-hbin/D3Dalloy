@@ -225,6 +225,7 @@ _CacheWriter_set(void *obj) {
 
 extern void MTLSetShaderCachePath(NSString* path);
 extern NSString* MTLGetShaderCachePath();
+extern void MTLMakeShaderCacheWritableByAllUsers(void);
 
 int
 _WMTSetMetalShaderCachePath(void *obj) {
@@ -232,6 +233,7 @@ _WMTSetMetalShaderCachePath(void *obj) {
   NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
   NSString *resolved_path = resolve_cache_dir(path, false);
   MTLSetShaderCachePath(resolved_path);
+  MTLMakeShaderCacheWritableByAllUsers();
   params->ret_success = [MTLGetShaderCachePath() isEqualToString:resolved_path];
   [path release];
   return 0;

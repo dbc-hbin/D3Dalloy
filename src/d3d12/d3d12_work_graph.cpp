@@ -810,12 +810,16 @@ HRESULT MTLD3D12WorkGraph::Compile(Node &node, MTLD3D12RootSignature *root, bool
   desc.Exports = exports.data(); desc.ExportCount = exports.size(); desc.EntryLibraryIndex = node.library;
   desc.Reserved = validate_only;
   desc.AllowUnresolved = validate_only && (flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS);
+
   sm50_error_t error = nullptr; sm50_bitcode_t bitcode = nullptr; SM50_COMPILED_BITCODE metallib{};
   SM50_WG_NODE_COMPILED_INFO info{};
-  if (!SM50WGCompileNode(&desc, &bitcode, &metallib, &info, &error)) {
-    ERR("Work graph node ", node.entry, ": ", SM50GetErrorMessageString(error)); SM50FreeError(error); return E_INVALIDARG;
+  std::shared_ptr<const WorkGraphArtifact> artifact;
+  if (!device_->GetShaderArtifactCache().CompileWorkGraph(desc, &bitcode, metallib, info, &error, artifact, validate_only)) {
+    ERR("Work graph node ", node.entry, ": ", error ? SM50GetErrorMessageString(error) : "compile failed");
+    SM50FreeError(error); return E_INVALIDARG;
   }
   if (validate_only) { if (bitcode) SM50DestroyBitcode(bitcode); return S_OK; }
+  node.compiled_artifact = artifact;
   WMT::Reference<WMT::Error> metal_error;
   HRESULT constant_result = node.constants.Initialize(device_, metallib, bitcode);
   if (FAILED(constant_result)) { SM50DestroyBitcode(bitcode); return constant_result; }
@@ -824,7 +828,7 @@ HRESULT MTLD3D12WorkGraph::Compile(Node &node, MTLD3D12RootSignature *root, bool
     auto function = metal_library.newFunction(desc.FunctionName);
     if (function) node.pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, metal_error);
   }
-  SM50DestroyBitcode(bitcode);
+  if (bitcode) SM50DestroyBitcode(bitcode);
   if (!node.pipeline) {
     ERR("Work graph pipeline: ", metal_error ? metal_error.description().getUTF8String() : "no Metal error"); return E_FAIL;
   }
