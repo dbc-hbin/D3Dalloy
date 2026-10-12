@@ -204,6 +204,11 @@ ffxDispatchDescFrameGeneration fgGenerate(ID3D12GraphicsCommandList* list, uint6
     g.generationRect = rect;
     return g;
 }
+uint64_t fgHash(const std::vector<uint8_t>& bytes) {
+    uint64_t hash = 14695981039346656037ull;
+    for (uint8_t value : bytes) hash = (hash ^ value) * 1099511628211ull;
+    return hash;
+}
 std::vector<uint8_t> fgFrame(FgContext& context, Gpu& gpu, unsigned frame,
                             ID3D12Resource* depth, ID3D12Resource* motion, bool reset = false,
                             bool mutateAfterPrepare = false,
