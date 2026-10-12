@@ -346,25 +346,8 @@ struct StageFileHeader {
 };
 static_assert(sizeof(StageFileHeader) % 8 == 0);
 bool StageIdentity(WMTPipelineCacheIdentity &identity) { return WMTGetPipelineCacheIdentity(&identity); }
-bool StageDiskHasRoom(const std::wstring &directory, const std::wstring &path, uint64_t incoming) {
-  WIN32_FIND_DATAW data{};
-  const auto pattern = directory + L"dxmt-stage-*";
-  HANDLE search = FindFirstFileW(pattern.c_str(), &data);
-  if (search == INVALID_HANDLE_VALUE) {
-    return GetLastError() == ERROR_FILE_NOT_FOUND && incoming <= kStageDiskBytes;
-  }
-  uint64_t total = 0;
-  do {
-    if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-    const auto current = directory + data.cFileName;
-    if (current != path)
-      total += (uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-  } while (FindNextFileW(search, &data));
-  const DWORD enumeration_error = GetLastError();
-  FindClose(search);
-  if (enumeration_error != ERROR_NO_MORE_FILES) return false;
-  return total <= kStageDiskBytes && incoming <= kStageDiskBytes - total;
-}
+struct AutomaticDiskAccounting;
+bool StageDiskHasRoom(const std::wstring &, const std::wstring &, AutomaticDiskAccounting &, uint64_t, uint64_t &);
 
 struct FileHandle {
   HANDLE value = INVALID_HANDLE_VALUE;
@@ -390,6 +373,7 @@ struct AutomaticAccountingMapping {
 // This lock protects only registry ownership, never disk I/O or application-session caches.
 std::mutex automatic_accounting_mutex;
 std::map<std::wstring, std::unique_ptr<AutomaticAccountingMapping>> automatic_accounting;
+std::map<std::wstring, std::unique_ptr<AutomaticAccountingMapping>> stage_accounting;
 
 HRESULT AutomaticAccounting(const std::wstring &directory, AutomaticDiskAccounting *&state) {
   std::lock_guard lock(automatic_accounting_mutex);
@@ -410,12 +394,32 @@ HRESULT AutomaticAccounting(const std::wstring &directory, AutomaticDiskAccounti
   return S_OK;
 }
 
+HRESULT StageAccounting(const std::wstring &directory, AutomaticDiskAccounting *&state) {
+  std::lock_guard lock(automatic_accounting_mutex);
+  auto found = stage_accounting.find(directory);
+  if (found == stage_accounting.end()) {
+    auto mapping = std::make_unique<AutomaticAccountingMapping>();
+    const auto hash = Sha1HashState::compute(directory.data(), directory.size() * sizeof(WCHAR));
+    const auto name = L"Local\\dxmt-stage-accounting-v1-" + Hex(hash.data, sizeof(hash.data));
+    mapping->handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                         sizeof(AutomaticDiskAccounting), name.c_str());
+    if (!mapping->handle) return FileError();
+    mapping->state = static_cast<AutomaticDiskAccounting *>(
+        MapViewOfFile(mapping->handle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(AutomaticDiskAccounting)));
+    if (!mapping->state) return FileError();
+    found = stage_accounting.emplace(directory, std::move(mapping)).first;
+  }
+  state = found->second->state;
+  return S_OK;
+}
+
 // Disk metadata transactions never call into the in-process pipeline cache. Reads use atomic
 // published files and FILE_SHARE_DELETE, so they need neither this mutex nor a directory scan.
 struct AutomaticDiskLock {
   HANDLE value = nullptr;
   bool acquired = false;
   AutomaticDiskAccounting *accounting = nullptr;
+  AutomaticDiskAccounting *stage_accounting = nullptr;
   HRESULT acquire(const std::wstring &directory) {
     const auto hash = Sha1HashState::compute(directory.data(), directory.size() * sizeof(WCHAR));
     const auto name = L"Local\\dxmt-pso-" + Hex(hash.data, sizeof(hash.data));
@@ -426,7 +430,12 @@ struct AutomaticDiskLock {
     if (acquired) {
       const HRESULT hr = AutomaticAccounting(directory, accounting);
       if (FAILED(hr)) return hr;
-      if (result == WAIT_ABANDONED) accounting->valid = 0;
+      const HRESULT stage_hr = StageAccounting(directory, stage_accounting);
+      if (FAILED(stage_hr)) return stage_hr;
+      if (result == WAIT_ABANDONED) {
+        accounting->valid = 0;
+        stage_accounting->valid = 0;
+      }
       return S_OK;
     }
     return result == WAIT_FAILED ? FileError() : DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
@@ -436,6 +445,47 @@ struct AutomaticDiskLock {
     if (value) CloseHandle(value);
   }
 };
+
+bool StageDiskHasRoom(const std::wstring &directory, const std::wstring &path,
+                      AutomaticDiskAccounting &accounting, uint64_t incoming, uint64_t &total) {
+  WIN32_FIND_DATAW data{};
+  const auto pattern = directory + L"dxmt-stage-*";
+  const bool rescan = !accounting.valid;
+  total = accounting.bytes;
+  if (rescan) {
+    total = 0;
+    HANDLE search = FindFirstFileW(pattern.c_str(), &data);
+    if (search == INVALID_HANDLE_VALUE) {
+      if (GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+    } else {
+      do {
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const uint64_t size = (uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+        if (size > UINT64_MAX - total) {
+          FindClose(search);
+          return false;
+        }
+        total += size;
+      } while (FindNextFileW(search, &data));
+      const DWORD enumeration_error = GetLastError();
+      FindClose(search);
+      if (enumeration_error != ERROR_NO_MORE_FILES) return false;
+    }
+  }
+  uint64_t replaced = 0;
+  WIN32_FILE_ATTRIBUTE_DATA info{};
+  if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) {
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;
+    replaced = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+  } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+    return false;
+  }
+  if (replaced > accounting.bytes && !rescan) return false;
+  if (replaced > total || total > kStageDiskBytes || incoming > kStageDiskBytes - (total - replaced)) return false;
+  total -= replaced;
+  accounting.valid = 0;
+  return true;
+}
 
 struct AutomaticTempFile {
   std::wstring path;
@@ -738,7 +788,8 @@ void WriteAutomaticStageArtifact(const std::string &key, const ShaderStageArtifa
     static std::atomic<uint32_t> sequence{0};
     const uint32_t pid = GetCurrentProcessId(), serial = ++sequence;
     const auto temp = path + L"-" + Hex(&pid, sizeof(pid)) + L"-" + Hex(&serial, sizeof(serial)) + L".tmp";
-    if (!StageDiskHasRoom(directory, path, sizeof(StageFileHeader) + payload)) return;
+    uint64_t total = 0;
+    if (!StageDiskHasRoom(directory, path, *disk_lock.stage_accounting, sizeof(StageFileHeader) + payload, total)) return;
     FileHandle file{CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr)};
     if (file.value == INVALID_HANDLE_VALUE) return;
     StageFileHeader header{kStageMagic, kStageVersion, uint32_t(key.size()), artifact.library.size(), encoded_metadata.size(),
@@ -761,6 +812,10 @@ void WriteAutomaticStageArtifact(const std::string &key, const ShaderStageArtifa
     CloseHandle(file.value); file.value = INVALID_HANDLE_VALUE;
     if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
       DeleteFileW(temp.c_str());
+    else {
+      disk_lock.stage_accounting->bytes = total + sizeof(StageFileHeader) + payload;
+      disk_lock.stage_accounting->valid = 1;
+    }
   } catch (...) {}
 }
 
@@ -857,6 +912,7 @@ HRESULT ClearAutomaticPipelineCacheDisk() {
     hr = lock.acquire(directory);
     if (FAILED(hr)) return hr;
     lock.accounting->valid = 0;
+    lock.stage_accounting->valid = 0;
     std::vector<AutomaticDiskEntry> unused;
     uint64_t total = 0;
     hr = AutomaticDiskEntries(directory, unused, total, true);
@@ -878,6 +934,8 @@ HRESULT ClearAutomaticPipelineCacheDisk() {
     if (SUCCEEDED(hr)) {
       lock.accounting->bytes = 0;
       lock.accounting->valid = 1;
+      lock.stage_accounting->bytes = 0;
+      lock.stage_accounting->valid = 1;
     }
     return hr;
   } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }

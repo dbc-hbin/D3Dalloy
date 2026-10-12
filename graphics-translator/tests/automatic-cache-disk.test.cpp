@@ -8,28 +8,41 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <list>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+#include <cwchar>
 #include <cstdio>
 #include <cstdlib>
+#define WINEMETAL_API extern "C"
+#include "../../src/d3d12/d3d12_pipeline_cache.hpp"
+#undef WINEMETAL_API
 uint64_t enumerations = 0;
+uint64_t stage_enumerations = 0;
 HANDLE counted_find(const WCHAR *pattern, WIN32_FIND_DATAW *info) {
   ++enumerations;
+  if (std::wcsstr(pattern, L"dxmt-stage-*")) ++stage_enumerations;
   return FindFirstFileW(pattern, info);
 }
 namespace dxmt {
 HRESULT CreateBlobFromMalloc(SIZE_T size, ID3DBlob **blob) { return D3DCreateBlob(size, blob); }
+void PublishAutomaticStageArtifact(const std::string &, std::shared_ptr<const ShaderStageArtifact>, uint64_t) {}
 }
 #define FindFirstFileW counted_find
 #include PRODUCTION_CACHE
 #undef FindFirstFileW
 using namespace dxmt;
+extern "C" bool WMTGetPipelineCacheIdentity(WMTPipelineCacheIdentity *identity) {
+  *identity = {}; identity->compiler_uuid[0] = 1; return true;
+}
 constexpr uint64_t MiB = 1024 * 1024;
 void require(bool value, const char *message) {
   if (!value) { std::fprintf(stderr, "AUTOMATIC_CACHE_DISK_FAIL %s error=%lu\n", message, GetLastError()); std::exit(1); }
@@ -72,6 +85,23 @@ uint64_t disk_bytes() {
   return total;
 }
 void clear() { require(ClearAutomaticPipelineCacheDisk() == S_OK, "clear automatic cache"); }
+void stageStore(unsigned value) {
+  ShaderStageArtifact artifact;
+  artifact.library = {'M', 'T', 'L', 'B'};
+  artifact.metadata_sizes = {0};
+  artifact.constants = {0};
+  artifact.view.ConstantDataAlignment = 1;
+  WriteAutomaticStageArtifact("stage-" + std::to_string(value), artifact);
+}
+void testStageAccounting() {
+  stage_enumerations = 0;
+  stageStore(1);
+  stageStore(2);
+  require(stage_enumerations == 1, "stage publication rescans directory once");
+  std::printf("STAGE_CACHE_DISK_OPERATIONS publications=2 stage_metadata_enumerations=%llu\n",
+              static_cast<unsigned long long>(stage_enumerations));
+  clear();
+}
 void child(const std::wstring &arguments) {
   WCHAR executable[32768];
   require(GetModuleFileNameW(nullptr, executable, std::size(executable)) != 0, "child executable");
@@ -117,6 +147,7 @@ int main(int argc, char **argv) {
     } else return 2;
     return 0;
   }
+  testStageAccounting();
   clear();
   const auto foreign = directory() + L"dxmt-pso-not-owned.bin";
   HANDLE foreign_file = CreateFileW(foreign.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);

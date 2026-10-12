@@ -20,8 +20,7 @@ runtime = args.runtime.resolve()
 source_path = args.source or root / "src/d3d12/d3d12_shader_cache.cpp"
 source = source_path.read_text()
 # Exclude application sessions and Device COM wrappers, not any automatic-cache operation.
-helpers = source[source.index("struct SearchHandle {"):source.index("bool Seek(")]
-helpers += source[source.index("bool Read("):source.index("struct Cache {")]
+helpers = source[source.index("struct SearchHandle {"):source.index("struct Cache {")]
 private = source[source.index("std::wstring Hex("):source.index("class ShaderCacheSession final")]
 public = source[source.index("HRESULT ReadAutomaticPipelineCache("):source.index("HRESULT CreateShaderCacheSession(")]
 production = out / "production-cache.inc"
@@ -30,7 +29,7 @@ production.write_text("namespace dxmt {\nnamespace {\n" + helpers + private + "\
 executable = out / "automatic-cache-disk.exe"
 command = [str(args.compiler_bin / "x86_64-w64-mingw32-clang++"), "-std=c++20", "-O2",
            "-Wall", "-Wextra", "-Werror", "-static", f'-DPRODUCTION_CACHE="{production}"',
-           "-Isrc/util", "graphics-translator/tests/automatic-cache-disk.test.cpp",
+           "-Isrc/util", "-Isrc/airconv", "-Isrc/d3d12", "-Isrc/winemetal", "graphics-translator/tests/automatic-cache-disk.test.cpp",
            "src/util/sha1/sha1_util.cpp", "-x", "c++", "src/util/sha1/sha1.c", "-ld3dcompiler", "-o", str(executable)]
 with (out / "build.log").open("w") as log:
     subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
