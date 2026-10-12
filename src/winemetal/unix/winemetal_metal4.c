@@ -726,6 +726,7 @@ static int32_t m4_as_call(struct WMTMetal4Call *call) {
  * using its exact command/allocator/resource identities when feedback arrives. */
 static void m4_finish_submission(DXMTM4Submission *submission) {
   if (!submission->commitReturned || !submission->feedbackReceived) return;
+  for (DXMTM4PresentTicket *ticket in submission->presentTickets) [ticket complete:submission->error == nil];
   // Removal waits for native commit return AND GPU retirement. No allocations
   // persist between recordings in the retired native-slot residency cache.
   for (id lease in submission->leases) {
@@ -781,7 +782,6 @@ static int32_t m4_commit(struct WMTMetal4Call *call) {
     [context->recording release]; context->recording=nil;
   }
   if (submission->error) {
-    for (DXMTM4PresentTicket *ticket in submission->presentTickets) [ticket complete:NO];
     [submission->condition lock]; submission->commitReturned=YES; submission->feedbackReceived=YES;
     m4_finish_submission(submission); [submission->condition unlock];
   } else {
@@ -790,10 +790,17 @@ static int32_t m4_commit(struct WMTMetal4Call *call) {
       [submission->condition lock]; submission->error=[feedback.error retain];
       submission->gpuStart=(uint64_t)(feedback.GPUStartTime*1000000000.0);
       submission->gpuEnd=(uint64_t)(feedback.GPUEndTime*1000000000.0);
-      for (DXMTM4PresentTicket *ticket in submission->presentTickets) [ticket complete:feedback.error == nil];
       submission->feedbackReceived=YES; m4_finish_submission(submission); [submission->condition unlock];
     }];
     [queue commit:commands count:command_count options:options]; [options release];
+    // Feedback may arrive before commit returns. Signal every drawable before
+    // publishing commitReturned, which permits its ticket to present.
+    for (DXMTM4PresentTicket *ticket in submission->presentTickets) {
+      id<CAMetalDrawable> primary, residual;
+      winemetal_composition_drawables(ticket->drawable, &primary, &residual);
+      [queue signalDrawable:primary];
+      if (residual) [queue signalDrawable:residual];
+    }
     [submission->condition lock]; submission->commitReturned=YES;
     m4_finish_submission(submission); [submission->condition unlock];
   }

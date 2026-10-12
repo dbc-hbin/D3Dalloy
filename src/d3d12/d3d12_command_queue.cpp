@@ -1024,7 +1024,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     WMT::Reference<WMT::Event> signal_event;
     uint64_t signal_value = 0;
     bool timestamp_predecessors_ordered = false;
-    WMT::Reference<WMT::MetalDrawable> signal_drawable;
     // This stays locked through the destructor's commit(), then releases. No
     // GPU completion or ring-capacity wait occurs while it is held.
     std::unique_lock<std::mutex> temporal_submission_lock;
@@ -1065,8 +1064,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       inflight.submission = queue->device_->CommitMetal4CommandBuffers(queue->queue_, &buffer, 1);
       if (signal_event)
         queue->queue_.signalEvent(signal_event, signal_value);
-      if (signal_drawable)
-        queue->queue_.signalDrawable(signal_drawable);
       owned_graphics::Trace("submit", ",\"queue\":", queue->owned_id_, ",\"submission\":", seq);
       queue->submission_ring_.publish(seq);
     }
@@ -8283,7 +8280,6 @@ public:
     queue_.waitForDrawable(drawable);
     scope.signal_event = order_event;
     scope.signal_value = frame_id;
-    scope.signal_drawable = drawable;
     if (task.observer && !drawable.observePresentation(task.observer, task.present_id)) {
       task.observer.cancel(task.present_id);
       task.observer_fault->store(true, std::memory_order_release);
