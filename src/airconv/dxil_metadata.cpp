@@ -25,6 +25,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "DXBCParser/DxbcSignature.h"
 #include "DXBCParser/ShaderBytecode.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "airconv_error.hpp"
@@ -79,9 +80,6 @@ Stage stageFromShaderKind(uint32_t shader_kind) {
 }
 
 namespace {
-
-/** ISG1/OSG1/PSG1 elements are at least 32 bytes; PSG1 appends interpolation mode. */
-constexpr size_t kSignatureElementMinSize = 32;
 
 struct ChunkView {
   const uint8_t *data = nullptr;
@@ -194,66 +192,51 @@ llvm::Expected<ChunkView> findChunk(const void *bytecode, size_t size, const cha
 /* Signature chunks                                                   */
 /* ------------------------------------------------------------------ */
 
+llvm::Error signatureError(uint32_t status) {
+  switch (status) {
+  case DXMT_DXBC_SIGNATURE_HEADER:
+    return createError("DXIL signature chunk is truncated");
+  case DXMT_DXBC_SIGNATURE_RECORDS:
+    return createError("DXIL signature element is out of bounds");
+  case DXMT_DXBC_SIGNATURE_NAME:
+    return createError("DXIL signature name is out of bounds or not terminated");
+  case DXMT_DXBC_SIGNATURE_REGISTER_ORDER:
+    return createError("DXIL signature registers are not sorted within a stream");
+  case DXMT_DXBC_SIGNATURE_STREAM_ORDER:
+    return createError("DXIL signature streams are not sorted in 0..3");
+  default:
+    llvm_unreachable("unexpected DXBC signature status");
+  }
+}
+
+/* ISG1/OSG1/PSG1 use 32-byte records. DXC sorts them by stream, then register, so
+ * the grouped parse accepts every chunk it writes, including multi-stream GS outputs
+ * whose registers restart per stream. */
 llvm::Error parseSignatureChunk(const ChunkView &chunk, std::vector<SigElement> &out) {
   if (chunk.size == 0)
     return llvm::Error::success();
-  if (chunk.size < 8)
-    return createError("DXIL signature chunk is truncated");
+  DxmtDxbcSignatureInfo info;
+  if (uint32_t status = dxmt_dxbc_signature_parse(chunk.data, chunk.size, DXMT_DXBC_SIGNATURE_11_1, 1, &info))
+    return signatureError(status);
 
-  uint32_t count = readU32(chunk.data);
-  uint32_t elements_offset = readU32(chunk.data + 4);
-  if (count == 0)
-    return llvm::Error::success();
-  if (elements_offset < 8 || elements_offset > chunk.size)
-    return createError("DXIL signature element offset is out of bounds");
-
-  /* The name table follows the element array, and names are emitted in element
-   * order, so the first name offset marks the end of the element array. This is
-   * what fixes the element stride (32 for ISG1/OSG1, larger for PSG1). */
-  if (elements_offset + 8 > chunk.size)
-    return createError("DXIL signature element is truncated");
-  uint32_t first_name_offset = readU32(chunk.data + elements_offset + 4);
-  if (first_name_offset < elements_offset || first_name_offset > chunk.size)
-    return createError("DXIL signature name offset is out of bounds");
-  size_t element_bytes = first_name_offset - elements_offset;
-  if (element_bytes % count != 0)
-    return createError("DXIL signature element stride is inconsistent");
-  size_t stride = element_bytes / count;
-  if (stride < kSignatureElementMinSize)
-    return createError("DXIL signature element is too small");
-
-  out.reserve(out.size() + count);
-  for (uint32_t i = 0; i < count; i++) {
-    size_t base = elements_offset + i * stride;
-    if (base + stride > chunk.size)
-      return createError("DXIL signature element is out of bounds");
-    const uint8_t *element = chunk.data + base;
+  out.reserve(out.size() + info.parameter_count);
+  for (uint32_t i = 0; i < info.parameter_count; i++) {
+    DxmtDxbcSignatureParameter record;
+    if (uint32_t status = dxmt_dxbc_signature_parameter(chunk.data, chunk.size, &info, i, &record))
+      return signatureError(status);
 
     SigElement sig;
     sig.id = i;
-    sig.stream = readU32(element);
-    uint32_t name_offset = readU32(element + 4);
-    if (name_offset >= chunk.size)
-      return createError("DXIL signature name is out of bounds");
-    sig.semantic_index = readU32(element + 8);
-    sig.semantic_kind = static_cast<uint8_t>(readU32(element + 12));
-    sig.comp_type = static_cast<uint8_t>(readU32(element + 16));
-    uint32_t register_index = readU32(element + 20);
-    sig.mask = element[24];
-    sig.read_write_mask = element[25];
-    /* element[26..27] is the stream (already read from +0 for the same value) and
-     * element[28..31] the min precision, which AIR lowering does not need. */
-
-    size_t name_start = name_offset;
-    size_t name_end = name_start;
-    while (name_end < chunk.size && chunk.data[name_end] != 0)
-      name_end++;
-    if (name_end >= chunk.size)
-      return createError("DXIL signature name is not terminated");
-    sig.name.assign(reinterpret_cast<const char *>(chunk.data + name_start), name_end - name_start);
+    sig.stream = record.stream;
+    sig.semantic_index = record.semantic_index;
+    sig.semantic_kind = static_cast<uint8_t>(record.system_value);
+    sig.comp_type = static_cast<uint8_t>(record.component_type);
+    sig.mask = record.mask;
+    sig.read_write_mask = static_cast<uint8_t>(record.never_writes_mask);
+    sig.name.assign(reinterpret_cast<const char *>(chunk.data + record.name_offset), record.name_size);
 
     sig.rows = 1;
-    sig.start_row = register_index;
+    sig.start_row = record.register_index;
     sig.start_col = sig.mask ? std::countr_zero(sig.mask) : 0;
     sig.cols = std::popcount(sig.mask & 0xf);
     if (sig.cols == 0)

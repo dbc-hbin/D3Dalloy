@@ -2,6 +2,7 @@
 // malformed inputs. Host-portable: python3 graphics-translator/tests/run-bytecode-parsers-cpu.py
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/DXBCUtils.h"
+#include "DXBCParser/DxbcSignature.h"
 #include "DXBCParser/PipelineLibrary.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "../../src/d3d12/d3d12_dxil_subobjects.hpp"
@@ -203,6 +204,32 @@ static void signatures() {
   auto unterminated = legacy;
   unterminated.back() = 'x';
   reject(unterminated, "unterminated-name");
+
+  // The DXIL frontend parses ISG1/OSG1/PSG1 payloads grouped, as DXC sorts them:
+  // a multi-stream GS output restarts its registers per stream.
+  const auto gs = signature(32, {{0, "SV_Position", 0, 1, 3, 0, 0xf, 0, 0}, {0, "COLOR", 0, 0, 3, 1, 0xf, 0, 0},
+                                 {1, "SV_Position", 0, 1, 3, 0, 0xf, 0, 0}, {1, "COLOR", 0, 0, 3, 1, 0xf, 0, 0}});
+  DxmtDxbcSignatureInfo info{}, untouched{};
+  check(dxmt_dxbc_signature_parse(gs.data(), gs.size(), DXMT_DXBC_SIGNATURE_11_1, 1, &info) == 0 &&
+            info.parameter_count == 4 && info.stream_count == 2 && info.stream_parameters[1] == 2,
+        "dxil-gs-streams-grouped");
+  check(dxmt_dxbc_signature_parse(gs.data(), gs.size(), DXMT_DXBC_SIGNATURE_11_1, 0, &untouched) ==
+            DXMT_DXBC_SIGNATURE_REGISTER_ORDER && untouched.parameter_count == 0,
+        "dxil-gs-streams-ungrouped-rejected");
+  DxmtDxbcSignatureParameter record{};
+  check(dxmt_dxbc_signature_parameter(gs.data(), gs.size(), &info, 3, &record) == 0 && record.stream == 1 &&
+            record.register_index == 1 && record.name_size == 5 &&
+            !std::memcmp(gs.data() + record.name_offset, "COLOR", 6),
+        "dxil-gs-record");
+  check(dxmt_dxbc_signature_parameter(gs.data(), gs.size(), &info, 4, &record) == DXMT_DXBC_SIGNATURE_INVALID_ARGUMENT,
+        "dxil-record-index-past-count");
+  for (size_t size = 8; size < 8 + 4 * 32; size += 31)
+    check(dxmt_dxbc_signature_parse(gs.data(), size, DXMT_DXBC_SIGNATURE_11_1, 1, &untouched) ==
+              DXMT_DXBC_SIGNATURE_RECORDS && untouched.parameter_count == 0,
+          "dxil-truncated-record-table");
+  check(dxmt_dxbc_signature_parse(gs.data(), gs.size() - 1, DXMT_DXBC_SIGNATURE_11_1, 1, &untouched) ==
+            DXMT_DXBC_SIGNATURE_NAME,
+        "dxil-truncated-last-name");
 }
 
 static Bytes program(uint32_t version, std::initializer_list<uint32_t> body) {
