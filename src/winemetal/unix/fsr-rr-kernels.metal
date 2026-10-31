@@ -268,11 +268,9 @@ kernel void rr_neural_common(texture2d<float,access::read> depth [[texture(0)]],
                              texture2d<float,access::read> diffAlbedo [[texture(4)]],
                              texture2d<float,access::write> projectedDepth [[texture(5)]],
                              texture2d<float,access::write> pixelMotion [[texture(6)]],
-                             texture2d<float,access::write> normals [[texture(7)]],
                              texture2d<float,access::write> roughness [[texture(8)]],
                              texture2d<float,access::write> diffuse [[texture(9)]],
                              texture2d<float,access::write> specular [[texture(10)]],
-                             texture2d<float,access::write> zero [[texture(11)]],
                              constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
     if (p.x >= c.width || p.y >= c.height) return;
     float d = deviceDepth(p,depth.read(p).x,c);
@@ -284,12 +282,11 @@ kernel void rr_neural_common(texture2d<float,access::read> depth [[texture(0)]],
     projectedDepth.write(float4(isfinite(d) ? clamp(d,0.0f,1.0f) : reversed ? 0.0f : 1.0f),p);
     float2 mv = motion.read(p).xy*float2(c.motionScale[0]*c.width,c.motionScale[1]*c.height);
     pixelMotion.write(float4(mv,0,0),p);
+    // rr_geometry's decoded guide is the scaler's world normal input.
     float4 packed = packedNormals.read(p);
-    normals.write(float4(octNormal(packed.xy),0),p);
     roughness.write(float4(packed.z),p);
     diffuse.write(float4(diffuseAlbedo(diffAlbedo,p,c),0),p);
     specular.write(float4(albedo(specAlbedo,p,c),0),p);
-    zero.write(float4(0),p);
 }
 
 kernel void rr_neural_prepare(texture2d<float,access::read> source [[texture(0)]],

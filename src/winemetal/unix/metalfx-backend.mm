@@ -301,10 +301,11 @@ id<MTLTexture> makeExposureR16(id<MTLDevice> device) noexcept {
     }
 }
 
-using ResidencyBindings = std::array<id, 23>;
+// Feature-owned scratch only. Caller textures are D3D12 resources, resident
+// through the device residency set every D3D12 queue attaches at commit.
+using ResidencyBindings = std::array<id, 16>;
 
-ResidencyBindings residencyBindings(const TextureSet& textures,
-                                    id<MTLTexture> outputTexture, id<MTLTexture> convertedExposure,
+ResidencyBindings residencyBindings(id<MTLTexture> privateOutput, id<MTLTexture> convertedExposure,
                                     id<MTLTexture> linearColor, id<MTLTexture> combinedMask,
                                     id<MTLTexture> stagedColor, id<MTLTexture> stagedDepth,
                                     id<MTLTexture> stagedMotion, id<MTLTexture> stagedReactive,
@@ -313,19 +314,32 @@ ResidencyBindings residencyBindings(const TextureSet& textures,
                                     id<MTLTexture> alphaOutput, id<MTLBuffer> alphaParams,
                                     id<MTLBuffer> debugParams, id<MTLBuffer> copyParams) noexcept {
     return {{
-        asTexture(textures.color), asTexture(textures.depth), asTexture(textures.motion),
-        asTexture(textures.output), asTexture(textures.exposure), asTexture(textures.reactive),
-        asTexture(textures.composition), outputTexture, convertedExposure, linearColor,
+        privateOutput, convertedExposure, linearColor,
         combinedMask, stagedColor, stagedDepth, stagedMotion, stagedReactive,
         linearizeParams, maskParams, finishParams,
         alphaColor, alphaOutput, alphaParams, debugParams, copyParams,
     }};
 }
 
-// The caller owns an already-empty reusable set, or receives a newly created one.
-// On any binding failure the set is dropped, never returned with partial bindings.
+bool containsBinding(const ResidencyBindings& bindings, id value) noexcept {
+    return std::find(bindings.begin(), bindings.end(), value) != bindings.end();
+}
+
+// Order-insensitive equality of the non-null allocations.
+bool sameBindings(const ResidencyBindings& left, const ResidencyBindings& right) noexcept {
+    for (id value : left)
+        if (value && !containsBinding(right, value)) return false;
+    for (id value : right)
+        if (value && !containsBinding(left, value)) return false;
+    return true;
+}
+
+// The set belongs to a retired lease, or is new, so no committed or committing
+// command buffer uses it. An unchanged set is reused without a commit. On any
+// binding failure the set is dropped, never returned with partial bindings.
 id makeResidencySet(id<MTLDevice> device, const ResidencyBindings& candidates,
-                    id residency = nil) noexcept {
+                    ResidencyBindings& contents, id residency = nil) noexcept {
+    if (residency && sameBindings(candidates, contents)) return residency;
     if (@available(macOS 15.0, *)) {
         MTLResidencySetDescriptor* descriptor = nil;
         @try {
@@ -336,7 +350,10 @@ id makeResidencySet(id<MTLDevice> device, const ResidencyBindings& candidates,
                 NSError* error = nil;
                 residency = [device newResidencySetWithDescriptor:descriptor error:&error];
                 if (!residency) return nil;
+            } else {
+                [reinterpret_cast<id<MTLResidencySet>>(residency) removeAllAllocations];
             }
+            contents = {};
             for (std::size_t i = 0; i != std::size(candidates); ++i) {
                 id candidate = candidates[i];
                 if (!candidate) continue;
@@ -347,6 +364,7 @@ id makeResidencySet(id<MTLDevice> device, const ResidencyBindings& candidates,
                     [residency addAllocation:reinterpret_cast<id<MTLAllocation>>(candidate)];
             }
             [residency commit];
+            contents = candidates;
             return residency;
         } @catch (id) {
             [residency release];
@@ -357,20 +375,6 @@ id makeResidencySet(id<MTLDevice> device, const ResidencyBindings& candidates,
     }
     [residency release];
     return nil;
-}
-
-bool emptyResidencySet(id& set) noexcept {
-    if (@available(macOS 15.0, *)) {
-        @try {
-            id<MTLResidencySet> residency = reinterpret_cast<id<MTLResidencySet>>(set);
-            [residency removeAllAllocations];
-            [residency commit];
-            return true;
-        } @catch (id) {
-            releaseObject(set);
-        }
-    }
-    return false;
 }
 
 } // namespace
@@ -445,6 +449,8 @@ struct ExecutionResources {
     id<MTLBuffer> finishParams = nil;
     id<MTLBuffer> copyParams = nil;
     id residency = nil;
+    // Allocations last committed to residency; a retired set keeps them.
+    ResidencyBindings residencyContents{};
     // Argument tables hold resource IDs, not ownership; they are rebound on
     // every lease and recycled with the completed scratch side.
     id argumentTable = nil;
@@ -454,6 +460,7 @@ struct ExecutionResources {
         releaseObject(fsrArgumentTable);
         releaseObject(argumentTable);
         releaseObject(residency);
+        residencyContents = {};
         releaseObject(debugParams);
         releaseObject(alphaParams);
         releaseObject(alphaOutput);
@@ -490,6 +497,7 @@ struct ExecutionResources {
         std::swap(finishParams, other.finishParams);
         std::swap(copyParams, other.copyParams);
         std::swap(residency, other.residency);
+        std::swap(residencyContents, other.residencyContents);
         std::swap(argumentTable, other.argumentTable);
         std::swap(fsrArgumentTable, other.fsrArgumentTable);
     }
@@ -535,20 +543,29 @@ struct Feature::Impl {
         ExecutionResources resources;
         const PreparedFrame::Impl* owner = nullptr;
     };
-    // Completed bundles preserve same-PreparedFrame replay. Empty residency sets
-    // are bounded separately and can be rebound for a different prepared frame.
+    // Completed bundles preserve same-PreparedFrame replay. Retired residency
+    // sets keep their committed scratch, are bounded separately and can be
+    // rebound for a different prepared frame.
     std::mutex bundleMutex;
     std::array<CachedBundle, 2> idleBundles{};
     std::array<id, 2> idleResidencies{};
+    std::array<ResidencyBindings, 2> idleResidencyContents{};
     std::size_t nextBundleSlot = 0;
 
+    // Prefer the allocations already committed to the lease's residency set,
+    // so a steady frame rebinds the same scratch without another commit.
     id<MTLTexture> takeTexture(MTLPixelFormat format, NSUInteger width, NSUInteger height,
-                               MTLTextureUsage usage, bool allowGPUOptimizedContents = true) noexcept {
+                               MTLTextureUsage usage, bool allowGPUOptimizedContents = true,
+                               const ResidencyBindings* prefer = nullptr) noexcept {
         std::lock_guard<std::mutex> lock(scratchMutex);
-        for (auto& texture : idleTextures) {
-            if (scratchMatches(texture, format, width, height, usage, allowGPUOptimizedContents)) {
-                idleTextureBytes -= scratchBytes(texture);
-                return std::exchange(texture, nil);
+        for (bool preferred : {true, false}) {
+            if (preferred && !prefer) continue;
+            for (auto& texture : idleTextures) {
+                if ((!preferred || containsBinding(*prefer, texture)) &&
+                    scratchMatches(texture, format, width, height, usage, allowGPUOptimizedContents)) {
+                    idleTextureBytes -= scratchBytes(texture);
+                    return std::exchange(texture, nil);
+                }
             }
         }
         return nil;
@@ -588,8 +605,12 @@ struct Feature::Impl {
             nextTextureSlot = (nextTextureSlot + 1) % idleTextures.size();
         }
     }
-    id<MTLBuffer> takeBuffer(NSUInteger length) noexcept {
+    id<MTLBuffer> takeBuffer(NSUInteger length, const ResidencyBindings* prefer = nullptr) noexcept {
         std::lock_guard<std::mutex> lock(scratchMutex);
+        if (prefer)
+            for (auto& buffer : idleBuffers)
+                if (buffer && buffer.length == length && containsBinding(*prefer, buffer))
+                    return std::exchange(buffer, nil);
         for (auto& buffer : idleBuffers)
             if (buffer && buffer.length == length) return std::exchange(buffer, nil);
         return nil;
@@ -632,19 +653,22 @@ struct Feature::Impl {
     }
 
     void returnResources(ExecutionResources& resources) noexcept {
-        // The lease is retained until GPU completion. Commit the empty set
-        // before allowing any scratch allocation it named into the general pool.
-        if (resources.residency &&
-            !dormant.load(std::memory_order_relaxed) &&
-            emptyResidencySet(resources.residency)) {
+        // The lease is retained until GPU completion, so no command buffer uses
+        // this set any more. It keeps its committed scratch: the set retains
+        // those allocations, is never attached while idle, and is mutated only
+        // by the next lease that takes it. Pooled scratch may meanwhile join
+        // another set; residency is the union and hazards are fence-tracked.
+        if (resources.residency && !dormant.load(std::memory_order_relaxed)) {
             std::lock_guard<std::mutex> lock(bundleMutex);
-            for (auto& slot : idleResidencies) {
-                if (slot || dormant.load(std::memory_order_relaxed)) continue;
-                slot = std::exchange(resources.residency, nil);
+            for (std::size_t i = 0; i != idleResidencies.size(); ++i) {
+                if (idleResidencies[i] || dormant.load(std::memory_order_relaxed)) continue;
+                idleResidencies[i] = std::exchange(resources.residency, nil);
+                idleResidencyContents[i] = resources.residencyContents;
                 break;
             }
         }
         releaseObject(resources.residency);
+        resources.residencyContents = {};
         putTable(idleFsrTables, resources.fsrArgumentTable);
         putTable(idleExposureTables, resources.argumentTable);
         putBuffer(resources.debugParams);
@@ -665,17 +689,19 @@ struct Feature::Impl {
         putTexture(resources.privateOutput);
     }
 
-    // An idle set has no bindings. If all sets are still in completed bundles,
-    // reclaim one before scratch acquisition; active leases are never touched.
-    id takeResidency() noexcept {
+    // An idle set keeps its last committed scratch. If all sets are still in
+    // completed bundles, reclaim one before scratch acquisition; its scratch
+    // returns to the pool, where the new lease prefers it. Active leases are
+    // never touched.
+    id takeResidency(ResidencyBindings& contents) noexcept {
         ExecutionResources displaced;
         id residency = nil;
-        bool reclaimed = false;
         {
             std::lock_guard<std::mutex> lock(bundleMutex);
-            for (auto& slot : idleResidencies) {
-                if (!slot) continue;
-                residency = std::exchange(slot, nil);
+            for (std::size_t i = 0; i != idleResidencies.size(); ++i) {
+                if (!idleResidencies[i]) continue;
+                residency = std::exchange(idleResidencies[i], nil);
+                contents = std::exchange(idleResidencyContents[i], {});
                 break;
             }
             if (!residency) {
@@ -684,14 +710,12 @@ struct Feature::Impl {
                     entry.resources.swap(displaced);
                     entry.owner = nullptr;
                     residency = std::exchange(displaced.residency, nil);
-                    reclaimed = true;
+                    contents = std::exchange(displaced.residencyContents, {});
                     break;
                 }
             }
         }
-        if (reclaimed && !emptyResidencySet(residency)) residency = nil;
-        // The old set is empty (or released) before its scratch becomes reusable.
-        if (reclaimed) returnResources(displaced);
+        returnResources(displaced);
         return residency;
     }
 
@@ -762,6 +786,7 @@ struct Feature::Impl {
                 idleBundles[i].owner = nullptr;
             }
             residencies.swap(idleResidencies);
+            idleResidencyContents = {};
         }
         for (auto& resources : bundles) resources.release();
         for (auto& set : residencies) releaseObject(set);
@@ -873,22 +898,24 @@ id<MTLTexture> acquireScratch(Feature::Impl& feature, id<MTLTexture> source,
                               MTLPixelFormat format, MTLTextureUsage usage,
                               NSString* suffix, NSUInteger width = 0,
                               NSUInteger height = 0,
-                              bool allowGPUOptimizedContents = true) noexcept {
+                              bool allowGPUOptimizedContents = true,
+                              const ResidencyBindings* prefer = nullptr) noexcept {
     const NSUInteger actualWidth = width ? width : source.width;
     const NSUInteger actualHeight = height ? height : source.height;
     // A pooled texture keeps the label from its creation. Relabeling every
     // acquisition would build a new string per scratch texture per frame.
     if (id<MTLTexture> texture = feature.takeTexture(format, actualWidth, actualHeight, usage,
-                                                     allowGPUOptimizedContents))
+                                                     allowGPUOptimizedContents, prefer))
         return texture;
     return makeScratchTexture(feature.device, source, format, usage, suffix,
                               actualWidth, actualHeight, allowGPUOptimizedContents);
 }
 
-id<MTLTexture> acquireExposure(Feature::Impl& feature) noexcept {
+id<MTLTexture> acquireExposure(Feature::Impl& feature,
+                               const ResidencyBindings* prefer = nullptr) noexcept {
     id<MTLTexture> texture = feature.takeTexture(
         MTLPixelFormatR16Float, 1, 1,
-        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, true, prefer);
     return texture ? texture : makeExposureR16(feature.device);
 }
 
@@ -1482,7 +1509,8 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
         ScalerGeneration& generation = *frame.generation;
 
         if (!feature.takeBundle(*lease, &frame)) {
-            lease->residency = feature.takeResidency();
+            lease->residency = feature.takeResidency(lease->residencyContents);
+            const ResidencyBindings* prefer = &lease->residencyContents;
             // Scratch padded by copies or in-place edge writes keeps GPU-optimized
             // contents disabled; the combined mask is written once and keeps it.
             const bool fullInputCapacity =
@@ -1504,7 +1532,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 scalerOutput = acquireScratch(
                     feature, frame.output, generation.outputFormat, outputUsage,
                     @".YAAGL.MetalFX.ActiveOutput", frame.temporalOutputWidth,
-                    frame.temporalOutputHeight);
+                    frame.temporalOutputHeight, true, prefer);
                 if (!scalerOutput) {
                     setError(error, ErrorCode::ResourceCreationFailed,
                              "failed to allocate exact-size Private MetalFX output texture");
@@ -1517,7 +1545,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     feature, frame.color, generation.colorFormat,
                     generation.colorUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
                     @".YAAGL.FSR.LinearColor", generation.inputCapacityWidth,
-                    generation.inputCapacityHeight, fullInputCapacity);
+                    generation.inputCapacityHeight, fullInputCapacity, prefer);
                 if (!lease->linearColor) {
                     setError(error, ErrorCode::ResourceCreationFailed,
                              "failed to allocate exact-size FSR linear input texture");
@@ -1528,14 +1556,14 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     feature, frame.color, frame.color.pixelFormat,
                     generation.colorUsage | copyUsage(1u),
                     @".YAAGL.MetalFX.ActiveColor", generation.inputCapacityWidth,
-                    generation.inputCapacityHeight, fullInputCapacity);
+                    generation.inputCapacityHeight, fullInputCapacity, prefer);
             }
             if (frame.needsDepthStaging)
                 lease->stagedDepth = acquireScratch(
                     feature, frame.depth, frame.depth.pixelFormat,
                     generation.depthUsage | copyUsage(2u),
                     @".YAAGL.MetalFX.ActiveDepth", generation.inputCapacityWidth,
-                    generation.inputCapacityHeight, fullInputCapacity);
+                    generation.inputCapacityHeight, fullInputCapacity, prefer);
             if (frame.needsMotionStaging)
                 lease->stagedMotion = acquireScratch(
                     feature, frame.motion, frame.motion.pixelFormat,
@@ -1545,14 +1573,14 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                                                                 : frame.scalerMotionRect.width,
                     feature.create.lowResolutionMotionVectors() ? generation.inputCapacityHeight
                                                                 : frame.scalerMotionRect.height,
-                    !feature.create.lowResolutionMotionVectors() || fullInputCapacity);
+                    !feature.create.lowResolutionMotionVectors() || fullInputCapacity, prefer);
             if (frame.operations.combineCompositionMask && !frame.directMask) {
                 lease->combinedMask = acquireScratch(
                     feature, frame.reactive ? frame.reactive : frame.composition,
                     MTLPixelFormatR8Unorm,
                     MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
                     @".YAAGL.FSR.CombinedMask", generation.inputCapacityWidth,
-                    generation.inputCapacityHeight);
+                    generation.inputCapacityHeight, true, prefer);
                 if (!lease->combinedMask ||
                     !hasUsage(lease->combinedMask, generation.reactiveUsage)) {
                     setError(error, ErrorCode::ResourceCreationFailed,
@@ -1563,7 +1591,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 lease->stagedReactive = acquireScratch(
                     feature, frame.reactive, frame.reactive.pixelFormat,
                     generation.reactiveUsage | copyUsage(8u), @".YAAGL.MetalFX.ActiveReactive",
-                    generation.inputCapacityWidth, generation.inputCapacityHeight, fullInputCapacity);
+                    generation.inputCapacityWidth, generation.inputCapacityHeight, fullInputCapacity, prefer);
             }
             if ((!transfer && frame.needsColorStaging && !lease->stagedColor) ||
                 (frame.needsDepthStaging && !lease->stagedDepth) ||
@@ -1575,7 +1603,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
             }
 
             if (frame.needsExposureConversion) {
-                lease->convertedExposure = acquireExposure(feature);
+                lease->convertedExposure = acquireExposure(feature, prefer);
                 if (!lease->convertedExposure) {
                     setError(error, ErrorCode::ResourceCreationFailed,
                              "failed to allocate R16Float exposure conversion texture");
@@ -1586,10 +1614,10 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
             if (alpha) {
                 lease->alphaColor = acquireScratch(feature, frame.color, MTLPixelFormatRGBA16Float,
                     [generation.alphaScaler colorTextureUsage] | MTLTextureUsageShaderWrite,
-                    @".YAAGL.Alpha.Input", generation.inputCapacityWidth, generation.inputCapacityHeight);
+                    @".YAAGL.Alpha.Input", generation.inputCapacityWidth, generation.inputCapacityHeight, true, prefer);
                 lease->alphaOutput = acquireScratch(feature, frame.output, MTLPixelFormatRGBA16Float,
                     [generation.alphaScaler outputTextureUsage] | MTLTextureUsageShaderRead,
-                    @".YAAGL.Alpha.Output", frame.temporalOutputWidth, frame.temporalOutputHeight);
+                    @".YAAGL.Alpha.Output", frame.temporalOutputWidth, frame.temporalOutputHeight, true, prefer);
                 if (!lease->alphaColor || !lease->alphaOutput) {
                     setError(error, ErrorCode::ResourceCreationFailed, "failed to allocate temporal alpha textures");
                     return {};
@@ -1610,7 +1638,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
             };
             const auto makeBuffer = [&](const Params* records, std::size_t count) -> id<MTLBuffer> {
                 const std::size_t length = count * sizeof(Params);
-                id<MTLBuffer> buffer = feature.takeBuffer(length);
+                id<MTLBuffer> buffer = feature.takeBuffer(length, prefer);
                 if (buffer) {
                     std::memcpy(buffer.contents, records, length);
                     return buffer;
@@ -1684,7 +1712,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     {f.motionRect.x, f.motionRect.y}, {f.motionRect.width, f.motionRect.height},
                     {f.motionVectorScaleX, f.motionVectorScaleY}, uint32_t(feature.create.depthInverted()),
                     uint32_t(outputTransfer)};
-                lease->debugParams = feature.takeBuffer(sizeof(params));
+                lease->debugParams = feature.takeBuffer(sizeof(params), prefer);
                 if (lease->debugParams) std::memcpy(lease->debugParams.contents, &params, sizeof(params));
                 else lease->debugParams = [feature.device newBufferWithBytes:&params length:sizeof(params)
                                                                   options:MTLResourceStorageModeShared];
@@ -1714,12 +1742,12 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
 
             id reusable = std::exchange(lease->residency, nil);
             lease->residency = makeResidencySet(feature.device,
-                residencyBindings(frame.textures, scalerOutput, lease->convertedExposure,
+                residencyBindings(lease->privateOutput, lease->convertedExposure,
                     lease->linearColor, lease->combinedMask, lease->stagedColor,
                     lease->stagedDepth, lease->stagedMotion, lease->stagedReactive,
                     lease->linearizeParams, lease->maskParams, lease->finishParams,
                     lease->alphaColor, lease->alphaOutput, lease->alphaParams, lease->debugParams,
-                    lease->copyParams), reusable);
+                    lease->copyParams), lease->residencyContents, reusable);
             if (!lease->residency) {
                 setError(error, ErrorCode::ResourceCreationFailed,
                          "failed to create Metal4 residency set for MetalFX execution");

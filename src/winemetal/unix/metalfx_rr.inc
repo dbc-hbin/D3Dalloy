@@ -26,17 +26,30 @@ struct Resources {
   std::array<id<MTLTexture>, Count> textures{};
   id<MTLBuffer> params = nil;
   id<MTL4ArgumentTable> table = nil;
+  // Feature-owned scratch only; app inputs are D3D12 resources resident through
+  // the device set on every D3D12 queue. Rebuilt only after scratch changes.
   id<MTLResidencySet> residency = nil;
+  bool residencyDirty = true;
   ~Resources() {
     for (auto texture : textures) [texture release];
     [params release]; [table release]; [residency release];
   }
 };
+// Conversion pipelines depend only on the device. Features share them; the
+// weak cache never extends their lifetime past the last feature, and a failed
+// compilation is not cached so a later create retries.
+struct Pipelines {
+  id<MTLDevice> device = nil;
+  id<MTLComputePipelineState> conversion = nil;
+  id<MTLComputePipelineState> depthConversion = nil;
+  ~Pipelines() { [conversion release]; [depthConversion release]; [device release]; }
+};
 struct Core {
   id<MTLDevice> device = nil;
   id<MTL4Compiler> compiler = nil;
-  id<MTLComputePipelineState> conversion = nil;
-  id<MTLComputePipelineState> depthConversion = nil;
+  std::shared_ptr<const Pipelines> pipelines;
+  id<MTLComputePipelineState> conversion = nil; // borrowed from pipelines
+  id<MTLComputePipelineState> depthConversion = nil; // borrowed from pipelines
   WMTMetal4FXTemporalInfo info{};
   std::mutex mutex;
   std::array<std::shared_ptr<Generation>, 8> generations{};
@@ -44,7 +57,7 @@ struct Core {
   std::vector<std::unique_ptr<Resources>> pool;
   uint64_t lastGeneration = 0;
   float lastJitterX = 0, lastJitterY = 0;
-  ~Core() { [conversion release]; [depthConversion release]; [compiler release]; [device release]; }
+  ~Core() { [compiler release]; [device release]; }
 };
 struct Params {
   uint32_t x, y, width, height, sourceWidth, sourceHeight, mode, destinationX, destinationY, padding[3];
@@ -95,6 +108,30 @@ kernel void dxmt_rr_convert_depth(depth2d<float,access::read> source [[texture(0
   destination.write(dxmt_rr_value(float4(source.read(dxmt_rr_source(p,gid)),0,0,1),p,gid),gid);
 }
 )METAL";
+std::mutex pipelineMutex;
+std::vector<std::weak_ptr<const Pipelines>> pipelineCache;
+std::shared_ptr<const Pipelines> devicePipelines(id<MTLDevice> device) {
+  std::lock_guard lock(pipelineMutex);
+  std::shared_ptr<const Pipelines> found;
+  std::erase_if(pipelineCache, [&](const std::weak_ptr<const Pipelines> &entry) {
+    auto pipelines = entry.lock();
+    if (pipelines && pipelines->device == device) found = pipelines;
+    return !pipelines;
+  });
+  if (found) return found;
+  auto result = std::make_shared<Pipelines>();
+  NSError *error = nil;
+  id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:Kernel] options:nil error:&error];
+  id<MTLFunction> function = [library newFunctionWithName:@"dxmt_rr_convert"];
+  if (function) result->conversion = [device newComputePipelineStateWithFunction:function error:&error];
+  [function release]; function = [library newFunctionWithName:@"dxmt_rr_convert_depth"];
+  if (function) result->depthConversion = [device newComputePipelineStateWithFunction:function error:&error];
+  [function release]; [library release];
+  if (!result->conversion || !result->depthConversion) return {};
+  result->device = [device retain];
+  pipelineCache.push_back(result);
+  return result;
+}
 MTLPixelFormat format(size_t i) {
   switch (i) {
   case 1: case 10: case 11: return MTLPixelFormatR32Float;
@@ -210,13 +247,11 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
 - (void)dealloc {
   if (resources) {
     // Retirement runs after recording ownership has ended, including partial encode failure.
-    @try {
-      [resources->residency removeAllAllocations]; [resources->residency commit];
-      try {
-        std::lock_guard lock(core->mutex);
-        core->pool.push_back(std::move(resources));
-      } catch (...) { resources.reset(); }
-    } @catch (id) { resources.reset(); }
+    // The retired set keeps its scratch; only the next owner mutates it.
+    try {
+      std::lock_guard lock(core->mutex);
+      core->pool.push_back(std::move(resources));
+    } catch (...) { resources.reset(); }
   }
   [frame release]; [super dealloc];
 }
@@ -257,11 +292,15 @@ static bool dxmtRRResources(DXMTRRFrame *frame, dxmt_rr::Resources &resources,
       auto descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format(i) width:width height:height mipmapped:NO];
       descriptor.storageMode = MTLStorageModePrivate; descriptor.usage = usage;
       scratch = [core.device newTextureWithDescriptor:descriptor];
+      resources.residencyDirty = true;
       if (!scratch) return false;
     }
     bound[i] = scratch;
   }
-  if (!resources.params) resources.params = [core.device newBufferWithLength:(Count + 1) * 256 options:MTLResourceStorageModeShared];
+  if (!resources.params) {
+    resources.params = [core.device newBufferWithLength:(Count + 1) * 256 options:MTLResourceStorageModeShared];
+    resources.residencyDirty = true;
+  }
   if (!resources.table) {
     auto d = [MTL4ArgumentTableDescriptor new]; d.maxBufferBindCount = 1; d.maxTextureBindCount = 2;
     resources.table = [core.device newArgumentTableWithDescriptor:d error:nil]; [d release];
@@ -286,14 +325,9 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
         (info.feature_flags & ~(Flag | 1u | 2u | 4u | 8u | 64u))) return true;
     auto core = std::make_shared<Core>(); core->info = info;
     core->device = [device retain]; core->compiler = [compiler retain];
-    NSError *error = nil;
-    id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:Kernel] options:nil error:&error];
-    id<MTLFunction> function = [library newFunctionWithName:@"dxmt_rr_convert"];
-    if (function) core->conversion = [device newComputePipelineStateWithFunction:function error:&error];
-    [function release]; function = [library newFunctionWithName:@"dxmt_rr_convert_depth"];
-    if (function) core->depthConversion = [device newComputePipelineStateWithFunction:function error:&error];
-    [function release]; [library release];
-    if (!core->conversion || !core->depthConversion) { call->ret[1] = 0x8007000e; return true; }
+    core->pipelines = devicePipelines(device);
+    if (!core->pipelines) { call->ret[1] = 0x8007000e; return true; }
+    core->conversion = core->pipelines->conversion; core->depthConversion = core->pipelines->depthConversion;
     auto holder = [DXMTRRFeature new]; holder->core = std::move(core);
     call->ret[0] = uintptr_t(holder); call->ret[1] = 0;
     return true;
@@ -390,10 +424,13 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
   const bool reset = p.reset || call->args[3] || core.lastGeneration != frame->generation->serial;
   std::array<id<MTLTexture>,Count> bound{};
   if (!dxmtRRResources(frame,resources,bound)) { call->ret[1] = 0x8007000e; return true; }
-  [resources.residency removeAllAllocations];
+  if (resources.residencyDirty) {
+    [resources.residency removeAllAllocations];
+    for (auto texture : resources.textures) if (texture) [resources.residency addAllocation:texture];
+    [resources.residency addAllocation:resources.params]; [resources.residency commit];
+    resources.residencyDirty = false;
+  }
   for (size_t i = 0; i < Count; ++i) {
-    if (frame->inputs[i]) [resources.residency addAllocation:frame->inputs[i]];
-    if (bound[i]) [resources.residency addAllocation:bound[i]];
     Params values{}; const auto &r = frame->rects[i]; values.x = r.x; values.y = r.y;
     values.width = uint32_t(bound[i].width); values.height = uint32_t(bound[i].height);
     values.sourceWidth = r.width; values.sourceHeight = r.height;
@@ -418,7 +455,6 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
   outputParams.sourceWidth = outputParams.width; outputParams.sourceHeight = outputParams.height;
   outputParams.destinationX = p.output_rect.x; outputParams.destinationY = p.output_rect.y;
   std::memcpy(static_cast<char *>(resources.params.contents) + Count * 256,&outputParams,sizeof(outputParams));
-  [resources.residency addAllocation:resources.params]; [resources.residency commit];
   id<MTL4CommandBuffer> command = (id<MTL4CommandBuffer>)winemetal_metal4_command_buffer(call->args[0]);
   id<MTLFence> fence = (id<MTLFence>)call->args[2];
   if (!command || command.device != core.device || !fence || fence.device != core.device) {
