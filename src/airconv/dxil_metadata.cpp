@@ -25,6 +25,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "DXBCParser/ShaderBytecode.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "airconv_error.hpp"
 
@@ -79,9 +80,6 @@ Stage stageFromShaderKind(uint32_t shader_kind) {
 
 namespace {
 
-constexpr uint32_t kDXBCMagic = 0x43425844;    // 'DXBC'
-constexpr uint32_t kBitcodeMagic = 0xdec04342; // 'BC\xc0\xde'
-
 /** ISG1/OSG1/PSG1 elements are at least 32 bytes; PSG1 appends interpolation mode. */
 constexpr size_t kSignatureElementMinSize = 32;
 
@@ -94,10 +92,6 @@ uint32_t readU32(const uint8_t *p) {
   uint32_t value = 0;
   memcpy(&value, p, sizeof(value));
   return value;
-}
-
-uint32_t shaderKindFromProgramVersion(uint32_t version) {
-  return (version >> 16) & 0xffu;
 }
 
 /* ------------------------------------------------------------------ */
@@ -128,9 +122,6 @@ uint32_t getU32Or(const llvm::MDNode *node, unsigned index, uint32_t fallback) {
   return getU32(node, index, value) ? value : fallback;
 }
 
-bool getBool(const llvm::MDNode *node, unsigned index) {
-  return getU32Or(node, index, 0) != 0;
-}
 
 std::string getString(const llvm::MDNode *node, unsigned index) {
   if (!node || index >= node->getNumOperands())
@@ -150,28 +141,53 @@ llvm::Value *getValue(const llvm::MDNode *node, unsigned index) {
 /* Container                                                          */
 /* ------------------------------------------------------------------ */
 
-llvm::Expected<ChunkView> findChunk(const void *bytecode, size_t size, const char *fourcc) {
-  if (!bytecode || size < 32)
+llvm::Error bytecodeError(uint32_t status) {
+  switch (status) {
+  case DXMT_SHADER_BYTECODE_INVALID_ARGUMENT:
+    return createError("invalid shader bytecode argument");
+  case DXMT_SHADER_BYTECODE_TRUNCATED_CONTAINER:
     return createError("DXBC container is truncated");
-  auto *bytes = static_cast<const uint8_t *>(bytecode);
-  if (readU32(bytes) != kDXBCMagic)
+  case DXMT_SHADER_BYTECODE_CONTAINER_MAGIC:
     return createError("not a DXBC container");
-
-  uint32_t chunk_count = readU32(bytes + 28);
-  if (chunk_count > (size - 32) / 4)
+  case DXMT_SHADER_BYTECODE_CONTAINER_VERSION:
+    return createError("unsupported DXBC container version");
+  case DXMT_SHADER_BYTECODE_CONTAINER_SIZE:
+    return createError("DXBC container size is out of bounds");
+  case DXMT_SHADER_BYTECODE_CHUNK_TABLE:
     return createError("DXBC chunk table is out of bounds");
-
-  for (uint32_t i = 0; i < chunk_count; i++) {
-    uint32_t offset = readU32(bytes + 32 + i * 4);
-    if (offset < 32 || offset > size - 8)
-      return createError("DXBC chunk offset is out of bounds");
-    uint32_t chunk_size = readU32(bytes + offset + 4);
-    if (chunk_size > size - offset - 8)
-      return createError("DXBC chunk size is out of bounds");
-    if (!memcmp(bytes + offset, fourcc, 4))
-      return ChunkView{bytes + offset + 8, chunk_size};
+  case DXMT_SHADER_BYTECODE_CHUNK_OFFSET:
+    return createError("DXBC chunk offset is out of bounds");
+  case DXMT_SHADER_BYTECODE_CHUNK_SIZE:
+    return createError("DXBC chunk size is out of bounds");
+  case DXMT_SHADER_BYTECODE_CHUNK_LAYOUT:
+    return createError("DXBC chunks are not contiguous");
+  case DXMT_SHADER_BYTECODE_NOT_FOUND:
+    return createError("DXBC chunk not found");
+  case DXMT_SHADER_BYTECODE_TRUNCATED_DXIL:
+    return createError("DXIL chunk is truncated");
+  case DXMT_SHADER_BYTECODE_DXIL_ENCODING:
+    return createError("unsupported DXIL chunk encoding");
+  case DXMT_SHADER_BYTECODE_BITCODE_OFFSET:
+    return createError("DXIL bitcode offset is out of bounds");
+  case DXMT_SHADER_BYTECODE_BITCODE_SIZE:
+    return createError("DXIL bitcode size is out of bounds");
+  case DXMT_SHADER_BYTECODE_BITCODE_MAGIC:
+    return createError("DXIL chunk does not contain bitcode");
+  default:
+    llvm_unreachable("unexpected shader bytecode status");
   }
-  return createError("DXBC chunk not found");
+}
+
+llvm::Expected<ChunkView> findChunk(const void *bytecode, size_t size, const char *fourcc) {
+  if (!fourcc)
+    return bytecodeError(DXMT_SHADER_BYTECODE_INVALID_ARGUMENT);
+  uint32_t tag = uint32_t(uint8_t(fourcc[0])) | uint32_t(uint8_t(fourcc[1])) << 8 |
+                 uint32_t(uint8_t(fourcc[2])) << 16 | uint32_t(uint8_t(fourcc[3])) << 24;
+  DxmtShaderChunk chunk;
+  uint32_t status = dxmt_shader_container_find(bytecode, size, DXMT_SHADER_CONTAINER_DXIL, tag, 0, &chunk);
+  if (status != DXMT_SHADER_BYTECODE_SUCCESS)
+    return bytecodeError(status);
+  return ChunkView{static_cast<const uint8_t *>(bytecode) + chunk.offset, chunk.size};
 }
 
 /* ------------------------------------------------------------------ */
@@ -347,12 +363,7 @@ unsigned resourceTagIndex(const llvm::MDNode *node) {
    * backwards keeps older producers (fewer flag operands) working. */
   for (unsigned i = node->getNumOperands(); i > 6; i--) {
     llvm::MDNode *candidate = getNode(node, i - 1);
-    if (!candidate || candidate->getNumOperands() < 2)
-      continue;
-    uint32_t tag = 0;
-    if (!getU32(candidate, 0, tag))
-      continue;
-    if (tag == 0 || tag == 1)
+    if (candidate)
       return i - 1;
   }
   return ~0u;
@@ -366,17 +377,17 @@ llvm::Error parseResourceClass(
   for (unsigned i = 0; i < list->getNumOperands(); i++) {
     llvm::MDNode *node = getNode(list, i);
     if (!node)
-      continue;
+      return createError("DXIL resource metadata has an invalid declaration");
     ResourceBinding binding;
     binding.klass = klass;
-    binding.declaration_id = getU32Or(node, 0, 0);
-    binding.space = getU32Or(node, 3, 0);
-    binding.lower_bound = getU32Or(node, 4, 0);
-    binding.range_size = getU32Or(node, 5, 1);
+    uint32_t candidate_kind = 0;
+    if (!getU32(node, 0, binding.declaration_id) || !getU32(node, 3, binding.space) ||
+        !getU32(node, 4, binding.lower_bound) || !getU32(node, 5, binding.range_size) ||
+        !getU32(node, 6, candidate_kind))
+      return createError("DXIL resource metadata has an invalid integer field");
     binding.name = getString(node, 2);
     binding.symbol = getValue(node, 1);
 
-    uint32_t candidate_kind = getU32Or(node, 6, 0);
     switch (klass) {
     case ResourceClass::CBV:
       /* A constant buffer has no element type in metadata; the register access type
@@ -389,9 +400,12 @@ llvm::Error parseResourceClass(
       break;
     case ResourceClass::UAV:
       binding.kind = static_cast<ResourceKind>(candidate_kind);
-      binding.globally_coherent = getBool(node, 7);
-      binding.has_counter = getBool(node, 8);
-      binding.rasterizer_order = getBool(node, 9);
+      uint32_t coherent, counter, ordered;
+      if (!getU32(node, 7, coherent) || !getU32(node, 8, counter) || !getU32(node, 9, ordered))
+        return createError("DXIL UAV metadata has an invalid flag");
+      binding.globally_coherent = coherent != 0;
+      binding.has_counter = counter != 0;
+      binding.rasterizer_order = ordered != 0;
       break;
     case ResourceClass::SRV:
       binding.kind = static_cast<ResourceKind>(candidate_kind);
@@ -401,13 +415,19 @@ llvm::Error parseResourceClass(
     unsigned tag_index = resourceTagIndex(node);
     if (tag_index != ~0u) {
       llvm::MDNode *tags = getNode(node, tag_index);
-      uint32_t tag = getU32Or(tags, 0, ~0u);
-      if (tag == 0) {
-        /* Sampled format: the second operand is a DXIL::ComponentType. */
-        binding.component_type = static_cast<ComponentType>(getU32Or(tags, 1, 0));
-      } else if (tag == 1) {
-        /* Structured/raw buffer: the second operand is the byte stride. */
-        binding.structure_stride = getU32Or(tags, 1, 0);
+      if (tags->getNumOperands() % 2)
+        return createError("DXIL resource metadata has an incomplete tag pair");
+      for (unsigned j = 0; j < tags->getNumOperands(); j += 2) {
+        uint32_t tag = 0, value = 0;
+        if (!getU32(tags, j, tag) || !getU32(tags, j + 1, value))
+          return createError("DXIL resource metadata has an invalid tag pair");
+        if (tag == 0) {
+          /* Sampled format: the second operand is a DXIL::ComponentType. */
+          binding.component_type = static_cast<ComponentType>(value);
+        } else if (tag == 1) {
+          /* Structured/raw buffer: the second operand is the byte stride. */
+          binding.structure_stride = value;
+        }
       }
     }
 
@@ -1344,39 +1364,15 @@ const ResourceBinding *ModuleInfo::find_resource_at(
 }
 
 llvm::Expected<DXILProgram> FindDXILProgram(const void *bytecode, size_t size) {
-  auto chunk = findChunk(bytecode, size, "DXIL");
-  if (!chunk)
-    return chunk.takeError();
-
-  const uint8_t *data = chunk->data;
-  size_t chunk_size = chunk->size;
-
+  DxmtDxilProgram decoded;
+  uint32_t status = dxmt_shader_dxil_program(bytecode, size, &decoded);
+  if (status != DXMT_SHADER_BYTECODE_SUCCESS)
+    return bytecodeError(status);
   DXILProgram program;
-  if (chunk_size < 4)
-    return createError("DXIL chunk is truncated");
-  program.program_version = readU32(data);
-  program.shader_kind = shaderKindFromProgramVersion(program.program_version);
-
-  if (readU32(data) == kBitcodeMagic) {
-    program.bitcode = data;
-    program.bitcode_size = chunk_size;
-    return program;
-  }
-
-  /* Wrapped bitcode: 'DXIL' magic, a version, then the bitcode offset and size,
-   * both relative to the magic. */
-  if (chunk_size < 24 || memcmp(data + 8, "DXIL", 4))
-    return createError("unsupported DXIL chunk encoding");
-  uint32_t bitcode_offset = readU32(data + 16);
-  uint32_t bitcode_size = readU32(data + 20);
-  if (bitcode_offset < 16 || bitcode_offset > chunk_size - 8)
-    return createError("DXIL bitcode offset is out of bounds");
-  if (bitcode_size > chunk_size - 8 - bitcode_offset)
-    return createError("DXIL bitcode size is out of bounds");
-  program.bitcode = data + 8 + bitcode_offset;
-  program.bitcode_size = bitcode_size;
-  if (program.bitcode_size < 4 || readU32(program.bitcode) != kBitcodeMagic)
-    return createError("DXIL chunk does not contain bitcode");
+  program.program_version = decoded.program_version;
+  program.shader_kind = decoded.shader_kind;
+  program.bitcode = static_cast<const uint8_t *>(bytecode) + decoded.bitcode_offset;
+  program.bitcode_size = decoded.bitcode_size;
   return program;
 }
 

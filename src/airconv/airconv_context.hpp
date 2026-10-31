@@ -7,6 +7,7 @@ namespace dxmt {
 void initializeModule(llvm::Module &M);
 
 void runOptimizationPasses(llvm::Module &M);
+void lowerBoundedLoads(llvm::Module &M);
 
 void linkMSAD(llvm::Module &M);
 

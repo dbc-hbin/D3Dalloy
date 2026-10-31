@@ -101,7 +101,10 @@ read_control_flow(
 
   while (!Parser.EndOfShader()) {
     D3D10ShaderBinary::CInstruction Inst;
-    Parser.ParseInstruction(&Inst);
+    if (!Parser.ParseInstruction(&Inst)) {
+      sm50_shader->initialization_error = "Invalid DXBC instruction encoding";
+      break;
+    }
 
     switch (Inst.OpCode()) {
 
@@ -714,11 +717,11 @@ read_control_flow(
                 [&](BasicBlockConditionalBranch cond) -> BasicBlockTarget {
                   return BasicBlockConditionalBranch{cond.cond, clone(cond.true_branch), clone(cond.false_branch)};
                 },
-                [&](BasicBlockSwitch swc) -> BasicBlockTarget {
+                [&](const BasicBlockSwitch &swc) -> BasicBlockTarget {
                   BasicBlockSwitch new_swc;
                   new_swc.value = swc.value;
                   new_swc.case_default = clone(swc.case_default);
-                  for (auto [val, case_] : swc.cases) {
+                  for (auto &[val, case_] : swc.cases) {
                     new_swc.cases.insert({val, clone(case_)});
                   }
                   return new_swc;

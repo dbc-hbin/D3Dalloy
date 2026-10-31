@@ -48,7 +48,8 @@ endif
 airconv_lib_darwin = static_library('airconv', airconv_src,
   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],
-  dependencies        : [ dxbc_parser_native_dep ],
+  # Generated Rust archives belong to the final link, not the ar command.
+  dependencies        : [ dxbc_parser_native_dep.partial_dependency(compile_args: true, includes: true) ],
   link_args           : llvm_ld_flags_darwin,
   native              : dxmt_crossbuild
 )
@@ -56,7 +57,7 @@ airconv_lib_darwin = static_library('airconv', airconv_src,
 airconv_dep_darwin = declare_dependency(
   link_with           : [ airconv_lib_darwin ],
   include_directories : [ dxmt_include_path, include_directories('..') ],
-  dependencies        : llvm_system_dependencies,
+  dependencies        : llvm_system_dependencies + [dxbc_parser_native_dep],
   link_args           : [ llvm_ld_flags_darwin, llvm_native_deps ]
 )
 
@@ -95,6 +96,26 @@ root_status_test = executable('airconv-root-status-test',
   native: dxmt_crossbuild,
 )
 test('airconv-root-status', root_status_test)
+
+container_test = executable('airconv-container-test',
+  files('../../../graphics-translator/tests/airconv-container.test.cpp'),
+  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  cpp_args: [airconv_args],
+  dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
+  native: dxmt_crossbuild,
+)
+test('airconv-container', container_test)
+
+error_kind_clone_test = executable('airconv-error-kind-clone-test',
+  files('../../../graphics-translator/tests/airconv-error-kind-clone.test.cpp'),
+  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  cpp_args: [airconv_args],
+  dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
+  native: dxmt_crossbuild,
+)
+test('airconv-error-kind-clone', error_kind_clone_test, args: [
+  join_paths(meson.project_source_root(), 'graphics-translator/tests/dxil/advanced-texture-cmp2-cs.dxil'),
+])
 
 library_usage_test = executable('airconv-library-usage-test',
   files('../../../graphics-translator/tests/airconv-library-usage.test.cpp'),

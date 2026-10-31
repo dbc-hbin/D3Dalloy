@@ -19,6 +19,7 @@
  */
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <map>
 #include <string>
@@ -31,6 +32,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #include "dxbc_converter.hpp"
 #include "shader_common.hpp"
@@ -39,6 +41,22 @@
 namespace dxmt::dxil {
 
 using llvm::StringRef;
+
+class RootBindingError : public llvm::ErrorInfo<RootBindingError> {
+public:
+  static char ID;
+  std::string message;
+  explicit RootBindingError(StringRef message) : message(message.str()) {}
+  void log(llvm::raw_ostream &stream) const override { stream << message; }
+  std::error_code convertToErrorCode() const override {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+};
+
+template <typename... Args>
+llvm::Error rootBindingError(const char *format, const Args &...args) {
+  return llvm::make_error<RootBindingError>(llvm::formatv(format, args...).str());
+}
 
 // ---------------------------------------------------------------------------
 // Container access. All reads are bounds checked; malformed input yields an
@@ -704,6 +722,11 @@ llvm::Error LowerImmutableConstants(llvm::Module &module, SM50CompiledBitcodeInt
 class SM50ErrorInternal {
 public:
   llvm::SmallVector<char, 0> buf;
+  SM50_ERROR_KIND kind = SM50_ERROR_UNKNOWN;
+  // Clone allocations must report failure rather than LLVM SmallVector's fatal OOM.
+  char *cloned_buf = nullptr;
+  size_t cloned_size = 0;
+  ~SM50ErrorInternal() { std::free(cloned_buf); }
 };
 
 } // namespace dxmt::dxil

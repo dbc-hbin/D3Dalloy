@@ -26,6 +26,8 @@ UINT GetNumInstructionOperands(D3D10_SB_OPCODE_TYPE OpCode) {
 }
 
 CInstructionInfo g_InstructionInfo[D3D10_SB_NUM_OPCODES];
+// Generic operand counts for the Rust token-bounds check of ParseInstruction.
+static uint8_t g_InstructionOperandCounts[D3D10_SB_NUM_OPCODES];
 
 void InitInstructionInfo() {
 #define SET(OpCode, Name, NumOperands, PrecMask, OpClass)                      \
@@ -343,6 +345,9 @@ void InitInstructionInfo() {
       D3D10_SB_TEX_OP);
   SET(D3DWDDM1_3_SB_OPCODE_CHECK_ACCESS_FULLY_MAPPED,
       "check_access_fully_mapped", 2, 0x00, D3D10_SB_TEX_OP);
+
+  for (UINT i = 0; i < D3D10_SB_NUM_OPCODES; i++)
+    g_InstructionOperandCounts[i] = g_InstructionInfo[i].m_NumOperands;
 }
 
 struct GlobalInfoInitializer {
@@ -357,11 +362,18 @@ GlobalInfoInitializer init;
 //
 //*****************************************************************************
 
-void CShaderCodeParser::SetShader(CONST CShaderToken *pBuffer) {
+HRESULT CShaderCodeParser::SetShader(CONST CShaderToken *pBuffer,
+                                     UINT ByteSize) {
+  DxmtDxbcProgram program;
+  if (dxmt_dxbc_program_parse(pBuffer, ByteSize, &program) !=
+      DXMT_DXBC_PROGRAM_SUCCESS)
+    return E_FAIL;
   m_pShaderCode = pBuffer;
-  m_pShaderEndToken = pBuffer + pBuffer[1];
+  m_ByteSize = ByteSize;
+  m_pShaderEndToken = pBuffer + program.length_tokens;
   // First OpCode token
   m_pCurrentToken = &pBuffer[2];
+  return S_OK;
 }
 
 D3D10_SB_TOKENIZED_PROGRAM_TYPE CShaderCodeParser::ShaderType() {
@@ -531,9 +543,17 @@ void CShaderCodeParser::ParseOperand(COperandBase *pOperand) {
   }
 }
 
-void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
+BOOL CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
   pInstruction->Clear(true);
   const CShaderToken *pStart = m_pCurrentToken;
+  // Rust walks the tokens decoded below and bounds them by both the
+  // instruction length and the program. Nothing is decoded on failure.
+  DxmtDxbcInstruction bounds;
+  if (dxmt_dxbc_instruction_parse(m_pShaderCode, m_ByteSize,
+                                  g_InstructionOperandCounts,
+                                  D3D10_SB_NUM_OPCODES, CurrentTokenOffset(),
+                                  &bounds) != DXMT_DXBC_PROGRAM_SUCCESS)
+    return FALSE;
   const CShaderToken Token = *m_pCurrentToken++;
   pInstruction->m_OpCode = DECODE_D3D10_SB_OPCODE_TYPE(Token);
   pInstruction->m_OpClass = g_InstructionInfo[pInstruction->m_OpCode].m_OpClass;
@@ -541,7 +561,6 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
       DECODE_D3D11_SB_INSTRUCTION_PRECISE_VALUES(Token);
   pInstruction->m_bSaturate =
       DECODE_IS_D3D10_SB_INSTRUCTION_SATURATE_ENABLED(Token);
-  UINT InstructionLength = DECODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(Token);
   pInstruction->m_NumOperands =
       GetNumInstructionOperands(pInstruction->m_OpCode);
 
@@ -553,10 +572,9 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
       ((pInstruction->m_OpCode == D3D11_SB_OPCODE_DCL_INTERFACE) ||
        (pInstruction->m_OpCode == D3D11_SB_OPCODE_DCL_FUNCTION_TABLE))) {
     pInstruction->m_ExtendedOpCodeCount = 1;
-    CShaderToken Token = *m_pCurrentToken++;
     // these instructions may be longer than can fit in the normal
-    // instructionlength field
-    InstructionLength = (UINT)(Token);
+    // instructionlength field; Rust already read that length.
+    m_pCurrentToken++;
   } else {
     pInstruction->m_ExtendedOpCodeCount = 0;
     for (int i = 0;
@@ -611,9 +629,7 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
 
     // not bothering to keep custom-data for now. TODO: store
     pInstruction->m_CustomData.Type = DECODE_D3D10_SB_CUSTOMDATA_CLASS(Token);
-    InstructionLength = *m_pCurrentToken;
     if (*m_pCurrentToken < 2) {
-      InstructionLength = 2;
       pInstruction->m_CustomData.pData = 0;
       pInstruction->m_CustomData.DataSizeInBytes = 0;
     } else {
@@ -666,6 +682,11 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
           }
 
           pMessage->pOperands[i].Clear();
+          UINT next;
+          if (dxmt_dxbc_operand_parse(pData, Length * sizeof(UINT),
+                                      UINT(pOperands - pData), 5 + OpLength,
+                                      &next) != DXMT_DXBC_PROGRAM_SUCCESS)
+            break;
           pOperands =
               ParseOperandAt(&pMessage->pOperands[i], pOperands, pOpEnd);
         }
@@ -685,6 +706,8 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
       }
       case D3D10_SB_CUSTOMDATA_COMMENT: {
         // Guarantee that the C string comment is Null-terminated
+        if (!pInstruction->m_CustomData.DataSizeInBytes)
+          break;
         *((LPSTR)pInstruction->m_CustomData.pData +
           pInstruction->m_CustomData.DataSizeInBytes - 1) = '\0';
         break;
@@ -710,7 +733,7 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
     // table ID
     // table length
     // data
-    assert(InstructionLength ==
+    assert(bounds.length_tokens ==
            (3 + (bExtended ? 1 : 0) +
             pInstruction->m_FunctionTableDecl.TableLength));
 
@@ -747,7 +770,7 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
     // table size
     // num types/array length
     // data
-    assert(InstructionLength == (4 + (bExtended ? 1 : 0) +
+    assert(bounds.length_tokens == (4 + (bExtended ? 1 : 0) +
                                  pInstruction->m_InterfaceDecl.TableLength));
 
     pInstruction->m_InterfaceDecl.pFunctionTableIdentifiers = (UINT *)malloc(
@@ -1097,7 +1120,8 @@ void CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
     break;
   }
   }
-  m_pCurrentToken = pStart + InstructionLength;
+  m_pCurrentToken = pStart + bounds.length_tokens;
+  return TRUE;
 }
 
 //*****************************************************************************

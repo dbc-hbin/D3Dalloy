@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+#pragma once
+#include <stdint.h>
+
+// DXBC signature chunk payloads (the bytes after the chunk header). The caller keeps
+// the payload readable and immutable for each call; name offsets refer to it.
+enum {
+    DXMT_DXBC_SIGNATURE_SUCCESS = 0,
+    DXMT_DXBC_SIGNATURE_INVALID_ARGUMENT = 1,
+    DXMT_DXBC_SIGNATURE_HEADER = 2,
+    DXMT_DXBC_SIGNATURE_RECORDS = 3,
+    DXMT_DXBC_SIGNATURE_NAME = 4,
+    DXMT_DXBC_SIGNATURE_REGISTER_ORDER = 5,
+    DXMT_DXBC_SIGNATURE_STREAM_ORDER = 6,
+};
+
+enum {
+    // ISGN, OSGN, PCSG: 24-byte records without stream or precision.
+    DXMT_DXBC_SIGNATURE_LEGACY = 0,
+    // OSG5: 28-byte records with a stream.
+    DXMT_DXBC_SIGNATURE_STREAM = 1,
+    // ISG1, OSG1, PSG1: 32-byte records with stream and minimum precision.
+    DXMT_DXBC_SIGNATURE_11_1 = 2,
+};
+
+typedef struct DxmtDxbcSignatureInfo {
+    uint32_t parameter_count;
+    uint32_t records_offset;
+    uint32_t format;
+    // Grouped parses only: records are partitioned into stream_count leading
+    // streams, stream_parameters[s] records each. Ungrouped parses report all
+    // records in stream 0.
+    uint32_t stream_count;
+    uint32_t stream_parameters[4];
+    // Sum over records of name length plus one terminator.
+    uint64_t string_bytes;
+} DxmtDxbcSignatureInfo;
+
+typedef struct DxmtDxbcSignatureParameter {
+    uint32_t stream;
+    uint32_t semantic_index;
+    uint32_t system_value;
+    uint32_t component_type;
+    uint32_t register_index;
+    uint32_t mask;
+    uint32_t never_writes_mask;
+    // Zero (D3D_MIN_PRECISION_DEFAULT) for formats without precision.
+    uint32_t min_precision;
+    // NUL-terminated name at name_offset; name_size excludes the terminator.
+    uint32_t name_offset;
+    uint32_t name_size;
+} DxmtDxbcSignatureParameter;
+
+#ifdef __cplusplus
+static_assert(sizeof(DxmtDxbcSignatureInfo) == 40, "DXBC signature info ABI");
+static_assert(sizeof(DxmtDxbcSignatureParameter) == 40, "DXBC signature parameter ABI");
+extern "C" {
+#endif
+
+// Validates the header, the complete record table, every name and register
+// order (nondecreasing per stream when grouped, else across the table). Grouped
+// parses reject records whose streams are not nondecreasing in 0..3. An empty
+// signature succeeds without a table. Output remains untouched on failure.
+uint32_t dxmt_dxbc_signature_parse(const void *data, uint64_t length, uint32_t format, uint32_t grouped,
+                                   DxmtDxbcSignatureInfo *out);
+// Requires unmodified info from a successful parse of the same immutable input.
+uint32_t dxmt_dxbc_signature_parameter(const void *data, uint64_t length, const DxmtDxbcSignatureInfo *info,
+                                       uint32_t index, DxmtDxbcSignatureParameter *out);
+
+#ifdef __cplusplus
+}
+#endif

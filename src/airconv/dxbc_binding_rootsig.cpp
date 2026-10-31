@@ -1082,12 +1082,10 @@ deserialize_root_signature(
     /* A DXBC container: the signature is its RTS0 chunk. */
     const void *pRawRootSig;
     UINT RawRootSigSize;
-    if (FAILED(microsoft::DXBCGetRootSignature(bytecode, &pRawRootSig, &RawRootSigSize))) {
-      assert(0 && "invalid root signature blob");
+    if (FAILED(microsoft::DXBCGetRootSignature(bytecode, bytecode_length, &pRawRootSig, &RawRootSigSize))) {
       return nullptr;
     }
     if (FAILED(deserializer.Deserialize(pRawRootSig, RawRootSigSize))) {
-      assert(0 && "invalid root signature");
       return nullptr;
     }
     return &deserializer.desc_1_1_.Desc_1_1;

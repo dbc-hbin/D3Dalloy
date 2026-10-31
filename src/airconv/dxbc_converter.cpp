@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <bit>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,7 @@
  */
 using dxmt::dxil::SM50CompiledBitcodeInternal;
 using dxmt::dxil::SM50ErrorInternal;
+char dxmt::dxil::RootBindingError::ID = 0;
 
 void dxmt::dxbc::initialize_sample_mask_constant(
     llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args) {
@@ -78,11 +80,15 @@ static void failCall(SM50ErrorInternal *errorObj, sm50_error_t *ppError) {
 }
 
 /** Logs any llvm::Error into the SM50 error buffer, keeping the NUL terminator. */
-static void reportError(llvm::Error error, llvm::raw_ostream &errorOut) {
+static void reportError(llvm::Error error, llvm::raw_ostream &errorOut, SM50ErrorInternal *errorObj) {
   std::string message;
   llvm::raw_string_ostream stream(message);
   llvm::handleAllErrors(
-    std::move(error), [&](const llvm::ErrorInfoBase &base) { base.log(stream); }
+    std::move(error), [&](const llvm::ErrorInfoBase &base) {
+      if (base.isA<dxmt::dxil::RootBindingError>())
+        errorObj->kind = SM50_ERROR_ROOT_BINDING;
+      base.log(stream);
+    }
   );
   stream.flush();
   errorOut << message << '\0';
@@ -104,7 +110,7 @@ static int compileDXILPipelineStage(
     kind, (dxmt::dxbc::SM50ShaderInternal *)first, (dxmt::dxbc::SM50ShaderInternal *)second, args, name
   );
   if (!compiled) {
-    reportError(compiled.takeError(), errorOut);
+    reportError(compiled.takeError(), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
@@ -1640,6 +1646,9 @@ dxmt::dxbc::build_argument_tables(dxmt::dxbc::SM50ShaderInternal *shader) {
     if (srv.read || srv.sampled || srv.compared) {
       flags |= MTL_SM50_SHADER_ARGUMENT_READ_ACCESS;
     }
+    if (srv.acceleration_structure) {
+      flags |= MTL_SM50_SHADER_ARGUMENT_ACCELERATION_STRUCTURE;
+    }
     shader->args_reflection.push_back({
       .Type = SM50BindingType::SRV,
       .SM50BindingSlot = range_id,
@@ -1865,7 +1874,7 @@ AIRCONV_API int SM50Initialize(
   if (dxmt::dxil::IsDXILContainer(pBytecode, BytecodeSize)) {
     auto sm50_shader = new SM50ShaderInternal();
     if (auto err = dxmt::dxil::PrepareShader(*sm50_shader, pBytecode, BytecodeSize, pRefl)) {
-      reportError(std::move(err), errorOut);
+      reportError(std::move(err), errorOut, errorObj);
       delete sm50_shader;
       failCall(errorObj, ppError);
       return 1;
@@ -1895,7 +1904,12 @@ AIRCONV_API int SM50Initialize(
 
   CShaderToken *ShaderCode = (CShaderToken *)(BYTE *)codeBlob;
   // 1. Collect information about the shader.
-  D3D10ShaderBinary::CShaderCodeParser CodeParser(ShaderCode);
+  D3D10ShaderBinary::CShaderCodeParser CodeParser;
+  if (FAILED(CodeParser.SetShader(ShaderCode, DXBCParser.GetBlobSize(codeBlobIdx)))) {
+    errorOut << "Invalid DXBC bytecode: malformed shader program\0";
+    failCall(errorObj, ppError);
+    return 1;
+  }
   CSignatureParser inputParser;
   if (DXBCGetInputSignature(pBytecode, &inputParser) != S_OK) {
     errorOut << "Invalid DXBC bytecode: input signature not found\0";
@@ -2434,7 +2448,7 @@ AIRCONV_API int SM50Compile(
      * AIR module, so it uses its own context and module instead of `shader.air`. */
     auto lowered = dxmt::dxil::LowerShader(*sm50_shader, FunctionName, pArgs);
     if (!lowered) {
-      reportError(lowered.takeError(), errorOut);
+      reportError(lowered.takeError(), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2442,14 +2456,14 @@ AIRCONV_API int SM50Compile(
     auto &pModule = info->module;
     if (indirect_views) {
       if (auto error = applyIndirectViewLocations(*pModule, *indirect_views)) {
-        reportError(std::move(error), errorOut);
+        reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
     }
     if (msaa_mesh) {
       if (auto error = dxmt::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
-        reportError(std::move(error), errorOut);
+        reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
@@ -2457,33 +2471,33 @@ AIRCONV_API int SM50Compile(
     if (msaa_pixel) {
       if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel, coarse_shading != nullptr,
                                                    conservative_raster != nullptr)) {
-        reportError(std::move(error), errorOut);
+        reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
     } else if (msaa_vertex) {
       if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex, conservative_raster != nullptr)) {
-        reportError(std::move(error), errorOut);
+        reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
     } else if (sample_frequency_mask != 0xffffffffu) {
       if (auto error = dxmt::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
-        reportError(std::move(error), errorOut);
+        reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
     }
     if (logic_op) {
       if (auto error = dxmt::logic_op::applyLogicOp(*pModule, *logic_op)) {
-        reportError(std::move(error), errorOut);
+        reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
     }
     if (mark_rov_buffers) {
       if (auto error = activateRasterOrderedBuffers(*pModule, marker_samples, sample_frequency_mask)) {
-        reportError(std::move(error), errorOut);
+        reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
@@ -2495,14 +2509,14 @@ AIRCONV_API int SM50Compile(
       linkSamplePos(*pModule);
 
     if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
     runOptimizationPasses(*pModule);
     auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2512,13 +2526,14 @@ AIRCONV_API int SM50Compile(
     metallib::MetallibWriter writer;
 
     if (auto error = writer.Write(*pModule, OS)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
 
     info.reset();
 
+    delete errorObj;
     *ppBitcode = (sm50_bitcode_t)compiled.release();
     return 0;
   }
@@ -2539,14 +2554,14 @@ AIRCONV_API int SM50Compile(
   }
   if (indirect_views) {
     if (auto error = applyIndirectViewLocations(*pModule, *indirect_views)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
   }
   if (msaa_mesh) {
     if (auto error = dxmt::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2554,33 +2569,33 @@ AIRCONV_API int SM50Compile(
   if (msaa_pixel) {
     if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel, coarse_shading != nullptr,
                                                    conservative_raster != nullptr)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
   } else if (msaa_vertex) {
     if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex, conservative_raster != nullptr)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
   } else if (sample_frequency_mask != 0xffffffffu) {
     if (auto error = dxmt::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
   }
   if (logic_op) {
     if (auto error = dxmt::logic_op::applyLogicOp(*pModule, *logic_op)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
   }
   if (mark_rov_buffers) {
     if (auto error = activateRasterOrderedBuffers(*pModule, marker_samples, sample_frequency_mask)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2592,7 +2607,7 @@ AIRCONV_API int SM50Compile(
     linkSamplePos(*pModule);
 
   if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
@@ -2602,7 +2617,7 @@ AIRCONV_API int SM50Compile(
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2613,13 +2628,14 @@ AIRCONV_API int SM50Compile(
   metallib::MetallibWriter writer;
 
   if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
 
   pModule.reset();
 
+  delete errorObj;
   *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
@@ -2680,7 +2696,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   linkTessellation(*pModule);
 
   if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
@@ -2690,7 +2706,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2701,13 +2717,14 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   metallib::MetallibWriter writer;
 
   if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
 
   pModule.reset();
 
+  delete errorObj;
   *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
@@ -2772,13 +2789,13 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   linkTessellation(*pModule);
   if (dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_MESH, SM50_SHADER_D3D12_MSAA_MESH_DATA>(pDomainShaderArgs, &msaa_mesh))
     if (auto error = msaa::transformMesh(*pModule, *msaa_mesh, conservative != nullptr)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
 
   if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
@@ -2788,7 +2805,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2799,13 +2816,14 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   metallib::MetallibWriter writer;
 
   if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
 
   pModule.reset();
 
+  delete errorObj;
   *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
@@ -2873,7 +2891,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
     linkSamplePos(*pModule);
 
   if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
@@ -2883,7 +2901,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2894,13 +2912,14 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   metallib::MetallibWriter writer;
 
   if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
 
   pModule.reset();
 
+  delete errorObj;
   *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
@@ -2960,7 +2979,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
       pGeometryShaderArgs, &conservative);
   if (dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_MESH, SM50_SHADER_D3D12_MSAA_MESH_DATA>(pGeometryShaderArgs, &msaa_mesh))
     if (auto error = msaa::transformMesh(*pModule, *msaa_mesh, conservative != nullptr)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2971,7 +2990,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
     linkSamplePos(*pModule);
   
   if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
@@ -2981,7 +3000,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
   if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
     if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut);
+      reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
@@ -2992,13 +3011,14 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   metallib::MetallibWriter writer;
 
   if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut);
+    reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
   }
 
   pModule.reset();
 
+  delete errorObj;
   *ppBitcode = (sm50_bitcode_t)compiled.release();
   return 0;
 }
@@ -3063,11 +3083,42 @@ AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_
   }
   auto pInternal = (SM50ErrorInternal *)pError;
   // LLVM diagnostics may already contain a terminator; never count it as message text.
-  auto end = std::find(pInternal->buf.begin(), pInternal->buf.end(), '\0');
-  auto str_len = std::min(static_cast<size_t>(end - pInternal->buf.begin()), BufferSize - 1);
-  memcpy(pBuffer, pInternal->buf.data(), str_len);
+  const char *data = pInternal->cloned_buf ? pInternal->cloned_buf : pInternal->buf.data();
+  size_t size = pInternal->cloned_buf ? pInternal->cloned_size : pInternal->buf.size();
+  size_t str_len = size ? static_cast<size_t>(std::find(data, data + size, '\0') - data) : 0;
+  str_len = std::min(str_len, BufferSize - 1);
+  if (str_len)
+    memcpy(pBuffer, data, str_len);
   pBuffer[str_len] = '\0';
   return str_len;
+}
+
+AIRCONV_API SM50_ERROR_KIND SM50GetErrorKind(sm50_error_t pError) {
+  return pError ? ((SM50ErrorInternal *)pError)->kind : SM50_ERROR_UNKNOWN;
+}
+
+AIRCONV_API int SM50CloneError(sm50_error_t pError, sm50_error_t *ppError) {
+  if (!ppError)
+    return 1;
+  *ppError = nullptr;
+  if (!pError)
+    return 0;
+  auto source = (SM50ErrorInternal *)pError;
+  auto clone = new (std::nothrow) SM50ErrorInternal();
+  if (!clone)
+    return 1;
+  clone->kind = source->kind;
+  clone->cloned_size = source->cloned_buf ? source->cloned_size : source->buf.size();
+  if (clone->cloned_size) {
+    clone->cloned_buf = static_cast<char *>(std::malloc(clone->cloned_size));
+    if (!clone->cloned_buf) {
+      delete clone;
+      return 1;
+    }
+    memcpy(clone->cloned_buf, source->cloned_buf ? source->cloned_buf : source->buf.data(), clone->cloned_size);
+  }
+  *ppError = (sm50_error_t)clone;
+  return 0;
 }
 
 AIRCONV_API void SM50FreeError(sm50_error_t pError) {

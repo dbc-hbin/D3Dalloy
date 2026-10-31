@@ -84,7 +84,8 @@ runOptimizationPasses(llvm::Module &M) {
       auto *call = dyn_cast<CallInst>(&instruction);
       auto *callee = call ? call->getCalledFunction() : nullptr;
       if (!callee || !callee->isDeclaration() || !callee->getName().startswith("air.") ||
-          callee->getName().startswith("air.atomic_") || call->arg_empty())
+          callee->getName().startswith("air.atomic_") || callee->getName().startswith("air.is_null_") ||
+          call->arg_empty())
         continue;
       auto *pointer = dyn_cast<PointerType>(call->getArgOperand(0)->getType());
       auto *type = pointer && !pointer->isOpaque() && pointer->getAddressSpace() == 1
@@ -97,7 +98,14 @@ runOptimizationPasses(llvm::Module &M) {
     }
     for (auto *call : accesses) {
       IRBuilder<> builder(call);
-      Value *present = builder.CreateIsNotNull(call->getArgOperand(0));
+      auto *texture = call->getArgOperand(0);
+      auto *type = cast<StructType>(cast<PointerType>(texture->getType())->getNonOpaquePointerElementType());
+      // Native texture arguments are opaque handles, not ordinary pointers.
+      // Use the same null query as Metal's is_null_texture, including without shader validation.
+      auto is_null = M.getOrInsertFunction(
+          ("air.is_null_" + type->getName().drop_front(StringRef("struct._").size()).drop_back(2)).str(),
+          FunctionType::get(builder.getInt1Ty(), {texture->getType()}, false));
+      Value *present = builder.CreateNot(builder.CreateCall(is_null, {texture}));
       for (auto &argument : call->args()) {
         auto *pointer = dyn_cast<PointerType>(argument->getType());
         auto *type = pointer && !pointer->isOpaque() && pointer->getAddressSpace() == 2
@@ -242,6 +250,30 @@ runOptimizationPasses(llvm::Module &M) {
 
   // Optimize the IR!
   MPM.run(M, MAM);
+  lowerBoundedLoads(M);
+}
+
+void
+lowerBoundedLoads(llvm::Module &M) {
+  /* dxmt.bounded.load.N(valid, pointer) is a device load that reads zero when
+   * `valid` is false: Metal defines device loads through a null pointer as zero. */
+  SmallVector<Function *, 4> helpers;
+  for (auto &function : M)
+    if (function.isDeclaration() && function.getName().startswith("dxmt.bounded.load."))
+      helpers.push_back(&function);
+  for (auto *helper : helpers) {
+    for (auto *user : make_early_inc_range(helper->users())) {
+      auto *call = cast<CallInst>(user);
+      IRBuilder<> builder(call);
+      auto *pointer = call->getArgOperand(1);
+      auto *bounded = builder.CreateSelect(call->getArgOperand(0), pointer,
+                                           ConstantPointerNull::get(cast<PointerType>(pointer->getType())));
+      auto *load = builder.CreateLoad(call->getType(), bounded);
+      call->replaceAllUsesWith(load);
+      call->eraseFromParent();
+    }
+    helper->eraseFromParent();
+  }
 }
 
 void
@@ -253,8 +285,8 @@ removeNamedMetadata(llvm::Module &M, StringRef Name) {
 
 template<size_t N>
 void linkShader(llvm::Module &M, const unsigned char (&bitcode)[N]) {
-  auto buffer = MemoryBuffer::getMemBufferCopy(StringRef((const char *)bitcode, N));
-  Expected<std::unique_ptr<Module>> modOrErr = parseBitcodeFile(buffer->getMemBufferRef(), M.getContext());
+  Expected<std::unique_ptr<Module>> modOrErr =
+      parseBitcodeFile(MemoryBufferRef(StringRef((const char *)bitcode, N), ""), M.getContext());
 
   if (!modOrErr) {
     // not expected to see this unless something really bad happened in compile time

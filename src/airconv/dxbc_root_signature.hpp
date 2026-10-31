@@ -19,6 +19,7 @@
 #pragma once
 #include "d3d12.h"
 #include "../d3d12/d3d12_interfaces_ext.hpp"
+#include "DXBCParser/ShaderBytecode.h"
 
 #include <cstring>
 #include <cstdint>
@@ -46,6 +47,13 @@ struct RawRootDescriptorTable {
   uint32_t NumDescriptorRanges;
   uint32_t DescriptorRangesOffset;
 };
+
+// Wire strides consumed by the Rust validator, independent of host pointer size.
+static_assert(sizeof(RawRootSignatureDesc) == 24 && sizeof(RawRootParameter) == 12 &&
+              sizeof(RawRootDescriptorTable) == 8 && sizeof(D3D12_ROOT_CONSTANTS) == 12);
+static_assert(sizeof(D3D12_ROOT_DESCRIPTOR) == 8 && sizeof(D3D12_ROOT_DESCRIPTOR1) == 12 &&
+              sizeof(D3D12_DESCRIPTOR_RANGE) == 20 && sizeof(D3D12_DESCRIPTOR_RANGE1) == 24);
+static_assert(sizeof(D3D12_STATIC_SAMPLER_DESC) == 52 && sizeof(D3D12_STATIC_SAMPLER_DESC1) == 56);
 
 template <typename TO, typename FROM>
 void
@@ -92,7 +100,7 @@ public:
   template <typename T>
   T *
   AllocateBuffer(size_t Count, size_t Size = sizeof(T)) {
-    if (Count == 0)
+    if (Count == 0 || Size > SIZE_MAX / Count)
       return nullptr;
     T *ptr = (T *)malloc(Size * Count);
     if (ptr)
@@ -109,7 +117,8 @@ public:
 
     Output.Flags = (D3D12_ROOT_SIGNATURE_FLAGS)raw_root_sig_->Flags;
     /* Root Parameters */
-    auto Parameters = (const RawRootParameter *)((char *)raw_root_sig_ + raw_root_sig_->RootParametersOffset);
+    auto Parameters = raw_root_sig_->NumParameters
+        ? (const RawRootParameter *)((char *)raw_root_sig_ + raw_root_sig_->RootParametersOffset) : nullptr;
     auto pParameters = AllocateBuffer<ROOT_PARAMETER>(raw_root_sig_->NumParameters);
     if (raw_root_sig_->NumParameters && !pParameters)
       return E_OUTOFMEMORY;
@@ -124,7 +133,8 @@ public:
       case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: {
         auto Table = (const RawRootDescriptorTable *)((char *)raw_root_sig_ + RootParameter.PayloadOffset);
         ParameterOut.DescriptorTable.NumDescriptorRanges = Table->NumDescriptorRanges;
-        auto Ranges = (DESCRIPTOR_RANGE *)((char *)raw_root_sig_ + Table->DescriptorRangesOffset);
+        auto Ranges = Table->NumDescriptorRanges
+            ? (DESCRIPTOR_RANGE *)((char *)raw_root_sig_ + Table->DescriptorRangesOffset) : nullptr;
         ParameterOut.DescriptorTable.pDescriptorRanges = Ranges;
 
         break;
@@ -247,6 +257,8 @@ public:
       return E_OUTOFMEMORY;
 
     memcpy(raw_root_sig_, pBytecode, DataSize);
+    if (!dxmt_validate_root_signature(raw_root_sig_, DataSize))
+      return E_INVALIDARG;
 
     desc_1_0_.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
     desc_1_1_.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;

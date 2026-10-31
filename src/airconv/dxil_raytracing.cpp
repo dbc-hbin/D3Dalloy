@@ -59,6 +59,7 @@
 
 #include "dxil_raytracing.h"
 #include "dxil_workgraph.h"
+#include "DXBCParser/ShaderBytecode.h"
 
 #include <algorithm>
 #include <array>
@@ -186,33 +187,9 @@ struct LibraryExport {
  * match that spelling, so the name D3D12 exports is the unmangled one, which the
  * container records in its RDAT chunk and in its DXC reflection.
  *
- * On-disk layout read here (DXC's container runtime data, the same RDAT chunk
- * `dxc` writes and `dxil-dis` reads). Every field used below was verified against
- * the container Microsoft DXC produces for graphics-translator's raytracing
- * fixture, whose string table holds each entry's mangled name immediately followed
- * by its public one:
- *
- *   RuntimeDataHeader { u32 Version; u32 PartCount; u32 PartOffsets[]; }
- *   each part        { u32 PartType; u32 PartSize; } then the part payload
- *   part 1           the string table: NUL terminated strings
- *   part 4           the function table: { u32 RecordCount; u32 RecordStride; }
- *                    followed by RecordCount records of RecordStride bytes, each
- *                    beginning { u32 NameOffset; u32 UnmangledNameOffset; ... }
- *
- * Both offsets are relative to the start of the string table payload. Nothing but
- * those two fields is read, and RecordCount/RecordStride are taken from the chunk
- * rather than assumed, so a container from another DXC revision is bounds checked
- * the same way.
+ * Rust reads the part table, strided records and bounded string bytes. C++ owns
+ * the resulting names; no borrowed view escapes this call.
  */
-constexpr uint32_t kRdatPartStringTable = 1;
-constexpr uint32_t kRdatPartFunctionInfo = 4;
-
-uint32_t readU32(const uint8_t *p) {
-  uint32_t value = 0;
-  std::memcpy(&value, p, sizeof(value));
-  return value;
-}
-
 /**
  * Collect the public name of every entry point the container records, keyed by the
  * container's own (mangled) name. False when the container has no usable RDAT.
@@ -220,65 +197,17 @@ uint32_t readU32(const uint8_t *p) {
 bool readRuntimeDataPublicNames(
   const void *bytecode, uint64_t size, std::map<std::string, std::string> &out
 ) {
-  DXBCChunkView rdat;
-  if (!FindDXBCChunk(bytecode, static_cast<size_t>(size), "RDAT", rdat) || rdat.size < 8)
-    return false;
-  const uint32_t part_count = readU32(rdat.data + 4);
-  if (!part_count || 8 + uint64_t(part_count) * 4 > rdat.size)
+  DxmtRdatInfo rdat;
+  if (dxmt_shader_rdat_parse(bytecode, size, &rdat) != DXMT_SHADER_BYTECODE_SUCCESS)
     return false;
 
-  const uint8_t *strings = nullptr;
-  size_t strings_size = 0;
-  const uint8_t *functions = nullptr;
-  size_t functions_size = 0;
-  for (uint32_t i = 0; i < part_count; ++i) {
-    const size_t header = 8 + 4ull * i;
-    if (header + 4 > rdat.size)
-      return false;
-    const uint32_t part_offset = readU32(rdat.data + header);
-    if (part_offset > rdat.size || rdat.size - part_offset < 8)
-      return false;
-    const uint32_t part_type = readU32(rdat.data + part_offset);
-    const uint32_t part_size = readU32(rdat.data + part_offset + 4);
-    if (part_size > rdat.size - part_offset - 8)
-      return false;
-    const uint8_t *part = rdat.data + part_offset + 8;
-    if (part_type == kRdatPartStringTable) {
-      strings = part;
-      strings_size = part_size;
-    } else if (part_type == kRdatPartFunctionInfo) {
-      functions = part;
-      functions_size = part_size;
-    }
-  }
-  if (!strings || !functions || functions_size < 8)
-    return false;
-
-  const uint32_t record_count = readU32(functions);
-  const uint32_t record_stride = readU32(functions + 4);
-  if (!record_count || record_stride < 8 ||
-      8 + uint64_t(record_count) * record_stride > functions_size)
-    return false;
-
-  auto read_string = [&](uint32_t offset, std::string &value) {
-    if (offset >= strings_size)
-      return false;
-    const char *begin = reinterpret_cast<const char *>(strings + offset);
-    const void *terminator = std::memchr(begin, '\0', strings_size - offset);
-    if (!terminator)
-      return false;
-    value.assign(begin, static_cast<const char *>(terminator));
-    return !value.empty();
-  };
-
-  for (uint32_t i = 0; i < record_count; ++i) {
-    const uint8_t *record = functions + 8 + size_t(i) * record_stride;
-    std::string container_name, public_name;
-    if (!read_string(readU32(record), container_name))
+  const char *bytes = static_cast<const char *>(bytecode);
+  for (uint32_t i = 0; i < rdat.record_count; ++i) {
+    DxmtRdatFunction function;
+    if (dxmt_shader_rdat_function(bytecode, size, &rdat, i, &function) != DXMT_SHADER_BYTECODE_SUCCESS)
       continue;
-    if (!read_string(readU32(record + 4), public_name))
-      continue;
-    out.emplace(std::move(container_name), std::move(public_name));
+    out.emplace(std::string(bytes + function.name_offset, function.name_size),
+                std::string(bytes + function.public_name_offset, function.public_name_size));
   }
   return !out.empty();
 }

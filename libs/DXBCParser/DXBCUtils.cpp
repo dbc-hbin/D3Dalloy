@@ -3,6 +3,7 @@
 
 #include "DXBCUtils.h"
 #include "BlobContainer.h"
+#include "DxbcSignature.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -17,7 +18,9 @@ UINT DXBCGetSizeAssumingValidPointer(const void* pDXBC)
 {
     if( !pDXBC ) return 0;
 
-    return *(UINT*)((const BYTE*)pDXBC + DXBCSizeOffset);
+    uint32_t size = 0;
+    dxmt_shader_container_declared_size(pDXBC, sizeof(DXBCHeader), &size);
+    return size;
 }
 
 //---------------------------------------------------------------------------------------------------------------------------------
@@ -185,33 +188,6 @@ HRESULT DXBCGetPatchConstantSignature( const void* pBlobContainer, CSignaturePar
     return E_FAIL;
 }
 
-HRESULT DXBCGetRootSignature( const void *pBlobContainer, const void **ppBlob, UINT *pByteSize) {
-    CDXBCParser DXBCParser;
-    HRESULT hr = S_OK;
-    if( FAILED(hr = DXBCParser.ReadDXBCAssumingValidSize(pBlobContainer) ) )
-    {
-        assert(pBlobContainer);
-        return hr;
-    }
-
-    UINT BlobIndex = DXBCParser.FindNextMatchingBlob( DXBC_RootSignature, 0 );
-    if( BlobIndex != DXBC_BLOB_NOT_FOUND )
-    {
-        const void* pBlob = DXBCParser.GetBlob(BlobIndex);
-        UINT BlobSize = DXBCParser.GetBlobSize(BlobIndex);
-        if( !BlobSize )
-        {
-            return E_FAIL;
-        }
-        *ppBlob = pBlob;
-        *pByteSize = BlobSize;
-        return S_OK;
-    }
-
-        assert(0);
-    return E_FAIL;
-}
-
 //=================================================================================================================================
 // CSignatureParser
 
@@ -241,166 +217,6 @@ void CSignatureParser::Cleanup()
     m_cParameters = 0;
     m_OwnParameters = TRUE;
 }
-
-//---------------------------------------------------------------------------------------------------------------------------------
-// BoundedStringLength
-//
-// Safely returns length of null-terminated string pointed to by pBegin (not including null)
-// given that the memory [ pBegin, pEnd ) is readable.
-//
-// Returns an error if pBegin doesn't point to a valid NT string.
-//
-HRESULT BoundedStringLength(const char *pBegin,
-                            const char *pEnd,
-                            UINT *pLength)
-{
-    if (pBegin >= pEnd)
-    {
-        // No readable memory!
-        return E_FAIL;
-    }
-
-    const char *pc = pBegin;
-    
-    while (pc < pEnd && *pc)
-    {
-        ++pc;
-    }
-
-    if (pc == pEnd)
-    {
-        return E_FAIL;
-    }
-
-    assert(!*pc);
-
-    *pLength = (UINT)(pc-pBegin);
-    return S_OK;
-}
-
-typedef struct _D3D10_INTERNALSHADER_SIGNATURE
-{
-    UINT Parameters;      // Number of parameters
-    UINT ParameterInfo;   // Offset to D3D10_INTERNALSHADER_PARAMETER[Parameters]
-} D3D10_INTERNALSHADER_SIGNATURE, *LPD3D10_INTERNALSHADER_SIGNATURE;
-
-typedef struct _D3D10_INTERNALSHADER_PARAMETER
-{
-    UINT SemanticName;                              // Offset to LPCSTR
-    UINT SemanticIndex;                             // Semantic Index
-    D3D10_NAME SystemValue;                         // Internally defined enumeration
-    D3D10_REGISTER_COMPONENT_TYPE  ComponentType;   // Type of  of bits
-    UINT Register;                                  // Register Index
-    BYTE Mask;                                      // Combination of D3D10_COMPONENT_MASK values
-
-    // The following unioned fields, NeverWrites_Mask and AlwaysReads_Mask, are exclusively used for 
-    // output signatures or input signatures, respectively.
-    //
-    // For an output signature, NeverWrites_Mask indicates that the shader the signature belongs to never 
-    // writes to the masked components of the output register.  Meaningful bits are the ones set in Mask above.
-    //
-    // For an input signature, AlwaysReads_Mask indicates that the shader the signature belongs to always
-    // reads the masked components of the input register.  Meaningful bits are the ones set in the Mask above.
-    //
-    // This allows many shaders to share similar signatures even though some of them may not happen to use
-    // all of the inputs/outputs - something which may not be obvious when authored.  The NeverWrites_Mask
-    // and AlwaysReads_Mask can be checked in a debug layer at runtime for the one interesting case: that a 
-    // shader that always reads a value is fed by a shader that always writes it.  Cases where shaders may
-    // read values or may not cannot be validated unfortunately.  
-    //
-    // In scenarios where a signature is being passed around standalone (so it isn't tied to input or output 
-    // of a given shader), this union can be zeroed out in the absence of more information.  This effectively
-    // forces off linkage validation errors with the signature, since if interpreted as a input or output signature
-    // somehow, since the meaning on output would be "everything is always written" and on input it would be 
-    // "nothing is always read".
-    union
-    {
-        BYTE NeverWrites_Mask;  // For an output signature, the shader the signature belongs to never 
-                                // writes the masked components of the output register.
-        BYTE AlwaysReads_Mask;  // For an input signature, the shader the signature belongs to always
-                                // reads the masked components of the input register.
-    };
-} D3D10_INTERNALSHADER_PARAMETER, *LPD3D10_INTERNALSHADER_PARAMETER;
-
-typedef struct _D3D11_INTERNALSHADER_PARAMETER_11_1
-{
-    UINT Stream;                                    // Stream index (parameters must appear in non-decreasing stream order)
-    UINT SemanticName;                              // Offset to LPCSTR
-    UINT SemanticIndex;                             // Semantic Index
-    D3D10_NAME SystemValue;                         // Internally defined enumeration
-    D3D10_REGISTER_COMPONENT_TYPE  ComponentType;   // Type of  of bits
-    UINT Register;                                  // Register Index
-    BYTE Mask;                                      // Combination of D3D10_COMPONENT_MASK values
-
-    // The following unioned fields, NeverWrites_Mask and AlwaysReads_Mask, are exclusively used for 
-    // output signatures or input signatures, respectively.
-    //
-    // For an output signature, NeverWrites_Mask indicates that the shader the signature belongs to never 
-    // writes to the masked components of the output register.  Meaningful bits are the ones set in Mask above.
-    //
-    // For an input signature, AlwaysReads_Mask indicates that the shader the signature belongs to always
-    // reads the masked components of the input register.  Meaningful bits are the ones set in the Mask above.
-    //
-    // This allows many shaders to share similar signatures even though some of them may not happen to use
-    // all of the inputs/outputs - something which may not be obvious when authored.  The NeverWrites_Mask
-    // and AlwaysReads_Mask can be checked in a debug layer at runtime for the one interesting case: that a 
-    // shader that always reads a value is fed by a shader that always writes it.  Cases where shaders may
-    // read values or may not cannot be validated unfortunately.  
-    //
-    // In scenarios where a signature is being passed around standalone (so it isn't tied to input or output 
-    // of a given shader), this union can be zeroed out in the absence of more information.  This effectively
-    // forces off linkage validation errors with the signature, since if interpreted as a input or output signature
-    // somehow, since the meaning on output would be "everything is always written" and on input it would be 
-    // "nothing is always read".
-    union
-    {
-        BYTE NeverWrites_Mask;  // For an output signature, the shader the signature belongs to never 
-                                // writes the masked components of the output register.
-        BYTE AlwaysReads_Mask;  // For an input signature, the shader the signature belongs to always
-                                // reads the masked components of the input register.
-    };
-
-    D3D_MIN_PRECISION MinPrecision;                 // Minimum precision of input/output data
-} D3D11_INTERNALSHADER_PARAMETER_11_1, *LPD3D11_INTERNALSHADER_PARAMETER_11_1;
-
-typedef struct _D3D11_INTERNALSHADER_PARAMETER_FOR_GS
-{
-    UINT Stream;                                    // Stream index (parameters must appear in non-decreasing stream order)
-    UINT SemanticName;                              // Offset to LPCSTR
-    UINT SemanticIndex;                             // Semantic Index
-    D3D10_NAME SystemValue;                         // Internally defined enumeration
-    D3D10_REGISTER_COMPONENT_TYPE  ComponentType;   // Type of  of bits
-    UINT Register;                                  // Register Index
-    BYTE Mask;                                      // Combination of D3D10_COMPONENT_MASK values
-
-    // The following unioned fields, NeverWrites_Mask and AlwaysReads_Mask, are exclusively used for 
-    // output signatures or input signatures, respectively.
-    //
-    // For an output signature, NeverWrites_Mask indicates that the shader the signature belongs to never 
-    // writes to the masked components of the output register.  Meaningful bits are the ones set in Mask above.
-    //
-    // For an input signature, AlwaysReads_Mask indicates that the shader the signature belongs to always
-    // reads the masked components of the input register.  Meaningful bits are the ones set in the Mask above.
-    //
-    // This allows many shaders to share similar signatures even though some of them may not happen to use
-    // all of the inputs/outputs - something which may not be obvious when authored.  The NeverWrites_Mask
-    // and AlwaysReads_Mask can be checked in a debug layer at runtime for the one interesting case: that a 
-    // shader that always reads a value is fed by a shader that always writes it.  Cases where shaders may
-    // read values or may not cannot be validated unfortunately.  
-    //
-    // In scenarios where a signature is being passed around standalone (so it isn't tied to input or output 
-    // of a given shader), this union can be zeroed out in the absence of more information.  This effectively
-    // forces off linkage validation errors with the signature, since if interpreted as a input or output signature
-    // somehow, since the meaning on output would be "everything is always written" and on input it would be 
-    // "nothing is always read".
-    union
-    {
-        BYTE NeverWrites_Mask;  // For an output signature, the shader the signature belongs to never 
-                                // writes the masked components of the output register.
-        BYTE AlwaysReads_Mask;  // For an input signature, the shader the signature belongs to always
-                                // reads the masked components of the input register.
-    };
-} D3D11_INTERNALSHADER_PARAMETER_FOR_GS, *LPD3D11_INTERNALSHADER_PARAMETER_FOR_GS;
 
 inline D3D10_SB_NAME ConvertToSB(D3D10_NAME Value, UINT SemanticIndex)
 {
@@ -579,223 +395,120 @@ inline D3D10_SB_REGISTER_COMPONENT_TYPE ConvertToSB(D3D10_REGISTER_COMPONENT_TYP
 }
 
 //---------------------------------------------------------------------------------------------------------------------------------
-// CSignatureParser::ReadSignature()
+// ReadSignatureParameters
+//
+// Rust validates the header, record table, every name and the register/stream ordering before
+// anything is allocated. One allocation then holds the parameters, their lowercase name char sums
+// and, unless names reference the blob, copies of the names.
+static HRESULT ReadSignatureParameters(const void* pSignature, UINT BlobSize, uint32_t Format, bool bGrouped,
+                                       bool bForceStringReference, DxmtDxbcSignatureInfo& Info,
+                                       D3D11_SIGNATURE_PARAMETER*& pParameters, UINT*& pCharSums)
+{
+    if( !pSignature ||
+        dxmt_dxbc_signature_parse(pSignature, BlobSize, Format, bGrouped, &Info) != DXMT_DXBC_SIGNATURE_SUCCESS )
+    {
+        return E_FAIL;
+    }
+    if( !Info.parameter_count )
+    {
+        return S_OK;
+    }
+    const uint64_t ParameterBytes = uint64_t(Info.parameter_count) * sizeof(D3D11_SIGNATURE_PARAMETER);
+    const uint64_t CharSumBytes = uint64_t(Info.parameter_count) * sizeof(UINT);
+    const uint64_t TotalBytes = ParameterBytes + CharSumBytes + (bForceStringReference ? 0 : Info.string_bytes);
+    if( TotalBytes > SIZE_MAX )
+    {
+        return E_OUTOFMEMORY;
+    }
+    BYTE* pStorage = (BYTE*)malloc(size_t(TotalBytes));
+    if( !pStorage )
+    {
+        return E_OUTOFMEMORY;
+    }
+    D3D11_SIGNATURE_PARAMETER* pDst = (D3D11_SIGNATURE_PARAMETER*)pStorage;
+    UINT* pSums = (UINT*)(pStorage + ParameterBytes);
+    char* pNextDstString = (char*)(pStorage + ParameterBytes + CharSumBytes);
+    for( UINT i = 0; i < Info.parameter_count; i++ )
+    {
+        DxmtDxbcSignatureParameter Record;
+        if( dxmt_dxbc_signature_parameter(pSignature, BlobSize, &Info, i, &Record) != DXMT_DXBC_SIGNATURE_SUCCESS )
+        {
+            free(pStorage);
+            return E_FAIL;
+        }
+        char* pSrcString = (char*)pSignature + Record.name_offset;
+        const UINT Length = Record.name_size + 1;
+
+        // Ungrouped parsers expose a single signature, so every parameter belongs to stream 0.
+        pDst[i].Stream = bGrouped ? Record.stream : 0;
+        pDst[i].ComponentType = ConvertToSB((D3D10_REGISTER_COMPONENT_TYPE)Record.component_type);
+        pDst[i].Mask = (BYTE)Record.mask;
+        pDst[i].Register = Record.register_index;
+        pDst[i].SemanticIndex = Record.semantic_index;
+        pDst[i].SystemValue = ConvertToSB((D3D10_NAME)Record.system_value, Record.semantic_index);
+        pDst[i].NeverWrites_Mask = (BYTE)Record.never_writes_mask; // union with AlwaysReadMask
+        // Only 11.1 records carry a precision; Rust reports D3D_MIN_PRECISION_DEFAULT otherwise.
+        pDst[i].MinPrecision = (D3D_MIN_PRECISION)Record.min_precision;
+        if( bForceStringReference )
+        {
+            pDst[i].SemanticName = pSrcString;
+        }
+        else
+        {
+            // Rust summed every validated name length into string_bytes.
+            memcpy(pNextDstString, pSrcString, Length);
+            pDst[i].SemanticName = pNextDstString;
+            pNextDstString += Length;
+        }
+
+        pSums[i] = 0;
+        for( UINT j = 0; j < Length; j++ )
+        {
+            pSums[i] += tolower(pSrcString[j]);
+        }
+    }
+    pParameters = pDst;
+    pCharSums = pSums;
+    return S_OK;
+}
+
+//---------------------------------------------------------------------------------------------------------------------------------
+// CSignatureParser::ReadSignature11_1()
 HRESULT CSignatureParser::ReadSignature11_1(const void* pSignature, UINT BlobSize, bool bForceStringReference )
 {
     if( m_cParameters )
     {
         Cleanup();
     }
-    if( !pSignature || BlobSize < sizeof(D3D10_INTERNALSHADER_SIGNATURE) )
+    DxmtDxbcSignatureInfo Info;
+    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, DXMT_DXBC_SIGNATURE_11_1, false, bForceStringReference,
+                                         Info, m_pSignatureParameters, m_pSemanticNameCharSums);
+    if( FAILED(hr) )
     {
-        return E_FAIL;
-    }
-    D3D10_INTERNALSHADER_SIGNATURE* pHeader = (D3D10_INTERNALSHADER_SIGNATURE*)pSignature;
-    if( pHeader->Parameters == 0 )
-    {
-        m_cParameters = 0;
-        return S_OK;
-    }
-
-    // If parameter count is less than MaxParameters calculation of SignatureAndParameterInfoSize will not overflow.
-    const UINT MaxParameters = ((UINT_MAX - sizeof(D3D10_INTERNALSHADER_SIGNATURE)) / sizeof(D3D10_INTERNALSHADER_PARAMETER));
-
-    if (pHeader->Parameters > MaxParameters)
-    {
-        return E_FAIL;
-    }
-    
-    UINT ParameterInfoSize = pHeader->Parameters * sizeof(D3D11_INTERNALSHADER_PARAMETER_11_1);
-    UINT SignatureAndParameterInfoSize = ParameterInfoSize + sizeof(D3D10_INTERNALSHADER_SIGNATURE);
-    
-    if (BlobSize < SignatureAndParameterInfoSize)
-    {
-        return E_FAIL;
-    }
-
-    // Keep end pointer around for checking
-    const void *pEnd = static_cast<const BYTE*>(pSignature) + BlobSize;
-    const D3D11_INTERNALSHADER_PARAMETER_11_1* pParameterInfo = (D3D11_INTERNALSHADER_PARAMETER_11_1*)((const BYTE*)pSignature + pHeader->ParameterInfo);
-    UINT cParameters = pHeader->Parameters;
-    UINT TotalStringLength = 0;
-    UINT LastRegister = 0;
-    for( UINT i = 0; i < cParameters; i++ )
-    {
-        UINT StringLength;
-        if (FAILED(BoundedStringLength((const char*)((const BYTE*)pSignature + pParameterInfo[i].SemanticName),
-                                       (const char*) pEnd,
-                                        &StringLength)))
-        {
-            return E_FAIL;
-        }
-        if (!bForceStringReference)
-        {
-            TotalStringLength += StringLength + 1;
-        }
-        if( i > 0 )
-        {
-            // registers must show up in nondecreasing order in a signature
-            if( LastRegister > pParameterInfo[i].Register )
-            {
-                return E_FAIL;
-            }
-        }
-        LastRegister = pParameterInfo[i].Register;
-    }
-    UINT TotalParameterSize = pHeader->Parameters*sizeof(D3D11_SIGNATURE_PARAMETER);
-    UINT TotalCharSumsSize = sizeof(UINT)*cParameters; // char sums for each SemanticName
-    m_pSignatureParameters = (D3D11_SIGNATURE_PARAMETER*)malloc((TotalParameterSize + TotalCharSumsSize + TotalStringLength)*sizeof(BYTE));
-    if( !m_pSignatureParameters )
-    {
-        return E_OUTOFMEMORY;
+        return hr;
     }
     m_OwnParameters = TRUE;
-    m_pSemanticNameCharSums = (UINT*)((BYTE*)m_pSignatureParameters + TotalParameterSize);
-    char* pNextDstString = (char*)((BYTE*)m_pSemanticNameCharSums + TotalCharSumsSize);
-    for( UINT i = 0; i < cParameters; i++ )
-    {
-        char* pNextSrcString = (char*)((const BYTE*)pSignature + pParameterInfo[i].SemanticName);
-
-        m_pSignatureParameters[i].Stream = 0;
-        m_pSignatureParameters[i].ComponentType = ConvertToSB(pParameterInfo[i].ComponentType);
-        m_pSignatureParameters[i].Mask = pParameterInfo[i].Mask;
-        m_pSignatureParameters[i].Register = pParameterInfo[i].Register;
-        m_pSignatureParameters[i].SemanticIndex = pParameterInfo[i].SemanticIndex;
-        m_pSignatureParameters[i].SystemValue = ConvertToSB(pParameterInfo[i].SystemValue,pParameterInfo[i].SemanticIndex);
-        m_pSignatureParameters[i].SemanticName = bForceStringReference ? pNextSrcString : pNextDstString;
-        m_pSignatureParameters[i].SemanticIndex = pParameterInfo[i].SemanticIndex;
-        m_pSignatureParameters[i].NeverWrites_Mask = pParameterInfo[i].NeverWrites_Mask; // union with AlwaysReadMask
-        m_pSignatureParameters[i].MinPrecision = pParameterInfo[i].MinPrecision;
-
-        // This strlen was checked with BoundedStringLength in the first loop.
-#pragma prefast( suppress : __WARNING_PRECONDITION_NULLTERMINATION_VIOLATION )
-        UINT length = (UINT)strlen(pNextSrcString) + 1;
-
-        if (!bForceStringReference)
-        {
-            // Calculation of TotalStringLength ensures that we have space in pNextDstString
-#pragma prefast( suppress : __WARNING_POTENTIAL_BUFFER_OVERFLOW_LOOP_DEPENDENT )
-            memcpy(pNextDstString, pNextSrcString, length);
-            pNextDstString += length;
-        }
-
-        m_pSemanticNameCharSums[i] = 0;
-        for( UINT j = 0; j < length; j++ )
-        {
-            m_pSemanticNameCharSums[i] += tolower(pNextSrcString[j]);
-        }
-    }
-    m_cParameters = cParameters;
+    m_cParameters = Info.parameter_count;
     return S_OK;
 }
 
-
+//---------------------------------------------------------------------------------------------------------------------------------
+// CSignatureParser::ReadSignature4()
 HRESULT CSignatureParser::ReadSignature4(const void* pSignature, UINT BlobSize, bool bForceStringReference )
 {
     if( m_cParameters )
     {
         Cleanup();
     }
-    if( !pSignature || BlobSize < sizeof(D3D10_INTERNALSHADER_SIGNATURE) )
+    DxmtDxbcSignatureInfo Info;
+    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, DXMT_DXBC_SIGNATURE_LEGACY, false, bForceStringReference,
+                                         Info, m_pSignatureParameters, m_pSemanticNameCharSums);
+    if( FAILED(hr) )
     {
-        return E_FAIL;
-    }
-    D3D10_INTERNALSHADER_SIGNATURE* pHeader = (D3D10_INTERNALSHADER_SIGNATURE*)pSignature;
-    if( pHeader->Parameters == 0 )
-    {
-        m_cParameters = 0;
-        return S_OK;
-    }
-
-    // If parameter count is less than MaxParameters calculation of SignatureAndParameterInfoSize will not overflow.
-    const UINT MaxParameters = ((UINT_MAX - sizeof(D3D10_INTERNALSHADER_SIGNATURE)) / sizeof(D3D10_INTERNALSHADER_PARAMETER));
-
-    if (pHeader->Parameters > MaxParameters)
-    {
-        return E_FAIL;
-    }
-    
-    UINT ParameterInfoSize = pHeader->Parameters * sizeof(D3D10_INTERNALSHADER_PARAMETER);
-    UINT SignatureAndParameterInfoSize = ParameterInfoSize + sizeof(D3D10_INTERNALSHADER_SIGNATURE);
-    
-    if (BlobSize < SignatureAndParameterInfoSize)
-    {
-        return E_FAIL;
-    }
-
-    // Keep end pointer around for checking
-    const void *pEnd = static_cast<const BYTE*>(pSignature) + BlobSize;
-    const D3D10_INTERNALSHADER_PARAMETER* pParameterInfo = (D3D10_INTERNALSHADER_PARAMETER*)((const BYTE*)pSignature + pHeader->ParameterInfo);
-    UINT cParameters = pHeader->Parameters;
-    UINT TotalStringLength = 0;
-    UINT LastRegister = 0;
-    for( UINT i = 0; i < cParameters; i++ )
-    {
-        UINT StringLength;
-        if (FAILED(BoundedStringLength((const char*)((const BYTE*)pSignature + pParameterInfo[i].SemanticName),
-                                       (const char*) pEnd,
-                                        &StringLength)))
-        {
-            return E_FAIL;
-        }
-        if (!bForceStringReference)
-        {
-            TotalStringLength += StringLength + 1;
-        }
-        if( i > 0 )
-        {
-            // registers must show up in nondecreasing order in a signature
-            if( LastRegister > pParameterInfo[i].Register )
-            {
-                return E_FAIL;
-            }
-        }
-        LastRegister = pParameterInfo[i].Register;
-    }
-    UINT TotalParameterSize = pHeader->Parameters*sizeof(D3D11_SIGNATURE_PARAMETER);
-    UINT TotalCharSumsSize = sizeof(UINT)*cParameters; // char sums for each SemanticName
-    m_pSignatureParameters = (D3D11_SIGNATURE_PARAMETER*)malloc((TotalParameterSize + TotalCharSumsSize + TotalStringLength)*sizeof(BYTE));
-    if( !m_pSignatureParameters )
-    {
-        return E_OUTOFMEMORY;
+        return hr;
     }
     m_OwnParameters = TRUE;
-    m_pSemanticNameCharSums = (UINT*)((BYTE*)m_pSignatureParameters + TotalParameterSize);
-    char* pNextDstString = (char*)((BYTE*)m_pSemanticNameCharSums + TotalCharSumsSize);
-    for( UINT i = 0; i < cParameters; i++ )
-    {
-        char* pNextSrcString = (char*)((const BYTE*)pSignature + pParameterInfo[i].SemanticName);
-
-        m_pSignatureParameters[i].Stream = 0;
-        m_pSignatureParameters[i].ComponentType = ConvertToSB(pParameterInfo[i].ComponentType);
-        m_pSignatureParameters[i].Mask = pParameterInfo[i].Mask;
-        m_pSignatureParameters[i].Register = pParameterInfo[i].Register;
-        m_pSignatureParameters[i].SemanticIndex = pParameterInfo[i].SemanticIndex;
-        m_pSignatureParameters[i].SystemValue = ConvertToSB(pParameterInfo[i].SystemValue,pParameterInfo[i].SemanticIndex);
-        m_pSignatureParameters[i].SemanticName = bForceStringReference ? pNextSrcString : pNextDstString;
-        m_pSignatureParameters[i].SemanticIndex = pParameterInfo[i].SemanticIndex;
-        m_pSignatureParameters[i].NeverWrites_Mask = pParameterInfo[i].NeverWrites_Mask; // union with AlwaysReadMask
-        m_pSignatureParameters[i].MinPrecision = D3D_MIN_PRECISION_DEFAULT;
-
-        // This strlen was checked with BoundedStringLength in the first loop.
-#pragma prefast( suppress : __WARNING_PRECONDITION_NULLTERMINATION_VIOLATION )
-        UINT length = (UINT)strlen(pNextSrcString) + 1;
-
-        if (!bForceStringReference)
-        {
-            // Calculation of TotalStringLength ensures that we have space in pNextDstString
-#pragma prefast( suppress : __WARNING_POTENTIAL_BUFFER_OVERFLOW_LOOP_DEPENDENT )
-            memcpy(pNextDstString, pNextSrcString, length);
-            pNextDstString += length;
-        }
-
-        m_pSemanticNameCharSums[i] = 0;
-        for( UINT j = 0; j < length; j++ )
-        {
-            m_pSemanticNameCharSums[i] += tolower(pNextSrcString[j]);
-        }
-    }
-    m_cParameters = cParameters;
+    m_cParameters = Info.parameter_count;
     return S_OK;
 }
 
@@ -874,132 +587,25 @@ void CSignatureParser5::Cleanup()
 }
 
 //---------------------------------------------------------------------------------------------------------------------------------
-// CSignatureParser::ReadSignature11_1()
+// CSignatureParser5::ReadSignature11_1()
 HRESULT CSignatureParser5::ReadSignature11_1(const void* pSignature, UINT BlobSize, bool bForceStringReference )
 {
     Cleanup();
-    if( !pSignature || BlobSize < sizeof(D3D10_INTERNALSHADER_SIGNATURE) )
+    DxmtDxbcSignatureInfo Info;
+    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, DXMT_DXBC_SIGNATURE_11_1, true, bForceStringReference,
+                                         Info, m_pSignatureParameters, m_pSemanticNameCharSums);
+    if( FAILED(hr) )
     {
-        return E_FAIL;
+        return hr;
     }
-
-    D3D10_INTERNALSHADER_SIGNATURE* pHeader = (D3D10_INTERNALSHADER_SIGNATURE*)pSignature;
-    if( pHeader->Parameters == 0 )
-    {
-        m_cParameters = 0;
-        return S_OK;
-    }
-
-    // If parameter count is less than MaxParameters calculation of SignatureAndParameterInfoSize will not overflow.
-    const UINT MaxParameters = ((UINT_MAX - sizeof(D3D10_INTERNALSHADER_SIGNATURE)) / sizeof(D3D11_INTERNALSHADER_PARAMETER_11_1));
-
-    if (pHeader->Parameters > MaxParameters)
-    {
-        return E_FAIL;
-    }
-    
-    UINT ParameterInfoSize = pHeader->Parameters * sizeof(D3D11_INTERNALSHADER_PARAMETER_11_1);
-    UINT SignatureAndParameterInfoSize = ParameterInfoSize + sizeof(D3D10_INTERNALSHADER_SIGNATURE);
-    
-    if (BlobSize < SignatureAndParameterInfoSize)
-    {
-        return E_FAIL;
-    }
-
-    // Keep end pointer around for checking
-    const void *pEnd = static_cast<const BYTE*>(pSignature) + BlobSize;
-    
-    const D3D11_INTERNALSHADER_PARAMETER_11_1* pParameterInfo = (D3D11_INTERNALSHADER_PARAMETER_11_1*)((const BYTE*)pSignature + pHeader->ParameterInfo);
-    UINT cParameters = pHeader->Parameters;
-    UINT TotalStringLength = 0;
-    UINT StreamParameters[D3D11_SO_STREAM_COUNT] = {0};
-    UINT i = 0;
-    for( UINT s = 0; s < D3D11_SO_STREAM_COUNT; s++ )
-    {
-        UINT LastRegister = 0;
-        UINT FirstParameter = i;
-
-        for( ; i < cParameters; i++ )
-        {
-            if( pParameterInfo[i].Stream != s )
-            {
-                break;
-            }
-
-            StreamParameters[s]++;
-            UINT StringLength;
-            if (FAILED(BoundedStringLength((const char*)((const BYTE*)pSignature + pParameterInfo[i].SemanticName),
-                                           (const char*) pEnd,
-                                            &StringLength)))
-            {
-                return E_FAIL;
-            }
-            if (!bForceStringReference)
-            {
-                TotalStringLength += StringLength + 1;
-            }
-            if( i > FirstParameter )
-            {
-                // registers must show up in nondecreasing order in a signature
-                if( LastRegister > pParameterInfo[i].Register )
-                {
-                    return E_FAIL;
-                }
-            }
-            LastRegister = pParameterInfo[i].Register;
-            m_NumSigs = s + 1;
-        }
-    }
-    UINT TotalParameterSize = pHeader->Parameters*sizeof(D3D11_SIGNATURE_PARAMETER);
-    UINT TotalCharSumsSize = sizeof(UINT)*cParameters; // char sums for each SemanticName
-    m_pSignatureParameters = (D3D11_SIGNATURE_PARAMETER*)malloc((TotalParameterSize + TotalCharSumsSize + TotalStringLength)*sizeof(BYTE));
-    if( !m_pSignatureParameters )
-    {
-        return E_OUTOFMEMORY;
-    }
-    m_pSemanticNameCharSums = (UINT*)((BYTE*)m_pSignatureParameters + TotalParameterSize);
-    char* pNextDstString = (char*)((BYTE*)m_pSemanticNameCharSums + TotalCharSumsSize);
-    for( i = 0; i < cParameters; i++ )
-    {
-        char* pNextSrcString = (char*)((const BYTE*)pSignature + pParameterInfo[i].SemanticName);
-
-        m_pSignatureParameters[i].Stream = pParameterInfo[i].Stream;
-        m_pSignatureParameters[i].ComponentType = ConvertToSB(pParameterInfo[i].ComponentType);
-        m_pSignatureParameters[i].Mask = pParameterInfo[i].Mask;
-        m_pSignatureParameters[i].Register = pParameterInfo[i].Register;
-        m_pSignatureParameters[i].SemanticIndex = pParameterInfo[i].SemanticIndex;
-        m_pSignatureParameters[i].SystemValue = ConvertToSB(pParameterInfo[i].SystemValue,pParameterInfo[i].SemanticIndex);
-        m_pSignatureParameters[i].SemanticName = bForceStringReference ? pNextSrcString : pNextDstString;
-        m_pSignatureParameters[i].SemanticIndex = pParameterInfo[i].SemanticIndex;
-        m_pSignatureParameters[i].NeverWrites_Mask = pParameterInfo[i].NeverWrites_Mask; // union with AlwaysReadMask
-        m_pSignatureParameters[i].MinPrecision = pParameterInfo[i].MinPrecision;
-
-        // This strlen was checked with BoundedStringLength in the first loop.
-#pragma prefast( suppress : __WARNING_PRECONDITION_NULLTERMINATION_VIOLATION )
-        UINT length = (UINT)strlen(pNextSrcString) + 1;
-
-        if (!bForceStringReference)
-        {
-            // __analysis_assume((char*)pNextDstString + length < (char*)m_pSignatureParameters + (TotalParameterSize + TotalCharSumsSize + TotalStringLength) * sizeof(BYTE));
-            // Calculation of TotalStringLength ensures that we have space in pNextDstString
-#pragma prefast( suppress : __WARNING_POTENTIAL_BUFFER_OVERFLOW_LOOP_DEPENDENT )
-            memcpy(pNextDstString, pNextSrcString, length);
-            pNextDstString += length;
-        }
-
-        m_pSemanticNameCharSums[i] = 0;
-        for( UINT j = 0; j < length; j++ )
-        {
-            m_pSemanticNameCharSums[i] += tolower(pNextSrcString[j]);
-        }
-    }
-    m_cParameters = cParameters;
+    m_cParameters = Info.parameter_count;
+    m_NumSigs = Info.stream_count;
 
     UINT PreviousParams = 0;
-    for( i = 0; i < m_NumSigs; i++ )
+    for( UINT i = 0; i < m_NumSigs; i++ )
     {
-        m_Sig[i].ReadSignature11_1( &m_pSignatureParameters[PreviousParams], &m_pSemanticNameCharSums[PreviousParams], StreamParameters[i] );
-        PreviousParams += StreamParameters[i];
+        m_Sig[i].ReadSignature11_1( &m_pSignatureParameters[PreviousParams], &m_pSemanticNameCharSums[PreviousParams], Info.stream_parameters[i] );
+        PreviousParams += Info.stream_parameters[i];
     }
 
     return S_OK;
@@ -1007,132 +613,25 @@ HRESULT CSignatureParser5::ReadSignature11_1(const void* pSignature, UINT BlobSi
 
 
 //---------------------------------------------------------------------------------------------------------------------------------
-// CSignatureParser::ReadSignature5()
+// CSignatureParser5::ReadSignature5()
 HRESULT CSignatureParser5::ReadSignature5(const void* pSignature, UINT BlobSize, bool bForceStringReference )
 {
     Cleanup();
-    if( !pSignature || BlobSize < sizeof(D3D10_INTERNALSHADER_SIGNATURE) )
+    DxmtDxbcSignatureInfo Info;
+    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, DXMT_DXBC_SIGNATURE_STREAM, true, bForceStringReference,
+                                         Info, m_pSignatureParameters, m_pSemanticNameCharSums);
+    if( FAILED(hr) )
     {
-        return E_FAIL;
+        return hr;
     }
-
-    D3D10_INTERNALSHADER_SIGNATURE* pHeader = (D3D10_INTERNALSHADER_SIGNATURE*)pSignature;
-    if( pHeader->Parameters == 0 )
-    {
-        m_cParameters = 0;
-        return S_OK;
-    }
-
-    // If parameter count is less than MaxParameters calculation of SignatureAndParameterInfoSize will not overflow.
-    const UINT MaxParameters = ((UINT_MAX - sizeof(D3D10_INTERNALSHADER_SIGNATURE)) / sizeof(D3D11_INTERNALSHADER_PARAMETER_FOR_GS));
-
-    if (pHeader->Parameters > MaxParameters)
-    {
-        return E_FAIL;
-    }
-    
-    UINT ParameterInfoSize = pHeader->Parameters * sizeof(D3D11_INTERNALSHADER_PARAMETER_FOR_GS);
-    UINT SignatureAndParameterInfoSize = ParameterInfoSize + sizeof(D3D10_INTERNALSHADER_SIGNATURE);
-    
-    if (BlobSize < SignatureAndParameterInfoSize)
-    {
-        return E_FAIL;
-    }
-
-    // Keep end pointer around for checking
-    const void *pEnd = static_cast<const BYTE*>(pSignature) + BlobSize;
-    
-    const D3D11_INTERNALSHADER_PARAMETER_FOR_GS* pParameterInfo = (D3D11_INTERNALSHADER_PARAMETER_FOR_GS*)((const BYTE*)pSignature + pHeader->ParameterInfo);
-    UINT cParameters = pHeader->Parameters;
-    UINT TotalStringLength = 0;
-    UINT StreamParameters[D3D11_SO_STREAM_COUNT] = {0};
-    UINT i = 0;
-    for( UINT s = 0; s < D3D11_SO_STREAM_COUNT; s++ )
-    {
-        UINT LastRegister = 0;
-        UINT FirstParameter = i;
-
-        for( ; i < cParameters; i++ )
-        {
-            if( pParameterInfo[i].Stream != s )
-            {
-                break;
-            }
-
-            StreamParameters[s]++;
-            UINT StringLength;
-            if (FAILED(BoundedStringLength((const char*)((const BYTE*)pSignature + pParameterInfo[i].SemanticName),
-                                           (const char*) pEnd,
-                                           &StringLength)))
-            {
-                return E_FAIL;
-            }
-            if (!bForceStringReference)
-            {
-                TotalStringLength += StringLength + 1;
-            }
-            if( i > FirstParameter )
-            {
-                // registers must show up in nondecreasing order in a signature
-                if( LastRegister > pParameterInfo[i].Register )
-                {
-                    return E_FAIL;
-                }
-            }
-            LastRegister = pParameterInfo[i].Register;
-            m_NumSigs = s + 1;
-        }
-    }
-    UINT TotalParameterSize = pHeader->Parameters*sizeof(D3D11_SIGNATURE_PARAMETER);
-    UINT TotalCharSumsSize = sizeof(UINT)*cParameters; // char sums for each SemanticName
-    m_pSignatureParameters = (D3D11_SIGNATURE_PARAMETER*)malloc((TotalParameterSize + TotalCharSumsSize + TotalStringLength)*sizeof(BYTE));
-    if( !m_pSignatureParameters )
-    {
-        return E_OUTOFMEMORY;
-    }
-    m_pSemanticNameCharSums = (UINT*)((BYTE*)m_pSignatureParameters + TotalParameterSize);
-    char* pNextDstString = (char*)((BYTE*)m_pSemanticNameCharSums + TotalCharSumsSize);
-    for( i = 0; i < cParameters; i++ )
-    {
-        char* pNextSrcString = (char*)((const BYTE*)pSignature + pParameterInfo[i].SemanticName);
-
-        m_pSignatureParameters[i].Stream = pParameterInfo[i].Stream;
-        m_pSignatureParameters[i].ComponentType = ConvertToSB(pParameterInfo[i].ComponentType);
-        m_pSignatureParameters[i].Mask = pParameterInfo[i].Mask;
-        m_pSignatureParameters[i].Register = pParameterInfo[i].Register;
-        m_pSignatureParameters[i].SemanticIndex = pParameterInfo[i].SemanticIndex;
-        m_pSignatureParameters[i].SystemValue = ConvertToSB(pParameterInfo[i].SystemValue,pParameterInfo[i].SemanticIndex);
-        m_pSignatureParameters[i].SemanticName = pNextDstString;
-        m_pSignatureParameters[i].SemanticIndex = pParameterInfo[i].SemanticIndex;
-        m_pSignatureParameters[i].NeverWrites_Mask = pParameterInfo[i].NeverWrites_Mask; // union with AlwaysReadMask
-        m_pSignatureParameters[i].MinPrecision = D3D_MIN_PRECISION_DEFAULT;
-
-        // This strlen was checked with BoundedStringLength in the first loop.
-#pragma prefast( suppress : __WARNING_PRECONDITION_NULLTERMINATION_VIOLATION )
-        UINT length = (UINT)strlen(pNextSrcString) + 1;
-
-        if (!bForceStringReference)
-        {
-            // __analysis_assume((char*)pNextDstString + length < (char*)m_pSignatureParameters + (TotalParameterSize + TotalCharSumsSize + TotalStringLength) * sizeof(BYTE));
-            // Calculation of TotalStringLength ensures that we have space in pNextDstString
-#pragma prefast( suppress : __WARNING_POTENTIAL_BUFFER_OVERFLOW_LOOP_DEPENDENT )
-            memcpy(pNextDstString, pNextSrcString, length);
-            pNextDstString += length;
-        }
-
-        m_pSemanticNameCharSums[i] = 0;
-        for( UINT j = 0; j < length; j++ )
-        {
-            m_pSemanticNameCharSums[i] += tolower(pNextSrcString[j]);
-        }
-    }
-    m_cParameters = cParameters;
+    m_cParameters = Info.parameter_count;
+    m_NumSigs = Info.stream_count;
 
     UINT PreviousParams = 0;
-    for( i = 0; i < m_NumSigs; i++ )
+    for( UINT i = 0; i < m_NumSigs; i++ )
     {
-        m_Sig[i].ReadSignature5( &m_pSignatureParameters[PreviousParams], &m_pSemanticNameCharSums[PreviousParams], StreamParameters[i] );
-        PreviousParams += StreamParameters[i];
+        m_Sig[i].ReadSignature5( &m_pSignatureParameters[PreviousParams], &m_pSemanticNameCharSums[PreviousParams], Info.stream_parameters[i] );
+        PreviousParams += Info.stream_parameters[i];
     }
 
     return S_OK;

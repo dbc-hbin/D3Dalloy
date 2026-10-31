@@ -3,7 +3,9 @@
 #pragma once
 #include "d3d12tokenizedprogramformat.hpp"
 #include "d3d11.h"
+#include "ShaderBytecode.h"
 #include <cstddef>
+#include <cstdint>
 
 namespace microsoft {
 
@@ -23,8 +25,19 @@ HRESULT DXBCGetOutputSignature(const void *pBlobContainer,
 HRESULT DXBCGetPatchConstantSignature(const void *pBlobContainer,
                                       CSignatureParser *pParserToUse,
                                       bool bForceStringReference = false);
-HRESULT DXBCGetRootSignature(const void *pBlobContainer,
-                                      const void **ppBlob, UINT *pByteSize);
+
+inline HRESULT DXBCGetRootSignature(const void *pBlobContainer, size_t ContainerSize,
+                                   const void **ppBlob, UINT *pByteSize) {
+    if (!pBlobContainer || !ppBlob || !pByteSize || ContainerSize > UINT32_MAX)
+        return E_INVALIDARG;
+    DxmtShaderChunk chunk;
+    if (dxmt_shader_container_find(pBlobContainer, ContainerSize, DXMT_SHADER_CONTAINER_ROOT_SIGNATURE,
+                                  0x30535452u, 0, &chunk) != DXMT_SHADER_BYTECODE_SUCCESS || chunk.size == 0)
+        return E_FAIL;
+    *ppBlob = static_cast<const unsigned char *>(pBlobContainer) + chunk.offset;
+    *pByteSize = chunk.size;
+    return S_OK;
+}
 
 //=================================================================================================================================
 //

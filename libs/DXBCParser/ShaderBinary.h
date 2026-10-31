@@ -5,6 +5,7 @@
 #define _SHADERBINARY_H
 
 #include "d3d12tokenizedprogramformat.hpp"
+#include "DxbcProgram.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -1418,15 +1419,15 @@ class CShaderAsm {};
 class CShaderCodeParser {
 public:
   CShaderCodeParser()
-      : m_pCurrentToken(NULL), m_pShaderCode(NULL), m_pShaderEndToken(NULL) {
-  }
-  CShaderCodeParser(CONST CShaderToken *pBuffer)
-      : m_pCurrentToken(NULL), m_pShaderCode(NULL), m_pShaderEndToken(NULL) {
-    SetShader(pBuffer);
-  }
+      : m_pCurrentToken(NULL), m_pShaderCode(NULL), m_pShaderEndToken(NULL),
+        m_ByteSize(0) {}
   ~CShaderCodeParser() {}
-  void SetShader(CONST CShaderToken *pBuffer);
-  void ParseInstruction(CInstruction *pInstruction);
+  // ByteSize is the SHDR/SHEX chunk payload size. Fails when the declared
+  // program length does not fit it; the parser must not be used then.
+  HRESULT SetShader(CONST CShaderToken *pBuffer, UINT ByteSize);
+  // FALSE, with nothing decoded, when the instruction's tokens are malformed or
+  // escape the program. Callers stop parsing on FALSE.
+  BOOL ParseInstruction(CInstruction *pInstruction);
   void ParseIndex(COperandIndex *pOperandIndex,
                   D3D10_SB_OPERAND_INDEX_REPRESENTATION IndexType);
   void ParseOperand(COperandBase *pOperand);
@@ -1465,6 +1466,7 @@ protected:
   const CShaderToken *m_pShaderCode;
   // Points to the last token of the current shader
   const CShaderToken *m_pShaderEndToken;
+  UINT m_ByteSize;
 };
 
 }; // namespace D3D10ShaderBinary

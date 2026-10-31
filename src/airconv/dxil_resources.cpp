@@ -53,6 +53,7 @@
 #include "airconv_context.hpp"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -850,46 +851,134 @@ ResourceLowering::loadBufferWords(
     return createError("dxil: raw buffer load lane must be 16, 32 or 64 bits wide");
   auto *lane_int = builder.getIntNTy(width);
   auto *byte_offset = bufferByteOffset(c0, c1, buffer.StructureStride);
-  /* The addresses and their bound conditions are emitted before any block split so
-   * they dominate the guarded access; only the access itself moves behind the branch. */
   llvm::SmallVector<unsigned, 4> lanes;
   llvm::SmallVector<llvm::Value *, 4> bytes;
-  llvm::SmallVector<llvm::Value *, 4> conditions;
   for (unsigned i = 0; i < 4; i++) {
     if (!(mask & (1u << i)))
       continue;
     auto *byte = builder.CreateAdd(byte_offset, builder.getInt64(i * width / 8));
     lanes.push_back(i);
     bytes.push_back(byte);
-    conditions.push_back(bufferBytesInBounds(buffer, byte, width / 8));
   }
+  auto *in_bounds = bytes.empty() ? nullptr : bufferBytesInBounds(buffer, bytes.back(), width / 8);
   auto load = [&](llvm::Type *type, llvm::Value *pointer) -> llvm::Value * {
     return coherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(type, pointer)
                     : (llvm::Value *)builder.CreateLoad(type, pointer);
   };
+  auto load_lane = [&](unsigned lane) -> llvm::Value * {
+    auto *byte = bytes[lane];
+    if (width != 64)
+      return load(lane_int, bufferBytePointer(buffer, byte, lane_int));
+    auto *low = load(air.getIntTy(), bufferBytePointer(buffer, byte, air.getIntTy()));
+    auto *high = load(air.getIntTy(),
+                      bufferBytePointer(buffer, builder.CreateAdd(byte, builder.getInt64(4)), air.getIntTy()));
+    return builder.CreateOr(builder.CreateZExt(low, lane_int),
+                            builder.CreateShl(builder.CreateZExt(high, lane_int), 32));
+  };
+  llvm::SmallVector<llvm::Value *, 4> fast_values;
+  llvm::BasicBlock *fast_block = nullptr;
+  llvm::Instruction *slow_term = call;
+  if (!coherent && !(buffer.StatusBase && usesStatus(call))) {
+    /* Loads need no control flow: a Metal device load through a null pointer reads
+     * zero, so each lane selects its own address or null. Partial out-of-bounds
+     * accesses still zero exactly the lanes past the view. Branch-free loads keep
+     * the generated AIR small enough for fast native pipeline compilation. */
+    llvm::SmallVector<llvm::Value *, 4> components(4, llvm::UndefValue::get(lane_type));
+    for (unsigned lane = 0; lane < lanes.size(); lane++) {
+      auto *byte = bytes[lane];
+      auto *condition = bufferBytesInBounds(buffer, byte, width / 8);
+      auto lane_load = [&](llvm::Type *type, llvm::Value *at, llvm::Value *valid) -> llvm::Value * {
+        auto *pointer = bufferBytePointer(buffer, at, type);
+        if (!valid)
+          return builder.CreateLoad(type, pointer);
+        /* The select is materialized after optimization (dxmt::lowerBoundedLoads):
+         * InstCombine rescans the block for every load of a select, which costs
+         * far more conversion time than it saves. */
+        auto bounded = info.module->getOrInsertFunction(
+            (llvm::Twine("dxmt.bounded.load.") + llvm::Twine(type->getPrimitiveSizeInBits())).str(),
+            llvm::FunctionType::get(type, {builder.getInt1Ty(), pointer->getType()}, false));
+        llvm::cast<llvm::Function>(bounded.getCallee())->setOnlyReadsMemory();
+        llvm::cast<llvm::Function>(bounded.getCallee())->setDoesNotThrow();
+        llvm::cast<llvm::Function>(bounded.getCallee())->setWillReturn();
+        return builder.CreateCall(bounded, {valid, pointer});
+      };
+      llvm::Value *value;
+      if (width != 64) {
+        value = lane_load(lane_int, byte, condition);
+      } else {
+        auto *low = lane_load(air.getIntTy(), byte, condition);
+        auto *high = lane_load(air.getIntTy(), builder.CreateAdd(byte, builder.getInt64(4)), condition);
+        value = builder.CreateOr(builder.CreateZExt(low, lane_int),
+                                 builder.CreateShl(builder.CreateZExt(high, lane_int), 32));
+      }
+      components[lanes[lane]] = builder.CreateBitCast(value, lane_type);
+    }
+    call->replaceAllUsesWith(buildResult(call, components));
+    call->eraseFromParent();
+    return llvm::Error::success();
+  }
+  if (lanes.size() > 1 && in_bounds) {
+    /* Widened byte offsets cannot wrap, so the last selected lane bounds all
+     * earlier lanes, including sparse masks. Only a partial access needs per-lane guards. */
+    llvm::Instruction *fast_term;
+    llvm::SplitBlockAndInsertIfThenElse(in_bounds, call, &fast_term, &slow_term);
+    builder.SetInsertPoint(fast_term);
+    if (coherent) {
+      for (unsigned lane = 0; lane < lanes.size(); lane++)
+        fast_values.push_back(builder.CreateBitCast(load_lane(lane), lane_type));
+    } else {
+      /* Every byte from the first through the last selected lane is inside the view,
+       * so one span load covers sparse masks too. Lanes only guarantee their own
+       * alignment: 64 bit lanes are moved as dword pairs. */
+      auto *word = width == 64 ? air.getIntTy() : lane_int;
+      const unsigned per_lane = width == 64 ? 2 : 1;
+      const unsigned span = (lanes.back() - lanes.front() + 1) * per_lane;
+      auto *span_type = llvm::FixedVectorType::get(word, span);
+      auto *loaded = builder.CreateAlignedLoad(span_type, bufferBytePointer(buffer, bytes.front(), span_type),
+                                               llvm::Align(word->getPrimitiveSizeInBits() / 8));
+      for (unsigned lane = 0; lane < lanes.size(); lane++) {
+        const unsigned at = (lanes[lane] - lanes.front()) * per_lane;
+        llvm::Value *value = builder.CreateExtractElement(loaded, at);
+        if (width == 64)
+          value = builder.CreateOr(builder.CreateZExt(value, lane_int),
+                                   builder.CreateShl(builder.CreateZExt(builder.CreateExtractElement(loaded, at + 1),
+                                                                        lane_int), 32));
+        fast_values.push_back(builder.CreateBitCast(value, lane_type));
+      }
+    }
+    fast_block = builder.GetInsertBlock();
+    builder.SetInsertPoint(slow_term);
+  }
   llvm::SmallVector<llvm::Value *, 4> components(4, llvm::UndefValue::get(lane_type));
   for (unsigned lane = 0; lane < lanes.size(); lane++) {
-    auto *byte = bytes[lane];
+    if (fast_block && lane + 1 == lanes.size()) {
+      /* The final lane failed the common guard; do not issue its load again. */
+      components[lanes[lane]] = llvm::Constant::getNullValue(lane_type);
+      continue;
+    }
+    auto *condition = lane + 1 == lanes.size() ? in_bounds
+                                              : bufferBytesInBounds(buffer, bytes[lane], width / 8);
     auto guarded = emitGuardedAccess(
-        conditions[lane], call, {lane_int},
+        condition, slow_term, {lane_int},
         [&]() -> llvm::SmallVector<llvm::Value *, 4> {
-          if (width != 64)
-            return {load(lane_int, bufferBytePointer(buffer, byte, lane_int))};
-          auto *low = load(air.getIntTy(), bufferBytePointer(buffer, byte, air.getIntTy()));
-          auto *high = load(air.getIntTy(),
-                            bufferBytePointer(buffer, builder.CreateAdd(byte, builder.getInt64(4)), air.getIntTy()));
-          return {builder.CreateOr(builder.CreateZExt(low, lane_int),
-                                   builder.CreateShl(builder.CreateZExt(high, lane_int), 32))};
+          return {load_lane(lane)};
         }
     );
     components[lanes[lane]] = builder.CreateBitCast(guarded[0], lane_type);
   }
+  if (fast_block) {
+    auto *slow_block = builder.GetInsertBlock();
+    builder.SetInsertPoint(call);
+    for (unsigned lane = 0; lane < lanes.size(); lane++) {
+      auto *merged = builder.CreatePHI(lane_type, 2);
+      merged->addIncoming(fast_values[lane], fast_block);
+      merged->addIncoming(components[lanes[lane]], slow_block);
+      components[lanes[lane]] = merged;
+    }
+  }
   if (!bytes.empty() && buffer.StatusBase && usesStatus(call)) {
     /* The descriptor pointer is the view's GPU address; the lanes span [first, last] bytes past it. */
     /* Out-of-bounds lanes read zero without touching memory, so they must not index the tile array. */
-    llvm::Value *in_bounds = conditions.front();
-    for (auto *condition : conditions)
-      in_bounds = builder.CreateAnd(in_bounds, condition);
     auto *status_base = builder.CreateSelect(in_bounds, buffer.StatusBase, builder.getInt64(0));
     auto *base = builder.CreatePtrToInt(buffer.Pointer, builder.getInt64Ty());
     auto *first = builder.CreateAdd(base, bytes.front());
@@ -1478,14 +1567,16 @@ ResourceLowering::lookupDescriptors(const HandleSite &site, bool needs_counter) 
   case kCbvClass: {
     auto descriptor = binding.GetConstantBuffer(air, key, absolute_index);
     if (!descriptor)
-      return createError("dxil: constant buffer " + site.name + " is not bound by the root signature");
+      return rootBindingError("dxil: constant buffer {0} is not bound by the root signature (class={1}, id={2}, register={3}, space={4})",
+                              site.name, site.klass, site.declaration_id, site.lower_bound, site.space);
     handle.cbuffer = *descriptor;
     return handle;
   }
   case kSamplerClass: {
     auto descriptor = binding.GetSampler(air, key, absolute_index);
     if (!descriptor)
-      return createError("dxil: sampler " + site.name + " is not bound by the root signature");
+      return rootBindingError("dxil: sampler {0} is not bound by the root signature (class={1}, id={2}, register={3}, space={4})",
+                              site.name, site.klass, site.declaration_id, site.lower_bound, site.space);
     handle.sampler = *descriptor;
     return handle;
   }
@@ -1502,9 +1593,8 @@ ResourceLowering::lookupDescriptors(const HandleSite &site, bool needs_counter) 
         return createError("dxil: a RaytracingAccelerationStructure must be a shader resource");
       auto descriptor = binding.GetAccelerationStructure(air, key, absolute_index);
       if (!descriptor)
-        return createError(
-            "dxil: the acceleration structure " + site.name + " is not bound by the root signature"
-        );
+        return rootBindingError("dxil: acceleration structure {0} is not bound by the root signature (class={1}, id={2}, register={3}, space={4})",
+                                site.name, site.klass, site.declaration_id, site.lower_bound, site.space);
       handle.acceleration_structure = *descriptor;
       return handle;
     }
@@ -1512,25 +1602,24 @@ ResourceLowering::lookupDescriptors(const HandleSite &site, bool needs_counter) 
       auto descriptor = site.klass == kSrvClass ? binding.GetSRVTexture(air, key, absolute_index)
                                                 : binding.GetUAVTexture(air, key, absolute_index);
       if (!descriptor)
-        return createError(
-            "dxil: " + llvm::Twine(site.klass == kSrvClass ? "shader resource " : "unordered access view ") + site.name
-            + " is not bound by the root signature"
-        );
+        return rootBindingError("dxil: {0} {1} is not bound by the root signature (class={2}, id={3}, register={4}, space={5})",
+                                site.klass == kSrvClass ? "shader resource" : "unordered access view",
+                                site.name, site.klass, site.declaration_id, site.lower_bound, site.space);
       handle.texture = *descriptor;
       return handle;
     }
     auto descriptor = site.klass == kSrvClass ? binding.GetSRVBuffer(air, key, absolute_index)
                                               : binding.GetUAVBuffer(air, key, absolute_index);
     if (!descriptor)
-      return createError(
-          "dxil: " + llvm::Twine(site.klass == kSrvClass ? "shader resource " : "unordered access view ") + site.name
-          + " is not bound by the root signature"
-      );
+      return rootBindingError("dxil: {0} {1} is not bound by the root signature (class={2}, id={3}, register={4}, space={5})",
+                              site.klass == kSrvClass ? "shader resource" : "unordered access view",
+                              site.name, site.klass, site.declaration_id, site.lower_bound, site.space);
     handle.buffer = *descriptor;
     if (needs_counter && site.klass == kUavClass) {
       auto counter = binding.GetUAVCounter(air, key, absolute_index);
       if (!counter)
-        return createError("dxil: UAV " + site.name + " has no counter bound");
+        return rootBindingError("dxil: UAV {0} has no counter bound (class={1}, id={2}, register={3}, space={4})",
+                                site.name, site.klass, site.declaration_id, site.lower_bound, site.space);
       handle.counter = counter->Pointer;
     }
     return handle;
@@ -4321,6 +4410,8 @@ ResourceLowering::run() {
   if (auto *kernels = info.module->getNamedMetadata("air.kernel"))
     kernel_stage = kernels->getNumOperands() != 0;
   quad_derivative_stage = kernel_stage || info.stage == Stage::Mesh || info.stage == Stage::Amplification;
+  // shortcut: DXIL helper references are not always direct calls; lower every
+  // defined function until the module carries authoritative call-graph metadata.
   collectAnnotations();
   collectCounterHandles();
   collectHeapUsage();

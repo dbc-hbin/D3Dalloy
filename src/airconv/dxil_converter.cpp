@@ -279,6 +279,7 @@ void PopulateShaderResourceBindings(
       srv.read = resource.read;
       srv.sampled = resource.sampled;
       srv.compared = resource.compared;
+      srv.acceleration_structure = resource.kind == ResourceKind::RTAccelerationStructure;
       break;
     }
     case ResourceClass::UAV: {

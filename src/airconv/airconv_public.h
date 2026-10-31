@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 41
+#define AIRCONV_VERSION 45
 
 #ifdef __cplusplus
 #include <string>
@@ -70,6 +70,9 @@ enum MTL_SM50_SHADER_ARGUMENT_FLAG : uint32_t {
   MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP = 1 << 4,
   MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET = 1 << 5,
   MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY = 1 << 6,
+  /* RaytracingAccelerationStructure SRV: its traversal reads the structure
+   * and every BLAS it references, not the bound buffer range. */
+  MTL_SM50_SHADER_ARGUMENT_ACCELERATION_STRUCTURE = 1 << 7,
   MTL_SM50_SHADER_ARGUMENT_READ_ACCESS = 1 << 10,
   MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS = 1 << 11,
 };
@@ -203,6 +206,11 @@ typedef struct sm50_ptr64_t {
 typedef sm50_ptr64_t sm50_shader_t;
 typedef sm50_ptr64_t sm50_bitcode_t;
 typedef sm50_ptr64_t sm50_error_t;
+
+enum SM50_ERROR_KIND {
+  SM50_ERROR_UNKNOWN = 0,
+  SM50_ERROR_ROOT_BINDING = 1,
+};
 
 #ifdef _WIN32
 #ifdef WIN_EXPORT
@@ -942,6 +950,9 @@ AIRCONV_API void SM50GetCompiledBitcode(
 );
 AIRCONV_API void SM50DestroyBitcode(sm50_bitcode_t pBitcode);
 AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_t BufferSize);
+AIRCONV_API enum SM50_ERROR_KIND SM50GetErrorKind(sm50_error_t pError);
+/** Independent, lossless copy; initializes *ppError to null and returns nonzero on allocation failure. */
+AIRCONV_API int SM50CloneError(sm50_error_t pError, sm50_error_t *ppError);
 AIRCONV_API void SM50FreeError(sm50_error_t pError);
 
 AIRCONV_API int SM50CompileTessellationPipelineHull(
@@ -978,6 +989,10 @@ inline std::string SM50GetErrorMessageString(sm50_error_t pError) {
   std::string str;
   str.resize(256);
   auto size = SM50GetErrorMessage(pError, str.data(), str.size());
+  while (size == str.size() - 1) {
+    str.resize(str.size() * 2);
+    size = SM50GetErrorMessage(pError, str.data(), str.size());
+  }
   str.resize(size);
   return str;
 };

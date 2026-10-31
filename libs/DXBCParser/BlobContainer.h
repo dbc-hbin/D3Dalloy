@@ -3,6 +3,7 @@
 #pragma once 
 #include <stddef.h>
 #include "d3dcommon.h"
+#include "ShaderBytecode.h"
 
 #define DXBC_MAJOR_VERSION 1
 #define DXBC_MINOR_VERSION 0
@@ -87,10 +88,10 @@ class CDXBCParser;
 // 
 // Read comments inline below for full detail.
 //
-// (kuttas) IMPORTANT: This class should be kept lightweight and destructor-free;
-//      other systems assume that this class is relatively small in size (less than a couple of pointers)
-//      and that it does not need cleaning up.  If this ceases to be the case, the FX10
-//      system will need some minor modifications to cope with this.
+// The container remains caller-owned and immutable while this parser is used.
+// Only the borrowed pointer and fixed-size decoded metadata are retained; no
+// allocation or destructor is needed. Cached metadata also supports unaligned
+// container storage without exposing unaligned typed pointers.
 //
 class CDXBCParser
 {
@@ -102,7 +103,7 @@ public:
     //     Major = DXBC_MAJOR_VERSION
     //     Minor = DXBC_MAJOR_VERSION
     // 
-    // Returns S_OK, or E_FAIL
+    // Returns S_OK, or E_FAIL without changing a previously valid container.
     //
     // Note, if you don't know ContainerSize and are willing to 
     // assume your pointer pContainer is valid, you can call
@@ -130,8 +131,12 @@ public:
     UINT32 FindNextMatchingBlob( DXBCFourCC SearchFourCC, UINT32 SearchStartBlobIndex = 0 ); 
                                     
 private:
-    const DXBCHeader*    m_pHeader;
-    const UINT32*        m_pIndex;
+    bool GetChunk(UINT32 BlobIndex, DxmtShaderChunk& Chunk) const;
+    const BYTE* m_pContainer;
+    UINT32 m_ContainerSize;
+    UINT32 m_BlobCount;
+    DXBCVersion m_Version;
+    DXBCHash m_Hash;
 };
 
 }

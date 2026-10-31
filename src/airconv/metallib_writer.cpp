@@ -138,6 +138,26 @@ Error MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
   {
 
     raw_svector_ostream function_def_stream(function_def);
+    auto writeFunctionPrefix = [&](const Function *function, FunctionType type, const FunctionBitcode &compiled) {
+      auto name = function->getName();
+      function_def_stream << "NAME";
+      function_def_stream << value((uint16_t)(name.size() + 1));
+      function_def_stream << name << '\0';
+      function_def_stream << value(MTLB_TYPE_TAG{.type = type});
+      function_def_stream << value(MTLB_HASH_TAG{.hash = compiled.hash});
+      function_def_stream << value(MTLB_MDSZ_TAG{.bitcodeSize = compiled.size});
+      function_def_stream << value(MTLB_OFFT_TAG{
+        .PublicMetadataOffset = public_metadata_stream.tell(),
+        .PrivateMetadataOffset = private_metadata_stream.tell(),
+        .BitcodeOffset = compiled.offset,
+      });
+      function_def_stream << value(MTLB_VERS_TAG{
+        .airVersionMajor = airVersionMajor,
+        .airVersionMinor = airVersionMinor,
+        .languageVersionMajor = 3,
+        .languageVersionMinor = 1,
+      });
+    };
 
     auto vertexFns = module.getNamedMetadata("air.vertex");
     if (vertexFns) {
@@ -149,26 +169,7 @@ Error MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           dyn_cast<ConstantAsMetadata>(fn->getOperand(0).get())->getValue()
         );
         const auto compiled = appendBitcode(func);
-        auto name = func->getName();
-        function_def_stream << "NAME";
-        function_def_stream << value((uint16_t)(name.size() + 1));
-        function_def_stream << name << '\0';
-        function_def_stream
-          << value(MTLB_TYPE_TAG{.type = FunctionType::Vertex});
-        function_def_stream << value(MTLB_HASH_TAG{.hash = compiled.hash});
-        function_def_stream
-          << value(MTLB_MDSZ_TAG{.bitcodeSize = compiled.size});
-        function_def_stream << value(MTLB_OFFT_TAG{
-          .PublicMetadataOffset = public_metadata_stream.tell(),
-          .PrivateMetadataOffset = private_metadata_stream.tell(),
-          .BitcodeOffset = compiled.offset,
-        });
-        function_def_stream << value(MTLB_VERS_TAG{
-                  .airVersionMajor = airVersionMajor,
-                  .airVersionMinor = airVersionMinor,
-                  .languageVersionMajor = 3,
-                  .languageVersionMinor = 1,
-                });
+        writeFunctionPrefix(func, FunctionType::Vertex, compiled);
         while (fn->getNumOperands() > 3 && isa<MDTuple>(fn->getOperand(3).get())
         ) {
           auto maybe_patch_tuple = cast<MDTuple>(fn->getOperand(3).get());
@@ -288,24 +289,7 @@ Error MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           dyn_cast<ConstantAsMetadata>(fn->getOperand(0).get())->getValue()
         );
         const auto compiled = appendBitcode(func);
-        auto name = func->getName();
-        function_def_stream << "NAME";
-        function_def_stream << value((uint16_t)(name.size() + 1));
-        function_def_stream << name << '\0';
-        function_def_stream << value(MTLB_TYPE_TAG{.type = kind.type});
-        function_def_stream << value(MTLB_HASH_TAG{.hash = compiled.hash});
-        function_def_stream << value(MTLB_MDSZ_TAG{.bitcodeSize = compiled.size});
-        function_def_stream << value(MTLB_OFFT_TAG{
-          .PublicMetadataOffset = public_metadata_stream.tell(),
-          .PrivateMetadataOffset = private_metadata_stream.tell(),
-          .BitcodeOffset = compiled.offset,
-        });
-        function_def_stream << value(MTLB_VERS_TAG{
-                  .airVersionMajor = airVersionMajor,
-                  .airVersionMinor = airVersionMinor,
-                  .languageVersionMajor = 3,
-                  .languageVersionMinor = 1,
-                });
+        writeFunctionPrefix(func, kind.type, compiled);
         function_def_stream << "ENDT";
         const auto recordSize = uint32_t(function_def_stream.tell() - recordOffset);
         std::memcpy(function_def.data() + recordOffset, &recordSize, sizeof(recordSize));

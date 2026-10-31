@@ -20,8 +20,6 @@ SimdgroupImplicitMemBarrierPass::run(Function &F, FunctionAnalysisManager &AM) {
   SmallVector<LoadInst *, 4> ToCheck;
   SmallDenseSet<Instruction *, 4> Fenced;
 
-  auto &MemSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
-
   for (auto &BB : F) {
     for (auto &Inst : BB) {
       if (auto Load = llvm::dyn_cast<LoadInst>(&Inst)) {
@@ -30,6 +28,11 @@ SimdgroupImplicitMemBarrierPass::run(Function &F, FunctionAnalysisManager &AM) {
       }
     }
   }
+
+  if (ToCheck.empty())
+    return PreservedAnalyses::all();
+
+  auto &MemSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
 
   for (auto &Load : ToCheck) {
     auto MA = MemSSA.getMemoryAccess(Load);

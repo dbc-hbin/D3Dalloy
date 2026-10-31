@@ -1779,6 +1779,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   auto body_entry = TransplantEntryBody(*module.entry, *function, *epilogue_bb);
   if (!body_entry)
     return body_entry.takeError();
+  // Resource lowering must start at the AIR entry; the DXIL entry body was moved above.
+  module.entry = function;
 
   /* An AIR prologue helper may have left the builder in a continuation block of
    * its own (input assembly pull), which is where the body has to be joined. */
