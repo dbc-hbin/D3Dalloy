@@ -53,6 +53,10 @@ struct MTL_FRAME_GENERATION_GENERATE_DESC {
   UINT ui_x, ui_y, ui_alpha_x, ui_alpha_y;
   ID3D12Resource *disable_interpolation;
 };
+// MTL_FRAME_GENERATION_PREPARE_DESC::flags: the caller records this frame's
+// GenerateFrames next on the same command list with nothing in between, so the
+// Generate pass may read depth/motion in place instead of a Prepare snapshot.
+constexpr UINT MTL_FRAME_GENERATION_PREPARE_DIRECT_INPUTS = 1u << 5;
 // Native-only ABI: old phase-result consumers must not use these vtables.
 DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a020", IMTLD3D12FrameGenerationState) : public IUnknown {
   // OFF discards frame metadata and history. Recorded native commands own

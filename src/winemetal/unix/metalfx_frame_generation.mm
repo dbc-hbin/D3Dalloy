@@ -194,7 +194,10 @@ public:
                 break;
             }
         }
-        if (!found) found = privateTexture(device, format, width, height, usage);
+        if (!found) {
+            found = privateTexture(device, format, width, height, usage);
+            if (found && !admit(device, found)) return {};
+        }
         return lend(std::move(found), Kind::Texture);
     }
 
@@ -205,6 +208,7 @@ public:
                                                       options:MTLResourceStorageModeShared];
             found = Object(buffer);
             [buffer release];
+            if (found && !admit(device, found)) return {};
         }
         return lend(std::move(found), Kind::Buffer);
     }
@@ -225,25 +229,13 @@ public:
         return lend(std::move(found), Kind::Table);
     }
 
-    // Returned sets are empty and committed, so they name no pooled allocation.
-    Object residency(id<MTLDevice> device) API_AVAILABLE(macos(15.0)) {
-        Object found = take(residencies_, device);
-        if (found) return found;
-        MTLResidencySetDescriptor* descriptor = [[MTLResidencySetDescriptor alloc] init];
-        descriptor.initialCapacity = 32;
-        NSError* error = nil;
-        id<MTLResidencySet> set = [device newResidencySetWithDescriptor:descriptor error:&error];
-        [descriptor release];
-        found = Object(set);
-        [set release];
-        return found;
-    }
-
-    void putResidency(Object set) noexcept {
+    // Every live pool texture and parameter buffer, idle or lent, is a member.
+    // Membership changes only on creation and release, so steady-state frames
+    // attach the set without committing it. Application resources are resident
+    // through the device-global set attached to every queue.
+    id residency() noexcept {
         std::lock_guard lock(mutex_);
-        if (dormant_) return;
-        for (auto& slot : residencies_)
-            if (!slot) { slot = std::move(set); return; }
+        return residency_.get();
     }
 
     // Generation off: free idle memory but keep accepting completions.
@@ -287,24 +279,68 @@ private:
         return false;
     }
 
+    // A new allocation joins the set before its first encode can commit.
+    bool admit(id<MTLDevice> device, const Object& object) noexcept {
+        if (@available(macOS 15.0, *)) {
+            @try {
+                std::lock_guard lock(mutex_);
+                if (!residency_) {
+                    MTLResidencySetDescriptor* descriptor = [[MTLResidencySetDescriptor alloc] init];
+                    descriptor.initialCapacity = textures_.size() + buffers_.size();
+                    NSError* error = nil;
+                    id<MTLResidencySet> set = [device newResidencySetWithDescriptor:descriptor error:&error];
+                    [descriptor release];
+                    residency_ = Object(set);
+                    [set release];
+                    if (!residency_) return false;
+                }
+                auto set = (id<MTLResidencySet>)residency_.get();
+                if (set.device != device) return false;
+                [set addAllocation:(id<MTLAllocation>)object.get()];
+                [set commit];
+                [set requestResidency];
+                return true;
+            } @catch (id) {
+            }
+        }
+        return false;
+    }
+
+    // Called with mutex_ held, only for allocations no recorded work still uses.
+    void evictLocked(Object& object, bool commit = true) noexcept {
+        if (!object) return;
+        if (@available(macOS 15.0, *)) {
+            @try {
+                if (residency_) {
+                    auto set = (id<MTLResidencySet>)residency_.get();
+                    [set removeAllocation:(id<MTLAllocation>)object.get()];
+                    if (commit) [set commit];
+                }
+            } @catch (id) {
+            }
+        }
+        object = Object{};
+    }
+
     void put(Kind kind, Object object) noexcept {
         if (!object) return;
         std::lock_guard lock(mutex_);
-        if (dormant_) return;
-        if (kind == Kind::Buffer) { putSlot(buffers_, object); return; }
+        if (dormant_) { if (kind != Kind::Table) evictLocked(object); return; }
+        if (kind == Kind::Buffer) { if (!putSlot(buffers_, object)) evictLocked(object); return; }
         if (kind == Kind::Table) { putSlot(tables_, object); return; }
         const NSUInteger bytes = ((id<MTLTexture>)object.get()).allocatedSize;
-        if (!bytes || bytes > kMaxIdleTextureBytes) return;
+        if (!bytes || bytes > kMaxIdleTextureBytes) { evictLocked(object); return; }
         // Evict until the byte cap admits this texture, oldest slot first.
         for (std::size_t i = 0; i != textures_.size() && textureBytes_ > kMaxIdleTextureBytes - bytes; ++i) {
             auto& slot = textures_[(nextTexture_ + i) % textures_.size()];
             if (!slot) continue;
             textureBytes_ -= ((id<MTLTexture>)slot.get()).allocatedSize;
-            slot = Object{};
+            evictLocked(slot);
         }
         if (!putSlot(textures_, object)) {
             auto& slot = textures_[nextTexture_];
             textureBytes_ -= ((id<MTLTexture>)slot.get()).allocatedSize;
+            evictLocked(slot);
             slot = std::move(object);
             nextTexture_ = (nextTexture_ + 1) % textures_.size();
         }
@@ -312,10 +348,15 @@ private:
     }
 
     void clearLocked() noexcept {
-        for (auto& slot : textures_) slot = Object{};
-        for (auto& slot : buffers_) slot = Object{};
+        for (auto& slot : textures_) evictLocked(slot, false);
+        for (auto& slot : buffers_) evictLocked(slot, false);
         for (auto& slot : tables_) slot = Object{};
-        for (auto& slot : residencies_) slot = Object{};
+        if (@available(macOS 15.0, *)) {
+            @try {
+                if (residency_) [(id<MTLResidencySet>)residency_.get() commit];
+            } @catch (id) {
+            }
+        }
         textureBytes_ = 0;
     }
 
@@ -326,7 +367,7 @@ private:
     std::size_t nextTexture_ = 0;
     std::array<Object, 8> buffers_{};
     std::array<Object, 8> tables_{};
-    std::array<Object, 8> residencies_{};
+    Object residency_;
 };
 using Lent = std::shared_ptr<Pool::Lent>;
 
@@ -523,6 +564,12 @@ struct State {
     // Protected by executionMutex; set while this context holds a HudRow count.
     bool hudCounted = false;
     bool providerValidated = false;
+    Object supportDevice;
+    bool supportResult = false;
+    // Protected by executionMutex: raw (non-sRGB) views of recent color sources,
+    // e.g. the swapchain ring. Dropped when generation turns off or the context dies.
+    std::array<std::pair<Object, Object>, 8> rawViews{};
+    std::size_t nextRawView = 0;
     FrameRegistry frames;
     std::shared_ptr<Configuration> historyConfiguration;
     WMTFGdispatch_packet historyDispatch{};
@@ -541,9 +588,15 @@ std::shared_ptr<State> lookup(std::uint64_t context) {
     return found == contexts.end() ? nullptr : found->second;
 }
 
-bool supported(id<MTLDevice> device, std::uint64_t compiler) {
+bool supported(State& state, id<MTLDevice> device, std::uint64_t compiler) {
     if (@available(macOS 27.0, *)) {
-        return device && compiler && [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:device];
+        if (!device || !compiler) return false;
+        // Protected by State::mutex; device support is immutable.
+        if (state.supportDevice.get() != device) {
+            state.supportResult = [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:device];
+            state.supportDevice = Object(device);
+        }
+        return state.supportResult;
     }
     return false;
 }
@@ -555,7 +608,7 @@ std::shared_ptr<Configuration> configure(
     NSUInteger outputWidth, NSUInteger outputHeight, std::uint32_t transfer, bool distortionEnabled) {
     if (@available(macOS 26.0, *)) {
         auto device = (id<MTLDevice>)command.value.device;
-        if (!supported(device, command.value.compiler)) return {};
+        if (!supported(state, device, command.value.compiler)) return {};
         const MTLPixelFormat color = MTLPixelFormatRGBA16Float;
         const MTLPixelFormat ui = sourceUi == MTLPixelFormatInvalid
                                 ? MTLPixelFormatInvalid : MTLPixelFormatRGBA16Float;
@@ -707,7 +760,7 @@ bool validParameters(const WMTFGprepare_packet& p, std::uint32_t createFlags) {
         const float determinant = simd_determinant(transform);
         if (!std::isfinite(determinant) || determinant == 0) return false;
     }
-    if ((p.flags & ~31u) || !p.render_width || !p.render_height || !p.motion_width || !p.motion_height ||
+    if ((p.flags & ~(31u | WMTFG_PREPARE_DIRECT_INPUTS)) || !p.render_width || !p.render_height || !p.motion_width || !p.motion_height ||
         !std::isfinite(p.jitter_x) || !std::isfinite(p.jitter_y) ||
         !std::isfinite(p.motion_scale_x) || !std::isfinite(p.motion_scale_y) ||
         !std::isfinite(p.frame_time_delta_ms) || p.frame_time_delta_ms < 0 ||
@@ -914,23 +967,6 @@ struct ExecutionLease::Impl {
     // Dropped after GPU retirement, when this lease leaves the recording.
     std::vector<Lent> scratch;
     std::vector<Object> objects;
-    Object residency;
-
-    ~Impl() {
-        if (residency) {
-            if (@available(macOS 15.0, *)) {
-                @try {
-                    // Empty the set before its scratch returns to the pool.
-                    auto set = (id<MTLResidencySet>)residency.get();
-                    [set endResidency];
-                    [set removeAllAllocations];
-                    [set commit];
-                    pool->putResidency(std::move(residency));
-                } @catch (id) {
-                }
-            }
-        }
-    }
 
     Object scratchTexture(MTLPixelFormat format, NSUInteger width, NSUInteger height, MTLTextureUsage usage) {
         auto device = (id<MTLDevice>)prepared->configuration->device.get();
@@ -940,17 +976,12 @@ struct ExecutionLease::Impl {
         return lent->object;
     }
 
+    // Pool scratch lives in the pool's persistent set; application resources in
+    // the device-global set attached to the queue.
     bool makeResident(id buffer) {
         if (@available(macOS 26.0, *)) {
-            auto device = (id<MTLDevice>)prepared->configuration->device.get();
-            residency = pool->residency(device);
-            auto set = (id<MTLResidencySet>)residency.get();
+            auto set = (id<MTLResidencySet>)pool->residency();
             if (!set) return false;
-            for (const auto& object : objects)
-                if ([object.get() conformsToProtocol:@protocol(MTLAllocation)])
-                    [set addAllocation:(id<MTLAllocation>)object.get()];
-            [set commit];
-            [set requestResidency];
             [(id<MTL4CommandBuffer>)buffer useResidencySet:set];
             return true;
         }
@@ -1117,9 +1148,16 @@ bool PreparedFrame::encode(
                     if (raw == MTLPixelFormatRGBA8Unorm_sRGB) raw = MTLPixelFormatRGBA8Unorm;
                     else if (raw == MTLPixelFormatBGRA8Unorm_sRGB) raw = MTLPixelFormatBGRA8Unorm;
                     if (raw == texture.pixelFormat) return Object(texture);
+                    // The entry retains its source, so a cached pointer is never reused.
+                    for (const auto& entry : state.rawViews)
+                        if (entry.first.get() == texture) return entry.second;
                     id<MTLTexture> view = [texture newTextureViewWithPixelFormat:raw];
                     Object result(view);
                     [view release];
+                    if (result) {
+                        state.rawViews[state.nextRawView] = {Object(texture), result};
+                        state.nextRawView = (state.nextRawView + 1) % state.rawViews.size();
+                    }
                     return result;
                 };
                 Object sceneView = rawView(scene);
@@ -1505,6 +1543,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 std::lock_guard executionLock(state->executionMutex);
                 ++state->generationEpoch;
                 releaseHudRow(state->hudCounted);
+                state->rawViews = {};
                 state->pool->markDormant();
                 return finish(Ok);
             }
@@ -1544,6 +1583,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     state->configurations.clear();
                     state->hasPreparedJitter = false;
                     state->historyConfiguration.reset();
+                    state->rawViews = {};
                     state->pool->trim();
                 }
                 return finish(Ok);
@@ -1595,7 +1635,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
             void* list = pointer(generate ? d->command_list : p->command_list);
             Command command;
             if (!command.open(list)) return finish(Unsupported);
-            if (!supported((id<MTLDevice>)command.value.device,
+            if (!supported(*state, (id<MTLDevice>)command.value.device,
                            command.value.compiler))
                 return finish(Unsupported);
             if (state->providerValidated && state->device.get() != (id)command.value.device)
@@ -1615,6 +1655,9 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     p->render_width > state->creation.max_render_width ||
                     p->render_height > state->creation.max_render_height)
                     return finish(Parameter, "prepare_parameters", state->creation.flags);
+                // Cleared unless this Prepare is accepted without a snapshot command.
+                const bool requestDirect = (p->flags & WMTFG_PREPARE_DIRECT_INPUTS) != 0;
+                p->flags &= ~WMTFG_PREPARE_DIRECT_INPUTS;
                 if (state->frames.find(frame)) return finish(Parameter);
                 // Prepare may continue while FG is off. Recorded work owns its snapshot,
                 // but disabled presentation cannot consume frame-ID metadata.
@@ -1670,22 +1713,42 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 snapshot->previousJitterX = state->preparedJitterX;
                 snapshot->previousJitterY = state->preparedJitterY;
                 auto nativeInputs = (id<MTLFXFrameInterpolatorBase>)configuration->factory.get();
-                snapshot->depthScratch = state->pool->texture(
-                    (id<MTLDevice>)configuration->device.get(), configuration->depth,
-                    p->render_width, p->render_height,
-                    nativeInputs.depthTextureUsage | MTLTextureUsageShaderRead);
-                snapshot->motionScratch = state->pool->texture(
-                    (id<MTLDevice>)configuration->device.get(), motion.pixelFormat,
-                    motionWidth, motionHeight,
-                    nativeInputs.motionTextureUsage | MTLTextureUsageShaderRead);
-                if (!snapshot->depthScratch || !snapshot->motionScratch) return finish(Unsupported);
-                snapshot->depth = snapshot->depthScratch->object;
-                snapshot->motion = snapshot->motionScratch->object;
+                // A Generate recorded next on the same list reads the inputs before the
+                // application can change them. Every Generate pass samples only the
+                // origin-zero snapshot extent, and MetalFX consumes an input directly
+                // only at its exact descriptor size, so origin-zero inputs are the snapshot.
+                const bool direct = requestDirect &&
+                    !p->depth_subrect_x && !p->depth_subrect_y && !p->motion_subrect_x && !p->motion_subrect_y &&
+                    (depth.usage & MTLTextureUsageShaderRead) && (motion.usage & MTLTextureUsageShaderRead);
+                if (direct) {
+                    snapshot->depth = Object(depth);
+                    snapshot->motion = Object(motion);
+                    snapshot->produced.store(true, std::memory_order_relaxed);
+                } else {
+                    snapshot->depthScratch = state->pool->texture(
+                        (id<MTLDevice>)configuration->device.get(), configuration->depth,
+                        p->render_width, p->render_height,
+                        nativeInputs.depthTextureUsage | MTLTextureUsageShaderRead);
+                    snapshot->motionScratch = state->pool->texture(
+                        (id<MTLDevice>)configuration->device.get(), motion.pixelFormat,
+                        motionWidth, motionHeight,
+                        nativeInputs.motionTextureUsage | MTLTextureUsageShaderRead);
+                    if (!snapshot->depthScratch || !snapshot->motionScratch) return finish(Unsupported);
+                    snapshot->depth = snapshot->depthScratch->object;
+                    snapshot->motion = snapshot->motionScratch->object;
+                }
                 state->hasPreparedJitter = true;
                 state->preparedFrame = frame;
                 state->preparedJitterX = p->jitter_x;
                 state->preparedJitterY = p->jitter_y;
                 implementation->snapshot = std::move(snapshot);
+                if (direct) {
+                    // No Prepare command: register the frame and record nothing.
+                    if (!state->frames.insert(frame, implementation->snapshot)) return finish(Runtime);
+                    p->flags |= WMTFG_PREPARE_DIRECT_INPUTS;
+                    state->providerValidated = true;
+                    return finish(Ok);
+                }
             } else {
                 if ((d->flags & ~7u) || d->output_subrect_only > 1 || d->independent_subrects > 1 ||
                     d->distortion_low_precision > 1 || (d->distortion_low_precision &&

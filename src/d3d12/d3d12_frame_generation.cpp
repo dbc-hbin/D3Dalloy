@@ -88,11 +88,17 @@ struct OwnedFrameGenerationFrame {
   std::array<D3D12_RESOURCE_STATES, 8> states{};
   Rc<BufferAllocation> disable_allocation;
   WMT::Reference<WMT::Object> native;
+  // Generate only: a direct Prepare's depth/motion, read in place by this pass.
+  std::shared_ptr<OwnedFrameGenerationFrame> inputs;
+  uint64_t frame_id = 0;
   bool generate = false;
 };
 namespace {
 class OwnedFrameGenerationState final : public ComObject<IMTLD3D12FrameGenerationState, IOwnedFrameGenerationStateInternal> {
   std::shared_ptr<Core> core_;
+  // A direct Prepare records nothing; its Generate on the same list adopts these inputs.
+  std::mutex direct_mutex_;
+  std::shared_ptr<OwnedFrameGenerationFrame> direct_inputs_;
 public:
   explicit OwnedFrameGenerationState(std::shared_ptr<Core> core) : core_(std::move(core)) {}
   ~OwnedFrameGenerationState() { Configure(FALSE); }
@@ -154,7 +160,15 @@ public:
     p.projection_matrix_present = desc.projection_matrix_present;
     std::memcpy(p.view_to_clip, desc.view_to_clip, sizeof(p.view_to_clip));
     if (FAILED(hr = request(p.header, &frame->native))) return hr;
-    if (!frame->native) return S_FALSE;
+    if (!frame->native) {
+      // Native accepted the frame without a snapshot command (direct inputs or FG off).
+      if (p.flags & WMTFG_PREPARE_DIRECT_INPUTS) {
+        frame->frame_id = desc.frame_id;
+        std::lock_guard lock(direct_mutex_);
+        direct_inputs_ = std::move(frame);
+      }
+      return S_FALSE;
+    }
     result = std::move(frame); return S_OK;
   }
   HRESULT Generate(MTLD3D12Device *device, const MTL_FRAME_GENERATION_GENERATE_DESC &desc,
@@ -228,6 +242,11 @@ public:
     }
     if (FAILED(hr = request(p.header, &frame->native))) return hr;
     if (!frame->native) return E_FAIL;
+    {
+      std::lock_guard lock(direct_mutex_);
+      if (direct_inputs_ && direct_inputs_->frame_id == desc.frame_id) frame->inputs = std::move(direct_inputs_);
+      direct_inputs_.reset();
+    }
     result = std::move(frame); return S_OK;
   }
 };
@@ -271,13 +290,19 @@ HRESULT GenerateOwnedFrameGenerationFrame(MTLD3D12Device *device, IMTLD3D12Frame
   if (FAILED(state->QueryInterface(kInternalStateId, reinterpret_cast<void **>(&internal)))) return E_INVALIDARG;
   try { return internal->Generate(device, *desc, frame); } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
 }
-std::array<MTLD3D12Resource *, 8> GetOwnedFrameGenerationResources(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+// Slots 8-9 are a direct Prepare's depth/motion, which the Generate pass reads in place.
+std::array<MTLD3D12Resource *, 10> GetOwnedFrameGenerationResources(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+  const auto &inputs = frame->inputs;
   return {frame->resources[0].ptr(), frame->resources[1].ptr(), frame->resources[2].ptr(),
       frame->resources[3].ptr(), frame->resources[4].ptr(), frame->resources[5].ptr(), frame->resources[6].ptr(),
-      frame->resources[7].ptr()};
+      frame->resources[7].ptr(), inputs ? inputs->resources[0].ptr() : nullptr,
+      inputs ? inputs->resources[1].ptr() : nullptr};
 }
-std::array<D3D12_RESOURCE_STATES, 8> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
-  return frame->states;
+std::array<D3D12_RESOURCE_STATES, 10> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+  const auto &s = frame->states;
+  const auto &inputs = frame->inputs;
+  return {s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+      inputs ? inputs->states[0] : D3D12_RESOURCE_STATE_COMMON, inputs ? inputs->states[1] : D3D12_RESOURCE_STATE_COMMON};
 }
 bool IsOwnedFrameGenerationOutput(const std::shared_ptr<OwnedFrameGenerationFrame> &frame, size_t index) {
   return frame->generate && (index == 1 || index == 3 || index == 7);

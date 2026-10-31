@@ -928,6 +928,8 @@ evaluateFrameGeneration(ID3D12GraphicsCommandList *list, const ParametersImpl *p
   generate.outputs[0] = output;
   generate.output_states[0] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   generate.real_output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  // Generate is recorded next on this list, so Prepare need not snapshot depth/motion.
+  prepare.flags |= MTL_FRAME_GENERATION_PREPARE_DIRECT_INPUTS;
   auto hr = extension->PrepareFrameGeneration(feature.frame_generation.ptr(), &prepare);
   if (FAILED(hr)) return mapBackendResult(hr, false);
   hr = extension->GenerateFrames(feature.frame_generation.ptr(), &generate);
