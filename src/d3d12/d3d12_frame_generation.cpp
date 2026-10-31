@@ -35,6 +35,7 @@ struct Core {
   // Queue-thread encode order only. Native requests serialize on their own
   // context state, so app-thread Configure/Prepare/Generate never wait on encode.
   uint64_t sequence = 0;
+  uint64_t last_queue = 0; // owned id of the queue that encoded `sequence`
   WMT::Reference<WMT::SharedEvent> timeline;
   std::mutex encode_mutex;
   ~Core() {
@@ -282,14 +283,20 @@ std::array<D3D12_RESOURCE_STATES, 8> GetOwnedFrameGenerationStates(const std::sh
 bool IsOwnedFrameGenerationOutput(const std::shared_ptr<OwnedFrameGenerationFrame> &frame, size_t index) {
   return frame->generate && (index == 1 || index == 3 || index == 7);
 }
+uint64_t OwnedFrameGenerationFrameHistoryQueue(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+  auto &core = *frame->core;
+  std::lock_guard lock(core.encode_mutex);
+  return core.sequence ? core.last_queue : 0;
+}
 void EncodeOwnedFrameGenerationFrame(const std::shared_ptr<OwnedFrameGenerationFrame> &frame,
-    WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence,
+    WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence, uint64_t queue,
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
     const std::function<void(WMT::Event, uint64_t)> &signal_event) {
   auto &core = *frame->core;
   std::lock_guard lock(core.encode_mutex);
-  if (core.sequence) wait_event(core.timeline, core.sequence);
+  if (core.sequence && core.last_queue != queue) wait_event(core.timeline, core.sequence);
   const auto sequence = ++core.sequence;
+  core.last_queue = queue;
   struct WMTMetal4Call call{};
   call.operation = WMTMetal4FGEncode;
   call.args[0] = cmdbuf.handle; call.args[1] = frame->native.handle; call.args[2] = fence.handle;

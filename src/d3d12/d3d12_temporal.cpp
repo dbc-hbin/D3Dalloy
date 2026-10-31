@@ -24,6 +24,7 @@ struct Core {
   WMT::Reference<WMT::SharedEvent> timeline;
   std::mutex mutex;
   uint64_t sequence = 0, last_executed_generation = 0;
+  uint64_t last_queue = 0; // owned id of the queue that encoded `sequence`
 };
 constexpr GUID kInternalStateId = {0xc5b7eebc, 0xa4fc, 0x45b2, {0x9b, 0x1c, 0xd9, 0xb1, 0x31, 0xf1, 0x37, 0x92}};
 struct IOwnedTemporalStateInternal : IUnknown {
@@ -208,14 +209,20 @@ std::array<MTLD3D12Resource *, 12> GetOwnedTemporalFrameResources(const std::sha
           frame->resources[7].ptr(), frame->resources[8].ptr(), frame->resources[9].ptr(),
           frame->resources[10].ptr(), frame->resources[11].ptr()};
 }
+uint64_t OwnedTemporalFrameHistoryQueue(const std::shared_ptr<OwnedTemporalFrame> &frame) {
+  auto &core = *frame->core;
+  std::lock_guard lock(core.mutex);
+  return core.sequence ? core.last_queue : 0;
+}
 void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
     WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence, uint64_t queue, uint64_t submission, uint64_t encoder,
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
     const std::function<void(WMT::Event, uint64_t)> &signal_event) {
   auto &core = *frame->core;
   std::lock_guard lock(core.mutex);
-  if (core.sequence) wait_event(core.timeline, core.sequence);
+  if (core.sequence && core.last_queue != queue) wait_event(core.timeline, core.sequence);
   const auto sequence = ++core.sequence;
+  core.last_queue = queue;
   const bool reset = frame->props.reset || core.last_executed_generation != frame->generation;
   owned_graphics::Trace("temporal_encode", ",\"queue\":", queue, ",\"submission\":", submission,
       ",\"encoder\":", encoder, ",\"feature\":", core.id, ",\"evaluation\":", frame->id,
