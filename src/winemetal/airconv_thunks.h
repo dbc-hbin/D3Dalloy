@@ -32,6 +32,8 @@ enum airconv_unixcalls {
   /* D3D12 work graph node shaders (dxil_workgraph.h). */
   unix_sm50_wg_reflect_library = 312,
   unix_sm50_wg_compile_node = 313,
+  unix_sm50_get_error_kind = 319,
+  unix_sm50_clone_error = 320,
 };
 
 /** One export of a DXIL library, as reported by SM50RTEnumerateLibraryExports. */
@@ -143,6 +145,26 @@ struct sm50_get_error_message_params {
 struct sm50_free_error_params {
   sm50_error_t error;
 };
+
+struct sm50_get_error_kind_params {
+  sm50_error_t error;
+  uint32_t kind;
+  uint32_t reserved;
+};
+
+/* Return the opaque handle inline: no caller pointer conversion on PE32. */
+struct sm50_clone_error_params {
+  sm50_error_t error;
+  sm50_error_t clone;
+  int32_t ret;
+  uint32_t reserved;
+};
+
+_Static_assert(sizeof(struct sm50_get_error_kind_params) == 16, "incompatible error-kind size");
+_Static_assert(offsetof(struct sm50_get_error_kind_params, kind) == 8, "incompatible error-kind offset");
+_Static_assert(sizeof(struct sm50_clone_error_params) == 24, "incompatible error-clone size");
+_Static_assert(offsetof(struct sm50_clone_error_params, clone) == 8, "incompatible error-clone offset");
+_Static_assert(offsetof(struct sm50_clone_error_params, ret) == 16, "incompatible error-clone result offset");
 
 struct sm50_compile_geometry_pipeline_vertex_params {
   sm50_shader_t vertex;

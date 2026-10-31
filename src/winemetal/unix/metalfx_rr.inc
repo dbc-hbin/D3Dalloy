@@ -164,6 +164,16 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     result->width = p.input_width; result->height = p.input_height;
     result->outputWidth = p.output_rect.width; result->outputHeight = p.output_rect.height;
     result->hit = hit; result->reactive = reactive;
+    // Dynamic output keeps one feature across output extents. Cache only the
+    // new and the last encoded output extent; prepared frames keep evictees.
+    const Generation *last = nullptr;
+    for (const auto &cached : core.generations)
+      if (cached && cached->serial == core.lastGeneration) last = cached.get();
+    for (auto &cached : core.generations) {
+      if (!cached || (cached->outputWidth == result->outputWidth && cached->outputHeight == result->outputHeight) ||
+          (last && cached->outputWidth == last->outputWidth && cached->outputHeight == last->outputHeight)) continue;
+      cached.reset();
+    }
     core.generations[core.nextGenerationSlot] = result;
     core.nextGenerationSlot = (core.nextGenerationSlot + 1) % core.generations.size();
     return result;

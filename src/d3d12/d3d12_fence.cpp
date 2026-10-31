@@ -139,6 +139,13 @@ public:
   SetEventOnCompletion(UINT64 Value, HANDLE Event) {
     if (device_->RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
+    // Already reached: completion registration would latch immediately anyway,
+    // so skip its latch/subscription/registration allocations.
+    if (fence->completedValue() >= Value) {
+      if (Event)
+        SetEvent(Event);
+      return device_->RemovedReason() == S_OK || Event ? S_OK : DXGI_ERROR_DEVICE_REMOVED;
+    }
     try {
       if (!Event) {
         fence->wait(Value);

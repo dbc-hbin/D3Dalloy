@@ -38,6 +38,14 @@ public:
     return true;
   }
 
+  bool tryPop(Task &task) {
+    std::lock_guard lock(mutex_);
+    if (tasks_.empty()) return false;
+    task = std::move(tasks_.front());
+    tasks_.pop_front();
+    return true;
+  }
+
   void close() {
     {
       std::lock_guard lock(mutex_);

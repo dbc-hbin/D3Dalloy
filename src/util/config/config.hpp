@@ -72,12 +72,11 @@ namespace dxmt {
      * method will return a fallback value.
      * 
      * Currently, this supports the types \c bool,
-     * \c int32_t, and \c std::string.
+     * \c int32_t, \c float, \c Tristate, and \c std::string.
      * \tparam T Return value type
      * \param [in] option Option name
      * \param [in] fallback Fallback value
      * \returns Parsed option value
-     * \returns The parsed option value
      */
     template<typename T>
     T getOption(const char* option, T fallback = T()) const {

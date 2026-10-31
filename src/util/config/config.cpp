@@ -9,12 +9,12 @@
  */
 
 #include <array>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <regex>
 #include <utility>
-#include <cmath>
 #include <limits>
 
 #include "config.hpp"
@@ -260,59 +260,39 @@ namespace dxmt {
     if (value.size() == 0)
       return false;
 
-    // Parse sign
-    size_t pos = 0;
-    bool negate = false;
-
-    if (value[0] == '-') {
-      negate = true;
-
-      if (++pos == value.size())
-        return false;
-    }
-
-    // Parse integer part
-    uint64_t intPart = 0;
-
-    if (value[pos] == '.')
+    // Keep the config grammar narrower than from_chars: -?[0-9]+(\.[0-9]+)?
+    size_t pos = value[0] == '-' ? 1 : 0;
+    if (pos == value.size() || value[pos] < '0' || value[pos] > '9')
       return false;
 
-    while (pos < value.size()) {
-      if (value[pos] == '.') {
-        if (++pos == value.size())
+    bool nonzero_integer = false;
+    while (pos < value.size() && value[pos] >= '0' && value[pos] <= '9') {
+      nonzero_integer |= value[pos] != '0';
+      pos += 1;
+    }
+
+    if (pos < value.size()) {
+      if (value[pos++] != '.' || pos == value.size())
+        return false;
+
+      for (; pos < value.size(); pos++) {
+        if (value[pos] < '0' || value[pos] > '9')
           return false;
-        break;
       }
-
-      if (value[pos] < '0' || value[pos] > '9')
-        return false;
-
-      intPart *= 10;
-      intPart += value[pos] - '0';
-      pos += 1;
     }
 
-    // Parse fractional part
-    uint64_t fractPart = 0;
-    uint64_t fractDivisor = 1;
-
-    while (pos < value.size()) {
-      if (value[pos] < '0' || value[pos] > '9')
-        return false;
-
-      fractDivisor *= 10;
-      fractPart *= 10;
-      fractPart += value[pos] - '0';
-      pos += 1;
+    float parsed = 0;
+    const auto conversion = std::from_chars(value.data(), value.data() + value.size(), parsed,
+                                             std::chars_format::fixed);
+    if (conversion.ec == std::errc::result_out_of_range && !nonzero_integer) {
+      // With no exponent, an out-of-range magnitude below one can only underflow.
+      parsed = value[0] == '-' ? -0.0f : 0.0f;
+    } else if (conversion.ec != std::errc{}) {
+      return false;
     }
 
-    // Compute final number, not super accurate but this should do
-    result = float((double(fractPart) / double(fractDivisor)) + double(intPart));
-
-    if (negate)
-      result = -result;
-
-    return std::isfinite(result);
+    result = parsed;
+    return true;
   }
 
 

@@ -372,6 +372,10 @@ public:
   /* Set before D3D12 resource publication; D3D11 keeps eager view preparation. */
   bool descriptorIndexedViews = false;
   bool supportsDescriptorViewPool(TextureViewKey key);
+  // A shader view the submission planner can describe by allocation, mip and
+  // slice: a native view of the current allocation, no cast/shadow/sparse
+  // indirection. Unlike the view pool, multisample and format views qualify.
+  bool directViewOfAllocation(TextureViewKey key);
 
   TextureViewKey checkViewUseArray(TextureViewKey key, bool isArray);
   TextureViewKey checkViewUseFormat(TextureViewKey key, WMTPixelFormat format);

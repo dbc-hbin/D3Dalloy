@@ -53,6 +53,9 @@ public:
     return next > 1 ? next - 1 : 0;
   }
 
+  // Every sequence below this value has completed on the GPU.
+  std::uint64_t firstUnretired() const { return retired_.load(std::memory_order_acquire); }
+
   void waitUntilRetired(std::uint64_t sequence) const {
     auto retired = retired_.load(std::memory_order_acquire);
     while (retired <= sequence) {

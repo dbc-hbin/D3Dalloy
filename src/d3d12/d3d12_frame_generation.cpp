@@ -31,9 +31,12 @@ HRESULT request(WMTFGpacket_header &packet, WMT::Reference<WMT::Object> *recorde
 }
 struct Core {
   Com<MTLD3D12Device> device;
-  uint64_t context = 0, sequence = 0;
+  uint64_t context = 0;
+  // Queue-thread encode order only. Native requests serialize on their own
+  // context state, so app-thread Configure/Prepare/Generate never wait on encode.
+  uint64_t sequence = 0;
   WMT::Reference<WMT::SharedEvent> timeline;
-  std::mutex mutex;
+  std::mutex encode_mutex;
   ~Core() {
     if (context) {
       WMTFGdestroy_packet p{{sizeof(p), WMTFG_BRIDGE_VERSION, WMTFG_DESTROY, 0, context}};
@@ -104,14 +107,12 @@ public:
   }
   HRESULT STDMETHODCALLTYPE Configure(BOOL enabled) final {
     if (enabled != FALSE && enabled != TRUE) return E_INVALIDARG;
-    std::lock_guard lock(core_->mutex);
     WMTFGconfigure_packet p{{sizeof(p), WMTFG_BRIDGE_VERSION, WMTFG_CONFIGURE, 0, core_->context}, UINT(enabled)};
     return request(p.header);
   }
   HRESULT STDMETHODCALLTYPE RetireFrame(UINT64 frame_id, UINT64 *oldest, BOOL *pending) final {
     if (!oldest || !pending) return E_POINTER;
     *oldest = 0; *pending = FALSE;
-    std::lock_guard lock(core_->mutex);
     WMTFGretire_frame_packet p{{sizeof(p), WMTFG_BRIDGE_VERSION, WMTFG_RETIRE_FRAME, 0, core_->context}, frame_id, 0, 0};
     const auto hr = request(p.header);
     if (SUCCEEDED(hr)) { *oldest = p.oldest_pending_frame_id; *pending = p.has_pending_frame; }
@@ -152,7 +153,6 @@ public:
     std::memcpy(p.clip_to_previous_clip, desc.clip_to_previous_clip, sizeof(p.clip_to_previous_clip));
     p.projection_matrix_present = desc.projection_matrix_present;
     std::memcpy(p.view_to_clip, desc.view_to_clip, sizeof(p.view_to_clip));
-    std::lock_guard lock(core_->mutex);
     if (FAILED(hr = request(p.header, &frame->native))) return hr;
     if (!frame->native) return S_FALSE;
     result = std::move(frame); return S_OK;
@@ -226,7 +226,6 @@ public:
       p.disable_interpolation = frame->disable_allocation->buffer().handle;
       p.disable_interpolation_offset = frame->disable_allocation->currentSuballocationOffset();
     }
-    std::lock_guard lock(core_->mutex);
     if (FAILED(hr = request(p.header, &frame->native))) return hr;
     if (!frame->native) return E_FAIL;
     result = std::move(frame); return S_OK;
@@ -288,7 +287,7 @@ void EncodeOwnedFrameGenerationFrame(const std::shared_ptr<OwnedFrameGenerationF
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
     const std::function<void(WMT::Event, uint64_t)> &signal_event) {
   auto &core = *frame->core;
-  std::lock_guard lock(core.mutex);
+  std::lock_guard lock(core.encode_mutex);
   if (core.sequence) wait_event(core.timeline, core.sequence);
   const auto sequence = ++core.sequence;
   struct WMTMetal4Call call{};

@@ -6,6 +6,7 @@ winemetal_unix_sources = files(
   'winemetal/unix/winemetal_metal4_fx.mm',
   'winemetal/unix/metalfx-backend.mm',
   'winemetal/unix/metalfx_frame_generation.mm',
+  'winemetal/unix/metalfx_amd_rr.mm',
 
   'winemetal/unix/winemetal_rt.c',
   'winemetal/unix/rt_acceleration_structure.c',
@@ -17,6 +18,11 @@ if build_native_components
     input: 'winemetal/unix/fsr-kernels.inc.in',
     output: 'fsr-kernels.inc',
     configuration: {'FSR_KERNELS_SOURCE': fs.read('winemetal/unix/fsr-kernels.metal')},
+  )
+  configure_file(
+    input: 'winemetal/unix/fsr-rr-kernels.inc.in',
+    output: 'fsr-rr-kernels.inc',
+    configuration: {'FSR_RR_KERNELS_SOURCE': fs.read('winemetal/unix/fsr-rr-kernels.metal')},
   )
 endif
 
@@ -56,5 +62,6 @@ endif
 if get_option('enable_fsr')
 subdir('fsr')
 subdir('fsrfg')
+subdir('fsrrr')
 endif
 endif

@@ -60,10 +60,11 @@ Fence::initialize(uint64_t value) {
 
 uint64_t
 Fence::completedValue() {
-  auto order = currentOrder();
   if (shared_event_)
     return observeShared();
-  return order->completedValue();
+  // order_ is assigned only by initialize() before the fence is published, so
+  // this polling path needs neither schedule_mutex_ nor a shared_ptr copy.
+  return order_->completedValue();
 }
 
 bool

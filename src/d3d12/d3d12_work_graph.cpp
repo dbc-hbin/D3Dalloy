@@ -40,17 +40,17 @@ bool SameRoot(MTLD3D12RootSignature *a, MTLD3D12RootSignature *b) {
   if (a == b) return true;
   if (!a || !b) return false;
   const void *left = nullptr, *right = nullptr;
-  a->GetBlob(&left); b->GetBlob(&right);
+  const UINT left_blob_size = a->GetBlob(&left), right_blob_size = b->GetBlob(&right);
   const void *left_payload = nullptr, *right_payload = nullptr; UINT left_size = 0, right_size = 0;
-  return SUCCEEDED(microsoft::DXBCGetRootSignature(left, &left_payload, &left_size)) &&
-      SUCCEEDED(microsoft::DXBCGetRootSignature(right, &right_payload, &right_size)) &&
+  return SUCCEEDED(microsoft::DXBCGetRootSignature(left, left_blob_size, &left_payload, &left_size)) &&
+      SUCCEEDED(microsoft::DXBCGetRootSignature(right, right_blob_size, &right_payload, &right_size)) &&
       left_size == right_size && !std::memcmp(left_payload, right_payload, left_size);
 }
 HRESULT CreateSamplerUnionRoot(MTLD3D12Device *device, MTLD3D12RootSignature *root,
                               const std::vector<D3D12_STATIC_SAMPLER_DESC> &samplers, Com<MTLD3D12RootSignature> &result) {
   const void *blob_data = nullptr, *raw = nullptr; UINT raw_size = 0;
-  root->GetBlob(&blob_data);
-  if (FAILED(microsoft::DXBCGetRootSignature(blob_data, &raw, &raw_size))) return E_INVALIDARG;
+  const UINT blob_size = root->GetBlob(&blob_data);
+  if (FAILED(microsoft::DXBCGetRootSignature(blob_data, blob_size, &raw, &raw_size))) return E_INVALIDARG;
   RootSignatureDeserializer deserializer;
   if (FAILED(deserializer.Deserialize(raw, raw_size))) return E_INVALIDARG;
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned = deserializer.desc_1_1_;

@@ -107,6 +107,26 @@ SM50FreeError(sm50_error_t pError) {
   UNIX_CALL(sm50_free_error, &params);
 }
 
+AIRCONV_API enum SM50_ERROR_KIND
+SM50GetErrorKind(sm50_error_t pError) {
+  struct sm50_get_error_kind_params params = {pError, SM50_ERROR_UNKNOWN, 0};
+  if (UNIX_CALL(sm50_get_error_kind, &params))
+    return SM50_ERROR_UNKNOWN;
+  return (enum SM50_ERROR_KIND)params.kind;
+}
+
+AIRCONV_API int
+SM50CloneError(sm50_error_t pError, sm50_error_t *ppError) {
+  if (!ppError)
+    return 1;
+  *ppError = (sm50_error_t){0};
+  struct sm50_clone_error_params params = {pError, {0}, 1, 0};
+  if (UNIX_CALL(sm50_clone_error, &params))
+    return 1;
+  *ppError = params.clone;
+  return params.ret;
+}
+
 AIRCONV_API int
 SM50CompileTessellationPipelineHull(
     sm50_shader_t pVertexShader, sm50_shader_t pHullShader,

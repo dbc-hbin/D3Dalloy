@@ -1,8 +1,11 @@
 #pragma once
 #include "nvngx.hpp"
+#include <cmath>
+#include <functional>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <variant>
-#include <string>
 
 namespace dxmt {
 
@@ -40,9 +43,13 @@ castable(unsigned int val, float *out) {
   return true;
 }
 
+// Float-to-integer conversion is undefined outside the target range. NaN and
+// out-of-range values are type mismatches, not truncated garbage.
 template <>
 inline bool
 castable(float val, unsigned int *out) {
+  if (!(val > -1.0f && val < 4294967296.0f))
+    return false;
   *out = static_cast<unsigned int>(val);
   return true;
 }
@@ -57,6 +64,8 @@ castable(int val, float *out) {
 template <>
 inline bool
 castable(float val, int *out) {
+  if (!(val > -2147483904.0f && val < 2147483648.0f))
+    return false;
   *out = static_cast<int>(val);
   return true;
 }
@@ -207,19 +216,31 @@ public:
   }
 
 private:
-  std::unordered_map<std::string, Parameter> values_;
+  // Heterogeneous lookup: Get never allocates a key; Set allocates only on insert.
+  struct NameHash {
+    using is_transparent = void;
+    size_t
+    operator()(std::string_view name) const noexcept {
+      return std::hash<std::string_view>{}(name);
+    }
+  };
+  std::unordered_map<std::string, Parameter, NameHash, std::equal_to<>> values_;
 
   template <typename T>
   void
   SetType(const char *name, T value) {
-    values_[name] = value;
+    const std::string_view key(name);
+    if (auto iter = values_.find(key); iter != values_.end())
+      iter->second = value;
+    else
+      values_.emplace(std::string(key), value);
   }
 
   template <typename T>
   NVNGX_RESULT
   GetType(const char *name, T *out_value) const {
 
-    auto iter = values_.find(name);
+    auto iter = values_.find(std::string_view(name));
     if (iter == values_.end()) {
       return NVNGX_RESULT_FAIL;
     };

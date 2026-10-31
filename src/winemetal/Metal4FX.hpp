@@ -13,15 +13,14 @@ inline void PresentMetal4Drawable(WMT::MetalDrawable drawable, double duration,
                     allow_tearing ? 1u : 0u);
 }
 inline bool ReserveMetal4Present(WMT::MTL4CommandBuffer command_buffer, WMT::MetalDrawable drawable, double duration,
-                                 const WMTCompositionFrame *composition, uint32_t sync_interval, bool allow_tearing,
-                                 WMT::SharedEvent restart_token, uint64_t restart_epoch) {
+                                 const WMTCompositionFrame *composition, uint32_t sync_interval, bool allow_tearing) {
   uint64_t bits;
   std::memcpy(&bits, &duration, sizeof(bits));
   struct WMTMetal4Call call{};
   call.operation = WMTMetal4FXReservePresent;
   call.args[0] = command_buffer.handle; call.args[1] = drawable.handle; call.args[2] = bits;
   call.args[3] = WMT::Metal4CPUPointer(composition); call.args[4] = sync_interval;
-  call.args[5] = allow_tearing ? 1u : 0u; call.args[6] = restart_token.handle; call.args[7] = restart_epoch;
+  call.args[5] = allow_tearing ? 1u : 0u;
   return WMTMetal4Call(&call) == 0 && call.ret[0];
 }
 class TemporalFrame : public WMT::Object {

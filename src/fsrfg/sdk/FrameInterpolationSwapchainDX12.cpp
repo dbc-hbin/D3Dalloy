@@ -24,6 +24,7 @@
 #include <tuple>
 #include <initguid.h>
 #include "FrameInterpolationSwapchainDX12.h"
+#include "../../d3d12/d3d12_frame_generation_interfaces.hpp"
 
 #include "sdk_backend.hpp"
 #include "FrameInterpolationSwapchainDX12_UiComposition.h"
@@ -381,7 +382,17 @@ void presentToSwapChain(PresentType* presenter, PacingData* pacingEntry, FrameTy
     const UINT uFlags                   = bSetAllowTearingFlag * DXGI_PRESENT_ALLOW_TEARING;
 
     // AntiLag2 AMD driver transport is not part of the host adapter.
-    presenter->swapChain->Present(uSyncInterval, uFlags);
+    // An interpolated frame followed by its real member belongs to that real
+    // frame: only the real Present ends the application frame on DXMT.
+    IMTLD3D12GeneratedPresent* generated = nullptr;
+    if (frameType == FrameType::Interpolated_1 && pacingEntry->frames[FrameType::Real].doPresent &&
+        SUCCEEDED(presenter->swapChain->QueryInterface(__uuidof(IMTLD3D12GeneratedPresent), reinterpret_cast<void**>(&generated))))
+    {
+        generated->PresentGenerated(uSyncInterval, uFlags);
+        generated->Release();
+    }
+    else
+        presenter->swapChain->Present(uSyncInterval, uFlags);
 
     // tick frames sent for presentation
     presenter->presentQueue->Signal(presenter->presentFence, frameInfo.presentIndex);

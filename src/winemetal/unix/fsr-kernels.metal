@@ -90,13 +90,46 @@ kernel void yaagl_fsr_combine_masks(
     texture2d<float, access::write> destination [[texture(2)]],
     constant YaaglFsrParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
-    if (any(tid >= params.extent)) return;
-    uint2 sourcePosition = params.sourceOrigin + tid;
-    uint2 destinationPosition = params.destinationOrigin + tid;
-    float r = (params.flags & YaaglFsrHasReactive) ? reactive.read(sourcePosition).r : 0.0f;
-    float c = (params.flags & YaaglFsrHasComposition) ? composition.read(params.compositionOrigin + tid).r : 0.0f;
+    // Dispatch covers the descriptor capacity; padding replicates active edges.
+    if (any(tid >= params.dispatchExtent)) return;
+    uint2 sourceOffset = min(tid, params.extent - 1u);
+    float r = (params.flags & YaaglFsrHasReactive)
+        ? reactive.read(params.sourceOrigin + sourceOffset).r : 0.0f;
+    float c = (params.flags & YaaglFsrHasComposition)
+        ? composition.read(params.compositionOrigin + sourceOffset).r : 0.0f;
     destination.write(float4(max(clamp(r, 0.0f, 1.0f), clamp(c, 0.0f, 1.0f))),
-                      destinationPosition);
+                      params.destinationOrigin + tid);
+}
+
+kernel void yaagl_fsr_extend_edges(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(1)]],
+    constant YaaglFsrParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.dispatchExtent)) return;
+    uint2 position = params.dispatchOrigin + tid;
+    // Source and destination alias, but active source pixels are never written.
+    destination.write(source.read(min(position, params.extent - 1u)), position);
+}
+
+// Copy an active subrect to origin and replicate its edges over the dispatch
+// extent. Half/float element types preserve the stored source values exactly.
+kernel void yaagl_sr_copy_pad_half(
+    texture2d<half, access::read> source [[texture(0)]],
+    texture2d<half, access::write> destination [[texture(1)]],
+    constant YaaglFsrParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.dispatchExtent)) return;
+    destination.write(source.read(params.sourceOrigin + min(tid, params.extent - 1u)), tid);
+}
+
+kernel void yaagl_sr_copy_pad_float(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(1)]],
+    constant YaaglFsrParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.dispatchExtent)) return;
+    destination.write(source.read(params.sourceOrigin + min(tid, params.extent - 1u)), tid);
 }
 
 static float3 rcas_load(texture2d<float, access::read> source, int2 position,
@@ -106,11 +139,12 @@ static float3 rcas_load(texture2d<float, access::read> source, int2 position,
 }
 
 static float3 rcas(texture2d<float, access::read> source, uint2 position,
-                   uint2 lower, uint2 upper, float sharpness, float exposure) {
+                   uint2 lower, uint2 upper, float sharpness, float exposure, float3 center) {
     int2 p = int2(position);
     float3 b = rcas_load(source, p + int2(0, -1), lower, upper, exposure);
     float3 d = rcas_load(source, p + int2(-1, 0), lower, upper, exposure);
-    float3 e = rcas_load(source, p, lower, upper, exposure);
+    // The caller's center read is always inside [lower, upper).
+    float3 e = center * exposure;
     float3 f = rcas_load(source, p + int2(1, 0), lower, upper, exposure);
     float3 h = rcas_load(source, p + int2(0, 1), lower, upper, exposure);
 
@@ -164,7 +198,7 @@ kernel void yaagl_fsr_finish(
         exposure = max(exposureTexture.read(uint2(0)).r, 1.0e-7f);
     if (params.flags & YaaglFsrSharpen)
         color.rgb = rcas(source, sourcePosition, params.sourceOrigin,
-                         params.sourceOrigin + params.extent, params.sharpness, exposure);
+                         params.sourceOrigin + params.extent, params.sharpness, exposure, color.rgb);
     color.rgb = forward_transfer(color.rgb, params.transfer);
     destination.write(color, destinationPosition);
 }
@@ -263,7 +297,39 @@ struct YaaglFgParams {
     float4x4 clipToPreviousClip;
     float motionVectorsInvalidValue;
     uint motionVectorsInvalidValuePresent;
+    // Render-grid reconstruction: pick the nearest-camera depth of each 3x3
+    // neighborhood (FSR3 ReconstructAndDilate) and read motion at that sample.
+    uint2 depthSourceExtent;
+    uint depthDilation;
+    uint depthInverted;
 };
+
+static uint2 fg_source_position(uint2 tid, uint2 extent, uint2 sourceExtent) {
+    return min(uint2((float2(tid) + 0.5f) * float2(sourceExtent) / float2(extent)), sourceExtent - 1u);
+}
+
+// The center sample wins ties; neighbors replace it only when strictly nearer.
+static uint2 fg_nearest_depth(texture2d<float, access::read> depth, uint2 center,
+                              uint2 extent, bool inverted) {
+    uint2 nearest = center;
+    float nearestDepth = depth.read(center).r;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            int2 position = int2(center) + int2(x, y);
+            if ((x == 0 && y == 0) || any(position < 0) || any(position >= int2(extent))) continue;
+            float candidate = depth.read(uint2(position)).r;
+            if (inverted ? candidate > nearestDepth : candidate < nearestDepth) {
+                nearest = uint2(position);
+                nearestDepth = candidate;
+            }
+        }
+    return nearest;
+}
+
+static float fg_store_half_range(float value) {
+    // Round-to-nearest half store; finite overflow saturates, NaN/Inf are preserved.
+    return isfinite(value) ? clamp(value, -65504.0f, 65504.0f) : value;
+}
 
 static float3 fg_decode(float3 value, constant YaaglFgParams& params) {
     if (params.transfer == 0u) return inverse_srgb(value);
@@ -306,14 +372,20 @@ kernel void yaagl_fg_decode_distortion(
 
 kernel void yaagl_fg_normalize_motion(
     texture2d<float, access::read> source [[texture(0)]],
-    texture2d<float, access::write> destination [[texture(1)]],
+    texture2d<half, access::write> destination [[texture(1)]],
     texture2d<float, access::read> depth [[texture(2)]],
+    texture2d<float, access::read> sourceDepth [[texture(4)]],
     constant YaaglFgParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
     if (any(tid >= params.extent)) return;
-    uint2 sourcePosition = min(
-        uint2((float2(tid) + 0.5f) * float2(params.sourceExtent) /
-              float2(params.extent)), params.sourceExtent - 1u);
+    uint2 sourcePosition = fg_source_position(tid, params.extent, params.sourceExtent);
+    if (params.depthDilation) {
+        uint2 nearest = fg_nearest_depth(sourceDepth,
+            fg_source_position(tid, params.extent, params.depthSourceExtent),
+            params.depthSourceExtent, params.depthInverted != 0u);
+        sourcePosition = min(uint2((float2(nearest) + 0.5f) * float2(params.sourceExtent) /
+                                   float2(params.depthSourceExtent)), params.sourceExtent - 1u);
+    }
     float2 value = source.read(sourcePosition).xy;
     // Either invalid component invalidates the object vector; camera reprojection is still applied below.
     if (params.motionVectorsInvalidValuePresent &&
@@ -329,7 +401,7 @@ kernel void yaagl_fg_normalize_motion(
         if (all(isfinite(previous)) && abs(previous.w) > 1.0e-6f)
             pixels += (previous.xy / previous.w - clip.xy) * float2(0.5f, -0.5f) * float2(params.outputExtent);
     }
-    destination.write(float4(pixels, 0.0f, 0.0f), tid);
+    destination.write(half4(half(fg_store_half_range(pixels.x)), half(fg_store_half_range(pixels.y)), 0.0h, 0.0h), tid);
 }
 
 kernel void yaagl_fg_encode_scatter(
@@ -387,8 +459,8 @@ kernel void yaagl_fg_resample_depth(
     constant YaaglFgParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
     if (any(tid >= params.extent)) return;
-    uint2 sourcePosition = min(
-        uint2((float2(tid) + 0.5f) * float2(params.sourceExtent) /
-              float2(params.extent)), params.sourceExtent - 1u);
+    uint2 sourcePosition = fg_source_position(tid, params.extent, params.sourceExtent);
+    if (params.depthDilation)
+        sourcePosition = fg_nearest_depth(source, sourcePosition, params.sourceExtent, params.depthInverted != 0u);
     destination.write(source.read(sourcePosition), tid);
 }

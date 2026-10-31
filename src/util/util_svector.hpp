@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -265,12 +266,12 @@ public:
 
   /** Provides safe access to elements */
   const T& at(size_t idx) const {
-    dxbc_spv_assert(idx < size());
+    assert(idx < size());
     return *ptr(idx);
   }
 
   T& at(size_t idx) {
-    dxbc_spv_assert(idx < size());
+    assert(idx < size());
     return *ptr(idx);
   }
 

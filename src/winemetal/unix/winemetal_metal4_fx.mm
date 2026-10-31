@@ -7,6 +7,7 @@
 #define WINEMETAL_API
 #include "../winemetal_metal4_fx.h"
 #include "metalfx-backend.hpp"
+#include "metalfx_amd_rr.hpp"
 namespace fx = yaagl::pso::metalfx;
 extern "C" int32_t winemetal_metal4_fg_call(struct WMTMetal4Call *call);
 extern "C" void winemetal_composition_present(id<MTLDrawable> drawable, double duration,
@@ -45,13 +46,95 @@ static uint32_t resultFor(const fx::Error &error) {
   }
 }
 static fx::Rect rect(const WMTMetal4FXRect &r) { return {r.x, r.y, r.width, r.height}; }
+
+@interface DXMTAmdRRFeature : NSObject {
+@public std::shared_ptr<dxmt::rr::Feature> feature;
+}
+@end
+@implementation DXMTAmdRRFeature
+@end
+@interface DXMTAmdRRFrame : NSObject {
+@public std::shared_ptr<const dxmt::rr::PreparedFrame> frame;
+}
+@end
+@implementation DXMTAmdRRFrame
+@end
+@interface DXMTAmdRRExecution : NSObject {
+@public std::shared_ptr<const dxmt::rr::PreparedFrame> frame;
+@public std::shared_ptr<const dxmt::rr::ExecutionLease> lease;
+}
+@end
+@implementation DXMTAmdRRExecution
+@end
+static uint64_t amdRRResult(const fx::Error &error) {
+  switch (error.code) {
+  case fx::ErrorCode::None: return WMTRR_OK;
+  case fx::ErrorCode::InvalidContext:
+  case fx::ErrorCode::InvalidFrame: return WMTRR_PARAMETER;
+  case fx::ErrorCode::UnsupportedFeature:
+  case fx::ErrorCode::IncompatibleTexture:
+  case fx::ErrorCode::ScalerCreationFailed: return WMTRR_NO_PROVIDER;
+  case fx::ErrorCode::ResourceCreationFailed: return WMTRR_MEMORY;
+  default: return WMTRR_RUNTIME;
+  }
+}
+// AMD Ray Regeneration: one native feature per FFX context, one prepared frame per recorded dispatch.
+static bool amdRRCall(struct WMTMetal4Call *call) {
+  switch (call->operation) {
+  case WMTMetal4RRCreate: {
+    fx::Error error;
+    auto feature = dxmt::rr::Feature::create(reinterpret_cast<void *>(call->args[0]),
+        reinterpret_cast<void *>(call->args[1]), *reinterpret_cast<const WMTRRCreateInfo *>(call->args[2]), &error);
+    call->ret[0] = 0; call->ret[1] = amdRRResult(error);
+    if (feature) {
+      auto holder = [DXMTAmdRRFeature new]; holder->feature = std::move(feature);
+      call->ret[0] = reinterpret_cast<uintptr_t>(holder); call->ret[1] = WMTRR_OK;
+    } else if (!call->ret[1]) call->ret[1] = WMTRR_RUNTIME;
+    return true;
+  }
+  case WMTMetal4RRPrepare: {
+    const auto &p = *reinterpret_cast<const WMTRRFrame *>(call->args[1]);
+    dxmt::rr::TextureSet textures{};
+    for (size_t i = 0; i < textures.size(); ++i) textures[i] = reinterpret_cast<void *>(p.textures[i]);
+    fx::Error error;
+    auto frame = ((DXMTAmdRRFeature *)call->args[0])->feature->prepare(p, textures, p.settings, &error);
+    call->ret[0] = 0; call->ret[1] = amdRRResult(error);
+    if (frame) {
+      auto holder = [DXMTAmdRRFrame new]; holder->frame = std::move(frame);
+      call->ret[0] = reinterpret_cast<uintptr_t>(holder); call->ret[1] = WMTRR_OK;
+    } else if (!call->ret[1]) call->ret[1] = WMTRR_RUNTIME;
+    return true;
+  }
+  case WMTMetal4RREncode: {
+    auto holder = [DXMTAmdRRExecution new];
+    holder->frame = ((DXMTAmdRRFrame *)call->args[1])->frame;
+    // The lease is published before any GPU command; the recording owns it through retirement.
+    winemetal_metal4_retain_resource(call->args[0], holder);
+    [holder release];
+    winemetal_metal4_retain_resource(call->args[0], (id)call->args[2]);
+    fx::Error error;
+    const bool success = holder->frame->encode(winemetal_metal4_command_buffer(call->args[0]),
+        reinterpret_cast<void *>(call->args[2]), holder->lease, winemetal_metal4_split_command_buffer,
+        reinterpret_cast<void *>(call->args[0]), &error);
+    call->ret[0] = success ? WMTRR_OK : (amdRRResult(error) ? amdRRResult(error) : WMTRR_RUNTIME);
+    return true;
+  }
+  case WMTMetal4RRDormant:
+    ((DXMTAmdRRFeature *)call->args[0])->feature->markDormant();
+    return true;
+  case WMTMetal4RRMemory:
+    call->ret[0] = ((DXMTAmdRRFeature *)call->args[0])->feature->memoryUsage();
+    return true;
+  default: return false;
+  }
+}
 #include "metalfx_rr.inc"
 extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
   if (call->operation >= 240 && call->operation < 256) return winemetal_metal4_fg_call(call);
   @autoreleasepool {
     @try {
       if (@available(macOS 26.0, *)) {
-        if (dxmtRRCall(call)) return 0;
+        if (dxmtRRCall(call) || amdRRCall(call)) return 0;
         switch (call->operation) {
         case WMTMetal4FXSupportsTemporal:
           if (call->args[1] & 256u)

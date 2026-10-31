@@ -34,6 +34,15 @@ class MTLD3D12ComputePipelineStateImpl : public MTLD3D12Pageable<MTLD3D12Compute
                                              REFIID, void **);
 
   PipelineCache cache_;
+  std::mutex native_owners_mutex;
+  std::vector<std::shared_ptr<const NativePipelineArtifact>> native_owners;
+  WMT::Reference<WMT::ComputePipelineState> CreateNativePipeline(const WMTComputePipelineInfo &info, WMT::Error &error) {
+    auto artifact = device_->GetShaderArtifactCache().NativePipeline(device_->GetMetal4Compiler(), info, error);
+    if (!artifact->compute) return {};
+    std::lock_guard lock(native_owners_mutex);
+    native_owners.push_back(artifact);
+    return artifact->compute;
+  }
   MTL_SHADER_REFLECTION ref_cs{};
 
   /* Everything the indirect-command-buffer variant of this pipeline is rebuilt from.
@@ -105,10 +114,12 @@ public:
 
     if (cache_.Compile(PipelineCache::Compute, device_->GetShaderArtifactCache(), pDesc->CS, shader_cs,
                        (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main", &sm50_err)) {
-      RecordShaderCompileFailure("CS", pDesc->CS, rootsig,
-                                 reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
-                                 "cs_main", SM50GetErrorMessageString(sm50_err), pDesc->pRootSignature != nullptr);
-      ERR("Failed to compile cs shader: ", SM50GetErrorMessageString(sm50_err));
+      const auto error = SM50GetErrorMessageString(sm50_err);
+      const bool first = RecordShaderCompileFailure(
+          "CS", pDesc->CS, rootsig, reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
+          "cs_main", error, pDesc->pRootSignature != nullptr, &cache_.stageKey(PipelineCache::Compute));
+      if (SM50GetErrorKind(sm50_err) != SM50_ERROR_ROOT_BINDING || first)
+        ERR("Failed to compile cs shader: ", error);
       return E_FAIL;
     }
     if (trace) times[3] = Clock::now();
@@ -127,7 +138,7 @@ public:
       return cache_.loaded() ? E_INVALIDARG : E_FAIL;
     if (trace) times[5] = Clock::now();
 
-    auto cs_func = cs_lib.newFunction("cs_main");
+    auto cs_func = device_->GetShaderArtifactCache().Function(cs_lib, "cs_main");
     if (!cs_func)
       return cache_.loaded() ? E_INVALIDARG : E_FAIL;
     if (trace) times[6] = Clock::now();
@@ -142,7 +153,7 @@ public:
        * GetIndirectCommandBufferPipelineState. */
       info.support_indirect_command_buffers = false;
 
-      pso = device_->GetMetal4Compiler().newComputePipelineState(info, err);
+      pso = CreateNativePipeline(info, err);
       if (!pso) {
         ERR("Failed to create compute PSO: ", err.description().getUTF8String());
         return E_FAIL;
@@ -175,7 +186,7 @@ public:
       auto info = indirect_info;
       info.compute_function = indirect_compute_function.handle;
       info.support_indirect_command_buffers = true;
-      indirect_pso = device_->GetMetal4Compiler().newComputePipelineState(info, error);
+      indirect_pso = CreateNativePipeline(info, error);
       if (!indirect_pso)
         ERR("Failed to create indirect command buffer PSO: ", error.description().getUTF8String());
     }
@@ -220,7 +231,7 @@ public:
       auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       if (!lib)
         return {};
-      statistics_function = lib.newFunction("cs_main");
+      statistics_function = device_->GetShaderArtifactCache().Function(lib, "cs_main");
       if (!statistics_function)
         return {};
     }
@@ -231,7 +242,7 @@ public:
       info.support_indirect_command_buffers = indirect;
       
       
-      variant = device_->GetMetal4Compiler().newComputePipelineState(info, error);
+      variant = CreateNativePipeline(info, error);
       if (!variant)
         ERR("Failed to create statistics compute PSO: ", error.description().getUTF8String());
     }

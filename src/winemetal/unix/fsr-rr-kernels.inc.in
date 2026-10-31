@@ -1,0 +1,3 @@
+static const char kFsrRrKernelsSource[] = R"DXMTMETAL(
+@FSR_RR_KERNELS_SOURCE@
+)DXMTMETAL";

@@ -9,6 +9,7 @@
 #include "dxmt_hud_state.hpp"
 #include "dxmt_statistics.hpp"
 #include "dxmt_presenter.hpp"
+#include "dxmt_monitor_format.hpp"
 #include "log/log.hpp"
 #include "d3d11_resource.hpp"
 #include "d3d11_device.hpp"
@@ -63,31 +64,6 @@ WMTColorSpace ConvertColorSpace(DXGI_COLOR_SPACE_TYPE color_space, bool hdr) {
     return WMTColorSpaceBT2020;
   default:
     return WMTColorSpaceInvalid;
-  }
-}
-
-/**
- FIXME: duplicated implementation in dxgi_output.cpp
-*/
-uint32_t
-GetMonitorFormatBpp(DXGI_FORMAT Format) {
-  switch (Format) {
-  case DXGI_FORMAT_R8G8B8A8_UNORM:
-  case DXGI_FORMAT_B8G8R8A8_UNORM:
-  case DXGI_FORMAT_B8G8R8X8_UNORM:
-  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-  case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-  case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
-  case DXGI_FORMAT_R10G10B10A2_UNORM:
-  case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
-    return 32;
-
-  case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    return 64;
-
-  default:
-    Logger::warn(str::format("GetMonitorFormatBpp: Unknown format: ", Format));
-    return 32;
   }
 }
 

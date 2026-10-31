@@ -47,6 +47,10 @@
 #include "owned_bundle_recording.hpp"
 #include "owned_rtas_lifetime.hpp"
 #include "owned_rtas_mirror.hpp"
+#include "owned_async_pipeline.hpp"
+#include "config/config.hpp"
+#include "thread.hpp"
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <condition_variable>
@@ -196,7 +200,8 @@ public:
                           WMT::Reference<WMT::PresentationObserver> observer, uint64_t present_id,
                           std::shared_ptr<std::atomic<bool>> observer_fault,
                           DXMTPresentComposition composition, bool do_not_wait,
-                          std::shared_ptr<DXMTPresentLatency> latency, bool restart, bool borrowed) = 0;
+                          std::shared_ptr<DXMTPresentLatency> latency, bool restart, bool borrowed,
+                          bool closes_frame) = 0;
 };
 
 class MTLD3D12Resource : public ID3D12Resource2 {
@@ -229,6 +234,9 @@ public:
   HRESULT PublishOwnedFormatCasting();
   HRESULT ImportOwnedFormatCasting(MTLD3D12Device *device,const D3D12_RESOURCE_DESC &desc);
   std::shared_ptr<BarrierTracker> owned_barrier_state;
+  // Set with release once owned_barrier_state is created (under owned_barrier_state_mutex); that
+  // shared_ptr is never reassigned, so an acquire load seeing it set may copy it without the mutex.
+  std::atomic<bool> owned_barrier_state_ready{false};
   Rc<Texture> texture;
   Rc<Buffer> buffer;
   std::unique_ptr<standard_swizzle::Layout> swizzle_layout;
@@ -588,6 +596,15 @@ struct ViewInstancingState {
 class MTLD3D12GraphicsPipelineState : public MTLD3D12PipelineState {
 public:
   WMT::Reference<WMT::RenderPipelineState> pso;
+  /* d3d12.asyncPipelineCompile: deferred creation of `pso`. Every reader of `pso` calls
+   * WaitNativePipeline() first; a failed job is a recording error, not a fallback. */
+  std::shared_ptr<owned_graphics::AsyncCompileJob> async_job;
+  /* Shaders expose no UAV and no side-effect path, so a pending draw may be omitted. */
+  bool async_omittable = false;
+  bool NativePipelinePending() const {
+    return async_job && async_job->status() == owned_graphics::AsyncCompileJob::Pending;
+  }
+  bool WaitNativePipeline() { return !async_job || async_job->Wait(); }
   // Ready direct native MSAA slot; captured variants and ordinary pso remain independent.
   WMT::Reference<WMT::RenderPipelineState> native_msaa_pso;
   MeshPipelineKind mesh_kind = MeshPipelineKind::None;
@@ -841,6 +858,56 @@ public:
 };
 
 struct Atomic64PhasePipelines;
+
+/* d3d12.asyncPipelineCompile: device-owned workers for deferred graphics PSO linking, the
+ * presentation epoch, and render-target recurrence for omitting draws while a PSO is pending. */
+class AsyncPipelineCompiler {
+public:
+  /* `threads` is d3d12.asyncPipelineCompileThreads: 0 (default) uses max(1, logical CPUs / 2). */
+  AsyncPipelineCompiler(bool enabled, int32_t threads) : enabled_(enabled), threads_(threads > 0 ? threads : 0) {}
+  ~AsyncPipelineCompiler() {
+    if (dxmt::this_thread::isInModuleDetachment()) {
+      // Workers were terminated by ExitProcess and may own the queue lock: never lock or join.
+      // Detaching closes their handles so ~ThreadFn does not terminate on a joinable thread.
+      for (auto &worker : workers_)
+        worker.detach();
+      return;
+    }
+    queue_.Stop();
+    for (auto &worker : workers_)
+      worker.join();
+  }
+  bool Enabled() const { return enabled_; }
+  void Submit(std::shared_ptr<owned_graphics::AsyncCompileJob> job) {
+    // OWNED_ASYNC_PIPELINE_HOLD=1 (fixture control) never starts workers: queued links complete
+    // only through a synchronous consumer, so pending omission is observable without timing.
+    std::call_once(start_, [this] {
+      if (dxmt::env::getEnvVar("OWNED_ASYNC_PIPELINE_HOLD") == "1")
+        return;
+      // Leave cores for the application's render thread; workers run below it so a link burst does
+      // not preempt frame submission. Unclaimed jobs still run on a consumer that needs them.
+      const uint32_t count = threads_ ? threads_ : std::max(1u, dxmt::thread::hardware_concurrency() / 2);
+      for (uint32_t i = 0; i < count; ++i) {
+        workers_.emplace_back([this] { queue_.RunWorker(); });
+        workers_.back().set_priority(dxmt::ThreadPriority::Lowest);
+      }
+    });
+    queue_.Submit(std::move(job));
+  }
+  uint64_t Epoch() const { return epoch_.load(std::memory_order_acquire); }
+  void AdvanceEpoch() { epoch_.fetch_add(1, std::memory_order_acq_rel); }
+  owned_graphics::RenderTargetHistory &Targets() { return targets_; }
+
+private:
+  const bool enabled_;
+  const uint32_t threads_;
+  std::once_flag start_;
+  owned_graphics::AsyncCompileQueue queue_;
+  std::vector<dxmt::thread> workers_;
+  std::atomic<uint64_t> epoch_{1};
+  owned_graphics::RenderTargetHistory targets_;
+};
+
 class MTLD3D12Device : public ID3D12Device14 {
 public:
   RuntimeConfiguration runtime_configuration;
@@ -848,6 +915,8 @@ public:
   DeviceDiagnostics diagnostics{this};
   ReflexState reflex;
   GPUExecutionGate gpu_execution_gate;
+  AsyncPipelineCompiler async_pipelines{Config::getInstance().getOption<bool>("d3d12.asyncPipelineCompile", false),
+                                        Config::getInstance().getOption<int32_t>("d3d12.asyncPipelineCompileThreads", 0)};
   std::shared_ptr<Atomic64PhasePipelines> atomic64_phase_pipelines;
   virtual HRESULT RemovedReason() const = 0;
   virtual void ReportRemoval(HRESULT reason) = 0;
@@ -909,6 +978,13 @@ public:
   ) = 0;
 
   virtual BufferAllocation *LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
+  /* LookupBufferByVA that also reports the VA interval [*pBegin, *pEnd) over which the same
+   * allocation is returned and the map generation observed; *pEnd is 0 for a null result. */
+  virtual BufferAllocation *LookupBufferRangeByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pBegin,
+                                                  uint64_t *pEnd, uint64_t *pGeneration) = 0;
+  /* Advances whenever the VA map gains or loses a buffer; a cached lookup result is reusable
+   * only while this value is unchanged. */
+  std::atomic<uint64_t> buffer_va_generation{0};
 
   virtual InternalCommandLibrary& GetLib() = 0;
 

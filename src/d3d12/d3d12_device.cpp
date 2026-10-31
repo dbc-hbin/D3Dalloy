@@ -29,6 +29,7 @@
 #include "d3d12_matrix.hpp"
 #include "d3d12_temporal.hpp"
 #include "d3d12_frame_generation.hpp"
+#include "d3d12_ray_regeneration.hpp"
 #include "Metal.hpp"
 #include "Metal4FX.hpp"
 #include "DXBCParser/BlobContainer.h"
@@ -119,7 +120,7 @@ bool ResolveRTASGPUVA(void *context, D3D12_GPU_VIRTUAL_ADDRESS address, uint64_t
   return true;
 }
 
-class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt, IMTLD3D12FrameGenerationDevice, IMTLD3D12Reflex, ID3D12DevicePreview, ID3D12DeviceConfiguration>> {
+class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt, IMTLD3D12FrameGenerationDevice, IMTLD3D12RayRegenerationDevice, IMTLD3D12Reflex, ID3D12DevicePreview, ID3D12DeviceConfiguration>> {
 
   Com<IMTLDXGIAdapter> adapter_;
   WMT::Reference<WMT4::Compiler> metal4_compiler_;
@@ -452,6 +453,18 @@ public:
 
     *ppvObject = nullptr;
 
+    // Device-child ownership checks query ID3D12Device on every recorded
+    // reference; no earlier branch accepts these IIDs, so test them first.
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12Device) ||
+        riid == __uuidof(ID3D12Device1) || riid == __uuidof(ID3D12Device2) || riid == __uuidof(ID3D12Device3) ||
+        riid == __uuidof(ID3D12Device4) || riid == __uuidof(ID3D12Device5) || riid == __uuidof(ID3D12Device6) ||
+        riid == __uuidof(ID3D12Device7) || riid == __uuidof(ID3D12Device8) || riid == __uuidof(ID3D12Device9) ||
+        riid == __uuidof(ID3D12Device10) || riid == __uuidof(ID3D12Device11) || riid == __uuidof(ID3D12Device12) ||
+        riid == __uuidof(ID3D12Device13) || riid == __uuidof(ID3D12Device14)) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+
     if (HRESULT hr = diagnostics.QueryInterface(riid, ppvObject); hr != E_NOINTERFACE)
       return hr;
 
@@ -470,6 +483,11 @@ public:
       AddRef();
       return S_OK;
     }
+    if (riid == __uuidof(IMTLD3D12RayRegenerationDevice)) {
+      *ppvObject = static_cast<IMTLD3D12RayRegenerationDevice *>(this);
+      AddRef();
+      return S_OK;
+    }
     if (riid == __uuidof(IMTLD3D12Reflex)) {
       *ppvObject = static_cast<IMTLD3D12Reflex *>(this);
       AddRef();
@@ -478,16 +496,6 @@ public:
     if (riid == __uuidof(IMTLD3D12DeviceExt)) {
       *ppvObject = static_cast<IMTLD3D12DeviceExt *>(this);
       AddRef();
-      return S_OK;
-    }
-
-    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12Device) ||
-        riid == __uuidof(ID3D12Device1) || riid == __uuidof(ID3D12Device2) || riid == __uuidof(ID3D12Device3) ||
-        riid == __uuidof(ID3D12Device4) || riid == __uuidof(ID3D12Device5) || riid == __uuidof(ID3D12Device6) ||
-        riid == __uuidof(ID3D12Device7) || riid == __uuidof(ID3D12Device8) || riid == __uuidof(ID3D12Device9) ||
-        riid == __uuidof(ID3D12Device10) || riid == __uuidof(ID3D12Device11) || riid == __uuidof(ID3D12Device12) ||
-        riid == __uuidof(ID3D12Device13) || riid == __uuidof(ID3D12Device14)) {
-      *ppvObject = ref(this);
       return S_OK;
     }
 
@@ -1998,23 +2006,16 @@ public:
       }
       for (UINT i = 0; i < FenceCount; ++i)
         values.push_back(fences[i]->prepareWaitValue(pValues[i]));
-      HANDLE event = hEvent;
-      if (!event) {
-        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!event)
-          return HRESULT_FROM_WIN32(GetLastError());
-      }
-      HRESULT hr = event_listener.setEventOnValues(
-          values.data(), FenceCount, Flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, event
-      ) ? S_OK : E_OUTOFMEMORY;
-      if (!hEvent) {
-        if (SUCCEEDED(hr) && WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0)
-          hr = HRESULT_FROM_WIN32(GetLastError());
-        CloseHandle(event);
-        if (SUCCEEDED(hr) && RemovedReason() != S_OK)
-          hr = DXGI_ERROR_DEVICE_REMOVED;
-      }
-      return hr;
+      const bool wait_all = Flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL;
+      if (hEvent)
+        return event_listener.setEventOnValues(values.data(), FenceCount, wait_all, hEvent) ? S_OK : E_OUTOFMEMORY;
+      // Block on a process-local latch, as the single-fence path does, rather
+      // than creating, waiting on, and closing a kernel event per call.
+      auto done = std::make_shared<owned_graphics::FenceCompletionLatch>();
+      if (!owned_graphics::FenceEventRegistration::set(values.data(), FenceCount, wait_all, [done] { done->signal(); }))
+        return E_OUTOFMEMORY;
+      done->wait();
+      return RemovedReason() == S_OK ? S_OK : DXGI_ERROR_DEVICE_REMOVED;
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
     }
@@ -3033,6 +3034,11 @@ public:
     return CreateOwnedFrameGenerationState(this, desc, state);
   }
 
+  HRESULT STDMETHODCALLTYPE CreateRayRegenerationState(const MTL_RAY_REGENERATION_CREATE_DESC *desc,
+      IMTLD3D12RayRegenerationState **state) final {
+    return CreateOwnedRayRegenerationState(this, desc, state);
+  }
+
   HRESULT
   UnregisterResidency(WMT::Allocation allocation, MTLD3D12PageableResidency *owner) {
     if (!allocation)
@@ -3060,6 +3066,7 @@ public:
       auto [entry, inserted] = interval_map_.emplace(allocation->gpuAddress(), allocation);
       if (!inserted)
         return E_INVALIDARG;
+      buffer_va_generation.fetch_add(1, std::memory_order_release);
       if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
         return S_OK;
       auto buffer = allocation->buffer();
@@ -3130,6 +3137,7 @@ public:
       return E_INVALIDARG;
     std::unique_lock<dxmt::mutex> lock(residency_lock_);
     interval_map_.erase(allocation->gpuAddress());
+    buffer_va_generation.fetch_add(1, std::memory_order_release);
     /*
      * Every acceleration structure that lived in this allocation dies with it, so each of its
      * versions is released here: this is D3D12's own lifetime rule (the application may not free
@@ -3165,8 +3173,18 @@ public:
 
   BufferAllocation *
   LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) {
+    uint64_t begin, end, generation;
+    return LookupBufferRangeByVA(VA, pOffset, &begin, &end, &generation);
+  }
+
+  BufferAllocation *
+  LookupBufferRangeByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pBegin, uint64_t *pEnd,
+                        uint64_t *pGeneration) {
     std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    *pGeneration = buffer_va_generation.load(std::memory_order_relaxed);
+    *pBegin = *pEnd = 0;
     auto iter = interval_map_.upper_bound(VA);
+    const uint64_t next = iter == interval_map_.end() ? UINT64_MAX : iter->first;
     if (iter == interval_map_.begin()) {
       *pOffset = 0;
       return {};
@@ -3177,6 +3195,10 @@ public:
       *pOffset = 0;
       return {};
     }
+    // A later registered start (aliasing placed buffers) wins the lookup, so the result
+    // holds only up to the next key.
+    *pBegin = iter->first;
+    *pEnd = iter->first + std::min<uint64_t>(iter->second->byteLength(), next - iter->first);
     return iter->second;
   }
 

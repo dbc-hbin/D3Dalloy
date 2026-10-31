@@ -22,6 +22,8 @@
 #include "dxmt_command_clear.hpp"
 #include "dxmt_ring_bump_allocator.hpp"
 #include "owned_submission_storage.hpp"
+#include <memory>
+#include <new>
 #include <source_location>
 #include <unordered_set>
 
@@ -104,7 +106,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
 
   std::vector<void *> spilled_cpu_heap_;
   void *cpu_heap_ = nullptr;
-  size_t cpu_heap_offset_;
+  size_t cpu_heap_offset_ = 0;
 
   struct GPUHeapChunk {
     WMT::Reference<WMT::Buffer> buffer;
@@ -120,6 +122,8 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   std::vector<GPUHeapChunk> gpu_heap_chunks_;
   size_t gpu_heap_active_ = 0;
   uint64_t gpu_heap_epoch_ = 0;
+  // Immutable device limit; ReserveGPUHeap runs per root upload, so avoid a native call each time.
+  const uint64_t gpu_heap_max_length_ = std::min<uint64_t>(device_->GetMTLDevice().maxBufferLength(), SIZE_MAX);
   const uint64_t trace_id_ = owned_graphics::NewObjectId();
 
   EncoderData *encoder_last = nullptr;
@@ -244,18 +248,20 @@ public:
   void *
   AllocateCPUHeap(size_t Length, size_t Alignment) {
     assert(Length < kCPUHeapSize);
-    for (;;) {
-      std::size_t adjustment = align_forward_adjustment((void *)cpu_heap_offset_, Alignment);
-      auto aligned = cpu_heap_offset_ + adjustment;
-      cpu_heap_offset_ = aligned + Length;
-      if (unlikely(cpu_heap_offset_ >= kCPUHeapSize)) {
-        spilled_cpu_heap_.push_back(cpu_heap_);
-        cpu_heap_ = malloc(kCPUHeapSize);
-        cpu_heap_offset_ = 0;
-        continue;
-      }
-      return ptr_add(cpu_heap_, aligned);
+    const auto adjustment = align_forward_adjustment((void *)cpu_heap_offset_, Alignment);
+    auto aligned = cpu_heap_offset_ + adjustment;
+    if (unlikely(aligned >= kCPUHeapSize || Length >= kCPUHeapSize - aligned)) {
+      // Neither the current cursor nor ownership changes until both allocations
+      // succeed. Existing command pointers must survive either failure.
+      std::unique_ptr<void, decltype(&free)> next(malloc(kCPUHeapSize), &free);
+      if (!next)
+        throw std::bad_alloc();
+      spilled_cpu_heap_.push_back(cpu_heap_);
+      cpu_heap_ = next.release();
+      aligned = 0;
     }
+    cpu_heap_offset_ = aligned + Length;
+    return ptr_add(cpu_heap_, aligned);
   }
 
   template <typename T>
@@ -287,12 +293,15 @@ public:
 
   template <typename cmd_struct>
   cmd_struct &
-  EncodeBlitCommand() {
+  EncodeBlitCommand(bool tracked = false) {
     assert(encoder_current->type == EncoderType::Blit);
     auto encoder = static_cast<BlitEncoderData *>(encoder_current);
     if constexpr (std::is_same_v<cmd_struct, wmtcmd_blit_copy_from_buffer_to_buffer>)
       ++encoder->submission_copy_count;
-    else
+    else if (!tracked)
+      // Tracked commands describe their accesses through the command list's
+      // RecordBlitTextureAccess/RecordBlitUploadAccess; every other blit
+      // command stays untracked.
       encoder->submission_access_complete = false;
     auto storage = (cmd_struct *)AllocateCPUHeap(sizeof(cmd_struct), 16);
     encoder->cmd_tail->next.set(storage);

@@ -32,6 +32,7 @@ d3d12_src = [
   'd3d12_texture.cpp',
   'd3d12_temporal.cpp',
   'd3d12_frame_generation.cpp',
+  'd3d12_ray_regeneration.cpp',
   '../d3d10/d3d10_blob.cpp',
 ]
 

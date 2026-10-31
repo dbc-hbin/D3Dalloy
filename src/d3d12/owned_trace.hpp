@@ -5,8 +5,10 @@
 #include "util_env.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <new>
 #include <utility>
 
 namespace owned_graphics {
@@ -14,6 +16,12 @@ namespace owned_graphics {
 inline std::uint64_t NewObjectId() {
   static std::atomic<std::uint64_t> next{1};
   return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline std::uint64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
 
 inline bool TraceEnabled() {
@@ -42,7 +50,7 @@ inline std::atomic<std::uint64_t> trace_event_counter{0};
 // pass application annotation strings, paths, shader text, or arbitrary blobs.
 // IDs are process-local and never derived from reusable COM object addresses.
 template <typename... Fields>
-inline void Trace(const char *event, Fields &&...fields) {
+inline void Trace(const char *event, Fields &&...fields) noexcept try {
   if (!TraceEnabled())
     return;
   static_assert(sizeof...(Fields) > 0);
@@ -51,7 +59,10 @@ inline void Trace(const char *event, Fields &&...fields) {
     return;
   dxmt::Logger::info(dxmt::str::format(
       "OWNED_GRAPHICS_TRACE {\"event\":\"", event, "\",\"event_id\":", sequence + 1,
+      ",\"timestamp_ns\":", NowNs(),
       std::forward<Fields>(fields)..., "}"));
+} catch (const std::bad_alloc &) {
+  // Optional diagnostics must not throw out of recording cleanup or retirement.
 }
 
 } // namespace owned_graphics

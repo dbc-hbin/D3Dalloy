@@ -30,7 +30,8 @@ public:
 
   void
   retain() {
-    NSObject_retain(handle);
+    if (handle != NULL_OBJECT_HANDLE)
+      NSObject_retain(handle);
   }
 
   void
@@ -75,7 +76,7 @@ public:
     this->handle = copy.handle;
     this->retain();
   }
-  Reference(Reference &&move) {
+  Reference(Reference &&move) noexcept {
     this->handle = move.handle;
     move.handle = NULL_OBJECT_HANDLE;
   }
@@ -1582,6 +1583,7 @@ InitializeRenderPipelineInfo(WMTRenderPipelineInfo &info) {
   info.fail_on_binary_archive_miss = false;
   info.support_indirect_command_buffers = false;
   info.max_vertex_amplification_count = 0;
+  info.inherit_color_attachment_mapping = false;
 }
 
 inline void

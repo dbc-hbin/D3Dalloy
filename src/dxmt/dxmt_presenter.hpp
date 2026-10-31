@@ -119,6 +119,11 @@ public:
     frame_presented_.wait(frame_requested_);
   }
 
+  // Blocks until the first `count` frames finished encoding or were canceled.
+  void waitPresentEncoded(uint64_t count) {
+    frame_presented_.wait(count);
+  }
+
   void waitPresentsCompleted() {
     waitPresentsEncoded();
     frame_completed_.wait(frame_requested_);
@@ -166,6 +171,7 @@ public:
   // already waits for its frame ID. Release all outstanding GPU order waits terminally.
   void cancelPresentOrder() {
     present_order_event_.signalValue(UINT64_MAX);
+    frame_presented_.signal(UINT64_MAX);
     frame_completed_.signal(UINT64_MAX);
   }
 
@@ -269,7 +275,18 @@ private:
   WMTColorSpace display_colorspace_ = WMTColorSpaceSRGB;
   WMTHDRMetadata display_hdr_metadata_;
   WMTEDRValue display_edr_value_{0.0, 1.0};
+  // Gamma ramp state is written by SetGammaControl and consumed at present sync.
+  std::mutex gamma_mutex_;
   uint64_t gamma_version_ = 0;
+  bool gamma_lut_dirty_ = false;
+  std::atomic<bool> layer_resized_ = false;
+  struct PipelineKey {
+    WMTPixelFormat pixel_format = WMTPixelFormatInvalid;
+    bool source_srgb = false, is_pq = false, with_hdr_metadata = false, is_ms = false, gamma_enable = false;
+    bool composition_residual = false, linear_composition_transport = false;
+    bool operator==(const PipelineKey &) const = default;
+  };
+  PipelineKey pipeline_key_;
   std::array<float, DXMT_GAMMA_CP_COUNT * 4> gamma_lut_rgba_;
   WMT::Reference<WMT::Texture> gamma_lut_texture_;
   WMT::Reference<WMT::RenderPipelineState> present_blit_;

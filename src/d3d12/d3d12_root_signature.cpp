@@ -26,6 +26,8 @@
 #include "dxmt_sampler.hpp"
 #include "util_math.hpp"
 #include "util_md5.hpp"
+#include "owned_trace.hpp"
+#include "sha1/sha1_util.hpp"
 #include <algorithm>
 #include <cstring>
 #include <set>
@@ -46,7 +48,7 @@ HRESULT AppendRootStaticSamplers(
   if (!root) return S_OK;
   const void *blob = nullptr, *raw = nullptr;
   const UINT blob_size = root->GetBlob(&blob); UINT raw_size = 0;
-  if (!blob_size || !blob || FAILED(microsoft::DXBCGetRootSignature(blob, &raw, &raw_size))) return E_INVALIDARG;
+  if (!blob_size || !blob || FAILED(microsoft::DXBCGetRootSignature(blob, blob_size, &raw, &raw_size))) return E_INVALIDARG;
   RootSignatureDeserializer deserializer;
   if (FAILED(deserializer.Deserialize(raw, raw_size))) return E_INVALIDARG;
   const auto &desc = deserializer.desc_1_1_.Desc_1_1;
@@ -572,7 +574,7 @@ D3D12CreateVersionedRootSignatureDeserializer(
 
   const void *pRawRootSig;
   UINT RawRootSigSize;
-  HRESULT hr = microsoft::DXBCGetRootSignature(pBytecode, &pRawRootSig, &RawRootSigSize);
+  HRESULT hr = microsoft::DXBCGetRootSignature(pBytecode, DataSize, &pRawRootSig, &RawRootSigSize);
   if (FAILED(hr))
     return hr;
 
@@ -589,7 +591,7 @@ D3D12CreateRootSignatureDeserializer(const void *pBytecode, SIZE_T DataSize, REF
 
   const void *pRawRootSig;
   UINT RawRootSigSize;
-  HRESULT hr = microsoft::DXBCGetRootSignature(pBytecode, &pRawRootSig, &RawRootSigSize);
+  HRESULT hr = microsoft::DXBCGetRootSignature(pBytecode, DataSize, &pRawRootSig, &RawRootSigSize);
   if (FAILED(hr))
     return hr;
 
@@ -655,6 +657,12 @@ public:
       MTLD3D12DeviceChild<MTLD3D12RootSignature>(pDevice) {
     blob_.resize(BytecodeLength);
     memcpy(blob_.data(), pBytecode, BytecodeLength);
+    if (owned_graphics::TraceEnabled()) {
+      const auto input = Sha1HashState::compute(pBytecode, BytecodeLength);
+      const auto stored = Sha1HashState::compute(blob_.data(), blob_.size());
+      owned_graphics::Trace("root_signature_input", ",\"bytes\":", uint64_t(BytecodeLength),
+                            ",\"input_sha1\":\"", input.string(), "\",\"stored_sha1\":\"", stored.string(), "\"");
+    }
   }
 
   ~MTLD3D12RootSignatureImpl() override {
@@ -672,7 +680,7 @@ public:
   Initialize() {
     const void *pRawRootSig;
     UINT RawRootSigSize;
-    HRESULT hr = microsoft::DXBCGetRootSignature(blob_.data(), &pRawRootSig, &RawRootSigSize);
+    HRESULT hr = microsoft::DXBCGetRootSignature(blob_.data(), blob_.size(), &pRawRootSig, &RawRootSigSize);
     if (FAILED(hr))
       return hr;
 

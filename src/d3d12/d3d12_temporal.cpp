@@ -21,7 +21,6 @@ struct Core {
   const uint64_t id = owned_graphics::NewObjectId();
   MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC create{};
   WMT::Reference<WMT4::TemporalFeature> feature;
-  UINT feature_output_width = 0, feature_output_height = 0;
   WMT::Reference<WMT::SharedEvent> timeline;
   std::mutex mutex;
   uint64_t sequence = 0, last_executed_generation = 0;
@@ -159,23 +158,11 @@ public:
     p.debug_view = desc.DrawDebugView;
     int32_t native_hr;
     std::lock_guard lock(core_->mutex);
-    WMT::Reference<WMT4::TemporalFeature> replacement;
-    if (create.DynamicOutputEnabled &&
-        (ow != core_->feature_output_width || oh != core_->feature_output_height)) {
-      const WMTMetal4FXTemporalInfo info{create.InputWidth, create.InputHeight, ow, oh, create.FeatureFlags,
-          uint32_t(create.OutputSubrectsEnabled), uint32_t(create.DynamicOutputEnabled)};
-      replacement = WMT4::TemporalFeature::Create(device->GetMTLDevice(), device->GetMetal4Compiler(), info, native_hr);
-      if (native_hr < 0) return HRESULT(native_hr);
-      if (!replacement) return E_FAIL;
-    }
-    frame->native = (replacement ? replacement : core_->feature).prepare(p, native_hr, frame->generation);
+    // Dynamic output stays on one native feature: its bounded scaler cache
+    // keys generations by output extent and resets history on a switch.
+    frame->native = core_->feature.prepare(p, native_hr, frame->generation);
     if (native_hr < 0) return HRESULT(native_hr);
     if (!frame->native) return E_FAIL;
-    if (replacement) {
-      core_->feature.markDormant();
-      core_->feature = std::move(replacement);
-      core_->feature_output_width = ow; core_->feature_output_height = oh;
-    }
     owned_graphics::Trace("temporal_record", ",\"feature\":", core_->id, ",\"evaluation\":", frame->id,
         ",\"generation\":", frame->generation, ",\"color\":", frame->resources[0]->owned_id,
         ",\"depth\":", frame->resources[1]->owned_id, ",\"motion\":", frame->resources[2]->owned_id,
@@ -195,7 +182,6 @@ HRESULT CreateOwnedTemporalState(MTLD3D12Device *device,
   if (!WMT4::TemporalFeature::Supports(device->GetMTLDevice(), desc->FeatureFlags & 256u)) return DXGI_ERROR_UNSUPPORTED;
   try {
     auto core = std::make_shared<Core>(); core->device = device; core->create = *desc;
-    core->feature_output_width = desc->OutputWidth; core->feature_output_height = desc->OutputHeight;
     core->timeline = device->GetMTLDevice().newSharedEvent();
     if (!core->timeline) return E_OUTOFMEMORY;
     const WMTMetal4FXTemporalInfo p{desc->InputWidth, desc->InputHeight, desc->OutputWidth, desc->OutputHeight,

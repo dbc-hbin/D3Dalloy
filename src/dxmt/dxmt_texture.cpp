@@ -563,6 +563,15 @@ bool Texture::supportsDescriptorViewPool(TextureViewKey key) {
       (textureType() == WMTTextureType2D || textureType() == WMTTextureType2DArray);
 }
 
+bool Texture::directViewOfAllocation(TextureViewKey key) {
+  const auto descriptor = viewDescriptor(key);
+  auto allocation = current();
+  return allocation && !bytes_per_image_ && !reservedResource && !reservedVolumeLayoutAddress &&
+      !allocation->flags().test(TextureAllocationFlag::PlacementSparse) &&
+      !descriptor.castBlockSize && !descriptor.castCompressed && !descriptor.msaaShadow &&
+      !descriptor.reservedVolumeRender;
+}
+
 TextureViewKey Texture::checkViewUseArray(TextureViewKey key, bool isArray) {
   std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
   auto view = viewDescriptors_[key.index];

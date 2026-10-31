@@ -41,11 +41,18 @@ Sampler::createSampler(WMT::Device device, const WMTSamplerInfo &info, float lod
     cube_sampler_info.t_address_mode = WMTSamplerAddressModeClampToEdge;
     cube_sampler_info.r_address_mode = WMTSamplerAddressModeClampToEdge;
   }
-  ret->sampler_state_cube = create(cube_sampler_info);
-  if (!ret->sampler_state_cube) {
-    return nullptr;
+  if (cube_sampler_info.s_address_mode == info.s_address_mode &&
+      cube_sampler_info.t_address_mode == info.t_address_mode &&
+      cube_sampler_info.r_address_mode == info.r_address_mode) {
+    ret->sampler_state_cube = ret->sampler_state;
+    ret->sampler_state_cube_handle = ret->sampler_state_handle;
+  } else {
+    ret->sampler_state_cube = create(cube_sampler_info);
+    if (!ret->sampler_state_cube) {
+      return nullptr;
+    }
+    ret->sampler_state_cube_handle = cube_sampler_info.gpu_resource_id;
   }
-  ret->sampler_state_cube_handle = cube_sampler_info.gpu_resource_id;
   ret->lod_bias = lod_bias;
 
   return ret;

@@ -11,10 +11,12 @@ class MTLD3D12Device;
 class MTLD3D12Resource;
 struct OwnedTemporalFrame;
 struct OwnedFrameGenerationFrame;
+struct OwnedRayRegenerationFrame;
 
 struct TemporalEncoderData : EncoderData {
   std::shared_ptr<OwnedTemporalFrame> frame;
   std::shared_ptr<OwnedFrameGenerationFrame> fg_frame;
+  std::shared_ptr<OwnedRayRegenerationFrame> rr_frame;
 };
 
 HRESULT CreateOwnedTemporalState(MTLD3D12Device *device,

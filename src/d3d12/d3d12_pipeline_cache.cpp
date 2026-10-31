@@ -3,9 +3,9 @@
 #include "d3d12_shader_cache.hpp"
 #include "../d3d10/d3d10_blob.hpp"
 #include "DXBCParser/BlobContainer.h"
+#include "DXBCParser/PipelineCache.h"
 #include <algorithm>
 #include <cstring>
-#include <limits>
 #include <condition_variable>
 #include <mutex>
 #include <unordered_map>
@@ -36,7 +36,6 @@ struct AutomaticPipelineCacheFlight {
 
 namespace {
 
-constexpr uint64_t kMagic = 0x004f5350544d5844; // "DXMTPSO\0", little endian.
 // 2: graphics key covers the stream-output declaration. 3: it covers GS/HS/DS bytecode.
 // 4: P3 hidden-resource/signature AIR ABI changed even for unchanged shader/PSO inputs.
 // Serialized pipeline libraries validate this revision for every embedded PSO blob.
@@ -193,28 +192,9 @@ bool OwnsFlight(const AutomaticCache &cache, const std::shared_ptr<AutomaticPipe
          it != cache.flights.end() && it->second == flight;
 }
 
-struct StageRecord {
-  uint64_t library_size;
-  uint64_t constant_size;
-  uint64_t constant_alignment;
-  uint64_t relocation_count;
-};
-
-struct CacheHeader {
-  uint64_t magic;
-  uint32_t version;
-  uint32_t stages;
-  uint64_t size;
-  uint64_t adapter;
-  WMTPipelineCacheIdentity identity;
-  Sha1Digest key;
-  Sha1Digest digest;
-  std::array<StageRecord, PipelineCache::StageCount> records;
-};
-static_assert(sizeof(CacheHeader) == 216);
+static_assert(sizeof(WMTPipelineCacheIdentity) == 48);
 static_assert(sizeof(SM50_CONSTANT_RELOCATION) == 16);
-
-struct StageOffsets { size_t library, constants, relocations; };
+static_assert(uint32_t(PipelineCache::StageCount) == DXMT_PIPELINE_CACHE_STAGE_COUNT);
 
 struct NativeIdentity {
   WMTPipelineCacheIdentity value{};
@@ -226,76 +206,33 @@ const NativeIdentity &Identity() {
   return identity;
 }
 
-Sha1Digest BlobDigest(const void *data, size_t size) {
+Sha1Digest BlobDigest(const void *data, const DxmtPipelineCacheLayout &layout) {
   const auto *bytes = static_cast<const uint8_t *>(data);
-  constexpr size_t begin = offsetof(CacheHeader, digest);
-  constexpr size_t end = begin + sizeof(Sha1Digest);
   Sha1HashState hash;
-  hash.update(bytes, begin);
-  hash.update(bytes + end, size - end);
+  hash.update(bytes, layout.digest_begin);
+  hash.update(bytes + layout.digest_end, layout.size - layout.digest_end);
   return hash.final();
 }
 
-// Offsets are relative to an owned allocation, not to a possibly unaligned
-// application pointer. Every region is bounded before its bytes are examined.
-bool Layout(const CacheHeader &header, size_t limit,
-            std::array<StageOffsets, PipelineCache::StageCount> &offsets, size_t &size) {
-  size = sizeof(CacheHeader);
-  if (limit < size)
-    return false;
-  auto region = [&](uint64_t length, size_t &offset) {
-    if (length > limit - size)
-      return false;
-    offset = size;
-    size += length;
-    const size_t padding = (-size) & 7;
-    if (padding > limit - size)
-      return false;
-    size += padding;
-    return true;
-  };
-  for (uint32_t i = 0; i < PipelineCache::StageCount; ++i) {
-    const auto &record = header.records[i];
-    if (!(header.stages & (1u << i))) {
-      if (record.library_size || record.constant_size || record.constant_alignment || record.relocation_count)
-        return false;
-      continue;
-    }
-    if (record.library_size < 4 || !record.constant_alignment ||
-        (record.constant_alignment & (record.constant_alignment - 1)) ||
-        record.constant_alignment > UINT32_MAX || record.constant_size > UINT32_MAX ||
-        record.relocation_count > record.constant_size / sizeof(uint64_t) ||
-        (!record.constant_size && record.constant_alignment != 1))
-      return false;
-    if (!region(record.library_size, offsets[i].library) ||
-        !region(record.constant_size, offsets[i].constants) ||
-        !region(record.relocation_count * sizeof(SM50_CONSTANT_RELOCATION), offsets[i].relocations))
-      return false;
-  }
-  return true;
-}
-
 std::shared_ptr<const PipelineCacheStorage> ShareBlob(ID3DBlob *blob) {
-  CacheHeader header;
-  memcpy(&header, blob->GetBufferPointer(), sizeof(header));
-  std::array<StageOffsets, PipelineCache::StageCount> offsets{};
-  size_t size = 0;
-  if (!Layout(header, blob->GetBufferSize(), offsets, size))
+  DxmtPipelineCacheInfo info{};
+  if (dxmt_pipeline_cache_decode(blob->GetBufferPointer(), blob->GetBufferSize(), &info))
     return {};
   auto storage = std::make_shared<PipelineCacheStorage>();
   storage->bytes = blob;
   auto *bytes = static_cast<uint8_t *>(blob->GetBufferPointer());
   for (uint32_t i = 0; i < PipelineCache::StageCount; ++i) {
-    if (!(header.stages & (1u << i)))
+    if (!(info.description.stages & (1u << i)))
       continue;
-    const auto &record = header.records[i];
+    const auto &record = info.description.records[i];
+    const auto &offsets = info.layout.offsets[i];
     auto &view = storage->views[i];
-    view.Data = bytes + offsets[i].library;
+    view.Data = bytes + offsets.library;
     view.Size = record.library_size;
-    view.ConstantData = record.constant_size ? bytes + offsets[i].constants : nullptr;
+    view.ConstantData = record.constant_size ? bytes + offsets.constants : nullptr;
     view.ConstantDataSize = record.constant_size;
     view.ConstantDataAlignment = record.constant_alignment;
-    view.ConstantRelocations = record.relocation_count ? bytes + offsets[i].relocations : nullptr;
+    view.ConstantRelocations = record.relocation_count ? bytes + offsets.relocations : nullptr;
     view.ConstantRelocationCount = record.relocation_count;
   }
   return storage;
@@ -490,13 +427,14 @@ public:
   }
 };
 
-template <typename T> struct ArtifactCache {
+template <typename T, bool Weak = false> struct ArtifactCache {
   struct Flight {
     std::condition_variable ready;
     bool done = false;
     uint64_t last_use = 0;
     size_t bytes = 0;
     std::shared_ptr<const T> value;
+    std::weak_ptr<const T> weak_value;
   };
   std::mutex mutex;
   std::unordered_map<std::string, std::shared_ptr<Flight>> entries;
@@ -537,6 +475,12 @@ template <typename T> struct ArtifactCache {
     if (enabled) {
       if (auto it = entries.find(key); it != entries.end()) {
         flight = it->second;
+        if constexpr (Weak) {
+          if (flight->done && !(flight->value = flight->weak_value.lock())) {
+            bytes -= flight->bytes; --completed; entries.erase(it); flight.reset();
+          }
+        }
+        if (flight) {
         flight->last_use = ++clock;
         if (!flight->done) {
           try {
@@ -548,11 +492,13 @@ template <typename T> struct ArtifactCache {
         }
         flight->ready.wait(lock, [&] { return flight->done; });
         auto value = flight->value;
+        if constexpr (Weak) if (flight->done && !flight->weak_value.expired()) flight->value.reset();
         lock.unlock();
         if (value && owned_graphics::TraceEnabled())
           owned_graphics::Trace("pipeline_artifact_hit", ",\"kind\":\"", kind, "\",\"cache\":", id, ",\"key\":\"",
                                 Sha1HashState::compute(key.data(), key.size()).string(), "\"");
         return value;
+        }
       }
       flight = std::make_shared<Flight>();
       flight->last_use = ++clock;
@@ -573,7 +519,7 @@ template <typename T> struct ArtifactCache {
       }
       if (!value) value = create();
       if constexpr (std::is_same_v<T, ShaderStageArtifact>) {
-        if (value && !disk_loaded && enabled)
+        if (value && !value->failure_result && !disk_loaded && enabled)
           QueueAutomaticStageArtifact(key, value, current);
       }
     } catch (...) {
@@ -587,6 +533,13 @@ template <typename T> struct ArtifactCache {
       throw;
     }
     if (!flight) return value;
+    std::shared_ptr<Flight> completed_flight;
+    if constexpr (Weak) {
+      try {
+        completed_flight = std::make_shared<Flight>();
+        completed_flight->done = true; completed_flight->weak_value = value;
+      } catch (const std::bad_alloc &) {}
+    }
     lock.lock();
     flight->value = value;
     flight->done = true;
@@ -594,9 +547,16 @@ template <typename T> struct ArtifactCache {
     if (it != entries.end() && it->second == flight) {
       flight->bytes = key.size() + (value ? value->size() : 0);
       constexpr size_t limit = 32u * 1024u * 1024u;
-      if (!value || flight->bytes > limit) {
+      bool retain = bool(value);
+      if constexpr (Weak) retain = value && value->retained() && completed_flight;
+      if (!retain || flight->bytes > limit) {
         entries.erase(it);
       } else {
+        if constexpr (Weak) {
+          completed_flight->bytes = flight->bytes;
+          completed_flight->last_use = flight->last_use;
+          it->second = std::move(completed_flight);
+        }
         bytes += flight->bytes; ++completed;
         // ponytail: bounded 256-entry LRU scan; pending flights are never evicted.
         while (bytes > limit || completed > 256) {
@@ -629,6 +589,7 @@ struct NativeLibraryArtifact {
 };
 struct NativeFunctionArtifact {
   WMT::Reference<WMT4::Function> function;
+  WMT::Reference<WMT4::Library> library;
   size_t size() const { return 0; }
 };
 struct ShaderReflectionArtifact {
@@ -647,6 +608,7 @@ struct DeviceShaderArtifactCache::Impl {
   ArtifactCache<ShaderStageArtifact> stages;
   ArtifactCache<NativeLibraryArtifact> libraries;
   ArtifactCache<NativeFunctionArtifact> functions;
+  ArtifactCache<NativePipelineArtifact, true> pipelines;
   ArtifactCache<ShaderReflectionArtifact> reflections;
   ArtifactCache<RasterMarkerArtifact> markers;
   ArtifactCache<WorkGraphArtifact> workgraphs;
@@ -851,14 +813,14 @@ int PipelineCache::Compile(Stage stage, DeviceShaderArtifactCache &artifacts, D3
     return SM50Compile(shader, args, name, out, err);
   };
   return artifacts.Compile("ordinary", {source}, args, name, output(stage), error, stage_artifacts_[stage],
-                           std::ref(lower));
+                           std::ref(lower), &stage_keys_[stage]);
 }
 
 int DeviceShaderArtifactCache::Compile(
     const char *family, std::initializer_list<D3D12_SHADER_BYTECODE> sources,
     SM50_SHADER_COMPILATION_ARGUMENT_DATA *args, const char *name, sm50_bitcode_t *output,
     sm50_error_t *error, std::shared_ptr<const ShaderStageArtifact> &artifact,
-    const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &lower) {
+    const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &lower, Sha1Digest *stage_key) {
   int result = 0;
   StageKeyBuilder key;
   auto compile = [&] {
@@ -872,8 +834,16 @@ int DeviceShaderArtifactCache::Compile(
     for (const auto &source : sources) key.bytes(source.pShaderBytecode, source.BytecodeLength);
     key.bytes(name, strlen(name));
     if (!key.arguments(args)) return compile();
+    if (stage_key) *stage_key = Sha1HashState::compute(key.key.data(), key.key.size());
     artifact = impl_->stages.Get(key.key, "air_compile", [&]() -> std::shared_ptr<const ShaderStageArtifact> {
-      if ((result = compile())) return {};
+      if ((result = compile())) {
+        if (!error || !*error || SM50GetErrorKind(*error) != SM50_ERROR_ROOT_BINDING) return {};
+        auto value = std::make_shared<ShaderStageArtifact>();
+        if (SM50CloneError(*error, &value->failure)) return {};
+        value->failure_result = result;
+        value->failure_bytes = SM50GetErrorMessageString(value->failure).size() + 1;
+        return value;
+      }
       SM50_COMPILED_BITCODE code{};
       SM50GetCompiledBitcode(*output, &code);
       auto value = std::make_shared<ShaderStageArtifact>();
@@ -898,6 +868,15 @@ int DeviceShaderArtifactCache::Compile(
       }
       return value;
     });
+    if (artifact && artifact->failure_result) {
+      const int failed = artifact->failure_result;
+      if (result)
+        return result;
+      if (error && SM50CloneError(artifact->failure, error) == 0)
+        return failed;
+      artifact.reset();
+      return compile();
+    }
     if (artifact && artifact->metadata_sizes.size() != key.outputs.size()) {
       auto invalid = artifact;
       artifact.reset();
@@ -1000,9 +979,104 @@ WMT::Reference<WMT4::Function> DeviceShaderArtifactCache::SampleMaskFunction(
     auto function = library.newFunctionWithConstants(name, &constant, 1, error);
     if (!function) return {};
     auto artifact = std::make_shared<NativeFunctionArtifact>();
+    artifact->library = library;
     artifact->function = std::move(function); return artifact;
   });
   return value ? value->function : WMT::Reference<WMT4::Function>{};
+}
+
+WMT::Reference<WMT4::Function> DeviceShaderArtifactCache::Function(WMT4::Library library, const char *name) {
+  StageKeyBuilder key;
+  key.add(library.handle, false); key.bytes(name, strlen(name));
+  auto value = impl_->functions.Get(key.key, "new_function", [&]() -> std::shared_ptr<const NativeFunctionArtifact> {
+    impl_->functions.Operation("new_function", key.key);
+    auto artifact = std::make_shared<NativeFunctionArtifact>();
+    artifact->library = library; artifact->function = library.newFunction(name);
+    return artifact->function ? artifact : nullptr;
+  });
+  return value ? value->function : WMT::Reference<WMT4::Function>{};
+}
+
+namespace {
+template <typename Info> bool NativePipelineKey(StageKeyBuilder &key, WMT4::Compiler compiler, const Info &info) {
+  // Archive requests have observable lookup/serialization side effects.
+  if (info.num_binary_archives_for_lookup || info.binary_archive_for_serialization || info.fail_on_binary_archive_miss)
+    return false;
+  key.add(compiler.handle, Identity().value);
+  if constexpr (std::is_same_v<Info, WMTComputePipelineInfo>) {
+    key.add(uint8_t(0), info.compute_function, info.support_indirect_command_buffers,
+            info.tgsize_is_multiple_of_sgwidth, info.immutable_buffers, info.max_call_stack_depth);
+  } else {
+    key.add(uint8_t(std::is_same_v<Info, WMTRenderPipelineInfo> ? 1 : 2));
+    for (const auto &color : info.colors)
+      key.add(color.pixel_format, color.rgb_blend_operation, color.alpha_blend_operation,
+              color.src_rgb_blend_factor, color.dst_rgb_blend_factor, color.src_alpha_blend_factor,
+              color.dst_alpha_blend_factor, color.write_mask, color.blending_enabled);
+    key.add(info.alpha_to_coverage_enabled, info.logic_operation_enabled, info.logic_operation,
+            info.rasterization_enabled, info.raster_sample_count, info.depth_pixel_format, info.stencil_pixel_format,
+            info.fragment_function, info.immutable_fragment_buffers, info.support_indirect_command_buffers,
+            info.max_vertex_amplification_count);
+    if constexpr (std::is_same_v<Info, WMTRenderPipelineInfo>)
+      key.add(info.vertex_function, info.immutable_vertex_buffers, info.input_primitive_topology,
+              info.tessellation_partition_mode, info.max_tessellation_factor, info.tessellation_output_winding_order,
+              info.tessellation_factor_step, info.inherit_color_attachment_mapping);
+    else
+      key.add(info.object_function, info.mesh_function, info.immutable_object_buffers, info.immutable_mesh_buffers,
+              info.payload_memory_length, info.mesh_tgsize_is_multiple_of_sgwidth,
+              info.object_tgsize_is_multiple_of_sgwidth);
+  }
+  return true;
+}
+
+template <typename Info> std::shared_ptr<const NativePipelineArtifact> CreateNativePipeline(
+    ArtifactCache<NativePipelineArtifact, true> &cache, WMT4::Compiler compiler, const Info &info, WMT::Error &error) {
+  StageKeyBuilder key;
+  const bool share = NativePipelineKey(key, compiler, info);
+  auto create = [&]() -> std::shared_ptr<const NativePipelineArtifact> {
+    auto value = std::make_shared<NativePipelineArtifact>();
+    auto parent = [&](obj_handle_t handle) {
+      WMT4::Function function; function.handle = handle;
+      value->parents.emplace_back(function);
+    };
+    if constexpr (std::is_same_v<Info, WMTComputePipelineInfo>) {
+      parent(info.compute_function);
+    } else {
+      parent(info.fragment_function);
+      if constexpr (std::is_same_v<Info, WMTRenderPipelineInfo>)
+        parent(info.vertex_function);
+      else {
+        parent(info.object_function); parent(info.mesh_function);
+      }
+    }
+    cache.Operation(std::is_same_v<Info, WMTComputePipelineInfo> ? "native_compute" :
+        std::is_same_v<Info, WMTRenderPipelineInfo> ? "native_render" : "native_mesh", key.key);
+    // MTL4Compiler compiles concurrently; distinct keys must not serialize behind one device lock.
+    // Equal keys already single-flight in `cache.Get`, and mesh variants keep their own reentrancy lock.
+    if constexpr (std::is_same_v<Info, WMTComputePipelineInfo>)
+      value->compute = compiler.newComputePipelineState(info, value->error);
+    else value->render = compiler.newRenderPipelineState(info, value->error);
+    return value;
+  };
+  auto value = share ? cache.Get(key.key, std::is_same_v<Info, WMTComputePipelineInfo> ? "native_compute" :
+      std::is_same_v<Info, WMTRenderPipelineInfo> ? "native_render" : "native_mesh", create) : create();
+  if (error) error.release();
+  error.handle = value->error.handle;
+  if (error) error.retain();
+  return value;
+}
+}
+
+std::shared_ptr<const NativePipelineArtifact> DeviceShaderArtifactCache::NativePipeline(
+    WMT4::Compiler compiler, const WMTComputePipelineInfo &info, WMT::Error &error) {
+  return CreateNativePipeline(impl_->pipelines, compiler, info, error);
+}
+std::shared_ptr<const NativePipelineArtifact> DeviceShaderArtifactCache::NativePipeline(
+    WMT4::Compiler compiler, const WMTRenderPipelineInfo &info, WMT::Error &error) {
+  return CreateNativePipeline(impl_->pipelines, compiler, info, error);
+}
+std::shared_ptr<const NativePipelineArtifact> DeviceShaderArtifactCache::NativePipeline(
+    WMT4::Compiler compiler, const WMTMeshRenderPipelineInfo &info, WMT::Error &error) {
+  return CreateNativePipeline(impl_->pipelines, compiler, info, error);
 }
 
 HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Digest &key) {
@@ -1102,17 +1176,13 @@ bool PipelineCacheIdentity(WMTPipelineCacheIdentity &identity) {
 }
 
 HRESULT PipelineCacheBlobKey(const void *data, size_t size, Sha1Digest &key) {
-  if (!data || size < sizeof(CacheHeader))
-    return E_INVALIDARG;
-  CacheHeader header;
-  memcpy(&header, data, sizeof(header));
-  if (header.magic != kMagic)
-    return E_INVALIDARG;
-  if (header.version != kVersion)
+  DxmtPipelineCacheDigest parsed{};
+  const auto status = dxmt_pipeline_cache_key(data, size, &parsed);
+  if (status == DXMT_PIPELINE_CACHE_VERSION_MISMATCH)
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
-  if (header.size != size)
+  if (status != DXMT_PIPELINE_CACHE_SUCCESS)
     return E_INVALIDARG;
-  key = header.key;
+  memcpy(key.data, parsed.bytes, sizeof(key.data));
   return S_OK;
 }
 
@@ -1120,7 +1190,7 @@ PipelineCache::~PipelineCache() {
   Complete(E_ABORT);
 }
 
-void PipelineCache::Complete(HRESULT result) noexcept {
+void PipelineCache::Complete(HRESULT result, bool retain) noexcept {
   auto flight = std::move(flight_);
   if (!flight)
     return;
@@ -1163,7 +1233,7 @@ void PipelineCache::Complete(HRESULT result) noexcept {
     flight->blob = blob_;
   const bool current = OwnsFlight(cache, flight);
   if (current) {
-    if (SUCCEEDED(result) && blob_) {
+    if (SUCCEEDED(result) && blob_ && retain) {
       try {
         cache.Retain(flight->key, blob_);
       } catch (...) {
@@ -1171,6 +1241,13 @@ void PipelineCache::Complete(HRESULT result) noexcept {
       }
     }
     cache.flights.erase(flight->key);
+  }
+  if (SUCCEEDED(result) && blob_ && current && !retain) {
+    deferred_retain_ = true;
+    deferred_publish_ = !flight->disk_hit;
+    deferred_disk_hit_ = flight->disk_hit;
+    deferred_key_ = flight->key;
+    deferred_generation_ = flight->generation;
   }
   flight->result = result;
   flight->done = true;
@@ -1186,8 +1263,39 @@ void PipelineCache::Complete(HRESULT result) noexcept {
   } catch (...) {
     // Tracing must not escape completion/destruction.
   }
-  if (SUCCEEDED(result) && blob_ && current && !flight->disk_hit)
+  if (SUCCEEDED(result) && blob_ && current && !flight->disk_hit && retain)
     cache.Publish(flight->key, flight->generation, blob_);
+}
+
+void PipelineCache::CommitDeferred(bool linked) noexcept {
+  if (!std::exchange(deferred_retain_, false))
+    return;
+  auto &cache = Automatic();
+  if (!linked) {
+    // Never retained or published; a restored disk entry that no longer links must not be reused.
+    if (deferred_disk_hit_) {
+      try {
+        AutomaticCachePhase phase{"disk_remove"};
+        std::lock_guard disk_lock(cache.disk_mutex);
+        RemoveAutomaticPipelineCache(deferred_key_);
+      } catch (...) {
+      }
+    }
+    return;
+  }
+  {
+    auto lock = LockMetadata(cache);
+    // Controls since completion invalidate membership exactly as for synchronous creation.
+    if (!cache.enabled || cache.generation != deferred_generation_)
+      return;
+    try {
+      if (!cache.entries.count(deferred_key_))
+        cache.Retain(deferred_key_, blob_);
+    } catch (...) {
+    }
+  }
+  if (deferred_publish_)
+    cache.Publish(deferred_key_, deferred_generation_, blob_);
 }
 
 void PipelineCache::RetryAutomatic(PipelineCache &fresh) {
@@ -1362,45 +1470,29 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
 }
 
 HRESULT PipelineCache::LoadBlob(const D3D12_CACHED_PIPELINE_STATE &cached, ID3DBlob *owned) {
-  if (!cached.pCachedBlob || cached.CachedBlobSizeInBytes < sizeof(CacheHeader))
-    return E_INVALIDARG;
-  CacheHeader header;
-  memcpy(&header, cached.pCachedBlob, sizeof(header));
-  if (header.magic != kMagic)
-    return E_INVALIDARG;
-  if (header.version != kVersion)
+  DxmtPipelineCacheInfo info{};
+  const auto status = dxmt_pipeline_cache_decode(cached.pCachedBlob, cached.CachedBlobSizeInBytes, &info);
+  if (status == DXMT_PIPELINE_CACHE_VERSION_MISMATCH)
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
-  if (header.size != cached.CachedBlobSizeInBytes || header.stages != stages_ || header.key != key_)
+  if (status != DXMT_PIPELINE_CACHE_SUCCESS)
     return E_INVALIDARG;
-  std::array<StageOffsets, StageCount> offsets{};
-  size_t size = 0;
-  if (!Layout(header, cached.CachedBlobSizeInBytes, offsets, size) || size != header.size ||
-      BlobDigest(cached.pCachedBlob, size) != header.digest)
+  const auto &description = info.description;
+  if (description.stages != stages_ || memcmp(description.key.bytes, key_.data, sizeof(key_.data)))
     return E_INVALIDARG;
-  if (header.adapter != adapter_)
+  const auto digest = BlobDigest(cached.pCachedBlob, info.layout);
+  if (memcmp(digest.data, info.digest.bytes, sizeof(digest.data)))
+    return E_INVALIDARG;
+  if (description.adapter != adapter_)
     return D3D12_ERROR_ADAPTER_NOT_FOUND;
   const auto &identity = Identity();
   if (!identity.valid)
     return E_FAIL;
-  if (memcmp(&identity.value, &header.identity, sizeof(header.identity)))
+  if (memcmp(&identity.value, description.identity, sizeof(identity.value)))
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
   const auto *input = static_cast<const uint8_t *>(cached.pCachedBlob);
-  for (uint32_t i = 0; i < StageCount; ++i) {
-    if (!(stages_ & (1u << i)))
-      continue;
-    const auto &record = header.records[i];
-    if (memcmp(input + offsets[i].library, "MTLB", 4))
-      return E_INVALIDARG;
-    for (uint64_t j = 0; j < record.relocation_count; ++j) {
-      SM50_CONSTANT_RELOCATION relocation;
-      memcpy(&relocation, input + offsets[i].relocations + j * sizeof(relocation), sizeof(relocation));
-      if (relocation.Offset > record.constant_size - sizeof(uint64_t) ||
-          (relocation.TargetOffset > record.constant_size &&
-           relocation.TargetOffset != SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE &&
-           relocation.TargetOffset != SM50_CONSTANT_RELOCATION_TARGET_ATOMIC64_CONTEXT))
-        return E_INVALIDARG;
-    }
-  }
+  if (dxmt_pipeline_cache_validate_payload(input, cached.CachedBlobSizeInBytes, &info))
+    return E_INVALIDARG;
+  const size_t size = info.layout.size;
   try {
     Com<ID3DBlob> copy;
     if (!owned) {
@@ -1448,51 +1540,57 @@ HRESULT PipelineCache::GetBlob(ID3DBlob **blob) {
     const auto &identity = Identity();
     if (!identity.valid)
       return E_FAIL;
-    CacheHeader header{};
-    header.magic = kMagic;
-    header.version = kVersion;
-    header.stages = stages_;
-    header.adapter = adapter_;
-    header.identity = identity.value;
-    header.key = key_;
+    DxmtPipelineCacheDescription description{};
+    description.stages = stages_;
+    description.adapter = adapter_;
+    memcpy(description.identity, &identity.value, sizeof(identity.value));
+    memcpy(description.key.bytes, key_.data, sizeof(key_.data));
     std::array<SM50_COMPILED_BITCODE, StageCount> views{};
     for (uint32_t i = 0; i < StageCount; ++i) {
       if (!(stages_ & (1u << i)))
         continue;
       auto &compiled = views[i] = view(Stage(i));
-      header.records[i] = {compiled.Size, compiled.ConstantDataSize, compiled.ConstantDataAlignment,
-                           compiled.ConstantRelocationCount};
+      description.records[i] = {compiled.Size, compiled.ConstantDataSize, compiled.ConstantDataAlignment,
+                                compiled.ConstantRelocationCount};
     }
-    std::array<StageOffsets, StageCount> offsets{};
-    size_t size = 0;
-    if (!Layout(header, std::numeric_limits<size_t>::max(), offsets, size))
+    DxmtPipelineCacheLayout layout{};
+    if (dxmt_pipeline_cache_layout(&description, &layout))
       return E_FAIL;
-    header.size = size;
-    const HRESULT hr = CreateBlobFromMalloc(size, blob);
+    const HRESULT hr = CreateBlobFromMalloc(layout.size, blob);
     if (FAILED(hr))
       return hr;
     auto *bytes = static_cast<uint8_t *>((*blob)->GetBufferPointer());
-    memset(bytes, 0, size);
-    memcpy(bytes, &header, sizeof(header));
+    if (dxmt_pipeline_cache_begin(&description, bytes, layout.size)) {
+      (*blob)->Release();
+      *blob = nullptr;
+      return E_FAIL;
+    }
     for (uint32_t i = 0; i < StageCount; ++i) {
       if (!(stages_ & (1u << i)))
         continue;
       const auto &compiled = views[i];
+      const auto &offsets = layout.offsets[i];
       const sm50_bitcode_t source = bitcode(Stage(i));
       if (!SM50ReadCompiledBitcode(source, SM50_COMPILED_BITCODE_PART_LIBRARY, compiled.Data,
-                                   bytes + offsets[i].library, compiled.Size) ||
+                                   bytes + offsets.library, compiled.Size) ||
           !SM50ReadCompiledBitcode(source, SM50_COMPILED_BITCODE_PART_CONSTANTS, compiled.ConstantData,
-                                   bytes + offsets[i].constants, compiled.ConstantDataSize) ||
+                                   bytes + offsets.constants, compiled.ConstantDataSize) ||
           !SM50ReadCompiledBitcode(source, SM50_COMPILED_BITCODE_PART_RELOCATIONS, compiled.ConstantRelocations,
-                                   bytes + offsets[i].relocations,
+                                   bytes + offsets.relocations,
                                    compiled.ConstantRelocationCount * sizeof(SM50_CONSTANT_RELOCATION))) {
         (*blob)->Release();
         *blob = nullptr;
         return E_FAIL;
       }
     }
-    const auto digest = BlobDigest(bytes, size);
-    memcpy(bytes + offsetof(CacheHeader, digest), &digest, sizeof(digest));
+    const auto digest = BlobDigest(bytes, layout);
+    DxmtPipelineCacheDigest encoded{};
+    memcpy(encoded.bytes, digest.data, sizeof(digest.data));
+    if (dxmt_pipeline_cache_set_digest(bytes, layout.size, &encoded)) {
+      (*blob)->Release();
+      *blob = nullptr;
+      return E_FAIL;
+    }
     return S_OK;
   } catch (const std::bad_alloc &) {
     return E_OUTOFMEMORY;

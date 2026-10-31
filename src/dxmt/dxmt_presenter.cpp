@@ -48,7 +48,8 @@ Presenter::changeLayerProperties(
   alpha_ = alpha;
   layer_props_.opaque = alpha == DXMTPresentAlpha::Opaque;
   should_invalidated |= source_format_ != format;
-  should_invalidated |= layer_props_.drawable_width != width || layer_props_.drawable_height != height;
+  // Drawable size is not a pipeline input; it is applied to the layer directly.
+  const bool resized = layer_props_.drawable_width != width || layer_props_.drawable_height != height;
   source_format_ = format;
   should_invalidated |= sample_count_ != sample_count;
   sample_count_ = sample_count;
@@ -57,9 +58,11 @@ Presenter::changeLayerProperties(
   colorspace_ = colorspace;
   if (should_invalidated)
     pso_valid.clear(); // defer changes
+  else if (resized)
+    layer_resized_.store(true, std::memory_order_release); // drain, but keep pipelines
   else
     layer_.setProps(layer_props_);
-  return should_invalidated;
+  return should_invalidated || resized;
 }
 
 void
@@ -124,12 +127,18 @@ Presenter::changeHDRMetadata(const WMTHDRMetadata *metadata) {
 
 void
 Presenter::changeGammaRamp(const DXMTGammaRamp *gamma_ramp) {
+  std::lock_guard lock(gamma_mutex_);
   if (!gamma_ramp && gamma_version_ != 0) {
     gamma_version_ = 0;
+    gamma_lut_dirty_ = false;
     pso_valid.clear();
     return;
   }
   if (gamma_ramp && gamma_version_ != gamma_ramp->version) {
+    // Only enabling gamma changes the pipeline. A new ramp is uploaded at the
+    // next synchronization, after earlier presents stopped reading the LUT.
+    if (gamma_version_ == 0)
+      pso_valid.clear();
     gamma_version_ = gamma_ramp->version;
     for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
       gamma_lut_rgba_[i * 4 + 0] = std::clamp(gamma_ramp->red[i], 0.f, 1.f);
@@ -137,12 +146,7 @@ Presenter::changeGammaRamp(const DXMTGammaRamp *gamma_ramp) {
       gamma_lut_rgba_[i * 4 + 2] = std::clamp(gamma_ramp->blue[i], 0.f, 1.f);
       gamma_lut_rgba_[i * 4 + 3] = 1.0f;
     }
-    gamma_lut_texture_.replaceRegion(
-          {0, 0, 0}, {DXMT_GAMMA_CP_COUNT, 1, 1}, 0, 0,
-          gamma_lut_rgba_.data(),
-          DXMT_GAMMA_CP_COUNT * sizeof(float) * 4,
-          0);
-    pso_valid.clear();
+    gamma_lut_dirty_ = true;
   }
 }
 
@@ -166,7 +170,10 @@ Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_
   WMTQueryDisplaySettingForLayer(
       layer_.handle, &display_setting_version, &display_colorspace, &display_hdr_metadata, &display_edr_value
   );
-  if (do_not_wait && (display_setting_version != display_setting_version_ || !pso_valid.test()) &&
+  std::unique_lock gamma_lock(gamma_mutex_);
+  const bool layer_resized = layer_resized_.load(std::memory_order_acquire);
+  if (do_not_wait &&
+      (display_setting_version != display_setting_version_ || !pso_valid.test() || gamma_lut_dirty_ || layer_resized) &&
       frames_completed_.load(std::memory_order_acquire) < frame_requested_)
     return std::nullopt;
   display_colorspace_ = display_colorspace;
@@ -188,17 +195,44 @@ Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_
   auto hdr_metadata = !composition_residual && display_setting_version_ > 0 ? &display_hdr_metadata_
                       : has_hdr_metadata_          ? &hdr_metadata_
                                                    : nullptr;
-  if (unlikely(!pso_valid.test_and_set())) {
+  const bool pso_invalid = !pso_valid.test_and_set();
+  // Earlier presents must stop sampling the LUT and use the old drawable size
+  // before either changes. Only a pipeline-key change rebuilds pipelines.
+  if (unlikely(pso_invalid || gamma_lut_dirty_ || layer_resized)) {
     if (!do_not_wait) {
       if (wait_for_gpu_completion)
         waitPresentsCompleted();
       else
         waitPresentsEncoded();
     }
+    if (gamma_lut_dirty_) {
+      gamma_lut_texture_.replaceRegion(
+            {0, 0, 0}, {DXMT_GAMMA_CP_COUNT, 1, 1}, 0, 0,
+            gamma_lut_rgba_.data(),
+            DXMT_GAMMA_CP_COUNT * sizeof(float) * 4,
+            0);
+      gamma_lut_dirty_ = false;
+    }
+  }
+  const bool gamma_enable = gamma_version_ != 0;
+  gamma_lock.unlock();
+  if (unlikely(layer_resized && !pso_invalid)) {
+    layer_resized_.store(false, std::memory_order_relaxed);
+    layer_.setProps(layer_props_);
+  }
+  if (unlikely(pso_invalid)) {
+    layer_resized_.store(false, std::memory_order_relaxed);
     // Transparent remote exports retain signed/extended energy in both planes.
     layer_props_.pixel_format = linear_composition_transport ? WMTPixelFormatRGBA16Float : Forget_sRGB(source_format_);
-    buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr,
-                             sample_count_ > 1, gamma_version_ != 0, composition_residual, linear_composition_transport);
+    const PipelineKey key{layer_props_.pixel_format, Is_sRGBVariant(source_format_),
+                          final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr,
+                          sample_count_ > 1, gamma_enable, composition_residual, linear_composition_transport};
+    // Invalidation means a layer transition, not necessarily a new pipeline.
+    if (!present_blit_ || !present_scale_ || !(key == pipeline_key_)) {
+      buildRenderPipelineState(key.is_pq, key.with_hdr_metadata, key.is_ms, key.gamma_enable,
+                               key.composition_residual, key.linear_composition_transport);
+      pipeline_key_ = key;
+    }
     layer_.setProps(layer_props_);
     layer_.setColorSpace(linear_composition_transport
         ? (is_hdr ? WMTColorSpaceHDR_scRGB : WMTColorSpaceSRGBLinear) : final_colorspace);

@@ -29,14 +29,16 @@ private:
   };
 
   mutable std::mutex mutex_;
-  uint64_t completed_value_ = 0;
+  // Written only under mutex_; also read lock-free by completedValue(). The
+  // release store publishes every write the completing thread made first.
+  std::atomic<uint64_t> completed_value_ = 0;
   bool removed_ = false;
   std::list<CompletionWaiter> completion_waiters_;
   uint64_t next_waiter_id_ = 1;
   const uint64_t generation_;
 
   void completeValueLocked(uint64_t value, std::list<CompletionWaiter> &ready) {
-    completed_value_ = value;
+    completed_value_.store(value, std::memory_order_release);
     for (auto it = completion_waiters_.begin(); it != completion_waiters_.end();) {
       if (value >= it->value) {
         auto completed = it++;
@@ -101,8 +103,7 @@ public:
   }
 
   uint64_t completedValue() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return completed_value_;
+    return completed_value_.load(std::memory_order_acquire);
   }
 
   bool addCompletionWaiter(uint64_t value, std::function<void()> callback, uint64_t *registration = nullptr) {
@@ -117,7 +118,7 @@ public:
       std::lock_guard<std::mutex> lock(mutex_);
       // Registration and its initial observation are atomic with completion and
       // rewind, so a qualifying crossing cannot disappear between two calls.
-      if (completed_value_ >= value) {
+      if (completed_value_.load(std::memory_order_relaxed) >= value) {
         if (registration)
           *registration = 0;
       } else {

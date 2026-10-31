@@ -24,6 +24,36 @@ MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format) {
 
 @class DXMTM4CommandBuffer;
 static char m4_view_pool_key;
+static char m4_device_residency_key;
+/* One residency set per MTLDevice shared by every recording (D3DMetal 4.0b3
+ * DoExecute commits a single device set under one lock). Each allocation is
+ * counted once per live recording that uses it and leaves the set only when
+ * the last such recording retires or is dropped unsubmitted. The lock also
+ * spans native queue commit, whose preCommit traverses the committed set. */
+@interface DXMTM4DeviceResidency : NSObject {
+@public
+  NSRecursiveLock *lock;
+  id<MTLResidencySet> set;
+  NSCountedSet *uses;
+  BOOL dirty;
+}
+@end
+@implementation DXMTM4DeviceResidency
+- (void)dealloc { [lock release]; [set release]; [uses release]; [super dealloc]; }
+@end
+static DXMTM4DeviceResidency *m4_device_residency(id<MTLDevice> device) {
+  @synchronized(device) {
+    DXMTM4DeviceResidency *shared=objc_getAssociatedObject(device,&m4_device_residency_key);
+    if (shared) return shared;
+    MTLResidencySetDescriptor *descriptor=[MTLResidencySetDescriptor new]; descriptor.initialCapacity=256;
+    id<MTLResidencySet> set=[device newResidencySetWithDescriptor:descriptor error:nil]; [descriptor release];
+    if (!set) return nil;
+    shared=[DXMTM4DeviceResidency new]; shared->lock=[NSRecursiveLock new]; shared->set=set; shared->uses=[NSCountedSet new];
+    objc_setAssociatedObject(device,&m4_device_residency_key,shared,OBJC_ASSOCIATION_RETAIN);
+    [shared release];
+    return shared;
+  }
+}
 @interface DXMTM4ViewPool : NSObject {
 @public
   id<MTLTextureViewPool> pool;
@@ -100,16 +130,21 @@ typedef struct {
   void (*texture)(id, SEL, MTLResourceID, NSUInteger);
   struct { uint64_t value, offset; id object; BOOL resource; } buffers[31];
   uint64_t textures[128];
+  // Slots written since the last reset; every other entry is zero.
+  uint32_t bufferMask;
+  uint64_t textureMask[2];
 } M4TableState;
 typedef struct {
   uint64_t tableNew, tableSet, tableBind, residencyNew, residencyAdd, residencyRemove, residencyCommit;
+  uint64_t blitHazardBarrier, blitCapacityBarrier;
 } M4BindingCounters;
 @interface DXMTM4Recording : NSObject {
 @public
-  id<MTLResidencySet> residency;
+  DXMTM4DeviceResidency *residency;
   NSMutableSet *objects;
   NSMutableSet *allocations;
-  BOOL residencyDirty, trace;
+  NSMutableArray *pending, *published;
+  BOOL released, trace;
   M4BindingCounters counters;
   NSMutableArray *encoders;
   NSMutableArray<id<MTL4CommandBuffer>> *segments;
@@ -117,24 +152,26 @@ typedef struct {
   NSError *error;
 }
 @end
+static void m4_release_residency(DXMTM4Recording *recording);
 @implementation DXMTM4Recording
 - (void)dealloc {
-  [residency release]; [objects release]; [allocations release]; [encoders release]; [segments release];
+  // A recording dropped without submission still holds published uses.
+  m4_release_residency(self);
+  [residency release]; [objects release]; [allocations release]; [pending release]; [published release]; [encoders release]; [segments release];
   [presentTickets release]; [error release]; [super dealloc];
 }
 @end
 
 @interface DXMTM4PresentTicket : NSObject {
 @public
-  id drawable, restart_token, surface;
+  id drawable, surface;
   struct WMTCompositionFrame frame;
-  uint64_t epoch;
   double duration;
   uint32_t sync_interval;
-  BOOL allow_tearing, completed;
+  BOOL allow_tearing;
 }
 - (id)initWithCall:(struct WMTMetal4Call *)call;
-- (void)complete:(BOOL)success;
+- (void)present;
 @end
 
 @implementation DXMTM4PresentTicket
@@ -142,28 +179,24 @@ typedef struct {
   self = [super init];
   if (!self) return nil;
   drawable = [(id)(uintptr_t)call->args[1] retain];
-  restart_token = [(id)(uintptr_t)call->args[6] retain];
-  if (!drawable || !restart_token) { [self release]; return nil; }
+  if (!drawable) { [self release]; return nil; }
   memcpy(&duration, &call->args[2], sizeof(duration));
   if (call->args[3]) {
     frame = *(const struct WMTCompositionFrame *)(uintptr_t)call->args[3];
     surface = [(id)(uintptr_t)frame.surface retain];
   }
-  epoch = call->args[7];
   sync_interval = (uint32_t)call->args[4];
   allow_tearing = call->args[5] != 0;
   return self;
 }
-- (void)complete:(BOOL)success {
-  @synchronized(self) {
-    if (completed) return;
-    completed = YES;
-    if (!success || [restart_token signaledValue] != epoch) return;
-    winemetal_composition_present(drawable, duration, surface ? &frame : NULL, sync_interval, allow_tearing);
-  }
+/* Called right after commit and signalDrawable, as D3DMetal 4.0b3 DoPresent
+ * does: Core Animation waits for the signaled GPU work, so no CPU completion
+ * wait sits between the GPU finishing the frame and its presentation. */
+- (void)present {
+  winemetal_composition_present(drawable, duration, surface ? &frame : NULL, sync_interval, allow_tearing);
 }
 - (void)dealloc {
-  [drawable release]; [restart_token release]; [surface release]; [super dealloc];
+  [drawable release]; [surface release]; [super dealloc];
 }
 @end
 
@@ -173,7 +206,7 @@ typedef struct {
   id<MTL4CommandBuffer> command;
   id<MTL4CommandAllocator> allocator;
   DXMTM4Recording *recording;
-  id<MTLResidencySet> residency;
+  DXMTM4DeviceResidency *residency;
   M4TableState tables[5]; // Render stages 0-3; compute has a separate table.
   NSMutableArray<id<MTLBuffer>> *uploads;
   NSMutableArray<NSString *> *debugGroups;
@@ -207,12 +240,20 @@ typedef struct {
   [encoder release]; [super dealloc];
 }
 @end
+/* One blit footprint: a byte range of a buffer (or buffer-backed texture), or
+ * a level/slice/region box of a root texture. */
+typedef struct {
+  uint64_t resource, begin, end;
+  uint32_t level_begin, level_end, slice_begin, slice_end;
+  uint64_t x0, x1, y0, y1, z0, z1;
+  BOOL write, texture;
+} M4BlitAccess;
 @interface DXMTM4ComputeEncoder : DXMTM4Encoder {
 @public
   MTLSize threadgroupSize;
   BOOL concurrent;
   MTLStages pendingStages;
-  struct { uint64_t resource, begin, end; BOOL write; } blitAccesses[32];
+  M4BlitAccess blitAccesses[32];
   unsigned blitAccessCount;
 }
 @end
@@ -282,16 +323,57 @@ static void m4_allocation(DXMTM4Recording *recording, id<MTLAllocation> allocati
   }
   [recording->objects addObject:allocation];
   if (![recording->allocations containsObject:allocation]) {
-    [recording->allocations addObject:allocation]; [recording->residency addAllocation:allocation];
-    recording->residencyDirty=YES;
-    if (recording->trace) ++recording->counters.residencyAdd;
+    [recording->allocations addObject:allocation]; [recording->pending addObject:allocation];
   }
 }
+/* Publish this recording's new uses before its command buffer ends. Only an
+ * allocation no live recording holds changes the set, so steady-state frames
+ * commit nothing. */
 static void m4_commit_residency(DXMTM4Recording *recording) {
-  if (recording->residencyDirty) {
-    [recording->residency commit]; recording->residencyDirty=NO;
+  if (!recording->pending.count) return;
+  DXMTM4DeviceResidency *shared=recording->residency;
+  BOOL dirty=NO;
+  [shared->lock lock];
+  for (id allocation in recording->pending) {
+    if (![shared->uses countForObject:allocation]) {
+      [shared->set addAllocation:allocation]; dirty=YES;
+      if (recording->trace) ++recording->counters.residencyAdd;
+    }
+    [shared->uses addObject:allocation];
+  }
+  if (dirty) {
+    [shared->set commit];
     if (recording->trace) ++recording->counters.residencyCommit;
   }
+  [shared->lock unlock];
+  [recording->published addObjectsFromArray:recording->pending];
+  [recording->pending removeAllObjects];
+}
+/* Drop this recording's uses after native commit return and GPU retirement, or
+ * when the recording dies unsubmitted. Removal is never visible to work that
+ * still uses the allocation: another live user keeps its count above zero. */
+static void m4_release_residency(DXMTM4Recording *recording) {
+  if (recording->released || !recording->residency) return;
+  recording->released=YES;
+  if (!recording->published.count) return;
+  DXMTM4DeviceResidency *shared=recording->residency;
+  BOOL dirty=NO;
+  [shared->lock lock];
+  for (id allocation in recording->published) {
+    [shared->uses removeObject:allocation];
+    if (![shared->uses countForObject:allocation]) {
+      [shared->set removeAllocation:allocation]; dirty=YES;
+      if (recording->trace) ++recording->counters.residencyRemove;
+    }
+  }
+  if (dirty) {
+    [shared->set commit];
+    if (recording->trace) ++recording->counters.residencyCommit;
+  }
+  if (recording->trace)
+    fprintf(stderr,"OWNED_GRAPHICS_NATIVE_RESIDENCY live_allocations=%lu\n",(unsigned long)shared->uses.count);
+  [shared->lock unlock];
+  [recording->published removeAllObjects];
 }
 
 id<MTL4CommandBuffer> winemetal_metal4_command_buffer(obj_handle_t handle) { return handle ? m4cb(handle)->command : nil; }
@@ -314,7 +396,7 @@ void *winemetal_metal4_split_command_buffer(void *opaque) {
   // All segments share the existing recording, allocator and retirement owner.
   if (!context->recording->segments) context->recording->segments = [NSMutableArray new];
   m4_commit_residency(context->recording);
-  [context->command useResidencySet:context->recording->residency];
+  [context->command useResidencySet:context->recording->residency->set];
   for (NSUInteger i=0;i<context->debugGroups.count;++i) [context->command popDebugGroup];
   [context->command endCommandBuffer];
   [context->recording->segments addObject:context->command];
@@ -352,19 +434,24 @@ static id<MTL4ArgumentTable> m4_table(DXMTM4Encoder *context, unsigned stage) {
   if (!context->tableReady[stage]) {
     // New encoders formerly received nil-initialized tables. Restore that contract
     // before publishing any new binding; prior draws/dispatches own native snapshots.
-    for (unsigned i=0;i<31;++i) {
+    for (uint32_t mask=state->bufferMask;mask;mask&=mask-1) {
+      const unsigned i=__builtin_ctz(mask);
       if (state->buffers[i].value) {
         state->address(state->table,@selector(setAddress:atIndex:),0,i);
         if (context->recording->trace) ++context->recording->counters.tableSet;
       }
+      state->buffers[i]=(typeof(state->buffers[0])){0};
     }
-    for (unsigned i=0;i<128;++i) {
-      if (state->textures[i]) {
-        state->texture(state->table,@selector(setTexture:atIndex:),(MTLResourceID){0},i);
-        if (context->recording->trace) ++context->recording->counters.tableSet;
+    for (unsigned word=0;word<2;++word)
+      for (uint64_t mask=state->textureMask[word];mask;mask&=mask-1) {
+        const unsigned i=word*64+__builtin_ctzll(mask);
+        if (state->textures[i]) {
+          state->texture(state->table,@selector(setTexture:atIndex:),(MTLResourceID){0},i);
+          if (context->recording->trace) ++context->recording->counters.tableSet;
+        }
+        state->textures[i]=0;
       }
-    }
-    memset(state->buffers,0,sizeof(state->buffers)); memset(state->textures,0,sizeof(state->textures));
+    state->bufferMask=0; state->textureMask[0]=state->textureMask[1]=0;
     context->tableReady[stage]=YES; m4_retain(context->recording,state->table);
   }
   return state->table;
@@ -390,10 +477,12 @@ static void m4_bind_resource(DXMTM4Encoder *context, unsigned stage, MTLResource
   if (texture) {
     if (state->textures[index]==resource._impl) return;
     state->texture(table,@selector(setTexture:atIndex:),resource,index); state->textures[index]=resource._impl;
+    state->textureMask[index/64]|=1ull<<(index%64);
   } else {
     if (state->buffers[index].resource && state->buffers[index].value==resource._impl) return;
     state->resource(table,@selector(setResource:atBufferIndex:),resource,index);
     state->buffers[index]=(typeof(state->buffers[0])){.value=resource._impl,.resource=YES};
+    state->bufferMask|=1u<<index;
     context->buffers[stage][index]=nil;
   }
   if (context->recording->trace) ++context->recording->counters.tableSet;
@@ -423,40 +512,160 @@ static void m4_stage_barrier(DXMTM4ComputeEncoder *context, MTLStages stage) {
   context->pendingStages |= stage;
   for (unsigned i=0;i<3;++i) context->orderedFor[i] &= ~stage;
 }
-static uint64_t m4_texture_key(id<MTLTexture> texture) {
-  while (texture.parentTexture) texture=texture.parentTexture;
-  return texture.buffer ? (uint64_t)texture.buffer : (uint64_t)texture;
+static uint64_t m4_add_clamped(uint64_t a, uint64_t b) { return b>UINT64_MAX-a ? UINT64_MAX : a+b; }
+static uint64_t m4_mul_clamped(uint64_t a, uint64_t b) { return a && b>UINT64_MAX/a ? UINT64_MAX : a*b; }
+static M4BlitAccess m4_buffer_footprint(uint64_t buffer, uint64_t offset, uint64_t length, BOOL write) {
+  return (M4BlitAccess){.resource=buffer,.begin=offset,.end=m4_add_clamped(offset,length),.write=write};
 }
-static void m4_blit_access(DXMTM4ComputeEncoder *context, uint64_t source, uint64_t sourceOffset, uint64_t sourceLength,
-                          uint64_t destination, uint64_t destinationOffset, uint64_t destinationLength) {
-  m4_stage_barrier(context,MTLStageBlit);
-  typeof(context->blitAccesses[0]) accesses[2]={
-    {source,sourceOffset,sourceLength>UINT64_MAX-sourceOffset ? UINT64_MAX : sourceOffset+sourceLength,NO},
-    {destination,destinationOffset,destinationLength>UINT64_MAX-destinationOffset ? UINT64_MAX : destinationOffset+destinationLength,YES}
-  };
-  BOOL conflict=context->blitAccessCount>30;
-  for (unsigned j=0;j<2 && !conflict;++j)
-    for (unsigned i=0;i<context->blitAccessCount && !conflict;++i)
-      conflict=accesses[j].resource && accesses[j].resource==context->blitAccesses[i].resource &&
-        (accesses[j].write || context->blitAccesses[i].write) && accesses[j].begin<context->blitAccesses[i].end && context->blitAccesses[i].begin<accesses[j].end;
-  if (conflict) {
+/* Upper bound of the bytes a buffer<->texture copy touches: every image but
+ * the last spans bytesPerImage, and an image spans at most bytesPerRow per
+ * pixel row (block rows are never more than pixel rows). Unknown pitches
+ * cover the rest of the buffer. */
+static M4BlitAccess m4_linear_footprint(uint64_t buffer, uint64_t offset, uint64_t bytesPerRow, uint64_t bytesPerImage,
+                                        struct WMTSize size, BOOL write) {
+  uint64_t image=bytesPerRow ? m4_mul_clamped(bytesPerRow,size.height) : UINT64_MAX;
+  uint64_t length=size.depth>1 ? m4_add_clamped(m4_mul_clamped(bytesPerImage ? bytesPerImage : UINT64_MAX,size.depth-1),image) : image;
+  if (!size.width || !size.height || !size.depth) length=0;
+  return m4_buffer_footprint(buffer,offset,length,write);
+}
+/* A texture view's level/slice/region in its root texture. Buffer-backed
+ * textures and views whose format may change texel units fall back to the
+ * whole buffer or the whole level/slice. */
+static M4BlitAccess m4_texture_footprint(id<MTLTexture> texture, uint32_t level, uint32_t levels, uint32_t slice,
+                                         uint32_t slices, struct WMTOrigin origin, struct WMTSize size, BOOL write) {
+  BOOL region=YES;
+  id<MTLTexture> root=texture;
+  while (root.parentTexture) {
+    if (root.pixelFormat!=root.parentTexture.pixelFormat) region=NO;
+    level=level+(uint32_t)root.parentRelativeLevel;
+    slice=slice+(uint32_t)root.parentRelativeSlice;
+    root=root.parentTexture;
+  }
+  if (root.buffer) return m4_buffer_footprint((uint64_t)root.buffer,0,UINT64_MAX,write);
+  M4BlitAccess access={.resource=(uint64_t)root,.level_begin=level,.level_end=levels==UINT32_MAX ? UINT32_MAX : level+levels,
+    .slice_begin=slice,.slice_end=slices==UINT32_MAX ? UINT32_MAX : slice+slices,
+    .x1=UINT64_MAX,.y1=UINT64_MAX,.z1=UINT64_MAX,.write=write,.texture=YES};
+  if (region && levels==1) {
+    access.x0=origin.x; access.x1=m4_add_clamped(origin.x,size.width);
+    access.y0=origin.y; access.y1=m4_add_clamped(origin.y,size.height);
+    access.z0=origin.z; access.z1=m4_add_clamped(origin.z,size.depth);
+  }
+  if (!size.width || !size.height || !size.depth) access.slice_end=access.slice_begin;
+  return access;
+}
+static M4BlitAccess m4_whole_texture(id<MTLTexture> texture, BOOL write) {
+  return m4_texture_footprint(texture,0,UINT32_MAX,0,UINT32_MAX,(struct WMTOrigin){0,0,0},
+                              (struct WMTSize){UINT64_MAX,UINT64_MAX,UINT64_MAX},write);
+}
+static BOOL m4_blit_empty(const M4BlitAccess *a) {
+  return !a->resource || (a->texture ? a->level_begin>=a->level_end || a->slice_begin>=a->slice_end ||
+      a->x0>=a->x1 || a->y0>=a->y1 || a->z0>=a->z1 : a->begin>=a->end);
+}
+static BOOL m4_blit_overlaps(const M4BlitAccess *a, const M4BlitAccess *b) {
+  if (a->resource!=b->resource) return NO;
+  if (a->texture!=b->texture) return YES;
+  if (!a->texture) return a->begin<b->end && b->begin<a->end;
+  return a->level_begin<b->level_end && b->level_begin<a->level_end && a->slice_begin<b->slice_end &&
+      b->slice_begin<a->slice_end && a->x0<b->x1 && b->x0<a->x1 && a->y0<b->y1 && b->y0<a->y1 && a->z0<b->z1 && b->z0<a->z1;
+}
+static BOOL m4_blit_covers(const M4BlitAccess *a, const M4BlitAccess *b) {
+  if (a->resource!=b->resource || a->texture!=b->texture || (b->write && !a->write)) return NO;
+  if (!a->texture) return a->begin<=b->begin && b->end<=a->end;
+  return a->level_begin<=b->level_begin && b->level_end<=a->level_end && a->slice_begin<=b->slice_begin &&
+      b->slice_end<=a->slice_end && a->x0<=b->x0 && b->x1<=a->x1 && a->y0<=b->y0 && b->y1<=a->y1 &&
+      a->z0<=b->z0 && b->z1<=a->z1;
+}
+/* The bounding footprint of two same-kind accesses of one resource. A larger
+ * footprint only adds conflicts, so replacing both by it stays ordered. */
+static M4BlitAccess m4_blit_bound(const M4BlitAccess *a, const M4BlitAccess *b) {
+  M4BlitAccess u=*a;
+  u.write=a->write || b->write;
+  #define M4_LO(f) if (b->f<u.f) u.f=b->f
+  #define M4_HI(f) if (b->f>u.f) u.f=b->f
+  M4_LO(begin); M4_HI(end); M4_LO(level_begin); M4_HI(level_end); M4_LO(slice_begin); M4_HI(slice_end);
+  M4_LO(x0); M4_HI(x1); M4_LO(y0); M4_HI(y1); M4_LO(z0); M4_HI(z1);
+  #undef M4_LO
+  #undef M4_HI
+  return u;
+}
+static BOOL m4_blit_adjacent(const M4BlitAccess *a, const M4BlitAccess *b) {
+  if (a->resource!=b->resource || a->texture!=b->texture || a->write!=b->write) return NO;
+  if (!a->texture) return a->begin<=b->end && b->begin<=a->end;
+  /* Consecutive slices of one level and region. */
+  return a->level_begin==b->level_begin && a->level_end==b->level_end && a->x0==b->x0 && a->x1==b->x1 &&
+      a->y0==b->y0 && a->y1==b->y1 && a->z0==b->z0 && a->z1==b->z1 &&
+      a->slice_begin<=b->slice_end && b->slice_begin<=a->slice_end;
+}
+/* Absorbs an access into an entry that covers it, or widens a covered or
+ * adjacent entry. Returns NO when it needs its own slot. */
+static BOOL m4_blit_absorb(DXMTM4ComputeEncoder *context, const M4BlitAccess *access) {
+  for (unsigned i=0;i<context->blitAccessCount;++i) {
+    M4BlitAccess *prior=&context->blitAccesses[i];
+    if (m4_blit_covers(prior,access)) return YES;
+    if (m4_blit_covers(access,prior) || m4_blit_adjacent(prior,access)) {
+      *prior=m4_blit_bound(prior,access);
+      /* The widened entry may now cover later ones. */
+      for (unsigned j=i+1;j<context->blitAccessCount;)
+        if (m4_blit_covers(prior,&context->blitAccesses[j]))
+          context->blitAccesses[j]=context->blitAccesses[--context->blitAccessCount];
+        else ++j;
+      return YES;
+    }
+  }
+  return NO;
+}
+/* Frees two slots before a copy records its footprints. Two same-kind
+ * entries of one resource merge into their bound first; only when nothing
+ * merges does one barrier order every earlier copy before this one. */
+static void m4_blit_reserve(DXMTM4ComputeEncoder *context) {
+  const unsigned capacity=sizeof(context->blitAccesses)/sizeof(context->blitAccesses[0]);
+  for (unsigned i=0;i<context->blitAccessCount && context->blitAccessCount>capacity-2;++i)
+    for (unsigned j=i+1;j<context->blitAccessCount && context->blitAccessCount>capacity-2;) {
+      M4BlitAccess *a=&context->blitAccesses[i], *b=&context->blitAccesses[j];
+      if (a->resource!=b->resource || a->texture!=b->texture || a->write!=b->write) { ++j; continue; }
+      *a=m4_blit_bound(a,b);
+      *b=context->blitAccesses[--context->blitAccessCount];
+    }
+  if (context->blitAccessCount>capacity-2) {
     [context->encoder barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+    if (context->recording->trace) ++context->recording->counters.blitCapacityBarrier;
     context->blitAccessCount=0;
   }
+}
+static void m4_blit_access(DXMTM4ComputeEncoder *context, M4BlitAccess source, M4BlitAccess destination) {
+  m4_stage_barrier(context,MTLStageBlit);
+  const M4BlitAccess accesses[2]={source,destination};
+  BOOL conflict=NO;
+  for (unsigned j=0;j<2 && !conflict;++j)
+    for (unsigned i=0;i<context->blitAccessCount && !conflict;++i)
+      conflict=!m4_blit_empty(&accesses[j]) && (accesses[j].write || context->blitAccesses[i].write) &&
+        m4_blit_overlaps(&accesses[j],&context->blitAccesses[i]);
+  if (conflict) {
+    [context->encoder barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice];
+    if (context->recording->trace) ++context->recording->counters.blitHazardBarrier;
+    context->blitAccessCount=0;
+  }
+  m4_blit_reserve(context);
   for (unsigned j=0;j<2;++j)
-    if (accesses[j].resource && accesses[j].begin<accesses[j].end) context->blitAccesses[context->blitAccessCount++]=accesses[j];
+    if (!m4_blit_empty(&accesses[j]) && !m4_blit_absorb(context,&accesses[j]))
+      context->blitAccesses[context->blitAccessCount++]=accesses[j];
 }
 static void m4_bind_buffer(DXMTM4Encoder *context, unsigned stage, id<MTLBuffer> buffer, uint64_t offset, unsigned index) {
   if (index>=31 || (buffer && offset>buffer.length)) { m4_error(context->recording,@"Metal4 buffer binding is out of range"); return; }
   context->buffers[stage][index]=buffer;
+  M4TableState *state=&context->owner->tables[context->compute ? 4 : stage];
+  /* A ready table was reset when this encoder (and so this recording) first used it, so a matching
+   * entry was bound, and its allocation leased, by this recording. */
+  if (buffer && context->tableReady[stage] && state->buffers[index].object==buffer &&
+      !state->buffers[index].resource && state->buffers[index].offset==offset) return;
   m4_allocation(context->recording,buffer);
   id<MTL4ArgumentTable> table=m4_table(context,stage); if (!table) return;
-  M4TableState *state=&context->owner->tables[context->compute ? 4 : stage];
   uint64_t address=buffer ? buffer.gpuAddress+offset : 0;
   if (!state->buffers[index].resource && state->buffers[index].value==address &&
       state->buffers[index].object==buffer && state->buffers[index].offset==offset) return;
   state->address(table,@selector(setAddress:atIndex:),address,index);
   state->buffers[index]=(typeof(state->buffers[0])){.value=address,.offset=offset,.object=buffer};
+  state->bufferMask|=1u<<index;
   if (context->recording->trace) ++context->recording->counters.tableSet;
 }
 static void m4_render_buffer(DXMTM4RenderEncoder *context, unsigned stage, id<MTLBuffer> buffer, uint64_t offset, unsigned index) {
@@ -546,10 +755,15 @@ static MTL4RenderPassDescriptor *m4_render_pass(DXMTM4CommandBuffer *context, co
                                   .5f+info->sample_positions.positions[i][1]/16.f)
           : MTLSamplePositionMake(.5f,.5f);
     [descriptor setSamplePositions:positions count:count];
+    // Metal accepts the option only for store actions that keep multisample data.
     for (unsigned i=0;i<8;++i)
-      if (descriptor.colorAttachments[i].texture)
+      if (descriptor.colorAttachments[i].texture &&
+          (descriptor.colorAttachments[i].storeAction==MTLStoreActionStore ||
+           descriptor.colorAttachments[i].storeAction==MTLStoreActionStoreAndMultisampleResolve))
         descriptor.colorAttachments[i].storeActionOptions=MTLStoreActionOptionCustomSamplePositions;
-    if (descriptor.depthAttachment.texture)
+    if (descriptor.depthAttachment.texture &&
+        (descriptor.depthAttachment.storeAction==MTLStoreActionStore ||
+         descriptor.depthAttachment.storeAction==MTLStoreActionStoreAndMultisampleResolve))
       descriptor.depthAttachment.storeActionOptions=MTLStoreActionOptionCustomSamplePositions;
   }
   if (info->forced16_half) {
@@ -726,23 +940,21 @@ static int32_t m4_as_call(struct WMTMetal4Call *call) {
  * using its exact command/allocator/resource identities when feedback arrives. */
 static void m4_finish_submission(DXMTM4Submission *submission) {
   if (!submission->commitReturned || !submission->feedbackReceived) return;
-  for (DXMTM4PresentTicket *ticket in submission->presentTickets) [ticket complete:submission->error == nil];
-  // Removal waits for native commit return AND GPU retirement. No allocations
-  // persist between recordings in the retired native-slot residency cache.
+  // Removal waits for native commit return AND GPU retirement. The device set
+  // keeps an allocation only while another live recording still uses it.
   for (id lease in submission->leases) {
     if (![lease isKindOfClass:[DXMTM4Recording class]]) continue;
     DXMTM4Recording *recording=lease;
-    if (recording->allocations.count) {
-      [recording->residency removeAllAllocations]; recording->residencyDirty=YES;
-      if (recording->trace) recording->counters.residencyRemove+=recording->allocations.count;
-      m4_commit_residency(recording);
-    }
+    m4_release_residency(recording);
     if (recording->trace) {
       M4BindingCounters c=recording->counters;
       fprintf(stderr,"OWNED_GRAPHICS_NATIVE_BINDING table_new=%llu table_set=%llu table_bind=%llu residency_new=%llu residency_add=%llu residency_remove=%llu residency_commit=%llu\n",
         (unsigned long long)c.tableNew,(unsigned long long)c.tableSet,(unsigned long long)c.tableBind,
         (unsigned long long)c.residencyNew,(unsigned long long)c.residencyAdd,
         (unsigned long long)c.residencyRemove,(unsigned long long)c.residencyCommit);
+      if (c.blitHazardBarrier || c.blitCapacityBarrier)
+        fprintf(stderr,"OWNED_GRAPHICS_BLIT_HAZARD hazard_barrier=%llu capacity_barrier=%llu\n",
+          (unsigned long long)c.blitHazardBarrier,(unsigned long long)c.blitCapacityBarrier);
     }
   }
   [submission->leases removeAllObjects];
@@ -792,14 +1004,20 @@ static int32_t m4_commit(struct WMTMetal4Call *call) {
       submission->gpuEnd=(uint64_t)(feedback.GPUEndTime*1000000000.0);
       submission->feedbackReceived=YES; m4_finish_submission(submission); [submission->condition unlock];
     }];
+    // preCommit snapshots the shared device set; no retirement may remove an
+    // allocation while it traverses that set (the per-device lock, 4.0b3 +0xc4).
+    DXMTM4DeviceResidency *shared=m4cb(handles[0])->residency;
+    [shared->lock lock];
     [queue commit:commands count:command_count options:options]; [options release];
-    // Feedback may arrive before commit returns. Signal every drawable before
-    // publishing commitReturned, which permits its ticket to present.
+    [shared->lock unlock];
+    // Signal each drawable after its commit and present it immediately; the
+    // display waits for the signal, not the CPU (D3DMetal 4.0b3 DoPresent).
     for (DXMTM4PresentTicket *ticket in submission->presentTickets) {
       id<CAMetalDrawable> primary, residual;
       winemetal_composition_drawables(ticket->drawable, &primary, &residual);
       [queue signalDrawable:primary];
       if (residual) [queue signalDrawable:residual];
+      [ticket present];
     }
     [submission->condition lock]; submission->commitReturned=YES;
     m4_finish_submission(submission); [submission->condition unlock];
@@ -943,10 +1161,10 @@ int32_t winemetal_metal4_call(void *params) {
       context->recording=[DXMTM4Recording new]; context->recording->objects=[NSMutableSet new]; context->recording->encoders=[NSMutableArray new];
       context->recording->presentTickets=[NSMutableArray new];
       context->recording->allocations=[NSMutableSet new];
+      context->recording->pending=[NSMutableArray new]; context->recording->published=[NSMutableArray new];
       const char *trace=getenv("OWNED_GRAPHICS_TRACE"); context->recording->trace=trace && trace[0]=='1' && !trace[1];
       if (!context->residency) {
-        MTLResidencySetDescriptor *descriptor=[MTLResidencySetDescriptor new]; descriptor.initialCapacity=64;
-        context->residency=[context->device newResidencySetWithDescriptor:descriptor error:nil]; [descriptor release];
+        context->residency=[m4_device_residency(context->device) retain];
         if (context->recording->trace) ++context->recording->counters.residencyNew;
       }
       context->recording->residency=[context->residency retain];
@@ -958,7 +1176,7 @@ int32_t winemetal_metal4_call(void *params) {
     case WMTMetal4EndCommandBuffer: {
       DXMTM4CommandBuffer *context=m4cb(a[0]); if (!context->recording || context->ended) return M4_INVALID;
       m4_commit_residency(context->recording);
-      [context->command useResidencySet:context->recording->residency];
+      [context->command useResidencySet:context->recording->residency->set];
       for (NSUInteger i=0;i<context->debugGroups.count;++i) [context->command popDebugGroup];
       [context->command endCommandBuffer]; context->ended=YES; return M4_SUCCESS;
     }
@@ -1571,7 +1789,8 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
     case WMTBlitCommandCopyFromBufferToBuffer: {
       struct wmtcmd_blit_copy_from_buffer_to_buffer *body = (struct wmtcmd_blit_copy_from_buffer_to_buffer *)next;
       m4_allocation(context->recording,m4obj(body->src)); m4_allocation(context->recording,m4obj(body->dst));
-      m4_blit_access(context,body->src,body->src_offset,body->copy_length,body->dst,body->dst_offset,body->copy_length);
+      m4_blit_access(context,m4_buffer_footprint(body->src,body->src_offset,body->copy_length,NO),
+        m4_buffer_footprint(body->dst,body->dst_offset,body->copy_length,YES));
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
                  sourceOffset:body->src_offset
                      toBuffer:(id<MTLBuffer>)body->dst
@@ -1582,7 +1801,8 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
     case WMTBlitCommandCopyFromBufferToTexture: {
       struct wmtcmd_blit_copy_from_buffer_to_texture *body = (struct wmtcmd_blit_copy_from_buffer_to_texture *)next;
       m4_allocation(context->recording,m4obj(body->src)); m4_allocation(context->recording,m4obj(body->dst));
-      m4_blit_access(context,body->src,body->src_offset,UINT64_MAX,m4_texture_key(m4obj(body->dst)),0,UINT64_MAX);
+      m4_blit_access(context,m4_linear_footprint(body->src,body->src_offset,body->bytes_per_row,body->bytes_per_image,body->size,NO),
+        m4_texture_footprint((id<MTLTexture>)body->dst,body->level,1,body->slice,1,body->origin,body->size,YES));
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
                  sourceOffset:body->src_offset
             sourceBytesPerRow:body->bytes_per_row
@@ -1598,7 +1818,8 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
       struct wmtcmd_blit_copy_from_buffer_to_texture_withblitoption *body =
           (struct wmtcmd_blit_copy_from_buffer_to_texture_withblitoption *)next;
       m4_allocation(context->recording,m4obj(body->src)); m4_allocation(context->recording,m4obj(body->dst));
-      m4_blit_access(context,body->src,body->src_offset,UINT64_MAX,m4_texture_key(m4obj(body->dst)),0,UINT64_MAX);
+      m4_blit_access(context,m4_linear_footprint(body->src,body->src_offset,body->bytes_per_row,body->bytes_per_image,body->size,NO),
+        m4_texture_footprint((id<MTLTexture>)body->dst,body->level,1,body->slice,1,body->origin,body->size,YES));
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
                  sourceOffset:body->src_offset
             sourceBytesPerRow:body->bytes_per_row
@@ -1614,7 +1835,8 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
     case WMTBlitCommandCopyFromTextureToBuffer: {
       struct wmtcmd_blit_copy_from_texture_to_buffer *body = (struct wmtcmd_blit_copy_from_texture_to_buffer *)next;
       m4_allocation(context->recording,m4obj(body->src)); m4_allocation(context->recording,m4obj(body->dst));
-      m4_blit_access(context,m4_texture_key(m4obj(body->src)),0,UINT64_MAX,body->dst,body->offset,UINT64_MAX);
+      m4_blit_access(context,m4_texture_footprint((id<MTLTexture>)body->src,body->level,1,body->slice,1,body->origin,body->size,NO),
+        m4_linear_footprint(body->dst,body->offset,body->bytes_per_row,body->bytes_per_image,body->size,YES));
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                        sourceSlice:body->slice
                        sourceLevel:body->level
@@ -1630,7 +1852,8 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
       struct wmtcmd_blit_copy_from_texture_to_buffer_withblitoption *body =
           (struct wmtcmd_blit_copy_from_texture_to_buffer_withblitoption *)next;
       m4_allocation(context->recording,m4obj(body->src)); m4_allocation(context->recording,m4obj(body->dst));
-      m4_blit_access(context,m4_texture_key(m4obj(body->src)),0,UINT64_MAX,body->dst,body->offset,UINT64_MAX);
+      m4_blit_access(context,m4_texture_footprint((id<MTLTexture>)body->src,body->level,1,body->slice,1,body->origin,body->size,NO),
+        m4_linear_footprint(body->dst,body->offset,body->bytes_per_row,body->bytes_per_image,body->size,YES));
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                        sourceSlice:body->slice
                        sourceLevel:body->level
@@ -1646,7 +1869,11 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
     case WMTBlitCommandCopyFromTextureToTexture: {
       struct wmtcmd_blit_copy_from_texture_to_texture *body = (struct wmtcmd_blit_copy_from_texture_to_texture *)next;
       m4_allocation(context->recording,m4obj(body->src)); m4_allocation(context->recording,m4obj(body->dst));
-      m4_blit_access(context,m4_texture_key(m4obj(body->src)),0,UINT64_MAX,m4_texture_key(m4obj(body->dst)),0,UINT64_MAX);
+      m4_blit_access(context,m4_texture_footprint((id<MTLTexture>)body->src,body->src_level,1,body->src_slice,1,body->src_origin,body->src_size,NO),
+        /* Source texels of a format-reinterpreting copy are not destination texels. */
+        m4_texture_footprint((id<MTLTexture>)body->dst,body->dst_level,1,body->dst_slice,1,body->dst_origin,
+                             ((id<MTLTexture>)body->src).pixelFormat==((id<MTLTexture>)body->dst).pixelFormat ? body->src_size :
+                             (struct WMTSize){UINT64_MAX,UINT64_MAX,UINT64_MAX},YES));
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                    sourceSlice:body->src_slice
                    sourceLevel:body->src_level
@@ -1661,7 +1888,7 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
     case WMTBlitCommandGenerateMipmaps: {
       struct wmtcmd_blit_generate_mipmaps *body = (struct wmtcmd_blit_generate_mipmaps *)next;
       m4_allocation(context->recording,m4obj(body->texture));
-      m4_blit_access(context,m4_texture_key(m4obj(body->texture)),0,UINT64_MAX,m4_texture_key(m4obj(body->texture)),0,UINT64_MAX);
+      m4_blit_access(context,m4_whole_texture((id<MTLTexture>)body->texture,NO),m4_whole_texture((id<MTLTexture>)body->texture,YES));
       [encoder generateMipmapsForTexture:(id<MTLTexture>)body->texture];
       break;
     }
@@ -1680,7 +1907,7 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
     case WMTBlitCommandFillBuffer: {
       struct wmtcmd_blit_fillbuffer *body = (struct wmtcmd_blit_fillbuffer *)next;
       m4_allocation(context->recording,m4obj(body->buffer));
-      m4_blit_access(context,0,0,0,body->buffer,body->offset,body->length);
+      m4_blit_access(context,(M4BlitAccess){0},m4_buffer_footprint(body->buffer,body->offset,body->length,YES));
       [encoder fillBuffer:(id<MTLBuffer>)body->buffer range:NSMakeRange(body->offset, body->length) value:body->value];
       break;
     }
@@ -1690,7 +1917,7 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
     case WMTBlitCommandResetCommandsInBuffer: {
       struct wmtcmd_blit_resetcommands *body = (struct wmtcmd_blit_resetcommands *)next;
       m4_allocation(context->recording,m4obj(body->indirect_command_buffer));
-      m4_blit_access(context,0,0,0,body->indirect_command_buffer,body->location,body->length);
+      m4_blit_access(context,(M4BlitAccess){0},m4_buffer_footprint(body->indirect_command_buffer,body->location,body->length,YES));
       [encoder resetCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
                            withRange:NSMakeRange(body->location, body->length)];
       break;
@@ -1698,7 +1925,7 @@ static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtc
     case WMTBlitCommandCopyTexture: {
       struct wmtcmd_blit_copy_texture *body = (struct wmtcmd_blit_copy_texture *)next;
       m4_allocation(context->recording,m4obj(body->src)); m4_allocation(context->recording,m4obj(body->dst));
-      m4_blit_access(context,m4_texture_key(m4obj(body->src)),0,UINT64_MAX,m4_texture_key(m4obj(body->dst)),0,UINT64_MAX);
+      m4_blit_access(context,m4_whole_texture((id<MTLTexture>)body->src,NO),m4_whole_texture((id<MTLTexture>)body->dst,YES));
       [encoder copyFromTexture:(id<MTLTexture>)body->src toTexture:(id<MTLTexture>)body->dst];
       break;
     }

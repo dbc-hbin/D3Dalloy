@@ -143,6 +143,7 @@ SHA1Update(SHA1_CTX *context, const uint8_t *data, size_t len)
 void
 SHA1Pad(SHA1_CTX *context)
 {
+	static const uint8_t zeros[64];
 	uint8_t finalcount[8];
 	uint32_t i;
 
@@ -151,8 +152,7 @@ SHA1Pad(SHA1_CTX *context)
 		    ((7 - (i & 7)) * 8)) & 255);	/* Endian independent */
 	}
 	SHA1Update(context, (uint8_t *)"\200", 1);
-	while ((context->count & 504) != 448)
-		SHA1Update(context, (uint8_t *)"\0", 1);
+	SHA1Update(context, zeros, ((448 - (context->count & 504)) & 504) >> 3);
 	SHA1Update(context, finalcount, 8); /* Should cause a SHA1Transform() */
 }
 

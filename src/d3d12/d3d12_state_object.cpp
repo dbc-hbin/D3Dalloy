@@ -595,7 +595,7 @@ class MTLD3D12StateObjectImpl final
       const UINT blob_size = global_root_->GetBlob(&blob);
       const void *raw = nullptr;
       UINT raw_size = 0;
-      if (!blob_size || !blob || FAILED(microsoft::DXBCGetRootSignature(blob, &raw, &raw_size)))
+      if (!blob_size || !blob || FAILED(microsoft::DXBCGetRootSignature(blob, blob_size, &raw, &raw_size)))
         return RejectStateObject("the global root signature has no readable description");
       if (FAILED(deserializer.Deserialize(raw, raw_size)))
         return RejectStateObject("the global root signature does not deserialize");
@@ -1740,7 +1740,8 @@ private:
         if (entry.global_root_signature) {
           const void *raw = nullptr;
           UINT raw_size = 0;
-          if (FAILED(microsoft::DXBCGetRootSignature(function.GlobalRootSignature, &raw, &raw_size)) ||
+          if (FAILED(microsoft::DXBCGetRootSignature(function.GlobalRootSignature, function.GlobalRootSignatureSize,
+                      &raw, &raw_size)) ||
               FAILED(deserializer.Deserialize(raw, raw_size)))
             return E_INVALIDARG;
           root_desc.Desc_1_1 = deserializer.desc_1_1_.Desc_1_1;

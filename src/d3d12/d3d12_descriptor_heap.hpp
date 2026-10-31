@@ -265,6 +265,8 @@ struct MTL_RENDER_TARGET_DESC {
   UINT RenderTargetArrayLength = 0;
   bool CenterSamplePattern = false;
   UINT Flags = 0;
+  /* Never-reused owning resource id (MTLD3D12Resource::owned_id) for texture views; 0 otherwise. */
+  uint64_t Owner = 0;
 };
 
 class MTLD3D12RenderTargetDescriptorHeap : public ID3D12DescriptorHeap {

@@ -33,7 +33,10 @@ MTLD3D12CommandAllocatorImpl::MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevi
     copy_temp_version_(0) {}
 
 HRESULT
-CreateCommandAllocator(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, REFIID riid, void **ppCommandAllocator) {
+CreateCommandAllocator(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, REFIID riid, void **ppCommandAllocator) try {
+  InitReturnPtr(ppCommandAllocator);
+  if (!ppCommandAllocator)
+    return E_POINTER;
   switch (Type) {
   case D3D12_COMMAND_LIST_TYPE_DIRECT:
   case D3D12_COMMAND_LIST_TYPE_BUNDLE:
@@ -48,6 +51,8 @@ CreateCommandAllocator(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, RE
   if (FAILED(hr))
     return hr;
   return command_allocator->QueryInterface(riid, ppCommandAllocator);
+} catch (const std::bad_alloc &) {
+  return E_OUTOFMEMORY;
 }
 
 HRESULT
@@ -99,7 +104,7 @@ MTLD3D12CommandAllocatorImpl::QueryInterface(REFIID riid, void **ppvObject) {
 }
 
 HRESULT STDMETHODCALLTYPE
-MTLD3D12CommandAllocatorImpl::Reset() {
+MTLD3D12CommandAllocatorImpl::Reset() try {
   std::lock_guard<dxmt::mutex> lock(submission_mutex_);
   if (outstanding_submissions_ || encoder_last) {
     owned_graphics::Trace("root_upload_reset", ",\"allocator\":", trace_id_, ",\"epoch\":", gpu_heap_epoch_,
@@ -139,6 +144,8 @@ MTLD3D12CommandAllocatorImpl::Reset() {
   owned_graphics::Trace("root_upload_reset", ",\"allocator\":", trace_id_, ",\"epoch\":", gpu_heap_epoch_,
                         ",\"accepted\":1,\"reason\":\"retired\",\"retained_bytes\":", retained, ",\"chunks\":", keep);
   return S_OK;
+} catch (const std::bad_alloc &) {
+  return E_OUTOFMEMORY;
 };
 
 MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
@@ -156,7 +163,7 @@ MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
 
 bool
 MTLD3D12CommandAllocatorImpl::ReserveGPUHeap(uint64_t Length, size_t Alignment) {
-  const auto maximum = std::min<uint64_t>(device_->GetMTLDevice().maxBufferLength(), SIZE_MAX);
+  const auto maximum = gpu_heap_max_length_;
   if (!Alignment || (Alignment & (Alignment - 1)) || Length > maximum)
     return false;
   for (size_t i = gpu_heap_active_; i < gpu_heap_chunks_.size(); ++i) {
@@ -433,6 +440,9 @@ IndirectRenderCommandData *
 MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount, bool index_pull
 ) {
+  // The trailing restore binds the direct `pso`; indirect draws are never omitted.
+  if (!pPSO->WaitNativePipeline())
+    return nullptr;
   auto indirect_pso = index_pull ? pPSO->GetIndexPullPipelineState(true)
                                  : pPSO->GetIndirectCommandBufferPipelineState();
   if (!indirect_pso)

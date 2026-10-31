@@ -2973,6 +2973,20 @@ thunk_SM50FreeError(void *args) {
 }
 
 static NTSTATUS
+thunk_SM50GetErrorKind(void *args) {
+  struct sm50_get_error_kind_params *params = args;
+  params->kind = SM50GetErrorKind(params->error);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_SM50CloneError(void *args) {
+  struct sm50_clone_error_params *params = args;
+  params->ret = SM50CloneError(params->error, &params->clone);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 thunk_SM50CompileTessellationPipelineHull(void *args) {
   struct sm50_compile_tessellation_pipeline_hull_params *params = args;
 
@@ -4102,14 +4116,15 @@ GetChromaticity_xy(ColorSyncProfileRef profile, CFStringRef tag, float *out_x, f
   CFDataRef tag_data = ColorSyncProfileCopyTag(profile, tag);
   if (!tag_data)
     return false;
-  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t))
+  const icc_XYZ_t *data = (const icc_XYZ_t *)CFDataGetBytePtr(tag_data);
+  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t) || data->sig != 0x205a5958) {
+    CFRelease(tag_data);
     return false;
-  icc_XYZ_t *data = (icc_XYZ_t *)CFDataGetBytePtr(tag_data);
-  if (data->sig != 0x205a5958)
-    return false;
+  }
   double X = (int32_t)__builtin_bswap32(data->x) / 65536.0;
   double Y = (int32_t)__builtin_bswap32(data->y) / 65536.0;
   double Z = (int32_t)__builtin_bswap32(data->z) / 65536.0;
+  CFRelease(tag_data);
   *out_x = X / (X + Y + Z);
   *out_y = Y / (X + Y + Z);
   return true;
@@ -4148,8 +4163,14 @@ _WMTGetDisplayDescription(void *obj) {
   CGDirectDisplayID display_id = params->handle;
   struct WMTDisplayDescription *desc_out = params->arg.ptr;
   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
-  if (!profile || !GetDisplayColorGamut(profile, desc_out))
-    GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
+  if (!profile || !GetDisplayColorGamut(profile, desc_out)) {
+    ColorSyncProfileRef generic = ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile);
+    GetDisplayColorGamut(generic, desc_out);
+    if (generic)
+      CFRelease(generic);
+  }
+  if (profile)
+    CFRelease(profile);
   NSScreen *screen = GetNSScreenForDisplayID(display_id);
   if (screen) {
     desc_out->maximum_edr_color_component_value = [screen maximumExtendedDynamicRangeColorComponentValue];
@@ -6785,8 +6806,10 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTMonitorTiming_call, /* 316: fixed-width monitor timing */
     &_WMTComposition_call, /* 317: fixed-width composition, including nested PE32 pointers */
     &_WMTGetGuestWindowBase, /* 318: native typed guest-window query */
+    &thunk_SM50GetErrorKind, /* 319: fixed-width error kind */
+    &thunk_SM50CloneError, /* 320: fixed-width independent error handle */
 };
-_Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == 319,
+_Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == 321,
                "PE64/native composition dispatch index");
 
 #ifndef DXMT_NATIVE
@@ -7101,7 +7124,9 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTMonitorTiming_call, /* 316: identical fixed-width POD layout */
     &_WMTComposition_call, /* 317: identical 40-byte native/PE32 layout */
     &_WMTGetGuestWindowBase, /* 318: native typed guest-window query */
+    &thunk_SM50GetErrorKind, /* 319: identical fixed-width layout on PE32 */
+    &thunk_SM50CloneError, /* 320: inline handle needs no pointer conversion */
 };
-_Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == 319,
+_Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == 321,
                "PE32/native composition dispatch index");
 #endif

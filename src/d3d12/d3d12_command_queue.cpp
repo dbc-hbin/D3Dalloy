@@ -31,6 +31,7 @@
 #include "owned_queue_task_fifo.hpp"
 #include "d3d12_temporal.hpp"
 #include "d3d12_frame_generation.hpp"
+#include "d3d12_ray_regeneration.hpp"
 #include "d3d12_work_graph.hpp"
 #include "d3d12_state_object.hpp"
 #include "dxil_raytracing.h"
@@ -81,7 +82,24 @@ struct SubmissionNode {
   size_t list_ordinal, node_ordinal;
   size_t group = SIZE_MAX;
   const char *rejection = nullptr;
-  bool access_complete = false, boundary_before = false, boundary_after = false, skip_clear = false;
+  // Access completeness answers whether resource dependencies can be trusted.
+  // Merge eligibility is separate: an encoder may be fully described yet still
+  // require its own native render encoder (for example, fragment completion).
+  bool access_complete = false, merge_eligible = false;
+  bool boundary_before = false, boundary_after = false, force_fence_before = false, skip_clear = false;
+  // The boundary only bounds planner frontier work: it orders no memory the
+  // allocation summaries miss, so replay keeps in-flight tracking across it.
+  bool partition_before = false;
+  // Writable MSAA import/export helpers run around this node and wait on the
+  // fence themselves: the node keeps its own wait and produces render stages.
+  bool helper_passes = false;
+  bool sparse_resource_used = false;
+  // A whole-surface AVERAGE ResolveSubresource immediately after this native
+  // MSAA pass, folded into the pass's color store. Value-owned: the target
+  // view is retained by the plan, the const resolve record stays unmodified.
+  struct FoldedResolve { unsigned slot; TextureViewRef target; };
+  std::optional<FoldedResolve> folded_resolve;
+  bool resolve_folded_into_previous = false;
   std::vector<SubmissionAccess> accesses;
   std::unordered_map<const void *, std::vector<size_t>> access_slots;
   size_t descriptor_resolutions = 0;
@@ -89,8 +107,18 @@ struct SubmissionNode {
   std::vector<SubmissionDependency> dependencies;
   std::vector<size_t> clears_before;
 };
+
+// Metal4 cannot complete a fragment producer inside the current render
+// encoder. Keep the only proven inline family explicit: attachment-only edges
+// are represented by the render-pass mapping; non-attachment edges must be
+// vertex-to-vertex to use an inline buffer/texture barrier.
+bool InlineRenderDependencySafe(const SubmissionDependency &dependency) {
+  return dependency.attachment_only ||
+      (dependency.before == WMTMetal4StageVertex && dependency.after == WMTMetal4StageVertex);
+}
 struct RenderReplayGroup {
   std::vector<size_t> members;
+  bool force_fence_before = false;
   WMTRenderPassInfo descriptor{};
   std::vector<std::array<uint8_t, 8>> color_maps;
   std::array<TextureViewRef, 8> colors;
@@ -126,6 +154,19 @@ bool AppendSubmissionAccess(SubmissionNode &node, SubmissionAccess access) {
   slots.push_back(node.accesses.size()); node.accesses.push_back(access);
   return true;
 }
+bool AppendSubmissionNativeBuffer(SubmissionNode &node, WMT::Buffer buffer, bool writes, uint64_t stages) {
+  if (!buffer) return true;
+  return AppendSubmissionAccess(node, {reinterpret_cast<const void *>(buffer.handle), 0, UINT64_MAX,
+      0, 1, 0, 1, 0, writes, false, stages});
+}
+bool AppendSubmissionAllocation(SubmissionNode &node, BufferAllocation *allocation,
+    uint64_t offset, uint64_t bytes, bool writes, uint64_t stages) {
+  if (!allocation || allocation->canonicalHeap || allocation->reservedResource ||
+      allocation->flags().test(BufferAllocationFlag::PlacementSparse) || offset >= allocation->byteLength())
+    return false;
+  if (bytes > allocation->byteLength() - offset) return false;
+  return AppendSubmissionAccess(node, {allocation, offset, offset + bytes, 0, 1, 0, 1, 0, writes, false, stages});
+}
 bool ResolveSubmissionDescriptorBudget(SubmissionNode &node, uint64_t count) {
   if (count > kSubmissionDescriptorBudget - node.descriptor_resolutions) {
     node.rejection = "descriptor_resolution_budget"; return false;
@@ -134,23 +175,50 @@ bool ResolveSubmissionDescriptorBudget(SubmissionNode &node, uint64_t count) {
   return true;
 }
 
-const char *OrdinaryRenderRejection(const RenderEncoderData &render, MTLD3D12Device *device) {
+// With access_only, only restrictions that leave resource accesses unproven
+// reject; descriptor-only merge restrictions (read-only DSV, layered or
+// offset attachments, sample pattern, depth bounds, attachmentless passes)
+// keep exact access summaries and are rejected for merging alone.
+const char *OrdinaryRenderRejection(const RenderEncoderData &render, MTLD3D12Device *device, bool access_only = false) {
   if (render.submission_root_srv_opaque) return "unresolved_root_srv";
   if (render.submission_snapshot_budget) return "recorded_buffer_budget";
   if (!render.submission_group_safe) return "shader_or_state_unresolved";
   if (render.endpoint_reason == RecordedEndpointReason::Opaque) return "opaque_endpoint";
-  if ((!render.render_target_count && !render.depth.attachment && !render.stencil.attachment) ||
-      render.dsv_readonly_flags || render.default_raster_sample_count || render.center_sample_pattern ||
-      render.sample_positions.count || render.render_target_array_length > 1 ||
-      render.atomic64_phase || render.msaa_draw || render.capture_indirect || render.so_indirect ||
+  // Native MSAA passes always carry their explicit or center sample pattern;
+  // that is pass-descriptor state, not an untracked resource access.
+  const bool native_msaa = render.native_msaa_sample_count > 1;
+  if (render.atomic64_phase || render.msaa_draw || render.capture_indirect || render.so_indirect ||
       !render.so_draws.empty() || render.use_geometry || render.use_tessellation ||
-      render.visibility_scratch || !render.visibility_targets.empty() || render.rov_marker_sample_count ||
-      render.depth_bounds_active) return "advanced_render";
+      render.rov_marker_sample_count) return "advanced_render";
+  if (!access_only &&
+      ((!render.render_target_count && !render.depth.attachment && !render.stencil.attachment) ||
+       render.dsv_readonly_flags || render.default_raster_sample_count ||
+       (!native_msaa && (render.center_sample_pattern || render.sample_positions.count)) ||
+       render.render_target_array_length > 1 || render.depth_bounds_active)) return "advanced_render";
+  // Native MSAA passes keep their multisample attachments in Metal; a folded
+  // ending-access resolve writes its single-sample target at the attachment
+  // store. Both are fragment-stage attachment writes the planner can track.
+  const uint32_t samples = render.native_msaa_sample_count ? render.native_msaa_sample_count : 1;
+  // Access tracking needs only allocation identity; the 2D type proof is for merged attachment unions.
+  auto plain_texture = [&](const TextureAllocation *allocation, uint32_t count) {
+    return !allocation->canonicalHeap && !allocation->flags().test(TextureAllocationFlag::Shared) &&
+        !allocation->flags().test(TextureAllocationFlag::PlacementSparse) && allocation->descriptor->sampleCount() == count &&
+        (access_only ||
+         allocation->descriptor->textureType() == (count == 1 ? WMTTextureType2D : WMTTextureType2DMultisample)) &&
+        !device->LookupStandardSwizzleTexture(allocation->descriptor);
+  };
   for (unsigned i = 0; i < render.render_target_count; ++i) {
     const auto &color = render.colors[i];
+    if (color.buffer_attachment) return "attachment_buffer";
     if (!color.attachment) continue;
-    if (color.buffer_attachment || color.resolve_attachment || color.level || color.slice ||
-        color.depth_plane || color.store_action != WMTStoreActionStore ||
+    const bool folded_resolve = color.resolve_attachment && samples > 1 &&
+        (color.store_action == WMTStoreActionStoreAndMultisampleResolve ||
+         color.store_action == WMTStoreActionMultisampleResolve) && !color.resolve_level &&
+        !color.resolve_slice && !color.resolve_depth_plane;
+    if (color.buffer_attachment || (color.resolve_attachment && !folded_resolve) ||
+        (!access_only && (color.level || color.slice || color.depth_plane)) ||
+        (!folded_resolve && color.store_action != WMTStoreActionStore &&
+                              color.store_action != WMTStoreActionDontCare) ||
         (color.load_action != WMTLoadActionLoad && color.load_action != WMTLoadActionClear))
       return "attachment_actions";
     const auto *view = color.attachment.ptr();
@@ -162,10 +230,13 @@ const char *OrdinaryRenderRejection(const RenderEncoderData &render, MTLD3D12Dev
           other->key.mip_start < view->key.mip_end && view->key.mip_start < other->key.mip_end &&
           other->key.array_start < view->key.array_end && view->key.array_start < other->key.array_end)
         return "attachment_overlap";
-    if (allocation->canonicalHeap || allocation->flags().test(TextureAllocationFlag::Shared) ||
-        allocation->flags().test(TextureAllocationFlag::PlacementSparse) || allocation->descriptor->sampleCount() != 1 ||
-        allocation->descriptor->textureType() != WMTTextureType2D ||
-        device->LookupStandardSwizzleTexture(allocation->descriptor)) return "attachment_alias_or_swizzle";
+    if (!plain_texture(allocation, samples)) return "attachment_alias_or_swizzle";
+    if (folded_resolve) {
+      const auto *target = color.resolve_attachment.ptr();
+      if (target->castBlockSize || target->msaaSampleAddress || target->reservedCast || target->reservedVolumeRender ||
+          target->reservedVolumeAtlasCast) return "attachment_cast_or_sparse";
+      if (!plain_texture(target->allocation, 1)) return "attachment_alias_or_swizzle";
+    }
   }
   return nullptr;
 }
@@ -174,19 +245,27 @@ bool AppendSubmissionBuffer(SubmissionNode &node, MTLD3D12Device *device,
                             uint64_t address, uint64_t bytes, bool writes, uint64_t stages) {
   uint64_t offset = 0;
   auto *allocation = device->LookupBufferByVA(address, &offset);
-  if (!allocation || allocation->canonicalHeap || allocation->reservedResource ||
-      allocation->flags().test(BufferAllocationFlag::PlacementSparse) || offset >= allocation->byteLength()) return false;
+  if (!allocation || allocation->canonicalHeap || offset >= allocation->byteLength()) return false;
+  if (allocation->reservedResource || allocation->flags().test(BufferAllocationFlag::PlacementSparse)) {
+    node.sparse_resource_used = true;
+    return false;
+  }
   const uint64_t length = bytes == UINT64_MAX ? allocation->byteLength() - offset : bytes;
   if (length > allocation->byteLength() - offset) return false;
   return !length || AppendSubmissionAccess(node, {allocation, bytes == UINT64_MAX ? 0 : offset,
       bytes == UINT64_MAX ? allocation->byteLength() : offset + length, 0, 1, 0, 1, 0, writes, false, stages});
 }
 bool AppendSubmissionTexture(SubmissionNode &node, MTLD3D12Device *device, Texture *texture,
-    TextureAllocation *allocation, TextureViewKey key, uint8_t aspects, bool writes, bool attachment, uint64_t stages) {
+    TextureAllocation *allocation, TextureViewKey key, uint8_t aspects, bool writes, bool attachment, uint64_t stages,
+    uint32_t samples = 1) {
   if (!texture || !allocation || allocation->canonicalHeap ||
       allocation->flags().test(TextureAllocationFlag::Shared) ||
-      allocation->flags().test(TextureAllocationFlag::PlacementSparse) ||
-      allocation->descriptor->sampleCount() != 1 || device->LookupStandardSwizzleTexture(texture)) return false;
+      allocation->descriptor->sampleCount() != samples || device->LookupStandardSwizzleTexture(texture)) return false;
+  if (texture->reservedResource || texture->reservedVolumeLayoutAddress ||
+      allocation->flags().test(TextureAllocationFlag::PlacementSparse)) {
+    node.sparse_resource_used = true;
+    return false;
+  }
   if (!key.mip_end || !key.array_end) return false;
   return AppendSubmissionAccess(node, {allocation, 0, 0, uint32_t(key.mip_start), uint32_t(key.mip_end),
       uint32_t(key.array_start), uint32_t(key.array_end), aspects, writes, attachment, stages});
@@ -229,8 +308,22 @@ bool ResolveSubmissionTables(SubmissionPlan &plan, SubmissionNode &node, MTLD3D1
           if (!owner || !texture) { complete = false; break; }
           const auto key = uav ? descriptor.UAVTexture.view : descriptor.SRVTexture.view;
           // Plane reinterpretation, casts and shadow work are deliberately opaque.
-          if (!texture->supportsDescriptorViewPool(key)) { complete = false; break; }
-          complete &= AppendSubmissionTexture(node, device, texture, texture->current(), key, 4, writes, false, binding_stages);
+          // A writable MSAA view is the exception: its import/export helper
+          // passes touch only this allocation and are ordered by the node's
+          // own fence wait (SubmissionNode::helper_passes).
+          uint32_t samples = 1;
+          if (texture->directViewOfAllocation(key)) {
+            samples = texture->sampleCount();
+          } else {
+            if (!uav || !texture->isWritableMSAAView(key)) { complete = false; break; }
+            samples = texture->sampleCount();
+            node.helper_passes = true;
+          }
+          // A depth SRV/UAV reads the same planes depth clears and copies
+          // write; record every plane of the format, never the color aspect.
+          const auto planes = DepthStencilPlanarFlags(texture->pixelFormat());
+          complete &= AppendSubmissionTexture(node, device, texture, texture->current(), key,
+              planes ? uint8_t(planes) : uint8_t(4), writes, false, binding_stages, samples);
           if (plan.descriptor_owner_ids.insert(owner->owned_id).second) plan.descriptor_owners.push_back(std::move(owner)); break;
         }
         case ShaderVisibleDescriptorType::SRVBuffer:
@@ -598,6 +691,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   WMT::Reference<WMT::MTL4CommandQueue> queue_;
   WMT::Reference<WMT::Fence> fence_;
+  // Retained once: per-pass labels otherwise cost an NSString unix call each.
+  WMT::Reference<WMT::String> clear_batch_label_, clear_pass_label_, resolve_pass_label_;
   WMT::Reference<WMT::Event> timestamp_order_event_;
   uint64_t timestamp_order_value_ = 0; // submission thread only
   WMT::Reference<WMT::Texture> null_shading_rate_image_; // submission thread only; never sampled
@@ -630,6 +725,159 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   owned_graphics::SubmissionRing<kCommandQueueSize> submission_ring_;
 
+  // Submission-thread state. Accesses of tracked encoders whose submission may
+  // still run on the GPU, and the last submission holding queue work outside
+  // that tracking. An encoder may skip the queue fence only when neither can
+  // overlap it: Metal 4 reorders encoders across command buffers otherwise.
+  // Accesses are keyed by allocation identity. Entries with an identical
+  // range, subresource span, aspect set and access kind coalesce: their stages
+  // union and the entry retires with the newest contributing submission, so
+  // every WAR reader and every partial range stays visible until it retires.
+  struct InflightAccess { uint64_t seq, producer_stages; SubmissionAccess access; };
+  std::unordered_map<const void *, std::vector<InflightAccess>> inflight_accesses_;
+  size_t inflight_access_count_ = 0;
+  uint64_t inflight_swept_retired_ = 0;
+  bool inflight_unsealed_ = false;
+  uint64_t untracked_seq_ = 0;
+
+  // Fallback stages of an encoder type whose access summary lacks stages.
+  // Metal 4 blits run on compute encoders. Unknown types are conservative.
+  static uint64_t ProducerStages(EncoderType type) {
+    constexpr uint64_t compute = WMTMetal4StageDispatch | WMTMetal4StageBlit | WMTMetal4StageAccelerationStructure;
+    if (type == EncoderType::Render || type == EncoderType::Clear)
+      return WMTMetal4StageVertex | WMTMetal4StageFragment | WMTMetal4StageTile | WMTMetal4StageObject |
+          WMTMetal4StageMesh | compute;
+    if (type == EncoderType::Compute || type == EncoderType::Blit) return compute;
+    return WMTMetal4StageAll;
+  }
+  // Stages of helper work replay encodes around an access-complete node, in
+  // addition to the stages its proven accesses record. Each helper touches
+  // only memory the node's summary already records, so its stages attach to
+  // every access of the node. Types without a proof stay conservative.
+  static uint64_t HelperStages(const SubmissionNode &node) {
+    const auto *record = node.record;
+    if (record->type == EncoderType::Render) {
+      const auto &render = *static_cast<const RenderEncoderData *>(record);
+      uint64_t stages = 0;
+      // Interval zero-fill and visibility reset are blits; accumulation is a dispatch.
+      if (render.visibility_scratch || !render.visibility_targets.empty())
+        stages |= WMTMetal4StageBlit | WMTMetal4StageDispatch;
+      // Writable-MSAA import is a dispatch; export is a fragment pass.
+      if (node.helper_passes) stages |= WMTMetal4StageDispatch | WMTMetal4StageFragment;
+      return stages;
+    }
+    if (record->type == EncoderType::Compute)
+      return node.helper_passes ? WMTMetal4StageDispatch | WMTMetal4StageFragment : 0;
+    if (record->type == EncoderType::Blit || record->type == EncoderType::Clear) return 0;
+    return WMTMetal4StageAll;
+  }
+  void SweepInflightAccesses(uint64_t retired) {
+    if (retired == inflight_swept_retired_) return;
+    inflight_swept_retired_ = retired;
+    for (auto it = inflight_accesses_.begin(); it != inflight_accesses_.end();) {
+      auto &entries = it->second;
+      inflight_access_count_ -= std::erase_if(entries, [&](const InflightAccess &prior) { return prior.seq < retired; });
+      if (entries.empty()) it = inflight_accesses_.erase(it);
+      else ++it;
+    }
+  }
+  // Producer stages of every in-flight access that conflicts with these
+  // accesses: 0 when nothing conflicts, WMTMetal4StageAll when untracked
+  // queue work may still run.
+  uint64_t InflightHazard(std::span<const SubmissionAccess> accesses) {
+    const uint64_t retired = submission_ring_.firstUnretired();
+    if (untracked_seq_ >= retired) return WMTMetal4StageAll;
+    SweepInflightAccesses(retired);
+    uint64_t stages = 0;
+    for (const auto &access : accesses) {
+      auto it = inflight_accesses_.find(access.allocation);
+      if (it == inflight_accesses_.end()) continue;
+      for (const auto &prior : it->second)
+        if ((access.writes || prior.access.writes) && AccessOverlaps(access, prior.access))
+          stages |= prior.producer_stages;
+    }
+    return stages;
+  }
+  void MarkUntracked(uint64_t seq) {
+    untracked_seq_ = seq;
+    inflight_accesses_.clear();
+    inflight_access_count_ = 0;
+    inflight_unsealed_ = false;
+  }
+  static bool SameAccessSpan(const SubmissionAccess &a, const SubmissionAccess &b) {
+    return a.begin == b.begin && a.end == b.end && a.mip_begin == b.mip_begin && a.mip_end == b.mip_end &&
+        a.slice_begin == b.slice_begin && a.slice_end == b.slice_end && a.aspects == b.aspects &&
+        a.writes == b.writes && a.attachment == b.attachment;
+  }
+  // Producer stages are per access: its recorded stages plus the stages of
+  // helper work around it, or the encoder type's fallback when it has none.
+  void RecordInflightAccesses(std::span<const SubmissionAccess> accesses, uint64_t helper_stages,
+                              uint64_t fallback_stages) {
+    for (const auto &access : accesses) {
+      auto &entries = inflight_accesses_[access.allocation];
+      const uint64_t producer = !access.stages ? fallback_stages
+          : access.stages | helper_stages | (access.attachment ? uint64_t(WMTMetal4StageTile) : 0);
+      // A node can be encoded into a later segment than the one current at
+      // planning time, so its sequence is assigned when the Execute finishes.
+      auto same = std::find_if(entries.begin(), entries.end(),
+                               [&](const InflightAccess &prior) { return SameAccessSpan(prior.access, access); });
+      if (same != entries.end()) {
+        same->seq = UINT64_MAX;
+        same->producer_stages |= producer;
+        same->access.stages |= access.stages;
+      } else {
+        // Same bound as one plan's group span; beyond it tracking degrades to fences.
+        if (inflight_access_count_ == kSubmissionGroupBudget * kSubmissionRangeBudget) {
+          MarkUntracked(UINT64_MAX);
+          owned_graphics::Trace("native_inflight_fallback", ",\"entries\":", kSubmissionGroupBudget * kSubmissionRangeBudget,
+                                ",\"fallback_count\":1");
+          return;
+        }
+        entries.push_back({UINT64_MAX, producer, access});
+        ++inflight_access_count_;
+      }
+      inflight_unsealed_ = true;
+    }
+  }
+  void SealInflightAccesses(uint64_t seq) {
+    if (inflight_unsealed_)
+      for (auto &[allocation, entries] : inflight_accesses_)
+        for (auto &prior : entries) if (prior.seq == UINT64_MAX) prior.seq = seq;
+    inflight_unsealed_ = false;
+    if (untracked_seq_ == UINT64_MAX) untracked_seq_ = seq;
+    if (fence_chain_broken_seq_ == UINT64_MAX) fence_chain_broken_seq_ = seq;
+  }
+  // A fence wait orders only after the most recent fence update. An encoder
+  // that skipped its wait may still run when a later one updates the fence,
+  // so before the next fence waiter one empty encoder waits for all earlier
+  // queue work and updates the fence, restoring the chain for every waiter.
+  // The broken chain carries across submissions: every fence waiter drains
+  // first (replay nodes that keep their wait, Present), and every other queue
+  // consumer orders by CPU retirement or queue-level events, which cover
+  // skipped encoders of earlier command buffers.
+  bool fence_chain_broken_ = false;
+  // Newest submission holding a skipped wait. A skipped node may be encoded
+  // into a later segment than the one current at its decision, so the value
+  // stays unknown until the Execute seals its final sequence.
+  uint64_t fence_chain_broken_seq_ = 0;
+  void BreakFenceChain() {
+    fence_chain_broken_ = true;
+    fence_chain_broken_seq_ = UINT64_MAX;
+  }
+  void DrainSkippedWork(WMT::MTL4CommandBuffer cmdbuf, uint64_t seq) {
+    if (!fence_chain_broken_) return;
+    fence_chain_broken_ = false;
+    // Retired skipped work already precedes every later fence waiter.
+    if (fence_chain_broken_seq_ < submission_ring_.firstUnretired()) {
+      owned_graphics::Trace("native_skipped_drain_retired", ",\"submission\":", seq, ",\"elided_count\":1");
+      return;
+    }
+    auto drain = cmdbuf.blitCommandEncoder();
+    drain.barrierAfterQueueStages(WMTMetal4StageAll, WMTMetal4StageBlit, WMTMetal4VisibilityDevice);
+    drain.updateFence(fence_);
+    drain.endEncoding();
+    owned_graphics::Trace("native_skipped_drain", ",\"submission\":", seq, ",\"barrier_count\":1");
+  }
   using OwnedHandle = std::unique_ptr<void, decltype([](HANDLE handle) { CloseHandle(handle); })>;
 
   // An allocator cannot discard recorded payloads while a FIFO task or any
@@ -829,7 +1077,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // scratch until Metal completion, independently of frontend ReleaseFeature.
     std::vector<std::shared_ptr<OwnedTemporalFrame>> temporal_frames;
     std::vector<std::shared_ptr<OwnedFrameGenerationFrame>> frame_generation_frames;
-    std::optional<SignalTask> fence_completion;
+    std::vector<std::shared_ptr<OwnedRayRegenerationFrame>> ray_regeneration_frames;
+    uint64_t cpu_submit_ns = 0;
+    std::vector<SignalTask> fence_completions;
     // Retain the presenter until GPU completion, not merely task encoding.
     Rc<Presenter> present_completion;
     std::shared_ptr<DXMTPresentHistory> present_history;
@@ -922,7 +1172,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       }
 
       owned_graphics::Trace("complete", ",\"queue\":", owned_id_, ",\"submission\":", internal_seq,
-                            ",\"status\":", uint32_t(metal_error ? WMTCommandBufferStatusError : WMTCommandBufferStatusCompleted));
+                            ",\"status\":", uint32_t(metal_error ? WMTCommandBufferStatusError : WMTCommandBufferStatusCompleted),
+                            ",\"cpu_submit_ns\":", inflight.cpu_submit_ns,
+                            ",\"cpu_complete_ns\":", owned_graphics::NowNs(),
+                            ",\"gpu_start_ns\":", completion.gpu_start_ns,
+                            ",\"gpu_end_ns\":", completion.gpu_end_ns,
+                            ",\"present_frame_id\":", inflight.native_present ? inflight.native_present->frame_id : 0);
       if (inflight.native_present) {
         auto presenter = inflight.present_completion;
         const bool composition = bool(inflight.native_present->surface);
@@ -935,13 +1190,15 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
           const bool terminal = present.surface &&
               presenter->presentOrderEvent().signaledValue() == UINT64_MAX;
           const bool current = !terminal && present.restart_token.signaledValue() == present.restart_epoch;
-          const bool presented = (present.native_present_reserved && !metal_error && current) ||
+          // A reserved present reached Core Animation at commit (D3DMetal 4.0b3
+          // DoPresent); only an unreserved one is presented or withdrawn here.
+          const bool presented = present.native_present_reserved ||
                                  (!present.native_present_attempted && !metal_error && current);
           if (!present.native_present_attempted && !metal_error && current)
             WMT4::PresentMetal4Drawable(present.drawable, present.after,
                                        present.surface ? &present.frame : nullptr, present.sync_interval,
                                        present.surface ? present.allow_tearing : false);
-          else if ((metal_error || !current || !present.native_present_reserved) && present.observer)
+          else if (!presented && present.observer)
             present.observer.cancel(present.present_id);
           owned_graphics::Trace("present_native_decision", ",\"queue\":", queue_id,
                                 ",\"present_id\":", present.present_id,
@@ -1001,13 +1258,14 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       // A public fence completion is an allocator-retirement watermark too:
       // after the app observes it, Reset of every preceding allocator must be
       // immediately legal. Release all native and allocator leases first.
-      auto fence_completion = std::move(inflight.fence_completion);
+      auto fence_completions = std::move(inflight.fence_completions);
       if (!metal_error)
         for (const auto &breadcrumb : inflight.breadcrumbs) device_->diagnostics.Complete(breadcrumb);
       inflight = {};
       submission_ring_.retire(internal_seq);
-      if (fence_completion && device_->RemovedReason() == S_OK)
-        fence_completion->fence->markQueueSignalCompleted(fence_completion->ticket);
+      if (device_->RemovedReason() == S_OK)
+        for (auto &completion : fence_completions)
+          completion.fence->markQueueSignalCompleted(completion.ticket);
 
       internal_seq++;
     }
@@ -1061,10 +1319,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         inflight.reflex_driver_end = ReflexState::NowUs();
         inflight.reflex_queue_start = inflight.reflex_driver_end;
       }
+      inflight.cpu_submit_ns = owned_graphics::NowNs();
       inflight.submission = queue->device_->CommitMetal4CommandBuffers(queue->queue_, &buffer, 1);
       if (signal_event)
         queue->queue_.signalEvent(signal_event, signal_value);
-      owned_graphics::Trace("submit", ",\"queue\":", queue->owned_id_, ",\"submission\":", seq);
+      owned_graphics::Trace("submit", ",\"queue\":", queue->owned_id_, ",\"submission\":", seq,
+                            ",\"cpu_submit_ns\":", inflight.cpu_submit_ns);
       queue->submission_ring_.publish(seq);
     }
   };
@@ -1074,26 +1334,79 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     return CommittingScope(this);
   }
 
+  void ProcessTask(QueueTask &task) {
+    if (cancel_unsubmitted_) {
+      if (auto *present = std::get_if<PresentTask>(&task))
+        CancelPresent(*present);
+      else if (auto *wait = std::get_if<WaitTask>(&task))
+        wait->fence->cancelQueueWait(wait->ticket);
+    } else if (device_->RemovedReason() == S_OK) {
+      try {
+        std::visit([this](auto &typed) { this->Process(typed); }, task);
+      } catch (HRESULT reason) {
+        device_->ReportRemoval(reason);
+        if (auto *present = std::get_if<PresentTask>(&task)) CancelPresent(*present);
+      }
+    } else if (auto *present = std::get_if<PresentTask>(&task)) {
+      CancelPresent(*present);
+    }
+  }
+
   void
   SubmissionThread() {
     env::setThreadName("dxmt-d3d12-submit-thread");
     QueueTask task;
-    while (task_fifo_.waitPop(task)) {
-      if (cancel_unsubmitted_) {
-        if (auto *present = std::get_if<PresentTask>(&task))
-          CancelPresent(*present);
-        else if (auto *wait = std::get_if<WaitTask>(&task))
-          wait->fence->cancelQueueWait(wait->ticket);
-      } else if (device_->RemovedReason() == S_OK) {
+    std::optional<QueueTask> pending_task;
+    while (pending_task || task_fifo_.waitPop(task)) {
+      if (pending_task) {
+        task = std::move(*pending_task);
+        pending_task.reset();
+      }
+      if (auto *signal = std::get_if<SignalTask>(&task);
+          signal && !cancel_unsubmitted_ && device_->RemovedReason() == S_OK) {
         try {
-          std::visit([this](auto &typed) { this->Process(typed); }, task);
+          std::vector<SignalTask> signals;
+          signals.push_back(std::move(*signal));
+          QueueTask next;
+          while (task_fifo_.tryPop(next)) {
+            if (auto *next_signal = std::get_if<SignalTask>(&next))
+              signals.push_back(std::move(*next_signal));
+            else {
+              pending_task = std::move(next);
+              break;
+            }
+          }
+          ProcessSignalBatch(signals);
+        } catch (const std::bad_alloc &) {
+          device_->ReportRemoval(E_OUTOFMEMORY);
         } catch (HRESULT reason) {
           device_->ReportRemoval(reason);
-          if (auto *present = std::get_if<PresentTask>(&task)) CancelPresent(*present);
         }
+      } else if (auto *execute = std::get_if<ExecuteTask>(&task);
+                 execute && !cancel_unsubmitted_ && device_->RemovedReason() == S_OK) {
+        // beta3 FoldedSignal: signals already queued behind an Execute ride its
+        // final commit. Any other task ends the run and is processed next.
+        std::vector<SignalTask> signals;
+        try {
+          QueueTask next;
+          while (task_fifo_.tryPop(next)) {
+            if (auto *next_signal = std::get_if<SignalTask>(&next))
+              signals.push_back(std::move(*next_signal));
+            else {
+              pending_task = std::move(next);
+              break;
+            }
+          }
+          ProcessExecute(*execute, &signals, &pending_task);
+          if (!signals.empty()) ProcessSignalBatch(signals);
+        } catch (const std::bad_alloc &) {
+          device_->ReportRemoval(E_OUTOFMEMORY);
+        } catch (HRESULT reason) {
+          device_->ReportRemoval(reason);
+        }
+      } else {
+        ProcessTask(task);
       }
-      else if (auto *present = std::get_if<PresentTask>(&task))
-        CancelPresent(*present);
       // Release allocator/fence/presenter/resource references as soon as the
       // task has been encoded instead of retaining the last task while idle.
       task = ExecuteTask{};
@@ -1270,6 +1583,11 @@ public:
     fence_ = metal_device.newFence();
     if (!fence_)
       return E_FAIL;
+    clear_batch_label_ = WMT::MakeString("SubmissionClearBatch", WMTUTF8StringEncoding);
+    clear_pass_label_ = WMT::MakeString("ClearPass", WMTUTF8StringEncoding);
+    resolve_pass_label_ = WMT::MakeString("ResolvePass", WMTUTF8StringEncoding);
+    if (!clear_batch_label_ || !clear_pass_label_ || !resolve_pass_label_)
+      return E_OUTOFMEMORY;
     timestamp_order_event_ = metal_device.newEvent();
     if (!timestamp_order_event_)
       return E_FAIL;
@@ -4953,7 +5271,8 @@ public:
   }
 
   void
-  ProcessExecute(ExecuteTask &task) {
+  ProcessExecute(ExecuteTask &task, std::vector<SignalTask> *folded_signals = nullptr,
+                 std::optional<QueueTask> *pending_task = nullptr) {
     std::optional<CommittingScope> scope;
     struct AtomicPhasePermit {
       MTLD3D12CommandQueueImpl *queue;
@@ -5376,73 +5695,175 @@ public:
               node.access_complete = AppendSubmissionBuffer(node, device_, use.address, use.length, use.writes, use.stages ? use.stages : stages);
             }
           };
-          auto append_attachment = [&](const auto &attachment, uint8_t aspect) {
+          auto append_attachment = [&](const auto &attachment, uint8_t aspect, uint32_t samples, uint32_t layers) {
             if (!node.access_complete || !attachment.attachment) return;
             const auto *view = attachment.attachment.ptr();
+            const TextureViewRef *resolve = nullptr;
+            if constexpr (requires { attachment.resolve_attachment; })
+              if (attachment.resolve_attachment) resolve = &attachment.resolve_attachment;
+            const bool folded_resolve = resolve && samples > 1 &&
+                (attachment.store_action == WMTStoreActionStoreAndMultisampleResolve ||
+                 attachment.store_action == WMTStoreActionMultisampleResolve);
             if (view->castBlockSize || view->msaaSampleAddress || view->reservedCast || view->reservedVolumeRender ||
-                view->reservedVolumeAtlasCast || attachment.level || attachment.slice || attachment.depth_plane ||
-                attachment.store_action != WMTStoreActionStore ||
+                view->reservedVolumeAtlasCast ||
+                (resolve && !folded_resolve) ||
+                (!folded_resolve && attachment.store_action != WMTStoreActionStore &&
+                 attachment.store_action != WMTStoreActionDontCare) ||
                 (attachment.load_action != WMTLoadActionLoad && attachment.load_action != WMTLoadActionClear)) {
               node.access_complete = false; return;
             }
+            // Attachment level/slice are relative to the view. A layered pass
+            // renders from that slice to the end of the view; a 3D depth plane
+            // stays inside its mip, which the whole-mip span covers.
+            auto key = view->key;
+            if (attachment.level >= key.mip_end - key.mip_start ||
+                attachment.slice >= key.array_end - key.array_start) {
+              node.access_complete = false; return;
+            }
+            key.mip_start = key.mip_start + attachment.level;
+            key.mip_end = key.mip_start + 1;
+            key.array_start = key.array_start + attachment.slice;
+            if (layers <= 1) key.array_end = key.array_start + 1;
             node.access_complete = AppendSubmissionTexture(node, device_, view->allocation->descriptor,
-                view->allocation, view->key, aspect, true, true, WMTMetal4StageFragment);
+                view->allocation, key, aspect, true, true, WMTMetal4StageFragment, samples);
+            if (node.access_complete && folded_resolve) {
+              const auto *target = resolve->ptr();
+              node.access_complete = AppendSubmissionTexture(node, device_, target->allocation->descriptor,
+                  target->allocation, target->key, aspect, true, true, WMTMetal4StageFragment);
+            }
           };
           if (record->type == EncoderType::Render) {
             const auto &render = *static_cast<const RenderEncoderData *>(record);
-            node.rejection = fenced ? "fence_segment" : ReservedResource::AnyLive() ? "sparse_alias" :
-                OrdinaryRenderRejection(render, device_);
+            const uint32_t samples = render.native_msaa_sample_count ? render.native_msaa_sample_count : 1;
+            node.rejection = fenced ? "fence_segment" : OrdinaryRenderRejection(render, device_, true);
+            const char *merge_rejection = fenced ? nullptr : OrdinaryRenderRejection(render, device_);
             node.access_complete = !node.rejection;
             if (node.access_complete) append_buffers(render.submission_buffers, render_stages);
             if (node.access_complete) node.access_complete = ResolveSubmissionTables(plan, node, device_, render.submission_tables, render_stages);
             if (node.access_complete) node.access_complete = CollectStandardSwizzleTables(render.swizzle_tables).empty();
-            for (const auto &color : render.colors) append_attachment(color, 4);
-            append_attachment(render.depth, 1); append_attachment(render.stencil, 2);
+            if (node.access_complete && render.visibility_scratch)
+              node.access_complete = AppendSubmissionNativeBuffer(node, render.visibility_scratch, true,
+                  WMTMetal4StageFragment);
+            if (render.visibility_scratch) node.boundary_before = true;
+            if (node.access_complete)
+              for (const auto &target : render.visibility_targets)
+                if (!AppendSubmissionNativeBuffer(node, target.destination, true, WMTMetal4StageDispatch)) {
+                  node.access_complete = false;
+                  break;
+                }
+            const uint32_t layers = render.render_target_array_length;
+            for (const auto &color : render.colors) append_attachment(color, 4, samples, layers);
+            append_attachment(render.depth, 1, samples, layers); append_attachment(render.stencil, 2, samples, layers);
             // A shader-visible attachment feedback loop needs its own native
             // side-work proof; it cannot become an ordinary load/store group.
             for (const auto &attachment : node.accesses)
               if (attachment.attachment)
                 for (const auto &shader : node.accesses)
                   if (!shader.attachment && AccessOverlaps(attachment, shader)) node.access_complete = false;
-            if (!node.access_complete && !node.rejection) node.rejection = "access_or_side_work_unresolved";
+            for (const auto &color : render.colors)
+              // A resolve-only store leaves the multisample source undefined, like DONT_CARE.
+              if (color.attachment && (color.store_action == WMTStoreActionDontCare ||
+                                       color.store_action == WMTStoreActionMultisampleResolve))
+                node.boundary_before = node.boundary_after = true;
+            if ((render.depth.attachment && render.depth.store_action == WMTStoreActionDontCare) ||
+                (render.stencil.attachment && render.stencil.store_action == WMTStoreActionDontCare))
+              node.boundary_before = node.boundary_after = true;
+            if (render.render_pass_requires_fence) node.force_fence_before = true;
+            if (node.sparse_resource_used) node.rejection = "sparse_alias";
+            else if (!node.access_complete && !node.rejection) node.rejection = "access_or_side_work_unresolved";
+            // Descriptor-only restrictions keep exact accesses but never merge.
+            if (node.access_complete && !node.rejection) node.rejection = merge_rejection;
+            node.merge_eligible = node.access_complete && !node.rejection && samples == 1 &&
+                !render.visibility_scratch && render.visibility_targets.empty();
             owned_graphics::Trace("submission_render_candidate", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
                 ",\"list_ordinal\":", ordinal, ",\"node_ordinal\":", node.node_ordinal, ",\"encoder\":", record->id,
-                ",\"eligible\":", !node.rejection, ",\"reason\":\"", node.rejection ? node.rejection : "eligible", "\"");
+                ",\"eligible\":", node.merge_eligible, ",\"reason\":\"", node.rejection ? node.rejection : "eligible", "\"");
           } else if (record->type == EncoderType::Compute) {
             const auto &compute = *static_cast<const ComputeEncoderData *>(record);
             if (compute.submission_root_srv_opaque) node.rejection = "unresolved_root_srv";
             else if (compute.submission_snapshot_budget) node.rejection = "recorded_buffer_budget";
-            node.access_complete = !node.rejection && !fenced && !ReservedResource::AnyLive() && compute.submission_access_complete && !compute.atomic64_phase &&
+            node.access_complete = !node.rejection && !fenced && compute.submission_access_complete && !compute.atomic64_phase &&
                 compute.atomic64_indirect.empty() && !compute.atomic64_ray && compute.cast_textures.empty();
             if (node.access_complete) append_buffers(compute.submission_buffers, WMTMetal4StageDispatch);
             if (node.access_complete) node.access_complete = ResolveSubmissionTables(plan, node, device_, compute.submission_tables, WMTMetal4StageDispatch);
-            if (node.access_complete) node.access_complete = CollectStandardSwizzleTables(compute.swizzle_tables).empty();
+            if (node.access_complete) {
+              // Helper collection scans bound ranges, including shader-unused
+              // descriptors. Import/export touches every slice, not just the UAV view.
+              auto uses = CollectStandardSwizzleTables(compute.swizzle_tables);
+              for (auto &use : uses) {
+                if (use.resource || !use.msaa_texture || use.cast_view->castBlockSize ||
+                    use.cast_view->reservedVolumeRender || !use.descriptor_owner) {
+                  node.access_complete = false;
+                  break;
+                }
+                auto key = use.cast_view->key;
+                key.mip_start = key.array_start = 0;
+                key.mip_end = 1;
+                key.array_end = use.msaa_texture->arrayLength();
+                node.helper_passes = true;
+                if (!AppendSubmissionTexture(node, device_, use.msaa_texture, use.cast_allocation.ptr(), key,
+                    4, true, false, WMTMetal4StageDispatch | WMTMetal4StageFragment,
+                    use.msaa_texture->sampleCount())) {
+                  node.access_complete = false;
+                  break;
+                }
+                if (plan.descriptor_owner_ids.insert(use.descriptor_owner->owned_id).second)
+                  plan.descriptor_owners.push_back(std::move(use.descriptor_owner));
+              }
+            }
             for (auto *cmd = reinterpret_cast<const wmtcmd_base *>(&compute.cmd_head); node.access_complete && cmd;
                  cmd = static_cast<const wmtcmd_base *>(cmd->next.get_accessible_or_null()))
               if (cmd->type != WMTComputeCommandNop && cmd->type != WMTComputeCommandSetPSO &&
                   cmd->type != WMTComputeCommandSetBuffer && cmd->type != WMTComputeCommandUseResource &&
                   cmd->type != WMTComputeCommandDispatch) node.access_complete = false;
+            if (node.sparse_resource_used) node.rejection = "sparse_alias";
           } else if (record->type == EncoderType::Blit) {
             const auto &blit = *static_cast<const BlitEncoderData *>(record);
-            node.access_complete = !fenced && !ReservedResource::AnyLive() && blit.submission_access_complete &&
+            node.access_complete = !fenced && blit.submission_access_complete &&
                 blit.submission_buffers.size() == blit.submission_copy_count * 2;
             append_buffers(blit.submission_buffers, WMTMetal4StageBlit);
+            for (const auto &use : blit.submission_uploads) {
+              if (!node.access_complete) break;
+              node.access_complete = AppendSubmissionBuffer(node, device_, use.address, use.length, use.writes, WMTMetal4StageBlit);
+            }
+            for (const auto &use : blit.submission_textures) {
+              if (!node.access_complete) break;
+              const auto aspects = DepthStencilPlanarFlags(use.texture->pixelFormat());
+              node.access_complete = AppendSubmissionTexture(node, device_, use.texture.ptr(), use.texture->current(),
+                  use.key, aspects ? uint8_t(aspects) : uint8_t(4), use.writes, false, WMTMetal4StageBlit);
+            }
+            if (node.sparse_resource_used) node.rejection = "sparse_alias";
           } else if (record->type == EncoderType::Clear) {
             const auto &clear = *static_cast<const ClearEncoderData *>(record);
-            // Zero is the recording/descriptor sentinel for a nonlayered view.
-            node.access_complete = !clear.sample_positions.count && clear.array_length <= 1 && !fenced && !ReservedResource::AnyLive();
+            // Layered and programmable-sample clears replay natively in place
+            // (no batching), but their attachment writes are still tracked.
+            node.access_complete = !fenced;
             if (node.access_complete && !clear.folded_into_render && clear.attachment) {
               const auto *view = clear.attachment.ptr();
               node.access_complete &= !view->castBlockSize && !view->msaaSampleAddress && !view->reservedCast &&
                   !view->reservedVolumeRender && !view->reservedVolumeAtlasCast && !clear.depth_plane &&
-                  view->key.mip_end - view->key.mip_start == 1 && view->key.array_end - view->key.array_start == 1;
+                  view->key.mip_end - view->key.mip_start == 1;
               if (node.access_complete) node.access_complete = AppendSubmissionTexture(node, device_, view->allocation->descriptor,
                   view->allocation, view->key, clear.clear_dsv ? uint8_t(clear.clear_dsv) : uint8_t(4),
-                  true, true, WMTMetal4StageFragment);
+                  true, true, WMTMetal4StageFragment, view->allocation->descriptor->sampleCount());
+            }
+          } else if (record->type == EncoderType::Query) {
+            const auto &query = *static_cast<const QueryEncoderData *>(record);
+            node.access_complete = !fenced && query.op != QueryEncoderOp::AliasFlush;
+            if (node.access_complete) {
+              node.access_complete = AppendSubmissionNativeBuffer(node, query.counters, true, WMTMetal4StageDispatch);
+              node.access_complete &= AppendSubmissionNativeBuffer(node, query.source, true, WMTMetal4StageDispatch);
+              if (query.destination_allocation)
+                node.access_complete &= AppendSubmissionAllocation(node, query.destination_allocation.ptr(),
+                    query.destination_offset, uint64_t(query.query_count) * std::max<uint32_t>(query.record_bytes, 8u), true,
+                    WMTMetal4StageDispatch);
+              else
+                node.access_complete &= AppendSubmissionNativeBuffer(node, query.destination, true,
+                    WMTMetal4StageDispatch);
             }
           }
           if (record->endpoint_reason == RecordedEndpointReason::Opaque) node.boundary_after = true;
-          if (fenced || ReservedResource::AnyLive()) node.access_complete = false;
+          if (fenced || node.sparse_resource_used) node.access_complete = false;
           if (!node.access_complete) { node.accesses.clear(); node.access_slots.clear(); }
           if (!node.access_complete) owned_graphics::Trace("submission_access_opaque", ",\"submission\":", scope->seq,
               ",\"list_ordinal\":", ordinal, ",\"node_ordinal\":", node.node_ordinal, ",\"encoder\":", record->id,
@@ -5511,6 +5932,70 @@ public:
           }
           if (!observation && anchor->second + 1 < plan.nodes.size()) plan.nodes[anchor->second + 1].boundary_before = true;
         }
+        // A whole-surface AVERAGE ResolveSubresource recorded right after a
+        // native MSAA pass that stores its source folds into that pass as a
+        // StoreAndMultisampleResolve color store, removing the ResolvePass
+        // that reloads the samples. The source keeps its store: a standalone
+        // resolve cannot prove the samples are dead. Barriers between the
+        // two must be resource-scoped to the source or destination, which
+        // the attachment store order satisfies; the destination write joins
+        // the pass's tracked accesses so in-flight hazards still order it.
+        for (size_t index = list_begin; index + 1 < plan.nodes.size(); ++index) {
+          auto &producer = plan.nodes[index];
+          auto &consumer = plan.nodes[index + 1];
+          if (producer.record->type != EncoderType::Render || consumer.record->type != EncoderType::Resolve ||
+              !producer.access_complete || producer.boundary_after || consumer.boundary_before ||
+              producer.folded_resolve) continue;
+          const auto &render = *static_cast<const RenderEncoderData *>(producer.record);
+          const auto &resolve = *static_cast<const ResolveEncoderData *>(consumer.record);
+          if (render.native_msaa_sample_count < 2 || render.render_target_array_length > 1 || resolve.pipeline ||
+              resolve.dsv_flags || !resolve.src || !resolve.dst) continue;
+          const auto *source = resolve.src.ptr();
+          const auto *target = resolve.dst.ptr();
+          auto source_texture = resolve.src.texture();
+          if (target->castBlockSize || target->msaaSampleAddress || target->reservedCast || target->reservedVolumeRender ||
+              target->reservedVolumeAtlasCast || target->key.mip_end - target->key.mip_start != 1 ||
+              target->key.array_end - target->key.array_start != 1 ||
+              source_texture.width() != render.render_target_width || source_texture.height() != render.render_target_height ||
+              resolve.dst.texture().pixelFormat() != source_texture.pixelFormat()) continue;
+          unsigned slot = 8;
+          for (unsigned i = 0; i < render.render_target_count && slot == 8; ++i) {
+            const auto &color = render.colors[i];
+            if (color.attachment && !color.buffer_attachment && !color.resolve_attachment &&
+                color.store_action == WMTStoreActionStore && !color.level && !color.slice && !color.depth_plane &&
+                color.attachment->allocation == source->allocation && color.attachment->key.mip_start == source->key.mip_start &&
+                color.attachment->key.mip_end == source->key.mip_end &&
+                color.attachment->key.array_start == source->key.array_start &&
+                color.attachment->key.array_end == source->key.array_end &&
+                color.attachment.texture().pixelFormat() == source_texture.pixelFormat())
+              slot = i;
+          }
+          if (slot == 8) continue;
+          SubmissionAccess written{target->allocation, 0, 0, uint32_t(target->key.mip_start), uint32_t(target->key.mip_end),
+              uint32_t(target->key.array_start), uint32_t(target->key.array_end), 4, true, true, WMTMetal4StageFragment};
+          bool scoped = true;
+          for (const auto *observations : {&producer.scopes_after, &consumer.scopes_before})
+            for (const auto &observation : *observations)
+              scoped &= observation.allocation == source->allocation || observation.allocation == target->allocation;
+          // The pass must not read or write the destination itself.
+          for (const auto &access : producer.accesses) scoped &= !AccessOverlaps(access, written);
+          if (!scoped) continue;
+          const auto rejection = producer.rejection;
+          const bool sparse = producer.sparse_resource_used;
+          if (!AppendSubmissionTexture(producer, device_, target->allocation->descriptor, target->allocation, target->key,
+                                       4, true, true, WMTMetal4StageFragment)) {
+            producer.rejection = rejection;
+            producer.sparse_resource_used = sparse;
+            continue;
+          }
+          producer.folded_resolve = SubmissionNode::FoldedResolve{slot, resolve.dst};
+          // The folded record encodes nothing; its accesses moved into the pass.
+          consumer.access_complete = true;
+          consumer.resolve_folded_into_previous = true;
+          consumer.scopes_before.clear();
+          owned_graphics::Trace("resolve_folded_standalone", ",\"submission\":", scope->seq, ",\"encoder\":", render.id,
+                                ",\"resolve\":", resolve.id, ",\"slot\":", slot);
+        }
       }
       std::list<std::pair<size_t, uint8_t>> pending_clears;
       using PendingIterator = decltype(pending_clears)::iterator;
@@ -5547,7 +6032,8 @@ public:
           for (auto it = pending_clears.begin(); it != pending_clears.end();) {
             const auto &data = *static_cast<const ClearEncoderData *>(plan.nodes[it->first].record);
             const auto aspect = it->second;
-            bool compatible = data.width == first.width && data.height == first.height && data.array_length == first.array_length;
+            bool compatible = data.width == first.width && data.height == first.height && data.array_length == first.array_length &&
+                data.attachment->allocation->descriptor->sampleCount() == first.attachment->allocation->descriptor->sampleCount();
             if (aspect == 4) compatible &= colors < 8;
             if (aspect == 1) compatible &= !batch.descriptor.depth.texture;
             if (aspect == 2) compatible &= !batch.descriptor.stencil.texture;
@@ -5583,11 +6069,16 @@ public:
         // ponytail: 64-source-node planning partitions bound frontier scans.
         // Establish them before clear promotion so no replay group or delayed
         // clear can cross discarded history; original native fences remain.
-        if (index && index % kSubmissionGroupBudget == 0) node.boundary_before = true;
+        if (index && index % kSubmissionGroupBudget == 0 && !node.boundary_before)
+          node.boundary_before = node.partition_before = true;
         if (node.boundary_before || !node.scopes_before.empty() || !node.access_complete) flush_clears(node.clears_before);
         if (node.record->type == EncoderType::Clear && node.access_complete) {
           const auto &clear = *static_cast<const ClearEncoderData *>(node.record);
-          if (!clear.folded_into_render) {
+          // Zero is the recording/descriptor sentinel for a nonlayered view.
+          const bool batchable = !clear.sample_positions.count && clear.array_length <= 1 && clear.attachment &&
+              clear.attachment->key.array_end - clear.attachment->key.array_start == 1;
+          if (!batchable) flush_clears(node.clears_before);
+          if (batchable && !clear.folded_into_render) {
             node.skip_clear = true;
             // Bound compatible-batch exploration; larger windows materialize
             // conservatively rather than retaining an unbounded clear scan.
@@ -5612,7 +6103,8 @@ public:
             }
           }
         } else if (!pending_clears.empty()) {
-          if (node.record->type == EncoderType::Render && !node.rejection && node.access_complete) {
+          if (node.record->type == EncoderType::Render && !node.rejection && node.access_complete &&
+              !static_cast<const RenderEncoderData *>(node.record)->native_msaa_sample_count) {
             const auto &render = *static_cast<const RenderEncoderData *>(node.record);
             RenderReplayGroup trial;
             std::array<uint8_t, 8> first_map;
@@ -5645,6 +6137,7 @@ public:
               }
               if (absorbed) {
                 trial.members.push_back(index);
+                trial.force_fence_before = node.force_fence_before;
                 for (const auto &access : node.accesses) trial.stages |= access.stages;
                 node.group = plan.groups.size(); plan.groups.push_back(std::move(trial));
               }
@@ -5674,6 +6167,8 @@ public:
       size_t partition = 0;
       for (size_t index = 0; index < plan.nodes.size(); ++index) {
         auto &node = plan.nodes[index];
+        if (index && (!plan.nodes[index - 1].access_complete || plan.nodes[index - 1].boundary_after))
+          node.boundary_before = true, node.partition_before = false;
         if (node.boundary_before || !node.access_complete) { history.clear(); partition = index; }
         std::unordered_map<size_t, size_t> edge_slots;
         for (const auto &access : node.accesses) {
@@ -5714,7 +6209,7 @@ public:
             frontier.writers.push_back({index, access});
           } else frontier.readers.push_back({index, access});
         }
-        if (node.record->type == EncoderType::Render && !node.rejection && node.access_complete &&
+        if (node.record->type == EncoderType::Render && node.merge_eligible &&
             !node.boundary_before && node.clears_before.empty() && node.group == SIZE_MAX) {
           size_t attempts = 0;
           // ponytail: bounded candidates/source span and 64-member groups; a
@@ -5723,7 +6218,7 @@ public:
           for (size_t candidate = index; candidate-- > lower;) {
             auto &prior = plan.nodes[candidate];
             if (prior.boundary_after || !prior.access_complete) break;
-            if (prior.record->type != EncoderType::Render || prior.rejection) continue;
+            if (prior.record->type != EncoderType::Render || !prior.merge_eligible) continue;
             if (attempts++ == kSubmissionCandidateBudget) break;
             ++plan.candidate_checks;
             const auto *existing = prior.group == SIZE_MAX ? nullptr : &plan.groups[prior.group];
@@ -5738,8 +6233,7 @@ public:
               // TBDR cannot complete Fragment inside the same render pass.
               // The proven ordinary inline family is Vertex -> Vertex only;
               // other nonattachment dependencies retain store/load + fences.
-              if (internal && !dependency.attachment_only &&
-                  (dependency.before != WMTMetal4StageVertex || dependency.after != WMTMetal4StageVertex)) commute = false;
+              if (internal && !InlineRenderDependencySafe(dependency)) commute = false;
             }
             for (size_t crossed = leader + 1; commute && crossed < index; ++crossed)
               if (plan.nodes[crossed].boundary_before || plan.nodes[crossed].boundary_after ||
@@ -5791,6 +6285,7 @@ public:
             for (const auto &access : prior.accesses) trial.stages |= access.stages;
             if (!existing) {
               trial.members.push_back(candidate); trial.color_maps.push_back(first_map);
+              trial.force_fence_before = plan.nodes[candidate].force_fence_before;
               prior.group = plan.groups.size(); plan.groups.push_back(std::move(trial));
             } else {
               auto &group = plan.groups[prior.group];
@@ -5798,8 +6293,11 @@ public:
               group.depth = std::move(trial.depth); group.stencil = std::move(trial.stencil);
               group.color_count = trial.color_count; group.needs_unbound_slot = trial.needs_unbound_slot;
               group.stages = trial.stages;
+              group.force_fence_before |= trial.force_fence_before;
             }
-            auto &group = plan.groups[prior.group]; group.members.push_back(index); group.color_maps.push_back(map);
+            auto &group = plan.groups[prior.group];
+            group.members.push_back(index); group.color_maps.push_back(map);
+            group.force_fence_before |= node.force_fence_before;
             node.group = prior.group;
             owned_graphics::Trace("submission_render_merged", ",\"submission\":", scope->seq, ",\"group\":", node.group,
                 ",\"before_list\":", prior.list_ordinal, ",\"after_list\":", node.list_ordinal,
@@ -5819,16 +6317,45 @@ public:
       device_->ReportRemoval(DXGI_ERROR_DEVICE_REMOVED);
       return;
     }
+    // A batch whose member clears are all tracked records their attachment
+    // writes as in-flight accesses. It waits only for conflicting tracked
+    // stages (or nothing), and consumers see its writes through the same
+    // in-flight check. An untracked neighbor already reset tracking.
     auto emit_clear_batches = [&](const std::vector<size_t> &batches) {
       for (const auto batch_index : batches) {
         auto &batch = plan.clear_batches[batch_index];
+        std::vector<SubmissionAccess> accesses;
+        bool tracked = true;
+        for (const auto &[member, aspect] : batch.members) {
+          const auto &clear_node = plan.nodes[member];
+          tracked &= clear_node.access_complete;
+          for (auto access : clear_node.accesses) { access.aspects &= aspect; if (access.aspects) accesses.push_back(access); }
+        }
+        uint64_t hazard = WMTMetal4StageAll;
+        if (tracked) {
+          hazard = InflightHazard(accesses);
+          RecordInflightAccesses(accesses, 0, ProducerStages(EncoderType::Clear));
+        } else {
+          MarkUntracked(UINT64_MAX);
+        }
+        if (hazard == WMTMetal4StageAll) DrainSkippedWork(scope->inflight.cmdbuf, scope->seq);
+        else BreakFenceChain();
         auto encoder = scope->inflight.cmdbuf.renderCommandEncoder(batch.descriptor);
         owned_graphics::Trace("native_clear_begin", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
             ",\"members\":", batch.members.size(), ",\"begin_count\":1");
-        encoder.setLabel(WMT::String::string("SubmissionClearBatch", WMTUTF8StringEncoding));
-        encoder.waitForFence(fence_, WMTRenderStageFragment);
-        owned_graphics::Trace("native_clear_wait", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
-            ",\"stages\":", uint32_t(WMTRenderStageFragment), ",\"wait_count\":1");
+        encoder.setLabel(clear_batch_label_);
+        if (hazard == WMTMetal4StageAll) {
+          encoder.waitForFence(fence_, WMTRenderStageFragment);
+          owned_graphics::Trace("native_clear_wait", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
+              ",\"stages\":", uint32_t(WMTRenderStageFragment), ",\"wait_count\":1");
+        } else if (hazard) {
+          encoder.barrierAfterQueueStages(hazard, uint64_t(WMTRenderStageFragment), WMTMetal4VisibilityDevice);
+          owned_graphics::Trace("native_clear_queue_barrier", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
+              ",\"after\":", hazard, ",\"barrier_count\":1");
+        } else {
+          owned_graphics::Trace("native_fence_wait_skipped", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
+              ",\"reason\":\"no_known_hazard\",\"skip_count\":1");
+        }
         for (const auto &[node, aspect] : batch.members)
           owned_graphics::Trace("native_clear_load", ",\"submission\":", scope->seq, ",\"batch\":", batch_index,
               ",\"node\":", node, ",\"aspect\":", uint32_t(aspect), ",\"clear_count\":1");
@@ -5875,15 +6402,76 @@ public:
           return;
         const RenderReplayGroup *replay_group = nullptr;
         const SubmissionNode *replay_current_node = nullptr;
+        bool native_fence_required = true;
+        uint64_t consumer_barrier_after = 0;
         if (current->type != EncoderType::Null) {
           const auto index = replay_node++;
           const auto &node = plan.nodes[index];
           assert(node.record == current);
           replay_current_node = &node;
+          if (node.resolve_folded_into_previous) {
+            // Encoded by the preceding pass's resolve store.
+            emit_clear_batches(node.clears_before);
+            current = current->next;
+            continue;
+          }
+          if (node.group != SIZE_MAX) replay_group = &plan.groups[node.group];
+          // Skip the queue fence only when no tracked in-flight access (this
+          // or an earlier submission) overlaps and no untracked work may still
+          // run. Grouped members replay inside the leader's encoder. A boundary
+          // (alias/global barrier, opaque neighbor, DISCARD, partition) orders
+          // memory allocation identity cannot describe, so it resets tracking.
+          // A planner partition orders nothing: earlier nodes stay recorded as
+          // in-flight accesses, and the hazard check covers them instead.
+          const bool ordering_boundary = node.boundary_before && !node.partition_before;
+          if (!node.access_complete || ordering_boundary) MarkUntracked(UINT64_MAX);
+          // Deferred clears encode first and record their writes in flight,
+          // so this node's hazard check below orders it after them.
           emit_clear_batches(node.clears_before);
+          uint64_t inflight_stages = WMTMetal4StageAll;
+          if (node.access_complete && (node.group == SIZE_MAX || replay_group->members.front() == index)) {
+            // Earlier nodes of this submission are recorded in flight too, so
+            // a same-submission dependency is one of these hazards. A
+            // resource-scoped barrier orders the same way as a write to its
+            // resource; it is checked but never recorded as GPU work.
+            const auto check = [&](std::span<const SubmissionAccess> accesses) { inflight_stages |= InflightHazard(accesses); };
+            inflight_stages = 0;
+            if (replay_group) {
+              for (const auto member : replay_group->members) check(plan.nodes[member].accesses);
+            } else {
+              check(node.accesses);
+            }
+            check(node.scopes_before);
+            const auto record = [&](const SubmissionNode &member) {
+              RecordInflightAccesses(member.accesses, HelperStages(member), ProducerStages(member.record->type));
+            };
+            if (replay_group) {
+              for (const auto member : replay_group->members) record(plan.nodes[member]);
+            } else {
+              record(node);
+            }
+          }
+          native_fence_required = !node.access_complete || inflight_stages == WMTMetal4StageAll || ordering_boundary ||
+              node.helper_passes ||
+              node.force_fence_before || (replay_group && replay_group->force_fence_before);
+          // Only render, blit, compute and in-place clear replay honor a
+          // skipped wait; every other emitted encoder waits on the fence
+          // itself and needs the drain.
+          if (!node.skip_clear && node.record->type != EncoderType::Render && node.record->type != EncoderType::Clear &&
+              node.record->type != EncoderType::Blit && node.record->type != EncoderType::Compute)
+            native_fence_required = true;
+          // A conflict only with tracked in-flight work of known producer
+          // stages waits for those stages through a consumer queue barrier
+          // instead of the queue-wide fence chain (D3DMetal ResolveBarriers).
+          if (!native_fence_required) consumer_barrier_after = inflight_stages;
+          if (native_fence_required) DrainSkippedWork(scope->inflight.cmdbuf, scope->seq);
+          else BreakFenceChain();
+          if (!native_fence_required)
+            owned_graphics::Trace("native_fence_wait_skipped", ",\"submission\":", scope->seq,
+                ",\"encoder\":", current->id, ",\"reason\":\"", consumer_barrier_after ? "queue_barrier" : "no_known_hazard",
+                "\",\"skip_count\":1");
           if (node.skip_clear) { current = current->next; continue; }
           if (node.group != SIZE_MAX) {
-            replay_group = &plan.groups[node.group];
             if (replay_group->members.front() != index) {
               current = current->next;
               continue;
@@ -6566,9 +7154,15 @@ public:
             WMT::SetRenderTargetArrayLength(info, data->array_length);
             auto encoder = cmdbuf.renderCommandEncoder(info);
             owned_graphics::Trace("native_clear_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"members\":1,\"begin_count\":1");
-            encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
-            encoder.waitForFence(fence_, WMTRenderStageFragment);
-            owned_graphics::Trace("native_clear_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"wait_count\":1");
+            encoder.setLabel(clear_pass_label_);
+            if (native_fence_required) {
+              encoder.waitForFence(fence_, WMTRenderStageFragment);
+              owned_graphics::Trace("native_clear_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"wait_count\":1");
+            } else if (consumer_barrier_after) {
+              encoder.barrierAfterQueueStages(consumer_barrier_after, uint64_t(WMTRenderStageFragment), WMTMetal4VisibilityDevice);
+              owned_graphics::Trace("native_clear_queue_barrier", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                  ",\"after\":", consumer_barrier_after, ",\"barrier_count\":1");
+            }
             for (uint8_t aspect : {uint8_t(1), uint8_t(2), uint8_t(4)})
               if ((data->clear_dsv ? data->clear_dsv : 4) & aspect)
                 owned_graphics::Trace("native_clear_load", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
@@ -6751,6 +7345,17 @@ public:
             render_pass_info.render_target_height = data->render_target_height;
             render_pass_info.visibility_buffer = data->visibility_scratch;
           }
+          if (replay_current_node && replay_current_node->folded_resolve) {
+            const auto &folded = *replay_current_node->folded_resolve;
+            auto &color_info = render_pass_info.colors[folded.slot];
+            color_info.store_action = WMTStoreActionStoreAndMultisampleResolve;
+            color_info.resolve_texture = folded.target.texture();
+            color_info.resolve_level = 0;
+            color_info.resolve_slice = 0;
+            color_info.resolve_depth_plane = 0;
+            owned_graphics::Trace("native_resolve_folded", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                                  ",\"slot\":", folded.slot, ",\"resolve_pass_elided\":1");
+          }
           if (data->native_msaa_sample_count) {
             if (data->submission_tables) {
               bool bindings_safe = true;
@@ -6789,7 +7394,13 @@ public:
             bool valid = !data->msaa_draw && !data->dsv_descriptor_flags &&
                 safe_view(data->depth.attachment) && safe_view(data->stencil.attachment);
             for (const auto &color : data->colors)
-              valid &= safe_view(color.attachment) && !color.buffer_attachment && !color.resolve_attachment;
+              valid &= safe_view(color.attachment) && !color.buffer_attachment &&
+                  (!color.resolve_attachment ||
+                   ((color.store_action == WMTStoreActionStoreAndMultisampleResolve ||
+                     color.store_action == WMTStoreActionMultisampleResolve) &&
+                    !color.resolve_attachment->allocation->canonicalHeap &&
+                    !color.resolve_attachment->allocation->flags().test(TextureAllocationFlag::PlacementSparse) &&
+                    color.resolve_attachment->allocation->descriptor->sampleCount() == 1));
             if (!valid) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
           }
           std::array<WMT::Texture, 8> rov_markers{};
@@ -6837,18 +7448,31 @@ public:
             owned_graphics::Trace("native_clear_load", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"aspect\":1,\"clear_count\":1");
           if (render_pass_info.stencil.texture && render_pass_info.stencil.load_action == WMTLoadActionClear)
             owned_graphics::Trace("native_clear_load", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"aspect\":2,\"clear_count\":1");
+          // One encodeCommands chain instead of a unix call per useResource; the
+          // native walker applies the nodes in this same order.
+          std::vector<wmtcmd_render_useresource> resource_uses;
+          auto use_resource = [&](WMT::Resource resource, WMTResourceUsage usage) {
+            wmtcmd_render_useresource &command = resource_uses.emplace_back();
+            command.type = WMTRenderCommandUseResource;
+            command.resource = resource;
+            command.usage = usage;
+            command.stages = WMTRenderStageVertex | WMTRenderStageFragment | WMTRenderStageObject | WMTRenderStageMesh;
+          };
           for (const auto &use : swizzle_uses) {
             if (!use.cast_view) continue;
             const auto usage = use.writes ? WMTResourceUsageRead | WMTResourceUsageWrite : WMTResourceUsageRead;
             if (use.cast_view->castBlockSize)
-              encoder.useResource(use.cast_view->texture, usage, WMTRenderStageVertex | WMTRenderStageFragment | WMTRenderStageObject | WMTRenderStageMesh);
+              use_resource(use.cast_view->texture, usage);
             if (use.cast_view->msaaSampleAddress) {
-              encoder.useResource(use.cast_view->msaaSampleIds, WMTResourceUsageRead,
-                  WMTRenderStageVertex | WMTRenderStageFragment | WMTRenderStageObject | WMTRenderStageMesh);
+              use_resource(use.cast_view->msaaSampleIds, WMTResourceUsageRead);
               for (uint32_t sample = 0; sample < use.cast_view->allocation->descriptor->sampleCount(); ++sample)
-                encoder.useResource(use.cast_view->msaaViews[sample], usage,
-                    WMTRenderStageVertex | WMTRenderStageFragment | WMTRenderStageObject | WMTRenderStageMesh);
+                use_resource(use.cast_view->msaaViews[sample], usage);
             }
+          }
+          if (!resource_uses.empty()) {
+            for (size_t i = 0; i < resource_uses.size(); ++i)
+              resource_uses[i].next.set(i + 1 < resource_uses.size() ? &resource_uses[i + 1] : nullptr);
+            encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(resource_uses.data()));
           }
           // Object/mesh (GS/HS/DS) functions read resources earlier writers produced.
           const bool mesh_pass = data->use_geometry || data->use_tessellation;
@@ -6856,11 +7480,20 @@ public:
           if (replay_current_node && replay_current_node->access_complete) {
             uint64_t stages = replay_group ? replay_group->stages : 0;
             for (const auto &access : replay_current_node->accesses) stages |= access.stages;
-            wait_stages = WMTRenderStages(stages & (WMTMetal4StageVertex | WMTMetal4StageFragment));
+            constexpr uint64_t render_stage_mask = WMTMetal4StageVertex | WMTMetal4StageFragment |
+                WMTMetal4StageTile | WMTMetal4StageObject | WMTMetal4StageMesh;
+            const auto selected_stages = stages & render_stage_mask;
+            if (selected_stages) wait_stages = WMTRenderStages(selected_stages);
           }
-          encoder.waitForFence(fence_, wait_stages);
-          owned_graphics::Trace("native_render_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
-              ",\"stages\":", uint32_t(wait_stages), ",\"wait_count\":1");
+          if (native_fence_required) {
+            encoder.waitForFence(fence_, wait_stages);
+            owned_graphics::Trace("native_render_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                ",\"stages\":", uint32_t(wait_stages), ",\"wait_count\":1");
+          } else if (consumer_barrier_after) {
+            encoder.barrierAfterQueueStages(consumer_barrier_after, uint64_t(wait_stages), WMTMetal4VisibilityDevice);
+            owned_graphics::Trace("native_render_queue_barrier", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                ",\"after\":", consumer_barrier_after, ",\"before\":", uint32_t(wait_stages), ",\"barrier_count\":1");
+          }
           for (uint32_t i = 0; i < data->rov_marker_sample_count; ++i) {
             encoder.setFragmentTexture(rov_markers[i], 31 + i);
             encoder.useResource(rov_markers[i], WMTResourceUsageRead | WMTResourceUsageWrite,
@@ -7194,8 +7827,14 @@ public:
           auto data = static_cast<BlitEncoderData *>(current);
           auto encoder = cmdbuf.blitCommandEncoder();
           owned_graphics::Trace("native_blit_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"begin_count\":1");
-          encoder.waitForFence(fence_);
-          owned_graphics::Trace("native_blit_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"wait_count\":1");
+          if (native_fence_required) {
+            encoder.waitForFence(fence_);
+            owned_graphics::Trace("native_blit_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"wait_count\":1");
+          } else if (consumer_barrier_after) {
+            encoder.barrierAfterQueueStages(consumer_barrier_after, WMTMetal4StageBlit, WMTMetal4VisibilityDevice);
+            owned_graphics::Trace("native_blit_queue_barrier", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                ",\"after\":", consumer_barrier_after, ",\"before\":", uint64_t(WMTMetal4StageBlit), ",\"barrier_count\":1");
+          }
           encoder.encodeCommands(&data->cmd_head);
           owned_graphics::Trace("native_blit_encode", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"encode_count\":1");
           encoder.updateFence(fence_);
@@ -7366,8 +8005,14 @@ public:
           }
           auto encoder = cmdbuf.computeCommandEncoder(false);
           owned_graphics::Trace("native_compute_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"begin_count\":1");
-          encoder.waitForFence(fence_);
-          owned_graphics::Trace("native_compute_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"wait_count\":1");
+          if (native_fence_required) {
+            encoder.waitForFence(fence_);
+            owned_graphics::Trace("native_compute_wait", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"wait_count\":1");
+          } else if (consumer_barrier_after) {
+            encoder.barrierAfterQueueStages(consumer_barrier_after, WMTMetal4StageDispatch, WMTMetal4VisibilityDevice);
+            owned_graphics::Trace("native_compute_queue_barrier", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+                ",\"after\":", consumer_barrier_after, ",\"before\":", uint64_t(WMTMetal4StageDispatch), ",\"barrier_count\":1");
+          }
           for (const auto &use : swizzle_uses) {
             if (!use.cast_view) continue;
             wmtcmd_compute_useresource declaration{};
@@ -7415,6 +8060,7 @@ public:
             return;
           auto temporal_cmdbuf = scope->inflight.cmdbuf;
           if (data->fg_frame) scope->inflight.frame_generation_frames.push_back(data->fg_frame);
+          else if (data->rr_frame) scope->inflight.ray_regeneration_frames.push_back(data->rr_frame);
           else scope->inflight.temporal_frames.push_back(data->frame);
           std::vector<SwizzlePassResource> swizzle_uses;
           if (device_->HasStandardSwizzleTextures()) {
@@ -7424,6 +8070,12 @@ public:
                 if (resources[i] && resources[i]->swizzle_layout)
                   AppendStandardResource(swizzle_uses, Com<MTLD3D12Resource, false>(resources[i]),
                       IsOwnedFrameGenerationOutput(data->fg_frame, i));
+            } else if (data->rr_frame) {
+              const auto resources = GetOwnedRayRegenerationResources(data->rr_frame);
+              for (size_t i = 0; i < resources.size(); ++i)
+                if (resources[i] && resources[i]->swizzle_layout)
+                  AppendStandardResource(swizzle_uses, Com<MTLD3D12Resource, false>(resources[i]),
+                      IsOwnedRayRegenerationOutput(i));
             } else {
               const auto resources = GetOwnedTemporalFrameResources(data->frame);
               for (size_t i = 0; i < resources.size(); ++i)
@@ -7442,6 +8094,7 @@ public:
             scope.reset();
           };
           if (data->fg_frame) EncodeOwnedFrameGenerationFrame(data->fg_frame, temporal_cmdbuf, fence_, wait, signal);
+          else if (data->rr_frame) EncodeOwnedRayRegenerationFrame(data->rr_frame, temporal_cmdbuf, fence_, wait, signal);
           else EncodeOwnedTemporalFrame(data->frame, temporal_cmdbuf, fence_, owned_id_, scope->seq, current->id, wait, signal);
           // Reacquire the device submission lock only after the feature mutex
           // has been released, preserving device-lock then feature-lock order.
@@ -7495,7 +8148,7 @@ public:
 
           auto encoder = cmdbuf.renderCommandEncoder(info);
           encoder.waitForFence(fence_, WMTRenderStageFragment);
-          encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
+          encoder.setLabel(resolve_pass_label_);
           if (data->pipeline) {
             encoder.setRenderPipelineState(data->pipeline);
             if (data->depth_stencil_state)
@@ -7754,10 +8407,44 @@ public:
       scope->inflight.breadcrumbs.push_back(list.breadcrumb);
     }
     emit_clear_batches(plan.tail_clears);
+    // A skipped fence wait stays outstanding across this Execute: the next
+    // fence waiter (a later replay node or Present) drains it first.
+    if (scope) SealInflightAccesses(scope->seq);
     if (fenced && !task.lists.empty()) {
       const auto &last = task.lists.back();
       const auto count = static_cast<RecordingHead *>(last.entry)->state_events.size();
       if (!validate_transitions(&last, count, count, true)) return;
+    }
+    // Signals queued directly behind this Execute retire with its last command
+    // buffer instead of an empty submission; completion order is unchanged.
+    // Signals enqueued while it encoded fold too when the earlier lookahead
+    // found no other task in between: only immediately adjacent signals are
+    // taken, and the first other task stays next in FIFO order.
+    if (folded_signals && pending_task && !*pending_task && scope && !cancel_unsubmitted_ &&
+        device_->RemovedReason() == S_OK) {
+      QueueTask next;
+      while (task_fifo_.tryPop(next)) {
+        if (auto *next_signal = std::get_if<SignalTask>(&next)) {
+          folded_signals->push_back(std::move(*next_signal));
+        } else {
+          *pending_task = std::move(next);
+          break;
+        }
+      }
+    }
+    if (folded_signals && scope && device_->RemovedReason() == S_OK) {
+      auto &completions = scope->inflight.fence_completions;
+      completions.reserve(completions.size() + folded_signals->size());
+      for (auto &signal : *folded_signals) {
+        owned_graphics::Trace("signal", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
+                              ",\"fence\":", signal.fence_id, ",\"value\":", signal.ticket.value,
+                              ",\"generation\":", signal.ticket.generation, ",\"folded\":1");
+        owned_graphics::Trace("signal_committed", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
+                              ",\"fence\":", signal.fence_id, ",\"value\":", signal.ticket.value,
+                              ",\"generation\":", signal.ticket.generation, ",\"folded\":1");
+        completions.push_back(std::move(signal));
+      }
+      folded_signals->clear();
     }
   };
 
@@ -7953,29 +8640,52 @@ public:
   void STDMETHODCALLTYPE EndEvent() { EnqueueAnnotation(2, 0, nullptr, 0); }
 
   void
-  ProcessSignal(SignalTask &task) {
+  ProcessSignalBatch(std::vector<SignalTask> &tasks) {
     if (device_->RemovedReason() != S_OK)
       return;
+    struct SignalTrace {
+      uint64_t fence, value, generation;
+    };
+    std::vector<SignalTrace> traces;
     uint64_t submission = 0;
     try {
+      if (owned_graphics::TraceEnabled()) {
+        traces.reserve(tasks.size());
+        for (const auto &task : tasks)
+          traces.push_back({task.fence_id, task.ticket.value, task.ticket.generation});
+      }
       {
         auto scope = StartCommitting();
         submission = scope.seq;
         // Publish logical signals only on validated retirement. Reserving a
         // shared native token here would confuse enqueue and completion order.
-        scope.inflight.fence_completion.emplace(task);
-        owned_graphics::Trace("signal", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
-                              ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
-                              ",\"generation\":", task.ticket.generation);
+        for (const auto &task : tasks) {
+          owned_graphics::Trace("signal", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
+                                ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
+                                ",\"generation\":", task.ticket.generation);
+        }
+        scope.inflight.fence_completions = std::move(tasks);
       }
     } catch (const std::bad_alloc &) {
       ERR("CommandQueue::Signal: out of memory preparing native submission");
       device_->ReportRemoval(DXGI_ERROR_DEVICE_REMOVED);
       return;
     }
-    owned_graphics::Trace("signal_committed", ",\"queue\":", owned_id_, ",\"submission\":", submission,
-                          ",\"fence\":", task.fence_id, ",\"value\":", task.ticket.value,
-                          ",\"generation\":", task.ticket.generation);
+    for (const auto &trace : traces)
+      owned_graphics::Trace("signal_committed", ",\"queue\":", owned_id_, ",\"submission\":", submission,
+                            ",\"fence\":", trace.fence, ",\"value\":", trace.value,
+                            ",\"generation\":", trace.generation);
+  }
+
+  void
+  ProcessSignal(SignalTask &task) {
+    try {
+      std::vector<SignalTask> tasks;
+      tasks.push_back(std::move(task));
+      ProcessSignalBatch(tasks);
+    } catch (const std::bad_alloc &) {
+      device_->ReportRemoval(E_OUTOFMEMORY);
+    }
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -8015,6 +8725,17 @@ public:
     {
       std::lock_guard<std::mutex> lock(wait_mutex_);
       blocked_wait_ = task.ticket.latch;
+    }
+    // Fixture-only observation of this FIFO worker's arrival. Read each time:
+    // independent cases replace the name after draining their queues.
+    wchar_t arrival_name[256];
+    const auto arrival_length = GetEnvironmentVariableW(
+        L"OWNED_GRAPHICS_QUEUE_WAIT_ARRIVAL", arrival_name, std::size(arrival_name));
+    if (arrival_length && arrival_length < std::size(arrival_name)) {
+      if (auto arrival = OpenEventW(EVENT_MODIFY_STATE, FALSE, arrival_name)) {
+        SetEvent(arrival);
+        CloseHandle(arrival);
+      }
     }
     const bool satisfied = task.fence->waitForQueueProducer(task.ticket, stopping_);
     {
@@ -8153,6 +8874,15 @@ public:
       CancelPresent(task);
       return;
     }
+    // Native present now happens at commit (D3DMetal 4.0b3 DoPresent), so a
+    // frame from another queue must be committed or skipped before this one;
+    // the FIFO already orders frames of one queue. Waiting before the epoch
+    // check keeps the frame restartable until it can actually commit.
+    task.presenter->waitPresentEncoded(task.state->frame_id - 1);
+    if (device_->RemovedReason() != S_OK) {
+      CancelPresent(task);
+      return;
+    }
     if (!task.presenter->beginNativePresent(task.restart_epoch, task.state->frame_id)) {
       if (task.observer)
         task.observer.cancel(task.present_id);
@@ -8189,22 +8919,30 @@ public:
 
   void
   EncodePresent(PresentTask &task) {
-    // No submission ticket may span a wait on an unsubmitted producer. A
-    // predecessor present can itself follow an exclusive atomic phase on another queue.
+    // Order presents from different queues on the GPU timeline, as D3DMetal
+    // 4.0b3 DoPresent does: frame N's commands wait for N-1's signal without
+    // blocking on GPU completion. A canceled order signals UINT64_MAX.
     auto order_event = task.presenter->presentOrderEvent();
     const uint64_t frame_id = task.state->frame_id;
-    while (!order_event.waitUntilSignaledValue(frame_id - 1, 100)) {
-      if (stopping_.load(std::memory_order_acquire) || device_->RemovedReason() != S_OK) {
-        CancelPresent(task);
-        return;
-      }
-    }
+    queue_.waitForEvent(order_event, frame_id - 1);
+    EncodePresentCommitted(task, order_event, frame_id);
+    // The native present ran in the scope destructor's commit; publish encoding
+    // only now, so a later frame on another queue presents after this one.
+    task.state.reset();
+  }
+
+  void
+  EncodePresentCommitted(PresentTask &task, WMT::SharedEvent order_event, uint64_t frame_id) {
     auto scope = StartCommitting();
     if (device_->RemovedReason() != S_OK) {
       CancelPresent(task);
       return;
     }
     auto &cmdbuf = scope.inflight.cmdbuf;
+    // Present reads the backbuffer outside planner tracking.
+    MarkUntracked(scope.seq);
+    // Its encoders wait on the queue fence; skipped work of earlier Executes drains first.
+    DrainSkippedWork(cmdbuf, scope.seq);
     scope.inflight.semaphore = task.completion_handle.release();
     scope.inflight.reflex_work = task.reflex_work;
     if (task.reflex_work) scope.inflight.reflex_driver_start = ReflexState::NowUs();
@@ -8285,9 +9023,9 @@ public:
       task.observer_fault->store(true, std::memory_order_release);
     }
 
-    // Core Animation receives the drawable only after this command buffer completes, and only if
-    // no DXGI_PRESENT_RESTART advanced the epoch since this frame left the queue. A discarded
-    // frame withdraws its observation there, like a queue-discarded frame.
+    // Core Animation receives the drawable right after this command buffer commits; the
+    // signaled drawable makes the display wait for the GPU (D3DMetal 4.0b3 DoPresent). A
+    // DXGI_PRESENT_RESTART or GPU error after commit no longer withdraws the frame.
     scope.inflight.native_present.emplace(InflightCommandBuffer::NativePresent{
         drawable, task.presenter->restartToken(), task.observer, task.backbuffer,
         std::move(task.composition.surface), task.composition.frame,
@@ -8297,8 +9035,7 @@ public:
     scope.inflight.native_present->native_present_reserved = WMT4::ReserveMetal4Present(
         cmdbuf, drawable, task.after,
         scope.inflight.native_present->surface ? &scope.inflight.native_present->frame : nullptr,
-        task.composition.sync_interval, scope.inflight.native_present->surface ? task.composition.allow_tearing : false,
-        task.presenter->restartToken(), task.restart_epoch);
+        task.composition.sync_interval, scope.inflight.native_present->surface ? task.composition.allow_tearing : false);
     if (!scope.inflight.native_present->native_present_reserved)
       device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
     owned_graphics::Trace("present_encode", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
@@ -8306,7 +9043,6 @@ public:
     // Encoding completion releases PSO readers. Layer transitions additionally
     // wait for the completion thread to retire this command buffer.
     scope.inflight.present_completion = std::move(task.presenter);
-    task.state.reset();
   }
 
   HRESULT
@@ -8314,12 +9050,15 @@ public:
           const DXMTPresentGeometry &geometry, WMT::Reference<WMT::PresentationObserver> observer,
           uint64_t present_id, std::shared_ptr<std::atomic<bool>> observer_fault,
           DXMTPresentComposition composition, bool do_not_wait,
-          std::shared_ptr<DXMTPresentLatency> latency, bool restart, bool borrowed) {
+          std::shared_ptr<DXMTPresentLatency> latency, bool restart, bool borrowed, bool closes_frame) {
     if (device_->RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
     if (!presenter || !backbuffer || !latency)
       return E_INVALIDARG;
-    if (HRESULT hr = device_->reflex.Sleep(true, do_not_wait); FAILED(hr)) return hr;
+    // Fallback pacing and Reflex present generations count application frames: the
+    // interpolated member of a generated/real pair is GPU work of the frame its real member closes.
+    if (closes_frame)
+      if (HRESULT hr = device_->reflex.Sleep(true, do_not_wait); FAILED(hr)) return hr;
     const bool native_composition = bool(composition.surface);
     uint64_t captured_frame_id = 0;
     try {
@@ -8348,7 +9087,7 @@ public:
       // Do this under the queue capture lock so concurrent Present calls cannot
       // snapshot layer/frame state in an order different from their FIFO tasks.
       PresentTask task;
-      task.reflex_work = device_->reflex.Capture(true);
+      task.reflex_work = device_->reflex.Capture(closes_frame);
       if (do_not_wait) {
         auto ready = presenter->trySynchronizeLayerProperties();
         if (!ready)

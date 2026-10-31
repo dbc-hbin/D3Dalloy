@@ -1,6 +1,7 @@
 #include "d3d12_pipeline_library.hpp"
 #include "d3d12_device_child.hpp"
 #include "d3d12_pipeline_cache.hpp"
+#include "DXBCParser/PipelineLibrary.h"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
 #include "util_math.hpp"
@@ -466,40 +467,15 @@ HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_ST
 
 namespace {
 
-constexpr uint64_t kLibraryMagic = 0x00424c50544d5844; // "DXMTPLB\0", little endian.
-constexpr uint32_t kLibraryVersion = 1;
-
 enum PipelineKind : uint32_t { KindGraphics, KindCompute };
 
-struct LibraryHeader {
-  uint64_t magic;
-  uint32_t version;
-  uint32_t count;
-  uint64_t size;
-  uint64_t adapter;
-  WMTPipelineCacheIdentity identity;
-  Sha1Digest digest;
-  uint32_t reserved;
-};
-static_assert(sizeof(LibraryHeader) == 104);
-
-struct EntryRecord {
-  uint32_t name_bytes;
-  uint32_t kind;
-  uint64_t blob_size;
-  Sha1Digest key;
-  uint32_t reserved;
-};
-static_assert(sizeof(EntryRecord) == 40);
-
-constexpr size_t Pad8(size_t size) { return (size + 7) & ~size_t(7); }
+static_assert(sizeof(WMTPipelineCacheIdentity) == sizeof(DxmtPipelineLibraryHeader::identity));
+static_assert(sizeof(Sha1Digest) == sizeof(DxmtPipelineLibraryHeader::digest));
 
 Sha1Digest LibraryDigest(const uint8_t *bytes, size_t size) {
-  constexpr size_t begin = offsetof(LibraryHeader, digest);
-  constexpr size_t end = begin + sizeof(Sha1Digest);
   Sha1HashState hash;
-  hash.update(bytes, begin);
-  hash.update(bytes + end, size - end);
+  hash.update(bytes, DXMT_PIPELINE_LIBRARY_DIGEST_BEGIN);
+  hash.update(bytes + DXMT_PIPELINE_LIBRARY_DIGEST_END, size - DXMT_PIPELINE_LIBRARY_DIGEST_END);
   return hash.final();
 }
 
@@ -523,27 +499,34 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
   std::unordered_map<std::wstring, Entry> entries_;
   // Deterministic order for Serialize: names in insertion order.
   std::vector<const std::wstring *> order_;
-
-  size_t SerializedSizeLocked() const {
-    size_t size = sizeof(LibraryHeader);
-    for (const auto *name : order_) {
-      const auto &entry = entries_.at(*name);
-      size += sizeof(EntryRecord) + Pad8(name->size() * sizeof(WCHAR)) + Pad8(entry.blob.size());
-    }
-    return size;
-  }
+  // Serialized size and entry count of order_, checked by Rust on every insert.
+  DxmtPipelineLibraryExtent extent_{DXMT_PIPELINE_LIBRARY_HEADER_SIZE, 0};
 
   HRESULT Insert(std::wstring name, PipelineKind kind, const Sha1Digest &key, const uint8_t *blob, size_t size,
                  ID3D12PipelineState *pipeline) {
-    auto [it, inserted] = entries_.try_emplace(std::move(name));
-    if (!inserted)
+    if (entries_.count(name))
       return E_INVALIDARG;
+    DxmtPipelineLibraryExtent extent;
+    switch (dxmt_pipeline_library_extend(&extent_, uint64_t(name.size()) * sizeof(WCHAR), size, &extent)) {
+    case DXMT_PIPELINE_LIBRARY_SUCCESS:
+      break;
+    case DXMT_PIPELINE_LIBRARY_OVERFLOW:
+      return E_OUTOFMEMORY;
+    default:
+      return E_INVALIDARG;
+    }
+    // Allocate before publishing, so extent_, order_ and entries_ stay consistent on bad_alloc.
+    std::vector<uint8_t> copy(blob, blob + size);
+    if (order_.size() == order_.capacity())
+      order_.reserve(std::max<size_t>(1, order_.size() * 2));
+    auto [it, inserted] = entries_.try_emplace(std::move(name));
     auto &entry = it->second;
     entry.kind = kind;
     entry.key = key;
-    entry.blob.assign(blob, blob + size);
+    entry.blob = std::move(copy);
     entry.pipeline = pipeline;
     order_.push_back(&it->first);
+    extent_ = extent;
     return S_OK;
   }
 
@@ -603,16 +586,15 @@ public:
     if (!size)
       return S_OK;
     const auto *bytes = static_cast<const uint8_t *>(data);
-    if (size < sizeof(LibraryHeader))
-      return E_INVALIDARG;
-    LibraryHeader header;
-    memcpy(&header, bytes, sizeof(header));
-    if (header.magic != kLibraryMagic)
-      return E_INVALIDARG;
-    if (header.version != kLibraryVersion)
+    DxmtPipelineLibraryHeader header;
+    switch (dxmt_pipeline_library_header(bytes, size, &header)) {
+    case DXMT_PIPELINE_LIBRARY_SUCCESS:
+      break;
+    case DXMT_PIPELINE_LIBRARY_VERSION_MISMATCH:
       return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
-    if (header.size != size || header.reserved)
+    default:
       return E_INVALIDARG;
+    }
     // Identity is checked before the digest so that a library from another GPU or
     // driver build reports the error an application acts on (rebuild the library).
     if (header.adapter != device_->GetMTLDevice().registryID())
@@ -620,35 +602,29 @@ public:
     WMTPipelineCacheIdentity identity;
     if (!PipelineCacheIdentity(identity))
       return E_FAIL;
-    if (memcmp(&identity, &header.identity, sizeof(identity)))
+    if (memcmp(&identity, header.identity, sizeof(identity)))
       return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
-    if (LibraryDigest(bytes, size) != header.digest)
+    if (memcmp(LibraryDigest(bytes, size).data, header.digest, sizeof(header.digest)))
       return E_INVALIDARG;
-    size_t offset = sizeof(LibraryHeader);
+    uint64_t offset = DXMT_PIPELINE_LIBRARY_HEADER_SIZE;
     try {
       for (uint32_t i = 0; i < header.count; ++i) {
-        EntryRecord record;
-        if (sizeof(record) > size - offset)
-          return E_INVALIDARG;
-        memcpy(&record, bytes + offset, sizeof(record));
-        offset += sizeof(record);
-        if ((record.name_bytes & 1) || record.reserved || record.kind > KindCompute || !record.blob_size ||
-            Pad8(record.name_bytes) > size - offset)
+        DxmtPipelineLibraryEntry record;
+        if (dxmt_pipeline_library_entry(bytes, size, offset, &record) != DXMT_PIPELINE_LIBRARY_SUCCESS)
           return E_INVALIDARG;
         std::wstring name(record.name_bytes / sizeof(WCHAR), L'\0');
-        memcpy(name.data(), bytes + offset, record.name_bytes);
-        offset += Pad8(record.name_bytes);
-        if (record.blob_size > size - offset || Pad8(record.blob_size) > size - offset)
-          return E_INVALIDARG;
-        const uint8_t *blob = bytes + offset;
-        Sha1Digest blob_key;
+        memcpy(name.data(), bytes + record.name_offset, record.name_bytes);
+        const uint8_t *blob = bytes + record.blob_offset;
+        Sha1Digest key, blob_key;
+        memcpy(key.data, record.key, sizeof(key.data));
         if (HRESULT hr = PipelineCacheBlobKey(blob, record.blob_size, blob_key); FAILED(hr))
           return hr;
-        if (blob_key != record.key)
+        if (blob_key != key)
           return E_INVALIDARG;
-        offset += Pad8(record.blob_size);
-        if (FAILED(Insert(std::move(name), PipelineKind(record.kind), record.key, blob, record.blob_size, nullptr)))
-          return E_INVALIDARG;
+        offset = record.next_offset;
+        if (HRESULT hr = Insert(std::move(name), PipelineKind(record.kind), key, blob, record.blob_size, nullptr);
+            FAILED(hr))
+          return hr == E_OUTOFMEMORY ? hr : E_INVALIDARG;
       }
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
@@ -725,7 +701,7 @@ public:
   SIZE_T STDMETHODCALLTYPE
   GetSerializedSize() override {
     std::shared_lock lock(mutex_);
-    return SerializedSizeLocked();
+    return extent_.size;
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -736,36 +712,36 @@ public:
     if (!PipelineCacheIdentity(identity))
       return E_FAIL;
     std::shared_lock lock(mutex_);
-    const size_t required = SerializedSizeLocked();
-    if (size < required)
+    if (size < extent_.size)
       return E_INVALIDARG;
     auto *bytes = static_cast<uint8_t *>(data);
-    memset(bytes, 0, required);
-    LibraryHeader header{};
-    header.magic = kLibraryMagic;
-    header.version = kLibraryVersion;
-    header.count = uint32_t(order_.size());
-    header.size = required;
+    DxmtPipelineLibraryHeader header{};
     header.adapter = device_->GetMTLDevice().registryID();
-    header.identity = identity;
-    memcpy(bytes, &header, sizeof(header));
-    size_t offset = sizeof(header);
+    header.size = extent_.size;
+    header.count = uint32_t(extent_.count);
+    memcpy(header.identity, &identity, sizeof(identity));
+    if (dxmt_pipeline_library_begin(&header, bytes, extent_.size) != DXMT_PIPELINE_LIBRARY_SUCCESS)
+      return E_FAIL;
+    uint64_t offset = DXMT_PIPELINE_LIBRARY_HEADER_SIZE;
     for (const auto *name : order_) {
       const auto &entry = entries_.at(*name);
-      EntryRecord record{};
-      record.name_bytes = uint32_t(name->size() * sizeof(WCHAR));
-      record.kind = entry.kind;
+      DxmtPipelineLibraryRecord record{};
+      record.name_bytes = name->size() * sizeof(WCHAR);
       record.blob_size = entry.blob.size();
-      record.key = entry.key;
-      memcpy(bytes + offset, &record, sizeof(record));
-      offset += sizeof(record);
-      memcpy(bytes + offset, name->data(), record.name_bytes);
-      offset += Pad8(record.name_bytes);
-      memcpy(bytes + offset, entry.blob.data(), entry.blob.size());
-      offset += Pad8(entry.blob.size());
+      record.kind = entry.kind;
+      memcpy(record.key, entry.key.data, sizeof(record.key));
+      DxmtPipelineLibraryEntry placed;
+      if (dxmt_pipeline_library_put_entry(bytes, extent_.size, offset, &record, &placed) !=
+          DXMT_PIPELINE_LIBRARY_SUCCESS)
+        return E_FAIL;
+      memcpy(bytes + placed.name_offset, name->data(), placed.name_bytes);
+      memcpy(bytes + placed.blob_offset, entry.blob.data(), placed.blob_size);
+      offset = placed.next_offset;
     }
-    const auto digest = LibraryDigest(bytes, required);
-    memcpy(bytes + offsetof(LibraryHeader, digest), &digest, sizeof(digest));
+    const auto digest = LibraryDigest(bytes, extent_.size);
+    if (offset != extent_.size ||
+        dxmt_pipeline_library_set_digest(bytes, extent_.size, digest.data) != DXMT_PIPELINE_LIBRARY_SUCCESS)
+      return E_FAIL;
     return S_OK;
   }
 };

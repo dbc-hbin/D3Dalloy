@@ -229,3 +229,24 @@ typedef struct FfxApiConstantBufferAllocation
 /// @ingroup SDKTypes
 typedef FfxApiConstantBufferAllocation(*FfxApiConstantBufferAllocator)(void* data, const uint64_t dataSize);
 
+/* Additive SDK 2.3 value types used by Ray Regeneration 1.2. */
+typedef struct FfxApiFloat4
+{
+    float x;
+    float y;
+    float z;
+    float w;
+} FfxApiFloat4;
+
+/* Row-major storage, row-vector multiplication (v * M). */
+typedef struct FfxApiMatrix4x4
+{
+    FfxApiFloat4 rows[4];
+} FfxApiMatrix4x4;
+
+typedef struct FfxApiFloatBounds
+{
+    float min;
+    float max;
+} FfxApiFloatBounds;
+

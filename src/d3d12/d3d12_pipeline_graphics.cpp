@@ -41,9 +41,11 @@ std::atomic_uint32_t g_shader_probe_count = 0;
 
 void
 TraceShaderProbe(const char *stage, D3D12_SHADER_BYTECODE bytecode, const char *chunk, HRESULT hr) {
-  const uint32_t probe_index = g_shader_probe_count.fetch_add(1, std::memory_order_relaxed);
-  if (probe_index >= kShaderProbeLimit)
-    return;
+  uint32_t probe_index = g_shader_probe_count.load(std::memory_order_relaxed);
+  do {
+    if (probe_index >= kShaderProbeLimit)
+      return;
+  } while (!g_shader_probe_count.compare_exchange_weak(probe_index, probe_index + 1, std::memory_order_relaxed));
 
   const auto digest = bytecode.pShaderBytecode && bytecode.BytecodeLength
                         ? Sha1HashState::compute(bytecode.pShaderBytecode, bytecode.BytecodeLength).string()
@@ -567,6 +569,29 @@ class MTLD3D12GraphicsPipelineStateImpl : public MTLD3D12Pageable<MTLD3D12Graphi
                                               REFIID, void **, const GraphicsPipelineExtras *);
 protected:
   PipelineCache cache_;
+  std::mutex native_owners_mutex;
+  std::vector<std::shared_ptr<const NativePipelineArtifact>> native_owners;
+  WMT::Reference<WMT::ComputePipelineState> CreateNativePipeline(const WMTComputePipelineInfo &info, WMT::Error &error) {
+    auto artifact = device_->GetShaderArtifactCache().NativePipeline(device_->GetMetal4Compiler(), info, error);
+    if (!artifact->compute) return {};
+    std::lock_guard lock(native_owners_mutex);
+    native_owners.push_back(artifact);
+    return artifact->compute;
+  }
+  WMT::Reference<WMT::RenderPipelineState> CreateNativePipeline(const WMTRenderPipelineInfo &info, WMT::Error &error) {
+    auto artifact = device_->GetShaderArtifactCache().NativePipeline(device_->GetMetal4Compiler(), info, error);
+    if (!artifact->render) return {};
+    std::lock_guard lock(native_owners_mutex);
+    native_owners.push_back(artifact);
+    return artifact->render;
+  }
+  WMT::Reference<WMT::RenderPipelineState> CreateNativePipeline(const WMTMeshRenderPipelineInfo &info, WMT::Error &error) {
+    auto artifact = device_->GetShaderArtifactCache().NativePipeline(device_->GetMetal4Compiler(), info, error);
+    if (!artifact->render) return {};
+    std::lock_guard lock(native_owners_mutex);
+    native_owners.push_back(artifact);
+    return artifact->render;
+  }
   MTL_SHADER_REFLECTION ref_vs{};
   MTL_SHADER_REFLECTION ref_ps{};
 
@@ -654,7 +679,7 @@ protected:
     auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, *compiled, err);
     if (!lib)
       return E_FAIL;
-    function = lib.newFunction(name);
+    function = device_->GetShaderArtifactCache().Function(lib, name);
     return function ? S_OK : E_FAIL;
   }
 
@@ -897,7 +922,7 @@ protected:
     {
       static std::mutex creation_mutex;
       std::lock_guard<std::mutex> lock(creation_mutex);
-      variant.pso = device_->GetMetal4Compiler().newRenderPipelineState(info, err);
+      variant.pso = CreateNativePipeline(info, err);
     }
     if (!variant.pso) {
       ERR("Failed to create mesh shader PSO: ", err ? err.description().getUTF8String() : "");
@@ -1187,7 +1212,7 @@ protected:
       // Metal's mesh-pipeline compiler is not reentrant for these payload sizes (see D3D11 ts_global_mutex).
       static std::mutex creation_mutex;
       std::lock_guard<std::mutex> lock(creation_mutex);
-      variant.pso = device_->GetMetal4Compiler().newRenderPipelineState(info, err);
+      variant.pso = CreateNativePipeline(info, err);
     }
     if (!variant.pso) {
       ERR("Failed to create mesh PSO: ", err ? err.description().getUTF8String() : "");
@@ -1200,6 +1225,13 @@ public:
   MTLD3D12GraphicsPipelineStateImpl(MTLD3D12Device *pDevice) :
       MTLD3D12Pageable<MTLD3D12GraphicsPipelineState>(pDevice) {
     IsComputePipelineState = FALSE;
+  }
+  // The deferred job captures this object: retire unstarted work or join a running one first.
+  // During process detach the OS has already terminated the workers, so a claimed job can never
+  // finish; abandon it (the process is exiting) instead of waiting forever.
+  ~MTLD3D12GraphicsPipelineStateImpl() {
+    if (async_job && !dxmt::this_thread::isInModuleDetachment())
+      async_job->Cancel();
   }
 
   HRESULT InitializeStatisticsCapture(D3D12_SHADER_BYTECODE vs, bool rasterization_enabled) {
@@ -1725,10 +1757,12 @@ public:
               PipelineCache::Vertex, device_->GetShaderArtifactCache(), pDesc->VS,
               shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &sm50_err
           )) {
-        RecordShaderCompileFailure("VS", pDesc->VS, rootsig,
-                                   reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&rootsig),
-                                   "vs_main", SM50GetErrorMessageString(sm50_err), pDesc->pRootSignature != nullptr);
-        ERR("Failed to compile vs shader: ", SM50GetErrorMessageString(sm50_err));
+        const auto error = SM50GetErrorMessageString(sm50_err);
+        const bool first = RecordShaderCompileFailure(
+            "VS", pDesc->VS, rootsig, reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&rootsig),
+            "vs_main", error, pDesc->pRootSignature != nullptr, &cache_.stageKey(PipelineCache::Vertex));
+        if (SM50GetErrorKind(sm50_err) != SM50_ERROR_ROOT_BINDING || first)
+          ERR("Failed to compile vs shader: ", error);
         return E_FAIL;
       }
 
@@ -1741,7 +1775,7 @@ public:
                                                               cache_.bitcode(PipelineCache::Vertex), err);
         if (!vs_lib)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
-        vs_func = vs_lib.newFunction("vs_main");
+        vs_func = device_->GetShaderArtifactCache().Function(vs_lib, "vs_main");
         if (!vs_func)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
       }
@@ -1772,6 +1806,7 @@ public:
         (pDesc->DepthStencilState.DepthEnable || pDesc->DepthStencilState.StencilEnable);
     const bool coverage_input = (ref_ps.PSCoverageInputs & SM50_PIXEL_COVERAGE_INPUT) != 0;
     const bool inner_coverage_input = (ref_ps.PSCoverageInputs & SM50_PIXEL_INNER_COVERAGE_INPUT) != 0;
+    bool sample_position_input = false;
     if (pDesc->PS.pShaderBytecode) {
       microsoft::CSignatureParser input_signature;
       if (FAILED(hr = microsoft::DXBCGetInputSignature(pDesc->PS.pShaderBytecode, &input_signature)))
@@ -1781,6 +1816,11 @@ public:
       // select the captured-pixel draw path.
       const auto count = use_fragment ? input_signature.GetParameters(&parameters) : 0u;
       for (uint32_t i = 0; i < count; ++i) {
+        // Metal's position builtin remains pixel-centered even at sample frequency.
+        // Captured replay reconstructs D3D's sample position, including Z/W.
+        if (owned_sample_frequency_pixel_shader && parameters[i].Mask &&
+            parameters[i].SystemValue == microsoft::D3D10_SB_NAME_POSITION)
+          sample_position_input = true;
         if (uint32_t(parameters[i].SystemValue) == 24) owned_shading_rate_pixel_shader = true;
         if (parameters[i].Mask &&
             (parameters[i].SystemValue == microsoft::D3D10_SB_NAME_CLIP_DISTANCE ||
@@ -1872,10 +1912,12 @@ public:
               PipelineCache::Fragment, device_->GetShaderArtifactCache(), pDesc->PS,
               shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &sm50_err
           )) {
-        RecordShaderCompileFailure("PS", pDesc->PS, rootsig,
-                                   reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&rootsig),
-                                   ps_name.c_str(), SM50GetErrorMessageString(sm50_err), pDesc->pRootSignature != nullptr);
-        ERR("Failed to compile ps shader: ", SM50GetErrorMessageString(sm50_err));
+        const auto error = SM50GetErrorMessageString(sm50_err);
+        const bool first = RecordShaderCompileFailure(
+            "PS", pDesc->PS, rootsig, reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&rootsig),
+            ps_name.c_str(), error, pDesc->pRootSignature != nullptr, &cache_.stageKey(PipelineCache::Fragment));
+        if (SM50GetErrorKind(sm50_err) != SM50_ERROR_ROOT_BINDING || first)
+          ERR("Failed to compile ps shader: ", error);
         return E_FAIL;
       }
       const auto ps_bitcode_compiled = cache_.view(PipelineCache::Fragment);
@@ -1892,7 +1934,7 @@ public:
         ps_func = sample_mask_constant
           ? device_->GetShaderArtifactCache().SampleMaskFunction(ps_lib, ps_name.c_str(),
               {rootsig.bytecode, rootsig.bytecode_length}, owned_sample_mask, err)
-          : ps_lib.newFunction(ps_name.c_str());
+          : device_->GetShaderArtifactCache().Function(ps_lib, ps_name.c_str());
         if (!ps_func)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
       }
@@ -1944,10 +1986,32 @@ public:
       info.max_vertex_amplification_count = max_vertex_amplification;
 
       if (!RequiresMSAAExecution()) {
-        pso = device_->GetMetal4Compiler().newRenderPipelineState(info, err);
-        if (!pso) {
-          ERR("Failed to create PSO: ", err.description().getUTF8String());
-          return E_FAIL;
+        // Shader conversion and libraries above stay synchronous so invalid shaders still fail creation;
+        // only the native link of this ordinary pipeline is deferred.
+        if (device_->async_pipelines.Enabled() && !stream_output.active && !uses_atomic64 &&
+            !needs_rov_buffer_marker && !view_instancing.count) {
+          async_omittable = std::none_of(resource_bindings.begin(), resource_bindings.end(),
+              [](const auto &binding) { return binding.Type == SM50BindingType::UAV; });
+          // Submitted by CreateGraphicsPipelineState after Initialize succeeds. Creation completes the
+          // cache flight without retaining it; the link result decides retention and disk publication,
+          // so a failed link is never published as a good PSO.
+          async_job = std::make_shared<owned_graphics::AsyncCompileJob>([this, info] {
+            WMT::Reference<WMT::Error> error;
+            auto native = CreateNativePipeline(info, error);
+            cache_.CommitDeferred(bool(native));
+            if (!native) {
+              ERR("Failed to create deferred PSO: ", error ? error.description().getUTF8String() : "");
+              return false;
+            }
+            pso = std::move(native);
+            return true;
+          });
+        } else {
+          pso = CreateNativePipeline(info, err);
+          if (!pso) {
+            ERR("Failed to create PSO: ", err.description().getUTF8String());
+            return E_FAIL;
+          }
         }
       } else {
         const auto count = owned_sample_desc.Count;
@@ -1959,7 +2023,7 @@ public:
             use_fragment && !stream_output.active && !rasterization_disabled &&
             !forced_sample_count && !ForcedSampleReplay() && !owned_conservative &&
             !owned_distance_interpolation && !owned_mesh_output_replay && !uses_atomic64 &&
-            !needs_rov_buffer_marker && !owned_depth_bounds && !owned_sample_frequency_pixel_shader &&
+            !needs_rov_buffer_marker && !owned_depth_bounds && !sample_position_input &&
             !coverage_input && !inner_coverage_input && !owned_shading_rate_pixel_shader &&
             !pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput &&
             owned_line_mode == SM50_MSAA_LINE_NONE && !use_fetch_logic_op &&
@@ -1967,7 +2031,7 @@ public:
             !view_instancing.count;
         if (native_msaa) {
           // Identity mapping, original VS/PS and their constants; no capture or ICB epilogue.
-          native_msaa_pso = device_->GetMetal4Compiler().newRenderPipelineState(info, err);
+          native_msaa_pso = CreateNativePipeline(info, err);
           if (!native_msaa_pso) {
             ERR("Failed to create native MSAA PSO: ", err ? err.description().getUTF8String() : "");
             return E_FAIL;
@@ -2017,6 +2081,12 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   GetCachedBlob(ID3DBlob **blob) override {
+    // The deferred link commits the cache; export only a PSO whose link actually succeeded.
+    if (!WaitNativePipeline()) {
+      if (blob)
+        *blob = nullptr;
+      return E_FAIL;
+    }
     return cache_.GetBlob(blob);
   }
 
@@ -2109,11 +2179,13 @@ public:
     auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
     if (!library)
       return false;
-    function = library.newFunction("vs_main");
+    function = device_->GetShaderArtifactCache().Function(library, "vs_main");
     return bool(function);
   }
 
   WMT::RenderPipelineState GetColorWriteMaskPipelineState(uint8_t disabled_outputs) override {
+    if (!WaitNativePipeline())
+      return {};
     if (!disabled_outputs)
       return pso;
     if (!submission_mapping_safe || !pso)
@@ -2129,7 +2201,7 @@ public:
       if (disabled_outputs & (1u << i))
         info.colors[i].write_mask = 0;
     WMT::Reference<WMT::Error> error;
-    auto variant = device_->GetMetal4Compiler().newRenderPipelineState(info, error);
+    auto variant = CreateNativePipeline(info, error);
     if (!variant) {
       ERR("Failed to create logical color write-mask PSO: ",
           error ? error.description().getUTF8String() : "");
@@ -2152,7 +2224,7 @@ public:
       }
       info.fragment_function = indirect_fragment_function.handle;
       info.support_indirect_command_buffers = true;
-      indirect_pso = device_->GetMetal4Compiler().newRenderPipelineState(info, error);
+      indirect_pso = CreateNativePipeline(info, error);
       if (!indirect_pso)
         ERR("Failed to create indirect command buffer PSO: ", error.description().getUTF8String());
     }
@@ -2207,7 +2279,7 @@ public:
       auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       if (!lib)
         return {};
-      pull_vertex_function = lib.newFunction("vs_main");
+      pull_vertex_function = device_->GetShaderArtifactCache().Function(lib, "vs_main");
       if (!pull_vertex_function)
         return {};
     }
@@ -2222,7 +2294,7 @@ public:
       }
       info.support_indirect_command_buffers = indirect;
       
-      variant = device_->GetMetal4Compiler().newRenderPipelineState(info, error);
+      variant = CreateNativePipeline(info, error);
       if (!variant)
         ERR("Failed to create indexed pull PSO: ", error.description().getUTF8String());
     }
@@ -2288,7 +2360,7 @@ public:
       auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       if (!lib)
         return {};
-      statistics_vertex_function = lib.newFunction("vs_main");
+      statistics_vertex_function = device_->GetShaderArtifactCache().Function(lib, "vs_main");
       if (!statistics_vertex_function)
         return {};
     }
@@ -2309,7 +2381,7 @@ public:
       
       
       
-      variant = device_->GetMetal4Compiler().newRenderPipelineState(info, error);
+      variant = CreateNativePipeline(info, error);
       if (!variant)
         ERR("Failed to create statistics graphics PSO: ", error.description().getUTF8String());
     }
@@ -2369,7 +2441,7 @@ public:
       auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
       if (!lib)
         return {};
-      statistics_fragment_function = lib.newFunction(statistics_ps_name.c_str());
+      statistics_fragment_function = device_->GetShaderArtifactCache().Function(lib, statistics_ps_name.c_str());
       if (!statistics_fragment_function)
         return false;
     }
@@ -2524,7 +2596,7 @@ public:
       if (FAILED(fragment_constants[i]->Initialize(device_, bytecode, compiled)))
         return false;
       auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
-      if (!library || !(fragments[i] = library.newFunction(statistics_ps_name.c_str()))) {
+      if (!library || !(fragments[i] = device_->GetShaderArtifactCache().Function(library, statistics_ps_name.c_str()))) {
         ERR("Failed to load MSAA PS variant ", i);
         return false;
       }
@@ -2621,11 +2693,16 @@ public:
       if (FAILED(constants.Initialize(device_, bytecode, compiled)))
         return false;
       auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
-      auto function = library ? library.newFunction("vs_main") : WMT::Reference<WMT4::Function>();
+      auto function = library ? device_->GetShaderArtifactCache().Function(library, "vs_main") : WMT::Reference<WMT4::Function>();
       if (!function)
         return false;
       if (i) vertex_replay = function;
-      else variants->capture = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+      else {
+        WMTComputePipelineInfo info;
+        WMT::InitializeComputePipelineInfo(info);
+        info.compute_function = function.handle;
+        variants->capture = CreateNativePipeline(info, error);
+      }
       if (!i && !variants->capture) return false;
       return true;
     };
@@ -2651,18 +2728,22 @@ public:
     if (owned_line_mode != SM50_MSAA_LINE_NONE)
       coverage_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
     auto internal = WMT4::Library(device_->GetLib().getLibrary());
-    auto gather_fragment = internal.newFunction(owned_conservative ? "msaa_gather_conservative_depth"
+    auto gather_fragment = device_->GetShaderArtifactCache().Function(internal, owned_conservative ? "msaa_gather_conservative_depth"
         : owned_line_mode == SM50_MSAA_LINE_NONE ? "msaa_gather_depth" : "msaa_gather_line_depth");
-    auto explicit_depth_fragment = internal.newFunction(sample_count == 1
+    auto explicit_depth_fragment = device_->GetShaderArtifactCache().Function(internal, sample_count == 1
         ? "msaa_explicit_depth_single" : "msaa_explicit_depth");
-    auto depth_only_fragment = internal.newFunction(sample_count == 1
+    auto depth_only_fragment = device_->GetShaderArtifactCache().Function(internal, sample_count == 1
         ? "msaa_explicit_depth_only_single" : "msaa_explicit_depth_only");
     if (!gather_fragment || !explicit_depth_fragment || !depth_only_fragment)
       return nullptr;
     if (emulated_depth_bounds) {
-      auto probe = internal.newFunction(sample_count == 1 ? "msaa_depth_bounds_probe_single"
+      auto probe = device_->GetShaderArtifactCache().Function(internal, sample_count == 1 ? "msaa_depth_bounds_probe_single"
                                                           : "msaa_depth_bounds_probe");
-      variants->depth_bounds_probe = device_->GetMetal4Compiler().newComputePipelineState(probe, error);
+      if (!probe) return nullptr;
+      WMTComputePipelineInfo info;
+      WMT::InitializeComputePipelineInfo(info);
+      info.compute_function = probe.handle;
+      variants->depth_bounds_probe = CreateNativePipeline(info, error);
       if (!variants->depth_bounds_probe) return nullptr;
     }
     coverage_info.fragment_function = has_pixel_shader ? fragments[0] : gather_fragment;
@@ -2671,7 +2752,7 @@ public:
     
     
     
-    variants->coverage_with_depth = device_->GetMetal4Compiler().newRenderPipelineState(coverage_info, error);
+    variants->coverage_with_depth = CreateNativePipeline(coverage_info, error);
     if (!variants->coverage_with_depth) {
       ERR("MSAA coverage-with-depth PSO failed: ", error.description().getUTF8String());
       return nullptr;
@@ -2681,14 +2762,14 @@ public:
     // fixed D16 and floating D32 have different native depth-bias units.
     coverage_info.depth_pixel_format = WMTPixelFormatInvalid;
     coverage_info.stencil_pixel_format = WMTPixelFormatInvalid;
-    variants->coverage = device_->GetMetal4Compiler().newRenderPipelineState(coverage_info, error);
+    variants->coverage = CreateNativePipeline(coverage_info, error);
     if (!variants->coverage) {
       ERR("MSAA depthless coverage PSO failed: ", error.description().getUTF8String());
       return nullptr;
     }
     auto clear_info = coverage_info;
-    auto fullscreen_vertex = WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_fullscreen_vertex");
-    auto clear_fragment = WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_clear_coverage");
+    auto fullscreen_vertex = device_->GetShaderArtifactCache().Function(internal, "msaa_fullscreen_vertex");
+    auto clear_fragment = device_->GetShaderArtifactCache().Function(internal, "msaa_clear_coverage");
     if (!fullscreen_vertex || !clear_fragment)
       return nullptr;
     clear_info.vertex_function = fullscreen_vertex;
@@ -2699,7 +2780,7 @@ public:
     clear_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
     
     
-    variants->clear_coverage = device_->GetMetal4Compiler().newRenderPipelineState(clear_info, error);
+    variants->clear_coverage = CreateNativePipeline(clear_info, error);
     if (!variants->clear_coverage) {
       ERR("MSAA clear PSO failed: ", error.description().getUTF8String());
       return nullptr;
@@ -2711,7 +2792,7 @@ public:
     gather_info.stencil_pixel_format = msaa_original_info.stencil_pixel_format;
     gather_info.fragment_function = gather_fragment;
     
-    variants->gather_depth = device_->GetMetal4Compiler().newRenderPipelineState(gather_info, error);
+    variants->gather_depth = CreateNativePipeline(gather_info, error);
     WMTDepthStencilInfo capture_state{};
     capture_state.depth_compare_function = WMTCompareFunctionAlways;
     capture_state.depth_write_enabled = false;
@@ -2721,11 +2802,11 @@ public:
     if (msaa_original_info.depth_pixel_format != WMTPixelFormatInvalid) {
       auto early_info = gather_info;
       early_info.fragment_function = explicit_depth_fragment;
-      variants->early_depth = device_->GetMetal4Compiler().newRenderPipelineState(early_info, error);
+      variants->early_depth = CreateNativePipeline(early_info, error);
       auto late_info = gather_info;
       for (auto &color : late_info.colors) color = {};
       late_info.fragment_function = depth_only_fragment;
-      variants->late_depth = device_->GetMetal4Compiler().newRenderPipelineState(late_info, error);
+      variants->late_depth = CreateNativePipeline(late_info, error);
       if (!variants->early_depth || !variants->late_depth)
         return nullptr;
     }
@@ -2737,7 +2818,7 @@ public:
     pixel_info.vertex_function = fullscreen_vertex;
     WMT::Reference<WMT4::Function> atomic_tile_vertex;
     if (uses_atomic64) {
-      atomic_tile_vertex = WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_atomic_tile_vertex");
+      atomic_tile_vertex = device_->GetShaderArtifactCache().Function(internal, "msaa_atomic_tile_vertex");
       if (!atomic_tile_vertex) return nullptr;
       pixel_info.vertex_function = atomic_tile_vertex;
     }
@@ -2748,7 +2829,7 @@ public:
     
     
     if (has_pixel_shader && !variants->sample_frequency)
-      variants->pixel = device_->GetMetal4Compiler().newRenderPipelineState(pixel_info, error);
+      variants->pixel = CreateNativePipeline(pixel_info, error);
     if (has_pixel_shader && !variants->sample_frequency && !variants->pixel) {
       ERR("MSAA pixel PSO failed: ", error.description().getUTF8String());
       return nullptr;
@@ -2773,7 +2854,7 @@ public:
     
     
     if (has_pixel_shader && (!variants->sample_frequency || uses_atomic64))
-      variants->replay = device_->GetMetal4Compiler().newRenderPipelineState(replay_info, error);
+      variants->replay = CreateNativePipeline(replay_info, error);
     if (has_pixel_shader && (!variants->sample_frequency || uses_atomic64) && !variants->replay) {
       ERR("MSAA replay PSO failed: ", error.description().getUTF8String());
       return nullptr;
@@ -2781,19 +2862,19 @@ public:
     if (single_sample_replay && has_pixel_shader && !variants->sample_frequency) {
       auto query_info = clear_info;
       for (auto &color : query_info.colors) color = {};
-      auto query_fragment = internal.newFunction(sample_count == 1
+      auto query_fragment = device_->GetShaderArtifactCache().Function(internal, sample_count == 1
           ? "msaa_query_coverage_single" : "msaa_query_coverage");
       if (!query_fragment) return nullptr;
       query_info.fragment_function = query_fragment;
-      variants->query_coverage = device_->GetMetal4Compiler().newRenderPipelineState(query_info, error);
+      variants->query_coverage = CreateNativePipeline(query_info, error);
       if (!variants->query_coverage) {
         ERR("MSAA query coverage PSO failed: ", error.description().getUTF8String());
         return nullptr;
       }
-      auto layered_vertex = internal.newFunction("msaa_fullscreen_layer_vertex");
+      auto layered_vertex = device_->GetShaderArtifactCache().Function(internal, "msaa_fullscreen_layer_vertex");
       if (!layered_vertex) return nullptr;
       replay_info.vertex_function = layered_vertex;
-      variants->replay_layer = device_->GetMetal4Compiler().newRenderPipelineState(replay_info, error);
+      variants->replay_layer = CreateNativePipeline(replay_info, error);
       if (!variants->replay_layer) {
         ERR("MSAA layered fullscreen replay PSO failed: ", error.description().getUTF8String());
         return nullptr;
@@ -2805,7 +2886,7 @@ public:
       sample_info.fragment_function = fragments[3];
       
       
-      variants->sample_pixel = device_->GetMetal4Compiler().newRenderPipelineState(sample_info, error);
+      variants->sample_pixel = CreateNativePipeline(sample_info, error);
       if (!variants->sample_pixel) {
         ERR("MSAA sample-frequency PSO failed: ", error.description().getUTF8String());
         return nullptr;
@@ -2964,9 +3045,13 @@ CreateGraphicsPipelineState(
     pso = std::move(fresh); // Never reinitialize mutated bindings or native state.
     hr = pso->Initialize(pDesc, extras ? *extras : GraphicsPipelineExtras{});
   }
-  pso->cache_.Complete(hr);
+  // Same-key creators wait on this flight, so it completes now; a deferred link holds only the
+  // entry's retention/publication (PipelineCache::CommitDeferred) until the link succeeds.
+  pso->cache_.Complete(hr, !pso->async_job);
   if (FAILED(hr))
     return hr;
+  if (pso->async_job)
+    pDevice->async_pipelines.Submit(pso->async_job);
   return pso->QueryInterface(riid, ppPipelineState);
 };
 

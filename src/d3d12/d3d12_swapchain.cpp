@@ -17,12 +17,14 @@
  */
 
 #include "d3d12_device.hpp"
+#include "d3d12_frame_generation_interfaces.hpp"
 #include "dxgi_interfaces.h"
 #include "dxgi_composition.h"
 #include "dxgi_object.hpp"
 #include "dxgi_output.hpp"
 #include "dxmt_hud_state.hpp"
 #include "dxmt_presenter.hpp"
+#include "dxmt_monitor_format.hpp"
 #include "dxmt_queue_order.hpp"
 #include "dxmt_info.hpp"
 #include "com/com_pointer.hpp"
@@ -213,31 +215,6 @@ ConvertColorSpace(DXGI_COLOR_SPACE_TYPE color_space, bool hdr) {
   }
 }
 
-/**
- FIXME: duplicated implementation in dxgi_output.cpp
-*/
-uint32_t
-GetMonitorFormatBpp(DXGI_FORMAT Format) {
-  switch (Format) {
-  case DXGI_FORMAT_R8G8B8A8_UNORM:
-  case DXGI_FORMAT_B8G8R8A8_UNORM:
-  case DXGI_FORMAT_B8G8R8X8_UNORM:
-  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-  case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-  case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
-  case DXGI_FORMAT_R10G10B10A2_UNORM:
-  case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
-    return 32;
-
-  case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    return 64;
-
-  default:
-    Logger::warn(str::format("GetMonitorFormatBpp: Unknown format: ", Format));
-    return 32;
-  }
-}
-
 class ModeSetGuard {
   std::atomic_flag in_progress_;
 public:
@@ -261,7 +238,8 @@ public:
 };
 
 class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D12Device>,
-                              public IMTLDXGICompositionSurface {
+                              public IMTLDXGICompositionSurface,
+                              public IMTLD3D12GeneratedPresent {
 
   Com<IDXGIFactory1> factory_;
   Com<MTLD3D12CommandQueue> queue_;
@@ -317,6 +295,14 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   // One present queue per backbuffer; Present rotates both with the same index.
   std::vector<Com<MTLD3D12CommandQueue>> present_queues_;
   UINT current_buffer_ = 0;
+
+  void
+  ResetFrameStatisticsLocked() {
+    statistics_disjoint_ = true;
+    has_presentation_event_ = false;
+    earliest_presentation_id_ = next_presentation_id_ + 1;
+    statistics_clock_ = {};
+  }
 
   bool
   LayerSupportEDR() {
@@ -554,6 +540,11 @@ public:
       AddRef();
       return S_OK;
     }
+    if (riid == __uuidof(IMTLD3D12GeneratedPresent)) {
+      *ppvObject = static_cast<IMTLD3D12GeneratedPresent *>(this);
+      AddRef();
+      return S_OK;
+    }
 
     if (logQueryInterfaceError(__uuidof(IDXGISwapChain1), riid)) {
       WARN("DXGISwapChain: Unknown interface query ", str::format(riid));
@@ -722,10 +713,7 @@ public:
       target_ = std::move(output);
       fullscreen_desc_.Windowed = FALSE;
       dxmt::InvalidateOutputStatistics(monitor_, this);
-      statistics_disjoint_ = true;
-      has_presentation_event_ = false;
-      earliest_presentation_id_ = next_presentation_id_ + 1;
-      statistics_clock_ = {};
+      ResetFrameStatisticsLocked();
     }
     return S_OK;
   }
@@ -755,10 +743,7 @@ public:
       fullscreen_desc_.Windowed = TRUE;
       target_ = nullptr;
       monitor_ = wsi::getWindowMonitor(hWnd);
-      statistics_disjoint_ = true;
-      has_presentation_event_ = false;
-      earliest_presentation_id_ = next_presentation_id_ + 1;
-      statistics_clock_ = {};
+      ResetFrameStatisticsLocked();
     }
 
     return S_OK;
@@ -1027,10 +1012,7 @@ public:
     source_width_ = new_desc.Width;
     source_height_ = new_desc.Height;
     dxmt::InvalidateOutputStatistics(monitor_, this);
-    statistics_disjoint_ = true;
-    has_presentation_event_ = false;
-    earliest_presentation_id_ = next_presentation_id_ + 1;
-    statistics_clock_ = {};
+    ResetFrameStatisticsLocked();
     ApplyLayerProps();
     return S_OK;
   }
@@ -1087,10 +1069,7 @@ public:
     {
       std::lock_guard<dxmt::mutex> lock(mutex_);
       dxmt::InvalidateOutputStatistics(monitor_, this);
-      statistics_disjoint_ = true;
-      has_presentation_event_ = false;
-      earliest_presentation_id_ = next_presentation_id_ + 1;
-      statistics_clock_ = {};
+      ResetFrameStatisticsLocked();
     }
     return S_OK;
   };
@@ -1251,6 +1230,16 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
+    return PresentImpl(SyncInterval, PresentFlags, pPresentParameters, true);
+  }
+
+  HRESULT STDMETHODCALLTYPE PresentGenerated(UINT SyncInterval, UINT Flags) final {
+    return PresentImpl(SyncInterval, Flags, nullptr, false);
+  }
+
+  // closes_frame is false only for an interpolated Present followed by its real member.
+  HRESULT PresentImpl(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters,
+                      bool closes_frame) {
     const bool do_not_wait = (PresentFlags & DXGI_PRESENT_DO_NOT_WAIT) != 0;
     std::unique_lock<dxmt::mutex> lock(mutex_, std::defer_lock);
     if (do_not_wait) {
@@ -1322,7 +1311,14 @@ public:
       hr = DXGI_STATUS_OCCLUDED;
     if (PresentFlags & DXGI_PRESENT_TEST)
       return hr;
+    // A successful or occluded non-TEST Present ends an application frame, except
+    // the interpolated member of a generated/real pair. Failed Presents do not.
+    const auto end_frame = [&] {
+      if (closes_frame)
+        device_->async_pipelines.AdvanceEpoch();
+    };
     if (hr == DXGI_STATUS_OCCLUDED) {
+      end_frame();
       // A client that waited before rendering must not lose its frame credit
       // when no presentation is submitted.
       if (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
@@ -1330,8 +1326,10 @@ public:
       return hr;
     }
     if ((PresentFlags & DXGI_PRESENT_DO_NOT_SEQUENCE) && !presentation_count_ &&
-        !(PresentFlags & DXGI_PRESENT_RESTART))
+        !(PresentFlags & DXGI_PRESENT_RESTART)) {
+      end_frame();
       return S_OK;
+    }
 
     // Waiting for a free queued-frame slot cannot hold the swapchain state
     // mutex: another thread may increase the limit or resize while we wait.
@@ -1451,16 +1449,14 @@ public:
     hr = present_queue->Present(this->presenter.ptr(), backbuffer.ptr(), present_semaphore_, vsync_duration,
                                 geometry, presentation_observer_, next_presentation_id_ + 1,
                                 presentation_observer_fault_, std::move(composition), do_not_wait, latency_,
-                                (PresentFlags & DXGI_PRESENT_RESTART) != 0, borrowed_credit);
+                                (PresentFlags & DXGI_PRESENT_RESTART) != 0, borrowed_credit, closes_frame);
 
     if (SUCCEEDED(hr)) {
+      end_frame();
       if (PresentFlags & DXGI_PRESENT_RESTART) {
         history_presents_ = 0;
         dxmt::InvalidateOutputStatistics(monitor_, this);
-        statistics_disjoint_ = true;
-        has_presentation_event_ = false;
-        earliest_presentation_id_ = next_presentation_id_ + 1;
-        statistics_clock_ = {};
+        ResetFrameStatisticsLocked();
       }
       admission.latency.reset();
       next_presentation_id_ += 1;

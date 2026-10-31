@@ -97,7 +97,7 @@ public:
     return &sm50_error_;
   }
 
-  operator sm50_error_t() {
+  operator sm50_error_t() const {
     return sm50_error_;
   }
 

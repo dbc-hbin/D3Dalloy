@@ -19,39 +19,49 @@ namespace dxmt {
 
 // Only the initial VS/PS/CS SM50Compile calls use this recorder. The bytecode
 // retains the input signature; IA elements below are the exact extracted Metal inputs.
-inline void
+inline bool
 RecordShaderCompileFailure(const char *stage, D3D12_SHADER_BYTECODE shader,
                            const SM50_SHADER_ROOT_SIGNATURE_DATA &root,
                            const SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-                           const char *entry, const std::string &error, bool explicit_root) noexcept {
+                           const char *entry, const std::string &error, bool explicit_root,
+                           const Sha1Digest *stage_key = nullptr) noexcept {
   // Function-local statics in this inline function are shared across translation units.
   static std::mutex mutex;
   static std::array<Sha1Digest, 64> identities{};
   static size_t count = 0;
   try {
     static const std::string directory = env::getEnvVar("DXMT_SHADER_FAILURE_PATH");
-    if (directory.empty()) return;
     // ponytail: serialize at most 64 failed pairs; a queue only helps if failure recording becomes hot.
     std::lock_guard<std::mutex> lock(mutex);
-    if (count == identities.size()) return;
+    if (count == identities.size()) return false;
     Sha1HashState hash;
     hash.update(stage, std::strlen(stage));
-    hash.update(shader.BytecodeLength);
-    hash.update(shader.pShaderBytecode, shader.BytecodeLength);
-    hash.update(root.bytecode_length);
-    hash.update(root.bytecode, root.bytecode_length);
+    if (directory.empty()) {
+      // Production does not need a replay capture. Use the existing stage key so
+      // deduplication does not hash full shader/root blobs on every failed PSO.
+      if (stage_key) hash.update(*stage_key);
+    } else {
+      hash.update(shader.BytecodeLength);
+      hash.update(shader.pShaderBytecode, shader.BytecodeLength);
+      hash.update(root.bytecode_length);
+      hash.update(root.bytecode, root.bytecode_length);
+      if (stage_key) hash.update(*stage_key);
+    }
     const auto identity = hash.final();
     for (size_t i = 0; i < count; ++i)
-      if (identities[i] == identity) return;
+      if (identities[i] == identity) return false;
     // Failed saves also consume a slot: broken paths must not cause unbounded retries/logs.
     identities[count++] = identity;
+    if (directory.empty()) return true;
 
     std::ostringstream metadata;
     metadata << "schema 1\nstage " << stage << "\nentry " << std::quoted(entry)
              << "\nroot_source " << (explicit_root ? "explicit" : "embedded_shader")
              << "\nshader_bytes " << shader.BytecodeLength << "\nroot_bytes " << root.bytecode_length
              << "\nshader_sha1 " << Sha1HashState::compute(shader.pShaderBytecode, shader.BytecodeLength).string()
-             << "\nroot_sha1 " << Sha1HashState::compute(root.bytecode, root.bytecode_length).string() << '\n';
+             << "\nroot_sha1 " << Sha1HashState::compute(root.bytecode, root.bytecode_length).string();
+    if (stage_key) metadata << "\nstage_key_sha1 " << stage_key->string();
+    metadata << '\n';
     // Each argument line is in original next-chain order. Values are decimal,
     // named after the public SM50 structs; quoted strings use std::quoted escaping.
     for (auto *arg = args; arg; arg = static_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(arg->next)) {
@@ -124,7 +134,7 @@ RecordShaderCompileFailure(const char *stage, D3D12_SHADER_BYTECODE shader,
                                               temporary + "\\stack.txt"};
     if (!CreateDirectoryA(temporary.c_str(), nullptr)) {
       WARN("D3D12 shader failure capture directory creation failed: error=", GetLastError());
-      return;
+      return true;
     }
     // Publish the entire directory only after every file closes successfully.
     const void *data[] = {shader.pShaderBytecode, root.bytecode, text.data(), error.data(), stack.data()};
@@ -169,6 +179,7 @@ RecordShaderCompileFailure(const char *stage, D3D12_SHADER_BYTECODE shader,
     if (exceptions.fetch_add(1, std::memory_order_relaxed) < 64)
       WARN("D3D12 shader failure capture failed: exception");
   }
+  return true;
 }
 
 } // namespace dxmt

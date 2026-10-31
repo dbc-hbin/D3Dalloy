@@ -5,6 +5,7 @@
 #include "../d3d12/d3d12_frame_generation_interfaces.hpp"
 #include "com/com_pointer.hpp"
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include <utility>
 
@@ -272,17 +273,13 @@ ffxReturnCode_t generate(Context& c, const ffxDispatchDescFrameGeneration& desc,
   if (code) return code;
   const auto color = p.present_color->GetDesc();
   if (color.Width != c.width || color.Height != c.height) return FFX_API_RETURN_ERROR_PARAMETER;
-  for (UINT i = 0; i < desc.numGeneratedFrames; ++i) {
-    code = resource(c, desc.outputs[i], &p.outputs[i], &p.output_states[i]);
-    if (code) return code;
-    const auto output = p.outputs[i]->GetDesc();
-    if (p.outputs[i] == p.present_color || p.outputs[i] == p.hudless_color ||
-        output.Width != color.Width || output.Height != color.Height || output.Format != color.Format ||
-        output.MipLevels != 1 || !(output.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
-      return FFX_API_RETURN_ERROR_PARAMETER;
-    for (UINT j = 0; j < i; ++j)
-      if (p.outputs[i] == p.outputs[j]) return FFX_API_RETURN_ERROR_PARAMETER;
-  }
+  code = resource(c, desc.outputs[0], &p.outputs[0], &p.output_states[0]);
+  if (code) return code;
+  const auto output = p.outputs[0]->GetDesc();
+  if (p.outputs[0] == p.present_color || p.outputs[0] == p.hudless_color ||
+      output.Width != color.Width || output.Height != color.Height || output.Format != color.Format ||
+      output.MipLevels != 1 || !(output.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+    return FFX_API_RETURN_ERROR_PARAMETER;
   Com<IMTLD3D12FrameGenerationCommandList> list;
   auto hr = static_cast<IUnknown*>(desc.commandList)->QueryInterface(IID_PPV_ARGS(&list));
   if (FAILED(hr)) return result(hr);
@@ -364,13 +361,22 @@ ffxReturnCode_t configureGeneration(Context& c, const ffxConfigureDescFrameGener
     *binding = {&c, desc.presentCallback, desc.presentCallbackUserContext, desc.frameGenerationCallback, desc.frameGenerationCallbackUserContext};
   }
   Snapshot* snapshot = nullptr;
+  bool redundant = false;
   if (desc.frameGenerationEnabled) {
     {
       DispatchLock lock(c);
+      // A repeated Configure for a recorded frame with identical values replaces
+      // nothing. Distinct frame IDs still count toward the 64-snapshot backpressure.
+      auto current = snapshotFor(c, desc.frameID);
+      redundant = current && current->frame == desc.frameID && current->flags == desc.flags &&
+          current->hudless.resource == desc.HUDLessColor.resource && current->hudless.state == desc.HUDLessColor.state &&
+          !std::memcmp(&current->hudless.description, &desc.HUDLessColor.description, sizeof(desc.HUDLessColor.description));
       UINT count = 0; bool replacing = false;
       for (auto s = c.snapshots; s; s = s->next) { ++count; replacing |= s->frame == desc.frameID; }
-      if (count >= 64 && !replacing) { if (changed) deallocate(c, binding); return FFX_API_RETURN_ERROR_RUNTIME_ERROR; }
+      if (!redundant && count >= 64 && !replacing) { if (changed) deallocate(c, binding); return FFX_API_RETURN_ERROR_RUNTIME_ERROR; }
     }
+  }
+  if (desc.frameGenerationEnabled && !redundant) {
     snapshot = static_cast<Snapshot*>(allocate(c, sizeof(Snapshot)));
     if (!snapshot) { if (changed) deallocate(c, binding); return FFX_API_RETURN_ERROR_MEMORY; }
     *snapshot = {nullptr, desc.frameID, desc.HUDLessColor, desc.flags};
@@ -388,11 +394,13 @@ ffxReturnCode_t configureGeneration(Context& c, const ffxConfigureDescFrameGener
     c.attached = sc; claimed = true;
     ReleaseSRWLockExclusive(&g_lock);
   }
-  if (desc.frameGenerationEnabled) {
+  // Configure(FALSE) runs only through this context, so an enabled context is already ON.
+  if (desc.frameGenerationEnabled && !c.enabled) {
     auto code = result(c.backend->Configure(TRUE));
     if (code) {
       if (claimed) { AcquireSRWLockExclusive(&g_lock); c.attached = nullptr; ReleaseSRWLockExclusive(&g_lock); }
-      releaseResource(snapshot->hudless); deallocate(c, snapshot); if (changed) deallocate(c, binding); return code;
+      if (snapshot) { releaseResource(snapshot->hudless); deallocate(c, snapshot); }
+      if (changed) deallocate(c, binding); return code;
     }
   }
   if (snapshot) {

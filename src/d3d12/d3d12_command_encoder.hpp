@@ -601,6 +601,7 @@ inline uint32_t MSAAIndexStride(SM50_MSAA_LINE_MODE line_mode, bool conservative
 }
 
 struct RenderEncoderData : EncoderData {
+  bool render_pass_requires_fence = false;
   // Every ordinary draw contributes its root/input and reflected table uses.
   // An unresolved or advanced draw permanently excludes the pass.
   bool submission_group_safe = false;
@@ -668,6 +669,17 @@ struct BlitEncoderData : EncoderData {
   bool submission_access_complete = true;
   size_t submission_copy_count = 0;
   std::vector<RecordedBufferAccess> submission_buffers;
+  // Whole-subresource texture copies the planner can describe; every other
+  // texture blit command clears submission_access_complete.
+  struct TextureAccess {
+    Rc<Texture> texture;
+    TextureViewKey key;
+    bool writes;
+  };
+  std::vector<TextureAccess> submission_textures;
+  // Whole buffers of tracked placed-footprint copies (UINT64_MAX = whole);
+  // readbacks write them, uploads read them.
+  std::vector<RecordedBufferAccess> submission_uploads;
   wmtcmd_blit_nop cmd_head;
   wmtcmd_base *cmd_tail;
 };
@@ -808,6 +820,7 @@ struct QueryEncoderData : EncoderData {
   WMT::Reference<WMT::MTL4CounterHeap> timestamp_samples;
   WMT::Reference<WMT::Buffer> source;
   WMT::Reference<WMT::Buffer> destination;
+  Rc<BufferAllocation> destination_allocation;
   WMT::Reference<WMT::Buffer> timestamp_dummy;
   WMT::Reference<WMT::ComputePipelineState> compute_pipeline;
   uint32_t start_index = 0;

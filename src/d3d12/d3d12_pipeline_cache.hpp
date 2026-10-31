@@ -33,17 +33,29 @@ HRESULT AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAGS control);
 struct AutomaticPipelineCacheFlight;
 struct PipelineCacheStorage;
 struct ShaderStageArtifact {
+  SM50Error failure;
+  int failure_result = 0;
+  size_t failure_bytes = 0;
   std::vector<uint8_t> library, metadata;
   std::vector<uint32_t> metadata_sizes;
   std::vector<uint64_t> constants;
   std::vector<SM50_CONSTANT_RELOCATION> relocations;
   SM50_COMPILED_BITCODE view{};
   size_t size() const {
-    return library.size() + metadata.size() + constants.size() * sizeof(uint64_t) +
+    return failure_bytes + library.size() + metadata.size() + constants.size() * sizeof(uint64_t) +
            relocations.size() * sizeof(SM50_CONSTANT_RELOCATION);
   }
 };
 class DeviceShaderArtifactCache;
+
+struct NativePipelineArtifact {
+  WMT::Reference<WMT::ComputePipelineState> compute;
+  WMT::Reference<WMT::RenderPipelineState> render;
+  std::vector<WMT::Reference<WMT4::Function>> parents;
+  WMT::Reference<WMT::Error> error;
+  bool retained() const { return compute || render; }
+  size_t size() const { return 0; }
+};
 
 // CPU-only output; every consumer creates its own native objects and relocated constants.
 struct WorkGraphArtifact : ShaderStageArtifact {
@@ -83,9 +95,14 @@ public:
   int Compile(Stage stage, DeviceShaderArtifactCache &artifacts, D3D12_SHADER_BYTECODE source,
               sm50_shader_t shader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
               const char *name, sm50_error_t *error);
+  const Sha1Digest &stageKey(Stage stage) const { return stage_keys_[stage]; }
   HRESULT GetBlob(ID3DBlob **blob);
   // Called after the complete native PSO initialization, never just shader compilation.
-  void Complete(HRESULT result) noexcept;
+  // `retain = false` (deferred native link) releases same-key waiters now but holds memory
+  // retention and disk publication until CommitDeferred(true) confirms the link succeeded.
+  void Complete(HRESULT result, bool retain = true) noexcept;
+  // Deferred link result: success retains/publishes the held entry, failure drops a disk entry.
+  void CommitDeferred(bool linked) noexcept;
   bool CanRetryAutomatic(HRESULT result) const {
     return result == E_INVALIDARG && automatic_loaded_ && !retry_;
   }
@@ -100,11 +117,16 @@ private:
   uint64_t adapter_ = 0;
   std::array<SM50ShaderBitcode, StageCount> compiled_;
   std::array<std::shared_ptr<const ShaderStageArtifact>, StageCount> stage_artifacts_;
+  std::array<Sha1Digest, StageCount> stage_keys_{};
   std::shared_ptr<const PipelineCacheStorage> blob_;
   std::shared_ptr<AutomaticPipelineCacheFlight> flight_;
   Sha1Digest automatic_key_{};
   uint64_t automatic_generation_ = 0;
   bool automatic_loaded_ = false, retry_ = false, bypass_automatic_ = false;
+  // Complete(hr, false): the entry CommitDeferred publishes once the native link succeeds.
+  bool deferred_retain_ = false, deferred_publish_ = false, deferred_disk_hit_ = false;
+  Sha1Digest deferred_key_{};
+  uint64_t deferred_generation_ = 0;
 };
 
 // Owned by one D3D12 device/compiler. Functions retain libraries independently of eviction.
@@ -129,11 +151,19 @@ public:
                                       sm50_bitcode_t owner, WMT::Error &error);
   WMT::Reference<WMT4::Function> SampleMaskFunction(WMT4::Library library, const char *name,
       D3D12_SHADER_BYTECODE root, uint32_t mask, WMT::Error &error);
+  WMT::Reference<WMT4::Function> Function(WMT4::Library library, const char *name);
+  std::shared_ptr<const NativePipelineArtifact> NativePipeline(WMT4::Compiler compiler,
+      const WMTComputePipelineInfo &info, WMT::Error &error);
+  std::shared_ptr<const NativePipelineArtifact> NativePipeline(WMT4::Compiler compiler,
+      const WMTRenderPipelineInfo &info, WMT::Error &error);
+  std::shared_ptr<const NativePipelineArtifact> NativePipeline(WMT4::Compiler compiler,
+      const WMTMeshRenderPipelineInfo &info, WMT::Error &error);
   // Synchronous/non-escaping: pass std::ref(local lowering lambda) to avoid callable allocation.
   int Compile(const char *family, std::initializer_list<D3D12_SHADER_BYTECODE> sources,
               SM50_SHADER_COMPILATION_ARGUMENT_DATA *args, const char *name, sm50_bitcode_t *output,
               sm50_error_t *error, std::shared_ptr<const ShaderStageArtifact> &artifact,
-              const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &compile);
+              const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &compile,
+              Sha1Digest *stage_key = nullptr);
   int CompileShader(D3D12_SHADER_BYTECODE source, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
                     const char *name, sm50_bitcode_t *output, sm50_error_t *error,
                     std::shared_ptr<const ShaderStageArtifact> &artifact);

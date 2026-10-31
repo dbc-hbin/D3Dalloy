@@ -28,11 +28,9 @@ namespace dxmt {
 namespace {
 
 /*
- * RDAT part types (DxilRuntimeReflection.h RuntimeDataPartType): the string buffer, the
- * index arrays (each array is { u32 count; u32 elements[count] } addressed by its word
- * offset), the raw bytes and the subobject table.
- *
- * Subobject record payloads after { Kind, Name } (RDAT_SubobjectTypes.inl), verified against
+ * Rust (dxmt_shader_rdat_subobjects) validates the RDAT parts and each subobject
+ * record of DxilRuntimeReflection.h RuntimeDataPartType::SubobjectTable = 6.
+ * Record payloads after { Kind, Name } (RDAT_SubobjectTypes.inl), verified against
  * DXC 1.9 output of graphics-translator/tests/dxil/raytracing-stateobj.hlsl:
  *   StateObjectConfig            { u32 Flags }
  *   Global/LocalRootSignature    { u32 RawBytesOffset; u32 Size }
@@ -42,113 +40,59 @@ namespace {
  *   HitGroup                     { u32 Type; u32 AnyHit; u32 ClosestHit; u32 Intersection }
  *   RaytracingPipelineConfig1    { u32 MaxTraceRecursionDepth; u32 Flags }
  */
-constexpr uint32_t kPartStrings = 1, kPartIndexArrays = 2, kPartRawBytes = 5, kPartSubobjects = 6;
-
-struct Part {
-  const uint8_t *data = nullptr;
-  size_t size = 0;
-};
-
-uint32_t ReadU32(const uint8_t *p) {
-  uint32_t value;
-  std::memcpy(&value, p, sizeof(value));
-  return value;
-}
 
 /* Names are HLSL identifiers and export names (ASCII); widened code unit by code unit. */
-bool ReadString(const Part &strings, uint32_t offset, std::wstring &out) {
-  if (!strings.data || offset >= strings.size)
-    return false;
-  const char *text = reinterpret_cast<const char *>(strings.data + offset);
-  const size_t length = strnlen(text, strings.size - offset);
-  if (length == strings.size - offset)
-    return false;
-  out.assign(text, text + length);
-  return true;
+std::wstring Widen(const uint8_t *bytes, DxmtShaderSpan span) {
+  const char *text = reinterpret_cast<const char *>(bytes + span.offset);
+  return std::wstring(text, text + span.size);
 }
 
 } // namespace
 
 HRESULT ReadDxilLibrarySubobjects(const void *blob, size_t size, std::vector<DxilSubobject> &out) {
   out.clear();
-  microsoft::CDXBCParser parser;
-  if (!blob || !size || size > UINT32_MAX || FAILED(parser.ReadDXBC(blob, UINT32(size))))
+  DxmtRdatSubobjects table;
+  if (!blob || !size || size > UINT32_MAX || dxmt_shader_rdat_subobjects(blob, size, &table))
     return E_INVALIDARG;
-  const UINT32 index = parser.FindNextMatchingBlob(
-      microsoft::DXBCFourCC(UINT('R') | UINT('D') << 8 | UINT('A') << 16 | UINT('T') << 24)
-  );
-  if (index == DXBC_BLOB_NOT_FOUND)
+  if (!table.present)
     return S_OK;
-  const auto *rdat = static_cast<const uint8_t *>(parser.GetBlob(index));
-  const size_t rdat_size = parser.GetBlobSize(index);
-  if (!rdat || rdat_size < 8)
-    return E_INVALIDARG;
-  const uint32_t part_count = ReadU32(rdat + 4);
-  if (8 + uint64_t(part_count) * 4 > rdat_size)
-    return E_INVALIDARG;
-  Part strings, indices, raw, table;
-  for (uint32_t i = 0; i < part_count; ++i) {
-    const uint32_t offset = ReadU32(rdat + 8 + 4 * i);
-    if (offset > rdat_size || rdat_size - offset < 8)
-      return E_INVALIDARG;
-    const uint32_t type = ReadU32(rdat + offset), part_size = ReadU32(rdat + offset + 4);
-    if (part_size > rdat_size - offset - 8)
-      return E_INVALIDARG;
-    const Part part{rdat + offset + 8, part_size};
-    if (type == kPartStrings)
-      strings = part;
-    else if (type == kPartIndexArrays)
-      indices = part;
-    else if (type == kPartRawBytes)
-      raw = part;
-    else if (type == kPartSubobjects)
-      table = part;
-  }
-  if (!table.data)
-    return S_OK;
-  if (table.size < 8)
-    return E_INVALIDARG;
-  const uint32_t count = ReadU32(table.data), stride = ReadU32(table.data + 4);
-  if (stride < 24 || 8 + uint64_t(count) * stride > table.size)
-    return E_INVALIDARG;
-
+  const auto *bytes = static_cast<const uint8_t *>(blob);
   try {
-    out.reserve(count);
-    for (uint32_t i = 0; i < count; ++i) {
-      const uint8_t *record = table.data + 8 + size_t(i) * stride;
-      const uint32_t w[4] = {ReadU32(record + 8), ReadU32(record + 12), ReadU32(record + 16), ReadU32(record + 20)};
-      DxilSubobject subobject{};
-      subobject.kind = static_cast<DxilSubobjectKind>(ReadU32(record));
-      if (!ReadString(strings, ReadU32(record + 4), subobject.name) || subobject.name.empty())
+    out.reserve(table.record_count);
+    for (uint32_t i = 0; i < table.record_count; ++i) {
+      DxmtRdatSubobject record;
+      switch (dxmt_shader_rdat_subobject(blob, size, &table, i, &record)) {
+      case DXMT_SHADER_BYTECODE_SUCCESS:
+        break;
+      case DXMT_SHADER_BYTECODE_RDAT_KIND:
+        /* A subobject kind this table cannot describe would be dropped silently. */
+        return E_NOTIMPL;
+      default:
         return E_INVALIDARG;
+      }
+      const uint32_t *w = record.words;
+      DxilSubobject subobject{};
+      subobject.kind = static_cast<DxilSubobjectKind>(record.kind);
+      subobject.name = Widen(bytes, record.name);
       switch (subobject.kind) {
       case DxilSubobjectKind::StateObjectConfig:
         subobject.state_object_flags = static_cast<D3D12_STATE_OBJECT_FLAGS>(w[0]);
         break;
       case DxilSubobjectKind::GlobalRootSignature:
       case DxilSubobjectKind::LocalRootSignature:
-        if (!raw.data || !w[1] || w[0] > raw.size || w[1] > raw.size - w[0])
-          return E_INVALIDARG;
-        subobject.root_signature.assign(raw.data + w[0], raw.data + w[0] + w[1]);
+        subobject.root_signature.assign(bytes + record.root_signature.offset,
+                                        bytes + record.root_signature.offset + record.root_signature.size);
         break;
-      case DxilSubobjectKind::SubobjectToExportsAssociation: {
-        if (!ReadString(strings, w[0], subobject.associated_subobject) || subobject.associated_subobject.empty())
-          return E_INVALIDARG;
-        /* The export list is an index array: a word offset to { count, string offsets... }. */
-        if (!indices.data || uint64_t(w[1]) * 4 + 4 > indices.size)
-          return E_INVALIDARG;
-        const uint8_t *array = indices.data + size_t(w[1]) * 4;
-        const uint32_t export_count = ReadU32(array);
-        if ((uint64_t(w[1]) + 1 + export_count) * 4 > indices.size)
-          return E_INVALIDARG;
-        for (uint32_t j = 0; j < export_count; ++j) {
-          std::wstring name;
-          if (!ReadString(strings, ReadU32(array + 4 + 4 * j), name) || name.empty())
+      case DxilSubobjectKind::SubobjectToExportsAssociation:
+        subobject.associated_subobject = Widen(bytes, record.strings[0]);
+        subobject.exports.reserve(record.export_count);
+        for (uint32_t j = 0; j < record.export_count; ++j) {
+          DxmtShaderSpan name;
+          if (dxmt_shader_rdat_export(blob, size, &table, &record, j, &name))
             return E_INVALIDARG;
-          subobject.exports.push_back(std::move(name));
+          subobject.exports.push_back(Widen(bytes, name));
         }
         break;
-      }
       case DxilSubobjectKind::RaytracingShaderConfig:
         subobject.shader_config = {w[0], w[1]};
         break;
@@ -159,16 +103,11 @@ HRESULT ReadDxilLibrarySubobjects(const void *blob, size_t size, std::vector<Dxi
         subobject.pipeline_config = {w[0], static_cast<D3D12_RAYTRACING_PIPELINE_FLAGS>(w[1])};
         break;
       case DxilSubobjectKind::HitGroup:
-        if (w[0] != D3D12_HIT_GROUP_TYPE_TRIANGLES && w[0] != D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE)
-          return E_INVALIDARG;
         subobject.hit_group_type = static_cast<D3D12_HIT_GROUP_TYPE>(w[0]);
-        if (!ReadString(strings, w[1], subobject.any_hit) || !ReadString(strings, w[2], subobject.closest_hit) ||
-            !ReadString(strings, w[3], subobject.intersection))
-          return E_INVALIDARG;
+        subobject.any_hit = Widen(bytes, record.strings[0]);
+        subobject.closest_hit = Widen(bytes, record.strings[1]);
+        subobject.intersection = Widen(bytes, record.strings[2]);
         break;
-      default:
-        /* A subobject kind this table cannot describe would be dropped silently. */
-        return E_NOTIMPL;
       }
       out.push_back(std::move(subobject));
     }

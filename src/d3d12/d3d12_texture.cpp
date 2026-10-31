@@ -1788,6 +1788,7 @@ public:
     if (!texture->view(View).texture)
       return E_OUTOFMEMORY;
     RenderTargetDesc.Texture = texture.ptr();
+    RenderTargetDesc.Owner = owned_id;
     RenderTargetDesc.View = View;
     RenderTargetDesc.Width = texture->width(View);
     RenderTargetDesc.Height = texture->height(View);
@@ -1928,6 +1929,7 @@ public:
     if (!texture->view(View).texture)
       return E_OUTOFMEMORY;
     RenderTargetDesc.Texture = texture.ptr();
+    RenderTargetDesc.Owner = owned_id;
     RenderTargetDesc.View = View;
     RenderTargetDesc.Width = std::max<uint32_t>(1u, texture->width() >> view_descriptor.firstMiplevel);
     RenderTargetDesc.Height = std::max<uint32_t>(1u, texture->height() >> view_descriptor.firstMiplevel);
