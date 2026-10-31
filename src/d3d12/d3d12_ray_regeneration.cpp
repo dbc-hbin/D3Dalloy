@@ -27,6 +27,7 @@ struct Core {
   WMT::Reference<WMT::SharedEvent> timeline;
   std::mutex mutex;
   uint64_t sequence = 0;
+  uint64_t last_queue = 0; // owned id of the queue that encoded `sequence`
   ~Core() {
     if (feature) WMT::Metal4Invoke(WMTMetal4RRDormant, feature.handle);
   }
@@ -164,15 +165,21 @@ std::array<D3D12_RESOURCE_STATES, MTL_RAY_REGENERATION_RESOURCE_COUNT>
 GetOwnedRayRegenerationStates(const std::shared_ptr<OwnedRayRegenerationFrame> &frame) {
   return frame->states;
 }
+uint64_t OwnedRayRegenerationFrameHistoryQueue(const std::shared_ptr<OwnedRayRegenerationFrame> &frame) {
+  auto &core = *frame->core;
+  std::lock_guard lock(core.mutex);
+  return core.sequence ? core.last_queue : 0;
+}
 void EncodeOwnedRayRegenerationFrame(const std::shared_ptr<OwnedRayRegenerationFrame> &frame,
-    WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence,
+    WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence, uint64_t queue,
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
     const std::function<void(WMT::Event, uint64_t)> &signal_event) {
   auto &core = *frame->core;
   std::lock_guard lock(core.mutex);
   // Native history is per context: order executions across queues.
-  if (core.sequence) wait_event(core.timeline, core.sequence);
+  if (core.sequence && core.last_queue != queue) wait_event(core.timeline, core.sequence);
   const auto sequence = ++core.sequence;
+  core.last_queue = queue;
   const auto call = WMT::Metal4Invoke(WMTMetal4RREncode, cmdbuf.handle, frame->native.handle, fence.handle);
   if (call.ret[0]) core.device->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
   // Commit even partial native work before signaling, so another queue cannot strand.

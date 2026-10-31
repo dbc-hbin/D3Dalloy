@@ -19,8 +19,10 @@ GetOwnedRayRegenerationResources(const std::shared_ptr<OwnedRayRegenerationFrame
 std::array<D3D12_RESOURCE_STATES, MTL_RAY_REGENERATION_RESOURCE_COUNT>
 GetOwnedRayRegenerationStates(const std::shared_ptr<OwnedRayRegenerationFrame> &);
 bool IsOwnedRayRegenerationOutput(size_t index);
+// See OwnedTemporalFrameHistoryQueue.
+uint64_t OwnedRayRegenerationFrameHistoryQueue(const std::shared_ptr<OwnedRayRegenerationFrame> &);
 void EncodeOwnedRayRegenerationFrame(const std::shared_ptr<OwnedRayRegenerationFrame> &,
-    WMT::MTL4CommandBuffer, WMT::Fence,
+    WMT::MTL4CommandBuffer, WMT::Fence, uint64_t queue,
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
     const std::function<void(WMT::Event, uint64_t)> &signal_event);
 } // namespace dxmt

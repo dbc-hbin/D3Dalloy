@@ -19,8 +19,10 @@ HRESULT GenerateOwnedFrameGenerationFrame(MTLD3D12Device *, IMTLD3D12FrameGenera
 std::array<MTLD3D12Resource *, 8> GetOwnedFrameGenerationResources(const std::shared_ptr<OwnedFrameGenerationFrame> &);
 std::array<D3D12_RESOURCE_STATES, 8> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &);
 bool IsOwnedFrameGenerationOutput(const std::shared_ptr<OwnedFrameGenerationFrame> &, size_t index);
+// See OwnedTemporalFrameHistoryQueue.
+uint64_t OwnedFrameGenerationFrameHistoryQueue(const std::shared_ptr<OwnedFrameGenerationFrame> &);
 void EncodeOwnedFrameGenerationFrame(const std::shared_ptr<OwnedFrameGenerationFrame> &,
-    WMT::MTL4CommandBuffer, WMT::Fence,
+    WMT::MTL4CommandBuffer, WMT::Fence, uint64_t queue,
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
     const std::function<void(WMT::Event, uint64_t)> &signal_event);
 } // namespace dxmt

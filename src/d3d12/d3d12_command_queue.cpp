@@ -688,6 +688,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   const uint64_t owned_id_ = owned_graphics::NewObjectId();
   D3D12_COMMAND_QUEUE_DESC desc_;
+  // Submission labels only serve debugging tools: the D3D12 debug layer,
+  // structured tracing, or a Metal capture. Each costs a string and a unix call.
+  // Declared before the worker threads, so it is set before they start.
+  const bool label_submissions_ = owned_graphics::TraceEnabled() || device_->runtime_configuration.debug ||
+                                  env::getEnvVar("MTL_CAPTURE_ENABLED") == "1";
 
   WMT::Reference<WMT::MTL4CommandQueue> queue_;
   WMT::Reference<WMT::Fence> fence_;
@@ -1279,8 +1284,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     uint64_t seq;
     InflightCommandBuffer &inflight;
     WMT::Reference<WMT::Object> pool;
-    WMT::Reference<WMT::Event> signal_event;
-    uint64_t signal_value = 0;
+    // Queue-level event signals issued right after this command buffer commits.
+    std::vector<std::pair<WMT::Reference<WMT::Event>, uint64_t>> signals;
     bool timestamp_predecessors_ordered = false;
     // This stays locked through the destructor's commit(), then releases. No
     // GPU completion or ring-capacity wait occurs while it is held.
@@ -1306,8 +1311,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       slot.allocator.reset();
       slot.cmdbuf.begin(slot.allocator);
       inflight.cmdbuf = slot.cmdbuf;
-      auto label = str::format("D3D12 queue ", queue->owned_id_, " submission ", seq);
-      if (inflight.cmdbuf.diagnostic(3, label.data(), label.size())) queue->device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
+      if (queue->label_submissions_) {
+        auto label = str::format("D3D12 queue ", queue->owned_id_, " submission ", seq);
+        if (inflight.cmdbuf.diagnostic(3, label.data(), label.size()))
+          queue->device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
+      }
       for (const auto &group : queue->diagnostic_groups_)
         if (inflight.cmdbuf.diagnostic(1, group.data(), group.size())) queue->device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
     };
@@ -1321,8 +1329,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       }
       inflight.cpu_submit_ns = owned_graphics::NowNs();
       inflight.submission = queue->device_->CommitMetal4CommandBuffers(queue->queue_, &buffer, 1);
-      if (signal_event)
-        queue->queue_.signalEvent(signal_event, signal_value);
+      for (const auto &[event, value] : signals)
+        queue->queue_.signalEvent(event, value);
       owned_graphics::Trace("submit", ",\"queue\":", queue->owned_id_, ",\"submission\":", seq,
                             ",\"cpu_submit_ns\":", inflight.cpu_submit_ns);
       queue->submission_ring_.publish(seq);
@@ -1403,6 +1411,36 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
           device_->ReportRemoval(E_OUTOFMEMORY);
         } catch (HRESULT reason) {
           device_->ReportRemoval(reason);
+        }
+      } else if (auto *present = std::get_if<PresentTask>(&task);
+                 present && !cancel_unsubmitted_ && device_->RemovedReason() == S_OK) {
+        // Signals queued directly behind a Present retire with its command
+        // buffer instead of an empty submission. A Present that encodes nothing
+        // (restart skip, cancellation) leaves them for an ordinary batch after it.
+        std::vector<SignalTask> signals;
+        try {
+          QueueTask next;
+          while (task_fifo_.tryPop(next)) {
+            if (auto *next_signal = std::get_if<SignalTask>(&next))
+              signals.push_back(std::move(*next_signal));
+            else {
+              pending_task = std::move(next);
+              break;
+            }
+          }
+        } catch (const std::bad_alloc &) {
+          device_->ReportRemoval(E_OUTOFMEMORY);
+        }
+        try {
+          ProcessPresent(*present, &signals);
+        } catch (HRESULT reason) {
+          device_->ReportRemoval(reason);
+          CancelPresent(*present);
+        }
+        try {
+          if (!signals.empty()) ProcessSignalBatch(signals);
+        } catch (const std::bad_alloc &) {
+          device_->ReportRemoval(E_OUTOFMEMORY);
         }
       } else {
         ProcessTask(task);
@@ -8063,11 +8101,22 @@ public:
         case EncoderType::Temporal: {
           auto data = static_cast<TemporalEncoderData *>(current);
 
-          // History waits precede this feature commit, not application work
-          // already encoded into the prior segment.
-          scope.reset();
-          if (!start_segment())
-            return;
+          // A feature last evaluated by another queue waits for its history
+          // timeline at queue level. That wait must precede only this feature
+          // commit, not application work already encoded into the prior segment.
+          // A same-queue predecessor needs neither the wait nor its own command
+          // buffer: a consumer queue barrier below orders this encode after it.
+          // Every temporal segment holds the device temporal mutex, so the
+          // history queue cannot change before the encode below.
+          const uint64_t history_queue = data->fg_frame ? OwnedFrameGenerationFrameHistoryQueue(data->fg_frame)
+              : data->rr_frame ? OwnedRayRegenerationFrameHistoryQueue(data->rr_frame)
+              : OwnedTemporalFrameHistoryQueue(data->frame);
+          const bool cross_queue_history = history_queue && history_queue != owned_id_;
+          if (cross_queue_history) {
+            scope.reset();
+            if (!start_segment())
+              return;
+          }
           auto temporal_cmdbuf = scope->inflight.cmdbuf;
           if (data->fg_frame) scope->inflight.frame_generation_frames.push_back(data->fg_frame);
           else if (data->rr_frame) scope->inflight.ray_regeneration_frames.push_back(data->rr_frame);
@@ -8097,18 +8146,38 @@ public:
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
             return;
           }
+          // Recording the timeline signal must not fail after the native encode.
+          scope->signals.reserve(scope->signals.size() + 1);
+          if (history_queue == owned_id_) {
+            // The skipped timeline wait ordered this encode after all earlier queue
+            // work, including internal MetalFX encoders of the previous evaluation
+            // that fence_ does not cover. A consumer queue barrier keeps that order
+            // on the GPU without a commit or event.
+            auto order = temporal_cmdbuf.computeCommandEncoder();
+            order.barrierAfterQueueStages(WMTMetal4StageAll,
+                WMTMetal4StageDispatch | WMTMetal4StageBlit | WMTMetal4StageAccelerationStructure,
+                WMTMetal4VisibilityDevice);
+            order.endEncoding();
+            owned_graphics::Trace("temporal_history_queue_barrier", ",\"queue\":", owned_id_,
+                ",\"submission\":", scope->seq, ",\"encoder\":", current->id, ",\"barrier_count\":1");
+          }
           const auto wait = [&](WMT::Event event, uint64_t value) { queue_.waitForEvent(event, value); };
+          // The timeline is signaled after the commit of the command buffer that
+          // holds this encode, partial or not. Cross-queue history commits here so
+          // the next waiter is released promptly; a same-queue encode rides the
+          // commit of the current segment.
           const auto signal = [&](WMT::Event event, uint64_t value) {
-            scope->signal_event = event;
-            scope->signal_value = value;
-            scope.reset();
+            scope->signals.emplace_back(event, value);
+            if (cross_queue_history) scope.reset();
           };
-          if (data->fg_frame) EncodeOwnedFrameGenerationFrame(data->fg_frame, temporal_cmdbuf, fence_, wait, signal);
-          else if (data->rr_frame) EncodeOwnedRayRegenerationFrame(data->rr_frame, temporal_cmdbuf, fence_, wait, signal);
+          if (data->fg_frame)
+            EncodeOwnedFrameGenerationFrame(data->fg_frame, temporal_cmdbuf, fence_, owned_id_, wait, signal);
+          else if (data->rr_frame)
+            EncodeOwnedRayRegenerationFrame(data->rr_frame, temporal_cmdbuf, fence_, owned_id_, wait, signal);
           else EncodeOwnedTemporalFrame(data->frame, temporal_cmdbuf, fence_, owned_id_, scope->seq, current->id, wait, signal);
           // Reacquire the device submission lock only after the feature mutex
           // has been released, preserving device-lock then feature-lock order.
-          if (!start_segment())
+          if (cross_queue_history && !start_segment())
             return;
           if (!EndStandardSwizzlePass(scope->inflight.cmdbuf, scope->inflight, swizzle_uses)) {
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
@@ -8879,7 +8948,7 @@ public:
   }
 
   void
-  ProcessPresent(PresentTask &task) {
+  ProcessPresent(PresentTask &task, std::vector<SignalTask> *folded_signals = nullptr) {
     if (device_->RemovedReason() != S_OK) {
       CancelPresent(task);
       return;
@@ -8915,7 +8984,7 @@ public:
       return;
     }
     try {
-      EncodePresent(task);
+      EncodePresent(task, folded_signals);
     } catch (const std::bad_alloc &) {
       ERR("D3D12: Present command allocation failed");
       device_->ReportRemoval(E_OUTOFMEMORY);
@@ -8928,25 +8997,40 @@ public:
   }
 
   void
-  EncodePresent(PresentTask &task) {
+  EncodePresent(PresentTask &task, std::vector<SignalTask> *folded_signals) {
     // Order presents from different queues on the GPU timeline, as D3DMetal
     // 4.0b3 DoPresent does: frame N's commands wait for N-1's signal without
     // blocking on GPU completion. A canceled order signals UINT64_MAX.
     auto order_event = task.presenter->presentOrderEvent();
     const uint64_t frame_id = task.state->frame_id;
     queue_.waitForEvent(order_event, frame_id - 1);
-    EncodePresentCommitted(task, order_event, frame_id);
+    EncodePresentCommitted(task, order_event, frame_id, folded_signals);
     // The native present ran in the scope destructor's commit; publish encoding
     // only now, so a later frame on another queue presents after this one.
     task.state.reset();
   }
 
   void
-  EncodePresentCommitted(PresentTask &task, WMT::SharedEvent order_event, uint64_t frame_id) {
+  EncodePresentCommitted(PresentTask &task, WMT::SharedEvent order_event, uint64_t frame_id,
+                         std::vector<SignalTask> *folded_signals) {
     auto scope = StartCommitting();
     if (device_->RemovedReason() != S_OK) {
       CancelPresent(task);
       return;
+    }
+    if (folded_signals && !folded_signals->empty()) {
+      // Published on validated retirement of this command buffer, like any
+      // queue signal; device removal before then suppresses them alike.
+      for (const auto &signal : *folded_signals) {
+        owned_graphics::Trace("signal", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
+                              ",\"fence\":", signal.fence_id, ",\"value\":", signal.ticket.value,
+                              ",\"generation\":", signal.ticket.generation, ",\"folded\":1");
+        owned_graphics::Trace("signal_committed", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
+                              ",\"fence\":", signal.fence_id, ",\"value\":", signal.ticket.value,
+                              ",\"generation\":", signal.ticket.generation, ",\"folded\":1");
+      }
+      scope.inflight.fence_completions = std::move(*folded_signals);
+      folded_signals->clear();
     }
     auto &cmdbuf = scope.inflight.cmdbuf;
     // Present reads the backbuffer outside planner tracking.
@@ -9026,8 +9110,7 @@ public:
       encoder.endEncoding();
     }
     queue_.waitForDrawable(drawable);
-    scope.signal_event = order_event;
-    scope.signal_value = frame_id;
+    scope.signals.emplace_back(order_event, frame_id);
     if (task.observer && !drawable.observePresentation(task.observer, task.present_id)) {
       task.observer.cancel(task.present_id);
       task.observer_fault->store(true, std::memory_order_release);

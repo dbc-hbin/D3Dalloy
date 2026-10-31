@@ -259,7 +259,14 @@ typedef struct {
 @end
 @implementation DXMTM4ComputeEncoder
 @end
-@interface DXMTM4RenderEncoder : DXMTM4Encoder
+@interface DXMTM4RenderEncoder : DXMTM4Encoder {
+@public
+  /* Last indexed-draw buffer of this encoder, already leased by its recording.
+   * Repeated draws from one index buffer skip the lease and ObjC queries. */
+  uint64_t indexHandle;
+  MTLGPUAddress indexAddress;
+  NSUInteger indexLength;
+}
 @end
 @implementation DXMTM4RenderEncoder
 @end
@@ -704,10 +711,25 @@ static MTLGPUAddress m4_address(DXMTM4Recording *recording, uint64_t handle, uin
   if (!buffer || offset>buffer.length) { m4_error(recording,@"Metal4 indirect/index buffer is out of range"); return 0; }
   return buffer.gpuAddress+offset;
 }
-static NSUInteger m4_index_length(DXMTM4Recording *recording, uint64_t handle, uint64_t offset) {
-  id<MTLBuffer> buffer=m4obj(handle);
-  if (!buffer || offset>buffer.length) { m4_error(recording,@"Metal4 index buffer offset is out of range"); return 0; }
-  return buffer.length-offset;
+
+/* Resolves an indexed-draw buffer range for one render encoder. An encoder
+ * belongs to exactly one recording, so a cached buffer remains leased by it. */
+static BOOL m4_index_range(DXMTM4RenderEncoder *context, uint64_t handle, uint64_t offset,
+                           MTLGPUAddress *address, NSUInteger *length) {
+  if (!handle || handle != context->indexHandle) {
+    id<MTLBuffer> buffer=m4obj(handle); m4_allocation(context->recording,buffer);
+    if (!buffer) {
+      m4_error(context->recording,@"Metal4 indirect/index buffer is out of range"); *address=0; *length=0;
+      return NO;
+    }
+    context->indexHandle=handle; context->indexAddress=buffer.gpuAddress; context->indexLength=buffer.length;
+  }
+  if (offset>context->indexLength) {
+    m4_error(context->recording,@"Metal4 indirect/index buffer is out of range"); *address=0; *length=0;
+    return NO;
+  }
+  *address=context->indexAddress+offset; *length=context->indexLength-offset;
+  return YES;
 }
 
 static MTL4RenderPassDescriptor *m4_render_pass(DXMTM4CommandBuffer *context, const struct WMTRenderPassInfo *info) {
@@ -1582,11 +1604,13 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
     }
     case WMTRenderCommandDrawIndexed: {
       struct wmtcmd_render_draw_indexed *body = (struct wmtcmd_render_draw_indexed *)next;
+      MTLGPUAddress index_address; NSUInteger index_length;
+      m4_index_range(context,body->index_buffer,body->index_buffer_offset,&index_address,&index_length);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                           indexCount:body->index_count
                            indexType:(MTLIndexType)body->index_type
-                         indexBuffer:m4_address(context->recording,body->index_buffer,body->index_buffer_offset)
-                   indexBufferLength:m4_index_length(context->recording,body->index_buffer,body->index_buffer_offset)
+                         indexBuffer:index_address
+                   indexBufferLength:index_length
                        instanceCount:body->instance_count
                           baseVertex:body->base_vertex
                         baseInstance:body->base_instance];
@@ -1603,10 +1627,12 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
     }
     case WMTRenderCommandDrawIndexedIndirect: {
       struct wmtcmd_render_draw_indexed_indirect *body = (struct wmtcmd_render_draw_indexed_indirect *)next;
+      MTLGPUAddress index_address; NSUInteger index_length;
+      m4_index_range(context,body->index_buffer,body->index_buffer_offset,&index_address,&index_length);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                            indexType:(MTLIndexType)body->index_type
-                         indexBuffer:m4_address(context->recording,body->index_buffer,body->index_buffer_offset)
-                   indexBufferLength:m4_index_length(context->recording,body->index_buffer,body->index_buffer_offset)
+                         indexBuffer:index_address
+                   indexBufferLength:index_length
                       indirectBuffer:m4_address(context->recording,body->indirect_args_buffer,body->indirect_args_offset)];
       if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_DRAW_INDEXED_INDIRECT encoder=%llu argument_buffer=%llu argument_offset=%llu primitive_type=%u index_type=%u index_buffer=%llu index_offset=%llu\n",
           (unsigned long long)(uintptr_t)encoder,(unsigned long long)body->indirect_args_buffer,
