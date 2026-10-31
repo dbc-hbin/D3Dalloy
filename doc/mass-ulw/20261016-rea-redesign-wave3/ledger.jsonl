@@ -1,0 +1,8 @@
+{"event":"beta3-observation","status":"observed","evidence":"REA beta3 DoExecute contains FoldedSignal vector handling before MTL4 commit; beta3 binary SHA256 a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660."}
+{"event":"implementation","status":"completed","evidence":"DXMT now folds only consecutive SignalTask items already present in the queue; first non-signal is held pending and processed after the batch. InflightCommandBuffer retains every logical SignalTask and retirement marks each ticket."}
+{"event":"build","status":"passed","evidence":"ninja -C build/local/wave2-build -j8 completed with existing 14 missing-override warnings only."}
+{"event":"gpu-query","status":"passed","evidence":"build/local/wave3-query-output-001/result.json: exit_code=0, validation_errors=[], pass=true, native-only owned modules."}
+{"event":"review","status":"found-and-fixed","evidence":"remove-ai-slops found unconditional DontCare checks on unattached render slots and unguarded bad_alloc during signal vector growth. Fixed both; no speculative helper/dead code was reported."}
+{"event":"final-build","status":"passed","evidence":"Rebuilt current source with ninja -C build/local/wave2-build -j8; existing 14 missing-override warnings only."}
+{"event":"final-query","status":"passed","evidence":"build/local/wave3-query-output-002/result.json: exit_code=0, validation_errors=[], pass=true, native-only owned modules."}
+{"event":"focused-diagnostics","status":"passed","evidence":"execution_graph (1 test) and multiqueue (2 tests) both passed; git diff --check passed."}

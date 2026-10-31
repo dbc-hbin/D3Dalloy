@@ -17,12 +17,14 @@ python3 scripts/test-owned-graphics-build.py
 python3 scripts/test-owned-graphics-staging.py
 python3 scripts/test-owned-graphics-diagnostics.py
 python3 scripts/test-owned-ngx-frontend.py
+python3 graphics-translator/tests/run-command-recording-cpu.py
 ```
 
 - `build`: frozen import builder의 pin/patch/input/artifact 계약이며 현재 루트 translator 전체 빌드가 아니다.
 - `staging`: 격리 복사·manifest·ABI/architecture·wrapper·dependency gate.
 - `diagnostics`: runner의 suite marker/readback/validation 판정.
-- `ngx-frontend`: 현재 소스에서 frontend DLL을 CPU/PE로 만들고 exports/MSVC parameter ABI를 검사한다. GPU나 NVIDIA DLSS 품질 증거가 아니다.
+- `ngx-frontend`: 현재 소스에서 frontend DLL을 CPU/PE로 만들고 exports/MSVC parameter ABI를 검사한다. `--abi-only --all-abis`는 x86/x64/ARM64/ARM64EC의 SR/FG/RR exports·calling convention과 RR 1.2·legacy 1.0/1.1·bridge POD의 MSVC/MinGW C/C++ layout을 비교한다. GPU나 NVIDIA DLSS 품질 증거가 아니다.
+- `run-command-recording-cpu`: 실제 allocator·recording·Signal 함수 본문을 ASan/UBSan으로 실행한다. 최초 할당과 arena 확장/metadata 할당 실패의 소유권 rollback, void recording의 첫 오류와 `Close`/HRESULT 전파, trace 비활성 시 불필요한 할당 부재 및 commit 이후 독립 snapshot 수명을 검사한다.
 
 `enable_tests=true`의 업스트림 DX11 samples 및 수동 CPU `*.test.cpp` probes와 공용 PE/GPU runner는 별개다. 일반 project-wide lint/자동 GPU suite가 있다고 가정하지 않는다.
 
@@ -34,7 +36,7 @@ python3 graphics-translator/tests/run-automatic-cache-cpu.py \
   --out build/local/automatic-cache-cpu-001
 ```
 
-내용 readback, 256MiB 한도에서 같은 key 교체, 다른 프로세스의 저장·clear, rename 실패와 mutex 소유자 종료 뒤 복구, foreign file 보존을 검사한다. Runner는 전용 prefix/TEMP를 만들고 해당 Wine 종료 뒤 제거한다. `metadata_enumerations`는 256회 작은 저장의 관측값이며 시간 기반 합격 기준이 아니다.
+내용 readback, 256MiB 한도에서 같은 key 교체, 다른 프로세스의 저장·clear, rename 실패와 mutex 소유자 종료 뒤 복구, foreign file 보존과 PSO/stage accounting namespace 격리를 검사한다. Stage artifact 소멸자의 error-release import는 선택한 runtime의 실제 `winemetal.dll`에 연결한다. Runner는 전용 prefix/TEMP를 만들고 해당 Wine 종료 뒤 제거한다. `metadata_enumerations`는 256회 작은 저장의 관측값이며 시간 기반 합격 기준이 아니다.
 
 실제 셰이더 실패 입력이 필요하면 미리 만든 **Windows 경로**를 `DXMT_SHADER_FAILURE_PATH`로 지정한다. 초기 VS/PS/CS 컴파일 실패에서 stage·bytecode·root-signature 조합별 최대64개를 `.failure` 디렉터리에 저장한다(`shader.cso`, `rootsig.bin`, compilation arguments의 `metadata.txt`, `error.txt`, module-relative caller `stack.txt`). 기본값은 꺼짐이며 모든 shader variant/native PSO 실패를 포괄하지 않는다. 게임 소유 bytecode와 실행 경로가 포함되므로 private evidence로 보관하고 저장소에 추가하거나 외부에 전송하지 않는다.
 
@@ -63,6 +65,20 @@ done
 ```
 
 최종 acceptance는 actual cap3·exit0/pass=true·API+Shader Validation·owned backend 확인·validation/foreign 오류0과 retained 전체 geometry/ClipDistance/CullDistance matrix를 요구한다. Numeric oracle는10 families×7=70 Tier3 grid rows·18 DXIL/DXBC early/late depth/stencil/UAV/occlusion interactions·16K precision·degenerate point/line·winding/cull/Vertex0/depth·helper·SampleMask·forced4·OFF/ON toggle·indirect/bundle/replay와 새 AS/MS FrontCounterClockwise cull·near/far DepthClip ON/OFF4 rows를 검사한다. ON은 각 covered28·mandatory10, ClipDistance3e066666·depth00000000/3f800000, OFF는 각 covered64·mandatory64, ClipDistance3f31999a·depth39000000/3f7ff800의 exact comparison이다. Before의 post-snap-line 실패는 Tier1이 허용하는 cull이며 과거 Tier1 proof를 무효화하지 않는다. 기존1/128 ambiguity band는 유지하고 Tier3-specific exact-grid bounds는 별도로 검사한다. OFF/nontriangle에서 undefined인 InnerCoverage 특정 상수는 요구하지 않는다. 새 재현에서는 paired cut의 `depth-bounds`, `pipeline-statistics`, `multisample-capabilities`도 ABI별 직렬 실행하고 cut/manifest를 각각 기록한다. 위 관찰된8회는5개 runtime03+3개 retained runtime02의 mixed-cut이지 이 새 recipe를 동일 cut에서 실행했다는 주장이 아니다.
+
+## Async PSO compile acceptance
+
+`graphics-translator/tests/owned-d3d12-async-pipeline.cpp`는 `main`(`-municode` 없음)이며 `-std=c++20 -O2 -Wall -Wextra -static -ld3d12 -ldxgi -ld3dcompiler -luuid`로 빌드한다. Runner는 두 suite 모두에 `d3d12.asyncPipelineCompile=True`를 설정한다. `async-pipeline-hold`는 `OWNED_ASYNC_PIPELINE_HOLD=1`로 worker를 시작하지 않으므로 pending direct/indexed draw와 5회 Present 경계 draw가 정확히 3회(`async_pipeline_omit` trace) 생략돼야 한다. 4회 Present 경계, 넓힌 3D RTV, sample positions 상태의 draw는 생략되지 않아야 하며, sample positions 불일치 draw는 `Close()` 실패로 검증한다. Runner는 상속된 `OWNED_ASYNC_PIPELINE_HOLD`를 항상 제거한다. `async-pipeline`은 실제 worker와 경쟁하므로 첫 draw는 생략 또는 정상 렌더링 둘 다 허용한다. 두 suite 모두 13 case 순서와 query·UAV·첫 사용 target·생략 이력 만료·대기 중 PSO 해제를 검사한다. 다른 suite를 async on으로 회귀하려면 `--async-pipeline-compile`을 추가한다(runner는 상속된 `DXMT_CONFIG`를 제거한다).
+
+```sh
+"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -Wall -Wextra -static \
+  graphics-translator/tests/owned-d3d12-async-pipeline.cpp -ld3d12 -ldxgi -ld3dcompiler -luuid \
+  -o "$OUT/async-pipeline.exe"
+for suite in async-pipeline-hold async-pipeline; do
+  python3 scripts/test-owned-graphics.py --runtime "$RUNTIME" --guest-arch x64 --suite "$suite" \
+    --fixture "$OUT/async-pipeline.exe" --mode present --validation --out "$OUT/$suite"
+done
+```
 
 ## Depth bounds 50-case focused proof
 
@@ -338,7 +354,7 @@ python3 scripts/stage-owned-graphics.py verify --runtime "$P1_RUNTIME"
 for pair in x64:x86_64 x86:i686; do
   abi="${pair%%:*}"; target="${pair#*:}"
   "$LLVM_MINGW/$target-w64-mingw32-clang++" -std=c++20 -O2 -static \
-    -Iinclude/native/directx graphics-translator/tests/owned-d3d12-multisample-capabilities.cpp \
+    graphics-translator/tests/owned-d3d12-multisample-capabilities.cpp \
     -ld3d12 -ldxgi -ld3dcompiler -ldxguid -luuid \
     -o "$P1_WORK/fixtures/multisample-$abi.exe"
   "$LLVM_MINGW/$target-w64-mingw32-clang++" -std=c++20 -O2 -static -municode \
@@ -365,6 +381,8 @@ done
 `multisample-capabilities`는 기존 format/quality gates와 새 Tier1 consumer를 함께 실행한다. 1 pixel의2/4/8 positions는 signed xy[-8,7]/16, pixel-center-relative·Y down이다. Custom render surface GetSamplePosition/SamplePos는 [공식 undefined](https://raw.githubusercontent.com/microsoft/DirectX-Specs/master/d3d/ProgrammableSamplePositions.md)이므로 특정 수치로 re-pin하지 않는다. 실제 raster coverage·sample-frequency interpolation·resolve·reset/replay와 고정 texture의 독립 sample pattern이 oracle다. Tier1의 full ResolveSubresourceRegion은 MIN/MAX, 허용 AVERAGE, sample-preserving DECOMPRESS의 rect/origin/plane·depth pattern을 포함한다. Runner gates는 programmable GPU6·float/depth resolve18·integer/stencil resolve12·DECOMPRESS12, lifecycle markers와 정확한 error13이다. DECOMPRESS는1×도 포함하며 separate-resource sample 보존과 in-place same-rect/origin을 구분한다.
 
 `sharing`의 `adapter-luid-lifetime-errors`와 `OWNED_D3D12_SHARING_ADAPTER_LUID_PASS`를 기존 전체 GPU sharing 판정에 추가한다. Actual creator LUID를 enumeration/GetAdapterLuid와 비교하고 duplicate/named/by-name/cross-process query 수명 및 invalid/forged/copied/wrongtype 경계를 확인한다. 기존 named GPU import-after-last-COM-owner 제한은 이 query-only 작업의 완료 범위가 아니다.
+
+Shared-fence의 negative wait 검사는 고정 지연 대신 fixture가 미리 만든 고유 named event를 사용한다. `OWNED_GRAPHICS_QUEUE_WAIT_ARRIVAL`은 해당 event 이름을 받는 test-only 관측점이며, queue worker가 `blocked_wait_`를 게시한 뒤 신호한다. Fixture는 양 queue를 drain한 뒤 관측점을 설치하고 도착 확인·미완료 marker 검사·fence 해제·완료 readback 순서를 지킨다. 종료 시 환경과 handle을 복원하며 runner는 상속된 `OWNED_GRAPHICS_*`를 제거한다. 미설정 상태에서는 event를 만들지 않으며 제품 동기화나 공개 API 계약을 바꾸지 않는다.
 
 Public NGX는 [MSVC+MinGW fixture recipe](NGX-TEST.ko.md#현재-fixture-빌드)로 다시 빌드해 `ngx`/`ngx-contracts`를 x64 `--validation`으로 실행한다. `ngx`는 `exposure_scale_auto`, `exposure_scale_texture`, `exposure_scale_no_texture`, `mv_value_offsets_lowres`, `mv_value_offsets_highres_jittered` 각각 replay0–2의 default-vs-nondefault GPU 출력을 비교한다(max_byte_delta≤1·active contrast·outside sentinel·live inputs·parameter destroy·release-before-submit). Negative/nonfinite scalar 거부도 output sentinel을 보존해야 한다. 이것은 accept+ignore 호환 증거이며 exposure/MV 수식 또는 pristine/NVIDIA GPU differential proof가 아니다. Backend `temporal` x64/WoW64 실행은 public NGX ABI proof와 별도로 보존한다.
 
@@ -432,6 +450,8 @@ python3 scripts/stage-owned-graphics.py stage --help
 
 `--suite`의 현재 전체 집합은 runner help/parser가 authority다. `--runtime`, `--fixture`, `--out`이 필수다. `--timeout`은 1~600초(기본 120)이며 timeout을 성공으로 취급하지 않는다. `--dxil-dir` 기본은 `graphics-translator/tests/dxil`; `--lock`은 frozen lock 경로/hash를 증거에 기록할 뿐 **current root source를 frozen patches로 재생성하거나 동일하다고 증명하지 않는다**.
 
+`work-graphs`, `workgraphs-atomic64`, `workgraphs-atomic64-typed`는 선택한 `--dxil-dir` 안의 `preview-d3d12.h`를 필수 입력으로 사용한다. [DirectX-Headers v1.721.2-preview의 원본 d3d12.h](https://raw.githubusercontent.com/microsoft/DirectX-Headers/v1.721.2-preview/include/directx/d3d12.h)를 그 이름으로 보관하고 fixture도 같은 파일을 `DXMT_MATRIX_PREVIEW_SDK_HEADER`로 컴파일한다. 과거 `build/local` 경로를 자동 선택하지 않는다. Header가 없으면 Wine 실행 전에 거부하며, 실제 선택한 header와 shader/producer 입력을 함께 freeze·hash한다.
+
 Runner는 먼저 stage verifier를 실행하고 fixture·suite별 fixed shader/source 입력을 `--out/fixture`에 복사한다. `--out/prefix`의 새 prefix, per-run shader-cache/log paths를 사용하고 inherited foreign backend/`DXMT_*`/`DYLD_*` state를 정리한다. 종료/오류에도 **해당 prefix의** wineserver만 종료한다. 다른 prefix나 전역 wineserver를 종료하지 않는다.
 
 출력에서 다음을 함께 보존한다.
@@ -471,6 +491,7 @@ Fixture는 보통 `graphics-translator/tests/owned-d3d12-<suite>.cpp`이지만 �
 | `temporal`, `ngx`, `ngx-contracts` | [전용 지침](TEMPORAL-TEST.ko.md), [NGX](NGX-TEST.ko.md) | Temporal backend identity/trace; NV modules 필요 시 stage 옵션 명시 |
 | `fsr` / `owned-d3d12-fsr.cpp` | `main`, `-Isrc/fsr/include`, `-ld3d12 -ldxgi -lole32`, `-municode` 제외 | x64 public SR 전체 효과·GPU/replay·독립 native max-scale oracle; 아래 전용 recipe |
 | `fsr-fg` / `owned-d3d12-fsr-fg.cpp` | `main`; 아래 PE/observer compile recipe | Public FG prepare/generate·history/lifetime·실제 SDK proxy/UI/pacing·native drawable pixels/order/timestamps |
+| `fsr-rr` / `owned-d3d12-fsr-rr.cpp` | `main`, `-Isrc/fsr/include -Isrc/fsrrr`, `-ld3d12 -ld3dcompiler -ldxgi -lole32` | Public AMD RR 1.2 seven signals·1.0/1.1 split/fused/composite·settings/query/callback·destroy-before-replay·legacy depth-delta history GPU readback |
 | `shader-cache` / `owned-d3d12-shader-cache.cpp` | `wmain`, `-municode`, `-ld3d12 -ldxgi -ldxguid -luuid -ladvapi32`; 최신 compiler headers | CPU Device9 MEMORY/DISK·실제 child processes·isolated developer control; 아래 전용 recipe |
 | `arena-heap-arena`, `arena-heap-mapping` | 공용 `owned-d3d12-arena-heap.cpp` fixture | Runner가 `arena`/`mapping` mode를 전달. Arena는 single 20,000/shared 24,000/indirect 20,000 exact word와 replay/reset/first error; mapping은 기존 shared-view cleanup 계약 |
 | `raytracing` / `owned-d3d12-raytracing.cpp` | `wmain`, `-municode`, 아래 전용 recipe; frozen HitObject 입력도 필수 | DXR callbacks/state objects/ray queries 및 SM6.9 HitObject280-word oracle; 단일 AS probe와 구분 |
@@ -563,6 +584,8 @@ Public `D3D12EnableExperimentalFeatures`에 `D3D12ExperimentalShaderModels` GUID
 
 ~~~sh
 LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal
+: "${MATRIX_INPUTS:?pinned preview-d3d12.h와 suite 입력이 있는 디렉터리}"
+SDK_HEADER="$(realpath "$MATRIX_INPUTS/preview-d3d12.h")"
 for abi in x64 x86; do
   target=x86_64-w64-mingw32
   test "$abi" != x86 || target=i686-w64-mingw32
@@ -571,14 +594,14 @@ for abi in x64 x86; do
     test "$suite" != work-graphs || extra=-ld3dcompiler
     "$LLVM_MINGW/bin/$target-clang++" -std=c++20 -fms-extensions -O2 -static \
       -static-libgcc -static-libstdc++ \
-      '-DDXMT_MATRIX_PREVIEW_SDK_HEADER="../../build/local/p3-20261003/matrix/preview-d3d12.h"' \
+      "-DDXMT_MATRIX_PREVIEW_SDK_HEADER=\"$SDK_HEADER\"" \
       "graphics-translator/tests/owned-d3d12-$suite.cpp" -ld3d12 -ldxgi -lole32 $extra \
-      -o "build/local/p3-20261003/matrix/$suite-public-$abi.exe"
+      -o "$MATRIX_INPUTS/$suite-public-$abi.exe"
   done
 done
 ~~~
 
-새 output과 승인된 exclusive GPU window에서 `python3 scripts/test-owned-graphics.py --suite matrix-runtime --runtime <fresh-cut> --fixture <public-exe> --dxil-dir build/local/p3-20261003/matrix --out <fresh-output> --validation`을 양 ABI 직렬 실행한다. Work graphs는 `--suite work-graphs --dxil-dir graphics-translator/tests/dxil`을 사용한다. Runner가 executable/source/untouched SDK와 producer inputs를 freeze한다. 통과한 unchanged body를 반복 실행하는 지시가 아니다.
+새 output과 승인된 exclusive GPU window에서 `python3 scripts/test-owned-graphics.py --suite matrix-runtime --runtime <fresh-cut> --fixture <public-exe> --dxil-dir "$MATRIX_INPUTS" --out <fresh-output> --validation`을 양 ABI 직렬 실행한다. Work graphs도 untouched SDK와 해당 shader 입력을 둔 디렉터리를 `--suite work-graphs --dxil-dir`에 전달한다. Runner가 executable/source/untouched SDK와 producer inputs를 freeze한다. 통과한 unchanged body를 반복 실행하는 지시가 아니다.
 
 Runtime-05는 **LinearAlgebraTier0 / legacy support FALSE**를 정직하게 보고한 채 runtime oracles를 실행했다. Shader oracle·최종 Tier1/native shape public query proof가 끝나기 전에는 이 결과를 구형 WaveMMA와 후속 SM6.10 matrix의 전체 #20 closure나 SM/FL 상향으로 세지 않는다. 최종 enabled cut에서는 query와 readback을 다시 확인해야 한다. 첫 x64 enhanced case의 [실패 기록](../build/local/p3-20261003/matrix/runtime05-public-x64-01/result.json)은 보존했다. Frozen enhanced spec의 interop 규칙대로 초기 `COPY_DEST→COMMON` handoff를 fixture에 추가했고 runtime validation을 약화하지 않았다.
 
@@ -708,6 +731,8 @@ ABI별 정확한 순서는 `fp64`, `fp64_ftz`, `fp64_legacy50`, `fp64_legacy51`,
 ```sh
 RUNTIME=build/local/p3-20261003/runtime-02
 OUT=build/local/waves-smoke-001
+: "${WORK_GRAPH_INPUTS:?pinned preview-d3d12.h와 work-graph shader 입력이 있는 디렉터리}"
+SDK_HEADER="$(realpath "$WORK_GRAPH_INPUTS/preview-d3d12.h")"
 mkdir -p "$OUT/fixtures"
 for abi in x64 x86; do
   case "$abi" in x64) target=x86_64 ;; x86) target=i686 ;; esac
@@ -715,7 +740,8 @@ for abi in x64 x86; do
     graphics-translator/tests/owned-d3d12-sm6.cpp \
     -ld3d12 -ldxgi -ldxguid -ld3dcompiler -luuid -lole32 \
     -o "$OUT/fixtures/sm6-$abi.exe"
-  "$LLVM_MINGW/$target-w64-mingw32-clang++" -std=c++20 -O2 -static \
+  "$LLVM_MINGW/$target-w64-mingw32-clang++" -std=c++20 -fms-extensions -O2 -static \
+    "-DDXMT_MATRIX_PREVIEW_SDK_HEADER=\"$SDK_HEADER\"" \
     graphics-translator/tests/owned-d3d12-work-graphs.cpp \
     -ld3d12 -ldxgi -ldxguid -ld3dcompiler -luuid -lole32 \
     -o "$OUT/fixtures/work-graphs-$abi.exe"
@@ -724,6 +750,7 @@ for abi in x64 x86; do
     --out "$OUT/waves-$abi" --validation
   python3 scripts/test-owned-graphics.py --runtime "$RUNTIME" --suite work-graphs \
     --fixture "$OUT/fixtures/work-graphs-$abi.exe" --guest-arch "$abi" \
+    --dxil-dir "$WORK_GRAPH_INPUTS" \
     --out "$OUT/work-graphs-$abi" --validation
 done
 ```
@@ -832,6 +859,15 @@ python3 scripts/test-owned-graphics.py \
   --suite fsr-fg --mode present \
   --fg-observer "$FX_WORK/fixtures/owned-fg-drawable-observer.dylib" \
   --validation --timeout 180 --out "$FX_WORK/run-fsr-fg"
+"$LLVM_MINGW/x86_64-w64-mingw32-clang++" \
+  -std=c++20 -O2 -static -Isrc/fsr/include -Isrc/fsrrr \
+  graphics-translator/tests/owned-d3d12-fsr-rr.cpp \
+  -ld3d12 -ld3dcompiler -ldxgi -lole32 -o "$FX_WORK/fixtures/owned-d3d12-fsr-rr.exe"
+python3 scripts/test-owned-graphics.py \
+  --runtime "$FX_WORK/runtime" --guest-arch x64 \
+  --fixture "$FX_WORK/fixtures/owned-d3d12-fsr-rr.exe" \
+  --suite fsr-rr --mode no-present --validation --timeout 300 \
+  --out "$FX_WORK/run-fsr-rr"
 python3 scripts/test-owned-graphics.py \
   --runtime "$FX_WORK/runtime" --guest-arch x64 \
   --fixture "$FX_WORK/fixtures/owned-d3d12-shader-cache.exe" \
@@ -839,7 +875,7 @@ python3 scripts/test-owned-graphics.py \
   --out "$FX_WORK/run-shader-cache"
 ```
 
-SR/FG fixture는 current temporal source를 rename-main include한다. Public headers/license와 reference checksums는 [integration](NGX-INTEGRATION.ko.md#owned-fsr-public-api와-provenance)에 있다. `enable_fsr=true`는 owned SR/FG frontend를 함께 빌드하고 stage의 `--with-fsr`는 **두 DLL 모두** 선택한다. Stage는 builtin marker와 각 five names/ordinals를 검증한다. FG reference ordinals는 Configure=1/Create=2/Destroy=3/Dispatch=4/Query=5다. 선택하지 않은 새 runtime에서는 두 foreign fallback을 차단한다. 과거 manifest에 `fsr_framegeneration` 필드가 없으면 verifier는 과거 SR-only loader 정책과 runtime bytes를 그대로 보존한다. 이는 FG 선택/자동 업그레이드가 아니므로 새 경로에 다시 stage해야 `fsr-fg`를 실행할 수 있다. `--with-nvngx`는 NGX 회귀 DLL도 선택하며 public NGX fixture는 [별도 MSVC compile recipe](NGX-TEST.ko.md#현재-fixture-빌드)를 사용한다. 현재 public SR/FG는 x64/WoW64를 유지한다. WoW64는 matching i686 fixture/install을 paired stage하고 `--guest-arch x86`으로 실행한다.
+SR/FG fixture는 current temporal source를 rename-main include한다. Public headers/license와 reference checksums는 [integration](NGX-INTEGRATION.ko.md#owned-fsr-public-api와-provenance)에 있다. `enable_fsr=true`는 owned SR/FG/RR frontend를 함께 빌드하고 stage의 `--with-fsr`는 **세 DLL 모두** 선택한다. RR이 없는 과거 manifest는 `fsr_rayregeneration` 필드가 없으며 verifier는 그 loader 정책을 그대로 보존한다. Stage는 builtin marker와 각 five names/ordinals를 검증한다. FG reference ordinals는 Configure=1/Create=2/Destroy=3/Dispatch=4/Query=5다. 선택하지 않은 새 runtime에서는 두 foreign fallback을 차단한다. 과거 manifest에 `fsr_framegeneration` 필드가 없으면 verifier는 과거 SR-only loader 정책과 runtime bytes를 그대로 보존한다. 이는 FG 선택/자동 업그레이드가 아니므로 새 경로에 다시 stage해야 `fsr-fg`를 실행할 수 있다. `--with-nvngx`는 NGX 회귀 DLL도 선택하며 public NGX fixture는 [별도 MSVC compile recipe](NGX-TEST.ko.md#현재-fixture-빌드)를 사용한다. 현재 public SR/FG는 x64/WoW64를 유지한다. WoW64는 matching i686 fixture/install을 paired stage하고 `--guest-arch x86`으로 실행한다.
 
 `fsr`의 full-SR 판정은 high-resolution/jittered motion·nonzero scale/effect, reactive/composition masks·history/reset, linear/sRGB/PQ, sharpening constant/edge/alpha, automatic/manual exposure·GPU-produced R32 replay, dynamic output generation, native scale cap·centered black-opaque margins, inflight release·command-list reset discard와 rejection sentinel을 함께 요구한다. `OWNED_FSR_NATIVE_MAX_SCALE`은 **같은 장치에서 독립 public MetalFX descriptor로 측정한 값**이어야 한다. M5 Pro에서 측정한 3을 portable constant로 복사하지 않는다. 현재 cap fixture는 input64×64의 native-extent control과 caller256×224의 중심 결과를 비교하고264×232 외부 sentinel을 보존한다.
 

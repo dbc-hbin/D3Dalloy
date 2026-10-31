@@ -1,0 +1,115 @@
+# Resources-side FPS audit — dxmt-d3d12 (read-only)
+
+## Summary
+
+The resource subsystem is already dirty-gated and bump-allocated almost everywhere I looked, so the *classic* wins (per-draw malloc, per-copy CPU memcpy, per-upload flush, per-RTV rebind) are **absent — they are already done**. Three costs survive and are the plausible reason a depth-only pass-reuse fix moved nothing:
+
+1. **A process-wide switch flips the whole frame into conservative mode.** If *any* reserved/tiled resource exists (including a BC-compressed `TEXTURE3D`, which is created as one internally), `ReservedResource::AnyLive()` (a global counter) makes the submission planner reject the merged-encoder path for every node **and** inserts a shared-event signal/wait per ordering barrier. That directly cancels the encoder-count reduction P1 was chasing.
+2. **Per-draw root/vertex-table rebinding** is recorded as 3–5 `setbuffer` commands per draw and, on the native side, each binding pays ~4 Objective-C collection operations (`m4_allocation`) *before* any state dedup.
+3. **Descriptor writes are not free**: each SRV/UAV texture write does a view-pool `clear` + `setTextureView` (two unixcalls + counted-set ops) plus an exclusive texture lock, and the first use of a shader-visible heap in a command buffer walks **every** unique parent texture in the pool.
+
+Confidence is high in the *mechanisms* (explicit code), low in *share of frame time* — none of these is measured against the city scene. Every claim below is either marked confirmed-code or inferred-cost.
+
+## Files
+
+- `src/d3d12/d3d12_descriptor_heap.cpp:180-700` — CBV/SRV/UAV heap: argument-buffer storage, Metal 4 view pool (`SetPoolSlot`/`ResetPoolSlot`), `CopyDescriptors` bulk path; `:700-1012` — RTV/DSV and sampler heaps.
+- `src/d3d12/d3d12_descriptor_heap.hpp:80-200` — CPU-side descriptor storage, GPU storage layout, heap interfaces.
+- `src/d3d12/d3d12_root_signature.cpp:502-894` — root signature deserialize/validate, `UploadQwords`/`SlotQwordOffsets`, encoded static samplers.
+- `src/d3d12/d3d12_command_allocator.hpp:190-389`, `.cpp:100-200,300-560` — CPU heap bump allocator, GPU heap chunks (`AllocateGPUHeap`/`ReserveGPUHeap`/`ResolveGPUHeap`), temp-copy ring, indirect data.
+- `src/d3d12/d3d12_command_list.cpp:1772-1970` (vertex table, swizzle capture, `CaptureSubmissionAccess`), `:2400-2800` (per-draw bind), `:4100-4300` (root encode, `PreDispatch`), `:6950-7270` (root setters), `:7318-7440` (OMSetRenderTargets reuse), `:4341-5060` (copies).
+- `src/d3d12/d3d12_device.cpp:205-330` (residency set, commit), `:2890-3130` (`RegisterResidency`/`RegisterResidencyAndVA`), `:3166-3180` (`LookupBufferByVA`).
+- `src/d3d12/d3d12_buffer.cpp:80-200,224-241` (allocation, reserved tiling, Map/Unmap), `d3d12_texture.cpp:358-490` (texture info/options), `:686-760` (BC-volume, swizzle, row-major), `:1068-1200` (CPU subresource transfers), `d3d12_resource_helper.cpp` (format/view validation), `d3d12_heap.cpp` (placement/sparse heaps).
+- `src/d3d12/d3d12_reserved_resource.hpp/.cpp` — sparse tiling, `AnyLive()`, `Apply`, `CollectMappedTiles`.
+- Adjacent (used as evidence for native cost): `src/winemetal/Metal4.hpp:15-215`, `src/winemetal/unix/winemetal_metal4.c:269-289,449-456,1219-1283`, `src/winemetal/winemetal_metal4_thunks.c:9-11`; `src/dxmt/dxmt_buffer.cpp:100-200,224-300`, `dxmt_ring_bump_allocator.hpp`.
+
+## Architecture
+
+Recording (game thread) writes a CPU command stream plus root-argument staging into a per-allocator bump heap; root arguments/vertex tables/static samplers become `wmtcmd_render_setbuffer` commands pointing at a **GPU heap chunk** (no-copy MTLBuffer over malloc). Textures are reached through the shader-visible descriptor heap's argument buffer (Metal 4 view pool + `gpuResourceID`), so there are **no per-texture native binds** on the ordinary path. The queue worker plans submissions, then hands whole recorded chains to the native bridge in one call per encoder (`encodeCommands(&data->cmd_head)`), which walks the chain, updates argument tables, and accumulates a residency set.
+
+## Report
+
+### Angles checked (12) and dispositions
+
+| # | Angle | Disposition |
+|---|---|---|
+| 1 | Root argument encoding | Confirmed: staged in CPU array, re-uploaded only when dirty (`command_list.cpp:4145-4160`, setters `:7005-7100`, `:7194-7230`). Cost real, per-draw (C2). |
+| 2 | Root signature change cost | Negative: identity early-out (`:6974`) + dirty flags; `EncodeStaticSamplers` (`:4162-4174`) copies `64×NumStaticSamplers` bytes only on signature change. |
+| 3 | Descriptor write path | Confirmed cost: `ResetPoolSlot`+`SetPoolSlot` per write (`descriptor_heap.cpp:226-241`), `Texture::view` exclusive lock (`dxmt_texture.cpp:534-551`). (C3) |
+| 4 | Descriptor copy path | Negative: contiguous runs use one native `copyTextureViews` (`descriptor_heap.cpp:649-651`); per-descriptor only when the pool is unsupported (`:675-679`). Overlap/reverse handled. |
+| 5 | Heap flush/residency | Negative for flushing: D3D12 resources are untracked, shared/private, written in place; no `didModifyRange` on any D3D12 path (`grep`). Positive for residency: view-pool parent walk (C4). |
+| 6 | Per-draw rebinding | Confirmed: root args bound to up to 4 stages (`:2658-2675`), vertex table re-`memset` per draw (`:1772-1806`). (C2) |
+| 7 | Mapped uploads | Negative: `Map` returns the allocation's own mapped pointer, `Unmap` is a no-op (`d3d12_buffer.cpp:224-241`; `dxmt_buffer.hpp:120-122`). No per-frame flush. |
+| 8 | Buffer copies | Negative: `CopyBufferRegion` is one native `copyFromBufferToBuffer` (`:4341-4400`), no CPU memcpy; temp storage is a 32 MB ring (`dxmt_ring_bump_allocator.hpp`). |
+| 9 | Texture copies | Mixed: `SUBRESOURCE→SUBRESOURCE` does texture→staging→texture with per-row buffer→texture copies (`:4890-5060`); `PLACED_FOOTPRINT` emits one native copy per row (`:4974-4990`, `:5150-5180`). Not retained as a candidate — no activation evidence. |
+| 10 | Layout/format conversion | Negative for mainstream formats (native path). Conditional: RGB32/422 emulation does per-pixel CPU row conversion (`d3d12_texture.cpp:105-125`, `:1094-1110`), BC 3D volume and standard swizzle take special paths (`:686-760`). |
+| 11 | Allocation/pooling | Negative in steady state: per-resource `newBuffer`/`newTexture` exists but only at creation (`dxmt_buffer.cpp:100-160`, `dxmt_texture.cpp:415-444`); allocator heaps, temp ring, and GPU chunks are reused. Cost is at creation/streaming: `RegisterResidencyAndVA` takes the device residency lock and calls `residency_set_.commit()` per resource (`d3d12_device.cpp:3053-3090`). |
+| 12 | Reserved/tiled resources | Confirmed severe cross-cutting cost (C1, C6). |
+
+### Candidate 1 — Global sparse-alias mode (strongest)
+
+**Evidence.** `reserved_resource.hpp:102-105` (`AnyLive()` = process-wide live counter) → planner rejection `"sparse_alias"` at `d3d12_command_queue.cpp:5401` (render), `:5423` (compute), `:5435` (blit), `:5441` (clear), `:5453`; alias flush emitted at `:5872-5880`, `:5907-5910`, `:7534-7539`; implementation `:611-616` (`signalEvent`+`waitForEvent` on a shared event) — each flush also does `scope.reset()` + `start_segment()`, i.e. ends the command buffer and starts a new one.
+**Chain.** App creates any reserved resource → `MTLD3D12Buffer::InitializeReserved` (`d3d12_buffer.cpp:156-163`) or `MTLD3D12Texture::InitializeReserved` (`d3d12_texture.cpp:854-957`), **or** creates a BC-compressed `TEXTURE3D`, which routes to `InitializeOrdinaryBCVolume` (`d3d12_texture.cpp:753-754`, `:686-698`) → `live_++` → for the rest of the process every node is `access_complete=false`, the merged render-group replay is never taken, and every ordering barrier pays a GPU event signal/wait plus a segment split.
+**Activation.** One such resource existing anywhere, at any time. Not usage-based — existence only.
+**Class.** Steady-state GPU (extra synchronisation + more encoders) with a CPU component (planner path, segment churn).
+**Confidence.** High that the code does this; unknown whether the city scene creates such a resource (ZZZ uses tiled streaming and compressed volume textures commonly — must be verified, not assumed).
+**Existing counterevidence.** The comment at `reserved_resource.hpp:96-101` records a measured Metal coherence bug (GPU probe, M5 Pro, macOS 27) that *requires* the flush; removing it is unsafe. Prior research (`wave-1-render-performance.md`) already flagged barrier-induced pass splits as the leading steady-frame hypothesis.
+**Minimum safe remedy.** Scope the trigger, do not delete it: keep `live_` for the correctness workaround but gate the *planner* rejection and the per-barrier flush on "this submission actually aliases sparse tiles" (mapped tiles with shared pages / volume-cast publication), instead of a process-global existence bit.
+**Falsifier.** `OWNED_GRAPHICS_TRACE=1` on a bounded city capture: count `native_render_member` (merged groups) vs `render_targets_rebind_rejected` reasons, and whether any `tile_mapping` event exists. Metal System Trace: encoder/segment count per frame with the reserved resource created vs. not.
+
+### Candidate 2 — Per-draw root/vertex argument rebinding
+
+**Evidence.** `command_list.cpp:4145-4160` (memcpy `UploadQwords×8` into GPU heap), `:2658-2675` (up to 4 `setbuffer` commands per dirty root), `:2638-2645` + `:1772-1806` (vertex table `memset` + copy), `:4162-4174` (static samplers); bump allocation `command_allocator.hpp:311-330`, chunk scan/growth `command_allocator.cpp:159-190`. Native side: `winemetal_metal4.c:1229-1260` → `m4_bind_buffer` (`:449-456`) → `m4_allocation` (`:269-289`) — per binding: `objc_getAssociatedObject`, `[objects addObject:]`, `[allocations containsObject:]`, maybe `addAllocation`.
+**Activation.** Any draw whose root arguments changed since the previous draw (`SetGraphicsRoot32BitConstants`/CBV/SRV/UAV/table), i.e. normal per-object constants.
+**Class.** CPU (recording + native bridge). GPU cost is negligible (small `setbuffer`s into a resident heap).
+**Confidence.** High mechanism; medium magnitude.
+**Existing counterevidence.** Dirty-gating already suppresses unchanged draws (`:6974`, `:7013-7018`, `:7076-7090`); the GPU heap never mallocs per upload in steady state; prior research ranked static-sampler re-upload as a small win and warned against arena rewrites. `m4_bind_buffer` dedups the *argument-table write* but not the `m4_allocation` bookkeeping before it.
+**Minimum safe remedy.** (a) In `m4_bind_buffer`/`m4_bind_resource`, move the `m4_allocation` call after the existing state-compare early-outs (the same recording already retained the allocation for that index — verify per index, since the table is per stage). (b) On the recording side, bind root arguments only to the stages the bound PSO's shader bindings actually use, using the data `CaptureSubmissionAccess` already walks.
+**Falsifier.** Native counters (`tableSet`, `residencyAdd`) and queue-worker CPU time on a city frame; A/B the dedup reorder.
+
+### Candidate 3 — Descriptor-heap writes and their per-write native cost
+
+**Evidence.** `descriptor_heap.cpp:226-241` (`ResetPoolSlot` → `view_pool_.clear(index)` = one unixcall; `SetPoolSlot` → `view_pool_.setTextureView` = one unixcall + `Texture::view`), `:305` (pool per heap), `Metal4.hpp:40-51` (each call is `WINE_UNIX_CALL`), `winemetal_metal4.c:60-87` (native `setTexture`: descriptor fill, `MTLTextureViewPool setTextureView`, `NSCountedSet removeObject/addObject`).
+**Activation.** App rewrites shader-visible descriptors per frame (dynamic descriptor heaps — common in modern engines for materials/bindless updates).
+**Class.** CPU steady.
+**Confidence.** Medium-high mechanism, unknown frequency.
+**Existing counterevidence.** Bulk `CopyDescriptors` path exists; non-shader-visible heaps use plain malloc storage (no native calls); `TypedResidencyStatus` early-outs for non-reserved buffers (`descriptor_heap.cpp:193-197`).
+**Minimum safe remedy.** Skip the clear+set when the slot is rewritten with an identical (texture, view key, owner) — compare before calling `ResetPoolSlot`.
+**Falsifier.** Native `OWNED_GRAPHICS_NATIVE_VIEW_POOL` counters: `slot_set`/`slot_clear` per frame vs. unique descriptors; if `slot_set` ≈ descriptor count and the app rewrites the same heap every frame, the redundancy is real.
+
+### Candidate 4 — View-pool parent walk per command buffer
+
+**Evidence.** `winemetal_metal4.c:269-289`: on first use of a heap's argument buffer in a recording, iterate **all** `views->parents` (`NSCountedSet`) and `m4_allocation` each → `residency addAllocation` per texture (`:275-281`). Command buffers per frame: `d3d12_command_queue.cpp:1055` (`slot.cmdbuf.begin`), one per ExecuteCommandLists task.
+**Activation.** Shader-visible CBV/SRV/UAV heap holding many unique textures, once per command buffer per pool, regardless of which descriptors the submission reads.
+**Class.** CPU steady; scales with heap population, not use.
+**Confidence.** Medium.
+**Existing counterevidence.** `NSCountedSet` dedups parents; heaps are usually small; this is the mechanism that keeps residency correct for view-pool views.
+**Minimum safe remedy.** Retain only the parents whose descriptors the submission can read — the queue already computes used ranges in `ResolveSubmissionTables` (`d3d12_command_queue.cpp:195-265`).
+**Falsifier.** Native counters `unique_parent_visits`/`residencyAdd` and `residency commit` count per frame with a large bindless heap.
+
+### Candidate 5 — `LookupBufferByVA` takes a device-global exclusive lock
+
+**Evidence.** `d3d12_device.cpp:3166-3180` (`unique_lock<dxmt::mutex>` + `interval_map_.upper_bound`). Callers per draw: `command_list.cpp:1915` inside `CaptureSubmissionAccess` (invoked per draw at `:2448`), `:2431` per vertex slot (native-MSAA path), `:7162` per root CBV/SRV/UAV set, `:7250` per `IASetIndexBuffer`; also `command_queue.cpp:175,3122,5097`.
+**Activation.** Every draw and every root-view set; contention appears only with multi-threaded recording.
+**Class.** CPU steady (contention, not work).
+**Confidence.** High mechanism, unknown contention.
+**Existing counterevidence.** Critical section is one map lookup, no allocation; the priorities doc (P5) explicitly defers CPU binding work until CPU-bound is measured; the queue is already single-threaded for replay.
+**Minimum safe remedy.** Readers-only shared lock (or sharded index) for lookups, keeping the exclusive lock for insert/erase.
+**Falsifier.** CPU profile of recording threads showing `residency_lock_` contention; multi-threaded recording A/B.
+
+### Candidate 6 — Tile-mapping queue serialization
+
+**Evidence.** `d3d12_command_queue.cpp:1136-1178`: unless `NO_HAZARD`, wait for the last published submission to retire, then `Apply`, then `signalEvent` and `waitUntilSignaledValue(..., 10000)` on the submission thread; `reserved_resource.cpp:384-419`.
+**Activation.** `UpdateTileMappings` without `D3D12_TILE_MAPPING_FLAG_NO_HAZARD` (streaming tiled resources).
+**Class.** CPU stall on the queue worker + GPU; serializes all later work.
+**Confidence.** High mechanism; activation unknown.
+**Existing counterevidence.** The ordering is documented as required for queue-ordered mapping semantics; `NO_HAZARD` is the app's escape hatch; overlaps with Candidate 1 (same resource class).
+**Minimum safe remedy.** None beyond what exists; the actionable part is Candidate 1's scoping so a single mapping update does not degrade every later barrier.
+**Falsifier.** Count `tile_mapping` trace events and the worker's wait time per frame.
+
+### D3DMetal comparison question (one)
+
+With the same scene and a **single reserved/tiled resource or BC 3D texture alive**, does D3DMetal keep its per-frame native encoder count constant and issue no per-barrier sparse-alias event signal/wait — i.e., is its sparse-alias handling per-resource/per-submission rather than a process-global mode switch? The measurable form: encoder/segment count and barrier classification from a Metal System Trace capture, plus residency-set size per command buffer, on a build where the reserved resource is created but never used.
+
+---
+
+*Skipped: any runtime measurement (no builds/launches per the boundary), so every candidate is a mechanism with an unmeasured share; I did not audit the shader/PSO or temporal paths, and I did not verify that the target game actually creates a reserved resource or BC 3D texture — Candidate 1's activation is the single fact most worth checking first, since it would invalidate the premise that P1-style encoder merging can pay off at all.*

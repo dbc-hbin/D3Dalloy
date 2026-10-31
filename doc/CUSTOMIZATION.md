@@ -17,6 +17,8 @@ The [loader](../src/util/config/config.cpp) uses `prefix.name = value` syntax:
 | Keys | Effect and boundary |
 | --- | --- |
 | `d3d12.preferredMaxFrameRate` | D3D12 presentation-rate preference, not guaranteed FPS or measured pacing |
+| `d3d12.asyncPipelineCompile` | Opt-in (default False). Defers the final native link of ordinary graphics PSOs and omits qualifying pending direct draws on targets recurring across 5 Presents; changes rendering while linking, not a measured FPS/stutter gain |
+| `d3d12.asyncPipelineCompileThreads` | Worker count for `d3d12.asyncPipelineCompile` (default 0 = max(1, logical CPUs / 2)). Workers run at lowest thread priority |
 | `dxgi.customVendorId`, `dxgi.customDeviceId`, `dxgi.customDeviceDesc` | Reported adapter identity, not hardware capability |
 | `dxgi.forceSDR` | Output reporting, not proof of physical colour/HDR correctness |
 | `d3d11.*` | D3D11 behavior; does not configure D3D12 |

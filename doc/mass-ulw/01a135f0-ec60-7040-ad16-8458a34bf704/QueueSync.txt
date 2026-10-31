@@ -1,0 +1,114 @@
+## Coverage
+
+**Files read (whole or cited ranges):** `src/d3d12/d3d12_command_queue.cpp` (8429 lines; regions 594–1140, 4960–5100, 5260–5425, 5820–6000, 6100–6400, 6570–7100, 7410–7460, 7770–8090, 8180–8330), `d3d12_fence.cpp`, `d3d12_diagnostics.cpp` (whole), `d3d12_diagnostics.hpp`, `d3d12_device.hpp:755–855`, `d3d12_device.cpp:2813–2830`, `owned_submission_ring.hpp`, `owned_queue_task_fifo.hpp`, `owned_trace.hpp`, `src/dxmt/dxmt_queue_order.hpp`, `dxmt_fence.hpp`, `dxmt_fence.cpp`, `src/winemetal/unix/winemetal_metal4.c` (89–333, 699–1010), `Metal.hpp`, `Metal4.hpp`, `winemetal.h`, `winemetal_thunks.c`, `winemetal_unix.c` (queue/event/mapping entries), `d3d12_command_list.cpp:10330–10375` (FenceBarrier recording only).
+
+**Angles and dispositions (12):**
+
+1. **Queue FIFO mechanics** — `QueueTaskFifo` is an unbounded `std::deque<variant>` under `std::mutex`+`cv` (`owned_queue_task_fifo.hpp:13–50`). App-side `push` never blocks. No batching/dedup. Confirmed, benign; negative finding.
+2. **Submission ring backpressure** — `SubmissionRing<32>::reserve()` blocks the submit thread at 32 outstanding (`owned_submission_ring.hpp:26–35`). Reachable only with very high submissions/frame. Confirmed code; low impact.
+3. **Commit batching** — one `commit(count=1)` per `CommittingScope`; `ProcessExecute` splits a call into extra scopes at FenceBarrier (5916), predication (5999), WorkGraph (5944), temporal/frame-gen (7421), Query AliasFlush (7535), MSAA producer (6331). All segments of one recording are committed together in `m4_commit` (`winemetal_metal4.c:774–795`). Confirmed.
+4. **Empty native submission per `Signal`** — `ProcessSignal` opens a scope and encodes nothing (`d3d12_command_queue.cpp:7969–7978`); the destructor commits it (1071). Confirmed.
+5. **Per-pass MTLFence staging** — every ordinary render pass waits/updates one shared queue-level `fence_` (6869, 7004). Confirmed; candidate 1.
+6. **`fenced` gate** — a submission containing any FenceBarrier operand rejects every render and compute node from access analysis (5270, 5401, 5414). Confirmed.
+7. **DRED breadcrumb capture default-on** — `capture_enabled = breadcrumbs != FORCED_OFF` (`d3d12_diagnostics.cpp:405`), default `SYSTEM_CONTROLLED` (`d3d12_diagnostics.hpp:14`). Confirmed; candidate 2.
+8. **SubmissionPlan construction on the worker** — `plan.nodes` grown without reserve, each node owning an `unordered_map` + 4 vectors (5459). Confirmed; candidate 3.
+9. **Duplicate barrier-state validation** — app thread (7897–7906) and worker (5277–5305) each build `unordered_map<BarrierTracker*, BarrierResourceState>`, the worker deep-copying persistent state per distinct resource. Confirmed; moderate, folded into candidate 3's remediation.
+10. **Cross-queue `Wait` is CPU-side** — `ProcessWait` blocks the FIFO worker on a `FenceCompletionLatch` (8020–8030); no `MTL4CommandQueue_waitForEvent` is used. Confirmed; candidate 6.
+11. **Device-global commit lock** — `CommitMetal4CommandBuffers` takes `residency_lock_` around `queue.commit` (`d3d12_device.cpp:2814–2822`); the same lock guards every `LookupBufferByVA` (3168). Confirmed; candidate 5.
+12. **Residency churn per submission** — `[recording->residency addAllocation:]` per bound resource (285), `commit` at `endCommandBuffer`, then `removeAllAllocations`+`commit` at retirement (`winemetal_metal4.c:736–742`). Confirmed; folded into candidate 4.
+
+**Negatives checked:** no per-frame `Signal`/`Wait`/`GetCompletedValue` spin in `d3d12_swapchain.cpp`; `ProcessTileMapping` serializes only for sparse resources (`d3d12_command_queue.cpp:1139–1173`); the completion thread uses a condition-variable wait, not polling (`winemetal_metal4.c:1016–1018`); `submission_ring_` uses wait/notify rather than spinning.
+
+---
+
+## Candidates
+
+### C1 — One shared MTLFence serializes every consecutive render pass
+`src/d3d12/d3d12_command_queue.cpp:6869` (`encoder.waitForFence(fence_, wait_stages)`) and `:7004` (`encoder.updateFence(fence_, update_stages)`); rejection gate at `:5401`.
+
+**Chain:** `ProcessExecute` → per `EncoderType::Render` encoder → one queue-wide `WMT::Fence fence_` (declared `:600`, created `:1278`). Pass N ends by updating the fence after `update_stages`; pass N+1 begins by waiting before `wait_stages`. A single MTLFence carries one monotonic value, so pass N+1's waited stages cannot start until pass N's update executes. When `replay_current_node->access_complete` is false, `wait_stages` is the conservative `Vertex` (or `PreRaster`) and `update_stages` the `Vertex|Fragment|Object|Mesh` union (`:6996–7003`); when true, both narrow to the proven hazard stages (`:6860–6869`).
+
+**Activation:** every submission; severity depends on how many passes are `access_complete`. `OrdinaryRenderRejection` (`:123–160`) rejects on `dsv_readonly_flags` (read-only DSV — standard for the main opaque pass), `default_raster_sample_count` (MSAA), `dsv_readonly_flags`, `render_target_array_length > 1`, and others. `fenced` (`:5270`) rejects **all** render and compute nodes in the submission when any list encodes a `WaitBarrier`/`SignalBarrier`.
+
+**Class:** GPU / steady state (lost overlap). **Confidence:** confirmed code behavior; **inferred** performance impact.
+
+**Counterevidence:** grouped members share one native render encoder (`:6902–6921`), so no fence sits between merged passes. The P1 depth-only grouping fix produced negligible FPS gain — which either means those passes were not eligible (`fenced`, MSAA, read-only DSV, `ReservedResource::AnyLive()`), or that pass-to-pass serialization is not the limiter. Also, in a sequential deferred renderer most consecutive pass pairs have a genuine fragment→vertex hazard, so the fence may cost nothing beyond the real dependency.
+
+**Minimum safe remedy:** narrow `wait_stages`/`update_stages` for non-`access_complete` passes from the conservative union to the stages actually produced/consumed (a per-pass `wmtcmd`-derived stage set), and, for independent attachment sets, drop the fence update/wait pair entirely when the plan proves no cross-pass access overlap.
+
+**Falsification:** with `OWNED_GRAPHICS_TRACE=1 OWNED_GRAPHICS_TRACE_LIMIT=200000`, per frame count `submission_render_candidate` events by `eligible`/`reason`; compute GPU idle as `gpu_start_ns(submission N+1) − gpu_end_ns(submission N)` from `complete` events. If consecutive-pass gaps are already ≈0, C1 is dead.
+
+### C2 — Default-on DRED breadcrumbs walk every draw on the app thread
+`src/d3d12/d3d12_command_queue.cpp:7830–7884` builds `std::vector<D3D12_AUTO_BREADCRUMB_OP> history` by walking every encoder's `cmd_head`→`next` chain (one `push_back` per draw/dispatch/copy/clear/resolve/barrier) plus a `std::string` per diagnostic annotation; `:7885` calls `BeginSubmission`.
+
+**Chain:** `ID3D12CommandQueue::ExecuteCommandLists` (`:7772`) holds `mutex_enqueue_` (`:7784`) across the whole walk, then `DeviceDiagnostics::BeginSubmission` (`d3d12_diagnostics.cpp:420–467`) takes a device-global `recursive_mutex`, `make_shared`s a breadcrumb, resolves list and queue debug names via two `GetPrivateData` calls, moves the history in, linear-scans up to 128 retained entries, and pushes. `capture_enabled` is true by default (`:405`), so the early return at `:422` does **not** skip the walk.
+
+**Activation:** every `ExecuteCommandLists`, on the application thread. **Class:** CPU / steady state. **Confidence:** confirmed code; magnitude inferred (proportional to commands submitted per frame).
+
+**Counterevidence:** none in-tree; the 128-entry bound and the `contexts` reservation are already deliberate trims. The `trace`/diagnostics fields are needed for DRED correctness, and `Complete` only sets an integer.
+
+**Minimum safe remedy:** hoist the eligibility check — expose `DeviceDiagnostics::BreadcrumbsEnabled()` and skip history construction entirely when false, and/or build `history` only on the fault path from the recorded command stream.
+
+**Falsification:** time `ExecuteCommandLists` (or `BeginSubmission`) with breadcrumbs forced off vs. on for one fixed frame; if the delta is ≪1 % of frame time, C2 is dead.
+
+### C3 — Per-`ExecuteCommandLists` SubmissionPlan construction on the single submitter
+`src/d3d12/d3d12_command_queue.cpp:5459` (`plan.nodes.push_back`), node shape at `:80–91`, anchors map at `:5378`/`:5458`, barrier maps at `:5277` and `:7897`.
+
+**Chain:** `SubmissionThread` → `ProcessExecute` → `validate_transitions` builds a fresh `unordered_map<BarrierTracker*, BarrierResourceState>` (deep-copying persistent tracker state per distinct resource) → node loop constructs one `SubmissionNode` (one `unordered_map` + four vectors) per encoder and grows `plan.nodes` without reserve → group matching runs `AppendRenderMember` trials over prior candidates. The FIFO worker is the only thread that reaches the GPU, so its per-frame planning time is a hard throughput ceiling: if planning exceeds the frame budget, the GPU starves regardless of GPU-side work.
+
+**Activation:** every `ExecuteCommandLists`; scales with encoders and transitions per submission. **Class:** CPU / steady state (submit-thread throughput). **Confidence:** confirmed code; inferred magnitude.
+
+**Counterevidence:** the `history_checks`/`candidate_checks`/`metadata_copies` counters and `kSubmissionGroupBudget` (`:54`) show this path was already tuned; empty `unordered_map`s allocate lazily, so cost is per distinct resource, not per node.
+
+**Minimum safe remedy:** `plan.nodes.reserve(total encoders)` before the loop, and reuse `SubmissionNode` storage across submissions (a plan object owned by the queue, cleared per call) so the maps/vectors keep capacity; extend the same reuse to `validate_transitions`' `pending` map.
+
+**Falsification:** trace or sample `cpu_submit_ns` minus the previous `complete`'s `cpu_submit_ns` per submission; if worker planning is a small fraction of frame time, C3 is dead.
+
+### C4 — Full native submission object graph per segment, Signal, marker, and Present
+`src/d3d12/d3d12_command_queue.cpp:1071` (commit), `:1125–1130` (marker), `:7969–7978` (signal), `:8210` (present); `src/winemetal/unix/winemetal_metal4.c:754–800` (`m4_commit`), `:938–941` (fresh `newCommandBuffer` on every slot reuse), `:736–742` (residency add/remove commit churn), `:283–287` (`addAllocation` per bound resource).
+
+**Chain:** each `CommittingScope` allocates a `DXMTM4Submission`, an `NSCondition`, three `NSMutableArray`s, an `MTL4CommitOptions` with a retained feedback block, a fresh `id<MTL4CommandBuffer>` (because `context->ended`), and performs `[residency commit]` twice per submission. Queue-level `BeginEvent`/`EndEvent`/`SetMarker` each push a `MarkerTask` (`:7953`) which becomes a **complete native submission with no GPU work**.
+
+**Activation:** per segment/`Signal`/marker/`Present`. Marker cost activates only if the application calls queue-level markers (some engines, overlays, and capture tools do; per-draw marking would be catastrophic here). **Class:** CPU + startup/steady GPU queueing overhead. **Confidence:** confirmed code; magnitude inferred.
+
+**Counterevidence:** an empty command buffer is cheap on the GPU; `m4_commit`'s allocations are amortizable by the allocator; the fresh `MTL4CommandBuffer` exists to work around a macOS 27 MetalTools retired-heap bug (comment at `:936–938`), so it is not gratuitous.
+
+**Minimum safe remedy:** batch a `Signal` into the preceding submission of the same queue when one exists (attach `fence_completion` to the last published `InflightCommandBuffer` instead of committing an empty one), and skip the `MarkerTask` submission when the encoder would carry no observable diagnostic (diagnostics disabled).
+
+**Falsification:** count `submit` trace events per frame and classify by whether the submission contained encoders; if signals/markers are ≤2 per frame, C4's submission overhead is negligible.
+
+### C5 — Device-global `residency_lock_` held across every native commit
+`src/d3d12/d3d12_device.cpp:2820` inside `CommitMetal4CommandBuffers`; same lock at `:3168` (`LookupBufferByVA`), `:2899`, `:3041`, `:3131`, `:3314`.
+
+**Chain:** every queue's commit takes the device-global `dxmt::mutex`, and the FIFO worker's descriptor resolution takes the same lock per `AppendSubmissionBuffer`. With multiple D3D12 queues (graphics + compute + copy) committing concurrently, all commits serialize, and any long residency mutation blocks commits **and** every VA lookup.
+
+**Activation:** multi-queue workloads, or any frame with concurrent residency register/unregister. **Class:** CPU / steady state (cross-queue serialization). **Confidence:** confirmed code; contention inferred.
+
+**Counterevidence:** the critical section is only `queue.commit(...)` — the comment at `:2816–2819` documents that GPU waits and retirement deliberately run outside it, and critical sections elsewhere are short lookups.
+
+**Minimum safe remedy:** shrink the guarded region to the preCommit allocation traversal it protects, or replace the global mutex with a reader/writer scheme where VA lookups take a shared lock.
+
+**Falsification:** record commit-lock wait time (a one-line `NowNs()` delta around the `lock_guard`) per submission; if p99 wait is under a few µs, C5 is dead.
+
+### C6 — Cross-queue `Wait` is a CPU-blocking gate, not a GPU-side event wait
+`src/d3d12/d3d12_command_queue.cpp:8020–8030`; `src/dxmt/dxmt_fence.cpp:191–201` and `:224–226`; `src/dxmt/dxmt_queue_order.hpp:149–201`.
+
+**Chain:** `ProcessWait` blocks the FIFO worker on `FenceCompletionLatch::waitUnless`; the latch fires from the producer queue's completion thread only after GPU retirement. Subsequent tasks on the waiting queue are not submitted at all. `MTL4CommandQueue_waitForEvent` exists in the bridge (`Metal.hpp:1056`) and is used for `timestamp_order_event_`/`alias_flush_event_` but never for D3D12 fences, because D3D12 fences have no per-fence native event — only the shared-memory timeline plus observer threads (`d3d12_fence.cpp:130–150`).
+
+**Activation:** any frame with a cross-queue fence dependency (graphics↔compute ping-pong, async compute, copy-engine handoff). **Class:** CPU latency + lost GPU overlap. **Confidence:** confirmed code; latency cost inferred (~1 CPU wakeup + submission round trip per dependency).
+
+**Counterevidence:** D3D12 semantics already forbid the waiting queue's later work from starting, so the observable ordering is correct; the worker blocking is a *stronger* guarantee than a GPU-side wait, not a weaker one.
+
+**Minimum safe remedy:** give each fence a lazily created `MTL::SharedEvent` and encode the wait on the MTL4 queue (`waitForEvent`/`signalEvent`) so the dependency is resolved in hardware, keeping the CPU latch only for `GetCompletedValue`/`SetEventOnCompletion`.
+
+**Falsification:** trace `wait` events and their timestamps; if the gap between a producer's `complete` and the consumer's next `submit` is under ~20 µs, C6 is dead.
+
+---
+
+## D3DMetal comparison question
+
+Does D3DMetal express `ID3D12CommandQueue::Wait`/`Signal` as native `MTL4CommandQueue` `waitForEvent`/`signalEvent` pairs on the GPU timeline (rather than serializing its submission worker), and does it place a single per-queue fence wait/update around every render pass, or derive per-resource dependencies? The answer would show whether the CPU-side wait gate and the coarse pass fence are this codebase's own choices or the only viable mapping onto Metal 4.
+
+---
+
+*Skipped: `RenderPass` grouping internals (`AppendRenderMember`, `SubmissionPlan` group matching) per scope, and any build/runtime/REA verification — all dispositions above are static reading, not measurements. Risk: the three GPU-overlap candidates (C1, C4, C6) cannot be ranked against the CPU candidates (C2, C3, C5) without the trace data named in their falsification steps.*

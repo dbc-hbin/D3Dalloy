@@ -62,12 +62,15 @@ Headers의 read-only reference는 `/Users/hanbinnoh/Documents/zzz-wine-yaagl-pr-
 
 | `src/fsr/include/` 아래 public header | SHA256 |
 |---|---|
-| `api/include/ffx_api.h` | `6b23d642141cbbad01f22a9f2e44e0f9df51fbe00a7fd490b06d06ca7bd42967` |
-| `api/include/ffx_api_types.h` | `68534c808a0b981b92b1381bc39d58e85ff3d47159c27afd6d0da3caefd0f5cb` |
+| `api/include/ffx_api.h` | `744418a64b03d3ef7e9742665f9ac3648727909feb0d7dde79d8a9f212732dac` |
+| `api/include/ffx_api_types.h` | `3575a77c38f6f2066c38ad5d60f5346ee5a9bb4e6792e20cc20f51628d5f3a86` |
+| `denoisers/include/ffx_denoiser.h` | `bdfde56568543abe5fef75debc141f0199bc84e8733a8e151b40b4b5cda3008c` |
 | `api/include/dx12/ffx_api_dx12.h` | `6b0b377c43ebcb3c3b820008b3f05e5cf5e16f08ad41935eabcbe764970c6c88` |
 | `upscalers/include/ffx_upscale.h` | `5d0fed5deaf7e243136c70dac117d6b74c632a6f2d144fa6c3ea30c08b6c7523` |
 
-빌드는 `-Denable_fsr=true -Denable_nvngx=true`, 새 x64 staging은 `--with-fsr --with-nvngx`로 선택한다. Stage는 builtin marker·5 names/ordinals를 검사한다. [전용 smoke recipe](SMOKE-TEST.ko.md#전체-srpublic-fg와-shader-cache-전용-recipe)의 `--suite fsr`는 public AMD headers로 컴파일한 consumer를 사용한다. FSR 선택만으로 NVEXT/NGX를 요구하는 backend는 아니며 동시 stage는 두 public frontends의 회귀 입력을 갖추기 위한 선택이다.
+`ffx_api.h`·`ffx_api_types.h`는 위 reference에 SDK 2.3 RR 1.2용 `ffxConfigureDescGlobalDebug`·`FfxApiMatrix4x4`·`FfxApiFloatBounds` 선언만 추가한 bytes이며, `ffx_denoiser.h`와 함께 `zzz-wine-yaagl-pr-runtime` `e9d0e50db84`의 vendored copy와 byte-identical이다. 원본은 [FidelityFX SDK v2.3.0 denoiser header](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.3.0/Kits/FidelityFX/denoisers/include/ffx_denoiser.h)다.
+
+빌드는 `-Denable_fsr=true -Denable_nvngx=true`, 새 x64 staging은 `--with-fsr --with-nvngx`로 선택한다. Stage는 SR/FG/RR 각 builtin marker·5 names/ordinals를 검사한다. RR(`amd_fidelityfx_denoiser_dx12.dll`)의 계약과 증거는 [CORE FSR RR](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-ray-regeneration--2026-10-30)를 따른다. [전용 smoke recipe](SMOKE-TEST.ko.md#전체-srpublic-fg와-shader-cache-전용-recipe)의 `--suite fsr`는 public AMD headers로 컴파일한 consumer를 사용한다. FSR 선택만으로 NVEXT/NGX를 요구하는 backend는 아니며 동시 stage는 두 public frontends의 회귀 입력을 갖추기 위한 선택이다.
 
 ## Submission·history·completion
 

@@ -1,0 +1,5 @@
+{"node":"render-failure-audit","status":"verified","evidence":["build/local/wave2-render-output/result.json","build/local/wave2-render-output/render-passes-x64_d3d12.log","agent://RenderFailureAudit"]}
+{"node":"render-source-audit","status":"verified","evidence":["graphics-translator/tests/owned-d3d12-render-passes.cpp:819-854","src/d3d12/d3d12_texture.cpp:446-447","agent://RenderSourceAudit"]}
+{"node":"render-fix","status":"implemented","evidence":["src/d3d12/d3d12_command_encoder.hpp:604","src/d3d12/d3d12_command_list.cpp:2256","src/d3d12/d3d12_command_queue.cpp:108,5497,5759,5907-5919,6001-6004"]}
+{"node":"remove-ai-slops","status":"approved","evidence":["agent://RemoveSlopsWave4Followup","agent://RemoveSlopsWave5","agent://RemoveSlopsWave7"]}
+{"node":"runtime","status":"blocked","reason":"full link stops at undefined reference to __imp_WMTGetGuestWindowBase in winemetal.dll; changed D3D12 objects compile and clangd reports no errors"}

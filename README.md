@@ -77,7 +77,7 @@ Import baseline은 DXMT `7c8dee1c2d73415301ceb7d1fa810861cef4cd67` + owned patch
 ### x64/WoW64 중간 baseline
 
 확인한 로컬 도구는 macOS Xcode/Metal tools, Python 3, Meson **1.10.0**, Ninja **1.13 계열**,
-llvm-mingw clang **22.1.8**, native LLVM **15.0.7** static libraries와 설치된 Wine SDK다.
+llvm-mingw clang **22.1.8**, native LLVM **15.0.7** static libraries, Rust **1.85.1**과 설치된 Wine SDK다.
 Meson의 선언상 최소 버전은 1.3.0이며 검증에 사용한 버전과 구분한다.
 아래 x86_64 native Wine 경로는 Apple Silicon에서 Rosetta가 필요하다.
 
@@ -92,6 +92,7 @@ D3D11의 upstream 타깃도 보존한다. [타깃 선택·양 ABI fence 증거](
 | 입력 | 예시 위치 |
 |---|---|
 | x86_64 native LLVM 15.0.7 | `toolchains/llvm-15` |
+| Rust compiler와 대상별 standard library | `toolchains/rust-1.85.1` |
 | Meson/Ninja | `toolchains/tools/bin` |
 | 설치된 Wine SDK | `toolchains/wine-sdk` |
 | staging 원본 Wine runtime | `toolchains/wine-runtime` |
@@ -100,9 +101,18 @@ D3D11의 upstream 타깃도 보존한다. [타깃 선택·양 ABI fence 증거](
 LLVM과 Wine native libraries의 아키텍처는 선택한 native target과 일치해야 한다.
 LLVM 구축과 clangd 설정은 [Development](doc/DEVELOPMENT.md)에 있다.
 
+DXBC/DXIL 셰이더 컨테이너·RDAT 함수 이름 해석, Root Signature 범위 검사와 shader-stage/PSO 캐시 codec은 Rust `no_std` 정적 라이브러리를 사용한다.
+헤더·청크·문자열·캐시 영역과 재배치 정보는 Rust에서 검증하며, 소유권·파일 I/O·SHA1·캐시 정책·shader token·LLVM 변환은 C++에 유지한다.
+Cargo나 외부 crate는 필요 없지만 `rustc`와 선택한 대상의 `core` 라이브러리가 필요하다.
+x64 baseline에는 `x86_64-apple-darwin`, `x86_64-pc-windows-gnu` 대상이 필요하다.
+다른 구성은 native ARM64에 `aarch64-apple-darwin`, Win32에 `i686-pc-windows-gnu`,
+Windows ARM64에 `aarch64-pc-windows-msvc`, ARM64EC에 `arm64ec-pc-windows-msvc`를 사용한다.
+Rustup으로 관리한다면 필요한 대상을 `rustup target add <target>`으로 추가한다.
+아래 PATH는 저장소 안의 독립 Rust 설치 예시이며, 이미 정상인 Rust 설치가 있다면 그 경로를 사용해도 된다.
+
 ```sh
 export LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin
-export PATH="$LLVM_MINGW:$PWD/toolchains/tools/bin:$PATH"
+export PATH="$PWD/toolchains/rust-1.85.1/bin:$LLVM_MINGW:$PWD/toolchains/tools/bin:$PATH"
 export CC_FOR_BUILD=/usr/bin/clang CXX_FOR_BUILD=/usr/bin/clang++ OBJCXX_FOR_BUILD=/usr/bin/clang++
 
 meson setup build/local/build . --cross-file build-win64.txt \

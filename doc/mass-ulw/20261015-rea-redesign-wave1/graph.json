@@ -1,0 +1,19 @@
+{
+  "key": "rea-redesign-wave1-20261015",
+  "name": "REA-guided D3DMetal redesign wave 1",
+  "phase": "mass-redesign-wave-1",
+  "status": "verified-with-preexisting-diagnostic-failure",
+  "goal": "Replace DXMT's queue-wide synchronization and per-surface replay assumptions with a D3DMetal-informed GPU work graph, then continue through bindings, tile lifetime, present/temporal, and shader/indirect execution without claiming FPS until a current-source runtime proves it.",
+  "success_criteria": [
+    "Every harvest lane produces a bounded evidence handoff with observed facts, inferred design, exact source owners, risks, and one recommended next increment.",
+    "The main implementation increment preserves unknown/auxiliary fallback and passes clangd, git diff --check, and the focused diagnostics it affects.",
+    "A final verification node re-reads all producer handoffs and runs the real repository checks before the phase is reported complete."
+  ],
+  "nodes": [
+    {"id":"auxiliary-scheduler-harvest","task":"Harvest auxiliary GPU work and dependency edge ownership for the next queue scheduler increment.","solutionSpace":"unspecified-high: spans queue replay, encoder metadata, and internal helper work but is read-only.","dependsOn":[],"write_scope":"/Users/hanbinnoh/Documents/dxmt-d3d12/doc/mass-ulw/20261015-rea-redesign-wave1/auxiliary-scheduler.md","status":"completed","verdict":"verified-file-248-lines"},
+    {"id":"binding-tile-harvest","task":"Harvest persistent binding and tile-lifetime redesign candidates against current source and retained D3DMetal evidence.","solutionSpace":"unspecified-high: spans command encoder metadata, descriptor ownership, render replay, and resolve/store semantics.","dependsOn":[],"write_scope":"/Users/hanbinnoh/Documents/dxmt-d3d12/doc/mass-ulw/20261015-rea-redesign-wave1/binding-tile.md","status":"completed","verdict":"verified-materialized-26855-bytes"},
+    {"id":"temporal-shader-harvest","task":"Harvest temporal/present and shader/indirect redesign candidates against current source and retained D3DMetal evidence.","solutionSpace":"unspecified-high: spans temporal/present and compiler/indirect domains.","dependsOn":[],"write_scope":"/Users/hanbinnoh/Documents/dxmt-d3d12/doc/mass-ulw/20261015-rea-redesign-wave1/temporal-shader.md","status":"completed","verdict":"verified-materialized-30734-bytes"},
+    {"id":"synthesis-next-increment","task":"Read all three harvest handoffs, select one bounded implementation increment, and apply it only in the assigned source scope.","solutionSpace":"deep-high: cross-component scheduling judgment must reconcile correctness, REA evidence, and shared dirty files.","dependsOn":["auxiliary-scheduler-harvest","binding-tile-harvest","temporal-shader-harvest"],"write_scope":"/Users/hanbinnoh/Documents/dxmt-d3d12/src/d3d12/d3d12_command_queue.cpp","status":"completed","verdict":"query-visibility-access-increment-applied"},
+    {"id":"wave1-verification","task":"Verify the integrated wave-1 source increment and all producer claims with repository diagnostics and focused tests.","solutionSpace":"unspecified-high: runs the real checks and reports binary pass/fail evidence.","dependsOn":["synthesis-next-increment"],"write_scope":"/Users/hanbinnoh/Documents/dxmt-d3d12/doc/mass-ulw/20261015-rea-redesign-wave1/verification.md","status":"completed","verdict":"focused-pass-full-suite-109-of-110-preexisting-failure"}
+  ]
+}

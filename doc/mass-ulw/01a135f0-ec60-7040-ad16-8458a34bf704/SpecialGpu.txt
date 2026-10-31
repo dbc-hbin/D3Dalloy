@@ -1,0 +1,88 @@
+I read this as a read-only static audit of the specialized-GPU feature paths - I have the caller chains, activation predicates and existing measurements; I'll now report. Stop condition: each scoped path and 12 angles has a disposition with cited evidence.
+
+**Scope note:** `SpecialGpu` is this assignment's id, not a source symbol - `grep SpecialGpu src/` returns nothing (only `doc/mass-ulw/*/graph.json`). The audited domain is the specialized-GPU feature surface below.
+
+## 1. Coverage and angles checked
+
+**Files read (bounded ranges)**: `src/d3d12/d3d12_atomic64_phase.{hpp,cpp}` (whole), `d3d12_atomic64_storage.hpp`/`_gpu.hpp`, `d3d12_sampler_feedback.{hpp,cpp}`, `d3d12_work_graph.{hpp,cpp}`, `d3d12_acceleration_structure.hpp`, `d3d12_matrix.hpp`, `d3d12_command_signature.cpp:379-731`, `d3d12_command_allocator.cpp:300-520`, `d3d12_command_queue.cpp:900-950, 1650-1760, 1990-2560, 2820-2960, 4890-5075, 6020-6200, 6300-6670, 6950-7200`, `d3d12_command_list.cpp:2090-2180, 2360-2520, 2740-2800, 2820-2900, 3190-3430, 3830-3910, 6060-6150, 8340-9200, 9780-9990, 10250-10330`; `src/airconv/dxil_fp64.cpp`, `dxil_atomic64.cpp`, `dxil_matrix.cpp`, `dxil_mesh.cpp`, `dxil_workgraph.h`, `msaa_coarse.hpp`, `msaa_mesh.hpp`, `shaders/air_sampler_feedback.metal`, `d3d12_pipeline_graphics.cpp:2420-2560`, `d3d12_pipeline_compute.cpp:100-115`. Existing evidence: `build/local/d3dmetal-opt-port-20261009/indirect-cost-probe/{phase3c-comparison-report.md,comparison-report.md}`, `graphics-translator/{CORE-IMPLEMENTATION-STATUS.ko.md,ZZZ-COMPATIBILITY.ko.md}`, `doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md`.
+
+**Angles and dispositions** (all "confirmed code" unless marked inferred):
+
+1. **Indirect draw emulation / ICB path** - real cost, measured (§C3). `simple_indirect` fast paths exist but are capped: compute only at `MaxCommandCount == 1` (`d3d12_command_list.cpp:9041`), graphics at `<= 64` (`:9172-9176`). Everything else takes the GPU resolver + ICB.
+2. **Per-execution native resource creation for capture/SO/MSAA indirect** - confirmed (§C4). `newIndirectCommandBuffer` per execution (`d3d12_command_queue.cpp:2907`) plus per-slot `metal.newBuffer` (`:2931`, `:2943`) inside the command loop.
+3. **Emulated MSAA/ROV execution** - confirmed, largest structural cost (§C1). Triggered far more broadly than "MSAA game": `d3d12_device.hpp:702-703` adds `uses_atomic64`, `owned_conservative`, `emulated_depth_bounds`, `owned_distance_interpolation`, `owned_mesh_output_replay`; `d3d12_command_list.cpp:6110-6113` adds `CoarseShadingRateState()` and **`topology_ == kTriangleFan`**.
+4. **Native MSAA fast path** - negative finding. `CanUseNativeMSAA()` (`:2093-2099`) is taken first; a plain multisampled PSO with ordinary state uses real raster and pays no capture cost. Emulation is the fallback, not the default.
+5. **Tessellation / geometry-shader emulation** - confirmed structural (VS+HS+DS+GS or VS+GS run as capture + replay passes; `d3d12_command_list.cpp:2507-2510`, `:3684-3841`, `:8480-8483`), and indirect TS/GS additionally pays the GPU preflight round trip (§C5). Negative on evidence: no retained trace proves ZZZ tessellates; the only tessellation timings in-repo are historical D3DMetal test-shader numbers explicitly not ZZZ (`doc/SHADER-CACHE-REGRESSION-DESIGN-2026-10-13.ko.md:34`).
+6. **Atomic64** - confirmed, highest-severity conditional (§C2). Shader lowering is an elected-lane cooperative loop (`dxil_atomic64.cpp:20-43`: `air.simd_ballot`, `get_thread_index_in_simdgroup`, retry loop per atomic op).
+7. **DXR / acceleration structures** - confirmed multi-pass per build: shadow helper (`d3d12_command_queue.cpp:7129-7144`), `encodeASPrepass` (`:7160-7162`), native build/refit (`:7168-7175`), postbuild helpers (`:7187-7197`); helpers use a fixed 4096-thread grid-stride (`d3d12_acceleration_structure.hpp:161-163`). Activation is app AS builds; RT is recorded OFF in the measured ZZZ configuration (`doc/FEX-PERFORMANCE-2026-10-09.md:48`), so this is unlikely to explain current FPS.
+8. **Work graphs** - confirmed CPU-serialized (§C6). Advertised as WorkGraphsTier1.0 (`CORE-IMPLEMENTATION-STATUS.ko.md:158`).
+9. **Matrix / WaveMMA** - confirmed amplification, narrow activation. `dxil_matrix.cpp:5-6, 554-556`: wave32 distribution, threadgroup snapshot + barrier before each op; runtime `ConvertLinearAlgebraMatrix` is one compute dispatch per conversion (`d3d12_command_list.cpp:10280-10325`) - no cost unless the app calls it.
+10. **FP64** - compile-time lowering to integer SoftFloat (`dxil_fp64.cpp:1-6, 24-70`); runtime ALU blowup only in shaders that use `double`. No in-repo proof ZZZ does.
+11. **Sampler feedback** - negative finding. The map is an opaque owned buffer with no texture, no CPU map, no per-draw CPU work (`d3d12_sampler_feedback.cpp:23-30, 61-91, 152-175`); only `WriteSamplerFeedback*` shader ops (`shaders/air_sampler_feedback.metal:6-24`, atomic max per footprint texel) and `ClearUnorderedAccessViewUint`.
+12. **Command signatures** - one-time per signature: a generated Metal source resolver plus a native compute PSO (`d3d12_command_signature.cpp:379-445`). No per-draw cost. Negative.
+13. **PSO variant explosion** - startup cost: MSAA variants compile up to 3-4 pixel functions per PSO (`d3d12_pipeline_graphics.cpp:2476-2513`), lazily on first `GetMSAAPipelineVariants` (`:2424-2435`, guarded by an `attempted` flag - so once, not per draw).
+
+## 2. Candidates
+
+### C1. Per-tile encoder storm in emulated MSAA/ROV execution (strongest structural candidate)
+- **Chain**: `SetPipelineState` → `PreDraw` sets `render->atomic64_phase = true` (`d3d12_command_list.cpp:2790`) or the draw is a triangle fan / has coarse shading rate / is conservative → `DrawInstanced` (`:3424-3426`) or `DrawIndexedInstanced` (`:4069-4071`) → `RecordMSAADraw` → `render->msaa_draw = std::move(draw); allocator_->InvalidateCurrentPass()` (`:3371-3372`) → queue `EncodeMSAARender` (`d3d12_command_queue.cpp:2022`) → **per primitive** loop (`:2351`), **per 8x8 tile** (`:2394-2395`) creating, for each tile, a blit encoder (`:2398-2401`) plus up to three render encoders (`:2467`, `:2503`, `:2516`, `:2537`), each with `waitForFence`/`updateFence`.
+- **Activation**: any of `EffectiveRasterSampleCount() > 1` without native eligibility, `uses_atomic64`, `owned_conservative`, `emulated_depth_bounds`, `owned_distance_interpolation`, `owned_mesh_output_replay` (`d3d12_device.hpp:702-703`), `CoarseShadingRateState() != 0` (VRS), or `topology_ == kTriangleFan` (`d3d12_command_list.cpp:6110-6113`). The triangle-fan and VRS predicates are one API call away and are not rare features in themselves.
+- **Classification**: CPU encode + GPU fence/encoder overhead, steady-state. Encoder count ≈ primitives × covered-tiles × ~4, i.e. O(covered pixels / 64).
+- **Confidence**: high that this is the code path; **inferred** that it is hot in ZZZ (no trace shows which draws take it).
+- **Counterevidence**: native MSAA short-circuits it (`:2093-2099`); the pass is skipped entirely for ordinary draws; `InvalidateCurrentPass` means one such draw per pass, so the cost is bounded by the number of qualifying draws, not by all draws.
+- **Minimum safe remedy**: none structural. Instrument first - count qualifying draws and tiles per frame (the trace tag `render_work` already carries `"msaa"`/`"atomic64"`/`"rov_samples"`, `d3d12_command_queue.cpp:6623-6626`), then consider only hoisting the per-tile blit clear out of the tile loop if the tile's records are provably dead.
+- **Falsification**: capture the trace with the `render_work` tag on; if qualifying draws ≈ 0 in city frames, this candidate is dead.
+
+### C2. Atomic64 exclusive phase: GPU drain + O(texels) CPU map build
+- **Chain**: any PSO whose reflection sets `HasAtomic64` (`d3d12_pipeline_graphics.cpp:693,751,780,805,1652,1673`; `d3d12_pipeline_compute.cpp:106`; `d3d12_state_object.cpp:844`) → `PreDraw` marks the pass and calls `InvalidateCurrentPass` per draw (`d3d12_command_list.cpp:2162-2163`) → queue `begin_atomic` (`d3d12_command_queue.cpp:5043-5065`): `scope.reset()`, **`submission_ring_.waitUntilRetired(preceding)`** (`:5050`), **`gpu_execution_gate.AcquireExclusive()`** (`:5051`), `PrepareAtomic64Phase` (`:5058`), `EncodeImport` + `PublishContext` (`:5063-5064`) → work → `end_atomic` (`:5068-5075`) → `Retire()` waits for the ring again (`:4972-4980`).
+- **CPU amplification inside `PrepareAtomic64Phase`**: per bound texture, for every sample × mip × array × z × y × x it builds a canonical cell map and uploads it (`d3d12_atomic64_phase.cpp:396`, `:451-452`, `Upload<uint32_t>(map, ...)`), plus a staging buffer per sample (`NewBuffer(slice_pitch * depth, ...)`). That is O(texels) CPU work and O(bytes/8) of CPU-visible buffer per phase.
+- **GPU amplification**: `EncodeImport` issues one blit encoder **per transfer** (each with `waitForFence`/`updateFence`, `:728-745`) plus a compute dispatch (`:549`); `EncodeExport` one dispatch per buffer and per writable texture; `ClearContext` a fill (`:702-712`).
+- **Worst activation**: for MSAA/indirect draws the phase runs **per command slot** - `begin_atomic(16384, ...)` inside the per-`msaa_executions[i]` loop (`d3d12_command_queue.cpp:6652`, `end_atomic` `:6661-6662`; likewise `:6312-6323`), i.e. one exclusive GPU phase + full cell-map rebuild per ExecuteIndirect slot.
+- **Classification**: CPU (map build, waits) and GPU (drain/serialization, import/export passes), steady-state.
+- **Confidence**: high for the mechanism; **unknown** whether ZZZ's city shaders use 64-bit atomics - no retained evidence either way.
+- **Counterevidence**: `Retire()` avoids a wait when the ring is already retired; the phase pipelines are compiled once per device (`:662-676`); the whole path is skipped when no bound shader has `HasAtomic64`.
+- **Minimum safe remedy**: nothing without measurement. The cheapest real win would be to skip cell-map construction for read-only bindings that are never written in the pass (the code already tracks `writable`), but that is a correctness-sensitive change and should follow a count of atomic64 phases per frame.
+- **Falsification**: instrument `PrepareAtomic64Phase` calls and `bindings.textures` sizes per frame; zero phases kills this candidate outright.
+
+### C3. ExecuteIndirect beyond the simple-path caps (already measured)
+- **Chain**: `ExecuteIndirect` (`d3d12_command_list.cpp:8965`) → not `simple_indirect` or over threshold (`:9025-9027`, `:9041`, `:9172-9176`) → `EncodeIndirectRenderCommand`/`EncodeIndirectComputeCommand` → `newIndirectCommandBuffer` (`d3d12_command_allocator.cpp:349`, `:465`) + a resolver dispatch + `ExecuteCommandsInBuffer` → per-execution replay cost in `winemetal_metal4.c:1037-1048`.
+- **Existing measurement**: 4097-slot ExecuteIndirect warm elapsed **2,399.6 µs (no count buffer) / 2,386.0 µs (counted)**; 32 slots ≈ 185-305 µs; count 1 ≈ 172-296 µs (`build/local/d3dmetal-opt-port-20261009/indirect-cost-probe/phase3c-comparison-report.md`). That is ~14% of a 16.6 ms budget **per call** at 4097 slots.
+- **Classification**: CPU/wall (encode + replay), steady-state. The report explicitly warns these are not FPS or GPU-duration numbers.
+- **Confidence**: high (measured, same source hash as the current cut).
+- **Counterevidence**: phase3c already cut the large no-count arm 5× vs phase2d; small counts are sub-300 µs and likely irrelevant.
+- **Remedy**: none recommended here; the measurement already exists and a threshold change would be unmeasured tuning.
+- **Falsification**: count ExecuteIndirect calls and MaxCommandCount per city frame; if all calls are ≤ 64 commands or simple, this is not the bottleneck.
+
+### C4. Per-execution ICB + per-slot native buffers for capture/SO/MSAA indirect
+- **Chain**: `RecordStreamOutputIndirect` (`d3d12_command_list.cpp:8347-8365`) / `RecordMeshCaptureIndirect` (`:8477`) → queue `PrepareSOIndirectExecution` → `execution.storage = metal.newBuffer(info)` (`d3d12_command_queue.cpp:2862`), `execution.icb = metal.newIndirectCommandBuffer(..., count, ...)` (`:2907`), and **inside the per-command loop** `draw->scratch = metal.newBuffer(...)` (`:2931`) and `draw->positions = metal.newBuffer(...)` (`:2943`).
+- **Activation**: `RequiresMSAAExecution()` (see C1) or `stream_output.active` or non-empty `active_pipeline_statistics_` at the ExecuteIndirect site (`:9155-9157`).
+- **Classification**: CPU (native resource creation, O(count) per execution), steady-state.
+- **Confidence**: high on code; **inferred** cost magnitude (ICB creation is a driver-side compile of the ICB program).
+- **Counterevidence**: `needs_stream_assembly` gates scratch/positions creation - draws without assembly reuse `execution.storage` (`:2928-2946`); the ordinary (non-capture) indirect path reuses a recording-time ICB instead.
+- **Remedy**: none proposed; this path is correctness-coupled to GPU-written draw arguments.
+- **Falsification**: count native `newIndirectCommandBuffer`/`newBuffer` calls per frame with Metal API tracing.
+
+### C5. GPU preflight round trips that stall the submission thread
+- **Chain**: SO/MSAA indirect with a count buffer or predicate: `EncodeSOIndirectPreflight` → `scope.reset(); submission_ring_.waitUntilRetired(producer); start_segment()` (`d3d12_command_queue.cpp:6049-6056`, again `:6097-6103`); capture-sized ExecuteIndirect: same at `:6097-6103`; mesh/tessellation capture: `finish_mesh_preflight()` → `waitUntilRetired(producer)` (`:6158`); mesh grid: a 16-byte blit into a shared buffer followed by the same wait (`:6173-6184`).
+- **Activation**: TS+GS or GS `capture_indirect` pass, SO indirect with count/predicate, or MSAA indirect.
+- **Classification**: CPU stall (full GPU round trip inside `ExecuteCommandLists`), steady-state.
+- **Confidence**: high on code; magnitude **inferred** (depends on how much work is in flight).
+- **Counterevidence**: only taken when the argument buffer must be read on the GPU - the code deliberately avoids stale CPU copies of arguments.
+- **Remedy**: none safe in this scope; the alternative (CPU-side count read) is exactly what the design rejected.
+- **Falsification**: measure `ExecuteCommandLists` wall time with and without TS/GS indirect present in the frame.
+
+### C6. Work-graph execution is CPU-serialized per node and per group
+- **Chain**: `DispatchGraph` → `ExecuteWorkGraph` (`d3d12_command_queue.cpp:5982`) → `RunNode` (`d3d12_work_graph.cpp:968`) → per group: `Begin()` acquires the execution gate and allocates a fresh `MTL4CommandBuffer` (`:912-919`), per node a fence wait (`:1060`), then `Complete()` → **`submission.waitUntilCompleted()`** (`:927`) → then for each child record a CPU `Read()` that issues a blit and waits again (`:935-956`, called at `:1105-1110`).
+- **Activation**: app dispatches a work graph (Tier 1.0 advertised). Atomic64 nodes add C2 on top (`:1026-1058`, `:1074-1085`).
+- **Classification**: CPU + GPU idle gaps, steady-state.
+- **Confidence**: high on code; ZZZ usage **unknown**.
+- **Counterevidence**: none found - there is no pipelining between nodes.
+- **Falsification**: count `ExecuteWorkGraph` calls per frame; zero closes it.
+
+## 3. One D3DMetal comparison question
+
+Does the reference (SHA-256 `f5b56df1…`) execute work graphs and atomic64-phase shaders through a **single pipelined command stream with GPU-side node scheduling**, or does it also stop-and-read per node/phase as `RunNode`+`Complete`+`Read` do at `src/d3d12/d3d12_work_graph.cpp:912-956`? Concretely: does `D3D12::WorkGraphCommandEncoder::EncodeDispatchGraph` (reference `0x1607bf`) submit once per `DispatchGraph`, and does `MPLCommandList` expose any atomic64-equivalent import/export pass (`SM50_ATOMIC64_*` counterpart) at all? A "single submit, no per-node wait" answer would make C6 a real parity gap; "reference unsupported" would close it.
+
+---
+
+Skipped: no REA calls, no build, no runtime; `dxil_rt_operations.cpp`/`dxil_raytracing.cpp` bodies were only scanned for activation, not audited line-by-line. Risk: every retained candidate except C3 is conditional on shader/topology features whose ZZZ usage has no retained evidence - treat C1/C2 as "measure this predicate first", not as the cause of the current FPS plateau.

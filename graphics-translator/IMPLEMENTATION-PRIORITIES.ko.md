@@ -2,6 +2,10 @@
 
 기준일: **2026-10-10**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
 
+## 2026-10-31 최적화 묶음 후속
+
+[2026-10-31 최적화](CORE-IMPLEMENTATION-STATUS.ko.md#d3d12-경로srfgrrrust-경계-최적화--2026-10-31)는 native ARM64 Wine+FEX의 x64 GPU suite를 통과했다. 남은 일은 세 가지다. trace counter로 동기화 감소를 측정하고, 같은 장면에서 FPS를 비교한다. x86 guest를 검증하고, Reflex fixed-two admission을 측정 probe와 함께 다시 판단하고, 기존 실패 항목인 fullscreen frame statistics·tiled/dxil-resource-review의 Shader Validation 중 compiler XPC 끊김·fsr marker·sm6 입력을 따로 처리한다.
+
 ## 현재 관리 범위
 
 이 저장소는 DXMT D3D12 번역기와 그 검증을 관리한다. Wine SDK/runtime 빌드는 별도 Wine-darwin, FEX 소스·빌드는 FEX-darwin의 책임이다. 아래 완료 결과와 미완료 계약을 구분하며, 과거 세션의 실행 순서·중단·위임 지시는 현재 작업 지시로 유지하지 않는다.
@@ -13,7 +17,6 @@
 | 항목 | 현재 판정 | 남은 조건 |
 | --- | --- | --- |
 | 동일 장면 게임 FPS·frame time | 사용자 요청으로 후속 검증 보류 | Steam 래퍼와 `-use-d3d12`로 실제 D3D12를 확인하고 동일 설정·장면·drawable·계측 조건을 맞춘 비교. 이전 DX11 실행과 불연속 HUD 수치는 제외 |
-| Commit 시점 Present 예약 | 미이식, completion 기반 표시 유지 | 이미 예약한 표시의 취소 또는 epoch 조건부 표시와 GPU 오류 시 억제를 보존하는 native 계약. D3DMetal의 더 약한 RESTART 처리를 그대로 이식하지 않음 |
 | Native SR 112×112 | Framework-only Conv3x3 BBR invalid store 재현 | 같은 입력의 독립 native 검증이 먼저 통과해야 한다. 128×128·96×112 controls는 clean이며, 출력 크기를 임의로 올린 뒤 crop하거나 validation을 끄지 않음 |
 | RR 초기 cold-cache 경계 | 추가 ResponsivityMask 검사에서 비동기 초기화 timeout을 재현했고 최종 모델 동기 초기화 후32 frames 통과 | 생성 시 CPU 대기는 늘 수 있다. 전역 compiler cache·다른 OS/GPU·실게임 cold-start는 별도이며 모든 과거 timeout의 원인을 하나로 단정하지 않음 |
 
@@ -44,6 +47,7 @@ SampleCmpGrad/Bias는 dynamic cube gradient 수정과 54-case 공개 검증 후 
 | --- | --- | --- |
 | Composition absolute alpha/colour | Premultiplied FP16·G10/P709·PQ/P2020·G22/P2020 구현, 공개 HDR 계약과 paired drawable32개 수치·기존 Presenter11 frames PASS | 현재 ARM64 Wine DComp stub·target attachment 실패로 최종 compositor/scanout 미검증. Qualified Windows/reference/profile 비교는 별도 |
 | NGX Ray Reconstruction | 기존 non-fused native 위임에 ResponsivityMask와 독립 origin 연결. 4 variants×8 frames·243,392 RGB 성분 반응·atlas/tight exact·release/replay PASS | 나머지 ray-direction/DoF/transparency/alpha 등의 guide는 정확한 native consumer가 없어 거부. NVIDIA 모델 동등성·다른 OS/GPU·실게임은 별도 |
+| FSR Ray Regeneration | x64 RR 1.0/1.1/1.2 frontend와 MetalFX neural radiance·analytic scalar correction, public `fsr-rr` API+Shader Validation PASS | WoW64 x86·ARM64/FEX 실행, 실제 AMD RR 게임, AMD debug view, context 없는 memory 예측, AMD 모델·화질 동등성 |
 | HDR10+ GAMING | 일반 HDR10/scRGB/PQ·EDR, generic transport 조사, Samsung APP/GPU·calibration 근거 | Supported Gaming payload/SSTM·native mode/readback·owner/restore·calibrated GPU tone-map·실제 적합 출력. Mandatory sink ACK를 임의로 요구하지 않음 |
 
 이 항목은 게임 관련 기능의 미완료로 유지한다. ALLM/SBTM/HDR10+ video·DX11 SR·validation suppression·내부 상태 echo로 대체하지 않는다. 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)과 [현재 리뷰의 native 계약](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#outstanding-externalnative-contracts)을 따른다.
@@ -82,3 +86,19 @@ Fresh output/runtime·전용 prefix를 쓰며 기존 게임/live prefix에 설�
 <a id="현재-남은-구현-목록--2026-10-05-정리"></a>
 <a id="2026-10-03-중간-정리"></a>
 과거 P0–P4의 중복 표·중간 보류·인수인계 문서는 삭제했다. 현재 판정에 필요한 증거와 당시 cut의 한계만 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)에 남긴다. 과거 관측을 최신 소스의 재검증으로 세지 않는다.
+
+## 2026-10-14 FPS 후속 우선순위
+
+상태: 우선순위와 조건만 기록. P1 구현과 게임 FPS 개선 검증은 아직 하지 않았다.
+
+이번 계측에서 도시 화면은 HUD 43.63 FPS, 22.92ms frame interval로 관측됐다. 그러나 trace가 시작 화면에서 먼저 100,000 event budget을 소진해, render 22개·compute 2개·blit 2개·clear 5개·draw 30개라는 상세 구성은 **로그인 구간 측정**이다. 따라서 이 숫자를 도시의 pass 수나 MetalFX 비용으로 사용하지 않는다. shader cache operation이 안정 구간에 없었다는 관측도 같은 trace 범위에 한정한다.
+
+| 순위 | 과제 | 진행 조건과 금지 범위 |
+| --- | --- | --- |
+| **P1** | **depth-only render pass 재사용 후보 검증 및 최소 수정** | 기존 OMSetRenderTargets는 같은 RTV/DSV 재바인딩을 이미 생략한다. 먼저 bounded 도시 trace에서 NumRTV == 0의 동일 DSV가 zero_rtvs 이유로 반복 split되는지 확인한다. 실제로 발생하면 동일 retained DSV view/plane/aspect/flags/sample/dimensions/load-store 조건에서만 현재 encoder를 유지한다. 다른 attachment, barrier hazard, resolve, local/suspend, MSAA·visibility·predication·stream-output·temporal 경계는 계속 split한다. 상세 설계와 검증은 [D3D12 review](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-10-14-실게임-gpu-측정과-render-pass-재사용-설계)에 둔다. |
+| **P2** | **도시 pass split reason 계측** | trace event budget을 시작 화면에서 소진하지 않도록 bounded capture 조건을 정한다. render_targets_rebind_rejected, render_targets_rebind_elided, pass_end, clear/load/store, resolve, barrier를 recording/list/encoder와 연결한다. 원인 카운터 없이 전체 barrier tracker나 submission merger를 재작성하지 않는다. |
+| **P3** | **생성된 AIR/Metal 셰이더의 GPU 실행 비용** | P1/P2에서 실제 pass 원인이 아니거나 수정 후에도 GPU frame time이 높을 때만 진행한다. 같은 shader 입력의 instruction 수, texture/sample 수, descriptor lookup, register/occupancy를 비교한다. shader parse, function cache, native library cache를 steady-state FPS 해결책으로 다시 추가하지 않는다. |
+| **P4** | **MetalFX temporal과 후처리 조합** | P3 셰이더 비용이 원인이 아닐 때 Metal System Trace에서 temporal encode, input preparation, output composite, blit/clear를 frame ID별로 식별한다. MetalFX를 끄는 우회는 하지 않고 같은 입력·출력 해상도와 history/reset 상태로 A/B한다. |
+| **P5** | **CPU binding/residency 비용** | GPU가 아닌 CPU frame time이 병목으로 측정될 때만 진행한다. 기존 argument-table cache, residency-set dedup, root binding dirty suppression과 중복되는 새 cache나 D3DMetal IMP cache 복사는 추가하지 않는다. |
+
+P1의 목표는 draw 수를 줄이는 것이 아니라 **실제로 반복되는 동일 depth-only binding을 더 적은 native render encoder로 기록하는 것**이다. 해당 호출이 도시에서 관측되지 않으면 P1을 ZZZ FPS 수정으로 주장하지 않고 P2~P4의 증거 수집으로 되돌린다. output hash·validation·barrier 순서를 보존하지 못하면 기존 split 경로를 유지한다.

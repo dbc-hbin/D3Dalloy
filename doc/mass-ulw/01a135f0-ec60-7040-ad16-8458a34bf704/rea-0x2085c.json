@@ -1,0 +1,152 @@
+{
+  "evidence_id": "ev_efa4645ee9ea0c60d9ae62cd54074a85d7d3e2205b41676f71723f82b4d0c807",
+  "subject": {
+    "name": "D3DMetal",
+    "digest": {
+      "sha256": "f5b56df1b8fe8b364dd9530651a3769c8aed948bd343be3b4510604d503e2bad"
+    },
+    "format": "mach-o",
+    "architecture": "x86_64",
+    "local_path": "/Users/hanbinnoh/Downloads/D3DMetal.framework/Versions/A/D3DMetal"
+  },
+  "provider": {
+    "id": "ghidra",
+    "name": "Ghidra",
+    "version": "12.1.4"
+  },
+  "parameters": {
+    "procedure": "0x2085c"
+  },
+  "limitations": [
+    "The session serves operations only after Ghidra reports default auto-analysis complete; incomplete analysis does not expose partial results.",
+    "The imported Program and temporary project are ephemeral and deleted on close. Annotation operations edit session database metadata; original executable bytes are never written.",
+    "Cancelling an active Ghidra request terminates its ephemeral database and discards session annotations. The selected target remains open; the next provider query imports the original artifact again.",
+    "Default-space addresses use lowercase 0x-prefixed hexadecimal; other address spaces use <percent-encoded-space>:0x<hex>.",
+    "References cover the complete Ghidra function-body AddressSet and exact entry. Dossier incoming edges omit sources owned by that function; procedure_references also retains those internal edges.",
+    "The dossier combines Ghidra FunctionManager, Listing, ReferenceManager, BasicBlockModel, and decompiler observations; provider-specific pseudocode and assembly are not cross-provider text invariants.",
+    "Resolved reference metadata identifies computed, indirect, external, call, jump, and data edges; unresolved targetless flows remain unknown, and function classifications distinguish thunks and externals.",
+    "Synthetic Ghidra entry-point references without actionable memory sources are omitted.",
+    "The Java bridge serializes one function request per Program and lets each decompilation run until it completes or the caller cancels.",
+    "macOS sessions require a matching executable Ghidra native decompiler; REA checks for it but does not build native components or change Gatekeeper quarantine state."
+  ],
+  "procedure": {
+    "address": "0x2085c",
+    "name": "MPLCommandList::EmitBarrierDependencies",
+    "classification": {
+      "external": false,
+      "thunk": false,
+      "thunk_target": null,
+      "provenance": "ghidra-function-manager"
+    },
+    "body": {
+      "available": true,
+      "provenance": "ghidra-function-body-address-set",
+      "ranges": [
+        {
+          "start": "0x2085c",
+          "end": "0x20d81"
+        }
+      ],
+      "total_bytes": 1318,
+      "span_bytes": 1318,
+      "non_contiguous": false,
+      "contains_entry": true
+    },
+    "signature": "undefined __thiscall EmitBarrierDependencies(MPLCommandList * this, MPLEncoderType param_1, bool param_2, EncoderIndex param_3, EncoderIndex param_4, MPLDynamicBitset * param_5)",
+    "locals": [
+      {
+        "description": "undefined1 local_31 @ Stack[-0x31]:1",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined1 local_32 @ Stack[-0x32]:1",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_38 @ Stack[-0x38]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_40 @ Stack[-0x40]:8",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_44 @ Stack[-0x44]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_48 @ Stack[-0x48]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_4c @ Stack[-0x4c]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_50 @ Stack[-0x50]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_54 @ Stack[-0x54]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined1 local_58 @ Stack[-0x58]:1",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_5c @ Stack[-0x5c]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_60 @ Stack[-0x60]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_64 @ Stack[-0x64]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_70 @ Stack[-0x70]:8",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_78 @ Stack[-0x78]:8",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_80 @ Stack[-0x80]:8",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined4 local_84 @ Stack[-0x84]:4",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_90 @ Stack[-0x90]:8",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_98 @ Stack[-0x98]:8",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_a0 @ Stack[-0xa0]:8",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_a8 @ Stack[-0xa8]:8",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_b0 @ Stack[-0xb0]:8",
+        "provenance": "ghidra-function-database"
+      },
+      {
+        "description": "undefined8 local_b8 @ Stack[-0xb8]:8",
+        "provenance": "ghidra-function-database"
+      }
+    ]
+  },
+  "pseudocode": "\n/* MPLCommandList::EmitBarrierDependencies(MPLEncoderType, bool, EncoderIndex, EncoderIndex,\n   MPLDynamicBitset<unsigned long long> const&) */\n\nvoid __thiscall\nMPLCommandList::EmitBarrierDependencies\n          (MPLCommandList *this,byte param_2,char param_3,uint param_4,undefined8 param_5,\n          ulong param_6)\n\n{\n  MPLCommandList *pMVar1;\n  long lVar2;\n  MPLCommandList *pMVar3;\n  byte *pbVar4;\n  MPLCommandList MVar5;\n  uint uVar6;\n  MPLSubresource *pMVar7;\n  long lVar8;\n  undefined4 *puVar9;\n  long lVar10;\n  MPLCommandList *pMVar11;\n  long lVar12;\n  long lVar13;\n  ulong uVar14;\n  ulong uVar15;\n  byte bVar16;\n  uint uVar17;\n  uint uVar18;\n  ulong uVar19;\n  uint uVar20;\n  ulong uVar21;\n  ulong uVar22;\n  MPLSubresource *pMVar23;\n  long lVar24;\n  bool bVar25;\n  bool bVar26;\n  undefined4 local_5c;\n  undefined1 local_58;\n  uint local_54;\n  undefined4 local_50;\n  uint local_4c;\n  undefined4 local_48;\n  uint local_44;\n  MPLCommandList *local_40;\n  uint local_38;\n  byte local_32;\n  byte local_31;\n  \n  local_58 = 0;\n  local_5c = 0;\n  pMVar23 = *(MPLSubresource **)(this + 0x2b60);\n  pMVar7 = *(MPLSubresource **)(this + 0x2b68);\n  local_40 = this;\n  local_38 = param_4;\n  if (pMVar23 != pMVar7) {\n    do {\n      lVar12 = ankerl::unordered_dense::v4_5_0::detail::\n               table<MPLSubresource,MPLCommandList::NoProducerBarrier,MPLSubresourceHasher,std::equal_to<MPLSubresource>,std::allocator<std::pair<MPLSubresource,MPLCommandList::NoProducerBarrier>>,ankerl::unordered_dense::v4_5_0::bucket_type::standard,ankerl::unordered_dense::v4_5_0::detail::default_container_t,false>\n               ::do_try_emplace<MPLSubresource_const&>\n                         ((table<MPLSubresource,MPLCommandList::NoProducerBarrier,MPLSubresourceHasher,std::equal_to<MPLSubresource>,std::allocator<std::pair<MPLSubresource,MPLCommandList::NoProducerBarrier>>,ankerl::unordered_dense::v4_5_0::bucket_type::standard,ankerl::unordered_dense::v4_5_0::detail::default_container_t,false>\n                           *)(this + 0x2870),pMVar23);\n      param_4 = local_38;\n      for (bVar16 = pMVar23[0x10]; bVar16 != 0; bVar16 = bVar16 ^ '\\x01' << ((byte)uVar17 & 0x1f)) {\n        uVar17 = 0;\n        if (bVar16 != 0) {\n          for (; (bVar16 >> uVar17 & 1) == 0; uVar17 = uVar17 + 1) {\n          }\n        }\n        uVar15 = (ulong)uVar17;\n        if (*(int *)(lVar12 + 0x18 + uVar15 * 4) == -1) {\n          *(uint *)(lVar12 + 0x18 + uVar15 * 4) = param_4;\n        }\n        *(byte *)((long)&local_5c + uVar15) =\n             *(byte *)((long)&local_5c + uVar15) | *(byte *)(lVar12 + 0x16);\n      }\n      pMVar23 = pMVar23 + 0x18;\n    } while (pMVar23 != pMVar7);\n    pMVar23 = *(MPLSubresource **)(local_40 + 0x2b60);\n  }\n  *(MPLSubresource **)(local_40 + 0x2b68) = pMVar23;\n  lVar8 = *(long *)(local_40 + 0x24d0);\n  lVar24 = (ulong)param_4 * 0x1e8;\n  lVar12 = lVar8 + lVar24;\n  AddExplicitDeps(local_40,(ulong)param_4,param_6);\n  pMVar11 = local_40;\n  uVar15 = (ulong)(0x10080403 >> (param_2 * '\\b' & 0x1f));\n  lVar13 = (ulong)param_2 * 0x20;\n  local_4c = 0;\n  local_48 = 0;\n  local_50 = 0;\n  uVar17 = local_38;\n  do {\n    uVar20 = 0;\n    if ((uVar15 & 0xff) != 0) {\n      for (; (((uint)uVar15 & 0xff) >> uVar20 & 1) == 0; uVar20 = uVar20 + 1) {\n      }\n    }\n    uVar21 = (ulong)uVar20;\n    local_31 = '\\x01' << ((byte)uVar20 & 0x1f);\n    MVar5 = pMVar11[uVar21 * 0x18 + 0x2930];\n    param_6 = CONCAT71((int7)(param_6 >> 8),MVar5);\n    if (MVar5 != (MPLCommandList)0x0) {\n      pMVar1 = pMVar11 + uVar21 * 0x18 + 0x2930;\n      bVar26 = false;\n      local_44 = (uint)uVar15;\n      if ((param_3 != '\\0') && (((byte)MVar5 & local_31) != 0)) {\n        bVar26 = *(uint *)(pMVar1 + uVar21 * 4 + 4) == uVar17;\n      }\n      lVar10 = uVar21 * 0x18 + 0x2934;\n      uVar20 = (uint)*(byte *)((long)&local_5c + uVar21);\n      uVar15 = param_6 & 0xffffffff;\n      local_54 = (uint)*(byte *)((long)&local_5c + uVar21);\n      do {\n        uVar18 = 0;\n        if ((param_6 & 0xff) != 0) {\n          for (; (((uint)param_6 & 0xff) >> uVar18 & 1) == 0; uVar18 = uVar18 + 1) {\n          }\n        }\n        bVar16 = '\\x01' << ((byte)uVar18 & 0x1f);\n        uVar6 = *(uint *)(pMVar11 + (ulong)uVar18 * 4 + lVar10);\n        uVar14 = (ulong)uVar6;\n        uVar19 = uVar15;\n        if (((uVar20 >> (uVar18 & 0x1f) & 1) == 0) || (uVar6 != 0xffffffff)) {\n          uVar18 = *(uint *)(pMVar11 + (ulong)uVar18 * 4 + uVar21 * 0x14 + 0x2a20);\n          uVar22 = (ulong)uVar18;\n          if (uVar22 != 0xffffffff) {\n            if (uVar6 == 0xffffffff) {\n              if (uVar18 <= uVar17) {\n                local_32 = (byte)uVar15 & ~bVar16;\n                uVar15 = CONCAT71((int7)(uVar15 >> 8),local_32);\n                pbVar4 = (byte *)(lVar12 + 0x11 + uVar21);\n                *pbVar4 = *pbVar4 | bVar16;\n                if (uVar18 < uVar17) {\n                  AddExplicitDep(local_40,uVar17,uVar22);\n                  AddExplicitDeps(local_40,local_38,\n                                  *(long *)(local_40 + 0x24d0) + uVar22 * 0x1e8 + 0x1b8);\n                  AddExplicitDeps(local_40,local_38,\n                                  *(long *)(local_40 + 0x24d0) + uVar22 * 0x1e8 + 0x1a0);\n                  uVar15 = CONCAT71((int7)(uVar15 >> 8),local_32);\n                  uVar17 = local_38;\n                  uVar20 = local_54;\n                }\n              }\n            }\n            else if (uVar6 <= uVar18) {\n              bVar25 = true;\n              if ((uVar6 != uVar17) &&\n                 ((lVar2 = *(long *)(local_40 + 0x24d0) + uVar22 * 0x1e8, uVar20 = local_54,\n                  *(ulong *)(*(long *)(local_40 + 0x24d0) + 0x1b8 + uVar22 * 0x1e8) <= uVar14 ||\n                  (uVar19 = uVar15 & 0xffffffff,\n                  (*(ulong *)(*(long *)(lVar2 + 0x1c8) + (ulong)(uVar6 >> 6) * 8) >> (uVar14 & 0x3f)\n                  & 1) == 0)))) {\n                uVar19 = uVar15 & 0xffffffff;\n                uVar15 = uVar19;\n                if (*(ulong *)(lVar2 + 0x1a0) <= uVar14) goto LAB_00020b7d;\n                bVar25 = (*(ulong *)(*(long *)(lVar2 + 0x1b0) + (ulong)(uVar6 >> 6) * 8) >>\n                          (uVar14 & 0x3f) & 1) != 0;\n              }\n              uVar15 = uVar19;\n              if ((uVar18 <= uVar17) && (bVar25)) goto LAB_00020a28;\n            }\n          }\n        }\n        else {\nLAB_00020a28:\n          uVar15 = CONCAT71((int7)(uVar19 >> 8),(byte)uVar19 & ~bVar16);\n        }\nLAB_00020b7d:\n        bVar16 = (byte)param_6 ^ bVar16;\n        param_6 = CONCAT71((int7)(param_6 >> 8),bVar16);\n      } while (bVar16 != 0);\n      if ((byte)uVar15 == 0) {\n        if (bVar26 != false) {\n          puVar9 = *(undefined4 **)(local_40 + lVar13 + 0x23d8);\n          *puVar9 = 0x39000008;\n          *(long *)(local_40 + lVar13 + 0x23d8) = *(long *)(local_40 + lVar13 + 0x23d8) + 8;\n          *(byte *)(puVar9 + 1) = param_2;\n          pMVar3 = pMVar11 + uVar21 * 0x18 + 0x29a8;\n          *pMVar3 = (MPLCommandList)((byte)*pMVar3 | local_31);\n          if (*(uint *)(pMVar3 + uVar21 * 4 + 4) == 0xffffffff) {\n            *(uint *)(pMVar3 + uVar21 * 4 + 4) = uVar17;\n          }\n          else if ((uVar17 != 0xffffffff) && (*(uint *)(pMVar3 + uVar21 * 4 + 4) < uVar17)) {\n            *(uint *)(pMVar3 + uVar21 * 4 + 4) = uVar17;\n          }\n        }\n      }\n      else {\n        pbVar4 = (byte *)(lVar12 + 0x11 + uVar21);\n        *pbVar4 = *pbVar4 | (byte)uVar15;\n        lVar2 = lVar8 + 0x18 + lVar24 + uVar21 * 0x14;\n        uVar19 = uVar15 & 0xffffffff;\n        do {\n          uVar20 = 0;\n          if ((uVar19 & 0xff) != 0) {\n            for (; (((uint)uVar19 & 0xff) >> uVar20 & 1) == 0; uVar20 = uVar20 + 1) {\n            }\n          }\n          uVar14 = (ulong)(uVar20 * 4);\n          *(uint *)(pMVar11 + uVar14 + uVar21 * 0x14 + 0x2a20) = uVar17;\n          uVar18 = *(uint *)(pMVar11 + uVar14 + lVar10);\n          uVar6 = *(uint *)(lVar2 + uVar14);\n          if (uVar18 == uVar17) {\n            if (uVar6 == 0xffffffff) {\n              uVar18 = 0xffffffff;\nLAB_00020bfd:\n              *(uint *)(lVar2 + (ulong)uVar20 * 4) = uVar18;\n            }\n          }\n          else if ((uVar6 == 0xffffffff) || ((uVar18 != 0xffffffff && (uVar6 < uVar18))))\n          goto LAB_00020bfd;\n          bVar16 = (byte)uVar19 ^ '\\x01' << ((byte)uVar20 & 0x1f);\n          uVar19 = (ulong)bVar16;\n        } while (bVar16 != 0);\n        local_50 = (undefined4)\n                   CONCAT71((int7)((uVar15 & 0xffffffff) >> 8),\n                            (byte)(uVar15 & 0xffffffff) | (byte)local_50);\n        local_48 = CONCAT31((int3)((uint)local_48 >> 8),(byte)local_48 | local_31);\n        local_4c = CONCAT31((int3)(local_4c >> 8),(byte)local_4c | bVar26) & 0xffffff01;\n        if (bVar26 != false) {\n          pMVar3 = pMVar11 + uVar21 * 0x18 + 0x29a8;\n          *pMVar3 = (MPLCommandList)((byte)*pMVar3 | local_31);\n          if ((*(uint *)(pMVar3 + uVar21 * 4 + 4) == 0xffffffff) ||\n             ((uVar17 != 0xffffffff && (*(uint *)(pMVar3 + uVar21 * 4 + 4) < uVar17)))) {\n            *(uint *)(pMVar3 + uVar21 * 4 + 4) = uVar17;\n          }\n        }\n      }\n      uVar15 = (ulong)local_44;\n      *(undefined4 *)(pMVar1 + 4) = 0xffffffff;\n      *(undefined4 *)(pMVar1 + 8) = 0xffffffff;\n      *(undefined4 *)(pMVar1 + 0xc) = 0xffffffff;\n      *(undefined4 *)(pMVar1 + 0x10) = 0xffffffff;\n      *(undefined4 *)(pMVar1 + 0x14) = 0xffffffff;\n      *pMVar1 = (MPLCommandList)0x0;\n    }\n    local_31 = (byte)uVar15 ^ local_31;\n    uVar15 = CONCAT71((int7)(uVar15 >> 8),local_31);\n    if (local_31 == 0) {\n      if ((char)local_50 != '\\0') {\n        puVar9 = *(undefined4 **)(local_40 + lVar13 + 0x23d8);\n        *puVar9 = 0x3a000010;\n        *(long *)(local_40 + lVar13 + 0x23d8) = *(long *)(local_40 + lVar13 + 0x23d8) + 0x10;\n        *(char *)(puVar9 + 1) = (char)local_50;\n        *(char *)((long)puVar9 + 5) = (char)local_48;\n        puVar9[2] = 0;\n        *(char *)(puVar9 + 3) = (char)local_4c;\n      }\n      return;\n    }\n  } while( true );\n}\n\n"
+}
