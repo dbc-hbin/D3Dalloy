@@ -59,6 +59,7 @@
 
 #include "dxil_raytracing.h"
 #include "dxil_workgraph.h"
+#include "DXBCParser/DXBCUtils.h"
 #include "DXBCParser/ShaderBytecode.h"
 
 #include <algorithm>
@@ -327,37 +328,18 @@ struct RootSignatureBlob {
  * A D3D12 root signature reaches the compiler as a DXBC container holding an RTS0
  * chunk (that is what MTLD3D12RootSignature::GetBlob returns) or as a raw
  * versioned descriptor; the front end wants the raw descriptor. Unwrapping is
- * idempotent on a raw blob.
+ * idempotent on a raw blob. A DXBC container goes through the same Rust-validated
+ * RTS0 lookup as CreateRootSignature; one that fails it is handed on unchanged, so
+ * setup_binding_rootsig rejects it instead of a fallback signature being chosen.
  */
 RootSignatureBlob unwrapRootSignature(const void *blob, uint64_t size) {
   RootSignatureBlob result{blob, static_cast<size_t>(size)};
-  if (!blob || size < 32)
+  if (!blob || size < 4 || std::memcmp(blob, "DXBC", 4) != 0)
     return result;
-  const auto *bytes = static_cast<const uint8_t *>(blob);
-  if (std::memcmp(bytes, "DXBC", 4) != 0)
-    return result;
-  auto read = [&](size_t offset) {
-    uint32_t value = 0;
-    std::memcpy(&value, bytes + offset, sizeof(value));
-    return value;
-  };
-  const uint32_t chunk_count = read(28);
-  for (uint32_t i = 0; i < chunk_count; ++i) {
-    const size_t header = 32 + 4ull * i;
-    if (header + 4 > size)
-      break;
-    const uint32_t chunk_offset = read(header);
-    if (chunk_offset > size || size - chunk_offset < 8)
-      continue;
-    if (std::memcmp(bytes + chunk_offset, "RTS0", 4) != 0)
-      continue;
-    const uint32_t chunk_size = read(chunk_offset + 4);
-    if (chunk_size > size - chunk_offset - 8)
-      break;
-    result.data = bytes + chunk_offset + 8;
-    result.size = chunk_size;
-    break;
-  }
+  const void *raw = nullptr;
+  UINT raw_size = 0;
+  if (SUCCEEDED(microsoft::DXBCGetRootSignature(blob, size, &raw, &raw_size)))
+    result = {raw, raw_size};
   return result;
 }
 
