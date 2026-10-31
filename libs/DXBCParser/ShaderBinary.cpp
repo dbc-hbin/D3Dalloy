@@ -643,67 +643,6 @@ BOOL CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
              (*m_pCurrentToken - 2) * 4);
 
       switch (pInstruction->m_CustomData.Type) {
-      case D3D11_SB_CUSTOMDATA_SHADER_MESSAGE: {
-        CShaderMessage *pMessage = &pInstruction->m_CustomData.ShaderMessage;
-        UINT Length = pInstruction->m_CustomData.DataSizeInBytes / 4;
-        UINT *pData = (UINT *)pInstruction->m_CustomData.pData;
-
-        // ZeroMemory(pMessage, sizeof(*pMessage));
-        memset(pMessage, 0, sizeof(*pMessage));
-
-        if (Length < 6) {
-          break;
-        }
-
-        UINT StrChars = pData[2];
-        // Add one for the terminator and then round up.
-        UINT StrWords = (StrChars + sizeof(DWORD)) / sizeof(DWORD);
-        UINT NumOperands = pData[3];
-        UINT OpLength = pData[4];
-
-        // Enforce some basic sanity size limits.
-        if (OpLength >= 0x10000 || NumOperands >= 0x1000 ||
-            StrWords >= 0x10000 || Length < 5 + OpLength + StrWords) {
-          break;
-        }
-
-        UINT *pOpEnd = &pData[5 + OpLength];
-
-        pMessage->pOperands =
-            (COperand *)malloc(NumOperands * sizeof(COperand));
-        if (!pMessage->pOperands) {
-          throw E_OUTOFMEMORY;
-        }
-
-        CONST CShaderToken *pOperands = (CShaderToken *)&pData[5];
-        for (UINT i = 0; i < NumOperands; i++) {
-          if (pOperands >= pOpEnd) {
-            break;
-          }
-
-          pMessage->pOperands[i].Clear();
-          UINT next;
-          if (dxmt_dxbc_operand_parse(pData, Length * sizeof(UINT),
-                                      UINT(pOperands - pData), 5 + OpLength,
-                                      &next) != DXMT_DXBC_PROGRAM_SUCCESS)
-            break;
-          pOperands =
-              ParseOperandAt(&pMessage->pOperands[i], pOperands, pOpEnd);
-        }
-        if (pOperands != pOpEnd) {
-          free(pMessage->pOperands);
-          pMessage->pOperands = NULL;
-          break;
-        }
-
-        // Now that we're sure everything is valid we can
-        // fill in the message info.
-        pMessage->MessageID = (D3D11_SB_SHADER_MESSAGE_ID)pData[0];
-        pMessage->FormatStyle = (D3D11_SB_SHADER_MESSAGE_FORMAT)pData[1];
-        pMessage->pFormatString = (PCSTR)pOpEnd;
-        pMessage->NumOperands = NumOperands;
-        break;
-      }
       case D3D10_SB_CUSTOMDATA_COMMENT: {
         // Guarantee that the C string comment is Null-terminated
         if (!pInstruction->m_CustomData.DataSizeInBytes)

@@ -2,6 +2,7 @@
 // malformed inputs. Host-portable: python3 graphics-translator/tests/run-bytecode-parsers-cpu.py
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/DXBCUtils.h"
+#include "DXBCParser/DxbcSignature.h"
 #include "DXBCParser/PipelineLibrary.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "../../src/d3d12/d3d12_dxil_subobjects.hpp"
@@ -203,6 +204,32 @@ static void signatures() {
   auto unterminated = legacy;
   unterminated.back() = 'x';
   reject(unterminated, "unterminated-name");
+
+  // The DXIL frontend parses ISG1/OSG1/PSG1 payloads grouped, as DXC sorts them:
+  // a multi-stream GS output restarts its registers per stream.
+  const auto gs = signature(32, {{0, "SV_Position", 0, 1, 3, 0, 0xf, 0, 0}, {0, "COLOR", 0, 0, 3, 1, 0xf, 0, 0},
+                                 {1, "SV_Position", 0, 1, 3, 0, 0xf, 0, 0}, {1, "COLOR", 0, 0, 3, 1, 0xf, 0, 0}});
+  DxmtDxbcSignatureInfo info{}, untouched{};
+  check(dxmt_dxbc_signature_parse(gs.data(), gs.size(), DXMT_DXBC_SIGNATURE_11_1, 1, &info) == 0 &&
+            info.parameter_count == 4 && info.stream_count == 2 && info.stream_parameters[1] == 2,
+        "dxil-gs-streams-grouped");
+  check(dxmt_dxbc_signature_parse(gs.data(), gs.size(), DXMT_DXBC_SIGNATURE_11_1, 0, &untouched) ==
+            DXMT_DXBC_SIGNATURE_REGISTER_ORDER && untouched.parameter_count == 0,
+        "dxil-gs-streams-ungrouped-rejected");
+  DxmtDxbcSignatureParameter record{};
+  check(dxmt_dxbc_signature_parameter(gs.data(), gs.size(), &info, 3, &record) == 0 && record.stream == 1 &&
+            record.register_index == 1 && record.name_size == 5 &&
+            !std::memcmp(gs.data() + record.name_offset, "COLOR", 6),
+        "dxil-gs-record");
+  check(dxmt_dxbc_signature_parameter(gs.data(), gs.size(), &info, 4, &record) == DXMT_DXBC_SIGNATURE_INVALID_ARGUMENT,
+        "dxil-record-index-past-count");
+  for (size_t size = 8; size < 8 + 4 * 32; size += 31)
+    check(dxmt_dxbc_signature_parse(gs.data(), size, DXMT_DXBC_SIGNATURE_11_1, 1, &untouched) ==
+              DXMT_DXBC_SIGNATURE_RECORDS && untouched.parameter_count == 0,
+          "dxil-truncated-record-table");
+  check(dxmt_dxbc_signature_parse(gs.data(), gs.size() - 1, DXMT_DXBC_SIGNATURE_11_1, 1, &untouched) ==
+            DXMT_DXBC_SIGNATURE_NAME,
+        "dxil-truncated-last-name");
 }
 
 static Bytes program(uint32_t version, std::initializer_list<uint32_t> body) {
@@ -285,6 +312,26 @@ static void programs() {
   }
   const auto empty_comment = program(vs50, {0x00000035, 2});
   check(parse_all(empty_comment, empty_comment.size()), "customdata-empty-comment");
+  // Shader messages are kept as opaque payload bytes: an inconsistent string length
+  // (which wrapped the old decoder's word count) only bounds the block, and the
+  // instruction after it still parses.
+  const uint32_t message = 0x00000035 | (D3D11_SB_CUSTOMDATA_SHADER_MESSAGE << 11);
+  for (uint32_t chars : {0u, 3u, UINT32_MAX - 2, UINT32_MAX}) {
+    const auto code = program(vs50, {message, 8, 0, 0, chars, 1, 0, 0x00434241, 0x0100003e});
+    CShaderCodeParser parser;
+    CInstruction custom, ret;
+    check(SUCCEEDED(parser.SetShader(reinterpret_cast<const CShaderToken *>(code.data()), code.size())) &&
+              parser.ParseInstruction(&custom) && custom.OpCode() == D3D10_SB_OPCODE_CUSTOMDATA &&
+              custom.m_CustomData.Type == D3D11_SB_CUSTOMDATA_SHADER_MESSAGE &&
+              custom.m_CustomData.DataSizeInBytes == 24 &&
+              static_cast<const uint32_t *>(custom.m_CustomData.pData)[2] == chars &&
+              parser.ParseInstruction(&ret) && ret.OpCode() == D3D10_SB_OPCODE_RET && parser.EndOfShader(),
+          "customdata-shader-message-opaque");
+  }
+  const auto short_message = program(vs50, {message, 3, 0});
+  check(parse_all(short_message, short_message.size()), "customdata-shader-message-short");
+  const auto message_past = program(vs50, {message, 9, 0, 0, 0, 0, 0});
+  check(!parse_all(message_past, message_past.size()), "customdata-shader-message-past-program");
   const auto table = program(vs50, {0x80000091, 6, 0, 2, 7});
   check(!parse_all(table, table.size()), "function-table-past-program");
   const auto table_ok = program(vs50, {0x80000091, 6, 0, 2, 7, 8});

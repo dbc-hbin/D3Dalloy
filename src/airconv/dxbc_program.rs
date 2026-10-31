@@ -266,20 +266,3 @@ pub unsafe extern "C" fn dxmt_dxbc_instruction_parse(
     })();
     unsafe { publish(out, result) }
 }
-
-/// Bounds one standalone operand in tokens [token_offset, token_end) of `data`.
-#[no_mangle]
-pub unsafe extern "C" fn dxmt_dxbc_operand_parse(
-    data: *const u8, length: u64, token_offset: u32, token_end: u32, out: *mut u32,
-) -> u32 {
-    let result = (|| {
-        let bytes = unsafe { input(data, length) }.ok_or(Error::InvalidArgument)?;
-        if token_end as u64 * 4 > bytes.len() as u64 || token_offset > token_end {
-            return Err(Error::InvalidArgument);
-        }
-        let mut cursor = Cursor { bytes, position: token_offset, end: token_end };
-        cursor.operand(0)?;
-        Ok(cursor.position)
-    })();
-    unsafe { publish(out, result) }
-}
