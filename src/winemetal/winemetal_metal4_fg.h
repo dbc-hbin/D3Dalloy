@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "winemetal_metal4.h"
 
-#define WMTFG_BRIDGE_VERSION 11u
+#define WMTFG_BRIDGE_VERSION 12u
 
 #pragma pack(push, 8)
 enum WMTFG_create_flags
@@ -13,6 +13,14 @@ enum WMTFG_create_flags
     WMTFG_DEPTH_INFINITE = 1u << 1,
     WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS = 1u << 2,
     WMTFG_MOTION_VECTORS_JITTERED = 1u << 3
+};
+
+enum WMTFG_prepare_flags
+{
+    /* The caller records this frame's Generate next on the same command list, with
+     * nothing in between. Native may then reference depth/motion instead of copying
+     * them; it records no Prepare command (ret[1] is 0) when it accepts. */
+    WMTFG_PREPARE_DIRECT_INPUTS = 1u << 5
 };
 
 enum WMTFGoperation
