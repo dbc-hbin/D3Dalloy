@@ -3,7 +3,10 @@
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/DXBCUtils.h"
 #include "DXBCParser/DxbcSignature.h"
+#include "DXBCParser/PeImage.h"
 #include "DXBCParser/PipelineLibrary.h"
+#include "DXBCParser/PsoStream.h"
+#include "DXBCParser/RtasSerialized.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "../../src/d3d12/d3d12_dxil_subobjects.hpp"
 #include <cstdio>
@@ -521,6 +524,309 @@ static void subobjects(const char *path) {
   check(dxmt::ReadDxilLibrarySubobjects(nullptr, 0, none) == E_INVALIDARG, "rdat-null");
 }
 
+static void put64(Bytes &bytes, size_t offset, uint64_t value) {
+  if (bytes.size() < offset + 8)
+    bytes.resize(offset + 8);
+  std::memcpy(bytes.data() + offset, &value, sizeof(value));
+}
+
+// Serialized structure: 56-byte header, pointers, 64-byte dxmt header, shadow.
+struct Serialized {
+  Bytes bytes;
+  uint64_t header;
+  DxmtRtasSerializedLayout layout{};
+  uint32_t prefix() { return dxmt_rtas_serialized_prefix(bytes.data(), 56, bytes.size(), &layout); }
+  uint32_t parse(DxmtRtasSerializedInfo &info, uint64_t destination = 1 << 20) {
+    if (uint32_t status = prefix())
+      return status;
+    if (layout.blocks)
+      if (uint32_t status = dxmt_rtas_serialized_block(&layout, bytes.data() + 56, 16, &layout))
+        return status;
+    if (layout.header_offset + 64 > bytes.size())
+      return 99;
+    uint64_t geometry = 0;
+    if (uint32_t status =
+            dxmt_rtas_serialized_geometry_bytes(&layout, bytes.data() + layout.header_offset, 64, &geometry))
+      return status;
+    return dxmt_rtas_serialized_parse(bytes.data(), 56, &layout, bytes.data() + layout.header_offset, 64,
+                                      bytes.data() + layout.header_offset + 64, geometry, destination, &info);
+  }
+};
+
+static Serialized serialized(uint32_t type, uint32_t count, uint64_t pointers, uint64_t shadow, uint64_t prefix = 0) {
+  Serialized s;
+  s.header = 56 + prefix;
+  s.bytes.assign(s.header + 64 + shadow, 0);
+  put64(s.bytes, 32, s.bytes.size());
+  put64(s.bytes, 40, 64 + shadow);
+  put64(s.bytes, 48, pointers);
+  put(s.bytes, s.header + 16, 0x53415844u);
+  put(s.bytes, s.header + 20, type);
+  put(s.bytes, s.header + 28, count);
+  put64(s.bytes, s.header + 32, shadow);
+  put64(s.bytes, s.header + 56, 64 + shadow);
+  return s;
+}
+
+static void rtas() {
+  DxmtRtasSerializedInfo info{};
+  auto top = serialized(0, 2, 2, 128, 16);
+  check(top.parse(info) == 0 && info.header_offset == 72 && info.instances.offset == 64 &&
+            info.instances.size == 128 && info.desc_count == 2,
+        "rtas-top-level");
+  auto bad = top;
+  put64(bad.bytes, 48, 1);
+  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-top-pointer-count");
+  bad = top;
+  put64(bad.bytes, top.header + 32, 64);
+  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-top-instances-past-shadow");
+  check(top.parse(info, 64 + 127) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-destination-too-small");
+  bad = top;
+  put64(bad.bytes, 48, UINT64_MAX >> 33);
+  check(bad.prefix() == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-pointer-overflow");
+  // Every size below the 120-byte minimum or past the readable source fails.
+  bool truncated = true;
+  for (uint64_t size = 0; size <= top.bytes.size() + 1; ++size) {
+    auto cut = top;
+    put64(cut.bytes, 32, size);
+    truncated &= (cut.prefix() == 0) == (size >= 120 + 16 && size <= top.bytes.size());
+  }
+  check(truncated, "rtas-serialized-size-bounds");
+
+  // Bottom level: triangles with indices and a transform, then AABBs.
+  auto bottom = serialized(1, 2, 0, 2 * 96 + 256);
+  const size_t g0 = bottom.header + 64, g1 = g0 + 96;
+  put(bottom.bytes, g0 + 8, 6);      // DXGI_FORMAT_R32G32B32_FLOAT
+  put(bottom.bytes, g0 + 12, 42);    // DXGI_FORMAT_R32_UINT
+  put(bottom.bytes, g0 + 16, 3);     // vertices
+  put(bottom.bytes, g0 + 20, 3);     // indices
+  put(bottom.bytes, g0 + 24, 1);     // primitives
+  put(bottom.bytes, g0 + 28, 12u | 0x80000000u);
+  put64(bottom.bytes, g0 + 32, 256); // data
+  put64(bottom.bytes, g0 + 40, 292); // indices
+  put64(bottom.bytes, g0 + 48, 304); // transform
+  put(bottom.bytes, g1, 1);
+  put(bottom.bytes, g1 + 24, 1);
+  put(bottom.bytes, g1 + 28, 24);
+  put64(bottom.bytes, g1 + 32, 352);
+  DxmtRtasSerializedGeometry spans{};
+  const uint8_t *records = bottom.bytes.data() + g0;
+  check(bottom.parse(info) == 0 && info.type == 1 && info.shadow_size == 448 &&
+            dxmt_rtas_serialized_geometry(&info, records, 192, 0, &spans) == 0 && spans.present == 7 &&
+            spans.data.offset == 256 && spans.data.size == 36 && spans.indices.size == 12 &&
+            spans.transform.offset == 304 && spans.transform.size == 48 &&
+            dxmt_rtas_serialized_geometry(&info, records, 192, 1, &spans) == 0 && spans.present == 1 &&
+            spans.data.size == 24 && dxmt_rtas_serialized_geometry(&info, records, 192, 2, &spans) ==
+                                         DXMT_RTAS_SERIALIZED_INVALID_ARGUMENT,
+        "rtas-bottom-level");
+  for (const auto &[at, value] : {std::pair<size_t, uint64_t>{g1 + 32, 64 + 448 - 23}, {g0 + 32, 63},
+                                  {g0 + 40, 64 + 448 - 11}, {g0 + 48, 64 + 448 - 47}, {g1, 3}}) {
+    bad = bottom;
+    put64(bad.bytes, at, value);
+    check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-geometry-span-rejects");
+  }
+  bad = bottom;
+  put(bad.bytes, g0 + 20, UINT32_MAX);
+  put(bad.bytes, g0 + 12, 0); // no index buffer: index count is ignored
+  check(bad.parse(info) == 0, "rtas-index-count-without-indices");
+  bad = bottom;
+  put(bad.bytes, bottom.header + 28, 5);
+  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-geometry-count-past-shadow");
+  bad = bottom;
+  put(bad.bytes, bottom.header + 16, 0);
+  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-magic");
+  bad = bottom;
+  put64(bad.bytes, 40, 1);
+  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-deserialized-size");
+
+  // Micromap array: packed 2-bit states of 4^level microtriangles.
+  auto omm = serialized(2, 1, 0, 96 + 64);
+  put(omm.bytes, omm.header + 64, 2);
+  put(omm.bytes, omm.header + 64 + 8, 2);
+  put(omm.bytes, omm.header + 64 + 12, 3);
+  put(omm.bytes, omm.header + 64 + 16, 16);
+  put64(omm.bytes, omm.header + 64 + 32, 160);
+  check(omm.parse(info) == 0 && info.type == 2, "rtas-omm-array");
+  for (const auto &[at, value] : {std::pair<size_t, uint32_t>{12, 13}, {12, UINT32_MAX}, {16, 15}, {8, 3}, {0, 1}}) {
+    bad = omm;
+    put(bad.bytes, omm.header + 64 + at, value);
+    check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-omm-rejects");
+  }
+
+  // OMM bottom level: header, block, one array pointer, then the dxmt header.
+  auto blocks = serialized(1, 1, 0xffffffff00000001ull, 96 + 64, 24);
+  put64(blocks.bytes, 64, 1);
+  put(blocks.bytes, blocks.header + 52, 2);
+  const size_t record = blocks.header + 64;
+  put(blocks.bytes, record, 2);
+  put(blocks.bytes, record + 8, 6);
+  put(blocks.bytes, record + 28, 12);
+  put64(blocks.bytes, record + 32, 160);
+  put64(blocks.bytes, record + 64, 0x1000);
+  check(blocks.parse(info) == 0 && info.header_offset == 80, "rtas-omm-blocks");
+  for (const auto &[at, value] : {std::pair<size_t, uint64_t>{56, 1}, {64, 2}, {64, UINT64_MAX / 8},
+                                  {48, 0xffffffff00000002ull}, {blocks.header + 52, 3}, {record + 64, 0}}) {
+    bad = blocks;
+    put64(bad.bytes, at, value);
+    if (at == blocks.header + 52)
+      put(bad.bytes, at + 4, 0);
+    check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-blocks-rejects");
+  }
+  bool untouched = true;
+  DxmtRtasSerializedLayout layout{7, 7, 7, 7};
+  untouched &= dxmt_rtas_serialized_prefix(top.bytes.data(), 55, 1024, &layout) ==
+                   DXMT_RTAS_SERIALIZED_INVALID_ARGUMENT && layout.serialized_size == 7;
+  untouched &= dxmt_rtas_serialized_block(&top.layout, top.bytes.data(), 16, &layout) ==
+                   DXMT_RTAS_SERIALIZED_INVALID_ARGUMENT && layout.header_offset == 7;
+  check(untouched, "rtas-outputs-untouched");
+}
+
+// Little subobjects in the D3D12 stream layout of this ABI.
+template <class T> static void subobject(Bytes &stream, uint32_t type, const T &data) {
+  struct alignas(void *) Subobject {
+    uint32_t type;
+    T data;
+  } value{type, data};
+  const size_t offset = stream.size();
+  stream.resize(offset + (sizeof(value) + sizeof(void *) - 1) / sizeof(void *) * sizeof(void *));
+  std::memcpy(stream.data() + offset, &value, sizeof(value));
+}
+
+static void pso_streams() {
+  DxmtPsoStreamLayout layouts[64] = {};
+  layouts[0] = {sizeof(void *), alignof(void *)};
+  layouts[1] = layouts[6] = {sizeof(D3D12_SHADER_BYTECODE), alignof(D3D12_SHADER_BYTECODE)};
+  layouts[9] = {4, 4};
+  layouts[10] = {sizeof(D3D12_RASTERIZER_DESC), 4};
+  layouts[27] = {44, 4};
+  layouts[15] = {sizeof(D3D12_RT_FORMAT_ARRAY), 4};
+  Bytes stream;
+  subobject(stream, 0, (void *)0x1234);
+  subobject(stream, 9, 0xffu);
+  subobject(stream, 1, D3D12_SHADER_BYTECODE{(void *)8, 16});
+  subobject(stream, 15, D3D12_RT_FORMAT_ARRAY{});
+  uint64_t defined = 0, offset = 0;
+  unsigned seen = 0;
+  bool walked = true;
+  while (offset < stream.size()) {
+    DxmtPsoStreamSubobject next;
+    if (dxmt_pso_stream_next(stream.data(), stream.size(), layouts, offset, defined, &next)) {
+      walked = false;
+      break;
+    }
+    walked &= next.payload_offset == offset + (next.type == 0 || next.type == 1 ? sizeof(void *) : 4);
+    defined = next.defined;
+    offset = next.next_offset;
+    ++seen;
+  }
+  check(walked && seen == 4 && defined == (1u << 0 | 1u << 9 | 1u << 1 | 1u << 15), "pso-stream-walk");
+  // The final subobject may end before its pointer-aligned stride.
+  auto status = [&](const Bytes &bytes, uint64_t at = 0, uint64_t mask = 0) {
+    DxmtPsoStreamSubobject next;
+    return dxmt_pso_stream_next(bytes.data(), bytes.size(), layouts, at, mask, &next);
+  };
+  Bytes mask;
+  subobject(mask, 9, 0u);
+  mask.resize(8);
+  check(status(mask) == 0, "pso-stream-short-final-padding");
+  bool truncated = true;
+  for (size_t size = 1; size < sizeof(void *) + sizeof(D3D12_SHADER_BYTECODE); ++size) {
+    Bytes cut(stream.begin() + 2 * sizeof(void *) + 8, stream.begin() + 2 * sizeof(void *) + 8 + size);
+    truncated &= status(cut) == DXMT_PSO_STREAM_TRUNCATED;
+  }
+  check(truncated, "pso-stream-truncated-subobject");
+  Bytes unknown;
+  subobject(unknown, 23, 0u);
+  check(status(unknown) == DXMT_PSO_STREAM_UNKNOWN_TYPE, "pso-stream-unhandled-type");
+  put(unknown, 0, 64);
+  check(status(unknown) == DXMT_PSO_STREAM_UNKNOWN_TYPE, "pso-stream-type-range");
+  // Range precedes duplicates, which precede handled type and bounds.
+  check(status(unknown, 0, ~0ull) == DXMT_PSO_STREAM_UNKNOWN_TYPE, "pso-stream-range-before-duplicate");
+  Bytes truncated_duplicate{9, 0, 0, 0};
+  check(status(truncated_duplicate, 0, 1u << 9) == DXMT_PSO_STREAM_DUPLICATE, "pso-stream-duplicate-before-bounds");
+  Bytes rasterizer;
+  subobject(rasterizer, 27, D3D12_RASTERIZER_DESC{});
+  check(status(rasterizer, 0, 1u << 10) == DXMT_PSO_STREAM_DUPLICATE && status(rasterizer, 0, 1u << 27) ==
+            DXMT_PSO_STREAM_DUPLICATE && status(rasterizer, 0, 1u << 11) == 0,
+        "pso-stream-revision-groups");
+  check(status(Bytes{1, 0, 0}) == DXMT_PSO_STREAM_TRUNCATED &&
+            status(stream, stream.size()) == DXMT_PSO_STREAM_INVALID_ARGUMENT,
+        "pso-stream-type-word");
+}
+
+// A PE32+ AMD64 image with one section holding the export directory and tables.
+static Bytes pe_image(const std::initializer_list<std::pair<const char *, uint32_t>> &exports) {
+  Bytes image(0x400, 0);
+  put(image, 0, 0x5a4d);
+  put(image, 60, 0x80);
+  put(image, 0x80, 0x4550);
+  put(image, 0x84, 0x8664 | 1u << 16); // machine, one section
+  put(image, 0x94, 240);              // SizeOfOptionalHeader
+  put(image, 0x98, 0x20b);
+  put(image, 0x98 + 108, 16);          // NumberOfRvaAndSizes
+  put(image, 0x98 + 112, 0x1000);      // export directory
+  put(image, 0x98 + 116, 40);
+  const size_t section = 0x98 + 240;
+  put(image, section + 12, 0x1000);
+  put(image, section + 16, 0x200);
+  put(image, section + 20, 0x200);
+  const uint32_t count = uint32_t(exports.size());
+  put(image, 0x200 + 20, count);
+  put(image, 0x200 + 24, count);
+  put(image, 0x200 + 28, 0x1040);
+  put(image, 0x200 + 32, 0x1080);
+  put(image, 0x200 + 36, 0x10c0);
+  uint32_t name = 0x1100, index = 0;
+  for (const auto &[text, rva] : exports) {
+    put(image, 0x240 + index * 4, rva);
+    put(image, 0x280 + index * 4, name);
+    image[0x2c0 + index * 2] = uint8_t(index);
+    std::memcpy(image.data() + name - 0xe00, text, std::strlen(text) + 1);
+    name += uint32_t(std::strlen(text) + 1);
+    ++index;
+  }
+  return image;
+}
+
+static void pe_images() {
+  const Bytes image = pe_image({{"Data", 0x1180}, {"Forward", 0x1010}, {"Late", 0x11fe}});
+  DxmtPeImage pe{};
+  uint64_t offset = 0;
+  const auto lookup = [&](const Bytes &bytes, const char *name, uint64_t count) {
+    return dxmt_pe_export(bytes.data(), bytes.size(), &pe, name, std::strlen(name), count, &offset);
+  };
+  check(dxmt_pe_image(image.data(), image.size(), 0x8664, &pe) == 0 && pe.section_count == 1 &&
+            pe.name_count == 3 && lookup(image, "Data", 4) == 0 && offset == 0x380,
+        "pe-valid-image");
+  check(lookup(image, "Forward", 1) == DXMT_PE_NOT_FOUND && lookup(image, "Late", 2) == 0 &&
+            lookup(image, "Late", 3) == DXMT_PE_NOT_FOUND && lookup(image, "Dat", 1) == DXMT_PE_NOT_FOUND &&
+            lookup(image, "Missing", 1) == DXMT_PE_NOT_FOUND,
+        "pe-export-lookup");
+  check(dxmt_pe_image(image.data(), image.size(), 0x14c, &pe) == DXMT_PE_UNSUPPORTED &&
+            dxmt_pe_image(image.data(), image.size(), 0xaa64, &pe) == DXMT_PE_UNSUPPORTED,
+        "pe-machine");
+  bool truncated = true;
+  for (size_t size = 0; size < 0x2c6; ++size)
+    truncated &= dxmt_pe_image(image.data(), size, 0x8664, &pe) == DXMT_PE_UNSUPPORTED;
+  check(truncated, "pe-truncated-image");
+  for (const auto &[at, value] : {std::pair<size_t, uint32_t>{60, 0x80000000u}, {0x84, 0x8664 | 97u << 16},
+                                  {0x84, 0x8664}, {0x94, 224}, {0x98 + 108, 0}, {0x98 + 112, 0x1200},
+                                  {0x98 + 240 + 16, 0x10}, {0x200 + 24, 65537}, {0x200 + 20, 0},
+                                  {0x200 + 32, 0x11ff}, {0x40, 0x656e6957}}) {
+    auto bad = image;
+    put(bad, at, value);
+    if (at == 0x40)
+      std::memcpy(bad.data() + 0x40, "Wine builtin DLL", 17);
+    check(dxmt_pe_image(bad.data(), bad.size(), 0x8664, &pe) == DXMT_PE_UNSUPPORTED, "pe-header-rejects");
+  }
+  dxmt_pe_image(image.data(), image.size(), 0x8664, &pe);
+  auto ordinal = image;
+  ordinal[0x2c0] = 3;
+  check(lookup(ordinal, "Data", 4) == DXMT_PE_NOT_FOUND, "pe-ordinal-range");
+  check(dxmt_pe_export(image.data(), image.size(), &pe, "Da\0a", 4, 1, &offset) == DXMT_PE_INVALID_ARGUMENT,
+        "pe-name-argument");
+}
+
 int main(int argc, char **argv) {
   if (argc != 2) {
     std::fprintf(stderr, "usage: %s raytracing-stateobj.dxil\n", argv[0]);
@@ -530,6 +836,9 @@ int main(int argc, char **argv) {
   programs();
   library();
   subobjects(argv[1]);
+  rtas();
+  pso_streams();
+  pe_images();
   std::printf("PARSERS_%s checks=%u failures=%u\n", failures ? "FAIL" : "PASS", checks, failures);
   return failures ? 1 : 0;
 }

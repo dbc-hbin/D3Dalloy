@@ -8,6 +8,9 @@ mod cache_stage;
 mod cache_wire;
 mod dxbc_program;
 mod dxbc_signature;
+mod pe_image;
+mod pso_stream;
+mod rtas_serialized;
 
 use core::{panic::PanicInfo, slice};
 

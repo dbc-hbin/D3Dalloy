@@ -511,118 +511,81 @@ D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS CheckDriverMatchingIdentifier(uint64_t r
 }
 
 HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER &serialized,
-    const AccelerationStructureHeader &header, const uint8_t *geometryData, uint64_t geometryBytes,
-    uint64_t available, uint64_t registryID,
-    const BufferLocation &destination, DeserializedStructure &result, uint64_t headerOffset) {
-  if (available < kSerializedHeaderSize)
-    return E_INVALIDARG;
+    const DxmtRtasSerializedLayout &layout, const AccelerationStructureHeader &header, const uint8_t *geometryData,
+    uint64_t geometryBytes, uint64_t registryID, const BufferLocation &destination, DeserializedStructure &result) {
   if (CheckDriverMatchingIdentifier(registryID, D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE,
           &serialized.DriverMatchingIdentifier) != D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE)
     return E_INVALIDARG;
-  const bool blocks = uint32_t(serialized.NumBottomLevelAccelerationStructurePointersAfterHeader >> 32) == UINT32_MAX;
-  if (!blocks && (!CheckedMul(serialized.NumBottomLevelAccelerationStructurePointersAfterHeader, 8, headerOffset) ||
-      !CheckedAdd(headerOffset, kSerializedHeaderSize, headerOffset) || headerOffset > available ||
-      available - headerOffset < kHeaderSize))
-    return E_INVALIDARG;
-  uint64_t ommPointers = 0;
-  if (blocks) {
-    if (!geometryData || geometryBytes < uint64_t(header.descCount) * sizeof(ShadowGeometry)) return E_INVALIDARG;
-    for (uint32_t i = 0; i < header.descCount; ++i) {
-      ShadowGeometry geometry; memcpy(&geometry, geometryData + uint64_t(i) * sizeof(geometry), sizeof(geometry));
-      ommPointers += geometry.ommArrayAddress != 0;
-    }
-  }
-  if (blocks && (serialized.NumBottomLevelAccelerationStructurePointersAfterHeader != 0xffffffff00000001ull ||
-      header.type != 1 || !header.reserved0 || !ommPointers || ommPointers != header.reserved0 - 1 || headerOffset != 72 + ommPointers * 8 ||
-      headerOffset > available || available - headerOffset < kHeaderSize)) return E_INVALIDARG;
-  if (header.magic != kHeaderMagic || header.type > 2 || header.shadowSize > available - headerOffset - kHeaderSize ||
-      header.deserializedSize > destination.available || header.deserializedSize < kHeaderSize + header.shadowSize ||
-      serialized.SerializedSizeInBytesIncludingHeader != headerOffset + kHeaderSize + header.shadowSize ||
-      serialized.DeserializedSizeInBytes != header.deserializedSize ||
-      (!blocks && serialized.NumBottomLevelAccelerationStructurePointersAfterHeader != (header.type == 0 ? header.descCount : 0)))
+  DxmtRtasSerializedInfo info;
+  if (dxmt_rtas_serialized_parse(&serialized, sizeof(serialized), &layout, &header, sizeof(header), geometryData,
+          geometryBytes, destination.available, &info) != DXMT_RTAS_SERIALIZED_SUCCESS)
     return E_INVALIDARG;
   result = {};
-  result.shadowSize = header.shadowSize;
-  result.deserializedSize = header.deserializedSize;
-  result.descCount = header.descCount;
+  result.shadowSize = info.shadow_size;
+  result.deserializedSize = info.deserialized_size;
+  result.descCount = info.desc_count;
   auto &inputs = result.inputs;
-  inputs.type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE(header.type);
-  inputs.flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(header.flags & ~D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE);
+  inputs.type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE(info.type);
+  inputs.flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(info.flags & ~D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE);
   inputs.metalUsage = Usage(inputs.flags);
-  auto location = [&](uint64_t offset, uint64_t count, uint64_t stride, BufferLocation &out) {
-    uint64_t bytes;
-    if (offset < kHeaderSize || !CheckedMul(count, stride, bytes) || offset > kHeaderSize + header.shadowSize ||
-        bytes > kHeaderSize + header.shadowSize - offset)
-      return false;
-    out = {destination.buffer, destination.offset + offset, bytes, destination.allocationIdentity,
-           destination.address + offset};
-    return true;
+  // Spans were bounded by the shadow copy the deserialization writes at `destination`.
+  auto location = [&](const DxmtRtasSpan &span) {
+    return BufferLocation{destination.buffer, destination.offset + span.offset, span.size,
+                          destination.allocationIdentity, destination.address + span.offset};
   };
-  if (header.type == 0) {
-    inputs.instanceCount = header.descCount;
-    if (!location(kHeaderSize, header.descCount, 64, inputs.instances))
+  if (info.type == 0) {
+    inputs.instanceCount = info.desc_count;
+    inputs.instances = location(info.instances);
+    return S_OK;
+  }
+  if (info.type == 2)
+    inputs.ommCount = info.desc_count;
+  else
+    inputs.geometries.reserve(info.desc_count);
+  result.geometries.resize(info.desc_count);
+  if (info.desc_count)
+    memcpy(result.geometries.data(), geometryData, size_t(info.desc_count) * sizeof(ShadowGeometry));
+  if (info.type == 2)
+    return S_OK;
+  for (uint32_t i = 0; i < info.desc_count; ++i) {
+    const ShadowGeometry &record = result.geometries[i];
+    DxmtRtasSerializedGeometry spans;
+    if (dxmt_rtas_serialized_geometry(&info, geometryData, geometryBytes, i, &spans) != DXMT_RTAS_SERIALIZED_SUCCESS)
       return E_INVALIDARG;
-  } else if (header.type == 2) {
-    if (header.descCount > header.shadowSize / sizeof(ShadowGeometry) ||
-        header.descCount > geometryBytes / sizeof(ShadowGeometry)) return E_INVALIDARG;
-    inputs.ommCount = header.descCount;
-    for (uint32_t i = 0; i < header.descCount; ++i) {
-      ShadowGeometry record;
-      memcpy(&record, geometryData + uint64_t(i) * sizeof(record), sizeof(record));
-      if (record.type != 2 || record.indexFormat > 12 || record.vertexFormat < 1 || record.vertexFormat > 2 ||
-          record.vertexCount != (((1u << (2 * record.indexFormat)) * record.vertexFormat + 7) / 8)) return E_INVALIDARG;
-      BufferLocation data;
-      if (!location(record.dataOffset, 1, record.vertexCount, data)) return E_INVALIDARG;
-      result.geometries.push_back(record);
-    }
-  } else {
-    if (header.descCount > header.shadowSize / sizeof(ShadowGeometry) ||
-        header.descCount > geometryBytes / sizeof(ShadowGeometry))
-      return E_INVALIDARG;
-    inputs.geometries.reserve(header.descCount);
-    result.geometries.reserve(header.descCount);
-    for (uint32_t i = 0; i < header.descCount; ++i) {
-      ShadowGeometry record;
-      memcpy(&record, geometryData + i * sizeof(record), sizeof(record));
-      Geometry geometry{};
-      geometry.type = D3D12_RAYTRACING_GEOMETRY_TYPE(record.type);
-      geometry.flags = D3D12_RAYTRACING_GEOMETRY_FLAGS(record.flags);
-      geometry.primitiveCount = record.primitiveCount;
-      geometry.vertexCount = record.vertexCount;
-      geometry.indexCount = record.indexCount;
-      geometry.dxgiVertexFormat = DXGI_FORMAT(record.vertexFormat);
-      geometry.indexFormat = DXGI_FORMAT(record.indexFormat);
-      geometry.stride = record.strideAndTransform & ~kShadowHasTransform;
-      geometry.hasTransform = record.strideAndTransform & kShadowHasTransform;
-      if (record.type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES || record.type == D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES) {
-        const auto *format = FindVertexFormat(geometry.dxgiVertexFormat);
-        if (!format)
-          return E_INVALIDARG;
-        geometry.vertexFormat = format->metal;
-        geometry.positionSize = format->positionSize;
-        if (geometry.indexFormat != DXGI_FORMAT_UNKNOWN &&
-            !location(record.indexOffset, geometry.primitiveCount ? record.indexCount : 0, 4, geometry.indices))
-          return E_INVALIDARG;
-        // Shadow index elements use a 4-byte stride; R16 is packed by the GPU deserialize kernel.
-        if (geometry.indexFormat == DXGI_FORMAT_R16_UINT)
-          geometry.indexFormat = DXGI_FORMAT_R32_UINT;
-        if (record.type == D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES) {
-          geometry.ommArray.address = record.ommArrayAddress;
-          geometry.ommIndexBytes = record.ommIndexBytes;
-          geometry.ommIndexStride = record.ommIndexStride;
-          geometry.ommBase = record.ommBase;
-          if (record.ommIndexBytes && !location(record.ommIndexOffset, geometry.primitiveCount,
-              record.ommIndexStride, geometry.ommIndices)) return E_INVALIDARG;
-        }
-      } else if (record.type != D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS)
+    Geometry geometry{};
+    geometry.type = D3D12_RAYTRACING_GEOMETRY_TYPE(record.type);
+    geometry.flags = D3D12_RAYTRACING_GEOMETRY_FLAGS(record.flags);
+    geometry.primitiveCount = record.primitiveCount;
+    geometry.vertexCount = record.vertexCount;
+    geometry.indexCount = record.indexCount;
+    geometry.dxgiVertexFormat = DXGI_FORMAT(record.vertexFormat);
+    geometry.indexFormat = DXGI_FORMAT(record.indexFormat);
+    geometry.stride = record.strideAndTransform & ~kShadowHasTransform;
+    geometry.hasTransform = record.strideAndTransform & kShadowHasTransform;
+    if (record.type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES || record.type == D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES) {
+      const auto *format = FindVertexFormat(geometry.dxgiVertexFormat);
+      if (!format)
         return E_INVALIDARG;
-      if (!location(record.dataOffset, geometry.primitiveCount ? (record.type != 1 ? record.vertexCount : record.primitiveCount) : 0,
-                    geometry.stride, geometry.verticesOrBoxes) ||
-          (geometry.hasTransform && !location(record.transformOffset, geometry.primitiveCount ? 1 : 0, 48, geometry.transform)))
-        return E_INVALIDARG;
-      inputs.geometries.push_back(geometry);
-      result.geometries.push_back(record);
+      geometry.vertexFormat = format->metal;
+      geometry.positionSize = format->positionSize;
+      if (spans.present & DXMT_RTAS_GEOMETRY_INDICES)
+        geometry.indices = location(spans.indices);
+      // Shadow index elements use a 4-byte stride; R16 is packed by the GPU deserialize kernel.
+      if (geometry.indexFormat == DXGI_FORMAT_R16_UINT)
+        geometry.indexFormat = DXGI_FORMAT_R32_UINT;
+      if (record.type == D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES) {
+        geometry.ommArray.address = record.ommArrayAddress;
+        geometry.ommIndexBytes = record.ommIndexBytes;
+        geometry.ommIndexStride = record.ommIndexStride;
+        geometry.ommBase = record.ommBase;
+        if (spans.present & DXMT_RTAS_GEOMETRY_OMM_INDICES)
+          geometry.ommIndices = location(spans.omm_indices);
+      }
     }
+    geometry.verticesOrBoxes = location(spans.data);
+    if (spans.present & DXMT_RTAS_GEOMETRY_TRANSFORM)
+      geometry.transform = location(spans.transform);
+    inputs.geometries.push_back(geometry);
   }
   return S_OK;
 }

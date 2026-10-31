@@ -6,6 +6,9 @@ shader_bytecode_modules = files(
   '../../src/airconv/cache_library.rs',
   '../../src/airconv/dxbc_program.rs',
   '../../src/airconv/dxbc_signature.rs',
+  '../../src/airconv/pe_image.rs',
+  '../../src/airconv/pso_stream.rs',
+  '../../src/airconv/rtas_serialized.rs',
 )
 rustc = find_program('rustc', native: true)
 rust_optimization = get_option('optimization')

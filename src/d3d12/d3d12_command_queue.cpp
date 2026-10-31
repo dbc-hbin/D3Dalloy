@@ -7029,38 +7029,25 @@ public:
             } else if (as->operation == RTASOperation::Deserialize) {
               D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER serialized;
               memcpy(&serialized, mapped, sizeof(serialized));
-              const uint64_t minimumSize = raytracing::kSerializedHeaderSize + raytracing::kHeaderSize;
-              const bool blocks = uint32_t(serialized.NumBottomLevelAccelerationStructurePointersAfterHeader >> 32) == UINT32_MAX;
-              if (serialized.SerializedSizeInBytesIncludingHeader < minimumSize ||
-                  serialized.SerializedSizeInBytesIncludingHeader > as->sourceLocation.available ||
-                  (!blocks && serialized.NumBottomLevelAccelerationStructurePointersAfterHeader >
-                      (serialized.SerializedSizeInBytesIncludingHeader - minimumSize) / 8)) {
+              DxmtRtasSerializedLayout layout;
+              if (dxmt_rtas_serialized_prefix(&serialized, sizeof(serialized), as->sourceLocation.available, &layout)) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
               }
-              uint64_t headerOffset = raytracing::kSerializedHeaderSize +
-                  serialized.NumBottomLevelAccelerationStructurePointersAfterHeader * 8;
-              if (blocks) {
-                if (serialized.NumBottomLevelAccelerationStructurePointersAfterHeader != 0xffffffff00000001ull ||
-                    !read_source(56, 16)) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
-                D3D12_RAYTRACING_SERIALIZED_BLOCK block;
-                memcpy(&block, mapped, 16);
-                if (block.Type != 0 || block.NumBlockPointersAfterHeader >
-                    (serialized.SerializedSizeInBytesIncludingHeader - minimumSize - 16) / 8) {
+              if (layout.blocks) {
+                if (!read_source(DXMT_RTAS_SERIALIZED_HEADER_SIZE, DXMT_RTAS_SERIALIZED_BLOCK_SIZE) ||
+                    dxmt_rtas_serialized_block(&layout, mapped, DXMT_RTAS_SERIALIZED_BLOCK_SIZE, &layout)) {
                   device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
                 }
-                headerOffset = 72 + block.NumBlockPointersAfterHeader * 8;
               }
-              if (!read_source(headerOffset, raytracing::kHeaderSize)) return;
+              if (!read_source(layout.header_offset, raytracing::kHeaderSize)) return;
               memcpy(&as_source_header, mapped, sizeof(as_source_header));
-              const uint64_t geometryBytes = as_source_header.type != 0
-                  ? uint64_t(as_source_header.descCount) * sizeof(raytracing::ShadowGeometry) : 0;
-              if (geometryBytes > serialized.SerializedSizeInBytesIncludingHeader - headerOffset - raytracing::kHeaderSize) {
+              uint64_t geometryBytes;
+              if (dxmt_rtas_serialized_geometry_bytes(&layout, &as_source_header, sizeof(as_source_header), &geometryBytes)) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
               }
-              if (geometryBytes && !read_source(headerOffset + raytracing::kHeaderSize, geometryBytes)) return;
-              if (FAILED(raytracing::ParseSerialized(serialized, as_source_header, mapped, geometryBytes,
-                      serialized.SerializedSizeInBytesIncludingHeader, device_->GetMTLDevice().registryID(),
-                      as->destinationLocation, as_deserialized, headerOffset))) {
+              if (geometryBytes && !read_source(layout.header_offset + raytracing::kHeaderSize, geometryBytes)) return;
+              if (FAILED(raytracing::ParseSerialized(serialized, layout, as_source_header, mapped, geometryBytes,
+                      device_->GetMTLDevice().registryID(), as->destinationLocation, as_deserialized))) {
                 ERR("Invalid serialized acceleration structure");
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
               }

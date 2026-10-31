@@ -2,10 +2,12 @@
 #include "d3d12_device_child.hpp"
 #include "d3d12_pipeline_cache.hpp"
 #include "DXBCParser/PipelineLibrary.h"
+#include "DXBCParser/PsoStream.h"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
 #include "util_math.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -95,14 +97,47 @@ void CopyStencilFace(D3D12_DEPTH_STENCILOP_DESC &out, const DepthStencilOpDesc1 
   out = {in.StencilFailOp, in.StencilDepthFailOp, in.StencilPassOp, in.StencilFunc};
 }
 
+// Payload layouts of the handled subobject types; must match the cases of ParsePipelineStateStream.
+constexpr auto kStreamLayouts = [] {
+  std::array<DxmtPsoStreamLayout, DXMT_PSO_STREAM_TYPES> table{};
+  const auto set = [&]<class T>(uint32_t type, T *) { table[type] = {uint32_t(sizeof(T)), uint32_t(alignof(T))}; };
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, (ID3D12RootSignature **)nullptr);
+  set(kSubobjectSerializedRootSignature, (SerializedRootSignatureDesc *)nullptr);
+  for (uint32_t type : {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+                        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS,
+                        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS,
+                        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS})
+    set(type, (D3D12_SHADER_BYTECODE *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT, (D3D12_STREAM_OUTPUT_DESC *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, (D3D12_BLEND_DESC *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, (UINT *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, (D3D12_RASTERIZER_DESC *)nullptr);
+  set(kSubobjectRasterizer1, (RasterizerDesc1 *)nullptr);
+  set(kSubobjectRasterizer2, (RasterizerDesc2 *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, (D3D12_DEPTH_STENCIL_DESC *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, (D3D12_DEPTH_STENCIL_DESC1 *)nullptr);
+  set(kSubobjectDepthStencil2, (DepthStencilDesc2 *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, (D3D12_INPUT_LAYOUT_DESC *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, (D3D12_INDEX_BUFFER_STRIP_CUT_VALUE *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, (D3D12_PRIMITIVE_TOPOLOGY_TYPE *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, (D3D12_RT_FORMAT_ARRAY *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, (DXGI_FORMAT *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, (DXGI_SAMPLE_DESC *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, (UINT *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, (D3D12_CACHED_PIPELINE_STATE *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, (D3D12_PIPELINE_STATE_FLAGS *)nullptr);
+  set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, (D3D12_VIEW_INSTANCING_DESC *)nullptr);
+  return table;
+}();
+
 } // namespace
 
 HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc,
                                  PipelineStateStream &stream) {
   if (!pDesc || (pDesc->SizeInBytes && !pDesc->pPipelineStateSubobjectStream))
     return E_INVALIDARG;
-  const char *stream_start = reinterpret_cast<const char *>(pDesc->pPipelineStateSubobjectStream);
-  const char *stream_end = stream_start + pDesc->SizeInBytes;
+  const auto *stream_bytes = static_cast<const uint8_t *>(pDesc->pPipelineStateSubobjectStream);
+  const uint64_t stream_size = pDesc->SizeInBytes;
 
   auto &desc_cs = stream.compute_desc;
   auto &desc_graphics = stream.graphics;
@@ -128,47 +163,39 @@ HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_ST
   desc_graphics.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
 
   uint64_t defined_type = 0;
-  constexpr uint64_t kDepthStencilTypes = 1ull << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL |
-                                          1ull << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1 |
-                                          1ull << kSubobjectDepthStencil2;
-  constexpr uint64_t kRasterizerTypes = 1ull << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER |
-                                        1ull << kSubobjectRasterizer1 | 1ull << kSubobjectRasterizer2;
-  constexpr uint64_t kRootTypes =
-      1ull << D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE | 1ull << kSubobjectSerializedRootSignature;
-
-  while (stream_start < stream_end) {
-    if (stream_start + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) > stream_end) {
-      ERR("CreatePipelineState: invalid stream");
-      return E_INVALIDARG;
-    }
-    const uint32_t type = *reinterpret_cast<const uint32_t *>(stream_start);
-    if (type >= 64) {
+  for (uint64_t offset = 0; offset < stream_size;) {
+    DxmtPsoStreamSubobject next;
+    switch (dxmt_pso_stream_next(stream_bytes, stream_size, kStreamLayouts.data(), offset, defined_type, &next)) {
+    case DXMT_PSO_STREAM_SUCCESS:
+      break;
+    case DXMT_PSO_STREAM_UNKNOWN_TYPE: {
+      uint32_t type;
+      memcpy(&type, stream_bytes + offset, sizeof(type));
       ERR("CreatePipelineState: unhandled subobject type ", type);
       return E_INVALIDARG;
     }
-    const uint64_t bit = 1ull << type;
-    // Each state has one definition, whichever revision of its subobject carries it.
-    const uint64_t group = bit & kDepthStencilTypes ? kDepthStencilTypes
-                         : bit & kRasterizerTypes   ? kRasterizerTypes
-                         : bit & kRootTypes         ? kRootTypes
-                                                    : bit;
-    if (defined_type & group) {
+    case DXMT_PSO_STREAM_DUPLICATE: {
+      uint32_t type;
+      memcpy(&type, stream_bytes + offset, sizeof(type));
       ERR("CreatePipelineState: duplicated subobject type ", type);
       return E_INVALIDARG;
     }
-    defined_type |= bit;
+    default:
+      ERR("CreatePipelineState: invalid stream");
+      return E_INVALIDARG;
+    }
+    const uint32_t type = next.type;
+    const uint8_t *payload = stream_bytes + next.payload_offset;
+    defined_type = next.defined;
+    offset = next.next_offset;
 
+// Streams need not align payloads for their types: copy each before use.
 #define GET_STREAM_DATA(data_type)                                                                                     \
-  using subobject_t = struct {                                                                                         \
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;                                                                          \
+  struct {                                                                                                             \
     data_type data;                                                                                                    \
-  };                                                                                                                   \
-  auto subobject = reinterpret_cast<subobject_t const *>(stream_start);                                                \
-  if (stream_start + sizeof(*subobject) > stream_end) {                                                                \
-    ERR("CreatePipelineState: invalid stream");                                                                        \
-    return E_INVALIDARG;                                                                                               \
-  }                                                                                                                    \
-  stream_start += align(sizeof(*subobject), sizeof(void *));
+  } subobject_storage;                                                                                                 \
+  memcpy(&subobject_storage.data, payload, sizeof(data_type));                                                         \
+  const auto *subobject = &subobject_storage;
 
     switch (type) {
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: {

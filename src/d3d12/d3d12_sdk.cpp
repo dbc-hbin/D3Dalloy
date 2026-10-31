@@ -3,6 +3,7 @@
 #include "d3d12_diagnostics.hpp"
 #include "d3d12_core_generation.h"
 #include "com/com_object.hpp"
+#include "DXBCParser/PeImage.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 extern "C" const char OwnedD3D12CoreGeneration[33] = OWNED_D3D12_CORE_GENERATION;
 namespace dxmt {
@@ -165,24 +167,6 @@ HRESULT PreflightInstalled(HANDLE file, UINT version) {
   if (!bytes) { HRESULT hr = HRESULT_FROM_WIN32(GetLastError()); CloseHandle(mapping); return hr; }
   const auto check = [&]() -> HRESULT {
     const uint64_t size = uint64_t(length.QuadPart);
-    const auto read = [&](uint64_t offset, void *out, size_t count) {
-      if (offset > size || count > size - offset) return false;
-      std::memcpy(out, bytes + offset, count); return true;
-    };
-    IMAGE_DOS_HEADER dos; IMAGE_NT_HEADERS nt;
-    if (!read(0, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0 ||
-        !read(uint64_t(dos.e_lfanew), &nt, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE ||
-        nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC ||
-        nt.FileHeader.SizeOfOptionalHeader != sizeof(nt.OptionalHeader) ||
-        nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT ||
-        !nt.FileHeader.NumberOfSections || nt.FileHeader.NumberOfSections > 96) return DXGI_ERROR_UNSUPPORTED;
-    // Wine reads these DOS-stub signatures before deciding native versus builtin.
-    // Reject redirectable/placeholder Core images before any executable mapping.
-    char loader_marker[32];
-    if (!read(sizeof(dos), loader_marker, sizeof(loader_marker)) ||
-        !std::memcmp(loader_marker, "Wine builtin DLL", sizeof("Wine builtin DLL")) ||
-        !std::memcmp(loader_marker, "Wine placeholder DLL", sizeof("Wine placeholder DLL")))
-      return DXGI_ERROR_UNSUPPORTED;
 #if defined(__arm64ec__) || defined(_M_ARM64EC)
     // The paired Core file is ARM64; Wine applies its ARM64EC view only to an image mapping.
     constexpr WORD machine = IMAGE_FILE_MACHINE_ARM64;
@@ -195,46 +179,14 @@ HRESULT PreflightInstalled(HANDLE file, UINT version) {
 #else
 #error Unsupported owned Core PE ABI
 #endif
-    if (nt.FileHeader.Machine != machine) return DXGI_ERROR_UNSUPPORTED;
-    std::array<IMAGE_SECTION_HEADER, 96> sections;
-    const uint64_t section_offset = uint64_t(dos.e_lfanew) + sizeof(nt);
-    if (!read(section_offset, sections.data(), nt.FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER)))
-      return DXGI_ERROR_UNSUPPORTED;
-    const auto address = [&](uint64_t rva, size_t count) -> const unsigned char * {
-      for (UINT i = 0; i < nt.FileHeader.NumberOfSections; ++i) {
-        const auto &s = sections[i];
-        if (rva < s.VirtualAddress || rva - s.VirtualAddress > s.SizeOfRawData) continue;
-        const uint64_t delta = rva - s.VirtualAddress;
-        const uint64_t offset = uint64_t(s.PointerToRawData) + delta;
-        if (count > s.SizeOfRawData - delta || offset > size || count > size - offset) continue;
-        return bytes + offset;
-      }
-      return nullptr;
-    };
-    const auto &directory = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    const auto *raw = address(directory.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY));
-    if (!raw) return DXGI_ERROR_UNSUPPORTED;
-    IMAGE_EXPORT_DIRECTORY exports; std::memcpy(&exports, raw, sizeof(exports));
-    if (!exports.NumberOfNames || exports.NumberOfNames > 65536 || !exports.NumberOfFunctions ||
-        exports.NumberOfFunctions > 65536) return DXGI_ERROR_UNSUPPORTED;
-    const auto *names = address(exports.AddressOfNames, size_t(exports.NumberOfNames) * sizeof(DWORD));
-    const auto *ordinals = address(exports.AddressOfNameOrdinals, size_t(exports.NumberOfNames) * sizeof(WORD));
-    const auto *functions = address(exports.AddressOfFunctions, size_t(exports.NumberOfFunctions) * sizeof(DWORD));
-    if (!names || !ordinals || !functions) return DXGI_ERROR_UNSUPPORTED;
-    const auto lookup = [&](const char *name, size_t count) -> const unsigned char * {
-      const size_t name_size = std::strlen(name) + 1;
-      for (DWORD i = 0; i < exports.NumberOfNames; ++i) {
-        DWORD name_rva; std::memcpy(&name_rva, names + size_t(i) * sizeof(DWORD), sizeof(name_rva));
-        const auto *candidate = address(name_rva, name_size);
-        if (!candidate || std::memcmp(candidate, name, name_size)) continue;
-        WORD ordinal; std::memcpy(&ordinal, ordinals + size_t(i) * sizeof(WORD), sizeof(ordinal));
-        if (ordinal >= exports.NumberOfFunctions) return nullptr;
-        DWORD rva; std::memcpy(&rva, functions + size_t(ordinal) * sizeof(DWORD), sizeof(rva));
-        if (rva >= directory.VirtualAddress && uint64_t(rva) < uint64_t(directory.VirtualAddress) + directory.Size)
-          return nullptr; // Export forwarders are never owned Core code/data.
-        return address(rva, count);
-      }
-      return nullptr;
+    // Also rejects Wine builtin/placeholder DOS stubs before any executable mapping.
+    DxmtPeImage image;
+    if (dxmt_pe_image(bytes, size, machine, &image) != DXMT_PE_SUCCESS) return DXGI_ERROR_UNSUPPORTED;
+    const auto lookup = [&](std::string_view name, uint64_t count) -> const unsigned char * {
+      uint64_t offset;
+      if (dxmt_pe_export(bytes, size, &image, name.data(), name.size(), count, &offset) != DXMT_PE_SUCCESS)
+        return nullptr;
+      return bytes + offset;
     };
     const auto *sdk = lookup("D3D12SDKVersion", sizeof(UINT));
     const auto *generation = lookup("OwnedD3D12CoreGeneration", 33);

@@ -2,6 +2,7 @@
 
 #include "d3d12_interfaces_ext.hpp"
 #include "Metal4.hpp"
+#include "DXBCParser/RtasSerialized.h"
 #include <cstdint>
 #include <vector>
 
@@ -313,10 +314,10 @@ struct DeserializedStructure {
   std::vector<ShadowGeometry> geometries;
 };
 
+/* `layout` comes from dxmt_rtas_serialized_prefix/_block over the same header bytes. */
 HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER &serialized,
-    const AccelerationStructureHeader &header, const uint8_t *geometryData, uint64_t geometryBytes,
-    uint64_t available, uint64_t registryID,
-    const BufferLocation &destination, DeserializedStructure &result, uint64_t headerOffset = 0);
+    const DxmtRtasSerializedLayout &layout, const AccelerationStructureHeader &header, const uint8_t *geometryData,
+    uint64_t geometryBytes, uint64_t registryID, const BufferLocation &destination, DeserializedStructure &result);
 
 } // namespace dxmt::raytracing
 
