@@ -312,6 +312,26 @@ static void programs() {
   }
   const auto empty_comment = program(vs50, {0x00000035, 2});
   check(parse_all(empty_comment, empty_comment.size()), "customdata-empty-comment");
+  // Shader messages are kept as opaque payload bytes: an inconsistent string length
+  // (which wrapped the old decoder's word count) only bounds the block, and the
+  // instruction after it still parses.
+  const uint32_t message = 0x00000035 | (D3D11_SB_CUSTOMDATA_SHADER_MESSAGE << 11);
+  for (uint32_t chars : {0u, 3u, UINT32_MAX - 2, UINT32_MAX}) {
+    const auto code = program(vs50, {message, 8, 0, 0, chars, 1, 0, 0x00434241, 0x0100003e});
+    CShaderCodeParser parser;
+    CInstruction custom, ret;
+    check(SUCCEEDED(parser.SetShader(reinterpret_cast<const CShaderToken *>(code.data()), code.size())) &&
+              parser.ParseInstruction(&custom) && custom.OpCode() == D3D10_SB_OPCODE_CUSTOMDATA &&
+              custom.m_CustomData.Type == D3D11_SB_CUSTOMDATA_SHADER_MESSAGE &&
+              custom.m_CustomData.DataSizeInBytes == 24 &&
+              static_cast<const uint32_t *>(custom.m_CustomData.pData)[2] == chars &&
+              parser.ParseInstruction(&ret) && ret.OpCode() == D3D10_SB_OPCODE_RET && parser.EndOfShader(),
+          "customdata-shader-message-opaque");
+  }
+  const auto short_message = program(vs50, {message, 3, 0});
+  check(parse_all(short_message, short_message.size()), "customdata-shader-message-short");
+  const auto message_past = program(vs50, {message, 9, 0, 0, 0, 0, 0});
+  check(!parse_all(message_past, message_past.size()), "customdata-shader-message-past-program");
   const auto table = program(vs50, {0x80000091, 6, 0, 2, 7});
   check(!parse_all(table, table.size()), "function-table-past-program");
   const auto table_ok = program(vs50, {0x80000091, 6, 0, 2, 7, 8});

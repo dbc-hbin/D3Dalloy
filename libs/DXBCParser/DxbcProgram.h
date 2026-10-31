@@ -40,9 +40,6 @@ uint32_t dxmt_dxbc_program_parse(const void *data, uint64_t length, DxmtDxbcProg
 // custom data, invalid component selection and relative-index nesting past 4.
 uint32_t dxmt_dxbc_instruction_parse(const void *data, uint64_t length, const uint8_t *operand_counts,
                                      uint32_t opcode_count, uint32_t token_offset, DxmtDxbcInstruction *out);
-// Bounds one operand in tokens [token_offset, token_end); out is the next token.
-uint32_t dxmt_dxbc_operand_parse(const void *data, uint64_t length, uint32_t token_offset, uint32_t token_end,
-                                 uint32_t *out);
 
 #ifdef __cplusplus
 }

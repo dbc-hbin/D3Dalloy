@@ -1116,22 +1116,10 @@ struct CHSJoinPhaseInstanceCountDecl {
   UINT InstanceCount;
 };
 
-struct CShaderMessage {
-  D3D11_SB_SHADER_MESSAGE_ID MessageID;
-  D3D11_SB_SHADER_MESSAGE_FORMAT FormatStyle;
-  PCSTR pFormatString;
-  UINT NumOperands;
-  COperandBase *pOperands;
-};
-
 struct CCustomData {
   D3D10_SB_CUSTOMDATA_CLASS Type;
   UINT DataSizeInBytes;
   void *pData;
-
-  union {
-    CShaderMessage ShaderMessage;
-  };
 };
 
 struct CFunctionTableDecl {
@@ -1263,9 +1251,6 @@ public:
   void ClearAllocations() {
     if (m_OpCode == D3D10_SB_OPCODE_CUSTOMDATA) {
       free(m_CustomData.pData);
-      if (m_CustomData.Type == D3D11_SB_CUSTOMDATA_SHADER_MESSAGE) {
-        free(m_CustomData.ShaderMessage.pOperands);
-      }
     } else if (m_OpCode == D3D11_SB_OPCODE_DCL_FUNCTION_TABLE) {
       free(m_FunctionTableDecl.pFunctionIdentifiers);
     } else if (m_OpCode == D3D11_SB_OPCODE_DCL_INTERFACE) {
@@ -1441,25 +1426,6 @@ public:
     return CurrentTokenOffset() * sizeof(CShaderToken);
   }
   void SetCurrentTokenOffset(UINT Offset);
-
-  CONST CShaderToken *ParseOperandAt(COperandBase *pOperand,
-                                     CONST CShaderToken *pBuffer,
-                                     CONST CShaderToken *pBufferEnd) {
-    const CShaderToken *pCurTok = m_pCurrentToken;
-    const CShaderToken *pEndTok = m_pShaderEndToken;
-    const CShaderToken *pRet;
-
-    m_pCurrentToken = (pBuffer);
-    m_pShaderEndToken = (pBufferEnd);
-
-    ParseOperand(pOperand);
-    pRet = m_pCurrentToken;
-
-    m_pCurrentToken = pCurTok;
-    m_pShaderEndToken = pEndTok;
-
-    return pRet;
-  }
 
 protected:
   const CShaderToken *m_pCurrentToken;
