@@ -22,6 +22,23 @@
 
 현재 판정에 필요한 runtime033–044의 실패/성공 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)에 남긴다. 과거 paused/resumed 실행 지시와 중복 인수인계는 삭제했다. 최신 상태를 과거 실패로 되돌리거나 보존된 PASS를 현재 변경의 재검증으로 바꾸지 않는다. Agility SDK617/618의 owned Core/Main identity·inbox/SxS 정책은 유지하며 다른 package나 실제 게임의 전체 호환성을 주장하지 않는다.
 
+## 확정 저위험 최적화와 남은 Rust 경계 — 2026-11-01
+
+**상태: native ARM64 Wine+FEX x64 GPU matrix에서 base(같은 HEAD)와 동일 판정. 게임 FPS는 미측정이다.** trace 수집 없이 코드상 매번 발생하는 비용만 줄였다. 입력은 `runtime-par-20261031`·`paired-sdk-par-20261031`·`fex-par-20261031`, 비교 runtime은 `build/local/par-20261101/base`다.
+
+| 영역 | 변경 | 증거 |
+| --- | --- | --- |
+| 기록 | swizzle table capture를 hash dedup하고, Execute 시점에 swizzle·cast·MSAA shadow·reserved volume 텍스처가 없으면 table walk를 생략. pool view CopyDescriptors의 중복 native clear 제거와 인접 range 병합. `Texture::view()` shared-lock fast path. 같은 PSO/root signature 재설정은 소유권 검증 전에 반환. viewport·scissor·blend factor는 값이 바뀔 때만 dirty. encoder 안에서 같은 depth-stencil·rasterizer 상태 재전송 생략 | resources에서 Execute walk 290회 생략·0회 실행, bindless의 native slot clear 82→44 |
+| 큐 | 같은 queue의 SR/FG/RR 평가는 history 대기·사전 분할 없이 현재 segment에 encode하고, consumer barrier 하나로 순서를 유지한다. signal은 해당 command buffer commit 뒤에 게시한다(signal slot을 vector로 변경). cross-queue는 기존 동작 유지. Present 직후 Signal을 present completion에 병합. submission label은 trace·debug·capture일 때만 생성. native render encoder가 마지막 index buffer를 캐시 | submit 수 ngx 478→302, ngx-features 1498→844, fsr-fg 1428→890 |
+| SR·RR | 실행별 residency set에서 앱 텍스처를 빼고(device 전역 set 소속), scratch가 바뀔 때만 commit. 반납 시 removeAll+commit 제거. NGX RR 변환 PSO와 FSR RR kernel library를 device 단위로 공유. FSR RR normal decode 1회와 generation별 zero 텍스처 1회 clear | SR residency commit temporal 64/81 실행, 기존은 실행당 2회 이상. fsr-rr signal 35줄이 base와 동일 |
+| FG | NGX의 연속 Prepare→Generate는 depth/motion snapshot 복사 없이 앱 텍스처를 직접 쓴다(`MTL_FRAME_GENERATION_PREPARE_DIRECT_INPUTS`, FSR은 복사 유지). pool별 영구 residency set, `supportsMetal4FX` 캐시, sRGB raw view 캐시. `WMTFG_BRIDGE_VERSION` 12 | submit ngx-fg 749→619, fsr-fg 동일 |
+| FSR FG SDK | fence 대기를 thread별 event 대기로 바꾸고 hybrid spin을 기본값으로 켰다. 같은 queue의 game fence Wait와 중복 interpolation fence Wait 제거. 앱 pacing tuning은 그대로 우선 | fsr-fg pacing PASS, process CPU base 2.93/2.11s → 0.93/1.60s(각 2회) |
+| Rust | DXIL ISG1/OSG1/PSG1을 `dxbc_signature.rs`(grouped)로, RT root signature unwrap을 Rust container 조회로, serialized AS·PSO subobject stream·D3D12Core PE preflight를 새 `rtas_serialized.rs`·`pso_stream.rs`·`pe_image.rs`로 옮겼다. 사용하지 않는 shader-message 디코딩(i686 길이 wrap)과 `dxmt_dxbc_operand_parse` 삭제 | CPU 173 checks(ASan+UBSan). DXIL 8979개 signature dump sha1 동일, RT unwrap 10858개 차이 0, AS·PSO·PE mutated parity 각 800k·400k·27k 차이 0. 6개 target opt0/opt2 링크 |
+
+GPU matrix 43개 중 39개 PASS다. bindless·dxil(Shader Validation의 GPU address 0 load), fsr(frame marker 중복), temporal(MetalFX Conv3x3)은 base에서도 같은 PASS 줄 수·오류 수로 실패한다. bindless·dxil은 10-31 runtime에서는 통과했으므로 HEAD의 `AIRCONV_VERSION=45` bounded load 변경 이후 생긴 별도 문제로 본다 [INFERENCE]. agility suite는 PASS, diagnostics의 `agility-high-fl`은 base와 같이 실패한다.
+
+동작 차이: RT export의 손상된 DXBC root signature container는 이제 raster·`CreateRootSignature`와 같이 거부된다. DXIL signature는 stream>3·stream 역순·stream 내 register 감소를 거부하며 stride는 32로 고정한다(실제 DXC corpus에서 해당 없음). SR/RR/FG는 앱 텍스처의 residency를 device 전역 set에 의존하므로, evict·`CREATE_NOT_RESIDENT` 리소스를 넘기는 잘못된 사용은 더 이상 보정하지 않는다. FSR SDK pacing의 실제 게임 jitter는 측정하지 않았다. DRED `SYSTEM_CONTROLLED` 기본값 변경은 동작 변경이라 적용하지 않았다. WoW64 x86 guest는 실행하지 않았다.
+
 ## D3D12 경로·SR/FG/RR·Rust 경계 최적화 — 2026-10-31
 
 **상태: native ARM64 Wine에서 GPU suite 검증 완료. 게임 FPS는 미측정이다.** Rosetta 없이 Wine 11.17 ARM64X runtime과 FEX `xtajit64`로 x64 fixture를 실행했다. 입력은 `../Wine-darwin/build/local/runtime-par-20261031`, `../FEX-darwin/build/local/fex-par-20261031`, `build/local/par-20261031/integ/build/local/arm64-package-integ-3`다. 결과는 `build/local/par-20261031/integ/build/a64/`에, 비교용 변경 전 runtime은 `build/local/par-20261031/base/build/local/arm64-package-base-1`에 있다. Validation은 API+Shader이며 runner 상한인 600초 timeout을 썼다. 첫 FEX x64 smoke(`../Wine-darwin/build/local/integ-arm64-smoke-1`)에서 모든 host process의 `proc_translated=0`을 확인했다.

@@ -2,6 +2,10 @@
 
 기준일: **2026-10-10**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
 
+## 2026-11-01 후속
+
+[2026-11-01 저위험 최적화·Rust 경계](CORE-IMPLEMENTATION-STATUS.ko.md#확정-저위험-최적화와-남은-rust-경계--2026-11-01) 이후 남은 일: HEAD에서 생긴 bindless·dxil의 Shader Validation null-address load(`AIRCONV_VERSION=45` bounded load 의심) 조사, trace 수집이 필요한 후보(heap view-pool residency 순회, reserved 리소스 commit 분할, Present/Temporal `MarkUntracked`, IB 범위 병합, DEFAULT heap 텍스처 Private storage, table CBV select), DRED 기본값 결정, FSR FG pacing jitter와 동일 장면 FPS 측정, `run-command-recording-cpu.py` 컴파일 오류(`async_targets_epoch_`).
+
 ## 2026-10-31 최적화 묶음 후속
 
 [2026-10-31 최적화](CORE-IMPLEMENTATION-STATUS.ko.md#d3d12-경로srfgrrrust-경계-최적화--2026-10-31)는 native ARM64 Wine+FEX의 x64 GPU suite를 통과했다. 남은 일은 세 가지다. trace counter로 동기화 감소를 측정하고, 같은 장면에서 FPS를 비교한다. x86 guest를 검증하고, Reflex fixed-two admission을 측정 probe와 함께 다시 판단하고, 기존 실패 항목인 fullscreen frame statistics·tiled/dxil-resource-review의 Shader Validation 중 compiler XPC 끊김·fsr marker·sm6 입력을 따로 처리한다.
