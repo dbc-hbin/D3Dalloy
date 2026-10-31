@@ -137,9 +137,11 @@ struct TFrameInterpolationPresentInfo
 
     volatile double     safetyMarginInSec       = 0.0001; //0.1ms
     volatile double     varianceFactor          = 0.1;
-    volatile bool       allowHybridSpin         = false;
-    volatile uint32_t   hybridSpinTime          = 2; //Measured in system timer resolution units. Default is 2. Below 1 will frequently result in overshoot. Overshoots stop showing up >=2.
-    volatile bool       allowWaitForSingleObjectOnFence = false;
+    // DXMT: default to sleeping/event waits instead of pure spinning; Wine's Sleep on macOS is not quantized
+    // to a Windows scheduler tick. FFX_FI_SWAPCHAIN_CONFIGURE_KEY_FRAMEPACINGTUNING still overrides all three.
+    volatile bool       allowHybridSpin         = true;
+    volatile uint32_t   hybridSpinTime          = 1; //Measured in system timer resolution units. Upstream default is 2. Below 1 will frequently result in overshoot. Overshoots stop showing up >=2.
+    volatile bool       allowWaitForSingleObjectOnFence = true;
 
     FfxWaitCallbackFunc waitCallback            = nullptr;
 
