@@ -76,14 +76,21 @@ struct History {
     ~History();
 };
 // Per-execution constants, bindings and residency. Each in-flight execution
-// owns one set; only retired, emptied sets return to the feature pool.
+// owns one set; only retired sets return to the feature pool. A retired set
+// keeps its committed scratch (sorted in contents) and is rebuilt only when the
+// next execution's scratch differs. Caller textures are D3D12 resources made
+// resident by the device set attached to every D3D12 queue.
 struct ExecutionBindings {
     Storage parameters;
     Object table, residency;
+    std::vector<id> contents;
 };
 struct NeuralGeneration {
     uint32_t width = 0, height = 0;
     std::array<Object,WMTRR_SIGNAL_COUNT> scalers;
+    // Albedo for the absent lighting component. Cleared once at creation and
+    // never written by the GPU, so it stays outside the scratch pool.
+    Storage zero;
 };
 bool radiance(unsigned s) { return s == 1 || s == 2 || s == 4 || s == 5; }
 bool hasRadiance(uint32_t signals) {
@@ -103,6 +110,34 @@ bool finite(const float* values, size_t count) {
     for (size_t i=0;i<count;++i) if (!std::isfinite(values[i])) return false;
     return true;
 }
+// The RR kernel library depends only on the device. Features share it; the
+// weak cache never extends its lifetime past the last feature, and a failed
+// compilation is not cached so a later create retries.
+struct KernelLibrary {
+    id<MTLDevice> device = nil;
+    Object library;
+    ~KernelLibrary() { [device release]; }
+};
+std::mutex kernelLibraryMutex;
+std::vector<std::weak_ptr<const KernelLibrary>> kernelLibraryCache;
+std::shared_ptr<const KernelLibrary> deviceKernelLibrary(id<MTLDevice> device, NSError** nativeError) {
+    std::lock_guard lock(kernelLibraryMutex);
+    std::shared_ptr<const KernelLibrary> found;
+    std::erase_if(kernelLibraryCache,[&](const std::weak_ptr<const KernelLibrary>& entry) {
+        auto library = entry.lock();
+        if (library && library->device == device) found = library;
+        return !library;
+    });
+    if (found) return found;
+    id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kFsrRrKernelsSource]
+        options:nil error:nativeError];
+    if (!library) return {};
+    auto result = std::make_shared<KernelLibrary>();
+    result->library = Object(library); [library release];
+    result->device = [device retain];
+    kernelLibraryCache.push_back(result);
+    return result;
+}
 Object pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString* name) {
     id<MTLFunction> function = [library newFunctionWithName:name];
     if (!function) return {};
@@ -117,6 +152,8 @@ struct Feature::Impl {
     Object device, compiler, library, snapshotPipeline, geometryPipeline, unpackPipeline, filterPipeline;
     Object neuralCommonPipeline, neuralPreparePipeline, neuralResolvePipeline, neuralResolveWritePipeline;
     Object resolvePipeline, resolveWritePipeline, historyFence;
+    // Keeps the device cache entry alive while this feature exists.
+    std::shared_ptr<const KernelLibrary> kernelLibrary;
     WMTRRCreateInfo info{};
     std::shared_ptr<std::atomic<uint64_t>> bytes = std::make_shared<std::atomic<uint64_t>>(0);
     std::mutex mutex;
@@ -229,6 +266,40 @@ static std::shared_ptr<NeuralGeneration> makeNeuralGeneration(Feature::Impl& fea
                 }
             }
         } @finally { [descriptor release]; }
+        auto device = (id<MTLDevice>)feature.device.get();
+        MTLTextureUsage zeroUsage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        for (const auto& value : generation->scalers) if (value) {
+            auto scaler = (id<MTL4FXTemporalDenoisedScaler>)value.get();
+            zeroUsage |= scaler.diffuseAlbedoTextureUsage | scaler.specularAlbedoTextureUsage;
+        }
+        auto zeroDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+            width:width height:height mipmapped:NO];
+        zeroDescriptor.storageMode = MTLStorageModePrivate;
+        zeroDescriptor.usage = zeroUsage;
+        id<MTLTexture> zero = [device newTextureWithDescriptor:zeroDescriptor];
+        if (!zero) { fail(error,ErrorCode::ResourceCreationFailed,"RR zero albedo allocation failed"); return {}; }
+        Object zeroOwner(zero); [zero release];
+        // Private contents are undefined. Clear synchronously, like the
+        // synchronous scaler initialization above, before any frame reads it.
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        bool cleared = false;
+        if (queue) {
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = zero;
+            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0,0,0,0);
+            id<MTLCommandBuffer> command = [queue commandBuffer];
+            id<MTLRenderCommandEncoder> clear = [command renderCommandEncoderWithDescriptor:pass];
+            if (clear) {
+                [clear endEncoding];
+                [command commit]; [command waitUntilCompleted];
+                cleared = command.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+        [queue release];
+        if (!cleared) { fail(error,ErrorCode::ResourceCreationFailed,"RR zero albedo initialization failed"); return {}; }
+        generation->zero = std::make_shared<Allocation>((id<MTLResource>)zeroOwner.get(),feature.bytes);
         return generation;
     }
     return {};
@@ -253,26 +324,20 @@ struct ExecutionLease::Impl {
     bool resident = false;
     std::vector<Object> objects;
     ~Impl() {
-        bool empty = false;
-        if (bindings.residency) {
+        // No command buffer uses this set after retirement; it is mutated only
+        // by its next owner. The separate mutex also permits retirement during
+        // an encode failure.
+        if (resident) {
             if (@available(macOS 15.0,*)) {
-                @try {
-                    auto set = (id<MTLResidencySet>)bindings.residency.get();
-                    if (resident) [set endResidency];
-                    [set removeAllAllocations];
-                    [set commit];
-                    empty = true;
-                } @catch (id) {}
+                @try { [(id<MTLResidencySet>)bindings.residency.get() endResidency]; } @catch (id) {}
             }
         }
-        // Empty residency before recycling, just as the SR execution lease does.
-        // The separate mutex also permits retirement during an encode failure.
         auto& feature = *prepared->feature;
         std::lock_guard lock(feature.scratchMutex);
         for (auto& allocation : allocations)
             feature.recycle(allocation,prepared->frame.width,prepared->frame.height);
-        // Only a complete, emptied set is reusable; partial sets are dropped.
-        if (empty && bindings.parameters && bindings.table && !feature.dormant &&
+        // Only a complete set is reusable; partial sets are dropped.
+        if (bindings.residency && bindings.parameters && bindings.table && !feature.dormant &&
             feature.idleBindings.size() < Feature::Impl::kMaxIdleBindings) {
             try { feature.idleBindings.push_back(std::move(bindings)); } catch (...) {}
         }
@@ -323,9 +388,9 @@ std::shared_ptr<Feature> Feature::create(void* nativeDevice, void* nativeCompile
                 fail(error,ErrorCode::UnsupportedFeature,"RR requires MetalFX neural denoising at 1:1 scale"); return {};
             }
             NSError* nativeError = nil;
-            id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kFsrRrKernelsSource]
-                options:nil error:&nativeError];
-            state->library = Object(library); [library release];
+            auto shared = deviceKernelLibrary(device,&nativeError);
+            if (shared) state->library = shared->library;
+            state->kernelLibrary = std::move(shared);
             if (!state->library) {
                 fail(error,ErrorCode::ResourceCreationFailed,nativeError ? nativeError.localizedDescription.UTF8String : "RR shader compilation failed"); return {};
             }
@@ -526,7 +591,8 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
             {
                 std::lock_guard scratchLock(feature->scratchMutex);
                 if (feature->scratchWidth != frame.width || feature->scratchHeight != frame.height) {
-                    feature->idleTextures.clear(); feature->idleBytes = 0;
+                    // Idle sets would otherwise keep old-extent scratch alive.
+                    feature->idleTextures.clear(); feature->idleBytes = 0; feature->idleBindings.clear();
                     feature->scratchWidth = frame.width; feature->scratchHeight = frame.height;
                 }
             }
@@ -560,9 +626,9 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
             Storage fused;
             std::array<Storage,WMTRR_SIGNAL_COUNT> snapshots;
             std::array<id<MTLTexture>,WMTRR_SIGNAL_COUNT> inputs{};
-            // Depth, pixel motion, world normal, roughness, diffuse/specular
-            // albedo and a zero albedo for the absent lighting component.
-            std::array<Storage,7> neuralCommon;
+            // Depth, pixel motion, roughness and diffuse/specular albedo. The
+            // world normal is the decoded guide; the zero albedo is per generation.
+            std::array<Storage,6> neuralCommon;
             struct NeuralFrame { Storage color, reactive, strength, lower, upper, output, hit; };
             std::array<NeuralFrame,WMTRR_SIGNAL_COUNT> neuralFrames;
             execution->allocations.reserve(22); execution->objects.reserve(4);
@@ -581,8 +647,12 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
             current->depth = common[0]; current->normals = common[2];
             // Signal-independent neighborhood guides: view position + depth,
             // and the decoded normal. Built once and read by every signal.
+            // The decoded normal is also the neural scaler's normal input.
+            MTLTextureUsage normalUsage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            for (unsigned s=0;s<WMTRR_SIGNAL_COUNT;++s) if (generation && generation->scalers[s])
+                normalUsage |= ((id<MTL4FXTemporalDenoisedScaler>)generation->scalers[s].get()).normalTextureUsage;
             Storage guide = feature->texture(frame.width,frame.height);
-            Storage decoded = feature->texture(frame.width,frame.height);
+            Storage decoded = feature->texture(frame.width,frame.height,MTLPixelFormatRGBA32Float,normalUsage);
             if (!guide || !decoded) return fail(error,ErrorCode::ResourceCreationFailed,"RR geometry guide allocation failed");
             execution->allocations.push_back(guide); execution->allocations.push_back(decoded);
             if (frame.legacy_mode == 3 &&
@@ -604,7 +674,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 if (!current->signals[s]) return fail(error,ErrorCode::ResourceCreationFailed,"RR independent signal allocation failed");
                 execution->allocations.push_back(current->signals[s]);
             }
-            std::array<MTLTextureUsage,7> commonUsage{};
+            std::array<MTLTextureUsage,6> commonUsage{};
             for (unsigned s=0;s<WMTRR_SIGNAL_COUNT;++s) if (generation && generation->scalers[s]) {
                 auto scaler = (id<MTL4FXTemporalDenoisedScaler>)generation->scalers[s].get();
                 commonUsage[0] |= scaler.depthTextureUsage;
@@ -613,7 +683,6 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 commonUsage[3] |= scaler.roughnessTextureUsage;
                 commonUsage[4] |= scaler.diffuseAlbedoTextureUsage;
                 commonUsage[5] |= scaler.specularAlbedoTextureUsage;
-                commonUsage[6] |= scaler.diffuseAlbedoTextureUsage | scaler.specularAlbedoTextureUsage;
                 auto allocate = [&](MTLPixelFormat format, MTLTextureUsage usage) {
                     auto value = feature->texture(frame.width,frame.height,format,
                         usage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
@@ -643,6 +712,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                     current->reconstructedAlpha[s] = n.upper;
             }
             for (unsigned i=0;generation && i<neuralCommon.size();++i) {
+                if (i == 2) continue;
                 MTLPixelFormat format = i == 1 ? MTLPixelFormatRG32Float :
                     i == 0 || i == 3 ? MTLPixelFormatR32Float : MTLPixelFormatRGBA32Float;
                 neuralCommon[i] = feature->texture(frame.width,frame.height,format,
@@ -715,17 +785,27 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 if (!bindings.residency) return fail(error,ErrorCode::ResourceCreationFailed,"RR residency allocation failed");
             }
             auto residency = (id<MTLResidencySet>)bindings.residency.get();
-            for (const auto& t : impl_->textures) if (t) [residency addAllocation:(id<MTLAllocation>)t.get()];
-            for (const auto& a : execution->allocations) [residency addAllocation:(id<MTLAllocation>)a->object.get()];
-            [residency addAllocation:parameters];
+            std::vector<id> contents;
+            contents.reserve(execution->allocations.size()+16);
+            for (const auto& a : execution->allocations) contents.push_back(a->object.get());
+            contents.push_back(parameters);
+            if (generation) contents.push_back(generation->zero->object.get());
             if (reuse) {
-                [residency addAllocation:(id<MTLAllocation>)previous->depth->object.get()];
-                [residency addAllocation:(id<MTLAllocation>)previous->normals->object.get()];
-                for (const auto& a : previous->signals) if (a) [residency addAllocation:(id<MTLAllocation>)a->object.get()];
-                for (const auto& a : previous->reconstructedAlpha) if (a)
-                    [residency addAllocation:(id<MTLAllocation>)a->object.get()];
+                contents.push_back(previous->depth->object.get());
+                contents.push_back(previous->normals->object.get());
+                for (const auto& a : previous->signals) if (a) contents.push_back(a->object.get());
+                for (const auto& a : previous->reconstructedAlpha) if (a) contents.push_back(a->object.get());
             }
-            [residency commit]; [residency requestResidency]; execution->resident = true;
+            std::sort(contents.begin(),contents.end());
+            contents.erase(std::unique(contents.begin(),contents.end()),contents.end());
+            if (contents != bindings.contents) {
+                bindings.contents.clear();
+                [residency removeAllAllocations];
+                for (id allocation : contents) [residency addAllocation:(id<MTLAllocation>)allocation];
+                [residency commit];
+                bindings.contents = std::move(contents);
+            }
+            [residency requestResidency]; execution->resident = true;
             // Publish before any GPU commands: failures retain captured objects.
             lease = std::shared_ptr<const ExecutionLease>(new ExecutionLease(execution));
             auto buffer = (id<MTL4CommandBuffer>)commandBuffer;
@@ -771,8 +851,8 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 if (generation)
                     dispatch((id<MTLComputePipelineState>)feature->neuralCommonPipeline.get(),0,
                         {tex(common[0]),(id<MTLTexture>)impl_->textures[1].get(),tex(common[2]),specAlbedo,diffAlbedo,
-                         tex(neuralCommon[0]),tex(neuralCommon[1]),tex(neuralCommon[2]),tex(neuralCommon[3]),
-                         tex(neuralCommon[4]),tex(neuralCommon[5]),tex(neuralCommon[6])});
+                         tex(neuralCommon[0]),tex(neuralCommon[1]),nil,tex(neuralCommon[3]),
+                         tex(neuralCommon[4]),tex(neuralCommon[5])});
                 for (unsigned s=0;s<7;++s) if (inputs[s]) {
                     if (radiance(s)) {
                         const auto& n = neuralFrames[s];
@@ -834,10 +914,10 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                     @try {
                         scaler.colorTexture = tex(n.color); scaler.outputTexture = tex(n.output);
                         scaler.depthTexture = tex(neuralCommon[0]); scaler.motionTexture = tex(neuralCommon[1]);
-                        scaler.normalTexture = tex(neuralCommon[2]); scaler.roughnessTexture = tex(neuralCommon[3]);
+                        scaler.normalTexture = tex(decoded); scaler.roughnessTexture = tex(neuralCommon[3]);
                         bool composite = frame.legacy_mode == 3;
-                        scaler.diffuseAlbedoTexture = tex(neuralCommon[composite || s == 1 || s == 4 ? 4 : 6]);
-                        scaler.specularAlbedoTexture = tex(neuralCommon[composite || s == 2 || s == 5 ? 5 : 6]);
+                        scaler.diffuseAlbedoTexture = composite || s == 1 || s == 4 ? tex(neuralCommon[4]) : tex(generation->zero);
+                        scaler.specularAlbedoTexture = composite || s == 2 || s == 5 ? tex(neuralCommon[5]) : tex(generation->zero);
                         scaler.reactiveMaskTexture = tex(n.reactive); scaler.denoiseStrengthMaskTexture = tex(n.strength);
                         scaler.specularHitDistanceTexture = tex(n.hit);
                         scaler.preExposure = 1;
