@@ -37,3 +37,5 @@ for entry in vs_msaa ps_msaa; do
   WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -T "$profile" -E "$entry" \
     "$here/owned-d3d12-writable-msaa.hlsl" -Fo "$out/sm6-$entry.dxil"
 done
+WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -T cs_6_7 -E cs_msaa_unused \
+  "$here/owned-d3d12-writable-msaa.hlsl" -Fo "$out/sm6-cs_msaa_unused.dxil"

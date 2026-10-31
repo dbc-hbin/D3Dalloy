@@ -231,6 +231,9 @@ Texture2D<uint> GraphTexture : register(t3);
 RWTexture2D<uint> GraphWrite : register(u2);
 float4 psGraphTexture() : SV_Target { return color + float4(GraphTexture.Load(int3(0, 0, 0)) / 255.0, 0, 0, 0); }
 [numthreads(1, 1, 1)] void csGraphMip() { GraphWrite[uint2(0, 0)] = 64; }
+Texture2D<float> DepthRead : register(t4);
+RWStructuredBuffer<float> DepthOut : register(u3);
+[numthreads(4, 4, 1)] void csDepthSrv(uint2 id : SV_DispatchThreadID) { DepthOut[id.y * 4 + id.x] = DepthRead.Load(int3(id, 0)); }
 // Per-sample distinct values for resolve tests: sample i writes (i + 1) / 8 in red.
 float4 psSamples(uint sample : SV_SampleIndex) : SV_Target { return float4((sample + 1) / 8.0, 0, 0, 1); }
 
@@ -352,6 +355,10 @@ void submissionAccessScheduling(UINT control) {
   auto output = committed(c.dev.Get(), D3D12_HEAP_TYPE_READBACK, bufDesc(4), D3D12_RESOURCE_STATE_COPY_DEST);
   auto computeData = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
       bufDesc(4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  const auto unusedReservedDesc = bufDesc(65536);
+  ComPtr<ID3D12Resource> unusedReserved;
+  check(c.dev->CreateReservedResource(&unusedReservedDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                      IID_PPV_ARGS(&unusedReserved)), "CreateReservedResource(graph-unused)");
   void *mapped = nullptr;
   check(input->Map(0, nullptr, &mapped), "Map(graph-input)");
   std::memset(mapped, 0, 256); *static_cast<uint32_t *>(mapped) = 16; input->Unmap(0, nullptr);
@@ -406,11 +413,61 @@ void submissionAccessScheduling(UINT control) {
     check(output->Map(0, nullptr, &mapped), "Map(graph-copy)");
     const auto word = *static_cast<const uint32_t *>(mapped); output->Unmap(0, nullptr);
     if (word != (control == 2 ? 0x13579bdfu : 16u)) fail("graph-unrelated-work");
-    std::printf("%s_GRAPH_ACCESS control=%u replay=%u rgba=%08x unrelated=%08x render_encoders=%u members=2 exact=1\n",
-        kPrefix, control, replay, color.at<uint32_t>(0), word, control == 3 ? 2u : 1u);
+    std::printf("%s_GRAPH_ACCESS control=%u replay=%u rgba=%08x unrelated=%08x render_encoders=1 members=2 exact=1\n",
+        kPrefix, control, replay, color.at<uint32_t>(0), word);
   }
   pass(control == 0 ? "graph-same-list-read-copy-read" : control == 1 ? "graph-cross-list-read-read-copy" :
-       control == 2 ? "graph-cross-list-independent-compute" : "graph-root-srv-opaque-control");
+       control == 2 ? "graph-cross-list-independent-compute" : "graph-root-srv-buffer-read");
+}
+
+// A large copy into a COMMON buffer in one ExecuteCommandLists and a copy of
+// its last word in the next, queued back to back with no CPU wait and no
+// barrier: buffer state decays and promotes implicitly across Execute
+// boundaries. Each Execute starts with an empty in-plan history, so only queue
+// tracking orders them; the long producer leaves a missed dependency visible.
+void submissionCrossExecuteProducer() {
+  Context c;
+  constexpr UINT64 kBytes = 64ull << 20;
+  auto input = committed(c.dev.Get(), D3D12_HEAP_TYPE_UPLOAD, bufDesc(kBytes), D3D12_RESOURCE_STATE_GENERIC_READ);
+  auto data = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT, bufDesc(kBytes), D3D12_RESOURCE_STATE_COMMON);
+  auto output = committed(c.dev.Get(), D3D12_HEAP_TYPE_READBACK, bufDesc(4), D3D12_RESOURCE_STATE_COPY_DEST);
+  void *mapped = nullptr;
+  check(input->Map(0, nullptr, &mapped), "Map(cross-execute-input)");
+  auto *words = static_cast<uint32_t *>(mapped);
+  for (UINT64 i = 0; i < kBytes / 4; ++i) words[i] = 0x13579bdfu;
+  input->Unmap(0, nullptr);
+  auto zeros = committed(c.dev.Get(), D3D12_HEAP_TYPE_UPLOAD, bufDesc(4), D3D12_RESOURCE_STATE_GENERIC_READ);
+  check(zeros->Map(0, nullptr, &mapped), "Map(cross-execute-zero)");
+  *static_cast<uint32_t *>(mapped) = 0; zeros->Unmap(0, nullptr);
+  auto producer = c.list(), consumer = c.list();
+  producer.list->CopyBufferRegion(data.Get(), 0, input.Get(), 0, kBytes);
+  consumer.list->CopyBufferRegion(output.Get(), 0, data.Get(), kBytes - 4, 4);
+  check(producer.list->Close(), "Close(cross-execute-producer)");
+  check(consumer.list->Close(), "Close(cross-execute-consumer)");
+  ID3D12CommandList *first[] = {producer.list.Get()}, *second[] = {consumer.list.Get()};
+  for (UINT replay = 0; replay < 2; ++replay) {
+    // The producer must refill the last word every replay.
+    auto reset = c.list();
+    reset.list->CopyBufferRegion(data.Get(), kBytes - 4, zeros.Get(), 0, 4);
+    c.execute({reset.list.Get()});
+    check(output->Map(0, nullptr, &mapped), "Map(cross-execute-reset)");
+    *static_cast<uint32_t *>(mapped) = 0; output->Unmap(0, nullptr);
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    check(c.fence->SetEventOnCompletion(++c.value, event), "SetEventOnCompletion(cross-execute)");
+    c.queue->ExecuteCommandLists(1, first);
+    c.queue->ExecuteCommandLists(1, second);
+    check(c.queue->Signal(c.fence.Get(), c.value), "Signal(cross-execute)");
+    if (WaitForSingleObject(event, kTimeoutMs) != WAIT_OBJECT_0) fail("cross-execute-wait");
+    CloseHandle(event);
+    check(output->Map(0, nullptr, &mapped), "Map(cross-execute)");
+    const auto word = *static_cast<const uint32_t *>(mapped); output->Unmap(0, nullptr);
+    if (word != 0x13579bdfu) {
+      std::fprintf(stderr, "%s_FAIL case=cross-execute-producer replay=%u got=%08x expected=13579bdf\n", kPrefix, replay, word);
+      std::exit(1);
+    }
+    std::printf("%s_CROSS_EXECUTE replay=%u word=%08x exact=1\n", kPrefix, replay, word);
+  }
+  pass("graph-cross-execute-producer");
 }
 
 // Each closed list contributes one small, disjoint writer to the same buffer.
@@ -554,6 +611,55 @@ void submissionDisjointMips() {
   std::printf("%s_GRAPH_MIPS rgba=%08x mip0=%u mip1=%u mip1_untouched=%u render_encoders=1 members=2 exact=1\n",
       kPrefix, color.at<uint32_t>(0), mip0.at<uint32_t>(0), mip1.at<uint32_t>(0), mip1.at<uint32_t>(1));
   pass("graph-descriptor-disjoint-mip-compute");
+}
+
+// A depth clear followed by a compute read of the same depth through an SRV.
+// The SRV and the DSV name the same depth plane, so the dispatch must be ordered
+// after the clear even though the transition rides on the clear's encoder.
+void submissionDepthClearSrvRead() {
+  Context c;
+  auto ds = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
+      texDesc(DXGI_FORMAT_R32_TYPELESS, 4, 4, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL), D3D12_RESOURCE_STATE_DEPTH_WRITE);
+  auto out = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
+      bufDesc(64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto readback = committed(c.dev.Get(), D3D12_HEAP_TYPE_READBACK, bufDesc(64), D3D12_RESOURCE_STATE_COPY_DEST);
+  ComPtr<ID3D12DescriptorHeap> dsvHeap, heap;
+  const auto dsv = descriptor(c.dev.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, dsvHeap);
+  D3D12_DEPTH_STENCIL_VIEW_DESC dd{}; dd.Format = DXGI_FORMAT_D32_FLOAT; dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  c.dev->CreateDepthStencilView(ds.Get(), &dd, dsv);
+  D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  check(c.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "Create(depth-srv-heap)");
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{}; srv.Format = DXGI_FORMAT_R32_FLOAT; srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
+  c.dev->CreateShaderResourceView(ds.Get(), &srv, heap->GetCPUDescriptorHandleForHeapStart());
+  D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4, 0, 0};
+  D3D12_ROOT_PARAMETER params[2]{};
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; params[0].DescriptorTable = {1, &range};
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; params[1].Descriptor.ShaderRegister = 3;
+  auto root = rootSignature(c.dev.Get(), {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE});
+  auto cs = compile(kSource, "csDepthSrv", "cs_5_0");
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pd{}; pd.pRootSignature = root.Get(); pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+  ComPtr<ID3D12PipelineState> compute; check(c.dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&compute)), "Create(depth-srv)");
+  auto initial = c.list(); initial.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, nullptr);
+  c.execute({initial.list.Get()});
+  auto l = c.list(), read = c.list();
+  ID3D12DescriptorHeap *bound[] = {heap.Get()};
+  l.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.75f, 0, 0, nullptr);
+  transition(l.list.Get(), ds.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  l.list->SetDescriptorHeaps(1, bound); l.list->SetPipelineState(compute.Get()); l.list->SetComputeRootSignature(root.Get());
+  l.list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+  l.list->SetComputeRootUnorderedAccessView(1, out->GetGPUVirtualAddress()); l.list->Dispatch(1, 1, 1);
+  transition(read.list.Get(), out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  read.list->CopyBufferRegion(readback.Get(), 0, out.Get(), 0, 64);
+  std::fprintf(stderr, "%s_DEPTH_SRV_PHASE begin\n", kPrefix); std::fflush(stderr);
+  c.execute({l.list.Get()});
+  std::fprintf(stderr, "%s_DEPTH_SRV_PHASE end\n", kPrefix); std::fflush(stderr);
+  c.execute({read.list.Get()});
+  void *mapped = nullptr; check(readback->Map(0, nullptr, &mapped), "Map(depth-srv)");
+  float values[16]; std::memcpy(values, mapped, sizeof(values)); readback->Unmap(0, nullptr);
+  for (float value : values) if (value != 0.75f) fail("depth-clear-srv-read");
+  std::printf("%s_DEPTH_SRV depth=%08x exact=1\n", kPrefix, std::bit_cast<uint32_t>(values[0]));
+  pass("depth-clear-srv-compute-read");
 }
 
 // A and B emit one output into an unbound slot; C restores identity. Native
@@ -1115,6 +1221,9 @@ void clearToRenderLoadActions() {
     l.list->ClearDepthStencilView(dsv, flags[stage], clearDepth[stage], clearStencil[stage], 0, nullptr);
     l.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
     depthDraw.draw(l.list.Get(), 2, 2, term, drawDepth[stage]);
+    // Rebinding the same depth-only view must keep the current native render pass.
+    l.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    depthDraw.draw(l.list.Get(), 2, 2, term, drawDepth[stage]);
     // A farther draw must fail, leaving the near write and the outside clear intact.
     depthDraw.draw(l.list.Get(), 2, 2, term, 0.875f);
     transition(l.list.Get(), ds.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1165,7 +1274,7 @@ void clearToRenderLoadActions() {
       }
   }
   std::printf("%s_CLEAR_LOAD_FOLD outside=%08x inside=%08x executions=2 color_pixels=32 "
-      "depth_pixels=96 stencil_pixels=96 exact=1\n", kPrefix, color.at<uint32_t>(3, 3), color.at<uint32_t>(0, 0));
+      "depth_pixels=96 stencil_pixels=96 depth_only_redundant=3 exact=1\n", kPrefix, color.at<uint32_t>(3, 3), color.at<uint32_t>(0, 0));
   pass("clear-to-render-load-actions");
 }
 
@@ -1217,32 +1326,35 @@ void discardAndDepthClear() {
   pass("discard-begin-depth-clear");
 }
 
-// 4x MSAA pass with ENDING_ACCESS_RESOLVE: AVERAGE into one target, MIN and MAX of the sample values
+// 4x native MSAA pass with ENDING_ACCESS_RESOLVE: the full-rect AVERAGE exercises
+// resolve folding while MIN/MAX remain separate; preserve a source sample and read
+// back both resolved destinations.
 // (1..4)/8 into others via the subresource parameters, including a sub-rectangle with a DstX offset.
 void resolveModes() {
   Context c;
   constexpr auto kFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
   constexpr auto kFloat = DXGI_FORMAT_R32_FLOAT;
-  auto run = [&](DXGI_FORMAT fmt, D3D12_RESOLVE_MODE mode, bool offset) {
+  auto run = [&](DXGI_FORMAT fmt, D3D12_RESOLVE_MODE mode, bool offset, bool native = false) {
+    const char *ps = native ? "psMain" : "psSamples";
     auto msaa = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
                           texDesc(fmt, 4, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 4),
                           D3D12_RESOURCE_STATE_RENDER_TARGET);
     // The translator's resolve renders into the destination, which therefore needs ALLOW_RENDER_TARGET
     // (a Metal render-target usage); see the report's constraint on ResolveSubresourceRegion.
     auto dst = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
-                         texDesc(fmt, 8, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RESOLVE_DEST);
+                         texDesc(fmt, native ? 4 : 8, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RESOLVE_DEST);
     ComPtr<ID3D12DescriptorHeap> rtvHeap;
     auto rtv = descriptor(c.dev.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, rtvHeap);
     c.dev->CreateRenderTargetView(msaa.Get(), nullptr, rtv);
-    Draw samples(c.dev.Get(), fmt, DXGI_FORMAT_UNKNOWN, 4, "psSamples", false);
+    Draw samples(c.dev.Get(), fmt, DXGI_FORMAT_UNKNOWN, 4, ps, false);
     auto l = c.list();
     D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS region{0, 0, offset ? 4u : 0u, 0, {0, 0, 4, 4}};
     auto access = rtAccess(rtv, D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD,
                            D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE);
     access.EndingAccess.Resolve = {msaa.Get(), dst.Get(), 1, &region, fmt, mode, FALSE};
     l.list->BeginRenderPass(1, &access, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
-    const float unused[4] = {};
-    samples.draw(l.list.Get(), 4, 4, unused);
+    const float color[4] = {0, 0x40 / 255.0f, 0x80 / 255.0f, 1};
+    samples.draw(l.list.Get(), 4, 4, color);
     l.list->EndRenderPass();
     transition(l.list.Get(), dst.Get(), D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
     auto out = copyOut(c.dev.Get(), l.list.Get(), dst.Get());
@@ -1252,11 +1364,17 @@ void resolveModes() {
   auto average = run(kFmt, D3D12_RESOLVE_MODE_AVERAGE, false);
   auto minimum = run(kFloat, D3D12_RESOLVE_MODE_MIN, true);
   auto maximum = run(kFloat, D3D12_RESOLVE_MODE_MAX, false);
+  // A uniform-color native 4x pass folds its AVERAGE resolve into the pass store;
+  // a lost resolve leaves the zero-initialized destination.
+  auto folded = run(kFmt, D3D12_RESOLVE_MODE_AVERAGE, false, true);
+  const uint32_t folded_pixel = folded.at<uint32_t>(1, 1);
+  std::printf("%s_RESOLVE_FOLDED pixel=%08x\n", kPrefix, folded_pixel);
+  if (folded_pixel != 0xff804000u) fail("resolve-folded");
   // Samples write 1/8..4/8: average 2.5/8 = 0.3125 -> 80 (0x50); min 0.125; max 0.5.
   const uint32_t avg = average.at<uint32_t>(1, 1);
   const float mn = minimum.at<float>(5, 1), mx = maximum.at<float>(1, 1), untouched = minimum.at<float>(1, 1);
   std::printf("%s_RESOLVE average=%08x min=%.6f max=%.6f min_left=%.6f\n", kPrefix, avg, mn, mx, untouched);
-  if ((avg & 0xff) < 0x4f || (avg & 0xff) > 0x51 || (avg >> 24) != 0xff || mn != 0.125f || mx != 0.5f)
+  if ((avg & 0xff) < 0x4f || (avg & 0xff) > 0x51 || (avg >> 24) != 0xff || mn != 0.125f || mx != 0.5f || untouched != 0.0f)
     fail("resolve-modes");
   pass("ending-resolve-average-min-max");
 }
@@ -1645,11 +1763,13 @@ int main() {
   for (UINT control = 0; control < 5; ++control) crossListRenderGrouping(control);
   for (UINT control = 0; control < 5; ++control) crossListUavDependency(control);
   for (UINT control = 0; control < 4; ++control) submissionAccessScheduling(control);
+  submissionCrossExecuteProducer();
   submissionLongFrontier(256);
   submissionLongFrontier(512);
   submissionFrontierBoundary(false);
   submissionFrontierBoundary(true);
   submissionDisjointMips();
+  submissionDepthClearSrvRead();
   submissionAttachmentUnion(false);
   submissionAttachmentUnion(true);
   submissionAttachmentUnion(true, true);

@@ -1,7 +1,6 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
-#define dxbc_spv_assert(condition) assert(condition)
 #include "../../src/util/util_svector.hpp"
 
 struct Owner {
@@ -54,9 +53,14 @@ int main() {
   dxmt::small_vector<int, 2> values{1, 2};
   auto inline_storage = values.data();
   assert(values.is_embedded() && values.capacity() == 2);
+  values.at(1) = 4;
+  const auto &const_values = values;
+  assert(const_values.at(0) == 1 && const_values.at(1) == 4);
+  values.at(1) = 2;
   values.push_back(3);
   assert(!values.is_embedded() && values.data() != inline_storage);
   assert(values[0] == 1 && values[1] == 2 && values.back() == 3);
+  assert(&values.at(2) == &const_values.at(2) && const_values.at(2) == 3);
   auto heap_storage = values.data();
   auto capacity = values.capacity();
   values.clear();

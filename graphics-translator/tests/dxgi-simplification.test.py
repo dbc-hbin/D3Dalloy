@@ -42,7 +42,32 @@ for header, kind, name in (
 source += extract("src/dxgi/dxgi_options.cpp", r"static int32_t parsePciId\(.*?\n\}")
 source += extract("src/dxgi/dxgi_output.cpp", r"void FilterModesByDesc\(.*?\n\}")
 source += r'''
+std::vector<DXGI_FORMAT> format_warnings;
+namespace str {
+  DXGI_FORMAT format(const char *, DXGI_FORMAT value) { return value; }
+}
+struct Logger {
+  static void warn(DXGI_FORMAT value) { format_warnings.push_back(value); }
+};
+'''
+source += extract("src/dxmt/dxmt_monitor_format.hpp",
+                  r"static inline uint32_t\nGetMonitorFormatBpp\(.*?\n\}")
+source += r'''
 int main() {
+  for (DXGI_FORMAT format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+                             DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                             DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_UNORM_SRGB,
+                             DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM})
+    assert(GetMonitorFormatBpp(format) == 32);
+  assert(GetMonitorFormatBpp(DXGI_FORMAT_R16G16B16A16_FLOAT) == 64);
+  assert(format_warnings.empty());
+  for (DXGI_FORMAT format : {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8_UNORM,
+                             DXGI_FORMAT_R16G16B16A16_UNORM, static_cast<DXGI_FORMAT>(0x1234)}) {
+    const auto warnings_before = format_warnings.size();
+    assert(GetMonitorFormatBpp(format) == 32);
+    assert(format_warnings.size() == warnings_before + 1 && format_warnings.back() == format);
+  }
+
   for (uint32_t id = 0; id <= 0xffff; ++id) {
     char hex[5];
     std::snprintf(hex, sizeof(hex), "%04x", id);

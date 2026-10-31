@@ -27,11 +27,25 @@ production = out / "production-cache.inc"
 production.write_text("namespace dxmt {\nnamespace {\n" + helpers + private + "\n}\n" + public + "\n}\n")
 (out / "source.sha256").write_text(hashlib.sha256(source.encode()).hexdigest() + "\n")
 executable = out / "automatic-cache-disk.exe"
+imports = out / "winemetal.def"
+imports.write_text("LIBRARY winemetal.dll\nEXPORTS\n  SM50FreeError\n")
+library = out / "winemetal.lib"
+subprocess.run([str(args.compiler_bin / "llvm-dlltool"), "-m", "i386:x86-64",
+                "-d", str(imports), "-l", str(library)], cwd=root, check=True)
+sha1 = out / "sha1.o"
+codec = out / "libshader_bytecode.a"
 command = [str(args.compiler_bin / "x86_64-w64-mingw32-clang++"), "-std=c++20", "-O2",
            "-Wall", "-Wextra", "-Werror", "-static", f'-DPRODUCTION_CACHE="{production}"',
-           "-Isrc/util", "-Isrc/airconv", "-Isrc/d3d12", "-Isrc/winemetal", "graphics-translator/tests/automatic-cache-disk.test.cpp",
-           "src/util/sha1/sha1_util.cpp", "-x", "c++", "src/util/sha1/sha1.c", "-ld3dcompiler", "-o", str(executable)]
+           "-Isrc/util", "-Isrc/airconv", "-Isrc/d3d12", "-Isrc/winemetal", "-Ilibs", "graphics-translator/tests/automatic-cache-disk.test.cpp",
+           "src/util/sha1/sha1_util.cpp", str(sha1), str(codec),
+           str(library), "-ld3dcompiler", "-o", str(executable)]
 with (out / "build.log").open("w") as log:
+    subprocess.run([str(args.compiler_bin / "x86_64-w64-mingw32-clang"), "-O2", "-c",
+                    "src/util/sha1/sha1.c", "-o", str(sha1)],
+                   cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
+    subprocess.run(["rustc", "--edition=2021", "--crate-type=staticlib", "-Cpanic=abort", "-Copt-level=2",
+                    "--target", "x86_64-pc-windows-gnu", "src/airconv/shader_bytecode.rs", "-o", str(codec)],
+                   cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
     subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
 prefix = out / "prefix"
 temporary = out / "temp"

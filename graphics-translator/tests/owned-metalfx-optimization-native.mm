@@ -12,6 +12,7 @@
 
 namespace probe {
 using namespace yaagl::pso::metalfx;
+namespace metalfx = yaagl::pso::metalfx;
 using TextureCopy = void (*)(id, SEL, id<MTLTexture>, NSUInteger, NSUInteger, MTLOrigin, MTLSize,
                             id<MTLTexture>, NSUInteger, NSUInteger, MTLOrigin);
 Method copyMethod = nullptr;
@@ -29,6 +30,91 @@ void observeCopy(id encoder, SEL selector, id<MTLTexture> source, NSUInteger sli
 }
 void require(bool ok, const char* reason) {
     if (!ok) { std::fprintf(stderr, "OWNED_METALFX_OPT_FAIL reason=%s\n", reason); std::exit(1); }
+}
+using NewLibrary = id<MTLLibrary> (*)(id, SEL, NSString*, MTLCompileOptions*, NSError**);
+using NewPipeline = id<MTLComputePipelineState> (*)(id, SEL, id<MTLFunction>, NSError**);
+NewLibrary originalLibrary = nullptr;
+NewPipeline originalPipeline = nullptr;
+unsigned fsrLibraries = 0, exposureLibraries = 0, pipelineAttempts = 0;
+NSString* failedPipeline = nil;
+bool throwLibrary = false, throwPipeline = false;
+id<MTLLibrary> observeLibrary(id device, SEL selector, NSString* source, MTLCompileOptions* options, NSError** error) {
+    if ([source isEqualToString:[NSString stringWithUTF8String:kFsrKernelsSource]]) {
+        ++fsrLibraries;
+        if (throwLibrary) {
+            throwLibrary = false;
+            [NSException raise:NSInternalInconsistencyException format:@"injected library failure"];
+        }
+    }
+    if ([source isEqualToString:[NSString stringWithUTF8String:kExposureKernel]]) ++exposureLibraries;
+    return originalLibrary(device, selector, source, options, error);
+}
+id<MTLComputePipelineState> observePipeline(id device, SEL selector, id<MTLFunction> function, NSError** error) {
+    if ([function.name hasPrefix:@"yaagl_"]) ++pipelineAttempts;
+    if ([function.name isEqualToString:failedPipeline]) {
+        failedPipeline = nil;
+        if (throwPipeline) {
+            throwPipeline = false;
+            [NSException raise:NSInternalInconsistencyException format:@"injected pipeline failure"];
+        }
+        return nil;
+    }
+    return originalPipeline(device, selector, function, error);
+}
+void pipelineBatchProof(id<MTLDevice> device) {
+    Method libraryMethod = class_getInstanceMethod(object_getClass(device), @selector(newLibraryWithSource:options:error:));
+    Method pipelineMethod = class_getInstanceMethod(object_getClass(device), @selector(newComputePipelineStateWithFunction:error:));
+    require(libraryMethod && pipelineMethod, "pipeline-observer-methods");
+    originalLibrary = reinterpret_cast<NewLibrary>(method_setImplementation(libraryMethod, reinterpret_cast<IMP>(observeLibrary)));
+    originalPipeline = reinterpret_cast<NewPipeline>(method_setImplementation(pipelineMethod, reinterpret_cast<IMP>(observePipeline)));
+    const CreateInfo create{{128,128},{256,256},FeatureFlagMVLowRes|FeatureFlagIsHDR|FeatureFlagAlphaUpscaling,true,true};
+    auto core = std::make_shared<Feature::Impl>();
+    core->device = retainObject(device); core->create = create;
+    Error error;
+    FsrPipelineNeeds linearOnly; linearOnly.linearize = true;
+    require(ensureFsrPipelines(*core, linearOnly, &error) && fsrLibraries == 1 && pipelineAttempts == 1 &&
+            core->linearizePipeline && !core->combineMaskPipeline && !core->finishPipeline,
+            "lazy-compiles-only-needed-pipeline");
+    FsrPipelineNeeds all; all.linearize = all.combineMasks = all.finish = all.alpha = all.debug = all.padding = true;
+    failedPipeline = @"yaagl_fsr_combine_masks";
+    require(!ensureFsrPipelines(*core, all, &error) && error.code == ErrorCode::ResourceCreationFailed,
+            "partial-pipeline-creation-reported");
+    require(fsrLibraries == 1 && pipelineAttempts == 6 && !core->combineMaskPipeline,
+            "failure-attempts-every-needed-pipeline-from-one-library");
+    std::array<id<MTLComputePipelineState>, 5> retained = {core->linearizePipeline, core->finishPipeline,
+        core->alphaPipeline, core->debugPipeline, core->paddingPipeline};
+    for (auto pipeline : retained) require(pipeline != nil, "successful-partial-pipeline-retained");
+    clearError(&error);
+    require(ensureFsrPipelines(*core, all, &error) && !error && fsrLibraries == 1 && pipelineAttempts == 7,
+            "retry-compiles-only-missing-pipeline");
+    require(retained == std::array<id<MTLComputePipelineState>, 5>{core->linearizePipeline, core->finishPipeline,
+        core->alphaPipeline, core->debugPipeline, core->paddingPipeline}, "retry-preserves-existing-pipelines");
+    require(ensureFsrPipelines(*core, all, nullptr) && fsrLibraries == 1 && pipelineAttempts == 7,
+            "complete-feature-does-not-recompile");
+    require(ensureExposurePipeline(*core, &error) && exposureLibraries == 1 && fsrLibraries == 1,
+            "exposure-uses-separate-source-library");
+    require(ensureExposurePipeline(*core, nullptr) && exposureLibraries == 1, "exposure-reuses-pipeline");
+    {
+        auto shared = std::make_shared<Feature::Impl>();
+        shared->device = retainObject(device); shared->create = create;
+        require(ensureFsrPipelines(*shared, linearOnly, &error) && fsrLibraries == 1 &&
+                shared->fsrLibrary == core->fsrLibrary, "same-device-features-share-library");
+    }
+    core.reset();
+    auto independent = std::make_shared<Feature::Impl>();
+    independent->device = retainObject(device); independent->create = create;
+    throwLibrary = true;
+    require(!ensureFsrPipelines(*independent, all, &error) &&
+            fsrLibraries == 2 && !independent->fsrLibrary,
+            "library-objc-exception-contained-and-not-cached");
+    failedPipeline = @"yaagl_fsr_combine_masks"; throwPipeline = true;
+    require(!ensureFsrPipelines(*independent, all, &error) && fsrLibraries == 3,
+            "pipeline-objc-exception-contained");
+    require(ensureFsrPipelines(*independent, all, &error) && fsrLibraries == 3,
+            "retry-after-exception-reuses-library");
+    method_setImplementation(pipelineMethod, reinterpret_cast<IMP>(originalPipeline));
+    method_setImplementation(libraryMethod, reinterpret_cast<IMP>(originalLibrary));
+    std::puts("OWNED_METALFX_OPT_PIPELINES_PASS lazy=1 device_shared_library=1 partial_retry_missing=1 exposure_separate=1 objc_exceptions=contained");
 }
 struct GPU {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -98,7 +184,8 @@ bool compare(const std::vector<float>& a, const std::vector<float>& b, const cha
 }
 std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
                          const std::shared_ptr<ScalerGeneration>& generation, unsigned mask, unsigned iteration,
-                         const std::shared_ptr<Feature>& publicFeature = {}) {
+                         const std::shared_ptr<Feature>& publicFeature = {},
+                         MTLPixelFormat depthFormat = MTLPixelFormatR32Float) {
     PreparedFrame::Impl frame;
     frame.feature = core; frame.generation = generation;
     auto& p = frame.frame;
@@ -108,7 +195,7 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     frame.scalerMotionRect = p.motionRect; frame.temporalOutputWidth = frame.temporalOutputHeight = 256;
     frame.needsOutputShadow = true;
     frame.color = texture(gpu,MTLPixelFormatRGBA16Float,128,generation->colorUsage);
-    frame.depth = texture(gpu,MTLPixelFormatR32Float,128,generation->depthUsage);
+    frame.depth = texture(gpu,depthFormat,128,generation->depthUsage);
     frame.motion = texture(gpu,MTLPixelFormatRG16Float,128,generation->motionUsage);
     frame.output = texture(gpu,MTLPixelFormatRGBA16Float,264,generation->outputUsage);
     frame.textures = {(void*)frame.color,(void*)frame.depth,(void*)frame.motion,(void*)frame.output};
@@ -176,7 +263,11 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     mean/=256*256; require(std::fabs(mean-.5)<.02,"offset-region-value");
     unsigned copies=0; uint64_t bytes=0;
     for (unsigned i=0; i<3; ++i) {
-        require(inputCopies[i].load() == unsigned(bool(mask & (1u << i))),"actual-native-input-copy-count");
+        // Public prepare pads readable RGBA16F/R32F/RG16F inputs by compute;
+        // depth formats keep the blit copy and edge-replication fallback.
+        const bool blitDepth = i == 1 && depthFormat != MTLPixelFormatR32Float;
+        require(inputCopies[i].load() == (prepared ? unsigned(blitDepth) : unsigned(bool(mask & (1u << i)))),
+                "actual-native-input-copy-count");
         copies+=inputCopies[i]; bytes+=inputBytes[i]; observedInputs[i]=nil;
     }
     std::printf("OWNED_METALFX_OPT_SR iteration=%u staging_mask=%u generation=%llu mean=%.9g outside_pixels=%u primary_input_copies=%u primary_input_copy_bytes=%llu public_prepare=%u\n",
@@ -185,6 +276,132 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     ScalerBindings clear(generation->scaler);
     for(auto c:commands) [c release]; [fence release]; [allocator release];
     return result;
+}
+// Byte-exact padding oracle: every scratch texel equals the source texel at the
+// clamped active position (compute copies and the blit fallback alike); the
+// generated linear color and combined mask replicate their own active edges.
+std::vector<uint8_t> readRaw(GPU& gpu, id<MTLTexture> texture, size_t bpp) {
+    const size_t row = texture.width * bpp, bytes = row * texture.height;
+    auto buffer = [gpu.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    auto command = [gpu.queue commandBuffer]; auto blit = [command blitCommandEncoder];
+    [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+        sourceSize:MTLSizeMake(texture.width,texture.height,1) toBuffer:buffer destinationOffset:0
+        destinationBytesPerRow:row destinationBytesPerImage:bytes];
+    [blit endEncoding]; gpu.finish(command);
+    std::vector<uint8_t> result(static_cast<const uint8_t*>(buffer.contents),
+                                static_cast<const uint8_t*>(buffer.contents) + bytes);
+    [buffer release]; return result;
+}
+id<MTLTexture> filled(GPU& gpu, MTLPixelFormat format, unsigned size, size_t bpp, unsigned seed,
+                      std::vector<uint8_t>& bytes) {
+    auto result = texture(gpu, format, size, MTLTextureUsageUnknown);
+    bytes.resize(size * size * bpp);
+    uint32_t state = seed * 2654435761u + 1;
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        state = state * 1664525u + 1013904223u; bytes[i] = uint8_t(state >> 24);
+    }
+    if (format == MTLPixelFormatRGBA16Float || format == MTLPixelFormatRG16Float)
+        for (size_t i = 0; i < bytes.size(); i += 2) { // finite halves in [-8, 8)
+            _Float16 value = _Float16(float(int(bytes[i] | (bytes[i + 1] << 8)) - 32768) / 4096.f);
+            std::memcpy(&bytes[i], &value, 2);
+        }
+    if (format == MTLPixelFormatR32Float)
+        for (size_t i = 0; i < bytes.size(); i += 4) {
+            uint32_t bits; std::memcpy(&bits, &bytes[i], 4);
+            float value = float(bits % 1000003u) / 1000003.f; std::memcpy(&bytes[i], &value, 4);
+        }
+    gpu.upload(result, bytes.data(), size * bpp);
+    return result;
+}
+unsigned paddingOracle(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
+                       const std::shared_ptr<ScalerGeneration>& generation, bool compute,
+                       ColorTransfer transfer, MTLPixelFormat colorFormat, metalfx::Rect active) {
+    PreparedFrame::Impl frame;
+    frame.feature = core; frame.generation = generation;
+    frame.operations.colorTransfer = transfer;
+    frame.operations.combineCompositionMask = transfer != ColorTransfer::Linear;
+    auto& p = frame.frame;
+    const unsigned cap = unsigned(generation->inputCapacityWidth);
+    p.inputContent = {active.width, active.height};
+    p.colorRect = {active.x, active.y, active.width, active.height};
+    p.depthRect = {std::min(active.y, cap - active.width), std::min(active.x, cap - active.height),
+                   active.width, active.height};
+    p.motionRect = {cap - active.width, cap - active.height, active.width, active.height};
+    p.reactiveRect = {(cap - active.width) / 2, (cap - active.height) / 2, active.width, active.height};
+    p.compositionRect = {cap - active.width, 0, active.width, active.height};
+    frame.scalerMotionRect = p.motionRect;
+    const size_t colorBpp = colorFormat == MTLPixelFormatRGBA16Float ? 8 : 4;
+    std::vector<uint8_t> colors, depths, motions, reactives, compositions;
+    frame.color = filled(gpu, colorFormat, cap, colorBpp, 1, colors);
+    frame.depth = filled(gpu, MTLPixelFormatR32Float, cap, 4, 2, depths);
+    frame.motion = filled(gpu, MTLPixelFormatRG16Float, cap, 4, 3, motions);
+    frame.reactive = filled(gpu, MTLPixelFormatR8Unorm, cap, 1, 4, reactives);
+    frame.composition = transfer != ColorTransfer::Linear
+        ? filled(gpu, MTLPixelFormatR8Unorm, cap, 1, 5, compositions) : nil;
+    frame.textures = {(void*)frame.color,(void*)frame.depth,(void*)frame.motion,nullptr,nullptr,
+                      (void*)frame.reactive,(void*)frame.composition};
+    frame.needsColorStaging = transfer == ColorTransfer::Linear;
+    frame.needsDepthStaging = frame.needsMotionStaging = true;
+    frame.needsReactiveStaging = transfer == ColorTransfer::Linear;
+    frame.computeCopyMask = compute ? (frame.needsColorStaging ? 1u : 0u) | 2u | 4u |
+                                      (frame.needsReactiveStaging ? 8u : 0u) : 0u;
+    Error error; auto lease = makeLease(frame, &error); require(bool(lease), error.message.c_str());
+    require(!lease->stagedDepth.allowGPUOptimizedContents &&
+            (!lease->stagedColor || !lease->stagedColor.allowGPUOptimizedContents) &&
+            (!lease->linearColor || !lease->linearColor.allowGPUOptimizedContents),
+            "padded-scratch-not-gpu-optimized");
+    auto allocator = [gpu.device newCommandAllocator]; auto fence = [gpu.device newFence];
+    auto command = [gpu.device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
+    [command useResidencySet:(id<MTLResidencySet>)lease->residency];
+    require(encodeInputCopiesMetal4(frame, *lease, command, fence) &&
+            encodeFsrPreMetal4(frame, *lease, command, fence) &&
+            encodeFsrInputPaddingMetal4(frame, *lease, command, fence), "oracle-encode");
+    [command endCommandBuffer]; gpu.commit({command});
+    unsigned checked = 0;
+    const auto expectCopy = [&](id<MTLTexture> staged, const std::vector<uint8_t>& source,
+                                size_t bpp, const metalfx::Rect& rect, const char* name) {
+        if (!staged) return;
+        auto actual = readRaw(gpu, staged, bpp);
+        for (unsigned y = 0; y < cap; ++y) for (unsigned x = 0; x < cap; ++x) {
+            const unsigned sx = rect.x + std::min(x, rect.width - 1), sy = rect.y + std::min(y, rect.height - 1);
+            if (std::memcmp(&actual[(y * cap + x) * bpp], &source[(sy * cap + sx) * bpp], bpp)) {
+                std::fprintf(stderr, "OWNED_METALFX_PAD_MISMATCH input=%s compute=%u x=%u y=%u\n", name, compute, x, y);
+                require(false, "copied-padding-exact");
+            }
+        }
+        ++checked;
+    };
+    expectCopy(lease->stagedColor, colors, colorBpp, p.colorRect, "color");
+    expectCopy(lease->stagedDepth, depths, 4, p.depthRect, "depth");
+    expectCopy(lease->stagedMotion, motions, 4, p.motionRect, "motion");
+    expectCopy(lease->stagedReactive, reactives, 1, p.reactiveRect, "reactive");
+    const auto expectSelfPadded = [&](id<MTLTexture> texture, size_t bpp, const char* name) {
+        if (!texture) return;
+        auto actual = readRaw(gpu, texture, bpp);
+        for (unsigned y = 0; y < cap; ++y) for (unsigned x = 0; x < cap; ++x) {
+            const unsigned sx = std::min(x, active.width - 1), sy = std::min(y, active.height - 1);
+            if (std::memcmp(&actual[(y * cap + x) * bpp], &actual[(sy * cap + sx) * bpp], bpp)) {
+                std::fprintf(stderr, "OWNED_METALFX_PAD_MISMATCH input=%s x=%u y=%u\n", name, x, y);
+                require(false, "generated-padding-exact");
+            }
+        }
+        ++checked;
+    };
+    expectSelfPadded(lease->linearColor, 8, "linear-color");
+    if (lease->combinedMask) {
+        auto actual = readRaw(gpu, lease->combinedMask, 1);
+        for (unsigned y = 0; y < cap; ++y) for (unsigned x = 0; x < cap; ++x) {
+            const unsigned ox = std::min(x, active.width - 1), oy = std::min(y, active.height - 1);
+            const uint8_t r = reactives[(p.reactiveRect.y + oy) * cap + p.reactiveRect.x + ox];
+            const uint8_t c = compositions[(p.compositionRect.y + oy) * cap + p.compositionRect.x + ox];
+            require(actual[y * cap + x] == std::max(r, c), "combined-mask-clamped-exact");
+        }
+        ++checked;
+    }
+    for (id<MTLTexture> t : {frame.color, frame.depth, frame.motion, frame.reactive, frame.composition}) [t release];
+    frame.color = frame.depth = frame.motion = frame.reactive = frame.composition = nil;
+    [command release]; [fence release]; [allocator release];
+    return checked;
 }
 std::vector<std::vector<float>> runFG(GPU& gpu, id<MTL4Compiler> compiler, bool staged) {
     auto descriptor=[MTLFXFrameInterpolatorDescriptor new];
@@ -251,6 +468,7 @@ int main() { @autoreleasepool {
     using namespace probe;
     GPU gpu;
     if (@available(macOS 27.0,*)) {} else require(false,"macos27-offset-contract");
+    pipelineBatchProof(gpu.device);
     auto core=std::make_shared<Feature::Impl>(); core->device=retainObject(gpu.device);
     auto d=[MTL4CompilerDescriptor new]; core->compiler=[gpu.device newCompilerWithDescriptor:d error:nil]; [d release];
     require(core->compiler!=nil,"metal4-compiler");
@@ -266,18 +484,40 @@ int main() { @autoreleasepool {
     Error error; const uint64_t start=ScalerGeneration::nextId.load();
     auto a=ensureScaler(*core,p,textures,{},&error); require(bool(a),error.message.c_str()); const uint64_t activation=a->activation;
     p.outputRect={0,0,192,192}; auto b=ensureScaler(*core,p,textures,{},&error); require(bool(b),error.message.c_str());
-    p.outputRect={0,0,128,128}; auto c=ensureScaler(*core,p,textures,{},&error); require(bool(c),error.message.c_str());
     p.outputRect={0,0,256,256}; auto again=ensureScaler(*core,p,textures,{},&error);
-    require(again==a && a!=b && a!=c && b!=c && a->activation==activation+1,"A-B-C-A-reuse-and-activation");
-    require(ScalerGeneration::nextId.load()-start==3,"three-real-generation-creations");
+    require(again==a && a!=b && a->activation==activation+1,"A-B-A-reuse-and-activation");
+    again=ensureScaler(*core,p,textures,{},&error);
+    require(again==a && a->activation==activation+1,"unchanged-selection-keeps-activation");
+    p.outputRect={0,0,128,128}; auto c=ensureScaler(*core,p,textures,{},&error); require(bool(c),error.message.c_str());
+    require(c!=a && c!=b && ScalerGeneration::nextId.load()-start==3,"three-real-generation-creations");
+    // Dynamic output keeps only the new and the previously current output extents.
     for(unsigned variant=0;variant<9;++variant) {
         p.outputRect={0,0,129+variant*7,129+variant*7};
         require(bool(ensureScaler(*core,p,textures,{},&error)),error.message.c_str());
     }
     unsigned retained=0; bool aCached=false;
     for(const auto& entry:core->generations) { retained+=bool(entry); aCached|=entry==a; }
-    require(retained==8 && !aCached && a->scaler!=nil,"bounded-cache-retains-evicted-generation-lease");
+    require(retained==2 && !aCached && a->scaler!=nil,"two-output-eviction-retains-evicted-generation-lease");
     require(ScalerGeneration::nextId.load()-start==12,"nine-additional-native-creations");
+    {
+        // Exact-extent preference: a fitting high-water generation yields to a
+        // cached exact one; the activation bumps only when the selection changes.
+        auto exact=std::make_shared<Feature::Impl>(); exact->device=retainObject(gpu.device);
+        exact->compiler=retainObject(core->compiler); exact->create=core->create;
+        exact->minScale=core->minScale; exact->maxScale=core->maxScale;
+        FrameInfo q{}; q.outputRect={0,0,256,256};
+        q.inputContent={112,112}; auto small=ensureScaler(*exact,q,textures,{},&error); require(bool(small),error.message.c_str());
+        q.inputContent={128,128}; auto large=ensureScaler(*exact,q,textures,{},&error); require(bool(large),error.message.c_str());
+        require(large!=small && large->inputCapacityWidth==128,"high-water-growth");
+        const uint64_t smallActivation=small->activation, largeActivation=large->activation;
+        q.inputContent={112,112}; auto back=ensureScaler(*exact,q,textures,{},&error);
+        require(back==small && small->activation==smallActivation+1,"prefers-cached-exact-generation");
+        back=ensureScaler(*exact,q,textures,{},&error);
+        require(back==small && small->activation==smallActivation+1,"exact-reselection-keeps-activation");
+        q.inputContent={120,120}; back=ensureScaler(*exact,q,textures,{},&error);
+        require(back==large && large->activation==largeActivation+1,"fitting-high-water-fallback");
+        std::printf("OWNED_METALFX_OPT_EXACT_EXTENT exact_preferred=1 fallback_high_water=1 activation_on_change_only=1\n");
+    }
     auto publicFeature=Feature::create({(void*)gpu.device,(void*)core->compiler},core->create,&error);
     require(bool(publicFeature),error.message.c_str());
     p.inputContent={128,128}; p.colorRect=p.depthRect=p.motionRect={0,0,128,128};
@@ -291,8 +531,37 @@ int main() { @autoreleasepool {
     auto repeatCold=runSR(gpu,core,a,6,4,publicFeature), repeatWarm=runSR(gpu,core,a,6,5,publicFeature);
     parity &= compare(repeatCold,staged,"repeat-offset-cold");
     parity &= compare(repeatWarm,stagedWarm,"repeat-offset-history");
+    auto depthBlit=runSR(gpu,core,a,6,6,publicFeature,MTLPixelFormatDepth32Float);
+    parity &= compare(depthBlit,staged,"depth32-blit-fallback-cold");
     require(parity,"direct-staged-numeric-parity");
-    std::printf("OWNED_METALFX_OPT_CACHE sequence=A,B,C,A creations=3 reused=1 activation_reset=1 capacity=8\n");
+    {
+        FsrPipelineNeeds needs; needs.linearize = needs.combineMasks = needs.padding = true;
+        require(ensureFsrPipelines(*core,needs,&error) &&
+                ensureFsrPipeline(*core,true,core->copyHalfPipeline,@"yaagl_sr_copy_pad_half") &&
+                ensureFsrPipeline(*core,true,core->copyFloatPipeline,@"yaagl_sr_copy_pad_float"),
+                "oracle-pipelines");
+        unsigned checked = 0;
+        for (metalfx::Rect active : {metalfx::Rect{3,5,96,72}, metalfx::Rect{0,0,127,1}, metalfx::Rect{1,0,1,128}, metalfx::Rect{2,2,120,120}})
+            for (bool compute : {false, true}) {
+                checked += paddingOracle(gpu,core,a,compute,ColorTransfer::Linear,MTLPixelFormatRGBA16Float,active);
+                checked += paddingOracle(gpu,core,a,compute,ColorTransfer::Linear,MTLPixelFormatRGBA8Unorm,active);
+                checked += paddingOracle(gpu,core,a,compute,ColorTransfer::SRGB,MTLPixelFormatRGBA8Unorm,active);
+            }
+        std::printf("OWNED_METALFX_OPT_PADDING_ORACLE textures=%u exact=1\n",checked);
+    }
+    {
+        // Dormant drops cache ownership; a frame's own generation still executes.
+        std::weak_ptr<ScalerGeneration> cached;
+        for(const auto& entry:core->generations) if(entry && entry!=a) cached=entry;
+        require(!cached.expired(),"cached-generation-before-dormant");
+        core->markDormant();
+        unsigned live=0; for(const auto& entry:core->generations) live+=bool(entry);
+        require(live==0 && !core->currentGeneration && cached.expired(),"dormant-releases-cached-generations");
+        auto afterDormant=runSR(gpu,core,a,7,8);
+        require(compare(afterDormant,staged,"dormant-retained-generation-executes"),"dormant-retained-generation-output");
+        std::printf("OWNED_METALFX_OPT_DORMANT cached_released=1 retained_generation_executed=1\n");
+    }
+    std::printf("OWNED_METALFX_OPT_CACHE sequence=A,B,A,C creations=3 reused=1 activation_reset=1\n");
     std::printf("OWNED_METALFX_OPT_EVICTION retained=%u additional_creations=9 evicted_generation_executed=1\n",retained);
     auto fgDirect=runFG(gpu,(id<MTL4Compiler>)core->compiler,false);
     auto fgStaged=runFG(gpu,(id<MTL4Compiler>)core->compiler,true);

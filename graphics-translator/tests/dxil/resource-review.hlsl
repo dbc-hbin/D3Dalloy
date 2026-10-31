@@ -4,6 +4,8 @@ RWByteAddressBuffer Output : register(u0);
 cbuffer Indices : register(b0) { uint4 indices; };
 #ifdef REVIEW64
 StructuredBuffer<uint64_t> Input64 : register(t0);
+StructuredBuffer<uint64_t2> Wide64 : register(t1);
+ByteAddressBuffer RawInput64 : register(t2);
 RWStructuredBuffer<uint64_t> Mutable64 : register(u1);
 [numthreads(1, 1, 1)]
 void cs_bounds64() {
@@ -18,6 +20,11 @@ void cs_bounds64() {
     Output.Store<uint64_t>(lane * 32 + 16, old);
     Output.Store<uint64_t>(lane * 32 + 24, Mutable64[index]);
   }
+  Output.Store<uint64_t2>(128, Wide64[indices.x]);
+  // The raw view ends halfway through the second 64 bit lane.
+  Output.Store<uint64_t2>(144, RawInput64.Load<uint64_t2>(indices.x));
+  Output.Store<uint64_t2>(160, RawInput64.Load<uint64_t2>(indices.w - 3));
+  Output.Store<uint64_t2>(176, RawInput64.Load<uint64_t4>(indices.x).xz);
 }
 #else
 StructuredBuffer<uint> Input : register(t0);
@@ -48,6 +55,15 @@ void cs_bounds() {
   RawMutable.Store4(indices.w - 3, uint4(91, 92, 93, 94));
   // Stride and member/lane offsets both contribute to the widened address.
   Output.Store4(80, Wide[indices.z >> 2]);
+  // Fully in-range and partial vector loads, including sparse read masks.
+  Output.Store4(96, RawInput.Load4(indices.x));
+  Output.Store4(112, Wide[indices.x]);
+#ifdef REVIEW16
+  Output.Store<uint16_t4>(128, RawInput.Load<uint16_t4>(indices.x));
+  Output.Store<uint16_t2>(136, RawInput.Load<uint16_t2>(indices.x));
+#endif
+  Output.Store2(144, RawInput.Load4(indices.x).xz);
+  Output.Store2(152, Wide[indices.x].yw);
 }
 [numthreads(1, 1, 1)]
 void cs_gradients() {

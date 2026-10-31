@@ -94,7 +94,7 @@ define void @main(i32 %index) {
 !7 = !{i32 2, %Object* undef, !"named", i32 3, i32 0, i32 1, i32 11, i32 0, null}
 !8 = !{i32 1, i8* bitcast (%Object* @counter to i8*), !"counter", i32 1, i32 0, i32 1, i32 12, i1 false, i1 true, i1 false, !10}
 !9 = !{i32 2, %Object* getelementptr ([2 x %Object], [2 x %Object]* @array, i32 0, i32 1), !"array", i32 2, i32 0, i32 2, i32 11, i1 false, i1 false, i1 false, null}
-!10 = !{i32 1, i32 4}
+!10 = !{i32 99, i32 0, i32 1, i32 4}
 )", diagnostic, context);
   if (!module) { diagnostic.print("library-usage", errs()); return false; }
   if (verifyModule(*module, &errs())) return false;
@@ -121,9 +121,23 @@ define void @main(i32 %index) {
   const auto &counter = shader.uavMap.at(1);
   const auto &array = shader.uavMap.at(2);
   okay &= counter.read && counter.written && counter.with_counter && counter.global_coherent &&
+      counter.structure_stride == 4 &&
       counter.rasterizer_order && array.written && !array.read && !array.with_counter &&
       shader.srvMap.at(0).read && !shader.srvMap.at(1).read && shader.srvMap.at(2).read;
   std::printf("LIBRARY_ORIGINS_%s resources=%zu\n", okay ? "PASS" : "FAIL", (*parsed)->resources.size());
+  auto *resource = module->getNamedMetadata("dx.resources")->getOperand(0)->getOperand(0).get();
+  auto *declaration = cast<MDNode>(cast<MDNode>(resource)->getOperand(0));
+  declaration->replaceOperandWith(3, MDString::get(context, "invalid space"));
+  bitcode.clear();
+  WriteBitcodeToFile(*module, stream);
+  bytes.resize(44 + bitcode.size());
+  uint32_t total = bytes.size(), payload = bitcode.size();
+  std::memcpy(bytes.data() + 24, &total, sizeof(total));
+  std::memcpy(bytes.data() + 40, &payload, sizeof(payload));
+  std::memcpy(bytes.data() + 44, bitcode.data(), bitcode.size());
+  auto malformed = dxmt::dxil::ModuleInfo::Parse(bytes.data(), bytes.size());
+  if (malformed) return false;
+  consumeError(malformed.takeError());
   return okay;
 }
 

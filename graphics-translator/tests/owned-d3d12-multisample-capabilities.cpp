@@ -310,11 +310,20 @@ struct Fixture {
     csUintResolved = compile(shaders, "readUintResolved", "cs_5_0");
     csDepthResolved = compile(shaders, "readDepthResolved", "cs_5_0");
   }
+  // One WriteFile per marker: unbuffered fprintf splits a line into several
+  // writes, and concurrent runtime trace lines would land inside it.
+  void mark(const char *phase, unsigned long long id, const char *label) {
+    char line[256];
+    const int length = std::snprintf(line, sizeof(line), "%s_SUBMISSION_%s id=%llu label=%s\n", marker, phase, id, label);
+    require(length > 0 && length < int(sizeof(line)), "submission marker length");
+    DWORD written = 0;
+    require(WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, DWORD(length), &written, nullptr) && written == DWORD(length),
+            "submission marker write");
+  }
   void submit(ID3D12GraphicsCommandList *list, const char *label = "existing", bool closed = false) {
     if (!closed) check(list->Close(), "close");
-    std::fprintf(stderr, "%s_SUBMISSION_BEGIN id=%llu label=%s\n", marker,
-                 static_cast<unsigned long long>(fenceValue + 1), label);
     std::fflush(stderr);
+    mark("BEGIN", fenceValue + 1, label);
     ID3D12CommandList *lists[]{list};
     queue->ExecuteCommandLists(1, lists);
     check(queue->Signal(fence.Get(), ++fenceValue), "signal");
@@ -323,9 +332,7 @@ struct Fixture {
       require(WaitForSingleObject(event, 15000) == WAIT_OBJECT_0, "GPU timeout");
     }
     check(device->GetDeviceRemovedReason(), "GPU removed");
-    std::fprintf(stderr, "%s_SUBMISSION_END id=%llu label=%s\n", marker,
-                 static_cast<unsigned long long>(fenceValue), label);
-    std::fflush(stderr);
+    mark("END", fenceValue, label);
   }
 };
 
@@ -659,8 +666,13 @@ int main(int argc, char **argv) {
     nativeBindingBudgetCase(f);
     return 0;
   }
+  if(argc==2 && std::strcmp(argv[1],"--native-sample-frequency")==0) {
+    nativeSampleFrequencyCases(f);
+    return 0;
+  }
   require(argc==1,"fixture arguments");
   nativeOrdinaryCases(f);
+  nativeSampleFrequencyCases(f);
   nativeResourceCases(f,false);
   nativeResourceCases(f,true);
   nativeBindingBudgetCase(f);

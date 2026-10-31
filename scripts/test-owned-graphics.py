@@ -33,6 +33,7 @@ SUITE_PREFIXES = {
     "fsr": "OWNED_D3D12_FSR",
     "fsr-debug": "OWNED_D3D12_FSR_DEBUG",
     "fsr-fg": "OWNED_D3D12_FSR_FG",
+    "fsr-rr": "OWNED_D3D12_FSR_RR",
     "nvapi-reflex": "OWNED_NVAPI_REFLEX",
     "queue-priority": "OWNED_QUEUE_PRIORITY",
     "corewindow-composition": "OWNED_D3D12_COREWINDOW_COMPOSITION",
@@ -107,6 +108,9 @@ SUITE_PREFIXES = {
     "enhanced-barriers": "OWNED_D3D12_ENHANCED_BARRIERS",
     # BARRIERS: render passes (tier 0), GPU upload heaps, CreateSampler2 UINT borders.
     "render-passes": "OWNED_D3D12_RENDER_PASSES",
+    # ASYNC: d3d12.asyncPipelineCompile pending-draw omission/fallbacks; -hold disables workers.
+    "async-pipeline": "OWNED_D3D12_ASYNC_PIPELINE",
+    "async-pipeline-hold": "OWNED_D3D12_ASYNC_PIPELINE",
     # TILED: reserved resources at TiledResourcesTier 2.
     "tiled": "OWNED_D3D12_TILED",
     # GSTS: GS and HS/DS pipelines (DXBC + DXIL).
@@ -247,7 +251,7 @@ WRITABLE_MSAA_ENTRIES = tuple(
 ) + ("vs_msaa", "ps_msaa") + tuple(
     f"{entry}{scalar}" for scalar in ("sint", "float")
     for entry in ("cs_msaa_store", "cs_msaa_read", "cs_msaa_srv", "ps_msaa")
-) + ("cs_msaa_storeraw16", "cs_msaa_readraw16")
+) + ("cs_msaa_storeraw16", "cs_msaa_readraw16", "cs_msaa_unused")
 WRITABLE_MSAA_CASES = tuple(
     case for samples in (2, 4, 8) for array in (False, True)
     for case in (("same_dispatch", "next_dispatch_dimensions", "SRV_after_transition", "direct_heap",
@@ -258,6 +262,7 @@ WRITABLE_MSAA_CASES = tuple(
           for case in ("same_dispatch", "next_dispatch_dimensions", "SRV_after_transition",
                        "native_copy", "native_raster", "native_resolve_min_max", "UAV_clear")) + (
     "typeless16_same_dispatch", "typeless16_next_dispatch", "typeless16_native_copy_float_srv",
+    "partial_array_helper_other_slice_clear", "unused_descriptor_helper_order",
 )
 SM6_ENTRIES = (
     "cs_wave4", "cs_wave8", "cs_wave16", "cs_divergent4", "cs_divergent8", "cs_divergent16",
@@ -1540,6 +1545,11 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
                 if set(metadata) != {"table_new", "table_set", "table_bind", "residency_new", "residency_add", "residency_remove", "residency_commit"} or len(words) != 8 or any(not re.fullmatch("[0-9]+", value) for value in metadata.values()):
                     failures.append("malformed native binding metadata: " + line)
                 continue
+            if kind == "RESIDENCY":
+                # Residency-set release counter, not an encoded GPU command.
+                if len(words) != 2 or not re.fullmatch("live_allocations=[0-9]+", words[1]):
+                    failures.append("malformed native residency metadata: " + line)
+                continue
             try:
                 values = dict(word.split("=", 1) for word in words[1:])
                 if kind not in schemas or set(values) != schemas[kind] or len(values) != len(words) - 1:
@@ -1733,8 +1743,17 @@ def native_msaa_failures(stdout: str, stderr: str) -> list[str]:
                 edge = ((1 << count) - 1 if quality == 0xfffffffe else {2: 2, 4: 5, 8: 58}[count]) & mask
                 expected.append(f"{prefix}_NATIVE_ORDINARY_PASS count={count} quality={quality} mask={mask:08x} edge={edge} pixels=16 channels=4 depth=1")
                 labels.append((f"native_ordinary_count{count}_quality{quality}_mask{mask:08x}", count, quality, False))
-            expected.append(f"{prefix}_NATIVE_FALLBACK_TRANSITIONS_PASS count={count} quality={quality} draws=4 native_candidates=2 fallback=2 indexed=1 index_pull=1")
+            expected.append(f"{prefix}_NATIVE_FALLBACK_TRANSITIONS_PASS count={count} quality={quality} draws=4 native_candidates={2 if quality == 0xfffffffe else 3} fallback={2 if quality == 0xfffffffe else 1} indexed=1 index_pull=1")
             labels.append((f"native_fallback_transitions_count{count}_quality{quality}", count, quality, True))
+    for count in (2, 4, 8):
+        for quality in (0, 0xffffffff):
+            for mask in (0xffffffff, 0x55555555, 0):
+                samples = 4 * bin(mask & ((1 << count) - 1)).count("1")
+                for replay in range(2):
+                    expected.append(f"{prefix}_NATIVE_SAMPLE_FREQUENCY_PASS count={count} quality={quality} mask={mask:08x} replay={replay} draws=3 explicit=2 interpolated=1 indexed=1 index_pull=1 pixels=12 channels=4 depth=1 route=native_static")
+                    labels.append((f"native_sample_frequency_count{count}_quality{quality}_mask{mask:08x}_replay{replay}", count, quality, False))
+                    expected.append(f"{prefix}_CAPTURED_SAMPLE_FREQUENCY_QUERY_PASS count={count} quality={quality} mask={mask:08x} replay={replay} draws=1 pixels=4 channels=4 depth=1 query_samples={samples} route=captured_query")
+                    labels.append((f"captured_sample_frequency_query_count{count}_quality{quality}_mask{mask:08x}_replay{replay}", count, quality, False))
     for static in (False, True):
         marker_kind, label_kind = ("STATIC_", "static_") if static else ("", "")
         route = "native_static" if static else "captured_volatile"
@@ -1752,16 +1771,17 @@ def native_msaa_failures(stdout: str, stderr: str) -> list[str]:
     events, failures = phase3_trace("\n".join(lines), 100000)
     if failures:
         return failures
-    if [line for line in stdout.splitlines() if line.startswith((prefix + "_NATIVE_ORDINARY_PASS", prefix + "_NATIVE_FALLBACK_TRANSITIONS_PASS", prefix + "_NATIVE_RESOURCE_INPUTS_PASS", prefix + "_NATIVE_RESOURCE_TRANSITIONS_PASS", prefix + "_NATIVE_STATIC_RESOURCE_INPUTS_PASS", prefix + "_NATIVE_STATIC_RESOURCE_TRANSITIONS_PASS"))] != expected:
-        failures.append("MSAA exact108 native/volatile/static sample-mask-pattern-depth groups differ")
+    if [line for line in stdout.splitlines() if line.startswith((prefix + "_NATIVE_ORDINARY_PASS", prefix + "_NATIVE_FALLBACK_TRANSITIONS_PASS", prefix + "_NATIVE_SAMPLE_FREQUENCY_PASS", prefix + "_CAPTURED_SAMPLE_FREQUENCY_QUERY_PASS", prefix + "_NATIVE_RESOURCE_INPUTS_PASS", prefix + "_NATIVE_RESOURCE_TRANSITIONS_PASS", prefix + "_NATIVE_STATIC_RESOURCE_INPUTS_PASS", prefix + "_NATIVE_STATIC_RESOURCE_TRANSITIONS_PASS"))] != expected:
+        failures.append("MSAA exact180 native/volatile/static/sample-frequency/query sample-mask-pattern-depth groups differ")
     brackets = [(i, m[1], int(m[2]), m[3]) for i, line in enumerate(lines) if (m := re.fullmatch(prefix + r"_SUBMISSION_(BEGIN|END) id=([0-9]+) label=([^ ]+)", line))]
     owned_labels = {label for label, _, _, _ in labels}
     sibling_labels = {"native_binding_budget_" + label for label in ("first", "color_observe", "depth_observe", "replay")} | {"native_resource_upload", "native_static_resource_upload"}
-    if any(b[3].startswith("native_") and b[3] not in owned_labels | sibling_labels for b in brackets):
+    if any(b[3].startswith(("native_", "captured_sample_frequency_")) and b[3] not in owned_labels | sibling_labels for b in brackets):
         return failures + ["MSAA native submission family label unknown"]
-    selected = [(a, b) for a, b in zip(brackets[::2], brackets[1::2]) if a[3].startswith(("native_ordinary_", "native_fallback_transitions_", "native_resource_inputs_", "native_resource_transitions_", "native_static_resource_inputs_", "native_static_resource_transitions_"))]
+    selected = [(a, b) for a, b in zip(brackets[::2], brackets[1::2]) if a[3].startswith(("native_ordinary_", "native_fallback_transitions_", "native_sample_frequency_", "captured_sample_frequency_", "native_resource_inputs_", "native_resource_transitions_", "native_static_resource_inputs_", "native_static_resource_transitions_"))]
     if [a[3] for a, _ in selected] != [label for label, _, _, _ in labels]:
         return failures + ["MSAA native submission case order differs"]
+    replay_identities = {}
     for (start, end), (label, count, quality, transition) in zip(selected, labels):
         try:
             part = [json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1]) for line in lines[start[0] + 1:end[0]] if "OWNED_GRAPHICS_TRACE " in line]
@@ -1772,6 +1792,40 @@ def native_msaa_failures(stdout: str, stderr: str) -> list[str]:
         draws = [e for e in events if e["event"] == "native_msaa_draw_record" and e.get("encoder") in encoder_ids]
         bindings = [e for e in events if e["event"] == "native_msaa_record" and e.get("encoder") in encoder_ids]
         waits = [e for e in part if e["event"] == "msaa_producer_wait"]
+        sample_frequency = label.startswith("native_sample_frequency_")
+        query = label.startswith("captured_sample_frequency_query_")
+        if sample_frequency or query:
+            executes = [(e.get("list"), e.get("recording")) for e in part if e["event"] == "execute_list"]
+            if len(executes) != 1 or any(type(value) is not int or value <= 0 for key in executes for value in key):
+                failures.append("sample-frequency closed-list execution identity missing: " + label)
+            if sample_frequency:
+                wanted_draws = [(0, 0, 3, 1), (1, 0, 3, 1), (1, 1, 3, 1)]
+                if len(begins) != 3 or len(set(encoder_ids)) != 3 or any(type(value) is not int or value <= 0 for value in encoder_ids) or [e.get("encoder") for e in part if e["event"] == "native_render_begin"] != encoder_ids or [e.get("encoder") for e in part if e["event"] == "native_render_end"] != encoder_ids:
+                    failures.append("sample-frequency actual three native begin/end pairs differ: " + label)
+                if [(e.get("indexed"), e.get("index_pull"), e.get("count"), e.get("instances")) for e in draws] != wanted_draws or [e.get("encoder") for e in draws] != encoder_ids:
+                    failures.append("sample-frequency actual direct/indexed/index-pull draws differ: " + label)
+                if [e.get("encoder") for e in bindings] != encoder_ids or [e.get("index_pull") for e in bindings] != [0, 0, 1] or any((e.get("sample_count"), e.get("center")) != (count, 0) or not e.get("pso") for e in bindings) or any((e.get("list"), e.get("recording")) not in executes for e in bindings + draws):
+                    failures.append("sample-frequency native recording attribution differs: " + label)
+                if waits or any(e["event"] == "native_compute_encode" for e in part):
+                    failures.append("sample-frequency native execution encoded captured producer work: " + label)
+                retained_encoders = tuple(encoder_ids)
+            else:
+                if any(e["event"] in ("native_render_begin", "native_render_end") for e in part):
+                    failures.append("sample-frequency active query incorrectly selected native MSAA: " + label)
+                if len(waits) != 1 or any(e.get("wait_count") != 1 or not e.get("queue") or not e.get("encoder") or not any(c["event"] == "complete" and c.get("queue") == e.get("queue") and c.get("submission") == e.get("producer") and c.get("status") == 4 for c in part) for e in waits):
+                    failures.append("sample-frequency query capture producer/wait/completion differs: " + label)
+                retained_encoders = tuple(e.get("encoder") for e in waits)
+            replay_label, replay = label.rsplit("_replay", 1)
+            identity = (tuple(executes), retained_encoders)
+            if replay == "0":
+                replay_identities[replay_label] = identity
+            elif replay_identities.get(replay_label) != identity:
+                failures.append("sample-frequency closed-list replay changed recorded identities: " + label)
+            submitted = [(e.get("queue"), e.get("submission")) for e in part if e["event"] == "submit"]
+            completed = [(e.get("queue"), e.get("submission")) for e in part if e["event"] == "complete" and e.get("status") == 4]
+            if not submitted or Counter(submitted) != Counter(completed):
+                failures.append("sample-frequency fenced execution retirement missing: " + label)
+            continue
         volatile = label.startswith("native_resource_")
         resource = volatile or label.startswith("native_static_resource_")
         if volatile:
@@ -1780,19 +1834,21 @@ def native_msaa_failures(stdout: str, stderr: str) -> list[str]:
             if len(waits) != (4 if transition else 1) or any(e.get("wait_count") != 1 or not e.get("queue") or not e.get("encoder") or not any(c["event"] == "complete" and c.get("queue") == e.get("queue") and c.get("submission") == e.get("producer") and c.get("status") == 4 for c in part) for e in waits):
                 failures.append("volatile MSAA actual capture producer/wait/completion differs: " + label)
             continue
-        if len(begins) != (3 if transition and resource else 2 if transition else 1) or len(draws) != (3 if transition and resource else 2 if transition else 1) or len(bindings) != len(begins) or any(e.get("sample_count") != count or e.get("center") != int(quality == 0xfffffffe) or not e.get("pso") for e in bindings):
+        frequency_transition = transition and not resource and quality != 0xfffffffe
+        native_count = 3 if transition and (resource or frequency_transition) else 2 if transition else 1
+        if len(begins) != native_count or len(draws) != native_count or len(bindings) != len(begins) or any(e.get("sample_count") != count or e.get("center") != int(quality == 0xfffffffe) or not e.get("pso") for e in bindings):
             failures.append("MSAA actual native encoder/binding/draw attribution differs: " + label)
-        expected_draws = [(0, 0, 3, 1)] * 3 if transition and resource else [(1, 0, 3, 1), (1, 1, 3, 1)] if transition else [(0, 0, 6, 1)]
+        expected_draws = [(0, 0, 3, 1)] * 3 if transition and resource else [(1, 0, 3, 1), (0, 0, 3, 1), (1, 1, 3, 1)] if frequency_transition else [(1, 0, 3, 1), (1, 1, 3, 1)] if transition else [(0, 0, 6, 1)]
         if [(e.get("indexed"), e.get("index_pull"), e.get("count"), e.get("instances")) for e in draws] != expected_draws:
             failures.append("MSAA actual native indexed/index-pull ordering differs: " + label)
         if [e.get("encoder") for e in part if e["event"] == "native_render_end" and e.get("encoder") in encoder_ids] != encoder_ids:
             failures.append("MSAA native encoder completion attribution differs: " + label)
-        if len(waits) != (1 if transition and resource else 2 if transition else 0) or any(e.get("encoder") in encoder_ids or e.get("wait_count") != 1 or not any(c["event"] == "complete" and c.get("queue") == e.get("queue") and c.get("submission") == e.get("producer") and c.get("status") == 4 for c in part) for e in waits):
+        if len(waits) != (4 - native_count if transition else 0) or any(e.get("encoder") in encoder_ids or e.get("wait_count") != 1 or not any(c["event"] == "complete" and c.get("queue") == e.get("queue") and c.get("submission") == e.get("producer") and c.get("status") == 4 for c in part) for e in waits):
             failures.append("MSAA captured producer retirement work differs: " + label)
         if not transition and any(e["event"] == "native_compute_encode" for e in part):
             failures.append("ordinary native MSAA encoded captured producer work: " + label)
         route_order = ["native" if e in begins else "fallback" for e in part if e in begins or e in waits]
-        wanted_routes = ["native", "fallback", "native", "native"] if transition and resource else ["native", "fallback", "native", "fallback"] if transition else ["native"]
+        wanted_routes = ["native", "fallback", "native", "native"] if transition and resource else ["native", "native", "native", "fallback"] if frequency_transition else ["native", "fallback", "native", "fallback"] if transition else ["native"]
         if route_order != wanted_routes:
             failures.append("MSAA actual native/fallback producer order differs: " + label)
     return failures
@@ -2022,7 +2078,7 @@ def query_ordering_failures(stdout: str) -> list[str]:
 
 def dxil_resource_review_failures(stdout: str) -> list[str]:
     failures = []
-    checks = (("bounds", 26), ("gradients", 6), ("array-atomics", 24), ("bounds64", 17))
+    checks = (("bounds", 44), ("gradients", 6), ("array-atomics", 24), ("bounds64", 25))
     cases = re.findall(r"^OWNED_D3D12_DXIL_RESOURCE_REVIEW_CASE_PASS case=([\w-]+) checks=(\d+)$",
                        stdout, re.MULTILINE)
     if cases != [(name, str(count)) for name, count in checks]:
@@ -2200,15 +2256,16 @@ def pipeline_cache_failures(stdout: str, stderr: str, logs: dict[str, str]) -> l
 
 def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
     """Count real compiler/library operations between same-stream, joined phase markers."""
-    expected = ({"distinct_compute": (1, 1, 1, 0), "concurrent_distinct_compute": (1, 0, 1, 0)}
-                if suite == "pipeline-cache" else {"concurrent_graphics": (2, 2, 2, 0),
-                "root_abi": (2, 0, 2, 0), "pixel_specialization": (1, 1, 1, 1),
-                "constant_concurrent": (0, 0, 0, 1), "constant_distinct": (0, 0, 0, 1),
-                "constant_hit": (0, 0, 0, 0), "constant_root_abi": (1, 0, 1, 1),
-                "constant_entry": (1, 1, 1, 1), "linked_geometry_cold": (2, 2, 2, 0),
-                "linked_geometry_hit": (0, 0, 0, 0), "linked_geometry_input": (2, 0, 2, 0),
-                "captured_layout_cold": (6, 6, 6, 0), "captured_layout_hit": (0, 0, 0, 0),
-                "clear_rebuild": (2, 2, 2, 0)})
+    expected = ({"distinct_compute": (1, 1, 1, 0, 1, 1),
+                 "concurrent_distinct_compute": (1, 0, 1, 0, 1, 1)}
+                if suite == "pipeline-cache" else {"concurrent_graphics": (2, 2, 2, 0, 1, 2),
+                "root_abi": (2, 0, 2, 0, 1, 2), "pixel_specialization": (1, 1, 1, 1, 1, 0),
+                "constant_concurrent": (0, 0, 0, 1, 1, 0), "constant_distinct": (0, 0, 0, 1, 1, 0),
+                "constant_hit": (0, 0, 0, 0, 0, 0), "constant_root_abi": (1, 0, 1, 1, 1, 0),
+                "constant_entry": (1, 1, 1, 1, 1, 0), "linked_geometry_cold": (2, 2, 2, 0, 1, 2),
+                "linked_geometry_hit": (0, 0, 0, 0, 0, 0), "linked_geometry_input": (2, 0, 2, 0, 1, 1),
+                "captured_layout_cold": (6, 6, 6, 0, 6, 11), "captured_layout_hit": (0, 0, 0, 0, 0, 0),
+                "clear_rebuild": (2, 2, 2, 0, 1, 2)})
     prefix = SUITE_PREFIXES[suite] + "_ARTIFACT_PHASE "
     failures, completed = [], []
     active, counts = None, {}
@@ -2220,16 +2277,20 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
             kind, _, name = phase.partition("=")
             if kind == "begin" and active is None and name in expected and name not in completed:
                 active, counts = name, {"shader_initialize": 0, "air_compile": 0,
-                                        "new_library": 0, "specialize_function": 0}
+                                        "new_library": 0, "specialize_function": 0,
+                                        "new_function": 0, "native_compute": 0,
+                                        "native_render": 0, "native_mesh": 0}
             elif kind == "end" and name == active:
-                air, low, high, specializations = expected[name]
+                air, low, high, specializations, native, functions = expected[name]
+                native_operations = sum(counts[k] for k in ("native_compute", "native_render", "native_mesh"))
                 if (counts["air_compile"] != air or not low <= counts["new_library"] <= high
                         or counts["specialize_function"] != specializations
+                        or native_operations != native or counts["new_function"] != functions
                         or (air == 0 and counts["shader_initialize"] != 0)
                         or (name == "captured_layout_cold" and counts["shader_initialize"] != 6)):
                     failures.append(f"artifact {name}: actual operations {counts}, expected AIR={air}, "
                                     f"libraries={low}..{high}, specializations={specializations}, "
-                                    f"warm reflection reuse={air == 0}")
+                                    f"native={native}, functions={functions}, warm reflection reuse={air == 0}")
                 completed.append(name)
                 active = None
             else:
@@ -2266,6 +2327,23 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
     return failures
 
 
+def depth_srv_dispatch_ordered(stderr: str) -> bool:
+    """The depth-clear -> SRV dispatch must wait or barrier; a 4x4 race rarely shows in pixels."""
+    events, active = [], False
+    for line in stderr.splitlines():
+        if line == "OWNED_D3D12_RENDER_PASSES_DEPTH_SRV_PHASE begin":
+            active = True
+        elif line == "OWNED_D3D12_RENDER_PASSES_DEPTH_SRV_PHASE end":
+            break
+        elif active and "OWNED_GRAPHICS_TRACE " in line:
+            try:
+                events.append(json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1]).get("event"))
+            except ValueError:
+                return False
+    return events.count("native_compute_begin") == 1 and (
+        "native_compute_wait" in events or "native_compute_queue_barrier" in events)
+
+
 def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
     """Require the fixture oracle and actual native calls inside retired Execute intervals."""
     # phase: replays, ordered begin members, mapped members, identity calls, blits,
@@ -2286,7 +2364,7 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
             "graph-access-0": (2, (2,), 2, 0, 1, 0, 0, 0, 0, 0),
             "graph-access-1": (2, (2,), 2, 0, 1, 0, 0, 0, 0, 0),
             "graph-access-2": (2, (2,), 2, 0, 0, 1, 0, 0, 0, 0),
-            "graph-access-3": (2, (1, 1), 0, 0, 1, 0, 0, 0, 0, 0),
+            "graph-access-3": (2, (2,), 2, 0, 1, 0, 0, 0, 0, 0),
             "graph-frontier-256": (2, (), 0, 0, 256, 0, 0, 0, 0, 0),
             "graph-frontier-512": (2, (), 0, 0, 512, 0, 0, 0, 0, 0),
             "graph-frontier-boundary-0": (2, (2, 2), 4, 0, 61, 0, 0, 1, 0, 0),
@@ -2328,6 +2406,8 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
                     and phase == expected_phases[len(completed)]):
                 active, counts, maps, map_members, members, aspects = phase, Counter(), [], [], [], Counter()
                 planning = []
+                skipped, barriered, begun = set(), set(), {"render": set(), "blit": set(), "compute": set()}
+                clear_skipped = 0
             elif action == "end" and active == phase:
                 _, begin_members, mapped, identities, blits, computes, clears, loads, superseded, barriers = matrix[name]
                 expected = Counter({"native_render_member": sum(n - 1 for n in begin_members),
@@ -2341,6 +2421,22 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
                         expected[f"native_{kind}_{operation}"] = count
                     if kind in ("blit", "compute"):
                         expected[f"native_{kind}_encode"] = count
+                    # An encoder whose accesses overlap nothing in flight skips
+                    # its queue fence wait; every other begun encoder waits.
+                    if kind != "clear":
+                        expected[f"native_{kind}_wait"] = count - len(skipped & begun[kind])
+                        # A skip against tracked in-flight producers waits
+                        # through exactly one consumer queue barrier instead.
+                        expected[f"native_{kind}_queue_barrier"] = len(barriered & begun[kind])
+                # A tracked clear batch either skips (no conflict), waits through
+                # one queue barrier, or keeps the fence: exactly one per batch,
+                # so the fixture's clear count still bounds all three.
+                clear_barriers = counts["native_clear_queue_barrier"]
+                if clear_skipped + clear_barriers > clears:
+                    failures.append(f"graph {phase}: more clear fence skips/barriers than clear batches")
+                expected["native_clear_wait"] = max(0, clears - clear_skipped - clear_barriers)
+                if clear_barriers:
+                    expected["native_clear_queue_barrier"] = clear_barriers
                 if counts != expected or members != list(begin_members):
                     failures.append(f"graph {phase}: native calls {dict(counts)}, members={members}, expected={dict(expected)}")
                 expected_maps = [identity] * mapped
@@ -2394,6 +2490,17 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
             if kind == "native_render_attachment":
                 # Descriptor metadata is not a native operation call.
                 continue
+            if kind == "native_fence_wait_skipped":
+                if "batch" in event:
+                    # Clear batches are keyed by batch, not encoder.
+                    clear_skipped += 1
+                    continue
+                skipped.add((event.get("submission"), event.get("encoder")))
+                if event.get("reason") == "queue_barrier":
+                    barriered.add((event.get("submission"), event.get("encoder")))
+                continue
+            if kind in ("native_render_begin", "native_blit_begin", "native_compute_begin"):
+                begun[kind.split("_")[1]].add((event.get("submission"), event.get("encoder")))
             if not (kind.startswith(("native_render_", "native_blit_", "native_compute_", "native_clear_"))
                     or kind == "submission_clear_superseded"):
                 continue
@@ -2405,8 +2512,7 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
             if field and (type(event.get(field)) is not int or event[field] != 1):
                 failures.append(f"graph {active}: invalid native operation count")
             if kind in ("native_render_wait", "native_render_update", "native_clear_wait", "native_clear_update"):
-                # Unresolved root SRV nodes use the conservative vertex wait/fragment update.
-                stage = 1 if active[0] == "graph-access-3" and operation == "wait" else 2
+                stage = 2
                 if active[0] == "graph-uav-vertex" and kind.startswith("native_render_"):
                     stage = 3
                 if type(event.get("stages")) is not int or event["stages"] != stage:
@@ -2450,7 +2556,7 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
                         base + f"_GRAPH_UAV control={control} word={6 if control == 4 else 64 if control == 2 else 32} "
                         f"render_encoders={1 if control == 4 else 2} members=2 inline_barriers={int(control == 4)} exact=1"]
         numeric += [base + f"_GRAPH_ACCESS control={c} replay={r} rgba=ff000050 "
-                    f"unrelated={('13579bdf' if c == 2 else '00000010')} render_encoders={2 if c == 3 else 1} members=2 exact=1"
+                    f"unrelated={('13579bdf' if c == 2 else '00000010')} render_encoders=1 members=2 exact=1"
                     for c in range(4) for r in range(2)]
         numeric += [base + f"_GRAPH_FRONTIER count={count} replay={replay} word=13579bdf exact=1 sealed=1"
                     for count in (256, 512) for replay in range(2)]
@@ -2839,7 +2945,9 @@ def rr_oracle_comparison(frozen: Path, oracle: Path) -> dict:
     images = {}
     public_names = [f"public-rr-{variant}{suffix}.bin" for variant in ("", "linear-", "packed-", "mirror-")
                     for suffix in (*[f"frame-{frame}" for frame in range(1, 9)], "replay")]
-    if sorted(path.name for path in frozen.glob("public-rr-*.bin")) != sorted(public_names):
+    # Responsivity-mask artifacts are gated by their own case.
+    if sorted(path.name for path in frozen.glob("public-rr-*.bin")
+              if not path.name.startswith("public-rr-responsivity-")) != sorted(public_names):
         failures.append("RR public 32 history frames and four replay artifacts incomplete or extra")
     for root, names in ((frozen, public_names), (oracle, [name for name in RR_ORACLE_FILES if name.endswith(".bin")])):
         for name in names:
@@ -3166,6 +3274,7 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
     game_sources = {
         "sr-alpha": ("owned-d3d12-sr-alpha.cpp", "owned-d3d12-temporal.cpp"),
         "fsr-debug": ("owned-d3d12-fsr-debug.cpp", "owned-d3d12-fsr.cpp", "owned-d3d12-temporal.cpp"),
+        "fsr-rr": ("owned-d3d12-fsr-rr.cpp",),
         "ngx-features": ("owned-d3d12-ngx-features.cpp", "owned-d3d12-ngx.cpp",
                          "owned-d3d12-temporal.cpp", "owned-rr-pattern.h",
                          "owned-rr-native-control.mm", "owned-d3d12-ngx-msvc.cpp",
@@ -3184,6 +3293,9 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
         if suite == "ngx-features":
             inputs += [REPOSITORY_ROOT / "external/nvngx/include" / name for name in
                        ("nvsdk_ngx.h", "nvsdk_ngx_defs.h", "nvsdk_ngx_params.h")]
+        if suite == "fsr-rr":
+            inputs += [REPOSITORY_ROOT / "src/fsrrr/legacy.h",
+                       REPOSITORY_ROOT / "src/fsr/include/denoisers/include/ffx_denoiser.h"]
         if suite == "fsr-debug":
             inputs += [REPOSITORY_ROOT / "src/fsr/include" / name for name in
                        ("upscalers/include/ffx_upscale.h", "api/include/ffx_api.h",
@@ -3210,7 +3322,11 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
         return [dxil_dir / "pipeline-cache-a.dxil", dxil_dir / "pipeline-cache-b.dxil"]
     if suite in ("multisample-capabilities", "pipeline-library"):
         stem = "native-msaa-coverage" if suite == "multisample-capabilities" else "pipeline-library-coverage"
-        return [dxil_dir / (stem + suffix) for suffix in (".hlsl", ".dxil")] + [dxil_dir / "native-msaa-coverage-provenance.json"]
+        inputs = [dxil_dir / (stem + suffix) for suffix in (".hlsl", ".dxil")] + [dxil_dir / "native-msaa-coverage-provenance.json"]
+        if suite == "multisample-capabilities":
+            inputs += [dxil_dir / name for name in ("native-msaa-sample.hlsl", "native-msaa-sample-vs.dxil",
+                                                   "native-msaa-sample-ps.dxil")]
+        return inputs
     if suite == "smoke":
         return sorted(fixture.parent.glob(SMOKE_SHADER_GLOB))
     if suite == "dxil":
@@ -3347,15 +3463,15 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
         return [dxil_dir / name for name in ("work-graphs.hlsl", "work-graphs-sharing.hlsl", "work-graphs-linkage.hlsl", "build-work-graphs.sh",
                                            "work-graphs-nodes.dxil", "work-graphs-sharing.dxil", "work-graphs-link-nodes.dxil", "work-graphs-link-helpers.dxil", "work-graphs-root-subobjects.dxil")] + [
                                                REPOSITORY_ROOT / "graphics-translator/tests/owned-d3d12-work-graphs.cpp",
-                                               REPOSITORY_ROOT / "build/local/p3-20261003/matrix/preview-d3d12.h"]
+                                               dxil_dir / "preview-d3d12.h"]
     if suite == "workgraphs-atomic64":
         return [dxil_dir / name for name in ("atomic64-workgraph-records.dxil", "atomic64-workgraph-records.hlsl", "build-sm6.sh")] + [
             REPOSITORY_ROOT / "graphics-translator/tests/owned-d3d12-atomic64-workgraph.cpp",
-            REPOSITORY_ROOT / "build/local/p3-20261003/matrix/preview-d3d12.h"]
+            dxil_dir / "preview-d3d12.h"]
     if suite == "workgraphs-atomic64-typed":
         return [dxil_dir / name for name in ("atomic64-workgraph-typed.dxil", "atomic64-workgraph-typed.hlsl", "build-sm6.sh")] + [
             REPOSITORY_ROOT / "graphics-translator/tests/owned-d3d12-atomic64-workgraph-typed.cpp",
-            REPOSITORY_ROOT / "build/local/p3-20261003/matrix/preview-d3d12.h"]
+            dxil_dir / "preview-d3d12.h"]
     if suite == "vrs":
         return [dxil_dir / name for name in VRS_INPUTS]
     if suite == "sampler-feedback":
@@ -3372,11 +3488,1234 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
 
 def multiqueue_submission_failures(events: list[dict]) -> list[str]:
     # This fixture has 32 compute/copy pairs, 64 signals and 63 CPU-gated waits.
-    expected = {"execute_list": 64, "signal_committed": 64, "wait": 63, "submit": 128, "complete": 128}
+    # A signal folded into its preceding Execute commit adds no submission.
+    folded = sum(event.get("event") == "signal_committed" and event.get("folded") == 1 for event in events)
+    expected = {"execute_list": 64, "signal_committed": 64, "wait": 63, "submit": 128 - folded, "complete": 128 - folded}
     counts = {kind: sum(event.get("event") == kind for event in events) for kind in expected}
     if counts != expected or any("submission" in event for event in events if event.get("event") == "wait"):
         return [f"multiqueue logical waits must not submit GPU work: {counts}"]
     return []
+
+
+def render_passes_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    success = (success
+               and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 40
+               and all(stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_CASE_PASS case=" + case) == 1
+                       for case in ("graph-frontier-256", "graph-frontier-512",
+                                    "graph-frontier-overlap-group-boundary", "graph-frontier-delayed-clear-boundary",
+                                    "graph-cross-execute-producer", "depth-clear-srv-compute-read"))
+               and "OWNED_D3D12_RENDER_PASSES_DEPTH_SRV depth=3f400000 exact=1" in stdout
+               and depth_srv_dispatch_ordered(stderr)
+               and all(f"OWNED_D3D12_RENDER_PASSES_CROSS_EXECUTE replay={replay} word=13579bdf exact=1" in stdout
+                       for replay in range(2))
+               and "OWNED_D3D12_RENDER_PASSES_CLEAR_PRESERVE pixel=ff402080" in stdout
+               and "OWNED_D3D12_RENDER_PASSES_RESOLVE_FOLDED pixel=ff804000" in stdout
+               and sum('"event":"resolve_folded"' in line for line in stderr.splitlines()) == 1
+               and ("OWNED_D3D12_RENDER_PASSES_RTV_REBIND first=ff102040 view=ff800000 "
+                    "resource=ff002040 draws=6 redundant=2 unbind=1") in stdout
+               and ("OWNED_D3D12_RENDER_PASSES_DSV_REBIND color=ff2040c0 "
+                    "depth=3d000000,3e800000,3d800000 stencil=11,22,33 draws=7 redundant=2 "
+                    "flag_boundaries=2 view_boundaries=1 resource_boundaries=1 "
+                    "expected_render_encoders=5 exact=1") in stdout
+               and ("OWNED_D3D12_RENDER_PASSES_RECT_CLEAR untouched=ffff0000 outside=ff00ff00 "
+                    "inside=ff0000ff depth=3f000000,3f400000 stencil=22,33 preserved_stencil=11 exact=1") in stdout
+               and ("OWNED_D3D12_RENDER_PASSES_CLEAR_LOAD_FOLD outside=ff402010 inside=ff483030 "
+                    "executions=2 color_pixels=32 depth_pixels=96 stencil_pixels=96 depth_only_redundant=3 exact=1") in stdout
+               and sum('"event":"render_targets_rebind_elided"' in line and '"rtvs":0' in line
+                       for line in (stdout + stderr).splitlines()) >= 3
+               and "OWNED_D3D12_RENDER_PASSES_SUSPEND_RESUME pixel=ff204010" in stdout
+               and "OWNED_D3D12_RENDER_PASSES_VALIDATION_PASS rejected=10 conformant_barrier=1" in stdout
+               and "OWNED_D3D12_RENDER_PASSES_UINT_BORDER b0000=0000 b0001=0001 b1111=1111" in stdout
+               and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=40") == 1
+               and "_FAIL" not in stdout)
+    return success
+
+
+def enhanced_barriers_output_matches(stdout: str, success: bool) -> bool:
+    success = (success
+               and stdout.count("OWNED_D3D12_ENHANCED_BARRIERS_CASE_PASS ") == 26
+               and "OWNED_D3D12_ENHANCED_BARRIERS_INVALID_BARRIERS_PASS rejected=10" in stdout
+               and "OWNED_D3D12_ENHANCED_BARRIERS_STENCIL front=11 back=f2" in stdout
+               and "OWNED_D3D12_ENHANCED_BARRIERS_INTERFACES device14=1 command_list9=1" in stdout
+               and stdout.splitlines().count("OWNED_D3D12_ENHANCED_BARRIERS_PASS cases=26") == 1
+               and "_FAIL" not in stdout)
+    return success
+
+
+def pipeline_statistics_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    success = (success and dxil_compiler_loaded
+               and stdout.count("OWNED_D3D12_PIPELINE_STATISTICS_GPU_CASE_PASS ") == 346
+               and stdout.count("OWNED_D3D12_PIPELINE_STATISTICS_MATRIX_PASS ") == 2
+               and "OWNED_D3D12_PIPELINE_STATISTICS_MATRIX_PASS shader=dxbc cases=168 fields=11" in stdout
+               and "OWNED_D3D12_PIPELINE_STATISTICS_MATRIX_PASS shader=dxil cases=178 fields=11" in stdout
+               and stdout.count("OWNED_D3D12_PIPELINE_STATISTICS_VALIDATION_PASS ") == 26
+               and stdout.count("OWNED_D3D12_PIPELINE_STATISTICS_PASS "
+                                "shaders=dxbc,dxil fields=11 independent_gpu_oracle=1") == 1
+               and "OWNED_D3D12_PIPELINE_STATISTICS_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def tiled_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    # Every case line must pass, in order, and the fixture must see exactly Tier 2 with
+    # Tier 3 (SRV-only) unreported and no Metal validation fault.
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_TILED_CASE ([\w.-]+) status=PASS$", stdout, re.MULTILINE)
+    success = (success and tuple(cases) == TILED_CASES
+               and "OWNED_D3D12_TILED_CAPS tier=4 srv_only_tier3=0 " in stdout
+               and f"OWNED_D3D12_TILED_PASS cases={len(TILED_CASES)} tier=4" in stdout
+               and "OWNED_D3D12_TILED_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def bindless_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    # Every case line must pass, in order, with the exact caps the fixture checks.
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_BINDLESS_CASE ([\w.-]+) status=PASS$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == BINDLESS_CASES
+               and stdout.count("OWNED_D3D12_BINDLESS_UINT_BORDER variants=24 replays=2 signed=1 "
+                                "narrow_8_16=1 raw_gather_16_32_64=1 empty_view=1 copy_lifetime=1") == 1
+               and "OWNED_D3D12_BINDLESS_CAPS binding_tier=3 heap_tier=2 root_signature=0x3" in stdout
+               and "OWNED_D3D12_BINDLESS_PASS cases=10 heap=1000000 samplers=2048 max_index=999999" in stdout
+               and stdout.splitlines().count("OWNED_D3D12_BINDLESS_VIEW_POOL_GPU executions=2 slots=8 words=128 "
+                   "same_heap=1 cross_heap=1 overlap=1 source_overwrite=1 destination_overwrite=1 null=1 "
+                   "srv=1 uav=1 mip_array=1 source_heap_release=1 resource_generations=2") == 1
+               and re.search(r"^OWNED_D3D12_BINDLESS_ROV triangles=512 pixels=256 expected=0x[0-9a-f]{8} "
+                             r"structured_mismatches=0 typed_mismatches=0 texture_mismatches=0$", stdout, re.MULTILINE)
+               and "OWNED_D3D12_BINDLESS_MISMATCH" not in stdout
+               and "OWNED_D3D12_BINDLESS_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def writable_msaa_failures(stdout: str, stderr: str) -> list[str]:
+    """Attribute helper waits and consumers to their own retired Execute interval."""
+    names = ("partial_array_helper_other_slice_clear", "unused_descriptor_helper_order")
+    values = [f"OWNED_D3D12_WRITABLE_MSAA_HELPER_VALUES case={names[0]} helper=500 first=500 last=1283 clear=7,11,13,17",
+              f"OWNED_D3D12_WRITABLE_MSAA_HELPER_VALUES case={names[1]} prior=13579bdf helper=2468ace0 first=600 last=1399"]
+    failures = []
+    if [line for line in stdout.splitlines() if line.startswith("OWNED_D3D12_WRITABLE_MSAA_HELPER_VALUES")] != values:
+        failures.append("writable MSAA helper numerical readbacks differ or are incomplete")
+    prefix = "OWNED_D3D12_WRITABLE_MSAA_HELPER_PHASE "
+    phases, active, events = [], None, []
+    for line in stderr.splitlines():
+        if line.startswith(prefix.rstrip()):
+            marker = re.fullmatch(re.escape(prefix) + r"(begin|end)=([\w-]+)", line)
+            if marker is None:
+                failures.append("malformed writable MSAA helper phase")
+                continue
+            action, name = marker.groups()
+            if action == "begin" and active is None and len(phases) < len(names) and name == names[len(phases)]:
+                active, events = name, []
+            elif action == "end" and active == name:
+                phases.append((name, events))
+                active, events = None, []
+            else:
+                failures.append("invalid writable MSAA helper phase transition")
+        elif active is not None and "OWNED_GRAPHICS_TRACE " in line:
+            try:
+                event = json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+            except ValueError:
+                event = None
+            if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+                failures.append("malformed writable MSAA helper operation")
+            else:
+                events.append(event)
+    if active is not None or [name for name, _ in phases] != list(names):
+        failures.append("writable MSAA helper phase matrix incomplete or reordered")
+
+    def key(event):
+        field = "batch" if "batch" in event else "encoder"
+        return event.get("submission"), field, event.get(field)
+
+    for name, part in phases:
+        def rows(kind, owner):
+            return [(index, event) for index, event in enumerate(part) if event["event"] == kind and key(event) == owner]
+
+        computes = [(index, event) for index, event in enumerate(part) if event["event"] == "native_compute_begin"]
+        clears = [(index, event) for index, event in enumerate(part) if event["event"] == "native_clear_begin"]
+        unused = name == names[1]
+        if (len(computes) != (3 if unused else 1) or len(clears) != (0 if unused else 1)
+                or (not unused and "batch" in clears[0][1])):
+            failures.append(f"{name}: helper/consumer native encoders missing, duplicated or not in place")
+            continue
+        owners = [key(event) for _, event in computes + clears]
+        submission = owners[0][0]
+        if (type(submission) is not int or submission <= 0 or len(set(owners)) != len(owners)
+                or any(owner[0] != submission or type(owner[2]) is not int or owner[2] < 0
+                       or (owner[1] == "encoder" and owner[2] == 0) for owner in owners)):
+            failures.append(f"{name}: invalid native encoder ownership")
+            continue
+        submits = [event for event in part if event["event"] == "submit" and event.get("submission") == submission]
+        completes = [event for event in part if event["event"] == "complete" and event.get("submission") == submission]
+        if (len(submits) != 1 or len(completes) != 1 or completes[0].get("status") != 4
+                or type(submits[0].get("queue")) is not int or submits[0]["queue"] <= 0
+                or completes[0].get("queue") != submits[0]["queue"]
+                or part.index(submits[0]) >= part.index(completes[0])):
+            failures.append(f"{name}: actual helper submission did not retire successfully")
+        for begin_index, event in computes + clears:
+            owner, kind = key(event), "compute" if event["event"] == "native_compute_begin" else "clear"
+            previous = begin_index
+            for operation in (("encode", "update", "end") if kind == "compute" else ("load", "update", "end")):
+                matches = rows(f"native_{kind}_{operation}", owner)
+                counter = "clear_count" if operation == "load" else operation + "_count"
+                if (len(matches) != 1 or matches[0][0] <= previous
+                        or type(matches[0][1].get(counter)) is not int or matches[0][1][counter] != 1
+                        or (operation == "load" and matches[0][1].get("aspect") != 4)):
+                    failures.append(f"{name}: {kind} {operation} lacks exact native attribution")
+                if matches:
+                    previous = matches[0][0]
+        helper_index, helper = computes[1 if unused else 0]
+        helper_owner = key(helper)
+        waits = rows("native_compute_wait", helper_owner)
+        encodes = rows("native_compute_encode", helper_owner)
+        if (len(waits) != 1 or waits[0][1].get("wait_count") != 1 or not encodes
+                or not helper_index < waits[0][0] < encodes[0][0]
+                or rows("native_fence_wait_skipped", helper_owner)
+                or rows("native_compute_queue_barrier", helper_owner)):
+            failures.append(f"{name}: helper failed to restore and wait on the fence chain")
+        if unused:
+            prior_owner = key(computes[0][1])
+            skips = rows("native_fence_wait_skipped", prior_owner)
+            prior_ends = rows("native_compute_end", prior_owner)
+            drains = [(index, event) for index, event in enumerate(part)
+                      if event["event"] == "native_skipped_drain" and event.get("submission") == submission
+                      and prior_ends and prior_ends[0][0] < index < helper_index]
+            if (len(skips) != 1 or skips[0][1].get("reason") != "no_known_hazard"
+                    or skips[0][1].get("skip_count") != 1 or skips[0][0] >= computes[0][0]
+                    or rows("native_compute_wait", prior_owner) or rows("native_compute_queue_barrier", prior_owner)
+                    or len(drains) != 1 or drains[0][1].get("barrier_count") != 1):
+                failures.append(f"{name}: skipped predecessor was not reconciled before the helper")
+        consumer_index, consumer = computes[2] if unused else clears[0]
+        consumer_owner, kind = key(consumer), "compute" if unused else "clear"
+        helper_ends = rows("native_compute_end", helper_owner)
+        first_operation = rows(f"native_{kind}_{'encode' if unused else 'load'}", consumer_owner)
+        waits = rows(f"native_{kind}_wait", consumer_owner)
+        barriers = rows(f"native_{kind}_queue_barrier", consumer_owner)
+        sync = waits + barriers
+        # A helper exports with fragment-stage draws even when its shader uses
+        # only u1 or a partial-array UAV. A compute-only producer mask is wrong.
+        if (len(helper_ends) != 1 or consumer_index <= helper_ends[0][0] or len(sync) != 1 or not first_operation
+                or not consumer_index < sync[0][0] < first_operation[0][0]
+                or any(event.get("wait_count") != 1 for _, event in waits)
+                or any(type(event.get("after")) is not int or not event["after"] & (1 << 1)
+                       or event.get("barrier_count") != 1
+                       or (unused and event.get("before") != 1 << 27) for _, event in barriers)
+                or any(event.get("reason") != "queue_barrier" for _, event in rows("native_fence_wait_skipped", consumer_owner))):
+            failures.append(f"{name}: consumer did not wait for the helper's whole-allocation fragment writes")
+    return failures
+
+
+def writable_msaa_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    shapes = re.findall(r"^OWNED_D3D12_WRITABLE_MSAA_SHAPE samples=(2|4|8) array=([01])$", stdout, re.MULTILINE)
+    scalars = re.findall(r"^OWNED_D3D12_WRITABLE_MSAA_SCALAR type=(sint|float)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == WRITABLE_MSAA_CASES
+               and shapes == [(str(samples), str(array)) for samples in (2, 4, 8) for array in (0, 1)]
+               and scalars == ["sint", "float"]
+               and stdout.count("OWNED_D3D12_WRITABLE_MSAA_CAPS writable=1\n") == 1
+               and stdout.count("OWNED_D3D12_WRITABLE_MSAA_PASS") == 1
+               and "OWNED_D3D12_SM6_MISMATCH" not in stdout
+               and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
+               and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
+               and "kIOGPUCommandBufferCallbackError" not in stderr
+               and not writable_msaa_failures(stdout, stderr))
+    return success, dxil_compiler_loaded
+
+
+def vectors_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == VECTOR_CASES
+               and stdout.count("OWNED_D3D12_VECTORS_PASS") == 1
+               and "OWNED_D3D12_SM6_MISMATCH" not in stdout
+               and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
+               and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
+               and "kIOGPUCommandBufferCallbackError" not in stderr)
+    return success, dxil_compiler_loaded
+
+
+def matrix_capabilities_output_matches(args: argparse.Namespace, stdout: str, stderr: str, arch: dict, success: bool) -> bool:
+    pointer, query_size = ("8", "56") if arch["guest_arch"] == "x64" else ("4", "48")
+    if args.suite == "wave-mma-capabilities":
+        expected = f"MATRIX_CAPABILITIES_PASS sdk=retired pointer={pointer} query=32 wave_mma_tier=10 shapes=12"
+        readback = True
+    else:
+        expected = f"MATRIX_CAPABILITIES_PASS sdk=successor pointer={pointer} query={query_size} wave_mma_tier=10 linear_algebra_tier=16 operations=6 readback=exact"
+        readback = stdout.splitlines().count("MATRIX_RUNTIME_ALLOCATION_LIFETIME_PASS released_resources=1 released_recording=1") == 1
+    success = (success and stdout.splitlines().count(expected) == 1 and readback
+               and stdout.splitlines().count("MATRIX_CAPABILITIES_BACKEND id=owned-graphics-d3d12") == 1
+               and "MATRIX_CAPABILITIES_FAIL" not in stdout + stderr
+               and "MATRIX_RUNTIME_FAIL" not in stdout + stderr
+               and "MATRIX_RUNTIME_MISMATCH" not in stdout + stderr
+               and "kIOGPUCommandBufferCallbackError" not in stderr)
+    return success
+
+
+def matrix_runtime_output_matches(stdout: str, stderr: str, arch: dict, success: bool) -> bool:
+    conversions = re.findall(r"^MATRIX_RUNTIME_CONVERSIONS_PASS src=(\d+) layouts=16 replay=2 padding=preserved bits=exact$", stdout, re.MULTILINE)
+    abi = re.findall(r"^MATRIX_RUNTIME_ABI_PASS pointer=(4|8) union=(48|56) tier=(0|16) legacy=(0|1) pinned_sdk=1$", stdout, re.MULTILINE)
+    expected_abi = ("8", "56") if arch["guest_arch"] == "x64" else ("4", "48")
+    success = (success and conversions == [str(t) for t in (2,3,4,5,7,8,18,19,20,21)]
+               and len(abi) == 1 and abi[0][:2] == expected_abi
+               and all(stdout.splitlines().count(marker) == 1 for marker in (
+                   "MATRIX_RUNTIME_EXPERIMENTAL_PASS unknown=1 malformed=3 unchanged=1 removal=2 lifetime=1",
+                   "MATRIX_RUNTIME_ALIGNMENT_PASS sint8_offset=32 float16_offset=64 guards=preserved",
+                   "MATRIX_RUNTIME_VALIDATION_PASS invalid_recordings=10 overflow=1",
+                   "MATRIX_RUNTIME_ALLOCATION_LIFETIME_PASS released_resources=1 released_recording=1",
+                   "MATRIX_RUNTIME_PREDICATION_PASS suppressed=1 executed=1 padding=preserved",
+                   "MATRIX_RUNTIME_FENCE_BARRIERS_PASS crossqueue=1 rewind=1 async=1 lifetime=1 state_handoff=1",
+                   "MATRIX_RUNTIME_PASS"))
+               and "MATRIX_RUNTIME_FAIL" not in stdout + stderr
+               and "MATRIX_RUNTIME_MISMATCH" not in stdout + stderr
+               and "kIOGPUCommandBufferCallbackError" not in stderr)
+    return success
+
+
+def matrix_shaders_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == MATRIX_ENTRIES
+               and re.findall(r"^OWNED_D3D12_MATRICES_PASS failures=0$", stdout, re.MULTILINE) == ["OWNED_D3D12_MATRICES_PASS failures=0"]
+               and stdout.count("MATRIX_PUBLIC_SHADER_ADMISSION_PASS") == 1
+               and stdout.count("MATRIX_CONVERTED_VECTOR_CONSUMER_PASS") == 1
+               and "OWNED_D3D12_SM6_MISMATCH" not in stdout
+               and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout + stderr
+               and "OWNED_D3D12_MATRICES_FAIL" not in stdout + stderr
+               and "kIOGPUCommandBufferCallbackError" not in stderr)
+    return success, dxil_compiler_loaded
+
+
+def waves_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    rejects = re.findall(r"^OWNED_D3D12_WAVES_REJECT entry=(\w+) hr=0x80004005$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == WAVE_CASES
+               and rejects == SM6_REJECTS
+               and re.search(r"^OWNED_D3D12_SM6_CAPS .* wave=1 lanes=4-32 ", stdout, re.MULTILINE)
+               and stdout.count("OWNED_D3D12_WAVES_PASS") == 1
+               and "OWNED_D3D12_SM6_MISMATCH" not in stdout
+               and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
+               and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
+               and "kIOGPUCommandBufferCallbackError" not in stderr)
+    return success, dxil_compiler_loaded
+
+
+def fp64_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == FP64_CASES
+               and re.search(r"^OWNED_D3D12_SM6_CAPS .* double=1 ", stdout, re.MULTILINE)
+               and stdout.count("OWNED_D3D12_FP64_PASS cases=8") == 1
+               and "OWNED_D3D12_SM6_MISMATCH" not in stdout
+               and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
+               and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
+               and "kIOGPUCommandBufferCallbackError" not in stderr)
+    return success, dxil_compiler_loaded
+
+
+def sm6_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    # Every case passes in order; each atomic stress run is exact on every repetition;
+    # every negative compile is rejected; the caps line is exactly what was verified.
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    stress = re.findall(r"^OWNED_D3D12_SM6_STRESS case=(\w+) threads=65536 targets=(\d+) reps=(\d+) "
+                        r"exact=(\d+) ", stdout, re.MULTILINE)
+    rejects = re.findall(r"^OWNED_D3D12_SM6_REJECT entry=(\w+) hr=0x8\w{7}$", stdout, re.MULTILINE)
+    # A GPU hang anywhere (the fragment-lock failure mode that keeps 64 bit atomics
+    # compute-only) fails the suite even if every case line printed.
+    gpu_hang = "kIOGPUCommandBufferCallbackError" in stderr
+    success = (success and dxil_compiler_loaded and tuple(cases) == SM6_CASES
+               and [name for name, *_ in stress] == ["cs_atomic64_stress_1", "cs_atomic64_stress_16"]
+               and all(reps == exact == str(SM6_STRESS_REPS) for _, _, reps, exact in stress)
+               and rejects == SM6_REJECTS and not gpu_hang
+               and re.search(r"^OWNED_D3D12_SM6_CAPS shader_model=0x66/0x0 double=1 minprec=2 wave=1 "
+                             r"lanes=4-32 total_lanes=\d+ int64=1 barycentrics=1 view_instancing=1 "
+                             r"native16=1 atomic64_typed=1 atomic64_groupshared=1 atomic64_heap=1 "
+                             r"wave_mma=10$", stdout, re.MULTILINE)
+               and f"OWNED_D3D12_SM6_PASS stress_reps={SM6_STRESS_REPS}" in stdout
+               and "OWNED_D3D12_SM6_MISMATCH" not in stdout
+               and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
+               and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def mesh_shader_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    # Full mesh coverage stays independent of the focused Atomic64 route.
+    # Every case passes in order with exact pixels/counters; the caps line is exactly what was verified.
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_MESH_SHADER_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == MESH_SHADER_CASES
+               and "kIOGPUCommandBufferCallbackError" not in stderr
+               and re.search(r"^OWNED_D3D12_MESH_SHADER_CAPS tier=10 stats=1 full_range_rtai=1 derivatives=1 "
+                             r"ms_primitives_culled=0$", stdout, re.MULTILINE)
+               and "OWNED_D3D12_MESH_SHADER_PASS" in stdout
+               and "OWNED_D3D12_MESH_SHADER_MISMATCH" not in stdout
+               and "OWNED_D3D12_MESH_SHADER_CASE_FAIL" not in stdout
+               and "OWNED_D3D12_MESH_SHADER_PSO_FAIL" not in stdout
+               and "OWNED_D3D12_MESH_SHADER_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def raster_order_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^RASTER_ORDER_CASE ([\w-]+) status=PASS$", stdout, re.MULTILINE)
+    expected_cases = {
+        "raw-direct-dxil", "structured-direct-dxbc", "structured-direct-dxil",
+        "raw-table-dxil", "typed-table-dxbc", "structured-table-dxbc",
+        "structured-table-dxil", "unbounded-dxil", "mixed-dxbc", "mixed-dxil",
+        "spaces-dxil", "layer-table-dxil", "raw-table-dxil-cached",
+        "sample-table-4x-dxil", "sample-direct-4x-dxil",
+    }
+    success = (success and dxil_compiler_loaded
+               and len(cases) == len(expected_cases) and set(cases) == expected_cases
+               and stdout.count("RASTER_ORDER_SAMPLES values=27,27,27,27,27,27,27,27 expected=27") == 2
+               and stdout.count("RASTER_ORDER_LAYERS values=27,27,90,90 expected=27,27,90,90") == 1
+               and stdout.count("OWNED_D3D12_RASTER_ORDER_PASS") == 1
+               and "status=FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def feature_level_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    # FL 11_1/12_0: OutputMergerLogicOp (16 ops x 7 UINT formats + R32G32B32A32_UINT MRT), UAV-only
+    # ForcedSampleCount 1/4/8/16 (16 = two programmed 8x halves) with exact coverage/invocation/occlusion,
+    # ForcedSampleCount 1 on 4x/8x RTVs with SampleMask/occlusion/statistics, and the 18 required typed UAV
+    # load formats exact through texture2d and buffer views.
+    logic = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_LOGIC_OP format=(\w+) ops=16 pixels=16 "
+                       r"mrt=R32G32B32A32_UINT", stdout)
+    forced = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_UAV_ONLY_FORCED samples=(\d+) triangles=40 "
+                        r"pixels=10240 partial=(\d+)", stdout)
+    forced1 = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_FORCED1_MSAA_RTV samples=(\d) mask=(0x[0-9a-f]+) "
+                         r"triangles=6", stdout)
+    typed = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_TYPED_UAV_LOAD format=(\w+) texels=32 "
+                       r"views=texture2d,buffer", stdout)
+    cases = re.findall(r"^OWNED_D3D12_FEATURE_LEVEL_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+    success = (success and logic == ["R8G8B8A8_UINT", "R16G16_UINT", "R32_UINT", "R10G10B10A2_UINT",
+                                     "R8_UINT", "R16_UINT", "R8G8_UINT"]
+               and [samples for samples, _ in forced] == ["1", "4", "8", "16"]
+               and all(int(partial) > 0 for samples, partial in forced if samples != "1")
+               and forced1 == [("4", "0xffffffff"), ("4", "0x5"), ("8", "0xffffffff"), ("8", "0x81"),
+                               ("4", "0x0")]
+               and len(typed) == 18 and len(set(typed)) == 18
+               and re.search(r"OWNED_D3D12_FEATURE_LEVEL_TIR16_RTV triangles=40 partial=[1-9]\d*", stdout)
+               and cases == ["logic_ops_16_uint_formats_7_mrt_and_rejections",
+                             "uav_only_forced_1_4_8_16_and_tir16_rtv_coverage_invocation_occlusion_exact",
+                             "forced1_multisample_rtv_4x_8x_samplemask_occlusion_statistics",
+                             "typed_uav_load_18_required_formats_texture2d_and_buffer_exact"]
+               and stdout.count("OWNED_D3D12_FEATURE_LEVEL_PASS cases=4") == 1
+               and "OWNED_D3D12_FEATURE_LEVEL_FAIL" not in stdout + stderr)
+    return success
+
+
+def work_graphs_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+    results = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_RESULT mode=(\d) sum=(\d+) expected_sum=(\d+) "
+                         r"count=(\d+) expected_count=(\d+)$", stdout, re.MULTILINE)
+    linked_results = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_LINK_RESULT program=([AB]) exact_min=(\d+) "
+                                r"sum=(\d+) expected_sum=(\d+) count=(\d+) expected_count=4 "
+                                r"helper_sum=(\d+) expected_helper_sum=54 helper_count=(\d+) expected_helper_count=4$",
+                                stdout, re.MULTILINE)
+    sampler_results = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_SAMPLER_RESULT exact_min=(\d+) "
+                                 r"sum=(\d+) expected_sum=68 count=(\d+) expected_count=4 local_argument_bytes=0$",
+                                 stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded
+               and cases == [f"mode_{mode}_min_backing_depth32_fanout16" for mode in range(4)] +
+                   ["shared_budget_sparse_array_input_sharing_local_roots_cross_group", "collection_external_namespace_root_contract_negatives",
+                    "global_roots_collection_functions_program_A", "global_roots_collection_functions_program_B", "local_static_sampler_union_exact"]
+               and [mode for mode, *_ in results] == ["0", "1", "2", "3", "4"]
+               and all(actual == expected and count == expected_count
+                   for _, actual, expected, count, expected_count in results)
+               and [program for program, *_ in linked_results] == ["A", "B"]
+               and all(actual == expected and count == "4" and helper_sum == "54" and helper_count == "4"
+                   for _, minimum, actual, expected, count, helper_sum, helper_count in linked_results)
+               and len(sampler_results) == 1 and sampler_results[0][1:] == ("68", "4")
+               and stdout.count("OWNED_D3D12_WORK_GRAPHS_CAPS tier=10 options21_bytes=16") == 1
+               and stdout.splitlines().count("OWNED_D3D12_WORK_GRAPHS_LIMIT_RESET_PASS default_restored=1 records=4") == 1
+               and stdout.splitlines().count("OWNED_D3D12_WORK_GRAPHS_LIMIT_REJECT_PASS records=4 max=3 nodes=1 max_nodes=1") == 1
+               and "OWNED_D3D12_WORK_GRAPHS_PASS cases=9 tier=1_0" in stdout
+               and "OWNED_D3D12_WORK_GRAPHS_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def atomic64_helpers_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_ATOMIC64_HELPERS_CASE mode=(\d+) samples=(\d+) status=PASS$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded
+               and cases == [(str(mode), str(samples)) for mode, samples in enumerate((1, 4, 1, 1, 4, 1, 1, 8, 8, 8, 4))]
+               and stdout.splitlines().count("OWNED_D3D12_ATOMIC64_HELPERS_PASS cases=11 failures=0") == 1
+               and "OWNED_D3D12_SM6_MISMATCH" not in stdout
+               and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout + stderr
+               and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
+               and "OWNED_D3D12_ATOMIC64_HELPERS_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def atomic64_pixel_coupled_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool, list[tuple[str, str, str, str]]]:
+    dxil_compiler_loaded = native_compiler_proof
+    pixel_rows = re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CASE rov=([01]) typed=([01]) sample=([01]) mode=([0-4]) status=PASS$", stdout, re.MULTILINE)
+    expected_pixel_rows = [(str(rov), str(typed), str(sample), str(mode))
+                           for rov in range(2) for typed in range(2) for sample in range(2) for mode in range(5)]
+    begins = re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_BEGIN rov=([01]) typed=([01]) sample=([01]) mode=([0-4])$", stdout, re.MULTILINE)
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and pixel_rows == begins == expected_pixel_rows
+               and cases == ["atomic64_pixel_coupled_color_depth_stencil_query"] * 40
+               and stdout.splitlines().count("OWNED_D3D12_ATOMIC64_PIXEL_PASS cases=40 failures=0") == 1
+               and len(re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CAP typed=1$", stdout, re.MULTILINE)) == 1
+               and not re.search(r"OWNED_D3D12_SM6_(?:MISMATCH|CASE_FAIL|FAIL)|OWNED_D3D12_ATOMIC64_PIXEL_FAIL", stdout + stderr))
+    return success, dxil_compiler_loaded, pixel_rows
+
+
+def atomic64_pixel_contention_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool, list[tuple[str, str]]]:
+    dxil_compiler_loaded = native_compiler_proof
+    contention_rows = re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_CASE operation=(add|cas) targets=(1|16) "
+                                 r"fragments=4096 old_values=4096 pixels=4096 status=PASS$", stdout, re.MULTILINE)
+    begins = re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_BEGIN operation=(add|cas) targets=(1|16) fragments=4096$",
+                        stdout, re.MULTILINE)
+    expected_contention = [(operation, str(targets)) for operation in ("add", "cas") for targets in (1, 16)]
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and contention_rows == begins == expected_contention
+               and stdout.count("OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_CASE ") == 4
+               and stdout.count("OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_BEGIN ") == 4
+               and cases == ["atomic64_pixel_contention_full64_multiset_color_guards"] * 4
+               and stdout.splitlines().count("OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_PASS cases=4 fragments=4096 failures=0") == 1
+               and len(re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_CAP typed=1$", stdout, re.MULTILINE)) == 1
+               and not re.search(r"OWNED_D3D12_SM6_(?:MISMATCH|CASE_FAIL|FAIL)|OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_FAIL", stdout + stderr))
+    return success, dxil_compiler_loaded, contention_rows
+
+
+def atomic64_groupshared_output_matches(args: argparse.Namespace, stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    capacity = args.suite.endswith("-capacity")
+    mode = "capacity" if capacity else "operations-stress"
+    expected = ["atomic64_groupshared_32k_capacity"] if capacity else [
+        "atomic64_groupshared_operations", "atomic64_groupshared_stress"]
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and cases == expected
+               and len(re.findall(r"^OWNED_D3D12_SM6_CAPS .* atomic64_groupshared=1 ", stdout, re.MULTILINE)) == 1
+               and stdout.splitlines().count(f"OWNED_D3D12_ATOMIC64_RESULT mode={mode} failures=0") == 1
+               and stdout.splitlines().count(f"OWNED_D3D12_ATOMIC64_PASS mode={mode}") == 1
+               and not re.search(r"OWNED_D3D12_SM6_(?:MISMATCH|CASE_FAIL|FAIL)|OWNED_D3D12_ATOMIC64_FAIL",
+                                 stdout + stderr))
+    return success, dxil_compiler_loaded
+
+
+def view_instancing_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    # VIEWINST: every case passes in order with exact pixels, Tier 1 statistics count one draw per enabled
+    # view, and the device reports exactly ViewInstancingTier 1.
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_VIEW_INSTANCING_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+    statistics = re.findall(r"^OWNED_D3D12_VIEW_INSTANCING_STATISTICS views=(\d) ia_vertices=(\d+) "
+                            r"ia_primitives=(\d+) vs=(\d+) c_invocations=(\d+) c_primitives=(\d+) ps=(\d+)$",
+                            stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == VIEW_INSTANCING_CASES
+               and statistics == [("3", "9", "3", "9", "3", "3", "192"), ("2", "6", "2", "6", "2", "2", "128")]
+               and f"OWNED_D3D12_VIEW_INSTANCING_PASS cases={len(VIEW_INSTANCING_CASES)} tier=1" in stdout
+               and "OWNED_D3D12_VIEW_INSTANCING_MISMATCH" not in stderr
+               and "OWNED_D3D12_VIEW_INSTANCING_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def vrs_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    # VRS: the advertised Tier2 contract must pass every stage, source, viewport and submission case.
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_VRS_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == VRS_CASES
+               and "OWNED_D3D12_VRS_COMMON_SUBMISSION_PASS capture=S_OK submission=887a0005 promotion=0" in stdout
+               and "OWNED_D3D12_VRS_CAPS tier=2 additional=1 tile=8 per_primitive_viewports=1" in stdout
+               and f"OWNED_D3D12_VRS_PASS cases={len(VRS_CASES)}" in stdout
+               and "OWNED_D3D12_VRS_MISMATCH" not in stderr
+               and "OWNED_D3D12_VRS_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def sampler_feedback_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    # FEEDBACK: every case passes in order against the CPU oracle and the device reports SamplerFeedbackTier 1.0.
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_SAMPLER_FEEDBACK_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == SAMPLER_FEEDBACK_CASES
+               and f"OWNED_D3D12_SAMPLER_FEEDBACK_PASS cases={len(SAMPLER_FEEDBACK_CASES)} tier=100" in stdout
+               and "OWNED_D3D12_SAMPLER_FEEDBACK_MISMATCH" not in stderr
+               and "OWNED_D3D12_SAMPLER_FEEDBACK_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def sharing_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    # Every sharing case passes in order, the child process reported success, and
+    # only verified cross-adapter caps are claimed.
+    cases = re.findall(r"^OWNED_D3D12_SHARING_CASE ([\w-]+) status=PASS$", stdout, re.MULTILINE)
+    success = (success and tuple(cases) == SHARING_CASES
+               and stdout.count("OWNED_D3D12_SHARING_CHILD ok") == 1
+               and stdout.count("OWNED_D3D12_SHARING_CHILD_REWIND value=15") == 1
+               and stdout.count("OWNED_D3D12_SHARING_CHILD_LATCH event=1 queue=1 late=1 current=0") == 1
+               and stdout.count("OWNED_D3D12_SHARING_STRESS signals=3000 final=3000") == 1
+               and stdout.count("OWNED_D3D12_SHARING_NAMED_CHILD ok rewind=40") == 1
+               and stdout.count("OWNED_D3D12_SHARING_ADAPTER_LUID_PASS") == 1
+               and "OWNED_D3D12_SHARING_CAPS cross_node=0 row_major=1" in stdout
+               and f"OWNED_D3D12_SHARING_PASS cases={len(SHARING_CASES)}" in stdout
+               and "OWNED_D3D12_SHARING_FAIL" not in stdout + stderr
+               and "OWNED_D3D12_SHARING_MISMATCH" not in stdout + stderr)
+    return success
+
+
+def resources_output_matches(stdout: str, success: bool) -> bool:
+    success = (success
+               and stdout.count("OWNED_D3D12_RESOURCES_PASS owned_backend=1 resource_contracts=1") == 1
+               and stdout.count("OWNED_D3D12_RESOURCES_ALIASING_GPU_PASS ") == 1
+               and stdout.count("OWNED_D3D12_RESOURCES_VIEW_HASH_GPU texture_keys=64 buffer_keys=64 "
+                                "repeats=64 generations=2 probes=320 words=2560 guards=1 "
+                                "incremental_keys=1 resource_replacement=1") == 1
+               and stdout.count("ordered_snapshots=4 barriers=first_to_second,second_to_first "
+                                "inheritance=bidirectional") == 1)
+    return success
+
+
+def atomic_copy_output_matches(args: argparse.Namespace, stdout: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"OWNED_D3D12_ATOMIC_COPY_CASE_PASS list=(\w+) uint32=1 dependencies=0,1 ordered=1",
+                       stdout)
+    cases64 = re.findall(r"OWNED_D3D12_ATOMIC_COPY64_CASE_PASS list=(\w+) scenarios=6 "
+                         r"dependencies=0,2 exact=1", stdout)
+    live = re.findall(r"OWNED_D3D12_ATOMIC_COPY64_LIVE_(OBSERVED|INCONCLUSIVE) observed=(\d+) "
+                      r"changed_threads=(\d+) first=(\d+) last=(\d+) atomic64_snapshot=unproven", stdout)
+    live_observed = (len(live) == 1 and live[0][0] == "OBSERVED"
+                     and 0 < int(live[0][2]) <= int(live[0][1])
+                     and int(live[0][3]) < int(live[0][4]))
+    success = (success and dxil_compiler_loaded and cases == ["direct", "compute", "copy"]
+               and cases64 == ["direct", "compute", "copy"]
+               and (args.suite != "atomic-copy-live" or live_observed)
+               and stdout.count("OWNED_D3D12_ATOMIC_COPY64_COMPUTE_PASS list=0 "
+                                "predication_false=1 payload=1") == 1
+               and stdout.count("OWNED_D3D12_ATOMIC_COPY64_COMPUTE_PASS list=2 "
+                                "predication_false=0 payload=1") == 1
+               and stdout.count("OWNED_D3D12_ATOMIC_COPY64_LIFETIME_PASS replay=2 released_list=1") == 1
+               and stdout.count("OWNED_D3D12_ATOMIC_COPY64_CONTROL_PASS threads=256 final=128 payload=1") == 1
+               and stdout.count("OWNED_D3D12_ATOMIC_COPY_VALIDATION_PASS cases=33") == 1
+               and stdout.count("OWNED_D3D12_ATOMIC_COPY_PASS uint32=1 uint64=1") == 1)
+    return success, dxil_compiler_loaded
+
+
+def present_queues_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    success = (success
+               and stdout.count("OWNED_D3D12_PRESENT_QUEUES_VALIDATION_PASS rejected=12 preserved=1") == 1
+               and stdout.count("OWNED_D3D12_PRESENT_QUEUES_ROTATION_PASS buffer0=queue_a buffer1=queue_b "
+                                "blocked=1 released=1 ordered=1") == 1
+               and stdout.count("OWNED_D3D12_PRESENT_QUEUES_PLAIN_RESIZE_PASS buffers=3 "
+                                "creation_queue=1") == 1
+               and stdout.count("OWNED_D3D12_PRESENT_QUEUES_RESTART_PASS queued_discard=1 credit=1 "
+                                "release_restores=1") == 1
+               and stdout.count("OWNED_D3D12_PRESENT_QUEUES_RESTART_NATIVE_PASS discarded=2 credit=1 "
+                                "presented=restart_only") == 1)
+    # Native decision per drawable: only the restart frame is committed and handed to Core Animation.
+    native_window = stderr.partition("RESTART_NATIVE_BEGIN")[2].partition("RESTART_NATIVE_END")
+    native_decisions = re.findall(r"OWNED_GRAPHICS_NATIVE_PRESENT_DECISION present_id=(\d+) reserved=([01]), presented=([01]) "
+                                  r"reason=(\w+)", native_window[0])
+    success = (success and bool(native_window[1])
+               and sorted(native_decisions) == [("3", "1", "1", "current")])
+    return success
+
+
+def hdr_metadata_output_matches(stdout: str, stderr: str, success: bool) -> tuple[bool, list[str]]:
+    frames = re.findall(r"OWNED_D3D12_HDR_METADATA_FRAME frame=(\d+) source_pixels=3072 "
+                        r"exact=1 fence=complete present=ok", stdout)
+    success = (success and frames == [str(n) for n in range(7)]
+               and stdout.count("OWNED_D3D12_HDR_METADATA_VALIDATION_PASS invalid=4 unsupported=2") == 1
+               and stdout.count("OWNED_D3D12_HDR_METADATA_LIFECYCLE_PASS before=1 set=1 "
+                                "replaced=1 cleared=1 caller_modified=1") == 1
+               and stdout.count("OWNED_D3D12_HDR_METADATA_RESIZE_PASS format=r10g10b10a2 frames=2") == 1
+               and stdout.count("OWNED_D3D12_HDR_METADATA_PENDING_PASS accepted=1 "
+                                "replaced_before_release=1 next_present=1") == 1
+               and stdout.count("OWNED_D3D12_HDR_METADATA_PASS frames=7 source_readback=1 "
+                                "gpu_fence=1 present=1") == 1
+               and "OWNED_D3D12_HDR_METADATA_FAIL" not in stdout + stderr)
+    return success, frames
+
+
+def colorspace_output_matches(stdout: str, stderr: str, success: bool) -> tuple[bool, list[tuple[str, str]]]:
+    frames = re.findall(r"OWNED_D3D12_COLORSPACE_FRAME format=(\d+) frame=(\d+) "
+                        r"source_pixels=3072 exact=1 fence=complete present=ok", stdout)
+    success = (success and len(frames) == 13
+               and [int(frame) for _, frame in frames] == list(range(13))
+               and {int(fmt) for fmt, _ in frames} == {28, 10, 24}
+               and stdout.count("OWNED_D3D12_COLORSPACE_CONTRACT mapped=4 rejected=23 "
+                                "null=invalidarg post_reject_frame=ok") == 1
+               and stdout.count("OWNED_D3D12_COLORSPACE_FAILED_RESIZE rejected=1 "
+                                "desc_preserved=1 next_frame=ok") == 1
+               and stdout.count("OWNED_D3D12_COLORSPACE_RESIZE same=1 format=28 frame=ok") == 1
+               and stdout.count("OWNED_D3D12_COLORSPACE_RESIZE same=0 format=24 frame=ok") == 1
+               and stdout.count("OWNED_D3D12_COLORSPACE_RESIZE same=0 format=10 frame=ok") == 1
+               and stdout.count("OWNED_D3D12_COLORSPACE_PENDING accepted=1 "
+                                "setter_before_release=1 queue_rotation=1 next_frame=ok") == 1
+               and stdout.count("OWNED_D3D12_COLORSPACE_PASS frames=13 formats=3 "
+                                "source_readback=1 present=1") == 1
+               and "OWNED_D3D12_COLORSPACE_FAIL " not in stdout + stderr)
+    return success, frames
+
+
+def fullscreen_output_matches(stdout: str, stderr: str, runtime: Path, arch: dict, success: bool) -> bool:
+    # D3D12 has a product export for its identity; D3D11 does not. The
+    # verified staged runtime and Wine's actual D3D11 builtin module load
+    # prove the latter instead of inventing an identity export for that API.
+    module = r'Loaded L"C:\\windows\\system32\\d3d11.dll"'
+    module_loads = (runtime / arch["windows_directory"] / "d3d11.dll").is_file() and any(
+        module.lower() in line.lower() and "builtin" in line.lower() for line in stderr.splitlines())
+    success = (success and module_loads
+               and stdout.count("OWNED_DXGI_FULLSCREEN_D3D11_DEVICE feature_level=0x") == 1
+               and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_FRAME api=(d3d11|d3d12) "
+                                     r"pixels=3888 exact=1 (?:fence|query)=complete present=ok", stdout))
+                   == ["d3d11", "d3d12"]
+               and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_TRANSITION api=(d3d11|d3d12) "
+                                     r"enter=1 resize=1 frame=1 leave=1 rect=restored", stdout))
+                   == ["d3d11", "d3d12"]
+               and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_REPEAT api=(d3d11|d3d12) "
+                                     r"cycles=2 restored=1", stdout)) == ["d3d11", "d3d12"]
+               and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_ERRORS api=(d3d11|d3d12) "
+                                     r"invalid=1 qi=1 desc=1 mode=1 resize=1 reentrant=1 "
+                                     r"native_enter=1 native_leave=1 preserved=1", stdout)) == ["d3d11", "d3d12"]
+               and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_CREATION api=(d3d11|d3d12) "
+                                     r"native=1 windowed=1 rect=restored", stdout)) == ["d3d11", "d3d12"]
+               and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_INVALID_CREATION api=(d3d11|d3d12) "
+                                     r"rejected=1 null_output=1", stdout)) == ["d3d11", "d3d12"])
+    return success
+
+
+def stream_output_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    # GS streams 0-3: per-stream slot bytes, BufferFilledSize and SO_STATISTICS_STREAM0..3, DXBC then DXIL
+    # (3 + 3 points; emissions per point: stream 0 one, 1 two, 2 one (never declared), 3 three).
+    gs_streams = [
+        ("gs-streams-0-1", "6,12,0,0", "6,12,0,0", "96,96,0,0"),
+        ("gs-streams-3-split-1", "0,12,0,18", "0,12,0,18", "216,0,72,48"),
+        ("gs-streams-overflow", "6,12,0,5", "6,12,0,18", "96,96,20,40"),
+        ("gs-streams-raster0", "0,12,0,18", "0,12,0,18", "96,72,0,0"),
+    ]
+    found_gs = re.findall(r"^OWNED_D3D12_STREAM_OUTPUT_GS_STREAM_PASS case=([\w-]+) shader=(dxbc|dxil) "
+                          r"written=([\d,]+) needed=([\d,]+) filled=([\d,]+)$", stdout, re.MULTILINE)
+    success = success and found_gs == [(name, shader, *rest) for shader in ("dxbc", "dxil")
+                                       for name, *rest in gs_streams]
+    success = (success and stdout.count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=122") == 1
+               and stdout.count("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=53") == 1
+               and stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS ") == 55
+               and stdout.count("OWNED_D3D12_STREAM_OUTPUT_NO_RASTER_DISTANCE_PASS cases=2") == 1
+               and "OWNED_D3D12_STREAM_OUTPUT_PASS validation=1 capture=1" in stdout
+               and "OWNED_D3D12_STREAM_OUTPUT_FAIL" not in stdout + stderr
+               and stdout.count("OWNED_D3D12_STREAM_OUTPUT_QUERY_GPU_PASS streams=0,1,2,3 "
+                                "written=0 needed=0 offset=24 guards=1") == 1)
+    return success
+
+
+def so_format_support_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    names = [f"R32{'G32' if n >= 2 else ''}{'B32' if n >= 3 else ''}{'A32' if n >= 4 else ''}_{kind}"
+             for kind in ("FLOAT", "SINT", "UINT") for n in range(1, 5)]
+    words = (("3fa00000", "c0200000", "40700000", "c0900000"),
+             ("fffffff9", "12345678", "ffffff9d", "7fffffff"),
+             ("89abcdef", "00000011", "fedcba98", "76543210"))
+    gpu = re.findall(r"OWNED_D3D12_SO_FORMAT_SUPPORT_GPU format=(\w+) words=(\d+) "
+                     r"bits=([0-9a-f,]+) bytes=(\d+) counters=(\d+),(\d+) guards=1 ia=1", stdout)
+    expected_gpu = [(name, str(n), ",".join(words[k][:n]), str(4 * n), str(4 * n), str(4 * n))
+                    for k in range(3) for n in range(1, 5) for name in [names[4 * k + n - 1]]]
+    capabilities = re.findall(r"OWNED_D3D12_SO_FORMAT_SUPPORT_CAP format=(\w+) so_buffer=1", stdout)
+    negatives = re.findall(r"OWNED_D3D12_SO_FORMAT_SUPPORT_NEGATIVE format=(\w+) so_buffer=0", stdout)
+    success = (success and gpu == expected_gpu and capabilities == names
+               and negatives == ["UNKNOWN", "R32_TYPELESS", "R32G32B32_TYPELESS",
+                                 "R16_FLOAT", "R16G16B16A16_UINT", "R8G8B8A8_UNORM",
+                                 "R32_FLOAT_X8X24_TYPELESS", "D32_FLOAT"]
+               and stdout.count("OWNED_D3D12_SO_FORMAT_SUPPORT_PASS gpu=12 capabilities=12 "
+                                "negatives=8 ia=12") == 1
+               and "OWNED_D3D12_SO_FORMAT_SUPPORT_FAIL" not in stdout + stderr)
+    return success
+
+
+def format_support_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    success = (success and re.search(r"OWNED_D3D12_FORMAT_SUPPORT_MATRIX formats=98 "
+                                     r"texture2d=\d+ buffer=\d+ compressed=21", stdout) is not None
+               and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_SRGB_UAV_PASS "
+                                "formats=RGBA8,BGRA8 bytes=64 preserved=1") == 1
+               and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_DEPTH_GPU_PASS "
+                                "planes=depth,stencil typed_combined=dsv_only mip=1") == 1
+               and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_SINGLE_DEPTH_GPU_PASS "
+                                "typed=dsv_only aliases=R32_FLOAT,R16_UNORM load=1 comparison=1") == 1
+               and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_CAST_GPU_PASS "
+                                "typed_resource=R8G8B8A8_UNORM views=linear,srgb") == 1
+               and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_CAST_GROUPS_GPU_PASS "
+                                "r16=uint_to_half rgba32=uint_to_float bc1=linear_to_srgb") == 1
+               and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_MIP_GPU_PASS "
+                                "formats=R32_UINT,R8G8B8A8_TYPELESS mip=1") == 1
+               and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_PASS") == 1
+               and "OWNED_D3D12_FORMAT_SUPPORT_FAIL" not in stdout + stderr)
+    return success
+
+
+def multisample_capabilities_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    gpu_cases = re.findall(
+        r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_GPU_CASE_PASS "
+        r"format=([0-9]+) view=([0-9]+) count=([0-9]+) quality=([0-9]+) depth=([0-9]+)", stdout)
+    expected_cases = {(str(resource), str(view), str(count), str(quality), str(depth))
+                      for count in (2, 4, 8)
+                      for resource, view, quality, depth in
+                      ((28, 28, 0xffffffff, 0), (28, 28, 0, 0),
+                       (27, 28, 0, 0), (42, 42, 0, 0),
+                       (40, 40, 0, 1), (39, 40, 0, 1), (20, 20, 0, 1))}
+    rejected = re.findall(
+        r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_REJECT "
+        r"format=([0-9]+) count=([0-9]+) quality=([0-9]+) hr=([0-9a-f]+)", stdout)
+    rejected_cases = {(int(fmt), int(count), int(quality)) for fmt, count, quality, _ in rejected}
+    required_rejections = {(28, count, 0) for count in (0, 3, 16, 32, 0xffffffff)}
+    required_rejections |= {(28, count, 1) for count in (2, 4, 8)}
+    required_rejections |= {(71, 4, 0), (28, 1, 1), (28, 1, 0xfffffffe)}
+    center_cases = re.findall(
+        r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_CENTER_GPU_PASS count=([0-9]+) coverage=([0-9]+)", stdout)
+    center_masks = re.findall(
+        r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_CENTER_MASK_GPU_PASS count=([0-9]+) mask=([0-9]+)", stdout)
+    center_depth = re.findall(
+        r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_CENTER_DEPTH_GPU_PASS count=([0-9]+)", stdout)
+    programmable = re.findall(
+        r"^OWNED_D3D12_MULTISAMPLE_CAPABILITIES_PROGRAMMABLE_GPU_PASS count=(\d+) depth=(\d+)$",
+        stdout, re.MULTILINE)
+    resolves = re.findall(
+        r"^OWNED_D3D12_MULTISAMPLE_CAPABILITIES_RESOLVE_GPU_PASS count=(\d+) depth=(\d+) "
+        r"mode=(\d+) no_target_flag=1$", stdout, re.MULTILINE)
+    integer_resolves = re.findall(
+        r"^OWNED_D3D12_MULTISAMPLE_CAPABILITIES_RESOLVE_INTEGER_GPU_PASS count=(\d+) stencil=(\d+) "
+        r"mode=(\d+) no_target_flag=1$", stdout, re.MULTILINE)
+    decompressions = re.findall(
+        r"^OWNED_D3D12_MULTISAMPLE_CAPABILITIES_DECOMPRESS_GPU_PASS count=(\d+) depth=(\d+) "
+        r"plane=(\d+) partial=1 no_target_flag=1$", stdout, re.MULTILINE)
+    success = (success and len(gpu_cases) == len(expected_cases)
+               and set(gpu_cases) == expected_cases
+               and len(programmable) == 6
+               and set(programmable) == {(str(count), str(depth))
+                                         for count in (2, 4, 8) for depth in (0, 1)}
+               and len(resolves) == 18
+               and set(resolves) == {(str(count), str(depth), str(mode))
+                                     for count in (2, 4, 8) for depth in (0, 1) for mode in (1, 2, 3)}
+               and len(integer_resolves) == 12
+               and set(integer_resolves) == {(str(count), str(stencil), str(mode))
+                                             for count in (2, 4, 8) for stencil in (0, 1) for mode in (1, 2)}
+               and len(decompressions) == 12
+               and set(decompressions) == {(str(count), str(depth), str(plane))
+                                           for count in (1, 2, 4, 8) for depth in (0, 1)
+                                           for plane in range(depth + 1)}
+               and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_PROGRAMMABLE_LIFECYCLE_PASS "
+                                "switches=2 replay=6 reset=6 clearstate=6 crosslist=6 bundles=6") == 1
+               and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_PROGRAMMABLE_ERRORS_PASS "
+                                "rejected=13 first_error=E_INVALIDARG") == 1
+               and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_RESOLVE_LIFECYCLE_PASS "
+                                "inplace=8 separate=8 partial=12 planes=4") == 1
+               and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_CUSTOM_DEPTH_COPY_GPU_PASS "
+                                "count=4 planes=2 other_plane=1") == 1
+               and len(center_cases) == 3
+               and set(center_cases) == {("2", "3"), ("4", "15"), ("8", "255")}
+               and len(center_masks) == 3
+               and set(center_masks) == {("2", "1"), ("4", "5"), ("8", "85")}
+               and len(center_depth) == 3 and set(center_depth) == {"2", "4", "8"}
+               and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_SEMANTIC_GPU_PASS "
+                                "rgba=0.750,0.500,0.125,0.250") == 1
+               and required_rejections.issubset(rejected_cases)
+               and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_PASS") == 1
+               and "OWNED_D3D12_MULTISAMPLE_CAPABILITIES_FAIL" not in stdout + stderr)
+    return success
+
+
+def geometry_output_matches(args: argparse.Namespace, stdout: str, stderr: str, success: bool) -> bool:
+    # GSTS: the DXBC matrix always runs; once frozen <suite>-*.dxil inputs exist the DXIL matrix must pass with
+    # exactly the DXBC case list.
+    prefix = SUITE_PREFIXES[args.suite]
+    matrix_cases = {"geometry": 87, "tessellation": 166}[args.suite]
+    dxil_frozen = (args.dxil_dir / f"{args.suite}-vs_pass.dxil").exists()
+    # A case is identified by its name plus the tessellation domain/partition it ran with.
+    case_names = [(shader, name + qualifier) for shader, name, qualifier in re.findall(
+        rf"^{prefix}_CASE_PASS shader=(dxbc|dxil) case=([\w-]+)((?: domain=\w+ partition=\w+)?)",
+        stdout, re.MULTILINE)]
+    dxbc_cases = [name for shader, name in case_names if shader == "dxbc"]
+    dxil_cases = [name for shader, name in case_names if shader == "dxil"]
+    matrices = re.findall(rf"^{prefix}_MATRIX_PASS shader=(dxbc|dxil) cases=(\d+)$", stdout, re.MULTILINE)
+    success = (success
+               and len(dxbc_cases) == len(set(dxbc_cases)) and bool(dxbc_cases)
+               and matrices == ([("dxbc", str(matrix_cases)), ("dxil", str(matrix_cases))] if dxil_frozen
+                                else [("dxbc", str(matrix_cases))])
+               and (dxil_cases == dxbc_cases if dxil_frozen
+                    else not dxil_cases and f"{prefix}_DXIL_SKIPPED" in stdout)
+               and re.findall(rf"^{prefix}_PASS$", stdout, re.MULTILINE) == [f"{prefix}_PASS"]
+               and f"{prefix}_CASE_FAIL" not in stdout + stderr
+               and f"{prefix}_MISMATCH" not in stdout + stderr)
+    mutation_kinds = ["gs", "stripcut", "adjacency"] if args.suite == "geometry" else ["ts", "tsgs"]
+    mutation_cases = [f"indirect-mutation-{kind}{suffix}" for kind in mutation_kinds for suffix in ("", "-so")]
+    if args.suite == "tessellation":
+        mutation_cases += ["indirect-mutation-ts-so-no-raster", "indirect-mutation-ts-so-overflow",
+                           "indirect-mutation-ts-so-no-raster-overflow",
+                           "ds-so-fractional-tri-order", "ds-so-fractional-quad-order",
+                           "ds-so-isoline-points", "ds-so-isoline-lines"]
+        domain_so = re.findall(rf"^{prefix}_DOMAIN_SO shader=(dxbc|dxil) case=([\w-]+) bytes=(\d+) "
+                               rf"written=(\d+) needed=(\d+) ds=(\d+) c=(\d+) ps=(\d+)$",
+                               stdout, re.MULTILINE)
+        expected_domain_so = [(shader, "indirect-mutation-ts-so" + suffix, size, written, "2", "6", clip, ps)
+                              for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+                              for suffix, size, written, clip, ps in (
+                                  ("", "192", "2", "2", "2"),
+                                  ("-no-raster", "192", "2", "0", "0"),
+                                  ("-overflow", "96", "1", "2", "2"),
+                                  ("-no-raster-overflow", "96", "1", "0", "0"))]
+        success = success and sorted(domain_so) == sorted(expected_domain_so)
+    success = success and all(dxbc_cases.count(case) == 1 for case in mutation_cases)
+    if args.suite == "geometry":
+        # GS streams 0-3: per-stream written/needed counters, GSPrimitives over every stream and the clipper
+        # count of the rasterized stream, for both shader kinds.
+        multi_stream = [
+            ("so-streams2-raster0", "2,4,0,0", "2,4,0,0", "6", "2"),
+            ("so-streams2-raster1", "2,4,0,0", "2,4,0,0", "6", "4"),
+            ("so-streams4-raster2", "2,4,6,8", "2,4,6,8", "20", "6"),
+            ("so-streams4-no-raster", "2,4,6,8", "2,4,6,8", "20", "0"),
+            ("so-streams4-overflow", "2,3,6,5", "2,4,6,8", "20", "8"),
+            # ExecuteIndirect: two GPU-counted commands of both points append in API order.
+            ("so-streams2-indirect", "4,8,0,0", "4,8,0,0", "12", "8"),
+            ("so-streams4-indirect-overflow", "4,3,8,5", "4,8,12,16", "40", "16"),
+        ]
+        found = re.findall(rf"^{prefix}_CASE_PASS shader=(dxbc|dxil) case=(so-streams[\w-]+) written=([\d,]+) "
+                           rf"needed=([\d,]+) gs=(\d+) c=(\d+)$", stdout, re.MULTILINE)
+        success = success and found == [(shader, *case) for shader in
+                                        (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+                                        for case in multi_stream]
+        # MSAA GS draws with a forced-early-depth PS (claim buffer): PSInvocations of the direct, indirect and
+        # indirect-SO draws with an occluder, and of the direct draw without it, equal the CPU oracle.
+        early = re.findall(rf"^{prefix}_EARLY_DEPTH_STATISTICS shader=(dxbc|dxil) samples=(\d) "
+                           rf"ps=([\d,]+) oracle=([\d,]+)$", stdout, re.MULTILINE)
+        expected_early = [("2", "57,57,57,75", "57,75"), ("4", "71,71,71,95", "71,95"),
+                          ("8", "86,86,86,113", "86,113")]
+        # Indirect GS strips with a cut / triangle strip with adjacency: indirect == direct (filled SO bytes).
+        strips = re.findall(rf"^{prefix}_STRIP_EXPANSION shader=(dxbc|dxil) case=([\w-]+) .* "
+                            rf"filled=(\d+)/(\d+)$", stdout, re.MULTILINE)
+        expected_strips = [("indirect-strip-cut", "0", "0"), ("indirect-strip-cut-so", "2304", "2304"),
+                           ("indirect-triadj-strip", "0", "0"), ("indirect-triadj-strip-so", "1920", "1920")]
+        shaders = ("dxbc", "dxil") if dxil_frozen else ("dxbc",)
+        success = (success
+                   and early == [(shader, *case) for shader in shaders for case in expected_early]
+                   and strips == [(shader, *case) for shader in shaders for case in expected_strips])
+    if args.suite == "tessellation":
+        # MSAA HS/DS and HS/DS/GS draws with a forced-early-depth PS (claim buffer): direct and indirect
+        # PSInvocations equal the CPU oracle at 2x/4x/8x.
+        early = re.findall(rf"^{prefix}_EARLY_DEPTH_STATISTICS shader=(dxbc|dxil) case=([\w-]+) "
+                           rf"ps=([\d,]+) oracle=(\d+) c=(\d+)$", stdout, re.MULTILINE)
+        expected_early = [("ds-early-depth-msaa2", "269,269", "269", "4"),
+                          ("tsgs-early-depth-msaa2", "538,538", "538", "8"),
+                          ("ds-early-depth-msaa4", "287,287", "287", "4"),
+                          ("tsgs-early-depth-msaa4", "574,574", "574", "8"),
+                          ("ds-early-depth-msaa8", "301,301", "301", "4"),
+                          ("tsgs-early-depth-msaa8", "602,602", "602", "8")]
+        success = success and early == [(shader, *case) for shader in
+                                         (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+                                         for case in expected_early]
+    return success
+
+
+def indexed_restart_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    case_passes = re.findall(
+        r"OWNED_D3D12_INDEXED_RESTART_CASE_PASS shader=(dxbc|dxil) case=([\w-]+) "
+        r"compared=(\d+) nonzero=(\d+) primitives=(\d+)", stdout)
+    success = (success and dxil_compiler_loaded
+               and stdout.count("OWNED_D3D12_INDEXED_RESTART_MATRIX_PASS "
+                                "shaders=dxbc,dxil cases=31") == 1
+               and len(case_passes) == 62
+               and [name for shader, name, *_ in case_passes if shader == "dxbc"] ==
+                   [name for shader, name, *_ in case_passes if shader == "dxil"]
+               and "OWNED_D3D12_INDEXED_RESTART_CASE_FAIL" not in stdout + stderr)
+    return success, dxil_compiler_loaded
+
+
+def copy_resolve_output_matches(stdout: str, success: bool) -> bool:
+    success = (success
+               and stdout.count("OWNED_D3D12_COPY_RESOLVE_PASS average=2.5 min=1 max=4 "
+                                "guard=99 uav=1 aliasing=1") == 1
+               and stdout.count("OWNED_D3D12_COPY_RESOLVE_MSAA_PREDICATION_PASS") == 1
+               and stdout.count("OWNED_D3D12_COPY_RESOLVE_PREDICATE_SNAPSHOT_PASS") == 1
+               and stdout.count("OWNED_D3D12_COPY_RESOLVE_RGBA_PASS") == 1
+               and stdout.count("OWNED_D3D12_COPY_RESOLVE_DEPTH_STENCIL_PASS") == 1)
+    return success
+
+
+def predication_indirect_output_matches(stdout: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    success = (success and dxil_compiler_loaded
+               and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_CLEAR_CASES_PASS") == 1
+               and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_INDIRECT_CASES_PASS") == 1
+               and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_PREDICATE_SNAPSHOT_PASS "
+                                "saved=1 source_updated=0 copy_predicated=1 resnap_skip_observed=1") == 1
+               and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_TYPED_MULTILAYER_CLEARS_PASS "
+                                "rtv=R16G16B16A16_UINT dsv=D32_FLOAT_S8X24_UINT "
+                                "uav=R32G32B32A32_UINT layers=2 rect_preservation=1 "
+                                "component_preservation=1 predicate_preservation=1") == 1
+               and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_TYPED_FLOAT_UAV_PASS "
+                                "format=R32G32B32A32_FLOAT layers=2 rect_preservation=1 "
+                                "predicate_preservation=1") == 1
+               and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_BUFFER_UAV_PASS cases=60 "
+                                "view_relative=1 clipping=1 sentinels=1 predicate_preservation=1") == 1)
+    return success, dxil_compiler_loaded
+
+
+def ngx_output_matches(stdout: str, success: bool) -> tuple[bool, list[str]]:
+    frames = re.findall(r"OWNED_D3D12_NGX_FRAME_PASS frame=(\d+)\b", stdout)
+    number = r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+    compatibility = re.findall(
+        r"^OWNED_D3D12_NGX_BEHAVIOR_PASS case=(\w+) replay=(\d+) exposure_scale=" + number
+        + r" mv_offset_x=" + number + r" mv_offset_y=" + number
+        + r" max_byte_delta=(\d+) sentinel=1 live_inputs=1 params_destroyed=1 "
+          r"released_before_submit=1 highres_jittered=([01])$", stdout, re.MULTILINE)
+    expected_compatibility = {
+        "exposure_scale_auto": (2.0, 0.0, 0.0, 0),
+        "exposure_scale_texture": (2.0, 0.0, 0.0, 0),
+        "exposure_scale_no_texture": (0.375, 0.0, 0.0, 0),
+        "mv_value_offsets_lowres": (1.0, -1.25, 2.5, 0),
+        "mv_value_offsets_highres_jittered": (1.0, -0.375, 0.625, 1),
+    }
+    success = (success and frames == [str(n) for n in range(8)]
+               and [(name, int(replay)) for name, replay, *_ in compatibility]
+                   == [(name, replay) for name in expected_compatibility for replay in range(3)]
+               and all((float(scale), float(offset_x), float(offset_y), int(highres))
+                       == expected_compatibility[name] and int(delta) <= 1
+                       for name, _, scale, offset_x, offset_y, delta, highres in compatibility)
+               and stdout.count("OWNED_D3D12_NGX_BEHAVIOR_PASS case=rejected_output_preserved "
+                                "invalid_input_bounds=1 invalid_compatibility_scalars=5 sentinel=1") == 1)
+    return success, frames
+
+
+def fsr_rr_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    # One 1.2 seven-signal dispatch, six legacy mode dispatches and four legacy temporal runs.
+    signals = re.findall(r"^OWNED_D3D12_FSR_RR_SIGNAL api=([0-9a-f]+) mode=(\d) temporal=([01]) signal=(\d) ", stdout, re.MULTILINE)
+    runs = {(api, mode, temporal) for api, mode, temporal, _ in signals}
+    # Each run reads back every created signal: 1.2 has seven; legacy modes 0/1/2 add the
+    # dominant light to four/two/one radiance signals. Legacy temporal runs use mode 2 twice per version.
+    expected = {"402000": 7, "0": 5, "1": 3, "2": 2}
+    success = (success and len(runs) == 9 and len(signals) == 7 + 2 * (5 + 3 + 2) + 4 * 2
+               and all(sum(1 for item in signals if item[:3] == run) ==
+                       expected["402000" if run[0] == "402000" else run[1]] * (2 if run[2] == "1" else 1)
+                       for run in runs)
+               and stdout.splitlines().count("OWNED_D3D12_FSR_RR_LEGACY_TEMPORAL_PASS versions=2 depth_delta=selects_history") == 1
+               and "OWNED_D3D12_FSR_RR_FAIL" not in stdout + stderr)
+    return success
+
+
+def fsr_output_matches(stdout: str, stderr: str, success: bool) -> tuple[bool, list[str]]:
+    frames = re.findall(r"OWNED_D3D12_FSR_FRAME_PASS frame=(\d+)\b", stdout)
+    replays = re.findall(r"OWNED_D3D12_FSR_REPLAY_PASS replay=(\d+) .*"
+                         r"destroyed_before_submit=1 sentinel=1 changed_gpu_input=(\d+)", stdout)
+    exposures = re.findall(r"OWNED_D3D12_FSR_EXPOSURE_PASS format=(\d+) value=1 .* sentinel=1", stdout)
+    cases = Counter(re.findall(r"OWNED_D3D12_FSR_BEHAVIOR_PASS case=(\w+)\b", stdout))
+    required_cases = {
+        "zero_motion_resolution_jitter_equivalence": 2, "auto_exposure_ignores_poison_texture": 3,
+        "nonzero_motion_scale_equivalence": 3, "nonzero_motion_effect": 3,
+        "sharpen_constant_invariance": 1, "sharpen_edge_alpha": 1,
+        "constant_transfer_roundtrip": 2, "transfer_independent_scene": 2,
+        "reactive_composition_equivalence": 1, "mask_idempotence": 1,
+        "history_mask_channel_equivalence": 2, "reactive_history_effect": 1,
+        "composition_below_reactive_no_change": 1,
+        "output_generation_switch_resets_history": 1, "history_reset_matches_fresh": 1,
+        "cap_center_matches_native_scale_control": 1, "cap_scale_geometry": 1,
+        "inflight_release": 1, "command_list_reset_discards_work": 1, "exposure_gpu_replay": 3,
+    }
+    motion_effects = re.findall(r"case=nonzero_motion_effect option=(\d+) rgb_byte_delta_sum=(\d+) jitter_nonzero=(\d+)", stdout)
+    transfers = re.findall(r"case=transfer_independent_scene transfer=(\d+) linear_mean_abs_error=(\S+) "
+                           r"wrong_flag_byte_delta_sum=(\d+) alpha_unchanged=1", stdout)
+    constant_transfers = re.findall(r"case=constant_transfer_roundtrip transfer=(\d+) linear_max_error=(\S+) "
+                                    r"alpha_unchanged=1 sentinel=1", stdout)
+    gpu_exposures = re.findall(r"case=exposure_gpu_replay replay=(\d+) value=(\S+) half_bits=([0-9a-f]{4}) "
+                              r"max_ulp=(\d+) contexts_destroyed=1 gpu_produced_r32=1", stdout)
+    caps = re.findall(r"case=cap_scale_geometry native_max=(\S+) content=(\d+)x(\d+) caller=256x224 "
+                      r"center=(\d+),(\d+) black_opaque=1 sentinel=1", stdout)
+    cap_ok = False
+    try:
+        if len(caps) == 1:
+            scale, width, height, x, y = caps[0]
+            scale = float(scale)
+            extent = math.floor(64 * scale)
+            cap_ok = (1 <= scale < 3.5 and (int(width), int(height), int(x), int(y))
+                      == (extent, extent, (256 - extent) // 2, (224 - extent) // 2))
+        numeric_ok = (sorted((int(option), int(jitter)) for option, _, jitter in motion_effects) == [(0, 0), (2, 0), (4, 1)]
+                      and all(int(delta) > 0 for _, delta, _ in motion_effects)
+                      and sorted(transfer for transfer, _, _ in transfers) == ["2", "4"]
+                      and all(0 <= float(error) <= 0.02 and int(delta) > 0 for _, error, delta in transfers)
+                      and sorted(transfer for transfer, _ in constant_transfers) == ["2", "4"]
+                      and all(0 <= float(error) <= 1.5 / 255 for _, error in constant_transfers)
+                      and [(replay, bits) for replay, _, bits, _ in gpu_exposures]
+                          == [("0", "3555"), ("1", "3cf0"), ("2", "4248")]
+                      and all(int(ulp) <= 1 and abs(float(value) - expected) < 0.00001
+                              for (_, value, _, ulp), expected in zip(gpu_exposures, (0.3333, 1.234567, 3.14159))))
+    except (ValueError, OverflowError):
+        numeric_ok = False
+    success = (success and frames == ["0", "1", "2", "3"]
+               and replays == [("0", "0"), ("1", "0"), ("2", "1")]
+               and exposures == ["0", "54", "41"]
+               and "OWNED_D3D12_FSR_CASE_PASS case=rejected_dispatch_output_unchanged result=0" in stdout
+               and all(cases[name] == count for name, count in required_cases.items())
+               and cap_ok and numeric_ok
+               and "OWNED_D3D12_FSR_FULL_SR_PASS motion=1 masks=1 transfer=1 sharpening_constant=1 output_generation=1" in stdout
+               and "case=inflight_release fence_gate=1 context_destroyed=1 caller_resources_released=1 sentinel=1" in stdout
+               and "case=command_list_reset_discards_work output_unchanged=1 sentinel=1" in stdout
+               and "OWNED_D3D12_FSR_FAIL" not in stdout + stderr)
+    return success, frames
+
+
+def fsr_fg_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    present_calls = re.findall(r"OWNED_D3D12_FSR_FG_PRESENT_CALL frame=(\d+) enabled=(\d+) only_generated=(\d+) "
+                               r"generation_error=(\d+) present_error=(\d+) qpc_start=(\d+) qpc_end=(\d+) frequency=(\d+)", stdout)
+    callbacks = re.findall(r"OWNED_D3D12_FSR_FG_CALLBACK_PIXELS frame=(\d+) generated=(\d+) output_index=(\d+) width=128 height=128 "
+                           r"hash=([0-9a-f]{16}) marker=(\d+),(\d+),220", stdout)
+    generated_counts = dict.fromkeys((1, 2, 3, 4, 7, 8, 10, 11, 12), 1)
+    expected_callbacks = []
+    for frame in range(1, 13):
+        expected_callbacks.extend((frame, 1, index) for index in range(1, generated_counts.get(frame, 0) + 1))
+        if frame not in (8, 12):
+            expected_callbacks.append((frame, 0, 0))
+    grouped = re.findall(r"^OWNED_D3D12_FSR_FG_NATIVE_PASS count=(1) distinct_gpu_outputs=(1) "
+                         r"rect_guard=exact reset_output=current$", stdout, re.MULTILINE)
+    ui_frames = re.findall(r"OWNED_D3D12_FSR_FG_UI_FRAME frame=(\d+) width=(\d+) height=(\d+) source=(\d+),60,100 "
+                           r"ui=64,0,0,128 premul=1 doublebuffer=1 overwritten_after_present=1", stdout)
+    statistics = re.findall(r"OWNED_D3D12_FSR_FG_STATISTICS frame=(\d+) statistics=(actual|disjoint) "
+                            r"result=(0x[0-9a-fA-F]+) submitted_present=(\d+) native_present=(\d+) "
+                            r"present_refresh=(\d+) sync_refresh=(\d+) sync_qpc=(\d+) qpc_end=(\d+) frequency=(\d+) "
+                            r"source=public_dxgi_actual_presentation", stdout)
+    final_statistics = re.findall(r"OWNED_D3D12_FSR_FG_FINAL_STATISTICS stream=(callback|builtin_ui) "
+                                  r"output_vblanks=3 statistics=(actual|disjoint) result=(0x[0-9a-fA-F]+) "
+                                  r"submitted_present=(\d+) native_present=(\d+) present_refresh=(\d+) "
+                                  r"sync_refresh=(\d+) sync_qpc=(\d+) qpc_end=(\d+) frequency=(\d+) "
+                                  r"source=public_dxgi_actual_presentation", stdout)
+    observations_ok = len(statistics) == 16 and [row[0] for row in final_statistics] == ["callback", "builtin_ui"]
+    if observations_ok:
+        for rows, final, requested in zip((statistics[:12], statistics[12:]), final_statistics,
+                                          (len(expected_callbacks), len(ui_frames))):
+            previous = (0, 0, 0, 0)
+            previous_submitted = 0
+            frequencies = set()
+            for _, outcome, result, submitted, count, refresh, sync, qpc, end, frequency in [*rows, final]:
+                submitted, count, refresh, sync, qpc, end, frequency = map(int, (submitted, count, refresh, sync, qpc, end, frequency))
+                values = (count, refresh, sync, qpc)
+                observations_ok &= submitted >= previous_submitted and frequency > 0 and end > 0
+                frequencies.add(frequency)
+                if outcome == "actual":
+                    observations_ok &= (int(result, 0) == 0 and 0 < count <= submitted and 0 < refresh <= sync and
+                                        0 < qpc <= end and all(a <= b for a, b in zip(previous, values)))
+                    previous = values
+                else:
+                    observations_ok &= int(result, 0) == 0x887A000B and values == (0, 0, 0, 0)
+                previous_submitted = submitted
+            observations_ok &= (final[1] == "actual" and final[3] == rows[-1][3] and
+                                int(final[3]) == requested and len(frequencies) == 1)
+    success = (success
+               and stdout.count("OWNED_D3D12_FSR_FG_ORIGINAL_SDK_PASS resize1=unsupported unchanged=1 resize=implemented pacing=original") == 1
+               and "OWNED_D3D12_FSR_FG_DIRECT_PASS snapshot=exact rect_guard=exact frames=4" in stdout
+               and "OWNED_D3D12_FSR_FG_HISTORY_PASS reset=fresh gap=reset off_on=fresh stale_record=no_history_publication negative_output=unchanged" in stdout
+               and "OWNED_D3D12_FSR_FG_LIFETIME_PASS context_destroy_before_execute=1 input_release=1 allocation_balance=1" in stdout
+               and "OWNED_D3D12_FSR_FG_CONFIG_PASS repeated_id=replace retained_distinct_limit=64 overflow=runtime_error off_clears=1" in stdout
+               and all(stdout.splitlines().count(marker) == 1 for marker in (
+                   "OWNED_D3D12_FSR_FG_DEBUG_PASS tear=gpu_effect reset=history debug=real_inputs configure=frame_snapshot history=unmodified alpha=opaque",
+                   "OWNED_D3D12_FSR_FG_DEBUG_CAPTURE_PASS prepare=per_frame configure=recorded rect=recorded output=independent_gpu_exact",
+                   "OWNED_D3D12_FSR_FG_DEBUG_REPLAY_PASS combined=1 debug_overlay=full_display replay=fresh_native context_destroy_before_replay=1",
+                   "OWNED_D3D12_FSR_FG_COUNT_REJECTION_PASS invalid=0,5 unsupported=2,3,4 sentinel=exact prepare=retained",
+                   "OWNED_D3D12_FSR_FG_NO_NOTIFY_PROXY_PASS frame=3 generated=1",
+                   "OWNED_D3D12_FSR_FG_PREPARE_ORDER_PASS matching_frame=2 newest_prepare=3 output=exact",
+                   "OWNED_D3D12_FSR_FG_NATIVE_PACING_PASS count=1 generated_before_real=1 bootstrap_reset=native_output disabled=real_only callback_error=real_only"))
+               and grouped == [("1", "1")]
+               and all(len({row[3] for row in callbacks if int(row[0]) == frame and row[1] == "1"}) == count
+                       for frame, count in generated_counts.items())
+               and "OWNED_D3D12_FSR_FG_PROXY_PASS create=hwnd callbacks=gpu-readback generated_before_real=1 only_generated=1 disabled=1 callback_error=1 drain=1 destroy=1" in stdout
+               and "OWNED_D3D12_FSR_FG_PACING_PASS ordered=1 bounded_progress=1 qpc=observed native_timestamps=external_observer_required" in stdout
+               and "OWNED_D3D12_FSR_FG_UI_PASS wrap=real_hwnd ui=builtin_shader premultiplied=1 doublebuffer=gpu_snapshot resize=96x80 lifetime=drained" in stdout
+               and [tuple(map(int, row)) for row in ui_frames]
+                   == [(11, 128, 128, 88), (12, 128, 128, 96), (13, 96, 80, 104), (14, 96, 80, 112)]
+               and [int(frame) for frame, *_ in statistics] == [*range(1, 13), *range(11, 15)]
+               and observations_ok
+               and [int(frame) for frame, *_ in present_calls] == list(range(1, 13))
+               and [(int(frame), int(generated), int(index)) for frame, generated, index, *_ in callbacks] == expected_callbacks
+               and all(int(red) == int(frame) + 32 and int(green) == (190 if generated == "1" else 70)
+                       for frame, generated, _, _, red, green in callbacks)
+               and all((int(enabled), int(only), int(generation_error), int(present_error))
+                       == (int(int(frame) not in (5, 6)), int(frame in ("8", "12")), int(frame == "9"), 0)
+                       and int(frequency) > 0 and 0 <= int(end) - int(start) < 60 * int(frequency)
+                       for frame, enabled, only, generation_error, present_error, start, end, frequency in present_calls)
+               and "OWNED_D3D12_FSR_FG_FAIL" not in stdout + stderr
+               and "OWNED_D3D12_FSR_FG_OBSERVER_FAIL" not in stdout + stderr)
+    return success
+
+
+def temporal_output_matches(stdout: str, success: bool) -> tuple[bool, list[tuple[str, str]]]:
+    frames = re.findall(r"OWNED_D3D12_TEMPORAL_FRAME_PASS variant=(\w+) frame=(\d+)\b", stdout)
+    exposures = re.findall(r"case=r32_exposure_numeric replay=(\d+) exposure=\S+ "
+                           r"r16_bits=0x([0-9a-f]{4}) max_output_ulp=(\d+) "
+                           r"gpu_producer=rtv_clear release_before_completion=(\d+)", stdout)
+    success = (success and frames == [(variant, str(n)) for variant in ("typed", "typeless_zzz")
+                                     for n in range(8)]
+               and [(replay, bits, released) for replay, bits, ulp, released in exposures]
+               == [("0", "3555", "0"), ("1", "3cf0", "0"), ("2", "4248", "1")]
+               and all(int(ulp) <= 1 for _, _, ulp, _ in exposures)
+               and stdout.count("OWNED_D3D12_TEMPORAL_CASE_PASS case=descriptor_ABC_reuse "
+                                "sequence=A,B,C,A executions=8 explicit_reset=1 caller_released=1") == 1)
+    return success, frames
+
+
+def dxil_output_matches(args: argparse.Namespace, stdout: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool, list[tuple[str, str, str]]]:
+    # A DXIL run is only meaningful when the staged native module carrying the
+    # owned compiler is present and dyld actually loaded that exact file.
+    dxil_compiler_loaded = native_compiler_proof
+    success = success and dxil_compiler_loaded
+    compute = re.findall(
+        r"OWNED_D3D12_DXIL_COMPUTE index=(\d+) expected=0x([0-9a-f]{8}) actual=0x([0-9a-f]{8})",
+        stdout)
+    success = success and len(compute) == 1 and compute[0][1] == compute[0][2]
+    # The owned compiler's descriptor-table binding must execute and read back
+    # the expected value; an unsupported HRESULT is never accepted as evidence.
+    if args.suite == "dxil":
+        table = re.findall(re.escape(DXIL_DESCRIPTOR_TABLE_MARKER)
+                           + r" expected=0x([0-9a-f]{8}) actual=0x([0-9a-f]{8})", stdout)
+        success = success and len(table) == 1 and table[0] == (
+            DXIL_DESCRIPTOR_TABLE_VALUE, DXIL_DESCRIPTOR_TABLE_VALUE)
+        spaces = re.findall(r"OWNED_D3D12_DXIL_REGISTER_SPACES b0_space2=0x([0-9a-f]{8}) "
+                            r"b0_space9=0x([0-9a-f]{8})", stdout)
+        success = success and spaces == [("13579bdf", "2468ace0")]
+        success = (success and stdout.count("OWNED_D3D12_DXIL_STATIC_BOUNDS_PASS null_reads=zero "
+                                           "oob_atomic=zero oob_writes=dropped sentinels=preserved "
+                                           "in_range=exact root_uav=exact") == 1)
+    varying = re.findall(r"OWNED_D3D12_DXIL_VARYING slot=(\d+) ", stdout)
+    success = success and varying == [str(n) for n in range(4)]
+    depth = re.findall(r"OWNED_D3D12_DXIL_DEPTH center=([0-9.]+) ", stdout)
+    depth_ok = False
+    if len(depth) == 1:
+        try:
+            depth_ok = float(depth[0]) < 0.0001
+        except ValueError:
+            depth_ok = False
+    success = success and depth_ok
+    if args.suite == "dxil-ia":
+        pairs = re.findall(re.escape(DXIL_IA_MARKER) + r" pair=(DXIL-DXIL|DXBC-DXIL|DXIL-DXBC)", stdout)
+        clip_link = DXIL_IA_MARKER.replace("DXIL_IA_PASS", "DXIL_CLIP_LINK_PASS") + " pair=DXBC-DXBC-CLIP"
+        packed_link = DXIL_IA_MARKER.replace("DXIL_IA_PASS", "DXIL_PACKED_LINK_PASS") + " pair=DXBC-DXBC-PACKED"
+        success = (success and len(pairs) == 3
+                   and set(pairs) == {"DXIL-DXIL", "DXBC-DXIL", "DXIL-DXBC"}
+                   and stdout.count(clip_link) == 1 and stdout.count(packed_link) == 1
+                   and re.findall(r"OWNED_D3D12_DISTANCE_PASS samples=(\d+)", stdout) == ["1", "4"])
+    frames = compute
+    return success, dxil_compiler_loaded, frames
+
+
+def advanced_texture_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_ADVANCED_TEXTURE_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == ADVANCED_TEXTURE_CASES
+               and len(re.findall(r"^OWNED_D3D12_ADVANCED_TEXTURE_CAPS relaxed_format_casting=1 advanced_texture_ops=1 comparison_gradient_bias=1$", stdout, re.MULTILINE)) == 1
+               and stdout.count("OWNED_D3D12_ADVANCED_TEXTURE_PASS cases=60") == 1
+               and "OWNED_D3D12_ADVANCED_TEXTURE_FAIL" not in stdout + stderr
+               and "OWNED_D3D12_DXIL_FAIL" not in stdout + stderr
+               and "kIOGPUCommandBufferCallbackError" not in stderr)
+    return success, dxil_compiler_loaded
+
+
+def depth_casting_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    dxil_compiler_loaded = native_compiler_proof
+    cases = re.findall(r"^OWNED_D3D12_DEPTH_CASTING_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    success = (success and dxil_compiler_loaded and tuple(cases) == DEPTH_CASTING_CASES
+               and stdout.count("OWNED_D3D12_DEPTH_CASTING_PASS cases=8") == 1
+               and "OWNED_D3D12_DEPTH_CASTING_FAIL" not in stdout + stderr
+               and "OWNED_D3D12_DXIL_FAIL" not in stdout + stderr
+               and "kIOGPUCommandBufferCallbackError" not in stderr)
+    return success, dxil_compiler_loaded
 
 
 def run(args: argparse.Namespace) -> int:
@@ -3473,8 +4812,8 @@ def run(args: argparse.Namespace) -> int:
         shutil.copy2(source, frozen / source.name)
     executable = frozen / fixture.name
     manifest = json.loads((runtime / "owned-graphics-runtime.json").read_text())
-    if args.suite in ("fsr", "fsr-debug", "fsr-fg"):
-        selection = "fsr" if args.suite != "fsr-fg" else "fsr_framegeneration"
+    if args.suite in ("fsr", "fsr-debug", "fsr-fg", "fsr-rr"):
+        selection = {"fsr-fg": "fsr_framegeneration", "fsr-rr": "fsr_rayregeneration"}.get(args.suite, "fsr")
         if manifest.get("optional_modules", {}).get(selection) is not True:
             raise ValueError(f"--suite {args.suite} requires a runtime staged with --with-fsr ({selection}=true)")
     arch = execution_architecture(manifest,
@@ -3502,6 +4841,8 @@ def run(args: argparse.Namespace) -> int:
         "OWNED_GRAPHICS_DYLD_AUDIT": "1",
     })
     env.pop("OWNED_SHADER_CACHE_CONTROL_ISOLATED", None)
+    # Only async-pipeline-hold may stop workers; an inherited value would fake real-worker evidence.
+    env.pop("OWNED_ASYNC_PIPELINE_HOLD", None)
     if fg_observer is not None:
         capture_dir = out / "fg-capture"
         capture_dir.mkdir()
@@ -3514,6 +4855,10 @@ def run(args: argparse.Namespace) -> int:
     if args.suite == "pipeline-cache":
         for phase in ("disk", "corrupt", "truncated", "identity", "native", "failure", "control"):
             (out / f"pipeline-cache-{phase}").mkdir()
+    if args.suite in ("async-pipeline", "async-pipeline-hold") or getattr(args, "async_pipeline_compile", False):
+        env["DXMT_CONFIG"] = "d3d12.asyncPipelineCompile=True"
+        if args.suite == "async-pipeline-hold":
+            env["OWNED_ASYNC_PIPELINE_HOLD"] = "1"
     validation_mode = ("api-and-shader" if args.validation else
                        "api-only" if args.api_validation else "none")
     if args.validation:
@@ -3548,6 +4893,8 @@ def run(args: argparse.Namespace) -> int:
         command.append("--d3d12-only")
     elif args.suite == "queue-priority":
         command.append("--gpu")
+    elif args.suite == "async-pipeline-hold":
+        command.append("--hold")
     elif args.suite == "atomic64-pixel-contention":
         command.append("--contention-only")
     elif args.suite == "atomic64-mesh-groupshared":
@@ -3612,6 +4959,7 @@ def run(args: argparse.Namespace) -> int:
         command.extend(("--atomic64", "raytracing-contract.dxil", "raytracing-atomic64.dxil"))
     evidence = {
         "schema": 1, "suite": args.suite, "mode": args.mode, "validation": args.validation,
+        "async_pipeline_compile": env.get("DXMT_CONFIG") == "d3d12.asyncPipelineCompile=True",
         "validation_mode": validation_mode,
         "architecture": arch,
         "command": command, "prefix": env["WINEPREFIX"],
@@ -3631,6 +4979,12 @@ def run(args: argparse.Namespace) -> int:
     code = -1
     with (out / "stdout.log").open("w") as stdout, (out / "stderr.log").open("w") as stderr:
         try:
+            # The owned wrapper pins WINEDLLOVERRIDES, so a first fixture launch would
+            # block wineboot on the Mono/Gecko addon install until Wine's 5-minute
+            # boot timeout. Create the fresh prefix without those addons first.
+            boot_env = {**env, "WINEDLLOVERRIDES": "mscoree,mshtml=", "WINEDEBUG": "-all"}
+            subprocess.run([str(runtime / "bin/wine.real"), "wineboot", "-i"], env=boot_env, cwd=frozen,
+                           stdout=subprocess.DEVNULL, stderr=stderr, timeout=args.timeout, check=True)
             result = subprocess.run(command, env=env, cwd=frozen, stdout=stdout, stderr=stderr,
                                     timeout=args.timeout)
             code = result.returncode
@@ -3691,15 +5045,30 @@ def run(args: argparse.Namespace) -> int:
         success = (success and native_compiler_proof and validation_mode != "none"
                    and not composition_public["failures"] and not composition_module["failures"])
     fsr_module_loads = []
-    if args.suite in ("fsr", "fsr-debug", "fsr-fg"):
-        module_name = ("amd_fidelityfx_upscaler_dx12.dll" if args.suite != "fsr-fg"
-                       else "amd_fidelityfx_framegeneration_dx12.dll")
+    if args.suite in ("fsr", "fsr-debug", "fsr-fg", "fsr-rr"):
+        module_name = {"fsr-fg": "amd_fidelityfx_framegeneration_dx12.dll",
+                       "fsr-rr": "amd_fidelityfx_denoiser_dx12.dll"}.get(args.suite, "amd_fidelityfx_upscaler_dx12.dll")
         module = rf'Loaded L"C:\\windows\\system32\\{module_name}"'
         fsr_module_loads = [line for line in stderr.splitlines()
                             if module.lower() in line.lower() and "builtin" in line.lower()]
         success = (success and native_compiler_proof and fsr_module_loads
                    and (runtime / arch["windows_directory"] / module_name).is_file())
     dxil_compiler_loaded = False
+    if args.suite in ("async-pipeline", "async-pipeline-hold"):
+        hold = args.suite == "async-pipeline-hold"
+        cases = re.findall(r"^OWNED_D3D12_ASYNC_PIPELINE_CASE_PASS (\w+)", stdout, re.MULTILINE)
+        omitted = [line for line in stderr.splitlines() if '"event":"async_pipeline_omit"' in line]
+        success = (success and native_compiler_proof
+                   and cases == ["warm_recurring_target", "pending_direct_omitted", "query_draw_waits",
+                                 "ready_draw_resumes", "pending_indexed_omitted", "omitted_history_expires",
+                                 "uav_pipeline_waits", "release_while_pending", "new_target_waits",
+                                 "four_presents_wait", "five_presents_omit", "wider_volume_rtv_recorded",
+                                 "sample_positions_validated"]
+                   and stdout.splitlines().count(f"OWNED_D3D12_ASYNC_PIPELINE_PASS hold={int(hold)}") == 1
+                   # Held workers never link: direct, indexed and the five-Present boundary draw are
+                   # omitted; the four-Present, widened 3D RTV and sample-position draws are not.
+                   and (len(omitted) == 3 if hold else len(omitted) <= 3)
+                   and "OWNED_D3D12_ASYNC_PIPELINE_FAIL" not in stdout + stderr)
     if args.suite == "queue-priority":
         success = (success and native_compiler_proof
                    and stdout.splitlines().count(
@@ -3753,35 +5122,9 @@ def run(args: argparse.Namespace) -> int:
         success = (success and stdout.splitlines().count("OWNED_D3D12_EXECUTION_SAFETY_PASS") == 1
                    and "_FAIL" not in stdout)
     if args.suite == "render-passes":
-        success = (success
-                   and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 38
-                   and all(stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_CASE_PASS case=" + case) == 1
-                           for case in ("graph-frontier-256", "graph-frontier-512",
-                                        "graph-frontier-overlap-group-boundary", "graph-frontier-delayed-clear-boundary"))
-                   and "OWNED_D3D12_RENDER_PASSES_CLEAR_PRESERVE pixel=ff402080" in stdout
-                   and ("OWNED_D3D12_RENDER_PASSES_RTV_REBIND first=ff102040 view=ff800000 "
-                        "resource=ff002040 draws=6 redundant=2 unbind=1") in stdout
-                   and ("OWNED_D3D12_RENDER_PASSES_DSV_REBIND color=ff2040c0 "
-                        "depth=3d000000,3e800000,3d800000 stencil=11,22,33 draws=7 redundant=2 "
-                        "flag_boundaries=2 view_boundaries=1 resource_boundaries=1 "
-                        "expected_render_encoders=5 exact=1") in stdout
-                   and ("OWNED_D3D12_RENDER_PASSES_RECT_CLEAR untouched=ffff0000 outside=ff00ff00 "
-                        "inside=ff0000ff depth=3f000000,3f400000 stencil=22,33 preserved_stencil=11 exact=1") in stdout
-                   and ("OWNED_D3D12_RENDER_PASSES_CLEAR_LOAD_FOLD outside=ff402010 inside=ff483030 "
-                        "executions=2 color_pixels=32 depth_pixels=96 stencil_pixels=96 exact=1") in stdout
-                   and "OWNED_D3D12_RENDER_PASSES_SUSPEND_RESUME pixel=ff204010" in stdout
-                   and "OWNED_D3D12_RENDER_PASSES_VALIDATION_PASS rejected=10 conformant_barrier=1" in stdout
-                   and "OWNED_D3D12_RENDER_PASSES_UINT_BORDER b0000=0000 b0001=0001 b1111=1111" in stdout
-                   and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=38") == 1
-                   and "_FAIL" not in stdout)
+        success = render_passes_output_matches(stdout, stderr, success)
     if args.suite == "enhanced-barriers":
-        success = (success
-                   and stdout.count("OWNED_D3D12_ENHANCED_BARRIERS_CASE_PASS ") == 26
-                   and "OWNED_D3D12_ENHANCED_BARRIERS_INVALID_BARRIERS_PASS rejected=10" in stdout
-                   and "OWNED_D3D12_ENHANCED_BARRIERS_STENCIL front=11 back=f2" in stdout
-                   and "OWNED_D3D12_ENHANCED_BARRIERS_INTERFACES device14=1 command_list9=1" in stdout
-                   and stdout.splitlines().count("OWNED_D3D12_ENHANCED_BARRIERS_PASS cases=26") == 1
-                   and "_FAIL" not in stdout)
+        success = enhanced_barriers_output_matches(stdout, success)
     if args.suite == "multiqueue":
         frames = re.findall(r"OWNED_D3D12_MULTIQUEUE_FRAME frame=(\d+) words=1024 exact=ok", stdout)
         success = success and frames == [str(n) for n in range(32)]
@@ -3801,256 +5144,46 @@ def run(args: argparse.Namespace) -> int:
         success = (success and len(views) == 1 and int(views[0][0]) > 0 and views[0][0] == views[0][1]
                    and "OWNED_D3D12_ARENA_HEAP_FAIL" not in stdout + stderr)
     if args.suite == "pipeline-statistics":
-        dxil_compiler_loaded = native_compiler_proof
-        success = (success and dxil_compiler_loaded
-                   and stdout.count("OWNED_D3D12_PIPELINE_STATISTICS_GPU_CASE_PASS ") == 346
-                   and stdout.count("OWNED_D3D12_PIPELINE_STATISTICS_MATRIX_PASS ") == 2
-                   and "OWNED_D3D12_PIPELINE_STATISTICS_MATRIX_PASS shader=dxbc cases=168 fields=11" in stdout
-                   and "OWNED_D3D12_PIPELINE_STATISTICS_MATRIX_PASS shader=dxil cases=178 fields=11" in stdout
-                   and stdout.count("OWNED_D3D12_PIPELINE_STATISTICS_VALIDATION_PASS ") == 26
-                   and stdout.count("OWNED_D3D12_PIPELINE_STATISTICS_PASS "
-                                    "shaders=dxbc,dxil fields=11 independent_gpu_oracle=1") == 1
-                   and "OWNED_D3D12_PIPELINE_STATISTICS_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = pipeline_statistics_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "tiled":
-        # Every case line must pass, in order, and the fixture must see exactly Tier 2 with
-        # Tier 3 (SRV-only) unreported and no Metal validation fault.
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_TILED_CASE ([\w.-]+) status=PASS$", stdout, re.MULTILINE)
-        success = (success and tuple(cases) == TILED_CASES
-                   and "OWNED_D3D12_TILED_CAPS tier=4 srv_only_tier3=0 " in stdout
-                   and f"OWNED_D3D12_TILED_PASS cases={len(TILED_CASES)} tier=4" in stdout
-                   and "OWNED_D3D12_TILED_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = tiled_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "bindless":
-        # Every case line must pass, in order, with the exact caps the fixture checks.
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_BINDLESS_CASE ([\w.-]+) status=PASS$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == BINDLESS_CASES
-                   and stdout.count("OWNED_D3D12_BINDLESS_UINT_BORDER variants=24 replays=2 signed=1 "
-                                    "narrow_8_16=1 raw_gather_16_32_64=1 empty_view=1 copy_lifetime=1") == 1
-                   and "OWNED_D3D12_BINDLESS_CAPS binding_tier=3 heap_tier=2 root_signature=0x3" in stdout
-                   and "OWNED_D3D12_BINDLESS_PASS cases=10 heap=1000000 samplers=2048 max_index=999999" in stdout
-                   and stdout.splitlines().count("OWNED_D3D12_BINDLESS_VIEW_POOL_GPU executions=2 slots=8 words=128 "
-                       "same_heap=1 cross_heap=1 overlap=1 source_overwrite=1 destination_overwrite=1 null=1 "
-                       "srv=1 uav=1 mip_array=1 source_heap_release=1 resource_generations=2") == 1
-                   and re.search(r"^OWNED_D3D12_BINDLESS_ROV triangles=512 pixels=256 expected=0x[0-9a-f]{8} "
-                                 r"structured_mismatches=0 typed_mismatches=0 texture_mismatches=0$", stdout, re.MULTILINE)
-                   and "OWNED_D3D12_BINDLESS_MISMATCH" not in stdout
-                   and "OWNED_D3D12_BINDLESS_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = bindless_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "writable-msaa":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        shapes = re.findall(r"^OWNED_D3D12_WRITABLE_MSAA_SHAPE samples=(2|4|8) array=([01])$", stdout, re.MULTILINE)
-        scalars = re.findall(r"^OWNED_D3D12_WRITABLE_MSAA_SCALAR type=(sint|float)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == WRITABLE_MSAA_CASES
-                   and shapes == [(str(samples), str(array)) for samples in (2, 4, 8) for array in (0, 1)]
-                   and scalars == ["sint", "float"]
-                   and stdout.count("OWNED_D3D12_WRITABLE_MSAA_CAPS writable=1\n") == 1
-                   and stdout.count("OWNED_D3D12_WRITABLE_MSAA_PASS") == 1
-                   and "OWNED_D3D12_SM6_MISMATCH" not in stdout
-                   and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
-                   and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
-                   and "kIOGPUCommandBufferCallbackError" not in stderr)
+        success, dxil_compiler_loaded = writable_msaa_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "vectors":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == VECTOR_CASES
-                   and stdout.count("OWNED_D3D12_VECTORS_PASS") == 1
-                   and "OWNED_D3D12_SM6_MISMATCH" not in stdout
-                   and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
-                   and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
-                   and "kIOGPUCommandBufferCallbackError" not in stderr)
+        success, dxil_compiler_loaded = vectors_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite in ("matrix-capabilities", "wave-mma-capabilities"):
-        pointer, query_size = ("8", "56") if arch["guest_arch"] == "x64" else ("4", "48")
-        if args.suite == "wave-mma-capabilities":
-            expected = f"MATRIX_CAPABILITIES_PASS sdk=retired pointer={pointer} query=32 wave_mma_tier=10 shapes=12"
-            readback = True
-        else:
-            expected = f"MATRIX_CAPABILITIES_PASS sdk=successor pointer={pointer} query={query_size} wave_mma_tier=10 linear_algebra_tier=16 operations=6 readback=exact"
-            readback = stdout.splitlines().count("MATRIX_RUNTIME_ALLOCATION_LIFETIME_PASS released_resources=1 released_recording=1") == 1
-        success = (success and stdout.splitlines().count(expected) == 1 and readback
-                   and stdout.splitlines().count("MATRIX_CAPABILITIES_BACKEND id=owned-graphics-d3d12") == 1
-                   and "MATRIX_CAPABILITIES_FAIL" not in stdout + stderr
-                   and "MATRIX_RUNTIME_FAIL" not in stdout + stderr
-                   and "MATRIX_RUNTIME_MISMATCH" not in stdout + stderr
-                   and "kIOGPUCommandBufferCallbackError" not in stderr)
+        success = matrix_capabilities_output_matches(args, stdout, stderr, arch, success)
     if args.suite == "matrix-runtime":
-        conversions = re.findall(r"^MATRIX_RUNTIME_CONVERSIONS_PASS src=(\d+) layouts=16 replay=2 padding=preserved bits=exact$", stdout, re.MULTILINE)
-        abi = re.findall(r"^MATRIX_RUNTIME_ABI_PASS pointer=(4|8) union=(48|56) tier=(0|16) legacy=(0|1) pinned_sdk=1$", stdout, re.MULTILINE)
-        expected_abi = ("8", "56") if arch["guest_arch"] == "x64" else ("4", "48")
-        success = (success and conversions == [str(t) for t in (2,3,4,5,7,8,18,19,20,21)]
-                   and len(abi) == 1 and abi[0][:2] == expected_abi
-                   and all(stdout.splitlines().count(marker) == 1 for marker in (
-                       "MATRIX_RUNTIME_EXPERIMENTAL_PASS unknown=1 malformed=3 unchanged=1 removal=2 lifetime=1",
-                       "MATRIX_RUNTIME_ALIGNMENT_PASS sint8_offset=32 float16_offset=64 guards=preserved",
-                       "MATRIX_RUNTIME_VALIDATION_PASS invalid_recordings=10 overflow=1",
-                       "MATRIX_RUNTIME_ALLOCATION_LIFETIME_PASS released_resources=1 released_recording=1",
-                       "MATRIX_RUNTIME_PREDICATION_PASS suppressed=1 executed=1 padding=preserved",
-                       "MATRIX_RUNTIME_FENCE_BARRIERS_PASS crossqueue=1 rewind=1 async=1 lifetime=1 state_handoff=1",
-                       "MATRIX_RUNTIME_PASS"))
-                   and "MATRIX_RUNTIME_FAIL" not in stdout + stderr
-                   and "MATRIX_RUNTIME_MISMATCH" not in stdout + stderr
-                   and "kIOGPUCommandBufferCallbackError" not in stderr)
+        success = matrix_runtime_output_matches(stdout, stderr, arch, success)
     if args.suite == "matrix-shaders":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == MATRIX_ENTRIES
-                   and re.findall(r"^OWNED_D3D12_MATRICES_PASS failures=0$", stdout, re.MULTILINE) == ["OWNED_D3D12_MATRICES_PASS failures=0"]
-                   and stdout.count("MATRIX_PUBLIC_SHADER_ADMISSION_PASS") == 1
-                   and stdout.count("MATRIX_CONVERTED_VECTOR_CONSUMER_PASS") == 1
-                   and "OWNED_D3D12_SM6_MISMATCH" not in stdout
-                   and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout + stderr
-                   and "OWNED_D3D12_MATRICES_FAIL" not in stdout + stderr
-                   and "kIOGPUCommandBufferCallbackError" not in stderr)
+        success, dxil_compiler_loaded = matrix_shaders_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "waves":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        rejects = re.findall(r"^OWNED_D3D12_WAVES_REJECT entry=(\w+) hr=0x80004005$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == WAVE_CASES
-                   and rejects == SM6_REJECTS
-                   and re.search(r"^OWNED_D3D12_SM6_CAPS .* wave=1 lanes=4-32 ", stdout, re.MULTILINE)
-                   and stdout.count("OWNED_D3D12_WAVES_PASS") == 1
-                   and "OWNED_D3D12_SM6_MISMATCH" not in stdout
-                   and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
-                   and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
-                   and "kIOGPUCommandBufferCallbackError" not in stderr)
+        success, dxil_compiler_loaded = waves_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "fp64":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == FP64_CASES
-                   and re.search(r"^OWNED_D3D12_SM6_CAPS .* double=1 ", stdout, re.MULTILINE)
-                   and stdout.count("OWNED_D3D12_FP64_PASS cases=8") == 1
-                   and "OWNED_D3D12_SM6_MISMATCH" not in stdout
-                   and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
-                   and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
-                   and "kIOGPUCommandBufferCallbackError" not in stderr)
+        success, dxil_compiler_loaded = fp64_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "sm6":
-        # Every case passes in order; each atomic stress run is exact on every repetition;
-        # every negative compile is rejected; the caps line is exactly what was verified.
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        stress = re.findall(r"^OWNED_D3D12_SM6_STRESS case=(\w+) threads=65536 targets=(\d+) reps=(\d+) "
-                            r"exact=(\d+) ", stdout, re.MULTILINE)
-        rejects = re.findall(r"^OWNED_D3D12_SM6_REJECT entry=(\w+) hr=0x8\w{7}$", stdout, re.MULTILINE)
-        # A GPU hang anywhere (the fragment-lock failure mode that keeps 64 bit atomics
-        # compute-only) fails the suite even if every case line printed.
-        gpu_hang = "kIOGPUCommandBufferCallbackError" in stderr
-        success = (success and dxil_compiler_loaded and tuple(cases) == SM6_CASES
-                   and [name for name, *_ in stress] == ["cs_atomic64_stress_1", "cs_atomic64_stress_16"]
-                   and all(reps == exact == str(SM6_STRESS_REPS) for _, _, reps, exact in stress)
-                   and rejects == SM6_REJECTS and not gpu_hang
-                   and re.search(r"^OWNED_D3D12_SM6_CAPS shader_model=0x66/0x0 double=1 minprec=2 wave=1 "
-                                 r"lanes=4-32 total_lanes=\d+ int64=1 barycentrics=1 view_instancing=1 "
-                                 r"native16=1 atomic64_typed=1 atomic64_groupshared=1 atomic64_heap=1 "
-                                 r"wave_mma=10$", stdout, re.MULTILINE)
-                   and f"OWNED_D3D12_SM6_PASS stress_reps={SM6_STRESS_REPS}" in stdout
-                   and "OWNED_D3D12_SM6_MISMATCH" not in stdout
-                   and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout
-                   and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = sm6_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "mesh-shader":
-        # Full mesh coverage stays independent of the focused Atomic64 route.
-        # Every case passes in order with exact pixels/counters; the caps line is exactly what was verified.
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_MESH_SHADER_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == MESH_SHADER_CASES
-                   and "kIOGPUCommandBufferCallbackError" not in stderr
-                   and re.search(r"^OWNED_D3D12_MESH_SHADER_CAPS tier=10 stats=1 full_range_rtai=1 derivatives=1 "
-                                 r"ms_primitives_culled=0$", stdout, re.MULTILINE)
-                   and "OWNED_D3D12_MESH_SHADER_PASS" in stdout
-                   and "OWNED_D3D12_MESH_SHADER_MISMATCH" not in stdout
-                   and "OWNED_D3D12_MESH_SHADER_CASE_FAIL" not in stdout
-                   and "OWNED_D3D12_MESH_SHADER_PSO_FAIL" not in stdout
-                   and "OWNED_D3D12_MESH_SHADER_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = mesh_shader_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "raster-order":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^RASTER_ORDER_CASE ([\w-]+) status=PASS$", stdout, re.MULTILINE)
-        expected_cases = {
-            "raw-direct-dxil", "structured-direct-dxbc", "structured-direct-dxil",
-            "raw-table-dxil", "typed-table-dxbc", "structured-table-dxbc",
-            "structured-table-dxil", "unbounded-dxil", "mixed-dxbc", "mixed-dxil",
-            "spaces-dxil", "layer-table-dxil", "raw-table-dxil-cached",
-            "sample-table-4x-dxil", "sample-direct-4x-dxil",
-        }
-        success = (success and dxil_compiler_loaded
-                   and len(cases) == len(expected_cases) and set(cases) == expected_cases
-                   and stdout.count("RASTER_ORDER_SAMPLES values=27,27,27,27,27,27,27,27 expected=27") == 2
-                   and stdout.count("RASTER_ORDER_LAYERS values=27,27,90,90 expected=27,27,90,90") == 1
-                   and stdout.count("OWNED_D3D12_RASTER_ORDER_PASS") == 1
-                   and "status=FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = raster_order_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "options13":
         success = success and native_compiler_proof and not options13_failures(stdout, stderr)
     if args.suite == "feature-level":
-        # FL 11_1/12_0: OutputMergerLogicOp (16 ops x 7 UINT formats + R32G32B32A32_UINT MRT), UAV-only
-        # ForcedSampleCount 1/4/8/16 (16 = two programmed 8x halves) with exact coverage/invocation/occlusion,
-        # ForcedSampleCount 1 on 4x/8x RTVs with SampleMask/occlusion/statistics, and the 18 required typed UAV
-        # load formats exact through texture2d and buffer views.
-        logic = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_LOGIC_OP format=(\w+) ops=16 pixels=16 "
-                           r"mrt=R32G32B32A32_UINT", stdout)
-        forced = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_UAV_ONLY_FORCED samples=(\d+) triangles=40 "
-                            r"pixels=10240 partial=(\d+)", stdout)
-        forced1 = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_FORCED1_MSAA_RTV samples=(\d) mask=(0x[0-9a-f]+) "
-                             r"triangles=6", stdout)
-        typed = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_TYPED_UAV_LOAD format=(\w+) texels=32 "
-                           r"views=texture2d,buffer", stdout)
-        cases = re.findall(r"^OWNED_D3D12_FEATURE_LEVEL_CASE_PASS (\w+)$", stdout, re.MULTILINE)
-        success = (success and logic == ["R8G8B8A8_UINT", "R16G16_UINT", "R32_UINT", "R10G10B10A2_UINT",
-                                         "R8_UINT", "R16_UINT", "R8G8_UINT"]
-                   and [samples for samples, _ in forced] == ["1", "4", "8", "16"]
-                   and all(int(partial) > 0 for samples, partial in forced if samples != "1")
-                   and forced1 == [("4", "0xffffffff"), ("4", "0x5"), ("8", "0xffffffff"), ("8", "0x81"),
-                                   ("4", "0x0")]
-                   and len(typed) == 18 and len(set(typed)) == 18
-                   and re.search(r"OWNED_D3D12_FEATURE_LEVEL_TIR16_RTV triangles=40 partial=[1-9]\d*", stdout)
-                   and cases == ["logic_ops_16_uint_formats_7_mrt_and_rejections",
-                                 "uav_only_forced_1_4_8_16_and_tir16_rtv_coverage_invocation_occlusion_exact",
-                                 "forced1_multisample_rtv_4x_8x_samplemask_occlusion_statistics",
-                                 "typed_uav_load_18_required_formats_texture2d_and_buffer_exact"]
-                   and stdout.count("OWNED_D3D12_FEATURE_LEVEL_PASS cases=4") == 1
-                   and "OWNED_D3D12_FEATURE_LEVEL_FAIL" not in stdout + stderr)
+        success = feature_level_output_matches(stdout, stderr, success)
     if args.suite == "conservative-raster":
         success = success and not conservative_raster_failures(stdout, stderr)
     if args.suite == "work-graphs":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_CASE_PASS (\w+)$", stdout, re.MULTILINE)
-        results = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_RESULT mode=(\d) sum=(\d+) expected_sum=(\d+) "
-                             r"count=(\d+) expected_count=(\d+)$", stdout, re.MULTILINE)
-        linked_results = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_LINK_RESULT program=([AB]) exact_min=(\d+) "
-                                    r"sum=(\d+) expected_sum=(\d+) count=(\d+) expected_count=4 "
-                                    r"helper_sum=(\d+) expected_helper_sum=54 helper_count=(\d+) expected_helper_count=4$",
-                                    stdout, re.MULTILINE)
-        sampler_results = re.findall(r"^OWNED_D3D12_WORK_GRAPHS_SAMPLER_RESULT exact_min=(\d+) "
-                                     r"sum=(\d+) expected_sum=68 count=(\d+) expected_count=4 local_argument_bytes=0$",
-                                     stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded
-                   and cases == [f"mode_{mode}_min_backing_depth32_fanout16" for mode in range(4)] +
-                       ["shared_budget_sparse_array_input_sharing_local_roots_cross_group", "collection_external_namespace_root_contract_negatives",
-                        "global_roots_collection_functions_program_A", "global_roots_collection_functions_program_B", "local_static_sampler_union_exact"]
-                   and [mode for mode, *_ in results] == ["0", "1", "2", "3", "4"]
-                   and all(actual == expected and count == expected_count
-                       for _, actual, expected, count, expected_count in results)
-                   and [program for program, *_ in linked_results] == ["A", "B"]
-                   and all(actual == expected and count == "4" and helper_sum == "54" and helper_count == "4"
-                       for _, minimum, actual, expected, count, helper_sum, helper_count in linked_results)
-                   and len(sampler_results) == 1 and sampler_results[0][1:] == ("68", "4")
-                   and stdout.count("OWNED_D3D12_WORK_GRAPHS_CAPS tier=10 options21_bytes=16") == 1
-                   and stdout.splitlines().count("OWNED_D3D12_WORK_GRAPHS_LIMIT_RESET_PASS default_restored=1 records=4") == 1
-                   and stdout.splitlines().count("OWNED_D3D12_WORK_GRAPHS_LIMIT_REJECT_PASS records=4 max=3 nodes=1 max_nodes=1") == 1
-                   and "OWNED_D3D12_WORK_GRAPHS_PASS cases=9 tier=1_0" in stdout
-                   and "OWNED_D3D12_WORK_GRAPHS_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = work_graphs_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "workgraphs-atomic64":
         dxil_compiler_loaded = native_compiler_proof
         wg_atomic64_failures = workgraphs_atomic64_failures(stdout, stderr)
         validation_errors.extend(wg_atomic64_failures)
         success = success and dxil_compiler_loaded and not wg_atomic64_failures
     if args.suite == "atomic64-helpers":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_ATOMIC64_HELPERS_CASE mode=(\d+) samples=(\d+) status=PASS$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded
-                   and cases == [(str(mode), str(samples)) for mode, samples in enumerate((1, 4, 1, 1, 4, 1, 1, 8, 8, 8, 4))]
-                   and stdout.splitlines().count("OWNED_D3D12_ATOMIC64_HELPERS_PASS cases=11 failures=0") == 1
-                   and "OWNED_D3D12_SM6_MISMATCH" not in stdout
-                   and "OWNED_D3D12_SM6_CASE_FAIL" not in stdout + stderr
-                   and "OWNED_D3D12_SM6_FAIL" not in stdout + stderr
-                   and "OWNED_D3D12_ATOMIC64_HELPERS_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = atomic64_helpers_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "atomic64-mesh-groupshared":
         dxil_compiler_loaded = native_compiler_proof
         cases = re.findall(r"^OWNED_D3D12_MESH_SHADER_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
@@ -4058,45 +5191,11 @@ def run(args: argparse.Namespace) -> int:
                    and stdout.splitlines().count("OWNED_D3D12_MESH_SHADER_PASS groupshared64=2 failures=0") == 1
                    and not re.search(r"OWNED_D3D12_MESH_SHADER_(?:MISMATCH|CASE_FAIL|FAIL)", stdout + stderr))
     if args.suite == "atomic64-pixel-coupled":
-        dxil_compiler_loaded = native_compiler_proof
-        pixel_rows = re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CASE rov=([01]) typed=([01]) sample=([01]) mode=([0-4]) status=PASS$", stdout, re.MULTILINE)
-        expected_pixel_rows = [(str(rov), str(typed), str(sample), str(mode))
-                               for rov in range(2) for typed in range(2) for sample in range(2) for mode in range(5)]
-        begins = re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_BEGIN rov=([01]) typed=([01]) sample=([01]) mode=([0-4])$", stdout, re.MULTILINE)
-        cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and pixel_rows == begins == expected_pixel_rows
-                   and cases == ["atomic64_pixel_coupled_color_depth_stencil_query"] * 40
-                   and stdout.splitlines().count("OWNED_D3D12_ATOMIC64_PIXEL_PASS cases=40 failures=0") == 1
-                   and len(re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CAP typed=1$", stdout, re.MULTILINE)) == 1
-                   and not re.search(r"OWNED_D3D12_SM6_(?:MISMATCH|CASE_FAIL|FAIL)|OWNED_D3D12_ATOMIC64_PIXEL_FAIL", stdout + stderr))
+        success, dxil_compiler_loaded, pixel_rows = atomic64_pixel_coupled_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "atomic64-pixel-contention":
-        dxil_compiler_loaded = native_compiler_proof
-        contention_rows = re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_CASE operation=(add|cas) targets=(1|16) "
-                                     r"fragments=4096 old_values=4096 pixels=4096 status=PASS$", stdout, re.MULTILINE)
-        begins = re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_BEGIN operation=(add|cas) targets=(1|16) fragments=4096$",
-                            stdout, re.MULTILINE)
-        expected_contention = [(operation, str(targets)) for operation in ("add", "cas") for targets in (1, 16)]
-        cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and contention_rows == begins == expected_contention
-                   and stdout.count("OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_CASE ") == 4
-                   and stdout.count("OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_BEGIN ") == 4
-                   and cases == ["atomic64_pixel_contention_full64_multiset_color_guards"] * 4
-                   and stdout.splitlines().count("OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_PASS cases=4 fragments=4096 failures=0") == 1
-                   and len(re.findall(r"^OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_CAP typed=1$", stdout, re.MULTILINE)) == 1
-                   and not re.search(r"OWNED_D3D12_SM6_(?:MISMATCH|CASE_FAIL|FAIL)|OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION_FAIL", stdout + stderr))
+        success, dxil_compiler_loaded, contention_rows = atomic64_pixel_contention_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite in ("atomic64-groupshared", "atomic64-groupshared-capacity"):
-        dxil_compiler_loaded = native_compiler_proof
-        capacity = args.suite.endswith("-capacity")
-        mode = "capacity" if capacity else "operations-stress"
-        expected = ["atomic64_groupshared_32k_capacity"] if capacity else [
-            "atomic64_groupshared_operations", "atomic64_groupshared_stress"]
-        cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS (\w+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and cases == expected
-                   and len(re.findall(r"^OWNED_D3D12_SM6_CAPS .* atomic64_groupshared=1 ", stdout, re.MULTILINE)) == 1
-                   and stdout.splitlines().count(f"OWNED_D3D12_ATOMIC64_RESULT mode={mode} failures=0") == 1
-                   and stdout.splitlines().count(f"OWNED_D3D12_ATOMIC64_PASS mode={mode}") == 1
-                   and not re.search(r"OWNED_D3D12_SM6_(?:MISMATCH|CASE_FAIL|FAIL)|OWNED_D3D12_ATOMIC64_FAIL",
-                                     stdout + stderr))
+        success, dxil_compiler_loaded = atomic64_groupshared_output_matches(args, stdout, stderr, native_compiler_proof, success)
     if args.suite == "atomic64-producers":
         dxil_compiler_loaded = native_compiler_proof
         producer_failures = atomic64_producers_failures(stdout, stderr)
@@ -4113,36 +5212,11 @@ def run(args: argparse.Namespace) -> int:
         validation_errors.extend(wg_typed_failures)
         success = success and dxil_compiler_loaded and not wg_typed_failures
     if args.suite == "view-instancing":
-        # VIEWINST: every case passes in order with exact pixels, Tier 1 statistics count one draw per enabled
-        # view, and the device reports exactly ViewInstancingTier 1.
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_VIEW_INSTANCING_CASE_PASS (\w+)$", stdout, re.MULTILINE)
-        statistics = re.findall(r"^OWNED_D3D12_VIEW_INSTANCING_STATISTICS views=(\d) ia_vertices=(\d+) "
-                                r"ia_primitives=(\d+) vs=(\d+) c_invocations=(\d+) c_primitives=(\d+) ps=(\d+)$",
-                                stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == VIEW_INSTANCING_CASES
-                   and statistics == [("3", "9", "3", "9", "3", "3", "192"), ("2", "6", "2", "6", "2", "2", "128")]
-                   and f"OWNED_D3D12_VIEW_INSTANCING_PASS cases={len(VIEW_INSTANCING_CASES)} tier=1" in stdout
-                   and "OWNED_D3D12_VIEW_INSTANCING_MISMATCH" not in stderr
-                   and "OWNED_D3D12_VIEW_INSTANCING_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = view_instancing_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "vrs":
-        # VRS: the advertised Tier2 contract must pass every stage, source, viewport and submission case.
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_VRS_CASE_PASS (\w+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == VRS_CASES
-                   and "OWNED_D3D12_VRS_COMMON_SUBMISSION_PASS capture=S_OK submission=887a0005 promotion=0" in stdout
-                   and "OWNED_D3D12_VRS_CAPS tier=2 additional=1 tile=8 per_primitive_viewports=1" in stdout
-                   and f"OWNED_D3D12_VRS_PASS cases={len(VRS_CASES)}" in stdout
-                   and "OWNED_D3D12_VRS_MISMATCH" not in stderr
-                   and "OWNED_D3D12_VRS_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = vrs_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "sampler-feedback":
-        # FEEDBACK: every case passes in order against the CPU oracle and the device reports SamplerFeedbackTier 1.0.
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_SAMPLER_FEEDBACK_CASE_PASS (\w+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == SAMPLER_FEEDBACK_CASES
-                   and f"OWNED_D3D12_SAMPLER_FEEDBACK_PASS cases={len(SAMPLER_FEEDBACK_CASES)} tier=100" in stdout
-                   and "OWNED_D3D12_SAMPLER_FEEDBACK_MISMATCH" not in stderr
-                   and "OWNED_D3D12_SAMPLER_FEEDBACK_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = sampler_feedback_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "stencil-reference":
         dxil_compiler_loaded = native_compiler_proof
         cases = re.findall(r"^STENCIL_REFERENCE_CASE (dxbc|dxil) status=PASS$", stdout, re.MULTILINE)
@@ -4150,20 +5224,7 @@ def run(args: argparse.Namespace) -> int:
                    and stdout.count("STENCIL_OWNED_READBACK left=30 right=35 row=256 bytes=2") == 2
                    and stdout.count("OWNED_D3D12_STENCIL_REFERENCE_PASS") == 1)
     if args.suite == "sharing":
-        # Every sharing case passes in order, the child process reported success, and
-        # only verified cross-adapter caps are claimed.
-        cases = re.findall(r"^OWNED_D3D12_SHARING_CASE ([\w-]+) status=PASS$", stdout, re.MULTILINE)
-        success = (success and tuple(cases) == SHARING_CASES
-                   and stdout.count("OWNED_D3D12_SHARING_CHILD ok") == 1
-                   and stdout.count("OWNED_D3D12_SHARING_CHILD_REWIND value=15") == 1
-                   and stdout.count("OWNED_D3D12_SHARING_CHILD_LATCH event=1 queue=1 late=1 current=0") == 1
-                   and stdout.count("OWNED_D3D12_SHARING_STRESS signals=3000 final=3000") == 1
-                   and stdout.count("OWNED_D3D12_SHARING_NAMED_CHILD ok rewind=40") == 1
-                   and stdout.count("OWNED_D3D12_SHARING_ADAPTER_LUID_PASS") == 1
-                   and "OWNED_D3D12_SHARING_CAPS cross_node=0 row_major=1" in stdout
-                   and f"OWNED_D3D12_SHARING_PASS cases={len(SHARING_CASES)}" in stdout
-                   and "OWNED_D3D12_SHARING_FAIL" not in stdout + stderr
-                   and "OWNED_D3D12_SHARING_MISMATCH" not in stdout + stderr)
+        success = sharing_output_matches(stdout, stderr, success)
     if args.suite == "residency":
         success = (success
                    and stdout.count("OWNED_D3D12_RESIDENCY_BUDGET_PASS") == 1
@@ -4176,156 +5237,29 @@ def run(args: argparse.Namespace) -> int:
                    and stdout.count("OWNED_D3D12_CORE_CONTRACTS_ROOT_VALIDATION_PASS") == 1
                    and stdout.count("OWNED_D3D12_CORE_CONTRACTS_RANGE_FLAGS_PASS") == 1)
     if args.suite == "resources":
-        success = (success
-                   and stdout.count("OWNED_D3D12_RESOURCES_PASS owned_backend=1 resource_contracts=1") == 1
-                   and stdout.count("OWNED_D3D12_RESOURCES_ALIASING_GPU_PASS ") == 1
-                   and stdout.count("OWNED_D3D12_RESOURCES_VIEW_HASH_GPU texture_keys=64 buffer_keys=64 "
-                                    "repeats=64 generations=2 probes=320 words=2560 guards=1 "
-                                    "incremental_keys=1 resource_replacement=1") == 1
-                   and stdout.count("ordered_snapshots=4 barriers=first_to_second,second_to_first "
-                                    "inheritance=bidirectional") == 1)
+        success = resources_output_matches(stdout, success)
     if args.suite == "buffer-rtv":
         success = (success
                    and stdout.count("OWNED_D3D12_BUFFER_RTV_DRAW_READBACK_PASS") == 1
                    and stdout.count("OWNED_D3D12_BUFFER_RTV_PREDICATED_CLEAR_PASS") == 1
                    and stdout.count("OWNED_D3D12_BUFFER_RTV_BOUNDARY_PASS") == 1)
     if args.suite in ("atomic-copy", "atomic-copy-live"):
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"OWNED_D3D12_ATOMIC_COPY_CASE_PASS list=(\w+) uint32=1 dependencies=0,1 ordered=1",
-                           stdout)
-        cases64 = re.findall(r"OWNED_D3D12_ATOMIC_COPY64_CASE_PASS list=(\w+) scenarios=6 "
-                             r"dependencies=0,2 exact=1", stdout)
-        live = re.findall(r"OWNED_D3D12_ATOMIC_COPY64_LIVE_(OBSERVED|INCONCLUSIVE) observed=(\d+) "
-                          r"changed_threads=(\d+) first=(\d+) last=(\d+) atomic64_snapshot=unproven", stdout)
-        live_observed = (len(live) == 1 and live[0][0] == "OBSERVED"
-                         and 0 < int(live[0][2]) <= int(live[0][1])
-                         and int(live[0][3]) < int(live[0][4]))
-        success = (success and dxil_compiler_loaded and cases == ["direct", "compute", "copy"]
-                   and cases64 == ["direct", "compute", "copy"]
-                   and (args.suite != "atomic-copy-live" or live_observed)
-                   and stdout.count("OWNED_D3D12_ATOMIC_COPY64_COMPUTE_PASS list=0 "
-                                    "predication_false=1 payload=1") == 1
-                   and stdout.count("OWNED_D3D12_ATOMIC_COPY64_COMPUTE_PASS list=2 "
-                                    "predication_false=0 payload=1") == 1
-                   and stdout.count("OWNED_D3D12_ATOMIC_COPY64_LIFETIME_PASS replay=2 released_list=1") == 1
-                   and stdout.count("OWNED_D3D12_ATOMIC_COPY64_CONTROL_PASS threads=256 final=128 payload=1") == 1
-                   and stdout.count("OWNED_D3D12_ATOMIC_COPY_VALIDATION_PASS cases=33") == 1
-                   and stdout.count("OWNED_D3D12_ATOMIC_COPY_PASS uint32=1 uint64=1") == 1)
+        success, dxil_compiler_loaded = atomic_copy_output_matches(args, stdout, native_compiler_proof, success)
     if args.suite == "atomic64-phase":
         dxil_compiler_loaded = native_compiler_proof
         success = success and dxil_compiler_loaded and not atomic64_phase_failures(stdout, stderr)
     if args.suite == "present-queues":
-        success = (success
-                   and stdout.count("OWNED_D3D12_PRESENT_QUEUES_VALIDATION_PASS rejected=12 preserved=1") == 1
-                   and stdout.count("OWNED_D3D12_PRESENT_QUEUES_ROTATION_PASS buffer0=queue_a buffer1=queue_b "
-                                    "blocked=1 released=1 ordered=1") == 1
-                   and stdout.count("OWNED_D3D12_PRESENT_QUEUES_PLAIN_RESIZE_PASS buffers=3 "
-                                    "creation_queue=1") == 1
-                   and stdout.count("OWNED_D3D12_PRESENT_QUEUES_RESTART_PASS queued_discard=1 credit=1 "
-                                    "release_restores=1") == 1
-                   and stdout.count("OWNED_D3D12_PRESENT_QUEUES_RESTART_NATIVE_PASS discarded=2 credit=1 "
-                                    "presented=restart_only") == 1)
-        # Native decision per drawable: only the restart frame may be handed to Core Animation.
-        native_window = stderr.partition("RESTART_NATIVE_BEGIN")[2].partition("RESTART_NATIVE_END")
-        native_decisions = re.findall(r"OWNED_GRAPHICS_NATIVE_PRESENT_DECISION present_id=(\d+) reserved=([01]), presented=([01]) "
-                                      r"reason=(\w+)", native_window[0])
-        success = (success and bool(native_window[1])
-                   and sorted(native_decisions) == [("2", "1", "0", "epoch"), ("3", "1", "1", "current")])
+        success = present_queues_output_matches(stdout, stderr, success)
     if args.suite == "hdr-metadata":
-        frames = re.findall(r"OWNED_D3D12_HDR_METADATA_FRAME frame=(\d+) source_pixels=3072 "
-                            r"exact=1 fence=complete present=ok", stdout)
-        success = (success and frames == [str(n) for n in range(7)]
-                   and stdout.count("OWNED_D3D12_HDR_METADATA_VALIDATION_PASS invalid=4 unsupported=2") == 1
-                   and stdout.count("OWNED_D3D12_HDR_METADATA_LIFECYCLE_PASS before=1 set=1 "
-                                    "replaced=1 cleared=1 caller_modified=1") == 1
-                   and stdout.count("OWNED_D3D12_HDR_METADATA_RESIZE_PASS format=r10g10b10a2 frames=2") == 1
-                   and stdout.count("OWNED_D3D12_HDR_METADATA_PENDING_PASS accepted=1 "
-                                    "replaced_before_release=1 next_present=1") == 1
-                   and stdout.count("OWNED_D3D12_HDR_METADATA_PASS frames=7 source_readback=1 "
-                                    "gpu_fence=1 present=1") == 1
-                   and "OWNED_D3D12_HDR_METADATA_FAIL" not in stdout + stderr)
+        success, frames = hdr_metadata_output_matches(stdout, stderr, success)
     if args.suite == "colorspace":
-        frames = re.findall(r"OWNED_D3D12_COLORSPACE_FRAME format=(\d+) frame=(\d+) "
-                            r"source_pixels=3072 exact=1 fence=complete present=ok", stdout)
-        success = (success and len(frames) == 13
-                   and [int(frame) for _, frame in frames] == list(range(13))
-                   and {int(fmt) for fmt, _ in frames} == {28, 10, 24}
-                   and stdout.count("OWNED_D3D12_COLORSPACE_CONTRACT mapped=4 rejected=23 "
-                                    "null=invalidarg post_reject_frame=ok") == 1
-                   and stdout.count("OWNED_D3D12_COLORSPACE_FAILED_RESIZE rejected=1 "
-                                    "desc_preserved=1 next_frame=ok") == 1
-                   and stdout.count("OWNED_D3D12_COLORSPACE_RESIZE same=1 format=28 frame=ok") == 1
-                   and stdout.count("OWNED_D3D12_COLORSPACE_RESIZE same=0 format=24 frame=ok") == 1
-                   and stdout.count("OWNED_D3D12_COLORSPACE_RESIZE same=0 format=10 frame=ok") == 1
-                   and stdout.count("OWNED_D3D12_COLORSPACE_PENDING accepted=1 "
-                                    "setter_before_release=1 queue_rotation=1 next_frame=ok") == 1
-                   and stdout.count("OWNED_D3D12_COLORSPACE_PASS frames=13 formats=3 "
-                                    "source_readback=1 present=1") == 1
-                   and "OWNED_D3D12_COLORSPACE_FAIL " not in stdout + stderr)
+        success, frames = colorspace_output_matches(stdout, stderr, success)
     if args.suite == "fullscreen":
-        # D3D12 has a product export for its identity; D3D11 does not. The
-        # verified staged runtime and Wine's actual D3D11 builtin module load
-        # prove the latter instead of inventing an identity export for that API.
-        module = r'Loaded L"C:\\windows\\system32\\d3d11.dll"'
-        module_loads = (runtime / arch["windows_directory"] / "d3d11.dll").is_file() and any(
-            module.lower() in line.lower() and "builtin" in line.lower() for line in stderr.splitlines())
-        success = (success and module_loads
-                   and stdout.count("OWNED_DXGI_FULLSCREEN_D3D11_DEVICE feature_level=0x") == 1
-                   and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_FRAME api=(d3d11|d3d12) "
-                                         r"pixels=3888 exact=1 (?:fence|query)=complete present=ok", stdout))
-                       == ["d3d11", "d3d12"]
-                   and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_TRANSITION api=(d3d11|d3d12) "
-                                         r"enter=1 resize=1 frame=1 leave=1 rect=restored", stdout))
-                       == ["d3d11", "d3d12"]
-                   and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_REPEAT api=(d3d11|d3d12) "
-                                         r"cycles=2 restored=1", stdout)) == ["d3d11", "d3d12"]
-                   and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_ERRORS api=(d3d11|d3d12) "
-                                         r"invalid=1 qi=1 desc=1 mode=1 resize=1 reentrant=1 "
-                                         r"native_enter=1 native_leave=1 preserved=1", stdout)) == ["d3d11", "d3d12"]
-                   and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_CREATION api=(d3d11|d3d12) "
-                                         r"native=1 windowed=1 rect=restored", stdout)) == ["d3d11", "d3d12"]
-                   and sorted(re.findall(r"OWNED_DXGI_FULLSCREEN_INVALID_CREATION api=(d3d11|d3d12) "
-                                         r"rejected=1 null_output=1", stdout)) == ["d3d11", "d3d12"])
+        success = fullscreen_output_matches(stdout, stderr, runtime, arch, success)
     if args.suite == "stream-output":
-        # GS streams 0-3: per-stream slot bytes, BufferFilledSize and SO_STATISTICS_STREAM0..3, DXBC then DXIL
-        # (3 + 3 points; emissions per point: stream 0 one, 1 two, 2 one (never declared), 3 three).
-        gs_streams = [
-            ("gs-streams-0-1", "6,12,0,0", "6,12,0,0", "96,96,0,0"),
-            ("gs-streams-3-split-1", "0,12,0,18", "0,12,0,18", "216,0,72,48"),
-            ("gs-streams-overflow", "6,12,0,5", "6,12,0,18", "96,96,20,40"),
-            ("gs-streams-raster0", "0,12,0,18", "0,12,0,18", "96,72,0,0"),
-        ]
-        found_gs = re.findall(r"^OWNED_D3D12_STREAM_OUTPUT_GS_STREAM_PASS case=([\w-]+) shader=(dxbc|dxil) "
-                              r"written=([\d,]+) needed=([\d,]+) filled=([\d,]+)$", stdout, re.MULTILINE)
-        success = success and found_gs == [(name, shader, *rest) for shader in ("dxbc", "dxil")
-                                           for name, *rest in gs_streams]
-        success = (success and stdout.count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=122") == 1
-                   and stdout.count("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=53") == 1
-                   and stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS ") == 55
-                   and stdout.count("OWNED_D3D12_STREAM_OUTPUT_NO_RASTER_DISTANCE_PASS cases=2") == 1
-                   and "OWNED_D3D12_STREAM_OUTPUT_PASS validation=1 capture=1" in stdout
-                   and "OWNED_D3D12_STREAM_OUTPUT_FAIL" not in stdout + stderr
-                   and stdout.count("OWNED_D3D12_STREAM_OUTPUT_QUERY_GPU_PASS streams=0,1,2,3 "
-                                    "written=0 needed=0 offset=24 guards=1") == 1)
+        success = stream_output_output_matches(stdout, stderr, success)
     if args.suite == "so-format-support":
-        names = [f"R32{'G32' if n >= 2 else ''}{'B32' if n >= 3 else ''}{'A32' if n >= 4 else ''}_{kind}"
-                 for kind in ("FLOAT", "SINT", "UINT") for n in range(1, 5)]
-        words = (("3fa00000", "c0200000", "40700000", "c0900000"),
-                 ("fffffff9", "12345678", "ffffff9d", "7fffffff"),
-                 ("89abcdef", "00000011", "fedcba98", "76543210"))
-        gpu = re.findall(r"OWNED_D3D12_SO_FORMAT_SUPPORT_GPU format=(\w+) words=(\d+) "
-                         r"bits=([0-9a-f,]+) bytes=(\d+) counters=(\d+),(\d+) guards=1 ia=1", stdout)
-        expected_gpu = [(name, str(n), ",".join(words[k][:n]), str(4 * n), str(4 * n), str(4 * n))
-                        for k in range(3) for n in range(1, 5) for name in [names[4 * k + n - 1]]]
-        capabilities = re.findall(r"OWNED_D3D12_SO_FORMAT_SUPPORT_CAP format=(\w+) so_buffer=1", stdout)
-        negatives = re.findall(r"OWNED_D3D12_SO_FORMAT_SUPPORT_NEGATIVE format=(\w+) so_buffer=0", stdout)
-        success = (success and gpu == expected_gpu and capabilities == names
-                   and negatives == ["UNKNOWN", "R32_TYPELESS", "R32G32B32_TYPELESS",
-                                     "R16_FLOAT", "R16G16B16A16_UINT", "R8G8B8A8_UNORM",
-                                     "R32_FLOAT_X8X24_TYPELESS", "D32_FLOAT"]
-                   and stdout.count("OWNED_D3D12_SO_FORMAT_SUPPORT_PASS gpu=12 capabilities=12 "
-                                    "negatives=8 ia=12") == 1
-                   and "OWNED_D3D12_SO_FORMAT_SUPPORT_FAIL" not in stdout + stderr)
+        success = so_format_support_output_matches(stdout, stderr, success)
     if args.suite == "depth-plane-copy":
         cases = re.findall(r"OWNED_D3D12_DEPTH_PLANE_COPY_CASE_PASS format=(\d+) removed=00000000", stdout)
         success = (success and cases == ["44", "45", "19", "20"]
@@ -4333,214 +5267,17 @@ def run(args: argparse.Namespace) -> int:
                                     "cases=4 depth=packed24 stencil=exact controls=d32s8") == 1
                    and "OWNED_D3D12_DEPTH_PLANE_COPY_FAIL" not in stdout + stderr)
     if args.suite == "format-support":
-        success = (success and re.search(r"OWNED_D3D12_FORMAT_SUPPORT_MATRIX formats=98 "
-                                         r"texture2d=\d+ buffer=\d+ compressed=21", stdout) is not None
-                   and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_SRGB_UAV_PASS "
-                                    "formats=RGBA8,BGRA8 bytes=64 preserved=1") == 1
-                   and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_DEPTH_GPU_PASS "
-                                    "planes=depth,stencil typed_combined=dsv_only mip=1") == 1
-                   and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_SINGLE_DEPTH_GPU_PASS "
-                                    "typed=dsv_only aliases=R32_FLOAT,R16_UNORM load=1 comparison=1") == 1
-                   and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_CAST_GPU_PASS "
-                                    "typed_resource=R8G8B8A8_UNORM views=linear,srgb") == 1
-                   and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_CAST_GROUPS_GPU_PASS "
-                                    "r16=uint_to_half rgba32=uint_to_float bc1=linear_to_srgb") == 1
-                   and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_MIP_GPU_PASS "
-                                    "formats=R32_UINT,R8G8B8A8_TYPELESS mip=1") == 1
-                   and stdout.count("OWNED_D3D12_FORMAT_SUPPORT_PASS") == 1
-                   and "OWNED_D3D12_FORMAT_SUPPORT_FAIL" not in stdout + stderr)
+        success = format_support_output_matches(stdout, stderr, success)
     if args.suite == "multisample-capabilities":
-        gpu_cases = re.findall(
-            r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_GPU_CASE_PASS "
-            r"format=([0-9]+) view=([0-9]+) count=([0-9]+) quality=([0-9]+) depth=([0-9]+)", stdout)
-        expected_cases = {(str(resource), str(view), str(count), str(quality), str(depth))
-                          for count in (2, 4, 8)
-                          for resource, view, quality, depth in
-                          ((28, 28, 0xffffffff, 0), (28, 28, 0, 0),
-                           (27, 28, 0, 0), (42, 42, 0, 0),
-                           (40, 40, 0, 1), (39, 40, 0, 1), (20, 20, 0, 1))}
-        rejected = re.findall(
-            r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_REJECT "
-            r"format=([0-9]+) count=([0-9]+) quality=([0-9]+) hr=([0-9a-f]+)", stdout)
-        rejected_cases = {(int(fmt), int(count), int(quality)) for fmt, count, quality, _ in rejected}
-        required_rejections = {(28, count, 0) for count in (0, 3, 16, 32, 0xffffffff)}
-        required_rejections |= {(28, count, 1) for count in (2, 4, 8)}
-        required_rejections |= {(71, 4, 0), (28, 1, 1), (28, 1, 0xfffffffe)}
-        center_cases = re.findall(
-            r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_CENTER_GPU_PASS count=([0-9]+) coverage=([0-9]+)", stdout)
-        center_masks = re.findall(
-            r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_CENTER_MASK_GPU_PASS count=([0-9]+) mask=([0-9]+)", stdout)
-        center_depth = re.findall(
-            r"OWNED_D3D12_MULTISAMPLE_CAPABILITIES_CENTER_DEPTH_GPU_PASS count=([0-9]+)", stdout)
-        programmable = re.findall(
-            r"^OWNED_D3D12_MULTISAMPLE_CAPABILITIES_PROGRAMMABLE_GPU_PASS count=(\d+) depth=(\d+)$",
-            stdout, re.MULTILINE)
-        resolves = re.findall(
-            r"^OWNED_D3D12_MULTISAMPLE_CAPABILITIES_RESOLVE_GPU_PASS count=(\d+) depth=(\d+) "
-            r"mode=(\d+) no_target_flag=1$", stdout, re.MULTILINE)
-        integer_resolves = re.findall(
-            r"^OWNED_D3D12_MULTISAMPLE_CAPABILITIES_RESOLVE_INTEGER_GPU_PASS count=(\d+) stencil=(\d+) "
-            r"mode=(\d+) no_target_flag=1$", stdout, re.MULTILINE)
-        decompressions = re.findall(
-            r"^OWNED_D3D12_MULTISAMPLE_CAPABILITIES_DECOMPRESS_GPU_PASS count=(\d+) depth=(\d+) "
-            r"plane=(\d+) partial=1 no_target_flag=1$", stdout, re.MULTILINE)
-        success = (success and len(gpu_cases) == len(expected_cases)
-                   and set(gpu_cases) == expected_cases
-                   and len(programmable) == 6
-                   and set(programmable) == {(str(count), str(depth))
-                                             for count in (2, 4, 8) for depth in (0, 1)}
-                   and len(resolves) == 18
-                   and set(resolves) == {(str(count), str(depth), str(mode))
-                                         for count in (2, 4, 8) for depth in (0, 1) for mode in (1, 2, 3)}
-                   and len(integer_resolves) == 12
-                   and set(integer_resolves) == {(str(count), str(stencil), str(mode))
-                                                 for count in (2, 4, 8) for stencil in (0, 1) for mode in (1, 2)}
-                   and len(decompressions) == 12
-                   and set(decompressions) == {(str(count), str(depth), str(plane))
-                                               for count in (1, 2, 4, 8) for depth in (0, 1)
-                                               for plane in range(depth + 1)}
-                   and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_PROGRAMMABLE_LIFECYCLE_PASS "
-                                    "switches=2 replay=6 reset=6 clearstate=6 crosslist=6 bundles=6") == 1
-                   and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_PROGRAMMABLE_ERRORS_PASS "
-                                    "rejected=13 first_error=E_INVALIDARG") == 1
-                   and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_RESOLVE_LIFECYCLE_PASS "
-                                    "inplace=8 separate=8 partial=12 planes=4") == 1
-                   and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_CUSTOM_DEPTH_COPY_GPU_PASS "
-                                    "count=4 planes=2 other_plane=1") == 1
-                   and len(center_cases) == 3
-                   and set(center_cases) == {("2", "3"), ("4", "15"), ("8", "255")}
-                   and len(center_masks) == 3
-                   and set(center_masks) == {("2", "1"), ("4", "5"), ("8", "85")}
-                   and len(center_depth) == 3 and set(center_depth) == {"2", "4", "8"}
-                   and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_SEMANTIC_GPU_PASS "
-                                    "rgba=0.750,0.500,0.125,0.250") == 1
-                   and required_rejections.issubset(rejected_cases)
-                   and stdout.count("OWNED_D3D12_MULTISAMPLE_CAPABILITIES_PASS") == 1
-                   and "OWNED_D3D12_MULTISAMPLE_CAPABILITIES_FAIL" not in stdout + stderr)
+        success = multisample_capabilities_output_matches(stdout, stderr, success)
     if args.suite in ("geometry", "tessellation"):
-        # GSTS: the DXBC matrix always runs; once frozen <suite>-*.dxil inputs exist the DXIL matrix must pass with
-        # exactly the DXBC case list.
-        prefix = SUITE_PREFIXES[args.suite]
-        matrix_cases = {"geometry": 87, "tessellation": 166}[args.suite]
-        dxil_frozen = (args.dxil_dir / f"{args.suite}-vs_pass.dxil").exists()
-        # A case is identified by its name plus the tessellation domain/partition it ran with.
-        case_names = [(shader, name + qualifier) for shader, name, qualifier in re.findall(
-            rf"^{prefix}_CASE_PASS shader=(dxbc|dxil) case=([\w-]+)((?: domain=\w+ partition=\w+)?)",
-            stdout, re.MULTILINE)]
-        dxbc_cases = [name for shader, name in case_names if shader == "dxbc"]
-        dxil_cases = [name for shader, name in case_names if shader == "dxil"]
-        matrices = re.findall(rf"^{prefix}_MATRIX_PASS shader=(dxbc|dxil) cases=(\d+)$", stdout, re.MULTILINE)
-        success = (success
-                   and len(dxbc_cases) == len(set(dxbc_cases)) and bool(dxbc_cases)
-                   and matrices == ([("dxbc", str(matrix_cases)), ("dxil", str(matrix_cases))] if dxil_frozen
-                                    else [("dxbc", str(matrix_cases))])
-                   and (dxil_cases == dxbc_cases if dxil_frozen
-                        else not dxil_cases and f"{prefix}_DXIL_SKIPPED" in stdout)
-                   and re.findall(rf"^{prefix}_PASS$", stdout, re.MULTILINE) == [f"{prefix}_PASS"]
-                   and f"{prefix}_CASE_FAIL" not in stdout + stderr
-                   and f"{prefix}_MISMATCH" not in stdout + stderr)
-        mutation_kinds = ["gs", "stripcut", "adjacency"] if args.suite == "geometry" else ["ts", "tsgs"]
-        mutation_cases = [f"indirect-mutation-{kind}{suffix}" for kind in mutation_kinds for suffix in ("", "-so")]
-        if args.suite == "tessellation":
-            mutation_cases += ["indirect-mutation-ts-so-no-raster", "indirect-mutation-ts-so-overflow",
-                               "indirect-mutation-ts-so-no-raster-overflow",
-                               "ds-so-fractional-tri-order", "ds-so-fractional-quad-order",
-                               "ds-so-isoline-points", "ds-so-isoline-lines"]
-            domain_so = re.findall(rf"^{prefix}_DOMAIN_SO shader=(dxbc|dxil) case=([\w-]+) bytes=(\d+) "
-                                   rf"written=(\d+) needed=(\d+) ds=(\d+) c=(\d+) ps=(\d+)$",
-                                   stdout, re.MULTILINE)
-            expected_domain_so = [(shader, "indirect-mutation-ts-so" + suffix, size, written, "2", "6", clip, ps)
-                                  for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
-                                  for suffix, size, written, clip, ps in (
-                                      ("", "192", "2", "2", "2"),
-                                      ("-no-raster", "192", "2", "0", "0"),
-                                      ("-overflow", "96", "1", "2", "2"),
-                                      ("-no-raster-overflow", "96", "1", "0", "0"))]
-            success = success and sorted(domain_so) == sorted(expected_domain_so)
-        success = success and all(dxbc_cases.count(case) == 1 for case in mutation_cases)
-        if args.suite == "geometry":
-            # GS streams 0-3: per-stream written/needed counters, GSPrimitives over every stream and the clipper
-            # count of the rasterized stream, for both shader kinds.
-            multi_stream = [
-                ("so-streams2-raster0", "2,4,0,0", "2,4,0,0", "6", "2"),
-                ("so-streams2-raster1", "2,4,0,0", "2,4,0,0", "6", "4"),
-                ("so-streams4-raster2", "2,4,6,8", "2,4,6,8", "20", "6"),
-                ("so-streams4-no-raster", "2,4,6,8", "2,4,6,8", "20", "0"),
-                ("so-streams4-overflow", "2,3,6,5", "2,4,6,8", "20", "8"),
-                # ExecuteIndirect: two GPU-counted commands of both points append in API order.
-                ("so-streams2-indirect", "4,8,0,0", "4,8,0,0", "12", "8"),
-                ("so-streams4-indirect-overflow", "4,3,8,5", "4,8,12,16", "40", "16"),
-            ]
-            found = re.findall(rf"^{prefix}_CASE_PASS shader=(dxbc|dxil) case=(so-streams[\w-]+) written=([\d,]+) "
-                               rf"needed=([\d,]+) gs=(\d+) c=(\d+)$", stdout, re.MULTILINE)
-            success = success and found == [(shader, *case) for shader in
-                                            (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
-                                            for case in multi_stream]
-            # MSAA GS draws with a forced-early-depth PS (claim buffer): PSInvocations of the direct, indirect and
-            # indirect-SO draws with an occluder, and of the direct draw without it, equal the CPU oracle.
-            early = re.findall(rf"^{prefix}_EARLY_DEPTH_STATISTICS shader=(dxbc|dxil) samples=(\d) "
-                               rf"ps=([\d,]+) oracle=([\d,]+)$", stdout, re.MULTILINE)
-            expected_early = [("2", "57,57,57,75", "57,75"), ("4", "71,71,71,95", "71,95"),
-                              ("8", "86,86,86,113", "86,113")]
-            # Indirect GS strips with a cut / triangle strip with adjacency: indirect == direct (filled SO bytes).
-            strips = re.findall(rf"^{prefix}_STRIP_EXPANSION shader=(dxbc|dxil) case=([\w-]+) .* "
-                                rf"filled=(\d+)/(\d+)$", stdout, re.MULTILINE)
-            expected_strips = [("indirect-strip-cut", "0", "0"), ("indirect-strip-cut-so", "2304", "2304"),
-                               ("indirect-triadj-strip", "0", "0"), ("indirect-triadj-strip-so", "1920", "1920")]
-            shaders = ("dxbc", "dxil") if dxil_frozen else ("dxbc",)
-            success = (success
-                       and early == [(shader, *case) for shader in shaders for case in expected_early]
-                       and strips == [(shader, *case) for shader in shaders for case in expected_strips])
-        if args.suite == "tessellation":
-            # MSAA HS/DS and HS/DS/GS draws with a forced-early-depth PS (claim buffer): direct and indirect
-            # PSInvocations equal the CPU oracle at 2x/4x/8x.
-            early = re.findall(rf"^{prefix}_EARLY_DEPTH_STATISTICS shader=(dxbc|dxil) case=([\w-]+) "
-                               rf"ps=([\d,]+) oracle=(\d+) c=(\d+)$", stdout, re.MULTILINE)
-            expected_early = [("ds-early-depth-msaa2", "269,269", "269", "4"),
-                              ("tsgs-early-depth-msaa2", "538,538", "538", "8"),
-                              ("ds-early-depth-msaa4", "287,287", "287", "4"),
-                              ("tsgs-early-depth-msaa4", "574,574", "574", "8"),
-                              ("ds-early-depth-msaa8", "301,301", "301", "4"),
-                              ("tsgs-early-depth-msaa8", "602,602", "602", "8")]
-            success = success and early == [(shader, *case) for shader in
-                                             (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
-                                             for case in expected_early]
+        success = geometry_output_matches(args, stdout, stderr, success)
     if args.suite == "indexed-restart":
-        dxil_compiler_loaded = native_compiler_proof
-        case_passes = re.findall(
-            r"OWNED_D3D12_INDEXED_RESTART_CASE_PASS shader=(dxbc|dxil) case=([\w-]+) "
-            r"compared=(\d+) nonzero=(\d+) primitives=(\d+)", stdout)
-        success = (success and dxil_compiler_loaded
-                   and stdout.count("OWNED_D3D12_INDEXED_RESTART_MATRIX_PASS "
-                                    "shaders=dxbc,dxil cases=31") == 1
-                   and len(case_passes) == 62
-                   and [name for shader, name, *_ in case_passes if shader == "dxbc"] ==
-                       [name for shader, name, *_ in case_passes if shader == "dxil"]
-                   and "OWNED_D3D12_INDEXED_RESTART_CASE_FAIL" not in stdout + stderr)
+        success, dxil_compiler_loaded = indexed_restart_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "copy-resolve":
-        success = (success
-                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_PASS average=2.5 min=1 max=4 "
-                                    "guard=99 uav=1 aliasing=1") == 1
-                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_MSAA_PREDICATION_PASS") == 1
-                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_PREDICATE_SNAPSHOT_PASS") == 1
-                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_RGBA_PASS") == 1
-                   and stdout.count("OWNED_D3D12_COPY_RESOLVE_DEPTH_STENCIL_PASS") == 1)
+        success = copy_resolve_output_matches(stdout, success)
     if args.suite == "predication-indirect":
-        dxil_compiler_loaded = native_compiler_proof
-        success = (success and dxil_compiler_loaded
-                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_CLEAR_CASES_PASS") == 1
-                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_INDIRECT_CASES_PASS") == 1
-                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_PREDICATE_SNAPSHOT_PASS "
-                                    "saved=1 source_updated=0 copy_predicated=1 resnap_skip_observed=1") == 1
-                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_TYPED_MULTILAYER_CLEARS_PASS "
-                                    "rtv=R16G16B16A16_UINT dsv=D32_FLOAT_S8X24_UINT "
-                                    "uav=R32G32B32A32_UINT layers=2 rect_preservation=1 "
-                                    "component_preservation=1 predicate_preservation=1") == 1
-                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_TYPED_FLOAT_UAV_PASS "
-                                    "format=R32G32B32A32_FLOAT layers=2 rect_preservation=1 "
-                                    "predicate_preservation=1") == 1
-                   and stdout.count("OWNED_D3D12_PREDICATION_INDIRECT_BUFFER_UAV_PASS cases=60 "
-                                    "view_relative=1 clipping=1 sentinels=1 predicate_preservation=1") == 1)
+        success, dxil_compiler_loaded = predication_indirect_output_matches(stdout, native_compiler_proof, success)
     if args.suite == "fence-events":
         fence_rewind_cases = re.findall(r"OWNED_D3D12_FENCE_EVENTS_CASE_PASS case=([a-z0-9_]+)", stdout)
         required_rewind_cases = {"cpu_rewind_events", "gpu_rewind_mixed"}
@@ -4549,217 +5286,17 @@ def run(args: argparse.Namespace) -> int:
                    and stdout.count("case=gpu_rewind_mixed from=10 to=5 equal=1 gated_cpu_gpu=1 "
                                     "competing_queues=1 api_wait_latch=1 retained=1") == 1)
     if args.suite == "ngx":
-        frames = re.findall(r"OWNED_D3D12_NGX_FRAME_PASS frame=(\d+)\b", stdout)
-        number = r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
-        compatibility = re.findall(
-            r"^OWNED_D3D12_NGX_BEHAVIOR_PASS case=(\w+) replay=(\d+) exposure_scale=" + number
-            + r" mv_offset_x=" + number + r" mv_offset_y=" + number
-            + r" max_byte_delta=(\d+) sentinel=1 live_inputs=1 params_destroyed=1 "
-              r"released_before_submit=1 highres_jittered=([01])$", stdout, re.MULTILINE)
-        expected_compatibility = {
-            "exposure_scale_auto": (2.0, 0.0, 0.0, 0),
-            "exposure_scale_texture": (2.0, 0.0, 0.0, 0),
-            "exposure_scale_no_texture": (0.375, 0.0, 0.0, 0),
-            "mv_value_offsets_lowres": (1.0, -1.25, 2.5, 0),
-            "mv_value_offsets_highres_jittered": (1.0, -0.375, 0.625, 1),
-        }
-        success = (success and frames == [str(n) for n in range(8)]
-                   and [(name, int(replay)) for name, replay, *_ in compatibility]
-                       == [(name, replay) for name in expected_compatibility for replay in range(3)]
-                   and all((float(scale), float(offset_x), float(offset_y), int(highres))
-                           == expected_compatibility[name] and int(delta) <= 1
-                           for name, _, scale, offset_x, offset_y, delta, highres in compatibility)
-                   and stdout.count("OWNED_D3D12_NGX_BEHAVIOR_PASS case=rejected_output_preserved "
-                                    "invalid_input_bounds=1 invalid_compatibility_scalars=5 sentinel=1") == 1)
+        success, frames = ngx_output_matches(stdout, success)
+    if args.suite == "fsr-rr":
+        success = fsr_rr_output_matches(stdout, stderr, success)
     if args.suite == "fsr":
-        frames = re.findall(r"OWNED_D3D12_FSR_FRAME_PASS frame=(\d+)\b", stdout)
-        replays = re.findall(r"OWNED_D3D12_FSR_REPLAY_PASS replay=(\d+) .*"
-                             r"destroyed_before_submit=1 sentinel=1 changed_gpu_input=(\d+)", stdout)
-        exposures = re.findall(r"OWNED_D3D12_FSR_EXPOSURE_PASS format=(\d+) value=1 .* sentinel=1", stdout)
-        cases = Counter(re.findall(r"OWNED_D3D12_FSR_BEHAVIOR_PASS case=(\w+)\b", stdout))
-        required_cases = {
-            "zero_motion_resolution_jitter_equivalence": 2, "auto_exposure_ignores_poison_texture": 3,
-            "nonzero_motion_scale_equivalence": 3, "nonzero_motion_effect": 3,
-            "sharpen_constant_invariance": 1, "sharpen_edge_alpha": 1,
-            "constant_transfer_roundtrip": 2, "transfer_independent_scene": 2,
-            "reactive_composition_equivalence": 1, "mask_idempotence": 1,
-            "history_mask_channel_equivalence": 2, "reactive_history_effect": 1,
-            "composition_below_reactive_no_change": 1,
-            "output_generation_switch_resets_history": 1, "history_reset_matches_fresh": 1,
-            "cap_center_matches_native_scale_control": 1, "cap_scale_geometry": 1,
-            "inflight_release": 1, "command_list_reset_discards_work": 1, "exposure_gpu_replay": 3,
-        }
-        motion_effects = re.findall(r"case=nonzero_motion_effect option=(\d+) rgb_byte_delta_sum=(\d+) jitter_nonzero=(\d+)", stdout)
-        transfers = re.findall(r"case=transfer_independent_scene transfer=(\d+) linear_mean_abs_error=(\S+) "
-                               r"wrong_flag_byte_delta_sum=(\d+) alpha_unchanged=1", stdout)
-        constant_transfers = re.findall(r"case=constant_transfer_roundtrip transfer=(\d+) linear_max_error=(\S+) "
-                                        r"alpha_unchanged=1 sentinel=1", stdout)
-        gpu_exposures = re.findall(r"case=exposure_gpu_replay replay=(\d+) value=(\S+) half_bits=([0-9a-f]{4}) "
-                                  r"max_ulp=(\d+) contexts_destroyed=1 gpu_produced_r32=1", stdout)
-        caps = re.findall(r"case=cap_scale_geometry native_max=(\S+) content=(\d+)x(\d+) caller=256x224 "
-                          r"center=(\d+),(\d+) black_opaque=1 sentinel=1", stdout)
-        cap_ok = False
-        try:
-            if len(caps) == 1:
-                scale, width, height, x, y = caps[0]
-                scale = float(scale)
-                extent = math.floor(64 * scale)
-                cap_ok = (1 <= scale < 3.5 and (int(width), int(height), int(x), int(y))
-                          == (extent, extent, (256 - extent) // 2, (224 - extent) // 2))
-            numeric_ok = (sorted((int(option), int(jitter)) for option, _, jitter in motion_effects) == [(0, 0), (2, 0), (4, 1)]
-                          and all(int(delta) > 0 for _, delta, _ in motion_effects)
-                          and sorted(transfer for transfer, _, _ in transfers) == ["2", "4"]
-                          and all(0 <= float(error) <= 0.02 and int(delta) > 0 for _, error, delta in transfers)
-                          and sorted(transfer for transfer, _ in constant_transfers) == ["2", "4"]
-                          and all(0 <= float(error) <= 1.5 / 255 for _, error in constant_transfers)
-                          and [(replay, bits) for replay, _, bits, _ in gpu_exposures]
-                              == [("0", "3555"), ("1", "3cf0"), ("2", "4248")]
-                          and all(int(ulp) <= 1 and abs(float(value) - expected) < 0.00001
-                                  for (_, value, _, ulp), expected in zip(gpu_exposures, (0.3333, 1.234567, 3.14159))))
-        except (ValueError, OverflowError):
-            numeric_ok = False
-        success = (success and frames == ["0", "1", "2", "3"]
-                   and replays == [("0", "0"), ("1", "0"), ("2", "1")]
-                   and exposures == ["0", "54", "41"]
-                   and "OWNED_D3D12_FSR_CASE_PASS case=rejected_dispatch_output_unchanged result=0" in stdout
-                   and all(cases[name] == count for name, count in required_cases.items())
-                   and cap_ok and numeric_ok
-                   and "OWNED_D3D12_FSR_FULL_SR_PASS motion=1 masks=1 transfer=1 sharpening_constant=1 output_generation=1" in stdout
-                   and "case=inflight_release fence_gate=1 context_destroyed=1 caller_resources_released=1 sentinel=1" in stdout
-                   and "case=command_list_reset_discards_work output_unchanged=1 sentinel=1" in stdout
-                   and "OWNED_D3D12_FSR_FAIL" not in stdout + stderr)
+        success, frames = fsr_output_matches(stdout, stderr, success)
     if args.suite == "fsr-fg":
-        present_calls = re.findall(r"OWNED_D3D12_FSR_FG_PRESENT_CALL frame=(\d+) enabled=(\d+) only_generated=(\d+) "
-                                   r"generation_error=(\d+) present_error=(\d+) qpc_start=(\d+) qpc_end=(\d+) frequency=(\d+)", stdout)
-        callbacks = re.findall(r"OWNED_D3D12_FSR_FG_CALLBACK_PIXELS frame=(\d+) generated=(\d+) output_index=(\d+) width=128 height=128 "
-                               r"hash=([0-9a-f]{16}) marker=(\d+),(\d+),220", stdout)
-        generated_counts = dict.fromkeys((1, 2, 3, 4, 7, 8, 10, 11, 12), 1)
-        expected_callbacks = []
-        for frame in range(1, 13):
-            expected_callbacks.extend((frame, 1, index) for index in range(1, generated_counts.get(frame, 0) + 1))
-            if frame not in (8, 12):
-                expected_callbacks.append((frame, 0, 0))
-        grouped = re.findall(r"^OWNED_D3D12_FSR_FG_NATIVE_PASS count=(1) distinct_gpu_outputs=(1) "
-                             r"rect_guard=exact reset_output=current$", stdout, re.MULTILINE)
-        ui_frames = re.findall(r"OWNED_D3D12_FSR_FG_UI_FRAME frame=(\d+) width=(\d+) height=(\d+) source=(\d+),60,100 "
-                               r"ui=64,0,0,128 premul=1 doublebuffer=1 overwritten_after_present=1", stdout)
-        statistics = re.findall(r"OWNED_D3D12_FSR_FG_STATISTICS frame=(\d+) statistics=(actual|disjoint) "
-                                r"result=(0x[0-9a-fA-F]+) submitted_present=(\d+) native_present=(\d+) "
-                                r"present_refresh=(\d+) sync_refresh=(\d+) sync_qpc=(\d+) qpc_end=(\d+) frequency=(\d+) "
-                                r"source=public_dxgi_actual_presentation", stdout)
-        final_statistics = re.findall(r"OWNED_D3D12_FSR_FG_FINAL_STATISTICS stream=(callback|builtin_ui) "
-                                      r"output_vblanks=3 statistics=(actual|disjoint) result=(0x[0-9a-fA-F]+) "
-                                      r"submitted_present=(\d+) native_present=(\d+) present_refresh=(\d+) "
-                                      r"sync_refresh=(\d+) sync_qpc=(\d+) qpc_end=(\d+) frequency=(\d+) "
-                                      r"source=public_dxgi_actual_presentation", stdout)
-        observations_ok = len(statistics) == 16 and [row[0] for row in final_statistics] == ["callback", "builtin_ui"]
-        if observations_ok:
-            for rows, final, requested in zip((statistics[:12], statistics[12:]), final_statistics,
-                                              (len(expected_callbacks), len(ui_frames))):
-                previous = (0, 0, 0, 0)
-                previous_submitted = 0
-                frequencies = set()
-                for _, outcome, result, submitted, count, refresh, sync, qpc, end, frequency in [*rows, final]:
-                    submitted, count, refresh, sync, qpc, end, frequency = map(int, (submitted, count, refresh, sync, qpc, end, frequency))
-                    values = (count, refresh, sync, qpc)
-                    observations_ok &= submitted >= previous_submitted and frequency > 0 and end > 0
-                    frequencies.add(frequency)
-                    if outcome == "actual":
-                        observations_ok &= (int(result, 0) == 0 and 0 < count <= submitted and 0 < refresh <= sync and
-                                            0 < qpc <= end and all(a <= b for a, b in zip(previous, values)))
-                        previous = values
-                    else:
-                        observations_ok &= int(result, 0) == 0x887A000B and values == (0, 0, 0, 0)
-                    previous_submitted = submitted
-                observations_ok &= (final[1] == "actual" and final[3] == rows[-1][3] and
-                                    int(final[3]) == requested and len(frequencies) == 1)
-        success = (success
-                   and stdout.count("OWNED_D3D12_FSR_FG_ORIGINAL_SDK_PASS resize1=unsupported unchanged=1 resize=implemented pacing=original") == 1
-                   and "OWNED_D3D12_FSR_FG_DIRECT_PASS snapshot=exact rect_guard=exact frames=4" in stdout
-                   and "OWNED_D3D12_FSR_FG_HISTORY_PASS reset=fresh gap=reset off_on=fresh stale_record=no_history_publication negative_output=unchanged" in stdout
-                   and "OWNED_D3D12_FSR_FG_LIFETIME_PASS context_destroy_before_execute=1 input_release=1 allocation_balance=1" in stdout
-                   and "OWNED_D3D12_FSR_FG_CONFIG_PASS repeated_id=replace retained_distinct_limit=64 overflow=runtime_error off_clears=1" in stdout
-                   and all(stdout.splitlines().count(marker) == 1 for marker in (
-                       "OWNED_D3D12_FSR_FG_DEBUG_PASS tear=gpu_effect reset=history debug=real_inputs configure=frame_snapshot history=unmodified alpha=opaque",
-                       "OWNED_D3D12_FSR_FG_DEBUG_CAPTURE_PASS prepare=per_frame configure=recorded rect=recorded output=independent_gpu_exact",
-                       "OWNED_D3D12_FSR_FG_DEBUG_REPLAY_PASS combined=1 debug_overlay=full_display replay=fresh_native context_destroy_before_replay=1",
-                       "OWNED_D3D12_FSR_FG_COUNT_REJECTION_PASS invalid=0,5 unsupported=2,3,4 sentinel=exact prepare=retained",
-                       "OWNED_D3D12_FSR_FG_NO_NOTIFY_PROXY_PASS frame=3 generated=1",
-                       "OWNED_D3D12_FSR_FG_PREPARE_ORDER_PASS matching_frame=2 newest_prepare=3 output=exact",
-                       "OWNED_D3D12_FSR_FG_NATIVE_PACING_PASS count=1 generated_before_real=1 bootstrap_reset=native_output disabled=real_only callback_error=real_only"))
-                   and grouped == [("1", "1")]
-                   and all(len({row[3] for row in callbacks if int(row[0]) == frame and row[1] == "1"}) == count
-                           for frame, count in generated_counts.items())
-                   and "OWNED_D3D12_FSR_FG_PROXY_PASS create=hwnd callbacks=gpu-readback generated_before_real=1 only_generated=1 disabled=1 callback_error=1 drain=1 destroy=1" in stdout
-                   and "OWNED_D3D12_FSR_FG_PACING_PASS ordered=1 bounded_progress=1 qpc=observed native_timestamps=external_observer_required" in stdout
-                   and "OWNED_D3D12_FSR_FG_UI_PASS wrap=real_hwnd ui=builtin_shader premultiplied=1 doublebuffer=gpu_snapshot resize=96x80 lifetime=drained" in stdout
-                   and [tuple(map(int, row)) for row in ui_frames]
-                       == [(11, 128, 128, 88), (12, 128, 128, 96), (13, 96, 80, 104), (14, 96, 80, 112)]
-                   and [int(frame) for frame, *_ in statistics] == [*range(1, 13), *range(11, 15)]
-                   and observations_ok
-                   and [int(frame) for frame, *_ in present_calls] == list(range(1, 13))
-                   and [(int(frame), int(generated), int(index)) for frame, generated, index, *_ in callbacks] == expected_callbacks
-                   and all(int(red) == int(frame) + 32 and int(green) == (190 if generated == "1" else 70)
-                           for frame, generated, _, _, red, green in callbacks)
-                   and all((int(enabled), int(only), int(generation_error), int(present_error))
-                           == (int(int(frame) not in (5, 6)), int(frame in ("8", "12")), int(frame == "9"), 0)
-                           and int(frequency) > 0 and 0 <= int(end) - int(start) < 60 * int(frequency)
-                           for frame, enabled, only, generation_error, present_error, start, end, frequency in present_calls)
-                   and "OWNED_D3D12_FSR_FG_FAIL" not in stdout + stderr
-                   and "OWNED_D3D12_FSR_FG_OBSERVER_FAIL" not in stdout + stderr)
+        success = fsr_fg_output_matches(stdout, stderr, success)
     if args.suite == "temporal":
-        frames = re.findall(r"OWNED_D3D12_TEMPORAL_FRAME_PASS variant=(\w+) frame=(\d+)\b", stdout)
-        exposures = re.findall(r"case=r32_exposure_numeric replay=(\d+) exposure=\S+ "
-                               r"r16_bits=0x([0-9a-f]{4}) max_output_ulp=(\d+) "
-                               r"gpu_producer=rtv_clear release_before_completion=(\d+)", stdout)
-        success = (success and frames == [(variant, str(n)) for variant in ("typed", "typeless_zzz")
-                                         for n in range(8)]
-                   and [(replay, bits, released) for replay, bits, ulp, released in exposures]
-                   == [("0", "3555", "0"), ("1", "3cf0", "0"), ("2", "4248", "1")]
-                   and all(int(ulp) <= 1 for _, _, ulp, _ in exposures)
-                   and stdout.count("OWNED_D3D12_TEMPORAL_CASE_PASS case=descriptor_ABC_reuse "
-                                    "sequence=A,B,C,A executions=8 explicit_reset=1 caller_released=1") == 1)
+        success, frames = temporal_output_matches(stdout, success)
     if args.suite in ("dxil", "dxil-ia"):
-        # A DXIL run is only meaningful when the staged native module carrying the
-        # owned compiler is present and dyld actually loaded that exact file.
-        dxil_compiler_loaded = native_compiler_proof
-        success = success and dxil_compiler_loaded
-        compute = re.findall(
-            r"OWNED_D3D12_DXIL_COMPUTE index=(\d+) expected=0x([0-9a-f]{8}) actual=0x([0-9a-f]{8})",
-            stdout)
-        success = success and len(compute) == 1 and compute[0][1] == compute[0][2]
-        # The owned compiler's descriptor-table binding must execute and read back
-        # the expected value; an unsupported HRESULT is never accepted as evidence.
-        if args.suite == "dxil":
-            table = re.findall(re.escape(DXIL_DESCRIPTOR_TABLE_MARKER)
-                               + r" expected=0x([0-9a-f]{8}) actual=0x([0-9a-f]{8})", stdout)
-            success = success and len(table) == 1 and table[0] == (
-                DXIL_DESCRIPTOR_TABLE_VALUE, DXIL_DESCRIPTOR_TABLE_VALUE)
-            spaces = re.findall(r"OWNED_D3D12_DXIL_REGISTER_SPACES b0_space2=0x([0-9a-f]{8}) "
-                                r"b0_space9=0x([0-9a-f]{8})", stdout)
-            success = success and spaces == [("13579bdf", "2468ace0")]
-            success = (success and stdout.count("OWNED_D3D12_DXIL_STATIC_BOUNDS_PASS null_reads=zero "
-                                               "oob_atomic=zero oob_writes=dropped sentinels=preserved "
-                                               "in_range=exact root_uav=exact") == 1)
-        varying = re.findall(r"OWNED_D3D12_DXIL_VARYING slot=(\d+) ", stdout)
-        success = success and varying == [str(n) for n in range(4)]
-        depth = re.findall(r"OWNED_D3D12_DXIL_DEPTH center=([0-9.]+) ", stdout)
-        depth_ok = False
-        if len(depth) == 1:
-            try:
-                depth_ok = float(depth[0]) < 0.0001
-            except ValueError:
-                depth_ok = False
-        success = success and depth_ok
-        if args.suite == "dxil-ia":
-            pairs = re.findall(re.escape(DXIL_IA_MARKER) + r" pair=(DXIL-DXIL|DXBC-DXIL|DXIL-DXBC)", stdout)
-            clip_link = DXIL_IA_MARKER.replace("DXIL_IA_PASS", "DXIL_CLIP_LINK_PASS") + " pair=DXBC-DXBC-CLIP"
-            packed_link = DXIL_IA_MARKER.replace("DXIL_IA_PASS", "DXIL_PACKED_LINK_PASS") + " pair=DXBC-DXBC-PACKED"
-            success = (success and len(pairs) == 3
-                       and set(pairs) == {"DXIL-DXIL", "DXBC-DXIL", "DXIL-DXBC"}
-                       and stdout.count(clip_link) == 1 and stdout.count(packed_link) == 1
-                       and re.findall(r"OWNED_D3D12_DISTANCE_PASS samples=(\d+)", stdout) == ["1", "4"])
-        frames = compute
+        success, dxil_compiler_loaded, frames = dxil_output_matches(args, stdout, native_compiler_proof, success)
     if args.suite == "dxil-static-sampler":
         dxil_compiler_loaded = native_compiler_proof
         success = (success and dxil_compiler_loaded
@@ -4771,22 +5308,9 @@ def run(args: argparse.Namespace) -> int:
                    and stdout.count("OWNED_D3D12_DXIL_RESOURCE_REVIEW_PASS") == 1
                    and "OWNED_D3D12_DXIL_RESOURCE_REVIEW_FAIL" not in stdout + stderr)
     if args.suite == "advanced-texture":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_ADVANCED_TEXTURE_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == ADVANCED_TEXTURE_CASES
-                   and len(re.findall(r"^OWNED_D3D12_ADVANCED_TEXTURE_CAPS relaxed_format_casting=1 advanced_texture_ops=1 comparison_gradient_bias=1$", stdout, re.MULTILINE)) == 1
-                   and stdout.count("OWNED_D3D12_ADVANCED_TEXTURE_PASS cases=60") == 1
-                   and "OWNED_D3D12_ADVANCED_TEXTURE_FAIL" not in stdout + stderr
-                   and "OWNED_D3D12_DXIL_FAIL" not in stdout + stderr
-                   and "kIOGPUCommandBufferCallbackError" not in stderr)
+        success, dxil_compiler_loaded = advanced_texture_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "depth-casting":
-        dxil_compiler_loaded = native_compiler_proof
-        cases = re.findall(r"^OWNED_D3D12_DEPTH_CASTING_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
-        success = (success and dxil_compiler_loaded and tuple(cases) == DEPTH_CASTING_CASES
-                   and stdout.count("OWNED_D3D12_DEPTH_CASTING_PASS cases=8") == 1
-                   and "OWNED_D3D12_DEPTH_CASTING_FAIL" not in stdout + stderr
-                   and "OWNED_D3D12_DXIL_FAIL" not in stdout + stderr
-                   and "kIOGPUCommandBufferCallbackError" not in stderr)
+        success, dxil_compiler_loaded = depth_casting_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "depth-bounds":
         dxil_compiler_loaded = native_compiler_proof
         depth_bounds_errors = depth_bounds_failures(stdout, stderr)
@@ -5125,6 +5649,8 @@ def main() -> int:
     validation.add_argument("--api-validation", action="store_true",
                             help="enable Metal API validation without shader instrumentation")
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--async-pipeline-compile", action="store_true",
+                        help="run any suite with d3d12.asyncPipelineCompile=True (async-pipeline suites always enable it)")
     args = parser.parse_args()
     if not 1 <= args.timeout <= 600:
         parser.error("--timeout must be between 1 and 600 seconds")

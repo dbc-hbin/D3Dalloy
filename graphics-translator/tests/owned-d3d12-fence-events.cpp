@@ -94,6 +94,14 @@ void asynchronous(ID3D12Device1 *device) {
   check(device->SetEventOnMultipleFenceCompletion(fences, values, 2,
       D3D12_MULTIPLE_FENCE_WAIT_FLAG_NONE, completed.handle), "already completed ALL");
   completed.expect(WAIT_OBJECT_0, kTimeout, "already completed ALL notification");
+  // Already-reached single-fence values take the registration-free path.
+  Event reached;
+  check(second->SetEventOnCompletion(5, reached.handle), "already completed single");
+  reached.expect(WAIT_OBJECT_0, 0, "already completed single notification");
+  reached.expect(WAIT_TIMEOUT, 0, "already completed single fired twice");
+  check(second->SetEventOnCompletion(7, nullptr), "already completed single null event");
+  check(device->SetEventOnMultipleFenceCompletion(fences, values, 2,
+      D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, nullptr), "already completed ALL null event");
   std::puts("OWNED_D3D12_FENCE_EVENTS_CASE_PASS case=async_all_any exactly_once=1 already_completed=1");
 }
 

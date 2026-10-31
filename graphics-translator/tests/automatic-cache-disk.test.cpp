@@ -3,6 +3,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3dcompiler.h>
+#include "DXBCParser/StageCache.h"
 #include "sha1/sha1_util.hpp"
 #include "com/com_pointer.hpp"
 #include <algorithm>
@@ -93,11 +94,249 @@ void stageStore(unsigned value) {
   artifact.view.ConstantDataAlignment = 1;
   WriteAutomaticStageArtifact("stage-" + std::to_string(value), artifact);
 }
+std::wstring stagePath(const std::string &value) {
+  const auto digest = Sha1HashState::compute(value.data(), value.size());
+  return directory() + L"dxmt-stage-" + Hex(digest.data, sizeof(digest.data)) + L".bin";
+}
+std::vector<uint8_t> stageBytes(const std::string &value) {
+  FileHandle file{CreateFileW(stagePath(value).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+  require(file.value != INVALID_HANDLE_VALUE, "open stage publication");
+  LARGE_INTEGER size{};
+  require(GetFileSizeEx(file.value, &size) && size.QuadPart >= 0 && uint64_t(size.QuadPart) <= 8 * MiB,
+          "bounded stage publication");
+  std::vector<uint8_t> bytes((size_t(size.QuadPart)));
+  require(Read(file.value, bytes.data(), DWORD(bytes.size())), "read stage publication bytes");
+  return bytes;
+}
+void replaceStageBytes(const std::string &value, const std::vector<uint8_t> &bytes) {
+  FileHandle file{CreateFileW(stagePath(value).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)};
+  require(file.value != INVALID_HANDLE_VALUE && Write(file.value, bytes.data(), DWORD(bytes.size())) &&
+              FlushFileBuffers(file.value), "replace owned stage fixture");
+}
+void stageChecksum(std::vector<uint8_t> &bytes, const DxmtStageCacheLayout &layout) {
+  Sha1HashState checksum;
+  checksum.update(bytes.data() + layout.checksum_header.offset, size_t(layout.checksum_header.size))
+      .update(bytes.data() + layout.checksum_payload.offset, bytes.size() - size_t(layout.checksum_payload.offset));
+  const auto digest = checksum.final();
+  std::memcpy(bytes.data() + layout.checksum.offset, digest.data, sizeof(digest.data));
+}
+void testStageCodec() {
+  clear();
+  const std::string value("stage-\0payload", 14);
+  ShaderStageArtifact source;
+  source.library = {'M', 'T', 'L', 'B', 0, 0xff, 1};
+  source.metadata_sizes = {0, 3, 2};
+  source.metadata = {0, 1, 0xff, 3, 4};
+  source.constants = {0, UINT64_MAX, 0x0123456789abcdefull, 0xfedcba9876543210ull};
+  source.relocations = {{0, 8}, {8, 32}, {16, SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE},
+                        {24, SM50_CONSTANT_RELOCATION_TARGET_ATOMIC64_CONTEXT}};
+  source.view.ConstantDataAlignment = 256;
+  WriteAutomaticStageArtifact(value, source);
+  std::shared_ptr<const ShaderStageArtifact> loaded;
+  require(ReadAutomaticStageArtifact(value, loaded) == S_OK && loaded, "full stage disk roundtrip");
+  require(loaded->library == source.library && loaded->metadata_sizes == source.metadata_sizes &&
+              loaded->metadata == source.metadata && loaded->constants == source.constants &&
+              loaded->relocations.size() == source.relocations.size() &&
+              !std::memcmp(loaded->relocations.data(), source.relocations.data(),
+                           source.relocations.size() * sizeof(SM50_CONSTANT_RELOCATION)),
+          "stage library metadata constants and relocations roundtrip");
+  require(loaded->view.Data == loaded->library.data() && loaded->view.Size == loaded->library.size() &&
+              loaded->view.ConstantData == loaded->constants.data() &&
+              loaded->view.ConstantDataSize == source.constants.size() * sizeof(uint64_t) &&
+              loaded->view.ConstantDataAlignment == 256 &&
+              loaded->view.ConstantRelocations == loaded->relocations.data() &&
+              loaded->view.ConstantRelocationCount == source.relocations.size(),
+          "stage decoded views retain their artifact owner");
+  WMTPipelineCacheIdentity identity{};
+  require(StageIdentity(identity), "stage test identity");
+  const auto original = stageBytes(value);
+  DxmtStageCacheLayout layout{};
+  require(dxmt_stage_cache_decode(original.data(), original.size(), value.data(), value.size(), &identity, &layout) ==
+              DXMT_STAGE_CACHE_SUCCESS, "decode published stage layout");
+  require(layout.checksum_header.offset == 0 && layout.checksum_header.size == 104 &&
+              layout.checksum_payload.offset == 128 && layout.checksum_payload.size == original.size() - 128 &&
+              layout.checksum.offset == 104 && layout.checksum.size == 20,
+          "stage version two checksum excludes digest and trailing header padding");
+  const DxmtStageCacheParts parts{
+      value.data(), source.library.data(), source.metadata_sizes.data(), source.metadata.data(),
+      source.constants.data(), source.relocations.data(), &identity,
+      value.size(), source.library.size(), source.metadata_sizes.size() * sizeof(uint32_t), source.metadata.size(),
+      source.constants.size() * sizeof(uint64_t), source.relocations.size() * sizeof(SM50_CONSTANT_RELOCATION), 256};
+  uint64_t encoded_size = 0;
+  require(dxmt_stage_cache_measure(&parts, &encoded_size) == DXMT_STAGE_CACHE_SUCCESS && encoded_size == original.size(),
+          "stage encoder measures complete payload");
+  std::vector<uint8_t> encoded(size_t(encoded_size), 0xa5);
+  DxmtStageCacheLayout encoded_layout{};
+  require(dxmt_stage_cache_encode(&parts, encoded.data(), encoded.size(), &encoded_layout) == DXMT_STAGE_CACHE_SUCCESS,
+          "stage encoder assembles actual artifact regions");
+  require(std::all_of(encoded.begin() + 104, encoded.begin() + 128, [](auto byte) { return byte == 0; }),
+          "stage encoder initializes checksum and header padding");
+  stageChecksum(encoded, encoded_layout);
+  require(encoded == original, "stage encoder matches published bytes");
+  auto invalid = [&](std::vector<uint8_t> bytes, const char *message) {
+    DxmtStageCacheLayout rejected_layout;
+    std::memset(&rejected_layout, 0xa5, sizeof(rejected_layout));
+    const auto untouched = rejected_layout;
+    require(dxmt_stage_cache_decode(bytes.data(), bytes.size(), value.data(), value.size(), &identity, &rejected_layout) !=
+                DXMT_STAGE_CACHE_SUCCESS && !std::memcmp(&rejected_layout, &untouched, sizeof(untouched)), message);
+    stageChecksum(bytes, layout);
+    replaceStageBytes(value, bytes);
+    auto rejected = loaded;
+    require(ReadAutomaticStageArtifact(value, rejected) == E_FAIL && !rejected, message);
+  };
+  auto bytes = original;
+  const uint32_t huge_count = UINT32_MAX;
+  std::memcpy(bytes.data() + layout.metadata_sizes.offset - sizeof(uint32_t), &huge_count, sizeof(huge_count));
+  invalid(bytes, "reject independently malformed metadata count without publishing layout");
+  bytes = original;
+  const uint32_t short_length = 1, long_length = 3;
+  std::memcpy(bytes.data() + layout.metadata_sizes.offset + 2 * sizeof(uint32_t), &short_length, sizeof(short_length));
+  invalid(bytes, "reject metadata length sum below payload without publishing layout");
+  bytes = original;
+  std::memcpy(bytes.data() + layout.metadata_sizes.offset + 2 * sizeof(uint32_t), &long_length, sizeof(long_length));
+  invalid(bytes, "reject metadata length sum above payload without publishing layout");
+  bytes = original;
+  const auto metadata_start = size_t(layout.metadata_sizes.offset) - sizeof(uint32_t);
+  bytes.erase(bytes.begin() + metadata_start + 3, bytes.begin() + layout.constants.offset);
+  const uint64_t missing_count = 3;
+  std::memcpy(bytes.data() + 24, &missing_count, sizeof(missing_count));
+  invalid(bytes, "reject metadata region shorter than its count field with valid total length");
+  bytes = original;
+  bytes.pop_back();
+  invalid(bytes, "reject truncated stage length without publishing layout");
+  bytes = original;
+  bytes.push_back(0);
+  invalid(bytes, "reject trailing stage bytes without publishing layout");
+  bytes = original;
+  const uint64_t huge_length = UINT64_MAX;
+  std::memcpy(bytes.data() + 16, &huge_length, sizeof(huge_length));
+  invalid(bytes, "reject overflowing stage region length without publishing layout");
+  bytes = original;
+  const uint64_t bad_source = source.constants.size() * sizeof(uint64_t) - 7;
+  std::memcpy(bytes.data() + layout.relocations.offset, &bad_source, sizeof(bad_source));
+  invalid(bytes, "reject relocation source beyond last complete constant without publishing layout");
+  bytes = original;
+  const uint64_t bad_target = source.constants.size() * sizeof(uint64_t) + 1;
+  std::memcpy(bytes.data() + layout.relocations.offset + sizeof(uint64_t), &bad_target, sizeof(bad_target));
+  invalid(bytes, "reject relocation target outside constants and reserved targets without publishing layout");
+  bytes = original;
+  bytes.insert(bytes.end(), sizeof(SM50_CONSTANT_RELOCATION), 0);
+  const uint64_t too_many_relocations = layout.relocations.size + sizeof(SM50_CONSTANT_RELOCATION);
+  std::memcpy(bytes.data() + 48, &too_many_relocations, sizeof(too_many_relocations));
+  invalid(bytes, "reject relocation count exceeding constant words with valid total length");
+  bytes = original;
+  bytes[size_t(layout.library.offset)] = 'X';
+  invalid(bytes, "reject non MTLB stage without publishing layout");
+  bytes = original;
+  bytes[56] ^= 1;
+  invalid(bytes, "reject stage identity mismatch without publishing layout");
+  bytes = original;
+  bytes[128] ^= 1;
+  invalid(bytes, "reject stage key mismatch without publishing layout");
+  bytes = original;
+  bytes[size_t(layout.checksum.offset)] ^= 1;
+  replaceStageBytes(value, bytes);
+  auto rejected = loaded;
+  require(ReadAutomaticStageArtifact(value, rejected) == E_FAIL && !rejected, "reject stage checksum mismatch");
+  bytes = original;
+  std::fill(bytes.begin() + 124, bytes.begin() + 128, 0xa5);
+  replaceStageBytes(value, bytes);
+  require(ReadAutomaticStageArtifact(value, loaded) == S_OK, "stage header padding remains outside checksum");
+  auto invalid_parts = parts;
+  const uint32_t invalid_lengths[] = {0, 3, 1};
+  invalid_parts.metadata_sizes = invalid_lengths;
+  uint64_t untouched_size = UINT64_MAX;
+  require(dxmt_stage_cache_measure(&invalid_parts, &untouched_size) == DXMT_STAGE_CACHE_INVALID_DATA &&
+              untouched_size == UINT64_MAX, "invalid stage measure leaves size unchanged");
+  std::fill(encoded.begin(), encoded.end(), 0xa5);
+  const auto untouched_bytes = encoded;
+  DxmtStageCacheLayout untouched_layout;
+  std::memset(&untouched_layout, 0xa5, sizeof(untouched_layout));
+  encoded_layout = untouched_layout;
+  require(dxmt_stage_cache_encode(&invalid_parts, encoded.data(), encoded.size(), &encoded_layout) ==
+              DXMT_STAGE_CACHE_INVALID_DATA && encoded == untouched_bytes &&
+              !std::memcmp(&encoded_layout, &untouched_layout, sizeof(untouched_layout)),
+          "invalid stage encode leaves destination and layout unchanged");
+  require(dxmt_stage_cache_encode(&parts, encoded.data(), encoded.size() - 1, &encoded_layout) == DXMT_STAGE_CACHE_OUTPUT_SIZE &&
+              encoded == untouched_bytes && !std::memcmp(&encoded_layout, &untouched_layout, sizeof(untouched_layout)),
+          "undersized stage encode leaves destination and layout unchanged");
+  invalid_parts = parts;
+  invalid_parts.metadata_sizes = nullptr;
+  require(dxmt_stage_cache_encode(&invalid_parts, encoded.data(), encoded.size(), &encoded_layout) ==
+              DXMT_STAGE_CACHE_INVALID_ARGUMENT && encoded == untouched_bytes &&
+              !std::memcmp(&encoded_layout, &untouched_layout, sizeof(untouched_layout)),
+          "null nonempty stage input leaves destination and layout unchanged");
+  require(dxmt_stage_cache_file_size(127) != DXMT_STAGE_CACHE_SUCCESS &&
+              dxmt_stage_cache_file_size(8 * MiB + 1) != DXMT_STAGE_CACHE_SUCCESS &&
+              dxmt_stage_cache_file_size(128) == DXMT_STAGE_CACHE_SUCCESS &&
+              dxmt_stage_cache_file_size(8 * MiB) == DXMT_STAGE_CACHE_SUCCESS,
+          "stage file bounds checked before allocation");
+  source.library[0] = 'X';
+  WriteAutomaticStageArtifact(value, source);
+  require(stageBytes(value)[size_t(layout.library.offset)] == 'X' &&
+              ReadAutomaticStageArtifact(value, loaded) == E_FAIL && !loaded,
+          "stage writer retains legacy reader-only library magic check");
+  source.library[0] = 'M';
+  source.relocations[0].Offset = bad_source;
+  WriteAutomaticStageArtifact(value, source);
+  bytes = stageBytes(value);
+  uint64_t encoded_source = 0;
+  std::memcpy(&encoded_source, bytes.data() + layout.relocations.offset, sizeof(encoded_source));
+  require(encoded_source == bad_source && ReadAutomaticStageArtifact(value, loaded) == E_FAIL && !loaded,
+          "stage writer retains legacy reader-only relocation check");
+  source.relocations[0].Offset = 0;
+  source.view.ConstantDataAlignment = uint64_t(1) << 32;
+  WriteAutomaticStageArtifact(value, source);
+  bytes = stageBytes(value);
+  uint64_t encoded_alignment = 0;
+  std::memcpy(&encoded_alignment, bytes.data() + 40, sizeof(encoded_alignment));
+  require(encoded_alignment == source.view.ConstantDataAlignment &&
+              ReadAutomaticStageArtifact(value, loaded) == E_FAIL && !loaded,
+          "stage writer retains legacy reader-only alignment limit");
+  source.library = {'M', 'T', 'L', 'B'};
+  source.metadata.clear(); source.metadata_sizes.clear();
+  source.constants.clear(); source.relocations.clear();
+  source.view.ConstantDataAlignment = 1;
+  WriteAutomaticStageArtifact(value, source);
+  require(ReadAutomaticStageArtifact(value, loaded) == S_OK && loaded->metadata_sizes.empty() && loaded->metadata.empty() &&
+              loaded->constants.empty() && loaded->relocations.empty() && !loaded->view.ConstantData &&
+              !loaded->view.ConstantRelocations && loaded->view.ConstantDataAlignment == 1,
+          "empty stage regions and zero metadata records roundtrip");
+  clear();
+  std::puts("STAGE_CACHE_DISK_PASS full-codec-roundtrip-and-malformed-inputs");
+}
 void testStageAccounting() {
   stage_enumerations = 0;
   stageStore(1);
   stageStore(2);
   require(stage_enumerations == 1, "stage publication rescans directory once");
+  {
+    const auto cache_directory = directory();
+    AutomaticDiskLock lock;
+    require(lock.acquire(cache_directory) == S_OK, "inspect accounting mappings");
+    require(lock.accounting != lock.stage_accounting, "whole-PSO and stage accounting remain separate");
+    AutomaticDiskAccounting *whole = nullptr, *stage = nullptr;
+    require(AutomaticAccounting(cache_directory, whole) == S_OK && whole == lock.accounting,
+            "whole-PSO registry retains its mapping");
+    require(StageAccounting(cache_directory, stage) == S_OK && stage == lock.stage_accounting,
+            "stage registry retains its mapping");
+    const auto hash = Sha1HashState::compute(cache_directory.data(), cache_directory.size() * sizeof(WCHAR));
+    const auto suffix = Hex(hash.data, sizeof(hash.data));
+    const struct {
+      const WCHAR *prefix;
+      AutomaticDiskAccounting *state;
+    } expected[] = {{L"Local\\dxmt-pso-accounting-v1-", whole}, {L"Local\\dxmt-stage-accounting-v1-", stage}};
+    for (const auto &entry : expected) {
+      AutomaticAccountingMapping mapping;
+      mapping.handle = OpenFileMappingW(FILE_MAP_READ, FALSE, (entry.prefix + suffix).c_str());
+      require(mapping.handle != nullptr, "accounting mapping keeps its cross-process name");
+      mapping.state = static_cast<AutomaticDiskAccounting *>(
+          MapViewOfFile(mapping.handle, FILE_MAP_READ, 0, 0, sizeof(AutomaticDiskAccounting)));
+      require(mapping.state && mapping.state->bytes == entry.state->bytes && mapping.state->valid == entry.state->valid,
+              "named mapping exposes the retained accounting state");
+    }
+  }
   std::printf("STAGE_CACHE_DISK_OPERATIONS publications=2 stage_metadata_enumerations=%llu\n",
               static_cast<unsigned long long>(stage_enumerations));
   clear();
@@ -148,6 +387,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   testStageAccounting();
+  testStageCodec();
   clear();
   const auto foreign = directory() + L"dxmt-pso-not-owned.bin";
   HANDLE foreign_file = CreateFileW(foreign.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);

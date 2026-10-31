@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Source-owned compile/COFF/PE facade ABI proof; never executes a Windows guest.
 
---abi-only --all-abis compiles NGX, FSR SR/FG and NVAPI production sources with
+--abi-only --all-abis compiles NGX, FSR SR/FG/RR and NVAPI production sources with
 existing compilers for x86/x64/ARM64/ARM64EC. The parameter vtable is compared
 with an independent official-header oracle, including x86 thiscall and all 17
-slots. Without --abi-only, link NGX against the selected Meson build libraries.
+slots. RR 1.2 and legacy 1.0/1.1 PODs are compared across MSVC/MinGW C/C++
+frontends. Without --abi-only, link NGX against the selected Meson build libraries.
 """
 from __future__ import annotations
 
@@ -59,6 +60,7 @@ def vtable(ir: str) -> list[str]:
 
 def verify_abi(abi: str, args: argparse.Namespace, out: Path) -> list[Path]:
     prefix, msvc, machine = ARCHES[abi]
+    cc = args.toolchain / (prefix + "-w64-mingw32-gcc")
     cxx = args.toolchain / (prefix + "-w64-mingw32-g++")
     clang = args.toolchain / "clang++"
     objdump = args.toolchain / "llvm-objdump"
@@ -73,14 +75,26 @@ def verify_abi(abi: str, args: argparse.Namespace, out: Path) -> list[Path]:
     actual_ir = (out / "facade.ll").read_text()
     reference_ir = (out / "reference.ll").read_text()
     layout_source = ROOT / "graphics-translator/tests/owned-facade-pod-abi.cpp"
+    layout_symbols = ("owned_facade_pod_layout", "owned_rr_12_pod_layout",
+                      "owned_rr_legacy_pod_layout", "owned_rr_bridge_pod_layout")
     layouts = []
-    for name, compiler_flags in (("msvc", [flag for flag in flags if flag != "-Werror"]), ("mingw", [str(cxx), "-std=c++20"])):
+    layout_compilers = (
+        ("msvc", [flag for flag in flags if flag != "-Werror"]),
+        ("mingw", [str(cxx), "-std=c++20"]),
+        ("msvc-c", [str(args.toolchain / "clang"), f"--target={msvc}-pc-windows-msvc", "-x", "c", "-std=c11", "-Wall", "-Wextra"]),
+        ("mingw-c", [str(cc), "-x", "c", "-std=c11"]),
+    )
+    for name, compiler_flags in layout_compilers:
         layout_path = out / (name + "-pod.ll")
         run([*compiler_flags, "-ffreestanding", "-S", "-emit-llvm", str(layout_source), "-o", str(layout_path)], out / (name + "-pod.log"))
-        layout_line = next(line for line in layout_path.read_text().splitlines() if "owned_facade_pod_layout" in line and "constant" in line)
-        layouts.append(re.findall(r"i32 (\d+)", layout_line))
-    if not layouts[0] or layouts[0] != layouts[1]:
-        raise RuntimeError(f"{abi} public FFX POD layout mismatch: {layouts}")
+        layout_ir = layout_path.read_text().splitlines()
+        layout = {
+            symbol: re.findall(r"i32 (\d+)", next(line for line in layout_ir if symbol in line and "constant" in line))
+            for symbol in layout_symbols
+        }
+        if any(not values for values in layout.values()) or (layouts and layout != layouts[0]):
+            raise RuntimeError(f"{abi} {name} public FFX/RR POD layout mismatch: {layout} != {layouts[:1]}")
+        layouts.append(layout)
     actual, expected = vtable(actual_ir), vtable(reference_ir)
     # Enum and unsigned return values both lower to i32. Compare parameter
     # identity/order independently of that deliberately different C++ spelling.
@@ -103,12 +117,17 @@ def verify_abi(abi: str, args: argparse.Namespace, out: Path) -> list[Path]:
     run([str(objdump), "-d", str(out / "consumer.obj")], out / "consumer-disassembly.log")
     objects = []
     compiled = {}
-    sources = ["nvngx/nvngx.cpp", "nvngx/nvngx_d3d12.cpp", "fsr/fsr.cpp", "fsrfg/fsrfg.cpp", "nvapi/nvapi.cpp"]
+    sources = ["nvngx/nvngx.cpp", "nvngx/nvngx_d3d12.cpp", "fsr/fsr.cpp", "fsrfg/fsrfg.cpp",
+               "fsrrr/fsrrr.c", "fsrrr/fsrrr_backend.cpp", "nvapi/nvapi.cpp"]
     sources += ["fsrfg/sdk/" + name for name in ("sdk_backend.cpp", "FrameInterpolationSwapchainDX12.cpp", "FrameInterpolationSwapchainDX12_Helpers.cpp", "FrameInterpolationSwapchainDX12_UiComposition.cpp", "FrameInterpolationSwapchainDX12_DebugPacing.cpp")]
     for source in sources:
         name = source.replace("/", "-")
         obj = out / (name + ".obj")
-        run([str(cxx), *COMMON, "-c", str(ROOT / "src" / source), "-o", str(obj)], out / (name + ".log"))
+        compiler, source_flags = cxx, COMMON
+        if source.endswith(".c"):
+            compiler = cc
+            source_flags = [flag for flag in COMMON if flag != "-std=c++20"] + ["-std=c11"]
+        run([str(compiler), *source_flags, "-c", str(ROOT / "src" / source), "-o", str(obj)], out / (name + ".log"))
         dump = run([str(readobj), "--file-headers", str(obj)], out / (name + "-headers.log"))
         if f"0x{machine:X}" not in dump:
             raise RuntimeError(f"wrong COFF machine for {abi}: {obj}")
@@ -120,7 +139,8 @@ def verify_abi(abi: str, args: argparse.Namespace, out: Path) -> list[Path]:
     stage = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(stage)
     pe_facts = {}
-    for directory, module in (("fsr", "amd_fidelityfx_upscaler_dx12"), ("fsrfg", "amd_fidelityfx_framegeneration_dx12")):
+    for directory, module in (("fsr", "amd_fidelityfx_upscaler_dx12"), ("fsrfg", "amd_fidelityfx_framegeneration_dx12"),
+                              ("fsrrr", "amd_fidelityfx_denoiser_dx12")):
         dll = out / (module + ".dll")
         inputs = [str(obj) for source, obj in compiled.items() if source.startswith(directory + "/")]
         run([str(cxx), "-shared", "-static", *inputs, str(ROOT / "src" / directory / (directory + ".def")),
@@ -133,6 +153,9 @@ def verify_abi(abi: str, args: argparse.Namespace, out: Path) -> list[Path]:
     # entries must carry the compiler-generated # entry convention.
     for source, names in (("nvapi/nvapi.cpp", {"nvapi_QueryInterface"}),
                           ("fsr/fsr.cpp", stage.REQUIRED_FSR_EXPORTS.keys()),
+                          ("fsrfg/fsrfg.cpp", stage.REQUIRED_FSR_EXPORTS.keys()),
+                          ("fsrrr/fsrrr.c", stage.REQUIRED_FSR_EXPORTS.keys()),
+                          ("fsrrr/fsrrr_backend.cpp", {"rr_backend_call"}),
                           ("nvngx/nvngx_d3d12.cpp", {"NVSDK_NGX_D3D12_" + suffix for suffix in NGX_SUFFIXES})):
         symbols = run([str(args.toolchain / "llvm-nm"), "--defined-only", str(compiled[source])], out / (source.replace("/", "-") + "-symbols.log"))
         actual_names = {line.split()[-1] for line in symbols.splitlines() if line.split()}
@@ -140,7 +163,13 @@ def verify_abi(abi: str, args: argparse.Namespace, out: Path) -> list[Path]:
         if {prefix + name for name in names} - actual_names:
             raise RuntimeError(f"{abi} public C calling convention mismatch: {source}")
     objects.append(out / "facade.obj")
-    (out / "result.json").write_text(json.dumps({"windows_abi": abi, "source_compile": "pass", "official_parameter_slots": 17, "x86_thiscall": abi == "x86", "official_ffx_pod_layout": layouts[0], "fsr_pe": pe_facts, "public_c_calling_conventions": "pass", "guest_execution": "not_run"}, indent=2) + "\n")
+    (out / "result.json").write_text(json.dumps({
+        "windows_abi": abi, "source_compile": "pass", "official_parameter_slots": 17,
+        "x86_thiscall": abi == "x86", "official_ffx_pod_layout": layouts[0][layout_symbols[0]],
+        "rr_pod_layouts": {symbol: layouts[0][symbol] for symbol in layout_symbols[1:]},
+        "pod_layout_compilers": [name for name, _ in layout_compilers],
+        "fsr_pe": pe_facts, "public_c_calling_conventions": "pass", "guest_execution": "not_run",
+    }, indent=2) + "\n")
     print(f"OWNED_FACADE_ABI_PASS abi={abi} slots=17 sources={len(sources)} guest=not_run")
     return objects
 

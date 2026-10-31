@@ -169,7 +169,7 @@ struct CacheMutationHeader {
 static_assert(sizeof(CacheMutationHeader)==216 && sizeof(CacheMutationStage)==32);
 static_assert(offsetof(CacheMutationHeader,identity)==32 && offsetof(CacheMutationHeader,digest)==100 &&
               offsetof(CacheMutationHeader,records)==120);
-constexpr uint32_t kMutationCacheVersion=6;
+constexpr uint32_t kMutationCacheVersion=7;
 
 size_t cacheLibrarySize(const std::vector<uint8_t> &bytes) {
   // Mutate only a validated single-stage export; unknown wire revisions fail closed.

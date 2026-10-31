@@ -83,12 +83,12 @@ int runReview(int argc, wchar_t **argv) {
     handle.ptr += slot * stride;
     return handle;
   };
-  auto bufferView = [&](ID3D12Resource *resource, UINT slot, UINT structure, bool uav) {
+  auto bufferView = [&](ID3D12Resource *resource, UINT slot, UINT structure, bool uav, UINT elements = 1) {
     if (uav) {
       D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
       view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
       view.Format = structure ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R32_TYPELESS;
-      view.Buffer.NumElements = 1;
+      view.Buffer.NumElements = elements;
       view.Buffer.StructureByteStride = structure;
       view.Buffer.Flags = structure ? D3D12_BUFFER_UAV_FLAG_NONE : D3D12_BUFFER_UAV_FLAG_RAW;
       device->CreateUnorderedAccessView(resource, nullptr, &view, cpuHandle(slot));
@@ -97,7 +97,7 @@ int runReview(int argc, wchar_t **argv) {
       view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
       view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
       view.Format = structure ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R32_TYPELESS;
-      view.Buffer.NumElements = 1;
+      view.Buffer.NumElements = elements;
       view.Buffer.StructureByteStride = structure;
       view.Buffer.Flags = structure ? D3D12_BUFFER_SRV_FLAG_NONE : D3D12_BUFFER_SRV_FLAG_RAW;
       device->CreateShaderResourceView(resource, &view, cpuHandle(slot));
@@ -117,14 +117,14 @@ int runReview(int argc, wchar_t **argv) {
     psoDesc.CS = {code.data(), code.size()};
     ComPtr<ID3D12PipelineState> pso;
     check(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso)), names[test]);
-    auto output = createBuffer(device.Get(), 128, D3D12_HEAP_TYPE_DEFAULT,
+    auto output = createBuffer(device.Get(), 256, D3D12_HEAP_TYPE_DEFAULT,
                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    auto readback = createBuffer(device.Get(), 256, D3D12_HEAP_TYPE_READBACK,
+    auto readback = createBuffer(device.Get(), 384, D3D12_HEAP_TYPE_READBACK,
                                  D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_UNORDERED_ACCESS_VIEW_DESC outputView{};
     outputView.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     outputView.Format = DXGI_FORMAT_R32_TYPELESS;
-    outputView.Buffer.NumElements = 32;
+    outputView.Buffer.NumElements = 64;
     outputView.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     device->CreateUnorderedAccessView(output.Get(), nullptr, &outputView, cpuHandle(5));
     std::vector<ComPtr<ID3D12Resource>> retained;
@@ -138,12 +138,19 @@ int runReview(int argc, wchar_t **argv) {
       std::memset(mapped, 0, 64);
       const uint64_t value = 11;
       std::memcpy(mapped, &value, structure);
+      if (test == 3) {
+        const uint64_t second = 0x1122334455667788ull;
+        std::memcpy(static_cast<uint8_t *>(mapped) + 8, &second, 8);
+      } else {
+        const uint32_t rest[] = {12, 13, 14};
+        std::memcpy(static_cast<uint8_t *>(mapped) + 4, rest, sizeof(rest));
+      }
       const uint32_t raw = 77;
       std::memcpy(static_cast<uint8_t *>(mapped) + 16, &raw, 4);
       upload->Unmap(0, nullptr);
       bufferView(upload.Get(), 0, structure, false);
       bufferView(upload.Get(), 1, 16, false);
-      bufferView(upload.Get(), 2, 0, false);
+      bufferView(upload.Get(), 2, 0, false, test == 3 ? 3 : 1);
       mutableBuffer = createBuffer(device.Get(), 64, D3D12_HEAP_TYPE_DEFAULT,
                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
       rawMutable = createBuffer(device.Get(), 64, D3D12_HEAP_TYPE_DEFAULT,
@@ -227,18 +234,18 @@ int runReview(int argc, wchar_t **argv) {
     ctx.list->SetPipelineState(pso.Get());
     ctx.list->Dispatch(1, 1, 1);
     transition(ctx.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    ctx.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, 128);
+    ctx.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, 256);
     if (mutableBuffer) {
       transition(ctx.list.Get(), mutableBuffer.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                  D3D12_RESOURCE_STATE_COPY_SOURCE);
       transition(ctx.list.Get(), rawMutable.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                  D3D12_RESOURCE_STATE_COPY_SOURCE);
-      ctx.list->CopyBufferRegion(readback.Get(), 128, mutableBuffer.Get(), 0, 8);
-      ctx.list->CopyBufferRegion(readback.Get(), 136, rawMutable.Get(), 0, 4);
+      ctx.list->CopyBufferRegion(readback.Get(), 256, mutableBuffer.Get(), 0, 8);
+      ctx.list->CopyBufferRegion(readback.Get(), 264, rawMutable.Get(), 0, 4);
     }
     ctx.submitAndWait();
     void *mapped = nullptr;
-    D3D12_RANGE range{0, 140};
+    D3D12_RANGE range{0, 268};
     check(readback->Map(0, &range, &mapped), "review readback map");
     const auto *words = static_cast<const uint32_t *>(mapped);
     bool ok = true;
@@ -250,8 +257,17 @@ int runReview(int argc, wchar_t **argv) {
       const uint32_t expected[] = {11, 20, 23, 29};
       for (unsigned i = 0; i < 24; ++i)
         compare(words[i], i < 4 ? expected[i] : 0);
-      compare(words[32], 29);
-      compare(words[34], 77);
+      const uint32_t vectorExpected[] = {11, 0, 0, 0, 11, 12, 13, 14};
+      for (unsigned i = 0; i < 8; ++i)
+        compare(words[24 + i], vectorExpected[i]);
+      const auto *halves = static_cast<const uint16_t *>(mapped);
+      for (unsigned i = 0; i < 6; ++i)
+        compare(halves[64 + i], i == 0 || i == 4 ? 11 : 0);
+      const uint32_t sparseExpected[] = {11, 0, 12, 14};
+      for (unsigned i = 0; i < 4; ++i)
+        compare(words[36 + i], sparseExpected[i]);
+      compare(words[64], 29);
+      compare(words[66], 77);
     } else if (test == 1) {
       const float expected[] = {101, 102, 211, 212, 102, 212};
       for (unsigned i = 0; i < 6; ++i) {
@@ -269,7 +285,10 @@ int runReview(int argc, wchar_t **argv) {
       const uint64_t expected[] = {11, 31, 38, 41};
       for (unsigned i = 0; i < 16; ++i)
         compare(wide[i], i < 4 ? expected[i] : 0);
-      compare(wide[16], 41);
+      const uint64_t vectorExpected[] = {11, 0x1122334455667788ull, 11, 0, 0, 0, 11, 0};
+      for (unsigned i = 0; i < 8; ++i)
+        compare(wide[16 + i], vectorExpected[i]);
+      compare(wide[32], 41);
     }
     readback->Unmap(0, nullptr);
     if (!ok)

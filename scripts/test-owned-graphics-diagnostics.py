@@ -6,8 +6,10 @@ import argparse
 import contextlib
 import importlib.util
 import io
+import hashlib
 import json
 from pathlib import Path
+import re
 import struct
 import subprocess
 import tempfile
@@ -158,6 +160,49 @@ RAYTRACING_CONTRACT_TRACE += RAYTRACING_COHERENCE_CONTROL_TRACE
 
 
 class RunnerFailures(unittest.TestCase):
+    def test_workgraph_inputs_freeze_the_selected_preview_sdk(self):
+        for suite in ("work-graphs", "workgraphs-atomic64", "workgraphs-atomic64-typed"):
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory(dir=SCRATCH, prefix="workgraph-inputs-") as directory:
+                base = Path(directory)
+                runtime = base / "runtime"
+                runtime.mkdir()
+                (runtime / "owned-graphics-runtime.json").write_text('{"schema": 1}\n')
+                fixture = base / "fixture.exe"
+                fixture.write_bytes(controlled_pe_fixture())
+                inputs = base / "selected-inputs"
+                inputs.mkdir()
+                for source in runner.suite_inputs(suite, fixture, inputs):
+                    if source.is_relative_to(inputs) and source.name != "preview-d3d12.h":
+                        source.write_bytes(b"controlled shader input")
+                header = inputs / "preview-d3d12.h"
+                original = b"controlled pinned preview SDK bytes\n"
+                args = argparse.Namespace(runtime=runtime, lock=runtime / "owned-graphics-runtime.json",
+                                          fixture=fixture, dxil_dir=inputs, out=base / "missing",
+                                          suite=suite, mode="no-present", validation=True,
+                                          api_validation=False, timeout=1)
+                launches = []
+
+                def fake_run(command, **kwargs):
+                    if command[0] == str(runtime / "bin/wine"):
+                        launches.append(command)
+                        header.write_bytes(b"changed after input freeze")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                with patch.object(runner.subprocess, "run", side_effect=fake_run):
+                    with self.assertRaises(ValueError):
+                        runner.run(args)
+                    self.assertEqual(launches, [])
+                    header.write_bytes(original)
+                    args.out = base / "frozen"
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        runner.run(args)
+                self.assertEqual(len(launches), 1)
+                self.assertEqual((args.out / "fixture/preview-d3d12.h").read_bytes(), original)
+                self.assertNotEqual(header.read_bytes(), original)
+                invocation = json.loads((args.out / "invocation.json").read_text())
+                self.assertEqual(invocation["fixture_sha256"]["preview-d3d12.h"],
+                                 hashlib.sha256(original).hexdigest())
+
     def test_multiqueue_waits_do_not_create_native_submissions(self):
         events = [{"event": kind} for kind, count in
                   (("execute_list", 64), ("signal_committed", 64), ("wait", 63), ("submit", 128), ("complete", 128))
@@ -167,6 +212,11 @@ class RunnerFailures(unittest.TestCase):
         self.assertTrue(runner.multiqueue_submission_failures(events[:-1]))
         next(event for event in events if event["event"] == "wait")["submission"] = 99
         self.assertTrue(runner.multiqueue_submission_failures(events))
+        folded = [{"event": kind, **({"folded": 1} if kind == "signal_committed" else {})} for kind, count in
+                  (("execute_list", 64), ("signal_committed", 64), ("wait", 63), ("submit", 64), ("complete", 64))
+                  for _ in range(count)]
+        self.assertEqual(runner.multiqueue_submission_failures(folded), [])
+        self.assertTrue(runner.multiqueue_submission_failures(folded + [{"event": "submit"}, {"event": "complete"}]))
 
     def test_automatic_pipeline_cache_scopes_same_executable_logs_and_producers(self):
         # Synthetic trace protocol only: NOT compilation, GPU or disk persistence evidence.
@@ -324,7 +374,7 @@ class RunnerFailures(unittest.TestCase):
             ("graph-access-0", 2, [2], [identity, identity], 0, 1, 0, 0, [], 0, False),
             ("graph-access-1", 2, [2], [identity, identity], 0, 1, 0, 0, [], 0, False),
             ("graph-access-2", 2, [2], [identity, identity], 0, 0, 1, 0, [], 0, False),
-            ("graph-access-3", 2, [1, 1], [], 0, 1, 0, 0, [], 0, False),
+            ("graph-access-3", 2, [2], [identity, identity], 0, 1, 0, 0, [], 0, False),
             ("graph-frontier-256", 2, [], [], 0, 256, 0, 0, [], 0, False),
             ("graph-frontier-512", 2, [], [], 0, 512, 0, 0, [], 0, False),
             ("graph-frontier-boundary-0", 2, [2, 2], [identity, identity, identity, identity], 0, 61, 0, 0, [4], 0, False),
@@ -349,7 +399,7 @@ class RunnerFailures(unittest.TestCase):
                                f"GRAPH_UAV control={c} word={6 if c == 4 else 64 if c == 2 else 32} render_encoders={1 if c == 4 else 2} "
                                f"members=2 inline_barriers={int(c == 4)} exact=1"]
         render_numeric += [f"GRAPH_ACCESS control={c} replay={r} rgba=ff000050 unrelated={('13579bdf' if c == 2 else '00000010')} "
-                           f"render_encoders={2 if c == 3 else 1} members=2 exact=1" for c in range(4) for r in range(2)]
+                           f"render_encoders=1 members=2 exact=1" for c in range(4) for r in range(2)]
         render_numeric += [f"GRAPH_FRONTIER count={count} replay={replay} word=13579bdf exact=1 sealed=1"
                            for count in (256, 512) for replay in range(2)]
         render_numeric += [f"GRAPH_FRONTIER_BOUNDARY delayed_clear={delayed} replay={replay} "
@@ -393,7 +443,7 @@ class RunnerFailures(unittest.TestCase):
                                 events += [{"event": "native_render_attachment", "slot": slot, "load": 1, "store": 1}
                                            for slot in range(2 if name.startswith("graph-union-") else 1)]
                             events.append({"event": f"native_{kind}_wait", "wait_count": 1,
-                                           **({"stages": 3 if inline else 1 if name == "graph-access-3" else 2} if kind == "render"
+                                           **({"stages": 3 if inline else 2} if kind == "render"
                                               else {"stages": 2} if kind == "clear" else {})})
                             if index == 0 and kind == ("clear" if name == "graph-frontier-boundary-1" else "render" if begins else "clear"):
                                 events += [{"event": "native_clear_load", "clear_count": 1, "aspect": a,
@@ -554,7 +604,8 @@ class RunnerFailures(unittest.TestCase):
                               ("wrong-UAV-word", stdout.replace("word=32", "word=31"), stderr),
                               ("wrong-mip", stdout.replace("mip1=64", "mip1=16"), stderr),
                               ("wrong-depth", stdout.replace("depth=3f000000", "depth=3f800000"), stderr),
-                              ("old-access-generation", stdout.replace("render_encoders=2 members=2 exact=1", "render_encoders=1 members=2 exact=1"), stderr),
+                              ("old-root-srv-opaque", stdout.replace("control=3 replay=0 rgba=ff000050 unrelated=00000010 render_encoders=1",
+                               "control=3 replay=0 rgba=ff000050 unrelated=00000010 render_encoders=2"), stderr),
                               ("old-15-phase-matrix", stdout, "\n".join(line for c in chunks[14:20] + chunks[22:] for line in c))]
             elif suite == "execution-safety":
                 eager = [row for row in rows if '"submission_clear_superseded"' not in row]
@@ -2049,7 +2100,7 @@ class QueryOrderingFailures(unittest.TestCase):
 
 
 class ReviewEvidenceFailures(unittest.TestCase):
-    def simulate(self, suite, trace, *, native=True):
+    def simulate(self, suite, trace, *, native=True, stderr=""):
         with tempfile.TemporaryDirectory(dir=SCRATCH, prefix="review-") as directory:
             base = Path(directory)
             runtime = base / "runtime"
@@ -2074,6 +2125,7 @@ class ReviewEvidenceFailures(unittest.TestCase):
             def fake_run(command, **kwargs):
                 if command[0] == str(runtime / "bin/wine"):
                     kwargs["stdout"].write(trace)
+                    kwargs["stderr"].write(stderr)
                     if native:
                         kwargs["stderr"].write(f"dyld[1]: {runtime}/lib/wine/x86_64-unix/winemetal.so\n")
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
@@ -2085,7 +2137,7 @@ class ReviewEvidenceFailures(unittest.TestCase):
 
     def test_shader_review_rejects_missing_case_and_mismatched_readback(self):
         trace = "OWNED_D3D12_DXIL_RESOURCE_REVIEW_BACKEND id=owned-graphics-d3d12\n"
-        for name, count in (("bounds", 26), ("gradients", 6), ("array-atomics", 24), ("bounds64", 17)):
+        for name, count in (("bounds", 44), ("gradients", 6), ("array-atomics", 24), ("bounds64", 25)):
             trace += "".join(f"OWNED_D3D12_DXIL_RESOURCE_REVIEW_WORD case={name} index={index} "
                              "actual=0x0000000000000000 expected=0x0000000000000000\n"
                              for index in range(count))
@@ -2093,13 +2145,58 @@ class ReviewEvidenceFailures(unittest.TestCase):
         trace += "OWNED_D3D12_DXIL_RESOURCE_REVIEW_PASS\n"
         self.assertTrue(self.simulate("dxil-resource-review", trace))
         self.assertFalse(self.simulate("dxil-resource-review", trace.replace(
-            "OWNED_D3D12_DXIL_RESOURCE_REVIEW_CASE_PASS case=bounds64 checks=17\n", "")))
+            "OWNED_D3D12_DXIL_RESOURCE_REVIEW_CASE_PASS case=bounds64 checks=25\n", "")))
         self.assertFalse(self.simulate("dxil-resource-review", trace.replace(
-            "OWNED_D3D12_DXIL_RESOURCE_REVIEW_WORD case=bounds64 index=16 "
+            "OWNED_D3D12_DXIL_RESOURCE_REVIEW_WORD case=bounds64 index=24 "
             "actual=0x0000000000000000 expected=0x0000000000000000\n", "")))
         self.assertFalse(self.simulate("dxil-resource-review", trace.replace(
             "actual=0x0000000000000000", "actual=0x00000000ffffffff")))
         self.assertFalse(self.simulate("dxil-resource-review", trace, native=False))
+
+    @staticmethod
+    def writable_msaa_helper_control():
+        # Controlled parser input, not GPU evidence. Each phase owns different
+        # encoder/submission IDs so unrelated waits cannot satisfy its oracle.
+        names = ("partial_array_helper_other_slice_clear", "unused_descriptor_helper_order")
+        stdout = (f"OWNED_D3D12_WRITABLE_MSAA_HELPER_VALUES case={names[0]} helper=500 first=500 last=1283 clear=7,11,13,17\n"
+                  f"OWNED_D3D12_WRITABLE_MSAA_HELPER_VALUES case={names[1]} prior=13579bdf helper=2468ace0 first=600 last=1399\n")
+        lines = []
+        stages = 31 | (1 << 27) | (1 << 28) | (1 << 29)
+        for submission, name in enumerate(names, 101):
+            lines.append(f"OWNED_D3D12_WRITABLE_MSAA_HELPER_PHASE begin={name}")
+
+            def event(kind, **fields):
+                lines.append("OWNED_GRAPHICS_TRACE " + json.dumps(dict(event=kind, submission=submission, **fields)))
+
+            def compute(encoder, sync):
+                if sync != "wait":
+                    event("native_fence_wait_skipped", encoder=encoder, reason=sync, skip_count=1)
+                event("native_compute_begin", encoder=encoder, begin_count=1)
+                if sync == "wait":
+                    event("native_compute_wait", encoder=encoder, wait_count=1)
+                elif sync == "queue_barrier":
+                    event("native_compute_queue_barrier", encoder=encoder, after=stages, before=1 << 27, barrier_count=1)
+                event("native_compute_encode", encoder=encoder, encode_count=1)
+                event("native_compute_update", encoder=encoder, update_count=1)
+                event("native_compute_end", encoder=encoder, end_count=1)
+
+            if submission == 101:
+                compute(10, "wait")
+                event("native_clear_begin", encoder=11, members=1, begin_count=1)
+                event("native_clear_queue_barrier", encoder=11, after=stages, barrier_count=1)
+                event("native_clear_load", encoder=11, aspect=4, clear_count=1)
+                event("native_clear_update", encoder=11, update_count=1)
+                event("native_clear_end", encoder=11, end_count=1)
+            else:
+                compute(20, "no_known_hazard")
+                event("native_skipped_drain", barrier_count=1)
+                compute(21, "wait")
+                compute(22, "queue_barrier")
+            event("native_skipped_drain", barrier_count=1)
+            event("submit", queue=7)
+            event("complete", queue=7, status=4)
+            lines.append(f"OWNED_D3D12_WRITABLE_MSAA_HELPER_PHASE end={name}")
+        return stdout, "\n".join(lines) + "\n"
 
     def test_writable_msaa_requires_every_shape_scalar_and_native_compiler(self):
         # Controlled runner-contract input only; this is not GPU execution evidence.
@@ -2116,28 +2213,84 @@ class ReviewEvidenceFailures(unittest.TestCase):
             cases += [f"{scalar}_{case}" for case in ("same_dispatch", "next_dispatch_dimensions",
                       "SRV_after_transition", "native_copy", "native_raster", "native_resolve_min_max", "UAV_clear")]
         cases += ["typeless16_same_dispatch", "typeless16_next_dispatch", "typeless16_native_copy_float_srv"]
+        cases += ["partial_array_helper_other_slice_clear", "unused_descriptor_helper_order"]
         trace = ("OWNED_D3D12_WRITABLE_MSAA_BACKEND id=owned-graphics-d3d12\n"
                  "OWNED_D3D12_WRITABLE_MSAA_CAPS writable=1\n")
         trace += "".join(f"OWNED_D3D12_SM6_CASE_PASS {case}\n" for case in cases)
         trace += "".join(f"OWNED_D3D12_WRITABLE_MSAA_SHAPE samples={samples} array={array}\n"
                          for samples in (2, 4, 8) for array in (0, 1))
+        values, stderr = self.writable_msaa_helper_control()
         trace += ("OWNED_D3D12_WRITABLE_MSAA_SCALAR type=sint\n"
-                  "OWNED_D3D12_WRITABLE_MSAA_SCALAR type=float\nOWNED_D3D12_WRITABLE_MSAA_PASS\n")
-        self.assertTrue(self.simulate("writable-msaa", trace))
-        self.assertFalse(self.simulate("writable-msaa", trace, native=False))
+                  "OWNED_D3D12_WRITABLE_MSAA_SCALAR type=float\n" + values + "OWNED_D3D12_WRITABLE_MSAA_PASS\n")
+        self.assertTrue(self.simulate("writable-msaa", trace, stderr=stderr))
+        self.assertFalse(self.simulate("writable-msaa", trace, native=False, stderr=stderr))
         for line in ("OWNED_D3D12_SM6_CASE_PASS out_of_bounds_sample_xy_layer\n",
                      "OWNED_D3D12_WRITABLE_MSAA_CAPS writable=1\n",
                      "OWNED_D3D12_SM6_CASE_PASS float_native_resolve_min_max\n",
                      "OWNED_D3D12_SM6_CASE_PASS typeless16_native_copy_float_srv\n",
+                     "OWNED_D3D12_SM6_CASE_PASS partial_array_helper_other_slice_clear\n",
+                     "OWNED_D3D12_SM6_CASE_PASS unused_descriptor_helper_order\n",
                      "OWNED_D3D12_WRITABLE_MSAA_SHAPE samples=8 array=1\n",
                      "OWNED_D3D12_WRITABLE_MSAA_SCALAR type=float\n"):
             with self.subTest(line=line):
-                self.assertFalse(self.simulate("writable-msaa", trace.replace(line, "", 1)))
+                self.assertFalse(self.simulate("writable-msaa", trace.replace(line, "", 1), stderr=stderr))
         for extra in ("OWNED_D3D12_SM6_CASE_PASS same_dispatch\n",
                       "OWNED_D3D12_SM6_MISMATCH invalid samples\n",
                       "OWNED_D3D12_WRITABLE_MSAA_PASS\n"):
             with self.subTest(extra=extra):
-                self.assertFalse(self.simulate("writable-msaa", trace + extra))
+                self.assertFalse(self.simulate("writable-msaa", trace + extra, stderr=stderr))
+        self.assertFalse(self.simulate("writable-msaa", trace))
+
+    def test_writable_msaa_helper_order_requires_own_waits_and_fragment_consumers(self):
+        stdout, stderr = self.writable_msaa_helper_control()
+        self.assertEqual(runner.writable_msaa_failures(stdout, stderr), [])
+        for old, new in (("helper=500", "helper=501"), ("last=1283", "last=1282"),
+                         ("clear=7,11,13,17", "clear=7,11,13,16"),
+                         ("prior=13579bdf", "prior=2468ace0"), ("helper=2468ace0", "helper=13579bdf"),
+                         ("first=600", "first=601"), ("last=1399", "last=1398")):
+            with self.subTest(numeric=old):
+                self.assertTrue(runner.writable_msaa_failures(stdout.replace(old, new), stderr))
+        lines = stderr.splitlines()
+        required = []
+        for line in lines:
+            if not line.startswith("OWNED_GRAPHICS_TRACE "):
+                continue
+            event = json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+            if (event["event"] in ("native_compute_wait", "native_compute_queue_barrier",
+                                   "native_clear_queue_barrier", "submit", "complete")
+                    or (event["event"] == "native_fence_wait_skipped" and event.get("encoder") == 20)):
+                required.append(line)
+        for line in required:
+            with self.subTest(missing=line):
+                self.assertTrue(runner.writable_msaa_failures(stdout, stderr.replace(line + "\n", "", 1)))
+        helper_wait = next(line for line in lines if '"event": "native_compute_wait"' in line and '"encoder": 21' in line)
+        consumer_barrier = next(line for line in lines if '"event": "native_compute_queue_barrier"' in line)
+        clear_barrier = next(line for line in lines if '"event": "native_clear_queue_barrier"' in line)
+        drain = next(index for index, line in enumerate(lines) if '"event": "native_skipped_drain"' in line and '"submission": 102' in line)
+        early_drain = lines.copy()
+        moved = early_drain.pop(drain)
+        early_drain.insert(next(index for index, line in enumerate(early_drain) if '"encoder": 20' in line), moved)
+        mutations = [
+            stderr.replace(helper_wait, helper_wait.replace('"encoder": 21', '"encoder": 20')),
+            stderr.replace(helper_wait, helper_wait.replace('"submission": 102', '"submission": 101')),
+            stderr.replace(consumer_barrier, consumer_barrier.replace('"encoder": 22', '"encoder": 21')),
+            stderr.replace(clear_barrier, clear_barrier.replace('"encoder": 11', '"encoder": 10')),
+            stderr.replace('"encoder": 11', '"batch": 0'),
+            stderr.replace('"after": 939524127', '"after": 939524096'),
+            "\n".join(lines[:drain] + lines[drain + 1:]),
+            "\n".join(early_drain),
+            stderr.replace('"status": 4', '"status": 5'),
+            stderr.replace('"queue": 7, "status"', '"queue": 8, "status"'),
+            stderr.replace("OWNED_GRAPHICS_TRACE {", "OWNED_GRAPHICS_TRACE [", 1),
+            stderr.replace("OWNED_GRAPHICS_TRACE " + json.dumps(dict(event="native_compute_begin", submission=101, encoder=10, begin_count=1)),
+                           "OWNED_GRAPHICS_TRACE []"),
+            stderr.replace("HELPER_PHASE end=", "HELPER_PHASE begin=", 1),
+            stderr + "\n" + stderr,
+            "",
+        ]
+        for altered in mutations:
+            with self.subTest(trace=altered):
+                self.assertTrue(runner.writable_msaa_failures(stdout, altered))
 
     def test_mapping_requires_live_control_view_and_no_growth(self):
         trace = ("OWNED_D3D12_ARENA_HEAP_BACKEND id=owned-graphics-d3d12\n"
@@ -3019,7 +3172,40 @@ class Phase3NativeMSAA(unittest.TestCase):
             if name in ("submit", "complete"):
                 fields.setdefault("queue", 2 if fields["submission"] >= 10000 else 1)
             err.append("OWNED_GRAPHICS_TRACE "+json.dumps(dict(event=name,event_id=serial,**fields)))
-        for resource in ("free", "volatile", "static"):
+        for resource in ("free", "sample", "volatile", "static"):
+            if resource=="sample":
+                for count in (2,4,8):
+                    for quality in (0,4294967295):
+                        for mask in (0xffffffff,0x55555555,0):
+                            native_ids=[encoder,encoder+1,encoder+2]
+                            native_list,captured_list=encoder+1000,encoder+1001
+                            for i,id in enumerate(native_ids):
+                                event("native_msaa_record",list=native_list,recording=1,encoder=id,sample_count=count,center=0,index_pull=int(i==2),pso=encoder+2000+int(i==1))
+                                event("native_msaa_draw_record",list=native_list,recording=1,encoder=id,indexed=int(i!=0),index_pull=int(i==2),count=3,instances=1)
+                            for replay in range(2):
+                                for captured in (False,True):
+                                    label=f"{'captured_sample_frequency_query' if captured else 'native_sample_frequency'}_count{count}_quality{quality}_mask{mask:08x}_replay{replay}"
+                                    submission+=1
+                                    err.append(f"{prefix}_SUBMISSION_BEGIN id={submission} label={label}")
+                                    event("execute_list",queue=1,submission=submission,list=captured_list if captured else native_list,recording=1)
+                                    if captured:
+                                        producer=10000+submission*4
+                                        event("native_compute_encode",encoder=encoder+4,submission=producer)
+                                        event("submit",submission=producer)
+                                        event("msaa_producer_wait",encoder=encoder+3,producer=producer,queue=2,wait_count=1)
+                                        event("complete",submission=producer,status=4)
+                                    else:
+                                        for id in native_ids:
+                                            event("native_render_begin",encoder=id,native_msaa_sample_count=count,submission=submission)
+                                            event("native_render_end",encoder=id,submission=submission)
+                                    event("submit",submission=submission)
+                                    event("complete",submission=submission,status=4)
+                                    err.append(f"{prefix}_SUBMISSION_END id={submission} label={label}")
+                                samples=4*bin(mask&((1<<count)-1)).count("1")
+                                out.append(f"{prefix}_NATIVE_SAMPLE_FREQUENCY_PASS count={count} quality={quality} mask={mask:08x} replay={replay} draws=3 explicit=2 interpolated=1 indexed=1 index_pull=1 pixels=12 channels=4 depth=1 route=native_static")
+                                out.append(f"{prefix}_CAPTURED_SAMPLE_FREQUENCY_QUERY_PASS count={count} quality={quality} mask={mask:08x} replay={replay} draws=1 pixels=4 channels=4 depth=1 query_samples={samples} route=captured_query")
+                            encoder+=8
+                continue
             for count in (2,4,8):
                 for quality in (0,4294967295,4294967294):
                     for variant in range(4):
@@ -3034,7 +3220,7 @@ class Phase3NativeMSAA(unittest.TestCase):
                             marker=f"NATIVE_{uppercase}RESOURCE_TRANSITIONS_PASS count={count} quality={quality} draws=4 native_candidates={3 if static else 0} fallback={1 if static else 4} srv=1 cbv=1 msaa_srv=1 owners_released={int(count==8 and quality==4294967294)}" if mixed else f"NATIVE_{uppercase}RESOURCE_INPUTS_PASS count={count} quality={quality} mask={mask:08x} edge={edge} pixels=16 channels=4 depth=1 srv=1 cbv=1 route={'native_static' if static else 'captured_volatile'}"
                         else:
                             label=f"native_fallback_transitions_count{count}_quality{quality}" if mixed else f"native_ordinary_count{count}_quality{quality}_mask{mask:08x}"
-                            marker=f"NATIVE_FALLBACK_TRANSITIONS_PASS count={count} quality={quality} draws=4 native_candidates=2 fallback=2 indexed=1 index_pull=1" if mixed else f"NATIVE_ORDINARY_PASS count={count} quality={quality} mask={mask:08x} edge={edge} pixels=16 channels=4 depth=1"
+                            marker=f"NATIVE_FALLBACK_TRANSITIONS_PASS count={count} quality={quality} draws=4 native_candidates={2 if quality==4294967294 else 3} fallback={2 if quality==4294967294 else 1} indexed=1 index_pull=1" if mixed else f"NATIVE_ORDINARY_PASS count={count} quality={quality} mask={mask:08x} edge={edge} pixels=16 channels=4 depth=1"
                         out.append(prefix+"_"+marker)
                         if resource == "volatile":
                             submission+=1
@@ -3049,19 +3235,20 @@ class Phase3NativeMSAA(unittest.TestCase):
                             err.append(f"{prefix}_SUBMISSION_END id={submission} label={label}")
                             encoder+=4
                             continue
-                        native_ids=[encoder,encoder+2,encoder+3] if mixed and resource=="static" else [encoder,encoder+2] if mixed else [encoder]
-                        for i,id in enumerate(native_ids):
-                            event("native_msaa_record",encoder=id,sample_count=count,center=int(quality==4294967294),index_pull=int(mixed and resource=="free" and i==1),pso=id+1000)
-                            event("native_msaa_draw_record",encoder=id,indexed=int(mixed and resource=="free"),index_pull=int(mixed and resource=="free" and i==1),count=3 if mixed else 6,instances=1)
+                        native_rows=(0,2,3) if mixed and resource=="static" else (0,1,2) if mixed and quality!=4294967294 else (0,2) if mixed else (0,)
+                        native_ids=[encoder+row for row in native_rows]
+                        for row,id in zip(native_rows,native_ids):
+                            event("native_msaa_record",encoder=id,sample_count=count,center=int(quality==4294967294),index_pull=int(mixed and resource=="free" and row==2),pso=id+1000)
+                            event("native_msaa_draw_record",encoder=id,indexed=int(mixed and resource=="free" and row!=1),index_pull=int(mixed and resource=="free" and row==2),count=3 if mixed else 6,instances=1)
                         submission+=1
                         err.append(f"{prefix}_SUBMISSION_BEGIN id={submission} label={label}")
                         for native_index,id in enumerate(native_ids):
                             event("native_render_begin",encoder=id,native_msaa_sample_count=count,submission=submission)
                             event("native_render_end",encoder=id,submission=submission)
-                            if mixed and (resource=="free" or native_index==0):
+                            if mixed and (resource=="free" and (quality==4294967294 or native_index==2) or resource=="static" and native_index==0):
                                 producer=10000+submission*4+native_index
                                 event("submit",submission=producer)
-                                event("msaa_producer_wait",encoder=encoder+1,producer=producer,queue=2,wait_count=1)
+                                event("msaa_producer_wait",encoder=encoder+(3 if resource=="free" and quality!=4294967294 else 1),producer=producer,queue=2,wait_count=1)
                                 event("complete",submission=producer,status=4)
                         event("submit",submission=submission)
                         event("complete",submission=submission,status=4)
@@ -3085,16 +3272,76 @@ class Phase3NativeMSAA(unittest.TestCase):
         self.assertTrue(runner.native_msaa_failures(out,err.replace(line,line+"\n"+line,1)))
         self.assertTrue(runner.native_msaa_failures(out.replace("route=captured_volatile","route=native_static",1),err))
         self.assertTrue(runner.native_msaa_failures(out.replace("native_candidates=0 fallback=4","native_candidates=3 fallback=1",1),err))
+        self.assertTrue(runner.native_msaa_failures(out.replace("native_candidates=3 fallback=1","native_candidates=2 fallback=2",1),err))
+        self.assertTrue(runner.native_msaa_failures(out.replace("native_candidates=2 fallback=2","native_candidates=3 fallback=1",1),err))
         self.assertTrue(runner.native_msaa_failures(out.replace("NATIVE_STATIC_RESOURCE_INPUTS_PASS","NATIVE_RESOURCE_INPUTS_PASS",1),err))
+
+    def test_sample_frequency_queries_replay_and_route_attribution(self):
+        out,err=self.control()
+        self.assertEqual(runner.native_msaa_failures(out,err),[])
+        native_marker="OWNED_D3D12_MULTISAMPLE_CAPABILITIES_NATIVE_SAMPLE_FREQUENCY_PASS"
+        query_marker="OWNED_D3D12_MULTISAMPLE_CAPABILITIES_CAPTURED_SAMPLE_FREQUENCY_QUERY_PASS"
+        self.assertEqual(sum(line.startswith(native_marker) for line in out.splitlines()),36)
+        self.assertEqual(sum(line.startswith(query_marker) for line in out.splitlines()),36)
+        for line in out.splitlines():
+            if line.startswith(query_marker):
+                fields=dict(field.split("=",1) for field in line.split()[1:])
+                samples=int(fields["query_samples"])
+                expected={2:(8,4,0),4:(16,8,0),8:(32,16,0)}[int(fields["count"])][("ffffffff","55555555","00000000").index(fields["mask"])]
+                self.assertEqual(samples,expected)
+                self.assertTrue(runner.native_msaa_failures(out.replace(line,line.replace(f"query_samples={samples}",f"query_samples={samples+4}"),1),err))
+        for marker in (native_marker,query_marker):
+            line=next(line for line in out.splitlines() if line.startswith(marker) and "replay=1" in line)
+            for replacement in ("",line.replace("replay=1","replay=0"),line.replace("route=native_static","route=captured_query") if marker==native_marker else line.replace("route=captured_query","route=native_static")):
+                self.assertTrue(runner.native_msaa_failures(out.replace(line,replacement,1),err))
+        labels=("native_sample_frequency_count2_quality0_maskffffffff","captured_sample_frequency_query_count2_quality0_maskffffffff")
+        def change_group(label,change):
+            lines=err.splitlines()
+            first=next(i for i,line in enumerate(lines) if "_SUBMISSION_BEGIN" in line and f"label={label}" in line)
+            last=next(i for i in range(first+1,len(lines)) if "_SUBMISSION_END" in lines[i])
+            events=[json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]) for line in lines[first+1:last]]
+            changed=change(events)
+            lines[first:last+1]=[] if changed is None else [lines[first]]+["OWNED_GRAPHICS_TRACE "+json.dumps(e) for e in changed]+[lines[last]]
+            serial=0
+            for i,line in enumerate(lines):
+                if "OWNED_GRAPHICS_TRACE " in line:
+                    serial+=1
+                    e=json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1])
+                    e["event_id"]=serial
+                    lines[i]="OWNED_GRAPHICS_TRACE "+json.dumps(e)
+            return "\n".join(lines)
+        for label in labels:
+            self.assertTrue(runner.native_msaa_failures(out,change_group(label+"_replay1",lambda events: None)))
+            self.assertTrue(runner.native_msaa_failures(out,change_group(label+"_replay1",lambda events: [dict(e,recording=2) if e["event"]=="execute_list" else e for e in events])))
+        native_label,query_label=(label+"_replay0" for label in labels)
+        for kind in ("native_render_begin","native_render_end"):
+            self.assertTrue(runner.native_msaa_failures(out,change_group(native_label,lambda events: [dict(e,event="ignored_work") if e["event"]==kind else e for e in events])))
+            self.assertTrue(runner.native_msaa_failures(out,change_group(native_label,lambda events: events+[dict(next(e for e in events if e["event"]==kind))])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(native_label,lambda events: events+[dict(event="native_compute_encode",encoder=99999)])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(native_label,lambda events: events+[dict(event="msaa_producer_wait",encoder=99999,queue=2,producer=1,wait_count=1)])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: events+[dict(event="native_render_begin",encoder=99999,native_msaa_sample_count=2)])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: [e for e in events if e["event"]!="msaa_producer_wait"])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: events+[dict(next(e for e in events if e["event"]=="msaa_producer_wait"))])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: [dict(e,producer=e["producer"]+1) if e["event"]=="msaa_producer_wait" else e for e in events])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(labels[1]+"_replay1",lambda events: [dict(e,encoder=99999) if e["event"]=="msaa_producer_wait" else e for e in events])))
+        native_first=next(json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]) for line in err.splitlines() if '"event": "execute_list"' in line)
+        native_records=[e for line in err.splitlines() if "OWNED_GRAPHICS_TRACE " in line and (e:=json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]))["event"] in ("native_msaa_record","native_msaa_draw_record") and e.get("list")==native_first["list"]]
+        self.assertTrue(runner.native_msaa_failures(out,change_group(labels[0]+"_replay1",lambda events: [dict(e,encoder=e["encoder"]+100000) for e in native_records]+[dict(e,encoder=e["encoder"]+100000) if e["event"] in ("native_render_begin","native_render_end") else e for e in events])))
+        for kind,field,value in (("native_msaa_draw_record","indexed",1),("native_msaa_draw_record","index_pull",1),("native_msaa_draw_record","count",6),("native_msaa_draw_record","instances",2),("native_msaa_draw_record","event","ignored_work"),("native_msaa_record","sample_count",4),("native_msaa_record","index_pull",1)):
+            line=next(line for line in err.splitlines() if "OWNED_GRAPHICS_TRACE " in line and (e:=json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]))["event"]==kind and e.get("list")==native_first["list"])
+            changed=json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1])
+            changed[field]=value
+            self.assertTrue(runner.native_msaa_failures(out,err.replace(line,"OWNED_GRAPHICS_TRACE "+json.dumps(changed),1)))
 
 
 class Phase3NativeBudget(unittest.TestCase):
-    def test_mixed_108_budget_and_legacy_interleaving_preserves_every_record(self):
+    def test_mixed_180_budget_and_legacy_interleaving_preserves_every_record(self):
         native_out,native_err=Phase3NativeMSAA().control()
         budget_out,budget_err=self.control()
         offset=sum("OWNED_GRAPHICS_TRACE " in line for line in native_err.splitlines())
         shifted=[]
-        for submission,label in enumerate(("native_resource_upload","native_static_resource_upload"),109):
+        last_submission=max(int(m[1]) for line in native_err.splitlines() if (m:=re.search(r"_SUBMISSION_BEGIN id=([0-9]+)",line)))
+        for submission,label in enumerate(("native_resource_upload","native_static_resource_upload"),last_submission+1):
             native_err+=f"\nOWNED_D3D12_MULTISAMPLE_CAPABILITIES_SUBMISSION_BEGIN id={submission} label={label}\nOWNED_D3D12_MULTISAMPLE_CAPABILITIES_SUBMISSION_END id={submission} label={label}"
         for line in budget_err.splitlines():
             if "OWNED_GRAPHICS_TRACE " in line:
@@ -3109,8 +3356,8 @@ class Phase3NativeBudget(unittest.TestCase):
         out=native_out+"\n"+budget_out
         err=native_err+"\n"+"\n".join(shifted)
         prefix="OWNED_D3D12_MULTISAMPLE_CAPABILITIES"
-        begin=prefix+"_SUBMISSION_BEGIN id=115 label=existing"
-        end=prefix+"_SUBMISSION_END id=115 label=existing"
+        begin=f"{prefix}_SUBMISSION_BEGIN id={submission+1} label=existing"
+        end=f"{prefix}_SUBMISSION_END id={submission+1} label=existing"
         event=dict(event="encode",event_id=offset+sum("OWNED_GRAPHICS_TRACE " in line for line in shifted)+1,queue=6,submission=7,list=10010,recording=2,encoder=10022,type=2)
         trace="info:  OWNED_GRAPHICS_TRACE "+json.dumps(event)
         separate=err+"\n"+begin+"\n"+trace+"\n"+end
@@ -3118,7 +3365,7 @@ class Phase3NativeBudget(unittest.TestCase):
         for helper in (runner.native_msaa_failures,runner.native_msaa_budget_failures):
             self.assertEqual(helper(out,separate),[])
             self.assertEqual(helper(out,merged),[])
-            for changed in (merged.replace(begin+trace,trace,1),merged.replace(begin+trace,begin+"\n"+begin+trace,1),merged.replace(end,end.replace("115","116"),1),merged.replace(begin+trace,begin+trace[:-1],1),merged.replace(begin+trace,begin+trace+"garbage",1),merged+"\n"+trace,merged.replace(begin+trace,begin+trace.replace(f'"event_id": {event["event_id"]}','"event_id": 99999'),1),merged+"\n"+prefix+"_SUBMISSION_BEGIN id=116 label=existing truncated"):
+            for changed in (merged.replace(begin+trace,trace,1),merged.replace(begin+trace,begin+"\n"+begin+trace,1),merged.replace(end,end.replace(f"id={submission+1}",f"id={submission+2}"),1),merged.replace(begin+trace,begin+trace[:-1],1),merged.replace(begin+trace,begin+trace+"garbage",1),merged+"\n"+trace,merged.replace(begin+trace,begin+trace.replace(f'"event_id": {event["event_id"]}','"event_id": 99999'),1),merged+f"\n{prefix}_SUBMISSION_BEGIN id={submission+2} label=existing truncated"):
                 self.assertTrue(helper(out,changed),helper.__name__)
         lines=separate.splitlines()
         index=next(i for i,line in enumerate(lines) if "_SUBMISSION_BEGIN" in line and "label=native_ordinary_" in line)
@@ -3129,6 +3376,7 @@ class Phase3NativeBudget(unittest.TestCase):
             self.assertEqual(runner.native_msaa_failures(out,changed),[])
             self.assertEqual(runner.native_msaa_budget_failures(out,changed),[])
         self.assertTrue(runner.native_msaa_failures(out,merged.replace("label=native_ordinary_count2","label=native_unknown_count2",1)))
+        self.assertTrue(runner.native_msaa_failures(out,merged.replace("label=captured_sample_frequency_query_count2","label=captured_sample_frequency_unknown_count2",1)))
         self.assertTrue(runner.native_msaa_failures(out,merged.replace("label=native_binding_budget_first","label=native_binding_budget_unknown",1)))
 
     def control(self):

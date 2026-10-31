@@ -22,6 +22,7 @@
 #include "metallib_writer.hpp"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -58,7 +59,10 @@ int main(int argc, char **argv) {
   llvm::SmallVector<char, 0> libraryBytes;
   llvm::raw_svector_ostream stream(libraryBytes);
   dxmt::metallib::MetallibWriter writer;
-  writer.Write(*module, stream);
+  if (auto error = writer.Write(*module, stream)) {
+    llvm::logAllUnhandledErrors(std::move(error), llvm::errs(), "OWNED_RT_FAIL serialize: ");
+    return 3;
+  }
 
   @autoreleasepool {
     auto device = MTLCreateSystemDefaultDevice();

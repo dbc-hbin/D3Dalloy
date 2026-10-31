@@ -32,6 +32,21 @@ int main() {
     float number = 0;
     check(params.Get("numeric", &number) == NVNGX_RESULT_OK && number == 7.0f,
           "numeric_conversion_preserved");
+    params.Set("numeric", 2.75f);
+    int integer = 0;
+    unsigned int unsigned_integer = 0;
+    check(params.Get("numeric", &integer) == NVNGX_RESULT_OK && integer == 2, "overwrite_float_truncates");
+    params.Set("numeric", __builtin_nanf(""));
+    check(params.Get("numeric", &integer) == NVNGX_RESULT_FAIL &&
+              params.Get("numeric", &unsigned_integer) == NVNGX_RESULT_FAIL,
+          "nan_integer_rejected");
+    params.Set("numeric", 1e10f);
+    check(params.Get("numeric", &integer) == NVNGX_RESULT_FAIL &&
+              params.Get("numeric", &unsigned_integer) == NVNGX_RESULT_FAIL,
+          "out_of_range_integer_rejected");
+    params.Set("numeric", -0.5f);
+    check(params.Get("numeric", &unsigned_integer) == NVNGX_RESULT_OK && unsigned_integer == 0,
+          "negative_fraction_truncates_to_zero");
     params.Reset();
     check(params.Get("Color", &out_resource) == NVNGX_RESULT_FAIL, "reset_clears_resources");
     return failures ? 1 : 0;

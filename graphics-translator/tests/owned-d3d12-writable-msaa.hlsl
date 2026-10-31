@@ -58,6 +58,10 @@ void cs_msaa_read(uint3 p : SV_DispatchThreadID) {
     Output.Store4(Layers * 16 * SAMPLE_COUNT * 32, uint4(w, h, a, n));
   }
 }
+[numthreads(1, 1, 1)]
+void cs_msaa_unused() {
+  Output.Store(0, Base);
+}
 [numthreads(4, 4, 1)]
 void cs_msaa_heap(uint3 p : SV_DispatchThreadID) {
   RW_MSAA target = ResourceDescriptorHeap[0];

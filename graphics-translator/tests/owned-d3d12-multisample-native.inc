@@ -223,14 +223,117 @@ void nativeOrdinaryCases(Fixture &f) {
     for(UINT row=0;row<4;row++) for(UINT x=0;x<4;x++) for(UINT s=0;s<count;s++) {
       const bool frequency=row==1 && quality!=centerPattern;
       const float expected[4]{frequency ? (s+1)/16.f : .0625f,.25f,.5f,1.f};
-      for(UINT channel=0;channel<4;channel++)
+      for(UINT channel=0;channel<4;channel++) {
+        if(std::bit_cast<UINT>(colors[(row*4+x)*count+s][channel])!=std::bit_cast<UINT>(expected[channel]))
+          std::fprintf(stderr,"%s_TRANSITION_COLOR_MISMATCH count=%u quality=%u row=%u x=%u sample=%u channel=%u actual=%08x expected=%08x\n",
+              marker,count,quality,row,x,s,channel,std::bit_cast<UINT>(colors[(row*4+x)*count+s][channel]),
+              std::bit_cast<UINT>(expected[channel]));
         require(std::bit_cast<UINT>(colors[(row*4+x)*count+s][channel])==std::bit_cast<UINT>(expected[channel]),
                 "transition exact color sample");
+      }
       require(std::bit_cast<UINT>(depths[(row*4+x)*count+s][0])==
               std::bit_cast<UINT>(frequency ? .375f+s/32.f : .375f),"transition exact depth sample");
     }
-    std::printf("%s_NATIVE_FALLBACK_TRANSITIONS_PASS count=%u quality=%u draws=4 native_candidates=2 fallback=2 indexed=1 index_pull=1\n",
-                marker,count,quality);
+    std::printf("%s_NATIVE_FALLBACK_TRANSITIONS_PASS count=%u quality=%u draws=4 native_candidates=%u fallback=%u indexed=1 index_pull=1\n",
+                marker,count,quality,quality==centerPattern ? 2 : 3,quality==centerPattern ? 2 : 1);
+  }
+}
+
+void nativeSampleFrequencyCases(Fixture &f) {
+  auto sample=compile(nativeOrdinaryShaders,"sampleFallback","ps_5_0");
+  const auto interpolation=readFile(L"native-msaa-sample-ps.dxil");
+  const auto interpolationVS=readFile(L"native-msaa-sample-vs.dxil");
+  auto upload=heap(D3D12_HEAP_TYPE_UPLOAD), readback=heap(D3D12_HEAP_TYPE_READBACK);
+  const UINT16 indexValues[3]{0,1,2};
+  auto indexDesc=buffer(sizeof(indexValues));
+  ComPtr<ID3D12Resource> indices;
+  check(f.device->CreateCommittedResource(&upload,D3D12_HEAP_FLAG_NONE,&indexDesc,
+      D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&indices)),"sample frequency indices");
+  void *mapped=nullptr; D3D12_RANGE empty{0,0};
+  check(indices->Map(0,&empty,&mapped),"sample frequency index map");
+  std::memcpy(mapped,indexValues,sizeof(indexValues)); indices->Unmap(0,nullptr);
+  D3D12_INDEX_BUFFER_VIEW indexView{indices->GetGPUVirtualAddress(),sizeof(indexValues),DXGI_FORMAT_R16_UINT};
+  for(UINT count : {2u,4u,8u}) for(UINT quality : {0u,standardPattern}) {
+    const auto pattern=defaultPattern(count);
+    for(UINT mask : {UINT_MAX,0x55555555u,0u}) {
+      GPUSurface color(f,DXGI_FORMAT_R32G32B32A32_FLOAT,DXGI_FORMAT_R32G32B32A32_FLOAT,count,false,true,quality);
+      GPUSurface depth(f,DXGI_FORMAT_R32_TYPELESS,DXGI_FORMAT_D32_FLOAT,count,true,true,quality);
+      ComPtr<ID3D12PipelineState> psos[2];
+      for(UINT i=0;i<2;i++) {
+        auto pd=graphicsDesc(f,color.view,count,quality,false);
+        if(i) {
+          pd.PS={interpolation.data(),interpolation.size()};
+          pd.VS={interpolationVS.data(),interpolationVS.size()};
+        } else pd.PS={sample->GetBufferPointer(),sample->GetBufferSize()};
+        pd.SampleMask=mask; pd.DSVFormat=depth.view;
+        pd.DepthStencilState.DepthEnable=TRUE;
+        pd.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ALL;
+        pd.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_ALWAYS;
+        check(f.device->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&psos[i])),"sample frequency PSO");
+      }
+      GPUList native(f), captured(f);
+      clearSurface(native.list.Get(),color); clearSurface(native.list.Get(),depth,4,1);
+      native.list->IASetIndexBuffer(&indexView);
+      for(UINT row=0;row<3;row++) {
+        bindDraw(f,native.list.Get(),color,psos[row==1 ? 1 : 0].Get(),row);
+        native.list->OMSetRenderTargets(1,&color.target,FALSE,&depth.target);
+        if(row==0) native.list->DrawInstanced(3,1,0,0);
+        else {
+          if(row==2) native.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+          native.list->DrawIndexedInstanced(3,1,0,0,0);
+        }
+      }
+      D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_OCCLUSION,1,0};
+      ComPtr<ID3D12QueryHeap> query;
+      check(f.device->CreateQueryHeap(&qd,IID_PPV_ARGS(&query)),"sample frequency query heap");
+      auto resultDesc=buffer(sizeof(UINT64));
+      ComPtr<ID3D12Resource> result;
+      check(f.device->CreateCommittedResource(&readback,D3D12_HEAP_FLAG_NONE,&resultDesc,
+          D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&result)),"sample frequency query result");
+      // The same explicit-sample PSO as row 0 must still capture while an occlusion query is active.
+      bindDraw(f,captured.list.Get(),color,psos[0].Get(),3);
+      captured.list->OMSetRenderTargets(1,&color.target,FALSE,&depth.target);
+      captured.list->BeginQuery(query.Get(),D3D12_QUERY_TYPE_OCCLUSION,0);
+      captured.list->DrawInstanced(3,1,0,0);
+      captured.list->EndQuery(query.Get(),D3D12_QUERY_TYPE_OCCLUSION,0);
+      captured.list->ResolveQueryData(query.Get(),D3D12_QUERY_TYPE_OCCLUSION,0,1,result.Get(),0);
+      check(native.list->Close(),"sample frequency native close");
+      check(captured.list->Close(),"sample frequency captured close");
+      const UINT64 expectedSamples=4*std::popcount(mask&((1u<<count)-1));
+      for(UINT replay=0;replay<2;replay++) {
+        char label[160];
+        std::snprintf(label,sizeof(label),"native_sample_frequency_count%u_quality%u_mask%08x_replay%u",
+                      count,quality,mask,replay);
+        f.submit(native.list.Get(),label,true);
+        std::snprintf(label,sizeof(label),"captured_sample_frequency_query_count%u_quality%u_mask%08x_replay%u",
+                      count,quality,mask,replay);
+        f.submit(captured.list.Get(),label,true);
+        auto colors=observe(f,color), depths=observe(f,depth);
+        for(UINT row=0;row<4;row++) for(UINT x=0;x<4;x++) for(UINT s=0;s<count;s++) {
+          const bool written=mask&(1u<<s);
+          const float u=(x+.5f+pattern[s].X/16.f)/8.f;
+          const float v=(row+.5f+pattern[s].Y/16.f)/8.f;
+          const float expected[4]{row==1 ? u : (s+1)/16.f,row==1 ? v : .25f,.5f,1.f};
+          for(UINT channel=0;channel<4;channel++)
+            require(std::bit_cast<UINT>(colors[(row*4+x)*count+s][channel])==
+                    std::bit_cast<UINT>(written ? expected[channel] : 0.f),
+                    "sample frequency exact color sample");
+          const float expectedDepth=row==1 ? .125f+u*.5f+v*.25f : .375f+s/32.f;
+          require(std::bit_cast<UINT>(depths[(row*4+x)*count+s][0])==
+                  std::bit_cast<UINT>(written ? expectedDepth : 1.f),
+                  "sample frequency exact depth sample");
+        }
+        D3D12_RANGE range{0,sizeof(UINT64)};
+        check(result->Map(0,&range,&mapped),"sample frequency query map");
+        UINT64 actualSamples=0; std::memcpy(&actualSamples,mapped,sizeof(actualSamples));
+        result->Unmap(0,&empty);
+        require(actualSamples==expectedSamples,"sample frequency exact occlusion samples");
+        std::printf("%s_NATIVE_SAMPLE_FREQUENCY_PASS count=%u quality=%u mask=%08x replay=%u draws=3 explicit=2 interpolated=1 indexed=1 index_pull=1 pixels=12 channels=4 depth=1 route=native_static\n",
+                    marker,count,quality,mask,replay);
+        std::printf("%s_CAPTURED_SAMPLE_FREQUENCY_QUERY_PASS count=%u quality=%u mask=%08x replay=%u draws=1 pixels=4 channels=4 depth=1 query_samples=%llu route=captured_query\n",
+                    marker,count,quality,mask,replay,static_cast<unsigned long long>(actualSamples));
+      }
+    }
   }
 }
 

@@ -430,6 +430,27 @@ void fgGrouped(const FgApi& api, Gpu& gpu) {
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     invalid = generation; invalid.outputs[0] = ffxApiGetResourceDX12(wrongFormat.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     fgResult(api.dispatch(&context.value, &invalid.header), FFX_API_RETURN_ERROR_PARAMETER, "invalid-output-format");
+    auto noUav = createTexture(gpu.device.Get(), fgWidth, fgHeight, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+    invalid = generation; invalid.outputs[0] = ffxApiGetResourceDX12(noUav.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    fgResult(api.dispatch(&context.value, &invalid.header), FFX_API_RETURN_ERROR_PARAMETER, "output-requires-uav");
+    auto mipDesc = output->GetDesc(); mipDesc.MipLevels = 2;
+    const auto heap = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    ComPtr<ID3D12Resource> mipOutput;
+    check(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &mipDesc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&mipOutput)), "mip-output-fixture");
+    invalid = generation; invalid.outputs[0] = ffxApiGetResourceDX12(mipOutput.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    fgResult(api.dispatch(&context.value, &invalid.header), FFX_API_RETURN_ERROR_PARAMETER, "output-requires-single-mip");
+    ffxConfigureDescFrameGeneration hudless{};
+    hudless.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    hudless.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    hudless.frameGenerationEnabled = true; hudless.frameID = generation.frameID;
+    hudless.generationRect = generation.generationRect;
+    hudless.HUDLessColor = ffxApiGetResourceDX12(output.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    fgResult(api.configure(&context.value, &hudless.header), FFX_API_RETURN_OK, "configure-hudless-alias-fixture");
+    fgResult(api.dispatch(&context.value, &generation.header), FFX_API_RETURN_ERROR_PARAMETER, "output-hudless-alias");
+    hudless.HUDLessColor = {};
+    fgResult(api.configure(&context.value, &hudless.header), FFX_API_RETURN_OK, "clear-hudless-alias-fixture");
     fgResult(api.dispatch(&context.value, &generation.header), FFX_API_RETURN_OK, "single-generate");
     check(r.list->Close(), "single-close"); gpu.executeAndWait(r.list.Get());
     const auto pixels = fgPixels(gpu, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

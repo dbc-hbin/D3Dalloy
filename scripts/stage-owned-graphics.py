@@ -80,8 +80,11 @@ FSR_MODULE = "amd_fidelityfx_upscaler_dx12.dll"
 OWNED_FSR_MARKER = b"dxmt-owned-fsr-metalfx-v1"
 FSR_FRAMEGENERATION_MODULE = "amd_fidelityfx_framegeneration_dx12.dll"
 OWNED_FSR_FRAMEGENERATION_MARKER = b"dxmt-owned-fsr-framegeneration-metalfx-v1"
+FSR_RAYREGENERATION_MODULE = "amd_fidelityfx_denoiser_dx12.dll"
+OWNED_FSR_RAYREGENERATION_MARKER = b"dxmt-owned-fsr-rr-metalfx-v1"
 FSR_MODULE_MARKERS = {FSR_MODULE: OWNED_FSR_MARKER,
-                      FSR_FRAMEGENERATION_MODULE: OWNED_FSR_FRAMEGENERATION_MARKER}
+                      FSR_FRAMEGENERATION_MODULE: OWNED_FSR_FRAMEGENERATION_MARKER,
+                      FSR_RAYREGENERATION_MODULE: OWNED_FSR_RAYREGENERATION_MARKER}
 REQUIRED_FSR_EXPORTS = {
     "ffxConfigure": 1,
     "ffxCreateContext": 2,
@@ -267,8 +270,9 @@ def regular_file(path: Path, label: str) -> None:
 
 
 def wow64_artifacts(with_wow64: bool, with_nvngx: bool = False, with_nvapi: bool = False,
-                    with_fsr: bool = False) -> tuple[Path, ...]:
-    names = (*WINDOWS_MODULES, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr, windows_abi="x86"))
+                    with_fsr: bool = False, with_fsr_rayregeneration: bool = False) -> tuple[Path, ...]:
+    names = (*WINDOWS_MODULES, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr, windows_abi="x86",
+                                                 with_fsr_rayregeneration=with_fsr_rayregeneration))
     return tuple(WOW64_WINDOWS_DIR / name for name in names) if with_wow64 else ()
 
 
@@ -360,7 +364,8 @@ def pe_exports(path: Path, *, uint32_data: tuple[str, ...] = (), string_data: tu
 
 
 def optional_modules(with_nvngx: bool, with_nvapi: bool, with_fsr: bool = False,
-                     with_fsr_framegeneration: bool = False, *, windows_abi: str = "x64") -> tuple[str, ...]:
+                     with_fsr_framegeneration: bool = False, *, windows_abi: str = "x64",
+                     with_fsr_rayregeneration: bool = False) -> tuple[str, ...]:
     modules = []
     if with_nvngx:
         modules.append("nvngx.dll")
@@ -370,21 +375,25 @@ def optional_modules(with_nvngx: bool, with_nvapi: bool, with_fsr: bool = False,
         modules.append(FSR_MODULE)
     if with_fsr_framegeneration:
         modules.append(FSR_FRAMEGENERATION_MODULE)
+    if with_fsr_rayregeneration:
+        modules.append(FSR_RAYREGENERATION_MODULE)
     return tuple(modules)
 
 
 def runtime_artifacts(with_nvngx: bool = False, with_nvapi: bool = False,
                       extra: tuple[Path, ...] = (), arch: dict | None = None, *, with_fsr: bool = False,
-                      with_fsr_framegeneration: bool = False) -> tuple[Path, ...]:
+                      with_fsr_framegeneration: bool = False, with_fsr_rayregeneration: bool = False) -> tuple[Path, ...]:
     arch = arch or architecture("x86_64", "x64")
     windows_dir, unix_dir = Path(arch["windows_directory"]), Path(arch["unix_directory"])
-    artifacts = tuple(windows_dir / name for name in (*WINDOWS_MODULES, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr_framegeneration))) + (unix_dir / NATIVE_MODULE,)
+    artifacts = tuple(windows_dir / name for name in (*WINDOWS_MODULES, *optional_modules(
+        with_nvngx, with_nvapi, with_fsr, with_fsr_framegeneration,
+        with_fsr_rayregeneration=with_fsr_rayregeneration))) + (unix_dir / NATIVE_MODULE,)
     return artifacts + tuple(extra)
 
 
 def owned_overrides(with_nvngx: bool = False, with_nvapi: bool = False, *, with_fsr: bool | None = False,
                     with_fsr_framegeneration: bool | None = False, wow64_frontends: bool | None = None, with_core: bool = True,
-                    with_dcomp: bool = False) -> str:
+                    with_dcomp: bool = False, with_fsr_rayregeneration: bool | None = None) -> str:
     # Unselected vendor modules must not fall through to the source Wine
     # package: its NVAPI implementation can load D3DMetal on first use.
     parts = [OWNED_OVERRIDES, "nvngx=b" if with_nvngx else "nvngx=",
@@ -402,6 +411,9 @@ def owned_overrides(with_nvngx: bool = False, with_nvapi: bool = False, *, with_
     # No FG field means a retained SR-only policy: preserve its wrapper bytes.
     if with_fsr_framegeneration is not None:
         parts.append("amd_fidelityfx_framegeneration_dx12=b" if with_fsr_framegeneration else "amd_fidelityfx_framegeneration_dx12=")
+    # No RR field means a retained pre-RR policy: preserve its wrapper bytes.
+    if with_fsr_rayregeneration is not None:
+        parts.append("amd_fidelityfx_denoiser_dx12=b" if with_fsr_rayregeneration else "amd_fidelityfx_denoiser_dx12=")
     if with_dcomp:
         parts.append("dcomp=b")
     return ";".join(parts)
@@ -583,7 +595,8 @@ def resolve_wow64_artifacts(dxmt_install32: Path, with_nvngx: bool = False, with
         raise ValueError(f"dxmt-install32 must be a real Meson install directory: {dxmt_install32}")
     reject_removed_sdk_artifacts(dxmt_install32)
     result: dict[Path, Path] = {}
-    for name in (*WINDOWS_MODULES, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr, windows_abi="x86")):
+    for name in (*WINDOWS_MODULES, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr, windows_abi="x86",
+                                                     with_fsr_rayregeneration=with_fsr)):
         source = dxmt_install32 / DXMT_WOW64_DIR / name
         regular_file(source, f"32-bit DXMT {name}")
         if inspect_pe(source)["windows_abi"] != "x86":
@@ -747,7 +760,8 @@ def macho_audit_problems(path: Path, label: str, native_arch: str = "x86_64") ->
 
 def render_wrapper(with_nvngx: bool = False, with_nvapi: bool = False, arch: dict | None = None, *, with_fsr: bool | None = False,
                    with_fsr_framegeneration: bool | None = False, wow64_frontends: bool | None = None, with_core: bool = True,
-                   with_wow64: bool = False, with_dcomp: bool = False) -> str:
+                   with_wow64: bool = False, with_dcomp: bool = False,
+                   with_fsr_rayregeneration: bool | None = None) -> str:
     arch = arch or architecture("x86_64", "x64")
     dll_paths = [arch["windows_directory"]]
     if with_wow64:
@@ -809,7 +823,7 @@ fi
 
 # Environment load order wins over prefix registry overrides. Builtin-only means
 # a missing owned module is a hard load failure rather than a native/GPTK fallback.
-export WINEDLLOVERRIDES="{owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration, wow64_frontends=wow64_frontends, with_core=with_core, with_dcomp=with_dcomp)}"
+export WINEDLLOVERRIDES="{owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration, wow64_frontends=wow64_frontends, with_core=with_core, with_dcomp=with_dcomp, with_fsr_rayregeneration=with_fsr_rayregeneration)}"
 
 {"export DXMT_ENABLE_NVEXT=1" if (with_nvngx or with_nvapi) else "unset DXMT_ENABLE_NVEXT"}
 
@@ -841,7 +855,7 @@ def prepare_real_wine(runtime: Path, with_nvngx: bool = False, with_nvapi: bool 
         if real.exists() or real.is_symlink():
             raise ValueError("staged runtime has ambiguous bin/wine.real")
         launcher.replace(real)
-    launcher.write_text(render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=wow64_frontends, with_wow64=with_wow64, with_dcomp=with_dcomp))
+    launcher.write_text(render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=wow64_frontends, with_wow64=with_wow64, with_dcomp=with_dcomp, with_fsr_rayregeneration=with_fsr))
     launcher.chmod(0o755)
 
 def artifact_records(
@@ -849,7 +863,8 @@ def artifact_records(
 ) -> dict[str, dict]:
     records: dict[str, dict] = {}
     arch = arch or architecture("x86_64", "x64")
-    for relative in (*runtime_artifacts(with_nvngx, with_nvapi, extra, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr),
+    for relative in (*runtime_artifacts(with_nvngx, with_nvapi, extra, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr,
+                                        with_fsr_rayregeneration=with_fsr),
                      Path("bin/wine"), Path("bin/wine.real"), Path("bin/wineserver"),
                      Path(arch["unix_directory"]) / "ntdll.so", Path(arch["windows_directory"]) / "ntdll.dll"):
         path = runtime / relative
@@ -939,7 +954,8 @@ def verify_runtime(runtime: Path) -> list[str]:
         problems.append("WoW64 frontends require WoW64 modules")
     wow64_extra = wow64_artifacts(with_wow64, with_wow64_frontends and with_nvngx,
                                  with_wow64_frontends and with_nvapi,
-                                 with_wow64_frontends and optional.get("fsr") is True)
+                                 with_wow64_frontends and optional.get("fsr") is True,
+                                 with_wow64_frontends and optional.get("fsr_rayregeneration") is True)
     if not with_core:
         wow64_extra = tuple(path for path in wow64_extra if path.name != "d3d12core.dll")
     fsr_policy = optional.get("fsr")
@@ -952,6 +968,12 @@ def verify_runtime(runtime: Path) -> list[str]:
     with_fsr_framegeneration = fg_policy is True
     if with_fsr_framegeneration and not with_fsr:
         problems.append("owned FSR frame generation requires the owned FSR module group")
+    rr_policy = optional.get("fsr_rayregeneration")
+    if "fsr_rayregeneration" in optional and not isinstance(rr_policy, bool):
+        problems.append("manifest optional FSR ray-regeneration selection must be a boolean")
+    with_fsr_rayregeneration = rr_policy is True
+    if with_fsr_rayregeneration and not with_fsr:
+        problems.append("owned FSR ray regeneration requires the owned FSR module group")
     native_record = data.get("native_compiler")
     if "dxil_compiler" in data:
         problems.append("manifest still records the removed external DXIL compiler")
@@ -966,7 +988,7 @@ def verify_runtime(runtime: Path) -> list[str]:
         leftover = runtime / relative
         if leftover.exists() or leftover.is_symlink():
             problems.append(f"staged runtime still contains a removed external DXIL compiler artifact: {relative}")
-    expected_overrides = owned_overrides(with_nvngx, with_nvapi, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_dcomp=with_dcomp)
+    expected_overrides = owned_overrides(with_nvngx, with_nvapi, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_dcomp=with_dcomp, with_fsr_rayregeneration=rr_policy)
     if legacy_core_builtin:
         expected_overrides = expected_overrides.replace("d3d12core=n", "d3d12core=b")
     if data.get("loader", {}).get("winedlloverrides") != expected_overrides:
@@ -979,7 +1001,7 @@ def verify_runtime(runtime: Path) -> list[str]:
         return problems
     if with_wow64 and arch["native_arch"] != "x86_64" and not with_fex_x86:
         problems.append("WoW64 staging is only established for the x86_64 Wine layout")
-    expected = {str(path) for path in (*runtime_artifacts(with_nvngx, with_nvapi, wow64_extra + display_extra + fex_extra, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration),
+    expected = {str(path) for path in (*runtime_artifacts(with_nvngx, with_nvapi, wow64_extra + display_extra + fex_extra, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration, with_fsr_rayregeneration=with_fsr_rayregeneration),
                                        Path("bin/wine"), Path("bin/wine.real"))}
     if not with_core:
         expected.discard(str(WINDOWS_DIR / "d3d12core.dll"))
@@ -1048,7 +1070,7 @@ def verify_runtime(runtime: Path) -> list[str]:
         problems.append("manifest owned DLL discovery paths do not match staged ABIs")
     # Retained manifests predate the pinned paired path. Verify their original
     # wrapper without changing its bytes or broadening its loader policy.
-    expected_wrapper = render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_wow64=with_wow64 and dll_paths is not None, with_dcomp=with_dcomp)
+    expected_wrapper = render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_wow64=with_wow64 and dll_paths is not None, with_dcomp=with_dcomp, with_fsr_rayregeneration=rr_policy)
     if legacy_core_builtin:
         expected_wrapper = expected_wrapper.replace("d3d12core=n", "d3d12core=b")
     if wrapper.is_file() and not wrapper.is_symlink() and wrapper.read_text() != expected_wrapper:
@@ -1060,7 +1082,8 @@ def verify_runtime(runtime: Path) -> list[str]:
         module = runtime / WINDOWS_DIR / name
         if name != "d3d12core.dll" and module.is_file() and not module.is_symlink() and WINE_BUILTIN_MARKER not in module.read_bytes():
             problems.append(f"staged {name} lacks the Wine builtin marker; winebuild --builtin postprocess did not run")
-    for name in (*windows_modules, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr_framegeneration), "ntdll.dll"):
+    for name in (*windows_modules, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr_framegeneration,
+                                                     with_fsr_rayregeneration=with_fsr_rayregeneration), "ntdll.dll"):
         module = runtime / WINDOWS_DIR / name
         try:
             if inspect_pe(module)["windows_abi"] != arch["windows_abi"]:
@@ -1124,7 +1147,8 @@ def verify_runtime(runtime: Path) -> list[str]:
             else:
                 if missing:
                     problems.append(f"staged nvapi64.dll is missing exports: {sorted(missing)}")
-    for name in optional_modules(False, False, with_fsr, with_fsr_framegeneration):
+    for name in optional_modules(False, False, with_fsr, with_fsr_framegeneration,
+                                 with_fsr_rayregeneration=with_fsr_rayregeneration):
         try:
             validate_fsr_module(runtime / WINDOWS_DIR / name, arch["windows_abi"])
         except (OSError, ValueError) as error:
@@ -1300,7 +1324,7 @@ def stage(
             shutil.copy2(source, target)
         ngx_signing = sign_ngx(temporary, tuple(relative for relative in dxmt_artifacts
                               if relative.name == "nvngx.dll")) if with_nvngx else None
-        records = artifact_records(temporary, with_nvngx, with_nvapi, wow64_artifacts(with_wow64, with_nvngx, with_nvapi, with_fsr) + tuple(display_sources) + fex_extra, arch, with_fsr=with_fsr)
+        records = artifact_records(temporary, with_nvngx, with_nvapi, wow64_artifacts(with_wow64, with_nvngx, with_nvapi, with_fsr, with_fsr) + tuple(display_sources) + fex_extra, arch, with_fsr=with_fsr)
         manifest = {
             "schema": SCHEMA,
             "architecture": arch,
@@ -1311,7 +1335,7 @@ def stage(
                 "wine_source": str(wine_source),
             },
             "loader": {
-                "winedlloverrides": owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=with_wow64, with_dcomp=wine_display_build is not None),
+                "winedlloverrides": owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=with_wow64, with_dcomp=wine_display_build is not None, with_fsr_rayregeneration=with_fsr),
                 "winedllpath": [arch["windows_directory"], *([str(WOW64_WINDOWS_DIR)] if with_wow64 else []), arch["unix_directory"]],
                 "explicit_wineprefix_required": True,
             },
@@ -1320,6 +1344,7 @@ def stage(
                 "nvapi64": with_nvapi,
                 "fsr": with_fsr,
                 "fsr_framegeneration": with_fsr,
+                "fsr_rayregeneration": with_fsr,
                 "wow64": with_wow64,
                 "wow64_frontends": with_wow64,
             },

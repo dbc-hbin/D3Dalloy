@@ -4,7 +4,9 @@ set -eu
 wine=$1 dxc=$2 prefix=$3 out=$4
 here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$out"
-for entry in cs_bounds cs_gradients cs_array_atomics; do
+WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -enable-16bit-types -T cs_6_2 -E cs_bounds -DREVIEW16 \
+  "$here/resource-review.hlsl" -Fo "$out/resource-review-cs_bounds.dxil"
+for entry in cs_gradients cs_array_atomics; do
   WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T cs_6_0 -E "$entry" \
     "$here/resource-review.hlsl" -Fo "$out/resource-review-$entry.dxil"
 done

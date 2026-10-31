@@ -108,7 +108,8 @@ def main() -> int:
             if args.with_nvngx:
                 required_modules.add("nvngx.dll")
             if args.with_fsr:
-                required_modules.update(("amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll"))
+                required_modules.update(("amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll",
+                                         "amd_fidelityfx_denoiser_dx12.dll"))
             if not required_modules.issubset(Path(artifact["path"]).name for artifact in evidence["artifacts"]):
                 raise RuntimeError("paired build is missing selected optional frontends")
             for artifact in evidence["artifacts"]:

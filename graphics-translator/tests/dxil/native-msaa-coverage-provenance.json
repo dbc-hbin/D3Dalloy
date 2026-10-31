@@ -49,5 +49,27 @@
   "cleanup": "scoped wineserver -k/-w completed; fresh prefix removed; build/local/d3dmetal-opt-port-20261009/phase3b-msaa/dxc-cleanup.log",
   "command_receipt": "build/local/d3dmetal-opt-port-20261009/phase3b-msaa/dxc-producer-command.sh.txt",
   "runtime_dependency_receipt": "build/local/d3dmetal-opt-port-20261009/phase3b-msaa/runtime-compiler-dependency-sha256.txt",
-  "gpu_exercised": false
+  "gpu_exercised": false,
+  "sample_frequency_followup": {
+    "producer": "official Microsoft DXC 1.9.2609.5",
+    "source": "native-msaa-sample.hlsl",
+    "source_sha256": "6eeb276642c770fc79459fe65de8fd816291582235d5f81db3429dce1eac4185",
+    "common_arguments": ["-nologo", "-HV", "2021", "-O3"],
+    "compile_validation_enabled": true,
+    "outputs": [
+      {
+        "entry": "sampleInterpolationVS",
+        "profile": "vs_6_0",
+        "output": "native-msaa-sample-vs.dxil",
+        "sha256": "b1d5abb8e511d3912bd12408d6cafcbb890d68bb06607f819a99eaa5e6445a4a"
+      },
+      {
+        "entry": "sampleInterpolation",
+        "profile": "ps_6_0",
+        "output": "native-msaa-sample-ps.dxil",
+        "sha256": "65decc91a61d43cc78a5123434fe42d6ddfb99f681b2debba3335bb43a93291c"
+      }
+    ],
+    "gpu_evidence": "build/local/w8-ms-complete-{none,api,valid}/result.json"
+  }
 }

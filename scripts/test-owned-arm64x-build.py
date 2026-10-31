@@ -122,6 +122,7 @@ class PairedFrontendBuildTests(unittest.TestCase):
             "fsr": {
                 "amd_fidelityfx_upscaler_dx12": "src/fsr/amd_fidelityfx_upscaler_dx12.dll",
                 "amd_fidelityfx_framegeneration_dx12": "src/fsrfg/amd_fidelityfx_framegeneration_dx12.dll",
+                "amd_fidelityfx_denoiser_dx12": "src/fsrrr/amd_fidelityfx_denoiser_dx12.dll",
             },
         }
         for flags in itertools.product((False, True), repeat=3):

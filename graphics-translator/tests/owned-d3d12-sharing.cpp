@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <iterator>
 #include <type_traits>
 #include <vector>
 
@@ -268,6 +269,45 @@ struct Device {
   }
 };
 
+struct QueueWaitArrival {
+  static constexpr auto variable = L"OWNED_GRAPHICS_QUEUE_WAIT_ARRIVAL";
+  std::vector<wchar_t> previous;
+  HANDLE event = nullptr;
+
+  QueueWaitArrival(Device &a, Device &b, const wchar_t *test) {
+    // No unrelated wait may acknowledge this case's observer event.
+    check(a.queue->Signal(a.fence.Get(), ++a.value), "drain arrival queue A");
+    check(b.queue->Signal(b.fence.Get(), ++b.value), "drain arrival queue B");
+    Device::waitFor(a.fence.Get(), a.value);
+    Device::waitFor(b.fence.Get(), b.value);
+    const DWORD size = GetEnvironmentVariableW(variable, nullptr, 0);
+    if (size) {
+      previous.resize(size);
+      if (GetEnvironmentVariableW(variable, previous.data(), size) != size - 1)
+        fail("save wait arrival environment");
+    }
+    wchar_t name[192];
+    std::swprintf(name, std::size(name), L"Local\\OwnedGraphicsQueueWaitArrival-%lu-%ls",
+                  static_cast<unsigned long>(GetCurrentProcessId()), test);
+    event = CreateEventW(nullptr, TRUE, FALSE, name);
+    if (!event || GetLastError() == ERROR_ALREADY_EXISTS)
+      fail("create unique wait arrival event");
+    if (!SetEnvironmentVariableW(variable, name))
+      fail("install wait arrival environment");
+  }
+
+  void wait() {
+    if (WaitForSingleObject(event, kTimeoutMs) != WAIT_OBJECT_0)
+      fail("queue worker wait arrival");
+  }
+
+  ~QueueWaitArrival() {
+    if (!SetEnvironmentVariableW(variable, previous.empty() ? nullptr : previous.data()))
+      fail("restore wait arrival environment");
+    CloseHandle(event);
+  }
+};
+
 ComPtr<ID3D12Resource> sharedBuffer(Device &d) {
   auto p = heapProps(D3D12_HEAP_TYPE_DEFAULT);
   auto desc = bufferDesc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
@@ -391,12 +431,13 @@ void cpuSignalGpuWait(Device &a, Device &b) {
     words[i] = pattern(0x77, i);
   upload->Unmap(0, nullptr);
 
+  QueueWaitArrival arrival(a, b, L"cpu-signal-gpu-wait");
   check(b.queue->Wait(ofence.Get(), 5), "queue Wait shared");
   auto *l = b.begin();
   l->CopyBufferRegion(buf.Get(), 0, upload.Get(), 0, kBytes);
   b.submit(false);
   const UINT64 marker = b.value;
-  Sleep(200);
+  arrival.wait();
   if (b.fence->GetCompletedValue() >= marker)
     fail("GPU wait did not block");
   if (fence->GetCompletedValue() != 0 || ofence->GetCompletedValue() != 0)
@@ -662,12 +703,13 @@ void fenceRewindCase(Device &a, Device &b) {
   Device::waitFor(b.fence.Get(), early);
 
   // Wait(7) registered after the rewind blocks until Signal(7).
+  QueueWaitArrival arrival(a, b, L"fence-rewind");
   check(b.queue->Wait(ofence.Get(), 7), "queue Wait 7");
   auto *l = b.begin();
   l->CopyBufferRegion(buf.Get(), 0, upload.Get(), 0, kBytes);
   b.submit(false);
   const UINT64 late = b.value;
-  Sleep(200);
+  arrival.wait();
   if (b.fence->GetCompletedValue() >= late)
     fail("Wait(7) did not block after rewind");
   if (fence->GetCompletedValue() != 5 || ofence->GetCompletedValue() != 5)

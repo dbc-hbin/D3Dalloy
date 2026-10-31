@@ -543,10 +543,10 @@ void run() {
   std::printf("OWNED_D3D12_PRESENT_QUEUES_RESTART_ONE_SLOT_PASS elapsed_ms=%lld credit=1\n",
               static_cast<long long>(restartMs));
 
-  // Restart must also discard a frame whose command buffer is already committed to Metal.
-  // Buffer 0 presents on blocked queue B (queue-owned); buffer 1 presents on idle queue A and is
-  // encoded, its GPU work waiting on frame 1's order event (native in flight). The restart frame
-  // then targets buffer 0 on B again.
+  // Restart discards every frame not yet committed to Metal. Native present happens at commit
+  // (as in D3DMetal 4.0b3), so a frame on another queue cannot commit before its blocked
+  // predecessor: buffer 0 presents on blocked queue B, buffer 1 on idle queue A waits behind it,
+  // and both are still queue-owned when the restart frame targets buffer 0 on B again.
   check(factory->CreateSwapChainForHwnd(queueA.Get(), window.get(), &desc, nullptr, nullptr, &base),
         "restart-native-swapchain");
   check(base.As(&swapchain), "restart-native-swapchain3");
@@ -583,14 +583,13 @@ void run() {
   UINT nativeCount = 0;
   check(swapchain->GetLastPresentCount(&nativeCount), "restart-native-count");
   const UINT nativeIndex = swapchain->GetCurrentBackBufferIndex();
-  // Releasing B skips discarded frame 1 and lets encoded frame 2 complete on the GPU; its
-  // restart epoch is stale, so its drawable must never reach the display.
+  // Releasing B skips discarded frame 1; frame 2 then sees the advanced epoch and is skipped
+  // too, so only the restart frame reaches the display.
   check(nativeStall->Signal(1), "restart-native-release-queue-b");
   waitIdle(device.Get(), queueB.Get());
   waitIdle(device.Get(), queueA.Get());
-  // Frame 1's credit was transferred to the restart frame; the encoded discarded frame and the
-  // restart frame each return one on GPU completion, and nothing else.
-  const DWORD nativeDiscardedCredit = WaitForSingleObject(nativeWaitable, kCompletionTimeoutMs);
+  // Frame 1's credit was transferred to the restart frame and frame 2's returned at restart;
+  // only the restart frame returns one on GPU completion, and nothing else.
   const DWORD nativeRestartCredit = WaitForSingleObject(nativeWaitable, kCompletionTimeoutMs);
   // Give the native completion handlers (traced as OWNED_GRAPHICS_NATIVE_PRESENT_DECISION) time
   // to log before the swapchain and its layer are torn down.
@@ -625,9 +624,9 @@ void run() {
   if (!nativeModeRestored)
     ChangeDisplaySettingsW(&windowedMode, 0);
   require(nativeEarlyCredit == WAIT_TIMEOUT, "restart-native-encoded-frame-waits-on-queued-frame");
-  require(nativeRestart == S_OK && nativeMs < kBlockedProbeMs && nativeBeforeRelease == WAIT_TIMEOUT &&
-          nativeCount == 3 && nativeIndex == 1 && nativeDiscardedCredit == WAIT_OBJECT_0 &&
-          nativeRestartCredit == WAIT_OBJECT_0 && nativeExtraCredit == WAIT_TIMEOUT,
+  require(nativeRestart == S_OK && nativeMs < kBlockedProbeMs && nativeBeforeRelease == WAIT_OBJECT_0 &&
+          nativeCount == 3 && nativeIndex == 1 && nativeRestartCredit == WAIT_OBJECT_0 &&
+          nativeExtraCredit == WAIT_TIMEOUT,
           "restart-native-discard-without-block-or-extra-credit");
   require(nativeStyleRestored && nativeRectRestored && nativeModeRestored,
           "restart-native-release-restores-window-and-display");

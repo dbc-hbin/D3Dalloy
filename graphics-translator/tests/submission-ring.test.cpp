@@ -118,10 +118,27 @@ template <std::size_t Capacity> static void concurrent_producers() {
               Capacity, static_cast<unsigned long long>(consumed));
 }
 
+// The in-flight access record trusts firstUnretired() as "every lower
+// sequence completed"; it must not advance on publish, only on retire.
+static void first_unretired_tracks_retirement() {
+  owned_graphics::SubmissionRing<4> ring;
+  CHECK(ring.firstUnretired() == 1);
+  ring.publish(ring.reserve());
+  ring.publish(ring.reserve());
+  CHECK(ring.firstUnretired() == 1);
+  CHECK(ring.wait(1));
+  ring.retire(1);
+  CHECK(ring.firstUnretired() == 2);
+  CHECK(ring.wait(2));
+  ring.retire(2);
+  CHECK(ring.firstUnretired() == 3);
+}
+
 int main() {
   empty_stop();
   completion_before_next_reservation();
   capacity_and_drain();
+  first_unretired_tracks_retirement();
   concurrent_producers<1>();
   concurrent_producers<4>();
   concurrent_producers<32>();

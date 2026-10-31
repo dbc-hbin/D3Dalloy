@@ -711,6 +711,8 @@ class StagingPolicyTests(unittest.TestCase):
         fsr.write_bytes(self.fsr_image())
         fg = self.dxmt / "x86_64-windows" / stage_owned_graphics.FSR_FRAMEGENERATION_MODULE
         fg.write_bytes(self.fsr_image(stage_owned_graphics.OWNED_FSR_FRAMEGENERATION_MARKER))
+        rr = self.dxmt / "x86_64-windows" / stage_owned_graphics.FSR_RAYREGENERATION_MODULE
+        rr.write_bytes(self.fsr_image(stage_owned_graphics.OWNED_FSR_RAYREGENERATION_MARKER))
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
             stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_fsr=True)
@@ -719,6 +721,10 @@ class StagingPolicyTests(unittest.TestCase):
             relative = str(stage_owned_graphics.WINDOWS_DIR / stage_owned_graphics.FSR_MODULE)
             self.assertIs(manifest["optional_modules"]["fsr"], True)
             self.assertIs(manifest["optional_modules"]["fsr_framegeneration"], True)
+            self.assertIs(manifest["optional_modules"]["fsr_rayregeneration"], True)
+            self.assertIn("amd_fidelityfx_denoiser_dx12=b", manifest["loader"]["winedlloverrides"].split(";"))
+            rr_relative = str(stage_owned_graphics.WINDOWS_DIR / rr.name)
+            self.assertEqual(manifest["artifacts"][rr_relative]["sha256"], stage_owned_graphics.sha256(rr))
             self.assertEqual(manifest["artifacts"][relative]["sha256"], stage_owned_graphics.sha256(fsr))
             fg_relative = str(stage_owned_graphics.WINDOWS_DIR / fg.name)
             self.assertEqual(manifest["artifacts"][fg_relative]["sha256"], stage_owned_graphics.sha256(fg))
@@ -745,8 +751,12 @@ class StagingPolicyTests(unittest.TestCase):
             path = self.dest / stage_owned_graphics.MANIFEST
             manifest = json.loads(path.read_text())
             del manifest["optional_modules"]["fsr_framegeneration"]
+            del manifest["optional_modules"]["fsr_rayregeneration"]
             del manifest["optional_modules"]["wow64_frontends"]
             fg_relative = str(stage_owned_graphics.WINDOWS_DIR / stage_owned_graphics.FSR_FRAMEGENERATION_MODULE)
+            rr_relative = str(stage_owned_graphics.WINDOWS_DIR / stage_owned_graphics.FSR_RAYREGENERATION_MODULE)
+            del manifest["artifacts"][rr_relative]
+            (self.dest / rr_relative).unlink()
             # Retained SR-only policy predates Core; reconstruct the actual
             # old inventory and wrapper rather than a mixed-generation fixture.
             del manifest["agility_sdk"]
@@ -779,6 +789,7 @@ class StagingPolicyTests(unittest.TestCase):
             manifest = json.loads(path.read_text())
             self.assertIs(manifest["optional_modules"]["fsr"], False)
             del manifest["optional_modules"]["fsr_framegeneration"]
+            del manifest["optional_modules"]["fsr_rayregeneration"]
             del manifest["optional_modules"]["fsr"]
             del manifest["optional_modules"]["wow64_frontends"]
             del manifest["agility_sdk"]
@@ -1171,8 +1182,14 @@ class StagingPolicyTests(unittest.TestCase):
         guest = self.root / "guest.exe"
         guest.write_bytes(self.pe_image(0x8664, b"x64"))
         for abi in ("arm64", "arm64ec", "arm64x"):
-            with self.subTest(abi=abi), self.assertRaises(ValueError):
+            with self.subTest(abi=abi), self.assertRaisesRegex(ValueError, "audited FEX"):
                 execution_architecture({"schema": 2, "architecture": architecture("arm64", abi)}, guest)
+        with self.assertRaisesRegex(ValueError, "audited FEX"):
+            execution_architecture({"schema": 2, "architecture": architecture("arm64", "arm64"),
+                                    "optional_modules": {"fex_x64": True}}, guest)
+        facts = execution_architecture({"schema": 2, "architecture": architecture("arm64", "arm64x"),
+                                        "optional_modules": {"fex_x64": True}}, guest)
+        self.assertEqual((facts["guest_arch"], facts["windows_abi"]), ("x64", "arm64x"))
         with self.assertRaisesRegex(ValueError, "guest-arch"):
             execution_architecture({"schema": 1}, guest, "arm64")
         guest.write_bytes(self.pe_image(0x14C, b"x86"))
@@ -1268,7 +1285,7 @@ class StagingPolicyTests(unittest.TestCase):
             self.assertTrue(any("discovery paths" in problem for problem in stage_owned_graphics.verify_runtime(self.dest)))
             # Genuine retained paired runtimes lacked the new discovery hint.
             del manifest["loader"]["winedllpath"]
-            wrapper.write_text(stage_owned_graphics.render_wrapper(wow64_frontends=True))
+            wrapper.write_text(stage_owned_graphics.render_wrapper(wow64_frontends=True, with_fsr_rayregeneration=False))
             manifest["artifacts"]["bin/wine"]["sha256"] = stage_owned_graphics.sha256(wrapper)
             manifest_file.write_text(json.dumps(manifest))
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])

@@ -367,6 +367,133 @@ void runRaw16(Gpu &gpu) {
     }
   end("typeless16_native_copy_float_srv");
 }
+void runHelperOrdering(Gpu &gpu) {
+  auto root = msaaRoot(gpu.device.Get(), false);
+  ComPtr<ID3D12PipelineState> read, unused, srv;
+  check(computePso(gpu.device.Get(), root.Get(), shader("cs_msaa_read4array"), read), "helper read PSO");
+  check(computePso(gpu.device.Get(), root.Get(), shader("cs_msaa_unused"), unused), "unused helper PSO");
+  check(computePso(gpu.device.Get(), root.Get(), shader("cs_msaa_srv4array"), srv), "helper consumer PSO");
+  for (bool shader_unused : {false, true}) {
+    const char *name = shader_unused ? "unused_descriptor_helper_order" : "partial_array_helper_other_slice_clear";
+    const UINT base = shader_unused ? 600 : 500;
+    const UINT layers = shader_unused ? 2 : 3;
+    begin();
+    auto texture = msaaTexture(gpu, 4, layers);
+    auto prior_output = gpu.uavBuffer(filled(16));
+    auto helper_output = gpu.uavBuffer(filled(shader_unused ? 16 : 16 * 4 * 32 + 16));
+    auto consumer_output = gpu.uavBuffer(filled(2 * 16 * 4 * 32 + 16));
+    views(gpu, texture.Get(), true, 0, layers);
+    auto initialized = dispatch(gpu, root.Get(), "cs_msaa_store4array", 4, layers, base);
+    expectSamples(name, initialized, 4, layers, base);
+
+    // Separate table ranges stay immutable until Execute retires. Only table 0
+    // contains writable-MSAA descriptors; the u1-only shader does not reflect them.
+    views(gpu, nullptr, true, 0, layers);
+    for (UINT slot : {4u, 6u, 8u, 10u})
+      gpu.device->CopyDescriptorsSimple(1, gpu.cpu(slot), gpu.cpu(0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    gpu.device->CopyDescriptorsSimple(1, gpu.cpu(11), gpu.cpu(3), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_SHADER_RESOURCE_VIEW_DESC source{};
+    source.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+    source.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+    source.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    source.Texture2DMSArray.ArraySize = layers;
+    gpu.device->CreateShaderResourceView(texture.Get(), &source, gpu.cpu(7));
+    views(gpu, texture.Get(), true, 0, 1);
+    gpu.rawUav(1, helper_output.Get());
+    gpu.rawUav(5, consumer_output.Get());
+    gpu.rawUav(9, prior_output.Get());
+    std::vector<ComPtr<ID3D12GraphicsCommandList>> recordings;
+    auto next = [&] {
+      check(gpu.list->Close(), "helper recording close");
+      recordings.push_back(gpu.list);
+      ComPtr<ID3D12GraphicsCommandList> list;
+      check(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, gpu.allocator.Get(), nullptr,
+          IID_PPV_ARGS(&list)), "helper next recording");
+      gpu.list = list;
+    };
+    auto record = [&](ID3D12PipelineState *pso, UINT table, UINT token, UINT layers) {
+      ID3D12DescriptorHeap *heaps[] = {gpu.heap.Get()};
+      gpu.list->SetDescriptorHeaps(1, heaps);
+      gpu.list->SetPipelineState(pso);
+      gpu.list->SetComputeRootSignature(root.Get());
+      const UINT constants[] = {token, 0, layers, 0};
+      gpu.list->SetComputeRoot32BitConstants(0, 4, constants, 0);
+      gpu.list->SetComputeRootDescriptorTable(1, gpu.gpu(table));
+      gpu.list->SetComputeRootDescriptorTable(2, gpu.gpu(table + 3));
+      gpu.list->Dispatch(1, 1, layers);
+      next();
+    };
+    if (shader_unused) record(unused.Get(), 8, 0x13579bdf, 1);
+    record(shader_unused ? unused.Get() : read.Get(), 0, shader_unused ? 0x2468ace0 : base, 1);
+    if (shader_unused) {
+      gpu.transition(texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      record(srv.Get(), 4, base, 2);
+    } else {
+      D3D12_RESOURCE_BARRIER barrier{};
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition = {texture.Get(), 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET};
+      gpu.list->ResourceBarrier(1, &barrier);
+      barrier.Transition.Subresource = 2;
+      gpu.list->ResourceBarrier(1, &barrier);
+      D3D12_RENDER_TARGET_VIEW_DESC target{};
+      target.Format = source.Format;
+      target.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+      target.Texture2DMSArray.FirstArraySlice = 1;
+      // Two other slices keep this clear in place; deferred clear batches have
+      // a conservative barrier that would hide missing helper tracking.
+      target.Texture2DMSArray.ArraySize = layers - 1;
+      auto handle = gpu.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+      gpu.device->CreateRenderTargetView(texture.Get(), &target, handle);
+      const float clear[] = {7, 11, 13, 17};
+      gpu.list->ClearRenderTargetView(handle, clear, 0, nullptr);
+      std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+      gpu.list->ResourceBarrier(1, &barrier);
+      barrier.Transition.Subresource = 1;
+      gpu.list->ResourceBarrier(1, &barrier);
+      next();
+    }
+    std::vector<ID3D12CommandList *> lists;
+    for (const auto &list : recordings) lists.push_back(list.Get());
+    const auto completion = ++gpu.fenceValue;
+    check(gpu.fence->SetEventOnCompletion(completion, gpu.event), "helper completion event");
+    std::fprintf(stderr, "OWNED_D3D12_WRITABLE_MSAA_HELPER_PHASE begin=%s\n", name); std::fflush(stderr);
+    gpu.queue->ExecuteCommandLists(static_cast<UINT>(lists.size()), lists.data());
+    check(gpu.queue->Signal(gpu.fence.Get(), completion), "helper signal");
+    if (WaitForSingleObject(gpu.event, kFenceTimeoutMs) != WAIT_OBJECT_0)
+      die("helper GPU fence timeout", HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    std::fprintf(stderr, "OWNED_D3D12_WRITABLE_MSAA_HELPER_PHASE end=%s\n", name); std::fflush(stderr);
+    recordings.clear();
+    if (shader_unused) {
+      auto bytes = gpu.finish({prior_output.Get(), helper_output.Get(), consumer_output.Get()}, nullptr);
+      EXPECT_EQ(name, "prior token", 0, load<UINT>(bytes[0], 0), 0x13579bdfu);
+      EXPECT_EQ(name, "helper token", 0, load<UINT>(bytes[1], 0), 0x2468ace0u);
+      for (UINT output = 0; output < 2; ++output) for (UINT word = 1; word < 4; ++word)
+        EXPECT_EQ(name, "token guard", word, load<UINT>(bytes[output], word * 4), kSentinel);
+      expectSamples(name, bytes[2], 4, 2, base);
+      std::printf("OWNED_D3D12_WRITABLE_MSAA_HELPER_VALUES case=%s prior=%08x helper=%08x first=%u last=%u\n",
+          name, load<UINT>(bytes[0], 0), load<UINT>(bytes[1], 0), load<UINT>(bytes[2], 0),
+          load<UINT>(bytes[2], (2 * 16 * 4 - 1) * 32));
+    } else {
+      auto helper_bytes = gpu.finish({helper_output.Get()}, nullptr)[0];
+      expectSamples(name, helper_bytes, 4, 1, base);
+      views(gpu, texture.Get(), true, 0, layers);
+      auto bytes = dispatch(gpu, root.Get(), "cs_msaa_read4array", 4, layers, base);
+      expectSamples(name, bytes, 4, 1, base);
+      const UINT clear[] = {7, 11, 13, 17};
+      for (UINT layer = 1; layer < layers; ++layer)
+        for (UINT pixel = 0; pixel < 16; ++pixel) for (UINT sample = 0; sample < 4; ++sample)
+          for (UINT alias = 0; alias < 2; ++alias) for (UINT component = 0; component < 4; ++component) {
+            const UINT offset = ((layer * 16 + pixel) * 4 + sample) * 32 + alias * 16 + component * 4;
+            EXPECT_EQ(name, "other slice clear", offset / 4, load<UINT>(bytes, offset), clear[component]);
+          }
+      std::printf("OWNED_D3D12_WRITABLE_MSAA_HELPER_VALUES case=%s helper=%u first=%u last=%u clear=%u,%u,%u,%u\n",
+          name, load<UINT>(helper_bytes, 0), load<UINT>(bytes, 0), load<UINT>(bytes, (16 * 4 - 1) * 32),
+          load<UINT>(bytes, 16 * 4 * 32), load<UINT>(bytes, 16 * 4 * 32 + 4),
+          load<UINT>(bytes, 16 * 4 * 32 + 8), load<UINT>(bytes, 16 * 4 * 32 + 12));
+    }
+    end(name);
+  }
+}
 }
 int wmain() {
   using BackendIdFn = const char *(WINAPI *)();
@@ -383,6 +510,7 @@ int wmain() {
   for (UINT samples : {2u, 4u, 8u}) for (bool array : {false, true}) run(gpu, samples, array);
   for (bool floating : {false, true}) runScalar(gpu, floating);
   runRaw16(gpu);
+  runHelperOrdering(gpu);
   std::printf("OWNED_D3D12_WRITABLE_MSAA_%s\n", g_failures ? "FAIL" : "PASS");
   return g_failures ? 1 : 0;
 }

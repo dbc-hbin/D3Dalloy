@@ -1,5 +1,6 @@
 // Test-only observer. Public Objective-C selectors, no renderer offsets or
-// private layouts. Present is intercepted after the owned GPU completion.
+// private layouts. Present is intercepted; readback waits for the GPU work the
+// renderer ordered with MTL4CommandQueue signalDrawable.
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -20,6 +21,12 @@ std::atomic<unsigned long long> nextSequence{0};
 IMP originalNext;
 char capturedKey;
 char acquisitionLayerKey;
+char signalEventKey;
+char signalValueKey;
+IMP originalSignalDrawable;
+std::mutex signalMutex;
+std::unordered_map<void*, id<MTLSharedEvent>> signalEvents;
+std::unordered_map<void*, uint64_t> signalValues;
 bool windowMetadata = false;
 const char* capturePrefix = "OWNED_D3D12_FSR_FG";
 thread_local bool capturing = false;
@@ -118,6 +125,11 @@ void capture(id<CAMetalDrawable> drawable) {
     id<MTLBuffer> buffer = [texture.device newBufferWithLength:row * height options:MTLResourceStorageModeShared];
     id<MTLCommandQueue> queue = [texture.device newCommandQueue];
     id<MTLCommandBuffer> command = [queue commandBuffer];
+    // A Metal 4 renderer may present right after commit: the drawable's GPU
+    // work is ordered only by its signalDrawable. Read back after the event the
+    // hooked signal published on that queue.
+    if (id<MTLSharedEvent> event = objc_getAssociatedObject(drawable, &signalEventKey))
+        [command encodeWaitForEvent:event value:[objc_getAssociatedObject(drawable, &signalValueKey) unsignedLongLongValue]];
     id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
     [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
               sourceSize:MTLSizeMake(width, height, 1) toBuffer:buffer destinationOffset:0
@@ -199,6 +211,23 @@ id nextDrawable(id self, SEL selector) {
     }
     return result;
 }
+// Public MTL4CommandQueue selector: after the renderer signals a drawable,
+// publish a queue-ordered event value the readback can wait for.
+void signalDrawable(id self, SEL selector, id<MTLDrawable> drawable) {
+    reinterpret_cast<void(*)(id, SEL, id)>(originalSignalDrawable)(self, selector, drawable);
+    id<MTLSharedEvent> event;
+    uint64_t value;
+    {
+        std::lock_guard<std::mutex> lock(signalMutex);
+        auto &slot = signalEvents[(__bridge void*)self];
+        if (!slot) slot = [[(id<MTLCommandQueue>)self device] newSharedEvent];
+        event = slot;
+        value = ++signalValues[(__bridge void*)self];
+    }
+    [(id<MTL4CommandQueue>)self signalEvent:event value:value];
+    objc_setAssociatedObject(drawable, &signalEventKey, event, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(drawable, &signalValueKey, @(value), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
 __attribute__((constructor)) void install() {
     if (!getenv("FG_CAPTURE_DIR")) return;
     // DYLD injection is inherited by Wine services, including ARM64 wineserver.
@@ -216,6 +245,16 @@ __attribute__((constructor)) void install() {
     @autoreleasepool {
         Method method = class_getInstanceMethod([CAMetalLayer class], @selector(nextDrawable));
         originalNext = method_setImplementation(method, reinterpret_cast<IMP>(nextDrawable));
+        if (@available(macOS 26.0, *)) {
+            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+            id<MTL4CommandQueue> probe = [device newMTL4CommandQueue];
+            if (probe) {
+                Method signal = class_getInstanceMethod(object_getClass(probe), @selector(signalDrawable:));
+                if (signal)
+                    originalSignalDrawable = method_setImplementation(signal, reinterpret_cast<IMP>(signalDrawable));
+            }
+            [probe release]; [device release];
+        }
         fprintf(stderr, "%s_OBSERVER_READY public_selectors=1\n", capturePrefix);
     }
 }

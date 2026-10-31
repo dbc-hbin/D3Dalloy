@@ -29,6 +29,7 @@ constexpr HRESULT D3D12_ERROR_DRIVER_VERSION_MISMATCH = HRESULT(0x887e0002u);
 constexpr HRESULT E_ABORT = HRESULT(0x80004004u);
 #include "d3d12_pipeline_cache.hpp"
 #include "../../src/d3d10/d3d10_blob.hpp"
+#include "DXBCParser/PipelineCache.h"
 
 namespace dxmt {
 struct ShaderStageArtifact;
@@ -149,9 +150,43 @@ void PublishAutomaticStageArtifact(const std::string &, std::shared_ptr<const Sh
 extern "C" bool WMTGetPipelineCacheIdentity(WMTPipelineCacheIdentity *identity) {
   *identity = {}; identity->compiler_uuid[0] = 1; return true;
 }
+thread_local SM50_COMPILED_BITCODE *codec_source_views = nullptr;
+thread_local unsigned codec_owner_reads = 0;
+thread_local bool codec_copy_failure = false;
 extern "C" void SM50DestroyBitcode(sm50_bitcode_t) {}
-extern "C" int SM50CopyCompiledBitcode(sm50_bitcode_t, SM50_COMPILED_BITCODE_PART, void *, uint64_t) { return 1; }
+extern "C" void SM50FreeError(sm50_error_t) {}
+extern "C" int SM50CopyCompiledBitcode(sm50_bitcode_t bitcode, SM50_COMPILED_BITCODE_PART part, void *out, uint64_t size) {
+  if (!codec_source_views || codec_copy_failure) return 1;
+  for (unsigned i = 0; i < 3; ++i) {
+    const auto &source = codec_source_views[i];
+    if (bitcode != &codec_source_views[i]) continue;
+    const void *bytes = nullptr;
+    uint64_t expected = 0;
+    switch (part) {
+    case SM50_COMPILED_BITCODE_PART_LIBRARY:
+      bytes = dxmt::SM50AccessiblePointer(source.Data); expected = source.Size; break;
+    case SM50_COMPILED_BITCODE_PART_CONSTANTS:
+      bytes = dxmt::SM50AccessiblePointer(source.ConstantData); expected = source.ConstantDataSize; break;
+    case SM50_COMPILED_BITCODE_PART_RELOCATIONS:
+      bytes = dxmt::SM50AccessiblePointer(source.ConstantRelocations);
+      expected = source.ConstantRelocationCount * sizeof(SM50_CONSTANT_RELOCATION); break;
+    }
+    require(bytes && size == expected, "owner-aware codec copy extent");
+    std::memcpy(out, bytes, size);
+    ++codec_owner_reads;
+    return 0;
+  }
+  return 1;
+}
 extern "C" void SM50GetCompiledBitcode(sm50_bitcode_t bitcode, SM50_COMPILED_BITCODE *out) {
+  if (codec_source_views)
+    for (unsigned i = 0; i < 3; ++i)
+      if (bitcode == &codec_source_views[i]) {
+        *out = codec_source_views[i];
+        // Simulate compiler-owned bytes inaccessible through the native pointer.
+        out->Data = nullptr; out->ConstantData = nullptr; out->ConstantRelocations = nullptr;
+        return;
+      }
   *out = {}; out->Data = bitcode; out->Size = 8; out->ConstantDataAlignment = 1;
 }
 
@@ -361,6 +396,186 @@ void testStrictAndBounds() {
   }
   std::puts("PIPELINE_CACHE_STRICT_BOUNDS_PASS explicit=1 retry=0 entries=512");
 }
+
+void wire32(std::vector<uint8_t> &bytes, size_t offset, uint32_t value) {
+  for (unsigned i = 0; i < 4; ++i) bytes[offset + i] = uint8_t(value >> (8 * i));
+}
+void wire64(std::vector<uint8_t> &bytes, size_t offset, uint64_t value) {
+  for (unsigned i = 0; i < 8; ++i) bytes[offset + i] = uint8_t(value >> (8 * i));
+}
+void sealPipelineFixture(std::vector<uint8_t> &bytes) {
+  // Independent v7 wire oracle: SHA1 excludes exactly bytes [100, 120).
+  Sha1HashState hash;
+  hash.update(bytes.data(), 100).update(bytes.data() + 120, bytes.size() - 120);
+  const auto digest = hash.final();
+  std::memcpy(bytes.data() + 100, digest.data, 20);
+}
+std::vector<uint8_t> pipelineFixture() {
+  // Three explicit records, a 216-byte header and independently computed spans.
+  std::vector<uint8_t> bytes(344);
+  std::memcpy(bytes.data(), "DXMTPSO", 7);
+  wire32(bytes, 8, 7); wire32(bytes, 12, 7);
+  wire64(bytes, 16, 344); wire64(bytes, 24, 7);
+  bytes[32] = 1; bytes[80] = 91;
+  const uint64_t records[3][4] = {{5, 16, 16, 1}, {6, 0, 1, 0}, {7, 24, 32, 3}};
+  for (unsigned stage = 0; stage < 3; ++stage)
+    for (unsigned field = 0; field < 4; ++field)
+      wire64(bytes, 120 + stage * 32 + field * 8, records[stage][field]);
+  std::memcpy(bytes.data() + 216, "MTLBv", 5);
+  std::memcpy(bytes.data() + 256, "MTLBff", 6);
+  std::memcpy(bytes.data() + 264, "MTLBccc", 7);
+  for (unsigned i = 0; i < 16; ++i) bytes[224 + i] = uint8_t(i + 1);
+  for (unsigned i = 0; i < 24; ++i) bytes[272 + i] = uint8_t(i + 17);
+  wire64(bytes, 240, 0); wire64(bytes, 248, 16);
+  wire64(bytes, 296, 0); wire64(bytes, 304, 24);
+  wire64(bytes, 312, 8); wire64(bytes, 320, UINT64_MAX);
+  wire64(bytes, 328, 16); wire64(bytes, 336, UINT64_MAX - 1);
+  sealPipelineFixture(bytes);
+  return bytes;
+}
+void testPipelineBlobCodec() {
+  require(AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) == S_OK, "codec isolates automatic policy");
+  auto golden = pipelineFixture();
+  auto restore = [&](const std::vector<uint8_t> &bytes, uint32_t expected_stages = 7) {
+    PipelineCache cache;
+    return cache.Initialize({bytes.data(), bytes.size()}, key(91), expected_stages, 7);
+  };
+  require(restore(golden) == S_OK, "independent three-stage v7 fixture restores");
+  DxmtPipelineCacheInfo info{};
+  require(dxmt_pipeline_cache_decode(golden.data(), golden.size(), &info) == DXMT_PIPELINE_CACHE_SUCCESS,
+          "Rust decodes independent fixture");
+  require(info.layout.size == 344 && info.layout.digest_begin == 100 && info.layout.digest_end == 120 &&
+              info.description.adapter == 7 && info.description.stages == 7 &&
+              info.description.identity[0] == 1 && info.description.key.bytes[0] == 91,
+          "exact header and checksum spans");
+  const uint64_t offsets[3][3] = {{216, 224, 240}, {256, 264, 264}, {264, 272, 296}};
+  const uint64_t sizes[3][4] = {{5, 16, 16, 1}, {6, 0, 1, 0}, {7, 24, 32, 3}};
+  for (unsigned i = 0; i < 3; ++i) {
+    const auto &record = info.description.records[i];
+    require(info.layout.offsets[i].library == offsets[i][0] && info.layout.offsets[i].constants == offsets[i][1] &&
+                info.layout.offsets[i].relocations == offsets[i][2] &&
+                record.library_size == sizes[i][0] && record.constant_size == sizes[i][1] &&
+                record.constant_alignment == sizes[i][2] && record.relocation_count == sizes[i][3],
+            "independent stage layout");
+  }
+  std::vector<uint8_t> unaligned(golden.size() + 1);
+  std::memcpy(unaligned.data() + 1, golden.data(), golden.size());
+  PipelineCache loaded;
+  require(loaded.Initialize({unaligned.data() + 1, golden.size()}, key(91), 7, 7) == S_OK, "unaligned blob restores");
+  for (unsigned i = 0; i < 3; ++i) {
+    const auto view = loaded.view(PipelineCache::Stage(i));
+    require(view.Size == sizes[i][0] && view.ConstantDataSize == sizes[i][1] &&
+                view.ConstantDataAlignment == sizes[i][2] && view.ConstantRelocationCount == sizes[i][3] &&
+                !std::memcmp(SM50AccessiblePointer(view.Data), golden.data() + offsets[i][0], sizes[i][0]),
+            "restored stage views retain wire metadata");
+    require(bool(SM50AccessiblePointer(view.ConstantData)) == bool(sizes[i][1]) &&
+                bool(SM50AccessiblePointer(view.ConstantRelocations)) == bool(sizes[i][3]),
+            "empty restored parts are null");
+  }
+  unaligned[217] ^= 1;
+  Com<ID3DBlob> copied;
+  require(loaded.GetBlob(&copied) == S_OK && copied->GetBufferSize() == golden.size() &&
+              !std::memcmp(copied->GetBufferPointer(), golden.data(), golden.size()),
+          "restored blob owns a separate exact copy");
+  static_cast<uint8_t *>(copied->GetBufferPointer())[216] ^= 1;
+  require(static_cast<const uint8_t *>(SM50AccessiblePointer(loaded.view(PipelineCache::Vertex).Data))[0] == 'M',
+          "GetBlob returns independent writable storage");
+
+  SM50_COMPILED_BITCODE sources[3]{};
+  for (unsigned i = 0; i < 3; ++i) {
+    sources[i].Data = golden.data() + offsets[i][0]; sources[i].Size = sizes[i][0];
+    sources[i].ConstantData = sizes[i][1] ? golden.data() + offsets[i][1] : nullptr;
+    sources[i].ConstantDataSize = sizes[i][1]; sources[i].ConstantDataAlignment = sizes[i][2];
+    sources[i].ConstantRelocations = sizes[i][3] ? golden.data() + offsets[i][2] : nullptr;
+    sources[i].ConstantRelocationCount = sizes[i][3];
+  }
+  codec_source_views = sources; codec_owner_reads = 0;
+  {
+    PipelineCache cold;
+    require(cold.Initialize({}, key(91), 7, 7) == S_OK, "cold three-stage codec");
+    for (unsigned i = 0; i < 3; ++i) *cold.output(PipelineCache::Stage(i)) = &sources[i];
+    Com<ID3DBlob> encoded;
+    require(cold.GetBlob(&encoded) == S_OK && encoded->GetBufferSize() == 344 &&
+                !std::memcmp(encoded->GetBufferPointer(), golden.data(), golden.size()) && codec_owner_reads == 7,
+            "cold encoding matches independent wire bytes using seven owner-aware reads");
+    require(cold.GetBlob(nullptr) == E_POINTER, "GetBlob null output");
+    codec_copy_failure = true;
+    Com<ID3DBlob> failed;
+    require(cold.GetBlob(&failed) == E_FAIL && !failed, "owner read failure releases partial blob");
+    codec_copy_failure = false;
+  }
+  codec_source_views = nullptr;
+
+  Sha1Digest parsed{};
+  require(PipelineCacheBlobKey(unaligned.data() + 1, golden.size(), parsed) == S_OK && parsed == key(91),
+          "header-only key ignores corrupted payload");
+  for (size_t length = 1; length < golden.size(); ++length) {
+    PipelineCache truncated;
+    require(truncated.Initialize({golden.data(), length}, key(91), 7, 7) == E_INVALIDARG, "all truncation boundaries reject");
+  }
+  require(PipelineCacheBlobKey(nullptr, golden.size(), parsed) == E_INVALIDARG, "null blob key");
+  require(PipelineCacheBlobKey(golden.data(), 0, parsed) == E_INVALIDARG, "empty blob key");
+  std::memset(&info, 0xa5, sizeof(info));
+  const auto untouched = info;
+  require(dxmt_pipeline_cache_decode(nullptr, 0, &info) == DXMT_PIPELINE_CACHE_INVALID_ARGUMENT &&
+              !std::memcmp(&info, &untouched, sizeof(info)),
+          "failed decode leaves output untouched");
+  require(dxmt_pipeline_cache_decode(golden.data(), golden.size(), nullptr) == DXMT_PIPELINE_CACHE_INVALID_ARGUMENT,
+          "null decode output");
+
+  auto changed = golden;
+  changed[0] ^= 1; wire32(changed, 8, 6);
+  require(restore(changed) == E_INVALIDARG &&
+              PipelineCacheBlobKey(changed.data(), changed.size(), parsed) == E_INVALIDARG, "magic precedes version");
+  changed = golden; wire32(changed, 8, 6); wire64(changed, 16, 0); wire64(changed, 24, 8); changed[216] = 0;
+  require(restore(changed) == D3D12_ERROR_DRIVER_VERSION_MISMATCH &&
+              PipelineCacheBlobKey(changed.data(), changed.size(), parsed) == D3D12_ERROR_DRIVER_VERSION_MISMATCH,
+          "version precedes size, adapter and payload");
+  changed = golden; wire64(changed, 24, 8);
+  require(restore(changed) == E_INVALIDARG, "checksum precedes adapter");
+  sealPipelineFixture(changed); changed[216] = 0; sealPipelineFixture(changed);
+  require(restore(changed) == D3D12_ERROR_ADAPTER_NOT_FOUND, "adapter precedes payload");
+  changed[32] ^= 1; sealPipelineFixture(changed);
+  require(restore(changed) == D3D12_ERROR_ADAPTER_NOT_FOUND, "adapter precedes native identity");
+  wire64(changed, 24, 7); sealPipelineFixture(changed);
+  require(restore(changed) == D3D12_ERROR_DRIVER_VERSION_MISMATCH, "native identity precedes payload");
+  changed = golden; changed[79] = 1; sealPipelineFixture(changed);
+  require(restore(changed) == D3D12_ERROR_DRIVER_VERSION_MISMATCH, "all 48 native identity bytes participate");
+  changed = golden; wire64(changed, 24, 8); changed[80] ^= 1; sealPipelineFixture(changed);
+  require(restore(changed) == E_INVALIDARG, "application key precedes adapter");
+  changed = golden; wire32(changed, 12, 4); wire64(changed, 24, 8); sealPipelineFixture(changed);
+  require(restore(changed) == E_INVALIDARG, "stage mask and layout precede adapter");
+
+  struct MalformedField { size_t offset; uint64_t value; };
+  const MalformedField malformed[] = {
+      {16, 343}, {120, 3}, {120, UINT64_MAX}, {128, uint64_t(UINT32_MAX) + 1},
+      {136, 0}, {136, 3}, {136, uint64_t(UINT32_MAX) + 1}, {144, 3},
+      {168, 2}, {176, 1}, {240, 9}, {248, 17}, {304, UINT64_MAX - 2}};
+  for (const auto &field : malformed) {
+    changed = golden; wire64(changed, field.offset, field.value); sealPipelineFixture(changed);
+    require(restore(changed) == E_INVALIDARG, "malformed lengths, alignments or relocation bounds");
+    if (field.offset != 16)
+      require(PipelineCacheBlobKey(changed.data(), changed.size(), parsed) == S_OK && parsed == key(91),
+              "header-only key does not validate records or relocations");
+  }
+  changed = golden; changed[216] = 'X'; sealPipelineFixture(changed);
+  require(restore(changed) == E_INVALIDARG, "library magic validated after identity");
+  changed = golden; wire32(changed, 12, 4); sealPipelineFixture(changed);
+  require(restore(changed, 4) == E_INVALIDARG, "inactive stage records must be zero");
+  changed = golden; wire64(changed, 240, 1); sealPipelineFixture(changed);
+  require(restore(changed) == S_OK, "unaligned relocation destinations remain accepted");
+  changed = golden; changed.push_back(0); wire64(changed, 16, changed.size()); sealPipelineFixture(changed);
+  require(restore(changed) == E_INVALIDARG &&
+              PipelineCacheBlobKey(changed.data(), changed.size(), parsed) == S_OK, "exact payload extent but header-only key");
+  for (uint32_t mask : {0u, 8u}) {
+    changed.assign(golden.begin(), golden.begin() + 216);
+    std::fill(changed.begin() + 120, changed.end(), 0);
+    wire32(changed, 12, mask); wire64(changed, 16, 216); sealPipelineFixture(changed);
+    require(restore(changed, mask) == S_OK, "zero and upper stage bits retain legacy semantics");
+  }
+  require(AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE) == S_OK, "codec restores automatic policy");
+  std::puts("PIPELINE_CACHE_CODEC_PASS independent_v7=1 stages=3 owner_reads=7 unaligned=1 truncations=343 precedence=8 malformed=13 header_only=1");
+}
 }
 void testStageArtifactKeys() {
   using namespace dxmt;
@@ -512,6 +727,7 @@ void testCompiledArtifactKinds() {
   std::puts("PIPELINE_COMPILED_ARTIFACT_KINDS_PASS workgraph=1 raytracing=1 reflection=1");
 }
 int main() {
+  testPipelineBlobCodec();
   testStageArtifactKeys(); testStageArtifactFlights(); testCompiledArtifactKinds();
   testBlockedDisk(); testDelayedWrite(); testDelayedReadAndInvalid(); testDelayedRetry(); testStrictAndBounds();
   std::puts("PIPELINE_CACHE_CPU_PASS");

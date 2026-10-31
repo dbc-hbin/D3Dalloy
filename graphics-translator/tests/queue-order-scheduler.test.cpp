@@ -113,6 +113,70 @@ void testDeviceRemovalTerminatesFence() {
   std::puts("QUEUE_ORDER_REMOVAL_PASS pending_and_late_waiters=1 terminal=1 ordinary_rewind=1");
 }
 
+// completedValue() is read without the epoch mutex. A poller must only ever
+// see published values, monotonic under monotonic signals, and a waiter
+// registered at an observed value must not miss a crossing.
+void testLockFreeCompletionReadsUnderConcurrentSignals() {
+  constexpr uint64_t kFinal = 200000;
+  FenceOrderEpoch timeline(15, 0);
+  std::atomic<bool> done{false};
+  std::atomic<unsigned> failures{0};
+  std::vector<std::thread> pollers;
+  for (unsigned t = 0; t < 4; ++t)
+    pollers.emplace_back([&] {
+      uint64_t last = 0;
+      while (!done.load(std::memory_order_acquire)) {
+        const uint64_t value = timeline.completedValue();
+        if (value < last || value > kFinal)
+          failures.fetch_add(1);
+        last = value;
+      }
+    });
+  std::atomic<unsigned> fired{0};
+  std::thread registrar([&] {
+    for (unsigned i = 0; i < 2000; ++i) {
+      const uint64_t target = std::min<uint64_t>(timeline.completedValue() + 64, kFinal);
+      if (!timeline.addCompletionWaiter(target, [&] { fired.fetch_add(1); }))
+        failures.fetch_add(1);
+    }
+  });
+  for (uint64_t value = 1; value <= kFinal; ++value)
+    timeline.signalCpu(value);
+  registrar.join();
+  done.store(true, std::memory_order_release);
+  for (auto &poller : pollers)
+    poller.join();
+  require(failures.load() == 0, "lock-free completion read observed an unpublished or regressed value");
+  require(fired.load() == 2000, "waiter registered during concurrent completion missed its crossing");
+  require(timeline.completedValue() == kFinal, "final concurrent completion mismatch");
+
+  timeline.signalCpu(3);
+  require(timeline.completedValue() == 3, "lock-free read missed rewind");
+  timeline.remove();
+  timeline.signalCpu(4);
+  require(timeline.completedValue() == UINT64_MAX, "lock-free read missed terminal removal");
+  std::puts("QUEUE_ORDER_LOCKFREE_READ_PASS pollers=4 monotonic=1 waiters=2000 rewind=1 removal=1");
+
+  // Informational GetCompletedValue polling cost; reported, never asserted.
+  for (unsigned threads : {1u, 4u}) {
+    constexpr uint64_t kReads = 2000000;
+    std::atomic<uint64_t> sink{0};
+    std::vector<std::thread> readers;
+    const auto begin = std::chrono::steady_clock::now();
+    for (unsigned t = 0; t < threads; ++t)
+      readers.emplace_back([&] {
+        uint64_t sum = 0;
+        for (uint64_t i = 0; i < kReads; ++i)
+          sum += timeline.completedValue();
+        sink.fetch_add(sum);
+      });
+    for (auto &reader : readers)
+      reader.join();
+    const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - begin).count();
+    std::printf("QUEUE_ORDER_COMPLETED_VALUE_BENCH threads=%u ns_per_read=%.2f\n", threads, ns / kReads);
+  }
+}
+
 void testTaskRetainsSubmissionStorage() {
   struct Storage {
     explicit Storage(std::atomic<unsigned> &destroyed) : destroyed(destroyed) {}
@@ -238,6 +302,7 @@ int main() {
   testLogicalFenceRewindAndOverlap();
   testCompletionRegistrationAcrossRewind();
   testDeviceRemovalTerminatesFence();
+  testLockFreeCompletionReadsUnderConcurrentSignals();
   testCloseDrainsFifo();
   testTaskRetainsSubmissionStorage();
   testRecordHeadAddressStabilityAcrossListReset();

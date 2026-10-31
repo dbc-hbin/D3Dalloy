@@ -6,6 +6,7 @@
 #include "../../src/winemetal/unix/metalfx_frame_generation.hpp"
 #include "../../src/winemetal/winemetal_metal4_fg.h"
 #include "owned-fg-pattern.h"
+#include "fsr-kernels.inc"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,17 +26,40 @@ using namespace dxmt::framegeneration;
 void require(bool ok, const char* reason) {
     if (!ok) { std::fprintf(stderr, "OWNED_FG_DEBUG_NATIVE_FAIL reason=%s\n", reason); std::exit(1); }
 }
-// Observe public native calls only. Every IMP forwards its original arguments.
+// Observe public native calls; only the explicit retry proof injects failures.
 struct Operations { unsigned depth=0, motion=0, snapshots=0; };
+struct CompileCounts { unsigned libraries=0, pipelines=0; } compileCounts;
+using NewLibrary = id<MTLLibrary> (*)(id,SEL,NSString*,MTLCompileOptions*,NSError**);
 using NewPipeline = id<MTLComputePipelineState> (*)(id,SEL,id<MTLFunction>,NSError**);
 using SetPipeline = void (*)(id,SEL,id<MTLComputePipelineState>);
 using Dispatch = void (*)(id,SEL,MTLSize,MTLSize);
 using TextureCopy = void (*)(id,SEL,id<MTLTexture>,NSUInteger,NSUInteger,MTLOrigin,MTLSize,id<MTLTexture>,NSUInteger,NSUInteger,MTLOrigin);
-NewPipeline originalNew; SetPipeline originalSet; Dispatch originalDispatch; TextureCopy originalCopy;
+NewLibrary originalLibrary; NewPipeline originalNew; SetPipeline originalSet; Dispatch originalDispatch; TextureCopy originalCopy;
 std::mutex observationMutex;
 std::unordered_map<id,unsigned> ownedPipelines, encoderPipelines;
 Operations operations; id<MTLTexture> snapshotSources[2]{};
+NSString* failedPipeline = nil;
+bool throwPipeline = false;
+CompileCounts compilations() { std::lock_guard lock(observationMutex); return compileCounts; }
+id<MTLLibrary> observeLibrary(id device,SEL selector,NSString* source,MTLCompileOptions* options,NSError** error) {
+    if ([source isEqualToString:[NSString stringWithUTF8String:kFsrKernelsSource]]) {
+        std::lock_guard lock(observationMutex); ++compileCounts.libraries;
+    }
+    return originalLibrary(device,selector,source,options,error);
+}
 id<MTLComputePipelineState> observeNew(id device,SEL selector,id<MTLFunction> function,NSError** error) {
+    {
+        std::lock_guard lock(observationMutex);
+        if ([function.name hasPrefix:@"yaagl_fg_"]) ++compileCounts.pipelines;
+        if ([function.name isEqualToString:failedPipeline]) {
+            failedPipeline = nil;
+            if (throwPipeline) {
+                throwPipeline = false;
+                [NSException raise:NSInternalInconsistencyException format:@"injected pipeline failure"];
+            }
+            return nil;
+        }
+    }
     auto pipeline=originalNew(device,selector,function,error);
     unsigned kernel=[function.name isEqualToString:@"yaagl_fg_resample_depth"]?1:[function.name isEqualToString:@"yaagl_fg_normalize_motion"]?2:0;
     std::lock_guard lock(observationMutex); if(pipeline) ownedPipelines[pipeline]=kernel; return pipeline;
@@ -53,22 +77,25 @@ void observeCopy(id encoder,SEL selector,id<MTLTexture> source,NSUInteger slice,
     originalCopy(encoder,selector,source,slice,level,origin,size,target,targetSlice,targetLevel,targetOrigin);
 }
 struct Observer {
-    Method methods[4]; IMP originals[4];
+    Method methods[5]; IMP originals[5];
     Observer(id<MTLDevice> device) {
+        compileCounts = {};
         auto allocator=[device newCommandAllocator]; auto command=[device newCommandBuffer];
         [command beginCommandBufferWithAllocator:allocator]; auto encoder=[command computeCommandEncoder];
         methods[0]=class_getInstanceMethod(object_getClass(device),@selector(newComputePipelineStateWithFunction:error:));
         methods[1]=class_getInstanceMethod(object_getClass(encoder),@selector(setComputePipelineState:));
         methods[2]=class_getInstanceMethod(object_getClass(encoder),@selector(dispatchThreads:threadsPerThreadgroup:));
         methods[3]=class_getInstanceMethod(object_getClass(encoder),@selector(copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:));
+        methods[4]=class_getInstanceMethod(object_getClass(device),@selector(newLibraryWithSource:options:error:));
         for(auto method:methods)require(method!=nullptr,"observer-method");
         originals[0]=method_setImplementation(methods[0],reinterpret_cast<IMP>(observeNew)); originalNew=reinterpret_cast<NewPipeline>(originals[0]);
         originals[1]=method_setImplementation(methods[1],reinterpret_cast<IMP>(observeSet)); originalSet=reinterpret_cast<SetPipeline>(originals[1]);
         originals[2]=method_setImplementation(methods[2],reinterpret_cast<IMP>(observeDispatch)); originalDispatch=reinterpret_cast<Dispatch>(originals[2]);
         originals[3]=method_setImplementation(methods[3],reinterpret_cast<IMP>(observeCopy)); originalCopy=reinterpret_cast<TextureCopy>(originals[3]);
+        originals[4]=method_setImplementation(methods[4],reinterpret_cast<IMP>(observeLibrary)); originalLibrary=reinterpret_cast<NewLibrary>(originals[4]);
         [encoder endEncoding]; [command endCommandBuffer]; [command release]; [allocator release];
     }
-    ~Observer(){for(unsigned i=0;i<4;++i)method_setImplementation(methods[i],originals[i]);}
+    ~Observer(){for(unsigned i=0;i<5;++i)method_setImplementation(methods[i],originals[i]);}
 };
 template<class T> void header(T& p, unsigned operation, uint64_t context = 0) { p.header = {sizeof(p), WMTFG_BRIDGE_VERSION, operation, 0, context}; }
 id<MTLTexture> texture(id<MTLDevice> device, MTLPixelFormat format) {
@@ -140,6 +167,36 @@ struct Harness {
         std::shared_ptr<const PreparedFrame> generate; require(api(WMTFG_DISPATCH,&g,&generate)==0,"generate"); if(mutate)return {generate}; return {prepare,generate};
     }
 };
+void pipelineBatchProof(Harness& h) {
+    Observer observer(h.device);
+    auto context = h.create();
+    auto depth = texture(h.device, MTLPixelFormatR32Float);
+    auto motion = texture(h.device, MTLPixelFormatRG16Float);
+    WMTFGprepare_packet p{}; header(p, WMTFG_PREPARE, context);
+    p.command_list=(uint64_t)&h.native; p.frame_id=1;
+    p.depth=(uint64_t)depth; p.motion_vectors=(uint64_t)motion;
+    p.render_width=p.render_height=p.motion_width=p.motion_height=128;
+    p.motion_scale_x=p.motion_scale_y=1; p.frame_time_delta_ms=33.3333f;
+    p.camera_near=.1f; p.camera_far=100; p.camera_fov_vertical_radians=1; p.view_space_to_meters=1;
+    std::shared_ptr<const PreparedFrame> prepared;
+    failedPipeline = @"yaagl_fg_resample_depth";
+    require(api(WMTFG_PREPARE, &p, &prepared)==4 && !prepared, "partial-configuration-failure-reported");
+    auto counts = compilations();
+    require(counts.libraries==1 && counts.pipelines==4, "one-library-for-four-pipeline-attempts");
+    failedPipeline = @"yaagl_fg_decode_crop"; throwPipeline = true;
+    require(api(WMTFG_PREPARE, &p, &prepared)==3 && !prepared, "configuration-objc-exception-contained");
+    counts = compilations();
+    require(counts.libraries==2 && counts.pipelines==5, "failed-configuration-not-cached");
+    require(api(WMTFG_PREPARE, &p, &prepared)==0 && bool(prepared), "configuration-retry-succeeds");
+    counts = compilations();
+    require(counts.libraries==3 && counts.pipelines==9, "retry-creates-one-complete-library-batch");
+    p.frame_id=2;
+    require(api(WMTFG_PREPARE, &p, &prepared)==0 && bool(prepared), "cached-configuration-prepare");
+    counts = compilations();
+    require(counts.libraries==3 && counts.pipelines==9, "cached-configuration-does-not-recompile");
+    h.destroy(context); [depth release]; [motion release];
+    std::puts("OWNED_FG_PIPELINES_PASS complete_batch_libraries=1 pipelines=4 partial_retry=complete objc_exception=contained cache_hit_libraries=0");
+}
 void normalizationProof(Harness& h) {
     Observer observer(h.device);
     uint64_t contexts[]={h.create(),h.create(),h.create()};
@@ -159,7 +216,12 @@ void normalizationProof(Harness& h) {
             }
             upload(h.device,h.queue,depth,z.data(),128*4); upload(h.device,h.queue,motion,mv.data(),128*4);
             operations={}; snapshotSources[0]=depth; snapshotSources[1]=motion;
+            const auto beforeCompile = compilations();
             h.execute(h.record(contexts[mode],frame,color,depth,motion,output,frame==6?4:0,mode==1?64:128,mode==1?2:1,mode==2));
+            const auto afterCompile = compilations();
+            const unsigned batches = frame==1 ? (mode==1 ? 2 : 1) : 0;
+            require(afterCompile.libraries-beforeCompile.libraries==batches &&
+                    afterCompile.pipelines-beforeCompile.pipelines==4*batches, "configuration-batch-library-count-and-reuse");
             snapshotSources[0]=snapshotSources[1]=nil; auto counts=operations;
             require(counts.snapshots==2,"prepare-two-private-snapshots");
             require(mode==1?(counts.depth>0 && counts.motion>0):(!counts.depth && !counts.motion),"actual-normalization-dispatch-count");
@@ -193,6 +255,8 @@ void normalizationProof(Harness& h) {
         [color release];
     }
     require(interpolated>=3,"three-interpolated-frames");
+    const auto counts = compilations();
+    require(counts.libraries==4 && counts.pipelines==16, "independent-configurations-have-no-global-library-cache");
     for(unsigned mode=0;mode<3;++mode) {h.destroy(contexts[mode]);std::printf("OWNED_FG_NORMALIZATION_COUNTS mode=%u depth_dispatches=%u motion_dispatches=%u private_snapshot_copies=%u\n",mode,totals[mode].depth,totals[mode].motion,totals[mode].snapshots);}
     std::printf("OWNED_FG_NORMALIZATION_PASS interpolated_frames=%u all_pixels=1 guards=1 snapshots_mutated_after_completion=1\n",interpolated);
 }
@@ -232,5 +296,6 @@ int main() { @autoreleasepool {
     h.execute(recorded); auto first=read(h.device,h.queue,output); h.execute(recorded); require(first==read(h.device,h.queue,output),"destroyed-context-replay-exact");
     for(auto context:contexts)h.destroy(context); [output release]; [depth release]; [motion release];
     std::puts("OWNED_FG_DEBUG_NATIVE_PASS tear=exact reset=first_and_history view=input_sensitive history=unmodified replay=exact destroy_before_execute=1");
+    pipelineBatchProof(h);
     normalizationProof(h);
 } }

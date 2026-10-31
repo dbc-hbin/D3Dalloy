@@ -220,8 +220,10 @@ def execution_architecture(manifest: dict, fixture: Path, guest_arch: str | None
         raise ValueError("--guest-arch does not match the fixture machine/ABI")
     if record["native_arch"] == "arm64":
         if inferred in ("x86", "x64"):
-            raise ValueError("x86/x64 guest execution requires supported Darwin FEX runtime integration evidence; unavailable")
-        if record["windows_abi"] != "arm64":
+            emulator = "fex_x64" if inferred == "x64" else "fex_x86"
+            if record["windows_abi"] != "arm64x" or manifest.get("optional_modules", {}).get(emulator) is not True:
+                raise ValueError(f"{inferred} guest on native ARM64 requires a paired ARM64X runtime staged with audited FEX ({emulator})")
+        elif record["windows_abi"] != "arm64":
             raise ValueError("plain ARM64 guest requires the plain ARM64 translator ABI; ARM64EC/ARM64X interoperation is not established")
     elif inferred not in ("x64", "x86"):
         raise ValueError("guest architecture cannot execute with this Wine runtime")

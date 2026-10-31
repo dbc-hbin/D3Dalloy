@@ -25,10 +25,16 @@ with nullcontext(str(args.out.resolve())) if args.out else tempfile.TemporaryDir
     production = directory / "production-cache.inc"
     production.write_text(source)
     executable = directory / "pipeline-cache-cpu"
+    sha1 = directory / "sha1.o"
+    subprocess.run(["clang", "-std=c11", "-O2", "-c", "src/util/sha1/sha1.c", "-o", str(sha1)],
+                   cwd=root, check=True)
+    codec = directory / "libshader_bytecode.a"
+    subprocess.run(["rustc", "--edition=2021", "--crate-type=staticlib", "-Cpanic=abort", "-Copt-level=2",
+                    "src/airconv/shader_bytecode.rs", "-o", str(codec)], cwd=root, check=True)
     command = ["clang++", "-std=c++20", "-fms-extensions", "-pthread", "-Wall", "-Wextra", "-Werror",
                f'-DPRODUCTION_CACHE="{production}"',
                "-isystem", "include/native/windows", "-isystem", "include/native/directx", "-Isrc/util", "-Isrc/airconv",
-               "-Isrc/winemetal", "-Isrc/d3d12", "graphics-translator/tests/pipeline-cache-locks.test.cpp",
-               "src/util/sha1/sha1_util.cpp", "-x", "c++", "src/util/sha1/sha1.c", "-o", str(executable)]
+               "-Isrc/winemetal", "-Isrc/d3d12", "-Ilibs", "graphics-translator/tests/pipeline-cache-locks.test.cpp",
+               "src/util/sha1/sha1_util.cpp", str(sha1), str(codec), "-o", str(executable)]
     subprocess.run(command, cwd=root, check=True)
     subprocess.run([str(executable)], cwd=root, check=True, timeout=60)
