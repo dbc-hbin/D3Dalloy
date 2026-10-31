@@ -77,6 +77,10 @@ bool waitForFenceValue(ID3D12Fence* fence, UINT64 value, DWORD dwMilliseconds, F
 
     if (fence)
     {
+        // DXMT: return before timing/debug-name queries when the value is already complete.
+        if (fence->GetCompletedValue() >= value)
+            return true;
+
         int64_t originalQpc = 0;
         QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&originalQpc));
         int64_t currentQpc = originalQpc;
@@ -85,10 +89,14 @@ bool waitForFenceValue(ID3D12Fence* fence, UINT64 value, DWORD dwMilliseconds, F
         const DWORD waitCallbackIntervalInMs = 1;
         int64_t deltaQpcWaitCallback = qpcFrequency * waitCallbackIntervalInMs / 1000;
         int64_t deltaQpcTimeout = qpcFrequency * dwMilliseconds /1000;
-        wchar_t fenceName[64];
-        static const GUID debugNameW = {0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
-        uint32_t fenceNameLen = sizeof(fenceName);
-        fence->GetPrivateData(debugNameW, &fenceNameLen, &fenceName);
+        // DXMT: the debug name is only consumed by waitCallback.
+        wchar_t fenceName[64] = {};
+        if (waitCallback)
+        {
+            static const GUID debugNameW = {0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
+            uint32_t fenceNameLen = sizeof(fenceName);
+            fence->GetPrivateData(debugNameW, &fenceNameLen, &fenceName);
+        }
 
         if (waitForSingleObjectOnFence == false)
         {
@@ -118,32 +126,39 @@ bool waitForFenceValue(ID3D12Fence* fence, UINT64 value, DWORD dwMilliseconds, F
         }
         else
         {
-            status = fence->GetCompletedValue() >= value;
-
-            if (!status)
+            // DXMT: reuse one auto-reset event per thread instead of creating one per wait. A signal left
+            // by an earlier timed-out registration is rejected by the completed-value check, which also
+            // observes device removal (UINT64_MAX); such a stale wakeup re-registers this wait. Without
+            // waitCallback the slice only bounds that recheck.
+            struct ThreadFenceEvent
             {
                 HANDLE handle = CreateEvent(0, false, false, 0);
+                ~ThreadFenceEvent() { if (isValidHandle(handle)) CloseHandle(handle); }
+            };
+            static thread_local ThreadFenceEvent threadEvent;
+            HANDLE handle = threadEvent.handle;
+            const DWORD waitSliceInMs = waitCallback ? waitCallbackIntervalInMs : 100;
 
-                if (isValidHandle(handle))
+            if (isValidHandle(handle) && SUCCEEDED(fence->SetEventOnCompletion(value, handle)))
+            {
+                while (status != true)
                 {
-                    if (SUCCEEDED(fence->SetEventOnCompletion(value, handle)))
+                    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&currentQpc));
+                    int64_t deltaQpc = currentQpc - originalQpc;
+                    if (deltaQpc > deltaQpcTimeout && dwMilliseconds != INFINITE)
                     {
-                        while (status != true)
-                        {
-                            QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&currentQpc));
-                            int64_t deltaQpc = currentQpc - originalQpc;
-                            if (deltaQpc > deltaQpcTimeout && dwMilliseconds != INFINITE)
-                            {
-                                break;
-                            }
-                            status = (WaitForSingleObject(handle, waitCallbackIntervalInMs) == WAIT_OBJECT_0);
-                            if (waitCallback)
-                            {
-                                waitCallback(fenceName, value);
-                            }
-                        }
+                        break;
                     }
-                    CloseHandle(handle);
+                    const bool signaled = WaitForSingleObject(handle, waitSliceInMs) == WAIT_OBJECT_0;
+                    status = fence->GetCompletedValue() >= value;
+                    if (signaled && !status && FAILED(fence->SetEventOnCompletion(value, handle)))
+                    {
+                        break;
+                    }
+                    if (waitCallback)
+                    {
+                        waitCallback(fenceName, value);
+                    }
                 }
             }
         }

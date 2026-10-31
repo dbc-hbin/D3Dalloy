@@ -323,8 +323,8 @@ HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry,
 
     const typename PacingData::FrameInfo& frameInfo = pacingEntry->frames[frameID];
 
-    if(frameID != FrameType::Real)
-        presenter->presentQueue->Wait(presenter->interpolationFence, frameInfo.interpolationCompletedFenceValue);
+    // DXMT: presenterThread already made presentQueue wait for the entry's interpolationCompletedFenceValue,
+    // which equals every frame's value, so the upstream per-interpolated-frame Wait is redundant.
 
     if (pacingEntry->drawDebugPacingLines)
     {
@@ -463,7 +463,8 @@ DWORD WINAPI presenterThread(LPVOID param)
                             }
 
                             // pacing without composition
-                            waitForFenceValue(presenter->compositionFenceGPU, frameInfo.presentIndex);
+                            waitForFenceValue(presenter->compositionFenceGPU, frameInfo.presentIndex, INFINITE, nullptr,
+                                              presenter->allowWaitForSingleObjectOnFence);
                             uint64_t targetQpc = presenter->previousPresentQpc + frameInfo.presentQpcDelta;
                             waitForPerformanceCount(targetQpc, qpcFrequency, timerCaps.wPeriodMin, presenter->hybridSpinTime);
 
@@ -505,7 +506,6 @@ DWORD WINAPI interpolationThread(LPVOID param)
             SimpleMovingAverage<10, double> frameTime{};
 
             int64_t previousQpc = 0;
-            int64_t previousDelta = 0;
             int64_t qpcFrequency;
             QueryPerformanceFrequency(reinterpret_cast<LARGE_INTEGER*>(&qpcFrequency)); 
 
@@ -522,35 +522,17 @@ DWORD WINAPI interpolationThread(LPVOID param)
 
                     LeaveCriticalSection(&presenter->criticalSectionScheduledFrame);
                     
-                    int64_t preWaitQPC = 0;
-                    QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&preWaitQPC));
-                    int64_t previousPresentQPC = presenter->previousPresentQpc;
-                    int64_t targetDelta = (previousPresentQPC + previousDelta) - preWaitQPC;
-                    
-                    //Risk of late wake if overthreading. If allowed, use WaitForSingleObject to wait for interpolationFence if the target is more than 2ms later.
-                    if (previousPresentQPC && (targetDelta * 1000000) / qpcFrequency > 2000)  
-                    {
-                        waitForFenceValue(
-                            presenter->interpolationFence, 
-                            entry.frames[FrameType::Interpolated_1].interpolationCompletedFenceValue, 
-                            INFINITE,
-                            nullptr,
-                            presenter->allowWaitForSingleObjectOnFence
-                        );
-                        
-                    }
-                    else
-                    {
-                        // spin to wait for interpolationFence if the target is less than 2ms.
-                        waitForFenceValue(
-                            presenter->interpolationFence, 
-                            entry.frames[FrameType::Interpolated_1].interpolationCompletedFenceValue, 
-                            INFINITE,
-                            nullptr,
-                            false
-                        );
-                    }
-                    
+                    // DXMT: wait on the fence event regardless of the pacing target. Upstream spins when the
+                    // target is under 2ms to avoid a late Windows wake; Wine wakes the event waiter directly
+                    // from the fence completion. allowWaitForSingleObjectOnFence=false restores spinning.
+                    waitForFenceValue(
+                        presenter->interpolationFence,
+                        entry.frames[FrameType::Interpolated_1].interpolationCompletedFenceValue,
+                        INFINITE,
+                        nullptr,
+                        presenter->allowWaitForSingleObjectOnFence
+                    );
+
                     SetEvent(presenter->interpolationEvent);
 
                     int64_t currentQpc = 0;
@@ -577,7 +559,6 @@ DWORD WINAPI interpolationThread(LPVOID param)
                     const int64_t deltaToUse        = conservativeAvg > qpcSafetyMargin ? (conservativeAvg - qpcSafetyMargin) : 0;
                     entry.frames[FrameType::Interpolated_1].presentQpcDelta = deltaToUse;
                     entry.frames[FrameType::Real].presentQpcDelta           = deltaToUse;
-                    previousDelta                                                       = deltaToUse;
                     
                     // schedule presents
                     EnterCriticalSection(&presenter->criticalSectionScheduledFrame);
@@ -1433,7 +1414,9 @@ void FrameInterpolationSwapChainDX12::presentInterpolated(UINT SyncInterval, UIN
 
     // interpolation needs to wait for the game queue
     presentInfo.gameQueue->Signal(presentInfo.gameFence, ++gameFenceValue);
-    presentInfo.interpolationQueue->Wait(presentInfo.gameFence, gameFenceValue);
+    // DXMT: a queue already observes its own earlier Signal in FIFO order.
+    if (presentInfo.interpolationQueue != presentInfo.gameQueue)
+        presentInfo.interpolationQueue->Wait(presentInfo.gameFence, gameFenceValue);
 
     FfxApiResource interpolatedFrame{}, realFrame{};
     dispatchInterpolationCommands(&interpolatedFrame, &realFrame);
@@ -1647,7 +1630,8 @@ HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::Present(UINT SyncInte
     const bool runInterpolation        = interpolationEnabled && (fgCallbackConfigured || fgCommandListConfigured);
 
     // Ensure presenter thread has signaled before applying any wait to the game queue
-    waitForFenceValue(presentInfo.compositionFenceCPU, previousFramesSentForPresentation);
+    waitForFenceValue(presentInfo.compositionFenceCPU, previousFramesSentForPresentation, INFINITE, nullptr,
+                      presentInfo.allowWaitForSingleObjectOnFence);
     presentInfo.gameQueue->Wait(presentInfo.compositionFenceGPU, previousFramesSentForPresentation);
 
     // Verify integrity of internal Ui resource
@@ -1695,7 +1679,8 @@ HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::Present(UINT SyncInte
 
     LeaveCriticalSection(&criticalSection);
 
-    waitForFenceValue(presentInfo.replacementBufferFence, replacementSwapBuffers[replacementSwapBufferIndex].availabilityFenceValue, INFINITE, presentInfo.waitCallback);
+    waitForFenceValue(presentInfo.replacementBufferFence, replacementSwapBuffers[replacementSwapBufferIndex].availabilityFenceValue, INFINITE, presentInfo.waitCallback,
+                      presentInfo.allowWaitForSingleObjectOnFence);
 
     return S_OK;
 }
