@@ -613,6 +613,14 @@ struct RenderEncoderData : EncoderData {
   std::vector<RecordedBufferAccess> submission_buffers;
   std::unique_ptr<std::vector<StandardSwizzleTableUse>> submission_tables;
   bool depth_bounds_active = false;
+  // Last depth-stencil state and rasterizer tuple emitted into this encoder's chain (0 / invalid: none yet).
+  obj_handle_t fixed_depth_stencil_state = 0;
+  bool fixed_raster_valid = false;
+  WMTTriangleFillMode fixed_fill_mode{};
+  WMTCullMode fixed_cull_mode{};
+  WMTDepthClipMode fixed_depth_clip_mode{};
+  WMTWinding fixed_winding{};
+  float fixed_depth_bias = 0, fixed_slope_scale = 0, fixed_depth_bias_clamp = 0;
   bool atomic64_phase = false;
   Com<ID3D12PipelineState> atomic64_pipeline;
   uint32_t atomic64_tess_workloads = 0, atomic64_gs_instances = 0;

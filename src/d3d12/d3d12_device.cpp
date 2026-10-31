@@ -1391,8 +1391,60 @@ public:
             GetShaderVisibleDescriptorHeap(this, DstDescriptorRangeOffsets[dst_range_idx]);
         auto [SrcRangeHeap, SrcRangeIndex] =
             GetShaderVisibleDescriptorHeap(this, SrcDescriptorRangeOffsets[src_range_idx]);
-        SrcRangeHeap->CopyDescriptors(SrcRangeIndex + src_idx, DstRangeHeap, DstRangeIndex + dst_idx, copy_count);
-        break;
+        // Extend the run across range boundaries while both sides stay contiguous in their heaps, so one heap
+        // call (and one native view-pool range copy) serves e.g. many single-descriptor source ranges.
+        auto continues = [&](UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE *offsets, unsigned next,
+                             MTLD3D12DescriptorHeap *heap, uint64_t index) {
+          if (next >= count) return false;
+          auto [next_heap, next_index] = GetShaderVisibleDescriptorHeap(this, offsets[next]);
+          return next_heap == heap && next_index == index;
+        };
+        auto size_of = [](const UINT *sizes, unsigned range) { return sizes ? sizes[range] : 1u; };
+        uint64_t total = copy_count;
+        unsigned s_range = src_range_idx, d_range = dst_range_idx;
+        uint64_t s_off = src_idx + copy_count, d_off = dst_idx + copy_count;
+        for (;;) {
+          if (s_off == size_of(SrcDescriptorRangeSizes, s_range)) {
+            if (!continues(SrcDescriptorRangeCount, SrcDescriptorRangeOffsets, s_range + 1, SrcRangeHeap,
+                           uint64_t(SrcRangeIndex) + src_idx + total))
+              break;
+            ++s_range;
+            s_off = 0;
+          }
+          if (d_off == size_of(DstDescriptorRangeSizes, d_range)) {
+            if (!continues(DstDescriptorRangeCount, DstDescriptorRangeOffsets, d_range + 1, DstRangeHeap,
+                           uint64_t(DstRangeIndex) + dst_idx + total))
+              break;
+            ++d_range;
+            d_off = 0;
+          }
+          const uint64_t step = std::min<uint64_t>(size_of(SrcDescriptorRangeSizes, s_range) - s_off,
+                                                   size_of(DstDescriptorRangeSizes, d_range) - d_off);
+          if (!step || total + step > UINT_MAX) break;
+          total += step;
+          s_off += step;
+          d_off += step;
+        }
+        // Overlapping same-heap runs keep the original per-range order.
+        if (SrcRangeHeap == DstRangeHeap) {
+          const uint64_t from = uint64_t(SrcRangeIndex) + src_idx, to = uint64_t(DstRangeIndex) + dst_idx;
+          if (from < to + total && to < from + total)
+            total = copy_count;
+        }
+        SrcRangeHeap->CopyDescriptors(SrcRangeIndex + src_idx, DstRangeHeap, DstRangeIndex + dst_idx, UINT(total));
+        if (total == copy_count)
+          break;
+        auto consume = [&](unsigned &range, unsigned &index, UINT count, const UINT *sizes) {
+          uint64_t remaining = uint64_t(index) + total;
+          while (range < count && remaining >= size_of(sizes, range)) {
+            remaining -= size_of(sizes, range);
+            ++range;
+          }
+          index = unsigned(remaining);
+        };
+        consume(dst_range_idx, dst_idx, DstDescriptorRangeCount, DstDescriptorRangeSizes);
+        consume(src_range_idx, src_idx, SrcDescriptorRangeCount, SrcDescriptorRangeSizes);
+        continue;
       }
 
       case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER: {

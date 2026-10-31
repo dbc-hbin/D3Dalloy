@@ -32,10 +32,13 @@
 #include "dxmt_buffer.hpp"
 #include "dxmt_format.hpp"
 #include <array>
+#include <bit>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <new>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace dxmt {
@@ -1616,6 +1619,8 @@ public:
     // Drop the plans too, so a list does not keep released pipelines alive across recordings.
     submission_capture_plans_ = {};
     static_sampler_uploads_ = {};
+    swizzle_capture_owner_ = nullptr;
+    swizzle_capture_keys_.clear();
   }
 
   HRESULT
@@ -1957,6 +1962,30 @@ public:
     }
   }
 
+  /* Identity of each captured table use, (rootsig, heap, parameter, base); a direct heap use has base 0. Keys
+   * describe the use list `swizzle_capture_owner_` only, rebuilt from its contents when another list is captured. */
+  struct SwizzleCaptureKey {
+    const void *rootsig, *heap;
+    uint64_t base;
+    uint32_t parameter;
+    bool operator==(const SwizzleCaptureKey &) const = default;
+  };
+  struct SwizzleCaptureKeyHash {
+    size_t operator()(const SwizzleCaptureKey &key) const {
+      uint64_t hash = reinterpret_cast<uintptr_t>(key.rootsig) * 0x9e3779b97f4a7c15ull;
+      hash ^= reinterpret_cast<uintptr_t>(key.heap) + 0x7f4a7c159e3779b9ull + (hash << 6) + (hash >> 2);
+      hash ^= key.base + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+      hash ^= key.parameter + (hash << 6) + (hash >> 2);
+      return size_t(hash);
+    }
+  };
+  const std::vector<StandardSwizzleTableUse> *swizzle_capture_owner_ = nullptr;
+  std::unordered_set<SwizzleCaptureKey, SwizzleCaptureKeyHash> swizzle_capture_keys_;
+
+  static SwizzleCaptureKey SwizzleUseKey(const StandardSwizzleTableUse &use) {
+    return {use.rootsig, use.heap, use.parameter == ~0u ? 0 : use.base, use.parameter};
+  }
+
   void CaptureStandardSwizzleTables(std::unique_ptr<std::vector<StandardSwizzleTableUse>> &uses,
                                     MTLD3D12RootSignature *rootsig, const uint64_t *root_arguments, bool atomic_phase,
                                     const MTLD3D12PipelineState *pipeline = nullptr) {
@@ -1965,16 +1994,39 @@ public:
     owned_graphics::Trace("descriptor_table_capture", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                           ",\"atomic\":", atomic_phase);
     auto *heap = static_cast<MTLD3D12DescriptorHeap *>(descriptor_heaps_[0]);
+    auto bind_keys = [&] {
+      if (!uses)
+        uses = std::make_unique<std::vector<StandardSwizzleTableUse>>();
+      if (swizzle_capture_owner_ == uses.get())
+        return;
+      swizzle_capture_owner_ = nullptr;
+      swizzle_capture_keys_.clear();
+      for (const auto &use : *uses)
+        swizzle_capture_keys_.insert(SwizzleUseKey(use));
+      swizzle_capture_owner_ = uses.get();
+    };
+    // Publishes the key before the use so a failed vector growth leaves no key without its use.
+    auto append = [&](StandardSwizzleTableUse use) {
+      const auto key = SwizzleUseKey(use);
+      auto [entry, inserted] = swizzle_capture_keys_.insert(key);
+      if (!inserted)
+        return false;
+      try {
+        uses->push_back(std::move(use));
+      } catch (...) {
+        swizzle_capture_keys_.erase(entry);
+        throw;
+      }
+      rootsig->AddRefPrivate();
+      heap->AddRefPrivate();
+      return true;
+    };
     if (rootsig->Flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
-      if (!uses) uses = std::make_unique<std::vector<StandardSwizzleTableUse>>();
-      if (std::none_of(uses->begin(), uses->end(), [&](const auto &use) {
-            return use.rootsig == rootsig && use.heap == heap && use.parameter == ~0u;
-          })) {
+      bind_keys();
+      if (!swizzle_capture_keys_.contains({rootsig, heap, 0, ~0u})) {
         D3D12_GPU_DESCRIPTOR_HANDLE start{};
         heap->GetGPUDescriptorHandleForHeapStart(&start);
-        uses->push_back({rootsig, heap, start.ptr, ~0u});
-        rootsig->AddRefPrivate();
-        heap->AddRefPrivate();
+        append({rootsig, heap, start.ptr, ~0u});
       }
     }
     for (uint32_t parameter = 0; parameter < rootsig->ParameterSlots; ++parameter) {
@@ -1988,19 +2040,13 @@ public:
       const uint64_t base = root_arguments[rootsig->SlotQwordOffsets[parameter]];
       if (!base)
         continue;
-      if (!uses)
-        uses = std::make_unique<std::vector<StandardSwizzleTableUse>>();
-      if (std::any_of(uses->begin(), uses->end(), [&](const auto &use) {
-            return use.rootsig == rootsig && use.heap == heap && use.parameter == parameter && use.base == base;
-          }))
-        continue;
-      uses->push_back({rootsig, heap, base, parameter});
+      bind_keys();
+      StandardSwizzleTableUse use{rootsig, heap, base, parameter};
       if (atomic_phase && pipeline) {
-        uses->back().shader_bindings = pipeline->resource_bindings;
-        uses->back().restrict_to_shader = true;
+        use.shader_bindings = pipeline->resource_bindings;
+        use.restrict_to_shader = true;
       }
-      rootsig->AddRefPrivate();
-      heap->AddRefPrivate();
+      append(std::move(use));
     }
   }
 
@@ -2302,14 +2348,20 @@ public:
 
   void EncodeGraphicsFixedState(bool capture_only) {
     auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
-    auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdepthstencilstate>();
-    cmd_setdsso.type = WMTRenderCommandSetDepthStencilState;
-    cmd_setdsso.depth_stencil_state =
+    // Encoder state persists within one chain, and every consumer replays a chain from its head, so a
+    // repeat of the state already emitted into this encoder is dropped.
+    const WMT::DepthStencilState depth_stencil_state =
         capture_only ? device_->default_depth_stencil_state :
         pso_graphics_->owned_depth_bounds && !pso_graphics_->emulated_depth_bounds &&
         render->depth.attachment && depth_bounds_min_ > depth_bounds_max_
             ? WMT::DepthStencilState(pso_graphics_->depth_bounds_reject_state) :
         pso_graphics_->GetDepthStencilState(render->dsv_planar_flags, render->dsv_readonly_flags);
+    if (!render->fixed_depth_stencil_state || render->fixed_depth_stencil_state != depth_stencil_state.handle) {
+      auto &cmd_setdsso = allocator_->EncodeRenderCommand<wmtcmd_render_setdepthstencilstate>();
+      cmd_setdsso.type = WMTRenderCommandSetDepthStencilState;
+      cmd_setdsso.depth_stencil_state = depth_stencil_state;
+      render->fixed_depth_stencil_state = depth_stencil_state.handle;
+    }
     const bool bounds_enabled = !capture_only && pso_graphics_->owned_depth_bounds &&
                                 !pso_graphics_->emulated_depth_bounds &&
                                 render->depth.attachment && depth_bounds_min_ <= depth_bounds_max_;
@@ -2321,6 +2373,15 @@ public:
       render->depth_bounds_active = bounds_enabled;
     }
 
+    // Bitwise float comparison: only an identical tuple is elided (NaN and -0 included).
+    auto same_float = [](float a, float b) { return std::bit_cast<uint32_t>(a) == std::bit_cast<uint32_t>(b); };
+    if (render->fixed_raster_valid && render->fixed_cull_mode == pso_graphics_->cull_mode &&
+        render->fixed_depth_clip_mode == pso_graphics_->depth_clip_mode &&
+        render->fixed_fill_mode == pso_graphics_->fill_mode && render->fixed_winding == pso_graphics_->winding &&
+        same_float(render->fixed_depth_bias, depth_bias_) &&
+        same_float(render->fixed_depth_bias_clamp, depth_bias_clamp_) &&
+        same_float(render->fixed_slope_scale, slope_scaled_depth_bias_))
+      return;
     auto &cmd_setrs = allocator_->EncodeRenderCommand<wmtcmd_render_setrasterizerstate>();
     cmd_setrs.type = WMTRenderCommandSetRasterizerState;
     cmd_setrs.cull_mode = pso_graphics_->cull_mode;
@@ -2330,6 +2391,14 @@ public:
     cmd_setrs.depth_bias_clamp = depth_bias_clamp_;
     cmd_setrs.scole_scale = slope_scaled_depth_bias_;
     cmd_setrs.winding = pso_graphics_->winding;
+    render->fixed_raster_valid = true;
+    render->fixed_cull_mode = cmd_setrs.cull_mode;
+    render->fixed_depth_clip_mode = cmd_setrs.depth_clip_mode;
+    render->fixed_fill_mode = cmd_setrs.fill_mode;
+    render->fixed_winding = cmd_setrs.winding;
+    render->fixed_depth_bias = depth_bias_;
+    render->fixed_depth_bias_clamp = depth_bias_clamp_;
+    render->fixed_slope_scale = slope_scaled_depth_bias_;
   }
 
   bool NativeMSAABindingsSafe(RenderEncoderData *capture = nullptr) {
@@ -6471,6 +6540,10 @@ public:
       return;
     if (NumViewports > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
       return;
+    // A new render encoder dirties every fixed state, so an identical array needs no re-emission.
+    if (num_viewports == NumViewports &&
+        (!NumViewports || !std::memcmp(viewports, pViewports, sizeof(*pViewports) * NumViewports)))
+      return;
     num_viewports = NumViewports;
     for (auto i = 0u; i < NumViewports; i++) {
       viewports[i] = pViewports[i];
@@ -6486,6 +6559,8 @@ public:
     if (RejectBundleOperation())
       return;
     if (NumRects > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+      return;
+    if (num_scissors == NumRects && (!NumRects || !std::memcmp(scissors, rects, sizeof(*rects) * NumRects)))
       return;
     num_scissors = NumRects;
     for (auto i = 0u; i < NumRects; i++) {
@@ -6506,14 +6581,11 @@ public:
       AppendBundleCommand([values](auto &parent) { parent.OMSetBlendFactor(values.data()); });
       return;
     }
-    if (BlendFactors) {
-      memcpy(blend_factor_, BlendFactors, std::size(blend_factor_) * sizeof(blend_factor_[0]));
-    } else {
-      blend_factor_[0] = 1.0f;
-      blend_factor_[1] = 1.0f;
-      blend_factor_[2] = 1.0f;
-      blend_factor_[3] = 1.0f;
-    }
+    const FLOAT defaults[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    const FLOAT *values = BlendFactors ? BlendFactors : defaults;
+    if (!std::memcmp(blend_factor_, values, sizeof(blend_factor_)))
+      return;
+    memcpy(blend_factor_, values, sizeof(blend_factor_));
     dirty_state_.set(DirtyState::BlendFactor);
   } catch (const std::bad_alloc &) {
     RecordError(E_OUTOFMEMORY);
@@ -6786,7 +6858,11 @@ public:
   void STDMETHODCALLTYPE
   SetPipelineState(ID3D12PipelineState *pPSO) try {
     if (FAILED(recording_error_)) return;
-    if (!IsRecording() || (pPSO && !QueryObjectOwnedByThisDevice(pPSO))) {
+    // A bound PSO was validated by this recording; skip the COM ownership query on rebinding it.
+    const bool rebind = pPSO && IsRecording() && type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
+        (pPSO == static_cast<ID3D12PipelineState *>(pso_graphics_.ptr()) ||
+         pPSO == static_cast<ID3D12PipelineState *>(pso_compute_.ptr()));
+    if (!rebind && (!IsRecording() || (pPSO && !QueryObjectOwnedByThisDevice(pPSO)))) {
       RecordError();
       return;
     }
@@ -7516,6 +7592,10 @@ public:
   void STDMETHODCALLTYPE
   SetComputeRootSignature(ID3D12RootSignature *pRootSignature) try {
     if (FAILED(recording_error_)) return;
+    // The bound signature was validated by this recording; rebinding it is a no-op in direct lists.
+    if (pRootSignature && IsRecording() && type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
+        rootsig_compute_.ptr() == pRootSignature)
+      return;
     if (!IsRecording() || (pRootSignature && !QueryObjectOwnedByThisDevice(pRootSignature))) {
       RecordError();
       return;
@@ -7548,6 +7628,10 @@ public:
   void STDMETHODCALLTYPE
   SetGraphicsRootSignature(ID3D12RootSignature *pRootSignature) try {
     if (FAILED(recording_error_)) return;
+    // The bound signature was validated by this recording; rebinding it is a no-op in direct lists.
+    if (pRootSignature && IsRecording() && type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE &&
+        rootsig_graphics_.ptr() == pRootSignature)
+      return;
     if (!IsRecording() || (pRootSignature && !QueryObjectOwnedByThisDevice(pRootSignature))) {
       RecordError();
       return;

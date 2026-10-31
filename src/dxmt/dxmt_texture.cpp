@@ -367,6 +367,10 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
     throw;
   }
   version_ = version_ + 1;
+  if (!has_special_view_ && (descriptor.castBlockSize || descriptor.msaaShadow || descriptor.reservedVolumeRender)) {
+    has_special_view_ = true;
+    special_view_textures_.fetch_add(1, std::memory_order_release);
+  }
   return TextureViewKey(descriptor, i, info_.mipmap_level_count);
 }
 
@@ -533,6 +537,11 @@ Texture::view(TextureViewKey key) {
 TextureView &
 Texture::view(TextureViewKey key, TextureAllocation* allocation) {
   if (descriptorIndexedViews) {
+    {
+      std::shared_lock<dxmt::shared_mutex> lock(mutex_);
+      if (key.index < allocation->cached_view_.size() && allocation->cached_view_[key.index])
+        return *allocation->cached_view_[key.index];
+    }
     TextureViewDescriptor descriptor;
     {
       std::unique_lock<dxmt::shared_mutex> lock(mutex_);
@@ -651,8 +660,11 @@ void Texture::incRef(){
 };
 
 void Texture::decRef(){
-  if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
+  if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u) {
+    if (has_special_view_)
+      special_view_textures_.fetch_sub(1, std::memory_order_release);
     delete this;
+  }
 };
 
 RenamableTexturePool::RenamableTexturePool(

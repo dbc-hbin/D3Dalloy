@@ -248,6 +248,8 @@ public:
   void decRef();
 
   TextureViewKey createView(TextureViewDescriptor const &descriptor);
+  /* True while any live texture owns a cast, MSAA-shadow or reserved-volume view (process-wide). */
+  static bool AnySpecialViews() { return special_view_textures_.load(std::memory_order_acquire) != 0; }
   TextureViewDescriptor viewDescriptor(TextureViewKey key) {
     std::shared_lock<dxmt::shared_mutex> lock(mutex_);
     return viewDescriptors_[key.index];
@@ -401,6 +403,8 @@ private:
   std::unordered_map<TextureViewDescriptor, unsigned, TextureViewDescriptor::Hash> viewIndices_;
   dxmt::shared_mutex mutex_;
   WMT::Device device_;
+  bool has_special_view_ = false;
+  static inline std::atomic<uint32_t> special_view_textures_{0};
 };
 
 class RenamableTexturePool {

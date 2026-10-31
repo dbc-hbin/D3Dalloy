@@ -4022,6 +4022,12 @@ public:
     uses.push_back(std::move(use));
   }
 
+  /* Ordinary table walks only find swizzled, cast, MSAA-shadow or reserved-volume textures. Read at Execute,
+   * after every descriptor write the submission can observe. */
+  bool StandardSwizzleTablesMayMatter() const {
+    return device_->HasStandardSwizzleTextures() || Texture::AnySpecialViews() || ReservedResource::AnyLive();
+  }
+
   std::vector<SwizzlePassResource>
   CollectStandardSwizzleTables(const std::unique_ptr<std::vector<StandardSwizzleTableUse>> &tables) {
     std::vector<SwizzlePassResource> uses;
@@ -5740,7 +5746,8 @@ public:
             node.access_complete = !node.rejection;
             if (node.access_complete) append_buffers(render.submission_buffers, render_stages);
             if (node.access_complete) node.access_complete = ResolveSubmissionTables(plan, node, device_, render.submission_tables, render_stages);
-            if (node.access_complete) node.access_complete = CollectStandardSwizzleTables(render.swizzle_tables).empty();
+            if (node.access_complete && StandardSwizzleTablesMayMatter())
+              node.access_complete = CollectStandardSwizzleTables(render.swizzle_tables).empty();
             if (node.access_complete && render.visibility_scratch)
               node.access_complete = AppendSubmissionNativeBuffer(node, render.visibility_scratch, true,
                   WMTMetal4StageFragment);
@@ -5789,7 +5796,8 @@ public:
             if (node.access_complete) {
               // Helper collection scans bound ranges, including shader-unused
               // descriptors. Import/export touches every slice, not just the UAV view.
-              auto uses = CollectStandardSwizzleTables(compute.swizzle_tables);
+              auto uses = StandardSwizzleTablesMayMatter() ? CollectStandardSwizzleTables(compute.swizzle_tables)
+                                                           : std::vector<SwizzlePassResource>{};
               for (auto &use : uses) {
                 if (use.resource || !use.msaa_texture || use.cast_view->castBlockSize ||
                     use.cast_view->reservedVolumeRender || !use.descriptor_owner) {
@@ -7180,7 +7188,8 @@ public:
         }
         case EncoderType::Render: {
           auto data = static_cast<RenderEncoderData *>(current);
-          auto swizzle_uses = CollectStandardSwizzleTables(data->swizzle_tables);
+          auto swizzle_uses = StandardSwizzleTablesMayMatter() ? CollectStandardSwizzleTables(data->swizzle_tables)
+                                                               : std::vector<SwizzlePassResource>{};
           const bool atomic_render = data->atomic64_phase && !data->msaa_draw;
           std::vector<Atomic64RootBinding> atomic_render_roots;
           std::unique_ptr<std::vector<StandardSwizzleTableUse>> atomic_render_tables;
@@ -7881,7 +7890,8 @@ public:
         }
         case EncoderType::Compute: {
           auto data = static_cast<ComputeEncoderData *>(current);
-          auto swizzle_uses = CollectStandardSwizzleTables(data->swizzle_tables);
+          auto swizzle_uses = StandardSwizzleTablesMayMatter() ? CollectStandardSwizzleTables(data->swizzle_tables)
+                                                               : std::vector<SwizzlePassResource>{};
           for (const auto &use : data->cast_textures)
             AppendStandardTexture(swizzle_uses, use.texture.ptr(), use.writes, use.view, use.allocation.ptr());
           if (data->atomic64_phase) {

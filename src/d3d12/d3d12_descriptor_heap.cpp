@@ -645,8 +645,8 @@ public:
           ++range;
         if (range > 1) {
           const uint64_t source_id = mapped_argument_buffer_[From + n].SRVTexture.resource_id;
-          for (unsigned i = 0; i < range; ++i)
-            destination->ResetPoolSlot(DescriptorTo + n + i);
+          // The native range copy replaces every destination texture itself; a failed copy changes
+          // nothing and the slots fall through to the per-descriptor path below.
           const uint64_t destination_id = destination->view_pool_.copyTextureViews(
               view_pool_, From + n, DescriptorTo + n, range);
           if (destination_id) {
@@ -669,12 +669,17 @@ public:
       const auto slot = pool_slots_[From + i];
       const auto cpu = descriptors_[From + i];
       auto gpu = mapped_argument_buffer_[From + i];
-      destination->ResetPoolSlot(DescriptorTo + i);
+      // The native slot copy replaces the destination texture, so only a non-pool source needs the clear.
+      if (!slot.texture)
+        destination->ResetPoolSlot(DescriptorTo + i);
       destination->descriptors_[DescriptorTo + i] = cpu;
       destination->pool_slots_[DescriptorTo + i] = slot;
       if (slot.texture) {
         gpu.SRVTexture.resource_id = destination->view_pool_.copyTextureView(
             view_pool_, From + i, DescriptorTo + i, slot.texture, slot.info);
+        // A rejected copy leaves the old native slot; clear it as the reset would have.
+        if (!gpu.SRVTexture.resource_id)
+          destination->view_pool_.clear(DescriptorTo + i);
       }
       destination->mapped_argument_buffer_[DescriptorTo + i] = gpu;
       ++n;
