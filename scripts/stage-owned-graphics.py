@@ -1032,7 +1032,8 @@ def verify_runtime(runtime: Path) -> list[str]:
                 fex.get("repository") != "https://github.com/FEX-Emu/FEX.git" or
                 fex.get("module") != module or not fex.get("source_patches") or
                 fex.get("sha256") != recorded.get(module, {}).get("sha256") or
-                not fex.get("wine_build_result_sha256") or not fex.get("wine_source_patches")):
+                not fex.get("wine_build_result_sha256") or
+                not (fex.get("wine_source_patches") or fex.get("wine_guest_window") is True)):
             problems.append("manifest FEX x86 or guest-window Wine provenance is incomplete")
         for relative, abi in ((WINDOWS_DIR / "xtajit.dll", "arm64"),
                               (WINDOWS_DIR / "wow64.dll", "arm64"), (WOW64_WINDOWS_DIR / "ntdll.dll", "x86")):
@@ -1282,7 +1283,8 @@ def stage(
             wine_receipt = wine_source.parent / "runtime-result.json"
             wine_build = json.loads(wine_receipt.read_text())
             if (wine_build.get("status") != "pass" or wine_build.get("native_arch") != "arm64" or
-                    not any(Path(patch["path"]).name == "wine-arm64-guest-window.patch" for patch in wine_build["patches"])):
+                    not (wine_build.get("wow64_guest_window") is True or
+                         any(Path(patch["path"]).name == "wine-arm64-guest-window.patch" for patch in wine_build["patches"]))):
                 raise ValueError("native ARM64 WoW64 requires the accepted guest-window Wine build")
             for identity in wine_build["identities"]:
                 if sha256(Path(identity["path"])) != identity["sha256"]:
@@ -1290,6 +1292,7 @@ def stage(
             fex_x86_provenance["wine_build_result_sha256"] = sha256(wine_receipt)
             fex_x86_provenance["wine_source_commit"] = wine_build["source_commit"]
             fex_x86_provenance["wine_source_patches"] = wine_build["patches"]
+            fex_x86_provenance["wine_guest_window"] = True
             for relative in (Path(arch["windows_directory"]) / "wow64.dll", WOW64_WINDOWS_DIR / "ntdll.dll"):
                 regular_file(wine_source / relative, "Wine guest-window module")
                 fex_extra += (relative,)
