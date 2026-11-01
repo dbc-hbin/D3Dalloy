@@ -55,6 +55,9 @@ env = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG="-all", WINEDLLOVERRIDE
            TEMP=windows_temp, TMP=windows_temp)
 try:
     with (out / "run.log").open("w") as log:
+        # The owned wrapper pins WINEDLLOVERRIDES; boot without the Mono/Gecko addon install first.
+        subprocess.run([str(runtime / "bin/wine.real"), "wineboot", "-i"], cwd=root, env=env,
+                       stdout=subprocess.DEVNULL, stderr=log, check=True, timeout=180)
         subprocess.run([str(runtime / "bin/wine"), str(executable), "--operations"], cwd=root, env=env,
                        stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
         subprocess.run([str(runtime / "bin/wine"), str(executable)], cwd=root, env=env,

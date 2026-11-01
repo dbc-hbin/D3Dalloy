@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -86,9 +87,10 @@ uint64_t disk_bytes() {
   return total;
 }
 void clear() { require(ClearAutomaticPipelineCacheDisk() == S_OK, "clear automatic cache"); }
-void stageStore(unsigned value) {
+void stageStore(unsigned value, size_t library = 4) {
   ShaderStageArtifact artifact;
-  artifact.library = {'M', 'T', 'L', 'B'};
+  artifact.library.assign(library, 0);
+  std::memcpy(artifact.library.data(), "MTLB", 4);
   artifact.metadata_sizes = {0};
   artifact.constants = {0};
   artifact.view.ConstantDataAlignment = 1;
@@ -354,6 +356,65 @@ void child(const std::wstring &arguments) {
   require(GetExitCodeProcess(process.hProcess, &code) && code == 0, "child successful exit");
   CloseHandle(process.hProcess);
 }
+constexpr size_t kStageLibrary = 4 * MiB - 4096;
+uint64_t stageDiskBytes() {
+  WIN32_FIND_DATAW info;
+  HANDLE search = FindFirstFileW((directory() + L"d3dalloy-stage-*").c_str(), &info);
+  require(search != INVALID_HANDLE_VALUE, "enumerate stage files");
+  uint64_t total = 0;
+  do {
+    bool temporary = false;
+    require(StageFileName(info.cFileName, temporary) && !temporary, "only published stage files remain");
+    total += (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+  } while (FindNextFileW(search, &info));
+  FindClose(search);
+  require(total <= 256 * MiB, "256 MiB stage cap");
+  return total;
+}
+bool stageExists(unsigned value) {
+  return GetFileAttributesW(stagePath("stage-" + std::to_string(value)).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+void testStageEviction() {
+  clear();
+  for (unsigned value = 1; value <= 64; ++value) {
+    stageStore(value, kStageLibrary);
+    HANDLE file = CreateFileW(stagePath("stage-" + std::to_string(value)).c_str(), FILE_WRITE_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    require(file != INVALID_HANDLE_VALUE, "set deterministic stage eviction order");
+    // Wine stores Unix mtimes, so pre-1970 FILETIMEs do not persist; count seconds from 2020.
+    const uint64_t time = 132223104000000000ull + uint64_t(value) * 10000000;
+    const FILETIME age{DWORD(time), DWORD(time >> 32)};
+    require(SetFileTime(file, nullptr, nullptr, &age), "deterministic stage publication age");
+    CloseHandle(file);
+  }
+  const uint64_t full = stageDiskBytes();
+  require(full > 255 * MiB && stageExists(64), "fill stage cache to its cap");
+  stageStore(65, kStageLibrary);
+  require(!stageExists(65) && stageDiskBytes() == full, "entries used by this process are never evicted");
+  const auto orphan = stagePath("stage-orphan") + L"-00000000-00000000.tmp";
+  HANDLE file = CreateFileW(orphan.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  require(file != INVALID_HANDLE_VALUE, "crashed stage writer temp");
+  CloseHandle(file);
+  HANDLE reader = CreateFileW(stagePath("stage-1").c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+  require(reader != INVALID_HANDLE_VALUE, "open reader on oldest stage file");
+  child(L"--stage 0 65");
+  std::vector<uint8_t> head(4);
+  require(Read(reader, head.data(), 4) && !std::memcmp(head.data(), "DDXM", 4), "evicted file stays readable");
+  CloseHandle(reader);
+  require(!stageExists(1) && stageExists(2) && stageExists(65) && GetFileAttributesW(orphan.c_str()) == INVALID_FILE_ATTRIBUTES,
+          "new process evicts the oldest stage file and orphan temps");
+  child(L"--stage 2 66");
+  require(stageExists(2) && !stageExists(3) && stageExists(4) && stageExists(66), "a read entry survives eviction");
+  stageDiskBytes(); // Keys are stored in the file, so sizes differ slightly; the cap is the invariant.
+  std::shared_ptr<const ShaderStageArtifact> loaded;
+  require(ReadAutomaticStageArtifact("stage-66", loaded) == S_OK && loaded->library.size() == kStageLibrary,
+          "published replacement roundtrips");
+  clear();
+  std::puts("STAGE_CACHE_DISK_PASS oldest-first-eviction");
+}
 int main(int argc, char **argv) {
   if (argc > 1) {
     if (!std::strcmp(argv[1], "--operations")) {
@@ -367,6 +428,12 @@ int main(int argc, char **argv) {
       const unsigned value = std::strtoul(argv[2], nullptr, 10);
       const size_t size = std::strtoull(argv[3], nullptr, 10);
       store(value, size, value & 255); contents(value, size, value & 255);
+    } else if (!std::strcmp(argv[1], "--stage")) {
+      if (const unsigned read = std::strtoul(argv[2], nullptr, 10)) {
+        std::shared_ptr<const ShaderStageArtifact> loaded;
+        require(ReadAutomaticStageArtifact("stage-" + std::to_string(read), loaded) == S_OK, "child stage read");
+      }
+      stageStore(std::strtoul(argv[3], nullptr, 10), kStageLibrary);
     } else if (!std::strcmp(argv[1], "--clear")) {
       clear();
     } else if (!std::strcmp(argv[1], "--abandon")) {
@@ -388,6 +455,7 @@ int main(int argc, char **argv) {
   }
   testStageAccounting();
   testStageCodec();
+  testStageEviction();
   clear();
   const auto foreign = directory() + L"d3dalloy-pso-not-owned.bin";
   HANDLE foreign_file = CreateFileW(foreign.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
