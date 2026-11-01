@@ -19,6 +19,7 @@ struct Generation {
   id<MTL4FXTemporalDenoisedScaler> scaler = nil;
   uint32_t width = 0, height = 0, outputWidth = 0, outputHeight = 0;
   bool hit = false, reactive = false;
+  std::array<MTLPixelFormat, Count> formats{};
   explicit Generation(uint64_t value) : serial(value) {}
   ~Generation() { [scaler release]; }
 };
@@ -140,6 +141,34 @@ MTLPixelFormat format(size_t i) {
   default: return MTLPixelFormatRGBA16Float;
   }
 }
+std::array<MTLPixelFormat, Count> fixedFormats() {
+  std::array<MTLPixelFormat, Count> result{};
+  for (size_t i = 0; i < Count; ++i) result[i] = format(i);
+  return result;
+}
+// Scaler input format for slot i. App formats are bound directly only where the
+// native denoiser output was measured bit-identical to the mode-0 conversion
+// into format(i): exact widenings (Depth16Unorm/Depth32Float/R16Float depth,
+// R16Float roughness and hit distance, RG11B10Float color) and RG32Float/RG16Snorm motion,
+// which the scaler quantizes like the conversion. Sub-rects, size mismatch and
+// value-changing modes (linear depth, packed roughness, scaled motion) convert.
+MTLPixelFormat descriptorFormat(const Core &core, const WMTMetal4FXTemporalFrame &p, size_t i,
+                                id<MTLTexture> input, const WMTMetal4FXRect &rect) {
+  if (!input || rect.x || rect.y || input.width != p.input_width || input.height != p.input_height) return format(i);
+  const auto value = input.pixelFormat;
+  switch (i) {
+  case 0: return value == MTLPixelFormatRG11B10Float ? value : format(i);
+  case 1:
+    return !p.depth_linear && (value == MTLPixelFormatDepth32Float || value == MTLPixelFormatDepth16Unorm ||
+                               value == MTLPixelFormatR16Float) ? value : format(i);
+  case 2:
+    return (core.info.feature_flags & 6) == 2 && p.motion_scale_x == 1 && p.motion_scale_y == 1 &&
+      (value == MTLPixelFormatRG32Float || value == MTLPixelFormatRG16Snorm) ? value : format(i);
+  case 10: return !p.roughness_packed && value == MTLPixelFormatR16Float ? value : format(i);
+  case 11: return value == MTLPixelFormatR16Float ? value : format(i);
+  default: return format(i);
+  }
+}
 bool readableFormat(MTLPixelFormat value) {
   switch (value) {
   case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Snorm:
@@ -167,12 +196,13 @@ void matrix(simd_float4x4 &result, const float *input) {
   // GPTK4 4.0b2 convertMatrix + EncodeDenoiseMTLFX preserve these 64 bytes.
   std::memcpy(&result,input,sizeof(result));
 }
-std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFrame &p) {
+std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFrame &p,
+                                       const std::array<MTLPixelFormat, Count> &formats = fixedFormats()) {
   const bool hit = p.specular_hit_distance != 0, reactive = p.reactive != 0;
   for (const auto &cached : core.generations) {
     if (cached && cached->width == p.input_width && cached->height == p.input_height &&
         cached->outputWidth == p.output_rect.width && cached->outputHeight == p.output_rect.height &&
-        cached->hit == hit && cached->reactive == reactive) {
+        cached->hit == hit && cached->reactive == reactive && cached->formats == formats) {
       // History is reset by encode order (lastGeneration), not descriptor lookup.
       return cached;
     }
@@ -183,11 +213,12 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
   @try {
     d.inputWidth = p.input_width; d.inputHeight = p.input_height;
     d.outputWidth = p.output_rect.width; d.outputHeight = p.output_rect.height;
-    d.colorTextureFormat = d.outputTextureFormat = MTLPixelFormatRGBA16Float;
-    d.depthTextureFormat = d.roughnessTextureFormat = d.specularHitDistanceTextureFormat = MTLPixelFormatR32Float;
-    d.motionTextureFormat = MTLPixelFormatRG16Float;
-    d.diffuseAlbedoTextureFormat = d.specularAlbedoTextureFormat = d.normalTextureFormat = MTLPixelFormatRGBA16Float;
-    d.reactiveMaskTextureEnabled = reactive; d.reactiveMaskTextureFormat = MTLPixelFormatR16Float;
+    d.colorTextureFormat = formats[0]; d.outputTextureFormat = formats[3];
+    d.depthTextureFormat = formats[1]; d.motionTextureFormat = formats[2];
+    d.roughnessTextureFormat = formats[10]; d.specularHitDistanceTextureFormat = formats[11];
+    d.diffuseAlbedoTextureFormat = formats[7]; d.specularAlbedoTextureFormat = formats[8];
+    d.normalTextureFormat = formats[9];
+    d.reactiveMaskTextureEnabled = reactive; d.reactiveMaskTextureFormat = formats[5];
     d.specularHitDistanceTextureEnabled = hit;
     d.autoExposureEnabled = (core.info.feature_flags & 64) != 0;
     // Build the final model before submission instead of encoding the slower
@@ -200,7 +231,7 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     if (!result->scaler) return {};
     result->width = p.input_width; result->height = p.input_height;
     result->outputWidth = p.output_rect.width; result->outputHeight = p.output_rect.height;
-    result->hit = hit; result->reactive = reactive;
+    result->hit = hit; result->reactive = reactive; result->formats = formats;
     // Dynamic output keeps one feature across output extents. Cache only the
     // new and the last encoded output extent; prepared frames keep evictees.
     const Generation *last = nullptr;
@@ -281,9 +312,12 @@ static bool dxmtRRResources(DXMTRRFrame *frame, dxmt_rr::Resources &resources,
       if (@available(macOS 27.0, *)) required = scaler.reactiveMaskTextureUsage;
       else required = scaler.reactiveTextureUsage;
     }
+    const auto descriptorFormat = frame->generation->formats[i];
     if (!convert && !rect.x && !rect.y && input.width == width && input.height == height &&
-        input.pixelFormat == format(i) && (input.usage & required) == required &&
+        input.pixelFormat == descriptorFormat && (input.usage & required) == required &&
         (i != 3 || input.storageMode == MTLStorageModePrivate)) { bound[i] = input; continue; }
+    // Scratch is always written by conversion in the fixed format.
+    if (descriptorFormat != format(i)) return false;
     auto &scratch = resources.textures[i];
     const auto usage = required | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     if (!scratch || scratch.width != width || scratch.height != height ||
@@ -394,8 +428,11 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
       }
       holder->inputs[i] = [texture retain];
     }
+    std::array<MTLPixelFormat,Count> formats = fixedFormats();
+    for (size_t i : {0u,1u,2u,10u,11u})
+      formats[i] = descriptorFormat(*feature->core,p,i,holder->inputs[i],holder->rects[i]);
     std::lock_guard lock(feature->core->mutex);
-    holder->generation = generation(*feature->core,p);
+    holder->generation = generation(*feature->core,p,formats);
     if (!holder->generation) { call->ret[1] = 0x887a0004; return true; }
     if (feature->core->pool.empty()) holder->firstResources = std::make_unique<Resources>();
     else { holder->firstResources = std::move(feature->core->pool.back()); feature->core->pool.pop_back(); }
@@ -461,21 +498,28 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
     call->ret[1] = 0x80070057; return true;
   }
   [command useResidencySet:resources.residency];
+  // Conversions read only app inputs and write disjoint scratch, so one encoder
+  // behind one fence wait needs no intra-encoder barrier.
+  id<MTL4ComputeCommandEncoder> prepass = nil;
   for (size_t i = 0; i < Count; ++i) {
     if (i == 3 || !bound[i] || bound[i] == frame->inputs[i]) continue;
-    auto encoder = [command computeCommandEncoder];
-    if (!encoder) return true;
+    if (!prepass) {
+      prepass = [command computeCommandEncoder];
+      if (!prepass) return true;
+      [prepass waitForFence:fence beforeEncoderStages:MTLStageDispatch];
+    }
     [resources.table setTexture:frame->inputs[i].gpuResourceID atIndex:0];
     [resources.table setTexture:bound[i].gpuResourceID atIndex:1];
     [resources.table setAddress:resources.params.gpuAddress + i * 256 atIndex:0];
-    [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
     const auto sourceFormat = frame->inputs[i].pixelFormat;
     const bool depthSource = sourceFormat == MTLPixelFormatDepth16Unorm || sourceFormat == MTLPixelFormatDepth32Float ||
       sourceFormat == MTLPixelFormatDepth32Float_Stencil8 || sourceFormat == MTLPixelFormatDepth24Unorm_Stencil8;
-    [encoder setComputePipelineState:depthSource ? core.depthConversion : core.conversion];
-    [encoder setArgumentTable:resources.table];
-    [encoder dispatchThreads:MTLSizeMake(bound[i].width,bound[i].height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-    [encoder updateFence:fence afterEncoderStages:MTLStageDispatch]; [encoder endEncoding];
+    [prepass setComputePipelineState:depthSource ? core.depthConversion : core.conversion];
+    [prepass setArgumentTable:resources.table];
+    [prepass dispatchThreads:MTLSizeMake(bound[i].width,bound[i].height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+  }
+  if (prepass) {
+    [prepass updateFence:fence afterEncoderStages:MTLStageDispatch]; [prepass endEncoding];
   }
   auto scaler = frame->generation->scaler;
   @try {

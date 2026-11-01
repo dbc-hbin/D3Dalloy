@@ -180,8 +180,6 @@ int main() { @autoreleasepool {
     if (variant == 4) { core.info.feature_flags &= ~2u; frame->rects[2] = p.output_rect = {0,0,256,256}; }
     if (variant == 6) frame->rects[2].x = 4;
     if (variant == 8) p.output_rect = {0,0,256,256}; // Upscaling still accepts input-resolution MV.
-    frame->generation = dxmt_rr::generation(core,p);
-    if (!frame->generation) return 1;
     const unsigned width = variant == 4 ? 256 : variant == 6 || variant == 7 ? 132 : 128;
     auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
       variant == 5 ? MTLPixelFormatRG32Float : MTLPixelFormatRG16Float
@@ -189,9 +187,13 @@ int main() { @autoreleasepool {
     d.storageMode = MTLStorageModePrivate; d.usage = usage;
     [frame->inputs[2] release]; frame->inputs[2] = [core.device newTextureWithDescriptor:d];
     if (!frame->inputs[2]) return 1;
+    auto formats = dxmt_rr::fixedFormats();
+    formats[2] = dxmt_rr::descriptorFormat(core,p,2,frame->inputs[2],frame->rects[2]);
+    frame->generation = dxmt_rr::generation(core,p,formats);
+    if (!frame->generation) return 1;
     dxmt_rr::Resources resources;
     std::array<id<MTLTexture>,dxmt_rr::Count> bound{};
-    const bool direct = variant == 0 || variant == 8;
+    const bool direct = variant == 0 || variant == 5 || variant == 8;
     if (!dxmtRRResources(frame,resources,bound) || (bound[2] == frame->inputs[2]) != direct ||
         (resources.textures[2] == nil) != direct) {
       std::fprintf(stderr,"OWNED_RR_MOTION_FAIL case=%u expected_direct=%u\n",variant,unsigned(direct));
@@ -202,5 +204,5 @@ int main() { @autoreleasepool {
   }
   descriptorReuse(frame->core);
   [frame release];
-  std::printf("OWNED_RR_MOTION_PASS cases=%u direct=2 conversion_required=7\n",cases);
+  std::printf("OWNED_RR_MOTION_PASS cases=%u direct=3 conversion_required=6\n",cases);
 } }
