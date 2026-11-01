@@ -21,7 +21,7 @@ static_assert(RR_BRIDGE_RESOURCE_COUNT == MTL_RAY_REGENERATION_RESOURCE_COUNT);
 static_assert(sizeof(rr_bridge_settings) == sizeof(MTL_RAY_REGENERATION_SETTINGS));
 struct State {
   std::mutex mutex;
-  rr_bridge_create_packet create{};
+  uint32_t version = 0;
   WMTRRSettings settings = WMTRRDefaultSettings();
   Com<IUnknown> identity;
   Com<IMTLD3D12RayRegenerationState> backend;
@@ -89,7 +89,7 @@ uint32_t create(rr_bridge_create_packet &packet) {
       packet.signals, packet.checkerboard, packet.flags};
   if (auto hr = extension->CreateRayRegenerationState(&desc, &state->backend); FAILED(hr) || !state->backend)
     return backendResult(FAILED(hr) ? hr : E_FAIL);
-  state->create = packet;
+  state->version = packet.version;
   std::lock_guard lock(g_mutex);
   packet.header.context = g_next++;
   g_contexts.emplace(packet.header.context, std::move(state));
@@ -108,7 +108,7 @@ uint32_t configure(rr_bridge_configure_packet &packet) {
   std::lock_guard lock(state->mutex);
   auto updated = state->settings;
   if (packet.key == 8) {
-    if (state->create.version != 0x00400000) return kParameter;
+    if (state->version != 0x00400000) return kParameter;
     updated.history_rejection_strength = packet.legacy_values[0];
     updated.normal_strength = packet.legacy_values[1];
     updated.stability_bias = packet.legacy_values[2];

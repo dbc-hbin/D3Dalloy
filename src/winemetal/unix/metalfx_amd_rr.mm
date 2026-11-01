@@ -152,7 +152,7 @@ Object pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString* name) {
 }
 
 struct Feature::Impl {
-    Object device, compiler, library, snapshotPipeline, geometryPipeline, unpackPipeline, filterPipeline;
+    Object device, compiler, snapshotPipeline, geometryPipeline, unpackPipeline, filterPipeline;
     Object neuralCommonPipeline, neuralPreparePipeline, neuralResolvePipeline, neuralResolveWritePipeline;
     Object resolvePipeline, resolveWritePipeline, historyFence;
     // Keeps the device cache entry alive while this feature exists.
@@ -391,24 +391,23 @@ std::shared_ptr<Feature> Feature::create(void* nativeDevice, void* nativeCompile
                 fail(error,ErrorCode::UnsupportedFeature,"RR requires MetalFX neural denoising at 1:1 scale"); return {};
             }
             NSError* nativeError = nil;
-            auto shared = deviceKernelLibrary(device,&nativeError);
-            if (shared) state->library = shared->library;
-            state->kernelLibrary = std::move(shared);
-            if (!state->library) {
+            state->kernelLibrary = deviceKernelLibrary(device,&nativeError);
+            if (!state->kernelLibrary) {
                 fail(error,ErrorCode::ResourceCreationFailed,nativeError ? nativeError.localizedDescription.UTF8String : "RR shader compilation failed"); return {};
             }
-            state->snapshotPipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_snapshot");
-            state->geometryPipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_geometry");
-            state->unpackPipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_unpack");
-            state->filterPipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_filter");
+            auto library = (id<MTLLibrary>)state->kernelLibrary->library.get();
+            state->snapshotPipeline = pipeline(device,library,@"rr_snapshot");
+            state->geometryPipeline = pipeline(device,library,@"rr_geometry");
+            state->unpackPipeline = pipeline(device,library,@"rr_unpack");
+            state->filterPipeline = pipeline(device,library,@"rr_filter");
             if (needsNeural) {
-                state->neuralCommonPipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_neural_common");
-                state->neuralPreparePipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_neural_prepare");
-                state->neuralResolvePipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_neural_resolve");
-                state->neuralResolveWritePipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_neural_resolve_write");
+                state->neuralCommonPipeline = pipeline(device,library,@"rr_neural_common");
+                state->neuralPreparePipeline = pipeline(device,library,@"rr_neural_prepare");
+                state->neuralResolvePipeline = pipeline(device,library,@"rr_neural_resolve");
+                state->neuralResolveWritePipeline = pipeline(device,library,@"rr_neural_resolve_write");
             }
-            state->resolvePipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_resolve");
-            state->resolveWritePipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_resolve_write");
+            state->resolvePipeline = pipeline(device,library,@"rr_resolve");
+            state->resolveWritePipeline = pipeline(device,library,@"rr_resolve_write");
             id<MTLFence> fence = [device newFence];
             state->historyFence = Object(fence); [fence release];
             auto tileFits = [](const Object& pipeline) {

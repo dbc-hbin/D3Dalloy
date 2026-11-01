@@ -49,8 +49,6 @@ struct Core {
   id<MTLDevice> device = nil;
   id<MTL4Compiler> compiler = nil;
   std::shared_ptr<const Pipelines> pipelines;
-  id<MTLComputePipelineState> conversion = nil; // borrowed from pipelines
-  id<MTLComputePipelineState> depthConversion = nil; // borrowed from pipelines
   WMTMetal4FXTemporalInfo info{};
   std::mutex mutex;
   std::array<std::shared_ptr<Generation>, 8> generations{};
@@ -361,7 +359,6 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     core->device = [device retain]; core->compiler = [compiler retain];
     core->pipelines = devicePipelines(device);
     if (!core->pipelines) { call->ret[1] = 0x8007000e; return true; }
-    core->conversion = core->pipelines->conversion; core->depthConversion = core->pipelines->depthConversion;
     auto holder = [D3DALLOYRRFeature new]; holder->core = std::move(core);
     call->ret[0] = uintptr_t(holder); call->ret[1] = 0;
     return true;
@@ -514,7 +511,7 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     const auto sourceFormat = frame->inputs[i].pixelFormat;
     const bool depthSource = sourceFormat == MTLPixelFormatDepth16Unorm || sourceFormat == MTLPixelFormatDepth32Float ||
       sourceFormat == MTLPixelFormatDepth32Float_Stencil8 || sourceFormat == MTLPixelFormatDepth24Unorm_Stencil8;
-    [prepass setComputePipelineState:depthSource ? core.depthConversion : core.conversion];
+    [prepass setComputePipelineState:depthSource ? core.pipelines->depthConversion : core.pipelines->conversion];
     [prepass setArgumentTable:resources.table];
     [prepass dispatchThreads:MTLSizeMake(bound[i].width,bound[i].height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
   }
@@ -565,7 +562,7 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
         [resources.table setTexture:frame->inputs[3].gpuResourceID atIndex:1];
         [resources.table setAddress:resources.params.gpuAddress + Count * 256 atIndex:0];
         [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
-        [encoder setComputePipelineState:core.conversion]; [encoder setArgumentTable:resources.table];
+        [encoder setComputePipelineState:core.pipelines->conversion]; [encoder setArgumentTable:resources.table];
         [encoder dispatchThreads:MTLSizeMake(outputParams.width,outputParams.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
         [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
       }

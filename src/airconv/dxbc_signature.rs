@@ -13,7 +13,7 @@ enum Error {
     RegisterOrder = 5,
     StreamOrder = 6,
 }
-type Result<T, E = Error> = core::result::Result<T, E>;
+type Result<T> = core::result::Result<T, Error>;
 
 #[derive(Clone, Copy)]
 enum Format {

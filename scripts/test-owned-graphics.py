@@ -2344,6 +2344,99 @@ def depth_srv_dispatch_ordered(stderr: str) -> bool:
         "native_compute_wait" in events or "native_compute_queue_barrier" in events)
 
 
+def render_pass_discard_failures(stdout: str, stderr: str) -> list[str]:
+    """Check native descriptor stores, encoder retirement and the preserved MRT oracle."""
+    prefix = "OWNED_D3D12_RENDER_PASSES_FINAL_DISCARD"
+    expected_phases = [(suspended, replay) for suspended in range(2) for replay in range(2)]
+    expected_pixels = [
+        f"{prefix} suspended={suspended} replay={replay} color=ff003000 pixels=16 depth_test=1 stencil_test=1"
+        for suspended, replay in expected_phases]
+    failures = []
+    if [line for line in stdout.splitlines() if line.startswith(prefix + " ")] != expected_pixels:
+        failures.append("final discard GPU preservation matrix differs")
+    active = None
+    phases, renders, ends, completed, attachments = [], [], [], set(), []
+    native_pattern = re.compile(
+        r"OWNED_GRAPHICS_NATIVE_RENDER_ATTACHMENT encoder=(\d+) aspect=(\d+) slot=(\d+) "
+        r"texture=(\d+) load=(\d+) store=(\d+)")
+    for line in stderr.splitlines():
+        marker = re.fullmatch(re.escape(prefix) + r"_PHASE (begin|end) suspended=([01]) replay=([01])", line)
+        if marker:
+            key = (int(marker[2]), int(marker[3]))
+            if marker[1] == "begin":
+                if active is not None:
+                    failures.append("final discard nested execution phase")
+                active = key
+                phases.append(key)
+                renders, ends, completed, attachments = [], [], set(), []
+            else:
+                if active != key:
+                    failures.append("final discard execution phase mismatch")
+                count = 3 if key[0] else 2
+                identities = [record[0] for record in renders]
+                if (len(renders) != count or len(set(identities)) != count or attachments or
+                        [identity[1:] for identity in identities] != ends):
+                    failures.append("final discard native encoder begin/end sequence differs")
+                textures = None
+                for index, (identity, rows) in enumerate(renders):
+                    stores = (0, 1, 0, 0) if index == count - 1 else (1, 1, 1, 1)
+                    expected = [(4, 0, 1, stores[0]), (4, 1, 1, stores[1]),
+                                (1, 0, 1, stores[2]), (2, 0, 1, stores[3])]
+                    if [(row[1], row[2], row[4], row[5]) for row in rows] != expected:
+                        failures.append("final discard native color/depth/stencil store actions differ")
+                    if len({row[0] for row in rows}) != 1 or any(row[0] <= 0 or row[3] <= 0 for row in rows):
+                        failures.append("final discard native attachment owner missing")
+                    current_textures = [row[3] for row in rows]
+                    if textures is not None and current_textures != textures:
+                        failures.append("final discard native attachment identity changed across split")
+                    textures = current_textures
+                    if identity[:2] not in completed:
+                        failures.append("final discard native render submission did not retire")
+                active = None
+            continue
+        if active is None:
+            continue
+        if line.startswith("OWNED_GRAPHICS_NATIVE_RENDER_ATTACHMENT"):
+            row = native_pattern.fullmatch(line)
+            if row is None:
+                failures.append("final discard malformed native attachment trace")
+            else:
+                attachments.append(tuple(int(value) for value in row.groups()))
+        elif "OWNED_GRAPHICS_TRACE " in line:
+            try:
+                event = json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+            except ValueError:
+                failures.append("final discard malformed recording trace")
+                continue
+            if not isinstance(event, dict):
+                failures.append("final discard non-object recording trace")
+                continue
+            identity = (event.get("queue"), event.get("submission"), event.get("encoder"))
+            if event.get("event") == "native_render_begin":
+                if (any(type(value) is not int or value <= 0 for value in identity) or
+                        type(event.get("members")) is not int or event.get("members") != 1 or
+                        type(event.get("begin_count")) is not int or event.get("begin_count") != 1):
+                    failures.append("final discard native render identity differs")
+                    attachments = []
+                    continue
+                renders.append((identity, attachments))
+                attachments = []
+            elif event.get("event") == "native_render_end":
+                if (any(type(value) is not int or value <= 0 for value in identity[1:]) or
+                        type(event.get("end_count")) is not int or event.get("end_count") != 1):
+                    failures.append("final discard native encoder end count differs")
+                    continue
+                ends.append(identity[1:])
+            elif event.get("event") == "complete" and event.get("status") == 4:
+                if any(type(value) is not int or value <= 0 for value in identity[:2]):
+                    failures.append("final discard invalid retirement identity")
+                    continue
+                completed.add(identity[:2])
+    if active is not None or phases != expected_phases:
+        failures.append("final discard execution phase matrix differs")
+    return failures
+
+
 def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
     """Require the fixture oracle and actual native calls inside retired Execute intervals."""
     # phase: replays, ordered begin members, mapped members, identity calls, blits,
@@ -3499,11 +3592,12 @@ def multiqueue_submission_failures(events: list[dict]) -> list[str]:
 
 def render_passes_output_matches(stdout: str, stderr: str, success: bool) -> bool:
     success = (success
-               and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 40
+               and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 42
                and all(stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_CASE_PASS case=" + case) == 1
                        for case in ("graph-frontier-256", "graph-frontier-512",
                                     "graph-frontier-overlap-group-boundary", "graph-frontier-delayed-clear-boundary",
-                                    "graph-cross-execute-producer", "depth-clear-srv-compute-read"))
+                                    "graph-cross-execute-producer", "depth-clear-srv-compute-read",
+                                    "final-discard-query-split", "final-discard-suspend-resume"))
                and "OWNED_D3D12_RENDER_PASSES_DEPTH_SRV depth=3f400000 exact=1" in stdout
                and depth_srv_dispatch_ordered(stderr)
                and all(f"OWNED_D3D12_RENDER_PASSES_CROSS_EXECUTE replay={replay} word=13579bdf exact=1" in stdout
@@ -3526,7 +3620,7 @@ def render_passes_output_matches(stdout: str, stderr: str, success: bool) -> boo
                and "OWNED_D3D12_RENDER_PASSES_SUSPEND_RESUME pixel=ff204010" in stdout
                and "OWNED_D3D12_RENDER_PASSES_VALIDATION_PASS rejected=10 conformant_barrier=1" in stdout
                and "OWNED_D3D12_RENDER_PASSES_UINT_BORDER b0000=0000 b0001=0001 b1111=1111" in stdout
-               and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=40") == 1
+               and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=42") == 1
                and "_FAIL" not in stdout)
     return success
 
@@ -5095,6 +5189,8 @@ def run(args: argparse.Namespace) -> int:
     validation_errors.extend(core_load_evidence["failures"])
     if args.suite in ("render-passes", "enhanced-barriers", "execution-safety"):
         validation_errors.extend(execution_graph_failures(stdout, stderr, args.suite))
+    if args.suite == "render-passes":
+        validation_errors.extend(render_pass_discard_failures(stdout, stderr))
     if agility_inputs is not None:
         validation_errors.extend(agility_failures(stdout, stderr, frozen / "sdk-owned/d3d12core.dll", agility_inputs["generation"], runtime / agility_inputs["source"]))
     if corewindow_evidence is not None:

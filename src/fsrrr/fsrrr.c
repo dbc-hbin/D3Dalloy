@@ -48,11 +48,6 @@ static ffxReturnCode_t finish(ffxReturnCode_t result)
     return result;
 }
 
-static ffxReturnCode_t backend_call(void *packet)
-{
-    return rr_backend_call(packet);
-}
-
 static void init_packet(struct rr_packet_header *header, uint32_t size,
                         uint32_t operation, const struct rr_context *context)
 {
@@ -189,7 +184,7 @@ ffxReturnCode_t ffxCreateContext(ffxContext *output, ffxCreateContextDescHeader 
     packet.signals = context->signals = create->signalFlags;
     packet.checkerboard = context->checkerboard = create->checkerboardSignalFlags;
     packet.flags = context->flags = create->flags;
-    result = backend_call(&packet);
+    result = rr_backend_call(&packet);
     if (result || !packet.header.context)
     {
         if (context->allocation.dealloc) context->allocation.dealloc(context->allocation.pUserData, context);
@@ -225,7 +220,7 @@ ffxReturnCode_t ffxDestroyContext(ffxContext *handle, const ffxAllocationCallbac
         return finish(FFX_API_RETURN_ERROR_PARAMETER);
     }
     init_packet(&packet, sizeof(packet), RR_BRIDGE_DESTROY, context);
-    result = backend_call(&packet);
+    result = rr_backend_call(&packet);
     if (!result) { *link = context->next; *handle = NULL; }
     ReleaseSRWLockExclusive(&contexts_lock);
     if (!result)
@@ -279,7 +274,7 @@ ffxReturnCode_t ffxConfigure(ffxContext *handle, const ffxConfigureDescHeader *d
         packet.key = 8;
         memcpy(packet.legacy_values, &old->settings.historyRejectionStrength, sizeof(packet.legacy_values));
         init_packet(&packet.header, sizeof(packet), RR_BRIDGE_CONFIGURE, context);
-        result = backend_call(&packet);
+        result = rr_backend_call(&packet);
         return finish_context(context, result);
     }
     config = (const void *)desc;
@@ -294,7 +289,7 @@ ffxReturnCode_t ffxConfigure(ffxContext *handle, const ffxConfigureDescHeader *d
         return finish_context(context, FFX_API_RETURN_ERROR_PARAMETER);
     }
     init_packet(&packet.header, sizeof(packet), RR_BRIDGE_CONFIGURE, context);
-    result = backend_call(&packet);
+    result = rr_backend_call(&packet);
     return finish_context(context, result);
 }
 
@@ -353,7 +348,7 @@ ffxReturnCode_t ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
         {
             struct rr_legacy_memory *query = (void *)desc;
             if (!query->gpuMemoryUsage) result = FFX_API_RETURN_ERROR_PARAMETER;
-            else if (!(result = backend_call(&packet)))
+            else if (!(result = rr_backend_call(&packet)))
             {
                 query->gpuMemoryUsage->totalUsageInBytes = packet.total_bytes;
                 query->gpuMemoryUsage->aliasableUsageInBytes = packet.aliasable_bytes;
@@ -371,7 +366,7 @@ ffxReturnCode_t ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
                 for (i = 0; i < 5; ++i)
                 {
                     packet.key = i + 1;
-                    if ((result = backend_call(&packet))) break;
+                    if ((result = rr_backend_call(&packet))) break;
                     fields[i] = packet.value[0];
                 }
                 if (!result)
@@ -393,7 +388,7 @@ ffxReturnCode_t ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
             else
             {
                 packet.key = query->key;
-                if (!(result = backend_call(&packet))) memcpy(query->data, packet.value, sizeof(float));
+                if (!(result = rr_backend_call(&packet))) memcpy(query->data, packet.value, sizeof(float));
             }
         }
         goto query_done;
@@ -419,7 +414,7 @@ ffxReturnCode_t ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
         if (!context || query->key < 1 || query->key > 7 || query->count != 1 || !query->data)
         { result = FFX_API_RETURN_ERROR_PARAMETER; break; }
         packet.key = query->key;
-        result = backend_call(&packet);
+        result = rr_backend_call(&packet);
         if (!result) memcpy(query->data, packet.value, query->key == 7 ? sizeof(packet.value) : sizeof(float));
         break;
     }
@@ -436,7 +431,7 @@ ffxReturnCode_t ffxQuery(ffxContext *handle, ffxQueryDescHeader *desc)
         packet.signals = context ? context->signals : query->signalFlags;
         packet.checkerboard = context ? context->checkerboard : query->checkerboardSignalFlags;
         packet.flags = context ? context->flags : query->flags;
-        result = backend_call(&packet);
+        result = rr_backend_call(&packet);
         if (!result)
         {
             query->gpuMemoryUsage->totalUsageInBytes = packet.total_bytes;
@@ -571,7 +566,7 @@ static ffxReturnCode_t dispatch_current(ffxContext *handle, const ffxDispatchDes
         packet.debug_mode = debug->mode;
         packet.debug_viewport = debug->viewportIndex;
     }
-    result = backend_call(&packet);
+    result = rr_backend_call(&packet);
 done:
     return finish_context(context, result);
 }

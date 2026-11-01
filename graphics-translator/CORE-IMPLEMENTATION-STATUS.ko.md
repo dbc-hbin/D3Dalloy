@@ -22,6 +22,46 @@
 
 현재 판정에 필요한 runtime033–044의 실패/성공 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)에 남긴다. 과거 paused/resumed 실행 지시와 중복 인수인계는 삭제했다. 최신 상태를 과거 실패로 되돌리거나 보존된 PASS를 현재 변경의 재검증으로 바꾸지 않는다. Agility SDK617/618의 owned Core/Main identity·inbox/SxS 정책은 유지하며 다른 package나 실제 게임의 전체 호환성을 주장하지 않는다.
 
+## 최근 최적화 리뷰와 정리 — 2026-11-02
+
+`9668acb..8db14be`의 최근 최적화 묶음을 이름 전환 후 `b29fb60`의 호출 경로와 대조했다.
+Rust 파서·기록/제출·fence·Private storage·SR/FG/RR·async PSO·stage eviction·IFT·FSR
+presentation을 검토했으며, P0–P2 정확성 결함은 확인하지 못했고 최종 render store 생략이
+적용되지 않는 P3 항목 하나를 수정했다. 정적 리뷰가 모든 게임이나 성능 수치를 입증하는 것은 아니다.
+
+- **최종 DISCARD:** `PreDraw`의 `DontCare` 설정이 attachment 초기화의 `Store`로 덮이던 것을
+  제거했다. `BeginRenderPass`가 기록한 allocator-owned 경계 이후만 검사하고, suspend가 아닌
+  `EndRenderPass`에서 마지막 render record에만 color/depth/stencil discard를 적용한다.
+  중간 query split과 suspended pass는 `Store`를 유지하며 resolve source 계약은 바꾸지 않았다.
+- **실제 native 회귀:** 이전 runtime에서는 마지막 color0도 `store=1`이었다.
+  새 runtime의 `render-passes` 42개 case는 API·Shader Validation으로 통과했다.
+  query split과 suspend/resume 두 경우를 각각 두 번 replay하며, 중간 attachment는
+  `(color0,color1,depth,stencil)=(1,1,1,1)`, 마지막은 `(0,1,0,0)`임을 실제 Metal descriptor로 확인한다.
+  보존 MRT의 16개 pixel `ff003000`도 depth/stencil 검사를 포함해 일치한다.
+- **동작 보존 정리:** FSR RR의 단순 전달 함수와 사용하지 않는 create packet 복사를 제거했다.
+  AMD RR shader library의 중복 소유 필드, NGX RR conversion pipeline의 borrowed 별칭을 제거하고
+  기존 shared owner를 직접 사용한다. Rust 파서 8개 모듈의 private `Result` alias는 실제 사용하는
+  모듈별 `Error`만 받도록 단순화했다. 공개 ABI·packet layout·경계 검증·GPU retirement 소유권은 유지한다.
+- **빌드·CPU 증거:** ARM64X DLL 11개와 native ARM64/WoW64 package·staging이 통과했다.
+  파서 ASan/UBSan 173개 검사, cache/codec/concurrency CPU probe, recording allocation-failure
+  probe와 diagnostics 114개 검사가 통과했다. 새로운 테스트 삭제나 검사 완화는 없다.
+- **GPU 회귀:** native ARM64 Wine/FEX x64와 API·Shader Validation에서 render-passes를 포함한
+  18개 suite가 통과했다. copy/resolve·barrier·execution safety·query·multiqueue·fence·pipeline
+  library·presentation·HDR·colorspace·fullscreen·FSR RR·temporal·NGX RR/FG를 포함한다.
+- **FSR FG 표시 증거는 미해결:** 동일 fixture/observer로 수정 runtime 3회 중 2회가 통과했고,
+  1회는 첫 wrapped UI drawable(sequence 20)의 `presentedTime=0` 때문에 timestamp 검사에서
+  실패했다. 해당 drawable의 캡처 pixel은 맞았지만 실제 표시를 입증하지 못했다.
+  기준 `b29fb60` runtime은 같은 3회 모두 통과했으므로 기존 실패라고 단정하지 않는다.
+  [Metal 계약](https://developer.apple.com/documentation/metal/mtldrawable/presentedtime)은
+  미표시·drop된 frame의 0을 허용하지만, 그것만으로 이번 누락의 원인을 설명하거나
+  전체 표시 검증을 PASS로 바꿀 수 없다. 실패 결과와 검사 조건을 그대로 보존했다.
+
+증거 root는 `build/local/optimization-review-20261102`다. `final-discard-before`는 기준 runtime의
+불필요한 store를, `final-discard-after`는 수정 후 native store와 pixel 보존을 기록한다.
+새 native attachment 관찰은 기존 trace가 켜졌을 때만 실행한다. 실제 게임 FPS·로딩시간 개선은
+측정하지 않았으며, async compute held-worker·반복 allocator reset의 IFT identity·FSR RR의 모든
+checkerboard/signal 조합을 이번 실행으로 완전 검증했다고 주장하지 않는다.
+
 ## ZZZ 실측과 측정 기반 후속 — 2026-11-02
 
 **상태: 격리 ZZZ 복제본에서 counter를 수집했고, 그중 근거가 선 셰이더·storage 변경을 적용했다. 도시 진입 측정과 FPS 비교는 못 했다.** 원본 게임과 live prefix는 바꾸지 않았다. `Yaagl ZZZ OS Test` prefix와 게임을 APFS로 복제하고 ARM64X/FEX x64 runtime에 임시 counter를 넣어 실행했다(증거 `build/local/zzz-measure-20261102`, counter는 커밋하지 않음).

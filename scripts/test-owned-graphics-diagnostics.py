@@ -363,6 +363,65 @@ class RunnerFailures(unittest.TestCase):
                 self.assertTrue(runner.pipeline_artifact_failures(
                     text.replace("specialize_function", "new_library"), suite))
 
+    def test_render_pass_final_discard_requires_native_stores_and_preserved_pixels(self):
+        # Controlled native/queue protocol input, not observed GPU evidence.
+        prefix = "OWNED_D3D12_RENDER_PASSES_FINAL_DISCARD"
+        output, trace = [], []
+        serial = 0
+        for suspended in range(2):
+            for replay in range(2):
+                submission = 100 + 2 * suspended + replay
+                output.append(f"{prefix} suspended={suspended} replay={replay} color=ff003000 "
+                              "pixels=16 depth_test=1 stencil_test=1")
+                trace.append(f"{prefix}_PHASE begin suspended={suspended} replay={replay}")
+                count = 3 if suspended else 2
+                for index in range(count):
+                    serial += 1
+                    stores = (0, 1, 0, 0) if index == count - 1 else (1, 1, 1, 1)
+                    for (aspect, slot, texture), store in zip(
+                            ((4, 0, 700), (4, 1, 701), (1, 0, 702), (2, 0, 702)), stores):
+                        trace.append(f"OWNED_GRAPHICS_NATIVE_RENDER_ATTACHMENT encoder={900 + serial} "
+                                     f"aspect={aspect} slot={slot} texture={texture} load=1 store={store}")
+                    trace.append("OWNED_GRAPHICS_TRACE " + json.dumps(
+                        dict(event="native_render_begin", queue=9, submission=submission, encoder=serial,
+                             members=1, begin_count=1)))
+                    trace.append("OWNED_GRAPHICS_TRACE " + json.dumps(
+                        dict(event="native_render_end", submission=submission, encoder=serial, end_count=1)))
+                trace.append("OWNED_GRAPHICS_TRACE " + json.dumps(
+                    dict(event="complete", queue=9, submission=submission, status=4)))
+                trace.append(f"{prefix}_PHASE end suspended={suspended} replay={replay}")
+        stdout, stderr = "\n".join(output), "\n".join(trace)
+        self.assertEqual(runner.render_pass_discard_failures(stdout, stderr), [])
+        for index, row in enumerate(trace):
+            with self.subTest(missing_row=index):
+                self.assertTrue(runner.render_pass_discard_failures(
+                    stdout, "\n".join(trace[:index] + trace[index + 1:])))
+            if row.startswith("OWNED_GRAPHICS_NATIVE_RENDER_ATTACHMENT "):
+                store = int(row.rsplit("=", 1)[1])
+                mutations = [
+                    row.rsplit("=", 1)[0] + f"={1 - store}",
+                    row.replace("load=1", "load=0"),
+                    row.replace("encoder=", "ignored="),
+                    row.replace("texture=70", "texture=80"),
+                    row + "\n" + row,
+                    "OWNED_GRAPHICS_TRACE " + json.dumps(
+                        dict(event="native_render_attachment", slot=0, load=1, store=store))]
+                for changed in mutations:
+                    with self.subTest(native_row=index, changed=changed):
+                        self.assertTrue(runner.render_pass_discard_failures(
+                            stdout, "\n".join(trace[:index] + [changed] + trace[index + 1:])))
+        for row in output:
+            with self.subTest(pixel_row=row):
+                self.assertTrue(runner.render_pass_discard_failures(stdout.replace(row, ""), stderr))
+                self.assertTrue(runner.render_pass_discard_failures(
+                    stdout.replace(row, row.replace("color=ff003000", "color=ff001000")), stderr))
+        self.assertTrue(runner.render_pass_discard_failures(stdout, stderr.replace('"status": 4', '"status": 5')))
+        recording_row = next(row for row in trace if '"native_render_begin"' in row)
+        for malformed in ("[]", "{", '{"event":"native_render_begin","queue":[]}'):
+            with self.subTest(malformed=malformed):
+                self.assertTrue(runner.render_pass_discard_failures(
+                    stdout, stderr.replace(recording_row, "OWNED_GRAPHICS_TRACE " + malformed, 1)))
+
     def test_execution_graph_requires_gpu_values_and_retired_native_operations(self):
         # Independent log input from the frozen ExecutionGraph fixture/oracle, not
         # runner-owned expectations. The generator emits records, never verifies them.

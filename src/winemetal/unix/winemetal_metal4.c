@@ -1290,8 +1290,19 @@ int32_t winemetal_metal4_call(void *params) {
        * A Fragment-only wait therefore cannot protect a preceding GPU read. */
       if (descriptor.visibilityResultBuffer && descriptor.visibilityResultType==MTLVisibilityResultTypeReset)
         context->fenceWaitStages=MTLStageVertex|MTLStageObject|MTLStageMesh;
-      context->encoder=[[owner->command renderCommandEncoderWithDescriptor:descriptor] retain]; [descriptor release];
-      if (!context->encoder) { [context release]; return M4_FAILED; }
+      context->encoder=[[owner->command renderCommandEncoderWithDescriptor:descriptor] retain];
+      if (!context->encoder) { [descriptor release]; [context release]; return M4_FAILED; }
+      if (owner->recording->trace) {
+        for (unsigned i=0;i<10;++i) {
+          MTLRenderPassAttachmentDescriptor *attachment=i<8 ? descriptor.colorAttachments[i] :
+              i==8 ? descriptor.depthAttachment : descriptor.stencilAttachment;
+          if (!attachment.texture) continue;
+          fprintf(stderr,"OWNED_GRAPHICS_NATIVE_RENDER_ATTACHMENT encoder=%llu aspect=%u slot=%u texture=%llu load=%u store=%u\n",
+              (unsigned long long)(uintptr_t)context->encoder,i<8?4u:i==8?1u:2u,i<8?i:0u,
+              (unsigned long long)(uintptr_t)attachment.texture,(unsigned)attachment.loadAction,(unsigned)attachment.storeAction);
+        }
+      }
+      [descriptor release];
       [owner->recording->encoders addObject:context]; call->ret[0]=(uint64_t)context; [context release]; return M4_SUCCESS;
     }
     case WMTMetal4ComputeEncoder: {

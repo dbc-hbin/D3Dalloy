@@ -15,7 +15,7 @@ enum Error {
     UnknownType = 3,
     Duplicate = 4,
 }
-type Result<T, E = Error> = core::result::Result<T, E>;
+type Result<T> = core::result::Result<T, Error>;
 
 // Revisions of one state share a definition: depth-stencil 0/1/2, rasterizer
 // 0/1/2, and root signature object/serialized blob.

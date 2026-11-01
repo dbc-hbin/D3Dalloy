@@ -263,7 +263,7 @@ struct Draw {
   ComPtr<ID3D12RootSignature> root;
   ComPtr<ID3D12PipelineState> pso;
   Draw(ID3D12Device *dev, DXGI_FORMAT rt, DXGI_FORMAT ds, UINT samples, const char *ps, bool additive,
-       bool depth_write = false, UINT rootConstants = 6, bool uav = false, bool srv = false, UINT rtCount = 1, bool table = false, bool cbv = false, bool vertex_uav = false) {
+       bool depth_write = false, UINT rootConstants = 6, bool uav = false, bool srv = false, UINT rtCount = 1, bool table = false, bool cbv = false, bool vertex_uav = false, bool stencil_test = false) {
     D3D12_ROOT_PARAMETER param{};
     param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     param.Constants.Num32BitValues = rootConstants;
@@ -298,6 +298,12 @@ struct Draw {
       pd.DepthStencilState.DepthEnable = TRUE;
       pd.DepthStencilState.DepthWriteMask = depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
       pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    }
+    if (stencil_test) {
+      pd.DepthStencilState.StencilEnable = TRUE;
+      pd.DepthStencilState.StencilReadMask = pd.DepthStencilState.StencilWriteMask = 0xff;
+      pd.DepthStencilState.FrontFace = pd.DepthStencilState.BackFace =
+          {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_EQUAL};
     }
     check(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)), "CreateGraphicsPipelineState");
   }
@@ -1412,6 +1418,87 @@ void suspendResume() {
   pass("suspend-resume-across-lists");
 }
 
+// Only the final native encoder may discard. The preserved MRT observes color,
+// depth and stencil across a query split and, optionally, a suspended list.
+void finalStoreDiscard(bool suspended) {
+  Context c;
+  constexpr auto fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+  constexpr auto depthFmt = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+  std::array<ComPtr<ID3D12Resource>, 2> targets;
+  for (auto &target : targets)
+    target = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
+        texDesc(fmt, 4, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
+  D3D12_CLEAR_VALUE clearDepth{depthFmt};
+  clearDepth.DepthStencil = {0.75f, 0x22};
+  auto ds = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
+      texDesc(depthFmt, 4, 4, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL), D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearDepth);
+  ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap;
+  D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  check(c.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtvHeap)), "Create(discard-rtvs)");
+  const auto firstRtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+  const auto stride = c.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[] = {firstRtv, {firstRtv.ptr + stride}};
+  for (UINT i = 0; i < 2; ++i) c.dev->CreateRenderTargetView(targets[i].Get(), nullptr, rtvs[i]);
+  const auto dsv = descriptor(c.dev.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, dsvHeap);
+  c.dev->CreateDepthStencilView(ds.Get(), nullptr, dsv);
+  ComPtr<ID3D12QueryHeap> query;
+  D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0};
+  check(c.dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&query)), "Create(discard-query)");
+  Draw draw(c.dev.Get(), fmt, depthFmt, 1, "psGraphMrt", true, true, 6, false, false, 2,
+            false, false, false, true);
+  auto initial = c.list(), a = c.list(), b = c.list(), read = c.list();
+  const float black[] = {0, 0, 0, 1};
+  for (auto rtv : rtvs) initial.list->ClearRenderTargetView(rtv, black, 0, nullptr);
+  initial.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.75f, 0x22, 0, nullptr);
+  D3D12_RENDER_PASS_RENDER_TARGET_DESC colors[] = {
+      rtAccess(rtvs[0], D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE, D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD),
+      rtAccess(rtvs[1], D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE, D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE)};
+  D3D12_RENDER_PASS_DEPTH_STENCIL_DESC depth{};
+  depth.cpuDescriptor = dsv;
+  depth.DepthBeginningAccess.Type = depth.StencilBeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
+  depth.DepthEndingAccess.Type = depth.StencilEndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD;
+  a.list->BeginRenderPass(2, colors, &depth,
+      suspended ? D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS : D3D12_RENDER_PASS_FLAG_NONE);
+  a.list->OMSetStencilRef(0x22);
+  const float first[] = {16 / 255.0f, 0, 0, 0}, rejected[] = {64 / 255.0f, 0, 0, 0}, last[] = {32 / 255.0f, 0, 0, 0};
+  draw.draw(a.list.Get(), 4, 4, first, 0.25f);
+  a.list->EndQuery(query.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+  draw.draw(a.list.Get(), 4, 4, rejected, 0.5f);
+  auto *final = a.list.Get();
+  if (suspended) {
+    a.list->EndRenderPass();
+    b.list->BeginRenderPass(2, colors, &depth, D3D12_RENDER_PASS_FLAG_RESUMING_PASS);
+    b.list->OMSetStencilRef(0x22);
+    final = b.list.Get();
+  }
+  draw.draw(final, 4, 4, last, 0.125f);
+  // EndRenderPass must find the recorded render even with a non-render tail.
+  final->EndQuery(query.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+  final->EndRenderPass();
+  transition(read.list.Get(), targets[1].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  const auto out = copyOut(c.dev.Get(), read.list.Get(), targets[1].Get());
+  transition(read.list.Get(), targets[1].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  for (auto *l : {initial.list.Get(), a.list.Get(), b.list.Get(), read.list.Get()})
+    check(l->Close(), "Close(final-discard)");
+  std::vector<ID3D12CommandList *> batch{a.list.Get()};
+  if (suspended) batch.push_back(b.list.Get());
+  batch.push_back(read.list.Get());
+  for (UINT replay = 0; replay < 2; ++replay) {
+    c.executeSealed({initial.list.Get()});
+    std::fprintf(stderr, "%s_FINAL_DISCARD_PHASE begin suspended=%u replay=%u\n", kPrefix, unsigned(suspended), replay);
+    std::fflush(stderr);
+    c.executeSealed(batch);
+    std::fprintf(stderr, "%s_FINAL_DISCARD_PHASE end suspended=%u replay=%u\n", kPrefix, unsigned(suspended), replay);
+    std::fflush(stderr);
+    for (UINT y = 0; y < 4; ++y)
+      for (UINT x = 0; x < 4; ++x)
+        if (out.at<uint32_t>(x, y) != 0xff003000u) fail("final-discard-preservation");
+    std::printf("%s_FINAL_DISCARD suspended=%u replay=%u color=ff003000 pixels=16 depth_test=1 stencil_test=1\n",
+        kPrefix, unsigned(suspended), replay);
+  }
+  pass(suspended ? "final-discard-suspend-resume" : "final-discard-query-split");
+}
+
 // Spec validation: nesting, End without Begin, Close inside a pass, disallowed APIs inside a pass,
 // UAV barriers and write-state transitions of pass surfaces, and suspend followed by GPU work.
 void validation() {
@@ -1784,6 +1871,8 @@ int main() {
   discardAndDepthClear();
   resolveModes();
   suspendResume();
+  finalStoreDiscard(false);
+  finalStoreDiscard(true);
   validation();
   gpuUploadHeap();
   capabilities();

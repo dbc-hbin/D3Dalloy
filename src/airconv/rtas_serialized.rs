@@ -35,7 +35,7 @@ enum Error {
     InvalidArgument = 1,
     InvalidData = 2,
 }
-type Result<T, E = Error> = core::result::Result<T, E>;
+type Result<T> = core::result::Result<T, Error>;
 
 #[derive(Clone, Copy)]
 #[repr(C)]

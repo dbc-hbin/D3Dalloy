@@ -65,7 +65,7 @@ enum Error {
     VersionMismatch = 2,
 }
 
-type Result<T, E = Error> = core::result::Result<T, E>;
+type Result<T> = core::result::Result<T, Error>;
 
 fn header(bytes: &[u8], length: u64) -> Result<()> {
     if bytes.len() < HEADER_SIZE as usize || u64_at(bytes, 0) != Some(MAGIC) {

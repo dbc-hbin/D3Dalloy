@@ -16,7 +16,7 @@ enum Error {
     InvalidData = 2,
     OutputSize = 3,
 }
-type Result<T, E = Error> = core::result::Result<T, E>;
+type Result<T> = core::result::Result<T, Error>;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

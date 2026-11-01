@@ -20,7 +20,7 @@ enum Error {
     Unsupported = 2,
     NotFound = 3,
 }
-type Result<T, E = Error> = core::result::Result<T, E>;
+type Result<T> = core::result::Result<T, Error>;
 
 #[derive(Clone, Copy)]
 #[repr(C)]

@@ -578,6 +578,8 @@ class MTLD3D12GraphicsCommandListImpl
   std::array<bool, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_pass_discard_colors_{};
   uint32_t render_pass_discard_color_count_ = 0;
   bool render_pass_discard_depth_ = false, render_pass_discard_stencil_ = false;
+  // Allocator-owned recorded boundary; encoder records stay stable until allocator Reset.
+  EncoderData *render_pass_recording_anchor_ = nullptr;
   // The last pass ended surfaces in PRESERVE_LOCAL_*: only pass setup may come before the next pass.
   bool render_pass_ends_local_ = false, render_pass_pending_local_ = false;
   bool render_pass_local_compute_ = false;
@@ -1533,6 +1535,7 @@ public:
 
   ~MTLD3D12GraphicsCommandListImpl() {
     // Releasing an unfinished list must release its allocator's recording slot.
+    render_pass_recording_anchor_ = nullptr;
     if (IsRecording())
       allocator_->EndRecord(&encoder_count);
   }
@@ -1579,6 +1582,7 @@ public:
     render_pass_discard_colors_.fill(false);
     render_pass_discard_color_count_ = 0;
     render_pass_discard_depth_ = render_pass_discard_stencil_ = false;
+    render_pass_recording_anchor_ = nullptr;
     render_pass_ends_local_ = render_pass_pending_local_ = render_pass_local_compute_ = false;
     render_pass_suspended_ = false;
     render_pass_resolves_.clear();
@@ -2722,10 +2726,6 @@ public:
       render->dsv_readonly_flags = 0;
       render->render_target_count = num_rtvs;
       render->render_pass_requires_fence = render_pass_active_;
-      for (UINT i = 0; i < render_pass_discard_color_count_; ++i)
-        if (render_pass_discard_colors_[i]) render->colors[i].store_action = WMTStoreActionDontCare;
-      if (render_pass_discard_depth_) render->depth.store_action = WMTStoreActionDontCare;
-      if (render_pass_discard_stencil_) render->stencil.store_action = WMTStoreActionDontCare;
       render->center_sample_pattern = center_sample_pattern;
       render->sample_positions = effective_positions;
       render->native_msaa_sample_count = NativeMSAA ? raster_samples : 0;
@@ -10899,8 +10899,8 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
    * BeginRenderPass binds every surface whose beginning access is bound for raster (DISCARD,
    * PRESERVE, CLEAR, PRESERVE_LOCAL_RENDER, and PRESERVE_LOCAL_SRV with a read-only DSV flag), in
    * order without gaps, as if by OMSetRenderTargets, then performs the CLEARs. EndRenderPass performs
-   * the RESOLVEs and unbinds the surfaces. DISCARD and PRESERVE need no work: discarded contents are
-   * undefined, so keeping them is conformant. A RESUMING pass continues the suspended pass of the
+   * the RESOLVEs, discards final stores, and unbinds the surfaces. Intermediate native encoders must
+   * store their attachments for later draws. A RESUMING pass continues the suspended pass of the
    * previous command list, so it skips its beginning loads, and a SUSPENDING pass skips its ending
    * resolves; the matching pass that finally ends the sequence repeats them (vkd3d-proton does the
    * same). The APIs the spec disallows inside a pass fail the recording (RejectInRenderPass).
@@ -11094,13 +11094,7 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       render_pass_discard_stencil_ = bind_stencil &&
           pDepthStencil->StencilEndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD;
     }
-    if (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render) {
-      auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
-      for (UINT i = 0; i < render_pass_discard_color_count_; ++i)
-        if (render_pass_discard_colors_[i]) render->colors[i].store_action = WMTStoreActionDontCare;
-      if (render_pass_discard_depth_) render->depth.store_action = WMTStoreActionDontCare;
-      if (render_pass_discard_stencil_) render->stencil.store_action = WMTStoreActionDontCare;
-    }
+    render_pass_recording_anchor_ = allocator_->encoder_current ? allocator_->encoder_current : allocator_->encoder_last;
     owned_graphics::Trace("render_pass_begin", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                           ",\"rtvs\":", bound_count, ",\"dsv\":", bind_depth, ",\"flags\":", UINT(Flags));
   } catch (const std::bad_alloc &) {
@@ -11129,6 +11123,20 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     const bool suspending = render_pass_flags_ & D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS;
     render_pass_internal_ = true;
     if (!suspending) {
+      // The last draw may already have ended its encoder (for example at a query).
+      // Inspect only this pass's stable recorded chain, not a saved mutable encoder.
+      RenderEncoderData *render = nullptr;
+      for (auto *record = render_pass_recording_anchor_->next; record; record = record->next)
+        if (record->type == EncoderType::Render)
+          render = static_cast<RenderEncoderData *>(record);
+      if (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render)
+        render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+      if (render) {
+        for (UINT i = 0; i < render_pass_discard_color_count_; ++i)
+          if (render_pass_discard_colors_[i]) render->colors[i].store_action = WMTStoreActionDontCare;
+        if (render_pass_discard_depth_) render->depth.store_action = WMTStoreActionDontCare;
+        if (render_pass_discard_stencil_) render->stencil.store_action = WMTStoreActionDontCare;
+      }
       for (auto &resolve : render_pass_resolves_) {
         render_pass_resolve_source_state_ = resolve.source_state;
         // Without PreserveResolveSource the source is undefined after the
@@ -11151,6 +11159,7 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     render_pass_discard_colors_.fill(false);
     render_pass_discard_color_count_ = 0;
     render_pass_discard_depth_ = render_pass_discard_stencil_ = false;
+    render_pass_recording_anchor_ = nullptr;
     owned_graphics::Trace("render_pass_end", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                           ",\"suspending\":", suspending);
   } catch (const std::bad_alloc &) {

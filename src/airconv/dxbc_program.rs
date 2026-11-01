@@ -23,7 +23,7 @@ enum Error {
     Truncated = 6,
     Operand = 7,
 }
-type Result<T, E = Error> = core::result::Result<T, E>;
+type Result<T> = core::result::Result<T, Error>;
 
 #[repr(C)]
 pub struct Program {
