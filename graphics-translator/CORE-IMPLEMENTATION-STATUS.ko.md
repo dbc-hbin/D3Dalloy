@@ -38,6 +38,22 @@
 
 도시 진입은 확인하지 못했다. 복제본에서 측정 runtime은 world load 뒤 로딩 화면에서 UnityPlayer null+8 read로 종료했고, 변경 전 runtime은 Start 뒤 보고 없이 종료했으며, 세 번째 실행은 로딩 화면에서 9분간 멈췄다. 따라서 이 종료를 이번 변경에 귀속하지 않는다. 원인은 아래 TLAS prebuild 수정으로 해결했다.
 
+## DLSS·FSR 공통 경로와 후속 최적화
+
+ZZZ 사용 여부와 별개로 D3D12 게임에 적용되는 다섯 변경을 구현했다. 아래 수치는 native probe 또는 public GPU fixture 결과이며 게임 FPS 측정이 아니다.
+
+- **DLSS-G·FSR FG render-grid 입력:** motion과 depth grid가 같고 최대 render 크기가 generation rect 안에 들어가면 MetalFX descriptor는 최대 render 크기, frame content는 현재 render 크기를 쓴다. Depth dilation과 display-size 확대를 생략하고 motion·camera displacement는 render-pixel 단위로 정규화한다. Display-resolution motion·서로 다른 guide grid는 기존 경로를 유지한다. 동일 grid의 scale·독립 subrect·padding 표현을 비교하는 NGX oracle은 최대 1 byte 허용을 유지한다. Native 합성 장면에서 PSNR은 2배 확대 41.77→43.64 dB, 1.5배 확대 42.04→42.92 dB였으나 production backend 화질 측정은 아니다. 증거: `build/local/par-20261105/fgres/build/local/`.
+- **DLSS RR 입력 변환:** disjoint scratch에 쓰는 변환을 compute encoder 하나에 기록하고 fence wait/update를 한 번씩 한다. 검증된 full-size·zero-origin 포맷만 직접 연결하며 포맷을 scaler generation key에 넣는다. Native production harness의 16개 설정·8프레임과 public RR 이미지 72개가 validation ON/OFF 각각 base와 bit-identical이다. 다섯 변환이 필요한 경우 compute encoder 수는 10→6, 모두 직접 연결 가능한 경우 10→5였다(MetalFX 내부 encoder 포함). 증거: `build/local/par-20261105/ngxrr/build/local/acceptance.json`.
+- **FSR RR 7x7 tiling:** [아래 상세 결과](#fsr-rr-neighborhood-tiling)와 같이 두 kernel을 threadgroup tile로 바꿨다. 1,344개 비교가 bit-identical이며 합성 1080p filter·prepare GPU 평균은 각각 2.47배·2.20배 빨랐다.
+- **FSR FG no-UI copy 제거:** default callback·UI 없음·debug pacing 꺼짐일 때 private `IMTLD3D12ResourcePresent`로 소스 자체를 표시한다. 직접 표시하는 소스는 Present GPU retirement 뒤에, UI/copy 소스는 composition 뒤에 재사용을 허용한다. Pacing fence는 별도로 유지한다. 동일 ring에서 UI 유무를 바꾸고 다음 backbuffer를 즉시 덮는 14-present fixture에서 CopyResource 10→0, drawable render 14→14와 pixel 검사를 확인했다. 증거: `build/local/par-20261105/fsruicopy/build/local/final-source-copy-evidence.json`.
+- **Mesh·GS·tessellation PSO:** native 생성의 process-wide mutex 두 개를 제거했다. Per-pipeline variant lock과 equal-key single-flight는 유지한다. M5/macOS 27.2의 16-thread probe에서 실패·shape mismatch 0, 직렬/동시 생성 중앙값은 validation OFF 1550→177 ms, API validation ON 1676→227 ms였다. Shader validation OFF의 `ms_payload` compiler-service 실패는 base에서도 같았다. 증거: `build/local/par-20261105/meshmutex/build/local/mm/`.
+
+MSAA full-surface average resolve는 기존 recording/submission planner가 이미 producing native render pass에 접는다. 별도 변경하지 않았다. Partial·MIN/MAX·emulated-MSAA resolve를 같은 최적화로 처리했다고 주장하지 않는다.
+
+통합 ARM64X/FEX x64 runtime(`build/local/par-20261105/integ/build/local/pkg-1`)의 43-suite matrix는 재시도 없이 41 PASS다. 새 5-feature NGX fixture와 mixed-source FSR FG fixture를 사용했다. `fsr` 중복 frame marker와 `temporal` MetalFX invalid store 6개는 base와 같으며, 결과는 같은 디렉터리의 `matrix-1/`·`matrix-summary.json`에 있다. Runner diagnostics는 112/113 PASS로 기존 joined-phase pipeline-artifact 검사만 실패한다. Native optimization probe의 `offset-region-value` 실패도 base에서 재현됐다. 이 결과를 전체 conformance나 실게임 화질·FPS 증거로 확장하지 않는다.
+
+최종 리뷰에서 invalid-vector sentinel의 정상 motion 기준 비교가 빠진 점을 복원했다. 동일 grid에서 독립 정상 displacement와 camera reconstruction을 최대 1 byte 차이로 비교하며, 새 fixture의 `review-ngx-fg/result.json`은 API+Shader Validation PASS다. 제품 코드 변경은 없고 후속 리뷰에서 지적이 해소됐다.
+
 ## 로딩·FG·SR·RT 추가 최적화 — 2026-11-04
 
 **상태: 다섯 변경을 합친 ARM64X/FEX x64 GPU matrix가 base와 같은 판정이다. ZZZ FPS는 측정하지 않았다.**

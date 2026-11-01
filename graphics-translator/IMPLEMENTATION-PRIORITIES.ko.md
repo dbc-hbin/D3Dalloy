@@ -4,7 +4,7 @@
 
 ## 2026-11-04 후속
 
-[2026-11-04 최적화](CORE-IMPLEMENTATION-STATUS.ko.md#로딩fgsrrt-추가-최적화--2026-11-04) 뒤 남은 후보: FG depth/motion을 렌더 해상도로 MetalFX에 넘기기(화질 A/B 필요), FSR FG UI 합성의 전체 화면 복사(AMD SDK 수정 범위 결정 필요), NGX RR 변환 pass 묶기(FSR RR 7x7 tiling은 구현·bit 일치 검증 완료; [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-rr-neighborhood-tiling)), MSAA resolve를 producing pass에 접기(ZZZ MSAA 사용 확인 필요), mesh/GS/tess PSO 전역 mutex(macOS 27 재진입 재현 확인 필요). `pipeline-library` suite의 async-on phase 기대값은 graphics 비동기 링크를 반영하지 않는다.
+[후속 구현](CORE-IMPLEMENTATION-STATUS.ko.md#dlssfsr-공통-경로와-후속-최적화)에서 DLSS-G·FSR FG render-grid 입력, FSR FG no-UI copy 제거, DLSS RR 변환 encoder 통합·검증된 포맷 직접 연결, FSR RR 7x7 tiling, mesh/GS/tess PSO 전역 mutex 제거를 처리했다. MSAA eligible resolve는 이미 producing pass에 접히므로 중복 구현하지 않았다. 남은 검증은 실제 게임 장면의 FG 화질·FPS·pacing과 다른 GPU/OS의 mesh compiler 동시성이다. Shader validation OFF의 mesh payload compiler-service 실패는 base에서도 재현된다. `pipeline-library` suite의 async-on phase 기대값은 graphics 비동기 링크를 반영하지 않는다.
 
 ## 2026-11-03 후속
 
