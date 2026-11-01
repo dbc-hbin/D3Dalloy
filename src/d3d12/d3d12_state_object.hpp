@@ -185,6 +185,8 @@ public:
   virtual uint32_t GetMaxAttributeSize() const = 0;
 
   virtual WMT::Reference<WMT::ComputePipelineState> GetPipelineState() const = 0;
+  /** Power-of-two thread count of one ray generation threadgroup (SM50_RT_RAYGEN_THREADGROUP_SIZE bound). */
+  virtual uint32_t GetRayGenerationThreadgroupThreads() const = 0;
   /**
    * Tables of the compiled intersection functions. Miss, closest hit, any hit and
    * callable exports are reached by direct calls from the lowered traversal, so

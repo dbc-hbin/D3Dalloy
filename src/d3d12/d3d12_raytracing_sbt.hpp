@@ -177,14 +177,17 @@ struct RaysIndirectControl {
   uint32_t max_commands;
   uint32_t arguments_stride;
   uint32_t predicate_not_equal;
+  uint32_t group_width;     // traversal threadgroup shape the written counts are for (depth 1)
+  uint32_t group_height;
 };
-static_assert(sizeof(RaysIndirectControl) == 56);
+static_assert(sizeof(RaysIndirectControl) == 64);
 
 /**
  * One thread per command slot. A slot past the count buffer, a slot culled by
  * predication, and a description that violates the D3D12 shader table rules (the
  * PrepareDispatch rules above) all dispatch 0 threadgroups; a valid slot dispatches
- * Width x Height x Depth single-thread groups, which is the traversal's grid.
+ * ceil(Width / group_width) x ceil(Height / group_height) x Depth threadgroups of the
+ * traversal's group shape (threads past the grid return in the raygen prologue).
  * Field offsets are SM50_RT_DISPATCH_ARGUMENTS's (dxil_raytracing.h), passed in as
  * the DXMT_* macros so the two cannot disagree.
  */
@@ -202,6 +205,8 @@ struct dxmt_rays_indirect_control {
   uint max_commands;
   uint arguments_stride;
   uint predicate_not_equal;
+  uint group_width;
+  uint group_height;
 };
 
 struct dxmt_range { ulong address; ulong size; };
@@ -268,8 +273,8 @@ kernel void dxmt_rays_indirect(constant dxmt_rays_indirect_control &control [[bu
   *(device uint *)(block + DXMT_HEIGHT) = d.height;
   *(device uint *)(block + DXMT_DEPTH) = d.depth;
   *(device ulong *)(block + DXMT_SELF) = self;
-  grid[0] = d.width;
-  grid[1] = d.height;
+  grid[0] = (d.width + control.group_width - 1) / control.group_width;
+  grid[1] = (d.height + control.group_height - 1) / control.group_height;
   grid[2] = d.depth;
 }
 )metal";

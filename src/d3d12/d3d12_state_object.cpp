@@ -443,6 +443,7 @@ class MTLD3D12StateObjectImpl final
   std::vector<WMT::Reference<WMT4::Function>> metal_functions_;
   std::shared_ptr<const RaytracingArtifact> compiled_artifact_;
   WMT::Reference<WMT::ComputePipelineState> pipeline_state_;
+  uint32_t raygen_threadgroup_threads_ = 1;
   WMT::Reference<WMT::IntersectionFunctionTable> intersection_table_;
   WMT::Reference<WMT::VisibleFunctionTable> visible_function_table_;
   /**
@@ -921,6 +922,12 @@ class MTLD3D12StateObjectImpl final
           metal_error ? metal_error.description().getUTF8String() : "no Metal error");
       return E_FAIL;
     }
+    /* Largest power of two within both the compiled max work group size and what the pipeline allows. */
+    const uint64_t pipeline_threads =
+        std::min<uint64_t>(SM50_RT_RAYGEN_THREADGROUP_SIZE, pipeline_state_.maxTotalThreadsPerThreadgroup());
+    raygen_threadgroup_threads_ = 1;
+    while (raygen_threadgroup_threads_ * 2 <= pipeline_threads)
+      raygen_threadgroup_threads_ *= 2;
 
     /* Hardware IFT slots select geometry-kind callbacks only. Each callback
      * resolves the D3D12 hit group from the execution-time GPU shader table. */
@@ -2345,6 +2352,7 @@ public:
   uint32_t GetMaxPayloadSize() const override { return max_payload_size_; }
   uint32_t GetMaxAttributeSize() const override { return max_attribute_size_; }
   WMT::Reference<WMT::ComputePipelineState> GetPipelineState() const override { return pipeline_state_; }
+  uint32_t GetRayGenerationThreadgroupThreads() const override { return raygen_threadgroup_threads_; }
   WMT::Reference<WMT::IntersectionFunctionTable> GetIntersectionFunctionTable() const override {
     return intersection_table_;
   }

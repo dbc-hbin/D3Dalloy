@@ -900,6 +900,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
   uint32_t object_to_world_index = ~0u;
   uint32_t world_to_object_index = ~0u;
   uint32_t dispatch_arguments_index = ~0u;
+  uint32_t thread_position_index = ~0u;
 
   if (stage == SM50_RT_STAGE_RAYGEN) {
     dispatch_arguments_index = func_signature.DefineInput(air::InputRaytracingDispatchArguments{
@@ -918,8 +919,10 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
       .memory_access = air::MemoryAccess::read,
       .arg_name = "vft",
     });
-    func_signature.DefineInput(air::InputThreadPositionInGrid{});
-    func_signature.UseMaxWorkgroupSize(1);
+    thread_position_index = func_signature.DefineInput(air::InputThreadPositionInGrid{});
+    /* Every invocation block is the thread's own alloca, so rays share threadgroups freely; the
+     * dispatch rounds the grid up to whole groups and the prologue returns past Width/Height/Depth. */
+    func_signature.UseMaxWorkgroupSize(SM50_RT_RAYGEN_THREADGROUP_SIZE);
   } else if (hardware_intersection) {
     /*
      * Metal's own intersection contract, read back from the public front end
@@ -1371,7 +1374,33 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
     argument->replaceAllUsesWith(bound);
   }
   // Parameter addresses must precede the branch into every use in the shader body.
-  builder.CreateBr(*body_entry);
+  if (stage == SM50_RT_STAGE_RAYGEN) {
+    /* The grid is rounded up to whole threadgroups: a thread past Width/Height/Depth is no ray. */
+    Value *dispatch = function->getArg(dispatch_arguments_index);
+    Value *bytes = builder.CreateBitCast(
+      dispatch, Type::getInt8PtrTy(llvm_context, cast<PointerType>(dispatch->getType())->getAddressSpace())
+    );
+    Value *position = function->getArg(thread_position_index);
+    Value *inside = builder.getTrue();
+    const uint32_t bounds[3] = {
+      offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchWidth), offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchHeight),
+      offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchDepth)
+    };
+    for (uint32_t i = 0; i < 3; ++i) {
+      Value *field = builder.CreateGEP(Type::getInt8Ty(llvm_context), bytes, builder.getInt32(bounds[i]));
+      Value *bound = builder.CreateAlignedLoad(
+        builder.getInt32Ty(),
+        builder.CreateBitCast(field, builder.getInt32Ty()->getPointerTo(cast<PointerType>(field->getType())->getAddressSpace())),
+        Align(4)
+      );
+      inside = builder.CreateAnd(inside, builder.CreateICmpULT(builder.CreateExtractElement(position, uint64_t(i)), bound));
+    }
+    auto *outside_bb = BasicBlock::Create(llvm_context, "rt.outside_grid", function);
+    IRBuilder<>(outside_bb).CreateRetVoid();
+    builder.CreateCondBr(inside, *body_entry, outside_bb);
+  } else {
+    builder.CreateBr(*body_entry);
+  }
 
   /*
    * Thread the per-invocation storage to the operation pass. The pass cannot find

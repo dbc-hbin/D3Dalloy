@@ -25,6 +25,14 @@
 /** Value used in a *_index field to mean "this hit group has no such shader". */
 #define SM50_RT_INDEX_NONE 0xffffffffu
 
+/**
+ * Upper bound on the threads of one ray generation threadgroup: the compiler declares it as the
+ * kernel's max work group size and the runtime shapes the dispatch's threadgroups within it (and
+ * within the pipeline's own maxTotalThreadsPerThreadgroup). Threads past the dispatch's
+ * Width/Height/Depth return in the kernel prologue.
+ */
+#define SM50_RT_RAYGEN_THREADGROUP_SIZE 64u
+
 #ifdef __cplusplus
 extern "C" {
 #endif

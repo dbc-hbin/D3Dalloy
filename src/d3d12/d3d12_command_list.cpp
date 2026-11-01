@@ -11501,20 +11501,24 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     arguments->DispatchDepth = desc->Depth;
 
     /*
-     * Under predication the grid is the predicated copy of (Width, Height, Depth): a culled dispatch
-     * launches zero threadgroups. The traversal's threadgroup size is 1, so threadgroups are rays.
+     * Rays share threadgroups (raygen threads past the grid return at once). A direct dispatch knows its
+     * grid, so the group is shaped to it; under predication the grid is the predicated copy of the
+     * threadgroup counts, so a culled dispatch launches zero threadgroups.
      */
+    const WMTSize group = RayGenerationThreadgroup(*state_object, desc->Height, desc->Depth);
     uint64_t predicated_grid_offset = ~0ull;
     if (predication_enabled_) {
-      const uint32_t grid[3] = {desc->Width, desc->Height, desc->Depth};
+      const uint32_t grid[3] = {uint32_t((desc->Width + group.width - 1) / group.width),
+                                uint32_t((desc->Height + group.height - 1) / group.height),
+                                uint32_t((desc->Depth + group.depth - 1) / group.depth)};
       predicated_grid_offset = PreparePredicatedArguments(grid, sizeof(grid));
       if (predicated_grid_offset == UINT64_MAX) {
         RecordError(E_OUTOFMEMORY);
         return;
       }
     }
-    auto *traversal =
-        EncodeRaytracingTraversal(arguments_offset, {desc->Width, desc->Height, desc->Depth}, predicated_grid_offset);
+    auto *traversal = EncodeRaytracingTraversal(arguments_offset, {desc->Width, desc->Height, desc->Depth}, group,
+                                               predicated_grid_offset);
     if (!traversal)
       return;
     owned_graphics::Trace(
@@ -11591,6 +11595,11 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     control->max_commands = MaxCommandCount;
     control->arguments_stride = static_cast<uint32_t>(kBlockBytes);
     control->predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
+    /* The slot dimensions are GPU data, so every slot takes the 2D tile; the resolve kernel divides each
+     * slot's dimensions by it. */
+    const WMTSize group = RayGenerationThreadgroup(*state_object, 0, 0);
+    control->group_width = uint32_t(group.width);
+    control->group_height = uint32_t(group.height);
 
     BindGPUHeapPredicationBuffer(control_offset, 0);
     auto &resolve = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
@@ -11601,7 +11610,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
 
     const uint64_t roots_stride = dispatch_rootsig ? uint64_t(dispatch_rootsig->UploadQwords) * 8 : 0;
     for (UINT i = 0; i < MaxCommandCount; ++i) {
-      auto *traversal = EncodeRaytracingTraversal(blocks_offset + i * kBlockBytes, {}, grids_offset + uint64_t(i) * 16,
+      auto *traversal = EncodeRaytracingTraversal(blocks_offset + i * kBlockBytes, {}, group, grids_offset + uint64_t(i) * 16,
                                                  roots_offset == ~0ull ? ~0ull : roots_offset + uint64_t(i) * roots_stride);
       if (!traversal)
         return;
@@ -11675,6 +11684,21 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
            allocator_->ReserveGPUHeap(per_dispatch * dispatches + root_bytes + 64, 64);
   }
 
+  /**
+   * Threadgroup shape for a ray generation dispatch: the state object's thread count laid out along x for a
+   * one-row grid, else as a near-square 2D tile so neighbouring rays - which tend to traverse alike - share a
+   * SIMD group.
+   */
+  static WMTSize RayGenerationThreadgroup(const MTLD3D12StateObject &state_object, uint64_t height, uint64_t depth) {
+    const uint64_t threads = state_object.GetRayGenerationThreadgroupThreads();
+    if (height == 1 && depth == 1)
+      return {threads, 1, 1};
+    uint64_t width = 1;
+    while (width * width < threads)
+      width *= 2;
+    return {width, threads / width, 1};
+  }
+
   /** The dispatch constants every raytracing dispatch of `state_object` shares (the tables are the caller's). */
   static void FillRaytracingDispatchConstants(
       SM50_RT_DISPATCH_ARGUMENTS &arguments, MTLD3D12StateObject &state_object, uint64_t own_address
@@ -11698,10 +11722,11 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
    * Encode one traversal pass over the dispatch constants at `arguments_offset` in this list's heap.
    * The traversal resolves every shader record on the GPU straight out of the application's tables,
    * so a direct and an indirect dispatch differ only in where the grid comes from: `grid` threads, or
-   * (when `indirect_grid_offset` is not ~0) the threadgroup counts written at that heap offset.
+   * (when `indirect_grid_offset` is not ~0) the threadgroup counts written at that heap offset. `group` is the
+   * threadgroup shape; raygen threads past the dispatch's Width/Height/Depth return in the kernel prologue.
    */
-  ComputeEncoderData *EncodeRaytracingTraversal(uint64_t arguments_offset, WMTSize grid, uint64_t indirect_grid_offset,
-                                               uint64_t root_arguments_offset = ~0ull) {
+  ComputeEncoderData *EncodeRaytracingTraversal(uint64_t arguments_offset, WMTSize grid, WMTSize group,
+                                               uint64_t indirect_grid_offset, uint64_t root_arguments_offset = ~0ull) {
     auto *state_object = static_cast<MTLD3D12StateObject *>(rt_state_object_.ptr());
     /*
      * The intersection function table the traversal will select from is built per dispatch, not
@@ -11779,7 +11804,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     auto &set_pipeline = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
     set_pipeline.type = WMTComputeCommandSetPSO;
     set_pipeline.pso = rt_pipeline_;
-    set_pipeline.threadgroup_size = {1, 1, 1};
+    set_pipeline.threadgroup_size = group;
 
     auto &set_arguments = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
     set_arguments.type = WMTComputeCommandSetBuffer;
@@ -11812,7 +11837,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       dispatch_rays.type = WMTComputeCommandDispatchThreads;
       dispatch_rays.size = grid;
     } else {
-      /* The traversal runs one thread per threadgroup (threadgroup size 1), so threadgroups are rays. */
+      /* dxmt_rays_indirect wrote the slot's threadgroup counts for `group`. */
       auto &dispatch_rays = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
       dispatch_rays.type = WMTComputeCommandDispatchIndirect;
       allocator_->BindGPUHeap(dispatch_rays.indirect_args_buffer, dispatch_rays.indirect_args_offset, indirect_grid_offset);
