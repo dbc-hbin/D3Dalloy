@@ -4,7 +4,7 @@
 
 ## 2026-11-02 후속
 
-[ZZZ 실측](CORE-IMPLEMENTATION-STATUS.ko.md#zzz-실측과-측정-기반-후속--2026-11-02) 기준 남은 일: 격리 복제본에서 도시 진입 실패(UnityPlayer null+8 종료·무보고 종료·로딩 정지)의 원인 확인과 도시 구간 재측정, ZZZ 프레임당 opaque 노드 약 100개(render merge 거부·불완전 clear/blit 접근)의 원인 축소, view-pool residency 순회(프레임당 약 820회), placed DEFAULT 텍스처의 Private storage, SR output shadow의 출력 rect 조건, FSR FG pacing jitter와 동일 장면 FPS 측정, `run-command-recording-cpu.py` 컴파일 오류.
+[ZZZ 실측](CORE-IMPLEMENTATION-STATUS.ko.md#zzz-실측과-측정-기반-후속--2026-11-02) 기준 남은 일: 격리 복제본에서 도시 진입 실패(UnityPlayer null+8 종료·무보고 종료·로딩 정지)의 원인 확인과 도시 구간 재측정, ZZZ 프레임당 opaque 노드 약 100개(render merge 거부·불완전 clear/blit 접근)의 원인 축소, view-pool residency 순회(프레임당 약 820회), placed DEFAULT 텍스처의 Private storage, FSR FG pacing jitter와 동일 장면 FPS 측정, `run-command-recording-cpu.py` 컴파일 오류.
 
 ## 2026-11-01 후속
 
