@@ -45,7 +45,7 @@
 #include <bit>
 #include <cstdint>
 
-namespace dxmt::sampler_feedback {
+namespace d3dalloy::sampler_feedback {
 
 /* VulkanOn12 / DDI 0100: W and bias are unrestricted; sampled views are single-mip 1D/2D. */
 template <typename DESC>
@@ -201,4 +201,4 @@ SamplerLodRange(float min_lod, float max_lod) {
   return uint64_t(std::bit_cast<uint32_t>(min_lod)) | uint64_t(std::bit_cast<uint32_t>(max_lod)) << 32;
 }
 
-} // namespace dxmt::sampler_feedback
+} // namespace d3dalloy::sampler_feedback

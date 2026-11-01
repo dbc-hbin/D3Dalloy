@@ -20,7 +20,7 @@
 #include "d3d12_temporal.hpp"
 #include "com/com_pointer.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 MTLD3D12CommandAllocatorImpl::MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type) :
     MTLD3D12Pageable<MTLD3D12CommandAllocator>(pDevice),
@@ -105,7 +105,7 @@ MTLD3D12CommandAllocatorImpl::QueryInterface(REFIID riid, void **ppvObject) {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D12CommandAllocatorImpl::Reset() try {
-  std::lock_guard<dxmt::mutex> lock(submission_mutex_);
+  std::lock_guard<d3dalloy::mutex> lock(submission_mutex_);
   if (outstanding_submissions_ || encoder_last) {
     owned_graphics::Trace("root_upload_reset", ",\"allocator\":", trace_id_, ",\"epoch\":", gpu_heap_epoch_,
                           ",\"accepted\":0,\"reason\":\"", outstanding_submissions_ ? "in_flight" : "recording", "\"");
@@ -863,4 +863,4 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::drawIndirect(
   draw.indirect_args_offset = offset;
 }
 
-}; // namespace dxmt
+}; // namespace d3dalloy

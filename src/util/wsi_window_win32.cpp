@@ -15,7 +15,7 @@
 #include "util_string.hpp"
 #include "log/log.hpp"
 
-namespace dxmt::wsi {
+namespace d3dalloy::wsi {
 
 static bool getWindowLong(HWND hWindow, int index, LONG *value) {
   ::SetLastError(0);
@@ -124,7 +124,7 @@ void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
     *pHeight = rect.bottom - rect.top;
 }
 
-bool resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
+bool resizeWindow(HWND hWindow, D3DalloyWindowState *pState, uint32_t width,
                   uint32_t height) {
   // Adjust window position and size
   RECT newRect = {0, 0, 0, 0};
@@ -174,7 +174,7 @@ bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
 }
 
 bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
-                         DXMTWindowState *pState,
+                         D3DalloyWindowState *pState,
                          [[maybe_unused]] bool modeSwitch) {
   RECT rect = {};
   NativeWindowState oldState = {};
@@ -208,7 +208,7 @@ bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
   return true;
 }
 
-bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
+bool leaveFullscreenMode(HWND hWindow, D3DalloyWindowState *pState,
                          bool restoreCoordinates) {
   NativeWindowState oldState = {};
   if (!getNativeWindowState(hWindow, &oldState))
@@ -340,4 +340,4 @@ bool isMinimized(HWND hWindow) {
   return ::IsIconic(hWindow);
 }
 
-} // namespace dxmt::wsi
+} // namespace d3dalloy::wsi

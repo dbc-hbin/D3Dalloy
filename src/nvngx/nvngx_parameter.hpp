@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <variant>
 
-namespace dxmt {
+namespace d3dalloy {
 
 using Parameter =
     std::variant<unsigned long long, float, double, unsigned int, int, void *, ID3D11Resource *, ID3D12Resource *>;
@@ -258,4 +258,4 @@ private:
   }
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

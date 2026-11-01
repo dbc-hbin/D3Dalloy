@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 /*
  * Subobjects a DXIL library declares in HLSL (GlobalRootSignature, LocalRootSignature,
@@ -76,4 +76,4 @@ HRESULT ReadDxilLibrarySubobjects(const void *blob, size_t size, std::vector<Dxi
  */
 HRESULT WrapRootSignaturePayload(const void *data, size_t size, std::vector<uint8_t> &container);
 
-} // namespace dxmt
+} // namespace d3dalloy

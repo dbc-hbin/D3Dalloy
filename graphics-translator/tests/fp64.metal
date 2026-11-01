@@ -1,20 +1,20 @@
 #include <metal_stdlib>
 using namespace metal;
-#define BINARY(name) ulong fp64_##name(ulong, ulong) asm("dxmt.fp64." #name);
+#define BINARY(name) ulong fp64_##name(ulong, ulong) asm("d3dalloy.fp64." #name);
 BINARY(add) BINARY(sub) BINARY(mul) BINARY(div) BINARY(rem) BINARY(min) BINARY(max)
 #undef BINARY
-ulong fp64_fma(ulong, ulong, ulong) asm("dxmt.fp64.fma");
-ulong fp64_sqrt(ulong) asm("dxmt.fp64.sqrt");
-ulong fp64_round(ulong, uint) asm("dxmt.fp64.round");
-ulong fp64_from_i64(long) asm("dxmt.fp64.from.i64");
-ulong fp64_from_u64(ulong) asm("dxmt.fp64.from.u64");
-ulong fp64_from_f32(uint) asm("dxmt.fp64.from.f32");
-uint fp64_to_f32(ulong) asm("dxmt.fp64.to.f32");
-long fp64_to_i64(ulong) asm("dxmt.fp64.to.i64");
-ulong fp64_to_u64(ulong) asm("dxmt.fp64.to.u64");
-int fp64_to_i32(ulong) asm("dxmt.fp64.to.i32");
-uint fp64_to_u32(ulong) asm("dxmt.fp64.to.u32");
-bool fp64_eq(ulong, ulong) asm("dxmt.fp64.eq");
+ulong fp64_fma(ulong, ulong, ulong) asm("d3dalloy.fp64.fma");
+ulong fp64_sqrt(ulong) asm("d3dalloy.fp64.sqrt");
+ulong fp64_round(ulong, uint) asm("d3dalloy.fp64.round");
+ulong fp64_from_i64(long) asm("d3dalloy.fp64.from.i64");
+ulong fp64_from_u64(ulong) asm("d3dalloy.fp64.from.u64");
+ulong fp64_from_f32(uint) asm("d3dalloy.fp64.from.f32");
+uint fp64_to_f32(ulong) asm("d3dalloy.fp64.to.f32");
+long fp64_to_i64(ulong) asm("d3dalloy.fp64.to.i64");
+ulong fp64_to_u64(ulong) asm("d3dalloy.fp64.to.u64");
+int fp64_to_i32(ulong) asm("d3dalloy.fp64.to.i32");
+uint fp64_to_u32(ulong) asm("d3dalloy.fp64.to.u32");
+bool fp64_eq(ulong, ulong) asm("d3dalloy.fp64.eq");
 kernel void fp64_compute(device const ulong *input [[buffer(0)]], device ulong *output [[buffer(1)]], uint id [[thread_position_in_grid]]) {
   ulong a=input[id*3], b=input[id*3+1], c=input[id*3+2];
   device ulong *r=output+id*22;

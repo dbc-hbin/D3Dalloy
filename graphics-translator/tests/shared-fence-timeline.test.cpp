@@ -1,5 +1,5 @@
-#include "dxmt_shared_fence.hpp"
-#include "dxmt_queue_order.hpp"
+#include "d3dalloy_shared_fence.hpp"
+#include "d3dalloy_queue_order.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -13,14 +13,14 @@ void require(bool condition, const char *step) {
   }
 }
 
-void drain(dxmt::SharedFenceTimeline &shared, uint32_t index, owned_graphics::FenceOrderEpoch &local) {
+void drain(d3dalloy::SharedFenceTimeline &shared, uint32_t index, owned_graphics::FenceOrderEpoch &local) {
   const auto observation = shared.take(index);
   local.signalCpu(observation.highest);
   local.signalCpu(observation.logical);
 }
 
 void testUnobservedRewindAndRegistration() {
-  dxmt::SharedFenceTimeline shared{};
+  d3dalloy::SharedFenceTimeline shared{};
   const auto observer = shared.attach(1);
   owned_graphics::FenceOrderEpoch local(1, 0);
   bool event = false, queue = false, late = false;
@@ -43,7 +43,7 @@ void testUnobservedRewindAndRegistration() {
 }
 
 void testCompletionNotPreparationOrder() {
-  dxmt::SharedFenceTimeline shared{};
+  d3dalloy::SharedFenceTimeline shared{};
   const auto observer = shared.attach(1);
   owned_graphics::FenceOrderEpoch producer(1, 0), local(2, 0);
   auto older = producer.prepare(10);
@@ -68,7 +68,7 @@ void testCompletionNotPreparationOrder() {
 }
 
 void testIndependentAndNewObservers() {
-  dxmt::SharedFenceTimeline shared{};
+  d3dalloy::SharedFenceTimeline shared{};
   auto first = shared.attach(1), second = shared.attach(2);
   shared.publish(UINT64_MAX);
   shared.publish(2);
@@ -86,7 +86,7 @@ void testIndependentAndNewObservers() {
 }
 
 void testAbandonedPublicationRecovery() {
-  dxmt::SharedFenceTimeline shared{};
+  d3dalloy::SharedFenceTimeline shared{};
   const auto first = shared.attach(1), second = shared.attach(2);
   // State at interruption halfway through a publisher's protected update.
   shared.pending_value = 11;
@@ -103,13 +103,13 @@ void testAbandonedPublicationRecovery() {
 }
 
 void testObserverCapacityDoesNotBlockPublication() {
-  dxmt::SharedFenceTimeline shared{};
-  for (uint32_t i = 0; i < dxmt::SharedFenceTimeline::kObservers; ++i)
+  d3dalloy::SharedFenceTimeline shared{};
+  for (uint32_t i = 0; i < d3dalloy::SharedFenceTimeline::kObservers; ++i)
     require(shared.attach(i + 1) == int32_t(i), "attach observer at capacity boundary");
   require(shared.attach(9999) == -1, "observer capacity did not reject exhaustion");
   shared.publish(99);
   shared.publish(0);
-  for (uint32_t i = 0; i < dxmt::SharedFenceTimeline::kObservers; ++i) {
+  for (uint32_t i = 0; i < d3dalloy::SharedFenceTimeline::kObservers; ++i) {
     const auto observation = shared.take(i);
     require(observation.highest == 99 && observation.logical == 0, "full observer capacity blocked publication");
   }

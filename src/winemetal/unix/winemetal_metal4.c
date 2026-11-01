@@ -22,7 +22,7 @@ MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format) {
   return (MTLPixelFormat)ORIGINAL_FORMAT(format);
 }
 
-@class DXMTM4CommandBuffer;
+@class D3DALLOYM4CommandBuffer;
 static char m4_view_pool_key;
 static char m4_device_residency_key;
 /* One residency set per MTLDevice shared by every recording (D3DMetal 4.0b3
@@ -30,7 +30,7 @@ static char m4_device_residency_key;
  * counted once per live recording that uses it and leaves the set only when
  * the last such recording retires or is dropped unsubmitted. The lock also
  * spans native queue commit, whose preCommit traverses the committed set. */
-@interface DXMTM4DeviceResidency : NSObject {
+@interface D3DALLOYM4DeviceResidency : NSObject {
 @public
   NSRecursiveLock *lock;
   id<MTLResidencySet> set;
@@ -38,17 +38,17 @@ static char m4_device_residency_key;
   BOOL dirty;
 }
 @end
-@implementation DXMTM4DeviceResidency
+@implementation D3DALLOYM4DeviceResidency
 - (void)dealloc { [lock release]; [set release]; [uses release]; [super dealloc]; }
 @end
-static DXMTM4DeviceResidency *m4_device_residency(id<MTLDevice> device) {
+static D3DALLOYM4DeviceResidency *m4_device_residency(id<MTLDevice> device) {
   @synchronized(device) {
-    DXMTM4DeviceResidency *shared=objc_getAssociatedObject(device,&m4_device_residency_key);
+    D3DALLOYM4DeviceResidency *shared=objc_getAssociatedObject(device,&m4_device_residency_key);
     if (shared) return shared;
     MTLResidencySetDescriptor *descriptor=[MTLResidencySetDescriptor new]; descriptor.initialCapacity=256;
     id<MTLResidencySet> set=[device newResidencySetWithDescriptor:descriptor error:nil]; [descriptor release];
     if (!set) return nil;
-    shared=[DXMTM4DeviceResidency new]; shared->lock=[NSRecursiveLock new]; shared->set=set; shared->uses=[NSCountedSet new];
+    shared=[D3DALLOYM4DeviceResidency new]; shared->lock=[NSRecursiveLock new]; shared->set=set; shared->uses=[NSCountedSet new];
     objc_setAssociatedObject(device,&m4_device_residency_key,shared,OBJC_ASSOCIATION_RETAIN);
     [shared release];
     return shared;
@@ -57,15 +57,15 @@ static DXMTM4DeviceResidency *m4_device_residency(id<MTLDevice> device) {
 /* Immutable unique member set of one view pool generation. It is one counted
  * residency user: its members enter the device set when its first user
  * acquires it and leave when its last user releases it. */
-@interface DXMTM4ViewSnapshot : NSObject {
+@interface D3DALLOYM4ViewSnapshot : NSObject {
 @public
   NSArray *members;
 }
 @end
-@implementation DXMTM4ViewSnapshot
+@implementation D3DALLOYM4ViewSnapshot
 - (void)dealloc { [members release]; [super dealloc]; }
 @end
-static NSUInteger m4_snapshot_acquire(DXMTM4DeviceResidency *shared, DXMTM4ViewSnapshot *snapshot) {
+static NSUInteger m4_snapshot_acquire(D3DALLOYM4DeviceResidency *shared, D3DALLOYM4ViewSnapshot *snapshot) {
   NSUInteger added=0;
   if (![shared->uses countForObject:snapshot]) {
     for (id allocation in snapshot->members) {
@@ -76,7 +76,7 @@ static NSUInteger m4_snapshot_acquire(DXMTM4DeviceResidency *shared, DXMTM4ViewS
   [shared->uses addObject:snapshot];
   return added;
 }
-static NSUInteger m4_snapshot_release(DXMTM4DeviceResidency *shared, DXMTM4ViewSnapshot *snapshot) {
+static NSUInteger m4_snapshot_release(D3DALLOYM4DeviceResidency *shared, D3DALLOYM4ViewSnapshot *snapshot) {
   NSUInteger removed=0;
   [shared->uses removeObject:snapshot];
   if ([shared->uses countForObject:snapshot]) return 0;
@@ -86,7 +86,7 @@ static NSUInteger m4_snapshot_release(DXMTM4DeviceResidency *shared, DXMTM4ViewS
   }
   return removed;
 }
-@interface DXMTM4ViewPool : NSObject {
+@interface D3DALLOYM4ViewPool : NSObject {
 @public
   id<MTLTextureViewPool> pool;
   MTLTextureViewDescriptor *descriptor;
@@ -97,7 +97,7 @@ static NSUInteger m4_snapshot_release(DXMTM4DeviceResidency *shared, DXMTM4ViewS
   /* Bumped only when the unique member set changes; recordings lease the
    * cached snapshot of an unchanged generation without walking members. */
   uint64_t generation, snapshotGeneration;
-  DXMTM4ViewSnapshot *snapshot;
+  D3DALLOYM4ViewSnapshot *snapshot;
   BOOL trace;
   uint64_t setCount, copyCount, clearCount, residencyVisits, ordinaryNew, ordinaryReuse;
 }
@@ -105,7 +105,7 @@ static NSUInteger m4_snapshot_release(DXMTM4DeviceResidency *shared, DXMTM4ViewS
 - (void)replaceOrdinaryView:(id)view atIndex:(NSUInteger)index;
 - (uint64_t)setTexture:(id<MTLTexture>)texture info:(const struct WMTTextureViewPoolInfo *)info atIndex:(NSUInteger)index;
 @end
-@implementation DXMTM4ViewPool
+@implementation D3DALLOYM4ViewPool
 - (void)replaceTexture:(id)texture atIndex:(NSUInteger)index {
   id previous=textures[index];
   if (previous == texture) return;
@@ -188,9 +188,9 @@ typedef struct {
   uint64_t tableNew, tableSet, tableBind, residencyNew, residencyAdd, residencyRemove, residencyCommit;
   uint64_t blitHazardBarrier, blitCapacityBarrier;
 } M4BindingCounters;
-@interface DXMTM4Recording : NSObject {
+@interface D3DALLOYM4Recording : NSObject {
 @public
-  DXMTM4DeviceResidency *residency;
+  D3DALLOYM4DeviceResidency *residency;
   NSMutableSet *objects;
   NSMutableSet *allocations;
   NSMutableArray *pending, *published;
@@ -202,8 +202,8 @@ typedef struct {
   NSError *error;
 }
 @end
-static void m4_release_residency(DXMTM4Recording *recording);
-@implementation DXMTM4Recording
+static void m4_release_residency(D3DALLOYM4Recording *recording);
+@implementation D3DALLOYM4Recording
 - (void)dealloc {
   // A recording dropped without submission still holds published uses.
   m4_release_residency(self);
@@ -212,7 +212,7 @@ static void m4_release_residency(DXMTM4Recording *recording);
 }
 @end
 
-@interface DXMTM4PresentTicket : NSObject {
+@interface D3DALLOYM4PresentTicket : NSObject {
 @public
   id drawable, surface;
   struct WMTCompositionFrame frame;
@@ -224,7 +224,7 @@ static void m4_release_residency(DXMTM4Recording *recording);
 - (void)present;
 @end
 
-@implementation DXMTM4PresentTicket
+@implementation D3DALLOYM4PresentTicket
 - (id)initWithCall:(struct WMTMetal4Call *)call {
   self = [super init];
   if (!self) return nil;
@@ -250,13 +250,13 @@ static void m4_release_residency(DXMTM4Recording *recording);
 }
 @end
 
-@interface DXMTM4CommandBuffer : NSObject {
+@interface D3DALLOYM4CommandBuffer : NSObject {
 @public
   id<MTLDevice> device;
   id<MTL4CommandBuffer> command;
   id<MTL4CommandAllocator> allocator;
-  DXMTM4Recording *recording;
-  DXMTM4DeviceResidency *residency;
+  D3DALLOYM4Recording *recording;
+  D3DALLOYM4DeviceResidency *residency;
   M4TableState tables[5]; // Render stages 0-3; compute has a separate table.
   NSMutableArray<id<MTLBuffer>> *uploads;
   NSMutableArray<NSString *> *debugGroups;
@@ -265,7 +265,7 @@ static void m4_release_residency(DXMTM4Recording *recording);
   BOOL ended;
 }
 @end
-@implementation DXMTM4CommandBuffer
+@implementation D3DALLOYM4CommandBuffer
 - (void)dealloc {
   [device release]; [command release]; [allocator release]; [recording release]; [residency release];
   for (unsigned i=0;i<5;++i) [tables[i].table release];
@@ -273,10 +273,10 @@ static void m4_release_residency(DXMTM4Recording *recording);
 }
 @end
 
-@interface DXMTM4Encoder : NSObject {
+@interface D3DALLOYM4Encoder : NSObject {
 @public
-  DXMTM4CommandBuffer *owner;
-  DXMTM4Recording *recording;
+  D3DALLOYM4CommandBuffer *owner;
+  D3DALLOYM4Recording *recording;
   id<MTL4CommandEncoder> encoder;
   BOOL tableReady[4], tableBound[4], compute;
   id<MTLBuffer> buffers[4][31];
@@ -285,7 +285,7 @@ static void m4_release_residency(DXMTM4Recording *recording);
   uint64_t tracePSO; // Borrowed identity only; recording already retains the native PSO.
 }
 @end
-@implementation DXMTM4Encoder
+@implementation D3DALLOYM4Encoder
 - (void)dealloc {
   [encoder release]; [super dealloc];
 }
@@ -298,7 +298,7 @@ typedef struct {
   uint64_t x0, x1, y0, y1, z0, z1;
   BOOL write, texture;
 } M4BlitAccess;
-@interface DXMTM4ComputeEncoder : DXMTM4Encoder {
+@interface D3DALLOYM4ComputeEncoder : D3DALLOYM4Encoder {
 @public
   MTLSize threadgroupSize;
   BOOL concurrent;
@@ -307,9 +307,9 @@ typedef struct {
   unsigned blitAccessCount;
 }
 @end
-@implementation DXMTM4ComputeEncoder
+@implementation D3DALLOYM4ComputeEncoder
 @end
-@interface DXMTM4RenderEncoder : DXMTM4Encoder {
+@interface D3DALLOYM4RenderEncoder : D3DALLOYM4Encoder {
 @public
   /* Last indexed-draw buffer of this encoder, already leased by its recording.
    * Repeated draws from one index buffer skip the lease and ObjC queries. */
@@ -318,27 +318,27 @@ typedef struct {
   NSUInteger indexLength;
 }
 @end
-@implementation DXMTM4RenderEncoder
+@implementation D3DALLOYM4RenderEncoder
 @end
 
-@interface DXMTM4Submission : NSObject {
+@interface D3DALLOYM4Submission : NSObject {
 @public
   NSCondition *condition;
   NSMutableArray *leases;
-  NSMutableArray<DXMTM4CommandBuffer *> *buffers;
+  NSMutableArray<D3DALLOYM4CommandBuffer *> *buffers;
   NSMutableArray *presentTickets;
   NSError *error;
   uint64_t gpuStart, gpuEnd;
   BOOL completed, commitReturned, feedbackReceived;
 }
 @end
-@implementation DXMTM4Submission
+@implementation D3DALLOYM4Submission
 - (void)dealloc {
   [condition release]; [leases release]; [buffers release]; [presentTickets release]; [error release]; [super dealloc];
 }
 @end
 
-@interface DXMTM4ASDescriptor : NSObject {
+@interface D3DALLOYM4ASDescriptor : NSObject {
 @public
   MTL4AccelerationStructureDescriptor *descriptor;
   NSMutableArray *geometries;
@@ -348,30 +348,30 @@ typedef struct {
   BOOL unresolvedInstances;
 }
 @end
-@implementation DXMTM4ASDescriptor
+@implementation D3DALLOYM4ASDescriptor
 - (void)dealloc {
   [descriptor release]; [geometries release]; [inputs release]; [placeholder release]; [unresolvedGeometries release]; [super dealloc];
 }
 @end
 
 static inline id m4obj(uint64_t handle) { return (id)(uintptr_t)handle; }
-static inline DXMTM4CommandBuffer *m4cb(uint64_t handle) { return (DXMTM4CommandBuffer *)m4obj(handle); }
-static void m4_error(DXMTM4Recording *recording, NSString *description) {
+static inline D3DALLOYM4CommandBuffer *m4cb(uint64_t handle) { return (D3DALLOYM4CommandBuffer *)m4obj(handle); }
+static void m4_error(D3DALLOYM4Recording *recording, NSString *description) {
   if (!recording->error)
     recording->error=[[NSError errorWithDomain:MTL4CommandQueueErrorDomain code:MTL4CommandQueueErrorInternal
       userInfo:@{NSLocalizedDescriptionKey:description}] retain];
 }
-static void m4_retain(DXMTM4Recording *recording, id object) {
+static void m4_retain(D3DALLOYM4Recording *recording, id object) {
   if (object) [recording->objects addObject:object];
 }
-static void m4_allocation(DXMTM4Recording *recording, id<MTLAllocation> allocation) {
+static void m4_allocation(D3DALLOYM4Recording *recording, id<MTLAllocation> allocation) {
   if (!allocation) return;
-  DXMTM4ViewPool *views=objc_getAssociatedObject(allocation,&m4_view_pool_key);
+  D3DALLOYM4ViewPool *views=objc_getAssociatedObject(allocation,&m4_view_pool_key);
   if (views && ![recording->objects containsObject:views]) {
     // The recording, not the mutable descriptor heap, owns this GPU-use lease:
     // the immutable snapshot of the heap's current members.
     m4_retain(recording,views);
-    DXMTM4ViewSnapshot *snapshot;
+    D3DALLOYM4ViewSnapshot *snapshot;
     @synchronized(views) {
       if (!views->snapshot || views->snapshotGeneration!=views->generation) {
         NSMutableArray *members=[[NSMutableArray alloc] initWithCapacity:views->parents.count+views->ordinaryOwners.count];
@@ -381,7 +381,7 @@ static void m4_allocation(DXMTM4Recording *recording, id<MTLAllocation> allocati
         }
         for (id view in views->ordinaryOwners) [members addObject:view];
         [views->snapshot release];
-        views->snapshot=[DXMTM4ViewSnapshot new]; views->snapshot->members=members;
+        views->snapshot=[D3DALLOYM4ViewSnapshot new]; views->snapshot->members=members;
         views->snapshotGeneration=views->generation;
       }
       snapshot=views->snapshot;
@@ -399,13 +399,13 @@ static void m4_allocation(DXMTM4Recording *recording, id<MTLAllocation> allocati
 /* Publish this recording's new uses before its command buffer ends. Only an
  * allocation no live recording holds changes the set, so steady-state frames
  * commit nothing. */
-static void m4_commit_residency(DXMTM4Recording *recording) {
+static void m4_commit_residency(D3DALLOYM4Recording *recording) {
   if (!recording->pending.count) return;
-  DXMTM4DeviceResidency *shared=recording->residency;
+  D3DALLOYM4DeviceResidency *shared=recording->residency;
   BOOL dirty=NO;
   [shared->lock lock];
   for (id allocation in recording->pending) {
-    if ([allocation isKindOfClass:[DXMTM4ViewSnapshot class]]) {
+    if ([allocation isKindOfClass:[D3DALLOYM4ViewSnapshot class]]) {
       NSUInteger added=m4_snapshot_acquire(shared,allocation);
       if (added) {
         dirty=YES;
@@ -430,15 +430,15 @@ static void m4_commit_residency(DXMTM4Recording *recording) {
 /* Drop this recording's uses after native commit return and GPU retirement, or
  * when the recording dies unsubmitted. Removal is never visible to work that
  * still uses the allocation: another live user keeps its count above zero. */
-static void m4_release_residency(DXMTM4Recording *recording) {
+static void m4_release_residency(D3DALLOYM4Recording *recording) {
   if (recording->released || !recording->residency) return;
   recording->released=YES;
   if (!recording->published.count) return;
-  DXMTM4DeviceResidency *shared=recording->residency;
+  D3DALLOYM4DeviceResidency *shared=recording->residency;
   BOOL dirty=NO;
   [shared->lock lock];
   for (id allocation in recording->published) {
-    if ([allocation isKindOfClass:[DXMTM4ViewSnapshot class]]) {
+    if ([allocation isKindOfClass:[D3DALLOYM4ViewSnapshot class]]) {
       NSUInteger removed=m4_snapshot_release(shared,allocation);
       if (removed) {
         dirty=YES;
@@ -465,9 +465,9 @@ static void m4_release_residency(DXMTM4Recording *recording) {
 id<MTL4CommandBuffer> winemetal_metal4_command_buffer(obj_handle_t handle) { return handle ? m4cb(handle)->command : nil; }
 int32_t winemetal_metal4_reserve_present(struct WMTMetal4Call *call) {
   if (!call || !call->args[0]) return M4_INVALID;
-  DXMTM4CommandBuffer *context = m4cb(call->args[0]);
+  D3DALLOYM4CommandBuffer *context = m4cb(call->args[0]);
   if (!context || !context->recording || context->ended) return M4_INVALID;
-  DXMTM4PresentTicket *ticket = [[DXMTM4PresentTicket alloc] initWithCall:call];
+  D3DALLOYM4PresentTicket *ticket = [[D3DALLOYM4PresentTicket alloc] initWithCall:call];
   if (!ticket) return M4_FAILED;
   [context->recording->presentTickets addObject:ticket];
   [ticket release];
@@ -475,7 +475,7 @@ int32_t winemetal_metal4_reserve_present(struct WMTMetal4Call *call) {
   return M4_SUCCESS;
 }
 void *winemetal_metal4_split_command_buffer(void *opaque) {
-  DXMTM4CommandBuffer *context = opaque;
+  D3DALLOYM4CommandBuffer *context = opaque;
   if (!context || !context->recording || context->ended) return NULL;
   id<MTL4CommandBuffer> next = [context->device newCommandBuffer];
   if (!next) return NULL;
@@ -493,15 +493,15 @@ void *winemetal_metal4_split_command_buffer(void *opaque) {
   return next;
 }
 id<MTL4ComputeCommandEncoder> winemetal_metal4_compute_encoder(obj_handle_t handle) {
-  return handle ? (id<MTL4ComputeCommandEncoder>)((DXMTM4ComputeEncoder *)m4obj(handle))->encoder : nil;
+  return handle ? (id<MTL4ComputeCommandEncoder>)((D3DALLOYM4ComputeEncoder *)m4obj(handle))->encoder : nil;
 }
 id<MTL4RenderCommandEncoder> winemetal_metal4_render_encoder(obj_handle_t handle) {
-  return handle ? (id<MTL4RenderCommandEncoder>)((DXMTM4RenderEncoder *)m4obj(handle))->encoder : nil;
+  return handle ? (id<MTL4RenderCommandEncoder>)((D3DALLOYM4RenderEncoder *)m4obj(handle))->encoder : nil;
 }
 void winemetal_metal4_retain_resource(obj_handle_t handle, id resource) { m4_retain(m4cb(handle)->recording,resource); }
 void winemetal_metal4_use_allocation(obj_handle_t handle, id<MTLAllocation> resource) { m4_allocation(m4cb(handle)->recording,resource); }
 
-static id<MTL4ArgumentTable> m4_table(DXMTM4Encoder *context, unsigned stage) {
+static id<MTL4ArgumentTable> m4_table(D3DALLOYM4Encoder *context, unsigned stage) {
   M4TableState *state=&context->owner->tables[context->compute ? 4 : stage];
   if (!state->table) {
     MTL4ArgumentTableDescriptor *descriptor=[MTL4ArgumentTableDescriptor new];
@@ -543,21 +543,21 @@ static id<MTL4ArgumentTable> m4_table(DXMTM4Encoder *context, unsigned stage) {
   return state->table;
 }
 static const MTLRenderStages m4_render_stages[4]={MTLRenderStageVertex,MTLRenderStageFragment,MTLRenderStageMesh,MTLRenderStageObject};
-static void m4_render_table(DXMTM4RenderEncoder *context, unsigned stage) {
+static void m4_render_table(D3DALLOYM4RenderEncoder *context, unsigned stage) {
   if (!context->tableBound[stage]) {
     [(id<MTL4RenderCommandEncoder>)context->encoder setArgumentTable:m4_table(context,stage) atStages:m4_render_stages[stage]];
     context->tableBound[stage]=YES;
     if (context->recording->trace) ++context->recording->counters.tableBind;
   }
 }
-static void m4_compute_table(DXMTM4ComputeEncoder *context) {
+static void m4_compute_table(D3DALLOYM4ComputeEncoder *context) {
   if (!context->tableBound[0]) {
     [(id<MTL4ComputeCommandEncoder>)context->encoder setArgumentTable:m4_table(context,0)];
     context->tableBound[0]=YES;
     if (context->recording->trace) ++context->recording->counters.tableBind;
   }
 }
-static void m4_bind_resource(DXMTM4Encoder *context, unsigned stage, MTLResourceID resource, unsigned index, BOOL texture) {
+static void m4_bind_resource(D3DALLOYM4Encoder *context, unsigned stage, MTLResourceID resource, unsigned index, BOOL texture) {
   id<MTL4ArgumentTable> table=m4_table(context,stage); if (!table) return;
   M4TableState *state=&context->owner->tables[context->compute ? 4 : stage];
   if (texture) {
@@ -573,12 +573,12 @@ static void m4_bind_resource(DXMTM4Encoder *context, unsigned stage, MTLResource
   }
   if (context->recording->trace) ++context->recording->counters.tableSet;
 }
-static void m4_record_barrier(DXMTM4Encoder *context, MTLStages after, MTLStages before) {
+static void m4_record_barrier(D3DALLOYM4Encoder *context, MTLStages after, MTLStages before) {
   if (before & MTLStageDispatch) context->orderedFor[0] |= after;
   if (before & MTLStageBlit) context->orderedFor[1] |= after;
   if (before & MTLStageAccelerationStructure) context->orderedFor[2] |= after;
 }
-static void m4_stage_barrier(DXMTM4ComputeEncoder *context, MTLStages stage) {
+static void m4_stage_barrier(D3DALLOYM4ComputeEncoder *context, MTLStages stage) {
   /* The SDK's combined encoder has no serial selector. Dispatch/AS accesses
    * may be bindless, so a serial pass orders all prior memory stages. Copy
    * accesses are known; independent copies keep Metal4's native concurrency. */
@@ -684,7 +684,7 @@ static BOOL m4_blit_adjacent(const M4BlitAccess *a, const M4BlitAccess *b) {
 }
 /* Absorbs an access into an entry that covers it, or widens a covered or
  * adjacent entry. Returns NO when it needs its own slot. */
-static BOOL m4_blit_absorb(DXMTM4ComputeEncoder *context, const M4BlitAccess *access) {
+static BOOL m4_blit_absorb(D3DALLOYM4ComputeEncoder *context, const M4BlitAccess *access) {
   for (unsigned i=0;i<context->blitAccessCount;++i) {
     M4BlitAccess *prior=&context->blitAccesses[i];
     if (m4_blit_covers(prior,access)) return YES;
@@ -703,7 +703,7 @@ static BOOL m4_blit_absorb(DXMTM4ComputeEncoder *context, const M4BlitAccess *ac
 /* Frees two slots before a copy records its footprints. Two same-kind
  * entries of one resource merge into their bound first; only when nothing
  * merges does one barrier order every earlier copy before this one. */
-static void m4_blit_reserve(DXMTM4ComputeEncoder *context) {
+static void m4_blit_reserve(D3DALLOYM4ComputeEncoder *context) {
   const unsigned capacity=sizeof(context->blitAccesses)/sizeof(context->blitAccesses[0]);
   for (unsigned i=0;i<context->blitAccessCount && context->blitAccessCount>capacity-2;++i)
     for (unsigned j=i+1;j<context->blitAccessCount && context->blitAccessCount>capacity-2;) {
@@ -718,7 +718,7 @@ static void m4_blit_reserve(DXMTM4ComputeEncoder *context) {
     context->blitAccessCount=0;
   }
 }
-static void m4_blit_access(DXMTM4ComputeEncoder *context, M4BlitAccess source, M4BlitAccess destination) {
+static void m4_blit_access(D3DALLOYM4ComputeEncoder *context, M4BlitAccess source, M4BlitAccess destination) {
   m4_stage_barrier(context,MTLStageBlit);
   const M4BlitAccess accesses[2]={source,destination};
   BOOL conflict=NO;
@@ -736,7 +736,7 @@ static void m4_blit_access(DXMTM4ComputeEncoder *context, M4BlitAccess source, M
     if (!m4_blit_empty(&accesses[j]) && !m4_blit_absorb(context,&accesses[j]))
       context->blitAccesses[context->blitAccessCount++]=accesses[j];
 }
-static void m4_bind_buffer(DXMTM4Encoder *context, unsigned stage, id<MTLBuffer> buffer, uint64_t offset, unsigned index) {
+static void m4_bind_buffer(D3DALLOYM4Encoder *context, unsigned stage, id<MTLBuffer> buffer, uint64_t offset, unsigned index) {
   if (index>=31 || (buffer && offset>buffer.length)) { m4_error(context->recording,@"Metal4 buffer binding is out of range"); return; }
   context->buffers[stage][index]=buffer;
   M4TableState *state=&context->owner->tables[context->compute ? 4 : stage];
@@ -754,17 +754,17 @@ static void m4_bind_buffer(DXMTM4Encoder *context, unsigned stage, id<MTLBuffer>
   state->bufferMask|=1u<<index;
   if (context->recording->trace) ++context->recording->counters.tableSet;
 }
-static void m4_render_buffer(DXMTM4RenderEncoder *context, unsigned stage, id<MTLBuffer> buffer, uint64_t offset, unsigned index) {
+static void m4_render_buffer(D3DALLOYM4RenderEncoder *context, unsigned stage, id<MTLBuffer> buffer, uint64_t offset, unsigned index) {
   m4_bind_buffer(context,stage,buffer,offset,index); m4_render_table(context,stage);
 }
-static void m4_render_offset(DXMTM4RenderEncoder *context, unsigned stage, uint64_t offset, unsigned index) {
+static void m4_render_offset(D3DALLOYM4RenderEncoder *context, unsigned stage, uint64_t offset, unsigned index) {
   if (index>=31) { m4_error(context->recording,@"Metal4 buffer offset index is out of range"); return; }
   m4_render_buffer(context,stage,context->buffers[stage][index],offset,index);
 }
-static void m4_compute_buffer(DXMTM4ComputeEncoder *context, id<MTLBuffer> buffer, uint64_t offset, unsigned index) {
+static void m4_compute_buffer(D3DALLOYM4ComputeEncoder *context, id<MTLBuffer> buffer, uint64_t offset, unsigned index) {
   m4_bind_buffer(context,0,buffer,offset,index); m4_compute_table(context);
 }
-static id<MTLBuffer> m4_upload(DXMTM4CommandBuffer *context, const void *bytes, uint64_t length, NSUInteger *offset) {
+static id<MTLBuffer> m4_upload(D3DALLOYM4CommandBuffer *context, const void *bytes, uint64_t length, NSUInteger *offset) {
   if (!length || !bytes || length>NSUIntegerMax-255) { m4_error(context->recording,@"Invalid Metal4 inline constant data"); return nil; }
   const NSUInteger aligned=(length+255)&~(NSUInteger)255;
   for (;;) {
@@ -781,11 +781,11 @@ static id<MTLBuffer> m4_upload(DXMTM4CommandBuffer *context, const void *bytes, 
     ++context->uploadIndex; context->uploadOffset=0;
   }
 }
-static void m4_render_bytes(DXMTM4RenderEncoder *context, const void *bytes, uint64_t length, unsigned index) {
+static void m4_render_bytes(D3DALLOYM4RenderEncoder *context, const void *bytes, uint64_t length, unsigned index) {
   NSUInteger offset=0; id<MTLBuffer> buffer=m4_upload(context->owner,bytes,length,&offset);
   if (buffer) m4_render_buffer(context,1,buffer,offset,index);
 }
-static MTLGPUAddress m4_address(DXMTM4Recording *recording, uint64_t handle, uint64_t offset) {
+static MTLGPUAddress m4_address(D3DALLOYM4Recording *recording, uint64_t handle, uint64_t offset) {
   id<MTLBuffer> buffer=m4obj(handle); m4_allocation(recording,buffer);
   if (!buffer || offset>buffer.length) { m4_error(recording,@"Metal4 indirect/index buffer is out of range"); return 0; }
   return buffer.gpuAddress+offset;
@@ -793,7 +793,7 @@ static MTLGPUAddress m4_address(DXMTM4Recording *recording, uint64_t handle, uin
 
 /* Resolves an indexed-draw buffer range for one render encoder. An encoder
  * belongs to exactly one recording, so a cached buffer remains leased by it. */
-static BOOL m4_index_range(DXMTM4RenderEncoder *context, uint64_t handle, uint64_t offset,
+static BOOL m4_index_range(D3DALLOYM4RenderEncoder *context, uint64_t handle, uint64_t offset,
                            MTLGPUAddress *address, NSUInteger *length) {
   if (!handle || handle != context->indexHandle) {
     id<MTLBuffer> buffer=m4obj(handle); m4_allocation(context->recording,buffer);
@@ -811,7 +811,7 @@ static BOOL m4_index_range(DXMTM4RenderEncoder *context, uint64_t handle, uint64
   return YES;
 }
 
-static MTL4RenderPassDescriptor *m4_render_pass(DXMTM4CommandBuffer *context, const struct WMTRenderPassInfo *info) {
+static MTL4RenderPassDescriptor *m4_render_pass(D3DALLOYM4CommandBuffer *context, const struct WMTRenderPassInfo *info) {
   MTL4RenderPassDescriptor *descriptor=[MTL4RenderPassDescriptor new];
   descriptor.supportColorAttachmentMapping=info->support_color_attachment_mapping != 0;
   for (unsigned i=0;i<8;++i) {
@@ -881,15 +881,15 @@ static MTL4RenderPassDescriptor *m4_render_pass(DXMTM4CommandBuffer *context, co
 }
 
 
-static int32_t m4_compute_commands(DXMTM4ComputeEncoder *context, const struct wmtcmd_base *next);
-static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmtcmd_base *next);
-static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtcmd_base *next);
+static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next);
+static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct wmtcmd_base *next);
+static int32_t m4_blit_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next);
 
 static MTL4BufferRange m4_buffer_range(id<MTLBuffer> buffer, uint64_t offset) {
   return buffer && offset<=buffer.length ? MTL4BufferRangeMake(buffer.gpuAddress+offset,buffer.length-offset) : MTL4BufferRangeMake(0,0);
 }
-static DXMTM4ASDescriptor *m4_as_new(id<MTLDevice> device, BOOL topLevel, uint32_t geometryCount) {
-  DXMTM4ASDescriptor *owner=[DXMTM4ASDescriptor new];
+static D3DALLOYM4ASDescriptor *m4_as_new(id<MTLDevice> device, BOOL topLevel, uint32_t geometryCount) {
+  D3DALLOYM4ASDescriptor *owner=[D3DALLOYM4ASDescriptor new];
   owner->inputs=[NSMutableSet new];
   owner->placeholder=[device newBufferWithLength:256 options:MTLResourceStorageModePrivate];
   if (!owner->placeholder) { [owner release]; return nil; }
@@ -908,30 +908,30 @@ static DXMTM4ASDescriptor *m4_as_new(id<MTLDevice> device, BOOL topLevel, uint32
   }
   return owner;
 }
-static void m4_as_input(DXMTM4ASDescriptor *owner, id buffer) { if (buffer) [owner->inputs addObject:buffer]; }
-static void m4_as_unresolved(DXMTM4ASDescriptor *owner, NSUInteger geometry, BOOL unresolved) {
+static void m4_as_input(D3DALLOYM4ASDescriptor *owner, id buffer) { if (buffer) [owner->inputs addObject:buffer]; }
+static void m4_as_unresolved(D3DALLOYM4ASDescriptor *owner, NSUInteger geometry, BOOL unresolved) {
   if (unresolved) {
     if (!owner->unresolvedGeometries) owner->unresolvedGeometries=[NSMutableIndexSet new];
     [owner->unresolvedGeometries addIndex:geometry];
   } else [owner->unresolvedGeometries removeIndex:geometry];
 }
-static void m4_as_resources(DXMTM4Recording *recording, DXMTM4ASDescriptor *descriptor, uint64_t sidecar) {
+static void m4_as_resources(D3DALLOYM4Recording *recording, D3DALLOYM4ASDescriptor *descriptor, uint64_t sidecar) {
   if (descriptor) {
     m4_retain(recording,descriptor);
     for (id<MTLAllocation> allocation in descriptor->inputs) m4_allocation(recording,allocation);
   }
   if (sidecar) {
     m4_retain(recording,m4obj(sidecar));
-    NSArray *generations=m4obj(dxmt_as_sidecar_generations(sidecar));
+    NSArray *generations=m4obj(d3dalloy_as_sidecar_generations(sidecar));
     for (id<MTLAllocation> allocation in generations) m4_allocation(recording,allocation);
-    m4_allocation(recording,m4obj(dxmt_as_sidecar_acceleration_structure(sidecar)));
-    m4_allocation(recording,m4obj(dxmt_as_sidecar_instance_buffer(sidecar)));
-    m4_allocation(recording,m4obj(dxmt_as_sidecar_contribution_buffer(sidecar)));
+    m4_allocation(recording,m4obj(d3dalloy_as_sidecar_acceleration_structure(sidecar)));
+    m4_allocation(recording,m4obj(d3dalloy_as_sidecar_instance_buffer(sidecar)));
+    m4_allocation(recording,m4obj(d3dalloy_as_sidecar_contribution_buffer(sidecar)));
   }
 }
 static int32_t m4_as_call(struct WMTMetal4Call *call) {
   uint64_t *a=call->args;
-  DXMTM4ASDescriptor *descriptor=(DXMTM4ASDescriptor *)m4obj(a[0]);
+  D3DALLOYM4ASDescriptor *descriptor=(D3DALLOYM4ASDescriptor *)m4obj(a[0]);
   switch (call->operation) {
   case WMTMetal4NewASDescriptor:
     call->ret[0]=(uint64_t)m4_as_new(m4obj(a[0]),a[1]!=0,(uint32_t)a[2]); return M4_SUCCESS;
@@ -973,13 +973,13 @@ static int32_t m4_as_call(struct WMTMetal4Call *call) {
     m4_as_input(descriptor,buffer); call->ret[0]=1; return M4_SUCCESS;
   }
   case WMTMetal4ASSizes: {
-    descriptor=(DXMTM4ASDescriptor *)m4obj(a[1]);
+    descriptor=(D3DALLOYM4ASDescriptor *)m4obj(a[1]);
     MTLAccelerationStructureSizes sizes=[(id<MTLDevice>)m4obj(a[0]) accelerationStructureSizesWithDescriptor:descriptor->descriptor];
     call->ret[0]=sizes.accelerationStructureSize; call->ret[1]=sizes.buildScratchBufferSize; call->ret[2]=sizes.refitScratchBufferSize; return M4_SUCCESS;
   }
   case WMTMetal4ASBuild:
   case WMTMetal4ASRefit: {
-    DXMTM4ComputeEncoder *context=(DXMTM4ComputeEncoder *)m4obj(a[0]); descriptor=(DXMTM4ASDescriptor *)m4obj(a[1]);
+    D3DALLOYM4ComputeEncoder *context=(D3DALLOYM4ComputeEncoder *)m4obj(a[0]); descriptor=(D3DALLOYM4ASDescriptor *)m4obj(a[1]);
     BOOL refit=call->operation==WMTMetal4ASRefit; uint64_t destination=refit?a[3]:a[2];
     id<MTLBuffer> scratch=m4obj(a[refit?4:3]); uint64_t offset=a[refit?5:4];
     if (!descriptor || !scratch || offset>scratch.length || !destination) return M4_INVALID;
@@ -987,35 +987,35 @@ static int32_t m4_as_call(struct WMTMetal4Call *call) {
      * count/format descriptor is valid for sizing, never for executing work. */
     if (descriptor->unresolvedGeometries.count || descriptor->unresolvedInstances) return M4_INVALID;
     m4_as_resources(context->recording,descriptor,destination); m4_allocation(context->recording,scratch);
-    id<MTLAccelerationStructure> target=m4obj(dxmt_as_sidecar_acceleration_structure(destination));
+    id<MTLAccelerationStructure> target=m4obj(d3dalloy_as_sidecar_acceleration_structure(destination));
     id<MTL4ComputeCommandEncoder> encoder=(id<MTL4ComputeCommandEncoder>)context->encoder;
     m4_stage_barrier(context,MTLStageAccelerationStructure);
     if (refit) {
       m4_as_resources(context->recording,nil,a[2]);
-      [encoder refitAccelerationStructure:m4obj(dxmt_as_sidecar_acceleration_structure(a[2])) descriptor:descriptor->descriptor destination:target scratchBuffer:m4_buffer_range(scratch,offset)];
+      [encoder refitAccelerationStructure:m4obj(d3dalloy_as_sidecar_acceleration_structure(a[2])) descriptor:descriptor->descriptor destination:target scratchBuffer:m4_buffer_range(scratch,offset)];
     } else [encoder buildAccelerationStructure:target descriptor:descriptor->descriptor scratchBuffer:m4_buffer_range(scratch,offset)];
     call->ret[0]=1; return M4_SUCCESS;
   }
   case WMTMetal4ASCopy: {
-    DXMTM4ComputeEncoder *context=(DXMTM4ComputeEncoder *)m4obj(a[0]); if (a[3]>1) return M4_INVALID;
+    D3DALLOYM4ComputeEncoder *context=(D3DALLOYM4ComputeEncoder *)m4obj(a[0]); if (a[3]>1) return M4_INVALID;
     m4_as_resources(context->recording,nil,a[1]); m4_as_resources(context->recording,nil,a[2]);
     id<MTL4ComputeCommandEncoder> encoder=(id<MTL4ComputeCommandEncoder>)context->encoder;
-    id<MTLAccelerationStructure> source=m4obj(dxmt_as_sidecar_acceleration_structure(a[1])),destination=m4obj(dxmt_as_sidecar_acceleration_structure(a[2]));
+    id<MTLAccelerationStructure> source=m4obj(d3dalloy_as_sidecar_acceleration_structure(a[1])),destination=m4obj(d3dalloy_as_sidecar_acceleration_structure(a[2]));
     m4_stage_barrier(context,MTLStageAccelerationStructure);
     if (a[3]) [encoder copyAndCompactAccelerationStructure:source toAccelerationStructure:destination];
     else [encoder copyAccelerationStructure:source toAccelerationStructure:destination];
     call->ret[0]=1; return M4_SUCCESS;
   }
   case WMTMetal4ASCompactedSize: {
-    DXMTM4ComputeEncoder *context=(DXMTM4ComputeEncoder *)m4obj(a[0]); id<MTLBuffer> buffer=m4obj(a[2]);
+    D3DALLOYM4ComputeEncoder *context=(D3DALLOYM4ComputeEncoder *)m4obj(a[0]); id<MTLBuffer> buffer=m4obj(a[2]);
     if (!buffer || a[3]>buffer.length || buffer.length-a[3]<sizeof(uint64_t)) return M4_INVALID;
     m4_as_resources(context->recording,nil,a[1]); m4_allocation(context->recording,buffer);
     m4_stage_barrier(context,MTLStageAccelerationStructure);
-    [(id<MTL4ComputeCommandEncoder>)context->encoder writeCompactedAccelerationStructureSize:m4obj(dxmt_as_sidecar_acceleration_structure(a[1])) toBuffer:MTL4BufferRangeMake(buffer.gpuAddress+a[3],sizeof(uint64_t))];
+    [(id<MTL4ComputeCommandEncoder>)context->encoder writeCompactedAccelerationStructureSize:m4obj(d3dalloy_as_sidecar_acceleration_structure(a[1])) toBuffer:MTL4BufferRangeMake(buffer.gpuAddress+a[3],sizeof(uint64_t))];
     return M4_SUCCESS;
   }
   case WMTMetal4ASPrepass: {
-    DXMTM4ComputeEncoder *context=(DXMTM4ComputeEncoder *)m4obj(a[0]); id<MTLComputePipelineState> state=m4obj(a[1]);
+    D3DALLOYM4ComputeEncoder *context=(D3DALLOYM4ComputeEncoder *)m4obj(a[0]); id<MTLComputePipelineState> state=m4obj(a[1]);
     const struct WMTASPrepassInfo *info=(const void *)(uintptr_t)a[12];
     if (!state || !info || !a[6] || !a[10]) return M4_INVALID;
     id<MTL4ComputeCommandEncoder> encoder=(id<MTL4ComputeCommandEncoder>)context->encoder;
@@ -1039,13 +1039,13 @@ static int32_t m4_as_call(struct WMTMetal4Call *call) {
 
 /* Called with the submission condition locked. Native commit can still be
  * using its exact command/allocator/resource identities when feedback arrives. */
-static void m4_finish_submission(DXMTM4Submission *submission) {
+static void m4_finish_submission(D3DALLOYM4Submission *submission) {
   if (!submission->commitReturned || !submission->feedbackReceived) return;
   // Removal waits for native commit return AND GPU retirement. The device set
   // keeps an allocation only while another live recording still uses it.
   for (id lease in submission->leases) {
-    if (![lease isKindOfClass:[DXMTM4Recording class]]) continue;
-    DXMTM4Recording *recording=lease;
+    if (![lease isKindOfClass:[D3DALLOYM4Recording class]]) continue;
+    D3DALLOYM4Recording *recording=lease;
     m4_release_residency(recording);
     if (recording->trace) {
       M4BindingCounters c=recording->counters;
@@ -1059,7 +1059,7 @@ static void m4_finish_submission(DXMTM4Submission *submission) {
     }
   }
   [submission->leases removeAllObjects];
-  for (DXMTM4CommandBuffer *context in submission->buffers)
+  for (D3DALLOYM4CommandBuffer *context in submission->buffers)
     atomic_fetch_sub_explicit(&context->inFlight,1,memory_order_release);
   submission->completed=YES; [submission->condition broadcast];
 }
@@ -1070,7 +1070,7 @@ static int32_t m4_commit(struct WMTMetal4Call *call) {
   if (!queue || !handles || !count || count>NSUIntegerMax/sizeof(id)) return M4_INVALID;
   uint64_t command_count = count;
   for (uint64_t i=0;i<count;++i) {
-    DXMTM4CommandBuffer *context=m4cb(handles[i]);
+    D3DALLOYM4CommandBuffer *context=m4cb(handles[i]);
     if (!context || !context->recording || !context->ended || atomic_load_explicit(&context->inFlight,memory_order_acquire))
       return M4_INVALID;
     if (context->recording->segments.count > NSUIntegerMax/sizeof(id) - command_count) return M4_INVALID;
@@ -1078,19 +1078,19 @@ static int32_t m4_commit(struct WMTMetal4Call *call) {
   }
   id<MTL4CommandBuffer> local[32]; id<MTL4CommandBuffer> *commands=command_count<=32?local:malloc(command_count*sizeof(*commands));
   if (!commands) return M4_FAILED;
-  DXMTM4Submission *submission=[DXMTM4Submission new]; submission->condition=[NSCondition new];
+  D3DALLOYM4Submission *submission=[D3DALLOYM4Submission new]; submission->condition=[NSCondition new];
   submission->leases=[[NSMutableArray alloc] initWithCapacity:count*3]; submission->buffers=[[NSMutableArray alloc] initWithCapacity:count];
   submission->presentTickets=[NSMutableArray new];
   NSUInteger command_index = 0;
   for (uint64_t i=0;i<count;++i) {
-    DXMTM4CommandBuffer *context=m4cb(handles[i]);
+    D3DALLOYM4CommandBuffer *context=m4cb(handles[i]);
     for (id<MTL4CommandBuffer> segment in context->recording->segments) commands[command_index++]=segment;
     commands[command_index++]=context->command; [submission->buffers addObject:context];
     [submission->leases addObject:context->recording]; [submission->leases addObject:context->command]; [submission->leases addObject:context->allocator];
     [submission->presentTickets addObjectsFromArray:context->recording->presentTickets];
     if (context->recording->error && !submission->error) submission->error=[context->recording->error retain];
   }
-  for (DXMTM4CommandBuffer *context in submission->buffers) {
+  for (D3DALLOYM4CommandBuffer *context in submission->buffers) {
     atomic_fetch_add_explicit(&context->inFlight,1,memory_order_release);
     [context->recording release]; context->recording=nil;
   }
@@ -1107,13 +1107,13 @@ static int32_t m4_commit(struct WMTMetal4Call *call) {
     }];
     // preCommit snapshots the shared device set; no retirement may remove an
     // allocation while it traverses that set (the per-device lock, 4.0b3 +0xc4).
-    DXMTM4DeviceResidency *shared=m4cb(handles[0])->residency;
+    D3DALLOYM4DeviceResidency *shared=m4cb(handles[0])->residency;
     [shared->lock lock];
     [queue commit:commands count:command_count options:options]; [options release];
     [shared->lock unlock];
     // Signal each drawable after its commit and present it immediately; the
     // display waits for the signal, not the CPU (D3DMetal 4.0b3 DoPresent).
-    for (DXMTM4PresentTicket *ticket in submission->presentTickets) {
+    for (D3DALLOYM4PresentTicket *ticket in submission->presentTickets) {
       id<CAMetalDrawable> primary, residual;
       winemetal_composition_drawables(ticket->drawable, &primary, &residual);
       [queue signalDrawable:primary];
@@ -1140,7 +1140,7 @@ int32_t winemetal_metal4_call(void *params) {
     case WMTMetal4Supports: call->ret[0]=[(id<MTLDevice>)m4obj(a[0]) supportsFamily:MTLGPUFamilyMetal4]; return M4_SUCCESS;
     case WMTMetal4NewTextureViewPool: {
       if (!a[1]) return M4_INVALID;
-      DXMTM4ViewPool *views=[DXMTM4ViewPool new];
+      D3DALLOYM4ViewPool *views=[D3DALLOYM4ViewPool new];
       MTLResourceViewPoolDescriptor *descriptor=[MTLResourceViewPoolDescriptor new];
       descriptor.resourceViewCount=a[1];
       views->pool=[(id<MTLDevice>)m4obj(a[0]) newTextureViewPoolWithDescriptor:descriptor error:nil];
@@ -1159,7 +1159,7 @@ int32_t winemetal_metal4_call(void *params) {
       call->ret[0]=(uint64_t)views; return M4_SUCCESS;
     }
     case WMTMetal4SetTextureView: {
-      DXMTM4ViewPool *views=m4obj(a[0]);
+      D3DALLOYM4ViewPool *views=m4obj(a[0]);
       const struct WMTTextureViewPoolInfo *info=(const struct WMTTextureViewPoolInfo *)(uintptr_t)a[2];
       if (!a[1] || !info || a[3]>=views->textures.count) return M4_INVALID;
       @synchronized(views) {
@@ -1168,7 +1168,7 @@ int32_t winemetal_metal4_call(void *params) {
       return call->ret[0] ? M4_SUCCESS : M4_FAILED;
     }
     case WMTMetal4CopyTextureViews: {
-      DXMTM4ViewPool *views=m4obj(a[0]), *source=m4obj(a[1]);
+      D3DALLOYM4ViewPool *views=m4obj(a[0]), *source=m4obj(a[1]);
       const struct WMTTextureViewPoolInfo *info=(const struct WMTTextureViewPoolInfo *)(uintptr_t)a[5];
       if (!source || !a[4] || !info || a[2]>=source->textures.count || a[3]>=views->textures.count) return M4_INVALID;
       // D3D12 serializes writes/copies to the same slots; copy one slot so overlap has CPU memmove order.
@@ -1195,7 +1195,7 @@ int32_t winemetal_metal4_call(void *params) {
       return call->ret[0] ? M4_SUCCESS : M4_FAILED;
     }
     case WMTMetal4CopyTextureViewsRange: {
-      DXMTM4ViewPool *views=m4obj(a[0]), *source=m4obj(a[1]);
+      D3DALLOYM4ViewPool *views=m4obj(a[0]), *source=m4obj(a[1]);
       NSUInteger from=a[2], to=a[3], count=a[4];
       if (!views || !source || !views->pool || !source->pool || !count ||
           from > source->textures.count || count > source->textures.count-from ||
@@ -1217,7 +1217,7 @@ int32_t winemetal_metal4_call(void *params) {
       return M4_SUCCESS;
     }
     case WMTMetal4ClearTextureView: {
-      DXMTM4ViewPool *views=m4obj(a[0]); if (a[1]>=views->textures.count) return M4_INVALID;
+      D3DALLOYM4ViewPool *views=m4obj(a[0]); if (a[1]>=views->textures.count) return M4_INVALID;
       @synchronized(views) {
         [views replaceTexture:[NSNull null] atIndex:a[1]];
         if (views->ordinaryViews) [views replaceOrdinaryView:nil atIndex:a[1]];
@@ -1233,7 +1233,7 @@ int32_t winemetal_metal4_call(void *params) {
         if (indices[i]>=8) { [mapping release]; return M4_INVALID; }
         [mapping setPhysicalIndex:indices[i] forLogicalIndex:i];
       }
-      DXMTM4RenderEncoder *context=m4obj(a[0]);
+      D3DALLOYM4RenderEncoder *context=m4obj(a[0]);
       [(id<MTL4RenderCommandEncoder>)context->encoder setColorAttachmentMap:mapping];
       [mapping release]; return M4_SUCCESS;
     }
@@ -1241,13 +1241,13 @@ int32_t winemetal_metal4_call(void *params) {
     case WMTMetal4ResetAllocator: [(id<MTL4CommandAllocator>)m4obj(a[0]) reset]; return M4_SUCCESS;
     case WMTMetal4AllocatorSize: call->ret[0]=[(id<MTL4CommandAllocator>)m4obj(a[0]) allocatedSize]; return M4_SUCCESS;
     case WMTMetal4NewCommandBuffer: {
-      DXMTM4CommandBuffer *context=[DXMTM4CommandBuffer new]; context->device=[m4obj(a[0]) retain];
+      D3DALLOYM4CommandBuffer *context=[D3DALLOYM4CommandBuffer new]; context->device=[m4obj(a[0]) retain];
       context->command=[context->device newCommandBuffer]; context->uploads=[NSMutableArray new]; atomic_init(&context->inFlight,0);
       if (!context->command) { [context release]; return M4_FAILED; }
       call->ret[0]=(uint64_t)context; return M4_SUCCESS;
     }
     case WMTMetal4BeginCommandBuffer: {
-      DXMTM4CommandBuffer *context=m4cb(a[0]); if (!a[1] || context->recording || atomic_load_explicit(&context->inFlight,memory_order_acquire)) return M4_INVALID;
+      D3DALLOYM4CommandBuffer *context=m4cb(a[0]); if (!a[1] || context->recording || atomic_load_explicit(&context->inFlight,memory_order_acquire)) return M4_INVALID;
       if (context->ended) {
         /* macOS 27 MetalTools keeps retired heap-usage entries across begin.
          * A subsequent preCommit dereferences a freed GPU debug heap, even
@@ -1259,7 +1259,7 @@ int32_t winemetal_metal4_call(void *params) {
         [context->command release]; context->command=command;
       }
       [context->allocator release]; context->allocator=[m4obj(a[1]) retain];
-      context->recording=[DXMTM4Recording new]; context->recording->objects=[NSMutableSet new]; context->recording->encoders=[NSMutableArray new];
+      context->recording=[D3DALLOYM4Recording new]; context->recording->objects=[NSMutableSet new]; context->recording->encoders=[NSMutableArray new];
       context->recording->presentTickets=[NSMutableArray new];
       context->recording->allocations=[NSMutableSet new];
       context->recording->pending=[NSMutableArray new]; context->recording->published=[NSMutableArray new];
@@ -1275,16 +1275,16 @@ int32_t winemetal_metal4_call(void *params) {
       [context->command beginCommandBufferWithAllocator:context->allocator]; return M4_SUCCESS;
     }
     case WMTMetal4EndCommandBuffer: {
-      DXMTM4CommandBuffer *context=m4cb(a[0]); if (!context->recording || context->ended) return M4_INVALID;
+      D3DALLOYM4CommandBuffer *context=m4cb(a[0]); if (!context->recording || context->ended) return M4_INVALID;
       m4_commit_residency(context->recording);
       [context->command useResidencySet:context->recording->residency->set];
       for (NSUInteger i=0;i<context->debugGroups.count;++i) [context->command popDebugGroup];
       [context->command endCommandBuffer]; context->ended=YES; return M4_SUCCESS;
     }
     case WMTMetal4RenderEncoder: {
-      DXMTM4CommandBuffer *owner=m4cb(a[0]); if (!owner->recording || owner->ended || !a[1]) return M4_INVALID;
+      D3DALLOYM4CommandBuffer *owner=m4cb(a[0]); if (!owner->recording || owner->ended || !a[1]) return M4_INVALID;
       MTL4RenderPassDescriptor *descriptor=m4_render_pass(owner,(const void *)(uintptr_t)a[1]); if (!descriptor) return M4_FAILED;
-      DXMTM4RenderEncoder *context=[DXMTM4RenderEncoder new]; context->owner=owner; context->recording=owner->recording;
+      D3DALLOYM4RenderEncoder *context=[D3DALLOYM4RenderEncoder new]; context->owner=owner; context->recording=owner->recording;
       /* Registering a visibility mode makes Reset write the scratch buffer
        * before rasterization, even if the mode is disabled before drawing.
        * A Fragment-only wait therefore cannot protect a preceding GPU read. */
@@ -1295,18 +1295,18 @@ int32_t winemetal_metal4_call(void *params) {
       [owner->recording->encoders addObject:context]; call->ret[0]=(uint64_t)context; [context release]; return M4_SUCCESS;
     }
     case WMTMetal4ComputeEncoder: {
-      DXMTM4CommandBuffer *owner=m4cb(a[0]); if (!owner->recording || owner->ended) return M4_INVALID;
-      DXMTM4ComputeEncoder *context=[DXMTM4ComputeEncoder new]; context->owner=owner; context->recording=owner->recording;
+      D3DALLOYM4CommandBuffer *owner=m4cb(a[0]); if (!owner->recording || owner->ended) return M4_INVALID;
+      D3DALLOYM4ComputeEncoder *context=[D3DALLOYM4ComputeEncoder new]; context->owner=owner; context->recording=owner->recording;
       context->compute=YES;
       context->concurrent=a[1]!=0;
       context->encoder=[[owner->command computeCommandEncoder] retain];
       if (!context->encoder) { [context release]; return M4_FAILED; }
       [owner->recording->encoders addObject:context]; call->ret[0]=(uint64_t)context; [context release]; return M4_SUCCESS;
     }
-    case WMTMetal4EndEncoding: [((DXMTM4Encoder *)m4obj(a[0]))->encoder endEncoding]; return M4_SUCCESS;
-    case WMTMetal4SetEncoderLabel: ((DXMTM4Encoder *)m4obj(a[0]))->encoder.label=m4obj(a[1]); return M4_SUCCESS;
+    case WMTMetal4EndEncoding: [((D3DALLOYM4Encoder *)m4obj(a[0]))->encoder endEncoding]; return M4_SUCCESS;
+    case WMTMetal4SetEncoderLabel: ((D3DALLOYM4Encoder *)m4obj(a[0]))->encoder.label=m4obj(a[1]); return M4_SUCCESS;
     case WMTMetal4Diagnostic: {
-      DXMTM4CommandBuffer *context=m4cb(a[0]);
+      D3DALLOYM4CommandBuffer *context=m4cb(a[0]);
       if (!context->recording || context->ended || a[1]>3 || (a[3] && !a[2])) return M4_INVALID;
       NSString *label=[[[NSString alloc] initWithBytes:(const void *)(uintptr_t)a[2]
         length:a[3] encoding:NSUTF8StringEncoding] autorelease];
@@ -1328,16 +1328,16 @@ int32_t winemetal_metal4_call(void *params) {
       }
       return M4_SUCCESS;
     }
-    case WMTMetal4RenderCommands: return m4_render_commands((DXMTM4RenderEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
-    case WMTMetal4ComputeCommands: return m4_compute_commands((DXMTM4ComputeEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
-    case WMTMetal4BlitCommands: return m4_blit_commands((DXMTM4ComputeEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
+    case WMTMetal4RenderCommands: return m4_render_commands((D3DALLOYM4RenderEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
+    case WMTMetal4ComputeCommands: return m4_compute_commands((D3DALLOYM4ComputeEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
+    case WMTMetal4BlitCommands: return m4_blit_commands((D3DALLOYM4ComputeEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
     case WMTMetal4Commit: return m4_commit(call);
     case WMTMetal4WaitSubmission: {
-      DXMTM4Submission *submission=(DXMTM4Submission *)m4obj(a[0]); [submission->condition lock];
+      D3DALLOYM4Submission *submission=(D3DALLOYM4Submission *)m4obj(a[0]); [submission->condition lock];
       while (!submission->completed) [submission->condition wait]; [submission->condition unlock]; return M4_SUCCESS;
     }
     case WMTMetal4GetSubmissionInfo: {
-      if (!a[1]) return M4_INVALID; DXMTM4Submission *submission=(DXMTM4Submission *)m4obj(a[0]);
+      if (!a[1]) return M4_INVALID; D3DALLOYM4Submission *submission=(D3DALLOYM4Submission *)m4obj(a[0]);
       struct WMTMetal4SubmissionInfo *info=(void *)(uintptr_t)a[1]; [submission->condition lock];
       *info=(struct WMTMetal4SubmissionInfo){submission->completed,(uint64_t)submission->error,submission->gpuStart,submission->gpuEnd};
       [submission->condition unlock]; return M4_SUCCESS;
@@ -1362,15 +1362,15 @@ int32_t winemetal_metal4_call(void *params) {
       return M4_SUCCESS;
     }
     case WMTMetal4UseResidencySet: {
-      DXMTM4CommandBuffer *context=m4cb(a[0]); if (!context->recording) return M4_INVALID;
+      D3DALLOYM4CommandBuffer *context=m4cb(a[0]); if (!context->recording) return M4_INVALID;
       m4_retain(context->recording,m4obj(a[1])); [context->command useResidencySet:m4obj(a[1])]; return M4_SUCCESS;
     }
     case WMTMetal4UseAllocation: {
-      DXMTM4CommandBuffer *context=m4cb(a[0]); if (!context->recording || context->ended) return M4_INVALID;
+      D3DALLOYM4CommandBuffer *context=m4cb(a[0]); if (!context->recording || context->ended) return M4_INVALID;
       m4_allocation(context->recording,m4obj(a[1])); return M4_SUCCESS;
     }
     case WMTMetal4UseDrawable: {
-      DXMTM4CommandBuffer *context=m4cb(a[0]);
+      D3DALLOYM4CommandBuffer *context=m4cb(a[0]);
       if (!context->recording || context->ended || !a[1]) return M4_INVALID;
       id<CAMetalDrawable> primary, residual;
       winemetal_composition_drawables(m4obj(a[1]), &primary, &residual);
@@ -1398,17 +1398,17 @@ int32_t winemetal_metal4_call(void *params) {
     case WMTMetal4TableSampler: [(id<MTL4ArgumentTable>)m4obj(a[0]) setSamplerState:(MTLResourceID){a[1]} atIndex:a[2]]; return M4_SUCCESS;
     case WMTMetal4TableAddressStride: [(id<MTL4ArgumentTable>)m4obj(a[0]) setAddress:a[1] attributeStride:a[2] atIndex:a[3]]; return M4_SUCCESS;
     case WMTMetal4ComputeArgumentTable: {
-      DXMTM4ComputeEncoder *context=(DXMTM4ComputeEncoder *)m4obj(a[0]); m4_retain(context->recording,m4obj(a[1]));
+      D3DALLOYM4ComputeEncoder *context=(D3DALLOYM4ComputeEncoder *)m4obj(a[0]); m4_retain(context->recording,m4obj(a[1]));
       context->tableBound[0]=NO;
       [(id<MTL4ComputeCommandEncoder>)context->encoder setArgumentTable:m4obj(a[1])]; return M4_SUCCESS;
     }
     case WMTMetal4RenderArgumentTable: {
-      DXMTM4RenderEncoder *context=(DXMTM4RenderEncoder *)m4obj(a[0]); m4_retain(context->recording,m4obj(a[1]));
+      D3DALLOYM4RenderEncoder *context=(D3DALLOYM4RenderEncoder *)m4obj(a[0]); m4_retain(context->recording,m4obj(a[1]));
       for (unsigned stage=0;stage<4;++stage) if (a[2]&m4_render_stages[stage]) context->tableBound[stage]=NO;
       [(id<MTL4RenderCommandEncoder>)context->encoder setArgumentTable:m4obj(a[1]) atStages:(MTLRenderStages)a[2]]; return M4_SUCCESS;
     }
     case WMTMetal4Barrier: {
-      DXMTM4Encoder *context=(DXMTM4Encoder *)m4obj(a[0]); id<MTL4CommandEncoder> encoder=context->encoder;
+      D3DALLOYM4Encoder *context=(D3DALLOYM4Encoder *)m4obj(a[0]); id<MTL4CommandEncoder> encoder=context->encoder;
       if (a[1]==0) [encoder barrierAfterQueueStages:(MTLStages)a[2] beforeStages:(MTLStages)a[3] visibilityOptions:(MTL4VisibilityOptions)a[4]];
       else if (a[1]==1) [encoder barrierAfterStages:(MTLStages)a[2] beforeQueueStages:(MTLStages)a[3] visibilityOptions:(MTL4VisibilityOptions)a[4]];
       else if (a[1]==2) [encoder barrierAfterEncoderStages:(MTLStages)a[2] beforeEncoderStages:(MTLStages)a[3] visibilityOptions:(MTL4VisibilityOptions)a[4]];
@@ -1417,7 +1417,7 @@ int32_t winemetal_metal4_call(void *params) {
       return M4_SUCCESS;
     }
     case WMTMetal4Fence: {
-      DXMTM4Encoder *context=(DXMTM4Encoder *)m4obj(a[0]); m4_retain(context->recording,m4obj(a[1]));
+      D3DALLOYM4Encoder *context=(D3DALLOYM4Encoder *)m4obj(a[0]); m4_retain(context->recording,m4obj(a[1]));
       if (a[2]) [context->encoder updateFence:m4obj(a[1]) afterEncoderStages:(MTLStages)a[3]];
       else [context->encoder waitForFence:m4obj(a[1]) beforeEncoderStages:(MTLStages)a[3]|context->fenceWaitStages]; return M4_SUCCESS;
     }
@@ -1428,7 +1428,7 @@ int32_t winemetal_metal4_call(void *params) {
 }
 
 
-static int32_t m4_compute_commands(DXMTM4ComputeEncoder *context, const struct wmtcmd_base *next) {
+static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next) {
   id<MTL4ComputeCommandEncoder> encoder=(id<MTL4ComputeCommandEncoder>)context->encoder;
   while (next) {
     switch ((enum WMTComputeCommandType)next->type) {
@@ -1532,7 +1532,7 @@ static int32_t m4_compute_commands(DXMTM4ComputeEncoder *context, const struct w
   }
   return context->recording->error ? M4_FAILED : M4_SUCCESS;
 }
-static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmtcmd_base *next) {
+static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct wmtcmd_base *next) {
   id<MTL4RenderCommandEncoder> encoder=(id<MTL4RenderCommandEncoder>)context->encoder;
   while (next) {
     switch ((enum WMTRenderCommandType)next->type) {
@@ -1756,16 +1756,16 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
       [encoder barrierAfterEncoderStages:(MTLStages)body->stages_after beforeEncoderStages:(MTLStages)body->stages_before visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
-    case WMTRenderCommandDXMTGeometryDraw: {
-      struct wmtcmd_render_dxmt_geometry_draw *body = (struct wmtcmd_render_dxmt_geometry_draw *)next;
+    case WMTRenderCommandD3DalloyGeometryDraw: {
+      struct wmtcmd_render_d3dalloy_geometry_draw *body = (struct wmtcmd_render_d3dalloy_geometry_draw *)next;
       m4_render_offset(context,3,body->draw_arguments_offset,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
       break;
     }
-    case WMTRenderCommandDXMTGeometryDrawIndexed: {
-      struct wmtcmd_render_dxmt_geometry_draw_indexed *body = (struct wmtcmd_render_dxmt_geometry_draw_indexed *)next;
+    case WMTRenderCommandD3DalloyGeometryDrawIndexed: {
+      struct wmtcmd_render_d3dalloy_geometry_draw_indexed *body = (struct wmtcmd_render_d3dalloy_geometry_draw_indexed *)next;
       m4_render_buffer(context,3,m4obj(body->index_buffer),body->index_buffer_offset,SM50_BINDING_INDEX_INDEX_BUFFER);
       m4_render_offset(context,3,body->draw_arguments_offset,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
@@ -1773,8 +1773,8 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
       break;
     }
-    case WMTRenderCommandDXMTGeometryDrawIndirect: {
-      struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
+    case WMTRenderCommandD3DalloyGeometryDrawIndirect: {
+      struct wmtcmd_render_d3dalloy_geometry_draw_indirect *body = (struct wmtcmd_render_d3dalloy_geometry_draw_indirect *)next;
       m4_render_buffer(context,3,m4obj(body->indirect_args_buffer),body->indirect_args_offset,SM50_BINDING_INDEX_INDIRECT_ARGUMENTS);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->dispatch_args_buffer,body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
@@ -1782,9 +1782,9 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
       m4_render_buffer(context,3,m4obj(body->imm_draw_arguments),0,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
       break;
     }
-    case WMTRenderCommandDXMTGeometryDrawIndexedIndirect: {
-      struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *body =
-          (struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)next;
+    case WMTRenderCommandD3DalloyGeometryDrawIndexedIndirect: {
+      struct wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect *body =
+          (struct wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect *)next;
       m4_render_buffer(context,3,m4obj(body->index_buffer),body->index_buffer_offset,SM50_BINDING_INDEX_INDEX_BUFFER);
       m4_render_buffer(context,3,m4obj(body->indirect_args_buffer),body->indirect_args_offset,SM50_BINDING_INDEX_INDIRECT_ARGUMENTS);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->dispatch_args_buffer,body->dispatch_args_offset)
@@ -1793,17 +1793,17 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
       m4_render_buffer(context,3,m4obj(body->imm_draw_arguments),0,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
       break;
     }
-    case WMTRenderCommandDXMTTessellationMeshDraw: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw *)next;
+    case WMTRenderCommandD3DalloyTessellationMeshDraw: {
+      struct wmtcmd_render_d3dalloy_tessellation_mesh_draw *body = (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw *)next;
       m4_render_offset(context,3,body->draw_arguments_offset,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
       break;
     }
-    case WMTRenderCommandDXMTTessellationMeshDrawIndexed: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *body =
-          (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *)next;
+    case WMTRenderCommandD3DalloyTessellationMeshDrawIndexed: {
+      struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed *body =
+          (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed *)next;
       m4_render_buffer(context,3,m4obj(body->index_buffer),body->index_buffer_offset,SM50_BINDING_INDEX_INDEX_BUFFER);
       m4_render_offset(context,3,body->draw_arguments_offset,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
@@ -1812,8 +1812,8 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
       break;
     }
 
-    case WMTRenderCommandDXMTTessellationMeshDrawIndirect: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *)next;
+    case WMTRenderCommandD3DalloyTessellationMeshDrawIndirect: {
+      struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indirect *)next;
       m4_render_buffer(context,3,m4obj(body->indirect_args_buffer),body->indirect_args_offset,SM50_BINDING_INDEX_INDIRECT_ARGUMENTS);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->dispatch_args_buffer,body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
@@ -1821,9 +1821,9 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
       m4_render_buffer(context,3,m4obj(body->imm_draw_arguments),0,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
       break;
     }
-    case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *body =
-          (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *)next;
+    case WMTRenderCommandD3DalloyTessellationMeshDrawIndexedIndirect: {
+      struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed_indirect *body =
+          (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed_indirect *)next;
       m4_render_buffer(context,3,m4obj(body->index_buffer),body->index_buffer_offset,SM50_BINDING_INDEX_INDEX_BUFFER);
       m4_render_buffer(context,3,m4obj(body->indirect_args_buffer),body->indirect_args_offset,SM50_BINDING_INDEX_INDIRECT_ARGUMENTS);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->dispatch_args_buffer,body->dispatch_args_offset)
@@ -1884,7 +1884,7 @@ static int32_t m4_render_commands(DXMTM4RenderEncoder *context, const struct wmt
 
 
 
-static int32_t m4_blit_commands(DXMTM4ComputeEncoder *context, const struct wmtcmd_base *next) {
+static int32_t m4_blit_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next) {
   id<MTL4ComputeCommandEncoder> encoder=(id<MTL4ComputeCommandEncoder>)context->encoder;
   while (next) {
     switch ((enum WMTBlitCommandType)next->type) {

@@ -19,10 +19,10 @@
 #include "dxbc_converter.hpp"
 
 using namespace microsoft;
-using namespace dxmt::air;
-using namespace dxmt::shader::common;
+using namespace d3dalloy::air;
+using namespace d3dalloy::shader::common;
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 inline std::optional<air::Interpolation>
 to_air_interpolation(microsoft::D3D10_SB_INTERPOLATION_MODE mode) {
@@ -351,7 +351,7 @@ void handle_signature_ps(
         // Ordinary user metadata is only a compiler placeholder. transformPixel removes it
         // from all native entries and supplies the gathered geometric value to the body.
         auto index = ctx.captured_pixel ? ctx.func_signature.DefineInput(InputFragmentStageIn{
-          .user = "dxmt_inner_coverage", .type = msl_uint, .interpolation = Interpolation::flat,
+          .user = "d3dalloy_inner_coverage", .type = msl_uint, .interpolation = Interpolation::flat,
           .pull_mode = false,
         }) : ~0u;
         ctx.prologue << make_effect([=](struct context ctx) {
@@ -1363,4 +1363,4 @@ void handle_signature(
   }
 }
 
-}; // namespace dxmt::dxbc
+}; // namespace d3dalloy::dxbc

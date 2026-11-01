@@ -534,10 +534,11 @@ struct OutputResource {
 
 OutputResource makeOutput(
     Gpu& gpu, UINT tag,
-    DXGI_FORMAT parentFormat = DXGI_FORMAT_R8G8B8A8_UNORM) {
+    DXGI_FORMAT parentFormat = DXGI_FORMAT_R8G8B8A8_UNORM,
+    UINT backingWidth = kOutputBacking, UINT backingHeight = kOutputBacking) {
     OutputResource result;
     result.resource =
-        createTexture(gpu.device.Get(), kOutputBacking, kOutputBacking,
+        createTexture(gpu.device.Get(), backingWidth, backingHeight,
                       parentFormat,
                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                       D3D12_RESOURCE_STATE_COPY_DEST);
@@ -548,10 +549,10 @@ OutputResource makeOutput(
         static_cast<std::uint8_t>(83u + (tag % 47u)),
     };
     std::vector<std::uint8_t> pixels(
-        static_cast<std::size_t>(kOutputBacking) * kOutputBacking * 4);
+        static_cast<std::size_t>(backingWidth) * backingHeight * 4);
     for (std::size_t i = 0; i < pixels.size(); i += 4)
         std::copy(result.sentinel.begin(), result.sentinel.end(), pixels.begin() + i);
-    uploadTexture(gpu, result.resource.Get(), pixels.data(), kOutputBacking * 4,
+    uploadTexture(gpu, result.resource.Get(), pixels.data(), backingWidth * 4,
                   D3D12_RESOURCE_STATE_COPY_SOURCE);
     result.readback = createTextureReadback(gpu, result.resource.Get());
     return result;
@@ -567,8 +568,9 @@ OutputStats validateOutput(const OutputResource& output, std::uint8_t inputTag,
                            const char* caseName, UINT frame,
                            UINT outputBaseX = 0, UINT outputBaseY = 0,
                            UINT outputWidth = kOutputWidth, UINT outputHeight = kOutputHeight) {
-    if (!outputWidth || !outputHeight || outputBaseX + outputWidth > kOutputBacking ||
-        outputBaseY + outputHeight > kOutputBacking)
+    const auto backing = output.resource->GetDesc();
+    if (!outputWidth || !outputHeight || outputBaseX + outputWidth > backing.Width ||
+        outputBaseY + outputHeight > backing.Height)
         fail("output validation rectangle exceeds backing");
     D3D12_RANGE range{0, static_cast<SIZE_T>(output.readback.totalBytes)};
     std::uint8_t* data = nullptr;
@@ -578,11 +580,11 @@ OutputStats validateOutput(const OutputResource& output, std::uint8_t inputTag,
     double sum = 0.0;
     std::size_t samples = 0;
     std::size_t changedInside = 0;
-    for (UINT y = 0; y < kOutputBacking; ++y) {
+    for (UINT y = 0; y < backing.Height; ++y) {
         const std::uint8_t* row =
             data + output.readback.footprint.Offset +
             static_cast<std::size_t>(y) * output.readback.footprint.Footprint.RowPitch;
-        for (UINT x = 0; x < kOutputBacking; ++x) {
+        for (UINT x = 0; x < backing.Width; ++x) {
             const std::uint8_t* pixel = row + static_cast<std::size_t>(x) * 4;
             const bool inside =
                 x >= outputBaseX && x < outputBaseX + outputWidth &&
@@ -1192,22 +1194,36 @@ void runGenerationTransitionReplay(
         "expected_reset_sequence=1,1,1,0");
 }
 
-void runDescriptorABCReuse(Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
-                           ID3D12Resource* depth, ID3D12Resource* motion) {
+void runDescriptorABCReuse(Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension) {
+    constexpr UINT inputWidth = 1280, inputHeight = 720;
+    const std::array<UINT, 4> widths{1920, 1600, 2560, 1920};
+    const UINT maxWidth = *std::max_element(widths.begin(), widths.end());
+    const UINT maxHeight = maxWidth * inputHeight / inputWidth;
+    const UINT padding = kOutputBacking - kOutputWidth;
+    auto depth = makeDepth(gpu, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                           DXGI_FORMAT_D32_FLOAT_S8X24_UINT, inputWidth, inputHeight);
+    auto motion = makeMotion(gpu, DXGI_FORMAT_R16G16_FLOAT, inputWidth, inputHeight);
     auto create = makeCreateDesc();
+    create.InputWidth = inputWidth;
+    create.InputHeight = inputHeight;
+    create.OutputWidth = maxWidth;
+    create.OutputHeight = maxHeight;
     create.DynamicOutputEnabled = TRUE;
     ComPtr<IMTLD3D12TemporalUpscaleState> state;
     check(deviceExtension->CreateTemporalUpscaleState(&create, &state),
           "ABC descriptor reuse CreateTemporalUpscaleState");
-    const std::array<UINT, 4> widths{128, 112, 96, 128};
     const std::array<std::uint8_t, 4> tags{112, 144, 176, 112};
     std::array<OutputResource, 4> outputs;
     std::array<Recording, 4> recordings;
     for (std::size_t i = 0; i < recordings.size(); ++i) {
-        auto color = makeColor(gpu, tags[i]);
-        outputs[i] = makeOutput(gpu, 880 + static_cast<UINT>(i));
-        auto desc = makeFrameDesc(color.Get(), outputs[i].resource.Get(), depth, motion, TRUE);
-        desc.OutputWidth = desc.OutputHeight = widths[i];
+        auto color = makeColor(gpu, tags[i], DXGI_FORMAT_R8G8B8A8_UNORM, inputWidth, inputHeight);
+        outputs[i] = makeOutput(gpu, 880 + static_cast<UINT>(i), DXGI_FORMAT_R8G8B8A8_UNORM,
+                                maxWidth + padding, maxHeight + padding);
+        auto desc = makeFrameDesc(color.Get(), outputs[i].resource.Get(), depth.Get(), motion.Get(), TRUE);
+        desc.InputContentWidth = inputWidth;
+        desc.InputContentHeight = inputHeight;
+        desc.OutputWidth = widths[i];
+        desc.OutputHeight = widths[i] * inputHeight / inputWidth;
         recordings[i] = recordTemporal(gpu, state.Get(), desc, outputs[i]);
     }
     state.Reset(); // Each immutable recording owns the feature and input color.
@@ -1216,13 +1232,13 @@ void runDescriptorABCReuse(Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
         for (UINT replay = 0; replay < 2; ++replay) {
             gpu.executeAndWait(recordings[i].list.Get());
             const auto stats = validateOutput(outputs[i], tags[i], "descriptor_ABC_reuse",
-                static_cast<UINT>(i * 2 + replay), 0, 0, widths[i], widths[i]);
+                static_cast<UINT>(i * 2 + replay), 0, 0, widths[i], widths[i] * inputHeight / inputWidth);
             if (i == 0 && replay == 0) firstA = stats.mean;
             if (i == 3 && std::fabs(stats.mean - firstA) > 1.0 / 255.0)
                 fail("ABC restored A differs from cold explicit-reset A");
-            std::printf("OWNED_D3D12_TEMPORAL_ABC sequence=%u replay=%u width=%u "
+            std::printf("OWNED_D3D12_TEMPORAL_ABC sequence=%u replay=%u width=%u height=%u "
                 "explicit_reset=1 caller_released=1 mean=%.9g outside_sentinel=1\n",
-                static_cast<unsigned>(i), replay, widths[i], stats.mean);
+                static_cast<unsigned>(i), replay, widths[i], widths[i] * inputHeight / inputWidth, stats.mean);
         }
     }
     std::puts("OWNED_D3D12_TEMPORAL_CASE_PASS case=descriptor_ABC_reuse "
@@ -1230,24 +1246,37 @@ void runDescriptorABCReuse(Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
 }
 
 void runDynamicOutputOldRecordReplay(
-    Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension,
-    ID3D12Resource* depth, ID3D12Resource* motion) {
-    constexpr UINT widthA = 96, heightA = 112;
+    Gpu& gpu, IMTLD3D12DeviceExt* deviceExtension) {
+    constexpr UINT inputWidth = 1280, inputHeight = 720;
+    constexpr UINT widthA = 1600, heightA = 900, widthB = 1920, heightB = 1080;
+    const UINT padding = kOutputBacking - kOutputWidth;
+    const UINT backingWidth = widthB + padding, backingHeight = heightB + padding;
     constexpr std::uint8_t tagA = 72, tagB = 184;
+    auto depth = makeDepth(gpu, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                           DXGI_FORMAT_D32_FLOAT_S8X24_UINT, inputWidth, inputHeight);
+    auto motion = makeMotion(gpu, DXGI_FORMAT_R16G16_FLOAT, inputWidth, inputHeight);
     auto create = makeCreateDesc();
+    create.InputWidth = inputWidth;
+    create.InputHeight = inputHeight;
+    create.OutputWidth = widthB;
+    create.OutputHeight = heightB;
     create.DynamicOutputEnabled = TRUE;
     ComPtr<IMTLD3D12TemporalUpscaleState> state;
     check(deviceExtension->CreateTemporalUpscaleState(&create, &state),
           "dynamic output CreateTemporalUpscaleState");
-    auto colorA = makeColor(gpu, tagA);
-    auto colorB = makeColor(gpu, tagB);
-    auto outputA = makeOutput(gpu, 850);
-    auto outputB = makeOutput(gpu, 851);
-    auto descA = makeFrameDesc(colorA.Get(), outputA.resource.Get(), depth, motion);
+    auto colorA = makeColor(gpu, tagA, DXGI_FORMAT_R8G8B8A8_UNORM, inputWidth, inputHeight);
+    auto colorB = makeColor(gpu, tagB, DXGI_FORMAT_R8G8B8A8_UNORM, inputWidth, inputHeight);
+    auto outputA = makeOutput(gpu, 850, DXGI_FORMAT_R8G8B8A8_UNORM, backingWidth, backingHeight);
+    auto outputB = makeOutput(gpu, 851, DXGI_FORMAT_R8G8B8A8_UNORM, backingWidth, backingHeight);
+    auto descA = makeFrameDesc(colorA.Get(), outputA.resource.Get(), depth.Get(), motion.Get());
+    descA.InputContentWidth = inputWidth;
+    descA.InputContentHeight = inputHeight;
     descA.OutputWidth = widthA;
     descA.OutputHeight = heightA;
     auto recordingA = recordTemporal(gpu, state.Get(), descA, outputA);
-    auto descB = makeFrameDesc(colorB.Get(), outputB.resource.Get(), depth, motion);
+    auto descB = makeFrameDesc(colorB.Get(), outputB.resource.Get(), depth.Get(), motion.Get());
+    descB.InputContentWidth = inputWidth;
+    descB.InputContentHeight = inputHeight;
     auto recordingB = recordTemporal(gpu, state.Get(), descB, outputB);
     state.Reset();
     colorA.Reset();
@@ -1256,7 +1285,7 @@ void runDynamicOutputOldRecordReplay(
     gpu.executeAndWait(recordingA.list.Get());
     validateOutput(outputA, tagA, "dynamic_output_A1", 0, 0, 0, widthA, heightA);
     gpu.executeAndWait(recordingB.list.Get());
-    validateOutput(outputB, tagB, "dynamic_output_B1", 1);
+    validateOutput(outputB, tagB, "dynamic_output_B1", 1, 0, 0, widthB, heightB);
     recordingB = {};
     outputB = {};
     auto clear = gpu.makeRecording();
@@ -1265,8 +1294,8 @@ void runDynamicOutputOldRecordReplay(
     check(clear.list->Close(), "dynamic replay sentinel Close");
     gpu.executeAndWait(clear.list.Get());
     std::vector<std::array<std::uint8_t, 4>> sentinel(
-        kOutputBacking * kOutputBacking, outputA.sentinel);
-    uploadTexture(gpu, outputA.resource.Get(), sentinel.data(), kOutputBacking * 4,
+        backingWidth * backingHeight, outputA.sentinel);
+    uploadTexture(gpu, outputA.resource.Get(), sentinel.data(), backingWidth * 4,
                   D3D12_RESOURCE_STATE_COPY_SOURCE);
     auto poisonReadback = gpu.makeRecording();
     copyTextureToReadback(poisonReadback.list.Get(), outputA.resource.Get(), outputA.readback);
@@ -1281,9 +1310,11 @@ void runDynamicOutputOldRecordReplay(
     create.OutputHeight = heightA;
     check(deviceExtension->CreateTemporalUpscaleState(&create, &freshState),
           "dynamic replay reference CreateTemporalUpscaleState");
-    auto freshColor = makeColor(gpu, tagA);
-    auto freshOutput = makeOutput(gpu, 852);
-    auto freshDesc = makeFrameDesc(freshColor.Get(), freshOutput.resource.Get(), depth, motion, TRUE);
+    auto freshColor = makeColor(gpu, tagA, DXGI_FORMAT_R8G8B8A8_UNORM, inputWidth, inputHeight);
+    auto freshOutput = makeOutput(gpu, 852, DXGI_FORMAT_R8G8B8A8_UNORM, backingWidth, backingHeight);
+    auto freshDesc = makeFrameDesc(freshColor.Get(), freshOutput.resource.Get(), depth.Get(), motion.Get(), TRUE);
+    freshDesc.InputContentWidth = inputWidth;
+    freshDesc.InputContentHeight = inputHeight;
     auto freshRecording = recordTemporal(gpu, freshState.Get(), freshDesc, freshOutput);
     gpu.executeAndWait(freshRecording.list.Get());
     const auto freshStats = validateOutput(
@@ -1291,9 +1322,9 @@ void runDynamicOutputOldRecordReplay(
     if (std::fabs(stats.mean - freshStats.mean) > 1.0 / 255.0)
         fail("old dynamic output generation replay differs from fresh reset");
     std::printf("OWNED_D3D12_TEMPORAL_CASE_PASS case=dynamic_output_old_record_replay "
-                "sequence=A,B,A A=%ux%u B=128x128 caller_released=1 B_retired=1 "
+                "sequence=A,B,A A=%ux%u B=%ux%u caller_released=1 B_retired=1 "
                 "replay_mean=%.9g fresh_mean=%.9g outside_sentinel=1\n",
-                widthA, heightA, stats.mean, freshStats.mean);
+                widthA, heightA, widthB, heightB, stats.mean, freshStats.mean);
 }
 
 struct FutureSignalCallerContext {
@@ -1733,9 +1764,8 @@ int run() {
     runReleaseBeforeExecuteReplay(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runCallerResetReplay(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runGenerationTransitionReplay(gpu, deviceExtension.Get());
-    runDescriptorABCReuse(gpu, deviceExtension.Get(), depth.Get(), motion.Get());
-    runDynamicOutputOldRecordReplay(
-        gpu, deviceExtension.Get(), depth.Get(), motion.Get());
+    runDescriptorABCReuse(gpu, deviceExtension.Get());
+    runDynamicOutputOldRecordReplay(gpu, deviceExtension.Get());
     runCrossQueueFutureSignal(
         gpu, deviceExtension.Get(), depth.Get(), motion.Get());
     runOppositeFeatureOrder(gpu, deviceExtension.Get());

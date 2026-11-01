@@ -11,8 +11,8 @@
 #include <utility>
 
 int main() {
-  using namespace dxmt;
-  using namespace dxmt::dxbc;
+  using namespace d3dalloy;
+  using namespace d3dalloy::dxbc;
   using namespace llvm;
   unsigned cases = 0;
   bool okay = true;
@@ -55,7 +55,7 @@ int main() {
             context.setOpaquePointers(false);
             Module module("root-status-regression", context);
             initializeModule(module);
-            dxmt::air::FunctionSignatureBuilder signature;
+            d3dalloy::air::FunctionSignatureBuilder signature;
             const bool vertex = root.parameters[visible].ShaderVisibility == D3D12_SHADER_VISIBILITY_VERTEX;
             auto map = setup_binding_rootsig(&shader, signature, module,
                 vertex ? microsoft::D3D10_SB_VERTEX_SHADER : microsoft::D3D10_SB_PIXEL_SHADER,

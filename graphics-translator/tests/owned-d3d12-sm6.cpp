@@ -179,7 +179,7 @@ struct Gpu {
   ~Gpu() { CloseHandle(event); }
 
   D3D12_CPU_DESCRIPTOR_HANDLE cpu(UINT slot) {
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};heap->GetCPUDescriptorHandleForHeapStart(&handle);
 #else
     auto handle = heap->GetCPUDescriptorHandleForHeapStart();
@@ -188,7 +188,7 @@ struct Gpu {
     return handle;
   }
   D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT slot) {
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
     D3D12_GPU_DESCRIPTOR_HANDLE handle{};heap->GetGPUDescriptorHandleForHeapStart(&handle);
 #else
     auto handle = heap->GetGPUDescriptorHandleForHeapStart();
@@ -256,7 +256,7 @@ struct Gpu {
   std::vector<std::vector<uint8_t>> finish(std::initializer_list<ID3D12Resource *> resources, double *elapsed_ms) {
     std::vector<ComPtr<ID3D12Resource>> readbacks;
     for (auto *resource : resources) {
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
       D3D12_RESOURCE_DESC resourceDesc{};resource->GetDesc(&resourceDesc);
       const UINT64 size = resourceDesc.Width;
 #else
@@ -298,7 +298,7 @@ struct Gpu {
       *elapsed_ms = 1000.0 * static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
     std::vector<std::vector<uint8_t>> result;
     for (auto &readback : readbacks) {
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
       D3D12_RESOURCE_DESC resourceDesc{};readback->GetDesc(&resourceDesc);
       const UINT64 size = resourceDesc.Width;
 #else
@@ -320,7 +320,7 @@ struct Gpu {
     D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
     desc.Format = DXGI_FORMAT_R32_TYPELESS;
     desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
     D3D12_RESOURCE_DESC resourceDesc{};resource->GetDesc(&resourceDesc);
     desc.Buffer.NumElements = static_cast<UINT>(resourceDesc.Width / 4);
 #else
@@ -333,7 +333,7 @@ struct Gpu {
     D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
     desc.Format = DXGI_FORMAT_UNKNOWN;
     desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
     D3D12_RESOURCE_DESC resourceDesc{};resource->GetDesc(&resourceDesc);
     desc.Buffer.NumElements = static_cast<UINT>(resourceDesc.Width / stride);
 #else
@@ -862,7 +862,7 @@ struct Graphics {
     check(gpu.device->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &rt, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                               nullptr, IID_PPV_ARGS(&target)),
           "CreateCommittedResource(RT)");
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{};gpu.rtvHeap->GetCPUDescriptorHandleForHeapStart(&rtv);
 #else
     const auto rtv = gpu.rtvHeap->GetCPUDescriptorHandleForHeapStart();

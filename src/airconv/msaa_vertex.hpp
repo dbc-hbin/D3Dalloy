@@ -7,7 +7,7 @@ namespace llvm {
 class Module;
 }
 
-namespace dxmt::msaa {
+namespace d3dalloy::msaa {
 
 // Rewrites one independently lowered AIR vertex entry. Capture calls the
 // original stage once per IA ordinal; replay reads only its native output.
@@ -16,4 +16,4 @@ namespace dxmt::msaa {
 llvm::Error transformVertex(llvm::Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &options,
                             bool conservative);
 
-} // namespace dxmt::msaa
+} // namespace d3dalloy::msaa

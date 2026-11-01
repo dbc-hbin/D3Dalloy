@@ -43,7 +43,7 @@
 
 #include "../airconv/dxbc_root_signature.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 namespace {
 
 struct LibraryExport {
@@ -2444,4 +2444,4 @@ HRESULT AddToStateObject(
   return object->QueryInterface(riid, state_object);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

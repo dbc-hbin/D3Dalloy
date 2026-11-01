@@ -79,7 +79,7 @@ const unsigned char collision2[] = {
   0x61, 0x30, 0x97, 0x89, 0x60, 0x6b, 0xd0, 0xbf, 0x3f, 0x98, 0xcd, 0xa8, 0x04, 0x46, 0x29, 0xa1,
 };
 int main() {
-  using namespace dxmt;
+  using namespace d3dalloy;
   WCHAR directory[MAX_PATH], path[MAX_PATH];
   require(GetTempPathW(MAX_PATH, directory) && GetTempFileNameW(directory, L"sc", 0, path), "unique file");
   D3D12_SHADER_CACHE_SESSION_DESC desc{};

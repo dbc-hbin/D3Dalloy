@@ -185,7 +185,7 @@ void roundTrip(NSString* path) {
 
 int main() { @autoreleasepool {
     char directory[PATH_MAX];
-    require(snprintf(directory, sizeof(directory), "%s/dxmt-cache-init-XXXXXX", NSTemporaryDirectory().fileSystemRepresentation)
+    require(snprintf(directory, sizeof(directory), "%s/d3dalloy-cache-init-XXXXXX", NSTemporaryDirectory().fileSystemRepresentation)
             < (int)sizeof(directory), "temporary-path-fits");
     require(mkdtemp(directory) != NULL, "temporary-directory");
     NSString* root = [NSString stringWithUTF8String:directory];

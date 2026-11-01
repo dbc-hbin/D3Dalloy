@@ -2,7 +2,7 @@
 
 #include "d3d10_util.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 template <typename D3D10Interface, typename D3D11Interface>
 class MTLD3D10Shader final : public D3D10Interface {
@@ -54,4 +54,4 @@ using MTLD3D10VertexShader = MTLD3D10Shader<ID3D10VertexShader, ID3D11VertexShad
 using MTLD3D10PixelShader = MTLD3D10Shader<ID3D10PixelShader, ID3D11PixelShader>;
 using MTLD3D10GeometryShader = MTLD3D10Shader<ID3D10GeometryShader, ID3D11GeometryShader>;
 
-} // namespace dxmt
+} // namespace d3dalloy

@@ -66,7 +66,7 @@ def main() -> int:
 
     subprocess.run([
         "xcrun", "clang++", "-arch", args.native_arch, "-std=c++20", "-fobjc-arc", "-O1",
-        *(["-DDXMT_UNIX_PLUGIN_PROBE=1" if args.unix_plugin else "-DDXMT_NATIVE_BRIDGE_PROBE=1",
+        *(["-DD3DALLOY_UNIX_PLUGIN_PROBE=1" if args.unix_plugin else "-DD3DALLOY_NATIVE_BRIDGE_PROBE=1",
            "-I" + str(source / "src/winemetal")] if bridge else []),
         *[p for p in compiler["parameters"] if p.startswith("-I")],
         "-I" + str(source / "src/airconv"), "-I" + str(fixture),

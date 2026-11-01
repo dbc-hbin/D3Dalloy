@@ -9,7 +9,7 @@
 
 #include <metal_stdlib>
 
-namespace dxmt_conservative {
+namespace d3dalloy_conservative {
 using namespace metal;
 
 constant uint kMaxClip = 8;
@@ -202,4 +202,4 @@ inline bool square_inside(thread const float2 *polygon, uint count, float2 pixel
   return true;
 }
 
-} // namespace dxmt_conservative
+} // namespace d3dalloy_conservative

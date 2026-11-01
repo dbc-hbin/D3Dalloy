@@ -28,7 +28,7 @@ class StagingPolicyTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.wine = self.root / "wine-source"
-        self.dxmt = self.root / "dxmt-install"
+        self.d3dalloy = self.root / "d3dalloy-install"
         self.dest = self.root / "runtime-new"
         (self.wine / "bin").mkdir(parents=True)
         (self.wine / stage_owned_graphics.WINDOWS_DIR).mkdir(parents=True)
@@ -39,50 +39,50 @@ class StagingPolicyTests(unittest.TestCase):
         (self.wine / stage_owned_graphics.UNIX_DIR / "ntdll.so").write_bytes(macho)
         (self.wine / stage_owned_graphics.WINDOWS_DIR / "ntdll.dll").write_bytes(self.pe_image(0x8664, b"wine"))
         (self.wine / "bin/wine").chmod(0o755)
-        (self.dxmt / stage_owned_graphics.DXMT_WINDOWS_DIR).mkdir(parents=True)
-        (self.dxmt / stage_owned_graphics.DXMT_UNIX_DIR).mkdir(parents=True)
+        (self.d3dalloy / stage_owned_graphics.D3DALLOY_WINDOWS_DIR).mkdir(parents=True)
+        (self.d3dalloy / stage_owned_graphics.D3DALLOY_UNIX_DIR).mkdir(parents=True)
         for name in stage_owned_graphics.WINDOWS_MODULES:
             payload = b"MZ-" + name.encode() + b"-" + stage_owned_graphics.WINE_BUILTIN_MARKER
             if name == "d3d12.dll":
                 payload += b"-" + stage_owned_graphics.OWNED_D3D12_MARKER
             image = self.core_image(abi="x64", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll") else self.pe_image(0x8664, payload)
-            (self.dxmt / stage_owned_graphics.DXMT_WINDOWS_DIR / name).write_bytes(image)
-        (self.dxmt / stage_owned_graphics.DXMT_UNIX_DIR / "winemetal.so").write_bytes(macho)
+            (self.d3dalloy / stage_owned_graphics.D3DALLOY_WINDOWS_DIR / name).write_bytes(image)
+        (self.d3dalloy / stage_owned_graphics.D3DALLOY_UNIX_DIR / "winemetal.so").write_bytes(macho)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
     def test_mesons_install_layout_resolves_to_wine_layout(self) -> None:
-        artifacts = stage_owned_graphics.resolve_dxmt_artifacts(self.dxmt)
+        artifacts = stage_owned_graphics.resolve_d3dalloy_artifacts(self.d3dalloy)
         self.assertEqual(
             set(artifacts),
             set(stage_owned_graphics.TRANSLATOR_ARTIFACTS),
         )
         self.assertEqual(
             artifacts[stage_owned_graphics.UNIX_DIR / "winemetal.so"],
-            self.dxmt / "x86_64-unix/winemetal.so",
+            self.d3dalloy / "x86_64-unix/winemetal.so",
         )
 
     def test_destination_must_not_exist_or_overlap_inputs(self) -> None:
-        stage_owned_graphics.validate_destination(self.dest, self.wine, self.dxmt)
+        stage_owned_graphics.validate_destination(self.dest, self.wine, self.d3dalloy)
         self.dest.mkdir()
         with self.assertRaisesRegex(ValueError, "new path"):
-            stage_owned_graphics.validate_destination(self.dest, self.wine, self.dxmt)
+            stage_owned_graphics.validate_destination(self.dest, self.wine, self.d3dalloy)
         overlap = self.wine / "private-runtime"
         with self.assertRaisesRegex(ValueError, "contain one another"):
-            stage_owned_graphics.validate_destination(overlap, self.wine, self.dxmt)
+            stage_owned_graphics.validate_destination(overlap, self.wine, self.d3dalloy)
 
     def test_destination_symlink_and_symlink_parent_are_refused(self) -> None:
         link = self.root / "runtime-link"
         link.symlink_to(self.root / "somewhere")
         with self.assertRaisesRegex(ValueError, "symlink"):
-            stage_owned_graphics.validate_destination(link, self.wine, self.dxmt)
+            stage_owned_graphics.validate_destination(link, self.wine, self.d3dalloy)
         real_parent = self.root / "real-parent"
         real_parent.mkdir()
         parent_link = self.root / "parent-link"
         parent_link.symlink_to(real_parent, target_is_directory=True)
         with self.assertRaisesRegex(ValueError, "parent path"):
-            stage_owned_graphics.validate_destination(parent_link / "runtime", self.wine, self.dxmt)
+            stage_owned_graphics.validate_destination(parent_link / "runtime", self.wine, self.d3dalloy)
 
     def test_runtime_symlink_target_is_never_overwritten(self) -> None:
         staged = self.root / "staged"
@@ -97,13 +97,13 @@ class StagingPolicyTests(unittest.TestCase):
         self.assertEqual(outside.read_bytes(), b"outside")
 
     def test_unowned_d3d12_is_refused(self) -> None:
-        (self.dxmt / "x86_64-windows/d3d12.dll").write_bytes(b"MZ-plain-dxmt")
+        (self.d3dalloy / "x86_64-windows/d3d12.dll").write_bytes(b"MZ-plain-d3dalloy")
         with self.assertRaisesRegex(ValueError, "owned backend marker"):
-            stage_owned_graphics.resolve_dxmt_artifacts(self.dxmt)
+            stage_owned_graphics.resolve_d3dalloy_artifacts(self.d3dalloy)
 
     def test_optional_nvngx_and_nvapi_require_validated_exports(self) -> None:
-        nvngx = self.dxmt / "x86_64-windows/nvngx.dll"
-        nvapi = self.dxmt / "x86_64-windows/nvapi64.dll"
+        nvngx = self.d3dalloy / "x86_64-windows/nvngx.dll"
+        nvapi = self.d3dalloy / "x86_64-windows/nvapi64.dll"
         nvngx.write_bytes(self.pe_image(0x8664, stage_owned_graphics.OWNED_NGX_D3D12_MARKER))
         nvapi.write_bytes(self.pe_image(0x8664, b"nvapi"))
 
@@ -116,28 +116,28 @@ class StagingPolicyTests(unittest.TestCase):
             return original_exports(path, **kwargs)
 
         with mock.patch.object(stage_owned_graphics, "pe_exports", side_effect=exports):
-            artifacts = stage_owned_graphics.resolve_dxmt_artifacts(self.dxmt, True, True)
+            artifacts = stage_owned_graphics.resolve_d3dalloy_artifacts(self.d3dalloy, True, True)
         self.assertEqual(artifacts[stage_owned_graphics.WINDOWS_DIR / "nvngx.dll"], nvngx)
         self.assertEqual(artifacts[stage_owned_graphics.WINDOWS_DIR / "nvapi64.dll"], nvapi)
 
     def test_optional_nvngx_refuses_missing_d3d12_export(self) -> None:
-        nvngx = self.dxmt / "x86_64-windows/nvngx.dll"
+        nvngx = self.d3dalloy / "x86_64-windows/nvngx.dll"
         nvngx.write_bytes(b"MZ-fixture-" + stage_owned_graphics.OWNED_NGX_D3D12_MARKER)
         incomplete = dict.fromkeys(stage_owned_graphics.REQUIRED_NGX_D3D12_EXPORTS, 1)
         del incomplete["NVSDK_NGX_D3D12_EvaluateFeature"]
         with mock.patch.object(stage_owned_graphics, "pe_exports", return_value=incomplete):
             with self.assertRaisesRegex(ValueError, "missing required D3D12 exports"):
-                stage_owned_graphics.resolve_dxmt_artifacts(self.dxmt, True, False)
+                stage_owned_graphics.resolve_d3dalloy_artifacts(self.d3dalloy, True, False)
 
     def ngx_inputs(self, wow64: bool = False) -> Path | None:
         inf = self.wine / stage_owned_graphics.WINE_INF
         inf.parent.mkdir(parents=True)
         inf.write_bytes(b"; unrelated\r\n[BaseInstall]\r\nAddReg=Existing\r\n[Existing]\r\n; keep\r\n")
         install32 = self.root / "install32" if wow64 else None
-        directories = [("x64", self.dxmt / stage_owned_graphics.DXMT_WINDOWS_DIR)]
+        directories = [("x64", self.d3dalloy / stage_owned_graphics.D3DALLOY_WINDOWS_DIR)]
         if wow64:
             (self.wine / stage_owned_graphics.WOW64_WINDOWS_DIR).mkdir()
-            directory = install32 / stage_owned_graphics.DXMT_WOW64_DIR
+            directory = install32 / stage_owned_graphics.D3DALLOY_WOW64_DIR
             directory.mkdir(parents=True)
             directories.append(("x86", directory))
             for name in stage_owned_graphics.WINDOWS_MODULES:
@@ -169,14 +169,14 @@ class StagingPolicyTests(unittest.TestCase):
     def test_ngx_real_signing_metadata_integrity_and_restaging(self) -> None:
         install32 = self.ngx_inputs(wow64=True)
         original_inf = (self.wine / stage_owned_graphics.WINE_INF).read_bytes()
-        sources = [self.dxmt / stage_owned_graphics.DXMT_WINDOWS_DIR / "nvngx.dll",
-                   install32 / stage_owned_graphics.DXMT_WOW64_DIR / "nvngx.dll"]
+        sources = [self.d3dalloy / stage_owned_graphics.D3DALLOY_WINDOWS_DIR / "nvngx.dll",
+                   install32 / stage_owned_graphics.D3DALLOY_WOW64_DIR / "nvngx.dll"]
         original_modules = [path.read_bytes() for path in sources]
         run = subprocess.run
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]), \
              mock.patch.object(stage_owned_graphics.subprocess, "run", wraps=run) as invoked:
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_nvngx=True, dxmt_install32=install32)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, with_nvngx=True, d3dalloy_install32=install32)
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
             commands = [call.args[0] for call in invoked.call_args_list]
             for action in ("sign", "verify"):
@@ -216,13 +216,13 @@ class StagingPolicyTests(unittest.TestCase):
             manifest["ngx_signing"] = signing
             manifest_path.write_text(json.dumps(manifest))
             restaged = self.root / "restaged"
-            stage_owned_graphics.stage(self.dxmt, self.dest, restaged, with_nvngx=True, dxmt_install32=install32)
+            stage_owned_graphics.stage(self.d3dalloy, self.dest, restaged, with_nvngx=True, d3dalloy_install32=install32)
             self.assertEqual(stage_owned_graphics.verify_runtime(restaged), [])
             fresh_der = (restaged / stage_owned_graphics.NGX_CERTIFICATE).read_bytes()
             self.assertNotEqual(fresh_der, der)
             fresh_inf = (restaged / stage_owned_graphics.WINE_INF).read_bytes()
             self.assertEqual(fresh_inf, stage_owned_graphics.ngx_enrollment(original_inf, fresh_der))
-            self.assertEqual(fresh_inf.count(b"[DXMT.NGX.Certificate]"), 1)
+            self.assertEqual(fresh_inf.count(b"[D3Dalloy.NGX.Certificate]"), 1)
             self.assertNotIn(signing["certificate_sha1"].encode(), fresh_inf)
 
     def test_ngx_missing_signing_tools_never_publish(self) -> None:
@@ -233,7 +233,7 @@ class StagingPolicyTests(unittest.TestCase):
                  mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
                  mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
                 with self.assertRaisesRegex(ValueError, f"requires {missing}"):
-                    stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_nvngx=True)
+                    stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, with_nvngx=True)
                 self.assertFalse(self.dest.exists())
                 self.assertEqual(list(self.root.glob("runtime-new.staging-*")), [])
 
@@ -250,7 +250,7 @@ class StagingPolicyTests(unittest.TestCase):
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]), \
              mock.patch.object(stage_owned_graphics.subprocess, "run", side_effect=fail):
             with self.assertRaisesRegex(ValueError, "NGX Authenticode") as failure:
-                stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_nvngx=True)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, with_nvngx=True)
             self.assertNotIn("private output", str(failure.exception))
         self.assertFalse(Path(commands[0][commands[0].index("-keyout") + 1]).parent.exists())
         self.assertFalse(self.dest.exists())
@@ -342,7 +342,7 @@ class StagingPolicyTests(unittest.TestCase):
                 else:
                     module.write_bytes(image)
                 with self.assertRaisesRegex(ValueError, error):
-                    stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, wine_display_build=build)
+                    stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, wine_display_build=build)
                 copy.assert_not_called()
                 self.assertFalse(self.dest.exists())
                 self.assertEqual(list(self.root.glob("runtime-new.staging-*")), [])
@@ -356,7 +356,7 @@ class StagingPolicyTests(unittest.TestCase):
             self.assertEqual(len(artifacts), 1)
             self.assertEqual(provenance["source_directory"], str(source.resolve()))
             with self.assertRaises(ValueError):
-                stage_owned_graphics.stage(self.dxmt, self.wine, source / "runtime",
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, source / "runtime",
                     wine_display_build=build, wine_display_source=source)
         with mock.patch.object(stage_owned_graphics, "WINE_DISPLAY_SOURCE_PIN", "0" * 40):
             with self.assertRaisesRegex(ValueError, "pin mismatch"):
@@ -380,14 +380,14 @@ class StagingPolicyTests(unittest.TestCase):
         original = (self.wine / "bin/wine").read_bytes()
         for dest in (self.wine, build / "new-runtime", stage_owned_graphics.WINE_DISPLAY_SOURCE / "new-runtime"):
             with self.subTest(dest=dest), self.assertRaises(ValueError):
-                stage_owned_graphics.stage(self.dxmt, self.wine, dest, wine_display_build=build)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, dest, wine_display_build=build)
         module = build / "dlls/dcomp/x86_64-windows/dcomp.dll"
         external = self.root / "external.dll"
         external.write_bytes(module.read_bytes())
         module.unlink()
         module.symlink_to(external)
         with self.assertRaisesRegex(ValueError, "symlink"):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, wine_display_build=build)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, wine_display_build=build)
         self.assertEqual((self.wine / "bin/wine").read_bytes(), original)
         self.assertFalse(self.dest.exists())
 
@@ -412,7 +412,7 @@ class StagingPolicyTests(unittest.TestCase):
     def test_display_paired_stage_rejects_missing_input_then_publishes_both_abis(self) -> None:
         build = self.display_build()
         install32 = self.root / "install32"
-        directory = install32 / stage_owned_graphics.DXMT_WOW64_DIR
+        directory = install32 / stage_owned_graphics.D3DALLOY_WOW64_DIR
         directory.mkdir(parents=True)
         (self.wine / stage_owned_graphics.WOW64_WINDOWS_DIR).mkdir()
         for name in stage_owned_graphics.WINDOWS_MODULES:
@@ -424,12 +424,12 @@ class StagingPolicyTests(unittest.TestCase):
         module.unlink()
         with mock.patch.object(stage_owned_graphics.shutil, "copytree") as copy:
             with self.assertRaisesRegex(ValueError, "regular non-symlink"):
-                stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, dxmt_install32=install32, wine_display_build=build)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, d3dalloy_install32=install32, wine_display_build=build)
             copy.assert_not_called()
         module.write_bytes(payload)
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, dxmt_install32=install32, wine_display_build=build)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, d3dalloy_install32=install32, wine_display_build=build)
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
             manifest = json.loads((self.dest / stage_owned_graphics.MANIFEST).read_text())
             for relative in stage_owned_graphics.display_artifacts(True, architecture("x86_64", "x64"), True):
@@ -437,7 +437,7 @@ class StagingPolicyTests(unittest.TestCase):
                 self.assertEqual(inspect_pe(self.dest / relative)["windows_abi"], "x86" if relative.parent == stage_owned_graphics.WOW64_WINDOWS_DIR else "x64")
         before = (self.dest / stage_owned_graphics.MANIFEST).read_bytes()
         with self.assertRaisesRegex(ValueError, "new path"):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, dxmt_install32=install32, wine_display_build=build)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, d3dalloy_install32=install32, wine_display_build=build)
         self.assertEqual((self.dest / stage_owned_graphics.MANIFEST).read_bytes(), before)
 
     def test_display_unchanged_binary_and_target_symlink_never_modify_existing_runtime(self) -> None:
@@ -447,7 +447,7 @@ class StagingPolicyTests(unittest.TestCase):
         baseline.write_bytes(payload)
         with mock.patch.object(stage_owned_graphics.shutil, "copytree") as copy:
             with self.assertRaisesRegex(ValueError, "unchanged"):
-                stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, wine_display_build=build)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, wine_display_build=build)
             copy.assert_not_called()
         outside = self.root / "existing-dcomp.dll"
         outside.write_bytes(b"existing runtime module")
@@ -456,7 +456,7 @@ class StagingPolicyTests(unittest.TestCase):
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
             with self.assertRaisesRegex(ValueError, "symlink"):
-                stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, wine_display_build=build)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, wine_display_build=build)
         self.assertEqual(outside.read_bytes(), b"existing runtime module")
         self.assertTrue(baseline.is_symlink())
         self.assertFalse(self.dest.exists())
@@ -475,7 +475,7 @@ class StagingPolicyTests(unittest.TestCase):
         before = {str(relative): (self.wine / relative).read_bytes() for relative in preserved}
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, wine_display_build=build)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, wine_display_build=build)
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
             for relative, payload in before.items():
                 self.assertEqual((self.wine / relative).read_bytes(), payload)
@@ -572,15 +572,15 @@ class StagingPolicyTests(unittest.TestCase):
                 stage_owned_graphics.validate_core_module(core, abi)
             self.assertIn("d3d12core=n", stage_owned_graphics.owned_overrides().split(";"))
             self.assertNotIn("d3d12core=b", stage_owned_graphics.owned_overrides().split(";"))
-        missing = self.dxmt / "x86_64-windows/d3d12core.dll"
+        missing = self.d3dalloy / "x86_64-windows/d3d12core.dll"
         missing.unlink()
         with self.assertRaisesRegex(ValueError, "regular non-symlink"):
-            stage_owned_graphics.resolve_dxmt_artifacts(self.dxmt)
+            stage_owned_graphics.resolve_d3dalloy_artifacts(self.d3dalloy)
 
     def test_native_core_staging_rejects_loader_fallback_and_builtin_inputs(self) -> None:
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
             path = self.dest / stage_owned_graphics.MANIFEST
             manifest = json.loads(path.read_text())
             self.assertEqual(manifest["schema"], 2)
@@ -598,17 +598,17 @@ class StagingPolicyTests(unittest.TestCase):
             path.write_text(json.dumps(manifest))
             core.unlink()
             self.assertTrue(any("d3d12core.dll" in problem for problem in stage_owned_graphics.verify_runtime(self.dest)))
-            source = self.dxmt / stage_owned_graphics.DXMT_WINDOWS_DIR / "d3d12core.dll"
+            source = self.d3dalloy / stage_owned_graphics.D3DALLOY_WINDOWS_DIR / "d3d12core.dll"
             source.write_bytes(self.core_image(builtin=True))
             rejected = self.root / "builtin-core-runtime"
             with self.assertRaisesRegex(ValueError, "ordinary owned PE"):
-                stage_owned_graphics.stage(self.dxmt, self.wine, rejected)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, rejected)
             self.assertFalse(rejected.exists())
 
     def test_retained_builtin_core_requires_recorded_image_mode_and_identity(self) -> None:
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
             path = self.dest / stage_owned_graphics.MANIFEST
             manifest = json.loads(path.read_text())
             del manifest["agility_sdk"]["delivery"]
@@ -657,9 +657,9 @@ class StagingPolicyTests(unittest.TestCase):
             stage_owned_graphics.resolve_wow64_artifacts(install, with_nvapi=True)
 
     def test_fsr_rejects_unowned_wrong_abi_or_invalid_exports_before_publication(self) -> None:
-        fsr = self.dxmt / "x86_64-windows" / stage_owned_graphics.FSR_MODULE
+        fsr = self.d3dalloy / "x86_64-windows" / stage_owned_graphics.FSR_MODULE
         with self.assertRaisesRegex(ValueError, "regular non-symlink"):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_fsr=True)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, with_fsr=True)
         cases = []
         image = self.fsr_image()
         image[0x800:0x800 + len(stage_owned_graphics.OWNED_FSR_MARKER)] = bytes(len(stage_owned_graphics.OWNED_FSR_MARKER))
@@ -689,33 +689,33 @@ class StagingPolicyTests(unittest.TestCase):
             with self.subTest(message=message):
                 fsr.write_bytes(image)
                 with self.assertRaisesRegex(ValueError, message):
-                    stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_fsr=True)
+                    stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, with_fsr=True)
                 self.assertFalse(self.dest.exists())
                 self.assertEqual(list(self.root.glob("runtime-new.staging-*")), [])
 
     def test_fsr_group_requires_owned_framegeneration_before_publication(self) -> None:
-        fsr = self.dxmt / "x86_64-windows" / stage_owned_graphics.FSR_MODULE
+        fsr = self.d3dalloy / "x86_64-windows" / stage_owned_graphics.FSR_MODULE
         fsr.write_bytes(self.fsr_image())
-        fg = self.dxmt / "x86_64-windows" / stage_owned_graphics.FSR_FRAMEGENERATION_MODULE
+        fg = self.d3dalloy / "x86_64-windows" / stage_owned_graphics.FSR_FRAMEGENERATION_MODULE
         for image, message in ((None, "regular non-symlink"),
                                (self.fsr_image(), "owned MetalFX FSR marker")):
             with self.subTest(message=message):
                 if image is not None:
                     fg.write_bytes(image)
                 with self.assertRaisesRegex(ValueError, message):
-                    stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_fsr=True)
+                    stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, with_fsr=True)
                 self.assertFalse(self.dest.exists())
 
     def test_fsr_stage_inventory_and_contract_are_reverified(self) -> None:
-        fsr = self.dxmt / "x86_64-windows" / stage_owned_graphics.FSR_MODULE
+        fsr = self.d3dalloy / "x86_64-windows" / stage_owned_graphics.FSR_MODULE
         fsr.write_bytes(self.fsr_image())
-        fg = self.dxmt / "x86_64-windows" / stage_owned_graphics.FSR_FRAMEGENERATION_MODULE
+        fg = self.d3dalloy / "x86_64-windows" / stage_owned_graphics.FSR_FRAMEGENERATION_MODULE
         fg.write_bytes(self.fsr_image(stage_owned_graphics.OWNED_FSR_FRAMEGENERATION_MARKER))
-        rr = self.dxmt / "x86_64-windows" / stage_owned_graphics.FSR_RAYREGENERATION_MODULE
+        rr = self.d3dalloy / "x86_64-windows" / stage_owned_graphics.FSR_RAYREGENERATION_MODULE
         rr.write_bytes(self.fsr_image(stage_owned_graphics.OWNED_FSR_RAYREGENERATION_MARKER))
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_fsr=True)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, with_fsr=True)
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
             manifest = json.loads((self.dest / stage_owned_graphics.MANIFEST).read_text())
             relative = str(stage_owned_graphics.WINDOWS_DIR / stage_owned_graphics.FSR_MODULE)
@@ -744,10 +744,10 @@ class StagingPolicyTests(unittest.TestCase):
 
     def test_retained_sr_only_manifest_keeps_policy_until_fg_explicitly_selected(self) -> None:
         for name, marker in stage_owned_graphics.FSR_MODULE_MARKERS.items():
-            (self.dxmt / "x86_64-windows" / name).write_bytes(self.fsr_image(marker))
+            (self.d3dalloy / "x86_64-windows" / name).write_bytes(self.fsr_image(marker))
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, with_fsr=True)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, with_fsr=True)
             path = self.dest / stage_owned_graphics.MANIFEST
             manifest = json.loads(path.read_text())
             del manifest["optional_modules"]["fsr_framegeneration"]
@@ -784,7 +784,7 @@ class StagingPolicyTests(unittest.TestCase):
     def test_retained_manifest_without_fsr_preserves_old_loader_policy(self) -> None:
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
             path = self.dest / stage_owned_graphics.MANIFEST
             manifest = json.loads(path.read_text())
             self.assertIs(manifest["optional_modules"]["fsr"], False)
@@ -834,7 +834,7 @@ class StagingPolicyTests(unittest.TestCase):
             'printf "DYLD_FALLBACK_LIBRARY_PATH=%s\\n" "${DYLD_FALLBACK_LIBRARY_PATH-}"\n'
             'printf "CX_ACTIVE_GRAPHICS_BACKEND=%s\n" "${CX_ACTIVE_GRAPHICS_BACKEND-}"\n'
             'printf "WINEDLLOVERRIDES=%s\n" "${WINEDLLOVERRIDES-}"\n'
-            'printf "DXMT_ENABLE_NVEXT=%s\n" "${DXMT_ENABLE_NVEXT-}"\n'
+            'printf "D3DALLOY_ENABLE_NVEXT=%s\n" "${D3DALLOY_ENABLE_NVEXT-}"\n'
             'printf "FEX_HIDEHYPERVISORBIT=%s\n" "${FEX_HIDEHYPERVISORBIT-}"\n'
         )
         real.chmod(0o755)
@@ -848,7 +848,7 @@ class StagingPolicyTests(unittest.TestCase):
             "DYLD_FALLBACK_LIBRARY_PATH": "/tmp/foreign-dyld",
             "CX_ACTIVE_GRAPHICS_BACKEND": "d3dmetal",
             "WINEDLLOVERRIDES": "d3d12=n",
-            "DXMT_ENABLE_NVEXT": "1",
+            "D3DALLOY_ENABLE_NVEXT": "1",
             "FEX_HIDEHYPERVISORBIT": "0",
         })
         output = subprocess.check_output([str(wrapper)], env=environment, text=True)
@@ -858,7 +858,7 @@ class StagingPolicyTests(unittest.TestCase):
         self.assertEqual(values["CX_ACTIVE_GRAPHICS_BACKEND"], "")
         self.assertEqual(values["WINEDLLOVERRIDES"], stage_owned_graphics.owned_overrides())
         self.assertIn("amd_fidelityfx_upscaler_dx12=", values["WINEDLLOVERRIDES"].split(";"))
-        self.assertEqual(values["DXMT_ENABLE_NVEXT"], "")
+        self.assertEqual(values["D3DALLOY_ENABLE_NVEXT"], "")
         self.assertEqual(values["FEX_HIDEHYPERVISORBIT"], "0")
         wrapper.write_text(stage_owned_graphics.render_wrapper(with_wow64=True))
         output = subprocess.check_output([str(wrapper)], env=environment, text=True)
@@ -869,13 +869,13 @@ class StagingPolicyTests(unittest.TestCase):
         output = subprocess.check_output([str(wrapper)], env=environment, text=True)
         values = dict(line.split("=", 1) for line in output.splitlines())
         self.assertEqual(values["WINEDLLOVERRIDES"], stage_owned_graphics.owned_overrides(True, True))
-        self.assertEqual(values["DXMT_ENABLE_NVEXT"], "1")
+        self.assertEqual(values["D3DALLOY_ENABLE_NVEXT"], "1")
         wrapper.write_text(stage_owned_graphics.render_wrapper(with_fsr=True, with_fsr_framegeneration=True))
         output = subprocess.check_output([str(wrapper)], env=environment, text=True)
         values = dict(line.split("=", 1) for line in output.splitlines())
         self.assertIn("amd_fidelityfx_upscaler_dx12=b", values["WINEDLLOVERRIDES"].split(";"))
         self.assertIn("amd_fidelityfx_framegeneration_dx12=b", values["WINEDLLOVERRIDES"].split(";"))
-        self.assertEqual(values["DXMT_ENABLE_NVEXT"], "")
+        self.assertEqual(values["D3DALLOY_ENABLE_NVEXT"], "")
         wrapper.write_text(stage_owned_graphics.render_wrapper(with_dcomp=True, with_wow64=True))
         output = subprocess.check_output([str(wrapper)], env=environment, text=True)
         values = dict(line.split("=", 1) for line in output.splitlines())
@@ -977,7 +977,7 @@ class StagingPolicyTests(unittest.TestCase):
                         "/usr/lib/libSystem.B.dylib"]
         with mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]), \
              mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=dependencies):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
         staged = self.dest / stage_owned_graphics.WINDOWS_DIR / "d3d12.dll"
         staged.write_bytes(staged.read_bytes().replace(stage_owned_graphics.WINE_BUILTIN_MARKER, b""))
@@ -991,7 +991,7 @@ class StagingPolicyTests(unittest.TestCase):
              mock.patch.object(stage_owned_graphics, "macho_audit_problems",
                                return_value=["winemetal.so has non-relocatable LC_RPATH: /Users/build"]):
             with self.assertRaisesRegex(ValueError, "non-relocatable LC_RPATH"):
-                stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
 
     def test_complete_stage_copies_only_destination_and_verifies_hashes(self) -> None:
         original_wine = (self.wine / "bin/wine").read_bytes()
@@ -1004,27 +1004,27 @@ class StagingPolicyTests(unittest.TestCase):
         ]
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=dependencies), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
         self.assertEqual((self.wine / "bin/wine").read_bytes(), original_wine)
         self.assertFalse((self.wine / "bin/wine.real").exists())
         self.assertEqual((self.dest / "bin/wine.real").read_bytes(), original_wine)
-        for relative, source in stage_owned_graphics.resolve_dxmt_artifacts(self.dxmt).items():
+        for relative, source in stage_owned_graphics.resolve_d3dalloy_artifacts(self.d3dalloy).items():
             self.assertEqual((self.dest / relative).read_bytes(), source.read_bytes())
         manifest = self.dest / stage_owned_graphics.MANIFEST
         self.assertTrue(manifest.is_file())
 
     def test_leftover_external_dxil_artifacts_are_refused(self) -> None:
         for relative in (*stage_owned_graphics.FORBIDDEN_STAGED_ARTIFACTS,
-                         stage_owned_graphics.DXMT_WINDOWS_DIR / "libmetalirconverter.dylib"):
+                         stage_owned_graphics.D3DALLOY_WINDOWS_DIR / "libmetalirconverter.dylib"):
             with self.subTest(relative=str(relative)):
-                path = self.dxmt / relative
+                path = self.d3dalloy / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"leftover")
                 with self.assertRaisesRegex(ValueError, "removed external DXIL compiler"):
-                    stage_owned_graphics.resolve_dxmt_artifacts(self.dxmt)
+                    stage_owned_graphics.resolve_d3dalloy_artifacts(self.d3dalloy)
                 path.unlink()
-        self.assertTrue(stage_owned_graphics.resolve_dxmt_artifacts(self.dxmt))
+        self.assertTrue(stage_owned_graphics.resolve_d3dalloy_artifacts(self.d3dalloy))
 
     def test_winemetal_linking_a_removed_compiler_library_is_refused(self) -> None:
         dependencies = ["@rpath/winemetal.so", "@rpath/winemac.so", "@rpath/ntdll.so",
@@ -1032,14 +1032,14 @@ class StagingPolicyTests(unittest.TestCase):
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=dependencies), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
             with self.assertRaisesRegex(ValueError, "external compiler/backend library"):
-                stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
 
     def test_native_compiler_is_recorded_and_reverified(self) -> None:
         dependencies = ["@rpath/winemetal.so", "@rpath/winemac.so", "@rpath/ntdll.so",
                         "/usr/lib/libSystem.B.dylib"]
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=dependencies), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
             manifest = json.loads((self.dest / stage_owned_graphics.MANIFEST).read_text())
             self.assertEqual(manifest["native_compiler"]["ownership"], "self-owned")
@@ -1135,7 +1135,7 @@ class StagingPolicyTests(unittest.TestCase):
         server.write_bytes(struct.pack("<IIIIIIII", 0xFEEDFACF, 0x100000C, 0, 2, 0, 0, 0, 0))
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
             manifest = json.loads((self.dest / stage_owned_graphics.MANIFEST).read_text())
             self.assertEqual(manifest["artifacts"]["bin/wineserver"]["native_architectures"], ["arm64"])
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
@@ -1174,10 +1174,10 @@ class StagingPolicyTests(unittest.TestCase):
             runtime_architecture({"schema": 2, "architecture": malformed})
 
     def test_machine_mismatch_refuses_publication_and_guest_execution(self) -> None:
-        dll = self.dxmt / "x86_64-windows/dxgi.dll"
+        dll = self.d3dalloy / "x86_64-windows/dxgi.dll"
         dll.write_bytes(self.pe_image(0xAA64, stage_owned_graphics.WINE_BUILTIN_MARKER))
         with self.assertRaisesRegex(ValueError, "ABI mismatch"):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
         self.assertFalse(self.dest.exists())
         guest = self.root / "guest.exe"
         guest.write_bytes(self.pe_image(0x8664, b"x64"))
@@ -1207,7 +1207,7 @@ class StagingPolicyTests(unittest.TestCase):
         fex = self.root / "fex-build"
         fex.mkdir()
         with self.assertRaisesRegex(ValueError, "native ARM64/paired ARM64X"):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, fex_build=fex)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, fex_build=fex)
         self.assertFalse(self.dest.exists())
 
     def test_arm64_staging_selects_native_and_windows_axes_independently(self) -> None:
@@ -1219,19 +1219,19 @@ class StagingPolicyTests(unittest.TestCase):
         macho = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x100000C, 0, 2, 0, 0, 0, 0)
         for path in (self.wine / "bin/wine", self.wine / "bin/wineserver", native / "ntdll.so"):
             path.write_bytes(macho)
-        (self.dxmt / "arm64ec-windows").mkdir()
-        (self.dxmt / "aarch64-unix").mkdir()
+        (self.d3dalloy / "arm64ec-windows").mkdir()
+        (self.d3dalloy / "aarch64-unix").mkdir()
         for name in stage_owned_graphics.WINDOWS_MODULES:
             payload = self.hybrid_image() + stage_owned_graphics.WINE_BUILTIN_MARKER
             if name == "d3d12.dll":
                 payload += stage_owned_graphics.OWNED_D3D12_MARKER
-            (self.dxmt / "arm64ec-windows" / name).write_bytes(self.core_image("arm64ec", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll") else payload)
-        (self.dxmt / "aarch64-unix/winemetal.so").write_bytes(macho)
+            (self.d3dalloy / "arm64ec-windows" / name).write_bytes(self.core_image("arm64ec", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll") else payload)
+        (self.d3dalloy / "aarch64-unix/winemetal.so").write_bytes(macho)
         for name, marker in stage_owned_graphics.FSR_MODULE_MARKERS.items():
-            (self.dxmt / "arm64ec-windows" / name).write_bytes(self.fsr_image(marker, "arm64ec"))
+            (self.d3dalloy / "arm64ec-windows" / name).write_bytes(self.fsr_image(marker, "arm64ec"))
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=["@rpath/winemac.so", "@rpath/ntdll.so"]), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, native_arch="arm64", windows_abi="arm64ec", with_fsr=True)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, native_arch="arm64", windows_abi="arm64ec", with_fsr=True)
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
             manifest = json.loads((self.dest / stage_owned_graphics.MANIFEST).read_text())
             self.assertEqual(manifest["architecture"], arch)
@@ -1248,31 +1248,31 @@ class StagingPolicyTests(unittest.TestCase):
             self.assertTrue(any("lacks arm64" in p for p in stage_owned_graphics.verify_runtime(self.dest)))
 
     def test_wow64_modules_are_staged_machine_checked_and_reverified(self) -> None:
-        dxmt32 = self.root / "dxmt-install32"
-        (dxmt32 / stage_owned_graphics.DXMT_WOW64_DIR).mkdir(parents=True)
+        d3dalloy32 = self.root / "d3dalloy-install32"
+        (d3dalloy32 / stage_owned_graphics.D3DALLOY_WOW64_DIR).mkdir(parents=True)
         (self.wine / stage_owned_graphics.WOW64_WINDOWS_DIR).mkdir(parents=True)
         for name in stage_owned_graphics.WINDOWS_MODULES:
             payload = name.encode() + b"-" + stage_owned_graphics.WINE_BUILTIN_MARKER
             if name == "d3d12.dll":
                 payload += b"-" + stage_owned_graphics.OWNED_D3D12_MARKER
-            (dxmt32 / stage_owned_graphics.DXMT_WOW64_DIR / name).write_bytes(
+            (d3dalloy32 / stage_owned_graphics.D3DALLOY_WOW64_DIR / name).write_bytes(
                 self.core_image("x86", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll") else self.pe_image(stage_owned_graphics.PE_MACHINE_I386, payload))
         dependencies = ["@rpath/winemetal.so", "@rpath/winemac.so", "@rpath/ntdll.so", "/usr/lib/libSystem.B.dylib"]
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=dependencies), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
             # An x86_64 image in the 32-bit prefix is a mislabeled build, not a WoW64 module.
-            amd64 = dxmt32 / stage_owned_graphics.DXMT_WOW64_DIR / "dxgi.dll"
+            amd64 = d3dalloy32 / stage_owned_graphics.D3DALLOY_WOW64_DIR / "dxgi.dll"
             good = amd64.read_bytes()
             amd64.write_bytes(self.pe_image(0x8664, good[0x40 + 24:]))
             with self.assertRaisesRegex(ValueError, "not an i386 PE image"):
-                stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, dxmt_install32=dxmt32)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, d3dalloy_install32=d3dalloy32)
             self.assertFalse(self.dest.exists())
             amd64.write_bytes(good)
 
-            stage_owned_graphics.stage(self.dxmt, self.wine, self.dest, dxmt_install32=dxmt32)
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest, d3dalloy_install32=d3dalloy32)
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
             staged = self.dest / stage_owned_graphics.WOW64_WINDOWS_DIR / "d3d12.dll"
-            self.assertEqual(staged.read_bytes(), (dxmt32 / "i386-windows/d3d12.dll").read_bytes())
+            self.assertEqual(staged.read_bytes(), (d3dalloy32 / "i386-windows/d3d12.dll").read_bytes())
             manifest = json.loads((self.dest / stage_owned_graphics.MANIFEST).read_text())
             self.assertIs(manifest["optional_modules"]["wow64"], True)
             self.assertEqual(manifest["loader"]["winedllpath"], ["lib/wine/x86_64-windows", "lib/wine/i386-windows", "lib/wine/x86_64-unix"])
@@ -1301,14 +1301,14 @@ class StagingPolicyTests(unittest.TestCase):
             core.write_bytes(original_core)
             # A newly selected facade group must also be source-owned in WoW64.
             for name, marker in stage_owned_graphics.FSR_MODULE_MARKERS.items():
-                (self.dxmt / "x86_64-windows" / name).write_bytes(self.fsr_image(marker))
+                (self.d3dalloy / "x86_64-windows" / name).write_bytes(self.fsr_image(marker))
             fsr_runtime = self.root / "runtime-wow64-fsr"
             with self.assertRaisesRegex(ValueError, "regular non-symlink"):
-                stage_owned_graphics.stage(self.dxmt, self.wine, fsr_runtime, dxmt_install32=dxmt32, with_fsr=True)
+                stage_owned_graphics.stage(self.d3dalloy, self.wine, fsr_runtime, d3dalloy_install32=d3dalloy32, with_fsr=True)
             self.assertFalse(fsr_runtime.exists())
             for name, marker in stage_owned_graphics.FSR_MODULE_MARKERS.items():
-                (dxmt32 / "i386-windows" / name).write_bytes(self.fsr_image(marker, "x86"))
-            stage_owned_graphics.stage(self.dxmt, self.wine, fsr_runtime, dxmt_install32=dxmt32, with_fsr=True)
+                (d3dalloy32 / "i386-windows" / name).write_bytes(self.fsr_image(marker, "x86"))
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, fsr_runtime, d3dalloy_install32=d3dalloy32, with_fsr=True)
             self.assertEqual(stage_owned_graphics.verify_runtime(fsr_runtime), [])
             fsr_manifest = json.loads((fsr_runtime / stage_owned_graphics.MANIFEST).read_text())
             self.assertIs(fsr_manifest["optional_modules"]["wow64_frontends"], True)

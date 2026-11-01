@@ -29,7 +29,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 llvm::ArrayType *
 GetArrayType(llvm::Value *Array) {
@@ -1162,13 +1162,13 @@ Converter::operator()(const InstDoubleOp &inst) {
     };
     Value *value = nullptr;
     switch (op) {
-    case D3D11_SB_OPCODE_DADD: value = call("dxmt.fp64.add", i64, {packed(0), packed(1)}); break;
-    case D3D11_SB_OPCODE_DMUL: value = call("dxmt.fp64.mul", i64, {packed(0), packed(1)}); break;
-    case D3D11_1_SB_OPCODE_DDIV: value = call("dxmt.fp64.div", i64, {packed(0), packed(1)}); break;
-    case D3D11_1_SB_OPCODE_DFMA: value = call("dxmt.fp64.fma", i64, {packed(0), packed(1), packed(2)}); break;
-    case D3D11_1_SB_OPCODE_DRCP: value = call("dxmt.fp64.div", i64, {ir.getInt64(0x3ff0000000000000ULL), packed(0)}); break;
-    case D3D11_SB_OPCODE_DMIN: value = call("dxmt.fp64.min", i64, {packed(0), packed(1)}); break;
-    case D3D11_SB_OPCODE_DMAX: value = call("dxmt.fp64.max", i64, {packed(0), packed(1)}); break;
+    case D3D11_SB_OPCODE_DADD: value = call("d3dalloy.fp64.add", i64, {packed(0), packed(1)}); break;
+    case D3D11_SB_OPCODE_DMUL: value = call("d3dalloy.fp64.mul", i64, {packed(0), packed(1)}); break;
+    case D3D11_1_SB_OPCODE_DDIV: value = call("d3dalloy.fp64.div", i64, {packed(0), packed(1)}); break;
+    case D3D11_1_SB_OPCODE_DFMA: value = call("d3dalloy.fp64.fma", i64, {packed(0), packed(1), packed(2)}); break;
+    case D3D11_1_SB_OPCODE_DRCP: value = call("d3dalloy.fp64.div", i64, {ir.getInt64(0x3ff0000000000000ULL), packed(0)}); break;
+    case D3D11_SB_OPCODE_DMIN: value = call("d3dalloy.fp64.min", i64, {packed(0), packed(1)}); break;
+    case D3D11_SB_OPCODE_DMAX: value = call("d3dalloy.fp64.max", i64, {packed(0), packed(1)}); break;
     case D3D11_SB_OPCODE_DMOV: value = packed(0); break;
     case D3D11_SB_OPCODE_DMOVC: value = ir.CreateSelect(ir.CreateIsNotNull(word(0)), packed(1), packed(2)); break;
     case D3D11_SB_OPCODE_DEQ:
@@ -1176,7 +1176,7 @@ Converter::operator()(const InstDoubleOp &inst) {
     case D3D11_SB_OPCODE_DLT:
     case D3D11_SB_OPCODE_DGE: {
       auto *a = packed(0), *b = packed(1);
-      auto *equal = call("dxmt.fp64.eq", ir.getInt1Ty(), {a, b});
+      auto *equal = call("d3dalloy.fp64.eq", ir.getInt1Ty(), {a, b});
       Value *test = equal;
       if (op == D3D11_SB_OPCODE_DNE) test = ir.CreateNot(equal);
       if (op == D3D11_SB_OPCODE_DLT || op == D3D11_SB_OPCODE_DGE) {
@@ -1193,17 +1193,17 @@ Converter::operator()(const InstDoubleOp &inst) {
       value = ir.CreateSExt(test, i32);
       break;
     }
-    case D3D11_SB_OPCODE_DTOF: value = call("dxmt.fp64.to.f32", i32, {packed(0)}); break;
-    case D3D11_1_SB_OPCODE_DTOI: value = call("dxmt.fp64.to.i32", i32, {packed(0)}); break;
-    case D3D11_1_SB_OPCODE_DTOU: value = call("dxmt.fp64.to.u32", i32, {packed(0)}); break;
-    case D3D11_SB_OPCODE_FTOD: value = call("dxmt.fp64.from.f32", i64, {word(0)}); break;
-    case D3D11_1_SB_OPCODE_ITOD: value = call("dxmt.fp64.from.i64", i64, {ir.CreateSExt(word(0), i64)}); break;
-    case D3D11_1_SB_OPCODE_UTOD: value = call("dxmt.fp64.from.u64", i64, {ir.CreateZExt(word(0), i64)}); break;
+    case D3D11_SB_OPCODE_DTOF: value = call("d3dalloy.fp64.to.f32", i32, {packed(0)}); break;
+    case D3D11_1_SB_OPCODE_DTOI: value = call("d3dalloy.fp64.to.i32", i32, {packed(0)}); break;
+    case D3D11_1_SB_OPCODE_DTOU: value = call("d3dalloy.fp64.to.u32", i32, {packed(0)}); break;
+    case D3D11_SB_OPCODE_FTOD: value = call("d3dalloy.fp64.from.f32", i64, {word(0)}); break;
+    case D3D11_1_SB_OPCODE_ITOD: value = call("d3dalloy.fp64.from.i64", i64, {ir.CreateSExt(word(0), i64)}); break;
+    case D3D11_1_SB_OPCODE_UTOD: value = call("d3dalloy.fp64.from.u64", i64, {ir.CreateZExt(word(0), i64)}); break;
     default: llvm_unreachable("unhandled DXBC double instruction");
     }
     if (!narrow && inst._.saturate) {
-      value = call("dxmt.fp64.max", i64, {value, ir.getInt64(0)});
-      value = call("dxmt.fp64.min", i64, {value, ir.getInt64(0x3ff0000000000000ULL)});
+      value = call("d3dalloy.fp64.max", i64, {value, ir.getInt64(0)});
+      value = call("d3dalloy.fp64.min", i64, {value, ir.getInt64(0x3ff0000000000000ULL)});
     }
     if (narrow) {
       result = words == 1 ? value : ir.CreateInsertElement(result, value, output++);
@@ -2714,7 +2714,7 @@ Converter::operator()(const InstSamplePos &sample) {
     Pos = ir.CreateSelect(center, llvm::ConstantAggregateZero::get(air.getFloatTy(2)), Pos);
   } else if (!sample.src) {
     if (auto *call = llvm::dyn_cast<llvm::CallInst>(Pos))
-      call->setMetadata("dxmt.rt_sample_pos", llvm::MDNode::get(ir.getContext(), {}));
+      call->setMetadata("d3dalloy.rt_sample_pos", llvm::MDNode::get(ir.getContext(), {}));
   }
   ValueVec4 = ir.CreateShuffleVector(Pos, ValueVec4, {0, 1, 2, 3});
 
@@ -3168,7 +3168,7 @@ Converter::operator()(const InstInterpolateOffset &eval) {
   auto Offset = LoadOperand(eval.offset, kMaskVecXY);
   // Truncate to the D3D signed [-8, 7] sixteenth-pixel offset domain.
   llvm::Value *Truncated = ir.CreateAdd(Offset, air.getInt2(8, 8));
-  if (!ir.GetInsertBlock()->getModule()->getModuleFlag("dxmt.coarse.snapped"))
+  if (!ir.GetInsertBlock()->getModule()->getModuleFlag("d3dalloy.coarse.snapped"))
     Truncated = ir.CreateAnd(Truncated, air.getInt2(0b1111, 0b1111));
   // D3D offsets are center-relative; Metal's interpolate_at_offset uses the pixel corner.
   auto OffsetFloat = ir.CreateFMul(air.CreateConvertToFloat(Truncated), air.getFloat2(1.0f / 16.0f, 1.0f / 16.0f));
@@ -3204,7 +3204,7 @@ Converter::operator()(const InstMaskedSumOfAbsDiff &msad) {
   Tys.push_back(Accum->getType());
   Ops.push_back(Accum);
 
-  std::string FnName = "dxmt.msad";
+  std::string FnName = "d3dalloy.msad";
   FnName += air.getTypeOverloadSuffix(Ref->getType());
 
   auto Fn = air.getModule()->getOrInsertFunction(FnName, FunctionType::get(Accum->getType(), Tys, false), Attrs);
@@ -3259,7 +3259,7 @@ Converter::HullGenerateWorkloadForTriangle(
   Tys.push_back(TessFactorOut2->getType());
   Ops.push_back(TessFactorOut2);
 
-  std::string FnName = Points ? "dxmt.generate_workload.triangle_points" : "dxmt.generate_workload.triangle";
+  std::string FnName = Points ? "d3dalloy.generate_workload.triangle_points" : "d3dalloy.generate_workload.triangle";
   switch (Partitioning) {
   case TessellatorPartitioning::integer:
     FnName += ".integer";
@@ -3295,7 +3295,7 @@ Converter::HullGenerateWorkloadForIsoline(
   SmallVector<Type *> Tys;
   for (auto *Op : Ops)
     Tys.push_back(Op->getType());
-  std::string FnName = "dxmt.generate_workload.isoline";
+  std::string FnName = "d3dalloy.generate_workload.isoline";
   switch (Partitioning) {
   case TessellatorPartitioning::integer:
     FnName += ".integer";
@@ -3352,7 +3352,7 @@ Converter::HullGenerateWorkloadForQuad(
   Tys.push_back(TessFactorOut3->getType());
   Ops.push_back(TessFactorOut3);
 
-  std::string FnName = Points ? "dxmt.generate_workload.quad_points" : "dxmt.generate_workload.quad";
+  std::string FnName = Points ? "d3dalloy.generate_workload.quad_points" : "d3dalloy.generate_workload.quad";
   switch (Partitioning) {
   case TessellatorPartitioning::integer:
     FnName += ".integer";
@@ -3392,7 +3392,7 @@ Converter::DomainGetPatchIndex(llvm::Value *WorkloadIndex, llvm::Value *DataPtr)
   Tys.push_back(DataPtr->getType());
   Ops.push_back(DataPtr);
 
-  std::string FnName = "dxmt.get_domain_patch_index";
+  std::string FnName = "d3dalloy.get_domain_patch_index";
   auto Fn = air.getModule()->getOrInsertFunction(FnName, llvm::FunctionType::get(air.getIntTy(), Tys, false), Attrs);
   return ir.CreateCall(Fn, Ops);
 }
@@ -3422,7 +3422,7 @@ Converter::DomainGetLocation(
   Tys.push_back(DataPtr->getType());
   Ops.push_back(DataPtr);
 
-  std::string FnName = "dxmt.get_domain_location";
+  std::string FnName = "d3dalloy.get_domain_location";
   switch (Partitioning) {
   case TessellatorPartitioning::integer:
     FnName += ".integer";
@@ -3476,7 +3476,7 @@ Converter::DomainGeneratePrimitives(
   Tys.push_back(air.getMeshHandleType());
   Ops.push_back(air.getMeshHandle());
 
-  std::string FnName = "dxmt.domain_generate_primitives";
+  std::string FnName = "d3dalloy.domain_generate_primitives";
   switch (Primitive) {
   case TessellatorOutputPrimitive::point:
     FnName += ".point";
@@ -3514,7 +3514,7 @@ Converter::DomainGeneratePrimitivesCapture(
   Value *Ops[] = {WorkloadIndex, DataPtr, IndicesPtr};
   Type *Tys[] = {WorkloadIndex->getType(), DataPtr->getType(), IndicesPtr->getType()};
 
-  std::string FnName = "dxmt.domain_generate_primitives";
+  std::string FnName = "d3dalloy.domain_generate_primitives";
   switch (Primitive) {
   case TessellatorOutputPrimitive::point:
     FnName += ".point";
@@ -3551,7 +3551,7 @@ Converter::DomainGetWorkloadRank(llvm::Value *WorkloadIndex, llvm::Value *DataPt
   Type *Tys[] = {WorkloadIndex->getType(), DataPtr->getType()};
 
   auto Fn = air.getModule()->getOrInsertFunction(
-      "dxmt.get_domain_workload_rank", llvm::FunctionType::get(air.getIntTy(), Tys, false), Attrs
+      "d3dalloy.get_domain_workload_rank", llvm::FunctionType::get(air.getIntTy(), Tys, false), Attrs
   );
   return ir.CreateCall(Fn, Ops);
 }
@@ -3616,4 +3616,4 @@ Converter::SupportsNonExecutionBarrier() const {
   return ctx.metal_version >= SM50_SHADER_METAL_320;
 }
 
-} // namespace dxmt::dxbc
+} // namespace d3dalloy::dxbc

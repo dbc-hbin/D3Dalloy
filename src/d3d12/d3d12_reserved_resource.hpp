@@ -27,7 +27,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D12Device;
 
@@ -233,7 +233,7 @@ public:
   WMT::Reference<WMT::Buffer> status_buffer;
   uint8_t *status_bytes = nullptr;
 
-  dxmt::mutex mutex;
+  d3dalloy::mutex mutex;
 
 private:
   void EncodeTexture(
@@ -273,4 +273,4 @@ private:
   std::unordered_map<obj_handle_t, std::pair<WMT::Reference<WMT::Heap>, uint32_t>> heaps_;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

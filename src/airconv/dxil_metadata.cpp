@@ -30,7 +30,7 @@
 #include "DXBCParser/ShaderBinary.h"
 #include "airconv_error.hpp"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 /**
  * The stage of one DXIL entry, from the `ShaderKind` value in its
@@ -141,35 +141,35 @@ llvm::Value *getValue(const llvm::MDNode *node, unsigned index) {
 
 llvm::Error bytecodeError(uint32_t status) {
   switch (status) {
-  case DXMT_SHADER_BYTECODE_INVALID_ARGUMENT:
+  case D3DALLOY_SHADER_BYTECODE_INVALID_ARGUMENT:
     return createError("invalid shader bytecode argument");
-  case DXMT_SHADER_BYTECODE_TRUNCATED_CONTAINER:
+  case D3DALLOY_SHADER_BYTECODE_TRUNCATED_CONTAINER:
     return createError("DXBC container is truncated");
-  case DXMT_SHADER_BYTECODE_CONTAINER_MAGIC:
+  case D3DALLOY_SHADER_BYTECODE_CONTAINER_MAGIC:
     return createError("not a DXBC container");
-  case DXMT_SHADER_BYTECODE_CONTAINER_VERSION:
+  case D3DALLOY_SHADER_BYTECODE_CONTAINER_VERSION:
     return createError("unsupported DXBC container version");
-  case DXMT_SHADER_BYTECODE_CONTAINER_SIZE:
+  case D3DALLOY_SHADER_BYTECODE_CONTAINER_SIZE:
     return createError("DXBC container size is out of bounds");
-  case DXMT_SHADER_BYTECODE_CHUNK_TABLE:
+  case D3DALLOY_SHADER_BYTECODE_CHUNK_TABLE:
     return createError("DXBC chunk table is out of bounds");
-  case DXMT_SHADER_BYTECODE_CHUNK_OFFSET:
+  case D3DALLOY_SHADER_BYTECODE_CHUNK_OFFSET:
     return createError("DXBC chunk offset is out of bounds");
-  case DXMT_SHADER_BYTECODE_CHUNK_SIZE:
+  case D3DALLOY_SHADER_BYTECODE_CHUNK_SIZE:
     return createError("DXBC chunk size is out of bounds");
-  case DXMT_SHADER_BYTECODE_CHUNK_LAYOUT:
+  case D3DALLOY_SHADER_BYTECODE_CHUNK_LAYOUT:
     return createError("DXBC chunks are not contiguous");
-  case DXMT_SHADER_BYTECODE_NOT_FOUND:
+  case D3DALLOY_SHADER_BYTECODE_NOT_FOUND:
     return createError("DXBC chunk not found");
-  case DXMT_SHADER_BYTECODE_TRUNCATED_DXIL:
+  case D3DALLOY_SHADER_BYTECODE_TRUNCATED_DXIL:
     return createError("DXIL chunk is truncated");
-  case DXMT_SHADER_BYTECODE_DXIL_ENCODING:
+  case D3DALLOY_SHADER_BYTECODE_DXIL_ENCODING:
     return createError("unsupported DXIL chunk encoding");
-  case DXMT_SHADER_BYTECODE_BITCODE_OFFSET:
+  case D3DALLOY_SHADER_BYTECODE_BITCODE_OFFSET:
     return createError("DXIL bitcode offset is out of bounds");
-  case DXMT_SHADER_BYTECODE_BITCODE_SIZE:
+  case D3DALLOY_SHADER_BYTECODE_BITCODE_SIZE:
     return createError("DXIL bitcode size is out of bounds");
-  case DXMT_SHADER_BYTECODE_BITCODE_MAGIC:
+  case D3DALLOY_SHADER_BYTECODE_BITCODE_MAGIC:
     return createError("DXIL chunk does not contain bitcode");
   default:
     llvm_unreachable("unexpected shader bytecode status");
@@ -178,12 +178,12 @@ llvm::Error bytecodeError(uint32_t status) {
 
 llvm::Expected<ChunkView> findChunk(const void *bytecode, size_t size, const char *fourcc) {
   if (!fourcc)
-    return bytecodeError(DXMT_SHADER_BYTECODE_INVALID_ARGUMENT);
+    return bytecodeError(D3DALLOY_SHADER_BYTECODE_INVALID_ARGUMENT);
   uint32_t tag = uint32_t(uint8_t(fourcc[0])) | uint32_t(uint8_t(fourcc[1])) << 8 |
                  uint32_t(uint8_t(fourcc[2])) << 16 | uint32_t(uint8_t(fourcc[3])) << 24;
-  DxmtShaderChunk chunk;
-  uint32_t status = dxmt_shader_container_find(bytecode, size, DXMT_SHADER_CONTAINER_DXIL, tag, 0, &chunk);
-  if (status != DXMT_SHADER_BYTECODE_SUCCESS)
+  D3DalloyShaderChunk chunk;
+  uint32_t status = d3dalloy_shader_container_find(bytecode, size, D3DALLOY_SHADER_CONTAINER_DXIL, tag, 0, &chunk);
+  if (status != D3DALLOY_SHADER_BYTECODE_SUCCESS)
     return bytecodeError(status);
   return ChunkView{static_cast<const uint8_t *>(bytecode) + chunk.offset, chunk.size};
 }
@@ -194,15 +194,15 @@ llvm::Expected<ChunkView> findChunk(const void *bytecode, size_t size, const cha
 
 llvm::Error signatureError(uint32_t status) {
   switch (status) {
-  case DXMT_DXBC_SIGNATURE_HEADER:
+  case D3DALLOY_DXBC_SIGNATURE_HEADER:
     return createError("DXIL signature chunk is truncated");
-  case DXMT_DXBC_SIGNATURE_RECORDS:
+  case D3DALLOY_DXBC_SIGNATURE_RECORDS:
     return createError("DXIL signature element is out of bounds");
-  case DXMT_DXBC_SIGNATURE_NAME:
+  case D3DALLOY_DXBC_SIGNATURE_NAME:
     return createError("DXIL signature name is out of bounds or not terminated");
-  case DXMT_DXBC_SIGNATURE_REGISTER_ORDER:
+  case D3DALLOY_DXBC_SIGNATURE_REGISTER_ORDER:
     return createError("DXIL signature registers are not sorted within a stream");
-  case DXMT_DXBC_SIGNATURE_STREAM_ORDER:
+  case D3DALLOY_DXBC_SIGNATURE_STREAM_ORDER:
     return createError("DXIL signature streams are not sorted in 0..3");
   default:
     llvm_unreachable("unexpected DXBC signature status");
@@ -215,14 +215,14 @@ llvm::Error signatureError(uint32_t status) {
 llvm::Error parseSignatureChunk(const ChunkView &chunk, std::vector<SigElement> &out) {
   if (chunk.size == 0)
     return llvm::Error::success();
-  DxmtDxbcSignatureInfo info;
-  if (uint32_t status = dxmt_dxbc_signature_parse(chunk.data, chunk.size, DXMT_DXBC_SIGNATURE_11_1, 1, &info))
+  D3DalloyDxbcSignatureInfo info;
+  if (uint32_t status = d3dalloy_dxbc_signature_parse(chunk.data, chunk.size, D3DALLOY_DXBC_SIGNATURE_11_1, 1, &info))
     return signatureError(status);
 
   out.reserve(out.size() + info.parameter_count);
   for (uint32_t i = 0; i < info.parameter_count; i++) {
-    DxmtDxbcSignatureParameter record;
-    if (uint32_t status = dxmt_dxbc_signature_parameter(chunk.data, chunk.size, &info, i, &record))
+    D3DalloyDxbcSignatureParameter record;
+    if (uint32_t status = d3dalloy_dxbc_signature_parameter(chunk.data, chunk.size, &info, i, &record))
       return signatureError(status);
 
     SigElement sig;
@@ -1009,10 +1009,10 @@ llvm::Error extractMetadata(
             return createError("DXIL wide WaveSize requires scalar integer/half/float collectives");
         }
       }
-      module.addModuleFlag(llvm::Module::Error, "dxmt.wide-wave-threads", uint32_t(threads));
+      module.addModuleFlag(llvm::Module::Error, "d3dalloy.wide-wave-threads", uint32_t(threads));
     }
     if (declared || wave_size != 32)
-      module.addModuleFlag(llvm::Module::Error, "dxmt.wave-size", wave_size);
+      module.addModuleFlag(llvm::Module::Error, "d3dalloy.wave-size", wave_size);
   }
   // ForceEarlyDepthStencil is bit 3 in the low word of ShaderFlags (tag 0).
   uint32_t shader_flags = 0;
@@ -1347,9 +1347,9 @@ const ResourceBinding *ModuleInfo::find_resource_at(
 }
 
 llvm::Expected<DXILProgram> FindDXILProgram(const void *bytecode, size_t size) {
-  DxmtDxilProgram decoded;
-  uint32_t status = dxmt_shader_dxil_program(bytecode, size, &decoded);
-  if (status != DXMT_SHADER_BYTECODE_SUCCESS)
+  D3DalloyDxilProgram decoded;
+  uint32_t status = d3dalloy_shader_dxil_program(bytecode, size, &decoded);
+  if (status != D3DALLOY_SHADER_BYTECODE_SUCCESS)
     return bytecodeError(status);
   DXILProgram program;
   program.program_version = decoded.program_version;
@@ -1415,4 +1415,4 @@ shader::common::ScalerDataType to_scaler_type(ComponentType type) {
   }
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

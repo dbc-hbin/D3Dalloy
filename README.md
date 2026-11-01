@@ -1,8 +1,10 @@
-# dxmt-d3d12
+# D3Dalloy
 
-DXMT 기반 D3D12 → Metal 번역기와 자체 DXIL/DXBC → AIR/metallib compiler.
+Wine/macOS용 D3D12 → Metal 번역기와 자체 DXIL/DXBC → AIR/metallib compiler.
 현재 개발 기준은 이 저장소 루트의 `src/`다. Apple Metal Shader Converter, GPTK/D3DMetal,
 SPIR-V compiler fallback을 사용하지 않는다.
+
+설정은 [`d3dalloy.conf`](d3dalloy.conf), `D3DALLOY_CONFIG_FILE`·`D3DALLOY_CONFIG`와 `D3DALLOY_*` 환경변수를 사용한다. [설정 우선순위와 키](doc/CUSTOMIZATION.md)를 따르며 기존 DXMT 설정 alias는 제공하지 않는다. 모듈 로그는 `<실행파일>_d3dalloy-<모듈>.log`로 분리한다.
 
 Wine SDK·runtime 빌드와 Wine 패치는 별도 [Wine-darwin](../Wine-darwin/README.md),
 FEX 소스·빌드는 [FEX-darwin](../FEX-darwin/README.md)에서 관리한다.
@@ -60,7 +62,7 @@ FEX 소스·빌드는 [FEX-darwin](../FEX-darwin/README.md)에서 관리한다.
 | `src/d3d12/` | Device·resource·PSO·command list/queue·query·DXR·temporal |
 | `src/airconv/` | 자체 DXIL/DXBC compiler, AIR/metallib 출력 |
 | `src/winemetal/` | Windows/native Metal ABI와 Metal 4 backend |
-| `src/dxmt/`, `src/dxgi/` | 공유 backend·동기화·adapter·presentation |
+| `src/d3dalloy/`, `src/dxgi/` | 공유 backend·동기화·adapter·presentation |
 | `src/nvapi/`, `src/nvngx/` | 공용 backend를 사용하는 연동 facade |
 | `src/d3d10/`, `src/d3d11/` | 유지하는 업스트림 frontend |
 | `graphics-translator/tests/` | 공개 D3D12 fixture·CPU probe·frozen DXIL/DXBC |
@@ -127,7 +129,7 @@ meson install -C build/local/build --no-rebuild
 
 처음에는 새 build directory를 configure한다. 이후에는 같은 설정에서 Ninja와 install만 다시 실행한다.
 WoW64는 `build-win32.txt`의 별도 i686 build/install을 만들고 staging의
-`--dxmt-install32`로 추가한다. PE32만으로 native Unix library를 대체하지 않는다.
+`--d3dalloy-install32`로 추가한다. PE32만으로 native Unix library를 대체하지 않는다.
 `d3d12.dll`과 같은 build generation의 **owned `d3d12core.dll`도 필수 설치 항목**이다.
 Core는 Wine Unix 경계가 없는 일반 PE이며 staging은 `d3d12core=n`으로 실제 SDK 경로를
 선택한다. 나머지 graphics DLL의 builtin 정책은 유지한다. 별도 Core 활성화 옵션은 없다.
@@ -206,7 +208,7 @@ GPU 검증은 아니다. 일반 lint target이나 Meson regression suite는 없�
 
 ```sh
 python3 scripts/stage-owned-graphics.py stage \
-  --dxmt-install build/local/install --wine-source toolchains/wine-runtime \
+  --d3dalloy-install build/local/install --wine-source toolchains/wine-runtime \
   --wine-dest build/local/runtime --with-nvapi --with-nvngx
 "$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -municode -static \
   -Iinclude/native/directx graphics-translator/tests/owned-d3d12-pipeline-cache.cpp \

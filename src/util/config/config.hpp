@@ -14,7 +14,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace dxmt {
+namespace d3dalloy {
 
   /**
    * \brief Tri-state

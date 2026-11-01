@@ -79,7 +79,7 @@ static uint atomic64_allocate(device Atomic64Context *context) {
     }
   }
 }
-extern "C" ulong dxmt_atomic64_read(device uchar *bytes, device atomic_uint *root) {
+extern "C" ulong d3dalloy_atomic64_read(device uchar *bytes, device atomic_uint *root) {
   if (!root) return 0;
   auto context = reinterpret_cast<device Atomic64Context *>(bytes);
   auto nodes = reinterpret_cast<device Atomic64Node *>(context->nodes);
@@ -88,7 +88,7 @@ extern "C" ulong dxmt_atomic64_read(device uchar *bytes, device atomic_uint *roo
   atomic64_release(context, index);
   return value;
 }
-extern "C" ulong dxmt_atomic64_compare_exchange(
+extern "C" ulong d3dalloy_atomic64_compare_exchange(
   device uchar *bytes, device atomic_uint *root, ulong comparison, ulong desired
 ) {
   if (!root) return 0;

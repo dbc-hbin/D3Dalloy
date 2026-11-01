@@ -2,7 +2,7 @@
 #include "d3d11_input_layout.hpp"
 #include "d3d11_state_object.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D11PipelineCacheBase {
 public:
@@ -34,4 +34,4 @@ public:
 std::unique_ptr<MTLD3D11PipelineCacheBase>
 InitializePipelineCache(MTLD3D11Device *device);
 
-} // namespace dxmt
+} // namespace d3dalloy

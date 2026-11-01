@@ -32,6 +32,8 @@ Valid open-list control이 먼저 exact S_OK여야 한다. Control이 실패하�
 - state release-before-Execute: Close 뒤 caller COM state를 release하고 Execute/readback한다. Recorded frame이 state/resource/scratch를 retain해야 한다.
 - 동일 closed list는 **앞 실행 완료 후** replay한다. Caller reset false이면 같은 generation reset `1,0`, caller true replay는 매번 1이다.
 - A(backing 64×64)·B(backing 80×80)를 둘 다 실행 전에 기록한다. Active content는 둘 다 64×64다. A1→B1→A2→A3의 effective reset은 `1,1,1,0`이어야 한다.
+- 동적 출력 descriptor 재사용은 1280×720 input에서 1920×1080→1600×900→2560×1440→1920×1080을 실행한다. 각 recording을 두 번 replay하고, caller state 해제 뒤에도 결과와 output 바깥 sentinel을 보존하며 마지막 A가 처음 A와 일치해야 한다.
+- 옛 dynamic recording 재실행은 같은 input의 A=1600×900, B=1920×1080에서 A→B→A를 검사한다. B를 retire하고 A output을 sentinel로 다시 채운 뒤 replay한 결과를 독립적인 fresh-reset A와 비교한다. 이 두 검사에서 사용하던 64×64 input·96/112/128 크기의 초소형 동적 출력 시나리오는 제거했다. Typed/typeless·수명·경계 검사용 작은 resource와 업스케일 품질 평가를 혼동하지 않는다.
 - Reset은 이미지에서 추정하지 않고 actual `temporal_encode` trace와 비교한다. `last_executed_generation`이 현재 backend 기준이며 옛 generation-local initialized flag 설명으로 돌아가지 않는다.
 
 ## Output subrect와 exact HRESULT
@@ -66,7 +68,7 @@ TEMPORAL_WORK="$(mktemp -d "$PWD/build/temporal-check.XXXXXX")"
   graphics-translator/tests/owned-d3d12-temporal.cpp \
   -o "$TEMPORAL_WORK/owned-d3d12-temporal.exe" -ld3d12 -ldxgi -lole32 -luuid
 python3 scripts/stage-owned-graphics.py stage \
-  --dxmt-install "$OWNED_INSTALL" --wine-source "$WINE_SOURCE" \
+  --d3dalloy-install "$OWNED_INSTALL" --wine-source "$WINE_SOURCE" \
   --wine-dest "$TEMPORAL_WORK/runtime" \
   --native-arch x86_64 --windows-abi x64
 python3 scripts/test-owned-graphics.py \
@@ -78,7 +80,7 @@ python3 scripts/test-owned-graphics.py \
 
 Runner는 fresh out/prefix, runtime verification·fixture freeze·hash·load identity·validation을 요구하고 성공한 temporal run에서 trace analyzer도 자동 실행한다. API wait/queue completion case는 fixture 내부 15초 watchdog으로 bounded다. Runner timeout은 전체 run 제한이다.
 
-WoW64은 matching i386 fixture를 `--target=i686-w64-mingw32`로 빌드하고 matching x64+i386 staged runtime을 사용한다. `--dxmt-install32`를 stage에 추가하고 runner guest assertion은 `--guest-arch x86`이다. **x64 PE를 x86 옵션으로 바꾸는 것만으로 WoW64 시험이 되지 않는다.** ARM64 Wine/FEX acceptance와도 별개다.
+WoW64은 matching i386 fixture를 `--target=i686-w64-mingw32`로 빌드하고 matching x64+i386 staged runtime을 사용한다. `--d3dalloy-install32`를 stage에 추가하고 runner guest assertion은 `--guest-arch x86`이다. **x64 PE를 x86 옵션으로 바꾸는 것만으로 WoW64 시험이 되지 않는다.** ARM64 Wine/FEX acceptance와도 별개다.
 
 ## PASS·증거의 의미
 

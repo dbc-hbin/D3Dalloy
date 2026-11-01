@@ -38,7 +38,7 @@
 #include "shader_common.hpp"
 #include "dxil_workgraph.h"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 using llvm::StringRef;
 
@@ -556,7 +556,7 @@ llvm::Error LowerRayQueries(llvm::Module &module);
 
 /**
  * Resolved arguments of a lowered raytracing export, recovered from the AIR entry
- * metadata the stage builder wrote plus the `dxmt.rt.locals` node that names the
+ * metadata the stage builder wrote plus the `d3dalloy.rt.locals` node that names the
  * per-invocation allocations.
  */
 struct RaytracingEntryArguments {
@@ -615,10 +615,10 @@ inline constexpr uint32_t kDxilRangedWaveSizeTag = 23;
  * table (SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE). The resource lowering
  * creates it on first use; LowerImmutableConstants turns it into a runtime relocation.
  */
-inline constexpr const char *kAtomicLockTableGlobal = "dxmt.atomic64_lock_table";
-inline constexpr const char *kAtomic64ContextGlobal = "dxmt.atomic64.context";
-inline constexpr const char *kAtomic64PhaseFlag = "dxmt.atomic64.phase";
-inline constexpr const char *kAtomic64Metadata = "dxmt.atomic64.metadata";
+inline constexpr const char *kAtomicLockTableGlobal = "d3dalloy.atomic64_lock_table";
+inline constexpr const char *kAtomic64ContextGlobal = "d3dalloy.atomic64.context";
+inline constexpr const char *kAtomic64PhaseFlag = "d3dalloy.atomic64.phase";
+inline constexpr const char *kAtomic64Metadata = "d3dalloy.atomic64.metadata";
 
 /** Only instantiated in the D3D12 atomic-phase compiler variant. Metadata
  * operations protect helper reads; application writes remain logically guarded. */
@@ -729,4 +729,4 @@ public:
   ~SM50ErrorInternal() { std::free(cloned_buf); }
 };
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

@@ -43,14 +43,14 @@ static void check(const char *name, StringRef declarations, StringRef body,
   auto module = parseAssemblyString(source, diagnostic, context);
   if (!module) { diagnostic.print(name, errs()); ++failures; return; }
   auto bytes = container(*module);
-  auto parsed = dxmt::dxil::ModuleInfo::Parse(bytes.data(), bytes.size());
+  auto parsed = d3dalloy::dxil::ModuleInfo::Parse(bytes.data(), bytes.size());
   const bool actual = bool(parsed);
   std::string error = actual ? "" : toString(parsed.takeError());
   if (actual != accepted) {
     std::fprintf(stderr, "VECTOR_CONTRACT_FAIL %s expected=%d actual=%d error=%s\n", name, accepted, actual, error.c_str());
     ++failures;
   } else if (actual && lower) {
-    if (auto failure = dxmt::dxil::LowerOperations(*(*parsed)->module)) {
+    if (auto failure = d3dalloy::dxil::LowerOperations(*(*parsed)->module)) {
       std::fprintf(stderr, "VECTOR_CONTRACT_FAIL %s lowering=%s\n", name, toString(std::move(failure)).c_str());
       ++failures;
     } else if (verifyModule(*(*parsed)->module, &errs())) {
@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
   if (argc != 2) { std::fprintf(stderr, "usage: vector-contract <raytracing-contract.dxil>\n"); return 2; }
   auto legacy = MemoryBuffer::getFile(argv[1]);
   if (!legacy) { std::fprintf(stderr, "cannot read real legacy DXR contract\n"); return 2; }
-  auto parsed = dxmt::dxil::ModuleInfo::Parse((*legacy)->getBufferStart(), (*legacy)->getBufferSize());
+  auto parsed = d3dalloy::dxil::ModuleInfo::Parse((*legacy)->getBufferStart(), (*legacy)->getBufferSize());
   if (!parsed) { std::fprintf(stderr, "VECTOR_CONTRACT_FAIL legacy-dxr %s\n", toString(parsed.takeError()).c_str()); ++failures; }
   else std::puts("VECTOR_CONTRACT_CASE_PASS legacy-dxr");
   for (unsigned length : {2u, 4u, 5u, 8u, 1024u}) {

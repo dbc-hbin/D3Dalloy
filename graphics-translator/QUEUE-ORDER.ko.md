@@ -18,7 +18,7 @@
 
 ## Logical fence completion과 rewind
 
-[`FenceOrderEpoch`](../src/dxmt/dxmt_queue_order.hpp)는 CPU/GPU 감소·동일값 signal, 미완료 다중 queue/CPU producer를 허용한다. Public completed value는 최신 게시값이며 monotonic maximum이 아니다. CPU signal과 검증된 GPU completion은 같은 logical mutex로 직렬화한다. 이미 완료한 producer를 다시 적용하지 않아 이후 CPU rewind를 덮어쓰지 않는다.
+[`FenceOrderEpoch`](../src/d3dalloy/d3dalloy_queue_order.hpp)는 CPU/GPU 감소·동일값 signal, 미완료 다중 queue/CPU producer를 허용한다. Public completed value는 최신 게시값이며 monotonic maximum이 아니다. CPU signal과 검증된 GPU completion은 같은 logical mutex로 직렬화한다. 이미 완료한 producer를 다시 적용하지 않아 이후 CPU rewind를 덮어쓰지 않는다.
 
 Wait를 첫 blocked producer에 고정하지 않는다. 다음과 같은 순서에서는 A의 signal이 실제 완료되기 전까지 B의 뒤 encode가 보류된다.
 

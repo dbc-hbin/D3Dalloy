@@ -9,7 +9,7 @@
 
 #include "d3d12_interfaces_ext.hpp"
 
-namespace dxmt::enhanced_barrier {
+namespace d3dalloy::enhanced_barrier {
 
 constexpr UINT kSyncAll = D3D12_BARRIER_SYNC_ALL;
 constexpr UINT kSyncDrawStages = D3D12_BARRIER_SYNC_DRAW | D3D12_BARRIER_SYNC_INDEX_INPUT |
@@ -319,4 +319,4 @@ LayoutPermitsAccess(UINT layout, UINT access, D3D12_COMMAND_LIST_TYPE queue) {
   return allowed && !(access & ~allowed);
 }
 
-} // namespace dxmt::enhanced_barrier
+} // namespace d3dalloy::enhanced_barrier

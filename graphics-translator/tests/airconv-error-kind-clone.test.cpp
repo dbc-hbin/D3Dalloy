@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
       !SM50CloneError(nullptr, nullptr)) return 1;
   auto bytes = llvm::MemoryBuffer::getFile(argv[1]);
   if (!bytes) return 1;
-  auto parsed = dxmt::dxil::ModuleInfo::Parse((*bytes)->getBufferStart(), (*bytes)->getBufferSize());
+  auto parsed = d3dalloy::dxil::ModuleInfo::Parse((*bytes)->getBufferStart(), (*bytes)->getBufferSize());
   if (!parsed) { llvm::logAllUnhandledErrors(parsed.takeError(), llvm::errs()); return 1; }
   auto &module = *(*parsed)->module;
   const std::string name(4096, 'R');
@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
   if (SM50Initialize(container.data(), container.size(), &shader, nullptr, &error)) {
     llvm::errs() << SM50GetErrorMessageString(error) << '\n'; return 1;
   }
-  dxmt::RawRootSignatureDesc root{D3D_ROOT_SIGNATURE_VERSION_1_1, 0, 0, 0, 0, 0};
+  d3dalloy::RawRootSignatureDesc root{D3D_ROOT_SIGNATURE_VERSION_1_1, 0, 0, 0, 0, 0};
   SM50_SHADER_ROOT_SIGNATURE_DATA args{};
   args.type = SM50_SHADER_ROOT_SIGNATURE;
   args.bytecode = &root;

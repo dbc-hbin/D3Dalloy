@@ -5,7 +5,7 @@
 #include <limits>
 
 int main() {
-  using dxmt::RefreshTickOffset;
+  using d3dalloy::RefreshTickOffset;
   constexpr double anchor = 100, period = 1;
   // Both sides of the former +/-0.4 phase cutoff are valid presentations.
   for (double fraction : {0.39, 0.41, 0.49, 0.5, 0.51, 0.59, 0.61}) {
@@ -48,7 +48,7 @@ int main() {
   const int64_t old6 = midpoint6 + std::llround((host34 - sampled6) * frequency);
   assert(old5 == 4825489534308LL && old6 == old5 - 2);
 
-  dxmt::RefreshClockBasis clock;
+  d3dalloy::RefreshClockBasis clock;
   assert(clock.SetEpoch(1, 1, 1000000000, 1000000000));
   clock.calibration_host_seconds = sampled5;
   clock.calibration_qpc = midpoint5;

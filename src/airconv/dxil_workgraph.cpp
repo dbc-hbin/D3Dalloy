@@ -5,7 +5,7 @@
  * processes one batch of the records waiting in its input queue; the runtime scheduler
  * (src/d3d12/d3d12_work_graph.cpp) sizes every batch so the records the batch can
  * write fit the queues they target. Node-specific DXIL operations (238-253) become
- * calls into the dxmt.wg.* helpers of shaders/air_workgraph.metal, which address the
+ * calls into the d3dalloy.wg.* helpers of shaders/air_workgraph.metal, which address the
  * SM50_WG_NODE_CONTEXT the runtime binds at SM50_BINDING_INDEX_WORK_GRAPH_CONTEXT.
  *
  * Node and record handles are group uniform (spec "Handle value uniformity"), so a
@@ -60,7 +60,7 @@
 
 using namespace llvm;
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 namespace {
 /* Call after unreachable function bodies are removed; llvm.used is not shader resource use. */
@@ -230,7 +230,7 @@ Error LinkLibraryDependencies(ModuleInfo &info, const SM50_WG_NODE_COMPILE_DESC 
   for (uint32_t i = 0; i < desc.LibraryCount; ++i) {
     if (!used[i]) continue;
     auto &source = *modules[i];
-    const std::string prefix = "dxmt.lib." + std::to_string(i) + ".";
+    const std::string prefix = "d3dalloy.lib." + std::to_string(i) + ".";
     for (auto &[name, function] : definitions[i]) function->setName(prefix + name);
     for (GlobalVariable &global : source.module->globals())
       if (!global.getName().startswith("llvm.")) global.setName(prefix + global.getName());
@@ -609,14 +609,14 @@ private:
     return b.CreateOr(low, b.CreateShl(high, 32));
   }
   Value *outputQueue(IRBuilder<> &b, Value *element) {
-    return b.CreateCall(helper("dxmt.wg.output_queue", i32, {context->getType(), i32}), {context, element});
+    return b.CreateCall(helper("d3dalloy.wg.output_queue", i32, {context->getType(), i32}), {context, element});
   }
   Value *reserve(IRBuilder<> &b, Value *queue, Value *count) {
-    return b.CreateCall(helper("dxmt.wg.reserve", i32, {context->getType(), i32, i32}), {context, queue, count});
+    return b.CreateCall(helper("d3dalloy.wg.reserve", i32, {context->getType(), i32, i32}), {context, queue, count});
   }
   Value *recordAddress(IRBuilder<> &b, Value *queue, Value *index) {
     return b.CreateCall(
-      helper("dxmt.wg.record_address", i64, {context->getType(), i32, i32}), {context, queue, index}
+      helper("d3dalloy.wg.record_address", i64, {context->getType(), i32, i32}), {context, queue, index}
     );
   }
   GlobalVariable *groupScratch() {
@@ -624,7 +624,7 @@ private:
     if (!scratch) {
       auto *type = ArrayType::get(i32, 1);
       scratch = new GlobalVariable(
-        module, type, false, GlobalValue::InternalLinkage, UndefValue::get(type), "dxmt.wg.scratch", nullptr,
+        module, type, false, GlobalValue::InternalLinkage, UndefValue::get(type), "d3dalloy.wg.scratch", nullptr,
         GlobalValue::NotThreadLocal, 3
       );
       scratch->setAlignment(Align(4));
@@ -898,7 +898,7 @@ Error NodeLowering::lowerCall(CallInst &call, uint32_t opcode) {
       air.CreateAtomicFence(llvm::air::MemFlags::Device, llvm::air::ThreadScope::Device);
     }
     auto *last = b.CreateCall(
-      helper("dxmt.wg.finish_sharing", i32, {context->getType(), i32}), {context, handle->base}
+      helper("d3dalloy.wg.finish_sharing", i32, {context->getType(), i32}), {context, handle->base}
     );
     b.CreateStore(last, slot);
     {
@@ -1096,7 +1096,7 @@ Error compileNode(const SM50_WG_NODE_COMPILE_DESC &desc, SM50CompiledBitcodeInte
   LLVMContext &context = *info.context;
   isolateExport(module, *info.entry);
   if (module.getDataLayout().getPointerSizeInBits() != 64)
-    dxmt::initializeModule(module);
+    d3dalloy::initializeModule(module);
   out.HasAtomic64 = HasDeviceAtomic64(module) ? 1 : 0;
   SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{nullptr, SM50_SHADER_D3D12_ATOMIC64_PHASE};
   if (out.HasAtomic64) InitializeAtomic64Phase(module, &atomic_phase);
@@ -1167,10 +1167,10 @@ Error compileNode(const SM50_WG_NODE_COMPILE_DESC &desc, SM50CompiledBitcodeInte
   case SM50_WG_LAUNCH_BROADCASTING: {
     Value *g = builder.CreateExtractElement(tg, uint64_t(0));
     auto record_fn = module.getOrInsertFunction(
-      "dxmt.wg.bc_record", FunctionType::get(i32, {ctx_words->getType(), i32}, false)
+      "d3dalloy.wg.bc_record", FunctionType::get(i32, {ctx_words->getType(), i32}, false)
     );
     auto group_fn = module.getOrInsertFunction(
-      "dxmt.wg.bc_group", FunctionType::get(i32, {ctx_words->getType(), i32, i32, i32}, false)
+      "d3dalloy.wg.bc_group", FunctionType::get(i32, {ctx_words->getType(), i32, i32, i32}, false)
     );
     Value *record = builder.CreateCall(record_fn, {ctx_words, g});
     Value *gid = UndefValue::get(v3);
@@ -1264,7 +1264,7 @@ Error compileNode(const SM50_WG_NODE_COMPILE_DESC &desc, SM50CompiledBitcodeInte
   if (verifyModule(module, &errs()))
     return createError("work graph node compilation produced invalid IR");
   if (auto error = LowerAtomic64Phase(module)) return error;
-  dxmt::runOptimizationPasses(module);
+  d3dalloy::runOptimizationPasses(module);
   if (auto error = LowerImmutableConstants(module, compiled))
     return error;
   raw_svector_ostream stream(compiled.vec);
@@ -1290,9 +1290,9 @@ void report(Error failure, sm50_error_t *ppError) {
 
 } // namespace
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil
 
-using namespace dxmt::dxil;
+using namespace d3dalloy::dxil;
 
 AIRCONV_API int SM50WGReflectLibrary(
   const void *pBytecode, uint64_t BytecodeSize, struct SM50_WG_NODE_INFO *pNodes, uint32_t NodeCapacity,

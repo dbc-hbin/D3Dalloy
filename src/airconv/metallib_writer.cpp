@@ -11,7 +11,7 @@
 
 using namespace llvm;
 
-namespace dxmt::metallib {
+namespace d3dalloy::metallib {
 
 template <typename T> std::string_view value(const T &value) {
   return std::string_view((const char *)(&value), sizeof(T));
@@ -340,4 +340,4 @@ Error MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
   return Error::success();
 }
 
-} // namespace dxmt::metallib
+} // namespace d3dalloy::metallib

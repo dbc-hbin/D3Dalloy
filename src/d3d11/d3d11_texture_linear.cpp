@@ -1,13 +1,13 @@
 #include "d3d11_private.h"
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_staging.hpp"
-#include "dxmt_texture.hpp"
+#include "d3dalloy_dynamic.hpp"
+#include "d3dalloy_format.hpp"
+#include "d3dalloy_staging.hpp"
+#include "d3dalloy_texture.hpp"
 #include "d3d11_resource.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 #pragma region DynamicLinearTexture
 
@@ -243,4 +243,4 @@ CreateDynamicLinearTexture1D(
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

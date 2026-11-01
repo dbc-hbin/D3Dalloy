@@ -5,11 +5,11 @@
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
 #include "d3d11_context.hpp"
-#include "dxmt_context.hpp"
-#include "dxmt_hud_state.hpp"
-#include "dxmt_statistics.hpp"
-#include "dxmt_presenter.hpp"
-#include "dxmt_monitor_format.hpp"
+#include "d3dalloy_context.hpp"
+#include "d3dalloy_hud_state.hpp"
+#include "d3dalloy_statistics.hpp"
+#include "d3dalloy_presenter.hpp"
+#include "d3dalloy_monitor_format.hpp"
 #include "log/log.hpp"
 #include "d3d11_resource.hpp"
 #include "d3d11_device.hpp"
@@ -21,8 +21,8 @@
 #include "wsi_monitor.hpp"
 #include "wsi_platform_win32.hpp"
 #include "wsi_window.hpp"
-#include "dxmt_info.hpp"
-#include "dxmt_presenter.hpp"
+#include "d3dalloy_info.hpp"
+#include "d3dalloy_presenter.hpp"
 #include <atomic>
 #include <cfloat>
 #include <format>
@@ -33,7 +33,7 @@ This value is 1 by default.
 */
 constexpr size_t kSwapchainLatency = 1;
 
-namespace dxmt {
+namespace d3dalloy {
 
 WMTPixelFormat ConvertSwapChainFormat(DXGI_FORMAT format) {
   switch (format) {
@@ -110,7 +110,7 @@ public:
     native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
 
     if (!native_view_) {
-      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
+      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by D3Dalloy.");
       abort();
     }
 
@@ -119,7 +119,7 @@ public:
     }
 
     presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_,
-                                 pDevice->GetDXMTDevice().queue().cmd_library,
+                                 pDevice->GetD3DalloyDevice().queue().cmd_library,
                                  scale_factor, desc_.SampleDesc.Count));
 
     frame_latency = kSwapchainLatency;
@@ -217,7 +217,7 @@ public:
     return factory_->QueryInterface(riid, parent);
   };
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present(UINT sync_interval, UINT flags) final {
@@ -235,7 +235,7 @@ public:
     }
   };
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   SetFullscreenState(BOOL Fullscreen, IDXGIOutput *pTarget) final {
@@ -480,7 +480,7 @@ public:
     return S_OK;
   };
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format,
@@ -511,7 +511,7 @@ public:
     backbuffer_desc_.Format = desc_.Format;
 
     backbuffer_ = nullptr;
-    if (FAILED(dxmt::CreateDeviceTexture2D(
+    if (FAILED(d3dalloy::CreateDeviceTexture2D(
             device_, &backbuffer_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&backbuffer_)
         )))
       return E_FAIL;
@@ -524,7 +524,7 @@ public:
       upscaled_desc_.Height *= scale_factor;
       upscaled_desc_.Width *= scale_factor;
       upscaled_backbuffer_ = nullptr;
-      if (FAILED(dxmt::CreateDeviceTexture2D(
+      if (FAILED(d3dalloy::CreateDeviceTexture2D(
               device_, &upscaled_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&upscaled_backbuffer_)
           )))
         return E_FAIL;
@@ -543,7 +543,7 @@ public:
     return S_OK;
   };
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeTarget(const DXGI_MODE_DESC *pDesc) final {
@@ -751,7 +751,7 @@ public:
     return SyncFrameState();
   };
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags,
@@ -784,14 +784,14 @@ public:
         return gamma_hr;
 
       bool changed = !gamma_initialized_;
-      for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+      for (uint32_t i = 0; i < D3DALLOY_GAMMA_CP_COUNT; i++) {
         const auto &color = control.GammaCurve[i];
         changed |= gamma_ramp_.red[i] != color.Red ||
                    gamma_ramp_.green[i] != color.Green ||
                    gamma_ramp_.blue[i] != color.Blue;
       }
       if (changed) {
-        for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+        for (uint32_t i = 0; i < D3DALLOY_GAMMA_CP_COUNT; i++) {
           const auto &color = control.GammaCurve[i];
           gamma_ramp_.red[i] = color.Red;
           gamma_ramp_.green[i] = color.Green;
@@ -816,7 +816,7 @@ public:
                                                : init_refresh_rate_),
                  preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0);
 
-    auto &cmd_queue = device_->GetDXMTDevice().queue();
+    auto &cmd_queue = device_->GetD3DalloyDevice().queue();
     auto chunk = cmd_queue.CurrentChunk();
     chunk->signal_frame_latency_fence_ = cmd_queue.CurrentFrameSeq();
     if constexpr (EnableMetalFX) {
@@ -1059,7 +1059,7 @@ public:
     return 0;
   }
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height,
                          DXGI_FORMAT Format, UINT SwapChainFlags,
                          const UINT *pCreationNodeMask,
@@ -1116,9 +1116,9 @@ private:
   HWND hWnd;
   HMONITOR monitor_;
   Com<IDXGIOutput1> target_;
-  DXMTGammaRamp gamma_ramp_ = {};
+  D3DalloyGammaRamp gamma_ramp_ = {};
   bool gamma_initialized_ = false;
-  wsi::DXMTWindowState window_state_;
+  wsi::D3DalloyWindowState window_state_;
   uint32_t frame_latency;
   DXGI_COLOR_SPACE_TYPE colorspace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   double init_refresh_rate_ = DBL_MAX;
@@ -1126,7 +1126,7 @@ private:
   HUDState hud;
   Rc<Presenter> presenter;
   ModeSetGuard modeset_guard_;
-  dxmt::mutex mutex_;
+  d3dalloy::mutex mutex_;
 
   bool handle_alt_tab_;
 
@@ -1163,7 +1163,7 @@ CreateSwapChain(
       pDesc->BufferCount != 1) {
     WARN("CreateSwapChain: unsupported swap effect ", pDesc->SwapEffect, " with backbuffer size ", pDesc->BufferCount);
   }
-  if (env::getEnvVar("DXMT_METALFX_SPATIAL_SWAPCHAIN") == "1") {
+  if (env::getEnvVar("D3DALLOY_METALFX_SPATIAL_SWAPCHAIN") == "1") {
     if (pDevice->GetMTLDevice().supportsFXSpatialScaler()) {
       Com<IDXGISwapChain1> swapchain = new MTLD3D11SwapChain<true>(
           pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
@@ -1191,4 +1191,4 @@ CreateSwapChain(
   return S_OK;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

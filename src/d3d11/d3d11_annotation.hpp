@@ -1,7 +1,7 @@
 #pragma once
 #include "d3d11_1.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 class D3D11UserDefinedAnnotation : public ID3DUserDefinedAnnotation {
 public:
@@ -28,4 +28,4 @@ private:
   IUnknown *container_;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

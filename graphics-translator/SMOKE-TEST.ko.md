@@ -68,7 +68,7 @@ done
 
 ## Async PSO compile acceptance
 
-`graphics-translator/tests/owned-d3d12-async-pipeline.cpp`는 `main`(`-municode` 없음)이며 `-std=c++20 -O2 -Wall -Wextra -static -ld3d12 -ldxgi -ld3dcompiler -luuid`로 빌드한다. Runner는 두 suite 모두에 `d3d12.asyncPipelineCompile=True`를 설정한다. `async-pipeline-hold`는 `OWNED_ASYNC_PIPELINE_HOLD=1`로 worker를 시작하지 않으므로 pending direct/indexed draw와 5회 Present 경계 draw가 정확히 3회(`async_pipeline_omit` trace) 생략돼야 한다. 4회 Present 경계, 넓힌 3D RTV, sample positions 상태의 draw는 생략되지 않아야 하며, sample positions 불일치 draw는 `Close()` 실패로 검증한다. Runner는 상속된 `OWNED_ASYNC_PIPELINE_HOLD`를 항상 제거한다. `async-pipeline`은 실제 worker와 경쟁하므로 첫 draw는 생략 또는 정상 렌더링 둘 다 허용한다. 두 suite 모두 13 case 순서와 query·UAV·첫 사용 target·생략 이력 만료·대기 중 PSO 해제를 검사한다. 다른 suite를 async on으로 회귀하려면 `--async-pipeline-compile`을 추가한다(runner는 상속된 `DXMT_CONFIG`를 제거한다).
+`graphics-translator/tests/owned-d3d12-async-pipeline.cpp`는 `main`(`-municode` 없음)이며 `-std=c++20 -O2 -Wall -Wextra -static -ld3d12 -ldxgi -ld3dcompiler -luuid`로 빌드한다. Runner는 두 suite 모두에 `d3d12.asyncPipelineCompile=True`를 설정한다. `async-pipeline-hold`는 `OWNED_ASYNC_PIPELINE_HOLD=1`로 worker를 시작하지 않으므로 pending direct/indexed draw와 5회 Present 경계 draw가 정확히 3회(`async_pipeline_omit` trace) 생략돼야 한다. 4회 Present 경계, 넓힌 3D RTV, sample positions 상태의 draw는 생략되지 않아야 하며, sample positions 불일치 draw는 `Close()` 실패로 검증한다. Runner는 상속된 `OWNED_ASYNC_PIPELINE_HOLD`를 항상 제거한다. `async-pipeline`은 실제 worker와 경쟁하므로 첫 draw는 생략 또는 정상 렌더링 둘 다 허용한다. 두 suite 모두 13 case 순서와 query·UAV·첫 사용 target·생략 이력 만료·대기 중 PSO 해제를 검사한다. 다른 suite를 async on으로 회귀하려면 `--async-pipeline-compile`을 추가한다(runner는 상속된 `D3DALLOY_CONFIG`를 제거한다).
 
 ```sh
 "$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -Wall -Wextra -static \
@@ -250,7 +250,7 @@ Runner의 실제 Wine module-load gate도 Core basename을 blanket whitelist하�
 
 같은 lifetime case는 selected Core의 실제 public `D3D12GetInterface`를 직접 호출해 factory와 SDK618 configuration을 얻는다. 원래 device/child/settings/configuration-only 수명 검사를 그대로 수행한 뒤 direct factory만 selected module의 owner로 남겨 `FreeUnusedSDKs` 후에도 module과 public configuration이 유효함을 검사하고, 그 factory의 최종 Release 뒤 actual unload를 요구한다. 이는 Main import thunk가 Core export 주소처럼 보이는 경우를 public 동작으로 잡으며 vtable/module pin이나 assembly byte pattern에 의존하지 않는다.
 
-Godot `e7cfa294a0b81bed7986be04a848cc1832a3f083`의 `project_settings.cpp:1863` 요청인 SDK618/package1.618.5를 대상으로 한 **owned compatibility-package identity**다. Microsoft SDK618 전체 기능 conformance나 foreign Microsoft/GPTK Core 지원이 아니다. 현재 루트를 양 ABI로 함께 build/install한 뒤 `--dxmt-install32`를 포함해 새 paired runtime을 stage한다. 기존 game/live prefix는 변경하지 않는다.
+Godot `e7cfa294a0b81bed7986be04a848cc1832a3f083`의 `project_settings.cpp:1863` 요청인 SDK618/package1.618.5를 대상으로 한 **owned compatibility-package identity**다. Microsoft SDK618 전체 기능 conformance나 foreign Microsoft/GPTK Core 지원이 아니다. 현재 루트를 양 ABI로 함께 build/install한 뒤 `--d3dalloy-install32`를 포함해 새 paired runtime을 stage한다. 기존 game/live prefix는 변경하지 않는다.
 
 ```sh
 LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin
@@ -278,7 +278,7 @@ done
 
 Runner는 **실제 staged owned Core**를 frozen EXE 옆 `sdk-owned/d3d12core.dll`로 복사하고 source/copy hash·generation을 기록한다. Consumer는 cwd를 다른 directory로 바꾼 뒤 `CreateDeviceFactory(618, ".\\sdk-owned\\", ...)`를 호출한다. 실제 loaded module path, concrete `D3D12GetInterface`, DATA `D3D12SDKVersion=618`, factory/device의 공개 `ID3D12DeviceConfiguration::GetDesc()`와 debug/experimental snapshot, root-signature serializer/deserializer roundtrip을 확인한다. Factory 해제와 `FreeUnusedSDKs` 뒤 retained settings/configuration/device 및 device 외부 참조 없이 남은 queue/list/resource/fence로 실제 GPU copy/readback을 수행한다. 마지막 live configuration까지 해제한 뒤 exact-path `GetModuleHandle`로 unused Core unload를 확인한다. Vtable이 어느 DLL에 있는지는 public API 계약이 아니므로 pin하지 않는다.
 
-Fresh child는 Wine-visible OS registry `HKLM/Software/Microsoft/Windows/CurrentVersion/AppModelUnlock/AllowDevelopmentWithoutDevLicense`의 기존 value/type을 저장한다. Ordinary mode에서 base `SetSDKVersion`의 실패·미로드 및 SDK1 factory 성공을 확인한 뒤 Developer Mode를 켜 device 생성 전 Set 성공을 검사한다. 유효한 alternate Core path로 late Set을 호출하면 실패와 **기존 global device 제거**, independent factory device 생존·GPU copy, 선택 미변경과 future global SDK618을 요구한다. 다른 fresh retail child는 Developer Mode 없이 factory `ApplyToGlobalState`로 Core618 선택·global lease·GPU를 확인하고 alternate Core factory의 `InitializeFromGlobalState`를 검사한다. Live global과 다른 Core의 Apply는 실패하며 global/independent device 둘 다 살아 있고 선택은 유지돼야 한다. 두 child 모두 OS state를 복구한다. 실패 HRESULT는 실제 값을 기록하고 `FAILED`를 요구하지만 공개 규약이 특정 값을 지정하지 않은 incidental code는 pin하지 않는다. 이것은 전용 prefix의 공개 계약 시험이며 live/game prefix나 DXMT-only Developer Mode switch를 사용하지 않는다.
+Fresh child는 Wine-visible OS registry `HKLM/Software/Microsoft/Windows/CurrentVersion/AppModelUnlock/AllowDevelopmentWithoutDevLicense`의 기존 value/type을 저장한다. Ordinary mode에서 base `SetSDKVersion`의 실패·미로드 및 SDK1 factory 성공을 확인한 뒤 Developer Mode를 켜 device 생성 전 Set 성공을 검사한다. 유효한 alternate Core path로 late Set을 호출하면 실패와 **기존 global device 제거**, independent factory device 생존·GPU copy, 선택 미변경과 future global SDK618을 요구한다. 다른 fresh retail child는 Developer Mode 없이 factory `ApplyToGlobalState`로 Core618 선택·global lease·GPU를 확인하고 alternate Core factory의 `InitializeFromGlobalState`를 검사한다. Live global과 다른 Core의 Apply는 실패하며 global/independent device 둘 다 살아 있고 선택은 유지돼야 한다. 두 child 모두 OS state를 복구한다. 실패 HRESULT는 실제 값을 기록하고 `FAILED`를 요구하지만 공개 규약이 특정 값을 지정하지 않은 incidental code는 pin하지 않는다. 이것은 전용 prefix의 공개 계약 시험이며 live/game prefix나 D3Dalloy-only Developer Mode switch를 사용하지 않는다.
 
 같은 source의 `-DOWNED_AGILITY_EXECUTABLE_SELECTION=617/618/619` 세 compile variant는 immutable EXE exports를 제공한다. SDK617은 missing app path, SDK618은 invalid app-local Core에도 ordinary `D3D12CreateDevice`가 실제 설치된 owned618을 선택하여 GPU readback을 통과해야 한다. SDK619는 유효한 owned619 package가 없으므로 실패·null device를 요구한다. Setter child도 SDK619 EXE에서 시작하여 Developer Mode의 SetSDKVersion617/618이 exports보다 우선하는지 검증한다. Setter가 no-op이면 EXE619 선택 실패로 잡힌다. Runner는 `$FIXTURE` stem에 `-executable-617.exe`, `-executable-618.exe`, `-executable-619.exe`를 붙인 세 companion PE를 모두 freeze/hash하고, global inbox 선택의 실제 installed path·generation·ABI·hash와 explicit/alternate native Core loads를 검사한다.
 
@@ -326,7 +326,7 @@ for row in protection:x64 protection:x86 selection:x64 selection:x86 interfaces:
     if [ "$kind" = ngx ]; then exe="$P0_WORK/discovery-x64.exe"; set -- --ngx; fi
     set +e
     env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR="${TMPDIR:-/tmp}" \
-      WINEPREFIX="$WINEPREFIX" WINEDEBUG=+loaddll DXMT_LOG_LEVEL=error DXMT_LOG_PATH="$run" \
+      WINEPREFIX="$WINEPREFIX" WINEDEBUG=+loaddll D3DALLOY_LOG_LEVEL=error D3DALLOY_LOG_PATH="$run" \
       MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
       OWNED_GRAPHICS_DYLD_AUDIT=1 \
       "$P0_RUNTIME/bin/wine" "$exe" "$@" >"$run/stdout.log" 2>"$run/stderr.log"
@@ -405,7 +405,7 @@ mkdir -p build/local/fixtures-smoke-001
 cp graphics-translator/tests/owned-d3d12-graphics.hlsl \
    graphics-translator/tests/owned-d3d12-compute.hlsl build/local/fixtures-smoke-001/
 python3 scripts/stage-owned-graphics.py stage \
-  --dxmt-install build/local/install \
+  --d3dalloy-install build/local/install \
   --wine-source toolchains/wine-runtime \
   --wine-dest build/local/runtime-smoke-001
 python3 scripts/test-owned-graphics.py \
@@ -450,9 +450,9 @@ python3 scripts/stage-owned-graphics.py stage --help
 
 `--suite`의 현재 전체 집합은 runner help/parser가 authority다. `--runtime`, `--fixture`, `--out`이 필수다. `--timeout`은 1~600초(기본 120)이며 timeout을 성공으로 취급하지 않는다. `--dxil-dir` 기본은 `graphics-translator/tests/dxil`; `--lock`은 frozen lock 경로/hash를 증거에 기록할 뿐 **current root source를 frozen patches로 재생성하거나 동일하다고 증명하지 않는다**.
 
-`work-graphs`, `workgraphs-atomic64`, `workgraphs-atomic64-typed`는 선택한 `--dxil-dir` 안의 `preview-d3d12.h`를 필수 입력으로 사용한다. [DirectX-Headers v1.721.2-preview의 원본 d3d12.h](https://raw.githubusercontent.com/microsoft/DirectX-Headers/v1.721.2-preview/include/directx/d3d12.h)를 그 이름으로 보관하고 fixture도 같은 파일을 `DXMT_MATRIX_PREVIEW_SDK_HEADER`로 컴파일한다. 과거 `build/local` 경로를 자동 선택하지 않는다. Header가 없으면 Wine 실행 전에 거부하며, 실제 선택한 header와 shader/producer 입력을 함께 freeze·hash한다.
+`work-graphs`, `workgraphs-atomic64`, `workgraphs-atomic64-typed`는 선택한 `--dxil-dir` 안의 `preview-d3d12.h`를 필수 입력으로 사용한다. [DirectX-Headers v1.721.2-preview의 원본 d3d12.h](https://raw.githubusercontent.com/microsoft/DirectX-Headers/v1.721.2-preview/include/directx/d3d12.h)를 그 이름으로 보관하고 fixture도 같은 파일을 `D3DALLOY_MATRIX_PREVIEW_SDK_HEADER`로 컴파일한다. 과거 `build/local` 경로를 자동 선택하지 않는다. Header가 없으면 Wine 실행 전에 거부하며, 실제 선택한 header와 shader/producer 입력을 함께 freeze·hash한다.
 
-Runner는 먼저 stage verifier를 실행하고 fixture·suite별 fixed shader/source 입력을 `--out/fixture`에 복사한다. `--out/prefix`의 새 prefix, per-run shader-cache/log paths를 사용하고 inherited foreign backend/`DXMT_*`/`DYLD_*` state를 정리한다. 종료/오류에도 **해당 prefix의** wineserver만 종료한다. 다른 prefix나 전역 wineserver를 종료하지 않는다.
+Runner는 먼저 stage verifier를 실행하고 fixture·suite별 fixed shader/source 입력을 `--out/fixture`에 복사한다. `--out/prefix`의 새 prefix, per-run shader-cache/log paths를 사용하고 inherited foreign backend/`D3DALLOY_*`/`DYLD_*` state를 정리한다. 종료/오류에도 **해당 prefix의** wineserver만 종료한다. 다른 prefix나 전역 wineserver를 종료하지 않는다.
 
 출력에서 다음을 함께 보존한다.
 
@@ -460,7 +460,7 @@ Runner는 먼저 stage verifier를 실행하고 fixture·suite별 fixed shader/s
 |---|---|
 | `runtime-verification.log` | Manifest/hash/loader/dependency preflight |
 | `fixture/` 및 input hashes | 실제 사용한 PE/shader snapshot |
-| `stdout.log`, `stderr.log`, `*_d3d12.log` | Exact markers/readbacks, dyld, backend/validation/trace |
+| `stdout.log`, `stderr.log`, `*_d3dalloy-d3d12.log` | Exact markers/readbacks, dyld, backend/validation/trace |
 | `result.json` | Command, architecture/guest, runtime manifest/lock hashes, exit/timeout, suite 판정, validation mode/errors |
 | temporal trace analysis | Temporal suite의 ordering/lifetime 후처리 결과 |
 
@@ -473,6 +473,13 @@ Runtime manifest **schema 2**와 runner result **schema 1**은 서로 다른 형
 ## fixture runner suite와 컴파일 차이
 
 Fixture는 보통 `graphics-translator/tests/owned-d3d12-<suite>.cpp`이지만 이름/entry/header/link를 일괄 가정하지 않는다. 아래는 기존 README의 상세 compile 지침을 이관한 운영 표다. 모두 `-std=c++20 -O2 -static`을 기본으로 하고 suite의 실제 source entry를 확인한다.
+
+`pipeline-cache`의 비동기 disk publication 검사는 파일 변경 알림을 구독한 뒤 scan/wait한다.
+macOS Wine은 [libinotify-kqueue](https://github.com/libinotify-kqueue/libinotify-kqueue) 지원을 포함해
+빌드해야 한다(`HAVE_SYS_INOTIFY_H=1`). 알림 지원이 없는 Wine에서는 blob이 실제로 저장돼도
+대기가 timeout할 수 있다. 동시 cold-build 측정은 새 D3D12 device의 native artifact cache를
+사용한다. 앞선 검사의 정상적인 native artifact 재사용을 생성 누락으로 오판하지 않으며,
+기존 automatic cache key는 지우지 않는다.
 
 | Suite / fixture | Entry/header/link 지침 | 입력·범위 |
 |---|---|---|
@@ -594,7 +601,7 @@ for abi in x64 x86; do
     test "$suite" != work-graphs || extra=-ld3dcompiler
     "$LLVM_MINGW/bin/$target-clang++" -std=c++20 -fms-extensions -O2 -static \
       -static-libgcc -static-libstdc++ \
-      "-DDXMT_MATRIX_PREVIEW_SDK_HEADER=\"$SDK_HEADER\"" \
+      "-DD3DALLOY_MATRIX_PREVIEW_SDK_HEADER=\"$SDK_HEADER\"" \
       "graphics-translator/tests/owned-d3d12-$suite.cpp" -ld3d12 -ldxgi -lole32 $extra \
       -o "$MATRIX_INPUTS/$suite-public-$abi.exe"
   done
@@ -605,7 +612,7 @@ done
 
 Runtime-05는 **LinearAlgebraTier0 / legacy support FALSE**를 정직하게 보고한 채 runtime oracles를 실행했다. Shader oracle·최종 Tier1/native shape public query proof가 끝나기 전에는 이 결과를 구형 WaveMMA와 후속 SM6.10 matrix의 전체 #20 closure나 SM/FL 상향으로 세지 않는다. 최종 enabled cut에서는 query와 readback을 다시 확인해야 한다. 첫 x64 enhanced case의 [실패 기록](../build/local/p3-20261003/matrix/runtime05-public-x64-01/result.json)은 보존했다. Frozen enhanced spec의 interop 규칙대로 초기 `COPY_DEST→COMMON` handoff를 fixture에 추가했고 runtime validation을 약화하지 않았다.
 
-최종 positive-cap cut의 작은 재검증은 [`owned-d3d12-matrix-capabilities.cpp`](tests/owned-d3d12-matrix-capabilities.cpp)를 양 ABI, 서로 다른 untouched SDK로 각각 빌드한다. Retired branch는 `DXMT_MATRIX_RETIRED_SDK_HEADER="../../build/local/p3-20261003/matrix/original-d3d12.h"`, successor branch는 기존 `DXMT_MATRIX_PREVIEW_SDK_HEADER`를 사용한다. 두 SDK를 한 translation unit에 섞지 않으며 `_MSC_VER`를 정의하지 않는다. 위의 동일한 compile/link flags를 쓰고 output은 `capabilities-retired-{x64,x86}.exe` / `capabilities-preview-{x64,x86}.exe`로 구분한다.
+최종 positive-cap cut의 작은 재검증은 [`owned-d3d12-matrix-capabilities.cpp`](tests/owned-d3d12-matrix-capabilities.cpp)를 양 ABI, 서로 다른 untouched SDK로 각각 빌드한다. Retired branch는 `D3DALLOY_MATRIX_RETIRED_SDK_HEADER="../../build/local/p3-20261003/matrix/original-d3d12.h"`, successor branch는 기존 `D3DALLOY_MATRIX_PREVIEW_SDK_HEADER`를 사용한다. 두 SDK를 한 translation unit에 섞지 않으며 `_MSC_VER`를 정의하지 않는다. 위의 동일한 compile/link flags를 쓰고 output은 `capabilities-retired-{x64,x86}.exe` / `capabilities-preview-{x64,x86}.exe`로 구분한다.
 
 승인된 최종 enabled runtime·exclusive GPU window에서 `--suite wave-mma-capabilities`와 `--suite matrix-capabilities`를 각 해당 fixture와 `--dxil-dir build/local/p3-20261003/matrix --out <fresh-output> --validation`으로 직렬 실행한다. Retired branch는 actual query38의 3 input types ×2 M ×2 N, K16·accumulator flags·wave32와 OPTIONS9 WaveMMATier10을 요구한다. Successor branch는 actual query77 tier16, query78의6 operation arms·10 construction types·native16³ count/fill tail 보존·F16 emulated-output flags·group limits32–1024·vector transpose·atomic buffer/group를 요구하고, 기존 isolated conversion exact readback을 하나만 재사용한다. 기존160 layout pairs·predication·fence barrier body 전체를 반복하지 않는다. Runner는 두 branch의 SDK/source/ABI/strict singleton markers를 freeze한다. **이 fixture의 CPU compile은 positive GPU proof가 아니며 final enabled run 전에는 PASS를 주장하지 않는다.**
 
@@ -641,7 +648,7 @@ MATRIX_WORK="$(mktemp -d "$PWD/build/local/matrix-check.XXXXXX")"
 for pair in x64:x86_64 x86:i686; do
   abi="${pair%%:*}"; target="${pair#*:}"
   "$LLVM_MINGW/$target-w64-mingw32-g++" -std=c++20 -O2 -static -municode -fms-extensions \
-    "-DDXMT_MATRIX_PREVIEW_SDK_HEADER=\"$MATRIX_PREVIEW_SDK\"" \
+    "-DD3DALLOY_MATRIX_PREVIEW_SDK_HEADER=\"$MATRIX_PREVIEW_SDK\"" \
     graphics-translator/tests/owned-d3d12-matrices.cpp \
     -ld3d12 -ldxgi -ldxguid -ld3dcompiler -o "$MATRIX_WORK/matrices-$abi.exe"
   python3 scripts/test-owned-graphics.py --runtime "$MATRIX_RUNTIME" \
@@ -741,7 +748,7 @@ for abi in x64 x86; do
     -ld3d12 -ldxgi -ldxguid -ld3dcompiler -luuid -lole32 \
     -o "$OUT/fixtures/sm6-$abi.exe"
   "$LLVM_MINGW/$target-w64-mingw32-clang++" -std=c++20 -fms-extensions -O2 -static \
-    "-DDXMT_MATRIX_PREVIEW_SDK_HEADER=\"$SDK_HEADER\"" \
+    "-DD3DALLOY_MATRIX_PREVIEW_SDK_HEADER=\"$SDK_HEADER\"" \
     graphics-translator/tests/owned-d3d12-work-graphs.cpp \
     -ld3d12 -ldxgi -ldxguid -ld3dcompiler -luuid -lole32 \
     -o "$OUT/fixtures/work-graphs-$abi.exe"
@@ -855,7 +862,7 @@ xcrun clang++ -std=c++20 -Wall -Wextra -Werror \
   -ld3d12 -ldxgi -ldxguid -luuid -ladvapi32 \
   -o "$FX_WORK/fixtures/owned-d3d12-shader-cache.exe"
 python3 scripts/stage-owned-graphics.py stage \
-  --dxmt-install "$FX_WORK/install" --wine-source "$WINE_SOURCE" \
+  --d3dalloy-install "$FX_WORK/install" --wine-source "$WINE_SOURCE" \
   --wine-dest "$FX_WORK/runtime" --native-arch x86_64 --windows-abi x64 \
   --with-fsr --with-nvngx
 python3 scripts/stage-owned-graphics.py verify --runtime "$FX_WORK/runtime"
@@ -921,7 +928,7 @@ MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
   2> "$FX_WORK/native-fg-control/stderr.log"
 ```
 
-Shader-cache fixture는 최신 llvm-mingw Device9 headers를 사용하므로 `-Iinclude/native/directx`를 앞세우지 않는다. **CPU API-only** suite라 위 명령은 GPU validation을 요청하지 않는다. Runner가 fresh prefix에만 `OWNED_SHADER_CACHE_CONTROL_ISOLATED=1`을 설정하며 fixture는 developer registry 값을 복원한다. 이 marker를 수동으로 live prefix에 설정하지 않는다. WoW64 cache는 같은 source를 `i686-w64-mingw32-clang++`로 compile하고 matching i686 install을 stage의 `--dxmt-install32`로 추가한 뒤 `--guest-arch x86 --suite shader-cache`로 실행한다.
+Shader-cache fixture는 최신 llvm-mingw Device9 headers를 사용하므로 `-Iinclude/native/directx`를 앞세우지 않는다. **CPU API-only** suite라 위 명령은 GPU validation을 요청하지 않는다. Runner가 fresh prefix에만 `OWNED_SHADER_CACHE_CONTROL_ISOLATED=1`을 설정하며 fixture는 developer registry 값을 복원한다. 이 marker를 수동으로 live prefix에 설정하지 않는다. WoW64 cache는 같은 source를 `i686-w64-mingw32-clang++`로 compile하고 matching i686 install을 stage의 `--d3dalloy-install32`로 추가한 뒤 `--guest-arch x86 --suite shader-cache`로 실행한다.
 
 위 명령은 **현재 full-SR/public-FG 검증 절차**이며 이번 문서 갱신 자체가 두 suite의 PASS를 뜻하지 않는다. 관측된 source/runtime cut과 최종 validation 결과는 [CORE status](CORE-IMPLEMENTATION-STATUS.ko.md)·[이력](IMPLEMENTATION-HISTORY.ko.md)이 authority다. 과거 SR의4 changed/reset/dynamic-render frames·destroyed-context replay3회·null/R16/R32 unit equality와 cache의4 case groups+5 child-process 관측을 새 full-SR/public-FG 결과로 합산하지 않는다. R32 numeric/replay/completion은 [complete temporal fixture](TEMPORAL-TEST.ko.md)에서 양 ABI로 검증한다. Native MetalFX tiny16→48 control에서도6 `Conv3x3` Shader Validation OOB stores가 재현된 platform 경계가 있다. 이를 suppress하거나 임의 minimum-size rejection으로 바꾸지 않으며64→192 cap fixture PASS가 tiny-input 무오류를 뜻하지 않는다. 이는 game/image-quality equivalence 또는 native-Windows cache parity가 아니다.
 
@@ -1008,7 +1015,7 @@ WoW64는 같은 source를 i686 compiler로 빌드하고 staged i686 install이 �
 
 ### Residency budget notification 검증
 
-현재 source install과 위의 staging recipe를 재사용한다. 양 ABI 실행에는 같은 generation의 i686 install을 `stage --dxmt-install32`로 함께 넣은 runtime이 필요하다([WoW64](#wow64)). 아래 새 fixture/output 이름은 retained evidence 경로를 덮어쓰지 않는 예시이며, 재사용 시에도 존재하지 않는 이름으로 바꾼다. `residency`는 `main`이므로 **`-municode`를 붙이지 않는다.** 별도 HLSL/DXIL producer나 새로운 일반 build target은 필요 없다.
+현재 source install과 위의 staging recipe를 재사용한다. 양 ABI 실행에는 같은 generation의 i686 install을 `stage --d3dalloy-install32`로 함께 넣은 runtime이 필요하다([WoW64](#wow64)). 아래 새 fixture/output 이름은 retained evidence 경로를 덮어쓰지 않는 예시이며, 재사용 시에도 존재하지 않는 이름으로 바꾼다. `residency`는 `main`이므로 **`-municode`를 붙이지 않는다.** 별도 HLSL/DXIL producer나 새로운 일반 build target은 필요 없다.
 
 ```sh
 (
@@ -1161,7 +1168,7 @@ CPU-only parser 회귀는 `python3 scripts/test-owned-graphics-diagnostics.py Ru
 
 `atomic64-phase` 입력은 `sh graphics-translator/tests/dxil/build-atomic64-phase.sh "$WINE" "$DXC_EXE" "$DXC_PREFIX" "$PHASE_OUT"`로 final DXC의 validator-enabled `cs_6_6` 4개 entry를 생성한다. 같은 output에 `atomic64-phase.hlsl`·`build-atomic64-phase.sh`를 복사해 runner snapshot에 포함한다. `owned-d3d12-atomic64-phase.cpp`를 위 공통 llvm-mingw/link 옵션과 `-municode`로 x64·i686 각각 빌드하고, exclusive GPU window에서 `scripts/test-owned-graphics.py --runtime "$RUNTIME" --fixture "$PHASE_OUT/phase-x64.exe" --dxil-dir "$PHASE_OUT" --suite atomic64-phase --validation --out <새-결과경로>`로 실행한다(x86은 `phase-x86.exe --guest-arch x86`). Producer prefix는 해당 runtime의 `wineserver -k`·`-w` 후 정리한다. Runner는 PASS 문구가 아니라 모든 old/final/canonical/ordinary 값·GPU argument21words×4·work count·guard·+4 raw/vector7words×6·future wait의 미완료 fence/event와 retirement/rewind를 독립 oracle로 비교한다. CPU parser corruption check는 `python3 scripts/test-owned-graphics-diagnostics.py Atomic64PhaseEvidence`이며 GPU 결과를 대체하지 않는다.
 
-`i686-w64-mingw32-clang++`로 PE32 fixture를 만들고 entry/link 원칙은 동일하게 적용한다. 같은 generation의 i686 Meson install을 `stage --dxmt-install32`로 추가한 runtime에 `--guest-arch x86`으로 실행한다. x64 fixture 실행을 WoW64 결과로 세거나 ARM64 Wine에 이 옵션만 붙여 x86 guest 실행이 가능하다고 하지 않는다.
+`i686-w64-mingw32-clang++`로 PE32 fixture를 만들고 entry/link 원칙은 동일하게 적용한다. 같은 generation의 i686 Meson install을 `stage --d3dalloy-install32`로 추가한 runtime에 `--guest-arch x86`으로 실행한다. x64 fixture 실행을 WoW64 결과로 세거나 ARM64 Wine에 이 옵션만 붙여 x86 guest 실행이 가능하다고 하지 않는다.
 
 ## 역사적 관측과 retained evidence
 
@@ -1207,6 +1214,6 @@ CPU-only parser 회귀는 `python3 scripts/test-owned-graphics-diagnostics.py Ru
 - 격리 game probe에서 startup PSO 오류 해소 뒤에도 검은 창이었다. Xcode trace는 19 command buffers/111 draw/6 dispatch와 검은 최종 출력이었다. Shader Validation은 capture 실행에서 껐고 별도 validation run과 구분했다. Backend error가 없던 60초 관찰이나 screenshot 없는 후속 canonical run도 시각적 성공으로 세지 않았다.
 - 이 역사적 game probe는 현재 운영 예제가 아니며 새 검증을 위해 live 설치/prefix를 사용하지 않는다. 게임 호환성·DLSS·RT 완성을 위 관측에서 추론하지 않는다.
 
-### pinned DXMT D3D12에서 확인한 실제 미완성 지점
+### pinned D3Dalloy D3D12에서 확인한 실제 미완성 지점
 
 Upstream `7c8dee1c...`의 ResourceBarrier TODO와 bundle/tiled 등 gaps는 import 전 참조 분석이었다. **현재 루트의 ResourceBarrier·bundles·tiled 구현이 미완성이라는 진술이 아니다.** 같은 readback이 upstream에서 성공해도 state tracking correctness는 증명되지 않는다는 역사적 판단만 유지한다. 현재 구현·소스 감사 후보는 CORE에 따른다.

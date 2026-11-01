@@ -21,16 +21,16 @@
 #include "d3d12_pageable.hpp"
 #include "d3d12_sampler_feedback.hpp"
 #include "com/com_pointer.hpp"
-#include "dxmt_sampler.hpp"
+#include "d3dalloy_sampler.hpp"
 #include "log/log.hpp"
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
 #include <map>
 #include <shared_mutex>
 #endif
 
-namespace dxmt {
+namespace d3dalloy {
 
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
 namespace {
 
 struct DescriptorHandleRange {
@@ -239,7 +239,7 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
     mapped_argument_buffer_[index].SRVTexture.resource_id = view_pool_.setTextureView(slot.texture, slot.info, index);
     return true;
   }
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   DescriptorHandleRangeOwner handles_;
 #endif
 
@@ -306,7 +306,7 @@ public:
       if (!view_pool_) return E_OUTOFMEMORY;
     }
 
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
     return handles_.Register(static_cast<MTLD3D12DescriptorHeap *>(this), DescriptorHandleKind::ShaderVisible,
                              pDesc->NumDescriptors);
 #else
@@ -692,7 +692,7 @@ class MTLD3D12RenderTargetDescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12R
   D3D12_DESCRIPTOR_HEAP_DESC desc_;
 
   std::vector<MTL_RENDER_TARGET_DESC> render_targets_;
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   DescriptorHandleRangeOwner handles_;
 #endif
 
@@ -717,7 +717,7 @@ public:
       return E_INVALIDARG;
     }
     InitializeResidency(true);
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
     return handles_.Register(static_cast<MTLD3D12RenderTargetDescriptorHeap *>(this),
                              DescriptorHandleKind::RenderTarget, pDesc->NumDescriptors);
 #else
@@ -808,7 +808,7 @@ class MTLD3D12SamplerDescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12Sample
   Rc<Buffer> buffer_;
   SamplerGPUStorage *mapped_argument_buffer_ = nullptr;
   uint64_t argument_buffer_gpu_address_ = 0;
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   DescriptorHandleRangeOwner handles_;
 #endif
 
@@ -860,7 +860,7 @@ public:
       InitializeResidency(true);
     }
 
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
     return handles_.Register(static_cast<MTLD3D12SamplerDescriptorHeap *>(this), DescriptorHandleKind::Sampler,
                              pDesc->NumDescriptors);
 #else
@@ -1014,4 +1014,4 @@ CreateDescriptorHeap(
   return E_INVALIDARG;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

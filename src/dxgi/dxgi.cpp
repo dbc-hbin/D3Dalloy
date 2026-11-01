@@ -5,7 +5,7 @@
 #include <mutex>
 #include <utility>
 
-namespace dxmt {
+namespace d3dalloy {
 Logger Logger::s_instance("dxgi.log");
 
 VendorExtension g_extension_enabled = VendorExtension::None;
@@ -29,7 +29,7 @@ static void InitializeVendorExtensionNV() {
                       nullptr, 0, KEY_ALL_ACCESS, nullptr, &key3, nullptr)) {
     goto cleanup;
   }
-  if (env::getEnvVar("DXMT_ENABLE_NVEXT") != "1") {
+  if (env::getEnvVar("D3DALLOY_ENABLE_NVEXT") != "1") {
     RegDeleteValueW(key1, name1);
     RegDeleteValueW(key2, name1);
     RegDeleteValueW(key3, name2);
@@ -48,10 +48,10 @@ static void InitializeVendorExtensionNV() {
 };
 
 static void InitializeMetalCachePath() {
-  if (env::getEnvVar("DXMT_USE_DEFAULT_METAL_CACHE") == "1")
+  if (env::getEnvVar("D3DALLOY_USE_DEFAULT_METAL_CACHE") == "1")
     return;
-  // This is the framework cache (mainly for PSOs), not managed by DXMT
-  auto metal_cache_path = str::format("dxmt/", env::getExeName(), "/com.apple.metal");
+  // This is the framework cache (mainly for PSOs), not managed by D3Dalloy
+  auto metal_cache_path = str::format("d3dalloy/", env::getExeName(), "/com.apple.metal");
   if (!WMTSetMetalShaderCachePath(metal_cache_path.c_str())) {
     Logger::info("Failed to set Metal cache path, fallback to system default");
   }
@@ -75,8 +75,8 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
 extern "C" HRESULT __stdcall DXGIGetDebugInterface1(UINT Flags, REFIID riid,
                                                     void **ppDebug) {
 #ifdef _WIN32
-  // it's a DXMT implementation detail
-  if (riid == DXMT_NVEXT_GUID) {
+  // it's a D3Dalloy implementation detail
+  if (riid == D3DALLOY_NVEXT_GUID) {
     std::call_once(nvext_init, InitializeVendorExtensionNV);
     return g_extension_enabled == VendorExtension::Nvidia ? S_OK : E_NOINTERFACE;
   }
@@ -95,4 +95,4 @@ extern "C" HRESULT __stdcall DXGIDeclareAdapterRemovalSupport() {
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

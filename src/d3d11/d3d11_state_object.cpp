@@ -20,11 +20,11 @@
 #include "Metal.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_state_object.hpp"
-#include "dxmt_sampler.hpp"
+#include "d3dalloy_sampler.hpp"
 #include "log/log.hpp"
 #include "../d3d10/d3d10_state_object.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 constexpr WMTCompareFunction kCompareFunctionMap[] = {
   WMTCompareFunctionNever, // padding 0
@@ -344,7 +344,7 @@ public:
     (b) when logic blending all RenderTargets bound must have a UINT format (undefined rendering otherwise).
     */
     if (!desc_.IndependentBlendEnable && desc_.RenderTarget[0].LogicOpEnable) {
-#ifdef DXMT_NO_PRIVATE_API
+#ifdef D3DALLOY_NO_PRIVATE_API
       ERR("OutputMerger LogicOp is not supported");
       continue;
 #else
@@ -559,7 +559,7 @@ template <>
 HRESULT StateObjectCache<D3D11_DEPTH_STENCIL_DESC, IMTLD3D11DepthStencilState>::
     CreateStateObject(const D3D11_DEPTH_STENCIL_DESC *pDesc,
                       IMTLD3D11DepthStencilState **ppDepthStencilState) {
-  std::lock_guard<dxmt::mutex> lock(mutex_cache);
+  std::lock_guard<d3dalloy::mutex> lock(mutex_cache);
   InitReturnPtr(ppDepthStencilState);
 
   // TODO: validation
@@ -656,7 +656,7 @@ template <>
 HRESULT StateObjectCache<D3D11_RASTERIZER_DESC2, IMTLD3D11RasterizerState>::
     CreateStateObject(const D3D11_RASTERIZER_DESC2 *pRasterizerDesc,
                       IMTLD3D11RasterizerState **ppRasterizerState) {
-  std::lock_guard<dxmt::mutex> lock(mutex_cache);
+  std::lock_guard<d3dalloy::mutex> lock(mutex_cache);
   InitReturnPtr(ppRasterizerState);
 
   // TODO: validate
@@ -683,7 +683,7 @@ HRESULT
 StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState>::CreateStateObject(
     const D3D11_SAMPLER_DESC *pSamplerDesc,
     D3D11SamplerState **ppSamplerState) {
-  std::lock_guard<dxmt::mutex> lock(mutex_cache);
+  std::lock_guard<d3dalloy::mutex> lock(mutex_cache);
 
   InitReturnPtr(ppSamplerState);
 
@@ -797,7 +797,7 @@ HRESULT
 StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState>::CreateStateObject(
     const D3D11_BLEND_DESC1 *pBlendStateDesc,
     IMTLD3D11BlendState **ppBlendState) {
-  std::lock_guard<dxmt::mutex> lock(mutex_cache);
+  std::lock_guard<d3dalloy::mutex> lock(mutex_cache);
   InitReturnPtr(ppBlendState);
 
   if (!pBlendStateDesc)
@@ -832,4 +832,4 @@ StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState>::CreateStateObject(
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

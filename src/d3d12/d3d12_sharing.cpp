@@ -15,7 +15,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace dxmt::sharing {
+namespace d3dalloy::sharing {
 
 namespace {
 
@@ -354,4 +354,4 @@ OpenByName(const WCHAR *name, DWORD access, HANDLE *handle) {
   return S_OK;
 }
 
-} // namespace dxmt::sharing
+} // namespace d3dalloy::sharing

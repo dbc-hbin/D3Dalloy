@@ -22,7 +22,7 @@ extern "C" id<MTL4CommandBuffer> winemetal_metal4_command_buffer(obj_handle_t ha
 extern "C" void winemetal_metal4_retain_resource(obj_handle_t handle, id object) { [reinterpret_cast<RecordingOwner*>(handle)->objects addObject:object]; }
 
 namespace {
-using namespace dxmt::framegeneration;
+using namespace d3dalloy::framegeneration;
 void require(bool ok, const char* reason) {
     if (!ok) { std::fprintf(stderr, "OWNED_FG_DEBUG_NATIVE_FAIL reason=%s\n", reason); std::exit(1); }
 }

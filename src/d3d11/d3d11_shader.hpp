@@ -16,17 +16,17 @@ struct MTL_COMPILED_SHADER {
   WMT::Function Function;
 };
 
-namespace dxmt {
+namespace d3dalloy {
 class Shader;
 };
-typedef dxmt::Shader *ManagedShader;
+typedef d3dalloy::Shader *ManagedShader;
 
 DEFINE_COM_INTERFACE("e95ba1c7-e43f-49c3-a907-4ac669c9fb42", IMTLD3D11Shader)
     : public IUnknown {
   virtual ManagedShader GetManagedShader() = 0;
 };
 
-namespace dxmt {
+namespace d3dalloy {
 
 class NullD3D10Shader {
 public:
@@ -185,11 +185,11 @@ template <typename Variant>
 std::unique_ptr<CompiledShader>
 CreateVariantShader(MTLD3D11Device *, ManagedShader, Variant);
 
-} // namespace dxmt
+} // namespace d3dalloy
 
 namespace std {
-template <> struct hash<dxmt::ShaderVariant> {
-  size_t operator()(const dxmt::ShaderVariant &v) const noexcept {
+template <> struct hash<d3dalloy::ShaderVariant> {
+  size_t operator()(const d3dalloy::ShaderVariant &v) const noexcept {
     return v.index(); // FIXME:
   };
 };

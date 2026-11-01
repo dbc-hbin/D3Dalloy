@@ -433,7 +433,7 @@ void fsrErrorCases(const FsrApi& api, Gpu& gpu, FsrCreation& creation, ffxContex
 }
 
 void fsrGpuFrames(const FsrApi& api, Gpu& gpu, ffxContext* context,
-                   ID3D12Resource* depth, ID3D12Resource* motion) {
+                   ID3D12Resource* depth, ID3D12Resource* motion, const char* variant) {
     double resetMean = 0;
     for (UINT frame = 0; frame < 4; ++frame) {
         const uint8_t tag = frame == 1 ? 160 : 96;
@@ -471,8 +471,8 @@ void fsrGpuFrames(const FsrApi& api, Gpu& gpu, ffxContext* context,
             fail("FSR changed color did not increase output");
         if (frame == 2 && std::fabs(stats.mean - resetMean) > 1.0 / 255.0)
             fail("FSR history reset did not recover first-frame constant");
-        std::printf("OWNED_D3D12_FSR_FRAME_PASS frame=%u input_tag=%u output_mean=%.9g reset=%u render=%u output=128 sentinel=1 state_restored=1\n",
-                    frame, tag, stats.mean, frame != 1, frame == 3 ? 48 : 64);
+        std::printf("OWNED_D3D12_FSR_FRAME_PASS frame=%u variant=%s input_tag=%u output_mean=%.9g reset=%u render=%u output=128 sentinel=1 state_restored=1\n",
+                    frame, variant, tag, stats.mean, frame != 1, frame == 3 ? 48 : 64);
     }
 }
 
@@ -515,7 +515,7 @@ void fsrDeviceProxy(const FsrApi& api, Gpu& gpu, const ffxAllocationCallbacks& c
             check(recording.list->Close(), "FSR proxy negative list Close");
         }
         // Lists and resources deliberately come from gpu, not from the proxy.
-        fsrGpuFrames(api, gpu, &context, depth, motion);
+        fsrGpuFrames(api, gpu, &context, depth, motion, "device_proxy");
         fsrResult(api.destroy(&context, &callbacks), FFX_API_RETURN_OK, "proxy_destroy");
         if (context)
             fail("FSR proxy destroy retained context");
@@ -1115,7 +1115,7 @@ int OWNED_FSR_FIXTURE_ENTRY() {
     auto motion = makeMotion(gpu);
     fsrFullBehavior(api, gpu, depth.Get(), motion.Get());
     fsrErrorCases(api, gpu, creation, &context, callbacks, depth.Get(), motion.Get());
-    fsrGpuFrames(api, gpu, &context, depth.Get(), motion.Get());
+    fsrGpuFrames(api, gpu, &context, depth.Get(), motion.Get(), "direct");
     fsrResult(api.destroy(&context, &callbacks), FFX_API_RETURN_OK, "destroy");
     fsrResult(api.destroy(&context, &callbacks), FFX_API_RETURN_ERROR_PARAMETER, "destroy_twice");
     fsrDeviceProxy(api, gpu, callbacks, depth.Get(), motion.Get());

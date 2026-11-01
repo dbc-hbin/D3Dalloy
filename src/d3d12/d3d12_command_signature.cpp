@@ -20,14 +20,14 @@
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 constexpr auto kSharedHeader = R"(
 #include <metal_stdlib>
 
 using namespace metal;
 
-struct dxmt_compute_command_data {
+struct d3dalloy_compute_command_data {
   command_buffer cmd_buf;
   ulong max_count;
   device uint * max_count_buffer;
@@ -69,20 +69,20 @@ struct d3d12_index_buffer_view {
   uint format;
 };
 
-struct dxmt_vertex_buffer {
+struct d3dalloy_vertex_buffer {
   device void * buffer;
   uint stride;
   uint length;
 };
 
-struct dxmt_index_pull_control {
+struct d3dalloy_index_pull_control {
   uint index_size;
   uint index_first;
   int base_vertex;
   uint reserved;
 };
 
-struct dxmt_so_draw_arguments {
+struct d3dalloy_so_draw_arguments {
   uint vertex_count;
   uint instance_count;
   uint start_location;
@@ -92,15 +92,15 @@ struct dxmt_so_draw_arguments {
   ulong index_address;
 };
 
-struct dxmt_so_capture_binding {
+struct d3dalloy_so_capture_binding {
   device ushort * index_address;
   device uint * control_address;
   device uint * scratch_address;
   device uint * positions_address;
-  dxmt_so_draw_arguments args;
+  d3dalloy_so_draw_arguments args;
 };
 
-struct dxmt_render_command_data {
+struct d3dalloy_render_command_data {
   command_buffer cmd_buf;
   ulong max_count;
   device uint * max_count_buffer;
@@ -117,10 +117,10 @@ struct dxmt_render_command_data {
   device void * index_buffer;
   uint index_buffer_format;
   uint vertex_argbuf_stride;
-  device dxmt_index_pull_control * index_pull_controls;
+  device d3dalloy_index_pull_control * index_pull_controls;
   uint index_pull_mode;
   uint index_pull_padding;
-  device dxmt_so_capture_binding * so_draws;
+  device d3dalloy_so_capture_binding * so_draws;
   device uint * pipeline_statistics;
 };
 
@@ -134,7 +134,7 @@ public:
   /*
    * DISPATCH_MESH / DISPATCH_RAYS. `source` holds the shared header and the packed `d3d12_arguments` struct. With
    * root argument updates, `resolve_root_arguments` (one thread per slot) writes each executed slot's constants
-   * and root views into that slot's copy of the root arguments (`dxmt_slot_root_control`); the command list
+   * and root views into that slot's copy of the root arguments (`d3dalloy_slot_root_control`); the command list
    * binds slot i's copy for slot i's dispatch. Validation matches the ICB path.
    */
   HRESULT
@@ -145,7 +145,7 @@ public:
     if (!pRootSignature)
       return E_INVALIDARG;
     auto rootsig = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-    source << "struct dxmt_slot_root_control {\n"
+    source << "struct d3dalloy_slot_root_control {\n"
               "  device char *arguments;\n"
               "  device const uint *count;\n"
               "  device const ulong *predicate;\n"
@@ -155,7 +155,7 @@ public:
               "  uint predicate_not_equal;\n"
               "};\n"
               "kernel void resolve_root_arguments(uint i [[thread_position_in_grid]],\n"
-              "    constant dxmt_slot_root_control &control [[buffer(0)]]) {\n"
+              "    constant d3dalloy_slot_root_control &control [[buffer(0)]]) {\n"
               "  if (i >= control.max_commands) return;\n"
               "  uint limit = control.count ? control.count[0] : control.max_commands;\n"
               "  if (i >= limit) return;\n"
@@ -390,13 +390,13 @@ public:
     std::stringstream graphics_updates;
     if (updates_graphics_bindings)
       source << "void update_graphics_bindings(device d3d12_arguments &arg, device ulong *rootsig_qwords, "
-                "device dxmt_vertex_buffer *vertex_buffer);\n";
+                "device d3dalloy_vertex_buffer *vertex_buffer);\n";
 
     if (is_compute)
       source
-          << "[[kernel]] void resolve_indirect_commands([[thread_position_in_grid]] uint i, constant dxmt_compute_command_data";
+          << "[[kernel]] void resolve_indirect_commands([[thread_position_in_grid]] uint i, constant d3dalloy_compute_command_data";
     else
-      source << "[[vertex]] void resolve_indirect_commands(uint i [[vertex_id]], constant dxmt_render_command_data";
+      source << "[[vertex]] void resolve_indirect_commands(uint i [[vertex_id]], constant d3dalloy_render_command_data";
     source << " &command_data [[buffer(30)]]) {\n";
 
     if (is_compute)
@@ -422,8 +422,8 @@ public:
     source << "device ulong * rootsig_qwords = command_data.rootsig_qwords ? command_data.rootsig_qwords + "
            << "(" << (is_compute ? "ulong(i)" : "i") << " * command_data.rootsig_qwords_stride) : nullptr;\n";
     if (!is_compute)
-      source << "device dxmt_vertex_buffer * vertex_buffer = "
-                "reinterpret_cast<device dxmt_vertex_buffer *>(command_data.vertex_buffer + "
+      source << "device d3dalloy_vertex_buffer * vertex_buffer = "
+                "reinterpret_cast<device d3dalloy_vertex_buffer *>(command_data.vertex_buffer + "
                 "(i * command_data.vertex_argbuf_stride));\n";
     if (updates_graphics_bindings)
       source << "update_graphics_bindings(arg, rootsig_qwords, vertex_buffer);\n";
@@ -463,7 +463,7 @@ public:
       switch (arg.Type) {
       case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: {
         source << "if (command_data.so_draws) {\n"
-                  "device dxmt_so_capture_binding &so = command_data.so_draws[i];\n"
+                  "device d3dalloy_so_capture_binding &so = command_data.so_draws[i];\n"
                   "cmd.set_vertex_buffer(so.index_address,26);\n"
                   "cmd.set_vertex_buffer(so.control_address,27);\n"
                   "cmd.set_vertex_buffer(so.scratch_address,28);\n"
@@ -484,7 +484,7 @@ public:
           source << "device void* ib = command_data.index_buffer;\n";
         }
         source << "if (command_data.so_draws) {\n"
-                  "device dxmt_so_capture_binding &so = command_data.so_draws[i];\n"
+                  "device d3dalloy_so_capture_binding &so = command_data.so_draws[i];\n"
                   "cmd.set_vertex_buffer(so.index_address,26);\n"
                   "cmd.set_vertex_buffer(so.control_address,27);\n"
                   "cmd.set_vertex_buffer(so.scratch_address,28);\n"
@@ -494,7 +494,7 @@ public:
                   "} else {\n";
         source << "if (command_data.index_pull_mode != ~0u) {\n"
                   "bool pull = command_data.index_pull_mode != (ib32bit ? 2u : 1u);\n"
-                  "device dxmt_index_pull_control *control = command_data.index_pull_controls + i;\n"
+                  "device d3dalloy_index_pull_control *control = command_data.index_pull_controls + i;\n"
                   "if (pull) {\n"
                   "uint size = ib32bit ? 4u : 2u;\n"
                   "ulong first = (ulong)ib + (ulong)arg.draw_indexed.start_index_location * size;\n"
@@ -627,17 +627,17 @@ public:
     source << "};\n";
     if (updates_graphics_bindings) {
       source << "void update_graphics_bindings(device d3d12_arguments &arg, device ulong *rootsig_qwords, "
-                "device dxmt_vertex_buffer *vertex_buffer) {\n"
+                "device d3dalloy_vertex_buffer *vertex_buffer) {\n"
              << graphics_updates.view() << "}\n";
       // MSAA execution consumes these bindings in a compute VS, without an ICB draw.
       source << "kernel void resolve_graphics_arguments(uint i [[thread_position_in_grid]], "
-                "constant dxmt_render_command_data &command_data [[buffer(30)]]) {\n"
+                "constant d3dalloy_render_command_data &command_data [[buffer(30)]]) {\n"
                 "if (i >= command_data.max_count) return;\n"
                 "device d3d12_arguments &arg = *reinterpret_cast<device d3d12_arguments *>("
                 "command_data.argument_buffer + ulong(i) * " << pDesc->ByteStride << ");\n"
                 "device ulong *roots = command_data.rootsig_qwords ? command_data.rootsig_qwords + "
                 "ulong(i) * command_data.rootsig_qwords_stride : nullptr;\n"
-                "device dxmt_vertex_buffer *vertices = reinterpret_cast<device dxmt_vertex_buffer *>("
+                "device d3dalloy_vertex_buffer *vertices = reinterpret_cast<device d3dalloy_vertex_buffer *>("
                 "command_data.vertex_buffer + ulong(i) * command_data.vertex_argbuf_stride);\n"
                 "update_graphics_bindings(arg, roots, vertices);\n}\n";
     }
@@ -728,4 +728,4 @@ CreateCommandSignature(
   return sig->QueryInterface(riid, ppCommandSignature);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

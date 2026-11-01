@@ -6,10 +6,10 @@ nvngx_src = [
 nvngx_ld_args      = []
 nvngx_link_depends = []
 
-if dxmt_crossbuild
+if d3dalloy_crossbuild
   # NVSDK_NGX_Parameter is a C++ interface consumed by MSVC-built applications.
   # Keep its vftable in a tiny MSVC-ABI object while the storage/frontend stays
-  # in the normal DXMT MinGW translation units.
+  # in the normal D3Dalloy MinGW translation units.
   msvc_bridge_compiler = find_program('x86_64-w64-mingw32-g++')
   if cpu_family == 'x86'
     nvngx_msvc_target = 'i686-pc-windows-msvc'
@@ -35,7 +35,7 @@ endif
 nvngx_dll = shared_library('nvngx', nvngx_src,
   name_prefix         : '',
   dependencies        : [ dxgi_dep, util_dep, winemetal_dep ],
-  include_directories : [ dxmt_include_path ],
+  include_directories : [ d3dalloy_include_path ],
   install             : true,
   install_dir         : windows_builtin_install_dir,
   link_args           : nvngx_ld_args,

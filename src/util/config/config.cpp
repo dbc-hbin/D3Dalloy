@@ -23,7 +23,7 @@
 
 #include "../util_env.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
   class SingletonConfig : public Config {
   public:
@@ -51,7 +51,7 @@ namespace dxmt {
      * for the explicitly selected NGX/NVAPI path. Renderer capabilities and
      * the Genshin/YuanShen profiles are independent of these PCI identities. */
     { R"(\\ZenlessZoneZero\.exe$)",
-      env::getEnvVar("DXMT_ENABLE_NVEXT") == "1"
+      env::getEnvVar("D3DALLOY_ENABLE_NVEXT") == "1"
         ? Config{{
             { "dxgi.customDeviceDesc",   "NVIDIA GeForce RTX 4060" },
             { "dxgi.customVendorId",     "10de" },
@@ -352,12 +352,12 @@ namespace dxmt {
   Config Config::getUserConfig() {
     Config config;
 
-    // Load either $DXMT_CONFIG_FILE or $PWD/dxmt.conf
-    std::string filePath = env::getEnvVar("DXMT_CONFIG_FILE");
-    std::string confLine = env::getEnvVar("DXMT_CONFIG");
+    // Load either $D3DALLOY_CONFIG_FILE or $PWD/d3dalloy.conf
+    std::string filePath = env::getEnvVar("D3DALLOY_CONFIG_FILE");
+    std::string confLine = env::getEnvVar("D3DALLOY_CONFIG");
 
     if (filePath == "")
-      filePath = "dxmt.conf";
+      filePath = "d3dalloy.conf";
 
     // Open the file if it exists
     std::ifstream stream(str::topath(filePath.c_str()).c_str());

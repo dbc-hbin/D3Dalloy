@@ -107,14 +107,14 @@ struct Source {
   }
 };
 
-DWORD registerEvent(dxmt::DxgiBudgetNotifications &observer, HANDLE event) {
+DWORD registerEvent(d3dalloy::DxgiBudgetNotifications &observer, HANDLE event) {
   DWORD cookie = 0;
   require(observer.Register(event, &cookie) == S_OK, "register event");
   require(cookie != 0, "successful cookie must not equal failure cookie");
   return cookie;
 }
 
-void rejected(dxmt::DxgiBudgetNotifications &observer, HANDLE event, const char *step) {
+void rejected(d3dalloy::DxgiBudgetNotifications &observer, HANDLE event, const char *step) {
   DWORD cookie = 0xabcdef01;
   require(FAILED(observer.Register(event, &cookie)), step);
   require(cookie == 0, "failed registration clears output cookie");
@@ -124,7 +124,7 @@ void testTransitionsAndIndependentCookies() {
   Source source;
   Event manual;
   Event automatic(false);
-  dxmt::DxgiBudgetNotifications observer(Source::read, &source);
+  d3dalloy::DxgiBudgetNotifications observer(Source::read, &source);
   const ULONG manualBaseline = handleCount(manual.value);
   const ULONG autoBaseline = handleCount(automatic.value);
   const DWORD first = registerEvent(observer, manual.value);
@@ -187,7 +187,7 @@ void testRightsValidationAndCallerLifetime() {
   Source source;
   Event witness;
   Event initiallySignaled(false, true);
-  dxmt::DxgiBudgetNotifications observer(Source::read, &source);
+  d3dalloy::DxgiBudgetNotifications observer(Source::read, &source);
   const ULONG baseline = handleCount(witness.value);
   Handle queryOnly(duplicate(witness.value, kEventQueryState));
   Handle syncOnly(duplicate(witness.value, SYNCHRONIZE));
@@ -228,7 +228,7 @@ void testRightsValidationAndCallerLifetime() {
 
 struct Operation {
   enum Kind { Register, Unregister, Stop, Destroy } kind;
-  dxmt::DxgiBudgetNotifications *observer;
+  d3dalloy::DxgiBudgetNotifications *observer;
   Source *source;
   HANDLE event = nullptr;
   DWORD cookie = 0;
@@ -258,7 +258,7 @@ void testSecondRegistrationCannotSwallowChange() {
   Source source;
   Event oldEvent;
   Event newEvent;
-  dxmt::DxgiBudgetNotifications observer(Source::read, &source);
+  d3dalloy::DxgiBudgetNotifications observer(Source::read, &source);
   const DWORD oldCookie = registerEvent(observer, oldEvent.value);
   Operation operation{Operation::Register, &observer, &source};
   operation.event = newEvent.value;
@@ -286,7 +286,7 @@ void testWorkerAndUnregisterDispatchOrdering() {
   Source source;
   Event removed;
   Event survivor;
-  dxmt::DxgiBudgetNotifications observer(Source::read, &source);
+  d3dalloy::DxgiBudgetNotifications observer(Source::read, &source);
   // Arm the next callback from inside Register's baseline read, before the
   // registry lock can be released to the newly started worker.
   source.armAfterRead.store(true);
@@ -341,7 +341,7 @@ void testShutdownOrdering(bool destroy) {
   Source source;
   Event witness;
   const ULONG baseline = handleCount(witness.value);
-  auto *observer = new dxmt::DxgiBudgetNotifications(Source::read, &source);
+  auto *observer = new d3dalloy::DxgiBudgetNotifications(Source::read, &source);
   registerEvent(*observer, witness.value);
   require(handleCount(witness.value) == baseline + 1, "shutdown fixture owns event duplicate");
   source.arm();

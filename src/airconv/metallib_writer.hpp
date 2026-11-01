@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <array>
 
-namespace dxmt::metallib {
+namespace d3dalloy::metallib {
 
 #define MTLB_FOURCC(ch0, ch1, ch2, ch3)                                        \
   ((uint32_t)(char)(ch0) | ((uint32_t)(char)(ch1) << 8) |                      \
@@ -125,4 +125,4 @@ public:
   llvm::Error Write(const llvm::Module &module, llvm::raw_ostream &OS);
 };
 
-} // namespace dxmt::metallib
+} // namespace d3dalloy::metallib

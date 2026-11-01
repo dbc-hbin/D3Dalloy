@@ -64,7 +64,7 @@ class PreflightTests(unittest.TestCase):
         for relative in ('lib/wine/aarch64-unix/winemetal.so', 'lib/wine/aarch64-windows/winemetal.dll'):
             self.owned_records[relative] = {'sha256': self.records.pop(relative)['sha256'],
                                            'provenance_type': 'verified-owned-stage',
-                                           'source': {'dxmt_install': 'isolated owned contract fixture'}}
+                                           'source': {'d3dalloy_install': 'isolated owned contract fixture'}}
 
     def audit(self, abi: str = 'arm64', guest: str = 'arm64') -> dict:
         return preflight.audit_candidate(self.root, abi, guest, {'schema': 1, 'artifacts': self.records})

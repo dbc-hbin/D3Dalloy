@@ -12,7 +12,7 @@
 
 using namespace llvm;
 
-namespace dxmt::msaa {
+namespace d3dalloy::msaa {
 namespace {
 
 Error invalid(const Twine &message) {
@@ -64,7 +64,7 @@ MDNode *vertexMetadata(const Field &field, LLVMContext &context) {
     values.erase(values.begin() + 1);
   } else if (field.kind == "air.primitive_id") {
     values[0] = MDString::get(context, "air.vertex_output");
-    values.insert(values.begin() + 1, MDString::get(context, "user(dxmt_primitive_id)"));
+    values.insert(values.begin() + 1, MDString::get(context, "user(d3dalloy_primitive_id)"));
   }
   return MDTuple::get(context, values);
 }
@@ -201,7 +201,7 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
   SmallVector<Function *, 8> domainOutputs;
   for (auto &instruction : instructions(*original))
     if (auto *call = dyn_cast<CallBase>(&instruction); call && call->getCalledFunction() &&
-        call->getCalledFunction()->getName().startswith("dxmt.domain_generate_primitives."))
+        call->getCalledFunction()->getName().startswith("d3dalloy.domain_generate_primitives."))
       domainOutputs.push_back(call->getCalledFunction());
   // The exported helper delegates to templated connectivity/sink functions.
   // Materialize the complete reachable helper closure, not just its wrapper.
@@ -281,8 +281,8 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
   SmallVector<std::pair<GlobalVariable *, unsigned>, 8> stagedOutputs;
   for (auto &global : module.globals()) {
     if (global.getAddressSpace() != 3 ||
-        !(global.getName().startswith("dxmt.mesh.vertex.") ||
-          global.getName().startswith("dxmt.mesh.primitive."))) continue;
+        !(global.getName().startswith("d3dalloy.mesh.vertex.") ||
+          global.getName().startswith("d3dalloy.mesh.primitive."))) continue;
     const uint64_t bytes = module.getDataLayout().getTypeAllocSize(global.getValueType()).getFixedValue();
     if ((bytes & 3) || bytes / 4 > UINT32_MAX - scratchWords)
       return invalid("staged mesh output exceeds capture record format");
@@ -423,7 +423,7 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
     for (auto &instruction : block)
       if (auto *call = dyn_cast<CallInst>(&instruction); call && call->getCalledFunction()) {
         auto name = call->getCalledFunction()->getName();
-        if (name == "dxmt.msaa.mesh.slot") slotMarker = call;
+        if (name == "d3dalloy.msaa.mesh.slot") slotMarker = call;
         if (name.startswith("air.set_") && name.contains("_mesh")) stores.push_back(call);
       }
   IRBuilder<> b(slotMarker ? slotMarker : &*entry->getEntryBlock().getFirstInsertionPt());
@@ -473,10 +473,10 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
   Value *thread = entry->getArg(threadArg);
   if (!stagedOutputs.empty())
     for (auto &instruction : instructions(*entry))
-      if (auto *call = dyn_cast<CallInst>(&instruction); call && call->getMetadata("dxmt.mesh.output_barrier")) {
+      if (auto *call = dyn_cast<CallInst>(&instruction); call && call->getMetadata("d3dalloy.mesh.output_barrier")) {
         auto *flags = cast<ConstantInt>(call->getArgOperand(0));
         call->setArgOperand(0, b.getInt32(flags->getZExtValue() | unsigned(llvm::air::MemFlags::Device)));
-        call->setMetadata("dxmt.mesh.output_barrier", nullptr);
+        call->setMetadata("d3dalloy.mesh.output_barrier", nullptr);
       }
   if (slotMarker) { b.ClearInsertionPoint(); slotMarker->eraseFromParent(); }
 
@@ -601,4 +601,4 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
   original->eraseFromParent();
   return Error::success();
 }
-} // namespace dxmt::msaa
+} // namespace d3dalloy::msaa

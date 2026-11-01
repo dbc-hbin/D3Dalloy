@@ -6,13 +6,13 @@
 // immutable for each call; writable outputs must not overlap inputs. Native
 // identity, SHA1, names, PSO blobs and their order remain caller-owned.
 enum {
-    DXMT_PIPELINE_LIBRARY_SUCCESS = 0,
-    DXMT_PIPELINE_LIBRARY_INVALID_ARGUMENT = 1,
-    DXMT_PIPELINE_LIBRARY_VERSION_MISMATCH = 2,
-    DXMT_PIPELINE_LIBRARY_OVERFLOW = 3,
+    D3DALLOY_PIPELINE_LIBRARY_SUCCESS = 0,
+    D3DALLOY_PIPELINE_LIBRARY_INVALID_ARGUMENT = 1,
+    D3DALLOY_PIPELINE_LIBRARY_VERSION_MISMATCH = 2,
+    D3DALLOY_PIPELINE_LIBRARY_OVERFLOW = 3,
 };
 
-typedef struct DxmtPipelineLibraryHeader {
+typedef struct D3DalloyPipelineLibraryHeader {
     uint64_t adapter;
     uint64_t size;
     uint32_t count;
@@ -20,11 +20,11 @@ typedef struct DxmtPipelineLibraryHeader {
     uint8_t identity[48];
     uint8_t digest[20];
     uint32_t reserved_tail;
-} DxmtPipelineLibraryHeader;
+} D3DalloyPipelineLibraryHeader;
 
 // Offsets into the serialized library. name_offset/blob_offset are 8-aligned
 // and next_offset is the following record (or the end).
-typedef struct DxmtPipelineLibraryEntry {
+typedef struct D3DalloyPipelineLibraryEntry {
     uint64_t name_offset;
     uint64_t blob_offset;
     uint64_t blob_size;
@@ -33,54 +33,54 @@ typedef struct DxmtPipelineLibraryEntry {
     uint32_t kind;
     uint8_t key[20];
     uint32_t reserved;
-} DxmtPipelineLibraryEntry;
+} D3DalloyPipelineLibraryEntry;
 
 // Running serialized size and entry count; start with { 104, 0 }.
-typedef struct DxmtPipelineLibraryExtent {
+typedef struct D3DalloyPipelineLibraryExtent {
     uint64_t size;
     uint64_t count;
-} DxmtPipelineLibraryExtent;
+} D3DalloyPipelineLibraryExtent;
 
-typedef struct DxmtPipelineLibraryRecord {
+typedef struct D3DalloyPipelineLibraryRecord {
     uint64_t name_bytes;
     uint64_t blob_size;
     uint32_t kind;
     uint32_t reserved;
     uint8_t key[20];
     uint32_t reserved_tail;
-} DxmtPipelineLibraryRecord;
+} D3DalloyPipelineLibraryRecord;
 
-#define DXMT_PIPELINE_LIBRARY_HEADER_SIZE 104u
+#define D3DALLOY_PIPELINE_LIBRARY_HEADER_SIZE 104u
 // SHA1 covers [0, 80) followed by [100, size).
-#define DXMT_PIPELINE_LIBRARY_DIGEST_BEGIN 80u
-#define DXMT_PIPELINE_LIBRARY_DIGEST_END 100u
+#define D3DALLOY_PIPELINE_LIBRARY_DIGEST_BEGIN 80u
+#define D3DALLOY_PIPELINE_LIBRARY_DIGEST_END 100u
 
 #ifdef __cplusplus
-static_assert(sizeof(DxmtPipelineLibraryHeader) == 96, "pipeline library header ABI");
-static_assert(sizeof(DxmtPipelineLibraryEntry) == 64, "pipeline library entry ABI");
-static_assert(sizeof(DxmtPipelineLibraryExtent) == 16, "pipeline library extent ABI");
-static_assert(sizeof(DxmtPipelineLibraryRecord) == 48, "pipeline library record ABI");
+static_assert(sizeof(D3DalloyPipelineLibraryHeader) == 96, "pipeline library header ABI");
+static_assert(sizeof(D3DalloyPipelineLibraryEntry) == 64, "pipeline library entry ABI");
+static_assert(sizeof(D3DalloyPipelineLibraryExtent) == 16, "pipeline library extent ABI");
+static_assert(sizeof(D3DalloyPipelineLibraryRecord) == 48, "pipeline library record ABI");
 extern "C" {
 #endif
 
 // Adds one entry: rejects odd or >u32 name byte counts, empty blobs, a count
 // past u32 and a total past isize (OVERFLOW). Output untouched on failure.
-uint32_t dxmt_pipeline_library_extend(const DxmtPipelineLibraryExtent *extent, uint64_t name_bytes,
-                                      uint64_t blob_size, DxmtPipelineLibraryExtent *out);
+uint32_t d3dalloy_pipeline_library_extend(const D3DalloyPipelineLibraryExtent *extent, uint64_t name_bytes,
+                                      uint64_t blob_size, D3DalloyPipelineLibraryExtent *out);
 // Magic is checked before version, and version before size and reserved fields.
 // Adapter, identity and digest are returned for the caller's policy checks.
-uint32_t dxmt_pipeline_library_header(const void *data, uint64_t length, DxmtPipelineLibraryHeader *out);
+uint32_t d3dalloy_pipeline_library_header(const void *data, uint64_t length, D3DalloyPipelineLibraryHeader *out);
 // Bounds the record at offset with its padded name and blob inside the input,
 // and validates name parity, reserved, kind and nonempty blob.
-uint32_t dxmt_pipeline_library_entry(const void *data, uint64_t length, uint64_t offset,
-                                     DxmtPipelineLibraryEntry *out);
+uint32_t d3dalloy_pipeline_library_entry(const void *data, uint64_t length, uint64_t offset,
+                                     D3DalloyPipelineLibraryEntry *out);
 // Zeroes the complete destination of description->size bytes and writes the
 // header without digest. adapter, size, count and identity are used.
-uint32_t dxmt_pipeline_library_begin(const DxmtPipelineLibraryHeader *description, void *data, uint64_t length);
+uint32_t d3dalloy_pipeline_library_begin(const D3DalloyPipelineLibraryHeader *description, void *data, uint64_t length);
 // Writes the record at offset and returns where the caller copies name and blob.
-uint32_t dxmt_pipeline_library_put_entry(void *data, uint64_t length, uint64_t offset,
-                                         const DxmtPipelineLibraryRecord *record, DxmtPipelineLibraryEntry *out);
-uint32_t dxmt_pipeline_library_set_digest(void *data, uint64_t length, const uint8_t digest[20]);
+uint32_t d3dalloy_pipeline_library_put_entry(void *data, uint64_t length, uint64_t offset,
+                                         const D3DalloyPipelineLibraryRecord *record, D3DalloyPipelineLibraryEntry *out);
+uint32_t d3dalloy_pipeline_library_set_digest(void *data, uint64_t length, const uint8_t digest[20]);
 
 #ifdef __cplusplus
 }

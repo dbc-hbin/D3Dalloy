@@ -22,7 +22,7 @@
 #include "util_env.hpp"
 #include "unknwn.h"
 
-namespace dxmt::env {
+namespace d3dalloy::env {
 
 std::string getEnvVar(const char *name) {
 #ifdef _WIN32
@@ -113,7 +113,7 @@ void setThreadName(const std::string &name) {
   }
 #else
   std::array<char, 16> posixName = {};
-  dxmt::str::strlcpy(posixName.data(), name.c_str(), 16);
+  d3dalloy::str::strlcpy(posixName.data(), name.c_str(), 16);
   ::pthread_setname_np(posixName.data());
 #endif
 }
@@ -155,4 +155,4 @@ std::string getUnixPath(const std::string &path) {
 #endif
 }
 
-} // namespace dxmt::env
+} // namespace d3dalloy::env

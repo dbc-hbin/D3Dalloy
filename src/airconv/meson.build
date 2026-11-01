@@ -82,7 +82,7 @@ llvm_ld_flags = [
 ]
 
 airconv_forward_dep = declare_dependency(
-  include_directories : [ dxmt_include_path, include_directories('.') ],
+  include_directories : [ d3dalloy_include_path, include_directories('.') ],
 )
 
 airconv_shaders = [
@@ -127,7 +127,7 @@ airconv_sampler_feedback_ir = metalir_generator.process(
 airconv_sampler_feedback_header = hexdump_generator.process(airconv_sampler_feedback_ir)
 
 # Conservative rasterization: the snapped polygon must match msaa_gather_conservative_depth bit for bit
-# (src/airconv/shaders/conservative_polygon.h is shared with src/dxmt/dxmt_command.metal).
+# (src/airconv/shaders/conservative_polygon.h is shared with src/d3dalloy/d3dalloy_command.metal).
 airconv_conservative_ir = metalir_generator.process(
   'shaders/air_conservative.metal',
   extra_args: ['-std=metal3.1', '--target=air64-apple-macos14.0', '-fno-fast-math'],
@@ -149,7 +149,7 @@ if build_airconv_for_windows
 llvm_include_path = include_directories('../../toolchains/llvm/include') # FIXME: in favor of path relative to project
 
 airconv_lib = static_library('airconv', airconv_src,
-  include_directories : [ dxmt_include_path, llvm_include_path ],
+  include_directories : [ d3dalloy_include_path, llvm_include_path ],
   cpp_args            : [ airconv_args, '-DWIN_EXPORT' ],
   dependencies        : [ dxbc_parser_dep ],
   link_args           : llvm_ld_flags
@@ -157,7 +157,7 @@ airconv_lib = static_library('airconv', airconv_src,
 
 airconv_dep = declare_dependency(
   link_with           : [ airconv_lib ],
-  include_directories : [ dxmt_include_path, include_directories('.') ],
+  include_directories : [ d3dalloy_include_path, include_directories('.') ],
   dependencies        : [ dxbc_parser_dep ],
   link_args           : [ llvm_ld_flags, llvm_deps ] # meh
 )
@@ -165,7 +165,7 @@ airconv_dep = declare_dependency(
 lib_d3dcompiler = cpp.find_library('d3dcompiler_47')
 
 executable('airconv', airconv_src + airconv_cli_src,
-  include_directories : [ dxmt_include_path, llvm_include_path ],
+  include_directories : [ d3dalloy_include_path, llvm_include_path ],
   cpp_args            : [ airconv_args, '-DWIN_EXPORT' ],
   dependencies        : [ dxbc_parser_dep, lib_d3dcompiler ],
   link_args           : [ llvm_ld_flags, llvm_deps ]
@@ -173,6 +173,6 @@ executable('airconv', airconv_src + airconv_cli_src,
 
 endif
 
-if build_native_components and (cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild)
+if build_native_components and (cpu_family == 'x86_64' or cpu_family == 'aarch64' or not d3dalloy_crossbuild)
   subdir('darwin')
 endif

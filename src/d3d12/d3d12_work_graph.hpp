@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D12WorkGraph final : public MTLD3D12DeviceChild<ID3D12StateObject, ID3D12StateObjectProperties1,
                                                        ID3D12WorkGraphProperties> {
@@ -147,4 +147,4 @@ struct WorkGraphTexturePublisher {
 HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, const WorkGraphDispatch &dispatch,
                         const WorkGraphTexturePublisher &textures);
 
-} // namespace dxmt
+} // namespace d3dalloy

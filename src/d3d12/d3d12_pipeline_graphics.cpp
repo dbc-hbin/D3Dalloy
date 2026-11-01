@@ -23,7 +23,7 @@
 #include "d3d12_pipeline.hpp"
 #include "d3d12_pipeline_cache.hpp"
 #include "d3d12_shader_failure.hpp"
-#include "dxmt_format.hpp"
+#include "d3dalloy_format.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "sha1/sha1_util.hpp"
@@ -32,7 +32,7 @@
 #include <atomic>
 #include <bit>
 
-namespace dxmt {
+namespace d3dalloy {
 
 namespace {
 
@@ -1221,7 +1221,7 @@ public:
   // During process detach the OS has already terminated the workers, so a claimed job can never
   // finish; abandon it (the process is exiting) instead of waiting forever.
   ~MTLD3D12GraphicsPipelineStateImpl() {
-    if (async_job && !dxmt::this_thread::isInModuleDetachment())
+    if (async_job && !d3dalloy::this_thread::isInModuleDetachment())
       async_job->Cancel();
   }
 
@@ -3046,4 +3046,4 @@ CreateGraphicsPipelineState(
   return pso->QueryInterface(riid, ppPipelineState);
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

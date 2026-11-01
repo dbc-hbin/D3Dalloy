@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
           }
           SM50_COMPILED_BITCODE data{};
           SM50GetCompiledBitcode(compiled, &data);
-          dxmt::metallib::MTLBHeader header{};
+          d3dalloy::metallib::MTLBHeader header{};
           if (data.Size < sizeof(header)) return 1;
           std::memcpy(&header, data.Data, sizeof(header));
           if (header.BitcodeOffset > data.Size || header.BitcodeSize > data.Size - header.BitcodeOffset) return 1;

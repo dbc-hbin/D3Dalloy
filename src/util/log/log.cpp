@@ -16,7 +16,7 @@
 #include "../util_env.hpp"
 #include "util_string.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 Logger::Logger(const std::string &fileName)
     : m_minLevel(getMinLogLevel()), m_fileName(fileName) {}
@@ -49,7 +49,7 @@ void Logger::log(LogLevel level, const std::string &message) {
 
 void Logger::emitMsg(LogLevel level, const std::string &message) {
   if (level >= m_minLevel) {
-    std::lock_guard<dxmt::mutex> lock(m_mutex);
+    std::lock_guard<d3dalloy::mutex> lock(m_mutex);
 
     static std::array<const char *, 5> s_prefixes = {
         {"trace: ", "debug: ", "info:  ", "warn:  ", "err:   "}};
@@ -93,7 +93,7 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
 }
 
 std::string Logger::getFileName(const std::string &base) {
-  std::string path = env::getEnvVar("DXMT_LOG_PATH");
+  std::string path = env::getEnvVar("D3DALLOY_LOG_PATH");
 
   if (path == "none")
     return std::string();
@@ -106,7 +106,7 @@ std::string Logger::getFileName(const std::string &base) {
     path += '/';
 
   std::string exeName = env::getExeBaseName();
-  path += exeName + "_" + base;
+  path += exeName + "_d3dalloy-" + base;
   return path;
 }
 
@@ -120,7 +120,7 @@ LogLevel Logger::getMinLogLevel() {
       {"none", LogLevel::None},
   }};
 
-  const std::string logLevelStr = env::getEnvVar("DXMT_LOG_LEVEL");
+  const std::string logLevelStr = env::getEnvVar("D3DALLOY_LOG_LEVEL");
 
   for (const auto &pair : logLevels) {
     if (logLevelStr == pair.first)
@@ -130,4 +130,4 @@ LogLevel Logger::getMinLogLevel() {
   return LogLevel::Info;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

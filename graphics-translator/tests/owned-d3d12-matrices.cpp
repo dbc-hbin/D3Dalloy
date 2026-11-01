@@ -1,5 +1,5 @@
 // The production owned D3D12 path, not a native feasibility shader.
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
 #include <windows.h>
 #include <rpc.h>
 #include <rpcndr.h>
@@ -8,12 +8,12 @@
 #undef MIDL_INTERFACE
 #define MIDL_INTERFACE(value) struct __declspec(uuid(value))
 #endif
-#include DXMT_MATRIX_PREVIEW_SDK_HEADER
+#include D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
 #endif
 #define wmain sm6_suite_main
 #include "owned-d3d12-sm6.cpp"
 #undef wmain
-#ifndef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifndef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
 #include "../../src/d3d12/d3d12_interfaces_ext.hpp"
 #endif
 

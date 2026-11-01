@@ -24,10 +24,10 @@
 #include <mach/machine.h>
 
 #include "airconv_public.h"
-#if defined(DXMT_NATIVE_BRIDGE_PROBE) || defined(DXMT_UNIX_PLUGIN_PROBE)
+#if defined(D3DALLOY_NATIVE_BRIDGE_PROBE) || defined(D3DALLOY_UNIX_PLUGIN_PROBE)
 #include "winemetal_metal4.h"
 #endif
-#ifdef DXMT_UNIX_PLUGIN_PROBE
+#ifdef D3DALLOY_UNIX_PLUGIN_PROBE
 #include "winemetal_thunks.h"
 extern "C" const void *__wine_unix_call_funcs[];
 #endif
@@ -341,12 +341,12 @@ int main(int argc, char **argv) {
       return 2;
     }
     std::printf("NULL_DESCRIPTOR_PROBE_DEVICE name=%s\n", device.name.UTF8String);
-#if defined(DXMT_NATIVE_BRIDGE_PROBE) || defined(DXMT_UNIX_PLUGIN_PROBE)
+#if defined(D3DALLOY_NATIVE_BRIDGE_PROBE) || defined(D3DALLOY_UNIX_PLUGIN_PROBE)
     const obj_handle_t device_handle = reinterpret_cast<uintptr_t>((__bridge void *)device);
     struct WMTMetal4Call supports{};
     supports.operation = WMTMetal4Supports;
     supports.args[0] = device_handle;
-#ifdef DXMT_UNIX_PLUGIN_PROBE
+#ifdef D3DALLOY_UNIX_PLUGIN_PROBE
     // Invoke the actual exported native dispatch table, not Windows thunks or a stand-in.
     using UnixCall = int32_t (*)(void *);
     const auto *calls = __wine_unix_call_funcs;
@@ -367,7 +367,7 @@ int main(int argc, char **argv) {
       fail("native typed Metal4 bridge capability differs from the real device");
       return 1;
     }
-#ifdef DXMT_UNIX_PLUGIN_PROBE
+#ifdef D3DALLOY_UNIX_PLUGIN_PROBE
     struct unixcall_generic_obj_uint64_obj_ret queue_call{device_handle, 64, 0};
     if (reinterpret_cast<UnixCall>(const_cast<void *>(calls[9]))(&queue_call) != 0) {
       fail("real Unix-plugin command-queue dispatch failed");
@@ -393,7 +393,7 @@ int main(int argc, char **argv) {
 #endif
   }
 
-#ifdef DXMT_UNIX_PLUGIN_PROBE
+#ifdef D3DALLOY_UNIX_PLUGIN_PROBE
   const uint32_t image_count = _dyld_image_count();
   for (uint32_t index = 0; index < image_count; ++index) {
     const auto *header = _dyld_get_image_header(index);

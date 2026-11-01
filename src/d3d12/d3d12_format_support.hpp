@@ -3,7 +3,7 @@
 #include "d3d12.h"
 #include "d3d12_resource_contract.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 // The DXGI names for depth/stencil plane SRVs contain TYPELESS even though
 // each selects a concrete shader-readable aspect of a two-plane resource.
@@ -224,4 +224,4 @@ BuildD3D12FormatSupport(DXGI_FORMAT format, const D3D12FormatSupportProperties &
   return support;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

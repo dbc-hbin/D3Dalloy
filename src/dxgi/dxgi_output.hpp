@@ -1,12 +1,12 @@
 #pragma once
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
-#include "dxmt_presenter.hpp"
+#include "d3dalloy_presenter.hpp"
 #include "dxgi_refresh_timing.hpp"
 #include <atomic>
 #include <memory>
 
-namespace dxmt {
+namespace d3dalloy {
 
 HRESULT ComputeFrameStatistics(const WMTPresentationEvent &event, const WMTDisplayRefreshSample &sample,
                                bool windowed, RefreshClockBasis &clock, bool &disjoint, DXGI_FRAME_STATISTICS *stats);
@@ -17,7 +17,7 @@ void PublishOutputStatistics(HMONITOR monitor, const void *owner, const WMTPrese
 void InvalidateOutputStatistics(HMONITOR monitor, const void *owner);
 
 struct MTLDXGIOutput : public MTLDXGIObject<IDXGIOutput6> {
-  virtual const DXMTGammaRamp *STDMETHODCALLTYPE GetGammaRamp() = 0;
+  virtual const D3DalloyGammaRamp *STDMETHODCALLTYPE GetGammaRamp() = 0;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

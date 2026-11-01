@@ -45,7 +45,7 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
     NSString *name = [NSString stringWithUTF8String:(const char *)(uintptr_t)params->args[1]];
     if (![library.functionNames containsObject:name]) {
       if (params->operation == WMTMetal4PipelineSpecializedFunction)
-        error = [NSError errorWithDomain:@"DXMTMetal4Pipeline" code:1
+        error = [NSError errorWithDomain:@"D3DalloyMetal4Pipeline" code:1
                                userInfo:@{NSLocalizedDescriptionKey: @"Metallib entry point is missing"}];
       break;
     }

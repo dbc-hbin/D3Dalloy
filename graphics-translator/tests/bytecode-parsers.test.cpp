@@ -212,26 +212,26 @@ static void signatures() {
   // a multi-stream GS output restarts its registers per stream.
   const auto gs = signature(32, {{0, "SV_Position", 0, 1, 3, 0, 0xf, 0, 0}, {0, "COLOR", 0, 0, 3, 1, 0xf, 0, 0},
                                  {1, "SV_Position", 0, 1, 3, 0, 0xf, 0, 0}, {1, "COLOR", 0, 0, 3, 1, 0xf, 0, 0}});
-  DxmtDxbcSignatureInfo info{}, untouched{};
-  check(dxmt_dxbc_signature_parse(gs.data(), gs.size(), DXMT_DXBC_SIGNATURE_11_1, 1, &info) == 0 &&
+  D3DalloyDxbcSignatureInfo info{}, untouched{};
+  check(d3dalloy_dxbc_signature_parse(gs.data(), gs.size(), D3DALLOY_DXBC_SIGNATURE_11_1, 1, &info) == 0 &&
             info.parameter_count == 4 && info.stream_count == 2 && info.stream_parameters[1] == 2,
         "dxil-gs-streams-grouped");
-  check(dxmt_dxbc_signature_parse(gs.data(), gs.size(), DXMT_DXBC_SIGNATURE_11_1, 0, &untouched) ==
-            DXMT_DXBC_SIGNATURE_REGISTER_ORDER && untouched.parameter_count == 0,
+  check(d3dalloy_dxbc_signature_parse(gs.data(), gs.size(), D3DALLOY_DXBC_SIGNATURE_11_1, 0, &untouched) ==
+            D3DALLOY_DXBC_SIGNATURE_REGISTER_ORDER && untouched.parameter_count == 0,
         "dxil-gs-streams-ungrouped-rejected");
-  DxmtDxbcSignatureParameter record{};
-  check(dxmt_dxbc_signature_parameter(gs.data(), gs.size(), &info, 3, &record) == 0 && record.stream == 1 &&
+  D3DalloyDxbcSignatureParameter record{};
+  check(d3dalloy_dxbc_signature_parameter(gs.data(), gs.size(), &info, 3, &record) == 0 && record.stream == 1 &&
             record.register_index == 1 && record.name_size == 5 &&
             !std::memcmp(gs.data() + record.name_offset, "COLOR", 6),
         "dxil-gs-record");
-  check(dxmt_dxbc_signature_parameter(gs.data(), gs.size(), &info, 4, &record) == DXMT_DXBC_SIGNATURE_INVALID_ARGUMENT,
+  check(d3dalloy_dxbc_signature_parameter(gs.data(), gs.size(), &info, 4, &record) == D3DALLOY_DXBC_SIGNATURE_INVALID_ARGUMENT,
         "dxil-record-index-past-count");
   for (size_t size = 8; size < 8 + 4 * 32; size += 31)
-    check(dxmt_dxbc_signature_parse(gs.data(), size, DXMT_DXBC_SIGNATURE_11_1, 1, &untouched) ==
-              DXMT_DXBC_SIGNATURE_RECORDS && untouched.parameter_count == 0,
+    check(d3dalloy_dxbc_signature_parse(gs.data(), size, D3DALLOY_DXBC_SIGNATURE_11_1, 1, &untouched) ==
+              D3DALLOY_DXBC_SIGNATURE_RECORDS && untouched.parameter_count == 0,
           "dxil-truncated-record-table");
-  check(dxmt_dxbc_signature_parse(gs.data(), gs.size() - 1, DXMT_DXBC_SIGNATURE_11_1, 1, &untouched) ==
-            DXMT_DXBC_SIGNATURE_NAME,
+  check(d3dalloy_dxbc_signature_parse(gs.data(), gs.size() - 1, D3DALLOY_DXBC_SIGNATURE_11_1, 1, &untouched) ==
+            D3DALLOY_DXBC_SIGNATURE_NAME,
         "dxil-truncated-last-name");
 }
 
@@ -344,55 +344,55 @@ static void programs() {
 }
 
 static void library() {
-  const DxmtPipelineLibraryExtent start{DXMT_PIPELINE_LIBRARY_HEADER_SIZE, 0};
-  DxmtPipelineLibraryExtent extent{}, untouched{77, 77};
-  check(dxmt_pipeline_library_extend(&start, 6, 9, &extent) == DXMT_PIPELINE_LIBRARY_SUCCESS &&
+  const D3DalloyPipelineLibraryExtent start{D3DALLOY_PIPELINE_LIBRARY_HEADER_SIZE, 0};
+  D3DalloyPipelineLibraryExtent extent{}, untouched{77, 77};
+  check(d3dalloy_pipeline_library_extend(&start, 6, 9, &extent) == D3DALLOY_PIPELINE_LIBRARY_SUCCESS &&
             extent.size == 104 + 40 + 8 + 16 && extent.count == 1,
         "library-extend");
-  check(dxmt_pipeline_library_extend(&start, 3, 9, &untouched) == DXMT_PIPELINE_LIBRARY_INVALID_ARGUMENT &&
-            dxmt_pipeline_library_extend(&start, 2, 0, &untouched) == DXMT_PIPELINE_LIBRARY_INVALID_ARGUMENT &&
-            dxmt_pipeline_library_extend(&start, uint64_t(UINT32_MAX) + 1, 1, &untouched) ==
-                DXMT_PIPELINE_LIBRARY_INVALID_ARGUMENT &&
-            dxmt_pipeline_library_extend(&start, 2, UINT64_MAX - 3, &untouched) == DXMT_PIPELINE_LIBRARY_OVERFLOW &&
+  check(d3dalloy_pipeline_library_extend(&start, 3, 9, &untouched) == D3DALLOY_PIPELINE_LIBRARY_INVALID_ARGUMENT &&
+            d3dalloy_pipeline_library_extend(&start, 2, 0, &untouched) == D3DALLOY_PIPELINE_LIBRARY_INVALID_ARGUMENT &&
+            d3dalloy_pipeline_library_extend(&start, uint64_t(UINT32_MAX) + 1, 1, &untouched) ==
+                D3DALLOY_PIPELINE_LIBRARY_INVALID_ARGUMENT &&
+            d3dalloy_pipeline_library_extend(&start, 2, UINT64_MAX - 3, &untouched) == D3DALLOY_PIPELINE_LIBRARY_OVERFLOW &&
             untouched.size == 77 && untouched.count == 77,
         "library-extend-rejects");
-  const DxmtPipelineLibraryExtent full{104, UINT32_MAX};
-  check(dxmt_pipeline_library_extend(&full, 2, 1, &untouched) == DXMT_PIPELINE_LIBRARY_INVALID_ARGUMENT,
+  const D3DalloyPipelineLibraryExtent full{104, UINT32_MAX};
+  check(d3dalloy_pipeline_library_extend(&full, 2, 1, &untouched) == D3DALLOY_PIPELINE_LIBRARY_INVALID_ARGUMENT,
         "library-count-limit");
 
   // Build a two-entry library with the production writer API.
   const std::u16string names[] = {u"abc", u"longer-name"};
   const Bytes blobs[] = {Bytes(9, 0xa1), Bytes(16, 0xb2)};
-  DxmtPipelineLibraryExtent total = start;
+  D3DalloyPipelineLibraryExtent total = start;
   for (int i = 0; i < 2; ++i)
-    dxmt_pipeline_library_extend(&total, names[i].size() * 2, blobs[i].size(), &total);
+    d3dalloy_pipeline_library_extend(&total, names[i].size() * 2, blobs[i].size(), &total);
   Bytes bytes(total.size, 0xcc);
-  DxmtPipelineLibraryHeader header{};
+  D3DalloyPipelineLibraryHeader header{};
   header.adapter = 0x1122334455667788ull;
   header.size = total.size;
   header.count = 2;
   std::memset(header.identity, 0x5a, sizeof(header.identity));
-  check(dxmt_pipeline_library_begin(&header, bytes.data(), bytes.size() - 1) != DXMT_PIPELINE_LIBRARY_SUCCESS,
+  check(d3dalloy_pipeline_library_begin(&header, bytes.data(), bytes.size() - 1) != D3DALLOY_PIPELINE_LIBRARY_SUCCESS,
         "library-begin-size");
-  check(dxmt_pipeline_library_begin(&header, bytes.data(), bytes.size()) == DXMT_PIPELINE_LIBRARY_SUCCESS,
+  check(d3dalloy_pipeline_library_begin(&header, bytes.data(), bytes.size()) == D3DALLOY_PIPELINE_LIBRARY_SUCCESS,
         "library-begin");
-  uint64_t offset = DXMT_PIPELINE_LIBRARY_HEADER_SIZE;
+  uint64_t offset = D3DALLOY_PIPELINE_LIBRARY_HEADER_SIZE;
   for (int i = 0; i < 2; ++i) {
-    DxmtPipelineLibraryRecord record{names[i].size() * 2, blobs[i].size(), uint32_t(i), 0, {}, 0};
+    D3DalloyPipelineLibraryRecord record{names[i].size() * 2, blobs[i].size(), uint32_t(i), 0, {}, 0};
     std::memset(record.key, 0x10 + i, sizeof(record.key));
-    DxmtPipelineLibraryEntry placed;
-    check(dxmt_pipeline_library_put_entry(bytes.data(), bytes.size(), offset, &record, &placed) ==
-              DXMT_PIPELINE_LIBRARY_SUCCESS,
+    D3DalloyPipelineLibraryEntry placed;
+    check(d3dalloy_pipeline_library_put_entry(bytes.data(), bytes.size(), offset, &record, &placed) ==
+              D3DALLOY_PIPELINE_LIBRARY_SUCCESS,
           "library-put-entry");
     std::memcpy(bytes.data() + placed.name_offset, names[i].data(), placed.name_bytes);
     std::memcpy(bytes.data() + placed.blob_offset, blobs[i].data(), placed.blob_size);
     offset = placed.next_offset;
   }
   const uint8_t digest[20] = {1, 2, 3};
-  check(offset == bytes.size() && dxmt_pipeline_library_set_digest(bytes.data(), bytes.size(), digest) == 0,
+  check(offset == bytes.size() && d3dalloy_pipeline_library_set_digest(bytes.data(), bytes.size(), digest) == 0,
         "library-digest");
-  // Byte layout of the previous C++ writer: header fields, records, zero padding.
-  check(get(bytes, 0) == 0x544d5844 && get(bytes, 4) == 0x00424c50 && get(bytes, 8) == 1 && get(bytes, 12) == 2 &&
+  // Owned wire layout: header fields, records, zero padding.
+  check(get(bytes, 0) == 0x4c413344 && get(bytes, 4) == 0x00424c50 && get(bytes, 8) == 1 && get(bytes, 12) == 2 &&
             get(bytes, 16) == bytes.size() && get(bytes, 24) == 0x55667788 && get(bytes, 28) == 0x11223344 &&
             bytes[32] == 0x5a && bytes[79] == 0x5a && bytes[80] == 1 && bytes[82] == 3 && get(bytes, 100) == 0 &&
             get(bytes, 104) == 6 && get(bytes, 108) == 0 && get(bytes, 112) == 9 && bytes[120] == 0x10 &&
@@ -400,37 +400,37 @@ static void library() {
             get(bytes, 168) == 22 && get(bytes, 172) == 1,
         "library-golden-layout");
 
-  DxmtPipelineLibraryHeader read;
-  check(dxmt_pipeline_library_header(bytes.data(), bytes.size(), &read) == 0 && read.count == 2 &&
+  D3DalloyPipelineLibraryHeader read;
+  check(d3dalloy_pipeline_library_header(bytes.data(), bytes.size(), &read) == 0 && read.count == 2 &&
             read.adapter == header.adapter && read.digest[2] == 3 && read.identity[47] == 0x5a,
         "library-header-read");
-  DxmtPipelineLibraryEntry first, second;
-  check(dxmt_pipeline_library_entry(bytes.data(), bytes.size(), 104, &first) == 0 && first.name_bytes == 6 &&
+  D3DalloyPipelineLibraryEntry first, second;
+  check(d3dalloy_pipeline_library_entry(bytes.data(), bytes.size(), 104, &first) == 0 && first.name_bytes == 6 &&
             first.blob_offset == 152 && first.blob_size == 9 &&
-            dxmt_pipeline_library_entry(bytes.data(), bytes.size(), first.next_offset, &second) == 0 &&
+            d3dalloy_pipeline_library_entry(bytes.data(), bytes.size(), first.next_offset, &second) == 0 &&
             second.kind == 1 && second.next_offset == bytes.size(),
         "library-entry-read");
   // Magic before version before size; truncated or overrunning records fail.
   auto version = bytes;
   put(version, 8, 2);
   put(version, 16, 1);
-  check(dxmt_pipeline_library_header(version.data(), version.size(), &read) == DXMT_PIPELINE_LIBRARY_VERSION_MISMATCH,
+  check(d3dalloy_pipeline_library_header(version.data(), version.size(), &read) == D3DALLOY_PIPELINE_LIBRARY_VERSION_MISMATCH,
         "library-version-before-size");
   put(version, 0, 0);
-  check(dxmt_pipeline_library_header(version.data(), version.size(), &read) == DXMT_PIPELINE_LIBRARY_INVALID_ARGUMENT,
+  check(d3dalloy_pipeline_library_header(version.data(), version.size(), &read) == D3DALLOY_PIPELINE_LIBRARY_INVALID_ARGUMENT,
         "library-magic-before-version");
-  check(dxmt_pipeline_library_header(bytes.data(), bytes.size() - 8, &read) == DXMT_PIPELINE_LIBRARY_INVALID_ARGUMENT,
+  check(d3dalloy_pipeline_library_header(bytes.data(), bytes.size() - 8, &read) == D3DALLOY_PIPELINE_LIBRARY_INVALID_ARGUMENT,
         "library-size-mismatch");
   for (const auto &[at, value] : {std::pair<size_t, uint32_t>{104, 7}, {104, UINT32_MAX - 1}, {108, 2}, {112, 0},
                                   {112, UINT32_MAX}, {116, 1}, {140, 1}}) {
     auto bad = bytes;
     put(bad, at, value);
-    check(dxmt_pipeline_library_entry(bad.data(), bad.size(), 104, &first) == DXMT_PIPELINE_LIBRARY_INVALID_ARGUMENT,
+    check(d3dalloy_pipeline_library_entry(bad.data(), bad.size(), 104, &first) == D3DALLOY_PIPELINE_LIBRARY_INVALID_ARGUMENT,
           "library-entry-rejects");
   }
-  check(dxmt_pipeline_library_entry(bytes.data(), bytes.size(), bytes.size() - 8, &first) != 0 &&
-            dxmt_pipeline_library_entry(bytes.data(), bytes.size(), 100, &first) != 0 &&
-            dxmt_pipeline_library_entry(bytes.data(), bytes.size(), UINT64_MAX, &first) != 0,
+  check(d3dalloy_pipeline_library_entry(bytes.data(), bytes.size(), bytes.size() - 8, &first) != 0 &&
+            d3dalloy_pipeline_library_entry(bytes.data(), bytes.size(), 100, &first) != 0 &&
+            d3dalloy_pipeline_library_entry(bytes.data(), bytes.size(), UINT64_MAX, &first) != 0,
         "library-entry-offset-rejects");
 }
 
@@ -459,10 +459,10 @@ static size_t part_offset(const Bytes &dxil, uint32_t type) {
 }
 
 static void subobjects(const char *path) {
-  using dxmt::DxilSubobjectKind;
+  using d3dalloy::DxilSubobjectKind;
   const auto dxil = read_file(path);
-  std::vector<dxmt::DxilSubobject> out;
-  check(dxmt::ReadDxilLibrarySubobjects(dxil.data(), dxil.size(), out) == S_OK && out.size() == 11, "rdat-fixture");
+  std::vector<d3dalloy::DxilSubobject> out;
+  check(d3dalloy::ReadDxilLibrarySubobjects(dxil.data(), dxil.size(), out) == S_OK && out.size() == 11, "rdat-fixture");
   if (out.size() == 11) {
     check(out[0].kind == DxilSubobjectKind::GlobalRootSignature && out[0].name == L"SoGlobalRS" &&
               out[0].root_signature.size() == 92 && out[1].root_signature.size() == 48,
@@ -487,8 +487,8 @@ static void subobjects(const char *path) {
   auto record = [&](unsigned i) { return table + 8 + i * stride; };
   // As before, records preceding the failing one remain in the output.
   auto expect = [&](const Bytes &bytes, HRESULT hr, const char *name) {
-    std::vector<dxmt::DxilSubobject> result;
-    check(dxmt::ReadDxilLibrarySubobjects(bytes.data(), bytes.size(), result) == hr, name);
+    std::vector<d3dalloy::DxilSubobject> result;
+    check(d3dalloy::ReadDxilLibrarySubobjects(bytes.data(), bytes.size(), result) == hr, name);
   };
   auto bad = dxil;
   put(bad, record(4), 77);
@@ -519,9 +519,9 @@ static void subobjects(const char *path) {
   put(bad, table, 0x10000000);
   expect(bad, E_INVALIDARG, "rdat-record-count-past-table");
   const Bytes empty = container({{"TEST", words({1})}});
-  std::vector<dxmt::DxilSubobject> none(1);
-  check(dxmt::ReadDxilLibrarySubobjects(empty.data(), empty.size(), none) == S_OK && none.empty(), "rdat-absent");
-  check(dxmt::ReadDxilLibrarySubobjects(nullptr, 0, none) == E_INVALIDARG, "rdat-null");
+  std::vector<d3dalloy::DxilSubobject> none(1);
+  check(d3dalloy::ReadDxilLibrarySubobjects(empty.data(), empty.size(), none) == S_OK && none.empty(), "rdat-absent");
+  check(d3dalloy::ReadDxilLibrarySubobjects(nullptr, 0, none) == E_INVALIDARG, "rdat-null");
 }
 
 static void put64(Bytes &bytes, size_t offset, uint64_t value) {
@@ -530,25 +530,25 @@ static void put64(Bytes &bytes, size_t offset, uint64_t value) {
   std::memcpy(bytes.data() + offset, &value, sizeof(value));
 }
 
-// Serialized structure: 56-byte header, pointers, 64-byte dxmt header, shadow.
+// Serialized structure: 56-byte header, pointers, 64-byte d3dalloy header, shadow.
 struct Serialized {
   Bytes bytes;
   uint64_t header;
-  DxmtRtasSerializedLayout layout{};
-  uint32_t prefix() { return dxmt_rtas_serialized_prefix(bytes.data(), 56, bytes.size(), &layout); }
-  uint32_t parse(DxmtRtasSerializedInfo &info, uint64_t destination = 1 << 20) {
+  D3DalloyRtasSerializedLayout layout{};
+  uint32_t prefix() { return d3dalloy_rtas_serialized_prefix(bytes.data(), 56, bytes.size(), &layout); }
+  uint32_t parse(D3DalloyRtasSerializedInfo &info, uint64_t destination = 1 << 20) {
     if (uint32_t status = prefix())
       return status;
     if (layout.blocks)
-      if (uint32_t status = dxmt_rtas_serialized_block(&layout, bytes.data() + 56, 16, &layout))
+      if (uint32_t status = d3dalloy_rtas_serialized_block(&layout, bytes.data() + 56, 16, &layout))
         return status;
     if (layout.header_offset + 64 > bytes.size())
       return 99;
     uint64_t geometry = 0;
     if (uint32_t status =
-            dxmt_rtas_serialized_geometry_bytes(&layout, bytes.data() + layout.header_offset, 64, &geometry))
+            d3dalloy_rtas_serialized_geometry_bytes(&layout, bytes.data() + layout.header_offset, 64, &geometry))
       return status;
-    return dxmt_rtas_serialized_parse(bytes.data(), 56, &layout, bytes.data() + layout.header_offset, 64,
+    return d3dalloy_rtas_serialized_parse(bytes.data(), 56, &layout, bytes.data() + layout.header_offset, 64,
                                       bytes.data() + layout.header_offset + 64, geometry, destination, &info);
   }
 };
@@ -569,21 +569,21 @@ static Serialized serialized(uint32_t type, uint32_t count, uint64_t pointers, u
 }
 
 static void rtas() {
-  DxmtRtasSerializedInfo info{};
+  D3DalloyRtasSerializedInfo info{};
   auto top = serialized(0, 2, 2, 128, 16);
   check(top.parse(info) == 0 && info.header_offset == 72 && info.instances.offset == 64 &&
             info.instances.size == 128 && info.desc_count == 2,
         "rtas-top-level");
   auto bad = top;
   put64(bad.bytes, 48, 1);
-  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-top-pointer-count");
+  check(bad.parse(info) == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-top-pointer-count");
   bad = top;
   put64(bad.bytes, top.header + 32, 64);
-  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-top-instances-past-shadow");
-  check(top.parse(info, 64 + 127) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-destination-too-small");
+  check(bad.parse(info) == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-top-instances-past-shadow");
+  check(top.parse(info, 64 + 127) == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-destination-too-small");
   bad = top;
   put64(bad.bytes, 48, UINT64_MAX >> 33);
-  check(bad.prefix() == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-pointer-overflow");
+  check(bad.prefix() == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-pointer-overflow");
   // Every size below the 120-byte minimum or past the readable source fails.
   bool truncated = true;
   for (uint64_t size = 0; size <= top.bytes.size() + 1; ++size) {
@@ -609,21 +609,21 @@ static void rtas() {
   put(bottom.bytes, g1 + 24, 1);
   put(bottom.bytes, g1 + 28, 24);
   put64(bottom.bytes, g1 + 32, 352);
-  DxmtRtasSerializedGeometry spans{};
+  D3DalloyRtasSerializedGeometry spans{};
   const uint8_t *records = bottom.bytes.data() + g0;
   check(bottom.parse(info) == 0 && info.type == 1 && info.shadow_size == 448 &&
-            dxmt_rtas_serialized_geometry(&info, records, 192, 0, &spans) == 0 && spans.present == 7 &&
+            d3dalloy_rtas_serialized_geometry(&info, records, 192, 0, &spans) == 0 && spans.present == 7 &&
             spans.data.offset == 256 && spans.data.size == 36 && spans.indices.size == 12 &&
             spans.transform.offset == 304 && spans.transform.size == 48 &&
-            dxmt_rtas_serialized_geometry(&info, records, 192, 1, &spans) == 0 && spans.present == 1 &&
-            spans.data.size == 24 && dxmt_rtas_serialized_geometry(&info, records, 192, 2, &spans) ==
-                                         DXMT_RTAS_SERIALIZED_INVALID_ARGUMENT,
+            d3dalloy_rtas_serialized_geometry(&info, records, 192, 1, &spans) == 0 && spans.present == 1 &&
+            spans.data.size == 24 && d3dalloy_rtas_serialized_geometry(&info, records, 192, 2, &spans) ==
+                                         D3DALLOY_RTAS_SERIALIZED_INVALID_ARGUMENT,
         "rtas-bottom-level");
   for (const auto &[at, value] : {std::pair<size_t, uint64_t>{g1 + 32, 64 + 448 - 23}, {g0 + 32, 63},
                                   {g0 + 40, 64 + 448 - 11}, {g0 + 48, 64 + 448 - 47}, {g1, 3}}) {
     bad = bottom;
     put64(bad.bytes, at, value);
-    check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-geometry-span-rejects");
+    check(bad.parse(info) == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-geometry-span-rejects");
   }
   bad = bottom;
   put(bad.bytes, g0 + 20, UINT32_MAX);
@@ -631,13 +631,13 @@ static void rtas() {
   check(bad.parse(info) == 0, "rtas-index-count-without-indices");
   bad = bottom;
   put(bad.bytes, bottom.header + 28, 5);
-  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-geometry-count-past-shadow");
+  check(bad.parse(info) == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-geometry-count-past-shadow");
   bad = bottom;
   put(bad.bytes, bottom.header + 16, 0);
-  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-magic");
+  check(bad.parse(info) == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-magic");
   bad = bottom;
   put64(bad.bytes, 40, 1);
-  check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-deserialized-size");
+  check(bad.parse(info) == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-deserialized-size");
 
   // Micromap array: packed 2-bit states of 4^level microtriangles.
   auto omm = serialized(2, 1, 0, 96 + 64);
@@ -650,10 +650,10 @@ static void rtas() {
   for (const auto &[at, value] : {std::pair<size_t, uint32_t>{12, 13}, {12, UINT32_MAX}, {16, 15}, {8, 3}, {0, 1}}) {
     bad = omm;
     put(bad.bytes, omm.header + 64 + at, value);
-    check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-omm-rejects");
+    check(bad.parse(info) == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-omm-rejects");
   }
 
-  // OMM bottom level: header, block, one array pointer, then the dxmt header.
+  // OMM bottom level: header, block, one array pointer, then the d3dalloy header.
   auto blocks = serialized(1, 1, 0xffffffff00000001ull, 96 + 64, 24);
   put64(blocks.bytes, 64, 1);
   put(blocks.bytes, blocks.header + 52, 2);
@@ -670,14 +670,14 @@ static void rtas() {
     put64(bad.bytes, at, value);
     if (at == blocks.header + 52)
       put(bad.bytes, at + 4, 0);
-    check(bad.parse(info) == DXMT_RTAS_SERIALIZED_INVALID_DATA, "rtas-blocks-rejects");
+    check(bad.parse(info) == D3DALLOY_RTAS_SERIALIZED_INVALID_DATA, "rtas-blocks-rejects");
   }
   bool untouched = true;
-  DxmtRtasSerializedLayout layout{7, 7, 7, 7};
-  untouched &= dxmt_rtas_serialized_prefix(top.bytes.data(), 55, 1024, &layout) ==
-                   DXMT_RTAS_SERIALIZED_INVALID_ARGUMENT && layout.serialized_size == 7;
-  untouched &= dxmt_rtas_serialized_block(&top.layout, top.bytes.data(), 16, &layout) ==
-                   DXMT_RTAS_SERIALIZED_INVALID_ARGUMENT && layout.header_offset == 7;
+  D3DalloyRtasSerializedLayout layout{7, 7, 7, 7};
+  untouched &= d3dalloy_rtas_serialized_prefix(top.bytes.data(), 55, 1024, &layout) ==
+                   D3DALLOY_RTAS_SERIALIZED_INVALID_ARGUMENT && layout.serialized_size == 7;
+  untouched &= d3dalloy_rtas_serialized_block(&top.layout, top.bytes.data(), 16, &layout) ==
+                   D3DALLOY_RTAS_SERIALIZED_INVALID_ARGUMENT && layout.header_offset == 7;
   check(untouched, "rtas-outputs-untouched");
 }
 
@@ -693,7 +693,7 @@ template <class T> static void subobject(Bytes &stream, uint32_t type, const T &
 }
 
 static void pso_streams() {
-  DxmtPsoStreamLayout layouts[64] = {};
+  D3DalloyPsoStreamLayout layouts[64] = {};
   layouts[0] = {sizeof(void *), alignof(void *)};
   layouts[1] = layouts[6] = {sizeof(D3D12_SHADER_BYTECODE), alignof(D3D12_SHADER_BYTECODE)};
   layouts[9] = {4, 4};
@@ -709,8 +709,8 @@ static void pso_streams() {
   unsigned seen = 0;
   bool walked = true;
   while (offset < stream.size()) {
-    DxmtPsoStreamSubobject next;
-    if (dxmt_pso_stream_next(stream.data(), stream.size(), layouts, offset, defined, &next)) {
+    D3DalloyPsoStreamSubobject next;
+    if (d3dalloy_pso_stream_next(stream.data(), stream.size(), layouts, offset, defined, &next)) {
       walked = false;
       break;
     }
@@ -722,8 +722,8 @@ static void pso_streams() {
   check(walked && seen == 4 && defined == (1u << 0 | 1u << 9 | 1u << 1 | 1u << 15), "pso-stream-walk");
   // The final subobject may end before its pointer-aligned stride.
   auto status = [&](const Bytes &bytes, uint64_t at = 0, uint64_t mask = 0) {
-    DxmtPsoStreamSubobject next;
-    return dxmt_pso_stream_next(bytes.data(), bytes.size(), layouts, at, mask, &next);
+    D3DalloyPsoStreamSubobject next;
+    return d3dalloy_pso_stream_next(bytes.data(), bytes.size(), layouts, at, mask, &next);
   };
   Bytes mask;
   subobject(mask, 9, 0u);
@@ -732,25 +732,25 @@ static void pso_streams() {
   bool truncated = true;
   for (size_t size = 1; size < sizeof(void *) + sizeof(D3D12_SHADER_BYTECODE); ++size) {
     Bytes cut(stream.begin() + 2 * sizeof(void *) + 8, stream.begin() + 2 * sizeof(void *) + 8 + size);
-    truncated &= status(cut) == DXMT_PSO_STREAM_TRUNCATED;
+    truncated &= status(cut) == D3DALLOY_PSO_STREAM_TRUNCATED;
   }
   check(truncated, "pso-stream-truncated-subobject");
   Bytes unknown;
   subobject(unknown, 23, 0u);
-  check(status(unknown) == DXMT_PSO_STREAM_UNKNOWN_TYPE, "pso-stream-unhandled-type");
+  check(status(unknown) == D3DALLOY_PSO_STREAM_UNKNOWN_TYPE, "pso-stream-unhandled-type");
   put(unknown, 0, 64);
-  check(status(unknown) == DXMT_PSO_STREAM_UNKNOWN_TYPE, "pso-stream-type-range");
+  check(status(unknown) == D3DALLOY_PSO_STREAM_UNKNOWN_TYPE, "pso-stream-type-range");
   // Range precedes duplicates, which precede handled type and bounds.
-  check(status(unknown, 0, ~0ull) == DXMT_PSO_STREAM_UNKNOWN_TYPE, "pso-stream-range-before-duplicate");
+  check(status(unknown, 0, ~0ull) == D3DALLOY_PSO_STREAM_UNKNOWN_TYPE, "pso-stream-range-before-duplicate");
   Bytes truncated_duplicate{9, 0, 0, 0};
-  check(status(truncated_duplicate, 0, 1u << 9) == DXMT_PSO_STREAM_DUPLICATE, "pso-stream-duplicate-before-bounds");
+  check(status(truncated_duplicate, 0, 1u << 9) == D3DALLOY_PSO_STREAM_DUPLICATE, "pso-stream-duplicate-before-bounds");
   Bytes rasterizer;
   subobject(rasterizer, 27, D3D12_RASTERIZER_DESC{});
-  check(status(rasterizer, 0, 1u << 10) == DXMT_PSO_STREAM_DUPLICATE && status(rasterizer, 0, 1u << 27) ==
-            DXMT_PSO_STREAM_DUPLICATE && status(rasterizer, 0, 1u << 11) == 0,
+  check(status(rasterizer, 0, 1u << 10) == D3DALLOY_PSO_STREAM_DUPLICATE && status(rasterizer, 0, 1u << 27) ==
+            D3DALLOY_PSO_STREAM_DUPLICATE && status(rasterizer, 0, 1u << 11) == 0,
         "pso-stream-revision-groups");
-  check(status(Bytes{1, 0, 0}) == DXMT_PSO_STREAM_TRUNCATED &&
-            status(stream, stream.size()) == DXMT_PSO_STREAM_INVALID_ARGUMENT,
+  check(status(Bytes{1, 0, 0}) == D3DALLOY_PSO_STREAM_TRUNCATED &&
+            status(stream, stream.size()) == D3DALLOY_PSO_STREAM_INVALID_ARGUMENT,
         "pso-stream-type-word");
 }
 
@@ -790,24 +790,24 @@ static Bytes pe_image(const std::initializer_list<std::pair<const char *, uint32
 
 static void pe_images() {
   const Bytes image = pe_image({{"Data", 0x1180}, {"Forward", 0x1010}, {"Late", 0x11fe}});
-  DxmtPeImage pe{};
+  D3DalloyPeImage pe{};
   uint64_t offset = 0;
   const auto lookup = [&](const Bytes &bytes, const char *name, uint64_t count) {
-    return dxmt_pe_export(bytes.data(), bytes.size(), &pe, name, std::strlen(name), count, &offset);
+    return d3dalloy_pe_export(bytes.data(), bytes.size(), &pe, name, std::strlen(name), count, &offset);
   };
-  check(dxmt_pe_image(image.data(), image.size(), 0x8664, &pe) == 0 && pe.section_count == 1 &&
+  check(d3dalloy_pe_image(image.data(), image.size(), 0x8664, &pe) == 0 && pe.section_count == 1 &&
             pe.name_count == 3 && lookup(image, "Data", 4) == 0 && offset == 0x380,
         "pe-valid-image");
-  check(lookup(image, "Forward", 1) == DXMT_PE_NOT_FOUND && lookup(image, "Late", 2) == 0 &&
-            lookup(image, "Late", 3) == DXMT_PE_NOT_FOUND && lookup(image, "Dat", 1) == DXMT_PE_NOT_FOUND &&
-            lookup(image, "Missing", 1) == DXMT_PE_NOT_FOUND,
+  check(lookup(image, "Forward", 1) == D3DALLOY_PE_NOT_FOUND && lookup(image, "Late", 2) == 0 &&
+            lookup(image, "Late", 3) == D3DALLOY_PE_NOT_FOUND && lookup(image, "Dat", 1) == D3DALLOY_PE_NOT_FOUND &&
+            lookup(image, "Missing", 1) == D3DALLOY_PE_NOT_FOUND,
         "pe-export-lookup");
-  check(dxmt_pe_image(image.data(), image.size(), 0x14c, &pe) == DXMT_PE_UNSUPPORTED &&
-            dxmt_pe_image(image.data(), image.size(), 0xaa64, &pe) == DXMT_PE_UNSUPPORTED,
+  check(d3dalloy_pe_image(image.data(), image.size(), 0x14c, &pe) == D3DALLOY_PE_UNSUPPORTED &&
+            d3dalloy_pe_image(image.data(), image.size(), 0xaa64, &pe) == D3DALLOY_PE_UNSUPPORTED,
         "pe-machine");
   bool truncated = true;
   for (size_t size = 0; size < 0x2c6; ++size)
-    truncated &= dxmt_pe_image(image.data(), size, 0x8664, &pe) == DXMT_PE_UNSUPPORTED;
+    truncated &= d3dalloy_pe_image(image.data(), size, 0x8664, &pe) == D3DALLOY_PE_UNSUPPORTED;
   check(truncated, "pe-truncated-image");
   for (const auto &[at, value] : {std::pair<size_t, uint32_t>{60, 0x80000000u}, {0x84, 0x8664 | 97u << 16},
                                   {0x84, 0x8664}, {0x94, 224}, {0x98 + 108, 0}, {0x98 + 112, 0x1200},
@@ -817,13 +817,13 @@ static void pe_images() {
     put(bad, at, value);
     if (at == 0x40)
       std::memcpy(bad.data() + 0x40, "Wine builtin DLL", 17);
-    check(dxmt_pe_image(bad.data(), bad.size(), 0x8664, &pe) == DXMT_PE_UNSUPPORTED, "pe-header-rejects");
+    check(d3dalloy_pe_image(bad.data(), bad.size(), 0x8664, &pe) == D3DALLOY_PE_UNSUPPORTED, "pe-header-rejects");
   }
-  dxmt_pe_image(image.data(), image.size(), 0x8664, &pe);
+  d3dalloy_pe_image(image.data(), image.size(), 0x8664, &pe);
   auto ordinal = image;
   ordinal[0x2c0] = 3;
-  check(lookup(ordinal, "Data", 4) == DXMT_PE_NOT_FOUND, "pe-ordinal-range");
-  check(dxmt_pe_export(image.data(), image.size(), &pe, "Da\0a", 4, 1, &offset) == DXMT_PE_INVALID_ARGUMENT,
+  check(lookup(ordinal, "Data", 4) == D3DALLOY_PE_NOT_FOUND, "pe-ordinal-range");
+  check(d3dalloy_pe_export(image.data(), image.size(), &pe, "Da\0a", 4, 1, &offset) == D3DALLOY_PE_INVALID_ARGUMENT,
         "pe-name-argument");
 }
 

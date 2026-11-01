@@ -15,7 +15,7 @@
 #include <mutex>
 #include <sstream>
 
-namespace dxmt {
+namespace d3dalloy {
 
 // Only the initial VS/PS/CS SM50Compile calls use this recorder. The bytecode
 // retains the input signature; IA elements below are the exact extracted Metal inputs.
@@ -182,4 +182,4 @@ RecordShaderCompileFailure(const char *stage, D3D12_SHADER_BYTECODE shader,
   return true;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

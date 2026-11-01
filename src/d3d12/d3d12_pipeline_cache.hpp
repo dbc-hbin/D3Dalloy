@@ -12,7 +12,7 @@
 #include <initializer_list>
 #include <string>
 
-namespace dxmt {
+namespace d3dalloy {
 
 // D3D12 device admission requires a Metal 4 compiler; Atomic64 stages select 4.1.
 inline constexpr auto kD3D12ShaderMetalVersion = SM50_SHADER_METAL_400;
@@ -26,7 +26,7 @@ HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Dige
 bool PipelineCacheIdentity(WMTPipelineCacheIdentity &identity);
 /**
  * Key of a single-PSO cache blob, read from its header without validating the payload.
- * E_INVALIDARG: not a DXMT PSO blob. D3D12_ERROR_DRIVER_VERSION_MISMATCH: older/newer blob format.
+ * E_INVALIDARG: not a D3Dalloy PSO blob. D3D12_ERROR_DRIVER_VERSION_MISMATCH: older/newer blob format.
  */
 HRESULT PipelineCacheBlobKey(const void *data, size_t size, Sha1Digest &key);
 HRESULT AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAGS control);
@@ -174,4 +174,4 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

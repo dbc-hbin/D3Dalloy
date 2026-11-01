@@ -1,5 +1,5 @@
 // Final positive-capability smoke: build separately against each untouched public SDK.
-#ifdef DXMT_MATRIX_RETIRED_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_RETIRED_SDK_HEADER
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -12,7 +12,7 @@
 #undef MIDL_INTERFACE
 #define MIDL_INTERFACE(value) struct __declspec(uuid(value))
 #endif
-#include DXMT_MATRIX_RETIRED_SDK_HEADER
+#include D3DALLOY_MATRIX_RETIRED_SDK_HEADER
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstdlib>
@@ -24,11 +24,11 @@ static void check(HRESULT hr,const char *step) {
 static void require(bool value,const char *step){if(!value)check(E_FAIL,step);}
 static_assert(sizeof(D3D12_FEATURE_DATA_WAVE_MMA)==32);
 #else
-#ifndef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifndef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
 #error Build with an untouched pinned public SDK header.
 #endif
 // Reuse the established single-conversion exact GPU readback, not the full runtime suite.
-#define DXMT_MATRIX_RUNTIME_NO_MAIN
+#define D3DALLOY_MATRIX_RUNTIME_NO_MAIN
 #include "owned-d3d12-matrix-runtime.cpp"
 #endif
 
@@ -42,7 +42,7 @@ int main() {
   D3D12_FEATURE_DATA_D3D12_OPTIONS9 options{};
   check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9,&options,sizeof(options)),"OPTIONS9");
   require(options.WaveMMATier==D3D12_WAVE_MMA_TIER_1_0,"positive WaveMMATier");
-#ifdef DXMT_MATRIX_RETIRED_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_RETIRED_SDK_HEADER
   for(UINT input=1;input<=3;++input)for(UINT m=1;m<=2;++m)for(UINT n=1;n<=2;++n) {
     D3D12_FEATURE_DATA_WAVE_MMA query{};
     query.InputDataType=D3D12_WAVE_MMA_INPUT_DATATYPE(input);

@@ -6,7 +6,7 @@
 #include "sha1/sha1_util.hpp"
 #include <mutex>
 
-namespace dxmt {
+namespace d3dalloy {
 
 SM50_SHADER_FLAG
 getGlobalShaderFlag() {
@@ -30,7 +30,7 @@ public:
       : CompiledShader(), proc(std::forward<Proc>(proc)), func_name(func_name), device_(pDevice),
         shader_(shader), variant_digest_(variant_digest) {
     sm50_common.type = SM50_SHADER_COMMON;
-    sm50_common.metal_version = (SM50_SHADER_METAL_VERSION)pDevice->GetDXMTDevice().metalVersion();
+    sm50_common.metal_version = (SM50_SHADER_METAL_VERSION)pDevice->GetD3DalloyDevice().metalVersion();
     sm50_common.flags = getGlobalShaderFlag();
     sm50_common.next = nullptr;
   }
@@ -441,4 +441,4 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
       pDevice, shader, std::move(proc), func_name, variant_digest);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

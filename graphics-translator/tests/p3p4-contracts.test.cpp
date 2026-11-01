@@ -11,7 +11,7 @@
 #include <limits>
 
 int main() {
-  using namespace dxmt::resource_contract;
+  using namespace d3dalloy::resource_contract;
   FootprintLayout layout;
   uint32_t footprint_checks = 0;
   for (const uint32_t bytes : {1u, 2u, 4u, 8u, 12u, 16u}) {

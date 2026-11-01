@@ -18,7 +18,7 @@
 
 using namespace llvm;
 
-namespace dxmt::msaa {
+namespace d3dalloy::msaa {
 namespace {
 
 Error invalid(const char *message) {
@@ -337,8 +337,8 @@ constexpr unsigned kConservativeClipVectors = 6;
 
 /*
  * Conservative triangle replay (SM50_SHADER_D3D12_CONSERVATIVE_RASTER). `encoded` = 16 * slot + corner of a
- * 24-word slot (18 fan corners, then the 3 original ordinals in D3D order). dxmt.conservative.corner returns the
- * affine plane weights of the corner and dxmt.conservative.corner_position its clip position
+ * 24-word slot (18 fan corners, then the 3 original ordinals in D3D order). d3dalloy.conservative.corner returns the
+ * affine plane weights of the corner and d3dalloy.conservative.corner_position its clip position
  * (air_conservative.metal); every other output is the affine combination of the three captured outputs, so
  * perspective-correct native interpolation is the exact plane extrapolation. Flat and integral outputs keep the
  * leading vertex. The primitive's clip positions, clip distances and flags are flat
@@ -427,9 +427,9 @@ Value *expandedConservative(IRBuilder<> &b, Value *encoded, Value *records, Valu
                                        false);
   Value *cornerFlags = b.CreateOr(corner, b.getInt32(options.depth_clip_enable ? 16u : 0u));
   cornerFlags = b.CreateOr(cornerFlags, b.getInt32(options.front_counter_clockwise ? 32u : 0u));
-  Value *weights = b.CreateCall(module.getOrInsertFunction("dxmt.conservative.corner", cornerType),
+  Value *weights = b.CreateCall(module.getOrInsertFunction("d3dalloy.conservative.corner", cornerType),
                                 {p[0], p[1], p[2], viewportRect, cornerFlags});
-  Value *cornerPosition = b.CreateCall(module.getOrInsertFunction("dxmt.conservative.corner_position", cornerType),
+  Value *cornerPosition = b.CreateCall(module.getOrInsertFunction("d3dalloy.conservative.corner_position", cornerType),
                                        {p[0], p[1], p[2], viewportRect, cornerFlags});
   Value *valid = b.CreateAnd(b.CreateNot(culled),
     b.CreateFCmpOEQ(component(b, weights, 3), ConstantFP::get(b.getFloatTy(), 1)));
@@ -577,9 +577,9 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     if (kind->getString() == "air.position") positionField = i;
     if (kind->getString() == "air.vertex_output") {
       auto *name = field->getNumOperands() > 1 ? dyn_cast<MDString>(field->getOperand(1)) : nullptr;
-      if (name && name->getString() == "user(dxmt_primitive_id)")
+      if (name && name->getString() == "user(d3dalloy_primitive_id)")
         layout.primitive_id_offset_dwords = uint32_t(offset / 4);
-      if (name && name->getString() == "user(dxmt_shading_rate)")
+      if (name && name->getString() == "user(d3dalloy_shading_rate)")
         layout.shading_rate_offset_dwords = uint32_t(offset / 4);
 
       if (!name || !name->getString().startswith("user(") || layout.user_count == 128)
@@ -928,4 +928,4 @@ Error transformVertex(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &
   return invalid("unknown vertex variant");
 }
 
-} // namespace dxmt::msaa
+} // namespace d3dalloy::msaa

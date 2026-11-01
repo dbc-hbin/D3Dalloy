@@ -4,7 +4,7 @@
 #include <limits>
 
 int main() {
-  using namespace dxmt::atomic64;
+  using namespace d3dalloy::atomic64;
   CanonicalCellMap cells;
   const CanonicalOwner buffer{CanonicalKind::Buffer, 41, 0};
   const CanonicalOwner placed{CanonicalKind::HeapBytes, 9, 0};

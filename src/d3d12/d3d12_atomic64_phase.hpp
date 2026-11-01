@@ -3,13 +3,13 @@
 #include "d3d12.h"
 #include "com/com_pointer.hpp"
 #include "Metal4.hpp"
-#include "dxmt_buffer.hpp"
-#include "dxmt_texture.hpp"
+#include "d3dalloy_buffer.hpp"
+#include "d3dalloy_texture.hpp"
 #include <memory>
 #include <span>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 class MTLD3D12Device;
 class MTLD3D12Resource;
 struct StandardSwizzleTableUse;
@@ -85,4 +85,4 @@ private:
 
 HRESULT PrepareAtomic64Phase(MTLD3D12Device *device, uint64_t participant_bound,
     const Atomic64PhaseBindings &bindings, std::shared_ptr<Atomic64Phase> &phase);
-} // namespace dxmt
+} // namespace d3dalloy

@@ -5,7 +5,7 @@
 #include <cstring>
 #include <limits>
 
-namespace dxmt::raytracing {
+namespace d3dalloy::raytracing {
 namespace {
 
 constexpr uint32_t kMetalUsageRefit = 1u;
@@ -489,7 +489,7 @@ bool IsCompatibleUpdate(const StructureInfo &source, const BuildInputs &inputs, 
 
 D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER DriverMatchingIdentifier(uint64_t registryID) {
   D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER result{};
-  const GUID driver = {0x44584d54, 0x4153, 0x5348, {0x41, 0x44, 0x4f, 0x57, 0x44, 0x58, 0x52, 1}};
+  const GUID driver = {0x4433414c, 0x4153, 0x5348, {0x41, 0x44, 0x4f, 0x57, 0x44, 0x58, 0x52, 1}};
   result.DriverOpaqueGUID = driver;
   memcpy(result.DriverOpaqueVersioningData, &registryID, 8);
   const uint64_t version = kSerializedVersion;
@@ -512,14 +512,14 @@ D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS CheckDriverMatchingIdentifier(uint64_t r
 }
 
 HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER &serialized,
-    const DxmtRtasSerializedLayout &layout, const AccelerationStructureHeader &header, const uint8_t *geometryData,
+    const D3DalloyRtasSerializedLayout &layout, const AccelerationStructureHeader &header, const uint8_t *geometryData,
     uint64_t geometryBytes, uint64_t registryID, const BufferLocation &destination, DeserializedStructure &result) {
   if (CheckDriverMatchingIdentifier(registryID, D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE,
           &serialized.DriverMatchingIdentifier) != D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE)
     return E_INVALIDARG;
-  DxmtRtasSerializedInfo info;
-  if (dxmt_rtas_serialized_parse(&serialized, sizeof(serialized), &layout, &header, sizeof(header), geometryData,
-          geometryBytes, destination.available, &info) != DXMT_RTAS_SERIALIZED_SUCCESS)
+  D3DalloyRtasSerializedInfo info;
+  if (d3dalloy_rtas_serialized_parse(&serialized, sizeof(serialized), &layout, &header, sizeof(header), geometryData,
+          geometryBytes, destination.available, &info) != D3DALLOY_RTAS_SERIALIZED_SUCCESS)
     return E_INVALIDARG;
   result = {};
   result.shadowSize = info.shadow_size;
@@ -530,7 +530,7 @@ HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE
   inputs.flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(info.flags & ~D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE);
   inputs.metalUsage = Usage(inputs.flags);
   // Spans were bounded by the shadow copy the deserialization writes at `destination`.
-  auto location = [&](const DxmtRtasSpan &span) {
+  auto location = [&](const D3DalloyRtasSpan &span) {
     return BufferLocation{destination.buffer, destination.offset + span.offset, span.size,
                           destination.allocationIdentity, destination.address + span.offset};
   };
@@ -550,8 +550,8 @@ HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE
     return S_OK;
   for (uint32_t i = 0; i < info.desc_count; ++i) {
     const ShadowGeometry &record = result.geometries[i];
-    DxmtRtasSerializedGeometry spans;
-    if (dxmt_rtas_serialized_geometry(&info, geometryData, geometryBytes, i, &spans) != DXMT_RTAS_SERIALIZED_SUCCESS)
+    D3DalloyRtasSerializedGeometry spans;
+    if (d3dalloy_rtas_serialized_geometry(&info, geometryData, geometryBytes, i, &spans) != D3DALLOY_RTAS_SERIALIZED_SUCCESS)
       return E_INVALIDARG;
     Geometry geometry{};
     geometry.type = D3D12_RAYTRACING_GEOMETRY_TYPE(record.type);
@@ -569,7 +569,7 @@ HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE
         return E_INVALIDARG;
       geometry.vertexFormat = format->metal;
       geometry.positionSize = format->positionSize;
-      if (spans.present & DXMT_RTAS_GEOMETRY_INDICES)
+      if (spans.present & D3DALLOY_RTAS_GEOMETRY_INDICES)
         geometry.indices = location(spans.indices);
       // Shadow index elements use a 4-byte stride; R16 is packed by the GPU deserialize kernel.
       if (geometry.indexFormat == DXGI_FORMAT_R16_UINT)
@@ -579,16 +579,16 @@ HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE
         geometry.ommIndexBytes = record.ommIndexBytes;
         geometry.ommIndexStride = record.ommIndexStride;
         geometry.ommBase = record.ommBase;
-        if (spans.present & DXMT_RTAS_GEOMETRY_OMM_INDICES)
+        if (spans.present & D3DALLOY_RTAS_GEOMETRY_OMM_INDICES)
           geometry.ommIndices = location(spans.omm_indices);
       }
     }
     geometry.verticesOrBoxes = location(spans.data);
-    if (spans.present & DXMT_RTAS_GEOMETRY_TRANSFORM)
+    if (spans.present & D3DALLOY_RTAS_GEOMETRY_TRANSFORM)
       geometry.transform = location(spans.transform);
     inputs.geometries.push_back(geometry);
   }
   return S_OK;
 }
 
-} // namespace dxmt::raytracing
+} // namespace d3dalloy::raytracing

@@ -6,7 +6,7 @@
 #include <limits>
 #include <type_traits>
 
-namespace dxmt {
+namespace d3dalloy {
 
 // Compatibility advertising, not physical dedicated VRAM or a Windows carveout.
 // R is OS-accessible RAM; Metal's dynamic budget remains independent of this.
@@ -25,4 +25,4 @@ constexpr Size advertisedDedicatedVideoMemory(bool unified, uint64_t recommended
   return static_cast<Size>(std::min({recommended, graphics, uint64_t{std::numeric_limits<Size>::max()}}));
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

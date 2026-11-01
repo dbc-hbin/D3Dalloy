@@ -16,7 +16,7 @@
 #include <functional>
 #include "./sha1.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 struct Sha1Digest {
   uint8_t data[20];
@@ -59,12 +59,12 @@ private:
   _SHA1_CTX ctx;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy
 
 namespace std {
-template <> struct hash<dxmt::Sha1Digest> {
+template <> struct hash<d3dalloy::Sha1Digest> {
   size_t
-  operator()(const dxmt::Sha1Digest &v) const noexcept {
+  operator()(const d3dalloy::Sha1Digest &v) const noexcept {
     std::hash<std::string_view> h;
     return h(std::string_view({reinterpret_cast<const char *>(v.data), sizeof(v)}));
   };

@@ -2,7 +2,7 @@
 #include <cstdint>
 #include "llvm/Support/Error.h"
 namespace llvm { class Module; class CallInst; }
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 struct ModuleInfo;
 // Pinned DXC v1.8.2306-preview WaveMatrix and v1.10.2605.37 LinAlg are
 // distinct contracts. Final LinAlg uses the published 322..342 signatures.

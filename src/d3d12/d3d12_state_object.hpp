@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 /*
  * D3D12 ray tracing state objects.
@@ -91,7 +91,7 @@ static_assert(offsetof(OwnedShaderIdentifier, export_index) == 12);
 static_assert(offsetof(OwnedShaderIdentifier, flags) == 16);
 static_assert(offsetof(OwnedShaderIdentifier, reserved) == 24);
 
-inline constexpr uint32_t kOwnedShaderIdentifierMagic = 0x544D5844; // 'DXMT'
+inline constexpr uint32_t kOwnedShaderIdentifierMagic = 0x4c413344; // 'D3AL'
 inline constexpr uint16_t kOwnedShaderIdentifierVersion = 1;
 
 class MTLD3D12StateObject : public ID3D12StateObject {
@@ -237,4 +237,4 @@ HRESULT AddToStateObject(
     void **state_object
 );
 
-} // namespace dxmt
+} // namespace d3dalloy

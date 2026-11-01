@@ -3,7 +3,7 @@
 #include "dxgiformat.h"
 #include <cstdint>
 
-namespace dxmt::resource_contract {
+namespace d3dalloy::resource_contract {
 
 enum class EmulatedTextureStorage : uint8_t {
   None,
@@ -65,24 +65,24 @@ enum class FormatFamily : uint8_t {
 inline FormatFamily
 GetFormatFamily(DXGI_FORMAT format) {
   switch (format) {
-#define DXMT_FORMAT_FAMILY_CASE(name) case DXGI_FORMAT_##name##_TYPELESS: case DXGI_FORMAT_##name##_FLOAT: \
+#define D3DALLOY_FORMAT_FAMILY_CASE(name) case DXGI_FORMAT_##name##_TYPELESS: case DXGI_FORMAT_##name##_FLOAT: \
   case DXGI_FORMAT_##name##_UINT: case DXGI_FORMAT_##name##_SINT: return FormatFamily::name
-  DXMT_FORMAT_FAMILY_CASE(R32G32B32A32);
-  DXMT_FORMAT_FAMILY_CASE(R32G32B32);
-  DXMT_FORMAT_FAMILY_CASE(R32G32);
-#undef DXMT_FORMAT_FAMILY_CASE
-#define DXMT_FORMAT_FAMILY_CASE(name) case DXGI_FORMAT_##name##_TYPELESS: case DXGI_FORMAT_##name##_FLOAT: \
+  D3DALLOY_FORMAT_FAMILY_CASE(R32G32B32A32);
+  D3DALLOY_FORMAT_FAMILY_CASE(R32G32B32);
+  D3DALLOY_FORMAT_FAMILY_CASE(R32G32);
+#undef D3DALLOY_FORMAT_FAMILY_CASE
+#define D3DALLOY_FORMAT_FAMILY_CASE(name) case DXGI_FORMAT_##name##_TYPELESS: case DXGI_FORMAT_##name##_FLOAT: \
   case DXGI_FORMAT_##name##_UNORM: case DXGI_FORMAT_##name##_UINT: case DXGI_FORMAT_##name##_SNORM: \
   case DXGI_FORMAT_##name##_SINT: return FormatFamily::name
-  DXMT_FORMAT_FAMILY_CASE(R16G16B16A16);
-  DXMT_FORMAT_FAMILY_CASE(R16G16);
-  DXMT_FORMAT_FAMILY_CASE(R16);
-#undef DXMT_FORMAT_FAMILY_CASE
-#define DXMT_FORMAT_FAMILY_CASE(name) case DXGI_FORMAT_##name##_TYPELESS: case DXGI_FORMAT_##name##_UNORM: \
+  D3DALLOY_FORMAT_FAMILY_CASE(R16G16B16A16);
+  D3DALLOY_FORMAT_FAMILY_CASE(R16G16);
+  D3DALLOY_FORMAT_FAMILY_CASE(R16);
+#undef D3DALLOY_FORMAT_FAMILY_CASE
+#define D3DALLOY_FORMAT_FAMILY_CASE(name) case DXGI_FORMAT_##name##_TYPELESS: case DXGI_FORMAT_##name##_UNORM: \
   case DXGI_FORMAT_##name##_UNORM_SRGB: case DXGI_FORMAT_##name##_UINT: case DXGI_FORMAT_##name##_SNORM: \
   case DXGI_FORMAT_##name##_SINT: return FormatFamily::name
-  DXMT_FORMAT_FAMILY_CASE(R8G8B8A8);
-#undef DXMT_FORMAT_FAMILY_CASE
+  D3DALLOY_FORMAT_FAMILY_CASE(R8G8B8A8);
+#undef D3DALLOY_FORMAT_FAMILY_CASE
   case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: return FormatFamily::R10G10B10A2;
   case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R8G8_SINT: return FormatFamily::R8G8;
   case DXGI_FORMAT_D16_UNORM: return FormatFamily::R16;
@@ -92,9 +92,9 @@ GetFormatFamily(DXGI_FORMAT format) {
   case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT:
   case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: case DXGI_FORMAT_X24_TYPELESS_G8_UINT: return FormatFamily::R24G8;
   case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_R8_SINT: return FormatFamily::R8;
-#define DXMT_BC_FAMILY(n) case DXGI_FORMAT_BC##n##_TYPELESS: case DXGI_FORMAT_BC##n##_UNORM: case DXGI_FORMAT_BC##n##_UNORM_SRGB: return FormatFamily::BC##n
-  DXMT_BC_FAMILY(1); DXMT_BC_FAMILY(2); DXMT_BC_FAMILY(3); DXMT_BC_FAMILY(7);
-#undef DXMT_BC_FAMILY
+#define D3DALLOY_BC_FAMILY(n) case DXGI_FORMAT_BC##n##_TYPELESS: case DXGI_FORMAT_BC##n##_UNORM: case DXGI_FORMAT_BC##n##_UNORM_SRGB: return FormatFamily::BC##n
+  D3DALLOY_BC_FAMILY(1); D3DALLOY_BC_FAMILY(2); D3DALLOY_BC_FAMILY(3); D3DALLOY_BC_FAMILY(7);
+#undef D3DALLOY_BC_FAMILY
   case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM: return FormatFamily::BC4;
   case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM: return FormatFamily::BC5;
   case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16: return FormatFamily::BC6H;
@@ -199,4 +199,4 @@ ValidateFootprintRange(
   return RangeFits(offset, required, buffer_size);
 }
 
-} // namespace dxmt::resource_contract
+} // namespace d3dalloy::resource_contract

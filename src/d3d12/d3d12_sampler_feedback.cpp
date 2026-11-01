@@ -28,7 +28,7 @@
 #include "com/com_pointer.hpp"
 #include <new>
 
-namespace dxmt {
+namespace d3dalloy {
 
 namespace {
 
@@ -219,4 +219,4 @@ CreateSamplerFeedbackMap(MTLD3D12Device *pDevice, const D3D12_HEAP_PROPERTIES &H
   return resource->QueryInterface(riid, ppResource);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

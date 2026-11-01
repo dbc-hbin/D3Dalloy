@@ -1,10 +1,10 @@
-// GPU proof that the owned DXMT metallib writer emits a library Metal accepts
+// GPU proof that the owned D3Dalloy metallib writer emits a library Metal accepts
 // and executes.
 //
 // The input is the AIR contract fixture graphics-translator/tests/owned-metallib-rt.metal,
 // produced by the public Metal frontend. The production DXIL path never invokes
 // that frontend; the serialized library under test is emitted by our own
-// dxmt::metallib::MetallibWriter. Both rays are run on a real device with Metal
+// d3dalloy::metallib::MetallibWriter. Both rays are run on a real device with Metal
 // API and GPU validation enabled.
 //
 // This is a contract proof, not a smoke test: both rays must read back exact
@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
   }
   llvm::SmallVector<char, 0> libraryBytes;
   llvm::raw_svector_ostream stream(libraryBytes);
-  dxmt::metallib::MetallibWriter writer;
+  d3dalloy::metallib::MetallibWriter writer;
   if (auto error = writer.Write(*module, stream)) {
     llvm::logAllUnhandledErrors(std::move(error), llvm::errs(), "OWNED_RT_FAIL serialize: ");
     return 3;

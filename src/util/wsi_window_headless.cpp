@@ -14,7 +14,7 @@
 #include "util_string.hpp"
 #include "log/log.hpp"
 
-namespace dxmt::wsi {
+namespace d3dalloy::wsi {
 
 void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
   if (pWidth)
@@ -24,7 +24,7 @@ void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
     *pHeight = 1024;
 }
 
-bool resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
+bool resizeWindow(HWND hWindow, D3DalloyWindowState *pState, uint32_t width,
                   uint32_t height) {
   return true;
 }
@@ -34,12 +34,12 @@ bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
 }
 
 bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
-                         DXMTWindowState *pState,
+                         D3DalloyWindowState *pState,
                          [[maybe_unused]] bool modeSwitch) {
   return false;
 }
 
-bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
+bool leaveFullscreenMode(HWND hWindow, D3DalloyWindowState *pState,
                          bool restoreCoordinates) {
   return false;
 }
@@ -63,4 +63,4 @@ bool isForeground(HWND hWindow) { return true; }
 
 bool isMinimized(HWND hWindow) { return false; }
 
-} // namespace dxmt::wsi
+} // namespace d3dalloy::wsi

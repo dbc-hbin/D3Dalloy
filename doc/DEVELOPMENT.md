@@ -53,7 +53,7 @@ For clangd, select the actual Meson compilation database, such as `--compile-com
 
 ## Verification and debugging
 
-Prefer the fixture runner's `--validation` for Metal API and shader validation. Use `--api-validation` only for the justified cases documented in SMOKE. The runner sanitizes inherited DXMT/DYLD injection state and assigns private logs/caches; environment overrides outside that policy are not reliable.
+Prefer the fixture runner's `--validation` for Metal API and shader validation. Use `--api-validation` only for the justified cases documented in SMOKE. The runner sanitizes inherited D3Dalloy/DYLD injection state and assigns private logs/caches; environment overrides outside that policy are not reliable.
 
 For a separate private manual session:
 
@@ -61,10 +61,10 @@ For a separate private manual session:
 | --- | --- |
 | `MTL_DEBUG_LAYER=1` | Metal API validation |
 | `MTL_SHADER_VALIDATION=1` plus `MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1`, `MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1` | Shader faults |
-| `DXMT_LOG_LEVEL`, `DXMT_LOG_PATH` | Logging threshold and separate module logs |
+| `D3DALLOY_LOG_LEVEL`, `D3DALLOY_LOG_PATH` | Logging threshold and separate module logs |
 | `OWNED_GRAPHICS_TRACE=1` | D3D12 lifecycle trace; see [configuration](CUSTOMIZATION.md#diagnostics-are-separate-from-configuration-keys) |
-| `MTL_CAPTURE_ENABLED=1`, `DXMT_CAPTURE_EXECUTABLE` | Executable-scoped capture where the backend supports it; shared classic `DXMT_CAPTURE_FRAME` is not proof of D3D12 Metal 4 capture |
-| `DXMT_SHADER_CACHE=0`, `DXMT_SHADER_CACHE_PATH` | Shared internal shader cache, not application `ID3D12ShaderCacheSession` |
+| `MTL_CAPTURE_ENABLED=1`, `D3DALLOY_CAPTURE_EXECUTABLE` | Executable-scoped capture where the backend supports it; shared classic `D3DALLOY_CAPTURE_FRAME` is not proof of D3D12 Metal 4 capture |
+| `D3DALLOY_SHADER_CACHE=0`, `D3DALLOY_SHADER_CACHE_PATH` | Shared internal shader cache, not application `ID3D12ShaderCacheSession` |
 
 Capture and shader-instrumented validation are separate runs. Keep stderr and per-module logs; clean stderr cannot override a backend error. FG's universal observer is test-only, audited input, not product telemetry; preserve unmeasured zero timestamps and do not equate GPU readback with physical display cadence. Use SMOKE's current fixture/observer commands rather than duplicating them here.
 

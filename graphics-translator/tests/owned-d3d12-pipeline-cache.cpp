@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -27,7 +28,7 @@ namespace {
 void check(HRESULT hr,const char *step) { if(FAILED(hr))fail(step,hr); }
 
 std::vector<uint8_t> readFile(const wchar_t *path) {
-  HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+  HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
   if(file==INVALID_HANDLE_VALUE)fail("open shader",HRESULT_FROM_WIN32(GetLastError()));
   LARGE_INTEGER size{};
   if(!GetFileSizeEx(file,&size)||size.QuadPart<=0||size.QuadPart>16*1024*1024)fail("shader size");
@@ -125,27 +126,52 @@ std::wstring cacheFile(ID3D12PipelineState *pso,const char *label) {
   ComPtr<ID3DBlob> blob;check(pso->GetCachedBlob(&blob),"automatic export");
   wchar_t temp[32768];if(!GetTempPathW(32768,temp))fail("cache temp path");
   const std::wstring base=std::wstring(temp)+L"d3dalloy-shader-sessions\\";
-  WIN32_FIND_DATAW directory{};HANDLE dirs=FindFirstFileW((base+L"*").c_str(),&directory);
-  if(dirs==INVALID_HANDLE_VALUE)fail("automatic directory missing");
-  std::wstring result;
-  do {
-    if(!(directory.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||directory.cFileName[0]==L'.')continue;
-    const auto path=base+directory.cFileName+L"\\";
-    WIN32_FIND_DATAW entry{};HANDLE files=FindFirstFileW((path+L"d3dalloy-pso-*.bin").c_str(),&entry);
-    if(files==INVALID_HANDLE_VALUE)continue;
+  constexpr wchar_t prefix[]=L"d3dalloy-pso-";
+  // PSO completion publishes to RAM; a separate worker atomically renames the disk blob.
+  // Arm before scanning so publication between the scan and wait cannot be missed.
+  const ULONGLONG started=GetTickCount64();
+  for(;;) {
+    std::vector<HANDLE> changes;
+    auto watch=[&](const std::wstring &path) {
+      HANDLE event=FindFirstChangeNotificationW(path.c_str(),FALSE,
+          FILE_NOTIFY_CHANGE_FILE_NAME|FILE_NOTIFY_CHANGE_SIZE|FILE_NOTIFY_CHANGE_LAST_WRITE);
+      if(event==INVALID_HANDLE_VALUE)fail("automatic directory event");
+      changes.push_back(event);
+    };
+    auto closeChanges=[&] {for(HANDLE event:changes)FindCloseChangeNotification(event);};
+    watch(base);
+    WIN32_FIND_DATAW directory{};HANDLE dirs=FindFirstFileW((base+L"*").c_str(),&directory);
+    if(dirs==INVALID_HANDLE_VALUE){closeChanges();fail("automatic directory missing");}
+    std::wstring result;
     do {
-      if(entry.nFileSizeHigh||entry.nFileSizeLow!=blob->GetBufferSize())continue;
-      const auto bytes=readFile((path+entry.cFileName).c_str());
-      if(!memcmp(bytes.data(),blob->GetBufferPointer(),bytes.size())) {
-        if(!result.empty())fail("ambiguous automatic cache entry");
-        result=path+entry.cFileName;
-        std::printf("OWNED_D3D12_PIPELINE_CACHE_KEY case=%s key=%ls\n",label,
-                    std::wstring(entry.cFileName+9,40).c_str());
-      }
-    } while(FindNextFileW(files,&entry));
-    FindClose(files);
-  } while(FindNextFileW(dirs,&directory));
-  FindClose(dirs);if(result.empty())fail("automatic blob not persisted");return result;
+      if(!(directory.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||directory.cFileName[0]==L'.')continue;
+      const auto path=base+directory.cFileName+L"\\";
+      // Subscribe to each session before scanning its files, without relying on
+      // recursive directory notification support.
+      watch(path);
+      WIN32_FIND_DATAW entry{};HANDLE files=FindFirstFileW((path+prefix+L"*.bin").c_str(),&entry);
+      if(files==INVALID_HANDLE_VALUE)continue;
+      do {
+        if(entry.nFileSizeHigh||entry.nFileSizeLow!=blob->GetBufferSize())continue;
+        const auto bytes=readFile((path+entry.cFileName).c_str());
+        if(!memcmp(bytes.data(),blob->GetBufferPointer(),bytes.size())) {
+          if(!result.empty())fail("ambiguous automatic cache entry");
+          result=path+entry.cFileName;
+          std::printf("OWNED_D3D12_PIPELINE_CACHE_KEY case=%s key=%ls\n",label,
+                      std::wstring(entry.cFileName+std::size(prefix)-1,40).c_str());
+        }
+      } while(FindNextFileW(files,&entry));
+      FindClose(files);
+    } while(FindNextFileW(dirs,&directory));
+    FindClose(dirs);
+    if(!result.empty()){closeChanges();return result;}
+    const ULONGLONG elapsed=GetTickCount64()-started;
+    if(changes.size()>MAXIMUM_WAIT_OBJECTS){closeChanges();fail("too many automatic cache directories");}
+    const DWORD waited=elapsed>=15000?WAIT_TIMEOUT:
+        WaitForMultipleObjects(DWORD(changes.size()),changes.data(),FALSE,DWORD(15000-elapsed));
+    closeChanges();
+    if(waited>=WAIT_OBJECT_0+changes.size())fail("automatic blob not persisted");
+  }
 }
 
 void writeFile(const std::wstring &path,const std::vector<uint8_t> &bytes) {
@@ -173,7 +199,7 @@ constexpr uint32_t kMutationCacheVersion=7;
 
 size_t cacheLibrarySize(const std::vector<uint8_t> &bytes) {
   // Mutate only a validated single-stage export; unknown wire revisions fail closed.
-  if(bytes.size()<sizeof(CacheMutationHeader)||memcmp(bytes.data(),"DXMTPSO",8))fail("mutation cache magic/header");
+  if(bytes.size()<sizeof(CacheMutationHeader)||memcmp(bytes.data(),"D3ALPSO",8))fail("mutation cache magic/header");
   CacheMutationHeader header{};memcpy(&header,bytes.data(),sizeof(header));
   const uint32_t stages=header.stages;
   if(header.version!=kMutationCacheVersion||header.size!=bytes.size()||!stages||(stages&(stages-1))||(stages&~7u))
@@ -218,14 +244,14 @@ void child(const wchar_t *first,const wchar_t *second,const wchar_t *mode) {
   std::wstring command=L"\""+std::wstring(executable)+L"\" \""+first+L"\" \""+second+L"\" "+mode;
   STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION process{};
   std::fflush(stdout);std::fflush(stderr);
-  char logPath[32768];const DWORD length=GetEnvironmentVariableA("DXMT_LOG_PATH",logPath,sizeof(logPath));
+  char logPath[32768];const DWORD length=GetEnvironmentVariableA("D3DALLOY_LOG_PATH",logPath,sizeof(logPath));
   if(!length||length>=sizeof(logPath))fail("child log path");
   const std::string childLog=std::string(logPath)+"/pipeline-cache-"+std::string(mode+2,mode+wcslen(mode));
   // Set the inherited environment before DLL static initialization opens the log.
-  if(!SetEnvironmentVariableA("DXMT_LOG_PATH",childLog.c_str()))fail("child log environment");
+  if(!SetEnvironmentVariableA("D3DALLOY_LOG_PATH",childLog.c_str()))fail("child log environment");
   const bool spawned=CreateProcessW(executable,command.data(),nullptr,nullptr,TRUE,0,nullptr,nullptr,&startup,&process);
   const DWORD spawnError=GetLastError();
-  if(!SetEnvironmentVariableA("DXMT_LOG_PATH",logPath))fail("restore parent log environment");
+  if(!SetEnvironmentVariableA("D3DALLOY_LOG_PATH",logPath))fail("restore parent log environment");
   if(!spawned)
     fail("cache child create",HRESULT_FROM_WIN32(spawnError));
   const DWORD waited=WaitForSingleObject(process.hProcess,120000);DWORD code=1;
@@ -337,16 +363,19 @@ void automatic(ID3D12Device9 *device,D3D12_COMPUTE_PIPELINE_STATE_DESC desc,
     if(readFile(path.c_str())==changed)fail("ignored entry not rebuilt");
   }
   std::puts("OWNED_D3D12_PIPELINE_CACHE_CASE_PASS disk_restore_invalid_rebuild");
-  auto concurrentRoot=rootSignature(device,4);auto shared=desc;shared.pRootSignature=concurrentRoot.Get();
+  // Keep the device-local native artifact cache cold without clearing earlier automatic keys.
+  ComPtr<ID3D12Device> concurrentDevice;
+  check(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&concurrentDevice)),"concurrent device");
+  auto concurrentRoot=rootSignature(concurrentDevice.Get(),4);auto shared=desc;shared.pRootSignature=concurrentRoot.Get();
   std::barrier start(8);std::vector<std::thread> threads;ComPtr<ID3D12PipelineState> psos[8];HRESULT results[8]{};
   std::fprintf(stderr, "OWNED_D3D12_PIPELINE_CACHE_ARTIFACT_PHASE begin=concurrent_distinct_compute\n");std::fflush(stderr);
   for(unsigned i=0;i<8;++i)threads.emplace_back([&,i]{auto entry=shared;entry.NodeMask=i&1u;start.arrive_and_wait();
-    results[i]=device->CreateComputePipelineState(&entry,IID_PPV_ARGS(&psos[i]));});
+    results[i]=concurrentDevice->CreateComputePipelineState(&entry,IID_PPV_ARGS(&psos[i]));});
   for(auto &thread:threads)thread.join();
   std::fprintf(stderr, "OWNED_D3D12_PIPELINE_CACHE_ARTIFACT_PHASE end=concurrent_distinct_compute air=1 libraries_max=1\n");std::fflush(stderr);
   for(unsigned i=0;i<8;++i){check(results[i],"concurrent ordinary create");if(!psos[i])fail("concurrent output");
     char label[32];std::snprintf(label,sizeof(label),"concurrent_%u",i);
-    gpuValue(device,psos[i].Get(),concurrentRoot.Get(),0x31415926u+0x135u,label);}
+    gpuValue(concurrentDevice.Get(),psos[i].Get(),concurrentRoot.Get(),0x31415926u+0x135u,label);}
   cacheFile(psos[0].Get(),"concurrent");
   std::puts("OWNED_D3D12_PIPELINE_CACHE_CASE_PASS concurrent_single_producer");
   child(first,second,L"--failure");child(first,second,L"--control");

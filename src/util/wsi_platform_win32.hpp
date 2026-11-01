@@ -12,15 +12,15 @@
 
 #include <windows.h>
 
-namespace dxmt::wsi {
+namespace d3dalloy::wsi {
 
 /**
  * \brief Impl-dependent state
  */
-struct DXMTWindowState {
+struct D3DalloyWindowState {
   LONG style = 0;
   LONG exstyle = 0;
   RECT rect = {0, 0, 0, 0};
 };
 
-} // namespace dxmt::wsi
+} // namespace d3dalloy::wsi

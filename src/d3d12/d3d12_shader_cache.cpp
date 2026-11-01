@@ -21,7 +21,7 @@
 #include <thread>
 #include <limits>
 
-namespace dxmt {
+namespace d3dalloy {
 namespace {
 
 // ponytail: one process-wide lock serializes cache I/O; split by cache only if profiling warrants it.
@@ -684,14 +684,14 @@ HRESULT ReadAutomaticStageArtifact(const std::string &key, std::shared_ptr<const
     if (file.value == INVALID_HANDLE_VALUE) return DXGI_ERROR_NOT_FOUND;
     LARGE_INTEGER size;
     if (!GetFileSizeEx(file.value, &size) || size.QuadPart < 0 ||
-        dxmt_stage_cache_file_size(uint64_t(size.QuadPart)) != DXMT_STAGE_CACHE_SUCCESS) return E_FAIL;
+        d3dalloy_stage_cache_file_size(uint64_t(size.QuadPart)) != D3DALLOY_STAGE_CACHE_SUCCESS) return E_FAIL;
     std::vector<uint8_t> bytes(size_t(size.QuadPart));
     if (!Seek(file.value, 0) || !Read(file.value, bytes.data(), DWORD(bytes.size()))) return E_FAIL;
     WMTPipelineCacheIdentity identity{};
-    DxmtStageCacheLayout layout{};
+    D3DalloyStageCacheLayout layout{};
     if (!StageIdentity(identity) ||
-        dxmt_stage_cache_decode(bytes.data(), bytes.size(), key.data(), key.size(), &identity, &layout) !=
-            DXMT_STAGE_CACHE_SUCCESS) return E_FAIL;
+        d3dalloy_stage_cache_decode(bytes.data(), bytes.size(), key.data(), key.size(), &identity, &layout) !=
+            D3DALLOY_STAGE_CACHE_SUCCESS) return E_FAIL;
     Sha1HashState checksum;
     checksum.update(bytes.data() + layout.checksum_header.offset, size_t(layout.checksum_header.size))
         .update(bytes.data() + layout.checksum_payload.offset, size_t(layout.checksum_payload.size));
@@ -720,19 +720,19 @@ HRESULT ReadAutomaticStageArtifact(const std::string &key, std::shared_ptr<const
 void WriteAutomaticStageArtifact(const std::string &key, const ShaderStageArtifact &artifact) {
   try {
     WMTPipelineCacheIdentity identity{};
-    const DxmtStageCacheParts parts{
+    const D3DalloyStageCacheParts parts{
         key.data(), artifact.library.data(), artifact.metadata_sizes.data(), artifact.metadata.data(),
         artifact.constants.data(), artifact.relocations.data(), &identity,
         key.size(), artifact.library.size(), uint64_t(artifact.metadata_sizes.size()) * sizeof(uint32_t), artifact.metadata.size(),
         uint64_t(artifact.constants.size()) * sizeof(uint64_t),
         uint64_t(artifact.relocations.size()) * sizeof(SM50_CONSTANT_RELOCATION), artifact.view.ConstantDataAlignment};
     uint64_t encoded_size = 0;
-    if (dxmt_stage_cache_measure(&parts, &encoded_size) != DXMT_STAGE_CACHE_SUCCESS || !StageIdentity(identity)) return;
+    if (d3dalloy_stage_cache_measure(&parts, &encoded_size) != D3DALLOY_STAGE_CACHE_SUCCESS || !StageIdentity(identity)) return;
     // The reader rejects larger files; the bound also keeps kStageDiskBytes - encoded_size from wrapping.
-    if (dxmt_stage_cache_file_size(encoded_size) != DXMT_STAGE_CACHE_SUCCESS) return;
+    if (d3dalloy_stage_cache_file_size(encoded_size) != D3DALLOY_STAGE_CACHE_SUCCESS) return;
     std::vector<uint8_t> bytes((size_t(encoded_size)));
-    DxmtStageCacheLayout layout{};
-    if (dxmt_stage_cache_encode(&parts, bytes.data(), bytes.size(), &layout) != DXMT_STAGE_CACHE_SUCCESS) return;
+    D3DalloyStageCacheLayout layout{};
+    if (d3dalloy_stage_cache_encode(&parts, bytes.data(), bytes.size(), &layout) != D3DALLOY_STAGE_CACHE_SUCCESS) return;
     Sha1HashState checksum;
     checksum.update(bytes.data() + layout.checksum_header.offset, size_t(layout.checksum_header.size))
         .update(bytes.data() + layout.checksum_payload.offset, size_t(layout.checksum_payload.size));
@@ -1020,4 +1020,4 @@ HRESULT ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS kinds, D3D12_SHADER_CAC
   } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

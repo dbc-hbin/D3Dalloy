@@ -30,7 +30,7 @@ ARCHES = {
 COMMON = [
     *(f"-I{ROOT / path}" for path in ("src/nvngx", "src/dxgi", "src/util", "src/winemetal", "include", "libs", "external/nvapi")),
     "-std=c++20", "-O2", "-g", "-Wall", "-Wextra",
-    "-DDXMT_PAGE_SIZE=4096", "-DNOMINMAX", "-D_WIN32_WINNT=0xa00", "-fblocks",
+    "-DD3DALLOY_PAGE_SIZE=4096", "-DNOMINMAX", "-D_WIN32_WINNT=0xa00", "-fblocks",
     "-Wno-missing-field-initializers", "-Wno-unused-parameter", "-Wno-cast-function-type",
     "-Wno-unused-private-field", "-Wno-microsoft-exception-spec", "-Wno-extern-c-compat",
     "-Wno-unused-const-variable", "-Wno-missing-braces",

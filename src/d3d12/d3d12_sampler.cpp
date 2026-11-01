@@ -19,7 +19,7 @@
 #include "Metal.hpp"
 #include "d3d12_device.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 constexpr WMTCompareFunction kCompareFunctionMap[] = {
     WMTCompareFunctionNever, // padding 0
@@ -173,4 +173,4 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_SAMPLE
   }
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

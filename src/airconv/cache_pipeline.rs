@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 use super::cache_wire::{input, output, put_u32, put_u64, range, range_mut, u32_at, u64_at};
 
-const MAGIC: u64 = 0x004f5350544d5844;
+const MAGIC: u64 = u64::from_le_bytes(*b"D3ALPSO\0");
 const VERSION: u32 = 7;
 const HEADER_SIZE: u64 = 216;
 const DIGEST_BEGIN: u64 = 100;
@@ -230,7 +230,7 @@ unsafe fn publish<T>(out: *mut T, result: Result<T>) -> u32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_cache_key(
+pub unsafe extern "C" fn d3dalloy_pipeline_cache_key(
     data: *const u8, length: u64, out: *mut Digest,
 ) -> u32 {
     let result = (|| {
@@ -242,7 +242,7 @@ pub unsafe extern "C" fn dxmt_pipeline_cache_key(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_cache_decode(
+pub unsafe extern "C" fn d3dalloy_pipeline_cache_decode(
     data: *const u8, length: u64, out: *mut Info,
 ) -> u32 {
     let result = (|| {
@@ -254,7 +254,7 @@ pub unsafe extern "C" fn dxmt_pipeline_cache_decode(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_cache_layout(
+pub unsafe extern "C" fn d3dalloy_pipeline_cache_layout(
     description: *const Description, out: *mut Layout,
 ) -> u32 {
     let result = (|| {
@@ -265,7 +265,7 @@ pub unsafe extern "C" fn dxmt_pipeline_cache_layout(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_cache_validate_payload(
+pub unsafe extern "C" fn d3dalloy_pipeline_cache_validate_payload(
     data: *const u8, length: u64, info: *const Info,
 ) -> u32 {
     let result = (|| {
@@ -277,7 +277,7 @@ pub unsafe extern "C" fn dxmt_pipeline_cache_validate_payload(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_cache_begin(
+pub unsafe extern "C" fn d3dalloy_pipeline_cache_begin(
     description: *const Description, data: *mut u8, length: u64,
 ) -> u32 {
     let result = (|| {
@@ -289,7 +289,7 @@ pub unsafe extern "C" fn dxmt_pipeline_cache_begin(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_cache_set_digest(
+pub unsafe extern "C" fn d3dalloy_pipeline_cache_set_digest(
     data: *mut u8, length: u64, digest: *const Digest,
 ) -> u32 {
     let result: Result<()> = (|| {

@@ -8,7 +8,7 @@
 #include "../dxgi/dxgi_interfaces.h"
 #include <cmath>
 
-namespace dxmt {
+namespace d3dalloy {
 Logger Logger::s_instance("nvngx.log");
 
 NVNGX_API NVNGX_RESULT
@@ -333,11 +333,11 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
 
   DisableThreadLibraryCalls(instance);
 
-  if (FAILED(DXGIGetDebugInterface1(0, DXMT_NVEXT_GUID, nullptr))) {
+  if (FAILED(DXGIGetDebugInterface1(0, D3DALLOY_NVEXT_GUID, nullptr))) {
     return FALSE;
   }
 
   return TRUE;
 }
 
-}; // namespace dxmt
+}; // namespace d3dalloy

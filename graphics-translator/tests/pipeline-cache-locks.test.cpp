@@ -31,7 +31,7 @@ constexpr HRESULT E_ABORT = HRESULT(0x80004004u);
 #include "../../src/d3d10/d3d10_blob.hpp"
 #include "DXBCParser/PipelineCache.h"
 
-namespace dxmt {
+namespace d3dalloy {
 struct ShaderStageArtifact;
 HRESULT ReadAutomaticStageArtifact(const std::string &, std::shared_ptr<const ShaderStageArtifact> &);
 void WriteAutomaticStageArtifact(const std::string &, const ShaderStageArtifact &);
@@ -88,7 +88,7 @@ template <typename... Fields> void Trace(const char *event, Fields &&...fields) 
   if (worker_hook) worker_hook(event, stream.str());
 }
 }
-namespace dxmt {
+namespace d3dalloy {
 HRESULT ReadAutomaticPipelineCache(const Sha1Digest &, ID3DBlob **);
 void WriteAutomaticPipelineCache(const Sha1Digest &, ID3DBlob *);
 void RemoveAutomaticPipelineCache(const Sha1Digest &);
@@ -96,7 +96,7 @@ HRESULT ClearAutomaticPipelineCacheDisk();
 }
 #include PRODUCTION_CACHE
 
-namespace dxmt {
+namespace d3dalloy {
 class TestBlob final : public ID3DBlob {
   std::atomic<ULONG> refs{1};
   std::vector<uint8_t> bytes;
@@ -164,11 +164,11 @@ extern "C" int SM50CopyCompiledBitcode(sm50_bitcode_t bitcode, SM50_COMPILED_BIT
     uint64_t expected = 0;
     switch (part) {
     case SM50_COMPILED_BITCODE_PART_LIBRARY:
-      bytes = dxmt::SM50AccessiblePointer(source.Data); expected = source.Size; break;
+      bytes = d3dalloy::SM50AccessiblePointer(source.Data); expected = source.Size; break;
     case SM50_COMPILED_BITCODE_PART_CONSTANTS:
-      bytes = dxmt::SM50AccessiblePointer(source.ConstantData); expected = source.ConstantDataSize; break;
+      bytes = d3dalloy::SM50AccessiblePointer(source.ConstantData); expected = source.ConstantDataSize; break;
     case SM50_COMPILED_BITCODE_PART_RELOCATIONS:
-      bytes = dxmt::SM50AccessiblePointer(source.ConstantRelocations);
+      bytes = d3dalloy::SM50AccessiblePointer(source.ConstantRelocations);
       expected = source.ConstantRelocationCount * sizeof(SM50_CONSTANT_RELOCATION); break;
     }
     require(bytes && size == expected, "owner-aware codec copy extent");
@@ -191,7 +191,7 @@ extern "C" void SM50GetCompiledBitcode(sm50_bitcode_t bitcode, SM50_COMPILED_BIT
 }
 
 namespace {
-using namespace dxmt;
+using namespace d3dalloy;
 constexpr uint32_t stages = 1u << PipelineCache::Compute;
 uint8_t library1[8] = {'M','T','L','B',1,0,0,0};
 uint8_t library2[8] = {'M','T','L','B',2,0,0,0};
@@ -413,7 +413,7 @@ void sealPipelineFixture(std::vector<uint8_t> &bytes) {
 std::vector<uint8_t> pipelineFixture() {
   // Three explicit records, a 216-byte header and independently computed spans.
   std::vector<uint8_t> bytes(344);
-  std::memcpy(bytes.data(), "DXMTPSO", 7);
+  std::memcpy(bytes.data(), "D3ALPSO", 7);
   wire32(bytes, 8, 7); wire32(bytes, 12, 7);
   wire64(bytes, 16, 344); wire64(bytes, 24, 7);
   bytes[32] = 1; bytes[80] = 91;
@@ -441,8 +441,8 @@ void testPipelineBlobCodec() {
     return cache.Initialize({bytes.data(), bytes.size()}, key(91), expected_stages, 7);
   };
   require(restore(golden) == S_OK, "independent three-stage v7 fixture restores");
-  DxmtPipelineCacheInfo info{};
-  require(dxmt_pipeline_cache_decode(golden.data(), golden.size(), &info) == DXMT_PIPELINE_CACHE_SUCCESS,
+  D3DalloyPipelineCacheInfo info{};
+  require(d3dalloy_pipeline_cache_decode(golden.data(), golden.size(), &info) == D3DALLOY_PIPELINE_CACHE_SUCCESS,
           "Rust decodes independent fixture");
   require(info.layout.size == 344 && info.layout.digest_begin == 100 && info.layout.digest_end == 120 &&
               info.description.adapter == 7 && info.description.stages == 7 &&
@@ -517,10 +517,10 @@ void testPipelineBlobCodec() {
   require(PipelineCacheBlobKey(golden.data(), 0, parsed) == E_INVALIDARG, "empty blob key");
   std::memset(&info, 0xa5, sizeof(info));
   const auto untouched = info;
-  require(dxmt_pipeline_cache_decode(nullptr, 0, &info) == DXMT_PIPELINE_CACHE_INVALID_ARGUMENT &&
+  require(d3dalloy_pipeline_cache_decode(nullptr, 0, &info) == D3DALLOY_PIPELINE_CACHE_INVALID_ARGUMENT &&
               !std::memcmp(&info, &untouched, sizeof(info)),
           "failed decode leaves output untouched");
-  require(dxmt_pipeline_cache_decode(golden.data(), golden.size(), nullptr) == DXMT_PIPELINE_CACHE_INVALID_ARGUMENT,
+  require(d3dalloy_pipeline_cache_decode(golden.data(), golden.size(), nullptr) == D3DALLOY_PIPELINE_CACHE_INVALID_ARGUMENT,
           "null decode output");
 
   auto changed = golden;
@@ -578,7 +578,7 @@ void testPipelineBlobCodec() {
 }
 }
 void testStageArtifactKeys() {
-  using namespace dxmt;
+  using namespace d3dalloy;
   SM50_SHADER_PSO_PIXEL_SHADER_DATA pixel{};
   pixel.type = SM50_SHADER_PSO_PIXEL_SHADER; pixel.sample_mask = 1; pixel.native_sample_count = 1;
   SM50_SHADER_COMPILATION_ARGUMENT_DATA constant{};
@@ -613,7 +613,7 @@ void testStageArtifactKeys() {
 }
 
 void testStageArtifactFlights() {
-  using namespace dxmt;
+  using namespace d3dalloy;
   controls(6);
   stage_publications = 0;
   ArtifactCache<ShaderStageArtifact> cache;
@@ -688,7 +688,7 @@ void testStageArtifactFlights() {
   std::puts("PIPELINE_STAGE_FLIGHT_PASS conversions=4 same_artifact=1 retained_after_clear=1 clear_pending=1 failure_retry=1 failure_wakeups=2 trace_exception=1 bounded=1");
 }
 void testCompiledArtifactKinds() {
-  using namespace dxmt;
+  using namespace d3dalloy;
   ArtifactCache<WorkGraphArtifact> workgraphs;
   std::atomic_uint workgraph_compiles{0};
   auto workgraph = workgraphs.Get("workgraph", "wg_compile", [&] {

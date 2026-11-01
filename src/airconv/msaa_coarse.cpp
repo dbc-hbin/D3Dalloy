@@ -7,7 +7,7 @@
 
 using namespace llvm;
 
-namespace dxmt::msaa::coarse {
+namespace d3dalloy::msaa::coarse {
 
 namespace {
 
@@ -444,4 +444,4 @@ Replay replay(IRBuilder<> &b, Value *position, Value *control, Value *rate, unsi
   return {record, b.CreateMul(fine, b.getInt32(sampleCount))};
 }
 
-} // namespace dxmt::msaa::coarse
+} // namespace d3dalloy::msaa::coarse

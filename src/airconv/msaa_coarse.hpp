@@ -26,7 +26,7 @@
  * output record to each covered fine sample; depth, stencil and coverage stay per fine sample. Coarse coverage
  * masks use the D3D order: fine pixels left to right then top to bottom, each fine pixel's samples packed.
  */
-namespace dxmt::msaa::coarse {
+namespace d3dalloy::msaa::coarse {
 
 /* Shared by captured position, line/distance interpolation and coarse pull-model evaluation. */
 inline llvm::Value *programmableSampleOffset(llvm::IRBuilder<> &b, llvm::Value *control, llvm::Value *sample,
@@ -140,4 +140,4 @@ struct Replay {
 Replay replay(llvm::IRBuilder<> &b, llvm::Value *position, llvm::Value *control, llvm::Value *rate,
               unsigned sampleCount);
 
-} // namespace dxmt::msaa::coarse
+} // namespace d3dalloy::msaa::coarse

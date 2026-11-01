@@ -23,7 +23,7 @@
 #include "d3d12_device.hpp"
 #include "d3d12_device_child.hpp"
 #include "d3d12_sampler_feedback.hpp"
-#include "dxmt_sampler.hpp"
+#include "d3dalloy_sampler.hpp"
 #include "util_math.hpp"
 #include "util_md5.hpp"
 #include "owned_trace.hpp"
@@ -38,7 +38,7 @@
 #include "../d3d10/d3d10_blob.hpp"
 #include "../airconv/dxbc_root_signature.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 /* Every global/local root used by one program shares this register-keyed immutable table. */
 HRESULT AppendRootStaticSamplers(
@@ -891,4 +891,4 @@ CreateRootSignature(
   return root_sig->QueryInterface(riid, ppRootSignature);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

@@ -113,7 +113,7 @@ struct LLVMDisDiagnosticHandler : public DiagnosticHandler {
 };
 } // namespace
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 llvm::Error convertDXBC(
   sm50_shader_t pShader, const char *name, llvm::LLVMContext &context,
   llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
@@ -203,7 +203,7 @@ int main(int argc, char **argv) {
   }
 
   Module M("default", Context);
-  dxmt::initializeModule(M);
+  d3dalloy::initializeModule(M);
 
   sm50_shader_t sm50;
   sm50_error_t err;
@@ -242,9 +242,9 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_tesselator_domain_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50, "shader_main",
-          (dxmt::dxbc::SM50ShaderInternal *)sm50_hull, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
+    if (auto err = d3dalloy::dxbc::convert_dxbc_tesselator_domain_shader(
+          (d3dalloy::dxbc::SM50ShaderInternal *)sm50, "shader_main",
+          (d3dalloy::dxbc::SM50ShaderInternal *)sm50_hull, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
       return 1;
@@ -270,8 +270,8 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_vertex_hull_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50_vertex, (dxmt::dxbc::SM50ShaderInternal *)sm50,
+    if (auto err = d3dalloy::dxbc::convert_dxbc_vertex_hull_shader(
+          (d3dalloy::dxbc::SM50ShaderInternal *)sm50_vertex, (d3dalloy::dxbc::SM50ShaderInternal *)sm50,
           "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
@@ -298,8 +298,8 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_vertex_hull_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50, (dxmt::dxbc::SM50ShaderInternal *)sm50_hull,
+    if (auto err = d3dalloy::dxbc::convert_dxbc_vertex_hull_shader(
+          (d3dalloy::dxbc::SM50ShaderInternal *)sm50, (d3dalloy::dxbc::SM50ShaderInternal *)sm50_hull,
           "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
@@ -326,9 +326,9 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_geometry_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50, "shader_main",
-          (dxmt::dxbc::SM50ShaderInternal *)sm50_vertex, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
+    if (auto err = d3dalloy::dxbc::convert_dxbc_geometry_shader(
+          (d3dalloy::dxbc::SM50ShaderInternal *)sm50, "shader_main",
+          (d3dalloy::dxbc::SM50ShaderInternal *)sm50_vertex, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
       return 1;
@@ -354,16 +354,16 @@ int main(int argc, char **argv) {
       SM50FreeError(err);
       return 1;
     }
-    if (auto err = dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
-          (dxmt::dxbc::SM50ShaderInternal *)sm50, "shader_main",
-          (dxmt::dxbc::SM50ShaderInternal *)sm50_geometry, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
+    if (auto err = d3dalloy::dxbc::convert_dxbc_vertex_for_geometry_shader(
+          (d3dalloy::dxbc::SM50ShaderInternal *)sm50, "shader_main",
+          (d3dalloy::dxbc::SM50ShaderInternal *)sm50_geometry, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data
         )) {
       errs() << err << '\n';
       return 1;
     }
   } else {
     if (auto err =
-          dxmt::dxbc::convertDXBC(sm50, "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data)) {
+          d3dalloy::dxbc::convertDXBC(sm50, "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data)) {
       errs() << err << '\n';
       return 1;
     }
@@ -374,12 +374,12 @@ int main(int argc, char **argv) {
   if (OptLevelO0) {
     // do nothing
   } else {
-    dxmt::runOptimizationPasses(M);
+    d3dalloy::runOptimizationPasses(M);
   }
 
-  dxmt::linkMSAD(M);
-  dxmt::linkSamplePos(M);
-  dxmt::linkTessellation(M);
+  d3dalloy::linkMSAD(M);
+  d3dalloy::linkSamplePos(M);
+  d3dalloy::linkTessellation(M);
 
   std::error_code EC;
   std::unique_ptr<ToolOutputFile> Out(new ToolOutputFile(
@@ -394,7 +394,7 @@ int main(int argc, char **argv) {
   if (EmitLLVM) {
     M.print(Out->os(), nullptr, PreserveAssemblyUseListOrder);
   } else if (EmitMetallib) {
-    dxmt::metallib::MetallibWriter writer;
+    d3dalloy::metallib::MetallibWriter writer;
     if (auto error = writer.Write(M, Out->os())) {
       logAllUnhandledErrors(std::move(error), errs());
       return 1;

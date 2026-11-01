@@ -1,7 +1,7 @@
 fsr_dll = shared_library('amd_fidelityfx_upscaler_dx12', 'fsr.cpp',
   name_prefix         : '',
   dependencies        : [ util_dep ],
-  include_directories : [ dxmt_include_path ],
+  include_directories : [ d3dalloy_include_path ],
   install             : true,
   install_dir         : windows_builtin_install_dir,
   vs_module_defs      : 'fsr.def',

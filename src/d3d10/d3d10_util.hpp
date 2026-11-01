@@ -2,7 +2,7 @@
 
 #include "d3d11.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 void GetD3D10Device(ID3D11DeviceChild *d3d11, ID3D10Device **ppDevice);
 
@@ -12,4 +12,4 @@ UINT ConvertD3D11ResourceFlags(UINT MiscFlags);
 
 UINT ConvertD3D10ResourceFlags(UINT MiscFlags);
 
-} // namespace dxmt
+} // namespace d3dalloy

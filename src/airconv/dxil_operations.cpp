@@ -69,7 +69,7 @@
 
 using namespace llvm;
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 namespace {
 
@@ -358,11 +358,11 @@ private:
   void preserveDenormals();
   /** The function declares "fp32-denorm-mode"="preserve" (SM 6.2). */
   static bool preserves(const Function &function);
-  /** fp32 add/sub/mul/div through the exact dxmt.denorm.* helpers. */
+  /** fp32 add/sub/mul/div through the exact d3dalloy.denorm.* helpers. */
   Value *exactBinary(IRBuilder<> &builder, Instruction::BinaryOps op, Value *a, Value *b);
   /** fcmp evaluated on the IEEE ordering of the bit patterns: a denormal is not zero. */
   Value *exactCompare(IRBuilder<> &builder, CmpInst::Predicate predicate, Value *a, Value *b);
-  /** Set once a dxmt.denorm.* helper is referenced; run() links air_denorm.metal. */
+  /** Set once a d3dalloy.denorm.* helper is referenced; run() links air_denorm.metal. */
   bool uses_denorm_helpers = false;
 
   Error expectArgs(const CallInst &call, unsigned expected, StringRef what) const;
@@ -536,7 +536,7 @@ OperationLowerer::laneIndex(IRBuilder<> &builder) {
 
 Error
 OperationLowerer::run() {
-  if (Metadata *flag = module.getModuleFlag("dxmt.wave-size")) {
+  if (Metadata *flag = module.getModuleFlag("d3dalloy.wave-size")) {
     auto *width = dyn_cast<ConstantAsMetadata>(flag);
     auto *constant = width ? dyn_cast<ConstantInt>(width->getValue()) : nullptr;
     if (!constant || !constant->getType()->isIntegerTy(32))
@@ -546,7 +546,7 @@ OperationLowerer::run() {
       return createError("DXIL selected wave width is outside the supported set");
   }
   if (wave_lanes > kNativeWaveLanes) {
-    auto *threads = mdconst::dyn_extract_or_null<ConstantInt>(module.getModuleFlag("dxmt.wide-wave-threads"));
+    auto *threads = mdconst::dyn_extract_or_null<ConstantInt>(module.getModuleFlag("d3dalloy.wide-wave-threads"));
     auto *kernels = module.getNamedMetadata("air.kernel");
     if (!threads || !kernels || kernels->getNumOperands() != 1)
       return createError("DXIL wide wave lowering requires the unconditional compute admission proof");
@@ -564,7 +564,7 @@ OperationLowerer::run() {
       return createError("DXIL wide wave lowering is missing its group index or thread count");
     auto *array = ArrayType::get(Type::getInt64Ty(module.getContext()), wide_threads);
     wide_scratch = new GlobalVariable(module, array, false, GlobalValue::InternalLinkage,
-      UndefValue::get(array), "dxmt.wide-wave-scratch", nullptr, GlobalValue::NotThreadLocal, 3);
+      UndefValue::get(array), "d3dalloy.wide-wave-scratch", nullptr, GlobalValue::NotThreadLocal, 3);
     wide_scratch->setAlignment(Align(8));
   }
   if (auto *fragments = module.getNamedMetadata("air.fragment"))
@@ -599,7 +599,7 @@ OperationLowerer::run() {
 
   preserveDenormals();
   if (uses_denorm_helpers)
-    dxmt::linkDenorm(module);
+    d3dalloy::linkDenorm(module);
   /* The mode is fully applied; it is a DXIL attribute, not an AIR one. */
   for (Function &function : module)
     function.removeFnAttr("fp32-denorm-mode");
@@ -687,7 +687,7 @@ OperationLowerer::run() {
  * (air.compile.denorms_enable / `-fdenorms` change nothing on the GPU); fp16 keeps
  * its denormals natively. So:
  *   "any", "ftz": native arithmetic (flush to zero, sign preserved).
- *   "preserve": fp32 fadd/fsub/fmul/fdiv call the exact dxmt.denorm.* helpers
+ *   "preserve": fp32 fadd/fsub/fmul/fdiv call the exact d3dalloy.denorm.* helpers
  *     (shaders/air_denorm.metal), fcmp compares IEEE bit orderings; FMad, dot and
  *     float wave sums/products were already expanded into those operations by their
  *     lowerings. Everything else is exact on bit patterns (fneg, fabs, loads/stores,
@@ -707,16 +707,16 @@ OperationLowerer::exactBinary(IRBuilder<> &builder, Instruction::BinaryOps op, V
   StringRef name;
   switch (op) {
   case Instruction::FAdd:
-    name = "dxmt.denorm.fadd.f32";
+    name = "d3dalloy.denorm.fadd.f32";
     break;
   case Instruction::FSub:
-    name = "dxmt.denorm.fsub.f32";
+    name = "d3dalloy.denorm.fsub.f32";
     break;
   case Instruction::FMul:
-    name = "dxmt.denorm.fmul.f32";
+    name = "d3dalloy.denorm.fmul.f32";
     break;
   case Instruction::FDiv:
-    name = "dxmt.denorm.fdiv.f32";
+    name = "d3dalloy.denorm.fdiv.f32";
     break;
   default:
     return builder.CreateBinOp(op, a, b);
@@ -1811,7 +1811,7 @@ OperationLowerer::lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &b,
   Value *value = call.getArgOperand(1);
   Type *type = value->getType();
   if (!(type->isIntegerTy() || type->isFloatTy() || type->isHalfTy()) ||
-      (type->isIntegerTy() && type->getIntegerBitWidth() > 64) || call.getMetadata("dxmt.fp64"))
+      (type->isIntegerTy() && type->getIntegerBitWidth() > 64) || call.getMetadata("d3dalloy.fp64"))
     return createError("DXIL wide collective supports scalar integers, half and float only");
   const bool vote = opcode == OpWaveAnyTrue || opcode == OpWaveAllTrue || opcode == OpWaveActiveBallot ||
       opcode == OpWaveAllBitCount || opcode == OpWavePrefixBitCount || opcode == OpWaveMultiPrefixBitCount;
@@ -1932,7 +1932,7 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
   Type *i64 = builder.getInt64Ty();
 
   /* LowerFP64 preserves the original overload while values become i64 bits. */
-  const bool fp64_wave = call.getMetadata("dxmt.fp64") || call.getCalledFunction()->getName().contains("f64");
+  const bool fp64_wave = call.getMetadata("d3dalloy.fp64") || call.getCalledFunction()->getName().contains("f64");
   if (fp64_wave && opcode == OpWaveActiveBit)
     return createError("DXIL FP64 wave bitwise reduction is invalid");
 
@@ -2015,10 +2015,10 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
     if (fp64_wave) {
       uint64_t identity = 0;
       switch (kind) {
-      case WaveReduce::Sum: fp64_helper = "dxmt.fp64.add"; break;
-      case WaveReduce::Product: fp64_helper = "dxmt.fp64.mul"; identity = 0x3ff0000000000000ull; break;
-      case WaveReduce::Min: fp64_helper = "dxmt.fp64.min"; identity = 0x7ff0000000000000ull; break;
-      case WaveReduce::Max: fp64_helper = "dxmt.fp64.max"; identity = 0xfff0000000000000ull; break;
+      case WaveReduce::Sum: fp64_helper = "d3dalloy.fp64.add"; break;
+      case WaveReduce::Product: fp64_helper = "d3dalloy.fp64.mul"; identity = 0x3ff0000000000000ull; break;
+      case WaveReduce::Min: fp64_helper = "d3dalloy.fp64.min"; identity = 0x7ff0000000000000ull; break;
+      case WaveReduce::Max: fp64_helper = "d3dalloy.fp64.max"; identity = 0xfff0000000000000ull; break;
       case WaveReduce::And:
       case WaveReduce::Or:
       case WaveReduce::Xor: llvm_unreachable("FP64 wave bitwise reduction is invalid");
@@ -2151,7 +2151,7 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
     for (unsigned i = 0; i < (vector ? vector->getNumElements() : 1u); ++i) {
       Value *component = vector ? builder.CreateExtractElement(value, i) : value;
       Value *first = shuffle(component, first_index);
-      Value *matches = fp64_wave ? emitAIR(builder, "dxmt.fp64.eq", {component, first}, i1, false)
+      Value *matches = fp64_wave ? emitAIR(builder, "d3dalloy.fp64.eq", {component, first}, i1, false)
           : component->getType()->isFloatingPointTy() ? builder.CreateFCmpOEQ(component, first)
                                                      : builder.CreateICmpEQ(component, first);
       equal = builder.CreateAnd(equal, matches);
@@ -2449,11 +2449,11 @@ LowerOperations(llvm::Module &module) {
     return error;
   // Wave reductions introduce FP64 helper calls after the binary64 prepass.
   for (Function &function : module)
-    if (function.isDeclaration() && !function.use_empty() && function.getName().startswith("dxmt.fp64.")) {
-      dxmt::linkFP64(module);
+    if (function.isDeclaration() && !function.use_empty() && function.getName().startswith("d3dalloy.fp64.")) {
+      d3dalloy::linkFP64(module);
       break;
     }
   return LowerVectors(module, true);
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

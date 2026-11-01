@@ -46,72 +46,72 @@ if fs.is_file(join_paths(native_llvm_path, 'lib/libunwind.a'))
 endif
 
 airconv_lib_darwin = static_library('airconv', airconv_src,
-  include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
+  include_directories : [ d3dalloy_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],
   # Generated Rust archives belong to the final link, not the ar command.
   dependencies        : [ dxbc_parser_native_dep.partial_dependency(compile_args: true, includes: true) ],
   link_args           : llvm_ld_flags_darwin,
-  native              : dxmt_crossbuild
+  native              : d3dalloy_crossbuild
 )
 
 airconv_dep_darwin = declare_dependency(
   link_with           : [ airconv_lib_darwin ],
-  include_directories : [ dxmt_include_path, include_directories('..') ],
+  include_directories : [ d3dalloy_include_path, include_directories('..') ],
   dependencies        : llvm_system_dependencies + [dxbc_parser_native_dep],
   link_args           : [ llvm_ld_flags_darwin, llvm_native_deps ]
 )
 
 fp64_lowering_test = executable('fp64-lowering-test',
   files('../../../graphics-translator/tests/fp64-lowering.test.cpp'),
-  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  include_directories: [d3dalloy_include_path, llvm_include_path_darwin],
   cpp_args: [airconv_args],
   dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
-  native: dxmt_crossbuild,
+  native: d3dalloy_crossbuild,
 )
 test('fp64-lowering', fp64_lowering_test)
 
 atomic64_phase_test = executable('atomic64-phase-test',
   files('../../../graphics-translator/tests/atomic64-phase.test.cpp'),
-  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  include_directories: [d3dalloy_include_path, llvm_include_path_darwin],
   cpp_args: [airconv_args],
   dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
-  native: dxmt_crossbuild,
+  native: d3dalloy_crossbuild,
 )
 test('atomic64-phase', atomic64_phase_test)
 
 volume_sample_test = executable('airconv-volume-sample-test',
   files('../../../graphics-translator/tests/airconv-volume-sample.test.cpp'),
-  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  include_directories: [d3dalloy_include_path, llvm_include_path_darwin],
   cpp_args: [airconv_args],
   dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
-  native: dxmt_crossbuild,
+  native: d3dalloy_crossbuild,
 )
 test('airconv-volume-sample', volume_sample_test)
 
 root_status_test = executable('airconv-root-status-test',
   files('../../../graphics-translator/tests/airconv-root-status.test.cpp'),
-  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  include_directories: [d3dalloy_include_path, llvm_include_path_darwin],
   cpp_args: [airconv_args],
   dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
-  native: dxmt_crossbuild,
+  native: d3dalloy_crossbuild,
 )
 test('airconv-root-status', root_status_test)
 
 container_test = executable('airconv-container-test',
   files('../../../graphics-translator/tests/airconv-container.test.cpp'),
-  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  include_directories: [d3dalloy_include_path, llvm_include_path_darwin],
   cpp_args: [airconv_args],
   dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
-  native: dxmt_crossbuild,
+  native: d3dalloy_crossbuild,
 )
 test('airconv-container', container_test)
 
 error_kind_clone_test = executable('airconv-error-kind-clone-test',
   files('../../../graphics-translator/tests/airconv-error-kind-clone.test.cpp'),
-  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  include_directories: [d3dalloy_include_path, llvm_include_path_darwin],
   cpp_args: [airconv_args],
   dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
-  native: dxmt_crossbuild,
+  native: d3dalloy_crossbuild,
 )
 test('airconv-error-kind-clone', error_kind_clone_test, args: [
   join_paths(meson.project_source_root(), 'graphics-translator/tests/dxil/advanced-texture-cmp2-cs.dxil'),
@@ -119,10 +119,10 @@ test('airconv-error-kind-clone', error_kind_clone_test, args: [
 
 library_usage_test = executable('airconv-library-usage-test',
   files('../../../graphics-translator/tests/airconv-library-usage.test.cpp'),
-  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  include_directories: [d3dalloy_include_path, llvm_include_path_darwin],
   cpp_args: [airconv_args],
   dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
-  native: dxmt_crossbuild,
+  native: d3dalloy_crossbuild,
 )
 test('airconv-library-usage', library_usage_test, args: [
   join_paths(meson.project_source_root(), 'graphics-translator/tests/dxil/advanced-texture-cmp2-cs.dxil'),
@@ -131,10 +131,10 @@ test('airconv-library-usage', library_usage_test, args: [
 
 msaa_target_test = executable('airconv-msaa-target-test',
   files('../../../graphics-translator/tests/airconv-msaa-target.test.cpp'),
-  include_directories: [dxmt_include_path, llvm_include_path_darwin],
+  include_directories: [d3dalloy_include_path, llvm_include_path_darwin],
   cpp_args: [airconv_args],
   dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
-  native: dxmt_crossbuild,
+  native: d3dalloy_crossbuild,
 )
 test('airconv-msaa-target', msaa_target_test, args: [
   join_paths(meson.project_source_root(), 'graphics-translator/tests/dxil/conservative-raster-ps_main.dxbc'),
@@ -142,9 +142,9 @@ test('airconv-msaa-target', msaa_target_test, args: [
 ])
 
 executable('airconv', airconv_src + airconv_cli_src,
-  include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
+  include_directories : [ d3dalloy_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],
   dependencies        : [ dxbc_parser_native_dep, llvm_system_dependencies ],
   link_args           : [ llvm_ld_flags_darwin, llvm_native_deps ],
-  native              : dxmt_crossbuild
+  native              : d3dalloy_crossbuild
 )

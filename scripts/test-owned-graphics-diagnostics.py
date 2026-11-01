@@ -270,7 +270,7 @@ class RunnerFailures(unittest.TestCase):
             {"event": "pipeline_cache_auto_publish", "key": keys["control"], "hr": 0, "bytes": 1024},
             {"event": "pipeline_cache_auto_bypass", "key": keys["control"], "reason": "disabled"}] * 2
         phases["pipeline-cache-control"] += [{"event": "pipeline_cache_auto_hit", "key": keys["control"], "source": "memory"}]
-        logs = {("same_d3d12.log" if phase == "parent" else phase + "/same_d3d12.log"):
+        logs = {("same_d3dalloy-d3d12.log" if phase == "parent" else phase + "/same_d3dalloy-d3d12.log"):
                 "\n".join("OWNED_GRAPHICS_TRACE " + json.dumps(event) for event in events)
                 for phase, events in phases.items()}
         self.assertEqual(runner.pipeline_cache_failures(stdout, "", logs), [])
@@ -278,42 +278,44 @@ class RunnerFailures(unittest.TestCase):
                               if event["event"] != "pipeline_cache_auto_control"]
         reordered_controls += [{"event": "pipeline_cache_auto_control", "flags": flags, "hr": 0}
                                for flags in (4, 2, 1, 2)]
-        reordered_logs = logs | {"pipeline-cache-control/same_d3d12.log":
+        reordered_logs = logs | {"pipeline-cache-control/same_d3dalloy-d3d12.log":
             "\n".join("OWNED_GRAPHICS_TRACE " + json.dumps(event) for event in reordered_controls)}
         self.assertEqual(runner.pipeline_cache_failures(stdout, "", reordered_logs), [])
         for label, corrupted in (
-                ("second producer", logs | {"same_d3d12.log": logs["same_d3d12.log"] + "\nOWNED_GRAPHICS_TRACE " +
+                ("second producer", logs | {"same_d3dalloy-d3d12.log": logs["same_d3dalloy-d3d12.log"] + "\nOWNED_GRAPHICS_TRACE " +
                     json.dumps({"event": "pipeline_cache_auto_begin", "key": keys["concurrent"]})}),
                 ("missing disk log", {name: text for name, text in logs.items() if not name.startswith("pipeline-cache-disk/")}),
-                ("native retry missing", logs | {"pipeline-cache-native/same_d3d12.log":
-                    logs["pipeline-cache-native/same_d3d12.log"].replace("pipeline_cache_auto_retry", "unrelated_event")}),
+                ("native retry missing", logs | {"pipeline-cache-native/same_d3dalloy-d3d12.log":
+                    logs["pipeline-cache-native/same_d3dalloy-d3d12.log"].replace("pipeline_cache_auto_retry", "unrelated_event")}),
                 ("merged child log", {name.split("/")[-1]: text for name, text in logs.items()}),
-                ("failed control", logs | {"pipeline-cache-control/same_d3d12.log":
-                    logs["pipeline-cache-control/same_d3d12.log"] + "\nOWNED_GRAPHICS_TRACE " +
+                ("failed control", logs | {"pipeline-cache-control/same_d3dalloy-d3d12.log":
+                    logs["pipeline-cache-control/same_d3dalloy-d3d12.log"] + "\nOWNED_GRAPHICS_TRACE " +
                     json.dumps({"event": "pipeline_cache_auto_control", "flags": 4, "hr": 0x80070005})}),
-                ("disable not covered", logs | {"pipeline-cache-control/same_d3d12.log":
-                    logs["pipeline-cache-control/same_d3d12.log"].replace('"flags": 1', '"flags": 2')}),
-                ("disabled cache hit", logs | {"pipeline-cache-control/same_d3d12.log":
-                    logs["pipeline-cache-control/same_d3d12.log"].replace("pipeline_cache_auto_bypass", "pipeline_cache_auto_hit")})):
+                ("disable not covered", logs | {"pipeline-cache-control/same_d3dalloy-d3d12.log":
+                    logs["pipeline-cache-control/same_d3dalloy-d3d12.log"].replace('"flags": 1', '"flags": 2')}),
+                ("disabled cache hit", logs | {"pipeline-cache-control/same_d3dalloy-d3d12.log":
+                    logs["pipeline-cache-control/same_d3dalloy-d3d12.log"].replace("pipeline_cache_auto_bypass", "pipeline_cache_auto_hit")})):
             with self.subTest(label=label):
                 self.assertTrue(runner.pipeline_cache_failures(stdout, "", corrupted))
 
     def test_pipeline_artifacts_require_real_operations_within_joined_phases(self):
-        for suite, phases in (("pipeline-cache", [("distinct_compute", 1, 1, 0),
-                              ("concurrent_distinct_compute", 1, 0, 0)]),
-                              ("pipeline-library", [("concurrent_graphics", 2, 2, 0), ("root_abi", 2, 0, 0),
-                               ("pixel_specialization", 1, 1, 1), ("constant_concurrent", 0, 0, 1),
-                               ("constant_distinct", 0, 0, 1), ("constant_hit", 0, 0, 0),
-                               ("constant_root_abi", 1, 0, 1), ("constant_entry", 1, 1, 1),
-                               ("linked_geometry_cold", 2, 2, 0), ("linked_geometry_hit", 0, 0, 0),
-                               ("linked_geometry_input", 2, 0, 0), ("captured_layout_cold", 6, 6, 0),
-                               ("captured_layout_hit", 0, 0, 0), ("clear_rebuild", 2, 2, 0)])):
+        for suite, phases in (("pipeline-cache", [("distinct_compute", 1, 1, 0, 1, 1),
+                              ("concurrent_distinct_compute", 1, 0, 0, 1, 1)]),
+                              ("pipeline-library", [("concurrent_graphics", 2, 2, 0, 1, 2), ("root_abi", 2, 0, 0, 1, 2),
+                               ("pixel_specialization", 1, 1, 1, 1, 0), ("constant_concurrent", 0, 0, 1, 1, 0),
+                               ("constant_distinct", 0, 0, 1, 1, 0), ("constant_hit", 0, 0, 0, 0, 0),
+                               ("constant_root_abi", 1, 0, 1, 1, 0), ("constant_entry", 1, 1, 1, 1, 0),
+                               ("linked_geometry_cold", 2, 2, 0, 1, 2), ("linked_geometry_hit", 0, 0, 0, 0, 0),
+                               ("linked_geometry_input", 2, 0, 0, 1, 1), ("captured_layout_cold", 6, 6, 0, 6, 11),
+                               ("captured_layout_hit", 0, 0, 0, 0, 0), ("clear_rebuild", 2, 2, 0, 1, 2)])):
             prefix = runner.SUITE_PREFIXES[suite] + "_ARTIFACT_PHASE "
             rows = []
-            for name, air, libraries, specializations in phases:
+            native_kind = "native_compute" if suite == "pipeline-cache" else "native_render"
+            for name, air, libraries, specializations, native, functions in phases:
                 rows.append(prefix + "begin=" + name)
                 for kind, count in (("shader_initialize", air), ("air_compile", air),
-                                    ("new_library", libraries), ("specialize_function", specializations)):
+                                    ("new_library", libraries), ("specialize_function", specializations),
+                                    ("new_function", functions), (native_kind, native)):
                     for index in range(count):
                         event={"event": "pipeline_artifact_operation", "kind": kind}
                         if name == "captured_layout_cold" and kind in ("air_compile","new_library"):
@@ -335,6 +337,10 @@ class RunnerFailures(unittest.TestCase):
                         text.replace(rows[0], prefix)):
                 with self.subTest(suite=suite, bad=bad):
                     self.assertTrue(runner.pipeline_artifact_failures(bad, suite))
+            for kind in ("new_function", native_kind):
+                missing = "\n".join(line for line in rows if f'"kind": "{kind}"' not in line)
+                with self.subTest(suite=suite, missing_operation=kind):
+                    self.assertTrue(runner.pipeline_artifact_failures(missing, suite))
             if suite == "pipeline-library":
                 for kind in ("air_compile","new_library"):
                     cold=next(line for line in rows if '"kind": "'+kind+'"' in line and '"key"' in line and '"event": "pipeline_artifact_operation"' in line)
@@ -346,7 +352,8 @@ class RunnerFailures(unittest.TestCase):
                 self.assertTrue(runner.pipeline_artifact_failures(before+prefix+"begin=captured_layout_cold"+cold_and_after.replace("pipeline_artifact_operation","ignored_work",1),suite))
                 extra="OWNED_GRAPHICS_TRACE "+json.dumps(dict(event="pipeline_artifact_operation",kind="shader_initialize"))
                 self.assertTrue(runner.pipeline_artifact_failures(text.replace(prefix+"end=captured_layout_hit",extra+"\n"+prefix+"end=captured_layout_hit",1),suite))
-                for operation in ("shader_initialize", "air_compile", "new_library", "specialize_function"):
+                for operation in ("shader_initialize", "air_compile", "new_library", "specialize_function",
+                                  "new_function", "native_compute", "native_render"):
                     unexpected = "OWNED_GRAPHICS_TRACE " + json.dumps(
                         {"event": "pipeline_artifact_operation", "kind": operation})
                     with self.subTest(unexpected_warm_operation=operation):
@@ -1042,12 +1049,17 @@ OWNED_D3D12_FSR_FG_PASS
         self.assertFalse(self.simulate_metalfx("fsr-fg", trace.replace("reset_output=current", "reset_output=unchanged"))["pass"])
 
     def test_fsr_real_three_channel_history_and_centered_cap_evidence(self):
-        # Reduced authentic runtime02 GPU evidence; independent of runner counts.
+        # Controlled parser input based on runtime02; not GPU execution evidence.
         trace = """OWNED_D3D12_TEMPORAL_BACKEND id=owned-graphics-d3d12
-OWNED_D3D12_FSR_FRAME_PASS frame=0 input_tag=96 sentinel=1
-OWNED_D3D12_FSR_FRAME_PASS frame=1 input_tag=160 sentinel=1
-OWNED_D3D12_FSR_FRAME_PASS frame=2 input_tag=96 sentinel=1
-OWNED_D3D12_FSR_FRAME_PASS frame=3 input_tag=96 sentinel=1
+OWNED_D3D12_FSR_FRAME_PASS frame=0 variant=direct input_tag=96 sentinel=1
+OWNED_D3D12_FSR_FRAME_PASS frame=1 variant=direct input_tag=160 sentinel=1
+OWNED_D3D12_FSR_FRAME_PASS frame=2 variant=direct input_tag=96 sentinel=1
+OWNED_D3D12_FSR_FRAME_PASS frame=3 variant=direct input_tag=96 sentinel=1
+OWNED_D3D12_FSR_FRAME_PASS frame=0 variant=device_proxy input_tag=96 sentinel=1
+OWNED_D3D12_FSR_FRAME_PASS frame=1 variant=device_proxy input_tag=160 sentinel=1
+OWNED_D3D12_FSR_FRAME_PASS frame=2 variant=device_proxy input_tag=96 sentinel=1
+OWNED_D3D12_FSR_FRAME_PASS frame=3 variant=device_proxy input_tag=96 sentinel=1
+OWNED_D3D12_FSR_CASE_PASS case=device_proxy_underlying_gpu result=0
 OWNED_D3D12_FSR_REPLAY_PASS replay=0 input_tag=116 destroyed_before_submit=1 sentinel=1 changed_gpu_input=0
 OWNED_D3D12_FSR_REPLAY_PASS replay=1 input_tag=116 destroyed_before_submit=1 sentinel=1 changed_gpu_input=0
 OWNED_D3D12_FSR_REPLAY_PASS replay=2 input_tag=140 destroyed_before_submit=1 sentinel=1 changed_gpu_input=1
@@ -1095,16 +1107,25 @@ case=exposure_gpu_replay replay=2 value=3.14159012 half_bits=4248 max_ulp=0 cont
         self.assertTrue(self.simulate_metalfx("fsr", trace)["pass"])
         self.assertFalse(self.simulate_metalfx("fsr", trace.replace("center=32,16", "center=0,0"))["pass"])
         self.assertFalse(self.simulate_metalfx("fsr", trace.replace("max_ulp=0", "max_ulp=2"))["pass"])
+        proxy_frame = "OWNED_D3D12_FSR_FRAME_PASS frame=2 variant=device_proxy input_tag=96 sentinel=1\n"
+        proxy_complete = "OWNED_D3D12_FSR_CASE_PASS case=device_proxy_underlying_gpu result=0\n"
+        for bad in (trace.replace(proxy_frame, ""), trace.replace(proxy_frame, proxy_frame * 2),
+                    trace.replace(proxy_frame, proxy_frame.replace("device_proxy", "direct")),
+                    trace.replace(proxy_complete, ""), trace.replace(proxy_complete, proxy_complete * 2)):
+            with self.subTest(proxy_contract=bad):
+                self.assertFalse(self.simulate_metalfx("fsr", bad)["pass"])
 
     def test_fsr_summary_without_full_sr_and_centered_cap_evidence_cannot_pass(self):
         trace = "OWNED_D3D12_TEMPORAL_BACKEND id=owned-graphics-d3d12\nOWNED_D3D12_FSR_PASS\n"
-        for frame in range(4):
-            trace += f"OWNED_D3D12_FSR_FRAME_PASS frame={frame}\n"
+        for variant in ("direct", "device_proxy"):
+            for frame in range(4):
+                trace += f"OWNED_D3D12_FSR_FRAME_PASS frame={frame} variant={variant}\n"
         for replay, changed in ((0, 0), (1, 0), (2, 1)):
             trace += f"OWNED_D3D12_FSR_REPLAY_PASS replay={replay} pixels=exact destroyed_before_submit=1 sentinel=1 changed_gpu_input={changed}\n"
         for format in (0, 54, 41):
             trace += f"OWNED_D3D12_FSR_EXPOSURE_PASS format={format} value=1 pixels=exact sentinel=1\n"
         trace += "OWNED_D3D12_FSR_CASE_PASS case=rejected_dispatch_output_unchanged result=0\n"
+        trace += "OWNED_D3D12_FSR_CASE_PASS case=device_proxy_underlying_gpu result=0\n"
         self.assertFalse(self.simulate_metalfx("fsr", trace)["pass"])
 
     def simulate(self, *, omit_frame: int | None = None, backend_log: str = "",
@@ -1150,7 +1171,7 @@ case=exposure_gpu_replay replay=2 value=3.14159012 half_bits=4248 max_ulp=0 cont
                     kwargs["stderr"].write(stderr_diagnostic)
                     if foreign:
                         kwargs["stderr"].write("dyld[1]: /not-executed/D3DMetal.framework/D3DMetal\n")
-                    (args.out / "owned-d3d12-ngx_d3d12.log").write_text(backend_log)
+                    (args.out / "owned-d3d12-ngx_d3dalloy-d3d12.log").write_text(backend_log)
                     if timeout:
                         raise subprocess.TimeoutExpired(command, 1)
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")

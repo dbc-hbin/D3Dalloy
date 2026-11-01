@@ -17,7 +17,7 @@ runtime = args.runtime.resolve()
 source = (root / "src/d3d12/d3d12_shader_cache.cpp").read_text()
 source = source[source.index("#include <algorithm>"):source.index("std::map<std::wstring, std::weak_ptr<Cache>> registry;")]
 production = out / "production-cache.inc"
-production.write_text(source + "\n} // namespace\n} // namespace dxmt\n")
+production.write_text(source + "\n} // namespace\n} // namespace d3dalloy\n")
 for abi, target in (("x64", "x86_64"), ("x86", "i686")):
     executable = out / f"shader-cache-index-{abi}.exe"
     subprocess.run([str(args.compiler_bin / f"{target}-w64-mingw32-clang++"), "-std=c++20", "-O2",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise DXMT metallib serialization with real linked Metal RT functions.
+"""Exercise D3Dalloy metallib serialization with real linked Metal RT functions.
 
 The public Metal frontend produces an AIR contract fixture only. DXIL production
 compilation never invokes it. The library under test is emitted by our writer.

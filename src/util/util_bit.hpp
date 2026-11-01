@@ -12,12 +12,12 @@
 
 #if (defined(__x86_64__) && !defined(__arm64ec__)) || (defined(_M_X64) && !defined(_M_ARM64EC)) \
     || defined(__i386__) ||  defined(_M_IX86)
-#define DXMT_ARCH_X86
+#define D3DALLOY_ARCH_X86
 #if defined(__x86_64__) || defined(_M_X64)
-#define DXMT_ARCH_X86_64
+#define D3DALLOY_ARCH_X86_64
 #endif
 #elif defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
-#define DXMT_ARCH_ARM64
+#define D3DALLOY_ARCH_ARM64
 #else
 #error "Unknown CPU Architecture"
 #endif
@@ -29,7 +29,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace dxmt::bit {
+namespace d3dalloy::bit {
 
 inline uint32_t popcnt(uint32_t n) {
   return std::popcount(n);
@@ -167,4 +167,4 @@ private:
   uint64_t m_qwords[Qwords];
 };
 
-} // namespace dxmt::bit
+} // namespace d3dalloy::bit

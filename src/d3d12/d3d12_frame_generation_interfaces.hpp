@@ -70,7 +70,7 @@ DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a021", IMTLD3D12FrameGener
   virtual HRESULT STDMETHODCALLTYPE CreateFrameGenerationState(const MTL_FRAME_GENERATION_CREATE_DESC *desc,
       IMTLD3D12FrameGenerationState **state) = 0;
 };
-// Exposed by DXMT D3D12 swapchains. Presents the interpolated member of a pair whose real
+// Exposed by D3Dalloy D3D12 swapchains. Presents the interpolated member of a pair whose real
 // member the caller presents next; only that real Present ends the application frame
 // (async-pipeline epoch, Reflex present generation and fallback sleep).
 DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a023", IMTLD3D12GeneratedPresent) : public IUnknown {

@@ -14,7 +14,7 @@
 #include <string_view>
 
 extern "C" const char OwnedD3D12CoreGeneration[33] = OWNED_D3D12_CORE_GENERATION;
-namespace dxmt {
+namespace d3dalloy {
 namespace {
 // D3D12_ERROR_INVALID_REDIST is absent from the supported MinGW winerror.h.
 // https://devblogs.microsoft.com/directx/gettingstarted-dx12agility/
@@ -180,11 +180,11 @@ HRESULT PreflightInstalled(HANDLE file, UINT version) {
 #error Unsupported owned Core PE ABI
 #endif
     // Also rejects Wine builtin/placeholder DOS stubs before any executable mapping.
-    DxmtPeImage image;
-    if (dxmt_pe_image(bytes, size, machine, &image) != DXMT_PE_SUCCESS) return DXGI_ERROR_UNSUPPORTED;
+    D3DalloyPeImage image;
+    if (d3dalloy_pe_image(bytes, size, machine, &image) != D3DALLOY_PE_SUCCESS) return DXGI_ERROR_UNSUPPORTED;
     const auto lookup = [&](std::string_view name, uint64_t count) -> const unsigned char * {
       uint64_t offset;
-      if (dxmt_pe_export(bytes, size, &image, name.data(), name.size(), count, &offset) != DXMT_PE_SUCCESS)
+      if (d3dalloy_pe_export(bytes, size, &image, name.data(), name.size(), count, &offset) != D3DALLOY_PE_SUCCESS)
         return nullptr;
       return bytes + offset;
     };
@@ -441,5 +441,5 @@ HRESULT CreateGlobalSDKDevice(IUnknown *adapter, D3D_FEATURE_LEVEL level, REFIID
 }
 }
 extern "C" const OwnedD3D12MainBridge1 *WINAPI OwnedD3D12MainGetBridge1(UINT version, UINT size) {
-  return version == 1 && size == sizeof(OwnedD3D12MainBridge1) ? &dxmt::main_bridge : nullptr;
+  return version == 1 && size == sizeof(OwnedD3D12MainBridge1) ? &d3dalloy::main_bridge : nullptr;
 }

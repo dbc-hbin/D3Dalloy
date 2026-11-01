@@ -1,11 +1,11 @@
 #pragma once
 #include "com/com_guid.hpp"
 #include "d3d11_device_child.hpp"
-#include "dxmt_occlusion_query.hpp"
+#include "d3dalloy_occlusion_query.hpp"
 #include "log/log.hpp"
 #include "../d3d10/d3d10_query.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 template <typename Query>
 class MTLD3DQueryBase : public MTLD3D11DeviceChild<Query> {
@@ -182,4 +182,4 @@ HRESULT CreateTimestampQuery(MTLD3D11Device *pDevice,
                               const D3D11_QUERY_DESC1 *pDesc,
                               ID3D11Query1 **ppQuery);
 
-} // namespace dxmt
+} // namespace d3dalloy

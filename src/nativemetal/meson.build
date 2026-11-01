@@ -17,9 +17,9 @@ winemetal_ld_args = [
 winemetal_dll = shared_library('winemetal', winemetal_src,
   name_prefix         : '',
   dependencies        : [ airconv_dep_darwin ],
-  include_directories : [ dxmt_include_path, include_directories('.'), include_directories('../') ],
-  c_args              : ['-ObjC', '-DDXMT_NATIVE=1'],
-  objcpp_args         : ['-DDXMT_NATIVE=1'],
+  include_directories : [ d3dalloy_include_path, include_directories('.'), include_directories('../') ],
+  c_args              : ['-ObjC', '-DD3DALLOY_NATIVE=1'],
+  objcpp_args         : ['-DD3DALLOY_NATIVE=1'],
   link_args           : winemetal_ld_args,
   build_rpath         : '@loader_path/:@loader_path/../../',
 )

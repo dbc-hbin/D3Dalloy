@@ -20,9 +20,9 @@ CDXBCParser::CDXBCParser() :
 // CDXBCParser::ReadDXBC()
 HRESULT CDXBCParser::ReadDXBC( const void* pContainer, UINT ContainerSizeInBytes )
 {
-    DxmtShaderContainerInfo info;
-    if (dxmt_shader_container_parse(pContainer, ContainerSizeInBytes, DXMT_SHADER_CONTAINER_LEGACY,
-                                    &info) != DXMT_SHADER_BYTECODE_SUCCESS)
+    D3DalloyShaderContainerInfo info;
+    if (d3dalloy_shader_container_parse(pContainer, ContainerSizeInBytes, D3DALLOY_SHADER_CONTAINER_LEGACY,
+                                    &info) != D3DALLOY_SHADER_BYTECODE_SUCCESS)
         return E_FAIL;
     m_pContainer = static_cast<const BYTE*>(pContainer);
     m_ContainerSize = info.size;
@@ -32,11 +32,11 @@ HRESULT CDXBCParser::ReadDXBC( const void* pContainer, UINT ContainerSizeInBytes
     return S_OK;
 }
 
-bool CDXBCParser::GetChunk(UINT32 BlobIndex, DxmtShaderChunk& Chunk) const
+bool CDXBCParser::GetChunk(UINT32 BlobIndex, D3DalloyShaderChunk& Chunk) const
 {
     return m_pContainer &&
-        dxmt_shader_container_chunk(m_pContainer, m_ContainerSize, DXMT_SHADER_CONTAINER_LEGACY,
-                                    BlobIndex, &Chunk) == DXMT_SHADER_BYTECODE_SUCCESS;
+        d3dalloy_shader_container_chunk(m_pContainer, m_ContainerSize, D3DALLOY_SHADER_CONTAINER_LEGACY,
+                                    BlobIndex, &Chunk) == D3DALLOY_SHADER_BYTECODE_SUCCESS;
 }
 
 //---------------------------------------------------------------------------------------------------------------------------------
@@ -56,7 +56,7 @@ UINT CDXBCParser::FindNextMatchingBlob( DXBCFourCC SearchFourCC, UINT SearchStar
 {
     for (UINT b = SearchStartBlobIndex; b < m_BlobCount; b++)
     {
-        DxmtShaderChunk chunk;
+        D3DalloyShaderChunk chunk;
         if (!GetChunk(b, chunk))
             return (UINT)DXBC_BLOB_NOT_FOUND;
         if (chunk.fourcc == static_cast<uint32_t>(SearchFourCC))
@@ -92,7 +92,7 @@ UINT CDXBCParser::GetBlobCount()
 // CDXBCParser::GetBlob()
 const void* CDXBCParser::GetBlob( UINT BlobIndex )
 {
-    DxmtShaderChunk chunk;
+    D3DalloyShaderChunk chunk;
     if (!GetChunk(BlobIndex, chunk))
     {
         return NULL;
@@ -104,7 +104,7 @@ const void* CDXBCParser::GetBlob( UINT BlobIndex )
 // CDXBCParser::GetBlobSize()
 UINT CDXBCParser::GetBlobSize( UINT BlobIndex )
 {
-    DxmtShaderChunk chunk;
+    D3DalloyShaderChunk chunk;
     if (!GetChunk(BlobIndex, chunk))
     {
         return 0;
@@ -116,7 +116,7 @@ UINT CDXBCParser::GetBlobSize( UINT BlobIndex )
 // CDXBCParser::GetBlobFourCC()
 UINT CDXBCParser::GetBlobFourCC( UINT BlobIndex )
 {
-    DxmtShaderChunk chunk;
+    D3DalloyShaderChunk chunk;
     if (!GetChunk(BlobIndex, chunk))
     {
         return 0;

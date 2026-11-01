@@ -12,7 +12,7 @@
 #include <string>
 #include <string_view>
 
-namespace dxmt::sharing {
+namespace d3dalloy::sharing {
 
 enum class Kind : uint32_t { Heap = 1, Buffer = 2, Texture = 3, Fence = 4 };
 constexpr uint64_t kPayloadOffset = 0x10000;
@@ -22,7 +22,7 @@ constexpr uint64_t kLinkMagic = 0x4b4e494c54584d44ull; // "DMXTLINK"
 constexpr uint32_t kVersion = 3;
 constexpr uint32_t kCastFormatWordCount = 4;
 constexpr uint32_t kTextureStorageSwizzledVolume = 1;
-/* Object-namespace prefix of a main shared section; distinct from upstream DXMT's so the two never open each other. */
+/* Object-namespace prefix of a main shared section; distinct from upstream D3Dalloy's so the two never open each other. */
 constexpr wchar_t kSharePrefix[] = L"Local\\d3dalloy.share.";
 
 struct Slot {
@@ -232,4 +232,4 @@ GetSharedAdapterLuid(HANDLE handle, LUID *luid) {
   return S_OK;
 }
 
-} // namespace dxmt::sharing
+} // namespace d3dalloy::sharing

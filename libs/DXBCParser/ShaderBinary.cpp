@@ -364,9 +364,9 @@ GlobalInfoInitializer init;
 
 HRESULT CShaderCodeParser::SetShader(CONST CShaderToken *pBuffer,
                                      UINT ByteSize) {
-  DxmtDxbcProgram program;
-  if (dxmt_dxbc_program_parse(pBuffer, ByteSize, &program) !=
-      DXMT_DXBC_PROGRAM_SUCCESS)
+  D3DalloyDxbcProgram program;
+  if (d3dalloy_dxbc_program_parse(pBuffer, ByteSize, &program) !=
+      D3DALLOY_DXBC_PROGRAM_SUCCESS)
     return E_FAIL;
   m_pShaderCode = pBuffer;
   m_ByteSize = ByteSize;
@@ -548,11 +548,11 @@ BOOL CShaderCodeParser::ParseInstruction(CInstruction *pInstruction) {
   const CShaderToken *pStart = m_pCurrentToken;
   // Rust walks the tokens decoded below and bounds them by both the
   // instruction length and the program. Nothing is decoded on failure.
-  DxmtDxbcInstruction bounds;
-  if (dxmt_dxbc_instruction_parse(m_pShaderCode, m_ByteSize,
+  D3DalloyDxbcInstruction bounds;
+  if (d3dalloy_dxbc_instruction_parse(m_pShaderCode, m_ByteSize,
                                   g_InstructionOperandCounts,
                                   D3D10_SB_NUM_OPCODES, CurrentTokenOffset(),
-                                  &bounds) != DXMT_DXBC_PROGRAM_SUCCESS)
+                                  &bounds) != D3DALLOY_DXBC_PROGRAM_SUCCESS)
     return FALSE;
   const CShaderToken Token = *m_pCurrentToken++;
   pInstruction->m_OpCode = DECODE_D3D10_SB_OPCODE_TYPE(Token);

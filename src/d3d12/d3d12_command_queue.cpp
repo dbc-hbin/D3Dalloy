@@ -23,7 +23,7 @@
 #include "d3d12_enhanced_barrier.hpp"
 #include "d3d12_pageable.hpp"
 #include "d3d12_standard_swizzle_gpu.hpp"
-#include "dxmt_format.hpp"
+#include "d3dalloy_format.hpp"
 #include "dxgi_interfaces.h"
 #include "log/log.hpp"
 #include "util_env.hpp"
@@ -53,7 +53,7 @@
 #include "d3d10_1.h"
 #include "d3d11_4.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 constexpr auto kCommandQueueSize = 32u;
 
@@ -1024,8 +1024,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     Rc<Presenter> presenter;
     WMT::Reference<WMT::PresentationObserver> observer;
     std::shared_ptr<std::atomic<bool>> observer_fault;
-    std::shared_ptr<DXMTPresentLatency> latency;
-    DXMTPresentComposition composition;
+    std::shared_ptr<D3DalloyPresentLatency> latency;
+    D3DalloyPresentComposition composition;
     uint64_t present_id = 0;
     uint64_t restart_epoch = 0;
     std::shared_ptr<std::atomic<bool>> credit;
@@ -1052,7 +1052,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   using QueueTask = std::variant<ExecuteTask, SignalTask, WaitTask, PresentTask, TileMappingTask, MarkerTask>;
   owned_graphics::QueueTaskFifo<QueueTask> task_fifo_;
-  dxmt::mutex mutex_enqueue_;
+  d3dalloy::mutex mutex_enqueue_;
   std::atomic<bool> stopping_ = false;
   bool cancel_unsubmitted_ = false; // Submission thread only, after an unresolved shutdown wait.
   std::mutex wait_mutex_;
@@ -1067,7 +1067,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::shared_ptr<Atomic64Phase> atomic64_phase;
     WMT::Reference<WMT::MTL4Submission> submission{};
     HANDLE semaphore{};
-    std::shared_ptr<DXMTPresentLatency> latency;
+    std::shared_ptr<D3DalloyPresentLatency> latency;
     // Allocator GPU argument storage uses newBufferWithBytesNoCopy. Retaining
     // its MTLBuffer alone does not retain the allocator's malloc backing.
     // Keep that owner until the submitted command buffer has completed.
@@ -1091,7 +1091,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::vector<SignalTask> fence_completions;
     // Retain the presenter until GPU completion, not merely task encoding.
     Rc<Presenter> present_completion;
-    std::shared_ptr<DXMTPresentHistory> present_history;
+    std::shared_ptr<D3DalloyPresentHistory> present_history;
     struct NativePresent {
       WMT::Reference<WMT::MetalDrawable> drawable;
       WMT::Reference<WMT::SharedEvent> restart_token;
@@ -1139,10 +1139,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   };
   std::array<NativeEncodingSlot, kCommandQueueSize> native_encoding_slots_;
   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
-  dxmt::thread inflight_cmdbuf_wait_thread_;
-  dxmt::thread submission_thread_;
+  d3dalloy::thread inflight_cmdbuf_wait_thread_;
+  d3dalloy::thread submission_thread_;
 
-  dxmt::mutex mutex_commit_;
+  d3dalloy::mutex mutex_commit_;
 
   void
   CommandBufferWaitingThread() {
@@ -1283,7 +1283,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   struct CommittingScope {
     MTLD3D12CommandQueueImpl *queue;
     GPUExecutionGate::Ticket execution_ticket;
-    std::lock_guard<dxmt::mutex> lock;
+    std::lock_guard<d3dalloy::mutex> lock;
     GPUExecutionGate::EncodingAdmission encoding_admission;
     uint64_t seq;
     InflightCommandBuffer &inflight;
@@ -1541,7 +1541,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   bool
   PushTileMapping(TileMappingTask &&task) {
     try {
-      std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
+      std::lock_guard<d3dalloy::mutex> enqueue_lock(mutex_enqueue_);
       if (device_->RemovedReason() != S_OK)
         return false;
       return task_fifo_.push(QueueTask{std::move(task)});
@@ -1589,7 +1589,7 @@ public:
     const uint64_t last_submission = submission_ring_.lastPublished();
     if (last_submission)
       submission_ring_.waitUntilRetired(last_submission);
-    std::lock_guard<dxmt::mutex> lock(mutex_commit_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_commit_);
     submission_ring_.stop();
     inflight_cmdbuf_wait_thread_.join();
   }
@@ -2498,14 +2498,14 @@ public:
         // its application stages (which would duplicate UAV/statistics/SO writes).
         case WMTRenderCommandDrawMeshThreadgroups:
         case WMTRenderCommandDrawMeshThreadgroupsIndirect:
-        case WMTRenderCommandDXMTGeometryDraw:
-        case WMTRenderCommandDXMTGeometryDrawIndexed:
-        case WMTRenderCommandDXMTGeometryDrawIndirect:
-        case WMTRenderCommandDXMTGeometryDrawIndexedIndirect:
-        case WMTRenderCommandDXMTTessellationMeshDraw:
-        case WMTRenderCommandDXMTTessellationMeshDrawIndexed:
-        case WMTRenderCommandDXMTTessellationMeshDrawIndirect:
-        case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect:
+        case WMTRenderCommandD3DalloyGeometryDraw:
+        case WMTRenderCommandD3DalloyGeometryDrawIndexed:
+        case WMTRenderCommandD3DalloyGeometryDrawIndirect:
+        case WMTRenderCommandD3DalloyGeometryDrawIndexedIndirect:
+        case WMTRenderCommandD3DalloyTessellationMeshDraw:
+        case WMTRenderCommandD3DalloyTessellationMeshDrawIndexed:
+        case WMTRenderCommandD3DalloyTessellationMeshDrawIndirect:
+        case WMTRenderCommandD3DalloyTessellationMeshDrawIndexedIndirect:
           if (!draw.mesh_capture) return false;
           break;
         case WMTRenderCommandUseResource: bind_record.operator()<wmtcmd_render_useresource>(); break;
@@ -3619,7 +3619,7 @@ public:
     return true;
   }
 
-  /* GS strip expansion (MeshCaptureIndirectData::strip_expand): per command, dxmt_mesh_strip_cut writes the list,
+  /* GS strip expansion (MeshCaptureIndirectData::strip_expand): per command, d3dalloy_mesh_strip_cut writes the list,
    * its draw arguments and object grid, exactly as RecordMeshStripCut does for a direct draw of the arguments. */
   void
   EncodeStripExpansion(WMT::MTL4CommandBuffer cmdbuf, const MeshCaptureExecution &execution) {
@@ -3740,8 +3740,8 @@ public:
           // The expanded list: an indexed list draw over 32-bit values with the strip's base vertex.
           const uint64_t arguments = command.strip_control_offset + sizeof(MeshCaptureIndirectData::StripCutControl);
           encoder.useResource(command.strip_list, WMTResourceUsageRead, WMTRenderStageObject);
-          wmtcmd_render_dxmt_geometry_draw_indexed_indirect draw{};
-          draw.type = WMTRenderCommandDXMTGeometryDrawIndexedIndirect;
+          wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect draw{};
+          draw.type = WMTRenderCommandD3DalloyGeometryDrawIndexedIndirect;
           draw.next.set(nullptr);
           draw.index_buffer = command.strip_list;
           draw.index_buffer_offset = 0;
@@ -3756,8 +3756,8 @@ public:
         }
         const uint32_t warps = (command.vertex_count - 1) / data.warp_increment + 1;
         if (data.indexed) {
-          wmtcmd_render_dxmt_geometry_draw_indexed draw{};
-          draw.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+          wmtcmd_render_d3dalloy_geometry_draw_indexed draw{};
+          draw.type = WMTRenderCommandD3DalloyGeometryDrawIndexed;
           draw.next.set(nullptr);
           draw.draw_arguments_offset = command.args_offset;
           draw.index_buffer = command.index_buffer;
@@ -3767,8 +3767,8 @@ public:
           draw.vertex_per_warp = data.vertex_per_warp;
           encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&draw));
         } else {
-          wmtcmd_render_dxmt_geometry_draw draw{};
-          draw.type = WMTRenderCommandDXMTGeometryDraw;
+          wmtcmd_render_d3dalloy_geometry_draw draw{};
+          draw.type = WMTRenderCommandD3DalloyGeometryDraw;
           draw.next.set(nullptr);
           draw.draw_arguments_offset = command.args_offset;
           draw.warp_count = warps;
@@ -3792,8 +3792,8 @@ public:
         encoder.setObjectBuffer(execution.storage, command.args_offset, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
         const uint32_t groups = (command.patches - 1) / patch_per_group + 1;
         if (data.indexed) {
-          wmtcmd_render_dxmt_tessellation_mesh_draw_indexed draw{};
-          draw.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
+          wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed draw{};
+          draw.type = WMTRenderCommandD3DalloyTessellationMeshDrawIndexed;
           draw.next.set(nullptr);
           draw.draw_arguments_offset = command.args_offset;
           draw.index_buffer = command.index_buffer;
@@ -3804,8 +3804,8 @@ public:
           draw.patch_per_mesh_instance = groups;
           encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&draw));
         } else {
-          wmtcmd_render_dxmt_tessellation_mesh_draw draw{};
-          draw.type = WMTRenderCommandDXMTTessellationMeshDraw;
+          wmtcmd_render_d3dalloy_tessellation_mesh_draw draw{};
+          draw.type = WMTRenderCommandD3DalloyTessellationMeshDraw;
           draw.next.set(nullptr);
           draw.draw_arguments_offset = command.args_offset;
           draw.instance_count = command.instances;
@@ -3893,8 +3893,8 @@ public:
       if (!cached) {
         WMTRenderPipelineInfo info;
         WMT::InitializeRenderPipelineInfo(info);
-        auto vertex = library.newFunction("dxmt_resolve_vertex");
-        auto fragment = library.newFunction((std::string("dxmt_msaa_export_") + suffix).c_str());
+        auto vertex = library.newFunction("d3dalloy_resolve_vertex");
+        auto fragment = library.newFunction((std::string("d3dalloy_msaa_export_") + suffix).c_str());
         info.vertex_function = vertex.handle;
         info.fragment_function = fragment.handle;
         info.colors[0].pixel_format = format;
@@ -3909,7 +3909,7 @@ public:
       const bool array = texture->arrayLength() > 1;
       auto &cached = writable_msaa_import_[scalar + (array ? 2 : 0)];
       if (!cached) {
-        std::string name = array ? "dxmt_msaa_import_array_" : "dxmt_msaa_import_";
+        std::string name = array ? "d3dalloy_msaa_import_array_" : "d3dalloy_msaa_import_";
         name += suffix;
         cached = device_->GetMetal4Compiler().newComputePipelineState(library.newFunction(name.c_str()), error);
         if (!cached) return false;
@@ -4048,7 +4048,7 @@ public:
     use.descriptor_owner = std::move(descriptor_owner);
     if (texture->reservedVolumeLayoutAddress) {
       auto &reserved = *texture->reservedResource;
-      std::lock_guard<dxmt::mutex> lock(reserved.mutex);
+      std::lock_guard<d3dalloy::mutex> lock(reserved.mutex);
       use.volume_buffers[0] = reserved.volume_layout_buffer;
       use.volume_buffers[2] = reserved.status_buffer;
       if (view.reservedVolumeCastLayoutAddress)
@@ -4371,7 +4371,7 @@ public:
         WMT::Error error;
         auto library = WMT4::Library(device_->GetLib().getLibrary());
         pipeline = device_->GetMetal4Compiler().newComputePipelineState(
-            library.newFunction(array ? "dxmt_depth_msaa_import_array" : "dxmt_depth_msaa_import"), error);
+            library.newFunction(array ? "d3dalloy_depth_msaa_import_array" : "d3dalloy_depth_msaa_import"), error);
         if (!pipeline) return false;
       }
       uint32_t layout[8] = {width, height, arrays, samples, pitch, uint32_t(image_pitch),
@@ -5549,26 +5549,26 @@ public:
           if (!add({cmd->index_count, cmd->instance_count})) return UINT64_MAX;
           break;
         }
-        case WMTRenderCommandDXMTGeometryDraw: {
-          const auto *cmd = reinterpret_cast<const wmtcmd_render_dxmt_geometry_draw *>(node);
+        case WMTRenderCommandD3DalloyGeometryDraw: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_render_d3dalloy_geometry_draw *>(node);
           if (!add({cmd->warp_count, cmd->instance_count, cmd->vertex_per_warp}) ||
               (!draw && !add({cmd->warp_count, cmd->instance_count, cmd->vertex_per_warp, render.atomic64_gs_instances}))) return UINT64_MAX;
           break;
         }
-        case WMTRenderCommandDXMTGeometryDrawIndexed: {
-          const auto *cmd = reinterpret_cast<const wmtcmd_render_dxmt_geometry_draw_indexed *>(node);
+        case WMTRenderCommandD3DalloyGeometryDrawIndexed: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_render_d3dalloy_geometry_draw_indexed *>(node);
           if (!add({cmd->warp_count, cmd->instance_count, cmd->vertex_per_warp}) ||
               (!draw && !add({cmd->warp_count, cmd->instance_count, cmd->vertex_per_warp, render.atomic64_gs_instances}))) return UINT64_MAX;
           break;
         }
-        case WMTRenderCommandDXMTTessellationMeshDraw: {
-          const auto *cmd = reinterpret_cast<const wmtcmd_render_dxmt_tessellation_mesh_draw *>(node);
+        case WMTRenderCommandD3DalloyTessellationMeshDraw: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_render_d3dalloy_tessellation_mesh_draw *>(node);
           if (!add({cmd->patch_per_mesh_instance, cmd->instance_count, cmd->threads_per_patch, cmd->patch_per_group}) ||
               (!draw && !add({cmd->patch_per_mesh_instance, cmd->instance_count, cmd->patch_per_group, render.atomic64_tess_workloads, 32}))) return UINT64_MAX;
           break;
         }
-        case WMTRenderCommandDXMTTessellationMeshDrawIndexed: {
-          const auto *cmd = reinterpret_cast<const wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *>(node);
+        case WMTRenderCommandD3DalloyTessellationMeshDrawIndexed: {
+          const auto *cmd = reinterpret_cast<const wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed *>(node);
           if (!add({cmd->patch_per_mesh_instance, cmd->instance_count, cmd->threads_per_patch, cmd->patch_per_group}) ||
               (!draw && !add({cmd->patch_per_mesh_instance, cmd->instance_count, cmd->patch_per_group, render.atomic64_tess_workloads, 32}))) return UINT64_MAX;
           break;
@@ -7033,20 +7033,20 @@ public:
             } else if (as->operation == RTASOperation::Deserialize) {
               D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER serialized;
               memcpy(&serialized, mapped, sizeof(serialized));
-              DxmtRtasSerializedLayout layout;
-              if (dxmt_rtas_serialized_prefix(&serialized, sizeof(serialized), as->sourceLocation.available, &layout)) {
+              D3DalloyRtasSerializedLayout layout;
+              if (d3dalloy_rtas_serialized_prefix(&serialized, sizeof(serialized), as->sourceLocation.available, &layout)) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
               }
               if (layout.blocks) {
-                if (!read_source(DXMT_RTAS_SERIALIZED_HEADER_SIZE, DXMT_RTAS_SERIALIZED_BLOCK_SIZE) ||
-                    dxmt_rtas_serialized_block(&layout, mapped, DXMT_RTAS_SERIALIZED_BLOCK_SIZE, &layout)) {
+                if (!read_source(D3DALLOY_RTAS_SERIALIZED_HEADER_SIZE, D3DALLOY_RTAS_SERIALIZED_BLOCK_SIZE) ||
+                    d3dalloy_rtas_serialized_block(&layout, mapped, D3DALLOY_RTAS_SERIALIZED_BLOCK_SIZE, &layout)) {
                   device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
                 }
               }
               if (!read_source(layout.header_offset, raytracing::kHeaderSize)) return;
               memcpy(&as_source_header, mapped, sizeof(as_source_header));
               uint64_t geometryBytes;
-              if (dxmt_rtas_serialized_geometry_bytes(&layout, &as_source_header, sizeof(as_source_header), &geometryBytes)) {
+              if (d3dalloy_rtas_serialized_geometry_bytes(&layout, &as_source_header, sizeof(as_source_header), &geometryBytes)) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
               }
               if (geometryBytes && !read_source(layout.header_offset + raytracing::kHeaderSize, geometryBytes)) return;
@@ -8527,7 +8527,7 @@ public:
       return;
     }
     try {
-      std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
+      std::lock_guard<d3dalloy::mutex> enqueue_lock(mutex_enqueue_);
       if (device_->RemovedReason() != S_OK)
         return;
       ExecuteTask task;
@@ -8697,7 +8697,7 @@ public:
   void EnqueueAnnotation(UINT action, UINT metadata, const void *data, UINT size) {
     try {
       auto annotation = CaptureAnnotation(action, metadata, data, size);
-      std::lock_guard<dxmt::mutex> lock(mutex_enqueue_);
+      std::lock_guard<d3dalloy::mutex> lock(mutex_enqueue_);
       if (device_->RemovedReason() != S_OK) return;
       auto breadcrumb = device_->diagnostics.BeginSubmission(nullptr, this, {D3D12_AUTO_BREADCRUMB_OP_BEGINSUBMISSION,
           static_cast<D3D12_AUTO_BREADCRUMB_OP>(action), D3D12_AUTO_BREADCRUMB_OP_ENDSUBMISSION}, {{1, annotation.label}});
@@ -8771,7 +8771,7 @@ public:
         owner.ptr() != static_cast<ID3D12Device *>(device_))
       return E_INVALIDARG;
     try {
-      std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
+      std::lock_guard<d3dalloy::mutex> enqueue_lock(mutex_enqueue_);
       if (device_->RemovedReason() != S_OK)
         return DXGI_ERROR_DEVICE_REMOVED;
       auto native = static_cast<MTLD3D12Fence *>(pFence);
@@ -8845,7 +8845,7 @@ public:
     std::shared_ptr<owned_graphics::FenceOrderEpoch> registration_order;
     uint64_t registration_id = 0;
     try {
-      std::lock_guard<dxmt::mutex> enqueue_lock(mutex_enqueue_);
+      std::lock_guard<d3dalloy::mutex> enqueue_lock(mutex_enqueue_);
       if (device_->RemovedReason() != S_OK)
         return DXGI_ERROR_DEVICE_REMOVED;
       auto native = static_cast<MTLD3D12Fence *>(pFence);
@@ -8925,18 +8925,18 @@ public:
   ) {
     if (device_->RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain, nullptr, nullptr,
-                                DXMTSwapChainKind::Hwnd);
+    return d3dalloy::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain, nullptr, nullptr,
+                                D3DalloySwapChainKind::Hwnd);
   }
 
   HRESULT STDMETHODCALLTYPE CreateSwapChainWithOutput(
       IDXGIFactory1 *pFactory, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGIOutput *pRestrictToOutput,
-      IDXGISwapChain1 **ppSwapChain, IUnknown *core_window, DXMTSwapChainKind kind
+      IDXGISwapChain1 **ppSwapChain, IUnknown *core_window, D3DalloySwapChainKind kind
   ) override {
     if (device_->RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain,
+    return d3dalloy::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain,
                                  pRestrictToOutput, core_window, kind);
   }
 
@@ -9133,10 +9133,10 @@ public:
 
   HRESULT
   Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after,
-          const DXMTPresentGeometry &geometry, WMT::Reference<WMT::PresentationObserver> observer,
+          const D3DalloyPresentGeometry &geometry, WMT::Reference<WMT::PresentationObserver> observer,
           uint64_t present_id, std::shared_ptr<std::atomic<bool>> observer_fault,
-          DXMTPresentComposition composition, bool do_not_wait,
-          std::shared_ptr<DXMTPresentLatency> latency, bool restart, bool borrowed, bool closes_frame) {
+          D3DalloyPresentComposition composition, bool do_not_wait,
+          std::shared_ptr<D3DalloyPresentLatency> latency, bool restart, bool borrowed, bool closes_frame) {
     if (device_->RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
     if (!presenter || !backbuffer || !latency)
@@ -9158,7 +9158,7 @@ public:
         return HRESULT_FROM_WIN32(GetLastError());
       OwnedHandle retained_completion_handle(completion_handle);
 
-      std::unique_lock<dxmt::mutex> enqueue_lock(mutex_enqueue_, std::defer_lock);
+      std::unique_lock<d3dalloy::mutex> enqueue_lock(mutex_enqueue_, std::defer_lock);
       if (do_not_wait) {
         if (!enqueue_lock.try_lock())
           return DXGI_ERROR_WAS_STILL_DRAWING;
@@ -9243,4 +9243,4 @@ CreateCommandQueue(MTLD3D12Device *pDevice, const D3D12_COMMAND_QUEUE_DESC *pDes
   return command_queue->QueryInterface(riid, ppCommandQueue);
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

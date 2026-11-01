@@ -36,7 +36,7 @@
 #include "airconv_context.hpp"
 #include "airconv_error.hpp"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 llvm::Error createError(const llvm::Twine &message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
@@ -394,7 +394,7 @@ llvm::Expected<std::unique_ptr<ModuleInfo>> LowerShader(
   if (auto error = LowerMatrices(**info))
     return std::move(error);
   InitializeAtomic64Phase(*(*info)->module, args);
-  if ((*info)->module->getModuleFlag("dxmt.wide-wave-threads")) {
+  if ((*info)->module->getModuleFlag("d3dalloy.wide-wave-threads")) {
     // Force the stage pass to bind the physical linear group index, even when
     // the source only uses WaveGetLaneIndex or dispatch coordinates.
     llvm::IRBuilder<> builder(&*(*info)->entry->getEntryBlock().getFirstInsertionPt());
@@ -413,10 +413,10 @@ llvm::Expected<std::unique_ptr<ModuleInfo>> LowerShader(
     return binding.takeError();
   if (auto err = LowerResources(**info, **binding))
     return std::move(err);
-  if (auto *sample_position = (*info)->module->getFunction("dxmt.sample_pos.i32");
+  if (auto *sample_position = (*info)->module->getFunction("d3dalloy.sample_pos.i32");
       sample_position && sample_position->isDeclaration()) {
-    dxmt::linkSamplePos(*(*info)->module);
-    sample_position = (*info)->module->getFunction("dxmt.sample_pos.i32");
+    d3dalloy::linkSamplePos(*(*info)->module);
+    sample_position = (*info)->module->getFunction("d3dalloy.sample_pos.i32");
     if (!sample_position || sample_position->isDeclaration())
       return createError("dxil: failed to link sample-position helper");
   }
@@ -919,4 +919,4 @@ llvm::Error LowerVectors(llvm::Module &module, bool final) {
   return Error::success();
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

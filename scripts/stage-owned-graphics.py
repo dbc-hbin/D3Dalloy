@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage and verify an isolated Wine runtime using the owned DXMT-derived graphics translator."""
+"""Stage and verify an isolated Wine runtime using the owned D3Dalloy-derived graphics translator."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from owned_graphics_arch import architecture, inspect_pe, macho_architectures, r
 
 SCHEMA = 2
 MANIFEST = "owned-graphics-runtime.json"
-NGX_CERTIFICATE = Path("share/dxmt/ngx-runtime.cer")
+NGX_CERTIFICATE = Path("share/d3dalloy/ngx-runtime.cer")
 WINE_INF = Path("share/wine/wine.inf")
 WINE_DISPLAY_SOURCE = Path(__file__).resolve().parents[2] / "Wine-darwin/toolchains/wine-game-display"
 WINE_DISPLAY_SOURCE_PIN = "913e31f201d344223bdf3d13a50a41af35893d12"
@@ -29,12 +29,12 @@ WINE_DISPLAY_ABI_HEADERS = ("src/dxgi/dxgi_composition.h", "src/winemetal/wineme
 REQUIRED_DCOMP_EXPORTS = {"DCompositionCreateDevice", "DCompositionCreateDevice2", "DCompositionCreateDevice3"}
 WINDOWS_DIR = Path("lib/wine/x86_64-windows")
 UNIX_DIR = Path("lib/wine/x86_64-unix")
-DXMT_WINDOWS_DIR = Path("x86_64-windows")
-DXMT_UNIX_DIR = Path("x86_64-unix")
+D3DALLOY_WINDOWS_DIR = Path("x86_64-windows")
+D3DALLOY_UNIX_DIR = Path("x86_64-unix")
 # New-style WoW64: 32-bit PE modules run in i386-windows and reach the single
 # x86_64 winemetal.so through Wine's 32-bit unix-call thunks.
 WOW64_WINDOWS_DIR = Path("lib/wine/i386-windows")
-DXMT_WOW64_DIR = Path("i386-windows")
+D3DALLOY_WOW64_DIR = Path("i386-windows")
 PE_MACHINE_I386 = 0x14C
 NATIVE_MODULE = "winemetal.so"
 # The owned DXIL shader compiler is compiled from the owned patch series into
@@ -42,7 +42,7 @@ NATIVE_MODULE = "winemetal.so"
 # on a separately licensed/native compiler library or the GPTK backend.
 FORBIDDEN_DEPENDENCY_TOKENS = ("d3dmetal", "libd3dshared", "metalirconverter", "dxilconv")
 # Artifacts the removed external-SDK DXIL flow used to install. Any of these names
-# anywhere in a DXMT install tree means a stale or substituted build, not the
+# anywhere in a D3Dalloy install tree means a stale or substituted build, not the
 # owned compiler.
 REMOVED_COMPILER_ARTIFACT_NAMES = (
     "libdxmt-dxilconv.dylib",
@@ -77,11 +77,11 @@ WINE_BUILTIN_MARKER = b"Wine builtin DLL"
 WINE_FAKE_MARKER = b"Wine placeholder DLL"
 OWNED_NGX_D3D12_MARKER = b"own-ngxd3d12"
 FSR_MODULE = "amd_fidelityfx_upscaler_dx12.dll"
-OWNED_FSR_MARKER = b"dxmt-owned-fsr-metalfx-v1"
+OWNED_FSR_MARKER = b"d3dalloy-owned-fsr-metalfx-v1"
 FSR_FRAMEGENERATION_MODULE = "amd_fidelityfx_framegeneration_dx12.dll"
-OWNED_FSR_FRAMEGENERATION_MARKER = b"dxmt-owned-fsr-framegeneration-metalfx-v1"
+OWNED_FSR_FRAMEGENERATION_MARKER = b"d3dalloy-owned-fsr-framegeneration-metalfx-v1"
 FSR_RAYREGENERATION_MODULE = "amd_fidelityfx_denoiser_dx12.dll"
-OWNED_FSR_RAYREGENERATION_MARKER = b"dxmt-owned-fsr-rr-metalfx-v1"
+OWNED_FSR_RAYREGENERATION_MARKER = b"d3dalloy-owned-fsr-rr-metalfx-v1"
 FSR_MODULE_MARKERS = {FSR_MODULE: OWNED_FSR_MARKER,
                       FSR_FRAMEGENERATION_MODULE: OWNED_FSR_FRAMEGENERATION_MARKER,
                       FSR_RAYREGENERATION_MODULE: OWNED_FSR_RAYREGENERATION_MARKER}
@@ -138,7 +138,7 @@ FOREIGN_GRAPHICS_ENV = (
     "DXVK_STATE_CACHE_PATH",
     "VK_ICD_FILENAMES",
     "VK_DRIVER_FILES",
-    "DXMT_ENABLE_NVEXT",
+    "D3DALLOY_ENABLE_NVEXT",
 )
 PRESERVED_GPTK_FILES = (
     Path("lib/external/D3DMetal.framework"),
@@ -158,26 +158,26 @@ def sha256(path: Path) -> str:
 def ngx_enrollment(inf: bytes, der: bytes) -> bytes:
     """Replace only our BaseInstall directive and certificate registry section."""
     for label, prefix in ((b"BaseInstall", b""), (b"certificate", b"\n")):
-        begin = prefix + b"; BEGIN DXMT NGX " + label + b"\n"
-        end = b"; END DXMT NGX " + label + b"\n"
+        begin = prefix + b"; BEGIN D3Dalloy NGX " + label + b"\n"
+        end = b"; END D3Dalloy NGX " + label + b"\n"
         if begin in inf:
             if inf.count(begin) != 1 or inf.count(end) != 1:
-                raise ValueError("invalid DXMT NGX wine.inf enrollment markers")
+                raise ValueError("invalid D3Dalloy NGX wine.inf enrollment markers")
             start = inf.index(begin)
             finish = inf.index(end, start) + len(end)
             inf = inf[:start] + inf[finish:]
     base = re.search(rb"(?im)^\[BaseInstall\][ \t]*\r?\n", inf)
     if base is None:
         raise ValueError("wine.inf lacks BaseInstall for NGX certificate enrollment")
-    directive = (b"; BEGIN DXMT NGX BaseInstall\n"
-                 b"AddReg=DXMT.NGX.Certificate\n; END DXMT NGX BaseInstall\n")
+    directive = (b"; BEGIN D3Dalloy NGX BaseInstall\n"
+                 b"AddReg=D3Dalloy.NGX.Certificate\n; END D3Dalloy NGX BaseInstall\n")
     thumbprint = hashlib.sha1(der).hexdigest().upper()
     blob = struct.pack("<III", 32, 1, len(der)) + der
     chunks = [b",".join(f"{byte:02x}".encode() for byte in blob[offset:offset + 32])
               for offset in range(0, len(blob), 32)]
-    section = (b"\n; BEGIN DXMT NGX certificate\n[DXMT.NGX.Certificate]\n"
+    section = (b"\n; BEGIN D3Dalloy NGX certificate\n[D3Dalloy.NGX.Certificate]\n"
                + f'HKCU,"Software\\Microsoft\\SystemCertificates\\Root\\Certificates\\{thumbprint}","Blob",0x00000001,\\\n'.encode()
-               + b",\\\n".join(chunks) + b"\n; END DXMT NGX certificate\n")
+               + b",\\\n".join(chunks) + b"\n; END D3Dalloy NGX certificate\n")
     return inf[:base.end()] + directive + inf[base.end():] + section
 
 
@@ -190,12 +190,12 @@ def sign_ngx(runtime: Path, modules: tuple[Path, ...]) -> dict:
     ensure_replaceable_target(inf, runtime)
     regular_file(inf, "Wine initialization INF")
     ensure_replaceable_target(runtime / NGX_CERTIFICATE, runtime)
-    with tempfile.TemporaryDirectory(prefix="dxmt-ngx-signing-") as directory:
+    with tempfile.TemporaryDirectory(prefix="d3dalloy-ngx-signing-") as directory:
         temporary = Path(directory)
         key, certificate = temporary / "key.pem", temporary / "certificate.pem"
         commands = [
             ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256", "-days", "3650",
-             "-subj", "/CN=DXMT Owned NGX Runtime", "-addext", "basicConstraints=critical,CA:FALSE",
+             "-subj", "/CN=D3Dalloy Owned NGX Runtime", "-addext", "basicConstraints=critical,CA:FALSE",
              "-addext", "keyUsage=critical,digitalSignature", "-addext", "extendedKeyUsage=codeSigning",
              "-keyout", str(key), "-out", str(certificate)],
             ["openssl", "x509", "-in", str(certificate), "-outform", "DER", "-out", str(temporary / "certificate.der")],
@@ -208,7 +208,7 @@ def sign_ngx(runtime: Path, modules: tuple[Path, ...]) -> dict:
             for index, relative in enumerate(modules):
                 signed = temporary / f"signed-{index}.dll"
                 subprocess.run(["osslsigncode", "sign", "-certs", str(certificate), "-key", str(key),
-                                "-h", "sha256", "-n", "DXMT Owned NGX Runtime",
+                                "-h", "sha256", "-n", "D3Dalloy Owned NGX Runtime",
                                 "-in", str(runtime / relative), "-out", str(signed)],
                                check=True, capture_output=True)
                 subprocess.run(["osslsigncode", "verify", "-CAfile", str(certificate), "-in", str(signed)],
@@ -221,7 +221,7 @@ def sign_ngx(runtime: Path, modules: tuple[Path, ...]) -> dict:
         public.parent.mkdir(parents=True, exist_ok=True)
         public.write_bytes(der)
         inf.write_bytes(enrollment)
-    return {"method": "authenticode-sha256", "subject": "DXMT Owned NGX Runtime",
+    return {"method": "authenticode-sha256", "subject": "D3Dalloy Owned NGX Runtime",
             "trust": "Wine BaseInstall HKCU Root leaf", "private_key_retained": False,
             "certificate": str(NGX_CERTIFICATE), "certificate_sha256": sha256(public),
             "certificate_sha1": hashlib.sha1(der).hexdigest().upper(),
@@ -253,13 +253,13 @@ def existing_symlink_component(path: Path, stop: Path | None = None) -> Path | N
         current = parent
 
 
-def validate_destination(dest: Path, wine_source: Path, dxmt_install: Path) -> None:
+def validate_destination(dest: Path, wine_source: Path, d3dalloy_install: Path) -> None:
     if dest.exists() or dest.is_symlink():
         raise ValueError("wine-dest must be a new path and must not be a symlink")
-    common = Path(os.path.commonpath((str(dest.absolute()), str(wine_source.absolute()), str(dxmt_install.absolute()))))
+    common = Path(os.path.commonpath((str(dest.absolute()), str(wine_source.absolute()), str(d3dalloy_install.absolute()))))
     if existing_symlink_component(dest.parent, common) is not None:
         raise ValueError("wine-dest parent path must not traverse a symlink")
-    for label, source in (("wine-source", wine_source), ("dxmt-install", dxmt_install)):
+    for label, source in (("wine-source", wine_source), ("d3dalloy-install", d3dalloy_install)):
         if under(dest, source) or under(source, dest):
             raise ValueError(f"wine-dest and {label} must not contain one another")
 
@@ -536,7 +536,7 @@ def validate_core_module(path: Path, windows_abi: str, *, legacy_builtin: bool =
 
 
 def validate_fsr_module(path: Path, windows_abi: str = "x64") -> None:
-    regular_file(path, "owned DXMT FSR module")
+    regular_file(path, "owned D3Dalloy FSR module")
     if inspect_pe(path)["windows_abi"] != windows_abi:
         raise ValueError(f"FSR Windows ABI mismatch: {path}; expected {windows_abi}")
     payload = path.read_bytes()
@@ -577,32 +577,32 @@ def validate_source_runtime(wine_source: Path, arch: dict | None = None) -> None
             raise ValueError(f"Wine native image lacks {arch['native_arch']}: {image}")
 
 
-def reject_removed_sdk_artifacts(dxmt_install: Path) -> None:
-    """Reject a DXMT install tree that still carries the removed external DXIL compiler."""
-    leftovers = sorted(str(path.relative_to(dxmt_install)) for path in dxmt_install.rglob("*")
-                       if set(path.relative_to(dxmt_install).parts) & set(REMOVED_COMPILER_ARTIFACT_NAMES))
+def reject_removed_sdk_artifacts(d3dalloy_install: Path) -> None:
+    """Reject a D3Dalloy install tree that still carries the removed external DXIL compiler."""
+    leftovers = sorted(str(path.relative_to(d3dalloy_install)) for path in d3dalloy_install.rglob("*")
+                       if set(path.relative_to(d3dalloy_install).parts) & set(REMOVED_COMPILER_ARTIFACT_NAMES))
     if leftovers:
         raise ValueError(
-            "DXMT install still contains artifacts of the removed external DXIL compiler: "
+            "D3Dalloy install still contains artifacts of the removed external DXIL compiler: "
             + ", ".join(leftovers)
         )
 
 
-def resolve_wow64_artifacts(dxmt_install32: Path, with_nvngx: bool = False, with_nvapi: bool = False,
+def resolve_wow64_artifacts(d3dalloy_install32: Path, with_nvngx: bool = False, with_nvapi: bool = False,
                             with_fsr: bool = False) -> dict[Path, Path]:
     """Resolve a 32-bit Meson install prefix (i386-windows) into the runtime's WoW64 module directory."""
-    if dxmt_install32.is_symlink() or not dxmt_install32.is_dir():
-        raise ValueError(f"dxmt-install32 must be a real Meson install directory: {dxmt_install32}")
-    reject_removed_sdk_artifacts(dxmt_install32)
+    if d3dalloy_install32.is_symlink() or not d3dalloy_install32.is_dir():
+        raise ValueError(f"d3dalloy-install32 must be a real Meson install directory: {d3dalloy_install32}")
+    reject_removed_sdk_artifacts(d3dalloy_install32)
     result: dict[Path, Path] = {}
     for name in (*WINDOWS_MODULES, *optional_modules(with_nvngx, with_nvapi, with_fsr, with_fsr, windows_abi="x86",
                                                      with_fsr_rayregeneration=with_fsr)):
-        source = dxmt_install32 / DXMT_WOW64_DIR / name
-        regular_file(source, f"32-bit DXMT {name}")
+        source = d3dalloy_install32 / D3DALLOY_WOW64_DIR / name
+        regular_file(source, f"32-bit D3Dalloy {name}")
         if inspect_pe(source)["windows_abi"] != "x86":
-            raise ValueError(f"32-bit DXMT {name} is not an i386 PE image: {source}")
+            raise ValueError(f"32-bit D3Dalloy {name} is not an i386 PE image: {source}")
         if name != "d3d12core.dll" and WINE_BUILTIN_MARKER not in source.read_bytes():
-            raise ValueError(f"32-bit DXMT {name} lacks the Wine builtin marker; winebuild --builtin did not run")
+            raise ValueError(f"32-bit D3Dalloy {name} lacks the Wine builtin marker; winebuild --builtin did not run")
         result[WOW64_WINDOWS_DIR / name] = source
         if name in FSR_MODULE_MARKERS:
             validate_fsr_module(source, "x86")
@@ -613,34 +613,34 @@ def resolve_wow64_artifacts(dxmt_install32: Path, with_nvngx: bool = False, with
                 raise ValueError("32-bit nvngx.dll is missing required D3D12 exports")
         elif name == "nvapi.dll" and pe_exports(source).get("nvapi_QueryInterface") != 2:
             raise ValueError("32-bit nvapi.dll is missing required exports")
-    if OWNED_D3D12_MARKER not in (dxmt_install32 / DXMT_WOW64_DIR / "d3d12.dll").read_bytes():
-        raise ValueError("32-bit d3d12.dll is missing the owned backend marker; refusing an unowned/stale DXMT build")
-    validate_core_module(dxmt_install32 / DXMT_WOW64_DIR / "d3d12core.dll", "x86")
+    if OWNED_D3D12_MARKER not in (d3dalloy_install32 / D3DALLOY_WOW64_DIR / "d3d12.dll").read_bytes():
+        raise ValueError("32-bit d3d12.dll is missing the owned backend marker; refusing an unowned/stale D3Dalloy build")
+    validate_core_module(d3dalloy_install32 / D3DALLOY_WOW64_DIR / "d3d12core.dll", "x86")
     return result
 
 
-def resolve_dxmt_artifacts(
-    dxmt_install: Path, with_nvngx: bool = False, with_nvapi: bool = False, arch: dict | None = None, *, with_fsr: bool = False
+def resolve_d3dalloy_artifacts(
+    d3dalloy_install: Path, with_nvngx: bool = False, with_nvapi: bool = False, arch: dict | None = None, *, with_fsr: bool = False
 ) -> dict[Path, Path]:
     arch = arch or architecture("x86_64", "x64")
     WINDOWS_DIR, UNIX_DIR = Path(arch["windows_directory"]), Path(arch["unix_directory"])
-    DXMT_WINDOWS_DIR, DXMT_UNIX_DIR = Path(WINDOWS_DIR.name), Path(UNIX_DIR.name)
-    if dxmt_install.is_symlink() or not dxmt_install.is_dir():
-        raise ValueError(f"dxmt-install must be a real Meson install directory: {dxmt_install}")
-    reject_removed_sdk_artifacts(dxmt_install)
+    D3DALLOY_WINDOWS_DIR, D3DALLOY_UNIX_DIR = Path(WINDOWS_DIR.name), Path(UNIX_DIR.name)
+    if d3dalloy_install.is_symlink() or not d3dalloy_install.is_dir():
+        raise ValueError(f"d3dalloy-install must be a real Meson install directory: {d3dalloy_install}")
+    reject_removed_sdk_artifacts(d3dalloy_install)
     result: dict[Path, Path] = {}
     for name in WINDOWS_MODULES:
-        source = dxmt_install / DXMT_WINDOWS_DIR / name
-        regular_file(source, f"DXMT {name}")
+        source = d3dalloy_install / D3DALLOY_WINDOWS_DIR / name
+        regular_file(source, f"D3Dalloy {name}")
         result[WINDOWS_DIR / name] = source
-    unixlib = dxmt_install / DXMT_UNIX_DIR / NATIVE_MODULE
-    regular_file(unixlib, f"DXMT {NATIVE_MODULE}")
+    unixlib = d3dalloy_install / D3DALLOY_UNIX_DIR / NATIVE_MODULE
+    regular_file(unixlib, f"D3Dalloy {NATIVE_MODULE}")
     result[UNIX_DIR / NATIVE_MODULE] = unixlib
-    if OWNED_D3D12_MARKER not in (dxmt_install / DXMT_WINDOWS_DIR / "d3d12.dll").read_bytes():
-        raise ValueError("d3d12.dll is missing the owned backend marker; refusing an unowned/stale DXMT build")
+    if OWNED_D3D12_MARKER not in (d3dalloy_install / D3DALLOY_WINDOWS_DIR / "d3d12.dll").read_bytes():
+        raise ValueError("d3d12.dll is missing the owned backend marker; refusing an unowned/stale D3Dalloy build")
     if with_nvngx:
-        source = dxmt_install / DXMT_WINDOWS_DIR / "nvngx.dll"
-        regular_file(source, "owned DXMT nvngx.dll")
+        source = d3dalloy_install / D3DALLOY_WINDOWS_DIR / "nvngx.dll"
+        regular_file(source, "owned D3Dalloy nvngx.dll")
         if OWNED_NGX_D3D12_MARKER not in source.read_bytes():
             raise ValueError("nvngx.dll is missing the owned D3D12 NGX marker")
         missing = REQUIRED_NGX_D3D12_EXPORTS - pe_exports(source).keys()
@@ -648,8 +648,8 @@ def resolve_dxmt_artifacts(
             raise ValueError(f"nvngx.dll is missing required D3D12 exports: {sorted(missing)}")
         result[WINDOWS_DIR / "nvngx.dll"] = source
     if with_nvapi:
-        source = dxmt_install / DXMT_WINDOWS_DIR / "nvapi64.dll"
-        regular_file(source, "owned DXMT nvapi64.dll")
+        source = d3dalloy_install / D3DALLOY_WINDOWS_DIR / "nvapi64.dll"
+        regular_file(source, "owned D3Dalloy nvapi64.dll")
         missing = REQUIRED_NVAPI_EXPORTS - pe_exports(source).keys()
         if missing:
             raise ValueError(f"nvapi64.dll is missing required exports: {sorted(missing)}")
@@ -658,13 +658,13 @@ def resolve_dxmt_artifacts(
         result[WINDOWS_DIR / "nvapi64.dll"] = source
     if with_fsr:
         for name in FSR_MODULE_MARKERS:
-            source = dxmt_install / DXMT_WINDOWS_DIR / name
+            source = d3dalloy_install / D3DALLOY_WINDOWS_DIR / name
             validate_fsr_module(source, arch["windows_abi"])
             result[WINDOWS_DIR / name] = source
     for relative, source in result.items():
         if relative.suffix == ".dll" and inspect_pe(source)["windows_abi"] != arch["windows_abi"]:
-            raise ValueError(f"DXMT Windows ABI mismatch: {source}; expected {arch["windows_abi"]}")
-    validate_core_module(dxmt_install / DXMT_WINDOWS_DIR / "d3d12core.dll", arch["windows_abi"])
+            raise ValueError(f"D3Dalloy Windows ABI mismatch: {source}; expected {arch["windows_abi"]}")
+    validate_core_module(d3dalloy_install / D3DALLOY_WINDOWS_DIR / "d3d12core.dll", arch["windows_abi"])
     return result
 
 
@@ -825,7 +825,7 @@ fi
 # a missing owned module is a hard load failure rather than a native/GPTK fallback.
 export WINEDLLOVERRIDES="{owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration, wow64_frontends=wow64_frontends, with_core=with_core, with_dcomp=with_dcomp, with_fsr_rayregeneration=with_fsr_rayregeneration)}"
 
-{"export DXMT_ENABLE_NVEXT=1" if (with_nvngx or with_nvapi) else "unset DXMT_ENABLE_NVEXT"}
+{"export D3DALLOY_ENABLE_NVEXT=1" if (with_nvngx or with_nvapi) else "unset D3DALLOY_ENABLE_NVEXT"}
 
 # Native ARM64 Wine runs under FEX, whose hypervisor-bit CPUID is rejected by
 # some games; the existing documented toggle hides it. The x86_64 layout never
@@ -919,7 +919,7 @@ def verify_runtime(runtime: Path) -> list[str]:
             inf = (runtime / WINE_INF).read_bytes()
             if (not isinstance(signing, dict)
                     or signing.get("method") != "authenticode-sha256"
-                    or signing.get("subject") != "DXMT Owned NGX Runtime"
+                    or signing.get("subject") != "D3Dalloy Owned NGX Runtime"
                     or signing.get("trust") != "Wine BaseInstall HKCU Root leaf"
                     or signing.get("private_key_retained") is not False
                     or signing.get("certificate") != str(NGX_CERTIFICATE)
@@ -1220,29 +1220,29 @@ def verify_runtime(runtime: Path) -> list[str]:
 
 
 def stage(
-    dxmt_install: Path, wine_source: Path, dest: Path, with_nvngx: bool = False, with_nvapi: bool = False,
-    dxmt_install32: Path | None = None,
+    d3dalloy_install: Path, wine_source: Path, dest: Path, with_nvngx: bool = False, with_nvapi: bool = False,
+    d3dalloy_install32: Path | None = None,
     native_arch: str = "x86_64", windows_abi: str = "x64",
     *, with_fsr: bool = False, wine_display_build: Path | None = None, fex_build: Path | None = None,
     wine_display_source: Path | None = None,
 ) -> None:
     arch = architecture(native_arch, windows_abi)
     UNIX_DIR = Path(arch["unix_directory"])
-    if dxmt_install32 is not None and native_arch != "x86_64" and not (native_arch == "arm64" and fex_build):
+    if d3dalloy_install32 is not None and native_arch != "x86_64" and not (native_arch == "arm64" and fex_build):
         raise ValueError("WoW64 staging is only established for the x86_64 Wine layout")
-    validate_destination(dest, wine_source, dxmt_install)
-    if dxmt_install32 is not None:
-        validate_destination(dest, wine_source, dxmt_install32)
+    validate_destination(dest, wine_source, d3dalloy_install)
+    if d3dalloy_install32 is not None:
+        validate_destination(dest, wine_source, d3dalloy_install32)
     if wine_display_build is not None:
         validate_destination(dest, wine_source, wine_display_build)
         validate_destination(dest, wine_source, wine_display_source if wine_display_source is not None else WINE_DISPLAY_SOURCE)
     validate_source_runtime(wine_source, arch)
-    with_wow64 = dxmt_install32 is not None
+    with_wow64 = d3dalloy_install32 is not None
     if with_wow64:
         wow64_dir = wine_source / WOW64_WINDOWS_DIR
         if wow64_dir.is_symlink() or not wow64_dir.is_dir():
             raise ValueError(f"missing Wine WoW64 runtime directory: {wow64_dir}")
-    dxmt_artifacts = resolve_dxmt_artifacts(dxmt_install, with_nvngx, with_nvapi, arch, with_fsr=with_fsr)
+    d3dalloy_artifacts = resolve_d3dalloy_artifacts(d3dalloy_install, with_nvngx, with_nvapi, arch, with_fsr=with_fsr)
     fex_provenance = None
     fex_x86_provenance = None
     fex_extra = ()
@@ -1269,7 +1269,7 @@ def stage(
                     set(pe_exports(module)) != set(record["exports"])):
                 raise ValueError("FEX DLL differs from the accepted source build")
             relative = Path(arch["windows_directory"]) / name
-            dxmt_artifacts[relative] = module
+            d3dalloy_artifacts[relative] = module
             fex_extra += (relative,)
             provenance = {"build_result_sha256": sha256(result_path),
                           "source_commit": fex_result["source_commit"], "repository": fex_result["repository"],
@@ -1297,7 +1297,7 @@ def stage(
                 regular_file(wine_source / relative, "Wine guest-window module")
                 fex_extra += (relative,)
     if with_wow64:
-        dxmt_artifacts.update(resolve_wow64_artifacts(dxmt_install32, with_nvngx, with_nvapi, with_fsr))
+        d3dalloy_artifacts.update(resolve_wow64_artifacts(d3dalloy_install32, with_nvngx, with_nvapi, with_fsr))
     display_sources, display_provenance = ({}, None)
     if wine_display_build is not None:
         display_sources, display_provenance = resolve_display_artifacts(wine_display_build, arch, with_wow64, wine_display_source)
@@ -1305,8 +1305,8 @@ def stage(
             baseline = wine_source / relative
             if baseline.is_file() and sha256(baseline) == sha256(module):
                 raise ValueError(f"Wine display frontend is unchanged from the source runtime: {module}")
-        dxmt_artifacts.update(display_sources)
-    winemetal_source = dxmt_artifacts[UNIX_DIR / NATIVE_MODULE]
+        d3dalloy_artifacts.update(display_sources)
+    winemetal_source = d3dalloy_artifacts[UNIX_DIR / NATIVE_MODULE]
     dependencies = macho_dependencies(winemetal_source)
     problems = dependency_problems(dependencies)
     problems.extend(macho_audit_problems(winemetal_source, NATIVE_MODULE, native_arch))
@@ -1318,23 +1318,23 @@ def stage(
     try:
         shutil.copytree(wine_source, temporary, symlinks=True)
         prepare_real_wine(temporary, with_nvngx, with_nvapi, arch, with_fsr=with_fsr, wow64_frontends=with_wow64, with_wow64=with_wow64, with_dcomp=wine_display_build is not None)
-        for relative, source in dxmt_artifacts.items():
+        for relative, source in d3dalloy_artifacts.items():
             target = temporary / relative
             ensure_replaceable_target(target, temporary)
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 target.unlink()
             shutil.copy2(source, target)
-        ngx_signing = sign_ngx(temporary, tuple(relative for relative in dxmt_artifacts
+        ngx_signing = sign_ngx(temporary, tuple(relative for relative in d3dalloy_artifacts
                               if relative.name == "nvngx.dll")) if with_nvngx else None
         records = artifact_records(temporary, with_nvngx, with_nvapi, wow64_artifacts(with_wow64, with_nvngx, with_nvapi, with_fsr, with_fsr) + tuple(display_sources) + fex_extra, arch, with_fsr=with_fsr)
         manifest = {
             "schema": SCHEMA,
             "architecture": arch,
-            "implementation": "owned-dxmt-derived",
+            "implementation": "owned-d3dalloy-derived",
             "source": {
-                "dxmt_install": str(dxmt_install),
-                "dxmt_install32": str(dxmt_install32) if with_wow64 else None,
+                "d3dalloy_install": str(d3dalloy_install),
+                "d3dalloy_install32": str(d3dalloy_install32) if with_wow64 else None,
                 "wine_source": str(wine_source),
             },
             "loader": {
@@ -1358,7 +1358,7 @@ def stage(
                 "version": AGILITY_SDK_VERSION,
                 "modules": {str(relative): {"sha256": sha256(source),
                     "generation": validate_core_module(source, "x86" if relative.parent == WOW64_WINDOWS_DIR else arch["windows_abi"])}
-                    for relative, source in dxmt_artifacts.items() if relative.name == "d3d12core.dll"},
+                    for relative, source in d3dalloy_artifacts.items() if relative.name == "d3d12core.dll"},
             },
             "winemetal_dependencies": dependencies,
             "native_compiler": {
@@ -1401,10 +1401,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     stage_parser = subparsers.add_parser("stage", help="create a new isolated owned-graphics Wine runtime")
-    stage_parser.add_argument("--dxmt-install", required=True, type=Path, help="Meson install prefix matching the selected Windows/native layout")
+    stage_parser.add_argument("--d3dalloy-install", required=True, type=Path, help="Meson install prefix matching the selected Windows/native layout")
     stage_parser.add_argument("--native-arch", choices=("x86_64", "arm64"), default="x86_64")
     stage_parser.add_argument("--windows-abi", choices=("x64", "arm64", "arm64ec", "arm64x"), default="x64")
-    stage_parser.add_argument("--dxmt-install32", type=Path, help="optional 32-bit Meson install prefix containing i386-windows; stages WoW64 modules into lib/wine/i386-windows")
+    stage_parser.add_argument("--d3dalloy-install32", type=Path, help="optional 32-bit Meson install prefix containing i386-windows; stages WoW64 modules into lib/wine/i386-windows")
     stage_parser.add_argument("--wine-source", required=True, type=Path, help="untouched Wine runtime to copy")
     stage_parser.add_argument("--wine-dest", required=True, type=Path, help="new destination; must not already exist")
     stage_parser.add_argument("--fex-build", type=Path, help="accepted FEX-darwin Darwin/build.py output; stage the pinned Darwin FEX x64 emulator")
@@ -1428,12 +1428,12 @@ def main() -> int:
         print(f"PASS: {runtime} matches {MANIFEST}; owned module load policy and winemetal dependencies are intact")
         return 0
 
-    dxmt_install = args.dxmt_install.expanduser().resolve()
+    d3dalloy_install = args.d3dalloy_install.expanduser().resolve()
     wine_source = args.wine_source.expanduser().resolve()
     dest = args.wine_dest.expanduser().absolute()
-    dxmt_install32 = args.dxmt_install32.expanduser().resolve() if args.dxmt_install32 else None
+    d3dalloy_install32 = args.d3dalloy_install32.expanduser().resolve() if args.d3dalloy_install32 else None
     wine_display_build = args.wine_display_build.expanduser().absolute() if args.wine_display_build else None
-    stage(dxmt_install, wine_source, dest, args.with_nvngx, args.with_nvapi, dxmt_install32, args.native_arch, args.windows_abi, with_fsr=args.with_fsr, wine_display_build=wine_display_build, fex_build=args.fex_build.resolve() if args.fex_build else None, wine_display_source=args.wine_display_source.expanduser().resolve())
+    stage(d3dalloy_install, wine_source, dest, args.with_nvngx, args.with_nvapi, d3dalloy_install32, args.native_arch, args.windows_abi, with_fsr=args.with_fsr, wine_display_build=wine_display_build, fex_build=args.fex_build.resolve() if args.fex_build else None, wine_display_source=args.wine_display_source.expanduser().resolve())
     print(f"PRIVATE owned-graphics runtime staged: {dest}")
     print("Use it only with an explicit isolated WINEPREFIX; the wrapper forces owned builtin graphics modules.")
     print(f"Verify later with: {Path(__file__).name} verify --runtime {dest}")

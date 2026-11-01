@@ -131,7 +131,7 @@ public:
     UINT32 FindNextMatchingBlob( DXBCFourCC SearchFourCC, UINT32 SearchStartBlobIndex = 0 ); 
                                     
 private:
-    bool GetChunk(UINT32 BlobIndex, DxmtShaderChunk& Chunk) const;
+    bool GetChunk(UINT32 BlobIndex, D3DalloyShaderChunk& Chunk) const;
     const BYTE* m_pContainer;
     UINT32 m_ContainerSize;
     UINT32 m_BlobCount;

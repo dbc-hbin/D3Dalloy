@@ -69,7 +69,7 @@
 #include "nt/air_builder.hpp"
 #include "nt/dxbc_binding_map.hpp"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 namespace {
 
@@ -421,7 +421,7 @@ private:
   llvm::Error lowerBufferUpdateCounter(llvm::CallInst *call);
   llvm::Error lowerAtomicBinOp(llvm::CallInst *call);
   llvm::Error lowerAtomicCompareExchange(llvm::CallInst *call);
-  /* WriteSamplerFeedback{,Bias,Level,Grad}: dxmt.sampler_feedback.write (air_sampler_feedback.metal). */
+  /* WriteSamplerFeedback{,Bias,Level,Grad}: d3dalloy.sampler_feedback.write (air_sampler_feedback.metal). */
   llvm::Error lowerWriteSamplerFeedback(llvm::CallInst *call, uint32_t opcode);
   bool uses_sampler_feedback = false;
 
@@ -842,7 +842,7 @@ ResourceLowering::bufferBytePointer(const dxbc::BufferDescriptor &buffer, llvm::
 }
 
 /* A load that reads zero when `valid` is false, without control flow. The select
- * of its address is materialized after optimization (dxmt::lowerBoundedLoads):
+ * of its address is materialized after optimization (d3dalloy::lowerBoundedLoads):
  * InstCombine rescans the block for every load of a select, which costs far more
  * conversion time than it saves. A null `valid` is an unconditional load. */
 llvm::Value *
@@ -851,7 +851,7 @@ ResourceLowering::boundedLoad(llvm::Type *type, llvm::Value *pointer, llvm::Valu
     return builder.CreateLoad(type, pointer);
   auto space = llvm::cast<llvm::PointerType>(pointer->getType())->getAddressSpace();
   auto bounded = info.module->getOrInsertFunction(
-      (llvm::Twine("dxmt.bounded.load.") + llvm::Twine(space) + "." + llvm::Twine(type->getPrimitiveSizeInBits())).str(),
+      (llvm::Twine("d3dalloy.bounded.load.") + llvm::Twine(space) + "." + llvm::Twine(type->getPrimitiveSizeInBits())).str(),
       llvm::FunctionType::get(type, {builder.getInt1Ty(), pointer->getType()}, false));
   auto *helper = llvm::cast<llvm::Function>(bounded.getCallee());
   helper->setOnlyReadsMemory();
@@ -3463,7 +3463,7 @@ ResourceLowering::lowerRenderTargetGetSamplePosition(llvm::CallInst *call) {
   builder.SetInsertPoint(call);
   auto *position = air.CreateGetSamplePosition(air.CreateGetNumSamples(), call->getArgOperand(1));
   if (auto *sample_call = llvm::dyn_cast<llvm::CallInst>(position))
-    sample_call->setMetadata("dxmt.rt_sample_pos", llvm::MDNode::get(builder.getContext(), {}));
+    sample_call->setMetadata("d3dalloy.rt_sample_pos", llvm::MDNode::get(builder.getContext(), {}));
   llvm::Value *result = llvm::UndefValue::get(call->getType());
   result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, (uint64_t)0), 0);
   result = builder.CreateInsertValue(result, builder.CreateExtractElement(position, 1), 1);
@@ -4162,7 +4162,7 @@ ResourceLowering::lowerGatherRaw(llvm::CallInst *call) {
  *   174: clamp; 175: bias, clamp; 176: lod; 177: ddx0..2, ddy0..2, clamp.
  *
  * The feedback map is bound as a buffer: q0 is its u32 cell array, q1 the layout word
- * (src/d3d12/d3d12_sampler_feedback.hpp). dxmt.sampler_feedback.write re-establishes the
+ * (src/d3d12/d3d12_sampler_feedback.hpp). d3dalloy.sampler_feedback.write re-establishes the
  * paired Sample's footprint from the texture SRV (q1 min LOD clamp and array size, q2 view
  * range) and the sampler words (q2 bias and state flags, q3 MinLOD/MaxLOD), so pixel and
  * compute stages share one LOD formula. A null map, a null paired texture and a helper
@@ -4258,7 +4258,7 @@ ResourceLowering::lowerWriteSamplerFeedback(llvm::CallInst *call, uint32_t opcod
 
   auto *cells_type = i32->getPointerTo(1);
   auto write = info.module->getOrInsertFunction(
-      "dxmt.sampler_feedback.write",
+      "d3dalloy.sampler_feedback.write",
       llvm::FunctionType::get(
           builder.getVoidTy(),
           {cells_type, i64, i64, i64, i64, i64, f32, f32, f32, f32, f32, f32, f32, f32, f32, i32, i32}, false
@@ -4565,7 +4565,7 @@ ResourceLowering::run() {
     declaration->eraseFromParent();
 
   if (uses_sampler_feedback)
-    dxmt::linkSamplerFeedback(*info.module);
+    d3dalloy::linkSamplerFeedback(*info.module);
   return llvm::Error::success();
 }
 
@@ -4577,4 +4577,4 @@ LowerResources(ModuleInfo &module, dxbc::BindingMap &binding) {
   return lowering.run();
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

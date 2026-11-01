@@ -25,9 +25,9 @@
 #include "log/log.hpp"
 #include "thread.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
-static dxmt::mutex ts_global_mutex;
+static d3dalloy::mutex ts_global_mutex;
 
 class MTLCompiledTessellationPipelineImpl: public MTLCompiledTessellationMeshPipeline {
 public:
@@ -172,7 +172,7 @@ public:
     info.object_tgsize_is_multiple_of_sgwidth = true;
 
     {
-      std::lock_guard<dxmt::mutex> lock(ts_global_mutex);
+      std::lock_guard<d3dalloy::mutex> lock(ts_global_mutex);
       state_rasterization_ =
           device_->GetMTLDevice().newRenderPipelineState(info, err);
     }
@@ -216,4 +216,4 @@ CreateTessellationMeshPipeline(MTLD3D11Device *pDevice,
   return std::make_unique<MTLCompiledTessellationPipelineImpl>(pDevice, pDesc);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

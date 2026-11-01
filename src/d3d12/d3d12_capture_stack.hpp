@@ -8,7 +8,7 @@
 #include <sstream>
 #include <string>
 
-namespace dxmt {
+namespace d3dalloy {
 
 // Called only after an opt-in capture has reserved its bounded output slot.
 __declspec(noinline) inline std::string
@@ -34,4 +34,4 @@ Win32CaptureStackBackTrace() {
   return text.str();
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

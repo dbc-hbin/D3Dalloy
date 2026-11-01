@@ -42,11 +42,11 @@
  * the raytracing entry points in dxil_raytracing.cpp allocate them too, so their
  * definitions are shared rather than repeated here.
  */
-using dxmt::dxil::SM50CompiledBitcodeInternal;
-using dxmt::dxil::SM50ErrorInternal;
-char dxmt::dxil::RootBindingError::ID = 0;
+using d3dalloy::dxil::SM50CompiledBitcodeInternal;
+using d3dalloy::dxil::SM50ErrorInternal;
+char d3dalloy::dxil::RootBindingError::ID = 0;
 
-void dxmt::dxbc::initialize_sample_mask_constant(
+void d3dalloy::dxbc::initialize_sample_mask_constant(
     llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args) {
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *constant = nullptr;
   if (!args_get_data<SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(args, &constant))
@@ -54,19 +54,19 @@ void dxmt::dxbc::initialize_sample_mask_constant(
   auto &context = module.getContext();
   auto *type = llvm::Type::getInt32Ty(context);
   auto *global = new llvm::GlobalVariable(module, type, true, llvm::GlobalValue::LinkOnceODRLinkage,
-      llvm::UndefValue::get(type), "dxmt_sample_mask.MTL_FC_INIT_0_j", nullptr,
+      llvm::UndefValue::get(type), "d3dalloy_sample_mask.MTL_FC_INIT_0_j", nullptr,
       llvm::GlobalValue::NotThreadLocal, 2, true);
   global->setVisibility(llvm::GlobalValue::HiddenVisibility);
   global->setSection("air.fc_initializer");
   global->setAlignment(llvm::Align(4));
   module.getOrInsertNamedMetadata("air.function_constants")->addOperand(llvm::MDNode::get(context, {
       llvm::ValueAsMetadata::get(global), llvm::MDString::get(context, "uint"),
-      llvm::MDString::get(context, "dxmt_sample_mask"),
+      llvm::MDString::get(context, "d3dalloy_sample_mask"),
       llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(type, 0))}));
 }
 
-llvm::Value *dxmt::dxbc::pixel_sample_mask(context ctx) {
-  if (auto *constant = ctx.module.getGlobalVariable("dxmt_sample_mask.MTL_FC_INIT_0_j"))
+llvm::Value *d3dalloy::dxbc::pixel_sample_mask(context ctx) {
+  if (auto *constant = ctx.module.getGlobalVariable("d3dalloy_sample_mask.MTL_FC_INIT_0_j"))
     return ctx.builder.CreateLoad(ctx.builder.getInt32Ty(), constant);
   return ctx.builder.getInt32(ctx.pso_sample_mask);
 }
@@ -85,7 +85,7 @@ static void reportError(llvm::Error error, llvm::raw_ostream &errorOut, SM50Erro
   llvm::raw_string_ostream stream(message);
   llvm::handleAllErrors(
     std::move(error), [&](const llvm::ErrorInfoBase &base) {
-      if (base.isA<dxmt::dxil::RootBindingError>())
+      if (base.isA<d3dalloy::dxil::RootBindingError>())
         errorObj->kind = SM50_ERROR_ROOT_BINDING;
       base.log(stream);
     }
@@ -100,14 +100,14 @@ static void reportError(llvm::Error error, llvm::raw_ostream &errorOut, SM50Erro
  * both stages are DXBC so the caller continues on the SM 5.x path.
  */
 static int compileDXILPipelineStage(
-  dxmt::dxil::PipelineKind kind, sm50_shader_t first, sm50_shader_t second,
+  d3dalloy::dxil::PipelineKind kind, sm50_shader_t first, sm50_shader_t second,
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *args, const char *name, sm50_bitcode_t *ppBitcode,
   SM50ErrorInternal *errorObj, llvm::raw_ostream &errorOut, sm50_error_t *ppError
 ) {
-  if (!dxmt::dxil::IsDXILShader(first) && !dxmt::dxil::IsDXILShader(second))
+  if (!d3dalloy::dxil::IsDXILShader(first) && !d3dalloy::dxil::IsDXILShader(second))
     return -1;
-  auto compiled = dxmt::dxil::CompilePipelineStage(
-    kind, (dxmt::dxbc::SM50ShaderInternal *)first, (dxmt::dxbc::SM50ShaderInternal *)second, args, name
+  auto compiled = d3dalloy::dxil::CompilePipelineStage(
+    kind, (d3dalloy::dxbc::SM50ShaderInternal *)first, (d3dalloy::dxbc::SM50ShaderInternal *)second, args, name
   );
   if (!compiled) {
     reportError(compiled.takeError(), errorOut, errorObj);
@@ -119,7 +119,7 @@ static int compileDXILPipelineStage(
   return 0;
 }
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 uint32_t next_pow2(uint32_t x) {
   return x == 1 ? 1 : 1 << (32 - __builtin_clz(x - 1));
@@ -239,7 +239,7 @@ SM50_SHADER_METAL_VERSION required_metal_version(const llvm::Module &module, SM5
       break;
     }
   }
-  if (module.getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) metal_version = SM50_SHADER_METAL_410;
+  if (module.getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) metal_version = SM50_SHADER_METAL_410;
   return metal_version;
 }
 
@@ -418,7 +418,7 @@ void increment_pixel_invocations(
 }
 
 /* The flat per-primitive key of SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM (mesh primitive data 0). */
-constexpr const char *kStatisticsKeyUser = "dxmt_statistics_key";
+constexpr const char *kStatisticsKeyUser = "d3dalloy_statistics_key";
 
 void define_mesh_statistics_key(air::FunctionSignatureBuilder &func_signature, uint32_t data_index) {
   func_signature.DefineMeshPrimitiveOutput(
@@ -1179,7 +1179,7 @@ llvm::Error convert_dxbc_vertex_shader(
       auto &builder = ctx.builder;
       auto base_vertex = ctx.function->getArg(bv);
       auto vertex_id = ctx.function->getArg(vid);
-      auto so_entries_type = ctx.types._dxmt_stream_output_buffer_entry;
+      auto so_entries_type = ctx.types._d3dalloy_stream_output_buffer_entry;
       auto so_entries = builder.CreateBitCast(
           ctx.function->getArg(so_table), so_entries_type->getPointerTo((uint32_t)air::AddressSpace::constant)
       );
@@ -1448,10 +1448,10 @@ llvm::Error convertDXBC(
   }
   return llvm::make_error<UnsupportedFeature>("Not supported shader type");
 };
-} // namespace dxmt::dxbc
+} // namespace d3dalloy::dxbc
 
-bool CheckGSBBIsPassThrough(dxmt::dxbc::BasicBlock *bb) {
-  using namespace dxmt::dxbc;
+bool CheckGSBBIsPassThrough(d3dalloy::dxbc::BasicBlock *bb) {
+  using namespace d3dalloy::dxbc;
   if (bb->instructions.any(patterns{
         [](InstNop &) { return false; }, [](InstMov &mov) { return false; },
         [](InstEmit &) { return false; }, [](InstCut &) { return false; },
@@ -1461,8 +1461,8 @@ bool CheckGSBBIsPassThrough(dxmt::dxbc::BasicBlock *bb) {
 
   return std::visit(
     patterns{
-      [](dxmt::dxbc::BasicBlockReturn) { return true; },
-      [](dxmt::dxbc::BasicBlockUnconditionalBranch uncond) {
+      [](d3dalloy::dxbc::BasicBlockReturn) { return true; },
+      [](d3dalloy::dxbc::BasicBlockUnconditionalBranch uncond) {
         return CheckGSBBIsPassThrough(uncond.target);
       },
       [](auto) { return false; }
@@ -1537,10 +1537,10 @@ bool CheckGSSignatureIsPassThrough(
  * SM 6.x DXIL paths feed their own ShaderInfo here so the argument layout and the
  * SM50 argument reflection are derived in exactly one place.
  */
-dxmt::dxbc::ArgumentTableMasks
-dxmt::dxbc::build_argument_tables(dxmt::dxbc::SM50ShaderInternal *shader) {
-  using namespace dxmt::air;
-  using namespace dxmt::shader::common;
+d3dalloy::dxbc::ArgumentTableMasks
+d3dalloy::dxbc::build_argument_tables(d3dalloy::dxbc::SM50ShaderInternal *shader) {
+  using namespace d3dalloy::air;
+  using namespace d3dalloy::shader::common;
   auto shader_info = &shader->shader_info;
   auto &binding_table = shader_info->binding_table;
   auto &binding_table_cbuffer = shader_info->binding_table_cbuffer;
@@ -1749,13 +1749,13 @@ dxmt::dxbc::build_argument_tables(dxmt::dxbc::SM50ShaderInternal *shader) {
  * parsers are only used by the geometry stage and may be null; it is told apart on
  * the caller side, since DXIL geometry shaders are rejected before this point.
  */
-bool dxmt::dxbc::fill_shader_reflection(
-  dxmt::dxbc::SM50ShaderInternal *shader, const dxmt::dxbc::ArgumentTableMasks &masks,
+bool d3dalloy::dxbc::fill_shader_reflection(
+  d3dalloy::dxbc::SM50ShaderInternal *shader, const d3dalloy::dxbc::ArgumentTableMasks &masks,
   MTL_SHADER_REFLECTION *pRefl, microsoft::CSignatureParser *inputParser,
   microsoft::CSignatureParser5 *outputParser, llvm::raw_ostream &error
 ) {
-  using namespace dxmt::air;
-  using namespace dxmt::shader::common;
+  using namespace d3dalloy::air;
+  using namespace d3dalloy::shader::common;
 pRefl->ConstanttBufferTableBindIndex =
     shader->args_reflection_cbuffer.size() > 0 ? 29 : ~0u;
   pRefl->ArgumentBufferBindIndex =
@@ -1853,9 +1853,9 @@ AIRCONV_API int SM50Initialize(
   MTL_SHADER_REFLECTION *pRefl, sm50_error_t *ppError
 ) {
   using namespace microsoft;
-  using namespace dxmt::dxbc;
-  using namespace dxmt::air;
-  using namespace dxmt::shader::common;
+  using namespace d3dalloy::dxbc;
+  using namespace d3dalloy::air;
+  using namespace d3dalloy::shader::common;
   if (ppError) {
     *ppError = nullptr;
   }
@@ -1871,9 +1871,9 @@ AIRCONV_API int SM50Initialize(
 
   /* Shader Model 6.x containers have no DXBC shader blob and no DXBC signature
    * chunks, so the DXIL path has to branch before the DXBC parsing below. */
-  if (dxmt::dxil::IsDXILContainer(pBytecode, BytecodeSize)) {
+  if (d3dalloy::dxil::IsDXILContainer(pBytecode, BytecodeSize)) {
     auto sm50_shader = new SM50ShaderInternal();
-    if (auto err = dxmt::dxil::PrepareShader(*sm50_shader, pBytecode, BytecodeSize, pRefl)) {
+    if (auto err = d3dalloy::dxil::PrepareShader(*sm50_shader, pBytecode, BytecodeSize, pRefl)) {
       reportError(std::move(err), errorOut, errorObj);
       delete sm50_shader;
       failCall(errorObj, ppError);
@@ -1977,7 +1977,7 @@ AIRCONV_API void SM50GetArgumentsInfo(
   sm50_shader_t pShader, struct MTL_SM50_SHADER_ARGUMENT *pConstantBuffers,
   struct MTL_SM50_SHADER_ARGUMENT *pArguments
 ) {
-  auto sm50_shader = (dxmt::dxbc::SM50ShaderInternal *)pShader;
+  auto sm50_shader = (d3dalloy::dxbc::SM50ShaderInternal *)pShader;
   if (pConstantBuffers && sm50_shader->args_reflection_cbuffer.size())
     memcpy(
       pConstantBuffers, sm50_shader->args_reflection_cbuffer.data(),
@@ -1993,7 +1993,7 @@ AIRCONV_API void SM50GetArgumentsInfo(
 }
 
 AIRCONV_API void SM50Destroy(sm50_shader_t pShader) {
-  delete (dxmt::dxbc::SM50ShaderInternal *)pShader;
+  delete (d3dalloy::dxbc::SM50ShaderInternal *)pShader;
 }
 
 // A raster-ordered buffer reached through a nested argument buffer does not
@@ -2020,7 +2020,7 @@ static llvm::Error activateRasterOrderedBuffers(llvm::Module &module, unsigned s
   for (auto &block : *original)
     for (auto &instruction : block)
       if (auto *call = dyn_cast<CallInst>(&instruction))
-        if (auto *metadata = call->getMetadata("dxmt.rov.logical_active")) {
+        if (auto *metadata = call->getMetadata("d3dalloy.rov.logical_active")) {
           auto *argument = metadata->getNumOperands() == 1
             ? mdconst::dyn_extract<ConstantInt>(metadata->getOperand(0)) : nullptr;
           if (logicalCall || !argument || !argument->getType()->isIntegerTy(32))
@@ -2032,8 +2032,8 @@ static llvm::Error activateRasterOrderedBuffers(llvm::Module &module, unsigned s
           if (!logicalActive->getType()->isIntegerTy(1))
             return createStringError(inconvertibleErrorCode(), "ROV marker: invalid logical coverage");
           logicalCall = call;
-          call->setMetadata("dxmt.rov.logical_active", nullptr);
-          if (auto *position = call->getMetadata("dxmt.rov.logical_position")) {
+          call->setMetadata("d3dalloy.rov.logical_active", nullptr);
+          if (auto *position = call->getMetadata("d3dalloy.rov.logical_position")) {
             auto *index = position->getNumOperands() == 1
               ? mdconst::dyn_extract<ConstantInt>(position->getOperand(0)) : nullptr;
             if (!index || !index->getType()->isIntegerTy(32) || index->getZExtValue() >= call->arg_size())
@@ -2042,7 +2042,7 @@ static llvm::Error activateRasterOrderedBuffers(llvm::Module &module, unsigned s
             if (!type || type->getNumElements() != 4 || !type->getElementType()->isFloatTy())
               return createStringError(inconvertibleErrorCode(), "ROV marker: invalid logical position");
             logicalPositionArgument = index->getZExtValue();
-            call->setMetadata("dxmt.rov.logical_position", nullptr);
+            call->setMetadata("d3dalloy.rov.logical_position", nullptr);
           }
         }
 
@@ -2378,7 +2378,7 @@ AIRCONV_API int SM50Compile(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace d3dalloy;
 
   if (ppError) {
     *ppError = nullptr;
@@ -2396,30 +2396,30 @@ AIRCONV_API int SM50Compile(
 
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
-  auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->shader_info;
+  auto &shader_info = ((d3dalloy::dxbc::SM50ShaderInternal *)pShader)->shader_info;
   SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(pArgs, &msaa_pixel);
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(pArgs, &msaa_pixel);
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *coarse_shading = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_COARSE_SHADING, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_COARSE_SHADING, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
       pArgs, &coarse_shading);
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *conservative_raster = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_CONSERVATIVE_RASTER, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_CONSERVATIVE_RASTER, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(
       pArgs, &conservative_raster);
   SM50_SHADER_D3D12_MSAA_VERTEX_DATA *msaa_vertex = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_VERTEX, SM50_SHADER_D3D12_MSAA_VERTEX_DATA>(pArgs, &msaa_vertex);
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_VERTEX, SM50_SHADER_D3D12_MSAA_VERTEX_DATA>(pArgs, &msaa_vertex);
   SM50_SHADER_D3D12_MSAA_MESH_DATA *msaa_mesh = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_MESH, SM50_SHADER_D3D12_MSAA_MESH_DATA>(pArgs, &msaa_mesh);
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_MESH, SM50_SHADER_D3D12_MSAA_MESH_DATA>(pArgs, &msaa_mesh);
   SM50_SHADER_PSO_PIXEL_SHADER_DATA *pixel_pso = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_PSO_PIXEL_SHADER, SM50_SHADER_PSO_PIXEL_SHADER_DATA>(pArgs, &pixel_pso);
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_PSO_PIXEL_SHADER, SM50_SHADER_PSO_PIXEL_SHADER_DATA>(pArgs, &pixel_pso);
   SM50_SHADER_ROOT_SIGNATURE_DATA *root_signature = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &root_signature);
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &root_signature);
   SM50_SHADER_D3D12_LOGIC_OP_DATA *logic_op = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_LOGIC_OP, SM50_SHADER_D3D12_LOGIC_OP_DATA>(pArgs, &logic_op);
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_LOGIC_OP, SM50_SHADER_D3D12_LOGIC_OP_DATA>(pArgs, &logic_op);
   SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA *indirect_views = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS,
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS,
     SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA>(pArgs, &indirect_views);
   const uint32_t sample_frequency_mask = !msaa_pixel && !msaa_vertex && pixel_pso &&
-    ((dxmt::dxbc::SM50ShaderInternal *)pShader)->ps_sample_frequency
+    ((d3dalloy::dxbc::SM50ShaderInternal *)pShader)->ps_sample_frequency
       ? pixel_pso->sample_mask : 0xffffffffu;
   const bool mark_rov_buffers = !msaa_vertex &&
     (!msaa_pixel || (msaa_pixel->variant & ~SM50_MSAA_ATOMIC_HELPERS) == SM50_MSAA_PIXEL ||
@@ -2434,7 +2434,7 @@ AIRCONV_API int SM50Compile(
     return 1;
   }
   SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *existing_capture = nullptr;
-  dxmt::dxbc::args_get_data<SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE, SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA>(pArgs, &existing_capture);
+  d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE, SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA>(pArgs, &existing_capture);
   SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA synthetic_capture{};
   if (msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE && !existing_capture) {
     synthetic_capture.next = pArgs;
@@ -2442,11 +2442,11 @@ AIRCONV_API int SM50Compile(
     pArgs = (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&synthetic_capture;
   }
 
-  if (auto *sm50_shader = (dxmt::dxbc::SM50ShaderInternal *)pShader;
+  if (auto *sm50_shader = (d3dalloy::dxbc::SM50ShaderInternal *)pShader;
       sm50_shader->dxil_bytecode) {
     /* Shader Model 6.x: the parsed DXIL module is lowered in place and becomes the
      * AIR module, so it uses its own context and module instead of `shader.air`. */
-    auto lowered = dxmt::dxil::LowerShader(*sm50_shader, FunctionName, pArgs);
+    auto lowered = d3dalloy::dxil::LowerShader(*sm50_shader, FunctionName, pArgs);
     if (!lowered) {
       reportError(lowered.takeError(), errorOut, errorObj);
       failCall(errorObj, ppError);
@@ -2462,34 +2462,34 @@ AIRCONV_API int SM50Compile(
       }
     }
     if (msaa_mesh) {
-      if (auto error = dxmt::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
+      if (auto error = d3dalloy::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
         reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
     }
     if (msaa_pixel) {
-      if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel, coarse_shading != nullptr,
+      if (auto error = d3dalloy::msaa::transformPixel(*pModule, *msaa_pixel, coarse_shading != nullptr,
                                                    conservative_raster != nullptr)) {
         reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
     } else if (msaa_vertex) {
-      if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex, conservative_raster != nullptr)) {
+      if (auto error = d3dalloy::msaa::transformVertex(*pModule, *msaa_vertex, conservative_raster != nullptr)) {
         reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
     } else if (sample_frequency_mask != 0xffffffffu) {
-      if (auto error = dxmt::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
+      if (auto error = d3dalloy::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
         reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
       }
     }
     if (logic_op) {
-      if (auto error = dxmt::logic_op::applyLogicOp(*pModule, *logic_op)) {
+      if (auto error = d3dalloy::logic_op::applyLogicOp(*pModule, *logic_op)) {
         reportError(std::move(error), errorOut, errorObj);
         failCall(errorObj, ppError);
         return 1;
@@ -2508,14 +2508,14 @@ AIRCONV_API int SM50Compile(
     if (shader_info.use_samplepos)
       linkSamplePos(*pModule);
 
-    if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+    if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
     runOptimizationPasses(*pModule);
     auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
@@ -2540,10 +2540,10 @@ AIRCONV_API int SM50Compile(
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
-  dxmt::dxil::InitializeAtomic64Phase(*pModule, pArgs);
-  if (coarse_shading) pModule->addModuleFlag(Module::Error, "dxmt.coarse.snapped", 1);
+  d3dalloy::dxil::InitializeAtomic64Phase(*pModule, pArgs);
+  if (coarse_shading) pModule->addModuleFlag(Module::Error, "d3dalloy.coarse.snapped", 1);
 
-  if (auto err = dxmt::dxbc::convertDXBC(
+  if (auto err = d3dalloy::dxbc::convertDXBC(
         pShader, FunctionName, context, *pModule, pArgs
       )) {
     llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
@@ -2560,34 +2560,34 @@ AIRCONV_API int SM50Compile(
     }
   }
   if (msaa_mesh) {
-    if (auto error = dxmt::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
+    if (auto error = d3dalloy::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
   }
   if (msaa_pixel) {
-    if (auto error = dxmt::msaa::transformPixel(*pModule, *msaa_pixel, coarse_shading != nullptr,
+    if (auto error = d3dalloy::msaa::transformPixel(*pModule, *msaa_pixel, coarse_shading != nullptr,
                                                    conservative_raster != nullptr)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
   } else if (msaa_vertex) {
-    if (auto error = dxmt::msaa::transformVertex(*pModule, *msaa_vertex, conservative_raster != nullptr)) {
+    if (auto error = d3dalloy::msaa::transformVertex(*pModule, *msaa_vertex, conservative_raster != nullptr)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
   } else if (sample_frequency_mask != 0xffffffffu) {
-    if (auto error = dxmt::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
+    if (auto error = d3dalloy::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
   }
   if (logic_op) {
-    if (auto error = dxmt::logic_op::applyLogicOp(*pModule, *logic_op)) {
+    if (auto error = d3dalloy::logic_op::applyLogicOp(*pModule, *logic_op)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
@@ -2606,7 +2606,7 @@ AIRCONV_API int SM50Compile(
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
 
-  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
     reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
@@ -2615,8 +2615,8 @@ AIRCONV_API int SM50Compile(
 
   // Serialize AIR
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
@@ -2646,7 +2646,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace d3dalloy;
 
   if (ppError) {
     *ppError = nullptr;
@@ -2660,7 +2660,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   }
 
   if (int dxil = compileDXILPipelineStage(
-        dxmt::dxil::PipelineKind::TessellationObject, pVertexShader, pHullShader, pHullShaderArgs, FunctionName,
+        d3dalloy::dxil::PipelineKind::TessellationObject, pVertexShader, pHullShader, pHullShaderArgs, FunctionName,
         ppBitcode, errorObj, errorOut, ppError
       );
       dxil >= 0)
@@ -2672,13 +2672,13 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
   auto &shader_info =
-    ((dxmt::dxbc::SM50ShaderInternal *)pHullShader)->shader_info;
+    ((d3dalloy::dxbc::SM50ShaderInternal *)pHullShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
-  dxmt::dxil::InitializeAtomic64Phase(*pModule, pHullShaderArgs);
+  d3dalloy::dxil::InitializeAtomic64Phase(*pModule, pHullShaderArgs);
 
-  if (auto err = dxmt::dxbc::convert_dxbc_vertex_hull_shader(
+  if (auto err = d3dalloy::dxbc::convert_dxbc_vertex_hull_shader(
         (dxbc::SM50ShaderInternal *)pVertexShader, (dxbc::SM50ShaderInternal *)pHullShader, 
         FunctionName, context, *pModule, pHullShaderArgs
       )) {
@@ -2695,7 +2695,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
     linkSamplePos(*pModule);
   linkTessellation(*pModule);
 
-  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
     reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
@@ -2704,8 +2704,8 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
 
   // Serialize AIR
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
@@ -2735,7 +2735,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace d3dalloy;
 
   if (ppError) {
     *ppError = nullptr;
@@ -2749,7 +2749,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   }
 
   if (int dxil = compileDXILPipelineStage(
-        dxmt::dxil::PipelineKind::TessellationMesh, pHullShader, pDomainShader, pDomainShaderArgs, FunctionName,
+        d3dalloy::dxil::PipelineKind::TessellationMesh, pHullShader, pDomainShader, pDomainShaderArgs, FunctionName,
         ppBitcode, errorObj, errorOut, ppError
       );
       dxil >= 0)
@@ -2761,13 +2761,13 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
   auto &shader_info =
-    ((dxmt::dxbc::SM50ShaderInternal *)pDomainShader)->shader_info;
+    ((d3dalloy::dxbc::SM50ShaderInternal *)pDomainShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
-  dxmt::dxil::InitializeAtomic64Phase(*pModule, pDomainShaderArgs);
+  d3dalloy::dxil::InitializeAtomic64Phase(*pModule, pDomainShaderArgs);
 
-  if (auto err = dxmt::dxbc::convert_dxbc_tesselator_domain_shader(
+  if (auto err = d3dalloy::dxbc::convert_dxbc_tesselator_domain_shader(
         (dxbc::SM50ShaderInternal *)pDomainShader, FunctionName,
         (dxbc::SM50ShaderInternal *)pHullShader, context, *pModule,
         pDomainShaderArgs
@@ -2794,7 +2794,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
       return 1;
     }
 
-  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
     reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
@@ -2803,8 +2803,8 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
 
   // Serialize AIR
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
@@ -2834,7 +2834,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace d3dalloy;
 
   if (ppError) {
     *ppError = nullptr;
@@ -2848,7 +2848,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   }
 
   if (int dxil = compileDXILPipelineStage(
-        dxmt::dxil::PipelineKind::GeometryObject, pVertexShader, pGeometryShader, pVertexShaderArgs, FunctionName,
+        d3dalloy::dxil::PipelineKind::GeometryObject, pVertexShader, pGeometryShader, pVertexShaderArgs, FunctionName,
         ppBitcode, errorObj, errorOut, ppError
       );
       dxil >= 0)
@@ -2859,20 +2859,20 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
 
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
-  auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
+  auto &shader_info = ((d3dalloy::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
-  dxmt::dxil::InitializeAtomic64Phase(*pModule, pVertexShaderArgs);
+  d3dalloy::dxil::InitializeAtomic64Phase(*pModule, pVertexShaderArgs);
 
   SM50_SHADER_GS_TESSELLATION_INPUT_DATA *tess_input = nullptr;
   const bool tessellation_input =
-      dxmt::dxbc::args_get_data<SM50_SHADER_GS_TESSELLATION_INPUT, SM50_SHADER_GS_TESSELLATION_INPUT_DATA>(
+      d3dalloy::dxbc::args_get_data<SM50_SHADER_GS_TESSELLATION_INPUT, SM50_SHADER_GS_TESSELLATION_INPUT_DATA>(
           pVertexShaderArgs, &tess_input
       );
   // With tessellation input the first stage is the DS and the object fetches the pass-1 capture.
-  auto convert = tessellation_input ? dxmt::dxbc::convert_dxbc_domain_for_geometry_shader
-                                    : dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader;
+  auto convert = tessellation_input ? d3dalloy::dxbc::convert_dxbc_domain_for_geometry_shader
+                                    : d3dalloy::dxbc::convert_dxbc_vertex_for_geometry_shader;
   if (auto err = convert(
         (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName,
         (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule,
@@ -2890,7 +2890,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
 
-  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
     reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
@@ -2899,8 +2899,8 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
 
   // Serialize AIR
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
@@ -2930,7 +2930,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 ) {
   using namespace llvm;
-  using namespace dxmt;
+  using namespace d3dalloy;
 
   if (ppError) {
     *ppError = nullptr;
@@ -2944,7 +2944,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   }
 
   if (int dxil = compileDXILPipelineStage(
-        dxmt::dxil::PipelineKind::GeometryMesh, pVertexShader, pGeometryShader, pGeometryShaderArgs, FunctionName,
+        d3dalloy::dxil::PipelineKind::GeometryMesh, pVertexShader, pGeometryShader, pGeometryShaderArgs, FunctionName,
         ppBitcode, errorObj, errorOut, ppError
       );
       dxil >= 0)
@@ -2956,13 +2956,13 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
   auto &shader_info =
-    ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
+    ((d3dalloy::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
-  dxmt::dxil::InitializeAtomic64Phase(*pModule, pGeometryShaderArgs);
+  d3dalloy::dxil::InitializeAtomic64Phase(*pModule, pGeometryShaderArgs);
 
-  if (auto err = dxmt::dxbc::convert_dxbc_geometry_shader(
+  if (auto err = d3dalloy::dxbc::convert_dxbc_geometry_shader(
         (dxbc::SM50ShaderInternal *)pGeometryShader, FunctionName,
         (dxbc::SM50ShaderInternal *)pVertexShader, context, *pModule,
         pGeometryShaderArgs
@@ -2989,7 +2989,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
   
-  if (auto error = dxmt::dxil::LowerAtomic64Phase(*pModule)) {
+  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
     reportError(std::move(error), errorOut, errorObj);
     failCall(errorObj, ppError);
     return 1;
@@ -2998,8 +2998,8 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
 
   // Serialize AIR
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = dxmt::dxil::LowerImmutableConstants(*pModule, *compiled)) {
+  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
+    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
       reportError(std::move(error), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;

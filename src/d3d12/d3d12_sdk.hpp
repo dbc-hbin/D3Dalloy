@@ -3,7 +3,7 @@
 #include "d3d12_core_bridge.hpp"
 #include <memory>
 extern "C" const GUID CLSID_D3D12DeviceFactory;
-namespace dxmt {
+namespace d3dalloy {
 struct OwnedCoreModule;
 // COM objects live in Main: last Release never executes in an unloadable Core.
 // Core owns the factory state, locking and behavior behind this private POD ABI.

@@ -7,11 +7,11 @@
 #include <mutex>
 #include <vector>
 
-@interface MTLFXTemporalDenoisedScalerDescriptor (DXMTRRBackend)
+@interface MTLFXTemporalDenoisedScalerDescriptor (D3DALLOYRRBackend)
 - (void)setVersion:(NSUInteger)version;
 @end
 
-namespace dxmt_rr {
+namespace d3dalloy_rr {
 constexpr uint32_t Flag = 256;
 constexpr size_t Count = 12;
 struct Generation {
@@ -71,11 +71,11 @@ const char *Kernel = R"METAL(
 using namespace metal;
 struct Params { uint x,y,width,height,sourceWidth,sourceHeight,mode,destinationX,destinationY,padding[3];
   float motionX,motionY,jitterX,jitterY; float4x4 projection; };
-inline uint2 dxmt_rr_source(constant Params &p, uint2 gid) {
+inline uint2 d3dalloy_rr_source(constant Params &p, uint2 gid) {
   return uint2(p.x,p.y) + min(uint2((float2(gid)+0.5f)*
     float2(p.sourceWidth,p.sourceHeight)/float2(p.width,p.height)), uint2(p.sourceWidth-1,p.sourceHeight-1));
 }
-inline float4 dxmt_rr_value(float4 value, constant Params &p, uint2 gid) {
+inline float4 d3dalloy_rr_value(float4 value, constant Params &p, uint2 gid) {
   if (p.mode == 1) value = float4(value.w,0,0,1);
   if (p.mode == 2) {
     // Recover view X/Y at the pixel center with the caller's view-space Z.
@@ -95,18 +95,18 @@ inline float4 dxmt_rr_value(float4 value, constant Params &p, uint2 gid) {
   if (p.mode == 3) value.xy = value.xy * float2(p.motionX,p.motionY) + float2(p.jitterX,p.jitterY);
   return value;
 }
-kernel void dxmt_rr_convert(texture2d<float,access::read> source [[texture(0)]],
+kernel void d3dalloy_rr_convert(texture2d<float,access::read> source [[texture(0)]],
   texture2d<float,access::write> destination [[texture(1)]],
   constant Params &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= p.width || gid.y >= p.height) return;
-  destination.write(dxmt_rr_value(source.read(dxmt_rr_source(p,gid)),p,gid),
+  destination.write(d3dalloy_rr_value(source.read(d3dalloy_rr_source(p,gid)),p,gid),
     gid + uint2(p.destinationX,p.destinationY));
 }
-kernel void dxmt_rr_convert_depth(depth2d<float,access::read> source [[texture(0)]],
+kernel void d3dalloy_rr_convert_depth(depth2d<float,access::read> source [[texture(0)]],
   texture2d<float,access::write> destination [[texture(1)]],
   constant Params &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
   if (gid.x >= p.width || gid.y >= p.height) return;
-  destination.write(dxmt_rr_value(float4(source.read(dxmt_rr_source(p,gid)),0,0,1),p,gid),gid);
+  destination.write(d3dalloy_rr_value(float4(source.read(d3dalloy_rr_source(p,gid)),0,0,1),p,gid),gid);
 }
 )METAL";
 std::mutex pipelineMutex;
@@ -123,9 +123,9 @@ std::shared_ptr<const Pipelines> devicePipelines(id<MTLDevice> device) {
   auto result = std::make_shared<Pipelines>();
   NSError *error = nil;
   id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:Kernel] options:nil error:&error];
-  id<MTLFunction> function = [library newFunctionWithName:@"dxmt_rr_convert"];
+  id<MTLFunction> function = [library newFunctionWithName:@"d3dalloy_rr_convert"];
   if (function) result->conversion = [device newComputePipelineStateWithFunction:function error:&error];
-  [function release]; function = [library newFunctionWithName:@"dxmt_rr_convert_depth"];
+  [function release]; function = [library newFunctionWithName:@"d3dalloy_rr_convert_depth"];
   if (function) result->depthConversion = [device newComputePipelineStateWithFunction:function error:&error];
   [function release]; [library release];
   if (!result->conversion || !result->depthConversion) return {};
@@ -249,32 +249,32 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
 }
 }
 
-@interface DXMTRRFeature : NSObject {
-@public std::shared_ptr<dxmt_rr::Core> core;
+@interface D3DALLOYRRFeature : NSObject {
+@public std::shared_ptr<d3dalloy_rr::Core> core;
 }
 @end
-@implementation DXMTRRFeature
+@implementation D3DALLOYRRFeature
 @end
-@interface DXMTRRFrame : NSObject {
-@public std::shared_ptr<dxmt_rr::Core> core;
-@public std::shared_ptr<dxmt_rr::Generation> generation;
+@interface D3DALLOYRRFrame : NSObject {
+@public std::shared_ptr<d3dalloy_rr::Core> core;
+@public std::shared_ptr<d3dalloy_rr::Generation> generation;
 @public WMTMetal4FXTemporalFrame props;
-@public std::array<id<MTLTexture>, dxmt_rr::Count> inputs;
-@public std::array<WMTMetal4FXRect, dxmt_rr::Count> rects;
-@public std::unique_ptr<dxmt_rr::Resources> firstResources;
+@public std::array<id<MTLTexture>, d3dalloy_rr::Count> inputs;
+@public std::array<WMTMetal4FXRect, d3dalloy_rr::Count> rects;
+@public std::unique_ptr<d3dalloy_rr::Resources> firstResources;
 }
 @end
-@implementation DXMTRRFrame
+@implementation D3DALLOYRRFrame
 - (void)dealloc { for (auto input : inputs) [input release]; [super dealloc]; }
 @end
-@interface DXMTRRExecution : NSObject {
-@public std::shared_ptr<dxmt_rr::Core> core;
-@public std::shared_ptr<dxmt_rr::Generation> generation;
-@public std::unique_ptr<dxmt_rr::Resources> resources;
-@public DXMTRRFrame *frame;
+@interface D3DALLOYRRExecution : NSObject {
+@public std::shared_ptr<d3dalloy_rr::Core> core;
+@public std::shared_ptr<d3dalloy_rr::Generation> generation;
+@public std::unique_ptr<d3dalloy_rr::Resources> resources;
+@public D3DALLOYRRFrame *frame;
 }
 @end
-@implementation DXMTRRExecution
+@implementation D3DALLOYRRExecution
 - (void)dealloc {
   if (resources) {
     // Retirement runs after recording ownership has ended, including partial encode failure.
@@ -288,9 +288,9 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
 }
 @end
 
-static bool dxmtRRResources(DXMTRRFrame *frame, dxmt_rr::Resources &resources,
-                            std::array<id<MTLTexture>, dxmt_rr::Count> &bound) {
-  using namespace dxmt_rr;
+static bool d3dalloyRRResources(D3DALLOYRRFrame *frame, d3dalloy_rr::Resources &resources,
+                            std::array<id<MTLTexture>, d3dalloy_rr::Count> &bound) {
+  using namespace d3dalloy_rr;
   const auto &p = frame->props;
   const auto &core = *frame->core;
   const auto scaler = frame->generation->scaler;
@@ -345,8 +345,8 @@ static bool dxmtRRResources(DXMTRRFrame *frame, dxmt_rr::Resources &resources,
   }
   return resources.params && resources.table && resources.residency;
 }
-static bool dxmtRRCall(struct WMTMetal4Call *call) try {
-  using namespace dxmt_rr;
+static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
+  using namespace d3dalloy_rr;
   if (call->operation == WMTMetal4FXCreateTemporal) {
     const auto &info = *reinterpret_cast<const WMTMetal4FXTemporalInfo *>(call->args[2]);
     if (!(info.feature_flags & Flag)) return false;
@@ -362,20 +362,20 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
     core->pipelines = devicePipelines(device);
     if (!core->pipelines) { call->ret[1] = 0x8007000e; return true; }
     core->conversion = core->pipelines->conversion; core->depthConversion = core->pipelines->depthConversion;
-    auto holder = [DXMTRRFeature new]; holder->core = std::move(core);
+    auto holder = [D3DALLOYRRFeature new]; holder->core = std::move(core);
     call->ret[0] = uintptr_t(holder); call->ret[1] = 0;
     return true;
   }
-  if (call->operation == WMTMetal4FXDormantTemporal && [(id)call->args[0] isKindOfClass:[DXMTRRFeature class]]) {
-    auto &core = *((DXMTRRFeature *)call->args[0])->core;
+  if (call->operation == WMTMetal4FXDormantTemporal && [(id)call->args[0] isKindOfClass:[D3DALLOYRRFeature class]]) {
+    auto &core = *((D3DALLOYRRFeature *)call->args[0])->core;
     // Release idle ownership, not history retained by recorded frames and replay.
     std::lock_guard lock(core.mutex); core.generations.fill(nullptr); core.pool.clear();
     return true;
   }
-  if (call->operation == WMTMetal4FXPrepareTemporal && [(id)call->args[0] isKindOfClass:[DXMTRRFeature class]]) {
+  if (call->operation == WMTMetal4FXPrepareTemporal && [(id)call->args[0] isKindOfClass:[D3DALLOYRRFeature class]]) {
     call->ret[0] = 0;
     call->ret[1] = 0x80070057;
-    auto feature = (DXMTRRFeature *)call->args[0];
+    auto feature = (D3DALLOYRRFeature *)call->args[0];
     const auto &p = *reinterpret_cast<const WMTMetal4FXTemporalFrame *>(call->args[1]);
     if (!p.reactive && (p.reactive_rect.x || p.reactive_rect.y)) return true;
     if (!p.input_width || !p.input_height || p.input_width > feature->core->info.input_width ||
@@ -397,7 +397,7 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
     const float maxScale = [MTLFXTemporalDenoisedScalerDescriptor supportedInputContentMaxScaleForDevice:feature->core->device];
     for (double scale : {double(p.output_rect.width) / p.input_width, double(p.output_rect.height) / p.input_height})
       if (scale < minScale || scale > maxScale) { call->ret[1] = 0x887a0004; return true; }
-    auto holder = [[DXMTRRFrame new] autorelease]; holder->core = feature->core; holder->props = p;
+    auto holder = [[D3DALLOYRRFrame new] autorelease]; holder->core = feature->core; holder->props = p;
     uint64_t handles[Count] = {p.color,p.depth,p.motion,p.output,p.exposure,p.reactive,0,
       p.diffuse_albedo,p.specular_albedo,p.normals,p.roughness_packed ? p.normals : p.roughness,p.specular_hit_distance};
     holder->rects = {p.color_rect,p.depth_rect,p.motion_rect,p.output_rect,{0,0,1,1},p.reactive_rect,{},
@@ -437,17 +437,17 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
     if (feature->core->pool.empty()) holder->firstResources = std::make_unique<Resources>();
     else { holder->firstResources = std::move(feature->core->pool.back()); feature->core->pool.pop_back(); }
     std::array<id<MTLTexture>,Count> bound{};
-    if (!dxmtRRResources(holder,*holder->firstResources,bound)) {
+    if (!d3dalloyRRResources(holder,*holder->firstResources,bound)) {
       call->ret[1] = 0x8007000e; return true;
     }
     [holder retain];
     call->ret[0] = uintptr_t(holder); call->ret[1] = 0; call->ret[2] = holder->generation->serial;
     return true;
   }
-  if (call->operation != WMTMetal4FXEncodeTemporal || ![(id)call->args[1] isKindOfClass:[DXMTRRFrame class]]) return false;
+  if (call->operation != WMTMetal4FXEncodeTemporal || ![(id)call->args[1] isKindOfClass:[D3DALLOYRRFrame class]]) return false;
   call->ret[1] = 0x887a0020;
-  auto frame = (DXMTRRFrame *)call->args[1];
-  auto execution = [DXMTRRExecution new]; execution->core = frame->core;
+  auto frame = (D3DALLOYRRFrame *)call->args[1];
+  auto execution = [D3DALLOYRRExecution new]; execution->core = frame->core;
   execution->generation = frame->generation; execution->frame = [frame retain];
   winemetal_metal4_retain_resource(call->args[0],execution); [execution release];
   winemetal_metal4_retain_resource(call->args[0],(id)call->args[2]);
@@ -460,7 +460,7 @@ static bool dxmtRRCall(struct WMTMetal4Call *call) try {
   const auto &p = frame->props;
   const bool reset = p.reset || call->args[3] || core.lastGeneration != frame->generation->serial;
   std::array<id<MTLTexture>,Count> bound{};
-  if (!dxmtRRResources(frame,resources,bound)) { call->ret[1] = 0x8007000e; return true; }
+  if (!d3dalloyRRResources(frame,resources,bound)) { call->ret[1] = 0x8007000e; return true; }
   if (resources.residencyDirty) {
     [resources.residency removeAllAllocations];
     for (auto texture : resources.textures) if (texture) [resources.residency addAllocation:texture];

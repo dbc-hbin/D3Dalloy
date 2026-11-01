@@ -3,7 +3,7 @@
 #include <cstdio>
 
 int main() {
-    dxmt::ParametersImpl params;
+    d3dalloy::ParametersImpl params;
     int failures = 0;
     auto check = [&](bool ok, const char* name) {
         std::printf("NGX_PARAMETER_CONTRACT_%s case=%s\n", ok ? "PASS" : "FAIL", name);

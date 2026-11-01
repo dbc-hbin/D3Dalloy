@@ -13,12 +13,12 @@ template<size_t From, size_t To, size_t Count>
 void check_move() {
   int releases[Count + 2] = {};
   {
-    dxmt::small_vector<std::unique_ptr<Owner>, From> source;
+    d3dalloy::small_vector<std::unique_ptr<Owner>, From> source;
     for (size_t i = 0; i < Count; ++i)
       source.emplace_back(std::make_unique<Owner>(&releases[i]));
     auto storage = source.data();
     auto capacity = source.capacity();
-    dxmt::small_vector<std::unique_ptr<Owner>, To> moved(std::move(source));
+    d3dalloy::small_vector<std::unique_ptr<Owner>, To> moved(std::move(source));
     assert(source.empty() && moved.size() == Count);
     if (capacity > std::max(From, To))
       assert(moved.data() == storage && source.capacity() == From);
@@ -50,7 +50,7 @@ int main() {
   check_move<1, 8, 3>(); // Heap source fits larger inline destination.
   check_move<1, 2, 5>(); // Heap transfer across inline capacities.
 
-  dxmt::small_vector<int, 2> values{1, 2};
+  d3dalloy::small_vector<int, 2> values{1, 2};
   auto inline_storage = values.data();
   assert(values.is_embedded() && values.capacity() == 2);
   values.at(1) = 4;
@@ -67,7 +67,7 @@ int main() {
   values.resize(3, 7);
   values.reserve(capacity);
   assert(values.data() == heap_storage && values.capacity() == capacity && values[2] == 7);
-  dxmt::small_vector<int, 8> copy(values);
+  d3dalloy::small_vector<int, 8> copy(values);
   values = copy;
   assert(values.data() == heap_storage && values.size() == 3 && values.front() == 7);
   auto same_capacity_copy = values;
@@ -78,7 +78,7 @@ int main() {
   assert(values.is_embedded() && values.data() == inline_storage && values[0] == 7);
 
   struct alignas(64) Aligned { int value; };
-  dxmt::small_vector<Aligned, 1> aligned;
+  d3dalloy::small_vector<Aligned, 1> aligned;
   aligned.emplace_back(Aligned{1});
   assert(reinterpret_cast<uintptr_t>(aligned.data()) % alignof(Aligned) == 0);
   aligned.emplace_back(Aligned{2});

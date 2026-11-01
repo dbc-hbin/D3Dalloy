@@ -20,7 +20,7 @@
 #include "dxil_converter.hpp"
 #include "dxil_signature.hpp"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 enum class PipelineKind {
   GeometryObject,     // SM50CompileGeometryPipelineVertex (VS body, GS state)
@@ -117,7 +117,7 @@ llvm::Error BindDomainStage(PipelineStage &stage);
 
 /**
  * Link the stage module into `target` (the converter's module) on first use. The entry
- * point is renamed `dxmt.dxil.<tag>` (the HS patch-constant function `dxmt.dxil.<tag>.pc`),
+ * point is renamed `d3dalloy.dxil.<tag>` (the HS patch-constant function `d3dalloy.dxil.<tag>.pc`),
  * module storage is relocated to AIR address spaces, every other definition is internalized
  * and the `dx.types.*` names the shared context uniqued are restored, so two stages of one
  * pipeline never collide. Sets `stage.entry` / `stage.patch_constant`.
@@ -148,4 +148,4 @@ llvm::Expected<uint32_t> ConstantOperand(const llvm::CallInst &call, unsigned in
 /** Every call to a `dx.op.<name>.*` overload inside `function`. */
 llvm::SmallVector<llvm::CallInst *, 16> CollectCalls(llvm::Function &function, llvm::StringRef name);
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

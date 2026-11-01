@@ -29,8 +29,8 @@
 #include "d3d12_ray_regeneration.hpp"
 #include "com/com_pointer.hpp"
 #include "dxil_raytracing.h"
-#include "dxmt_buffer.hpp"
-#include "dxmt_format.hpp"
+#include "d3dalloy_buffer.hpp"
+#include "d3dalloy_format.hpp"
 #include <array>
 #include <bit>
 #include <cmath>
@@ -41,7 +41,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 bool NativeMSAADescriptorSafe(MTLD3D12Device *device, const ShaderVisibleDescriptorCPUStorage &descriptor) {
   if (descriptor.type == ShaderVisibleDescriptorType::Null) return true;
@@ -522,7 +522,7 @@ class MTLD3D12GraphicsCommandListImpl
   WMT::Reference<WMT::ComputePipelineState> atomic_copy_u32_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> atomic_copy_u64_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> matrix_conversion_pipeline_;
-  /* Sampler feedback transcoding: [0] decode, [1] encode (dxmt_command.metal). */
+  /* Sampler feedback transcoding: [0] decode, [1] encode (d3dalloy_command.metal). */
   std::array<WMT::Reference<WMT::ComputePipelineState>, 2> feedback_transcode_pipelines_;
   uint64_t predication_snapshot_offset_ = 0;
   D3D12_PREDICATION_OP predication_op_ = D3D12_PREDICATION_OP_EQUAL_ZERO;
@@ -780,18 +780,18 @@ class MTLD3D12GraphicsCommandListImpl
     constexpr auto source = R"(
 #include <metal_stdlib>
 using namespace metal;
-kernel void dxmt_snapshot_predicate(device const ulong *source [[buffer(0)]],
+kernel void d3dalloy_snapshot_predicate(device const ulong *source [[buffer(0)]],
                                     device ulong *destination [[buffer(1)]]) {
   destination[0] = source[0];
 }
-kernel void dxmt_predicate_arguments(device const ulong *predicate [[buffer(0)]],
+kernel void d3dalloy_predicate_arguments(device const ulong *predicate [[buffer(0)]],
                                      device const uint *control [[buffer(1)]],
                                      device uint *arguments [[buffer(2)]]) {
   const bool execute = control[0] ? predicate[0] == 0 : predicate[0] != 0;
   for (uint i = 0; i < control[1]; i++)
     arguments[i] = execute ? control[i + 2] : 0;
 }
-kernel void dxmt_predicate_copy_bytes(device const ulong *predicate [[buffer(0)]],
+kernel void d3dalloy_predicate_copy_bytes(device const ulong *predicate [[buffer(0)]],
                                       device const ulong *control [[buffer(1)]],
                                       device const uchar *source [[buffer(2)]],
                                       device uchar *destination [[buffer(3)]],
@@ -802,7 +802,7 @@ kernel void dxmt_predicate_copy_bytes(device const ulong *predicate [[buffer(0)]
 }
 /* Rows x slices of one predicated texture-footprint copy: control = {op, row bytes, source row/slice pitch,
  * destination row/slice pitch}. Bytes between rows (pitch padding) are never written. */
-kernel void dxmt_predicate_copy_rows(device const ulong *predicate [[buffer(0)]],
+kernel void d3dalloy_predicate_copy_rows(device const ulong *predicate [[buffer(0)]],
                                      device const ulong *control [[buffer(1)]],
                                      device const uchar *source [[buffer(2)]],
                                      device uchar *destination [[buffer(3)]],
@@ -815,7 +815,7 @@ kernel void dxmt_predicate_copy_rows(device const ulong *predicate [[buffer(0)]]
 /* GS/HS/DS ExecuteIndirect: one thread per command slot copies the command's draw arguments (so the object function
  * reads them at SM50_BINDING_INDEX_DRAW_ARGUMENTS) and writes its object-threadgroup grid. Slots beyond the count
  * buffer, a false predicate, an empty draw or a grid above the device limit dispatch (0, 0, 0). */
-struct DXMTMeshIndirectControl {
+struct D3DalloyMeshIndirectControl {
   ulong arguments;       // first command's D3D12_DRAW_(INDEXED_)ARGUMENTS
   ulong count;           // count buffer address or 0
   ulong predicate;       // predicate snapshot address or 0
@@ -827,7 +827,7 @@ struct DXMTMeshIndirectControl {
   uint per_group;        // vertices (GS) or patches (TS) advanced per object threadgroup; 0: DISPATCH_MESH grid
   uint control_points;   // TS: vertices per patch, GS: 0
 };
-kernel void dxmt_mesh_indirect_arguments(constant DXMTMeshIndirectControl &control [[buffer(0)]],
+kernel void d3dalloy_mesh_indirect_arguments(constant D3DalloyMeshIndirectControl &control [[buffer(0)]],
                                          device uint *arguments_out [[buffer(1)]],
                                          device uint3 *dispatch_out [[buffer(2)]],
                                          uint index [[thread_position_in_grid]]) {
@@ -864,7 +864,7 @@ kernel void dxmt_mesh_indirect_arguments(constant DXMTMeshIndirectControl &contr
  * adjacency (its end-of-strip adjacency rules are position dependent). One thread rewrites the draw as the equivalent
  * list (D3D11.3 8.10 primitive order, winding and adjacency) of 32-bit index values, writes
  * its D3D12_DRAW_INDEXED_ARGUMENTS and object grid, and moves IAVertices from list to strip accounting. */
-struct DXMTMeshStripCutControl {
+struct D3DalloyMeshStripCutControl {
   ulong max_threadgroups;
   uint topology;  // D3D_PRIMITIVE_TOPOLOGY: 3 line strip, 5 triangle strip, 11 line strip adj, 13 triangle strip adj
   uint index_size;
@@ -881,12 +881,12 @@ struct DXMTMeshStripCutControl {
   uint cut_enabled;
 };
 // Index size 0: a non-indexed draw, whose IA position k is its own value.
-inline uint dxmt_mesh_read_index(device const uchar *indices, uint size, uint k) {
+inline uint d3dalloy_mesh_read_index(device const uchar *indices, uint size, uint k) {
   return size == 0 ? k : size == 4 ? uint(indices[4 * k]) | uint(indices[4 * k + 1]) << 8 | uint(indices[4 * k + 2]) << 16 |
                          uint(indices[4 * k + 3]) << 24
                    : uint(indices[2 * k]) | uint(indices[2 * k + 1]) << 8;
 }
-kernel void dxmt_mesh_strip_cut(constant DXMTMeshStripCutControl &control [[buffer(0)]],
+kernel void d3dalloy_mesh_strip_cut(constant D3DalloyMeshStripCutControl &control [[buffer(0)]],
                                 device const uchar *indices [[buffer(1)]],
                                 device uint *list [[buffer(2)]],
                                 device uint *arguments [[buffer(3)]],
@@ -905,7 +905,7 @@ kernel void dxmt_mesh_strip_cut(constant DXMTMeshStripCutControl &control [[buff
   ulong strip_vertices = 0;
   uint start = 0;
   for (uint k = 0; k <= control.count; k++) {
-    if (k < control.count && (!control.cut_enabled || dxmt_mesh_read_index(indices, control.index_size, k) != control.cut_value))
+    if (k < control.count && (!control.cut_enabled || d3dalloy_mesh_read_index(indices, control.index_size, k) != control.cut_value))
       continue;
     const uint length = k - start;
     const uint s = start;
@@ -942,7 +942,7 @@ kernel void dxmt_mesh_strip_cut(constant DXMTMeshStripCutControl &control [[buff
         }
       }
       for (uint j = 0; j < vpp; j++)
-        list[emitted + j] = dxmt_mesh_read_index(indices, control.index_size, s + v[j]);
+        list[emitted + j] = d3dalloy_mesh_read_index(indices, control.index_size, s + v[j]);
       emitted += vpp;
     }
   }
@@ -960,23 +960,23 @@ kernel void dxmt_mesh_strip_cut(constant DXMTMeshStripCutControl &control [[buff
   if (control.statistics_enabled)
     statistics[0] -= (ulong(emitted) - strip_vertices) * control.instances;
 }
-/* TS+GS (VS+HS+DS+GS) between the DS capture pass and the GS pass. dxmt_tess_capture_clear zeroes the per-slot
- * primitive counts before the capture; dxmt_tess_capture_compact (one 1024-thread group) prefix-sums them in slot
+/* TS+GS (VS+HS+DS+GS) between the DS capture pass and the GS pass. d3dalloy_tess_capture_clear zeroes the per-slot
+ * primitive counts before the capture; d3dalloy_tess_capture_compact (one 1024-thread group) prefix-sums them in slot
  * order (instance, patch, workload rank: the D3D primitive order), writes the flat list (entry = slot * P + p) after
  * the total at list[0] and the GS object grid (ceil(total / per_group), 1, 1). See SM50_TESS_CAPTURE_LAYOUT. */
-struct DXMTTessCompactControl {
+struct D3DalloyTessCompactControl {
   uint slot_count;
   uint max_primitives;  // P
   uint per_group;       // GS input primitives per object threadgroup
   uint reserved;
 };
-kernel void dxmt_tess_capture_clear(constant DXMTTessCompactControl &control [[buffer(0)]],
+kernel void d3dalloy_tess_capture_clear(constant D3DalloyTessCompactControl &control [[buffer(0)]],
                                     device uint *counts [[buffer(1)]],
                                     uint index [[thread_position_in_grid]]) {
   if (index < control.slot_count)
     counts[index] = 0;
 }
-kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [[buffer(0)]],
+kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &control [[buffer(0)]],
                                       device const uint *counts [[buffer(1)]],
                                       device uint *list [[buffer(2)]],
                                       device uint *dispatch [[buffer(3)]],
@@ -1013,14 +1013,14 @@ kernel void dxmt_tess_capture_compact(constant DXMTTessCompactControl &control [
     auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
     if (!library)
       return false;
-    auto snapshot = WMT4::Library(library).newFunction("dxmt_snapshot_predicate");
-    auto arguments = WMT4::Library(library).newFunction("dxmt_predicate_arguments");
-    auto copy = WMT4::Library(library).newFunction("dxmt_predicate_copy_bytes");
-    auto copy_rows = WMT4::Library(library).newFunction("dxmt_predicate_copy_rows");
-    auto mesh_indirect = WMT4::Library(library).newFunction("dxmt_mesh_indirect_arguments");
-    auto mesh_strip_cut = WMT4::Library(library).newFunction("dxmt_mesh_strip_cut");
-    auto tess_clear = WMT4::Library(library).newFunction("dxmt_tess_capture_clear");
-    auto tess_compact = WMT4::Library(library).newFunction("dxmt_tess_capture_compact");
+    auto snapshot = WMT4::Library(library).newFunction("d3dalloy_snapshot_predicate");
+    auto arguments = WMT4::Library(library).newFunction("d3dalloy_predicate_arguments");
+    auto copy = WMT4::Library(library).newFunction("d3dalloy_predicate_copy_bytes");
+    auto copy_rows = WMT4::Library(library).newFunction("d3dalloy_predicate_copy_rows");
+    auto mesh_indirect = WMT4::Library(library).newFunction("d3dalloy_mesh_indirect_arguments");
+    auto mesh_strip_cut = WMT4::Library(library).newFunction("d3dalloy_mesh_strip_cut");
+    auto tess_clear = WMT4::Library(library).newFunction("d3dalloy_tess_capture_clear");
+    auto tess_compact = WMT4::Library(library).newFunction("d3dalloy_tess_capture_compact");
     if (!snapshot || !arguments || !copy || !copy_rows || !mesh_indirect || !mesh_strip_cut || !tess_clear || !tess_compact)
       return false;
     tess_capture_clear_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(tess_clear, error);
@@ -3023,7 +3023,7 @@ public:
           binding.index = SM50_BINDING_INDEX_PIPELINE_STATISTICS;
         }
       }
-      // DXMTGeometryDraw/TessellationMeshDraw only rebase the draw-argument binding.
+      // D3DalloyGeometryDraw/TessellationMeshDraw only rebase the draw-argument binding.
       auto &arguments = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
       arguments.type = WMTRenderCommandSetObjectBuffer;
       allocator_->BindGPUHeap(arguments.buffer, arguments.offset, 0);
@@ -4050,7 +4050,7 @@ public:
   }
 
   /*
-   * Indexed GS strip draw with an active strip cut: dxmt_mesh_strip_cut expands it on the GPU into the equivalent
+   * Indexed GS strip draw with an active strip cut: d3dalloy_mesh_strip_cut expands it on the GPU into the equivalent
    * list of index values, drawn with the list variant (primitive ids and winding then match D3D11.3 8.10 exactly).
    * The expanded values are already base-vertex-free index values, so the draw keeps BaseVertexLocation.
    */
@@ -4148,8 +4148,8 @@ public:
     BindStatisticsClaim(0);
     if (stream_output && !BindGeometryStreamOutput())
       return;
-    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed_indirect>();
-    cmd.type = WMTRenderCommandDXMTGeometryDrawIndexedIndirect;
+    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect>();
+    cmd.type = WMTRenderCommandD3DalloyGeometryDrawIndexedIndirect;
     cmd.index_buffer = list;
     cmd.index_buffer_offset = list_offset;
     allocator_->BindGPUHeap(cmd.indirect_args_buffer, cmd.indirect_args_offset, arguments_offset);
@@ -4244,8 +4244,8 @@ public:
     const uint32_t patch_per_group = 32 / threads_per_patch;
     const uint32_t groups = (patches - 1) / patch_per_group + 1;
     if (indexed) {
-      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
-      cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed>();
+      cmd.type = WMTRenderCommandD3DalloyTessellationMeshDrawIndexed;
       cmd.draw_arguments_offset = argument_offset;
       cmd.index_buffer = index_buffer;
       cmd.index_buffer_offset = index_offset;
@@ -4254,8 +4254,8 @@ public:
       cmd.patch_per_group = patch_per_group;
       cmd.patch_per_mesh_instance = groups;
     } else {
-      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
-      cmd.type = WMTRenderCommandDXMTTessellationMeshDraw;
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_d3dalloy_tessellation_mesh_draw>();
+      cmd.type = WMTRenderCommandD3DalloyTessellationMeshDraw;
       cmd.draw_arguments_offset = argument_offset;
       cmd.instance_count = instances;
       cmd.threads_per_patch = threads_per_patch;
@@ -4308,7 +4308,7 @@ public:
   }
 
   /*
-   * GS or HS/DS draw: an object+mesh dispatch over DXMT_DRAW_(INDEXED_)ARGUMENTS in the GPU heap.
+   * GS or HS/DS draw: an object+mesh dispatch over D3DALLOY_DRAW_(INDEXED_)ARGUMENTS in the GPU heap.
    * Under predication the arguments are the predicated copy; a false predicate zeroes the vertex
    * count, so every object thread is inactive and nothing is emitted or counted.
    */
@@ -4419,8 +4419,8 @@ public:
         return;
       const uint32_t groups = (patches - 1) / patch_per_group + 1;
       if (indexed) {
-        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
-        cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
+        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed>();
+        cmd.type = WMTRenderCommandD3DalloyTessellationMeshDrawIndexed;
         cmd.draw_arguments_offset = argument_offset;
         cmd.index_buffer = index_buffer;
         cmd.index_buffer_offset = index_base;
@@ -4429,8 +4429,8 @@ public:
         cmd.patch_per_group = patch_per_group;
         cmd.patch_per_mesh_instance = groups;
       } else {
-        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
-        cmd.type = WMTRenderCommandDXMTTessellationMeshDraw;
+        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_d3dalloy_tessellation_mesh_draw>();
+        cmd.type = WMTRenderCommandD3DalloyTessellationMeshDraw;
         cmd.draw_arguments_offset = argument_offset;
         cmd.instance_count = instances;
         cmd.threads_per_patch = threads_per_patch;
@@ -4441,8 +4441,8 @@ public:
       const auto [vertex_per_warp, increment] = GeometryWarpShape(topology_);
       const uint32_t warps = (count - 1) / increment + 1;
       if (indexed) {
-        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
-        cmd.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_d3dalloy_geometry_draw_indexed>();
+        cmd.type = WMTRenderCommandD3DalloyGeometryDrawIndexed;
         cmd.draw_arguments_offset = argument_offset;
         cmd.index_buffer = index_buffer;
         cmd.index_buffer_offset = index_base;
@@ -4450,8 +4450,8 @@ public:
         cmd.instance_count = instances;
         cmd.vertex_per_warp = vertex_per_warp;
       } else {
-        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
-        cmd.type = WMTRenderCommandDXMTGeometryDraw;
+        auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_d3dalloy_geometry_draw>();
+        cmd.type = WMTRenderCommandD3DalloyGeometryDraw;
         cmd.draw_arguments_offset = argument_offset;
         cmd.warp_count = warps;
         cmd.instance_count = instances;
@@ -9482,7 +9482,7 @@ public:
 
   /*
    * ExecuteIndirect with a GS/HS/DS pipeline. A compute pass copies each command's draw arguments and derives its
-   * object-threadgroup grid (dxmt_mesh_indirect_arguments), then every command slot is one indirect mesh draw that
+   * object-threadgroup grid (d3dalloy_mesh_indirect_arguments), then every command slot is one indirect mesh draw that
    * reads its own argument copy. Empty/predicated-off/uncounted slots dispatch nothing.
    */
   void RecordMeshIndirect(MTLD3D12CommandSignature *sig, UINT MaxCommandCount, uint64_t ArgBufferAddress,
@@ -9649,7 +9649,7 @@ public:
 
   /*
    * ExecuteIndirect with D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH on a mesh-shader pipeline: one thread per slot
-   * (dxmt_mesh_indirect_arguments, per_group 0) writes the slot's grid, zeroed past the count buffer, under a false
+   * (d3dalloy_mesh_indirect_arguments, per_group 0) writes the slot's grid, zeroed past the count buffer, under a false
    * predicate or out of the D3D limits; each slot is one indirect object/mesh draw.
    */
   void RecordMeshShaderIndirect(MTLD3D12CommandSignature *sig, UINT MaxCommandCount, uint64_t ArgBufferAddress,
@@ -10094,14 +10094,14 @@ public:
       constexpr auto source = R"(
 #include <metal_stdlib>
 using namespace metal;
-kernel void dxmt_atomic_copy_u32(device atomic_uint *source [[buffer(0)]],
+kernel void d3dalloy_atomic_copy_u32(device atomic_uint *source [[buffer(0)]],
                                  device atomic_uint *destination [[buffer(1)]]) {
   atomic_store_explicit(destination, atomic_load_explicit(source, memory_order_relaxed), memory_order_relaxed);
 }
 )";
       WMT::Reference<WMT::Error> error;
       auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
-      auto function = library ? WMT4::Library(library).newFunction("dxmt_atomic_copy_u32") : WMT::Reference<WMT4::Function>();
+      auto function = library ? WMT4::Library(library).newFunction("d3dalloy_atomic_copy_u32") : WMT::Reference<WMT4::Function>();
       if (function)
         atomic_copy_u32_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!atomic_copy_u32_pipeline_) {
@@ -10150,7 +10150,7 @@ kernel void dxmt_atomic_copy_u32(device atomic_uint *source [[buffer(0)]],
       constexpr auto source = R"(
 #include <metal_stdlib>
 using namespace metal;
-kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
+kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
                                  device atomic_ulong *destination [[buffer(1)]]) {
   const ulong value = source[0];
   atomic_min_explicit(destination, value, memory_order_relaxed);
@@ -10159,7 +10159,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
 )";
       WMT::Reference<WMT::Error> error;
       auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
-      auto function = library ? WMT4::Library(library).newFunction("dxmt_atomic_copy_u64") : WMT::Reference<WMT4::Function>();
+      auto function = library ? WMT4::Library(library).newFunction("d3dalloy_atomic_copy_u64") : WMT::Reference<WMT4::Function>();
       if (function)
         atomic_copy_u64_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
       if (!atomic_copy_u64_pipeline_) {
@@ -10414,7 +10414,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     // closing native MSAA pass stores folds into that pass as
     // StoreAndMultisampleResolve: the tile resolves before it is written back,
     // so the separate ResolvePass that reloads the MSAA surface disappears
-    // (DXMT's D3D11 encoder optimizer does the same; D3DMetal 4.0b3 still
+    // (D3Dalloy's D3D11 encoder optimizer does the same; D3DMetal 4.0b3 still
     // encodes a separate load + MultisampleResolve pass).
     if (whole_average && native_full_rect && !decompress) {
       auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_last);
@@ -10448,20 +10448,20 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     if (decompress && src_resource_desc.SampleDesc.Count > 1) resolve->sample_positions = sample_positions_;
     if (!whole_average) {
       auto library = device_->GetLib().getLibrary();
-      auto vertex = WMT4::Library(library).newFunction("dxmt_resolve_vertex");
+      auto vertex = WMT4::Library(library).newFunction("d3dalloy_resolve_vertex");
       const bool integer = IsIntegerFormat(format_desc.PixelFormat);
       const bool unsigned_integer = integer && MTLGetUnsignedIntegerFormat(format_desc.PixelFormat) == format_desc.PixelFormat;
       const char *fragment_name = dsv_plane == 1 ?
-                                  (destination_dsv_plane ? "dxmt_resolve_depth" : "dxmt_resolve_depth_color") :
-                                  dsv_plane == 2 ? (destination_dsv_plane ? "dxmt_resolve_stencil" : "dxmt_resolve_uint") :
-                                  unsigned_integer ? "dxmt_resolve_uint" :
-                                  integer ? "dxmt_resolve_sint" : "dxmt_resolve_float";
+                                  (destination_dsv_plane ? "d3dalloy_resolve_depth" : "d3dalloy_resolve_depth_color") :
+                                  dsv_plane == 2 ? (destination_dsv_plane ? "d3dalloy_resolve_stencil" : "d3dalloy_resolve_uint") :
+                                  unsigned_integer ? "d3dalloy_resolve_uint" :
+                                  integer ? "d3dalloy_resolve_sint" : "d3dalloy_resolve_float";
       if (src_resource_desc.SampleDesc.Count == 1)
         fragment_name = dsv_plane == 1 ?
-                        (destination_dsv_plane ? "dxmt_decompress_depth_single" : "dxmt_decompress_depth_color_single") :
-                        dsv_plane == 2 ? (destination_dsv_plane ? "dxmt_decompress_stencil_single" : "dxmt_decompress_uint_single") :
-                        unsigned_integer ? "dxmt_decompress_uint_single" :
-                        integer ? "dxmt_decompress_sint_single" : "dxmt_decompress_float_single";
+                        (destination_dsv_plane ? "d3dalloy_decompress_depth_single" : "d3dalloy_decompress_depth_color_single") :
+                        dsv_plane == 2 ? (destination_dsv_plane ? "d3dalloy_decompress_stencil_single" : "d3dalloy_decompress_uint_single") :
+                        unsigned_integer ? "d3dalloy_decompress_uint_single" :
+                        integer ? "d3dalloy_decompress_sint_single" : "d3dalloy_decompress_float_single";
       const uint8_t fragment_kind = (dsv_plane == 1 ? (destination_dsv_plane ? 1 : 2) :
                                      dsv_plane == 2 ? (destination_dsv_plane ? 3 : 4) :
                                      unsigned_integer ? 5 : integer ? 6 : 7) + (decompress ? 8 : 0);
@@ -11180,7 +11180,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       if (!matrix_conversion_pipeline_) {
         WMT::Reference<WMT::Error> error;
         auto library = device_->GetMTLDevice().newLibraryWithSource(matrix::kConversionSource, error);
-        auto function = library ? WMT4::Library(library).newFunction("dxmt_convert_matrix") : WMT::Reference<WMT4::Function>();
+        auto function = library ? WMT4::Library(library).newFunction("d3dalloy_convert_matrix") : WMT::Reference<WMT4::Function>();
         if (function) matrix_conversion_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
         if (!matrix_conversion_pipeline_) { RecordError(E_FAIL); return; }
       }
@@ -11540,7 +11540,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
 
   /*
    * ExecuteIndirect with D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS. The descriptions are GPU data, so the
-   * DispatchRays validation runs on the GPU: one thread per slot (dxmt_rays_indirect) turns the slot's
+   * DispatchRays validation runs on the GPU: one thread per slot (d3dalloy_rays_indirect) turns the slot's
    * D3D12_DISPATCH_RAYS_DESC into the table fields and dimensions of the slot's own dispatch constants
    * and writes its threadgroup grid - zero past the count buffer, under a false predicate, or for a
    * description DispatchRays would reject. Each slot is then one traversal dispatched indirectly from
@@ -11646,20 +11646,20 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       source += std::to_string(offset);
       source += "u\n";
     };
-    define("DXMT_RAYGEN_RECORD", offsetof(SM50_RT_DISPATCH_ARGUMENTS, RayGenerationRecord));
-    define("DXMT_MISS_BASE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, MissRecordBase));
-    define("DXMT_HIT_BASE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordBase));
-    define("DXMT_CALLABLE_BASE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, CallableRecordBase));
-    define("DXMT_MISS_STRIDE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, MissRecordStride));
-    define("DXMT_MISS_COUNT", offsetof(SM50_RT_DISPATCH_ARGUMENTS, MissRecordCount));
-    define("DXMT_HIT_STRIDE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordStride));
-    define("DXMT_HIT_COUNT", offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordCount));
-    define("DXMT_CALLABLE_STRIDE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, CallableRecordStride));
-    define("DXMT_CALLABLE_COUNT", offsetof(SM50_RT_DISPATCH_ARGUMENTS, CallableRecordCount));
-    define("DXMT_WIDTH", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchWidth));
-    define("DXMT_HEIGHT", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchHeight));
-    define("DXMT_DEPTH", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchDepth));
-    define("DXMT_SELF", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchArgumentsAddress));
+    define("D3DALLOY_RAYGEN_RECORD", offsetof(SM50_RT_DISPATCH_ARGUMENTS, RayGenerationRecord));
+    define("D3DALLOY_MISS_BASE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, MissRecordBase));
+    define("D3DALLOY_HIT_BASE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordBase));
+    define("D3DALLOY_CALLABLE_BASE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, CallableRecordBase));
+    define("D3DALLOY_MISS_STRIDE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, MissRecordStride));
+    define("D3DALLOY_MISS_COUNT", offsetof(SM50_RT_DISPATCH_ARGUMENTS, MissRecordCount));
+    define("D3DALLOY_HIT_STRIDE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordStride));
+    define("D3DALLOY_HIT_COUNT", offsetof(SM50_RT_DISPATCH_ARGUMENTS, HitGroupRecordCount));
+    define("D3DALLOY_CALLABLE_STRIDE", offsetof(SM50_RT_DISPATCH_ARGUMENTS, CallableRecordStride));
+    define("D3DALLOY_CALLABLE_COUNT", offsetof(SM50_RT_DISPATCH_ARGUMENTS, CallableRecordCount));
+    define("D3DALLOY_WIDTH", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchWidth));
+    define("D3DALLOY_HEIGHT", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchHeight));
+    define("D3DALLOY_DEPTH", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchDepth));
+    define("D3DALLOY_SELF", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchArgumentsAddress));
     source += raytracing::kRaysIndirectMSL;
     WMT::Reference<WMT::Error> error;
     auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
@@ -11846,7 +11846,7 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       dispatch_rays.type = WMTComputeCommandDispatchThreads;
       dispatch_rays.size = grid;
     } else {
-      /* dxmt_rays_indirect wrote the slot's threadgroup counts for `group`. */
+      /* d3dalloy_rays_indirect wrote the slot's threadgroup counts for `group`. */
       auto &dispatch_rays = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
       dispatch_rays.type = WMTComputeCommandDispatchIndirect;
       allocator_->BindGPUHeap(dispatch_rays.indirect_args_buffer, dispatch_rays.indirect_args_offset, indirect_grid_offset);
@@ -11901,4 +11901,4 @@ CreateClosedCommandList(
   return E_OUTOFMEMORY;
 }
 
-}; // namespace dxmt
+}; // namespace d3dalloy

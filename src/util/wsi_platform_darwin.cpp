@@ -1,7 +1,7 @@
 #include "wsi_platform.hpp"
 #include <cstdlib>
 
-namespace dxmt::wsi {
+namespace d3dalloy::wsi {
 
 void *aligned_malloc(size_t size, size_t alignment) {
   void *ptr = nullptr;
@@ -10,4 +10,4 @@ void *aligned_malloc(size_t size, size_t alignment) {
 
 void aligned_free(void *ptr) { return free(ptr); }
 
-} // namespace dxmt::wsi
+} // namespace d3dalloy::wsi

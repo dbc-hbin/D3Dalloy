@@ -21,13 +21,13 @@
 #include "d3d12_pageable.hpp"
 #include "d3d12_resource_contract.hpp"
 #include "d3d12_sampler_feedback.hpp"
-#include "dxmt_format.hpp"
+#include "d3dalloy_format.hpp"
 #include "com/com_pointer.hpp"
 #include <algorithm>
 #include <new>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 namespace {
 
@@ -832,7 +832,7 @@ public:
   HRESULT PrepareReservedVolumeCastLayout(uint32_t mip) {
     if (!reserved || !reserved->volumeLayout() || reserved->blockWidth() != 4 || reserved->blockHeight() != 4)
       return S_OK;
-    std::lock_guard<dxmt::mutex> lock(reserved->mutex);
+    std::lock_guard<d3dalloy::mutex> lock(reserved->mutex);
     if (reserved->volume_cast_layouts.contains(mip)) return S_OK;
     auto layout = *reserved->volumeLayout();
     layout.width = (std::max(layout.width >> mip, 1u) + 3) / 4;
@@ -973,7 +973,7 @@ public:
         auto atlas = resource->reserved->GetVolumeCastAtlas(resource->device_, format, compressed);
         uint64_t address = 0;
         if (!compressed) {
-          std::lock_guard<dxmt::mutex> lock(resource->reserved->mutex);
+          std::lock_guard<d3dalloy::mutex> lock(resource->reserved->mutex);
           const auto metadata = resource->reserved->volume_cast_layouts.find(mip);
           if (metadata != resource->reserved->volume_cast_layouts.end()) address = metadata->second.address;
         }
@@ -1074,7 +1074,7 @@ public:
 
   /*
    * CPU transfers for Private storage (committed textures on heaps without CPU pages). D3D12 defines
-   * WriteToSubresource/ReadFromSubresource only where Map succeeds; DXMT keeps accepting them on
+   * WriteToSubresource/ReadFromSubresource only where Map succeeds; D3Dalloy keeps accepting them on
    * DEFAULT heaps by staging through a CPU-visible buffer and one synchronous blit, after which the
    * bytes are visible to later GPU work and to the caller, as with the former direct CPU copy.
    */
@@ -2208,4 +2208,4 @@ CreatePlacedTexture(
   return texture->QueryInterface(riid, ppResource);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

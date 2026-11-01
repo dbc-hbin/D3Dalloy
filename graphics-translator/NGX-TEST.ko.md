@@ -65,7 +65,7 @@ Main fixture는 `owned-d3d12-temporal.cpp`의 resource/readback helpers를 renam
 : "${OWNED_INSTALL:?현재 루트의 x64 Meson install 경로}"
 : "${WINE_SOURCE:?복제할 원본 Wine runtime 경로}"
 python3 scripts/stage-owned-graphics.py stage \
-  --dxmt-install "$OWNED_INSTALL" \
+  --d3dalloy-install "$OWNED_INSTALL" \
   --wine-source "$WINE_SOURCE" \
   --wine-dest "$NGX_WORK/runtime" \
   --native-arch x86_64 --windows-abi x64 --with-nvngx

@@ -12,7 +12,7 @@
 #include <mutex>
 #include <new>
 
-namespace dxmt {
+namespace d3dalloy {
 namespace {
 constexpr UINT kLowResMV = 2, kAutoExposure = 64;
 constexpr UINT kSupportedFlags = 1 | 2 | 4 | 8 | 64 | 128 | 256;
@@ -235,4 +235,4 @@ void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
   signal_event(core.timeline, sequence);
   core.last_executed_generation = hr < 0 ? 0 : frame->generation;
 }
-} // namespace dxmt
+} // namespace d3dalloy

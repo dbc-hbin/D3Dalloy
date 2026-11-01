@@ -52,8 +52,8 @@ configure_file(output: 'd3d12_core_generation.h', configuration: core_generation
 
 d3d12_dll = shared_library('d3d12', d3d12_src,
   name_prefix         : '',
-  dependencies        : [ dxgi_dep, dxmt_dep, airconv_forward_dep, util_dep, winemetal_dep, dxbc_parser_dep ],
-  include_directories : [ dxmt_include_path ],
+  dependencies        : [ dxgi_dep, d3dalloy_dep, airconv_forward_dep, util_dep, winemetal_dep, dxbc_parser_dep ],
+  include_directories : [ d3dalloy_include_path ],
   install             : true,
   install_dir         : windows_native_install_dir,
   vs_module_defs      : 'd3d12.def',
@@ -63,7 +63,7 @@ d3d12_dll = shared_library('d3d12', d3d12_src,
 
 d3d12_dep = declare_dependency(
   link_with           : [ d3d12_dll ],
-  include_directories : [ dxmt_include_path, include_directories('.') ],
+  include_directories : [ d3dalloy_include_path, include_directories('.') ],
 )
 
 # Core has no Unix library boundary. It must remain an ordinary PE image:
@@ -71,7 +71,7 @@ d3d12_dep = declare_dependency(
 d3d12core_dll = shared_library('d3d12core', 'd3d12_core.cpp',
   name_prefix         : '',
   dependencies        : [ d3d12_dep, cpp.find_library('dxguid') ],
-  include_directories : [ dxmt_include_path ],
+  include_directories : [ d3dalloy_include_path ],
   install             : true,
   install_dir         : windows_native_install_dir,
   vs_module_defs      : 'd3d12_core.def',

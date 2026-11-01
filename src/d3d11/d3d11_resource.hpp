@@ -1,9 +1,9 @@
 #pragma once
-#include "dxmt_buffer.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_staging.hpp"
-#include "dxmt_texture.hpp"
-#include "dxmt_keyed_mutex.hpp"
+#include "d3dalloy_buffer.hpp"
+#include "d3dalloy_dynamic.hpp"
+#include "d3dalloy_staging.hpp"
+#include "d3dalloy_texture.hpp"
+#include "d3dalloy_keyed_mutex.hpp"
 #include "d3d11_device_child.hpp"
 #include "com/com_pointer.hpp"
 #include "com/com_guid.hpp"
@@ -25,7 +25,7 @@ DEFINE_COM_INTERFACE("9a6f6549-d4b1-45ea-8794-8503d190d3d1",
   virtual float GetMinLOD() = 0;
 };
 
-namespace dxmt {
+namespace d3dalloy {
 
 template <typename RESOURCE_DESC>
 void UpgradeResourceDescription(const RESOURCE_DESC *pSrc, RESOURCE_DESC &dst) {
@@ -259,7 +259,7 @@ public:
   }
 
   void STDMETHODCALLTYPE GetDesc(void *pDesc) final {
-    ::dxmt::DowngradeResourceDescription(desc, (typename tag::DESC *)pDesc);
+    ::d3dalloy::DowngradeResourceDescription(desc, (typename tag::DESC *)pDesc);
   }
 
   void STDMETHODCALLTYPE GetDesc1(void *pDesc) override { *(typename tag::DESC1 *)pDesc = desc; }
@@ -476,7 +476,7 @@ inline void MakeUniqueSharedName(char (&out)[54]) {
     uint64_t r1 = dis(gen);
     uint64_t r2 = dis(gen);
 
-    std::snprintf(out, 54, "DXMT_shared_resource_%016llx%016llx",
+    std::snprintf(out, 54, "d3dalloy_shared_%016llx%016llx",
                   static_cast<unsigned long long>(r1),
                   static_cast<unsigned long long>(r2));
 }
@@ -622,4 +622,4 @@ CalculateBufferViewOffsetAndSize(const D3D11_BUFFER_DESC &buffer_desc,
 constexpr UINT kD3D11OutputBindFlags =
     D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_RENDER_TARGET;
 
-} // namespace dxmt
+} // namespace d3dalloy

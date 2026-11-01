@@ -1,4 +1,4 @@
-project('dxmt', ['c', 'cpp'], version : 'v0.1', meson_version: '>=1.3.0', default_options : [ 
+project('d3dalloy', ['c', 'cpp'], version : 'v0.1', meson_version: '>=1.3.0', default_options : [
   'cpp_std=c++20', 
   'warning_level=2', 
   'build.cpp_std=c++20',
@@ -7,7 +7,7 @@ project('dxmt', ['c', 'cpp'], version : 'v0.1', meson_version: '>=1.3.0', defaul
 
 fs = import('fs')
 
-dxmt_crossbuild = meson.is_cross_build()
+d3dalloy_crossbuild = meson.is_cross_build()
 
 cpp = meson.get_compiler('cpp')
 cc = meson.get_compiler('c')
@@ -24,25 +24,25 @@ if build_native_components
   add_project_arguments(['-std=c++20', '-arch', native_compiler_arch], language: 'objcpp', native: true)
   add_project_link_arguments(['-arch', native_compiler_arch], language: 'objcpp', native: true)
 endif
-if not build_native_components and not dxmt_crossbuild
+if not build_native_components and not d3dalloy_crossbuild
   error('build_native_components=false is only valid for Windows PE-only cross builds')
 endif
-if native_bridge_only and dxmt_crossbuild
+if native_bridge_only and d3dalloy_crossbuild
   error('native_bridge_only requires a native macOS build, not a Windows cross file')
 endif
 
-dxmt_include_dirs = [
+d3dalloy_include_dirs = [
   './include',
   './libs'
 ]
 
-dxmt_native_include_dirs = [
+d3dalloy_native_include_dirs = [
   './include/native/windows',
   './include/native/directx',
 ]
 
-if not dxmt_crossbuild
-  dxmt_include_dirs += dxmt_native_include_dirs
+if not d3dalloy_crossbuild
+  d3dalloy_include_dirs += d3dalloy_native_include_dirs
 endif
 
 source_prefix_path = fs.relative_to(
@@ -112,14 +112,14 @@ if get_option('debug')
   ]
 endif
 
-dxmt_include_path = include_directories(dxmt_include_dirs)
-dxmt_native_include_path = include_directories(dxmt_native_include_dirs)
+d3dalloy_include_path = include_directories(d3dalloy_include_dirs)
+d3dalloy_native_include_path = include_directories(d3dalloy_native_include_dirs)
 
 if not fs.is_file('include/native/directx/d3d11.h')
   error('Don\'t forget to clone submodules. `git submodule update --init --recursive`')
 endif
 
-if dxmt_crossbuild
+if d3dalloy_crossbuild
   res_ext = '.o'
   wrc = find_program('windres')
   wrc_generator = generator(wrc,
@@ -151,21 +151,21 @@ hexdump_generator = generator(xxd,
   arguments : [ '-n', '@BASENAME@', '-i', '@INPUT@', '@OUTPUT@'],
 )
 
-dxmt_debug = get_option('dxmt_debug')
+d3dalloy_debug = get_option('d3dalloy_debug')
 
-if dxmt_debug
-add_project_arguments('-DDXMT_DEBUG=1', language: 'cpp')
+if d3dalloy_debug
+add_project_arguments('-DD3DALLOY_DEBUG=1', language: 'cpp')
 endif
 
-add_project_arguments('-DDXMT_PAGE_SIZE=4096', language: 'cpp')
+add_project_arguments('-DD3DALLOY_PAGE_SIZE=4096', language: 'cpp')
 
-dxmt_version = vcs_tag(
+d3dalloy_version = vcs_tag(
   command: ['git', 'describe', '--always'],
   input:  'version.h.in',
   output: 'version.h',
 )
 
-if dxmt_crossbuild
+if d3dalloy_crossbuild
   wine_builtin_dll = get_option('wine_builtin_dll')
 
   if cpu_family == 'x86'

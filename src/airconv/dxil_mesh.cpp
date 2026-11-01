@@ -37,7 +37,7 @@
 
 #include <map>
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 namespace {
 
@@ -258,7 +258,7 @@ llvm::Error lower_output_stores(
     auto *type = llvm::ArrayType::get(row_type, max_count);
     output.staging = new llvm::GlobalVariable(
       ctx.module, type, false, llvm::GlobalValue::InternalLinkage, llvm::UndefValue::get(type),
-      "dxmt.mesh." + std::string(output.primitive ? "primitive." : "vertex.") + element.name, nullptr,
+      "d3dalloy.mesh." + std::string(output.primitive ? "primitive." : "vertex.") + element.name, nullptr,
       llvm::GlobalValue::NotThreadLocal, 3
     );
     output.staging->setAlignment(llvm::Align(16));
@@ -311,7 +311,7 @@ llvm::Error define_mesh_outputs(
         row.type = air::msl_uint;
         row.is_float = false;
         signature.DefineMeshPrimitiveOutput(air::OutputMeshData{
-          .user = "dxmt_shading_rate", .type = air::msl_uint, .index = row.data_index
+          .user = "d3dalloy_shading_rate", .type = air::msl_uint, .index = row.data_index
         });
         break;
       }
@@ -598,7 +598,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
     auto *i32 = builder.getInt32Ty();
     stats_count = new llvm::GlobalVariable(
       module_ir, i32, false, llvm::GlobalValue::InternalLinkage, llvm::UndefValue::get(i32),
-      "dxmt.mesh.statistics.count", nullptr, llvm::GlobalValue::NotThreadLocal, 3
+      "d3dalloy.mesh.statistics.count", nullptr, llvm::GlobalValue::NotThreadLocal, 3
     );
     for (auto &output : primitive_outputs)
       for (auto &row : output.rows)
@@ -607,7 +607,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
             auto *type = llvm::ArrayType::get(i32, culled_words);
             stats_culled = new llvm::GlobalVariable(
               module_ir, type, false, llvm::GlobalValue::InternalLinkage, llvm::UndefValue::get(type),
-              "dxmt.mesh.statistics.culled", nullptr, llvm::GlobalValue::NotThreadLocal, 3
+              "d3dalloy.mesh.statistics.culled", nullptr, llvm::GlobalValue::NotThreadLocal, 3
             );
           }
           output.culled_bits = stats_culled;
@@ -759,7 +759,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
     if (!staged)
       return;
     auto *barrier = air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
-    barrier->setMetadata("dxmt.mesh.output_barrier", llvm::MDTuple::get(llvm_context, {}));
+    barrier->setMetadata("d3dalloy.mesh.output_barrier", llvm::MDTuple::get(llvm_context, {}));
     emit_strided_loop(builder, function, thread_index, count, threads, [&](llvm::Value *i) {
       for (auto &output : outputs) {
         if (!output.staging)
@@ -783,7 +783,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
     auto *i32 = builder.getInt32Ty();
     auto *group = new llvm::GlobalVariable(
       module_ir, i32, false, llvm::GlobalValue::InternalLinkage, llvm::UndefValue::get(i32),
-      "dxmt.mesh.statistics.group", nullptr, llvm::GlobalValue::NotThreadLocal, 3
+      "d3dalloy.mesh.statistics.group", nullptr, llvm::GlobalValue::NotThreadLocal, 3
     );
     auto *take_bb = llvm::BasicBlock::Create(llvm_context, "statistics_group", function);
     auto *taken_bb = llvm::BasicBlock::Create(llvm_context, "statistics_group_done", function);
@@ -842,4 +842,4 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
   return std::move(binding_map);
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

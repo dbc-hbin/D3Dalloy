@@ -9,7 +9,7 @@ using Atomic64Uint = uint32_t;
 using Atomic64Ulong = uint64_t;
 #endif
 
-namespace dxmt {
+namespace d3dalloy {
 struct Atomic64ImportCell {
   Atomic64Ulong bytes[8];
 };
@@ -36,4 +36,4 @@ struct Atomic64TransferParams {
 static_assert(sizeof(Atomic64ImportCell) == 64);
 static_assert(sizeof(Atomic64TransferParams) == 96);
 #endif
-} // namespace dxmt
+} // namespace d3dalloy

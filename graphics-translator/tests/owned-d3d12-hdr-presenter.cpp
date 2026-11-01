@@ -1,8 +1,8 @@
 // GPU oracle for the production presenter, separate from the public DXGI HRESULT fixture.
-// Link this PE to the production libdxmt and WineMetal import library, not a copied shader.
+// Link this PE to the production libd3dalloy and WineMetal import library, not a copied shader.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include "dxmt_presenter.hpp"
+#include "d3dalloy_presenter.hpp"
 #include "Metal.hpp"
 #include "Metal4FX.hpp"
 #include "log/log.hpp"
@@ -13,7 +13,7 @@
 #include <cstring>
 #include <utility>
 
-namespace dxmt { Logger Logger::s_instance("owned-d3d12-hdr-presenter.log"); }
+namespace d3dalloy { Logger Logger::s_instance("owned-d3d12-hdr-presenter.log"); }
 
 namespace {
 constexpr unsigned kSize = 64;
@@ -88,8 +88,8 @@ struct Probe {
   WMT::Reference<WMT::MTL4CommandQueue> queue;
   obj_handle_t native_view = 0;
   WMT::MetalLayer layer;
-  dxmt::InternalCommandLibrary library;
-  dxmt::Presenter presenter;
+  d3dalloy::InternalCommandLibrary library;
+  d3dalloy::Presenter presenter;
   WMT::Reference<WMT::Texture> input;
 
   static WMT::Device firstDevice(WMT::Array<WMT::Device> d) {
@@ -138,7 +138,7 @@ struct Probe {
   }
   ~Probe() { ReleaseMetalView(native_view); }
   struct Sample { float black, highlight, peak; float content, display, scale; };
-  Sample render(dxmt::Presenter::PresentState state, const char *label) {
+  Sample render(d3dalloy::Presenter::PresentState state, const char *label) {
     step = label;
     WMTBufferInfo readback{};
     readback.length = kBytes;

@@ -25,13 +25,13 @@ inline std::uint64_t NowNs() {
 }
 
 inline bool TraceEnabled() {
-  static const bool enabled = dxmt::env::getEnvVar("OWNED_GRAPHICS_TRACE") == "1";
+  static const bool enabled = d3dalloy::env::getEnvVar("OWNED_GRAPHICS_TRACE") == "1";
   return enabled;
 }
 
 inline std::uint64_t TraceLimit() {
   static const std::uint64_t limit = [] {
-    auto value = dxmt::env::getEnvVar("OWNED_GRAPHICS_TRACE_LIMIT");
+    auto value = d3dalloy::env::getEnvVar("OWNED_GRAPHICS_TRACE_LIMIT");
     if (value.empty())
       return 8192ULL;
     char *end = nullptr;
@@ -57,7 +57,7 @@ inline void Trace(const char *event, Fields &&...fields) noexcept try {
   const auto sequence = trace_event_counter.fetch_add(1, std::memory_order_relaxed);
   if (sequence >= TraceLimit())
     return;
-  dxmt::Logger::info(dxmt::str::format(
+  d3dalloy::Logger::info(d3dalloy::str::format(
       "OWNED_GRAPHICS_TRACE {\"event\":\"", event, "\",\"event_id\":", sequence + 1,
       ",\"timestamp_ns\":", NowNs(),
       std::forward<Fields>(fields)..., "}"));

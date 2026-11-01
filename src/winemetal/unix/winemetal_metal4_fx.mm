@@ -13,24 +13,24 @@ extern "C" int32_t winemetal_metal4_fg_call(struct WMTMetal4Call *call);
 extern "C" void winemetal_composition_present(id<MTLDrawable> drawable, double duration,
                                              const WMTCompositionFrame *frame, uint32_t sync_interval, bool allow_tearing);
 
-@interface DXMTTemporalFeature : NSObject {
+@interface D3DalloyTemporalFeature : NSObject {
 @public std::shared_ptr<fx::Feature> feature;
 }
 @end
-@implementation DXMTTemporalFeature
+@implementation D3DalloyTemporalFeature
 @end
-@interface DXMTTemporalFrame : NSObject {
+@interface D3DalloyTemporalFrame : NSObject {
 @public std::shared_ptr<const fx::PreparedFrame> frame;
 }
 @end
-@implementation DXMTTemporalFrame
+@implementation D3DalloyTemporalFrame
 @end
-@interface DXMTTemporalExecution : NSObject {
+@interface D3DalloyTemporalExecution : NSObject {
 @public std::shared_ptr<const fx::PreparedFrame> frame;
 @public std::shared_ptr<const fx::ExecutionLease> lease;
 }
 @end
-@implementation DXMTTemporalExecution
+@implementation D3DalloyTemporalExecution
 @end
 
 static uint32_t resultFor(const fx::Error &error) {
@@ -47,24 +47,24 @@ static uint32_t resultFor(const fx::Error &error) {
 }
 static fx::Rect rect(const WMTMetal4FXRect &r) { return {r.x, r.y, r.width, r.height}; }
 
-@interface DXMTAmdRRFeature : NSObject {
-@public std::shared_ptr<dxmt::rr::Feature> feature;
+@interface D3DalloyAmdRRFeature : NSObject {
+@public std::shared_ptr<d3dalloy::rr::Feature> feature;
 }
 @end
-@implementation DXMTAmdRRFeature
+@implementation D3DalloyAmdRRFeature
 @end
-@interface DXMTAmdRRFrame : NSObject {
-@public std::shared_ptr<const dxmt::rr::PreparedFrame> frame;
+@interface D3DalloyAmdRRFrame : NSObject {
+@public std::shared_ptr<const d3dalloy::rr::PreparedFrame> frame;
 }
 @end
-@implementation DXMTAmdRRFrame
+@implementation D3DalloyAmdRRFrame
 @end
-@interface DXMTAmdRRExecution : NSObject {
-@public std::shared_ptr<const dxmt::rr::PreparedFrame> frame;
-@public std::shared_ptr<const dxmt::rr::ExecutionLease> lease;
+@interface D3DalloyAmdRRExecution : NSObject {
+@public std::shared_ptr<const d3dalloy::rr::PreparedFrame> frame;
+@public std::shared_ptr<const d3dalloy::rr::ExecutionLease> lease;
 }
 @end
-@implementation DXMTAmdRRExecution
+@implementation D3DalloyAmdRRExecution
 @end
 static uint64_t amdRRResult(const fx::Error &error) {
   switch (error.code) {
@@ -83,31 +83,31 @@ static bool amdRRCall(struct WMTMetal4Call *call) {
   switch (call->operation) {
   case WMTMetal4RRCreate: {
     fx::Error error;
-    auto feature = dxmt::rr::Feature::create(reinterpret_cast<void *>(call->args[0]),
+    auto feature = d3dalloy::rr::Feature::create(reinterpret_cast<void *>(call->args[0]),
         reinterpret_cast<void *>(call->args[1]), *reinterpret_cast<const WMTRRCreateInfo *>(call->args[2]), &error);
     call->ret[0] = 0; call->ret[1] = amdRRResult(error);
     if (feature) {
-      auto holder = [DXMTAmdRRFeature new]; holder->feature = std::move(feature);
+      auto holder = [D3DalloyAmdRRFeature new]; holder->feature = std::move(feature);
       call->ret[0] = reinterpret_cast<uintptr_t>(holder); call->ret[1] = WMTRR_OK;
     } else if (!call->ret[1]) call->ret[1] = WMTRR_RUNTIME;
     return true;
   }
   case WMTMetal4RRPrepare: {
     const auto &p = *reinterpret_cast<const WMTRRFrame *>(call->args[1]);
-    dxmt::rr::TextureSet textures{};
+    d3dalloy::rr::TextureSet textures{};
     for (size_t i = 0; i < textures.size(); ++i) textures[i] = reinterpret_cast<void *>(p.textures[i]);
     fx::Error error;
-    auto frame = ((DXMTAmdRRFeature *)call->args[0])->feature->prepare(p, textures, p.settings, &error);
+    auto frame = ((D3DalloyAmdRRFeature *)call->args[0])->feature->prepare(p, textures, p.settings, &error);
     call->ret[0] = 0; call->ret[1] = amdRRResult(error);
     if (frame) {
-      auto holder = [DXMTAmdRRFrame new]; holder->frame = std::move(frame);
+      auto holder = [D3DalloyAmdRRFrame new]; holder->frame = std::move(frame);
       call->ret[0] = reinterpret_cast<uintptr_t>(holder); call->ret[1] = WMTRR_OK;
     } else if (!call->ret[1]) call->ret[1] = WMTRR_RUNTIME;
     return true;
   }
   case WMTMetal4RREncode: {
-    auto holder = [DXMTAmdRRExecution new];
-    holder->frame = ((DXMTAmdRRFrame *)call->args[1])->frame;
+    auto holder = [D3DalloyAmdRRExecution new];
+    holder->frame = ((D3DalloyAmdRRFrame *)call->args[1])->frame;
     // The lease is published before any GPU command; the recording owns it through retirement.
     winemetal_metal4_retain_resource(call->args[0], holder);
     [holder release];
@@ -120,10 +120,10 @@ static bool amdRRCall(struct WMTMetal4Call *call) {
     return true;
   }
   case WMTMetal4RRDormant:
-    ((DXMTAmdRRFeature *)call->args[0])->feature->markDormant();
+    ((D3DalloyAmdRRFeature *)call->args[0])->feature->markDormant();
     return true;
   case WMTMetal4RRMemory:
-    call->ret[0] = ((DXMTAmdRRFeature *)call->args[0])->feature->memoryUsage();
+    call->ret[0] = ((D3DalloyAmdRRFeature *)call->args[0])->feature->memoryUsage();
     return true;
   default: return false;
   }
@@ -134,7 +134,7 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
   @autoreleasepool {
     @try {
       if (@available(macOS 26.0, *)) {
-        if (dxmtRRCall(call) || amdRRCall(call)) return 0;
+        if (d3dalloyRRCall(call) || amdRRCall(call)) return 0;
         switch (call->operation) {
         case WMTMetal4FXSupportsTemporal:
           if (call->args[1] & 256u)
@@ -153,13 +153,13 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
               reinterpret_cast<void *>(call->args[1])}, info, &error);
           call->ret[1] = resultFor(error);
           if (feature) {
-            auto holder = [DXMTTemporalFeature new]; holder->feature = std::move(feature);
+            auto holder = [D3DalloyTemporalFeature new]; holder->feature = std::move(feature);
             call->ret[0] = reinterpret_cast<uintptr_t>(holder);
           }
           return 0;
         }
         case WMTMetal4FXDormantTemporal:
-          ((DXMTTemporalFeature *)call->args[0])->feature->markDormant();
+          ((D3DalloyTemporalFeature *)call->args[0])->feature->markDormant();
           return 0;
         case WMTMetal4FXPrepareTemporal: {
           const auto &p = *reinterpret_cast<const WMTMetal4FXTemporalFrame *>(call->args[1]);
@@ -179,17 +179,17 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
           fx::TextureSet textures{info.color, info.depth, info.motionVectors, info.output,
               info.exposureTexture, info.reactiveMask, info.compositionMask};
           fx::Error error;
-          auto frame = ((DXMTTemporalFeature *)call->args[0])->feature->prepare(info, textures, &error, operations);
+          auto frame = ((D3DalloyTemporalFeature *)call->args[0])->feature->prepare(info, textures, &error, operations);
           call->ret[1] = resultFor(error);
           if (frame) {
-            auto holder = [DXMTTemporalFrame new]; call->ret[2] = frame->generationId();
+            auto holder = [D3DalloyTemporalFrame new]; call->ret[2] = frame->generationId();
             holder->frame = std::move(frame); call->ret[0] = reinterpret_cast<uintptr_t>(holder);
           }
           return 0;
         }
         case WMTMetal4FXEncodeTemporal: {
-          auto holder = [DXMTTemporalExecution new];
-          holder->frame = ((DXMTTemporalFrame *)call->args[1])->frame;
+          auto holder = [D3DalloyTemporalExecution new];
+          holder->frame = ((D3DalloyTemporalFrame *)call->args[1])->frame;
           // The mutable lease slot is published by PreparedFrame before ANY GPU command.
           // Attach its owner beforehand; partial failure still retires via M4Recording.objects.
           winemetal_metal4_retain_resource(call->args[0], holder);

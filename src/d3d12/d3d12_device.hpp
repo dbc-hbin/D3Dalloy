@@ -35,12 +35,12 @@
 #include "dxgi1_2.h"
 #include "dxgi_interfaces.h"
 #include "airconv_public.h"
-#include "dxmt_buffer.hpp"
-#include "dxmt_command.hpp"
-#include "dxmt_fence.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_presenter.hpp"
-#include "dxmt_texture.hpp"
+#include "d3dalloy_buffer.hpp"
+#include "d3dalloy_command.hpp"
+#include "d3dalloy_fence.hpp"
+#include "d3dalloy_format.hpp"
+#include "d3dalloy_presenter.hpp"
+#include "d3dalloy_texture.hpp"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
 #include "owned_trace.hpp"
@@ -70,13 +70,13 @@
     __builtin_unreachable();                                                                                           \
   } while (0);
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D12PageableResidency;
-struct DXMTPresentComposition;
+struct D3DalloyPresentComposition;
 
-struct DXMTPresentLatency {
-  ~DXMTPresentLatency();
+struct D3DalloyPresentLatency {
+  ~D3DalloyPresentLatency();
   HRESULT initializeWakeHandle(HANDLE semaphore);
   bool reserve(bool do_not_wait, UINT replaceable_queued = 0, bool *borrowed = nullptr);
   void cancel();
@@ -196,11 +196,11 @@ public:
 class MTLD3D12CommandQueue : public ID3D12CommandQueue1 {
 public:
   virtual HRESULT Present(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable,
-                          double after, const DXMTPresentGeometry &geometry,
+                          double after, const D3DalloyPresentGeometry &geometry,
                           WMT::Reference<WMT::PresentationObserver> observer, uint64_t present_id,
                           std::shared_ptr<std::atomic<bool>> observer_fault,
-                          DXMTPresentComposition composition, bool do_not_wait,
-                          std::shared_ptr<DXMTPresentLatency> latency, bool restart, bool borrowed,
+                          D3DalloyPresentComposition composition, bool do_not_wait,
+                          std::shared_ptr<D3DalloyPresentLatency> latency, bool restart, bool borrowed,
                           bool closes_frame) = 0;
 };
 
@@ -870,7 +870,7 @@ public:
   /* `threads` is d3d12.asyncPipelineCompileThreads: 0 (default) uses max(1, logical CPUs / 2). */
   AsyncPipelineCompiler(bool enabled, int32_t threads) : enabled_(enabled), threads_(threads > 0 ? threads : 0) {}
   ~AsyncPipelineCompiler() {
-    if (dxmt::this_thread::isInModuleDetachment()) {
+    if (d3dalloy::this_thread::isInModuleDetachment()) {
       // Workers were terminated by ExitProcess and may own the queue lock: never lock or join.
       // Detaching closes their handles so ~ThreadFn does not terminate on a joinable thread.
       for (auto &worker : workers_)
@@ -886,14 +886,14 @@ public:
     // OWNED_ASYNC_PIPELINE_HOLD=1 (fixture control) never starts workers: queued links complete
     // only through a synchronous consumer, so pending omission is observable without timing.
     std::call_once(start_, [this] {
-      if (dxmt::env::getEnvVar("OWNED_ASYNC_PIPELINE_HOLD") == "1")
+      if (d3dalloy::env::getEnvVar("OWNED_ASYNC_PIPELINE_HOLD") == "1")
         return;
       // Leave cores for the application's render thread; workers run below it so a link burst does
       // not preempt frame submission. Unclaimed jobs still run on a consumer that needs them.
-      const uint32_t count = threads_ ? threads_ : std::max(1u, dxmt::thread::hardware_concurrency() / 2);
+      const uint32_t count = threads_ ? threads_ : std::max(1u, d3dalloy::thread::hardware_concurrency() / 2);
       for (uint32_t i = 0; i < count; ++i) {
         workers_.emplace_back([this] { queue_.RunWorker(); });
-        workers_.back().set_priority(dxmt::ThreadPriority::Lowest);
+        workers_.back().set_priority(d3dalloy::ThreadPriority::Lowest);
       }
     });
     queue_.Submit(std::move(job));
@@ -907,7 +907,7 @@ private:
   const uint32_t threads_;
   std::once_flag start_;
   owned_graphics::AsyncCompileQueue queue_;
-  std::vector<dxmt::thread> workers_;
+  std::vector<d3dalloy::thread> workers_;
   std::atomic<uint64_t> epoch_{1};
   owned_graphics::RenderTargetHistory targets_;
 };
@@ -1065,24 +1065,24 @@ public:
 // Flip-sequential partial presents composite into two private, source-sized
 // textures. Every submitted frame retains the generation until GPU completion,
 // including when ResizeBuffers replaces the swapchain's history.
-struct DXMTPresentHistory {
+struct D3DalloyPresentHistory {
   Com<MTLD3D12Device> device;
   std::array<WMT::Reference<WMT::Texture>, 2> textures;
   std::array<bool, 2> resident{};
-  ~DXMTPresentHistory() {
+  ~D3DalloyPresentHistory() {
     for (size_t index = 0; index < textures.size(); ++index)
       if (resident[index])
         device->UnregisterResidency(textures[index]);
   }
 };
 
-struct DXMTPresentComposition {
+struct D3DalloyPresentComposition {
   // CPU-only native presentation snapshot; never part of GPU shader constants.
   WMT::Reference<WMT::Object> surface;
   WMTCompositionFrame frame{};
   uint32_t sync_interval = 0;
   bool allow_tearing = false;
-  std::shared_ptr<DXMTPresentHistory> history;
+  std::shared_ptr<D3DalloyPresentHistory> history;
   UINT write_index = 0;
   bool has_previous = false;
   bool scroll = false;
@@ -1231,7 +1231,7 @@ HRESULT
 CreateSwapChain(
     IDXGIFactory1 *pFactory, MTLD3D12Device *pDevice, MTLD3D12CommandQueue *pQueue, HWND hWnd,
     const DXGI_SWAP_CHAIN_DESC1 *pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
-    IDXGISwapChain1 **ppSwapChain, IDXGIOutput *pRestrictToOutput, IUnknown *core_window, DXMTSwapChainKind kind
+    IDXGISwapChain1 **ppSwapChain, IDXGIOutput *pRestrictToOutput, IUnknown *core_window, D3DalloySwapChainKind kind
 );
 
 HRESULT
@@ -1256,7 +1256,7 @@ void PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_S
 
 inline std::tuple<MTLD3D12RenderTargetDescriptorHeap *, UINT>
 GetRenderTargetHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
   return {impl.extract<MTLD3D12RenderTargetDescriptorHeap>(), (UINT)impl.Descriptor};
 #else
@@ -1267,7 +1267,7 @@ GetRenderTargetHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle)
 
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetRenderTargetDescriptor(MTLD3D12RenderTargetDescriptorHeap *pHeap, UINT Index) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   return EMBEDDED_DESCRIPTOR_HANDLE(pHeap, Index);
 #else
   return {DescriptorHandleOf(pHeap, Index)};
@@ -1276,7 +1276,7 @@ GetRenderTargetDescriptor(MTLD3D12RenderTargetDescriptorHeap *pHeap, UINT Index)
 
 inline std::tuple<MTLD3D12DescriptorHeap *, UINT>
 GetShaderVisibleDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
   return {impl.extract<MTLD3D12DescriptorHeap>(), (UINT)impl.Descriptor};
 #else
@@ -1287,7 +1287,7 @@ GetShaderVisibleDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HAN
 
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetShaderVisibleDescriptor(MTLD3D12DescriptorHeap *pHeap, UINT Index) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   return EMBEDDED_DESCRIPTOR_HANDLE(pHeap, Index);
 #else
   return {DescriptorHandleOf(pHeap, Index)};
@@ -1297,7 +1297,7 @@ GetShaderVisibleDescriptor(MTLD3D12DescriptorHeap *pHeap, UINT Index) {
 
 inline std::tuple<MTLD3D12SamplerDescriptorHeap *, UINT>
 GetSamplerDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   const SIZE_T heap = ((Handle.ptr >> 26) << 9) | ((Handle.ptr & 63) << 3);
   return {reinterpret_cast<MTLD3D12SamplerDescriptorHeap *>(heap), UINT((Handle.ptr >> 6) & 0xfffff)};
 #else
@@ -1308,7 +1308,7 @@ GetSamplerDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Ha
 
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetSamplerDescriptor(MTLD3D12SamplerDescriptorHeap *pHeap, UINT Index) {
-#ifdef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifdef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   // Six stride bits, twenty index bits, thirty-eight heap bits; retain the full CPU heap capacity.
   const SIZE_T heap = reinterpret_cast<SIZE_T>(pHeap);
   return {((heap >> 9) << 26) | ((heap >> 3) & 63) | (SIZE_T(Index) << 6)};
@@ -1370,4 +1370,4 @@ HRESULT RegisterExperimentalDevice(
 );
 void UnregisterExperimentalDevice(const std::shared_ptr<ExperimentalDeviceRegistration> &registration);
 
-} // namespace dxmt
+} // namespace d3dalloy

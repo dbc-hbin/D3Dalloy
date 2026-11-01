@@ -13,7 +13,7 @@
 #include <ostream>
 #include "../util_likely.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 /**
  * \brief Pointer for reference-counted objects
@@ -114,9 +114,9 @@ private:
   }
 };
 
-} // namespace dxmt
+} // namespace d3dalloy
 
 template <typename T>
-std::ostream &operator<<(std::ostream &os, const dxmt::Rc<T> &rc) {
+std::ostream &operator<<(std::ostream &os, const d3dalloy::Rc<T> &rc) {
   return os << rc.ptr();
 }

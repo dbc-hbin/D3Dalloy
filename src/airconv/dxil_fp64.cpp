@@ -15,7 +15,7 @@
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
 using namespace llvm;
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 namespace {
 class DoubleTypes final : public ValueMapTypeRemapper {
   DenseMap<Type *, Type *> mapped;
@@ -105,7 +105,7 @@ class DoubleLowerer {
   Value *helper(IRBuilder<> &builder, StringRef operation, Type *result, ArrayRef<Value *> arguments) {
     SmallVector<Type *, 4> parameters;
     for (Value *argument : arguments) parameters.push_back(argument->getType());
-    auto function = module.getOrInsertFunction(("dxmt.fp64." + operation).str(), FunctionType::get(result, parameters, false));
+    auto function = module.getOrInsertFunction(("d3dalloy.fp64." + operation).str(), FunctionType::get(result, parameters, false));
     helpers = true;
     return builder.CreateCall(function, arguments);
   }
@@ -328,7 +328,7 @@ public:
         auto *instruction = cast<Instruction>(values[&original]);
         if (auto *call = dyn_cast<CallInst>(instruction); call && call->getCalledFunction() &&
             call->getCalledFunction()->getName().startswith("dx.op."))
-          call->setMetadata("dxmt.fp64", MDNode::get(module.getContext(), {}));
+          call->setMetadata("d3dalloy.fp64", MDNode::get(module.getContext(), {}));
         IRBuilder<> builder(instruction);
         SmallVector<Value *, 8> operands;
         if (auto *call = dyn_cast<CallInst>(instruction)) for (Value *argument : call->args()) operands.push_back(argument);
@@ -389,10 +389,10 @@ public:
       global->dropAllReferences();
       global->eraseFromParent();
     }
-    if (helpers) dxmt::linkFP64(module);
+    if (helpers) d3dalloy::linkFP64(module);
     return Error::success();
   }
 };
 } // namespace
 Error LowerFP64(Module &module) { return DoubleLowerer(module).run(); }
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

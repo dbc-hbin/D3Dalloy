@@ -87,17 +87,17 @@ int main(int argc, char **argv) {
   expect(backend && std::strcmp(backend(), "owned-graphics-d3d12") == 0 ? S_OK : E_FAIL, S_OK, "owned backend");
   std::puts("OWNED_QUEUE_PRIORITY_BACKEND id=owned-graphics-d3d12");
   D3D12_FEATURE_DATA_HARDWARE_SCHEDULING_QUEUE_GROUPINGS groups{~0u};
-  expect(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(dxmt::kFeatureHardwareSchedulingQueueGroupings),
+  expect(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(d3dalloy::kFeatureHardwareSchedulingQueueGroupings),
                                      &groups, sizeof(groups)), S_OK, "groups");
   expect(groups.ComputeQueuesPer3DQueue == 0 ? S_OK : E_FAIL, S_OK, "one native queue per group");
-  expect(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(dxmt::kFeatureHardwareSchedulingQueueGroupings),
+  expect(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(d3dalloy::kFeatureHardwareSchedulingQueueGroupings),
                                      &groups, 0), E_INVALIDARG, "groups size");
   for (auto type : {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY}) {
     for (int creation : {0, 100, 10000}) {
       for (bool dynamic : {false, true}) {
         D3D12_COMMAND_QUEUE_DESC desc{};
         desc.Type = type; desc.Priority = creation;
-        desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(dynamic ? dxmt::kCommandQueueFlagAllowDynamicPriority : 0);
+        desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(dynamic ? d3dalloy::kCommandQueueFlagAllowDynamicPriority : 0);
         ComPtr<ID3D12CommandQueue1> queue;
         expect(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), S_OK, "queue1");
         ComPtr<IUnknown> identity, base_identity;
@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
   expect(device.As(&device9), S_OK, "device9");
   D3D12_COMMAND_QUEUE_DESC desc{};
   desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-  desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(dxmt::kCommandQueueFlagAllowDynamicPriority);
+  desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(d3dalloy::kCommandQueueFlagAllowDynamicPriority);
   ComPtr<ID3D12CommandQueue1> queue, other;
   const GUID creator = {0x27393735,0x145a,0x4b55,{0x89,0xe6,0x20,0x49,0xb8,0x4b,0xe0,0x5b}};
   expect(device9->CreateCommandQueue1(&desc, creator, IID_PPV_ARGS(&queue)), S_OK, "creator queue");

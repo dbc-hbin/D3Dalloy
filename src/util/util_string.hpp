@@ -17,7 +17,7 @@
 #include <cstdint>
 #include "unknwn.h"
 
-namespace dxmt::str {
+namespace d3dalloy::str {
 
 template <size_t S> struct UnicodeChar {};
 template <> struct UnicodeChar<1> { using type = uint8_t; };
@@ -218,4 +218,4 @@ inline std::vector<std::string_view> split(std::string_view string,
   return tokens;
 }
 
-} // namespace dxmt::str
+} // namespace d3dalloy::str

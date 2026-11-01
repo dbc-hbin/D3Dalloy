@@ -12,7 +12,7 @@
 #include <format>
 #include <utility>
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 using namespace microsoft;
 
@@ -602,7 +602,7 @@ convert_dxbc_geometry_shader(
     auto *slot = builder.CreateAdd(
         builder.CreateMul(builder.CreateAdd(builder.CreateMul(instance, per_instance), flat_primitive),
                           builder.getInt32(pShaderInternal->gs_instance_count)), resource_map.gs_instance_id);
-    auto marker = module.getOrInsertFunction("dxmt.msaa.mesh.slot",
+    auto marker = module.getOrInsertFunction("d3dalloy.msaa.mesh.slot",
         llvm::FunctionType::get(builder.getVoidTy(), {types._int}, false));
     builder.CreateCall(marker, {builder.CreateSelect(
         builder.CreateICmpULT(flat_primitive, per_instance), slot, builder.getInt32(~0u))});
@@ -941,8 +941,8 @@ convert_dxbc_vertex_for_geometry_shader(
       .memory_access = air::MemoryAccess::read,
       .address_space = air::AddressSpace::constant,
       .type = is_indexed_draw //
-          ? air::MSLWhateverStruct{"draw_indexed_arguments", types._dxmt_draw_indexed_arguments}
-          : air::MSLWhateverStruct{"draw_arguments", types._dxmt_draw_arguments},
+          ? air::MSLWhateverStruct{"draw_indexed_arguments", types._d3dalloy_draw_indexed_arguments}
+          : air::MSLWhateverStruct{"draw_arguments", types._d3dalloy_draw_arguments},
       .arg_name = "draw_arguments",
       .raster_order_group = {}
   });
@@ -992,8 +992,8 @@ convert_dxbc_vertex_for_geometry_shader(
   auto instance_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)1);
 
   auto draw_arguments = builder.CreateLoad(
-    is_indexed_draw ? types._dxmt_draw_indexed_arguments
-                    : types._dxmt_draw_arguments,
+    is_indexed_draw ? types._d3dalloy_draw_indexed_arguments
+                    : types._d3dalloy_draw_arguments,
     function->getArg(draw_argument_idx)
   );
 
@@ -1453,11 +1453,11 @@ convert_dxbc_domain_for_geometry_shader(
   return llvm::Error::success();
 }
 
-} // namespace dxmt::dxbc
+} // namespace d3dalloy::dxbc
 
-template <> struct environment_cast<::dxmt::dxbc::context, ::dxmt::air::AIRBuilderContext> {
-  ::dxmt::air::AIRBuilderContext
-  cast(const ::dxmt::dxbc::context &src) {
+template <> struct environment_cast<::d3dalloy::dxbc::context, ::d3dalloy::air::AIRBuilderContext> {
+  ::d3dalloy::air::AIRBuilderContext
+  cast(const ::d3dalloy::dxbc::context &src) {
     return {src.llvm, src.module, src.builder, src.types, src.air};
   };
 };

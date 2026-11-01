@@ -20,8 +20,8 @@ using namespace metal;
  * - corners 5-9, the remainder, where the plane lies beyond the horizon or behind the eye (only reached by the
  *   extrapolation of perspective slivers): the exact screen-affine depth z/w of the plane at constant W, attributes
  *   of the cut line.
- * dxmt.conservative.corner returns the attribute weights (zero rejects the corner),
- * dxmt.conservative.corner_position the clip position. `flags`: bits 0-3 corner, bit 4 depth clipping (clip and
+ * d3dalloy.conservative.corner returns the attribute weights (zero rejects the corner),
+ * d3dalloy.conservative.corner_position the clip position. `flags`: bits 0-3 corner, bit 4 depth clipping (clip and
  * cull distances only shrink the primitive, the gather applies them); bit 5 FrontCounterClockwise.
  */
 
@@ -65,14 +65,14 @@ struct ConservativeCorner {
 ConservativeCorner corner_of(float4 p0, float4 p1, float4 p2, float4 viewport, uint flags) {
   const ConservativeCorner reject = {float4(0.0f), float4(-2.0f, -2.0f, 0.0f, 1.0f)};
   float det;
-  float2 clipped[dxmt_conservative::kMaxVertices];
+  float2 clipped[d3dalloy_conservative::kMaxVertices];
   // Clip and cull distances only shrink the primitive; the gather applies them exactly.
   const uint clipped_count =
-      dxmt_conservative::clipped_polygon(p0, p1, p2, viewport, nullptr, 0, flags & 16, clipped, det);
+      d3dalloy_conservative::clipped_polygon(p0, p1, p2, viewport, nullptr, 0, flags & 16, clipped, det);
   if (!clipped_count)
     return reject;
-  const bool degenerate = !dxmt_conservative::polygon_area(clipped, clipped_count) ||
-      dxmt_conservative::snapped_triangle_degenerate(p0, p1, p2, viewport);
+  const bool degenerate = !d3dalloy_conservative::polygon_area(clipped, clipped_count) ||
+      d3dalloy_conservative::snapped_triangle_degenerate(p0, p1, p2, viewport);
   // Coverage uses the clipped polygon, but interpolation must use the viewport-scaled
   // 16.8 vertices, just as ordinary D3D rasterization does. Extrapolating the
   // unsnapped plane changes both per-sample depth and perspective attributes.
@@ -82,7 +82,7 @@ ConservativeCorner corner_of(float4 p0, float4 p1, float4 p2, float4 viewport, u
     // Keep its homogeneous numerator; clipping produces finite raster vertices.
     if (positions[i].w == 0.0f)
       continue;
-    const float2 screen = rint(dxmt_conservative::screen_of(positions[i], viewport) * 256.0f) / 256.0f;
+    const float2 screen = rint(d3dalloy_conservative::screen_of(positions[i], viewport) * 256.0f) / 256.0f;
     if (all(isfinite(screen))) positions[i].xy = ndc_of(screen, viewport) * positions[i].w;
   }
   p0 = positions[0];
@@ -169,30 +169,30 @@ ConservativeCorner corner_of(float4 p0, float4 p1, float4 p2, float4 viewport, u
 }
 
 float4 conservative_corner(float4 p0, float4 p1, float4 p2, float4 viewport, uint flags)
-    asm("dxmt.conservative.corner");
+    asm("d3dalloy.conservative.corner");
 float4 conservative_corner(float4 p0, float4 p1, float4 p2, float4 viewport, uint flags) {
   return corner_of(p0, p1, p2, viewport, flags).alpha;
 }
 
 float4 conservative_corner_position(float4 p0, float4 p1, float4 p2, float4 viewport, uint flags)
-    asm("dxmt.conservative.corner_position");
+    asm("d3dalloy.conservative.corner_position");
 float4 conservative_corner_position(float4 p0, float4 p1, float4 p2, float4 viewport, uint flags) {
   return corner_of(p0, p1, p2, viewport, flags).position;
 }
 
 uint conservative_degenerate(float4 p0, float4 p1, float4 p2, float4 viewport, uint depth_clip)
-    asm("dxmt.conservative.degenerate");
+    asm("d3dalloy.conservative.degenerate");
 uint conservative_degenerate(float4 p0, float4 p1, float4 p2, float4 viewport, uint depth_clip) {
   float det;
-  float2 polygon[dxmt_conservative::kMaxVertices];
-  const uint count = dxmt_conservative::clipped_polygon(p0, p1, p2, viewport, nullptr, 0, depth_clip != 0,
+  float2 polygon[d3dalloy_conservative::kMaxVertices];
+  const uint count = d3dalloy_conservative::clipped_polygon(p0, p1, p2, viewport, nullptr, 0, depth_clip != 0,
                                                         polygon, det);
-  return count && (!dxmt_conservative::polygon_area(polygon, count) ||
-                  dxmt_conservative::snapped_triangle_degenerate(p0, p1, p2, viewport));
+  return count && (!d3dalloy_conservative::polygon_area(polygon, count) ||
+                  d3dalloy_conservative::snapped_triangle_degenerate(p0, p1, p2, viewport));
 }
 
 uint conservative_polygon(float4 p0, float4 p1, float4 p2, float4 viewport, thread const float *clip,
-                          uint flags, thread float4 *out) asm("dxmt.conservative.polygon");
+                          uint flags, thread float4 *out) asm("d3dalloy.conservative.polygon");
 
 /* The clipped, snapped screen polygon (conservative_polygon.h) as kMaxVertices / 2 float4 vertex pairs; returns
  * the vertex count, 0 for a culled primitive. Unused pairs repeat the last vertex. `flags`: bit 3 depth clipping,
@@ -200,10 +200,10 @@ uint conservative_polygon(float4 p0, float4 p1, float4 p2, float4 viewport, thre
 uint conservative_polygon(float4 p0, float4 p1, float4 p2, float4 viewport, thread const float *clip,
                           uint flags, thread float4 *out) {
   float det;
-  float2 polygon[dxmt_conservative::kMaxVertices];
-  const uint count = dxmt_conservative::clipped_polygon(p0, p1, p2, viewport, clip, (flags >> 4) & 15, flags & 8,
+  float2 polygon[d3dalloy_conservative::kMaxVertices];
+  const uint count = d3dalloy_conservative::clipped_polygon(p0, p1, p2, viewport, clip, (flags >> 4) & 15, flags & 8,
                                                         polygon, det);
-  for (uint part = 0; part < dxmt_conservative::kMaxVertices / 2; part++)
+  for (uint part = 0; part < d3dalloy_conservative::kMaxVertices / 2; part++)
     out[part] = count ? float4(polygon[min(2 * part, count - 1)], polygon[min(2 * part + 1, count - 1)])
                       : float4(0.0f);
   return count;

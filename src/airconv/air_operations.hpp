@@ -10,7 +10,7 @@
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Error.h"
 
-namespace dxmt::air {
+namespace d3dalloy::air {
 
 using pvalue = llvm::Value *;
 using epvalue = llvm::Expected<pvalue>;
@@ -92,4 +92,4 @@ AIRBuilderResult pull_vec4_from_addr(
   MTLAttributeFormat format, pvalue base_addr, pvalue byte_offset
 );
 
-}; // namespace dxmt::air
+}; // namespace d3dalloy::air

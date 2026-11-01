@@ -2,7 +2,7 @@
 
 #include "d3d10_util.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D10InputLayout final : public ID3D10InputLayout {
 public:
@@ -46,4 +46,4 @@ public:
   }
 };
 
-}; // namespace dxmt
+}; // namespace d3dalloy

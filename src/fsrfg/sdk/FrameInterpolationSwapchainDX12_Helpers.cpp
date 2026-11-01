@@ -77,7 +77,7 @@ bool waitForFenceValue(ID3D12Fence* fence, UINT64 value, DWORD dwMilliseconds, F
 
     if (fence)
     {
-        // DXMT: return before timing/debug-name queries when the value is already complete.
+        // D3Dalloy: return before timing/debug-name queries when the value is already complete.
         if (fence->GetCompletedValue() >= value)
             return true;
 
@@ -89,7 +89,7 @@ bool waitForFenceValue(ID3D12Fence* fence, UINT64 value, DWORD dwMilliseconds, F
         const DWORD waitCallbackIntervalInMs = 1;
         int64_t deltaQpcWaitCallback = qpcFrequency * waitCallbackIntervalInMs / 1000;
         int64_t deltaQpcTimeout = qpcFrequency * dwMilliseconds /1000;
-        // DXMT: the debug name is only consumed by waitCallback.
+        // D3Dalloy: the debug name is only consumed by waitCallback.
         wchar_t fenceName[64] = {};
         if (waitCallback)
         {
@@ -126,7 +126,7 @@ bool waitForFenceValue(ID3D12Fence* fence, UINT64 value, DWORD dwMilliseconds, F
         }
         else
         {
-            // DXMT: reuse one auto-reset event per thread instead of creating one per wait. A signal left
+            // D3Dalloy: reuse one auto-reset event per thread instead of creating one per wait. A signal left
             // by an earlier timed-out registration is rejected by the completed-value check, which also
             // observes device removal (UINT64_MAX); such a stale wakeup re-registers this wait. Without
             // waitCallback the slice only bounds that recheck.

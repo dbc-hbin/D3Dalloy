@@ -16,7 +16,7 @@
 #include <thread>
 #include <type_traits>
 
-namespace dxmt {
+namespace d3dalloy {
 
 // Bytes are never exposed to the application: GetBlob returns a separate writable copy.
 struct PipelineCacheStorage {
@@ -194,7 +194,7 @@ bool OwnsFlight(const AutomaticCache &cache, const std::shared_ptr<AutomaticPipe
 
 static_assert(sizeof(WMTPipelineCacheIdentity) == 48);
 static_assert(sizeof(SM50_CONSTANT_RELOCATION) == 16);
-static_assert(uint32_t(PipelineCache::StageCount) == DXMT_PIPELINE_CACHE_STAGE_COUNT);
+static_assert(uint32_t(PipelineCache::StageCount) == D3DALLOY_PIPELINE_CACHE_STAGE_COUNT);
 
 struct NativeIdentity {
   WMTPipelineCacheIdentity value{};
@@ -206,7 +206,7 @@ const NativeIdentity &Identity() {
   return identity;
 }
 
-Sha1Digest BlobDigest(const void *data, const DxmtPipelineCacheLayout &layout) {
+Sha1Digest BlobDigest(const void *data, const D3DalloyPipelineCacheLayout &layout) {
   const auto *bytes = static_cast<const uint8_t *>(data);
   Sha1HashState hash;
   hash.update(bytes, layout.digest_begin);
@@ -215,8 +215,8 @@ Sha1Digest BlobDigest(const void *data, const DxmtPipelineCacheLayout &layout) {
 }
 
 std::shared_ptr<const PipelineCacheStorage> ShareBlob(ID3DBlob *blob) {
-  DxmtPipelineCacheInfo info{};
-  if (dxmt_pipeline_cache_decode(blob->GetBufferPointer(), blob->GetBufferSize(), &info))
+  D3DalloyPipelineCacheInfo info{};
+  if (d3dalloy_pipeline_cache_decode(blob->GetBufferPointer(), blob->GetBufferSize(), &info))
     return {};
   auto storage = std::make_shared<PipelineCacheStorage>();
   storage->bytes = blob;
@@ -1176,11 +1176,11 @@ bool PipelineCacheIdentity(WMTPipelineCacheIdentity &identity) {
 }
 
 HRESULT PipelineCacheBlobKey(const void *data, size_t size, Sha1Digest &key) {
-  DxmtPipelineCacheDigest parsed{};
-  const auto status = dxmt_pipeline_cache_key(data, size, &parsed);
-  if (status == DXMT_PIPELINE_CACHE_VERSION_MISMATCH)
+  D3DalloyPipelineCacheDigest parsed{};
+  const auto status = d3dalloy_pipeline_cache_key(data, size, &parsed);
+  if (status == D3DALLOY_PIPELINE_CACHE_VERSION_MISMATCH)
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
-  if (status != DXMT_PIPELINE_CACHE_SUCCESS)
+  if (status != D3DALLOY_PIPELINE_CACHE_SUCCESS)
     return E_INVALIDARG;
   memcpy(key.data, parsed.bytes, sizeof(key.data));
   return S_OK;
@@ -1470,11 +1470,11 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
 }
 
 HRESULT PipelineCache::LoadBlob(const D3D12_CACHED_PIPELINE_STATE &cached, ID3DBlob *owned) {
-  DxmtPipelineCacheInfo info{};
-  const auto status = dxmt_pipeline_cache_decode(cached.pCachedBlob, cached.CachedBlobSizeInBytes, &info);
-  if (status == DXMT_PIPELINE_CACHE_VERSION_MISMATCH)
+  D3DalloyPipelineCacheInfo info{};
+  const auto status = d3dalloy_pipeline_cache_decode(cached.pCachedBlob, cached.CachedBlobSizeInBytes, &info);
+  if (status == D3DALLOY_PIPELINE_CACHE_VERSION_MISMATCH)
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
-  if (status != DXMT_PIPELINE_CACHE_SUCCESS)
+  if (status != D3DALLOY_PIPELINE_CACHE_SUCCESS)
     return E_INVALIDARG;
   const auto &description = info.description;
   if (description.stages != stages_ || memcmp(description.key.bytes, key_.data, sizeof(key_.data)))
@@ -1490,7 +1490,7 @@ HRESULT PipelineCache::LoadBlob(const D3D12_CACHED_PIPELINE_STATE &cached, ID3DB
   if (memcmp(&identity.value, description.identity, sizeof(identity.value)))
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
   const auto *input = static_cast<const uint8_t *>(cached.pCachedBlob);
-  if (dxmt_pipeline_cache_validate_payload(input, cached.CachedBlobSizeInBytes, &info))
+  if (d3dalloy_pipeline_cache_validate_payload(input, cached.CachedBlobSizeInBytes, &info))
     return E_INVALIDARG;
   const size_t size = info.layout.size;
   try {
@@ -1540,7 +1540,7 @@ HRESULT PipelineCache::GetBlob(ID3DBlob **blob) {
     const auto &identity = Identity();
     if (!identity.valid)
       return E_FAIL;
-    DxmtPipelineCacheDescription description{};
+    D3DalloyPipelineCacheDescription description{};
     description.stages = stages_;
     description.adapter = adapter_;
     memcpy(description.identity, &identity.value, sizeof(identity.value));
@@ -1553,14 +1553,14 @@ HRESULT PipelineCache::GetBlob(ID3DBlob **blob) {
       description.records[i] = {compiled.Size, compiled.ConstantDataSize, compiled.ConstantDataAlignment,
                                 compiled.ConstantRelocationCount};
     }
-    DxmtPipelineCacheLayout layout{};
-    if (dxmt_pipeline_cache_layout(&description, &layout))
+    D3DalloyPipelineCacheLayout layout{};
+    if (d3dalloy_pipeline_cache_layout(&description, &layout))
       return E_FAIL;
     const HRESULT hr = CreateBlobFromMalloc(layout.size, blob);
     if (FAILED(hr))
       return hr;
     auto *bytes = static_cast<uint8_t *>((*blob)->GetBufferPointer());
-    if (dxmt_pipeline_cache_begin(&description, bytes, layout.size)) {
+    if (d3dalloy_pipeline_cache_begin(&description, bytes, layout.size)) {
       (*blob)->Release();
       *blob = nullptr;
       return E_FAIL;
@@ -1584,9 +1584,9 @@ HRESULT PipelineCache::GetBlob(ID3DBlob **blob) {
       }
     }
     const auto digest = BlobDigest(bytes, layout);
-    DxmtPipelineCacheDigest encoded{};
+    D3DalloyPipelineCacheDigest encoded{};
     memcpy(encoded.bytes, digest.data, sizeof(digest.data));
-    if (dxmt_pipeline_cache_set_digest(bytes, layout.size, &encoded)) {
+    if (d3dalloy_pipeline_cache_set_digest(bytes, layout.size, &encoded)) {
       (*blob)->Release();
       *blob = nullptr;
       return E_FAIL;
@@ -1597,4 +1597,4 @@ HRESULT PipelineCache::GetBlob(ID3DBlob **blob) {
   }
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

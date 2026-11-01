@@ -431,7 +431,7 @@ gen_workload_triangle_impl(
 uint gen_workload_triangle_integer(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
-) asm("dxmt.generate_workload.triangle.integer");
+) asm("d3dalloy.generate_workload.triangle.integer");
 uint
 gen_workload_triangle_integer(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
@@ -445,7 +445,7 @@ gen_workload_triangle_integer(
 uint gen_workload_triangle_pow2(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
-) asm("dxmt.generate_workload.triangle.pow2");
+) asm("d3dalloy.generate_workload.triangle.pow2");
 uint
 gen_workload_triangle_pow2(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
@@ -457,7 +457,7 @@ gen_workload_triangle_pow2(
 uint gen_workload_triangle_odd(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
-) asm("dxmt.generate_workload.triangle.odd");
+) asm("d3dalloy.generate_workload.triangle.odd");
 uint
 gen_workload_triangle_odd(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
@@ -471,7 +471,7 @@ gen_workload_triangle_odd(
 uint gen_workload_triangle_even(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
     float out2
-) asm("dxmt.generate_workload.triangle.even");
+) asm("d3dalloy.generate_workload.triangle.even");
 uint
 gen_workload_triangle_even(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in, float out0, float out1,
@@ -633,7 +633,7 @@ gen_workload_quad_impl(
 uint gen_workload_quad_integer(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
-) asm("dxmt.generate_workload.quad.integer");
+) asm("d3dalloy.generate_workload.quad.integer");
 uint
 gen_workload_quad_integer(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
@@ -647,7 +647,7 @@ gen_workload_quad_integer(
 uint gen_workload_quad_pow2(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
-) asm("dxmt.generate_workload.quad.pow2");
+) asm("d3dalloy.generate_workload.quad.pow2");
 uint
 gen_workload_quad_pow2(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
@@ -661,7 +661,7 @@ gen_workload_quad_pow2(
 uint gen_workload_quad_odd(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
-) asm("dxmt.generate_workload.quad.odd");
+) asm("d3dalloy.generate_workload.quad.odd");
 uint
 gen_workload_quad_odd(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
@@ -675,7 +675,7 @@ gen_workload_quad_odd(
 uint gen_workload_quad_even(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
     float out1, float out2, float out3
-) asm("dxmt.generate_workload.quad.even");
+) asm("d3dalloy.generate_workload.quad.even");
 uint
 gen_workload_quad_even(
     int patch_index, threadgroup int *out_count, object_data int *out_buffer, float in0, float in1, float out0,
@@ -809,7 +809,7 @@ gen_workload_quad_points_impl(
 #define POINT_ENTRIES(suffix, part)                                                                                  \
   uint gen_workload_triangle_points_##suffix(int patch_index, threadgroup int *out_count,                          \
                                              object_data int *out_buffer, float in, float out0, float out1,        \
-                                             float out2) asm("dxmt.generate_workload.triangle_points." #suffix);   \
+                                             float out2) asm("d3dalloy.generate_workload.triangle_points." #suffix);   \
   uint gen_workload_triangle_points_##suffix(int patch_index, threadgroup int *out_count,                          \
                                              object_data int *out_buffer, float in, float out0, float out1,        \
                                              float out2) {                                                         \
@@ -817,7 +817,7 @@ gen_workload_quad_points_impl(
   }                                                                                                                \
   uint gen_workload_quad_points_##suffix(int patch_index, threadgroup int *out_count, object_data int *out_buffer, \
                                          float in0, float in1, float out0, float out1, float out2, float out3)     \
-      asm("dxmt.generate_workload.quad_points." #suffix);                                                          \
+      asm("d3dalloy.generate_workload.quad_points." #suffix);                                                          \
   uint gen_workload_quad_points_##suffix(int patch_index, threadgroup int *out_count, object_data int *out_buffer, \
                                          float in0, float in1, float out0, float out1, float out2, float out3) {   \
     return gen_workload_quad_points_impl<part>(patch_index, out_count, out_buffer, in0, in1, out0, out1, out2,     \
@@ -861,7 +861,7 @@ gen_workload_isoline_impl(
 
 #define ISOLINE_ENTRY(suffix, part)                                                                                  \
   uint gen_workload_isoline_##suffix(int patch_index, threadgroup int *out_count, object_data int *out_buffer,     \
-                                     float detail, float density) asm("dxmt.generate_workload.isoline." #suffix); \
+                                     float detail, float density) asm("d3dalloy.generate_workload.isoline." #suffix); \
   uint gen_workload_isoline_##suffix(int patch_index, threadgroup int *out_count, object_data int *out_buffer,     \
                                      float detail, float density) {                                               \
     return gen_workload_isoline_impl<part>(patch_index, out_count, out_buffer, detail, density);                    \
@@ -914,7 +914,7 @@ get_domain_point(object_data TessMeshWorkload &workload, ushort tid) {
   return to_float(mix(left, right, place_on_ring<partition>(tid, real_factor, factor)));
 }
 
-int get_domain_patch_index(int workload_index, object_data int *data) asm("dxmt.get_domain_patch_index");
+int get_domain_patch_index(int workload_index, object_data int *data) asm("d3dalloy.get_domain_patch_index");
 
 int get_domain_patch_index(int workload_index, object_data int *data) {
   object_data TessMeshWorkload &workload = ((object_data TessMeshWorkload *)data)[workload_index];
@@ -954,7 +954,7 @@ get_domain_location_impl(int workload_index, int thread_index, object_data int *
 };
 
 domain_location get_domain_location_integer(int workload_index, int thread_index, object_data int *data) asm(
-    "dxmt.get_domain_location.integer"
+    "d3dalloy.get_domain_location.integer"
 );
 
 domain_location
@@ -963,7 +963,7 @@ get_domain_location_integer(int workload_index, int thread_index, object_data in
 };
 
 domain_location get_domain_location_pow2(int workload_index, int thread_index, object_data int *data) asm(
-    "dxmt.get_domain_location.pow2"
+    "d3dalloy.get_domain_location.pow2"
 );
 
 domain_location
@@ -972,7 +972,7 @@ get_domain_location_pow2(int workload_index, int thread_index, object_data int *
 };
 
 domain_location
-get_domain_location_odd(int workload_index, int thread_index, object_data int *data) asm("dxmt.get_domain_location.odd"
+get_domain_location_odd(int workload_index, int thread_index, object_data int *data) asm("d3dalloy.get_domain_location.odd"
 );
 
 domain_location
@@ -981,7 +981,7 @@ get_domain_location_odd(int workload_index, int thread_index, object_data int *d
 };
 
 domain_location get_domain_location_even(int workload_index, int thread_index, object_data int *data) asm(
-    "dxmt.get_domain_location.even"
+    "d3dalloy.get_domain_location.even"
 );
 
 domain_location
@@ -1094,7 +1094,7 @@ generate_primitive_point_impl(int workload_index, object_data int *data, Sink si
 }
 
 int generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) asm(
-    "dxmt.domain_generate_primitives.triangle"
+    "d3dalloy.domain_generate_primitives.triangle"
 );
 int
 generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mesh) {
@@ -1102,7 +1102,7 @@ generatePrimitiveTriangle(int workload_index, object_data int *data, MeshTri mes
 }
 
 int generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri mesh) asm(
-    "dxmt.domain_generate_primitives.triangle_ccw"
+    "d3dalloy.domain_generate_primitives.triangle_ccw"
 );
 int
 generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri mesh) {
@@ -1110,7 +1110,7 @@ generatePrimitiveTriangleCCW(int workload_index, object_data int *data, MeshTri 
 }
 
 int generatePrimitiveLine(int workload_index, object_data int *data, MeshLine mesh) asm(
-    "dxmt.domain_generate_primitives.line"
+    "d3dalloy.domain_generate_primitives.line"
 );
 int
 generatePrimitiveLine(int workload_index, object_data int *data, MeshLine mesh) {
@@ -1118,7 +1118,7 @@ generatePrimitiveLine(int workload_index, object_data int *data, MeshLine mesh) 
 }
 
 int generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) asm(
-    "dxmt.domain_generate_primitives.point"
+    "d3dalloy.domain_generate_primitives.point"
 );
 int
 generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) {
@@ -1126,7 +1126,7 @@ generatePrimitivePoint(int workload_index, object_data int *data, MeshTri mesh) 
 }
 
 int generatePrimitiveTriangleCapture(int workload_index, object_data int *data, device uint *indices) asm(
-    "dxmt.domain_generate_primitives.triangle.capture"
+    "d3dalloy.domain_generate_primitives.triangle.capture"
 );
 int
 generatePrimitiveTriangleCapture(int workload_index, object_data int *data, device uint *indices) {
@@ -1134,7 +1134,7 @@ generatePrimitiveTriangleCapture(int workload_index, object_data int *data, devi
 }
 
 int generatePrimitiveTriangleCCWCapture(int workload_index, object_data int *data, device uint *indices) asm(
-    "dxmt.domain_generate_primitives.triangle_ccw.capture"
+    "d3dalloy.domain_generate_primitives.triangle_ccw.capture"
 );
 int
 generatePrimitiveTriangleCCWCapture(int workload_index, object_data int *data, device uint *indices) {
@@ -1142,7 +1142,7 @@ generatePrimitiveTriangleCCWCapture(int workload_index, object_data int *data, d
 }
 
 int generatePrimitiveLineCapture(int workload_index, object_data int *data, device uint *indices) asm(
-    "dxmt.domain_generate_primitives.line.capture"
+    "d3dalloy.domain_generate_primitives.line.capture"
 );
 int
 generatePrimitiveLineCapture(int workload_index, object_data int *data, device uint *indices) {
@@ -1150,7 +1150,7 @@ generatePrimitiveLineCapture(int workload_index, object_data int *data, device u
 }
 
 int generatePrimitivePointCapture(int workload_index, object_data int *data, device uint *indices) asm(
-    "dxmt.domain_generate_primitives.point.capture"
+    "d3dalloy.domain_generate_primitives.point.capture"
 );
 int
 generatePrimitivePointCapture(int workload_index, object_data int *data, device uint *indices) {
@@ -1159,7 +1159,7 @@ generatePrimitivePointCapture(int workload_index, object_data int *data, device 
 
 /* Rank of a workload among its patch's workloads (TS->GS capture slot). A patch's workloads are
  * emitted by one thread in order, so rank = #{ j < workload_index : same patch_index }. */
-int get_domain_workload_rank(int workload_index, object_data int *data) asm("dxmt.get_domain_workload_rank");
+int get_domain_workload_rank(int workload_index, object_data int *data) asm("d3dalloy.get_domain_workload_rank");
 int
 get_domain_workload_rank(int workload_index, object_data int *data) {
   object_data TessMeshWorkload *workloads = (object_data TessMeshWorkload *)data;

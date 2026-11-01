@@ -93,21 +93,21 @@ int main() {
           !std::memcmp(hash->Digest, empty_hash.data(), empty_hash.size()), "legacy-header-fields");
   }
   auto find = [&](const void *data, size_t size, const Bytes &expected, const char *name) {
-    dxmt::dxil::DXBCChunkView view;
-    const bool found = dxmt::dxil::FindDXBCChunk(data, size, "DXIL", view);
+    d3dalloy::dxil::DXBCChunkView view;
+    const bool found = d3dalloy::dxil::FindDXBCChunk(data, size, "DXIL", view);
     check(found && view.size == expected.size() &&
           (expected.empty() || !std::memcmp(view.data, expected.data(), expected.size())), name);
   };
   auto reject = [&](const void *data, size_t size, const char *name) {
     microsoft::CDXBCParser parser;
     check(FAILED(parser.ReadDXBC(data, size)), name);
-    dxmt::dxil::DXBCChunkView view;
-    check(!dxmt::dxil::FindDXBCChunk(data, size, "DXIL", view), name);
+    d3dalloy::dxil::DXBCChunkView view;
+    check(!d3dalloy::dxil::FindDXBCChunk(data, size, "DXIL", view), name);
   };
   find(valid.data(), valid.size(), second, "first-matching-chunk");
   const auto missing = container({{"TEST", first}});
-  dxmt::dxil::DXBCChunkView missing_view;
-  check(!dxmt::dxil::FindDXBCChunk(missing.data(), missing.size(), "DXIL", missing_view), "missing-chunk");
+  d3dalloy::dxil::DXBCChunkView missing_view;
+  check(!d3dalloy::dxil::FindDXBCChunk(missing.data(), missing.size(), "DXIL", missing_view), "missing-chunk");
   const auto empty = container({});
   microsoft::CDXBCParser empty_parser;
   check(empty_parser.ReadDXBC(empty.data(), empty.size()) == S_OK && empty_parser.GetBlobCount() == 0,
@@ -158,7 +158,7 @@ int main() {
   const Bytes wrapped = words({0x00050066, 8, 0x4c495844, 0x00000100, 16, 8, 0xdec04342, 0x01234567});
   auto program = [&](const Bytes &payload, bool accepted, uint32_t version, uint32_t kind, const char *name) {
     const auto bytes = container({{"DXIL", payload}});
-    auto parsed = dxmt::dxil::FindDXILProgram(bytes.data(), bytes.size());
+    auto parsed = d3dalloy::dxil::FindDXILProgram(bytes.data(), bytes.size());
     if (!parsed) {
       llvm::consumeError(parsed.takeError());
       check(!accepted, name);
@@ -189,7 +189,7 @@ int main() {
   using Names = std::map<std::string, std::string>;
   auto names = [&](const Bytes &payload, bool accepted, const Names &expected, const char *name, Names actual = Names()) {
     const auto bytes = container({{"RDAT", payload}});
-    const bool read = dxmt::dxil::ReadLibraryFunctionNames(bytes.data(), bytes.size(), actual);
+    const bool read = d3dalloy::dxil::ReadLibraryFunctionNames(bytes.data(), bytes.size(), actual);
     check(read == accepted && actual == expected, name);
   };
   Bytes strings;
@@ -228,10 +228,10 @@ int main() {
   Bytes unaligned_library(library.size() + 1);
   std::memcpy(unaligned_library.data() + 1, library.data(), library.size());
   Names unaligned_names;
-  check(dxmt::dxil::ReadLibraryFunctionNames(unaligned_library.data() + 1, library.size(), unaligned_names) &&
+  check(d3dalloy::dxil::ReadLibraryFunctionNames(unaligned_library.data() + 1, library.size(), unaligned_names) &&
         unaligned_names == expected_names, "rdat-unaligned-input");
   Names null_names;
-  check(!dxmt::dxil::ReadLibraryFunctionNames(nullptr, 0, null_names) && null_names.empty(), "rdat-null-input");
+  check(!d3dalloy::dxil::ReadLibraryFunctionNames(nullptr, 0, null_names) && null_names.empty(), "rdat-null-input");
   for (const auto &payload : {runtime_data({{1, strings}}), runtime_data({{4, functions}}),
                               runtime_data({{77, {}}})})
     names(payload, false, {}, "rdat-missing-required-part");
@@ -295,7 +295,7 @@ int main() {
   put(malformed_later, malformed_later.size() - 4, 1);
   names(malformed_later, false, retained, "rdat-malformed-later-part-does-not-change-output", retained);
   Names missing_names = retained;
-  check(!dxmt::dxil::ReadLibraryFunctionNames(missing.data(), missing.size(), missing_names) &&
+  check(!d3dalloy::dxil::ReadLibraryFunctionNames(missing.data(), missing.size(), missing_names) &&
         missing_names == retained, "rdat-missing-chunk-does-not-change-output");
 
   std::printf("CONTAINER_%s checks=%u failures=%u\n", failures ? "FAIL" : "PASS", checks, failures);

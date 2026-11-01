@@ -52,7 +52,7 @@ Cell cell(uint32_t index, uint32_t level) {
   for (UINT i = 0; i < 3; ++i) { c.x[i] /= scale; c.y[i] /= scale; }
   return c;
 }
-D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS abi(const dxmt::OmmBuildInputs &in) {
+D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS abi(const d3dalloy::OmmBuildInputs &in) {
   D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS result;
   std::memcpy(&result, &in, sizeof(result));
   return result;
@@ -118,7 +118,7 @@ int execute(ID3D12Device5 *device, Context &ctx, const std::vector<uint8_t> &con
     D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY histogram{1, level, desc.Format};
     D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC arrayDesc{1, &histogram, data->GetGPUVirtualAddress(),
                                                         {descs->GetGPUVirtualAddress(), sizeof(desc)}};
-    dxmt::OmmBuildInputs arrayInputs{};
+    d3dalloy::OmmBuildInputs arrayInputs{};
     arrayInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY);
     arrayInputs.NumDescs = 1;
     arrayInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
@@ -127,11 +127,11 @@ int execute(ID3D12Device5 *device, Context &ctx, const std::vector<uint8_t> &con
     auto array = geometry.build(abi(arrayInputs), "omm: array build");
     D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC link{};
     link.OpacityMicromapArray = array->GetGPUVirtualAddress();
-    dxmt::OmmGeometryDesc g{};
+    d3dalloy::OmmGeometryDesc g{};
     g.Type = D3D12_RAYTRACING_GEOMETRY_TYPE(D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES);
     g.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE; // OMM replaces this flag.
     g.OmmTriangles = {&triangles, &link};
-    dxmt::OmmBuildInputs blas{};
+    d3dalloy::OmmBuildInputs blas{};
     blas.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
     blas.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(1 | 2 | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_OMM_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS);
     blas.NumDescs = 1; blas.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY; blas.pGeometryDescs = &g;
@@ -417,7 +417,7 @@ int execute(ID3D12Device5 *device, Context &ctx, const std::vector<uint8_t> &con
       float distantMacro[9]; std::memcpy(distantMacro, macro, sizeof(macro));
       for (UINT i = 0; i < 3; ++i) distantMacro[i*3] += 2;
       auto distantVertices = geometry.upload(distantMacro, sizeof(distantMacro));
-      dxmt::OmmGeometryDesc mixedGeometries[2]{};
+      d3dalloy::OmmGeometryDesc mixedGeometries[2]{};
       mixedGeometries[0].Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
       mixedGeometries[0].Triangles = triangles;
       mixedGeometries[0].Triangles.VertexBuffer.StartAddress = distantVertices->GetGPUVirtualAddress();

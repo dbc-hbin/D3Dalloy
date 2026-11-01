@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 // DXIL opcode numbers are a stable bytecode ABI, independent of the SDK headers.
 // Explicit levels/gradients do not require an implicit derivative or quad remap.
@@ -46,4 +46,4 @@ ClassifyQuadLayout(uint32_t x, uint32_t y, uint32_t z) {
   return QuadLayout::Unavailable;
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

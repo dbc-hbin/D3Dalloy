@@ -37,7 +37,7 @@
 #include <memory>
 #include <mutex>
 
-namespace dxmt::sharing {
+namespace d3dalloy::sharing {
 
 /* One mapped share per section per process; every device of the process reuses it. */
 struct SharedObjectAccess;
@@ -84,4 +84,4 @@ HRESULT Create(Kind kind, uint64_t payload_size, std::shared_ptr<SharedObject> &
 HRESULT Open(HANDLE handle, std::shared_ptr<SharedObject> &out);
 HRESULT OpenByName(const WCHAR *name, DWORD access, HANDLE *handle);
 
-} // namespace dxmt::sharing
+} // namespace d3dalloy::sharing

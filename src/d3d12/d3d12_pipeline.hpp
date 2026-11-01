@@ -20,7 +20,7 @@
 #include "airconv_public.h"
 #include <cstring>
 
-namespace dxmt {
+namespace d3dalloy {
 
 /* A compiler-owned pointer as seen by this image, or null when it lies outside a 32-bit PE's address space. */
 inline const void *
@@ -107,4 +107,4 @@ public:
   }
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

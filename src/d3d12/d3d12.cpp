@@ -27,7 +27,7 @@
 #include <mutex>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 Logger Logger::s_instance("d3d12.log");
 
@@ -200,7 +200,7 @@ CreateConfiguredDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel
   }
 
   if (FAILED(hr = dxgi_adapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter_mtl)))) {
-    ERR("D3D12CreateDevice: Not a D3DAlloy adapter");
+    ERR("D3D12CreateDevice: Not a D3Dalloy adapter");
     return hr;
   }
 
@@ -211,7 +211,7 @@ CreateConfiguredDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel
     return S_FALSE;
 
   try {
-    return dxmt::CreateD3D12Device(dxgi_adapter_mtl.ptr(), riid, ppDevice, configuration, independent);
+    return d3dalloy::CreateD3D12Device(dxgi_adapter_mtl.ptr(), riid, ppDevice, configuration, independent);
   } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
 }
 extern "C" HRESULT WINAPI
@@ -240,4 +240,4 @@ DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   return TRUE;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

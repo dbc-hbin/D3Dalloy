@@ -10,7 +10,7 @@ using SwizzleUint = uint32_t;
 using SwizzleUlong = uint64_t;
 #endif
 
-namespace dxmt {
+namespace d3dalloy {
 
 // Kernel arguments for one D3D12 texture subresource. The buffer bindings
 // carry the allocation offsets; first_tile is subresource-relative to the
@@ -46,4 +46,4 @@ struct D3D12StandardSwizzleParams {
 static_assert(sizeof(D3D12StandardSwizzleParams) == 104);
 #endif
 
-} // namespace dxmt
+} // namespace d3dalloy

@@ -2,7 +2,7 @@
 #include "d3d11_4.h"
 #include <atomic>
 
-namespace dxmt {
+namespace d3dalloy {
 
 class d3d11_device_mutex {
 public:
@@ -50,4 +50,4 @@ private:
   d3d11_device_mutex &mutex_;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

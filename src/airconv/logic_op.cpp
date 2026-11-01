@@ -9,7 +9,7 @@
 
 using namespace llvm;
 
-namespace dxmt::logic_op {
+namespace d3dalloy::logic_op {
 namespace {
 
 Error invalid(const char *message) {
@@ -141,4 +141,4 @@ Error applyLogicOp(Module &module, const SM50_SHADER_D3D12_LOGIC_OP_DATA &option
   return Error::success();
 }
 
-} // namespace dxmt::logic_op
+} // namespace d3dalloy::logic_op

@@ -10,11 +10,11 @@
 #include <memory>
 #include <mutex>
 
-namespace dxmt {
+namespace d3dalloy {
 
 class ReflexState {
   struct Frame {
-    DXMT_REFLEX_REPORT report{};
+    D3DALLOY_REFLEX_REPORT report{};
     UINT markers = 0;
     UINT pending = 0;
     bool valid = false, failed = false, presented = false;
@@ -172,7 +172,7 @@ public:
     // gpuActiveRenderTimeUs remains unavailable (0); no invented utilization/scanout time.
   }
 
-  HRESULT Reports(DXMT_REFLEX_REPORT *reports) {
+  HRESULT Reports(D3DALLOY_REFLEX_REPORT *reports) {
     std::lock_guard lock(mutex_);
     if (removed_) return DXGI_ERROR_DEVICE_REMOVED;
     std::array<const Frame *, 128> complete{};
@@ -195,4 +195,4 @@ public:
     return S_OK;
   }
 };
-} // namespace dxmt
+} // namespace d3dalloy

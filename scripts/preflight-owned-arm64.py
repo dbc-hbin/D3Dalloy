@@ -60,9 +60,9 @@ def verified_owned_artifacts(runtime: Path) -> dict:
         raise ValueError(f'invalid staged owned manifest: {error}') from error
     if problems:
         raise ValueError('STAGED_OWNED_PROVENANCE_INVALID: ' + '; '.join(problems))
-    if data.get('implementation') != 'owned-dxmt-derived' or not isinstance(data.get('source'), dict):
+    if data.get('implementation') != 'owned-d3dalloy-derived' or not isinstance(data.get('source'), dict):
         raise ValueError('staged manifest lacks repo-owned source provenance')
-    if not isinstance(data['source'].get('dxmt_install'), str) or not data['source']['dxmt_install']:
+    if not isinstance(data['source'].get('d3dalloy_install'), str) or not data['source']['d3dalloy_install']:
         raise ValueError('staged manifest lacks owned installation source')
     layout = runtime_architecture(data)
     owned = [f"{layout['unix_directory']}/winemetal.so", f"{layout['windows_directory']}/winemetal.dll"]

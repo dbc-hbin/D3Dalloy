@@ -5,7 +5,7 @@
 #include <string>
 #include "sha1/sha1_util.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 class MTLD3D12Device;
 struct ShaderStageArtifact;
 HRESULT CreateShaderCacheSession(MTLD3D12Device *device, const D3D12_SHADER_CACHE_SESSION_DESC *desc,
@@ -24,4 +24,4 @@ void QueueAutomaticStageArtifact(const std::string &key, std::shared_ptr<const S
                                  uint64_t generation);
 void PublishAutomaticStageArtifact(const std::string &key, std::shared_ptr<const ShaderStageArtifact> artifact,
                                    uint64_t generation);
-} // namespace dxmt
+} // namespace d3dalloy

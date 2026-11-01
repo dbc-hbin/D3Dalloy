@@ -1434,18 +1434,18 @@ enum WMTRenderCommandType : uint16_t {
   Unused0,
   Unused1,
   Unused2,
-  WMTRenderCommandDXMTGeometryDraw,
-  WMTRenderCommandDXMTGeometryDrawIndexed,
-  WMTRenderCommandDXMTGeometryDrawIndirect,
-  WMTRenderCommandDXMTGeometryDrawIndexedIndirect,
+  WMTRenderCommandD3DalloyGeometryDraw,
+  WMTRenderCommandD3DalloyGeometryDrawIndexed,
+  WMTRenderCommandD3DalloyGeometryDrawIndirect,
+  WMTRenderCommandD3DalloyGeometryDrawIndexedIndirect,
   WMTRenderCommandWaitForFence,
   WMTRenderCommandUpdateFence,
   WMTRenderCommandSetViewport,
   WMTRenderCommandSetScissorRect,
-  WMTRenderCommandDXMTTessellationMeshDraw,
-  WMTRenderCommandDXMTTessellationMeshDrawIndexed,
-  WMTRenderCommandDXMTTessellationMeshDrawIndirect,
-  WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect,
+  WMTRenderCommandD3DalloyTessellationMeshDraw,
+  WMTRenderCommandD3DalloyTessellationMeshDrawIndexed,
+  WMTRenderCommandD3DalloyTessellationMeshDrawIndirect,
+  WMTRenderCommandD3DalloyTessellationMeshDrawIndexedIndirect,
   WMTRenderCommandDispatchThreadsPerTile,
   WMTRenderCommandExecuteCommandsInBuffer,
   WMTRenderCommandSetBlendFactor,
@@ -1759,7 +1759,7 @@ struct wmtcmd_render_set_vertex_amplification {
   uint32_t render_target_array_offset;
 };
 
-struct wmtcmd_render_dxmt_geometry_draw {
+struct wmtcmd_render_d3dalloy_geometry_draw {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1769,7 +1769,7 @@ struct wmtcmd_render_dxmt_geometry_draw {
   uint32_t vertex_per_warp;
 };
 
-struct wmtcmd_render_dxmt_geometry_draw_indexed {
+struct wmtcmd_render_d3dalloy_geometry_draw_indexed {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1781,7 +1781,7 @@ struct wmtcmd_render_dxmt_geometry_draw_indexed {
   uint32_t vertex_per_warp;
 };
 
-struct wmtcmd_render_dxmt_geometry_draw_indirect {
+struct wmtcmd_render_d3dalloy_geometry_draw_indirect {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1793,7 +1793,7 @@ struct wmtcmd_render_dxmt_geometry_draw_indirect {
   uint32_t vertex_per_warp;
 };
 
-struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect {
+struct wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1815,7 +1815,7 @@ struct wmtcmd_render_fence_op {
   enum WMTRenderStages stages;
 };
 
-struct wmtcmd_render_dxmt_tessellation_mesh_draw {
+struct wmtcmd_render_d3dalloy_tessellation_mesh_draw {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1826,7 +1826,7 @@ struct wmtcmd_render_dxmt_tessellation_mesh_draw {
   uint32_t patch_per_mesh_instance;
 };
 
-struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed {
+struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1839,7 +1839,7 @@ struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed {
   uint32_t patch_per_mesh_instance;
 };
 
-struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect {
+struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indirect {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
@@ -1852,7 +1852,7 @@ struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect {
   uint32_t patch_per_group;
 };
 
-struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect {
+struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed_indirect {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;

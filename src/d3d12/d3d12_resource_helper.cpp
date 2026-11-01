@@ -22,7 +22,7 @@
 #include "util_bit.hpp"
 #include <bit>
 
-namespace dxmt {
+namespace d3dalloy {
 
 HRESULT
 ValidateCastableFormats(MTLD3D12Device *device,const D3D12_RESOURCE_DESC &desc,UINT32 count,
@@ -825,4 +825,4 @@ IsD3D12BoxInBounds(D3D12_BOX &box, D3D12_BOX &bounds) {
   return true;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

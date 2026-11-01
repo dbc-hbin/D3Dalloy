@@ -14,7 +14,7 @@ using namespace llvm;
 static bool comparison(const char *path, unsigned expected_handles, unsigned expected_calls) {
   auto bytes = MemoryBuffer::getFile(path);
   if (!bytes) { errs() << "Cannot read " << path << '\n'; return false; }
-  auto parsed = dxmt::dxil::ModuleInfo::Parse((*bytes)->getBufferStart(), (*bytes)->getBufferSize());
+  auto parsed = d3dalloy::dxil::ModuleInfo::Parse((*bytes)->getBufferStart(), (*bytes)->getBufferSize());
   if (!parsed) { logAllUnhandledErrors(parsed.takeError(), errs()); return false; }
   auto &info = **parsed;
   unsigned handles = 0, calls = 0, srvs = 0;
@@ -25,16 +25,16 @@ static bool comparison(const char *path, unsigned expected_handles, unsigned exp
           handles += callee->getName().startswith("dx.op.createHandleForLib");
           calls += callee->getName().startswith("dx.op.sampleCmp");
         }
-  dxmt::dxbc::ShaderInfo shader;
-  dxmt::dxil::PopulateShaderResourceBindings(shader, info.resources);
+  d3dalloy::dxbc::ShaderInfo shader;
+  d3dalloy::dxil::PopulateShaderResourceBindings(shader, info.resources);
   bool okay = handles == expected_handles && calls == expected_calls;
   for (const auto &resource : info.resources) {
-    if (resource.klass != dxmt::dxil::ResourceClass::SRV) continue;
+    if (resource.klass != d3dalloy::dxil::ResourceClass::SRV) continue;
     ++srvs;
     const auto &srv = shader.srvMap.at(resource.declaration_id);
     okay &= resource.read && resource.sampled && resource.compared && !resource.written &&
         !resource.with_counter && srv.read && srv.sampled && srv.compared &&
-        dxmt::air::to_air_resource_type(srv.resource_type, srv.compared) == llvm::air::Texture::depth2d;
+        d3dalloy::air::to_air_resource_type(srv.resource_type, srv.compared) == llvm::air::Texture::depth2d;
   }
   okay &= srvs == 6;
   std::printf("LIBRARY_COMPARISON_%s handles=%u calls=%u srvs=%u fixture=%s\n",
@@ -106,10 +106,10 @@ define void @main(i32 %index) {
                              0x4c495844, uint32_t(bitcode.size())};
   std::memcpy(bytes.data(), header, sizeof(header));
   std::memcpy(bytes.data() + 44, bitcode.data(), bitcode.size());
-  auto parsed = dxmt::dxil::ModuleInfo::Parse(bytes.data(), bytes.size());
+  auto parsed = d3dalloy::dxil::ModuleInfo::Parse(bytes.data(), bytes.size());
   if (!parsed) { logAllUnhandledErrors(parsed.takeError(), errs()); return false; }
-  dxmt::dxbc::ShaderInfo shader;
-  dxmt::dxil::PopulateShaderResourceBindings(shader, (*parsed)->resources);
+  d3dalloy::dxbc::ShaderInfo shader;
+  d3dalloy::dxil::PopulateShaderResourceBindings(shader, (*parsed)->resources);
   bool okay = (*parsed)->resources.size() == 5;
   for (const auto &resource : (*parsed)->resources) {
     bool counter = resource.name == "counter", array = resource.name == "array";
@@ -135,7 +135,7 @@ define void @main(i32 %index) {
   std::memcpy(bytes.data() + 24, &total, sizeof(total));
   std::memcpy(bytes.data() + 40, &payload, sizeof(payload));
   std::memcpy(bytes.data() + 44, bitcode.data(), bitcode.size());
-  auto malformed = dxmt::dxil::ModuleInfo::Parse(bytes.data(), bytes.size());
+  auto malformed = d3dalloy::dxil::ModuleInfo::Parse(bytes.data(), bytes.size());
   if (malformed) return false;
   consumeError(malformed.takeError());
   return okay;

@@ -118,11 +118,11 @@ def main() -> int:
                     raise RuntimeError("paired DLL changed since build acceptance")
                 shutil.copy2(image, install / "aarch64-windows" / image.name)
             result["paired_build_result_sha256"] = hashlib.sha256((paired / "result.json").read_bytes()).hexdigest()
-        run([sys.executable, str(root / "scripts/stage-owned-graphics.py"), "stage", "--dxmt-install", str(install),
+        run([sys.executable, str(root / "scripts/stage-owned-graphics.py"), "stage", "--d3dalloy-install", str(install),
              "--wine-source", str(wine / "runtime"), "--wine-dest", str(staged),
              "--native-arch", "arm64", "--windows-abi", windows_abi,
              *[f"--with-{name}" for name, enabled in optional.items() if enabled],
-             *(["--dxmt-install32", str(install32)] if args.with_wow64 else []),
+             *(["--d3dalloy-install32", str(install32)] if args.with_wow64 else []),
              *(["--fex-build", str(args.fex_build.resolve())] if args.fex_build else [])], "stage")
         run([sys.executable, str(root / "scripts/stage-owned-graphics.py"), "verify", "--runtime", str(staged)], "verify")
         result["wrapper_version"] = run([str(staged / "bin/wine"), "--version"], "wrapper-version").strip()

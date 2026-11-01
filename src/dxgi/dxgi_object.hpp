@@ -3,7 +3,7 @@
 #include "com/com_private_data.hpp"
 #include "com/com_object.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 template <typename Base> class MTLDXGIObject : public ComObjectWithInitialRef<Base> {
 
@@ -39,4 +39,4 @@ protected:
   Device* device_;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

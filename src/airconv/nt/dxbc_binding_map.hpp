@@ -3,7 +3,7 @@
 #include "air_builder.hpp"
 #include "llvm/IR/Value.h"
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 struct ShaderResourceViewInfo;
 struct UnorderedAccessViewInfo;
@@ -236,4 +236,4 @@ public:
   virtual uint32_t StaticSamplerArgumentIndex() const { return ~0u; }
 };
 
-} // namespace dxmt::dxbc
+} // namespace d3dalloy::dxbc

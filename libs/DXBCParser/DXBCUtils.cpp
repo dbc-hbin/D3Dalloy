@@ -19,7 +19,7 @@ UINT DXBCGetSizeAssumingValidPointer(const void* pDXBC)
     if( !pDXBC ) return 0;
 
     uint32_t size = 0;
-    dxmt_shader_container_declared_size(pDXBC, sizeof(DXBCHeader), &size);
+    d3dalloy_shader_container_declared_size(pDXBC, sizeof(DXBCHeader), &size);
     return size;
 }
 
@@ -401,11 +401,11 @@ inline D3D10_SB_REGISTER_COMPONENT_TYPE ConvertToSB(D3D10_REGISTER_COMPONENT_TYP
 // anything is allocated. One allocation then holds the parameters, their lowercase name char sums
 // and, unless names reference the blob, copies of the names.
 static HRESULT ReadSignatureParameters(const void* pSignature, UINT BlobSize, uint32_t Format, bool bGrouped,
-                                       bool bForceStringReference, DxmtDxbcSignatureInfo& Info,
+                                       bool bForceStringReference, D3DalloyDxbcSignatureInfo& Info,
                                        D3D11_SIGNATURE_PARAMETER*& pParameters, UINT*& pCharSums)
 {
     if( !pSignature ||
-        dxmt_dxbc_signature_parse(pSignature, BlobSize, Format, bGrouped, &Info) != DXMT_DXBC_SIGNATURE_SUCCESS )
+        d3dalloy_dxbc_signature_parse(pSignature, BlobSize, Format, bGrouped, &Info) != D3DALLOY_DXBC_SIGNATURE_SUCCESS )
     {
         return E_FAIL;
     }
@@ -430,8 +430,8 @@ static HRESULT ReadSignatureParameters(const void* pSignature, UINT BlobSize, ui
     char* pNextDstString = (char*)(pStorage + ParameterBytes + CharSumBytes);
     for( UINT i = 0; i < Info.parameter_count; i++ )
     {
-        DxmtDxbcSignatureParameter Record;
-        if( dxmt_dxbc_signature_parameter(pSignature, BlobSize, &Info, i, &Record) != DXMT_DXBC_SIGNATURE_SUCCESS )
+        D3DalloyDxbcSignatureParameter Record;
+        if( d3dalloy_dxbc_signature_parameter(pSignature, BlobSize, &Info, i, &Record) != D3DALLOY_DXBC_SIGNATURE_SUCCESS )
         {
             free(pStorage);
             return E_FAIL;
@@ -480,8 +480,8 @@ HRESULT CSignatureParser::ReadSignature11_1(const void* pSignature, UINT BlobSiz
     {
         Cleanup();
     }
-    DxmtDxbcSignatureInfo Info;
-    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, DXMT_DXBC_SIGNATURE_11_1, false, bForceStringReference,
+    D3DalloyDxbcSignatureInfo Info;
+    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, D3DALLOY_DXBC_SIGNATURE_11_1, false, bForceStringReference,
                                          Info, m_pSignatureParameters, m_pSemanticNameCharSums);
     if( FAILED(hr) )
     {
@@ -500,8 +500,8 @@ HRESULT CSignatureParser::ReadSignature4(const void* pSignature, UINT BlobSize, 
     {
         Cleanup();
     }
-    DxmtDxbcSignatureInfo Info;
-    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, DXMT_DXBC_SIGNATURE_LEGACY, false, bForceStringReference,
+    D3DalloyDxbcSignatureInfo Info;
+    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, D3DALLOY_DXBC_SIGNATURE_LEGACY, false, bForceStringReference,
                                          Info, m_pSignatureParameters, m_pSemanticNameCharSums);
     if( FAILED(hr) )
     {
@@ -591,8 +591,8 @@ void CSignatureParser5::Cleanup()
 HRESULT CSignatureParser5::ReadSignature11_1(const void* pSignature, UINT BlobSize, bool bForceStringReference )
 {
     Cleanup();
-    DxmtDxbcSignatureInfo Info;
-    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, DXMT_DXBC_SIGNATURE_11_1, true, bForceStringReference,
+    D3DalloyDxbcSignatureInfo Info;
+    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, D3DALLOY_DXBC_SIGNATURE_11_1, true, bForceStringReference,
                                          Info, m_pSignatureParameters, m_pSemanticNameCharSums);
     if( FAILED(hr) )
     {
@@ -617,8 +617,8 @@ HRESULT CSignatureParser5::ReadSignature11_1(const void* pSignature, UINT BlobSi
 HRESULT CSignatureParser5::ReadSignature5(const void* pSignature, UINT BlobSize, bool bForceStringReference )
 {
     Cleanup();
-    DxmtDxbcSignatureInfo Info;
-    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, DXMT_DXBC_SIGNATURE_STREAM, true, bForceStringReference,
+    D3DalloyDxbcSignatureInfo Info;
+    HRESULT hr = ReadSignatureParameters(pSignature, BlobSize, D3DALLOY_DXBC_SIGNATURE_STREAM, true, bForceStringReference,
                                          Info, m_pSignatureParameters, m_pSemanticNameCharSums);
     if( FAILED(hr) )
     {

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-DXMT-based D3D12-to-Metal translator for Wine on macOS, with an owned DXIL/DXBC-to-AIR/metallib compiler. D3D10/11, DXGI, NVAPI, and NGX support share the runtime. No GPTK/D3DMetal, Apple Metal Shader Converter, or SPIR-V fallback.
+D3Dalloy is a D3D12-to-Metal translator for Wine on macOS, with an owned DXIL/DXBC-to-AIR/metallib compiler. D3D10/11, DXGI, NVAPI, and NGX support share the runtime. No GPTK/D3DMetal, Apple Metal Shader Converter, or SPIR-V fallback.
 
 The current product scope is running D3D12 games on macOS through Metal, not general Windows graphics/API completeness. Prioritize game rendering correctness, compatibility, performance, presentation, and game-used upscaling/frame-generation/latency paths. A backlog entry or missing API alone does not authorize implementation: establish its relevance to D3D12 games before expanding scope.
 
@@ -17,11 +17,11 @@ Edit root `src/` directly. `README.md` describes the current workflow; `graphics
 
 ## Architecture & Data Flow
 
-- **API/device:** exported DLL entry points validate arguments, obtain a DXMT DXGI adapter, and construct an API-specific COM device over the shared backend.
-- **D3D12 execution:** command lists record typed encoder passes and command records; `Close` seals recording. Queue-local FIFO tasks (`Execute`, `Signal`, `Wait`, `Present`) retain submission ownership and feed a submission thread. A second thread retires Metal completions in order through `SubmissionRing<32>`. D3D11 uses the separate shared `src/dxmt` encoder/dependency-tracking path.
+- **API/device:** exported DLL entry points validate arguments, obtain a D3Dalloy DXGI adapter, and construct an API-specific COM device over the shared backend.
+- **D3D12 execution:** command lists record typed encoder passes and command records; `Close` seals recording. Queue-local FIFO tasks (`Execute`, `Signal`, `Wait`, `Present`) retain submission ownership and feed a submission thread. A second thread retires Metal completions in order through `SubmissionRing<32>`. D3D11 uses the separate shared `src/d3dalloy` encoder/dependency-tracking path.
 - **Shaders:** `src/airconv` parses bytecode, lowers DXIL in place using per-compilation `ModuleInfo`, validates it, and emits AIR/metallib. Mutable LLVM IR must remain local to one compilation/context.
 - **Metal boundary:** Windows WineMetal wrappers send POD parameters through numbered `WINE_UNIX_CALL`s to native Metal handlers. Change wrappers, parameter layouts, call indexes, handlers, and call tables together.
-- **NGX/NVAPI:** translation facades use private DXMT interfaces rather than independent renderers. Preserve cross-DLL ABI contracts.
+- **NGX/NVAPI:** translation facades use private D3Dalloy interfaces rather than independent renderers. Preserve cross-DLL ABI contracts.
 - **D3D12 fences:** logical values can rewind. GPU queue signals publish logical completion through validated retirement, not native-token reservation. Waits latch qualifying completion at API registration or afterward; shared fences retain per-observer threshold crossings, while native shared events only wake observers. Consumer workers wait for actual completion, not just producer commit; API callers remain asynchronous. D3D11 retains its separate native fence path.
 
 ## Key Directories
@@ -30,7 +30,7 @@ Edit root `src/` directly. `README.md` describes the current workflow; `graphics
 | --- | --- |
 | `src/d3d12/` | Devices, queues/lists, resources, descriptors, PSOs/cache, queries, temporal scaling, DXR |
 | `src/airconv/` | Shader conversion, LLVM lowering, AIR/metallib output |
-| `src/dxmt/`, `src/dxgi/` | Shared renderer, dependency tracking, adapters, presentation |
+| `src/d3dalloy/`, `src/dxgi/` | Shared renderer, dependency tracking, adapters, presentation |
 | `src/winemetal/` | Windows/native Metal bridge; native handlers under `unix/` |
 | `src/d3d10/`, `src/d3d11/`, `src/nvapi/`, `src/nvngx/` | Other API frontends and compatibility facades |
 | `src/util/` | COM/reference ownership, Wine-aware threading, logging, configuration |
@@ -50,9 +50,9 @@ Runtime destinations and evidence output directories must be fresh. Never instal
 ## Code Conventions & Common Patterns
 
 - C++20; preserve subsystem style. D3D12 formatting uses 2 spaces, no tabs, 120 columns; root formatting disables include sorting. Types/API functions use PascalCase, implementations often end in `Impl`, and locals/members commonly use snake_case. Keep Microsoft ABI spelling intact.
-- Use existing ownership types: `Com<T>` for COM, `Rc<T>` for shared DXMT objects, `WMT::Reference<T>` for Metal handles, and standard smart pointers where already established. Deferred tasks must retain owners until GPU retirement; CPU publication is not GPU completion.
+- Use existing ownership types: `Com<T>` for COM, `Rc<T>` for shared D3Dalloy objects, `WMT::Reference<T>` for Metal handles, and standard smart pointers where already established. Deferred tasks must retain owners until GPU retirement; CPU publication is not GPU completion.
 - API boundaries initialize output pointers and return contract-appropriate `HRESULT`s. Void recording methods retain the first recording error. Airconv is exception-free: propagate or consume `llvm::Error`/`llvm::Expected<T>`. Do not use aborting `IMPLEMENT_ME` for normal unsupported API requests.
-- Preserve queue acquire/release publication, stable record storage, backpressure, and shutdown order: close FIFO, join submitter, retire published GPU work, publish stop sentinel, join completion thread. Use `dxmt::thread`/mutex wrappers where Wine initialization matters; respect AppKit main-thread dispatch.
+- Preserve queue acquire/release publication, stable record storage, backpressure, and shutdown order: close FIFO, join submitter, retire published GPU work, publish stop sentinel, join completion thread. Use `d3dalloy::thread`/mutex wrappers where Wine initialization matters; respect AppKit main-thread dispatch.
 - Dependencies flow through COM/private interfaces and constructors. Keep state explicit in device/list/allocator objects; configuration singletons are module-local, not process-global across DLLs. Reuse `TRACE`, `DEBUG`, `WARN`, `ERR`, and structured lifecycle tracing.
 
 ## Important Files
@@ -61,7 +61,7 @@ Runtime destinations and evidence output directories must be fresh. Never instal
 - `src/d3d12/d3d12.cpp`, `src/d3d11/d3d11.cpp`, and adjacent `.def` files: public entry points/exports.
 - `src/d3d12/d3d12_interfaces.hpp`: private cross-DLL temporal ABI. `owned_submission_ring.hpp`, `owned_queue_task_fifo.hpp`, and `owned_rtas_lifetime.hpp` in that directory document concurrency/lifetime invariants.
 - `src/airconv/airconv_public.h`, `src/airconv/dxil_converter.hpp`: compiler ABI and lowering contract.
-- `dxmt.conf`, `doc/CUSTOMIZATION.md`: configuration, including `DXMT_CONFIG_FILE`/`DXMT_CONFIG`. `doc/DEVELOPMENT.md`: debugging background; prefer root README build instructions over older recipes.
+- `d3dalloy.conf`, `doc/CUSTOMIZATION.md`: configuration, including `D3DALLOY_CONFIG_FILE`/`D3DALLOY_CONFIG`. `doc/DEVELOPMENT.md`: debugging background; prefer root README build instructions over older recipes.
 
 ## Runtime/Tooling Preferences
 

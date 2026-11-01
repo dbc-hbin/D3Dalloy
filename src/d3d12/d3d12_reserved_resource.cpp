@@ -21,7 +21,7 @@
 #include <bit>
 #include <span>
 
-namespace dxmt {
+namespace d3dalloy {
 
 namespace {
 
@@ -376,7 +376,7 @@ ReservedResource::Release(const ReservedTileTarget &target) {
 
 ReservedTileTarget
 ReservedResource::CurrentTarget(uint32_t tile) {
-  std::lock_guard<dxmt::mutex> lock(mutex);
+  std::lock_guard<d3dalloy::mutex> lock(mutex);
   return tile < targets_.size() ? targets_[tile] : ReservedTileTarget{};
 }
 
@@ -385,7 +385,7 @@ ReservedResource::Apply(
     WMT::MTL4CommandQueue queue, WMT::Buffer buffer, WMT::Texture texture,
     const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments
 ) {
-  std::lock_guard<dxmt::mutex> lock(mutex);
+  std::lock_guard<d3dalloy::mutex> lock(mutex);
   /* Later assignments to the same tile win, exactly like overlapping D3D12 regions. */
   std::vector<std::pair<uint32_t, ReservedTileTarget>> effective;
   effective.reserve(assignments.size());
@@ -419,7 +419,7 @@ ReservedResource::Apply(
 
 uint64_t
 ReservedResource::CollectMappedTiles(uint64_t seen_generation, std::vector<uint32_t> &tiles, uint32_t subresource) {
-  std::lock_guard<dxmt::mutex> lock(mutex);
+  std::lock_guard<d3dalloy::mutex> lock(mutex);
   if (seen_generation == mapping_generation_)
     return mapping_generation_;
   tiles.clear();
@@ -458,7 +458,7 @@ ReservedResource::GetVolumeCastAtlas(MTLD3D12Device *owner, WMTPixelFormat forma
   }
   auto device = owner->GetMTLDevice();
   std::lock_guard<std::mutex> queue_lock(MappingQueueMutex);
-  std::lock_guard<dxmt::mutex> lock(mutex);
+  std::lock_guard<d3dalloy::mutex> lock(mutex);
   if (auto existing = volume_cast_atlases_.find(format); existing != volume_cast_atlases_.end()) return existing->second;
   if (!volume_ || !volume_mapping_queue) return {};
   WMTTextureInfo info{};
@@ -585,4 +585,4 @@ ReservedResource::EncodeTexture(
   flush(current);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

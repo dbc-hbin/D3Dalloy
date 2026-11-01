@@ -39,7 +39,7 @@ static BOOL composition_release(NSObject *object);
 
 static NTSTATUS _WMTGetGuestWindowBase(void *result) {
   *(uint64_t *)result = 0;
-#if defined(__aarch64__) && !defined(DXMT_NATIVE)
+#if defined(__aarch64__) && !defined(D3DALLOY_NATIVE)
   extern NTSTATUS NtQueryInformationProcess(void *, uint32_t, void *, uint32_t, uint32_t *);
   /* Owned Wine ProcessWineWow64GuestBase returns a native ULONG_PTR. */
   return NtQueryInformationProcess((void *)~(uintptr_t)0, 1010, result, sizeof(uint64_t), NULL);
@@ -287,7 +287,7 @@ _MTLDevice_newBuffer(void *obj) {
   return STATUS_SUCCESS;
 }
 
-#ifndef DXMT_NATIVE
+#ifndef D3DALLOY_NATIVE
 extern NTSTATUS NtAllocateVirtualMemory(void *process, void **address, uintptr_t zero_bits, size_t *size,
                                         uint32_t type, uint32_t protect);
 extern NTSTATUS NtFreeVirtualMemory(void *process, void **address, size_t *size, uint32_t type);
@@ -729,7 +729,7 @@ _MTLCommandEncoder_endEncoding(void *obj) {
   return STATUS_SUCCESS;
 }
 
-#ifndef DXMT_NO_PRIVATE_API
+#ifndef D3DALLOY_NO_PRIVATE_API
 
 typedef NS_ENUM(NSUInteger, MTLLogicOperation) {
   MTLLogicOperationClear,
@@ -795,7 +795,7 @@ _MTLDevice_newRenderPipelineState(void *obj) {
       descriptor.vertexBuffers[i].mutability = MTLMutabilityImmutable;
   }
 
-#ifndef DXMT_NO_PRIVATE_API
+#ifndef D3DALLOY_NO_PRIVATE_API
   [descriptor setLogicOperationEnabled:info->logic_operation_enabled];
   [descriptor setLogicOperation:(MTLLogicOperation)info->logic_operation];
 #endif
@@ -864,7 +864,7 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
       descriptor.objectBuffers[i].mutability = MTLMutabilityImmutable;
   }
 
-#ifndef DXMT_NO_PRIVATE_API
+#ifndef D3DALLOY_NO_PRIVATE_API
   [descriptor setLogicOperationEnabled:info->logic_operation_enabled];
   [descriptor setLogicOperation:(MTLLogicOperation)info->logic_operation];
 #endif
@@ -1375,16 +1375,16 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                          beforeStages:(MTLRenderStages)body->stages_before];
       break;
     }
-    case WMTRenderCommandDXMTGeometryDraw: {
-      struct wmtcmd_render_dxmt_geometry_draw *body = (struct wmtcmd_render_dxmt_geometry_draw *)next;
+    case WMTRenderCommandD3DalloyGeometryDraw: {
+      struct wmtcmd_render_d3dalloy_geometry_draw *body = (struct wmtcmd_render_d3dalloy_geometry_draw *)next;
       [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
       break;
     }
-    case WMTRenderCommandDXMTGeometryDrawIndexed: {
-      struct wmtcmd_render_dxmt_geometry_draw_indexed *body = (struct wmtcmd_render_dxmt_geometry_draw_indexed *)next;
+    case WMTRenderCommandD3DalloyGeometryDrawIndexed: {
+      struct wmtcmd_render_d3dalloy_geometry_draw_indexed *body = (struct wmtcmd_render_d3dalloy_geometry_draw_indexed *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
                         offset:body->index_buffer_offset
                        atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
@@ -1394,8 +1394,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
       break;
     }
-    case WMTRenderCommandDXMTGeometryDrawIndirect: {
-      struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
+    case WMTRenderCommandD3DalloyGeometryDrawIndirect: {
+      struct wmtcmd_render_d3dalloy_geometry_draw_indirect *body = (struct wmtcmd_render_d3dalloy_geometry_draw_indirect *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
                         offset:body->indirect_args_offset
                        atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
@@ -1408,9 +1408,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
-    case WMTRenderCommandDXMTGeometryDrawIndexedIndirect: {
-      struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *body =
-          (struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)next;
+    case WMTRenderCommandD3DalloyGeometryDrawIndexedIndirect: {
+      struct wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect *body =
+          (struct wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
                         offset:body->index_buffer_offset
                        atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
@@ -1426,17 +1426,17 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
-    case WMTRenderCommandDXMTTessellationMeshDraw: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw *)next;
+    case WMTRenderCommandD3DalloyTessellationMeshDraw: {
+      struct wmtcmd_render_d3dalloy_tessellation_mesh_draw *body = (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw *)next;
       [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
       break;
     }
-    case WMTRenderCommandDXMTTessellationMeshDrawIndexed: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *body =
-          (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *)next;
+    case WMTRenderCommandD3DalloyTessellationMeshDrawIndexed: {
+      struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed *body =
+          (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
                         offset:body->index_buffer_offset
                        atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
@@ -1447,8 +1447,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       break;
     }
 
-    case WMTRenderCommandDXMTTessellationMeshDrawIndirect: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *)next;
+    case WMTRenderCommandD3DalloyTessellationMeshDrawIndirect: {
+      struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indirect *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
                         offset:body->indirect_args_offset
                        atIndex:SM50_BINDING_INDEX_INDIRECT_ARGUMENTS];
@@ -1461,9 +1461,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                        atIndex:SM50_BINDING_INDEX_DRAW_ARGUMENTS];
       break;
     }
-    case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect: {
-      struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *body =
-          (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *)next;
+    case WMTRenderCommandD3DalloyTessellationMeshDrawIndexedIndirect: {
+      struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed_indirect *body =
+          (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed_indirect *)next;
       [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer
                         offset:body->index_buffer_offset
                        atIndex:SM50_BINDING_INDEX_INDEX_BUFFER];
@@ -3121,7 +3121,7 @@ UInt32ToPtr(uint32_t v) {
   return (void *)(base + v);
 }
 
-#ifndef DXMT_NATIVE
+#ifndef D3DALLOY_NATIVE
 
 static NTSTATUS
 thunk32_SM50Initialize(void *args) {
@@ -3967,7 +3967,7 @@ thunk32_SM50WGCompileNode(void *args) {
   free(exports); free(libraries);
   return STATUS_SUCCESS;
 }
-#endif /* DXMT_NATIVE */
+#endif /* D3DALLOY_NATIVE */
 
 static NTSTATUS
 _MTLCommandBuffer_error(void *obj) {
@@ -4306,7 +4306,7 @@ _MTLSharedEvent_signalValue(void *obj) {
   return STATUS_SUCCESS;
 }
 
-#ifndef DXMT_NATIVE
+#ifndef D3DALLOY_NATIVE
 
 // Callback blocks retain this state independently of the device and of the
 // Wine notification thread. Destroy marks it closed; callbacks which arrive
@@ -5093,21 +5093,21 @@ _MTLIntersectionFunctionTable_setVisibleFunctionTable(void *obj) {
 static NTSTATUS
 _WMTASDescriptor_new(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_descriptor_new(params->args[2], (uint32_t)params->args[0], (uint32_t)params->args[1]);
+  params->ret[0] = d3dalloy_as_descriptor_new(params->args[2], (uint32_t)params->args[0], (uint32_t)params->args[1]);
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _WMTASDescriptor_setUsage(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  dxmt_as_descriptor_set_usage(params->args[0], (uint32_t)params->args[1]);
+  d3dalloy_as_descriptor_set_usage(params->args[0], (uint32_t)params->args[1]);
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _WMTASDescriptor_setTriangles(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_descriptor_set_triangles(
+  params->ret[0] = d3dalloy_as_descriptor_set_triangles(
       params->args[0], (uint32_t)params->args[1], params->args[2], params->args[3], params->args[4],
       params->args[5], params->args[6], (uint32_t)params->args[7], params->args[8], params->args[9],
       params->args[10], (uint32_t)params->args[11], (uint32_t)params->args[12], (uint32_t)params->args[13]
@@ -5118,7 +5118,7 @@ _WMTASDescriptor_setTriangles(void *obj) {
 static NTSTATUS
 _WMTASDescriptor_setAABBs(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_descriptor_set_aabbs(
+  params->ret[0] = d3dalloy_as_descriptor_set_aabbs(
       params->args[0], (uint32_t)params->args[1], params->args[2], params->args[3], params->args[4],
       params->args[5], (uint32_t)params->args[6], (uint32_t)params->args[7]
   );
@@ -5128,7 +5128,7 @@ _WMTASDescriptor_setAABBs(void *obj) {
 static NTSTATUS
 _WMTASDescriptor_setInstances(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_descriptor_set_instances(
+  params->ret[0] = d3dalloy_as_descriptor_set_instances(
       params->args[0], params->args[1], params->args[2], params->args[3]
   );
   return STATUS_SUCCESS;
@@ -5137,7 +5137,7 @@ _WMTASDescriptor_setInstances(void *obj) {
 static NTSTATUS
 _WMTDevice_getASSizes(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  struct dxmt_as_sizes sizes = dxmt_as_get_sizes(params->args[0], params->args[1]);
+  struct d3dalloy_as_sizes sizes = d3dalloy_as_get_sizes(params->args[0], params->args[1]);
   params->ret[0] = sizes.acceleration_structure_size;
   params->ret[1] = sizes.build_scratch_size;
   params->ret[2] = sizes.refit_scratch_size;
@@ -5147,7 +5147,7 @@ _WMTDevice_getASSizes(void *obj) {
 static NTSTATUS
 _WMTASSidecar_new(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_sidecar_new(params->args[0], params->args[1], params->args[2]);
+  params->ret[0] = d3dalloy_as_sidecar_new(params->args[0], params->args[1], params->args[2]);
   return STATUS_SUCCESS;
 }
 
@@ -5158,19 +5158,19 @@ _WMTASSidecar_new(void *obj) {
     return STATUS_SUCCESS;                                                                         \
   }
 
-WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_accelerationStructure, dxmt_as_sidecar_acceleration_structure)
-WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_instanceBuffer, dxmt_as_sidecar_instance_buffer)
-WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_contributionBuffer, dxmt_as_sidecar_contribution_buffer)
-WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_resourceID, dxmt_as_sidecar_resource_id)
-WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_contributionGPUAddress, dxmt_as_sidecar_contribution_gpu_address)
-WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_size, dxmt_as_sidecar_size)
-WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_instanceCount, dxmt_as_sidecar_instance_count)
-WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_generations, dxmt_as_sidecar_generations)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_accelerationStructure, d3dalloy_as_sidecar_acceleration_structure)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_instanceBuffer, d3dalloy_as_sidecar_instance_buffer)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_contributionBuffer, d3dalloy_as_sidecar_contribution_buffer)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_resourceID, d3dalloy_as_sidecar_resource_id)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_contributionGPUAddress, d3dalloy_as_sidecar_contribution_gpu_address)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_size, d3dalloy_as_sidecar_size)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_instanceCount, d3dalloy_as_sidecar_instance_count)
+WMT_AS_SIDECAR_HANDLE(_WMTASSidecar_generations, d3dalloy_as_sidecar_generations)
 
 static NTSTATUS
 _WMTASSidecar_allocate(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_sidecar_allocate(params->args[0], params->args[1], params->args[2], params->args[3]);
+  params->ret[0] = d3dalloy_as_sidecar_allocate(params->args[0], params->args[1], params->args[2], params->args[3]);
   return STATUS_SUCCESS;
 }
 
@@ -5187,7 +5187,7 @@ _WMTCommandBuffer_accelerationStructureCommandEncoder(void *obj) {
 static NTSTATUS
 _WMTASEncoder_build(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_encode_build(
+  params->ret[0] = d3dalloy_as_encode_build(
       params->args[0], params->args[1], params->args[2], params->args[3], params->args[4]
   );
   return STATUS_SUCCESS;
@@ -5196,7 +5196,7 @@ _WMTASEncoder_build(void *obj) {
 static NTSTATUS
 _WMTASEncoder_refit(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_encode_refit(
+  params->ret[0] = d3dalloy_as_encode_refit(
       params->args[0], params->args[1], params->args[2], params->args[3], params->args[4], params->args[5]
   );
   return STATUS_SUCCESS;
@@ -5205,7 +5205,7 @@ _WMTASEncoder_refit(void *obj) {
 static NTSTATUS
 _WMTASEncoder_copy(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  params->ret[0] = dxmt_as_encode_copy(
+  params->ret[0] = d3dalloy_as_encode_copy(
       params->args[0], params->args[1], params->args[2], (uint32_t)params->args[3]
   );
   return STATUS_SUCCESS;
@@ -5214,19 +5214,19 @@ _WMTASEncoder_copy(void *obj) {
 static NTSTATUS
 _WMTASEncoder_compactedSize(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  dxmt_as_encode_compacted_size(params->args[0], params->args[1], params->args[2], params->args[3]);
+  d3dalloy_as_encode_compacted_size(params->args[0], params->args[1], params->args[2], params->args[3]);
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _WMTComputeEncoder_encodeASPrepass(void *obj) {
   struct unixcall_wmt_as *params = obj;
-  struct dxmt_as_prepass_params info = {
+  struct d3dalloy_as_prepass_params info = {
       params->args[12], params->args[13], (uint32_t)params->args[14], (uint32_t)params->args[15],
       (uint32_t)params->args[16], (uint32_t)params->args[17], (uint32_t)params->args[18],
       (uint32_t)params->args[19], (uint32_t)params->args[20]
   };
-  params->ret[0] = dxmt_as_encode_prepass(
+  params->ret[0] = d3dalloy_as_encode_prepass(
       params->args[0], params->args[1], params->args[2], params->args[3], params->args[4],
       params->args[5], params->args[6], params->args[7], params->args[8], params->args[9],
       params->args[10], params->args[11], &info
@@ -5251,14 +5251,14 @@ _WMTASEncoder_fence(void *obj) {
 /* gpuResourceID is declared by the concrete Metal resource protocols (function tables,
  * acceleration structures, ...), not by MTLResource itself, so name the requirement here and
  * let Objective-C dispatch resolve the receiver. */
-@protocol DXMTGPUResourceIdentity <NSObject>
+@protocol D3DALLOYGPUResourceIdentity <NSObject>
 @property (readonly) MTLResourceID gpuResourceID;
 @end
 
 static NTSTATUS
 _MTLResource_gpuResourceID(void *obj) {
   struct unixcall_wmt_resource_id *params = obj;
-  params->ret = [(id<DXMTGPUResourceIdentity>)params->resource gpuResourceID]._impl;
+  params->ret = [(id<D3DALLOYGPUResourceIdentity>)params->resource gpuResourceID]._impl;
   return STATUS_SUCCESS;
 }
 
@@ -6346,7 +6346,7 @@ _WMTShareRendezvousLookUp(void *obj) {
   request.msgh_size = sizeof(request);
   request.msgh_remote_port = service;
   request.msgh_local_port = reply_port;
-  request.msgh_id = 0x44584d54; /* 'DXMT' */
+  request.msgh_id = 0x4433414c; /* 'D3AL' */
   kr = mach_msg(&request, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(request), 0, MACH_PORT_NULL, 2000,
                 MACH_PORT_NULL);
   mach_port_deallocate(mach_task_self(), service);
@@ -6380,7 +6380,7 @@ _WMTShareRendezvousLookUp(void *obj) {
 - (IOSurfaceRef)ioSurface;
 @end
 
-@interface NSObject (DXMTShareIdentity)
+@interface NSObject (D3DalloyShareIdentity)
 - (uint64_t)globalTraceObjectID;
 - (id)baseObject;
 @end
@@ -6812,7 +6812,7 @@ const void *__wine_unix_call_funcs[] = {
 _Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == 321,
                "PE64/native composition dispatch index");
 
-#ifndef DXMT_NATIVE
+#ifndef D3DALLOY_NATIVE
 const void *__wine_unix_call_wow64_funcs[] = {
     &_NSObject_retain,
     &_NSObject_release,

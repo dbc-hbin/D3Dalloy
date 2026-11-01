@@ -4,12 +4,12 @@
 #include "d3d12_device.hpp"
 #include "com/com_object.hpp"
 #include "winemetal_metal4_fg.h"
-#include "dxmt_buffer.hpp"
+#include "d3dalloy_buffer.hpp"
 #include <cstring>
 #include <mutex>
 #include <new>
 
-namespace dxmt {
+namespace d3dalloy {
 namespace {
 HRESULT nativeResult(uint64_t result) {
   switch (result) {
@@ -329,4 +329,4 @@ void EncodeOwnedFrameGenerationFrame(const std::shared_ptr<OwnedFrameGenerationF
   // Commit even partial native work before signaling, so another queue cannot strand.
   signal_event(core.timeline, sequence);
 }
-} // namespace dxmt
+} // namespace d3dalloy

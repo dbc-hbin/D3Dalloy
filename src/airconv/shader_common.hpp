@@ -5,7 +5,7 @@
  * implementation-independent in case we need these for other projects
  */
 
-namespace dxmt::shader::common {
+namespace d3dalloy::shader::common {
 
 enum class ScalerDataType {
   Float,
@@ -62,4 +62,4 @@ enum class InputAttribute {
   GSInstanceId,
 };
 
-} // namespace dxmt::shader::common
+} // namespace d3dalloy::shader::common

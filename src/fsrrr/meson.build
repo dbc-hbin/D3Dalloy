@@ -1,7 +1,7 @@
 fsrrr_dll = shared_library('amd_fidelityfx_denoiser_dx12', 'fsrrr.c', 'fsrrr_backend.cpp',
   name_prefix         : '',
   dependencies        : [ util_dep ],
-  include_directories : [ dxmt_include_path ],
+  include_directories : [ d3dalloy_include_path ],
   install             : true,
   install_dir         : windows_builtin_install_dir,
   vs_module_defs      : 'fsrrr.def',

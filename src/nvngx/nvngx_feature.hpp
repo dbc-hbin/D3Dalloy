@@ -2,7 +2,7 @@
 #include "nvngx.hpp"
 #include <cstdint>
 
-namespace dxmt {
+namespace d3dalloy {
 
 struct CommonFeature {
   unsigned int handle;

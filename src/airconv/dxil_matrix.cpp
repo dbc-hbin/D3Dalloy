@@ -21,7 +21,7 @@
 #include <cmath>
 
 using namespace llvm;
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 namespace {
 struct Descriptor {
   unsigned component=0, rows=0, cols=0, use=0, scope=1, fragment=0;
@@ -493,7 +493,7 @@ public:
     if(auto error=remapMatrices())return error;
     SmallVector<CallInst *,32> calls;
     for(Function &function:module)if(!function.isDeclaration())for(Instruction &instruction:instructions(function))if(auto *call=dyn_cast<CallInst>(&instruction)){auto operation=classify(*call);if(!operation)return operation.takeError();if(operation->index){calls.push_back(call);if(!needsSnapshot(*call,*operation))continue;uint64_t bytes=0;SmallPtrSet<Value *,4> inputs;for(Value *argument:call->args())if(inputs.insert(argument).second){auto found=types.descriptions.find(argument->getType());if(found!=types.descriptions.end() && found->second.scope==2)bytes=((bytes+7)&~uint64_t(7))+uint64_t(cells(found->second))*types.group_threads*(componentBits(found->second.component)/8);}scratch_bytes=std::max(scratch_bytes,bytes);}}
-    if(scratch_bytes) {scratch=new GlobalVariable(module,ArrayType::get(builder.getInt8Ty(),scratch_bytes),false,GlobalValue::InternalLinkage,UndefValue::get(ArrayType::get(builder.getInt8Ty(),scratch_bytes)),"dxmt.matrix.snapshot",nullptr,GlobalVariable::NotThreadLocal,3);scratch->setAlignment(Align(8));}
+    if(scratch_bytes) {scratch=new GlobalVariable(module,ArrayType::get(builder.getInt8Ty(),scratch_bytes),false,GlobalValue::InternalLinkage,UndefValue::get(ArrayType::get(builder.getInt8Ty(),scratch_bytes)),"d3dalloy.matrix.snapshot",nullptr,GlobalVariable::NotThreadLocal,3);scratch->setAlignment(Align(8));}
     for(CallInst *call:calls) {position=call;builder.SetInsertPoint(call);auto operation=classify(*call);if(!operation)return operation.takeError();if(auto error=snapshotInputs(call,*operation))return error;if(auto error=operation->legacy?legacy(call,operation->index):successor(call,*operation))return error;}
     for(AllocaInst *allocation:obsolete_allocas) {SmallVector<Instruction *,8> dead;for(User *user:allocation->users())if(auto *cast=dyn_cast<BitCastInst>(user)){for(User *use:cast->users())if(auto *intrinsic=dyn_cast<IntrinsicInst>(use);intrinsic && (intrinsic->getIntrinsicID()==Intrinsic::lifetime_start || intrinsic->getIntrinsicID()==Intrinsic::lifetime_end))dead.push_back(intrinsic);else return createError("dxil: WaveMatrix object escapes through a pointer cast");dead.push_back(cast);}else return createError("dxil: WaveMatrix object escapes its intrinsic contract");for(Instruction *instruction:dead)instruction->eraseFromParent();allocation->eraseFromParent();}
     return Error::success();
@@ -553,7 +553,7 @@ Error LowerMatrices(ModuleInfo &info) {
     if(auto *call=dyn_cast<CallInst>(&instruction);call && call->getCalledFunction() && call->getCalledFunction()->getName().startswith("dx.op.waveMatrix_"))wave=true;
   // Matrix distribution is fixed to 32, even when a ranged WaveSize prefers
   // fewer lanes. Validation above proves the declared range includes 32.
-  if(wave)info.module->setModuleFlag(Module::Error,"dxmt.wave-size",ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(info.module->getContext()),32)));
+  if(wave)info.module->setModuleFlag(Module::Error,"d3dalloy.wave-size",ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(info.module->getContext()),32)));
   return MatrixLowerer(info,std::move(*records)).run();
 }
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

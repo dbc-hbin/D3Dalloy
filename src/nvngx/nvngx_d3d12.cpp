@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace dxmt {
+namespace d3dalloy {
 
 extern "C" {
 unsigned long long owned_ngxd3d12_msvc_parameter_size();
@@ -1317,4 +1317,4 @@ NVSDK_NGX_D3D12_GetFeatureRequirements(
   return kResultSuccess;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

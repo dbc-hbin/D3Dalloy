@@ -24,7 +24,7 @@
 #include "com/com_pointer.hpp"
 #include "wsi_platform.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D12HeapImpl : public MTLD3D12Pageable<MTLD3D12Heap> {
 
@@ -304,4 +304,4 @@ CreateHeapFromFileMapping(MTLD3D12Device *pDevice, HANDLE hFileMapping, REFIID r
   return CreateHostMemoryHeap(pDevice, view, 0, view, riid, ppHeap);
 }
 
-}; // namespace dxmt
+}; // namespace d3dalloy

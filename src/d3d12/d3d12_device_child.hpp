@@ -27,7 +27,7 @@ const GUID kWKPDID_D3DDebugObjectNameW = {0x4cca5fd8, 0x921f, 0x42c8, 0x85, 0x66
 
 #endif
 
-namespace dxmt {
+namespace d3dalloy {
 template <typename... Base> class MTLD3D12Object : public Base... {
 public:
   MTLD3D12Object() {}
@@ -79,4 +79,4 @@ protected:
   MTLD3D12Device *device_;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

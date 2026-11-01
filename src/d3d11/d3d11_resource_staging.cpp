@@ -1,9 +1,9 @@
 #include "d3d11_private.h"
 #include "d3d11_enumerable.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_staging.hpp"
+#include "d3dalloy_dynamic.hpp"
+#include "d3dalloy_staging.hpp"
 #include "d3d11_resource.hpp"
-namespace dxmt {
+namespace d3dalloy {
 
 #pragma region StagingBuffer
 
@@ -165,4 +165,4 @@ CreateStagingTexture3D(MTLD3D11Device *pDevice,
                                                       pInitialData, ppTexture);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

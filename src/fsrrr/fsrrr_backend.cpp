@@ -12,7 +12,7 @@
 #include <mutex>
 #include <new>
 
-using dxmt::Com;
+using d3dalloy::Com;
 namespace {
 constexpr uint32_t kOk = FFX_API_RETURN_OK, kRuntime = FFX_API_RETURN_ERROR_RUNTIME_ERROR,
     kNoProvider = FFX_API_RETURN_NO_PROVIDER, kMemory = FFX_API_RETURN_ERROR_MEMORY,

@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace dxmt::rr {
+namespace d3dalloy::rr {
 namespace {
 
 class Object {
@@ -225,13 +225,13 @@ History::~History() {
         for (auto& allocation : reconstructedAlpha) feature->recycle(allocation,width,height);
     }
 }
-} // namespace dxmt::rr
+} // namespace d3dalloy::rr
 
-@interface MTLFXTemporalDenoisedScalerDescriptor (DXMTAmdRRBackend)
+@interface MTLFXTemporalDenoisedScalerDescriptor (D3DalloyAmdRRBackend)
 - (void)setVersion:(NSUInteger)version;
 @end
 
-namespace dxmt::rr {
+namespace d3dalloy::rr {
 static std::shared_ptr<NeuralGeneration> makeNeuralGeneration(Feature::Impl& feature,
     uint32_t width, uint32_t height, Error* error) {
     if (@available(macOS 26.0,*)) {
@@ -997,4 +997,4 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
     } @catch (NSException* e) { return fail(error,ErrorCode::EncodeFailed,e.reason.UTF8String); }
     } catch (...) { return fail(error,ErrorCode::ResourceCreationFailed,"RR execution allocation failed"); }
 }
-} // namespace dxmt::rr
+} // namespace d3dalloy::rr

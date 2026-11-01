@@ -22,7 +22,7 @@
  * DirectX-Headers v1.614.1 (include/directx/d3d12.h). Each owner keeps its own section.
  *
  * Declarations that exist in some but not all of the supported headers (enumerators
- * such as the directly-indexed root signature flags) are provided as `dxmt::` constants
+ * such as the directly-indexed root signature flags) are provided as `d3dalloy::` constants
  * instead of redeclared, so either header compiles.
  */
 
@@ -70,7 +70,7 @@ ID3D12CommandQueue1 : public ID3D12CommandQueue {
 __CRT_UUID_DECL(ID3D12CommandQueue1, 0x3a3c3165, 0x0ee7, 0x4b8e, 0xa0, 0xaf, 0x63, 0x56, 0xb4, 0xc3, 0xbb, 0xb9)
 #endif
 #endif
-namespace dxmt {
+namespace d3dalloy {
 constexpr UINT kCommandQueueFlagAllowDynamicPriority = 0x2;
 constexpr UINT kFeatureHardwareSchedulingQueueGroupings = 60;
 }
@@ -78,8 +78,8 @@ constexpr UINT kFeatureHardwareSchedulingQueueGroupings = 60;
 
 // ---- BINDLESS: root signature 1.2 / static sampler flags ----
 
-#ifndef DXMT_D3D12_ROOT_SIGNATURE_1_2_DECLARED
-#define DXMT_D3D12_ROOT_SIGNATURE_1_2_DECLARED
+#ifndef D3DALLOY_D3D12_ROOT_SIGNATURE_1_2_DECLARED
+#define D3DALLOY_D3D12_ROOT_SIGNATURE_1_2_DECLARED
 
 typedef enum D3D12_SAMPLER_FLAGS {
   D3D12_SAMPLER_FLAG_NONE = 0,
@@ -114,7 +114,7 @@ typedef struct D3D12_ROOT_SIGNATURE_DESC2 {
 
 #endif
 
-namespace dxmt {
+namespace d3dalloy {
 
 constexpr D3D_ROOT_SIGNATURE_VERSION kRootSignatureVersion_1_2 = static_cast<D3D_ROOT_SIGNATURE_VERSION>(0x3);
 
@@ -147,7 +147,7 @@ struct VersionedRootSignatureDesc {
 static_assert(sizeof(VersionedRootSignatureDesc) == sizeof(D3D12_VERSIONED_ROOT_SIGNATURE_DESC));
 static_assert(sizeof(D3D12_STATIC_SAMPLER_DESC1) == sizeof(D3D12_STATIC_SAMPLER_DESC) + sizeof(UINT));
 
-} // namespace dxmt
+} // namespace d3dalloy
 
 // ---- end BINDLESS ----
 
@@ -161,8 +161,8 @@ static_assert(sizeof(D3D12_STATIC_SAMPLER_DESC1) == sizeof(D3D12_STATIC_SAMPLER_
 
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
 
-#ifndef DXMT_D3D12_SAMPLER_DESC2_DECLARED
-#define DXMT_D3D12_SAMPLER_DESC2_DECLARED
+#ifndef D3DALLOY_D3D12_SAMPLER_DESC2_DECLARED
+#define D3DALLOY_D3D12_SAMPLER_DESC2_DECLARED
 typedef struct D3D12_SAMPLER_DESC2 {
   D3D12_FILTER Filter;
   D3D12_TEXTURE_ADDRESS_MODE AddressU;
@@ -181,7 +181,7 @@ typedef struct D3D12_SAMPLER_DESC2 {
 } D3D12_SAMPLER_DESC2;
 #endif
 
-namespace dxmt {
+namespace d3dalloy {
 
 // Plain integers: the toolchain enums do not contain these values, so an enum cast is not a
 // constant expression.
@@ -192,7 +192,7 @@ constexpr UINT kBarrierLayoutDirectQueueGenericReadComputeQueueAccessible = 31;
 /* D3D12_HEAP_TYPE_GPU_UPLOAD (D3D12GPUUploadHeaps spec); absent from the toolchain enum. */
 constexpr D3D12_HEAP_TYPE kHeapTypeGpuUpload = static_cast<D3D12_HEAP_TYPE>(5);
 
-} // namespace dxmt
+} // namespace d3dalloy
 
 #if defined(__cplusplus) && !defined(CINTERFACE)
 
@@ -278,12 +278,12 @@ __CRT_UUID_DECL(ID3D12GraphicsCommandList9, 0x34ed2808, 0xffe6, 0x4c2b, 0xb1, 0x
 //
 // Copied from microsoft/DirectX-Headers commit adbd6f3ba40795c46a8d0f33af00bcb57ff0f0a4
 // (include/directx/d3d12.h). The llvm-mingw d3d12.h has none of the work graph declarations;
-// enum values it lacks are dxmt:: constants so no out-of-range enum cast is needed.
+// enum values it lacks are d3dalloy:: constants so no out-of-range enum cast is needed.
 
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
 
-#ifndef DXMT_D3D12_WORK_GRAPHS_DECLARED
-#define DXMT_D3D12_WORK_GRAPHS_DECLARED
+#ifndef D3DALLOY_D3D12_WORK_GRAPHS_DECLARED
+#define D3DALLOY_D3D12_WORK_GRAPHS_DECLARED
 
 typedef enum D3D12_WORK_GRAPHS_TIER {
   D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED = 0,
@@ -423,9 +423,9 @@ typedef struct D3D12_DISPATCH_GRAPH_DESC {
   };
 } D3D12_DISPATCH_GRAPH_DESC;
 
-#endif // DXMT_D3D12_WORK_GRAPHS_DECLARED
+#endif // D3DALLOY_D3D12_WORK_GRAPHS_DECLARED
 
-namespace dxmt {
+namespace d3dalloy {
 
 constexpr UINT kFeatureD3D12Options21 = 53;
 constexpr UINT kWorkGraphsTier1_0 = 10;
@@ -447,7 +447,7 @@ constexpr UINT kDispatchModeMultiNodeGPUInput = 3;
 constexpr UINT kWorkGraphsBackingMemoryAlignment = 8;
 constexpr UINT kWorkGraphsMaxNodeDepth = 32;
 
-} // namespace dxmt
+} // namespace d3dalloy
 
 #if defined(__cplusplus) && !defined(CINTERFACE)
 
@@ -610,7 +610,7 @@ typedef struct D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_POSTBUILD_INFO_TOOLS_VISU
   UINT64 DecodedSizeInBytes;
 } D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_POSTBUILD_INFO_TOOLS_VISUALIZATION_DESC;
 #endif
-namespace dxmt {
+namespace d3dalloy {
 struct OmmGeometryDesc {
   D3D12_RAYTRACING_GEOMETRY_TYPE Type;
   D3D12_RAYTRACING_GEOMETRY_FLAGS Flags;
@@ -638,7 +638,7 @@ static_assert(sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC) == 8);
 static_assert(sizeof(D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC) == 32);
 static_assert(sizeof(D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER1) == 56);
 static_assert(sizeof(D3D12_RAYTRACING_SERIALIZED_BLOCK) == 16);
-} // namespace dxmt
+} // namespace d3dalloy
 // ---- end OPACITY MICROMAPS ----
 #endif // __ID3D12Device5_INTERFACE_DEFINED__
 

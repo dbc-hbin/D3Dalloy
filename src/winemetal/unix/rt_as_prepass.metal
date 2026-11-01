@@ -1,5 +1,5 @@
 /*
- * DXMT acceleration-structure prepass kernels.
+ * D3Dalloy acceleration-structure prepass kernels.
  *
  * These run on the application's own command buffer immediately before a Metal
  * acceleration-structure build/refit/copy is encoded, so everything they write is ordered
@@ -7,14 +7,14 @@
  * in-flight frame from the CPU).
  *
  * Ordered GPU jobs:
- *  1. dxmt_as_prepass - publish the native identifiers in the 64-byte ASHeader
+ *  1. d3dalloy_as_prepass - publish the native identifiers in the 64-byte ASHeader
  *     that our own ray-tracing shaders dereference (the D3D12
  *     acceleration-structure GPUVA *is* the address of this header), and, for top-level
  *     builds, translate the application's D3D12_RAYTRACING_INSTANCE_DESC array into the
  *     MTLIndirectAccelerationStructureInstanceDescriptor array Metal's TLAS build consumes
  *     plus the per-instance contribution words our ray-tracing shaders read.
- *  2. dxmt_as_shadow - preserve self-contained build inputs and query metadata.
- *  3. dxmt_as_postbuild / serialize / deserialize / visualize - consume that shadow
+ *  2. d3dalloy_as_shadow - preserve self-contained build inputs and query metadata.
+ *  3. d3dalloy_as_postbuild / serialize / deserialize / visualize - consume that shadow
  *     in application GPU command order, including public TLAS relocation pointers.
  *
  * D3D12_RAYTRACING_INSTANCE_DESC (64 B) is NOT layout-compatible with any Metal instance
@@ -22,7 +22,7 @@
  * acceleration-structure resource id @64, while D3D puts InstanceID|InstanceMask @48,
  * InstanceContributionToHitGroupIndex|Flags @52 and a 64-bit acceleration-structure GPUVA
  * @56. The Metal side therefore needs a real translation; the resource id is recovered by
- * loading the dxmt header at that GPUVA (every acceleration-structure address dxmt builds
+ * loading the d3dalloy header at that GPUVA (every acceleration-structure address d3dalloy builds
  * into carries one).
  */
 
@@ -57,7 +57,7 @@ struct ShadowParams {
   ShadowMetadata metadata;
 };
 
-kernel void dxmt_as_shadow(constant ShadowParams &p [[buffer(0)]],
+kernel void d3dalloy_as_shadow(constant ShadowParams &p [[buffer(0)]],
     device const ShadowGeometry *geometries [[buffer(1)]], device const ShadowJob *jobs [[buffer(2)]],
     uint tid [[thread_position_in_grid]]) {
   device ASHeader *dst = (device ASHeader *)p.asAddress;
@@ -86,7 +86,7 @@ kernel void dxmt_as_shadow(constant ShadowParams &p [[buffer(0)]],
 }
 
 struct PostbuildParams { ulong asAddress, destination; uint operation, reserved; };
-kernel void dxmt_as_postbuild(constant PostbuildParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+kernel void d3dalloy_as_postbuild(constant PostbuildParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   if (tid) return;
   device ASHeader *h = (device ASHeader *)p.asAddress;
   device ulong *out = (device ulong *)p.destination;
@@ -108,7 +108,7 @@ kernel void dxmt_as_postbuild(constant PostbuildParams &p [[buffer(0)]], uint ti
   }
 }
 struct SerializeParams { ulong source, destination; uint identifier[8]; };
-kernel void dxmt_as_serialize(constant SerializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+kernel void d3dalloy_as_serialize(constant SerializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   device const ASHeader *h = (device const ASHeader *)p.source;
   const ulong pointers = h->type == 0 ? h->descCount : 0;
   const ulong ommPointers = h->type == 1 && h->reserved0 ? h->reserved0 - 1 : 0;
@@ -134,7 +134,7 @@ kernel void dxmt_as_serialize(constant SerializeParams &p [[buffer(0)]], uint ti
     dst[offset + i] = ((device const uchar *)h)[i];
 }
 struct DeserializeParams { ulong source, destination, currentSize; };
-kernel void dxmt_as_deserialize(constant DeserializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+kernel void d3dalloy_as_deserialize(constant DeserializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   device const ulong *src = (device const ulong *)p.source;
   const bool blocks = uint(src[6] >> 32) == 0xffffffffu;
   const ulong pointers = blocks ? src[8] : src[6];
@@ -158,7 +158,7 @@ kernel void dxmt_as_deserialize(constant DeserializeParams &p [[buffer(0)]], uin
   if (tid == 0) dst->currentSize = p.currentSize;
 }
 struct VisualizeParams { ulong source, destination; };
-kernel void dxmt_as_visualize(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+kernel void d3dalloy_as_visualize(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   device const ASHeader *h = (device const ASHeader *)p.source;
   device uchar *dst = (device uchar *)p.destination;
   if (tid == 0) { ((device uint *)dst)[0] = h->type; ((device uint *)dst)[1] = h->descCount; }
@@ -166,7 +166,7 @@ kernel void dxmt_as_visualize(constant VisualizeParams &p [[buffer(0)]], uint ti
   for (ulong i = tid; i < h->shadowSize; i += 4096)
     dst[8 + i] = ((device const uchar *)h)[64 + i];
 }
-kernel void dxmt_as_visualize_descriptors(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+kernel void d3dalloy_as_visualize_descriptors(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   device const ASHeader *h = (device const ASHeader *)p.source;
   if (h->type == 2) {
     device const ShadowGeometry *g = (device const ShadowGeometry *)(p.source + 64);
@@ -225,7 +225,7 @@ kernel void dxmt_as_visualize_descriptors(constant VisualizeParams &p [[buffer(0
   }
 }
 
-struct DXMTASPrepassParams
+struct D3DALLOYASPrepassParams
 {
     /* MTLAccelerationStructure.gpuResourceID written into the header (opaque resource id). */
     ulong asResourceID;
@@ -248,10 +248,10 @@ struct DXMTASPrepassParams
 };
 
 kernel void
-dxmt_as_prepass(
+d3dalloy_as_prepass(
     device const uchar *srcInstances [[buffer(0)]], device uchar *dstInstances [[buffer(1)]],
     device ulong *header [[buffer(2)]], device uint *contributions [[buffer(3)]],
-    constant DXMTASPrepassParams &params [[buffer(4)]],
+    constant D3DALLOYASPrepassParams &params [[buffer(4)]],
     device uint *liveMirror [[buffer(5)]], uint tid [[thread_position_in_grid]]
 ) {
   if (tid == 0) {
@@ -317,7 +317,7 @@ dxmt_as_prepass(
   tail[3] = instance_id;
 
   /* AccelerationStructure field: D3D12_GPU_VIRTUAL_ADDRESS of the bottom-level structure. Every
-   * acceleration-structure address dxmt builds into holds the dxmt header, whose first 8 bytes
+   * acceleration-structure address d3dalloy builds into holds the d3dalloy header, whose first 8 bytes
    * are the Metal resource id the TLAS build needs. */
   device const ulong *as_address = (device const ulong *)(instance + 56);
   device ulong *resource_id = (device ulong *)(dstInstances + dst + 64);

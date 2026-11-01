@@ -245,14 +245,14 @@ unsafe fn publish<T>(out: *mut T, result: Result<T>) -> u32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_dxbc_program_parse(data: *const u8, length: u64, out: *mut Program) -> u32 {
+pub unsafe extern "C" fn d3dalloy_dxbc_program_parse(data: *const u8, length: u64, out: *mut Program) -> u32 {
     let result = (|| program(unsafe { input(data, length) }.ok_or(Error::InvalidArgument)?))();
     unsafe { publish(out, result) }
 }
 
 /// `operand_counts` holds one generic operand count per opcode below 236.
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_dxbc_instruction_parse(
+pub unsafe extern "C" fn d3dalloy_dxbc_instruction_parse(
     data: *const u8, length: u64, operand_counts: *const u8, opcode_count: u32, token_offset: u32,
     out: *mut Instruction,
 ) -> u32 {

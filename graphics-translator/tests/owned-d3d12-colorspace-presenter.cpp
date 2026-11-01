@@ -2,7 +2,7 @@
 // not Core Animation's subsequent color-managed compositing to the display.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include "dxmt_presenter.hpp"
+#include "d3dalloy_presenter.hpp"
 #include "Metal.hpp"
 #include "Metal4FX.hpp"
 #include "log/log.hpp"
@@ -16,7 +16,7 @@
 #include <future>
 #include <utility>
 
-namespace dxmt { Logger Logger::s_instance("owned-d3d12-colorspace-presenter.log"); }
+namespace d3dalloy { Logger Logger::s_instance("owned-d3d12-colorspace-presenter.log"); }
 
 namespace {
 constexpr unsigned kSize = 64;
@@ -102,8 +102,8 @@ struct Probe {
   obj_handle_t target = 0;
   bool composition = false;
   WMT::MetalLayer layer;
-  dxmt::InternalCommandLibrary library;
-  dxmt::Presenter presenter;
+  d3dalloy::InternalCommandLibrary library;
+  d3dalloy::Presenter presenter;
   WMT::Reference<WMT::Texture> input;
 
   static WMT::Device firstDevice(WMT::Array<WMT::Device> d) {
@@ -168,9 +168,9 @@ struct Probe {
   }
   struct Sample {
     float black, mid, high;
-    dxmt::DXMTPresentMetadata metadata;
+    d3dalloy::D3DalloyPresentMetadata metadata;
   };
-  Sample render(dxmt::Presenter::PresentState state, const char *label, unsigned size = kSize,
+  Sample render(d3dalloy::Presenter::PresentState state, const char *label, unsigned size = kSize,
                 const double (*expected)[4] = nullptr) {
     step = label;
     const unsigned row = size * 4 * sizeof(unsigned short);
@@ -319,7 +319,7 @@ int main(int argc, char **argv) {
       composition.input.replaceRegion({0, 0, 0}, {kSize, kSize, 1}, 0, 0, upload,
                                      kSize * 8, sizeof(upload));
       composition.presenter.changeLayerProperties(WMTPixelFormatRGBA16Float, space, kSize, kSize, 1,
-                                                 dxmt::DXMTPresentAlpha::Premultiplied);
+                                                 d3dalloy::D3DalloyPresentAlpha::Premultiplied);
       auto state = composition.presenter.synchronizeLayerProperties(true);
       WMTLayerProps props{}; composition.layer.getProps(props);
       require(props.pixel_format == WMTPixelFormatRGBA16Float && !props.opaque, "transparent FP16 layer");

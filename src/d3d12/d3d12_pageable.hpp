@@ -23,7 +23,7 @@
 #include <limits>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 /*
  * Residency is an explicit property of the pageable object, not of each COM
@@ -126,4 +126,4 @@ public:
 
 using MTLD3D12PageableCommon = MTLD3D12Pageable<ID3D12Pageable>;
 
-}; // namespace dxmt
+}; // namespace d3dalloy

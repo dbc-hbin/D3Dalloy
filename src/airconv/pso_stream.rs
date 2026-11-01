@@ -81,7 +81,7 @@ fn next(bytes: &[u8], layouts: &[Layout; TYPES], offset: u64, defined: u64) -> R
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pso_stream_next(
+pub unsafe extern "C" fn d3dalloy_pso_stream_next(
     data: *const u8, length: u64, layouts: *const Layout, offset: u64, defined: u64, out: *mut Subobject,
 ) -> u32 {
     let result = (|| {

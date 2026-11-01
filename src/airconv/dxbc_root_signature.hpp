@@ -26,7 +26,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 struct RawRootSignatureDesc {
   uint32_t Version;
@@ -257,7 +257,7 @@ public:
       return E_OUTOFMEMORY;
 
     memcpy(raw_root_sig_, pBytecode, DataSize);
-    if (!dxmt_validate_root_signature(raw_root_sig_, DataSize))
+    if (!d3dalloy_validate_root_signature(raw_root_sig_, DataSize))
       return E_INVALIDARG;
 
     desc_1_0_.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
@@ -331,4 +331,4 @@ private:
   std::vector<void *> malloc_ptrs_;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 #include <utility>
-namespace dxmt {
+namespace d3dalloy {
 class MTLD3D12Device;
 // Device-creation snapshot; selected Core identity and lease follow the device.
 struct RuntimeConfiguration {

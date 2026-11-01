@@ -2,7 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
 #include <rpc.h>
 #include <rpcndr.h>
 #if defined(__clang__) && defined(__MINGW32__)
@@ -14,7 +14,7 @@
 #undef MIDL_INTERFACE
 #define MIDL_INTERFACE(value) struct __declspec(uuid(value))
 #endif
-#include DXMT_MATRIX_PREVIEW_SDK_HEADER
+#include D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
 #else
 #include <d3d12.h>
 #include "../../src/d3d12/d3d12_interfaces_ext.hpp"
@@ -324,7 +324,7 @@ static void fence_barriers(ID3D12Device *device, ID3D12CommandQueue *producer, I
   for(UINT i=0;i<256;++i) require(mapped[i]==(unsigned(i)^0x59),"crossqueue result"); readback->Unmap(0,&empty);
   std::puts("MATRIX_RUNTIME_FENCE_BARRIERS_PASS crossqueue=1 rewind=1 async=1 lifetime=1 state_handoff=1");
 }
-#ifndef DXMT_MATRIX_RUNTIME_NO_MAIN
+#ifndef D3DALLOY_MATRIX_RUNTIME_NO_MAIN
 int main() {
   experimental_admission();
   ComPtr<ID3D12Device> device; check(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"device");
@@ -367,7 +367,7 @@ int main() {
   require(device->CheckFeatureSupport(D3D12_FEATURE(78),&query,sizeof(query)-1)==E_INVALIDARG,"query wrongsize");
   struct LegacyQuery {UINT input,m,n; BOOL supported; UINT k,accum,min,max;} legacy{2,1,1};
   check(device->CheckFeatureSupport(D3D12_FEATURE(38),&legacy,sizeof(legacy)),"legacy ABI");
-#ifdef DXMT_MATRIX_PREVIEW_SDK_HEADER
+#ifdef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
   constexpr UINT pinned_sdk=1;
 #else
   constexpr UINT pinned_sdk=0;

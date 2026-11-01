@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <tuple>
 
-namespace dxmt::atomic64 {
+namespace d3dalloy::atomic64 {
 
 enum class CanonicalKind : uint32_t { Buffer, HeapBytes, HostBytes, TextureUnits, HeapTextureUnits };
 
@@ -72,4 +72,4 @@ struct ArenaLayout {
   }
 };
 
-} // namespace dxmt::atomic64
+} // namespace d3dalloy::atomic64

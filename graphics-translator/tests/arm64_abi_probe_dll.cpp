@@ -4,7 +4,7 @@
 class Probe final : public AbiObject {
   ULONG refs_ = 1;
 public:
-  dxmt::Com<AbiObject> STDMETHODCALLTYPE Retain(UINT tag, void *address) override {
+  d3dalloy::Com<AbiObject> STDMETHODCALLTYPE Retain(UINT tag, void *address) override {
     if (tag != 0x41424931 || address != this) return nullptr;
     return this;
   }

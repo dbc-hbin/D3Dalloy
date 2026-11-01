@@ -4,7 +4,7 @@
 #include "llvm/IR/Type.h"
 #include <cassert>
 
-namespace dxmt::air {
+namespace d3dalloy::air {
 
 class AirType {
 
@@ -36,10 +36,10 @@ public:
   llvm::Type *_long;
   llvm::Type *_long4;
 
-  llvm::Type *_dxmt_vertex_buffer_entry;
-  llvm::Type *_dxmt_draw_arguments;
-  llvm::Type *_dxmt_draw_indexed_arguments;
-  llvm::Type *_dxmt_stream_output_buffer_entry;
+  llvm::Type *_d3dalloy_vertex_buffer_entry;
+  llvm::Type *_d3dalloy_draw_arguments;
+  llvm::Type *_d3dalloy_draw_indexed_arguments;
+  llvm::Type *_d3dalloy_stream_output_buffer_entry;
 
   llvm::Type *_sampler;
 
@@ -82,4 +82,4 @@ public:
 
   llvm::LLVMContext &context;
 };
-} // namespace dxmt
+} // namespace d3dalloy

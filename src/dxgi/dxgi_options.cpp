@@ -1,7 +1,7 @@
 #include "dxgi_options.hpp"
 #include <charconv>
 
-namespace dxmt {
+namespace d3dalloy {
 
 static int32_t parsePciId(const std::string &str) {
   if (str.size() != 4)
@@ -24,4 +24,4 @@ DxgiOptions::DxgiOptions(const Config &config) {
   this->forceSDR = config.getOption<bool>("dxgi.forceSDR", false);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

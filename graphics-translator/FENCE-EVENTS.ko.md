@@ -8,7 +8,7 @@
 
 GPU signal은 해당 queue의 ordered completion worker가 앞선 Metal submission 및 draw-capture/SO status를 검증하고 inflight/allocator/native lease를 해제·retire한 뒤 공개한다. Native event 값, encode 또는 enqueue는 완료 authority가 아니다. CPU signal은 logical 값을 즉시 게시하지만 GPU allocator retirement를 대신하지 않는다.
 
-소스: [`dxmt_queue_order.hpp`](../src/dxmt/dxmt_queue_order.hpp)의 `FenceOrderEpoch`/`FenceCompletionLatch`, [`dxmt_fence.cpp`](../src/dxmt/dxmt_fence.cpp)의 `prepareQueueWait`/`prepareWaitValue`, [`d3d12_command_queue.cpp`](../src/d3d12/d3d12_command_queue.cpp)의 `CommandBufferWaitingThread`.
+소스: [`d3dalloy_queue_order.hpp`](../src/d3dalloy/d3dalloy_queue_order.hpp)의 `FenceOrderEpoch`/`FenceCompletionLatch`, [`d3dalloy_fence.cpp`](../src/d3dalloy/d3dalloy_fence.cpp)의 `prepareQueueWait`/`prepareWaitValue`, [`d3d12_command_queue.cpp`](../src/d3d12/d3d12_command_queue.cpp)의 `CommandBufferWaitingThread`.
 
 ## Single·ANY·ALL·null event
 
@@ -22,7 +22,7 @@ GPU signal은 해당 queue의 ordered completion worker가 앞선 Metal submissi
 
 ## Shared fence의 observer 계약
 
-공유 fence는 공유 section의 [`SharedFenceTimeline`](../src/dxmt/dxmt_shared_fence.hpp)과 kernel mutex, Metal shared-event wakeup을 사용한다. **과거 bounded signal-token ring이나 native reservation의 완료값을 사용하는 모델이 아니다.**
+공유 fence는 공유 section의 [`SharedFenceTimeline`](../src/d3dalloy/d3dalloy_shared_fence.hpp)과 kernel mutex, Metal shared-event wakeup을 사용한다. **과거 bounded signal-token ring이나 native reservation의 완료값을 사용하는 모델이 아니다.**
 
 1. CPU signal 또는 검증된 queue retirement가 `publish(value)`를 실행한다. Shared timeline의 최신 logical value와 publication serial을 갱신한다.
 2. 각 live observer에는 자신이 아직 소비하지 않은 최대값인 **high-water**를 누적한다. 10→5가 observer 실행 사이에 모두 게시돼도 이미 등록한 threshold 10 wait를 놓치지 않는다.

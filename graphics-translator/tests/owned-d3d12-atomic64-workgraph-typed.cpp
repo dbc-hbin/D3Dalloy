@@ -1,8 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#ifndef DXMT_MATRIX_PREVIEW_SDK_HEADER
-#error Compile with the pinned public preview SDK in DXMT_MATRIX_PREVIEW_SDK_HEADER.
+#ifndef D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
+#error Compile with the pinned public preview SDK in D3DALLOY_MATRIX_PREVIEW_SDK_HEADER.
 #endif
 #include <rpc.h>
 #include <rpcndr.h>
@@ -13,7 +13,7 @@
 #undef MIDL_INTERFACE
 #define MIDL_INTERFACE(value) struct __declspec(uuid(value))
 #endif
-#include DXMT_MATRIX_PREVIEW_SDK_HEADER
+#include D3DALLOY_MATRIX_PREVIEW_SDK_HEADER
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>

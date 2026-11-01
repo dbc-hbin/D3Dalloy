@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 enum class RegisterComponentType : uint32_t {
   Unknown,
@@ -15,4 +15,4 @@ enum class RegisterComponentType : uint32_t {
 
 /* anything in CAPITAL is not handled properly yet (rename in progress) */
 
-} // namespace dxmt::dxbc
+} // namespace d3dalloy::dxbc

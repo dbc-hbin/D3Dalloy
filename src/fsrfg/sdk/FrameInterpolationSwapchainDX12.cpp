@@ -70,9 +70,9 @@ void InitPresentCallback(ffxCallbackDescFrameGenerationPresent& desc, ffxCallbac
     desc.header.pNext = &extra.header;
 }
 
-static dxmt::Com<IFrameInterpolationSwapChainDX12> getOwnedSwapchain(FfxSwapchain gameSwapChain)
+static d3dalloy::Com<IFrameInterpolationSwapChainDX12> getOwnedSwapchain(FfxSwapchain gameSwapChain)
 {
-    dxmt::Com<IFrameInterpolationSwapChainDX12> owned;
+    d3dalloy::Com<IFrameInterpolationSwapChainDX12> owned;
     auto swapChain = ffxGetDX12SwapchainPtr(gameSwapChain);
     if (swapChain && SUCCEEDED(swapChain->QueryInterface(IID_IFrameInterpolationSwapChainDX12, reinterpret_cast<void**>(&owned))))
         return owned;
@@ -286,7 +286,7 @@ FfxErrorCode ffxWaitForPresents(FfxSwapchain gameSwapChain)
 using PresentType = FrameinterpolationPresentInfoExt;
 using PresentCallbackType = ffxCallbackDescFrameGenerationPresent;
 
-// DXMT: TEST shares PresentResource's validation without consuming a frame or latency credit.
+// D3Dalloy: TEST shares PresentResource's validation without consuming a frame or latency credit.
 bool canPresentSource(IDXGISwapChain4* swapChain, ID3D12Resource* source)
 {
     IMTLD3D12ResourcePresent* direct = nullptr;
@@ -334,7 +334,7 @@ HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry,
 
     typename PacingData::FrameInfo& frameInfo = pacingEntry->frames[frameID];
 
-    // DXMT: only the unmodified built-in no-UI callback is a pure resource copy.
+    // D3Dalloy: only the unmodified built-in no-UI callback is a pure resource copy.
     frameInfo.presentSourceDirectly =
         !pacingEntry->drawDebugPacingLines && !pacingEntry->uiSurface.resource &&
         pacingEntry->presentCallback == ffxFrameInterpolationUiComposition &&
@@ -346,7 +346,7 @@ HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry,
         return S_OK;
     }
 
-    // DXMT: presenterThread already made presentQueue wait for the entry's interpolationCompletedFenceValue,
+    // D3Dalloy: presenterThread already made presentQueue wait for the entry's interpolationCompletedFenceValue,
     // which equals every frame's value, so the upstream per-interpolated-frame Wait is redundant.
 
     if (pacingEntry->drawDebugPacingLines)
@@ -389,7 +389,7 @@ HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry,
     SafeRelease(swapchainBackbuffer);
 
     presenter->presentQueue->Signal(presenter->compositionFenceGPU, frameInfo.presentIndex);
-    // DXMT: copied/UI sources are no longer read after composition. Preserve
+    // D3Dalloy: copied/UI sources are no longer read after composition. Preserve
     // their original reuse point rather than waiting through pacing/drawable work.
     presenter->presentQueue->Signal(presenter->sourceReleaseFence, frameInfo.presentIndex);
     presenter->compositionFenceCPU->Signal(frameInfo.presentIndex);
@@ -409,7 +409,7 @@ void presentToSwapChain(PresentType* presenter, PacingData* pacingEntry, FrameTy
 
     // AntiLag2 AMD driver transport is not part of the host adapter.
     // An interpolated frame followed by its real member belongs to that real
-    // frame: only the real Present ends the application frame on DXMT.
+    // frame: only the real Present ends the application frame on D3Dalloy.
     IMTLD3D12GeneratedPresent* generated = nullptr;
     if (frameInfo.presentSourceDirectly)
     {
@@ -431,8 +431,8 @@ void presentToSwapChain(PresentType* presenter, PacingData* pacingEntry, FrameTy
         presenter->swapChain->Present(uSyncInterval, uFlags);
 
     // tick frames sent for presentation
-    // DXMT: the drawable blit, not composition readiness, releases a borrowed source.
-    // DXMT publishes trailing queue signals only after the Present command buffer retires.
+    // D3Dalloy: the drawable blit, not composition readiness, releases a borrowed source.
+    // D3Dalloy publishes trailing queue signals only after the Present command buffer retires.
     if (frameInfo.presentSourceDirectly)
         presenter->presentQueue->Signal(presenter->sourceReleaseFence, frameInfo.presentIndex);
     presenter->presentQueue->Signal(presenter->presentFence, frameInfo.presentIndex);
@@ -557,7 +557,7 @@ DWORD WINAPI interpolationThread(LPVOID param)
 
                     LeaveCriticalSection(&presenter->criticalSectionScheduledFrame);
                     
-                    // DXMT: wait on the fence event regardless of the pacing target. Upstream spins when the
+                    // D3Dalloy: wait on the fence event regardless of the pacing target. Upstream spins when the
                     // target is under 2ms to avoid a late Windows wake; Wine wakes the event waiter directly
                     // from the fence completion. allowWaitForSingleObjectOnFence=false restores spinning.
                     waitForFenceValue(
@@ -769,7 +769,7 @@ HRESULT FrameInterpolationSwapChainDX12::init(HWND                              
         presentInfo.presentFence->SetName(L"AMD FSR PresentFence");
 
         presentInfo.device->CreateFence(framesSentForPresentation, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&presentInfo.sourceReleaseFence));
-        presentInfo.sourceReleaseFence->SetName(L"DXMT FSR SourceReleaseFence");
+        presentInfo.sourceReleaseFence->SetName(L"D3Dalloy FSR SourceReleaseFence");
 
         presentInfo.device->CreateFence(framesSentForPresentation, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&presentInfo.compositionFenceGPU));
         presentInfo.compositionFenceGPU->SetName(L"AMD FSR CompositionFence GPU");
@@ -1338,7 +1338,7 @@ void FrameInterpolationSwapChainDX12::presentPassthrough(UINT SyncInterval, UINT
 
 void FrameInterpolationSwapChainDX12::presentWithUiComposition(UINT SyncInterval, UINT Flags)
 {
-    // DXMT: the non-interpolating path uses the same pure-copy default callback.
+    // D3Dalloy: the non-interpolating path uses the same pure-copy default callback.
     if (presentCallback == ffxFrameInterpolationUiComposition && !drawDebugPacingLines &&
         !presentInfo.currentUiSurface.resource &&
         (!(presentInfo.uiCompositionFlags & FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING) ||
@@ -1471,7 +1471,7 @@ void FrameInterpolationSwapChainDX12::presentInterpolated(UINT SyncInterval, UIN
 
     // interpolation needs to wait for the game queue
     presentInfo.gameQueue->Signal(presentInfo.gameFence, ++gameFenceValue);
-    // DXMT: a queue already observes its own earlier Signal in FIFO order.
+    // D3Dalloy: a queue already observes its own earlier Signal in FIFO order.
     if (presentInfo.interpolationQueue != presentInfo.gameQueue)
         presentInfo.interpolationQueue->Wait(presentInfo.gameFence, gameFenceValue);
 

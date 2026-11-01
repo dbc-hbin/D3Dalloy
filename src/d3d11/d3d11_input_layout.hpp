@@ -14,10 +14,10 @@ struct MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC {
   uint32_t InstanceStepRate : 31 = 0;
 };
 
-namespace dxmt {
+namespace d3dalloy {
 class InputLayout;
 };
-typedef dxmt::InputLayout *ManagedInputLayout;
+typedef d3dalloy::InputLayout *ManagedInputLayout;
 
 DEFINE_COM_INTERFACE("b56c6a99-80cf-4c7f-a756-9e9ceb38730f",
                      IMTLD3D11InputLayout)
@@ -38,11 +38,11 @@ DEFINE_COM_INTERFACE("fd58f76b-7c22-4605-b43c-28048c8b4a64",
   virtual uint32_t STDMETHODCALLTYPE GetStreamOutputElements(
       MTL_SHADER_STREAM_OUTPUT_ELEMENT_DESC * *ppElements,
       uint32_t Strides[4]) = 0;
-  virtual dxmt::Sha1Digest &Digest() = 0;
+  virtual d3dalloy::Sha1Digest &Digest() = 0;
   virtual UINT RasterizedStream() = 0;
 };
 
-namespace dxmt {
+namespace d3dalloy {
 
 class InputLayout {
 public:
@@ -64,7 +64,7 @@ HRESULT ExtractMTLStreamOutputElements(
     MTL_SHADER_STREAM_OUTPUT_ELEMENT_DESC *pStreamOut,
     uint32_t *pNumElementsOut);
 
-} // namespace dxmt
+} // namespace d3dalloy
 
 using MTL_INPUT_LAYOUT_DESC = std::vector<MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC>;
 
@@ -77,7 +77,7 @@ struct MTL_STREAM_OUTPUT_DESC {
 namespace std {
 template <> struct hash<MTL_INPUT_LAYOUT_DESC> {
   size_t operator()(const MTL_INPUT_LAYOUT_DESC &v) const noexcept {
-    dxmt::HashState state;
+    d3dalloy::HashState state;
     for (auto &element : v) {
       state.add(std::hash<string_view>{}(
           {reinterpret_cast<const char *>(&element), sizeof(element)}));
@@ -100,7 +100,7 @@ template <> struct equal_to<MTL_INPUT_LAYOUT_DESC> {
 
 template <> struct hash<MTL_STREAM_OUTPUT_DESC> {
   size_t operator()(const MTL_STREAM_OUTPUT_DESC &v) const noexcept {
-    dxmt::HashState state;
+    d3dalloy::HashState state;
     state.add(v.RasterizedStream);
     state.add(v.Strides[0]);
     state.add(v.Strides[1]);

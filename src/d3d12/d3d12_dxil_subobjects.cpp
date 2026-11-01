@@ -23,12 +23,12 @@
 #include <cstring>
 #include <new>
 
-namespace dxmt {
+namespace d3dalloy {
 
 namespace {
 
 /*
- * Rust (dxmt_shader_rdat_subobjects) validates the RDAT parts and each subobject
+ * Rust (d3dalloy_shader_rdat_subobjects) validates the RDAT parts and each subobject
  * record of DxilRuntimeReflection.h RuntimeDataPartType::SubobjectTable = 6.
  * Record payloads after { Kind, Name } (RDAT_SubobjectTypes.inl), verified against
  * DXC 1.9 output of graphics-translator/tests/dxil/raytracing-stateobj.hlsl:
@@ -42,7 +42,7 @@ namespace {
  */
 
 /* Names are HLSL identifiers and export names (ASCII); widened code unit by code unit. */
-std::wstring Widen(const uint8_t *bytes, DxmtShaderSpan span) {
+std::wstring Widen(const uint8_t *bytes, D3DalloyShaderSpan span) {
   const char *text = reinterpret_cast<const char *>(bytes + span.offset);
   return std::wstring(text, text + span.size);
 }
@@ -51,8 +51,8 @@ std::wstring Widen(const uint8_t *bytes, DxmtShaderSpan span) {
 
 HRESULT ReadDxilLibrarySubobjects(const void *blob, size_t size, std::vector<DxilSubobject> &out) {
   out.clear();
-  DxmtRdatSubobjects table;
-  if (!blob || !size || size > UINT32_MAX || dxmt_shader_rdat_subobjects(blob, size, &table))
+  D3DalloyRdatSubobjects table;
+  if (!blob || !size || size > UINT32_MAX || d3dalloy_shader_rdat_subobjects(blob, size, &table))
     return E_INVALIDARG;
   if (!table.present)
     return S_OK;
@@ -60,11 +60,11 @@ HRESULT ReadDxilLibrarySubobjects(const void *blob, size_t size, std::vector<Dxi
   try {
     out.reserve(table.record_count);
     for (uint32_t i = 0; i < table.record_count; ++i) {
-      DxmtRdatSubobject record;
-      switch (dxmt_shader_rdat_subobject(blob, size, &table, i, &record)) {
-      case DXMT_SHADER_BYTECODE_SUCCESS:
+      D3DalloyRdatSubobject record;
+      switch (d3dalloy_shader_rdat_subobject(blob, size, &table, i, &record)) {
+      case D3DALLOY_SHADER_BYTECODE_SUCCESS:
         break;
-      case DXMT_SHADER_BYTECODE_RDAT_KIND:
+      case D3DALLOY_SHADER_BYTECODE_RDAT_KIND:
         /* A subobject kind this table cannot describe would be dropped silently. */
         return E_NOTIMPL;
       default:
@@ -87,8 +87,8 @@ HRESULT ReadDxilLibrarySubobjects(const void *blob, size_t size, std::vector<Dxi
         subobject.associated_subobject = Widen(bytes, record.strings[0]);
         subobject.exports.reserve(record.export_count);
         for (uint32_t j = 0; j < record.export_count; ++j) {
-          DxmtShaderSpan name;
-          if (dxmt_shader_rdat_export(blob, size, &table, &record, j, &name))
+          D3DalloyShaderSpan name;
+          if (d3dalloy_shader_rdat_export(blob, size, &table, &record, j, &name))
             return E_INVALIDARG;
           subobject.exports.push_back(Widen(bytes, name));
         }
@@ -139,4 +139,4 @@ HRESULT WrapRootSignaturePayload(const void *data, size_t size, std::vector<uint
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

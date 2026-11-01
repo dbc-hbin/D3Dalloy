@@ -34,7 +34,7 @@ winemetal_unix_link_depends = []
 shared_library('winemetal', winemetal_unix_sources,
   name_prefix         : '',
   dependencies        : [ airconv_dep_darwin ],
-  include_directories : [dxmt_include_path, include_directories('../../')],
+  include_directories : [d3dalloy_include_path, include_directories('../../')],
   c_args              : ['-ObjC'],
   link_args           : winemetal_unix_ld_args,
   native              : true,

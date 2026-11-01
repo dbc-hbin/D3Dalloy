@@ -67,7 +67,7 @@ class PackageFrontendTests(unittest.TestCase):
                     for command in builds:
                         self.assertIn(f"-Denable_{feature}={str(enabled).lower()}", command)
                     self.assertEqual(f"--with-{feature}" in stage, enabled)
-                self.assertIn("--dxmt-install32", stage)
+                self.assertIn("--d3dalloy-install32", stage)
 
 
 if __name__ == "__main__":

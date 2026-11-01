@@ -164,7 +164,7 @@ unsafe fn publish<T>(out: *mut T, result: Result<T>) -> u32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_dxbc_signature_parse(
+pub unsafe extern "C" fn d3dalloy_dxbc_signature_parse(
     data: *const u8, length: u64, format: u32, grouped: u32, out: *mut SignatureInfo,
 ) -> u32 {
     let result = (|| {
@@ -176,7 +176,7 @@ pub unsafe extern "C" fn dxmt_dxbc_signature_parse(
 
 /// Info comes from a successful parse of this same immutable input.
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_dxbc_signature_parameter(
+pub unsafe extern "C" fn d3dalloy_dxbc_signature_parameter(
     data: *const u8, length: u64, info: *const SignatureInfo, index: u32, out: *mut SignatureParameter,
 ) -> u32 {
     let result = (|| {

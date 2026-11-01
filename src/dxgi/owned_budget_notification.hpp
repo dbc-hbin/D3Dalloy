@@ -9,7 +9,7 @@
 #include <map>
 #include <new>
 
-namespace dxmt {
+namespace d3dalloy {
 
 // Observe the same native budget used by QueryVideoMemoryInfo, not usage or
 // reservation changes. The source and its context outlive Stop().
@@ -43,7 +43,7 @@ public:
     if (FAILED(validation))
       return validation;
 
-    std::unique_lock<dxmt::mutex> lock(mutex_);
+    std::unique_lock<d3dalloy::mutex> lock(mutex_);
     if (stopping_)
       return E_FAIL;
     if (registrations_.size() >= (std::numeric_limits<DWORD>::max)())
@@ -59,7 +59,7 @@ public:
     try {
       registrations_.emplace(candidate, duplicate.handle);
       if (!worker_.joinable())
-        worker_ = dxmt::thread([this] { Run(); });
+        worker_ = d3dalloy::thread([this] { Run(); });
     } catch (const std::bad_alloc &) {
       registrations_.erase(candidate);
       return E_OUTOFMEMORY;
@@ -76,7 +76,7 @@ public:
   }
 
   void Unregister(DWORD cookie) {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     auto registration = registrations_.find(cookie);
     if (registration == registrations_.end())
       return;
@@ -86,22 +86,22 @@ public:
   }
 
   uint64_t QueryBudget() {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     return ObserveBudget();
   }
 
   void Stop() {
     // Serialize lifecycle callers, but never hold the registry lock across
     // join: the worker needs it to leave its interruptible wait.
-    std::lock_guard<dxmt::mutex> lifecycle_lock(stop_mutex_);
+    std::lock_guard<d3dalloy::mutex> lifecycle_lock(stop_mutex_);
     {
-      std::lock_guard<dxmt::mutex> lock(mutex_);
+      std::lock_guard<d3dalloy::mutex> lock(mutex_);
       stopping_ = true;
       wake_.notify_all();
     }
     if (worker_.joinable())
       worker_.join();
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     for (const auto &[cookie, event] : registrations_)
       CloseHandle(event);
     registrations_.clear();
@@ -186,7 +186,7 @@ private:
   }
 
   void Run() {
-    std::unique_lock<dxmt::mutex> lock(mutex_);
+    std::unique_lock<d3dalloy::mutex> lock(mutex_);
     while (!stopping_) {
       wake_.wait(lock, [this] { return stopping_ || !registrations_.empty(); });
       if (stopping_)
@@ -206,15 +206,15 @@ private:
 
   uint64_t (*source_)(void *);
   void *context_;
-  dxmt::mutex mutex_;
-  dxmt::mutex stop_mutex_;
-  dxmt::condition_variable wake_;
+  d3dalloy::mutex mutex_;
+  d3dalloy::mutex stop_mutex_;
+  d3dalloy::condition_variable wake_;
   std::map<DWORD, HANDLE> registrations_;
-  dxmt::thread worker_;
+  d3dalloy::thread worker_;
   uint64_t last_budget_ = 0;
   DWORD next_cookie_ = 1;
   bool have_budget_ = false;
   bool stopping_ = false;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

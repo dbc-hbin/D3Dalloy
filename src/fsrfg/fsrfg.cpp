@@ -9,11 +9,11 @@
 #include <new>
 #include <utility>
 
-using dxmt::Com;
+using d3dalloy::Com;
 namespace {
 constexpr uint64_t kProvider = 0x4d46584647000001ull;
-constexpr char kName[] = "MetalFX frame generation (dxmt-owned-fsr-framegeneration-metalfx-v1)";
-constexpr wchar_t kMarker[] = L"dxmt-owned-fsr-framegeneration-metalfx-v1: unsupported or invalid frame generation operation";
+constexpr char kName[] = "MetalFX frame generation (d3dalloy-owned-fsr-framegeneration-metalfx-v1)";
+constexpr wchar_t kMarker[] = L"d3dalloy-owned-fsr-framegeneration-metalfx-v1: unsupported or invalid frame generation operation";
 constexpr UINT kUnsupportedFlags = FFX_FRAMEGENERATION_FLAG_RESERVED_1 | FFX_FRAMEGENERATION_FLAG_RESERVED_2;
 constexpr UINT kKnownFlags = kUnsupportedFlags | FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY |
     FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES |

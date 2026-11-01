@@ -30,7 +30,7 @@
 #include "metallib_writer.hpp"
 #include "msaa_mesh.hpp"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 namespace {
 
@@ -323,9 +323,9 @@ llvm::Error LinkStageModule(PipelineStage &stage, llvm::Module &target) {
   auto &info = *stage.info;
   if (!info.entry)
     return createError("DXIL pipeline stage has no entry point");
-  info.entry->setName("dxmt.dxil." + stage.tag);
+  info.entry->setName("d3dalloy.dxil." + stage.tag);
   if (info.patch_constant_function)
-    info.patch_constant_function->setName("dxmt.dxil." + stage.tag + ".pc");
+    info.patch_constant_function->setName("d3dalloy.dxil." + stage.tag + ".pc");
   std::string entry_name = info.entry->getName().str();
   std::string patch_constant_name = info.patch_constant_function ? info.patch_constant_function->getName().str() : "";
 
@@ -339,7 +339,7 @@ llvm::Error LinkStageModule(PipelineStage &stage, llvm::Module &target) {
     for (auto &global : source.globals()) {
       if (!global.hasName() || global.getName().startswith("llvm."))
         continue;
-      global.setName("dxmt." + stage.tag + "." + global.getName());
+      global.setName("d3dalloy." + stage.tag + "." + global.getName());
     }
     for (auto &resource : info.resources)
       if (auto *global = llvm::dyn_cast_or_null<llvm::GlobalValue>(resource.symbol ? resource.symbol->stripPointerCasts() : nullptr))
@@ -626,7 +626,7 @@ llvm::Error BindGeometryStage(PipelineStage &stage) {
         declarations.push_back([=](dxbc::GSStreamOutputs &out) {
           const uint32_t index = out.num_mesh_vertex_data++;
           out.func_signature.DefineMeshVertexOutput(air::OutputMeshData{
-            .user = "dxmt_shading_rate", .type = air::msl_uint, .index = index
+            .user = "d3dalloy_shading_rate", .type = air::msl_uint, .index = index
           });
           out.mesh_output_handlers.push_back([=](dxbc::MeshOutputContext &output) -> dxbc::IREffect {
             return dxbc::pop_mesh_output_vertex_data(reg, mask, index, output.vertex_id, air::msl_uint);
@@ -760,7 +760,7 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
   // with this stage's binding map.
   for (auto &stage : stages)
     if (stage.info && stage.info->entry)
-      stage.info->entry->setName("dxmt.dxil." + stage.tag);
+      stage.info->entry->setName("d3dalloy.dxil." + stage.tag);
 
   auto convert = [&]() -> llvm::Error {
     switch (kind) {
@@ -802,7 +802,7 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
     if (!stage.error.empty())
       return createError(stage.error);
 
-  if (auto *sample_position = module->getFunction("dxmt.sample_pos.i32");
+  if (auto *sample_position = module->getFunction("d3dalloy.sample_pos.i32");
       sample_position && sample_position->isDeclaration())
     linkSamplePos(*module);
   if (auto error = LowerOperations(*module))
@@ -839,4 +839,4 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
   return std::move(compiled);
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

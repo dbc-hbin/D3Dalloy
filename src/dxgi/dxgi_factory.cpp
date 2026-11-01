@@ -14,7 +14,7 @@
 #include <array>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
                                    IDXGIFactory2 *pFactory, Config &config);
@@ -54,7 +54,7 @@ public:
 
   ~MTLDXGIFactory() {
     {
-      std::lock_guard<dxmt::mutex> lock(notification_mutex_);
+      std::lock_guard<d3dalloy::mutex> lock(notification_mutex_);
       stopping_ = true;
       notification_wake_.notify_all();
     }
@@ -112,7 +112,7 @@ public:
     return DXGI_ERROR_UNSUPPORTED;
   }
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE
   CreateSwapChain(IUnknown *pDevice, DXGI_SWAP_CHAIN_DESC *pDesc,
                   IDXGISwapChain **ppSwapChain) final {
@@ -146,7 +146,7 @@ public:
     return hr;
   }
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(
       IUnknown *pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
@@ -186,11 +186,11 @@ public:
     Com<IMTLD3D12SwapChainFactory> d3d12_factory;
     if (SUCCEEDED(pDevice->QueryInterface(IID_PPV_ARGS(&d3d12_factory))))
       return d3d12_factory->CreateSwapChainWithOutput(this, hWnd, &desc, &fsDesc,
-                                                       pRestrictToOutput, ppSwapChain, nullptr, DXMTSwapChainKind::Hwnd);
+                                                       pRestrictToOutput, ppSwapChain, nullptr, D3DalloySwapChainKind::Hwnd);
     return swapchain_factory->CreateSwapChain(this, hWnd, &desc, &fsDesc, ppSwapChain);
   }
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(
       IUnknown *pDevice, IUnknown *pWindow, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
@@ -201,8 +201,8 @@ public:
     if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&swapchain_factory))))
       return DXGI_ERROR_UNSUPPORTED;
     Com<IUnknown> core_window;
-    Com<DXMTCoreWindowInterop> interop;
-    if (FAILED(pWindow->QueryInterface(DXMT_CORE_WINDOW_IID, reinterpret_cast<void **>(&core_window))) ||
+    Com<D3DalloyCoreWindowInterop> interop;
+    if (FAILED(pWindow->QueryInterface(D3DALLOY_CORE_WINDOW_IID, reinterpret_cast<void **>(&core_window))) ||
         FAILED(pWindow->QueryInterface(IID_PPV_ARGS(&interop))))
       return DXGI_ERROR_INVALID_CALL;
     HWND window = nullptr;
@@ -214,10 +214,10 @@ public:
       return DXGI_ERROR_INVALID_CALL;
     // Attach to the CoreWindow's own native window. Never manufacture a hidden HWND.
     return swapchain_factory->CreateSwapChainWithOutput(this, window, pDesc, nullptr,
-                                                       pRestrictToOutput, ppSwapChain, pWindow, DXMTSwapChainKind::CoreWindow);
+                                                       pRestrictToOutput, ppSwapChain, pWindow, D3DalloySwapChainKind::CoreWindow);
   }
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(
       IUnknown *pDevice, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
@@ -228,7 +228,7 @@ public:
     if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&swapchain_factory))))
       return DXGI_ERROR_UNSUPPORTED;
     return swapchain_factory->CreateSwapChainWithOutput(this, nullptr, pDesc, nullptr,
-        pRestrictToOutput, ppSwapChain, nullptr, DXMTSwapChainKind::Composition);
+        pRestrictToOutput, ppSwapChain, nullptr, D3DalloySwapChainKind::Composition);
   }
 
   HRESULT STDMETHODCALLTYPE EnumAdapters(UINT Adapter,
@@ -468,7 +468,7 @@ private:
       if (!compare_objects)
         return E_FAIL;
     }
-    std::lock_guard<dxmt::mutex> lock(notification_mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(notification_mutex_);
     for (const auto &[key, registration] : registrations_)
       if (registration.kind == kind &&
           ((event && registration.event && compare_objects(registration.event, duplicate.handle) == 0) ||
@@ -485,8 +485,8 @@ private:
       // the caller may close its handle and Windows may recycle that value.
       registrations_.emplace(candidate, Registration{kind, duplicate.handle, window, message});
       if (kind != NotificationKind::Stereo && !notification_worker_.joinable())
-        notification_worker_ = dxmt::thread([this] {
-          std::unique_lock<dxmt::mutex> worker_lock(notification_mutex_);
+        notification_worker_ = d3dalloy::thread([this] {
+          std::unique_lock<d3dalloy::mutex> worker_lock(notification_mutex_);
           while (!stopping_) {
             if (registrations_.empty())
               notification_wake_.wait(worker_lock);
@@ -516,7 +516,7 @@ private:
     // Dispatch holds this lock through SetEvent/PostMessage, so unregister
     // returns only after any in-flight delivery. Already posted messages
     // remain in the caller queue, as on Windows.
-    std::lock_guard<dxmt::mutex> lock(notification_mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(notification_mutex_);
     auto found = registrations_.find(cookie);
     if (found == registrations_.end() || found->second.kind != kind)
       return false;
@@ -532,9 +532,9 @@ private:
   std::array<std::vector<UINT>, 3> adapter_order_;
   uint64_t initial_generation_ = 0;
   uint64_t last_generation_ = 0;
-  dxmt::mutex notification_mutex_;
-  dxmt::condition_variable notification_wake_;
-  dxmt::thread notification_worker_;
+  d3dalloy::mutex notification_mutex_;
+  d3dalloy::condition_variable notification_wake_;
+  d3dalloy::thread notification_worker_;
   std::map<DWORD, Registration> registrations_;
   DWORD next_cookie_ = 1;
   bool stopping_ = false;
@@ -574,4 +574,4 @@ extern "C" HRESULT __stdcall CreateDXGIFactory(REFIID riid, void **factory) {
   return CreateDXGIFactory2(0, riid, factory);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

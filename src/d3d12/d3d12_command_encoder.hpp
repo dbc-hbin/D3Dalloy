@@ -23,8 +23,8 @@
 #include "d3d12_diagnostics.hpp"
 #include "com/com_pointer.hpp"
 #include "airconv_public.h"
-#include "dxmt_buffer.hpp"
-#include "dxmt_texture.hpp"
+#include "d3dalloy_buffer.hpp"
+#include "d3dalloy_texture.hpp"
 #include "util_svector.hpp"
 #include "Metal4Query.hpp"
 #include <cstdint>
@@ -32,7 +32,7 @@
 #include <optional>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 
 enum class EncoderType {
   Null,
@@ -189,7 +189,7 @@ struct QueryVisibilityTarget {
   bool reset = false;
 };
 
-/* Mirrors DXMTSOAssembly in dxmt_command.metal (so_index_range / so_assemble). */
+/* Mirrors D3DALLOYSOAssembly in d3dalloy_command.metal (so_index_range / so_assemble). */
 struct StreamOutputAssemblyParams {
   struct Element {
     uint32_t slot;
@@ -296,7 +296,7 @@ struct MSAAPrimitiveTileBounds {
 };
 static_assert(sizeof(MSAAPrimitiveTileBounds) == 28);
 
-/* Mirrors DXMTSOIndirectPreflightParams/Record in dxmt_command.metal. The preflight
+/* Mirrors D3DALLOYSOIndirectPreflightParams/Record in d3dalloy_command.metal. The preflight
  * runs after preceding GPU argument producers and before allocating SO capture memory. */
 struct SOIndirectPreflightParams {
   uint64_t argument_buffer;
@@ -341,7 +341,7 @@ struct SOIndirectCaptureBinding {
 };
 static_assert(sizeof(SOIndirectCaptureBinding) == 64);
 
-/* Mirrors dxmt_render_command_data in the command-signature Metal source. */
+/* Mirrors d3dalloy_render_command_data in the command-signature Metal source. */
 struct IndirectRenderCommandData {
   uint64_t cmd_buf;
   uint64_t max_count;
@@ -457,7 +457,7 @@ struct SOIndirectEncoderData {
 struct MeshCaptureIndirectData {
   bool domain_only = false;
   SM50_MSAA_MESH_LAYOUT msaa_layout{};
-  /* Mirrors DXMTMeshStripCutControl (dxmt_mesh_strip_cut, d3d12_command_list.cpp). */
+  /* Mirrors D3DalloyMeshStripCutControl (d3dalloy_mesh_strip_cut, d3d12_command_list.cpp). */
   struct StripCutControl {
     uint64_t max_threadgroups;
     uint32_t topology, index_size, cut_value, count, instances;
@@ -500,7 +500,7 @@ struct MeshCaptureIndirectData {
   bool geometry = false;
   bool indexed = false;
   /* GS over an indexed strip with an active cut, or over a triangle strip with adjacency: before the pass every
-   * command is expanded on the GPU into the equivalent list (dxmt_mesh_strip_cut, as a direct draw of the same
+   * command is expanded on the GPU into the equivalent list (d3dalloy_mesh_strip_cut, as a direct draw of the same
    * arguments), drawn with the list variant; `topology` is then the strip topology, `vertex_per_warp` and
    * `warp_increment` the list's. */
   bool strip_expand = false;
@@ -894,4 +894,4 @@ struct RTASEncoderData : EncoderData {
   std::vector<RTASPostbuildInfo> postbuild;
 };
 
-}; // namespace dxmt
+}; // namespace d3dalloy

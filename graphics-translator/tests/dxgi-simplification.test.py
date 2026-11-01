@@ -50,7 +50,7 @@ struct Logger {
   static void warn(DXGI_FORMAT value) { format_warnings.push_back(value); }
 };
 '''
-source += extract("src/dxmt/dxmt_monitor_format.hpp",
+source += extract("src/d3dalloy/d3dalloy_monitor_format.hpp",
                   r"static inline uint32_t\nGetMonitorFormatBpp\(.*?\n\}")
 source += r'''
 int main() {

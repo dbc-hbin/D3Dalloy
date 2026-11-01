@@ -6,7 +6,7 @@
 #include <functional>
 #include <memory>
 
-namespace dxmt {
+namespace d3dalloy {
 class MTLD3D12Device;
 class MTLD3D12Resource;
 struct OwnedRayRegenerationFrame;
@@ -25,4 +25,4 @@ void EncodeOwnedRayRegenerationFrame(const std::shared_ptr<OwnedRayRegenerationF
     WMT::MTL4CommandBuffer, WMT::Fence, uint64_t queue,
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
     const std::function<void(WMT::Event, uint64_t)> &signal_event);
-} // namespace dxmt
+} // namespace d3dalloy

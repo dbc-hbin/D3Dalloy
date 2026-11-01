@@ -13,7 +13,7 @@
 #include "unknwn.h"
 #include "../util_likely.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 template <typename T> class NoWrapper : public T {
 
@@ -121,4 +121,4 @@ template <typename T> inline void InitReturnPtr(T **ptr) {
     *ptr = nullptr;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

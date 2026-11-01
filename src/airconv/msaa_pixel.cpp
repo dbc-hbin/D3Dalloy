@@ -19,7 +19,7 @@
 
 using namespace llvm;
 
-namespace dxmt::msaa {
+namespace d3dalloy::msaa {
 LoadInst *capturedLoad(IRBuilder<> &builder, Type *type, Value *pointer, MaybeAlign alignment) {
   auto *transport = builder.CreateAlignedLoad(type, pointer, alignment);
   // Only loads created from private captured records use this origin helper.
@@ -39,7 +39,7 @@ Error invalid(const char *message) {
 bool sampleExternalEffect(Instruction &instruction) {
   // Phase metadata protects ordinary reads in logically inactive derivative
   // lanes. It is not an application UAV effect; application writes remain guarded.
-  if (instruction.getMetadata("dxmt.atomic64.metadata")) return false;
+  if (instruction.getMetadata("d3dalloy.atomic64.metadata")) return false;
   if (auto *store = dyn_cast<StoreInst>(&instruction))
     return store->getPointerAddressSpace() != 0 || store->isVolatile();
   if (isa<LoadInst>(instruction))
@@ -60,7 +60,7 @@ bool sampleExternalEffect(Instruction &instruction) {
   // helpers must execute them too, including after discard and in inclusive waves.
   return !(name.startswith("air.dfdx.") || name.startswith("air.dfdy.") ||
            name.startswith("air.quad_") || name.startswith("air.simd_") ||
-           name.startswith("air.interpolate_") || name.startswith("dxmt.sample_pos.") ||
+           name.startswith("air.interpolate_") || name.startswith("d3dalloy.sample_pos.") ||
            name.startswith("air.sample_") || name.startswith("air.read_") ||
            name.startswith("air.gather_") || name.startswith("air.load.") ||
            name.startswith("air.get_") || name.startswith("air.calculate_clamped_lod_") ||
@@ -119,8 +119,8 @@ Error promoteApplication(Module &module, Function *&body, SmallVectorImpl<Value 
     for (auto &instruction : instructions(*body))
       if (auto *call = dyn_cast<CallInst>(&instruction); call && call->getCalledFunction() &&
           !call->getCalledFunction()->isDeclaration() &&
-          !call->getCalledFunction()->hasFnAttribute("dxmt.atomic64.helper") &&
-          !call->getMetadata("dxmt.rt_sample_pos")) { nested = call; break; }
+          !call->getCalledFunction()->hasFnAttribute("d3dalloy.atomic64.helper") &&
+          !call->getMetadata("d3dalloy.rt_sample_pos")) { nested = call; break; }
     if (!nested) break;
     if (nested->getCalledFunction() == body) return invalid("recursive promoted fragment helper");
     InlineFunctionInfo info;
@@ -141,7 +141,7 @@ Error promoteApplication(Module &module, Function *&body, SmallVectorImpl<Value 
     if (name == "air.get_num_samples.i32") {
       call->replaceAllUsesWith(ConstantInt::get(call->getType(), sampleCount));
       call->eraseFromParent();
-    } else if (name == "dxmt.sample_pos.i32" && call->getMetadata("dxmt.rt_sample_pos")) {
+    } else if (name == "d3dalloy.sample_pos.i32" && call->getMetadata("d3dalloy.rt_sample_pos")) {
       IRBuilder<> b(call);
       auto *sample = call->getArgOperand(1);
       Value *fallback = centerPattern ? static_cast<Value *>(Constant::getNullValue(call->getType())) :
@@ -940,9 +940,9 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   if (options.center_pattern && !promotedApp)
     for (auto &instruction : make_early_inc_range(instructions(*original))) {
       auto *call = dyn_cast<CallInst>(&instruction);
-      if (!call || !call->getMetadata("dxmt.rt_sample_pos") ||
+      if (!call || !call->getMetadata("d3dalloy.rt_sample_pos") ||
           !call->getCalledFunction() ||
-          call->getCalledFunction()->getName() != "dxmt.sample_pos.i32") continue;
+          call->getCalledFunction()->getName() != "d3dalloy.sample_pos.i32") continue;
       call->replaceAllUsesWith(Constant::getNullValue(call->getType()));
       call->eraseFromParent();
     }
@@ -997,10 +997,10 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     auto type = kind(*md);
     if (type == "air.fragment_input" && md->getNumOperands() > 2)
       if (auto *name = dyn_cast<MDString>(md->getOperand(2));
-          name && name->getString() == "user(dxmt_resolved_shading_rate)") shadingRateOld = i;
+          name && name->getString() == "user(d3dalloy_resolved_shading_rate)") shadingRateOld = i;
     if (type == "air.fragment_input" && md->getNumOperands() > 2)
       if (auto *name = dyn_cast<MDString>(md->getOperand(2));
-          name && name->getString() == "user(dxmt_inner_coverage)") {
+          name && name->getString() == "user(d3dalloy_inner_coverage)") {
         innerOld = i;
         continue;
       }
@@ -1060,7 +1060,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   const bool coarseShading = coarseRequested && coarse::supported(options.sample_count) &&
       options.line_mode == SM50_MSAA_LINE_NONE && (!options.distance_vertex_count || capturedTriangle) &&
       !(flags & (SM50_MSAA_PIXEL_SAMPLE_FREQUENCY | SM50_MSAA_PIXEL_DEPTH | SM50_MSAA_PIXEL_STENCIL));
-  if (!coarseShading && module.getModuleFlag("dxmt.coarse.snapped"))
+  if (!coarseShading && module.getModuleFlag("d3dalloy.coarse.snapped"))
     for (auto &instruction : instructions(*original)) {
       auto *call = dyn_cast<CallInst>(&instruction);
       if (!call || !call->getCalledFunction() || pullLocation(call->getCalledFunction()->getName()) != PullOffset)
@@ -1577,7 +1577,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           Value *rect = PoisonValue::get(float4);
           Value *components[] = {originX, originY, width, height};
           for (unsigned i = 0; i < 4; ++i) rect = builder.CreateInsertElement(rect, components[i], i);
-          auto helper = module.getOrInsertFunction("dxmt.conservative.degenerate",
+          auto helper = module.getOrInsertFunction("d3dalloy.conservative.degenerate",
             FunctionType::get(builder.getInt32Ty(), {float4, float4, float4, float4, builder.getInt32Ty()}, false));
           auto *value = builder.CreateCall(helper, {clipPositions[0], clipPositions[1], clipPositions[2], rect,
             builder.getInt32(options.depth_clip_enable ? 1 : 0)});
@@ -2028,8 +2028,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       if (auto error = promoteApplication(module, body, callArgs, builder, covered, alive, position, control, options.sample_count, options.center_pattern)) return error;
     auto *result = builder.CreateCall(body, callArgs);
     if (alive) covered = capturedLoad(builder, builder.getInt1Ty(), alive);
-    if (promotedApp) result->setMetadata("dxmt.rov.logical_active", MDNode::get(context,
-      {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 2))})); if (promotedApp) result->setMetadata("dxmt.rov.logical_position", MDNode::get(context, {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 4))}));
+    if (promotedApp) result->setMetadata("d3dalloy.rov.logical_active", MDNode::get(context,
+      {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 2))})); if (promotedApp) result->setMetadata("d3dalloy.rov.logical_position", MDNode::get(context, {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 4))}));
     auto *out = entry->getArg(outputArg);
     if (!original->getReturnType()->isVoidTy()) {
       auto *ptr = builder.CreateBitCast(recordPointer(builder, out, pixel, outputWords, 2),
@@ -2225,8 +2225,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       if (auto error = promoteApplication(module, body, callArgs, builder, covered, alive, position, control, options.sample_count, options.center_pattern)) return error;
     auto *result = builder.CreateCall(body, callArgs);
     if (alive) covered = capturedLoad(builder, builder.getInt1Ty(), alive);
-    if (promotedApp) result->setMetadata("dxmt.rov.logical_active", MDNode::get(context,
-      {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 2))})); if (promotedApp) result->setMetadata("dxmt.rov.logical_position", MDNode::get(context, {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 4))}));
+    if (promotedApp) result->setMetadata("d3dalloy.rov.logical_active", MDNode::get(context,
+      {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 2))})); if (promotedApp) result->setMetadata("d3dalloy.rov.logical_position", MDNode::get(context, {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 4))}));
     auto *out = entry->getArg(outputArg);
     if (!original->getReturnType()->isVoidTy()) {
       auto *ptr = builder.CreateBitCast(recordPointer(builder, out, pixel, outputWords, 2),
@@ -2471,8 +2471,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           for (auto &instruction : instructions(*body))
             if (auto *call = dyn_cast<CallInst>(&instruction); call &&
                 call->getCalledFunction() && !call->getCalledFunction()->isDeclaration() &&
-                !call->getCalledFunction()->hasFnAttribute("dxmt.atomic64.helper") &&
-                !(promotedApp && call->getMetadata("dxmt.rt_sample_pos"))) {
+                !call->getCalledFunction()->hasFnAttribute("d3dalloy.atomic64.helper") &&
+                !(promotedApp && call->getMetadata("d3dalloy.rt_sample_pos"))) {
               nested = call;
               break;
             }
@@ -2523,8 +2523,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       auto *result = builder.CreateCall(body, callArgs);
       // Non-marker shaders serialize this annotation: refer to a call operand,
       // never a function-local SSA value in module metadata.
-      result->setMetadata("dxmt.rov.logical_active", MDNode::get(context,
-        {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - (promotedApp ? 2 : 1)))})); if (promotedApp) result->setMetadata("dxmt.rov.logical_position", MDNode::get(context, {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 4))}));
+      result->setMetadata("d3dalloy.rov.logical_active", MDNode::get(context,
+        {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - (promotedApp ? 2 : 1)))})); if (promotedApp) result->setMetadata("d3dalloy.rov.logical_position", MDNode::get(context, {ConstantAsMetadata::get(builder.getInt32(result->arg_size() - 4))}));
       if (boundsMaskOffset != ~0u && !promotedApp) {
         // The application may have no SV_Coverage output at all. Late rejection must happen AFTER its
         // UAV writes, but before any color/depth/stencil commit, regardless of its return signature.
@@ -2620,8 +2620,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   }
   original->setLinkage(Function::InternalLinkage);
   fragments->setOperand(0, entryMetadata(*entry, *oldEntry, metadata, promotedApp ? SM50_MSAA_PIXEL : variant, defaultDepth));
-  if (conservative && module.getFunction("dxmt.conservative.degenerate")) linkConservative(module);
+  if (conservative && module.getFunction("d3dalloy.conservative.degenerate")) linkConservative(module);
   return Error::success();
 }
 
-} // namespace dxmt::msaa
+} // namespace d3dalloy::msaa

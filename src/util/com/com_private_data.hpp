@@ -13,7 +13,7 @@
 #include <vector>
 #include <unknwn.h>
 
-namespace dxmt {
+namespace d3dalloy {
 
 /**
  * \brief COM private data entry type
@@ -107,7 +107,7 @@ public:
   HRESULT getData(REFGUID guid, UINT *size, void *data);
 
 private:
-  dxmt::mutex mutex_;
+  d3dalloy::mutex mutex_;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

@@ -17,14 +17,14 @@
 #include "nvShaderExtnEnums.h"
 #undef __NVAPI_EMPTY_SAL
 
-namespace dxmt {
+namespace d3dalloy {
 Logger Logger::s_instance("nvapi.log");
 
 static std::atomic_uint32_t s_initialization_count = 0;
 
 NVAPI_INTERFACE
 NvAPI_Initialize() {
-  if (FAILED(DXGIGetDebugInterface1(0, DXMT_NVEXT_GUID, nullptr))) {
+  if (FAILED(DXGIGetDebugInterface1(0, D3DALLOY_NVEXT_GUID, nullptr))) {
     return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
   }
   s_initialization_count++;
@@ -74,7 +74,7 @@ NvAPI_GetDisplayDriverVersion(NvDisplayHandle hNvDisplay, NV_DISPLAY_DRIVER_VERS
 
 NVAPI_INTERFACE
 NvAPI_GetInterfaceVersionString(NvAPI_ShortString szDesc) {
-  std::string version_str = "NVAPI Open Source Interface (DXMT-NVAPI)";
+  std::string version_str = "NVAPI Open Source Interface (D3Dalloy-NVAPI)";
 
   if (!szDesc)
     return NVAPI_INVALID_ARGUMENT;
@@ -807,10 +807,10 @@ NvAPI_D3D_GetLatency(IUnknown *pDev, NV_LATENCY_RESULT_PARAMS *pGetLatencyParams
                   [](NvU8 value) { return value != 0; })) return NVAPI_INVALID_ARGUMENT;
   Com<IMTLD3D12Reflex> reflex;
   if (FAILED(pDev->QueryInterface(IID_PPV_ARGS(&reflex)))) return NVAPI_NOT_SUPPORTED;
-  static_assert(sizeof(DXMT_REFLEX_REPORT) == sizeof(NV_LATENCY_RESULT_PARAMS::FrameReport));
-  static_assert(offsetof(DXMT_REFLEX_REPORT, gpuRenderStartTime) ==
+  static_assert(sizeof(D3DALLOY_REFLEX_REPORT) == sizeof(NV_LATENCY_RESULT_PARAMS::FrameReport));
+  static_assert(offsetof(D3DALLOY_REFLEX_REPORT, gpuRenderStartTime) ==
                 offsetof(NV_LATENCY_RESULT_PARAMS::FrameReport, gpuRenderStartTime));
-  DXMT_REFLEX_REPORT reports[64]{};
+  D3DALLOY_REFLEX_REPORT reports[64]{};
   const auto hr = reflex->GetReflexReports(reports);
   // NVAPI explicitly returns all-zero reports during the 64-frame warmup.
   if (hr == S_FALSE) {
@@ -1048,4 +1048,4 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
   return nullptr;
 }
 
-}; // namespace dxmt
+}; // namespace d3dalloy

@@ -9,15 +9,15 @@
 #include "dxgi_output.hpp"
 #include "dxgi_refresh_timing.hpp"
 #include "dxgi_options.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_monitor_format.hpp"
-#include "dxmt_presenter.hpp"
+#include "d3dalloy_format.hpp"
+#include "d3dalloy_monitor_format.hpp"
+#include "d3dalloy_presenter.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include "wsi_monitor.hpp"
 #include "thread.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 namespace {
 struct OutputStatistics {
@@ -28,13 +28,13 @@ struct OutputStatistics {
   RefreshClockBasis clock{};
   bool disjoint = true;
 };
-dxmt::mutex output_statistics_mutex;
+d3dalloy::mutex output_statistics_mutex;
 std::unordered_map<HMONITOR, OutputStatistics> output_statistics;
 }
 
 __declspec(dllexport) HRESULT RegisterOutputStatistics(HMONITOR monitor, const void *owner, WMT::PresentationObserver observer,
                                  const std::shared_ptr<std::atomic<bool>> &fault) {
-  std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+  std::lock_guard<d3dalloy::mutex> lock(output_statistics_mutex);
   auto existing = output_statistics.find(monitor);
   if (existing != output_statistics.end() && existing->second.owner != owner)
     return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
@@ -47,21 +47,21 @@ __declspec(dllexport) HRESULT RegisterOutputStatistics(HMONITOR monitor, const v
 }
 
 __declspec(dllexport) void UnregisterOutputStatistics(HMONITOR monitor, const void *owner) {
-  std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+  std::lock_guard<d3dalloy::mutex> lock(output_statistics_mutex);
   auto entry = output_statistics.find(monitor);
   if (entry != output_statistics.end() && entry->second.owner == owner)
     output_statistics.erase(entry);
 }
 
 __declspec(dllexport) void PublishOutputStatistics(HMONITOR monitor, const void *owner, const WMTPresentationEvent &event) {
-  std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+  std::lock_guard<d3dalloy::mutex> lock(output_statistics_mutex);
   auto entry = output_statistics.find(monitor);
   if (entry != output_statistics.end() && entry->second.owner == owner)
     entry->second.event = event;
 }
 
 __declspec(dllexport) void InvalidateOutputStatistics(HMONITOR monitor, const void *owner) {
-  std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+  std::lock_guard<d3dalloy::mutex> lock(output_statistics_mutex);
   auto entry = output_statistics.find(monitor);
   if (entry != output_statistics.end() && entry->second.owner == owner) {
     entry->second.event = {};
@@ -235,9 +235,9 @@ public:
                                  ? WMTGetPrimaryDisplayId()
                                  : WMTGetSecondaryDisplayId(),
                              &native_desc_);
-    for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+    for (uint32_t i = 0; i < D3DALLOY_GAMMA_CP_COUNT; i++) {
       gamma_ramp_.red[i] = gamma_ramp_.green[i] = gamma_ramp_.blue[i] =
-          float(i) / float(DXMT_GAMMA_CP_COUNT - 1);
+          float(i) / float(D3DALLOY_GAMMA_CP_COUNT - 1);
     }
     gamma_ramp_.version = 0;
   }
@@ -247,7 +247,7 @@ public:
       vblank_observer_.close();
   }
 
-  const DXMTGammaRamp *
+  const D3DalloyGammaRamp *
   STDMETHODCALLTYPE
   GetGammaRamp() override {
     return &gamma_ramp_;
@@ -375,7 +375,7 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   WaitForVBlank() final {
-    std::lock_guard<dxmt::mutex> lock(vblank_mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(vblank_mutex_);
     RECT bounds{};
     if (!wsi::getDesktopCoordinates(monitor_, &bounds))
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
@@ -423,9 +423,9 @@ public:
     gamma_caps->ScaleAndOffsetSupported = false;
     gamma_caps->MaxConvertedValue = 1.0f;
     gamma_caps->MinConvertedValue = 0.0f;
-    gamma_caps->NumGammaControlPoints = DXMT_GAMMA_CP_COUNT;
+    gamma_caps->NumGammaControlPoints = D3DALLOY_GAMMA_CP_COUNT;
     for (uint32_t i = 0; i < gamma_caps->NumGammaControlPoints; i++)
-      gamma_caps->ControlPointPositions[i] = float(i) / float(DXMT_GAMMA_CP_COUNT - 1);
+      gamma_caps->ControlPointPositions[i] = float(i) / float(D3DALLOY_GAMMA_CP_COUNT - 1);
     return S_OK;
   }
 
@@ -435,7 +435,7 @@ public:
     if (gamma_control == nullptr)
       return DXGI_ERROR_INVALID_CALL;
 
-    for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+    for (uint32_t i = 0; i < D3DALLOY_GAMMA_CP_COUNT; i++) {
       gamma_ramp_.red[i] = gamma_control->GammaCurve[i].Red;
       gamma_ramp_.green[i] = gamma_control->GammaCurve[i].Green;
       gamma_ramp_.blue[i] = gamma_control->GammaCurve[i].Blue;
@@ -452,7 +452,7 @@ public:
 
     gamma_control->Scale = { 1.0f, 1.0f, 1.0f };
     gamma_control->Offset = { 0.0f, 0.0f, 0.0f };
-    for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
+    for (uint32_t i = 0; i < D3DALLOY_GAMMA_CP_COUNT; i++) {
       gamma_control->GammaCurve[i].Red = gamma_ramp_.red[i];
       gamma_control->GammaCurve[i].Green = gamma_ramp_.green[i];
       gamma_control->GammaCurve[i].Blue = gamma_ramp_.blue[i];
@@ -480,7 +480,7 @@ public:
   GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) final {
     if (!stats)
       return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(output_statistics_mutex);
+    std::lock_guard<d3dalloy::mutex> lock(output_statistics_mutex);
     auto entry = output_statistics.find(monitor_);
     if (entry == output_statistics.end())
       return DXGI_ERROR_INVALID_CALL; // Output statistics are fullscreen-only.
@@ -778,17 +778,17 @@ public:
   }
 
 private:
-  dxmt::mutex vblank_mutex_;
+  d3dalloy::mutex vblank_mutex_;
   WMT::Reference<WMT::PresentationObserver> vblank_observer_;
   Com<IMTLDXGIAdapter> adapter_ = nullptr;
   HMONITOR monitor_ = nullptr;
   WMTDisplayDescription native_desc_;
   DxgiOptions &options_;
-  DXMTGammaRamp gamma_ramp_;
+  D3DalloyGammaRamp gamma_ramp_;
 };
 
 Com<IDXGIOutput> CreateOutput(IMTLDXGIAdapter *pAadapter, HMONITOR monitor, DxgiOptions &options) {
   return Com<IDXGIOutput>::transfer(new MTLDXGIOutputImpl(pAadapter, monitor, options));
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

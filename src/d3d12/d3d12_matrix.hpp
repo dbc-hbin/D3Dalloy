@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace dxmt::matrix {
+namespace d3dalloy::matrix {
 inline uint32_t ComponentBytes(uint32_t type) {
   switch (type) {
   case 2: case 3: case 7: return 2;
@@ -47,7 +47,7 @@ inline constexpr const char *kConversionSource = R"metal(
 using namespace metal;
 struct ConversionParams { uint rows, columns, component_type, src_layout, dest_layout, src_stride, dest_stride; };
 uint component_bytes(uint t) { return t == 4 || t == 5 || t == 8 ? 4 : t == 2 || t == 3 || t == 7 ? 2 : 1; }
-kernel void dxmt_convert_matrix(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+kernel void d3dalloy_convert_matrix(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
                                 constant ConversionParams &p [[buffer(2)]], uint2 xy [[thread_position_in_grid]]) {
   uint column = xy.x, row = xy.y;
   if (row >= p.rows || column >= p.columns) return;
@@ -60,4 +60,4 @@ kernel void dxmt_convert_matrix(device const uchar *src [[buffer(0)]], device uc
   for (uint i = 0; i < bytes; ++i) dst[offset + i] = src[so + i];
 }
 )metal";
-} // namespace dxmt::matrix
+} // namespace d3dalloy::matrix

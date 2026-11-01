@@ -103,7 +103,7 @@
 
 using namespace llvm;
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 llvm::Error ValidateRayPayloadAnnotations(Module &module) {
   auto *annotations = module.getNamedMetadata("dx.dxrPayloadAnnotations");
@@ -198,14 +198,14 @@ struct LibraryExport {
 bool readRuntimeDataPublicNames(
   const void *bytecode, uint64_t size, std::map<std::string, std::string> &out
 ) {
-  DxmtRdatInfo rdat;
-  if (dxmt_shader_rdat_parse(bytecode, size, &rdat) != DXMT_SHADER_BYTECODE_SUCCESS)
+  D3DalloyRdatInfo rdat;
+  if (d3dalloy_shader_rdat_parse(bytecode, size, &rdat) != D3DALLOY_SHADER_BYTECODE_SUCCESS)
     return false;
 
   const char *bytes = static_cast<const char *>(bytecode);
   for (uint32_t i = 0; i < rdat.record_count; ++i) {
-    DxmtRdatFunction function;
-    if (dxmt_shader_rdat_function(bytecode, size, &rdat, i, &function) != DXMT_SHADER_BYTECODE_SUCCESS)
+    D3DalloyRdatFunction function;
+    if (d3dalloy_shader_rdat_function(bytecode, size, &rdat, i, &function) != D3DALLOY_SHADER_BYTECODE_SUCCESS)
       continue;
     out.emplace(std::string(bytes + function.name_offset, function.name_size),
                 std::string(bytes + function.public_name_offset, function.public_name_size));
@@ -822,7 +822,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
   /* DXIL containers carry the dxil-ms-dx 32 bit pointer layout; AIR needs air64
    * and the air.* module flags. */
   if (module_ir.getDataLayout().getPointerSizeInBits() != 64)
-    dxmt::initializeModule(module_ir);
+    d3dalloy::initializeModule(module_ir);
   InitializeAtomic64Phase(module_ir, args);
 
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
@@ -1415,7 +1415,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
   locals.push_back(ValueAsMetadata::get(hit_state));
   locals.push_back(ConstantAsMetadata::get(builder.getInt32(context.export_index)));
   locals.push_back(ConstantAsMetadata::get(builder.getInt32(0)));
-  module_ir.getOrInsertNamedMetadata("dxmt.rt.locals")->addOperand(
+  module_ir.getOrInsertNamedMetadata("d3dalloy.rt.locals")->addOperand(
     MDTuple::get(llvm_context, locals)
   );
 
@@ -1540,7 +1540,7 @@ static llvm::Error EmitDispatchCallback(
   auto *any_hit_type = ArrayType::get(Type::getInt32Ty(llvm_context), std::max(export_count, 1u));
   auto *any_hit_table = new GlobalVariable(
     module, any_hit_type, /*isConstant=*/true, GlobalValue::PrivateLinkage,
-    ConstantArray::get(any_hit_type, any_hit_words), "dxmt.rt.any_hit_table",
+    ConstantArray::get(any_hit_type, any_hit_words), "d3dalloy.rt.any_hit_table",
     nullptr, GlobalValue::NotThreadLocal, /*AddressSpace=*/2
   );
 
@@ -1884,7 +1884,7 @@ llvm::Error MergeRaytracingExport(
 ) {
   /*
    * The stage builder hands the operation pass its per-invocation storage through the
-   * `dxmt.rt.locals` named node, which names the payload block and the hit state block -
+   * `d3dalloy.rt.locals` named node, which names the payload block and the hit state block -
    * function-local values, i.e. `LocalAsMetadata` operands. The pass has consumed the
    * node by now and nothing reads it again, but `StripDXILArtifacts` only drops the
    * `dx.`-prefixed scaffolding, so the node is still in the module here. A named
@@ -1895,7 +1895,7 @@ llvm::Error MergeRaytracingExport(
    * the AIR entry metadata - the only metadata the merged pipeline is built from - is
    * untouched.
    */
-  if (NamedMDNode *locals = source.getNamedMetadata("dxmt.rt.locals"))
+  if (NamedMDNode *locals = source.getNamedMetadata("d3dalloy.rt.locals"))
     source.eraseNamedMetadata(locals);
   if (llvm::verifyModule(source, &llvm::errs())) {
     llvm::errs() << "OWNED_RT_INVALID_EXPORT_BEGIN " << entry_name << "\n";
@@ -1934,7 +1934,7 @@ llvm::Error MergeRaytracingExport(
   return llvm::Error::success();
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil
 
 /* -------------------------------------------------------------------------- */
 /* Export enumeration                                                         */
@@ -1946,7 +1946,7 @@ namespace {
 
 /** Hand an llvm::Error to the caller, or release it when no slot was offered. */
 void reportError(llvm::Error failure, sm50_error_t *ppError) {
-  auto *error = new dxmt::dxil::SM50ErrorInternal();
+  auto *error = new d3dalloy::dxil::SM50ErrorInternal();
   llvm::raw_svector_ostream stream(error->buf);
   llvm::handleAllErrors(
     std::move(failure), [&](const llvm::ErrorInfoBase &base) { base.log(stream); }
@@ -1959,7 +1959,7 @@ void reportError(llvm::Error failure, sm50_error_t *ppError) {
 }
 
 void reportMessage(const llvm::Twine &message, sm50_error_t *ppError) {
-  auto *error = new dxmt::dxil::SM50ErrorInternal();
+  auto *error = new d3dalloy::dxil::SM50ErrorInternal();
   llvm::raw_svector_ostream stream(error->buf);
   stream << message << '\0';
   if (ppError)
@@ -1975,7 +1975,7 @@ AIRCONV_API int SM50RTEnumerateLibraryExports(
   uint32_t ExportCapacity, char *pNames, uint64_t NamesSize, uint32_t *pExportCount,
   uint64_t *pNamesSize, sm50_error_t *ppError
 ) {
-  using namespace dxmt;
+  using namespace d3dalloy;
 
   if (ppError)
     *ppError = nullptr;
@@ -2042,7 +2042,7 @@ static llvm::Error EmitRayGenerationDispatch(
   LLVMContext &ctx = module.getContext();
   NamedMDNode *kernels = module.getNamedMetadata("air.kernel");
   if (!kernels || names.empty() || names.size() != raygen_indices.size())
-    return dxmt::dxil::createError("dxil: missing raygen dispatcher entries");
+    return d3dalloy::dxil::createError("dxil: missing raygen dispatcher entries");
 
   SmallVector<Function *, 4> targets;
   SmallVector<MDNode *, 4> entries;
@@ -2060,10 +2060,10 @@ static llvm::Error EmitRayGenerationDispatch(
         entry = candidate;
     }
     if (!target || !entry || entry->getNumOperands() < 3)
-      return dxmt::dxil::createError("dxil: missing raygen function metadata: " + target_name);
+      return d3dalloy::dxil::createError("dxil: missing raygen function metadata: " + target_name);
     auto *arguments = dyn_cast<MDNode>(entry->getOperand(2));
     if (!arguments || arguments->getNumOperands() != target->arg_size())
-      return dxmt::dxil::createError("dxil: inconsistent raygen argument metadata");
+      return d3dalloy::dxil::createError("dxil: inconsistent raygen argument metadata");
     targets.push_back(target);
     entries.push_back(entry);
     mappings.emplace_back(target->arg_size(), ~0u);
@@ -2071,7 +2071,7 @@ static llvm::Error EmitRayGenerationDispatch(
       auto *input = cast<MDNode>(operand.get());
       unsigned argument = mdconst::extract<ConstantInt>(input->getOperand(0))->getZExtValue();
       if (argument >= target->arg_size())
-        return dxmt::dxil::createError("dxil: raygen argument index is out of range");
+        return d3dalloy::dxil::createError("dxil: raygen argument index is out of range");
       StringRef kind = cast<MDString>(input->getOperand(1))->getString();
       uint64_t location = ~0ull;
       uint64_t size = 0;
@@ -2101,7 +2101,7 @@ static llvm::Error EmitRayGenerationDispatch(
         auto *new_pointer = dyn_cast<PointerType>(type);
         if (!buffer || !old_pointer || !new_pointer ||
             old_pointer->getAddressSpace() != new_pointer->getAddressSpace())
-          return dxmt::dxil::createError("dxil: incompatible raygen binding types");
+          return d3dalloy::dxil::createError("dxil: incompatible raygen binding types");
         // Different local-root layouts share one byte-addressed buffer binding.
         // Each selected body casts it back to its own validated root-signature layout.
         for (unsigned i = 2; i + 1 < inputs[index]->getNumOperands(); ++i) {
@@ -2125,7 +2125,7 @@ static llvm::Error EmitRayGenerationDispatch(
     }
   }
   if (dispatch_index == ~0u)
-    return dxmt::dxil::createError("dxil: raygen dispatcher has no dispatch binding");
+    return d3dalloy::dxil::createError("dxil: raygen dispatcher has no dispatch binding");
   Function *dispatcher = Function::Create(FunctionType::get(Type::getVoidTy(ctx), types, false),
     GlobalValue::ExternalLinkage, name, module);
   IRBuilder<> b(BasicBlock::Create(ctx, "entry", dispatcher));
@@ -2136,7 +2136,7 @@ static llvm::Error EmitRayGenerationDispatch(
   IRBuilder<>(done).CreateRetVoid();
   /* The identifier of the application's ray generation record names the raygen to run;
    * a record of another pipeline (SM50_RT_INDEX_NONE) takes the default: nothing runs. */
-  Value *record = EmitShaderRecordLookup(b, bytes, dxmt::dxil::RtShaderTable::RayGeneration, b.getInt32(0)).export_index;
+  Value *record = EmitShaderRecordLookup(b, bytes, d3dalloy::dxil::RtShaderTable::RayGeneration, b.getInt32(0)).export_index;
   SwitchInst *select = b.CreateSwitch(record, done, targets.size());
   for (unsigned i = 0; i < targets.size(); ++i) {
     Function *target = targets[i];
@@ -2181,7 +2181,7 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
   struct SM50_COMPILED_BITCODE *pMetallib, struct SM50_RT_FUNCTION_INFO *pFunctions,
   uint32_t FunctionCapacity, uint32_t *pFunctionCount, sm50_error_t *ppError
 ) {
-  using namespace dxmt;
+  using namespace d3dalloy;
 
 
 
@@ -2318,7 +2318,7 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
   LLVMContext context;
   context.setOpaquePointers(false);
   Module air_module("raytracing.air", context);
-  dxmt::initializeModule(air_module);
+  d3dalloy::initializeModule(air_module);
 
   std::vector<SM50_RT_FUNCTION_INFO> functions;
   functions.reserve(reflection_count);
@@ -2374,7 +2374,7 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
         reportError(std::move(failure), ppError);
         return 0;
       }
-      dxmt::dxil::IsolateSelectedExport(*info.module, *info.entry);
+      d3dalloy::dxil::IsolateSelectedExport(*info.module, *info.entry);
       const auto stage = dxil::stageFromShaderKind(variant ? SM50_RT_STAGE_CLOSEST_HIT : entry.Stage);
       if (info.stage != dxil::Stage::Library && info.stage != stage) {
         reportMessage("a raytracing export's entry point stage does not match its state object stage", ppError);
@@ -2587,15 +2587,15 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
       for (auto &entry : native_exports) entry.AnyHitIndex = SM50_RT_INDEX_NONE;
       native_desc.Exports = native_exports.data();
     }
-    if (auto failure = dxmt::dxil::EmitDispatchCallback(
-          air_module, native_desc, callback_context, "dxmt.rt.candidate"
+    if (auto failure = d3dalloy::dxil::EmitDispatchCallback(
+          air_module, native_desc, callback_context, "d3dalloy.rt.candidate"
         )) {
       reportError(std::move(failure), ppError);
       return 0;
     }
     /* Geometry kind alone selects the hardware callback slot. */
     SM50_RT_FUNCTION_INFO function{};
-    function_names.push_back("dxmt.rt.candidate");
+    function_names.push_back("d3dalloy.rt.candidate");
     function.Name = nullptr;
     function.ExportName = nullptr;
     function.Kind = SM50_RT_FUNCTION_DISPATCH;
@@ -2604,12 +2604,12 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
     function.Flags = uses_atomic64 ? SM50_RT_FUNCTION_FLAG_DEVICE_ATOMIC64_PHASE : 0u;
     functions.push_back(function);
     if (has_intersection && !query_callbacks) {
-      if (auto failure = dxmt::dxil::EmitBoundingBoxDispatch(
-            air_module, *pDesc, callback_context, "dxmt.rt.bounding_box")) {
+      if (auto failure = d3dalloy::dxil::EmitBoundingBoxDispatch(
+            air_module, *pDesc, callback_context, "d3dalloy.rt.bounding_box")) {
         reportError(std::move(failure), ppError);
         return 0;
       }
-      function_names.push_back("dxmt.rt.bounding_box");
+      function_names.push_back("d3dalloy.rt.bounding_box");
       function.TableIndex = 1;
       functions.push_back(function);
     }
@@ -2621,13 +2621,13 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
     for (uint32_t idx : raygen_indices)
       raygen_function_names.push_back(pDesc->Exports[idx].EntryPoint);
     if (auto failure = EmitRayGenerationDispatch(
-          air_module, raygen_indices, raygen_function_names, "dxmt.rt.raygen_dispatcher"
+          air_module, raygen_indices, raygen_function_names, "d3dalloy.rt.raygen_dispatcher"
         )) {
       reportError(std::move(failure), ppError);
       return 0;
     }
     SM50_RT_FUNCTION_INFO function{};
-    function_names.push_back("dxmt.rt.raygen_dispatcher");
+    function_names.push_back("d3dalloy.rt.raygen_dispatcher");
     function.Name = nullptr;
     function.ExportName = nullptr;
     function.Kind = SM50_RT_FUNCTION_RAYGEN;
@@ -2642,7 +2642,7 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
   if (uses_atomic64) {
     // These functions are emitted after application resource lowering. Mark only
     // their physical transport, never the already-lowered user UAV operations.
-    for (const char *name : {"dxmt.rt.candidate", "dxmt.rt.bounding_box", "dxmt.rt.raygen_dispatcher"})
+    for (const char *name : {"d3dalloy.rt.candidate", "d3dalloy.rt.bounding_box", "d3dalloy.rt.raygen_dispatcher"})
       if (auto *function = air_module.getFunction(name))
         dxil::MarkRaytracingTransport(*function);
     if (auto failure = dxil::LowerAtomic64Phase(air_module)) {
@@ -2688,7 +2688,7 @@ AIRCONV_API int SM50CompileRaytracingPipeline(
    * export.
    */
 
-  dxmt::runOptimizationPasses(air_module);
+  d3dalloy::runOptimizationPasses(air_module);
 
 
   raw_svector_ostream stream(compiled->vec);

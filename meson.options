@@ -3,7 +3,7 @@ option('native_arch', type : 'combo', choices : ['x86_64', 'arm64'], value : 'x8
 option('native_bridge_only', type : 'boolean', value : false, description : 'Build the owned AIR compiler and standalone Metal bridge without Wine/PE frontends')
 option('build_native_components', type : 'boolean', value : true, description : 'Build native AIR and Wine Unix plugin in a Windows cross build; disable for PE-only artifacts')
 option('build_airconv_for_windows', type : 'boolean', value : false)
-option('dxmt_debug', type : 'boolean', value : false)
+option('d3dalloy_debug', type : 'boolean', value : false)
 option('wine_build_path', type : 'string')
 option('wine_install_path', type : 'string')
 option('wine_builtin_dll', type : 'boolean', value : true)

@@ -67,7 +67,7 @@
 #include "dxil_converter.hpp"
 #include "dxil_raytracing.h"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 /**
  * The AIR address space a traversal hands a shader its payload in: `ray_data` /
@@ -431,4 +431,4 @@ RtShaderRecord EmitShaderRecordLookup(
   llvm::IRBuilder<> &builder, llvm::Value *dispatch, RtShaderTable table, llvm::Value *index
 );
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

@@ -27,7 +27,7 @@
 #include "log/log.hpp"
 #include <chrono>
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D12ComputePipelineStateImpl : public MTLD3D12Pageable<MTLD3D12ComputePipelineState> {
   friend HRESULT CreateComputePipelineState(MTLD3D12Device *, const D3D12_COMPUTE_PIPELINE_STATE_DESC *,
@@ -65,7 +65,7 @@ public:
   // The deferred job captures this object: retire unstarted work or join a running one first.
   // During process detach the workers are already terminated, so a claimed job never finishes.
   ~MTLD3D12ComputePipelineStateImpl() {
-    if (async_job && !dxmt::this_thread::isInModuleDetachment())
+    if (async_job && !d3dalloy::this_thread::isInModuleDetachment())
       async_job->Cancel();
   }
 
@@ -339,4 +339,4 @@ CreateComputePipelineState(
   return pso->QueryInterface(riid, ppPipelineState);
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

@@ -8,7 +8,7 @@
 #include "util_bit.hpp"
 #include <cassert>
 
-namespace dxmt::md5 {
+namespace d3dalloy::md5 {
 
 void Hasher::update(const void *data, size_t size) {
   auto src = reinterpret_cast<const unsigned char *>(data);
@@ -222,4 +222,4 @@ Digest hashDxbcBinary(const void *data, size_t size) {
   return hasher.getDigest();
 }
 
-} // namespace dxmt::md5
+} // namespace d3dalloy::md5

@@ -9,7 +9,7 @@
 
 #include <array>
 extern "C" MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format);
-static void retainFGLease(std::uint64_t, std::shared_ptr<const dxmt::framegeneration::ExecutionLease>);
+static void retainFGLease(std::uint64_t, std::shared_ptr<const d3dalloy::framegeneration::ExecutionLease>);
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -22,7 +22,7 @@ static void retainFGLease(std::uint64_t, std::shared_ptr<const dxmt::framegenera
 #include <utility>
 #include <vector>
 
-namespace dxmt::framegeneration {
+namespace d3dalloy::framegeneration {
 namespace {
 
 
@@ -1930,20 +1930,20 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
     }
 }
 
-} // namespace dxmt::framegeneration
+} // namespace d3dalloy::framegeneration
 
 
-@interface DXMTFGHolder : NSObject {
+@interface D3DALLOYFGHolder : NSObject {
 @public
-    std::shared_ptr<const dxmt::framegeneration::PreparedFrame> prepared;
-    std::shared_ptr<const dxmt::framegeneration::ExecutionLease> lease;
+    std::shared_ptr<const d3dalloy::framegeneration::PreparedFrame> prepared;
+    std::shared_ptr<const d3dalloy::framegeneration::ExecutionLease> lease;
 }
 @end
-@implementation DXMTFGHolder
+@implementation D3DALLOYFGHolder
 - (void)dealloc { prepared.reset(); lease.reset(); [super dealloc]; }
 @end
-static void retainFGLease(std::uint64_t recording, std::shared_ptr<const dxmt::framegeneration::ExecutionLease> lease) {
-    DXMTFGHolder* holder = [DXMTFGHolder new];
+static void retainFGLease(std::uint64_t recording, std::shared_ptr<const d3dalloy::framegeneration::ExecutionLease> lease) {
+    D3DALLOYFGHolder* holder = [D3DALLOYFGHolder new];
     if (!holder) throw std::bad_alloc();
     holder->lease = std::move(lease);
     winemetal_metal4_retain_resource(recording, holder);
@@ -1953,14 +1953,14 @@ extern "C" int32_t winemetal_metal4_fg_call(struct WMTMetal4Call* call) {
     @autoreleasepool {
         if (call->operation == WMTMetal4FGRequest) {
             // Allocate the recording owner before mutating frame-ID metadata.
-            DXMTFGHolder* holder = nullptr;
+            D3DALLOYFGHolder* holder = nullptr;
             if (call->args[0] == WMTFG_PREPARE || call->args[0] == WMTFG_DISPATCH) {
-                @try { holder = [DXMTFGHolder new]; }
+                @try { holder = [D3DALLOYFGHolder new]; }
                 @catch (NSException*) { call->ret[0] = 5; return 0; }
                 if (!holder) { call->ret[0] = 5; return 0; }
             }
-            std::shared_ptr<const dxmt::framegeneration::PreparedFrame> prepared;
-            call->ret[0] = dxmt::framegeneration::api(static_cast<std::uint32_t>(call->args[0]),
+            std::shared_ptr<const d3dalloy::framegeneration::PreparedFrame> prepared;
+            call->ret[0] = d3dalloy::framegeneration::api(static_cast<std::uint32_t>(call->args[0]),
                 reinterpret_cast<void*>(call->args[1]), &prepared);
             if (prepared) {
                 holder->prepared = std::move(prepared);
@@ -1969,9 +1969,9 @@ extern "C" int32_t winemetal_metal4_fg_call(struct WMTMetal4Call* call) {
             return 0;
         }
         if (call->operation == WMTMetal4FGEncode) {
-            auto holder = (DXMTFGHolder*)call->args[1];
+            auto holder = (D3DALLOYFGHolder*)call->args[1];
             if (!holder || !holder->prepared) { call->ret[0] = 0; return 0; }
-            std::shared_ptr<const dxmt::framegeneration::ExecutionLease> lease;
+            std::shared_ptr<const d3dalloy::framegeneration::ExecutionLease> lease;
             call->ret[0] = holder->prepared->encode((void*)winemetal_metal4_command_buffer(call->args[0]),
                 (void*)call->args[2], lease, call->args[0]);
             return 0;

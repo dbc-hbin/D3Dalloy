@@ -17,9 +17,9 @@
 #include "d3d11_state_object.hpp"
 #include "dxgi_interfaces.h"
 #include "../d3d10/d3d10_device.hpp"
-#include "dxmt_command_queue.hpp"
-#include "dxmt_device.hpp"
-#include "dxmt_format.hpp"
+#include "d3dalloy_command_queue.hpp"
+#include "d3dalloy_device.hpp"
+#include "d3dalloy_format.hpp"
 #include "ftl.hpp"
 #include "d3d11_resource.hpp"
 #include "dxgi_object.hpp"
@@ -28,7 +28,7 @@
 #include "d3d11_4.h"
 #include "util_win32_compat.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 const GUID kRenderdocUUID = {0xa7aa6116,
                              0x9c8d,
@@ -92,11 +92,11 @@ public:
       case D3D11_USAGE_DEFAULT:
       case D3D11_USAGE_IMMUTABLE:
       case D3D11_USAGE_DYNAMIC:
-        return dxmt::CreateBuffer(this, pDesc, pInitialData, ppBuffer);
+        return d3dalloy::CreateBuffer(this, pDesc, pInitialData, ppBuffer);
       case D3D11_USAGE_STAGING:
         return CreateStagingBuffer(this, pDesc, pInitialData, ppBuffer);
       default:
-        DXMT_UNREACHABLE
+        D3DALLOY_UNREACHABLE
       }
     } catch (const MTLD3DError &err) {
       ERR(err.message());
@@ -660,7 +660,7 @@ public:
             D3D11_FORMAT_SUPPORT2_SHAREABLE;
       }
 
-#ifndef DXMT_NO_PRIVATE_API
+#ifndef D3DALLOY_NO_PRIVATE_API
       if (any_bit_set(Capability & FormatCapability::Blend)) {
         /* UNCHECKED */
         info->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP;
@@ -998,7 +998,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateDeferredContext3(
     UINT ContextFlags, ID3D11DeviceContext3 **ppDeferredContext) override {
-    *ppDeferredContext = std::move(dxmt::CreateDeferredContext(this, ContextFlags));
+    *ppDeferredContext = std::move(d3dalloy::CreateDeferredContext(this, ContextFlags));
     return S_OK;
   }
 
@@ -1054,7 +1054,7 @@ public:
     return S_OK;
   };
 
-  Device &GetDXMTDevice() override { return device_; };
+  Device &GetD3DalloyDevice() override { return device_; };
 
   void CreateCommandList(ID3D11CommandList** pCommandList) final {
     commandlist_pool_->CreateCommandList(pCommandList);
@@ -1092,7 +1092,7 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE OpenSharedFence(HANDLE Handle, REFIID riid,
                                                     void **ppFence) final {
-    return dxmt::OpenSharedFence(this, Handle, riid, ppFence);
+    return d3dalloy::OpenSharedFence(this, Handle, riid, ppFence);
   };
 
   virtual HRESULT STDMETHODCALLTYPE CreateFence(UINT64 InitialValue,
@@ -1100,7 +1100,7 @@ public:
                                                 REFIID riid, void **ppFence) final {
     if (feature_flags_ & D3D11_CREATE_DEVICE_VIDEO_SUPPORT)
       return E_FAIL;
-    return dxmt::CreateFence(this, InitialValue, Flags, riid, ppFence);
+    return d3dalloy::CreateFence(this, InitialValue, Flags, riid, ppFence);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1108,7 +1108,7 @@ public:
       IDXGIFactory1 *pFactory, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGISwapChain1 **ppSwapChain
   ) override {
-    return dxmt::CreateSwapChain(pFactory, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
+    return d3dalloy::CreateSwapChain(pFactory, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 
 private:
@@ -1248,7 +1248,7 @@ public:
     if (!ppResources || !pResidency)
       return E_INVALIDARG;
 
-    // Basically in DXMT D3D11 implementation, all resources are assumed to be resident.
+    // Basically in D3Dalloy D3D11 implementation, all resources are assumed to be resident.
     for (uint32_t i = 0; i < ResourceCount; i++)
       pResidency[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
     return S_OK;
@@ -1308,7 +1308,7 @@ public:
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
       IDXGISwapChain1 **ppSwapChain) override {
 
-    return dxmt::CreateSwapChain(pFactory, &d3d11_device_, hWnd, pDesc, pFullscreenDesc,
+    return d3dalloy::CreateSwapChain(pFactory, &d3d11_device_, hWnd, pDesc, pFullscreenDesc,
                                  ppSwapChain);
   }
 
@@ -1329,4 +1329,4 @@ Com<IMTLDXGIDevice> CreateD3D11Device(std::unique_ptr<Device> &&device,
   return Com<IMTLDXGIDevice>::transfer(new MTLD3D11DXGIDevice(
       std::move(device), adapter, feature_level, feature_flags));
 };
-} // namespace dxmt
+} // namespace d3dalloy

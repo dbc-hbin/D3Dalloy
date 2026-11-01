@@ -3,14 +3,14 @@
 #include "d3d12_atomic64_storage.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_reserved_resource.hpp"
-#include "dxmt_format.hpp"
+#include "d3dalloy_format.hpp"
 #include <algorithm>
 #include <cstring>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 
-namespace dxmt {
+namespace d3dalloy {
 namespace {
 using atomic64::CanonicalKind;
 using atomic64::CanonicalOwner;
@@ -771,4 +771,4 @@ HRESULT Atomic64Phase::EncodeExport(WMT::MTL4CommandBuffer command_buffer, WMT::
   }
   return S_OK;
 }
-} // namespace dxmt
+} // namespace d3dalloy

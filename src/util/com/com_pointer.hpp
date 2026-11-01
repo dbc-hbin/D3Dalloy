@@ -13,7 +13,7 @@
 #include <unknwn.h>
 #include <cassert>
 
-namespace dxmt {
+namespace d3dalloy {
 
 /**
  * \brief Increment public ref count
@@ -100,7 +100,7 @@ public:
   ~Com() { this->decRef(); }
 
   T *operator->() const {
-#ifdef DXMT_DEBUG
+#ifdef D3DALLOY_DEBUG
     if (!m_ptr) {
       __builtin_trap();
     }
@@ -113,7 +113,7 @@ public:
   T *const *operator&() const { return &m_ptr; }
 
   /*
-   * dxmt: move to pointer semantic
+   * d3dalloy: move to pointer semantic
    * the ownersihp is completely taken away
    */
   operator T *() && {
@@ -143,7 +143,7 @@ public:
   bool operator==(std::nullptr_t) const { return m_ptr == nullptr; }
   bool operator!=(std::nullptr_t) const { return m_ptr != nullptr; }
 
-  T *ref() const { return dxmt::ref(m_ptr); }
+  T *ref() const { return d3dalloy::ref(m_ptr); }
 
   T *ptr() const { return m_ptr; }
 
@@ -195,4 +195,4 @@ template <typename T> Com<T> com_cast(IUnknown *pUnknwn) {
   return Com<T>::queryFrom(pUnknwn);
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

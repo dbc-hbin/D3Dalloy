@@ -26,7 +26,7 @@ if build_native_components
   )
 endif
 
-if get_option('enable_fsr') and (native_bridge_only or not dxmt_crossbuild or not get_option('enable_d3d12'))
+if get_option('enable_fsr') and (native_bridge_only or not d3dalloy_crossbuild or not get_option('enable_d3d12'))
   error('enable_fsr requires a Windows cross build with enable_d3d12=true')
 endif
 
@@ -35,14 +35,14 @@ subdir('util')
 endif
 subdir('airconv')
 
-if not dxmt_crossbuild
+if not d3dalloy_crossbuild
 subdir('nativemetal')
 else
 subdir('winemetal')
 endif
 
 if not native_bridge_only
-subdir('dxmt')
+subdir('d3dalloy')
 subdir('dxgi')
 subdir('d3d11')
 subdir('d3d10')

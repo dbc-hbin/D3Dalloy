@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Serialized acceleration structures read back from an application buffer for
 // CopyRaytracingAccelerationStructure(DESERIALIZE): the 56-byte D3D12 header, an
-// optional 16-byte OMM block plus its pointers, the 64-byte dxmt header at
+// optional 16-byte OMM block plus its pointers, the 64-byte d3dalloy header at
 // header_offset, then the shadow copy whose leading records are 96-byte geometries.
 // Offsets of the returned spans are relative to the deserialized structure.
 use super::cache_wire::{input, range, u32_at, u64_at};
@@ -93,7 +93,7 @@ fn blocks(pointers: u64) -> bool {
 }
 
 // The serialized header against the readable source range. Without blocks the
-// dxmt header follows the bottom-level pointers.
+// d3dalloy header follows the bottom-level pointers.
 fn prefix(serialized: &[u8], available: u64) -> Result<Layout> {
     let size = field64(serialized, 32)?;
     let pointers = field64(serialized, 48)?;
@@ -123,7 +123,7 @@ fn tail(layout: &Layout) -> Result<u64> {
         .and_then(|n| n.checked_sub(HEADER_SIZE)).ok_or(Error::InvalidArgument)
 }
 
-// Bytes of geometry records after the dxmt header; top levels have none.
+// Bytes of geometry records after the d3dalloy header; top levels have none.
 fn geometry_bytes(layout: &Layout, header: &[u8]) -> Result<u64> {
     let kind = field32(header, 20)?;
     let count = field32(header, 28)? as u64;
@@ -260,7 +260,7 @@ unsafe fn publish<T>(out: *mut T, result: Result<T>) -> u32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_rtas_serialized_prefix(
+pub unsafe extern "C" fn d3dalloy_rtas_serialized_prefix(
     serialized: *const u8, length: u64, available: u64, out: *mut Layout,
 ) -> u32 {
     let result = (|| prefix(unsafe { input(serialized, length) }.ok_or(Error::InvalidArgument)?, available))();
@@ -268,7 +268,7 @@ pub unsafe extern "C" fn dxmt_rtas_serialized_prefix(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_rtas_serialized_block(
+pub unsafe extern "C" fn d3dalloy_rtas_serialized_block(
     layout: *const Layout, data: *const u8, length: u64, out: *mut Layout,
 ) -> u32 {
     let result = (|| {
@@ -279,7 +279,7 @@ pub unsafe extern "C" fn dxmt_rtas_serialized_block(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_rtas_serialized_geometry_bytes(
+pub unsafe extern "C" fn d3dalloy_rtas_serialized_geometry_bytes(
     layout: *const Layout, header: *const u8, length: u64, out: *mut u64,
 ) -> u32 {
     let result = (|| {
@@ -290,7 +290,7 @@ pub unsafe extern "C" fn dxmt_rtas_serialized_geometry_bytes(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_rtas_serialized_parse(
+pub unsafe extern "C" fn d3dalloy_rtas_serialized_parse(
     serialized: *const u8, serialized_length: u64, layout: *const Layout, header: *const u8, header_length: u64,
     geometry: *const u8, geometry_length: u64, destination_available: u64, out: *mut Info,
 ) -> u32 {
@@ -306,7 +306,7 @@ pub unsafe extern "C" fn dxmt_rtas_serialized_parse(
 
 /// Info comes from a successful parse of these same immutable geometry records.
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_rtas_serialized_geometry(
+pub unsafe extern "C" fn d3dalloy_rtas_serialized_geometry(
     info: *const Info, geometry: *const u8, length: u64, index: u32, out: *mut Geometry,
 ) -> u32 {
     let result = (|| {

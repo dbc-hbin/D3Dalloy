@@ -13,7 +13,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace dxmt {
+namespace d3dalloy {
 
 /** Small vector container with embedded storage for a given number of
  *  elements. Largely functions as a drop-in replacement for std::vector. */

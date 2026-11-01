@@ -6,9 +6,9 @@
 #include <limits>
 #include <vector>
 
-using dxmt::standard_swizzle::Layout;
-using dxmt::standard_swizzle::pattern;
-using dxmt::standard_swizzle::tile_bytes;
+using d3dalloy::standard_swizzle::Layout;
+using d3dalloy::standard_swizzle::pattern;
+using d3dalloy::standard_swizzle::tile_bytes;
 
 // Independent bit-string oracle: consumes x BYTES from the least significant
 // bit upward, and y/z in texel (or BC block) coordinates. The published

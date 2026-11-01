@@ -30,9 +30,9 @@ inline HRESULT DXBCGetRootSignature(const void *pBlobContainer, size_t Container
                                    const void **ppBlob, UINT *pByteSize) {
     if (!pBlobContainer || !ppBlob || !pByteSize || ContainerSize > UINT32_MAX)
         return E_INVALIDARG;
-    DxmtShaderChunk chunk;
-    if (dxmt_shader_container_find(pBlobContainer, ContainerSize, DXMT_SHADER_CONTAINER_ROOT_SIGNATURE,
-                                  0x30535452u, 0, &chunk) != DXMT_SHADER_BYTECODE_SUCCESS || chunk.size == 0)
+    D3DalloyShaderChunk chunk;
+    if (d3dalloy_shader_container_find(pBlobContainer, ContainerSize, D3DALLOY_SHADER_CONTAINER_ROOT_SIGNATURE,
+                                  0x30535452u, 0, &chunk) != D3DALLOY_SHADER_BYTECODE_SUCCESS || chunk.size == 0)
         return E_FAIL;
     *ppBlob = static_cast<const unsigned char *>(pBlobContainer) + chunk.offset;
     *pByteSize = chunk.size;

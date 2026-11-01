@@ -11,9 +11,9 @@ int main() {
   LLVMContext context;
   context.setOpaquePointers(false);
   Module module("atomic64-phase-semantics", context);
-  dxmt::initializeModule(module);
+  d3dalloy::initializeModule(module);
   SM50_SHADER_COMPILATION_ARGUMENT_DATA phase{nullptr, SM50_SHADER_D3D12_ATOMIC64_PHASE};
-  dxmt::dxil::InitializeAtomic64Phase(module, &phase);
+  d3dalloy::dxil::InitializeAtomic64Phase(module, &phase);
   auto *i32 = Type::getInt32Ty(context);
   auto *vector = FixedVectorType::get(i32, 4);
   auto *pointer = PointerType::get(i32, 1);
@@ -38,9 +38,9 @@ int main() {
   auto legacy = module.getOrInsertFunction("air.atomic.global.add.u.i32", FunctionType::get(i32,
     {pointer, i32, i32, i32, builder.getInt1Ty()}, false));
   auto *metadata = builder.CreateCall(legacy, {data, builder.getInt32(1), builder.getInt32(0), builder.getInt32(3), builder.getTrue()});
-  metadata->setMetadata(dxmt::dxil::kAtomic64Metadata, MDNode::get(context, {}));
+  metadata->setMetadata(d3dalloy::dxil::kAtomic64Metadata, MDNode::get(context, {}));
   builder.CreateRetVoid();
-  if (auto error = dxmt::dxil::LowerAtomic64Phase(module)) {
+  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(module)) {
     logAllUnhandledErrors(std::move(error), errs()); return 1;
   }
   if (verifyModule(module, &errs())) return 1;
@@ -48,7 +48,7 @@ int main() {
   unsigned loads = 0, stores = 0, atomics = 0, exchanges = 0, nativeMetadata = 0;
   for (auto &instruction : instructions(function)) {
     if (auto *operation = dyn_cast<AtomicRMWInst>(&instruction);
-        operation && operation->getMetadata(dxmt::dxil::kAtomic64Metadata)) {
+        operation && operation->getMetadata(d3dalloy::dxil::kAtomic64Metadata)) {
       if (!operation->isVolatile() || operation->getOrdering() != AtomicOrdering::Monotonic) return 1;
       ++nativeMetadata;
     }
@@ -78,18 +78,18 @@ int main() {
   auto first = std::make_unique<Module>("stage_a", context);
   auto second = std::make_unique<Module>("stage_b", context);
   for (auto *stage : {first.get(), second.get()}) {
-    dxmt::initializeModule(*stage);
-    dxmt::dxil::InitializeAtomic64Phase(*stage, &phase);
+    d3dalloy::initializeModule(*stage);
+    d3dalloy::dxil::InitializeAtomic64Phase(*stage, &phase);
     auto *entry = Function::Create(FunctionType::get(Type::getInt8PtrTy(context, 1), false),
       GlobalValue::ExternalLinkage, stage->getName(), *stage);
     IRBuilder<> body(BasicBlock::Create(context, "entry", entry));
-    body.CreateRet(dxmt::dxil::EmitAtomic64Context(body));
+    body.CreateRet(d3dalloy::dxil::EmitAtomic64Context(body));
   }
   if (Linker::linkModules(*first, std::move(second)) || verifyModule(*first, &errs())) return 1;
   unsigned contexts = 0;
   for (const auto &global : first->globals()) {
-    if (!global.getName().startswith(dxmt::dxil::kAtomic64ContextGlobal)) continue;
-    if (global.getName() != dxmt::dxil::kAtomic64ContextGlobal || !global.isExternallyInitialized()) return 1;
+    if (!global.getName().startswith(d3dalloy::dxil::kAtomic64ContextGlobal)) continue;
+    if (global.getName() != d3dalloy::dxil::kAtomic64ContextGlobal || !global.isExternallyInitialized()) return 1;
     ++contexts;
   }
   std::printf("PHASE_LINKED_CONTEXT count=%u llvm_verify=PASS\n", contexts);
@@ -109,7 +109,7 @@ int main() {
           AtomicOrdering::SequentiallyConsistent);
       body.CreateRetVoid();
       if (verifyModule(classifier, &errs()) ||
-          dxmt::dxil::HasDeviceAtomic64(classifier) != (addressSpace != 3)) return 1;
+          d3dalloy::dxil::HasDeviceAtomic64(classifier) != (addressSpace != 3)) return 1;
     }
   std::puts("PHASE_CLASSIFIER_AS1_AS6_DEVICE_AS3_GROUP_ONLY cases=6 llvm_verify=PASS");
   return loads == 1 && stores == 5 && atomics == 1 && exchanges == 1 && nativeMetadata == 1 ? 0 : 1;

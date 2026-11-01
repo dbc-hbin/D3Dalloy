@@ -11,7 +11,7 @@
 | 구분 | 현행 상태 | 증거 경계 |
 | --- | --- | --- |
 | 코어 / 상위 기능 | SM6.6, 조건부 FL12_2, DXR1.2 및 아래 지정 계약 | Apple7+·placement sparse·BC 압축 gate. 공개 생성·PAQ·CS6.6 집중 proof이며 full conformance는 아님 |
-| ARM64 / FEX | SDK05의 세 guest ABI/Metal 및 no-present graphics/compute 기록. Wine/FEX runtime은 외부 저장소에서 생산하고 DXMT는 검증된 입력을 소비 | [현재 실행과 남은 gate](../doc/ARM64-FEX-IMPLEMENTATION.md); G8 전체 native matrix 미완료 |
+| ARM64 / FEX | SDK05의 세 guest ABI/Metal 및 no-present graphics/compute 기록. Wine/FEX runtime은 외부 저장소에서 생산하고 D3Dalloy는 검증된 입력을 소비 | [현재 실행과 남은 gate](../doc/ARM64-FEX-IMPLEMENTATION.md); G8 전체 native matrix 미완료 |
 | FEX 선정 변경 | 별도 FEX-darwin의 기존 CPU/ABI 수정과 10월9일 IR-tail 반복 탐색 제거. 동일 입력 출력 일치·34개 Wine 회귀·격리 ZZZ DLSS 렌더링 확인; disk cache 기본값 유지 | [현재 결과](../build/local/zzz-fex-opt-20261009/result.json)·[게임 경계](ZZZ-COMPATIBILITY.ko.md#2026-10-09-fex-최적화와-재검증); 전체 로딩·FPS·스터터링 개선율 미측정 |
 | 10월7일 frontend 기록 | 당시 paired optional frontends packaging, direct isolated FEX x64 NGX/NGX-contracts/FSR SR와 AMD/NVIDIA profile consumer PASS | [feature results](../build/local/arm64x-gpu-features03-20261007/feature-results.json), [profile results](../build/local/arm64x-gpu-features03-20261007/profile-results.json). Generic runner는 FEX를 거부하며 x86 FX·전체 no-Rosetta closure·FG/RR proof가 아님 |
 | ZZZ DLSS 지정 실게임 proof | 10월9일 owned NGX 실제 서명·prefix 한정 등록과 D3D12 resource pointer alias 수정 후, 일반 Streamline 로딩 및 도시 DLSS OFF/ON 재생성 PASS | [실행 결과](../build/local/zzz-dlss-fix-20261009/dlss-run-02/result.json)·[계약과 경계](ZZZ-COMPATIBILITY.ko.md#2026-10-09-owned-ngx-로딩과-dlss-검은-화면-복구). 장시간 stutter·NVIDIA 모델 동등성은 별도 검증 |
@@ -73,7 +73,51 @@ MSAA full-surface average resolve는 기존 recording/submission planner가 이�
 - **SR output shadow:** 출력 rect 크기가 scaler 출력과 같으면 `outputOffset`으로 앱 텍스처에 직접 쓴다. SR suite의 shadow가 186회에서 17회로 줄었다.
 - **Opaque endpoint:** `EndQuery`·`BeginQuery`·`WriteBufferImmediate`로 끝난 render pass도 접근 집합을 추적한다. 뒤 노드의 경계와 merge 금지는 그대로다. traced suite에서 opaque 노드가 204개에서 192개로 줄었다. 남은 opaque 대부분(`ResolveTextureRegion`·alias flush·allocator heap 소스·MSAA capture·placed heap aliasing)은 새 접근 모델이 필요해 하지 않았다.
 - **command recording CPU probe:** 현재 class layout에 맞춰 다시 통과한다.
-- **이름:** Metal HUD 제목은 `D3DAlloy D3D12 FL_…`, HUD label key는 `com.github.d3dalloy.*`다. 업스트림 DXMT와 같은 prefix에서 함께 쓰여도 충돌하지 않도록 D3D12 공유 section(`Local\d3dalloy.share.*`·`d3dalloy.d3d12.*`·`d3dalloy.fence.*`), Mach bootstrap 이름, 공유 salt 디렉터리(`d3dalloy-share`), 자동 PSO/stage cache 파일·mutex(`d3dalloy-pso-*`·`d3dalloy-stage-*`·`d3dalloy-shader-sessions`), shader-cache session 파일(`d3dalloy-sc-*`), D3D12 thread 이름과 로그 문구, 셰이더 실패 기록 환경변수(`D3DALLOY_SHADER_FAILURE_PATH`)를 바꿨다. 기존 `dxmt-*` 캐시는 더 읽지 않으므로 한 번 다시 컴파일된다. D3D11/DXGI·`dxmt.conf`·`DXMT_*` 설정·내부 namespace/파일명·모듈 이름은 아직 그대로다.
+- **이름:** 제품·Metal HUD는 `D3Dalloy`, HUD key는 `com.github.d3dalloy.*`다. 공유 backend는 `src/d3dalloy/`·`d3dalloy::`, Meson project/static library와 debug option은 `d3dalloy`·`d3dalloy_debug`로 통일했다. D3D10/11·DXGI version resource, runtime label·thread·Mach/shared-resource/cache 이름, Rust/C++/Metal 내부 symbol과 기존 fixture·staging consumer도 함께 전환했다. 설정은 `d3dalloy.conf`·`D3DALLOY_CONFIG_FILE`·`D3DALLOY_CONFIG`와 `d3dalloy.shaderMetalVersion`만 읽으며 legacy alias는 없다. Stage CLI는 `--d3dalloy-install`·`--d3dalloy-install32`, manifest는 `owned-d3dalloy-derived`와 `source.d3dalloy_install*`, 인증서는 `share/d3dalloy/ngx-runtime.cer`다. PSO/library/stage blob과 shader/serialized-AS identity도 분리해 이전 캐시를 재사용하지 않는다. Windows API DLL 이름·외부 WineMetal/WMT 계약·공개 API/UUID·업스트림 라이선스·frozen import와 과거 증거 경로는 보존한다.
+
+### D3Dalloy 전체 이름 전환 검증 — 2026-11-02
+
+ARM64/ARM64EC paired DLL 11개, native ARM64·WoW64 packaging과 staging 검증을 통과했다.
+실제 설정 loader에서 `d3dalloy.conf`, 명시 파일 선택, 환경변수 우선순위, 이전 설정명 무시와
+새 로그 이름을 확인했다. 파서 173개 검사, pipeline-cache CPU, automatic disk-cache 전체
+invariants와 command-recording CPU probe도 통과했다. Stage 파일 식별자가 바뀌어 기존
+eviction readback 검사의 magic 기대값을 함께 갱신했다.
+
+최초 GPU matrix는 45개 중 40개가 통과했다. `fsr`, `temporal`, `pipeline-cache` 실패는
+변경 전 runtime에서도 재현됐다. 사용자가 초기 `build/`를 삭제한 뒤 실패 항목의 재빌드를
+요청해 FEX·native ARM64 Wine·paired SDK와 owned runtime을 다시 빌드했다.
+최신 fixture의 `ngx-features`·`ngx-fg`와 direct/device-proxy 각각 4프레임을 구분한 `fsr`는
+Metal 검증을 켜고 통과했다. 현재 증거는 `build/local/failed-checks-20261102`에 있다.
+`pipeline-cache`는 비동기 disk publication을 즉시 읽던 검사와 파일명 key 추출을 수정했다.
+이벤트 기반 대기를 실행하려면 Wine의 파일 변경 알림 지원이 필요하며, 기존 native Wine은
+libinotify 없이 빌드돼 그 지원이 없었다. Wine/FEX 소스 변경 없이 static libinotify-kqueue를
+포함해 재빌드한 runtime에서 create/write/rename 알림을 확인했다. 동시 생성 검사는 새 device의
+차가운 native artifact cache를 사용해 이전 검사의 정상적인 재사용과 cold-build 계수를
+분리했다. 기존 automatic key와 엄격한 생성 횟수 assertion은 유지했다.
+최종 `pipeline-cache-device-cold`는 disk 복원·손상 복구·동시 생성·driver control을 포함해 통과했다.
+현재 host에서 검증했으며, libinotify의 macOS 27.2 deployment target과 Wine의 12.0 link target
+차이에 대한 경고가 있어 이전 macOS의 실행 호환성은 미검증이다.
+
+`temporal`의 `64×64 → 112×112` 실패는 standalone native MetalFX에서도 동일한
+buffer-boundary 오류로 재현됐다. 사용자 요청에 따라 초소형 동적 출력 시나리오를 제거하고,
+1280×720 input의 1600×900·1920×1080·2560×1440 출력에서 descriptor 재사용과
+old-record replay·fresh-reset 비교·영역 밖 sentinel 검증을 유지했다.
+`temporal-real-resolution` 전체 suite는 API·Shader Validation으로 통과했다.
+별도 native MetalFX와 owned public NGX의 `1280×720 → 1920×1080`도 각각 32프레임을
+통과했다. 작은 크기의 MetalFX 자체 오류를 고쳤거나 실제 게임 전체를 검증했다는 뜻은 아니다.
+
+GPTK 4.0b3 원본은 SHA-256
+`a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660`과 Apple 서명을 확인했다.
+동일 public NGX probe의 작은 크기와 1080p 비교는 모두 원본의
+`outputTexture must have private storage mode` assertion에서 먼저 막혔다.
+따라서 원본에서도 같은 buffer-boundary 오류가 난다고 단정하지 않는다.
+비교 로그·probe·identity는 `build/local/gptk4b3-reference`에 보존하며, 사용한 DMG는 해제하고
+불필요한 복사 runtime payload와 종료된 임시 prefix는 정리했다.
+별도 Metal HUD 화면 캡처는 미검증이다.
+Staging 49개, ARM64 preflight 14개, package 1개, paired-build 3개(실제 SDK 옵션 검사 1개 skip),
+문서 검사 2개와 설정 parser 검사가 통과했다. Diagnostics는 기존에도 실패한 합성 로그의
+phase별 operation 증거를 바로잡고 FSR variant 검사를 추가한 현재 113개 모두 통과했다.
+위 실행은 관측한 결과이며, 삭제된 로컬 산출물·로그를 현재 보유 증거로 인용하지 않는다.
 
 ## ZZZ 도시 레이트레이싱 수정 — 2026-11-02
 
@@ -81,7 +125,7 @@ MSAA full-surface average resolve는 기존 recording/submission planner가 이�
 
 - **TLAS prebuild:** `GetRaytracingAccelerationStructurePrebuildInfo`가 null `InstanceDescs`를 거부해 크기가 0으로 돌아왔다. D3D12MA가 Width=`UINT64_MAX` 버퍼를 할당하다 실패했고, 그 뒤 UnityPlayer가 null+8을 읽어 종료했다. Prebuild는 GPU 메모리를 읽지 않으므로 null을 허용한다(`d3d12_acceleration_structure.cpp`, fixture에 회귀 검사 추가).
 - **Library 리소스 배열:** `dx.op.createHandleForLib`의 operand가 리소스 배열 원소(`load (gep @array, 0, index)`)이면 RT 파이프라인 생성이 실패했다. 게임은 레이트레이싱을 건너뛰었고 조명이 초록색으로 보였다. 이제 원소 index를 배열의 base register에 더한다(`dxil_resources.cpp`).
-- **Raygen threadgroup (`AIRCONV_VERSION=47`):** traversal kernel이 threadgroup당 1 thread로 실행돼 SIMD 32 lane 중 31개가 놀았다. 도시 HUD의 GPU 시간은 프레임당 103ms였다(로딩 화면 9.4ms). 이제 raygen의 max work group을 `SM50_RT_RAYGEN_THREADGROUP_SIZE`(64)로 두고, pipeline의 `maxTotalThreadsPerThreadgroup`보다 작은 2의 거듭제곱을 쓴다. 높이가 1인 grid는 64×1, 그 외 grid와 ExecuteIndirect slot은 8×8로 실행한다. Grid를 넘는 thread는 prologue에서 반환한다. Predication과 `dxmt_rays_indirect`는 threadgroup 개수(올림)를 쓴다. Invocation block은 thread별 alloca여서 threadgroup 공유 상태가 없다.
+- **Raygen threadgroup (`AIRCONV_VERSION=47`):** traversal kernel이 threadgroup당 1 thread로 실행돼 SIMD 32 lane 중 31개가 놀았다. 도시 HUD의 GPU 시간은 프레임당 103ms였다(로딩 화면 9.4ms). 이제 raygen의 max work group을 `SM50_RT_RAYGEN_THREADGROUP_SIZE`(64)로 두고, pipeline의 `maxTotalThreadsPerThreadgroup`보다 작은 2의 거듭제곱을 쓴다. 높이가 1인 grid는 64×1, 그 외 grid와 ExecuteIndirect slot은 8×8로 실행한다. Grid를 넘는 thread는 prologue에서 반환한다. Predication과 `d3dalloy_rays_indirect`는 threadgroup 개수(올림)를 쓴다. Invocation block은 thread별 alloca여서 threadgroup 공유 상태가 없다.
 
 검증(ARM64X/FEX x64, API+Shader Validation, 증거 `build/local/rtgroup-20261102`):
 - `raytracing`: PASS(16/16 case). Native trace에서 RT dispatch가 8×8·64×1로 나간 것을 확인했다.
@@ -107,7 +151,7 @@ MSAA full-surface average resolve는 기존 recording/submission planner가 이�
 | SR·RR | 실행별 residency set에서 앱 텍스처를 빼고(device 전역 set 소속), scratch가 바뀔 때만 commit. 반납 시 removeAll+commit 제거. NGX RR 변환 PSO와 FSR RR kernel library를 device 단위로 공유. FSR RR normal decode 1회와 generation별 zero 텍스처 1회 clear | SR residency commit temporal 64/81 실행, 기존은 실행당 2회 이상. fsr-rr signal 35줄이 base와 동일 |
 | FG | NGX의 연속 Prepare→Generate는 depth/motion snapshot 복사 없이 앱 텍스처를 직접 쓴다(`MTL_FRAME_GENERATION_PREPARE_DIRECT_INPUTS`, FSR은 복사 유지). pool별 영구 residency set, `supportsMetal4FX` 캐시, sRGB raw view 캐시. `WMTFG_BRIDGE_VERSION` 12 | submit ngx-fg 749→619, fsr-fg 동일 |
 | FSR FG SDK | fence 대기를 thread별 event 대기로 바꾸고 hybrid spin을 기본값으로 켰다. 같은 queue의 game fence Wait와 중복 interpolation fence Wait 제거. 앱 pacing tuning은 그대로 우선 | fsr-fg pacing PASS, process CPU base 2.93/2.11s → 0.93/1.60s(각 2회) |
-| Rust | DXIL ISG1/OSG1/PSG1을 `dxbc_signature.rs`(grouped)로, RT root signature unwrap을 Rust container 조회로, serialized AS·PSO subobject stream·D3D12Core PE preflight를 새 `rtas_serialized.rs`·`pso_stream.rs`·`pe_image.rs`로 옮겼다. 사용하지 않는 shader-message 디코딩(i686 길이 wrap)과 `dxmt_dxbc_operand_parse` 삭제 | CPU 173 checks(ASan+UBSan). DXIL 8979개 signature dump sha1 동일, RT unwrap 10858개 차이 0, AS·PSO·PE mutated parity 각 800k·400k·27k 차이 0. 6개 target opt0/opt2 링크 |
+| Rust | DXIL ISG1/OSG1/PSG1을 `dxbc_signature.rs`(grouped)로, RT root signature unwrap을 Rust container 조회로, serialized AS·PSO subobject stream·D3D12Core PE preflight를 새 `rtas_serialized.rs`·`pso_stream.rs`·`pe_image.rs`로 옮겼다. 사용하지 않는 shader-message 디코딩(i686 길이 wrap)과 `d3dalloy_dxbc_operand_parse` 삭제 | CPU 173 checks(ASan+UBSan). DXIL 8979개 signature dump sha1 동일, RT unwrap 10858개 차이 0, AS·PSO·PE mutated parity 각 800k·400k·27k 차이 0. 6개 target opt0/opt2 링크 |
 
 GPU matrix 43개 중 39개 PASS였다(2026-11-02 병합 뒤 41개, 위 bindless·dxil 해결). bindless·dxil(Shader Validation의 GPU address 0 load), fsr(frame marker 중복), temporal(MetalFX Conv3x3)은 base에서도 같은 PASS 줄 수·오류 수로 실패한다. bindless·dxil은 10-31 runtime에서는 통과했으므로 HEAD의 `AIRCONV_VERSION=45` bounded load 변경 이후 생긴 별도 문제로 본다 [INFERENCE]. agility suite는 PASS, diagnostics의 `agility-high-fl`은 base와 같이 실패한다.
 
@@ -137,7 +181,7 @@ GPU 결과. 아래 외 suite는 모두 PASS다.
 
 | 영역 | 변경 | 현재 증거 |
 | --- | --- | --- |
-| 기록·바인딩 | allocator의 `maxBufferLength` 캐시. 같은 VB 재바인딩 생략. `(root signature, PSO, stages)`별 submission-access plan과 encoder-local 반복 생략(VA generation 검사, descriptor 내용은 계속 Execute 시점에 해석). barrier tracker의 lock-free 조회. recording별 static sampler upload 재사용. native argument table의 touched-slot mask와 이미 lease한 buffer의 early return. predication texture copy를 pitched 3D 단일 dispatch로 처리(같은 buffer 내부 복사와 dispatch 한도 초과는 기존 row loop 유지) | ARM64 GPU suite PASS. 새 `dxmt_predicate_copy_rows` kernel의 native Metal probe(홀수 offset, 70B row, pitch padding, 4가지 predicate 조합) mismatch 0 |
+| 기록·바인딩 | allocator의 `maxBufferLength` 캐시. 같은 VB 재바인딩 생략. `(root signature, PSO, stages)`별 submission-access plan과 encoder-local 반복 생략(VA generation 검사, descriptor 내용은 계속 Execute 시점에 해석). barrier tracker의 lock-free 조회. recording별 static sampler upload 재사용. native argument table의 touched-slot mask와 이미 lease한 buffer의 early return. predication texture copy를 pitched 3D 단일 dispatch로 처리(같은 buffer 내부 복사와 dispatch 한도 초과는 기존 row loop 유지) | ARM64 GPU suite PASS. 새 `d3dalloy_predicate_copy_rows` kernel의 native Metal probe(홀수 offset, 70B row, pitch padding, 4가지 predicate 조합) mismatch 0 |
 | 큐·동기화 | in-flight 접근을 allocation 단위 색인·병합하고 접근별 producer stage와 실제 helper stage만 합산. skipped-fence drain을 다음 fence waiter(replay·Present)까지 지연하고 이미 retire됐으면 생략. descriptor 전용 render 제한은 merge만 막고 접근 분석은 허용. Execute 인코딩 중 도착한 Signal을 commit에 병합. native blit hazard를 subresource·region 단위로 추적. standalone whole-surface AVERAGE resolve를 생성 MSAA pass에 접고, `PreserveResolveSource=FALSE` ending resolve는 resolve-only store 사용 | ARM64 GPU suite PASS. runner diagnostics의 기존 pipeline-artifact 1건 실패는 base와 동일 |
 | FG | generation rect 안쪽의 baseline 복사 제거(rect 밖 영역만 복사). context별 bounded pool로 중간 texture·snapshot·parameter buffer·argument table·residency set 재사용. device별 library·PSO 공유 | ARM64 GPU suite PASS. 임시 counter build에서 steady-state 프레임당 할당 0, Generate+Prepare blit 3→2 |
 | SR·RR·NGX·presenter | SR·AMD RR execution binding pool. AMD RR neural finish와 resolve 융합, 공유 geometry guide pass. dynamic output이 하나의 native feature를 재사용(scaler cache는 두 extent 유지). NGX parameter의 transparent lookup과 NaN·범위 밖 float→int의 FAIL 처리. presenter resize·gamma는 PSO key가 바뀔 때만 PSO 재생성 | ARM64 GPU suite PASS(fsr-rr·ngx-features 포함). NGX parameter CPU 12 case, facade ABI 4 ABI |
@@ -161,7 +205,7 @@ GPU 결과. 아래 외 suite는 모두 PASS다.
 | fence | `GetCompletedValue`를 잠금 없는 atomic 읽기로 바꿨다. 이미 완료된 `SetEventOnCompletion`과 null event 다중 fence 대기에 fast path를 넣었다. device QI는 `ID3D12Device*` GUID부터 확인한다. `maxBufferLength`를 캐시하고, pass label과 `useResource`는 한 번에 보낸다 | 호출당 비용이 1–4 thread에서 8.5–157ns에서 0.4–0.8ns로 줄었다. queue-order probe(TSan 포함)를 통과했다 |
 
 적용하지 않은 것:
-- **NGX FG pairing:** NGX FG는 앱이 생성 프레임과 실제 프레임을 DXGI로 직접 Present하므로, DXMT가 둘을 짝지을 정보가 없다.
+- **NGX FG pairing:** NGX FG는 앱이 생성 프레임과 실제 프레임을 DXGI로 직접 Present하므로, D3Dalloy가 둘을 짝지을 정보가 없다.
 - **Reflex fixed-two admission:** 측정용 probe가 없어 기존 drain을 유지했다.
 - **FG crop/jitter 정렬 변경:** 현재 동작이 틀렸다는 테스트가 없어 바꾸지 않았다.
 
@@ -306,7 +350,7 @@ Partial SR depth와 motion을 함께 원본 subrect로 전달하면 poisoned pad
 
 런처의 최종 `arch -e` 전달은 [49개 regression과 실제 CPU observer/audit smoke](../build/local/d3dmetal-opt-port-20261009/launcher-fix/report.json)를 통과했다. [새 런처 FG 재실행](../build/local/d3dmetal-opt-port-20261009/fg-launcher-retry/verification.json)에서는19native captures의 RGB가 callback readback과 일치했으나 presentedTime이 모두0이어서 여전히 FAIL이다. Attached NSWindow의 visible1·occlusion_visible0을 기록했다. [원본 fixture의 setup만 gated한 준비](../build/local/d3dmetal-opt-port-20261009/fg-visible-proof/cpu-preparation-report.json)는 원본 pixel/order/pacing/clock 판정을 유지한다. **전체128×156을 수동으로 uncover하라는 요구는 overconstraint였다:** AppKit `Visible`은 partial을 포함하고 frozen checker는 actual presented clock과 FULL texture oracle만 본다. 그래서 [fixture background partial placement 시험](../build/local/d3dmetal-opt-port-20261009/fg-visible-proof/gui-partial/placement-readback.json)으로 gate를 바꿨다. teardown 원인은 [4-marker 진단](../build/local/d3dmetal-opt-port-20261009/fg-visible-proof/teardown-diagnosis/run/execution.json)의 timeout stack에서 MacDrvEvent destructor를 통한 **NSLock 재진입**으로 입증됐고, 승인된 Wine-darwin 패치 `339a3212…`가 제거된 wrapper를 unlock **이후**에 release한다(bounded cleanup stack16). same-source old/fixed object CPU는 before124·after PASS다. 이후 [FG eventfix 검증](../build/local/d3dmetal-opt-port-20261009/fg-visible-proof/wine-eventfix-after/verification-eventfix.json)은 **9gate 전부 PASS**이고 원본 `38701…` fixture·frozen `ec1c…` checker·exit0·no timeout·terminal `OWNED_D3D12_FSR_FG_PASS`를 확인했다: 19paired capture×18probe point가 각각 max error0≤tol3이다(full-frame every-pixel 아님). runtime-phase3c-wine-eventfix manifest `a1e4…`·winemac `5e34…`이고 [attribution 준비](../build/local/d3dmetal-opt-port-20261009/fg-visible-proof/wine-eventfix-after/preparation-eventfix.json)가 mechanistic CPU·stack·current full after를 뒷받침한다. disposable FG prefix3개는 [별도 retirement receipt](../build/local/d3dmetal-opt-port-20261009/fg-visible-proof/prefix-retirement.json)로 제거됐고316 evidence file은 불변이다(historical cleanup receipt는 재작성하지 않음). 원본 msaa diagnostic before는 **다른 gfx generation**이라 one-variable FG 비교로 쓰지 않는다.
 
-**Commit 시점 Present 예약은 GPTK 4.0b3 방식으로 이식했다(2026-10-30).** Pristine 4.0b3(SHA256 `a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660`) `DoPresent` `0x16cc46`의 Metal4 경로는 queue GPU order wait → commit → `signalEvent` → `signalDrawable:` → CPU `present`이고, completion block `0x16e669`은 오류 로그와 pool 반환만 한다. DXMT도 이제 `m4_commit`에서 `signalDrawable` 직후 present하며, cross-queue 순서는 이전 frame의 commit(또는 skip)을 기다린 뒤 GPU `waitForEvent`로 잇는다. GPU 완료를 CPU에서 기다리지 않는다. **계약 변화:** commit 이전의 frame은 `DXGI_PRESENT_RESTART`로 여전히 버리지만, 이미 commit된 frame은 이후 RESTART나 GPU 오류가 생겨도 표시된다(4.0b3와 동일). Composition 경로도 같은 순서를 따른다. [present-queues](../build/local/w8-present-queues-021/result.json)의 native restart case는 이 계약으로 갱신했다. 근거는 [REA pseudocode](../build/local/d3dmetal-4b3-present-20261030/)이며 실게임 지연·FPS 개선 증거는 아니다. 이전 4.0b2 판정과 근거는 [바이너리 식별](../build/local/d3dmetal-opt-port-20261009/present-contract/identity.json)·[REA 근거](../build/local/d3dmetal-opt-port-20261009/present-contract/rea-evidence.json)에 남긴다.
+**Commit 시점 Present 예약은 GPTK 4.0b3 방식으로 이식했다(2026-10-30).** Pristine 4.0b3(SHA256 `a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660`) `DoPresent` `0x16cc46`의 Metal4 경로는 queue GPU order wait → commit → `signalEvent` → `signalDrawable:` → CPU `present`이고, completion block `0x16e669`은 오류 로그와 pool 반환만 한다. D3Dalloy도 이제 `m4_commit`에서 `signalDrawable` 직후 present하며, cross-queue 순서는 이전 frame의 commit(또는 skip)을 기다린 뒤 GPU `waitForEvent`로 잇는다. GPU 완료를 CPU에서 기다리지 않는다. **계약 변화:** commit 이전의 frame은 `DXGI_PRESENT_RESTART`로 여전히 버리지만, 이미 commit된 frame은 이후 RESTART나 GPU 오류가 생겨도 표시된다(4.0b3와 동일). Composition 경로도 같은 순서를 따른다. [present-queues](../build/local/w8-present-queues-021/result.json)의 native restart case는 이 계약으로 갱신했다. 근거는 [REA pseudocode](../build/local/d3dmetal-4b3-present-20261030/)이며 실게임 지연·FPS 개선 증거는 아니다. 이전 4.0b2 판정과 근거는 [바이너리 식별](../build/local/d3dmetal-opt-port-20261009/present-contract/identity.json)·[REA 근거](../build/local/d3dmetal-opt-port-20261009/present-contract/rea-evidence.json)에 남긴다.
 
 **Native residency set은 device 단위 하나다(2026-10-30, 4.0b3 `DoExecute` `D3DMDevice+200`/lock `+0xc4`).** 모든 recording이 같은 `MTLDevice`의 set을 공유하고, allocation마다 살아 있는 recording 수를 센다. 아무도 쓰지 않던 allocation만 End/split에서 추가하고, 마지막 사용자가 commit 반환과 GPU 완료를 모두 지난 뒤(또는 제출되지 않은 recording이 해제될 때) 제거한다. 같은 lock이 native `commit`을 감싸 preCommit traversal 중 제거를 막는다. 모든 [GPU suite](../build/local/w8-render-passes-res4/)는 `live_allocations=0`, add=remove로 끝난다. fixture는 frame을 겹쳐 실행하지 않으므로 commit 감소는 측정되지 않았다.
 
@@ -324,7 +368,7 @@ Writable-MSAA helper는 실제 실행 목록 전체를 기준으로 추적한다
 
 Direct/indirect diffuse/specular radiance는 signal별 `MTL4FXTemporalDenoisedScaler`가 처리한다. AO·dominant-light visibility·specular occlusion은 MetalFX 색상 denoiser 입력이 아니므로 analytic filter로 처리한다. Primary-albedo demodulation, octahedral normal·sqrt albedo·signed depth 변환, jitter grid 복원, checkerboard·material 경계 correction은 provider-specific 구현이며 AMD 학습 모델 재현이 아니다. MetalFX RR은 NGX RR 경로와 같은 non-fused backend(`setVersion:0x10000`)를 선택한다. 기본 fused backend는 macOS 27.2 M5 Pro에서 `Conv3x3Stride1U8` invalid load(offset 12672)를 Shader Validation에 기록했다. Debug view(key 7·debug descriptor), context 없는 expected-memory query, context 없는 legacy default query는 unsupported로 반환한다. Memory query는 owned conversion/correction/history allocation만 보고하며 opaque MetalFX model memory는 포함하지 않는다.
 
-GPTK 4.0b3 D3DMetal(SHA256 `a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660`)을 REA/Ghidra로 다시 확인했다. `ngx::DenoiserMPL::Evaluate` `0x112296`이 읽는 NGX key는 DXMT NGX RR이 이미 읽는 key와 같다. 차이는 `DLSSD.ColorBeforeParticles`를 MetalFX `transparencyOverlayTexture`로 넘기는 부분이다. 이 의미 변환 근거가 없어 DXMT는 해당 guide를 계속 거부한다. `DenoiserMPL::Create` `0x113550`은 output-resolution/jittered MV flag를 descriptor에 기록하고, `reactiveMaskMode()`는 macOS 26.1 이상에서 mode 2를 선택한다. 이 조사 결과로 DLSS RR 경로는 바꾸지 않았다. AMD RR에는 GPTK 대응 경로가 없다.
+GPTK 4.0b3 D3DMetal(SHA256 `a64950e8324cec32c9a442daa1fafd03823bd199fdd84fee5c73679b5fe86660`)을 REA/Ghidra로 다시 확인했다. `ngx::DenoiserMPL::Evaluate` `0x112296`이 읽는 NGX key는 D3Dalloy NGX RR이 이미 읽는 key와 같다. 차이는 `DLSSD.ColorBeforeParticles`를 MetalFX `transparencyOverlayTexture`로 넘기는 부분이다. 이 의미 변환 근거가 없어 D3Dalloy는 해당 guide를 계속 거부한다. `DenoiserMPL::Create` `0x113550`은 output-resolution/jittered MV flag를 descriptor에 기록하고, `reactiveMaskMode()`는 macOS 26.1 이상에서 mode 2를 선택한다. 이 조사 결과로 DLSS RR 경로는 바꾸지 않았다. AMD RR에는 GPTK 대응 경로가 없다.
 
 **검증:** `build/local/rr-verify-20261030/runtime-02` manifest `a9c15610448eb9611fb402d701220967a99ff221f5927455e750482520cfa085`에서 [`fsr-rr` suite](../build/local/rr-verify-20261030/run-fsr-rr-02/result.json)가 x64 API+Shader Validation PASS(exit 0, validation 오류 0)였다. 1.2 seven-signal dispatch, 1.0/1.1의 split·fused·composite 6 mode, context destroy 뒤 replay, legacy depth-delta history 선택을 GPU readback으로 확인했다. 같은 runtime의 기존 `fsr` SR suite는 fixture 출력과 validation이 모두 정상이었지만 runner가 frame 0–3을 한 번만 기대해 pass=false로 남았다. 이 불일치는 이번 변경 전부터 있던 runner/fixture 기대값 문제다. Native DLSS RR probe `owned-rr-motion-native`도 Shader Validation 오류 0으로 통과했다. WoW64 x86, ARM64/FEX, 실제 AMD RR 사용 게임, AMD 모델·화질 동등성은 검증하지 않았다.
 

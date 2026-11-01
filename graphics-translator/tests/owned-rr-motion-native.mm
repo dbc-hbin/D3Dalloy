@@ -39,43 +39,43 @@ static void upload(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLShared
   [blit endEncoding]; finish(command,event,value);
   [buffer release];
 }
-static void descriptorReuse(const std::shared_ptr<dxmt_rr::Core> &owner) {
-  auto core = std::make_shared<dxmt_rr::Core>();
+static void descriptorReuse(const std::shared_ptr<d3dalloy_rr::Core> &owner) {
+  auto core = std::make_shared<d3dalloy_rr::Core>();
   core->device = [owner->device retain]; core->compiler = [owner->compiler retain];
-  core->info.feature_flags = dxmt_rr::Flag | 2 | 8;
+  core->info.feature_flags = d3dalloy_rr::Flag | 2 | 8;
   WMTMetal4FXTemporalFrame p{}; p.input_width = p.input_height = 128; p.output_rect = {0,0,128,128};
-  auto a = dxmt_rr::generation(*core,p); require(bool(a),"generation-A");
-  p.specular_hit_distance = 1; auto b = dxmt_rr::generation(*core,p); require(bool(b),"generation-B");
-  p.reactive = 1; auto c = dxmt_rr::generation(*core,p); require(bool(c),"generation-C");
-  p.specular_hit_distance = p.reactive = 0; auto restored = dxmt_rr::generation(*core,p);
+  auto a = d3dalloy_rr::generation(*core,p); require(bool(a),"generation-A");
+  p.specular_hit_distance = 1; auto b = d3dalloy_rr::generation(*core,p); require(bool(b),"generation-B");
+  p.reactive = 1; auto c = d3dalloy_rr::generation(*core,p); require(bool(c),"generation-C");
+  p.specular_hit_distance = p.reactive = 0; auto restored = d3dalloy_rr::generation(*core,p);
   require(restored == a && a != b && b != c && a != c,"A-B-C-A-descriptor-reuse");
   require(b->serial == a->serial + 1 && c->serial == b->serial + 1,"three-native-generation-creations");
   auto queue = [core->device newCommandQueue]; auto queue4 = [core->device newMTL4CommandQueue];
   auto event = [core->device newSharedEvent]; uint64_t value = 0;
   require(queue && queue4 && event,"native-queues");
-  std::array<std::shared_ptr<dxmt_rr::Generation>,4> generations{a,b,c,restored};
+  std::array<std::shared_ptr<d3dalloy_rr::Generation>,4> generations{a,b,c,restored};
   std::vector<float> firstA;
   for (unsigned mode = 0; mode < generations.size(); ++mode) {
-    auto frame = [DXMTRRFrame new]; frame->core = core; frame->generation = generations[mode];
+    auto frame = [D3DALLOYRRFrame new]; frame->core = core; frame->generation = generations[mode];
     frame->props = p; frame->props.motion_scale_x = frame->props.motion_scale_y = 1;
     auto scaler = frame->generation->scaler;
-    const MTLTextureUsage usage[dxmt_rr::Count] = {scaler.colorTextureUsage,scaler.depthTextureUsage,
+    const MTLTextureUsage usage[d3dalloy_rr::Count] = {scaler.colorTextureUsage,scaler.depthTextureUsage,
       scaler.motionTextureUsage,scaler.outputTextureUsage,0,scaler.reactiveMaskTextureUsage,0,
       scaler.diffuseAlbedoTextureUsage,scaler.specularAlbedoTextureUsage,scaler.normalTextureUsage,
       scaler.roughnessTextureUsage,scaler.specularHitDistanceTextureUsage};
     for (size_t i : {0u,1u,2u,3u,7u,8u,9u,10u}) {
-      auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dxmt_rr::format(i) width:128 height:128 mipmapped:NO];
+      auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d3dalloy_rr::format(i) width:128 height:128 mipmapped:NO];
       d.storageMode = MTLStorageModePrivate; d.usage = usage[i] | MTLTextureUsageShaderRead;
       frame->inputs[i] = [core->device newTextureWithDescriptor:d]; require(frame->inputs[i] != nil,"required-input");
       frame->rects[i] = {0,0,128,128};
     }
     if (mode == 1 || mode == 2) {
-      auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dxmt_rr::format(11) width:128 height:128 mipmapped:NO];
+      auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d3dalloy_rr::format(11) width:128 height:128 mipmapped:NO];
       d.storageMode = MTLStorageModePrivate; d.usage = usage[11] | MTLTextureUsageShaderRead;
       frame->inputs[11] = [core->device newTextureWithDescriptor:d]; frame->rects[11] = {0,0,128,128};
     }
     if (mode == 2) {
-      auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dxmt_rr::format(5) width:128 height:128 mipmapped:NO];
+      auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d3dalloy_rr::format(5) width:128 height:128 mipmapped:NO];
       d.storageMode = MTLStorageModePrivate; d.usage = usage[5] | MTLTextureUsageShaderRead;
       frame->inputs[5] = [core->device newTextureWithDescriptor:d]; frame->rects[5] = {0,0,128,128};
     }
@@ -90,8 +90,8 @@ static void descriptorReuse(const std::shared_ptr<dxmt_rr::Core> &owner) {
     if (frame->inputs[11]) upload(core->device,queue,event,value,frame->inputs[11],scene.hit.data(),128*4);
     std::vector<uint16_t> reactive(128*128,0);
     if (frame->inputs[5]) upload(core->device,queue,event,value,frame->inputs[5],reactive.data(),128*2);
-    dxmt_rr::Resources resources; std::array<id<MTLTexture>,dxmt_rr::Count> bound{};
-    require(dxmtRRResources(frame,resources,bound),"native-resource-selection");
+    d3dalloy_rr::Resources resources; std::array<id<MTLTexture>,d3dalloy_rr::Count> bound{};
+    require(d3dalloyRRResources(frame,resources,bound),"native-resource-selection");
     auto allocator = [core->device newCommandAllocator];
     auto readback = [core->device newBufferWithLength:128*128*8 options:MTLResourceStorageModeShared];
     for (auto texture : bound) if (texture) [resources.residency addAllocation:texture];
@@ -103,7 +103,7 @@ static void descriptorReuse(const std::shared_ptr<dxmt_rr::Core> &owner) {
       scaler.preExposure=1; scaler.depthReversed=YES; scaler.shouldResetHistory=!warm;
       scaler.motionVectorScaleX=scaler.motionVectorScaleY=1;
       scaler.jitterOffsetX=scene.jitterX; scaler.jitterOffsetY=scene.jitterY;
-      simd_float4x4 world, projection; dxmt_rr::matrix(world,scene.world); dxmt_rr::matrix(projection,scene.projection);
+      simd_float4x4 world, projection; d3dalloy_rr::matrix(world,scene.world); d3dalloy_rr::matrix(projection,scene.projection);
       scaler.worldToViewMatrix=world; scaler.viewToClipMatrix=projection;
       auto command=[core->device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
       [command useResidencySet:resources.residency]; [scaler encodeToCommandBuffer:command]; [command endCommandBuffer];
@@ -133,17 +133,17 @@ static void descriptorReuse(const std::shared_ptr<dxmt_rr::Core> &owner) {
     [readback release]; [allocator release]; [frame release];
   }
   [event release]; [queue4 release]; [queue release];
-  auto feature = [DXMTRRFeature new]; feature->core = core;
-  auto prepared = [DXMTRRFrame new]; prepared->core = core; prepared->generation = a;
-  std::weak_ptr<dxmt_rr::Generation> retained = a, idleB = b, idleC = c;
+  auto feature = [D3DALLOYRRFeature new]; feature->core = core;
+  auto prepared = [D3DALLOYRRFrame new]; prepared->core = core; prepared->generation = a;
+  std::weak_ptr<d3dalloy_rr::Generation> retained = a, idleB = b, idleC = c;
   a.reset(); b.reset(); c.reset(); restored.reset(); generations.fill(nullptr);
   struct WMTMetal4Call dormant{}; dormant.operation = WMTMetal4FXDormantTemporal;
   dormant.args[0] = uintptr_t(feature);
-  require(dxmtRRCall(&dormant),"dormant-dispatch");
+  require(d3dalloyRRCall(&dormant),"dormant-dispatch");
   for (const auto &cached : core->generations) require(!cached,"dormant-cache-empty");
   require(idleB.expired() && idleC.expired() && !retained.expired() &&
           prepared->generation->scaler != nil,"dormant-releases-only-idle-generations");
-  auto execution = [DXMTRRExecution new]; execution->core = core;
+  auto execution = [D3DALLOYRRExecution new]; execution->core = core;
   execution->generation = prepared->generation;
   [prepared release]; [feature release];
   require(!retained.expired() && execution->generation->scaler != nil,"execution-retains-generation");
@@ -154,8 +154,8 @@ static void descriptorReuse(const std::shared_ptr<dxmt_rr::Core> &owner) {
 }
 
 int main() { @autoreleasepool {
-  auto frame = [DXMTRRFrame new];
-  frame->core = std::make_shared<dxmt_rr::Core>();
+  auto frame = [D3DALLOYRRFrame new];
+  frame->core = std::make_shared<d3dalloy_rr::Core>();
   auto &core = *frame->core;
   core.device = MTLCreateSystemDefaultDevice();
   auto descriptor = [MTL4CompilerDescriptor new];
@@ -164,13 +164,13 @@ int main() { @autoreleasepool {
   auto &p = frame->props;
   p.input_width = p.input_height = 128; p.output_rect = {0,0,128,128};
   p.motion_scale_x = p.motion_scale_y = 1;
-  core.info.feature_flags = dxmt_rr::Flag | 2 | 8;
-  frame->generation = dxmt_rr::generation(core,p);
+  core.info.feature_flags = d3dalloy_rr::Flag | 2 | 8;
+  frame->generation = d3dalloy_rr::generation(core,p);
   if (!frame->generation) return 1;
   const MTLTextureUsage usage = frame->generation->scaler.motionTextureUsage | MTLTextureUsageShaderRead;
   unsigned cases = 0;
   for (unsigned variant = 0; variant < 9; ++variant) {
-    core.info.feature_flags = dxmt_rr::Flag | 2 | 8;
+    core.info.feature_flags = d3dalloy_rr::Flag | 2 | 8;
     p.motion_scale_x = p.motion_scale_y = 1;
     frame->rects[2] = {0,0,128,128};
     p.output_rect = {0,0,128,128};
@@ -187,14 +187,14 @@ int main() { @autoreleasepool {
     d.storageMode = MTLStorageModePrivate; d.usage = usage;
     [frame->inputs[2] release]; frame->inputs[2] = [core.device newTextureWithDescriptor:d];
     if (!frame->inputs[2]) return 1;
-    auto formats = dxmt_rr::fixedFormats();
-    formats[2] = dxmt_rr::descriptorFormat(core,p,2,frame->inputs[2],frame->rects[2]);
-    frame->generation = dxmt_rr::generation(core,p,formats);
+    auto formats = d3dalloy_rr::fixedFormats();
+    formats[2] = d3dalloy_rr::descriptorFormat(core,p,2,frame->inputs[2],frame->rects[2]);
+    frame->generation = d3dalloy_rr::generation(core,p,formats);
     if (!frame->generation) return 1;
-    dxmt_rr::Resources resources;
-    std::array<id<MTLTexture>,dxmt_rr::Count> bound{};
+    d3dalloy_rr::Resources resources;
+    std::array<id<MTLTexture>,d3dalloy_rr::Count> bound{};
     const bool direct = variant == 0 || variant == 5 || variant == 8;
-    if (!dxmtRRResources(frame,resources,bound) || (bound[2] == frame->inputs[2]) != direct ||
+    if (!d3dalloyRRResources(frame,resources,bound) || (bound[2] == frame->inputs[2]) != direct ||
         (resources.textures[2] == nil) != direct) {
       std::fprintf(stderr,"OWNED_RR_MOTION_FAIL case=%u expected_direct=%u\n",variant,unsigned(direct));
       return 1;

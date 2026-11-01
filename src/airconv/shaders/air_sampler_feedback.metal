@@ -111,13 +111,13 @@ inline void record(device atomic_uint *map, Layout l, uint slice, uint level, in
 
 } // namespace
 
-void dxmt_sampler_feedback_write(
+void d3dalloy_sampler_feedback_write(
     device uint *cells, ulong layout_word, ulong sampler_meta, ulong sampler_lod, ulong srv_meta,
     ulong srv_range, float u, float v, float layer, float dudx, float dvdx, float dudy, float dvdy, float value,
     float lod_clamp, uint explicit_level, uint skip
-) asm("dxmt.sampler_feedback.write");
+) asm("d3dalloy.sampler_feedback.write");
 
-void dxmt_sampler_feedback_write(
+void d3dalloy_sampler_feedback_write(
     device uint *cells, ulong layout_word, ulong sampler_meta, ulong sampler_lod, ulong srv_meta,
     ulong srv_range, float u, float v, float layer, float dudx, float dvdx, float dudy, float dvdy, float value,
     float lod_clamp, uint explicit_level, uint skip

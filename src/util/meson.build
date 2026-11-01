@@ -23,7 +23,7 @@ util_src = files([
   'sha1/sha1_util.cpp',
 ])
 
-if not dxmt_crossbuild
+if not d3dalloy_crossbuild
   util_src += files([
     'wsi_monitor_headless.cpp',
     'wsi_window_headless.cpp',
@@ -38,7 +38,7 @@ else
 endif
 
 util_lib = static_library('util', util_src,
-  include_directories : [ dxmt_include_path ],
+  include_directories : [ d3dalloy_include_path ],
 )
 
 util_dep = declare_dependency(

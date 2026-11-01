@@ -6,7 +6,7 @@
 #include <memory>
 #include <functional>
 
-namespace dxmt {
+namespace d3dalloy {
 class MTLD3D12Device;
 class MTLD3D12Resource;
 struct OwnedTemporalFrame;
@@ -33,4 +33,4 @@ void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
     WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence, uint64_t queue, uint64_t submission, uint64_t encoder,
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
     const std::function<void(WMT::Event, uint64_t)> &signal_event);
-} // namespace dxmt
+} // namespace d3dalloy

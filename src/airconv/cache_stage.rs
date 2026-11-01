@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 use super::cache_wire::{input, output, put_u32, put_u64, range, u32_at, u64_at};
 
-const MAGIC: u64 = 0x314754534d584444;
+const MAGIC: u64 = u64::from_le_bytes(*b"D3ALSTG1");
 const VERSION: u32 = 2;
 const HEADER_SIZE: u64 = 128;
 const IDENTITY_OFFSET: u64 = 56;
@@ -243,7 +243,7 @@ unsafe fn publish<T>(out: *mut T, value: Result<T>) -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn dxmt_stage_cache_file_size(size: u64) -> u32 {
+pub extern "C" fn d3dalloy_stage_cache_file_size(size: u64) -> u32 {
     match file_size(size) {
         Ok(()) => 0,
         Err(error) => error as u32,
@@ -251,7 +251,7 @@ pub extern "C" fn dxmt_stage_cache_file_size(size: u64) -> u32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_stage_cache_measure(value: *const StageParts, out: *mut u64) -> u32 {
+pub unsafe extern "C" fn d3dalloy_stage_cache_measure(value: *const StageParts, out: *mut u64) -> u32 {
     let result = (|| {
         let parts = unsafe { parts(value) }?;
         let info = measure(&parts)?;
@@ -261,7 +261,7 @@ pub unsafe extern "C" fn dxmt_stage_cache_measure(value: *const StageParts, out:
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_stage_cache_encode(value: *const StageParts, destination: *mut u8,
+pub unsafe extern "C" fn d3dalloy_stage_cache_encode(value: *const StageParts, destination: *mut u8,
                                                 destination_size: u64, out: *mut StageLayout) -> u32 {
     if out.is_null() {
         return Error::InvalidArgument as u32;
@@ -275,7 +275,7 @@ pub unsafe extern "C" fn dxmt_stage_cache_encode(value: *const StageParts, desti
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_stage_cache_decode(data: *const u8, size: u64, key: *const u8,
+pub unsafe extern "C" fn d3dalloy_stage_cache_decode(data: *const u8, size: u64, key: *const u8,
                                                 key_size: u64, identity: *const u8, out: *mut StageLayout) -> u32 {
     let result = (|| {
         file_size(size)?;

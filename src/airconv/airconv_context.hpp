@@ -2,7 +2,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/OptimizationLevel.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 void initializeModule(llvm::Module &M);
 
@@ -15,15 +15,15 @@ void linkSamplePos(llvm::Module &M);
 
 void linkTessellation(llvm::Module &M);
 
-/** Links the exact fp32 denorm-preserve helpers (dxmt.denorm.*, air_denorm.metal). */
+/** Links the exact fp32 denorm-preserve helpers (d3dalloy.denorm.*, air_denorm.metal). */
 void linkDenorm(llvm::Module &M);
-/** Links the integer-only exact binary64 helpers (dxmt.fp64.*, air_fp64.cpp). */
+/** Links the integer-only exact binary64 helpers (d3dalloy.fp64.*, air_fp64.cpp). */
 void linkFP64(llvm::Module &M);
 /** Links only SC32 metadata operations; application i64 CAS is fully emulated. */
 void linkAtomic64(llvm::Module &M);
-/** Links the D3D12 sampler feedback writer (dxmt.sampler_feedback.write, air_sampler_feedback.metal). */
+/** Links the D3D12 sampler feedback writer (d3dalloy.sampler_feedback.write, air_sampler_feedback.metal). */
 void linkSamplerFeedback(llvm::Module &M);
-/** Links the conservative rasterization replay corner (dxmt.conservative.corner, air_conservative.metal). */
+/** Links the conservative rasterization replay corner (d3dalloy.conservative.corner, air_conservative.metal). */
 void linkConservative(llvm::Module &M);
 
-} // namespace dxmt
+} // namespace d3dalloy

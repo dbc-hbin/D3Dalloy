@@ -55,7 +55,7 @@
 
 using namespace llvm;
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 /* -------------------------------------------------------------------------- */
 /* Invocation block layout                                                    */
@@ -924,7 +924,7 @@ RtShaderRecord EmitShaderRecordLookup(
     return builder.CreateAlignedLoad(i32, builder.CreateGEP(i32, words, builder.getInt32(i)), Align(4));
   };
   Value *ours = builder.CreateAnd(
-    builder.CreateAnd(builder.CreateICmpEQ(word(0), builder.getInt32(0x544D5844u)),
+    builder.CreateAnd(builder.CreateICmpEQ(word(0), builder.getInt32(0x4c413344u)),
                       builder.CreateICmpEQ(word(1), builder.getInt32(1u | (1u << 16)))),
     builder.CreateICmpEQ(word(2), token)
   );
@@ -946,4 +946,4 @@ RtShaderRecord EmitShaderRecordLookup(
   return {export_index, local_entry};
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

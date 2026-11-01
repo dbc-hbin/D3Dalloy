@@ -2,7 +2,7 @@
 #include "d3d11_device.hpp"
 #include "util_d3dkmt.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 struct MTLD3D11Fence : public ID3D11Fence {
   WMT::Reference<WMT::SharedEvent> event;
@@ -17,4 +17,4 @@ HRESULT
 OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
                 REFIID riid, void **ppFence);
 
-} // namespace dxmt
+} // namespace d3dalloy

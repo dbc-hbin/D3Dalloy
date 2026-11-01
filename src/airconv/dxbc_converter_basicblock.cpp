@@ -27,9 +27,9 @@
 #include <array>
 #include <stack>
 
-char dxmt::UnsupportedFeature::ID;
+char d3dalloy::UnsupportedFeature::ID;
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 template <typename T = std::monostate>
 ReaderIO<context, T> throwUnsupported(llvm::StringRef ref) {
@@ -519,7 +519,7 @@ IREffect pull_vertex_input(
     if (!ctx.resource.vertex_buffer_table) {
       ctx.resource.vertex_buffer_table = ctx.builder.CreateBitCast(
         ctx.function->getArg(vbuf_table),
-        ctx.types._dxmt_vertex_buffer_entry->getPointerTo((uint32_t
+        ctx.types._d3dalloy_vertex_buffer_entry->getPointerTo((uint32_t
         )air::AddressSpace::constant)
       );
     }
@@ -529,9 +529,9 @@ IREffect pull_vertex_input(
       ? __builtin_popcount((slot_mask << shift) >> shift) : 0;
     const unsigned entry_index = dense_vertex_table ? element_info.slot : compact_index;
     auto vertex_buffer_entry = builder.CreateLoad(
-      types._dxmt_vertex_buffer_entry,
+      types._d3dalloy_vertex_buffer_entry,
       builder.CreateConstGEP1_32(
-        types._dxmt_vertex_buffer_entry, vertex_buffer_table,
+        types._d3dalloy_vertex_buffer_entry, vertex_buffer_table,
         entry_index
       )
     );
@@ -734,11 +734,11 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
   return visited[entry];
 }
 
-} // namespace dxmt::dxbc
+} // namespace d3dalloy::dxbc
 
 template <>
-struct environment_cast<::dxmt::dxbc::context, ::dxmt::air::AIRBuilderContext> {
-  ::dxmt::air::AIRBuilderContext cast(const ::dxmt::dxbc::context &src) {
+struct environment_cast<::d3dalloy::dxbc::context, ::d3dalloy::air::AIRBuilderContext> {
+  ::d3dalloy::air::AIRBuilderContext cast(const ::d3dalloy::dxbc::context &src) {
     return {src.llvm, src.module, src.builder, src.types, src.air};
   };
 };

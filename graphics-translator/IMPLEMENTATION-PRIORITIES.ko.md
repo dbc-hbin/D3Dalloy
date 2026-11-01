@@ -8,7 +8,7 @@
 
 ## 2026-11-03 후속
 
-도시 진입은 [TLAS prebuild·library 리소스 배열 수정](CORE-IMPLEMENTATION-STATUS.ko.md#zzz-도시-레이트레이싱-수정--2026-11-02)으로 해결했다. 남은 일: 레이트레이싱 threadgroup 수정 뒤 도시 구간 FPS·GPU 시간 측정, placed heap aliasing을 포함한 opaque 노드의 접근 모델(`ResolveTextureRegion`·allocator heap 소스·MSAA capture), FSR FG pacing jitter, `raytracing-atomic64` 기존 실패 3 case, 나머지 d3dalloy 이름(D3D11/DXGI·`dxmt.conf`·`DXMT_*` 설정·내부 이름·모듈 이름).
+도시 진입은 [TLAS prebuild·library 리소스 배열 수정](CORE-IMPLEMENTATION-STATUS.ko.md#zzz-도시-레이트레이싱-수정--2026-11-02)으로 해결했다. 남은 일: 레이트레이싱 threadgroup 수정 뒤 도시 구간 FPS·GPU 시간 측정, placed heap aliasing을 포함한 opaque 노드의 접근 모델(`ResolveTextureRegion`·allocator heap 소스·MSAA capture), FSR FG pacing jitter, `raytracing-atomic64` 기존 실패 3 case.
 
 ## 2026-11-02 후속
 
@@ -24,7 +24,7 @@
 
 ## 현재 관리 범위
 
-이 저장소는 DXMT D3D12 번역기와 그 검증을 관리한다. Wine SDK/runtime 빌드는 별도 Wine-darwin, FEX 소스·빌드는 FEX-darwin의 책임이다. 아래 완료 결과와 미완료 계약을 구분하며, 과거 세션의 실행 순서·중단·위임 지시는 현재 작업 지시로 유지하지 않는다.
+이 저장소는 D3Dalloy D3D12 번역기와 그 검증을 관리한다. Wine SDK/runtime 빌드는 별도 Wine-darwin, FEX 소스·빌드는 FEX-darwin의 책임이다. 아래 완료 결과와 미완료 계약을 구분하며, 과거 세션의 실행 순서·중단·위임 지시는 현재 작업 지시로 유지하지 않는다.
 
 ## D3DMetal 최적화 이식 후 남은 검증
 

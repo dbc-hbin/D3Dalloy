@@ -6,9 +6,9 @@
 #include <cstdint>
 #include <vector>
 
-namespace dxmt::raytracing {
+namespace d3dalloy::raytracing {
 
-/* Every acceleration structure dxmt builds carries this 64-byte header at its D3D12 GPU
+/* Every acceleration structure d3dalloy builds carries this 64-byte header at its D3D12 GPU
  * virtual address, followed by the shadow copy of its build inputs. Everything is written on the
  * GPU, in the pass that builds/updates/copies the structure, so it can never race the CPU
  * (rt_as_prepass.metal). Ray-tracing shaders read the native structure through the first two
@@ -65,7 +65,7 @@ struct BufferLocation {
   uint64_t address = 0;
 };
 
-/* One geometry of a bottom-level shadow copy (rt_as_prepass.metal: DXMTASShadowGeometry). The
+/* One geometry of a bottom-level shadow copy (rt_as_prepass.metal: D3DALLOYASShadowGeometry). The
  * offsets are relative to the acceleration-structure address, so a verbatim copy of the header and
  * shadow describes itself wherever it is copied to. */
 struct ShadowGeometry {
@@ -91,7 +91,7 @@ static_assert(sizeof(ShadowGeometry) == 96, "shadow geometry layout");
 
 inline constexpr uint32_t kShadowHasTransform = 0x80000000u;
 
-/* One strided copy the shadow kernel performs (rt_as_prepass.metal: DXMTASShadowJob). Element i
+/* One strided copy the shadow kernel performs (rt_as_prepass.metal: D3DALLOYASShadowJob). Element i
  * copies `elementSize` bytes from the source to `destinationOffset + i * destinationStride` of the
  * acceleration structure and zero-fills the rest of the destination stride. */
 struct ShadowJob {
@@ -113,7 +113,7 @@ enum : uint32_t {
   kShadowJobPointers = 1,
 };
 
-/* The shadow kernel's metadata source (DXMTASShadowParams::metadataMode). */
+/* The shadow kernel's metadata source (D3DALLOYASShadowParams::metadataMode). */
 enum : uint32_t {
   /* The header words come from the kernel parameters (build, update). */
   kShadowMetadataParams = 0,
@@ -145,7 +145,7 @@ struct ShadowParams {
 };
 static_assert(sizeof(ShadowParams) == 72, "shadow params layout");
 
-/* dxmt_as_postbuild operations: the D3D12 postbuild info types, plus the step that turns the
+/* d3dalloy_as_postbuild operations: the D3D12 postbuild info types, plus the step that turns the
  * Metal compacted size a compaction wrote into the header into the D3D12 current size. */
 inline constexpr uint32_t kPostbuildFinalizeCompactedHeader = 0x100;
 inline constexpr uint32_t kPostbuildRestoreOmmHeader = 0x101;
@@ -185,7 +185,7 @@ struct ShadowPlan {
 };
 
 /* D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER; the serialized blob continues with
- * the bottom-level pointers (top level), a copy of the dxmt header and the shadow. */
+ * the bottom-level pointers (top level), a copy of the d3dalloy header and the shadow. */
 inline constexpr uint64_t kSerializedHeaderSize = 56;
 static_assert(sizeof(D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER) == kSerializedHeaderSize);
 static_assert(sizeof(D3D12_RAYTRACING_GEOMETRY_DESC) == 56);
@@ -314,14 +314,14 @@ struct DeserializedStructure {
   std::vector<ShadowGeometry> geometries;
 };
 
-/* `layout` comes from dxmt_rtas_serialized_prefix/_block over the same header bytes. */
+/* `layout` comes from d3dalloy_rtas_serialized_prefix/_block over the same header bytes. */
 HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER &serialized,
-    const DxmtRtasSerializedLayout &layout, const AccelerationStructureHeader &header, const uint8_t *geometryData,
+    const D3DalloyRtasSerializedLayout &layout, const AccelerationStructureHeader &header, const uint8_t *geometryData,
     uint64_t geometryBytes, uint64_t registryID, const BufferLocation &destination, DeserializedStructure &result);
 
-} // namespace dxmt::raytracing
+} // namespace d3dalloy::raytracing
 
-namespace dxmt {
+namespace d3dalloy {
 struct RTASComputePipelines {
   WMT::Reference<WMT::ComputePipelineState> prepass;
   WMT::Reference<WMT::ComputePipelineState> shadow, postbuild, serialize, deserialize, visualize, visualizeDescriptors;

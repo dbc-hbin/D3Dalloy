@@ -90,7 +90,7 @@ effectiveReset = recordedCallerReset || lastExecutedGeneration != thisGeneration
 
 ## Runtime publication
 
-`stage-owned-graphics.py stage --with-nvngx`는 owned marker `own-ngxd3d12`와 required D3D12 exports를 검증하고, [실제 Authenticode 서명·prefix 한정 공개 인증서 등록](RUNTIME.ko.md#선택적-owned-nvidia-extension)을 포함한 DLL을 stage/hash한다. Wrapper는 `nvngx=b`를 사용하고 vendor extension 선택 시 `DXMT_ENABLE_NVEXT=1`을 내부에서 설정한다. NVNGX/NVAPI를 둘 다 선택하지 않으면 inherited NVEXT를 제거하고 vendor DLL fallback을 막는다. DXGI NVEXT setup의 `NGXCore\\FullPath` 등록만으로 실제 Streamline lookup이 증명되지는 않는다.
+`stage-owned-graphics.py stage --with-nvngx`는 owned marker `own-ngxd3d12`와 required D3D12 exports를 검증하고, [실제 Authenticode 서명·prefix 한정 공개 인증서 등록](RUNTIME.ko.md#선택적-owned-nvidia-extension)을 포함한 DLL을 stage/hash한다. Wrapper는 `nvngx=b`를 사용하고 vendor extension 선택 시 `D3DALLOY_ENABLE_NVEXT=1`을 내부에서 설정한다. NVNGX/NVAPI를 둘 다 선택하지 않으면 inherited NVEXT를 제거하고 vendor DLL fallback을 막는다. DXGI NVEXT setup의 `NGXCore\\FullPath` 등록만으로 실제 Streamline lookup이 증명되지는 않는다.
 
 `nvngx_dlss.dll`의 feature-plugin exports와 core-style `nvngx.dll` API는 동일 surface가 아니다. Synthetic PE는 system32 core DLL을 직접 요청한다. 실제 앱의 loader 선택, Streamline adapter 판단, public NGX 호출, queue encode, 출력까지의 관찰을 별도로 요구한다. 게임 plugin을 static 추측만으로 교체하지 않는다.
 

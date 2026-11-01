@@ -4,7 +4,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 
-namespace dxmt::logic_op {
+namespace d3dalloy::logic_op {
 /* Rewrites the native fragment's existing epilogues in place; it never reinvokes the application shader.
  * UINT targets in options.rt_mask return op(output, framebuffer) masked to their storage component widths.
  * MSAA callers must use the execution-frequency contract in SM50_SHADER_D3D12_LOGIC_OP_DATA. */

@@ -5,10 +5,10 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 using namespace llvm;
 namespace {
-constexpr const char *helperAttribute = "dxmt.atomic64.helper";
+constexpr const char *helperAttribute = "d3dalloy.atomic64.helper";
 
 FunctionCallee nativeHelper(Module &module, StringRef name, ArrayRef<Type *> arguments) {
   return module.getOrInsertFunction(name, FunctionType::get(Type::getInt64Ty(module.getContext()), arguments, false));
@@ -255,14 +255,14 @@ bool HasDeviceAtomic64(const Module &module) {
 Value *EmitAtomic64CellRead(IRBuilderBase &builder, Value *root) {
   auto *context = EmitAtomic64Context(builder);
   auto &module = *builder.GetInsertBlock()->getModule();
-  auto *function = module.getFunction("dxmt.atomic64.read");
+  auto *function = module.getFunction("d3dalloy.atomic64.read");
   if (!function) {
     function = Function::Create(FunctionType::get(builder.getInt64Ty(),
         {context->getType(), root->getType()}, false), GlobalValue::InternalLinkage,
-        "dxmt.atomic64.read", module);
+        "d3dalloy.atomic64.read", module);
     auto *entry = BasicBlock::Create(builder.getContext(), "entry", function);
     IRBuilder<> body(entry);
-    auto reader = nativeHelper(module, "dxmt_atomic64_read", {context->getType(), root->getType()});
+    auto reader = nativeHelper(module, "d3dalloy_atomic64_read", {context->getType(), root->getType()});
     auto *value = body.CreateCall(reader, {function->getArg(0), function->getArg(1)});
     body.CreateRet(value);
     // Reads remain available to helper lanes; only updates carry helperAttribute.
@@ -278,14 +278,14 @@ Value *EmitAtomic64CellUpdate(IRBuilderBase &builder, Value *root,
   auto *context = EmitAtomic64Context(builder);
   auto callerPoint = builder.saveIP();
   auto *temporary = Function::Create(FunctionType::get(builder.getInt64Ty(),
-    {context->getType(), root->getType()}, false), GlobalValue::InternalLinkage, "dxmt.atomic64.update.tmp", *module);
+    {context->getType(), root->getType()}, false), GlobalValue::InternalLinkage, "d3dalloy.atomic64.update.tmp", *module);
   temporary->addFnAttr(helperAttribute);
   auto *entry = BasicBlock::Create(builder.getContext(), "entry", temporary);
   auto *loop = BasicBlock::Create(builder.getContext(), "retry", temporary);
   auto *done = BasicBlock::Create(builder.getContext(), "done", temporary);
   builder.SetInsertPoint(entry);
-  auto reader = nativeHelper(*module, "dxmt_atomic64_read", {context->getType(), root->getType()});
-  auto cas = nativeHelper(*module, "dxmt_atomic64_compare_exchange", {context->getType(), root->getType(), builder.getInt64Ty(), builder.getInt64Ty()});
+  auto reader = nativeHelper(*module, "d3dalloy_atomic64_read", {context->getType(), root->getType()});
+  auto cas = nativeHelper(*module, "d3dalloy_atomic64_compare_exchange", {context->getType(), root->getType(), builder.getInt64Ty(), builder.getInt64Ty()});
   auto *initial = builder.CreateCall(reader, {temporary->getArg(0), temporary->getArg(1)});
   builder.CreateBr(loop);
   builder.SetInsertPoint(loop);
@@ -314,7 +314,7 @@ Value *EmitAtomic64CellUpdate(IRBuilderBase &builder, Value *root,
   SmallVector<Type *, 10> parameters{context->getType(), root->getType()};
   for (auto *value : captures) parameters.push_back(value->getType());
   auto *function = Function::Create(FunctionType::get(builder.getInt64Ty(), parameters, false),
-    GlobalValue::InternalLinkage, "dxmt.atomic64.update", *module);
+    GlobalValue::InternalLinkage, "d3dalloy.atomic64.update", *module);
   function->addFnAttr(helperAttribute);
   function->getBasicBlockList().splice(function->end(), temporary->getBasicBlockList());
   temporary->getArg(0)->replaceAllUsesWith(function->getArg(0));
@@ -335,7 +335,7 @@ Error LowerAtomic64Phase(Module &module) {
   if (auto error = exposeBufferAtomics(module)) return error;
   SmallVector<Instruction *, 64> accesses;
   for (auto &function : module) {
-    if (function.hasFnAttribute(helperAttribute) || function.getName().startswith("dxmt_atomic64_")) continue;
+    if (function.hasFnAttribute(helperAttribute) || function.getName().startswith("d3dalloy_atomic64_")) continue;
     for (auto &instruction : instructions(function)) {
       if (instruction.getMetadata(kAtomic64Metadata)) continue;
       if (auto *load = dyn_cast<LoadInst>(&instruction); load && load->getPointerAddressSpace() == 1)
@@ -484,10 +484,10 @@ Error LowerAtomic64Phase(Module &module) {
   for (auto &function : module) {
     if (function.isDeclaration() || intersections.contains(&function) ||
         function.hasFnAttribute(Attribute::Convergent)) continue;
-    if (function.hasFnAttribute(helperAttribute) || function.getName().startswith("dxmt.atomic64.read"))
+    if (function.hasFnAttribute(helperAttribute) || function.getName().startswith("d3dalloy.atomic64.read"))
       cooperateAtomic64(function, *cast<ReturnInst>(function.back().getTerminator()));
   }
-  dxmt::linkAtomic64(module);
+  d3dalloy::linkAtomic64(module);
   return Error::success();
 }
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

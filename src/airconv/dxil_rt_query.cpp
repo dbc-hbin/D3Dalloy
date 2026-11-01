@@ -10,7 +10,7 @@
  *   - the resource pass (any stage, root SRV / descriptor table / heap) and the
  *     raytracing pass (library exports) resolve the structure's handle to the D3D12
  *     GPU virtual address its descriptor holds, and call RewriteTraceRayInline, which
- *     replaces `dx.op.rayQuery_TraceRayInline` by `dxmt.rayquery.trace_inline` with
+ *     replaces `dx.op.rayQuery_TraceRayInline` by `d3dalloy.rayquery.trace_inline` with
  *     that address in place of the handle;
  *   - this pass then lowers the query object itself.
  *
@@ -68,11 +68,11 @@
 
 using namespace llvm;
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 namespace {
 
-constexpr const char kTraceInlineFunction[] = "dxmt.rayquery.trace_inline";
+constexpr const char kTraceInlineFunction[] = "d3dalloy.rayquery.trace_inline";
 constexpr const char kQuerySuffix[] = "_intersection_query.instancing.triangle_data";
 
 /* dx.op opcodes of the inline raytracing block (DXC DxilOperations.h). */
@@ -130,7 +130,7 @@ bool dxilOpcode(const CallInst &call, uint32_t &opcode) {
   const Function *callee = call.getCalledFunction();
   if (!callee || !callee->isDeclaration() || call.arg_size() < 1)
     return false;
-  if (callee->getName() == "dxmt.rayquery.hitobject_snapshot") {
+  if (callee->getName() == "d3dalloy.rayquery.hitobject_snapshot") {
     opcode = 263;
     return true;
   }
@@ -339,7 +339,7 @@ Error RayQueryLowerer::snapshot(CallInst &call, Query &q) {
 
 
 Error RayQueryLowerer::lowerTrace(CallInst &call, Query &q) {
-  /* dxmt.rayquery.trace_inline(i32 op, i32 query, i64 address, i32 flags, i32 mask,
+  /* d3dalloy.rayquery.trace_inline(i32 op, i32 query, i64 address, i32 flags, i32 mask,
    *   float ox, oy, oz, tmin, dx, dy, dz, tmax) */
   if (call.arg_size() != 13 || !call.getArgOperand(2)->getType()->isIntegerTy(64))
     return createError("dxil: rayQuery_TraceRayInline's acceleration structure was not resolved");
@@ -644,7 +644,7 @@ Error RayQueryLowerer::lowerFunction(Function &function) {
       auto *queryFlags = dyn_cast<ConstantInt>(call->getArgOperand(2));
       if (!queryFlags || (queryFlags->getZExtValue() & ~1ull)) return createError("dxil: invalid RayQuery feature flags");
       q->allow_omm = queryFlags->getZExtValue() & 1;
-    } else if (auto *flag = module.getModuleFlag("dxmt.rayquery.allowOMM")) {
+    } else if (auto *flag = module.getModuleFlag("d3dalloy.rayquery.allowOMM")) {
       if (auto *constant = mdconst::dyn_extract<ConstantInt>(flag)) q->allow_omm = constant->getZExtValue() != 0;
     }
     q->candidate_opaque = b.CreateAlloca(i1);
@@ -692,7 +692,7 @@ Error RayQueryLowerer::run() {
   SmallVector<Function *, 8> dead;
   for (Function &function : module)
     if (function.isDeclaration() && function.use_empty() &&
-        (function.getName() == kTraceInlineFunction || function.getName() == "dxmt.rayquery.hitobject_snapshot" || function.getName().startswith("dx.op.rayQuery_") ||
+        (function.getName() == kTraceInlineFunction || function.getName() == "d3dalloy.rayquery.hitobject_snapshot" || function.getName().startswith("dx.op.rayQuery_") ||
          function.getName().startswith("dx.op.allocateRayQuery")))
       dead.push_back(&function);
   for (Function *function : dead)
@@ -727,4 +727,4 @@ llvm::Error LowerRayQueries(llvm::Module &module) {
   return lowerer.run();
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

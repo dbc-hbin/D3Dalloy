@@ -21,13 +21,13 @@
 #include "d3d11_device.hpp"
 #include "d3d11_enumerable.hpp"
 #include "d3d11_view.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_staging.hpp"
-#include "dxmt_texture.hpp"
+#include "d3dalloy_dynamic.hpp"
+#include "d3dalloy_staging.hpp"
+#include "d3dalloy_texture.hpp"
 #include "d3d11_resource.hpp"
 #include "util_win32_compat.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 #pragma region DeviceTexture
 
@@ -371,7 +371,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   MTL_DXGI_FORMAT_DESC format_desc;
   MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, format_desc);
 
-  auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
+  auto &initializer = pDevice->GetD3DalloyDevice().queue().initializer;
 
   auto initialize = [&](Rc<TextureAllocation> &&allocation) {
     texture->rename(std::move(allocation));
@@ -733,4 +733,4 @@ ImportSharedTextureByName(
 
 #pragma endregion
 
-} // namespace dxmt
+} // namespace d3dalloy

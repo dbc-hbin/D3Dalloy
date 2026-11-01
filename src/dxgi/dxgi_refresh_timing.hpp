@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace dxmt {
+namespace d3dalloy {
 // CoreVideo output timestamps may predict a future refresh. Native drawable
 // presentation need not be vsync-aligned: select the interval containing time,
 // never reject its phase or round it forward into a refresh not yet reached.
@@ -63,4 +63,4 @@ struct RefreshClockBasis {
     return true;
   }
 };
-} // namespace dxmt
+} // namespace d3dalloy

@@ -9,10 +9,10 @@
 #include <new>
 #include <utility>
 
-using dxmt::Com;
+using d3dalloy::Com;
 namespace {
 constexpr uint64_t kProvider = 0x4d46580000000001ull;
-constexpr char kProviderName[] = "MetalFX (DXMT owned temporal upscaler; dxmt-owned-fsr-metalfx-v1)";
+constexpr char kProviderName[] = "MetalFX (D3Dalloy owned temporal upscaler; d3dalloy-owned-fsr-metalfx-v1)";
 constexpr uint32_t kCreateFlags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
     FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS |
     FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION |
@@ -23,7 +23,7 @@ constexpr uint32_t kCreateFlags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
 // Color-space/visualization create flags permit per-frame requests; dispatch
 // selects the actual transfer function and diagnostic output.
 // A binary marker, not another public export or an AMD model/version claim.
-constexpr wchar_t kMarker[] = L"dxmt-owned-fsr-metalfx-v1: unsupported MetalFX operation";
+constexpr wchar_t kMarker[] = L"d3dalloy-owned-fsr-metalfx-v1: unsupported MetalFX operation";
 struct Context {
   Context *next = nullptr;
   ffxContext handle = nullptr;
@@ -81,7 +81,7 @@ void report(Context *context, ffxReturnCode_t code) {
   const auto level = context && context->message ? context->debug : g_debug;
   ReleaseSRWLockShared(&g_lock);
   if (message && (level & FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS))
-    message(FFX_API_MESSAGE_TYPE_ERROR, code == FFX_API_RETURN_NO_PROVIDER ? kMarker : L"DXMT MetalFX: invalid parameter or runtime failure");
+    message(FFX_API_MESSAGE_TYPE_ERROR, code == FFX_API_RETURN_NO_PROVIDER ? kMarker : L"D3Dalloy MetalFX: invalid parameter or runtime failure");
 }
 bool validChain(const ffxApiHeader *head) {
   auto slow = head, fast = head;

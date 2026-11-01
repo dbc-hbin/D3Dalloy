@@ -6,7 +6,7 @@
 #include <array>
 #include <memory>
 
-namespace dxmt::rr {
+namespace d3dalloy::rr {
 using yaagl::pso::metalfx::Error;
 using yaagl::pso::metalfx::ErrorCode;
 using TextureSet = std::array<void*, WMTRR_RESOURCE_COUNT>;
@@ -52,4 +52,4 @@ private:
     explicit ExecutionLease(std::shared_ptr<Impl> impl) noexcept;
     std::shared_ptr<Impl> impl_;
 };
-} // namespace dxmt::rr
+} // namespace d3dalloy::rr

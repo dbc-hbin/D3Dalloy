@@ -1,14 +1,14 @@
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_texture.hpp"
-#include "dxmt_buffer.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_staging.hpp"
-#include "dxmt_texture.hpp"
+#include "d3dalloy_buffer.hpp"
+#include "d3dalloy_dynamic.hpp"
+#include "d3dalloy_staging.hpp"
+#include "d3dalloy_texture.hpp"
 #include "d3d11_resource.hpp"
 #include "d3d11_enumerable.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 #pragma region DynamicTexture
 
@@ -183,4 +183,4 @@ CreateDynamicTexture3D(MTLD3D11Device *pDevice,
 
 #pragma endregion
 
-} // namespace dxmt
+} // namespace d3dalloy

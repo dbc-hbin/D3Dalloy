@@ -19,15 +19,15 @@
 #pragma once
 
 #include "d3d12_pageable.hpp"
-#include "dxmt_command_clear.hpp"
-#include "dxmt_ring_bump_allocator.hpp"
+#include "d3dalloy_command_clear.hpp"
+#include "d3dalloy_ring_bump_allocator.hpp"
 #include "owned_submission_storage.hpp"
 #include <memory>
 #include <new>
 #include <source_location>
 #include <unordered_set>
 
-namespace dxmt {
+namespace d3dalloy {
 
 constexpr auto kCPUHeapSize = 0x400000u;
 constexpr auto kGPUHeapSize = 0x400000u;
@@ -101,7 +101,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
 
   D3D12_COMMAND_LIST_TYPE type_;
   std::shared_ptr<std::atomic<uint64_t>> recording_generation_ = std::make_shared<std::atomic<uint64_t>>(0);
-  dxmt::mutex submission_mutex_;
+  d3dalloy::mutex submission_mutex_;
   uint32_t outstanding_submissions_ = 0;
 
   std::vector<void *> spilled_cpu_heap_;
@@ -176,7 +176,7 @@ public:
   MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type);
 
   bool CaptureSubmission(uint64_t generation) {
-    std::lock_guard<dxmt::mutex> lock(submission_mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(submission_mutex_);
     if (recording_generation_->load(std::memory_order_acquire) != generation)
       return false;
     ++outstanding_submissions_;
@@ -184,12 +184,12 @@ public:
   }
 
   void RetainSubmission() {
-    std::lock_guard<dxmt::mutex> lock(submission_mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(submission_mutex_);
     ++outstanding_submissions_;
   }
 
   void ReleaseSubmission() {
-    std::lock_guard<dxmt::mutex> lock(submission_mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(submission_mutex_);
     assert(outstanding_submissions_);
     --outstanding_submissions_;
   }
@@ -430,4 +430,4 @@ public:
   IndirectRenderCommandData *EncodeIndirectRenderCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount, bool index_pull);
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

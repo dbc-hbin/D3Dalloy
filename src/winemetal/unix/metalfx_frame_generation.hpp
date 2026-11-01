@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace dxmt::framegeneration {
+namespace d3dalloy::framegeneration {
 class ExecutionLease;
 
 class PreparedFrame final {
@@ -39,5 +39,5 @@ private:
 bool available() noexcept;
 std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<const PreparedFrame>* recorded) noexcept;
 
-} // namespace dxmt::framegeneration
+} // namespace d3dalloy::framegeneration
 

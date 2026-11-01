@@ -6,7 +6,7 @@
 #include "../airconv/dxbc_root_signature.hpp"
 #include "DXBCParser/DXBCUtils.h"
 #include "dxil_raytracing.h"
-#include "dxmt_buffer.hpp"
+#include "d3dalloy_buffer.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -19,7 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace dxmt {
+namespace d3dalloy {
 WorkGraphDispatch::~WorkGraphDispatch() {
   if (atomic64_tables)
     for (const auto &table : *atomic64_tables) { table.rootsig->ReleasePrivate(); table.heap->ReleasePrivate(); }
@@ -784,7 +784,7 @@ HRESULT MTLD3D12WorkGraph::Compile(Node &node, MTLD3D12RootSignature *root, bool
   }
   const auto &library = libraries_[node.library];
   SM50_WG_NODE_COMPILE_DESC desc{}; desc.Library = library.data(); desc.LibrarySize = library.size();
-  desc.EntryPoint = node.entry.c_str(); desc.FunctionName = "dxmt_work_graph_node";
+  desc.EntryPoint = node.entry.c_str(); desc.FunctionName = "d3dalloy_work_graph_node";
   desc.GlobalRootSignatureSize = root->GetBlob(&desc.GlobalRootSignature);
   if (node.local_root) desc.LocalRootSignatureSize = node.local_root->GetBlob(&desc.LocalRootSignature);
   desc.MetalVersion = kD3D12ShaderMetalVersion; desc.Launch = node.info.Launch;
@@ -1171,4 +1171,4 @@ HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, co
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

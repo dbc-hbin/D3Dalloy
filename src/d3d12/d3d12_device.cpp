@@ -36,7 +36,7 @@
 #include "com/com_pointer.hpp"
 #include "com/com_object.hpp"
 #include "dxgi_interfaces.h"
-#include "dxmt_format.hpp"
+#include "d3dalloy_format.hpp"
 #include "log/log.hpp"
 #include <algorithm>
 #include <cstring>
@@ -46,7 +46,7 @@
 #include "d3d10_1.h"
 #include "d3d11_4.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 /* Enhanced barriers and the CommandList8/9 dynamic state: GPU verified by owned-d3d12-enhanced-barriers. */
 constexpr WINBOOL kReportLayoutFeatures = TRUE;
@@ -136,7 +136,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
 
   bool advertise_numa_ = false;
 
-  dxmt::mutex residency_lock_;
+  d3dalloy::mutex residency_lock_;
   WMT::Reference<WMT::ResidencySet> residency_set_;
   std::mutex sparse_mapping_queue_mutex_;
   WMT::Reference<WMT::MTL4CommandQueue> sparse_mapping_queue_;
@@ -149,7 +149,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   WMT::Reference<WMT::Buffer> atomic64_context_;
   uint64_t atomic64_context_address_ = 0;
   std::map<uint64_t, BufferAllocation *> interval_map_;
-  dxmt::mutex swizzle_texture_lock_;
+  d3dalloy::mutex swizzle_texture_lock_;
   std::unordered_map<const void *, MTLD3D12Resource *> descriptor_resources_;
   std::atomic<uint32_t> swizzle_texture_count_{0};
 
@@ -268,7 +268,7 @@ public:
   }
   HRESULT STDMETHODCALLTYPE ReflexSleep() override { return reflex.Sleep(); }
   HRESULT STDMETHODCALLTYPE ReflexMarker(UINT64 frame, UINT marker) override { return reflex.Marker(frame, marker); }
-  HRESULT STDMETHODCALLTYPE GetReflexReports(DXMT_REFLEX_REPORT *reports) override { return reflex.Reports(reports); }
+  HRESULT STDMETHODCALLTYPE GetReflexReports(D3DALLOY_REFLEX_REPORT *reports) override { return reflex.Reports(reports); }
 
   HRESULT RemovedReason() const override {
     return removal_reason_.load(std::memory_order_acquire);
@@ -533,35 +533,35 @@ public:
       diagnostics.Validation(D3D12_MESSAGE_ID_CORRUPTED_PARAMETER1, "CreateCommandQueue: invalid queue descriptor or node mask");
       return E_INVALIDARG;
     }
-    return dxmt::CreateCommandQueue(this, pDesc, riid, ppCommandQueue);
+    return d3dalloy::CreateCommandQueue(this, pDesc, riid, ppCommandQueue);
   };
 
   HRESULT STDMETHODCALLTYPE
   CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE Type, REFIID riid, void **ppCommandAllocator) {
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateCommandAllocator(this, Type, riid, ppCommandAllocator);
+    return d3dalloy::CreateCommandAllocator(this, Type, riid, ppCommandAllocator);
   };
 
   HRESULT STDMETHODCALLTYPE
   CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState) {
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateGraphicsPipelineState(this, pDesc, riid, ppPipelineState);
+    return d3dalloy::CreateGraphicsPipelineState(this, pDesc, riid, ppPipelineState);
   };
 
   HRESULT STDMETHODCALLTYPE
   CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState) {
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateComputePipelineState(this, pDesc, riid, ppPipelineState);
+    return d3dalloy::CreateComputePipelineState(this, pDesc, riid, ppPipelineState);
   };
 
   HRESULT STDMETHODCALLTYPE
   CreateStateObject(const D3D12_STATE_OBJECT_DESC *pDesc, REFIID riid, void **ppStateObject) {
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateStateObject(this, pDesc, riid, ppStateObject);
+    return d3dalloy::CreateStateObject(this, pDesc, riid, ppStateObject);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1249,7 +1249,7 @@ public:
     InitReturnPtr(ppDescriptorHeap);
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateDescriptorHeap(this, pDesc, riid, ppDescriptorHeap);
+    return d3dalloy::CreateDescriptorHeap(this, pDesc, riid, ppDescriptorHeap);
   };
 
   UINT STDMETHODCALLTYPE
@@ -1274,7 +1274,7 @@ public:
     InitReturnPtr(ppRootSignature);
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateRootSignature(this, NodeMask, pBytecode, BytecodeLength, riid, ppRootSignature);
+    return d3dalloy::CreateRootSignature(this, NodeMask, pBytecode, BytecodeLength, riid, ppRootSignature);
   };
 
   void STDMETHODCALLTYPE
@@ -1596,7 +1596,7 @@ public:
       return E_INVALIDARG;
     if (!ppHeap)
       return S_FALSE;
-    return dxmt::CreateHeap(this, pDesc, riid, ppHeap);
+    return d3dalloy::CreateHeap(this, pDesc, riid, ppHeap);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1769,7 +1769,7 @@ public:
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
     try {
-      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
       if (RemovedReason() != S_OK)
         return DXGI_ERROR_DEVICE_REMOVED;
       std::vector<ResidencyBatchEntry> batch;
@@ -1787,7 +1787,7 @@ public:
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
     try {
-      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
       if (RemovedReason() != S_OK)
         return DXGI_ERROR_DEVICE_REMOVED;
       std::vector<ResidencyBatchEntry> batch;
@@ -1804,7 +1804,7 @@ public:
   CreateFence(UINT64 InitialValue, D3D12_FENCE_FLAGS Flags, REFIID riid, void **ppFence) {
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateFence(this, InitialValue, Flags, riid, ppFence);
+    return d3dalloy::CreateFence(this, InitialValue, Flags, riid, ppFence);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1966,7 +1966,7 @@ public:
   CreateQueryHeap(const D3D12_QUERY_HEAP_DESC *pDesc, REFIID riid, void **ppHeap) {
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateQueryHeap(this, pDesc, riid, ppHeap);
+    return d3dalloy::CreateQueryHeap(this, pDesc, riid, ppHeap);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -1982,7 +1982,7 @@ public:
     InitReturnPtr(ppCommandSignature);
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::CreateCommandSignature(this, pDesc, pRootSignature, riid, ppCommandSignature);
+    return d3dalloy::CreateCommandSignature(this, pDesc, pRootSignature, riid, ppCommandSignature);
   };
 
   void STDMETHODCALLTYPE GetResourceTiling(
@@ -2028,7 +2028,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreatePipelineLibrary(const void *blob, SIZE_T blob_size, REFIID iid, void **lib) {
-    return dxmt::CreatePipelineLibrary(this, blob, blob_size, iid, lib);
+    return d3dalloy::CreatePipelineLibrary(this, blob, blob_size, iid, lib);
   };
 
   HRESULT STDMETHODCALLTYPE
@@ -2080,7 +2080,7 @@ public:
     if (ObjectCount && !pPriorities)
       return E_INVALIDARG;
     try {
-      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
       std::vector<ResidencyBatchEntry> batch;
       HRESULT hr = ResolveResidencyBatch(ObjectCount, pObjects, batch);
       if (FAILED(hr))
@@ -2110,7 +2110,7 @@ public:
       return hr;
     if (stream.compute)
       return CreateComputePipelineState(&stream.compute_desc, riid, ppPipelineState);
-    return dxmt::CreateGraphicsPipelineState(this, &stream.graphics, riid, ppPipelineState,
+    return d3dalloy::CreateGraphicsPipelineState(this, &stream.graphics, riid, ppPipelineState,
                                              &stream.graphics_extras);
   }
 
@@ -2142,7 +2142,7 @@ public:
         fence_device.ptr() != static_cast<ID3D12Device *>(this))
       return E_INVALIDARG;
     try {
-      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
       if (RemovedReason() != S_OK)
         return DXGI_ERROR_DEVICE_REMOVED;
       std::vector<ResidencyBatchEntry> batch;
@@ -2168,7 +2168,7 @@ public:
       return DXGI_ERROR_DEVICE_REMOVED;
     if (NodeMask > 1 || Flags != D3D12_COMMAND_LIST_FLAG_NONE)
       return E_INVALIDARG;
-    return dxmt::CreateClosedCommandList(this, Type, riid, ppCommandList);
+    return d3dalloy::CreateClosedCommandList(this, Type, riid, ppCommandList);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -2370,7 +2370,7 @@ public:
     InitReturnPtr(ppNewStateObject);
     if (RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    return dxmt::AddToStateObject(this, pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
+    return d3dalloy::AddToStateObject(this, pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -2561,12 +2561,12 @@ public:
       const uint64_t adapter = adapter_->GetMTLDevice().registryID();
       memcpy(driver_identity + sizeof(native), &adapter, sizeof(adapter));
     }
-    return dxmt::CreateShaderCacheSession(this, pDesc, driver_identity, sizeof(driver_identity), riid, ppvSession);
+    return d3dalloy::CreateShaderCacheSession(this, pDesc, driver_identity, sizeof(driver_identity), riid, ppvSession);
   }
 
   HRESULT STDMETHODCALLTYPE
   ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS Kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS Control) {
-    return dxmt::ShaderCacheControl(Kinds, Control);
+    return d3dalloy::ShaderCacheControl(Kinds, Control);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -2784,7 +2784,7 @@ public:
     std::vector<uint8_t> container;
     if (HRESULT hr = WrapRootSignaturePayload(payload.data(), payload.size(), container); FAILED(hr))
       return hr;
-    return dxmt::CreateRootSignature(this, nodeMask, container.data(), container.size(), riid, ppvRootSignature);
+    return d3dalloy::CreateRootSignature(this, nodeMask, container.data(), container.size(), riid, ppvRootSignature);
   }
 
   /* ---- ID3D12Device12 ---- */
@@ -2870,7 +2870,7 @@ public:
     // residency snapshot. Unregister must not remove and release an allocation
     // during that traversal. Share the mutation lock only through native commit;
     // GPU waits and C++ retirement/destruction run after this guard is released.
-    std::lock_guard<dxmt::mutex> lock(residency_lock_);
+    std::lock_guard<d3dalloy::mutex> lock(residency_lock_);
     return queue.commit(buffers, count);
   }
 
@@ -2949,7 +2949,7 @@ public:
     if (!allocation)
       return E_OUTOFMEMORY;
     try {
-      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
       bool owner_registered = false;
       if (owner) {
         if (!owner->AddResidencyAllocation(allocation))
@@ -2980,7 +2980,7 @@ public:
   UnregisterSwizzleShadowResidency(WMT::Allocation allocation, MTLD3D12PageableResidency *owner) {
     if (!allocation || !owner)
       return E_INVALIDARG;
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     const auto &allocations = owner->ResidencyAllocations();
     if (std::find(allocations.begin(), allocations.end(), allocation) == allocations.end())
       return E_INVALIDARG;
@@ -3002,7 +3002,7 @@ public:
     if (!resource || (!resource->texture && !resource->buffer))
       return E_INVALIDARG;
     try {
-      std::unique_lock<dxmt::mutex> lock(swizzle_texture_lock_);
+      std::unique_lock<d3dalloy::mutex> lock(swizzle_texture_lock_);
       try {
         if (resource->texture && !descriptor_resources_.emplace(resource->texture.ptr(), resource).second)
           return E_INVALIDARG;
@@ -3024,7 +3024,7 @@ public:
 
   void
   UnregisterDescriptorResource(MTLD3D12Resource *resource) {
-    std::unique_lock<dxmt::mutex> lock(swizzle_texture_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(swizzle_texture_lock_);
     bool erased = false;
     for (const void *backing : {static_cast<const void *>(resource->texture.ptr()),
                                static_cast<const void *>(resource->buffer.ptr())}) {
@@ -3040,7 +3040,7 @@ public:
 
   Com<MTLD3D12Resource, false>
   LookupDescriptorResource(const void *backing, uint64_t owner_id) {
-    std::unique_lock<dxmt::mutex> lock(swizzle_texture_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(swizzle_texture_lock_);
     const auto entry = descriptor_resources_.find(backing);
     if (entry == descriptor_resources_.end() ||
         (owner_id && entry->second->owned_id != owner_id) || !entry->second->TryAddRefPrivate())
@@ -3096,7 +3096,7 @@ public:
     if (!allocation)
       return E_INVALIDARG;
     try {
-      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
       if (!owner || owner->ResidencyReferenceCount()) {
         residency_set_.removeAllocations(&allocation, 1);
         residency_set_.commit();
@@ -3114,7 +3114,7 @@ public:
     if (!allocation || !allocation->buffer())
       return E_OUTOFMEMORY;
     try {
-      std::unique_lock<dxmt::mutex> lock(residency_lock_);
+      std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
       auto [entry, inserted] = interval_map_.emplace(allocation->gpuAddress(), allocation);
       if (!inserted)
         return E_INVALIDARG;
@@ -3187,7 +3187,7 @@ public:
   UnregisterResidencyAndVA(BufferAllocation *allocation, MTLD3D12PageableResidency *owner) {
     if (!allocation)
       return E_INVALIDARG;
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     interval_map_.erase(allocation->gpuAddress());
     buffer_va_generation.fetch_add(1, std::memory_order_release);
     /*
@@ -3232,7 +3232,7 @@ public:
   BufferAllocation *
   LookupBufferRangeByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pBegin, uint64_t *pEnd,
                         uint64_t *pGeneration) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     *pGeneration = buffer_va_generation.load(std::memory_order_relaxed);
     *pBegin = *pEnd = 0;
     auto iter = interval_map_.upper_bound(VA);
@@ -3272,7 +3272,7 @@ public:
 
   bool
   FindRTAS(const raytracing::ArenaKey &key, RTASState &state) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     const RTASState *recorded = rtas_.FindRecorded(key);
     if (!recorded)
       return false;
@@ -3283,7 +3283,7 @@ public:
   bool
   StoreRTAS(const raytracing::ArenaKey &key, RTASState state, uint32_t *token,
       WMT::Reference<WMT::Buffer> *mirror, uint64_t *mirror_offset) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     /*
      * The mirror slot is reserved before anything is published, because a version whose token has
      * no slot to be published into could never be identified by the GPU and would be retained
@@ -3337,7 +3337,7 @@ public:
 
   void
   ReleaseRTASLease(const raytracing::ArenaKey &key, uint32_t token) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     auto released = rtas_.ReleaseLease(key, token);
     if (released.empty())
       return;
@@ -3348,13 +3348,13 @@ public:
 
   void
   HoldRTASLease(const raytracing::ArenaKey &key, uint32_t token) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     rtas_.HoldLease(key, token);
   }
 
   void
   ObserveRTAS(const raytracing::ArenaKey &key) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     auto found = rtas_slots_.find(key);
     if (found == rtas_slots_.end())
       return;
@@ -3385,7 +3385,7 @@ public:
 
   /** Add one version's native structure and translation buffers to the residency set. */
   bool AllocateRTAS(WMT::AccelerationStructureSidecar sidecar, uint64_t size, uint64_t count) final {
-    std::lock_guard<dxmt::mutex> lock(residency_lock_);
+    std::lock_guard<d3dalloy::mutex> lock(residency_lock_);
     if (!sidecar.allocate(GetMTLDevice(), size, count))
       return false;
     AddRTASResidency({sidecar, size, uint32_t(count), {}});
@@ -3428,13 +3428,13 @@ public:
 
   uint64_t
   BeginRTASSubmission() {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     return rtas_.BeginSubmission();
   }
 
   void
   RetireRTASSubmission(uint64_t id) {
-    std::unique_lock<dxmt::mutex> lock(residency_lock_);
+    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     rtas_.RetireSubmission(id);
     ReleaseSupersededRTASLocked();
   }
@@ -3444,7 +3444,7 @@ public:
    * device lives, so a GPU store into a slot always targets a buffer that still exists.
    *
    * Called from inside StoreRTAS, which already holds residency_lock_, so this must not take it:
-   * dxmt::mutex is not recursive. The caller registers the new page's residency.
+   * d3dalloy::mutex is not recursive. The caller registers the new page's residency.
    */
   std::atomic<uint32_t> *
   CreateRTASMirrorPage(uint64_t slot_count) {
@@ -3478,13 +3478,13 @@ public:
     if (!rtas_pipelines_.prepass) {
       auto library = command_library.getLibrary();
       WMT::Reference<WMT::Error> error;
-      auto prepass_function = WMT4::Library(library).newFunction("dxmt_as_prepass");
+      auto prepass_function = WMT4::Library(library).newFunction("d3dalloy_as_prepass");
       auto prepass = GetMetal4Compiler().newComputePipelineState(prepass_function, error);
       if (error || !prepass)
         return E_FAIL;
       rtas_pipelines_.prepass = std::move(prepass);
-      const char *names[] = {"dxmt_as_shadow", "dxmt_as_postbuild", "dxmt_as_serialize",
-          "dxmt_as_deserialize", "dxmt_as_visualize", "dxmt_as_visualize_descriptors"};
+      const char *names[] = {"d3dalloy_as_shadow", "d3dalloy_as_postbuild", "d3dalloy_as_serialize",
+          "d3dalloy_as_deserialize", "d3dalloy_as_visualize", "d3dalloy_as_visualize_descriptors"};
       WMT::Reference<WMT::ComputePipelineState> *states[] = {&rtas_pipelines_.shadow, &rtas_pipelines_.postbuild,
           &rtas_pipelines_.serialize, &rtas_pipelines_.deserialize, &rtas_pipelines_.visualize,
           &rtas_pipelines_.visualizeDescriptors};
@@ -3598,4 +3598,4 @@ CreateD3D12Device(IMTLDXGIAdapter *adapter, const IID &riid, void **ppDevice,
   return device->QueryInterface(riid, ppDevice);
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

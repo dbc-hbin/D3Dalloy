@@ -81,10 +81,10 @@ inline float stand_in(uint b) { return is_denormal(b) ? value((b & 0x80000000u) 
 
 } // namespace
 
-float denorm_fadd(float a, float b) asm("dxmt.denorm.fadd.f32");
-float denorm_fsub(float a, float b) asm("dxmt.denorm.fsub.f32");
-float denorm_fmul(float a, float b) asm("dxmt.denorm.fmul.f32");
-float denorm_fdiv(float a, float b) asm("dxmt.denorm.fdiv.f32");
+float denorm_fadd(float a, float b) asm("d3dalloy.denorm.fadd.f32");
+float denorm_fsub(float a, float b) asm("d3dalloy.denorm.fsub.f32");
+float denorm_fmul(float a, float b) asm("d3dalloy.denorm.fmul.f32");
+float denorm_fdiv(float a, float b) asm("d3dalloy.denorm.fdiv.f32");
 
 float denorm_fadd(float a, float b) {
   const uint ba = bits(a), bb = bits(b);

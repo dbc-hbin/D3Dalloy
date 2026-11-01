@@ -20,7 +20,7 @@
 
 #include "airconv_public.h"
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 struct ResourceRange {
   uint32_t range_id;
@@ -112,7 +112,7 @@ Instruction readInstruction(
   ShaderInfo &shader_info, uint32_t phase
 );
 
-using pvalue = dxmt::air::pvalue;
+using pvalue = d3dalloy::air::pvalue;
 using epvalue = llvm::Expected<pvalue>;
 using dxbc::Swizzle;
 using dxbc::swizzle_identity;
@@ -513,7 +513,7 @@ public:
   }
 
   std::string varyingAttributeName() const {
-    return dxmt::dxbc::varyingAttributeName(semantic_name_, semantic_index_);
+    return d3dalloy::dxbc::varyingAttributeName(semantic_name_, semantic_index_);
   }
 
   uint32_t stream() const { return stream_; }
@@ -549,8 +549,8 @@ public:
    */
   std::optional<std::vector<uint8_t>> dxil_bytecode;
 
-  dxmt::dxbc::ShaderInfo shader_info;
-  dxmt::air::FunctionSignatureBuilder func_signature;
+  d3dalloy::dxbc::ShaderInfo shader_info;
+  d3dalloy::air::FunctionSignatureBuilder func_signature;
   std::vector<Signature> output_signature;
   std::vector<std::unique_ptr<BasicBlock>> bbs;
   std::vector<std::function<void(SignatureContext &)>> signature_handlers;
@@ -772,4 +772,4 @@ args_get_data(const struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data, data_t *
   return false;
 }
 
-} // namespace dxmt::dxbc
+} // namespace d3dalloy::dxbc

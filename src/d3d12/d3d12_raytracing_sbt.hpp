@@ -26,7 +26,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace dxmt::raytracing {
+namespace d3dalloy::raytracing {
 
 // D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT / _RECORD_BYTE_ALIGNMENT.
 inline constexpr uint64_t kShaderTableAlignment = 64;
@@ -159,7 +159,7 @@ inline SbtStatus PrepareDispatch(const DispatchDescription &desc, PreparedDispat
 /* ------------------------------------------------------------------------- */
 
 /**
- * Plain parameters of one indirect resolve; matches dxmt_rays_indirect_control in MSL.
+ * Plain parameters of one indirect resolve; matches d3dalloy_rays_indirect_control in MSL.
  *
  * Every slot gets its own SM50_RT_DISPATCH_ARGUMENTS block `arguments_stride` bytes
  * apart, initialized by the CPU from the dispatch's constant fields (export count,
@@ -189,13 +189,13 @@ static_assert(sizeof(RaysIndirectControl) == 64);
  * ceil(Width / group_width) x ceil(Height / group_height) x Depth threadgroups of the
  * traversal's group shape (threads past the grid return in the raygen prologue).
  * Field offsets are SM50_RT_DISPATCH_ARGUMENTS's (dxil_raytracing.h), passed in as
- * the DXMT_* macros so the two cannot disagree.
+ * the D3DALLOY_* macros so the two cannot disagree.
  */
 inline constexpr const char kRaysIndirectMSL[] = R"metal(
 #include <metal_stdlib>
 using namespace metal;
 
-struct dxmt_rays_indirect_control {
+struct d3dalloy_rays_indirect_control {
   ulong arguments;
   ulong count;
   ulong predicate;
@@ -209,18 +209,18 @@ struct dxmt_rays_indirect_control {
   uint group_height;
 };
 
-struct dxmt_range { ulong address; ulong size; };
-struct dxmt_strided { ulong address; ulong size; ulong stride; };
-struct dxmt_rays_desc {
-  dxmt_range ray_generation;
-  dxmt_strided miss;
-  dxmt_strided hit_group;
-  dxmt_strided callable;
+struct d3dalloy_range { ulong address; ulong size; };
+struct d3dalloy_strided { ulong address; ulong size; ulong stride; };
+struct d3dalloy_rays_desc {
+  d3dalloy_range ray_generation;
+  d3dalloy_strided miss;
+  d3dalloy_strided hit_group;
+  d3dalloy_strided callable;
   uint width, height, depth;
 };
 
 /* ValidateShaderTable above; returns the record count (0 for an absent table) and flags a violation. */
-static uint table_records(dxmt_strided t, thread bool &bad) {
+static uint table_records(d3dalloy_strided t, thread bool &bad) {
   if (!t.size) {
     bad |= t.address != 0 || t.stride != 0;
     return 0;
@@ -233,7 +233,7 @@ static uint table_records(dxmt_strided t, thread bool &bad) {
   return uint(records);
 }
 
-kernel void dxmt_rays_indirect(constant dxmt_rays_indirect_control &control [[buffer(0)]],
+kernel void d3dalloy_rays_indirect(constant d3dalloy_rays_indirect_control &control [[buffer(0)]],
                                uint slot [[thread_position_in_grid]]) {
   if (slot >= control.max_commands)
     return;
@@ -246,7 +246,7 @@ kernel void dxmt_rays_indirect(constant dxmt_rays_indirect_control &control [[bu
     ulong value = *(device const ulong *)control.predicate;
     culled = control.predicate_not_equal ? value != 0 : value == 0;
   }
-  dxmt_rays_desc d = *(device const dxmt_rays_desc *)(control.arguments + ulong(slot) * control.stride);
+  d3dalloy_rays_desc d = *(device const d3dalloy_rays_desc *)(control.arguments + ulong(slot) * control.stride);
   bool bad = slot >= count || culled;
   bad |= !d.width || !d.height || !d.depth || d.width > 1073741824u || d.height > 1073741824u ||
          d.depth > 1073741824u;
@@ -259,20 +259,20 @@ kernel void dxmt_rays_indirect(constant dxmt_rays_indirect_control &control [[bu
     grid[0] = grid[1] = grid[2] = 0;
     return;
   }
-  *(device ulong *)(block + DXMT_RAYGEN_RECORD) = d.ray_generation.address;
-  *(device ulong *)(block + DXMT_MISS_BASE) = d.miss.address;
-  *(device ulong *)(block + DXMT_HIT_BASE) = d.hit_group.address;
-  *(device ulong *)(block + DXMT_CALLABLE_BASE) = d.callable.address;
-  *(device uint *)(block + DXMT_MISS_STRIDE) = uint(d.miss.stride);
-  *(device uint *)(block + DXMT_MISS_COUNT) = miss;
-  *(device uint *)(block + DXMT_HIT_STRIDE) = uint(d.hit_group.stride);
-  *(device uint *)(block + DXMT_HIT_COUNT) = hit;
-  *(device uint *)(block + DXMT_CALLABLE_STRIDE) = uint(d.callable.stride);
-  *(device uint *)(block + DXMT_CALLABLE_COUNT) = callable;
-  *(device uint *)(block + DXMT_WIDTH) = d.width;
-  *(device uint *)(block + DXMT_HEIGHT) = d.height;
-  *(device uint *)(block + DXMT_DEPTH) = d.depth;
-  *(device ulong *)(block + DXMT_SELF) = self;
+  *(device ulong *)(block + D3DALLOY_RAYGEN_RECORD) = d.ray_generation.address;
+  *(device ulong *)(block + D3DALLOY_MISS_BASE) = d.miss.address;
+  *(device ulong *)(block + D3DALLOY_HIT_BASE) = d.hit_group.address;
+  *(device ulong *)(block + D3DALLOY_CALLABLE_BASE) = d.callable.address;
+  *(device uint *)(block + D3DALLOY_MISS_STRIDE) = uint(d.miss.stride);
+  *(device uint *)(block + D3DALLOY_MISS_COUNT) = miss;
+  *(device uint *)(block + D3DALLOY_HIT_STRIDE) = uint(d.hit_group.stride);
+  *(device uint *)(block + D3DALLOY_HIT_COUNT) = hit;
+  *(device uint *)(block + D3DALLOY_CALLABLE_STRIDE) = uint(d.callable.stride);
+  *(device uint *)(block + D3DALLOY_CALLABLE_COUNT) = callable;
+  *(device uint *)(block + D3DALLOY_WIDTH) = d.width;
+  *(device uint *)(block + D3DALLOY_HEIGHT) = d.height;
+  *(device uint *)(block + D3DALLOY_DEPTH) = d.depth;
+  *(device ulong *)(block + D3DALLOY_SELF) = self;
   grid[0] = (d.width + control.group_width - 1) / control.group_width;
   grid[1] = (d.height + control.group_height - 1) / control.group_height;
   grid[2] = d.depth;
@@ -280,6 +280,6 @@ kernel void dxmt_rays_indirect(constant dxmt_rays_indirect_control &control [[bu
 )metal";
 
 /** Metal function name of the indirect resolve kernel above. */
-inline constexpr const char kRaysIndirectFunction[] = "dxmt_rays_indirect";
+inline constexpr const char kRaysIndirectFunction[] = "d3dalloy_rays_indirect";
 
-} // namespace dxmt::raytracing
+} // namespace d3dalloy::raytracing

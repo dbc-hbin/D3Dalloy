@@ -31,18 +31,18 @@
 #include "d3d11_device.hpp"
 #include "d3d11_pipeline.hpp"
 #include "d3d11_query.hpp"
-#include "dxmt_buffer.hpp"
-#include "dxmt_context.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_ring_bump_allocator.hpp"
-#include "dxmt_staging.hpp"
+#include "d3dalloy_buffer.hpp"
+#include "d3dalloy_context.hpp"
+#include "d3dalloy_format.hpp"
+#include "d3dalloy_ring_bump_allocator.hpp"
+#include "d3dalloy_staging.hpp"
 #include "d3d11_resource.hpp"
-#include "dxmt_texture.hpp"
+#include "d3dalloy_texture.hpp"
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj);
 
@@ -257,7 +257,7 @@ get_gs_vertex_count(D3D11_PRIMITIVE_TOPOLOGY primitive) {
   default:
     break;
   }
-  DXMT_UNREACHABLE
+  D3DALLOY_UNREACHABLE
 }
 
 struct Subresource {
@@ -575,14 +575,14 @@ public:
   }
 };
 
-struct DXMT_DRAW_ARGUMENTS {
+struct D3DALLOY_DRAW_ARGUMENTS {
   uint32_t VertexCount;
   uint32_t InstanceCount;
   uint32_t StartVertex;
   uint32_t StartInstance;
 };
 
-struct DXMT_DRAW_INDEXED_ARGUMENTS {
+struct D3DALLOY_DRAW_INDEXED_ARGUMENTS {
   uint32_t IndexCount;
   uint32_t InstanceCount;
   uint32_t StartIndex;
@@ -590,7 +590,7 @@ struct DXMT_DRAW_INDEXED_ARGUMENTS {
   uint32_t StartInstance;
 };
 
-struct DXMT_DISPATCH_ARGUMENTS {
+struct D3DALLOY_DISPATCH_ARGUMENTS {
   uint32_t X;
   uint32_t Y;
   uint32_t Z;
@@ -1457,7 +1457,7 @@ public:
     // StartInstance advances with the chunk). Groups per instance depend on encoder state, but never exceed
     // the patch count, which bounds the number of chunks reserved here.
     const UINT blocks = MeshDrawChunks(VertexCountPerInstance / NumControlPoint, InstanceCount, max_object_threadgroups);
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS) * blocks, 32);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(D3DALLOY_DRAW_ARGUMENTS) * blocks, 32);
     EmitOP([=](ArgumentEncodingContext &enc) {
       auto PatchCountPerInstance = VertexCountPerInstance / NumControlPoint;
       auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
@@ -1471,8 +1471,8 @@ public:
       }
       for (UINT first = 0, block = 0; first < InstanceCount; first += chunk, ++block) {
         const UINT count = std::min(chunk, InstanceCount - first);
-        const auto offset = draw_arguments_offset + block * sizeof(DXMT_DRAW_ARGUMENTS);
-        DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(offset);
+        const auto offset = draw_arguments_offset + block * sizeof(D3DALLOY_DRAW_ARGUMENTS);
+        D3DALLOY_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<D3DALLOY_DRAW_ARGUMENTS>(offset);
         draw_argument->StartVertex = StartVertexLocation;
         draw_argument->VertexCount = VertexCountPerInstance;
         draw_argument->InstanceCount = count;
@@ -1480,8 +1480,8 @@ public:
 
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
-        cmd.type = WMTRenderCommandDXMTTessellationMeshDraw;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_d3dalloy_tessellation_mesh_draw>();
+        cmd.type = WMTRenderCommandD3DalloyTessellationMeshDraw;
         cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(offset);
         cmd.instance_count = count;
         cmd.threads_per_patch = ThreadsPerPatch;
@@ -1499,7 +1499,7 @@ public:
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     auto max_object_threadgroups = max_object_threadgroups_;
     const UINT blocks = MeshDrawChunks(IndexCountPerInstance / NumControlPoint, InstanceCount, max_object_threadgroups);
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS) * blocks, 32);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(D3DALLOY_DRAW_INDEXED_ARGUMENTS) * blocks, 32);
     EmitOP([=](ArgumentEncodingContext &enc) {
       auto PatchCountPerInstance = IndexCountPerInstance / NumControlPoint;
       auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
@@ -1514,8 +1514,8 @@ public:
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
       for (UINT first = 0, block = 0; first < InstanceCount; first += chunk, ++block) {
         const UINT count = std::min(chunk, InstanceCount - first);
-        const auto offset = draw_arguments_offset + block * sizeof(DXMT_DRAW_INDEXED_ARGUMENTS);
-        DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(offset);
+        const auto offset = draw_arguments_offset + block * sizeof(D3DALLOY_DRAW_INDEXED_ARGUMENTS);
+        D3DALLOY_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<D3DALLOY_DRAW_INDEXED_ARGUMENTS>(offset);
         draw_argument->BaseVertex = BaseVertexLocation;
         draw_argument->IndexCount = IndexCountPerInstance;
         draw_argument->StartIndex = StartIndexLocation;
@@ -1524,8 +1524,8 @@ public:
 
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
-        cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed>();
+        cmd.type = WMTRenderCommandD3DalloyTessellationMeshDrawIndexed;
         cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(offset);
         cmd.instance_count = count;
         cmd.threads_per_patch = ThreadsPerPatch;
@@ -1552,12 +1552,12 @@ public:
       return;
     }
     const UINT blocks = (InstanceCount - 1) / chunk + 1;
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS) * blocks, 32);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(D3DALLOY_DRAW_ARGUMENTS) * blocks, 32);
     EmitOP([=, vertex_per_warp = vertex_per_warp](ArgumentEncodingContext &enc) {
       for (UINT first = 0, block = 0; first < InstanceCount; first += chunk, ++block) {
         const UINT count = std::min(chunk, InstanceCount - first);
-        const auto offset = draw_arguments_offset + block * sizeof(DXMT_DRAW_ARGUMENTS);
-        DXMT_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(offset);
+        const auto offset = draw_arguments_offset + block * sizeof(D3DALLOY_DRAW_ARGUMENTS);
+        D3DALLOY_DRAW_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<D3DALLOY_DRAW_ARGUMENTS>(offset);
         draw_argument->StartVertex = StartVertexLocation;
         draw_argument->VertexCount = VertexCountPerInstance;
         draw_argument->InstanceCount = count;
@@ -1565,8 +1565,8 @@ public:
 
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
-        cmd.type = WMTRenderCommandDXMTGeometryDraw;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_d3dalloy_geometry_draw>();
+        cmd.type = WMTRenderCommandD3DalloyGeometryDraw;
         cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(offset);
         cmd.instance_count = count;
         cmd.warp_count = warp_count;
@@ -1590,13 +1590,13 @@ public:
       return;
     }
     const UINT blocks = (InstanceCount - 1) / chunk + 1;
-    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS) * blocks, 32);
+    auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(D3DALLOY_DRAW_INDEXED_ARGUMENTS) * blocks, 32);
     EmitOP([=, vertex_per_warp = vertex_per_warp](ArgumentEncodingContext &enc) {
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
       for (UINT first = 0, block = 0; first < InstanceCount; first += chunk, ++block) {
         const UINT count = std::min(chunk, InstanceCount - first);
-        const auto offset = draw_arguments_offset + block * sizeof(DXMT_DRAW_INDEXED_ARGUMENTS);
-        DXMT_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(offset);
+        const auto offset = draw_arguments_offset + block * sizeof(D3DALLOY_DRAW_INDEXED_ARGUMENTS);
+        D3DALLOY_DRAW_INDEXED_ARGUMENTS *draw_argument = enc.getMappedArgumentBuffer<D3DALLOY_DRAW_INDEXED_ARGUMENTS>(offset);
         draw_argument->BaseVertex = BaseVertexLocation;
         draw_argument->IndexCount = IndexCountPerInstance;
         draw_argument->StartIndex = StartIndexLocation;
@@ -1605,8 +1605,8 @@ public:
 
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
-        cmd.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_d3dalloy_geometry_draw_indexed>();
+        cmd.type = WMTRenderCommandD3DalloyGeometryDrawIndexed;
         cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(offset);
         cmd.instance_count = count;
         cmd.warp_count = warp_count;
@@ -1642,7 +1642,7 @@ public:
       EmitOP([IndexType, IndexBufferOffset, Primitive, ArgBuffer = bindable->buffer(),
               AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(D3DALLOY_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
         enc.bumpVisibilityResultOffset();
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
@@ -1680,7 +1680,7 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([Primitive, ArgBuffer = bindable->buffer(), AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(D3DALLOY_DRAW_ARGUMENTS), ResourceAccess::Read
         );
         enc.bumpVisibilityResultOffset();
         enc.resolveRenderPassBarrier();
@@ -1701,9 +1701,9 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(D3DALLOY_DRAW_ARGUMENTS), ResourceAccess::Read
         );
-        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(D3DALLOY_DISPATCH_ARGUMENTS), 4);
 
         auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
   
@@ -1713,8 +1713,8 @@ public:
           dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups
         );
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indirect>();
-        cmd.type = WMTRenderCommandDXMTGeometryDrawIndirect;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_d3dalloy_geometry_draw_indirect>();
+        cmd.type = WMTRenderCommandD3DalloyGeometryDrawIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
         cmd.vertex_per_warp = vertex_per_warp;
@@ -1735,9 +1735,9 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(D3DALLOY_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
-        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(D3DALLOY_DISPATCH_ARGUMENTS), 4);
 
         auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
@@ -1748,8 +1748,8 @@ public:
           dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups
         );
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed_indirect>();
-        cmd.type = WMTRenderCommandDXMTGeometryDrawIndexedIndirect;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect>();
+        cmd.type = WMTRenderCommandD3DalloyGeometryDrawIndexedIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
         cmd.vertex_per_warp = vertex_per_warp;
@@ -1770,9 +1770,9 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(D3DALLOY_DRAW_ARGUMENTS), ResourceAccess::Read
         );
-        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(D3DALLOY_DISPATCH_ARGUMENTS), 4);
 
         auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
         auto ThreadsPerPatch = enc.tess_threads_per_patch;
@@ -1784,8 +1784,8 @@ public:
             dispatch_arg.gpu_buffer, dispatch_arg.gpu_address,
             dispatch_arg.offset, max_object_threadgroups);
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indirect>();
-        cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndirect;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_d3dalloy_tessellation_mesh_draw_indirect>();
+        cmd.type = WMTRenderCommandD3DalloyTessellationMeshDrawIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
         cmd.patch_per_group = PatchPerGroup;
@@ -1807,9 +1807,9 @@ public:
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
-            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(D3DALLOY_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
         );
-        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        auto dispatch_arg = enc.allocateTempBuffer1(sizeof(D3DALLOY_DISPATCH_ARGUMENTS), 4);
 
         auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
         auto ThreadsPerPatch = enc.tess_threads_per_patch;
@@ -1822,8 +1822,8 @@ public:
             dispatch_arg.gpu_buffer, dispatch_arg.gpu_address,
             dispatch_arg.offset, max_object_threadgroups);
         enc.resolveRenderPassBarrier();
-        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect>();
-        cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect;
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed_indirect>();
+        cmd.type = WMTRenderCommandD3DalloyTessellationMeshDrawIndexedIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
         cmd.dispatch_args_offset = dispatch_arg.offset;
         cmd.patch_per_group = PatchPerGroup;
@@ -5189,7 +5189,7 @@ public:
     default_blend_state->Release();
     default_depth_stencil_state->Release();
 
-    max_object_threadgroups_ = m_parent->GetDXMTDevice().maxObjectThreadgroups();
+    max_object_threadgroups_ = m_parent->GetD3DalloyDevice().maxObjectThreadgroups();
   }
 };
 
@@ -5451,7 +5451,7 @@ public:
 
   void
   Reset() {
-    auto current_seq_id = m_parent->GetDXMTDevice().queue().CurrentSeqId();
+    auto current_seq_id = m_parent->GetD3DalloyDevice().queue().CurrentSeqId();
 
     while (!used_dynamic_buffers.empty()) {
       auto &buffer = used_dynamic_buffers.back();
@@ -5561,8 +5561,8 @@ private:
   CommandList<ArgumentEncodingContext> list;
 
   RingBumpState<StagingBufferBlockAllocator, kStagingBlockSizeForDeferredContext> staging_allocator;
-  RingBumpState<HostBufferBlockAllocator, kStagingBlockSizeForDeferredContext, dxmt::null_mutex> cpu_command_allocator; 
+  RingBumpState<HostBufferBlockAllocator, kStagingBlockSizeForDeferredContext, d3dalloy::null_mutex> cpu_command_allocator;
 
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

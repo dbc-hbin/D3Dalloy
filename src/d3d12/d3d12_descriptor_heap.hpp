@@ -18,19 +18,19 @@
 
 #pragma once
 #include "d3d12.h"
-#include "dxmt_buffer.hpp"
-#include "dxmt_texture.hpp"
+#include "d3dalloy_buffer.hpp"
+#include "d3dalloy_texture.hpp"
 #include <cstdint>
 #include <utility>
 
 #if UINTPTR_MAX == 0xffffffffffffffffULL
-#define DXMT_USE_EMBEDDED_HEAP_POINTER
+#define D3DALLOY_USE_EMBEDDED_HEAP_POINTER
 #endif
 
-namespace dxmt {
+namespace d3dalloy {
 
 struct EMBEDDED_DESCRIPTOR_HANDLE {
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
   SIZE_T Tag        : 5;
   SIZE_T Descriptor : 20;
   SIZE_T Heap       : 7;
@@ -77,7 +77,7 @@ struct EMBEDDED_DESCRIPTOR_HANDLE {
 static_assert(sizeof(EMBEDDED_DESCRIPTOR_HANDLE) == sizeof(D3D12_CPU_DESCRIPTOR_HANDLE));
 constexpr uint32_t kSamplerDescriptorStride = 64;
 
-#ifndef DXMT_USE_EMBEDDED_HEAP_POINTER
+#ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
 /*
  * 32-bit CPU descriptor handles. A 32-bit SIZE_T cannot embed a heap pointer and a 20-bit index,
  * so each heap reserves a disjoint range of a process-wide 32-bit handle space instead: its handle
@@ -277,4 +277,4 @@ public:
   virtual void CopyDescriptors(UINT From, MTLD3D12RenderTargetDescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) = 0;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

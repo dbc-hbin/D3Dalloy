@@ -17,7 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dxmt {
+namespace d3dalloy {
 namespace {
 
 // Stream subobjects newer than the build SDK headers; layouts follow Microsoft's d3d12.h.
@@ -99,7 +99,7 @@ void CopyStencilFace(D3D12_DEPTH_STENCILOP_DESC &out, const DepthStencilOpDesc1 
 
 // Payload layouts of the handled subobject types; must match the cases of ParsePipelineStateStream.
 constexpr auto kStreamLayouts = [] {
-  std::array<DxmtPsoStreamLayout, DXMT_PSO_STREAM_TYPES> table{};
+  std::array<D3DalloyPsoStreamLayout, D3DALLOY_PSO_STREAM_TYPES> table{};
   const auto set = [&]<class T>(uint32_t type, T *) { table[type] = {uint32_t(sizeof(T)), uint32_t(alignof(T))}; };
   set(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, (ID3D12RootSignature **)nullptr);
   set(kSubobjectSerializedRootSignature, (SerializedRootSignatureDesc *)nullptr);
@@ -164,17 +164,17 @@ HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_ST
 
   uint64_t defined_type = 0;
   for (uint64_t offset = 0; offset < stream_size;) {
-    DxmtPsoStreamSubobject next;
-    switch (dxmt_pso_stream_next(stream_bytes, stream_size, kStreamLayouts.data(), offset, defined_type, &next)) {
-    case DXMT_PSO_STREAM_SUCCESS:
+    D3DalloyPsoStreamSubobject next;
+    switch (d3dalloy_pso_stream_next(stream_bytes, stream_size, kStreamLayouts.data(), offset, defined_type, &next)) {
+    case D3DALLOY_PSO_STREAM_SUCCESS:
       break;
-    case DXMT_PSO_STREAM_UNKNOWN_TYPE: {
+    case D3DALLOY_PSO_STREAM_UNKNOWN_TYPE: {
       uint32_t type;
       memcpy(&type, stream_bytes + offset, sizeof(type));
       ERR("CreatePipelineState: unhandled subobject type ", type);
       return E_INVALIDARG;
     }
-    case DXMT_PSO_STREAM_DUPLICATE: {
+    case D3DALLOY_PSO_STREAM_DUPLICATE: {
       uint32_t type;
       memcpy(&type, stream_bytes + offset, sizeof(type));
       ERR("CreatePipelineState: duplicated subobject type ", type);
@@ -496,13 +496,13 @@ namespace {
 
 enum PipelineKind : uint32_t { KindGraphics, KindCompute };
 
-static_assert(sizeof(WMTPipelineCacheIdentity) == sizeof(DxmtPipelineLibraryHeader::identity));
-static_assert(sizeof(Sha1Digest) == sizeof(DxmtPipelineLibraryHeader::digest));
+static_assert(sizeof(WMTPipelineCacheIdentity) == sizeof(D3DalloyPipelineLibraryHeader::identity));
+static_assert(sizeof(Sha1Digest) == sizeof(D3DalloyPipelineLibraryHeader::digest));
 
 Sha1Digest LibraryDigest(const uint8_t *bytes, size_t size) {
   Sha1HashState hash;
-  hash.update(bytes, DXMT_PIPELINE_LIBRARY_DIGEST_BEGIN);
-  hash.update(bytes + DXMT_PIPELINE_LIBRARY_DIGEST_END, size - DXMT_PIPELINE_LIBRARY_DIGEST_END);
+  hash.update(bytes, D3DALLOY_PIPELINE_LIBRARY_DIGEST_BEGIN);
+  hash.update(bytes + D3DALLOY_PIPELINE_LIBRARY_DIGEST_END, size - D3DALLOY_PIPELINE_LIBRARY_DIGEST_END);
   return hash.final();
 }
 
@@ -527,17 +527,17 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
   // Deterministic order for Serialize: names in insertion order.
   std::vector<const std::wstring *> order_;
   // Serialized size and entry count of order_, checked by Rust on every insert.
-  DxmtPipelineLibraryExtent extent_{DXMT_PIPELINE_LIBRARY_HEADER_SIZE, 0};
+  D3DalloyPipelineLibraryExtent extent_{D3DALLOY_PIPELINE_LIBRARY_HEADER_SIZE, 0};
 
   HRESULT Insert(std::wstring name, PipelineKind kind, const Sha1Digest &key, const uint8_t *blob, size_t size,
                  ID3D12PipelineState *pipeline) {
     if (entries_.count(name))
       return E_INVALIDARG;
-    DxmtPipelineLibraryExtent extent;
-    switch (dxmt_pipeline_library_extend(&extent_, uint64_t(name.size()) * sizeof(WCHAR), size, &extent)) {
-    case DXMT_PIPELINE_LIBRARY_SUCCESS:
+    D3DalloyPipelineLibraryExtent extent;
+    switch (d3dalloy_pipeline_library_extend(&extent_, uint64_t(name.size()) * sizeof(WCHAR), size, &extent)) {
+    case D3DALLOY_PIPELINE_LIBRARY_SUCCESS:
       break;
-    case DXMT_PIPELINE_LIBRARY_OVERFLOW:
+    case D3DALLOY_PIPELINE_LIBRARY_OVERFLOW:
       return E_OUTOFMEMORY;
     default:
       return E_INVALIDARG;
@@ -613,11 +613,11 @@ public:
     if (!size)
       return S_OK;
     const auto *bytes = static_cast<const uint8_t *>(data);
-    DxmtPipelineLibraryHeader header;
-    switch (dxmt_pipeline_library_header(bytes, size, &header)) {
-    case DXMT_PIPELINE_LIBRARY_SUCCESS:
+    D3DalloyPipelineLibraryHeader header;
+    switch (d3dalloy_pipeline_library_header(bytes, size, &header)) {
+    case D3DALLOY_PIPELINE_LIBRARY_SUCCESS:
       break;
-    case DXMT_PIPELINE_LIBRARY_VERSION_MISMATCH:
+    case D3DALLOY_PIPELINE_LIBRARY_VERSION_MISMATCH:
       return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
     default:
       return E_INVALIDARG;
@@ -633,11 +633,11 @@ public:
       return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
     if (memcmp(LibraryDigest(bytes, size).data, header.digest, sizeof(header.digest)))
       return E_INVALIDARG;
-    uint64_t offset = DXMT_PIPELINE_LIBRARY_HEADER_SIZE;
+    uint64_t offset = D3DALLOY_PIPELINE_LIBRARY_HEADER_SIZE;
     try {
       for (uint32_t i = 0; i < header.count; ++i) {
-        DxmtPipelineLibraryEntry record;
-        if (dxmt_pipeline_library_entry(bytes, size, offset, &record) != DXMT_PIPELINE_LIBRARY_SUCCESS)
+        D3DalloyPipelineLibraryEntry record;
+        if (d3dalloy_pipeline_library_entry(bytes, size, offset, &record) != D3DALLOY_PIPELINE_LIBRARY_SUCCESS)
           return E_INVALIDARG;
         std::wstring name(record.name_bytes / sizeof(WCHAR), L'\0');
         memcpy(name.data(), bytes + record.name_offset, record.name_bytes);
@@ -742,24 +742,24 @@ public:
     if (size < extent_.size)
       return E_INVALIDARG;
     auto *bytes = static_cast<uint8_t *>(data);
-    DxmtPipelineLibraryHeader header{};
+    D3DalloyPipelineLibraryHeader header{};
     header.adapter = device_->GetMTLDevice().registryID();
     header.size = extent_.size;
     header.count = uint32_t(extent_.count);
     memcpy(header.identity, &identity, sizeof(identity));
-    if (dxmt_pipeline_library_begin(&header, bytes, extent_.size) != DXMT_PIPELINE_LIBRARY_SUCCESS)
+    if (d3dalloy_pipeline_library_begin(&header, bytes, extent_.size) != D3DALLOY_PIPELINE_LIBRARY_SUCCESS)
       return E_FAIL;
-    uint64_t offset = DXMT_PIPELINE_LIBRARY_HEADER_SIZE;
+    uint64_t offset = D3DALLOY_PIPELINE_LIBRARY_HEADER_SIZE;
     for (const auto *name : order_) {
       const auto &entry = entries_.at(*name);
-      DxmtPipelineLibraryRecord record{};
+      D3DalloyPipelineLibraryRecord record{};
       record.name_bytes = name->size() * sizeof(WCHAR);
       record.blob_size = entry.blob.size();
       record.kind = entry.kind;
       memcpy(record.key, entry.key.data, sizeof(record.key));
-      DxmtPipelineLibraryEntry placed;
-      if (dxmt_pipeline_library_put_entry(bytes, extent_.size, offset, &record, &placed) !=
-          DXMT_PIPELINE_LIBRARY_SUCCESS)
+      D3DalloyPipelineLibraryEntry placed;
+      if (d3dalloy_pipeline_library_put_entry(bytes, extent_.size, offset, &record, &placed) !=
+          D3DALLOY_PIPELINE_LIBRARY_SUCCESS)
         return E_FAIL;
       memcpy(bytes + placed.name_offset, name->data(), placed.name_bytes);
       memcpy(bytes + placed.blob_offset, entry.blob.data(), placed.blob_size);
@@ -767,7 +767,7 @@ public:
     }
     const auto digest = LibraryDigest(bytes, extent_.size);
     if (offset != extent_.size ||
-        dxmt_pipeline_library_set_digest(bytes, extent_.size, digest.data) != DXMT_PIPELINE_LIBRARY_SUCCESS)
+        d3dalloy_pipeline_library_set_digest(bytes, extent_.size, digest.data) != D3DALLOY_PIPELINE_LIBRARY_SUCCESS)
       return E_FAIL;
     return S_OK;
   }
@@ -794,4 +794,4 @@ HRESULT CreatePipelineLibrary(MTLD3D12Device *device, const void *blob, SIZE_T b
   }
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

@@ -9,7 +9,7 @@
 #include "llvm/IR/Value.h"
 #include "llvm/Support/AtomicOrdering.h"
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 struct TessMeshWorkload {
   short inner0[2];
@@ -317,8 +317,8 @@ convert_dxbc_vertex_hull_shader(
       .memory_access = air::MemoryAccess::read,
       .address_space = air::AddressSpace::constant,
       .type = is_indexed_draw //
-                  ? air::MSLWhateverStruct{"draw_indexed_arguments", types._dxmt_draw_indexed_arguments}
-                  : air::MSLWhateverStruct{"draw_arguments", types._dxmt_draw_arguments},
+                  ? air::MSLWhateverStruct{"draw_indexed_arguments", types._d3dalloy_draw_indexed_arguments}
+                  : air::MSLWhateverStruct{"draw_arguments", types._d3dalloy_draw_arguments},
       .arg_name = "draw_arguments",
       .raster_order_group = {}
   });
@@ -407,7 +407,7 @@ convert_dxbc_vertex_hull_shader(
     );
 
     auto draw_arguments = builder.CreateLoad(
-        is_indexed_draw ? types._dxmt_draw_indexed_arguments : types._dxmt_draw_arguments,
+        is_indexed_draw ? types._d3dalloy_draw_indexed_arguments : types._d3dalloy_draw_arguments,
         function->getArg(draw_argument_idx)
     );
 
@@ -1077,7 +1077,7 @@ convert_dxbc_tesselator_domain_shader(
         builder.CreateMul(builder.CreateAdd(builder.CreateMul(instance, patch_count), resource_map.patch_id),
                           builder.getInt32(max_workload_count)),
         dxbc.DomainGetWorkloadRank(workload_index, data));
-    auto marker = module.getOrInsertFunction("dxmt.msaa.mesh.slot",
+    auto marker = module.getOrInsertFunction("d3dalloy.msaa.mesh.slot",
         llvm::FunctionType::get(builder.getVoidTy(), {types._int}, false));
     builder.CreateCall(marker, {builder.CreateSelect(
         builder.CreateICmpULT(resource_map.patch_id, patch_count), slot, builder.getInt32(~0u))});
@@ -1399,4 +1399,4 @@ convert_dxbc_tesselator_domain_shader(
   return llvm::Error::success();
 }
 
-} // namespace dxmt::dxbc
+} // namespace d3dalloy::dxbc

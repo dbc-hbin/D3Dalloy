@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 
-using namespace dxmt::resource_contract;
+using namespace d3dalloy::resource_contract;
 
 int main() {
   uint32_t count = 0;

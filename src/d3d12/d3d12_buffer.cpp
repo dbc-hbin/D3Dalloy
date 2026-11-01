@@ -20,11 +20,11 @@
 #include "d3d12_pageable.hpp"
 #include "d3d12_resource_contract.hpp"
 #include "com/com_pointer.hpp"
-#include "dxmt_format.hpp"
+#include "d3dalloy_format.hpp"
 #include <cstring>
 #include <new>
 
-namespace dxmt {
+namespace d3dalloy {
 
 namespace {
 
@@ -610,4 +610,4 @@ CreatePlacedBuffer(
   return buffer->QueryInterface(riid, ppResource);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

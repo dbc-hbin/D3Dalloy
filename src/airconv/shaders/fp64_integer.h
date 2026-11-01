@@ -46,7 +46,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define SF_THREAD
 #define SF_CONST const
 #endif
-namespace dxmt_softfloat {
+namespace d3dalloy_softfloat {
+
 typedef unsigned char uint8_t; typedef signed char int8_t;
 typedef unsigned short uint16_t; typedef short int16_t;
 typedef unsigned int uint32_t; typedef int int32_t;
@@ -1830,4 +1831,3 @@ inline uint32_t f64_to_ui32_r_minMag( float64_t a, bool exact )
 }
 #undef SF_THREAD
 #undef SF_CONST
-

@@ -28,26 +28,26 @@ int main() {
     {maximum - 1, 14757395258967641291ULL},
   };
   for (const auto &test : cases) {
-    const auto actual = dxmt::advertisedDedicatedVideoMemory<uint64_t>(true, maximum, test.ram);
+    const auto actual = d3dalloy::advertisedDedicatedVideoMemory<uint64_t>(true, maximum, test.ram);
     CHECK(actual == test.expected);
     std::printf("ram=%llu advertised=%llu\n", static_cast<unsigned long long>(test.ram),
                 static_cast<unsigned long long>(actual));
   }
 
   // The Metal recommendation caps advertising; a discrete adapter ignores RAM.
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint64_t>(true, 10 * gib, 64 * gib) == 10 * gib);
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint64_t>(true, 0, 64 * gib) == 0);
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint64_t>(false, 60 * gib, 16 * gib) == 60 * gib);
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint64_t>(false, maximum, 0) == maximum);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint64_t>(true, 10 * gib, 64 * gib) == 10 * gib);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint64_t>(true, 0, 64 * gib) == 0);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint64_t>(false, 60 * gib, 16 * gib) == 60 * gib);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint64_t>(false, maximum, 0) == maximum);
 
   // UMA SIZE_T must saturate, not wrap at 4 GiB or a larger multiple.
   constexpr uint64_t maximum32 = std::numeric_limits<uint32_t>::max();
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint32_t>(true, maximum, 8 * gib - 2) == maximum32);
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint32_t>(true, maximum, 8 * gib) == maximum32);
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint32_t>(true, maximum, 16 * gib) == maximum32);
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint32_t>(true, maximum32 - 1, 64 * gib) == maximum32 - 1);
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint32_t>(true, 2 * gib, 64 * gib) == 2 * gib);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint32_t>(true, maximum, 8 * gib - 2) == maximum32);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint32_t>(true, maximum, 8 * gib) == maximum32);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint32_t>(true, maximum, 16 * gib) == maximum32);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint32_t>(true, maximum32 - 1, 64 * gib) == maximum32 - 1);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint32_t>(true, 2 * gib, 64 * gib) == 2 * gib);
   // Preserve the existing discrete-adapter conversion even for 32-bit callers.
-  CHECK(dxmt::advertisedDedicatedVideoMemory<uint32_t>(false, 5 * gib, 0) == gib);
+  CHECK(d3dalloy::advertisedDedicatedVideoMemory<uint32_t>(false, 5 * gib, 0) == gib);
   std::puts("DXGI_MEMORY_POLICY_PASS");
 }

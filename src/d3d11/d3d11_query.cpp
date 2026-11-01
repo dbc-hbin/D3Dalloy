@@ -1,7 +1,7 @@
 #include "d3d11_query.hpp"
-#include "dxmt_occlusion_query.hpp"
+#include "d3dalloy_occlusion_query.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 class OcclusionQuery : public MTLD3DQueryBase<MTLD3D11OcclusionQuery> {
   using MTLD3DQueryBase<MTLD3D11OcclusionQuery>::MTLD3DQueryBase;
@@ -125,4 +125,4 @@ CreateTimestampQuery(MTLD3D11Device *pDevice, const D3D11_QUERY_DESC1 *pDesc, ID
   return S_FALSE;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

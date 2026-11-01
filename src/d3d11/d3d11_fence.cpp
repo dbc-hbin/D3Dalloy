@@ -3,7 +3,7 @@
 #include "d3d11_resource.hpp"
 #include "util_win32_compat.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D11FenceImpl : public MTLD3D11DeviceChild<MTLD3D11Fence> {
 public:
@@ -82,7 +82,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 Value,
                                                  HANDLE Event) final {
-    auto shared_event_listener = this->m_parent->GetDXMTDevice().queue().GetSharedEventListener();
+    auto shared_event_listener = this->m_parent->GetD3DalloyDevice().queue().GetSharedEventListener();
     MTLSharedEvent_setWin32EventAtValue(event.handle, shared_event_listener, Event, Value);
     return S_OK;
   };
@@ -188,4 +188,4 @@ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource,
   return fence->QueryInterface(riid, ppFence);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

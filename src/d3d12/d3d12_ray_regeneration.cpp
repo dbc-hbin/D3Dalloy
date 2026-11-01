@@ -8,7 +8,7 @@
 #include <mutex>
 #include <new>
 
-namespace dxmt {
+namespace d3dalloy {
 namespace {
 HRESULT nativeResult(uint64_t result) {
   switch (result) {
@@ -185,4 +185,4 @@ void EncodeOwnedRayRegenerationFrame(const std::shared_ptr<OwnedRayRegenerationF
   // Commit even partial native work before signaling, so another queue cannot strand.
   signal_event(core.timeline, sequence);
 }
-} // namespace dxmt
+} // namespace d3dalloy

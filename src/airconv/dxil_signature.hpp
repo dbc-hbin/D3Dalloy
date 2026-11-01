@@ -22,7 +22,7 @@
 #include "dxbc_converter.hpp"
 #include "dxil_converter.hpp"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 /**
  * Where one signature element lives in `dxbc::io_binding_map::input` /
@@ -100,11 +100,11 @@ TransplantEntryBody(llvm::Function &entry, llvm::Function &function, llvm::Basic
  * The relocation redirects the uses of a relocated immutable global through an
  * addrspacecast into its own address space. Folding that cast (and the flat
  * GEP/load chain behind it) back onto the storage's address space is what
- * `dxmt::runOptimizationPasses` does through `InferAddressSpacesPass(0)`; a path
+ * `d3dalloy::runOptimizationPasses` does through `InferAddressSpacesPass(0)`; a path
  * that prepares storage therefore also has to run the optimization pipeline
  * before it serializes AIR, or the shader keeps dereferencing constant storage
  * as if it were device memory.
  */
 void PrepareModuleStorage(llvm::Module &module);
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

@@ -44,7 +44,7 @@ static inline device wg_queue *wg_queue_at(device uint *ctx, uint queue) {
 }
 
 /* Index (relative to BatchStart) of the batch record threadgroup `group` belongs to. */
-uint wg_bc_record(device uint *ctx, uint group) asm("dxmt.wg.bc_record");
+uint wg_bc_record(device uint *ctx, uint group) asm("d3dalloy.wg.bc_record");
 uint wg_bc_record(device uint *ctx, uint group) {
   device const wg_batch_record *table = (device const wg_batch_record *)wg_ctx64(ctx, WG_CTX_BATCH);
   uint absolute = ctx[WG_CTX_GROUP_START] + group;
@@ -61,7 +61,7 @@ uint wg_bc_record(device uint *ctx, uint group) {
 }
 
 /* Component `axis` of SV_GroupID of threadgroup `group` within its batch record `record`. */
-uint wg_bc_group(device uint *ctx, uint group, uint record, uint axis) asm("dxmt.wg.bc_group");
+uint wg_bc_group(device uint *ctx, uint group, uint record, uint axis) asm("d3dalloy.wg.bc_group");
 uint wg_bc_group(device uint *ctx, uint group, uint record, uint axis) {
   device const wg_batch_record *table = (device const wg_batch_record *)wg_ctx64(ctx, WG_CTX_BATCH);
   uint absolute = ctx[WG_CTX_GROUP_START] + group;
@@ -76,7 +76,7 @@ uint wg_bc_group(device uint *ctx, uint group, uint record, uint axis) {
 }
 
 /* Queue of output element `element`, or WG_NONE for an invalid / absent output. */
-uint wg_output_queue(device uint *ctx, uint element) asm("dxmt.wg.output_queue");
+uint wg_output_queue(device uint *ctx, uint element) asm("d3dalloy.wg.output_queue");
 uint wg_output_queue(device uint *ctx, uint element) {
   if (element >= ctx[WG_CTX_OUTPUT_COUNT])
     return WG_NONE;
@@ -84,7 +84,7 @@ uint wg_output_queue(device uint *ctx, uint element) {
 }
 
 /* Reserve `count` records in `queue`; returns the first record index (0 when nothing is reserved). */
-uint wg_reserve(device uint *ctx, uint queue, uint count) asm("dxmt.wg.reserve");
+uint wg_reserve(device uint *ctx, uint queue, uint count) asm("d3dalloy.wg.reserve");
 uint wg_reserve(device uint *ctx, uint queue, uint count) {
   if (queue >= WG_INPUT || !count)
     return 0;
@@ -92,7 +92,7 @@ uint wg_reserve(device uint *ctx, uint queue, uint count) {
 }
 
 /* Device address of record `index` of `queue` (WG_INPUT: the dispatch's input queue). */
-ulong wg_record_address(device uint *ctx, uint queue, uint index) asm("dxmt.wg.record_address");
+ulong wg_record_address(device uint *ctx, uint queue, uint index) asm("d3dalloy.wg.record_address");
 ulong wg_record_address(device uint *ctx, uint queue, uint index) {
   if (queue == WG_INPUT)
     queue = ctx[WG_CTX_INPUT_QUEUE];
@@ -103,7 +103,7 @@ ulong wg_record_address(device uint *ctx, uint queue, uint index) {
 }
 
 /* FinishedCrossGroupSharing for input record `index`: 1 for the last group to finish. */
-uint wg_finish_sharing(device uint *ctx, uint index) asm("dxmt.wg.finish_sharing");
+uint wg_finish_sharing(device uint *ctx, uint index) asm("d3dalloy.wg.finish_sharing");
 uint wg_finish_sharing(device uint *ctx, uint index) {
   device wg_queue *q = wg_queue_at(ctx, ctx[WG_CTX_INPUT_QUEUE]);
   device atomic_uint *counter = (device atomic_uint *)(q->sharing + ulong(index & q->mask) * 4);

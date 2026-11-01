@@ -5,7 +5,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 
-namespace dxmt::msaa {
+namespace d3dalloy::msaa {
 
 uint64_t userHash(llvm::StringRef semantic);
 llvm::Value *lineBlend(llvm::IRBuilder<> &builder, llvm::Value *a, llvm::Value *z, llvm::Value *fraction);

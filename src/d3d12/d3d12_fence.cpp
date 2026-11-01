@@ -23,7 +23,7 @@
 #include <new>
 #include <cwchar>
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D12FenceImpl : public MTLD3D12DeviceChild<MTLD3D12Fence> {
   D3D12_FENCE_FLAGS flags_;
@@ -193,4 +193,4 @@ OpenSharedFence(MTLD3D12Device *pDevice, std::shared_ptr<sharing::SharedObject> 
   return fence->QueryInterface(riid, ppFence);
 }
 
-}; // namespace dxmt
+}; // namespace d3dalloy

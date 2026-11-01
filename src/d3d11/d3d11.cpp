@@ -16,17 +16,17 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "dxmt_names.hpp"
+#include "d3dalloy_names.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "config/config.hpp"
 #include "d3d11_device.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
-#include "dxmt_capture.hpp"
+#include "d3dalloy_capture.hpp"
 #include <exception>
 
-namespace dxmt {
+namespace d3dalloy {
 Logger Logger::s_instance("d3d11.log");
 
 extern "C" HRESULT WINAPI
@@ -39,7 +39,7 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
 
   // Try to find the corresponding Metal device for the DXGI adapter
   if (FAILED(pAdapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter)))) {
-    ERR("Not a DXMT adapter");
+    ERR("Not a D3Dalloy adapter");
     return E_INVALIDARG;
   }
 
@@ -100,7 +100,7 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
     Logger::info(str::format("Using feature level ", devFeatureLevel));
 
     auto device = CreateD3D11Device(
-        CreateDXMTDevice({.device = dxgi_adapter->GetMTLDevice()}),
+        CreateD3DalloyDevice({.device = dxgi_adapter->GetMTLDevice()}),
         dxgi_adapter.ptr(), devFeatureLevel, Flags);
 
     return device->QueryInterface(IID_PPV_ARGS(ppDevice));
@@ -226,7 +226,7 @@ extern "C" HRESULT __stdcall D3D11On12CreateDevice(
   return E_NOTIMPL;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy
 
 #ifdef _WIN32
 
@@ -242,13 +242,13 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 
 extern "C" void _massert(const char *_Message, const char *_File,
                          unsigned _Line) {
-  dxmt::Logger::err(dxmt::str::format("Assertion failed: ", _Message,
+  d3dalloy::Logger::err(d3dalloy::str::format("Assertion failed: ", _Message,
                                       "\nfile: ", _File, ":", _Line));
   std::terminate();
 }
 
 extern "C" void __cxa_pure_virtual() {
-  dxmt::Logger::err(dxmt::str::format("Pure virtual function called"));
+  d3dalloy::Logger::err(d3dalloy::str::format("Pure virtual function called"));
 #ifndef NDEBUG
   __builtin_trap();
 #endif

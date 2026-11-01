@@ -18,12 +18,12 @@
 
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
-#include "dxmt_buffer.hpp"
-#include "dxmt_dynamic.hpp"
-#include "dxmt_format.hpp"
+#include "d3dalloy_buffer.hpp"
+#include "d3dalloy_dynamic.hpp"
+#include "d3dalloy_format.hpp"
 #include "d3d11_resource.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 struct BufferViewInfo {
   BufferViewKey viewKey;
@@ -35,7 +35,7 @@ struct BufferViewInfo {
 
 class D3D11Buffer : public TResourceBase<tag_buffer> {
 private:
-#ifdef DXMT_DEBUG
+#ifdef D3DALLOY_DEBUG
   std::string debug_name;
 #endif
   bool structured;
@@ -103,7 +103,7 @@ public:
 #endif
     }
     auto allocation = buffer_->allocate(flags);
-    auto &initializer = device->GetDXMTDevice().queue().initializer;
+    auto &initializer = device->GetD3DalloyDevice().queue().initializer;
     if (pInitialData) {
       allocation->updateContents(0, pInitialData->pSysMem, pDesc->ByteWidth);
     } else if (flags.test(BufferAllocationFlag::GpuPrivate)) {
@@ -303,7 +303,7 @@ public:
     if (!Name) {
       return;
     }
-#ifdef DXMT_DEBUG
+#ifdef D3DALLOY_DEBUG
     debug_name = std::string(Name);
 #endif
   }
@@ -318,4 +318,4 @@ CreateBuffer(
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

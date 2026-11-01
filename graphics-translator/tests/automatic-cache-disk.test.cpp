@@ -34,14 +34,14 @@ HANDLE counted_find(const WCHAR *pattern, WIN32_FIND_DATAW *info) {
   if (std::wcsstr(pattern, L"d3dalloy-stage-*")) ++stage_enumerations;
   return FindFirstFileW(pattern, info);
 }
-namespace dxmt {
+namespace d3dalloy {
 HRESULT CreateBlobFromMalloc(SIZE_T size, ID3DBlob **blob) { return D3DCreateBlob(size, blob); }
 void PublishAutomaticStageArtifact(const std::string &, std::shared_ptr<const ShaderStageArtifact>, uint64_t) {}
 }
 #define FindFirstFileW counted_find
 #include PRODUCTION_CACHE
 #undef FindFirstFileW
-using namespace dxmt;
+using namespace d3dalloy;
 extern "C" bool WMTGetPipelineCacheIdentity(WMTPipelineCacheIdentity *identity) {
   *identity = {}; identity->compiler_uuid[0] = 1; return true;
 }
@@ -116,7 +116,7 @@ void replaceStageBytes(const std::string &value, const std::vector<uint8_t> &byt
   require(file.value != INVALID_HANDLE_VALUE && Write(file.value, bytes.data(), DWORD(bytes.size())) &&
               FlushFileBuffers(file.value), "replace owned stage fixture");
 }
-void stageChecksum(std::vector<uint8_t> &bytes, const DxmtStageCacheLayout &layout) {
+void stageChecksum(std::vector<uint8_t> &bytes, const D3DalloyStageCacheLayout &layout) {
   Sha1HashState checksum;
   checksum.update(bytes.data() + layout.checksum_header.offset, size_t(layout.checksum_header.size))
       .update(bytes.data() + layout.checksum_payload.offset, bytes.size() - size_t(layout.checksum_payload.offset));
@@ -153,35 +153,35 @@ void testStageCodec() {
   WMTPipelineCacheIdentity identity{};
   require(StageIdentity(identity), "stage test identity");
   const auto original = stageBytes(value);
-  DxmtStageCacheLayout layout{};
-  require(dxmt_stage_cache_decode(original.data(), original.size(), value.data(), value.size(), &identity, &layout) ==
-              DXMT_STAGE_CACHE_SUCCESS, "decode published stage layout");
+  D3DalloyStageCacheLayout layout{};
+  require(d3dalloy_stage_cache_decode(original.data(), original.size(), value.data(), value.size(), &identity, &layout) ==
+              D3DALLOY_STAGE_CACHE_SUCCESS, "decode published stage layout");
   require(layout.checksum_header.offset == 0 && layout.checksum_header.size == 104 &&
               layout.checksum_payload.offset == 128 && layout.checksum_payload.size == original.size() - 128 &&
               layout.checksum.offset == 104 && layout.checksum.size == 20,
           "stage version two checksum excludes digest and trailing header padding");
-  const DxmtStageCacheParts parts{
+  const D3DalloyStageCacheParts parts{
       value.data(), source.library.data(), source.metadata_sizes.data(), source.metadata.data(),
       source.constants.data(), source.relocations.data(), &identity,
       value.size(), source.library.size(), source.metadata_sizes.size() * sizeof(uint32_t), source.metadata.size(),
       source.constants.size() * sizeof(uint64_t), source.relocations.size() * sizeof(SM50_CONSTANT_RELOCATION), 256};
   uint64_t encoded_size = 0;
-  require(dxmt_stage_cache_measure(&parts, &encoded_size) == DXMT_STAGE_CACHE_SUCCESS && encoded_size == original.size(),
+  require(d3dalloy_stage_cache_measure(&parts, &encoded_size) == D3DALLOY_STAGE_CACHE_SUCCESS && encoded_size == original.size(),
           "stage encoder measures complete payload");
   std::vector<uint8_t> encoded(size_t(encoded_size), 0xa5);
-  DxmtStageCacheLayout encoded_layout{};
-  require(dxmt_stage_cache_encode(&parts, encoded.data(), encoded.size(), &encoded_layout) == DXMT_STAGE_CACHE_SUCCESS,
+  D3DalloyStageCacheLayout encoded_layout{};
+  require(d3dalloy_stage_cache_encode(&parts, encoded.data(), encoded.size(), &encoded_layout) == D3DALLOY_STAGE_CACHE_SUCCESS,
           "stage encoder assembles actual artifact regions");
   require(std::all_of(encoded.begin() + 104, encoded.begin() + 128, [](auto byte) { return byte == 0; }),
           "stage encoder initializes checksum and header padding");
   stageChecksum(encoded, encoded_layout);
   require(encoded == original, "stage encoder matches published bytes");
   auto invalid = [&](std::vector<uint8_t> bytes, const char *message) {
-    DxmtStageCacheLayout rejected_layout;
+    D3DalloyStageCacheLayout rejected_layout;
     std::memset(&rejected_layout, 0xa5, sizeof(rejected_layout));
     const auto untouched = rejected_layout;
-    require(dxmt_stage_cache_decode(bytes.data(), bytes.size(), value.data(), value.size(), &identity, &rejected_layout) !=
-                DXMT_STAGE_CACHE_SUCCESS && !std::memcmp(&rejected_layout, &untouched, sizeof(untouched)), message);
+    require(d3dalloy_stage_cache_decode(bytes.data(), bytes.size(), value.data(), value.size(), &identity, &rejected_layout) !=
+                D3DALLOY_STAGE_CACHE_SUCCESS && !std::memcmp(&rejected_layout, &untouched, sizeof(untouched)), message);
     stageChecksum(bytes, layout);
     replaceStageBytes(value, bytes);
     auto rejected = loaded;
@@ -249,30 +249,30 @@ void testStageCodec() {
   const uint32_t invalid_lengths[] = {0, 3, 1};
   invalid_parts.metadata_sizes = invalid_lengths;
   uint64_t untouched_size = UINT64_MAX;
-  require(dxmt_stage_cache_measure(&invalid_parts, &untouched_size) == DXMT_STAGE_CACHE_INVALID_DATA &&
+  require(d3dalloy_stage_cache_measure(&invalid_parts, &untouched_size) == D3DALLOY_STAGE_CACHE_INVALID_DATA &&
               untouched_size == UINT64_MAX, "invalid stage measure leaves size unchanged");
   std::fill(encoded.begin(), encoded.end(), 0xa5);
   const auto untouched_bytes = encoded;
-  DxmtStageCacheLayout untouched_layout;
+  D3DalloyStageCacheLayout untouched_layout;
   std::memset(&untouched_layout, 0xa5, sizeof(untouched_layout));
   encoded_layout = untouched_layout;
-  require(dxmt_stage_cache_encode(&invalid_parts, encoded.data(), encoded.size(), &encoded_layout) ==
-              DXMT_STAGE_CACHE_INVALID_DATA && encoded == untouched_bytes &&
+  require(d3dalloy_stage_cache_encode(&invalid_parts, encoded.data(), encoded.size(), &encoded_layout) ==
+              D3DALLOY_STAGE_CACHE_INVALID_DATA && encoded == untouched_bytes &&
               !std::memcmp(&encoded_layout, &untouched_layout, sizeof(untouched_layout)),
           "invalid stage encode leaves destination and layout unchanged");
-  require(dxmt_stage_cache_encode(&parts, encoded.data(), encoded.size() - 1, &encoded_layout) == DXMT_STAGE_CACHE_OUTPUT_SIZE &&
+  require(d3dalloy_stage_cache_encode(&parts, encoded.data(), encoded.size() - 1, &encoded_layout) == D3DALLOY_STAGE_CACHE_OUTPUT_SIZE &&
               encoded == untouched_bytes && !std::memcmp(&encoded_layout, &untouched_layout, sizeof(untouched_layout)),
           "undersized stage encode leaves destination and layout unchanged");
   invalid_parts = parts;
   invalid_parts.metadata_sizes = nullptr;
-  require(dxmt_stage_cache_encode(&invalid_parts, encoded.data(), encoded.size(), &encoded_layout) ==
-              DXMT_STAGE_CACHE_INVALID_ARGUMENT && encoded == untouched_bytes &&
+  require(d3dalloy_stage_cache_encode(&invalid_parts, encoded.data(), encoded.size(), &encoded_layout) ==
+              D3DALLOY_STAGE_CACHE_INVALID_ARGUMENT && encoded == untouched_bytes &&
               !std::memcmp(&encoded_layout, &untouched_layout, sizeof(untouched_layout)),
           "null nonempty stage input leaves destination and layout unchanged");
-  require(dxmt_stage_cache_file_size(127) != DXMT_STAGE_CACHE_SUCCESS &&
-              dxmt_stage_cache_file_size(8 * MiB + 1) != DXMT_STAGE_CACHE_SUCCESS &&
-              dxmt_stage_cache_file_size(128) == DXMT_STAGE_CACHE_SUCCESS &&
-              dxmt_stage_cache_file_size(8 * MiB) == DXMT_STAGE_CACHE_SUCCESS,
+  require(d3dalloy_stage_cache_file_size(127) != D3DALLOY_STAGE_CACHE_SUCCESS &&
+              d3dalloy_stage_cache_file_size(8 * MiB + 1) != D3DALLOY_STAGE_CACHE_SUCCESS &&
+              d3dalloy_stage_cache_file_size(128) == D3DALLOY_STAGE_CACHE_SUCCESS &&
+              d3dalloy_stage_cache_file_size(8 * MiB) == D3DALLOY_STAGE_CACHE_SUCCESS,
           "stage file bounds checked before allocation");
   source.library[0] = 'X';
   WriteAutomaticStageArtifact(value, source);
@@ -402,7 +402,7 @@ void testStageEviction() {
   require(reader != INVALID_HANDLE_VALUE, "open reader on oldest stage file");
   child(L"--stage 0 65");
   std::vector<uint8_t> head(4);
-  require(Read(reader, head.data(), 4) && !std::memcmp(head.data(), "DDXM", 4), "evicted file stays readable");
+  require(Read(reader, head.data(), 4) && !std::memcmp(head.data(), "D3AL", 4), "evicted file stays readable");
   CloseHandle(reader);
   require(!stageExists(1) && stageExists(2) && stageExists(65) && GetFileAttributesW(orphan.c_str()) == INVALID_FILE_ATTRIBUTES,
           "new process evicts the oldest stage file and orphan temps");

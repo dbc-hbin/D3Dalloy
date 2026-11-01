@@ -28,7 +28,7 @@
 #include <cstring>
 #include <tuple>
 
-namespace dxmt::dxbc {
+namespace d3dalloy::dxbc {
 
 using namespace llvm::air;
 
@@ -922,7 +922,7 @@ public:
   llvm::Value *
   NullDescriptor(llvm::air::AIRBuilder &AIR) {
     auto &module = *AIR.builder.GetInsertBlock()->getModule();
-    constexpr const char *name = "dxmt.heap.null_descriptor";
+    constexpr const char *name = "d3dalloy.heap.null_descriptor";
     auto *type = llvm::ArrayType::get(llvm::Type::getInt64Ty(AIR.getContext()), 8);
     auto *global = module.getGlobalVariable(name, true);
     if (!global) {
@@ -1216,12 +1216,12 @@ setup_binding_rootsig(
     bool bind_signature_arguments
 ) {
   using namespace microsoft;
-  using namespace dxmt::dxbc;
-  using namespace dxmt::air;
-  using namespace dxmt::shader::common;
+  using namespace d3dalloy::dxbc;
+  using namespace d3dalloy::air;
+  using namespace d3dalloy::shader::common;
 
-  if (!module.getModuleFlag("dxmt.d3d12.root-signature"))
-    module.addModuleFlag(llvm::Module::Error, "dxmt.d3d12.root-signature", 1);
+  if (!module.getModuleFlag("d3dalloy.d3d12.root-signature"))
+    module.addModuleFlag(llvm::Module::Error, "d3dalloy.d3d12.root-signature", 1);
   auto binding_map = std::make_unique<RootSignatureBindingMap>();
 
   /*
@@ -1798,18 +1798,18 @@ setup_binding_rootsig(
   return binding_map;
 }
 
-} // namespace dxmt::dxbc
+} // namespace d3dalloy::dxbc
 
 AIRCONV_API int SM50NeedsRasterOrderedBufferMarker(
     sm50_shader_t pShader, const void *pRootSignature, size_t RootSignatureLength
 ) {
   if (!pShader || !pRootSignature || !RootSignatureLength)
     return 0;
-  const auto *shader = static_cast<const dxmt::dxbc::SM50ShaderInternal *>(pShader);
+  const auto *shader = static_cast<const d3dalloy::dxbc::SM50ShaderInternal *>(pShader);
   if (shader->shader_type != microsoft::D3D10_SB_PIXEL_SHADER)
     return 0;
-  dxmt::RootSignatureDeserializer deserializer;
-  const auto *root = dxmt::dxbc::deserialize_root_signature(
+  d3dalloy::RootSignatureDeserializer deserializer;
+  const auto *root = d3dalloy::dxbc::deserialize_root_signature(
       pRootSignature, RootSignatureLength, deserializer);
-  return root && dxmt::dxbc::needs_ordered_buffer_marker(shader->shader_info, *root);
+  return root && d3dalloy::dxbc::needs_ordered_buffer_marker(shader->shader_info, *root);
 }

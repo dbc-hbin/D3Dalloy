@@ -2,7 +2,7 @@
 // Presenter/Metal shader and reads the drawable before Core Animation composition.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include "dxmt_presenter.hpp"
+#include "d3dalloy_presenter.hpp"
 #include "Metal.hpp"
 #include "Metal4FX.hpp"
 #include "log/log.hpp"
@@ -11,7 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace dxmt { Logger Logger::s_instance("owned-d3d12-present-geometry.log"); }
+namespace d3dalloy { Logger Logger::s_instance("owned-d3d12-present-geometry.log"); }
 
 namespace {
 [[noreturn]] void fail(const char *step) {
@@ -63,8 +63,8 @@ struct Probe {
   WMT::Reference<WMT::MTL4CommandQueue> queue;
   obj_handle_t view = 0;
   WMT::MetalLayer layer;
-  dxmt::InternalCommandLibrary library;
-  dxmt::Presenter presenter;
+  d3dalloy::InternalCommandLibrary library;
+  d3dalloy::Presenter presenter;
   WMT::Reference<WMT::Texture> input;
   static WMT::Device first(WMT::Array<WMT::Device> devices) {
     require(devices && devices.count(), "device");
@@ -105,7 +105,7 @@ struct Probe {
   }
   ~Probe() { ReleaseMetalView(view); }
   struct Pixel { float r, g, b, a; };
-  Pixel render(dxmt::DXMTPresentGeometry geometry, unsigned width, unsigned height,
+  Pixel render(d3dalloy::D3DalloyPresentGeometry geometry, unsigned width, unsigned height,
                unsigned x, unsigned y, const char *label) {
     auto state = presenter.synchronizeLayerProperties(true);
     state.metadata.geometry = geometry;
@@ -158,7 +158,7 @@ int main() {
   auto pool = WMT::MakeAutoreleasePool();
   Window window;
   Probe probe(window.hwnd);
-  dxmt::DXMTPresentGeometry g{};
+  d3dalloy::D3DalloyPresentGeometry g{};
   auto defaultPixel = probe.render({}, 8, 6, 3, 2, "legacy-identity");
   checkNear(defaultPixel.r, 3.f / 8, "legacy-red");
   checkNear(defaultPixel.g, 2.f / 8, "legacy-green");

@@ -4496,6 +4496,7 @@ def fsr_rr_output_matches(stdout: str, stderr: str, success: bool) -> bool:
 
 def fsr_output_matches(stdout: str, stderr: str, success: bool) -> tuple[bool, list[str]]:
     frames = re.findall(r"OWNED_D3D12_FSR_FRAME_PASS frame=(\d+)\b", stdout)
+    frame_variants = re.findall(r"OWNED_D3D12_FSR_FRAME_PASS frame=(\d+) variant=(\w+)\b", stdout)
     replays = re.findall(r"OWNED_D3D12_FSR_REPLAY_PASS replay=(\d+) .*"
                          r"destroyed_before_submit=1 sentinel=1 changed_gpu_input=(\d+)", stdout)
     exposures = re.findall(r"OWNED_D3D12_FSR_EXPOSURE_PASS format=(\d+) value=1 .* sentinel=1", stdout)
@@ -4541,10 +4542,13 @@ def fsr_output_matches(stdout: str, stderr: str, success: bool) -> tuple[bool, l
                               for (_, value, _, ulp), expected in zip(gpu_exposures, (0.3333, 1.234567, 3.14159))))
     except (ValueError, OverflowError):
         numeric_ok = False
-    success = (success and frames == ["0", "1", "2", "3"]
+    success = (success and frames == ["0", "1", "2", "3"] * 2
+               and frame_variants == [(str(frame), variant)
+                                      for variant in ("direct", "device_proxy") for frame in range(4)]
                and replays == [("0", "0"), ("1", "0"), ("2", "1")]
                and exposures == ["0", "54", "41"]
                and "OWNED_D3D12_FSR_CASE_PASS case=rejected_dispatch_output_unchanged result=0" in stdout
+               and stdout.count("OWNED_D3D12_FSR_CASE_PASS case=device_proxy_underlying_gpu result=0") == 1
                and all(cases[name] == count for name, count in required_cases.items())
                and cap_ok and numeric_ok
                and "OWNED_D3D12_FSR_FULL_SR_PASS motion=1 masks=1 transfer=1 sharpening_constant=1 output_generation=1" in stdout
@@ -4821,7 +4825,7 @@ def run(args: argparse.Namespace) -> int:
     agility_inputs = prepare_agility_inputs(runtime, manifest, arch, frozen) if args.suite == "agility" else None
     env = dict(os.environ)
     for key in tuple(env):
-        if (key.startswith(("D3DM", "GPTK_", "DXVK_", "DXMT_", "OWNED_GRAPHICS_", "DYLD_"))
+        if (key.startswith(("D3DM", "GPTK_", "DXVK_", "D3DALLOY_", "OWNED_GRAPHICS_", "DYLD_"))
                 or key in {"WINEDLLPATH", "WINEDLLPATH_PREPEND", "WINEDLLOVERRIDES",
                            "OWNED_FG_OBSERVER", "FG_CAPTURE_DIR", "FG_CAPTURE_CONSUMER", "FG_CAPTURE_SUITE",
                            "CX_ACTIVE_GRAPHICS_BACKEND", "CX_APPLEGPTK_LIBD3DSHARED_PATH"}):
@@ -4831,9 +4835,9 @@ def run(args: argparse.Namespace) -> int:
         "WINEDLLPATH": str(runtime / "lib/wine"),
         "WINEDEBUG": "+loaddll",
         "WINEDLLOVERRIDES": "winemenubuilder.exe=d",
-        "DXMT_LOG_LEVEL": "info",
-        "DXMT_LOG_PATH": str(out),
-        "DXMT_SHADER_CACHE_PATH": str(out / "shader-cache"),
+        "D3DALLOY_LOG_LEVEL": "info",
+        "D3DALLOY_LOG_PATH": str(out),
+        "D3DALLOY_SHADER_CACHE_PATH": str(out / "shader-cache"),
         "OWNED_GRAPHICS_TRACE": "1",
         "OWNED_GRAPHICS_TRACE_LIMIT": "1000000" if args.suite == "arena-heap-upload-reuse" else "100000" if args.suite in ("queries", "multisample-capabilities", "render-passes", "predication-indirect", "fsr-fg") else "8192",
         # macOS strips DYLD_* while entering /bin/sh. The owned wrapper sets
@@ -4856,11 +4860,11 @@ def run(args: argparse.Namespace) -> int:
         for phase in ("disk", "corrupt", "truncated", "identity", "native", "failure", "control"):
             (out / f"pipeline-cache-{phase}").mkdir()
     if args.suite in ("async-pipeline", "async-pipeline-hold") or getattr(args, "async_pipeline_compile", False):
-        env["DXMT_CONFIG"] = "d3d12.asyncPipelineCompile=True"
+        env["D3DALLOY_CONFIG"] = "d3d12.asyncPipelineCompile=True"
         if args.suite == "async-pipeline-hold":
             env["OWNED_ASYNC_PIPELINE_HOLD"] = "1"
     if getattr(args, "auto_breadcrumbs", False):
-        env["DXMT_CONFIG"] = ";".join(filter(None, (env.get("DXMT_CONFIG"), "d3d12.enableAutoBreadcrumbs=True")))
+        env["D3DALLOY_CONFIG"] = ";".join(filter(None, (env.get("D3DALLOY_CONFIG"), "d3d12.enableAutoBreadcrumbs=True")))
     validation_mode = ("api-and-shader" if args.validation else
                        "api-only" if args.api_validation else "none")
     if args.validation:
@@ -4961,7 +4965,7 @@ def run(args: argparse.Namespace) -> int:
         command.extend(("--atomic64", "raytracing-contract.dxil", "raytracing-atomic64.dxil"))
     evidence = {
         "schema": 1, "suite": args.suite, "mode": args.mode, "validation": args.validation,
-        "async_pipeline_compile": env.get("DXMT_CONFIG") == "d3d12.asyncPipelineCompile=True",
+        "async_pipeline_compile": env.get("D3DALLOY_CONFIG") == "d3d12.asyncPipelineCompile=True",
         "validation_mode": validation_mode,
         "architecture": arch,
         "command": command, "prefix": env["WINEPREFIX"],
@@ -5425,11 +5429,11 @@ def run(args: argparse.Namespace) -> int:
         success = success and (stdout.count("present_backbuffer=exact present=ok") == 8
                                and "OWNED_D3D12_SMOKE_PRESENT_DRAIN fence=complete" in stdout)
     success = bool(success)
-    # DXMT's Logger writes to separate DLL logs when DXMT_LOG_PATH is set.
+    # D3Dalloy's Logger writes to separate DLL logs when D3DALLOY_LOG_PATH is set.
     # A GPU error there must not disappear merely because stderr was clean.
-    log_paths = sorted(out.glob("*_d3d12.log"))
+    log_paths = sorted(out.glob("*_d3dalloy-d3d12.log"))
     if args.suite == "pipeline-cache":
-        log_paths += sorted(out.glob("pipeline-cache-*/*_d3d12.log"))
+        log_paths += sorted(out.glob("pipeline-cache-*/*_d3dalloy-d3d12.log"))
     backend_logs = {str(path.relative_to(out)): path.read_text(errors="replace") for path in log_paths}
     diagnostic_text = "\n".join([stderr, *backend_logs.values()])
     validation_errors += [line for line in diagnostic_text.splitlines()
@@ -5481,7 +5485,7 @@ def run(args: argparse.Namespace) -> int:
         # The re-executed child writes its own log (named after its executable). Every PSO it
         # creates must be restored from the serialized library; any cold compile is a failure.
         child_events = [json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1])
-                        for line in backend_logs.get("owned-d3d12-pipeline-library-child_d3d12.log", "").splitlines()
+                        for line in backend_logs.get("owned-d3d12-pipeline-library-child_d3dalloy-d3d12.log", "").splitlines()
                         if "OWNED_GRAPHICS_TRACE " in line]
         child_restores = sum(event.get("event") == "pipeline_cache_restore" for event in child_events)
         child_colds = sum(event.get("event") == "pipeline_cache_cold" for event in child_events)

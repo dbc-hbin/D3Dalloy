@@ -29,7 +29,7 @@ constant uchar sample_pos_8[] = {
     ENCODE_SAMPLE_POS(7, -7),
 };
 
-float2 sample_pos(uint sample_count, uint index) asm("dxmt.sample_pos.i32");
+float2 sample_pos(uint sample_count, uint index) asm("d3dalloy.sample_pos.i32");
 
 float2 sample_pos(uint sample_count, uint index) {
     if (index >= sample_count)

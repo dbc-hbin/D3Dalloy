@@ -1,4 +1,4 @@
-/* AMD RR 1.0/1.1/1.2 public contracts, implemented by the DXMT MetalFX provider.
+/* AMD RR 1.0/1.1/1.2 public contracts, implemented by the D3Dalloy MetalFX provider.
  * Imported from zzz-wine-yaagl-pr-runtime e9d0e50db84 dlls/amd_fidelityfx_denoiser_dx12/main.c. */
 #include <math.h>
 #include <stdarg.h>
@@ -15,7 +15,7 @@
 #define RADIANCE_MASK 0x3eu
 struct backend_dx12_desc { ffxCreateContextDescHeader header; void *device; };
 /* A binary marker, not an AMD model/version claim. */
-static const char provider_name[] = "MetalFX (DXMT owned Ray Regeneration 1.2.0; dxmt-owned-fsr-rr-metalfx-v1)";
+static const char provider_name[] = "MetalFX (D3Dalloy owned Ray Regeneration 1.2.0; d3dalloy-owned-fsr-rr-metalfx-v1)";
 
 struct rr_context
 {
@@ -44,7 +44,7 @@ static ffxReturnCode_t finish(ffxReturnCode_t result)
     ReleaseSRWLockShared(&debug_lock);
     /* Call user code only after releasing all provider locks. */
     if (result && callback && (level & FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS))
-        callback(FFX_API_MESSAGE_TYPE_ERROR, L"DXMT MetalFX RR: operation rejected or native processing failed.");
+        callback(FFX_API_MESSAGE_TYPE_ERROR, L"D3Dalloy MetalFX RR: operation rejected or native processing failed.");
     return result;
 }
 
@@ -89,7 +89,7 @@ static ffxReturnCode_t finish_context(struct rr_context *context, ffxReturnCode_
     ffxApiMessage callback = context->message;
     unlock_context(context);
     if (result && callback)
-        callback(FFX_API_MESSAGE_TYPE_ERROR, L"DXMT MetalFX RR: operation rejected or native processing failed.");
+        callback(FFX_API_MESSAGE_TYPE_ERROR, L"D3Dalloy MetalFX RR: operation rejected or native processing failed.");
     return finish(result);
 }
 

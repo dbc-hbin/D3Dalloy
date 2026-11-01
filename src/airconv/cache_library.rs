@@ -3,7 +3,7 @@
 // 40-byte record, the UTF-16 name and the PSO blob, each padded to 8 bytes.
 use super::cache_wire::{input, output, put_u32, put_u64, range, range_mut, u32_at, u64_at};
 
-const MAGIC: u64 = 0x00424c50544d5844; // "DXMTPLB\0"
+const MAGIC: u64 = u64::from_le_bytes(*b"D3ALPLB\0");
 const VERSION: u32 = 1;
 const HEADER_SIZE: u64 = 104;
 const RECORD_SIZE: u64 = 40;
@@ -198,7 +198,7 @@ unsafe fn publish<T>(out: *mut T, result: Result<T>) -> u32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_library_extend(
+pub unsafe extern "C" fn d3dalloy_pipeline_library_extend(
     extent: *const Extent, name_bytes: u64, blob_size: u64, out: *mut Extent,
 ) -> u32 {
     let result = (|| extend(unsafe { extent.as_ref() }.ok_or(Error::InvalidArgument)?, name_bytes, blob_size))();
@@ -206,13 +206,13 @@ pub unsafe extern "C" fn dxmt_pipeline_library_extend(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_library_header(data: *const u8, length: u64, out: *mut Header) -> u32 {
+pub unsafe extern "C" fn d3dalloy_pipeline_library_header(data: *const u8, length: u64, out: *mut Header) -> u32 {
     let result = (|| header(unsafe { input(data, length) }.ok_or(Error::InvalidArgument)?))();
     unsafe { publish(out, result) }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_library_entry(
+pub unsafe extern "C" fn d3dalloy_pipeline_library_entry(
     data: *const u8, length: u64, offset: u64, out: *mut Entry,
 ) -> u32 {
     let result = (|| entry(unsafe { input(data, length) }.ok_or(Error::InvalidArgument)?, offset))();
@@ -220,7 +220,7 @@ pub unsafe extern "C" fn dxmt_pipeline_library_entry(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_library_begin(description: *const Header, data: *mut u8, length: u64) -> u32 {
+pub unsafe extern "C" fn d3dalloy_pipeline_library_begin(description: *const Header, data: *mut u8, length: u64) -> u32 {
     let result = (|| {
         let description = unsafe { description.as_ref() }.ok_or(Error::InvalidArgument)?;
         begin(description, unsafe { output(data, length) }.ok_or(Error::InvalidArgument)?)
@@ -229,7 +229,7 @@ pub unsafe extern "C" fn dxmt_pipeline_library_begin(description: *const Header,
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_library_put_entry(
+pub unsafe extern "C" fn d3dalloy_pipeline_library_put_entry(
     data: *mut u8, length: u64, offset: u64, record: *const Record, out: *mut Entry,
 ) -> u32 {
     let result = (|| {
@@ -243,7 +243,7 @@ pub unsafe extern "C" fn dxmt_pipeline_library_put_entry(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pipeline_library_set_digest(data: *mut u8, length: u64, digest: *const u8) -> u32 {
+pub unsafe extern "C" fn d3dalloy_pipeline_library_set_digest(data: *mut u8, length: u64, digest: *const u8) -> u32 {
     let result: Result<()> = (|| {
         let digest = unsafe { input(digest, 20) }.ok_or(Error::InvalidArgument)?;
         let bytes = unsafe { output(data, length) }.ok_or(Error::InvalidArgument)?;

@@ -390,7 +390,7 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
    * ForceEarlyDepthStencil with depth or stencil: early tests then run an arbitrary subset of a pixel's covered
    * samples, so the lowest-covered-sample rule of PIPELINE_STATS_PER_PIXEL does not hold.
    * GS/DS mesh function (with SM50_SHADER_D3D12_PIPELINE_STATS): every output primitive carries a flat uint4 key
-   * in primitive data 0 (user(dxmt_statistics_key)), unique among the draw's primitives and never all-zero.
+   * in primitive data 0 (user(d3dalloy_statistics_key)), unique among the draw's primitives and never all-zero.
    * PS (with SM50_SHADER_D3D12_PIPELINE_STATS, instead of PER_PIXEL): reads that key and, under
    * raster_order_group(0), claims its masked samples in the fragment buffer at
    * SM50_BINDING_INDEX_STATISTICS_CLAIM; PSInvocations counts once per (pixel, primitive) that ran at least one
@@ -701,7 +701,7 @@ struct SM50_MSAA_MESH_LAYOUT {
 
 /* Slot 13, constant uint4. GS/DS use groups_x as the input primitive/patch count.
  * Application MS uses groups_x/y to flatten the native group position. The stage-specific
- * dxmt.msaa.mesh.slot marker overrides that flattening for GS/DS. */
+ * d3dalloy.msaa.mesh.slot marker overrides that flattening for GS/DS. */
 struct SM50_MSAA_MESH_CONTROL {
   uint32_t groups_x;
   uint32_t groups_y;

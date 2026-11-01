@@ -548,107 +548,107 @@ extern "C"
 extern "C"
 {
   inline NTSTATUS D3DKMTCreateDevice(D3DKMT_CREATEDEVICE *desc) {
-    dxmt::Logger::warn("D3DKMTCreateDevice not implemented");
+    d3dalloy::Logger::warn("D3DKMTCreateDevice not implemented");
     return -1;
   }
 
   inline NTSTATUS D3DKMTDestroyAllocation(const D3DKMT_DESTROYALLOCATION *desc) {
-    dxmt::Logger::warn("D3DKMTDestroyAllocation not implemented.");
+    d3dalloy::Logger::warn("D3DKMTDestroyAllocation not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTDestroyDevice(const D3DKMT_DESTROYDEVICE *desc) {
-    dxmt::Logger::warn("D3DKMTDestroyDevice not implemented.");
+    d3dalloy::Logger::warn("D3DKMTDestroyDevice not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTDestroySynchronizationObject(const D3DKMT_DESTROYSYNCHRONIZATIONOBJECT *desc) {
-    dxmt::Logger::warn("D3DKMTDestroySynchronizationObject not implemented.");
+    d3dalloy::Logger::warn("D3DKMTDestroySynchronizationObject not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTCloseAdapter(const D3DKMT_CLOSEADAPTER *desc) {
-    dxmt::Logger::warn("D3DKMTCloseAdapter not implemented.");
+    d3dalloy::Logger::warn("D3DKMTCloseAdapter not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTOpenAdapterFromLuid(const D3DKMT_OPENADAPTERFROMLUID *desc) {
-    dxmt::Logger::warn("D3DKMTOpenAdapterFromLuid not implemented.");
+    d3dalloy::Logger::warn("D3DKMTOpenAdapterFromLuid not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTOpenResource2(D3DKMT_OPENRESOURCE *desc) {
-    dxmt::Logger::warn("D3DKMTOpenResource2 not implemented.");
+    d3dalloy::Logger::warn("D3DKMTOpenResource2 not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTOpenResourceFromNtHandle(D3DKMT_OPENRESOURCEFROMNTHANDLE *params) {
-    dxmt::Logger::warn("D3DKMTOpenResourceFromNtHandle not implemented.");
+    d3dalloy::Logger::warn("D3DKMTOpenResourceFromNtHandle not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTEscape(const D3DKMT_ESCAPE *desc) {
-    dxmt::Logger::warn("D3DKMTEscape not implemented.");
+    d3dalloy::Logger::warn("D3DKMTEscape not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTDestroyKeyedMutex(const D3DKMT_DESTROYKEYEDMUTEX *desc) {
-    dxmt::Logger::warn("D3DKMTDestroyKeyedMutex not implemented.");
+    d3dalloy::Logger::warn("D3DKMTDestroyKeyedMutex not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTQueryResourceInfo(D3DKMT_QUERYRESOURCEINFO *desc) {
-    dxmt::Logger::warn("D3DKMTQueryResourceInfo not implemented.");
+    d3dalloy::Logger::warn("D3DKMTQueryResourceInfo not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTQueryResourceInfoFromNtHandle(D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE *desc) {
-    dxmt::Logger::warn("D3DKMTQueryResourceInfoFromNtHandle not implemented.");
+    d3dalloy::Logger::warn("D3DKMTQueryResourceInfoFromNtHandle not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTCreateSynchronizationObject2(D3DKMT_CREATESYNCHRONIZATIONOBJECT2 *desc) {
-    dxmt::Logger::warn("D3DKMTCreateSynchronizationObject2 not implemented.");
+    d3dalloy::Logger::warn("D3DKMTCreateSynchronizationObject2 not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTOpenSyncObjectFromNtHandle2(D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *desc) {
-    dxmt::Logger::warn("D3DKMTOpenSyncObjectFromNtHandle2 not implemented.");
+    d3dalloy::Logger::warn("D3DKMTOpenSyncObjectFromNtHandle2 not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTCreateAllocation2(D3DKMT_CREATEALLOCATION *desc) {
-    dxmt::Logger::warn("D3DKMTCreateAllocation2 not implemented.");
+    d3dalloy::Logger::warn("D3DKMTCreateAllocation2 not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTShareObjects(UINT count, const D3DKMT_HANDLE *handles, OBJECT_ATTRIBUTES *attr, UINT access, HANDLE *handle) {
-    dxmt::Logger::warn("D3DKMTShareObjects not implemented.");
+    d3dalloy::Logger::warn("D3DKMTShareObjects not implemented.");
     return -1;
   }
 
   inline NTSTATUS D3DKMTOpenNtHandleFromName(D3DKMT_OPENNTHANDLEFROMNAME *desc) {
-    dxmt::Logger::warn("D3DKMTOpenNtHandleFromName not implemented.");
+    d3dalloy::Logger::warn("D3DKMTOpenNtHandleFromName not implemented.");
     return -1;
   }
 
   inline NTSTATUS WINAPI D3DKMTCreateKeyedMutex2(D3DKMT_CREATEKEYEDMUTEX2 *desc) {
-    dxmt::Logger::warn("D3DKMTCreateKeyedMutex2 not implemented.");
+    d3dalloy::Logger::warn("D3DKMTCreateKeyedMutex2 not implemented.");
     return -1;
   }
 
   inline NTSTATUS WINAPI D3DKMTOpenKeyedMutex2(D3DKMT_OPENKEYEDMUTEX2 *desc) {
-    dxmt::Logger::warn("D3DKMTOpenKeyedMutex2 not implemented.");
+    d3dalloy::Logger::warn("D3DKMTOpenKeyedMutex2 not implemented.");
     return -1;
   }
 
   inline NTSTATUS WINAPI D3DKMTAcquireKeyedMutex(D3DKMT_ACQUIREKEYEDMUTEX *desc) {
-    dxmt::Logger::warn("D3DKMTAcquireKeyedMutex not implemented.");
+    d3dalloy::Logger::warn("D3DKMTAcquireKeyedMutex not implemented.");
     return -1;
   }
 
   inline NTSTATUS WINAPI D3DKMTReleaseKeyedMutex(D3DKMT_RELEASEKEYEDMUTEX *desc) {
-    dxmt::Logger::warn("D3DKMTReleaseKeyedMutex not implemented.");
+    d3dalloy::Logger::warn("D3DKMTReleaseKeyedMutex not implemented.");
     return -1;
   }
 }

@@ -2,7 +2,7 @@
 #include <atomic>
 #include <cstdint>
 
-namespace dxmt {
+namespace d3dalloy {
 
 class CpuFence {
 public:
@@ -33,4 +33,4 @@ public:
 private:
   std::atomic<uint64_t> value_;
 };
-} // namespace dxmt
+} // namespace d3dalloy

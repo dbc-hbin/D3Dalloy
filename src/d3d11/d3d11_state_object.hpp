@@ -6,7 +6,7 @@
 #include "d3d11_device_child.hpp"
 #include "thread.hpp"
 #include "util_hash.hpp"
-#include "dxmt_sampler.hpp"
+#include "d3dalloy_sampler.hpp"
 
 DEFINE_COM_INTERFACE("03629ed8-bcdd-4582-8997-3817209a34f4",
                      IMTLD3D11RasterizerState)
@@ -50,7 +50,7 @@ template <> struct equal_to<D3D11_SAMPLER_DESC> {
 
 template <> struct hash<D3D11_BLEND_DESC1> {
   size_t operator()(const D3D11_BLEND_DESC1 &v) const noexcept {
-    dxmt::HashState hash;
+    d3dalloy::HashState hash;
     hash.add((v.IndependentBlendEnable << 1) | v.AlphaToCoverageEnable);
     uint32_t num_blend_target = v.IndependentBlendEnable ? 8 : 1;
     for (unsigned i = 0; i < num_blend_target; i++) {
@@ -149,7 +149,7 @@ template <> struct equal_to<D3D11_DEPTH_STENCIL_DESC> {
 };
 } // namespace std
 
-namespace dxmt {
+namespace d3dalloy {
 
 class D3D11SamplerState : public ID3D11SamplerState {
 public:
@@ -164,7 +164,7 @@ public:
 private:
   MTLD3D11Device *device;
   std::unordered_map<DESC, std::unique_ptr<ManagedDeviceChild<Object>>> cache;
-  dxmt::mutex mutex_cache;
+  d3dalloy::mutex mutex_cache;
 };
 
 constexpr D3D11_RASTERIZER_DESC2 kDefaultRasterizerDesc = {
@@ -234,4 +234,4 @@ constexpr D3D11_DEPTH_STENCIL_DESC kDefaultDepthStencilDesc = {
         .StencilFunc = D3D11_COMPARISON_ALWAYS,
     }};
 
-} // namespace dxmt
+} // namespace d3dalloy

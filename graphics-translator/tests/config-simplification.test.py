@@ -16,7 +16,7 @@ source = r'''
 #include <limits>
 #include <string>
 #include "src/util/config/config.hpp"
-namespace dxmt {
+namespace d3dalloy {
 '''
 implementation = (ROOT / "src/util/config/config.cpp").read_text()
 for pattern in (
@@ -30,12 +30,12 @@ for pattern in (
 source += r'''
 }
 
-void check_integer(dxmt::Config &config, const std::string &value, int32_t expected) {
+void check_integer(d3dalloy::Config &config, const std::string &value, int32_t expected) {
   config.setOption("integer", value);
   assert(config.getOption<int32_t>("integer", 42) == expected);
 }
 
-void check_float(dxmt::Config &config, const std::string &value, float expected) {
+void check_float(d3dalloy::Config &config, const std::string &value, float expected) {
   config.setOption("float", value);
   const float result = config.getOption<float>("float", -123.5f);
   assert(result == expected);
@@ -43,7 +43,7 @@ void check_float(dxmt::Config &config, const std::string &value, float expected)
 }
 
 int main() {
-  dxmt::Config config;
+  d3dalloy::Config config;
   assert(config.getOption<int32_t>("missing", 42) == 42);
   assert(config.getOption<float>("missing", -123.5f) == -123.5f);
   check_integer(config, "0", 0);

@@ -6,12 +6,12 @@
 #include "d3d11_shader.hpp"
 #include "d3d11_state_object.hpp"
 #include "d3d11_view.hpp"
-#include "dxmt_binding_set.hpp"
+#include "d3dalloy_binding_set.hpp"
 #include "log/log.hpp"
 #include "d3d11_resource.hpp"
 #include "util_string.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 struct UAV_B {
   IUnknown *RawPointer = 0;
@@ -213,4 +213,4 @@ public:
   }
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

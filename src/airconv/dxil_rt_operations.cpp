@@ -170,7 +170,7 @@
 
 using namespace llvm;
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 /*
  * dx.op opcode ids of the ray tracing block, from DXIL.rst and DXC's
@@ -351,7 +351,7 @@ enum RtHitStateField : uint32_t {
  * `res.object_to_world_transform` extracts field 13, `res.world_to_object_transform` field 9).
  */
 StructType *intersectionResultType(LLVMContext &context) {
-  StructType *type = namedStructType(context, "struct.dxmt.rt.intersection_result");
+  StructType *type = namedStructType(context, "struct.d3dalloy.rt.intersection_result");
   if (!type->isOpaque())
     return type;
   Type *f32 = Type::getFloatTy(context);
@@ -1803,7 +1803,7 @@ Value *RaytracingLowerer::emitQueryTraversal(
   storeHitState(b, child, kRtHitBarycentric, bary);
   Value *attributes = b.CreateGEP(b.getInt8Ty(), bytePointerOf(b, child), b.getInt32(layout.candidate_attribute));
   b.CreateAlignedStore(bary, b.CreateBitCast(attributes, v2->getPointerTo()), Align(1));
-  Value *any_hit = member(b, context.hit_group_any_hits, "dxmt.rt.query.any_hits");
+  Value *any_hit = member(b, context.hit_group_any_hits, "d3dalloy.rt.query.any_hits");
   emitConditional(b, b.CreateAnd(b.CreateICmpEQ(opacity, b.getInt32(1)),
     b.CreateICmpNE(any_hit, b.getInt32(kRtRecordIndexNone))), "rt.query.anyhit", [&](IRBuilder<> &g) {
     callVisibleFunction(g, child, any_hit, loadFrameField(g, child, offsetof(SM50_RT_FRAME, Depth), i32));
@@ -1825,7 +1825,7 @@ Value *RaytracingLowerer::emitQueryTraversal(
     b.SetInsertPoint(visible);
   }
   storeCandidateWord(b, child, kRtCandidateSkipAnyHit, b.CreateZExt(boxOpaque, i32));
-  Value *intersection = member(b, context.hit_group_intersections, "dxmt.rt.query.intersections");
+  Value *intersection = member(b, context.hit_group_intersections, "d3dalloy.rt.query.intersections");
   emitConditional(b, b.CreateICmpNE(intersection, b.getInt32(kRtRecordIndexNone)), "rt.query.intersection", [&](IRBuilder<> &g) {
     callVisibleFunction(g, child, intersection, loadFrameField(g, child, offsetof(SM50_RT_FRAME, Depth), i32));
   });
@@ -2286,13 +2286,13 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
     const uint32_t continuation_entries =
       std::max<uint32_t>(context.hit_group_continuation_count, kMinContinuationEntries);
     auto *continuation_type = ArrayType::get(b.getInt32Ty(), continuation_entries);
-    GlobalVariable *continuation_table = module.getGlobalVariable("dxmt.rt.continuations", true);
+    GlobalVariable *continuation_table = module.getGlobalVariable("d3dalloy.rt.continuations", true);
     if (!continuation_table) {
       std::vector<uint32_t> indices(context.hit_group_continuations,
                                     context.hit_group_continuations + context.hit_group_continuation_count);
       indices.resize(continuation_entries, kRtRecordIndexNone);
       continuation_table = new GlobalVariable(module, continuation_type, true, GlobalValue::PrivateLinkage,
-        ConstantDataArray::get(module.getContext(), indices), "dxmt.rt.continuations", nullptr,
+        ConstantDataArray::get(module.getContext(), indices), "d3dalloy.rt.continuations", nullptr,
         GlobalValue::NotThreadLocal, 2);
     }
     Value *hit_continuation = emitGuardedValue(b,
@@ -2565,13 +2565,13 @@ Value *RaytracingLowerer::hitContinuation(IRBuilder<> &b, Value *record) {
     return b.getInt32(kRtRecordIndexNone);
   const uint32_t size = std::max(8u, context.hit_group_continuation_count);
   auto *array = ArrayType::get(b.getInt32Ty(), size);
-  GlobalVariable *table = module.getGlobalVariable("dxmt.rt.continuations", true);
+  GlobalVariable *table = module.getGlobalVariable("d3dalloy.rt.continuations", true);
   if (!table) {
     std::vector<uint32_t> indices(context.hit_group_continuations,
       context.hit_group_continuations + context.hit_group_continuation_count);
     indices.resize(size, kRtRecordIndexNone);
     table = new GlobalVariable(module, array, true, GlobalValue::PrivateLinkage,
-      ConstantDataArray::get(module.getContext(), indices), "dxmt.rt.continuations", nullptr,
+      ConstantDataArray::get(module.getContext(), indices), "d3dalloy.rt.continuations", nullptr,
       GlobalValue::NotThreadLocal, 2);
   }
   return emitGuardedValue(b, b.CreateICmpULT(record, b.getInt32(context.hit_group_continuation_count)),
@@ -2640,7 +2640,7 @@ Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuild
       SmallVector<Type *, 10> types;
       for (Value *arg : args)
         types.push_back(arg->getType());
-      b.CreateCall(module.getOrInsertFunction("dxmt.rayquery.hitobject_snapshot",
+      b.CreateCall(module.getOrInsertFunction("d3dalloy.rayquery.hitobject_snapshot",
         FunctionType::get(b.getVoidTy(), types, false)), args);
     }
     replacement = hitObjectValue(b, block, call.getType());
@@ -2949,7 +2949,7 @@ Error RaytracingLowerer::run() {
  * stage builder wrote. `air.visible_input` is shared by every parameter of a
  * visible function, so those are additionally matched by `air.arg_name`; the
  * per-invocation block of the ray generation shader is a function-local
- * allocation, so the stage builder published it in the `dxmt.rt.locals` named
+ * allocation, so the stage builder published it in the `d3dalloy.rt.locals` named
  * metadata node (function, payload block, hit state block, record index, depth).
  * Nothing is guessed by position.
  *
@@ -3062,7 +3062,7 @@ llvm::Error ResolveRaytracingEntryArguments(
   out.record_index = match("air.visible_input", "record");
   out.depth = match("air.visible_input", "depth");
 
-  NamedMDNode *locals = module.getNamedMetadata("dxmt.rt.locals");
+  NamedMDNode *locals = module.getNamedMetadata("d3dalloy.rt.locals");
   if (locals) {
     for (unsigned i = 0; i < locals->getNumOperands(); ++i) {
       MDNode *node = locals->getOperand(i);
@@ -3100,7 +3100,7 @@ llvm::Error LowerRaytracingOperations(
   // SM6.9 queries opt in explicitly; only older queries inherit the pipeline flag.
   const bool legacy_omm = (context.pipeline_flags & 0x400) &&
     info.shader_model_major == 6 && info.shader_model_minor < 9;
-  info.module->addModuleFlag(Module::Override, "dxmt.rayquery.allowOMM", legacy_omm ? 1u : 0u);
+  info.module->addModuleFlag(Module::Override, "d3dalloy.rayquery.allowOMM", legacy_omm ? 1u : 0u);
   RaytracingEntryArguments arguments;
   if (Error error = ResolveRaytracingEntryArguments(*info.module, entry_name, arguments))
     return error;
@@ -3108,4 +3108,4 @@ llvm::Error LowerRaytracingOperations(
   return lowerer.run();
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

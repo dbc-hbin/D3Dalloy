@@ -23,7 +23,7 @@
 #include "dxbc_converter.hpp"
 #include "nt/air_builder.hpp"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 namespace {
 
@@ -515,4 +515,4 @@ llvm::Error BindDomainStage(PipelineStage &stage) {
   return llvm::Error::success();
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

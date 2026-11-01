@@ -22,11 +22,11 @@
 #include "dxgi_composition.h"
 #include "dxgi_object.hpp"
 #include "dxgi_output.hpp"
-#include "dxmt_hud_state.hpp"
-#include "dxmt_presenter.hpp"
-#include "dxmt_monitor_format.hpp"
-#include "dxmt_queue_order.hpp"
-#include "dxmt_info.hpp"
+#include "d3dalloy_hud_state.hpp"
+#include "d3dalloy_presenter.hpp"
+#include "d3dalloy_monitor_format.hpp"
+#include "d3dalloy_queue_order.hpp"
+#include "d3dalloy_info.hpp"
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
 #include "wsi_window.hpp"
@@ -48,18 +48,18 @@ constexpr size_t kSwapchainLatency = 1;
 TODO: some implementations can be shared with d3d11 swapchain
 */
 
-namespace dxmt {
+namespace d3dalloy {
 
 struct NativeViewUnavailable {};
 struct NativeViewAlreadyAttached {};
 
-DXMTPresentLatency::~DXMTPresentLatency() {
+D3DalloyPresentLatency::~D3DalloyPresentLatency() {
   if (wake_semaphore_)
     CloseHandle(wake_semaphore_);
 }
 
 HRESULT
-DXMTPresentLatency::initializeWakeHandle(HANDLE semaphore) {
+D3DalloyPresentLatency::initializeWakeHandle(HANDLE semaphore) {
   if (!DuplicateHandle(GetCurrentProcess(), semaphore, GetCurrentProcess(), &wake_semaphore_, 0,
                        FALSE, DUPLICATE_SAME_ACCESS))
     return HRESULT_FROM_WIN32(GetLastError());
@@ -67,7 +67,7 @@ DXMTPresentLatency::initializeWakeHandle(HANDLE semaphore) {
 }
 
 bool
-DXMTPresentLatency::reserve(bool do_not_wait, UINT replaceable_queued, bool *borrowed) {
+D3DalloyPresentLatency::reserve(bool do_not_wait, UINT replaceable_queued, bool *borrowed) {
   std::unique_lock lock(mutex_, std::defer_lock);
   if (do_not_wait) {
     if (!lock.try_lock() || removed_ || next_ticket_ != serving_ticket_ ||
@@ -91,7 +91,7 @@ DXMTPresentLatency::reserve(bool do_not_wait, UINT replaceable_queued, bool *bor
 }
 
 void
-DXMTPresentLatency::cancel() {
+D3DalloyPresentLatency::cancel() {
   {
     std::lock_guard lock(mutex_);
     assert(outstanding_);
@@ -101,7 +101,7 @@ DXMTPresentLatency::cancel() {
 }
 
 void
-DXMTPresentLatency::complete(HANDLE semaphore) {
+D3DalloyPresentLatency::complete(HANDLE semaphore) {
   {
     std::lock_guard lock(mutex_);
     assert(outstanding_);
@@ -115,7 +115,7 @@ DXMTPresentLatency::complete(HANDLE semaphore) {
 }
 
 void
-DXMTPresentLatency::discardQueuedForRestart(UINT canceled, bool borrowed, HANDLE semaphore) {
+D3DalloyPresentLatency::discardQueuedForRestart(UINT canceled, bool borrowed, HANDLE semaphore) {
   {
     std::lock_guard lock(mutex_);
     assert(canceled <= outstanding_);
@@ -135,7 +135,7 @@ DXMTPresentLatency::discardQueuedForRestart(UINT canceled, bool borrowed, HANDLE
 }
 
 void
-DXMTPresentLatency::remove() {
+D3DalloyPresentLatency::remove() {
   {
     std::lock_guard lock(mutex_);
     if (removed_)
@@ -151,7 +151,7 @@ DXMTPresentLatency::remove() {
 }
 
 HRESULT
-DXMTPresentLatency::setMaximum(UINT maximum, HANDLE semaphore) {
+D3DalloyPresentLatency::setMaximum(UINT maximum, HANDLE semaphore) {
   std::lock_guard lock(mutex_);
   if (removed_)
     return DXGI_ERROR_DEVICE_REMOVED;
@@ -179,7 +179,7 @@ DXMTPresentLatency::setMaximum(UINT maximum, HANDLE semaphore) {
 }
 
 UINT
-DXMTPresentLatency::maximum() const {
+D3DalloyPresentLatency::maximum() const {
   std::lock_guard lock(mutex_);
   return maximum_;
 }
@@ -245,17 +245,17 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   Com<MTLD3D12CommandQueue> queue_;
   const uint64_t owned_id_ = owned_graphics::NewObjectId();
   HWND hWnd;
-  const DXMTSwapChainKind kind_;
+  const D3DalloySwapChainKind kind_;
   WMT::Reference<WMT::Object> composition_surface_;
   DXGI_MATRIX_3X2_F matrix_ = {1, 0, 0, 1, 0, 0};
-  static inline dxmt::mutex view_owners_mutex_;
+  static inline d3dalloy::mutex view_owners_mutex_;
   static inline MTLD3D12SwapChain *view_owners_ = nullptr;
   MTLD3D12SwapChain *next_view_owner_ = nullptr;
   HMONITOR monitor_;
   Com<IDXGIOutput1> target_;
   Com<IDXGIOutput> restrict_output_;
   Com<IUnknown> core_window_;
-  wsi::DXMTWindowState window_state_;
+  wsi::D3DalloyWindowState window_state_;
   ULONG presentation_count_ = 0;
   uint64_t next_presentation_id_ = 0;
   WMT::Reference<WMT::PresentationObserver> presentation_observer_;
@@ -265,7 +265,7 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   bool has_presentation_event_ = false;
   bool statistics_disjoint_ = true;
   uint64_t earliest_presentation_id_ = 1;
-  dxmt::RefreshClockBasis statistics_clock_{};
+  d3dalloy::RefreshClockBasis statistics_clock_{};
   DXGI_SWAP_CHAIN_DESC1 desc_;
   UINT source_width_ = 0, source_height_ = 0;
   UINT drawable_width_ = 0, drawable_height_ = 0;
@@ -274,7 +274,7 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   D3D12_RESOURCE_DESC backbuffer_desc_;
   DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_{};
   HANDLE present_semaphore_ = nullptr;
-  std::shared_ptr<DXMTPresentLatency> latency_ = std::make_shared<DXMTPresentLatency>();
+  std::shared_ptr<D3DalloyPresentLatency> latency_ = std::make_shared<D3DalloyPresentLatency>();
   std::shared_ptr<owned_graphics::FenceOrderEpoch> removal_epoch_;
   WMT::Object native_view_;
   WMT::MetalLayer layer_weak_;
@@ -286,10 +286,10 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   double init_refresh_rate_ = 0; // Unknown until an actual display cadence is available.
   int preferred_max_frame_rate = 0;
   ModeSetGuard modeset_guard_;
-  dxmt::mutex mutex_;
+  d3dalloy::mutex mutex_;
 
   std::vector<Com<MTLD3D12Resource>> backbuffers_;
-  std::shared_ptr<DXMTPresentHistory> present_history_;
+  std::shared_ptr<D3DalloyPresentHistory> present_history_;
   uint64_t history_presents_ = 0;
   uint64_t resize_generation_ = 0;
   // One present queue per backbuffer; Present rotates both with the same index.
@@ -317,14 +317,14 @@ public:
   MTLD3D12SwapChain(
       IDXGIFactory1 *pFactory, MTLD3D12Device *pDevice, MTLD3D12CommandQueue *pQueue, HWND hWnd,
       const DXGI_SWAP_CHAIN_DESC1 *pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
-      IDXGIOutput *pRestrictToOutput, IUnknown *core_window, DXMTSwapChainKind kind
+      IDXGIOutput *pRestrictToOutput, IUnknown *core_window, D3DalloySwapChainKind kind
   ) :
       MTLDXGISubObject(pDevice),
       factory_(pFactory),
       queue_(pQueue),
       hWnd(hWnd),
       kind_(kind),
-      monitor_(kind == DXMTSwapChainKind::Composition ? nullptr : wsi::getWindowMonitor(hWnd)),
+      monitor_(kind == D3DalloySwapChainKind::Composition ? nullptr : wsi::getWindowMonitor(hWnd)),
       restrict_output_(pRestrictToOutput),
       core_window_(core_window),
       desc_(*pDesc),
@@ -337,14 +337,14 @@ public:
     // One flip chain per native layer avoids sharing and double-releasing it.
     // ponytail: linear active-chain scan; add indexing only if creation scale warrants it.
     std::unique_lock view_owner_lock(view_owners_mutex_, std::defer_lock);
-    if (kind_ != DXMTSwapChainKind::Composition) {
+    if (kind_ != D3DalloySwapChainKind::Composition) {
       view_owner_lock.lock();
       for (auto *owner = view_owners_; owner; owner = owner->next_view_owner_)
         if (owner->hWnd == hWnd)
           throw NativeViewAlreadyAttached{};
     }
 
-    if (kind_ == DXMTSwapChainKind::Composition) {
+    if (kind_ == D3DalloySwapChainKind::Composition) {
       obj_handle_t layer = 0;
       composition_surface_ = WMT::Reference<WMT::Object>(
           WMTCompositionCreateSurface(pDevice->GetMTLDevice().handle,
@@ -366,13 +366,13 @@ public:
     } native_guard{native_view_, present_semaphore_};
 
     if ((!native_view_ && !composition_surface_) || !layer_weak_.handle) {
-      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by D3DAlloy.");
+      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by D3Dalloy.");
       throw NativeViewUnavailable{};
     }
 
     presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_, lib, scale_factor,
                                  desc_.SampleDesc.Count, pDevice->GetMetal4Compiler(),
-                                 kind_ == DXMTSwapChainKind::Composition));
+                                 kind_ == D3DalloySwapChainKind::Composition));
 
     present_semaphore_ = CreateSemaphore(nullptr, kSwapchainLatency, DXGI_MAX_SWAP_CHAIN_BUFFERS, nullptr);
     if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
@@ -419,7 +419,7 @@ public:
     if (desc_.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS)
       backbuffer_desc_.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     native_guard.active = false;
-    if (kind_ != DXMTSwapChainKind::Composition) {
+    if (kind_ != D3DalloySwapChainKind::Composition) {
       next_view_owner_ = view_owners_;
       view_owners_ = this;
     }
@@ -429,9 +429,9 @@ public:
     // Composition has no HWND-owned layer to dismantle. Accepted presents
     // independently own their surface, presenter, resource, latency state and
     // duplicated completion handle; Release must not wait on a caller's queue gate.
-    if (kind_ != DXMTSwapChainKind::Composition) {
+    if (kind_ != D3DalloySwapChainKind::Composition) {
       presenter->waitPresentsCompleted();
-      dxmt::UnregisterOutputStatistics(monitor_, this);
+      d3dalloy::UnregisterOutputStatistics(monitor_, this);
     }
     if (presentation_observer_) {
       if (composition_surface_)
@@ -442,7 +442,7 @@ public:
     }
     if (!fullscreen_desc_.Windowed && FAILED(LeaveFullscreenMode()))
       ERR("DXGI: Failed to restore fullscreen window and display mode on swapchain release");
-    if (kind_ != DXMTSwapChainKind::Composition) {
+    if (kind_ != D3DalloySwapChainKind::Composition) {
       std::lock_guard view_owner_lock(view_owners_mutex_);
       auto **owner = &view_owners_;
       while (*owner != this)
@@ -469,19 +469,19 @@ public:
         while ((status = observer.wait(event)) == 1) {
           if (event.outcome != WMTPresentationPresented || event.presented_host_seconds <= 0)
             continue;
-          std::lock_guard<dxmt::mutex> lock(mutex_);
+          std::lock_guard<d3dalloy::mutex> lock(mutex_);
           if (event.present_id >= earliest_presentation_id_ &&
               (!has_presentation_event_ || event.present_id > last_presentation_event_.present_id)) {
             last_presentation_event_ = event;
             has_presentation_event_ = true;
             if (!fullscreen_desc_.Windowed)
-              dxmt::PublishOutputStatistics(monitor_, this, event);
+              d3dalloy::PublishOutputStatistics(monitor_, this, event);
           }
         }
         if (status < 0) {
           presentation_observer_fault_->store(true, std::memory_order_release);
-          std::lock_guard<dxmt::mutex> lock(mutex_);
-          dxmt::InvalidateOutputStatistics(monitor_, this);
+          std::lock_guard<d3dalloy::mutex> lock(mutex_);
+          d3dalloy::InvalidateOutputStatistics(monitor_, this);
         }
       });
     } catch (const std::system_error &) {
@@ -578,7 +578,7 @@ public:
     return factory_->QueryInterface(riid, parent);
   };
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present(UINT sync_interval, UINT flags) final {
@@ -596,11 +596,11 @@ public:
     return backbuffers_[Buffer]->QueryInterface(riid, ppSurface);
   };
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   SetFullscreenState(BOOL Fullscreen, IDXGIOutput *pTarget) final {
-    if (kind_ != DXMTSwapChainKind::Hwnd)
+    if (kind_ != D3DalloySwapChainKind::Hwnd)
       return DXGI_ERROR_INVALID_CALL;
     ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
     if (modeset_inprogress)
@@ -643,7 +643,7 @@ public:
           monitor_ = old_monitor;
           target_ = old_target;
           fullscreen_desc_.Windowed = FALSE;
-          dxmt::RegisterOutputStatistics(monitor_, this, presentation_observer_, presentation_observer_fault_);
+          d3dalloy::RegisterOutputStatistics(monitor_, this, presentation_observer_, presentation_observer_fault_);
         }
         return hr;
       }
@@ -678,7 +678,7 @@ public:
     wsi::WsiMode old_mode = {};
     if (!wsi::getCurrentDisplayMode(output_desc.Monitor, &old_mode))
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
-    hr = dxmt::RegisterOutputStatistics(output_desc.Monitor, this, presentation_observer_, presentation_observer_fault_);
+    hr = d3dalloy::RegisterOutputStatistics(output_desc.Monitor, this, presentation_observer_, presentation_observer_fault_);
     if (FAILED(hr))
       return hr;
     const double old_refresh_rate = init_refresh_rate_;
@@ -694,7 +694,7 @@ public:
     hr = ChangeDisplayMode(output.ptr(), &preferred_display_mode);
     if (FAILED(hr)) {
       ERR("DXGI: EnterFullscreenMode: Failed to change display mode");
-      dxmt::UnregisterOutputStatistics(output_desc.Monitor, this);
+      d3dalloy::UnregisterOutputStatistics(output_desc.Monitor, this);
       if (!wsi::setWindowMode(output_desc.Monitor, hWnd, old_mode))
         ERR("DXGI: EnterFullscreenMode: Failed to restore display mode");
       init_refresh_rate_ = old_refresh_rate;
@@ -704,7 +704,7 @@ public:
     bool modeSwitch = (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) != 0u;
     if (!wsi::enterFullscreenMode(output_desc.Monitor, hWnd, &window_state_, modeSwitch)) {
       ERR("DXGI: EnterFullscreenMode: Failed to enter fullscreen mode");
-      dxmt::UnregisterOutputStatistics(output_desc.Monitor, this);
+      d3dalloy::UnregisterOutputStatistics(output_desc.Monitor, this);
       if (!wsi::setWindowMode(output_desc.Monitor, hWnd, old_mode))
         ERR("DXGI: EnterFullscreenMode: Failed to restore display mode");
       init_refresh_rate_ = old_refresh_rate;
@@ -713,11 +713,11 @@ public:
 
     presentation_observer_.setView(native_view_.handle);
     {
-      std::lock_guard<dxmt::mutex> lock(mutex_);
+      std::lock_guard<d3dalloy::mutex> lock(mutex_);
       monitor_ = output_desc.Monitor;
       target_ = std::move(output);
       fullscreen_desc_.Windowed = FALSE;
-      dxmt::InvalidateOutputStatistics(monitor_, this);
+      d3dalloy::InvalidateOutputStatistics(monitor_, this);
       ResetFrameStatisticsLocked();
     }
     return S_OK;
@@ -743,8 +743,8 @@ public:
 
     presenter->changeGammaRamp(nullptr);
     {
-      std::lock_guard<dxmt::mutex> lock(mutex_);
-      dxmt::UnregisterOutputStatistics(monitor_, this);
+      std::lock_guard<d3dalloy::mutex> lock(mutex_);
+      d3dalloy::UnregisterOutputStatistics(monitor_, this);
       fullscreen_desc_.Windowed = TRUE;
       target_ = nullptr;
       monitor_ = wsi::getWindowMonitor(hWnd);
@@ -850,14 +850,14 @@ public:
     pDesc->SampleDesc = desc_.SampleDesc;
     pDesc->BufferUsage = desc_.BufferUsage;
     pDesc->BufferCount = desc_.BufferCount;
-    pDesc->OutputWindow = kind_ == DXMTSwapChainKind::Hwnd ? hWnd : nullptr;
+    pDesc->OutputWindow = kind_ == D3DalloySwapChainKind::Hwnd ? hWnd : nullptr;
     pDesc->Windowed = fullscreen_desc_.Windowed;
     pDesc->SwapEffect = desc_.SwapEffect;
     pDesc->Flags = desc_.Flags;
     return S_OK;
   };
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT flags) final {
@@ -894,7 +894,7 @@ public:
       UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT flags, const UINT *node_masks,
       IUnknown *const *queues
   ) {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     if (device_->RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
     // Waitable-object and tearing support are fixed at creation.
@@ -906,7 +906,7 @@ public:
                                       DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     if (flags & ~supported_flags)
       return DXGI_ERROR_UNSUPPORTED;
-    if (kind_ == DXMTSwapChainKind::Composition &&
+    if (kind_ == D3DalloySwapChainKind::Composition &&
         (!Width || !Height || (flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)))
       return DXGI_ERROR_INVALID_CALL;
     const UINT count = BufferCount ? BufferCount : desc_.BufferCount;
@@ -961,7 +961,7 @@ public:
     D3D12_HEAP_PROPERTIES heap_props = device_->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_DEFAULT);
     for (UINT i = 0; i < count; i++) {
       Com<ID3D12Resource> backbuffer;
-      HRESULT hr = dxmt::CreateCommittedTexture(
+      HRESULT hr = d3dalloy::CreateCommittedTexture(
           device_, &heap_props, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES, &new_backbuffer_desc,
           D3D12_RESOURCE_STATE_PRESENT, nullptr, IID_PPV_ARGS(&backbuffer)
       );
@@ -970,7 +970,7 @@ public:
       new_backbuffers.push_back(static_cast<MTLD3D12Resource *>(backbuffer.ptr()));
     }
 
-    std::shared_ptr<DXMTPresentHistory> new_history;
+    std::shared_ptr<D3DalloyPresentHistory> new_history;
     if (new_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) {
       auto source = new_backbuffers[0]->texture->view(new_backbuffers[0]->texture->fullView).texture;
       WMTTextureInfo info{};
@@ -985,7 +985,7 @@ public:
       info.usage = WMTTextureUsageShaderRead;
       info.options = WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked;
       try {
-        new_history = std::make_shared<DXMTPresentHistory>();
+        new_history = std::make_shared<D3DalloyPresentHistory>();
       } catch (const std::bad_alloc &) {
         return E_OUTOFMEMORY;
       }
@@ -1016,17 +1016,17 @@ public:
     current_buffer_ = 0;
     source_width_ = new_desc.Width;
     source_height_ = new_desc.Height;
-    dxmt::InvalidateOutputStatistics(monitor_, this);
+    d3dalloy::InvalidateOutputStatistics(monitor_, this);
     ResetFrameStatisticsLocked();
     ApplyLayerProps();
     return S_OK;
   }
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   ResizeTarget(const DXGI_MODE_DESC *pDesc) final {
-    if (kind_ != DXMTSwapChainKind::Hwnd || !pDesc)
+    if (kind_ != D3DalloySwapChainKind::Hwnd || !pDesc)
       return DXGI_ERROR_INVALID_CALL;
 
     ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
@@ -1072,8 +1072,8 @@ public:
     fullscreen_desc_.ScanlineOrdering = newDisplayMode.ScanlineOrdering;
     fullscreen_desc_.Scaling = newDisplayMode.Scaling;
     {
-      std::lock_guard<dxmt::mutex> lock(mutex_);
-      dxmt::InvalidateOutputStatistics(monitor_, this);
+      std::lock_guard<d3dalloy::mutex> lock(mutex_);
+      d3dalloy::InvalidateOutputStatistics(monitor_, this);
       ResetFrameStatisticsLocked();
     }
     return S_OK;
@@ -1082,7 +1082,7 @@ public:
   void
   ApplyLayerProps() {
     UINT width = 0, height = 0;
-    if (kind_ == DXMTSwapChainKind::Composition) {
+    if (kind_ == D3DalloySwapChainKind::Composition) {
       width = source_width_;
       height = source_height_;
     } else {
@@ -1091,10 +1091,10 @@ public:
     drawable_width_ = width ? width : desc_.Width;
     drawable_height_ = height ? height : desc_.Height;
     presenter->changeLayerProperties(
-        ConvertSwapChainFormat(desc_.Format), ConvertColorSpace(colorspace_, kind_ == DXMTSwapChainKind::Composition || LayerSupportEDR()),
+        ConvertSwapChainFormat(desc_.Format), ConvertColorSpace(colorspace_, kind_ == D3DalloySwapChainKind::Composition || LayerSupportEDR()),
         drawable_width_ * scale_factor, drawable_height_ * scale_factor, desc_.SampleDesc.Count,
-        desc_.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED ? DXMTPresentAlpha::Premultiplied :
-        desc_.AlphaMode == DXGI_ALPHA_MODE_STRAIGHT ? DXMTPresentAlpha::Straight : DXMTPresentAlpha::Opaque
+        desc_.AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED ? D3DalloyPresentAlpha::Premultiplied :
+        desc_.AlphaMode == DXGI_ALPHA_MODE_STRAIGHT ? D3DalloyPresentAlpha::Straight : D3DalloyPresentAlpha::Opaque
     );
     pending_colorspace_ = WMTColorSpaceInvalid;
   };
@@ -1133,7 +1133,7 @@ public:
     if (!ppOutput)
       return E_INVALIDARG;
     
-    if (kind_ == DXMTSwapChainKind::Composition || !wsi::isWindow(hWnd))
+    if (kind_ == D3DalloySwapChainKind::Composition || !wsi::isWindow(hWnd))
       return DXGI_ERROR_INVALID_CALL;
     
     Com<IDXGIOutput1> output;
@@ -1156,7 +1156,7 @@ public:
   GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) final {
     if (!stats)
       return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     if (fullscreen_desc_.Windowed && desc_.SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD &&
         desc_.SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)
       return DXGI_ERROR_UNSUPPORTED;
@@ -1168,7 +1168,7 @@ public:
     if (!presentation_observer_.getRefreshSample(sample) || !has_presentation_event_)
       return DXGI_ERROR_FRAME_STATISTICS_DISJOINT;
     DXGI_FRAME_STATISTICS measured{};
-    HRESULT hr = dxmt::ComputeFrameStatistics(last_presentation_event_, sample, fullscreen_desc_.Windowed,
+    HRESULT hr = d3dalloy::ComputeFrameStatistics(last_presentation_event_, sample, fullscreen_desc_.Windowed,
                                             statistics_clock_, statistics_disjoint_, &measured);
     if (FAILED(hr))
       return hr;
@@ -1186,7 +1186,7 @@ public:
     if (last_present_count == NULL) {
       return E_POINTER;
     }
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     *last_present_count = presentation_count_;
     return S_OK;
   };
@@ -1197,7 +1197,7 @@ public:
     if (pDesc == NULL) {
       return E_POINTER;
     }
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     *pDesc = desc_;
     return S_OK;
   };
@@ -1218,8 +1218,8 @@ public:
     if (pHwnd == NULL) {
       return E_POINTER;
     }
-    *pHwnd = kind_ == DXMTSwapChainKind::Hwnd ? hWnd : nullptr;
-    return kind_ == DXMTSwapChainKind::Hwnd ? S_OK : DXGI_ERROR_INVALID_CALL;
+    *pHwnd = kind_ == D3DalloySwapChainKind::Hwnd ? hWnd : nullptr;
+    return kind_ == D3DalloySwapChainKind::Hwnd ? S_OK : DXGI_ERROR_INVALID_CALL;
   };
 
   HRESULT
@@ -1231,7 +1231,7 @@ public:
     return core_window_ ? core_window_->QueryInterface(refiid, ppUnk) : DXGI_ERROR_INVALID_CALL;
   };
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
@@ -1252,7 +1252,7 @@ public:
   HRESULT PresentImpl(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters,
                       bool closes_frame, ID3D12Resource *source = nullptr) {
     const bool do_not_wait = (PresentFlags & DXGI_PRESENT_DO_NOT_WAIT) != 0;
-    std::unique_lock<dxmt::mutex> lock(mutex_, std::defer_lock);
+    std::unique_lock<d3dalloy::mutex> lock(mutex_, std::defer_lock);
     if (do_not_wait) {
       if (!lock.try_lock())
         return DXGI_ERROR_WAS_STILL_DRAWING;
@@ -1276,7 +1276,7 @@ public:
       if (!owned->texture || !owned->texture->current())
         return E_INVALIDARG;
     }
-    if (kind_ != DXMTSwapChainKind::Composition && !wsi::isWindow(hWnd))
+    if (kind_ != D3DalloySwapChainKind::Composition && !wsi::isWindow(hWnd))
       return DXGI_ERROR_INVALID_CALL;
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
@@ -1290,7 +1290,7 @@ public:
                         DXGI_PRESENT_USE_DURATION))
       return DXGI_ERROR_UNSUPPORTED;
     if ((PresentFlags & DXGI_PRESENT_RESTART) && fullscreen_desc_.Windowed &&
-        kind_ != DXMTSwapChainKind::Composition)
+        kind_ != D3DalloySwapChainKind::Composition)
       return DXGI_ERROR_INVALID_CALL;
     if ((PresentFlags & DXGI_PRESENT_ALLOW_TEARING) &&
         (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) || SyncInterval || !fullscreen_desc_.Windowed))
@@ -1299,7 +1299,7 @@ public:
       return DXGI_ERROR_INVALID_CALL;
     if ((PresentFlags & DXGI_PRESENT_RESTRICT_TO_OUTPUT) && !restrict_output_)
       return DXGI_ERROR_INVALID_CALL;
-    DXMTPresentComposition composition;
+    D3DalloyPresentComposition composition;
     if (pPresentParameters) {
       const bool has_scroll = pPresentParameters->pScrollRect || pPresentParameters->pScrollOffset;
       if ((pPresentParameters->DirtyRectsCount && !pPresentParameters->pDirtyRects) ||
@@ -1333,7 +1333,7 @@ public:
     }
     HRESULT hr = S_OK;
     if (desc_.Width == 0 || desc_.Height == 0 ||
-        (kind_ != DXMTSwapChainKind::Composition && (!::IsWindowVisible(hWnd) || ::IsIconic(hWnd))))
+        (kind_ != D3DalloySwapChainKind::Composition && (!::IsWindowVisible(hWnd) || ::IsIconic(hWnd))))
       hr = DXGI_STATUS_OCCLUDED;
     if (PresentFlags & DXGI_PRESENT_TEST)
       return hr;
@@ -1367,7 +1367,7 @@ public:
                            &borrowed_credit))
       return device_->RemovedReason() == S_OK ? DXGI_ERROR_WAS_STILL_DRAWING : DXGI_ERROR_DEVICE_REMOVED;
     struct Admission {
-      std::shared_ptr<DXMTPresentLatency> latency;
+      std::shared_ptr<D3DalloyPresentLatency> latency;
       ~Admission() { if (latency) latency->cancel(); }
     } admission{latency_};
     if (do_not_wait) {
@@ -1398,7 +1398,7 @@ public:
         (client_width != drawable_width_ || client_height != drawable_height_))
       ApplyLayerProps();
 
-    DXMTPresentGeometry geometry;
+    D3DalloyPresentGeometry geometry;
     geometry.source_width = source_width_;
     geometry.source_height = source_height_;
     geometry.destination_width = drawable_width_ * scale_factor;
@@ -1481,7 +1481,7 @@ public:
       end_frame();
       if (PresentFlags & DXGI_PRESENT_RESTART) {
         history_presents_ = 0;
-        dxmt::InvalidateOutputStatistics(monitor_, this);
+        d3dalloy::InvalidateOutputStatistics(monitor_, this);
         ResetFrameStatisticsLocked();
       }
       admission.latency.reset();
@@ -1516,7 +1516,7 @@ public:
     if (!pColor || !(pColor->r >= 0 && pColor->r <= 1 && pColor->g >= 0 && pColor->g <= 1 &&
                      pColor->b >= 0 && pColor->b <= 1 && pColor->a >= 0 && pColor->a <= 1))
       return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     background_ = *pColor;
     return S_OK;
   };
@@ -1526,7 +1526,7 @@ public:
   GetBackgroundColor(DXGI_RGBA *pColor) final {
     if (!pColor)
       return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     *pColor = background_;
     return S_OK;
   };
@@ -1536,7 +1536,7 @@ public:
   SetRotation(DXGI_MODE_ROTATION Rotation) final {
     if (Rotation < DXGI_MODE_ROTATION_IDENTITY || Rotation > DXGI_MODE_ROTATION_ROTATE270)
       return DXGI_ERROR_INVALID_CALL;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     if (desc_.SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD && desc_.SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)
       return DXGI_ERROR_INVALID_CALL;
     rotation_ = Rotation;
@@ -1548,14 +1548,14 @@ public:
   GetRotation(DXGI_MODE_ROTATION *pRotation) final {
     if (!pRotation)
       return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     *pRotation = rotation_;
     return S_OK;
   };
 
   HRESULT STDMETHODCALLTYPE
   SetSourceSize(UINT width, UINT height) override {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     if (!width || !height || width > desc_.Width || height > desc_.Height)
       return E_INVALIDARG;
     source_width_ = width;
@@ -1567,7 +1567,7 @@ public:
   GetSourceSize(UINT *width, UINT *height) override {
     if (!width || !height)
       return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     *width = source_width_;
     *height = source_height_;
     return S_OK;
@@ -1610,21 +1610,21 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   SetMatrixTransform(const DXGI_MATRIX_3X2_F *matrix) override {
-    if (kind_ != DXMTSwapChainKind::Composition) return DXGI_ERROR_INVALID_CALL;
+    if (kind_ != D3DalloySwapChainKind::Composition) return DXGI_ERROR_INVALID_CALL;
     if (!matrix || !std::isfinite(matrix->_11) || !std::isfinite(matrix->_12) ||
         !std::isfinite(matrix->_21) || !std::isfinite(matrix->_22) ||
         !std::isfinite(matrix->_31) || !std::isfinite(matrix->_32) || matrix->_12 != 0 || matrix->_21 != 0)
       return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     matrix_ = *matrix;
     return S_OK;
   };
 
   HRESULT STDMETHODCALLTYPE
   GetMatrixTransform(DXGI_MATRIX_3X2_F *matrix) override {
-    if (kind_ != DXMTSwapChainKind::Composition) return DXGI_ERROR_INVALID_CALL;
+    if (kind_ != D3DalloySwapChainKind::Composition) return DXGI_ERROR_INVALID_CALL;
     if (!matrix) return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     *matrix = matrix_;
     return S_OK;
   };
@@ -1633,8 +1633,8 @@ public:
   CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace, UINT *pColorSpaceSupport) override {
     if (!pColorSpaceSupport)
       return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
-    const auto native = ConvertColorSpace(ColorSpace, kind_ == DXMTSwapChainKind::Composition || LayerSupportEDR());
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
+    const auto native = ConvertColorSpace(ColorSpace, kind_ == D3DalloySwapChainKind::Composition || LayerSupportEDR());
     *pColorSpaceSupport = native != WMTColorSpaceInvalid &&
                                   (ColorSpace == colorspace_ || CGColorSpace_checkColorSpaceSupported(native))
                               ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT
@@ -1644,11 +1644,11 @@ public:
 
   UINT STDMETHODCALLTYPE
   GetCurrentBackBufferIndex() override {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     return current_buffer_;
   }
 
-  DXMT_HOTPATCHABLE
+  D3DALLOY_HOTPATCHABLE
   HRESULT STDMETHODCALLTYPE
   ResizeBuffers1(
       UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT SwapChainFlags, const UINT *pCreationNodeMask,
@@ -1661,8 +1661,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) override {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
-    const auto native = ConvertColorSpace(ColorSpace, kind_ == DXMTSwapChainKind::Composition || LayerSupportEDR());
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
+    const auto native = ConvertColorSpace(ColorSpace, kind_ == D3DalloySwapChainKind::Composition || LayerSupportEDR());
     if (native == WMTColorSpaceInvalid)
       return DXGI_ERROR_INVALID_CALL;
     if (ColorSpace != colorspace_ && !CGColorSpace_checkColorSpaceSupported(native))
@@ -1676,7 +1676,7 @@ public:
   SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void *pMetaData) override {
     if (Size && !pMetaData)
       return E_INVALIDARG;
-    std::lock_guard<dxmt::mutex> lock(mutex_);
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
     if (Type == DXGI_HDR_METADATA_TYPE_NONE) {
       presenter->changeHDRMetadata(nullptr);
       return S_OK;
@@ -1698,14 +1698,14 @@ HRESULT
 CreateSwapChain(
     IDXGIFactory1 *pFactory, MTLD3D12Device *pDevice, MTLD3D12CommandQueue *pQueue, HWND hWnd,
     const DXGI_SWAP_CHAIN_DESC1 *pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
-    IDXGISwapChain1 **ppSwapChain, IDXGIOutput *pRestrictToOutput, IUnknown *core_window, DXMTSwapChainKind kind
+    IDXGISwapChain1 **ppSwapChain, IDXGIOutput *pRestrictToOutput, IUnknown *core_window, D3DalloySwapChainKind kind
 ) {
   InitReturnPtr(ppSwapChain);
   if (!pFactory || !pDevice || !pQueue || !pDesc || !ppSwapChain ||
       pQueue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
-      (kind == DXMTSwapChainKind::Composition ? (hWnd || core_window || pFullscreenDesc) : !hWnd))
+      (kind == D3DalloySwapChainKind::Composition ? (hWnd || core_window || pFullscreenDesc) : !hWnd))
     return DXGI_ERROR_INVALID_CALL;
-  if (kind == DXMTSwapChainKind::Composition &&
+  if (kind == D3DalloySwapChainKind::Composition &&
       (!pDesc->Width || !pDesc->Height || pDesc->Scaling == DXGI_SCALING_ASPECT_RATIO_STRETCH ||
        (pDesc->Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)))
     return DXGI_ERROR_INVALID_CALL;
@@ -1722,7 +1722,7 @@ CreateSwapChain(
        pDesc->AlphaMode != DXGI_ALPHA_MODE_STRAIGHT) ||
       ConvertSwapChainFormat(pDesc->Format) == WMTPixelFormatInvalid)
     return DXGI_ERROR_INVALID_CALL;
-  if (kind != DXMTSwapChainKind::Composition &&
+  if (kind != D3DalloySwapChainKind::Composition &&
       (pDesc->AlphaMode == DXGI_ALPHA_MODE_PREMULTIPLIED ||
        pDesc->AlphaMode == DXGI_ALPHA_MODE_STRAIGHT))
     return DXGI_ERROR_UNSUPPORTED; // The HWND-backed Metal layer is opaque.
@@ -1784,4 +1784,4 @@ CreateSwapChain(
   return swapchain->QueryInterface(IID_PPV_ARGS(ppSwapChain));
 }
 
-}; // namespace dxmt
+}; // namespace d3dalloy

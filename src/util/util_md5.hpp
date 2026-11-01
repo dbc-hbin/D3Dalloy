@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace dxmt::md5 {
+namespace d3dalloy::md5 {
 
 /** 128-bit MD5 digest */
 struct Digest {
@@ -68,4 +68,4 @@ private:
 
 Digest hashDxbcBinary(const void *data, size_t size);
 
-} // namespace dxmt::md5
+} // namespace d3dalloy::md5

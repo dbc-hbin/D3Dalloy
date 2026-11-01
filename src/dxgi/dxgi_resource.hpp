@@ -5,7 +5,7 @@
 #include "dxgi1_2.h"
 #include "log/log.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 /* designed to be used as an aggregated object*/
 template <typename IResource> class MTLDXGIResource : public IDXGIResource1 {
@@ -155,4 +155,4 @@ private:
   IDeviceContext *context_;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

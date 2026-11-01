@@ -4,7 +4,7 @@
 #include "d3d11.h"
 #include "log/log.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 Logger Logger::s_instance("d3d10core.log");
 
 extern "C" HRESULT WINAPI D3D11CoreCreateDevice(
@@ -25,7 +25,7 @@ D3D10CoreCreateDevice(
   if (FAILED(hr))
     return hr;
 
-  hr = D3D11CoreCreateDevice(pFactory, pAdapter, Flags | 0x80000000 /* DXMT_D3D10_DEVICE */, &FeatureLevel, 1, &d3d11_device);
+  hr = D3D11CoreCreateDevice(pFactory, pAdapter, Flags | 0x80000000 /* D3DALLOY_D3D10_DEVICE */, &FeatureLevel, 1, &d3d11_device);
 
   if (FAILED(hr))
     return hr;
@@ -42,4 +42,4 @@ D3D10CoreRegisterLayers() {
   ERR("D3D10CoreRegisterLayers: stub");
   return E_NOTIMPL;
 }
-} // namespace dxmt
+} // namespace d3dalloy

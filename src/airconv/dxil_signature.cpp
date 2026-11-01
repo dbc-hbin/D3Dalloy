@@ -29,7 +29,7 @@
 #include <cstring>
 #include <string>
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 using llvm::cast;
 using llvm::dyn_cast;
@@ -368,7 +368,7 @@ void declare_vertex_signature(
     }
     case NAME_SHADINGRATE: {
       air_index = func_signature.DefineOutput(air::OutputVertex{
-        .user = "dxmt_shading_rate", .type = air::msl_uint,
+        .user = "d3dalloy_shading_rate", .type = air::msl_uint,
       });
       pop = dxbc::pop_output_reg(reg, mask, air_index);
       break;
@@ -425,7 +425,7 @@ void declare_pixel_signature(
     }
     if (element.semantic_kind == NAME_INNER_COVERAGE && element.start_row == ~0u) {
       if (sig_ctx.captured_pixel) func_signature.DefineInput(air::InputFragmentStageIn{
-        .user = "dxmt_inner_coverage", .type = air::msl_uint,
+        .user = "d3dalloy_inner_coverage", .type = air::msl_uint,
         .interpolation = air::Interpolation::flat, .pull_mode = false,
       });
       continue;
@@ -457,7 +457,7 @@ void declare_pixel_signature(
     switch (element.semantic_kind) {
     case NAME_SHADINGRATE: {
       air_index = sig_ctx.captured_pixel ? func_signature.DefineInput(air::InputFragmentStageIn{
-        .user = "dxmt_resolved_shading_rate", .type = air::msl_uint,
+        .user = "d3dalloy_resolved_shading_rate", .type = air::msl_uint,
         .interpolation = air::Interpolation::flat, .pull_mode = false,
       }) : ~0u;
       init_plain = false;
@@ -513,7 +513,7 @@ void declare_pixel_signature(
     }
     case NAME_INNER_COVERAGE: {
       air_index = sig_ctx.captured_pixel ? func_signature.DefineInput(air::InputFragmentStageIn{
-        .user = "dxmt_inner_coverage", .type = air::msl_uint,
+        .user = "d3dalloy_inner_coverage", .type = air::msl_uint,
         .interpolation = air::Interpolation::flat, .pull_mode = false,
       }) : ~0u;
       init_plain = false;
@@ -1127,7 +1127,7 @@ llvm::Error lower_evaluate_input(dxbc::context &ctx, const StageSignature &signa
     llvm::Value *offset = llvm::UndefValue::get(llvm::FixedVectorType::get(builder.getFloatTy(), 2));
     for (unsigned i = 0; i < 2; ++i) {
       llvm::Value *snapped = builder.CreateAdd(call.getArgOperand(4 + i), builder.getInt32(8));
-      const bool wide = ctx.function->getParent()->getModuleFlag("dxmt.coarse.snapped") != nullptr;
+      const bool wide = ctx.function->getParent()->getModuleFlag("d3dalloy.coarse.snapped") != nullptr;
       if (!wide) snapped = builder.CreateAnd(snapped, builder.getInt32(15));
 
       // D3D offsets are relative to the pixel center; AIR/Metal offsets are
@@ -1540,7 +1540,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     sig_ctx.captured_pixel = msaa_pixel != nullptr;
     SM50_SHADER_COMPILATION_ARGUMENT_DATA *coarse = nullptr;
     dxbc::args_get_data<SM50_SHADER_D3D12_COARSE_SHADING, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(args, &coarse);
-    if (coarse) module_ir.addModuleFlag(llvm::Module::Error, "dxmt.coarse.snapped", 1);
+    if (coarse) module_ir.addModuleFlag(llvm::Module::Error, "d3dalloy.coarse.snapped", 1);
     sig_ctx.pull_mode_reg_mask = msaa_pixel ? 0xffffffffu : shader.shader_info.pull_mode_reg_mask;
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
@@ -1607,7 +1607,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   SM50_SHADER_D3D12_MSAA_PIXEL_DATA *inner_pixel = nullptr;
   dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(args, &inner_pixel);
   const auto inner_input_arg = has_inner && inner_pixel ? func_signature.DefineInput(air::InputFragmentStageIn{
-    .user = "dxmt_inner_coverage", .type = air::msl_uint,
+    .user = "d3dalloy_inner_coverage", .type = air::msl_uint,
     .interpolation = air::Interpolation::flat, .pull_mode = false,
   }) : ~0u;
 
@@ -1684,7 +1684,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     if (pso_sample_mask != 0xffffffff) {
       llvm::IRBuilder<> builder(call);
       llvm::Value *mask = builder.getInt32(pso_sample_mask);
-      if (auto *constant = module_ir.getGlobalVariable("dxmt_sample_mask.MTL_FC_INIT_0_j"))
+      if (auto *constant = module_ir.getGlobalVariable("d3dalloy_sample_mask.MTL_FC_INIT_0_j"))
         mask = builder.CreateLoad(builder.getInt32Ty(), constant);
       coverage = builder.CreateAnd(coverage, mask, "coverage");
     }
@@ -1828,4 +1828,4 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   return std::move(binding_map);
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

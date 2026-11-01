@@ -16,7 +16,7 @@
 #include "../thread.hpp"
 #include "../util_string.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 enum class LogLevel : uint32_t {
   Trace = 0,
@@ -56,7 +56,7 @@ private:
   const LogLevel m_minLevel;
   const std::string m_fileName;
 
-  dxmt::mutex m_mutex;
+  d3dalloy::mutex m_mutex;
   std::ofstream m_fileStream;
 
   bool m_initialized = false;
@@ -69,7 +69,7 @@ private:
   static LogLevel getMinLogLevel();
 };
 
-} // namespace dxmt
+} // namespace d3dalloy
 
 
 #define TRACE(...) Logger::trace(str::format(__VA_ARGS__))

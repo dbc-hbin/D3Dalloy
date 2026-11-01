@@ -1,7 +1,7 @@
 #include "d3d11_inspection.hpp"
 #include "log/log.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 MTLD3D11Inspection::MTLD3D11Inspection(WMT::Device pDevice)
     : m_device(pDevice) {
@@ -53,7 +53,7 @@ MTLD3D11Inspection::MTLD3D11Inspection(WMT::Device pDevice)
   m_d3d11Options.ExtendedResourceSharing = TRUE;
   m_d3d11Options.SAD4ShaderInstructions = TRUE;
   m_d3d11Options.FlagsForUpdateAndCopySeenByDriver = TRUE;
-#ifdef DXMT_NO_PRIVATE_API
+#ifdef D3DALLOY_NO_PRIVATE_API
   m_d3d11Options.OutputMergerLogicOp = FALSE;
 #else
   m_d3d11Options.OutputMergerLogicOp = TRUE;
@@ -155,4 +155,4 @@ HRESULT MTLD3D11Inspection::GetFeatureData(D3D11_FEATURE Feature,
   }
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

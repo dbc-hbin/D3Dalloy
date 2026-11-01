@@ -3,7 +3,7 @@
 #include <cstdio>
 
 int main() {
-  using namespace dxmt::bit;
+  using namespace d3dalloy::bit;
   assert(popcnt(0) == 0 && popcnt(UINT32_MAX) == 32);
   assert(tzcnt(uint32_t(0)) == 32 && lzcnt(0) == 32);
   assert(tzcnt(uint64_t(0)) == 64);

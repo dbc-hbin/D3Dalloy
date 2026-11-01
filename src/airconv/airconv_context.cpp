@@ -44,7 +44,7 @@
 
 using namespace llvm;
 
-namespace dxmt {
+namespace d3dalloy {
 
 void initializeModule(llvm::Module &M) {
   M.setSourceFileName("airconv_generated.metal");
@@ -78,7 +78,7 @@ runOptimizationPasses(llvm::Module &M) {
   // Only D3D12 root-bound shaders define null-descriptor reads as zero. D3D11
   // modules never enter this path. Guard native AIR accesses, not their results:
   // selecting zero after a query/read/sample still touches a null Metal texture.
-  if (M.getModuleFlag("dxmt.d3d12.root-signature")) {
+  if (M.getModuleFlag("d3dalloy.d3d12.root-signature")) {
     SmallVector<CallInst *, 16> accesses;
     for (auto &function : M) for (auto &instruction : instructions(function)) {
       auto *call = dyn_cast<CallInst>(&instruction);
@@ -139,7 +139,7 @@ runOptimizationPasses(llvm::Module &M) {
     }
   }
   for (auto &function : M) {
-    if (function.isDeclaration() && function.getName().startswith("dxmt.fp64.")) {
+    if (function.isDeclaration() && function.getName().startswith("d3dalloy.fp64.")) {
       linkFP64(M);
       break;
     }
@@ -264,19 +264,19 @@ runOptimizationPasses(llvm::Module &M) {
 
 void
 lowerBoundedLoads(llvm::Module &M) {
-  /* dxmt.bounded.load.*(valid, pointer) is a device or constant load that reads zero
+  /* d3dalloy.bounded.load.*(valid, pointer) is a device or constant load that reads zero
    * when `valid` is false. The fallback address is a zero-filled constant: a load
    * through null also reads zero on Apple GPUs, but Shader Validation rejects it and
    * Metal does not define it. Its 16 bytes cover the widest bounded load (a CBV row). */
   SmallVector<Function *, 4> helpers;
   for (auto &function : M)
-    if (function.isDeclaration() && function.getName().startswith("dxmt.bounded.load."))
+    if (function.isDeclaration() && function.getName().startswith("d3dalloy.bounded.load."))
       helpers.push_back(&function);
   if (helpers.empty())
     return;
   auto *zero_type = ArrayType::get(Type::getInt32Ty(M.getContext()), 4);
   auto *zero = new GlobalVariable(M, zero_type, true, GlobalValue::InternalLinkage,
-                                  ConstantAggregateZero::get(zero_type), "dxmt.bounded.zero", nullptr,
+                                  ConstantAggregateZero::get(zero_type), "d3dalloy.bounded.zero", nullptr,
                                   GlobalValue::NotThreadLocal, 2);
   zero->setAlignment(Align(16));
   for (auto *helper : helpers) {
@@ -365,7 +365,7 @@ linkAtomic64(llvm::Module &M) {
   linkShader(M, air_atomic64);
   // Keep the allocator/reclamation loop shared: inlining it into every user
   // update makes AGX instruction selection grow pathologically on typed shaders.
-  if (auto *cas = M.getFunction("dxmt_atomic64_compare_exchange"))
+  if (auto *cas = M.getFunction("d3dalloy_atomic64_compare_exchange"))
     cas->addFnAttr(llvm::Attribute::NoInline);
 }
 
@@ -379,4 +379,4 @@ linkConservative(llvm::Module &M) {
   linkShader(M, air_conservative);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

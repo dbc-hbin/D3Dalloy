@@ -77,11 +77,11 @@ template<typename... Args> static uint64_t cpuPoolOperation(uint32_t operation,A
 @end
 int main() {
   @autoreleasepool {
-    auto views=[DXMTM4ViewPool new];
+    auto views=[D3DALLOYM4ViewPool new];
     views->textures=[[NSMutableArray alloc] initWithCapacity:1000000];
     views->parents=[NSCountedSet new]; views->trace=YES;
     for (NSUInteger i=0;i<1000000;++i) [views->textures addObject:[NSNull null]];
-    auto other=[DXMTM4ViewPool new];
+    auto other=[D3DALLOYM4ViewPool new];
     other->textures=[@[[NSNull null],[NSNull null]] mutableCopy];
     other->parents=[NSCountedSet new];
     auto first=[OwnedViewPoolCPUTexture new], second=[OwnedViewPoolCPUTexture new];
@@ -98,7 +98,7 @@ int main() {
     require([views->parents countForObject:first]==1 && [views->parents countForObject:second]==2,"overwrite-refcounts");
     auto buffer=[NSObject new];
     objc_setAssociatedObject(buffer,&m4_view_pool_key,views,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    auto recording=[DXMTM4Recording new];
+    auto recording=[D3DALLOYM4Recording new];
     recording->objects=[NSMutableSet new]; recording->allocations=[NSMutableSet new];
     recording->residency=(id<MTLResidencySet>)[OwnedViewPoolCPUResidency new]; recording->trace=YES;
     m4_allocation(recording,(id<MTLAllocation>)buffer);
@@ -118,17 +118,17 @@ int main() {
     std::puts("OWNED_METAL4_VIEW_POOL_CPU_PASS slots=1000000 unique_parent_visits=2 repeated_recording_visits=0 copy_refcounts=1 overwrite_null=1 retired_parents=2");
     auto device=[OwnedViewPoolCPUDevice new]; device->failFactory=YES;
     auto fallbackBuffer=[NSObject new];
-    auto fallback=(DXMTM4ViewPool *)(uintptr_t)cpuPoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)device,4,(uintptr_t)fallbackBuffer);
-    auto fallback2=(DXMTM4ViewPool *)(uintptr_t)cpuPoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)device,4,0);
+    auto fallback=(D3DALLOYM4ViewPool *)(uintptr_t)cpuPoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)device,4,(uintptr_t)fallbackBuffer);
+    auto fallback2=(D3DALLOYM4ViewPool *)(uintptr_t)cpuPoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)device,4,0);
     require(fallback && !fallback->pool && objc_getAssociatedObject(fallbackBuffer,&m4_view_pool_key)==fallback,"factory-nil-preserves-lease");
     device->failFactory=NO;
-    auto pooled=(DXMTM4ViewPool *)(uintptr_t)cpuPoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)device,4,0);
+    auto pooled=(D3DALLOYM4ViewPool *)(uintptr_t)cpuPoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)device,4,0);
     require(pooled->pool!=nil,"factory-success");
     fallback->trace=YES; fallback2->trace=YES; pooled->trace=YES;
     auto oldParent=[OwnedViewPoolCPUTexture new], newParent=[OwnedViewPoolCPUTexture new];
     WMTTextureViewPoolInfo info{WMTPixelFormatR32Uint,MTLTextureType2DArray,1,2,2,1};
-    auto set=[&](DXMTM4ViewPool *heap,unsigned slot,id parent) { return cpuPoolOperation(WMTMetal4SetTextureView,(uintptr_t)heap,(uintptr_t)parent,(uintptr_t)&info,slot); };
-    auto copy=[&](DXMTM4ViewPool *dst,unsigned to,DXMTM4ViewPool *src,unsigned from,id parent) { return cpuPoolOperation(WMTMetal4CopyTextureViews,(uintptr_t)dst,(uintptr_t)src,from,to,(uintptr_t)parent,(uintptr_t)&info); };
+    auto set=[&](D3DALLOYM4ViewPool *heap,unsigned slot,id parent) { return cpuPoolOperation(WMTMetal4SetTextureView,(uintptr_t)heap,(uintptr_t)parent,(uintptr_t)&info,slot); };
+    auto copy=[&](D3DALLOYM4ViewPool *dst,unsigned to,D3DALLOYM4ViewPool *src,unsigned from,id parent) { return cpuPoolOperation(WMTMetal4CopyTextureViews,(uintptr_t)dst,(uintptr_t)src,from,to,(uintptr_t)parent,(uintptr_t)&info); };
     const auto pooledID=set(pooled,0,oldParent);
     const auto ordinaryID=copy(fallback,0,pooled,0,oldParent);
     require(ordinaryID && ordinaryID!=pooledID,"pooled-to-fallback-id");
@@ -140,7 +140,7 @@ int main() {
     require(native->lastTexture==oldParent && native->levels.location==1 && native->slices.location==2,"fallback-to-pooled-frozen-backing");
     require(copy(fallback2,1,fallback,0,oldParent)==ordinaryID,"fallback-to-fallback-view-reuse");
     require(copy(fallback,2,fallback,0,oldParent)==ordinaryID && [fallback->ordinaryOwners countForObject:frozen]==2,"same-fallback-copy-refcounts");
-    auto lease=[DXMTM4Recording new]; lease->objects=[NSMutableSet new]; lease->allocations=[NSMutableSet new];
+    auto lease=[D3DALLOYM4Recording new]; lease->objects=[NSMutableSet new]; lease->allocations=[NSMutableSet new];
     lease->residency=(id<MTLResidencySet>)[OwnedViewPoolCPUResidency new];
     m4_allocation(lease,(id<MTLAllocation>)fallbackBuffer);
     const auto beforeViews=cpuViewRetirements;
@@ -218,13 +218,13 @@ kernel void read_view(texture2d<uint, access::read> input [[texture(0)]], device
     auto proxy=[OwnedViewPoolDeviceProxy new]; proxy->target=device; proxy->failFactory=sourceFallback;
     auto sourceBuffer=[device newBufferWithLength:32 options:MTLResourceStorageModeShared];
     auto destinationBuffer=[device newBufferWithLength:32 options:MTLResourceStorageModeShared];
-    auto sourceWrapper=(DXMTM4ViewPool *)(uintptr_t)bridgePoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)proxy,4,(uintptr_t)sourceBuffer);
+    auto sourceWrapper=(D3DALLOYM4ViewPool *)(uintptr_t)bridgePoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)proxy,4,(uintptr_t)sourceBuffer);
     proxy->failFactory=destinationFallback;
-    auto destinationWrapper=(DXMTM4ViewPool *)(uintptr_t)bridgePoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)proxy,4,(uintptr_t)destinationBuffer);
+    auto destinationWrapper=(D3DALLOYM4ViewPool *)(uintptr_t)bridgePoolOperation(WMTMetal4NewTextureViewPool,(uintptr_t)proxy,4,(uintptr_t)destinationBuffer);
     require(bool(sourceWrapper->pool)==!sourceFallback && bool(destinationWrapper->pool)==!destinationFallback,"controlled-factory-failure");
     WMTTextureViewPoolInfo viewInfo{WMTPixelFormatR32Uint,MTLTextureType2D,0,1,0,1};
-    auto setView=[&](DXMTM4ViewPool *heap,id texture,unsigned slot) { return MTLResourceID{bridgePoolOperation(WMTMetal4SetTextureView,(uintptr_t)heap,(uintptr_t)texture,(uintptr_t)&viewInfo,slot)}; };
-    auto copyView=[&](DXMTM4ViewPool *dst,DXMTM4ViewPool *src,unsigned from,unsigned to,id parent) { return MTLResourceID{bridgePoolOperation(WMTMetal4CopyTextureViews,(uintptr_t)dst,(uintptr_t)src,from,to,(uintptr_t)parent,(uintptr_t)&viewInfo)}; };
+    auto setView=[&](D3DALLOYM4ViewPool *heap,id texture,unsigned slot) { return MTLResourceID{bridgePoolOperation(WMTMetal4SetTextureView,(uintptr_t)heap,(uintptr_t)texture,(uintptr_t)&viewInfo,slot)}; };
+    auto copyView=[&](D3DALLOYM4ViewPool *dst,D3DALLOYM4ViewPool *src,unsigned from,unsigned to,id parent) { return MTLResourceID{bridgePoolOperation(WMTMetal4CopyTextureViews,(uintptr_t)dst,(uintptr_t)src,from,to,(uintptr_t)parent,(uintptr_t)&viewInfo)}; };
 #endif
     auto texture_descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
                                                                               width:1 height:1 mipmapped:NO];
@@ -258,7 +258,7 @@ kernel void read_view(texture2d<uint, access::read> input [[texture(0)]], device
       const auto overwritten_source=setView(sourceWrapper,second,0);
       const auto copied_again=copyView(destinationWrapper,destinationWrapper,2,0,first);
       const auto overwritten_destination=setView(destinationWrapper,second,2);
-      auto lease=[DXMTM4Recording new]; lease->objects=[NSMutableSet new]; lease->allocations=[NSMutableSet new];
+      auto lease=[D3DALLOYM4Recording new]; lease->objects=[NSMutableSet new]; lease->allocations=[NSMutableSet new];
       lease->residency=[device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
       require(lease->residency!=nil,"bridge-recording-residency",error);
       m4_allocation(lease,sourceBuffer); m4_allocation(lease,destinationBuffer);

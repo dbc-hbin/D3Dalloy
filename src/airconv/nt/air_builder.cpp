@@ -15,7 +15,7 @@ AIRBuilder::CreateAtomicPhaseMetadataLoad(Value *base, uint64_t offset, Type *ty
   auto *bytes = builder.CreateBitCast(base, builder.getInt8Ty()->getPointerTo(1));
   auto *ptr = builder.CreateGEP(builder.getInt8Ty(), bytes, builder.getInt64(offset));
   auto *result = builder.CreateLoad(type, builder.CreateBitCast(ptr, type->getPointerTo(1)));
-  result->setMetadata(dxmt::dxil::kAtomic64Metadata, MDNode::get(getContext(), {}));
+  result->setMetadata(d3dalloy::dxil::kAtomic64Metadata, MDNode::get(getContext(), {}));
   return result;
 }
 
@@ -25,10 +25,10 @@ AIRBuilder::CreateAtomicPhaseTypedView(Value *context, Value *handle) {
     return CreateAtomicPhaseMetadataLoad(base, offset, type);
   };
   auto *viewType = builder.getInt8Ty()->getPointerTo(1);
-  auto *lookup = getModule()->getFunction("dxmt.atomic64.typed_view");
+  auto *lookup = getModule()->getFunction("d3dalloy.atomic64.typed_view");
   if (!lookup) {
     lookup = Function::Create(FunctionType::get(viewType, {viewType, builder.getInt64Ty()}, false),
-                              GlobalValue::InternalLinkage, "dxmt.atomic64.typed_view", getModule());
+                              GlobalValue::InternalLinkage, "d3dalloy.atomic64.typed_view", getModule());
     lookup->addFnAttr(Attribute::NoUnwind);
     auto saved = builder.saveIP();
     auto *entry = BasicBlock::Create(getContext(), "entry", lookup);
@@ -69,9 +69,9 @@ AIRBuilder::CreateAtomicPhaseTypedAccess(
     const Texture &texture, Value *handle, Value *position, Value *arrayIndex, Value *sample, Value *level,
     Value *value, Value *comparison, AtomicRMWInst::BinOp operation, unsigned access, uint32_t writeMask,
     function_ref<std::pair<Value *, Value *>()> native) {
-  using dxmt::dxil::EmitAtomic64CellRead;
-  using dxmt::dxil::EmitAtomic64CellUpdate;
-  auto *context = dxmt::dxil::EmitAtomic64Context(builder);
+  using d3dalloy::dxil::EmitAtomic64CellRead;
+  using d3dalloy::dxil::EmitAtomic64CellUpdate;
+  auto *context = d3dalloy::dxil::EmitAtomic64Context(builder);
   auto load = [&](Value *base, uint64_t offset, Type *type) -> Value * {
     return CreateAtomicPhaseMetadataLoad(base, offset, type);
   };
@@ -126,7 +126,7 @@ AIRBuilder::CreateAtomicPhaseTypedAccess(
         auto root = [&](unsigned cell) -> Value * {
           auto *id = builder.CreateLoad(getIntTy(), builder.CreateGEP(getIntTy(), map,
               builder.CreateAdd(firstCell, builder.getInt64(cell))));
-          id->setMetadata(dxmt::dxil::kAtomic64Metadata, MDNode::get(getContext(), {}));
+          id->setMetadata(d3dalloy::dxil::kAtomic64Metadata, MDNode::get(getContext(), {}));
           // NULL sparse cells are not indices into the arena.
           return builder.CreateSelect(builder.CreateICmpEQ(id, getInt(~0u)),
               ConstantPointerNull::get(getIntTy()->getPointerTo(1)), builder.CreateGEP(getIntTy(), roots, id));
@@ -168,10 +168,10 @@ AIRBuilder::CreateAtomicPhaseTypedAccess(
         auto ordinary = [&]() -> std::pair<Value *, Value *> {
         // One descriptor per component: width6, bit-offset7, encoding3.
         // All uncompressed D3D typed UAV formats have at most four 32-bit components.
-        auto *formatInfo = getModule()->getFunction("dxmt.atomic64.typed_format");
+        auto *formatInfo = getModule()->getFunction("d3dalloy.atomic64.typed_format");
         if (!formatInfo) {
           formatInfo = Function::Create(FunctionType::get(i64, {getIntTy()}, false),
-              GlobalValue::InternalLinkage, "dxmt.atomic64.typed_format", getModule());
+              GlobalValue::InternalLinkage, "d3dalloy.atomic64.typed_format", getModule());
           formatInfo->addFnAttr(Attribute::NoUnwind);
           formatInfo->addFnAttr(Attribute::ReadNone);
           auto saved = builder.saveIP();
@@ -513,7 +513,7 @@ AIRBuilder::LoadVolumeWord(const Texture &texture, Value *index) {
   auto *layout = builder.CreateIntToPtr(address, getIntTy()->getPointerTo(1));
   auto *word = builder.CreateLoad(getIntTy(), builder.CreateGEP(getIntTy(), layout, index));
   // Runtime volume headers are transport metadata, not application UAV bytes.
-  word->setMetadata(dxmt::dxil::kAtomic64Metadata, MDNode::get(getContext(), {}));
+  word->setMetadata(d3dalloy::dxil::kAtomic64Metadata, MDNode::get(getContext(), {}));
   return word;
 }
 
@@ -585,7 +585,7 @@ AIRBuilder::VolumeMapped(const Texture &texture, Value *tile) {
   return CreateVolumeDispatch(texture, [&] {
     auto *status = builder.CreateIntToPtr(address, getIntTy()->getPointerTo(1));
     auto *word = builder.CreateLoad(getIntTy(), builder.CreateGEP(getIntTy(), status, tile));
-    word->setMetadata(dxmt::dxil::kAtomic64Metadata, MDNode::get(getContext(), {}));
+    word->setMetadata(d3dalloy::dxil::kAtomic64Metadata, MDNode::get(getContext(), {}));
     return std::pair<Value *, Value *>{builder.CreateICmpNE(word, getInt(0)), nullptr};
   }, [&] { return std::pair<Value *, Value *>{getBool(true), nullptr}; }, builder.CreateIsNotNull(address)).first;
 }
@@ -643,7 +643,7 @@ AIRBuilder::CreateVolumeSample(const Texture &texture, Value *handle, Value *coo
     return result;
   }
   const bool gradients = dx && dy;
-  const auto name = std::format("dxmt.volume.sample.{}.{}.{}.{}", unsigned(texture.sample_type),
+  const auto name = std::format("d3dalloy.volume.sample.{}.{}.{}.{}", unsigned(texture.sample_type),
       unsigned(texture.memory_access), gradients, texture.atomic_phase_native);
   SmallVector<Value *, 16> args{handle, coord, offset ? offset : Constant::getNullValue(getIntTy(3)),
       lod, minimum, texture.volume_layout, texture.volume_view, texture.volume_metadata,
@@ -1012,7 +1012,7 @@ Value *
 AIRBuilder::CreateAtomicRMW(
     const Texture &Texture, Value *Handle, AtomicRMWInst::BinOp Op, Value *Pos, Value *ValVec4, Value *ArrayIndex
 ) {
-  if (!Texture.atomic_phase_native && getModule()->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
+  if (!Texture.atomic_phase_native && getModule()->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
     auto native = Texture;
     native.atomic_phase_native = true;
     // Float exchange/CAS uses the scalar's bit pattern, not numerical conversion.
@@ -1141,7 +1141,7 @@ std::pair<Value *, Value *>
 AIRBuilder::CreateAtomicCmpXchg(
     const Texture &Texture, Value *Handle, Value *Pos, Value *CmpVec4, Value *NewVec4, Value *ArrayIndex
 ) {
-  if (!Texture.atomic_phase_native && getModule()->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
+  if (!Texture.atomic_phase_native && getModule()->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
     auto native = Texture;
     native.atomic_phase_native = true;
     native.sample_type = Texture::sample_uint;
@@ -1815,7 +1815,7 @@ AIRBuilder::CreateRead(
     const Texture &Texture, Value *Handle, Value *Pos, Value *ArrayIndex, Value *SampleIndexOrCubeFace, Value *Level,
     bool DeviceCoherent, Value *MSAAMetadata, Value *MSAASampleIds
 ) {
-  if (!Texture.atomic_phase_native && getModule()->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
+  if (!Texture.atomic_phase_native && getModule()->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
     auto native = Texture;
     native.atomic_phase_native = true;
     return CreateAtomicPhaseTypedAccess(Texture, Handle, Pos, ArrayIndex, SampleIndexOrCubeFace, Level, nullptr,
@@ -1976,7 +1976,7 @@ AIRBuilder::CreateWrite(
     const Texture &Texture, Value *Handle, Value *Pos, Value *ArrayIndex, Value *CubeFace, Value *Level, Value *ValVec4,
     bool DeviceCoherent, uint32_t WriteMask
 ) {
-  if (!Texture.atomic_phase_native && getModule()->getModuleFlag(dxmt::dxil::kAtomic64PhaseFlag)) {
+  if (!Texture.atomic_phase_native && getModule()->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
     auto native = Texture;
     native.atomic_phase_native = true;
     CallInst *call = nullptr;
@@ -2537,7 +2537,7 @@ AIRBuilder::CreateGetSamplePosition(Value *SampleCount, Value *Index) {
                 {~0U, Attribute::get(Context, Attribute::AttrKind::ReadNone)}}
   );
   auto Fn = getModule()->getOrInsertFunction(
-      "dxmt.sample_pos.i32", FunctionType::get(getFloatTy(2), {getIntTy(), getIntTy()}, false), Attrs
+      "d3dalloy.sample_pos.i32", FunctionType::get(getFloatTy(2), {getIntTy(), getIntTy()}, false), Attrs
   );
   return builder.CreateCall(Fn, {SampleCount, Index});
 }

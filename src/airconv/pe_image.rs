@@ -162,7 +162,7 @@ unsafe fn publish<T>(out: *mut T, result: Result<T>) -> u32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pe_image(data: *const u8, length: u64, machine: u32, out: *mut Image) -> u32 {
+pub unsafe extern "C" fn d3dalloy_pe_image(data: *const u8, length: u64, machine: u32, out: *mut Image) -> u32 {
     let result = (|| {
         let bytes = unsafe { input(data, length) }.ok_or(Error::InvalidArgument)?;
         image(bytes, u16::try_from(machine).map_err(|_| Error::InvalidArgument)?)
@@ -170,10 +170,10 @@ pub unsafe extern "C" fn dxmt_pe_image(data: *const u8, length: u64, machine: u3
     unsafe { publish(out, result) }
 }
 
-/// Image comes from a successful dxmt_pe_image over the same immutable bytes.
+/// Image comes from a successful d3dalloy_pe_image over the same immutable bytes.
 /// `name` holds `name_length` bytes without the terminator.
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_pe_export(
+pub unsafe extern "C" fn d3dalloy_pe_export(
     data: *const u8, length: u64, image: *const Image, name: *const u8, name_length: u64, export_length: u64,
     out: *mut u64,
 ) -> u32 {

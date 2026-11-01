@@ -3,7 +3,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 // The runtime shadow layout is shared by TraceRay, HitObject tracing and RayQuery.
 // Returns 0 = discard, 1 = nonopaque candidate, 2 = opaque candidate. Opacity
@@ -12,13 +12,13 @@ inline llvm::Value *emitOmmClassification(llvm::IRBuilder<> &caller, llvm::Modul
     llvm::Value *address, llvm::Value *instance, llvm::Value *geometry,
     llvm::Value *primitive, llvm::Value *barycentrics, llvm::Value *rayFlags) {
   using namespace llvm;
-  Function *fn = module.getFunction("dxmt.omm.classify");
+  Function *fn = module.getFunction("d3dalloy.omm.classify");
   if (!fn) {
     LLVMContext &c = module.getContext();
     Type *i32 = caller.getInt32Ty(), *i64 = caller.getInt64Ty(), *f32 = caller.getFloatTy();
     Type *v2 = FixedVectorType::get(f32, 2);
     fn = Function::Create(FunctionType::get(i32, {i64, i32, i32, i32, v2, i32}, false),
-      GlobalValue::InternalLinkage, "dxmt.omm.classify", module);
+      GlobalValue::InternalLinkage, "d3dalloy.omm.classify", module);
     fn->addFnAttr(Attribute::AlwaysInline);
     BasicBlock *entry = BasicBlock::Create(c, "entry", fn);
     BasicBlock *mapped = BasicBlock::Create(c, "mapped", fn);
@@ -123,4 +123,4 @@ inline llvm::Value *emitOmmClassification(llvm::IRBuilder<> &caller, llvm::Modul
   return caller.CreateCall(fn, {address, instance, geometry, primitive, barycentrics, rayFlags});
 }
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

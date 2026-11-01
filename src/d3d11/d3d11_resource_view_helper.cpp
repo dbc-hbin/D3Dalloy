@@ -1,7 +1,7 @@
-#include "dxmt_format.hpp"
+#include "d3dalloy_format.hpp"
 #include "d3d11_resource.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 void FixDepthStencilFormat(Texture *pTexture, MTL_DXGI_FORMAT_DESC &Desc) {
   switch (pTexture->pixelFormat()) {
@@ -909,4 +909,4 @@ void UpgradeViewDescription(const D3D11_RENDER_TARGET_VIEW_DESC *pSrc,
   }
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

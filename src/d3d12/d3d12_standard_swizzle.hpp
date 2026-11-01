@@ -5,7 +5,7 @@
 #include <limits>
 #include <optional>
 
-namespace dxmt::standard_swizzle {
+namespace d3dalloy::standard_swizzle {
 
 // D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE interleave within one tile.
 // See Microsoft's D3D12_TEXTURE_LAYOUT diagram. '-' means a byte-within-unit
@@ -198,4 +198,4 @@ static_assert(pattern(true, 4).tile_width == 32 && pattern(true, 4).tile_height 
 static_assert(pattern(true, 8).tile_width == 32 && pattern(true, 8).tile_height == 16 && pattern(true, 8).tile_depth == 16);
 static_assert(pattern(true, 16).tile_width == 16 && pattern(true, 16).tile_height == 16 && pattern(true, 16).tile_depth == 16);
 
-} // namespace dxmt::standard_swizzle
+} // namespace d3dalloy::standard_swizzle

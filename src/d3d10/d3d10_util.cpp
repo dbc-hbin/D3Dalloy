@@ -1,7 +1,7 @@
 #include "d3d10_util.hpp"
 #include "com/com_pointer.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 void
 GetD3D10Device(ID3D11DeviceChild *d3d11, ID3D10Device **ppDevice) {
@@ -49,4 +49,4 @@ ConvertD3D10ResourceFlags(UINT MiscFlags) {
   return ret;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

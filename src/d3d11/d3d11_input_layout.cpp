@@ -3,12 +3,12 @@
 #include "DXBCParser/DXBCUtils.h"
 #include "d3d11_shader.hpp"
 #include "d3d11_state_object.hpp"
-#include "dxmt_format.hpp"
+#include "d3dalloy_format.hpp"
 #include "sha1/sha1_util.hpp"
 #include "util_math.hpp"
 #include "log/log.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 HRESULT ExtractMTLInputLayoutElements(
     MTLD3D11Device *device, const void *pShaderBytecodeWithInputSignature,
@@ -256,7 +256,7 @@ template <>
 HRESULT StateObjectCache<MTL_STREAM_OUTPUT_DESC, IMTLD3D11StreamOutputLayout>::
     CreateStateObject(const MTL_STREAM_OUTPUT_DESC *pSOLayoutDesc,
                       IMTLD3D11StreamOutputLayout **ppSOLayout) {
-  std::lock_guard<dxmt::mutex> lock(mutex_cache);
+  std::lock_guard<d3dalloy::mutex> lock(mutex_cache);
   InitReturnPtr(ppSOLayout);
 
   if (!pSOLayoutDesc)
@@ -277,4 +277,4 @@ HRESULT StateObjectCache<MTL_STREAM_OUTPUT_DESC, IMTLD3D11StreamOutputLayout>::
   return S_OK;
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

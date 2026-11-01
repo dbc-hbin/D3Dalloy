@@ -3,7 +3,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Support/Error.h"
 
-namespace dxmt::dxil {
+namespace d3dalloy::dxil {
 
 // DXC encodes read=1/write=2 in four bits per role: caller, closesthit, miss, anyhit.
 llvm::Error ValidateRayPayloadAnnotations(llvm::Module &module);
@@ -13,4 +13,4 @@ void CopyQualifiedRayPayload(
   llvm::StructType *type, llvm::MDNode *fields, unsigned access_bit
 );
 
-} // namespace dxmt::dxil
+} // namespace d3dalloy::dxil

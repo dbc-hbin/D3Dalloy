@@ -83,7 +83,7 @@ attributes #0 = { "fp32-denorm-mode"="preserve" }
   // The same transient LocalAsMetadata shape used by raytracing stage storage.
   module->getOrInsertNamedMetadata("test.locals")->addOperand(llvm::MDNode::get(context,
       {llvm::ValueAsMetadata::get(old), llvm::ValueAsMetadata::get(allocation)}));
-  if (llvm::Error error = dxmt::dxil::LowerFP64(*module)) {
+  if (llvm::Error error = d3dalloy::dxil::LowerFP64(*module)) {
     llvm::logAllUnhandledErrors(std::move(error), llvm::errs());
     return 1;
   }
@@ -126,7 +126,7 @@ define float @entry(double %value) {
 )", diagnostic, context);
     assert(stage);
     stage->getFunction("entry")->setName(entry);
-    if (llvm::Error error = dxmt::dxil::LowerFP64(*stage)) {
+    if (llvm::Error error = d3dalloy::dxil::LowerFP64(*stage)) {
       llvm::logAllUnhandledErrors(std::move(error), llvm::errs());
       return 1;
     }

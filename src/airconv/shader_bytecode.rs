@@ -572,7 +572,7 @@ unsafe fn publish<T>(out: *mut T, value: Result<T>) -> u32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_container_parse(
+pub unsafe extern "C" fn d3dalloy_shader_container_parse(
     data: *const u8,
     length: u64,
     policy: u32,
@@ -587,7 +587,7 @@ pub unsafe extern "C" fn dxmt_shader_container_parse(
 
 /// Checked O(1) access after a successful parse of the same immutable buffer.
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_container_chunk(
+pub unsafe extern "C" fn d3dalloy_shader_container_chunk(
     data: *const u8,
     length: u64,
     policy: u32,
@@ -602,7 +602,7 @@ pub unsafe extern "C" fn dxmt_shader_container_chunk(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_container_find(
+pub unsafe extern "C" fn d3dalloy_shader_container_find(
     data: *const u8,
     length: u64,
     policy: u32,
@@ -619,7 +619,7 @@ pub unsafe extern "C" fn dxmt_shader_container_find(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_dxil_program(
+pub unsafe extern "C" fn d3dalloy_shader_dxil_program(
     data: *const u8,
     length: u64,
     out: *mut DxilProgram,
@@ -632,7 +632,7 @@ pub unsafe extern "C" fn dxmt_shader_dxil_program(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_container_declared_size(
+pub unsafe extern "C" fn d3dalloy_shader_container_declared_size(
     data: *const u8,
     length: u64,
     out: *mut u32,
@@ -645,7 +645,7 @@ pub unsafe extern "C" fn dxmt_shader_container_declared_size(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_rdat_parse(
+pub unsafe extern "C" fn d3dalloy_shader_rdat_parse(
     data: *const u8,
     length: u64,
     out: *mut RdatInfo,
@@ -659,7 +659,7 @@ pub unsafe extern "C" fn dxmt_shader_rdat_parse(
 
 /// Info comes from a successful parse of this same immutable input.
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_rdat_function(
+pub unsafe extern "C" fn d3dalloy_shader_rdat_function(
     data: *const u8,
     length: u64,
     info: *const RdatInfo,
@@ -675,7 +675,7 @@ pub unsafe extern "C" fn dxmt_shader_rdat_function(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_rdat_subobjects(
+pub unsafe extern "C" fn d3dalloy_shader_rdat_subobjects(
     data: *const u8,
     length: u64,
     out: *mut RdatSubobjects,
@@ -689,7 +689,7 @@ pub unsafe extern "C" fn dxmt_shader_rdat_subobjects(
 
 /// Table comes from a successful subobject parse of this same immutable input.
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_rdat_subobject(
+pub unsafe extern "C" fn d3dalloy_shader_rdat_subobject(
     data: *const u8,
     length: u64,
     table: *const RdatSubobjects,
@@ -706,7 +706,7 @@ pub unsafe extern "C" fn dxmt_shader_rdat_subobject(
 
 /// Subobject comes from a successful association read of this same input and table.
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_shader_rdat_export(
+pub unsafe extern "C" fn d3dalloy_shader_rdat_export(
     data: *const u8,
     length: u64,
     table: *const RdatSubobjects,
@@ -774,7 +774,7 @@ fn validate(bytes: &[u8]) -> Option<()> {
 /// The caller supplies an immutable, readable allocation of `length` bytes.
 /// Returns one only when all ranges the C++ deserializer reads are valid.
 #[no_mangle]
-pub unsafe extern "C" fn dxmt_validate_root_signature(data: *const u8, length: u64) -> i32 {
+pub unsafe extern "C" fn d3dalloy_validate_root_signature(data: *const u8, length: u64) -> i32 {
     let Ok(bytes) = (unsafe { input(data, length) }) else {
         return 0;
     };

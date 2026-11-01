@@ -136,7 +136,7 @@ struct TFrameInterpolationPresentInfo
 
     volatile double     safetyMarginInSec       = 0.0001; //0.1ms
     volatile double     varianceFactor          = 0.1;
-    // DXMT: default to sleeping/event waits instead of pure spinning; Wine's Sleep on macOS is not quantized
+    // D3Dalloy: default to sleeping/event waits instead of pure spinning; Wine's Sleep on macOS is not quantized
     // to a Windows scheduler tick. FFX_FI_SWAPCHAIN_CONFIGURE_KEY_FRAMEPACINGTUNING still overrides all three.
     volatile bool       allowHybridSpin         = true;
     volatile uint32_t   hybridSpinTime          = 1; //Measured in system timer resolution units. Upstream default is 2. Below 1 will frequently result in overshoot. Overshoots stop showing up >=2.
@@ -153,7 +153,7 @@ typedef TFrameInterpolationPresentInfo<32, FfxApiResource, FrameInterpolationPac
 // This type can be extended without breaking the ABI
 struct FrameinterpolationPresentInfoExt : public TFrameInterpolationPresentInfo<32, FfxApiResource, FrameInterpolationPacingDataExt>
 {
-    // DXMT: unlike compositionFenceGPU (pacing readiness), this protects source reuse.
+    // D3Dalloy: unlike compositionFenceGPU (pacing readiness), this protects source reuse.
     ID3D12Fence* sourceReleaseFence = nullptr;
 };
 

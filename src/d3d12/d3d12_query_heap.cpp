@@ -21,7 +21,7 @@
 #include "Metal4Pipeline.hpp"
 #include "Metal4Query.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) == 88);
 static_assert(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS1) == 112);
@@ -172,4 +172,4 @@ CreateQueryHeap(MTLD3D12Device *pDevice, const D3D12_QUERY_HEAP_DESC *pDesc, REF
   return heap->QueryInterface(riid, ppQueryHeap);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

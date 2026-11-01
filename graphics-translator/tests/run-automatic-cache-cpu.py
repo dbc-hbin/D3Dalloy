@@ -24,7 +24,7 @@ helpers = source[source.index("struct SearchHandle {"):source.index("struct Cach
 private = source[source.index("std::wstring Hex("):source.index("class ShaderCacheSession final")]
 public = source[source.index("HRESULT ReadAutomaticPipelineCache("):source.index("HRESULT CreateShaderCacheSession(")]
 production = out / "production-cache.inc"
-production.write_text("namespace dxmt {\nnamespace {\n" + helpers + private + "\n}\n" + public + "\n}\n")
+production.write_text("namespace d3dalloy {\nnamespace {\n" + helpers + private + "\n}\n" + public + "\n}\n")
 (out / "source.sha256").write_text(hashlib.sha256(source.encode()).hexdigest() + "\n")
 executable = out / "automatic-cache-disk.exe"
 imports = out / "winemetal.def"

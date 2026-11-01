@@ -6,7 +6,7 @@
 #include "com/com_private_data.hpp"
 #include "d3d11_private.h"
 
-namespace dxmt {
+namespace d3dalloy {
 
 template <typename... Base> class MTLD3D11DeviceObject : public Base... {
 
@@ -135,4 +135,4 @@ protected:
   std::atomic<uint32_t> m_refPrivate = {0ul};
 };
 
-} // namespace dxmt
+} // namespace d3dalloy

@@ -22,7 +22,7 @@ extern "C" const GUID CLSID_D3D12SDKConfiguration =
 extern "C" const GUID CLSID_D3D12DeviceFactory =
     {0x114863bf, 0xc386, 0x4aee, {0xb3, 0x9d, 0x8f, 0x0b, 0xbb, 0x06, 0x29, 0x55}};
 
-namespace dxmt {
+namespace d3dalloy {
 namespace {
 using FactoryConfiguration = CoreFactoryConfiguration;
 
@@ -539,4 +539,4 @@ DiagnosticAnnotation CaptureAnnotation(UINT action, UINT metadata, const void *d
   if (annotation.label.empty()) annotation.label = "D3D12 annotation metadata=" + std::to_string(metadata) + " bytes=" + std::to_string(size);
   return annotation;
 }
-} // namespace dxmt
+} // namespace d3dalloy

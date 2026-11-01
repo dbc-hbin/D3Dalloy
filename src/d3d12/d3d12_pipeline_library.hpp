@@ -2,7 +2,7 @@
 
 #include "d3d12_device.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 /**
  * One validated D3D12_PIPELINE_STATE_STREAM_DESC, flattened into the classic desc it selects.
@@ -24,4 +24,4 @@ HRESULT ParsePipelineStateStream(MTLD3D12Device *device, const D3D12_PIPELINE_ST
 HRESULT CreatePipelineLibrary(MTLD3D12Device *device, const void *blob, SIZE_T blob_size, REFIID riid,
                               void **library);
 
-} // namespace dxmt
+} // namespace d3dalloy

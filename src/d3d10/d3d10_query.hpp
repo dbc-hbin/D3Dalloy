@@ -2,7 +2,7 @@
 
 #include "d3d10_util.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 class MTLD3D10Query final : public ID3D10Query {
 
@@ -77,4 +77,4 @@ public:
   }
 };
 
-}; // namespace dxmt
+}; // namespace d3dalloy

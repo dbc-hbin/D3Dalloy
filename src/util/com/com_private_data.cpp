@@ -13,7 +13,7 @@
 
 #include "com_private_data.hpp"
 
-namespace dxmt {
+namespace d3dalloy {
 
 ComPrivateDataEntry::ComPrivateDataEntry() {}
 ComPrivateDataEntry::ComPrivateDataEntry(REFGUID guid, UINT size,
@@ -148,18 +148,18 @@ void ComPrivateData::insertEntry(ComPrivateDataEntry &&entry) {
 }
 
 HRESULT ConcurrentComPrivateData::setData(REFGUID guid, UINT size, const void *data) {
-  std::lock_guard<dxmt::mutex> lock(mutex_);
+  std::lock_guard<d3dalloy::mutex> lock(mutex_);
   return ComPrivateData::setData(guid, size, data);
 }
 
 HRESULT ConcurrentComPrivateData::setInterface(REFGUID guid, const IUnknown *iface) {
-  std::lock_guard<dxmt::mutex> lock(mutex_);
+  std::lock_guard<d3dalloy::mutex> lock(mutex_);
   return ComPrivateData::setInterface(guid, iface);
 }
 
 HRESULT ConcurrentComPrivateData::getData(REFGUID guid, UINT *size, void *data) {
-  std::lock_guard<dxmt::mutex> lock(mutex_);
+  std::lock_guard<d3dalloy::mutex> lock(mutex_);
   return ComPrivateData::getData(guid, size, data);
 }
 
-} // namespace dxmt
+} // namespace d3dalloy

@@ -1,7 +1,7 @@
 #pragma once
 #include <unknwn.h>
 
-namespace dxmt {
+namespace d3dalloy {
 /*
 \see https://learn.microsoft.com/en-us/windows/win32/com/aggregation
 */
@@ -24,4 +24,4 @@ protected:
   Outer *context;
 };
 
-} // namespace dxmt
+} // namespace d3dalloy
