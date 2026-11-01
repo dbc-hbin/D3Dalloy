@@ -4835,7 +4835,7 @@ def run(args: argparse.Namespace) -> int:
         "DXMT_LOG_PATH": str(out),
         "DXMT_SHADER_CACHE_PATH": str(out / "shader-cache"),
         "OWNED_GRAPHICS_TRACE": "1",
-        "OWNED_GRAPHICS_TRACE_LIMIT": "1000000" if args.suite == "arena-heap-upload-reuse" else "100000" if args.suite in ("queries", "multisample-capabilities", "render-passes", "predication-indirect") else "8192",
+        "OWNED_GRAPHICS_TRACE_LIMIT": "1000000" if args.suite == "arena-heap-upload-reuse" else "100000" if args.suite in ("queries", "multisample-capabilities", "render-passes", "predication-indirect", "fsr-fg") else "8192",
         # macOS strips DYLD_* while entering /bin/sh. The owned wrapper sets
         # this diagnostic variable itself on the final hop into real Wine.
         "OWNED_GRAPHICS_DYLD_AUDIT": "1",

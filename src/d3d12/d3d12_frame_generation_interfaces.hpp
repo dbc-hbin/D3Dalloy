@@ -76,6 +76,11 @@ DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a021", IMTLD3D12FrameGener
 DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a023", IMTLD3D12GeneratedPresent) : public IUnknown {
   virtual HRESULT STDMETHODCALLTYPE PresentGenerated(UINT SyncInterval, UINT Flags) = 0;
 };
+// Private flip-discard source substitution. TEST validates without enqueueing.
+// Queue signals following this call retire after the drawable has read source.
+DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a024", IMTLD3D12ResourcePresent) : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE PresentResource(ID3D12Resource *source, UINT sync, UINT flags, BOOL closes_frame) = 0;
+};
 DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a022", IMTLD3D12FrameGenerationCommandList) : public IUnknown {
   virtual HRESULT STDMETHODCALLTYPE PrepareFrameGeneration(IMTLD3D12FrameGenerationState *state,
       const MTL_FRAME_GENERATION_PREPARE_DESC *desc) = 0;

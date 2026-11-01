@@ -60,6 +60,7 @@ struct TFrameInterpolationFrameInfo
 // Inherits from TFrameInterpolationFrameInfo but can be extended without becoming part of the ABI
 struct FrameInterpolationFrameInfoExt : public TFrameInterpolationFrameInfo<FfxApiResource>
 {
+    bool presentSourceDirectly = false;
 };
 
 // No modifications to this type are permitted to maintain ABI stability
@@ -78,7 +79,6 @@ struct TFrameInterpolationPacingData
     bool                            drawDebugPacingLines;
 
     UINT64                          interpolationCompletedFenceValue;
-    UINT64                          replacementBufferFenceSignal;
     UINT64                          numFramesSentForPresentationBase;
     UINT32                          numFramesToPresent;
     UINT64                          currentFrameID;
@@ -124,7 +124,6 @@ struct TFrameInterpolationPresentInfo
     ID3D12Fence*        gameFence               = nullptr;
     ID3D12Fence*        interpolationFence      = nullptr;
     ID3D12Fence*        presentFence            = nullptr;
-    ID3D12Fence*        replacementBufferFence  = nullptr;
     ID3D12Fence*        compositionFenceCPU     = nullptr;
     ID3D12Fence*        compositionFenceGPU     = nullptr;
 
@@ -154,6 +153,8 @@ typedef TFrameInterpolationPresentInfo<32, FfxApiResource, FrameInterpolationPac
 // This type can be extended without breaking the ABI
 struct FrameinterpolationPresentInfoExt : public TFrameInterpolationPresentInfo<32, FfxApiResource, FrameInterpolationPacingDataExt>
 {
+    // DXMT: unlike compositionFenceGPU (pacing readiness), this protects source reuse.
+    ID3D12Fence* sourceReleaseFence = nullptr;
 };
 
 typedef struct ReplacementResource

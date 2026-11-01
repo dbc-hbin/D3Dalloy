@@ -239,7 +239,7 @@ public:
 
 class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D12Device>,
                               public IMTLDXGICompositionSurface,
-                              public IMTLD3D12GeneratedPresent {
+                              public IMTLD3D12GeneratedPresent, public IMTLD3D12ResourcePresent {
 
   Com<IDXGIFactory1> factory_;
   Com<MTLD3D12CommandQueue> queue_;
@@ -542,6 +542,11 @@ public:
     }
     if (riid == __uuidof(IMTLD3D12GeneratedPresent)) {
       *ppvObject = static_cast<IMTLD3D12GeneratedPresent *>(this);
+      AddRef();
+      return S_OK;
+    }
+    if (riid == __uuidof(IMTLD3D12ResourcePresent)) {
+      *ppvObject = static_cast<IMTLD3D12ResourcePresent *>(this);
       AddRef();
       return S_OK;
     }
@@ -1237,9 +1242,15 @@ public:
     return PresentImpl(SyncInterval, Flags, nullptr, false);
   }
 
+  HRESULT STDMETHODCALLTYPE PresentResource(ID3D12Resource *source, UINT sync, UINT flags, BOOL closes_frame) final {
+    if (!source)
+      return E_INVALIDARG;
+    return PresentImpl(sync, flags, nullptr, closes_frame != FALSE, source);
+  }
+
   // closes_frame is false only for an interpolated Present followed by its real member.
   HRESULT PresentImpl(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters,
-                      bool closes_frame) {
+                      bool closes_frame, ID3D12Resource *source = nullptr) {
     const bool do_not_wait = (PresentFlags & DXGI_PRESENT_DO_NOT_WAIT) != 0;
     std::unique_lock<dxmt::mutex> lock(mutex_, std::defer_lock);
     if (do_not_wait) {
@@ -1250,6 +1261,21 @@ public:
     }
     if (device_->RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
+    if (source) {
+      Com<ID3D12Device> owner;
+      const auto desc = source->GetDesc();
+      if (FAILED(source->GetDevice(IID_PPV_ARGS(&owner))) ||
+          owner.ptr() != static_cast<ID3D12Device *>(device_) ||
+          desc_.SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD ||
+          desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
+          desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
+          desc.Width != backbuffer_desc_.Width || desc.Height != backbuffer_desc_.Height ||
+          desc.Format != backbuffer_desc_.Format || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+        return E_INVALIDARG;
+      auto *owned = static_cast<MTLD3D12Resource *>(source);
+      if (!owned->texture || !owned->texture->current())
+        return E_INVALIDARG;
+    }
     if (kind_ != DXMTSwapChainKind::Composition && !wsi::isWindow(hWnd))
       return DXGI_ERROR_INVALID_CALL;
     if (SyncInterval > 4)
@@ -1428,7 +1454,7 @@ public:
     if (!(PresentFlags & DXGI_PRESENT_ALLOW_TEARING) && std::isfinite(cadence) && cadence > 0)
       vsync_duration = std::max(SyncInterval / cadence, preferred_max_frame_rate > 0 ? 1.0 / cadence : 0);
 
-    auto &backbuffer = backbuffers_[current_buffer_];
+    auto *backbuffer = source ? static_cast<MTLD3D12Resource *>(source) : backbuffers_[current_buffer_].ptr();
     auto &present_queue = present_queues_[current_buffer_];
     if (present_history_) {
       composition.history = present_history_;
@@ -1446,7 +1472,7 @@ public:
                           ",\"index\":", current_buffer_,
                           ",\"resource\":", backbuffer->owned_id,
                           ",\"sync_interval\":", SyncInterval);
-    hr = present_queue->Present(this->presenter.ptr(), backbuffer.ptr(), present_semaphore_, vsync_duration,
+    hr = present_queue->Present(this->presenter.ptr(), backbuffer, present_semaphore_, vsync_duration,
                                 geometry, presentation_observer_, next_presentation_id_ + 1,
                                 presentation_observer_fault_, std::move(composition), do_not_wait, latency_,
                                 (PresentFlags & DXGI_PRESENT_RESTART) != 0, borrowed_credit, closes_frame);
