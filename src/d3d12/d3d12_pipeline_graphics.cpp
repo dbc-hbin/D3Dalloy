@@ -919,11 +919,7 @@ protected:
       info.alpha_to_coverage_enabled = false;
     }
     WMT::Reference<WMT::Error> err;
-    {
-      static std::mutex creation_mutex;
-      std::lock_guard<std::mutex> lock(creation_mutex);
-      variant.pso = CreateNativePipeline(info, err);
-    }
+    variant.pso = CreateNativePipeline(info, err);
     if (!variant.pso) {
       ERR("Failed to create mesh shader PSO: ", err ? err.description().getUTF8String() : "");
       return E_INVALIDARG;
@@ -1208,12 +1204,7 @@ protected:
     
     
     WMT::Reference<WMT::Error> err;
-    {
-      // Metal's mesh-pipeline compiler is not reentrant for these payload sizes (see D3D11 ts_global_mutex).
-      static std::mutex creation_mutex;
-      std::lock_guard<std::mutex> lock(creation_mutex);
-      variant.pso = CreateNativePipeline(info, err);
-    }
+    variant.pso = CreateNativePipeline(info, err);
     if (!variant.pso) {
       ERR("Failed to create mesh PSO: ", err ? err.description().getUTF8String() : "");
       return E_FAIL;

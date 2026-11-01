@@ -786,6 +786,17 @@ done
 
 2026-10-03 final evidence: `build/local/p3-20261003/runtime-01`의 manifest SHA-256은 `2ab82529f066ab6fc58c9cf36c3fa3c97398642026b41a1d903cf23c310cfff2`이다. `build/local/p3-20261003/mesh/final-mesh-shader-{x64,x86}/result.json`에서 두 guest ABI 모두 OPTIONS9 `derivatives=1`, full suite PASS, exit 0, `api-and-shader`, `validation_errors=[]`, owned native compiler 확인을 기록했다. 같은 stage의 `final-pipeline-cache-{x64,x86}/result.json`도 PASS이며 shared 64-byte sampler descriptor 변경 후 mesh sampling/cache 회귀가 없었다. 모든 output의 frozen inputs·로그·hashes를 보존하고, 정지한 test prefix만 제거했다. 이는 synthetic contract 증거이며 게임 호환성이나 strict no-Rosetta 증거가 아니다.
 
+Mesh PSO 동시 생성 확인(macOS 27.2 / Apple M5 Pro): D3D12의 mesh·GS·tessellation native PSO
+생성 전역 잠금을 제거했다. 같은 pipeline의 `GetMeshPipeline` variant 잠금과 cache의 동일 key
+single-flight는 유지한다. `build/local/par-20261105/meshmutex/build/local/mm/`의
+`probe-{novalidation,apivalidation}-tessgs.log`는 built libairconv를 사용한 mask `0x7`,
+16 threads·8 variants·10 rounds에서 실패와 shape mismatch가 모두 0이다.
+`mesh-val-{mine,base}`의 x64 full mesh suite는 둘 다 43 cases PASS다. 반면
+`mesh-noval-{mine,base}`는 둘 다 `ms_payload` PSO에서 `XPC_ERROR_CONNECTION_INTERRUPTED`와
+`as_payload`·`ms_statistics`·`ms_pso_cache` 3 case 실패를 보였다. 기존 serialized probe에서도
+발생한 compiler-service 문제이므로 동시성 회귀로 분류하거나 우회하지 않는다.
+이는 해당 OS/GPU의 synthetic 증거이며 다른 Apple compiler 버전의 안전성이나 게임 성능 향상을 보장하지 않는다.
+
 ### 전체 SR·public FG와 shader-cache 전용 recipe
 
 새 build/install/runtime/output만 사용한다. [README toolchain](../README.md#빌드)을 준비한 뒤 **현재 root source**를 `enable_fsr=true`와 NGX enabled로 빌드한다. Frozen import builder/patch 재적용은 이 경로가 아니다.

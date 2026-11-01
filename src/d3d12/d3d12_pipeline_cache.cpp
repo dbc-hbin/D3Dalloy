@@ -1051,7 +1051,7 @@ template <typename Info> std::shared_ptr<const NativePipelineArtifact> CreateNat
     cache.Operation(std::is_same_v<Info, WMTComputePipelineInfo> ? "native_compute" :
         std::is_same_v<Info, WMTRenderPipelineInfo> ? "native_render" : "native_mesh", key.key);
     // MTL4Compiler compiles concurrently; distinct keys must not serialize behind one device lock.
-    // Equal keys already single-flight in `cache.Get`, and mesh variants keep their own reentrancy lock.
+    // Equal keys already single-flight in `cache.Get`; mesh, GS and tessellation variants compile concurrently too.
     if constexpr (std::is_same_v<Info, WMTComputePipelineInfo>)
       value->compute = compiler.newComputePipelineState(info, value->error);
     else value->render = compiler.newRenderPipelineState(info, value->error);
