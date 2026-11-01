@@ -1487,8 +1487,16 @@ ResourceLowering::siteFromCreateHandleForLib(llvm::CallInst *call) {
   llvm::Value *symbol = call->getArgOperand(1);
   if (auto *load = llvm::dyn_cast<llvm::LoadInst>(symbol))
     symbol = load->getPointerOperand();
-  else if (auto *gep = llvm::dyn_cast<llvm::GEPOperator>(symbol))
+  /* A resource array element is `load (gep @array, 0, index)`; the element's
+   * register is the array's base register plus the index. */
+  llvm::Value *element = nullptr;
+  if (auto *gep = llvm::dyn_cast<llvm::GEPOperator>(symbol)) {
+    if (gep->getNumIndices() == 2)
+      element = gep->getOperand(2);
+    else if (gep->getNumIndices() != 1)
+      return createError("dxil: dx.op.createHandleForLib operand indexes a nested resource array");
     symbol = gep->getPointerOperand();
+  }
   symbol = symbol->stripPointerCasts();
 
   auto *global = llvm::dyn_cast<llvm::GlobalVariable>(symbol);
@@ -1539,6 +1547,11 @@ ResourceLowering::siteFromCreateHandleForLib(llvm::CallInst *call) {
   site.declaration_id = match->declaration_id;
   /* A library resource object refers to the base of its range. */
   site.index = builder.getInt32(match->lower_bound);
+  if (element) {
+    builder.SetInsertPoint(call);
+    element = builder.CreateZExtOrTrunc(element, builder.getInt32Ty());
+    site.index = builder.CreateAdd(site.index, element);
+  }
   site.record = match;
   site.name = match->name;
   return site;
