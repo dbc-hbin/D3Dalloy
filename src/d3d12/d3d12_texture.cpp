@@ -797,8 +797,13 @@ public:
       flags.set(TextureAllocationFlag::Shared);
       flags.set(TextureAllocationFlag::GpuPrivate);
       texture->rename(texture->allocate(flags));
-    } else
+    } else {
+      // A heap without CPU pages never exposes texture memory: Private storage lets MetalFX and
+      // other native consumers use it directly. CPU transfers go through TransferPrivateCpu.
+      if (!IsCpuVisibleHeap(&heap_props_))
+        flags.set(TextureAllocationFlag::CpuInvisible);
       texture->rename(texture->allocate(flags));
+    }
     if (!texture->current() || !texture->current()->texture())
       return shared && share ? E_INVALIDARG : E_OUTOFMEMORY;
     if (shared) {
@@ -1064,6 +1069,111 @@ public:
     return 0;
   };
 
+  /*
+   * CPU transfers for Private storage (committed textures on heaps without CPU pages). D3D12 defines
+   * WriteToSubresource/ReadFromSubresource only where Map succeeds; DXMT keeps accepting them on
+   * DEFAULT heaps by staging through a CPU-visible buffer and one synchronous blit, after which the
+   * bytes are visible to later GPU work and to the caller, as with the former direct CPU copy.
+   */
+  HRESULT
+  TransferPrivateCpu(bool upload, UINT level, UINT slice, const D3D12_BOX &box, void *data, UINT row_pitch,
+                     UINT slice_pitch, uint64_t row_bytes, uint64_t rows) {
+    // A tiled volume's atlas does not use logical texel coordinates.
+    if (desc_.SampleDesc.Count > 1 || texture->reservedVolumeLayoutAddress)
+      return E_INVALIDARG;
+    const auto storage = resource_contract::GetEmulatedTextureStorage(desc_.Format);
+    const bool emulated = storage != resource_contract::EmulatedTextureStorage::None;
+    const UINT width = box.right - box.left, height = box.bottom - box.top, depth = box.back - box.front;
+    const uint64_t native_row = emulated
+        ? uint64_t(width) * (storage == resource_contract::EmulatedTextureStorage::RGB32 ? 16u : 4u) : row_bytes;
+    const uint64_t native_rows = emulated ? height : rows;
+    const uint64_t image = native_row * native_rows;
+    auto metal = device_->GetMTLDevice();
+    if (image > UINT32_MAX || image * depth > metal.maxBufferLength())
+      return E_OUTOFMEMORY;
+
+    WMTBufferInfo info{};
+    info.length = image * depth;
+    info.options = WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked | WMT_RESOURCE_CPU_ADDRESSABLE;
+    auto staging = metal.newBuffer(info);
+    auto *bytes = static_cast<uint8_t *>(info.memory.get_accessible_or_null());
+    if (!staging || !bytes)
+      return E_OUTOFMEMORY;
+    auto *client = static_cast<uint8_t *>(data);
+    const bool floating_point = desc_.Format == DXGI_FORMAT_R32G32B32_FLOAT;
+    auto copy_rows = [&](bool to_staging) {
+      for (UINT z = 0; z < depth; ++z)
+        for (uint64_t row = 0; row < native_rows; ++row) {
+          uint8_t *app = client + uint64_t(z) * slice_pitch + row * row_pitch;
+          uint8_t *native = bytes + z * image + row * native_row;
+          if (emulated)
+            ConvertEmulatedCpuRow(storage, to_staging, floating_point, to_staging ? app : native,
+                                  to_staging ? native : app, width);
+          else
+            memcpy(to_staging ? native : app, to_staging ? app : native, row_bytes);
+        }
+    };
+    if (upload)
+      copy_rows(true);
+    {
+      auto execution = device_->gpu_execution_gate.AcquireShared();
+      if (!execution)
+        return DXGI_ERROR_DEVICE_REMOVED;
+      auto queue = device_->GetSparseMappingQueue();
+      auto allocator = metal.newMTL4CommandAllocator();
+      auto command = metal.newMTL4CommandBuffer();
+      if (!queue || !allocator || !command)
+        return E_OUTOFMEMORY;
+      command.begin(allocator);
+      command.useResidencySet(device_->GetGlobalResidencySet());
+      auto encoder = command.blitCommandEncoder();
+      const WMTOrigin origin{box.left, box.top, box.front};
+      const WMTSize size{width, height, depth};
+      if (upload) {
+        wmtcmd_blit_copy_from_buffer_to_texture copy{};
+        copy.type = WMTBlitCommandCopyFromBufferToTexture;
+        copy.src = staging;
+        copy.bytes_per_row = uint32_t(native_row);
+        copy.bytes_per_image = uint32_t(image);
+        copy.size = size;
+        copy.dst = texture->current()->texture();
+        copy.slice = slice;
+        copy.level = level;
+        copy.origin = origin;
+        encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+      } else {
+        wmtcmd_blit_copy_from_texture_to_buffer copy{};
+        copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+        copy.src = texture->current()->texture();
+        copy.slice = slice;
+        copy.level = level;
+        copy.origin = origin;
+        copy.size = size;
+        copy.dst = staging;
+        copy.bytes_per_row = uint32_t(native_row);
+        copy.bytes_per_image = uint32_t(image);
+        encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+      }
+      encoder.endEncoding();
+      command.end();
+      WMT::Reference<WMT::MTL4Submission> submission;
+      {
+        // The sparse mapping queue orders Apply with its completion signal under this mutex.
+        std::lock_guard<std::mutex> mapping_lock(ReservedResource::MappingQueueMutex);
+        const WMT::MTL4CommandBuffer buffer = command;
+        submission = device_->CommitMetal4CommandBuffers(queue, &buffer, 1);
+      }
+      if (!submission)
+        return E_FAIL;
+      submission.waitUntilCompleted();
+      if (submission.error())
+        return E_FAIL;
+    }
+    if (!upload)
+      copy_rows(false);
+    return S_OK;
+  }
+
   virtual HRESULT STDMETHODCALLTYPE
   WriteToSubresource(
       UINT DstSubresource, const D3D12_BOX *pDstBox, const void *pSrcData, UINT SrcRowPitch, UINT SrcSlicePitch
@@ -1090,6 +1200,9 @@ public:
           static_cast<const uint8_t *>(pSrcData), static_cast<uint8_t *>(buffer->current()->mappedMemory(0)),
           SrcRowPitch, SrcSlicePitch, true);
     }
+    if (texture->current()->flags().test(TextureAllocationFlag::GpuPrivate))
+      return TransferPrivateCpu(true, Level, Slice, box, const_cast<void *>(pSrcData), SrcRowPitch, SrcSlicePitch,
+                                row_bytes, rows);
 
     const auto storage = resource_contract::GetEmulatedTextureStorage(desc_.Format);
     if (storage != resource_contract::EmulatedTextureStorage::None) {
@@ -1158,6 +1271,8 @@ public:
           static_cast<const uint8_t *>(buffer->current()->mappedMemory(0)), static_cast<uint8_t *>(pDstData),
           DstRowPitch, DstSlicePitch, false);
     }
+    if (texture->current()->flags().test(TextureAllocationFlag::GpuPrivate))
+      return TransferPrivateCpu(false, Level, Slice, box, pDstData, DstRowPitch, DstSlicePitch, row_bytes, rows);
 
     const auto storage = resource_contract::GetEmulatedTextureStorage(desc_.Format);
     if (storage != resource_contract::EmulatedTextureStorage::None) {
