@@ -141,6 +141,11 @@ MTLD3D12CommandAllocatorImpl::Reset() try {
     free(chunk.memory);
   }
   gpu_heap_chunks_.resize(keep);
+  // Retired with the heap: every table may be rebound. Drop pipelines this allocator stopped dispatching.
+  std::erase_if(dispatch_intersection_tables_,
+                [&](const auto &entry) { return gpu_heap_epoch_ - entry.last_used_epoch > 50; });
+  for (auto &entry : dispatch_intersection_tables_)
+    entry.used = 0;
   owned_graphics::Trace("root_upload_reset", ",\"allocator\":", trace_id_, ",\"epoch\":", gpu_heap_epoch_,
                         ",\"accepted\":1,\"reason\":\"retired\",\"retained_bytes\":", retained, ",\"chunks\":", keep);
   return S_OK;

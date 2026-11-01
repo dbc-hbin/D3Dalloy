@@ -449,7 +449,7 @@ class MTLD3D12StateObjectImpl final
   /**
    * What the state object's intersection function table is built from, kept so a
    * dispatch can build its own table with the same functions but its own dispatch
-   * arguments block (see CreateDispatchIntersectionFunctionTable). Hardware slots
+   * arguments block (see BindDispatchIntersectionFunctionTable). Hardware slots
    * select triangle or bounding-box callbacks; GPU SBT records select hit groups.
    */
   uint32_t intersection_callback_slots_ = 0;
@@ -2357,33 +2357,35 @@ public:
     return intersection_table_;
   }
   /**
-   * A table for one dispatch, built from the same functions as the state object's
-   * own but with the dispatch's argument block in its buffer argument table.
+   * A table for one dispatch, with the same functions as the state object's own but
+   * with the dispatch's argument block in its buffer argument table.
    *
    * The state object's table is shared and immutable, so a dispatch that needs the
-   * callback to see per-dispatch constants cannot bind them into it. This builds
-   * the equivalent table instead: the shared callbacks keep their fixed geometry
-   * slots, and the dispatch arguments block is bound at
-   * SM50_RT_BINDING_INDEX_DISPATCH together with the visible function table a hit
-   * shader reached from here calls through.
+   * callback to see per-dispatch constants cannot bind them into it. This uses an
+   * equivalent table instead: the shared callbacks keep their fixed geometry slots,
+   * and the dispatch arguments block is bound at SM50_RT_BINDING_INDEX_DISPATCH
+   * together with the visible function table a hit shader reached from here calls
+   * through. A reused table already holds this pipeline's callbacks.
    */
-  WMT::Reference<WMT::IntersectionFunctionTable> CreateDispatchIntersectionFunctionTable(
-      WMT::Buffer arguments, uint64_t arguments_offset,
+  bool BindDispatchIntersectionFunctionTable(
+      WMT::Reference<WMT::IntersectionFunctionTable> &table, WMT::Buffer arguments, uint64_t arguments_offset,
       WMT::Reference<WMT::VisibleFunctionTable> visible_function_table
   ) override {
     if (intersection_function_handles_.empty() || !intersection_callback_slots_)
-      return {};
-    auto table = pipeline_state_.newIntersectionFunctionTable(intersection_callback_slots_);
+      return false;
     if (!table) {
-      ERR("RT dispatch intersection function table creation failed");
-      return {};
+      table = pipeline_state_.newIntersectionFunctionTable(intersection_callback_slots_);
+      if (!table) {
+        ERR("RT dispatch intersection function table creation failed");
+        return false;
+      }
+      for (const auto &[slot, handle] : intersection_function_handles_)
+        table.setFunction(handle, slot);
     }
-    for (const auto &[slot, handle] : intersection_function_handles_)
-      table.setFunction(handle, slot);
     table.setBuffer(arguments, arguments_offset, SM50_RT_BINDING_INDEX_DISPATCH);
     if (visible_function_table)
       table.setVisibleFunctionTable(visible_function_table, SM50_RT_BINDING_INDEX_VISIBLE_FUNCTION_TABLE);
-    return table;
+    return true;
   }
   WMT::Reference<WMT::VisibleFunctionTable> GetVisibleFunctionTable() const override {
     return visible_function_table_;
