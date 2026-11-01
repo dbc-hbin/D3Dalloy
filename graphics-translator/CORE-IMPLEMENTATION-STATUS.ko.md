@@ -36,7 +36,20 @@
 
 병합된 main(`e9b381d` 이후)을 ARM64X/FEX x64에서 API+Shader Validation으로 돌린 43개 matrix는 41개 PASS이고, 실패는 기존 fsr·temporal뿐이다(`build/local/merge-20261102`).
 
-도시 진입은 확인하지 못했다. 복제본에서 측정 runtime은 world load 뒤 로딩 화면에서 UnityPlayer null+8 read로 종료했고, 변경 전 runtime은 Start 뒤 보고 없이 종료했으며, 세 번째 실행은 로딩 화면에서 9분간 멈췄다. 따라서 이 종료를 이번 변경에 귀속하지 않으며 원인은 미해결이다.
+도시 진입은 확인하지 못했다. 복제본에서 측정 runtime은 world load 뒤 로딩 화면에서 UnityPlayer null+8 read로 종료했고, 변경 전 runtime은 Start 뒤 보고 없이 종료했으며, 세 번째 실행은 로딩 화면에서 9분간 멈췄다. 따라서 이 종료를 이번 변경에 귀속하지 않는다. 원인은 아래 TLAS prebuild 수정으로 해결했다.
+
+## ZZZ 도시 레이트레이싱 수정 — 2026-11-02
+
+**상태: 도시 진입과 초록색 조명은 고쳤고, 레이트레이싱 threadgroup 수정은 GPU fixture에서 검증했다. ZZZ FPS 변화는 측정하지 않았다.**
+
+- **TLAS prebuild:** `GetRaytracingAccelerationStructurePrebuildInfo`가 null `InstanceDescs`를 거부해 크기가 0으로 돌아왔다. D3D12MA가 Width=`UINT64_MAX` 버퍼를 할당하다 실패했고, 그 뒤 UnityPlayer가 null+8을 읽어 종료했다. Prebuild는 GPU 메모리를 읽지 않으므로 null을 허용한다(`d3d12_acceleration_structure.cpp`, fixture에 회귀 검사 추가).
+- **Library 리소스 배열:** `dx.op.createHandleForLib`의 operand가 리소스 배열 원소(`load (gep @array, 0, index)`)이면 RT 파이프라인 생성이 실패했다. 게임은 레이트레이싱을 건너뛰었고 조명이 초록색으로 보였다. 이제 원소 index를 배열의 base register에 더한다(`dxil_resources.cpp`).
+- **Raygen threadgroup (`AIRCONV_VERSION=47`):** traversal kernel이 threadgroup당 1 thread로 실행돼 SIMD 32 lane 중 31개가 놀았다. 도시 HUD의 GPU 시간은 프레임당 103ms였다(로딩 화면 9.4ms). 이제 raygen의 max work group을 `SM50_RT_RAYGEN_THREADGROUP_SIZE`(64)로 두고, pipeline의 `maxTotalThreadsPerThreadgroup`보다 작은 2의 거듭제곱을 쓴다. 높이가 1인 grid는 64×1, 그 외 grid와 ExecuteIndirect slot은 8×8로 실행한다. Grid를 넘는 thread는 prologue에서 반환한다. Predication과 `dxmt_rays_indirect`는 threadgroup 개수(올림)를 쓴다. Invocation block은 thread별 alloca여서 threadgroup 공유 상태가 없다.
+
+검증(ARM64X/FEX x64, API+Shader Validation, 증거 `build/local/rtgroup-20261102`):
+- `raytracing`: PASS(16/16 case). Native trace에서 RT dispatch가 8×8·64×1로 나간 것을 확인했다.
+- `predication-indirect`: PASS.
+- `raytracing-atomic64`: FAIL. 변경 전 runtime(`rtfix-20261102`)도 같은 세 case(lanes=64, EXT mode 0/1)에서 FAIL이므로 회귀가 아니다. 출력 word는 다르다.
 
 ## 확정 저위험 최적화와 남은 Rust 경계 — 2026-11-01
 
