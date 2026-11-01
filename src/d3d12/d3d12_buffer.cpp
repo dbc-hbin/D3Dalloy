@@ -122,9 +122,12 @@ public:
         buffer->rename(buffer->allocate(flags, pHeap->host_memory + Offset));
       else
 #endif
-      if (pHeap)
+      if (pHeap) {
+        // A heap without CPU pages is Private (see MTLD3D12HeapImpl::Initialize); Map rejects such buffers.
+        if (!IsCpuVisibleHeap(&heap_props_))
+          flags.set(BufferAllocationFlag::CpuInvisible);
         buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
-      else
+      } else
         buffer->rename(buffer->allocate(flags));
     }
     if (!buffer->current() || !buffer->current()->buffer())

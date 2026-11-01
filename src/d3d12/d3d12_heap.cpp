@@ -138,9 +138,14 @@ public:
       return E_INVALIDARG;
 
     WMTHeapInfo info = {};
-    // Shared storage (CPU-visible on Apple unified memory); GPU upload heaps are CPU-write-combined.
-    info.options = desc_.Properties.Type == kHeapTypeGpuUpload ? WMTResourceOptionCPUCacheModeWriteCombined
-                                                               : WMTResourceOptions{};
+    // CPU-visible heaps use Shared storage (CPU-visible on Apple unified memory); GPU upload heaps are
+    // CPU-write-combined. A heap without CPU pages is Private: none of its placed resources can be mapped,
+    // and each requests the heap's storage mode (Metal rejects a mismatch). Placement sizes and alignments
+    // do not depend on the storage mode, so GetResourceAllocationInfo stays valid for either heap.
+    if (desc_.Properties.Type == kHeapTypeGpuUpload)
+      info.options = WMTResourceOptionCPUCacheModeWriteCombined;
+    else if (!IsCpuVisibleHeap(&desc_.Properties))
+      info.options = WMTResourceStorageModePrivate;
     info.size = size_aligned;
     info.sparse_page_size = WMTSparsePageSize16;
     info.type = WMTHeapTypePlacement;

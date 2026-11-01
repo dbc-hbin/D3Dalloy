@@ -73,9 +73,11 @@ public:
     else if (heap && heap->host_memory)
       buffer->rename(buffer->allocate(flags, heap->host_memory + offset));
 #endif
-    else if (heap)
+    else if (heap) {
+      // Feedback maps live only on heaps without CPU pages, which are Private (MTLD3D12HeapImpl::Initialize).
+      flags.set(BufferAllocationFlag::CpuInvisible);
       buffer->rename(buffer->allocate(flags, heap->heap, offset));
-    else
+    } else
       buffer->rename(buffer->allocate(flags)); // a new Metal buffer is zero filled: created cleared
     if (!buffer->current() || !buffer->current()->buffer())
       return E_OUTOFMEMORY;

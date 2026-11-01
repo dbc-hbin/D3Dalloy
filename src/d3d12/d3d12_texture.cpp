@@ -652,9 +652,12 @@ public:
       buffer->rename(buffer->allocate(buffer_flags,pHeap->external_memory+heap_offset));
     else if (volume && share)
       buffer->rename(buffer->allocate(buffer_flags,share->payload()));
-    else if (pHeap)
+    else if (pHeap) {
+      // A heap without CPU pages is Private (MTLD3D12HeapImpl::Initialize); Map and CPU transfers reject it.
+      if (!IsCpuVisibleHeap(&heap_props_))
+        buffer_flags.set(BufferAllocationFlag::CpuInvisible);
       buffer->rename(buffer->allocate(buffer_flags, pHeap->heap, heap_offset));
-    else
+    } else
       buffer->rename(buffer->allocate(buffer_flags));
     if (!buffer->current() || !buffer->current()->buffer())
       return E_OUTOFMEMORY;
@@ -788,6 +791,11 @@ public:
       return E_OUTOFMEMORY;
     }
     Flags<TextureAllocationFlag> flags = {};
+    // A heap without CPU pages never exposes texture memory, so the texture can be Private: committed ones
+    // choose it, placed ones must match their heap, which is Private then (MTLD3D12HeapImpl::Initialize).
+    // MetalFX and other native consumers use it directly; CPU transfers go through TransferPrivateCpu.
+    if (!shared && !IsCpuVisibleHeap(&heap_props_))
+      flags.set(TextureAllocationFlag::CpuInvisible);
     if (pHeap)
       texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
     else if (shared && share)
@@ -797,13 +805,8 @@ public:
       flags.set(TextureAllocationFlag::Shared);
       flags.set(TextureAllocationFlag::GpuPrivate);
       texture->rename(texture->allocate(flags));
-    } else {
-      // A heap without CPU pages never exposes texture memory: Private storage lets MetalFX and
-      // other native consumers use it directly. CPU transfers go through TransferPrivateCpu.
-      if (!IsCpuVisibleHeap(&heap_props_))
-        flags.set(TextureAllocationFlag::CpuInvisible);
+    } else
       texture->rename(texture->allocate(flags));
-    }
     if (!texture->current() || !texture->current()->texture())
       return shared && share ? E_INVALIDARG : E_OUTOFMEMORY;
     if (shared) {
