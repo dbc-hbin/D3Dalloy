@@ -2,7 +2,7 @@
 
 ## 현재 소스 빌드
 
-**현재 개발의 기준은 저장소 루트 소스이며, 빌드 명령의 기준은 [README.md](../README.md#빌드)다.** LLVM/Wine SDK 설정은 [DEVELOPMENT.md](../doc/DEVELOPMENT.md), 설치 결과의 격리 스테이징은 [RUNTIME.ko.md](RUNTIME.ko.md), fixture 실행은 [SMOKE-TEST.ko.md](SMOKE-TEST.ko.md)를 사용한다.
+**현재 개발의 기준은 저장소 루트 소스이며, 빌드 명령의 기준은 [README.md](../README.md#building)다.** LLVM/Wine SDK 설정은 [DEVELOPMENT.md](../doc/DEVELOPMENT.md), 설치 결과의 격리 스테이징은 [RUNTIME.ko.md](RUNTIME.ko.md), fixture 실행은 [SMOKE-TEST.ko.md](SMOKE-TEST.ko.md)를 사용한다.
 
 `src/` 변경을 `graphics-translator/patches/`로 역수출하지 않는다. `upstream.lock.json`, frozen patches, `doc/provenance`는 import 출처 기록이며 현재 소스에 맞춰 갱신할 대상이 아니다. `scripts/build-owned-graphics.py`는 **현재 루트 소스를 빌드하지 않는다**. 이 스크립트로 성공한 baseline을 최신 Metal 4·DXR·ARM64 Wine/FEX 구현의 빌드/검증 결과로 보고하면 안 된다.
 

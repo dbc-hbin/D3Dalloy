@@ -2,7 +2,7 @@
 
 ## 문서 범위와 판정
 
-현재 소스 빌드는 [README.md](../README.md#빌드), LLVM/Wine SDK와 debug controls는 [DEVELOPMENT.md](../doc/DEVELOPMENT.md), staging은 [RUNTIME.ko.md](RUNTIME.ko.md)가 기준이다. 여기서는 **현재 fixture를 다시 빌드해 새 private runtime·prefix에서 실행하는 방법**과 기록된 관측을 분리한다. 아래 명령은 반복 절차이며 실행한 named result만 PASS 증거다. 새 P0 공개 계약·VRS/sharing 결과는 [CORE P0 ledger](CORE-IMPLEMENTATION-STATUS.ko.md#p0-공개-계약-정합)를 따른다.
+현재 소스 빌드는 [README.md](../README.md#building), LLVM/Wine SDK와 debug controls는 [DEVELOPMENT.md](../doc/DEVELOPMENT.md), staging은 [RUNTIME.ko.md](RUNTIME.ko.md)가 기준이다. 여기서는 **현재 fixture를 다시 빌드해 새 private runtime·prefix에서 실행하는 방법**과 기록된 관측을 분리한다. 아래 명령은 반복 절차이며 실행한 named result만 PASS 증거다. 새 P0 공개 계약·VRS/sharing 결과는 [CORE P0 ledger](CORE-IMPLEMENTATION-STATUS.ko.md#p0-공개-계약-정합)를 따른다.
 
 지원 matrix·검증 경계는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거), 미완료 작업·실행 선택은 [PRIORITIES](IMPLEMENTATION-PRIORITIES.ko.md), 날짜별 관찰은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에서 관리한다. 과거 완료한 P0–P3 개발 단계와 새 backlog P0–P4는 다르다. Named acceptance·mixed-cut recovery를 전체 conformance나 최신 단일cut 실행으로 읽지 않는다.
 
@@ -806,7 +806,7 @@ single-flight는 유지한다. `build/local/par-20261105/meshmutex/build/local/m
 
 ### 전체 SR·public FG와 shader-cache 전용 recipe
 
-새 build/install/runtime/output만 사용한다. [README toolchain](../README.md#빌드)을 준비한 뒤 **현재 root source**를 `enable_fsr=true`와 NGX enabled로 빌드한다. Frozen import builder/patch 재적용은 이 경로가 아니다.
+새 build/install/runtime/output만 사용한다. [README toolchain](../README.md#building)을 준비한 뒤 **현재 root source**를 `enable_fsr=true`와 NGX enabled로 빌드한다. Frozen import builder/patch 재적용은 이 경로가 아니다.
 
 ```sh
 export LLVM_MINGW=/opt/llvm-mingw-20260616-ucrt-macos-universal/bin

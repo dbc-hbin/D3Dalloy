@@ -6,7 +6,7 @@
 | --- | --- |
 | 현재 지원·검증 한계 | [CORE](../graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md) |
 | 남은 구현·성능 검증 | [PRIORITIES](../graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md) |
-| 빌드·도구·디버깅 | [루트 빌드 절차](../README.md#빌드), [DEVELOPMENT](DEVELOPMENT.md) |
+| 빌드·도구·디버깅 | [루트 빌드 절차](../README.md#building), [DEVELOPMENT](DEVELOPMENT.md) |
 | 설정과 적용 범위 | [CUSTOMIZATION](CUSTOMIZATION.md) |
 | 외부 Wine/FEX와 ARM64 통합 | [ARM64-FEX-IMPLEMENTATION](ARM64-FEX-IMPLEMENTATION.md) |
 | 완료된 R1~R6 수정·R7 계측과 남은 계약 | [리뷰 후속 결과](D3D12-REVIEW-AND-DESIGN-2026-10-07.md) |

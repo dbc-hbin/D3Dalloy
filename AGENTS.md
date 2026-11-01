@@ -40,7 +40,7 @@ Edit root `src/` directly. `README.md` describes the current workflow; `graphics
 
 ## Development Commands
 
-Use [README: build](README.md#빌드) for current root-source build/install commands, [Runtime](graphics-translator/RUNTIME.ko.md) for fresh staging and architecture/module selection, and [Smoke test](graphics-translator/SMOKE-TEST.ko.md) for fixture compilation, CPU/tooling checks and isolated GPU execution. Do not keep a second recipe here.
+Use [README: build](README.md#building) for current root-source build/install commands, [Runtime](graphics-translator/RUNTIME.ko.md) for fresh staging and architecture/module selection, and [Smoke test](graphics-translator/SMOKE-TEST.ko.md) for fixture compilation, CPU/tooling checks and isolated GPU execution. Do not keep a second recipe here.
 
 Current support and evidence belong in [CORE](graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md); pending work belongs in [PRIORITIES](graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md). [HISTORY](graphics-translator/IMPLEMENTATION-HISTORY.ko.md) is a compact evidence index, not a task queue. Do not recreate session handoffs or duplicate mutable progress here. The current source review and implementation ledger is [the 2026-10-07 review](doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md).
 

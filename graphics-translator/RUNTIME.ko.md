@@ -1,6 +1,6 @@
 # Owned graphics runtime 스테이징 계약
 
-현재 루트 소스의 빌드 기준은 [README.md](../README.md#빌드)다. 이 문서는 **같은 빌드 세대의 graphics module 전체**를 caller가 제공한 Wine의 새 사본에 stage하는 계약을 설명한다. 게임 설치·live prefix 변경은 포함하지 않는다. 기능 지원과 실제 실행 경계는 [CORE-IMPLEMENTATION-STATUS.ko.md](CORE-IMPLEMENTATION-STATUS.ko.md), fixture 실행은 [SMOKE-TEST.ko.md](SMOKE-TEST.ko.md)를 참조한다.
+현재 루트 소스의 빌드 기준은 [README.md](../README.md#building)다. 이 문서는 **같은 빌드 세대의 graphics module 전체**를 caller가 제공한 Wine의 새 사본에 stage하는 계약을 설명한다. 게임 설치·live prefix 변경은 포함하지 않는다. 기능 지원과 실제 실행 경계는 [CORE-IMPLEMENTATION-STATUS.ko.md](CORE-IMPLEMENTATION-STATUS.ko.md), fixture 실행은 [SMOKE-TEST.ko.md](SMOKE-TEST.ko.md)를 참조한다.
 
 ## 아키텍처와 schema 2
 

@@ -1,6 +1,6 @@
 # Development, toolchains and debugging
 
-Use the [root README](../README.md#빌드) to build current root sources, [RUNTIME](../graphics-translator/RUNTIME.ko.md) to stage them, and [SMOKE](../graphics-translator/SMOKE-TEST.ko.md) to run fixtures. Current support and pending work belong in [CORE](../graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md) and [PRIORITIES](../graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md).
+Use the [root README](../README.md#building) to build current root sources, [RUNTIME](../graphics-translator/RUNTIME.ko.md) to stage them, and [SMOKE](../graphics-translator/SMOKE-TEST.ko.md) to run fixtures. Current support and pending work belong in [CORE](../graphics-translator/CORE-IMPLEMENTATION-STATUS.ko.md) and [PRIORITIES](../graphics-translator/IMPLEMENTATION-PRIORITIES.ko.md).
 
 ## Prerequisites
 

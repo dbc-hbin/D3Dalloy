@@ -10,4 +10,4 @@ DXMT의 `build/local/`에는 10월9일의 `zzz-ngx-enrollment-20261009`, `zzz-dl
 
 `build/owned-*`, `build/legacy/`, `build/retired-evidence/`, 과거 FG/RR·SDK05·review 결과와 `build/local/repo-cleanup-20261008/originals/`는 현재 없다. 과거 작은 로그/JSON을 옮겨 보존했다는 기록은 당시 조치이며 지금도 파일이 있다는 뜻이 아니다. 문서의 PASS와 경로만으로 새 실행·원본 보유를 주장하지 않는다.
 
-현재 빌드·입력은 [루트 README](../../README.md#빌드)와 [ARM64/Wine/FEX 안내](../ARM64-FEX-IMPLEMENTATION.md)를 따른다. 이관 전 게임/Wine 작업 폴더는 현재 DXMT 빌드 입력이 아니다.
+현재 빌드·입력은 [루트 README](../../README.md#building)와 [ARM64/Wine/FEX 안내](../ARM64-FEX-IMPLEMENTATION.md)를 따른다. 이관 전 게임/Wine 작업 폴더는 현재 DXMT 빌드 입력이 아니다.
