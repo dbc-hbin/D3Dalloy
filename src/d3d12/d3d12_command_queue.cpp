@@ -177,13 +177,17 @@ bool ResolveSubmissionDescriptorBudget(SubmissionNode &node, uint64_t count) {
 
 // With access_only, only restrictions that leave resource accesses unproven
 // reject; descriptor-only merge restrictions (read-only DSV, layered or
-// offset attachments, sample pattern, depth bounds, attachmentless passes)
+// offset attachments, sample pattern, depth bounds, attachmentless passes,
+// opaque recording endpoints)
 // keep exact access summaries and are rejected for merging alone.
 const char *OrdinaryRenderRejection(const RenderEncoderData &render, MTLD3D12Device *device, bool access_only = false) {
   if (render.submission_root_srv_opaque) return "unresolved_root_srv";
   if (render.submission_snapshot_budget) return "recorded_buffer_budget";
   if (!render.submission_group_safe) return "shader_or_state_unresolved";
-  if (render.endpoint_reason == RecordedEndpointReason::Opaque) return "opaque_endpoint";
+  // The pass's own accesses do not depend on why recording closed it. The
+  // opaque endpoint still forces boundary_after, so the next node resets
+  // in-flight tracking and keeps its fence wait (draining a skipped one).
+  if (!access_only && render.endpoint_reason == RecordedEndpointReason::Opaque) return "opaque_endpoint";
   // Native MSAA passes always carry their explicit or center sample pattern;
   // that is pass-descriptor state, not an untracked resource access.
   const bool native_msaa = render.native_msaa_sample_count > 1;
