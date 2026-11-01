@@ -2,9 +2,13 @@
 
 기준일: **2026-10-10**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
 
+## 2026-11-03 후속
+
+도시 진입은 [TLAS prebuild·library 리소스 배열 수정](CORE-IMPLEMENTATION-STATUS.ko.md#zzz-도시-레이트레이싱-수정--2026-11-02)으로 해결했다. 남은 일: 레이트레이싱 threadgroup 수정 뒤 도시 구간 FPS·GPU 시간 측정, placed heap aliasing을 포함한 opaque 노드의 접근 모델(`ResolveTextureRegion`·allocator heap 소스·MSAA capture), FSR FG pacing jitter, `raytracing-atomic64` 기존 실패 3 case, 나머지 d3dalloy 이름(D3D11/DXGI·`dxmt.conf`·`DXMT_*` 설정·내부 이름·모듈 이름).
+
 ## 2026-11-02 후속
 
-[ZZZ 실측](CORE-IMPLEMENTATION-STATUS.ko.md#zzz-실측과-측정-기반-후속--2026-11-02) 기준 남은 일: 격리 복제본에서 도시 진입 실패(UnityPlayer null+8 종료·무보고 종료·로딩 정지)의 원인 확인과 도시 구간 재측정, ZZZ 프레임당 opaque 노드 약 100개(render merge 거부·불완전 clear/blit 접근)의 원인 축소, view-pool residency 순회(프레임당 약 820회), placed DEFAULT 텍스처의 Private storage, FSR FG pacing jitter와 동일 장면 FPS 측정, `run-command-recording-cpu.py` 컴파일 오류.
+[ZZZ 실측](CORE-IMPLEMENTATION-STATUS.ko.md#zzz-실측과-측정-기반-후속--2026-11-02) 기준 남은 일 중 view-pool 순회, placed DEFAULT 텍스처 Private storage, SR output shadow, opaque endpoint, `run-command-recording-cpu.py`는 2026-11-03에 처리했다. 나머지는 위 2026-11-03 목록에 합쳤다.
 
 ## 2026-11-01 후속
 

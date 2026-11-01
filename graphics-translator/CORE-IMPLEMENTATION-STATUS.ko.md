@@ -38,6 +38,17 @@
 
 도시 진입은 확인하지 못했다. 복제본에서 측정 runtime은 world load 뒤 로딩 화면에서 UnityPlayer null+8 read로 종료했고, 변경 전 runtime은 Start 뒤 보고 없이 종료했으며, 세 번째 실행은 로딩 화면에서 9분간 멈췄다. 따라서 이 종료를 이번 변경에 귀속하지 않는다. 원인은 아래 TLAS prebuild 수정으로 해결했다.
 
+## 남은 측정 후보 적용과 d3dalloy 이름 — 2026-11-03
+
+**상태: ARM64X/FEX x64 GPU matrix에서 base와 같은 판정이다. ZZZ FPS는 측정하지 않았다.**
+
+- **View pool:** 기록마다 모든 parent texture를 순회하던 것을 pool의 멤버가 바뀔 때만 snapshot을 다시 만들고, 기록은 그 snapshot 하나를 lease한다. bindless에서 parent 순회가 532회에서 33회로 줄었다. Residency 추가·제거는 여전히 GPU retirement 뒤에만 일어난다.
+- **Placed 리소스 storage:** CPU 페이지가 없는 heap과 그 heap의 placed 리소스를 Private로 만들었다(위 2026-11-02 Storage 항목).
+- **SR output shadow:** 출력 rect 크기가 scaler 출력과 같으면 `outputOffset`으로 앱 텍스처에 직접 쓴다. SR suite의 shadow가 186회에서 17회로 줄었다.
+- **Opaque endpoint:** `EndQuery`·`BeginQuery`·`WriteBufferImmediate`로 끝난 render pass도 접근 집합을 추적한다. 뒤 노드의 경계와 merge 금지는 그대로다. traced suite에서 opaque 노드가 204개에서 192개로 줄었다. 남은 opaque 대부분(`ResolveTextureRegion`·alias flush·allocator heap 소스·MSAA capture·placed heap aliasing)은 새 접근 모델이 필요해 하지 않았다.
+- **command recording CPU probe:** 현재 class layout에 맞춰 다시 통과한다.
+- **이름:** Metal HUD 제목은 `D3DAlloy D3D12 FL_…`, HUD label key는 `com.github.d3dalloy.*`다. 업스트림 DXMT와 같은 prefix에서 함께 쓰여도 충돌하지 않도록 D3D12 공유 section(`Local\d3dalloy.share.*`·`d3dalloy.d3d12.*`·`d3dalloy.fence.*`), Mach bootstrap 이름, 공유 salt 디렉터리(`d3dalloy-share`), 자동 PSO/stage cache 파일·mutex(`d3dalloy-pso-*`·`d3dalloy-stage-*`·`d3dalloy-shader-sessions`), shader-cache session 파일(`d3dalloy-sc-*`), D3D12 thread 이름과 로그 문구, 셰이더 실패 기록 환경변수(`D3DALLOY_SHADER_FAILURE_PATH`)를 바꿨다. 기존 `dxmt-*` 캐시는 더 읽지 않으므로 한 번 다시 컴파일된다. D3D11/DXGI·`dxmt.conf`·`DXMT_*` 설정·내부 namespace/파일명·모듈 이름은 아직 그대로다.
+
 ## ZZZ 도시 레이트레이싱 수정 — 2026-11-02
 
 **상태: 도시 진입과 초록색 조명은 고쳤고, 레이트레이싱 threadgroup 수정은 GPU fixture에서 검증했다. ZZZ FPS 변화는 측정하지 않았다.**
