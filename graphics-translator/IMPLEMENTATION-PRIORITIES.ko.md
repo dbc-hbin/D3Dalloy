@@ -2,9 +2,13 @@
 
 기준일: **2026-10-10**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
 
+## 2026-11-02 후속
+
+[ZZZ 실측](CORE-IMPLEMENTATION-STATUS.ko.md#zzz-실측과-측정-기반-후속--2026-11-02) 기준 남은 일: 격리 복제본에서 도시 진입 실패(UnityPlayer null+8 종료·무보고 종료·로딩 정지)의 원인 확인과 도시 구간 재측정, ZZZ 프레임당 opaque 노드 약 100개(render merge 거부·불완전 clear/blit 접근)의 원인 축소, view-pool residency 순회(프레임당 약 820회), placed DEFAULT 텍스처의 Private storage, SR output shadow의 출력 rect 조건, FSR FG pacing jitter와 동일 장면 FPS 측정, `run-command-recording-cpu.py` 컴파일 오류.
+
 ## 2026-11-01 후속
 
-[2026-11-01 저위험 최적화·Rust 경계](CORE-IMPLEMENTATION-STATUS.ko.md#확정-저위험-최적화와-남은-rust-경계--2026-11-01) 이후 남은 일: HEAD에서 생긴 bindless·dxil의 Shader Validation null-address load(`AIRCONV_VERSION=45` bounded load 의심) 조사, trace 수집이 필요한 후보(heap view-pool residency 순회, reserved 리소스 commit 분할, Present/Temporal `MarkUntracked`, IB 범위 병합, DEFAULT heap 텍스처 Private storage, table CBV select), FSR FG pacing jitter와 동일 장면 FPS 측정, `run-command-recording-cpu.py` 컴파일 오류(`async_targets_epoch_`).
+[2026-11-01 저위험 최적화·Rust 경계](CORE-IMPLEMENTATION-STATUS.ko.md#확정-저위험-최적화와-남은-rust-경계--2026-11-01) 이후 남은 일 중 bindless·dxil null-address load, table CBV select, committed DEFAULT 텍스처 Private storage는 2026-11-02에 처리했고, IB 범위 병합·reserved 분할·Present `MarkUntracked`는 ZZZ 실측에서 효과가 없어 보류했다. 나머지는 위 2026-11-02 목록에 합쳤다.
 
 ## 2026-10-31 최적화 묶음 후속
 

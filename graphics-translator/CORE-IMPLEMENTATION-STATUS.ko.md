@@ -22,6 +22,22 @@
 
 현재 판정에 필요한 runtime033–044의 실패/성공 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)에 남긴다. 과거 paused/resumed 실행 지시와 중복 인수인계는 삭제했다. 최신 상태를 과거 실패로 되돌리거나 보존된 PASS를 현재 변경의 재검증으로 바꾸지 않는다. Agility SDK617/618의 owned Core/Main identity·inbox/SxS 정책은 유지하며 다른 package나 실제 게임의 전체 호환성을 주장하지 않는다.
 
+## ZZZ 실측과 측정 기반 후속 — 2026-11-02
+
+**상태: 격리 ZZZ 복제본에서 counter를 수집했고, 그중 근거가 선 셰이더·storage 변경을 적용했다. 도시 진입 측정과 FPS 비교는 못 했다.** 원본 게임과 live prefix는 바꾸지 않았다. `Yaagl ZZZ OS Test` prefix와 게임을 APFS로 복제하고 ARM64X/FEX x64 runtime에 임시 counter를 넣어 실행했다(증거 `build/local/zzz-measure-20261102`, counter는 커밋하지 않음).
+
+타이틀→로딩 화면 60초(64.5 fps) 프레임당 값: ExecuteCommandLists 2.0, submit 3.0, indexed draw 176.8, IB 64-entry budget 초과 0, reserved 리소스 분할 0, opaque 노드 101.7(budget 초과 0.9), native fence wait 124.9, fence wait 생략 약 0, view-pool parent 순회 821.7. 타이틀 30초의 opaque 노드는 render 76.3·clear 11.0·blit 7.5·compute 4.0·query 1.0이고, 이유는 render merge 거부 59.5·이유 없는 불완전 접근 23.5·side work 미해결 16.7이다.
+
+판정: IB 범위 병합과 reserved 리소스 분할은 ZZZ에서 발생하지 않아 구현하지 않았다. 지금 in-flight 추적이 거의 모든 노드를 opaque로 놓쳐 fence chain이 직렬이므로, Present `MarkUntracked`도 효과가 없어 보류했다. 다음 후보는 render·clear·blit 노드가 opaque가 되는 원인 축소와 view-pool residency 순회다.
+
+적용한 변경:
+- **셰이더(`AIRCONV_VERSION=46`):** bounded load의 범위 밖·null 경로가 address 0 대신 16-byte zero constant를 읽는다. Shader Validation의 `GPU address 0x0` 오류로 실패하던 bindless·dxil이 통과한다. table CBV row load도 같은 방식으로 branch를 없앴다(ZZZ PS 8개 branch 2513→1282). `air.is_null_*`에 Apple과 같은 readonly 속성을 붙였고(PS 하나 60→57), non-normalized sampler 경로는 D3D12가 허용하는 1D/2D·offset 0에서만 만든다. ZZZ CS 23개의 native 생성 합계는 36.06s→33.98s였다(1회 비교).
+- **Storage:** DEFAULT heap과 CPU 접근 불가 CUSTOM heap의 committed 텍스처를 Metal Private로 할당한다. NGX RR 출력과 FSR RR 입력의 storage 때문에 생기던 복사가 없어졌다. SR output shadow는 fixture에서 출력 rect/크기가 정확히 맞지 않아 대부분 남는다. 이런 텍스처의 `WriteToSubresource`/`ReadFromSubresource`는 staging blit을 동기로 실행하는 경로로 바꿨다. 사양상 DEFAULT 텍스처에서는 실패해야 하지만 기존 fixture가 사용하므로 허용을 유지했다. placed 텍스처와 heap은 placed buffer CPU 접근 때문에 바꾸지 않았다.
+
+병합된 main(`e9b381d` 이후)을 ARM64X/FEX x64에서 API+Shader Validation으로 돌린 43개 matrix는 41개 PASS이고, 실패는 기존 fsr·temporal뿐이다(`build/local/merge-20261102`).
+
+도시 진입은 확인하지 못했다. 복제본에서 측정 runtime은 world load 뒤 로딩 화면에서 UnityPlayer null+8 read로 종료했고, 변경 전 runtime은 Start 뒤 보고 없이 종료했으며, 세 번째 실행은 로딩 화면에서 9분간 멈췄다. 따라서 이 종료를 이번 변경에 귀속하지 않으며 원인은 미해결이다.
+
 ## 확정 저위험 최적화와 남은 Rust 경계 — 2026-11-01
 
 **상태: native ARM64 Wine+FEX x64 GPU matrix에서 base(같은 HEAD)와 동일 판정. 게임 FPS는 미측정이다.** trace 수집 없이 코드상 매번 발생하는 비용만 줄였다. 입력은 `runtime-par-20261031`·`paired-sdk-par-20261031`·`fex-par-20261031`, 비교 runtime은 `build/local/par-20261101/base`다.
@@ -35,7 +51,7 @@
 | FSR FG SDK | fence 대기를 thread별 event 대기로 바꾸고 hybrid spin을 기본값으로 켰다. 같은 queue의 game fence Wait와 중복 interpolation fence Wait 제거. 앱 pacing tuning은 그대로 우선 | fsr-fg pacing PASS, process CPU base 2.93/2.11s → 0.93/1.60s(각 2회) |
 | Rust | DXIL ISG1/OSG1/PSG1을 `dxbc_signature.rs`(grouped)로, RT root signature unwrap을 Rust container 조회로, serialized AS·PSO subobject stream·D3D12Core PE preflight를 새 `rtas_serialized.rs`·`pso_stream.rs`·`pe_image.rs`로 옮겼다. 사용하지 않는 shader-message 디코딩(i686 길이 wrap)과 `dxmt_dxbc_operand_parse` 삭제 | CPU 173 checks(ASan+UBSan). DXIL 8979개 signature dump sha1 동일, RT unwrap 10858개 차이 0, AS·PSO·PE mutated parity 각 800k·400k·27k 차이 0. 6개 target opt0/opt2 링크 |
 
-GPU matrix 43개 중 39개 PASS다. bindless·dxil(Shader Validation의 GPU address 0 load), fsr(frame marker 중복), temporal(MetalFX Conv3x3)은 base에서도 같은 PASS 줄 수·오류 수로 실패한다. bindless·dxil은 10-31 runtime에서는 통과했으므로 HEAD의 `AIRCONV_VERSION=45` bounded load 변경 이후 생긴 별도 문제로 본다 [INFERENCE]. agility suite는 PASS, diagnostics의 `agility-high-fl`은 base와 같이 실패한다.
+GPU matrix 43개 중 39개 PASS였다(2026-11-02 병합 뒤 41개, 위 bindless·dxil 해결). bindless·dxil(Shader Validation의 GPU address 0 load), fsr(frame marker 중복), temporal(MetalFX Conv3x3)은 base에서도 같은 PASS 줄 수·오류 수로 실패한다. bindless·dxil은 10-31 runtime에서는 통과했으므로 HEAD의 `AIRCONV_VERSION=45` bounded load 변경 이후 생긴 별도 문제로 본다 [INFERENCE]. agility suite는 PASS, diagnostics의 `agility-high-fl`은 base와 같이 실패한다.
 
 동작 차이: RT export의 손상된 DXBC root signature container는 이제 raster·`CreateRootSignature`와 같이 거부된다. DXIL signature는 stream>3·stream 역순·stream 내 register 감소를 거부하며 stride는 32로 고정한다(실제 DXC corpus에서 해당 없음). SR/RR/FG는 앱 텍스처의 residency를 device 전역 set에 의존하므로, evict·`CREATE_NOT_RESIDENT` 리소스를 넘기는 잘못된 사용은 더 이상 보정하지 않는다. FSR SDK pacing의 실제 게임 jitter는 측정하지 않았다. DRED auto-breadcrumbs는 이후 Windows와 같이 `SYSTEM_CONTROLLED`에서 꺼짐으로 바꿨고 `d3d12.enableAutoBreadcrumbs=True`로 켤 수 있다. 꺼져 있으면 ExecuteCommandLists가 breadcrumb history를 만들지 않는다. 앱의 `FORCED_ON`/`FORCED_OFF`가 우선한다. WoW64 x86 guest는 실행하지 않았다.
 
