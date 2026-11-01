@@ -48,7 +48,7 @@ Public parameter store는 D3D12 resource의 `void*`/`ID3D12Resource*` Set/Get al
 
 Scaler generation은 첫 유효한 record에서 준비하고 format·backing·output/layout 변경 시 교체한다. Old recording/replay는 자신이 retain한 generation·scratch·residency와 GPU-retirement lease를 사용한다. Active content·generation/activation·caller reset의 history 계약과 native scale 제한은 [현행 CORE 계약](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료)에만 유지한다.
 
-Frame은 Core/Generation, retained app resources, logical-size private scratch output, residency와 immutable props를 소유한다. Scratch는 ShaderRead|ShaderWrite|RenderTarget usage다. Scaler는 scratch origin에 출력하고, blit은 logical rectangle만 caller output base로 복사한다. Larger backing의 바깥 pixel은 보존한다.
+Frame은 Core/Generation, retained app resources, logical-size private scratch output, residency와 immutable props를 소유한다. Scratch는 ShaderRead|ShaderWrite|RenderTarget usage다. Linear·무sharpening·무cap·무alpha의 Private 출력은 scratch 없이 scaler가 `outputOffset`으로 caller output base의 logical rectangle에 직접 쓴다(macOS 27). 그 밖에는 scaler가 scratch origin에 출력하고, blit 또는 finish pass가 logical rectangle만 caller output base로 복사한다. 어느 경우든 larger backing의 바깥 pixel은 보존한다.
 
 R32 conversion은 `d3d12_temporal.cpp`의 lazy Metal4 compute pipeline과 private retained R16 scratch를 사용한다. 기존 bridge/ABI를 그대로 쓰며 clamp·tone correction·CPU readback·record-time cache가 없다. Scratch/pipeline은 GPU completion까지 보호된다. [양 ABI numeric/replay·public NGX proof](CORE-IMPLEMENTATION-STATUS.ko.md#fsr-facade와-manual-r32-exposure-완료)는 게임/image-quality equivalence와 별개다.
 

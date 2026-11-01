@@ -20,12 +20,15 @@ TextureCopy originalCopy = nullptr;
 std::atomic<id<MTLTexture>> observedInputs[3]{};
 std::atomic<unsigned> inputCopies[3]{};
 std::atomic<uint64_t> inputBytes[3]{};
+std::atomic<id<MTLTexture>> observedOutput{};
+std::atomic<unsigned> outputCopies{};
 void observeCopy(id encoder, SEL selector, id<MTLTexture> source, NSUInteger slice, NSUInteger level,
                  MTLOrigin origin, MTLSize size, id<MTLTexture> destination, NSUInteger targetSlice,
                  NSUInteger targetLevel, MTLOrigin targetOrigin) {
     for (unsigned i=0; i<3; ++i) if (source == observedInputs[i].load()) {
         ++inputCopies[i]; inputBytes[i] += size.width * size.height * size.depth * (i == 0 ? 8 : 4);
     }
+    if (destination == observedOutput.load()) ++outputCopies;
     originalCopy(encoder,selector,source,slice,level,origin,size,destination,targetSlice,targetLevel,targetOrigin);
 }
 void require(bool ok, const char* reason) {
@@ -226,6 +229,7 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     else { lease=makeLease(frame,&error); require(bool(lease),error.message.c_str()); }
     observedInputs[0]=frame.color; observedInputs[1]=frame.depth; observedInputs[2]=frame.motion;
     for (unsigned i=0; i<3; ++i) { inputCopies[i]=0; inputBytes[i]=0; }
+    observedOutput=frame.output; outputCopies=0;
     auto allocator = [gpu.device newCommandAllocator]; auto fence = [gpu.device newFence];
     std::vector<id<MTL4CommandBuffer>> commands;
     auto begin = [&] { auto command=[gpu.device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
@@ -270,9 +274,12 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
                 "actual-native-input-copy-count");
         copies+=inputCopies[i]; bytes+=inputBytes[i]; observedInputs[i]=nil;
     }
-    std::printf("OWNED_METALFX_OPT_SR iteration=%u staging_mask=%u generation=%llu mean=%.9g outside_pixels=%u primary_input_copies=%u primary_input_copy_bytes=%llu public_prepare=%u\n",
+    // Public prepare writes the offset Private output in place; the manual path forces the shadow.
+    const unsigned shadowCopies=outputCopies.load(); observedOutput=nil;
+    require(shadowCopies == (prepared ? 0u : 1u), "actual-native-output-shadow-copy-count");
+    std::printf("OWNED_METALFX_OPT_SR iteration=%u staging_mask=%u generation=%llu mean=%.9g outside_pixels=%u primary_input_copies=%u primary_input_copy_bytes=%llu output_shadow_copies=%u public_prepare=%u\n",
         iteration,mask,(unsigned long long)(prepared ? prepared->generationId() : generation->serial),mean,outside,copies,
-        (unsigned long long)bytes,unsigned(bool(prepared)));
+        (unsigned long long)bytes,shadowCopies,unsigned(bool(prepared)));
     ScalerBindings clear(generation->scaler);
     for(auto c:commands) [c release]; [fence release]; [allocator release];
     return result;

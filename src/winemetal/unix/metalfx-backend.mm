@@ -2149,8 +2149,9 @@ void configureScalerForFrame(Feature::Impl& feature, ScalerGeneration& generatio
         const Rect& reactiveRect = frame.directMask ? frame.directMaskRect : frame.frame.reactiveRect;
         [scaler setReactiveMaskContentOffsetX:lease.combinedMask || lease.stagedReactive ? 0 : reactiveRect.x];
         [scaler setReactiveMaskContentOffsetY:lease.combinedMask || lease.stagedReactive ? 0 : reactiveRect.y];
-        [scaler setOutputOffsetX:0];
-        [scaler setOutputOffsetY:0];
+        const bool directOutput = !alpha && !lease.privateOutput;
+        [scaler setOutputOffsetX:directOutput ? frame.frame.outputRect.x : 0];
+        [scaler setOutputOffsetY:directOutput ? frame.frame.outputRect.y : 0];
     }
     [scaler setPreExposure:alpha ? 1.0f : frame.frame.preExposure];
     [scaler setJitterOffsetX:frame.frame.jitterOffsetX];
@@ -2293,13 +2294,21 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
              !exactDescriptorInput(reactive, info.reactiveRect, activeInput.width, activeInput.height,
                                    generation->inputCapacityWidth, generation->inputCapacityHeight,
                                    generation->reactiveUsage));
+        // macOS 27 MetalFX writes only the outputOffset window of a larger output
+        // texture and preserves the texels outside it, so an uncapped validated
+        // subrect is written in place; older runtimes need exact output dimensions.
+        bool outputOffsets = false;
+        if (@available(macOS 27.0, *)) outputOffsets = true;
+        const bool directOutput = outputOffsets
+            ? info.outputRect.width == temporal.width && info.outputRect.height == temporal.height &&
+                  hasUsage(output, generation->outputUsage)
+            : exactTexture(output, info.outputRect, temporal.width, temporal.height,
+                           generation->outputUsage);
         frame->needsOutputShadow = temporal.capped ||
                                    operations.drawDebugView || generation->alphaScaler ||
                                    operations.colorTransfer != ColorTransfer::Linear ||
                                    operations.sharpening ||
-                                   output.storageMode != MTLStorageModePrivate ||
-                                   !exactTexture(output, info.outputRect, temporal.width,
-                                                 temporal.height, generation->outputUsage);
+                                   output.storageMode != MTLStorageModePrivate || !directOutput;
         frame->needsExposureConversion = exposureConversion;
 
         // Bind an exact R8 composition mask directly when nothing must be combined:
