@@ -200,7 +200,7 @@ CreateConfiguredDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel
   }
 
   if (FAILED(hr = dxgi_adapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter_mtl)))) {
-    ERR("D3D12CreateDevice: Not a DXMT adapter");
+    ERR("D3D12CreateDevice: Not a D3DAlloy adapter");
     return hr;
   }
 

@@ -124,14 +124,14 @@ struct DeveloperMode {
 std::wstring cacheFile(ID3D12PipelineState *pso,const char *label) {
   ComPtr<ID3DBlob> blob;check(pso->GetCachedBlob(&blob),"automatic export");
   wchar_t temp[32768];if(!GetTempPathW(32768,temp))fail("cache temp path");
-  const std::wstring base=std::wstring(temp)+L"dxmt-shader-sessions\\";
+  const std::wstring base=std::wstring(temp)+L"d3dalloy-shader-sessions\\";
   WIN32_FIND_DATAW directory{};HANDLE dirs=FindFirstFileW((base+L"*").c_str(),&directory);
   if(dirs==INVALID_HANDLE_VALUE)fail("automatic directory missing");
   std::wstring result;
   do {
     if(!(directory.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||directory.cFileName[0]==L'.')continue;
     const auto path=base+directory.cFileName+L"\\";
-    WIN32_FIND_DATAW entry{};HANDLE files=FindFirstFileW((path+L"dxmt-pso-*.bin").c_str(),&entry);
+    WIN32_FIND_DATAW entry{};HANDLE files=FindFirstFileW((path+L"d3dalloy-pso-*.bin").c_str(),&entry);
     if(files==INVALID_HANDLE_VALUE)continue;
     do {
       if(entry.nFileSizeHigh||entry.nFileSizeLow!=blob->GetBufferSize())continue;

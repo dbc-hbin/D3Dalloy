@@ -38,7 +38,7 @@ python3 graphics-translator/tests/run-automatic-cache-cpu.py \
 
 내용 readback, 256MiB 한도에서 같은 key 교체, 다른 프로세스의 저장·clear, rename 실패와 mutex 소유자 종료 뒤 복구, foreign file 보존과 PSO/stage accounting namespace 격리를 검사한다. Stage artifact 소멸자의 error-release import는 선택한 runtime의 실제 `winemetal.dll`에 연결한다. Runner는 전용 prefix/TEMP를 만들고 해당 Wine 종료 뒤 제거한다. `metadata_enumerations`는 256회 작은 저장의 관측값이며 시간 기반 합격 기준이 아니다.
 
-실제 셰이더 실패 입력이 필요하면 미리 만든 **Windows 경로**를 `DXMT_SHADER_FAILURE_PATH`로 지정한다. 초기 VS/PS/CS 컴파일 실패에서 stage·bytecode·root-signature 조합별 최대64개를 `.failure` 디렉터리에 저장한다(`shader.cso`, `rootsig.bin`, compilation arguments의 `metadata.txt`, `error.txt`, module-relative caller `stack.txt`). 기본값은 꺼짐이며 모든 shader variant/native PSO 실패를 포괄하지 않는다. 게임 소유 bytecode와 실행 경로가 포함되므로 private evidence로 보관하고 저장소에 추가하거나 외부에 전송하지 않는다.
+실제 셰이더 실패 입력이 필요하면 미리 만든 **Windows 경로**를 `D3DALLOY_SHADER_FAILURE_PATH`로 지정한다. 초기 VS/PS/CS 컴파일 실패에서 stage·bytecode·root-signature 조합별 최대64개를 `.failure` 디렉터리에 저장한다(`shader.cso`, `rootsig.bin`, compilation arguments의 `metadata.txt`, `error.txt`, module-relative caller `stack.txt`). 기본값은 꺼짐이며 모든 shader variant/native PSO 실패를 포괄하지 않는다. 게임 소유 bytecode와 실행 경로가 포함되므로 private evidence로 보관하고 저장소에 추가하거나 외부에 전송하지 않는다.
 
 ## Conservative Tier3 public proof
 

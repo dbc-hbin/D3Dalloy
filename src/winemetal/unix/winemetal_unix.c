@@ -6201,7 +6201,7 @@ _WMTUnimplemented(void *obj) {
  * registered with bootstrap directly, because bootstrap_register2(name, NULL)
  * does not remove a registration: only the death of the registered receive
  * right does. Each process that holds a shared object therefore owns one
- * receive right R registered as dxmt.share.<pid>.<128-bit random>. A lookup
+ * receive right R registered as d3dalloy.share.<pid>.<128-bit random>. A lookup
  * sends a request to R; the dispatch source replies with a copied send right of
  * the object port. Destroying the rendezvous destroys R, which unregisters the
  * name immediately.
@@ -6247,7 +6247,7 @@ _WMTShareRendezvousCreate(void *obj) {
 
   uint8_t random[16];
   arc4random_buf(random, sizeof(random));
-  int len = snprintf(params->name, sizeof(params->name), "dxmt.share.%d.", (int)getpid());
+  int len = snprintf(params->name, sizeof(params->name), "d3dalloy.share.%d.", (int)getpid());
   for (unsigned i = 0; i < sizeof(random); ++i)
     len += snprintf(params->name + len, sizeof(params->name) - len, "%02x", random[i]);
 
@@ -6325,7 +6325,7 @@ _WMTShareRendezvousLookUp(void *obj) {
   params->port = 0;
   params->handle = 0;
   params->name[sizeof(params->name) - 1] = '\0';
-  if (strncmp(params->name, "dxmt.share.", 11))
+  if (strncmp(params->name, "d3dalloy.share.", sizeof("d3dalloy.share.") - 1))
     return STATUS_UNSUCCESSFUL;
 
   mach_port_t bp, service = MACH_PORT_NULL, reply_port = MACH_PORT_NULL;
@@ -6442,7 +6442,7 @@ share_session_salt(uint8_t salt[16]) {
   size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
   if (!n || n >= sizeof(dir) - 32)
     return false;
-  strlcat(dir, "dxmt-share", sizeof(dir));
+  strlcat(dir, "d3dalloy-share", sizeof(dir));
   if (mkdir(dir, 0700) && errno != EEXIST)
     return false;
   struct stat st;
@@ -6485,7 +6485,7 @@ _WMTShareHashName(void *obj) {
     return STATUS_UNSUCCESSFUL;
   CC_SHA256_CTX ctx;
   CC_SHA256_Init(&ctx);
-  CC_SHA256_Update(&ctx, "dxmt.d3d12.name\0", 16);
+  CC_SHA256_Update(&ctx, "d3dalloy.d3d12.name", sizeof("d3dalloy.d3d12.name"));
   CC_SHA256_Update(&ctx, salt, sizeof(salt));
   CC_SHA256_Update(&ctx, params->name, params->length * sizeof(params->name[0]));
   uint8_t digest[CC_SHA256_DIGEST_LENGTH];

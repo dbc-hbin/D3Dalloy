@@ -568,7 +568,7 @@ void errorCases(Device &a, Device &b) {
   CloseHandle(anon);
   // A section that mimics the naming scheme but carries a forged header/token.
   wchar_t forgedName[96];
-  std::swprintf(forgedName, 96, L"Local\\dxmt.share.%lu.00112233445566778899aabbccddeeff", GetCurrentProcessId());
+  std::swprintf(forgedName, 96, L"Local\\d3dalloy.share.%lu.00112233445566778899aabbccddeeff", GetCurrentProcessId());
   HANDLE forged = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 1 << 20, forgedName);
   if (!forged)
     fail("CreateFileMapping forged");
@@ -1053,7 +1053,7 @@ void crossProcess(Device &a, Device &b) {
     fail("map shared fence scheduling identity");
   const auto *token = header + 16;
   WCHAR mutexName[80];
-  std::swprintf(mutexName, 80, L"Local\\dxmt.fence.%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+  std::swprintf(mutexName, 80, L"Local\\d3dalloy.fence.%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
                 token[0], token[1], token[2], token[3], token[4], token[5], token[6], token[7],
                 token[8], token[9], token[10], token[11], token[12], token[13], token[14], token[15]);
   HANDLE mutex = CreateMutexW(nullptr, FALSE, mutexName);
@@ -1187,7 +1187,7 @@ void adapterLuidLifetimeCase(Device &a, Device &b) {
   wchar_t forgedName[96];
   const auto *token = header + 16;
   std::swprintf(forgedName, 96,
-                L"Local\\dxmt.share.%lu.%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                L"Local\\d3dalloy.share.%lu.%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
                 GetCurrentProcessId() + 1, token[0], token[1], token[2], token[3], token[4], token[5], token[6],
                 token[7], token[8], token[9], token[10], token[11], token[12], token[13], token[14], token[15]);
   HANDLE clone = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 65536, forgedName);
@@ -1248,7 +1248,7 @@ void adapterLuidLifetimeCase(Device &a, Device &b) {
     rejectSharedAdapter(byName);
     link[offset] ^= 0xff;
   }
-  std::swprintf(forgedName, 96, L"Local\\dxmt.d3d12.identity-forged.%lu", GetCurrentProcessId());
+  std::swprintf(forgedName, 96, L"Local\\d3dalloy.d3d12.identity-forged.%lu", GetCurrentProcessId());
   clone = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 256, forgedName);
   cloneHeader = static_cast<uint8_t *>(MapViewOfFile(clone, FILE_MAP_WRITE, 0, 0, 256));
   if (!clone || !cloneHeader)

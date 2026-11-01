@@ -35,7 +35,7 @@ GetVersionDescriptionText(uint32_t ApiVersion, uint32_t FeatureLevel) {
     feature_level_text = "12_1";
     break;
   }
-  return str::format("DXMT D3D", ApiVersion, " FL_", feature_level_text, " ", DXMT_VERSION);
+  return str::format("D3DAlloy D3D", ApiVersion, " FL_", feature_level_text, " ", DXMT_VERSION);
 }
 
 } // namespace dxmt

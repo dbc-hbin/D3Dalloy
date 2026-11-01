@@ -81,7 +81,7 @@ public:
     // Use the random section token, not a recyclable native event identity.
     WCHAR mutex_name[80];
     const auto *token = share->header().token;
-    std::swprintf(mutex_name, 80, L"Local\\dxmt.fence.%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+    std::swprintf(mutex_name, 80, L"Local\\d3dalloy.fence.%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
                   token[0], token[1], token[2], token[3], token[4], token[5], token[6], token[7],
                   token[8], token[9], token[10], token[11], token[12], token[13], token[14], token[15]);
     return fence->initializeShared(std::move(event), timeline, share, mutex_name, publish_initial, initial_value) ? S_OK

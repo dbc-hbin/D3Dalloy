@@ -30,7 +30,7 @@ RecordShaderCompileFailure(const char *stage, D3D12_SHADER_BYTECODE shader,
   static std::array<Sha1Digest, 64> identities{};
   static size_t count = 0;
   try {
-    static const std::string directory = env::getEnvVar("DXMT_SHADER_FAILURE_PATH");
+    static const std::string directory = env::getEnvVar("D3DALLOY_SHADER_FAILURE_PATH");
     // ponytail: serialize at most 64 failed pairs; a queue only helps if failure recording becomes hot.
     std::lock_guard<std::mutex> lock(mutex);
     if (count == identities.size()) return false;

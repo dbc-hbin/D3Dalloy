@@ -302,6 +302,10 @@ std::wstring Hex(const void *data, size_t size) {
   return result;
 }
 
+/* File-name prefixes of the automatic PSO cache and the stage cache (also their mutex names under Local\). */
+constexpr WCHAR kAutomaticPrefix[] = L"d3dalloy-pso-";
+constexpr WCHAR kStagePrefix[] = L"d3dalloy-stage-";
+
 HRESULT Paths(bool working_directory, std::wstring &directory, std::wstring &exe_token) {
   WCHAR buffer[32768];
   DWORD count = GetModuleFileNameW(nullptr, buffer, std::size(buffer));
@@ -317,7 +321,7 @@ HRESULT Paths(bool working_directory, std::wstring &directory, std::wstring &exe
     count = GetTempPathW(std::size(buffer), buffer);
     if (!count || count >= std::size(buffer)) return E_FAIL;
     directory.assign(buffer, count);
-    directory += L"dxmt-shader-sessions";
+    directory += L"d3dalloy-shader-sessions";
     if (!CreateDirectoryW(directory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return FileError();
     directory += L"\\" + exe_token;
     if (!CreateDirectoryW(directory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return FileError();
@@ -384,11 +388,11 @@ HRESULT AccountingForDirectory(
 }
 
 HRESULT AutomaticAccounting(const std::wstring &directory, AutomaticDiskAccounting *&state) {
-  return AccountingForDirectory(directory, L"Local\\dxmt-pso-accounting-v1-", automatic_accounting, state);
+  return AccountingForDirectory(directory, L"Local\\d3dalloy-pso-accounting-v1-", automatic_accounting, state);
 }
 
 HRESULT StageAccounting(const std::wstring &directory, AutomaticDiskAccounting *&state) {
-  return AccountingForDirectory(directory, L"Local\\dxmt-stage-accounting-v1-", stage_accounting, state);
+  return AccountingForDirectory(directory, L"Local\\d3dalloy-stage-accounting-v1-", stage_accounting, state);
 }
 
 // Disk metadata transactions never call into the in-process pipeline cache. Reads use atomic
@@ -400,7 +404,7 @@ struct AutomaticDiskLock {
   AutomaticDiskAccounting *stage_accounting = nullptr;
   HRESULT acquire(const std::wstring &directory) {
     const auto hash = Sha1HashState::compute(directory.data(), directory.size() * sizeof(WCHAR));
-    const auto name = L"Local\\dxmt-pso-" + Hex(hash.data, sizeof(hash.data));
+    const auto name = L"Local\\" + std::wstring(kAutomaticPrefix) + Hex(hash.data, sizeof(hash.data));
     value = CreateMutexW(nullptr, FALSE, name.c_str());
     if (!value) return FileError();
     const DWORD result = WaitForSingleObject(value, 1000);
@@ -427,7 +431,7 @@ struct AutomaticDiskLock {
 bool StageDiskHasRoom(const std::wstring &directory, const std::wstring &path,
                       AutomaticDiskAccounting &accounting, uint64_t incoming, uint64_t &total) {
   WIN32_FIND_DATAW data{};
-  const auto pattern = directory + L"dxmt-stage-*";
+  const auto pattern = directory + std::wstring(kStagePrefix) + L"*";
   const bool rescan = !accounting.valid;
   total = accounting.bytes;
   if (rescan) {
@@ -479,19 +483,20 @@ struct AutomaticTempFile {
 };
 
 // Only these exact names belong to the automatic cache; application session files are untouched.
+// Layout: prefix, 40 hex key, then ".bin" or "-<8 hex>-<8 hex>.tmp".
 bool AutomaticFileName(const std::wstring &name, bool &temporary) {
-  if (name.size() != 53 && name.size() != 71) return false;
-  if (name.compare(0, 9, L"dxmt-pso-")) return false;
-  for (size_t i = 9; i < 49; ++i)
-    if (!((name[i] >= L'0' && name[i] <= L'9') || (name[i] >= L'a' && name[i] <= L'f'))) return false;
-  temporary = name.size() == 71;
-  if (!temporary) return name.compare(49, 4, L".bin") == 0;
-  if (name[49] != L'-' || name[58] != L'-' || name.compare(67, 4, L".tmp")) return false;
-  for (size_t i = 50; i < 67; ++i) {
-    if (i == 58) continue;
-    if (!((name[i] >= L'0' && name[i] <= L'9') || (name[i] >= L'a' && name[i] <= L'f'))) return false;
-  }
-  return true;
+  constexpr size_t p = std::size(kAutomaticPrefix) - 1, key = p + 40, final_size = key + 4, temp_size = key + 22;
+  auto hex = [&](size_t first, size_t last) {
+    for (size_t i = first; i < last; ++i)
+      if (!((name[i] >= L'0' && name[i] <= L'9') || (name[i] >= L'a' && name[i] <= L'f'))) return false;
+    return true;
+  };
+  if (name.size() != final_size && name.size() != temp_size) return false;
+  if (name.compare(0, p, kAutomaticPrefix) || !hex(p, key)) return false;
+  temporary = name.size() == temp_size;
+  if (!temporary) return name.compare(key, 4, L".bin") == 0;
+  return name[key] == L'-' && hex(key + 1, key + 9) && name[key + 9] == L'-' && hex(key + 10, key + 18) &&
+         name.compare(key + 18, 4, L".tmp") == 0;
 }
 
 struct AutomaticDiskEntry {
@@ -502,7 +507,7 @@ struct AutomaticDiskEntry {
 HRESULT AutomaticDiskEntries(const std::wstring &directory, std::vector<AutomaticDiskEntry> &entries,
                              uint64_t &total, bool clear) {
   WIN32_FIND_DATAW info;
-  HANDLE search = FindFirstFileW((directory + L"dxmt-pso-*").c_str(), &info);
+  HANDLE search = FindFirstFileW((directory + std::wstring(kAutomaticPrefix) + L"*").c_str(), &info);
   if (search == INVALID_HANDLE_VALUE)
     return GetLastError() == ERROR_FILE_NOT_FOUND ? S_OK : FileError();
   const SearchHandle search_handle{search};
@@ -570,7 +575,7 @@ HRESULT ReadAutomaticPipelineCache(const Sha1Digest &key, ID3DBlob **blob) {
     std::wstring directory, executable;
     HRESULT hr = Paths(false, directory, executable);
     if (FAILED(hr)) return hr;
-    const auto path = directory + L"dxmt-pso-" + Hex(key.data, sizeof(key.data)) + L".bin";
+    const auto path = directory + kAutomaticPrefix + Hex(key.data, sizeof(key.data)) + L".bin";
     const FileHandle file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
     if (file.value == INVALID_HANDLE_VALUE)
@@ -605,7 +610,7 @@ void WriteAutomaticPipelineCache(const Sha1Digest &key, ID3DBlob *blob) {
       if (FAILED(AutomaticDiskEntries(directory, entries, total, false))) return;
     }
     const uint64_t size = blob->GetBufferSize();
-    const auto name = L"dxmt-pso-" + Hex(key.data, sizeof(key.data)) + L".bin";
+    const auto name = kAutomaticPrefix + Hex(key.data, sizeof(key.data)) + L".bin";
     const auto path = directory + name;
     uint64_t replaced = 0;
     WIN32_FILE_ATTRIBUTE_DATA info;
@@ -631,7 +636,7 @@ void WriteAutomaticPipelineCache(const Sha1Digest &key, ID3DBlob *blob) {
       }
     }
     if (total - replaced > kAutomaticDiskBytes - size) return;
-    const auto stem = directory + L"dxmt-pso-" + Hex(key.data, sizeof(key.data));
+    const auto stem = directory + kAutomaticPrefix + Hex(key.data, sizeof(key.data));
     static std::atomic<uint32_t> sequence{0};
     const uint32_t pid = GetCurrentProcessId(), serial = ++sequence;
     AutomaticTempFile temporary;
@@ -658,7 +663,7 @@ HRESULT ReadAutomaticStageArtifact(const std::string &key, std::shared_ptr<const
     std::wstring directory, executable;
     if (FAILED(Paths(false, directory, executable))) return E_FAIL;
     const auto digest = Sha1HashState::compute(key.data(), key.size());
-    const auto path = directory + L"dxmt-stage-" + Hex(digest.data, sizeof(digest.data)) + L".bin";
+    const auto path = directory + kStagePrefix + Hex(digest.data, sizeof(digest.data)) + L".bin";
     const FileHandle file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
     if (file.value == INVALID_HANDLE_VALUE) return DXGI_ERROR_NOT_FOUND;
@@ -720,7 +725,7 @@ void WriteAutomaticStageArtifact(const std::string &key, const ShaderStageArtifa
     AutomaticDiskLock disk_lock;
     if (FAILED(disk_lock.acquire(directory))) return;
     const auto digest = Sha1HashState::compute(key.data(), key.size());
-    const auto path = directory + L"dxmt-stage-" + Hex(digest.data, sizeof(digest.data)) + L".bin";
+    const auto path = directory + kStagePrefix + Hex(digest.data, sizeof(digest.data)) + L".bin";
     static std::atomic<uint32_t> sequence{0};
     const uint32_t pid = GetCurrentProcessId(), serial = ++sequence;
     const auto temp = path + L"-" + Hex(&pid, sizeof(pid)) + L"-" + Hex(&serial, sizeof(serial)) + L".tmp";
@@ -821,7 +826,7 @@ void RemoveAutomaticPipelineCache(const Sha1Digest &key) {
     AutomaticDiskLock lock;
     if (FAILED(lock.acquire(directory))) return;
     lock.accounting->valid = 0;
-    const auto path = directory + L"dxmt-pso-" + Hex(key.data, sizeof(key.data)) + L".bin";
+    const auto path = directory + kAutomaticPrefix + Hex(key.data, sizeof(key.data)) + L".bin";
     DeleteFileW(path.c_str());
   } catch (const std::bad_alloc &) {}
 }
@@ -841,7 +846,7 @@ HRESULT ClearAutomaticPipelineCacheDisk() {
     hr = AutomaticDiskEntries(directory, unused, total, true);
     if (SUCCEEDED(hr)) {
       WIN32_FIND_DATAW info{};
-      HANDLE search = FindFirstFileW((directory + L"dxmt-stage-*").c_str(), &info);
+      HANDLE search = FindFirstFileW((directory + std::wstring(kStagePrefix) + L"*").c_str(), &info);
       if (search != INVALID_HANDLE_VALUE) {
         const SearchHandle search_handle{search};
         do {
@@ -897,7 +902,7 @@ HRESULT CreateShaderCacheSession(MTLD3D12Device *device, const D3D12_SHADER_CACH
         if (desc->Mode == D3D12_SHADER_CACHE_MODE_DISK) {
           HRESULT hr = Paths(desc->Flags & D3D12_SHADER_CACHE_FLAG_USE_WORKING_DIR, directory, executable);
           if (FAILED(hr)) return hr;
-          cache->path = directory + L"dxmt-sc-" + executable + L"-" + token + L".val";
+          cache->path = directory + L"d3dalloy-sc-" + executable + L"-" + token + L".val";
           hr = cache->open();
           if (FAILED(hr)) return hr;
         }
@@ -939,7 +944,7 @@ HRESULT ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS kinds, D3D12_SHADER_CAC
       HRESULT hr = Paths(false, directory, executable);
       if (FAILED(hr)) return hr;
       WIN32_FIND_DATAW info;
-      HANDLE search = FindFirstFileW((directory + L"dxmt-sc-*.val").c_str(), &info);
+      HANDLE search = FindFirstFileW((directory + L"d3dalloy-sc-*.val").c_str(), &info);
       if (search != INVALID_HANDLE_VALUE) {
         const SearchHandle search_handle{search};
         HRESULT error = S_OK;

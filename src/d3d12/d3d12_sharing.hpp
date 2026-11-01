@@ -10,7 +10,7 @@
  * D3D12 shared handles.
  *
  * Every shareable object owns one Wine section named
- * `Local\dxmt.share.<pid>.<128-bit random>`: a 64 KiB header followed by the
+ * `Local\d3dalloy.share.<pid>.<128-bit random>`: a 64 KiB header followed by the
  * payload (heap or committed-buffer memory; empty for textures and fences).
  * The NT handle given to the application is a real section handle, so
  * CloseHandle/DuplicateHandle/inheritance are native. The Wine server backs
@@ -20,14 +20,14 @@
  * The header carries a random 128-bit token, the creation descriptors and,
  * for IOSurface textures and MTLSharedEvents, per-process rendezvous slots:
  * each process holding the object registers a private receive right under a
- * fresh `dxmt.share.<pid>.<random>` bootstrap name that answers with the Metal
+ * fresh `d3dalloy.share.<pid>.<random>` bootstrap name that answers with the Metal
  * object port. The registration dies with its receive right (last close in
  * that process, or process exit). After import the Metal object's global
  * identity (IOSurfaceID / shared-event trace id) must equal the header's, so a
  * reused or stale name never yields a different object.
  *
- * A D3D object name maps to a link section `Local\dxmt.d3d12.<hash>` where
- * hash = SHA-256("dxmt.d3d12.name", per-user salt, UTF-16 name) truncated to
+ * A D3D object name maps to a link section `Local\d3dalloy.d3d12.<hash>` where
+ * hash = SHA-256("d3dalloy.d3d12.name", per-user salt, UTF-16 name) truncated to
  * 128 bits. The link holds the token and the main section name; the token is
  * verified again after resolving.
  */

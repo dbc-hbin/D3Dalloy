@@ -31,7 +31,7 @@ LinkName(const WCHAR *name, WCHAR out[64]) {
   char hash[40];
   if (!length || length > 256 || !WMTShareHashName(reinterpret_cast<const uint16_t *>(name), length, hash))
     return false;
-  swprintf(out, 64, L"Local\\dxmt.d3d12.%hs", hash);
+  swprintf(out, 64, L"Local\\d3dalloy.d3d12.%hs", hash);
   return true;
 }
 
@@ -53,7 +53,7 @@ HRESULT
 OpenMain(HANDLE section, const uint8_t *expected_token, std::shared_ptr<SharedObject> &out,
          SharedObject *(*make)(), bool (*adopt)(SharedObject *, HANDLE, void *, const WCHAR *)) {
   auto leaf = SectionLeafName(section);
-  if (leaf.rfind(L"dxmt.share.", 0) != 0 || leaf.size() >= 80)
+  if (leaf.rfind(L"d3dalloy.share.", 0) != 0 || leaf.size() >= 80)
     return E_INVALIDARG;
   uint64_t size = 0;
   auto *header = static_cast<Header *>(MapWhole(section, size));
@@ -273,7 +273,7 @@ Create(Kind kind, uint64_t payload_size, std::shared_ptr<SharedObject> &out) {
   }
   const auto hex = TokenHex(token);
   WCHAR name[80];
-  swprintf(name, 80, L"Local\\dxmt.share.%u.%hs", unsigned(GetCurrentProcessId()), hex.data());
+  swprintf(name, 80, L"Local\\d3dalloy.share.%u.%hs", unsigned(GetCurrentProcessId()), hex.data());
   const uint64_t payload = (payload_size + kGranularity - 1) & ~(kGranularity - 1);
   const uint64_t total = kPayloadOffset + payload;
   HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, DWORD(total >> 32), DWORD(total),
@@ -315,9 +315,9 @@ Open(HANDLE handle, std::shared_ptr<SharedObject> &out) {
   if (!handle || handle == INVALID_HANDLE_VALUE)
     return E_INVALIDARG;
   auto leaf = SectionLeafName(handle);
-  if (leaf.rfind(L"dxmt.share.", 0) == 0)
+  if (leaf.rfind(L"d3dalloy.share.", 0) == 0)
     return OpenMain(handle, nullptr, out, SharedObjectAccess::make, SharedObjectAccess::adopt);
-  if (leaf.rfind(L"dxmt.d3d12.", 0) != 0)
+  if (leaf.rfind(L"d3dalloy.d3d12.", 0) != 0)
     return E_INVALIDARG;
 
   uint64_t size = 0;

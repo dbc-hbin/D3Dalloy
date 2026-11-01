@@ -2355,7 +2355,7 @@ WINEMETAL_API obj_handle_t MTLDevice_newSharedEventWithMachPort(obj_handle_t dev
 
 /*
  * D3D12 sharing rendezvous. Create registers a private receive right under a
- * fresh `dxmt.share.<pid>.<128-bit random>` bootstrap name (name_out >= 64
+ * fresh `d3dalloy.share.<pid>.<128-bit random>` bootstrap name (name_out >= 64
  * bytes) that answers lookups with a copy of `object_port`; destroy
  * unregisters it. LookUp returns an owned send right, released with
  * WMTMachPortDeallocate.

@@ -366,7 +366,7 @@ public:
     } native_guard{native_view_, present_semaphore_};
 
     if ((!native_view_ && !composition_surface_) || !layer_weak_.handle) {
-      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
+      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by D3DAlloy.");
       throw NativeViewUnavailable{};
     }
 

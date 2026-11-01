@@ -44,7 +44,7 @@ void logFailure(std::uint32_t operation, const char* stage, std::uint32_t result
                 float cameraFar = 0, float fov = 0, float scale = 0) noexcept {
     if (errorCount.fetch_add(1, std::memory_order_relaxed) >= 120) return;
     std::fprintf(stderr,
-        "dxmt-frame-generation: operation=%u stage=%s result=%u flags=0x%x "
+        "d3dalloy-frame-generation: operation=%u stage=%s result=%u flags=0x%x "
         "input=%ux%u camera_near=%.9g camera_far=%.9g fov=%.9g scale=%.9g\n",
         operation, stage, result, flags, width, height, cameraNear, cameraFar, fov, scale);
 }

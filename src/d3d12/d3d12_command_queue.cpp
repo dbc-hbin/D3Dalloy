@@ -1146,7 +1146,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   void
   CommandBufferWaitingThread() {
-    env::setThreadName("dxmt-cmdbuf-waiting-thread");
+    env::setThreadName("d3dalloy-cmdbuf-waiting-thread");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     uint64_t internal_seq = 1;
@@ -1366,7 +1366,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   void
   SubmissionThread() {
-    env::setThreadName("dxmt-d3d12-submit-thread");
+    env::setThreadName("d3dalloy-d3d12-submit-thread");
     QueueTask task;
     std::optional<QueueTask> pending_task;
     while (pending_task || task_fifo_.waitPop(task)) {

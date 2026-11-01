@@ -30,7 +30,7 @@ uint64_t enumerations = 0;
 uint64_t stage_enumerations = 0;
 HANDLE counted_find(const WCHAR *pattern, WIN32_FIND_DATAW *info) {
   ++enumerations;
-  if (std::wcsstr(pattern, L"dxmt-stage-*")) ++stage_enumerations;
+  if (std::wcsstr(pattern, L"d3dalloy-stage-*")) ++stage_enumerations;
   return FindFirstFileW(pattern, info);
 }
 namespace dxmt {
@@ -54,7 +54,7 @@ std::wstring directory() {
   require(Paths(false, path, token) == S_OK, "cache directory");
   return path;
 }
-std::wstring path(unsigned value) { return directory() + L"dxmt-pso-" + Hex(key(value).data, 20) + L".bin"; }
+std::wstring path(unsigned value) { return directory() + L"d3dalloy-pso-" + Hex(key(value).data, 20) + L".bin"; }
 void store(unsigned value, size_t size, unsigned char fill) {
   Com<ID3DBlob> blob;
   require(D3DCreateBlob(size, &blob) == S_OK, "allocate blob");
@@ -96,7 +96,7 @@ void stageStore(unsigned value) {
 }
 std::wstring stagePath(const std::string &value) {
   const auto digest = Sha1HashState::compute(value.data(), value.size());
-  return directory() + L"dxmt-stage-" + Hex(digest.data, sizeof(digest.data)) + L".bin";
+  return directory() + L"d3dalloy-stage-" + Hex(digest.data, sizeof(digest.data)) + L".bin";
 }
 std::vector<uint8_t> stageBytes(const std::string &value) {
   FileHandle file{CreateFileW(stagePath(value).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -326,7 +326,7 @@ void testStageAccounting() {
     const struct {
       const WCHAR *prefix;
       AutomaticDiskAccounting *state;
-    } expected[] = {{L"Local\\dxmt-pso-accounting-v1-", whole}, {L"Local\\dxmt-stage-accounting-v1-", stage}};
+    } expected[] = {{L"Local\\d3dalloy-pso-accounting-v1-", whole}, {L"Local\\d3dalloy-stage-accounting-v1-", stage}};
     for (const auto &entry : expected) {
       AutomaticAccountingMapping mapping;
       mapping.handle = OpenFileMappingW(FILE_MAP_READ, FALSE, (entry.prefix + suffix).c_str());
@@ -372,7 +372,7 @@ int main(int argc, char **argv) {
     } else if (!std::strcmp(argv[1], "--abandon")) {
       AutomaticDiskLock lock;
       require(lock.acquire(directory()) == S_OK, "abandoned writer acquires mutex");
-      const auto temporary = directory() + L"dxmt-pso-0000000000000000000000000000000000000000-00000000-00000000.tmp";
+      const auto temporary = directory() + L"d3dalloy-pso-0000000000000000000000000000000000000000-00000000-00000000.tmp";
       HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
       require(file != INVALID_HANDLE_VALUE, "abandoned writer temp");
       DWORD done = 0;
@@ -389,7 +389,7 @@ int main(int argc, char **argv) {
   testStageAccounting();
   testStageCodec();
   clear();
-  const auto foreign = directory() + L"dxmt-pso-not-owned.bin";
+  const auto foreign = directory() + L"d3dalloy-pso-not-owned.bin";
   HANDLE foreign_file = CreateFileW(foreign.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
   require(foreign_file != INVALID_HANDLE_VALUE, "create foreign file");
   DWORD done = 0;
@@ -440,7 +440,7 @@ int main(int argc, char **argv) {
   require(disk_bytes() == 8192, "retry after failed publish");
   const auto cache_directory = directory();
   const auto hash = Sha1HashState::compute(cache_directory.data(), cache_directory.size() * sizeof(WCHAR));
-  const auto mutex_name = L"Local\\dxmt-pso-" + Hex(hash.data, 20);
+  const auto mutex_name = L"Local\\d3dalloy-pso-" + Hex(hash.data, 20);
   HANDLE keeper = CreateMutexW(nullptr, FALSE, mutex_name.c_str());
   require(keeper != nullptr, "retain abandoned mutex");
   child(L"--abandon");

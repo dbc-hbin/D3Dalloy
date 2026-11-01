@@ -348,7 +348,7 @@ void corruption(ID3D12Device9 *dev) {
   const unsigned char *guid = reinterpret_cast<const unsigned char *>(&d.Identifier);
   wchar_t token[33];
   for (unsigned i = 0; i < 16; ++i) swprintf(token + i * 2, 3, L"%02x", guid[i]);
-  const std::wstring pattern = L"dxmt-sc-*-" + std::wstring(token) + L".val";
+  const std::wstring pattern = L"d3dalloy-sc-*-" + std::wstring(token) + L".val";
   WIN32_FIND_DATAW info{};
   HANDLE search = FindFirstFileW(pattern.c_str(), &info);
   if (search == INVALID_HANDLE_VALUE) fail("corrupt file locate");
@@ -405,7 +405,7 @@ void disk_cost(ID3D12Device9 *dev) {
     wchar_t token[33];
     for (unsigned i = 0; i < 16; ++i) swprintf(token + i * 2, 3, L"%02x", guid[i]);
     WIN32_FIND_DATAW info{};
-    HANDLE search = FindFirstFileW((L"dxmt-sc-*-" + std::wstring(token) + L".val").c_str(), &info);
+    HANDLE search = FindFirstFileW((L"d3dalloy-sc-*-" + std::wstring(token) + L".val").c_str(), &info);
     if (search == INVALID_HANDLE_VALUE) fail("bounded disk file");
     FindClose(search);
     const unsigned long long file_bytes = (static_cast<unsigned long long>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;

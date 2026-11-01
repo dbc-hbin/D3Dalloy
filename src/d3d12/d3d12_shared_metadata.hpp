@@ -22,6 +22,8 @@ constexpr uint64_t kLinkMagic = 0x4b4e494c54584d44ull; // "DMXTLINK"
 constexpr uint32_t kVersion = 3;
 constexpr uint32_t kCastFormatWordCount = 4;
 constexpr uint32_t kTextureStorageSwizzledVolume = 1;
+/* Object-namespace prefix of a main shared section; distinct from upstream DXMT's so the two never open each other. */
+constexpr wchar_t kSharePrefix[] = L"Local\\d3dalloy.share.";
 
 struct Slot {
   uint32_t pid;
@@ -138,7 +140,7 @@ inline bool
 AdapterTag(const uint8_t token[16], Kind kind, LUID luid, std::wstring_view leaf, std::wstring_view target, char out[33]) {
   WCHAR input[256];
   const auto hex = TokenHex(token);
-  int length = swprintf(input, 256, L"dxmt.share.adapter.v2.%hs.%08x.%08x.%08x.%.*ls.%.*ls", hex.data(),
+  int length = swprintf(input, 256, L"d3dalloy.share.adapter.v2.%hs.%08x.%08x.%08x.%.*ls.%.*ls", hex.data(),
                         unsigned(kind), unsigned(luid.LowPart), unsigned(luid.HighPart), int(leaf.size()), leaf.data(),
                         int(target.size()), target.empty() ? L"" : target.data());
   return length > 0 && WMTShareHashName(reinterpret_cast<const uint16_t *>(input), uint32_t(length), out);
@@ -166,7 +168,7 @@ ValidHeader(const Header &header, std::wstring_view leaf, const uint8_t *expecte
          (header.format_list_explicit ||
           (!header.castable_formats[0] && !header.castable_formats[1] &&
            !header.castable_formats[2] && !header.castable_formats[3])) &&
-         leaf.rfind(L"dxmt.share.", 0) == 0 && leaf.size() < 80 && EndsWithToken(leaf, TokenHex(header.token)) &&
+         leaf.rfind(L"d3dalloy.share.", 0) == 0 && leaf.size() < 80 && EndsWithToken(leaf, TokenHex(header.token)) &&
          (!expected_token || !memcmp(expected_token, header.token, 16)) &&
          ValidAdapter(header.token, header.kind, header.adapter, leaf);
 }
@@ -174,7 +176,7 @@ ValidHeader(const Header &header, std::wstring_view leaf, const uint8_t *expecte
 inline bool
 ValidLink(const LinkHeader &link, std::wstring_view leaf) {
   if (link.magic != kLinkMagic || link.version != kVersion ||
-      !wmemchr(link.section_name, 0, 80) || wcsncmp(link.section_name, L"Local\\dxmt.share.", 17))
+      !wmemchr(link.section_name, 0, 80) || wcsncmp(link.section_name, kSharePrefix, std::size(kSharePrefix) - 1))
     return false;
   return EndsWithToken(link.section_name, TokenHex(link.token)) &&
          ValidAdapter(link.token, link.kind, link.adapter, leaf, link.section_name);
@@ -189,8 +191,8 @@ GetSharedAdapterLuid(HANDLE handle, LUID *luid) {
   if (!handle || handle == INVALID_HANDLE_VALUE)
     return DXGI_ERROR_INVALID_CALL;
   const auto leaf = SectionLeafName(handle);
-  const bool main = leaf.rfind(L"dxmt.share.", 0) == 0;
-  if (!main && leaf.rfind(L"dxmt.d3d12.", 0) != 0)
+  const bool main = leaf.rfind(L"d3dalloy.share.", 0) == 0;
+  if (!main && leaf.rfind(L"d3dalloy.d3d12.", 0) != 0)
     return DXGI_ERROR_INVALID_CALL;
   const SIZE_T bytes = main ? kPayloadOffset : sizeof(LinkHeader);
   const void *view = MapViewOfFile(handle, FILE_MAP_READ, 0, 0, bytes);
