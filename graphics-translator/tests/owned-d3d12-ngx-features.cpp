@@ -562,6 +562,14 @@ void runPublicFgMotionInputs(const NgxApi &api, Gpu &gpu, bool invalidSentinel) 
         maxDelta = std::max(maxDelta, std::abs(int(images[pair.first][i]) - int(images[pair.second][i])));
       if (maxDelta > 1) fail("FG motion inputs differ from equivalent normalized motion");
     }
+    // Sentinel cases share one grid: camera-reconstructed motion must also
+    // match the independently supplied valid displacement, not only its inverse.
+    if (invalidSentinel) {
+      int maxDelta = 0;
+      for (size_t i = 0; i != images[0].size(); ++i)
+        maxDelta = std::max(maxDelta, std::abs(int(images[0][i]) - int(images[1][i])));
+      if (maxDelta > 1) fail("FG invalid motion reconstruction differs from valid displacement");
+    }
     effectiveFrames += UINT(frame >= 2 && images[0] != images[3]);
     generatedFrames += UINT(frame >= 2 && images[1] != scene);
   }

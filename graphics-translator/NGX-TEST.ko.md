@@ -104,6 +104,8 @@ render-grid 원본과 두 배 vector/절반 scale·독립 padding/subrect 표현
 원본과 atlas/inverse-camera 표현을 따로 비교한다. Render-grid와 display-grid는 MetalFX의 interpolation
 입력 해상도가 다르므로 두 출력의 pixel equality는 계약이 아니다. 기존 zero-motion 대비 효과,
 warm-up 이후 실제 생성, reset/replay, padding guard, release-before-execute 검사는 유지한다.
+Invalid-vector sentinel 케이스는 모든 guide가 같은 grid이므로 camera reconstruction 결과를
+정상 displacement를 직접 제공한 독립 feature와도 최대 1 byte 차이로 비교한다.
 이 oracle은 public NGX transport와 단위·원점 변환을 검사하며 실제 DLSS 품질과 동등함을 뜻하지 않는다.
 
 `owned-d3d12-ngx-features.exe --mode present`는 RR oracle 없이 실행하는 별도 FG 경로다. Runner suite는 `ngx-fg-present --mode present`다. 기존 `ngx-features --mode no-present`의 FG/RR/alpha case 수·protocol·RR oracle 요구는 그대로 유지된다.
