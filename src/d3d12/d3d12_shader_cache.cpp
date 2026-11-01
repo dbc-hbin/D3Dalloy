@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -333,12 +334,24 @@ HRESULT Paths(bool working_directory, std::wstring &directory, std::wstring &exe
 constexpr uint64_t kAutomaticEntryBytes = 64ull * 1024 * 1024;
 constexpr uint64_t kAutomaticDiskBytes = 256ull * 1024 * 1024;
 constexpr uint64_t kStageDiskBytes = 256ull * 1024 * 1024;
+constexpr uint64_t kStageEvictBatchBytes = 1ull * 1024 * 1024;
 
 static_assert(sizeof(WMTPipelineCacheIdentity) == 48);
 static_assert(sizeof(SM50_CONSTANT_RELOCATION) == 16);
 bool StageIdentity(WMTPipelineCacheIdentity &identity) { return WMTGetPipelineCacheIdentity(&identity); }
-struct AutomaticDiskAccounting;
-bool StageDiskHasRoom(const std::wstring &, const std::wstring &, AutomaticDiskAccounting &, uint64_t, uint64_t &);
+
+// Stage files this process has read or published. Eviction skips them: a working set larger than
+// the cap would otherwise evict entries still needed this run and get no disk hits on any launch.
+std::mutex stage_used_mutex;
+std::set<std::wstring> stage_used;
+void MarkStageUsed(const std::wstring &name) {
+  std::lock_guard lock(stage_used_mutex);
+  stage_used.insert(name);
+}
+bool StageUsed(const std::wstring &name) {
+  std::lock_guard lock(stage_used_mutex);
+  return stage_used.count(name) != 0;
+}
 
 struct FileHandle {
   HANDLE value = INVALID_HANDLE_VALUE;
@@ -428,47 +441,6 @@ struct AutomaticDiskLock {
   }
 };
 
-bool StageDiskHasRoom(const std::wstring &directory, const std::wstring &path,
-                      AutomaticDiskAccounting &accounting, uint64_t incoming, uint64_t &total) {
-  WIN32_FIND_DATAW data{};
-  const auto pattern = directory + std::wstring(kStagePrefix) + L"*";
-  const bool rescan = !accounting.valid;
-  total = accounting.bytes;
-  if (rescan) {
-    total = 0;
-    HANDLE search = FindFirstFileW(pattern.c_str(), &data);
-    if (search == INVALID_HANDLE_VALUE) {
-      if (GetLastError() != ERROR_FILE_NOT_FOUND) return false;
-    } else {
-      do {
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        const uint64_t size = (uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-        if (size > UINT64_MAX - total) {
-          FindClose(search);
-          return false;
-        }
-        total += size;
-      } while (FindNextFileW(search, &data));
-      const DWORD enumeration_error = GetLastError();
-      FindClose(search);
-      if (enumeration_error != ERROR_NO_MORE_FILES) return false;
-    }
-  }
-  uint64_t replaced = 0;
-  WIN32_FILE_ATTRIBUTE_DATA info{};
-  if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) {
-    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return false;
-    replaced = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-  } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
-    return false;
-  }
-  if (replaced > accounting.bytes && !rescan) return false;
-  if (replaced > total || total > kStageDiskBytes || incoming > kStageDiskBytes - (total - replaced)) return false;
-  total -= replaced;
-  accounting.valid = 0;
-  return true;
-}
-
 struct AutomaticTempFile {
   std::wstring path;
   FileHandle file;
@@ -525,6 +497,48 @@ HRESULT AutomaticDiskEntries(const std::wstring &directory, std::vector<Automati
       entries.push_back({name, bytes, (uint64_t(info.ftLastWriteTime.dwHighDateTime) << 32) |
                                     info.ftLastWriteTime.dwLowDateTime});
     }
+  } while (FindNextFileW(search, &info));
+  return GetLastError() == ERROR_NO_MORE_FILES ? S_OK : FileError();
+}
+
+// Layout: stage prefix, 40 hex key, ".bin", then optionally "-<8 hex>-<8 hex>.tmp".
+bool StageFileName(const std::wstring &name, bool &temporary) {
+  constexpr size_t p = std::size(kStagePrefix) - 1, key = p + 40, final_size = key + 4, temp_size = final_size + 22;
+  auto hex = [&](size_t first, size_t last) {
+    for (size_t i = first; i < last; ++i)
+      if (!((name[i] >= L'0' && name[i] <= L'9') || (name[i] >= L'a' && name[i] <= L'f'))) return false;
+    return true;
+  };
+  if (name.size() != final_size && name.size() != temp_size) return false;
+  if (name.compare(0, p, kStagePrefix) || !hex(p, key) || name.compare(key, 4, L".bin")) return false;
+  temporary = name.size() == temp_size;
+  return !temporary || (name[final_size] == L'-' && hex(final_size + 1, final_size + 9) &&
+                        name[final_size + 9] == L'-' && hex(final_size + 10, final_size + 18) &&
+                        name.compare(final_size + 18, 4, L".tmp") == 0);
+}
+
+// Caller holds AutomaticDiskLock, so remaining stage temps belong to crashed writers.
+HRESULT StageDiskEntries(const std::wstring &directory, std::vector<AutomaticDiskEntry> &entries, uint64_t &total) {
+  entries.clear();
+  total = 0;
+  WIN32_FIND_DATAW info;
+  HANDLE search = FindFirstFileW((directory + std::wstring(kStagePrefix) + L"*").c_str(), &info);
+  if (search == INVALID_HANDLE_VALUE)
+    return GetLastError() == ERROR_FILE_NOT_FOUND ? S_OK : FileError();
+  const SearchHandle search_handle{search};
+  do {
+    bool temporary = false;
+    const std::wstring name = info.cFileName;
+    if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !StageFileName(name, temporary)) continue;
+    if (temporary) {
+      if (!DeleteFileW((directory + name).c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) return FileError();
+      continue;
+    }
+    const uint64_t bytes = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    if (bytes > UINT64_MAX - total) return E_FAIL;
+    total += bytes;
+    entries.push_back({name, bytes, (uint64_t(info.ftLastWriteTime.dwHighDateTime) << 32) |
+                                  info.ftLastWriteTime.dwLowDateTime});
   } while (FindNextFileW(search, &info));
   return GetLastError() == ERROR_NO_MORE_FILES ? S_OK : FileError();
 }
@@ -663,7 +677,8 @@ HRESULT ReadAutomaticStageArtifact(const std::string &key, std::shared_ptr<const
     std::wstring directory, executable;
     if (FAILED(Paths(false, directory, executable))) return E_FAIL;
     const auto digest = Sha1HashState::compute(key.data(), key.size());
-    const auto path = directory + kStagePrefix + Hex(digest.data, sizeof(digest.data)) + L".bin";
+    const auto name = kStagePrefix + Hex(digest.data, sizeof(digest.data)) + L".bin";
+    const auto path = directory + name;
     const FileHandle file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
     if (file.value == INVALID_HANDLE_VALUE) return DXGI_ERROR_NOT_FOUND;
@@ -696,6 +711,7 @@ HRESULT ReadAutomaticStageArtifact(const std::string &key, std::shared_ptr<const
     value->view.ConstantDataSize = layout.constants.size; value->view.ConstantDataAlignment = layout.constant_alignment;
     value->view.ConstantRelocations = value->relocations.empty() ? nullptr : value->relocations.data();
     value->view.ConstantRelocationCount = value->relocations.size();
+    MarkStageUsed(name);
     artifact = std::move(value);
     return S_OK;
   } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
@@ -712,6 +728,8 @@ void WriteAutomaticStageArtifact(const std::string &key, const ShaderStageArtifa
         uint64_t(artifact.relocations.size()) * sizeof(SM50_CONSTANT_RELOCATION), artifact.view.ConstantDataAlignment};
     uint64_t encoded_size = 0;
     if (dxmt_stage_cache_measure(&parts, &encoded_size) != DXMT_STAGE_CACHE_SUCCESS || !StageIdentity(identity)) return;
+    // The reader rejects larger files; the bound also keeps kStageDiskBytes - encoded_size from wrapping.
+    if (dxmt_stage_cache_file_size(encoded_size) != DXMT_STAGE_CACHE_SUCCESS) return;
     std::vector<uint8_t> bytes((size_t(encoded_size)));
     DxmtStageCacheLayout layout{};
     if (dxmt_stage_cache_encode(&parts, bytes.data(), bytes.size(), &layout) != DXMT_STAGE_CACHE_SUCCESS) return;
@@ -725,25 +743,56 @@ void WriteAutomaticStageArtifact(const std::string &key, const ShaderStageArtifa
     AutomaticDiskLock disk_lock;
     if (FAILED(disk_lock.acquire(directory))) return;
     const auto digest = Sha1HashState::compute(key.data(), key.size());
-    const auto path = directory + kStagePrefix + Hex(digest.data, sizeof(digest.data)) + L".bin";
+    const auto name = kStagePrefix + Hex(digest.data, sizeof(digest.data)) + L".bin";
+    const auto path = directory + name;
+    auto &accounting = *disk_lock.stage_accounting;
+    const bool rescan = !accounting.valid;
+    uint64_t total = accounting.bytes;
+    // Invalid until publication commits: temp cleanup, eviction, errors and crashes need a rescan.
+    accounting.valid = 0;
+    std::vector<AutomaticDiskEntry> entries;
+    if (rescan && FAILED(StageDiskEntries(directory, entries, total))) return;
+    uint64_t replaced = 0;
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info)) {
+      if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return;
+      replaced = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    } else if (GetLastError() != ERROR_FILE_NOT_FOUND) return;
+    if (replaced > total) return;
+    if (total - replaced > kStageDiskBytes - encoded_size) {
+      if (!rescan) {
+        if (FAILED(StageDiskEntries(directory, entries, total))) return;
+        if (replaced > total) return;
+      }
+      const uint64_t target = kStageDiskBytes - std::max<uint64_t>(encoded_size, kStageEvictBatchBytes);
+      // Oldest publication first, skipping entries this process read or wrote. Readers open with
+      // FILE_SHARE_DELETE, so an open reader keeps its bytes while the name disappears.
+      std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) { return a.age < b.age; });
+      for (const auto &entry : entries) {
+        if (total - replaced <= target) break;
+        if (entry.name == name || StageUsed(entry.name)) continue;
+        if (!DeleteFileW((directory + entry.name).c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) return;
+        total -= entry.bytes;
+      }
+    }
+    if (total - replaced > kStageDiskBytes - encoded_size) return;
     static std::atomic<uint32_t> sequence{0};
     const uint32_t pid = GetCurrentProcessId(), serial = ++sequence;
-    const auto temp = path + L"-" + Hex(&pid, sizeof(pid)) + L"-" + Hex(&serial, sizeof(serial)) + L".tmp";
-    uint64_t total = 0;
-    if (!StageDiskHasRoom(directory, path, *disk_lock.stage_accounting, encoded_size, total)) return;
-    FileHandle file{CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr)};
-    if (file.value == INVALID_HANDLE_VALUE) return;
-    if (!Write(file.value, bytes.data(), DWORD(bytes.size())) || !FlushFileBuffers(file.value)) {
-      CloseHandle(file.value); file.value = INVALID_HANDLE_VALUE;
-      DeleteFileW(temp.c_str()); return;
-    }
-    CloseHandle(file.value); file.value = INVALID_HANDLE_VALUE;
-    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-      DeleteFileW(temp.c_str());
-    else {
-      disk_lock.stage_accounting->bytes = total + encoded_size;
-      disk_lock.stage_accounting->valid = 1;
-    }
+    AutomaticTempFile temporary;
+    temporary.path = path + L"-" + Hex(&pid, sizeof(pid)) + L"-" + Hex(&serial, sizeof(serial)) + L".tmp";
+    temporary.file.value = CreateFileW(temporary.path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                       FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (temporary.file.value == INVALID_HANDLE_VALUE) return;
+    temporary.owned = true;
+    if (!Write(temporary.file.value, bytes.data(), DWORD(bytes.size())) || !FlushFileBuffers(temporary.file.value))
+      return;
+    if (!CloseHandle(temporary.file.value)) return;
+    temporary.file.value = INVALID_HANDLE_VALUE;
+    if (!MoveFileExW(temporary.path.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return;
+    temporary.owned = false;
+    MarkStageUsed(name);
+    accounting.bytes = total - replaced + encoded_size;
+    accounting.valid = 1;
   } catch (...) {}
 }
 
