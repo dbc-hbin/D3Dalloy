@@ -206,6 +206,7 @@ struct MTLD3D12GraphicsCommandListImpl : RecordingInterface {
   unsigned render_pass_flags_ = 0;
   bool owned_closed_valid = false, predication_enabled_ = false;
   uint64_t owned_id = 1, owned_recording = 1;
+  uint64_t async_targets_epoch_ = 0;
   struct Pipeline { bool uses_atomic64 = false; } pipeline;
   Pipeline *pso_compute_ = &pipeline;
 
