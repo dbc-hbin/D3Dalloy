@@ -1934,6 +1934,7 @@ Converter::operator()(const InstSample &sample) {
   }
 
   auto [Value, Residency] = air.CreateCoordinateSample(
+      Tex->Logical, sample.offsets[0] || sample.offsets[1] || sample.offsets[2],
       Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, nullptr,
       [&] {
         return air.CreateSample(
@@ -2029,6 +2030,7 @@ Converter::operator()(const InstSampleLOD &sample) {
   LOD = air.CreateFPBinOp(AIRBuilder::fmax, LOD, DecodeTextureMinLODClamp(Tex->Metadata));
 
   auto [Value, Residency] = air.CreateCoordinateSample(
+      Tex->Logical, sample.offsets[0] || sample.offsets[1] || sample.offsets[2],
       Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, nullptr,
       [&] {
         return air.CreateSample(
@@ -2126,6 +2128,7 @@ Converter::operator()(const InstSampleBias &sample) {
   auto Bias = ir.CreateFAdd(Sampler->Bias, LoadOperand(sample.src_bias, kMaskComponentX));
 
   auto [Value, Residency] = air.CreateCoordinateSample(
+      Tex->Logical, sample.offsets[0] || sample.offsets[1] || sample.offsets[2],
       Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, nullptr,
       [&] {
         return air.CreateSample(
@@ -2244,6 +2247,7 @@ Converter::operator()(const InstSampleDerivative &sample) {
   }
 
   auto [Value, Residency] = air.CreateCoordinateSample(
+      Tex->Logical, sample.offsets[0] || sample.offsets[1] || sample.offsets[2],
       Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, nullptr,
       [&] {
         return air.CreateSample(
@@ -2410,6 +2414,7 @@ Converter::operator()(const InstGather &sample) {
   }
 
   auto [Value, Residency] = air.CreateCoordinateSample(
+      Tex->Logical, air.HasSampleOffsets(Offset),
       Sampler->Metadata, Tex->Handle, DecodeTextureMinLODClamp(Tex->Metadata), Tex->FormatDefaults, Component,
       [&] {
         return air.CreateGather(

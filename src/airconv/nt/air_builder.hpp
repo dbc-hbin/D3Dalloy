@@ -132,9 +132,14 @@ public:
     return builder.CreateFDiv(coord, size);
   }
   std::pair<Value *, Value *> CreateCoordinateSample(
+      Texture::ResourceKind Logical, bool HasOffsets,
       Value *Metadata, Value *TextureHandle, Value *ResourceMinLOD, Value *FormatDefaults, Value *GatherComponent,
       function_ref<std::pair<Value *, Value *>()> Pixel,
       function_ref<std::pair<Value *, Value *>()> Normalized);
+  static bool HasSampleOffsets(Value *offset) {
+    auto *constant = dyn_cast_or_null<Constant>(offset);
+    return offset && (!constant || !constant->isNullValue());
+  }
   AIRBuilder(IRBuilderBase &ir_builder, raw_ostream &debug) : builder(ir_builder), debug(debug), options() {}
 
   AIRBuilder(const AIRBuilderOptions &options, IRBuilderBase &ir_builder, raw_ostream &debug) :

@@ -458,6 +458,7 @@ private:
   llvm::Value *bufferByteOffset(llvm::Value *c0, llvm::Value *c1, uint32_t structure_stride);
   llvm::Value *bufferBytesInBounds(const dxbc::BufferDescriptor &buffer, llvm::Value *byte, unsigned bytes);
   llvm::Value *bufferBytePointer(const dxbc::BufferDescriptor &buffer, llvm::Value *byte, llvm::Type *type);
+  llvm::Value *boundedLoad(llvm::Type *type, llvm::Value *pointer, llvm::Value *valid);
   llvm::Error loadBufferWords(
       llvm::CallInst *call, const dxbc::BufferDescriptor &buffer, llvm::Value *c0, llvm::Value *c1, uint32_t mask
   );
@@ -840,6 +841,25 @@ ResourceLowering::bufferBytePointer(const dxbc::BufferDescriptor &buffer, llvm::
   return builder.CreateBitCast(address, type->getPointerTo(1));
 }
 
+/* A load that reads zero when `valid` is false, without control flow. The select
+ * of its address is materialized after optimization (dxmt::lowerBoundedLoads):
+ * InstCombine rescans the block for every load of a select, which costs far more
+ * conversion time than it saves. A null `valid` is an unconditional load. */
+llvm::Value *
+ResourceLowering::boundedLoad(llvm::Type *type, llvm::Value *pointer, llvm::Value *valid) {
+  if (!valid)
+    return builder.CreateLoad(type, pointer);
+  auto space = llvm::cast<llvm::PointerType>(pointer->getType())->getAddressSpace();
+  auto bounded = info.module->getOrInsertFunction(
+      (llvm::Twine("dxmt.bounded.load.") + llvm::Twine(space) + "." + llvm::Twine(type->getPrimitiveSizeInBits())).str(),
+      llvm::FunctionType::get(type, {builder.getInt1Ty(), pointer->getType()}, false));
+  auto *helper = llvm::cast<llvm::Function>(bounded.getCallee());
+  helper->setOnlyReadsMemory();
+  helper->setDoesNotThrow();
+  helper->setWillReturn();
+  return builder.CreateCall(bounded, {valid, pointer});
+}
+
 llvm::Error
 ResourceLowering::loadBufferWords(
     llvm::CallInst *call, const dxbc::BufferDescriptor &buffer, llvm::Value *c0, llvm::Value *c1, uint32_t mask
@@ -879,8 +899,8 @@ ResourceLowering::loadBufferWords(
   llvm::BasicBlock *fast_block = nullptr;
   llvm::Instruction *slow_term = call;
   if (!coherent && !(buffer.StatusBase && usesStatus(call))) {
-    /* Loads need no control flow: a Metal device load through a null pointer reads
-     * zero, so each lane selects its own address or null. Partial out-of-bounds
+    /* Loads need no control flow: each lane selects its own address or a zero-filled
+     * constant (see boundedLoad). Partial out-of-bounds
      * accesses still zero exactly the lanes past the view. Branch-free loads keep
      * the generated AIR small enough for fast native pipeline compilation. */
     llvm::SmallVector<llvm::Value *, 4> components(4, llvm::UndefValue::get(lane_type));
@@ -888,19 +908,7 @@ ResourceLowering::loadBufferWords(
       auto *byte = bytes[lane];
       auto *condition = bufferBytesInBounds(buffer, byte, width / 8);
       auto lane_load = [&](llvm::Type *type, llvm::Value *at, llvm::Value *valid) -> llvm::Value * {
-        auto *pointer = bufferBytePointer(buffer, at, type);
-        if (!valid)
-          return builder.CreateLoad(type, pointer);
-        /* The select is materialized after optimization (dxmt::lowerBoundedLoads):
-         * InstCombine rescans the block for every load of a select, which costs
-         * far more conversion time than it saves. */
-        auto bounded = info.module->getOrInsertFunction(
-            (llvm::Twine("dxmt.bounded.load.") + llvm::Twine(type->getPrimitiveSizeInBits())).str(),
-            llvm::FunctionType::get(type, {builder.getInt1Ty(), pointer->getType()}, false));
-        llvm::cast<llvm::Function>(bounded.getCallee())->setOnlyReadsMemory();
-        llvm::cast<llvm::Function>(bounded.getCallee())->setDoesNotThrow();
-        llvm::cast<llvm::Function>(bounded.getCallee())->setWillReturn();
-        return builder.CreateCall(bounded, {valid, pointer});
+        return boundedLoad(type, bufferBytePointer(buffer, at, type), valid);
       };
       llvm::Value *value;
       if (width != 64) {
@@ -1936,22 +1944,13 @@ ResourceLowering::lowerCBufferLoadLegacy(llvm::CallInst *call) {
   const auto &buffer = *handle->cbuffer;
   auto *row = call->getArgOperand(2);
   auto *row_type = air.getIntTy(4);
-  /* SM5.1 constant buffer OOB reads return zero. A descriptor table CBV carries
-   * its size, and a null descriptor carries zero, so the row is guarded by real
-   * control flow: the row load must not be issued at all when the descriptor does
-   * not cover it. Root CBVs carry no size, which is exactly the information a root
-   * CBV is bound with, so their access stays unconditional. */
+  /* Table CBVs carry a size (zero for null descriptors). Select zero storage for
+   * an uncovered row; root CBVs carry no size and remain unconditional. */
   auto *condition = buffer.Metadata
                         ? builder.CreateICmpULT(row, builder.CreateLShr(Low32(buffer.Metadata), 4))
                         : nullptr;
-  auto guarded = emitGuardedAccess(
-      condition, call, {row_type},
-      [&]() -> llvm::SmallVector<llvm::Value *, 4> {
-        auto *pointer = builder.CreateGEP(row_type, buffer.Pointer, {row});
-        return {builder.CreateLoad(row_type, pointer)};
-      }
-  );
-  llvm::Value *value = guarded[0];
+  auto *pointer = builder.CreateGEP(row_type, buffer.Pointer, {row});
+  llvm::Value *value = boundedLoad(row_type, pointer, condition);
   auto *result_type = llvm::cast<llvm::StructType>(call->getType());
   auto *lane_type = result_type->getElementType(0);
   auto *vector_type = llvm::FixedVectorType::get(lane_type, result_type->getNumElements());
@@ -3304,6 +3303,7 @@ ResourceLowering::lowerSample(llvm::CallInst *call) {
     min_lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, min_lod, clamp);
 
   auto [texel, residency] = air.CreateCoordinateSample(
+      descriptor->ResourceKindLogical, air.HasSampleOffsets(offsets),
       sampler_handle->sampler->Metadata, descriptor->ResourceHandle, minLodClamp(*descriptor),
       descriptor->FormatDefaults, nullptr,
       [&] {
@@ -3357,6 +3357,7 @@ ResourceLowering::lowerGather(llvm::CallInst *call) {
   auto *offsets = gatherOffsets(call, *descriptor, *sampler_handle->sampler, coord);
 
   auto [texel, residency] = air.CreateCoordinateSample(
+      descriptor->ResourceKindLogical, air.HasSampleOffsets(textureOffsets(call, 7, *descriptor, 6)),
       sampler_handle->sampler->Metadata, descriptor->ResourceHandle, minLodClamp(*descriptor),
       descriptor->FormatDefaults, call->getArgOperand(9),
       [&] {
@@ -3707,6 +3708,7 @@ ResourceLowering::lowerSampleBias(llvm::CallInst *call) {
     min_lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, min_lod, clamp);
 
   auto [texel, residency] = air.CreateCoordinateSample(
+      descriptor->ResourceKindLogical, air.HasSampleOffsets(offsets),
       sampler_handle->sampler->Metadata, descriptor->ResourceHandle, minLodClamp(*descriptor),
       descriptor->FormatDefaults, nullptr,
       [&] {
@@ -3763,6 +3765,7 @@ ResourceLowering::lowerSampleLevel(llvm::CallInst *call) {
   lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, lod, minLodClamp(*descriptor));
 
   auto [texel, residency] = air.CreateCoordinateSample(
+      descriptor->ResourceKindLogical, air.HasSampleOffsets(offsets),
       sampler_handle->sampler->Metadata, descriptor->ResourceHandle, minLodClamp(*descriptor),
       descriptor->FormatDefaults, nullptr,
       [&] {
@@ -3825,6 +3828,7 @@ ResourceLowering::lowerSampleGrad(llvm::CallInst *call) {
     min_lod = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, min_lod, clamp);
 
   auto [texel, residency] = air.CreateCoordinateSample(
+      descriptor->ResourceKindLogical, air.HasSampleOffsets(offsets),
       sampler_handle->sampler->Metadata, descriptor->ResourceHandle, minLodClamp(*descriptor),
       descriptor->FormatDefaults, nullptr,
       [&] {
@@ -4062,6 +4066,7 @@ ResourceLowering::lowerGatherRaw(llvm::CallInst *call) {
   auto gather = [&](unsigned component) {
     auto *channel = air.getInt(component);
     auto result = air.CreateCoordinateSample(
+        descriptor->ResourceKindLogical, air.HasSampleOffsets(textureOffsets(call, 7, *descriptor, 6)),
         sampler_handle->sampler->Metadata, descriptor->ResourceHandle, minLodClamp(*descriptor),
         descriptor->FormatDefaults, channel,
         [&] {

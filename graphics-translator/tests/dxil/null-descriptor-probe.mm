@@ -96,6 +96,7 @@ constexpr DescriptorSlot kNullDescriptor{0, 0, 0, 0};
 
 struct CompiledShader {
   id<MTLFunction> function = nil;
+  id<MTLBuffer> constants = nil;
   MTL_SHADER_REFLECTION reflection{};
 };
 
@@ -141,6 +142,10 @@ bool CompileShader(
 
   SM50_COMPILED_BITCODE compiled{};
   SM50GetCompiledBitcode(bitcode, &compiled);
+  if (compiled.ConstantDataSize)
+    out.constants = [device newBufferWithBytes:compiled.ConstantData
+                                        length:compiled.ConstantDataSize
+                                       options:MTLResourceStorageModeShared];
   std::printf("NULL_DESCRIPTOR_PROBE_COMPILE metallib_bytes=%llu\n",
               static_cast<unsigned long long>(compiled.Size));
   dispatch_data_t data =
@@ -253,6 +258,8 @@ int RunProbe(id<MTLDevice> device, id<MTLCommandQueue> queue, const std::vector<
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:pipeline];
   [encoder setBuffer:arguments offset:0 atIndex:kRootArgumentsSlot];
+  if (shader.constants)
+    [encoder setBuffer:shader.constants offset:0 atIndex:SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS];
   [encoder useResource:heap usage:MTLResourceUsageRead];
   [encoder useResource:oob usage:MTLResourceUsageRead | MTLResourceUsageWrite];
   [encoder useResource:result usage:MTLResourceUsageRead | MTLResourceUsageWrite];

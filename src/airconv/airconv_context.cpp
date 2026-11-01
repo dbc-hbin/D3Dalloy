@@ -105,6 +105,15 @@ runOptimizationPasses(llvm::Module &M) {
       auto is_null = M.getOrInsertFunction(
           ("air.is_null_" + type->getName().drop_front(StringRef("struct._").size()).drop_back(2)).str(),
           FunctionType::get(builder.getInt1Ty(), {texture->getType()}, false));
+      auto *query = cast<Function>(is_null.getCallee());
+      query->setOnlyReadsMemory();
+      query->setOnlyAccessesArgMemory();
+      query->setDoesNotThrow();
+      query->setWillReturn();
+      query->addFnAttr(Attribute::NoFree);
+      query->addFnAttr(Attribute::MustProgress);
+      query->addParamAttr(0, Attribute::NoCapture);
+      query->addParamAttr(0, Attribute::ReadOnly);
       Value *present = builder.CreateNot(builder.CreateCall(is_null, {texture}));
       for (auto &argument : call->args()) {
         auto *pointer = dyn_cast<PointerType>(argument->getType());
@@ -255,19 +264,33 @@ runOptimizationPasses(llvm::Module &M) {
 
 void
 lowerBoundedLoads(llvm::Module &M) {
-  /* dxmt.bounded.load.N(valid, pointer) is a device load that reads zero when
-   * `valid` is false: Metal defines device loads through a null pointer as zero. */
+  /* dxmt.bounded.load.*(valid, pointer) is a device or constant load that reads zero
+   * when `valid` is false. The fallback address is a zero-filled constant: a load
+   * through null also reads zero on Apple GPUs, but Shader Validation rejects it and
+   * Metal does not define it. Its 16 bytes cover the widest bounded load (a CBV row). */
   SmallVector<Function *, 4> helpers;
   for (auto &function : M)
     if (function.isDeclaration() && function.getName().startswith("dxmt.bounded.load."))
       helpers.push_back(&function);
+  if (helpers.empty())
+    return;
+  auto *zero_type = ArrayType::get(Type::getInt32Ty(M.getContext()), 4);
+  auto *zero = new GlobalVariable(M, zero_type, true, GlobalValue::InternalLinkage,
+                                  ConstantAggregateZero::get(zero_type), "dxmt.bounded.zero", nullptr,
+                                  GlobalValue::NotThreadLocal, 2);
+  zero->setAlignment(Align(16));
   for (auto *helper : helpers) {
+    auto *type = cast<PointerType>(helper->getFunctionType()->getParamType(1));
+    /* Device pointers reach the constant by its address, as Metal's own
+     * reinterpret_cast of a program-scope constant does. */
+    auto *fallback = type->getAddressSpace() == 2
+        ? ConstantExpr::getBitCast(zero, type)
+        : ConstantExpr::getIntToPtr(ConstantExpr::getPtrToInt(zero, Type::getInt64Ty(M.getContext())), type);
     for (auto *user : make_early_inc_range(helper->users())) {
       auto *call = cast<CallInst>(user);
       IRBuilder<> builder(call);
       auto *pointer = call->getArgOperand(1);
-      auto *bounded = builder.CreateSelect(call->getArgOperand(0), pointer,
-                                           ConstantPointerNull::get(cast<PointerType>(pointer->getType())));
+      auto *bounded = builder.CreateSelect(call->getArgOperand(0), pointer, fallback);
       auto *load = builder.CreateLoad(call->getType(), bounded);
       call->replaceAllUsesWith(load);
       call->eraseFromParent();

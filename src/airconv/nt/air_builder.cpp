@@ -1409,11 +1409,14 @@ AIRBuilder::CreateIntegerBorder(const Texture &texture, Texture::ResourceKind lo
 
 std::pair<Value *, Value *>
 AIRBuilder::CreateCoordinateSample(
+    Texture::ResourceKind Logical, bool HasOffsets,
     Value *Metadata, Value *TextureHandle, Value *ResourceMinLOD, Value *FormatDefaults, Value *GatherComponent,
     function_ref<std::pair<Value *, Value *>()> Pixel,
     function_ref<std::pair<Value *, Value *>()> Normalized
 ) {
-  if (!Metadata)
+  // D3D12 pixel coordinates are only defined for non-array 1D/2D views without offsets.
+  if (!Metadata || HasOffsets ||
+      (Logical != Texture::texture1d && Logical != Texture::texture2d && Logical != Texture::depth2d))
     return Normalized();
   auto *pixel = builder.CreateICmpNE(builder.CreateAnd(Metadata, builder.getInt64(uint64_t(1) << 47)),
                                      builder.getInt64(0));
