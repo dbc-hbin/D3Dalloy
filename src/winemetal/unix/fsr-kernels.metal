@@ -370,22 +370,23 @@ kernel void yaagl_fg_decode_distortion(
     destination.write(source.read(uint2(params.sourceOrigin) + tid) * params.motionScale.x + params.motionScale.y, tid);
 }
 
-kernel void yaagl_fg_normalize_motion(
-    texture2d<float, access::read> source [[texture(0)]],
-    texture2d<half, access::write> destination [[texture(1)]],
-    texture2d<float, access::read> depth [[texture(2)]],
-    texture2d<float, access::read> sourceDepth [[texture(4)]],
-    constant YaaglFgParams& params [[buffer(0)]],
-    uint2 tid [[thread_position_in_grid]]) {
-    if (any(tid >= params.extent)) return;
-    uint2 sourcePosition = fg_source_position(tid, params.extent, params.sourceExtent);
-    if (params.depthDilation) {
-        uint2 nearest = fg_nearest_depth(sourceDepth,
-            fg_source_position(tid, params.extent, params.depthSourceExtent),
-            params.depthSourceExtent, params.depthInverted != 0u);
-        sourcePosition = min(uint2((float2(nearest) + 0.5f) * float2(params.sourceExtent) /
-                                   float2(params.depthSourceExtent)), params.sourceExtent - 1u);
-    }
+// Motion is read at the depth winner; a dilated winner maps onto the motion grid.
+static uint2 fg_motion_position(uint2 tid, uint2 depthPosition, constant YaaglFgParams& params) {
+    if (!params.depthDilation) return fg_source_position(tid, params.extent, params.sourceExtent);
+    return min(uint2((float2(depthPosition) + 0.5f) * float2(params.sourceExtent) /
+                     float2(params.depthSourceExtent)), params.sourceExtent - 1u);
+}
+
+static uint2 fg_depth_position(uint2 tid, texture2d<float, access::read> sourceDepth, constant YaaglFgParams& params) {
+    uint2 position = fg_source_position(tid, params.extent, params.depthSourceExtent);
+    if (params.depthDilation)
+        position = fg_nearest_depth(sourceDepth, position, params.depthSourceExtent, params.depthInverted != 0u);
+    return position;
+}
+
+// clipDepth is the normalized depth at tid; it is used only for camera reconstruction.
+static half4 fg_normalized_motion(texture2d<float, access::read> source, uint2 tid, uint2 sourcePosition,
+                                  float clipDepth, constant YaaglFgParams& params) {
     float2 value = source.read(sourcePosition).xy;
     // Either invalid component invalidates the object vector; camera reprojection is still applied below.
     if (params.motionVectorsInvalidValuePresent &&
@@ -395,13 +396,45 @@ kernel void yaagl_fg_normalize_motion(
                     float2(params.outputExtent) / float2(params.motionTargetExtent);
     if (params.reconstructCameraMotion) {
         float2 uv = (float2(tid) + 0.5f) / float2(params.extent);
-        float4 clip = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), depth.read(tid).r, 1.0f);
+        float4 clip = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), clipDepth, 1.0f);
         // NGX rows occupy Metal columns: this is the public row-vector transform.
         float4 previous = params.clipToPreviousClip * clip;
         if (all(isfinite(previous)) && abs(previous.w) > 1.0e-6f)
             pixels += (previous.xy / previous.w - clip.xy) * float2(0.5f, -0.5f) * float2(params.outputExtent);
     }
-    destination.write(half4(half(fg_store_half_range(pixels.x)), half(fg_store_half_range(pixels.y)), 0.0h, 0.0h), tid);
+    return half4(half(fg_store_half_range(pixels.x)), half(fg_store_half_range(pixels.y)), 0.0h, 0.0h);
+}
+
+kernel void yaagl_fg_normalize_motion(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<half, access::write> destination [[texture(1)]],
+    texture2d<float, access::read> depth [[texture(2)]],
+    texture2d<float, access::read> sourceDepth [[texture(4)]],
+    constant YaaglFgParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.extent)) return;
+    uint2 sourcePosition = fg_motion_position(tid,
+        params.depthDilation ? fg_depth_position(tid, sourceDepth, params) : uint2(0u), params);
+    float clipDepth = params.reconstructCameraMotion ? depth.read(tid).r : 0.0f;
+    destination.write(fg_normalized_motion(source, tid, sourcePosition, clipDepth, params), tid);
+}
+
+// yaagl_fg_resample_depth followed by yaagl_fg_normalize_motion on the same grid:
+// one nearest-depth search serves both, and camera reconstruction uses the
+// depth value this thread stores instead of reading it back.
+kernel void yaagl_fg_normalize_depth_motion(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<half, access::write> destination [[texture(1)]],
+    texture2d<float, access::write> depth [[texture(2)]],
+    texture2d<float, access::read> sourceDepth [[texture(4)]],
+    constant YaaglFgParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.extent)) return;
+    uint2 depthPosition = fg_depth_position(tid, sourceDepth, params);
+    float4 depthValue = sourceDepth.read(depthPosition);
+    depth.write(depthValue, tid);
+    destination.write(fg_normalized_motion(source, tid, fg_motion_position(tid, depthPosition, params),
+                                           depthValue.r, params), tid);
 }
 
 kernel void yaagl_fg_encode_scatter(

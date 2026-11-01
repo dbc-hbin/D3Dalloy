@@ -27,7 +27,7 @@ void require(bool ok, const char* reason) {
     if (!ok) { std::fprintf(stderr, "OWNED_FG_DEBUG_NATIVE_FAIL reason=%s\n", reason); std::exit(1); }
 }
 // Observe public native calls; only the explicit retry proof injects failures.
-struct Operations { unsigned depth=0, motion=0, snapshots=0; };
+struct Operations { unsigned depth=0, motion=0, snapshots=0, fused=0; };
 struct CompileCounts { unsigned libraries=0, pipelines=0; } compileCounts;
 using NewLibrary = id<MTLLibrary> (*)(id,SEL,NSString*,MTLCompileOptions*,NSError**);
 using NewPipeline = id<MTLComputePipelineState> (*)(id,SEL,id<MTLFunction>,NSError**);
@@ -61,7 +61,8 @@ id<MTLComputePipelineState> observeNew(id device,SEL selector,id<MTLFunction> fu
         }
     }
     auto pipeline=originalNew(device,selector,function,error);
-    unsigned kernel=[function.name isEqualToString:@"yaagl_fg_resample_depth"]?1:[function.name isEqualToString:@"yaagl_fg_normalize_motion"]?2:0;
+    unsigned kernel=[function.name isEqualToString:@"yaagl_fg_resample_depth"]?1:[function.name isEqualToString:@"yaagl_fg_normalize_motion"]?2:
+        [function.name isEqualToString:@"yaagl_fg_normalize_depth_motion"]?3:0;
     std::lock_guard lock(observationMutex); if(pipeline) ownedPipelines[pipeline]=kernel; return pipeline;
 }
 void observeSet(id encoder,SEL selector,id<MTLComputePipelineState> pipeline) {
@@ -69,7 +70,7 @@ void observeSet(id encoder,SEL selector,id<MTLComputePipelineState> pipeline) {
     originalSet(encoder,selector,pipeline);
 }
 void observeDispatch(id encoder,SEL selector,MTLSize threads,MTLSize group) {
-    { std::lock_guard lock(observationMutex); unsigned kernel=encoderPipelines[encoder]; if(kernel==1)++operations.depth; if(kernel==2)++operations.motion; }
+    { std::lock_guard lock(observationMutex); unsigned kernel=encoderPipelines[encoder]; if(kernel==1)++operations.depth; if(kernel==2)++operations.motion; if(kernel==3)++operations.fused; }
     originalDispatch(encoder,selector,threads,group);
 }
 void observeCopy(id encoder,SEL selector,id<MTLTexture> source,NSUInteger slice,NSUInteger level,MTLOrigin origin,MTLSize size,id<MTLTexture> target,NSUInteger targetSlice,NSUInteger targetLevel,MTLOrigin targetOrigin) {
@@ -224,8 +225,9 @@ void normalizationProof(Harness& h) {
                     afterCompile.pipelines-beforeCompile.pipelines==4*batches, "configuration-batch-library-count-and-reuse");
             snapshotSources[0]=snapshotSources[1]=nil; auto counts=operations;
             require(counts.snapshots==2,"prepare-two-private-snapshots");
-            require(mode==1?(counts.depth>0 && counts.motion>0):(!counts.depth && !counts.motion),"actual-normalization-dispatch-count");
-            totals[mode].depth+=counts.depth; totals[mode].motion+=counts.motion; totals[mode].snapshots+=counts.snapshots;
+            // Converted depth and motion share one fused normalization dispatch.
+            require(mode==1?(counts.fused>0 && !counts.depth && !counts.motion):(!counts.depth && !counts.motion && !counts.fused),"actual-normalization-dispatch-count");
+            totals[mode].depth+=counts.depth; totals[mode].motion+=counts.motion; totals[mode].snapshots+=counts.snapshots; totals[mode].fused+=counts.fused;
             auto pixels=read(h.device,h.queue,output);
             if(const char* directory=std::getenv("OWNED_FG_PROOF_OUTPUT")) {
                 char path[1024]; require(std::snprintf(path,sizeof(path),"%s/frame-%u-mode-%u.rgba16f",directory,frame,mode)<int(sizeof(path)),"artifact-path");
@@ -246,7 +248,7 @@ void normalizationProof(Harness& h) {
             } else {
                 float maximum=0;
                 for(size_t i=0;i<pixels.size();++i) { _Float16 a,b; std::memcpy(&a,baseline.data()+i,2);std::memcpy(&b,pixels.data()+i,2);require(std::isfinite(float(a)) && std::isfinite(float(b)),"normalization-finite"); maximum=std::max(maximum,std::fabs(float(a)-float(b))); }
-                std::printf("OWNED_FG_NORMALIZATION_COMPARE frame=%u mode=%u components=%zu max_abs=%.9g depth_dispatches=%u motion_dispatches=%u private_snapshot_copies=%u\n",frame,mode,pixels.size(),maximum,counts.depth,counts.motion,counts.snapshots);
+                std::printf("OWNED_FG_NORMALIZATION_COMPARE frame=%u mode=%u components=%zu max_abs=%.9g depth_dispatches=%u motion_dispatches=%u fused_dispatches=%u private_snapshot_copies=%u\n",frame,mode,pixels.size(),maximum,counts.depth,counts.motion,counts.fused,counts.snapshots);
                 require(maximum<=2.0f/255.0f,"normalization-output-history-equivalent");
                 if(mode==2)require(pixels==baseline,"prepare-retained-snapshot-exact");
             }
@@ -257,7 +259,7 @@ void normalizationProof(Harness& h) {
     require(interpolated>=3,"three-interpolated-frames");
     const auto counts = compilations();
     require(counts.libraries==4 && counts.pipelines==16, "independent-configurations-have-no-global-library-cache");
-    for(unsigned mode=0;mode<3;++mode) {h.destroy(contexts[mode]);std::printf("OWNED_FG_NORMALIZATION_COUNTS mode=%u depth_dispatches=%u motion_dispatches=%u private_snapshot_copies=%u\n",mode,totals[mode].depth,totals[mode].motion,totals[mode].snapshots);}
+    for(unsigned mode=0;mode<3;++mode) {h.destroy(contexts[mode]);std::printf("OWNED_FG_NORMALIZATION_COUNTS mode=%u depth_dispatches=%u motion_dispatches=%u fused_dispatches=%u private_snapshot_copies=%u\n",mode,totals[mode].depth,totals[mode].motion,totals[mode].fused,totals[mode].snapshots);}
     std::printf("OWNED_FG_NORMALIZATION_PASS interpolated_frames=%u all_pixels=1 guards=1 snapshots_mutated_after_completion=1\n",interpolated);
 }
 }

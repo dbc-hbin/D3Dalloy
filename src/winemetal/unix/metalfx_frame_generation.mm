@@ -425,6 +425,7 @@ struct Kernels {
     Object decodePipeline;
     Object depthPipeline;
     Object motionPipeline;
+    Object depthMotionPipeline;
     Object encodePipeline;
     Object distortionPipeline;
 };
@@ -452,10 +453,11 @@ std::shared_ptr<const Kernels> deviceKernels(id<MTLDevice> device) {
     result->decodePipeline = makePipeline(device, library, @"yaagl_fg_decode_crop");
     result->depthPipeline = makePipeline(device, library, @"yaagl_fg_resample_depth");
     result->motionPipeline = makePipeline(device, library, @"yaagl_fg_normalize_motion");
+    result->depthMotionPipeline = makePipeline(device, library, @"yaagl_fg_normalize_depth_motion");
     result->encodePipeline = makePipeline(device, library, @"yaagl_fg_encode_scatter");
     result->distortionPipeline = makePipeline(device, library, @"yaagl_fg_decode_distortion");
     if (!result->decodePipeline || !result->depthPipeline || !result->motionPipeline ||
-        !result->encodePipeline || !result->distortionPipeline)
+        !result->depthMotionPipeline || !result->encodePipeline || !result->distortionPipeline)
         return {};
     kernelCache.push_back(result);
     return result;
@@ -1289,7 +1291,13 @@ bool PreparedFrame::encode(
                     d.distortion_width, d.distortion_height, d.distortion_x, d.distortion_y};
                 // One prepass encoder: baseline copies, then independent decode and
                 // depth passes, then motion (camera reconstruction reads normalized
-                // depth). Stage barriers replace per-pass fence boundaries.
+                // depth). Stage barriers replace per-pass fence boundaries. When both
+                // depth and motion are normalized, one fused pass shares the
+                // nearest-depth search; both use the same extent and depth grid.
+                // The snapshot and normalized depth share configuration.depth, so the
+                // value the fused pass reconstructs camera motion from round-trips the
+                // store exactly, as the separate motion pass would read it back.
+                const bool fuseDepthMotion = !directDepth && !directMotion;
                 id<MTL4ComputeCommandEncoder> prepass = [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
                 if (!prepass) return fail("encode_prepass_encoder");
                 execution->objects.emplace_back(prepass);
@@ -1322,15 +1330,20 @@ bool PreparedFrame::encode(
                                         distortionSource, (id<MTLTexture>)distortion.get(),
                                         parameters, DistortionSlot, distortionParams))
                     return fail("encode_distortion_decode");
-                if (!directDepth && !dispatchPass(prepass, table,
-                                  (id<MTLComputePipelineState>)configuration.kernels->depthPipeline.get(),
-                                  (id<MTLTexture>)impl_->snapshot->depth.get(), (id<MTLTexture>)normalizedDepth.get(),
-                                  parameters, DepthSlot, depthParams))
-                    return fail("encode_depth_normalize");
-                if (!directMotion) {
-                    if (!directDepth && p.reconstruct_camera_motion)
-                        [prepass barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch
-                                         visibilityOptions:MTL4VisibilityOptionDevice];
+                if (fuseDepthMotion) {
+                    if (!dispatchPass(prepass, table,
+                                      (id<MTLComputePipelineState>)configuration.kernels->depthMotionPipeline.get(),
+                                      (id<MTLTexture>)impl_->snapshot->motion.get(), (id<MTLTexture>)normalizedMotion.get(),
+                                      parameters, MotionSlot, motionParams, (id<MTLTexture>)normalizedDepth.get(), nil,
+                                      (id<MTLTexture>)impl_->snapshot->depth.get()))
+                        return fail("encode_depth_motion_normalize");
+                } else if (!directDepth) {
+                    if (!dispatchPass(prepass, table,
+                                      (id<MTLComputePipelineState>)configuration.kernels->depthPipeline.get(),
+                                      (id<MTLTexture>)impl_->snapshot->depth.get(), (id<MTLTexture>)normalizedDepth.get(),
+                                      parameters, DepthSlot, depthParams))
+                        return fail("encode_depth_normalize");
+                } else if (!directMotion) {
                     if (!dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->motionPipeline.get(),
                                       (id<MTLTexture>)impl_->snapshot->motion.get(), (id<MTLTexture>)normalizedMotion.get(),
                                       parameters, MotionSlot, motionParams, (id<MTLTexture>)normalizedDepth.get(), nil,
