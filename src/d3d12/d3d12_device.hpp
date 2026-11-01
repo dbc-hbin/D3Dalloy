@@ -734,6 +734,10 @@ public:
 class MTLD3D12ComputePipelineState : public MTLD3D12PipelineState {
 public:
   WMT::Reference<WMT::ComputePipelineState> pso;
+  /* d3d12.asyncPipelineCompile: deferred creation of `pso`, as for graphics PSOs. Every reader of
+   * `pso` calls WaitNativePipeline() first; a failed job is a recording error, not a fallback. */
+  std::shared_ptr<owned_graphics::AsyncCompileJob> async_job;
+  bool WaitNativePipeline() { return !async_job || async_job->Wait(); }
   ShaderImmutableConstants compute_constants;
   ShaderImmutableConstants pipeline_statistics_compute_constants;
   WMTSize threadgroup_size;
