@@ -36,6 +36,9 @@ bool fail(Error* error, ErrorCode code, const char* message) {
 }
 void clear(Error* error) { if (error) *error = {}; }
 
+// Threadgroup edge of rr_filter and rr_neural_prepare; must match RrTileSize in fsr-rr-kernels.metal.
+constexpr NSUInteger RrTileSize = 8;
+
 // Must match the scalar-only MSL layout. Each dispatch gets distinct constants.
 struct Params {
     uint32_t width, height, signal, checkerboard;
@@ -408,8 +411,13 @@ std::shared_ptr<Feature> Feature::create(void* nativeDevice, void* nativeCompile
             state->resolveWritePipeline = pipeline(device,(id<MTLLibrary>)state->library.get(),@"rr_resolve_write");
             id<MTLFence> fence = [device newFence];
             state->historyFence = Object(fence); [fence release];
-            if (!state->snapshotPipeline || !state->geometryPipeline || !state->unpackPipeline || !state->filterPipeline ||
-                (needsNeural && (!state->neuralCommonPipeline || !state->neuralPreparePipeline ||
+            auto tileFits = [](const Object& pipeline) {
+                return pipeline && ((id<MTLComputePipelineState>)pipeline.get()).maxTotalThreadsPerThreadgroup >=
+                    RrTileSize*RrTileSize;
+            };
+            if (!state->snapshotPipeline || !state->geometryPipeline || !state->unpackPipeline ||
+                !tileFits(state->filterPipeline) ||
+                (needsNeural && (!state->neuralCommonPipeline || !tileFits(state->neuralPreparePipeline) ||
                                  !state->neuralResolvePipeline || !state->neuralResolveWritePipeline)) ||
                 !state->resolvePipeline || !state->resolveWritePipeline || !state->historyFence) {
                 fail(error,ErrorCode::ResourceCreationFailed,"RR pipeline or fence allocation failed"); return {};
@@ -818,11 +826,20 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 [encoder waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageDispatch];
                 if (reuse) [encoder waitForFence:(id<MTLFence>)feature->historyFence.get() beforeEncoderStages:MTLStageDispatch];
                 auto dispatch = [&](id<MTLComputePipelineState> state, unsigned parameter,
-                                    const Bindings& textures) {
+                                    const Bindings& textures, bool tiled = false) {
                     [table setAddress:parameters.gpuAddress+ParameterStride*parameter atIndex:0];
                     for (NSUInteger i=0;i<textures.size();++i)
                         [table setTexture:(textures[i] ? textures[i].gpuResourceID : MTLResourceID{}) atIndex:i];
                     [encoder setComputePipelineState:state]; [encoder setArgumentTable:table];
+                    // rr_filter and rr_neural_prepare stage their 7x7 neighborhood in an
+                    // RrTileSize^2 threadgroup tile filled by all threads, so every group,
+                    // including the edges, must be complete.
+                    if (tiled) {
+                        [encoder dispatchThreadgroups:MTLSizeMake((frame.width+RrTileSize-1)/RrTileSize,
+                                                                  (frame.height+RrTileSize-1)/RrTileSize,1)
+                            threadsPerThreadgroup:MTLSizeMake(RrTileSize,RrTileSize,1)];
+                        return;
+                    }
                     NSUInteger w = std::min<NSUInteger>(8,state.threadExecutionWidth);
                     NSUInteger h = std::min<NSUInteger>(8,state.maxTotalThreadsPerThreadgroup/w);
                     [encoder dispatchThreads:MTLSizeMake(frame.width,frame.height,1)
@@ -865,7 +882,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                              tex(current->signals[s]),n.hit ? tex(n.hit) : tex(n.color),
                              reuse && previous->reconstructedAlpha[s] ? tex(previous->reconstructedAlpha[s]) :
                                  reuse ? tex(previous->signals[s]) : inputs[s],
-                             tex(guide),tex(decoded)});
+                             tex(guide),tex(decoded)},true);
                         continue;
                     }
                     dispatch((id<MTLComputePipelineState>)feature->filterPipeline.get(),s+1,
@@ -874,7 +891,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                          specAlbedo,diffAlbedo,
                          reuse ? tex(previous->signals[s]) : inputs[s],
                          tex(reuse ? previous->depth : common[0]),tex(reuse ? previous->normals : common[2]),
-                         fusedAlbedo,tex(guide),tex(decoded)});
+                         fusedAlbedo,tex(guide),tex(decoded)},true);
                 }
                 [encoder updateFence:(id<MTLFence>)fence afterEncoderStages:MTLStageDispatch];
                 [encoder endEncoding]; encoder = nil;

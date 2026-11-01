@@ -72,6 +72,14 @@
 - `predication-indirect`: PASS.
 - `raytracing-atomic64`: FAIL. 변경 전 runtime(`rtfix-20261102`)도 같은 세 case(lanes=64, EXT mode 0/1)에서 FAIL이므로 회귀가 아니다. 출력 word는 다르다.
 
+## FSR RR neighborhood tiling
+
+`rr_filter`와 `rr_neural_prepare`의 7x7 tap을 8x8 threadgroup의 14x14 halo tile로 공유한다. Float32 값을 그대로 보관하고 tap 산술·누적 순서, 이미지 밖 tap 생략, center·fused albedo texture read를 유지한다. 유효 성분만 저장해 static threadgroup memory는 15,680 B(Shader Validation에서 31,360 B)다. 부분 edge group에서도 전체 64 thread를 dispatch하고, bounds·passthrough 분기 전에 cooperative fill과 barrier를 끝낸다.
+
+`build/local/par-20261105/rrtile/build/local/probe/`의 base/new 비교는 1920x1080·1283x719·13x5, signal 0..6, checkerboard, flags 0/2, legacyMode 0/3, apiVersion 0/0x00400000, history on/off를 조합했다. `rr_neural_prepare` 7개 출력까지 포함한 1,344 비교 모두 float bit 차이 0이며 API+Shader Validation에서도 같다. Validation을 끈 synthetic GPU 평균은 1080p filter 14,826.7→5,997.1 µs, prepare 15,185.5→6,895.4 µs다(게임 FPS 증거 아님). `pkg-3`의 `fsr-rr`·`ngx-features`는 변경 전 runtime과 모두 PASS, FSR RR 49개 결과 줄과 NGX RR oracle comparison·출력 hash가 동일하다.
+
+전체 43-suite matrix는 첫 결과 40 PASS, `fsr-fg` 1회 재실행 후 41 PASS다. 첫 `fsr-fg` 실패는 frame 2의 generated physical output proof 누락이며 원본을 `matrix-3/fsr-fg/`에 보존했다. 동일 변경의 재실행과 base는 PASS였다. 남은 `fsr`(중복 frame marker)·`temporal`(동일한 MetalFX invalid store 6개)은 base에서도 같은 방식으로 실패했다. Matrix 도중 중단된 `dxil`은 fresh `classify/dxil-resume/`에서 PASS, 나머지 결과와 실패 비교는 `build/local/par-20261105/rrtile/build/local/{matrix-3,classify,suites}/`에 있다. 전체 baseline은 기존 `build/local/par-20261104/evidence/integ/m1/`을 재사용했다.
+
 ## 확정 저위험 최적화와 남은 Rust 경계 — 2026-11-01
 
 **상태: native ARM64 Wine+FEX x64 GPU matrix에서 base(같은 HEAD)와 동일 판정. 게임 FPS는 미측정이다.** trace 수집 없이 코드상 매번 발생하는 비용만 줄였다. 입력은 `runtime-par-20261031`·`paired-sdk-par-20261031`·`fex-par-20261031`, 비교 runtime은 `build/local/par-20261101/base`다.
