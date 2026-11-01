@@ -285,7 +285,12 @@ def check(args):
     require(len(presented) == len(events), "duplicate native presented event")
     ui_frames = records(stdout, "OWNED_D3D12_FSR_FG_UI_FRAME")
     require([int(r["frame"]) for r in ui_frames] == [11, 12, 13, 14], "public wrap/UI/resize sequence incomplete")
-    require(len(drawables) == len(expected) + 4, "native presentation count differs from validated outputs")
+    source_reuse = records(stdout, "OWNED_D3D12_FSR_FG_SOURCE_REUSE_PASS")
+    require(not source_reuse or source_reuse == [
+        {"frames": "8", "presents": "14", "ui": "mixed", "callback": "default", "overwrite": "next_backbuffer"}],
+        "source reuse stream incomplete")
+    require(len(drawables) == len(expected) + 4 + (14 if source_reuse else 0),
+            "native presentation count differs from validated outputs")
     require(len(events) == len(drawables), "native presented event count differs from captured requests")
     images = []
     previous_time = 0
@@ -350,7 +355,7 @@ def check(args):
             require(all(image["presented_time"] < real["presented_time"] for image in generated), "displayed generated/real batch reversed")
             pairs.append(frame)
     require(len(pairs) >= 2, "repeated actual generated-before-real display not established")
-    for record, frame in zip(drawables[len(expected):], range(11, 15), strict=True):
+    for record, frame in zip(drawables[len(expected):len(expected) + 4], range(11, 15), strict=True):
         sequence = int(record["sequence"]); width, height, fmt = (int(record[k]) for k in ("width", "height", "format"))
         require(sequence > previous_sequence, "wrapped native requests reordered")
         raw = (args.captures / Path(record["path"]).name).read_bytes()
@@ -371,6 +376,23 @@ def check(args):
                        "presentation": "displayed",
                        "presented_time": time, "sha256": hashlib.sha256(raw).hexdigest()})
         previous_time, previous_sequence = time, sequence
+    for record in drawables[len(expected) + 4:]:
+        sequence = int(record["sequence"])
+        width, height, fmt = (int(record[k]) for k in ("width", "height", "format"))
+        require(sequence > previous_sequence, "source reuse native requests reordered")
+        raw = (args.captures / Path(record["path"]).name).read_bytes()
+        actual = rgba(raw, width, height, fmt)
+        for nx, ny in ((.25, .25), (.5, .5), (.75, .75)):
+            pixel = (min(height - 1, int(ny * height)) * width + min(width - 1, int(nx * width))) * 4
+            require(all(abs(actual[pixel + c] - color) <= 3 for c, color in enumerate((37, 83, 149))),
+                    f"borrowed source overwritten before drawable read sequence={sequence}")
+        event = presented.get(sequence)
+        require(event and event["drawable"] == record["drawable"], "source reuse drawable lacks presented event")
+        time = float(event["time"])
+        require(math.isfinite(time) and time >= 0, "source reuse presentation timestamp invalid")
+        images.append({"sequence": sequence, "source_reuse": True, "presented_time": time,
+                       "sha256": hashlib.sha256(raw).hexdigest()})
+        previous_sequence = sequence
     require(not args.native, "standalone native comparison is not configured; use native drawable content/order evidence")
     displayed = [image for image in images if image["presented_time"] > 0]
     return {"pass": True, "native_drawable_content_and_order": images,

@@ -375,6 +375,63 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
     fgResult(api.configure(&swapContext, &registration.header), FFX_API_RETURN_OK, "ui-unregister");
     ui.Reset(); fgDrain(api, swapContext); uiContext.destroy();
     fgResult(api.destroy(&swapContext, nullptr), FFX_API_RETURN_OK, "wrapped-proxy-destroy"); chain.Reset();
+    // Default callback/no UI: unlike the custom-callback and UI streams above,
+    // this presents borrowed sources. Reuse each newly available buffer before
+    // draining presents, so an early source-release signal can corrupt a drawable.
+    create.swapchain = chain.GetAddressOf();
+    fgResult(api.create(&swapContext, &create.header, nullptr), FFX_API_RETURN_OK, "direct-proxy-create");
+    FgContext directContext(api, gpu, fgWidth, fgHeight, desc.Format);
+    FgProxyCallbacks directCallbacks{};
+    directCallbacks.api = &api; directCallbacks.context = &directContext.value; directCallbacks.gpu = &gpu;
+    ffxConfigureDescFrameGeneration directConfig{};
+    directConfig.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    directConfig.swapChain = chain.Get(); directConfig.generationRect = {0, 0, fgWidth, fgHeight};
+    directConfig.frameGenerationCallback = fgGenerationCallback;
+    directConfig.frameGenerationCallbackUserContext = &directCallbacks;
+    std::vector<uint8_t> scene(fgWidth * fgHeight * 4), poison(scene.size());
+    auto transparentUi = createTexture(gpu.device.Get(), fgWidth, fgHeight, desc.Format,
+                                      D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::vector<uint8_t> transparentPixels(scene.size());
+    fgUpload(gpu, transparentUi.Get(), transparentPixels.data(), fgWidth * 4, fgRead);
+    for (size_t i = 0; i < scene.size(); i += 4) {
+        scene[i] = 37; scene[i + 1] = 83; scene[i + 2] = 149; scene[i + 3] = 255;
+        poison[i] = 255; poison[i + 2] = 255; poison[i + 3] = 255;
+    }
+    for (UINT frame = 21; frame <= 28; ++frame) {
+        directConfig.frameID = frame; directConfig.frameGenerationEnabled = frame >= 23;
+        fgResult(api.configure(&directContext.value, &directConfig.header), FFX_API_RETURN_OK, "direct-configure");
+        // Alternate borrowed-source and UI-composed presentation in one ring.
+        // Transparent UI keeps the independent drawable oracle unchanged.
+        registration.flags = 0;
+        registration.uiResource = (frame == 24 || frame == 26)
+            ? ffxApiGetResourceDX12(transparentUi.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ) : FfxApiResource{};
+        fgResult(api.configure(&swapContext, &registration.header), FFX_API_RETURN_OK, "direct-ui-transition");
+        ComPtr<ID3D12Resource> buffer;
+        check(chain->GetBuffer(chain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&buffer)), "direct-buffer");
+        auto r = fgRecording(gpu);
+        transition(r.list.Get(), buffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        check(r.list->Close(), "direct-transition"); gpu.executeAndWait(r.list.Get());
+        fgUpload(gpu, buffer.Get(), scene.data(), fgWidth * 4, D3D12_RESOURCE_STATE_PRESENT);
+        if (directConfig.frameGenerationEnabled) {
+            r = fgRecording(gpu);
+            auto prepare = fgPrepare(r.list.Get(), frame, depth.Get(), motion.Get(), frame == 23);
+            fgResult(api.dispatch(&directContext.value, &prepare.header), FFX_API_RETURN_OK, "direct-prepare");
+            check(r.list->Close(), "direct-prepare-close"); gpu.executeAndWait(r.list.Get());
+        }
+        check(chain->Present(1, 0), "direct-present");
+        ComPtr<ID3D12Resource> next;
+        check(chain->GetBuffer(chain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&next)), "direct-next-buffer");
+        r = fgRecording(gpu);
+        transition(r.list.Get(), next.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        check(r.list->Close(), "direct-overwrite-transition"); gpu.executeAndWait(r.list.Get());
+        fgUpload(gpu, next.Get(), poison.data(), fgWidth * 4, D3D12_RESOURCE_STATE_PRESENT);
+    }
+    fgDrain(api, swapContext);
+    directConfig.frameGenerationEnabled = false;
+    fgResult(api.configure(&directContext.value, &directConfig.header), FFX_API_RETURN_OK, "direct-disable");
+    directContext.destroy();
+    fgResult(api.destroy(&swapContext, nullptr), FFX_API_RETURN_OK, "direct-destroy"); chain.Reset();
+    std::puts("OWNED_D3D12_FSR_FG_SOURCE_REUSE_PASS frames=8 presents=14 ui=mixed callback=default overwrite=next_backbuffer");
     std::puts("OWNED_D3D12_FSR_FG_UI_PASS wrap=real_hwnd ui=builtin_shader premultiplied=1 doublebuffer=gpu_snapshot resize=96x80 lifetime=drained");
     std::puts("OWNED_D3D12_FSR_FG_ORIGINAL_SDK_PASS resize1=unsupported unchanged=1 resize=implemented pacing=original");
     std::puts("OWNED_D3D12_FSR_FG_PROXY_PASS create=hwnd callbacks=gpu-readback generated_before_real=1 only_generated=1 disabled=1 callback_error=1 drain=1 destroy=1");

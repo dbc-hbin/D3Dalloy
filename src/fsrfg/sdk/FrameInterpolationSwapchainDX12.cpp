@@ -286,6 +286,17 @@ FfxErrorCode ffxWaitForPresents(FfxSwapchain gameSwapChain)
 using PresentType = FrameinterpolationPresentInfoExt;
 using PresentCallbackType = ffxCallbackDescFrameGenerationPresent;
 
+// DXMT: TEST shares PresentResource's validation without consuming a frame or latency credit.
+bool canPresentSource(IDXGISwapChain4* swapChain, ID3D12Resource* source)
+{
+    IMTLD3D12ResourcePresent* direct = nullptr;
+    if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&direct))))
+        return false;
+    const HRESULT hr = direct->PresentResource(source, 0, DXGI_PRESENT_TEST, TRUE);
+    direct->Release();
+    return SUCCEEDED(hr);
+}
+
 void setSwapChainBufferResourceInfo(IDXGISwapChain4* swapChain, bool isInterpolated)
 {
     uint32_t        currBackbufferIndex = swapChain->GetCurrentBackBufferIndex();
@@ -321,7 +332,19 @@ template<typename PresentType, typename PacingData, typename PresentCallbackType
 HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry, uint32_t frameID)
 {
 
-    const typename PacingData::FrameInfo& frameInfo = pacingEntry->frames[frameID];
+    typename PacingData::FrameInfo& frameInfo = pacingEntry->frames[frameID];
+
+    // DXMT: only the unmodified built-in no-UI callback is a pure resource copy.
+    frameInfo.presentSourceDirectly =
+        !pacingEntry->drawDebugPacingLines && !pacingEntry->uiSurface.resource &&
+        pacingEntry->presentCallback == ffxFrameInterpolationUiComposition &&
+        canPresentSource(presenter->swapChain, static_cast<ID3D12Resource*>(frameInfo.resource.resource));
+    if (frameInfo.presentSourceDirectly)
+    {
+        presenter->presentQueue->Signal(presenter->compositionFenceGPU, frameInfo.presentIndex);
+        presenter->compositionFenceCPU->Signal(frameInfo.presentIndex);
+        return S_OK;
+    }
 
     // DXMT: presenterThread already made presentQueue wait for the entry's interpolationCompletedFenceValue,
     // which equals every frame's value, so the upstream per-interpolated-frame Wait is redundant.
@@ -366,6 +389,9 @@ HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry,
     SafeRelease(swapchainBackbuffer);
 
     presenter->presentQueue->Signal(presenter->compositionFenceGPU, frameInfo.presentIndex);
+    // DXMT: copied/UI sources are no longer read after composition. Preserve
+    // their original reuse point rather than waiting through pacing/drawable work.
+    presenter->presentQueue->Signal(presenter->sourceReleaseFence, frameInfo.presentIndex);
     presenter->compositionFenceCPU->Signal(frameInfo.presentIndex);
 
     return S_OK;
@@ -385,7 +411,17 @@ void presentToSwapChain(PresentType* presenter, PacingData* pacingEntry, FrameTy
     // An interpolated frame followed by its real member belongs to that real
     // frame: only the real Present ends the application frame on DXMT.
     IMTLD3D12GeneratedPresent* generated = nullptr;
-    if (frameType == FrameType::Interpolated_1 && pacingEntry->frames[FrameType::Real].doPresent &&
+    if (frameInfo.presentSourceDirectly)
+    {
+        IMTLD3D12ResourcePresent* direct = nullptr;
+        if (SUCCEEDED(presenter->swapChain->QueryInterface(IID_PPV_ARGS(&direct))))
+        {
+            direct->PresentResource(static_cast<ID3D12Resource*>(frameInfo.resource.resource), uSyncInterval, uFlags,
+                                    !(frameType == FrameType::Interpolated_1 && pacingEntry->frames[FrameType::Real].doPresent));
+            direct->Release();
+        }
+    }
+    else if (frameType == FrameType::Interpolated_1 && pacingEntry->frames[FrameType::Real].doPresent &&
         SUCCEEDED(presenter->swapChain->QueryInterface(__uuidof(IMTLD3D12GeneratedPresent), reinterpret_cast<void**>(&generated))))
     {
         generated->PresentGenerated(uSyncInterval, uFlags);
@@ -395,6 +431,10 @@ void presentToSwapChain(PresentType* presenter, PacingData* pacingEntry, FrameTy
         presenter->swapChain->Present(uSyncInterval, uFlags);
 
     // tick frames sent for presentation
+    // DXMT: the drawable blit, not composition readiness, releases a borrowed source.
+    // DXMT publishes trailing queue signals only after the Present command buffer retires.
+    if (frameInfo.presentSourceDirectly)
+        presenter->presentQueue->Signal(presenter->sourceReleaseFence, frameInfo.presentIndex);
     presenter->presentQueue->Signal(presenter->presentFence, frameInfo.presentIndex);
 
 }
@@ -436,6 +476,7 @@ DWORD WINAPI presenterThread(LPVOID param)
                 {
                     // we might have dropped entries so have to update here, oterwise we might deadlock
                     presenter->presentQueue->Signal(presenter->presentFence, entry.numFramesSentForPresentationBase);
+                    presenter->presentQueue->Signal(presenter->sourceReleaseFence, entry.numFramesSentForPresentationBase);
                     presenter->presentQueue->Wait(presenter->interpolationFence, entry.interpolationCompletedFenceValue);
 
                     for (uint32_t frameType = 0; frameType < FrameType::Count; frameType++)
@@ -444,12 +485,6 @@ DWORD WINAPI presenterThread(LPVOID param)
                         if (frameInfo.doPresent)
                         {
                             compositeSwapChainFrame<PresentType, PacingData, PresentCallbackType>(presenter, &entry, frameType);
-
-                            // signal replacement buffer availability
-                            if (frameInfo.presentIndex == entry.replacementBufferFenceSignal)
-                            {
-                                presenter->presentQueue->Signal(presenter->replacementBufferFence, entry.replacementBufferFenceSignal);
-                            }
 
                             
                             MMRESULT result = timeGetDevCaps(&timerCaps, sizeof(timerCaps));
@@ -733,8 +768,8 @@ HRESULT FrameInterpolationSwapChainDX12::init(HWND                              
         presentInfo.device->CreateFence(framesSentForPresentation, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&presentInfo.presentFence));
         presentInfo.presentFence->SetName(L"AMD FSR PresentFence");
 
-        presentInfo.device->CreateFence(framesSentForPresentation, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&presentInfo.replacementBufferFence));
-        presentInfo.replacementBufferFence->SetName(L"AMD FSR ReplacementBufferFence");
+        presentInfo.device->CreateFence(framesSentForPresentation, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&presentInfo.sourceReleaseFence));
+        presentInfo.sourceReleaseFence->SetName(L"DXMT FSR SourceReleaseFence");
 
         presentInfo.device->CreateFence(framesSentForPresentation, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&presentInfo.compositionFenceGPU));
         presentInfo.compositionFenceGPU->SetName(L"AMD FSR CompositionFence GPU");
@@ -837,7 +872,7 @@ HRESULT FrameInterpolationSwapChainDX12::shutdown()
 
         SafeRelease(presentInfo.interpolationFence);
         SafeRelease(presentInfo.presentFence);
-        SafeRelease(presentInfo.replacementBufferFence);
+        SafeRelease(presentInfo.sourceReleaseFence);
         SafeRelease(presentInfo.compositionFenceGPU);
         SafeRelease(presentInfo.compositionFenceCPU);
 
@@ -1085,9 +1120,9 @@ bool FrameInterpolationSwapChainDX12::destroyReplacementResources()
         presentInfo.presentFence->Signal(framesSentForPresentation);
     }
 
-    if (presentInfo.replacementBufferFence)
+    if (presentInfo.sourceReleaseFence)
     {
-        presentInfo.replacementBufferFence->Signal(framesSentForPresentation);
+        presentInfo.sourceReleaseFence->Signal(framesSentForPresentation);
     }
 
     if (presentInfo.compositionFenceGPU)
@@ -1287,8 +1322,9 @@ void FrameInterpolationSwapChainDX12::presentPassthrough(UINT SyncInterval, UINT
 
     passthroughList->execute(true);
 
-    presentInfo.presentQueue->Signal(presentInfo.replacementBufferFence, ++framesSentForPresentation);
+    ++framesSentForPresentation;
     presentInfo.presentQueue->Signal(presentInfo.compositionFenceGPU, framesSentForPresentation);
+    presentInfo.presentQueue->Signal(presentInfo.sourceReleaseFence, framesSentForPresentation);
     presentInfo.compositionFenceCPU->Signal(framesSentForPresentation);
 
     setSwapChainBufferResourceInfo(presentInfo.swapChain, false);
@@ -1302,6 +1338,26 @@ void FrameInterpolationSwapChainDX12::presentPassthrough(UINT SyncInterval, UINT
 
 void FrameInterpolationSwapChainDX12::presentWithUiComposition(UINT SyncInterval, UINT Flags)
 {
+    // DXMT: the non-interpolating path uses the same pure-copy default callback.
+    if (presentCallback == ffxFrameInterpolationUiComposition && !drawDebugPacingLines &&
+        !presentInfo.currentUiSurface.resource &&
+        (!(presentInfo.uiCompositionFlags & FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING) ||
+         !uiReplacementBuffer.resource) &&
+        canPresentSource(presentInfo.swapChain, replacementSwapBuffers[replacementSwapBufferIndex].resource))
+    {
+        IMTLD3D12ResourcePresent* direct = nullptr;
+        presentInfo.swapChain->QueryInterface(IID_PPV_ARGS(&direct));
+        ++framesSentForPresentation;
+        presentInfo.presentQueue->Signal(presentInfo.compositionFenceGPU, framesSentForPresentation);
+        presentInfo.compositionFenceCPU->Signal(framesSentForPresentation);
+        direct->PresentResource(replacementSwapBuffers[replacementSwapBufferIndex].resource, SyncInterval, Flags, TRUE);
+        direct->Release();
+        presentInfo.presentQueue->Signal(presentInfo.sourceReleaseFence, framesSentForPresentation);
+        presentInfo.presentQueue->Signal(presentInfo.presentFence, framesSentForPresentation);
+        presentInfo.gameQueue->Wait(presentInfo.presentFence, framesSentForPresentation);
+        return;
+    }
+
     auto uiCompositionList = presentInfo.commandPool.get(presentInfo.presentQueue, L"uiCompositionList()");
     auto list              = uiCompositionList->reset();
 
@@ -1332,8 +1388,9 @@ void FrameInterpolationSwapChainDX12::presentWithUiComposition(UINT SyncInterval
 
     uiCompositionList->execute(true);
 
-    presentInfo.presentQueue->Signal(presentInfo.replacementBufferFence, ++framesSentForPresentation);
+    ++framesSentForPresentation;
     presentInfo.presentQueue->Signal(presentInfo.compositionFenceGPU, framesSentForPresentation);
+    presentInfo.presentQueue->Signal(presentInfo.sourceReleaseFence, framesSentForPresentation);
     presentInfo.compositionFenceCPU->Signal(framesSentForPresentation);
 
     setSwapChainBufferResourceInfo(presentInfo.swapChain, false);
@@ -1358,7 +1415,7 @@ void FrameInterpolationSwapChainDX12::dispatchInterpolationCommands(FfxApiResour
     *pRealFrame = backbuffer;
 
     // interpolation queue must wait for output resource to become available
-    presentInfo.interpolationQueue->Wait(presentInfo.compositionFenceGPU, interpolationOutputs[interpolationBufferIndex].availabilityFenceValue);
+    presentInfo.interpolationQueue->Wait(presentInfo.sourceReleaseFence, interpolationOutputs[interpolationBufferIndex].availabilityFenceValue);
 
     auto pRegisteredCommandList = registeredInterpolationCommandLists[currentBackBufferIndex];
     if (pRegisteredCommandList != nullptr)
@@ -1466,7 +1523,6 @@ void FrameInterpolationSwapChainDX12::presentInterpolated(UINT SyncInterval, UIN
         }
     }
 
-    entry.replacementBufferFenceSignal  = framesSentForPresentation;
     entry.numFramesToPresent            = UINT32(framesSentForPresentation - entry.numFramesSentForPresentationBase);
 
     interpolationOutputs[interpolationBufferIndex].availabilityFenceValue = entry.numFramesSentForPresentationBase + fiInterpolated.doPresent;
@@ -1679,7 +1735,7 @@ HRESULT STDMETHODCALLTYPE FrameInterpolationSwapChainDX12::Present(UINT SyncInte
 
     LeaveCriticalSection(&criticalSection);
 
-    waitForFenceValue(presentInfo.replacementBufferFence, replacementSwapBuffers[replacementSwapBufferIndex].availabilityFenceValue, INFINITE, presentInfo.waitCallback,
+    waitForFenceValue(presentInfo.sourceReleaseFence, replacementSwapBuffers[replacementSwapBufferIndex].availabilityFenceValue, INFINITE, presentInfo.waitCallback,
                       presentInfo.allowWaitForSingleObjectOnFence);
 
     return S_OK;
