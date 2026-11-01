@@ -11729,21 +11729,23 @@ kernel void dxmt_atomic_copy_u64(device const ulong *source [[buffer(0)]],
                                                uint64_t indirect_grid_offset, uint64_t root_arguments_offset = ~0ull) {
     auto *state_object = static_cast<MTLD3D12StateObject *>(rt_state_object_.ptr());
     /*
-     * The intersection function table the traversal will select from is built per dispatch, not
-     * reused from the state object: an intersection function cannot see the compute encoder's
+     * The intersection function table the traversal will select from is bound per dispatch, not
+     * shared with the state object: an intersection function cannot see the compute encoder's
      * argument table, so the dispatch constants it resolves the hit group with - and the visible
      * function table it calls the group's any-hit shader through - are bound in the table's own
-     * buffer argument table, and those are per-dispatch values. A fresh table per dispatch keeps a
-     * table that is already in flight immutable.
+     * buffer argument table, and those are per-dispatch values. Each dispatch of this recording
+     * epoch takes its own table from the allocator, which hands a table out again only after a
+     * retired Reset, so a table that is in flight is never rebound.
      */
     const auto arguments_binding = allocator_->ResolveGPUHeap(arguments_offset);
-    auto dispatch_intersection_table = state_object->CreateDispatchIntersectionFunctionTable(
-        arguments_binding.buffer, arguments_binding.offset, rt_visible_function_table_
-    );
-    if (!dispatch_intersection_table) {
+    auto &dispatch_intersection_slot = allocator_->DispatchIntersectionTableSlot(rt_pipeline_);
+    if (!state_object->BindDispatchIntersectionFunctionTable(
+            dispatch_intersection_slot, arguments_binding.buffer, arguments_binding.offset, rt_visible_function_table_
+        )) {
       RecordError(E_FAIL);
       return nullptr;
     }
+    WMT::Reference<WMT::IntersectionFunctionTable> dispatch_intersection_table = dispatch_intersection_slot;
 
     allocator_->InvalidateCurrentPass();
     auto *traversal = allocator_->AllocatePass<ComputeEncoderData>();

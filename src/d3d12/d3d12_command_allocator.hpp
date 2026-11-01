@@ -144,6 +144,22 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   RingBumpState<GpuPrivateBufferBlockAllocator> copy_temp_allocator_;
   uint64_t copy_temp_version_;
 
+  /*
+   * Per-dispatch raytracing intersection function tables, grouped by the pipeline they were made from.
+   * Each table is rebound to one dispatch's arguments block, so within one epoch every dispatch takes
+   * a table of its own (`used` counts them). A table is handed out again only after Reset, which is
+   * accepted only once no submission of this allocator is outstanding - the same retirement rule that
+   * lets the GPU heap chunks be rewritten - so no in-flight command buffer still reads its bindings.
+   * The pipeline reference keeps its handle from being reused as a key while its tables live.
+   */
+  struct DispatchIntersectionTables {
+    WMT::Reference<WMT::ComputePipelineState> pipeline;
+    std::vector<WMT::Reference<WMT::IntersectionFunctionTable>> tables;
+    size_t used = 0;
+    uint64_t last_used_epoch = 0;
+  };
+  std::vector<DispatchIntersectionTables> dispatch_intersection_tables_;
+
 public:
   uint64_t GetTraceId() const { return trace_id_; }
   RecordedBoundary &RecordBoundary(RecordedBoundaryReason reason) {
@@ -380,6 +396,25 @@ public:
                           ",\"va\":", chunk.address + aligned, ",\"begin\":", chunk.begin,
                           ",\"offset\":", aligned, ",\"size\":", Length, ",\"alignment\":", Alignment);
     return {ptr_add(chunk.memory, aligned), chunk.begin + aligned};
+  }
+
+  /*
+   * The table slot for one more raytracing dispatch of `Pipeline` in this epoch. An empty slot has no
+   * table yet; a filled one was last bound by a dispatch of an earlier, retired epoch and may be rebound.
+   * The reference is valid until the next call.
+   */
+  WMT::Reference<WMT::IntersectionFunctionTable> &
+  DispatchIntersectionTableSlot(WMT::ComputePipelineState Pipeline) {
+    auto entry = std::find_if(dispatch_intersection_tables_.begin(), dispatch_intersection_tables_.end(),
+                              [&](const auto &candidate) { return candidate.pipeline == Pipeline; });
+    if (entry == dispatch_intersection_tables_.end()) {
+      dispatch_intersection_tables_.push_back({Pipeline});
+      entry = std::prev(dispatch_intersection_tables_.end());
+    }
+    entry->last_used_epoch = gpu_heap_epoch_;
+    if (entry->used == entry->tables.size())
+      entry->tables.emplace_back();
+    return entry->tables[entry->used++];
   }
 
   std::tuple<WMT::Buffer, uint64_t>

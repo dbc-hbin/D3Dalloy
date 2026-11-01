@@ -194,7 +194,7 @@ public:
    */
   virtual WMT::Reference<WMT::IntersectionFunctionTable> GetIntersectionFunctionTable() const = 0;
   /**
-   * The intersection function table one dispatch needs.
+   * Prepare the intersection function table one dispatch needs.
    *
    * Its functions are this state object's shared triangle and bounding-box callbacks.
    * They resolve the hit group from GPU shader-table records, not hardware IFT slots.
@@ -202,12 +202,14 @@ public:
    * bound in the table's own buffer argument table at SM50_RT_BINDING_INDEX_DISPATCH - an
    * intersection function cannot see the compute encoder's bindings, so it has to be bound here.
    *
-   * The state object's own table (GetIntersectionFunctionTable) is never mutated: it keeps serving
-   * the ray generation shader's encoder binding, and a table a dispatch already uses stays
-   * immutable while it is in flight. Returns null when the pipeline has no callback.
+   * An empty `table` gets a new table of this pipeline; a non-empty one must have been made by an
+   * earlier call for the same pipeline and must not be read by any in-flight command buffer, since
+   * its bindings are overwritten. The state object's own table (GetIntersectionFunctionTable) is
+   * never mutated: it keeps serving the ray generation shader's encoder binding. Returns false when
+   * the pipeline has no callback or the table cannot be created.
    */
-  virtual WMT::Reference<WMT::IntersectionFunctionTable> CreateDispatchIntersectionFunctionTable(
-      WMT::Buffer arguments, uint64_t arguments_offset,
+  virtual bool BindDispatchIntersectionFunctionTable(
+      WMT::Reference<WMT::IntersectionFunctionTable> &table, WMT::Buffer arguments, uint64_t arguments_offset,
       WMT::Reference<WMT::VisibleFunctionTable> visible_function_table
   ) = 0;
   /**
