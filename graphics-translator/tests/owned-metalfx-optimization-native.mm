@@ -245,7 +245,7 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
         }),error.message.c_str());
         [commands.back() endCommandBuffer];
     } else {
-    require(encodeInputCopiesMetal4(frame,*lease,command,fence), "sr-staging-copies");
+    require(encodePrepassMetal4(frame,*lease,command,fence), "sr-staging-copies");
     auto boundary=[command computeCommandEncoder];
     [boundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
     [boundary endEncoding]; [command endCommandBuffer]; command=begin();
@@ -360,9 +360,7 @@ unsigned paddingOracle(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     auto allocator = [gpu.device newCommandAllocator]; auto fence = [gpu.device newFence];
     auto command = [gpu.device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
     [command useResidencySet:(id<MTLResidencySet>)lease->residency];
-    require(encodeInputCopiesMetal4(frame, *lease, command, fence) &&
-            encodeFsrPreMetal4(frame, *lease, command, fence) &&
-            encodeFsrInputPaddingMetal4(frame, *lease, command, fence), "oracle-encode");
+    require(encodePrepassMetal4(frame, *lease, command, fence), "oracle-encode");
     [command endCommandBuffer]; gpu.commit({command});
     unsigned checked = 0;
     const auto expectCopy = [&](id<MTLTexture> staged, const std::vector<uint8_t>& source,

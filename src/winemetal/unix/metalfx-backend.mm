@@ -1827,27 +1827,6 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
     }
 }
 
-bool encodeExposureMetal4(const PreparedFrame::Impl& frame,
-                          ExecutionLease::Impl& lease,
-                          id<MTL4CommandBuffer> command,
-                          id<MTLFence> fence) API_AVAILABLE(macos(26.0)) {
-    id<MTL4ComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
-        [encoder setComputePipelineState:frame.feature->exposurePipeline];
-        [encoder setArgumentTable:lease.argumentTable];
-        [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
 // R8 mask combining measured faster at 16x16 on Apple M5 Pro Metal4 (fork
 // opt audit); every other SR pass keeps 8x8.
 constexpr MTLSize kFsrDefaultThreadgroup{8, 8, 1};
@@ -1942,18 +1921,31 @@ void barrierBetweenMetal4Blits(id<MTL4ComputeCommandEncoder> encoder)
                     visibilityOptions:MTL4VisibilityOptionDevice];
 }
 
-bool encodeInputCopiesMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
-                            id<MTL4CommandBuffer> command, id<MTLFence> fence)
-                            API_AVAILABLE(macos(26.0)) {
-    if (!lease.stagedColor && !lease.stagedDepth && !lease.stagedMotion &&
-        !lease.stagedReactive)
-        return true;
+// Records every SR preprocessing pass in one encoder behind one fence wait and
+// one update. Exposure conversion, input staging, alpha extraction, color
+// linearization and mask combining read only app inputs and write disjoint
+// lease scratch, so they may overlap. Blit edge copies consume earlier copy
+// output and the padding strips consume linearized color; only those wait.
+bool encodePrepassMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
+                         id<MTL4CommandBuffer> command, id<MTLFence> fence)
+                         API_AVAILABLE(macos(26.0)) {
+    const bool copies = lease.stagedColor || lease.stagedDepth || lease.stagedMotion ||
+                        lease.stagedReactive;
+    const bool dispatches = frame.needsExposureConversion || lease.alphaColor ||
+                            lease.linearColor || lease.combinedMask ||
+                            (copies && frame.computeCopyMask);
+    if (!copies && !dispatches) return true;
     id<MTL4ComputeCommandEncoder> encoder = [command computeCommandEncoder];
     if (!encoder) return false;
     @try {
-        const MTLStages stages = frame.computeCopyMask ? MTLStageBlit | MTLStageDispatch
-                                                       : MTLStageBlit;
+        const MTLStages stages = (copies ? MTLStageBlit : 0) | (dispatches ? MTLStageDispatch : 0);
         [encoder waitForFence:fence beforeEncoderStages:stages];
+        if (frame.needsExposureConversion) {
+            [encoder setComputePipelineState:frame.feature->exposurePipeline];
+            [encoder setArgumentTable:lease.argumentTable];
+            [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        }
         const auto barrier = [&] { barrierBetweenMetal4Blits(encoder); };
         const Rect capacity{0, 0, static_cast<std::uint32_t>(frame.generation->inputCapacityWidth),
                             static_cast<std::uint32_t>(frame.generation->inputCapacityHeight)};
@@ -1987,61 +1979,42 @@ bool encodeInputCopiesMetal4(const PreparedFrame::Impl& frame, ExecutionLease::I
         copy(frame.depth, lease.stagedDepth, frame.frame.depthRect);
         copy(frame.motion, lease.stagedMotion, frame.scalerMotionRect);
         copy(frame.reactive, lease.stagedReactive, frame.frame.reactiveRect);
-        [encoder updateFence:fence afterEncoderStages:stages];
-        [encoder endEncoding];
-        return true;
-    } @catch (id) {
-        @try { [encoder endEncoding]; } @catch (id) {}
-        return false;
-    }
-}
-
-bool encodeFsrPreMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Impl& lease,
-                        id<MTL4CommandBuffer> command, id<MTLFence> fence)
-                        API_AVAILABLE(macos(26.0)) {
-    if (lease.alphaColor && !encodeFsrPassMetal4(lease, command, fence, frame.feature->alphaPipeline,
-            lease.alphaParams, frame.color, lease.alphaColor, nil,
-            Rect{0, 0, uint32_t(lease.alphaColor.width), uint32_t(lease.alphaColor.height)})) return false;
-    if (lease.linearColor && !encodeFsrPassMetal4(
-            lease, command, fence, frame.feature->linearizePipeline,
-            lease.linearizeParams, frame.color, lease.linearColor, nil, frame.frame.colorRect))
-        return false;
-    if (lease.combinedMask) {
-        id<MTLTexture> fallback = frame.reactive ? frame.reactive : frame.composition;
-        if (!encodeFsrPassMetal4(lease, command, fence,
-                                frame.feature->combineMaskPipeline, lease.maskParams,
-                                frame.reactive ? frame.reactive : fallback,
-                                frame.composition ? frame.composition : fallback,
-                                lease.combinedMask,
-                                Rect{0, 0, static_cast<std::uint32_t>(lease.combinedMask.width),
-                                     static_cast<std::uint32_t>(lease.combinedMask.height)},
-                                nil, kFsrWideThreadgroup))
-            return false;
-    }
-    return true;
-}
-
-// Extend already-converted active color edges without repeating transfer math.
-// The combined mask is padded by its own clamped capacity dispatch.
-bool encodeFsrInputPaddingMetal4(const PreparedFrame::Impl& frame,
-                               ExecutionLease::Impl& lease,
-                               id<MTL4CommandBuffer> command,
-                               id<MTLFence> fence) API_AVAILABLE(macos(26.0)) {
-    if (!lease.linearColor || lease.linearizeParams.length <= sizeof(Params)) return true;
-    id<MTL4ComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    if (!encoder) return false;
-    @try {
-        [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
-        const auto* records = static_cast<const Params*>(lease.linearizeParams.contents);
-        for (std::size_t index = 1; index < lease.linearizeParams.length / sizeof(Params); ++index) {
-            const Rect strip{records[index].dispatchOrigin[0], records[index].dispatchOrigin[1],
-                             records[index].dispatchExtent[0], records[index].dispatchExtent[1]};
-            if (!strip.width || !strip.height) continue;
-            dispatchFsrPassMetal4(lease, encoder, frame.feature->paddingPipeline,
-                                  lease.linearizeParams, lease.linearColor, lease.linearColor, nil,
-                                  strip, nil, index * sizeof(Params));
+        if (lease.alphaColor)
+            dispatchFsrPassMetal4(lease, encoder, frame.feature->alphaPipeline, lease.alphaParams,
+                frame.color, lease.alphaColor, nil,
+                Rect{0, 0, uint32_t(lease.alphaColor.width), uint32_t(lease.alphaColor.height)});
+        if (lease.linearColor)
+            dispatchFsrPassMetal4(lease, encoder, frame.feature->linearizePipeline,
+                                  lease.linearizeParams, frame.color, lease.linearColor, nil,
+                                  frame.frame.colorRect);
+        if (lease.combinedMask) {
+            // The clamped capacity dispatch pads the mask itself.
+            id<MTLTexture> fallback = frame.reactive ? frame.reactive : frame.composition;
+            dispatchFsrPassMetal4(lease, encoder, frame.feature->combineMaskPipeline, lease.maskParams,
+                                  frame.reactive ? frame.reactive : fallback,
+                                  frame.composition ? frame.composition : fallback,
+                                  lease.combinedMask,
+                                  Rect{0, 0, static_cast<std::uint32_t>(lease.combinedMask.width),
+                                       static_cast<std::uint32_t>(lease.combinedMask.height)},
+                                  nil, 0, kFsrWideThreadgroup);
         }
-        [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
+        // Extend already-converted active color edges without repeating transfer math.
+        if (lease.linearColor && lease.linearizeParams.length > sizeof(Params)) {
+            [encoder barrierAfterEncoderStages:MTLStageDispatch
+                          beforeEncoderStages:MTLStageDispatch
+                            visibilityOptions:MTL4VisibilityOptionDevice];
+            const auto* records = static_cast<const Params*>(lease.linearizeParams.contents);
+            for (std::size_t index = 1; index < lease.linearizeParams.length / sizeof(Params);
+                 ++index) {
+                const Rect strip{records[index].dispatchOrigin[0], records[index].dispatchOrigin[1],
+                                 records[index].dispatchExtent[0], records[index].dispatchExtent[1]};
+                if (!strip.width || !strip.height) continue;
+                dispatchFsrPassMetal4(lease, encoder, frame.feature->paddingPipeline,
+                                      lease.linearizeParams, lease.linearColor, lease.linearColor,
+                                      nil, strip, nil, index * sizeof(Params));
+            }
+        }
+        [encoder updateFence:fence afterEncoderStages:stages];
         [encoder endEncoding];
         return true;
     } @catch (id) {
@@ -2453,25 +2426,9 @@ bool PreparedFrame::encode(void* commandBuffer, void* fencePointer,
                     return false;
                 }
                 if (residency) [command useResidencySet:residency];
-                if (impl_->needsExposureConversion &&
-                    !encodeExposureMetal4(*impl_, *lease, command, lease->fence)) {
+                if (!encodePrepassMetal4(*impl_, *lease, command, lease->fence)) {
                     setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode numerical exposure conversion on Metal4");
-                    return false;
-                }
-                if (!encodeInputCopiesMetal4(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode MetalFX active-input copies on Metal4");
-                    return false;
-                }
-                if (!encodeFsrPreMetal4(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to encode FSR preprocessing on Metal4");
-                    return false;
-                }
-                if (!encodeFsrInputPaddingMetal4(*impl_, *lease, command, lease->fence)) {
-                    setError(error, ErrorCode::EncodeFailed,
-                             "failed to extend processed MetalFX input padding on Metal4");
+                             "failed to encode MetalFX input preprocessing on Metal4");
                     return false;
                 }
                 if (!splitCommandBuffer) {
