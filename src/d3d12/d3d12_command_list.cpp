@@ -4699,6 +4699,11 @@ public:
 
     if (!pso_compute_)
         return false;
+    // Every dispatch path, direct or indirect, joins a deferred native compute link here.
+    if (!pso_compute_->WaitNativePipeline()) {
+      RecordError(E_FAIL);
+      return false;
+    }
     auto *submission_compute = static_cast<ComputeEncoderData *>(allocator_->encoder_current);
     submission_compute->submission_access_complete &= !SkipResourceBinding && !statistics &&
         !predication_enabled_ && !pso_compute_->uses_atomic64 &&
@@ -9812,7 +9817,9 @@ public:
       return;
     }
     if (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
-      if (simple_indirect && MaxCommandCount == 1 && pso_compute_ && !pso_compute_->uses_atomic64 && pso_compute_->pso) {
+      // Join a deferred link before reading `pso`; a failed link takes the path below, whose PreDispatch records E_FAIL.
+      if (simple_indirect && MaxCommandCount == 1 && pso_compute_ && !pso_compute_->uses_atomic64 &&
+          pso_compute_->WaitNativePipeline() && pso_compute_->pso) {
         if (!PreDispatch(false)) return;
         auto *allocation = arg_buffer->buffer->current();
         try {

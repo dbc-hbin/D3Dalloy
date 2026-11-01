@@ -62,6 +62,12 @@ public:
   MTLD3D12ComputePipelineStateImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12ComputePipelineState>(pDevice) {
     IsComputePipelineState = 1;
   }
+  // The deferred job captures this object: retire unstarted work or join a running one first.
+  // During process detach the workers are already terminated, so a claimed job never finishes.
+  ~MTLD3D12ComputePipelineStateImpl() {
+    if (async_job && !dxmt::this_thread::isInModuleDetachment())
+      async_job->Cancel();
+  }
 
   HRESULT
   Initialize(const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc) {
@@ -153,14 +159,33 @@ public:
        * GetIndirectCommandBufferPipelineState. */
       info.support_indirect_command_buffers = false;
 
-      pso = CreateNativePipeline(info, err);
-      if (!pso) {
-        ERR("Failed to create compute PSO: ", err.description().getUTF8String());
-        return E_FAIL;
-      }
-
+      // The job's `info` names cs_func's handle, which indirect_compute_function keeps alive.
       indirect_compute_function = cs_func;
       indirect_info = info;
+
+      // Shader conversion, library and function above stay synchronous so invalid shaders still fail
+      // creation; only the native link is deferred. Atomic64 pipelines stay synchronous, as for graphics.
+      if (device_->async_pipelines.Enabled() && !uses_atomic64) {
+        // Submitted by CreateComputePipelineState after Initialize succeeds; the link result decides
+        // cache retention and disk publication, so a failed link is never published as a good PSO.
+        async_job = std::make_shared<owned_graphics::AsyncCompileJob>([this, info] {
+          WMT::Reference<WMT::Error> error;
+          auto native = CreateNativePipeline(info, error);
+          cache_.CommitDeferred(bool(native));
+          if (!native) {
+            ERR("Failed to create deferred compute PSO: ", error ? error.description().getUTF8String() : "");
+            return false;
+          }
+          pso = std::move(native);
+          return true;
+        });
+      } else {
+        pso = CreateNativePipeline(info, err);
+        if (!pso) {
+          ERR("Failed to create compute PSO: ", err.description().getUTF8String());
+          return E_FAIL;
+        }
+      }
     }
 
     if (trace) {
@@ -272,6 +297,12 @@ public:
 
   virtual HRESULT STDMETHODCALLTYPE
   GetCachedBlob(ID3DBlob **blob) override {
+    // The deferred link commits the cache; export only a PSO whose link actually succeeded.
+    if (!WaitNativePipeline()) {
+      if (blob)
+        *blob = nullptr;
+      return E_FAIL;
+    }
     return cache_.GetBlob(blob);
   }
 };
@@ -299,9 +330,12 @@ CreateComputePipelineState(
     pso = std::move(fresh); // Rebuild bindings/constants/native objects on a fresh PSO.
     hr = pso->Initialize(pDesc);
   }
-  pso->cache_.Complete(hr);
+  // A deferred link holds only the entry's retention/publication (PipelineCache::CommitDeferred).
+  pso->cache_.Complete(hr, !pso->async_job);
   if (FAILED(hr))
     return hr;
+  if (pso->async_job)
+    pDevice->async_pipelines.Submit(pso->async_job);
   return pso->QueryInterface(riid, ppPipelineState);
 };
 
