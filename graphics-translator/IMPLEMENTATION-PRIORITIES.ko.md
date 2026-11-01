@@ -2,6 +2,10 @@
 
 기준일: **2026-10-10**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
 
+## 2026-11-04 후속
+
+[2026-11-04 최적화](CORE-IMPLEMENTATION-STATUS.ko.md#로딩fgsrrt-추가-최적화--2026-11-04) 뒤 남은 후보: FG depth/motion을 렌더 해상도로 MetalFX에 넘기기(화질 A/B 필요), FSR FG UI 합성의 전체 화면 복사(AMD SDK 수정 범위 결정 필요), NGX RR 변환 pass 묶기·FSR RR 7x7 kernel tiling(oracle bit 일치 필요), MSAA resolve를 producing pass에 접기(ZZZ MSAA 사용 확인 필요), mesh/GS/tess PSO 전역 mutex(macOS 27 재진입 재현 확인 필요). `pipeline-library` suite의 async-on phase 기대값은 graphics 비동기 링크를 반영하지 않는다.
+
 ## 2026-11-03 후속
 
 도시 진입은 [TLAS prebuild·library 리소스 배열 수정](CORE-IMPLEMENTATION-STATUS.ko.md#zzz-도시-레이트레이싱-수정--2026-11-02)으로 해결했다. 남은 일: 레이트레이싱 threadgroup 수정 뒤 도시 구간 FPS·GPU 시간 측정, placed heap aliasing을 포함한 opaque 노드의 접근 모델(`ResolveTextureRegion`·allocator heap 소스·MSAA capture), FSR FG pacing jitter, `raytracing-atomic64` 기존 실패 3 case, 나머지 d3dalloy 이름(D3D11/DXGI·`dxmt.conf`·`DXMT_*` 설정·내부 이름·모듈 이름).

@@ -38,6 +38,16 @@
 
 도시 진입은 확인하지 못했다. 복제본에서 측정 runtime은 world load 뒤 로딩 화면에서 UnityPlayer null+8 read로 종료했고, 변경 전 runtime은 Start 뒤 보고 없이 종료했으며, 세 번째 실행은 로딩 화면에서 9분간 멈췄다. 따라서 이 종료를 이번 변경에 귀속하지 않는다. 원인은 아래 TLAS prebuild 수정으로 해결했다.
 
+## 로딩·FG·SR·RT 추가 최적화 — 2026-11-04
+
+**상태: 다섯 변경을 합친 ARM64X/FEX x64 GPU matrix가 base와 같은 판정이다. ZZZ FPS는 측정하지 않았다.**
+
+- **Compute PSO 비동기 링크:** `d3d12.asyncPipelineCompile=True`이면 compute PSO의 최종 native 링크도 graphics처럼 device worker로 넘긴다. 셰이더 변환·library·function 생성은 동기로 남아 잘못된 셰이더는 Create에서 실패한다. Dispatch·간접 실행·`GetCachedBlob`은 링크 완료를 기다리고, 실패한 링크는 캐시에 남기지 않는다. Atomic64 PSO는 동기로 둔다. 기본값(꺼짐)은 동작이 같다.
+- **FG 전처리 융합:** depth와 motion을 모두 변환해야 하는 FG prepare는 3x3 nearest-depth 탐색을 한 번 하는 dispatch 하나로 처리한다(이전에는 dispatch 둘과 stage barrier). 16개 조합에서 기존 두 kernel과 bit 단위로 같다.
+- **SR 전처리 encoder:** exposure 변환·입력 복사·alpha·linearize·mask·padding을 compute encoder 하나에 넣고 fence 대기와 갱신을 한 번씩만 한다. 서로 의존하는 linearize→padding 사이에만 barrier를 둔다. native 테스트의 compute encoder가 122개에서 98개로 줄었고 출력은 같다.
+- **Stage cache eviction:** stage 디스크 캐시가 256MiB에 닿으면 새 항목을 거부하지 않고 오래된 파일부터 지운다. 이 프로세스가 읽거나 쓴 항목은 지우지 않는다. 다른 프로세스가 읽는 중인 파일은 `FILE_SHARE_DELETE`로 열려 있어 계속 읽힌다. CPU probe(`run-automatic-cache-cpu.py`)는 runner와 같은 wineboot 선행으로 다시 실행된다.
+- **RT intersection function table 재사용:** command allocator가 pipeline별 table pool을 두고, 이전 allocator epoch에 쓴 table만 다시 바인딩한다. Allocator Reset은 GPU retirement 뒤에만 성공하므로 실행 중인 table은 바뀌지 않는다. raytracing suite에서 table 생성 168회 중 98회가 재사용으로 바뀌었다.
+
 ## 남은 측정 후보 적용과 d3dalloy 이름 — 2026-11-03
 
 **상태: ARM64X/FEX x64 GPU matrix에서 base와 같은 판정이다. ZZZ FPS는 측정하지 않았다.**
