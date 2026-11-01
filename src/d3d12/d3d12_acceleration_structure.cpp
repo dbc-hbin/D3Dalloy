@@ -35,10 +35,11 @@ uint32_t Usage(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS flags) {
  * address is checked: the operation must not dereference it. */
 bool Resolve(ResolveGPUVA resolve, void *context, uint64_t address, uint64_t bytes,
     BufferLocation &location) {
-  if (!address)
-    return false;
+  /* Prebuild info never dereferences GPU memory, and the DXR spec lets those addresses be null. */
   if (!resolve)
     return true;
+  if (!address)
+    return false;
   if (!resolve(context, address, bytes, location))
     return false;
   return location.offset <= std::numeric_limits<uint64_t>::max() - bytes && location.available >= bytes;

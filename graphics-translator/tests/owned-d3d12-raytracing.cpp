@@ -936,6 +936,14 @@ int testRaytracing(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8
               static_cast<unsigned long long>(tlasInfo.ScratchDataSizeInBytes));
   require(tlasInfo.ResultDataMaxSizeInBytes > 0 && tlasInfo.ScratchDataSizeInBytes > 0,
           "GetRaytracingAccelerationStructurePrebuildInfo(TLAS) returned zero sizes");
+  // Prebuild never reads GPU memory, so a null InstanceDescs must report the same sizes (DXR spec).
+  D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS nullTlasInputs = tlasInputs;
+  nullTlasInputs.InstanceDescs = 0;
+  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO nullTlasInfo{};
+  device5->GetRaytracingAccelerationStructurePrebuildInfo(&nullTlasInputs, &nullTlasInfo);
+  require(nullTlasInfo.ResultDataMaxSizeInBytes == tlasInfo.ResultDataMaxSizeInBytes &&
+              nullTlasInfo.ScratchDataSizeInBytes == tlasInfo.ScratchDataSizeInBytes,
+          "GetRaytracingAccelerationStructurePrebuildInfo(TLAS) rejected a null InstanceDescs");
 
   resources.tlas = createBuffer(device, tlasInfo.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
                                 D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE,
