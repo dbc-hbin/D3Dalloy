@@ -2,7 +2,8 @@
 // src/winemetal/unix/fsr-kernels.metal (passed as argv[1]). No Wine or MetalFX.
 // Checks 3x3 nearest-depth dilation (center wins ties, inverted ordering, clamped
 // edges), motion read at the winning sample, and round-to-nearest half motion
-// stores with finite saturation while NaN/Inf are preserved.
+// stores with finite saturation while NaN/Inf are preserved, and that the fused
+// depth+motion kernel is bit-identical to the two separate passes.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <algorithm>
@@ -103,6 +104,7 @@ int main(int argc, char** argv) {
         };
         id<MTLComputePipelineState> depthPipeline = pipeline(@"yaagl_fg_resample_depth");
         id<MTLComputePipelineState> motionPipeline = pipeline(@"yaagl_fg_normalize_motion");
+        id<MTLComputePipelineState> fusedPipeline = pipeline(@"yaagl_fg_normalize_depth_motion");
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
         // Half-store rounding: RG16Float float-typed stores may truncate on Apple GPUs.
@@ -176,7 +178,55 @@ int main(int argc, char** argv) {
                 ++cases;
             }
         std::printf("OWNED_FG_NORMALIZATION_DILATION cases=%u pixels=%u mismatches=%u\n", cases, ow * oh, dilationMismatches);
-        failures = roundingMismatches + dilationMismatches;
+
+        // Fused depth+motion pass: bit-identical to depth then motion, including
+        // camera reconstruction (which reads the depth the separate pass stored).
+        // A motion grid larger than depth exercises the winner remap between grids.
+        constexpr unsigned mw = 11, mh = 8;
+        std::vector<std::array<float, 2>> wideVectors(mw * mh);
+        for (unsigned i = 0; i < wideVectors.size(); ++i) wideVectors[i] = {float(i % 13) / 4.f, -float(i) / 32.f};
+        auto wideMotion = makeTexture(device, MTLPixelFormatRG32Float, mw, mh, wideVectors.data(), 8);
+        unsigned fusedMismatches = 0, fusedCases = 0;
+        for (unsigned wide = 0; wide < 2; ++wide)
+        for (unsigned inverted = 0; inverted < 2; ++inverted)
+            for (unsigned dilate = 0; dilate < 2; ++dilate)
+                for (unsigned camera = 0; camera < 2; ++camera) {
+                    auto make = [&](MTLPixelFormat format, size_t pixel) {
+                        return makeTexture(device, format, ow, oh, nullptr, pixel);
+                    };
+                    auto separateDepth = make(MTLPixelFormatR32Float, 4), fusedDepth = make(MTLPixelFormatR32Float, 4);
+                    auto separateMotion = make(MTLPixelFormatRG16Float, 4), fusedMotion = make(MTLPixelFormatRG16Float, 4);
+                    FgParams d{};
+                    d.extent[0] = ow; d.extent[1] = oh;
+                    d.sourceExtent[0] = rw; d.sourceExtent[1] = rh;
+                    d.depthDilation = dilate; d.depthInverted = inverted;
+                    FgParams m = d;
+                    if (wide) { m.sourceExtent[0] = mw; m.sourceExtent[1] = mh; }
+                    id<MTLTexture> motionSource = wide ? wideMotion : motionTexture;
+                    m.motionTargetExtent[0] = rw; m.motionTargetExtent[1] = rh;
+                    m.outputExtent[0] = ow; m.outputExtent[1] = oh;
+                    m.motionScale[0] = 1.5f; m.motionScale[1] = -.75f;
+                    m.jitterCancellation[0] = .125f; m.jitterCancellation[1] = -.25f;
+                    m.motionVectorsInvalidValue = vectors[3][0];
+                    m.motionVectorsInvalidValuePresent = 1;
+                    m.depthSourceExtent[0] = rw; m.depthSourceExtent[1] = rh;
+                    m.reconstructCameraMotion = camera;
+                    const float clip[16]{1.f, .01f, 0, .002f, -.02f, .98f, 0, 0, .03f, -.01f, 1.01f, .001f, .004f, 0, .02f, 1.f};
+                    std::memcpy(m.clipToPreviousClip, clip, sizeof(clip));
+                    run(queue, depthPipeline, d, {{depthTexture, 0}, {separateDepth, 1}});
+                    run(queue, motionPipeline, m, {{motionSource, 0}, {separateMotion, 1}, {separateDepth, 2}, {depthTexture, 4}});
+                    run(queue, fusedPipeline, m, {{motionSource, 0}, {fusedMotion, 1}, {fusedDepth, 2}, {depthTexture, 4}});
+                    std::vector<std::uint32_t> a(ow * oh), b(ow * oh), c(ow * oh), e(ow * oh);
+                    const auto region = MTLRegionMake2D(0, 0, ow, oh);
+                    [separateDepth getBytes:a.data() bytesPerRow:ow * 4 fromRegion:region mipmapLevel:0];
+                    [fusedDepth getBytes:b.data() bytesPerRow:ow * 4 fromRegion:region mipmapLevel:0];
+                    [separateMotion getBytes:c.data() bytesPerRow:ow * 4 fromRegion:region mipmapLevel:0];
+                    [fusedMotion getBytes:e.data() bytesPerRow:ow * 4 fromRegion:region mipmapLevel:0];
+                    for (unsigned i = 0; i < a.size(); ++i) fusedMismatches += (a[i] != b[i]) + (c[i] != e[i]);
+                    ++fusedCases;
+                }
+        std::printf("OWNED_FG_NORMALIZATION_FUSED cases=%u pixels=%u mismatches=%u\n", fusedCases, ow * oh, fusedMismatches);
+        failures = roundingMismatches + dilationMismatches + fusedMismatches;
     }
     if (failures) { std::fprintf(stderr, "OWNED_FG_NORMALIZATION_FAIL mismatches=%u\n", failures); return 1; }
     std::puts("OWNED_FG_NORMALIZATION_PASS");
