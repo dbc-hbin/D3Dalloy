@@ -54,6 +54,38 @@ static DXMTM4DeviceResidency *m4_device_residency(id<MTLDevice> device) {
     return shared;
   }
 }
+/* Immutable unique member set of one view pool generation. It is one counted
+ * residency user: its members enter the device set when its first user
+ * acquires it and leave when its last user releases it. */
+@interface DXMTM4ViewSnapshot : NSObject {
+@public
+  NSArray *members;
+}
+@end
+@implementation DXMTM4ViewSnapshot
+- (void)dealloc { [members release]; [super dealloc]; }
+@end
+static NSUInteger m4_snapshot_acquire(DXMTM4DeviceResidency *shared, DXMTM4ViewSnapshot *snapshot) {
+  NSUInteger added=0;
+  if (![shared->uses countForObject:snapshot]) {
+    for (id allocation in snapshot->members) {
+      if (![shared->uses countForObject:allocation]) { [shared->set addAllocation:allocation]; ++added; }
+      [shared->uses addObject:allocation];
+    }
+  }
+  [shared->uses addObject:snapshot];
+  return added;
+}
+static NSUInteger m4_snapshot_release(DXMTM4DeviceResidency *shared, DXMTM4ViewSnapshot *snapshot) {
+  NSUInteger removed=0;
+  [shared->uses removeObject:snapshot];
+  if ([shared->uses countForObject:snapshot]) return 0;
+  for (id allocation in snapshot->members) {
+    [shared->uses removeObject:allocation];
+    if (![shared->uses countForObject:allocation]) { [shared->set removeAllocation:allocation]; ++removed; }
+  }
+  return removed;
+}
 @interface DXMTM4ViewPool : NSObject {
 @public
   id<MTLTextureViewPool> pool;
@@ -62,6 +94,10 @@ static DXMTM4DeviceResidency *m4_device_residency(id<MTLDevice> device) {
   NSCountedSet *parents;
   NSMutableDictionary *ordinaryViews;
   NSCountedSet *ordinaryOwners;
+  /* Bumped only when the unique member set changes; recordings lease the
+   * cached snapshot of an unchanged generation without walking members. */
+  uint64_t generation, snapshotGeneration;
+  DXMTM4ViewSnapshot *snapshot;
   BOOL trace;
   uint64_t setCount, copyCount, clearCount, residencyVisits, ordinaryNew, ordinaryReuse;
 }
@@ -72,15 +108,29 @@ static DXMTM4DeviceResidency *m4_device_residency(id<MTLDevice> device) {
 @implementation DXMTM4ViewPool
 - (void)replaceTexture:(id)texture atIndex:(NSUInteger)index {
   id previous=textures[index];
-  if (previous != [NSNull null]) [parents removeObject:previous];
+  if (previous == texture) return;
+  if (previous != [NSNull null]) {
+    [parents removeObject:previous];
+    if (![parents countForObject:previous]) ++generation;
+  }
   textures[index]=texture;
-  if (texture != [NSNull null]) [parents addObject:texture];
+  if (texture != [NSNull null]) {
+    if (![parents countForObject:texture]) ++generation;
+    [parents addObject:texture];
+  }
 }
 - (void)replaceOrdinaryView:(id)view atIndex:(NSUInteger)index {
   NSNumber *key=@(index);
   id previous=ordinaryViews[key];
-  if (previous) [ordinaryOwners removeObject:previous];
-  if (view) { ordinaryViews[key]=view; [ordinaryOwners addObject:view]; }
+  if (previous == view) return;
+  if (previous) {
+    [ordinaryOwners removeObject:previous];
+    if (![ordinaryOwners countForObject:previous]) ++generation;
+  }
+  if (view) {
+    if (![ordinaryOwners countForObject:view]) ++generation;
+    ordinaryViews[key]=view; [ordinaryOwners addObject:view];
+  }
   else [ordinaryViews removeObjectForKey:key];
 }
 - (uint64_t)setTexture:(id<MTLTexture>)texture info:(const struct WMTTextureViewPoolInfo *)info atIndex:(NSUInteger)index {
@@ -119,7 +169,7 @@ static DXMTM4DeviceResidency *m4_device_residency(id<MTLDevice> device) {
 - (void)dealloc {
   if (trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_VIEW_POOL pool_new=%u pool_fallback=%u slot_set=%llu slot_copy=%llu slot_clear=%llu slots=%lu unique_parent_visits=%llu ordinary_view_new=%llu ordinary_view_reuse=%llu\n",
       pool?1:0,pool?0:1,(unsigned long long)setCount,(unsigned long long)copyCount,(unsigned long long)clearCount,(unsigned long)textures.count,(unsigned long long)residencyVisits,(unsigned long long)ordinaryNew,(unsigned long long)ordinaryReuse);
-  [pool release]; [descriptor release]; [textures release]; [parents release];
+  [pool release]; [descriptor release]; [textures release]; [parents release]; [snapshot release];
   [ordinaryViews release]; [ordinaryOwners release]; [super dealloc];
 }
 @end
@@ -318,14 +368,27 @@ static void m4_allocation(DXMTM4Recording *recording, id<MTLAllocation> allocati
   if (!allocation) return;
   DXMTM4ViewPool *views=objc_getAssociatedObject(allocation,&m4_view_pool_key);
   if (views && ![recording->objects containsObject:views]) {
-    // The recording, not the mutable descriptor heap, owns this GPU-use lease.
+    // The recording, not the mutable descriptor heap, owns this GPU-use lease:
+    // the immutable snapshot of the heap's current members.
     m4_retain(recording,views);
+    DXMTM4ViewSnapshot *snapshot;
     @synchronized(views) {
-      for (id texture in views->parents) {
-        if (views->trace) ++views->residencyVisits;
-        m4_allocation(recording,texture);
+      if (!views->snapshot || views->snapshotGeneration!=views->generation) {
+        NSMutableArray *members=[[NSMutableArray alloc] initWithCapacity:views->parents.count+views->ordinaryOwners.count];
+        for (id texture in views->parents) {
+          if (views->trace) ++views->residencyVisits;
+          [members addObject:texture];
+        }
+        for (id view in views->ordinaryOwners) [members addObject:view];
+        [views->snapshot release];
+        views->snapshot=[DXMTM4ViewSnapshot new]; views->snapshot->members=members;
+        views->snapshotGeneration=views->generation;
       }
-      for (id view in views->ordinaryOwners) m4_allocation(recording,view);
+      snapshot=views->snapshot;
+      m4_retain(recording,snapshot);
+    }
+    if (![recording->allocations containsObject:snapshot]) {
+      [recording->allocations addObject:snapshot]; [recording->pending addObject:snapshot];
     }
   }
   [recording->objects addObject:allocation];
@@ -342,6 +405,14 @@ static void m4_commit_residency(DXMTM4Recording *recording) {
   BOOL dirty=NO;
   [shared->lock lock];
   for (id allocation in recording->pending) {
+    if ([allocation isKindOfClass:[DXMTM4ViewSnapshot class]]) {
+      NSUInteger added=m4_snapshot_acquire(shared,allocation);
+      if (added) {
+        dirty=YES;
+        if (recording->trace) recording->counters.residencyAdd+=added;
+      }
+      continue;
+    }
     if (![shared->uses countForObject:allocation]) {
       [shared->set addAllocation:allocation]; dirty=YES;
       if (recording->trace) ++recording->counters.residencyAdd;
@@ -367,6 +438,14 @@ static void m4_release_residency(DXMTM4Recording *recording) {
   BOOL dirty=NO;
   [shared->lock lock];
   for (id allocation in recording->published) {
+    if ([allocation isKindOfClass:[DXMTM4ViewSnapshot class]]) {
+      NSUInteger removed=m4_snapshot_release(shared,allocation);
+      if (removed) {
+        dirty=YES;
+        if (recording->trace) recording->counters.residencyRemove+=removed;
+      }
+      continue;
+    }
     [shared->uses removeObject:allocation];
     if (![shared->uses countForObject:allocation]) {
       [shared->set removeAllocation:allocation]; dirty=YES;
