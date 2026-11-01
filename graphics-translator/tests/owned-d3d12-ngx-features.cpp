@@ -430,7 +430,7 @@ void runPublicFgMotionInputs(const NgxApi &api, Gpu &gpu, bool invalidSentinel) 
   constexpr UINT extent = ngxPresentExtent, render = extent / 2;
   constexpr auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   constexpr auto write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  NVSDK_NGX_Handle* features[4]{};
+  NVSDK_NGX_Handle* features[5]{};
   for (auto& feature : features) feature = ngxPresentFeature(api, gpu, false, !invalidSentinel);
   const std::vector<uint8_t> sentinel(extent * extent * 4, 19);
   UINT effectiveFrames = 0, generatedFrames = 0;
@@ -439,14 +439,15 @@ void runPublicFgMotionInputs(const NgxApi &api, Gpu &gpu, bool invalidSentinel) 
     auto color = createTexture(gpu.device.Get(), extent, extent, DXGI_FORMAT_R8G8B8A8_UNORM,
         D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
     uploadTexture(gpu, color.Get(), scene.data(), extent * 4, read);
-    std::array<std::vector<uint8_t>, 4> images;
-    for (UINT mode = 0; mode != 4; ++mode) {
+    std::array<std::vector<uint8_t>, 5> images;
+    for (UINT mode = 0; mode != 5; ++mode) {
       const UINT depthExtent = invalidSentinel ? extent : render;
       const UINT motionExtent = invalidSentinel || mode == 1 || mode == 2 ? extent : render;
-      const UINT dx = mode == 2 ? 3 : 0, dy = mode == 2 ? 5 : 0;
-      const UINT mx = mode == 2 ? 11 : 0, my = mode == 2 ? 13 : 0;
-      const UINT dw = depthExtent + (mode == 2 ? 16 : 0), dh = depthExtent + (mode == 2 ? 20 : 0);
-      const UINT mw = motionExtent + (mode == 2 ? 32 : 0), mh = motionExtent + (mode == 2 ? 40 : 0);
+      const bool atlas = mode == 2 || mode == 4;
+      const UINT dx = atlas ? 3 : 0, dy = atlas ? 5 : 0;
+      const UINT mx = atlas ? 11 : 0, my = atlas ? 13 : 0;
+      const UINT dw = depthExtent + (atlas ? 16 : 0), dh = depthExtent + (atlas ? 20 : 0);
+      const UINT mw = motionExtent + (atlas ? 32 : 0), mh = motionExtent + (atlas ? 40 : 0);
       std::vector<float> depths(dw * dh, .01f);
       std::vector<uint16_t> vectors(mw * mh * 2, 0x4c00);
       for (UINT y = 0; y != depthExtent; ++y) for (UINT x = 0; x != depthExtent; ++x)
@@ -454,15 +455,17 @@ void runPublicFgMotionInputs(const NgxApi &api, Gpu &gpu, bool invalidSentinel) 
       for (UINT y = 0; y != motionExtent; ++y) for (UINT x = 0; x != motionExtent; ++x) {
         const UINT i = ((y + my) * mw + x + mx) * 2;
         // -32 is a finite invalid marker, never valid object displacement.
-        vectors[i] = mode == 3 ? 0 : invalidSentinel && mode ? (x % 2 ? 0x4000 : 0xd000) : motionExtent == extent ? 0x4400 : 0x4000;
-        vectors[i + 1] = mode == 3 ? 0 : invalidSentinel && mode ? (x % 2 ? 0xd000 : 0x4000) : motionExtent == extent ? 0x4000 : 0x3c00;
+        vectors[i] = mode == 3 ? 0 : invalidSentinel && (mode == 1 || mode == 2) ? (x % 2 ? 0x4000 : 0xd000) :
+            mode == 4 ? (motionExtent == extent ? 0x4800 : 0x4400) : motionExtent == extent ? 0x4400 : 0x4000;
+        vectors[i + 1] = mode == 3 ? 0 : invalidSentinel && (mode == 1 || mode == 2) ? (x % 2 ? 0xd000 : 0x4000) :
+            mode == 4 ? (motionExtent == extent ? 0x4400 : 0x4000) : motionExtent == extent ? 0x4000 : 0x3c00;
       }
       auto depth = createTexture(gpu.device.Get(), dw, dh, DXGI_FORMAT_R32_FLOAT,
           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
       auto motion = createTexture(gpu.device.Get(), mw, mh, DXGI_FORMAT_R16G16_FLOAT,
           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-      const UINT ow = extent + (mode == 2 ? 24 : 0), oh = extent + (mode == 2 ? 16 : 0);
-      const UINT ox = mode == 2 ? 7 : 0, oy = mode == 2 ? 5 : 0;
+      const UINT ow = extent + (atlas ? 24 : 0), oh = extent + (atlas ? 16 : 0);
+      const UINT ox = atlas ? 7 : 0, oy = atlas ? 5 : 0;
       const std::vector<uint8_t> outputSentinel(ow * oh * 4, 19);
       auto output = createTexture(gpu.device.Get(), ow, oh, DXGI_FORMAT_R8G8B8A8_UNORM,
           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -477,7 +480,7 @@ void runPublicFgMotionInputs(const NgxApi &api, Gpu &gpu, bool invalidSentinel) 
       auto params = allocateParams(api);
       ngx_feature_set_resource(params, "DLSSG.Backbuffer", color.Get());
       ngx_feature_set_resource(params, "DLSSG.OutputInterpolated", output.Get());
-      if (mode == 2) {
+      if (atlas) {
         ngx_feature_set_uint(params, "DLSSG.EvalFlags", 1);
         ngx_feature_set_uint(params, "DLSSG.OutputInterpolatedSubrectBaseX", ox);
         ngx_feature_set_uint(params, "DLSSG.OutputInterpolatedSubrectBaseY", oy);
@@ -498,8 +501,10 @@ void runPublicFgMotionInputs(const NgxApi &api, Gpu &gpu, bool invalidSentinel) 
       ngx_feature_set_uint(params, "DLSSG.BackbufferFrameID", frame);
       ngx_feature_set_uint(params, "DLSSG.Reset", !frame);
       ngx_feature_set_float(params, "FrameTimeDeltaInMsec", 1000.f / 30);
-      ngx_feature_set_float(params, "DLSSG.MvecScaleX", 1.f / motionExtent);
-      ngx_feature_set_float(params, "DLSSG.MvecScaleY", 1.f / motionExtent);
+      // Mode 4 doubles the encoded displacement and halves its scale on the
+      // same render grid; its independent padded origins must not change output.
+      ngx_feature_set_float(params, "DLSSG.MvecScaleX", (mode == 4 ? .5f : 1.f) / motionExtent);
+      ngx_feature_set_float(params, "DLSSG.MvecScaleY", (mode == 4 ? .5f : 1.f) / motionExtent);
       ngx_feature_set_float(params, "DLSSG.CameraNear", .1f);
       ngx_feature_set_float(params, "DLSSG.CameraFar", 1000);
       ngx_feature_set_float(params, "DLSSG.CameraFOV", 1);
@@ -542,23 +547,26 @@ void runPublicFgMotionInputs(const NgxApi &api, Gpu &gpu, bool invalidSentinel) 
       }
       const auto realPixels = ngxPresentPixels(gpu, real.Get(), write);
       for (UINT y = 0; y != rh; ++y) for (UINT x = 0; x != rw; ++x) for (UINT c = 0; c != 4; ++c) {
-        const auto expected = mode == 2 && x >= rx && x < rx + extent && y >= ry && y < ry + extent
+        const auto expected = atlas && x >= rx && x < rx + extent && y >= ry && y < ry + extent
             ? scene[((y - ry) * extent + x - rx) * 4 + c] : 19;
         if (realPixels[(y * rw + x) * 4 + c] != expected) fail("FG independent real-output crop or sentinel");
       }
       if (images[mode] == sentinel) fail("FG motion inputs output unwritten");
     }
-    for (UINT mode = 1; mode != 3; ++mode) {
+    // Different guide resolutions legitimately change MetalFX interpolation.
+    // Compare equivalent encodings within each grid, not render vs display:
+    // 0/4 covers render-grid scale and padding; 1/2 covers mixed-grid/inverse motion.
+    for (const auto pair : {std::pair{0u, 4u}, std::pair{1u, 2u}}) {
       int maxDelta = 0;
-      for (size_t i = 0; i != images[0].size(); ++i)
-        maxDelta = std::max(maxDelta, std::abs(int(images[0][i]) - int(images[mode][i])));
+      for (size_t i = 0; i != images[pair.first].size(); ++i)
+        maxDelta = std::max(maxDelta, std::abs(int(images[pair.first][i]) - int(images[pair.second][i])));
       if (maxDelta > 1) fail("FG motion inputs differ from equivalent normalized motion");
     }
     effectiveFrames += UINT(frame >= 2 && images[0] != images[3]);
     generatedFrames += UINT(frame >= 2 && images[1] != scene);
   }
   if (!effectiveFrames || !generatedFrames) fail("FG motion inputs never generated nontrivial motion beyond warmup");
-  std::printf("OWNED_D3D12_NGX_INPUT_PASS case=motion invalid_sentinel=%u frames=6 independent_features=4 equivalent_motion=1 poisoned_padding=1 output_real_rects=1 jitter_or_inverse=1 generated_beyond_warmup=1 release_before_execute=1 snapshot=1\n", UINT(invalidSentinel));
+  std::printf("OWNED_D3D12_NGX_INPUT_PASS case=motion invalid_sentinel=%u frames=6 independent_features=5 equivalent_motion=1 poisoned_padding=1 output_real_rects=1 jitter_or_inverse=1 generated_beyond_warmup=1 release_before_execute=1 snapshot=1\n", UINT(invalidSentinel));
 }
 void runPublicFgUi(const NgxApi &api, Gpu &gpu) {
   constexpr UINT extent = ngxPresentExtent, atlas = extent + 8, uiX = 3, uiY = 5;

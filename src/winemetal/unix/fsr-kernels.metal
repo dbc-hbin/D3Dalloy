@@ -470,10 +470,13 @@ kernel void yaagl_fg_encode_scatter(
             color = source.read(position);
             color.rgb = fg_encode(color.rgb, params);
         } else if (panel == 1u) {
-            float2 mv = motion.read(position).xy;
+            uint2 guidePosition = fg_source_position(position, params.extent, params.depthSourceExtent);
+            float2 mv = motion.read(guidePosition).xy *
+                        float2(params.extent) / float2(params.depthSourceExtent);
             color = float4(clamp(0.5f + mv * 0.1f, 0.0f, 1.0f), 0.5f, 1.0f);
         } else {
-            float value = clamp(depth.read(position).r, 0.0f, 1.0f);
+            uint2 guidePosition = fg_source_position(position, params.extent, params.depthSourceExtent);
+            float value = clamp(depth.read(guidePosition).r, 0.0f, 1.0f);
             color = float4(value, value, value, 1.0f);
         }
     }

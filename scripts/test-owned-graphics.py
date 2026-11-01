@@ -2831,7 +2831,7 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
                 "OWNED_D3D12_NGX_SCENE frames=14 reset=1 output_written=1 actual_count=unavailable consumer=gpu_readback"]:
             failures.append("NGX native explicit scene-reset output evidence incomplete")
         expected_inputs = [f"OWNED_D3D12_NGX_INPUT_PASS case=camera infinite_far={i} frames=6 independent_features=4 inverse_projection=1 invalid_untouched=1 native_boundaries=1 explicit_projection=1 complete_basis=1 aspect=2 generated_beyond_warmup=1 release_before_execute=1 snapshot=1" for i in (0, 1)]
-        expected_inputs += [f"OWNED_D3D12_NGX_INPUT_PASS case=motion invalid_sentinel={i} frames=6 independent_features=4 equivalent_motion=1 poisoned_padding=1 output_real_rects=1 jitter_or_inverse=1 generated_beyond_warmup=1 release_before_execute=1 snapshot=1" for i in (0, 1)]
+        expected_inputs += [f"OWNED_D3D12_NGX_INPUT_PASS case=motion invalid_sentinel={i} frames=6 independent_features=5 equivalent_motion=1 poisoned_padding=1 output_real_rects=1 jitter_or_inverse=1 generated_beyond_warmup=1 release_before_execute=1 snapshot=1" for i in (0, 1)]
         expected_rejections = [f"OWNED_D3D12_NGX_INPUT_REJECT case=camera infinite_far={i} aspect_zero_negative_nan_infinity=invalid_parameter far_negative_infinity_nan=invalid_parameter outputs_untouched=1" for i in (0, 1)]
         if ([line for line in lines if line.startswith("OWNED_D3D12_NGX_INPUT_PASS")] != expected_inputs
                 or [line for line in lines if line.startswith("OWNED_D3D12_NGX_INPUT_REJECT")] != expected_rejections):

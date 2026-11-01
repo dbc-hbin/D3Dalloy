@@ -475,6 +475,8 @@ struct Configuration {
     std::uint32_t transfer = 0;
     bool cameraPresent = false;
     bool distortionEnabled = false;
+    // Descriptor input is the maximum render size; see renderGridInputs.
+    bool renderGrid = false;
     MTLPixelFormat depth = MTLPixelFormatInvalid;
     MTLPixelFormat motion = MTLPixelFormatRG16Float;
     NSUInteger width = 0, height = 0, outputWidth = 0, outputHeight = 0;
@@ -603,11 +605,26 @@ bool supported(State& state, id<MTLDevice> device, std::uint64_t compiler) {
     return false;
 }
 
+// MetalFX consumes depth and motion on the render grid when the maximum render
+// size fits the generation rect: the descriptor input is that maximum and each
+// frame's depth extent is its content region, so dynamic resolution keeps one
+// interpolator. Motion is in render-grid pixels. Declared display-resolution
+// motion keeps both on the output grid.
+bool renderGridInputs(const WMTFGcreate_packet& creation, const WMTFGprepare_packet& packet,
+                      NSUInteger outputWidth, NSUInteger outputHeight) noexcept {
+    return !(creation.flags & WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS) &&
+           packet.motion_width == packet.render_width && packet.motion_height == packet.render_height &&
+           creation.max_render_width <= outputWidth && creation.max_render_height <= outputHeight;
+}
+
 std::shared_ptr<Configuration> configure(
     State& state, const Command& command,
     const WMTFGprepare_packet& packet,
     id<MTLTexture> depth, MTLPixelFormat sourceColor, MTLPixelFormat sourceUi,
     NSUInteger outputWidth, NSUInteger outputHeight, std::uint32_t transfer, bool distortionEnabled) {
+    const bool renderGrid = renderGridInputs(state.creation, packet, outputWidth, outputHeight);
+    const NSUInteger inputWidth = renderGrid ? state.creation.max_render_width : outputWidth;
+    const NSUInteger inputHeight = renderGrid ? state.creation.max_render_height : outputHeight;
     if (@available(macOS 26.0, *)) {
         auto device = (id<MTLDevice>)command.value.device;
         if (!supported(state, device, command.value.compiler)) return {};
@@ -625,7 +642,8 @@ std::shared_ptr<Configuration> configure(
                 cached->transfer == transfer && cached->cameraPresent == cameraPresent &&
                 cached->distortionEnabled == distortionEnabled &&
                 cached->depth == depthFormat && cached->motion == motion &&
-                cached->width == outputWidth && cached->height == outputHeight &&
+                cached->renderGrid == renderGrid &&
+                cached->width == inputWidth && cached->height == inputHeight &&
                 cached->outputWidth == outputWidth && cached->outputHeight == outputHeight)
                 return cached;
         }
@@ -642,8 +660,9 @@ std::shared_ptr<Configuration> configure(
         result->distortionEnabled = distortionEnabled;
         result->depth = depthFormat;
         result->motion = motion;
-        result->width = outputWidth;
-        result->height = outputHeight;
+        result->renderGrid = renderGrid;
+        result->width = inputWidth;
+        result->height = inputHeight;
         result->outputWidth = outputWidth;
         result->outputHeight = outputHeight;
 
@@ -1073,6 +1092,8 @@ bool PreparedFrame::encode(
                 auto device = (id<MTLDevice>)configuration.device.get();
                 const auto& p = impl_->snapshot->parameters;
                 const auto& d = impl_->dispatch;
+                const NSUInteger guideWidth = configuration.renderGrid ? p.render_width : configuration.width;
+                const NSUInteger guideHeight = configuration.renderGrid ? p.render_height : configuration.height;
                 const NSUInteger motionTargetWidth = p.motion_width;
                 const NSUInteger motionTargetHeight = p.motion_height;
                 // Display-resolution motion already carries color-grid silhouettes; dilate
@@ -1083,19 +1104,20 @@ bool PreparedFrame::encode(
                 const NSUInteger samplingHeight = impl_->dispatch.independent_subrects
                     ? configuration.height : impl_->state->creation.display_height;
                 const bool depthDilation =
+                    !configuration.renderGrid &&
                     !(impl_->state->creation.flags & WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS) &&
                     (impl_->snapshot->depthWidth < samplingWidth || impl_->snapshot->depthHeight < samplingHeight);
                 const bool motionConversion = depthDilation || p.reconstruct_camera_motion || p.motion_scale_x != 1 || p.motion_scale_y != 1 ||
                     p.motion_vectors_invalid_value_present ||
-                    motionTargetWidth != configuration.outputWidth ||
-                    motionTargetHeight != configuration.outputHeight ||
+                    motionTargetWidth != guideWidth ||
+                    motionTargetHeight != guideHeight ||
                     (impl_->state->creation.flags & WMTFG_MOTION_VECTORS_JITTERED);
                 const bool directDepth = exactDescriptorInput(
                     (id<MTLTexture>)impl_->snapshot->depth.get(), configuration.depth,
-                    configuration.width, configuration.height, effect.depthTextureUsage, depthDilation);
+                    guideWidth, guideHeight, effect.depthTextureUsage, depthDilation);
                 const bool directMotion = exactDescriptorInput(
                     (id<MTLTexture>)impl_->snapshot->motion.get(), configuration.motion,
-                    configuration.width, configuration.height, effect.motionTextureUsage, motionConversion);
+                    guideWidth, guideHeight, effect.motionTextureUsage, motionConversion);
                 Object current = execution->scratchTexture(configuration.color,
                     configuration.outputWidth, configuration.outputHeight,
                     effect.colorTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
@@ -1104,10 +1126,10 @@ bool PreparedFrame::encode(
                                    configuration.outputHeight, effect.uiTextureUsage |
                                    MTLTextureUsageShaderWrite);
                 Object normalizedDepth = directDepth ? impl_->snapshot->depth : execution->scratchTexture(configuration.depth,
-                    configuration.width, configuration.height,
+                    guideWidth, guideHeight,
                     effect.depthTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
                 Object normalizedMotion = directMotion ? impl_->snapshot->motion : execution->scratchTexture(configuration.motion,
-                    configuration.width, configuration.height,
+                    guideWidth, guideHeight,
                     effect.motionTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
                 Object output = execution->scratchTexture(configuration.color,
                     configuration.outputWidth, configuration.outputHeight,
@@ -1184,6 +1206,8 @@ bool PreparedFrame::encode(
                 colorParams.motionTargetExtent[1] = state.creation.display_height;
                 colorParams.outputExtent[0] = configuration.outputWidth;
                 colorParams.outputExtent[1] = configuration.outputHeight;
+                colorParams.depthSourceExtent[0] = guideWidth;
+                colorParams.depthSourceExtent[1] = guideHeight;
                 colorParams.minLuminance = d.min_luminance;
                 colorParams.maxLuminance = d.max_luminance;
                 colorParams.transfer = d.backbuffer_transfer_function;
@@ -1209,24 +1233,26 @@ bool PreparedFrame::encode(
                 distortionParams.motionScale[1] = d.distortion_bias;
 
                 FgParams depthParams{};
-                depthParams.extent[0] = configuration.width;
-                depthParams.extent[1] = configuration.height;
+                depthParams.extent[0] = guideWidth;
+                depthParams.extent[1] = guideHeight;
                 depthParams.sourceExtent[0] = impl_->snapshot->depthWidth;
                 depthParams.sourceExtent[1] = impl_->snapshot->depthHeight;
                 depthParams.depthDilation = depthDilation;
                 depthParams.depthInverted = (state.creation.flags & WMTFG_DEPTH_INVERTED) != 0;
 
                 FgParams motionParams{};
-                motionParams.extent[0] = configuration.width;
-                motionParams.extent[1] = configuration.height;
+                motionParams.extent[0] = guideWidth;
+                motionParams.extent[1] = guideHeight;
                 // The generation rectangle is a placement offset, not a source offset.
                 // Resample the complete origin-zero motion domain into the active rect.
                 motionParams.sourceExtent[0] = impl_->snapshot->motionWidth;
                 motionParams.sourceExtent[1] = impl_->snapshot->motionHeight;
                 motionParams.motionTargetExtent[0] = p.motion_width;
                 motionParams.motionTargetExtent[1] = p.motion_height;
-                motionParams.outputExtent[0] = configuration.outputWidth;
-                motionParams.outputExtent[1] = configuration.outputHeight;
+                // MetalFX motion and reconstructed camera displacement are in
+                // input-content pixels, not output-color pixels.
+                motionParams.outputExtent[0] = guideWidth;
+                motionParams.outputExtent[1] = guideHeight;
                 motionParams.motionScale[0] = p.motion_scale_x;
                 motionParams.motionScale[1] = p.motion_scale_y;
                 motionParams.reconstructCameraMotion = p.reconstruct_camera_motion;
@@ -1382,8 +1408,8 @@ bool PreparedFrame::encode(
                 if (@available(macOS 27.0, *)) {
                     // All interpolator inputs are normalized to the origin-zero
                     // generation-rectangle domain before MetalFX consumes them.
-                    effect.contentWidth = configuration.outputWidth;
-                    effect.contentHeight = configuration.outputHeight;
+                    effect.contentWidth = guideWidth;
+                    effect.contentHeight = guideHeight;
                     effect.depthContentOffsetX = 0;
                     effect.depthContentOffsetY = 0;
                     effect.motionContentOffsetX = 0;

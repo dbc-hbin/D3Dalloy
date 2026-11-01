@@ -99,6 +99,13 @@ python3 scripts/test-owned-graphics.py \
 
 ## NGX feature11 caller-owned native presentation
 
+FG motion 입력 oracle은 동일 guide grid 안에서만 최대 1 byte 차이를 허용한다. 5개의 독립 feature 중
+render-grid 원본과 두 배 vector/절반 scale·독립 padding/subrect 표현을 비교하고, mixed/display-grid
+원본과 atlas/inverse-camera 표현을 따로 비교한다. Render-grid와 display-grid는 MetalFX의 interpolation
+입력 해상도가 다르므로 두 출력의 pixel equality는 계약이 아니다. 기존 zero-motion 대비 효과,
+warm-up 이후 실제 생성, reset/replay, padding guard, release-before-execute 검사는 유지한다.
+이 oracle은 public NGX transport와 단위·원점 변환을 검사하며 실제 DLSS 품질과 동등함을 뜻하지 않는다.
+
 `owned-d3d12-ngx-features.exe --mode present`는 RR oracle 없이 실행하는 별도 FG 경로다. Runner suite는 `ngx-fg-present --mode present`다. 기존 `ngx-features --mode no-present`의 FG/RR/alpha case 수·protocol·RR oracle 요구는 그대로 유지된다.
 
 공식 NGX D3D12 ABI에는 Present export가 없다. Fixture가 HWND flip-discard `IDXGISwapChain4`를 만들고, **NGX feature11 EvaluateFeature → DLSSG.OutputInterpolated**를 generated texture로 사용한 뒤 generated/real texture를 실제 backbuffer에 copy하고 `Present(1,0)`한다. FFX public proxy를 호출하지 않으며 product NGX swapchain export도 추가하지 않는다. 사용한 `DLSSG.HUDLess`, `DLSSG.Backbuffer`, MV/jitter/reset keys는 현재 facade가 수용하는 runtime key이며 vendored official header가 그 문자열을 정의한다는 뜻은 아니다.
