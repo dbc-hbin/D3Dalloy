@@ -32,7 +32,7 @@
 
 적용한 변경:
 - **셰이더(`AIRCONV_VERSION=46`):** bounded load의 범위 밖·null 경로가 address 0 대신 16-byte zero constant를 읽는다. Shader Validation의 `GPU address 0x0` 오류로 실패하던 bindless·dxil이 통과한다. table CBV row load도 같은 방식으로 branch를 없앴다(ZZZ PS 8개 branch 2513→1282). `air.is_null_*`에 Apple과 같은 readonly 속성을 붙였고(PS 하나 60→57), non-normalized sampler 경로는 D3D12가 허용하는 1D/2D·offset 0에서만 만든다. ZZZ CS 23개의 native 생성 합계는 36.06s→33.98s였다(1회 비교).
-- **Storage:** DEFAULT heap과 CPU 접근 불가 CUSTOM heap의 committed 텍스처를 Metal Private로 할당한다. NGX RR 출력과 FSR RR 입력의 storage 때문에 생기던 복사가 없어졌다. SR output shadow는 fixture에서 출력 rect/크기가 정확히 맞지 않아 대부분 남는다. 이런 텍스처의 `WriteToSubresource`/`ReadFromSubresource`는 staging blit을 동기로 실행하는 경로로 바꿨다. 사양상 DEFAULT 텍스처에서는 실패해야 하지만 기존 fixture가 사용하므로 허용을 유지했다. placed 텍스처와 heap은 placed buffer CPU 접근 때문에 바꾸지 않았다.
+- **Storage:** DEFAULT heap과 CPU 접근 불가 CUSTOM heap의 committed 텍스처를 Metal Private로 할당한다. NGX RR 출력과 FSR RR 입력의 storage 때문에 생기던 복사가 없어졌다. SR output shadow는 fixture에서 출력 rect/크기가 정확히 맞지 않아 대부분 남는다. 이런 텍스처의 `WriteToSubresource`/`ReadFromSubresource`는 staging blit을 동기로 실행하는 경로로 바꿨다. 사양상 DEFAULT 텍스처에서는 실패해야 하지만 기존 fixture가 사용하므로 허용을 유지했다. CPU 페이지가 없는 heap(DEFAULT, CUSTOM NOT_AVAILABLE) 자체도 Private `MTLHeap`으로 만들고, 그 heap의 placed 텍스처·버퍼·standard swizzle 버퍼·sampler feedback map을 같은 Private storage로 할당한다. 이런 heap의 버퍼는 `Map`이 거부하므로 CPU 접근이 없다. Metal은 Private와 Shared 배치에 같은 크기·정렬을 보고하므로(4642개 texture descriptor 조합에서 차이 0) `GetResourceAllocationInfo`와 aliasing offset은 그대로다.
 
 병합된 main(`e9b381d` 이후)을 ARM64X/FEX x64에서 API+Shader Validation으로 돌린 43개 matrix는 41개 PASS이고, 실패는 기존 fsr·temporal뿐이다(`build/local/merge-20261102`).
 
