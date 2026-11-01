@@ -38,18 +38,22 @@ float3 viewPosition(uint2 p, float z, constant RrParams& c) {
     float numerator = z*a.w-a.z, denominator = delta.z-z*delta.w;
     return (a.xyz*denominator+delta.xyz*numerator)/(a.w*delta.z-delta.w*a.z);
 }
-float3 albedo(texture2d<float,access::read> t, uint2 p, constant RrParams& c) {
-    float3 a = max(t.read(p).xyz, 0.0f);
+float3 albedo(float4 t, constant RrParams& c) {
+    float3 a = max(t.xyz, 0.0f);
     return (c.flags & 2) ? a : a*a;
 }
-float3 diffuseAlbedo(texture2d<float,access::read> t, uint2 p, constant RrParams& c) {
-    float3 value = albedo(t,p,c);
+float3 albedo(texture2d<float,access::read> t, uint2 p, constant RrParams& c) { return albedo(t.read(p),c); }
+float3 diffuseAlbedo(float4 t, constant RrParams& c) {
+    float3 value = albedo(t,c);
     if (c.apiVersion == 0x00400000) {
-        float metallic = t.read(p).a;
+        float metallic = t.a;
         if (!(c.flags&2)) metallic *= metallic;
         value *= 1-clamp(metallic,0.0f,1.0f);
     }
     return value;
+}
+float3 diffuseAlbedo(texture2d<float,access::read> t, uint2 p, constant RrParams& c) {
+    return diffuseAlbedo(t.read(p),c);
 }
 bool traced(uint2 p, constant RrParams& c) {
     return !c.checkerboard || ((p.x&1) == ((p.y&1)^c.origin));
@@ -74,6 +78,44 @@ struct Neighborhood {
     float alpha;
     bool valid, materialBoundary;
 };
+bool usesSpecularAlbedo(constant RrParams& c) { return c.signal == 2 || c.signal == 3 || c.signal == 5; }
+bool usesDiffuseAlbedo(constant RrParams& c) {
+    return c.signal == 1 || c.signal == 3 || c.signal == 4 || (c.legacyMode == 3 && c.signal == 5);
+}
+// The 7x7 neighborhood of an 8x8 threadgroup, staged once in threadgroup
+// memory. Callers dispatch complete RrTileSize x RrTileSize groups covering
+// the image; threads past its edge help fill the tile and then return. Only
+// the channels neighborhood() reads are kept (15680 bytes), so the tile stays
+// within 32 KiB even when Metal shader validation doubles threadgroup memory.
+constant constexpr uint RrTileSize = 8, RrTileSpan = RrTileSize+6;
+struct RrTile {
+    float2 normals[RrTileSpan][RrTileSpan]; // packed normal (z, material a)
+    float4 source[RrTileSpan][RrTileSpan], guide[RrTileSpan][RrTileSpan];
+    packed_float3 decoded[RrTileSpan][RrTileSpan], spec[RrTileSpan][RrTileSpan];
+    float4 diff[RrTileSpan][RrTileSpan];
+};
+// Every thread of the group must call this before any early return. Taps
+// outside the image are never stored; neighborhood() skips them unread.
+void loadTile(threadgroup RrTile& t, texture2d<float,access::read> source,
+              texture2d<float,access::read> guide, texture2d<float,access::read> normals,
+              texture2d<float,access::read> decoded, texture2d<float,access::read> specAlbedo,
+              texture2d<float,access::read> diffAlbedo, uint index, uint2 group, constant RrParams& c) {
+    bool useSpec = usesSpecularAlbedo(c), useDiff = usesDiffuseAlbedo(c);
+    int2 origin = int2(group*RrTileSize)-3;
+    for (uint i=index;i<RrTileSpan*RrTileSpan;i+=RrTileSize*RrTileSize) {
+        uint2 l = uint2(i%RrTileSpan,i/RrTileSpan);
+        int2 q = origin+int2(l);
+        if (!inside(q,c)) continue;
+        uint2 u = uint2(q);
+        t.normals[l.y][l.x] = normals.read(u).zw;
+        t.source[l.y][l.x] = source.read(u);
+        t.guide[l.y][l.x] = guide.read(u);
+        t.decoded[l.y][l.x] = packed_float3(decoded.read(u).xyz);
+        if (useSpec) t.spec[l.y][l.x] = packed_float3(specAlbedo.read(u).xyz);
+        if (useDiff) t.diff[l.y][l.x] = diffAlbedo.read(u);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
 // Signal-independent geometry is decoded once per frame by rr_geometry:
 // guide = (view position, raw depth), decoded = (octahedral normal, 0).
 Neighborhood neighborhood(texture2d<float,access::read> source,
@@ -83,6 +125,7 @@ Neighborhood neighborhood(texture2d<float,access::read> source,
                           texture2d<float,access::read> specAlbedo,
                           texture2d<float,access::read> diffAlbedo,
                           texture2d<float,access::read> fusedAlbedo,
+                          threadgroup const RrTile& tile, uint2 local,
                           uint2 p, constant RrParams& c) {
     float4 center = guide.read(p);
     float z = center.w;
@@ -90,9 +133,8 @@ Neighborhood neighborhood(texture2d<float,access::read> source,
     float3 n = decoded.read(p).xyz;
     float3 vn = normalize((loadMatrix(c.view)*float4(n,0)).xyz);
     float3 position = center.xyz;
-    bool useSpec = c.signal == 2 || c.signal == 3 || c.signal == 5;
+    bool useSpec = usesSpecularAlbedo(c), useDiff = usesDiffuseAlbedo(c);
     bool composite = c.legacyMode == 3 && c.signal == 5;
-    bool useDiff = c.signal == 1 || c.signal == 3 || c.signal == 4 || composite;
     float3 sa = useSpec ? albedo(specAlbedo,p,c) : float3(0);
     float3 da = useDiff ? diffuseAlbedo(diffAlbedo,p,c) : float3(0);
     float3 fa = composite ? albedo(fusedAlbedo,p,c) : float3(0);
@@ -112,22 +154,23 @@ Neighborhood neighborhood(texture2d<float,access::read> source,
     for (int y=-3;y<=3;++y) for (int x=-3;x<=3;++x) {
         int2 q = int2(p)+int2(x,y);
         if (!inside(q,c)) continue;
-        float4 np = normals.read(uint2(q));
-        if (round(np.a*3) != round(packed.a*3)) { boundary = true; continue; }
-        float4 v = source.read(uint2(q));
+        uint2 t = local+uint2(x+3,y+3);
+        float2 np = tile.normals[t.y][t.x];
+        if (round(np.y*3) != round(packed.a*3)) { boundary = true; continue; }
+        float4 v = tile.source[t.y][t.x];
         if (!activeSample(v,uint2(q),c)) continue;
-        float4 qg = guide.read(uint2(q));
+        float4 qg = tile.guide[t.y][t.x];
         if (inBounds && !bounded(qg.w,c)) continue;
         float3 delta = qg.xyz-position;
         float exponent = -float(x*x+y*y)/(2*sigma*sigma)
             -abs(dot(vn,delta))/tolerance
-            -(1-clamp(dot(n,decoded.read(uint2(q)).xyz),0.0f,1.0f))*64*c.normalStrength;
-        float3 qs = useSpec ? albedo(specAlbedo,uint2(q),c) : float3(0);
-        float3 qd = useDiff ? diffuseAlbedo(diffAlbedo,uint2(q),c) : float3(0);
+            -(1-clamp(dot(n,float3(tile.decoded[t.y][t.x])),0.0f,1.0f))*64*c.normalStrength;
+        float3 qs = useSpec ? albedo(float4(float3(tile.spec[t.y][t.x]),0),c) : float3(0);
+        float3 qd = useDiff ? diffuseAlbedo(tile.diff[t.y][t.x],c) : float3(0);
         float edge = specular(c.signal) ? length(sa-qs) : length(da-qd);
         if (c.signal == 3) edge = length(sa-qs)+length(da-qd);
         if (composite) edge = length(fa-albedo(fusedAlbedo,uint2(q),c));
-        float weight = exp(exponent-edge*8-specWeight*abs(np.z-packed.z)*16);
+        float weight = exp(exponent-edge*8-specWeight*abs(np.x-packed.z)*16);
         float3 value = radiance(c.signal) ? clamp(v.xyz,0.0f,c.maxRadiance) :
             c.signal == 3 ? float3(v.x >= 65504.0f ? 1 : 0) : float3(clamp(v.x,0.0f,1.0f));
         sum += value*weight; squareSum += value*value*weight; weights += weight;
@@ -192,7 +235,11 @@ kernel void rr_filter(texture2d<float,access::read> source [[texture(0)]],
                       texture2d<float,access::read> fusedAlbedo [[texture(10)]],
                       texture2d<float,access::read> guide [[texture(11)]],
                       texture2d<float,access::read> decoded [[texture(12)]],
-                      constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+                      constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]],
+                      uint2 lp [[thread_position_in_threadgroup]], uint li [[thread_index_in_threadgroup]],
+                      uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup RrTile tile;
+    loadTile(tile,source,guide,normals,decoded,specAlbedo,diffAlbedo,li,group,c);
     if (p.x >= c.width || p.y >= c.height) return;
     float z = depth.read(p).x;
     float4 raw = source.read(p), packed = normals.read(p);
@@ -205,7 +252,7 @@ kernel void rr_filter(texture2d<float,access::read> source [[texture(0)]],
     float3 n = octNormal(packed.xy);
     float3 position = viewPosition(p,z,c);
     float specWeight = specular(c.signal) ? 1.0f : 0.0f;
-    Neighborhood local = neighborhood(source,guide,normals,decoded,specAlbedo,diffAlbedo,fusedAlbedo,p,c);
+    Neighborhood local = neighborhood(source,guide,normals,decoded,specAlbedo,diffAlbedo,fusedAlbedo,tile,lp,p,c);
     float3 mean = local.mean;
     float4 result = float4(mean,active ? raw.a : local.alpha);
     bool valid = local.valid;
@@ -309,14 +356,18 @@ kernel void rr_neural_prepare(texture2d<float,access::read> source [[texture(0)]
                               texture2d<float,access::read> previousAlpha [[texture(17)]],
                               texture2d<float,access::read> guide [[texture(18)]],
                               texture2d<float,access::read> decoded [[texture(19)]],
-                              constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+                              constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]],
+                              uint2 lp [[thread_position_in_threadgroup]], uint li [[thread_index_in_threadgroup]],
+                              uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup RrTile tile;
+    loadTile(tile,source,guide,normals,decoded,specAlbedo,diffAlbedo,li,group,c);
     if (p.x >= c.width || p.y >= c.height) return;
     float4 raw = source.read(p), packed = normals.read(p);
     float z = depth.read(p).x;
     bool active = activeSample(raw,p,c), inBounds = bounded(z,c);
     bool passthrough = !inBounds && (!c.checkerboard || active);
     Neighborhood local = {raw.xyz,float3(0),raw.a,true,false};
-    if (!passthrough) local = neighborhood(source,guide,normals,decoded,specAlbedo,diffAlbedo,fusedAlbedo,p,c);
+    if (!passthrough) local = neighborhood(source,guide,normals,decoded,specAlbedo,diffAlbedo,fusedAlbedo,tile,lp,p,c);
     float3 sa = albedo(specAlbedo,p,c), da = diffuseAlbedo(diffAlbedo,p,c);
     bool composite = c.legacyMode == 3;
     float3 modulator = composite ? albedo(fusedAlbedo,p,c) :
