@@ -4859,6 +4859,8 @@ def run(args: argparse.Namespace) -> int:
         env["DXMT_CONFIG"] = "d3d12.asyncPipelineCompile=True"
         if args.suite == "async-pipeline-hold":
             env["OWNED_ASYNC_PIPELINE_HOLD"] = "1"
+    if getattr(args, "auto_breadcrumbs", False):
+        env["DXMT_CONFIG"] = ";".join(filter(None, (env.get("DXMT_CONFIG"), "d3d12.enableAutoBreadcrumbs=True")))
     validation_mode = ("api-and-shader" if args.validation else
                        "api-only" if args.api_validation else "none")
     if args.validation:
@@ -5651,6 +5653,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--async-pipeline-compile", action="store_true",
                         help="run any suite with d3d12.asyncPipelineCompile=True (async-pipeline suites always enable it)")
+    parser.add_argument("--auto-breadcrumbs", action="store_true",
+                        help="run with d3d12.enableAutoBreadcrumbs=True (DRED SYSTEM_CONTROLLED records breadcrumbs)")
     args = parser.parse_args()
     if not 1 <= args.timeout <= 600:
         parser.error("--timeout must be between 1 and 600 seconds")

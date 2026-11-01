@@ -4,7 +4,7 @@
 
 ## 2026-11-01 후속
 
-[2026-11-01 저위험 최적화·Rust 경계](CORE-IMPLEMENTATION-STATUS.ko.md#확정-저위험-최적화와-남은-rust-경계--2026-11-01) 이후 남은 일: HEAD에서 생긴 bindless·dxil의 Shader Validation null-address load(`AIRCONV_VERSION=45` bounded load 의심) 조사, trace 수집이 필요한 후보(heap view-pool residency 순회, reserved 리소스 commit 분할, Present/Temporal `MarkUntracked`, IB 범위 병합, DEFAULT heap 텍스처 Private storage, table CBV select), DRED 기본값 결정, FSR FG pacing jitter와 동일 장면 FPS 측정, `run-command-recording-cpu.py` 컴파일 오류(`async_targets_epoch_`).
+[2026-11-01 저위험 최적화·Rust 경계](CORE-IMPLEMENTATION-STATUS.ko.md#확정-저위험-최적화와-남은-rust-경계--2026-11-01) 이후 남은 일: HEAD에서 생긴 bindless·dxil의 Shader Validation null-address load(`AIRCONV_VERSION=45` bounded load 의심) 조사, trace 수집이 필요한 후보(heap view-pool residency 순회, reserved 리소스 commit 분할, Present/Temporal `MarkUntracked`, IB 범위 병합, DEFAULT heap 텍스처 Private storage, table CBV select), FSR FG pacing jitter와 동일 장면 FPS 측정, `run-command-recording-cpu.py` 컴파일 오류(`async_targets_epoch_`).
 
 ## 2026-10-31 최적화 묶음 후속
 

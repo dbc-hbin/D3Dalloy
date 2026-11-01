@@ -412,7 +412,7 @@ public:
     *result = {};
     if (runtime_configuration.debug)
       result->Flags |= D3D12_DEVICE_FLAG_DEBUG_LAYER_ENABLED;
-    if (runtime_configuration.breadcrumbs != D3D12_DRED_ENABLEMENT_FORCED_OFF)
+    if (AutoBreadcrumbsEnabled(runtime_configuration.breadcrumbs))
       result->Flags |= D3D12_DEVICE_FLAG_DRED_AUTO_BREADCRUMBS_ENABLED;
     if (runtime_configuration.contexts == D3D12_DRED_ENABLEMENT_FORCED_ON)
       result->Flags |= D3D12_DEVICE_FLAG_DRED_BREADCRUMB_CONTEXT_ENABLED;

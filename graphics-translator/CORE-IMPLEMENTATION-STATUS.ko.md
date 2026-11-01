@@ -37,7 +37,7 @@
 
 GPU matrix 43개 중 39개 PASS다. bindless·dxil(Shader Validation의 GPU address 0 load), fsr(frame marker 중복), temporal(MetalFX Conv3x3)은 base에서도 같은 PASS 줄 수·오류 수로 실패한다. bindless·dxil은 10-31 runtime에서는 통과했으므로 HEAD의 `AIRCONV_VERSION=45` bounded load 변경 이후 생긴 별도 문제로 본다 [INFERENCE]. agility suite는 PASS, diagnostics의 `agility-high-fl`은 base와 같이 실패한다.
 
-동작 차이: RT export의 손상된 DXBC root signature container는 이제 raster·`CreateRootSignature`와 같이 거부된다. DXIL signature는 stream>3·stream 역순·stream 내 register 감소를 거부하며 stride는 32로 고정한다(실제 DXC corpus에서 해당 없음). SR/RR/FG는 앱 텍스처의 residency를 device 전역 set에 의존하므로, evict·`CREATE_NOT_RESIDENT` 리소스를 넘기는 잘못된 사용은 더 이상 보정하지 않는다. FSR SDK pacing의 실제 게임 jitter는 측정하지 않았다. DRED `SYSTEM_CONTROLLED` 기본값 변경은 동작 변경이라 적용하지 않았다. WoW64 x86 guest는 실행하지 않았다.
+동작 차이: RT export의 손상된 DXBC root signature container는 이제 raster·`CreateRootSignature`와 같이 거부된다. DXIL signature는 stream>3·stream 역순·stream 내 register 감소를 거부하며 stride는 32로 고정한다(실제 DXC corpus에서 해당 없음). SR/RR/FG는 앱 텍스처의 residency를 device 전역 set에 의존하므로, evict·`CREATE_NOT_RESIDENT` 리소스를 넘기는 잘못된 사용은 더 이상 보정하지 않는다. FSR SDK pacing의 실제 게임 jitter는 측정하지 않았다. DRED auto-breadcrumbs는 이후 Windows와 같이 `SYSTEM_CONTROLLED`에서 꺼짐으로 바꿨고 `d3d12.enableAutoBreadcrumbs=True`로 켤 수 있다. 꺼져 있으면 ExecuteCommandLists가 breadcrumb history를 만들지 않는다. 앱의 `FORCED_ON`/`FORCED_OFF`가 우선한다. WoW64 x86 guest는 실행하지 않았다.
 
 ## D3D12 경로·SR/FG/RR·Rust 경계 최적화 — 2026-10-31
 

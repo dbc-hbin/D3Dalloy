@@ -21,6 +21,8 @@ struct RuntimeConfiguration {
 RuntimeConfiguration GetGlobalRuntimeConfiguration();
 HRESULT ApplyGlobalRuntimeConfiguration(const RuntimeConfiguration &configuration);
 HRESULT ValidateExperimentalFeatures(UINT count, const IID *ids, void *configuration, UINT *sizes);
+// SYSTEM_CONTROLLED is off unless d3d12.enableAutoBreadcrumbs is set.
+bool AutoBreadcrumbsEnabled(D3D12_DRED_ENABLEMENT enablement);
 void EnableGlobalDebugLayer();
 void SetGlobalDredEnablement(bool contexts, D3D12_DRED_ENABLEMENT enablement);
 HRESULT CreateConfiguredDevice(IUnknown *adapter, D3D_FEATURE_LEVEL level, REFIID iid, void **out,
@@ -44,6 +46,7 @@ public:
   HRESULT QueryInterface(REFIID iid, void **object);
   void Validation(D3D12_MESSAGE_ID id, const char *description);
   void Removed(HRESULT reason);
+  bool CaptureEnabled() const;
   std::shared_ptr<DiagnosticBreadcrumb> BeginSubmission(ID3D12CommandList *list, ID3D12CommandQueue *queue,
       std::vector<D3D12_AUTO_BREADCRUMB_OP> history, const std::vector<std::pair<UINT, std::string>> &contexts = {});
   void Complete(const std::shared_ptr<DiagnosticBreadcrumb> &breadcrumb);

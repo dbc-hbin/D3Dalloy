@@ -129,7 +129,7 @@ public:
 #endif
     OwnedCoreConfiguration1 c; configuration_->bridge->get_configuration(configuration_->state, &c);
     UINT flags = c.debug ? D3D12_DEVICE_FLAG_DEBUG_LAYER_ENABLED : 0;
-    if (c.breadcrumbs != D3D12_DRED_ENABLEMENT_FORCED_OFF) flags |= D3D12_DEVICE_FLAG_DRED_AUTO_BREADCRUMBS_ENABLED;
+    if (AutoBreadcrumbsEnabled(D3D12_DRED_ENABLEMENT(c.breadcrumbs))) flags |= D3D12_DEVICE_FLAG_DRED_AUTO_BREADCRUMBS_ENABLED;
     if (c.contexts == D3D12_DRED_ENABLEMENT_FORCED_ON) flags |= D3D12_DEVICE_FLAG_DRED_BREADCRUMB_CONTEXT_ENABLED;
     *out = {D3D12_DEVICE_FLAGS(flags), 0, configuration_->bridge->sdk_version, UINT(c.experimental_shader_models != 0)};
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
@@ -400,11 +400,17 @@ struct DeviceDiagnostics::Impl final : ID3D12InfoQueue1, ID3D12DeviceRemovedExte
   }
 };
 DeviceDiagnostics::DeviceDiagnostics(MTLD3D12Device *device) : impl_(std::make_unique<Impl>(device)) {}
+bool AutoBreadcrumbsEnabled(D3D12_DRED_ENABLEMENT enablement) {
+  if (enablement == D3D12_DRED_ENABLEMENT_SYSTEM_CONTROLLED)
+    return Config::getInstance().getOption<bool>("d3d12.enableAutoBreadcrumbs", false);
+  return enablement == D3D12_DRED_ENABLEMENT_FORCED_ON;
+}
 void DeviceDiagnostics::Configure(const RuntimeConfiguration &configuration) {
   impl_->validation_enabled = configuration.debug;
-  impl_->capture_enabled = configuration.breadcrumbs != D3D12_DRED_ENABLEMENT_FORCED_OFF;
+  impl_->capture_enabled = AutoBreadcrumbsEnabled(configuration.breadcrumbs);
   impl_->context_enabled = configuration.contexts == D3D12_DRED_ENABLEMENT_FORCED_ON;
 }
+bool DeviceDiagnostics::CaptureEnabled() const { return impl_->capture_enabled; }
 DeviceDiagnostics::~DeviceDiagnostics() = default;
 HRESULT DeviceDiagnostics::QueryInterface(REFIID iid, void **out) { return impl_->Query(iid, out); }
 void DeviceDiagnostics::Validation(D3D12_MESSAGE_ID id, const char *description) {

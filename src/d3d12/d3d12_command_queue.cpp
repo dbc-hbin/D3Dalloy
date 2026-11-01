@@ -8570,64 +8570,66 @@ public:
         auto &submission = task.lists.emplace_back();
         submission.entry = list->entry; submission.list_id = list->owned_id; submission.recording = list->owned_recording;
         submission.allocator = std::move(lease); submission.recording_lease = std::move(recording);
-        std::vector<D3D12_AUTO_BREADCRUMB_OP> history{D3D12_AUTO_BREADCRUMB_OP_BEGINSUBMISSION};
-        std::vector<std::pair<UINT, std::string>> contexts;
-        for (auto *encoder = list->entry; encoder; encoder = encoder->next) {
-          if (encoder->type == EncoderType::Diagnostic) {
-            const auto &annotation = static_cast<DiagnosticEncoderData *>(encoder)->annotation;
-            if (annotation.action != 2) contexts.emplace_back(history.size(), annotation.label);
-            history.push_back(static_cast<D3D12_AUTO_BREADCRUMB_OP>(annotation.action));
-          } else {
-            const wmtcmd_base *command = nullptr;
-            if (encoder->type == EncoderType::Render)
-              command = reinterpret_cast<const wmtcmd_base *>(&static_cast<RenderEncoderData *>(encoder)->cmd_head);
-            if (encoder->type == EncoderType::Compute)
-              command = reinterpret_cast<const wmtcmd_base *>(&static_cast<ComputeEncoderData *>(encoder)->cmd_head);
-            if (encoder->type == EncoderType::Blit)
-              command = reinterpret_cast<const wmtcmd_base *>(&static_cast<BlitEncoderData *>(encoder)->cmd_head);
-            for (; command; command = static_cast<const wmtcmd_base *>(command->next.get())) {
-              std::optional<D3D12_AUTO_BREADCRUMB_OP> op;
-              if (encoder->type == EncoderType::Render) {
-                switch (command->type) {
-                case WMTRenderCommandDraw: op = D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED; break;
-                case WMTRenderCommandDrawIndexed: op = D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED; break;
-                case WMTRenderCommandDrawIndirect:
-                case WMTRenderCommandDrawIndexedIndirect: op = D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT; break;
-                case WMTRenderCommandDrawMeshThreadgroups:
-                case WMTRenderCommandDrawMeshThreadgroupsIndirect: op = D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH; break;
-                default: break;
+        if (device_->diagnostics.CaptureEnabled()) {
+          std::vector<D3D12_AUTO_BREADCRUMB_OP> history{D3D12_AUTO_BREADCRUMB_OP_BEGINSUBMISSION};
+          std::vector<std::pair<UINT, std::string>> contexts;
+          for (auto *encoder = list->entry; encoder; encoder = encoder->next) {
+            if (encoder->type == EncoderType::Diagnostic) {
+              const auto &annotation = static_cast<DiagnosticEncoderData *>(encoder)->annotation;
+              if (annotation.action != 2) contexts.emplace_back(history.size(), annotation.label);
+              history.push_back(static_cast<D3D12_AUTO_BREADCRUMB_OP>(annotation.action));
+            } else {
+              const wmtcmd_base *command = nullptr;
+              if (encoder->type == EncoderType::Render)
+                command = reinterpret_cast<const wmtcmd_base *>(&static_cast<RenderEncoderData *>(encoder)->cmd_head);
+              if (encoder->type == EncoderType::Compute)
+                command = reinterpret_cast<const wmtcmd_base *>(&static_cast<ComputeEncoderData *>(encoder)->cmd_head);
+              if (encoder->type == EncoderType::Blit)
+                command = reinterpret_cast<const wmtcmd_base *>(&static_cast<BlitEncoderData *>(encoder)->cmd_head);
+              for (; command; command = static_cast<const wmtcmd_base *>(command->next.get())) {
+                std::optional<D3D12_AUTO_BREADCRUMB_OP> op;
+                if (encoder->type == EncoderType::Render) {
+                  switch (command->type) {
+                  case WMTRenderCommandDraw: op = D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED; break;
+                  case WMTRenderCommandDrawIndexed: op = D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED; break;
+                  case WMTRenderCommandDrawIndirect:
+                  case WMTRenderCommandDrawIndexedIndirect: op = D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT; break;
+                  case WMTRenderCommandDrawMeshThreadgroups:
+                  case WMTRenderCommandDrawMeshThreadgroupsIndirect: op = D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH; break;
+                  default: break;
+                  }
+                } else if (encoder->type == EncoderType::Compute) {
+                  switch (command->type) {
+                  case WMTComputeCommandDispatch:
+                  case WMTComputeCommandDispatchThreads: op = D3D12_AUTO_BREADCRUMB_OP_DISPATCH; break;
+                  case WMTComputeCommandDispatchIndirect: op = D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT; break;
+                  default: break;
+                  }
+                } else {
+                  switch (command->type) {
+                  case WMTBlitCommandCopyFromBufferToBuffer: op = D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION; break;
+                  case WMTBlitCommandCopyFromBufferToTexture:
+                  case WMTBlitCommandCopyFromBufferToTextureWithBlitOption:
+                  case WMTBlitCommandCopyFromTextureToBuffer:
+                  case WMTBlitCommandCopyFromTextureToBufferWithBlitOption:
+                  case WMTBlitCommandCopyFromTextureToTexture: op = D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION; break;
+                  case WMTBlitCommandCopyTexture: op = D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE; break;
+                  default: break;
+                  }
                 }
-              } else if (encoder->type == EncoderType::Compute) {
-                switch (command->type) {
-                case WMTComputeCommandDispatch:
-                case WMTComputeCommandDispatchThreads: op = D3D12_AUTO_BREADCRUMB_OP_DISPATCH; break;
-                case WMTComputeCommandDispatchIndirect: op = D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT; break;
-                default: break;
-                }
-              } else {
-                switch (command->type) {
-                case WMTBlitCommandCopyFromBufferToBuffer: op = D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION; break;
-                case WMTBlitCommandCopyFromBufferToTexture:
-                case WMTBlitCommandCopyFromBufferToTextureWithBlitOption:
-                case WMTBlitCommandCopyFromTextureToBuffer:
-                case WMTBlitCommandCopyFromTextureToBufferWithBlitOption:
-                case WMTBlitCommandCopyFromTextureToTexture: op = D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION; break;
-                case WMTBlitCommandCopyTexture: op = D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE; break;
-                default: break;
-                }
+                if (op) history.push_back(*op);
               }
-              if (op) history.push_back(*op);
+              if (encoder->type == EncoderType::Clear) {
+                const auto *clear = static_cast<ClearEncoderData *>(encoder);
+                history.push_back(clear->clear_dsv ? D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW : D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW);
+              }
+              if (encoder->type == EncoderType::Resolve) history.push_back(D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE);
+              if (encoder->type == EncoderType::FenceBarrier) history.push_back(D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER);
             }
-            if (encoder->type == EncoderType::Clear) {
-              const auto *clear = static_cast<ClearEncoderData *>(encoder);
-              history.push_back(clear->clear_dsv ? D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW : D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW);
-            }
-            if (encoder->type == EncoderType::Resolve) history.push_back(D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE);
-            if (encoder->type == EncoderType::FenceBarrier) history.push_back(D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER);
           }
+          history.push_back(D3D12_AUTO_BREADCRUMB_OP_ENDSUBMISSION);
+          submission.breadcrumb = device_->diagnostics.BeginSubmission(list, this, std::move(history), contexts);
         }
-        history.push_back(D3D12_AUTO_BREADCRUMB_OP_ENDSUBMISSION);
-        submission.breadcrumb = device_->diagnostics.BeginSubmission(list, this, std::move(history), contexts);
         if (!task.contains_temporal) {
           for (auto *encoder = list->entry; encoder; encoder = encoder->next) {
             if (encoder->type == EncoderType::Temporal) {
