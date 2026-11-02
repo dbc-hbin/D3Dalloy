@@ -18,3 +18,21 @@ ref.sh
 *.test
 releases
 prefixes
+
+# Keep project documentation and research evidence local.
+*.md
+*.markdown
+*.rst
+*.adoc
+*.pdf
+*.doc
+*.docx
+*.chm
+/doc/
+/docs/
+/QA/
+/external/nvapi/docs/
+/graphics-translator/D3D12-CORE-CONTRACTS-PROVENANCE.txt
+
+# This vendor README contains license and copyright notices.
+!/include/native/directx/README.md
