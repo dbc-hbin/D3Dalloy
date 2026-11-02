@@ -123,9 +123,21 @@ def main() -> None:
             pass
         else:
             raise AssertionError("accepted different native and EC Core generations")
+        source = args.build_root / "aarch64-windows/amdxc64.dll"
+        audit(source, contract)
+        antilag = Path(directory) / "amdxc64.dll"
+        original = source.read_bytes()
+        for token in (b"d3dalloy-owned-antilag2", b"AmdExtD3DCreateInterface", b"OwnedAntiLagBackendId"):
+            antilag.write_bytes(original.replace(token, b"x" * len(token)))
+            try:
+                audit(antilag, contract)
+            except ValueError:
+                continue
+            raise AssertionError(f"accepted corrupted Anti-Lag 2 contract: {token!r}")
     print("PASS: rejects zero native/EC entries, missing builtin/native exports and changed export ordinal")
     print("PASS: distinct real CRT TLS views; rejects native TLS callbacks in the EC view")
     print("PASS: shared Core generation; rejects a changed EC generation")
+    print("PASS: paired Anti-Lag 2 builtin; rejects missing owned marker and public exports")
 
 
 if __name__ == "__main__":

@@ -1239,18 +1239,20 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE PresentGenerated(UINT SyncInterval, UINT Flags) final {
-    return PresentImpl(SyncInterval, Flags, nullptr, false);
+    return PresentImpl(SyncInterval, Flags, nullptr, false, nullptr, true);
   }
 
   HRESULT STDMETHODCALLTYPE PresentResource(ID3D12Resource *source, UINT sync, UINT flags, BOOL closes_frame) final {
     if (!source)
       return E_INVALIDARG;
-    return PresentImpl(sync, flags, nullptr, closes_frame != FALSE, source);
+    return PresentImpl(sync, flags, nullptr, closes_frame != FALSE, source, true);
   }
 
-  // closes_frame is false only for an interpolated Present followed by its real member.
+  // Internal FG supplies explicit membership. An ordinary Present can consume the
+  // AMD presentation thread's one-shot generated/real hint.
   HRESULT PresentImpl(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters,
-                      bool closes_frame, ID3D12Resource *source = nullptr) {
+                      bool closes_frame, ID3D12Resource *source = nullptr, bool explicit_group = false) {
+    closes_frame = device_->reflex.PresentClosesFrame(closes_frame, explicit_group);
     const bool do_not_wait = (PresentFlags & DXGI_PRESENT_DO_NOT_WAIT) != 0;
     std::unique_lock<d3dalloy::mutex> lock(mutex_, std::defer_lock);
     if (do_not_wait) {
@@ -1345,6 +1347,7 @@ public:
     };
     if (hr == DXGI_STATUS_OCCLUDED) {
       end_frame();
+      if (closes_frame) device_->reflex.SkipPresent();
       // A client that waited before rendering must not lose its frame credit
       // when no presentation is submitted.
       if (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
@@ -1354,6 +1357,7 @@ public:
     if ((PresentFlags & DXGI_PRESENT_DO_NOT_SEQUENCE) && !presentation_count_ &&
         !(PresentFlags & DXGI_PRESENT_RESTART)) {
       end_frame();
+      if (closes_frame) device_->reflex.SkipPresent();
       return S_OK;
     }
 
@@ -1472,10 +1476,11 @@ public:
                           ",\"index\":", current_buffer_,
                           ",\"resource\":", backbuffer->owned_id,
                           ",\"sync_interval\":", SyncInterval);
+    std::shared_ptr<owned_graphics::LowLatencyScheduler::Frame> latency_frame;
     hr = present_queue->Present(this->presenter.ptr(), backbuffer, present_semaphore_, vsync_duration,
                                 geometry, presentation_observer_, next_presentation_id_ + 1,
                                 presentation_observer_fault_, std::move(composition), do_not_wait, latency_,
-                                (PresentFlags & DXGI_PRESENT_RESTART) != 0, borrowed_credit, closes_frame);
+                                (PresentFlags & DXGI_PRESENT_RESTART) != 0, borrowed_credit, closes_frame, &latency_frame);
 
     if (SUCCEEDED(hr)) {
       end_frame();
@@ -1493,6 +1498,15 @@ public:
         current_buffer_ = (current_buffer_ + 1) % backbuffers_.size();
     }
 
+    lock.unlock();
+    if (SUCCEEDED(hr) && closes_frame) {
+      try {
+        return device_->reflex.PresentReturn(latency_frame, do_not_wait);
+      } catch (const std::bad_alloc &) {
+        device_->ReportRemoval(E_OUTOFMEMORY);
+        return E_OUTOFMEMORY;
+      }
+    }
     return hr;
   };
 

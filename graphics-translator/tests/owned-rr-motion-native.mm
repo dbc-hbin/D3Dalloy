@@ -22,6 +22,45 @@ extern "C" void winemetal_metal4_retain_resource(obj_handle_t, id) { std::abort(
 static void require(bool ok, const char *reason) {
   if (!ok) { std::fprintf(stderr,"OWNED_RR_REUSE_FAIL reason=%s\n",reason); std::exit(1); }
 }
+static void scratchPoolProof() {
+  auto core = std::make_shared<d3dalloy_rr::Core>();
+  core->idleByteLimit = 300;
+  auto make = [](uint32_t width, uint64_t bytes) {
+    auto set = std::make_unique<d3dalloy_rr::Resources>();
+    set->width = set->height = set->outputWidth = set->outputHeight = width;
+    set->bytes = bytes; set->ready = true; return set;
+  };
+  auto a = make(128,100), b = make(256,100), c = make(512,100);
+  const auto *bAddress = b.get();
+  core->recycle(a); core->recycle(b); core->recycle(c);
+  require(!a && !b && !c && core->idleBytes == 300,"pool-caches-retired-sets");
+  d3dalloy_rr::Generation g{0}; g.width = g.height = g.outputWidth = g.outputHeight = 256;
+  auto exact = core->takeResources(g);
+  require(exact.get() == bAddress && core->idleBytes == 200,"pool-prefers-exact-extent");
+  core->recycle(exact);
+  auto fourth = make(1024,100); core->recycle(fourth);
+  unsigned count = 0; for (const auto& entry : core->pool) count += bool(entry);
+  require(!fourth && count == 3 && core->idleBytes == 300,"pool-bounded-at-three");
+  core->idleByteLimit = 100; core->trimPool();
+  require(core->idleBytes <= 100,"pool-trims-resize-high-water");
+  auto large = make(2048,200); core->recycle(large);
+  require(bool(large) && core->idleBytes <= 100,"pool-rejects-oversized-idle-set");
+  auto failed = make(128,50); failed->ready = false; core->recycle(failed);
+  require(bool(failed),"pool-does-not-cache-partial-allocation");
+  auto feature = [D3DALLOYRRFeature new]; feature->core = core;
+  auto execution = [D3DALLOYRRExecution new]; execution->core = core;
+  execution->resources = make(128,100);
+  struct WMTMetal4Call dormant{}; dormant.operation = WMTMetal4FXDormantTemporal;
+  dormant.args[0] = uintptr_t(feature);
+  require(d3dalloyRRCall(&dormant) && core->dormant && core->idleBytes == 0,"pool-dormant-drops-idle");
+  require(bool(execution->resources),"pool-dormant-preserves-inflight");
+  [execution release]; [feature release];
+  for (const auto& entry : core->pool) require(!entry,"late-retirement-does-not-repopulate-dormant");
+  auto replay = core->takeResources(g); replay->ready = true; replay->bytes = 100;
+  core->recycle(replay);
+  require(bool(replay) && core->idleBytes == 0,"dormant-replay-owns-unpooled-resources");
+  std::puts("OWNED_RR_POOL_PASS max_idle_sets=3 byte_limit=working_set_based exact_extent=1 partial_failure=1 dormant_late_retirement=1 replay=1");
+}
 static void finish(id<MTLCommandBuffer> command, id<MTLSharedEvent> event, uint64_t &value) {
   auto done=dispatch_semaphore_create(0);
   [command addCompletedHandler:^(id<MTLCommandBuffer>) { dispatch_semaphore_signal(done); }];
@@ -38,6 +77,79 @@ static void upload(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLShared
     sourceSize:MTLSizeMake(128,128,1) toTexture:destination destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
   [blit endEncoding]; finish(command,event,value);
   [buffer release];
+}
+static void normalRoughnessProof(id<MTLDevice> device) {
+  using namespace d3dalloy_rr;
+  auto pipelines = devicePipelines(device); require(bool(pipelines),"packed-pipelines");
+  auto queue = [device newMTL4CommandQueue]; auto event = [device newSharedEvent];
+  unsigned cases = 0;
+  for (auto inputFormat : {MTLPixelFormatRGBA32Float, MTLPixelFormatRGBA16Float})
+  for (unsigned variant=0;variant<3;++variant) {
+    const unsigned width=variant==2?1:37, height=variant==1?1:29;
+    auto make = [&](MTLPixelFormat format, unsigned w, unsigned h) {
+      auto desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:NO];
+      desc.storageMode=MTLStorageModeShared; desc.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;
+      auto result=[device newTextureWithDescriptor:desc]; require(result != nil,"packed-texture"); return result;
+    };
+    auto source=make(inputFormat,64,48);
+    std::vector<float> values(64*48*4);
+    for (size_t i=0;i<values.size();++i) values[i]=float(int(i%197)-98)/97.f;
+    values[(5*64+3)*4+3]=1.0008f; values[(6*64+4)*4+3]=INFINITY; values[(7*64+5)*4+3]=NAN;
+    if (inputFormat==MTLPixelFormatRGBA32Float)
+      [source replaceRegion:MTLRegionMake2D(0,0,64,48) mipmapLevel:0 withBytes:values.data() bytesPerRow:64*16];
+    else {
+      std::vector<_Float16> half(values.begin(),values.end());
+      [source replaceRegion:MTLRegionMake2D(0,0,64,48) mipmapLevel:0 withBytes:half.data() bytesPerRow:64*8];
+    }
+    id<MTLTexture> outputs[4] = {make(MTLPixelFormatRGBA16Float,width,height),make(MTLPixelFormatR32Float,width,height),
+      make(MTLPixelFormatRGBA16Float,width,height),make(MTLPixelFormatR32Float,width,height)};
+    Params p{}; p.x=3; p.y=5; p.width=width; p.height=height;
+    p.sourceWidth=31; p.sourceHeight=23;
+    auto buffer=[device newBufferWithLength:512 options:MTLResourceStorageModeShared];
+    std::memcpy(buffer.contents,&p,sizeof(p)); p.mode=1;
+    std::memcpy(static_cast<char*>(buffer.contents)+256,&p,sizeof(p));
+    auto td=[MTL4ArgumentTableDescriptor new];td.maxBufferBindCount=1;td.maxTextureBindCount=3;td.initializeBindings=YES;
+    auto table=[device newArgumentTableWithDescriptor:td error:nil];[td release];
+    auto rd=[MTLResidencySetDescriptor new]; auto residency=[device newResidencySetWithDescriptor:rd error:nil];[rd release];
+    require(buffer && table && residency,"packed-encoding-resources");
+    [residency addAllocation:source];[residency addAllocation:buffer];
+    for(auto output:outputs)[residency addAllocation:output];
+    [residency commit];[residency requestResidency];
+    auto allocator=[device newCommandAllocator]; auto command=[device newCommandBuffer];
+    [command beginCommandBufferWithAllocator:allocator];[command useResidencySet:residency];
+    auto encoder=[command computeCommandEncoder];
+    for (unsigned pass=0;pass<3;++pass) {
+      [table setAddress:buffer.gpuAddress+(pass==1?256:0) atIndex:0];
+      [table setTexture:source.gpuResourceID atIndex:0];
+      [table setTexture:outputs[pass==2?2:pass].gpuResourceID atIndex:1];
+      [table setTexture:outputs[3].gpuResourceID atIndex:2];
+      [encoder setComputePipelineState:pass==2?pipelines->normalRoughness:pipelines->conversion];
+      [encoder setArgumentTable:table];
+      [encoder dispatchThreads:MTLSizeMake(width,height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+    }
+    [encoder endEncoding];[command endCommandBuffer];[queue commit:&command count:1];[queue signalEvent:event value:cases+1];
+    require([event waitUntilSignaledValue:cases+1 timeoutMS:15000],"packed-completion");
+    for (unsigned channel=0;channel<2;++channel) {
+      const size_t pixel=channel?4:8;std::vector<uint8_t> separate(width*height*pixel),fused(separate.size());
+      [outputs[channel] getBytes:separate.data() bytesPerRow:width*pixel fromRegion:MTLRegionMake2D(0,0,width,height) mipmapLevel:0];
+      [outputs[channel+2] getBytes:fused.data() bytesPerRow:width*pixel fromRegion:MTLRegionMake2D(0,0,width,height) mipmapLevel:0];
+      require(separate==fused,"packed-original-source-bit-exact");
+    }
+    auto frame=[D3DALLOYRRFrame new]; frame->props.roughness_packed=1;
+    frame->inputs[9]=[source retain];frame->inputs[10]=[source retain];
+    frame->rects[9]=frame->rects[10]={3,5,31,23};
+    std::array<id<MTLTexture>,Count> bound{};bound[9]=outputs[2];bound[10]=outputs[3];
+    require(d3dalloyRRFusesNormalRoughness(frame,bound),"packed-production-selection");
+    frame->rects[10].x++;require(!d3dalloyRRFusesNormalRoughness(frame,bound),"packed-different-rect-fallback");
+    frame->rects[10]=frame->rects[9];bound[9]=source;
+    require(!d3dalloyRRFusesNormalRoughness(frame,bound),"packed-direct-normal-fallback");
+    bound[9]=outputs[2];frame->props.roughness_packed=0;
+    require(!d3dalloyRRFusesNormalRoughness(frame,bound),"unpacked-fallback");
+    [frame release];[command release];[allocator release];[residency endResidency];[residency release];
+    [table release];[buffer release];[source release];for(auto output:outputs)[output release];++cases;
+  }
+  [event release];[queue release];
+  std::printf("OWNED_RR_PACKED_FUSION_PASS cases=%u original_precision=1 resampling_offsets=1 thin_extents=1 nonfinite_values=preserved outputs=bit_exact direct_normal_fallback=1\n",cases);
 }
 static void descriptorReuse(const std::shared_ptr<d3dalloy_rr::Core> &owner) {
   auto core = std::make_shared<d3dalloy_rr::Core>();
@@ -154,6 +266,7 @@ static void descriptorReuse(const std::shared_ptr<d3dalloy_rr::Core> &owner) {
 }
 
 int main() { @autoreleasepool {
+  scratchPoolProof();
   auto frame = [D3DALLOYRRFrame new];
   frame->core = std::make_shared<d3dalloy_rr::Core>();
   auto &core = *frame->core;
@@ -161,6 +274,7 @@ int main() { @autoreleasepool {
   auto descriptor = [MTL4CompilerDescriptor new];
   core.compiler = [core.device newCompilerWithDescriptor:descriptor error:nil]; [descriptor release];
   if (!core.device || !core.compiler) return 1;
+  normalRoughnessProof(core.device);
   auto &p = frame->props;
   p.input_width = p.input_height = 128; p.output_rect = {0,0,128,128};
   p.motion_scale_x = p.motion_scale_y = 1;
@@ -169,6 +283,8 @@ int main() { @autoreleasepool {
   if (!frame->generation) return 1;
   const MTLTextureUsage usage = frame->generation->scaler.motionTextureUsage | MTLTextureUsageShaderRead;
   unsigned cases = 0;
+  // Reuse the same retired set across conversion/direct mode switches.
+  d3dalloy_rr::Resources resources;
   for (unsigned variant = 0; variant < 9; ++variant) {
     core.info.feature_flags = d3dalloy_rr::Flag | 2 | 8;
     p.motion_scale_x = p.motion_scale_y = 1;
@@ -191,7 +307,6 @@ int main() { @autoreleasepool {
     formats[2] = d3dalloy_rr::descriptorFormat(core,p,2,frame->inputs[2],frame->rects[2]);
     frame->generation = d3dalloy_rr::generation(core,p,formats);
     if (!frame->generation) return 1;
-    d3dalloy_rr::Resources resources;
     std::array<id<MTLTexture>,d3dalloy_rr::Count> bound{};
     const bool direct = variant == 0 || variant == 5 || variant == 8;
     if (!d3dalloyRRResources(frame,resources,bound) || (bound[2] == frame->inputs[2]) != direct ||

@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "llvm/ADT/StringMap.h"
 #include "llvm/IR/IRBuilder.h"
 
 #include "dxil_converter.hpp"
@@ -53,6 +54,7 @@ struct IOElement {
 };
 
 struct EntrySignature {
+  /** Stable ID order; duplicate IDs retain their metadata order. */
   std::vector<IOElement> inputs;
   std::vector<IOElement> outputs;
   std::vector<IOElement> patch_constants;
@@ -74,6 +76,8 @@ struct PipelineStage {
    */
   std::unique_ptr<ModuleInfo> info;
   EntrySignature signature;
+  /** Matches the linked DXIL VS's raw-half output register representation. */
+  bool raw_half_inputs = false;
   /** Entry point (and HS patch-constant function) inside the converter's module once linked. */
   llvm::Function *entry = nullptr;
   llvm::Function *patch_constant = nullptr;
@@ -145,7 +149,8 @@ llvm::Value *RegisterLane(
 /** Constant operand `index` of a dx.op call. */
 llvm::Expected<uint32_t> ConstantOperand(const llvm::CallInst &call, unsigned index);
 
-/** Every call to a `dx.op.<name>.*` overload inside `function`. */
-llvm::SmallVector<llvm::CallInst *, 16> CollectCalls(llvm::Function &function, llvm::StringRef name);
+/** Collect the requested `dx.op.<name>[.*]` calls in one instruction walk. */
+llvm::StringMap<llvm::SmallVector<llvm::CallInst *, 16>>
+CollectCalls(llvm::Function &function, llvm::ArrayRef<llvm::StringRef> names);
 
 } // namespace d3dalloy::dxil

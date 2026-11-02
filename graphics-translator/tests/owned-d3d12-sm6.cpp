@@ -1383,7 +1383,46 @@ void testCalculateLodShapes(Compute &c) {
   end("calculate_lod_shapes");
 }
 
+void testWideIntegerHierarchy(Compute &c) {
+  struct Case {const char* entry;uint32_t width,threads;};
+  for (const auto& test : {Case{"cs_wide_exact64",64,173},Case{"cs_wide_exact128",128,173},
+      Case{"cs_wide_exact64_short",64,17},Case{"cs_wide_exact128_short",128,17}}) {
+    begin();
+    auto result=c.run(test.entry,filled(test.threads*256),filled(64),filled(64),{0,0,0,0},1);
+    if(!result.empty()) for(uint32_t gi=0;gi<test.threads;++gi) {
+      const uint32_t lane=gi%test.width,base=gi-lane,live=std::min(test.width,test.threads-base);
+      uint64_t expected[13]{0,0,UINT64_MAX,0,0,0,0,0,UINT64_MAX,0,0,1,1};
+      int64_t minimum=INT64_MAX,maximum=INT64_MIN;
+      uint16_t sum16=0,prefix16=0,min16=UINT16_MAX,max16=0;
+      int16_t minSigned16=INT16_MAX,maxSigned16=INT16_MIN;
+      uint32_t count=0,prefixCount=0;
+      for(uint32_t s=0;s<live;++s) {
+        const uint32_t id=base+s;
+        const uint64_t value=(uint64_t(id+1)<<32)|(uint64_t(id)*0x9e3779b9u+17u);
+        const int64_t signedValue=(id&1)?-int64_t(value):int64_t(value);
+        const uint64_t product=(s%3)*2+1;
+        expected[0]+=value;if(s<lane)expected[1]+=value;
+        expected[2]=std::min(expected[2],value);expected[3]=std::max(expected[3],value);
+        expected[4]+=uint64_t(signedValue);if(s<lane)expected[5]+=uint64_t(signedValue);
+        minimum=std::min(minimum,signedValue);maximum=std::max(maximum,signedValue);
+        expected[8]&=value;expected[9]|=value;expected[10]^=value;expected[11]*=product;if(s<lane)expected[12]*=product;
+        const uint16_t small=uint16_t(id*257+32761);const int16_t signedSmall=int16_t(small);
+        sum16=uint16_t(sum16+small);if(s<lane)prefix16=uint16_t(prefix16+small);
+        min16=std::min(min16,small);max16=std::max(max16,small);
+        minSigned16=std::min(minSigned16,signedSmall);maxSigned16=std::max(maxSigned16,signedSmall);
+        if(s%5==0){++count;if(s<lane)++prefixCount;}
+      }
+      expected[6]=uint64_t(minimum);expected[7]=uint64_t(maximum);
+      for(uint32_t i=0;i<13;++i)EXPECT_EQ(test.entry,"i64",gi*13+i,load<uint64_t>(result[0],gi*256+i*8),expected[i]);
+      const uint32_t other[]={sum16,prefix16,min16,max16,uint32_t(int32_t(minSigned16)),uint32_t(int32_t(maxSigned16)),
+          count,prefixCount,uint32_t(live>33),1};
+      for(uint32_t i=0;i<10;++i)EXPECT_EQ(test.entry,"i16_vote",gi*10+i,load<uint32_t>(result[0],gi*256+104+i*4),other[i]);
+    }
+    end(test.entry);
+  }
+}
 void testWideWaves(Compute &c) {
+  testWideIntegerHierarchy(c);
   struct Case { const char *entry; uint32_t width, threads; };
   for (const auto &test : {Case{"cs_wavesize64", 64, 128}, Case{"cs_wavesize128", 128, 256},
        Case{"cs_wavesize_range64only", 64, 128}, Case{"cs_wavesize64_partial", 64, 160},

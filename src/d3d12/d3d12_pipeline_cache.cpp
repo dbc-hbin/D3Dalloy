@@ -270,14 +270,14 @@ public:
 // Full canonical bytes are compared, not just a digest. No pointer/padding is a key input.
 class StageKeyBuilder {
 public:
-  std::string key;
+  CanonicalStageKey key;
   std::vector<std::pair<void *, size_t>> outputs;
   template <typename... T> void add(const T &...values) {
     (key.append(reinterpret_cast<const char *>(&values), sizeof(values)), ...);
   }
   void bytes(const void *data, size_t size) {
     add(uint64_t(size));
-    if (size) key.append(static_cast<const char *>(data), size);
+    key.reference(data, size);
   }
   template <typename T> void output(T *data) {
     add(bool(data));
@@ -437,25 +437,29 @@ template <typename T, bool Weak = false> struct ArtifactCache {
     std::weak_ptr<const T> weak_value;
   };
   std::mutex mutex;
-  std::unordered_map<std::string, std::shared_ptr<Flight>> entries;
+  std::unordered_map<CanonicalStageKey, std::shared_ptr<Flight>, CanonicalStageKey::Hash> entries;
+  ShaderBytecodePool key_storage;
   uint64_t generation = UINT64_MAX, clock = 0, operations = 0;
   const uint64_t id = owned_graphics::NewObjectId();
   size_t bytes = 0, completed = 0;
 
-  void Operation(const char *kind, const std::string &key) {
+  void Operation(const char *kind, const CanonicalStageKey &key) {
     uint64_t count;
     { std::lock_guard lock(mutex); count = ++operations; }
     try {
       if (owned_graphics::TraceEnabled())
         owned_graphics::Trace("pipeline_artifact_operation", ",\"kind\":\"", kind, "\",\"cache\":", id,
                               ",\"count\":", count, ",\"key\":\"",
-                              Sha1HashState::compute(key.data(), key.size()).string(), "\"");
+                              key.digest().string(), "\"");
     } catch (...) {
       // Optional instrumentation cannot change a compiler/native operation result.
     }
   }
 
-  template <typename Create> std::shared_ptr<const T> Get(const std::string &key, const char *kind, Create create) {
+  template <typename Create> std::shared_ptr<const T> Get(const CanonicalStageKey &key, const char *kind, Create create) {
+    // Hash raw canonical spans once, outside the cache lock. Rehashing, tracing,
+    // output identity and admission reuse this digest; equality remains exact.
+    key.digest();
     uint64_t current;
     bool enabled;
     {
@@ -496,13 +500,13 @@ template <typename T, bool Weak = false> struct ArtifactCache {
         lock.unlock();
         if (value && owned_graphics::TraceEnabled())
           owned_graphics::Trace("pipeline_artifact_hit", ",\"kind\":\"", kind, "\",\"cache\":", id, ",\"key\":\"",
-                                Sha1HashState::compute(key.data(), key.size()).string(), "\"");
+                                key.digest().string(), "\"");
         return value;
         }
       }
       flight = std::make_shared<Flight>();
       flight->last_use = ++clock;
-      entries.emplace(key, flight);
+      entries.emplace(key.owned(key_storage), flight);
     }
     lock.unlock();
     std::shared_ptr<const T> value;
@@ -511,7 +515,7 @@ template <typename T, bool Weak = false> struct ArtifactCache {
       if constexpr (std::is_same_v<T, ShaderStageArtifact>) {
         if (enabled) {
           std::shared_ptr<const ShaderStageArtifact> disk;
-          if (SUCCEEDED(ReadAutomaticStageArtifact(key, disk)) && disk) {
+          if (SUCCEEDED(ReadAutomaticStageArtifact(key.string(), disk)) && disk) {
             value = std::move(disk);
             disk_loaded = true;
           }
@@ -520,7 +524,7 @@ template <typename T, bool Weak = false> struct ArtifactCache {
       if (!value) value = create();
       if constexpr (std::is_same_v<T, ShaderStageArtifact>) {
         if (value && !value->failure_result && !disk_loaded && enabled)
-          QueueAutomaticStageArtifact(key, value, current);
+          QueueAutomaticStageArtifact(key.string(), value, current);
       }
     } catch (...) {
       if (flight) {
@@ -573,7 +577,7 @@ template <typename T, bool Weak = false> struct ArtifactCache {
     return value;
   }
 
-  void Erase(const std::string &key, const std::shared_ptr<const T> &value) {
+  void Erase(const CanonicalStageKey &key, const std::shared_ptr<const T> &value) {
     std::lock_guard lock(mutex);
     const auto it = entries.find(key);
     if (it == entries.end() || !it->second->done || it->second->value != value) return;
@@ -605,6 +609,7 @@ struct RasterMarkerArtifact {
 } // namespace
 
 struct DeviceShaderArtifactCache::Impl {
+  ShaderBytecodePool bytecodes;
   ArtifactCache<ShaderStageArtifact> stages;
   ArtifactCache<NativeLibraryArtifact> libraries;
   ArtifactCache<NativeFunctionArtifact> functions;
@@ -613,10 +618,14 @@ struct DeviceShaderArtifactCache::Impl {
   ArtifactCache<RasterMarkerArtifact> markers;
   ArtifactCache<WorkGraphArtifact> workgraphs;
   ArtifactCache<RaytracingArtifact> raytracing;
+  ArtifactCache<NativeRaytracingArtifact, true> raytracing_native;
 };
 
 DeviceShaderArtifactCache::DeviceShaderArtifactCache() : impl_(std::make_unique<Impl>()) {}
 DeviceShaderArtifactCache::~DeviceShaderArtifactCache() = default;
+SharedShaderBytecode DeviceShaderArtifactCache::RetainBytecode(const void *data, size_t size) {
+  return impl_->bytecodes.Capture(data, size);
+}
 
 namespace {
 bool CopyCompiledArtifact(sm50_bitcode_t owner, const SM50_COMPILED_BITCODE &code, ShaderStageArtifact &value) {
@@ -834,7 +843,7 @@ int DeviceShaderArtifactCache::Compile(
     for (const auto &source : sources) key.bytes(source.pShaderBytecode, source.BytecodeLength);
     key.bytes(name, strlen(name));
     if (!key.arguments(args)) return compile();
-    if (stage_key) *stage_key = Sha1HashState::compute(key.key.data(), key.key.size());
+    if (stage_key) *stage_key = key.key.digest();
     artifact = impl_->stages.Get(key.key, "air_compile", [&]() -> std::shared_ptr<const ShaderStageArtifact> {
       if ((result = compile())) {
         if (!error || !*error || SM50GetErrorKind(*error) != SM50_ERROR_ROOT_BINDING) return {};
@@ -944,20 +953,21 @@ int DeviceShaderArtifactCache::CompileShader(
 
 WMT::Reference<WMT4::Library> DeviceShaderArtifactCache::Library(
     WMT4::Compiler compiler, const SM50_COMPILED_BITCODE &code, sm50_bitcode_t owner, WMT::Error &error) {
-  std::string bytes(code.Size, char(0));
-  if (owner) {
-    if (!SM50ReadCompiledBitcode(owner, SM50_COMPILED_BITCODE_PART_LIBRARY, code.Data, bytes.data(), code.Size)) return {};
-  } else {
-    const void *direct = SM50AccessiblePointer(code.Data);
-    if (!direct) return {};
-    std::memcpy(bytes.data(), direct, code.Size);
-  }
   // Device ownership fixes native device/driver identity; compiler handle is an explicit key input.
   StageKeyBuilder key;
-  key.add(compiler.handle); key.bytes(bytes.data(), bytes.size());
+  key.add(compiler.handle, uint64_t(code.Size));
+  // Fill the exact canonical key directly. This also handles compiler-owned
+  // pointers outside a WoW64 image; no second full library scratch copy is needed.
+  if (!owner) {
+    const void *bytes = SM50AccessiblePointer(code.Data);
+    if (!bytes) return {};
+    key.key.reference(bytes, code.Size); // restored/artifact-owned bytes need no hit-path copy
+  } else if (!key.key.filled(code.Size, [&](char *bytes) {
+        return SM50ReadCompiledBitcode(owner, SM50_COMPILED_BITCODE_PART_LIBRARY, code.Data, bytes, code.Size);
+      })) return {};
   auto value = impl_->libraries.Get(key.key, "new_library", [&]() -> std::shared_ptr<const NativeLibraryArtifact> {
     impl_->libraries.Operation("new_library", key.key);
-    auto library = compiler.newLibrary(WMT::MakeDispatchData(bytes.data(), bytes.size()), error);
+    auto library = compiler.newLibrary(WMT::MakeDispatchData(const_cast<char *>(key.key.lastData()), code.Size), error);
     if (!library) return {};
     auto artifact = std::make_shared<NativeLibraryArtifact>();
     artifact->library = std::move(library);
@@ -1077,6 +1087,70 @@ std::shared_ptr<const NativePipelineArtifact> DeviceShaderArtifactCache::NativeP
 std::shared_ptr<const NativePipelineArtifact> DeviceShaderArtifactCache::NativePipeline(
     WMT4::Compiler compiler, const WMTMeshRenderPipelineInfo &info, WMT::Error &error) {
   return CreateNativePipeline(impl_->pipelines, compiler, info, error);
+}
+
+std::shared_ptr<const NativeRaytracingArtifact> DeviceShaderArtifactCache::NativeRaytracing(
+    WMT4::Compiler compiler, WMT4::Library library, const std::vector<SM50_RT_FUNCTION_INFO> &functions,
+    uint32_t max_call_stack_depth, WMT::Error &error) {
+  StageKeyBuilder key;
+  // A retained library fixes the complete emitted code, root layouts, constants
+  // ABI and compiler options. Include ordered linkage and handle-table metadata;
+  // do not key only by entry-point names or an application state-object pointer.
+  key.add(uint32_t(1), compiler.handle, library.handle, max_call_stack_depth, uint64_t(functions.size()));
+  for (const auto &function : functions) {
+    if (!function.Name || !*function.Name) return {};
+    key.bytes(function.Name, strlen(function.Name));
+    key.add(function.Kind, function.ExportIndex, function.TableIndex, function.Flags);
+  }
+  auto value = impl_->raytracing_native.Get(key.key, "native_rt_executable", [&] {
+    auto native = std::make_shared<NativeRaytracingArtifact>();
+    native->library = library;
+    native->parents.resize(functions.size());
+    native->handles.resize(functions.size());
+    std::vector<obj_handle_t> linked;
+    linked.reserve(functions.size());
+    obj_handle_t dispatch = NULL_OBJECT_HANDLE;
+    for (size_t i = 0; i < functions.size(); ++i) {
+      const auto &function = functions[i];
+      if ((function.Kind == SM50_RT_FUNCTION_RAYGEN && !(function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY)) ||
+          function.Kind == SM50_RT_FUNCTION_INTERSECTION) continue;
+      auto parent = Function(library, function.Name);
+      if (!parent) return native;
+      if (function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY) {
+        if (dispatch || function.Kind != SM50_RT_FUNCTION_RAYGEN) return native;
+        dispatch = parent;
+      } else linked.push_back(parent);
+      native->parents[i] = std::move(parent);
+    }
+    if (!dispatch) return native;
+    WMTComputePipelineInfo info;
+    WMT::InitializeComputePipelineInfo(info);
+    info.compute_function = dispatch;
+    info.support_indirect_command_buffers = false;
+    info.max_call_stack_depth = max_call_stack_depth;
+    impl_->raytracing_native.Operation("native_rt_executable", key.key);
+    native->compute = compiler.newComputePipelineStateWithLinkedFunctions(
+        info, linked.data(), static_cast<uint32_t>(linked.size()), native->error);
+    if (!native->compute) return native;
+    for (size_t i = 0; i < functions.size(); ++i) {
+      const auto &function = functions[i];
+      const bool callback = function.Kind == SM50_RT_FUNCTION_DISPATCH && function.TableIndex != SM50_RT_INDEX_NONE;
+      const bool visible = function.Kind == SM50_RT_FUNCTION_VISIBLE && !(function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY);
+      if (!callback && !visible) continue;
+      native->handles[i] = compiler.functionHandle(native->compute, native->parents[i]);
+      if (!native->handles[i]) {
+        // A partial native executable is never retained. Joined callers receive
+        // the failure and a later request can retry, just like ordinary PSOs.
+        native->compute = {};
+        return native;
+      }
+    }
+    return native;
+  });
+  if (error) error.release();
+  error.handle = value ? value->error.handle : NULL_OBJECT_HANDLE;
+  if (error) error.retain();
+  return value;
 }
 
 HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Digest &key) {
@@ -1206,7 +1280,7 @@ void PipelineCache::Complete(HRESULT result, bool retain) noexcept {
       Com<ID3DBlob> serialized;
       // Oversized results may be shared by live flight/PSO owners, but are never
       // retained as completed cache entries or written to disk.
-      if (SUCCEEDED(GetBlob(&serialized))) {
+      if (SUCCEEDED(GetPrivateBlob(&serialized))) {
         blob_ = ShareBlob(serialized.ptr());
         if (blob_) {
           // Native functions and immutable GPU constants already consumed these bytes.
@@ -1524,7 +1598,29 @@ SM50_COMPILED_BITCODE PipelineCache::view(Stage stage) {
   return result;
 }
 
+HRESULT PipelineCache::GetPrivateBlob(ID3DBlob **blob) {
+  if (!blob) return E_POINTER;
+  *blob = nullptr;
+  std::lock_guard lock(serialized_mutex_);
+  if (blob_) { *blob = ref(blob_->bytes.ptr()); return S_OK; }
+  if (!serialized_) {
+    if (HRESULT hr = SerializeBlob(&serialized_); FAILED(hr)) return hr;
+  }
+  *blob = ref(serialized_.ptr());
+  return S_OK;
+}
+
 HRESULT PipelineCache::GetBlob(ID3DBlob **blob) {
+  if (!blob) return E_POINTER;
+  *blob = nullptr;
+  Com<ID3DBlob> original;
+  if (HRESULT hr = GetPrivateBlob(&original); FAILED(hr)) return hr;
+  if (HRESULT hr = CreateBlobFromMalloc(original->GetBufferSize(), blob); FAILED(hr)) return hr;
+  std::memcpy((*blob)->GetBufferPointer(), original->GetBufferPointer(), original->GetBufferSize());
+  return S_OK;
+}
+
+HRESULT PipelineCache::SerializeBlob(ID3DBlob **blob) {
   if (!blob)
     return E_POINTER;
   *blob = nullptr;

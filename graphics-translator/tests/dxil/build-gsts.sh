@@ -39,4 +39,12 @@ for partition in integer pow2 fractional_odd fractional_even; do
   compile tessellation "hs_isoline_${partition}_line"
   compile tessellation "hs_isoline_${partition}_point"
 done
+for entry in vs_half hs_half_independent hs_half_dependent ds_half ps_half; do
+  if ! WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -enable-16bit-types \
+      -T "${entry%%_*}_6_2" -E "$entry" -I "Z:$here" "$here/tessellation-half.hlsl" \
+      -Fo "$out/tessellation-$entry.dxil" >/dev/null; then
+    echo "failed: tessellation $entry" >&2
+    status=1
+  fi
+done
 exit $status

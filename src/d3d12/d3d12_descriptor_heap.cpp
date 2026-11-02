@@ -229,14 +229,19 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
   }
 
   bool SetPoolSlot(UINT index, Texture *texture, TextureViewKey key) {
-    if (!pool_supported_) return false;
-    if (!texture->supportsDescriptorViewPool(key)) return false;
+    if (!pool_supported_ || !texture->supportsDescriptorViewPool(key)) {
+      ResetPoolSlot(index);
+      return false;
+    }
     const auto descriptor = texture->viewDescriptor(key);
     auto &slot = pool_slots_[index];
     slot.texture = texture->current()->texture();
     slot.info = {uint32_t(descriptor.format), uint32_t(descriptor.type), descriptor.firstMiplevel,
                  descriptor.miplevelCount, descriptor.firstArraySlice, descriptor.arraySize};
     mapped_argument_buffer_[index].SRVTexture.resource_id = view_pool_.setTextureView(slot.texture, slot.info, index);
+    // Native set replaces the old slot and its residency owner atomically. A
+    // rejected set must still leave a null slot, as the former clear+set did.
+    if (!mapped_argument_buffer_[index].SRVTexture.resource_id) view_pool_.clear(index);
     return true;
   }
 #ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
@@ -366,7 +371,6 @@ public:
                         bool CubeView, bool CenterSamplePattern, UINT64 FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
-    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexture;
     cpu_storage.SRVTexture.texture = Texture;
@@ -399,6 +403,12 @@ public:
     }
     return S_OK;
   }
+  uint64_t GetTextureResourceId(UINT index) const override {
+    if (index >= descriptors_.size()) return 0;
+    const auto type = descriptors_[index].type;
+    return type == ShaderVisibleDescriptorType::SRVTexture || type == ShaderVisibleDescriptorType::UAVTexture
+        ? mapped_argument_buffer_[index].SRVTexture.resource_id : 0;
+  }
     virtual HRESULT
   AddConstantBufferView(UINT Index, UINT64 VA, UINT32 SizeInBytes) {
     if (Index >= descriptors_.size())
@@ -419,7 +429,6 @@ public:
   AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize, UINT FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
-    ResetPoolSlot(Index);
     auto &cpu_storage = descriptors_[Index];
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexture;
     cpu_storage.UAVTexture.texture = Texture;
@@ -934,7 +943,7 @@ public:
       info.mip_filter = WMTSamplerMipFilterNearest;
       info.max_anisotroy = 1;
     }
-    auto sampler = Sampler::createSampler(device_->GetMTLDevice(), info, pDesc->MipLODBias,
+    auto sampler = device_->owned_native_states.SamplerState(device_->GetMTLDevice(), info, pDesc->MipLODBias,
                                           SamplerReductionMode(pDesc->Filter));
     if (!sampler)
       return E_OUTOFMEMORY;

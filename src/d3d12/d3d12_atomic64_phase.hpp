@@ -49,6 +49,7 @@ struct Atomic64TextureBinding {
   bool writable = false;
   uint16_t first_w_slice = 0;
   uint16_t w_size = 0;
+  uint64_t shader_resource_id = 0;
 };
 
 struct Atomic64PhaseBindings {

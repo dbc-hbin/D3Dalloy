@@ -13,4 +13,6 @@ enum WMTMetal4PipelineOperation : uint32_t {
   WMTMetal4PipelineMesh,
   WMTMetal4PipelineLinkedCompute,
   WMTMetal4PipelineFunctionHandle,
+  WMTMetal4PipelineArchiveFlush,
+  WMTMetal4PipelineArchiveControl,
 };

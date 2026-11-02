@@ -5,6 +5,7 @@
 #include <array>
 #include <memory>
 #include <functional>
+#include <mutex>
 
 namespace d3dalloy {
 class MTLD3D12Device;
@@ -27,7 +28,8 @@ std::array<MTLD3D12Resource *, 12> GetOwnedTemporalFrameResources(const std::sha
 // Owned id of the queue that encoded the feature's latest evaluation, or 0 before the first.
 // Encode waits for the history timeline only when that queue differs from its own; the
 // caller orders a same-queue predecessor on the GPU itself. Stable while the caller holds
-// the device temporal submission mutex, which every temporal encode runs under.
+// the feature submission mutex through native commit and timeline publication.
+std::mutex &OwnedTemporalSubmissionMutex(const std::shared_ptr<OwnedTemporalFrame> &frame);
 uint64_t OwnedTemporalFrameHistoryQueue(const std::shared_ptr<OwnedTemporalFrame> &frame);
 void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
     WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence, uint64_t queue, uint64_t submission, uint64_t encoder,

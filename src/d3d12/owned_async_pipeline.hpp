@@ -17,9 +17,9 @@
 namespace owned_graphics {
 
 // One deferred compile. Exactly one caller (a worker or a synchronous consumer)
-// runs the work; every other caller waits for it. Cancel() retires unstarted
-// work without running it, so a callback that arrives after the owner is gone
-// finds Done and never touches the owner.
+// runs the work. Consumers wait for its result; workers skip already claimed
+// jobs. Cancel() retires unstarted work without running it, so a callback that
+// arrives after the owner is gone finds Done and never touches the owner.
 class AsyncCompileJob {
 public:
   enum Status : int { Pending, Ready, Failed };
@@ -28,8 +28,8 @@ public:
 
   Status status() const { return Status(status_.load(std::memory_order_acquire)); }
 
-  // Returns true if this call ran the work (false: already claimed or done).
-  bool Run() {
+  // Claims queued work without waiting for another caller's compile.
+  bool TryRun() {
     std::unique_lock<std::mutex> lock(mutex_);
     if (state_ == State::Queued) {
       state_ = State::Running;
@@ -45,6 +45,14 @@ public:
       Finish(ok ? Ready : Failed);
       return true;
     }
+    return false;
+  }
+
+  // Returns true if this call ran the work; otherwise waits for completion.
+  bool Run() {
+    if (TryRun())
+      return true;
+    std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [&] { return state_ == State::Done; });
     return false;
   }
@@ -107,7 +115,9 @@ public:
         job = std::move(jobs_.front());
         jobs_.pop_front();
       }
-      job->Run();
+      // A synchronous consumer may have claimed this queued entry. Do not
+      // spend a worker waiting for it while other pipelines are still queued.
+      job->TryRun();
     }
   }
 

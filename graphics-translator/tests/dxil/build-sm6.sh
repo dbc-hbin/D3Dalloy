@@ -49,6 +49,9 @@ compile sm6-16bit.hlsl vs_6_2 vs_16bit -enable-16bit-types
 compile sm6-16bit.hlsl ps_6_2 ps_16bit -enable-16bit-types
 compile sm6-reject.hlsl cs_6_6 cs_wavesize32
 compile sm6-reject.hlsl cs_6_6 cs_wavesize64
+for entry in cs_wide_exact64 cs_wide_exact128 cs_wide_exact64_short cs_wide_exact128_short; do
+  compile wide-wave-exact.hlsl cs_6_6 "$entry" -enable-16bit-types
+done
 compile sm6-reject.hlsl cs_6_6 cs_wavesize128
 compile sm6-reject.hlsl cs_6_8 cs_wavesize_range64only
 compile sm6-reject.hlsl cs_6_6 cs_wavesize64_partial

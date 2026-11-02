@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Included by the owned Metal4FX dispatcher. RR is a denoiser, never an SR alias.
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -31,6 +32,9 @@ struct Resources {
   // the device set on every D3D12 queue. Rebuilt only after scratch changes.
   id<MTLResidencySet> residency = nil;
   bool residencyDirty = true;
+  bool ready = false;
+  uint32_t width = 0, height = 0, outputWidth = 0, outputHeight = 0;
+  uint64_t bytes = 0;
   ~Resources() {
     for (auto texture : textures) [texture release];
     [params release]; [table release]; [residency release];
@@ -43,7 +47,8 @@ struct Pipelines {
   id<MTLDevice> device = nil;
   id<MTLComputePipelineState> conversion = nil;
   id<MTLComputePipelineState> depthConversion = nil;
-  ~Pipelines() { [conversion release]; [depthConversion release]; [device release]; }
+  id<MTLComputePipelineState> normalRoughness = nil;
+  ~Pipelines() { [conversion release]; [depthConversion release]; [normalRoughness release]; [device release]; }
 };
 struct Core {
   id<MTLDevice> device = nil;
@@ -53,9 +58,46 @@ struct Core {
   std::mutex mutex;
   std::array<std::shared_ptr<Generation>, 8> generations{};
   size_t nextGenerationSlot = 0;
-  std::vector<std::unique_ptr<Resources>> pool;
+  // Only GPU-retired sets enter this fixed pool. The byte budget follows three
+  // copies of the current scratch working set, not a large historical extent.
+  std::array<std::unique_ptr<Resources>, 3> pool;
+  uint64_t idleBytes = 0, idleByteLimit = 0;
+  size_t nextPoolSlot = 0;
+  bool dormant = false;
+  float minScale = 1, maxScale = 1;
   uint64_t lastGeneration = 0;
   float lastJitterX = 0, lastJitterY = 0;
+  // Caller holds mutex. Recorded frames/active executions retain their own set.
+  std::unique_ptr<Resources> takeResources(const Generation &generation) {
+    for (bool exact : {true, false})
+      for (auto &entry : pool) {
+        if (!entry || (exact && (entry->width != generation.width || entry->height != generation.height ||
+            entry->outputWidth != generation.outputWidth || entry->outputHeight != generation.outputHeight))) continue;
+        idleBytes -= entry->bytes;
+        return std::move(entry);
+      }
+    return std::make_unique<Resources>();
+  }
+  void trimPool() noexcept {
+    for (auto &entry : pool) {
+      if (!entry || idleBytes <= idleByteLimit) continue;
+      idleBytes -= entry->bytes; entry.reset();
+    }
+  }
+  void recycle(std::unique_ptr<Resources> &resources) noexcept {
+    if (dormant || !resources->ready || resources->bytes > idleByteLimit) return;
+    for (auto &entry : pool) {
+      if (!entry || idleBytes <= idleByteLimit - resources->bytes) continue;
+      idleBytes -= entry->bytes; entry.reset();
+    }
+    auto slot = std::find_if(pool.begin(), pool.end(), [](const auto &entry) { return !entry; });
+    if (slot == pool.end()) {
+      slot = pool.begin() + nextPoolSlot++ % pool.size();
+      idleBytes -= (*slot)->bytes;
+    }
+    idleBytes += resources->bytes;
+    *slot = std::move(resources);
+  }
   ~Core() { [compiler release]; [device release]; }
 };
 struct Params {
@@ -106,6 +148,15 @@ kernel void d3dalloy_rr_convert_depth(depth2d<float,access::read> source [[textu
   if (gid.x >= p.width || gid.y >= p.height) return;
   destination.write(d3dalloy_rr_value(float4(source.read(d3dalloy_rr_source(p,gid)),0,0,1),p,gid),gid);
 }
+kernel void d3dalloy_rr_normal_roughness(texture2d<float,access::read> source [[texture(0)]],
+  texture2d<float,access::write> normal [[texture(1)]],
+  texture2d<float,access::write> roughness [[texture(2)]],
+  constant Params &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+  if (gid.x >= p.width || gid.y >= p.height) return;
+  float4 value = source.read(d3dalloy_rr_source(p,gid));
+  normal.write(value,gid);
+  roughness.write(float4(value.w,0,0,1),gid);
+}
 )METAL";
 std::mutex pipelineMutex;
 std::vector<std::weak_ptr<const Pipelines>> pipelineCache;
@@ -125,8 +176,10 @@ std::shared_ptr<const Pipelines> devicePipelines(id<MTLDevice> device) {
   if (function) result->conversion = [device newComputePipelineStateWithFunction:function error:&error];
   [function release]; function = [library newFunctionWithName:@"d3dalloy_rr_convert_depth"];
   if (function) result->depthConversion = [device newComputePipelineStateWithFunction:function error:&error];
+  [function release]; function = [library newFunctionWithName:@"d3dalloy_rr_normal_roughness"];
+  if (function) result->normalRoughness = [device newComputePipelineStateWithFunction:function error:&error];
   [function release]; [library release];
-  if (!result->conversion || !result->depthConversion) return {};
+  if (!result->conversion || !result->depthConversion || !result->normalRoughness) return {};
   result->device = [device retain];
   pipelineCache.push_back(result);
   return result;
@@ -279,7 +332,7 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     // The retired set keeps its scratch; only the next owner mutates it.
     try {
       std::lock_guard lock(core->mutex);
-      core->pool.push_back(std::move(resources));
+      core->recycle(resources);
     } catch (...) { resources.reset(); }
   }
   [frame release]; [super dealloc];
@@ -290,14 +343,20 @@ static bool d3dalloyRRResources(D3DALLOYRRFrame *frame, d3dalloy_rr::Resources &
                             std::array<id<MTLTexture>, d3dalloy_rr::Count> &bound) {
   using namespace d3dalloy_rr;
   const auto &p = frame->props;
-  const auto &core = *frame->core;
+  auto &core = *frame->core;
+  resources.ready = false;
   const auto scaler = frame->generation->scaler;
   const MTLTextureUsage usages[Count] = {scaler.colorTextureUsage, scaler.depthTextureUsage,
     scaler.motionTextureUsage, scaler.outputTextureUsage, MTLTextureUsageShaderRead,
     0, 0, scaler.diffuseAlbedoTextureUsage, scaler.specularAlbedoTextureUsage,
     scaler.normalTextureUsage, scaler.roughnessTextureUsage, scaler.specularHitDistanceTextureUsage};
   for (size_t i = 0; i < Count; ++i) {
-    id<MTLTexture> input = frame->inputs[i]; if (!input) continue;
+    auto discardScratch = [&] {
+      auto &scratch = resources.textures[i];
+      if (scratch) { [scratch release]; scratch = nil; resources.residencyDirty = true; }
+    };
+    id<MTLTexture> input = frame->inputs[i];
+    if (!input) { discardScratch(); continue; }
     const auto &rect = frame->rects[i];
     const uint32_t width = i == 3 ? p.output_rect.width : i == 4 ? 1 : p.input_width;
     const uint32_t height = i == 3 ? p.output_rect.height : i == 4 ? 1 : p.input_height;
@@ -313,7 +372,9 @@ static bool d3dalloyRRResources(D3DALLOYRRFrame *frame, d3dalloy_rr::Resources &
     const auto descriptorFormat = frame->generation->formats[i];
     if (!convert && !rect.x && !rect.y && input.width == width && input.height == height &&
         input.pixelFormat == descriptorFormat && (input.usage & required) == required &&
-        (i != 3 || input.storageMode == MTLStorageModePrivate)) { bound[i] = input; continue; }
+        (i != 3 || input.storageMode == MTLStorageModePrivate)) {
+      discardScratch(); bound[i] = input; continue;
+    }
     // Scratch is always written by conversion in the fixed format.
     if (descriptorFormat != format(i)) return false;
     auto &scratch = resources.textures[i];
@@ -334,14 +395,31 @@ static bool d3dalloyRRResources(D3DALLOYRRFrame *frame, d3dalloy_rr::Resources &
     resources.residencyDirty = true;
   }
   if (!resources.table) {
-    auto d = [MTL4ArgumentTableDescriptor new]; d.maxBufferBindCount = 1; d.maxTextureBindCount = 2;
+    auto d = [MTL4ArgumentTableDescriptor new]; d.maxBufferBindCount = 1; d.maxTextureBindCount = 3;
     resources.table = [core.device newArgumentTableWithDescriptor:d error:nil]; [d release];
   }
   if (!resources.residency) {
     auto d = [MTLResidencySetDescriptor new]; d.initialCapacity = Count * 2 + 1;
     resources.residency = [core.device newResidencySetWithDescriptor:d error:nil]; [d release];
   }
-  return resources.params && resources.table && resources.residency;
+  if (!resources.params || !resources.table || !resources.residency) return false;
+  resources.width = p.input_width; resources.height = p.input_height;
+  resources.outputWidth = p.output_rect.width; resources.outputHeight = p.output_rect.height;
+  resources.bytes = resources.params.allocatedSize;
+  for (auto texture : resources.textures) resources.bytes += texture.allocatedSize;
+  resources.ready = true;
+  core.idleByteLimit = resources.bytes > UINT64_MAX / core.pool.size()
+      ? UINT64_MAX : resources.bytes * core.pool.size();
+  core.trimPool();
+  return true;
+}
+static bool d3dalloyRRFusesNormalRoughness(D3DALLOYRRFrame* frame,
+    const std::array<id<MTLTexture>,d3dalloy_rr::Count>& bound) {
+  const auto &a = frame->rects[9], &b = frame->rects[10];
+  return frame->props.roughness_packed && frame->inputs[9] == frame->inputs[10] &&
+      bound[9] && bound[10] && bound[9] != frame->inputs[9] && bound[10] != frame->inputs[10] &&
+      bound[9].width == bound[10].width && bound[9].height == bound[10].height &&
+      a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
 }
 static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   using namespace d3dalloy_rr;
@@ -357,6 +435,8 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
         (info.feature_flags & ~(Flag | 1u | 2u | 4u | 8u | 64u))) return true;
     auto core = std::make_shared<Core>(); core->info = info;
     core->device = [device retain]; core->compiler = [compiler retain];
+    core->minScale = [MTLFXTemporalDenoisedScalerDescriptor supportedInputContentMinScaleForDevice:device];
+    core->maxScale = [MTLFXTemporalDenoisedScalerDescriptor supportedInputContentMaxScaleForDevice:device];
     core->pipelines = devicePipelines(device);
     if (!core->pipelines) { call->ret[1] = 0x8007000e; return true; }
     auto holder = [D3DALLOYRRFeature new]; holder->core = std::move(core);
@@ -366,7 +446,11 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   if (call->operation == WMTMetal4FXDormantTemporal && [(id)call->args[0] isKindOfClass:[D3DALLOYRRFeature class]]) {
     auto &core = *((D3DALLOYRRFeature *)call->args[0])->core;
     // Release idle ownership, not history retained by recorded frames and replay.
-    std::lock_guard lock(core.mutex); core.generations.fill(nullptr); core.pool.clear();
+    std::lock_guard lock(core.mutex);
+    core.dormant = true;
+    core.generations.fill(nullptr);
+    for (auto &entry : core.pool) entry.reset();
+    core.idleBytes = 0;
     return true;
   }
   if (call->operation == WMTMetal4FXPrepareTemporal && [(id)call->args[0] isKindOfClass:[D3DALLOYRRFeature class]]) {
@@ -390,10 +474,8 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
       if (!std::isfinite(p.world_to_view[i]) || !std::isfinite(p.view_to_clip[i])) return true;
     simd_float4x4 world, projection; matrix(world,p.world_to_view); matrix(projection,p.view_to_clip);
     if (simd_determinant(world) == 0 || simd_determinant(projection) == 0) return true;
-    const float minScale = [MTLFXTemporalDenoisedScalerDescriptor supportedInputContentMinScaleForDevice:feature->core->device];
-    const float maxScale = [MTLFXTemporalDenoisedScalerDescriptor supportedInputContentMaxScaleForDevice:feature->core->device];
     for (double scale : {double(p.output_rect.width) / p.input_width, double(p.output_rect.height) / p.input_height})
-      if (scale < minScale || scale > maxScale) { call->ret[1] = 0x887a0004; return true; }
+      if (scale < feature->core->minScale || scale > feature->core->maxScale) { call->ret[1] = 0x887a0004; return true; }
     auto holder = [[D3DALLOYRRFrame new] autorelease]; holder->core = feature->core; holder->props = p;
     uint64_t handles[Count] = {p.color,p.depth,p.motion,p.output,p.exposure,p.reactive,0,
       p.diffuse_albedo,p.specular_albedo,p.normals,p.roughness_packed ? p.normals : p.roughness,p.specular_hit_distance};
@@ -431,8 +513,7 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     std::lock_guard lock(feature->core->mutex);
     holder->generation = generation(*feature->core,p,formats);
     if (!holder->generation) { call->ret[1] = 0x887a0004; return true; }
-    if (feature->core->pool.empty()) holder->firstResources = std::make_unique<Resources>();
-    else { holder->firstResources = std::move(feature->core->pool.back()); feature->core->pool.pop_back(); }
+    holder->firstResources = feature->core->takeResources(*holder->generation);
     std::array<id<MTLTexture>,Count> bound{};
     if (!d3dalloyRRResources(holder,*holder->firstResources,bound)) {
       call->ret[1] = 0x8007000e; return true;
@@ -451,8 +532,7 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   auto &core = *frame->core;
   std::lock_guard lock(core.mutex);
   if (frame->firstResources) execution->resources = std::move(frame->firstResources);
-  else if (core.pool.empty()) execution->resources = std::make_unique<Resources>();
-  else { execution->resources = std::move(core.pool.back()); core.pool.pop_back(); }
+  else execution->resources = core.takeResources(*frame->generation);
   auto &resources = *execution->resources;
   const auto &p = frame->props;
   const bool reset = p.reset || call->args[3] || core.lastGeneration != frame->generation->serial;
@@ -465,6 +545,9 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     resources.residencyDirty = false;
   }
   for (size_t i = 0; i < Count; ++i) {
+    // Only conversion dispatches consume these slots. Direct inputs have no
+    // parameter read, and the output conversion uses its separate slot below.
+    if (i == 3 || !bound[i] || bound[i] == frame->inputs[i]) continue;
     Params values{}; const auto &r = frame->rects[i]; values.x = r.x; values.y = r.y;
     values.width = uint32_t(bound[i].width); values.height = uint32_t(bound[i].height);
     values.sourceWidth = r.width; values.sourceHeight = r.height;
@@ -497,9 +580,13 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   [command useResidencySet:resources.residency];
   // Conversions read only app inputs and write disjoint scratch, so one encoder
   // behind one fence wait needs no intra-encoder barrier.
+  // Both results must be computed from the original packed value. Reading the
+  // rounded normal scratch for roughness would change high-precision inputs.
+  const bool fusedNormalRoughness = d3dalloyRRFusesNormalRoughness(frame,bound);
   id<MTL4ComputeCommandEncoder> prepass = nil;
   for (size_t i = 0; i < Count; ++i) {
     if (i == 3 || !bound[i] || bound[i] == frame->inputs[i]) continue;
+    if (i == 10 && fusedNormalRoughness) continue;
     if (!prepass) {
       prepass = [command computeCommandEncoder];
       if (!prepass) return true;
@@ -507,11 +594,13 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     }
     [resources.table setTexture:frame->inputs[i].gpuResourceID atIndex:0];
     [resources.table setTexture:bound[i].gpuResourceID atIndex:1];
+    [resources.table setTexture:(i == 9 && fusedNormalRoughness ? bound[10].gpuResourceID : MTLResourceID{}) atIndex:2];
     [resources.table setAddress:resources.params.gpuAddress + i * 256 atIndex:0];
     const auto sourceFormat = frame->inputs[i].pixelFormat;
     const bool depthSource = sourceFormat == MTLPixelFormatDepth16Unorm || sourceFormat == MTLPixelFormatDepth32Float ||
       sourceFormat == MTLPixelFormatDepth32Float_Stencil8 || sourceFormat == MTLPixelFormatDepth24Unorm_Stencil8;
-    [prepass setComputePipelineState:depthSource ? core.pipelines->depthConversion : core.pipelines->conversion];
+    [prepass setComputePipelineState:i == 9 && fusedNormalRoughness ? core.pipelines->normalRoughness :
+        depthSource ? core.pipelines->depthConversion : core.pipelines->conversion];
     [prepass setArgumentTable:resources.table];
     [prepass dispatchThreads:MTLSizeMake(bound[i].width,bound[i].height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
   }

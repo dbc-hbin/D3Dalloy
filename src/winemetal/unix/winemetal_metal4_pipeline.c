@@ -3,6 +3,7 @@
 #include <stdint.h>
 #define WINEMETAL_API
 #include "../winemetal_metal4_pipeline.h"
+#include "metal4_pipeline_archive.inc"
 
 extern MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format);
 
@@ -31,6 +32,13 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
     MTL4CompilerDescriptor *descriptor = [[MTL4CompilerDescriptor alloc] init];
     params->ret[0] = (uint64_t)[(id<MTLDevice>)params->args[0] newCompilerWithDescriptor:descriptor error:&error];
     [descriptor release];
+    if (params->ret[0]) {
+      @try {
+        D3DalloyPipelineArchive *state=[[D3DalloyPipelineArchive alloc] initWithDevice:(id<MTLDevice>)params->args[0]];
+        if (state) objc_setAssociatedObject((id)params->ret[0],&d3dalloy_archive_key,state,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [state release];
+      } @catch (NSException *exception) {archive_trace("init_failure",1);}
+    }
     break;
   }
   case WMTMetal4PipelineLoadLibrary:
@@ -56,7 +64,7 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
       params->ret[0] = (uint64_t)function;
       break;
     }
-    const struct WMTFunctionConstant *constants = (const void *)(uintptr_t)params->args[2];
+    const struct WMTFunctionConstant *constants = (const struct WMTFunctionConstant *)(uintptr_t)params->args[2];
     MTLFunctionConstantValues *values = [[MTLFunctionConstantValues alloc] init];
     for (uint64_t i = 0; i < params->args[3]; ++i)
       [values setConstantValue:constants[i].data.ptr type:(MTLDataType)constants[i].type atIndex:constants[i].index];
@@ -71,7 +79,7 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
   }
   case WMTMetal4PipelineCompute:
   case WMTMetal4PipelineLinkedCompute: {
-    const struct WMTComputePipelineInfo *info = (const void *)(uintptr_t)params->args[1];
+    const struct WMTComputePipelineInfo *info = (const struct WMTComputePipelineInfo *)(uintptr_t)params->args[1];
     MTL4ComputePipelineDescriptor *descriptor = [[MTL4ComputePipelineDescriptor alloc] init];
     descriptor.computeFunctionDescriptor = (MTL4FunctionDescriptor *)info->compute_function;
     descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = info->tgsize_is_multiple_of_sgwidth;
@@ -89,15 +97,13 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
       descriptor.staticLinkingDescriptor = linking;
       [linking release];
     }
-    params->ret[0] = (uint64_t)[(id<MTL4Compiler>)params->args[0]
-        newComputePipelineStateWithDescriptor:descriptor dynamicLinkingDescriptor:dynamic
-                         compilerTaskOptions:nil error:&error];
+    params->ret[0] = (uint64_t)archive_pipeline((id<MTL4Compiler>)params->args[0],descriptor,dynamic,YES,&error);
     [dynamic release];
     [descriptor release];
     break;
   }
   case WMTMetal4PipelineRender: {
-    const struct WMTRenderPipelineInfo *info = (const void *)(uintptr_t)params->args[1];
+    const struct WMTRenderPipelineInfo *info = (const struct WMTRenderPipelineInfo *)(uintptr_t)params->args[1];
     MTL4RenderPipelineDescriptor *descriptor = [[MTL4RenderPipelineDescriptor alloc] init];
     descriptor.colorAttachmentMappingState = info->inherit_color_attachment_mapping
         ? MTL4LogicalToPhysicalColorAttachmentMappingStateInherited
@@ -114,13 +120,12 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
         ? MTL4IndirectCommandBufferSupportStateEnabled : MTL4IndirectCommandBufferSupportStateDisabled;
     if (info->max_vertex_amplification_count)
       descriptor.maxVertexAmplificationCount = info->max_vertex_amplification_count;
-    params->ret[0] = (uint64_t)[(id<MTL4Compiler>)params->args[0]
-        newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
+    params->ret[0] = (uint64_t)archive_pipeline((id<MTL4Compiler>)params->args[0],descriptor,nil,NO,&error);
     [descriptor release];
     break;
   }
   case WMTMetal4PipelineMesh: {
-    const struct WMTMeshRenderPipelineInfo *info = (const void *)(uintptr_t)params->args[1];
+    const struct WMTMeshRenderPipelineInfo *info = (const struct WMTMeshRenderPipelineInfo *)(uintptr_t)params->args[1];
     MTL4MeshRenderPipelineDescriptor *descriptor = [[MTL4MeshRenderPipelineDescriptor alloc] init];
     metal4_colors(descriptor.colorAttachments, info->colors);
     descriptor.objectFunctionDescriptor = (MTL4FunctionDescriptor *)info->object_function;
@@ -137,8 +142,7 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
         ? MTL4IndirectCommandBufferSupportStateEnabled : MTL4IndirectCommandBufferSupportStateDisabled;
     if (info->max_vertex_amplification_count)
       descriptor.maxVertexAmplificationCount = info->max_vertex_amplification_count;
-    params->ret[0] = (uint64_t)[(id<MTL4Compiler>)params->args[0]
-        newRenderPipelineStateWithDescriptor:descriptor compilerTaskOptions:nil error:&error];
+    params->ret[0] = (uint64_t)archive_pipeline((id<MTL4Compiler>)params->args[0],descriptor,nil,NO,&error);
     [descriptor release];
     break;
   }
@@ -152,6 +156,14 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
     params->ret[0] = (uint64_t)[[(id<MTLComputePipelineState>)params->args[0] functionHandleWithName:name] retain];
     break;
   }
+  case WMTMetal4PipelineArchiveFlush:
+    @try {[pipeline_archive((id<MTL4Compiler>)params->args[0]) flush];}
+    @catch (NSException *exception) {archive_trace("flush_failure",1);}
+    break;
+  case WMTMetal4PipelineArchiveControl:
+    @try {[D3DalloyPipelineArchive controlAll:(uint32_t)params->args[0]];}
+    @catch (NSException *exception) {archive_trace("control_failure",1);}
+    break;
   default:
     return (int32_t)0xc0000002;
   }

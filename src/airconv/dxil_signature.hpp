@@ -52,10 +52,12 @@ struct SignatureSlot {
   uint8_t semantic_kind = 0;
 };
 
-/** Element lookup for `dx.op` I/O instructions, indexed by element id. */
+/** Element lookup for `dx.op` I/O instructions, in stable element-ID order after declaration. */
 struct StageSignature {
   std::vector<SignatureSlot> inputs;
   std::vector<SignatureSlot> outputs;
+  /** Closed native-F16 VS -> HS register transport, never raster interpolation. */
+  bool raw_half_outputs = false;
 
   const SignatureSlot *find_input(uint32_t element_id, uint32_t row) const;
   const SignatureSlot *find_output(uint32_t element_id, uint32_t row) const;

@@ -567,8 +567,10 @@ struct OutputStats {
 OutputStats validateOutput(const OutputResource& output, std::uint8_t inputTag,
                            const char* caseName, UINT frame,
                            UINT outputBaseX = 0, UINT outputBaseY = 0,
-                           UINT outputWidth = kOutputWidth, UINT outputHeight = kOutputHeight) {
-    const auto backing = output.resource->GetDesc();
+                           UINT outputWidth = kOutputWidth, UINT outputHeight = kOutputHeight,
+                           const D3D12_RESOURCE_DESC* releasedBacking = nullptr) {
+    if (!output.resource && !releasedBacking) fail("released output validation requires recorded dimensions");
+    const auto backing = releasedBacking ? *releasedBacking : output.resource->GetDesc();
     if (!outputWidth || !outputHeight || outputBaseX + outputWidth > backing.Width ||
         outputBaseY + outputHeight > backing.Height)
         fail("output validation rectangle exceeds backing");

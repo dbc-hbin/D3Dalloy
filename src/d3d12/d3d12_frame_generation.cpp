@@ -38,6 +38,7 @@ struct Core {
   uint64_t last_queue = 0; // owned id of the queue that encoded `sequence`
   WMT::Reference<WMT::SharedEvent> timeline;
   std::mutex encode_mutex;
+  std::mutex submission_mutex;
   ~Core() {
     if (context) {
       WMTFGdestroy_packet p{{sizeof(p), WMTFG_BRIDGE_VERSION, WMTFG_DESTROY, 0, context}};
@@ -307,6 +308,9 @@ std::array<D3D12_RESOURCE_STATES, 10> GetOwnedFrameGenerationStates(const std::s
 }
 bool IsOwnedFrameGenerationOutput(const std::shared_ptr<OwnedFrameGenerationFrame> &frame, size_t index) {
   return frame->generate && (index == 1 || index == 3 || index == 7);
+}
+std::mutex &OwnedFrameGenerationSubmissionMutex(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
+  return frame->core->submission_mutex;
 }
 uint64_t OwnedFrameGenerationFrameHistoryQueue(const std::shared_ptr<OwnedFrameGenerationFrame> &frame) {
   auto &core = *frame->core;

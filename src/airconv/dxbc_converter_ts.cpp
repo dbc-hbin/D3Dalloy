@@ -757,7 +757,10 @@ convert_dxbc_vertex_hull_shader(
     builder.SetInsertPoint(real_return);
   }
 
-  air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
+  // MSL object_data writes are visible to the launched mesh threads without
+  // an additional barrier. No intra-object consumer follows this point.
+  if (!module.getModuleFlag("d3dalloy.d3d12.root-signature"))
+    air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
   builder.CreateRetVoid();
 
   module.getOrInsertNamedMetadata("air.object")->addOperand(function_metadata);

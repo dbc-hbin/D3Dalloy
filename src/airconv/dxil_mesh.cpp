@@ -478,12 +478,14 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
   uint32_t statistics_claim_arg = ~0u, primitive_key_index = 0;
 
   /* Payload: the mesh reads what the object stage wrote, the object writes its own. */
-  auto has_calls = [&](llvm::StringRef name) { return !CollectCalls(*module.entry, name).empty(); };
+  const llvm::StringRef payload_operation = mesh ? "getMeshPayload" : "dispatchMesh";
+  auto payload_operations = CollectCalls(*module.entry, {payload_operation});
+  const auto &payload_calls = payload_operations[payload_operation];
   uint32_t payload_size = module.mesh.payload_size;
-  const bool payload_used = mesh ? has_calls("getMeshPayload") : has_calls("dispatchMesh");
+  const bool payload_used = !payload_calls.empty();
   if (payload_used && !payload_size) {
     llvm::Type *payload_type = nullptr;
-    for (auto *call : CollectCalls(*module.entry, mesh ? "getMeshPayload" : "dispatchMesh")) {
+    for (auto *call : payload_calls) {
       llvm::Type *pointer = mesh ? call->getType() : call->getArgOperand(4)->getType();
       payload_type = pointer->getNonOpaquePointerElementType();
     }

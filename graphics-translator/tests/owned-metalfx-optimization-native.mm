@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <thread>
 #include <objc/runtime.h>
 
 namespace probe {
@@ -100,15 +101,35 @@ void pipelineBatchProof(id<MTLDevice> device) {
     {
         auto shared = std::make_shared<Feature::Impl>();
         shared->device = retainObject(device); shared->create = create;
+        const unsigned attempts = pipelineAttempts;
         require(ensureFsrPipelines(*shared, linearOnly, &error) && fsrLibraries == 1 &&
-                shared->fsrLibrary == core->fsrLibrary, "same-device-features-share-library");
+                shared->fsrLibrary == core->fsrLibrary && shared->linearizePipeline == core->linearizePipeline &&
+                pipelineAttempts == attempts, "same-device-features-share-library-and-pso");
+        require(ensureExposurePipeline(*shared, &error) && shared->exposurePipeline == core->exposurePipeline &&
+                exposureLibraries == 1 && pipelineAttempts == attempts, "same-device-exposure-pso");
+        std::array<std::thread, 6> threads;
+        std::array<id<MTLComputePipelineState>, 6> firstPipelines{};
+        FsrPipelineNeeds concurrent = all; concurrent.debugDepth = true;
+        for (size_t i = 0; i < threads.size(); ++i) threads[i] = std::thread([&, i] { @autoreleasepool {
+            auto parallel = std::make_shared<Feature::Impl>();
+            parallel->device = retainObject(device); parallel->create = create;
+            Error local;
+            require(ensureFsrPipelines(*parallel, concurrent, &local) && ensureExposurePipeline(*parallel, &local) &&
+                    parallel->finishPipeline == core->finishPipeline &&
+                    parallel->exposurePipeline == core->exposurePipeline, "concurrent-feature-pso-reuse");
+            firstPipelines[i] = parallel->debugDepthPipeline;
+        } });
+        for (auto& thread : threads) thread.join();
+        for (auto pipeline : firstPipelines)
+            require(pipeline && pipeline == firstPipelines[0], "concurrent-first-use-single-pso");
+        require(pipelineAttempts == attempts + 1, "concurrent-first-use-one-compilation");
     }
     core.reset();
     auto independent = std::make_shared<Feature::Impl>();
     independent->device = retainObject(device); independent->create = create;
     throwLibrary = true;
     require(!ensureFsrPipelines(*independent, all, &error) &&
-            fsrLibraries == 2 && !independent->fsrLibrary,
+            fsrLibraries == 2 && independent->fsrLibrary && !independent->fsrLibrary->library,
             "library-objc-exception-contained-and-not-cached");
     failedPipeline = @"yaagl_fsr_combine_masks"; throwPipeline = true;
     require(!ensureFsrPipelines(*independent, all, &error) && fsrLibraries == 3,
@@ -117,7 +138,7 @@ void pipelineBatchProof(id<MTLDevice> device) {
             "retry-after-exception-reuses-library");
     method_setImplementation(pipelineMethod, reinterpret_cast<IMP>(originalPipeline));
     method_setImplementation(libraryMethod, reinterpret_cast<IMP>(originalLibrary));
-    std::puts("OWNED_METALFX_OPT_PIPELINES_PASS lazy=1 device_shared_library=1 partial_retry_missing=1 exposure_separate=1 objc_exceptions=contained");
+    std::puts("OWNED_METALFX_OPT_PIPELINES_PASS lazy=1 device_shared_library=1 device_shared_pso=1 concurrent_features=6 partial_retry_missing=1 exposure_shared=1 objc_exceptions=contained");
 }
 struct GPU {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -231,16 +252,25 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     for (unsigned i=0; i<3; ++i) { inputCopies[i]=0; inputBytes[i]=0; }
     observedOutput=frame.output; outputCopies=0;
     auto allocator = [gpu.device newCommandAllocator]; auto fence = [gpu.device newFence];
+    // D3D12 attaches its device residency set to every recording. This standalone
+    // fixture must provide the same ownership/residency for its caller textures.
+    auto residencyDescriptor = [MTLResidencySetDescriptor new];
+    auto callerResidency = [gpu.device newResidencySetWithDescriptor:residencyDescriptor error:nil];
+    [residencyDescriptor release]; require(callerResidency != nil, "sr-caller-residency");
+    for (id texture : {frame.color,frame.depth,frame.motion,frame.output}) [callerResidency addAllocation:texture];
+    [callerResidency commit]; [callerResidency requestResidency];
     std::vector<id<MTL4CommandBuffer>> commands;
     auto begin = [&] { auto command=[gpu.device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
+        [command useResidencySet:callerResidency];
         if (lease) [command useResidencySet:(id<MTLResidencySet>)lease->residency]; commands.push_back(command); return command; };
     auto command = begin();
     if (prepared) {
-        struct Segments { GPU* gpu; id<MTL4CommandAllocator> allocator; std::vector<id<MTL4CommandBuffer>>* commands; };
-        Segments segments{&gpu,allocator,&commands};
+        struct Segments { GPU* gpu; id<MTL4CommandAllocator> allocator; std::vector<id<MTL4CommandBuffer>>* commands; id<MTLResidencySet> residency; };
+        Segments segments{&gpu,allocator,&commands,callerResidency};
         require(prepared->encode((void*)command,(void*)fence,publicLease,&error,false,&segments,[](void* context) -> void* {
             auto& s=*static_cast<Segments*>(context); [s.commands->back() endCommandBuffer];
             auto next=[s.gpu->device newCommandBuffer]; [next beginCommandBufferWithAllocator:s.allocator];
+            [next useResidencySet:s.residency];
             s.commands->push_back(next); return (void*)next;
         }),error.message.c_str());
         [commands.back() endCommandBuffer];
@@ -264,7 +294,12 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
         if(x<4||y<4||x>=260||y>=260) { for(unsigned c=0;c<4;++c) require(result[i+c]==.125f,"outside-output-sentinel"); ++outside; }
         else mean+=result[i];
     }
-    mean/=256*256; require(std::fabs(mean-.5)<.02,"offset-region-value");
+    mean/=256*256;
+    if (std::fabs(mean-.5)>=.02)
+        std::fprintf(stderr,"OWNED_METALFX_OFFSET_DIAGNOSTIC iteration=%u mask=%u public=%u mean=%.9g first=%.9g center=%.9g last=%.9g\n",
+            iteration, mask, unsigned(bool(prepared)), mean, result[(4*264+4)*4],
+            result[(132*264+132)*4], result[(259*264+259)*4]);
+    require(std::fabs(mean-.5)<.02,"offset-region-value");
     unsigned copies=0; uint64_t bytes=0;
     for (unsigned i=0; i<3; ++i) {
         // Public prepare pads readable RGBA16F/R32F/RG16F inputs by compute;
@@ -282,6 +317,7 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
         (unsigned long long)bytes,shadowCopies,unsigned(bool(prepared)));
     ScalerBindings clear(generation->scaler);
     for(auto c:commands) [c release]; [fence release]; [allocator release];
+    [callerResidency endResidency]; [callerResidency release];
     return result;
 }
 // Byte-exact padding oracle: every scratch texel equals the source texel at the
@@ -319,6 +355,100 @@ id<MTLTexture> filled(GPU& gpu, MTLPixelFormat format, unsigned size, size_t bpp
         }
     gpu.upload(result, bytes.data(), size * bpp);
     return result;
+}
+using DispatchThreads = void (*)(id, SEL, MTLSize, MTLSize);
+DispatchThreads originalDispatch = nullptr;
+unsigned observedDispatches = 0;
+void observeDispatch(id encoder, SEL selector, MTLSize extent, MTLSize group) {
+    ++observedDispatches; originalDispatch(encoder, selector, extent, group);
+}
+void fusedColorAlphaProof(GPU& gpu) {
+    unsigned cases = 0;
+    for (auto format : {MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Unorm_sRGB})
+    for (auto transfer : {ColorTransfer::SRGB, ColorTransfer::PQ}) {
+        auto core = std::make_shared<Feature::Impl>(); core->device = retainObject(gpu.device);
+        auto descriptor = [MTL4CompilerDescriptor new];
+        core->compiler = [gpu.device newCompilerWithDescriptor:descriptor error:nil]; [descriptor release];
+        require(core->compiler != nil, "prepass-compiler");
+        core->create = {{128,128},{256,256},FeatureFlagMVLowRes|FeatureFlagIsHDR|FeatureFlagAlphaUpscaling,true,true};
+        core->minScale = [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:gpu.device];
+        core->maxScale = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:gpu.device];
+        PreparedFrame::Impl frame; frame.feature = core;
+        std::vector<uint8_t> input;
+        frame.color = filled(gpu, format, 128, format == MTLPixelFormatRGBA16Float ? 8 : 4, 7, input);
+        frame.depth = texture(gpu,MTLPixelFormatR32Float,128,MTLTextureUsageShaderRead);
+        frame.motion = texture(gpu,MTLPixelFormatRG16Float,128,MTLTextureUsageShaderRead);
+        frame.output = texture(gpu,MTLPixelFormatRGBA16Float,256,MTLTextureUsageShaderWrite);
+        frame.textures = {(void*)frame.color,(void*)frame.depth,(void*)frame.motion,(void*)frame.output};
+        frame.frame.inputContent = {128,128};
+        frame.frame.colorRect = frame.frame.depthRect = frame.frame.motionRect = {0,0,128,128};
+        frame.frame.outputRect = {0,0,256,256};
+        frame.temporalOutputWidth = frame.temporalOutputHeight = 256;
+        frame.needsOutputShadow = true; frame.operations.colorTransfer = transfer;
+        Error error;
+        frame.generation = ensureScaler(*core,frame.frame,frame.textures,frame.operations,&error);
+        require(frame.generation && frame.generation->alphaScaler,"prepass-alpha-generation");
+        FsrPipelineNeeds needs;
+        needs.linearize = needs.alpha = needs.padding = needs.linearizeAlpha = true;
+        require(ensureFsrPipelines(*core,needs,&error),"prepass-pipelines");
+        auto residencyDesc = [MTLResidencySetDescriptor new];
+        auto inputs = [gpu.device newResidencySetWithDescriptor:residencyDesc error:nil]; [residencyDesc release];
+        require(inputs != nil,"prepass-input-residency");
+        [inputs addAllocation:frame.color]; [inputs commit]; [inputs requestResidency];
+        for (metalfx::Rect rect : {metalfx::Rect{0,0,128,128}, {3,5,96,72}, {0,0,127,1}, {1,0,1,128}}) {
+            frame.frame.inputContent = {rect.width,rect.height}; frame.frame.colorRect = rect;
+            std::array<std::vector<uint8_t>,2> reference; unsigned standaloneDispatches = 0;
+            for (bool fused : {false,true}) {
+                auto lease = makeLease(frame,&error); require(bool(lease),error.message.c_str());
+                require(lease->parameterArena != nil, "single-parameter-arena");
+                std::vector<std::pair<uint64_t,uint64_t>> spans;
+                for (const auto& slice : {lease->linearizeParams,lease->maskParams,lease->finishParams,
+                                         lease->alphaParams,lease->debugParams,lease->copyParams}) {
+                    if (!slice) continue;
+                    const uint64_t offset = slice.gpuAddress - lease->parameterArena.gpuAddress;
+                    require(slice.buffer == lease->parameterArena && offset % 256 == 0 &&
+                            offset + slice.length <= lease->parameterArena.length, "parameter-arena-aligned-slices");
+                    spans.emplace_back(offset, offset + slice.length);
+                }
+                std::sort(spans.begin(),spans.end());
+                for (size_t i=1;i<spans.size();++i) require(spans[i-1].second <= spans[i].first,
+                                                        "parameter-arena-disjoint-slices");
+                const auto* constants = static_cast<const uint8_t*>(lease->parameterArena.contents);
+                std::vector<uint8_t> frozen(constants,constants+lease->parameterArena.length);
+                auto concurrentLease = makeLease(frame,&error);
+                require(concurrentLease && concurrentLease->parameterArena != lease->parameterArena &&
+                        !std::memcmp(frozen.data(),lease->parameterArena.contents,frozen.size()),
+                        "active-executions-have-private-immutable-arenas");
+                concurrentLease.reset();
+                auto saved = core->linearizeAlphaPipeline;
+                if (!fused) core->linearizeAlphaPipeline = nil;
+                auto allocator = [gpu.device newCommandAllocator]; auto fence = [gpu.device newFence];
+                auto command = [gpu.device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
+                [command useResidencySet:(id<MTLResidencySet>)lease->residency]; [command useResidencySet:inputs];
+                auto initial = [command computeCommandEncoder];
+                [initial updateFence:fence afterEncoderStages:MTLStageDispatch];
+                auto method = class_getInstanceMethod(object_getClass(initial),@selector(dispatchThreads:threadsPerThreadgroup:));
+                require(method != nullptr,"dispatch-observer");
+                [initial endEncoding]; observedDispatches = 0;
+                originalDispatch = reinterpret_cast<DispatchThreads>(method_setImplementation(method,reinterpret_cast<IMP>(observeDispatch)));
+                const bool accepted = encodePrepassMetal4(frame,*lease,command,fence);
+                method_setImplementation(method,reinterpret_cast<IMP>(originalDispatch));
+                core->linearizeAlphaPipeline = saved;
+                require(accepted,"prepass-encode");
+                [command endCommandBuffer]; gpu.commit({command});
+                std::array<std::vector<uint8_t>,2> actual{readRaw(gpu,lease->linearColor,8),readRaw(gpu,lease->alphaColor,8)};
+                if (!fused) { reference = actual; standaloneDispatches = observedDispatches; }
+                else {
+                    require(actual == reference,"fused-color-alpha-bit-exact-including-padding");
+                    require(observedDispatches + 1 == standaloneDispatches,"one-fewer-native-dispatch");
+                }
+                [command release]; [fence release]; [allocator release];
+            }
+            ++cases;
+        }
+        [inputs endResidency]; [inputs release];
+    }
+    std::printf("OWNED_METALFX_FUSED_PREPASS_PASS cases=%u color_bit_exact=1 alpha_bit_exact=1 padded_origins=1 srgb_hardware_decode=1 one_fewer_dispatch=1 parameter_buffers_per_execution=1 aligned_immutable_slices=1\n", cases);
 }
 unsigned paddingOracle(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
                        const std::shared_ptr<ScalerGeneration>& generation, bool compute,
@@ -360,8 +490,15 @@ unsigned paddingOracle(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     auto allocator = [gpu.device newCommandAllocator]; auto fence = [gpu.device newFence];
     auto command = [gpu.device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
     [command useResidencySet:(id<MTLResidencySet>)lease->residency];
+    auto callerDescriptor = [MTLResidencySetDescriptor new];
+    auto callerResidency = [gpu.device newResidencySetWithDescriptor:callerDescriptor error:nil];
+    [callerDescriptor release]; require(callerResidency != nil, "padding-caller-residency");
+    for (id texture : {frame.color,frame.depth,frame.motion,frame.reactive,frame.composition})
+        if (texture) [callerResidency addAllocation:texture];
+    [callerResidency commit]; [callerResidency requestResidency]; [command useResidencySet:callerResidency];
     require(encodePrepassMetal4(frame, *lease, command, fence), "oracle-encode");
     [command endCommandBuffer]; gpu.commit({command});
+    [callerResidency endResidency]; [callerResidency release];
     unsigned checked = 0;
     const auto expectCopy = [&](id<MTLTexture> staged, const std::vector<uint8_t>& source,
                                 size_t bpp, const metalfx::Rect& rect, const char* name) {
@@ -469,11 +606,17 @@ std::vector<std::vector<float>> runFG(GPU& gpu, id<MTL4Compiler> compiler, bool 
     [scaler release]; [descriptor release]; return results;
 }
 }
-int main() { @autoreleasepool {
+int main(int argc, char** argv) { @autoreleasepool {
     using namespace probe;
+    const bool pipelinesOnly = argc == 2 && std::strcmp(argv[1], "--pipelines-only") == 0;
+    const bool prepassesOnly = argc == 2 && std::strcmp(argv[1], "--prepasses-only") == 0;
+    require(argc == 1 || pipelinesOnly || prepassesOnly, "arguments");
     GPU gpu;
     if (@available(macOS 27.0,*)) {} else require(false,"macos27-offset-contract");
     pipelineBatchProof(gpu.device);
+    if (pipelinesOnly) return 0;
+    fusedColorAlphaProof(gpu);
+    if (prepassesOnly) return 0;
     auto core=std::make_shared<Feature::Impl>(); core->device=retainObject(gpu.device);
     auto d=[MTL4CompilerDescriptor new]; core->compiler=[gpu.device newCompilerWithDescriptor:d error:nil]; [d release];
     require(core->compiler!=nil,"metal4-compiler");

@@ -73,7 +73,7 @@ HRESULT CollectAtomic64PhaseBindings(MTLD3D12Device *device, std::span<const Sta
       if (!buffer || !buffer->current() || !slice.byteLength) return;
       bindings.buffers.push_back({buffer->current(), slice.byteOffset, slice.byteLength, writable, buffer, view, slice.firstElement});
     };
-    auto append_descriptor = [&](const ShaderVisibleDescriptorCPUStorage &descriptor) {
+    auto append_descriptor = [&](const ShaderVisibleDescriptorCPUStorage &descriptor, uint64_t texture_id) {
       if (descriptor.type != ShaderVisibleDescriptorType::ConstantBuffer) {
         const void *backing = nullptr;
         switch (descriptor.type) {
@@ -95,12 +95,12 @@ HRESULT CollectAtomic64PhaseBindings(MTLD3D12Device *device, std::span<const Sta
       switch (descriptor.type) {
       case ShaderVisibleDescriptorType::SRVTexture:
         if (auto *texture = descriptor.SRVTexture.texture; texture && texture->current())
-          bindings.textures.push_back({texture, texture->current(), descriptor.SRVTexture.view, false});
+          bindings.textures.push_back({texture, texture->current(), descriptor.SRVTexture.view, false, 0, 0, texture_id});
         break;
       case ShaderVisibleDescriptorType::UAVTexture:
         if (auto *texture = descriptor.UAVTexture.texture; texture && texture->current())
           bindings.textures.push_back({texture, texture->current(), descriptor.UAVTexture.view, true,
-              descriptor.UAVTexture.first_w_slice, descriptor.UAVTexture.w_size});
+              descriptor.UAVTexture.first_w_slice, descriptor.UAVTexture.w_size, texture_id});
         break;
       case ShaderVisibleDescriptorType::SRVTexelBuffer:
         append_buffer(descriptor.SRVTexelBuffer.buffer, descriptor.SRVTexelBuffer.slice, false, descriptor.SRVTexelBuffer.view);
@@ -126,7 +126,7 @@ HRESULT CollectAtomic64PhaseBindings(MTLD3D12Device *device, std::span<const Sta
         append_buffer(descriptor.SamplerFeedback.buffer, descriptor.SamplerFeedback.slice, true); break;
       case ShaderVisibleDescriptorType::ConstantBuffer: {
         uint64_t offset = 0;
-        auto *allocation = device->LookupBufferByVA(descriptor.ConstantBuffer.address, &offset);
+        auto allocation = device->LookupBufferByVA(descriptor.ConstantBuffer.address, &offset);
         if (allocation && offset <= allocation->byteLength())
           bindings.buffers.push_back({allocation, offset,
               std::min(descriptor.ConstantBuffer.size, allocation->byteLength() - offset), false});
@@ -153,7 +153,7 @@ HRESULT CollectAtomic64PhaseBindings(MTLD3D12Device *device, std::span<const Sta
             }))
           continue;
         for (uint32_t index = 0; index < desc.NumDescriptors; ++index)
-          append_descriptor(table.heap->GetDescriptor(index));
+          append_descriptor(table.heap->GetDescriptor(index), table.heap->GetTextureResourceId(index));
         continue;
       }
       if (table.restrict_to_shader) {
@@ -163,7 +163,7 @@ HRESULT CollectAtomic64PhaseBindings(MTLD3D12Device *device, std::span<const Sta
           const uint64_t first = base + offset;
           count = std::min<uint64_t>(count, desc.NumDescriptors - first);
           for (uint64_t index = 0; index < count; ++index)
-            append_descriptor(table.heap->GetDescriptor(first + index));
+            append_descriptor(table.heap->GetDescriptor(first + index), table.heap->GetTextureResourceId(first + index));
         });
         continue;
       }
@@ -174,13 +174,13 @@ HRESULT CollectAtomic64PhaseBindings(MTLD3D12Device *device, std::span<const Sta
         const uint64_t first = base + range.offset;
         const uint64_t count = std::min<uint64_t>(range.count, desc.NumDescriptors - first);
         for (uint64_t index = 0; index < count; ++index)
-          append_descriptor(table.heap->GetDescriptor(first + index));
+          append_descriptor(table.heap->GetDescriptor(first + index), table.heap->GetTextureResourceId(first + index));
       }
     }
     for (const auto &root : roots) {
       if (!root.address || !root.byteLength) continue;
       uint64_t offset = 0;
-      auto *allocation = device->LookupBufferByVA(root.address, &offset);
+      auto allocation = device->LookupBufferByVA(root.address, &offset);
       if (!allocation || offset >= allocation->byteLength()) continue;
       bindings.buffers.push_back({allocation, offset,
           std::min(root.byteLength, allocation->byteLength() - offset), root.writable});
@@ -522,7 +522,8 @@ struct Atomic64Phase::Storage {
     uint64_t sub_address = 0;
     HRESULT hr = Upload<SM50_ATOMIC64_TYPED_SUBRESOURCE>(subresources, sub_address);
     if (FAILED(hr)) return hr;
-    views.push_back({native_view.gpuResourceID, sub_address, static_cast<uint32_t>(subresources.size()), mip_count,
+    views.push_back({binding.shader_resource_id ? binding.shader_resource_id : native_view.gpuResourceID,
+        sub_address, static_cast<uint32_t>(subresources.size()), mip_count,
         array_count, samples, unit_bytes, static_cast<uint32_t>(descriptor.format), binding.first_w_slice,
         binding.w_size, 0, 0, 0});
     return S_OK;
@@ -594,12 +595,16 @@ HRESULT PrepareAtomic64Phase(MTLD3D12Device *device, uint64_t participant_bound,
       else storage->bindings.buffers[entry->second].writable |= binding.writable;
     }
     std::map<std::tuple<TextureAllocation *, uint64_t, uint16_t, uint16_t>, size_t> texture_indices;
+    std::vector<std::pair<size_t,uint64_t>> texture_ids;
     for (const auto &binding : bindings.textures) {
       const auto [entry, inserted] = texture_indices.emplace(
           std::tuple{binding.allocation.ptr(), binding.view.impl_, binding.first_w_slice, binding.w_size},
           storage->bindings.textures.size());
       if (inserted) storage->bindings.textures.push_back(binding);
       else storage->bindings.textures[entry->second].writable |= binding.writable;
+      if (!inserted && binding.shader_resource_id &&
+          binding.shader_resource_id != storage->bindings.textures[entry->second].shader_resource_id)
+        texture_ids.emplace_back(entry->second,binding.shader_resource_id);
     }
     // Mapping updates use this same lock, and the queue's exclusive execution
     // permit remains held until export retirement. No tile may change identity.
@@ -608,9 +613,20 @@ HRESULT PrepareAtomic64Phase(MTLD3D12Device *device, uint64_t participant_bound,
       const HRESULT hr = storage->AddBuffer(binding);
       if (FAILED(hr)) return hr;
     }
+    size_t texture_index = 0;
     for (const auto &binding : storage->bindings.textures) {
+      const size_t before = storage->views.size();
       const HRESULT hr = storage->AddTexture(binding);
       if (FAILED(hr)) return hr;
+      // Different descriptor-pool slots may name the same physical view. Share
+      // its canonical map/import/export but publish every shader-visible identity.
+      if (storage->views.size() != before) {
+        const auto prototype = storage->views.back();
+        for (const auto &[index,id] : texture_ids) if (index == texture_index) {
+          auto alias = prototype; alias.resourceID = id; storage->views.push_back(alias);
+        }
+      }
+      ++texture_index;
     }
     if (storage->ranges.size() > UINT32_MAX || storage->views.size() > UINT32_MAX) return E_OUTOFMEMORY;
     const uint32_t cells = storage->cells.Count();
@@ -714,7 +730,15 @@ HRESULT Atomic64Phase::ClearContext(WMT::MTL4CommandBuffer command_buffer, WMT::
 }
 
 HRESULT Atomic64Phase::EncodeImport(WMT::MTL4CommandBuffer command_buffer, WMT::Fence fence) {
+  WMT::MTL4ComputeCommandEncoder encoder;
   for (const auto &transfer : storage_->textures) {
+    if (transfer.scattered && transfer.regions.empty()) continue;
+    if (!encoder) {
+      // Sources are read-only and every transfer owns a distinct staging
+      // buffer. Publish all copies together before the import kernel.
+      encoder = command_buffer.blitCommandEncoder();
+      encoder.waitForFence(fence);
+    }
     wmtcmd_blit_copy_from_texture_to_buffer_withblitoption copy{};
     copy.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
     copy.src = transfer.source;
@@ -724,9 +748,6 @@ HRESULT Atomic64Phase::EncodeImport(WMT::MTL4CommandBuffer command_buffer, WMT::
     copy.bytes_per_row = transfer.staging_row_pitch;
     copy.bytes_per_image = transfer.type == WMTTextureType3D ? transfer.staging_slice_pitch : 0;
     if (transfer.scattered) {
-      if (transfer.regions.empty()) continue;
-      auto encoder = command_buffer.blitCommandEncoder();
-      encoder.waitForFence(fence);
       for (const auto &region : transfer.regions) {
         copy.origin = region.origin;
         copy.size = region.size;
@@ -734,16 +755,14 @@ HRESULT Atomic64Phase::EncodeImport(WMT::MTL4CommandBuffer command_buffer, WMT::
         copy.offset = region.offset;
         encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
       }
-      encoder.updateFence(fence);
-      encoder.endEncoding();
     } else {
       copy.size = {transfer.params.width, transfer.params.height, transfer.params.depth};
-      auto encoder = command_buffer.blitCommandEncoder();
-      encoder.waitForFence(fence);
       encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
-      encoder.updateFence(fence);
-      encoder.endEncoding();
     }
+  }
+  if (encoder) {
+    encoder.updateFence(fence);
+    encoder.endEncoding();
   }
   if (storage_->params.cellCount)
     storage_->Dispatch(command_buffer, fence, storage_->pipelines->import, storage_->params,

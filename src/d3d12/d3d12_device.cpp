@@ -17,6 +17,7 @@
  */
 
 #include "d3d12_device.hpp"
+#include "owned_va_registry.hpp"
 #include "d3d12_device_child.hpp"
 #include "d3d12_dxil_subobjects.hpp"
 #include "d3d12_enhanced_barrier.hpp"
@@ -113,14 +114,14 @@ bool ResolveRTASGPUVA(void *context, D3D12_GPU_VIRTUAL_ADDRESS address, uint64_t
     raytracing::BufferLocation &location) {
   auto *device = static_cast<MTLD3D12Device *>(context);
   uint64_t offset = 0;
-  auto *allocation = device->LookupBufferByVA(address, &offset);
+  auto allocation = device->LookupBufferByVA(address, &offset);
   if (!allocation || offset > allocation->byteLength() || requiredBytes > allocation->byteLength() - offset)
     return false;
-  location = {allocation->buffer(), offset, allocation->byteLength() - offset, allocation};
+  location = {allocation->buffer(), offset, allocation->byteLength() - offset, allocation.ptr(), address, allocation};
   return true;
 }
 
-class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt, IMTLD3D12FrameGenerationDevice, IMTLD3D12RayRegenerationDevice, IMTLD3D12Reflex, ID3D12DevicePreview, ID3D12DeviceConfiguration>> {
+class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt, IMTLD3D12FrameGenerationDevice, IMTLD3D12RayRegenerationDevice, IMTLD3D12Reflex, IMTLD3D12AntiLag, ID3D12DevicePreview, ID3D12DeviceConfiguration>> {
 
   Com<IMTLDXGIAdapter> adapter_;
   WMT::Reference<WMT4::Compiler> metal4_compiler_;
@@ -138,6 +139,13 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
 
   d3dalloy::mutex residency_lock_;
   WMT::Reference<WMT::ResidencySet> residency_set_;
+  uint64_t pending_residency_adds_ = 0; // protected by residency_lock_
+  void PublishResidencyLocked() {
+    if (!pending_residency_adds_) return;
+    residency_set_.commit();
+    owned_graphics::Trace("residency_add_batch", ",\"allocations\":", pending_residency_adds_, ",\"commits\":1");
+    pending_residency_adds_ = 0;
+  }
   std::mutex sparse_mapping_queue_mutex_;
   WMT::Reference<WMT::MTL4CommandQueue> sparse_mapping_queue_;
   WMT::Reference<WMT::MTL4CommandAllocator> sparse_mapping_allocator_;
@@ -148,7 +156,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   uint64_t atomic_lock_table_address_ = 0;
   WMT::Reference<WMT::Buffer> atomic64_context_;
   uint64_t atomic64_context_address_ = 0;
-  std::map<uint64_t, BufferAllocation *> interval_map_;
+  OwnedVARegistry<Rc<BufferAllocation>> va_registry_{buffer_va_generation};
   d3dalloy::mutex swizzle_texture_lock_;
   std::unordered_map<const void *, MTLD3D12Resource *> descriptor_resources_;
   std::atomic<uint32_t> swizzle_texture_count_{0};
@@ -260,15 +268,33 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   }
 
 public:
+  template <typename Action> HRESULT LatencyCall(Action &&action) {
+    try {
+      return action();
+    } catch (const std::bad_alloc &) {
+      ReportRemoval(E_OUTOFMEMORY);
+      return E_OUTOFMEMORY;
+    }
+  }
   HRESULT STDMETHODCALLTYPE SetReflexMode(BOOL low, UINT interval, BOOL markers) override {
     return reflex.SetMode(low, interval, markers);
   }
   HRESULT STDMETHODCALLTYPE GetReflexStatus(BOOL *low, UINT *sleep, BOOL *game) override {
     return reflex.Status(low, sleep, game);
   }
-  HRESULT STDMETHODCALLTYPE ReflexSleep() override { return reflex.Sleep(); }
-  HRESULT STDMETHODCALLTYPE ReflexMarker(UINT64 frame, UINT marker) override { return reflex.Marker(frame, marker); }
+  HRESULT STDMETHODCALLTYPE ReflexSleep() override { return LatencyCall([&] { return reflex.Sleep(); }); }
+  HRESULT STDMETHODCALLTYPE ReflexMarker(UINT64 frame, UINT marker) override {
+    return LatencyCall([&] { return reflex.Marker(frame, marker); });
+  }
   HRESULT STDMETHODCALLTYPE GetReflexReports(D3DALLOY_REFLEX_REPORT *reports) override { return reflex.Reports(reports); }
+  HRESULT STDMETHODCALLTYPE SetAntiLagMode(BOOL low, UINT interval) override {
+    return reflex.SetAntiLagMode(low, interval);
+  }
+  HRESULT STDMETHODCALLTYPE AntiLagSleep() override { return LatencyCall([&] { return reflex.AntiLagSleep(); }); }
+  HRESULT STDMETHODCALLTYPE AntiLagEndFrame() override { return reflex.EndFrame(); }
+  HRESULT STDMETHODCALLTYPE AntiLagFrameType(BOOL interpolated) override {
+    return LatencyCall([&] { return reflex.FrameType(interpolated); });
+  }
 
   HRESULT RemovedReason() const override {
     return removal_reason_.load(std::memory_order_acquire);
@@ -313,7 +339,10 @@ public:
       adapter_(adapter), command_library(adapter_->GetMTLDevice()),
       rtas_mirror_([this](uint64_t slot_count) { return CreateRTASMirrorPage(slot_count); }) {}
 
-  ~MTLD3D12DeviceImpl() { UnregisterExperimentalDevice(experimental_registration_); }
+  ~MTLD3D12DeviceImpl() {
+    if (metal4_compiler_) metal4_compiler_.FlushArchive();
+    UnregisterExperimentalDevice(experimental_registration_);
+  }
 
   HRESULT RegisterExperimentalFeatures() {
     return RegisterExperimentalDevice(this, experimental_registration_);
@@ -490,6 +519,11 @@ public:
     }
     if (riid == __uuidof(IMTLD3D12Reflex)) {
       *ppvObject = static_cast<IMTLD3D12Reflex *>(this);
+      AddRef();
+      return S_OK;
+    }
+    if (riid == __uuidof(IMTLD3D12AntiLag)) {
+      *ppvObject = static_cast<IMTLD3D12AntiLag *>(this);
       AddRef();
       return S_OK;
     }
@@ -2566,7 +2600,10 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS Kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS Control) {
-    return d3dalloy::ShaderCacheControl(Kinds, Control);
+    const HRESULT result=d3dalloy::ShaderCacheControl(Kinds, Control);
+    if (SUCCEEDED(result) && (Kinds & D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED))
+      WMT4::Compiler::ControlArchive(uint32_t(Control));
+    return result;
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -2861,6 +2898,8 @@ public:
 
   WMT::ResidencySet
   GetGlobalResidencySet() {
+    std::lock_guard<d3dalloy::mutex> lock(residency_lock_);
+    PublishResidencyLocked();
     return residency_set_;
   };
 
@@ -2871,6 +2910,7 @@ public:
     // during that traversal. Share the mutation lock only through native commit;
     // GPU waits and C++ retirement/destruction run after this guard is released.
     std::lock_guard<d3dalloy::mutex> lock(residency_lock_);
+    PublishResidencyLocked();
     return queue.commit(buffers, count);
   }
 
@@ -2961,7 +3001,7 @@ public:
       try {
         if (!owner || owner->ResidencyReferenceCount()) {
           residency_set_.addAllocations(&allocation, 1);
-          residency_set_.commit();
+          ++pending_residency_adds_;
         }
       } catch (...) {
         if (owner_registered)
@@ -3115,29 +3155,27 @@ public:
       return E_OUTOFMEMORY;
     try {
       std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
-      auto [entry, inserted] = interval_map_.emplace(allocation->gpuAddress(), allocation);
-      if (!inserted)
+      if (!va_registry_.Insert(allocation->gpuAddress(), allocation->byteLength(), allocation))
         return E_INVALIDARG;
-      buffer_va_generation.fetch_add(1, std::memory_order_release);
       if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
         return S_OK;
       auto buffer = allocation->buffer();
       try {
         if (owner) {
           if (!owner->AddResidencyAllocation(buffer)) {
-            interval_map_.erase(entry);
+            va_registry_.Remove(allocation->gpuAddress());
             return E_OUTOFMEMORY;
           }
           if (!owner->SupportsResidency())
             owner->InitializeResidency(initially_resident);
         }
       } catch (...) {
-        interval_map_.erase(entry);
+        va_registry_.Remove(allocation->gpuAddress());
         throw;
       }
       if (!owner || initially_resident) {
         residency_set_.addAllocations(&buffer, 1);
-        residency_set_.commit();
+        ++pending_residency_adds_;
       }
       return S_OK;
     } catch (const std::bad_alloc &) {
@@ -3188,8 +3226,7 @@ public:
     if (!allocation)
       return E_INVALIDARG;
     std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
-    interval_map_.erase(allocation->gpuAddress());
-    buffer_va_generation.fetch_add(1, std::memory_order_release);
+    auto registered_owner = va_registry_.Remove(allocation->gpuAddress());
     /*
      * Every acceleration structure that lived in this allocation dies with it, so each of its
      * versions is released here: this is D3D12's own lifetime rule (the application may not free
@@ -3223,35 +3260,18 @@ public:
     return S_OK;
   }
 
-  BufferAllocation *
+  Rc<BufferAllocation>
   LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) {
     uint64_t begin, end, generation;
     return LookupBufferRangeByVA(VA, pOffset, &begin, &end, &generation);
   }
 
-  BufferAllocation *
+  Rc<BufferAllocation>
   LookupBufferRangeByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pBegin, uint64_t *pEnd,
                         uint64_t *pGeneration) {
-    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
-    *pGeneration = buffer_va_generation.load(std::memory_order_relaxed);
-    *pBegin = *pEnd = 0;
-    auto iter = interval_map_.upper_bound(VA);
-    const uint64_t next = iter == interval_map_.end() ? UINT64_MAX : iter->first;
-    if (iter == interval_map_.begin()) {
-      *pOffset = 0;
-      return {};
-    }
-    --iter;
-    *pOffset = VA - iter->first;
-    if (*pOffset >= iter->second->byteLength()) {
-      *pOffset = 0;
-      return {};
-    }
-    // A later registered start (aliasing placed buffers) wins the lookup, so the result
-    // holds only up to the next key.
-    *pBegin = iter->first;
-    *pEnd = iter->first + std::min<uint64_t>(iter->second->byteLength(), next - iter->first);
-    return iter->second;
+    auto pin = va_registry_.Lookup(VA);
+    *pOffset = pin.offset; *pBegin = pin.begin; *pEnd = pin.end; *pGeneration = pin.generation;
+    return std::move(pin.owner);
   }
 
   InternalCommandLibrary &

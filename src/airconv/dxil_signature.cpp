@@ -11,6 +11,8 @@
 #include "dxil_signature.hpp"
 #include "dxil_quad_layout.hpp"
 
+#include <algorithm>
+
 #include "air_signature.hpp"
 #include "airconv_context.hpp"
 #include "airconv_public.h"
@@ -252,20 +254,25 @@ void PrepareModuleStorage(llvm::Module &module) {
   }
 }
 
-const SignatureSlot *StageSignature::find_input(uint32_t element_id, uint32_t row) const {
-  for (auto &slot : inputs) {
-    if (slot.element_id == element_id && row >= slot.element_row && row - slot.element_row < slot.rows)
-      return &slot;
+static const SignatureSlot *find_slot(
+  const std::vector<SignatureSlot> &slots, uint32_t element_id, uint32_t row
+) {
+  auto it = std::lower_bound(slots.begin(), slots.end(), element_id, [](const SignatureSlot &slot, uint32_t id) {
+    return slot.element_id < id;
+  });
+  for (; it != slots.end() && it->element_id == element_id; ++it) {
+    if (row >= it->element_row && row - it->element_row < it->rows)
+      return &*it;
   }
   return nullptr;
 }
 
+const SignatureSlot *StageSignature::find_input(uint32_t element_id, uint32_t row) const {
+  return find_slot(inputs, element_id, row);
+}
+
 const SignatureSlot *StageSignature::find_output(uint32_t element_id, uint32_t row) const {
-  for (auto &slot : outputs) {
-    if (slot.element_id == element_id && row >= slot.element_row && row - slot.element_row < slot.rows)
-      return &slot;
-  }
-  return nullptr;
+  return find_slot(outputs, element_id, row);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -839,6 +846,13 @@ llvm::Error DeclareStageSignature(
     }
   }
 
+  // Chunk rows can share an ID. Stable order preserves the first matching row
+  // range without assuming dense IDs or changing declaration/epilogue order.
+  const auto by_id = [](const SignatureSlot &a, const SignatureSlot &b) {
+    return a.element_id < b.element_id;
+  };
+  std::stable_sort(out_signature.inputs.begin(), out_signature.inputs.end(), by_id);
+  std::stable_sort(out_signature.outputs.begin(), out_signature.outputs.end(), by_id);
   return llvm::Error::success();
 }
 
@@ -1067,7 +1081,10 @@ llvm::Error lower_store_output(
     return llvm::Error::success();
   }
 
-  value = widen_io_value(builder, value, element->comp_type);
+  if (signature.raw_half_outputs && element->comp_type == kComponentFloat16 && value->getType()->isHalfTy())
+    value = builder.CreateZExt(builder.CreateBitCast(value, builder.getInt16Ty()), builder.getInt32Ty());
+  else
+    value = widen_io_value(builder, value, element->comp_type);
   auto *registers =
     value->getType()->isFloatTy() ? ctx.resource.output.ptr_float4 : ctx.resource.output.ptr_int4;
   auto *registers_type =
@@ -1444,6 +1461,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     dxbc::args_get_data<SM50_SHADER_GS_PASS_THROUGH, SM50_SHADER_GS_PASS_THROUGH_DATA>(args, &gs_passthrough) &&
     gs_passthrough->RasterizationDisabled;
   SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *so_capture = nullptr;
+  SM50_SHADER_D3D12_MSAA_VERTEX_DATA *msaa_vertex = nullptr;
+  dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_VERTEX, SM50_SHADER_D3D12_MSAA_VERTEX_DATA>(args, &msaa_vertex);
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *index_pull = nullptr;
   if (dxbc::args_get_data<SM50_SHADER_D3D12_INDEX_PULL, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(args, &index_pull) &&
       module.stage != Stage::Vertex)
@@ -1455,8 +1474,6 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
       )) {
     if (module.stage != Stage::Vertex)
       return unsupported("stream output capture outside a vertex shader");
-    SM50_SHADER_D3D12_MSAA_VERTEX_DATA *msaa_vertex = nullptr;
-    dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_VERTEX, SM50_SHADER_D3D12_MSAA_VERTEX_DATA>(args, &msaa_vertex);
     if (index_pull && !(msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE))
       return unsupported("standalone index pulling and stream output on the same vertex shader");
     for (uint32_t i = 0; i < so_capture->num_elements; i++) {
@@ -1756,6 +1773,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     .pso_sample_mask = pso_sample_mask,
     .shader_type = shader_type,
     .metal_version = metal_version,
+    .capture_raw_distance_output = msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE,
   };
 
   if (so_capture)

@@ -109,6 +109,9 @@ std::vector<IOElement> read_elements(const llvm::MDNode *list) {
           element.stream = u32_at(properties, k + 1);
     elements.push_back(std::move(element));
   }
+  std::stable_sort(elements.begin(), elements.end(), [](const IOElement &a, const IOElement &b) {
+    return a.id < b.id;
+  });
   return elements;
 }
 
@@ -229,10 +232,10 @@ llvm::Expected<EntrySignature> ReadEntrySignature(const ModuleInfo &info) {
 }
 
 const IOElement *FindElement(const std::vector<IOElement> &elements, uint32_t id) {
-  for (auto &element : elements)
-    if (element.id == id)
-      return &element;
-  return nullptr;
+  auto it = std::lower_bound(elements.begin(), elements.end(), id, [](const IOElement &element, uint32_t id) {
+    return element.id < id;
+  });
+  return it != elements.end() && it->id == id ? &*it : nullptr;
 }
 
 std::vector<dxbc::Signature> BuildOutputSignature(const std::vector<SigElement> &elements) {
@@ -304,16 +307,22 @@ llvm::Expected<uint32_t> ConstantOperand(const llvm::CallInst &call, unsigned in
   );
 }
 
-llvm::SmallVector<llvm::CallInst *, 16> CollectCalls(llvm::Function &function, llvm::StringRef name) {
-  llvm::SmallVector<llvm::CallInst *, 16> calls;
-  std::string prefix = ("dx.op." + name + ".").str();
-  std::string exact = ("dx.op." + name).str();
+llvm::StringMap<llvm::SmallVector<llvm::CallInst *, 16>>
+CollectCalls(llvm::Function &function, llvm::ArrayRef<llvm::StringRef> names) {
+  llvm::StringMap<llvm::SmallVector<llvm::CallInst *, 16>> calls;
+  for (auto name : names)
+    calls[name];
   for (auto &block : function)
     for (auto &instruction : block)
       if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction))
-        if (auto *callee = call->getCalledFunction())
-          if (callee->getName().startswith(prefix) || callee->getName() == exact)
-            calls.push_back(call);
+        if (auto *callee = call->getCalledFunction()) {
+          auto name = callee->getName();
+          if (!name.consume_front("dx.op."))
+            continue;
+          auto found = calls.find(name.split('.').first);
+          if (found != calls.end())
+            found->second.push_back(call);
+        }
   return calls;
 }
 
@@ -471,8 +480,11 @@ llvm::Error lower_geometry_body(PipelineStage &stage, dxbc::context &ctx) {
   auto &builder = ctx.builder;
   auto &function = *ctx.function;
   auto &signature = stage.signature;
+  auto calls = CollectCalls(function, {
+    "loadInput", "storeOutput", "emitStream", "cutStream", "emitThenCutStream", "gsInstanceID", "primitiveID"
+  });
 
-  for (auto *call : CollectCalls(function, "loadInput")) {
+  for (auto *call : calls["loadInput"]) {
     auto id = ConstantOperand(*call, 1);
     auto col = ConstantOperand(*call, 3);
     if (!id) return id.takeError();
@@ -491,7 +503,7 @@ llvm::Error lower_geometry_body(PipelineStage &stage, dxbc::context &ctx) {
     call->eraseFromParent();
   }
 
-  for (auto *call : CollectCalls(function, "storeOutput")) {
+  for (auto *call : calls["storeOutput"]) {
     auto id = ConstantOperand(*call, 1);
     auto col = ConstantOperand(*call, 3);
     if (!id) return id.takeError();
@@ -509,7 +521,7 @@ llvm::Error lower_geometry_body(PipelineStage &stage, dxbc::context &ctx) {
   }
 
   for (llvm::StringRef name : {"emitStream", "cutStream", "emitThenCutStream"}) {
-    for (auto *call : CollectCalls(function, name)) {
+    for (auto *call : calls[name]) {
       auto opcode = ConstantOperand(*call, 0);
       auto stream = ConstantOperand(*call, 1);
       if (!opcode) return opcode.takeError();
@@ -535,7 +547,7 @@ llvm::Error lower_geometry_body(PipelineStage &stage, dxbc::context &ctx) {
 
   for (auto [name, value] : {std::pair<llvm::StringRef, llvm::Value *>{"gsInstanceID", ctx.resource.gs_instance_id},
                              {"primitiveID", ctx.resource.patch_id}}) {
-    for (auto *call : CollectCalls(function, name)) {
+    for (auto *call : calls[name]) {
       if (!value)
         return createError("dx.op." + name + " is not available in this stage");
       builder.SetInsertPoint(call);
@@ -720,6 +732,35 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
       if (module->getDataLayout().getPointerSizeInBits() != 64)
         initializeModule(*module);
     }
+  }
+  if (kind == PipelineKind::TessellationObject && stages[0].info && stages[1].info) {
+    // Only this register file is wholly inside one compiled object function.
+    // Native F16 container signatures must agree in both directions. Mixed
+    // bytecode, minimum precision, position and raster varyings keep float32.
+    const auto &outputs = stages[0].info->output_sig;
+    const auto &inputs = stages[1].info->input_sig;
+    const auto matching_half = [](const SigElement &element, const std::vector<SigElement> &other) {
+      return element.semantic_kind == 0 && std::any_of(other.begin(), other.end(), [&](const SigElement &match) {
+        return match.comp_type == element.comp_type && match.semantic_kind == element.semantic_kind &&
+               match.name == element.name && match.semantic_index == element.semantic_index &&
+               match.start_row == element.start_row && match.start_col == element.start_col &&
+               match.rows == element.rows && match.mask == element.mask;
+      });
+    };
+    bool has_half = false, compatible = true;
+    for (const auto &element : outputs)
+      if (element.comp_type == 6) { // D3D_REGISTER_COMPONENT_FLOAT16
+        has_half = true;
+        compatible &= matching_half(element, inputs);
+      }
+    for (const auto &element : inputs)
+      if (element.comp_type == 6)
+        compatible &= matching_half(element, outputs);
+    stages[0].vertex_signature.raw_half_outputs = stages[1].raw_half_inputs = has_half && compatible;
+  }
+  for (auto &stage : stages) {
+    if (!stage.info)
+      continue;
     auto bind = [&]() -> llvm::Error {
       switch (stage.info->stage) {
       case Stage::Vertex:

@@ -611,9 +611,9 @@ protected:
   std::mutex indirect_pso_mutex;
   std::mutex color_write_mask_pso_mutex;
   std::map<uint8_t, WMT::Reference<WMT::RenderPipelineState>> color_write_mask_psos;
-  std::vector<uint8_t> pull_vs_bytecode;
+  SharedShaderBytecode pull_vs_bytecode;
   // The explicit root signature is shared by every lazy graphics variant.
-  std::vector<uint8_t> pull_root_blob;
+  SharedShaderBytecode pull_root_blob;
   std::vector<SM50_IA_INPUT_ELEMENT> pull_ia_elements;
   bool supports_index_pull = false;
   WMT::Reference<WMT4::Function> pull_vertex_function;
@@ -621,7 +621,7 @@ protected:
   WMT::Reference<WMT::RenderPipelineState> pull_indirect_pso;
   std::mutex pull_pso_mutex;
   std::vector<StreamOutputLayout::Element> statistics_capture_elements;
-  std::vector<uint8_t> statistics_ps_bytecode;
+  SharedShaderBytecode statistics_ps_bytecode;
   std::string statistics_ps_name;
   uint32_t statistics_ps_sample_mask = 0;
   bool sample_mask_constant = false;
@@ -651,9 +651,9 @@ protected:
   std::mutex mesh_pso_mutex;
   std::map<uint32_t, MeshPipelineVariant> mesh_variants;
   /* Everything a mesh variant is compiled from. Stage bytecode is owned: variants are built lazily. */
-  std::vector<uint8_t> mesh_gs_bytecode, mesh_hs_bytecode, mesh_ds_bytecode;
+  SharedShaderBytecode mesh_gs_bytecode, mesh_hs_bytecode, mesh_ds_bytecode;
   /* MeshShader: AS (empty without one) and MS bytecode, and the root signature blob (empty: embedded in MS). */
-  std::vector<uint8_t> mesh_as_bytecode, mesh_ms_bytecode;
+  SharedShaderBytecode mesh_as_bytecode, mesh_ms_bytecode;
   WMTMeshRenderPipelineInfo mesh_info{};
   uint32_t mesh_max_potential_tess_factor = 0;
   bool mesh_rasterization_disabled = false;
@@ -685,7 +685,7 @@ protected:
 
   /* Validates and retains the AS/MS of a mesh-shader pipeline (MeshShaderTier 1). */
   HRESULT InitializeMeshShaderStages(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, const GraphicsPipelineExtras &extras) {
-    auto stage = [&](const char *name, const D3D12_SHADER_BYTECODE &bytecode, std::vector<uint8_t> &out,
+    auto stage = [&](const char *name, const D3D12_SHADER_BYTECODE &bytecode, SharedShaderBytecode &out,
                      std::array<uint32_t, 3> &threads) -> HRESULT {
       MTL_SHADER_REFLECTION reflection{};
       SM50Shader shader;
@@ -693,8 +693,7 @@ protected:
         return hr;
       threads = {reflection.ThreadgroupSize[0], reflection.ThreadgroupSize[1], reflection.ThreadgroupSize[2]};
       uses_atomic64 |= reflection.HasAtomic64 != 0;
-      const auto *source = static_cast<const uint8_t *>(bytecode.pShaderBytecode);
-      out.assign(source, source + bytecode.BytecodeLength);
+      out = device_->GetShaderArtifactCache().RetainBytecode(bytecode.pShaderBytecode, bytecode.BytecodeLength);
       return S_OK;
     };
     HRESULT hr;
@@ -739,9 +738,8 @@ protected:
 
   /* Validates and retains the GS or HS/DS stages of a mesh pipeline. */
   HRESULT InitializeMeshStages(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {
-    auto copy = [](const D3D12_SHADER_BYTECODE &bytecode, std::vector<uint8_t> &out) {
-      const auto *source = static_cast<const uint8_t *>(bytecode.pShaderBytecode);
-      out.assign(source, source + bytecode.BytecodeLength);
+    auto copy = [&](const D3D12_SHADER_BYTECODE &bytecode, SharedShaderBytecode &out) {
+      out = device_->GetShaderArtifactCache().RetainBytecode(bytecode.pShaderBytecode, bytecode.BytecodeLength);
     };
     MTL_SHADER_REFLECTION reflection{};
     SM50Shader shader;
@@ -837,7 +835,7 @@ protected:
     claim.next = &common;
     if (mesh_statistics_claim)
       stats.next = &claim;
-    auto compile = [&](const char *stage, const char *name, const std::vector<uint8_t> &bytecode,
+    auto compile = [&](const char *stage, const char *name, const SharedShaderBytecode &bytecode,
                        ShaderImmutableConstants &constants, SM50ShaderBitcode &bitcode,
                        WMT::Reference<WMT4::Function> &function) -> HRESULT {
       SM50Shader shader;
@@ -943,7 +941,7 @@ protected:
     const bool tess_geometry = mesh_kind == MeshPipelineKind::TessellationGeometry;
     // TS+GS: pass 1 is VS+HS / DS capture, pass 2 (kMeshTessellationGeometryPass) capture fetch / GS.
     const bool gs_pass = geometry || (tess_geometry && (key & kMeshTessellationGeometryPass));
-    auto initialize = [&](SM50Shader &shader, const std::vector<uint8_t> &source, sm50_error_t *error) {
+    auto initialize = [&](SM50Shader &shader, const SharedShaderBytecode &source, sm50_error_t *error) {
       return sm50_shader_t(shader) ? 0 : device_->GetShaderArtifactCache().InitializeCompiler(
           {source.data(), source.size()}, &shader, error);
     };
@@ -987,7 +985,7 @@ protected:
     const void *root_blob = pull_root_blob.empty() ? nullptr : pull_root_blob.data();
     const size_t root_length = pull_root_blob.size();
     auto root = [&](SM50_SHADER_ROOT_SIGNATURE_DATA &data, SM50_SHADER_COMPILATION_ARGUMENT_TYPE type,
-                    const std::vector<uint8_t> &embedded, void *next) {
+                    const SharedShaderBytecode &embedded, void *next) {
       data.type = type;
       data.bytecode = root_blob ? root_blob : embedded.data();
       data.bytecode_length = root_blob ? root_length : embedded.size();
@@ -1432,7 +1430,7 @@ public:
       // NEVER with writes/stencil disabled preserves the early/late PS contract.
       WMTDepthStencilInfo reject{};
       reject.depth_compare_function = WMTCompareFunctionNever;
-      depth_bounds_reject_state = device_->GetMTLDevice().newDepthStencilState(reject);
+      depth_bounds_reject_state = device_->owned_native_states.DepthStencil(device_->GetMTLDevice(),reject);
     }
     WMTDepthStencilInfo info;
     info.depth_compare_function = WMTCompareFunctionAlways;
@@ -1467,11 +1465,11 @@ public:
     }
 
     auto metal = device_->GetMTLDevice();
-    dsso = metal.newDepthStencilState(info);
+    dsso = device_->owned_native_states.DepthStencil(metal,info);
     if (info.depth_write_enabled) {
       auto info_depth_readonly = info;
       info_depth_readonly.depth_write_enabled = false;
-      dsso_depth_readonly = metal.newDepthStencilState(info_depth_readonly);
+      dsso_depth_readonly = device_->owned_native_states.DepthStencil(metal,info_depth_readonly);
     } else {
       dsso_depth_readonly = dsso;
     }
@@ -1488,10 +1486,10 @@ public:
       info_stencil_readonly.front_stencil.stencil_fail_op = WMTStencilOperationKeep;
       info_stencil_readonly.front_stencil.depth_stencil_pass_op = WMTStencilOperationKeep;
       info_stencil_readonly.front_stencil.depth_fail_op = WMTStencilOperationKeep;
-      dsso_stencil_readonly = metal.newDepthStencilState(info_stencil_readonly);
+      dsso_stencil_readonly = device_->owned_native_states.DepthStencil(metal,info_stencil_readonly);
       if (info.depth_write_enabled) {
         info_stencil_readonly.depth_write_enabled = false;
-        dsso_readonly = metal.newDepthStencilState(info_stencil_readonly);
+        dsso_readonly = device_->owned_native_states.DepthStencil(metal,info_stencil_readonly);
       } else {
         dsso_readonly = dsso_stencil_readonly;
       }
@@ -1500,10 +1498,10 @@ public:
       auto info_nostencil = info;
       info_nostencil.back_stencil.enabled = false;
       info_nostencil.front_stencil.enabled = false;
-      dsso_no_stencil = metal.newDepthStencilState(info_nostencil);
+      dsso_no_stencil = device_->owned_native_states.DepthStencil(metal,info_nostencil);
       if (info.depth_write_enabled) {
         info_nostencil.depth_write_enabled = false;
-        dsso_readonly_no_stencil = metal.newDepthStencilState(info_nostencil);
+        dsso_readonly_no_stencil = device_->owned_native_states.DepthStencil(metal,info_nostencil);
       } else {
         dsso_readonly_no_stencil = dsso_no_stencil;
       }
@@ -1694,8 +1692,7 @@ public:
       supports_index_pull = !stream_output.active &&
                             (pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE ||
                              pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
-      const auto *source = static_cast<const uint8_t *>(pDesc->VS.pShaderBytecode);
-      pull_vs_bytecode.assign(source, source + pDesc->VS.BytecodeLength);
+      pull_vs_bytecode = device_->GetShaderArtifactCache().RetainBytecode(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength);
       pull_ia_elements = elements;
 
       // Stream output: the VS epilogue writes each declared element into its capture record.
@@ -1738,9 +1735,8 @@ public:
         rootsig.bytecode_length = pDesc->VS.BytecodeLength;
       }
       rootsig.next = &data_ia_layout;
-      const auto *root_source = static_cast<const uint8_t *>(rootsig.bytecode);
       if (pDesc->pRootSignature)
-        pull_root_blob.assign(root_source, root_source + rootsig.bytecode_length);
+        pull_root_blob = device_->GetShaderArtifactCache().RetainBytecode(rootsig.bytecode, rootsig.bytecode_length);
 
       if (mesh) {
         // The VS is compiled into each mesh variant's object function (BuildMeshPipeline).
@@ -1775,7 +1771,7 @@ public:
       if (pDesc->pRootSignature) {
         const void *blob = nullptr;
         const size_t size = static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&blob);
-        pull_root_blob.assign(static_cast<const uint8_t *>(blob), static_cast<const uint8_t *>(blob) + size);
+        pull_root_blob = device_->GetShaderArtifactCache().RetainBytecode(blob, size);
       }
     } else {
       ERR("no vertex shader");
@@ -1844,9 +1840,8 @@ public:
     }
 
     if (use_fragment) {
-      const auto *source = static_cast<const uint8_t *>(pDesc->PS.pShaderBytecode);
-      statistics_ps_bytecode.assign(source, source + pDesc->PS.BytecodeLength);
-      auto sha1 = Sha1HashState::compute(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
+      statistics_ps_bytecode = device_->GetShaderArtifactCache().RetainBytecode(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
+      auto sha1 = statistics_ps_bytecode.digest();
 
       std::string ps_name = "ps_main" + sha1.string().substr(0, 8);
 
@@ -2068,6 +2063,11 @@ public:
     }
 
     return E_NOINTERFACE;
+  }
+
+  HRESULT GetPrivateCachedBlob(ID3DBlob **blob) override {
+    if (!WaitNativePipeline()) { if (blob) *blob = nullptr; return E_FAIL; }
+    return cache_.GetPrivateBlob(blob);
   }
 
   virtual HRESULT STDMETHODCALLTYPE

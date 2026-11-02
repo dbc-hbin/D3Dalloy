@@ -22,6 +22,7 @@
 #include "Metal4Pipeline.hpp"
 #include "d3d12_interfaces_ext.hpp"
 #include "d3d12_reflex.hpp"
+#include "d3d12_antilag_interfaces.hpp"
 #include "d3d12_diagnostics.hpp"
 #include "d3d12_acceleration_structure.hpp"
 #include "d3d12_command_encoder.hpp"
@@ -48,6 +49,7 @@
 #include "owned_rtas_lifetime.hpp"
 #include "owned_rtas_mirror.hpp"
 #include "owned_async_pipeline.hpp"
+#include "owned_native_states.hpp"
 #include "config/config.hpp"
 #include "thread.hpp"
 #include <algorithm>
@@ -201,7 +203,7 @@ public:
                           std::shared_ptr<std::atomic<bool>> observer_fault,
                           D3DalloyPresentComposition composition, bool do_not_wait,
                           std::shared_ptr<D3DalloyPresentLatency> latency, bool restart, bool borrowed,
-                          bool closes_frame) = 0;
+                          bool closes_frame, std::shared_ptr<owned_graphics::LowLatencyScheduler::Frame> *latency_frame) = 0;
 };
 
 class MTLD3D12Resource : public ID3D12Resource2 {
@@ -463,6 +465,9 @@ public:
   UINT IsComputePipelineState;
   bool uses_atomic64 = false;
   std::vector<MTL_SM50_SHADER_ARGUMENT> resource_bindings;
+  // Private C++ interface: named libraries retain this immutable snapshot rather
+  // than round-tripping through the application's writable GetCachedBlob copy.
+  virtual HRESULT GetPrivateCachedBlob(ID3DBlob **blob) { return GetCachedBlob(blob); }
 
   static HRESULT
   InitializeShader(
@@ -917,7 +922,7 @@ public:
   RuntimeConfiguration runtime_configuration;
   bool independent_device = false;
   DeviceDiagnostics diagnostics{this};
-  ReflexState reflex;
+  ReflexState reflex{Config::getInstance().getOption<bool>("d3d12.lowLatency", false)};
   GPUExecutionGate gpu_execution_gate;
   AsyncPipelineCompiler async_pipelines{Config::getInstance().getOption<bool>("d3d12.asyncPipelineCompile", false),
                                         Config::getInstance().getOption<int32_t>("d3d12.asyncPipelineCompileThreads", 0)};
@@ -981,10 +986,10 @@ public:
       BufferAllocation *allocation, MTLD3D12PageableResidency *owner = nullptr
   ) = 0;
 
-  virtual BufferAllocation *LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
+  virtual Rc<BufferAllocation> LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
   /* LookupBufferByVA that also reports the VA interval [*pBegin, *pEnd) over which the same
    * allocation is returned and the map generation observed; *pEnd is 0 for a null result. */
-  virtual BufferAllocation *LookupBufferRangeByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pBegin,
+  virtual Rc<BufferAllocation> LookupBufferRangeByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pBegin,
                                                   uint64_t *pEnd, uint64_t *pGeneration) = 0;
   /* Advances whenever the VA map gains or loses a buffer; a cached lookup result is reusable
    * only while this value is unchanged. */
@@ -1047,11 +1052,42 @@ public:
 
   EventListener event_listener;
 
-  // Publish all feature-history dependencies of one temporal-containing Metal
-  // command buffer atomically with respect to other queues on this device.
-  // Queue workers acquire this only after reserving their submission-ring slot.
-  std::mutex owned_temporal_submission_mutex;
+  // Resource state publication remains device-wide; temporal history uses
+  // independent per-feature reservations owned by the submitting segment.
   std::mutex owned_barrier_state_mutex;
+  OwnedNativeStates owned_native_states;
+
+  // Fixed-source, unspecialized command helpers. Only immutable native objects
+  // are shared; argument tables and recording state remain command-list local.
+  std::mutex owned_helper_pipeline_mutex;
+  WMT::Reference<WMT::Library> owned_predication_library;
+  std::array<WMT::Reference<WMT::ComputePipelineState>, 8> owned_predication_pipelines;
+  std::array<WMT::Reference<WMT::ComputePipelineState>, 2> owned_feedback_pipelines;
+  enum class CommandHelper {
+    D24Upload, D24Readback, RGB32Expand, RGB32Compact, Packed422Expand, Packed422Compact,
+    StreamOutputAssemble, StreamOutputPositions, StreamOutputIndirect, StreamOutputGS,
+    MSAAAssembly, MSAABounds, AtomicCopyU32, AtomicCopyU64, MatrixConversion, RaysIndirect, Count
+  };
+  struct CommandHelperEntry {
+    WMT::Reference<WMT::Library> library;
+    WMT::Reference<WMT::ComputePipelineState> pipeline;
+  };
+  std::array<CommandHelperEntry, size_t(CommandHelper::Count)> owned_command_helpers;
+
+  struct ResolvePipelineKey {
+    uint32_t attachment_format, raster_sample_count;
+    uint8_t fragment_kind, dsv_plane, depth_write_enabled, stencil_enabled;
+    bool operator==(const ResolvePipelineKey &) const = default;
+  };
+  struct ResolvePipelineCacheEntry {
+    ResolvePipelineKey key{};
+    WMT::Reference<WMT::RenderPipelineState> pipeline;
+    WMT::Reference<WMT::DepthStencilState> depth_stencil_state;
+  };
+  // Bounded device lookup; command-list hot entries and recorded passes retain
+  // evicted objects independently. No resource/encoder binding is stored here.
+  std::array<ResolvePipelineCacheEntry, 8> owned_resolve_pipelines{};
+  size_t owned_resolve_pipeline_count = 0, owned_resolve_pipeline_next = 0;
 
   // Static sampler states are shared across root signatures, with a device-wide
   // limit of 2032 distinct live states (not 2032 declarations per signature).

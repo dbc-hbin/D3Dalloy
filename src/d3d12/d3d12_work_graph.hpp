@@ -58,7 +58,7 @@ public:
   HRESULT Initialize(const D3D12_STATE_OBJECT_DESC *desc, const MTLD3D12WorkGraph *parent = nullptr);
   static Com<MTLD3D12WorkGraph> Resolve(MTLD3D12Device *device, const D3D12_PROGRAM_IDENTIFIER &id, uint32_t &index);
   MTLD3D12RootSignature *RootSignature(uint32_t graph) const;
-  const std::vector<std::vector<uint8_t>> &Libraries() const { return libraries_; }
+  const std::vector<SharedShaderBytecode> &Libraries() const { return libraries_; }
   const std::vector<Node> &Exports() const { return available_; }
   const std::vector<RootExport> &Roots() const { return root_exports_; }
   UINT Flags() const { return flags_; }
@@ -94,7 +94,7 @@ public:
 private:
   friend HRESULT CreateWorkGraphStateObject(MTLD3D12Device *, const D3D12_STATE_OBJECT_DESC *, ID3D12StateObject *, REFIID, void **);
   std::shared_ptr<std::atomic<uint64_t>> latest_version_;
-  std::vector<std::vector<uint8_t>> libraries_;
+  std::vector<SharedShaderBytecode> libraries_;
   std::vector<Node> available_;
   std::vector<RootExport> root_exports_;
   std::vector<Graph> graphs_;

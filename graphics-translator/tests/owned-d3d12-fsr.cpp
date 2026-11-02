@@ -744,10 +744,13 @@ void fsrInflightAndDiscard(const FsrApi& api, Gpu& gpu, ID3D12Resource* depth, I
     gpu.queue->ExecuteCommandLists(1, lists);
     check(gpu.queue->Signal(completed.Get(), 1), "inflight completion Signal");
     fsrResult(api.destroy(&context, nullptr), FFX_API_RETURN_OK, "destroy_inflight");
+    // Capture only value metadata: retaining the resource would weaken the
+    // caller-release lifetime test. The readback remains independently owned.
+    const auto releasedBacking = output.resource->GetDesc();
     color.Reset(); output.resource.Reset(); recording.extension.Reset(); recording.list.Reset();
     check(gate->Signal(1), "inflight gate release");
     waitForFenceValue(completed.Get(), 1, "inflight bounded completion");
-    validateOutput(output, 124, "fsr_inflight_release", 0);
+    validateOutput(output, 124, "fsr_inflight_release", 0, 0, 0, kOutputWidth, kOutputHeight, &releasedBacking);
     std::puts("OWNED_D3D12_FSR_BEHAVIOR_PASS case=inflight_release fence_gate=1 context_destroyed=1 caller_resources_released=1 sentinel=1");
 
     fsrResult(api.create(&context, &creation.desc.header, nullptr), FFX_API_RETURN_OK, "discard_create");

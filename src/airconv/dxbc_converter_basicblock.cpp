@@ -87,92 +87,77 @@ auto extend_to_vec4(pvalue value) {
   });
 }
 
-auto to_desired_type_from_int_vec4(pvalue vec4, llvm::Type *desired, uint32_t mask) {
-  return make_irvalue([=](context ctx) {
-    assert(vec4->getType() == ctx.types._int4);
-    std::function<pvalue(pvalue, llvm::Type *)> convert =
-      [&ctx, &convert, mask](pvalue vec4, llvm::Type *desired) {
-        // AIR exposes full vectors even for partial D3D signature masks.
-        // Keep absent lanes finite without changing any declared component.
-        auto masked = [mask](int i) {
-          return (mask & (1 << i)) ? i : 4;
-        };
-        if (desired == ctx.types._int4)
-          return ctx.builder.CreateShuffleVector(
-            vec4, llvm::ConstantAggregateZero::get(ctx.types._int4),
-            {masked(0), masked(1), masked(2), masked(3)}
-          );
-        if (desired == ctx.types._float4)
-          return ctx.builder.CreateShuffleVector(
-            ctx.builder.CreateBitCast(vec4, ctx.types._float4),
-            llvm::ConstantAggregateZero::get(ctx.types._float4),
-            {masked(0), masked(1), masked(2), masked(3)}
-          );
-        // FIXME: 3d/2d vector implementations are unused and probably wrong!
-        if (desired == ctx.types._int3)
-          return ctx.builder.CreateShuffleVector(
-            vec4, llvm::ConstantAggregateZero::get(ctx.types._int4), {masked(0), masked(1), masked(2)}
-          );
-        if (desired == ctx.types._float3)
-          return ctx.builder.CreateShuffleVector(
-            convert(vec4, ctx.types._float4), llvm::ConstantAggregateZero::get(ctx.types._float4),
-            {masked(0), masked(1), masked(2)}
-          );
-        if (desired == ctx.types._int2)
-          return ctx.builder.CreateShuffleVector(
-            vec4, llvm::ConstantAggregateZero::get(ctx.types._int4), {masked(0), masked(1)}
-          );
-        if (desired == ctx.types._float2)
-          return ctx.builder.CreateShuffleVector(
-            convert(vec4, ctx.types._float4), llvm::ConstantAggregateZero::get(ctx.types._float4),
-            {masked(0), masked(1)}
-          );
-        if (desired == ctx.types._int)
-          return ctx.builder.CreateExtractElement(vec4, (uint64_t)__builtin_ctz(mask));
-        if (desired == ctx.types._float)
-          return ctx.builder.CreateExtractElement(
-            ctx.builder.CreateBitCast(vec4, ctx.types._float4), (uint64_t)__builtin_ctz(mask)
-          );
-        assert(0 && "unhandled vec4");
-      };
-    return convert(vec4, desired);
-  });
-};
-
-auto load_from_array_at(llvm::Value *array, pvalue index) -> IRValue {
-  return make_irvalue([=](context ctx) {
-    auto array_ty = llvm::cast<llvm::ArrayType>( // force line break
-      llvm::cast<llvm::PointerType>(array->getType())
-        ->getNonOpaquePointerElementType()
+pvalue to_desired_type_from_int_vec4(context &ctx, pvalue vec4, llvm::Type *desired, uint32_t mask) {
+  assert(vec4->getType() == ctx.types._int4);
+  // AIR exposes full vectors even for partial D3D signature masks.
+  // Keep absent lanes finite without changing any declared component.
+  auto masked = [mask](int i) {
+    return (mask & (1 << i)) ? i : 4;
+  };
+  if (desired == ctx.types._int4)
+    return ctx.builder.CreateShuffleVector(
+      vec4, llvm::ConstantAggregateZero::get(ctx.types._int4),
+      {masked(0), masked(1), masked(2), masked(3)}
     );
-    auto ptr = ctx.builder.CreateGEP(
-      array_ty, array, {ctx.builder.getInt32(0), index}, "",
-      llvm::isa<llvm::ConstantInt>(index)
+  if (desired == ctx.types._float4)
+    return ctx.builder.CreateShuffleVector(
+      ctx.builder.CreateBitCast(vec4, ctx.types._float4),
+      llvm::ConstantAggregateZero::get(ctx.types._float4),
+      {masked(0), masked(1), masked(2), masked(3)}
     );
-    return ctx.builder.CreateLoad(array_ty->getElementType(), ptr);
-  });
-};
+  if (desired == ctx.types._int3)
+    return ctx.builder.CreateShuffleVector(
+      vec4, llvm::ConstantAggregateZero::get(ctx.types._int4), {masked(0), masked(1), masked(2)}
+    );
+  if (desired == ctx.types._float3)
+    return ctx.builder.CreateShuffleVector(
+      to_desired_type_from_int_vec4(ctx, vec4, ctx.types._float4, mask),
+      llvm::ConstantAggregateZero::get(ctx.types._float4), {masked(0), masked(1), masked(2)}
+    );
+  if (desired == ctx.types._int2)
+    return ctx.builder.CreateShuffleVector(
+      vec4, llvm::ConstantAggregateZero::get(ctx.types._int4), {masked(0), masked(1)}
+    );
+  if (desired == ctx.types._float2)
+    return ctx.builder.CreateShuffleVector(
+      to_desired_type_from_int_vec4(ctx, vec4, ctx.types._float4, mask),
+      llvm::ConstantAggregateZero::get(ctx.types._float4), {masked(0), masked(1)}
+    );
+  if (desired == ctx.types._int)
+    return ctx.builder.CreateExtractElement(vec4, (uint64_t)__builtin_ctz(mask));
+  if (desired == ctx.types._float)
+    return ctx.builder.CreateExtractElement(
+      ctx.builder.CreateBitCast(vec4, ctx.types._float4), (uint64_t)__builtin_ctz(mask)
+    );
+  llvm_unreachable("unhandled vec4");
+}
 
-IRValue
-load_from_vec4_array_masked(llvm::Value *array, pvalue index, uint32_t mask) {
-  if (mask == 0b1111) {
-    return load_from_array_at(array, index);
+pvalue load_from_array_at(context &ctx, llvm::Value *array, pvalue index) {
+  auto array_ty = llvm::cast<llvm::ArrayType>(
+    llvm::cast<llvm::PointerType>(array->getType())->getNonOpaquePointerElementType()
+  );
+  auto ptr = ctx.builder.CreateGEP(
+    array_ty, array, {ctx.builder.getInt32(0), index}, "", llvm::isa<llvm::ConstantInt>(index)
+  );
+  return ctx.builder.CreateLoad(array_ty->getElementType(), ptr);
+}
+
+pvalue load_from_vec4_array_masked(context &ctx, llvm::Value *array, pvalue index, uint32_t mask) {
+  if (mask == 0b1111)
+    return load_from_array_at(ctx, array, index);
+  auto array_type = llvm::cast<llvm::PointerType>(array->getType())->getNonOpaquePointerElementType();
+  auto vec4_type = llvm::cast<llvm::ArrayType>(array_type)->getArrayElementType();
+  auto ele_type = llvm::cast<llvm::VectorType>(vec4_type)->getElementType();
+  pvalue value = llvm::ConstantAggregateZero::get(vec4_type);
+  for (unsigned i = 0; i < 4; i++) {
+    if ((mask & (1 << i)) == 0)
+      continue;
+    auto component_ptr =
+        ctx.builder.CreateGEP(array_type, array, {ctx.builder.getInt32(0), index, ctx.builder.getInt32(i)});
+    value = ctx.builder.CreateInsertElement(value, ctx.builder.CreateLoad(ele_type, component_ptr), uint64_t(i));
   }
-  return make_irvalue([=](context ctx) {
-    auto array_type = llvm::cast<llvm::PointerType>(array->getType())->getNonOpaquePointerElementType();
-    auto vec4_type = llvm::cast<llvm::ArrayType>(array_type)->getArrayElementType();
-    auto ele_type = llvm::cast<llvm::VectorType>(vec4_type)->getElementType();
-    pvalue value = llvm::ConstantAggregateZero::get(vec4_type);
-    for (unsigned i = 0; i < 4; i++) {
-      if ((mask & (1 << i)) == 0)
-        continue;
-      auto component_ptr =
-          ctx.builder.CreateGEP(array_type, array, {ctx.builder.getInt32(0), index, ctx.builder.getInt32(i)});
-      value = ctx.builder.CreateInsertElement(value, ctx.builder.CreateLoad(ele_type, component_ptr), uint64_t(i));
-    }
-    return value;
-  });
-};
+  return value;
+}
 
 auto store_to_array_at(
   llvm::Value *array, pvalue index, pvalue vec4_type_matched
@@ -353,19 +338,11 @@ IREffect init_input_reg_with_interpolation_semantic(
 std::function<IRValue(pvalue)>
 pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
   return [=](pvalue ret) {
-    return make_irvalue_bind([=](context ctx) {
-      auto const_index =
-        llvm::ConstantInt::get(ctx.llvm, llvm::APInt{32, from_reg, false});
-      return load_from_array_at(
-               ctx.resource.output.ptr_int4, const_index
-             ) >>= [=, &ctx](auto ivec4) {
-        auto desired_type =
-          ctx.function->getReturnType()->getStructElementType(to_element);
-        return to_desired_type_from_int_vec4(ivec4, desired_type, mask) |
-               [=, &ctx](auto value) {
-                 return ctx.builder.CreateInsertValue(ret, value, {to_element});
-               };
-      };
+    return make_irvalue([=](context ctx) {
+      auto *ivec4 = load_from_array_at(ctx, ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg));
+      auto *desired = ctx.function->getReturnType()->getStructElementType(to_element);
+      auto *value = to_desired_type_from_int_vec4(ctx, ivec4, desired, mask);
+      return ctx.builder.CreateInsertValue(ret, value, {to_element});
     });
   };
 }
@@ -374,18 +351,23 @@ std::function<IRValue(pvalue)>
 pop_output_reg_semantic(uint32_t from_reg, uint32_t mask, uint32_t to_element,
                         bool sanitize_distance) {
   return [=](pvalue ret) {
-    return make_irvalue_bind([=](context ctx) -> IRValue {
-      auto *ivec4 = co_yield load_from_array_at(
-        ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg)
-      );
+    return make_irvalue([=](context ctx) {
       auto *desired = ctx.function->getReturnType()->getStructElementType(to_element);
-      auto *value = co_yield to_desired_type_from_int_vec4(ivec4, desired, 0xf);
+      if (sanitize_distance && !ctx.capture_raw_distance_output &&
+          ctx.module.getModuleFlag("d3dalloy.d3d12.root-signature")) {
+        // D3D12 PS distance consumers use raw capture/replay. The ordinary
+        // varying is unused, but Metal still validates it for finite values.
+        // Clipping and stream output read the original register file.
+        return ctx.builder.CreateInsertValue(ret, llvm::Constant::getNullValue(desired), {to_element});
+      }
+      auto *ivec4 = load_from_array_at(
+        ctx, ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg)
+      );
+      auto *value = to_desired_type_from_int_vec4(ctx, ivec4, desired, 0xf);
       value = ctx.builder.CreateShuffleVector(
         value, llvm::ConstantAggregateZero::get(desired), semantic_shuffle(mask, true)
       );
       if (sanitize_distance && !ctx.capture_raw_distance_output) {
-        // Native fragment interpolants reject non-finite values. Capture
-        // preserves the raw distance in the vertex record for pixel evaluation.
         auto *absolute = ctx.builder.CreateAnd(
           ctx.builder.CreateBitCast(value, ctx.types._int4),
           ctx.builder.CreateVectorSplat(4, ctx.builder.getInt32(0x7fffffffu))
@@ -397,7 +379,7 @@ pop_output_reg_semantic(uint32_t from_reg, uint32_t mask, uint32_t to_element,
           nonfinite, llvm::ConstantAggregateZero::get(ctx.types._float4), value
         );
       }
-      co_return ctx.builder.CreateInsertValue(ret, value, {to_element});
+      return ctx.builder.CreateInsertValue(ret, value, {to_element});
     });
   };
 }
@@ -406,7 +388,7 @@ std::function<IRValue(pvalue)> pop_output_reg_fix_unorm(uint32_t from_reg, uint3
   return [=](pvalue ret) {
     return make_irvalue_bind([=](context ctx) -> IRValue {
       auto const_index = llvm::ConstantInt::get(ctx.llvm, llvm::APInt{32, from_reg, false});
-      auto fvec4 = co_yield load_from_array_at(ctx.resource.output.ptr_float4, const_index);
+      auto fvec4 = load_from_array_at(ctx, ctx.resource.output.ptr_float4, const_index);
       auto fixed = ctx.builder.CreateFSub(fvec4, co_yield get_float4_splat(1.0f / 127500.0f) /* magic delta ?! */);
       co_return ctx.builder.CreateInsertValue(ret, fixed, {to_element});
     });
@@ -415,41 +397,44 @@ std::function<IRValue(pvalue)> pop_output_reg_fix_unorm(uint32_t from_reg, uint3
 
 std::function<IRValue(pvalue)> pop_output_reg_sanitize_pos(uint32_t from_reg, uint32_t mask, uint32_t to_element) {
   return [=](pvalue ret) {
-    return make_irvalue_bind([=](context ctx) -> IRValue {
+    return make_irvalue([=](context ctx) {
       auto const_index = llvm::ConstantInt::get(ctx.llvm, llvm::APInt{32, from_reg, false});
-      auto fvec4 = co_yield load_from_array_at(ctx.resource.output.ptr_float4, const_index);
+      auto fvec4 = load_from_array_at(ctx, ctx.resource.output.ptr_float4, const_index);
       auto fixed = ctx.air.SanitizePosition(fvec4);
-      co_return ctx.builder.CreateInsertValue(ret, fixed, {to_element});
+      return ctx.builder.CreateInsertValue(ret, fixed, {to_element});
     });
   };
 }
 
 IREffect
 pop_mesh_output_render_target_array_index(uint32_t from_reg, uint32_t mask, pvalue primitive_id) {
-  auto ctx = co_yield get_context();
-  auto result = co_yield to_desired_type_from_int_vec4(
-      co_yield load_from_array_at(ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg)), ctx.types._int, mask
-  );
-  ctx.air.CreateSetMeshRenderTargetArrayIndex(primitive_id, result);
-  co_return {};
+  return make_effect([=](context ctx) {
+    auto result = to_desired_type_from_int_vec4(
+      ctx, load_from_array_at(ctx, ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg)), ctx.types._int, mask
+    );
+    ctx.air.CreateSetMeshRenderTargetArrayIndex(primitive_id, result);
+    return std::monostate();
+  });
 }
 
 IREffect
 pop_mesh_output_viewport_array_index(uint32_t from_reg, uint32_t mask, pvalue primitive_id) {
-  auto ctx = co_yield get_context();
-  auto result = co_yield to_desired_type_from_int_vec4(
-      co_yield load_from_array_at(ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg)), ctx.types._int, mask
-  );
-  ctx.air.CreateSetMeshViewportArrayIndex(primitive_id, result);
-  co_return {};
+  return make_effect([=](context ctx) {
+    auto result = to_desired_type_from_int_vec4(
+      ctx, load_from_array_at(ctx, ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg)), ctx.types._int, mask
+    );
+    ctx.air.CreateSetMeshViewportArrayIndex(primitive_id, result);
+    return std::monostate();
+  });
 }
 
 IREffect
 pop_mesh_output_position(uint32_t from_reg, uint32_t mask, pvalue vertex_id) {
-  auto ctx = co_yield get_context();
-  auto result = co_yield load_from_array_at(ctx.resource.output.ptr_float4, ctx.builder.getInt32(from_reg));
-  ctx.air.CreateSetMeshPosition(vertex_id, result);
-  co_return {};
+  return make_effect([=](context ctx) {
+    auto result = load_from_array_at(ctx, ctx.resource.output.ptr_float4, ctx.builder.getInt32(from_reg));
+    ctx.air.CreateSetMeshPosition(vertex_id, result);
+    return std::monostate();
+  });
 }
 
 IREffect
@@ -457,27 +442,35 @@ pop_mesh_output_vertex_data(
     uint32_t from_reg, uint32_t mask, uint32_t idx, pvalue vertex_id, air::MSLScalerOrVectorType desired_type,
     bool sanitize_distance
 ) {
-  auto ctx = co_yield get_context();
-  auto result = co_yield to_desired_type_from_int_vec4(
-      co_yield load_from_vec4_array_masked(ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg), mask),
+  return make_effect([=](context ctx) {
+    if (sanitize_distance && !ctx.capture_raw_distance_output &&
+        ctx.module.getModuleFlag("d3dalloy.d3d12.root-signature")) {
+      ctx.air.CreateSetMeshVertexData(
+        vertex_id, idx, llvm::Constant::getNullValue(air::get_llvm_type(desired_type, ctx.llvm))
+      );
+      return std::monostate();
+    }
+    auto result = to_desired_type_from_int_vec4(
+      ctx, load_from_vec4_array_masked(ctx, ctx.resource.output.ptr_int4, ctx.builder.getInt32(from_reg), mask),
       air::get_llvm_type(desired_type, ctx.llvm), mask
-  );
-  // This is the final mesh -> fragment user varying. Keep the internal
-  // control-point registers packed, but publish semantic-local lanes here.
-  // System outputs such as SV_ShadingRate are scalar and already extracted.
-  if (llvm::isa<llvm::FixedVectorType>(result->getType()))
-    result = ctx.builder.CreateShuffleVector(
-      result, llvm::ConstantAggregateZero::get(result->getType()), semantic_shuffle(mask, true)
     );
-  if (sanitize_distance && !ctx.capture_raw_distance_output) {
-    auto *absolute = ctx.builder.CreateAnd(ctx.builder.CreateBitCast(result, ctx.types._int4),
-      ctx.builder.CreateVectorSplat(4, ctx.builder.getInt32(0x7fffffffu)));
-    auto *nonfinite = ctx.builder.CreateICmpUGE(absolute,
-      ctx.builder.CreateVectorSplat(4, ctx.builder.getInt32(0x7f800000u)));
-    result = ctx.builder.CreateSelect(nonfinite, llvm::Constant::getNullValue(ctx.types._float4), result);
-  }
-  ctx.air.CreateSetMeshVertexData(vertex_id, idx, result);
-  co_return {};
+    // This is the final mesh -> fragment user varying. Keep the internal
+    // control-point registers packed, but publish semantic-local lanes here.
+    // System outputs such as SV_ShadingRate are scalar and already extracted.
+    if (llvm::isa<llvm::FixedVectorType>(result->getType()))
+      result = ctx.builder.CreateShuffleVector(
+        result, llvm::ConstantAggregateZero::get(result->getType()), semantic_shuffle(mask, true)
+      );
+    if (sanitize_distance && !ctx.capture_raw_distance_output) {
+      auto *absolute = ctx.builder.CreateAnd(ctx.builder.CreateBitCast(result, ctx.types._int4),
+        ctx.builder.CreateVectorSplat(4, ctx.builder.getInt32(0x7fffffffu)));
+      auto *nonfinite = ctx.builder.CreateICmpUGE(absolute,
+        ctx.builder.CreateVectorSplat(4, ctx.builder.getInt32(0x7f800000u)));
+      result = ctx.builder.CreateSelect(nonfinite, llvm::Constant::getNullValue(ctx.types._float4), result);
+    }
+    ctx.air.CreateSetMeshVertexData(vertex_id, idx, result);
+    return std::monostate();
+  });
 }
 
 IREffect pull_vertex_input(

@@ -30,6 +30,7 @@ MODULES = {
     "d3d10core": "src/d3d10/d3d10core.dll",
     "d3d12": "src/d3d12/d3d12.dll",
     "d3d12core": "src/d3d12/d3d12core.dll",
+    "amdxc64": "src/amdxc/amdxc64.dll",
 }
 OPTIONAL_MODULES = {
     "nvapi": {"nvapi64": "src/nvapi/nvapi64.dll"},
@@ -211,6 +212,11 @@ def audit_image(image: Path, dump: str, expected_exports: dict[str, dict[str, in
             view["core_generation"] = generation[:-1].decode("ascii")
         if views["arm64"]["core_generation"] != views["arm64ec"]["core_generation"]:
             raise ValueError(f"split native/EC Core generation: {image}")
+    if image.name == "amdxc64.dll":
+        required = {"AmdExtD3DCreateInterface", "OwnedAntiLagBackendId"}
+        if b"d3dalloy-owned-antilag2" not in data or any(
+                required - view["exports"].keys() for view in views.values()):
+            raise ValueError(f"missing owned Anti-Lag 2 marker or export contract: {image}")
     return {**facts, "path": str(image), "sha256": hashlib.sha256(data).hexdigest(),
             "entry_rva": entry, "builtin": builtin, "views": views}
 

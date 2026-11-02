@@ -20,6 +20,10 @@ float4x4 loadMatrix(constant float* m) {
     return float4x4(float4(m[0],m[1],m[2],m[3]), float4(m[4],m[5],m[6],m[7]),
                     float4(m[8],m[9],m[10],m[11]), float4(m[12],m[13],m[14],m[15]));
 }
+kernel void rr_zero_albedo(texture2d<float,access::write> output [[texture(0)]],
+    constant RrParams& p [[buffer(0)]], uint2 tid [[thread_position_in_grid]]) {
+    if (tid.x < p.width && tid.y < p.height) output.write(float4(0),tid);
+}
 bool radiance(uint s) { return s == 1 || s == 2 || s == 4 || s == 5; }
 bool specular(uint s) { return s == 2 || s == 5 || s == 6; }
 float3 octNormal(float2 e) {

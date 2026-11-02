@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -24,8 +25,9 @@
 namespace d3dalloy {
 namespace {
 
-// ponytail: one process-wide lock serializes cache I/O; split by cache only if profiling warrants it.
-std::mutex cache_mutex;
+// Registry/control transactions are exclusive; unrelated sessions may perform
+// I/O concurrently under the shared control epoch and their own cache mutex.
+std::shared_mutex cache_mutex;
 bool caches_disabled = false;
 constexpr uint64_t kMagic = 0x31435354584d4444ull; // DDMXTSC1; fixed-width, little-endian disk format.
 struct FileHeader { uint64_t magic, version; };
@@ -64,10 +66,12 @@ bool Write(HANDLE file, const void *data, DWORD size) {
 }
 
 struct Cache {
+  std::mutex mutex;
   D3D12_SHADER_CACHE_SESSION_DESC desc;
   std::wstring path;
   HANDLE file = INVALID_HANDLE_VALUE;
   std::list<Entry> entries;
+  std::unordered_map<Sha1Digest, std::list<Entry>::iterator> memory_index;
   struct DiskRecord { RecordHeader header; uint64_t offset; };
   std::unordered_multimap<Sha1Digest, DiskRecord> records;
   bool indexed = true;
@@ -100,6 +104,7 @@ struct Cache {
     }
     corrupt = false;
     entries.clear();
+    memory_index.clear();
     records.clear();
     indexed = true;
     memory_bytes = 0;
@@ -208,9 +213,12 @@ struct Cache {
     Entry entry{hash, std::string(static_cast<const char *>(key), key_size),
                 std::string(static_cast<const char *>(value), value_size)};
     entries.push_front(std::move(entry));
+    try { memory_index.emplace(hash, entries.begin()); }
+    catch (...) { entries.pop_front(); throw; }
     memory_bytes += bytes;
     while (memory_bytes > desc.MaximumInMemoryCacheSizeBytes || entries.size() > desc.MaximumInMemoryCacheEntries) {
       memory_bytes -= entries.back().key.size() + entries.back().value.size();
+      memory_index.erase(entries.back().hash);
       entries.pop_back();
     }
   }
@@ -221,8 +229,8 @@ struct Cache {
     if (!key) key = "";
     if (corrupt) return E_FAIL;
     const auto hash = Sha1HashState::compute(key, key_size);
-    for (auto it = entries.begin(); it != entries.end(); ++it) {
-      if (it->hash != hash) continue;
+    if (const auto found = memory_index.find(hash); found != memory_index.end()) {
+      const auto it = found->second;
       if (it->key.size() != key_size || memcmp(it->key.data(), key, key_size)) return DXGI_ERROR_CACHE_HASH_COLLISION;
       const UINT capacity = *value_size;
       *value_size = UINT(it->value.size());
@@ -253,8 +261,8 @@ struct Cache {
     if (corrupt) return E_FAIL;
     const auto hash = Sha1HashState::compute(key, key_size);
     if (file == INVALID_HANDLE_VALUE) {
-      for (const auto &entry : entries) {
-        if (entry.hash != hash) continue;
+      if (const auto found = memory_index.find(hash); found != memory_index.end()) {
+        const auto &entry = *found->second;
         return entry.key.size() == key_size && !memcmp(entry.key.data(), key, key_size) ?
             DXGI_ERROR_ALREADY_EXISTS : DXGI_ERROR_CACHE_HASH_COLLISION;
       }
@@ -563,15 +571,18 @@ public:
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE FindValue(const void *key, UINT key_size, void *value, UINT *value_size) override {
-    std::lock_guard lock(cache_mutex);
+    std::shared_lock control(cache_mutex);
+    std::lock_guard lock(cache_->mutex);
     try { return cache_->find(key, key_size, value, value_size); } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
   }
   HRESULT STDMETHODCALLTYPE StoreValue(const void *key, UINT key_size, const void *value, UINT value_size) override {
-    std::lock_guard lock(cache_mutex);
+    std::shared_lock control(cache_mutex);
+    std::lock_guard lock(cache_->mutex);
     try { return cache_->store(key, key_size, value, value_size); } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
   }
   void STDMETHODCALLTYPE SetDeleteOnDestroy() override {
-    std::lock_guard lock(cache_mutex);
+    std::shared_lock control(cache_mutex);
+    std::lock_guard lock(cache_->mutex);
     cache_->delete_on_destroy = true;
   }
   D3D12_SHADER_CACHE_SESSION_DESC *STDMETHODCALLTYPE GetDesc(D3D12_SHADER_CACHE_SESSION_DESC *out) override {

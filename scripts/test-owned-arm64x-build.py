@@ -133,7 +133,8 @@ class PairedFrontendBuildTests(unittest.TestCase):
                 additions = {module: path for frontend, rows in expected.items()
                              if options["enable_" + frontend] for module, path in rows.items()}
                 self.assertEqual(modules, paired.MODULES | additions)
-        self.assertEqual(len(paired.MODULES), 6)
+        self.assertEqual(len(paired.MODULES), 7)
+        self.assertEqual(paired.MODULES["amdxc64"], "src/amdxc/amdxc64.dll")
 
     def test_real_paired_graphs_install_contract_and_msvc_bridge_abi(self):
         if SDK_ROOT is None:

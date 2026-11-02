@@ -328,6 +328,9 @@ class RunnerFailures(unittest.TestCase):
                 rows.append(prefix + "end=" + name)
             text = "\n".join(rows)
             self.assertEqual(runner.pipeline_artifact_failures(text, suite), [])
+            # Cache IDs are runtime object identities, not fixed kind ordinals.
+            relocated = text.replace('"cache": 1', '"cache": 41').replace('"cache": 2', '"cache": 73')
+            self.assertEqual(runner.pipeline_artifact_failures(relocated, suite), [])
             for bad in ("", text.replace("pipeline_artifact_operation", "pipeline_artifact_hit"),
                         text + "\n" + rows[0], "\n".join(rows[1:]),
                         text.replace(prefix + "end=" + phases[0][0],
@@ -495,7 +498,7 @@ class RunnerFailures(unittest.TestCase):
                 for replay in range(replays):
                     events = [{"event": "submission_clear_superseded", "aspect": 4} for _ in range(superseded)]
                     if name.startswith("graph-frontier-"):
-                        events.append({"event": "submission_plan_work", "history_checks": 8064 if name == "graph-frontier-256" else 16128 if name == "graph-frontier-512" else 0,
+                        events.append({"event": "submission_plan_work", "history_checks": 0,
                                        "candidate_checks": 0, "metadata_copies": 0, "scope_checks": 0, "feedback_checks": 0})
                         pairs = [(62, 63), (64, 65)] if name == "graph-frontier-boundary-0" else [(64, 65)] if name == "graph-frontier-boundary-1" else []
                         events += [{"event": "submission_render_merged", "before_list": before, "after_list": after, "members": 2} for before, after in pairs]
@@ -2885,6 +2888,111 @@ class DepthBoundsEvidence(unittest.TestCase):
                             for failure in runner.depth_bounds_failures(trace, "")))
 
 
+class RTExecutableCacheEvidence(unittest.TestCase):
+    def test_real_native_link_counts_and_live_clear_required(self):
+        names=("concurrent-cold","warm","local-root-variant","clear-live")
+        cases=((4,4),(1,1),(2,2),(1,3))
+        output="".join(f"OWNED_D3D12_RT_EXECUTABLE_CASE case={name} objects={objects} gpu_dispatches={dispatches} output=exact\n"
+            for name,(objects,dispatches) in zip(names,cases))
+        output+="OWNED_D3D12_RT_EXECUTABLE_PASS cases=4 gpu_dispatches=10 mutable_tables_and_localroots=isolated\n"
+        groups={"concurrent-cold":[("pipeline_artifact_operation","a")],"warm":[("pipeline_artifact_hit","a")],
+                "local-root-variant":[("pipeline_artifact_operation","b"),("pipeline_artifact_hit","b")],
+                "clear-live":[("pipeline_artifact_operation","c")]}
+        def log(values):
+            rows=[];index=1
+            for name in names:
+                rows.append(f"OWNED_D3D12_RT_EXECUTABLE_PHASE begin={name}")
+                for event,key in values[name]:
+                    rows.append("OWNED_GRAPHICS_TRACE "+json.dumps(dict(event=event,event_id=index,kind="native_rt_executable",key=key)));index+=1
+                rows.append(f"OWNED_D3D12_RT_EXECUTABLE_PHASE end={name}")
+            for event in ("submit","complete"):
+                rows.append("OWNED_GRAPHICS_TRACE "+json.dumps(dict(event=event,event_id=index,queue=1,submission=1,status=4)));index+=1
+            return "\n".join(rows)+"\n"
+        self.assertTrue(runner.rt_executable_output_matches(output,log(groups),True,True))
+        self.assertFalse(runner.rt_executable_output_matches(output,log(groups),False,True))
+        for name in ("concurrent-cold","local-root-variant","clear-live"):
+            broken={key:list(value) for key,value in groups.items()};broken[name]=[]
+            self.assertFalse(runner.rt_executable_output_matches(output,log(broken),True,True))
+        broken={key:list(value) for key,value in groups.items()};broken["warm"].append(("pipeline_artifact_operation","a"))
+        self.assertFalse(runner.rt_executable_output_matches(output,log(broken),True,True))
+        broken={key:list(value) for key,value in groups.items()};broken["local-root-variant"]=[("pipeline_artifact_operation","a")]
+        self.assertFalse(runner.rt_executable_output_matches(output,log(broken),True,True))
+        self.assertFalse(runner.rt_executable_output_matches(output+"OWNED_D3D12_RAYTRACING_CASE_MISMATCH local_root\n",log(groups),True,True))
+
+
+class SubmissionFoundationEvidence(unittest.TestCase):
+    def test_actual_resolved_execution_and_reuse_required(self):
+        names=["volatile_replay","retired_icb_reuse","placed_alias_clears","query_fanout","sparse_mapping_positive","cpu_strip_transfer"]
+        output="".join(f"OWNED_D3D12_SUBMISSION_FOUNDATION_CASE_PASS case={name} proof=exact\n" for name in names)
+        output+="OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=6\n"
+        records=[dict(event="recording_plan_sealed",passes=3,descriptor_values_captured=0),
+            dict(event="residency_add_batch",allocations=5,commits=1)]
+        records += [dict(event="indirect_buffer_reuse",count=1,capacity=2) for _ in range(2)]
+        records += [dict(event="sparse_publication_elided",proof="no_sparse_heap_or_opaque_access") for _ in range(4)]
+        records += [dict(event="submission_heap_clear_in_place") for _ in range(2)]
+        records += [dict(event="submission_access_opaque",reason="sparse_alias")]
+        records += [dict(event="query_fanout_batch",targets=2,native_encoders=1,reset=0),
+                    dict(event="query_fanout_batch",targets=1,native_encoders=1,reset=0),
+                    dict(event="submit",queue=1,submission=1),dict(event="complete",queue=1,submission=1,status=4)]
+        def check(rows,proof=True,text=output):
+            log="".join("OWNED_GRAPHICS_TRACE "+json.dumps(dict(row,event_id=i+1))+"\n" for i,row in enumerate(rows))
+            return runner.submission_foundation_output_matches(text,log,proof,True)
+        self.assertTrue(check(records));self.assertFalse(check(records,False))
+        for kind in ("recording_plan_sealed","residency_add_batch","indirect_buffer_reuse","sparse_publication_elided",
+                     "submission_heap_clear_in_place","query_fanout_batch"):
+            self.assertFalse(check([row for row in records if row["event"]!=kind]))
+        changed=[dict(row) for row in records];changed[0]["descriptor_values_captured"]=1
+        self.assertFalse(check(changed))
+        changed=[dict(row) for row in records]
+        for row in changed:
+            if row["event"]=="query_fanout_batch":row["native_encoders"]=2
+        self.assertFalse(check(changed))
+        self.assertFalse(check(records,text=output+"OWNED_D3D12_SUBMISSION_FOUNDATION_CASE_PASS case=query_fanout duplicate=1\n"))
+
+
+class WorkGraphBatchEvidence(unittest.TestCase):
+    def test_full_groups_coordinates_returns_and_native_batches_required(self):
+        output="".join(f"OWNED_D3D12_WG_BATCH_CASE atomic={a} gpu_input={g} groups={n} count={n} guard=ok coordinates_or_returns=exact\n"
+            for a,g,n in [(0,0,66049),(0,1,66049),(1,0,65),(1,1,65)])
+        output+="OWNED_D3D12_WG_BATCH_PASS cases=4\n"
+        expected=[(0,65535),(65535,514)]*2+[(0,32),(32,32),(64,1)]*2
+        events=[dict(event="work_graph_node_batch",event_id=i+1,first_group=first,groups=count,terminal=1)
+                for i,(first,count) in enumerate(expected)]
+        events += [dict(event="submit",event_id=11,queue=1,submission=1),
+                   dict(event="complete",event_id=12,queue=1,submission=1,status=4)]
+        def trace(rows):return "".join("OWNED_GRAPHICS_TRACE "+json.dumps(row)+"\n" for row in rows)
+        check=lambda out,rows,proof=True:runner.workgraph_batches_output_matches(out,trace(rows),proof,True)
+        self.assertTrue(check(output,events))
+        self.assertFalse(check(output,events,False))
+        self.assertFalse(check(output.replace("count=66049","count=66048",1),events))
+        self.assertFalse(check(output.replace("guard=ok","guard=bad",1),events))
+        self.assertFalse(check(output,events[:-1]))
+        altered=[dict(row) for row in events];altered[2]["groups"]=1
+        self.assertFalse(check(output,altered))
+        altered=[dict(row) for row in events];altered[6]["terminal"]=0
+        self.assertFalse(check(output,altered))
+
+
+class WideWaveFocusedEvidence(unittest.TestCase):
+    def test_all_partial_integer_and_legacy_wide_cases_required(self):
+        lines=["OWNED_D3D12_SM6_BACKEND id=owned-graphics-d3d12",
+            "OWNED_D3D12_SM6_CAPS shader_model=0x66/0x0 wave=1 lanes=4-32 total_lanes=2560"]
+        lines += ["OWNED_D3D12_SM6_CASE_PASS "+case for case in runner.WIDE_WAVE_CASES]
+        lines += [f"OWNED_D3D12_WAVES_REJECT entry={entry} hr=0x80004005" for entry in runner.SM6_REJECTS]
+        lines += ["OWNED_D3D12_WIDE_WAVES_PASS"]
+        out="\n".join(lines)+"\n"
+        check=lambda text,proof=True:runner.wide_waves_output_matches(text,"",proof,True)[0]
+        self.assertTrue(check(out))
+        self.assertFalse(check(out,False))
+        self.assertEqual(runner.BACKEND_PREFIXES["wide-waves"],"OWNED_D3D12_SM6")
+        for case in runner.WIDE_WAVE_CASES:
+            marker="OWNED_D3D12_SM6_CASE_PASS "+case+"\n"
+            self.assertFalse(check(out.replace(marker,"")))
+            self.assertFalse(check(out+marker))
+        self.assertFalse(check(out+"OWNED_D3D12_SM6_MISMATCH integer\n"))
+        self.assertFalse(check(out.replace("hr=0x80004005","hr=0x00000000",1)))
+
+
 class TemporalFailures(unittest.TestCase):
     def setUp(self):
         self.events = example_trace()
@@ -2910,6 +3018,35 @@ class TemporalFailures(unittest.TestCase):
     def test_history_reset_regression_rejected(self):
         next(e for e in self.events if e["event"] == "temporal_encode" and e["evaluation"] == 2)["reset"] = 1
         self.assertFalse(self.report()["pass"])
+
+    def test_independent_feature_overlap_permitted(self):
+        index = next(i for i,e in enumerate(self.events) if e["event"]=="submit")
+        self.events[index:index] = [
+            dict(event="temporal_record",evaluation=8,feature=9,generation=10,color=11,output=12),
+            dict(event="execute_list",queue=8,submission=80,list=81,recording=1),
+            dict(event="encode",queue=8,submission=80,list=81,recording=1,encoder=82),
+            dict(event="temporal_encode",queue=8,submission=80,encoder=82,evaluation=8,feature=9,generation=10,
+                 color=11,output=12,history_sequence=1,reset=1,caller_reset=0),
+        ]
+        self.events.extend([dict(event="submit",queue=8,submission=80),
+            dict(event="complete",queue=8,submission=80,status=4),
+            dict(event="temporal_frame_destroy",evaluation=8)])
+        for i,e in enumerate(self.events,1): e["event_id"]=i
+        report=self.report()
+        self.assertTrue(report["pass"],report["errors"])
+        # Changing only the feature makes this a real uncommitted same-history
+        # overlap and must still fail, rather than removing ordering checks.
+        for e in self.events:
+            if e.get("evaluation")==8 and e["event"] in ("temporal_record","temporal_encode"):
+                e["feature"]=3
+        self.assertTrue(any("before the previous commit" in error for error in self.report()["errors"]))
+
+    def test_same_feature_uncommitted_overlap_rejected(self):
+        submit=next(e for e in self.events if e["event"]=="submit" and e["submission"]==10)
+        consumer=next(e for e in self.events if e["event"]=="temporal_encode" and e["queue"]==2)
+        self.events.remove(submit); self.events.insert(self.events.index(consumer)+1,submit)
+        for i,e in enumerate(self.events,1):e["event_id"]=i
+        self.assertTrue(any("feature 3 encoded another" in error for error in self.report()["errors"]))
 
     def test_split_submission_retains_logical_execute_parent(self):
         for event in self.events:
@@ -3531,6 +3668,181 @@ class Phase3ConcurrentTrace(unittest.TestCase):
         self.assertTrue(runner.prepared_indirect_failures(out,err.replace(command,command+"\n"+command,1)))
         self.assertTrue(runner.prepared_indirect_failures(out,err.replace(command,command.replace("argument_buffer=2","argument_buffer=-2"),1)))
         self.assertTrue(runner.prepared_indirect_failures(out,err.replace(metadata,metadata.replace("table_set=2","table_set=no"),2)))
+
+
+class NativeAttachmentMetadata(unittest.TestCase):
+    def test_attachment_metadata_does_not_replace_indirect_work(self):
+        out, original = Phase3PreparedEvidence().indirect_control()
+        metadata = "OWNED_GRAPHICS_NATIVE_RENDER_ATTACHMENT encoder=12 aspect=4 slot=0 texture=25 load=2 store=1"
+        command = next(line for line in original.splitlines() if line.startswith("OWNED_GRAPHICS_NATIVE_DRAW_INDIRECT"))
+        err = original.replace(command, metadata + "\n" + command, 1)
+        self.assertEqual(runner.prepared_indirect_failures(out, err), [])
+        self.assertTrue(runner.prepared_indirect_failures(out, err.replace(command + "\n", "", 1)))
+        self.assertTrue(runner.prepared_indirect_failures(out, err.replace(command, command + "\n" + command, 1)))
+        for old, new in (("encoder=12", "encoder=0"), ("texture=25", "texture=0"),
+                         ("aspect=4", "aspect=8"), ("slot=0", "slot=8"),
+                         ("load=2", "load=-2"), ("store=1", ""), ("slot=0", "slot=0 slot=0")):
+            with self.subTest(old=old, new=new):
+                self.assertTrue(runner.prepared_indirect_failures(out, err.replace(metadata, metadata.replace(old, new))))
+
+
+class LowLatencyEvidence(unittest.TestCase):
+    def stderr(self, mode="forced"):
+        events = [dict(event="submit", queue=1, submission=1),
+                  dict(event="complete", queue=1, submission=1, status=4)]
+        if mode != "off":
+            for frame in range(2):
+                events.append(dict(event="low_latency_admit", scheduler=100, frame=frame + 1,
+                    source=2 if mode == "antilag2" else 0, now_ns=1000 + frame * 100,
+                    target_ns=0, pending_frames=1, capacity=0))
+        return ('Loaded L"C:\\windows\\system32\\amdxc64.dll" at 0001: builtin\n'
+                + "".join("OWNED_GRAPHICS_TRACE " + json.dumps({**event, "event_id": index + 1}) + "\n"
+                          for index, event in enumerate(events)))
+
+    def trace(self, mode="forced", supported=True):
+        prefix = "OWNED_D3D12_LOW_LATENCY"
+        lines = [f"{prefix}_BACKEND id=owned-graphics-d3d12",
+                 f"{prefix}_CLOCK cpu_frequency=1000000 gpu_supported={int(supported)} "
+                 f"gpu_frequency={1000000000 if supported else 0} "
+                 f"gpu_status=0x{'00000000' if supported else '80004001'}"]
+        for frame in range(2):
+            cpu, gpu = 100 + frame * 100, 1000 + frame * 1000
+            lines.append(f"{prefix}_FRAME frame={frame} input_begin={cpu} input_end={cpu + 1} "
+                         f"submit_begin={cpu + 2} submit_end={cpu + 3} "
+                         f"present_begin={cpu + 4} present_end={cpu + 5} "
+                         f"gpu_begin={gpu if supported else 0} gpu_end={gpu + 500 if supported else 0} "
+                         "pixels=230400 readback=exact")
+        if mode == "antilag2":
+            lines.append(f"{prefix}_AMD contracts=init,options,identity,lifetime,version,errors,input,fg,end-render "
+                         "backend=d3dalloy-owned-antilag2")
+        lines.append(f"{prefix}_PASS mode={mode} frames=2 verified=2 width=640 height=360 "
+                     f"draws=64 slots=8 amd_enable={int(mode == 'antilag2')} reflex_enable=0")
+        return "\n".join(lines) + "\n"
+
+    def test_measurement_contract_rejects_incomplete_or_fabricated_timestamps(self):
+        trace = self.trace()
+        corruptions = (
+            trace.replace("frame=1 ", "frame=0 ", 1),
+            trace.replace("readback=exact", "readback=failed", 1),
+            trace.replace("gpu_begin=1000", "gpu_begin=0", 1),
+            trace.replace("gpu_end=1500", "gpu_end=999", 1),
+            trace.replace("submit_end=103", "submit_end=99", 1),
+            trace.replace("verified=2", "verified=1"),
+            trace.replace("amd_enable=0", "amd_enable=1"),
+            trace.replace("cpu_frequency=1000000", "cpu_frequency=0"),
+            trace + next(line for line in trace.splitlines() if "_FRAME " in line) + "\n",
+        )
+        for performance in (False, True):
+            stderr = "" if performance else self.stderr()
+            with self.subTest(performance=performance):
+                self.assertEqual(runner.low_latency_failures(trace, stderr, "forced", 2,
+                                                            performance=performance), [])
+            for broken in corruptions:
+                with self.subTest(performance=performance, broken=broken):
+                    self.assertTrue(runner.low_latency_failures(broken, stderr, "forced", 2,
+                                                               performance=performance))
+
+    def test_unavailable_gpu_timing_is_explicit_not_synthetic(self):
+        trace = self.trace(supported=False)
+        self.assertEqual(runner.low_latency_failures(trace, self.stderr(), "forced", 2), [])
+        self.assertTrue(runner.low_latency_failures(trace.replace("gpu_begin=0", "gpu_begin=1", 1), self.stderr(), "forced", 2))
+        self.assertTrue(runner.low_latency_failures(trace.replace("80004001", "80004005"), self.stderr(), "forced", 2))
+
+    def test_cooperative_contract_requires_builtin_AMD_evidence(self):
+        trace = self.trace(mode="antilag2")
+        for performance in (False, True):
+            builtin = (self.stderr(mode="antilag2").splitlines()[0] + "\n"
+                       if performance else self.stderr(mode="antilag2"))
+            with self.subTest(performance=performance):
+                self.assertEqual(runner.low_latency_failures(trace, builtin, "antilag2", 2,
+                                                            performance=performance), [])
+                self.assertTrue(runner.low_latency_failures(trace, builtin.replace("builtin", "native"), "antilag2", 2,
+                                                           performance=performance))
+                self.assertTrue(runner.low_latency_failures(trace.replace("_AMD contracts=", "_MISSING contracts="),
+                                                           builtin, "antilag2", 2, performance=performance))
+                self.assertTrue(runner.low_latency_failures(trace, builtin, "forced", 2,
+                                                           performance=performance))
+
+    def test_trace_free_measurement_requires_explicit_performance_policy(self):
+        for mode in ("off", "forced", "antilag2"):
+            trace = self.trace(mode=mode)
+            stderr = self.stderr(mode=mode)
+            modules_only = stderr.splitlines()[0] + "\n"
+            with self.subTest(mode=mode):
+                self.assertTrue(runner.low_latency_failures(trace, modules_only, mode, 2))
+                self.assertEqual(runner.low_latency_failures(trace, modules_only, mode, 2,
+                                                            performance=True), [])
+                self.assertTrue(runner.low_latency_failures(trace, stderr, mode, 2, performance=True))
+
+    def test_performance_policy_rejects_other_suites_before_creating_evidence(self):
+        for suite in ("smoke", "nvapi-reflex"):
+            with self.subTest(suite=suite), self.assertRaises(ValueError):
+                runner.run(argparse.Namespace(suite=suite, low_latency_performance=True))
+
+    def test_scheduler_ownership_and_real_completion_are_required(self):
+        trace, stderr = self.trace(), self.stderr()
+        for broken in (stderr.replace('"source": 0', '"source": 2', 1),
+                       stderr.replace('"frame": 2', '"frame": 1'),
+                       stderr.replace('"capacity": 0', '"capacity": 2', 1),
+                       stderr.replace('"event": "low_latency_admit"', '"event": "low_latency_mode"', 1),
+                       stderr.replace('"status": 4', '"status": 5')):
+            with self.subTest(broken=broken):
+                self.assertTrue(runner.low_latency_failures(trace, broken, "forced", 2))
+        self.assertTrue(runner.low_latency_failures(self.trace(mode="off"), stderr, "off", 2))
+
+    def test_runner_strips_inherited_config_and_composes_only_explicit_options(self):
+        for mode, force, compose, performance in (
+                ("off", False, False, False), ("forced", True, False, False),
+                ("off", False, True, False), ("forced", True, True, False),
+                ("antilag2", False, True, False), ("antilag2", True, True, False),
+                ("off", False, False, True), ("forced", True, True, True),
+                ("antilag2", False, False, True)):
+            with self.subTest(mode=mode, force=force, compose=compose, performance=performance), tempfile.TemporaryDirectory(dir=SCRATCH, prefix="latency-") as directory:
+                base = Path(directory)
+                runtime = base / "runtime"
+                native = runtime / "lib/wine/x86_64-unix/winemetal.so"
+                native.parent.mkdir(parents=True)
+                native.write_bytes(b"controlled native module")
+                manifest = runtime / "owned-graphics-runtime.json"
+                manifest.write_text('{"schema": 1}\n')
+                fixture = base / "latency.exe"
+                fixture.write_bytes(controlled_pe_fixture())
+                args = argparse.Namespace(runtime=runtime, lock=manifest, fixture=fixture, dxil_dir=base,
+                    out=base / "result", suite="low-latency", mode="present", validation=False,
+                    api_validation=False, timeout=1, low_latency_mode=mode, low_latency_frames=2,
+                    low_latency_performance=performance, force_low_latency=force,
+                    async_pipeline_compile=compose, auto_breadcrumbs=compose)
+                observed_config = []
+
+                def fake_run(command, **kwargs):
+                    if command[0] == str(runtime / "bin/wine"):
+                        observed_config.append(kwargs["env"].get("D3DALLOY_CONFIG"))
+                        self.assertNotIn("D3DALLOY_CONFIG_FILE", kwargs["env"])
+                        kwargs["stdout"].write(self.trace(mode=mode))
+                        fixture_stderr = self.stderr(mode=mode)
+                        if performance:
+                            fixture_stderr = fixture_stderr.splitlines()[0] + "\n"
+                        kwargs["stderr"].write(f"dyld[1]: {native}\n" + fixture_stderr)
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                with patch.object(runner.subprocess, "run", side_effect=fake_run), \
+                     patch.dict(runner.os.environ, {"D3DALLOY_CONFIG": "d3d12.lowLatency=True;foreign=1",
+                                                   "D3DALLOY_CONFIG_FILE": "/foreign/settings"}), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    result = runner.run(args)
+                expected = "d3d12.asyncPipelineCompile=True;d3d12.enableAutoBreadcrumbs=True" if compose else ""
+                if force:
+                    expected = ";".join(filter(None, (expected, "d3d12.lowLatency=True")))
+                self.assertEqual(observed_config, [expected or None])
+                self.assertEqual(result, 0)
+                report = json.loads((args.out / "result.json").read_text())
+                self.assertEqual(report["explicit_configuration"], expected or None)
+                self.assertEqual(report["force_low_latency"], force)
+                self.assertEqual(report["low_latency_performance"], performance)
+                self.assertEqual(report["low_latency_trace_assertions_exercised"], not performance)
+                self.assertEqual(report["owned_graphics_trace_enabled"], not performance)
+                self.assertEqual(report["logger_level"], "warn" if performance else "info")
+                self.assertTrue(report["pass"])
 
 
 class Phase3PipelineMSAA(unittest.TestCase):

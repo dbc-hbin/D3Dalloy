@@ -1313,48 +1313,54 @@ OperationLowerer::lowerWideArith(CallInst &call, uint32_t opcode, IRBuilder<> &b
   Type *type = lhs->getType();
   if (!type->isIntegerTy(32) || rhs->getType() != type)
     return unsupported("dx.op integer arithmetic is only supported for the 32 bit overload");
-  if (Error error = expectAggregateResult(call, 2, type, "dx.op integer arithmetic"))
+  if (opcode == OpUAddc || opcode == OpUSubb) {
+    auto *result = dyn_cast<StructType>(call.getType());
+    if (!result || result->getNumElements() != 2 || result->getElementType(0) != type ||
+        !result->getElementType(1)->isIntegerTy(1))
+      return unsupported("dx.op carry arithmetic requires {i32, i1}");
+  } else if (Error error = expectAggregateResult(call, 2, type, "dx.op integer arithmetic")) {
     return std::move(error);
+  }
 
-  Value *low = nullptr;
-  Value *high = nullptr;
+  Value *first = nullptr;
+  Value *second = nullptr;
   switch (opcode) {
   case OpIMul: {
     Value *product = builder.CreateMul(builder.CreateSExt(lhs, builder.getInt64Ty()),
                                       builder.CreateSExt(rhs, builder.getInt64Ty()));
-    low = builder.CreateTrunc(product, type);
-    high = builder.CreateTrunc(builder.CreateAShr(product, 32), type);
+    first = builder.CreateTrunc(builder.CreateAShr(product, 32), type);
+    second = builder.CreateTrunc(product, type);
     break;
   }
   case OpUMul: {
     Value *product = builder.CreateMul(builder.CreateZExt(lhs, builder.getInt64Ty()),
                                       builder.CreateZExt(rhs, builder.getInt64Ty()));
-    low = builder.CreateTrunc(product, type);
-    high = builder.CreateTrunc(builder.CreateLShr(product, 32), type);
+    first = builder.CreateTrunc(builder.CreateLShr(product, 32), type);
+    second = builder.CreateTrunc(product, type);
     break;
   }
   case OpUDiv: {
     /* DXIL division by zero is undefined; LLVM's udiv poisons, which keeps that
      * contract without inventing a value. */
-    low = builder.CreateUDiv(lhs, rhs);
-    high = builder.CreateURem(lhs, rhs);
+    first = builder.CreateUDiv(lhs, rhs);
+    second = builder.CreateURem(lhs, rhs);
     break;
   }
   case OpUAddc: {
-    low = builder.CreateAdd(lhs, rhs);
-    high = builder.CreateZExt(builder.CreateICmpULT(low, lhs), type);
+    first = builder.CreateAdd(lhs, rhs);
+    second = builder.CreateICmpULT(first, lhs);
     break;
   }
   case OpUSubb: {
-    low = builder.CreateSub(lhs, rhs);
-    high = builder.CreateZExt(builder.CreateICmpUGT(rhs, lhs), type);
+    first = builder.CreateSub(lhs, rhs);
+    second = builder.CreateICmpULT(lhs, rhs);
     break;
   }
   default:
     return unsupported(("unhandled dx.op integer arithmetic opcode " + Twine(opcode)).str());
   }
 
-  return buildAggregate(builder, call.getType(), {low, high});
+  return buildAggregate(builder, call.getType(), {first, second});
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1421,23 +1427,27 @@ OperationLowerer::lowerBitField(CallInst &call, uint32_t opcode, IRBuilder<> &bu
   if (call.getType() != type)
     return createError("dx.op bit field operation result is not i32");
 
-  /* MSL's extract_bits/insert_bits (and therefore AIR's) define the same
-   * out-of-range clamping as D3D's ubfe/ibfe/bfi. */
+  // DXIL masks width/offset to five bits; AIR takes value/offset/width and
+  // requires a range contained in the 32-bit value.
+  Value *width = builder.CreateAnd(call.getArgOperand(1), builder.getInt32(31));
+  Value *offset = builder.CreateAnd(call.getArgOperand(2), builder.getInt32(31));
+  Value *available = builder.CreateSub(builder.getInt32(32), offset);
+  width = builder.CreateSelect(builder.CreateICmpULT(width, available), width, available);
   switch (opcode) {
   case OpUbfe:
     return emitAIR(
       builder, airSymbol(air_builder, "air.extract_bits", type, air::Signedness::Unsigned),
-      {call.getArgOperand(1), call.getArgOperand(2), call.getArgOperand(3)}, type, false
+      {call.getArgOperand(3), offset, width}, type, false
     );
   case OpIbfe:
     return emitAIR(
       builder, airSymbol(air_builder, "air.extract_bits", type, air::Signedness::Signed),
-      {call.getArgOperand(1), call.getArgOperand(2), call.getArgOperand(3)}, type, false
+      {call.getArgOperand(3), offset, width}, type, false
     );
   case OpBfi:
     return emitAIR(
       builder, airSymbol(air_builder, "air.insert_bits", type, air::Signedness::Unsigned),
-      {call.getArgOperand(1), call.getArgOperand(2), call.getArgOperand(3), call.getArgOperand(4)}, type, false
+      {call.getArgOperand(4), call.getArgOperand(3), offset, width}, type, false
     );
   default:
     return unsupported(("unhandled dx.op bit field opcode " + Twine(opcode)).str());
@@ -1865,11 +1875,97 @@ OperationLowerer::lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &b,
   if (opcode == OpWaveReadLaneAt && !call.getArgOperand(2)->getType()->isIntegerTy(32))
     return createError("DXIL wide lane read index must be i32");
 
+  auto pointer = [&](Value *index) { return b.CreateInBoundsGEP(wide_scratch->getValueType(), wide_scratch, {b.getInt32(0), index}); };
+  const auto nativeLane = [&] { return b.CreateAnd(lane, b.getInt32(kNativeWaveLanes - 1)); };
+  const auto partialAt = [&](unsigned group, Type *result_type, Value *identity) -> Value * {
+    Value *present = b.CreateICmpULT(b.getInt32(group * kNativeWaveLanes), active);
+    Value *index = b.CreateSelect(present, b.getInt32(group * kNativeWaveLanes), b.getInt32(0));
+    auto *load = b.CreateLoad(b.getInt64Ty(), pointer(b.CreateAdd(base, index)));
+    load->setVolatile(true);
+    return b.CreateSelect(present, b.CreateZExtOrTrunc(load, result_type), identity);
+  };
+  if (!multi && reduction && type->isIntegerTy()) {
+    // Exact associative integer arithmetic: one physical-SIMD partial followed
+    // by only 2/4 shared-memory partials, not 64/128 lane reads per thread.
+    // Floating-point and arbitrary per-lane multi-prefix masks keep the ordered
+    // reference path below, including precise/denormal handling.
+    Value *identity = waveIdentity(b, kind, type, is_signed);
+    Value *partial = nullptr, *localPrefix = nullptr;
+    if (type->isIntegerTy(64)) {
+      auto exchange = [&](Value *v, Value *index) {
+        auto *pair = FixedVectorType::get(b.getInt32Ty(), 2);
+        return b.CreateBitCast(emitAIR(b, "air.simd_shuffle.u.v2i32",
+            {b.CreateBitCast(v, pair), b.CreateTrunc(index, b.getInt16Ty())}, pair, true), type);
+      };
+      Value *local = nativeLane(), *inclusive = value;
+      for (unsigned stride = 1; stride < kNativeWaveLanes; stride *= 2) {
+        Value *hasPrevious = b.CreateICmpUGE(local, b.getInt32(stride));
+        Value *index = b.CreateSelect(hasPrevious, b.CreateSub(local,b.getInt32(stride)), b.getInt32(0));
+        Value *previous = exchange(inclusive, index);
+        inclusive = b.CreateSelect(hasPrevious, waveCombine(b,air,kind,previous,inclusive,is_signed), inclusive);
+      }
+      Value *remainingLocal = b.CreateSub(active, b.CreateAnd(lane,b.getInt32(~(kNativeWaveLanes - 1))));
+      Value *last = b.CreateSub(b.CreateSelect(b.CreateICmpULT(remainingLocal,b.getInt32(kNativeWaveLanes)),
+          remainingLocal,b.getInt32(kNativeWaveLanes)), b.getInt32(1));
+      partial = exchange(inclusive,last);
+      if (prefix) {
+        Value *first = b.CreateICmpEQ(local,b.getInt32(0));
+        localPrefix = b.CreateSelect(first,identity,exchange(inclusive,
+            b.CreateSelect(first,b.getInt32(0),b.CreateSub(local,b.getInt32(1)))));
+      }
+    } else {
+      Type *nativeType = type->isIntegerTy(16) ? type : b.getInt32Ty();
+      Value *nativeValue = is_signed ? b.CreateSExtOrTrunc(value,nativeType) : b.CreateZExtOrTrunc(value,nativeType);
+      const bool bitwise = kind == WaveReduce::And || kind == WaveReduce::Or || kind == WaveReduce::Xor;
+      const auto sign = airSign(nativeType,bitwise || !is_signed);
+      partial = b.CreateZExtOrTrunc(emitAIR(b,airSymbol(air,waveNativeName(kind,false),nativeType,sign),
+          {nativeValue},nativeType,true),type);
+      if (prefix) localPrefix = b.CreateZExtOrTrunc(emitAIR(b,
+          airSymbol(air,waveNativeName(kind,true),nativeType,sign),{nativeValue},nativeType,true),type);
+    }
+    b.CreateStore(b.CreateZExtOrTrunc(partial,b.getInt64Ty()),pointer(wide_group_index))->setVolatile(true);
+    air.CreateBarrier(air::MemFlags::Threadgroup,false);
+    Value *result = identity;
+    for (unsigned group = 0; group < wave_lanes / kNativeWaveLanes; ++group) {
+      Value *next = waveCombine(b,air,kind,result,partialAt(group,type,identity),is_signed);
+      result = prefix ? b.CreateSelect(b.CreateICmpULT(b.getInt32(group * kNativeWaveLanes),
+          b.CreateAnd(lane,b.getInt32(~(kNativeWaveLanes-1)))),next,result) : next;
+    }
+    if (prefix) result = waveCombine(b,air,kind,result,localPrefix,is_signed);
+    air.CreateBarrier(air::MemFlags::Threadgroup,false);
+    return result;
+  }
+  if (vote) {
+    Value *condition = opcode == OpWaveAllTrue ? b.CreateNot(value) : value;
+    Value *ballot = b.CreateTrunc(emitAIR(b,"air.simd_ballot.i64",{condition},b.getInt64Ty(),true),b.getInt32Ty());
+    b.CreateStore(b.CreateZExt(ballot,b.getInt64Ty()),pointer(wide_group_index))->setVolatile(true);
+    air.CreateBarrier(air::MemFlags::Threadgroup,false);
+    SmallVector<Value *,4> words(4,b.getInt32(0));
+    Value *result = b.getInt32(0);
+    for (unsigned group = 0; group < wave_lanes / kNativeWaveLanes; ++group) {
+      Value *word = partialAt(group,b.getInt32Ty(),b.getInt32(0));
+      if (multi) word = b.CreateAnd(word,call.getArgOperand(2+group));
+      if (prefix) {
+        Value *groupIndex = b.CreateLShr(lane,b.getInt32(5));
+        Value *below = b.CreateSub(b.CreateShl(b.getInt32(1),nativeLane()),b.getInt32(1));
+        word = b.CreateAnd(word,b.CreateSelect(b.CreateICmpULT(b.getInt32(group),groupIndex),
+            b.getInt32(~0u),b.CreateSelect(b.CreateICmpEQ(b.getInt32(group),groupIndex),below,b.getInt32(0))));
+      }
+      words[group] = word;
+      result = count_result ? b.CreateAdd(result,emitAIR(b,"air.popcount.i32",{word},b.getInt32Ty(),false))
+          : b.CreateOr(result,word);
+    }
+    air.CreateBarrier(air::MemFlags::Threadgroup,false);
+    if (opcode == OpWaveActiveBallot) return buildAggregate(b,call.getType(),words);
+    if (opcode == OpWaveAnyTrue) return b.CreateICmpNE(result,b.getInt32(0));
+    if (opcode == OpWaveAllTrue) return b.CreateICmpEQ(result,b.getInt32(0));
+    return result;
+  }
+
   // One snapshot per group, not per physical SIMD. Both barriers are unconditional:
   // admission ran on the original DXIL before any stage/resource lowering.
   Type *bits_type = type->isFloatingPointTy() ? b.getIntNTy(type->getPrimitiveSizeInBits()) : type;
   Value *bits = type->isFloatingPointTy() ? b.CreateBitCast(value, bits_type) : value;
-  auto pointer = [&](Value *index) { return b.CreateInBoundsGEP(wide_scratch->getValueType(), wide_scratch, {b.getInt32(0), index}); };
   b.CreateStore(b.CreateZExtOrTrunc(bits, b.getInt64Ty()), pointer(wide_group_index))->setVolatile(true);
   air.CreateBarrier(air::MemFlags::Threadgroup, false);
   auto read = [&](Value *index) -> Value * {

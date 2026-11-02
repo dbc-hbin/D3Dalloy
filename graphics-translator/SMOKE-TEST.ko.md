@@ -6,6 +6,22 @@
 
 지원 matrix·검증 경계는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md#검증-범위와-증거), 미완료 작업·실행 선택은 [PRIORITIES](IMPLEMENTATION-PRIORITIES.ko.md), 날짜별 관찰은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에서 관리한다. 과거 완료한 P0–P3 개발 단계와 새 backlog P0–P4는 다르다. Named acceptance·mixed-cut recovery를 전체 conformance나 최신 단일cut 실행으로 읽지 않는다.
 
+## DXIL 산술·내부 FP16 전달 회귀
+
+`test-owned-airconv-operations.py`는 macOS native `libairconv.a`가 빌드된 Meson directory를 사용한다. Metal frontend는 kernel ABI만 제공하며, 실제 `dx.op`를 production lowering·metallib writer로 변환해 GPU에서 실행한다. Bitfield 32,768개, wide arithmetic 56개, carry/borrow 64개 입력의 총 98,896개 결과를 독립 정수 oracle와 비교하고 API+Shader Validation을 켠다.
+
+```sh
+python3 scripts/test-owned-airconv-operations.py \
+  --build-root build/local/build \
+  --output build/local/airconv-operations-check-001
+```
+
+`--output`은 새 경로여야 한다. 빌드에 설정된 native LLVM include/link 인자를 재사용하며, 로그·명령·compiler/source hash는 output의 `result.json`에 기록한다. 이 검사는 public D3D12 실행을 대체하지 않는다.
+
+Tessellation fixture의 native FP16 검사는 `tests/dxil/tessellation-half.hlsl`과 `tessellation-{vs_half,hs_half_independent,hs_half_dependent,ds_half,ps_half}.dxil`을 추가로 사용한다. `tests/dxil/build-gsts.sh`는 이 다섯 입력을 genuine DXC의 SM6.2·`-enable-16bit-types`로 생성한다. 별도 input directory를 사용할 때 기존 tessellation·gsindirect 입력과 새 HLSL/DXIL을 함께 stage한다. 새 fixture는 기존 DXBC/DXIL 166-case matrix 각각에 더해 24개 draw·288개 half 값의 정상수·subnormal·signed zero·Inf·NaN 전달을 검사한다. NaN payload 자체의 보존은 요구하지 않는다.
+
+공개 `--suite tessellation --validation`은 independent PCF와 output-control-point를 읽는 PCF 모두의 전체 픽셀·domain-point readback을 확인하고 `HALF_TRANSPORT_PASS` marker를 요구한다. FP16 admission은 한 object 함수 안에서 native F16 signature가 일치하는 DXIL VS→HS에만 적용한다. CPU 변환을 바꿨을 때는 `geometry`, `conservative-raster`, `sm6`, `mesh-shader`, `stream-output`도 같은 fresh runtime으로 실행한다.
+
 ## CPU/tooling 검증
 
 저장소 루트에서 필요한 범위만 실행한다.
@@ -18,6 +34,8 @@ python3 scripts/test-owned-graphics-staging.py
 python3 scripts/test-owned-graphics-diagnostics.py
 python3 scripts/test-owned-ngx-frontend.py
 python3 graphics-translator/tests/run-command-recording-cpu.py
+python3 graphics-translator/tests/run-static-optimization-cpu.py
+python3 graphics-translator/tests/run-submission-foundation-cpu.py
 ```
 
 - `build`: frozen import builder의 pin/patch/input/artifact 계약이며 현재 루트 translator 전체 빌드가 아니다.
@@ -25,6 +43,8 @@ python3 graphics-translator/tests/run-command-recording-cpu.py
 - `diagnostics`: runner의 suite marker/readback/validation 판정.
 - `ngx-frontend`: 현재 소스에서 frontend DLL을 CPU/PE로 만들고 exports/MSVC parameter ABI를 검사한다. `--abi-only --all-abis`는 x86/x64/ARM64/ARM64EC의 SR/FG/RR exports·calling convention과 RR 1.2·legacy 1.0/1.1·bridge POD의 MSVC/MinGW C/C++ layout을 비교한다. GPU나 NVIDIA DLSS 품질 증거가 아니다.
 - `run-command-recording-cpu`: 실제 allocator·recording·Signal 함수 본문을 ASan/UBSan으로 실행한다. 최초 할당과 arena 확장/metadata 할당 실패의 소유권 rollback, void recording의 첫 오류와 `Close`/HRESULT 전파, trace 비활성 시 불필요한 할당 부재 및 commit 이후 독립 snapshot 수명을 검사한다.
+- `run-static-optimization-cpu`: production helper/descriptor 함수 본문을 ASan/UBSan으로 실행한다. 기존 8개 helper와 추가16종의 12-list 동시 초기화·device 격리·부분 실패 재시도, descriptor replace의 clear 생략 및 fallback/실패 null 처리를 검사한다. 실제 `owned_shader_bytecode.hpp`도 정상 SHA-1/강제 전체 collision 두 모드로 실행해 caller mutation·동시 공유·256-entry admission·소유권을 검사한다. `async-pipeline-queue.test.cpp`는 consumer가 첫 job을 실행 중일 때 단일 worker가 둘째 job을 완료하고 각 callback이 한 번만 실행되는지 실제 queue/header로 검사한다. Promise로 순서를 고정하며5초 watchdog을 성능 기준으로 사용하지 않는다. Native GPU 실행 증거와 구분한다.
+- `run-submission-foundation-cpu`: 실제 physical frontier·pinned VA·native-state cache header를 ASan/UBSan으로 실행한다. Texture plane/heap/byte hazard30720개·동일 노드 stage·partial WAR·모든 inflight producer 보존,4096개 disjoint range에서1개 방문,4-reader/20000-publication owner pin·주소 재사용,12-thread sampler 및 DS semantic key·eviction·실패·ICB padding 무시를 검사한다. Mock native 호출 수와 실제 GPU 결과를 혼동하지 않는다.
 
 `enable_tests=true`의 업스트림 DX11 samples 및 수동 CPU `*.test.cpp` probes와 공용 PE/GPU runner는 별개다. 일반 project-wide lint/자동 GPU suite가 있다고 가정하지 않는다.
 
@@ -39,6 +59,31 @@ python3 graphics-translator/tests/run-automatic-cache-cpu.py \
 내용 readback, 256MiB 한도에서 같은 key 교체, 다른 프로세스의 저장·clear, rename 실패와 mutex 소유자 종료 뒤 복구, foreign file 보존과 PSO/stage accounting namespace 격리를 검사한다. Stage cache가 256MiB에 차면 oldest-write 순으로 퇴출하되 현재 프로세스가 읽거나 쓴 entry는 남기고, 열린 reader가 퇴출된 파일을 계속 읽을 수 있으며 crashed writer의 stage temp가 회수되는지도 검사한다. Stage artifact 소멸자의 error-release import는 선택한 runtime의 실제 `winemetal.dll`에 연결한다. Runner는 전용 prefix/TEMP를 만들고 해당 Wine 종료 뒤 제거한다. `metadata_enumerations`는 256회 작은 저장의 관측값이며 시간 기반 합격 기준이 아니다.
 
 실제 셰이더 실패 입력이 필요하면 미리 만든 **Windows 경로**를 `D3DALLOY_SHADER_FAILURE_PATH`로 지정한다. 초기 VS/PS/CS 컴파일 실패에서 stage·bytecode·root-signature 조합별 최대64개를 `.failure` 디렉터리에 저장한다(`shader.cso`, `rootsig.bin`, compilation arguments의 `metadata.txt`, `error.txt`, module-relative caller `stack.txt`). 기본값은 꺼짐이며 모든 shader variant/native PSO 실패를 포괄하지 않는다. 게임 소유 bytecode와 실행 경로가 포함되므로 private evidence로 보관하고 저장소에 추가하거나 외부에 전송하지 않는다.
+
+## PSO native archive와 DXR executable cache
+
+Native archive는 AIR/owned PSO blob과 별도 계층이다. Cold/warm에 같은 native binary·device·OS·prefix·validation namespace를 사용해야 한다. Production은 생성 요청이 온 PSO만 수집하며 `D3DALLOY_METAL4_ARCHIVE=0`이 opt-out이다. `D3DALLOY_METAL4_ARCHIVE_DIR`은 절대경로만 받으며, `D3DALLOY_METAL4_ARCHIVE_TRACE=1`은 진단용이다. Test runner는 상속된 설정을 그대로 쓰지 않고 `--out/native-pipeline-archives`로 격리한다. Public trace가 필요하면 `--native-archive-trace`를 명시한다.
+
+```sh
+python3 graphics-translator/tests/run-metal4-archive-native.py --out "$OUT/native-archive"
+```
+
+Output은 기존 디렉터리가 아니어야 한다. 이 native runner는 실제 `winemetal_metal4_pipeline.c`와 archive 구현을 빌드해 cold/new-process warm, clear/disable/enable·paused serialization·capture 실패·손상 파일·잘못된 directory·Shader Validation의7조건을 검사한다. Warm에는 compiler selector를 실패하도록 막으며 compute/specialized/linked/render/mesh5종의 GPU 출력이 같고 compiler 호출이0이어야 한다. Cold는 compute3/render2다. Directory와 blob만 존재하거나 pipeline 생성 시간이 짧다는 이유로 archive hit를 인정하지 않는다. Source·binary·SDK·mode hash가 result에 기록된다.
+
+현재 macOS27.2/M5 Pro의 instrumented archive는 public API load에서 호환성 오류가 난다. 따라서 앞6조건은 API Validation ON/Shader Validation OFF의 archive proof이고, 마지막은 **API+Shader Validation ON**에서 부적합 capture가 게시되지 않고 기존 pipeline의 GPU output이 정확한지 검사한다. Production이나 테스트가 실패를 숨기려고 validation을 끄는 fallback은 없다. 다른 OS에서 validated archive가 지원되면 마지막 검사도 compiler를 막아 실제 hit를 확인한다. 이 차이는 [CORE 결과](CORE-IMPLEMENTATION-STATUS.ko.md#pso-지연과-dxr-실행-객체--2026-11-02)에 명시한다.
+
+Public RT focus는 기존 full raytracing geometry/table oracle를 include하는 새 executable이다. `LLVM_MINGW`는 toolchain bin이고, `RUNTIME`은 현재 source의 paired/native package, `DXIL`은 regular frozen input directory다. **`-municode`가 필요**하다.
+
+```sh
+"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static -municode graphics-translator/tests/owned-d3d12-rt-executable-cache.cpp -ld3d12 -ld3dcompiler -ldxgi -ldxguid -lole32 -luuid -ladvapi32 -o "$OUT/rt-executable-cache.exe"
+python3 scripts/test-owned-graphics.py --runtime "$RUNTIME" --fixture "$OUT/rt-executable-cache.exe" --suite rt-executable-cache --validation --native-archive-trace --guest-arch x64 --mode no-present --timeout 300 --dxil-dir "$DXIL" --out "$OUT/rt-cache-run"
+```
+
+동일 state4thread의 native link1개·warm0개·다른 local-root2객체의 link1개·live clear 뒤1개를 각각의 phase 안에서 세어야 한다. Raytracing library만 cache hit한 것을 native linked PSO hit로 바꾸지 않는다. Mutable identifiers/table/local-root와 살아 있는 old object가 clear 뒤 유효하며, caller release-before-submit도 GPU10dispatch의 exact triangle/any-hit/procedural/miss 결과를 보존해야 한다. Missing/duplicate operations·동일 key로 잘못 합친 variant·GPU mismatch는 diagnostics가 거부한다.
+
+Public archive 소비는 기존 `pipeline-cache` suite를 새 output의 **`--api-validation --native-archive-trace`**로 실행해 확인한다. 같은 suite의 `--validation` 실행도 별도로 통과해야 한다. 통과 run 수에 두 모드를 구분한다. `run-pipeline-cache-cpu.py`는 weak native entry의 membership clear와 live owner, last-owner 소멸 뒤 재생성, partial failure retry를 추가로 검사한다. Full `raytracing`, `raytracing-atomic64`, `pipeline-library`, `async-pipeline`, `shader-cache`, `geometry`, `tessellation`, `mesh-shader`, `render-passes`, `temporal`, `fsr-fg`, `fsr-rr`도 현재 build로 재검증한다.
+
+Render/RT phase markers는 bounded single `WriteFile`로 내보낸다. 기존 CRT `fprintf`가 async native cache logger와 줄 중간에 섞인 실패는 parser를 느슨하게 고쳐 통과시키지 않는다. 정확한 phase order·native operation count·numeric oracle와 module/source identity를 계속 요구한다. 이 절차는 실게임 wall-time·FPS 개선율 측정이 아니다.
 
 ## Conservative Tier3 public proof
 
@@ -65,6 +110,112 @@ done
 ```
 
 최종 acceptance는 actual cap3·exit0/pass=true·API+Shader Validation·owned backend 확인·validation/foreign 오류0과 retained 전체 geometry/ClipDistance/CullDistance matrix를 요구한다. Numeric oracle는10 families×7=70 Tier3 grid rows·18 DXIL/DXBC early/late depth/stencil/UAV/occlusion interactions·16K precision·degenerate point/line·winding/cull/Vertex0/depth·helper·SampleMask·forced4·OFF/ON toggle·indirect/bundle/replay와 새 AS/MS FrontCounterClockwise cull·near/far DepthClip ON/OFF4 rows를 검사한다. ON은 각 covered28·mandatory10, ClipDistance3e066666·depth00000000/3f800000, OFF는 각 covered64·mandatory64, ClipDistance3f31999a·depth39000000/3f7ff800의 exact comparison이다. Before의 post-snap-line 실패는 Tier1이 허용하는 cull이며 과거 Tier1 proof를 무효화하지 않는다. 기존1/128 ambiguity band는 유지하고 Tier3-specific exact-grid bounds는 별도로 검사한다. OFF/nontriangle에서 undefined인 InnerCoverage 특정 상수는 요구하지 않는다. 새 재현에서는 paired cut의 `depth-bounds`, `pipeline-statistics`, `multisample-capabilities`도 ABI별 직렬 실행하고 cut/manifest를 각각 기록한다. 위 관찰된8회는5개 runtime03+3개 retained runtime02의 mixed-cut이지 이 새 recipe를 동일 cut에서 실행했다는 주장이 아니다.
+
+## 정적 최적화의 native focused probe
+
+`NATIVE_BUILD`는 현재 root source를 빌드해 `src/fsr-kernels.inc`와 `src/fsr-rr-kernels.inc`를 생성한 native Meson build, `OPT_OUT`은 새 evidence 디렉터리다. 아래 native probe는 Wine prefix를 사용하지 않는다. Runtime/PE 회귀와 별도로 [CORE3차](CORE-IMPLEMENTATION-STATUS.ko.md#정적-최적화-3차--2026-11-02)의 source identity·출력 계약을 따른다.
+
+```sh
+mkdir "$OPT_OUT"
+xcrun clang++ -std=c++20 -O2 -fblocks -framework Foundation -framework Metal -framework MetalFX -I"$NATIVE_BUILD/src" graphics-translator/tests/owned-metalfx-optimization-native.mm -o "$OPT_OUT/metalfx-native"
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 "$OPT_OUT/metalfx-native" --pipelines-only > "$OPT_OUT/metalfx-pipelines.log" 2>&1
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 "$OPT_OUT/metalfx-native" --prepasses-only > "$OPT_OUT/metalfx-prepasses.log" 2>&1
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 "$OPT_OUT/metalfx-native" > "$OPT_OUT/metalfx-full.log" 2>&1
+xcrun clang++ -std=c++20 -O2 -fblocks -framework Foundation -framework Metal -framework MetalFX graphics-translator/tests/owned-rr-motion-native.mm -o "$OPT_OUT/rr-motion-native"
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 "$OPT_OUT/rr-motion-native" > "$OPT_OUT/rr-motion-native.log" 2>&1
+xcrun clang++ -std=c++20 -O2 -fblocks -framework Foundation -framework Metal -framework MetalFX -I"$NATIVE_BUILD/src" graphics-translator/tests/owned-amd-rr-cache-native.mm -o "$OPT_OUT/amd-rr-cache-native"
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 "$OPT_OUT/amd-rr-cache-native" > "$OPT_OUT/amd-rr-cache-native.log" 2>&1
+xcrun clang++ -std=c++20 -O2 -fblocks -framework Foundation -framework Metal -framework MetalFX -I"$NATIVE_BUILD/src" graphics-translator/tests/owned-fg-debug-native.mm src/winemetal/unix/metalfx_frame_generation.mm -o "$OPT_OUT/fg-native"
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 "$OPT_OUT/fg-native" > "$OPT_OUT/fg-native.log" 2>&1
+xcrun clang++ -std=c++20 -O2 -fobjc-arc -framework Foundation -framework Metal graphics-translator/tests/owned-fg-normalization-native.mm -o "$OPT_OUT/fg-kernels-native"
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 "$OPT_OUT/fg-kernels-native" src/winemetal/unix/fsr-kernels.metal > "$OPT_OUT/fg-kernels.log" 2>&1
+```
+
+`--pipelines-only`는 실제 PSO 공유·동시 첫 생성·예외 재시도에 한정한 exit code다. 옵션 없는 기존 full SR/FG image test의 성공으로 세지 않는다. RR motion probe는 native NGX RR의 9개 motion 조건·8-frame descriptor generation 재사용 및 idle scratch 정책을 검사한다. AMD cache probe는 production provider의 실제 PSO/model 생성을 관찰하며 A→B→A→A, 독립 feature와 Dormant 후 출력·reset을 검사한다. Public D3D12 queue/resolve는 별도 fixture로 검증한다. Rust를 사용하는 CPU/build 회귀는 README의 pinned `toolchains/rust-1.85.1/bin`을 `PATH` 앞에 두며 시스템 Rust/LLVM 조합을 같은 toolchain으로 취급하지 않는다.
+
+`--prepasses-only`는 pipeline proof에 더해 production prepass의24조건 전체 color/alpha bytes와 dispatch1개 감소, 단일 arena의256-byte 정렬·비중첩·동시 execution 불변성을 검사한다. Generated inc는 현재 source와 같아야 한다. 옵션 없는 default의 offset·강제 staging·96개 padding·cache·Dormant·native FG oracle도 통과해야 한다. 1·2차의 검은 offset 실패는 caller residency 누락을 수정해3차에서 해소했고, 이전 로그나 허용치는 바꾸지 않았다.
+
+NGX RR probe는 packed normal/roughness의6개 포맷·rect·비유한 값 조건을 기존 분리 kernel과 byte-compare하고 직접 입력 등 부적격 조건이 합쳐지지 않는지 확인한다. AMD probe는 PSO11개 공유·generation별 GPU zero-clear1회와 history reset을 확인한다. `OWNED_RR_CAPTURE`는 새 경로에만 사용하며 이전 provider와의 전체 출력 parity는 별도 비교한다. FG probe는 같은 source/view/rect의 decode1회 대 별도 source2회, real ROI5조건의 정확한 baseline/sentinel 및 copied pixels를 확인한다. Native64·128 grid는 각자6-frame direct/scaled-motion/입력변경을 비교한다. 서로 다른 native grid의 출력 동일성을 요구하거나 허용치를 늘리지 않는다. `--normalization-only`와 `OWNED_FG_PROOF_OUTPUT=<새 디렉터리>`로 이전 provider와36개 출력 비교를 재현할 수 있다.
+
+`run-static-optimization-cpu.py`는 실제 `CanonicalStageKey`의1MiB input50회 cache-hit에서 큰 임시 allocation0, 기존 canonical bytes/SHA-1, 다른 segmentation·강제 bucket collision·owned lifetime을 ASan/UBSan으로 확인한다. `run-pipeline-cache-cpu.py`는 private serialized blob 재사용과 public writable copy 격리, 초기 실패 뒤 retry를 포함한다. Public pipeline-library fixture도 caller의 `GetCachedBlob` 변조가 library Serialize 및 alias PSO에 영향을 주지 않아야 한다.
+
+## 정적 최적화 4차 재현
+
+`run-static-optimization-cpu.py`는 `OwnedTemporalSubmissionLocks`의 서로 반대 순서 feature 예약·독립 동시 보유·같은 feature8000회 commit-before-unlock·예외 해제를 검사한다. Atomic64는1MiB의131072개 연속 cell을 interval1개로 표현하고200000개 임의 owner/layout/alias를 기존 map의 exact first-seen ID와 비교한다. ASan/UBSan이며 실제 GPU ordering을 대체하지 않는다.
+
+FG native full probe는 성공한 Generate가 먼저 최종 계약을 선택한 경우와 raw Prepare 선실행을24개 history 조건에서 비교한다. Source offset·FP32 motion·camera·invalid vector·reset·jitter fallback·실패 Generate·Prepare 후 poison·Generate 전 destroy를 포함한다. `EXPECT_GUIDE_BAKING=0`은 **비교용 이전 provider와 테스트를 같이 빌드할 때만** 사용한다. Candidate에서 fallback을 강제로 켜 성공시키는 옵션이 아니다. Native full SR와 FG kernel 수식 oracle도 그대로 통과해야 한다.
+
+공개 `wide-waves`는 `owned-d3d12-sm6.cpp --wide-waves-only`에 대응하는 **집중 suite**다. 기존 whole-SM6/FP64 완료로 바꾸지 않는다. 새 `wide-wave-exact.hlsl`의4개 cs_6_6 entry는 `-enable-16bit-types`로 빌드하며 logical64/128, threadgroup173/17의 partial i64/i16 reduction/prefix/minmax/product·vote를 검사한다. 기존 wide float·ballot·명시 wave·divergence 거부도 필수다. `build-sm6.sh`가 입력을 재생성하고 runner는 모든 source/blob을 동결한다.
+
+공개 `workgraph-batches`는 frozen preview header로 `owned-d3d12-workgraph-batches.cpp`를 빌드한다. `build-work-graphs.sh`가 `workgraph-batches.hlsl`의 lib_6_8을 생성한다. CPU/GPU input 각각 ordinary66049그룹과 atomic65그룹의 full output·counter·guard를 확인하며 trace는 `65535+514`, `32+32+1`이어야 한다. Pixel/값만 맞고 batch가 빠진 결과는 PASS가 아니다. `work-graphs`, `workgraphs-atomic64`, `workgraphs-atomic64-typed`도 별도로 실행한다.
+
+```sh
+python3 scripts/test-owned-graphics.py --runtime "$RUNTIME" --fixture "$SM6_EXE" --suite wide-waves --validation --guest-arch x64 --mode no-present --timeout 300 --dxil-dir "$DXIL" --out "$OUT/wide"
+python3 scripts/test-owned-graphics.py --runtime "$RUNTIME" --fixture "$WG_BATCH_EXE" --suite workgraph-batches --validation --guest-arch x64 --mode no-present --timeout 300 --dxil-dir "$DXIL" --out "$OUT/wg-batch"
+```
+
+Temporal trace 검사는 이제 feature별·queue별 commit chain을 검사한다. 서로 다른 feature가 다른 큐에서 겹치는 것은 허용하되, 같은 feature의 다음 command buffer가 이전 commit을 추월하거나 이전 recording으로 되돌아가면 거부한다. Missing commit·GPU completion·signal/wait·retirement 조건도 유지한다. `test-owned-graphics-diagnostics.py`의 독립 overlap 양성 및 same-feature reorder 음성을 모두 통과해야 한다.
+
+Typed64/phase 회귀는 shader-visible pool view ID와 canonical metadata가 일치하고 same-dispatch ordinary reads도 shadow를 관찰해야 한다. `atomic64-phase`, `atomic64-typed`, `workgraphs-atomic64-typed`의 기존 numeric oracle를 완화하지 않는다. 누락된 입력은 pinned DXC와 해당 build-atomic64 스크립트로 regular file 디렉터리에 만들고 producer hash를 기록한다. Symlink input·동작이 다른 이전 blob·generic pass marker로 검사를 우회하지 않는다. [4차 증거와 실패 이력](CORE-IMPLEMENTATION-STATUS.ko.md#정적-최적화-4차--2026-11-02)을 따른다.
+
+## 독립 개선과 제출 기반 재설계 회귀
+
+`submission-foundation`은 current-source standalone PE fixture를 새 runtime/prefix로 실행한다. Close한 목록의 descriptor 갱신4회, root-update를 포함한 실제 ICB의 allocator reset3epoch, heap texture alias clear의 적법한 순서, nested occlusion32/16과 native fanout batch, reserved buffer2회 remap·alias read,256KiB 경계를 넘는 RGBA8/RGB32의 unaligned pointer/pitch strip 전체 byte·padding을 검사한다. Query reset·반복counter는 순서를 유지해야 한다. 값이 맞아도 ICB 재사용·sparse-negative proof·heap clear 분리·native query encoder 감소·batched residency trace가 없으면 실패한다.
+
+```sh
+"$LLVM_MINGW/x86_64-w64-mingw32-clang++" -std=c++20 -O2 -static graphics-translator/tests/owned-d3d12-submission-foundation.cpp -ld3d12 -ld3dcompiler -ldxgi -ldxguid -lole32 -luuid -o "$OUT/submission-foundation.exe"
+python3 scripts/test-owned-graphics.py --runtime "$RUNTIME" --fixture "$OUT/submission-foundation.exe" --suite submission-foundation --validation --guest-arch x64 --mode no-present --timeout 300 --out "$OUT/foundation-run"
+```
+
+Fixture는 공용 render-pass helper를 include하므로 runner가 두 source를 모두 동결한다. 단순 dispatch-indirect shortcut이 아니라 root-update signature로 native ICB 생성/재사용을 증명한다. 첫 버전이 숫자검사는 통과해도 ICB를 사용하지 않아 실패한 기록을 삭제하지 않는다. 공개 suite checker의 누락·중복 marker/trace 음성 검사는 diagnostics에 포함한다.
+
+기존 `render-passes`는 disjoint256/512개 writer를 두 번 replay해 pixels·merging/barriers를 확인한다. Interval frontier의 `history_checks=0`과 opaque 접근0을 모두 요구하며, 예전 vector scan의8064/16128회를 새 코드의 기대값으로 유지하지 않는다. Positive RAW/WAR/WAW·부분 subresource·scoped/global boundary의 기존 oracle는 그대로다.
+
+관련 공개 suite는 resources/copy-resolve/enhanced-barriers/render-passes/execution-safety/bindless/queries/pipeline-statistics/depth-plane-copy/expanded-formats/predication-indirect/residency/standard-swizzle/multiqueue/temporal/pipeline-cache/shader-cache/stream-output/raytracing/FSR 계열이다. Tiled full은 같은 fixture·shader 입력으로 이전 runtime과 비교하고 compiler-service XPC 실패를 clean PASS로 세지 않는다. 실제 mapping/remap alias 보존은 foundation과 full suite의 실패 전 검사 범위로 구분한다. [현재 결과·source cut](CORE-IMPLEMENTATION-STATUS.ko.md#독립-개선과-제출-기반-재설계--2026-11-02)을 따른다.
+
+## Adaptive low-latency acceptance
+
+`graphics-translator/tests/low-latency-scheduler.test.cpp`는 standalone C++20 CPU probe다.
+예측 제어의 CPU/GPU overlap, 입력 예약, 비동기 presenter의 생성/실제 frame 묶음,
+분할 native submission의 마지막 소유권 해제, GPU 시각과 CPU 회수의 분리, 명시적 frame 종료,
+역순 GPU 완료의 예측 시각 보존, 동시 Present 예약·실패 반환, 비차단 admission과
+여러 timed waiter의 장치 제거 취소를 검사한다.
+`clang++ -std=c++20 -O2 -pthread -Isrc/d3d12`로 빌드해 실행한다.
+Windows 대기 경로는 llvm-mingw로 `-std=c++20 -O2 -static -DNOMINMAX -Isrc/d3d12`
+및 `-lntdll`을 사용해 빌드한 동일 probe를 전용 Wine prefix에서 실행한다.
+정적 링크는 probe에 별도 `libc++.dll`/`libunwind.dll` 배포가 필요하지 않게 한다.
+
+`low-latency-reflex.test.cpp`는 실제 `ReflexState`의 capture/close 원자성,
+동시 real Present의 frame 분리와 생성/실제 grouping을 검사하는 Windows CPU probe다.
+위 Windows 옵션에 `-Isrc/winemetal -Isrc/util -Iinclude`를 추가한다.
+GPU나 완료 처리를 모의하지 않으며, 링크용 진단 출력만 생략한다.
+전용 prefix는 runner와 마찬가지로 `WINEDLLOVERRIDES=mscoree,mshtml=`을 설정한
+`wine.real wineboot -i`로 먼저 준비한다. Wrapper로 처음 부팅하면 addon 설치 대기로
+검사 시작 전에 멈출 수 있다.
+
+공개 GPU probe `graphics-translator/tests/owned-d3d12-low-latency.cpp`는
+`-std=c++20 -O2 -static -ld3d12 -ldxgi -ld3dcompiler -luuid`로 빌드한다.
+Runner의 `--suite low-latency --mode present --low-latency-mode off|forced|antilag2`
+와 `--low-latency-frames 120`을 사용한다. `forced`에는 `--force-low-latency`가 필수다.
+`antilag2`는 그 옵션 유무를 모두 실행해 강제·협조 경로가 중복 admission하지 않는지 확인한다.
+`off`와 `forced`는 NVAPI/AMD enable API를 호출하지 않는다.
+
+Runner는 상속된 `D3DALLOY_CONFIG`를 계속 제거한다. 테스트에서 강제 적용하려면
+명시적인 `--force-low-latency`를 써야 하며, 이는 다른 suite의 설정과 합성된다.
+실제 AMD SDK ABI의 preload·factory·options·input delay·frame-type/end-render 호출,
+프레임별 exact pixel readback, 실제 GPU query/CPU timestamp와 clock calibration,
+제어기 admission source를 검사한다. API+Shader Validation 실행은 정합성 증거이며,
+성능 비교는 validation을 끈 동일 workload에서 OFF/ON 순서를 교차해 별도로 수행한다.
+그때는 `--low-latency-performance`를 추가해 owned trace를 끄고 logger를 warn으로 제한한다.
+이 옵션은 low-latency suite에만 허용되며 pixel·API·timestamp·module 검사는 유지한다.
+반면 trace 기반 admission/completion 검사는 수행하지 않았다고 결과에 명시하므로
+일반 `--validation` 정합성 실행을 대체하지 않는다. 이전/새 런타임도 A/B/B/A로 교차한다.
+처음 30 frame을 warmup으로 제외하고 GPU 처리량·입력 marker부터 GPU 완료까지의 시간·
+submit-to-GPU-start를 비교한다. 이는 합성 부하이며 물리적 input-to-photon이나 게임 지연이 아니다.
+
+기존 `owned-nvapi-reflex.cpp`/`--suite nvapi-reflex`는 90 frame의 실제 NVAPI 호출과
+64개 완료 보고, interval 제한, 입력 전 overlap, out-of-band marker, 제거 취소를 검사한다.
+Reflex Boost는 지원하지 않는 것으로 반환한다.
 
 ## Async PSO compile acceptance
 

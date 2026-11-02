@@ -38,6 +38,12 @@ public:
 
 class Compiler : public WMT::Object {
 public:
+  void FlushArchive() {
+    struct WMTMetal4Call call{};call.operation=WMTMetal4PipelineArchiveFlush;call.args[0]=handle;WMTMetal4Call(&call);
+  }
+  static void ControlArchive(uint32_t flags) {
+    struct WMTMetal4Call call{};call.operation=WMTMetal4PipelineArchiveControl;call.args[0]=flags;WMTMetal4Call(&call);
+  }
   static WMT::Reference<Compiler> Create(WMT::Device device, WMT::Error &error) {
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4PipelineNewCompiler;

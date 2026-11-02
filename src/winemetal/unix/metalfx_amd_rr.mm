@@ -91,9 +91,10 @@ struct ExecutionBindings {
 struct NeuralGeneration {
     uint32_t width = 0, height = 0;
     std::array<Object,WMTRR_SIGNAL_COUNT> scalers;
-    // Albedo for the absent lighting component. Cleared once at creation and
-    // never written by the GPU, so it stays outside the scratch pool.
+    // Albedo for the absent lighting component. Its first execution clears it
+    // on the consuming command stream; later executions only read it.
     Storage zero;
+    bool zeroInitialized = false; // feature mutex; committed with successful encode state
 };
 bool radiance(unsigned s) { return s == 1 || s == 2 || s == 4 || s == 5; }
 bool hasRadiance(uint32_t signals) {
@@ -113,12 +114,15 @@ bool finite(const float* values, size_t count) {
     for (size_t i=0;i<count;++i) if (!std::isfinite(values[i])) return false;
     return true;
 }
-// The RR kernel library depends only on the device. Features share it; the
+// The RR kernel library and immutable PSOs depend only on the device. Features share them; the
 // weak cache never extends its lifetime past the last feature, and a failed
 // compilation is not cached so a later create retries.
 struct KernelLibrary {
     id<MTLDevice> device = nil;
     Object library;
+    mutable std::mutex pipelineMutex;
+    mutable std::array<std::pair<Object,Object>,11> pipelines;
+    Object getPipeline(NSString* name) const;
     ~KernelLibrary() { [device release]; }
 };
 std::mutex kernelLibraryMutex;
@@ -149,11 +153,24 @@ Object pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString* name) {
     [function release];
     Object result(state); [state release]; return result;
 }
+Object KernelLibrary::getPipeline(NSString* name) const {
+    std::lock_guard lock(pipelineMutex);
+    for (const auto& entry : pipelines)
+        if ([(NSString*)entry.first.get() isEqualToString:name]) return entry.second;
+    for (auto& entry : pipelines) {
+        if (entry.second) continue;
+        auto state = pipeline(device,(id<MTLLibrary>)library.get(),name);
+        if (!state) return {};
+        entry = {Object(name),std::move(state)};
+        return entry.second;
+    }
+    return {};
+}
 }
 
 struct Feature::Impl {
     Object device, compiler, snapshotPipeline, geometryPipeline, unpackPipeline, filterPipeline;
-    Object neuralCommonPipeline, neuralPreparePipeline, neuralResolvePipeline, neuralResolveWritePipeline;
+    Object neuralCommonPipeline, neuralPreparePipeline, neuralResolvePipeline, neuralResolveWritePipeline, zeroPipeline;
     Object resolvePipeline, resolveWritePipeline, historyFence;
     // Keeps the device cache entry alive while this feature exists.
     std::shared_ptr<const KernelLibrary> kernelLibrary;
@@ -162,6 +179,9 @@ struct Feature::Impl {
     std::mutex mutex;
     std::shared_ptr<History> history;
     std::shared_ptr<NeuralGeneration> neural;
+    // One alternate extent avoids rebuilding A after A->B->A. These objects
+    // may be reused, but a nonconsecutive history must still be reset.
+    std::shared_ptr<NeuralGeneration> alternateNeural;
     bool dormant = false;
     // History textures join scratch only after the last history reference retires.
     // Both limits come from the current execution's actual texture working set.
@@ -270,7 +290,7 @@ static std::shared_ptr<NeuralGeneration> makeNeuralGeneration(Feature::Impl& fea
             }
         } @finally { [descriptor release]; }
         auto device = (id<MTLDevice>)feature.device.get();
-        MTLTextureUsage zeroUsage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        MTLTextureUsage zeroUsage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         for (const auto& value : generation->scalers) if (value) {
             auto scaler = (id<MTL4FXTemporalDenoisedScaler>)value.get();
             zeroUsage |= scaler.diffuseAlbedoTextureUsage | scaler.specularAlbedoTextureUsage;
@@ -282,26 +302,9 @@ static std::shared_ptr<NeuralGeneration> makeNeuralGeneration(Feature::Impl& fea
         id<MTLTexture> zero = [device newTextureWithDescriptor:zeroDescriptor];
         if (!zero) { fail(error,ErrorCode::ResourceCreationFailed,"RR zero albedo allocation failed"); return {}; }
         Object zeroOwner(zero); [zero release];
-        // Private contents are undefined. Clear synchronously, like the
-        // synchronous scaler initialization above, before any frame reads it.
-        id<MTLCommandQueue> queue = [device newCommandQueue];
-        bool cleared = false;
-        if (queue) {
-            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-            pass.colorAttachments[0].texture = zero;
-            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-            pass.colorAttachments[0].clearColor = MTLClearColorMake(0,0,0,0);
-            id<MTLCommandBuffer> command = [queue commandBuffer];
-            id<MTLRenderCommandEncoder> clear = [command renderCommandEncoderWithDescriptor:pass];
-            if (clear) {
-                [clear endEncoding];
-                [command commit]; [command waitUntilCompleted];
-                cleared = command.status == MTLCommandBufferStatusCompleted;
-            }
-        }
-        [queue release];
-        if (!cleared) { fail(error,ErrorCode::ResourceCreationFailed,"RR zero albedo initialization failed"); return {}; }
+        // Private contents remain undefined until the first prefix dispatch. The
+        // execution lease/residency owns this allocation and existing prefix
+        // barriers order that clear before the isolated MetalFX consumers.
         generation->zero = std::make_shared<Allocation>((id<MTLResource>)zeroOwner.get(),feature.bytes);
         return generation;
     }
@@ -395,19 +398,20 @@ std::shared_ptr<Feature> Feature::create(void* nativeDevice, void* nativeCompile
             if (!state->kernelLibrary) {
                 fail(error,ErrorCode::ResourceCreationFailed,nativeError ? nativeError.localizedDescription.UTF8String : "RR shader compilation failed"); return {};
             }
-            auto library = (id<MTLLibrary>)state->kernelLibrary->library.get();
-            state->snapshotPipeline = pipeline(device,library,@"rr_snapshot");
-            state->geometryPipeline = pipeline(device,library,@"rr_geometry");
-            state->unpackPipeline = pipeline(device,library,@"rr_unpack");
-            state->filterPipeline = pipeline(device,library,@"rr_filter");
+            const auto& kernels = *state->kernelLibrary;
+            state->snapshotPipeline = kernels.getPipeline(@"rr_snapshot");
+            state->geometryPipeline = kernels.getPipeline(@"rr_geometry");
+            state->unpackPipeline = kernels.getPipeline(@"rr_unpack");
+            state->filterPipeline = kernels.getPipeline(@"rr_filter");
             if (needsNeural) {
-                state->neuralCommonPipeline = pipeline(device,library,@"rr_neural_common");
-                state->neuralPreparePipeline = pipeline(device,library,@"rr_neural_prepare");
-                state->neuralResolvePipeline = pipeline(device,library,@"rr_neural_resolve");
-                state->neuralResolveWritePipeline = pipeline(device,library,@"rr_neural_resolve_write");
+                state->zeroPipeline = kernels.getPipeline(@"rr_zero_albedo");
+                state->neuralCommonPipeline = kernels.getPipeline(@"rr_neural_common");
+                state->neuralPreparePipeline = kernels.getPipeline(@"rr_neural_prepare");
+                state->neuralResolvePipeline = kernels.getPipeline(@"rr_neural_resolve");
+                state->neuralResolveWritePipeline = kernels.getPipeline(@"rr_neural_resolve_write");
             }
-            state->resolvePipeline = pipeline(device,library,@"rr_resolve");
-            state->resolveWritePipeline = pipeline(device,library,@"rr_resolve_write");
+            state->resolvePipeline = kernels.getPipeline(@"rr_resolve");
+            state->resolveWritePipeline = kernels.getPipeline(@"rr_resolve_write");
             id<MTLFence> fence = [device newFence];
             state->historyFence = Object(fence); [fence release];
             auto tileFits = [](const Object& pipeline) {
@@ -416,7 +420,7 @@ std::shared_ptr<Feature> Feature::create(void* nativeDevice, void* nativeCompile
             };
             if (!state->snapshotPipeline || !state->geometryPipeline || !state->unpackPipeline ||
                 !tileFits(state->filterPipeline) ||
-                (needsNeural && (!state->neuralCommonPipeline || !tileFits(state->neuralPreparePipeline) ||
+                (needsNeural && (!state->zeroPipeline || !state->neuralCommonPipeline || !tileFits(state->neuralPreparePipeline) ||
                                  !state->neuralResolvePipeline || !state->neuralResolveWritePipeline)) ||
                 !state->resolvePipeline || !state->resolveWritePipeline || !state->historyFence) {
                 fail(error,ErrorCode::ResourceCreationFailed,"RR pipeline or fence allocation failed"); return {};
@@ -576,7 +580,7 @@ void Feature::markDormant() noexcept {
         impl_->idleTextures.clear(); impl_->idleBytes = 0;
         impl_->idleBindings.clear();
     }
-    impl_->history.reset(); impl_->neural.reset();
+    impl_->history.reset(); impl_->neural.reset(); impl_->alternateNeural.reset();
 }
 
 bool PreparedFrame::encode(void* commandBuffer, void* fence,
@@ -623,9 +627,13 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
             if (hasRadiance(feature->info.signals)) {
                 generation = feature->neural;
                 if (!generation || generation->width != frame.width || generation->height != frame.height) {
-                    generation = makeNeuralGeneration(*feature,frame.width,frame.height,error);
+                    generation = feature->alternateNeural;
+                    if (!generation || generation->width != frame.width || generation->height != frame.height)
+                        generation = makeNeuralGeneration(*feature,frame.width,frame.height,error);
                     if (!generation) return false;
                 }
+                // A cached model is not evidence that its internal history is current.
+                if (generation != feature->neural) reuse = false;
             }
             execution->neural = generation;
             auto device = (id<MTLDevice>)feature->device.get();
@@ -845,6 +853,8 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                         threadsPerThreadgroup:MTLSizeMake(w,h,1)];
                 };
                 auto tex = [](const Storage& a) -> id<MTLTexture> { return a ? (id<MTLTexture>)a->object.get() : nil; };
+                if (generation && !generation->zeroInitialized)
+                    dispatch((id<MTLComputePipelineState>)feature->zeroPipeline.get(),0,{tex(generation->zero)});
                 dispatch((id<MTLComputePipelineState>)feature->geometryPipeline.get(),0,
                     {(id<MTLTexture>)impl_->textures[0].get(),(id<MTLTexture>)impl_->textures[2].get(),
                      tex(common[0]),tex(common[2]),tex(guide),tex(decoded)});
@@ -989,7 +999,12 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 // Partial execution cannot become the next frame's history.
                 if (!completed) feature->history.reset();
             }
-            if (!feature->dormant) { feature->history = current; feature->neural = generation; }
+            if (!feature->dormant) {
+                feature->history = current;
+                if (feature->neural != generation) feature->alternateNeural = feature->neural;
+                feature->neural = generation;
+            }
+            if (generation) generation->zeroInitialized = true;
             return true;
         }
         return fail(error,ErrorCode::UnsupportedFeature,"RR requires macOS 26 Metal4");

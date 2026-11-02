@@ -47,7 +47,7 @@ bool NativeMSAADescriptorSafe(MTLD3D12Device *device, const ShaderVisibleDescrip
   if (descriptor.type == ShaderVisibleDescriptorType::Null) return true;
   if (descriptor.type == ShaderVisibleDescriptorType::ConstantBuffer) {
     uint64_t offset = 0;
-    auto *a = device->LookupBufferByVA(descriptor.ConstantBuffer.address, &offset);
+    auto a = device->LookupBufferByVA(descriptor.ConstantBuffer.address, &offset);
     return a && !a->canonicalHeap && !a->reservedResource &&
         !a->flags().test(BufferAllocationFlag::PlacementSparse) &&
         resource_contract::RangeFits(offset, descriptor.ConstantBuffer.size, a->byteLength());
@@ -86,10 +86,10 @@ ResolveRaytracingGPUVA(
 ) {
   auto *device = static_cast<MTLD3D12Device *>(context);
   uint64_t offset = 0;
-  auto *allocation = device->LookupBufferByVA(address, &offset);
+  auto allocation = device->LookupBufferByVA(address, &offset);
   if (!allocation || offset > allocation->byteLength() || requiredBytes > allocation->byteLength() - offset)
     return false;
-  location = {allocation->buffer(), offset, allocation->byteLength() - offset, allocation, address};
+  location = {allocation->buffer(), offset, allocation->byteLength() - offset, allocation.ptr(), address, allocation};
   return true;
 }
 
@@ -325,28 +325,10 @@ class MTLD3D12GraphicsCommandListImpl
   // Immutable device limit; draw-time capture sizing would otherwise make a native call per draw.
   const uint64_t max_buffer_length_ = device_->GetMTLDevice().maxBufferLength();
 
-  struct ResolvePipelineKey {
-    uint32_t attachment_format;
-    uint32_t raster_sample_count;
-    uint8_t fragment_kind;
-    uint8_t dsv_plane;
-    uint8_t depth_write_enabled;
-    uint8_t stencil_enabled;
+  using ResolvePipelineKey = MTLD3D12Device::ResolvePipelineKey;
+  using ResolvePipelineCacheEntry = MTLD3D12Device::ResolvePipelineCacheEntry;
 
-    bool operator==(const ResolvePipelineKey &other) const {
-      return attachment_format == other.attachment_format &&
-          raster_sample_count == other.raster_sample_count && fragment_kind == other.fragment_kind &&
-          dsv_plane == other.dsv_plane && depth_write_enabled == other.depth_write_enabled &&
-          stencil_enabled == other.stencil_enabled;
-    }
-  };
-
-  struct ResolvePipelineCacheEntry {
-    ResolvePipelineKey key{};
-    WMT::Reference<WMT::RenderPipelineState> pipeline;
-  };
-
-  // Resolve pipelines are device-owned and remain valid across command-list Reset.
+  // Immutable resolve state remains valid across command-list Reset.
   std::array<ResolvePipelineCacheEntry, 8> resolve_pipeline_cache_{};
   size_t resolve_pipeline_cache_count_ = 0;
   size_t resolve_pipeline_cache_next_ = 0;
@@ -774,6 +756,23 @@ class MTLD3D12GraphicsCommandListImpl
     return true;
   }
 
+  using CommandHelper = MTLD3D12Device::CommandHelper;
+  WMT::Reference<WMT::ComputePipelineState> SharedCommandHelper(
+      CommandHelper kind, const char *name, const char *source = nullptr) {
+    std::lock_guard lock(device_->owned_helper_pipeline_mutex);
+    auto &entry = device_->owned_command_helpers[size_t(kind)];
+    if (!entry.pipeline) {
+      WMT::Reference<WMT::Error> error;
+      if (!entry.library)
+        entry.library = source ? device_->GetMTLDevice().newLibraryWithSource(source, error)
+                               : device_->GetLib().getLibrary();
+      if (!entry.library) return {};
+      auto function = WMT4::Library(entry.library).newFunction(name);
+      if (function) entry.pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+    }
+    return entry.pipeline;
+  }
+
   bool EnsurePredicationPipelines() {
     if (predication_snapshot_pipeline_ && predication_arguments_pipeline_ && predication_copy_pipeline_ &&
         predication_pitched_copy_pipeline_ && mesh_indirect_pipeline_ && mesh_strip_cut_pipeline_ && tess_capture_clear_pipeline_ &&
@@ -1012,42 +1011,34 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
 }
 )";
     WMT::Reference<WMT::Error> error;
-    auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
+    std::lock_guard lock(device_->owned_helper_pipeline_mutex);
+    auto &library = device_->owned_predication_library;
+    if (!library) library = device_->GetMTLDevice().newLibraryWithSource(source, error);
     if (!library)
       return false;
-    auto snapshot = WMT4::Library(library).newFunction("d3dalloy_snapshot_predicate");
-    auto arguments = WMT4::Library(library).newFunction("d3dalloy_predicate_arguments");
-    auto copy = WMT4::Library(library).newFunction("d3dalloy_predicate_copy_bytes");
-    auto copy_rows = WMT4::Library(library).newFunction("d3dalloy_predicate_copy_rows");
-    auto mesh_indirect = WMT4::Library(library).newFunction("d3dalloy_mesh_indirect_arguments");
-    auto mesh_strip_cut = WMT4::Library(library).newFunction("d3dalloy_mesh_strip_cut");
-    auto tess_clear = WMT4::Library(library).newFunction("d3dalloy_tess_capture_clear");
-    auto tess_compact = WMT4::Library(library).newFunction("d3dalloy_tess_capture_compact");
-    if (!snapshot || !arguments || !copy || !copy_rows || !mesh_indirect || !mesh_strip_cut || !tess_clear || !tess_compact)
-      return false;
-    tess_capture_clear_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(tess_clear, error);
-    if (!tess_capture_clear_pipeline_)
-      return false;
-    tess_capture_compact_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(tess_compact, error);
-    if (!tess_capture_compact_pipeline_)
-      return false;
-    mesh_indirect_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(mesh_indirect, error);
-    if (!mesh_indirect_pipeline_)
-      return false;
-    mesh_strip_cut_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(mesh_strip_cut, error);
-    if (!mesh_strip_cut_pipeline_)
-      return false;
-    predication_snapshot_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(snapshot, error);
-    if (!predication_snapshot_pipeline_)
-      return false;
-    predication_arguments_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(arguments, error);
-    if (!predication_arguments_pipeline_)
-      return false;
-    predication_pitched_copy_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(copy_rows, error);
-    if (!predication_pitched_copy_pipeline_)
-      return false;
-    predication_copy_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(copy, error);
-    return bool(predication_copy_pipeline_);
+    constexpr const char *names[] = {
+        "d3dalloy_snapshot_predicate", "d3dalloy_predicate_arguments",
+        "d3dalloy_predicate_copy_bytes", "d3dalloy_predicate_copy_rows",
+        "d3dalloy_mesh_indirect_arguments", "d3dalloy_mesh_strip_cut",
+        "d3dalloy_tess_capture_clear", "d3dalloy_tess_capture_compact"};
+    auto &pipelines = device_->owned_predication_pipelines;
+    for (size_t i = 0; i < pipelines.size(); ++i) {
+      if (pipelines[i]) continue;
+      auto function = WMT4::Library(library).newFunction(names[i]);
+      if (!function) return false;
+      pipelines[i] = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+      // Keep successful entries; a failed creation is retried by the next caller.
+      if (!pipelines[i]) return false;
+    }
+    predication_snapshot_pipeline_ = pipelines[0];
+    predication_arguments_pipeline_ = pipelines[1];
+    predication_copy_pipeline_ = pipelines[2];
+    predication_pitched_copy_pipeline_ = pipelines[3];
+    mesh_indirect_pipeline_ = pipelines[4];
+    mesh_strip_cut_pipeline_ = pipelines[5];
+    tess_capture_clear_pipeline_ = pipelines[6];
+    tess_capture_compact_pipeline_ = pipelines[7];
+    return true;
   }
 
   void BeginPredicationComputePass(WMT::ComputePipelineState pipeline, uint32_t threadgroup_width = 1) {
@@ -1122,11 +1113,15 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
                                  const FeedbackTranscode &control) {
     auto &pipeline = feedback_transcode_pipelines_[encode];
     if (!pipeline) {
-      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction(encode ? "d3d12_feedback_encode"
-                                                                        : "d3d12_feedback_decode");
-      WMT::Reference<WMT::Error> error;
-      if (function)
-        pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+      std::lock_guard lock(device_->owned_helper_pipeline_mutex);
+      auto &cached = device_->owned_feedback_pipelines[encode];
+      if (!cached) {
+        auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction(encode ? "d3d12_feedback_encode"
+                                                                          : "d3d12_feedback_decode");
+        WMT::Reference<WMT::Error> error;
+        if (function) cached = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+      }
+      pipeline = cached;
       if (!pipeline) {
         RecordError(E_FAIL);
         return false;
@@ -1331,13 +1326,8 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
                        UINT width, UINT height, bool to_native_float) {
     auto &pipeline = to_native_float ? d24_upload_pipeline_ : d24_readback_pipeline_;
     if (!pipeline) {
-      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction(to_native_float ? "d3d12_d24_to_float" : "d3d12_float_to_d24");
-      if (!function) {
-        RecordError(E_FAIL);
-        return false;
-      }
-      WMT::Reference<WMT::Error> error;
-      pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+      pipeline = SharedCommandHelper(to_native_float ? CommandHelper::D24Upload : CommandHelper::D24Readback,
+          to_native_float ? "d3d12_d24_to_float" : "d3d12_float_to_d24");
       if (!pipeline) {
         RecordError(E_FAIL);
         return false;
@@ -1377,13 +1367,9 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
     if (!pipeline) {
       const char *name = rgb ? (upload ? "d3d12_rgb32_expand" : "d3d12_rgb32_compact") :
                                (upload ? "d3d12_packed422_expand" : "d3d12_packed422_compact");
-      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction(name);
-      if (!function) {
-        RecordError(E_FAIL);
-        return false;
-      }
-      WMT::Reference<WMT::Error> error;
-      pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+      constexpr CommandHelper kinds[] = {CommandHelper::RGB32Expand, CommandHelper::RGB32Compact,
+          CommandHelper::Packed422Expand, CommandHelper::Packed422Compact};
+      pipeline = SharedCommandHelper(kinds[index], name);
       if (!pipeline) {
         RecordError(E_FAIL);
         return false;
@@ -2071,7 +2057,8 @@ public:
         entry.generation == device_->buffer_va_generation.load(std::memory_order_acquire))
       return entry.allocation;
     uint64_t offset = 0, begin = 0, end = 0, generation = 0;
-    auto *allocation = device_->LookupBufferRangeByVA(VA, &offset, &begin, &end, &generation);
+    auto owner = device_->LookupBufferRangeByVA(VA, &offset, &begin, &end, &generation);
+    auto *allocation = owner.ptr();
     if (!allocation) return nullptr;
     if (allocator_->recording_head_->root_allocation_set.insert(allocation).second) {
       try {
@@ -2316,7 +2303,7 @@ public:
                  (binding.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER))) { complete = false; return; }
             const auto bound_address = arguments[signature->SlotQwordOffsets[parameter]];
             uint64_t offset = 0;
-            auto *allocation = bound_address ? device_->LookupBufferByVA(bound_address, &offset) : nullptr;
+            auto allocation = bound_address ? device_->LookupBufferByVA(bound_address, &offset) : nullptr;
             if (!allocation || !stages) { complete = false; return; }
             const auto address = allocation->gpuAddress(); // unknown root-view length covers this whole backing
             const bool writes = type == D3D12_ROOT_PARAMETER_TYPE_UAV &&
@@ -2482,9 +2469,9 @@ public:
                 capture->native_msaa_texture_allocations.emplace_back(allocation);
             } else {
               uint64_t ignored = 0;
-              auto *allocation = cbv ? device_->LookupBufferByVA(descriptor.ConstantBuffer.address, &ignored)
+              auto allocation = cbv ? device_->LookupBufferByVA(descriptor.ConstantBuffer.address, &ignored)
                   : texel ? descriptor.SRVTexelBuffer.buffer->current() : descriptor.SRVBuffer.buffer->current();
-              if (allocator_->recording_head_->root_allocation_set.insert(allocation).second)
+              if (allocator_->recording_head_->root_allocation_set.insert(allocation.ptr()).second)
                 allocator_->recording_head_->root_allocations.emplace_back(allocation);
             }
           }
@@ -2907,9 +2894,9 @@ public:
         for (unsigned slot = 0; slot < vertex_buffers_.size(); ++slot) {
           if (!(pso_graphics_->slot_mask & (1u << slot))) continue;
           uint64_t offset = 0;
-          auto *allocation = device_->LookupBufferByVA(vertex_buffers_[slot].BufferLocation, &offset);
+          auto allocation = device_->LookupBufferByVA(vertex_buffers_[slot].BufferLocation, &offset);
           if (!allocation) { RecordError(E_INVALIDARG); return DrawCallStatus::Invalid; }
-          if (allocator_->recording_head_->root_allocation_set.insert(allocation).second)
+          if (allocator_->recording_head_->root_allocation_set.insert(allocation.ptr()).second)
             allocator_->recording_head_->root_allocations.emplace_back(allocation);
         }
       } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return DrawCallStatus::Invalid; }
@@ -3281,14 +3268,12 @@ public:
   bool EnsureStreamOutputPipelines(bool indirect = false) {
     if (so_assemble_pipeline_ && so_positions_pipeline_ && (!indirect || so_indirect_preflight_pipeline_))
       return true;
-    WMT::Reference<WMT::Error> error;
-    auto library = device_->GetLib().getLibrary();
     if (!so_assemble_pipeline_)
-      so_assemble_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction("so_assemble"), error);
+      so_assemble_pipeline_ = SharedCommandHelper(CommandHelper::StreamOutputAssemble, "so_assemble");
     if (!so_positions_pipeline_)
-      so_positions_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction("so_index_positions"), error);
+      so_positions_pipeline_ = SharedCommandHelper(CommandHelper::StreamOutputPositions, "so_index_positions");
     if (indirect && !so_indirect_preflight_pipeline_)
-      so_indirect_preflight_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction("so_indirect_preflight"), error);
+      so_indirect_preflight_pipeline_ = SharedCommandHelper(CommandHelper::StreamOutputIndirect, "so_indirect_preflight");
     return so_assemble_pipeline_ && so_positions_pipeline_ && (!indirect || so_indirect_preflight_pipeline_);
   }
 
@@ -3489,9 +3474,7 @@ public:
     const auto &layout = pso_graphics_->stream_output;
     auto metal = device_->GetMTLDevice();
     if (!so_assemble_gs_pipeline_) {
-      WMT::Reference<WMT::Error> error;
-      so_assemble_gs_pipeline_ =
-          device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(device_->GetLib().getLibrary()).newFunction("so_assemble_gs"), error);
+      so_assemble_gs_pipeline_ = SharedCommandHelper(CommandHelper::StreamOutputGS, "so_assemble_gs");
       if (!so_assemble_gs_pipeline_) {
         RecordError(E_FAIL);
         return false;
@@ -3680,16 +3663,14 @@ public:
       return false;
     }
     if (!msaa_assembly_pipeline_) {
-      WMT::Reference<WMT::Error> error;
-      msaa_assembly_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_assemble_primitives"), error);
+      msaa_assembly_pipeline_ = SharedCommandHelper(CommandHelper::MSAAAssembly, "msaa_assemble_primitives");
       if (!msaa_assembly_pipeline_) {
         RecordError(E_FAIL);
         return false;
       }
     }
     if (!msaa_bounds_pipeline_) {
-      WMT::Reference<WMT::Error> error;
-      msaa_bounds_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(WMT4::Library(device_->GetLib().getLibrary()).newFunction("msaa_primitive_bounds"), error);
+      msaa_bounds_pipeline_ = SharedCommandHelper(CommandHelper::MSAABounds, "msaa_primitive_bounds");
       if (!msaa_bounds_pipeline_) {
         RecordError(E_FAIL);
         return false;
@@ -4539,9 +4520,9 @@ public:
     try {
       if (native_msaa) {
         uint64_t offset = 0;
-        auto *allocation = device_->LookupBufferByVA(index_buffer_address, &offset);
+        auto allocation = device_->LookupBufferByVA(index_buffer_address, &offset);
         if (!allocation) { RecordError(E_INVALIDARG); return; }
-        if (allocator_->recording_head_->root_allocation_set.insert(allocation).second)
+        if (allocator_->recording_head_->root_allocation_set.insert(allocation.ptr()).second)
           allocator_->recording_head_->root_allocations.emplace_back(allocation);
       }
       auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
@@ -8028,8 +8009,8 @@ public:
         continue;
       const auto &view = Views[i];
       uint64_t offset = 0, filled_offset = 0;
-      auto *buffer = device_->LookupBufferByVA(view.BufferLocation, &offset);
-      auto *filled = (view.BufferFilledSizeLocation & 3)
+      auto buffer = device_->LookupBufferByVA(view.BufferLocation, &offset);
+      auto filled = (view.BufferFilledSizeLocation & 3)
                          ? nullptr
                          : device_->LookupBufferByVA(view.BufferFilledSizeLocation, &filled_offset);
       if (!buffer || (view.BufferLocation & 3) || !RangeFits(offset, view.SizeInBytes, buffer->byteLength()) ||
@@ -9945,7 +9926,7 @@ public:
     const bool index_pull = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED && strip &&
                             (sig->UpdateIndexBuffer || !matching_cut);
     uint64_t ib_offset = 0;
-    auto *ib_allocation = index_buffer_address ? device_->LookupBufferByVA(index_buffer_address, &ib_offset) : nullptr;
+    auto ib_allocation = index_buffer_address ? device_->LookupBufferByVA(index_buffer_address, &ib_offset) : nullptr;
     const uint32_t index_width = index_type == WMTIndexTypeUInt32 ? 4 : 2;
     const bool indexed = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
     const bool native_index = !indexed || (index_buffer && ib_allocation && !(ib_offset % index_width) &&
@@ -9958,7 +9939,7 @@ public:
       if (PreDraw(false) != DrawCallStatus::Ordinary) return;
       auto *allocation = arg_buffer->buffer->current();
       try {
-        for (auto *retained : {allocation, indexed ? ib_allocation : nullptr})
+        for (auto *retained : {allocation, indexed ? ib_allocation.ptr() : nullptr})
           if (retained && allocator_->recording_head_->root_allocation_set.insert(retained).second)
             allocator_->recording_head_->root_allocations.emplace_back(retained);
         auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
@@ -10099,11 +10080,7 @@ kernel void d3dalloy_atomic_copy_u32(device atomic_uint *source [[buffer(0)]],
   atomic_store_explicit(destination, atomic_load_explicit(source, memory_order_relaxed), memory_order_relaxed);
 }
 )";
-      WMT::Reference<WMT::Error> error;
-      auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
-      auto function = library ? WMT4::Library(library).newFunction("d3dalloy_atomic_copy_u32") : WMT::Reference<WMT4::Function>();
-      if (function)
-        atomic_copy_u32_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+      atomic_copy_u32_pipeline_ = SharedCommandHelper(CommandHelper::AtomicCopyU32, "d3dalloy_atomic_copy_u32", source);
       if (!atomic_copy_u32_pipeline_) {
         ERR("AtomicCopyBufferUINT: failed to create atomic copy pipeline");
         RecordError(E_FAIL);
@@ -10157,11 +10134,7 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
   atomic_max_explicit(destination, value, memory_order_relaxed);
 }
 )";
-      WMT::Reference<WMT::Error> error;
-      auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
-      auto function = library ? WMT4::Library(library).newFunction("d3dalloy_atomic_copy_u64") : WMT::Reference<WMT4::Function>();
-      if (function)
-        atomic_copy_u64_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+      atomic_copy_u64_pipeline_ = SharedCommandHelper(CommandHelper::AtomicCopyU64, "d3dalloy_atomic_copy_u64", source);
       if (!atomic_copy_u64_pipeline_) {
         ERR("AtomicCopyBufferUINT64: failed to create atomic copy pipeline");
         RecordError(E_FAIL);
@@ -10447,8 +10420,6 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     resolve->dsv_flags = destination_dsv_plane;
     if (decompress && src_resource_desc.SampleDesc.Count > 1) resolve->sample_positions = sample_positions_;
     if (!whole_average) {
-      auto library = device_->GetLib().getLibrary();
-      auto vertex = WMT4::Library(library).newFunction("d3dalloy_resolve_vertex");
       const bool integer = IsIntegerFormat(format_desc.PixelFormat);
       const bool unsigned_integer = integer && MTLGetUnsignedIntegerFormat(format_desc.PixelFormat) == format_desc.PixelFormat;
       const char *fragment_name = dsv_plane == 1 ?
@@ -10465,40 +10436,57 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       const uint8_t fragment_kind = (dsv_plane == 1 ? (destination_dsv_plane ? 1 : 2) :
                                      dsv_plane == 2 ? (destination_dsv_plane ? 3 : 4) :
                                      unsigned_integer ? 5 : integer ? 6 : 7) + (decompress ? 8 : 0);
-      auto fragment = WMT4::Library(library).newFunction(fragment_name);
-      WMTRenderPipelineInfo pipeline_info;
-      WMT::InitializeRenderPipelineInfo(pipeline_info);
-      pipeline_info.vertex_function = vertex.handle;
-      pipeline_info.fragment_function = fragment.handle;
-      if (destination_dsv_plane & 1)
-        pipeline_info.depth_pixel_format = attachment_format;
-      else if (destination_dsv_plane & 2)
-        pipeline_info.stencil_pixel_format = attachment_format;
-      else
-        pipeline_info.colors[0].pixel_format = attachment_format;
-      pipeline_info.raster_sample_count = decompress ? src_resource_desc.SampleDesc.Count : 1;
-      pipeline_info.rasterization_enabled = true;
-      pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+      const uint32_t raster_sample_count = decompress ? src_resource_desc.SampleDesc.Count : 1;
       const ResolvePipelineKey pipeline_key{
-          static_cast<uint32_t>(attachment_format), pipeline_info.raster_sample_count, fragment_kind,
+          static_cast<uint32_t>(attachment_format), raster_sample_count, fragment_kind,
           destination_dsv_plane, uint8_t(destination_dsv_plane & 1), uint8_t(destination_dsv_plane & 2)};
+      bool cached = false;
       for (size_t i = 0; i < resolve_pipeline_cache_count_; ++i) {
         if (resolve_pipeline_cache_[i].key == pipeline_key) {
           resolve->pipeline = resolve_pipeline_cache_[i].pipeline;
+          resolve->depth_stencil_state = resolve_pipeline_cache_[i].depth_stencil_state;
+          cached = true;
+          break;
+        }
+      }
+      // List-local hits do not take a device lock. Only misses join the bounded
+      // device cache, whose owner fixes the library/compiler identity.
+      std::unique_lock<std::mutex> shared_lock(device_->owned_helper_pipeline_mutex, std::defer_lock);
+      bool shared_cached = cached;
+      if (!cached) {
+        shared_lock.lock();
+        for (size_t i = 0; i < device_->owned_resolve_pipeline_count; ++i) {
+          const auto &entry = device_->owned_resolve_pipelines[i];
+          if (entry.key != pipeline_key) continue;
+          resolve->pipeline = entry.pipeline;
+          resolve->depth_stencil_state = entry.depth_stencil_state;
+          shared_cached = true;
           break;
         }
       }
       if (!resolve->pipeline) {
+        // Native functions are needed only on a cache miss, not on every resolve.
+        auto library = device_->GetLib().getLibrary();
+        auto vertex = WMT4::Library(library).newFunction("d3dalloy_resolve_vertex");
+        auto fragment = WMT4::Library(library).newFunction(fragment_name);
+        WMTRenderPipelineInfo pipeline_info;
+        WMT::InitializeRenderPipelineInfo(pipeline_info);
+        pipeline_info.vertex_function = vertex.handle;
+        pipeline_info.fragment_function = fragment.handle;
+        if (destination_dsv_plane & 1)
+          pipeline_info.depth_pixel_format = attachment_format;
+        else if (destination_dsv_plane & 2)
+          pipeline_info.stencil_pixel_format = attachment_format;
+        else
+          pipeline_info.colors[0].pixel_format = attachment_format;
+        pipeline_info.raster_sample_count = raster_sample_count;
+        pipeline_info.rasterization_enabled = true;
+        pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
         WMT::Reference<WMT::Error> error;
-        resolve->pipeline = device_->GetMetal4Compiler().newRenderPipelineState(pipeline_info, error);
-        if (resolve->pipeline) {
-          auto &entry = resolve_pipeline_cache_[resolve_pipeline_cache_count_ < resolve_pipeline_cache_.size()
-              ? resolve_pipeline_cache_count_++ : resolve_pipeline_cache_next_++ % resolve_pipeline_cache_.size()];
-          entry.key = pipeline_key;
-          entry.pipeline = resolve->pipeline;
-        }
+        if (vertex && fragment)
+          resolve->pipeline = device_->GetMetal4Compiler().newRenderPipelineState(pipeline_info, error);
       }
-      if (destination_dsv_plane) {
+      if (destination_dsv_plane && !resolve->depth_stencil_state) {
         WMTDepthStencilInfo depth_stencil_info{};
         depth_stencil_info.depth_compare_function = WMTCompareFunctionAlways;
         depth_stencil_info.depth_write_enabled = destination_dsv_plane & 1;
@@ -10514,11 +10502,23 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
         }
         resolve->depth_stencil_state = device_->GetMTLDevice().newDepthStencilState(depth_stencil_info);
       }
-      if (!vertex || !fragment || !resolve->pipeline || (destination_dsv_plane && !resolve->depth_stencil_state)) {
+      if (!resolve->pipeline || (destination_dsv_plane && !resolve->depth_stencil_state)) {
         resolve->~ResolveEncoderData();
         allocator_->encoder_current = nullptr;
         RecordError(E_FAIL);
         return;
+      }
+      if (!cached) {
+        if (!shared_cached) {
+          auto &entries = device_->owned_resolve_pipelines;
+          auto &count = device_->owned_resolve_pipeline_count;
+          auto &next = device_->owned_resolve_pipeline_next;
+          entries[count < entries.size() ? count++ : next++ % entries.size()] =
+              {pipeline_key, resolve->pipeline, resolve->depth_stencil_state};
+        }
+        auto &entry = resolve_pipeline_cache_[resolve_pipeline_cache_count_ < resolve_pipeline_cache_.size()
+            ? resolve_pipeline_cache_count_++ : resolve_pipeline_cache_next_++ % resolve_pipeline_cache_.size()];
+        entry = {pipeline_key, resolve->pipeline, resolve->depth_stencil_state};
       }
       resolve->destination_x = DstX;
       resolve->destination_y = DstY;
@@ -11187,10 +11187,8 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     if (!count) return;
     try {
       if (!matrix_conversion_pipeline_) {
-        WMT::Reference<WMT::Error> error;
-        auto library = device_->GetMTLDevice().newLibraryWithSource(matrix::kConversionSource, error);
-        auto function = library ? WMT4::Library(library).newFunction("d3dalloy_convert_matrix") : WMT::Reference<WMT4::Function>();
-        if (function) matrix_conversion_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+        matrix_conversion_pipeline_ = SharedCommandHelper(CommandHelper::MatrixConversion,
+            "d3dalloy_convert_matrix", matrix::kConversionSource);
         if (!matrix_conversion_pipeline_) { RecordError(E_FAIL); return; }
       }
       for (UINT i = 0; i < count; ++i) {
@@ -11309,7 +11307,7 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     if (!object) { RecordError(); return; }
     const auto *graph = object->GetGraph(index);
     const auto &backing = desc->WorkGraph.BackingMemory;
-    uint64_t offset = 0; auto *allocation = device_->LookupBufferByVA(backing.StartAddress, &offset);
+    uint64_t offset = 0; auto allocation = device_->LookupBufferByVA(backing.StartAddress, &offset);
     if (backing.StartAddress % kWorkGraphsBackingMemoryAlignment || backing.SizeInBytes < graph->memory.MinSizeInBytes ||
         !allocation || offset > allocation->byteLength() || backing.SizeInBytes > allocation->byteLength() - offset) { RecordError(); return; }
     const auto &local = desc->WorkGraph.NodeLocalRootArgumentsTable;
@@ -11485,7 +11483,7 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       if (!table->present())
         continue;
       uint64_t offset = 0;
-      auto *allocation = device_->LookupBufferByVA(table->base, &offset);
+      auto allocation = device_->LookupBufferByVA(table->base, &offset);
       if (!allocation || offset > allocation->byteLength() || table->size > allocation->byteLength() - offset) {
         RecordError();
         return;
@@ -11670,17 +11668,8 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     define("D3DALLOY_DEPTH", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchDepth));
     define("D3DALLOY_SELF", offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchArgumentsAddress));
     source += raytracing::kRaysIndirectMSL;
-    WMT::Reference<WMT::Error> error;
-    auto library = device_->GetMTLDevice().newLibraryWithSource(source, error);
-    if (!library) {
-      ERR("ExecuteIndirect: DispatchRays resolve library failed: ",
-          error ? error.description().getUTF8String() : "no Metal error");
-      return false;
-    }
-    auto function = WMT4::Library(library).newFunction(raytracing::kRaysIndirectFunction);
-    if (!function)
-      return false;
-    rays_indirect_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+    rays_indirect_pipeline_ = SharedCommandHelper(CommandHelper::RaysIndirect,
+        raytracing::kRaysIndirectFunction, source.c_str());
     return bool(rays_indirect_pipeline_);
   }
 

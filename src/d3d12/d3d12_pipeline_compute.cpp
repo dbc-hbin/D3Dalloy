@@ -51,8 +51,8 @@ class MTLD3D12ComputePipelineStateImpl : public MTLD3D12Pageable<MTLD3D12Compute
   WMT::Reference<WMT4::Function> indirect_compute_function;
   WMT::Reference<WMT::ComputePipelineState> indirect_pso;
   std::mutex indirect_pso_mutex;
-  std::vector<uint8_t> statistics_cs_bytecode;
-  std::vector<uint8_t> statistics_root_blob;
+  SharedShaderBytecode statistics_cs_bytecode;
+  SharedShaderBytecode statistics_root_blob;
   WMT::Reference<WMT::ComputePipelineState> statistics_pso;
   WMT::Reference<WMT::ComputePipelineState> statistics_indirect_pso;
   WMT::Reference<WMT4::Function> statistics_function;
@@ -95,11 +95,10 @@ public:
       rootsig.bytecode_length = pDesc->CS.BytecodeLength;
     }
     rootsig.next = nullptr;
-    const auto *cs_source = static_cast<const uint8_t *>(pDesc->CS.pShaderBytecode);
-    statistics_cs_bytecode.assign(cs_source, cs_source + pDesc->CS.BytecodeLength);
-    const auto *root_source = static_cast<const uint8_t *>(rootsig.bytecode);
+    auto &artifacts = device_->GetShaderArtifactCache();
+    statistics_cs_bytecode = artifacts.RetainBytecode(pDesc->CS.pShaderBytecode, pDesc->CS.BytecodeLength);
     if (pDesc->pRootSignature)
-      statistics_root_blob.assign(root_source, root_source + rootsig.bytecode_length);
+      statistics_root_blob = artifacts.RetainBytecode(rootsig.bytecode, rootsig.bytecode_length);
 
     SM50_SHADER_COMMON_DATA common;
     common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
@@ -293,6 +292,11 @@ public:
     }
 
     return E_NOINTERFACE;
+  }
+
+  HRESULT GetPrivateCachedBlob(ID3DBlob **blob) override {
+    if (!WaitNativePipeline()) { if (blob) *blob = nullptr; return E_FAIL; }
+    return cache_.GetPrivateBlob(blob);
   }
 
   virtual HRESULT STDMETHODCALLTYPE

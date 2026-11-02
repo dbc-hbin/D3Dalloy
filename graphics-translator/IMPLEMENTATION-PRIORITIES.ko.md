@@ -2,6 +2,35 @@
 
 기준일: **2026-10-10**. 지원 선언과 증거는 [CORE](CORE-IMPLEMENTATION-STATUS.ko.md), 반복 실행 절차는 [SMOKE](SMOKE-TEST.ko.md)와 [RUNTIME](RUNTIME.ko.md), 실제 과거 실행은 [HISTORY](IMPLEMENTATION-HISTORY.ko.md)에 둔다. 단계 번호가 같은 과거 P0–P3와 후속 backlog를 혼동하지 않는다.
 
+## 2026-11-02 첫 추천 묶음 완료
+
+Async PSO worker의 consumer-owned job 대기 제거, draw별 custom MSAA 상태 chain 재사용, atomic64 texture import encoder 통합을 구현했다. [CORE의6개 집중 GPU 검증과 CPU 대조](CORE-IMPLEMENTATION-STATUS.ko.md#독립-최적화-3종--2026-11-02)를 완료 범위로 관리한다. 이 세 항목을 남은 후보로 다시 세지 않는다.
+
+Custom MSAA의 tile execution 구조 자체, descriptor-version resolved plan, phase 간 atomic64 allocation/alias generation cache와 실제 게임 성능 측정은 별도 후보다. 이번 상태 replay·phase 내부 encoder 변경을 그 전체 재설계의 완료로 확대하지 않는다.
+
+## 2026-11-02 PSO 지연과 DXR 실행 객체
+
+사용자가 선택한 native Metal4 archive와 DXR immutable executable 공유를 [review](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-pso-지연과-dxr-실행-객체-재설계)에 구현했다. 실제 요청한 pipeline만 수집하며 warm archive direct hit, corruption/clear/disable fallback, RT weak single-flight 및 mutable state 분리를 유지한다. [CORE의 validation 분리](CORE-IMPLEMENTATION-STATUS.ko.md#pso-지연과-dxr-실행-객체--2026-11-02)를 따른다. 현재 instrumented archive를 public API가 거부하는 경우 validation을 끄지 않고 기존 compiler로 간다.
+
+남은 PSO/RT 후보는 export dependency closure를 이용한 module clone/DCE 비용 축소와 measured real-game latency 평가다. 이번 변경을 모든 최초 compile 제거·FPS 증가·RT traversal 재설계로 세지 않는다. B04 archive/B05 executable bundle을 다시 미구현 항목으로 제시하지 않는다.
+
+## 2026-11-02 독립 개선과 제출 기반 재설계
+
+사용자가 선택한 43개 후속 후보의 첫 번째·두 번째 트랙을 [review5차](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-독립-개선과-제출-기반-재설계)에 구현했다. Device sampler/DS 공유, 퇴역 slab·ICB/vector 재사용, selective clear·독립 query fanout, view hit/strip transfer, cache별 I/O lock, Close-sealed shape, pinned physical-access interval frontier, 실행별 sparse publication 판정, VA/residency lock 분리와 추가 residency batch를 완료한 범위로 관리한다. 실제 결과는 [CORE5차](CORE-IMPLEMENTATION-STATUS.ko.md#독립-개선과-제출-기반-재설계--2026-11-02)를 따른다.
+
+다음에는 이 기반 위에서 확인 가능한 하위 계약만 넓힌다. Placed buffer interval은 구현됐지만 placed texture는 whole-heap conservative access다. Sparse/shared/cast·opaque indirect의 완전 추적, persistent descriptor-version resolved plan은 미구현이다. 이를 위해 기존 fallback을 제거하지 않는다. Native archive·RT linked bundle은 위 후속에서 구현했다. RR signal 수명·parallel strip/scan·custom MSAA tile execution·nonterminal GPU frontier는 별도 트랙이다. 기존 tiled compiler-service XPC 실패는 baseline/candidate 증거로 분리한다.
+
+## 2026-11-02 정적 감사 후속
+
+1·2차의 fixed helper26종·device resolve·원본 공유·SR linearize/alpha 뒤, [3차](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-정적-최적화-3차와-실패-경계-해소)에서 fragmented canonical key, private serialized payload, RT/WorkGraph 원본, SR parameter arena, packed RR normal/roughness, FG 동일 decode·real ROI 복사, AMD GPU zero-init 및 첫 temporal 전 잠금 지연을 처리했다. 검증은 [CORE3차](CORE-IMPLEMENTATION-STATUS.ko.md#정적-최적화-3차--2026-11-02)에 둔다. 완료한 하위 경로를 반복 구현하지 않는다. P20 CRC32는 현행 SHA-1에 해당하지 않아 제외한다.
+
+[4차 구현](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-정적-최적화-4차)은 Generate 확정 뒤 Prepare guide 생성, feature별 commit 예약, 정확한 정수 wide-wave, terminal Work Graph batching·record readback 축소와 atomic64 interval을 완료했다. Typed pool ID와 bounded ordinary read의 기존 atomic64 오류도 수정했다. 현재 증거는 [CORE4차](CORE-IMPLEMENTATION-STATUS.ko.md#정적-최적화-4차--2026-11-02)에 둔다. 아래는 적용 밖 계약이며 완료 항목을 반복 구현하지 않는다.
+
+1. **FG 보존 경로:** Generate보다 먼저 실행된 Prepare와 jitter/reset-dependent 보정은 raw snapshot 경로가 필요하다. 이를 무조건 옮기지 않는다. Nominal identity direct color/output은 signed-zero·NaN 반례가 있어 제외했으며 미완료 후보로 다시 제시하지 않는다.
+2. **순서가 의미를 갖는 알고리즘:** Float wide-wave 재결합과 임의 numeric multiprefix, 출력 queue가 있는 nonterminal Work Graph frontier는 별도다. 완료된 정수 hierarchy와 terminal batching을 전체 GPU scheduler 완료로 세지 않는다.
+3. **Phase 간 재사용:** Atomic64 interval은 phase 안의 불필요한 map 노드를 제거한다. Phase 사이 allocation/alias/sparse 변경까지 캐시하려면 generation 무효화 계약이 추가로 필요하다. GPU cell 값을 재사용하지 않는다.
+4. **범위 확장 검증:** 실게임 frame time·다른 GPU/OS·x86 guest FX. Canonical key의 호출당 최초 hash와 exact equality는 남으며 이를 없애려는 변경은 collision/lifetime 증명이 별도로 필요하다. Feature 간 동시 인코딩은 구현했지만 game FPS 개선율로 확대하지 않는다.
+
 ## 2026-11-04 후속
 
 [후속 구현](CORE-IMPLEMENTATION-STATUS.ko.md#dlssfsr-공통-경로와-후속-최적화)에서 DLSS-G·FSR FG render-grid 입력, FSR FG no-UI copy 제거, DLSS RR 변환 encoder 통합·검증된 포맷 직접 연결, FSR RR 7x7 tiling, mesh/GS/tess PSO 전역 mutex 제거를 처리했다. MSAA eligible resolve는 이미 producing pass에 접히므로 중복 구현하지 않았다. 남은 검증은 실제 게임 장면의 FG 화질·FPS·pacing과 다른 GPU/OS의 mesh compiler 동시성이다. Shader validation OFF의 mesh payload compiler-service 실패는 base에서도 재현된다. `pipeline-library` suite의 async-on phase 기대값은 graphics 비동기 링크를 반영하지 않는다.

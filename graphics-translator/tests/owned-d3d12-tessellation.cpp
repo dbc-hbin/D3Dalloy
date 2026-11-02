@@ -150,6 +150,25 @@ struct Context {
   }
 };
 
+void createRoot(Context &c, D3D12_SHADER_VISIBILITY constants_visibility) {
+  D3D12_ROOT_PARAMETER parameters[2] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.ShaderRegister = 0;
+  parameters[0].Constants.Num32BitValues = 8;
+  parameters[0].ShaderVisibility = constants_visibility;
+  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  parameters[1].Descriptor.ShaderRegister = 0;
+  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_DOMAIN;
+  D3D12_ROOT_SIGNATURE_DESC root = {};
+  root.NumParameters = 2;
+  root.pParameters = parameters;
+  root.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  ComPtr<ID3DBlob> code, errors;
+  check(D3D12SerializeRootSignature(&root, D3D_ROOT_SIGNATURE_VERSION_1, &code, &errors), "root-serialize");
+  check(c.device->CreateRootSignature(0, code->GetBufferPointer(), code->GetBufferSize(),
+                                     IID_PPV_ARGS(c.root.ReleaseAndGetAddressOf())), "root");
+}
+
 void init(Context &c) {
   HMODULE module = GetModuleHandleW(L"d3d12.dll");
   require(module != nullptr, "module");
@@ -182,22 +201,7 @@ void init(Context &c) {
   require(c.event != nullptr, "event-create");
 
   // b0: tess factors visible to the HULL only; u0: DS domain-point log visible to the DOMAIN only.
-  D3D12_ROOT_PARAMETER parameters[2] = {};
-  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  parameters[0].Constants.ShaderRegister = 0;
-  parameters[0].Constants.Num32BitValues = 8;
-  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_HULL;
-  parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-  parameters[1].Descriptor.ShaderRegister = 0;
-  parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_DOMAIN;
-  D3D12_ROOT_SIGNATURE_DESC root = {};
-  root.NumParameters = 2;
-  root.pParameters = parameters;
-  root.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-  ComPtr<ID3DBlob> code, errors;
-  check(D3D12SerializeRootSignature(&root, D3D_ROOT_SIGNATURE_VERSION_1, &code, &errors), "root-serialize");
-  check(c.device->CreateRootSignature(0, code->GetBufferPointer(), code->GetBufferSize(), IID_PPV_ARGS(&c.root)),
-        "root");
+  createRoot(c, D3D12_SHADER_VISIBILITY_HULL);
   D3D12_DESCRIPTOR_HEAP_DESC rtv = {};
   rtv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
   rtv.NumDescriptors = 1;
@@ -1535,6 +1539,39 @@ int runEarlyDepthCases(Context &c, const std::vector<uint8_t> &vs, const std::ve
 
 #include "owned-d3d12-gsindirect-contract.inc"
 
+void runHalfTransportCases(Context &c) {
+  auto original_root = c.root;
+  createRoot(c, D3D12_SHADER_VISIBILITY_ALL);
+  createTarget(c, 1);
+  auto reference_pso = pipeline(c, shader("vs_pass", "vs_5_0"), shader("hs_tri_integer", "hs_5_0"),
+                                shader("ds_tri", "ds_5_0"), shader("ps_color", "ps_5_0"));
+  tess_oracle::Factors factors = {{1, 1, 1, 1}, {1, 1}};
+  const auto reference = draw(c, reference_pso.Get(), false, factors);
+  require(reference.statistics.PSInvocations > 0, "half-reference-rasterization");
+  auto vs = readFile("tessellation-vs_half.dxil");
+  auto ds = readFile("tessellation-ds_half.dxil");
+  auto ps = readFile("tessellation-ps_half.dxil");
+  const uint32_t patterns[] = {0, 1, 0x03f8, 0x0400, 0x3550, 0x3bf8,
+                               0x3c00, 0x7bf4, 0x8000, 0x83f8, 0xfbfc, 0x7df8};
+  unsigned cases = 0;
+  for (const char *entry : {"hs_half_independent", "hs_half_dependent"}) {
+    auto pso = pipeline(c, vs, readFile(std::string("tessellation-") + entry + ".dxil"), ds, ps);
+    for (uint32_t pattern : patterns) {
+      std::memcpy(&factors.edge[0], &pattern, sizeof(pattern));
+      const auto actual = draw(c, pso.Get(), false, factors);
+      if (actual.texels != reference.texels || actual.points != reference.points ||
+          actual.statistics.HSInvocations != reference.statistics.HSInvocations) {
+        std::fprintf(stderr, "%s_MISMATCH half=%s pattern=0x%04x\n", kPrefix, entry, pattern);
+        fail("half-transport");
+      }
+      ++cases;
+    }
+  }
+  std::printf("%s_HALF_TRANSPORT_PASS cases=%u values=%u independent=1 output_cp_read=1\n",
+              kPrefix, cases, cases * 3 * 4);
+  c.root = original_root;
+}
+
 int runShaderSet(Context &c) {
   createTarget(c, 1);
   int cases = 0;
@@ -1580,6 +1617,7 @@ int main(int argc, char **argv) {
   if (GetFileAttributesA("tessellation-vs_pass.dxil") != INVALID_FILE_ATTRIBUTES) {
     useDxil = true;
     runShaderSet(c);
+    runHalfTransportCases(c);
   } else {
     std::printf("%s_DXIL_SKIPPED reason=no-frozen-dxil\n", kPrefix);
   }

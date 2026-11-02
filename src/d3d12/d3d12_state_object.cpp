@@ -55,7 +55,7 @@ struct LibraryExport {
 };
 
 struct Library {
-  std::vector<uint8_t> bytecode;
+  SharedShaderBytecode bytecode;
   std::vector<LibraryExport> exports;
 };
 
@@ -439,8 +439,7 @@ class MTLD3D12StateObjectImpl final
   uint32_t max_attribute_size_ = 0;
   bool is_pipeline_ = false;
 
-  std::vector<WMT::Reference<WMT4::Library>> metal_libraries_;
-  std::vector<WMT::Reference<WMT4::Function>> metal_functions_;
+  std::shared_ptr<const NativeRaytracingArtifact> native_executable_;
   std::shared_ptr<const RaytracingArtifact> compiled_artifact_;
   WMT::Reference<WMT::ComputePipelineState> pipeline_state_;
   uint32_t raygen_threadgroup_threads_ = 1;
@@ -829,17 +828,12 @@ class MTLD3D12StateObjectImpl final
     HRESULT constants_result = immutable_constants.Initialize(device_, metallib, bitcode);
     if (FAILED(constants_result)) return constants_result;
     WMT::Reference<WMT::Error> metal_error;
-    auto library = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(metallib.Data, metallib.Size), metal_error);
+    auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), metallib, bitcode, metal_error);
     if (!library) {
       ERR("RT metallib load failed: ", metal_error ? metal_error.description().getUTF8String() : "no Metal error");
       return E_FAIL;
     }
-    metal_libraries_.push_back(library);
-
-    std::vector<obj_handle_t> linked;
-    linked.reserve(functions.size());
-    metal_functions_.assign(functions.size(), {});
-    obj_handle_t dispatch_entry_function = NULL_OBJECT_HANDLE;
+    bool dispatch_entry_found = false;
     for (size_t i = 0; i < functions.size(); ++i) {
       const auto &function = functions[i];
       uses_atomic64 |= (function.Flags & SM50_RT_FUNCTION_FLAG_DEVICE_ATOMIC64_PHASE) != 0;
@@ -873,17 +867,12 @@ class MTLD3D12StateObjectImpl final
          */
         continue;
       }
-      auto metal_function = library.newFunction(function.Name);
-      if (!metal_function) {
-        ERR("RT metallib function not found: ", function.Name);
-        return E_FAIL;
-      }
       if (function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY) {
         if (function.Kind != SM50_RT_FUNCTION_RAYGEN) {
           ERR("RT reflection marked a non-raygen function as the dispatch entry: ", function.Name);
           return E_FAIL;
         }
-        if (dispatch_entry_function != NULL_OBJECT_HANDLE) {
+        if (dispatch_entry_found) {
           ERR("RT pipeline has more than one dispatch entry");
           return E_FAIL;
         }
@@ -891,14 +880,11 @@ class MTLD3D12StateObjectImpl final
          * The dispatch entry becomes the pipeline's compute function; it is part of
          * the pipeline on its own and must not appear in the linked function list.
          */
-        dispatch_entry_function = metal_function;
-        metal_functions_[i] = std::move(metal_function);
+        dispatch_entry_found = true;
         continue;
       }
-      linked.push_back(metal_function);
-      metal_functions_[i] = std::move(metal_function);
     }
-    if (dispatch_entry_function == NULL_OBJECT_HANDLE) {
+    if (!dispatch_entry_found) {
       ERR("RT pipeline reflection has no dispatch entry");
       return E_FAIL;
     }
@@ -911,12 +897,9 @@ class MTLD3D12StateObjectImpl final
       }
     }
 
-    WMTComputePipelineInfo info;
-    WMT::InitializeComputePipelineInfo(info);
-    info.compute_function = dispatch_entry_function;
-    info.support_indirect_command_buffers = false;
-    info.max_call_stack_depth = std::max<uint32_t>(2, 2 * pipeline_config_.MaxTraceRecursionDepth + 2);
-    pipeline_state_ = device_->GetMetal4Compiler().newComputePipelineStateWithLinkedFunctions(info, linked.data(), static_cast<uint32_t>(linked.size()), metal_error);
+    native_executable_ = device_->GetShaderArtifactCache().NativeRaytracing(device_->GetMetal4Compiler(), library,
+        functions, std::max<uint32_t>(2, 2 * pipeline_config_.MaxTraceRecursionDepth + 2), metal_error);
+    pipeline_state_ = native_executable_ ? native_executable_->compute : WMT::Reference<WMT::ComputePipelineState>{};
     if (!pipeline_state_) {
       ERR("RT pipeline creation failed: ",
           metal_error ? metal_error.description().getUTF8String() : "no Metal error");
@@ -955,7 +938,7 @@ class MTLD3D12StateObjectImpl final
       const auto &function = functions[i];
       if (function.Kind != SM50_RT_FUNCTION_DISPATCH || function.TableIndex == SM50_RT_INDEX_NONE)
         continue;
-      auto handle = device_->GetMetal4Compiler().functionHandle(pipeline_state_, metal_functions_[i]);
+      auto handle = native_executable_->handles[i];
       if (!handle) {
         ERR("RT intersection dispatch callback handle creation failed: ", function.Name);
         return E_FAIL;
@@ -994,7 +977,7 @@ class MTLD3D12StateObjectImpl final
         ERR("RT reflection returned an export index outside the export table: ", function.ExportIndex);
         return E_FAIL;
       }
-      auto handle = device_->GetMetal4Compiler().functionHandle(pipeline_state_, metal_functions_[i]);
+      auto handle = native_executable_->handles[i];
       if (!handle) {
         ERR("RT visible function handle creation failed: ", function.Name);
         return E_FAIL;
@@ -1886,8 +1869,8 @@ private:
         (library_desc.NumExports && !library_desc.pExports))
       return RejectStateObject("a DXIL library subobject has no bytecode, or an export list with no entries");
     Library library;
-    const auto *bytes = static_cast<const uint8_t *>(library_desc.DXILLibrary.pShaderBytecode);
-    library.bytecode.assign(bytes, bytes + library_desc.DXILLibrary.BytecodeLength);
+    library.bytecode = device_->GetShaderArtifactCache().RetainBytecode(
+        library_desc.DXILLibrary.pShaderBytecode, library_desc.DXILLibrary.BytecodeLength);
     std::vector<LibraryExport> reflected;
     HRESULT hr = EnumerateLibraryExports(library_desc.DXILLibrary, reflected);
     if (FAILED(hr))

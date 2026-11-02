@@ -332,6 +332,11 @@ Value *EmitAtomic64CellUpdate(IRBuilderBase &builder, Value *root,
 
 Error LowerAtomic64Phase(Module &module) {
   if (!module.getModuleFlag(kAtomic64PhaseFlag)) return Error::success();
+  // Ordinary bounded buffer reads are normally materialized after optimization.
+  // In an atomic64 phase they must first become visible to canonical-cell
+  // rewriting, otherwise same-dispatch reads observe the stale native backing
+  // while atomics update the shadow. Other shaders retain delayed lowering.
+  d3dalloy::lowerBoundedLoads(module);
   if (auto error = exposeBufferAtomics(module)) return error;
   SmallVector<Instruction *, 64> accesses;
   for (auto &function : module) {

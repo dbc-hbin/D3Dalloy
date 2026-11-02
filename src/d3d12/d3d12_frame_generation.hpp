@@ -5,6 +5,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 namespace d3dalloy {
 class MTLD3D12Device;
@@ -20,6 +21,7 @@ std::array<MTLD3D12Resource *, 10> GetOwnedFrameGenerationResources(const std::s
 std::array<D3D12_RESOURCE_STATES, 10> GetOwnedFrameGenerationStates(const std::shared_ptr<OwnedFrameGenerationFrame> &);
 bool IsOwnedFrameGenerationOutput(const std::shared_ptr<OwnedFrameGenerationFrame> &, size_t index);
 // See OwnedTemporalFrameHistoryQueue.
+std::mutex &OwnedFrameGenerationSubmissionMutex(const std::shared_ptr<OwnedFrameGenerationFrame> &);
 uint64_t OwnedFrameGenerationFrameHistoryQueue(const std::shared_ptr<OwnedFrameGenerationFrame> &);
 void EncodeOwnedFrameGenerationFrame(const std::shared_ptr<OwnedFrameGenerationFrame> &,
     WMT::MTL4CommandBuffer, WMT::Fence, uint64_t queue,

@@ -36,7 +36,7 @@ FEX 커밋 `206d61d07`은 `IREmitter.cpp/.h`의 10줄 추가·2줄 삭제다. OF
 | Head-fixed | 100,651,008 | 8,191 | 113.993ms | 0.108ms |
 | Alternating | 125,806,592 | 8,191 | 171.431ms | 0.207ms |
 
-실제 emitter를 사용한 baseline·candidate·현재 소스의 구조 해시는 `4f9b6c042a7a22d4`로 같았다. 다섯 번의 고정 작업 측정이며, 시간 임계값으로 테스트를 통과시키지 않았다. 자료는 별도 FEX 저장소의 [compare-result.json](../../FEX-darwin/build/local/ir-tail-proof-20261009/compare-result.json)과 [check-result.json](../../FEX-darwin/build/local/ir-tail-proof-20261009/check-result.json)에 있다.
+당시 기록에 따르면 실제 emitter를 사용한 baseline·candidate·소스의 구조 해시는 `4f9b6c042a7a22d4`로 같았다. 다섯 번의 고정 작업 측정이며 시간 임계값으로 테스트를 통과시키지 않았다는 보고였다. 위 표와 이 해시는 **2026-10-09의 역사적 기록**이다. 원래 증거 위치는 별도 FEX 저장소의 `build/local/ir-tail-proof-20261009/compare-result.json` 및 `check-result.json`이지만, **2026-11-02 확인 시 두 파일이 없어 현재 재검증할 수 없다**. 파일을 복원하거나 수치를 새로 입증한 것으로 취급하지 않는다. 아래 D3Dalloy에 남은 최종 결과·동일성 자료와 이 누락된 emitter 원본은 구분한다.
 
 ## 검증과 독립 검토
 

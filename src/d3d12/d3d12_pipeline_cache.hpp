@@ -1,6 +1,8 @@
 #pragma once
 
 #include "d3d12_pipeline.hpp"
+#include "owned_shader_bytecode.hpp"
+#include "owned_stage_key.hpp"
 #include "sha1/sha1_util.hpp"
 #include "Metal4Pipeline.hpp"
 #include "dxil_raytracing.h"
@@ -57,6 +59,13 @@ struct NativePipelineArtifact {
   size_t size() const { return 0; }
 };
 
+// Immutable native DXR executable only. State-object identifiers, relocated
+// constants, visible/intersection tables and dispatch bindings are never cached.
+struct NativeRaytracingArtifact : NativePipelineArtifact {
+  WMT::Reference<WMT4::Library> library;
+  std::vector<WMT::Reference<WMT::FunctionHandle>> handles;
+};
+
 // CPU-only output; every consumer creates its own native objects and relocated constants.
 struct WorkGraphArtifact : ShaderStageArtifact {
   SM50_WG_NODE_COMPILED_INFO info{};
@@ -97,6 +106,8 @@ public:
               const char *name, sm50_error_t *error);
   const Sha1Digest &stageKey(Stage stage) const { return stage_keys_[stage]; }
   HRESULT GetBlob(ID3DBlob **blob);
+  // Internal immutable owner only. Never return this writable COM view to an app.
+  HRESULT GetPrivateBlob(ID3DBlob **blob);
   // Called after the complete native PSO initialization, never just shader compilation.
   // `retain = false` (deferred native link) releases same-key waiters now but holds memory
   // retention and disk publication until CommitDeferred(true) confirms the link succeeded.
@@ -110,7 +121,10 @@ public:
   void RetryAutomatic(PipelineCache &fresh);
 
 private:
+  HRESULT SerializeBlob(ID3DBlob **blob);
   HRESULT LoadBlob(const D3D12_CACHED_PIPELINE_STATE &cached, ID3DBlob *owned = nullptr);
+  std::mutex serialized_mutex_;
+  Com<ID3DBlob> serialized_;
 
   Sha1Digest key_{};
   uint32_t stages_ = 0;
@@ -136,6 +150,7 @@ public:
   ~DeviceShaderArtifactCache();
   DeviceShaderArtifactCache(const DeviceShaderArtifactCache &) = delete;
   DeviceShaderArtifactCache &operator=(const DeviceShaderArtifactCache &) = delete;
+  SharedShaderBytecode RetainBytecode(const void *data, size_t size);
   int CompileWorkGraph(const SM50_WG_NODE_COMPILE_DESC &desc, sm50_bitcode_t *output,
       SM50_COMPILED_BITCODE &code, SM50_WG_NODE_COMPILED_INFO &info, sm50_error_t *error,
       std::shared_ptr<const WorkGraphArtifact> &artifact, bool bypass = false);
@@ -152,6 +167,9 @@ public:
   WMT::Reference<WMT4::Function> SampleMaskFunction(WMT4::Library library, const char *name,
       D3D12_SHADER_BYTECODE root, uint32_t mask, WMT::Error &error);
   WMT::Reference<WMT4::Function> Function(WMT4::Library library, const char *name);
+  std::shared_ptr<const NativeRaytracingArtifact> NativeRaytracing(
+      WMT4::Compiler compiler, WMT4::Library library, const std::vector<SM50_RT_FUNCTION_INFO> &functions,
+      uint32_t max_call_stack_depth, WMT::Error &error);
   std::shared_ptr<const NativePipelineArtifact> NativePipeline(WMT4::Compiler compiler,
       const WMTComputePipelineInfo &info, WMT::Error &error);
   std::shared_ptr<const NativePipelineArtifact> NativePipeline(WMT4::Compiler compiler,

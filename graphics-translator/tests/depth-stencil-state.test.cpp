@@ -13,6 +13,11 @@ struct GraphicsPipelineExtras {
   std::optional<std::pair<UINT8, UINT8>> back_stencil_read_write_mask;
 };
 struct Device {
+  struct StateBuilder {
+    WMT::Reference<WMT::DepthStencilState> DepthStencil(WMT::Device device,const WMTDepthStencilInfo& info) {
+      return device.newDepthStencilState(info);
+    }
+  } owned_native_states; // This test isolates descriptor math; cache ownership has its own probe.
   WMT::DepthStencilState default_depth_stencil_state;
   WMT::Device GetMTLDevice() { WMT::Device metal; metal.handle = 100; return metal; }
 };

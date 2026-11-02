@@ -171,13 +171,50 @@ id<MTLComputePipelineState> makeExposurePipeline(id<MTLDevice> device) noexcept 
     return pipeline;
 }
 
-// The FSR kernel library depends only on the device. Features share it; the
-// weak cache never extends its lifetime past the last feature, and a failed
-// compilation is not cached so a later prepare retries.
+// Immutable libraries and pipelines depend only on the device. Keep their
+// existing lazy preparation: exposure-only features need not compile FSR.
+// The weak cache does not outlive its features; failed entries remain retryable.
 struct FsrLibrary {
     id<MTLDevice> device = nil;
-    id<MTLLibrary> library = nil;
+    mutable id<MTLLibrary> library = nil;
+    mutable id<MTLComputePipelineState> exposure = nil;
+    mutable std::mutex pipelineMutex;
+    mutable std::array<std::pair<NSString*, id<MTLComputePipelineState>>, 10> pipelines{};
+
+    bool ensureLibrary() const noexcept {
+        std::lock_guard lock(pipelineMutex);
+        if (!library) library = makeLibrary(device, kFsrKernelsSource);
+        return library != nil;
+    }
+
+    id<MTLComputePipelineState> getExposurePipeline() const noexcept {
+        std::lock_guard lock(pipelineMutex);
+        if (!exposure) exposure = makeExposurePipeline(device);
+        return retainObject(exposure);
+    }
+
+    id<MTLComputePipelineState> getPipeline(NSString* name) const noexcept {
+        std::lock_guard lock(pipelineMutex);
+        for (const auto& entry : pipelines)
+            if ([entry.first isEqualToString:name]) return retainObject(entry.second);
+        for (auto& entry : pipelines) {
+            if (entry.second) continue;
+            if (!library) library = makeLibrary(device, kFsrKernelsSource);
+            if (!library) return nil;
+            auto pipeline = makePipeline(device, library, name);
+            if (!pipeline) return nil;
+            entry = {[name retain], pipeline};
+            return retainObject(pipeline);
+        }
+        return nil;
+    }
+
     ~FsrLibrary() {
+        for (auto& entry : pipelines) {
+            releaseObject(entry.first);
+            releaseObject(entry.second);
+        }
+        releaseObject(exposure);
         releaseObject(library);
         releaseObject(device);
     }
@@ -197,8 +234,6 @@ std::shared_ptr<const FsrLibrary> deviceFsrLibrary(id<MTLDevice> device) noexcep
         });
         if (found) return found;
         auto result = std::make_shared<FsrLibrary>();
-        result->library = makeLibrary(device, kFsrKernelsSource);
-        if (!result->library) return {};
         result->device = retainObject(device);
         fsrLibraryCache.push_back(result);
         return result;
@@ -309,15 +344,12 @@ ResidencyBindings residencyBindings(id<MTLTexture> privateOutput, id<MTLTexture>
                                     id<MTLTexture> linearColor, id<MTLTexture> combinedMask,
                                     id<MTLTexture> stagedColor, id<MTLTexture> stagedDepth,
                                     id<MTLTexture> stagedMotion, id<MTLTexture> stagedReactive,
-                                    id<MTLBuffer> linearizeParams, id<MTLBuffer> maskParams,
-                                    id<MTLBuffer> finishParams, id<MTLTexture> alphaColor,
-                                    id<MTLTexture> alphaOutput, id<MTLBuffer> alphaParams,
-                                    id<MTLBuffer> debugParams, id<MTLBuffer> copyParams) noexcept {
+                                    id<MTLBuffer> parameterArena, id<MTLTexture> alphaColor,
+                                    id<MTLTexture> alphaOutput) noexcept {
     return {{
         privateOutput, convertedExposure, linearColor,
         combinedMask, stagedColor, stagedDepth, stagedMotion, stagedReactive,
-        linearizeParams, maskParams, finishParams,
-        alphaColor, alphaOutput, alphaParams, debugParams, copyParams,
+        parameterArena, alphaColor, alphaOutput,
     }};
 }
 
@@ -431,11 +463,19 @@ NSUInteger scratchBytes(id<MTLTexture> texture) noexcept {
 
 // A committed set and every allocation it names travel together. Caller textures
 // remain owned by PreparedFrame; only the scratch side is transferred here.
+struct ParameterSlice {
+    // Non-owning view into this execution's immutable parameter arena.
+    id<MTLBuffer> buffer = nil;
+    NSUInteger length = 0;
+    void* contents = nullptr;
+    uint64_t gpuAddress = 0;
+    explicit operator bool() const noexcept { return buffer != nil; }
+};
 struct ExecutionResources {
     id<MTLTexture> alphaColor = nil;
     id<MTLTexture> alphaOutput = nil;
-    id<MTLBuffer> alphaParams = nil;
-    id<MTLBuffer> debugParams = nil;
+    id<MTLBuffer> parameterArena = nil;
+    ParameterSlice alphaParams, debugParams;
     id<MTLTexture> privateOutput = nil;
     id<MTLTexture> convertedExposure = nil;
     id<MTLTexture> linearColor = nil;
@@ -444,10 +484,7 @@ struct ExecutionResources {
     id<MTLTexture> stagedDepth = nil;
     id<MTLTexture> stagedMotion = nil;
     id<MTLTexture> stagedReactive = nil;
-    id<MTLBuffer> linearizeParams = nil;
-    id<MTLBuffer> maskParams = nil;
-    id<MTLBuffer> finishParams = nil;
-    id<MTLBuffer> copyParams = nil;
+    ParameterSlice linearizeParams, maskParams, finishParams, copyParams;
     id residency = nil;
     // Allocations last committed to residency; a retired set keeps them.
     ResidencyBindings residencyContents{};
@@ -461,14 +498,11 @@ struct ExecutionResources {
         releaseObject(argumentTable);
         releaseObject(residency);
         residencyContents = {};
-        releaseObject(debugParams);
-        releaseObject(alphaParams);
+        releaseObject(parameterArena);
+        debugParams = {}; alphaParams = {};
         releaseObject(alphaOutput);
         releaseObject(alphaColor);
-        releaseObject(copyParams);
-        releaseObject(finishParams);
-        releaseObject(maskParams);
-        releaseObject(linearizeParams);
+        copyParams = {}; finishParams = {}; maskParams = {}; linearizeParams = {};
         releaseObject(stagedReactive);
         releaseObject(stagedMotion);
         releaseObject(stagedDepth);
@@ -480,6 +514,7 @@ struct ExecutionResources {
     }
 
     void swap(ExecutionResources& other) noexcept {
+        std::swap(parameterArena, other.parameterArena);
         std::swap(alphaColor, other.alphaColor);
         std::swap(alphaOutput, other.alphaOutput);
         std::swap(alphaParams, other.alphaParams);
@@ -509,6 +544,7 @@ struct Feature::Impl {
     id compiler = nil;
     id<MTLComputePipelineState> exposurePipeline = nil;
     id<MTLComputePipelineState> linearizePipeline = nil;
+    id<MTLComputePipelineState> linearizeAlphaPipeline = nil;
     id<MTLComputePipelineState> combineMaskPipeline = nil;
     id<MTLComputePipelineState> finishPipeline = nil;
     id<MTLComputePipelineState> alphaPipeline = nil;
@@ -671,14 +707,12 @@ struct Feature::Impl {
         resources.residencyContents = {};
         putTable(idleFsrTables, resources.fsrArgumentTable);
         putTable(idleExposureTables, resources.argumentTable);
-        putBuffer(resources.debugParams);
-        putBuffer(resources.alphaParams);
+        resources.debugParams = {}; resources.alphaParams = {};
+        resources.copyParams = {}; resources.finishParams = {};
+        resources.maskParams = {}; resources.linearizeParams = {};
+        putBuffer(resources.parameterArena);
         putTexture(resources.alphaOutput);
         putTexture(resources.alphaColor);
-        putBuffer(resources.copyParams);
-        putBuffer(resources.finishParams);
-        putBuffer(resources.maskParams);
-        putBuffer(resources.linearizeParams);
         putTexture(resources.stagedReactive);
         putTexture(resources.stagedMotion);
         putTexture(resources.stagedDepth);
@@ -817,6 +851,7 @@ struct Feature::Impl {
         releaseObject(finishPipeline);
         releaseObject(combineMaskPipeline);
         releaseObject(linearizePipeline);
+        releaseObject(linearizeAlphaPipeline);
         releaseObject(exposurePipeline);
         releaseObject(compiler);
         releaseObject(device);
@@ -1207,7 +1242,8 @@ bool validateFrameTextures(const Feature::Impl& feature, const FrameInfo& frame,
 
 bool ensureExposurePipeline(Feature::Impl& feature, Error* error) noexcept {
     if (feature.exposurePipeline) return true;
-    feature.exposurePipeline = makeExposurePipeline(feature.device);
+    if (!feature.fsrLibrary) feature.fsrLibrary = deviceFsrLibrary(feature.device);
+    if (feature.fsrLibrary) feature.exposurePipeline = feature.fsrLibrary->getExposurePipeline();
     if (!feature.exposurePipeline) {
         setError(error, ErrorCode::ResourceCreationFailed,
                  "failed to synchronously create numerical MetalFX exposure conversion pipeline");
@@ -1219,6 +1255,7 @@ bool ensureExposurePipeline(Feature::Impl& feature, Error* error) noexcept {
 // Each prepared frame compiles only the SR passes it encodes.
 struct FsrPipelineNeeds {
     bool linearize = false;
+    bool linearizeAlpha = false;
     bool combineMasks = false;
     bool finish = false;
     bool alpha = false;
@@ -1232,20 +1269,25 @@ bool ensureFsrPipeline(Feature::Impl& feature, bool needed, id<MTLComputePipelin
                        NSString* name) noexcept {
     if (!needed || pipeline) return true;
     if (feature.fsrLibrary)
-        pipeline = makePipeline(feature.device, feature.fsrLibrary->library, name);
+        pipeline = feature.fsrLibrary->getPipeline(name);
     return pipeline != nil;
 }
 
 bool ensureFsrLibrary(Feature::Impl& feature) noexcept {
     if (!feature.fsrLibrary) feature.fsrLibrary = deviceFsrLibrary(feature.device);
-    return feature.fsrLibrary != nullptr;
+    return feature.fsrLibrary && feature.fsrLibrary->ensureLibrary();
 }
 
 bool ensureFsrPipelines(Feature::Impl& feature, const FsrPipelineNeeds& needs,
                         Error* error) noexcept {
-    const bool any = needs.linearize || needs.combineMasks || needs.finish || needs.alpha ||
-                     needs.debug || needs.padding;
-    if (any && !ensureFsrLibrary(feature)) {
+    const bool missing = (needs.linearize && !feature.linearizePipeline) ||
+        (needs.linearizeAlpha && !feature.linearizeAlphaPipeline) ||
+        (needs.combineMasks && !feature.combineMaskPipeline) || (needs.finish && !feature.finishPipeline) ||
+        (needs.alpha && !feature.alphaPipeline) || (needs.padding && !feature.paddingPipeline) ||
+        (needs.debug && !(needs.debugDepth ? feature.debugDepthPipeline : feature.debugPipeline));
+    // The shared cache mutex belongs to preparation misses, not the steady frame path.
+    if (!missing) return true;
+    if (!ensureFsrLibrary(feature)) {
         setError(error, ErrorCode::ResourceCreationFailed,
                  "failed to compile FSR translation kernel library");
         return false;
@@ -1253,6 +1295,8 @@ bool ensureFsrPipelines(Feature::Impl& feature, const FsrPipelineNeeds& needs,
     // Attempt every needed pipeline so one failure does not hide another.
     bool ok = ensureFsrPipeline(feature, needs.linearize, feature.linearizePipeline,
                                 @"yaagl_fsr_linearize");
+    ok &= ensureFsrPipeline(feature, needs.linearizeAlpha, feature.linearizeAlphaPipeline,
+                            @"yaagl_sr_linearize_alpha");
     ok &= ensureFsrPipeline(feature, needs.combineMasks, feature.combineMaskPipeline,
                             @"yaagl_fsr_combine_masks");
     ok &= ensureFsrPipeline(feature, needs.finish, feature.finishPipeline, @"yaagl_fsr_finish");
@@ -1636,15 +1680,28 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                               {dispatch.width, dispatch.height}, static_cast<std::uint32_t>(transfer),
                               flags, frame.operations.sharpness, frame.frame.preExposure};
             };
-            const auto makeBuffer = [&](const Params* records, std::size_t count) -> id<MTLBuffer> {
-                const std::size_t length = count * sizeof(Params);
-                id<MTLBuffer> buffer = feature.takeBuffer(length, prefer);
-                if (buffer) {
-                    std::memcpy(buffer.contents, records, length);
-                    return buffer;
+            // Copy, linearization/padding, mask, alpha, debug and finish each
+            // have one 256-byte-aligned slot. No live execution shares writable
+            // constants; only GPU-retired arenas return to the existing pool.
+            constexpr NSUInteger slotBytes = 256, arenaBytes = 6 * slotBytes;
+            static_assert(4 * sizeof(Params) <= slotBytes);
+            NSUInteger parameterSlot = 0;
+            const auto storeParams = [&](const void* records, NSUInteger length) -> ParameterSlice {
+                if (length > slotBytes || parameterSlot == 6) return {};
+                if (!lease->parameterArena) {
+                    lease->parameterArena = feature.takeBuffer(arenaBytes, prefer);
+                    if (!lease->parameterArena)
+                        lease->parameterArena = [feature.device newBufferWithLength:arenaBytes
+                                                                   options:MTLResourceStorageModeShared];
                 }
-                return [feature.device newBufferWithBytes:records length:length
-                                                   options:MTLResourceStorageModeShared];
+                if (!lease->parameterArena) return {};
+                const NSUInteger offset = parameterSlot++ * slotBytes;
+                void* contents = static_cast<char*>(lease->parameterArena.contents) + offset;
+                std::memcpy(contents, records, length);
+                return {lease->parameterArena, length, contents, lease->parameterArena.gpuAddress + offset};
+            };
+            const auto makeBuffer = [&](const Params* records, std::size_t count) {
+                return storeParams(records, count * sizeof(Params));
             };
             const auto makeParams = [&](const Rect& source, const Rect& destination,
                                         const Rect& dispatch, ColorTransfer transfer) {
@@ -1669,11 +1726,11 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     return {};
                 }
             }
+            const ColorTransfer inputTransfer =
+                frame.operations.colorTransfer == ColorTransfer::SRGB &&
+                        isSrgbFormat(frame.color.pixelFormat)
+                    ? ColorTransfer::Linear : frame.operations.colorTransfer;
             if (transfer) {
-                const ColorTransfer inputTransfer =
-                    frame.operations.colorTransfer == ColorTransfer::SRGB &&
-                            isSrgbFormat(frame.color.pixelFormat)
-                        ? ColorTransfer::Linear : frame.operations.colorTransfer;
                 const Rect destination{0, 0, active.width, active.height};
                 // Record 0 linearizes the active extent; records 1-2 replicate its
                 // converted edges over the disjoint right and bottom strips.
@@ -1696,7 +1753,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
             if (alpha)
                 lease->alphaParams = makeParams(frame.frame.colorRect, Rect{},
                     Rect{0, 0, static_cast<uint32_t>(generation.inputCapacityWidth),
-                               static_cast<uint32_t>(generation.inputCapacityHeight)}, ColorTransfer::Linear);
+                               static_cast<uint32_t>(generation.inputCapacityHeight)}, inputTransfer);
             if (frame.operations.drawDebugView) {
                 struct DebugParams {
                     uint32_t outputOrigin[2], outputExtent[2], depthOrigin[2], depthExtent[2];
@@ -1704,6 +1761,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     float motionScale[2];
                     uint32_t depthInverted, transfer;
                 };
+                static_assert(sizeof(DebugParams) <= slotBytes);
                 const auto& f = frame.frame;
                 const auto outputTransfer = frame.operations.colorTransfer == ColorTransfer::SRGB &&
                     isSrgbFormat(frame.output.pixelFormat) ? ColorTransfer::Linear : frame.operations.colorTransfer;
@@ -1712,10 +1770,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                     {f.motionRect.x, f.motionRect.y}, {f.motionRect.width, f.motionRect.height},
                     {f.motionVectorScaleX, f.motionVectorScaleY}, uint32_t(feature.create.depthInverted()),
                     uint32_t(outputTransfer)};
-                lease->debugParams = feature.takeBuffer(sizeof(params), prefer);
-                if (lease->debugParams) std::memcpy(lease->debugParams.contents, &params, sizeof(params));
-                else lease->debugParams = [feature.device newBufferWithBytes:&params length:sizeof(params)
-                                                                  options:MTLResourceStorageModeShared];
+                lease->debugParams = storeParams(&params, sizeof(params));
             }
             if (finish) {
                 const ColorTransfer outputTransfer =
@@ -1745,9 +1800,8 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                 residencyBindings(lease->privateOutput, lease->convertedExposure,
                     lease->linearColor, lease->combinedMask, lease->stagedColor,
                     lease->stagedDepth, lease->stagedMotion, lease->stagedReactive,
-                    lease->linearizeParams, lease->maskParams, lease->finishParams,
-                    lease->alphaColor, lease->alphaOutput, lease->alphaParams, lease->debugParams,
-                    lease->copyParams), lease->residencyContents, reusable);
+                    lease->parameterArena, lease->alphaColor, lease->alphaOutput),
+                    lease->residencyContents, reusable);
             if (!lease->residency) {
                 setError(error, ErrorCode::ResourceCreationFailed,
                          "failed to create Metal4 residency set for MetalFX execution");
@@ -1833,7 +1887,7 @@ constexpr MTLSize kFsrDefaultThreadgroup{8, 8, 1};
 constexpr MTLSize kFsrWideThreadgroup{16, 16, 1};
 
 void dispatchFsrPassMetal4(ExecutionLease::Impl& lease, id<MTL4ComputeCommandEncoder> encoder,
-                           id<MTLComputePipelineState> pipeline, id<MTLBuffer> params,
+                           id<MTLComputePipelineState> pipeline, const ParameterSlice& params,
                            id<MTLTexture> first, id<MTLTexture> second,
                            id<MTLTexture> third, const Rect& rect, id<MTLTexture> fourth = nil,
                            NSUInteger parameterOffset = 0,
@@ -1854,7 +1908,7 @@ void dispatchFsrPassMetal4(ExecutionLease::Impl& lease, id<MTL4ComputeCommandEnc
 
 bool encodeFsrPassMetal4(ExecutionLease::Impl& lease,
                          id<MTL4CommandBuffer> command, id<MTLFence> fence,
-                         id<MTLComputePipelineState> pipeline, id<MTLBuffer> params,
+                         id<MTLComputePipelineState> pipeline, const ParameterSlice& params,
                          id<MTLTexture> first, id<MTLTexture> second,
                          id<MTLTexture> third, const Rect& rect, id<MTLTexture> fourth = nil,
                          MTLSize threadgroup = kFsrDefaultThreadgroup) API_AVAILABLE(macos(26.0)) {
@@ -1979,11 +2033,16 @@ bool encodePrepassMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Impl&
         copy(frame.depth, lease.stagedDepth, frame.frame.depthRect);
         copy(frame.motion, lease.stagedMotion, frame.scalerMotionRect);
         copy(frame.reactive, lease.stagedReactive, frame.frame.reactiveRect);
-        if (lease.alphaColor)
+        const bool fusedColorAlpha = lease.alphaColor && lease.linearColor && frame.feature->linearizeAlphaPipeline;
+        if (fusedColorAlpha)
+            dispatchFsrPassMetal4(lease, encoder, frame.feature->linearizeAlphaPipeline, lease.alphaParams,
+                frame.color, lease.linearColor, lease.alphaColor,
+                Rect{0, 0, uint32_t(lease.alphaColor.width), uint32_t(lease.alphaColor.height)});
+        if (lease.alphaColor && !fusedColorAlpha)
             dispatchFsrPassMetal4(lease, encoder, frame.feature->alphaPipeline, lease.alphaParams,
                 frame.color, lease.alphaColor, nil,
                 Rect{0, 0, uint32_t(lease.alphaColor.width), uint32_t(lease.alphaColor.height)});
-        if (lease.linearColor)
+        if (lease.linearColor && !fusedColorAlpha)
             dispatchFsrPassMetal4(lease, encoder, frame.feature->linearizePipeline,
                                   lease.linearizeParams, frame.color, lease.linearColor, nil,
                                   frame.frame.colorRect);
@@ -2325,7 +2384,8 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
             const bool single = (candidates & (2u | 8u)) ||
                 ((candidates & 1u) && color.pixelFormat == MTLPixelFormatRGBA8Unorm);
             // A missing compute pipeline keeps that input on the blit fallback.
-            if (candidates) ensureFsrLibrary(*impl_);
+            if ((half && !impl_->copyHalfPipeline) || (single && !impl_->copyFloatPipeline))
+                ensureFsrLibrary(*impl_);
             if (half && !ensureFsrPipeline(*impl_, true, impl_->copyHalfPipeline,
                                            @"yaagl_sr_copy_pad_half")) {
                 candidates &= ~4u;
@@ -2349,6 +2409,10 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
         needs.finish = !needs.debug &&
                        (needs.linearize || operations.sharpening || temporal.capped || needs.alpha);
         needs.padding = needs.linearize && smallerThanInputCapacity;
+        // Both passes read the same color subrect. Keep alpha linear and the
+        // existing converted-color padding; only the redundant read/dispatch goes.
+        needs.linearizeAlpha = needs.linearize && needs.alpha;
+        if (needs.linearizeAlpha) needs.linearize = needs.alpha = false;
         if (!ensureFsrPipelines(*impl_, needs, error)) return {};
 
         // Pre-create one complete execution resource set. This makes the first

@@ -2,6 +2,8 @@
 
 #include "d3d12_interfaces_ext.hpp"
 #include "Metal4.hpp"
+#include "d3dalloy_allocation.hpp"
+#include "rc/util_rc_ptr.hpp"
 #include "DXBCParser/RtasSerialized.h"
 #include <cstdint>
 #include <vector>
@@ -63,6 +65,7 @@ struct BufferLocation {
   const void *allocationIdentity = nullptr;
   /* The D3D12 GPU virtual address that was resolved (a Metal device address). */
   uint64_t address = 0;
+  Rc<Allocation> lookup_owner;
 };
 
 /* One geometry of a bottom-level shadow copy (rt_as_prepass.metal: D3DALLOYASShadowGeometry). The

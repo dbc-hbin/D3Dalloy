@@ -64,6 +64,7 @@ WINDOWS_MODULES = (
     "d3d11.dll",
     "d3d10core.dll",
     "winemetal.dll",
+    "amdxc64.dll",
 )
 TRANSLATOR_ARTIFACTS = tuple(WINDOWS_DIR / name for name in WINDOWS_MODULES) + (
     UNIX_DIR / "winemetal.so",
@@ -76,6 +77,9 @@ AGILITY_SDK_VERSION = 618
 WINE_BUILTIN_MARKER = b"Wine builtin DLL"
 WINE_FAKE_MARKER = b"Wine placeholder DLL"
 OWNED_NGX_D3D12_MARKER = b"own-ngxd3d12"
+ANTILAG_MODULE = "amdxc64.dll"
+OWNED_ANTILAG_MARKER = b"d3dalloy-owned-antilag2"
+REQUIRED_ANTILAG_EXPORTS = {"AmdExtD3DCreateInterface", "OwnedAntiLagBackendId"}
 FSR_MODULE = "amd_fidelityfx_upscaler_dx12.dll"
 OWNED_FSR_MARKER = b"d3dalloy-owned-fsr-metalfx-v1"
 FSR_FRAMEGENERATION_MODULE = "amd_fidelityfx_framegeneration_dx12.dll"
@@ -393,7 +397,8 @@ def runtime_artifacts(with_nvngx: bool = False, with_nvapi: bool = False,
 
 def owned_overrides(with_nvngx: bool = False, with_nvapi: bool = False, *, with_fsr: bool | None = False,
                     with_fsr_framegeneration: bool | None = False, wow64_frontends: bool | None = None, with_core: bool = True,
-                    with_dcomp: bool = False, with_fsr_rayregeneration: bool | None = None) -> str:
+                    with_dcomp: bool = False, with_fsr_rayregeneration: bool | None = None,
+                    with_antilag: bool = True) -> str:
     # Unselected vendor modules must not fall through to the source Wine
     # package: its NVAPI implementation can load D3DMetal on first use.
     parts = [OWNED_OVERRIDES, "nvngx=b" if with_nvngx else "nvngx=",
@@ -416,6 +421,8 @@ def owned_overrides(with_nvngx: bool = False, with_nvapi: bool = False, *, with_
         parts.append("amd_fidelityfx_denoiser_dx12=b" if with_fsr_rayregeneration else "amd_fidelityfx_denoiser_dx12=")
     if with_dcomp:
         parts.append("dcomp=b")
+    if with_antilag:
+        parts.append("amdxc64=b")
     return ";".join(parts)
 
 
@@ -535,6 +542,20 @@ def validate_core_module(path: Path, windows_abi: str, *, legacy_builtin: bool =
     return generation
 
 
+def validate_antilag_module(path: Path, windows_abi: str) -> None:
+    regular_file(path, "owned Anti-Lag 2 module")
+    if inspect_pe(path)["windows_abi"] != windows_abi:
+        raise ValueError(f"Anti-Lag 2 Windows ABI mismatch: {path}; expected {windows_abi}")
+    payload = path.read_bytes()
+    if OWNED_ANTILAG_MARKER not in payload:
+        raise ValueError(f"{path.name} is missing the owned Anti-Lag 2 marker")
+    if WINE_BUILTIN_MARKER not in payload:
+        raise ValueError(f"{path.name} lacks the Wine builtin marker; winebuild --builtin did not run")
+    missing = REQUIRED_ANTILAG_EXPORTS - pe_exports(path).keys()
+    if missing:
+        raise ValueError(f"{path.name} is missing required Anti-Lag 2 exports: {sorted(missing)}")
+
+
 def validate_fsr_module(path: Path, windows_abi: str = "x64") -> None:
     regular_file(path, "owned D3Dalloy FSR module")
     if inspect_pe(path)["windows_abi"] != windows_abi:
@@ -604,7 +625,9 @@ def resolve_wow64_artifacts(d3dalloy_install32: Path, with_nvngx: bool = False, 
         if name != "d3d12core.dll" and WINE_BUILTIN_MARKER not in source.read_bytes():
             raise ValueError(f"32-bit D3Dalloy {name} lacks the Wine builtin marker; winebuild --builtin did not run")
         result[WOW64_WINDOWS_DIR / name] = source
-        if name in FSR_MODULE_MARKERS:
+        if name == ANTILAG_MODULE:
+            validate_antilag_module(source, "x86")
+        elif name in FSR_MODULE_MARKERS:
             validate_fsr_module(source, "x86")
         elif name == "nvngx.dll":
             if OWNED_NGX_D3D12_MARKER not in source.read_bytes():
@@ -665,6 +688,7 @@ def resolve_d3dalloy_artifacts(
         if relative.suffix == ".dll" and inspect_pe(source)["windows_abi"] != arch["windows_abi"]:
             raise ValueError(f"D3Dalloy Windows ABI mismatch: {source}; expected {arch["windows_abi"]}")
     validate_core_module(d3dalloy_install / D3DALLOY_WINDOWS_DIR / "d3d12core.dll", arch["windows_abi"])
+    validate_antilag_module(d3dalloy_install / D3DALLOY_WINDOWS_DIR / ANTILAG_MODULE, arch["windows_abi"])
     return result
 
 
@@ -761,7 +785,7 @@ def macho_audit_problems(path: Path, label: str, native_arch: str = "x86_64") ->
 def render_wrapper(with_nvngx: bool = False, with_nvapi: bool = False, arch: dict | None = None, *, with_fsr: bool | None = False,
                    with_fsr_framegeneration: bool | None = False, wow64_frontends: bool | None = None, with_core: bool = True,
                    with_wow64: bool = False, with_dcomp: bool = False,
-                   with_fsr_rayregeneration: bool | None = None) -> str:
+                   with_fsr_rayregeneration: bool | None = None, with_antilag: bool = True) -> str:
     arch = arch or architecture("x86_64", "x64")
     dll_paths = [arch["windows_directory"]]
     if with_wow64:
@@ -823,7 +847,7 @@ fi
 
 # Environment load order wins over prefix registry overrides. Builtin-only means
 # a missing owned module is a hard load failure rather than a native/GPTK fallback.
-export WINEDLLOVERRIDES="{owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration, wow64_frontends=wow64_frontends, with_core=with_core, with_dcomp=with_dcomp, with_fsr_rayregeneration=with_fsr_rayregeneration)}"
+export WINEDLLOVERRIDES="{owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration, wow64_frontends=wow64_frontends, with_core=with_core, with_dcomp=with_dcomp, with_fsr_rayregeneration=with_fsr_rayregeneration, with_antilag=with_antilag)}"
 
 {"export D3DALLOY_ENABLE_NVEXT=1" if (with_nvngx or with_nvapi) else "unset D3DALLOY_ENABLE_NVEXT"}
 
@@ -896,6 +920,12 @@ def verify_runtime(runtime: Path) -> list[str]:
         return [str(error)]
     WINDOWS_DIR, UNIX_DIR = Path(arch["windows_directory"]), Path(arch["unix_directory"])
     optional = data.get("optional_modules", {})
+    recorded = data.get("artifacts")
+    if not isinstance(recorded, dict):
+        return ["manifest artifact inventory is missing"]
+    # Inventory membership preserves immutable pre-Anti-Lag manifests. Every
+    # new stage requires the facade; this is only historical read compatibility.
+    with_antilag = str(WINDOWS_DIR / ANTILAG_MODULE) in recorded
     # Retained immutable schema 1/2 runtimes predate Core. New stages always
     # record agility_sdk; this is legacy read compatibility, not a feature gate.
     with_core = "agility_sdk" in data
@@ -903,7 +933,8 @@ def verify_runtime(runtime: Path) -> list[str]:
     # Only immutable Core manifests from before native-only delivery used b.
     # Verify that historical image mode too; new staging never accepts it.
     legacy_core_builtin = isinstance(core_record, dict) and "delivery" not in core_record
-    windows_modules = tuple(name for name in WINDOWS_MODULES if with_core or name != "d3d12core.dll")
+    windows_modules = tuple(name for name in WINDOWS_MODULES
+                            if (with_core or name != "d3d12core.dll") and (with_antilag or name != ANTILAG_MODULE))
     with_nvngx = optional.get("nvngx") is True
     with_nvapi = optional.get("nvapi64") is True
     with_wow64 = optional.get("wow64") is True
@@ -958,6 +989,8 @@ def verify_runtime(runtime: Path) -> list[str]:
                                  with_wow64_frontends and optional.get("fsr_rayregeneration") is True)
     if not with_core:
         wow64_extra = tuple(path for path in wow64_extra if path.name != "d3d12core.dll")
+    if not with_antilag:
+        wow64_extra = tuple(path for path in wow64_extra if path.name != ANTILAG_MODULE)
     fsr_policy = optional.get("fsr")
     if "fsr" in optional and not isinstance(fsr_policy, bool):
         problems.append("manifest optional FSR selection must be a boolean")
@@ -988,23 +1021,21 @@ def verify_runtime(runtime: Path) -> list[str]:
         leftover = runtime / relative
         if leftover.exists() or leftover.is_symlink():
             problems.append(f"staged runtime still contains a removed external DXIL compiler artifact: {relative}")
-    expected_overrides = owned_overrides(with_nvngx, with_nvapi, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_dcomp=with_dcomp, with_fsr_rayregeneration=rr_policy)
+    expected_overrides = owned_overrides(with_nvngx, with_nvapi, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_dcomp=with_dcomp, with_fsr_rayregeneration=rr_policy, with_antilag=with_antilag)
     if legacy_core_builtin:
         expected_overrides = expected_overrides.replace("d3d12core=n", "d3d12core=b")
     if data.get("loader", {}).get("winedlloverrides") != expected_overrides:
         problems.append("manifest loader override does not select the owned builtin modules exactly")
     if data.get("gptk_backend", {}).get("selected") is not False:
         problems.append("manifest does not record the GPTK backend as unselected")
-    recorded = data.get("artifacts")
-    if not isinstance(recorded, dict):
-        problems.append("manifest artifact inventory is missing")
-        return problems
     if with_wow64 and arch["native_arch"] != "x86_64" and not with_fex_x86:
         problems.append("WoW64 staging is only established for the x86_64 Wine layout")
     expected = {str(path) for path in (*runtime_artifacts(with_nvngx, with_nvapi, wow64_extra + display_extra + fex_extra, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr_framegeneration, with_fsr_rayregeneration=with_fsr_rayregeneration),
                                        Path("bin/wine"), Path("bin/wine.real"))}
     if not with_core:
         expected.discard(str(WINDOWS_DIR / "d3d12core.dll"))
+    if not with_antilag:
+        expected.discard(str(WINDOWS_DIR / ANTILAG_MODULE))
     if data["schema"] == 2:
         expected.update(("bin/wineserver", str(UNIX_DIR / "ntdll.so"), str(WINDOWS_DIR / "ntdll.dll")))
     if set(recorded) != expected:
@@ -1071,7 +1102,7 @@ def verify_runtime(runtime: Path) -> list[str]:
         problems.append("manifest owned DLL discovery paths do not match staged ABIs")
     # Retained manifests predate the pinned paired path. Verify their original
     # wrapper without changing its bytes or broadening its loader policy.
-    expected_wrapper = render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_wow64=with_wow64 and dll_paths is not None, with_dcomp=with_dcomp, with_fsr_rayregeneration=rr_policy)
+    expected_wrapper = render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_wow64=with_wow64 and dll_paths is not None, with_dcomp=with_dcomp, with_fsr_rayregeneration=rr_policy, with_antilag=with_antilag)
     if legacy_core_builtin:
         expected_wrapper = expected_wrapper.replace("d3d12core=n", "d3d12core=b")
     if wrapper.is_file() and not wrapper.is_symlink() and wrapper.read_text() != expected_wrapper:
@@ -1111,7 +1142,9 @@ def verify_runtime(runtime: Path) -> list[str]:
         if module.name != "d3d12core.dll" and WINE_BUILTIN_MARKER not in module.read_bytes():
             problems.append(f"staged {relative} lacks the Wine builtin marker; winebuild --builtin postprocess did not run")
         try:
-            if module.name in FSR_MODULE_MARKERS:
+            if module.name == ANTILAG_MODULE:
+                validate_antilag_module(module, "x86")
+            elif module.name in FSR_MODULE_MARKERS:
                 validate_fsr_module(module, "x86")
             elif module.name == "nvngx.dll":
                 if OWNED_NGX_D3D12_MARKER not in module.read_bytes() or REQUIRED_NGX_D3D12_EXPORTS - pe_exports(module).keys():
@@ -1124,6 +1157,11 @@ def verify_runtime(runtime: Path) -> list[str]:
         d3d12_32 = runtime / WOW64_WINDOWS_DIR / "d3d12.dll"
         if d3d12_32.is_file() and OWNED_D3D12_MARKER not in d3d12_32.read_bytes():
             problems.append("staged 32-bit d3d12.dll no longer carries the owned backend marker")
+    if with_antilag:
+        try:
+            validate_antilag_module(runtime / WINDOWS_DIR / ANTILAG_MODULE, arch["windows_abi"])
+        except (OSError, ValueError) as error:
+            problems.append(str(error))
     if with_nvngx:
         nvngx = runtime / WINDOWS_DIR / "nvngx.dll"
         if nvngx.is_file() and not nvngx.is_symlink():

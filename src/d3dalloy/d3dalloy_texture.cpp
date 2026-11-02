@@ -355,6 +355,11 @@ Texture::prepareAllocationViews(TextureAllocation *allocation) {
 
 TextureViewKey
 Texture::createView(TextureViewDescriptor const &descriptor) {
+  {
+    std::shared_lock<d3dalloy::shared_mutex> lock(mutex_);
+    if (auto entry = viewIndices_.find(descriptor); entry != viewIndices_.end())
+      return TextureViewKey(descriptor, entry->second, info_.mipmap_level_count);
+  }
   std::unique_lock<d3dalloy::shared_mutex> lock(mutex_);
   if (auto entry = viewIndices_.find(descriptor); entry != viewIndices_.end())
     return TextureViewKey(descriptor, entry->second, info_.mipmap_level_count);

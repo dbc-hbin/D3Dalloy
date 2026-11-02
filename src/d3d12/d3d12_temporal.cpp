@@ -23,6 +23,7 @@ struct Core {
   WMT::Reference<WMT4::TemporalFeature> feature;
   WMT::Reference<WMT::SharedEvent> timeline;
   std::mutex mutex;
+  std::mutex submission_mutex;
   uint64_t sequence = 0, last_executed_generation = 0;
   uint64_t last_queue = 0; // owned id of the queue that encoded `sequence`
 };
@@ -208,6 +209,9 @@ std::array<MTLD3D12Resource *, 12> GetOwnedTemporalFrameResources(const std::sha
           frame->resources[4].ptr(), frame->resources[5].ptr(), frame->resources[6].ptr(),
           frame->resources[7].ptr(), frame->resources[8].ptr(), frame->resources[9].ptr(),
           frame->resources[10].ptr(), frame->resources[11].ptr()};
+}
+std::mutex &OwnedTemporalSubmissionMutex(const std::shared_ptr<OwnedTemporalFrame> &frame) {
+  return frame->core->submission_mutex;
 }
 uint64_t OwnedTemporalFrameHistoryQueue(const std::shared_ptr<OwnedTemporalFrame> &frame) {
   auto &core = *frame->core;

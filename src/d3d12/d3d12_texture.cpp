@@ -1180,7 +1180,7 @@ public:
   virtual HRESULT STDMETHODCALLTYPE
   WriteToSubresource(
       UINT DstSubresource, const D3D12_BOX *pDstBox, const void *pSrcData, UINT SrcRowPitch, UINT SrcSlicePitch
-  ) {
+  ) try {
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
       SrcSlicePitch = 0;
     UINT Level = 0, Slice = 0;
@@ -1211,15 +1211,18 @@ public:
     if (storage != resource_contract::EmulatedTextureStorage::None) {
       const UINT width = box.right - box.left;
       const UINT native_row_bytes = width * (storage == resource_contract::EmulatedTextureStorage::RGB32 ? 16u : 4u);
-      std::vector<uint8_t> native_row(native_row_bytes);
+      const UINT strip_rows = std::min<UINT>(box.bottom - box.top, std::max<UINT>(1, (256 * 1024) / native_row_bytes));
+      std::vector<uint8_t> native_strip(size_t(native_row_bytes) * strip_rows);
       const auto *source = static_cast<const uint8_t *>(pSrcData);
       for (UINT z = box.front; z < box.back; ++z)
-        for (UINT row = box.top; row < box.bottom; ++row) {
-          ConvertEmulatedCpuRow(storage, true, desc_.Format == DXGI_FORMAT_R32G32B32_FLOAT,
-              source + uint64_t(z - box.front) * SrcSlicePitch + uint64_t(row - box.top) * SrcRowPitch,
-              native_row.data(), width);
+        for (UINT row = box.top; row < box.bottom; row += strip_rows) {
+          const UINT count = std::min(strip_rows, box.bottom - row);
+          for (UINT i = 0; i < count; ++i)
+            ConvertEmulatedCpuRow(storage, true, desc_.Format == DXGI_FORMAT_R32G32B32_FLOAT,
+                source + uint64_t(z - box.front) * SrcSlicePitch + uint64_t(row + i - box.top) * SrcRowPitch,
+                native_strip.data() + size_t(i) * native_row_bytes, width);
           texture->current()->texture().replaceRegion(
-              {box.left, row, z}, {width, 1, 1}, Level, Slice, native_row.data(), native_row_bytes, 0);
+              {box.left, row, z}, {width, count, 1}, Level, Slice, native_strip.data(), native_row_bytes, 0);
         }
       return S_OK;
     }
@@ -1228,14 +1231,19 @@ public:
         (box.back - box.front > 1 && SrcSlicePitch % SrcRowPitch)) {
       const UINT block_height = rows == box.bottom - box.top ? 1 : 4;
       auto *source = static_cast<const uint8_t *>(pSrcData);
+      const uint64_t strip_rows = std::min(rows, std::max<uint64_t>(1, (256 * 1024) / row_bytes));
+      std::vector<uint8_t> strip(size_t(strip_rows * row_bytes));
       for (UINT z = box.front; z < box.back; ++z) {
-        for (uint64_t row = 0; row < rows; ++row) {
+        for (uint64_t row = 0; row < rows; row += strip_rows) {
+          const auto count = std::min(strip_rows, rows - row);
           const UINT y = box.top + static_cast<UINT>(row * block_height);
-          const UINT height = std::min<UINT>(block_height, box.bottom - y);
+          const UINT height = std::min<UINT>(UINT(count * block_height), box.bottom - y);
           const uint64_t offset = uint64_t(z - box.front) * SrcSlicePitch + row * SrcRowPitch;
+          for (uint64_t i = 0; i < count; ++i)
+            std::memcpy(strip.data() + size_t(i * row_bytes), source + offset + i * SrcRowPitch, size_t(row_bytes));
           texture->current()->texture().replaceRegion(
               {box.left, y, z}, {box.right - box.left, height, 1}, Level, Slice,
-              source + offset, static_cast<UINT>(row_bytes), 0
+              strip.data(), static_cast<UINT>(row_bytes), 0
           );
         }
       }
@@ -1246,12 +1254,12 @@ public:
         Slice, pSrcData, SrcRowPitch, SrcSlicePitch
     );
     return S_OK;
-  };
+  } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; };
 
   virtual HRESULT STDMETHODCALLTYPE
   ReadFromSubresource(
       void *pDstData, UINT DstRowPitch, UINT DstSlicePitch, UINT SrcSubresource, const D3D12_BOX *pSrcBox
-  ) {
+  ) try {
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
       DstSlicePitch = 0;
     UINT Level = 0, Slice = 0;
@@ -1281,16 +1289,18 @@ public:
     if (storage != resource_contract::EmulatedTextureStorage::None) {
       const UINT width = box.right - box.left;
       const UINT native_row_bytes = width * (storage == resource_contract::EmulatedTextureStorage::RGB32 ? 16u : 4u);
-      std::vector<uint8_t> native_row(native_row_bytes);
+      const UINT strip_rows = std::min<UINT>(box.bottom - box.top, std::max<UINT>(1, (256 * 1024) / native_row_bytes));
+      std::vector<uint8_t> native_strip(size_t(native_row_bytes) * strip_rows);
       auto *destination = static_cast<uint8_t *>(pDstData);
       for (UINT z = box.front; z < box.back; ++z)
-        for (UINT row = box.top; row < box.bottom; ++row) {
+        for (UINT row = box.top; row < box.bottom; row += strip_rows) {
+          const UINT count = std::min(strip_rows, box.bottom - row);
           texture->current()->texture().getBytes(
-              {box.left, row, z}, {width, 1, 1}, Level, Slice, native_row.data(), native_row_bytes, 0);
-          ConvertEmulatedCpuRow(storage, false, desc_.Format == DXGI_FORMAT_R32G32B32_FLOAT,
-              native_row.data(),
-              destination + uint64_t(z - box.front) * DstSlicePitch + uint64_t(row - box.top) * DstRowPitch,
-              width);
+              {box.left, row, z}, {width, count, 1}, Level, Slice, native_strip.data(), native_row_bytes, 0);
+          for (UINT i = 0; i < count; ++i)
+            ConvertEmulatedCpuRow(storage, false, desc_.Format == DXGI_FORMAT_R32G32B32_FLOAT,
+                native_strip.data() + size_t(i) * native_row_bytes,
+                destination + uint64_t(z - box.front) * DstSlicePitch + uint64_t(row + i - box.top) * DstRowPitch, width);
         }
       return S_OK;
     }
@@ -1299,15 +1309,20 @@ public:
         (box.back - box.front > 1 && DstSlicePitch % DstRowPitch)) {
       const UINT block_height = rows == box.bottom - box.top ? 1 : 4;
       auto *destination = static_cast<uint8_t *>(pDstData);
+      const uint64_t strip_rows = std::min(rows, std::max<uint64_t>(1, (256 * 1024) / row_bytes));
+      std::vector<uint8_t> strip(size_t(strip_rows * row_bytes));
       for (UINT z = box.front; z < box.back; ++z) {
-        for (uint64_t row = 0; row < rows; ++row) {
+        for (uint64_t row = 0; row < rows; row += strip_rows) {
+          const auto count = std::min(strip_rows, rows - row);
           const UINT y = box.top + static_cast<UINT>(row * block_height);
-          const UINT height = std::min<UINT>(block_height, box.bottom - y);
+          const UINT height = std::min<UINT>(UINT(count * block_height), box.bottom - y);
           const uint64_t offset = uint64_t(z - box.front) * DstSlicePitch + row * DstRowPitch;
           texture->current()->texture().getBytes(
               {box.left, y, z}, {box.right - box.left, height, 1}, Level, Slice,
-              destination + offset, static_cast<UINT>(row_bytes), 0
+              strip.data(), static_cast<UINT>(row_bytes), 0
           );
+          for (uint64_t i = 0; i < count; ++i)
+            std::memcpy(destination + offset + i * DstRowPitch, strip.data() + size_t(i * row_bytes), size_t(row_bytes));
         }
       }
       return S_OK;
@@ -1317,7 +1332,7 @@ public:
         Slice, pDstData, DstRowPitch, DstSlicePitch
     );
     return S_OK;
-  };
+  } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; };
 
   virtual HRESULT STDMETHODCALLTYPE
   GetHeapProperties(D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS *pFlags) {

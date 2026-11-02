@@ -92,12 +92,28 @@ def analyze(path: Path) -> dict:
                     f"invalid encode/commit/retirement ordering {key}")
             require(complete["status"] == 4, f"Metal submission did not complete successfully {key}")
     require(bool(features), "no temporal execution")
-    require(len(groups) == len(set(groups)), "different command buffers interleaved temporal encoding")
-    for previous, following in zip(groups, groups[1:]):
-        first = next(e for e in by_kind["temporal_encode"]
-                     if (e["queue"], e["submission"]) == following)
-        require(submissions[previous]["event_id"] < first["event_id"],
-                "another temporal command buffer encoded before the previous commit")
+    # Independent feature histories may encode concurrently on different queues.
+    # The reservation contract is per feature: no next command buffer may use
+    # that feature before the previous buffer is committed. Keep the equivalent
+    # per-queue rule too; one queue cannot interleave its own native recordings.
+    def check_commit_chain(encodes: list[dict], domain: str) -> None:
+        previous = None
+        visited = set()
+        for event in encodes:
+            key = (event["queue"], event["submission"])
+            if key == previous:
+                continue
+            require(key not in visited, f"{domain} returned to an earlier temporal command buffer")
+            visited.add(key)
+            if previous is not None:
+                submit = submissions.get(previous)
+                require(submit is not None and submit["event_id"] < event["event_id"],
+                        f"{domain} encoded another temporal command buffer before the previous commit")
+            previous = key
+    for feature, encodes in features.items():
+        check_commit_chain(encodes, f"feature {feature}")
+    for queue in {e["queue"] for e in by_kind["temporal_encode"]}:
+        check_commit_chain([e for e in by_kind["temporal_encode"] if e["queue"] == queue], f"queue {queue}")
     histories = {}
     for feature, history in features.items():
         previous_generation = None

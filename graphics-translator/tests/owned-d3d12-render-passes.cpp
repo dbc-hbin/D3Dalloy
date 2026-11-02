@@ -11,6 +11,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -51,6 +52,14 @@ UINT gCases = 0;
   std::fprintf(stderr, "%s_FAIL step=%s hr=0x%08lx\n", kPrefix, step, static_cast<unsigned long>(hr));
   std::fflush(stdout);
   ExitProcess(1);
+}
+void graphPhaseLine(const char* format,...) {
+  // One bounded write prevents asynchronous native logs from splitting a PE
+  // CRT format string. The strict phase parser and GPU oracle stay unchanged.
+  char line[512];va_list args;va_start(args,format);const int count=std::vsnprintf(line,sizeof(line),format,args);va_end(args);
+  DWORD written=0;
+  if(count<0 || count>=int(sizeof(line)) || !WriteFile(GetStdHandle(STD_ERROR_HANDLE),line,DWORD(count),&written,nullptr) || written!=DWORD(count))
+    fail("graph phase marker write");
 }
 void check(HRESULT hr, const char *step) {
   if (FAILED(hr))
@@ -409,10 +418,10 @@ void submissionAccessScheduling(UINT control) {
   check(d.list->Close(), "Close(graph-C)"); check(read.list->Close(), "Close(graph-read)");
   for (UINT replay = 0; replay < 2; ++replay) {
     c.executeSealed({initialize.list.Get()});
-    std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-access-%u replay=%u\n", kPrefix, control, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE begin=graph-access-%u replay=%u\n", kPrefix, control, replay);
     if (control == 0) c.executeSealed({a.list.Get()});
     else c.executeSealed({a.list.Get(), b.list.Get(), d.list.Get()});
-    std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-access-%u replay=%u\n", kPrefix, control, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE end=graph-access-%u replay=%u\n", kPrefix, control, replay);
     c.executeSealed({read.list.Get()});
     for (UINT y = 0; y < 4; ++y) for (UINT x = 0; x < 4; ++x)
       if (color.at<uint32_t>(x, y) != 0xff000050u) fail("graph-resource-read-pixels");
@@ -494,9 +503,9 @@ void submissionLongFrontier(UINT count) {
     batch.push_back(lists.back().list.Get());
   }
   for (UINT replay = 0; replay < 2; ++replay) {
-    std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-frontier-%u replay=%u\n", kPrefix, count, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE begin=graph-frontier-%u replay=%u\n", kPrefix, count, replay);
     c.executeSealed(batch);
-    std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-frontier-%u replay=%u\n", kPrefix, count, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE end=graph-frontier-%u replay=%u\n", kPrefix, count, replay);
     check(output->Map(0, nullptr, &mapped), "Map(frontier-output)");
     for (UINT i = 0; i < count; ++i)
       if (static_cast<const UINT *>(mapped)[i] != 0x13579bdfu) fail("frontier-disjoint-copy-values");
@@ -540,9 +549,9 @@ void submissionFrontierBoundary(bool delayedClear) {
   transition(read.list.Get(), rt.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
   check(read.list->Close(), "Close(frontier-boundary-read)");
   for (UINT replay = 0; replay < 2; ++replay) {
-    std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-frontier-boundary-%u replay=%u\n", kPrefix, unsigned(delayedClear), replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE begin=graph-frontier-boundary-%u replay=%u\n", kPrefix, unsigned(delayedClear), replay);
     c.executeSealed(batch);
-    std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-frontier-boundary-%u replay=%u\n", kPrefix, unsigned(delayedClear), replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE end=graph-frontier-boundary-%u replay=%u\n", kPrefix, unsigned(delayedClear), replay);
     c.executeSealed({read.list.Get()});
     const UINT expected = delayedClear ? 0xff000020u : 0xff000040u;
     for (UINT y = 0; y < 4; ++y) for (UINT x = 0; x < 4; ++x)
@@ -606,9 +615,9 @@ void submissionDisjointMips() {
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE; read.list->ResourceBarrier(1, &barrier);
   }
   auto mip0 = copyOut(c.dev.Get(), read.list.Get(), texture.Get(), 0), mip1 = copyOut(c.dev.Get(), read.list.Get(), texture.Get(), 1);
-  std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-mips replay=0\n", kPrefix); std::fflush(stderr);
+  graphPhaseLine("%s_GRAPH_PHASE begin=graph-mips replay=0\n", kPrefix);
   c.execute({a.list.Get(), b.list.Get(), d.list.Get()});
-  std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-mips replay=0\n", kPrefix); std::fflush(stderr);
+  graphPhaseLine("%s_GRAPH_PHASE end=graph-mips replay=0\n", kPrefix);
   c.execute({read.list.Get()});
   for (UINT y = 0; y < 4; ++y) for (UINT x = 0; x < 4; ++x)
     if (color.at<uint32_t>(x, y) != 0xff000050u || mip0.at<uint32_t>(x, y) != 16) fail("graph-disjoint-mip0-read");
@@ -717,7 +726,7 @@ void submissionAttachmentUnion(bool unused, bool lifetime = false) {
   for (UINT replay = 0; replay < (lifetime ? 1u : 2u); ++replay) {
     c.executeSealed({initialize.list.Get()});
     const char *phase = lifetime ? "graph-union-lifetime" : unused ? "graph-union-1" : "graph-union-0";
-    std::fprintf(stderr, "%s_GRAPH_PHASE begin=%s replay=%u\n", kPrefix, phase, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE begin=%s replay=%u\n", kPrefix, phase, replay);
     if (lifetime) {
       ComPtr<ID3D12Fence> gate; check(c.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "Create(union-gate)");
       check(c.queue->Wait(gate.Get(), 1), "Wait(union-gate)");
@@ -733,7 +742,7 @@ void submissionAttachmentUnion(bool unused, bool lifetime = false) {
       a.list.Reset(); b.list.Reset(); a.allocator.Reset(); b.allocator.Reset();
       check(gate->Signal(1), "Signal(union-gate)"); c.executeSealed({});
     } else c.executeSealed({a.list.Get(), b.list.Get(), d.list.Get()});
-    std::fprintf(stderr, "%s_GRAPH_PHASE end=%s replay=%u\n", kPrefix, phase, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE end=%s replay=%u\n", kPrefix, phase, replay);
     c.executeSealed({read.list.Get()});
     const uint32_t expected[] = {unused ? 0xff000030u : 0xff004030u, unused ? 0xff005000u : 0xff003040u};
     for (UINT i = 0; i < 2; ++i) for (UINT y = 0; y < 4; ++y) for (UINT x = 0; x < 4; ++x)
@@ -787,9 +796,9 @@ void submissionPendingClears(bool observation) {
   transition(read.list.Get(), ds.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
   check(clear.list->Close(), "Close(pending-no-draw)"); check(read.list->Close(), "Close(pending-read)");
   for (UINT replay = 0; replay < 2; ++replay) {
-    std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-clears-%u replay=%u\n", kPrefix, unsigned(observation), replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE begin=graph-clears-%u replay=%u\n", kPrefix, unsigned(observation), replay);
     c.executeSealed({clear.list.Get()});
-    std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-clears-%u replay=%u\n", kPrefix, unsigned(observation), replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE end=graph-clears-%u replay=%u\n", kPrefix, unsigned(observation), replay);
     c.executeSealed({read.list.Get()});
     for (UINT y = 0; y < 4; ++y) for (UINT x = 0; x < 4; ++x)
       if (color[0].at<uint32_t>(x, y) != 0xff200000u || color[1].at<uint32_t>(x, y) != 0xff004000u ||
@@ -848,9 +857,9 @@ void crossListRenderGrouping(UINT control) {
   check(b.list->Close(), "Close(group-B)");
   check(read.list->Close(), "Close(group-readback)");
   for (UINT replay = 0; replay < 2; ++replay) {
-    std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-boundary-%u replay=%u\n", kPrefix, control, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE begin=graph-boundary-%u replay=%u\n", kPrefix, control, replay);
     c.executeSealed({a.list.Get(), b.list.Get()});
-    std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-boundary-%u replay=%u\n", kPrefix, control, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE end=graph-boundary-%u replay=%u\n", kPrefix, control, replay);
     c.executeSealed({read.list.Get()});
     for (UINT y = 0; y < 4; ++y)
       for (UINT x = 0; x < 4; ++x) {
@@ -907,9 +916,9 @@ void crossListUavDependency(UINT control = 0) {
   read.list->CopyBufferRegion(wordOut.Get(), 0, data.Get(), 0, 4);
   const char *phase = control == 0 ? "graph-uav-dependency" : control == 1 ? "graph-uav-war" :
       control == 2 ? "graph-uav-waw" : control == 3 ? "graph-uav-atomic" : "graph-uav-vertex";
-  std::fprintf(stderr, "%s_GRAPH_PHASE begin=%s replay=0\n", kPrefix, phase); std::fflush(stderr);
+  graphPhaseLine("%s_GRAPH_PHASE begin=%s replay=0\n", kPrefix, phase);
   c.execute({a.list.Get(), b.list.Get()});
-  std::fprintf(stderr, "%s_GRAPH_PHASE end=%s replay=0\n", kPrefix, phase); std::fflush(stderr);
+  graphPhaseLine("%s_GRAPH_PHASE end=%s replay=0\n", kPrefix, phase);
   c.execute({read.list.Get()});
   for (UINT y = 0; y < 4; ++y)
     for (UINT x = 0; x < 4; ++x)
@@ -1825,9 +1834,9 @@ void submissionOverlappingViewClears(UINT order) {
   transition(read.list.Get(), rt.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
   check(work.list->Close(), "Close(alias-clear-work)"); check(read.list->Close(), "Close(alias-clear-read)");
   for (UINT replay = 0; replay < 2; ++replay) {
-    std::fprintf(stderr, "%s_GRAPH_PHASE begin=graph-clear-view-%u replay=%u\n", kPrefix, order, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE begin=graph-clear-view-%u replay=%u\n", kPrefix, order, replay);
     c.executeSealed({work.list.Get()});
-    std::fprintf(stderr, "%s_GRAPH_PHASE end=graph-clear-view-%u replay=%u\n", kPrefix, order, replay); std::fflush(stderr);
+    graphPhaseLine("%s_GRAPH_PHASE end=graph-clear-view-%u replay=%u\n", kPrefix, order, replay);
     c.executeSealed({read.list.Get()});
     const auto untouched = out.at<uint32_t>(3, 0), drawn = out.at<uint32_t>(0, 0);
     std::printf("%s_GRAPH_CLEAR_VIEW order=%u replay=%u untouched=%08x drawn=%08x expected_untouched=ffff0000 expected_drawn=ff00ff00\n", kPrefix, order, replay, untouched, drawn); std::fflush(stdout);

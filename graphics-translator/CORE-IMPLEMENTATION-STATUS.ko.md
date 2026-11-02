@@ -18,9 +18,321 @@
 | ZZZ 실제 precompile 관찰 | cache-04에서 리소스 검사 흐름이 실제 종료(최종 dialog)하고 이후 최종 candidate 도시가 렌더링, 원본64쌍은 owned·pristine GPTK4.0b2에서 계속 거부 | [실행 identity·QA·한계](../build/local/zzz-dlss-fix-20261009/precompile-run-03/result.json)·[진단·경계](ZZZ-COMPATIBILITY.ko.md#2026-10-09-실제-precompile-경로-진단과-자동-pso-캐시-재스캔). Controlled FPS·frame-time·장시간 stutter·duration은 미측정 |
 | 표시 / RR / HDR | Composition geometry/cadence·일반 HDR·선정 FG proof. RR non-fused 경로의 양 ABI native parity·clean validation 통과 | Composition absolute colour parity, HDR10+ GAMING, RR 다른 OS/GPU·실게임 검증은 미완료 |
 | FSR Ray Regeneration | x64 `amd_fidelityfx_denoiser_dx12.dll`이 AMD RR 1.0/1.1/1.2 ABI를 owned D3D12 private recording과 native MetalFX RR provider로 번역한다. Radiance 4 signal은 MetalFX neural denoiser, AO·dominant light·specular occlusion은 analytic correction이다 | [x64 public GPU run](#fsr-ray-regeneration--2026-10-30) API+Shader Validation PASS. WoW64·실게임·AMD 모델/화질 동등성은 미검증 |
-| 리뷰 후속 구현 | R1 CPU pointer, R2/R3 fence 구독/완료, R4 cache 잠금 분리, R5 빈 Wait 제출 제거, R6 application cache index | [실제 후속 검증·R7 계측](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#follow-up-implementation-and-evidence); native PSO cache·게임 성능은 미입증 |
+| 리뷰 후속 구현 | R1 CPU pointer, R2/R3 fence 구독/완료, R4 cache 잠금 분리, R5 빈 Wait 제출 제거, R6 application cache index | [기존 리뷰 증거](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#follow-up-implementation-and-evidence)와 [후속 native PSO/DXR cache proof](#pso-지연과-dxr-실행-객체--2026-11-02)를 구분한다. 실게임 성능은 미측정 |
 
 현재 판정에 필요한 runtime033–044의 실패/성공 근거는 [검증 이력](IMPLEMENTATION-HISTORY.ko.md)에 남긴다. 과거 paused/resumed 실행 지시와 중복 인수인계는 삭제했다. 최신 상태를 과거 실패로 되돌리거나 보존된 PASS를 현재 변경의 재검증으로 바꾸지 않는다. Agility SDK617/618의 owned Core/Main identity·inbox/SxS 정책은 유지하며 다른 package나 실제 게임의 전체 호환성을 주장하지 않는다.
+
+## DXMT 검토 후 compiler 최적화 — 2026-11-03
+
+DXMT `647b0020ba5764e5593b12407afd76964fa11e20`까지의 변경을 검토하고, D3D12 계약에 맞춰 정확성 → 조건부 GPU 비용 → 내부 FP16 → CPU 변환 순서로 반영했다. 업스트림 전체 병합이나 D3D11 범위 확장이 아니다.
+
+| 경로 | 현재 구현과 제한 |
+| --- | --- |
+| Bitfield / 정수 tuple | DXIL width·offset·value를 AIR 인자 순서로 재배치하고 5-bit mask·남은 폭 clamp를 적용한다. IMul/UMul은 high,low 순서, UAddc/USubb은 i32,i1 반환을 사용한다. 기존 32-bit add/sub+compare는 유지한다. |
+| Tessellation 동기화 | 독립 PCF에서만 CP→PCF barrier를 생략한다. Output CP 읽기·분석하지 않은 helper 호출은 barrier를 유지하고, PCF 종료 join과 inactive CP guard도 보존한다. Payload 복사 뒤 중복 barrier와 D3D12 object 종료 barrier를 제거한다. |
+| 미사용 distance 출력 | D3D12의 일반 native user varying은 유한한 0을 내보내 register load·비유한값 보정 계산을 없앤다. Clipping·SO는 원래 register를 읽으며, PS가 distance를 소비하는 capture/replay는 원래 값을 보존한다. DXIL capture flag를 명시적으로 전달한다. D3D11 normalization은 유지한다. |
+| FP16 내부 전달 | 한 object 함수 안의 DXIL VS→HS에서 양쪽 native F16 signature가 정확히 일치할 때만 half bit를 정수 register로 전달한다. Mixed DXBC/DXIL·minprecision·position·raster interpolation은 기존 표현을 유지한다. |
+| CPU 변환 | GS/HS/DS의 opcode별 전체 순회를 한 번으로 묶고, signature ID를 stable sort한 뒤 binary search한다. 중복 ID·다중 row의 첫 매칭 의미를 보존한다. 출력 load·형변환은 직접 IRBuilder로 수행해 중첩 ReaderIO/coroutine을 제거하되 최상위 지연 실행 계약은 유지한다. |
+
+`AIRCONV_VERSION=49`로 이전 shader cache를 무효화한다. Native 산술 회귀의 98,896개 결과와 FP16 24개 draw·288개 값은 GPU readback으로 검증한다. 대표 VS→HS AIR의 `fpext` 4개·`fptrunc` 20개가 0개로 줄었고 CPU 리팩터링 전후 AIR는 동일했다. [재실행 방법](SMOKE-TEST.ko.md#dxil-산술내부-fp16-전달-회귀)과 [원본 증거·실패 이력](IMPLEMENTATION-HISTORY.ko.md#dxmt-검토-후-compiler-최적화--2026-11-03)을 따른다. CPU compile 시간·실게임 FPS 개선율, 다른 GPU/OS와 x86 guest는 이번 검증 범위가 아니다.
+
+[최종 acceptance](../build/local/upstream-compiler-20261102/acceptance.json)의 단일 runtime에서 x64 `stream-output`, `conservative-raster`, `geometry`, `tessellation`, `sm6`, `mesh-shader` 6개 suite가 모두 API+Shader Validation으로 통과했다. 모든 실행의 validation/foreign-backend 오류는0이다. 기존 diagnostics128개와 별도 native 산술 검증도 통과했다.
+
+## 독립 최적화 3종 — 2026-11-02
+
+남은 후보 중 첫 추천 묶음인 async PSO worker, custom MSAA 상태 replay, atomic64 texture import를 구현했다. [설계·소유권 계약](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-독립-최적화-3종)을 따른다.
+
+| 경로 | 현재 구현 | 보존한 의미 |
+| --- | --- | --- |
+| Async PSO | Worker는 `TryRun()`으로 다른 consumer가 선점한 job을 건너뛰고 다음 queued job을 처리한다 | Exactly-once 실행·release/acquire publication·consumer `Wait()`와 owner `Cancel()`의 완료 대기 |
+| Custom MSAA | Draw 안에서 query 참여·gather depth bias에 따른 최대4개 상태 chain을 lazy 생성하고 tile/pass에서 재사용한다 | 원본 recording, visibility reset·memory barrier 순서, line/conservative raster 변환, tile별 dynamic binding |
+| Atomic64 import | 첫 유효 texture copy에서만 blit encoder를 열고 모든 transfer 뒤 fence update·end를 한 번 수행한다 | Copy region·offset·순서, 독립 staging 소유권, import kernel 이전 completion 경계; export 경로 유지 |
+
+[ARM64/ARM64EC paired build](../build/local/independent-opt-arm64x-20261102-02/result.json)와 [native/WoW64 package](../build/local/independent-opt-package-20261102/package-result.json)가 통과했다. 같은 runtime의 **x64 GPU6회**(`async-pipeline`, `async-pipeline-hold`, `multisample-capabilities`, `msaa-lines`, `atomic64-typed`, `atomic64-phase`)가 모두 **API+Shader Validation**으로 통과했고 validation/foreign-backend 오류는0이다. [최종 acceptance](../build/local/independent-opt-evidence-20261102/acceptance.json)에616-file source cut와 manifest identity를 고정한다.
+
+[CPU queue 대조](../build/local/independent-opt-evidence-20261102/async-queue-before-after.json)는 consumer가 첫 job을 붙잡은 동안 단일 worker가 둘째 job을 완료하는지 검사한다. 수정 전에는 실패하고 수정 후에는 각각 한 번 실행하며 통과했다. [기존 ASan/UBSan CPU 검증](../build/local/independent-opt-evidence-20261102/static-optimization-cpu.log)도9개 출력 모두 통과했다.
+
+초기 build는 시스템 Rust dylib 불일치로 실패했으며 README의 Rust1.85.1을 명시한 fresh build가 통과했다. 첫 typed 실행은 기본 DXIL 경로의 입력 부재로 GPU 실행 전에 거부됐다. 기존 producer의 소스·compiler·45개 DXIL hash를 확인하고 [regular input을 고정](../build/local/independent-opt-evidence-20261102/atomic64-input-provenance.json)한 새 output에서 통과했다. 원래 실패 로그를 보존하고 oracle·validation 정책은 변경하지 않았다.
+
+이는 반복 상태 분류·bridge 호출과 불필요한 worker/encoder 대기를 줄인 구현이다. MSAA variant 구축의 최초 allocation은 남으며 실게임 FPS·frame-time 개선율, 다른 GPU/OS·x86 guest 실행은 이번 결과로 주장하지 않는다.
+
+## PSO 지연과 DXR 실행 객체 — 2026-11-02
+
+사용자가 선택한 **Metal4 native pipeline archive(B04)**와 **DXR immutable executable bundle(B05)**을 구현했다. [review의 소유권·fallback·제어 계약](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-pso-지연과-dxr-실행-객체-재설계)을 따른다. Native archive는 실제 생성된 compute·linked compute·render·mesh PSO를 수집하며, RT는 retained library/function·linked PSO·function handles만 device별 weak single-flight로 공유한다. Shader identifier·state token·local roots·relocated constants·mutable VFT/IFT·dispatch bindings는 state/실행별로 남긴다. 강제 사전 컴파일·품질 옵션·shader 계산·GPU RT traversal은 변경하지 않았다.
+
+[ARM64X paired build](../build/local/pso-dxr-arm64x-20261102/result.json), [native/WoW64 package](../build/local/pso-dxr-package-20261102/package-result.json), [paired audit](../build/local/pso-dxr-evidence-20261102/arm64x-audit.log)가 통과했다. [Production source cut616개](../build/local/pso-dxr-package-20261102/source-cut.json)는 최종 소스와 일치한다. Runtime manifest는 `ca9e34be7cd7c3b407390421b3b6bcef0213ef4c723b4d486512baf86f6d9e91`이다. 아래 public 실행은 Apple M5 Pro/native ARM64·ARM64X/x64 guest의 synthetic proof다.
+
+| 검증 | 결과와 정확한 범위 | 증거 |
+| --- | --- | --- |
+| Native cold→새 warm process | Compute·specialized·linked·render·mesh5종의 GPU exact 출력. Cold native compile은 compute3/render2, warm은 **compute0/render0**. Warm compiler를 실패하도록 막아 archive factory 적중을 직접 증명했다. API Validation ON, Shader Validation OFF | [source/binary hash와7case](../build/local/pso-dxr-evidence-20261102/native-acceptance/result.json), [cold](../build/local/pso-dxr-evidence-20261102/native-acceptance/cold.log), [warm](../build/local/pso-dxr-evidence-20261102/native-acceptance/warm.log) |
+| Native optional-cache 계약 | Disable·enable·clear, writer 정지 중 새 compile, clear 뒤 late publication 방지, capture compile 실패의 ordinary retry, 손상 archive·invalid directory fallback 통과. 외부 파일 보존 | [control](../build/local/pso-dxr-evidence-20261102/native-acceptance/controls.log), [corrupt](../build/local/pso-dxr-evidence-20261102/native-acceptance/corrupt-fallback.log), [invalid directory](../build/local/pso-dxr-evidence-20261102/native-acceptance/invalid-directory.log) |
+| Shader Validation 제한과 안전 실행 | API+Shader Validation ON에서 현재 instrumented archive가 호환성 오류로 거부됨. Production은 이를 게시하지 않고 해당 compiler의 추가 capture를 중단한다. Validation을 끄지 않은 ordinary compile과 GPU 출력은 정확 | [validated fallback](../build/local/pso-dxr-evidence-20261102/native-acceptance/shader-validation-fallback.log) |
+| 실제 D3D12 archive 소비 | Public pipeline-cache fixture에서 **native archive hit168회**, compile139회, publish3회·control5회 관찰, 전체 numeric/API oracle PASS. API Validation만 켠 별도 실행이며 validated 회귀와 합산해 같은 모드라고 하지 않는다 | [public API archive result](../build/local/pso-dxr-evidence-20261102/gpu-pipeline-cache-api-archive-02/result.json), [원본 native trace](../build/local/pso-dxr-evidence-20261102/gpu-pipeline-cache-api-archive-02/stderr.log) |
+| DXR 동시 생성·warm·key 분리 | 동일 state4개 동시 생성에 native linked PSO1개, warm 추가0개, 다른 local-root 구성2개에 link1개, live-cache clear 뒤 link1개. Triangle/any-hit/procedural/miss·constant/CBV local roots10dispatch exact. 기존 state와 submit 전 caller 해제 수명 유지 | [focused public](../build/local/pso-dxr-evidence-20261102/gpu-rt-executable-02/result.json), [scoped native link proof](../build/local/pso-dxr-evidence-20261102/rt-native-link-proof-final.json) |
+| Public GPU 회귀 | 최종 선택 **15회 PASS: API+Shader Validation14회, API-only archive1회**. Full DXR·DXR atomic64·PSO/cache/library/async·mesh/GS/tess·render·temporal/FG/RR. Validation/foreign-backend 오류0 | [단일 runtime acceptance](../build/local/pso-dxr-evidence-20261102/acceptance.json) |
+| CPU/검사기 | 실제 cache weak-flight의 live identity·membership clear/owner lifetime·expired recreation·partial failure retry와 기존 CPU4종 통과. Diagnostics128개 통과 | [CPU matrix](../build/local/pso-dxr-evidence-20261102/cpu-regression-result.json), [native-flight CPU](../build/local/pso-dxr-evidence-20261102/run-pipeline-cache-cpu-final.log), [diagnostics](../build/local/pso-dxr-evidence-20261102/diagnostics-final.log) |
+
+Public 선택 실행은 `rt-executable-cache`, `raytracing`, `raytracing-atomic64`, `pipeline-cache`(API+Shader와API-only 두 모드), `pipeline-library`, `async-pipeline`, `shader-cache`, `render-passes`, `geometry`, `tessellation`, `mesh-shader`, `temporal`, `fsr-fg`, `fsr-rr`다. 15회가 서로 다른15suite이거나 전부 Shader Validation을 켠 결과라는 뜻은 아니다.
+
+**Native 호환성 원인 분리:** 현재 macOS27.2/build26B123/M5 Pro에서 public serializer가 만든 instrumented archive를 같은 device가 `deployment target ... not compatible with current OS`로 거부했다. D3Dalloy를 include하지 않은 [독립 public Metal control](../build/local/pso-dxr-evidence-20261102/archive-public-control.mm)의 [validated](../build/local/pso-dxr-evidence-20261102/archive-public-control-validated.log)·[API-only](../build/local/pso-dxr-evidence-20261102/archive-public-control-unvalidated.log)을 대조했다. Production은 validation 정책/바이너리 header를 수정하지 않고 compatibility probe 실패를 안전한 miss로 처리한다. 다른 OS에서 validated archive가 성공하면 native test는 실제 hit도 검사한다. 과거 문서의 pristine GPTK reference는 [현재 부재](../build/local/pso-dxr-evidence-20261102/reference-availability.json)라 이번 binary 분석 결과로 인용하지 않는다.
+
+**검증 중 실패 보존:** 첫 render-pass는 전체42개 GPU case와 exit0이었지만 PE `fprintf`가 나뉘어 native async cache log가 phase marker 중간에 들어갔다([원래 실패](../build/local/pso-dxr-evidence-20261102/gpu-render-passes/result.json)). Fixture phase marker만 bounded single `WriteFile`로 바꾸고 exact phase parser와 픽셀 oracle를 유지한 [새 실행](../build/local/pso-dxr-evidence-20261102/gpu-render-passes-02/result.json)이 PASS했다. 새 RT fixture도 같은 단일 write를 사용한다. Public runner는 archive를 각 `--out/native-pipeline-archives`에 격리하고 opt-in `--native-archive-trace` 및 validation mode를 invocation에 기록한다.
+
+**동작·남은 경계:** Archive miss·첫 cold 생성은 여전히 compile이 필요하다. Writer serialization 중 compile은 ordinary compiler로 진행하고 explicit device destruction에서만 archive flush를 기다린다. Namespace는 module UUID/device/OS/prefix/validation 별이며 directory16shard·256MiB, shard64MiB를 제한한다. 파일 budget은 native GPU memory 측정값이 아니다. Relocated data·mutable binding을 cache에 넣지 않았고 memory-cache weak owner는 마지막 state/recording owner가 끝나면 해제된다. 실게임 FPS·wall-time·최초 stutter 개선율, export별 LLVM clone/DCE 재설계, 모든 GPU/OS·x86 FX 호환성은 이번 결과로 주장하지 않는다. 기존 dirty/저지연·외부 Wine/FEX source·live game prefix는 보존했고 commit/push하지 않았다.
+
+최종 [요약/source identity](../build/local/pso-dxr-evidence-20261102/final-summary.json), [전체 문서 검사](../build/local/pso-dxr-evidence-20261102/documentation-final.log), [cleanup receipt](../build/local/pso-dxr-evidence-20261102/cleanup.json)를 보존한다. 전용 prefix18개는 해당 Wine 서버 종료를 확인한 뒤 제거했고 최종 paired/native build·install·runtime, 이전5차 비교 runtime 및 native archive 원본·실패/성공 로그·readback·manifest는 남겼다.
+
+## 독립 개선과 제출 기반 재설계 — 2026-11-02
+
+사용자가 선택한 첫 번째 독립 개선과 두 번째 공통 D3D12 기반 재설계를 구현·검증했다. [review 원장](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-독립-개선과-제출-기반-재설계)에 semantic key·소유권·Close/Execute 경계와 fallback을 명시했다. 중단 전 stage5 구현을 보존해 이어갔고, sampler/DS·퇴역 slab/ICB/vector·selective clear/query·view/strip/I/O와 physical access·Close shape·interval frontier·sparse admission·pinned VA/residency publication을 연결했다. 기록의 고정 형태만 재사용하며 descriptor 값은 매 Execute에서 현재 값을 읽는다.
+
+최종 [ARM64X paired build03](../build/local/static-opt5-arm64x-20261102-03/result.json)·[native/WoW64 package02](../build/local/static-opt5-package-20261102-02/package-result.json)와 paired audit가 통과했다. [Production source cut615개](../build/local/static-opt5-package-20261102-02/source-cut.json)는 현재 소스와 전부 일치한다. Runtime manifest SHA-256은 `afdf1ce8f881d81a7ed917117cde355ab17876159a491de387739dce2888d6a2`다. Apple M5 Pro/native ARM64·ARM64X/x64 guest의 synthetic 결과이며 실게임 FPS·다른 OS/GPU·x86 guest FX를 입증하지 않는다.
+
+| 구현·검증 | 확인한 결과 | 증거 |
+| --- | --- | --- |
+| Physical access·interval frontier | 실제 header의 byte/texture/heap30720개 연산을 기존 full scan과 비교. 같은 node의 stage·partial WAR·모든 inflight producer 보존.4096개 disjoint range에서1개 방문. Public256/512노드의 native/픽셀 계약 유지하며 history 비교8064/16128→0, opaque fallback0 | [CPU](../build/local/static-opt5-evidence-20261102/run-submission-foundation-cpu-continuation-final.log), [native work](../build/local/static-opt5-evidence-20261102/foundation-native-proof.json), [render-pass](../build/local/static-opt5-evidence-20261102/final-gpu-render-passes/result.json) |
+| Pinned VA·native state |4-reader/20000-publication에서 unregister 수명·주소 generation·latest-start bounds·overflow 유지.12동시 sampler 요청의 native normal/cube pair2개, caller bias/disabled stencil/device 격리·bounded eviction·실패 retry·ICB padding 무시 통과 | [ASan/UBSan](../build/local/static-opt5-evidence-20261102/run-submission-foundation-cpu-continuation-final.log) |
+| Close plan·실행값 | Close1회 후 descriptor 슬롯과 source 값을4회 바꾼 public replay가 매번 새 값을 출력. unrelated live sparse가 있어도 해당 ordinary list의 publication만 생략 | [집중 GPU6계약](../build/local/static-opt5-evidence-20261102/gpu-foundation-03/result.json) |
+| 퇴역 ICB·query·residency | 실제 root-update ICB를 allocator reset3epoch에서2회 재사용. Query3개 target은 독립2개와 반복1개를2encoders로 처리하며 outer32/inner16 정확. Allocation7개를1commit으로 게시한 trace 확인 | [native proof](../build/local/static-opt5-evidence-20261102/foundation-native-proof.json) |
+| Heap/sparse·CPU strips | Placed texture alias2개의 full-pixel clear 순서 보존. Reserved buffer2회 remap 후 alias read 정확. RGBA8/RGB32F의256KiB 경계·unaligned pointer/pitch·전체값/row-padding/guards 정확 | [집중 출력](../build/local/static-opt5-evidence-20261102/gpu-foundation-03/stdout.log) |
+| CPU·검사기 | Foundation·recording·depth-stencil·bindless·pipeline-cache·기존 static optimization sanitizer6종 PASS. Diagnostics127개 PASS | [CPU matrix](../build/local/static-opt5-evidence-20261102/continuation-cpu-result.json), [diagnostics](../build/local/static-opt5-evidence-20261102/continuation-diagnostics-final.log) |
+| Public regression | Broad23개 중22개 PASS와 새 foundation1개 PASS, **총23개 clean PASS**. Tiled full1개는 baseline에서도 재현되는 compile-service 실패로 별도. 통과 실행의 API+Shader Validation·foreign-backend 오류0 | [acceptance](../build/local/static-opt5-evidence-20261102/acceptance.json), [broad matrix](../build/local/static-opt5-evidence-20261102/final-gpu-matrix.json) |
+
+통과 suite는 `submission-foundation`, `render-passes`, `queries`, `pipeline-statistics`, `predication-indirect`, `resources`, `copy-resolve`, `enhanced-barriers`, `execution-safety`, `bindless`, `depth-plane-copy`, `expanded-formats`, `residency`, `standard-swizzle`, `multiqueue`, `temporal`, `pipeline-cache`, `shader-cache`, `stream-output`, `raytracing`, `fsr`, `fsr-fg`, `fsr-rr`다. Query 전체나 모든 sparse/alias 표현을 완전 재설계했다는 선언이 아니다.
+
+**실패·수정 이력:** 초기 render-pass는 픽셀과 native 동작이 맞았지만 검사기가 구형64-node vector scan의 비교 횟수를 요구했다. 현재 interval proof의 정확한0회와 opaque fallback0을 요구하도록 고쳤으며 hazard/merge/partition 픽셀 oracle는 그대로다. 초기 foundation은 dispatch-only shortcut을 사용해 값은 맞아도 ICB 재사용 증거가 없어 실패했다. Root-UAV update signature로 실제 ICB를 사용해 새 run을 통과시켰으며 checker 요구를 제거하지 않았다. ICB cache key도 struct padding/output ID가 아닌 semantic 필드로 보강했다. Heap clear는 physical alias를 알아도 한 native attachment batch에 넣지 않는다.
+
+**Tiled full은 미해결 실패:** 같은 PE·shader 입력 hash로 [이전4차 runtime](../build/local/static-opt5-evidence-20261102/baseline-gpu-tiled/result.json)과 [최종 candidate](../build/local/static-opt5-evidence-20261102/final-gpu-tiled/result.json) 모두 volume DXIL/DXBC sampling·LOD 검사 뒤 compute PSO 생성에서 `XPC_ERROR_CONNECTION_INTERRUPTED`로 실패했다. [대조 JSON](../build/local/static-opt5-evidence-20261102/tiled-baseline-comparison.json)에 같은 입력과 오류를 보존했다. 이는 root cause를 플랫폼으로 확정한 증거가 아니며 clean PASS로 세지 않는다. Shader validation을 끄거나 numeric oracle를 완화하지 않았다. 실제 sparse remap/alias 보존은 집중 suite와 full suite의 실패 전 관찰 범위로 구분한다.
+
+**적용 경계:** Placed buffer는 정확한 heap interval이며 placed texture는 whole-heap conservative access다. Sparse/shared/cast/swizzle·불명확 indirect는 보수 fallback을 유지한다. Close plan은 descriptor 선언/command 형태까지만 고정하고 volatile 값과 GPU indirect data는 실행마다 해석한다. Persistent descriptor-version resolved cache, 완전한 sparse mapping hazard 모델, native pipeline archive, RR working set·strip/scan·MSAA·GPU frontier는 다른 후속 범위다. 실게임 FPS/프레임시간 개선은 이번에 측정하지 않았다. 기존 저지연 변경·외부 Wine/FEX source·live game prefix는 보존했다.
+
+최종 [요약/source identity](../build/local/static-opt5-evidence-20261102/final-summary.json), [전체 문서 검사](../build/local/static-opt5-evidence-20261102/continuation-documentation.log), [정리 기록](../build/local/static-opt5-evidence-20261102/continuation-cleanup.json)을 보존했다. 전용 prefix50개는 해당 서버 종료 뒤 제거했고 중단 전/중간 build·package payload11개만 정리했다. 최종 paired03/native02 build·install·runtime, 이전4차 비교 runtime과 모든 결과·로그·manifest·readback은 유지한다. 커밋·푸시는 하지 않았다.
+
+## 정적 최적화 4차 — 2026-11-02
+
+미완료였던 FG 준비, temporal feature 동시성, exact integer wide-wave, terminal Work Graph batching 및 atomic64 topology를 구현했다. 상세 적용 조건은 [review4차](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-정적-최적화-4차), 현재 적용 밖 경로는 [PRIORITIES](IMPLEMENTATION-PRIORITIES.ko.md#2026-11-02-정적-감사-후속)에 둔다. Generic identity color/output bypass는 실제 반례가 있어 제외했으며 미완료 TODO로 계속 제시하지 않는다.
+
+최종 [ARM64X paired build03](../build/local/static-opt4-arm64x-20261102-03/result.json)·[native/WoW64 package03](../build/local/static-opt4-package-20261102-03/package-result.json)와 paired audit가 통과했다. [Production source cut612개](../build/local/static-opt4-package-20261102-03/source-cut.json)는 최종 현재 소스와 일치한다. Runtime manifest는 `139cfe006dc697ccb7c9d3401057c2fc805fbe6048c65b8d38b855580c79d10c`이다. 아래 public 결과는 Apple M5 Pro/native ARM64·ARM64X/x64 guest synthetic proof이며 다른 OS/GPU·x86 FX·실게임 FPS 측정은 아니다.
+
+| 영역 | 확인한 결과 | 증거 |
+| --- | --- | --- |
+| FG Prepare 최적화 | 성공한 Generate가 계약을 확정한 경우 최종 guide를 Prepare에서 생성. Raw-first 대비24개4-frame 조건의 전체 출력 bit-exact. Source crop·FP32 motion·camera·invalid vector·reset·jitter fallback·실패 Generate·Prepare 뒤 poison·destroy-before-Generate 포함. 검사 집합에서 snapshot copies48→28 | [native full FG](../build/local/static-opt4-evidence-20261102/fg-candidate.log) |
+| 이전 native 출력·SR | 이전 FG provider36개 출력 동일. 기존 normalization CPU 수식 oracle, SR default full offset·padding·cache·Dormant와 fused prepass 통과 | [FG parity](../build/local/static-opt4-evidence-20261102/fg-provider-parity.json), [kernel](../build/local/static-opt4-evidence-20261102/fg-kernels.log), [SR full](../build/local/static-opt4-evidence-20261102/metalfx-native.log) |
+| Feature별 제출 | Device 전역 잠금을 제거하고 feature별 commit 예약. CPU reverse-order AB/BA·같은 feature8000회 게시·예외 해제 통과. Public trace에서 독립 feature/queue16개 overlap pair를 실제 관찰하고 같은 feature commit·GPU 완료·history 순서 검사 통과 | [CPU](../build/local/static-opt4-evidence-20261102/run-static-optimization-cpu-final.log), [실제 overlap](../build/local/static-opt4-evidence-20261102/temporal-feature-overlap.json), [public temporal](../build/local/static-opt4-evidence-20261102/final-temporal/result.json) |
+| Wide wave | 새64/128×173/17thread의 i64/i16 sum/prefix/minmax/product·bitwise·vote와 기존 wide scalar/ballot·admission 검사 통과. 계층 partial2/4개를 사용하고 ordered float 경로는 유지 | [집중 wide-waves](../build/local/static-opt4-evidence-20261102/final-wide-waves/result.json), [DXC producer/hash](../build/local/static-opt4-evidence-20261102/wide-wave-fixture-build-03.json) |
+| Work Graph | Terminal ordinary66049그룹을65535+514 두 batch, atomic65그룹을32+32+1 세 batch로 처리. CPU/GPU record 각각 전체 좌표·tag·counter·atomic old permutation·guard 정확. 기존 그래프·재귀·raw/typed atomic consumer도 통과 | [batch proof](../build/local/static-opt4-evidence-20261102/final-workgraph-batches/result.json), [frozen DXIL](../build/local/static-opt4-evidence-20261102/workgraph-batches-fixture-build.json) |
+| Atomic64 topology·정확성 | 131072개 연속 cell→ordered map node1개,200000개 owner/layout/alias의 exact ID. 실제 phase/raw/typed6shape×2sign·Work Graph typed 출력 통과 | [CPU](../build/local/static-opt4-evidence-20261102/run-static-optimization-cpu-final.log), [phase](../build/local/static-opt4-evidence-20261102/final-atomic64-phase/result.json), [typed](../build/local/static-opt4-evidence-20261102/final-atomic64-typed/result.json) |
+| 공개 회귀 | `atomic64-phase`, `workgraphs-atomic64-typed`, `workgraph-batches`, `atomic64-typed`, `wide-waves`, `work-graphs`, `workgraphs-atomic64`, `temporal`, `multiqueue`, `execution-safety`, `fsr-fg`, `fsr-rr`, `fsr`, `sr-alpha`, `raytracing` **15/15 PASS**, validation/foreign-backend 오류0 | [최종 matrix](../build/local/static-opt4-evidence-20261102/final-gpu-matrix.json), [acceptance](../build/local/static-opt4-evidence-20261102/acceptance.json) |
+| CPU/검사기 | ASan/UBSan regression 통과. Diagnostics126개 통과: same-feature 미commit·누락/중복wavecase·잘못된batch/guard는 계속 거부 | [최종 CPU matrix](../build/local/static-opt4-evidence-20261102/cpu-regression-final.json), [diagnostics](../build/local/static-opt4-evidence-20261102/diagnostics-final-03.log) |
+
+**발견한 기존 오류도 수정:** Typed WG는 변경 전 runtime에서도 실패했다. Atomic64 metadata가 ordinary view ID를 사용하지만 실제 shader는 descriptor-pool slot ID를 읽었던 문제였다. 현재 heap slot identity를 수집하고 동일 물리 view의 모든 descriptor alias에 같은 canonical map을 게시한다. 별도로 bounded ordinary load가 atomic phase rewriting 후 materialize되어 shadow 대신 stale backing을 읽는 오류를 phase 전 materialize로 수정했다. [변경 전 실패→수정 후 PASS 대조](../build/local/static-opt4-evidence-20261102/atomic64-correctness-proof.json)를 보존했으며 numeric oracle를 바꾸지 않았다.
+
+**검사 경계:** 초기 full `sm6` 입력은 기존 optional FP64 blob 일부가 없었다. 새 `wide-waves`는 원래 fixture의 집중 실행을 명시적으로 등록한 것으로 전체 SM6 PASS가 아니다. 새 i64/i16 DXIL은 pinned DXC x64로 생성했다. 초기 ARM64 DXC는 기존 Wine 경로에서 fault를 보였으나 외부 Wine/FEX를 수정하지 않았다. Atomic64에 누락됐던 입력은 같은 compiler와 기존 HLSL로 [regular frozen 입력](../build/local/static-opt4-evidence-20261102/completed-input-build.json)에 생성했다. 첫 temporal checker는 독립 feature까지 전역 직렬화를 강제했으므로 feature별·queue별 causal chain으로 고쳤으며 same-feature reorder 음성 검사를 추가했다. 초기 실패/중간 runtime 기록은 그대로 남긴다.
+
+**동등성 반증:** 모든 half bitpattern×4channel의 nominal identity FG 검사에서 decode는8180개 NaN 성분, encode는8180개 NaN과RGB signed-zero3개를 바꿨다. [실제 출력 counterexample](../build/local/static-opt4-evidence-20261102/identity-bypass-counterexample.json) 때문에 무조건 direct color/output 생략은 적용하지 않았다. Jitter/reset-dependent 또는 이미 실행된 Prepare의 raw 경로, floating reduction의 기존 순서, nonterminal 그래프의 기존 queue-drain, phase 간 새 allocation/alias 검사도 필수 fallback/별도 계약이다. 이를 게임 화질·FPS 수치로 바꾸지 않는다.
+
+[최종 요약](../build/local/static-opt4-evidence-20261102/final-summary.json)·[전체 문서 검사](../build/local/static-opt4-evidence-20261102/documentation-final.log)·[cleanup receipt](../build/local/static-opt4-evidence-20261102/cleanup.json)를 보존했다. 전용 prefix38개는 해당 Wine 서버 종료를 확인한 뒤 정리했고 중간 두 build/package의 payload20개를 제거했다. 최종build/install/runtime03·비교 runtime·모든 manifest/log/readback/provenance는 남겼다. 기존 dirty 작업, 다른 worker·live game prefix 및 외부 Wine/FEX 소스는 변경하지 않았다. 커밋·푸시는 하지 않았다.
+
+## 정적 최적화 3차 — 2026-11-02
+
+남은 key/payload·SR constants·RR/FG 동등 작업과 초기화 비용을 처리했다. 상세 구현·정확한 적용 조건은 [3차 review](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-정적-최적화-3차와-실패-경계-해소)에 있다. **기존 SR full `offset-region-value`와 전체 문서 링크 검사의 실패 경계도 해소**했다. 예전 실패 로그는 보존했고 결과나 픽셀 허용치를 바꾸지 않았다.
+
+[ARM64X build](../build/local/static-opt3-arm64x-20261102/result.json)·[native/WoW64 package](../build/local/static-opt3-package-20261102/package-result.json) 및 paired consumer audit가 통과했다. [Production source cut611개](../build/local/static-opt3-package-20261102/source-cut.json)는 최종 소스와 모두 일치한다. Runtime manifest SHA-256은 `f9d4f5211467fd2c688f4d9b5b067a70b4993b543f4b324c13b47407ba346577`이다. 아래 public GPU는 Apple M5 Pro/native ARM64/ARM64X/x64 guest의 synthetic proof다.
+
+| 구현·검증 | 실제 결과 | 증거 |
+| --- | --- | --- |
+| Canonical key·serialized payload | 1MiB key50회 hot lookup에서 대형 임시 allocation0. 기존 canonical bytes/SHA-1, segmentation 무관 equality와 collision 방어 유지. Private serialize1회·public writable copy 격리·실패 재시도 통과. RT/WG 원본 공유 포함 | [실제 header ASan/UBSan](../build/local/static-opt3-evidence-20261102/run-static-optimization-cpu-final.log), [cache CPU](../build/local/static-opt3-evidence-20261102/run-pipeline-cache-cpu-final.log) |
+| SR parameter arena·full image | 실행당 parameter buffer1개·256-byte aligned disjoint slice, live execution 불변. Fused24조건과 offset/forced-staging/padding96·cache·Dormant·native FG까지 default full oracle PASS | [full native](../build/local/static-opt3-evidence-20261102/metalfx-arena.log) |
+| NGX RR packed 변환 | 원본 normal/roughness를 한 번 읽는 fused kernel6조건의 전체 byte 동일. High precision·NaN/Inf·thin/offset/resampling 및 direct/unpacked fallback 검사. 기존 motion9·generation8-frame 회귀 통과 | [native RR](../build/local/static-opt3-evidence-20261102/ngx-rr-native.log) |
+| AMD zero-albedo | 별도 queue CPU wait 대신 최초 GPU prefix clear. Generation4개에 clear4회. 변경 전후 전체 출력860,232bytes 동일, extent 전환·독립 feature·Dormant reset 유지 | [native](../build/local/static-opt3-evidence-20261102/amd-rr-native.log), [exact parity/hash](../build/local/static-opt3-evidence-20261102/amd-zero-parity.json) |
+| FG decode·ROI | 동일 source의 decode2→1,4-frame 출력 동일. Real-output ROI5조건에서 copied pixels96,256→73,216, outside sentinel 포함 전체 출력 동일. Native64/128 grid 각각 동등 입력을6frame 검증 | [FG full](../build/local/static-opt3-evidence-20261102/fg-native-05.log) |
+| FG 이전 provider 대비 | 36개 전체 출력 bit-exact. 별도 kernel oracle의 rounding4096성분·dilation4·fused16조건 mismatch0 | [provider parity](../build/local/static-opt3-evidence-20261102/fg-provider-parity.json), [kernel proof](../build/local/static-opt3-evidence-20261102/fg-kernels-native.log) |
+| Public D3D12 | `pipeline-cache`, `pipeline-library`, `async-pipeline`, `work-graphs`, `raytracing`, `multiqueue`, `execution-safety`, `temporal`, `sr-alpha`, `ngx`, `ngx-contracts`, `fsr`, `fsr-rr`, `fsr-fg` **14/14 PASS**, validation/foreign-backend 오류0 | [최종 matrix](../build/local/static-opt3-evidence-20261102/gpu-matrix-final.json) |
+| CPU·runner | Recording·depth-stencil·bindless·cache sanitizer 통과. Diagnostics122개 통과, 기존 numeric/queue/native artifact gate 유지 | [CPU matrix](../build/local/static-opt3-evidence-20261102/cpu-regression-result.json), [최종 diagnostics](../build/local/static-opt3-evidence-20261102/diagnostics-final.log) |
+
+**원인과 실패 기록:** SR standalone은 D3D12가 제공하는 caller residency를 재현하지 않아 검은 출력이었다. [초기 mean0](../build/local/static-opt3-evidence-20261102/metalfx-baseline.log)와 [부분 residency 수정 후 padding 실패](../build/local/static-opt3-evidence-20261102/metalfx-residency.log)를 보존했고 전체 입력·split buffer에 residency를 제공한 뒤 원래 full oracle를 통과했다. Production shader나 threshold를 이 실패에 맞춰 변경하지 않았다.
+
+FG 검사에서는 stale observer pointer map·살아 있던 replay cache owner·예전4-PSO 가정과 서로 다른 native grid의 동일-output 가정을 정정했다. 현행6-PSO의 cold failure/retry를 엄격히 검사하고,64/128 각 grid 안의 direct/scaled/snapshot-mutated output과 변경 전 provider36출력 비교를 유지했다. 기존 cross-grid [실패](../build/local/static-opt3-evidence-20261102/fg-native-04.log)는 숨기지 않았다.
+
+Public matrix의 첫4입력은 symlink라 runner가 실행 전에 거부했다. [regular input 복사](../build/local/static-opt3-evidence-20261102/fixture-input-copy.json)와 frozen [preview SDK identity](../build/local/static-opt3-evidence-20261102/preview-sdk-source.json)를 사용해 새 output으로 다시 실행했다. 새 public blob-mutation case를 fixture에 추가한 첫 library run은 runner의 exact case 집합과 불일치했다. 기존 cases를 빼지 않고 새 case도 **필수**로 추가한 뒤 새 prefix에서 통과했다. 검사기나 pixel tolerance를 완화하지 않았다.
+
+**3차 당시 범위:** 첫 temporal 이전 잠금 지연·원본 공유까지만 구현한 상태였다. 위4차에서 feature별 제출, 조건부 FG Prepare, 정확한 정수 wide-wave·terminal WG·atomic64 interval을 구현했다. 과거3차 증거를 새 코드의 검증으로 바꾸지 않는다. 최초 key hash·exact equality 및 native model 생성 비용, 실게임 FPS·다른 OS/GPU·x86 FX 범위는 여전히 별도다.
+
+외부 FEX emitter JSON2개는 [역사적 미보유 자료](../doc/FEX-PERFORMANCE-2026-10-09.md#적용한-최적화)로 정확히 표기했다. 문서의 죽은 링크를 고친 것이며 파일 복원이나 해당 수치의 재검증은 아니다. External Wine/FEX 소스·live prefix·기존 저지연 변경을 수정하지 않았다.
+
+최종 [요약/source identity](../build/local/static-opt3-evidence-20261102/final-summary.json), [전체 문서 검사](../build/local/static-opt3-evidence-20261102/documentation-final.log), [prefix 정리 기록](../build/local/static-opt3-evidence-20261102/cleanup.json)을 보존한다. 전용 prefix15개는 해당 서버 종료를 확인한 뒤 삭제했고 runtime·fixture·readback·실패/성공 로그는 유지했다. 커밋·푸시는 하지 않았다.
+
+## 정적 최적화 2차 — 2026-11-02
+
+1차 다음 순서인 **나머지 fixed command helper16종, device resolve cache, shader/root immutable 원본 공유, native library 중간 복사 제거, SR linearize/alpha 결합**을 구현했다. 상세 key·소유권·실패 조건은 [2차 review](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-정적-최적화-2차)에 있다. 기존 fixed helper10종을 더해 command-list의26종이 device 단위로 재사용된다. 모든 subsystem PSO 또는 캐시 적중 시의 모든 바이트 해시가 제거됐다는 의미는 아니다. Caller/source bytes의 소유권을 공유할 뿐 mutable LLVM/compiler shader는 공유하지 않는다.
+
+[새 ARM64X build](../build/local/static-opt2-arm64x-20261102/result.json)·[native/WoW64 package](../build/local/static-opt2-package-20261102/package-result.json)가 통과했다. [610개 production source cut](../build/local/static-opt2-package-20261102/source-cut.json)은 최종 대조에서 현재 소스와 전부 일치했다. Manifest SHA-256은 `b7199d671cb8476658520e8945141679dfa518cd34c17965584448e8a7b6f290`이다. 아래 GPU 증거는 Apple M5 Pro, native ARM64/ARM64X DLL, x64 guest의 synthetic fixture이며 전체 no-Rosetta·다른 GPU/OS·실게임 성능 증거가 아니다.
+
+| 검증 | 확인한 결과 | 증거 |
+| --- | --- | --- |
+| 실제 production 함수의 CPU sanitizer | 추가 helper16종에12개 list가 동시에 접근해 PSO16개, inline library4개, builtin library1개만 생성. Device 격리·부분 실패 retry·기존 predication/descriptor 검사 통과 | [ASan/UBSan](../build/local/static-opt2-evidence-20261102/static-cpu.log) |
+| 실제 immutable bytecode header | 정상 SHA-1와 모든 digest를 같게 만든 test-only 모드에서 full-byte/length 구분, caller mutation,12-thread 공유,256-entry bounded admission, pool 종료 후 소유권 통과 | [동일 sanitizer 로그](../build/local/static-opt2-evidence-20261102/static-cpu.log) |
+| 기존 CPU 회귀 | Recording OOM/ownership, depth-stencil, bindless collection, pipeline-cache 통과 | [CPU matrix](../build/local/static-opt2-evidence-20261102/cpu-regression-result.json) |
+| Native SR 결합 | 실제 production prepass24조건에서 standalone/fused color와 alpha **전체 bytes 일치**, padding/barrier 유지, native dispatch 정확히1개 감소. Device PSO lazy·동시 생성·실패 재시도도 통과 | [API+Shader Validation](../build/local/static-opt2-evidence-20261102/metalfx-prepasses.log) |
+| Public D3D12 | `copy-resolve`, `pipeline-cache`, `pipeline-library`, `expanded-formats`, `depth-plane-copy`, `atomic-copy`, `stream-output`, `geometry`, `tessellation`, `multisample-capabilities`, `sr-alpha`, `fsr`, `temporal`, `raytracing`: **14/14 PASS**, validation/foreign-backend 오류0 | [최종 matrix](../build/local/static-opt2-evidence-20261102/gpu-matrix-final.json) |
+| Runner diagnostics | 기존122개 검사 통과. 허용치나 PASS marker 검사를 완화하지 않았다 | [diagnostics](../build/local/static-opt2-evidence-20261102/diagnostics.log) |
+
+**FSR 실행 실패와 fixture 수정:** 첫 시도는 필수 독립 scale 입력을 누락해 중단됐다. 같은 device의 public MetalFX descriptor로 [min1/max3](../build/local/static-opt2-evidence-20261102/native-scale-control.log)을 읽은 다음 시도는 기존 fixture의 null dereference를 드러냈다. `fsrInflightAndDiscard`가 `output.resource.Reset()`한 뒤 `validateOutput`이 `GetDesc()`를 호출한 것이며, fault PC `0x14001a0fc`를 fixture의 해당 함수로 확인했다. 이 제어 흐름이 원본 HEAD에도 있다는 [대조](../build/local/static-opt2-evidence-20261102/fsr-fixture-fault-analysis.json)를 보존했다. Resource를 계속 붙잡는 대신 release 전에 **descriptor 값만** 복사해 oracle에 전달했다. Caller resource/list/context release, GPU fence gate, sentinel·숫자 허용치는 유지했다. 수정 fixture의 FSR·temporal·SR-alpha와 후속 RT를 새 prefix로 순차 재실행해 통과했고, 앞선 실패 기록은 삭제하지 않았다.
+
+**2차 시점의 경계:** Native full [offset-region-value 실패](../build/local/static-opt2-evidence-20261102/metalfx-full.log)는 당시 미해결이었다. 현재는 위3차에서 caller residency 누락을 수정해 원래 full oracle까지 통과했다. 2차 결과 자체는 당시24-condition proof이며 나중 결과로 바꾸지 않는다. 남겼던 key/payload·RR/FG·초기화 항목의 구현과 제한도3차에서 구분한다. 실게임 FPS 수치는 여전히 미측정이다.
+
+변경한5개 문서의 [검사](../build/local/static-opt2-evidence-20261102/documentation-changed.log)는 PASS다. [전체 문서 검사](../build/local/static-opt2-evidence-20261102/documentation-all.log)는 이전과 같은 외부 FEX evidence JSON2개 부재로 실패했으며 해당 외부 자료나 검사기를 변경하지 않았다. 전용 Wine prefix19개는 각각 server 종료 확인 뒤 제거하고 [정리 기록](../build/local/static-opt2-evidence-20261102/cleanup.json)·실패/성공 로그·readback·runtime은 보존했다.
+
+## 정적 감사 확정 최적화 — 2026-11-02
+
+정적 감사의 **L01 일부·Q02·L17·R01·T01·T02·T03·T14 일부·T15**를 구현했다. 불변 helper/MetalFX PSO 공유, Execute-task 불변 metadata 재사용, resolve cache-hit 준비 생략, descriptor pooled-view replace, NGX RR retired scratch 제한, AMD RR 두 extent 재사용 및 RR 반복 parameter/capability 준비 축소가 범위다. [구현 원장](../doc/D3D12-REVIEW-AND-DESIGN-2026-10-07.md#2026-11-02-정적-감사-확정-후보-구현)에 위치·실패 재시도·수명 조건과 남은 범위를 기록했다. 기존 저지연 작업을 보존했고 public ABI, shader 계산, queue/history 동기화와 품질 옵션은 변경하지 않았다.
+
+검증 runtime은 [fresh ARM64X paired build](../build/local/static-opt-arm64x-20261102-02/result.json)와 [native/WoW64 package](../build/local/static-opt-package-20261102/package-result.json)다. [609개 입력 source cut](../build/local/static-opt-package-20261102/source-cut.json)을 빌드 중 일관되게 유지했고 ARM64/ARM64EC consumer audit 8개가 통과했다. Runtime manifest SHA-256은 `c8bf6721fe89a8babad17bf0edfc133e2caf1db6ea8e27a45b518048ffcf6936`이다. 아래 공개 GPU 실행은 `native_arch=arm64`, `windows_abi=arm64x`, `guest_arch=x64`이며 strict no-Rosetta 전체 증거로 확대하지 않는다.
+
+| 검증 | 확인한 결과 | 보존 증거 |
+| --- | --- | --- |
+| Production-method CPU ASan/UBSan | 12개 list 동시 생성에서 library 1개·PSO 8개, device 격리·부분 실패 재시도. Texture descriptor의 불필요한 clear 제거와 fallback/실패 null 유지 | [static CPU](../build/local/static-opt-evidence-20261102/static-cpu.log) |
+| 기존 CPU 회귀 | Command recording OOM/ownership, depth/stencil 3,072 cases·36,864 selections, bindless collection, pipeline cache 통과 | [recording](../build/local/static-opt-evidence-20261102/run-command-recording-cpu.log), [DS](../build/local/static-opt-evidence-20261102/run-depth-stencil-cpu.log), [bindless](../build/local/static-opt-evidence-20261102/run-bindless-collection-cpu.log), [cache](../build/local/static-opt-evidence-20261102/run-pipeline-cache-cpu-pinned.log) |
+| Native SR cache | 실제 같은-device PSO/exposure 공유, 6개 feature 동시 최초 요청에 단일 생성, lazy/부분 실패/Objective-C 예외 재시도 통과 | [API+Shader Validation](../build/local/static-opt-evidence-20261102/metalfx-pipelines.log) |
+| Native NGX RR | 3-set/working-set byte budget, exact extent, allocation failure, Dormant 뒤 late-retirement와 replay. 9개 motion 조건 및 8-frame generation 재활성화 출력 parity 통과 | [API+Shader Validation](../build/local/static-opt-evidence-20261102/rr-motion-native.log) |
+| Native AMD RR | 두 feature가 10개 PSO 공유. 한 feature의 A→B→A→A에 모델 2개만 생성; switch reset/consecutive history 분리, A 복귀와 독립 fresh A의 출력 bit-exact. Dormant 뒤 fresh 생성/출력 통과 | [API+Shader Validation](../build/local/static-opt-evidence-20261102/amd-rr-cache-native.log) |
+| Public D3D12 GPU | `copy-resolve`, `predication-indirect`, `sampler-feedback`, `temporal`, `bindless`, `execution-safety`, `fsr-rr`, `fsr-fg` **8/8 PASS**, API+Shader Validation 오류 0 | [최종 matrix](../build/local/static-opt-evidence-20261102/gpu-matrix-final.json) 및 각 `result.json`/readback/trace |
+| Runner diagnostics | Attachment metadata가 draw/dispatch로 오인되지 않도록 정확한 schema를 추가했다. Missing/duplicate 실제 명령·잘못된 attachment는 계속 거부. **122 tests PASS** | [diagnostics](../build/local/static-opt-evidence-20261102/diagnostics.log) |
+
+**실패와 경계:** 첫 predication 실행의 GPU oracle과 exit code는 정상이었지만, 기존 checker가 `OWNED_GRAPHICS_NATIVE_RENDER_ATTACHMENT`를 미지의 명령으로 분류해 [FAIL](../build/local/static-opt-evidence-20261102/gpu-predication-indirect/result.json)했다. Metadata schema를 좁혀 수정한 뒤 새 prefix의 [재실행](../build/local/static-opt-evidence-20261102/gpu-predication-indirect-02/result.json)이 PASS했다. 기존 실패를 덮어쓰지 않았다. 초기 시스템 Rust 1.96/LLVM dyld 오류도 기록을 유지하고, README의 pinned Rust 1.85.1로 새 paired build와 cache CPU를 실행했다.
+
+옵션 없는 `owned-metalfx-optimization-native.mm` full image test는 변경 전 HEAD와 변경 후 모두 `offset-region-value`에서 실패했다([baseline](../build/local/static-opt-evidence-20261102/metalfx-baseline.log), [최종 candidate](../build/local/static-opt-evidence-20261102/metalfx-native-final.log)). 이 기존 oracle 실패는 미해결이며 `--pipelines-only` PASS로 대체하거나 허용치를 완화하지 않았다. Public temporal suite 통과도 그 full image test의 통과를 뜻하지 않는다. 실게임 FPS·frame-time 개선, 다른 GPU/OS, x86 guest FX와 외부 모델 화질 동등성은 이번에 검증하지 않았다.
+
+최종 source-cut 대조에서 **이번 최적화 대상 소스는 모두 검증 cut과 동일**했으나, 별도 진행 중인 `src/d3d12/owned_low_latency.hpp`가 package 이후 변경된 것을 발견해 보존했다. Matrix의 `source_cut_changed`에 명시했으며, 위 결과를 그 동시 작업까지 포함한 현재 트리 전체의 재검증으로 취급하지 않는다.
+
+변경한 5개 문서의 링크 검사는 [PASS](../build/local/static-opt-evidence-20261102/documentation-changed.log)다. 전체 문서 검사는 기존 `doc/FEX-PERFORMANCE-2026-10-09.md`가 가리키는 외부 FEX 증거 JSON 2개 부재로 실패했고, 두 링크가 원본 HEAD에도 있음을 [대조 기록](../build/local/static-opt-evidence-20261102/documentation-baseline-missing.json)에 보존했다. 해당 외부 작업이나 검사기를 변경하지 않았다. 이번 실행의 전용 Wine prefix 9개는 각 prefix의 서버 종료 확인 뒤 제거했고, 첫 실패 빌드의 중간 payload만 정리했다([cleanup receipt](../build/local/static-opt-evidence-20261102/cleanup.json)). 검증 runtime·로그·manifest·readback은 유지한다.
+
+## 선택적 적응형 저지연과 Reflex·Anti-Lag 2 — 2026-11-02
+
+`d3d12.lowLatency`는 **기본 False**다. Yaagl 같은 런처가
+`D3DALLOY_CONFIG="d3d12.lowLatency=True"`를 게임 환경에 넣으면 저지연 API가 없는
+게임에도 adaptive Present-return pacing을 적용한다. 게임 profile에서 자동 활성화하지 않는다.
+False는 강제 경로만 끄며 게임이 요청한 Reflex·Anti-Lag 2 입력 전 제어는 유지한다.
+
+공통 scheduler는 CPU 예약과 생성/실제 Present를 application frame으로 묶고,
+각 API task의 모든 native fragment가 해제돼야 완료 처리한다. 고정 2-frame 상한 안에서
+LatencyFleX 기반 예측 목표를 계산하고, 측정된 CPU 준비 시간과 이전 완료 피드백으로
+GPU overlap을 보존한다. 활성 SDK Sleep이 실제로 호출되면 같은 예약을 재사용하며
+cooperative 호출이 없는 프레임은 활성화된 강제/SDK 모드의 Present 경로에서 처리한다. TEST·실패·DO_NOT_WAIT에는
+post-submit sleep을 추가하지 않는다. GPU 보고 시각과 scheduler의 완료 수신 시각을 구분한다.
+게임이 요청한 저지연·minimum interval은 launcher force OFF에서도 Sleep 없는 Present
+fallback으로 유지한다. 대기 후에는 예약 frame의 생존을 다시 확인하고, 여러 queue의
+Present는 queue 잠금을 잡기 전에 여유를 예약한다. 준비 중인 예약도 2-frame 상한에
+포함하며 capture·게시 또는 실패 반환 뒤 예약을 반납한다. Layer/GPU 준비 동안
+장치 전체 잠금을 유지하지 않고, 닫힌 frame은 별도로 실제 회수까지 상한에 남는다.
+
+후속 최적화는 Windows NT 상대 timeout과 취소 event, 측정한 wake 지연의 예측 목표 보정,
+calibrated GPU 완료 시각과 CPU 회수 시각의 분리, CPU 준비/native submit tail의 독립
+평활화, Reflex admission→report 직접 검색 및 명시적 frame 종료를 포함한다.
+Wake 보정은 적응형 목표에만 적용하고 게임의 minimum interval은 앞당기지 않는다.
+보정량은 측정한 wake 지연 이내에서 GPU gap이 늘면 증가하고 이미 쌓인 GPU 대기가 늘면
+감소한다. 역순 GPU 완료는 throughput 예측 시각을 되돌리지 않는다.
+GPU 시각을 먼저 알아도 native fragment의 소유권이나 fence 완료를 조기에 해제하지 않는다.
+
+`amdxc64.dll`의 `AmdExtD3DCreateInterface`는 Anti-Lag 2의 mode/FPS, input delay,
+end-render, interpolated/real packet을 같은 device scheduler에 연결한다. D3D12 생성 시
+preload하여 SDK의 `GetModuleHandle` 경로를 지원하며 ARM64X/native/WoW64 install·stage에
+포함한다. Reflex의 기존 NVAPI 경로와 실제 report는 유지하고 OOB marker를 연결했다.
+Boost·AMD control string·private input-index query는 지원을 가장하지 않고 거부한다.
+AMD는 frame ID가 없어 unrelated render thread의 임의 역순 제출은 FIFO 경계 이상으로 식별하지 못한다.
+
+초기 구현 증거(후속 최적화 이전):
+- `build/local/latency-arm64x-final-20261102`와 `latency-package-final-20261102`의 fresh build/package PASS.
+  CPU scheduler 일반·ASan/UBSan·TSan, packaging 51-case staging, diagnostics 119-case PASS.
+- `latency-final-reflex-20261102`: NVAPI 90 frame/64 report, 실제 interval wait와 제거 취소,
+  Sleep 없는 minimum-interval Present fallback PASS.
+- `latency-final-{forced,amd,amd-force}-20261102`: 각 120 frame exact pixel,
+  Metal API+Shader Validation 오류 0. 강제 경로는 vendor enable 호출 없이 실행하며,
+  AMD+force도 frame당 cooperative admission 하나만 관측했다.
+- `latency-final-fg-off-20261102`와 `latency-final-fg-force-{a,b,c}-20261102`:
+  실제 drawable·wrapped UI·생성/실제 frame 분류 PASS, Metal validation 오류 0.
+- 독립 리뷰에서 발견한 대기 중 예약 소멸, SDK-only fallback 누락, concurrent Present 상한
+  검사 경쟁을 수정했다. 예약 소멸 회귀는 수정 전 bounded completion FAIL, 수정 후 PASS다.
+- [교차 OFF/ON/ON/OFF 측정](../build/local/latency-fixtures-qa-20261102/final-measurements.json):
+  각 120 frame 중 첫 30을 제외한 두 run 평균이다. Validation OFF이지만 상세 trace는 ON이었다. GPU query와
+  `GetClockCalibration`으로 QPC를 연결했고 calibration bracket은 4.5–5.6us였다.
+
+| 합성 GPU 부하 | OFF | 강제 ON |
+| --- | ---: | ---: |
+| 입력 marker → GPU 완료 평균 | 56.73ms | 15.12ms |
+| 제출 → GPU 시작 평균 | 42.30ms | 0.56ms |
+| GPU 처리량 | 70.27 FPS | 66.10 FPS |
+
+이 계측 부하에서 지연은 약 73% 감소했고 처리량은 약 6% 낮아졌다.
+Trace를 끈 실사용 비용으로 그대로 해석하지 않는다.
+GPU 완료는 화면 표시가 아니며 ZZZ 또는 물리적 input-to-photon 측정이 아니다.
+분리된 게임 simulation thread가 입력을 일찍 읽는 문제를 범용 Present 제어만으로 해결했다고 주장하지 않는다.
+
+확장 회귀는 전체 PASS가 아니다. `latency-matrix-*`의 render-passes·multisample·copy-resolve·
+enhanced-barriers·execution-safety·queries·multiqueue·fence-events·smoke·colorspace는 PASS다.
+Pipeline-library의 evidence parser는 생성형 cache ID를 고정 숫자로 오인하던 검사를
+종류별 일관성/서로 다른 ID 검사로 고쳤으며 `latency-final-pipeline-library-20261102`는 PASS다.
+`latency-final-present-queues-20261102`는 restart 검사 후 `ReleaseMetalView`의
+`!status && "unix call failed"` assertion으로 exit 3이다. 기존 runtime의
+`latency-baseline-present-teardown-20261102`도 같은 restart 구간 이후 timeout이지만,
+두 종료 실패의 동일 원인까지 확정하지는 않았다. HDR/fullscreen matrix의 같은 assertion은
+`latency-baseline-compare-{hdr-metadata,fullscreen}-20261102`에서도 재현했다.
+이 표시/종료 실패는 이번 저지연 구현에서 해결한 것으로 표시하지 않는다.
+초기 FG 검증의 wrapped UI `presentedTime=0` 실패도 기존 runtime의
+`latency-baseline-compare-fsr-fg-2-20261102`에서 재현했고, 초기 구현의 마지막 네 FG 실행은 모두 PASS였다.
+설정·재현은 [Customization](../doc/CUSTOMIZATION.md#launcher-controlled-low-latency)와
+[Smoke](SMOKE-TEST.ko.md#adaptive-low-latency-acceptance)를 따른다.
+
+### 후속 저지연 최적화 검증
+
+최종 검증 cut은 `build/local/latency-opt6-arm64x-20261102`와
+`latency-opt6-package-20261102/runtime`이다. ARM64X/native/WoW64 build·package가 통과했다.
+일반·ASan/UBSan·TSan 및 Wine의 static x64 scheduler probe가 통과했으며,
+GPU 시각을 CPU 수신 시각으로 바꾸기, 명시적 종료 frame 무시, 준비 중 예약 무시,
+예약 반환 알림 누락, timed waiter 한 명만 깨우기, 역순 GPU 시각 수용의 의도적 변이에서는
+각각 회귀 검사가 실패했다.
+영구 소스에는 변이를 적용하지 않았다.
+
+독립 리뷰의 P1은 동시 real Present가 같은 열린 frame을 잡는 capture/close 경쟁이었다.
+선택과 닫기를 짧은 reporting 임계구역 안에서 끝내도록 수정했다.
+실제 `ReflexState` CPU probe에서 수정 전 FAIL, 수정 후 PASS이며,
+동시 real Present와 생성/실제 grouping도 통과했다. 기존 리뷰 판정은 수정 전 cut의
+`incorrect`로 보존했고 최종 코드의 별도 재승인으로 바꾸지 않았다.
+
+`latency-opt6-qa-{off,forced,antilag2,amd-force,reflex}-20261102`는 모두 PASS다.
+앞 네 실행은 각각 120 frame exact readback, Reflex는 90 frame/64 report이며
+Metal API+Shader Validation 오류는 0이다. 상세 결과와 남은 실패는
+[최종 QA summary](../build/local/latency-opt-fixtures-20261102/final-validation-summary.json)에 보존한다.
+
+아래는 같은 최종 runtime의 trace/validation OFF 측정이다. 각 120 frame 중 첫 30을 제외했고,
+OFF는 비교 구간 양끝에서, ON은 가운데에서 두 번 측정했다.
+[원자료](../build/local/latency-opt-fixtures-20261102/optimized-final-measurements.json)는
+이전 runtime의 강제 ON을 끼운 전체 `OFF/old/new/new/old/OFF` 순서도 보존한다.
+
+| 최종 runtime의 합성 부하 | OFF | 강제 ON |
+| --- | ---: | ---: |
+| 입력 marker → GPU 완료 평균 | 65.54ms | 17.21ms |
+| 제출 → GPU 시작 평균 | 49.09ms | 0.61ms |
+| GPU 처리량 | 60.73 FPS | 58.99 FPS |
+
+이전 runtime의 강제 ON 평균은 17.65ms/59.27 FPS, 제출→GPU 시작은 1.05ms였다.
+이번 비교의 평균 지연은 낮아졌지만 FPS 향상은 입증되지 않았다. 두 source cut 사이에는
+동시 진행된 command-list/descriptor/MetalFX 최적화도 포함돼 있으므로 저지연 변경만의
+개선율이나 이전 6% 손실의 완전한 회복을 주장하지 않는다. 최종 OFF 대비 강제 ON의
+처리량은 약 2.9% 낮았다. ZZZ·물리적 input-to-photon은 미측정이다.
+
+최종 `latency-opt6-fg-{off,force-a,force-b,force-c}-20261102`는 모두 PASS다.
+앞선 opt4 cut의 확장 matrix는 **10/14 PASS**였다. `render-passes`는 exit 0과 GPU oracle 통과 뒤
+stderr 3884–3885에서 phase marker와 `pipeline_cache_auto_published` 로그가 섞여
+checker가 실패했다. `present-queues`는 기존과 같은 restart 뒤 timeout이고,
+HDR/fullscreen은 기존 `ReleaseMetalView` assertion으로 exit 3이다.
+opt4의 강제 FG는 a/b가 `wrapped actual timestamps not ordered/bounded`로 실패하고 c가 PASS,
+OFF는 PASS다. 이전 runtime에 강제를 켠 `latency-opt4-fg-baseline-{a,b}-20261102`도
+각각 같은 오류 종류의 FAIL과 PASS였다. 생략된 wrapped drawable 번호는 새 실패에서 21,
+기준 실패에서 20으로 달라 완전히 동일한 실행이라고 취급하지 않는다.
+이 간헐 표시 실패와 로그 무결성 실패는 미해결로 남기며 검사를 완화하지 않았다.
+이후 수정은 활성 저지연 header 경로에 한정했다. 해당 공개 API/FG는 최종 cut에서 재검증했지만
+opt4의 넓은 matrix 결과를 최종 cut 전체를 다시 실행한 것으로 취급하지 않는다.
 
 ## 최근 최적화 리뷰와 정리 — 2026-11-02
 

@@ -84,6 +84,24 @@ kernel void yaagl_fsr_linearize(
     destination.write(color, destinationPosition);
 }
 
+// Same transfer and float-to-storage conversions as the two standalone passes.
+// Alpha padding reads clamped source coverage; only active color is transformed,
+// and its existing edge-extension pass consumes the stored result afterward.
+kernel void yaagl_sr_linearize_alpha(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> colorDestination [[texture(1)]],
+    texture2d<float, access::write> alphaDestination [[texture(2)]],
+    constant YaaglFsrParams& params [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]]) {
+    if (any(tid >= params.dispatchExtent)) return;
+    float4 color = source.read(params.sourceOrigin + min(tid, params.extent - 1u));
+    alphaDestination.write(float4(color.a, color.a, color.a, 1.0f), tid);
+    if (all(tid < params.extent)) {
+        color.rgb = inverse_transfer(color.rgb, params.transfer);
+        colorDestination.write(color, params.destinationOrigin + tid);
+    }
+}
+
 kernel void yaagl_fsr_combine_masks(
     texture2d<float, access::read> reactive [[texture(0)]],
     texture2d<float, access::read> composition [[texture(1)]],
@@ -310,14 +328,14 @@ static uint2 fg_source_position(uint2 tid, uint2 extent, uint2 sourceExtent) {
 
 // The center sample wins ties; neighbors replace it only when strictly nearer.
 static uint2 fg_nearest_depth(texture2d<float, access::read> depth, uint2 center,
-                              uint2 extent, bool inverted) {
+                              uint2 extent, bool inverted, uint2 origin = uint2(0u)) {
     uint2 nearest = center;
-    float nearestDepth = depth.read(center).r;
+    float nearestDepth = depth.read(origin + center).r;
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x) {
             int2 position = int2(center) + int2(x, y);
             if ((x == 0 && y == 0) || any(position < 0) || any(position >= int2(extent))) continue;
-            float candidate = depth.read(uint2(position)).r;
+            float candidate = depth.read(origin + uint2(position)).r;
             if (inverted ? candidate > nearestDepth : candidate < nearestDepth) {
                 nearest = uint2(position);
                 nearestDepth = candidate;
@@ -380,14 +398,14 @@ static uint2 fg_motion_position(uint2 tid, uint2 depthPosition, constant YaaglFg
 static uint2 fg_depth_position(uint2 tid, texture2d<float, access::read> sourceDepth, constant YaaglFgParams& params) {
     uint2 position = fg_source_position(tid, params.extent, params.depthSourceExtent);
     if (params.depthDilation)
-        position = fg_nearest_depth(sourceDepth, position, params.depthSourceExtent, params.depthInverted != 0u);
+        position = fg_nearest_depth(sourceDepth, position, params.depthSourceExtent, params.depthInverted != 0u, params.sceneOrigin);
     return position;
 }
 
 // clipDepth is the normalized depth at tid; it is used only for camera reconstruction.
 static half4 fg_normalized_motion(texture2d<float, access::read> source, uint2 tid, uint2 sourcePosition,
                                   float clipDepth, constant YaaglFgParams& params) {
-    float2 value = source.read(sourcePosition).xy;
+    float2 value = source.read(uint2(params.sourceOrigin) + sourcePosition).xy;
     // Either invalid component invalidates the object vector; camera reprojection is still applied below.
     if (params.motionVectorsInvalidValuePresent &&
         (value.x == params.motionVectorsInvalidValue || value.y == params.motionVectorsInvalidValue))
@@ -431,7 +449,7 @@ kernel void yaagl_fg_normalize_depth_motion(
     uint2 tid [[thread_position_in_grid]]) {
     if (any(tid >= params.extent)) return;
     uint2 depthPosition = fg_depth_position(tid, sourceDepth, params);
-    float4 depthValue = sourceDepth.read(depthPosition);
+    float4 depthValue = sourceDepth.read(params.sceneOrigin + depthPosition);
     depth.write(depthValue, tid);
     destination.write(fg_normalized_motion(source, tid, fg_motion_position(tid, depthPosition, params),
                                            depthValue.r, params), tid);
@@ -497,6 +515,6 @@ kernel void yaagl_fg_resample_depth(
     if (any(tid >= params.extent)) return;
     uint2 sourcePosition = fg_source_position(tid, params.extent, params.sourceExtent);
     if (params.depthDilation)
-        sourcePosition = fg_nearest_depth(source, sourcePosition, params.sourceExtent, params.depthInverted != 0u);
-    destination.write(source.read(sourcePosition), tid);
+        sourcePosition = fg_nearest_depth(source, sourcePosition, params.sourceExtent, params.depthInverted != 0u, uint2(params.sourceOrigin));
+    destination.write(source.read(uint2(params.sourceOrigin) + sourcePosition), tid);
 }

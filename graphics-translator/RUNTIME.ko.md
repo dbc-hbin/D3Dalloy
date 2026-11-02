@@ -89,6 +89,15 @@ README로 FSR-enabled x64 install을 만들고 stage에 `--with-fsr`를 추가�
 
 ## wrapper 로드 정책
 
+새 D3D12 install에는 Anti-Lag 2 SDK용 `amdxc64.dll`이 필수로 포함된다.
+32-bit install도 SDK 조회 이름을 유지하며, ARM64X는 native/EC 두 view를 함께 묶는다.
+Stage/verify는 `AmdExtD3DCreateInterface`, `OwnedAntiLagBackendId`, owned marker와
+builtin signature를 검사하고 `amdxc64=b`로 고정한다. D3D12 device 생성 시 이 facade를
+로드하므로 SDK의 `GetModuleHandle` 조회가 별도 게임 DLL 교체 없이 성공한다.
+이 DLL의 존재는 강제 저지연을 켜지 않는다. 강제 적용은 기본 OFF인
+`d3d12.lowLatency` 설정으로만 선택하며 [런처 설정](../doc/CUSTOMIZATION.md#launcher-controlled-low-latency)을 따른다.
+이 모듈 도입 전 보존 runtime은 manifest의 artifact 목록에 따라 기존 wrapper 그대로 검증한다.
+
 Wrapper는 명시적 `WINEPREFIX`가 없으면 실패한다. `WINEDLLPATH`는 manifest가 선택한 stage의 Windows/native module directories로 고정하며 core override는 다음과 같다.
 
 ```text

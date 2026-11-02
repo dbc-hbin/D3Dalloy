@@ -22,6 +22,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_device_child.hpp"
+#include "d3d12_pipeline_cache.hpp"
 #include "d3d12_sampler_feedback.hpp"
 #include "d3dalloy_sampler.hpp"
 #include "util_math.hpp"
@@ -633,7 +634,7 @@ CalculateRootSignatureQwordOffsets(const D3D12_ROOT_SIGNATURE_DESC1 &Desc) {
 
 class MTLD3D12RootSignatureImpl : public MTLD3D12DeviceChild<MTLD3D12RootSignature> {
 
-  std::vector<uint8_t> blob_;
+  SharedShaderBytecode blob_;
   std::vector<uint32_t> qword_offsets_;
   std::vector<uint32_t> status_qword_offsets_;
   std::vector<D3D12_ROOT_PARAMETER_TYPE> parameter_types_;
@@ -655,11 +656,10 @@ class MTLD3D12RootSignatureImpl : public MTLD3D12DeviceChild<MTLD3D12RootSignatu
 public:
   MTLD3D12RootSignatureImpl(MTLD3D12Device *pDevice, const void *pBytecode, SIZE_T BytecodeLength) :
       MTLD3D12DeviceChild<MTLD3D12RootSignature>(pDevice) {
-    blob_.resize(BytecodeLength);
-    memcpy(blob_.data(), pBytecode, BytecodeLength);
+    blob_ = device_->GetShaderArtifactCache().RetainBytecode(pBytecode, BytecodeLength);
     if (owned_graphics::TraceEnabled()) {
       const auto input = Sha1HashState::compute(pBytecode, BytecodeLength);
-      const auto stored = Sha1HashState::compute(blob_.data(), blob_.size());
+      const auto stored = blob_.digest();
       owned_graphics::Trace("root_signature_input", ",\"bytes\":", uint64_t(BytecodeLength),
                             ",\"input_sha1\":\"", input.string(), "\",\"stored_sha1\":\"", stored.string(), "\"");
     }
@@ -746,7 +746,7 @@ public:
           WMTSamplerInfo info;
           PopulateWMTSamplerInfo(device_->GetMTLDevice(), info, desc_1_2.pStaticSamplers[i]);
 
-          auto sampler = Sampler::createSampler(device_->GetMTLDevice(), info, desc_1_2.pStaticSamplers[i].MipLODBias,
+          auto sampler = device_->owned_native_states.SamplerState(device_->GetMTLDevice(), info, desc_1_2.pStaticSamplers[i].MipLODBias,
                                                 SamplerReductionMode(desc_1_2.pStaticSamplers[i].Filter));
           if (!sampler)
             return E_OUTOFMEMORY;

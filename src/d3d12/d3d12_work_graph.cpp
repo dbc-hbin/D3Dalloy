@@ -295,8 +295,8 @@ HRESULT MTLD3D12WorkGraph::Initialize(const D3D12_STATE_OBJECT_DESC *desc, const
         SM50FreeError(error); return E_INVALIDARG;
       }
       const uint32_t library_index = libraries_.size();
-      auto *bytes = static_cast<const uint8_t *>(lib.DXILLibrary.pShaderBytecode);
-      libraries_.emplace_back(bytes, bytes + lib.DXILLibrary.BytecodeLength);
+      libraries_.push_back(device_->GetShaderArtifactCache().RetainBytecode(
+          lib.DXILLibrary.pShaderBytecode, lib.DXILLibrary.BytecodeLength));
       std::vector<bool> matched(lib.NumExports);
       for (UINT e = 0; e < lib.NumExports; ++e) {
         const auto &exp = lib.pExports[e];
@@ -934,7 +934,7 @@ struct GraphExecution {
   }
   HRESULT Read(uint64_t address, void *destination, uint64_t size) {
     if (!size) return S_OK;
-    uint64_t offset = 0; auto *allocation = device->LookupBufferByVA(address, &offset);
+    uint64_t offset = 0; auto allocation = device->LookupBufferByVA(address, &offset);
     if (!allocation || offset > allocation->byteLength() || size > allocation->byteLength() - offset)
       return E_INVALIDARG;
     if (size > readback_info.length) {
@@ -963,19 +963,41 @@ struct GraphExecution {
   }
   HRESULT RunNode(uint32_t index, uint64_t input_address, const uint8_t *input, uint32_t level, uint32_t remaining) {
     const auto &node = graph.nodes[index];
+    if (node.info.Input.RecordSize && input_address != seed_address) {
+      // Removing a CPU readback must not remove its bounds validation. The GPU
+      // still consumes the complete record, even when the scheduler reads none.
+      uint64_t offset = 0; auto allocation = device->LookupBufferByVA(input_address, &offset);
+      if (!allocation || offset > allocation->byteLength() ||
+          node.info.Input.RecordSize > allocation->byteLength() - offset) return E_INVALIDARG;
+    }
     uint32_t grid[3] = {1, 1, 1}; uint64_t groups = 1;
     if (node.info.Launch == SM50_WG_LAUNCH_BROADCASTING) {
       std::copy_n(node.info.DispatchGrid, 3, grid);
       if (!node.info.HasFixedDispatchGrid && node.info.Input.DispatchGridComponents) {
+        // Only dynamic broadcasting metadata is consumed by the CPU scheduler.
+        // Thread/coalescing/fixed-grid nodes read their records directly on GPU.
+        std::array<uint8_t, 12> grid_record{};
+        const uint32_t component_bytes = node.info.Input.DispatchGridComponentType == 3 ? 2 : 4;
+        const auto *metadata = input ? input + node.info.Input.DispatchGridOffset : grid_record.data();
+        if (!input) {
+          const HRESULT hr = Read(input_address + node.info.Input.DispatchGridOffset, grid_record.data(),
+              node.info.Input.DispatchGridComponents * component_bytes);
+          if (FAILED(hr)) return hr;
+        }
         for (uint32_t axis = 0; axis < node.info.Input.DispatchGridComponents; ++axis) {
-          const uint32_t size = node.info.Input.DispatchGridComponentType == 3 ? 2 : 4;
-          grid[axis] = 0; std::memcpy(&grid[axis], input + node.info.Input.DispatchGridOffset + axis * size, size);
+          grid[axis] = 0; std::memcpy(&grid[axis], metadata + axis * component_bytes, component_bytes);
         }
         for (uint32_t axis = node.info.Input.DispatchGridComponents; axis < 3; ++axis) grid[axis] = 1;
       }
       groups = uint64_t(grid[0]) * grid[1] * grid[2];
     }
     if (!groups) return S_OK;
+    // A leaf cannot overflow output queues: there are no descendants to drain
+    // between its groups. Dispatch an independent frontier in bounded batches,
+    // retaining the original group coordinates and input-completion counter.
+    const bool terminal = std::all_of(node.targets.begin(), node.targets.end(),
+        [](uint32_t target) { return target == SM50_WG_NONE; });
+    const uint32_t group_limit = terminal ? (node.atomic64_phase ? 32u : 65535u) : 1u;
     const uint64_t base = level * control_stride;
     auto *words = static_cast<uint8_t *>(control_info.memory.get_accessible_or_null()) + base;
     auto *queues = reinterpret_cast<SM50_WG_QUEUE *>(words);
@@ -983,7 +1005,8 @@ struct GraphExecution {
     auto *batch = reinterpret_cast<SM50_WG_BATCH_RECORD *>(words + batch_offset);
     auto *sharing = reinterpret_cast<uint32_t *>(words + sharing_offset);
     *sharing = uint32_t(groups); batch->GroupEnd = uint32_t(groups); std::copy_n(grid, 3, batch->Grid);
-    for (uint64_t group = 0; group < groups; ++group) {
+    for (uint64_t group = 0; group < groups;) {
+      const uint32_t batch_groups = static_cast<uint32_t>(std::min<uint64_t>(groups - group, group_limit));
       for (uint32_t q = 0; q < graph.nodes.size(); ++q) {
         queues[q] = {dispatch.program.BackingMemory.StartAddress + uint64_t(level) * graph.level_bytes + graph.queue_offset[q],
                      0, graph.queue_capacity[q] - 1, graph.queue_stride[q], 0, 0};
@@ -992,7 +1015,7 @@ struct GraphExecution {
                                    node.info.Input.RecordSize, 0, 0};
       *context = {}; context->QueueTable = control_info.gpu_address + base;
       context->BatchTable = control_info.gpu_address + base + batch_offset;
-      context->InputQueue = graph.nodes.size(); context->BatchRecords = 1; context->BatchGroups = 1;
+      context->InputQueue = graph.nodes.size(); context->BatchRecords = 1; context->BatchGroups = batch_groups;
       context->GroupStart = group; context->RemainingRecursionLevels = remaining;
       context->OutputElementCount = node.targets.size();
       if (node.local_root && node.local_root->ParameterQwords) context->LocalRootArguments = dispatch.program.NodeLocalRootArgumentsTable.StartAddress +
@@ -1050,7 +1073,7 @@ struct GraphExecution {
           }
           hr = CollectAtomic64PhaseBindings(device, {}, payloads, bindings);
         }
-        if (SUCCEEDED(hr)) hr = PrepareAtomic64Phase(device, uint64_t(node.threads.width) * node.threads.height * node.threads.depth,
+        if (SUCCEEDED(hr)) hr = PrepareAtomic64Phase(device, uint64_t(node.threads.width) * node.threads.height * node.threads.depth * batch_groups,
                                                    bindings, atomic_phase);
         if (SUCCEEDED(hr)) hr = atomic_phase->EncodeImport(buffer, atomic_fence);
         if (SUCCEEDED(hr)) hr = atomic_phase->PublishContext(buffer, atomic_fence);
@@ -1066,7 +1089,7 @@ struct GraphExecution {
       Bind(encoder, dispatch.arguments, dispatch.roots, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
       Bind(encoder, dispatch.arguments, dispatch.samplers, SM50_BINDING_INDEX_STATIC_SAMPLERS);
       if (node.constants.buffer) Bind(encoder, node.constants.buffer, node.constants.offset, SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
-      wmtcmd_compute_dispatch launch{}; launch.type = WMTComputeCommandDispatch; launch.size = {1, 1, 1};
+      wmtcmd_compute_dispatch launch{}; launch.type = WMTComputeCommandDispatch; launch.size = {batch_groups, 1, 1};
       pipeline.next.set(&launch);
       encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&pipeline));
       if (node.atomic64_phase || texture_phase) encoder.updateFence(atomic_fence);
@@ -1084,6 +1107,8 @@ struct GraphExecution {
         if (FAILED(hr)) return hr;
       }
       if (!Complete(buffer)) return E_FAIL;
+      owned_graphics::Trace("work_graph_node_batch", ",\"node\":", index,
+          ",\"first_group\":", group, ",\"groups\":", batch_groups, ",\"terminal\":", unsigned(terminal));
       // Every suspended producer owns one level. Its siblings survive all descendant execution.
       // MaxRecords is a group-wide budget, including per-thread and node-array allocations.
       // A coalescing node may legally consume one record; no aggregation quota is required.
@@ -1091,14 +1116,13 @@ struct GraphExecution {
         const uint32_t count = queues[target].Tail;
         if (!count) continue;
         const auto &child = graph.nodes[target];
-        std::vector<uint8_t> record(child.info.Input.RecordSize);
         for (uint32_t r = 0; r < count; ++r) {
           const uint64_t address = queues[target].Records + uint64_t(r) * queues[target].Stride;
-          HRESULT hr = Read(address, record.data(), record.size()); if (FAILED(hr)) return hr;
-          hr = RunNode(target, address, record.data(), level + 1, target == index ? remaining - 1 : child.info.MaxRecursionDepth);
+          HRESULT hr = RunNode(target, address, nullptr, level + 1, target == index ? remaining - 1 : child.info.MaxRecursionDepth);
           if (FAILED(hr)) return hr;
         }
       }
+      group += batch_groups;
     }
     for (auto shared : graph.sharing_nodes[index]) {
       HRESULT hr = RunNode(shared, input_address, input, level, 0); if (FAILED(hr)) return hr;
@@ -1108,19 +1132,19 @@ struct GraphExecution {
   HRESULT RunInput(uint32_t entry, uint32_t count, uint64_t address, uint64_t stride, const uint8_t *cpu) {
     if (entry >= graph.entries.size()) return E_INVALIDARG;
     const uint32_t index = graph.entries[entry]; const auto &node = graph.nodes[index];
-    std::vector<uint8_t> record(node.info.Input.RecordSize);
-    WMTBufferInfo seed_info{}; seed_info.length = std::max<uint64_t>(4096, (record.size() + 4095) & ~uint64_t(4095));
+    const uint64_t record_size = node.info.Input.RecordSize;
+    WMTBufferInfo seed_info{}; seed_info.length = std::max<uint64_t>(4096, (record_size + 4095) & ~uint64_t(4095));
     seed_info.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE; auto seed = device->GetMTLDevice().newBuffer(seed_info);
     if (!seed) return E_OUTOFMEMORY;
     seed_resource = seed;
     seed_address = seed_info.gpu_address;
     for (uint32_t i = 0; i < count; ++i) {
       uint64_t input = address + uint64_t(i) * stride;
-      if (cpu) { if (!record.empty()) std::memcpy(seed_info.memory.get_accessible_or_null(), cpu + uint64_t(i) * stride, record.size());
+      if (cpu) { if (record_size) std::memcpy(seed_info.memory.get_accessible_or_null(), cpu + uint64_t(i) * stride, record_size);
         input = seed_info.gpu_address;
-        if (!record.empty()) std::memcpy(record.data(), seed_info.memory.get_accessible_or_null(), record.size());
-      } else { HRESULT hr = Read(input, record.data(), record.size()); if (FAILED(hr)) return hr; }
-      HRESULT hr = RunNode(index, input, record.data(), 0, node.info.MaxRecursionDepth); if (FAILED(hr)) return hr;
+      }
+      HRESULT hr = RunNode(index, input, cpu ? cpu + uint64_t(i) * stride : nullptr, 0, node.info.MaxRecursionDepth);
+      if (FAILED(hr)) return hr;
     }
     return S_OK;
   }

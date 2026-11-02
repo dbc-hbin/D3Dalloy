@@ -1,6 +1,7 @@
 #include "d3d12_pipeline_library.hpp"
 #include "d3d12_device_child.hpp"
 #include "d3d12_pipeline_cache.hpp"
+#include "../d3d10/d3d10_blob.hpp"
 #include "DXBCParser/PipelineLibrary.h"
 #include "DXBCParser/PsoStream.h"
 #include "com/com_pointer.hpp"
@@ -507,16 +508,22 @@ Sha1Digest LibraryDigest(const uint8_t *bytes, size_t size) {
 }
 
 /*
- * Named PSO payloads. Every entry owns a copy of its bytes, so the application
+ * Named PSO payloads. Entries retain an immutable owner of their bytes, so the application
  * may release the blob it created the library from (D3D12 requires it to keep
  * the blob alive; copying makes that requirement unnecessary here). An entry
  * also keeps the PSO it produced, so later loads return that same object.
  */
 class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary1> {
+  struct BlobSlice {
+    Com<ID3DBlob> owner;
+    size_t offset = 0, length = 0;
+    const uint8_t *data() const { return static_cast<const uint8_t *>(owner->GetBufferPointer()) + offset; }
+    size_t size() const { return length; }
+  };
   struct Entry {
     PipelineKind kind;
     Sha1Digest key;
-    std::vector<uint8_t> blob;
+    BlobSlice blob;
     std::mutex create_mutex;
     Com<ID3D12PipelineState> pipeline;
   };
@@ -529,7 +536,7 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
   // Serialized size and entry count of order_, checked by Rust on every insert.
   D3DalloyPipelineLibraryExtent extent_{D3DALLOY_PIPELINE_LIBRARY_HEADER_SIZE, 0};
 
-  HRESULT Insert(std::wstring name, PipelineKind kind, const Sha1Digest &key, const uint8_t *blob, size_t size,
+  HRESULT Insert(std::wstring name, PipelineKind kind, const Sha1Digest &key, ID3DBlob *owner, size_t offset, size_t size,
                  ID3D12PipelineState *pipeline) {
     if (entries_.count(name))
       return E_INVALIDARG;
@@ -543,14 +550,13 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
       return E_INVALIDARG;
     }
     // Allocate before publishing, so extent_, order_ and entries_ stay consistent on bad_alloc.
-    std::vector<uint8_t> copy(blob, blob + size);
     if (order_.size() == order_.capacity())
       order_.reserve(std::max<size_t>(1, order_.size() * 2));
     auto [it, inserted] = entries_.try_emplace(std::move(name));
     auto &entry = it->second;
     entry.kind = kind;
     entry.key = key;
-    entry.blob = std::move(copy);
+    entry.blob.owner = owner; entry.blob.offset = offset; entry.blob.length = size;
     entry.pipeline = pipeline;
     order_.push_back(&it->first);
     extent_ = extent;
@@ -635,6 +641,12 @@ public:
       return E_INVALIDARG;
     uint64_t offset = D3DALLOY_PIPELINE_LIBRARY_HEADER_SIZE;
     try {
+      // One private snapshot for all deserialized slices. It is not exposed as
+      // an application ID3DBlob and remains alive through every named entry.
+      Com<ID3DBlob> snapshot;
+      if (HRESULT hr = CreateBlobFromMalloc(size, &snapshot); FAILED(hr)) return hr;
+      std::memcpy(snapshot->GetBufferPointer(), bytes, size);
+      bytes = static_cast<const uint8_t *>(snapshot->GetBufferPointer());
       for (uint32_t i = 0; i < header.count; ++i) {
         D3DalloyPipelineLibraryEntry record;
         if (d3dalloy_pipeline_library_entry(bytes, size, offset, &record) != D3DALLOY_PIPELINE_LIBRARY_SUCCESS)
@@ -649,7 +661,8 @@ public:
         if (blob_key != key)
           return E_INVALIDARG;
         offset = record.next_offset;
-        if (HRESULT hr = Insert(std::move(name), PipelineKind(record.kind), key, blob, record.blob_size, nullptr);
+        if (HRESULT hr = Insert(std::move(name), PipelineKind(record.kind), key, snapshot.ptr(),
+                                record.blob_offset, record.blob_size, nullptr);
             FAILED(hr))
           return hr == E_OUTOFMEMORY ? hr : E_INVALIDARG;
       }
@@ -683,7 +696,7 @@ public:
         owner.ptr() != static_cast<ID3D12Device *>(device_))
       return E_INVALIDARG;
     Com<ID3DBlob> blob;
-    if (HRESULT hr = pipeline->GetCachedBlob(&blob); FAILED(hr))
+    if (HRESULT hr = static_cast<MTLD3D12PipelineState *>(pipeline)->GetPrivateCachedBlob(&blob); FAILED(hr))
       return hr;
     const auto *bytes = static_cast<const uint8_t *>(blob->GetBufferPointer());
     Sha1Digest key;
@@ -693,7 +706,7 @@ public:
                                                                                               : KindGraphics;
     try {
       std::unique_lock lock(mutex_);
-      return Insert(name, kind, key, bytes, blob->GetBufferSize(), pipeline);
+      return Insert(name, kind, key, blob.ptr(), 0, blob->GetBufferSize(), pipeline);
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
     }

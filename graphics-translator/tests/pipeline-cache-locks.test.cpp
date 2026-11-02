@@ -499,10 +499,22 @@ void testPipelineBlobCodec() {
                 !std::memcmp(encoded->GetBufferPointer(), golden.data(), golden.size()) && codec_owner_reads == 7,
             "cold encoding matches independent wire bytes using seven owner-aware reads");
     require(cold.GetBlob(nullptr) == E_POINTER, "GetBlob null output");
+    Com<ID3DBlob> private_first, private_again;
+    require(cold.GetPrivateBlob(&private_first) == S_OK && cold.GetPrivateBlob(&private_again) == S_OK &&
+                private_first.ptr() == private_again.ptr() && private_first.ptr() != encoded.ptr() &&
+                codec_owner_reads == 7, "private serialization is shared without repeating owner reads");
+    static_cast<uint8_t *>(encoded->GetBufferPointer())[216] ^= 1;
     codec_copy_failure = true;
+    Com<ID3DBlob> warm;
+    require(cold.GetBlob(&warm) == S_OK && !std::memcmp(warm->GetBufferPointer(), golden.data(), golden.size()) &&
+                codec_owner_reads == 7, "public writable copy cannot mutate shared payload; warm export needs no compiler reads");
+    PipelineCache failing;
+    require(failing.Initialize({}, key(92), 7, 7) == S_OK, "fresh failed serialization");
+    for (unsigned i = 0; i < 3; ++i) *failing.output(PipelineCache::Stage(i)) = &sources[i];
     Com<ID3DBlob> failed;
-    require(cold.GetBlob(&failed) == E_FAIL && !failed, "owner read failure releases partial blob");
+    require(failing.GetBlob(&failed) == E_FAIL && !failed, "owner read failure releases partial blob");
     codec_copy_failure = false;
+    require(failing.GetPrivateBlob(&failed) == S_OK, "failed snapshot is retryable");
   }
   codec_source_views = nullptr;
 
@@ -726,9 +738,34 @@ void testCompiledArtifactKinds() {
           "raytracing artifact owns reflection");
   std::puts("PIPELINE_COMPILED_ARTIFACT_KINDS_PASS workgraph=1 raytracing=1 reflection=1");
 }
+void testWeakNativeFlights() {
+  using namespace d3dalloy;
+  struct Native {
+    bool ready=false;
+    size_t size() const{return 0;}
+    bool retained() const{return ready;}
+  };
+  ArtifactCache<Native,true> cache;
+  unsigned operations=0;
+  auto create=[&]{++operations;auto value=std::make_shared<Native>();value->ready=true;return value;};
+  auto first=cache.Get("rt", "native_rt_executable", create);
+  auto same=cache.Get("rt", "native_rt_executable", create);
+  require(first==same && operations==1,"native executable same-live identity");
+  controls(4);
+  auto fresh=cache.Get("rt", "native_rt_executable", create);
+  require(fresh!=first && first->ready && operations==2,"native clear retires membership not ownership");
+  first.reset();same.reset();fresh.reset();
+  auto expired=cache.Get("rt","native_rt_executable",create);
+  require(operations==3 && expired->ready,"expired weak native executable is recreated");
+  auto failed=cache.Get("partial","native_rt_executable",[&]{++operations;return std::make_shared<Native>();});
+  require(failed && !failed->ready,"partial native creation remains a failure");
+  auto retry=cache.Get("partial","native_rt_executable",create);
+  require(retry->ready && operations==5,"partial handles are not cached; next request retries");
+  std::puts("PIPELINE_NATIVE_WEAK_FLIGHT_PASS same_live=1 clear_ownership=1 expired_recreate=1 partial_failure_retry=1");
+}
 int main() {
   testPipelineBlobCodec();
-  testStageArtifactKeys(); testStageArtifactFlights(); testCompiledArtifactKinds();
+  testStageArtifactKeys(); testStageArtifactFlights(); testCompiledArtifactKinds(); testWeakNativeFlights();
   testBlockedDisk(); testDelayedWrite(); testDelayedReadAndInvalid(); testDelayedRetry(); testStrictAndBounds();
   std::puts("PIPELINE_CACHE_CPU_PASS");
 }

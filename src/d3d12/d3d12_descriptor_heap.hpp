@@ -237,6 +237,9 @@ public:
                                          uint64_t LayoutWord) = 0;
 
   virtual ShaderVisibleDescriptorCPUStorage const &GetDescriptor(UINT Index) = 0;
+  // Shader-visible view identity, which may be a pooled slot rather than an
+  // ordinary native texture view. The caller retains this heap while using it.
+  virtual uint64_t GetTextureResourceId(UINT Index) const = 0;
 
   virtual void CopyDescriptors(UINT From, MTLD3D12DescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) = 0;
 };

@@ -210,6 +210,16 @@ CreateConfiguredDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel
   if (!ppDevice)
     return S_FALSE;
 
+  // The Anti-Lag 2 SDK discovers the driver with GetModuleHandle, not
+  // LoadLibrary. Load our staged facade outside DllMain and retain it for the
+  // process lifetime, so SDK contexts remain valid after a device is released.
+  static const HRESULT anti_lag_module = []() -> HRESULT {
+    return LoadLibraryExW(L"amdxc64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)
+      ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+  }();
+  if (FAILED(anti_lag_module))
+    return anti_lag_module;
+
   try {
     return d3dalloy::CreateD3D12Device(dxgi_adapter_mtl.ptr(), riid, ppDevice, configuration, independent);
   } catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }

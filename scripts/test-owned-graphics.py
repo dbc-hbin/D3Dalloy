@@ -35,6 +35,7 @@ SUITE_PREFIXES = {
     "fsr-fg": "OWNED_D3D12_FSR_FG",
     "fsr-rr": "OWNED_D3D12_FSR_RR",
     "nvapi-reflex": "OWNED_NVAPI_REFLEX",
+    "low-latency": "OWNED_D3D12_LOW_LATENCY",
     "queue-priority": "OWNED_QUEUE_PRIORITY",
     "corewindow-composition": "OWNED_D3D12_COREWINDOW_COMPOSITION",
     "composition": "OWNED_D3D12_COMPOSITION",
@@ -118,6 +119,10 @@ SUITE_PREFIXES = {
     "tessellation": "OWNED_D3D12_TESSELLATION",
     # SM: Shader Model 6.x DXIL features against CPU oracles.
     "sm6": "OWNED_D3D12_SM6",
+    "wide-waves": "OWNED_D3D12_WIDE_WAVES",
+    "workgraph-batches": "OWNED_D3D12_WG_BATCH",
+    "submission-foundation": "OWNED_D3D12_SUBMISSION_FOUNDATION",
+    "rt-executable-cache": "OWNED_D3D12_RT_EXECUTABLE",
     "waves": "OWNED_D3D12_WAVES",
     "fp64": "OWNED_D3D12_FP64",
     "vectors": "OWNED_D3D12_VECTORS",
@@ -167,6 +172,7 @@ BACKEND_PREFIXES = {
     "relaxed-casting-volume": "RELAXED_CASTING",
     "relaxed-casting-volume-standard": "RELAXED_CASTING",
     "waves": "OWNED_D3D12_SM6",
+    "wide-waves": "OWNED_D3D12_SM6",
     "fp64": "OWNED_D3D12_SM6",
     "arena-heap-arena": "OWNED_D3D12_ARENA_HEAP",
     "arena-heap-mapping": "OWNED_D3D12_ARENA_HEAP",
@@ -238,7 +244,7 @@ PARTIAL_3D_UAV_SHADERS = ("partial-3d-uav.dxil",)
 # SM: frozen DXIL read by name (sm6-<entry>.dxil) beside the executable; the HLSL and
 # its build script are frozen with them so the evidence names the exact sources.
 SM6_SOURCES = ("sm6.hlsl", "sm6-16bit.hlsl", "sm6-heap.hlsl", "sm6-reject.hlsl", "sm6-denorm.hlsl",
-               "fp64.hlsl", "fp64-legacy.hlsl", "build-sm6.sh", "build-fp64-legacy.sh")
+               "fp64.hlsl", "fp64-legacy.hlsl", "build-sm6.sh", "build-fp64-legacy.sh", "wide-wave-exact.hlsl")
 FP64_ENTRIES = ("cs_fp64", "cs_fp64_ftz", "cs_fp64_wave", "vs_fp64", "ps_fp64")
 FP64_LEGACY_INPUTS = tuple(f"sm6-{stage}_fp64_legacy{version}.dxbc"
                           for version in (50, 51) for stage in ("cs", "vs", "ps"))
@@ -265,6 +271,7 @@ WRITABLE_MSAA_CASES = tuple(
     "partial_array_helper_other_slice_clear", "unused_descriptor_helper_order",
 )
 SM6_ENTRIES = (
+    "cs_wide_exact64", "cs_wide_exact128", "cs_wide_exact64_short", "cs_wide_exact128_short",
     "cs_wave4", "cs_wave8", "cs_wave16", "cs_divergent4", "cs_divergent8", "cs_divergent16",
     "cs_int64wave4", "cs_int64wave8", "cs_int64wave16",
     "cs_wave_range4", "cs_wave_range8", "cs_wave_range16", "cs_wave_range32", "cs_wave_range64",
@@ -284,6 +291,7 @@ SM6_CASES = (
     "int64", "int64wave4", "int64wave8", "int64wave16",
     "atomic64_ops", "atomic64_heap", "16bit", "minprec", "packed", "quad_deriv",
     "calculate_lod", "calculate_lod_shapes",
+    "cs_wide_exact64", "cs_wide_exact128", "cs_wide_exact64_short", "cs_wide_exact128_short",
     "cs_wavesize64", "cs_wavesize128", "cs_wavesize_range64only", "cs_wavesize64_partial", "cs_wavesize128_partial",
     "rejections", "groupshared64", "sm69_input", "wavesize32", "barycentrics", "barycentrics_indexed", "helper_lanes", "helper_lanes_included",
     "16bit_io", "graphics_int64", "vs_wave", "sv_viewid", "sv_viewid_instanced",
@@ -293,6 +301,10 @@ SM6_CASES = (
 )
 SM6_REJECTS = ["cs_wavesize64_divergent", "cs_wavesize128_divergent", "cs_wavesize64_return"]
 SM6_STRESS_REPS = 20
+WIDE_WAVE_CASES = ("wave", "cs_wide_exact64", "cs_wide_exact128", "cs_wide_exact64_short", "cs_wide_exact128_short",
+    "cs_wavesize64", "cs_wavesize128", "cs_wavesize_range64only", "cs_wavesize64_partial",
+    "cs_wavesize128_partial", "wide_wave_requirements")
+WIDE_WAVE_ENTRIES = ("cs_wave", *WIDE_WAVE_CASES[1:-1], *SM6_REJECTS, "cs_wavesize32")
 WAVE_ENTRIES = tuple(entry for entry in SM6_ENTRIES
                      if entry.startswith(("cs_wave", "cs_divergent", "cs_int64"))
                      or entry in ("cs_quad_deriv", "vs_tiny", "ps_helper", "ps_helper_all", "vs_wave", "ps_null"))
@@ -415,7 +427,7 @@ INDEXED_RESTART_INPUTS = ("indexed-restart.hlsl", "indexed-restart-procedural-vs
                           "indexed-restart-attribute-vs.dxil", "indexed-restart-ps.dxil")
 # GSTS: the fixtures compile DXBC from the HLSL and load geometry-/tessellation-<entry>.dxil by name.
 GEOMETRY_INPUTS = ("geometry.hlsl",)
-TESSELLATION_INPUTS = ("tessellation.hlsl",)
+TESSELLATION_INPUTS = ("tessellation.hlsl", "tessellation-half.hlsl")
 PIPELINE_STATISTICS_SHADERS = ("pipeline-statistics-vs.dxil", "pipeline-statistics-ps.dxil",
                                "pipeline-statistics-cs.dxil")
 # FL: frozen by dxil/build-feature-level.sh; the fixture reads feature-level-<entry>.dxil by name.
@@ -1550,6 +1562,21 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
                 if len(words) != 2 or not re.fullmatch("live_allocations=[0-9]+", words[1]):
                     failures.append("malformed native residency metadata: " + line)
                 continue
+            if kind == "RENDER_ATTACHMENT":
+                # Render-pass attachment metadata accompanies, but cannot replace,
+                # the actual draw/dispatch/ICB commands counted below.
+                try:
+                    metadata = dict(word.split("=", 1) for word in words[1:])
+                    if len(words) != 7 or set(metadata) != {"encoder", "aspect", "slot", "texture", "load", "store"} or any(
+                            not re.fullmatch("[0-9]+", value) for value in metadata.values()):
+                        raise ValueError("attachment fields")
+                    metadata = {key: int(value) for key, value in metadata.items()}
+                    if not metadata["encoder"] or not metadata["texture"] or metadata["aspect"] not in (1, 2, 4) or (
+                            metadata["slot"] >= 8 if metadata["aspect"] == 4 else metadata["slot"] != 0):
+                        raise ValueError("attachment identity")
+                except ValueError:
+                    failures.append("malformed native attachment metadata: " + line)
+                continue
             try:
                 values = dict(word.split("=", 1) for word in words[1:])
                 if kind not in schemas or set(values) != schemas[kind] or len(values) != len(words) - 1:
@@ -2303,7 +2330,8 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
                 continue
             if isinstance(event, dict) and active in captured and event.get("event") in ("pipeline_artifact_operation", "pipeline_artifact_hit") and event.get("kind") in ("air_compile", "new_library"):
                 key = event.get("key")
-                if not isinstance(key, str) or re.fullmatch(r"[0-9a-f]{40}", key) is None or event.get("cache") != {"air_compile": 1, "new_library": 2}[event["kind"]]:
+                if (not isinstance(key, str) or re.fullmatch(r"[0-9a-f]{40}", key) is None
+                        or type(event.get("cache")) is not int or event["cache"] <= 0):
                     failures.append("captured artifact identity/key/cache schema malformed")
                 else:
                     captured[active].append(event)
@@ -2316,7 +2344,12 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
         failures.append("artifact operation phase matrix incomplete or reordered")
     if suite == "pipeline-library":
         cold, warm = captured["captured_layout_cold"], captured["captured_layout_hit"]
+        cache_ids = {}
         for kind in ("air_compile", "new_library"):
+            identities = {event["cache"] for event in cold + warm if event["kind"] == kind}
+            if len(identities) != 1:
+                failures.append("captured cold/warm must use the same cache identity: " + kind)
+            cache_ids[kind] = identities
             compiled = [event["key"] for event in cold if event["kind"] == kind and event["event"] == "pipeline_artifact_operation"]
             accessed = {event["key"] for event in cold if event["kind"] == kind}
             hits = [event["key"] for event in warm if event["kind"] == kind and event["event"] == "pipeline_artifact_hit"]
@@ -2324,6 +2357,8 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
                 failures.append("captured cold requires six distinct once-only artifacts: " + kind)
             if set(hits) != accessed or len(hits) != len(accessed):
                 failures.append("captured warm must hit exactly the cold accessed keys once: " + kind)
+        if cache_ids["air_compile"] & cache_ids["new_library"]:
+            failures.append("captured AIR and library caches must have distinct identities")
     return failures
 
 
@@ -2550,9 +2585,13 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
                     if len(work) != 1 or any(type(e.get(key)) is not int or e[key] < 0 for e in work for key in work_fields):
                         failures.append(f"graph {phase}: missing, duplicated or invalid planning work")
                     elif name in ("graph-frontier-256", "graph-frontier-512"):
-                        expected_work = (8064 if name.endswith("256") else 16128, 0, 0, 0, 0)
+                        # Disjoint domains visit no prior interval. This is not
+                        # the old all-pairs scan inside each 64-node partition.
+                        expected_work = (0, 0, 0, 0, 0)
                         if tuple(work[0][key] for key in work_fields) != expected_work:
                             failures.append(f"graph {phase}: bounded frontier work differs")
+                        if any(event["event"] == "submission_access_opaque" for event in planning):
+                            failures.append(f"graph {phase}: disjoint frontier degraded to opaque accesses")
                         frontier_work[phase] = work[0]["history_checks"]
                     merged = [(e.get("before_list"), e.get("after_list"), e.get("members")) for e in planning if e["event"] == "submission_render_merged"]
                     clear_loads = [(e.get("clear_node"), e.get("render_node"), e.get("aspect")) for e in planning if e["event"] == "submission_clear_load"]
@@ -2577,7 +2616,7 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
             if not isinstance(kind, str):
                 failures.append("non-string graph operation event")
                 continue
-            if active[0].startswith("graph-frontier-") and kind in ("submission_plan_work", "submission_render_merged", "submission_clear_load"):
+            if active[0].startswith("graph-frontier-") and kind in ("submission_plan_work", "submission_render_merged", "submission_clear_load", "submission_access_opaque"):
                 planning.append(event)
                 continue
             if kind == "native_render_attachment":
@@ -3360,6 +3399,75 @@ def diagnostics_failures(stdout: str, stderr: str) -> list[str]:
     return failures
 
 
+def low_latency_failures(stdout: str, stderr: str, mode: str, frames: int, *,
+                         performance: bool = False) -> list[str]:
+    """Require complete measured frames without imposing a latency improvement ratio."""
+    prefix = SUITE_PREFIXES["low-latency"]
+    failures: list[str] = []
+    summary = (f"{prefix}_PASS mode={mode} frames={frames} verified={frames} width=640 height=360 "
+               f"draws=64 slots=8 amd_enable={int(mode == 'antilag2')} reflex_enable=0")
+    if stdout.splitlines().count(summary) != 1:
+        failures.append("low latency mode/frame/readback summary missing or duplicated")
+    clocks = re.findall(rf"^{prefix}_CLOCK cpu_frequency=(\d+) gpu_supported=([01]) "
+                        r"gpu_frequency=(\d+) gpu_status=0x([0-9a-f]{8})$", stdout, re.MULTILINE)
+    if len(clocks) != 1:
+        return failures + ["low latency clock metadata missing or duplicated"]
+    cpu_frequency, supported, gpu_frequency, status = clocks[0]
+    if (int(cpu_frequency) <= 0 or (supported == "1" and (int(gpu_frequency) <= 0 or int(status, 16) != 0))
+            or (supported == "0" and (int(gpu_frequency) != 0 or status not in ("80004001", "887a0004")))):
+        failures.append("low latency clock support/status invalid")
+    rows = re.findall(rf"^{prefix}_FRAME frame=(\d+) input_begin=(\d+) input_end=(\d+) "
+                      r"submit_begin=(\d+) submit_end=(\d+) present_begin=(\d+) present_end=(\d+) "
+                      r"gpu_begin=(\d+) gpu_end=(\d+) pixels=230400 readback=exact$", stdout, re.MULTILINE)
+    if [int(row[0]) for row in rows] != list(range(frames)):
+        failures.append("low latency measured frame sequence/readback incomplete")
+    previous_cpu, previous_gpu = 0, 0
+    for row in rows:
+        values = [int(value) for value in row]
+        cpu = values[1:7]
+        gpu_begin, gpu_end = values[7:9]
+        if cpu[0] <= 0 or cpu != sorted(cpu) or cpu[0] < previous_cpu:
+            failures.append(f"low latency CPU timestamps unordered at frame {values[0]}")
+        if ((supported == "1" and (gpu_begin <= 0 or gpu_end < gpu_begin
+                                   or gpu_begin < previous_gpu or gpu_end == 2**64 - 1))
+                or (supported == "0" and (gpu_begin or gpu_end))):
+            failures.append(f"low latency GPU timestamps invalid at frame {values[0]}")
+        previous_cpu, previous_gpu = cpu[-1], gpu_end
+    amd = re.findall(rf"^{prefix}_AMD contracts=init,options,identity,lifetime,version,errors,input,fg,end-render "
+                     r"backend=d3dalloy-owned-antilag2$", stdout, re.MULTILINE)
+    if len(amd) != int(mode == "antilag2"):
+        failures.append("low latency AMD public contract evidence disagrees with mode")
+    if mode == "antilag2" and not any("amdxc64.dll" in line.lower() and "builtin" in line.lower()
+                                    for line in stderr.splitlines() if "Loaded" in line):
+        failures.append("low latency AMD builtin module load missing")
+    if f"{prefix}_FAIL" in stdout + stderr:
+        failures.append("low latency fixture failure")
+    if performance:
+        if "OWNED_GRAPHICS_TRACE " in stderr:
+            failures.append("low latency performance run emitted owned tracing")
+        return failures
+    events, trace_failures = phase3_trace(stderr, 1000000)
+    failures.extend(trace_failures)
+    latency_events = [event for event in events if event["event"].startswith("low_latency_")]
+    fields = ("scheduler", "frame", "source", "now_ns", "target_ns", "pending_frames", "capacity")
+    for event in latency_events:
+        if (any(type(event.get(field)) is not int or event[field] < 0 for field in fields)
+                or event.get("scheduler", 0) == 0 or event.get("now_ns", 0) == 0
+                or event.get("source") not in (0, 1, 2) or event.get("capacity") not in (0, 1)):
+            failures.append("low latency scheduler trace fields invalid")
+    admitted = [event for event in latency_events if event["event"] == "low_latency_admit"]
+    expected_admissions = 0 if mode == "off" else frames
+    if len(admitted) != expected_admissions:
+        failures.append("low latency scheduler admission count disagrees with workload")
+    source = 2 if mode == "antilag2" else 0
+    if any(event.get("source") != source for event in admitted):
+        failures.append("low latency scheduler ownership duplicated or incorrect")
+    tokens = [(event.get("scheduler"), event.get("frame")) for event in admitted]
+    if len(set(tokens)) != len(tokens):
+        failures.append("low latency scheduler frame admitted twice")
+    return failures
+
+
 def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
     """Inputs a suite reads beside its own executable, frozen before launch."""
     if suite in ("ngx-fg-present", "ngx-alpha", "ngx-fg"):
@@ -3396,6 +3504,8 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
         return inputs
     if suite == "nvapi-reflex":
         return [REPOSITORY_ROOT / "graphics-translator/tests/owned-nvapi-reflex.cpp"]
+    if suite == "low-latency":
+        return [REPOSITORY_ROOT / "graphics-translator/tests/owned-d3d12-low-latency.cpp"]
     if suite == "queue-priority":
         return [REPOSITORY_ROOT / "graphics-translator/tests/owned-d3d12-queue-priority.cpp",
                 REPOSITORY_ROOT / "src/d3d12/d3d12_interfaces_ext.hpp"]
@@ -3486,6 +3596,9 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
     if suite == "sm6":
         return ([dxil_dir / f"sm6-{entry}.dxil" for entry in SM6_ENTRIES]
                 + [dxil_dir / name for name in SM6_SOURCES + FP64_LEGACY_INPUTS])
+    if suite == "wide-waves":
+        return ([dxil_dir / f"sm6-{entry}.dxil" for entry in WIDE_WAVE_ENTRIES]
+                + [dxil_dir / name for name in SM6_SOURCES])
     if suite == "fp64":
         return ([dxil_dir / f"sm6-{entry}.dxil" for entry in FP64_ENTRIES]
                 + [dxil_dir / name for name in FP64_SOURCES + FP64_LEGACY_INPUTS])
@@ -3557,6 +3670,20 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
                                            "work-graphs-nodes.dxil", "work-graphs-sharing.dxil", "work-graphs-link-nodes.dxil", "work-graphs-link-helpers.dxil", "work-graphs-root-subobjects.dxil")] + [
                                                REPOSITORY_ROOT / "graphics-translator/tests/owned-d3d12-work-graphs.cpp",
                                                dxil_dir / "preview-d3d12.h"]
+    if suite == "workgraph-batches":
+        source = REPOSITORY_ROOT / "graphics-translator/tests"
+        return [dxil_dir / "workgraph-batches.dxil", dxil_dir / "workgraph-batches.hlsl",
+            dxil_dir / "preview-d3d12.h", source / "owned-d3d12-workgraph-batches.cpp",
+            source / "owned-d3d12-atomic64-workgraph-typed.cpp"]
+    if suite == "submission-foundation":
+        source = REPOSITORY_ROOT / "graphics-translator/tests"
+        return [source / "owned-d3d12-submission-foundation.cpp", source / "owned-d3d12-render-passes.cpp"]
+    if suite == "rt-executable-cache":
+        source = REPOSITORY_ROOT / "graphics-translator/tests"
+        return [dxil_dir / name for name in ("raytracing-contract.dxil","raytracing-stateobj.dxil",
+                "raytracing-contract.hlsl","raytracing-stateobj.hlsl")] + [
+            source / "owned-d3d12-rt-executable-cache.cpp",source / "owned-d3d12-raytracing.cpp",
+            *sorted(source.glob("owned-d3d12-raytracing-*.inc"))]
     if suite == "workgraphs-atomic64":
         return [dxil_dir / name for name in ("atomic64-workgraph-records.dxil", "atomic64-workgraph-records.hlsl", "build-sm6.sh")] + [
             REPOSITORY_ROOT / "graphics-translator/tests/owned-d3d12-atomic64-workgraph.cpp",
@@ -3878,6 +4005,89 @@ def matrix_shaders_output_matches(stdout: str, stderr: str, native_compiler_proo
                and "OWNED_D3D12_MATRICES_FAIL" not in stdout + stderr
                and "kIOGPUCommandBufferCallbackError" not in stderr)
     return success, dxil_compiler_loaded
+
+
+def wide_waves_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
+    # Focused suite for the existing --wide-waves-only fixture mode; not a pass
+    # for unrelated SM6/FP64 coverage. Every new partial i64/i16 case is required.
+    cases = re.findall(r"^OWNED_D3D12_SM6_CASE_PASS ([\w.-]+)$", stdout, re.MULTILINE)
+    rejects = re.findall(r"^OWNED_D3D12_WAVES_REJECT entry=(\w+) hr=0x80004005$", stdout, re.MULTILINE)
+    accepted = (success and native_compiler_proof and tuple(cases) == WIDE_WAVE_CASES and rejects == SM6_REJECTS
+        and re.search(r"^OWNED_D3D12_SM6_CAPS .* wave=1 lanes=4-32 ",stdout,re.MULTILINE)
+        and stdout.count("OWNED_D3D12_WIDE_WAVES_PASS") == 1
+        and not any(marker in stdout+stderr for marker in
+            ("OWNED_D3D12_SM6_MISMATCH","OWNED_D3D12_SM6_CASE_FAIL","OWNED_D3D12_SM6_FAIL","kIOGPUCommandBufferCallbackError")))
+    return bool(accepted), native_compiler_proof
+
+
+def rt_executable_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> bool:
+    names=("concurrent-cold","warm","local-root-variant","clear-live")
+    cases=re.findall(r"^OWNED_D3D12_RT_EXECUTABLE_CASE case=([\w-]+) objects=(\d+) gpu_dispatches=(\d+) .+$",stdout,re.MULTILINE)
+    captures={name:[] for name in names};active=None;phases=[]
+    for line in stderr.splitlines():
+        match=re.fullmatch(r"OWNED_D3D12_RT_EXECUTABLE_PHASE (begin|end)=([\w-]+)",line)
+        if match:
+            action,name=match.groups()
+            if name not in captures:return False
+            if action=="begin":
+                if active is not None:return False
+                active=name;phases.append(name)
+            else:
+                if active!=name:return False
+                active=None
+        elif active and "OWNED_GRAPHICS_TRACE " in line:
+            try:event=json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1])
+            except (ValueError,TypeError):return False
+            if event.get("kind")=="native_rt_executable":captures[active].append(event)
+    trace,failures=phase3_trace(stderr)
+    expected_counts={"concurrent-cold":1,"warm":0,"local-root-variant":1,"clear-live":1}
+    keys={}
+    for name,count in expected_counts.items():
+        operations=[event for event in captures[name] if event.get("event")=="pipeline_artifact_operation"]
+        if len(operations)!=count:return False
+        if operations:keys[name]=operations[0].get("key")
+    warm_hits=[event for event in captures["warm"] if event.get("event")=="pipeline_artifact_hit"]
+    return bool(success and native_compiler_proof and not failures and active is None and phases==list(names) and
+        cases==[("concurrent-cold","4","4"),("warm","1","1"),("local-root-variant","2","2"),("clear-live","1","3")] and
+        len(warm_hits)==1 and warm_hits[0].get("key")==keys.get("concurrent-cold") and
+        keys.get("concurrent-cold")!=keys.get("local-root-variant") and
+        stdout.count("OWNED_D3D12_RT_EXECUTABLE_PASS cases=4 gpu_dispatches=10 mutable_tables_and_localroots=isolated")==1 and
+        not any(marker in stdout+stderr for marker in ("OWNED_D3D12_RT_EXECUTABLE_FAIL","OWNED_D3D12_RAYTRACING_CASE_MISMATCH","OWNED_D3D12_RAYTRACING_FAIL")))
+
+
+def submission_foundation_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> bool:
+    cases = re.findall(r"^OWNED_D3D12_SUBMISSION_FOUNDATION_CASE_PASS case=(\w+) .+$",stdout,re.MULTILINE)
+    trace, failures = phase3_trace(stderr)
+    def events(kind): return [event for event in trace if event.get("event") == kind]
+    sealed = events("recording_plan_sealed")
+    reuse = events("indirect_buffer_reuse")
+    sparse = events("sparse_publication_elided")
+    clears = events("submission_heap_clear_in_place")
+    batches = events("query_fanout_batch")
+    return bool(success and native_compiler_proof and not failures and
+        cases == ["volatile_replay","retired_icb_reuse","placed_alias_clears","query_fanout","sparse_mapping_positive","cpu_strip_transfer"] and
+        stdout.count("OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=6") == 1 and
+        sealed and all(event.get("descriptor_values_captured") == 0 for event in sealed) and
+        len(reuse) >= 2 and all(event.get("capacity",0) >= event.get("count",1) for event in reuse) and
+        len(sparse) >= 4 and all(event.get("proof") == "no_sparse_heap_or_opaque_access" for event in sparse) and
+        len(clears) == 2 and batches and all(event.get("native_encoders") == 1 and event.get("targets",0) > 0 for event in batches) and
+        any(event["targets"] > 1 for event in batches) and
+        any(event.get("reason") == "sparse_alias" for event in events("submission_access_opaque")) and
+        any(event.get("allocations",0) > 1 and event.get("commits") == 1 for event in events("residency_add_batch")) and
+        "_FAIL" not in stdout and "OWNED_D3D12_RENDER_PASSES_FAIL" not in stderr)
+
+
+def workgraph_batches_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> bool:
+    cases = re.findall(r"^OWNED_D3D12_WG_BATCH_CASE atomic=([01]) gpu_input=([01]) groups=(\d+) count=(\d+) guard=ok coordinates_or_returns=exact$",stdout,re.MULTILINE)
+    trace, trace_failures = phase3_trace(stderr)
+    events = [event for event in trace if event.get("event") == "work_graph_node_batch"]
+    batches = [(e.get("first_group"),e.get("groups"),e.get("terminal")) for e in events]
+    expected = [(0,65535,1),(65535,514,1)]*2 + [(0,32,1),(32,32,1),(64,1,1)]*2
+    return bool(success and native_compiler_proof and not trace_failures and batches == expected and
+        cases == [("0","0","66049","66049"),("0","1","66049","66049"),
+                  ("1","0","65","65"),("1","1","65","65")] and
+        stdout.count("OWNED_D3D12_WG_BATCH_PASS cases=4") == 1 and
+        "FAIL" not in stdout and "OWNED_D3D12_ATOMIC64_WG_TYPED_FAIL" not in stderr)
 
 
 def waves_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> tuple[bool, bool]:
@@ -4435,6 +4645,9 @@ def geometry_output_matches(args: argparse.Namespace, stdout: str, stderr: str, 
     mutation_kinds = ["gs", "stripcut", "adjacency"] if args.suite == "geometry" else ["ts", "tsgs"]
     mutation_cases = [f"indirect-mutation-{kind}{suffix}" for kind in mutation_kinds for suffix in ("", "-so")]
     if args.suite == "tessellation":
+        success = success and (stdout.count(
+            f"{prefix}_HALF_TRANSPORT_PASS cases=24 values=288 independent=1 output_cp_read=1") == 1
+            if dxil_frozen else f"{prefix}_HALF_TRANSPORT_PASS" not in stdout)
         mutation_cases += ["indirect-mutation-ts-so-no-raster", "indirect-mutation-ts-so-overflow",
                            "indirect-mutation-ts-so-no-raster-overflow",
                            "ds-so-fractional-tri-order", "ds-so-fractional-quad-order",
@@ -4817,6 +5030,21 @@ def depth_casting_output_matches(stdout: str, stderr: str, native_compiler_proof
 
 
 def run(args: argparse.Namespace) -> int:
+    latency_mode = getattr(args, "low_latency_mode", "off")
+    latency_frames = getattr(args, "low_latency_frames", 120)
+    latency_performance = getattr(args, "low_latency_performance", False)
+    force_latency = getattr(args, "force_low_latency", False)
+    if latency_performance and args.suite != "low-latency":
+        raise ValueError("--low-latency-performance requires --suite low-latency")
+    if latency_mode not in ("off", "forced", "antilag2") or not 2 <= latency_frames <= 512:
+        raise ValueError("invalid low latency mode or frame count (2..512)")
+    if args.suite == "low-latency":
+        if args.mode != "present":
+            raise ValueError("--suite low-latency requires --mode present")
+        if (latency_mode == "forced" and not force_latency) or (latency_mode == "off" and force_latency):
+            raise ValueError("forced mode requires --force-low-latency; off mode forbids it")
+    elif latency_mode != "off" or latency_frames != 120:
+        raise ValueError("--low-latency-mode/--low-latency-frames require --suite low-latency")
     if getattr(args, "composition_visual_proof", False) and args.suite != "composition":
         raise ValueError("--composition-visual-proof requires --suite composition")
     runtime = args.runtime.resolve(strict=True)
@@ -4929,11 +5157,13 @@ def run(args: argparse.Namespace) -> int:
         "WINEDLLPATH": str(runtime / "lib/wine"),
         "WINEDEBUG": "+loaddll",
         "WINEDLLOVERRIDES": "winemenubuilder.exe=d",
-        "D3DALLOY_LOG_LEVEL": "info",
+        "D3DALLOY_LOG_LEVEL": "warn" if latency_performance else "info",
         "D3DALLOY_LOG_PATH": str(out),
         "D3DALLOY_SHADER_CACHE_PATH": str(out / "shader-cache"),
-        "OWNED_GRAPHICS_TRACE": "1",
-        "OWNED_GRAPHICS_TRACE_LIMIT": "1000000" if args.suite == "arena-heap-upload-reuse" else "100000" if args.suite in ("queries", "multisample-capabilities", "render-passes", "predication-indirect", "fsr-fg") else "8192",
+        "D3DALLOY_METAL4_ARCHIVE_DIR": str(out / "native-pipeline-archives"),
+        "D3DALLOY_METAL4_ARCHIVE_TRACE": "1" if getattr(args,"native_archive_trace",False) else "0",
+        "OWNED_GRAPHICS_TRACE": "0" if latency_performance else "1",
+        "OWNED_GRAPHICS_TRACE_LIMIT": "1000000" if args.suite in ("arena-heap-upload-reuse", "low-latency") else "100000" if args.suite in ("queries", "multisample-capabilities", "render-passes", "predication-indirect", "fsr-fg") else "8192",
         # macOS strips DYLD_* while entering /bin/sh. The owned wrapper sets
         # this diagnostic variable itself on the final hop into real Wine.
         "OWNED_GRAPHICS_DYLD_AUDIT": "1",
@@ -4959,6 +5189,8 @@ def run(args: argparse.Namespace) -> int:
             env["OWNED_ASYNC_PIPELINE_HOLD"] = "1"
     if getattr(args, "auto_breadcrumbs", False):
         env["D3DALLOY_CONFIG"] = ";".join(filter(None, (env.get("D3DALLOY_CONFIG"), "d3d12.enableAutoBreadcrumbs=True")))
+    if force_latency:
+        env["D3DALLOY_CONFIG"] = ";".join(filter(None, (env.get("D3DALLOY_CONFIG"), "d3d12.lowLatency=True")))
     validation_mode = ("api-and-shader" if args.validation else
                        "api-only" if args.api_validation else "none")
     if args.validation:
@@ -4979,7 +5211,9 @@ def run(args: argparse.Namespace) -> int:
         env.pop("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", None)
 
     command = [str(runtime / "bin/wine"), str(executable)]
-    if args.suite == "composition":
+    if args.suite == "low-latency":
+        command.extend(("--mode", latency_mode, "--frames", str(latency_frames)))
+    elif args.suite == "composition":
         command.append("--composition")
         if getattr(args, "composition_visual_proof", False):
             command.extend(("--visual-proof", "--control", "Z:" + str(out / "composition-control.txt").replace("/", "\\")))
@@ -5043,6 +5277,8 @@ def run(args: argparse.Namespace) -> int:
         command.extend(BINDLESS_SHADERS)
     elif args.suite == "sm6":
         command.extend(["--stress-reps", str(SM6_STRESS_REPS)])
+    elif args.suite == "wide-waves":
+        command.append("--wide-waves-only")
     elif args.suite == "waves":
         command.append("--waves-only")
     elif args.suite == "fp64":
@@ -5057,9 +5293,22 @@ def run(args: argparse.Namespace) -> int:
         command.extend(RAYTRACING_OMM_SHADERS)
     elif args.suite == "raytracing-atomic64":
         command.extend(("--atomic64", "raytracing-contract.dxil", "raytracing-atomic64.dxil"))
+    elif args.suite == "rt-executable-cache":
+        command.extend(("raytracing-contract.dxil","raytracing-stateobj.dxil"))
     evidence = {
         "schema": 1, "suite": args.suite, "mode": args.mode, "validation": args.validation,
         "async_pipeline_compile": env.get("D3DALLOY_CONFIG") == "d3d12.asyncPipelineCompile=True",
+        "explicit_configuration": env.get("D3DALLOY_CONFIG"),
+        "force_low_latency": force_latency,
+        "low_latency_mode": latency_mode if args.suite == "low-latency" else None,
+        "low_latency_frames": latency_frames if args.suite == "low-latency" else None,
+        "low_latency_performance": latency_performance,
+        "low_latency_trace_assertions_exercised": (not latency_performance
+                                                   if args.suite == "low-latency" else None),
+        "owned_graphics_trace_enabled": env["OWNED_GRAPHICS_TRACE"] == "1",
+        "logger_level": env["D3DALLOY_LOG_LEVEL"],
+        "native_archive_directory": env["D3DALLOY_METAL4_ARCHIVE_DIR"],
+        "native_archive_trace": env["D3DALLOY_METAL4_ARCHIVE_TRACE"] == "1",
         "validation_mode": validation_mode,
         "architecture": arch,
         "command": command, "prefix": env["WINEPREFIX"],
@@ -5186,6 +5435,10 @@ def run(args: argparse.Namespace) -> int:
     raytracing_evidence = None
     fence_rewind_cases: list[str] = []
     validation_errors: list[str] = list(rr_native_validation_errors)
+    if args.suite == "low-latency":
+        validation_errors.extend(low_latency_failures(stdout, stderr, latency_mode, latency_frames,
+                                                      performance=latency_performance))
+        success = success and native_compiler_proof
     validation_errors.extend(core_load_evidence["failures"])
     if args.suite in ("render-passes", "enhanced-barriers", "execution-safety"):
         validation_errors.extend(execution_graph_failures(stdout, stderr, args.suite))
@@ -5263,6 +5516,16 @@ def run(args: argparse.Namespace) -> int:
         success, dxil_compiler_loaded = matrix_shaders_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "waves":
         success, dxil_compiler_loaded = waves_output_matches(stdout, stderr, native_compiler_proof, success)
+    if args.suite == "workgraph-batches":
+        success = workgraph_batches_output_matches(stdout,stderr,native_compiler_proof,success)
+    if args.suite == "submission-foundation":
+        success = submission_foundation_output_matches(stdout,stderr,native_compiler_proof,success)
+        dxil_compiler_loaded = native_compiler_proof
+    if args.suite == "rt-executable-cache":
+        success = rt_executable_output_matches(stdout,stderr,native_compiler_proof,success)
+        dxil_compiler_loaded = native_compiler_proof
+    if args.suite == "wide-waves":
+        success, dxil_compiler_loaded = wide_waves_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "fp64":
         success, dxil_compiler_loaded = fp64_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "sm6":
@@ -5532,6 +5795,8 @@ def run(args: argparse.Namespace) -> int:
         log_paths += sorted(out.glob("pipeline-cache-*/*_d3dalloy-d3d12.log"))
     backend_logs = {str(path.relative_to(out)): path.read_text(errors="replace") for path in log_paths}
     diagnostic_text = "\n".join([stderr, *backend_logs.values()])
+    if latency_performance and any("OWNED_GRAPHICS_TRACE " in text for text in backend_logs.values()):
+        validation_errors.append("low latency performance backend log emitted owned tracing")
     validation_errors += [line for line in diagnostic_text.splitlines()
                          if any(term in line for term in ("validateCompute", "validateRender",
                                                            "Execution of the command buffer was aborted",
@@ -5548,7 +5813,7 @@ def run(args: argparse.Namespace) -> int:
         validation_errors.extend(relaxed_casting_failures(args.suite, stdout, stderr))
         success = success and native_compiler_proof
     trace_events = []
-    for text in backend_logs.values():
+    for text in (() if latency_performance else backend_logs.values()):
         for line in text.splitlines():
             marker = "OWNED_GRAPHICS_TRACE "
             if marker not in line:
@@ -5590,7 +5855,8 @@ def run(args: argparse.Namespace) -> int:
         success = (success and child_restores == 4 and child_colds == 0
                    and cases == {"feature_reporting", "stream_subobject_coverage", "store", "load_rejections",
                                  "serialize", "blob_rejections", "deserialize_same_process",
-                                 "concurrent_load_store", "cross_process_reuse", "immutable_stage_native_library_reuse"}
+                                 "concurrent_load_store", "cross_process_reuse", "immutable_stage_native_library_reuse",
+                                 "private_payload_public_mutation_isolation"}
                    and sorted(gpu) == sorted([f"{phase}_{kind}" for phase in ("stored", "deserialized", "child")
                                              for kind in ("compute", "stream_compute", "graphics",
                                                           "stream_graphics")] + ["thread_entry"]
@@ -5703,6 +5969,8 @@ def run(args: argparse.Namespace) -> int:
                         if args.suite == "composition" else
                         "synthetic owned D3D12/D3D11 fullscreen fixture; not general game compatibility"
                         if args.suite == "fullscreen" else
+                        "synthetic low-latency performance measurement; exact readback, timestamps and public API checks; trace assertions not exercised"
+                        if latency_performance else
                         "synthetic owned D3D12 fixture; not ZZZ compatibility or a nameplate fix")}
     if agility_inputs is not None:
         report["agility_sdk"] = agility_inputs
@@ -5751,10 +6019,21 @@ def main() -> int:
     validation.add_argument("--api-validation", action="store_true",
                             help="enable Metal API validation without shader instrumentation")
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--native-archive-trace", action="store_true",
+                        help="trace native pipeline archive hits/fallbacks; cache is always isolated under --out")
     parser.add_argument("--async-pipeline-compile", action="store_true",
                         help="run any suite with d3d12.asyncPipelineCompile=True (async-pipeline suites always enable it)")
     parser.add_argument("--auto-breadcrumbs", action="store_true",
                         help="run with d3d12.enableAutoBreadcrumbs=True (DRED SYSTEM_CONTROLLED records breadcrumbs)")
+    parser.add_argument("--force-low-latency", action="store_true",
+                        help="explicitly set d3d12.lowLatency=True; inherited D3DALLOY_CONFIG remains stripped")
+    parser.add_argument("--low-latency-mode", choices=("off", "forced", "antilag2"), default="off",
+                        help="low-latency workload policy; forced makes no AMD/Reflex enable calls")
+    parser.add_argument("--low-latency-frames", type=int, default=120,
+                        help="low-latency workload frame count, between 2 and 512")
+    parser.add_argument("--low-latency-performance", action="store_true",
+                        help="low-latency suite only: disable owned tracing and info/debug logging; retain "
+                             "timestamp, exact readback, public API and provenance checks; trace assertions are not exercised")
     args = parser.parse_args()
     if not 1 <= args.timeout <= 600:
         parser.error("--timeout must be between 1 and 600 seconds")

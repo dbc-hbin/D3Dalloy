@@ -641,6 +641,26 @@ void testContracts(Fixture &f, std::vector<uint8_t> &serialized) {
   // Foreign, corrupt, truncated and mismatched blobs.
   ComPtr<ID3DBlob> pso_blob;
   check(compute->GetCachedBlob(&pso_blob), "pso blob");
+  const std::vector<uint8_t> cached_before(static_cast<const uint8_t*>(pso_blob->GetBufferPointer()),
+      static_cast<const uint8_t*>(pso_blob->GetBufferPointer()) + pso_blob->GetBufferSize());
+  std::memset(pso_blob->GetBufferPointer(),0xa5,pso_blob->GetBufferSize());
+  ComPtr<ID3DBlob> cached_after;
+  check(compute->GetCachedBlob(&cached_after),"independent public cached blob");
+  if (cached_after->GetBufferPointer() == pso_blob->GetBufferPointer() ||
+      cached_after->GetBufferSize() != cached_before.size() ||
+      std::memcmp(cached_after->GetBufferPointer(),cached_before.data(),cached_before.size()) ||
+      serialize(library.Get()) != serialized)
+    fail("public cached blob mutation changed private library payload");
+  // Multiple names retain the private immutable payload, not the writable blob.
+  auto aliases = createLibrary(f,nullptr,0);
+  check(aliases->StorePipeline(L"a",compute.Get()),"store alias a");
+  check(aliases->StorePipeline(L"b",compute.Get()),"store alias b");
+  ComPtr<ID3D12PipelineState> aliasA,aliasB;
+  check(aliases->LoadComputePipeline(L"a",&cs,IID_PPV_ARGS(&aliasA)),"load alias a");
+  check(aliases->LoadComputePipeline(L"b",&cs,IID_PPV_ARGS(&aliasB)),"load alias b");
+  if (aliasA.Get()!=compute.Get() || aliasB.Get()!=compute.Get()) fail("alias identity");
+  pso_blob = cached_after;
+  passed("private_payload_public_mutation_isolation");
   rejectLibrary(f, pso_blob->GetBufferPointer(), pso_blob->GetBufferSize(), E_INVALIDARG, "pso_blob_as_library");
   rejectLibrary(f, nullptr, 16, E_INVALIDARG, "null_nonempty");
   rejectLibrary(f, serialized.data(), 0, E_INVALIDARG, "nonnull_empty");

@@ -75,7 +75,7 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   recording_head_ = nullptr;
   encoder_count_ = 0;
 
-  icb_.clear();
+  for (auto &entry : icb_) entry.used = false;
 
   copy_temp_allocator_.free_blocks(copy_temp_version_++);
 
@@ -117,6 +117,11 @@ MTLD3D12CommandAllocatorImpl::Reset() try {
   if (FAILED(hr))
     return hr;
   ++gpu_heap_epoch_;
+  uint64_t retained_commands = 0;
+  std::erase_if(icb_, [&](const auto &entry) {
+    if (gpu_heap_epoch_ - entry.last_epoch > 50 || entry.capacity > 65536 - retained_commands) return true;
+    retained_commands += entry.capacity; return false;
+  });
   // Retain a contiguous prefix: dropping an interior chunk would change virtual offsets.
   size_t keep = 1;
   uint64_t retained = gpu_heap_chunks_.front().capacity;
@@ -153,6 +158,61 @@ MTLD3D12CommandAllocatorImpl::Reset() try {
   return E_OUTOFMEMORY;
 };
 
+HRESULT MTLD3D12CommandAllocatorImpl::SealRecordingPlan() try {
+  if (!recording_head_) return E_FAIL;
+  auto &head = *recording_head_;
+  std::vector<ClosedPassShape> shapes;
+  std::unordered_map<const EncoderData *, size_t> indices;
+  size_t rtas = 0;
+  for (auto *record = head.next; record; record = record->next) {
+    ClosedPassShape shape{record};
+    const std::unique_ptr<std::vector<StandardSwizzleTableUse>> *tables = nullptr;
+    uint64_t stages = 0;
+    if (record->type == EncoderType::Render) {
+      tables = &static_cast<RenderEncoderData *>(record)->submission_tables;
+      stages = WMTMetal4StageVertex | WMTMetal4StageFragment;
+    } else if (record->type == EncoderType::Compute) {
+      const auto &compute = *static_cast<ComputeEncoderData *>(record);
+      tables = &compute.submission_tables; stages = WMTMetal4StageDispatch;
+      for (auto *cmd = reinterpret_cast<const wmtcmd_base *>(&compute.cmd_head); cmd;
+           cmd = static_cast<const wmtcmd_base *>(cmd->next.get_accessible_or_null()))
+        if (cmd->type != WMTComputeCommandNop && cmd->type != WMTComputeCommandSetPSO &&
+            cmd->type != WMTComputeCommandSetBuffer && cmd->type != WMTComputeCommandUseResource &&
+            cmd->type != WMTComputeCommandDispatch) shape.compute_commands_complete = false;
+    }
+    if (tables && *tables) for (const auto &table : **tables) {
+      D3D12_DESCRIPTOR_HEAP_DESC desc{}; D3D12_GPU_DESCRIPTOR_HANDLE start{};
+      table.heap->GetDesc(&desc); table.heap->GetGPUDescriptorHandleForHeapStart(&start);
+      if (!start.ptr || table.base < start.ptr || (table.base - start.ptr) % 32 || table.parameter == ~0u) {
+        shape.descriptors_complete = false; break;
+      }
+      const uint64_t base = (table.base - start.ptr) / 32;
+      if (base >= desc.NumDescriptors) {shape.descriptors_complete = false; break;}
+      for (const auto &binding : table.shader_bindings) {
+        uint64_t used_stages = stages;
+        if (!(stages & WMTMetal4StageDispatch) && !(binding.ShaderVisibilityMask & 1u))
+          used_stages = (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_VERTEX) ? WMTMetal4StageVertex : 0) |
+              (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_PIXEL) ? WMTMetal4StageFragment : 0);
+        table.rootsig->ForEachUsedDescriptorRange(table.rootsig->GetTableRanges(table.parameter), {&binding,1},
+            [&](uint64_t offset, uint64_t count, D3D12_DESCRIPTOR_RANGE_TYPE kind) {
+          if (!shape.descriptors_complete || kind == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) return;
+          if (!used_stages || offset >= desc.NumDescriptors - base || count > desc.NumDescriptors - base - offset) {
+            shape.descriptors_complete = false; return;
+          }
+          shape.descriptors.push_back({table.heap,uint32_t(base+offset),uint32_t(count),used_stages,
+              bool(binding.Flags & MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS)});
+        });
+      }
+    }
+    rtas += record->type == EncoderType::Raytracing;
+    indices.emplace(record,shapes.size()); shapes.push_back(std::move(shape));
+  }
+  head.pass_shapes = std::move(shapes); head.pass_indices = std::move(indices); head.raytracing_passes = rtas;
+  owned_graphics::Trace("recording_plan_sealed", ",\"allocator\":", trace_id_,
+      ",\"passes\":", head.pass_shapes.size(), ",\"descriptor_values_captured\":0");
+  return S_OK;
+} catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }
+
 MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
   // A caller may release an unfinished list instead of closing/resetting it.
   // Link its last pass before visiting and destroying the recorded payloads.
@@ -160,6 +220,7 @@ MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
   ClearRecordedCommands();
   free(cpu_heap_);
   cpu_heap_ = nullptr;
+  for (size_t i = 0; i < retired_cpu_heap_count_; ++i) free(retired_cpu_heaps_[i]);
   for (auto &chunk : gpu_heap_chunks_) {
     chunk.buffer = {};
     free(chunk.memory);
@@ -324,9 +385,34 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
   }
   encoder_lists_.clear();
 
-  for (auto ptr : spilled_cpu_heap_)
-    free(ptr);
+  for (auto ptr : spilled_cpu_heap_) {
+    if (retired_cpu_heap_count_ < retired_cpu_heaps_.size())
+      retired_cpu_heaps_[retired_cpu_heap_count_++] = ptr;
+    else free(ptr);
+  }
   spilled_cpu_heap_.clear();
+}
+
+WMT::Reference<WMT::IndirectCommandBuffer>
+MTLD3D12CommandAllocatorImpl::AcquireICB(WMTIndirectCommandBufferInfo &info, uint64_t count, WMTResourceOptions options) {
+  // Both resolver families reset every entry [0,count), even count-buffer and
+  // predication-disabled entries, before testing their actual count. Extra
+  // capacity is never executed. Reset is accepted only after full retirement.
+  info.gpu_resource_id = 0;
+  auto found = std::find_if(icb_.begin(), icb_.end(), [&](const auto &entry) {
+    return !entry.used && entry.capacity >= count && entry.options == options &&
+        NativeIndirectCommandKey(entry.info) == NativeIndirectCommandKey(info);
+  });
+  if (found != icb_.end()) {
+    found->used = true; found->last_epoch = gpu_heap_epoch_; info.gpu_resource_id = found->resource_id;
+    owned_graphics::Trace("indirect_buffer_reuse", ",\"allocator\":", trace_id_,
+        ",\"count\":", count, ",\"capacity\":", found->capacity);
+    return found->buffer;
+  }
+  const auto key = info;
+  auto buffer = device_->GetMTLDevice().newIndirectCommandBuffer(info, count, options);
+  if (buffer) icb_.push_back({key, options, buffer, count, info.gpu_resource_id, gpu_heap_epoch_, true});
+  return buffer;
 }
 
 IndirectComputeCommandData *
@@ -336,7 +422,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
                                  : pPSO->GetIndirectCommandBufferPipelineState();
   if (!indirect_pso)
     return nullptr;
-  WMTIndirectCommandBufferInfo info;
+  WMTIndirectCommandBufferInfo info{};
   info.inherit_buffers = !pCmdSig->UpdateRootArguments;
   info.inherit_pso = 1;
   info.inherit_cull_mode = 0;
@@ -358,7 +444,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
   info.max_object_threadgroup_memory_binding = 0;
   info.gpu_resource_id = 0;
 
-  auto icb = device_->GetMTLDevice().newIndirectCommandBuffer(info, MaxCount, WMTResourceStorageModeShared);
+  auto icb = AcquireICB(info, MaxCount, WMTResourceStorageModeShared);
+  if (!icb) return nullptr;
 
   auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectComputeCommandData), 16);
   if (!Ptr)
@@ -436,7 +523,6 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
   restore.threadgroup_size = pPSO->threadgroup_size;
   static_cast<ComputeEncoderData *>(encoder_current)->RetainPipeline(WMT::ComputePipelineState{restore.pso});
 
-  icb_.push_back(std::move(icb));
 
   return data;
 }
@@ -452,7 +538,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
                                  : pPSO->GetIndirectCommandBufferPipelineState();
   if (!indirect_pso)
     return nullptr;
-  WMTIndirectCommandBufferInfo info;
+  WMTIndirectCommandBufferInfo info{};
   info.inherit_buffers = !(index_pull || pCmdSig->UpdateVertexBuffers || pCmdSig->UpdateIndexBuffer ||
                            pCmdSig->UpdateRootArguments || pPSO->view_location_offsets);
   info.inherit_pso = 1;
@@ -477,7 +563,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   info.max_object_threadgroup_memory_binding = 0;
   info.gpu_resource_id = 0;
 
-  auto icb = device_->GetMTLDevice().newIndirectCommandBuffer(info, MaxCount, WMTResourceStorageModePrivate);
+  auto icb = AcquireICB(info, MaxCount, WMTResourceStorageModePrivate);
+  if (!icb) return nullptr;
 
   auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectRenderCommandData), 16);
   if (!Ptr)
@@ -593,7 +680,6 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   restore.type = WMTRenderCommandSetPSO;
   restore.pso = pPSO->pso;
 
-  icb_.push_back(std::move(icb));
 
   return data;
 }

@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -37,20 +38,37 @@ public:
       throw std::length_error("atomic64 canonical offset overflow");
     CanonicalCell key{owner, (owner.base + byte_offset) & ~uint64_t(7)};
     key.owner.base = 0;
-    const auto existing = cells_.find(key);
-    if (existing != cells_.end())
-      return existing->second;
-    if (cells_.size() == UINT32_MAX)
+    const auto after = runs_.upper_bound(key);
+    if (after != runs_.begin()) {
+      const auto previous = std::prev(after);
+      const auto &owner = previous->first.owner;
+      if (std::tie(owner.kind, owner.identity, owner.layout) ==
+          std::tie(key.owner.kind, key.owner.identity, key.owner.layout)) {
+        const uint64_t distance = (key.offset - previous->first.offset) / 8;
+        auto &run = previous->second;
+        if (distance < run.count) return run.first + uint32_t(distance);
+        // Preserve first-seen IDs exactly. Adjacent physical cells are merged
+        // only when their canonical IDs are adjacent too; interleaved aliases
+        // and sparse mappings can therefore never silently change identity.
+        if (distance == run.count && uint64_t(run.first) + run.count == count_) {
+          if (count_ == UINT32_MAX) throw std::length_error("atomic64 root index overflow");
+          ++run.count; return count_++;
+        }
+      }
+    }
+    if (count_ == UINT32_MAX)
       throw std::length_error("atomic64 root index overflow");
-    const uint32_t index = static_cast<uint32_t>(cells_.size());
-    cells_.emplace(std::move(key), index);
-    return index;
+    runs_.emplace_hint(after, std::move(key), Run{count_, 1});
+    return count_++;
   }
 
-  uint32_t Count() const { return static_cast<uint32_t>(cells_.size()); }
+  uint32_t Count() const { return count_; }
+  size_t RunCount() const { return runs_.size(); }
 
 private:
-  std::map<CanonicalCell, uint32_t> cells_;
+  struct Run { uint32_t first; uint64_t count; };
+  std::map<CanonicalCell, Run> runs_;
+  uint32_t count_ = 0;
 };
 
 struct ArenaLayout {

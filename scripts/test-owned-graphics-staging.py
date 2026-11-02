@@ -46,6 +46,8 @@ class StagingPolicyTests(unittest.TestCase):
             if name == "d3d12.dll":
                 payload += b"-" + stage_owned_graphics.OWNED_D3D12_MARKER
             image = self.core_image(abi="x64", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll") else self.pe_image(0x8664, payload)
+            if name == stage_owned_graphics.ANTILAG_MODULE:
+                image = self.antilag_image()
             (self.d3dalloy / stage_owned_graphics.D3DALLOY_WINDOWS_DIR / name).write_bytes(image)
         (self.d3dalloy / stage_owned_graphics.D3DALLOY_UNIX_DIR / "winemetal.so").write_bytes(macho)
 
@@ -143,6 +145,8 @@ class StagingPolicyTests(unittest.TestCase):
             for name in stage_owned_graphics.WINDOWS_MODULES:
                 image = (self.core_image("x86", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll")
                          else self.pe_image(0x14C, stage_owned_graphics.WINE_BUILTIN_MARKER))
+                if name == stage_owned_graphics.ANTILAG_MODULE:
+                    image = self.antilag_image("x86")
                 (directory / name).write_bytes(image)
         for abi, directory in directories:
             image = bytearray(self.pe_image(0x14C if abi == "x86" else 0x8664, bytes(0x1000)))
@@ -293,6 +297,37 @@ class StagingPolicyTests(unittest.TestCase):
         image[0x800:0x800 + len(marker)] = marker
         return image
 
+    def antilag_image(self, abi: str = "x64") -> bytearray:
+        return self.fsr_image(stage_owned_graphics.OWNED_ANTILAG_MARKER, abi,
+                              ("AmdExtD3DCreateInterface", "OwnedAntiLagBackendId"))
+
+    def test_antilag_requires_owned_builtin_exports_for_each_windows_abi(self) -> None:
+        for abi in ("x86", "x64", "arm64", "arm64ec"):
+            module = self.root / stage_owned_graphics.ANTILAG_MODULE
+            image = self.antilag_image(abi)
+            module.write_bytes(image)
+            stage_owned_graphics.validate_antilag_module(module, abi)
+            for original, replacement, error in (
+                (stage_owned_graphics.OWNED_ANTILAG_MARKER, b"x", "owned Anti-Lag 2 marker"),
+                (stage_owned_graphics.WINE_BUILTIN_MARKER, b"x", "Wine builtin marker"),
+                (b"AmdExtD3DCreateInterface", b"x", "required Anti-Lag 2 exports"),
+                (b"OwnedAntiLagBackendId", b"x", "required Anti-Lag 2 exports"),
+            ):
+                with self.subTest(abi=abi, error=error, original=original):
+                    module.write_bytes(image.replace(original, replacement.ljust(len(original), b"x")))
+                    with self.assertRaisesRegex(ValueError, error):
+                        stage_owned_graphics.validate_antilag_module(module, abi)
+            module.write_bytes(image)
+            with self.assertRaisesRegex(ValueError, "ABI mismatch"):
+                stage_owned_graphics.validate_antilag_module(module, "x64" if abi != "x64" else "x86")
+
+    def test_antilag_is_required_before_staging_without_optional_frontends(self) -> None:
+        module = self.d3dalloy / "x86_64-windows/amdxc64.dll"
+        module.unlink()
+        with self.assertRaisesRegex(ValueError, "regular non-symlink.*amdxc64.dll"):
+            stage_owned_graphics.stage(self.d3dalloy, self.wine, self.dest)
+        self.assertFalse(self.dest.exists())
+
     def display_build(self) -> Path:
         source = self.root / "wine-display-source"
         (source / "dlls/dcomp").mkdir(parents=True)
@@ -418,6 +453,8 @@ class StagingPolicyTests(unittest.TestCase):
         for name in stage_owned_graphics.WINDOWS_MODULES:
             image = (self.core_image("x86", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll")
                      else self.pe_image(0x14C, stage_owned_graphics.WINE_BUILTIN_MARKER))
+            if name == stage_owned_graphics.ANTILAG_MODULE:
+                image = self.antilag_image("x86")
             (directory / name).write_bytes(image)
         module = build / "dlls/dcomp/i386-windows/dcomp.dll"
         payload = module.read_bytes()
@@ -641,7 +678,10 @@ class StagingPolicyTests(unittest.TestCase):
             payload = stage_owned_graphics.WINE_BUILTIN_MARKER
             if name == "d3d12.dll":
                 payload += stage_owned_graphics.OWNED_D3D12_MARKER
-            (directory / name).write_bytes(self.core_image("x86", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll") else self.pe_image(0x14C, payload))
+            image = (self.core_image("x86", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll")
+                     else self.antilag_image("x86") if name == stage_owned_graphics.ANTILAG_MODULE
+                     else self.pe_image(0x14C, payload))
+            (directory / name).write_bytes(image)
         image = self.fsr_image(abi="x86")
         struct.pack_into("<III", image, 0x310, 2, 1, 1)
         image[0x3A0:0x3A0 + 21] = b"nvapi_QueryInterface\0"
@@ -765,10 +805,13 @@ class StagingPolicyTests(unittest.TestCase):
             (self.dest / core_relative).unlink()
             del manifest["artifacts"][fg_relative]
             (self.dest / fg_relative).unlink()
+            antilag_relative = str(stage_owned_graphics.WINDOWS_DIR / stage_owned_graphics.ANTILAG_MODULE)
+            del manifest["artifacts"][antilag_relative]
+            (self.dest / antilag_relative).unlink()
             manifest["loader"]["winedlloverrides"] = (
                 "d3d12=b;dxgi=b;d3d11=b;d3d10core=b;winemetal=b;nvngx=;nvapi64=;amd_fidelityfx_upscaler_dx12=b")
             wrapper = self.dest / "bin/wine"
-            wrapper.write_text(stage_owned_graphics.render_wrapper(with_fsr=True, with_fsr_framegeneration=None, with_core=False))
+            wrapper.write_text(stage_owned_graphics.render_wrapper(with_fsr=True, with_fsr_framegeneration=None, with_core=False, with_antilag=False))
             manifest["artifacts"]["bin/wine"]["sha256"] = stage_owned_graphics.sha256(wrapper)
             path.write_text(json.dumps(manifest))
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
@@ -796,12 +839,18 @@ class StagingPolicyTests(unittest.TestCase):
             core_relative = str(stage_owned_graphics.WINDOWS_DIR / "d3d12core.dll")
             del manifest["artifacts"][core_relative]
             (self.dest / core_relative).unlink()
-            manifest["loader"]["winedlloverrides"] = stage_owned_graphics.owned_overrides(with_fsr=None, with_fsr_framegeneration=None, with_core=False)
+            antilag_relative = str(stage_owned_graphics.WINDOWS_DIR / stage_owned_graphics.ANTILAG_MODULE)
+            del manifest["artifacts"][antilag_relative]
+            (self.dest / antilag_relative).unlink()
+            manifest["loader"]["winedlloverrides"] = stage_owned_graphics.owned_overrides(with_fsr=None, with_fsr_framegeneration=None, with_core=False, with_antilag=False)
             wrapper = self.dest / "bin/wine"
-            wrapper.write_text(stage_owned_graphics.render_wrapper(with_fsr=None, with_fsr_framegeneration=None, with_core=False))
+            wrapper.write_text(stage_owned_graphics.render_wrapper(with_fsr=None, with_fsr_framegeneration=None, with_core=False, with_antilag=False))
             manifest["artifacts"]["bin/wine"]["sha256"] = stage_owned_graphics.sha256(wrapper)
             path.write_text(json.dumps(manifest))
+            retained_manifest, retained_wrapper = path.read_bytes(), wrapper.read_bytes()
             self.assertEqual(stage_owned_graphics.verify_runtime(self.dest), [])
+            self.assertEqual(path.read_bytes(), retained_manifest)
+            self.assertEqual(wrapper.read_bytes(), retained_wrapper)
             manifest["schema"] = 1
             del manifest["architecture"]
             for relative in ("bin/wineserver", str(stage_owned_graphics.UNIX_DIR / "ntdll.so"), str(stage_owned_graphics.WINDOWS_DIR / "ntdll.dll")):
@@ -857,6 +906,7 @@ class StagingPolicyTests(unittest.TestCase):
         self.assertEqual(values["WINEDLLPATH_PREPEND"], "")
         self.assertEqual(values["CX_ACTIVE_GRAPHICS_BACKEND"], "")
         self.assertEqual(values["WINEDLLOVERRIDES"], stage_owned_graphics.owned_overrides())
+        self.assertIn("amdxc64=b", values["WINEDLLOVERRIDES"].split(";"))
         self.assertIn("amd_fidelityfx_upscaler_dx12=", values["WINEDLLOVERRIDES"].split(";"))
         self.assertEqual(values["D3DALLOY_ENABLE_NVEXT"], "")
         self.assertEqual(values["FEX_HIDEHYPERVISORBIT"], "0")
@@ -1013,6 +1063,20 @@ class StagingPolicyTests(unittest.TestCase):
             self.assertEqual((self.dest / relative).read_bytes(), source.read_bytes())
         manifest = self.dest / stage_owned_graphics.MANIFEST
         self.assertTrue(manifest.is_file())
+        data = json.loads(manifest.read_text())
+        relative = str(stage_owned_graphics.WINDOWS_DIR / stage_owned_graphics.ANTILAG_MODULE)
+        self.assertIn(relative, data["artifacts"])
+        self.assertIn("amdxc64=b", data["loader"]["winedlloverrides"].split(";"))
+        self.assertEqual(data["artifacts"][relative]["sha256"],
+                         stage_owned_graphics.sha256(self.d3dalloy / "x86_64-windows/amdxc64.dll"))
+        with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=dependencies), \
+             mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
+            module = self.dest / relative
+            name = b"AmdExtD3DCreateInterface"
+            module.write_bytes(module.read_bytes().replace(name, b"x" * len(name)))
+            problems = stage_owned_graphics.verify_runtime(self.dest)
+            self.assertTrue(any("hash changed" in problem and "amdxc64.dll" in problem for problem in problems), problems)
+            self.assertTrue(any("required Anti-Lag 2 exports" in problem for problem in problems), problems)
 
     def test_leftover_external_dxil_artifacts_are_refused(self) -> None:
         for relative in (*stage_owned_graphics.FORBIDDEN_STAGED_ARTIFACTS,
@@ -1225,7 +1289,9 @@ class StagingPolicyTests(unittest.TestCase):
             payload = self.hybrid_image() + stage_owned_graphics.WINE_BUILTIN_MARKER
             if name == "d3d12.dll":
                 payload += stage_owned_graphics.OWNED_D3D12_MARKER
-            (self.d3dalloy / "arm64ec-windows" / name).write_bytes(self.core_image("arm64ec", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll") else payload)
+            image = (self.core_image("arm64ec", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll")
+                     else self.antilag_image("arm64ec") if name == stage_owned_graphics.ANTILAG_MODULE else payload)
+            (self.d3dalloy / "arm64ec-windows" / name).write_bytes(image)
         (self.d3dalloy / "aarch64-unix/winemetal.so").write_bytes(macho)
         for name, marker in stage_owned_graphics.FSR_MODULE_MARKERS.items():
             (self.d3dalloy / "arm64ec-windows" / name).write_bytes(self.fsr_image(marker, "arm64ec"))
@@ -1255,8 +1321,10 @@ class StagingPolicyTests(unittest.TestCase):
             payload = name.encode() + b"-" + stage_owned_graphics.WINE_BUILTIN_MARKER
             if name == "d3d12.dll":
                 payload += b"-" + stage_owned_graphics.OWNED_D3D12_MARKER
-            (d3dalloy32 / stage_owned_graphics.D3DALLOY_WOW64_DIR / name).write_bytes(
-                self.core_image("x86", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll") else self.pe_image(stage_owned_graphics.PE_MACHINE_I386, payload))
+            image = (self.core_image("x86", main=name == "d3d12.dll") if name in ("d3d12.dll", "d3d12core.dll")
+                     else self.antilag_image("x86") if name == stage_owned_graphics.ANTILAG_MODULE
+                     else self.pe_image(stage_owned_graphics.PE_MACHINE_I386, payload))
+            (d3dalloy32 / stage_owned_graphics.D3DALLOY_WOW64_DIR / name).write_bytes(image)
         dependencies = ["@rpath/winemetal.so", "@rpath/winemac.so", "@rpath/ntdll.so", "/usr/lib/libSystem.B.dylib"]
         with mock.patch.object(stage_owned_graphics, "macho_dependencies", return_value=dependencies), \
              mock.patch.object(stage_owned_graphics, "macho_audit_problems", return_value=[]):
@@ -1274,6 +1342,9 @@ class StagingPolicyTests(unittest.TestCase):
             staged = self.dest / stage_owned_graphics.WOW64_WINDOWS_DIR / "d3d12.dll"
             self.assertEqual(staged.read_bytes(), (d3dalloy32 / "i386-windows/d3d12.dll").read_bytes())
             manifest = json.loads((self.dest / stage_owned_graphics.MANIFEST).read_text())
+            anti32 = str(stage_owned_graphics.WOW64_WINDOWS_DIR / "amdxc64.dll")
+            self.assertEqual(manifest["artifacts"][anti32]["pe"]["windows_abi"], "x86")
+            self.assertEqual((self.dest / anti32).read_bytes(), (d3dalloy32 / "i386-windows/amdxc64.dll").read_bytes())
             self.assertIs(manifest["optional_modules"]["wow64"], True)
             self.assertEqual(manifest["loader"]["winedllpath"], ["lib/wine/x86_64-windows", "lib/wine/i386-windows", "lib/wine/x86_64-unix"])
             manifest_file = self.dest / stage_owned_graphics.MANIFEST

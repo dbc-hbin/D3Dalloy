@@ -147,13 +147,18 @@ int main() {
                         CreateEventW(nullptr, TRUE, FALSE, nullptr), NVAPI_ERROR};
   HANDLE thread = CreateThread(nullptr, 0, sleepThread, &attempt, 0, nullptr);
   require(thread && WaitForSingleObject(attempt.started, 10000) == WAIT_OBJECT_0, "sleep-thread-start");
-  require(WaitForSingleObject(attempt.done, 100) == WAIT_TIMEOUT, "sleep-waits-for-actual-queue-retirement");
+  // A single pending render frame must retain CPU/GPU overlap. Admission is
+  // frame-bounded, not a drain of every Execute/native command buffer.
+  require(WaitForSingleObject(attempt.done, 10000) == WAIT_OBJECT_0, "sleep-preserves-render-overlap");
   status(api.sleep(other.Get()), NVAPI_OK, "other-device-not-blocked");
   check(gate->Signal(1), "release-queue");
-  require(WaitForSingleObject(attempt.done, 10000) == WAIT_OBJECT_0, "sleep-wakes-after-gpu");
   status(attempt.result, NVAPI_OK, "sleep-thread-result");
   WaitForSingleObject(thread, 10000); CloseHandle(thread); CloseHandle(attempt.started); CloseHandle(attempt.done);
   idle(device.Get(), queue.Get());
+  mode.bLowLatencyMode = 0;
+  status(api.set(device.Get(), &mode), NVAPI_OK, "release-offscreen-admission");
+  mode.bLowLatencyMode = 1;
+  status(api.set(device.Get(), &mode), NVAPI_OK, "restore-frame-admission");
   NV_LATENCY_RESULT_PARAMS report{}; report.version = NV_LATENCY_RESULT_PARAMS_VER1;
   status(api.latency(device.Get(), &report), NVAPI_OK, "specified-warmup-report");
   for (const auto &r : report.frameReport) require(!r.simStartTime && !r.gpuRenderEndTime, "warmup-zero");
@@ -218,6 +223,16 @@ int main() {
     require(r.gpuRenderStartTime && r.gpuRenderEndTime >= r.gpuRenderStartTime &&
             r.gpuRenderStartTime >= lo && r.gpuRenderEndTime <= nowUs(), "real-native-gpu-times");
   }
+  // The public contract preserves the requested interval even when the game
+  // omits Sleep. This must work with the launcher force option left off.
+  mode.bLowLatencyMode = 0; mode.minimumIntervalUs = 30000;
+  status(api.set(device.Get(), &mode), NVAPI_OK, "fallback-interval-mode");
+  check(chain->Present(0, 0), "fallback-first-present");
+  const auto fallback_start = nowUs();
+  check(chain->Present(0, 0), "fallback-second-present");
+  require(nowUs() - fallback_start >= 25000, "fallback-preserves-requested-interval");
+  mode.minimumIntervalUs = 0;
+  status(api.set(device.Get(), &mode), NVAPI_OK, "fallback-disable");
   status(api.latency(other.Get(), &report), NVAPI_OK, "report-device-isolation");
   for (const auto &r : report.frameReport) require(!r.simStartTime && !r.gpuRenderEndTime, "other-device-zero");
   NV_LATENCY_MARKER_PARAMS duplicate{}; duplicate.version = NV_LATENCY_MARKER_PARAMS_VER1;
@@ -225,6 +240,16 @@ int main() {
   status(api.marker(device.Get(), &duplicate), NVAPI_INVALID_ARGUMENT, "strict-frame-id");
   duplicate.frameID = 1090; duplicate.markerType = SIMULATION_END;
   status(api.marker(device.Get(), &duplicate), NVAPI_INVALID_ARGUMENT, "simulation-start-required");
+  duplicate.frameID = 1089;
+  duplicate.markerType = static_cast<NV_LATENCY_MARKER_TYPE>(10);
+  status(api.marker(device.Get(), &duplicate), NVAPI_INVALID_ARGUMENT, "out-of-band-render-start-required");
+  duplicate.markerType = static_cast<NV_LATENCY_MARKER_TYPE>(12);
+  status(api.marker(device.Get(), &duplicate), NVAPI_INVALID_ARGUMENT, "out-of-band-present-start-required");
+  for (UINT type = 9; type <= 12; ++type) {
+    duplicate.markerType = static_cast<NV_LATENCY_MARKER_TYPE>(type);
+    status(api.marker(device.Get(), &duplicate), NVAPI_OK, "out-of-band-existing-frame");
+  }
+  status(api.marker(device.Get(), &duplicate), NVAPI_INVALID_ARGUMENT, "out-of-band-duplicate");
   duplicate.markerType = static_cast<NV_LATENCY_MARKER_TYPE>(99);
   status(api.marker(device.Get(), &duplicate), NVAPI_INVALID_ARGUMENT, "unknown-marker");
   duplicate.version = 0; duplicate.markerType = SIMULATION_START;
@@ -232,7 +257,9 @@ int main() {
   mode.bLowLatencyMode = 0; status(api.set(device.Get(), &mode), NVAPI_OK, "disable-mode");
   status(api.get(device.Get(), &current), NVAPI_OK, "disabled-status"); require(!current.bLowLatencyMode, "disabled");
   // A wait may be canceled by device removal, never converted into successful GPU completion.
-  mode.bLowLatencyMode = 1; status(api.set(other.Get(), &mode), NVAPI_OK, "removal-mode");
+  mode.bLowLatencyMode = 0; mode.minimumIntervalUs = 5000000;
+  status(api.set(other.Get(), &mode), NVAPI_OK, "removal-mode");
+  status(api.sleep(other.Get()), NVAPI_OK, "removal-interval-anchor");
   ComPtr<ID3D12CommandQueue> removal_queue;
   check(other->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&removal_queue)), "removal-queue");
   ComPtr<ID3D12CommandAllocator> removal_allocator; ComPtr<ID3D12GraphicsCommandList> removal_list;
@@ -248,7 +275,6 @@ int main() {
                        CreateEventW(nullptr, TRUE, FALSE, nullptr), NVAPI_OK};
   HANDLE canceled_thread = CreateThread(nullptr, 0, sleepThread, &canceled, 0, nullptr);
   require(canceled_thread && WaitForSingleObject(canceled.started, 10000) == WAIT_OBJECT_0, "removal-sleep-start");
-  require(WaitForSingleObject(canceled.done, 100) == WAIT_TIMEOUT, "removal-sleep-blocked");
   ComPtr<ID3D12Device5> device5; check(other.As(&device5), "removal-device5"); device5->RemoveDevice();
   require(WaitForSingleObject(canceled.done, 10000) == WAIT_OBJECT_0, "removal-wakes-sleep");
   status(canceled.result, NVAPI_ERROR, "removal-not-success");

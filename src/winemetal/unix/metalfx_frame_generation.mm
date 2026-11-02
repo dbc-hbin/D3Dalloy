@@ -495,6 +495,7 @@ struct Configuration {
     }
 };
 
+struct PreparedGuidePlan;
 struct Snapshot {
     WMTFGprepare_packet parameters{};
     // Pooled copies stay immutable until every holder of this snapshot drops.
@@ -502,6 +503,11 @@ struct Snapshot {
     Lent motionScratch;
     Object depth;
     Object motion;
+    MTLPixelFormat depthFormat = MTLPixelFormatInvalid, motionFormat = MTLPixelFormatInvalid;
+    // Generate may select a normalization plan before Prepare executes. If
+    // Prepare already produced raw snapshots, that immutable path stays valid.
+    std::mutex planMutex;
+    std::shared_ptr<const PreparedGuidePlan> guidePlan;
     NSUInteger depthWidth = 0;
     NSUInteger depthHeight = 0;
     NSUInteger motionWidth = 0;
@@ -620,7 +626,7 @@ bool renderGridInputs(const WMTFGcreate_packet& creation, const WMTFGprepare_pac
 std::shared_ptr<Configuration> configure(
     State& state, const Command& command,
     const WMTFGprepare_packet& packet,
-    id<MTLTexture> depth, MTLPixelFormat sourceColor, MTLPixelFormat sourceUi,
+    MTLPixelFormat depthFormat, MTLPixelFormat sourceColor, MTLPixelFormat sourceUi,
     NSUInteger outputWidth, NSUInteger outputHeight, std::uint32_t transfer, bool distortionEnabled) {
     const bool renderGrid = renderGridInputs(state.creation, packet, outputWidth, outputHeight);
     const NSUInteger inputWidth = renderGrid ? state.creation.max_render_width : outputWidth;
@@ -631,7 +637,6 @@ std::shared_ptr<Configuration> configure(
         const MTLPixelFormat color = MTLPixelFormatRGBA16Float;
         const MTLPixelFormat ui = sourceUi == MTLPixelFormatInvalid
                                 ? MTLPixelFormatInvalid : MTLPixelFormatRGBA16Float;
-        const MTLPixelFormat depthFormat = depth.pixelFormat;
         const MTLPixelFormat motion = MTLPixelFormatRG16Float;
         const bool cameraPresent = packet.camera_info_present != 0;
         // MetalFX consumes color, depth, and motion in one origin-zero active domain.
@@ -910,6 +915,52 @@ struct alignas(16) FgParams {
 static_assert(sizeof(FgParams) == 208 && offsetof(FgParams, depthSourceExtent) == 184 &&
               sizeof(FgParams) <= Pool::kParameterSlot);
 
+struct GuideLayout {
+    NSUInteger width, height;
+    bool dilateDepth, convertMotion;
+};
+GuideLayout guideLayout(const WMTFGcreate_packet& creation, const Snapshot& snapshot,
+                        const Configuration& config, const WMTFGdispatch_packet& dispatch) {
+    const auto& p = snapshot.parameters;
+    const NSUInteger width = config.renderGrid ? p.render_width : config.width;
+    const NSUInteger height = config.renderGrid ? p.render_height : config.height;
+    const NSUInteger samplingWidth = dispatch.independent_subrects ? config.width : creation.display_width;
+    const NSUInteger samplingHeight = dispatch.independent_subrects ? config.height : creation.display_height;
+    const bool dilate = !config.renderGrid && !(creation.flags & WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS) &&
+        (snapshot.depthWidth < samplingWidth || snapshot.depthHeight < samplingHeight);
+    return {width,height,dilate,dilate || p.reconstruct_camera_motion || p.motion_scale_x != 1 ||
+        p.motion_scale_y != 1 || p.motion_vectors_invalid_value_present || p.motion_width != width ||
+        p.motion_height != height || (creation.flags & WMTFG_MOTION_VECTORS_JITTERED)};
+}
+FgParams guideMotionParams(const WMTFGcreate_packet& creation, const Snapshot& snapshot,
+                           const GuideLayout& layout, bool reset) {
+    const auto& p = snapshot.parameters;
+    FgParams result{};
+    result.extent[0] = result.outputExtent[0] = layout.width;
+    result.extent[1] = result.outputExtent[1] = layout.height;
+    result.sourceExtent[0] = snapshot.motionWidth; result.sourceExtent[1] = snapshot.motionHeight;
+    result.motionTargetExtent[0] = p.motion_width; result.motionTargetExtent[1] = p.motion_height;
+    result.motionScale[0] = p.motion_scale_x; result.motionScale[1] = p.motion_scale_y;
+    result.reconstructCameraMotion = p.reconstruct_camera_motion;
+    result.motionVectorsInvalidValue = p.motion_vectors_invalid_value;
+    result.motionVectorsInvalidValuePresent = p.motion_vectors_invalid_value_present;
+    result.depthDilation = layout.dilateDepth;
+    result.depthInverted = (creation.flags & WMTFG_DEPTH_INVERTED) != 0;
+    result.depthSourceExtent[0] = snapshot.depthWidth; result.depthSourceExtent[1] = snapshot.depthHeight;
+    std::memcpy(result.clipToPreviousClip,p.clip_to_previous_clip,sizeof(p.clip_to_previous_clip));
+    if ((creation.flags & WMTFG_MOTION_VECTORS_JITTERED) && snapshot.hasPreviousJitter && !reset) {
+        result.jitterCancellation[0] = (snapshot.previousJitterX-p.jitter_x)*p.motion_width/p.render_width;
+        result.jitterCancellation[1] = (snapshot.previousJitterY-p.jitter_y)*p.motion_height/p.render_height;
+    }
+    return result;
+}
+struct PreparedGuidePlan {
+    std::shared_ptr<Configuration> configuration;
+    GuideLayout layout;
+    bool depthConversion, motionConversion;
+    FgParams motionParams;
+};
+
 // Metal snapshots argument-table bindings at each dispatch, so one table and
 // one parameter buffer (one slot per pass) serve every pass of an execution.
 enum ParameterSlot : NSUInteger { ColorSlot, SceneSlot, UiSlot, DistortionSlot, DepthSlot, MotionSlot };
@@ -1055,8 +1106,6 @@ bool PreparedFrame::encode(
                 execution->objects.push_back(impl_->ui);
                 execution->objects.push_back(impl_->uiAlpha);
                 execution->objects.push_back(impl_->disableInterpolation);
-                execution->objects.push_back(impl_->snapshot->depth);
-                execution->objects.push_back(impl_->snapshot->motion);
 
                 auto retainedLease = std::shared_ptr<const ExecutionLease>(
                     new ExecutionLease(execution));
@@ -1066,25 +1115,82 @@ bool PreparedFrame::encode(
 
                 std::lock_guard executionLock(impl_->state->executionMutex);
                 if (impl_->kind == Impl::Kind::Snapshot) {
+                    auto& snapshot = *impl_->snapshot;
+                    std::lock_guard planLock(snapshot.planMutex);
+                    const auto& plan = snapshot.guidePlan;
+                    const auto& selected = plan ? *plan->configuration : configuration;
+                    auto nativeInputs = (id<MTLFXFrameInterpolatorBase>)selected.factory.get();
+                    auto device = (id<MTLDevice>)selected.device.get();
+                    if (!snapshot.depthScratch) snapshot.depthScratch = execution->pool->texture(device,selected.depth,
+                        plan ? plan->layout.width : snapshot.depthWidth, plan ? plan->layout.height : snapshot.depthHeight,
+                        nativeInputs.depthTextureUsage | MTLTextureUsageShaderRead |
+                        (plan && plan->depthConversion ? MTLTextureUsageShaderWrite : MTLTextureUsageUnknown));
+                    if (!snapshot.motionScratch) snapshot.motionScratch = execution->pool->texture(device,
+                        plan && plan->motionConversion ? selected.motion : snapshot.motionFormat,
+                        plan ? plan->layout.width : snapshot.motionWidth, plan ? plan->layout.height : snapshot.motionHeight,
+                        nativeInputs.motionTextureUsage | MTLTextureUsageShaderRead |
+                        (plan && plan->motionConversion ? MTLTextureUsageShaderWrite : MTLTextureUsageUnknown));
+                    if (!snapshot.depthScratch || !snapshot.motionScratch) return fail("snapshot_allocations");
+                    snapshot.depth = snapshot.depthScratch->object; snapshot.motion = snapshot.motionScratch->object;
+                    execution->objects.push_back(snapshot.depth); execution->objects.push_back(snapshot.motion);
+                    Lent parameterLease, tableLease;
+                    if (plan) {
+                        parameterLease = execution->pool->parameters(device); tableLease = execution->pool->table(device);
+                        if (!parameterLease || !tableLease) return fail("snapshot_parameters");
+                        execution->scratch.push_back(parameterLease); execution->scratch.push_back(tableLease);
+                    }
                     if (!execution->makeResident(buffer))
                         return fail("snapshot_residency");
-                    const std::array<Copy, 2> copies{{
-                        {(id<MTLTexture>)impl_->first.get(),
+                    std::array<Copy, 2> copies{}; unsigned copyCount = 0;
+                    if (!plan || !plan->depthConversion) copies[copyCount++] = {(id<MTLTexture>)impl_->first.get(),
                          (id<MTLTexture>)impl_->snapshot->depth.get(),
                          impl_->snapshot->depthWidth, impl_->snapshot->depthHeight,
-                         impl_->snapshot->parameters.depth_subrect_x, impl_->snapshot->parameters.depth_subrect_y},
-                        {(id<MTLTexture>)impl_->second.get(),
+                         impl_->snapshot->parameters.depth_subrect_x, impl_->snapshot->parameters.depth_subrect_y};
+                    if (!plan || !plan->motionConversion) copies[copyCount++] = {(id<MTLTexture>)impl_->second.get(),
                          (id<MTLTexture>)impl_->snapshot->motion.get(),
                          impl_->snapshot->motionWidth, impl_->snapshot->motionHeight,
-                         impl_->snapshot->parameters.motion_subrect_x, impl_->snapshot->parameters.motion_subrect_y}
-                    }};
-                    if (!copyTextures(buffer, (id)fence,
-                                      copies.data(), copies.size(), execution->objects))
+                         impl_->snapshot->parameters.motion_subrect_x, impl_->snapshot->parameters.motion_subrect_y};
+                    if (copyCount && !copyTextures(buffer, (id)fence, copies.data(), copyCount, execution->objects))
                         return fail("snapshot_copy");
+                    if (plan) {
+                        auto encoder = [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
+                        if (!encoder) return fail("snapshot_encoder");
+                        execution->objects.emplace_back(encoder);
+                        struct EndSnapshotEncoding {
+                            id<MTL4ComputeCommandEncoder> encoder;
+                            ~EndSnapshotEncoding() { if (encoder) [encoder endEncoding]; }
+                        } scope{encoder};
+                        [encoder waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageDispatch];
+                        auto params = plan->motionParams;
+                        params.sourceOrigin[0] = snapshot.parameters.motion_subrect_x;
+                        params.sourceOrigin[1] = snapshot.parameters.motion_subrect_y;
+                        params.sceneOrigin[0] = snapshot.parameters.depth_subrect_x;
+                        params.sceneOrigin[1] = snapshot.parameters.depth_subrect_y;
+                        bool accepted = false;
+                        if (plan->motionConversion) accepted = dispatchPass(encoder,tableLease->object.get(),
+                            (id<MTLComputePipelineState>)(plan->depthConversion ? selected.kernels->depthMotionPipeline.get()
+                                                                             : selected.kernels->motionPipeline.get()),
+                            (id<MTLTexture>)impl_->second.get(),(id<MTLTexture>)snapshot.motion.get(),
+                            (id<MTLBuffer>)parameterLease->object.get(),MotionSlot,params,
+                            (id<MTLTexture>)snapshot.depth.get(),nil,(id<MTLTexture>)impl_->first.get());
+                        else {
+                            params.sourceOrigin[0] = params.sceneOrigin[0]; params.sourceOrigin[1] = params.sceneOrigin[1];
+                            params.sourceExtent[0] = snapshot.depthWidth; params.sourceExtent[1] = snapshot.depthHeight;
+                            accepted = dispatchPass(encoder,tableLease->object.get(),
+                                (id<MTLComputePipelineState>)selected.kernels->depthPipeline.get(),
+                                (id<MTLTexture>)impl_->first.get(),(id<MTLTexture>)snapshot.depth.get(),
+                                (id<MTLBuffer>)parameterLease->object.get(),DepthSlot,params);
+                        }
+                        if (!accepted) return fail("snapshot_normalization");
+                        [encoder updateFence:(id<MTLFence>)fence afterEncoderStages:MTLStageDispatch];
+                        [encoder endEncoding]; scope.encoder = nil;
+                    }
                     impl_->snapshot->produced.store(true, std::memory_order_release);
                     return true;
                 }
                 if (!impl_->snapshot->produced.load(std::memory_order_acquire)) return fail("generate_before_prepare_execution");
+                execution->objects.push_back(impl_->snapshot->depth); execution->objects.push_back(impl_->snapshot->motion);
+                const bool preparedGuides = bool(impl_->snapshot->guidePlan);
 
                 Object interpolator = configuration.factory;
                 if (!interpolator) return fail("encode_interpolator");
@@ -1092,37 +1198,33 @@ bool PreparedFrame::encode(
                 auto device = (id<MTLDevice>)configuration.device.get();
                 const auto& p = impl_->snapshot->parameters;
                 const auto& d = impl_->dispatch;
-                const NSUInteger guideWidth = configuration.renderGrid ? p.render_width : configuration.width;
-                const NSUInteger guideHeight = configuration.renderGrid ? p.render_height : configuration.height;
-                const NSUInteger motionTargetWidth = p.motion_width;
-                const NSUInteger motionTargetHeight = p.motion_height;
+                const auto layout = guideLayout(impl_->state->creation,*impl_->snapshot,configuration,d);
+                const NSUInteger guideWidth = layout.width, guideHeight = layout.height;
                 // Display-resolution motion already carries color-grid silhouettes; dilate
                 // only a render grid smaller than its sampling grid. A public (FSR)
                 // generation rect keeps the full display's sampling density.
-                const NSUInteger samplingWidth = impl_->dispatch.independent_subrects
-                    ? configuration.width : impl_->state->creation.display_width;
-                const NSUInteger samplingHeight = impl_->dispatch.independent_subrects
-                    ? configuration.height : impl_->state->creation.display_height;
-                const bool depthDilation =
-                    !configuration.renderGrid &&
-                    !(impl_->state->creation.flags & WMTFG_DISPLAY_RESOLUTION_MOTION_VECTORS) &&
-                    (impl_->snapshot->depthWidth < samplingWidth || impl_->snapshot->depthHeight < samplingHeight);
-                const bool motionConversion = depthDilation || p.reconstruct_camera_motion || p.motion_scale_x != 1 || p.motion_scale_y != 1 ||
-                    p.motion_vectors_invalid_value_present ||
-                    motionTargetWidth != guideWidth ||
-                    motionTargetHeight != guideHeight ||
-                    (impl_->state->creation.flags & WMTFG_MOTION_VECTORS_JITTERED);
-                const bool directDepth = exactDescriptorInput(
+                const bool depthDilation = layout.dilateDepth;
+                const bool directDepth = preparedGuides || exactDescriptorInput(
                     (id<MTLTexture>)impl_->snapshot->depth.get(), configuration.depth,
                     guideWidth, guideHeight, effect.depthTextureUsage, depthDilation);
-                const bool directMotion = exactDescriptorInput(
+                const bool directMotion = preparedGuides || exactDescriptorInput(
                     (id<MTLTexture>)impl_->snapshot->motion.get(), configuration.motion,
-                    guideWidth, guideHeight, effect.motionTextureUsage, motionConversion);
+                    guideWidth, guideHeight, effect.motionTextureUsage, layout.convertMotion);
+                // Both native inputs are read-only. When HUD-less and present
+                // identify the same source view/rect and conversion format, the
+                // same decoded pixels can serve both without a second dispatch.
+                const bool sharedSceneUi = configuration.ui != MTLPixelFormatInvalid &&
+                    configuration.ui == configuration.color &&
+                    !((effect.colorTextureUsage | effect.uiTextureUsage) & MTLTextureUsageShaderWrite) &&
+                    (!impl_->third || (impl_->third.get() == impl_->first.get() &&
+                        d.hudless_x == d.present_x && d.hudless_y == d.present_y));
+                const MTLTextureUsage currentUsage = effect.colorTextureUsage | MTLTextureUsageShaderRead |
+                    MTLTextureUsageShaderWrite | (sharedSceneUi ? effect.uiTextureUsage : MTLTextureUsageUnknown);
                 Object current = execution->scratchTexture(configuration.color,
                     configuration.outputWidth, configuration.outputHeight,
-                    effect.colorTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+                    currentUsage);
                 Object ui = configuration.ui == MTLPixelFormatInvalid ? Object{} :
-                    execution->scratchTexture(configuration.ui, configuration.outputWidth,
+                    sharedSceneUi ? current : execution->scratchTexture(configuration.ui, configuration.outputWidth,
                                    configuration.outputHeight, effect.uiTextureUsage |
                                    MTLTextureUsageShaderWrite);
                 Object normalizedDepth = directDepth ? impl_->snapshot->depth : execution->scratchTexture(configuration.depth,
@@ -1240,36 +1342,7 @@ bool PreparedFrame::encode(
                 depthParams.depthDilation = depthDilation;
                 depthParams.depthInverted = (state.creation.flags & WMTFG_DEPTH_INVERTED) != 0;
 
-                FgParams motionParams{};
-                motionParams.extent[0] = guideWidth;
-                motionParams.extent[1] = guideHeight;
-                // The generation rectangle is a placement offset, not a source offset.
-                // Resample the complete origin-zero motion domain into the active rect.
-                motionParams.sourceExtent[0] = impl_->snapshot->motionWidth;
-                motionParams.sourceExtent[1] = impl_->snapshot->motionHeight;
-                motionParams.motionTargetExtent[0] = p.motion_width;
-                motionParams.motionTargetExtent[1] = p.motion_height;
-                // MetalFX motion and reconstructed camera displacement are in
-                // input-content pixels, not output-color pixels.
-                motionParams.outputExtent[0] = guideWidth;
-                motionParams.outputExtent[1] = guideHeight;
-                motionParams.motionScale[0] = p.motion_scale_x;
-                motionParams.motionScale[1] = p.motion_scale_y;
-                motionParams.reconstructCameraMotion = p.reconstruct_camera_motion;
-                motionParams.motionVectorsInvalidValue = p.motion_vectors_invalid_value;
-                motionParams.motionVectorsInvalidValuePresent = p.motion_vectors_invalid_value_present;
-                motionParams.depthDilation = depthDilation;
-                motionParams.depthInverted = depthParams.depthInverted;
-                motionParams.depthSourceExtent[0] = impl_->snapshot->depthWidth;
-                motionParams.depthSourceExtent[1] = impl_->snapshot->depthHeight;
-                std::memcpy(motionParams.clipToPreviousClip, p.clip_to_previous_clip, sizeof(p.clip_to_previous_clip));
-                if ((state.creation.flags & WMTFG_MOTION_VECTORS_JITTERED) &&
-                    impl_->snapshot->hasPreviousJitter && !reset) {
-                    motionParams.jitterCancellation[0] =
-                        (impl_->snapshot->previousJitterX - p.jitter_x) * p.motion_width / p.render_width;
-                    motionParams.jitterCancellation[1] =
-                        (impl_->snapshot->previousJitterY - p.jitter_y) * p.motion_height / p.render_height;
-                }
+                FgParams motionParams = guideMotionParams(state.creation,*impl_->snapshot,layout,reset);
 
                 auto parameterLease = impl_->state->pool->parameters(device);
                 auto tableLease = impl_->state->pool->table(device);
@@ -1287,7 +1360,7 @@ bool PreparedFrame::encode(
                 const NSUInteger copyY = d.output_subrect_only ? d.present_y : 0;
                 const NSUInteger copyWidth = d.output_subrect_only ? configuration.outputWidth : present.width;
                 const NSUInteger copyHeight = d.output_subrect_only ? configuration.outputHeight : present.height;
-                std::array<Copy, 8> copies{};
+                std::array<Copy, 10> copies{};
                 unsigned copyCount = 0;
                 // The output scatter writes every generation-rect pixel. A full
                 // output keeps only the present color outside that rect; a
@@ -1306,13 +1379,30 @@ bool PreparedFrame::encode(
                     for (const auto& band : bands)
                         if (band.width && band.height) copies[copyCount++] = band;
                 }
-                if (impl_->realOutput) copies[copyCount++] = {present, (id<MTLTexture>)impl_->realOutput.get(),
-                    copyWidth, copyHeight, copyX, copyY,
-                    d.output_subrect_only ? d.real_x : 0, d.output_subrect_only ? d.real_y : 0};
-                if (impl_->realOutput && !d.output_subrect_only &&
-                    (d.real_x != d.present_x || d.real_y != d.present_y))
-                    copies[copyCount++] = {present, (id<MTLTexture>)impl_->realOutput.get(),
-                        configuration.outputWidth, configuration.outputHeight, d.present_x, d.present_y, d.real_x, d.real_y};
+                if (impl_->realOutput) {
+                    auto real = (id<MTLTexture>)impl_->realOutput.get();
+                    if (!d.output_subrect_only && (d.real_x != d.present_x || d.real_y != d.present_y)) {
+                        // The moved ROI overwrites its destination. Preserve the
+                        // four outside bands rather than copying that ROI twice.
+                        // A separately sized real output can place its ROI partly
+                        // outside the present-sized baseline. Exclude only their
+                        // intersection; never subtract an out-of-range coordinate.
+                        const NSUInteger left = std::min<NSUInteger>(d.real_x,present.width);
+                        const NSUInteger top = std::min<NSUInteger>(d.real_y,present.height);
+                        const NSUInteger right = std::min<NSUInteger>(d.real_x + configuration.outputWidth,present.width);
+                        const NSUInteger bottom = std::min<NSUInteger>(d.real_y + configuration.outputHeight,present.height);
+                        const std::array<Copy,4> bands{{
+                            {present,real,present.width,top,0,0,0,0},
+                            {present,real,present.width,present.height-bottom,0,bottom,0,bottom},
+                            {present,real,left,bottom-top,0,top,0,top},
+                            {present,real,present.width-right,bottom-top,right,top,right,top},
+                        }};
+                        for (const auto& band : bands) if (band.width && band.height) copies[copyCount++] = band;
+                        copies[copyCount++] = {present,real,configuration.outputWidth,configuration.outputHeight,
+                            d.present_x,d.present_y,d.real_x,d.real_y};
+                    } else copies[copyCount++] = {present,real,copyWidth,copyHeight,copyX,copyY,
+                        d.output_subrect_only ? d.real_x : 0,d.output_subrect_only ? d.real_y : 0};
+                }
                 if (cropDistortion && !decodeDistortion) copies[copyCount++] = {distortionSource, (id<MTLTexture>)distortion.get(),
                     d.distortion_width, d.distortion_height, d.distortion_x, d.distortion_y};
                 // One prepass encoder: baseline copies, then independent decode and
@@ -1347,7 +1437,7 @@ bool PreparedFrame::encode(
                                   (id<MTLTexture>)sceneView.get(), (id<MTLTexture>)current.get(),
                                   parameters, SceneSlot, sceneParams))
                     return fail("encode_scene_decode");
-                if (ui && !dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->decodePipeline.get(),
+                if (ui && !sharedSceneUi && !dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->decodePipeline.get(),
                                         (id<MTLTexture>)presentView.get(), (id<MTLTexture>)ui.get(),
                                         parameters, UiSlot, uiParams))
                     return fail("encode_ui_decode");
@@ -1682,6 +1772,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
 
             Resources resources;
             auto implementation = std::make_shared<PreparedFrame::Impl>();
+            std::shared_ptr<const PreparedGuidePlan> candidateGuidePlan;
             implementation->state = state;
             std::array<std::uint64_t, 7> addresses{};
             std::uint64_t frame = generate ? d->frame_id : p->frame_id;
@@ -1731,7 +1822,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                         break;
                     }
                 if (!configuration)
-                    configuration = configure(*state, command, *p, depth,
+                    configuration = configure(*state, command, *p, depth.pixelFormat,
                         MTLPixelFormatRGBA16Float, MTLPixelFormatInvalid,
                         state->creation.display_width, state->creation.display_height, 0, false);
                 if (!configuration) return finish(Unsupported);
@@ -1743,6 +1834,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 auto snapshot = std::make_shared<Snapshot>();
                 implementation->configuration = configuration;
                 snapshot->parameters = *p;
+                snapshot->depthFormat = depth.pixelFormat; snapshot->motionFormat = motion.pixelFormat;
                 snapshot->depthWidth = p->render_width;
                 snapshot->depthHeight = p->render_height;
                 snapshot->motionWidth = motionWidth;
@@ -1751,7 +1843,6 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     state->preparedFrame + 1 == frame && !p->reset;
                 snapshot->previousJitterX = state->preparedJitterX;
                 snapshot->previousJitterY = state->preparedJitterY;
-                auto nativeInputs = (id<MTLFXFrameInterpolatorBase>)configuration->factory.get();
                 // A Generate recorded next on the same list reads the inputs before the
                 // application can change them. Every Generate pass samples only the
                 // origin-zero snapshot extent, and MetalFX consumes an input directly
@@ -1763,18 +1854,6 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     snapshot->depth = Object(depth);
                     snapshot->motion = Object(motion);
                     snapshot->produced.store(true, std::memory_order_relaxed);
-                } else {
-                    snapshot->depthScratch = state->pool->texture(
-                        (id<MTLDevice>)configuration->device.get(), configuration->depth,
-                        p->render_width, p->render_height,
-                        nativeInputs.depthTextureUsage | MTLTextureUsageShaderRead);
-                    snapshot->motionScratch = state->pool->texture(
-                        (id<MTLDevice>)configuration->device.get(), motion.pixelFormat,
-                        motionWidth, motionHeight,
-                        nativeInputs.motionTextureUsage | MTLTextureUsageShaderRead);
-                    if (!snapshot->depthScratch || !snapshot->motionScratch) return finish(Unsupported);
-                    snapshot->depth = snapshot->depthScratch->object;
-                    snapshot->motion = snapshot->motionScratch->object;
                 }
                 state->hasPreparedJitter = true;
                 state->preparedFrame = frame;
@@ -1894,10 +1973,30 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 }
                 implementation->configuration = configure(*state, command,
                     (*found)->parameters,
-                    (id<MTLTexture>)(*found)->depth.get(), scene.pixelFormat,
+                    (*found)->depthFormat, scene.pixelFormat,
                     uiFormat, rectWidth, rectHeight, d->backbuffer_transfer_function, d->distortion != 0);
                 if (!implementation->configuration) return finish(Unsupported);
                 implementation->snapshot = *found;
+                // Generate has now fixed the rect/grid/camera contract. Fuse only
+                // when Prepare has not executed, and no encode-time history reset
+                // can alter jitter cancellation. Otherwise keep raw snapshots.
+                auto& snapshot = *implementation->snapshot;
+                std::lock_guard planLock(snapshot.planMutex);
+                if (!snapshot.produced.load(std::memory_order_acquire) &&
+                    !(state->creation.flags & WMTFG_MOTION_VECTORS_JITTERED)) {
+                    const auto& config = *implementation->configuration;
+                    const auto layout = guideLayout(state->creation,snapshot,config,implementation->dispatch);
+                    const bool depthConversion = layout.dilateDepth || snapshot.depthWidth != layout.width || snapshot.depthHeight != layout.height;
+                    const bool motionConversion = layout.convertMotion || snapshot.motionFormat != config.motion ||
+                        snapshot.motionWidth != layout.width || snapshot.motionHeight != layout.height;
+                    if (depthConversion || motionConversion) {
+                        auto plan = std::make_shared<PreparedGuidePlan>();
+                        plan->configuration = implementation->configuration; plan->layout = layout;
+                        plan->depthConversion = depthConversion; plan->motionConversion = motionConversion;
+                        plan->motionParams = guideMotionParams(state->creation,snapshot,layout,true);
+                        candidateGuidePlan = std::move(plan);
+                    }
+                }
             }
             implementation->first = Object((id)resources.values[0].texture);
             implementation->second = Object((id)resources.values[1].texture);
@@ -1916,6 +2015,14 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
             if (!generate && state->generationEnabled)
                 state->frames.insert(frame, implementation->snapshot);
             if (!recorded) { if (!generate) state->frames.erase(frame); return finish(Parameter); }
+            // Publish only after all fallible owner/record admission succeeded.
+            // A rejected Generate must never alter a future Prepare's snapshot.
+            if (candidateGuidePlan) {
+                auto& snapshot = *implementation->snapshot;
+                std::lock_guard planLock(snapshot.planMutex);
+                if (!snapshot.produced.load(std::memory_order_acquire))
+                    snapshot.guidePlan = std::move(candidateGuidePlan);
+            }
             *recorded = std::move(prepared);
             if (generate) state->frames.erase(frame);
             state->providerValidated = true;

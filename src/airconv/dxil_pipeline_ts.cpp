@@ -112,11 +112,12 @@ llvm::Value *element_row(llvm::IRBuilder<> &builder, const IOElement &element, l
  * or 0 when the register file is not per vertex.
  */
 llvm::Error lower_register_loads(
-  dxbc::context &ctx, llvm::StringRef name, const std::vector<IOElement> &elements,
-  const dxbc::register_file &registers, unsigned vertex_operand, llvm::StringRef stage
+  dxbc::context &ctx, llvm::StringRef name, llvm::ArrayRef<llvm::CallInst *> calls,
+  const std::vector<IOElement> &elements,
+  const dxbc::register_file &registers, unsigned vertex_operand, llvm::StringRef stage, bool raw_half = false
 ) {
   auto &builder = ctx.builder;
-  for (auto *call : CollectCalls(*ctx.function, name)) {
+  for (auto *call : calls) {
     auto id = ConstantOperand(*call, 1);
     if (!id)
       return id.takeError();
@@ -131,7 +132,8 @@ llvm::Error lower_register_loads(
     if (!registers.ptr_int4)
       return createError("DXIL " + stage + " shader dx.op." + name + " has no register file in this stage");
     builder.SetInsertPoint(call);
-    const bool as_float = call->getType()->isFloatingPointTy();
+    const bool half_bits = raw_half && element->component_type == COMPONENT_F16 && call->getType()->isHalfTy();
+    const bool as_float = call->getType()->isFloatingPointTy() && !half_bits;
     llvm::SmallVector<llvm::Value *, 1> prefix;
     if (vertex_operand)
       prefix.push_back(builder.CreateZExtOrTrunc(call->getArgOperand(vertex_operand), builder.getInt32Ty()));
@@ -140,7 +142,9 @@ llvm::Error lower_register_loads(
       element->start_col + *col
     );
     auto *lane = builder.CreateLoad(as_float ? builder.getFloatTy() : builder.getInt32Ty(), lane_ptr);
-    call->replaceAllUsesWith(NarrowLane(builder, lane, call->getType()));
+    call->replaceAllUsesWith(half_bits
+      ? builder.CreateBitCast(builder.CreateTrunc(lane, builder.getInt16Ty()), builder.getHalfTy())
+      : NarrowLane(builder, lane, call->getType()));
     call->eraseFromParent();
   }
   return llvm::Error::success();
@@ -148,11 +152,12 @@ llvm::Error lower_register_loads(
 
 /* Replace every `dx.op.<name>` write (value at operand 4) with a store to its lane in `registers`. */
 llvm::Error lower_register_stores(
-  dxbc::context &ctx, llvm::StringRef name, const std::vector<IOElement> &elements,
+  dxbc::context &ctx, llvm::StringRef name, llvm::ArrayRef<llvm::CallInst *> calls,
+  const std::vector<IOElement> &elements,
   const dxbc::register_file &registers, llvm::Value *vertex, llvm::StringRef stage
 ) {
   auto &builder = ctx.builder;
-  for (auto *call : CollectCalls(*ctx.function, name)) {
+  for (auto *call : calls) {
     auto id = ConstantOperand(*call, 1);
     if (!id)
       return id.takeError();
@@ -184,9 +189,12 @@ llvm::Error lower_register_stores(
 }
 
 /* Replace every `dx.op.<name>` call with `value` (a system value the converter provides). */
-llvm::Error lower_system_value(dxbc::context &ctx, llvm::StringRef name, llvm::Value *value, llvm::StringRef stage) {
+llvm::Error lower_system_value(
+  dxbc::context &ctx, llvm::StringRef name, llvm::ArrayRef<llvm::CallInst *> calls,
+  llvm::Value *value, llvm::StringRef stage
+) {
   auto &builder = ctx.builder;
-  for (auto *call : CollectCalls(*ctx.function, name)) {
+  for (auto *call : calls) {
     if (!value)
       return createError("DXIL " + stage + " shader dx.op." + name + " is not available in this stage");
     builder.SetInsertPoint(call);
@@ -200,23 +208,31 @@ llvm::Error lower_system_value(dxbc::context &ctx, llvm::StringRef name, llvm::V
 llvm::Error lower_hull_body(PipelineStage &stage, dxbc::context &ctx) {
   auto &signature = stage.signature;
   auto &resource = ctx.resource;
-  if (auto error = lower_register_loads(ctx, "loadInput", signature.inputs, resource.input, 4, "hull"))
+  auto calls = CollectCalls(*ctx.function, {
+    "loadInput", "loadOutputControlPoint", "storeOutput", "storePatchConstant", "outputControlPointID", "primitiveID"
+  });
+  if (auto error = lower_register_loads(
+        ctx, "loadInput", calls["loadInput"], signature.inputs, resource.input, 4, "hull", stage.raw_half_inputs
+      ))
     return error;
   if (auto error = lower_register_loads(
-        ctx, "loadOutputControlPoint", signature.outputs, resource.output, 4, "hull"
+        ctx, "loadOutputControlPoint", calls["loadOutputControlPoint"], signature.outputs, resource.output, 4, "hull"
       ))
     return error;
   if (auto error = lower_register_stores(
-        ctx, "storeOutput", signature.outputs, resource.output, resource.thread_id_in_patch, "hull"
+        ctx, "storeOutput", calls["storeOutput"], signature.outputs, resource.output, resource.thread_id_in_patch, "hull"
       ))
     return error;
   if (auto error = lower_register_stores(
-        ctx, "storePatchConstant", signature.patch_constants, resource.patch_constant_output, nullptr, "hull"
+        ctx, "storePatchConstant", calls["storePatchConstant"], signature.patch_constants,
+        resource.patch_constant_output, nullptr, "hull"
       ))
     return error;
-  if (auto error = lower_system_value(ctx, "outputControlPointID", resource.thread_id_in_patch, "hull"))
+  if (auto error = lower_system_value(
+        ctx, "outputControlPointID", calls["outputControlPointID"], resource.thread_id_in_patch, "hull"
+      ))
     return error;
-  return lower_system_value(ctx, "primitiveID", resource.patch_id, "hull");
+  return lower_system_value(ctx, "primitiveID", calls["primitiveID"], resource.patch_id, "hull");
 }
 
 /* dx.op I/O of the domain shader body. */
@@ -224,7 +240,10 @@ llvm::Error lower_domain_body(PipelineStage &stage, dxbc::context &ctx) {
   auto &signature = stage.signature;
   auto &resource = ctx.resource;
   auto &builder = ctx.builder;
-  for (auto *call : CollectCalls(*ctx.function, "domainLocation")) {
+  auto calls = CollectCalls(*ctx.function, {
+    "domainLocation", "loadInput", "loadPatchConstant", "storeOutput", "primitiveID"
+  });
+  for (auto *call : calls["domainLocation"]) {
     auto component = ConstantOperand(*call, 1);
     if (!component)
       return component.takeError();
@@ -234,15 +253,18 @@ llvm::Error lower_domain_body(PipelineStage &stage, dxbc::context &ctx) {
     call->replaceAllUsesWith(NarrowLane(builder, builder.CreateExtractElement(resource.domain, *component), call->getType()));
     call->eraseFromParent();
   }
-  if (auto error = lower_register_loads(ctx, "loadInput", signature.inputs, resource.input, 4, "domain"))
+  if (auto error = lower_register_loads(ctx, "loadInput", calls["loadInput"], signature.inputs, resource.input, 4, "domain"))
     return error;
   if (auto error = lower_register_loads(
-        ctx, "loadPatchConstant", signature.patch_constants, resource.patch_constant_output, 0, "domain"
+        ctx, "loadPatchConstant", calls["loadPatchConstant"], signature.patch_constants,
+        resource.patch_constant_output, 0, "domain"
       ))
     return error;
-  if (auto error = lower_register_stores(ctx, "storeOutput", signature.outputs, resource.output, nullptr, "domain"))
+  if (auto error = lower_register_stores(
+        ctx, "storeOutput", calls["storeOutput"], signature.outputs, resource.output, nullptr, "domain"
+      ))
     return error;
-  return lower_system_value(ctx, "primitiveID", resource.patch_id, "domain");
+  return lower_system_value(ctx, "primitiveID", calls["primitiveID"], resource.patch_id, "domain");
 }
 
 } // namespace
@@ -364,10 +386,23 @@ llvm::Error BindHullStage(PipelineStage &stage) {
   view.shader_info.no_control_point_phase_passthrough = true;
   /* The control points the patch-constant phase reads live in threadgroup memory and are
    * copied to the payload afterwards (the DXBC BasicBlockHullShaderWriteOutput step). */
-  view.shader_info.output_control_point_read =
-    !CollectCalls(*info.patch_constant_function, "loadOutputControlPoint").empty();
+  view.shader_info.output_control_point_read = false;
+  bool independent_patch_constant = true;
+  // Unknown/helper calls may hide a CP-output dependency. Direct DXIL I/O is
+  // lowered here; do not infer independence across an unexamined call graph.
+  for (auto &block : *info.patch_constant_function)
+    for (auto &instruction : block)
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+        auto *callee = call->getCalledFunction();
+        if (callee && (callee->getName() == "dx.op.loadOutputControlPoint" ||
+                       callee->getName().startswith("dx.op.loadOutputControlPoint.")))
+          view.shader_info.output_control_point_read = true;
+        if (!callee || !callee->isDeclaration())
+          independent_patch_constant = false;
+      }
+  independent_patch_constant &= !view.shader_info.output_control_point_read;
 
-  view.body_emitter = [&stage](dxbc::context &ctx, llvm::BasicBlock *return_bb)
+  view.body_emitter = [&stage, independent_patch_constant](dxbc::context &ctx, llvm::BasicBlock *return_bb)
     -> llvm::Expected<llvm::BasicBlock *> {
     auto &builder = ctx.builder;
     auto &llvm_context = ctx.llvm;
@@ -398,7 +433,8 @@ llvm::Error BindHullStage(PipelineStage &stage) {
     if (!patch_constant_body)
       return patch_constant_body.takeError();
     builder.SetInsertPoint(control_point_end);
-    ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
+    if (!independent_patch_constant)
+      ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
     builder.CreateCondBr(
       builder.CreateICmpEQ(thread, builder.getInt32(0)), *patch_constant_body, patch_constant_end
     );
@@ -419,7 +455,8 @@ llvm::Error BindHullStage(PipelineStage &stage) {
       builder.CreateStore(builder.CreateLoad(type, source), ctx.resource.hull_cp_passthrough_dst);
       builder.CreateBr(write_end);
       builder.SetInsertPoint(write_end);
-      ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
+      // The post-PCF barrier already joins the phases. No object invocation
+      // reads these payload copies; Metal publishes them to the mesh stage.
     }
     builder.CreateBr(return_bb);
 

@@ -104,14 +104,16 @@ def main() -> int:
             if (evidence["status"] != "pass" or evidence["windows_abi"] != "arm64x" or
                     any(source_cut.get(name) != digest for name, digest in paired_cut.items())):
                 raise RuntimeError("paired DLLs must match the accepted owned source cut")
-            required_modules = {"nvapi64.dll"} if args.with_nvapi else set()
+            required_modules = {"amdxc64.dll"}
+            if args.with_nvapi:
+                required_modules.add("nvapi64.dll")
             if args.with_nvngx:
                 required_modules.add("nvngx.dll")
             if args.with_fsr:
                 required_modules.update(("amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll",
                                          "amd_fidelityfx_denoiser_dx12.dll"))
             if not required_modules.issubset(Path(artifact["path"]).name for artifact in evidence["artifacts"]):
-                raise RuntimeError("paired build is missing selected optional frontends")
+                raise RuntimeError("paired build is missing required or selected frontends")
             for artifact in evidence["artifacts"]:
                 image = Path(artifact["path"])
                 if hashlib.sha256(image.read_bytes()).hexdigest() != artifact["sha256"]:

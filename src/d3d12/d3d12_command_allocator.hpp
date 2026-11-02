@@ -86,6 +86,17 @@ struct RecordedStateEvent {
   D3D12_BARRIER_ACCESS access_after = D3D12_BARRIER_ACCESS_NO_ACCESS;
 };
 
+struct ClosedDescriptorSpan {
+  MTLD3D12DescriptorHeap *heap;
+  uint32_t first, count;
+  uint64_t stages;
+  bool writable;
+};
+struct ClosedPassShape {
+  const EncoderData *record;
+  std::vector<ClosedDescriptorSpan> descriptors;
+  bool descriptors_complete = true, compute_commands_complete = true;
+};
 struct RecordingHead : EncoderData {
   std::atomic<uint32_t> in_flight{0};
   std::vector<RecordedStateEvent> state_events;
@@ -93,11 +104,17 @@ struct RecordingHead : EncoderData {
   std::vector<Com<ID3D12DescriptorHeap>> descriptor_heaps;
   std::vector<Rc<BufferAllocation>> root_allocations;
   std::unordered_set<BufferAllocation *> root_allocation_set;
+  // Sealed only by Close. Execution resolves slot contents and current physical
+  // backing every time; no volatile descriptor or GPU value is stored here.
+  std::vector<ClosedPassShape> pass_shapes;
+  std::unordered_map<const EncoderData *, size_t> pass_indices;
+  size_t raytracing_passes = 0;
 };
 
 class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllocator> {
   friend class MTLD3D12GraphicsCommandListImpl;
   friend struct SimpleCommandContext<MTLD3D12CommandAllocatorImpl>;
+  HRESULT SealRecordingPlan();
 
   D3D12_COMMAND_LIST_TYPE type_;
   std::shared_ptr<std::atomic<uint64_t>> recording_generation_ = std::make_shared<std::atomic<uint64_t>>(0);
@@ -105,6 +122,9 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   uint32_t outstanding_submissions_ = 0;
 
   std::vector<void *> spilled_cpu_heap_;
+  // Retired 4MiB slabs only; no recording pointer is moved or recycled early.
+  std::array<void *, 3> retired_cpu_heaps_{};
+  size_t retired_cpu_heap_count_ = 0;
   void *cpu_heap_ = nullptr;
   size_t cpu_heap_offset_ = 0;
 
@@ -136,7 +156,16 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   // new recording after CommandList::Reset must not move earlier entry heads.
   owned_graphics::StableSubmissionStorage<RecordingHead> encoder_lists_;
 
-  small_vector<WMT::Reference<WMT::IndirectCommandBuffer>, 4> icb_;
+  struct CachedICB {
+    WMTIndirectCommandBufferInfo info{};
+    WMTResourceOptions options;
+    WMT::Reference<WMT::IndirectCommandBuffer> buffer;
+    uint64_t capacity, resource_id, last_epoch;
+    bool used = false;
+  };
+  std::vector<CachedICB> icb_;
+  WMT::Reference<WMT::IndirectCommandBuffer> AcquireICB(WMTIndirectCommandBufferInfo &info,
+      uint64_t count, WMTResourceOptions options);
 
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
   ClearRTV<MTLD3D12CommandAllocatorImpl, WMT4::Compiler, WMT4::Library, WMT4::Function> clear_rtv_;
@@ -254,11 +283,12 @@ public:
       encoder_current->endpoint_reason = RecordedEndpointReason::ListEnd;
       InvalidateCurrentPass();
     }
+    const HRESULT sealed = SealRecordingPlan();
     encoder_last = nullptr;
     recording_head_ = nullptr;
     *pEncoderCount = encoder_count_;
     encoder_count_ = 0;
-    return S_OK;
+    return sealed;
   }
 
   void *
@@ -269,11 +299,16 @@ public:
     if (unlikely(aligned >= kCPUHeapSize || Length >= kCPUHeapSize - aligned)) {
       // Neither the current cursor nor ownership changes until both allocations
       // succeed. Existing command pointers must survive either failure.
-      std::unique_ptr<void, decltype(&free)> next(malloc(kCPUHeapSize), &free);
-      if (!next)
-        throw std::bad_alloc();
-      spilled_cpu_heap_.push_back(cpu_heap_);
-      cpu_heap_ = next.release();
+      if (retired_cpu_heap_count_) {
+        spilled_cpu_heap_.push_back(cpu_heap_); // May throw; the spare still belongs to us.
+        cpu_heap_ = retired_cpu_heaps_[--retired_cpu_heap_count_];
+        retired_cpu_heaps_[retired_cpu_heap_count_] = nullptr;
+      } else {
+        std::unique_ptr<void, decltype(&free)> next(malloc(kCPUHeapSize), &free);
+        if (!next) throw std::bad_alloc();
+        spilled_cpu_heap_.push_back(cpu_heap_);
+        cpu_heap_ = next.release();
+      }
       aligned = 0;
     }
     cpu_heap_offset_ = aligned + Length;

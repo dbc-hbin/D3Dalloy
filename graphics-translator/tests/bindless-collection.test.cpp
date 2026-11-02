@@ -25,6 +25,7 @@ struct Heap {
   void GetDesc(D3D12_DESCRIPTOR_HEAP_DESC *desc) const { desc->NumDescriptors = size; }
   void GetGPUDescriptorHandleForHeapStart(D3D12_GPU_DESCRIPTOR_HANDLE *handle) const { handle->ptr = start; }
   uint64_t GetDescriptor(uint64_t index) { assert(index < size); visits.push_back(index); return index; }
+  uint64_t GetTextureResourceId(uint64_t index) const { assert(index < size); return 0x100000 + index; }
 };
 struct Table {
   Root *rootsig;
@@ -36,7 +37,7 @@ struct Table {
 };
 struct Probe {
   void append_descriptor(Heap *heap, uint64_t index) { heap->GetDescriptor(index); }
-  void append_descriptor(uint64_t) {}
+  void append_descriptor(uint64_t index, uint64_t texture) { assert(texture == 0x100000 + index); }
   void standard(std::span<const Table> tables) {
 #include STANDARD_LOOP
   }

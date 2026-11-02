@@ -5,6 +5,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 namespace d3dalloy {
 class MTLD3D12Device;
@@ -20,6 +21,7 @@ std::array<D3D12_RESOURCE_STATES, MTL_RAY_REGENERATION_RESOURCE_COUNT>
 GetOwnedRayRegenerationStates(const std::shared_ptr<OwnedRayRegenerationFrame> &);
 bool IsOwnedRayRegenerationOutput(size_t index);
 // See OwnedTemporalFrameHistoryQueue.
+std::mutex &OwnedRayRegenerationSubmissionMutex(const std::shared_ptr<OwnedRayRegenerationFrame> &);
 uint64_t OwnedRayRegenerationFrameHistoryQueue(const std::shared_ptr<OwnedRayRegenerationFrame> &);
 void EncodeOwnedRayRegenerationFrame(const std::shared_ptr<OwnedRayRegenerationFrame> &,
     WMT::MTL4CommandBuffer, WMT::Fence, uint64_t queue,

@@ -52,7 +52,7 @@ configure_file(output: 'd3d12_core_generation.h', configuration: core_generation
 
 d3d12_dll = shared_library('d3d12', d3d12_src,
   name_prefix         : '',
-  dependencies        : [ dxgi_dep, d3dalloy_dep, airconv_forward_dep, util_dep, winemetal_dep, dxbc_parser_dep ],
+  dependencies        : [ dxgi_dep, d3dalloy_dep, airconv_forward_dep, util_dep, winemetal_dep, dxbc_parser_dep, cpp.find_library('ntdll') ],
   include_directories : [ d3dalloy_include_path ],
   install             : true,
   install_dir         : windows_native_install_dir,

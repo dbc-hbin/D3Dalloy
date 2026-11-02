@@ -1,5 +1,6 @@
 // Compile extracted production methods, as in depth-stencil-state.test.cpp.
 #include <cassert>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -140,6 +141,8 @@ struct Device {
 
 struct Arena {
   std::vector<void *> spilled_cpu_heap_;
+  std::array<void *,3> retired_cpu_heaps_{};
+  size_t retired_cpu_heap_count_=0;
   void *cpu_heap_ = nullptr;
   size_t cpu_heap_offset_ = 0;
   int type_ = D3D12_COMMAND_LIST_TYPE_COMPUTE;
@@ -149,7 +152,10 @@ struct Arena {
   EncoderData head;
   EncoderData *encoder_current = nullptr, *encoder_last = nullptr, *recording_head_ = nullptr;
   size_t encoder_count_ = 0;
-  std::vector<int> icb_;
+  struct CachedICB {bool used=false;};
+  std::vector<CachedICB> icb_;
+  HRESULT seal_result=S_OK;
+  HRESULT SealRecordingPlan() {return seal_result;}
   struct CopyTemp { void free_blocks(uint64_t) {} } copy_temp_allocator_;
   uint64_t copy_temp_version_ = 0;
 
@@ -174,7 +180,8 @@ struct Arena {
     for (auto *pointer : spilled_cpu_heap_) arenaFree(pointer);
     spilled_cpu_heap_.clear();
   }
-  ~Arena() { releaseRecords(); arenaFree(cpu_heap_); }
+  ~Arena() { releaseRecords(); arenaFree(cpu_heap_);
+    for(size_t i=0;i<retired_cpu_heap_count_;++i)arenaFree(retired_cpu_heaps_[i]); }
 
 #define malloc arenaMalloc
 #define free arenaFree
@@ -319,6 +326,21 @@ void testRecordingFailure(bool passAllocation) {
           "first recording failure survives later commands and Close");
   require(!arena.encoder_last && !arena.encoder_current, "failed Close releases recording slot");
 }
+void testRetiredSpareAndSealFailure() {
+  Arena arena;Device device;
+  require(arena.Initialize()==S_OK,"spare initialize");
+  void* spare=arenaMalloc(kCPUHeapSize);
+  arena.retired_cpu_heaps_[arena.retired_cpu_heap_count_++]=spare;
+  fillCurrent(arena);const auto original=arena.cpu_heap_;const auto attempts=malloc_attempts;
+  fail_new=true;expectAllocationFailure([&]{arena.AllocateCPUHeap(128,16);});fail_new=false;
+  require(arena.cpu_heap_==original && arena.retired_cpu_heap_count_==1 &&
+      arena.retired_cpu_heaps_[0]==spare && malloc_attempts==attempts,"spare metadata failure preserves ownership");
+  require(arena.AllocateCPUHeap(128,16)==spare && arena.retired_cpu_heap_count_==0 &&
+      malloc_attempts==attempts,"retired spare reused without malloc");
+  MTLD3D12GraphicsCommandListImpl list(arena,device);arena.seal_result=E_OUTOFMEMORY;
+  require(list.Close()==E_OUTOFMEMORY && !list.owned_closed_valid && !arena.encoder_last,
+      "Close seal failure cannot publish executable plan");
+}
 
 void testFirstErrorAndHresult() {
   {
@@ -395,6 +417,7 @@ int main() {
   testRecordingFailure(false);
   testRecordingFailure(true);
   testFirstErrorAndHresult();
+  testRetiredSpareAndSealFailure();
   testSignalTrace(false, false);
   testSignalTrace(true, false);
   testSignalTrace(true, true);

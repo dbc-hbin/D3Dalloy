@@ -13,3 +13,4 @@ WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T lib_6_8 -D 
   "$here/work-graphs-linkage.hlsl" -Fo "$out/work-graphs-link-helpers.dxil"
 WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T lib_6_8 -D WG_LINK_ROOT_SUBOBJECTS \
   "$here/work-graphs-linkage.hlsl" -Fo "$out/work-graphs-root-subobjects.dxil"
+WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T lib_6_8 "$here/workgraph-batches.hlsl" -Fo "$out/workgraph-batches.dxil"

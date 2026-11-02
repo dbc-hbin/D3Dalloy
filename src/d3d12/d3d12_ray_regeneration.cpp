@@ -26,6 +26,7 @@ struct Core {
   WMT::Reference<WMT::Object> feature;
   WMT::Reference<WMT::SharedEvent> timeline;
   std::mutex mutex;
+  std::mutex submission_mutex;
   uint64_t sequence = 0;
   uint64_t last_queue = 0; // owned id of the queue that encoded `sequence`
   ~Core() {
@@ -164,6 +165,9 @@ GetOwnedRayRegenerationResources(const std::shared_ptr<OwnedRayRegenerationFrame
 std::array<D3D12_RESOURCE_STATES, MTL_RAY_REGENERATION_RESOURCE_COUNT>
 GetOwnedRayRegenerationStates(const std::shared_ptr<OwnedRayRegenerationFrame> &frame) {
   return frame->states;
+}
+std::mutex &OwnedRayRegenerationSubmissionMutex(const std::shared_ptr<OwnedRayRegenerationFrame> &frame) {
+  return frame->core->submission_mutex;
 }
 uint64_t OwnedRayRegenerationFrameHistoryQueue(const std::shared_ptr<OwnedRayRegenerationFrame> &frame) {
   auto &core = *frame->core;
