@@ -34,5 +34,8 @@ prefixes
 /external/nvapi/docs/
 /graphics-translator/D3D12-CORE-CONTRACTS-PROVENANCE.txt
 
+# Publish only the root project overview.
+!/README.md
+
 # This vendor README contains license and copyright notices.
 !/include/native/directx/README.md
