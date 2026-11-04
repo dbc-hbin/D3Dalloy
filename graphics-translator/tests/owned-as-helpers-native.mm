@@ -203,6 +203,29 @@ static void scalarCases() {
     uint64_t expected[2] = {operation==0?512ull:operation==1?104ull:operation==2?216ull:512ull,0};
     equal("scalar-query",output.contents,expected,operation==2?16:8);
   }
+  // The native size write at byte 48 has cleared the marker at byte 52.
+  // Exercise known markers and a relocated shadow with two surviving pointers.
+  for (uint32_t marker : {0u, 1u, 3u}) for (bool compact : {false, true}) {
+    constexpr uint32_t geometryCount = 4;
+    Metadata metadata{0x53415844,1,0,geometryCount,96*geometryCount,2048,100,0,2048};
+    std::memset(header.contents, 0xa7, header.length);
+    auto *bytes = static_cast<uint8_t *>(header.contents);
+    std::memcpy(bytes + 16, &metadata, sizeof(metadata));
+    for (unsigned i = 0; i < geometryCount; ++i) {
+      uint64_t address = marker != 1 && (i == 0 || i == 2) ? 0x1000u + i : 0;
+      std::memcpy(bytes + 64 + 96*i + 64, &address, sizeof(address));
+    }
+    std::vector<uint8_t> expected(bytes, bytes + header.length);
+    metadata.reserved = marker ? marker : 3;
+    if (compact) metadata.currentSize = 768;
+    std::memcpy(expected.data() + 16, &metadata, sizeof(metadata));
+    struct { uint64_t source,marker; uint32_t op,count; } params{header.gpuAddress,marker,compact?0x300u:0x200u,0};
+    auto cb=[queue commandBuffer]; auto e=[cb computeCommandEncoder]; [e setComputePipelineState:postbuild[1]];
+    [e setBytes:&params length:sizeof(params) atIndex:0]; [e useResource:header usage:MTLResourceUsageRead|MTLResourceUsageWrite];
+    [e dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+    [e endEncoding]; finish(cb);
+    equal("postbuild-header",bytes,expected.data(),expected.size());
+  }
 }
 int main(int argc,char **argv) { @autoreleasepool {
   if (argc < 3) return 2;

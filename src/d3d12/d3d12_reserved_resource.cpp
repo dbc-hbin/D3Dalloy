@@ -422,10 +422,12 @@ ReservedResource::Apply(
   // The guard poisons negative proofs on unwind. The caller's pending-native
   // lease excludes proofs after MappingQueueMutex is released at enqueue.
   auto update = heap_index_.BeginUpdate();
+  bool residency_changed = false;
   for (const auto &[tile, target] : assignments) {
     if (targets_[tile] == target)
       continue;
     const auto old = targets_[tile];
+    residency_changed |= (old.heap_tile == kReservedNullTile) != (target.heap_tile == kReservedNullTile);
     if (retirement_heaps) {
       if (old.heap_tile != kReservedNullTile) retirement_heaps->emplace_back(old.heap);
       if (target.heap_tile != kReservedNullTile) retirement_heaps->emplace_back(target.heap);
@@ -450,6 +452,10 @@ ReservedResource::Apply(
     EncodeTexture(queue, texture, effective);
   for (const auto &[format, atlas] : volume_cast_atlases_)
     EncodeTexture(queue, atlas, effective);
+  // The status table stores presence only. Replacing physical pages still
+  // remaps the resource and every atlas, and retires through the same event.
+  if (!residency_changed)
+    return true;
   if (publication && status_buffer) {
     const uint64_t stride = status_bytes ? 1 : sizeof(uint32_t);
     for (size_t i = 0; i < effective.size();) {

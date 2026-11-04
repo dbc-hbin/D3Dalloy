@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 57
+#define AIRCONV_VERSION 59
 
 #ifdef __cplusplus
 #include <string>
@@ -258,7 +258,7 @@ struct SM50_ATOMIC64_CONTEXT {
   uint32_t typedCount;
   uint32_t nodeCapacity;
   uint32_t bitmapWordCount;
-  uint32_t cursor;
+  uint32_t firstFreeWord;
   uint32_t hint;
   uint32_t reserved0;
   uint32_t reserved1;

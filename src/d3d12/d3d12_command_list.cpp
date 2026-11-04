@@ -3469,6 +3469,25 @@ public:
     return so_assemble_pipeline_ && so_positions_pipeline_;
   }
 
+  static bool CanScatterStreamOutput(const StreamOutputDrawData &draw, const StreamOutputAssemblyParams &params) {
+    if (!params.referenced_mask || params.bound_mask != params.referenced_mask) return false;
+    for (uint32_t i = 0; i < params.element_count; ++i) {
+      const auto &element = params.elements[i];
+      if (uint64_t(element.byte_offset) + uint64_t(element.component_count) * 4 > params.stride[element.slot])
+        return false;
+    }
+    for (unsigned s = 0; s < 4; ++s) {
+      const auto &target = draw.targets[s];
+      if (!target) continue;
+      if (!params.stride[s] || target->canonicalHeap || target->reservedResource ||
+          target->flags().test(BufferAllocationFlag::PlacementSparse) ||
+          target->flags().test(BufferAllocationFlag::CpuPlaced)) return false;
+      for (unsigned t = 0; t < s; ++t)
+        if (draw.targets[t] && draw.targets[t]->buffer() == target->buffer()) return false;
+    }
+    return true;
+  }
+
   /*
    * Stream-output draw, recording side (see StreamOutputDrawData). Records are keyed by IA
    * position, so the capture scratch is sized and created here: VertexCount * InstanceCount
@@ -3614,25 +3633,8 @@ public:
     // The list kernel scatters complete primitives in parallel. Different targets
     // must not overlap, and each declaration must fit in one vertex's stride.
     const uint32_t vertices_per_primitive = topology == 0 ? 1 : topology == 1 ? 2 : topology == 3 ? 3 : 0;
-    if (!Indirect && !statistics && vertices_per_primitive && params->referenced_mask &&
-        params->bound_mask == params->referenced_mask &&
-        uint64_t(VertexCount / vertices_per_primitive) * InstanceCount >= 32) {
-      bool independent = true;
-      for (const auto &element : layout.elements) {
-        const uint32_t stride = params->stride[element.slot];
-        independent &= stride && uint64_t(element.byte_offset) + uint64_t(element.component_count) * 4 <= stride;
-      }
-      for (unsigned s = 0; independent && s < 4; ++s) {
-        const auto &target = draw->targets[s];
-        if (!target) continue;
-        independent = params->stride[s] && !target->canonicalHeap && !target->reservedResource &&
-            !target->flags().test(BufferAllocationFlag::PlacementSparse) &&
-            !target->flags().test(BufferAllocationFlag::CpuPlaced);
-        for (unsigned t = 0; t < s; ++t)
-          if (draw->targets[t] && draw->targets[t]->buffer() == target->buffer()) independent = false;
-      }
-      draw->parallel_list_assembly = independent;
-    }
+    draw->parallel_assembly = !Indirect && !statistics && vertices_per_primitive &&
+        uint64_t(VertexCount / vertices_per_primitive) * InstanceCount >= 32 && CanScatterStreamOutput(*draw, *params);
     draw->positions_pipeline = so_positions_pipeline_;
     allocator_->BindGPUHeap(draw->heap, draw->params_offset, params_offset);
     draw->params_cpu = params;
@@ -3781,6 +3783,7 @@ public:
       memset(status_memory, 0, 16);
       draw->scratch = scratch;
       draw->assemble_pipeline = so_assemble_gs_pipeline_;
+      draw->parallel_assembly = keys >= 32 && CanScatterStreamOutput(*draw, *params);
       allocator_->BindGPUHeap(draw->heap, draw->params_offset, params_offset);
       draw->params_cpu = params;
       draw->counters_heap = counters;
@@ -11228,8 +11231,7 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     raytracing::CalculatePrebuildInfo(sizes, shadow.size, &currentSize, &buildScratch, &updateScratch);
     record->metadata = {raytracing::kHeaderMagic, uint32_t(inputs.type), uint32_t(inputs.flags),
         inputs.type == 0 ? inputs.instanceCount : ommArray ? inputs.ommCount : uint32_t(inputs.geometries.size()), shadow.size, currentSize,
-        0, uint32_t(std::ranges::any_of(inputs.geometries, [](const raytracing::Geometry &g) {
-          return uint32_t(g.type) == D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES; })), currentSize};
+        0, shadow.ommMarker, currentSize};
     auto structureInfo = raytracing::DescribeStructure(inputs, shadow);
     record->shadowPlan = std::move(shadow);
     if (record->deferredUpdate || ommArray)

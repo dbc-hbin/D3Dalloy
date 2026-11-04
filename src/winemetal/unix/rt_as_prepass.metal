@@ -126,12 +126,12 @@ kernel void d3dalloy_as_shadow(constant ShadowParams &p [[buffer(0)]],
   }
 }
 
-struct PostbuildParams { ulong asAddress, destination; uint operation, batchCount; };
+struct PostbuildParams { ulong asAddress, destinationOrMarker; uint operation, batchCount; };
 kernel void d3dalloy_as_postbuild(constant PostbuildParams *entries [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   if (tid >= max(entries[0].batchCount, 1u)) return;
   constant PostbuildParams &p = entries[tid];
   device ASHeader *h = (device ASHeader *)p.asAddress;
-  device ulong *out = (device ulong *)p.destination;
+  device ulong *out = (device ulong *)p.destinationOrMarker;
   const ulong compacted = (ulong(h->nativeCompactedSize) + 64 + h->shadowSize + 255) & ~255ul;
   if (p.operation == 0) out[0] = h->type == 2 ? h->currentSize : compacted;
   else if (p.operation == 1) out[0] = 8 + h->shadowSize + (h->type == 2 ? 352 + ulong(h->descCount) * 8
@@ -141,12 +141,18 @@ kernel void d3dalloy_as_postbuild(constant PostbuildParams *entries [[buffer(0)]
     out[0] = 56 + (h->type == 0 ? ulong(h->descCount) * 8 : ommPointers ? 16 + ommPointers * 8 : 0) + 64 + h->shadowSize;
     out[1] = h->type == 0 ? h->descCount : ommPointers ? 1 : 0;
   } else if (p.operation == 3) out[0] = h->currentSize;
-  else if (p.operation == 0x100) h->currentSize = compacted;
-  else if (p.operation == 0x101) {
-    device const ShadowGeometry *g = (device const ShadowGeometry *)((device const uchar *)h + 64);
-    uint pointers = 0;
-    for (uint i = 0; i < h->descCount; ++i) pointers += g[i].ommArrayAddress != 0;
-    h->reserved0 = pointers + 1;
+  else {
+    if (p.operation & 0x100) h->currentSize = compacted;
+    if (p.operation & 0x200) {
+      uint marker = uint(p.destinationOrMarker);
+      if (!marker) {
+        // Deserialization can replace original array pointers with null on the GPU.
+        device const ShadowGeometry *g = (device const ShadowGeometry *)((device const uchar *)h + 64);
+        marker = 1;
+        for (uint i = 0; i < h->descCount; ++i) marker += g[i].ommArrayAddress != 0;
+      }
+      h->reserved0 = marker;
+    }
   }
 }
 struct SerializeParams { ulong source, destination; uint identifier[8]; };

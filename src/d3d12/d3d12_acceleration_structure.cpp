@@ -460,6 +460,13 @@ bool PlanShadow(const BuildInputs &inputs, ShadowPlan &plan) {
                                         geometry.primitiveCount ? 1 : 0, record.transformOffset))
       return false;
     record.ommArrayAddress = geometry.ommArray.address;
+    if (uint32_t(geometry.type) == D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES) {
+      plan.ommMarker = std::max(plan.ommMarker, 1u);
+      if (record.ommArrayAddress) {
+        if (plan.ommMarker == UINT32_MAX) return false;
+        ++plan.ommMarker;
+      }
+    }
     record.ommIndexBytes = geometry.ommIndexBytes;
     record.ommBase = geometry.ommBase;
     // The shadow owns the linkage indices, not the build input buffer.

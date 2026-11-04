@@ -39,7 +39,7 @@ enum WMTMetal4Operation : uint32_t {
   WMTMetal4EndEncoding,
   WMTMetal4SetEncoderLabel,
   WMTMetal4RenderCommands,
-  WMTMetal4ComputeCommands,
+  WMTMetal4ComputeCommands, /* encoder, command chain, direct-dispatch independence bits (zero = default) */
   WMTMetal4BlitCommands,
   WMTMetal4Commit,
   WMTMetal4WaitSubmission,

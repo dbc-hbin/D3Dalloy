@@ -115,6 +115,9 @@ struct SubmissionNode {
   // require its own native render encoder (for example, fragment completion).
   bool access_complete = false, merge_eligible = false;
   bool concurrent_dispatches = false;
+  bool external_backing = false;
+  bool writes_external_backing = false;
+  uint64_t independent_dispatch_mask = 0;
   const char *dispatch_serial_reason = "unresolved";
   size_t dispatch_proof_checks = 0;
   bool boundary_before = false, boundary_after = false, force_fence_before = false, skip_clear = false;
@@ -259,6 +262,8 @@ struct SubmissionPlan {
   size_t descriptor_resolutions = 0, descriptor_cache_hits = 0, descriptor_cache_misses = 0, descriptor_cache_builds = 0;
 };
 bool AppendSubmissionAccess(SubmissionNode &node, SubmissionAccess access) {
+  node.external_backing |= access.external_backing;
+  node.writes_external_backing |= access.external_backing && access.writes;
   auto &slots = node.access_slots[access.Key()];
   for (const auto slot : slots) {
     auto &prior = node.accesses[slot];
@@ -283,7 +288,8 @@ SubmissionAccess BufferAccess(BufferAllocation *allocation,uint64_t offset,uint6
   const uint64_t base=heap?allocation->canonicalHeapOffset:allocation->currentSuballocationOffset();
   return {allocation,base+offset,base+offset+bytes,0,1,0,1,0,writes,false,stages,
       {heap?PhysicalDomain::Heap:PhysicalDomain::Buffer,
-       uintptr_t(heap?allocation->canonicalHeap.handle:allocation->buffer().handle)}};
+       uintptr_t(heap?allocation->canonicalHeap.handle:allocation->buffer().handle)},
+       allocation->flags().test(BufferAllocationFlag::CpuPlaced)};
 }
 SubmissionAccess TextureAccess(TextureAllocation *allocation,TextureViewKey key,uint8_t aspects,
     bool writes,bool attachment,uint64_t stages) {
@@ -293,7 +299,7 @@ SubmissionAccess TextureAccess(TextureAllocation *allocation,TextureViewKey key,
   SubmissionAccess access{allocation,0,0,uint32_t(key.mip_start),uint32_t(key.mip_end),
       uint32_t(key.array_start),uint32_t(key.array_end),aspects,writes,attachment,stages,
       {heap?PhysicalDomain::Heap:PhysicalDomain::Texture,
-       uintptr_t(heap?allocation->canonicalHeap.handle:allocation->texture().handle)}};
+       uintptr_t(heap?allocation->canonicalHeap.handle:allocation->texture().handle)}, allocation->mappedMemory != nullptr};
   if (heap) SetHeapAccessExtent(access, allocation->canonicalHeapOffset, allocation->canonicalHeapSize);
   return access;
 }
@@ -671,16 +677,22 @@ bool ResolveSubmissionTables(SubmissionPlan &plan, SubmissionNode &node, MTLD3D1
 // The encoder-wide union cannot prove dispatch independence: a later dispatch
 // may read an earlier dispatch's UAV. Resolve each sealed membership separately
 // using current descriptor versions and retained physical backing. Any unknown
-// or conflict keeps the original serial command stream, without rewriting it.
+// keeps the original serial command stream. A conflict starts a new group:
+// the serial encoder's device barrier orders all prior dispatches before it.
 bool IndependentComputeDispatches(SubmissionPlan &plan, SubmissionNode &node, MTLD3D12Device *device,
     const ComputeEncoderData &compute, const ClosedPassShape &shape) {
+  if (node.external_backing) { node.dispatch_serial_reason = "dispatch_external_backing"; return false; }
   if (!shape.dispatch_access_complete || shape.dispatches.size() < 2) {
     node.dispatch_serial_reason = "dispatch_capture"; return false;
   }
   constexpr size_t access_budget = 256, comparison_budget = 4096;
+  static_assert(kRecordedDispatchBudget <= 64);
+  uint64_t independent = 0;
+  bool has_dependency = false;
   size_t access_count = 0;
   std::unordered_map<PhysicalIdentity, std::vector<SubmissionAccess>, PhysicalIdentityHash> prior;
-  for (const auto &dispatch : shape.dispatches) {
+  for (size_t i = 0; i < shape.dispatches.size(); ++i) {
+    const auto &dispatch = shape.dispatches[i];
     SubmissionNode resolved{};
     bool complete = true;
     for (const auto index : dispatch.buffers) {
@@ -698,6 +710,12 @@ bool IndependentComputeDispatches(SubmissionPlan &plan, SubmissionNode &node, MT
       node.dispatch_serial_reason = "dispatch_budget"; return false;
     }
     access_count += resolved.accesses.size();
+    if (resolved.external_backing) {
+      node.external_backing = true;
+      node.writes_external_backing |= resolved.writes_external_backing;
+      node.dispatch_serial_reason = "dispatch_external_backing"; return false;
+    }
+    bool conflict = false;
     for (const auto &access : resolved.accesses) {
       const auto found = prior.find(access.Key());
       if (found == prior.end()) continue;
@@ -707,16 +725,29 @@ bool IndependentComputeDispatches(SubmissionPlan &plan, SubmissionNode &node, MT
           node.dispatch_serial_reason = "dispatch_budget"; return false;
         }
         if (AccessOverlaps(access, earlier)) {
-          node.dispatch_serial_reason = "dispatch_dependency"; return false;
+          conflict = true;
+          break;
         }
       }
+      if (conflict) break;
+    }
+    if (conflict) {
+      has_dependency = true;
+      prior.clear();
+    } else if (i) {
+      independent |= uint64_t(1) << i;
     }
     // Publish only after checking the entire dispatch: its own read/write
     // aliases are intra-dispatch semantics and do not imply a preceding edge.
     for (const auto &access : resolved.accesses) prior[access.Key()].push_back(access);
   }
-  node.dispatch_serial_reason = "independent";
-  return true;
+  if (has_dependency) {
+    node.dispatch_serial_reason = independent ? "mixed_dependencies" : "dispatch_dependency";
+    node.independent_dispatch_mask = independent;
+  } else {
+    node.dispatch_serial_reason = "independent";
+  }
+  return !has_dependency;
 }
 const char *AppendRenderMember(RenderReplayGroup &group, const RenderEncoderData &render, bool first,
                               std::array<uint8_t, 8> &map) {
@@ -1948,11 +1979,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     auto interval = [](const TileMappingTask &item, Interval &range) {
       if (item.copy_source || item.no_hazard || item.assignments.empty() || item.assignments.size() > max_tiles)
         return false;
-      range = {item.resource.ptr(), item.assignments.front().first,
-               uint64_t(item.assignments.front().first) + item.assignments.size()};
-      if (item.assignments.back().first != range.end - 1) return false;
-      for (size_t i = 1; i + 1 < item.assignments.size(); ++i)
-        if (item.assignments[i].first != range.begin + i) return false;
+      // Box rows and SKIP ranges can leave holes. Their enclosing interval
+      // is sufficient for the disjointness proof. Apply retains FIFO order.
+      range = {item.resource.ptr(), item.assignments.front().first, uint64_t(item.assignments.back().first) + 1};
+      for (size_t i = 1; i < item.assignments.size(); ++i)
+        if (item.assignments[i].first <= item.assignments[i - 1].first) return false;
       return true;
     };
     std::array<Interval, kMappingRunLimit> ranges;
@@ -2720,7 +2751,7 @@ public:
     wmtcmd_compute_setpso set_pso{};
     set_pso.type = WMTComputeCommandSetPSO;
     set_pso.pso = draw.assemble_pipeline;
-    uint32_t lanes = draw.parallel_list_assembly ? 32 : 1;
+    uint32_t lanes = draw.parallel_assembly ? 32 : 1;
     set_pso.threadgroup_size = {lanes, 1, 1};
     std::array<wmtcmd_compute_setbuffer, 16> buffers{};
     auto bind = [&](uint8_t index, WMT::Buffer buffer, uint64_t offset) {
@@ -3889,7 +3920,8 @@ public:
       clear.waitForFence(fence_);
       wmtcmd_blit_fillbuffer fill{};
       fill.type = WMTBlitCommandFillBuffer;
-      fill.buffer = task_state; fill.length = sizeof(MSAATileTaskState);
+      // Only the cursor and completion counters precede the write-only slot array.
+      fill.buffer = task_state; fill.length = offsetof(MSAATileTaskState, Slots);
       clear.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
       clear.updateFence(fence_); clear.endEncoding();
       owned_graphics::Trace("msaa_tile_begin", ",\"queue\":", owned_id_, ",\"encoder\":", render.id,
@@ -3989,6 +4021,10 @@ public:
       if (input_bytes / 4 > UINT32_MAX || output_bytes / 4 > UINT32_MAX) return false;
       task_params->InputDwords = uint32_t(input_bytes / 4);
       task_params->OutputDwords = outputs ? uint32_t(output_bytes / 4) : 0;
+      // Geometry/replay bind base 0 (and 8 for split raster). Only a promoted
+      // sample-frequency application binds its own control for each logical sample.
+      task_params->ControlMask = promoted && draw.sample_pixel_pipeline
+          ? (1u << draw.sample_count) - 1u : 1u | (split16 ? 1u << 8 : 0u);
       auto &base = task_params->Base;
       base.sample_count = draw.sample_count; base.sample_mask = raster_mask;
       base.output_mask = output_mask; base.shading_rate = draw.shading_rate;
@@ -5156,7 +5192,8 @@ public:
     Com<MTLD3D12Resource, false> descriptor_owner;
   };
 
-  void PrepareSwizzleValidity(InflightCommandBuffer &inflight, const EncoderData *record, uint64_t submission) {
+  void PrepareSwizzleValidity(InflightCommandBuffer &inflight, const EncoderData *record, uint64_t submission,
+                              const SubmissionNode *node) {
     ++inflight.swizzle_encoding_serial;
     inflight.swizzle_encoder_id = record->id;
     inflight.swizzle_submission = submission;
@@ -5168,6 +5205,35 @@ public:
     case EncoderType::StandardSwizzle:
       complete = true;
       break;
+    case EncoderType::Blit: {
+      if (inflight.swizzle_representations.empty() && !(inflight.swizzle_predecessor && swizzle_carry_count_)) break;
+      if (!node->access_complete || node->sparse_resource_used || node->helper_passes || node->accesses.empty()) break;
+      // Eligible swizzled images own both allocations. Only an ordinary,
+      // fully resolved destination can prove that another image is untouched.
+      complete = std::all_of(node->accesses.begin(), node->accesses.end(), [](const SubmissionAccess &a) {
+        if (!a.writes) return true;
+        if (a.Key().domain == PhysicalDomain::Buffer)
+          return PlainAdmissionBuffer(static_cast<const BufferAllocation *>(a.allocation));
+        return a.Key().domain == PhysicalDomain::Texture &&
+               PlainAdmissionTexture(static_cast<const TextureAllocation *>(a.allocation));
+      });
+      if (!complete) break;
+      auto written = [&](PhysicalDomain domain, obj_handle_t handle) {
+        auto slots = node->access_slots.find({domain, uintptr_t(handle)});
+        return slots != node->access_slots.end() && std::any_of(slots->second.begin(), slots->second.end(),
+            [&](size_t slot) { return node->accesses[slot].writes; });
+      };
+      for (auto &entry : inflight.swizzle_representations)
+        if (written(PhysicalDomain::Buffer, entry.canonical_handle) || written(PhysicalDomain::Texture, entry.shadow_handle))
+          entry.Invalidate(inflight.swizzle_encoding_serial, inflight.swizzle_encoder_id);
+      if (inflight.swizzle_predecessor) {
+        const auto end = swizzle_carry_.begin() + swizzle_carry_count_;
+        swizzle_carry_count_ = std::remove_if(swizzle_carry_.begin(), end, [&](const auto &entry) {
+          return written(PhysicalDomain::Buffer, entry.canonical) || written(PhysicalDomain::Texture, entry.shadow);
+        }) - swizzle_carry_.begin();
+      }
+      break;
+    }
     case EncoderType::Render: {
       const auto &render = *static_cast<const RenderEncoderData *>(record);
       complete = render.submission_group_safe && !render.submission_snapshot_budget &&
@@ -5183,8 +5249,8 @@ public:
     default:
       break;
     }
-    // Copies and every unproved writer invalidate first; their existing
-    // explicit export can establish equality again after the native write.
+    // Every unproved writer invalidates first. An explicit export can
+    // establish equality again after the native write.
     // Ordinary state/UAV barriers order work without changing either image.
     inflight.swizzle_validity_enabled = complete;
     if (!complete) inflight.InvalidateSwizzleRepresentations();
@@ -5456,11 +5522,9 @@ public:
         ? FindSwizzleRepresentation(inflight, resource) : nullptr;
     if (!representation && to_canonical && inflight.swizzle_predecessor)
       inflight.InvalidateSwizzleRepresentations();
-    if (representation && to_canonical)
-      representation->Invalidate(inflight.swizzle_encoding_serial, inflight.swizzle_encoder_id);
     std::array<uint64_t, 4> requested{};
     uint32_t requested_subresources = 0, reused_subresources = 0;
-    uint64_t reused_tiles = 0;
+    uint64_t requested_tiles = 0, reused_tiles = 0;
     if (representation) {
       for (uint32_t array = 0; array < layout.array_count; ++array)
         for (uint32_t mip = 0; mip < layout.mip_count; ++mip) {
@@ -5468,12 +5532,25 @@ public:
           const uint32_t subresource = array * layout.mip_count + mip;
           requested[subresource / 64] |= uint64_t(1) << (subresource % 64);
           ++requested_subresources;
+          const auto &m = layout.mips[mip];
+          const uint64_t tiles = uint64_t(m.tiles_x) * m.tiles_y * m.tiles_z;
+          requested_tiles += tiles;
           if (!to_canonical && representation->Contains(subresource)) {
             ++reused_subresources;
-            const auto &m = layout.mips[mip];
-            reused_tiles += uint64_t(m.tiles_x) * m.tiles_y * m.tiles_z;
+            reused_tiles += tiles;
           }
         }
+      if (to_canonical) {
+        // Each mip/slice owns disjoint canonical tiles. An exact shadow
+        // export invalidates only its selected texels until encoding succeeds.
+        for (size_t i = 0; i < requested.size(); ++i) {
+          representation->valid[i] &= ~requested[i];
+          representation->inherited[i] &= ~requested[i];
+        }
+        ++representation->content_version;
+        representation->writer_serial = inflight.swizzle_encoding_serial;
+        representation->writer_encoder = inflight.swizzle_encoder_id;
+      }
     }
     auto trace_reuse = [&] {
       if (!reused_subresources) return;
@@ -5544,15 +5621,17 @@ public:
     // aliases/volume atlases and any tile larger than the batching budget.
     const bool concurrent = !resource->reserved && !volume_source && !volume_layout &&
                             tile_scratch_size <= kBatchScratchLimit;
-    uint64_t max_mip_tiles = 1;
-    for (uint32_t mip = 0; mip < layout.mip_count; ++mip) {
-      if (selection && !selection->HasMip(mip)) continue;
-      const auto &m = layout.mips[mip];
-      max_mip_tiles = std::max(max_mip_tiles, uint64_t(m.tiles_x) * m.tiles_y * m.tiles_z);
+    uint64_t window_tiles = std::max<uint64_t>(1, requested_tiles - reused_tiles);
+    if (!representation) {
+      for (uint32_t mip = 0; mip < layout.mip_count; ++mip) {
+        if (selection && !selection->HasMip(mip)) continue;
+        const auto &m = layout.mips[mip];
+        window_tiles = std::max(window_tiles, uint64_t(m.tiles_x) * m.tiles_y * m.tiles_z);
+      }
     }
     const uint32_t batch_capacity = concurrent ? uint32_t(std::min({
         uint64_t(kMaxBatchTiles), kBatchScratchLimit / tile_scratch_size,
-        max_buffer_length / tile_scratch_size, max_mip_tiles})) : 1;
+        max_buffer_length / tile_scratch_size, window_tiles})) : 1;
     const uint64_t scratch_size = tile_scratch_size * batch_capacity;
     WMT::Reference<WMT::Buffer> scratch;
     if (inflight.swizzle_batch_scratch_length >= scratch_size && !inflight.swizzle_batch_buffers.empty()) {
@@ -5743,10 +5822,12 @@ public:
             }
           }
         }
-        // Do not mix resource, mip or array boundaries in a staging window.
-        flush_batch();
+        // Known nonaliased subresources can share the staging encoder. Each
+        // entry already carries its own level, slice and scratch offset.
+        if (!representation) flush_batch();
       }
     }
+    flush_batch();
     owned_graphics::Trace("standard_swizzle_batch", ",\"queue\":", owned_id_, ",\"resource\":", resource->owned_id,
         ",\"mode\":\"", compare ? "compare" : dirty_flags ? "export_if_dirty" : to_canonical ? "export" : "import", "\"",
         ",\"tiles\":", encoded_tiles, ",\"batches\":", encoded_batches, ",\"capacity\":", batch_capacity,
@@ -7696,7 +7777,13 @@ public:
           }
           if (record->endpoint_reason == RecordedEndpointReason::Opaque) node.boundary_after = true;
           if (fenced || node.sparse_resource_used) node.access_complete = false;
-          if (!node.access_complete) { node.accesses.clear(); node.access_slots.clear(); }
+          if (!node.access_complete) {
+            if (record->type == EncoderType::Compute || record->type == EncoderType::Blit) {
+              node.external_backing |= device_->has_used_external_backing.load(std::memory_order_acquire);
+              node.writes_external_backing = node.external_backing;
+            }
+            node.accesses.clear(); node.access_slots.clear();
+          }
           if (!node.access_complete) owned_graphics::Trace("submission_access_opaque", ",\"submission\":", scope->seq,
               ",\"list_ordinal\":", ordinal, ",\"node_ordinal\":", node.node_ordinal, ",\"encoder\":", record->id,
               ",\"reason\":\"", node.rejection ? node.rejection : "unresolved_encoder_access", "\"");
@@ -8367,9 +8454,9 @@ public:
       while (current) {
         if (device_->RemovedReason() != S_OK)
           return;
-        PrepareSwizzleValidity(scope->inflight, current, scope->seq);
         const RenderReplayGroup *replay_group = nullptr;
-        const SubmissionNode *replay_current_node = nullptr;
+        const SubmissionNode *replay_current_node = current->type == EncoderType::Null ? nullptr : &plan.nodes[replay_node];
+        PrepareSwizzleValidity(scope->inflight, current, scope->seq, replay_current_node);
         bool native_fence_required = true;
         uint64_t consumer_barrier_after = 0;
         uint64_t consumer_visibility = WMTMetal4VisibilityDevice;
@@ -8379,7 +8466,6 @@ public:
           for(const auto &access:node.accesses)if(access.Key().domain==PhysicalDomain::Heap)
             consumer_visibility |= WMTMetal4VisibilityResourceAlias;
           assert(node.record == current);
-          replay_current_node = &node;
           if (node.resolve_folded_into_previous) {
             // Encoded by the preceding pass's resolve store.
             emit_clear_batches(node.clears_before);
@@ -10021,12 +10107,12 @@ public:
                     // Metal writes an eight-byte compacted size at offset48,
                     // clearing the adjacent OMM marker. Restore it on the same
                     // GPU timeline before copies, serialization or postbuild.
-                    if (!ommArray && (build ? data->metadata.reserved0 : as_source_header.reserved0)) {
-                      raytracing::PostbuildParams params{data->destinationLocation.address, 0, raytracing::kPostbuildRestoreOmmHeader, 0};
-                      if (!EncodeASHelper(cmdbuf, data->pipelines.postbuild, &params, sizeof(params), 1)) { fail(); break; }
-                    }
-                    if (operation == RTASOperation::Compact) {
-                      raytracing::PostbuildParams params{data->destinationLocation.address, 0, raytracing::kPostbuildFinalizeCompactedHeader, 0};
+                    const uint32_t marker = build ? data->metadata.reserved0 : as_source_header.reserved0;
+                    const uint32_t fixup = (!ommArray && marker ? raytracing::kPostbuildRestoreOmmHeader : 0) |
+                        (operation == RTASOperation::Compact ? raytracing::kPostbuildFinalizeCompactedHeader : 0);
+                    if (fixup) {
+                      raytracing::PostbuildParams params{.asAddress = data->destinationLocation.address,
+                          .ommMarker = deserialize ? 0u : marker, .operation = fixup, .batchCount = 0};
                       if (!EncodeASHelper(cmdbuf, data->pipelines.postbuild, &params, sizeof(params), 1)) { fail(); break; }
                     }
                   }
@@ -10064,7 +10150,7 @@ public:
                 }
         case EncoderType::Blit: {
           auto data = static_cast<BlitEncoderData *>(current);
-          auto encoder = cmdbuf.blitCommandEncoder();
+          auto encoder = cmdbuf.computeCommandEncoder(false, replay_current_node->external_backing);
           owned_graphics::Trace("native_blit_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"begin_count\":1");
           if (native_fence_required) {
             encoder.waitForFence(fence_);
@@ -10076,6 +10162,9 @@ public:
           }
           encoder.encodeCommands(&data->cmd_head);
           owned_graphics::Trace("native_blit_encode", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"encode_count\":1");
+          if (replay_current_node->writes_external_backing)
+            encoder.barrierAfterStages(WMTMetal4StageBlit, WMTMetal4StageAll,
+                                       WMTMetal4VisibilityDevice | WMTMetal4VisibilityResourceAlias);
           encoder.updateFence(fence_);
           owned_graphics::Trace("native_blit_update", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"update_count\":1");
           encoder.endEncoding();
@@ -10328,7 +10417,9 @@ public:
           }
           const bool concurrent_dispatches = replay_current_node && replay_current_node->concurrent_dispatches &&
               swizzle_uses.empty() && !data->atomic64_phase;
-          auto encoder = cmdbuf.computeCommandEncoder(concurrent_dispatches);
+          const uint64_t independent = replay_current_node && swizzle_uses.empty() && !data->atomic64_phase
+              ? replay_current_node->independent_dispatch_mask : 0;
+          auto encoder = cmdbuf.computeCommandEncoder(concurrent_dispatches, replay_current_node->external_backing);
           owned_graphics::Trace("native_compute_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
               ",\"begin_count\":1,\"concurrent\":", concurrent_dispatches,
               ",\"native_context\":", encoder.handle,
@@ -10372,8 +10463,13 @@ public:
             constants.index = SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
             encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&constants));
           }
-          encoder.encodeCommands(&data->cmd_head);
+          encoder.encodeCommands(&data->cmd_head, independent);
           owned_graphics::Trace("native_compute_encode", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"encode_count\":1");
+          // Publish through the alias coherence point before a later command
+          // reads these host pages through a different native virtual address.
+          if (replay_current_node->writes_external_backing)
+            encoder.barrierAfterStages(WMTMetal4StageDispatch, WMTMetal4StageAll,
+                                       WMTMetal4VisibilityDevice | WMTMetal4VisibilityResourceAlias);
           encoder.updateFence(fence_);
           owned_graphics::Trace("native_compute_update", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"update_count\":1");
           encoder.endEncoding();
@@ -11406,11 +11502,19 @@ public:
     // Public validation has bounded every rect to these dimensions. A whole
     // backbuffer dirty rect overwrites every previous/scroll texel, so neither
     // history restoration nor copying that same result back is necessary.
-    const bool full_image_dirty = composition.history && !composition.full &&
-        std::any_of(composition.dirty_rects.begin(), composition.dirty_rects.end(), [&](const RECT &rect) {
-          return rect.left == 0 && rect.top == 0 && uint64_t(rect.right) == composition.width &&
-                 uint64_t(rect.bottom) == composition.height;
-        });
+    const RECT *largest_dirty = nullptr;
+    uint64_t dirty_area = 0;
+    if (composition.history && !composition.full) {
+      for (const auto &rect : composition.dirty_rects) {
+        const uint64_t area = uint64_t(rect.right - rect.left) * (rect.bottom - rect.top);
+        if (area > dirty_area) {
+          largest_dirty = &rect;
+          dirty_area = area;
+        }
+      }
+    }
+    const uint64_t frame_area = uint64_t(composition.width) * composition.height;
+    const bool full_image_dirty = largest_dirty && dirty_area == frame_area;
     const bool full_history = composition.full || !composition.has_previous || full_image_dirty;
     uint64_t history_copies = 0, history_texels = 0, backbuffer_copies = 0, backbuffer_texels = 0;
     if (task.composition.history) {
@@ -11448,7 +11552,12 @@ public:
           const int64_t top = std::max<int64_t>(rect.top, -offset_y);
           const int64_t right = std::min<int64_t>(rect.right, int64_t(composition.width) - offset_x);
           const int64_t bottom = std::min<int64_t>(rect.bottom, int64_t(composition.height) - offset_y);
-          if (right > left && bottom > top) {
+          // Only the clipped destination matters. Dirty pixels overwrite it
+          // after scroll, even when their source texels were also scrolled.
+          const bool overwritten = largest_dirty && largest_dirty->left <= left + offset_x &&
+              largest_dirty->top <= top + offset_y && largest_dirty->right >= right + offset_x &&
+              largest_dirty->bottom >= bottom + offset_y;
+          if (right > left && bottom > top && !overwritten) {
             copy(current, scroll_snapshot, left, top, right - left, bottom - top, 0, 0);
             copy(scroll_snapshot, current, 0, 0, right - left, bottom - top, left + offset_x, top + offset_y);
           }
@@ -11491,12 +11600,12 @@ public:
         backbuffer_texels += uint64_t(w) * h;
       };
       const auto w = composition.width, h = composition.height;
-      const auto *rect = composition.dirty_rects.size() == 1 ? &composition.dirty_rects.front() : nullptr;
       // Dirty pixels came from this exact public buffer, *after* scroll. They
       // already equal history. Restore everything else (including pixels
       // outside SetSourceSize), bounded to at most four nonempty blits.
-      if (rect && uint64_t(rect->right - rect->left) * (rect->bottom - rect->top) * 2 >= uint64_t(w) * h) {
-        const uint32_t l = rect->left, t = rect->top, r = rect->right, b = rect->bottom;
+      if (largest_dirty && dirty_area * 2 >= frame_area) {
+        const uint32_t l = largest_dirty->left, t = largest_dirty->top;
+        const uint32_t r = largest_dirty->right, b = largest_dirty->bottom;
         restore(0, 0, w, t);
         restore(0, b, w, h - b);
         restore(0, t, l, b - t);

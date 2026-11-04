@@ -23,6 +23,10 @@ void runPresentHistory() {
       {"stationary-scroll", 1, {{4, 3, 7, 5}}, true, {0, 0, 8, 6}, {0, 0}, false},
       {"large-inner-scroll", 1, {{1, 1, 7, 5}}, true, {0, 0, 8, 6}, {-1, 1}, true},
       {"large-edge-dirty", 1, {{0, 0, 8, 5}}, false, {}, {}, false},
+      {"adjacent-full", 2, {{0, 0, 3, 6}, {3, 0, 8, 6}}, false, {}, {}, false},
+      {"bands-cover-scroll", 2, {{1, 0, 5, 5}, {3, 0, 8, 5}}, true, {0, 0, 7, 4}, {1, 1}, true},
+      {"large-dirty-gap", 2, {{0, 0, 5, 6}, {6, 0, 8, 6}}, true, {0, 1, 7, 4}, {1, 0}, false},
+      {"corner-gap", 2, {{0, 0, 3, 3}, {3, 3, 8, 6}}, true, {0, 0, 8, 6}, {-2, 1}, false},
   };
   ComPtr<IDXGIFactory4> factory;
   check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "history-factory");
@@ -217,5 +221,5 @@ void runPresentHistory() {
     std::memcpy(previous, expected, sizeof(previous));
     std::printf("OWNED_D3D12_PRESENT_HISTORY_CASE case=%s pixels=48 hash=%08x exact=1\n", frame.name, hash);
   }
-  std::puts("OWNED_D3D12_PRESENT_HISTORY_PASS cases=11 pixels=528 full_dirty=3 partial=7 crop=3 queues=2 exact=1");
+  std::puts("OWNED_D3D12_PRESENT_HISTORY_PASS cases=15 pixels=720 full_dirty=4 partial=10 crop=4 queues=2 exact=1");
 }

@@ -7,7 +7,8 @@ struct Atomic64Node { atomic_uint state; uint low, high, unused; };
 struct Atomic64Context {
   ulong rawRanges, typedViews, roots, nodes, freeBitmap;
   uint rawCount, typedCount, nodeCapacity, bitmapWordCount;
-  atomic_uint cursor, hint;
+  uint firstFreeWord;
+  atomic_uint hint;
   uint reserved0, reserved1;
 };
 constant uint atomic64_retired = 0x80000000u;
@@ -25,8 +26,7 @@ static void atomic64_publish_free(device Atomic64Context *context, uint index) {
   auto bitmap = reinterpret_cast<device atomic_uint *>(context->freeBitmap);
   atomic_fetch_or_explicit(bitmap + index / 32, 1u << (index % 32),
     memory_order_seq_cst, mem_flags::mem_device);
-  atomic_exchange_explicit(&context->hint, index / 32,
-    memory_order_seq_cst, mem_flags::mem_device);
+  atomic_store_explicit(&context->hint, index / 32, memory_order_relaxed);
 }
 static void atomic64_release(device Atomic64Context *context, uint index) {
   auto nodes = reinterpret_cast<device Atomic64Node *>(context->nodes);
@@ -52,31 +52,42 @@ static uint atomic64_protect(device Atomic64Context *context, device atomic_uint
     atomic64_release(context, index);
   }
 }
-static uint atomic64_allocate(device Atomic64Context *context) {
+static uint atomic64_allocate(device Atomic64Context *context, device atomic_uint *root) {
   auto bitmap = reinterpret_cast<device atomic_uint *>(context->freeBitmap);
   auto nodes = reinterpret_cast<device Atomic64Node *>(context->nodes);
   // Bitmap bits are advisory: a delayed retirement publisher can advertise a
   // reused node. Only RETIRED|0 -> RESERVED acquires ownership. The exclusive
   // phase admits P invocations into C+3P+1 nodes, so no owner must run to free one.
-  uint start = atomic64_load(&context->hint) % context->bitmapWordCount;
-  for (uint scanned = 0;; ++scanned) {
-    uint word = (start + scanned) % context->bitmapWordCount;
-    uint bits = atomic64_load(bitmap + word);
+  // Spread first probes across the original free words. A stale/empty word
+  // falls back to the last retirement hint, then the entire bitmap. Neither
+  // probe publishes any cell data: ownership still requires both CASes.
+  bool first_probe = context->bitmapWordCount >= 8;
+  uint word;
+  if (first_probe) {
+    uint key = uint((reinterpret_cast<ulong>(root) - context->roots) >> 2);
+    word = context->firstFreeWord + (key * 0x9e3779b9u) % (context->bitmapWordCount - context->firstFreeWord);
+  } else {
+    word = atomic_load_explicit(&context->hint, memory_order_relaxed);
+  }
+  for (;;) {
+    uint bits = atomic_load_explicit(bitmap + word, memory_order_relaxed);
     while (bits) {
       uint bit = ctz(bits), mask = 1u << bit;
       uint expected_bits = bits;
       if (!atomic64_cas(bitmap + word, expected_bits, bits & ~mask)) { bits = expected_bits; continue; }
       uint index = word * 32 + bit;
       uint expected = atomic64_retired;
-      if (index < context->nodeCapacity && atomic64_cas(&nodes[index].state, expected, atomic64_reserved)) {
-        atomic_exchange_explicit(&context->hint, word, memory_order_seq_cst, mem_flags::mem_device);
+      if (index < context->nodeCapacity && atomic64_cas(&nodes[index].state, expected, atomic64_reserved))
         return index;
-      }
       // A weak-CAS miss on a genuinely free node must not lose its bitmap bit.
       if (index < context->nodeCapacity && expected == atomic64_retired)
         atomic64_publish_free(context, index);
-      bits = atomic64_load(bitmap + word);
+      bits = atomic_load_explicit(bitmap + word, memory_order_relaxed);
     }
+    if (first_probe) {
+      word = atomic_load_explicit(&context->hint, memory_order_relaxed);
+      first_probe = false;
+    } else if (++word == context->bitmapWordCount) word = 0;
   }
 }
 extern "C" ulong d3dalloy_atomic64_read(device uchar *bytes, device atomic_uint *root) {
@@ -109,7 +120,7 @@ extern "C" ulong d3dalloy_atomic64_compare_exchange(
       if (committed) return comparison;
       continue;
     }
-    uint candidate = atomic64_allocate(context);
+    uint candidate = atomic64_allocate(context, root);
     nodes[candidate].low = uint(desired);
     nodes[candidate].high = uint(desired >> 32);
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);

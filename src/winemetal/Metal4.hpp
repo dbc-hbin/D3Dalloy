@@ -102,8 +102,8 @@ public:
 
 class MTL4ComputeCommandEncoder : public MTL4CommandEncoder {
 public:
-  void encodeCommands(const wmtcmd_compute_nop *commands) {
-    Metal4Invoke(WMTMetal4ComputeCommands, handle, commands ? WMTGetGuestWindowBase() + uintptr_t(commands) : 0);
+  void encodeCommands(const wmtcmd_compute_nop *commands, uint64_t independent_dispatch_mask = 0) {
+    Metal4Invoke(WMTMetal4ComputeCommands, handle, Metal4CPUPointer(commands), independent_dispatch_mask);
   }
   void encodeCommands(const wmtcmd_blit_nop *commands) {
     Metal4Invoke(WMTMetal4BlitCommands, handle, commands ? WMTGetGuestWindowBase() + uintptr_t(commands) : 0);
@@ -237,8 +237,9 @@ public:
     return MTL4RenderCommandEncoder{
       Metal4Invoke(WMTMetal4RenderEncoder, handle, WMTGetGuestWindowBase() + uintptr_t(&info)).ret[0]};
   }
-  MTL4ComputeCommandEncoder computeCommandEncoder(bool concurrent = false) {
-    return MTL4ComputeCommandEncoder{Metal4Invoke(WMTMetal4ComputeEncoder, handle, uint64_t(concurrent)).ret[0]};
+  MTL4ComputeCommandEncoder computeCommandEncoder(bool concurrent = false, bool external_backing = false) {
+    return MTL4ComputeCommandEncoder{Metal4Invoke(WMTMetal4ComputeEncoder, handle, uint64_t(concurrent),
+                                                  uint64_t(external_backing)).ret[0]};
   }
   MTL4ComputeCommandEncoder blitCommandEncoder() { return computeCommandEncoder(); }
   MTL4ComputeCommandEncoder accelerationStructureCommandEncoder() { return computeCommandEncoder(); }

@@ -2208,6 +2208,7 @@ struct GSStreamCase {
   std::vector<UINT> strides;
   UINT rasterized;
   std::array<UINT, 4> capacity; // slot sizes in bytes
+  UINT points = 3;
 };
 
 struct GSStreamModel {
@@ -2331,8 +2332,11 @@ void gs_multi(point VSOut input[1], inout PointStream<S0> s0, inout PointStream<
        {16, 8, 4, 8}, D3D12_SO_NO_RASTERIZED_STREAM, {1024, 96, 20, 1024}},
       // Rasterized stream 0 (stream 2 is never streamed out; its outputs only feed nothing).
       {"gs-streams-raster0", {{1, "TEX", 0, 0, 2, 0}, {3, "IDA", 0, 0, 1, 1}}, {8, 4}, 0, {1024, 1024, 0, 0}},
+      // Two key batches, with overflow partway through the last full invocation.
+      {"gs-streams-key-prefix", {{3, "IDA", 0, 0, 1, 0}}, {4}, D3D12_SO_NO_RASTERIZED_STREAM,
+       {452, 0, 0, 0}, 39},
   };
-  constexpr UINT kPoints = 3, kSlotBytes = 1024, kFilledAt = 4 * kSlotBytes, kBytes = kFilledAt + 64;
+  constexpr UINT kSlotBytes = 1024, kFilledAt = 4 * kSlotBytes, kBytes = kFilledAt + 64;
   constexpr std::uint8_t kFillByte = 0xcd;
 
   for (int dxil = 0; dxil < 2; ++dxil) {
@@ -2393,8 +2397,8 @@ void gs_multi(point VSOut input[1], inout PointStream<S0> s0, inout PointStream<
       for (UINT s = 0; s < 4; ++s)
         list->BeginQuery(queries.Get(), D3D12_QUERY_TYPE(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + s), s);
       // The second draw appends after the first's BufferFilledSize (StartVertexLocation only moves the fetch).
-      list->DrawInstanced(kPoints, 1, 0, 0);
-      list->DrawInstanced(kPoints, 1, kPoints, 0);
+      list->DrawInstanced(c.points, 1, 0, 0);
+      list->DrawInstanced(c.points, 1, c.points, 0);
       for (UINT s = 0; s < 4; ++s) {
         list->EndQuery(queries.Get(), D3D12_QUERY_TYPE(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + s), s);
         list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE(D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + s), s, 1,
@@ -2412,8 +2416,8 @@ void gs_multi(point VSOut input[1], inout PointStream<S0> s0, inout PointStream<
       GSStreamModel m;
       for (auto &slot : m.slots)
         slot.assign(kSlotBytes, kFillByte);
-      modelGSDraw(c, kPoints, 0, m);
-      modelGSDraw(c, kPoints, 0, m); // non-indexed SV_VertexID is 0-based in each draw (FS 8.16)
+      modelGSDraw(c, c.points, 0, m);
+      modelGSDraw(c, c.points, 0, m); // non-indexed SV_VertexID is 0-based in each draw (FS 8.16)
 
       const D3D12_RANGE range{0, SIZE_T(kBytes + 64)};
       const std::uint8_t *bytes = nullptr;

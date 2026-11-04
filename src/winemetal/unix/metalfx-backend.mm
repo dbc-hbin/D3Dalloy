@@ -1650,11 +1650,12 @@ struct alignas(8) Params {
 
 // The alpha scaler's input is RGBA16F containing (a,a,a,1). An identical-format
 // native read swizzle supplies these exact half values without another full image.
+// PixelFormatView is only needed for a different component layout.
 id<MTLTexture> newAlphaView(id<MTLTexture> color, MTLTextureUsage usage) noexcept {
     @try {
         if (!color || color.textureType != MTLTextureType2D ||
             color.pixelFormat != MTLPixelFormatRGBA16Float ||
-            !hasUsage(color, usage | MTLTextureUsagePixelFormatView) ||
+            !hasUsage(color, usage) ||
             color.swizzle.alpha != MTLTextureSwizzleAlpha) return nil;
         return [color newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Float
                     textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)
@@ -1694,7 +1695,7 @@ std::shared_ptr<ExecutionLease::Impl> makeLease(const PreparedFrame::Impl& frame
                         generation.inputCapacityWidth, generation.inputCapacityHeight, fullInputCapacity, prefer);
                 };
                 if (frame.allowScratchAlphaView) {
-                    const auto desired = usage | MTLTextureUsagePixelFormatView | [generation.alphaScaler colorTextureUsage];
+                    const auto desired = usage | [generation.alphaScaler colorTextureUsage];
                     if (desired != usage)
                         if (auto color = acquire(desired)) return color;
                 }

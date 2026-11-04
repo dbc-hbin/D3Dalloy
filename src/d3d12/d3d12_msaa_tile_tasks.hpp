@@ -41,7 +41,7 @@ struct MSAATileTaskControl {
 
 struct MSAATileTaskParams {
   MSAATaskUInt MaxPrimitives, Width, Height, Layers;
-  MSAATaskUInt InputDwords, OutputDwords, ViewportCount, Reserved;
+  MSAATaskUInt InputDwords, OutputDwords, ViewportCount, ControlMask;
   MSAATileTaskControl Base;
   float ViewportDepths[16][2];
   float Viewports[16][4];

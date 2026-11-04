@@ -208,6 +208,18 @@ void runMappingBursts(Context &c, bool scattered) {
   for (UINT t = 2; t <= 5; ++t)
     map(t, 1, (t / physical) % 2, t % physical, D3D12_TILE_RANGE_FLAG_NONE);
   map(24, 1, 0, 2, D3D12_TILE_RANGE_FLAG_NONE, D3D12_TILE_MAPPING_FLAG_NO_HAZARD);
+  if (scattered) {
+    // Two calls with holes inside each envelope. All four tiles stay resident
+    // while the byte oracle below observes their replacement physical pages.
+    for (UINT h = 0; h < 2; ++h) {
+      const UINT t = 6 + 4 * h;
+      const D3D12_TILED_RESOURCE_COORDINATE at[] = {{t, 0, 0, 0}, {t + 2, 0, 0, 0}};
+      const D3D12_TILE_REGION_SIZE sizes[] = {{1, FALSE, 0, 0, 0}, {1, FALSE, 0, 0, 0}};
+      const UINT offset = 1 + h, count = 2;
+      c.queue->UpdateTileMappings(target.Get(), 2, at, sizes, heaps[h].Get(), 1, nullptr, &offset, &count,
+                                  D3D12_TILE_MAPPING_FLAG_NONE);
+    }
+  }
   snapshot(1);
   for (UINT h = 0; h < 2; ++h) { backing[h].Reset(); heaps[h].Reset(); }
   check(start->Signal(1), "burst release producer");
@@ -221,6 +233,8 @@ void runMappingBursts(Context &c, bool scattered) {
       if (t == 20 || t == 21) { mapped = true; h = 1; p = 2; }
       if (t == 22) { mapped = true; h = 1; p = 1; }
       if (t == 24) { mapped = true; h = 0; p = 2; }
+      if (scattered && (t == 6 || t == 8)) { h = 0; p = t == 6 ? 1 : 2; }
+      if (scattered && (t == 10 || t == 12)) { h = 1; p = t == 10 ? 2 : 3; }
     }
     for (UINT w = 0; w < words; ++w)
       expect("burst page and offset", out[(s * pages + t) * words + w], mapped ? bits(h, p, w) : 0);

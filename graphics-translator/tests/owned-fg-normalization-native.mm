@@ -107,7 +107,8 @@ int main(int argc, char** argv) {
         id<MTLComputePipelineState> depthPipeline = pipeline(@"yaagl_fg_resample_depth");
         id<MTLComputePipelineState> motionPipeline = pipeline(@"yaagl_fg_normalize_motion");
         id<MTLComputePipelineState> fusedPipeline = pipeline(@"yaagl_fg_normalize_depth_motion");
-        id<MTLComputePipelineState> sourcePipeline = pipeline(@"yaagl_fg_normalize_depth_motion_2x");
+        id<MTLComputePipelineState> sourcePipeline = pipeline(@"yaagl_fg_normalize_depth_motion_source");
+        id<MTLComputePipelineState> doubledPipeline = pipeline(@"yaagl_fg_normalize_depth_motion_2x");
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
         // Half-store rounding: RG16Float float-typed stores may truncate on Apple GPUs.
@@ -231,9 +232,10 @@ int main(int argc, char** argv) {
         std::printf("OWNED_FG_NORMALIZATION_FUSED cases=%u pixels=%u mismatches=%u\n", fusedCases, ow * oh, fusedMismatches);
         // Differentially check every output of the source-grid path, including
         // offset inputs and target-coordinate camera reconstruction.
-        for (bool camera : {false,true}) for (bool inverted : {false,true}) {
-            const unsigned w = argc == 3 ? 960 : 17, h = argc == 3 ? 540 : 13;
-            const unsigned width = w*2, height = h*2;
+        const unsigned w = argc == 3 ? 960 : 17, h = argc == 3 ? 540 : 13;
+        for (auto [width, height] : {std::pair{w*2, h*2}, {(3*w+1)/2, (3*h+1)/2},
+                                     {(7*w+3)/4, (11*h+6)/7}, {2*w-1, 2*h-1}}) {
+          for (bool camera : {false,true}) for (bool inverted : {false,true}) {
             std::vector<float> z((w+1)*(h+2));
             std::vector<std::array<float,2>> v((w+2)*(h+1));
             for (unsigned i = 0; i < z.size(); ++i) z[i] = argc == 2 && i%31 == 0 ? NAN : float(i%7)/8;
@@ -256,7 +258,8 @@ int main(int argc, char** argv) {
             std::array<std::vector<double>,2> times;
             for (unsigned i = 0; i < (argc == 3 ? 16u : 1u); ++i) for (unsigned j = 0; j < 2; ++j) {
                 auto mode = (i+j)&1u;
-                double us = run(queue,mode ? sourcePipeline : fusedPipeline,m,
+                auto selected = width==w*2 && height==h*2 ? doubledPipeline : sourcePipeline;
+                double us = run(queue,mode ? selected : fusedPipeline,m,
                     {{srcM,0},{motions[mode],1},{depths[mode],2},{srcZ,4}},mode);
                 if (i >= 3) times[mode].push_back(us);
             }
@@ -268,9 +271,10 @@ int main(int argc, char** argv) {
             }
             if (argc == 3) {
                 for (auto& values : times) std::sort(values.begin(),values.end());
-                std::printf("FG_SOURCE_GRID_US camera=%d inverted=%d baseline=%.3f candidate=%.3f\n",
-                    camera,inverted,times[0][6],times[1][6]);
+                std::printf("FG_SOURCE_GRID_US width=%u height=%u camera=%d inverted=%d baseline=%.3f candidate=%.3f\n",
+                    width,height,camera,inverted,times[0][6],times[1][6]);
             }
+          }
         }
         failures = roundingMismatches + dilationMismatches + fusedMismatches;
     }

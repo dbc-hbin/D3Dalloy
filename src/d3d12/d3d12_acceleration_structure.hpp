@@ -156,11 +156,14 @@ static_assert(sizeof(ShadowParams) == 72, "shadow params layout");
 /* d3dalloy_as_postbuild operations: the D3D12 postbuild info types, plus the step that turns the
  * Metal compacted size a compaction wrote into the header into the D3D12 current size. */
 inline constexpr uint32_t kPostbuildFinalizeCompactedHeader = 0x100;
-inline constexpr uint32_t kPostbuildRestoreOmmHeader = 0x101;
+inline constexpr uint32_t kPostbuildRestoreOmmHeader = 0x200;
 
 struct PostbuildParams {
   uint64_t asAddress;
-  uint64_t destination;
+  union {
+    uint64_t destination; // Public query.
+    uint64_t ommMarker;   // Header fixup. Zero means recount relocated GPU pointers.
+  };
   uint32_t operation;
   uint32_t batchCount; // First entry only, zero for the original single-entry invocation.
 };
@@ -188,6 +191,7 @@ inline constexpr uint32_t kHelperThreadgroup = 256;
 /* What the shadow copy of one build holds, and the copies that produce it. */
 struct ShadowPlan {
   uint64_t size = 0;
+  uint32_t ommMarker = 0; // One plus the number of linked arrays, or zero for an ordinary BLAS.
   std::vector<ShadowGeometry> geometries;
   std::vector<ShadowJob> jobs;
 };

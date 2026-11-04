@@ -350,7 +350,7 @@ struct Atomic64Phase::Storage {
     // exposed to a smaller phase. Every published word is initialized above.
     context.nodeCapacity = arena->node_count;
     context.bitmapWordCount = arena->bitmap_words;
-    context.cursor = context.hint = count / 32;
+    context.firstFreeWord = context.hint = count / 32;
     std::memcpy(execution.header.mapped, &context, sizeof(context));
     execution.node_count = arena->node_count;
     params.roots = execution.roots.address;

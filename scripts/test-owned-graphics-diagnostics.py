@@ -3029,14 +3029,15 @@ class SubmissionFoundationEvidence(unittest.TestCase):
         output=output.replace("case=placed_disjoint_ranges proof=exact", "case=placed_disjoint_ranges textures=2 buffer=1 pixels=185 words=64 exact=1")
         output=output.replace("case=placed_sparse_range_replay proof=exact", "case=placed_sparse_range_replay executions=4 close_count=1 mapping=unmapped,disjoint,overlap,null pixels=64 words=256 exact=1")
         output=output.replace("case=dispatch_independence proof=exact",
-            "case=dispatch_independence phases=7 table_replays=3 potential_raw_war_waw=serial "
-            "budget=65 roots=8 all_words_and_guards=exact")
+            "case=dispatch_independence phases=9 table_replays=4 potential_raw_war_waw=serial "
+            "budget=65 roots=8 external_alias=serial all_words_and_guards=exact")
         output+="OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=10\n"
         records=[dict(event="recording_plan_sealed",passes=3,descriptor_values_captured=0),
             dict(event="residency_add_batch",allocations=5,commits=1)]
         records += [dict(event="indirect_buffer_reuse",count=1,capacity=2) for _ in range(2)]
         records += [dict(event="sparse_publication_elided",proof="no_sparse_heap_or_opaque_access") for _ in range(4)]
         records += [dict(event="submission_access_opaque",reason="sparse_alias")]
+        records += [dict(event="native_compute_begin",reason="dispatch_external_backing",dispatches=3,concurrent=0)]
         records += [dict(event="query_fanout_batch",targets=2,native_encoders=1,reset=0),
                     dict(event="query_fanout_batch",targets=1,native_encoders=1,reset=0),
                     dict(event="submit",queue=1,submission=1),dict(event="complete",queue=1,submission=1,status=4)]
@@ -3089,7 +3090,7 @@ class SubmissionFoundationEvidence(unittest.TestCase):
         self.assertFalse(check(records,text=output.replace("dispatch_independence", "missing_dispatch_independence")))
         for kind in ("recording_plan_sealed","residency_add_batch","indirect_buffer_reuse","sparse_publication_elided",
                      "submission_heap_clear_in_place","native_clear_begin","native_clear_end",
-                     "query_fanout_batch","submission_plan_work",
+                     "query_fanout_batch","submission_plan_work","native_compute_begin",
                      "execute_list","native_fence_wait_skipped","sparse_publication_proof",
                      "sparse_publication_required","sparse_alias_flush","sparse_barrier_elided"):
             self.assertFalse(check([row for row in records if row["event"]!=kind]))

@@ -8,16 +8,6 @@ static_assert(sizeof(D3DALLOYMSAAPrimitiveDraw) == 24);
 static_assert(sizeof(D3DALLOYMSAATileBounds) == 28);
 static_assert(sizeof(D3DALLOYMSAATile) == 172);
 
-// A slot is immutable from publication until every native consumer in that
-// batch has completed. The next prepare is fenced after those consumers.
-static void msaa_tile_task_zero_slot(device MSAATileTaskSlot &slot) {
-  for (uint i = 0; i < 8; ++i) slot.Indexed[i] = 0;
-  for (uint i = 0; i < 4; ++i) {
-    slot.Fullscreen[i] = slot.Clear[i] = slot.Probe[i] = 0;
-  }
-  for (uint sample = 0; sample < 16; ++sample) slot.Controls[sample].task_active = 0;
-}
-
 static void msaa_tile_task_publish(device const MSAATileTaskState &state,
                                    device MSAATileTaskCompletion &completion) {
   completion.Status = state.Status;
@@ -125,7 +115,8 @@ static void msaa_tile_task_fill(device MSAATileTaskSlot &slot,
   control.scissor_bottom = min(params.Scissors[viewport][3], params.Height);
   control.task_active = 1;
   control.padding = 0;
-  for (uint sample = 0; sample < 16; ++sample) {
+  for (uint mask = params.ControlMask; mask; mask &= mask - 1) {
+    const uint sample = ctz(mask);
     control.sample_base = sample;
     slot.Controls[sample] = control;
   }
@@ -194,12 +185,8 @@ static void msaa_tile_task_fill(device MSAATileTaskSlot &slot,
       state.Status = state.BatchCount ? kMSAATileRunning : kMSAATileDone;
   }
 
-  // Padding is never consumed by the host. Disable every indirect packet and
-  // task guard; leave its unreachable payload untouched to bound reset traffic.
-  for (uint slot = state.BatchCount; slot < kMSAATileQuantum; ++slot) {
-    msaa_tile_task_zero_slot(state.Slots[slot]);
-    completion.Descriptors[slot] = {0, 0, 0, 0};
-  }
+  // The host encodes exactly ReadyTasks slots after retirement. No padding
+  // descriptor, indirect packet or unselected sample control is consumed.
   msaa_tile_task_publish(state, completion);
 }
 

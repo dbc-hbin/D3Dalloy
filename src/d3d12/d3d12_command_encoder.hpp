@@ -433,7 +433,7 @@ struct StreamOutputDrawData {
   uint64_t status_offset = 0;
   uint64_t claims_offset = 0;
   uint64_t claims_bytes = 0;
-  bool parallel_list_assembly = false;
+  bool parallel_assembly = false;
   std::array<Rc<BufferAllocation>, 4> targets;
   std::array<uint64_t, 4> target_offsets{};
   std::array<Rc<BufferAllocation>, 4> filled_sizes;

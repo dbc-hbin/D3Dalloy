@@ -1240,6 +1240,24 @@ struct GraphExecution {
     auto &state = *reinterpret_cast<WorkGraphSchedulerState *>(bytes);
     state = {}; state.SelectedNode = state.PendingPacket = SM50_WG_NONE;
     *reinterpret_cast<WorkGraphSchedulerSeed *>(bytes + seeds_offset) = {address, stride, count, index};
+    // All dynamic output indices select from these immutable target tables.
+    // A zero-grid producer can still forward its input to a sharing peer.
+    std::vector<uint32_t> reachable{index};
+    std::vector<bool> seen(graph.nodes.size());
+    seen[index] = true;
+    auto visit = [&](uint32_t target) {
+      if (target != SM50_WG_NONE && !seen[target]) {
+        seen[target] = true;
+        reachable.push_back(target);
+      }
+    };
+    for (size_t i = 0; i < reachable.size(); ++i) {
+      const auto node = reachable[i];
+      for (auto target : graph.nodes[node].targets) visit(target);
+      for (auto peer : graph.sharing_nodes[node]) visit(peer);
+    }
+    std::erase_if(reachable, [&](uint32_t node) { return node_bindings[node].host; });
+    const bool group_indirect = reachable.size() > 1;
     uint64_t quantum = 0;
     while (state.Status == kWorkGraphSchedulerRunning) {
       const uint64_t nodes_before = state.NodeSteps, nonterminal_before = state.NonterminalSteps, host_before = state.HostSteps;
@@ -1248,23 +1266,30 @@ struct GraphExecution {
       state.QuantumGroups = 0;
       auto buffer = Begin();
       if (!buffer) return E_OUTOFMEMORY;
-      auto encoder = buffer.computeCommandEncoder(false);
+      auto encoder = buffer.computeCommandEncoder(group_indirect);
       Use(encoder, frontier); Use(encoder, control); Use(encoder, backing_owner->buffer());
       if (seed_resource) Use(encoder, seed_resource);
       if (input_owner) Use(encoder, input_owner->buffer());
       for (uint32_t slot = 0; slot < kWorkGraphSchedulerQuantum; ++slot) {
+        if (slot && group_indirect)
+          encoder.barrierAfterEncoderStages(WMTMetal4StageDispatch, WMTMetal4StageDispatch, WMTMetal4VisibilityDevice);
         Bind(encoder, frontier, 0, 0); Bind(encoder, frontier, params_offset, 1);
         wmtcmd_compute_setpso prepare{}; prepare.type = WMTComputeCommandSetPSO;
         prepare.pso = frontier_pipeline; prepare.threadgroup_size = {1, 1, 1};
         wmtcmd_compute_dispatch step{}; step.type = WMTComputeCommandDispatch; step.size = {1, 1, 1};
         prepare.next.set(&step);
         encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&prepare));
-        for (uint32_t node_index = 0; node_index < graph.nodes.size(); ++node_index) {
-          if (node_bindings[node_index].host) continue;
-          const auto &node = graph.nodes[node_index];
+        // Prepare clears the previous live packet and enables at most one.
+        // Other indirect calls read zero grids and cannot touch node data.
+        if (group_indirect)
+          encoder.barrierAfterEncoderStages(WMTMetal4StageDispatch, WMTMetal4StageDispatch, WMTMetal4VisibilityDevice);
+        if (!reachable.empty()) {
           Bind(encoder, control, context_offset, SM50_BINDING_INDEX_WORK_GRAPH_CONTEXT);
           Bind(encoder, dispatch.arguments, dispatch.roots, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
           Bind(encoder, dispatch.arguments, dispatch.samplers, SM50_BINDING_INDEX_STATIC_SAMPLERS);
+        }
+        for (uint32_t node_index : reachable) {
+          const auto &node = graph.nodes[node_index];
           if (node.constants.buffer) Bind(encoder, node.constants.buffer, node.constants.offset, SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS);
           wmtcmd_compute_setpso pipeline{}; pipeline.type = WMTComputeCommandSetPSO;
           pipeline.pso = node.pipeline; pipeline.threadgroup_size = node.threads;
@@ -1275,9 +1300,7 @@ struct GraphExecution {
           encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&pipeline));
         }
       }
-      // The Metal4 serial encoder inserts a device-visibility dependency before
-      // every dispatch, including indirect dispatch. OutputComplete is lowered
-      // to a no-op: these dependencies publish tails, payloads and child grids.
+      // The last batch retires before the CPU consumes scheduler or host state.
       encoder.endEncoding();
       if (!Complete(buffer)) return E_FAIL;
       owned_graphics::Trace("work_graph_frontier_quantum", ",\"quantum\":", ++quantum,
@@ -1287,7 +1310,8 @@ struct GraphExecution {
           ",\"total_node_steps\":", state.NodeSteps, ",\"total_nonterminal_steps\":", state.NonterminalSteps,
           ",\"peak_depth\":", state.PeakDepth, ",\"host_yield\":", state.HostYield,
           ",\"done\":", unsigned(state.Status == kWorkGraphSchedulerDone), ",\"error\":", state.Error,
-          ",\"gpu_slots\":", kWorkGraphSchedulerQuantum, ",\"admitted_groups\":", state.QuantumGroups);
+          ",\"gpu_slots\":", kWorkGraphSchedulerQuantum, ",\"indirect_nodes\":", reachable.size(),
+          ",\"graph_nodes\":", graph.nodes.size(), ",\"admitted_groups\":", state.QuantumGroups);
       if (state.Status == kWorkGraphSchedulerError) {
         ERR("Work graph GPU frontier failed: ", state.Error, " node=", state.ErrorNode, " level=", state.ErrorLevel);
         return E_INVALIDARG;

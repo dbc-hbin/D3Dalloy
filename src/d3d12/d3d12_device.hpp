@@ -964,6 +964,8 @@ public:
   /* Advances whenever the VA map gains or loses a buffer; a cached lookup result is reusable
    * only while this value is unchanged. */
   std::atomic<uint64_t> buffer_va_generation{0};
+  // Opaque recordings can retain host-backed allocations after the public resource is released.
+  std::atomic<bool> has_used_external_backing{false};
 
   virtual InternalCommandLibrary& GetLib() = 0;
 

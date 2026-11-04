@@ -427,6 +427,7 @@ struct Kernels {
     Object depthPipeline;
     Object motionPipeline;
     Object depthMotionPipeline;
+    Object depthMotionSourcePipeline;
     Object depthMotion2xPipeline;
     Object encodePipeline;
     Object distortionPipeline;
@@ -456,6 +457,7 @@ std::shared_ptr<const Kernels> deviceKernels(id<MTLDevice> device) {
     result->depthPipeline = makePipeline(device, library, @"yaagl_fg_resample_depth");
     result->motionPipeline = makePipeline(device, library, @"yaagl_fg_normalize_motion");
     result->depthMotionPipeline = makePipeline(device, library, @"yaagl_fg_normalize_depth_motion");
+    result->depthMotionSourcePipeline = makePipeline(device, library, @"yaagl_fg_normalize_depth_motion_source");
     result->depthMotion2xPipeline = makePipeline(device, library, @"yaagl_fg_normalize_depth_motion_2x");
     result->encodePipeline = makePipeline(device, library, @"yaagl_fg_encode_scatter");
     result->distortionPipeline = makePipeline(device, library, @"yaagl_fg_decode_distortion");
@@ -991,11 +993,20 @@ bool dispatchPass(id encoderObject, id table, id<MTLComputePipelineState> pipeli
         [arguments setTexture:(ui ? ui : source).gpuResourceID atIndex:4];
         [arguments setTexture:(scene ? scene : source).gpuResourceID atIndex:5];
         [arguments setTexture:(present ? present : source).gpuResourceID atIndex:6];
-        const bool group2x = fusedGuides && fusedGuides->depthMotion2xPipeline && params.depthDilation &&
-            params.extent[0] == 2ull * params.depthSourceExtent[0] &&
-            params.extent[1] == 2ull * params.depthSourceExtent[1];
-        const auto* grid = group2x ? params.depthSourceExtent : params.extent;
-        [encoder setComputePipelineState:group2x ? (id<MTLComputePipelineState>)fusedGuides->depthMotion2xPipeline.get() : pipeline];
+        const auto useSourceAxis = [](uint32_t target, uint32_t source) {
+            return 2ull * target >= 3ull * source && target <= 2ull * source;
+        };
+        id<MTLComputePipelineState> sourcePipeline = nil;
+        if (fusedGuides && params.depthDilation &&
+            useSourceAxis(params.extent[0], params.depthSourceExtent[0]) &&
+            useSourceAxis(params.extent[1], params.depthSourceExtent[1])) {
+            const bool doubled = params.extent[0] == 2ull * params.depthSourceExtent[0] &&
+                                 params.extent[1] == 2ull * params.depthSourceExtent[1];
+            sourcePipeline = (id<MTLComputePipelineState>)(doubled ? fusedGuides->depthMotion2xPipeline :
+                                                                      fusedGuides->depthMotionSourcePipeline).get();
+        }
+        const auto* grid = sourcePipeline ? params.depthSourceExtent : params.extent;
+        [encoder setComputePipelineState:sourcePipeline ?: pipeline];
         [encoder setArgumentTable:arguments];
         [encoder dispatchThreads:MTLSizeMake(grid[0], grid[1], 1)
              threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];

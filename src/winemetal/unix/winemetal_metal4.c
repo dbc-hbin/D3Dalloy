@@ -301,7 +301,7 @@ typedef struct {
 @interface D3DALLOYM4ComputeEncoder : D3DALLOYM4Encoder {
 @public
   MTLSize threadgroupSize;
-  BOOL concurrent;
+  BOOL concurrent, externalBacking;
   MTLStages pendingStages;
   M4BlitAccess blitAccesses[32];
   unsigned blitAccessCount;
@@ -586,12 +586,14 @@ static void m4_stage_barrier(D3DALLOYM4ComputeEncoder *context, MTLStages stage)
   if (!context->concurrent) {
     unsigned target=stage==MTLStageDispatch ? 0 : stage==MTLStageBlit ? 1 : 2;
     MTLStages after=context->pendingStages & ~context->orderedFor[target];
-    if (stage==MTLStageBlit) {
+    if (stage==MTLStageBlit && !context->externalBacking) {
       if (context->orderedFor[1] & MTLStageBlit) context->blitAccessCount=0;
       after &= ~MTLStageBlit;
     }
     if (after) {
-      [context->encoder barrierAfterEncoderStages:after beforeEncoderStages:stage visibilityOptions:MTL4VisibilityOptionDevice];
+      MTL4VisibilityOptions visibility=MTL4VisibilityOptionDevice;
+      if (context->externalBacking) visibility|=MTL4VisibilityOptionResourceAlias;
+      [context->encoder barrierAfterEncoderStages:after beforeEncoderStages:stage visibilityOptions:visibility];
       if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_STAGE_BARRIER encoder=%llu after=%llu before=%llu implicit=1\n",
           (unsigned long long)(uintptr_t)context->encoder,(unsigned long long)after,(unsigned long long)stage);
       m4_record_barrier(context,after,stage);
@@ -723,6 +725,7 @@ static void m4_blit_reserve(D3DALLOYM4ComputeEncoder *context) {
 }
 static void m4_blit_access(D3DALLOYM4ComputeEncoder *context, M4BlitAccess source, M4BlitAccess destination) {
   m4_stage_barrier(context,MTLStageBlit);
+  if (context->externalBacking) return; // Native handles do not identify shared host pages.
   const M4BlitAccess accesses[2]={source,destination};
   BOOL conflict=NO;
   for (unsigned j=0;j<2 && !conflict;++j)
@@ -884,7 +887,7 @@ static MTL4RenderPassDescriptor *m4_render_pass(D3DALLOYM4CommandBuffer *context
 }
 
 
-static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next);
+static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next, uint64_t independent);
 static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct wmtcmd_base *next);
 static int32_t m4_blit_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next);
 
@@ -1324,9 +1327,13 @@ int32_t winemetal_metal4_call(void *params) {
       D3DALLOYM4CommandBuffer *owner=m4cb(a[0]); if (!owner->recording || owner->ended) return M4_INVALID;
       D3DALLOYM4ComputeEncoder *context=[D3DALLOYM4ComputeEncoder new]; context->owner=owner; context->recording=owner->recording;
       context->compute=YES;
-      context->concurrent=a[1]!=0;
+      context->externalBacking=a[2]!=0;
+      context->concurrent=a[1]!=0 && !context->externalBacking;
       context->encoder=[[owner->command computeCommandEncoder] retain];
       if (!context->encoder) { [context release]; return M4_FAILED; }
+      if (context->externalBacking)
+        [context->encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch|MTLStageBlit
+                          visibilityOptions:MTL4VisibilityOptionDevice|MTL4VisibilityOptionResourceAlias];
       if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_COMPUTE_BEGIN context=%llu encoder=%llu concurrent=%u\n",
           (unsigned long long)(uintptr_t)context,(unsigned long long)(uintptr_t)context->encoder,context->concurrent?1:0);
       [owner->recording->encoders addObject:context]; call->ret[0]=(uint64_t)context; [context release]; return M4_SUCCESS;
@@ -1357,7 +1364,7 @@ int32_t winemetal_metal4_call(void *params) {
       return M4_SUCCESS;
     }
     case WMTMetal4RenderCommands: return m4_render_commands((D3DALLOYM4RenderEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
-    case WMTMetal4ComputeCommands: return m4_compute_commands((D3DALLOYM4ComputeEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
+    case WMTMetal4ComputeCommands: return m4_compute_commands((D3DALLOYM4ComputeEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1],a[2]);
     case WMTMetal4BlitCommands: return m4_blit_commands((D3DALLOYM4ComputeEncoder *)m4obj(a[0]),(const void *)(uintptr_t)a[1]);
     case WMTMetal4Commit: return m4_commit(call);
     case WMTMetal4WaitSubmission: {
@@ -1456,7 +1463,7 @@ int32_t winemetal_metal4_call(void *params) {
 }
 
 
-static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next) {
+static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next, uint64_t independent) {
   id<MTL4ComputeCommandEncoder> encoder=(id<MTL4ComputeCommandEncoder>)context->encoder;
   while (next) {
     switch ((enum WMTComputeCommandType)next->type) {
@@ -1465,6 +1472,12 @@ static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const stru
     case WMTComputeCommandDispatchThreads: {
       const struct wmtcmd_compute_dispatch *body=(const void *)next;
       MTLSize size=MTLSizeMake(body->size.width,body->size.height,body->size.depth);
+      if (next->type==WMTComputeCommandDispatch) {
+        // The planner proved only the Dispatch -> Dispatch edge unnecessary.
+        // All other pending stages retain their original ordering.
+        if (independent & 1) context->orderedFor[0] |= MTLStageDispatch;
+        independent >>= 1;
+      }
       m4_stage_barrier(context,MTLStageDispatch);
       if (next->type==WMTComputeCommandDispatch) [encoder dispatchThreadgroups:size threadsPerThreadgroup:context->threadgroupSize];
       else [encoder dispatchThreads:size threadsPerThreadgroup:context->threadgroupSize];

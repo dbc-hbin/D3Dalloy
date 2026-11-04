@@ -3058,6 +3058,10 @@ public:
       }
       if (resource->swizzle_layout)
         swizzle_texture_count_.fetch_add(1, std::memory_order_release);
+      const auto *buffer = resource->buffer ? resource->buffer->current() : nullptr;
+      const auto *texture = resource->texture ? resource->texture->current() : nullptr;
+      if ((buffer && buffer->flags().test(BufferAllocationFlag::CpuPlaced)) || (texture && texture->mappedMemory))
+        has_used_external_backing.store(true, std::memory_order_release);
       return S_OK;
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;

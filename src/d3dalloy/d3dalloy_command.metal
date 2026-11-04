@@ -699,8 +699,10 @@ inline D3DALLOYMSAAMarker msaa_gather_conservative_depth_impl(
   float2 polygon[d3dalloy_conservative::kMaxVertices];
   const uint count = d3dalloy_conservative::clipped_polygon(input.p0, input.p1, input.p2, viewport, clip,
                                                         (input.flags >> 4) & 15, input.flags & 8, polygon, det);
-  const bool covered = count && d3dalloy_conservative::square_overlaps(polygon, count, floor(input.position.xy));
-  const bool inner = count && d3dalloy_conservative::square_inside(polygon, count, floor(input.position.xy));
+  const long area = count ? d3dalloy_conservative::polygon_area(polygon, count) : 0;
+  bool inner = false;
+  const bool covered = count && d3dalloy_conservative::square_coverage(
+      polygon, count, floor(input.position.xy), area, inner);
   // Native depth interpolation on the expanded fan quantizes its plane independently.
   // Derive the D3D plane from the original snapped vertices instead, using the
   // carrier only to recover the render pass's actual sample locations.
@@ -714,7 +716,7 @@ inline D3DALLOYMSAAMarker msaa_gather_conservative_depth_impl(
   }
   const float3 c0 = cross(screen[1], screen[2]);
   const float denominator = dot(screen[0], c0);
-  const bool degenerate = !count || !d3dalloy_conservative::polygon_area(polygon, count) ||
+  const bool degenerate = !area ||
       d3dalloy_conservative::snapped_triangle_degenerate(input.p0, input.p1, input.p2, viewport);
   float3 plane;
   if (degenerate)
@@ -1473,9 +1475,9 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
     device uchar *filled3 [[buffer(13)]],
     device uint *status [[buffer(14)]],
     device ulong *statistics [[buffer(15)]],
-    uint tid [[thread_position_in_grid]], uint3 group [[threads_per_threadgroup]], uint simd_width [[threads_per_simdgroup]]
+    uint tid [[thread_position_in_grid]], uint group_width [[threads_per_threadgroup]], uint simd_width [[threads_per_simdgroup]]
 ) {
-  const bool parallel = group.x == 32 && simd_width == 32;
+  const bool parallel = group_width == 32 && simd_width == 32;
   if (!parallel && tid) return;
   if (!tid) status[0] = 0;
   if (params.predicate_enabled && (params.predicate_not_equal ? predicate[0] != 0 : predicate[0] == 0))
@@ -1699,6 +1701,39 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
  * number of captured vertices. `control.record_count` is the number of keys. Output strips are written as lists
  * with the IA strip order (triangle i: (i, i+1, i+2), odd i: (i, i+2, i+1)), appended in key order (FS 14.5/14.6).
  * `params.topology` is the GS output topology: 0 point list, 2 line strip, 4 triangle strip. */
+static void so_write_gs_primitive(constant D3DALLOYSOAssembly &params, device const uint *records,
+    thread const uint *primitive, uint vpp, ulong first_vertex, thread const ulong *filled,
+    device uchar *thread *targets) {
+  for (uint p = 0; p < vpp; ++p) {
+    device const uint *source = records + ulong(primitive[p]) * (params.record_dwords + 1);
+    for (uint e = 0; e < params.element_count; ++e) {
+      const auto element = params.elements[e];
+      const ulong base = filled[element.slot] + (first_vertex + p) * params.stride[element.slot] + element.byte_offset;
+      for (uint c = 0; c < element.component_count; ++c)
+        d3dalloy_so_store_dword(targets[element.slot], base + 4 * c, source[element.dword_offset + c]);
+    }
+  }
+}
+
+static bool so_gs_primitive(uint topology, uint position, uint v, uint run_start, thread uint *primitive) {
+  bool complete = false;
+  if (topology == 0) {
+    primitive[0] = v;
+    complete = true;
+  } else if (topology == 2 && position >= 1) {
+    primitive[0] = v - 1;
+    primitive[1] = v;
+    complete = true;
+  } else if (topology == 4 && position >= 2) {
+    const uint i = position - 2;
+    primitive[0] = run_start + i;
+    primitive[1] = (i & 1) ? v : run_start + i + 1;
+    primitive[2] = (i & 1) ? run_start + i + 1 : v;
+    complete = true;
+  }
+  return complete;
+}
+
 [[kernel]] void so_assemble_gs(
     constant D3DALLOYSOAssembly &params [[buffer(0)]],
     constant D3DALLOYSOControl &control [[buffer(1)]],
@@ -1714,9 +1749,12 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
     device uchar *filled1 [[buffer(11)]],
     device uchar *filled2 [[buffer(12)]],
     device uchar *filled3 [[buffer(13)]],
-    device uint *status [[buffer(14)]]
+    device uint *status [[buffer(14)]], uint tid [[thread_position_in_grid]],
+    uint group_width [[threads_per_threadgroup]], uint simd_width [[threads_per_simdgroup]]
 ) {
-  status[0] = 0;
+  const bool parallel = group_width == 32 && simd_width == 32;
+  if (!parallel && tid) return;
+  if (!tid) status[0] = 0;
   if (params.predicate_enabled && (params.predicate_not_equal ? predicate[0] != 0 : predicate[0] == 0))
     return;
   device uchar *targets[4] = {target0, target1, target2, target3};
@@ -1730,6 +1768,47 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
   const uint max_vertices = params.vertex_count; // dcl_maxout
   const uint stride = params.record_dwords + 1;
   device const uint *headers = scratch + ulong(control.record_count) * max_vertices * stride;
+  if (parallel) {
+    ulong capacity = (params.referenced_mask & ~params.bound_mask) ? 0 : ~0ul;
+    for (uint s = 0; s < 4; ++s) if (params.referenced_mask & (1u << s)) {
+      const ulong room = params.size[s] - min(params.size[s], filled[s]);
+      capacity = min(capacity, room / (ulong(vpp) * params.stride[s]));
+    }
+    simdgroup_barrier(mem_flags::mem_device);
+    ulong needed = 0;
+    for (ulong first = 0; first < control.record_count; first += 32) {
+      const ulong key = first + tid;
+      const bool live = key < control.record_count;
+      const uint count = live ? min(headers[key], max_vertices) : 0;
+      device const uint *records = scratch + (live ? key : 0) * max_vertices * stride;
+      uint produced = count;
+      if (vpp != 1) {
+        produced = 0;
+        for (uint v = 0; v < count; ++v)
+          produced += records[ulong(v) * stride + params.record_dwords] >= vpp - 1;
+      }
+      // A lane owns one complete invocation. Prefix over actual emissions, including
+      // strip cuts, assigns each key its destination in the application's order.
+      ulong ordinal = needed + simd_prefix_exclusive_sum(produced);
+      needed += simd_sum(produced);
+      uint run_start = 0;
+      for (uint v = 0; v < count && ordinal < capacity; ++v) {
+        const uint position = records[ulong(v) * stride + params.record_dwords];
+        if (!position) run_start = v;
+        uint primitive[3];
+        if (so_gs_primitive(topology, position, v, run_start, primitive))
+          so_write_gs_primitive(params, records, primitive, vpp, ordinal++ * vpp, filled, targets);
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_device);
+    if (!tid) {
+      const ulong written = min(needed, capacity);
+      for (uint s = 0; s < 4; ++s) if ((params.referenced_mask & params.bound_mask) & (1u << s))
+        d3dalloy_so_store_dword(filled_sizes[s], 0, uint(filled[s] + written * vpp * params.stride[s]));
+      counters[0] += ulong2(written, needed);
+    }
+    return;
+  }
   bool stopped = (params.referenced_mask & ~params.bound_mask) != 0;
   ulong written = 0, needed = 0;
   for (uint key = 0; key < control.record_count; key++) {
@@ -1741,22 +1820,7 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
       if (position == 0)
         run_start = v;
       uint primitive[3];
-      bool complete = false;
-      if (topology == 0) {
-        primitive[0] = v;
-        complete = true;
-      } else if (topology == 2 && position >= 1) {
-        primitive[0] = v - 1;
-        primitive[1] = v;
-        complete = true;
-      } else if (topology == 4 && position >= 2) {
-        const uint i = position - 2;
-        primitive[0] = run_start + i;
-        primitive[1] = (i & 1) ? v : run_start + i + 1;
-        primitive[2] = (i & 1) ? run_start + i + 1 : v;
-        complete = true;
-      }
-      if (!complete)
+      if (!so_gs_primitive(topology, position, v, run_start, primitive))
         continue;
       needed++;
       if (!stopped) {
@@ -1767,15 +1831,7 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
       }
       if (stopped)
         continue;
-      for (uint p = 0; p < vpp; p++) {
-        device const uint *source = records + ulong(primitive[p]) * stride;
-        for (uint e = 0; e < params.element_count; e++) {
-          const D3DALLOYSOElement element = params.elements[e];
-          const ulong base = filled[element.slot] + ulong(p) * params.stride[element.slot] + element.byte_offset;
-          for (uint c = 0; c < element.component_count; c++)
-            d3dalloy_so_store_dword(targets[element.slot], base + 4 * c, source[element.dword_offset + c]);
-        }
-      }
+      so_write_gs_primitive(params, records, primitive, vpp, 0, filled, targets);
       for (uint s = 0; s < 4; s++)
         if (params.referenced_mask & (1u << s))
           filled[s] += ulong(vpp) * params.stride[s];

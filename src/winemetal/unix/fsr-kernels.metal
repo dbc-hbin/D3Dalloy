@@ -150,21 +150,16 @@ kernel void yaagl_sr_copy_pad_float(
     destination.write(source.read(params.sourceOrigin + min(tid, params.extent - 1u)), tid);
 }
 
-static float3 rcas_load(texture2d<float, access::read> source, int2 position,
-                        uint2 lower, uint2 upper, float exposure) {
-    int2 bounded = clamp(position, int2(lower), int2(upper - 1u));
-    return source.read(uint2(bounded)).rgb * exposure;
-}
-
 static float3 rcas(texture2d<float, access::read> source, uint2 position,
                    uint2 lower, uint2 upper, float sharpness, float exposure, float3 center) {
-    int2 p = int2(position);
-    float3 b = rcas_load(source, p + int2(0, -1), lower, upper, exposure);
-    float3 d = rcas_load(source, p + int2(-1, 0), lower, upper, exposure);
+    // Each tap moves one pixel along just one axis. The center already lies
+    // inside the active rectangle, so only the moving edge needs clamping.
+    float3 b = source.read(uint2(position.x, max(position.y, lower.y + 1u) - 1u)).rgb * exposure;
+    float3 d = source.read(uint2(max(position.x, lower.x + 1u) - 1u, position.y)).rgb * exposure;
     // The caller's center read is always inside [lower, upper).
     float3 e = center * exposure;
-    float3 f = rcas_load(source, p + int2(1, 0), lower, upper, exposure);
-    float3 h = rcas_load(source, p + int2(0, 1), lower, upper, exposure);
+    float3 f = source.read(uint2(min(position.x + 1u, upper.x - 1u), position.y)).rgb * exposure;
+    float3 h = source.read(uint2(position.x, min(position.y + 1u, upper.y - 1u))).rgb * exposure;
 
     float bL = b.b * 0.5f + (b.r * 0.5f + b.g);
     float dL = d.b * 0.5f + (d.r * 0.5f + d.g);
@@ -455,8 +450,7 @@ kernel void yaagl_fg_normalize_depth_motion(
                                            depthValue.r, params), tid);
 }
 
-// At exact 2x enlargement the four texel centers all map to the same depth
-// sample. Keep reprojection at each output position while sharing its winner.
+// Exact doubling uses a fixed four-texel loop.
 kernel void yaagl_fg_normalize_depth_motion_2x(
     texture2d<float, access::read> source [[texture(0)]],
     texture2d<half, access::write> destination [[texture(1)]],
@@ -470,6 +464,37 @@ kernel void yaagl_fg_normalize_depth_motion_2x(
     uint2 mv = fg_motion_position(center * 2u, winner, params);
     for (uint y = 0; y < 2; ++y) for (uint x = 0; x < 2; ++x) {
         uint2 tid = center * 2u + uint2(x, y);
+        depth.write(depthValue, tid);
+        destination.write(fg_normalized_motion(source, tid, mv, depthValue.r, params), tid);
+    }
+}
+
+// First target texel whose sample center maps to this source coordinate.
+// Correct ties using the scalar shader's float mapping. D3D12 2D texture
+// extents (<= 16384) keep the integer product in range.
+static uint2 fg_target_begin(uint2 s, uint2 target, uint2 source) {
+    uint2 begin = (2u * s * target + source - 1u) / (2u * source);
+    uint2 previous = max(begin, 1u) - 1u;
+    begin -= uint2((begin > 0u) & (fg_source_position(previous, target, source) >= s));
+    begin += uint2((begin < target) & (fg_source_position(begin, target, source) < s));
+    return begin;
+}
+
+kernel void yaagl_fg_normalize_depth_motion_source(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<half, access::write> destination [[texture(1)]],
+    texture2d<float, access::write> depth [[texture(2)]],
+    texture2d<float, access::read> sourceDepth [[texture(4)]],
+    constant YaaglFgParams& params [[buffer(0)]],
+    uint2 center [[thread_position_in_grid]]) {
+    uint2 winner = fg_nearest_depth(sourceDepth, center, params.depthSourceExtent,
+                                    params.depthInverted != 0u, params.sceneOrigin);
+    float4 depthValue = sourceDepth.read(params.sceneOrigin + winner);
+    uint2 begin = fg_target_begin(center, params.extent, params.depthSourceExtent);
+    uint2 end = fg_target_begin(center + 1u, params.extent, params.depthSourceExtent);
+    uint2 mv = fg_motion_position(begin, winner, params);
+    for (uint y = begin.y; y < end.y; ++y) for (uint x = begin.x; x < end.x; ++x) {
+        uint2 tid = uint2(x, y);
         depth.write(depthValue, tid);
         destination.write(fg_normalized_motion(source, tid, mv, depthValue.r, params), tid);
     }

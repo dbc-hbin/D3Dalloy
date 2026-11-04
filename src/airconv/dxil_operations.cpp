@@ -1884,6 +1884,31 @@ OperationLowerer::lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &b,
     load->setVolatile(true);
     return b.CreateSelect(present, b.CreateZExtOrTrunc(load, result_type), identity);
   };
+  if (opcode == OpWaveActiveAllEqual && type->getPrimitiveSizeInBits() <= 32) {
+    // The wide-wave admission proof guarantees contiguous active compute lanes.
+    // Pack one representative and one disagreement bit into a scratch word.
+    auto *bitsType = b.getIntNTy(type->getPrimitiveSizeInBits());
+    auto asValue = [&](Value *bits) { return b.CreateBitCast(b.CreateTruncOrBitCast(bits, bitsType), type); };
+    auto equals = [&](Value *other) {
+      return type->isFloatingPointTy() ? b.CreateFCmpOEQ(value, other) : b.CreateICmpEQ(value, other);
+    };
+    auto *bits = b.CreateZExtOrTrunc(b.CreateBitCast(value, bitsType), b.getInt32Ty());
+    auto *first = emitAIR(b, "air.simd_shuffle.u.i32", {bits, b.getInt16(0)}, b.getInt32Ty(), true);
+    auto *equal = emitAIR(b, "air.simd_all", {equals(asValue(first))}, b.getInt1Ty(), true);
+    if (wide_threads <= kNativeWaveLanes) return equal;
+    Value *word = b.CreateOr(b.CreateZExt(first, b.getInt64Ty()),
+        b.CreateSelect(equal, b.getInt64(0), b.getInt64(uint64_t(1) << 32)));
+    b.CreateStore(word, pointer(wide_group_index))->setVolatile(true);
+    air.CreateBarrier(air::MemFlags::Threadgroup, false);
+    Value *result = equal;
+    for (unsigned group = 0; group * kNativeWaveLanes < std::min(wide_threads, wave_lanes); ++group) {
+      Value *peer = partialAt(group, b.getInt64Ty(), word);
+      Value *uniform = b.CreateICmpULT(peer, b.getInt64(uint64_t(1) << 32));
+      result = b.CreateAnd(result, b.CreateAnd(uniform, equals(asValue(peer))));
+    }
+    air.CreateBarrier(air::MemFlags::Threadgroup, false);
+    return result;
+  }
   if (!multi && reduction && type->isIntegerTy()) {
     // Exact associative integer arithmetic: one physical-SIMD partial followed
     // by only 2/4 shared-memory partials, not 64/128 lane reads per thread.

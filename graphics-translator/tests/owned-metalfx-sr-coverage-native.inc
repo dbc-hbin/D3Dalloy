@@ -61,12 +61,12 @@ void srAlphaViewProof(GPU& gpu) {
             auto cf=candidate->prepare(info,in.textures(),&error,ops); require(bool(cf),error.message.c_str());
             auto actual=executeSRPrepared(gpu,cf,in,candidateGeneration,reset,{},2);
             require(actual==expected,"alpha-view-exact-output");
-            require(coverageBindings==(mode!=4) && extractBindings==(mode==4),"alpha-view-selection"); ++pairs;
+            require(coverageBindings==1 && extractBindings==0,"alpha-view-selection"); ++pairs;
         }
         method_setImplementation(viewMethod,(IMP)originalView);
         method_setImplementation(assignMethod,(IMP)originalColor);
         method_setImplementation(resetMethod,(IMP)originalSRReset);
     }
-    std::printf("OWNED_METALFX_SR_ALPHA_VIEW_PASS pairs=%u components=%u direct=5 staged=5 transfer=10 fallback=5\n",
+    std::printf("OWNED_METALFX_SR_ALPHA_VIEW_PASS pairs=%u components=%u direct=10 staged=5 transfer=10 forced_extract=25\n",
                 pairs,pairs*256*256*4);
 }

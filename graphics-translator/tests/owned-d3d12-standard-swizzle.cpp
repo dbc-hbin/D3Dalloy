@@ -887,6 +887,10 @@ static bool representation_validity(ID3D12Device *device, ID3D12CommandQueue *qu
   phase("begin","resource-handoff");
   bind_views(0);if(!submit(readers[2].Get()))return false;
   bind_views(1);if(!submit(readers[3].Get()))return false;
+  ComPtr<ID3D12GraphicsCommandList> unrelated;
+  if (!new_list(unrelated)) return false;
+  unrelated->CopyBufferRegion(output_readback.Get(), 0, upload.Get(), guard_offset, sizeof(uint32_t));
+  if (!ok(unrelated->Close(),"handoff-unrelated-close") || !submit(unrelated.Get())) return false;
   bind_views(0);
   if(!ok(foreign->Wait(fence.Get(),fence_value),"handoff-wait"))return false;
   execute(foreign.Get(),readers[6].Get());

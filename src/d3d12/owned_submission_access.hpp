@@ -30,6 +30,7 @@ struct SubmissionAccess {
   bool writes = false, attachment = false;
   uint64_t stages = 0;
   PhysicalIdentity physical{};
+  bool external_backing = false;
   PhysicalIdentity Key() const {
     return physical.owner ? physical : PhysicalIdentity{PhysicalDomain::Legacy,reinterpret_cast<uintptr_t>(allocation)};
   }

@@ -73,11 +73,14 @@ void dispatchIndependence() {
     sealed.list->SetComputeRoot32BitConstant(2,i,0);sealed.list->Dispatch(1,1,1);
   }
   copy(sealed.list.Get(),output.Get(),0);check(sealed.list->Close(),"dispatch sealed close");
-  const char *names[]={"dispatch_tables_disjoint","dispatch_tables_overlap","dispatch_tables_restore"};
-  for(UINT replay=0;replay<3;++replay) {
+  const char *names[]={"dispatch_tables_disjoint","dispatch_tables_overlap","dispatch_tables_restore","dispatch_tables_mixed"};
+  // Dispatches 3 and 6 conflict with a nonadjacent earlier view. All
+  // other dispatches in this replay are independent since the last barrier.
+  const UINT mixed[count]={0,1,2,0,3,4,3,5};
+  for(UINT replay=0;replay<4;++replay) {
     std::vector<uint32_t> expected(words,guard);
     for(UINT i=0;i<count;++i) {
-      const UINT row=replay==1?0:replay==2?(i+3)%count:i;
+      const UINT row=replay==1?0:replay==2?(i+3)%count:replay==3?mixed[i]:i;
       setView(i,row*64,64);expected[row*64+i]=0x13570000+i;
     }
     phase(names[replay],true);c.executeSealed({sealed.list.Get()});verify(expected);phase(names[replay],false);
@@ -130,5 +133,27 @@ void dispatchIndependence() {
   for(UINT i=0;i<count;++i)for(UINT j=0;j<words;++j)
     if(static_cast<const uint32_t*>(mapped)[i*words+j]!=(j==i?0x13570000+i:guard))fail("dispatch root values and guards");
   rootReadback->Unmap(0,nullptr);phase("dispatch_roots_disjoint",false);
-  std::printf("%s_CASE_PASS case=dispatch_independence phases=7 table_replays=3 potential_raw_war_waw=serial budget=65 roots=8 all_words_and_guards=exact\n",foundation);
+  const auto properties=heap(D3D12_HEAP_TYPE_DEFAULT);
+  const auto desc=bufDesc(bytes,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  ComPtr<ID3D12Resource> shared,opened;
+  check(c.dev->CreateCommittedResource(&properties,D3D12_HEAP_FLAG_SHARED,&desc,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&shared)),"shared dispatch buffer");
+  HANDLE handle=nullptr;
+  check(c.dev->CreateSharedHandle(shared.Get(),nullptr,GENERIC_ALL,nullptr,&handle),"share dispatch buffer");
+  check(c.dev->OpenSharedHandle(handle,IID_PPV_ARGS(&opened)),"reopen dispatch buffer");
+  CloseHandle(handle);
+  auto aliases=c.list();initialize(aliases.list.Get(),shared.Get());
+  aliases.list->SetComputeRootSignature(rootViews.Get());aliases.list->SetPipelineState(rootWriter.Get());
+  aliases.list->SetComputeRootShaderResourceView(0,source->GetGPUVirtualAddress());
+  // Each dispatch writes a distinct word. A and its reopened alias B have
+  // overlapping root footprints despite their separate native buffers.
+  for(UINT i=0;i<3;++i) {
+    aliases.list->SetComputeRootUnorderedAccessView(1,(i==2?opened:shared)->GetGPUVirtualAddress());
+    aliases.list->SetComputeRoot32BitConstant(2,i,0);aliases.list->Dispatch(1,1,1);
+  }
+  copy(aliases.list.Get(),shared.Get(),0);
+  phase("dispatch_external_backing",true);c.execute({aliases.list.Get()});
+  expected.assign(words,guard);for(UINT i=0;i<3;++i)expected[i]=0x13570000+i;
+  verify(expected);phase("dispatch_external_backing",false);
+  std::printf("%s_CASE_PASS case=dispatch_independence phases=9 table_replays=4 potential_raw_war_waw=serial budget=65 roots=8 external_alias=serial all_words_and_guards=exact\n",foundation);
 }

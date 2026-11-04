@@ -83,6 +83,7 @@ inline uint clipped_polygon(float4 p0, float4 p1, float4 p2, float4 viewport, th
   const float3 x(p0.x, p1.x, p2.x), y(p0.y, p1.y, p2.y);
   const float3 z(p0.z, p1.z, p2.z), w(p0.w, p1.w, p2.w);
   const uint fixed_planes = depth_clip ? 7u : 5u;
+  bool original_vertices = true;
   for (uint plane = 0; plane < fixed_planes + clip_count && count; ++plane) {
     float3 distance;
     if (plane == 0)
@@ -103,6 +104,10 @@ inline uint clipped_polygon(float4 p0, float4 p1, float4 p2, float4 viewport, th
     }
     const float distance_scale = max(max(abs(distance.x), abs(distance.y)), abs(distance.z));
     if (distance_scale > 1.0f) distance /= distance_scale;
+    // Before the first clip the three barycentrics are the unit vectors.
+    // With finite nonnegative distances every edge emits exactly its first vertex.
+    if (original_vertices && all(distance >= 0.0f) && all(distance <= 1.0f)) continue;
+    original_vertices = false;
     uint kept = 0;
     for (uint i = 0; i < count; ++i) {
       const float3 a = polygon[i], b = polygon[(i + 1) % count];
@@ -158,10 +163,11 @@ inline uint clipped_polygon(float4 p0, float4 p1, float4 p2, float4 viewport, th
  * degenerate, its collinear edges constrain both sides of the line; the axis bounds
  * constrain its endpoints (and a point). Contact belongs to the uncertainty region.
  */
-inline bool square_overlaps(thread const float2 *polygon, uint count, float2 pixel) {
+inline bool square_coverage(thread const float2 *polygon, uint count, float2 pixel,
+                            long area, thread bool &inner) {
   const long2 origin = long2(pixel * 256.0f);
   long2 low = long2(0x7fffffffffffffffL), high = long2(-0x7fffffffffffffffL);
-  const long area = polygon_area(polygon, count);
+  inner = false;
   const long orientation = area >= 0 ? 1 : -1;
   for (uint i = 0; i < count; ++i) {
     const long2 a = long2(polygon[i] * 256.0f) - origin;
@@ -169,36 +175,21 @@ inline bool square_overlaps(thread const float2 *polygon, uint count, float2 pix
     high = max(high, a);
   }
   if (high.x < -1 || low.x > 257 || high.y < -1 || low.y > 257) return false;
+  bool all_inside = area != 0;
   for (uint i = 0; i < count; ++i) {
     const long2 a = long2(polygon[i] * 256.0f) - origin;
     const long2 b = long2(polygon[(i + 1) % count] * 256.0f) - origin;
     const long2 normal = long2(b.y - a.y, a.x - b.x) * orientation;
     const long nearest = min(0L, normal.x * 256) + min(0L, normal.y * 256);
     const long uncertainty = long(abs(normal.x)) + long(abs(normal.y));
-    if (nearest > normal.x * a.x + normal.y * a.y + uncertainty) return false;
-  }
-  return true;
-}
-
-/* All four pixel corners must lie inside every edge eroded by one fixed-point
- * unit. The erosion accounts for any nearest-grid vertex snapping (<=1/512 per
- * axis) and finer grids, never declares a degenerate fully covered, and is positive
- * even for vertices that happened not to move during snapping.
- */
-inline bool square_inside(thread const float2 *polygon, uint count, float2 pixel) {
-  const long area = polygon_area(polygon, count);
-  if (!area) return false;
-  const long orientation = area > 0 ? 1 : -1;
-  const long2 origin = long2(pixel * 256.0f);
-  for (uint i = 0; i < count; ++i) {
-    const long2 a = long2(polygon[i] * 256.0f) - origin;
-    const long2 b = long2(polygon[(i + 1) % count] * 256.0f) - origin;
-    const long2 normal = long2(b.y - a.y, a.x - b.x) * orientation;
-    if (normal.x == 0 && normal.y == 0) continue;
+    const long edge = normal.x * a.x + normal.y * a.y;
+    if (nearest > edge + uncertainty) return false;
+    // All four corners must clear every nonzero edge, eroded by one
+    // fixed-point unit. Snapped lines and points can only have outer coverage.
     const long farthest = max(0L, normal.x * 256) + max(0L, normal.y * 256);
-    const long uncertainty = long(abs(normal.x)) + long(abs(normal.y));
-    if (farthest >= normal.x * a.x + normal.y * a.y - uncertainty) return false;
+    all_inside &= !uncertainty || farthest < edge - uncertainty;
   }
+  inner = all_inside;
   return true;
 }
 

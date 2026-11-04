@@ -4883,8 +4883,10 @@ def submission_foundation_output_matches(stdout: str, stderr: str, native_compil
                   "placed_disjoint_ranges","placed_sparse_range_replay","query_fanout","sparse_mapping_positive","cpu_strip_transfer",
                   "dispatch_independence"] and
         stdout.count("OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=10") == 1 and cache_ok and
-        stdout.count("case=dispatch_independence phases=7 table_replays=3 potential_raw_war_waw=serial "
-                     "budget=65 roots=8 all_words_and_guards=exact") == 1 and
+        stdout.count("case=dispatch_independence phases=9 table_replays=4 potential_raw_war_waw=serial "
+                     "budget=65 roots=8 external_alias=serial all_words_and_guards=exact") == 1 and
+        any(e.get("reason") == "dispatch_external_backing" and e.get("dispatches") == 3 and
+            e.get("concurrent") == 0 for e in events("native_compute_begin")) and
         not placed_sparse_range_failures(stdout, stderr) and
         sealed and all(event.get("descriptor_values_captured") == 0 for event in sealed) and
         len(reuse) >= 2 and all(event.get("capacity",0) >= event.get("count",1) for event in reuse) and
@@ -5446,11 +5448,13 @@ def present_history_output_matches(stdout: str, stderr: str, success: bool) -> b
                 ("partial-after-full", "23586f54"), ("full-dirty-cropped", "5820e745"),
                 ("dirty-crop-only", "18c9a105"), ("overlap-positive-scroll", "d791e13c"),
                 ("stationary-scroll", "f61989e8"), ("large-inner-scroll", "26eba67d"),
-                ("large-edge-dirty", "97e990ef")]
+                ("large-edge-dirty", "97e990ef"), ("adjacent-full", "85cec9c5"),
+                ("bands-cover-scroll", "d8bb0bdc"), ("large-dirty-gap", "23e1bf9f"),
+                ("corner-gap", "ebe409c7")]
     phases = re.findall(r"^OWNED_D3D12_PRESENT_HISTORY_PHASE (begin|end)=([\w-]+)\r?$", stderr, re.MULTILINE)
     return bool(success and history == expected and phases == [
         (edge, name) for name, _ in expected for edge in ("begin", "end")] and
-        stdout.count("OWNED_D3D12_PRESENT_HISTORY_PASS cases=11 pixels=528 full_dirty=3 partial=7 crop=3 queues=2 exact=1") == 1 and
+        stdout.count("OWNED_D3D12_PRESENT_HISTORY_PASS cases=15 pixels=720 full_dirty=4 partial=10 crop=4 queues=2 exact=1") == 1 and
         "OWNED_D3D12_PRESENT_HISTORY_FAIL" not in stdout + stderr and
         "OWNED_D3D12_PRESENT_QUEUES_FAIL" not in stdout + stderr)
 
@@ -5541,12 +5545,13 @@ def fullscreen_output_matches(stdout: str, stderr: str, runtime: Path, arch: dic
 
 def stream_output_output_matches(stdout: str, stderr: str, success: bool) -> bool:
     # GS streams 0-3: per-stream slot bytes, BufferFilledSize and SO_STATISTICS_STREAM0..3, DXBC then DXIL
-    # (3 + 3 points; emissions per point: stream 0 one, 1 two, 2 one (never declared), 3 three).
+    # Emissions per point: stream 0 one, 1 two, 2 one (never declared), 3 three.
     gs_streams = [
         ("gs-streams-0-1", "6,12,0,0", "6,12,0,0", "96,96,0,0"),
         ("gs-streams-3-split-1", "0,12,0,18", "0,12,0,18", "216,0,72,48"),
         ("gs-streams-overflow", "6,12,0,5", "6,12,0,18", "96,96,20,40"),
         ("gs-streams-raster0", "0,12,0,18", "0,12,0,18", "96,72,0,0"),
+        ("gs-streams-key-prefix", "0,0,0,113", "0,0,0,234", "452,0,0,0"),
     ]
     found_gs = re.findall(r"^OWNED_D3D12_STREAM_OUTPUT_GS_STREAM_PASS case=([\w-]+) shader=(dxbc|dxil) "
                           r"written=([\d,]+) needed=([\d,]+) filled=([\d,]+)$", stdout, re.MULTILINE)
@@ -5592,7 +5597,7 @@ def stream_output_output_matches(stdout: str, stderr: str, success: bool) -> boo
                and stdout.count("OWNED_D3D12_STREAM_OUTPUT_FRONTIER_PASS ") == 4
                and (stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS case=indirect_bounded_snapshot_") +
                     stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS case=indirect_mutating_bounded_")) == 7
-               and stdout.splitlines().count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=133") == 1
+               and stdout.splitlines().count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=135") == 1
                and stdout.splitlines().count("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=64") == 1
                and stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS ") == 66
                and stdout.count("OWNED_D3D12_STREAM_OUTPUT_NO_RASTER_DISTANCE_PASS cases=2") == 1

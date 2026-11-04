@@ -89,15 +89,15 @@ bool usesDiffuseAlbedo(constant RrParams& c) {
 // The 7x7 neighborhood of an 8x8 threadgroup, staged once in threadgroup
 // memory. Callers dispatch complete RrTileSize x RrTileSize groups covering
 // the image; threads past its edge help fill the tile and then return. Only
-// the channels neighborhood() reads are kept (15680 bytes), so the tile stays
-// within 32 KiB even when Metal shader validation doubles threadgroup memory.
+// the channels neighborhood() reads are kept. Decode the material ID and
+// albedo once per tile entry so overlapping 7x7 neighborhoods share the work.
 constant constexpr uint RrTileSize = 8, RrTileSpan = RrTileSize+6;
 template<bool Neural> struct RrTile {
-    float2 normals[RrTileSpan][RrTileSpan]; // packed normal (z, material a)
+    float2 normals[RrTileSpan][RrTileSpan]; // roughness, decoded material ID
     float4 source[RrTileSpan][RrTileSpan], guide[RrTileSpan][RrTileSpan];
     packed_float3 decoded[RrTileSpan][RrTileSpan];
     packed_float3 spec[Neural ? 1 : RrTileSpan][Neural ? 1 : RrTileSpan];
-    float4 diff[RrTileSpan][RrTileSpan];
+    packed_float3 material[RrTileSpan][RrTileSpan];
 };
 // Every thread of the group must call this before any early return. Taps
 // outside the image are never stored; neighborhood() skips them unread.
@@ -113,17 +113,19 @@ template<bool Neural> void loadTile(threadgroup RrTile<Neural>& t, texture2d<flo
         int2 q = origin+int2(l);
         if (!inside(q,c)) continue;
         uint2 u = uint2(q);
-        t.normals[l.y][l.x] = normals.read(u).zw;
+        float2 material = normals.read(u).zw;
+        t.normals[l.y][l.x] = float2(material.x, round(material.y*3));
         t.source[l.y][l.x] = source.read(u);
         t.guide[l.y][l.x] = guide.read(u);
         t.decoded[l.y][l.x] = packed_float3(decoded.read(u).xyz);
         if (Neural) {
             // Radiance uses a single material edge across its neighborhood.
-            t.diff[l.y][l.x] = c.legacyMode == 3 && c.signal == 5 ? fusedAlbedo.read(u) :
-                                useSpec ? specAlbedo.read(u) : diffAlbedo.read(u);
+            float3 materialColor = c.legacyMode == 3 && c.signal == 5 ? albedo(fusedAlbedo,u,c) :
+                                   useSpec ? albedo(specAlbedo,u,c) : diffuseAlbedo(diffAlbedo,u,c);
+            t.material[l.y][l.x] = packed_float3(materialColor);
         } else {
-            if (useSpec) t.spec[l.y][l.x] = packed_float3(specAlbedo.read(u).xyz);
-            if (useDiff) t.diff[l.y][l.x] = diffAlbedo.read(u);
+            if (useSpec) t.spec[l.y][l.x] = packed_float3(albedo(specAlbedo,u,c));
+            if (useDiff) t.material[l.y][l.x] = packed_float3(diffuseAlbedo(diffAlbedo,u,c));
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -143,10 +145,10 @@ template<bool Neural> Neighborhood neighborhood(texture2d<float,access::read> fu
     float3 position = center.xyz;
     bool useSpec = usesSpecularAlbedo(c), useDiff = usesDiffuseAlbedo(c);
     bool composite = c.legacyMode == 3 && c.signal == 5;
-    float3 sa = Neural ? (composite ? neuralSpec : albedo(tile.diff[centerIndex.y][centerIndex.x],c)) :
-                useSpec ? albedo(float4(float3(tile.spec[centerIndex.y][centerIndex.x]),0),c) : float3(0);
-    float3 da = Neural && composite ? neuralDiff : useDiff ? diffuseAlbedo(tile.diff[centerIndex.y][centerIndex.x],c) : float3(0);
-    float3 fa = composite ? (Neural ? albedo(tile.diff[centerIndex.y][centerIndex.x],c) : albedo(fusedAlbedo,p,c)) : float3(0);
+    float3 sa = Neural ? neuralSpec :
+                useSpec ? float3(tile.spec[centerIndex.y][centerIndex.x]) : float3(0);
+    float3 da = Neural ? neuralDiff : useDiff ? float3(tile.material[centerIndex.y][centerIndex.x]) : float3(0);
+    float3 fa = Neural ? float3(tile.material[centerIndex.y][centerIndex.x]) : composite ? albedo(fusedAlbedo,p,c) : float3(0);
     float specWeight = specular(c.signal) ? 1.0f : 0.0f;
     if (composite) specWeight = dot(sa,float3(1))/max(dot(sa+da,float3(1)),1e-6f);
     float sigma = 0.65f+1.85f*c.relaxation;
@@ -165,7 +167,7 @@ template<bool Neural> Neighborhood neighborhood(texture2d<float,access::read> fu
         if (!inside(q,c)) continue;
         uint2 t = local+uint2(x+3,y+3);
         float2 np = tile.normals[t.y][t.x];
-        if (round(np.y*3) != round(packed.y*3)) { boundary = true; continue; }
+        if (np.y != packed.y) { boundary = true; continue; }
         float4 v = tile.source[t.y][t.x];
         if (!activeSample(v,uint2(q),c)) continue;
         float4 qg = tile.guide[t.y][t.x];
@@ -176,14 +178,10 @@ template<bool Neural> Neighborhood neighborhood(texture2d<float,access::read> fu
             -(1-clamp(dot(n,float3(tile.decoded[t.y][t.x])),0.0f,1.0f))*64*c.normalStrength;
         float edge;
         if (Neural) {
-            float4 material = tile.diff[t.y][t.x];
-            float3 qs = useSpec ? albedo(material,c) : float3(0);
-            float3 qd = useDiff ? diffuseAlbedo(material,c) : float3(0);
-            edge = specular(c.signal) ? length(sa-qs) : length(da-qd);
-            if (composite) edge = length(fa-albedo(material,c));
+            edge = length(fa-float3(tile.material[t.y][t.x]));
         } else {
-            float3 qs = useSpec ? albedo(float4(float3(tile.spec[t.y][t.x]),0),c) : float3(0);
-            float3 qd = useDiff ? diffuseAlbedo(tile.diff[t.y][t.x],c) : float3(0);
+            float3 qs = useSpec ? float3(tile.spec[t.y][t.x]) : float3(0);
+            float3 qd = useDiff ? float3(tile.material[t.y][t.x]) : float3(0);
             edge = specular(c.signal) ? length(sa-qs) : length(da-qd);
             if (c.signal == 3) edge = length(sa-qs)+length(da-qd);
             if (composite) edge = length(fa-albedo(fusedAlbedo,uint2(q),c));

@@ -53,6 +53,22 @@ namespace d3dalloy {
 struct NativeViewUnavailable {};
 struct NativeViewAlreadyAttached {};
 
+// Both rectangles read the same backbuffer after scroll. Combine them only
+// when the bounding box contains no pixels from the previous frame.
+static bool MergePresentDirtyRect(RECT &a, const RECT &b) {
+  const RECT box{std::min(a.left, b.left), std::min(a.top, b.top),
+                 std::max(a.right, b.right), std::max(a.bottom, b.bottom)};
+  const auto contains = [](const RECT &r, const RECT &s) {
+    return r.left <= s.left && r.top <= s.top && r.right >= s.right && r.bottom >= s.bottom;
+  };
+  if (!contains(a, b) && !contains(b, a) &&
+      !(a.top == b.top && a.bottom == b.bottom && a.left <= b.right && b.left <= a.right) &&
+      !(a.left == b.left && a.right == b.right && a.top <= b.bottom && b.top <= a.bottom))
+    return false;
+  a = box;
+  return true;
+}
+
 D3DalloyPresentLatency::~D3DalloyPresentLatency() {
   if (wake_semaphore_)
     CloseHandle(wake_semaphore_);
@@ -1320,8 +1336,13 @@ public:
         return DXGI_ERROR_INVALID_CALL;
       if (pPresentParameters->DirtyRectsCount) {
         try {
-          composition.dirty_rects.assign(pPresentParameters->pDirtyRects,
-                                         pPresentParameters->pDirtyRects + pPresentParameters->DirtyRectsCount);
+          auto &rects = composition.dirty_rects;
+          rects.reserve(pPresentParameters->DirtyRectsCount);
+          for (UINT i = 0; i < pPresentParameters->DirtyRectsCount; ++i) {
+            const RECT &rect = pPresentParameters->pDirtyRects[i];
+            if (rects.empty() || !MergePresentDirtyRect(rects.back(), rect))
+              rects.push_back(rect);
+          }
         } catch (const std::bad_alloc &) {
           return E_OUTOFMEMORY;
         }
